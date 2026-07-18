@@ -60,6 +60,8 @@ public:
     [[nodiscard]] std::filesystem::path nativeSstableFile(unsigned shard, uint64_t fileNumber) const;
 
     [[nodiscard]] std::filesystem::path placementFile() const;
+    [[nodiscard]] std::filesystem::path workerRegistryFile() const;
+    [[nodiscard]] std::filesystem::path workerRegistryTemporaryFile() const;
     [[nodiscard]] std::filesystem::path shardCountMetadataFile() const;
     [[nodiscard]] std::filesystem::path shardCountMetadataTemporaryFile() const;
     [[nodiscard]] std::filesystem::path rebalanceStateFile() const;

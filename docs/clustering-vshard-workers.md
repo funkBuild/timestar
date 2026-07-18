@@ -1,6 +1,6 @@
 # Stable VShards and Local Storage Workers
 
-**Status:** Tasks 1 and 2a complete on `cluster-design`; Task 2b next
+**Status:** Tasks 1, 2a, and 2b complete on `cluster-design`; Task 3 next
 
 **Parent design:** [Cluster Architecture and Implementation Plan](clustering.md)
 
@@ -96,9 +96,33 @@ fails closed.
   checksum field. Decoding accepts only the exact compact encoder output and is
   bounded to 64 KiB before parsing, closing duplicate-key and alternate-JSON
   ambiguities.
-- Task 2b will place `workers.json` under `StorageLayout` and add the locked,
-  descriptor-relative durable I/O protocol. The pure codec performs no file
-  I/O and is not connected to live Engine routing.
+- Task 2b places `workers.json` under `StorageLayout` and adds the locked,
+  descriptor-relative durable I/O protocol. Updates use an exclusive temporary
+  file, complete write, file fsync, close, atomic rename, and root-directory
+  fsync. Recovery re-fsyncs a complete valid next-generation temporary file
+  before rolling it forward, and re-fsyncs the directory before accepting a
+  final-only generation after an ambiguous crash. With a valid final file it
+  durably cleans partial or stale scratch state. Without a final file, invalid
+  temporary evidence is preserved and startup fails closed. Corrupt
+  authoritative state is never masked. Reserved names are opened nonblocking
+  and never followed, so a FIFO or symlink cannot hang or redirect startup.
+- The store reuses the server-lifetime root lock, checks the configured root
+  inode before and after namespace mutations, and rejects a mismatched or
+  replaced root. Rename and install-failure cleanup additionally require the
+  reserved pathname to still name the exact device/inode that this install
+  created or recovery validated. Rename also revalidates the exact canonical
+  bytes, not only the inode, for both the prepared source and the authoritative
+  destination immediately before replacement. After the last crash-test
+  observer the store repeats an unobservable file-and-directory fsync pass,
+  then rechecks root binding, identity, and contents before acknowledging
+  success. An `O_EXCL` collision or pathname substitution preserves the
+  pre-existing artifact and fails closed.
+- Process-crash injection covers every create/write/fsync/close/rename boundary
+  in installation and every fsync/remove/rename boundary in recovery. These
+  tests model process exit: each child independently acquires the root lock and
+  the recovering parent reacquires it after child exit. The ordered file and
+  directory fsync protocol supplies the power-loss durability contract. The
+  codec/store remain disconnected from live Engine routing.
 - Create worker IDs monotonically when CPU capacity grows; never recycle IDs.
 - On shrink, retain excess workers, co-schedule them, and mark them draining.
 - Install updates through fsync-plus-atomic-rename under the existing root lock.
@@ -106,9 +130,16 @@ fails closed.
   state. A CRC detects corruption, not a valid historical rollback; freshness
   is enforced by comparing candidates to the last accepted generation.
 
+No local file format can detect rollback of an entire data-root snapshot when
+every generation witness is rolled back together. This phase detects rollback
+between the final and temporary candidates it can observe. A future replicated
+control plane must provide the external epoch witness needed to reject a
+coordinated whole-root rollback.
+
 Gate: crash injection at every write/rename/fsync boundary recovers one complete
-registry generation, and a missing reactor never makes an old worker's data
-unreachable.
+registry generation when one exists, and otherwise fails closed while
+preserving ambiguous evidence. A missing reactor never makes an old worker's
+data unreachable.
 
 ### Task 3: VShard layout and effective ownership generations
 

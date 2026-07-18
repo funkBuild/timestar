@@ -7,6 +7,10 @@
 
 namespace timestar {
 
+namespace cluster {
+class WorkerRegistryStore;
+}
+
 enum class ShardStoreStartupStatus {
     FreshStore,
     MatchingShardCount,
@@ -42,6 +46,7 @@ public:
     ~ShardStoreLock();
 
 private:
+    friend class cluster::WorkerRegistryStore;
     friend class ShardStoreStartup;
     ShardStoreLock(int directoryFd, std::filesystem::path dataDir);
 

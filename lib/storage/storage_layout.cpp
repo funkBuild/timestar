@@ -202,6 +202,14 @@ fs::path StorageLayout::placementFile() const {
     return underRoot("placement.json");
 }
 
+fs::path StorageLayout::workerRegistryFile() const {
+    return underRoot("workers.json");
+}
+
+fs::path StorageLayout::workerRegistryTemporaryFile() const {
+    return withSuffix(workerRegistryFile(), ".tmp");
+}
+
 fs::path StorageLayout::shardCountMetadataFile() const {
     return underRoot("shard_count.meta");
 }

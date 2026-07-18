@@ -52,6 +52,8 @@ TEST(StorageLayoutTest, DefaultRootExactlyPreservesLegacyNames) {
     EXPECT_EQ(layout.nativeWalFile(3, 7), "shard_3/native_index/wal/idx_000007.wal");
     EXPECT_EQ(layout.nativeSstableFile(3, 7), "shard_3/native_index/idx_000007.sst");
     EXPECT_EQ(layout.placementFile(), "placement.json");
+    EXPECT_EQ(layout.workerRegistryFile(), "workers.json");
+    EXPECT_EQ(layout.workerRegistryTemporaryFile(), "workers.json.tmp");
     EXPECT_EQ(layout.shardCountMetadataFile(), "shard_count.meta");
     EXPECT_EQ(layout.shardCountMetadataTemporaryFile(), "shard_count.meta.tmp");
     EXPECT_EQ(layout.rebalanceStateFile(), "rebalance.state");
@@ -68,6 +70,8 @@ TEST(StorageLayoutTest, RelativeRootWithSpacesIsPreservedLexically) {
     EXPECT_EQ(layout.shardStagingTsmDir(1), "tenant data/primary/shard_1_new/tsm");
     EXPECT_EQ(layout.rebalanceSplitTsmFile(1, 44), "tenant data/primary/shard_1_new/tsm/0_split_44.tsm");
     EXPECT_EQ(layout.placementFile(), "tenant data/primary/placement.json");
+    EXPECT_EQ(layout.workerRegistryFile(), "tenant data/primary/workers.json");
+    EXPECT_EQ(layout.workerRegistryTemporaryFile(), "tenant data/primary/workers.json.tmp");
 }
 
 TEST(StorageLayoutTest, AnchoredRootIsAbsoluteAndStableAtTheOwnershipBoundary) {
