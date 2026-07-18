@@ -39,6 +39,8 @@ struct StorageWorker {
     StorageWorkerId id;
     uint32_t weight = 1;
     StorageWorkerState state = StorageWorkerState::Active;
+
+    auto operator<=>(const StorageWorker&) const = default;
 };
 
 struct DesiredOwnershipChange {

@@ -1,6 +1,6 @@
 # Stable VShards and Local Storage Workers
 
-**Status:** Task 1 complete on `cluster-design`; Task 2 planned
+**Status:** Tasks 1 and 2a complete on `cluster-design`; Task 2b next
 
 **Parent design:** [Cluster Architecture and Implementation Plan](clustering.md)
 
@@ -89,11 +89,22 @@ fails closed.
 
 ### Task 2: Durable worker registry
 
-- Add a versioned, checksummed `workers.json` under `StorageLayout`.
+- Task 2a defines the pure registry state machine and canonical `workers.json`
+  codec. Format version 1 records the placement-algorithm version, generation,
+  next monotonic worker ID, sorted worker records, and checksum. The checksum is
+  CRC-32/ISO-HDLC over fixed-width little-endian fields and excludes the JSON
+  checksum field. Decoding accepts only the exact compact encoder output and is
+  bounded to 64 KiB before parsing, closing duplicate-key and alternate-JSON
+  ambiguities.
+- Task 2b will place `workers.json` under `StorageLayout` and add the locked,
+  descriptor-relative durable I/O protocol. The pure codec performs no file
+  I/O and is not connected to live Engine routing.
 - Create worker IDs monotonically when CPU capacity grows; never recycle IDs.
 - On shrink, retain excess workers, co-schedule them, and mark them draining.
 - Install updates through fsync-plus-atomic-rename under the existing root lock.
-- Reject corrupt, duplicate, zero-ID, unsupported-version, or rollback state.
+- Reject corrupt, duplicate, zero-ID, unsupported-version, or invalid-transition
+  state. A CRC detects corruption, not a valid historical rollback; freshness
+  is enforced by comparing candidates to the last accepted generation.
 
 Gate: crash injection at every write/rename/fsync boundary recovers one complete
 registry generation, and a missing reactor never makes an old worker's data
