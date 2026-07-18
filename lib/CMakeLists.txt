@@ -1,6 +1,7 @@
 # Collect source files from all subdirectories.
 # CONFIGURE_DEPENDS ensures cmake re-runs when files are added/removed.
 file(GLOB_RECURSE SRC_FILES CONFIGURE_DEPENDS
+    cluster/*.cpp
     core/*.cpp
     storage/*.cpp
     encoding/*.cpp

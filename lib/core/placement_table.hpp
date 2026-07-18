@@ -1,15 +1,12 @@
 #pragma once
 
 #include "series_id.hpp"
+#include "vshard.hpp"
 
-#include <array>
 #include <cstdint>
 #include <string>
 
 namespace timestar {
-
-static constexpr uint16_t VIRTUAL_SHARD_COUNT = 4096;
-static constexpr uint16_t VIRTUAL_SHARD_MASK = VIRTUAL_SHARD_COUNT - 1;
 
 struct VShardMapping {
     uint16_t serverId = 0;  // 0 = local (single-server)

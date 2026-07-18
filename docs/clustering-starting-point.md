@@ -1,6 +1,6 @@
 # Cluster Starting Point: Storage Layout Foundation
 
-**Status:** In implementation on `cluster-design`
+**Status:** Completed on `cluster-design`
 
 **Parent design:** [Cluster Architecture and Implementation Plan](clustering.md)
 
@@ -403,7 +403,9 @@ Do not add an unused generalized ownership hierarchy merely to anticipate
 VShards. Instead, record the requirements learned from layout injection and
 write the next implementation plan around an explicit stable VShard identity.
 
-The next epic begins only after this plan's acceptance gates pass. Its order is:
+The next epic is tracked in
+[Stable VShards and Local Storage Workers](clustering-vshard-workers.md). Its
+storage-boundary order is:
 
 1. define the local durable acknowledgement boundary and group-commit tests;
 2. make the series catalog durable and rebuildable;

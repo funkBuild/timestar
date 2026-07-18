@@ -763,6 +763,9 @@ core-count change cannot make an existing series undiscoverable.
 
 ### Phase 1: True VShard storage
 
+Follow the task boundaries and safety gates in
+[Stable VShards and Local Storage Workers](clustering-vshard-workers.md).
+
 - Replace local modulo routing with a stored, versioned placement abstraction.
 - Decouple on-disk identity from Seastar core assignment.
 - Persist OSD-like storage-worker identities and map them to reactor cores at
