@@ -6,12 +6,12 @@
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
-#include <format>
 #include <memory>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/seastar.hh>
 #include <seastar/core/sleep.hh>
 #include <seastar/util/log.hh>
+#include <utility>
 
 namespace timestar::index {
 
@@ -42,11 +42,12 @@ private:
     int priority_;
 };
 
-CompactionEngine::CompactionEngine(std::string dataDir, Manifest& manifest, CompactionConfig config)
-    : dataDir_(std::move(dataDir)), manifest_(manifest), config_(config) {}
+CompactionEngine::CompactionEngine(timestar::StorageLayout layout, unsigned workerId, Manifest& manifest,
+                                   CompactionConfig config)
+    : layout_(layout.anchored()), workerId_(workerId), manifest_(manifest), config_(config) {}
 
 std::string CompactionEngine::sstFilename(uint64_t fileNumber) {
-    return std::format("{}/idx_{:06}.sst", dataDir_, fileNumber);
+    return layout_.nativeSstableFile(workerId_, fileNumber).string();
 }
 
 std::optional<CompactionEngine::CompactionJob> CompactionEngine::pickCompaction() {

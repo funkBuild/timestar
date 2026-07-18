@@ -1,35 +1,36 @@
 #include "../../../lib/index/native/index_wal.hpp"
+
 #include "../../../lib/index/native/memtable.hpp"
 #include "../../../lib/index/native/write_batch.hpp"
-
 #include "../../seastar_gtest.hpp"
 
 #include <gtest/gtest.h>
-#include <seastar/core/coroutine.hh>
 
 #include <filesystem>
+#include <seastar/core/coroutine.hh>
 
 using namespace timestar::index;
 
 class IndexWALTest : public ::testing::Test {
 public:
     void SetUp() override {
-        dir_ = std::filesystem::temp_directory_path() / "timestar_wal_test";
+        std::filesystem::remove_all(layout_.root());
         std::filesystem::create_directories(dir_);
     }
-    void TearDown() override { std::filesystem::remove_all(dir_); }
-    std::string dir_;
+    void TearDown() override { std::filesystem::remove_all(layout_.root()); }
+    const timestar::StorageLayout layout_{std::filesystem::temp_directory_path() / "timestar_wal_test"};
+    const std::string dir_ = layout_.nativeWalDir(0).string();
 };
 
 SEASTAR_TEST_F(IndexWALTest, OpenAndClose) {
-    auto wal = co_await IndexWAL::open(self->dir_);
+    auto wal = co_await IndexWAL::open(self->layout_, 0);
     EXPECT_EQ(wal.sequenceNumber(), 0u);
     co_await wal.close();
 }
 
 SEASTAR_TEST_F(IndexWALTest, AppendAndReplay) {
     {
-        auto wal = co_await IndexWAL::open(self->dir_);
+        auto wal = co_await IndexWAL::open(self->layout_, 0);
 
         IndexWriteBatch batch1;
         batch1.put("key1", "val1");
@@ -47,7 +48,7 @@ SEASTAR_TEST_F(IndexWALTest, AppendAndReplay) {
 
     // Reopen and replay
     {
-        auto wal = co_await IndexWAL::open(self->dir_);
+        auto wal = co_await IndexWAL::open(self->layout_, 0);
         MemTable mt;
         auto count = co_await wal.replay(mt);
 
@@ -60,7 +61,7 @@ SEASTAR_TEST_F(IndexWALTest, AppendAndReplay) {
 }
 
 SEASTAR_TEST_F(IndexWALTest, Rotate) {
-    auto wal = co_await IndexWAL::open(self->dir_);
+    auto wal = co_await IndexWAL::open(self->layout_, 0);
 
     IndexWriteBatch batch;
     batch.put("key1", "val1");
@@ -88,7 +89,7 @@ SEASTAR_TEST_F(IndexWALTest, Rotate) {
 }
 
 SEASTAR_TEST_F(IndexWALTest, EmptyReplay) {
-    auto wal = co_await IndexWAL::open(self->dir_);
+    auto wal = co_await IndexWAL::open(self->layout_, 0);
     MemTable mt;
     auto count = co_await wal.replay(mt);
     EXPECT_EQ(count, 0u);
@@ -97,7 +98,7 @@ SEASTAR_TEST_F(IndexWALTest, EmptyReplay) {
 }
 
 SEASTAR_TEST_F(IndexWALTest, SyncMakesAppendsDurableWithoutClose) {
-    auto wal = co_await IndexWAL::open(self->dir_);
+    auto wal = co_await IndexWAL::open(self->layout_, 0);
 
     IndexWriteBatch b;
     b.put("crashkey", "crashval");
@@ -107,7 +108,7 @@ SEASTAR_TEST_F(IndexWALTest, SyncMakesAppendsDurableWithoutClose) {
     // Read back with an independent instance while the writer is still open —
     // equivalent to a crash right after sync (no close, no destructor net).
     {
-        auto reader = co_await IndexWAL::open(self->dir_);
+        auto reader = co_await IndexWAL::open(self->layout_, 0);
         MemTable mt;
         auto count = co_await reader.replay(mt);
         EXPECT_EQ(count, 1u);
@@ -122,7 +123,7 @@ SEASTAR_TEST_F(IndexWALTest, SyncMakesAppendsDurableWithoutClose) {
     co_await wal.append(b2);
     co_await wal.close();
 
-    auto reader2 = co_await IndexWAL::open(self->dir_);
+    auto reader2 = co_await IndexWAL::open(self->layout_, 0);
     MemTable mt2;
     auto count2 = co_await reader2.replay(mt2);
     EXPECT_EQ(count2, 2u);
@@ -134,7 +135,7 @@ SEASTAR_TEST_F(IndexWALTest, SyncMakesAppendsDurableWithoutClose) {
 SEASTAR_TEST_F(IndexWALTest, ReplayKeepsOldGenerationsUntilPurge) {
     std::string old1, old2;
     {
-        auto wal = co_await IndexWAL::open(self->dir_);
+        auto wal = co_await IndexWAL::open(self->layout_, 0);
         IndexWriteBatch b1;
         b1.put("k1", "v1");
         co_await wal.append(b1);
@@ -151,7 +152,7 @@ SEASTAR_TEST_F(IndexWALTest, ReplayKeepsOldGenerationsUntilPurge) {
         co_await wal.close();
     }
 
-    auto wal2 = co_await IndexWAL::open(self->dir_);
+    auto wal2 = co_await IndexWAL::open(self->layout_, 0);
     MemTable mt;
     auto count = co_await wal2.replay(mt);
     EXPECT_EQ(count, 3u);

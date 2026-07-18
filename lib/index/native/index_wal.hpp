@@ -1,5 +1,6 @@
 #pragma once
 
+#include "storage_layout.hpp"
 #include "write_batch.hpp"
 
 #include <cstdint>
@@ -30,10 +31,10 @@ class IndexWAL {
 public:
     ~IndexWAL();
     IndexWAL(IndexWAL&&) noexcept = default;
-    IndexWAL& operator=(IndexWAL&&) noexcept = default;
+    IndexWAL& operator=(IndexWAL&&) noexcept = delete;
 
-    // Open or create a WAL file in the given directory.
-    static seastar::future<IndexWAL> open(std::string directory);
+    // Open or create the WAL files owned by one storage worker.
+    static seastar::future<IndexWAL> open(timestar::StorageLayout layout, unsigned workerId);
 
     // Append a write batch to the WAL buffer. Data is made durable by the
     // owner's periodic sync() (bounded window), by rotate(), and by close() —
@@ -66,11 +67,13 @@ public:
     const std::string& currentPath() const { return currentPath_; }
 
 private:
-    IndexWAL() = default;
+    IndexWAL(timestar::StorageLayout layout, unsigned workerId);
 
     // Open/reopen the Seastar DMA file for the current WAL.
     seastar::future<> openFile();
 
+    std::shared_ptr<const timestar::StorageLayout> layout_;
+    unsigned workerId_;
     std::string directory_;
     std::string currentPath_;
     std::vector<std::string> oldWalPaths_;  // Older WAL generations found on open(), replayed before current
@@ -104,7 +107,6 @@ private:
     seastar::future<uint64_t> replayOneFile(const std::string& path, MemTable& target);
 
     static uint32_t computeCrc32(const char* data, size_t len);
-    static std::string walFileName(const std::string& dir, uint64_t generation);
 };
 
 }  // namespace timestar::index

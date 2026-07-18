@@ -26,11 +26,11 @@
 namespace fs = std::filesystem;
 
 Engine::Engine()
-    : layout_(timestar::dataRootPath()),
+    : layout_(timestar::StorageLayout(timestar::dataRootPath()).anchored()),
       shardId(seastar::this_shard_id()),
       tsmFileManager(layout_, shardId),
       walFileManager(layout_, shardId),
-      index(shardId) {
+      index(layout_, shardId) {
     // Directory creation moved to init() to avoid blocking the reactor thread
 }
 

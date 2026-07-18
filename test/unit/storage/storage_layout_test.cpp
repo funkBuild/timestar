@@ -70,6 +70,15 @@ TEST(StorageLayoutTest, RelativeRootWithSpacesIsPreservedLexically) {
     EXPECT_EQ(layout.placementFile(), "tenant data/primary/placement.json");
 }
 
+TEST(StorageLayoutTest, AnchoredRootIsAbsoluteAndStableAtTheOwnershipBoundary) {
+    const timestar::StorageLayout relative("tenant data/primary");
+    const auto anchored = relative.anchored();
+
+    EXPECT_EQ(anchored.root(), fs::absolute(relative.root()).lexically_normal());
+    EXPECT_TRUE(anchored.root().is_absolute());
+    EXPECT_EQ(anchored.anchored(), anchored);
+}
+
 TEST(StorageLayoutTest, AbsoluteAndFilesystemRootsComposeWithoutDuplicateSeparators) {
     const timestar::StorageLayout absolute("/var/lib/timestar///");
     const timestar::StorageLayout filesystemRoot("/");

@@ -355,7 +355,7 @@ SEASTAR_TEST_F(OptimizationBaseline, B3_NativeIndexInsertCacheOverhead) {
     fmt::print("║  B3: NativeIndex Insert Cache & Allocation Overhead            ║\n");
     fmt::print("╚══════════════════════════════════════════════════════════════════╝\n");
 
-    NativeIndex index(0);
+    NativeIndex index(timestar::StorageLayout("."), 0);
     co_await index.open();
 
     // Phase A: Measure getOrCreateSeriesId for increasing cardinality
@@ -646,7 +646,7 @@ SEASTAR_TEST_F(OptimizationBaseline, B7_NativeIndexHighCardinality) {
     fmt::print("║  B7: NativeIndex High-Cardinality Cache Pressure               ║\n");
     fmt::print("╚══════════════════════════════════════════════════════════════════╝\n");
 
-    NativeIndex index(0);
+    NativeIndex index(timestar::StorageLayout("."), 0);
     co_await index.open();
 
     // Insert many measurements with many unique tag values to stress caches

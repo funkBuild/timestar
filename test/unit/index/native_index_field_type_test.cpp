@@ -21,7 +21,7 @@ protected:
 
 // Test that indexInsert<double> stores field type as "float"
 seastar::future<> testIndexInsertStoresFloatType() {
-    timestar::index::NativeIndex index(0);
+    timestar::index::NativeIndex index(timestar::StorageLayout("."), 0);
     co_await index.open();
 
     TimeStarInsert<double> insert("temperature", "value");
@@ -42,7 +42,7 @@ TEST_F(NativeIndexFieldTypeTest, IndexInsertStoresFloatType) {
 
 // Test that indexInsert<bool> stores field type as "boolean"
 seastar::future<> testIndexInsertStoresBooleanType() {
-    timestar::index::NativeIndex index(0);
+    timestar::index::NativeIndex index(timestar::StorageLayout("."), 0);
     co_await index.open();
 
     TimeStarInsert<bool> insert("sensor", "is_active");
@@ -63,7 +63,7 @@ TEST_F(NativeIndexFieldTypeTest, IndexInsertStoresBooleanType) {
 
 // Test that indexInsert<std::string> stores field type as "string"
 seastar::future<> testIndexInsertStoresStringType() {
-    timestar::index::NativeIndex index(0);
+    timestar::index::NativeIndex index(timestar::StorageLayout("."), 0);
     co_await index.open();
 
     TimeStarInsert<std::string> insert("logs", "message");
@@ -84,7 +84,7 @@ TEST_F(NativeIndexFieldTypeTest, IndexInsertStoresStringType) {
 
 // Test that multiple fields on the same measurement each get correct types
 seastar::future<> testMultipleFieldTypesSameMeasurement() {
-    timestar::index::NativeIndex index(0);
+    timestar::index::NativeIndex index(timestar::StorageLayout("."), 0);
     co_await index.open();
 
     // Insert a float field
@@ -124,7 +124,7 @@ TEST_F(NativeIndexFieldTypeTest, MultipleFieldTypesSameMeasurement) {
 
 // Test that calling indexInsert multiple times for the same field doesn't change the type
 seastar::future<> testIdempotentFieldType() {
-    timestar::index::NativeIndex index(0);
+    timestar::index::NativeIndex index(timestar::StorageLayout("."), 0);
     co_await index.open();
 
     // Insert same field multiple times
@@ -149,7 +149,7 @@ TEST_F(NativeIndexFieldTypeTest, IdempotentFieldType) {
 seastar::future<> testFieldTypePersistence() {
     // First session: insert and set types
     {
-        timestar::index::NativeIndex index(0);
+        timestar::index::NativeIndex index(timestar::StorageLayout("."), 0);
         co_await index.open();
 
         TimeStarInsert<double> floatInsert("persistent_test", "value");
@@ -167,7 +167,7 @@ seastar::future<> testFieldTypePersistence() {
 
     // Second session: reopen and verify types persisted
     {
-        timestar::index::NativeIndex index(0);
+        timestar::index::NativeIndex index(timestar::StorageLayout("."), 0);
         co_await index.open();
 
         auto valueType = co_await index.getFieldType("persistent_test", "value");
@@ -186,7 +186,7 @@ TEST_F(NativeIndexFieldTypeTest, FieldTypePersistence) {
 
 // Test that a field with no stored type returns empty string (default behavior)
 seastar::future<> testUnknownFieldTypeReturnsEmpty() {
-    timestar::index::NativeIndex index(0);
+    timestar::index::NativeIndex index(timestar::StorageLayout("."), 0);
     co_await index.open();
 
     // Manually create a series without going through indexInsert

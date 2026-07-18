@@ -22,6 +22,7 @@
 #include <seastar/core/thread.hh>
 #include <seastar/coroutine/maybe_yield.hh>
 #include <seastar/util/log.hh>
+#include <utility>
 
 // Use short namespace alias for key encoding
 namespace ke = timestar::index::keys;
@@ -137,8 +138,10 @@ private:
 // Constructor / Destructor
 // ============================================================================
 
-NativeIndex::NativeIndex(int shardId)
-    : shardId_(shardId),
+NativeIndex::NativeIndex(timestar::StorageLayout layout, unsigned workerId)
+    : layout_(layout.anchored()),
+      shardId_(workerId),
+      indexPath_(layout_.nativeIndexDir(workerId)),
       blockCache_(timestar::config().index.block_cache_bytes / std::max(1u, seastar::smp::count)),
       seriesMetadataCache_(timestar::config().index.metadata_cache_bytes / std::max(1u, seastar::smp::count)),
       discoveryCache_(timestar::config().index.discovery_cache_bytes / std::max(1u, seastar::smp::count)) {}
@@ -164,17 +167,14 @@ NativeIndex::~NativeIndex() {
 // ============================================================================
 
 seastar::future<> NativeIndex::open() {
-    // Note: std::filesystem::absolute() depends on the process CWD at call time.
-    // This is fine because open() is called during startup before any CWD change.
-    indexPath_ = std::filesystem::absolute(timestar::shardDataPath(shardId_) + "/native_index").string();
-    co_await seastar::async([this] { std::filesystem::create_directories(indexPath_); });
+    co_await seastar::async([indexPath = indexPath_] { std::filesystem::create_directories(indexPath); });
 
     // Open manifest
-    manifest_ = std::make_unique<Manifest>(co_await Manifest::open(indexPath_));
+    manifest_ = std::make_unique<Manifest>(co_await Manifest::open(layout_, shardId_));
 
     // Open WAL and replay into MemTable
     memtable_ = std::make_shared<MemTable>();
-    wal_ = std::make_unique<IndexWAL>(co_await IndexWAL::open(indexPath_ + "/wal"));
+    wal_ = std::make_unique<IndexWAL>(co_await IndexWAL::open(layout_, shardId_));
     auto replayed = co_await wal_->replay(*memtable_);
     if (replayed > 0) {
         ::native_index_log.info("Replayed {} WAL records into MemTable", replayed);
@@ -191,7 +191,7 @@ seastar::future<> NativeIndex::open() {
     compCfg.blockSize = timestar::config().index.block_size;
     compCfg.bloomBitsPerKey = timestar::config().index.bloom_filter_bits;
     compCfg.rateLimitMBps = timestar::config().index.compaction_rate_limit_mbps;
-    compaction_ = std::make_unique<CompactionEngine>(indexPath_, *manifest_, compCfg);
+    compaction_ = std::make_unique<CompactionEngine>(layout_, shardId_, *manifest_, compCfg);
 
     // Durability: replayed WAL records exist only in the volatile memtable at
     // this point. Make them durable in an SSTable BEFORE the current WAL can
@@ -291,8 +291,8 @@ seastar::future<> NativeIndex::open() {
     // This avoids scanning all HLL/bloom KV entries at startup, which can stall for
     // 10K+ measurements.
 
-    ::native_index_log.info("NativeIndex opened at: {} ({} SSTables, {} MemTable entries, {} local IDs)", indexPath_,
-                            manifest_->files().size(), memtable_->size(), localIdMap_.size());
+    ::native_index_log.info("NativeIndex opened at: {} ({} SSTables, {} MemTable entries, {} local IDs)",
+                            indexPath_.string(), manifest_->files().size(), memtable_->size(), localIdMap_.size());
 }
 
 seastar::future<> NativeIndex::close() {
@@ -341,7 +341,7 @@ seastar::future<> NativeIndex::close() {
 // ============================================================================
 
 std::string NativeIndex::sstFilename(uint64_t fileNumber) {
-    return std::format("{}/idx_{:06}.sst", indexPath_, fileNumber);
+    return layout_.nativeSstableFile(shardId_, fileNumber).string();
 }
 
 // Step 4: Incremental SSTable refresh — only opens new files and closes removed ones.

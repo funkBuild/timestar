@@ -10,10 +10,18 @@
 #include <seastar/util/log.hh>
 #include <stdexcept>
 #include <unordered_set>
+#include <utility>
 
 namespace timestar::index {
 
 static seastar::logger manifest_log("timestar.manifest");
+
+Manifest::Manifest(timestar::StorageLayout layout, unsigned workerId) {
+    const auto anchored = layout.anchored();
+    directory_ = anchored.nativeIndexDir(workerId).string();
+    manifestPath_ = anchored.nativeManifestFile(workerId).string();
+    manifestTemporaryPath_ = anchored.nativeManifestTemporaryFile(workerId).string();
+}
 
 static void encodeFixed32(std::string& out, uint32_t v) {
     char buf[4];
@@ -46,12 +54,9 @@ seastar::future<> Manifest::openFileForAppend() {
     writeOffset_ = co_await file_.size();
 }
 
-seastar::future<Manifest> Manifest::open(std::string directory) {
-    co_await seastar::recursive_touch_directory(directory);
-
-    Manifest m;
-    m.directory_ = directory;
-    m.manifestPath_ = directory + "/MANIFEST";
+seastar::future<Manifest> Manifest::open(timestar::StorageLayout layout, unsigned workerId) {
+    Manifest m(std::move(layout), workerId);
+    co_await seastar::recursive_touch_directory(m.directory_);
 
     bool exists = co_await seastar::file_exists(m.manifestPath_);
     bool needsRewrite = false;
@@ -266,7 +271,7 @@ seastar::future<> Manifest::writeSnapshot() {
     crcFraming_ = true;
 
     // Write atomically: write to temp file via DMA, fsync, then rename.
-    auto tmpPath = manifestPath_ + ".tmp";
+    const auto& tmpPath = manifestTemporaryPath_;
     auto tmpFile = co_await seastar::open_file_dma(
         tmpPath, seastar::open_flags::wo | seastar::open_flags::create | seastar::open_flags::truncate);
     auto tmpAlign = tmpFile.disk_write_dma_alignment();

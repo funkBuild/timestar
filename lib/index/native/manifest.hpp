@@ -2,6 +2,7 @@
 
 #include "manifest_format.hpp"
 #include "sstable.hpp"
+#include "storage_layout.hpp"
 
 #include <cstdint>
 #include <optional>
@@ -38,7 +39,10 @@ namespace timestar::index {
 // All I/O uses Seastar's native async DMA file operations.
 class Manifest {
 public:
-    static seastar::future<Manifest> open(std::string directory);
+    Manifest(Manifest&&) noexcept = default;
+    Manifest& operator=(Manifest&&) noexcept = delete;
+
+    static seastar::future<Manifest> open(timestar::StorageLayout layout, unsigned workerId);
 
     // Current file set
     const std::vector<SSTableMetadata>& files() const { return files_; }
@@ -72,7 +76,7 @@ public:
     static constexpr size_t MANIFEST_HEADER_SIZE = timestar::index::MANIFEST_HEADER_SIZE;
 
 private:
-    Manifest() = default;
+    Manifest(timestar::StorageLayout layout, unsigned workerId);
 
     // Append a length-prefixed frame to the manifest file using DMA I/O.
     seastar::future<> appendFrame(const std::string& frame);
@@ -89,6 +93,7 @@ private:
 
     std::string directory_;
     std::string manifestPath_;
+    std::string manifestTemporaryPath_;
     uint64_t nextFileNumber_ = 1;
     std::vector<SSTableMetadata> files_;
 

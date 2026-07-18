@@ -14,10 +14,12 @@
 #include "memtable.hpp"
 #include "merge_iterator.hpp"
 #include "sstable.hpp"
+#include "storage_layout.hpp"
 #include "timestar_config.hpp"
 #include "timestar_value.hpp"
 #include "write_batch.hpp"
 
+#include <filesystem>
 #include <map>
 #include <memory>
 #include <roaring.hh>
@@ -80,7 +82,7 @@ namespace timestar::index {
 // Uses DMA I/O with no thread-pool crossings.
 class NativeIndex : public IndexBackend {
 public:
-    explicit NativeIndex(int shardId);
+    NativeIndex(timestar::StorageLayout layout, unsigned workerId);
     ~NativeIndex() override;
 
     // Lifecycle
@@ -227,8 +229,9 @@ public:
     seastar::future<> applySchemaUpdate(SchemaUpdate update);
 
 private:
-    int shardId_;
-    std::string indexPath_;
+    const timestar::StorageLayout layout_;
+    const unsigned shardId_;
+    const std::filesystem::path indexPath_;
 
     // --- LSM storage ---
     // shared_ptr: kvPrefixScan sources co-own the memtables so a background

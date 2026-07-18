@@ -5,10 +5,10 @@
 #include "../../seastar_gtest.hpp"
 
 #include <gtest/gtest.h>
-#include <seastar/core/coroutine.hh>
 
 #include <filesystem>
 #include <format>
+#include <seastar/core/coroutine.hh>
 
 using namespace timestar::index;
 
@@ -48,7 +48,7 @@ SEASTAR_TEST_F(NativeIndexCompactionGateTest, ManyFlushesKeepSSTableCountBounded
     constexpr int kPolicies = 2000;  // ~300KB of KV data → ~50+ flushes at a 4KB buffer
 
     {
-        NativeIndex index(0);
+        NativeIndex index(timestar::StorageLayout("."), 0);
         co_await index.open();
 
         for (int i = 0; i < kPolicies; ++i) {
@@ -80,8 +80,7 @@ SEASTAR_TEST_F(NativeIndexCompactionGateTest, ManyFlushesKeepSSTableCountBounded
     // level bounded. Without L1→L2 compaction, ~50 flushes leave ~12+ L1
     // files; with it, L1 stays below the threshold of 8.
     {
-        auto manifestDir = std::filesystem::absolute("shard_0/native_index").string();
-        auto manifest = co_await Manifest::open(manifestDir);
+        auto manifest = co_await Manifest::open(timestar::StorageLayout("."), 0);
         EXPECT_LT(manifest.filesAtLevel(0).size(), 4u);
         EXPECT_LT(manifest.filesAtLevel(1).size(), 8u) << "L1 -> L2 compaction never ran";
         EXPECT_LT(manifest.filesAtLevel(2).size(), 8u);
@@ -92,7 +91,7 @@ SEASTAR_TEST_F(NativeIndexCompactionGateTest, ManyFlushesKeepSSTableCountBounded
     // Reopen: recovery must see the compacted state (manifest v2 + maxKey
     // pruning) and still return correct data.
     {
-        NativeIndex index(0);
+        NativeIndex index(timestar::StorageLayout("."), 0);
         co_await index.open();
         auto val = co_await index.getRetentionPolicy("gate_meas_00042");
         EXPECT_TRUE(val.has_value());

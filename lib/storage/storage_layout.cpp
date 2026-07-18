@@ -11,6 +11,12 @@ namespace timestar {
 
 StorageLayout::StorageLayout(fs::path root) : root_(normalizeRoot(std::move(root))) {}
 
+StorageLayout StorageLayout::anchored() const {
+    if (root_.is_absolute())
+        return *this;
+    return StorageLayout(fs::absolute(root_));
+}
+
 fs::path StorageLayout::normalizeRoot(fs::path root) {
     if (root.empty())
         throw std::invalid_argument("StorageLayout root must not be empty");

@@ -13,6 +13,9 @@ public:
     explicit StorageLayout(std::filesystem::path root);
 
     [[nodiscard]] const std::filesystem::path& root() const noexcept { return root_; }
+    // Resolve a relative root against the process CWD once at an ownership
+    // boundary. The returned layout remains stable if the CWD later changes.
+    [[nodiscard]] StorageLayout anchored() const;
 
     [[nodiscard]] std::filesystem::path shardDir(unsigned shard) const;
     [[nodiscard]] std::filesystem::path shardStagingDir(unsigned shard) const;

@@ -3,11 +3,11 @@
 #include "../../seastar_gtest.hpp"
 
 #include <gtest/gtest.h>
-#include <seastar/core/coroutine.hh>
 
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <seastar/core/coroutine.hh>
 #include <string>
 
 using namespace timestar::index;
@@ -15,16 +15,16 @@ using namespace timestar::index;
 class ManifestTest : public ::testing::Test {
 public:
     void SetUp() override {
-        dir_ = std::filesystem::temp_directory_path() / "timestar_manifest_test";
-        std::filesystem::remove_all(dir_);
+        std::filesystem::remove_all(layout_.root());
         std::filesystem::create_directories(dir_);
     }
-    void TearDown() override { std::filesystem::remove_all(dir_); }
-    std::string dir_;
+    void TearDown() override { std::filesystem::remove_all(layout_.root()); }
+    const timestar::StorageLayout layout_{std::filesystem::temp_directory_path() / "timestar_manifest_test"};
+    const std::string dir_ = layout_.nativeIndexDir(0).string();
 };
 
 SEASTAR_TEST_F(ManifestTest, OpenAndClose) {
-    auto m = co_await Manifest::open(self->dir_);
+    auto m = co_await Manifest::open(self->layout_, 0);
     EXPECT_TRUE(m.files().empty());
     EXPECT_EQ(m.currentFileNumber(), 1u);
     co_await m.close();
@@ -32,7 +32,7 @@ SEASTAR_TEST_F(ManifestTest, OpenAndClose) {
 
 SEASTAR_TEST_F(ManifestTest, AddAndRecover) {
     {
-        auto m = co_await Manifest::open(self->dir_);
+        auto m = co_await Manifest::open(self->layout_, 0);
         SSTableMetadata f1;
         f1.fileNumber = m.nextFileNumber();
         f1.level = 0;
@@ -57,7 +57,7 @@ SEASTAR_TEST_F(ManifestTest, AddAndRecover) {
 
     // Reopen and verify recovery
     {
-        auto m = co_await Manifest::open(self->dir_);
+        auto m = co_await Manifest::open(self->layout_, 0);
         EXPECT_EQ(m.files().size(), 2u);
         EXPECT_EQ(m.files()[0].fileNumber, 1u);
         EXPECT_EQ(m.files()[0].minKey, "aaa");
@@ -70,7 +70,7 @@ SEASTAR_TEST_F(ManifestTest, AddAndRecover) {
 
 SEASTAR_TEST_F(ManifestTest, RemoveAndRecover) {
     {
-        auto m = co_await Manifest::open(self->dir_);
+        auto m = co_await Manifest::open(self->layout_, 0);
         SSTableMetadata f1;
         f1.fileNumber = m.nextFileNumber();
         f1.level = 0;
@@ -92,7 +92,7 @@ SEASTAR_TEST_F(ManifestTest, RemoveAndRecover) {
     }
 
     {
-        auto m = co_await Manifest::open(self->dir_);
+        auto m = co_await Manifest::open(self->layout_, 0);
         EXPECT_EQ(m.files().size(), 1u);
         EXPECT_EQ(m.files()[0].fileNumber, 2u);
         co_await m.close();
@@ -100,7 +100,7 @@ SEASTAR_TEST_F(ManifestTest, RemoveAndRecover) {
 }
 
 SEASTAR_TEST_F(ManifestTest, SnapshotCompaction) {
-    auto m = co_await Manifest::open(self->dir_);
+    auto m = co_await Manifest::open(self->layout_, 0);
 
     for (int i = 0; i < 10; ++i) {
         SSTableMetadata f;
@@ -120,13 +120,13 @@ SEASTAR_TEST_F(ManifestTest, SnapshotCompaction) {
     co_await m.close();
 
     // Reopen and verify
-    auto m2 = co_await Manifest::open(self->dir_);
+    auto m2 = co_await Manifest::open(self->layout_, 0);
     EXPECT_EQ(m2.files().size(), 10u);
     co_await m2.close();
 }
 
 SEASTAR_TEST_F(ManifestTest, FilesAtLevel) {
-    auto m = co_await Manifest::open(self->dir_);
+    auto m = co_await Manifest::open(self->layout_, 0);
 
     for (int level = 0; level < 3; ++level) {
         for (int i = 0; i < 3; ++i) {
@@ -188,7 +188,7 @@ void writeWholeFile(const std::string& path, const std::string& data) {
 // keeping everything recovered before it (same policy as WAL replay).
 SEASTAR_TEST_F(ManifestTest, CorruptRecordCRCStopsRecovery) {
     {
-        auto m = co_await Manifest::open(self->dir_);
+        auto m = co_await Manifest::open(self->layout_, 0);
         SSTableMetadata f1;
         f1.fileNumber = m.nextFileNumber();
         f1.level = 0;
@@ -215,7 +215,7 @@ SEASTAR_TEST_F(ManifestTest, CorruptRecordCRCStopsRecovery) {
     writeWholeFile(path, data);
 
     {
-        auto m = co_await Manifest::open(self->dir_);
+        auto m = co_await Manifest::open(self->layout_, 0);
         EXPECT_EQ(m.files().size(), 1u) << "recovery must stop at the corrupt record";
         if (m.files().size() == 1) {
             EXPECT_EQ(m.files()[0].fileNumber, 1u);
@@ -227,7 +227,7 @@ SEASTAR_TEST_F(ManifestTest, CorruptRecordCRCStopsRecovery) {
     // open() must have rewritten a clean snapshot: reopening again succeeds
     // with the same state and new appends are recoverable.
     {
-        auto m = co_await Manifest::open(self->dir_);
+        auto m = co_await Manifest::open(self->layout_, 0);
         EXPECT_EQ(m.files().size(), 1u);
         SSTableMetadata f3;
         f3.fileNumber = m.nextFileNumber();
@@ -236,7 +236,7 @@ SEASTAR_TEST_F(ManifestTest, CorruptRecordCRCStopsRecovery) {
         co_await m.close();
     }
     {
-        auto m = co_await Manifest::open(self->dir_);
+        auto m = co_await Manifest::open(self->layout_, 0);
         EXPECT_EQ(m.files().size(), 2u);
         co_await m.close();
     }
@@ -255,10 +255,10 @@ SEASTAR_TEST_F(ManifestTest, LegacyFormatBackwardCompat) {
     appendLE64(record, 12345);               // fileSize
     appendLE64(record, 678);                 // entryCount
     appendLE32(record, 3);
-    record.append("abc");                    // minKey
+    record.append("abc");  // minKey
     appendLE32(record, 3);
-    record.append("xyz");                    // maxKey
-    appendLE64(record, 999999);              // writeTimestamp
+    record.append("xyz");        // maxKey
+    appendLE64(record, 999999);  // writeTimestamp
 
     std::string file;
     appendLE32(file, static_cast<uint32_t>(record.size()));  // legacy frame: no CRC
@@ -268,7 +268,7 @@ SEASTAR_TEST_F(ManifestTest, LegacyFormatBackwardCompat) {
     writeWholeFile(path, file);
 
     {
-        auto m = co_await Manifest::open(self->dir_);
+        auto m = co_await Manifest::open(self->layout_, 0);
         EXPECT_EQ(m.files().size(), 1u);
         if (m.files().size() != 1) {
             co_await m.close();
@@ -292,7 +292,7 @@ SEASTAR_TEST_F(ManifestTest, LegacyFormatBackwardCompat) {
 
     // And it must still recover the same state through the v2 path.
     {
-        auto m = co_await Manifest::open(self->dir_);
+        auto m = co_await Manifest::open(self->layout_, 0);
         EXPECT_EQ(m.files().size(), 1u);
         if (m.files().size() == 1) {
             EXPECT_EQ(m.files()[0].fileNumber, 7u);
@@ -306,7 +306,7 @@ SEASTAR_TEST_F(ManifestTest, LegacyFormatBackwardCompat) {
 // preceding records, and the manifest must be rewritten clean.
 SEASTAR_TEST_F(ManifestTest, TornTailDiscardedOnRecovery) {
     {
-        auto m = co_await Manifest::open(self->dir_);
+        auto m = co_await Manifest::open(self->layout_, 0);
         SSTableMetadata f1;
         f1.fileNumber = m.nextFileNumber();
         f1.level = 0;
@@ -320,13 +320,13 @@ SEASTAR_TEST_F(ManifestTest, TornTailDiscardedOnRecovery) {
     auto path = self->dir_ + "/MANIFEST";
     auto data = readWholeFile(path);
     std::string torn;
-    appendLE32(torn, 1000);       // record_len
-    appendLE32(torn, 0xDEADBEEF); // record_crc
-    torn.append("partial");       // far fewer than 1000 bytes
+    appendLE32(torn, 1000);        // record_len
+    appendLE32(torn, 0xDEADBEEF);  // record_crc
+    torn.append("partial");        // far fewer than 1000 bytes
     writeWholeFile(path, data + torn);
 
     {
-        auto m = co_await Manifest::open(self->dir_);
+        auto m = co_await Manifest::open(self->layout_, 0);
         EXPECT_EQ(m.files().size(), 1u);
         if (m.files().size() == 1) {
             EXPECT_EQ(m.files()[0].fileNumber, 1u);
@@ -336,7 +336,7 @@ SEASTAR_TEST_F(ManifestTest, TornTailDiscardedOnRecovery) {
 
     // Clean after rewrite: no torn bytes remain, state survives reopen.
     {
-        auto m = co_await Manifest::open(self->dir_);
+        auto m = co_await Manifest::open(self->layout_, 0);
         EXPECT_EQ(m.files().size(), 1u);
         co_await m.close();
     }

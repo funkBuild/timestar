@@ -3,12 +3,14 @@
 #include "../../seastar_gtest.hpp"
 
 #include <gtest/gtest.h>
-#include <seastar/core/coroutine.hh>
 
 #include <cstdint>
 #include <filesystem>
+#include <seastar/core/coroutine.hh>
 
 using namespace timestar::index;
+
+static const timestar::StorageLayout kCrcWalLayout("test_wal_crc32c");
 
 // =============================================================================
 // CRC32C polynomial consistency tests.
@@ -40,8 +42,8 @@ static uint32_t referenceCrc32c(const char* data, size_t len) {
 
 class IndexWalCrc32cTest : public ::testing::Test {
 protected:
-    void SetUp() override { std::filesystem::remove_all("test_wal_crc32c"); }
-    void TearDown() override { std::filesystem::remove_all("test_wal_crc32c"); }
+    void SetUp() override { std::filesystem::remove_all(kCrcWalLayout.root()); }
+    void TearDown() override { std::filesystem::remove_all(kCrcWalLayout.root()); }
 };
 
 // Verify the reference CRC32C produces the RFC 3720 test vector
@@ -58,7 +60,7 @@ SEASTAR_TEST_F(IndexWalCrc32cTest, WalRoundtripVerifiesCrc32c) {
 
     // Write a batch
     {
-        auto wal = co_await IndexWAL::open("test_wal_crc32c");
+        auto wal = co_await IndexWAL::open(kCrcWalLayout, 0);
         IndexWriteBatch batch;
         batch.put("test_key_1", "value_1");
         batch.put("test_key_2", "value_2");
@@ -68,7 +70,7 @@ SEASTAR_TEST_F(IndexWalCrc32cTest, WalRoundtripVerifiesCrc32c) {
 
     // Replay and verify entries survived the CRC check
     {
-        auto wal = co_await IndexWAL::open("test_wal_crc32c");
+        auto wal = co_await IndexWAL::open(kCrcWalLayout, 0);
         MemTable mt;
         auto count = co_await wal.replay(mt);
 
@@ -77,11 +79,13 @@ SEASTAR_TEST_F(IndexWalCrc32cTest, WalRoundtripVerifiesCrc32c) {
 
         auto v1 = mt.get("test_key_1");
         EXPECT_TRUE(v1.has_value());
-        if (v1.has_value()) EXPECT_EQ(*v1, "value_1");
+        if (v1.has_value())
+            EXPECT_EQ(*v1, "value_1");
 
         auto v2 = mt.get("test_key_2");
         EXPECT_TRUE(v2.has_value());
-        if (v2.has_value()) EXPECT_EQ(*v2, "value_2");
+        if (v2.has_value())
+            EXPECT_EQ(*v2, "value_2");
 
         co_await wal.close();
     }
@@ -100,8 +104,7 @@ TEST_F(IndexWalCrc32cTest, SoftwareFallbackUsesCrc32cPolynomial) {
     }
 
     // The CRC32C Castagnoli reflected polynomial is 0x82F63B78
-    EXPECT_NE(src.find("0x82F63B78"), std::string::npos)
-        << "Software fallback must use CRC32C polynomial 0x82F63B78";
+    EXPECT_NE(src.find("0x82F63B78"), std::string::npos) << "Software fallback must use CRC32C polynomial 0x82F63B78";
 
     // The old zlib polynomial must NOT be present
     EXPECT_EQ(src.find("0xEDB88320"), std::string::npos)
