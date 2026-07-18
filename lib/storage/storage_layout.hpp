@@ -1,0 +1,77 @@
+#pragma once
+
+#include <cstdint>
+#include <filesystem>
+#include <string_view>
+
+namespace timestar {
+
+// Immutable, lexical authority for every path in the current shard_N storage
+// format. It performs no filesystem I/O and does not read global configuration.
+class StorageLayout final {
+public:
+    explicit StorageLayout(std::filesystem::path root);
+
+    [[nodiscard]] const std::filesystem::path& root() const noexcept { return root_; }
+
+    [[nodiscard]] std::filesystem::path shardDir(unsigned shard) const;
+    [[nodiscard]] std::filesystem::path shardStagingDir(unsigned shard) const;
+    [[nodiscard]] std::filesystem::path shardStagingTsmDir(unsigned shard) const;
+    [[nodiscard]] std::filesystem::path shardStagingNativeIndexDir(unsigned shard) const;
+    [[nodiscard]] std::filesystem::path shardRetiredDir(unsigned shard) const;
+
+    [[nodiscard]] std::filesystem::path walFile(unsigned shard, uint64_t sequence) const;
+    [[nodiscard]] std::filesystem::path tsmDir(unsigned shard) const;
+    [[nodiscard]] std::filesystem::path tsmFile(unsigned shard, const std::filesystem::path& filename) const;
+    [[nodiscard]] std::filesystem::path tsmTombstoneFile(unsigned shard,
+                                                         const std::filesystem::path& tsmFilename) const;
+    [[nodiscard]] std::filesystem::path tsmFile(unsigned shard, uint64_t tier, uint64_t sequence) const;
+    [[nodiscard]] std::filesystem::path tsmTemporaryFile(unsigned shard, uint64_t tier, uint64_t sequence) const;
+    [[nodiscard]] std::filesystem::path tsmTombstoneFile(unsigned shard, uint64_t tier, uint64_t sequence) const;
+    [[nodiscard]] std::filesystem::path compactedTsmFile(unsigned shard, uint64_t tier, uint64_t sequence,
+                                                         uint64_t dataSequence) const;
+    [[nodiscard]] std::filesystem::path compactedTsmTemporaryFile(unsigned shard, uint64_t tier, uint64_t sequence,
+                                                                  uint64_t dataSequence) const;
+    [[nodiscard]] std::filesystem::path compactedTsmTombstoneFile(unsigned shard, uint64_t tier, uint64_t sequence,
+                                                                  uint64_t dataSequence) const;
+
+    // Legacy CPU-shard rebalance paths. Basename overloads are deliberately
+    // restricted to one .tsm filename so callers cannot escape the layout root.
+    [[nodiscard]] std::filesystem::path shardStagingTsmFile(unsigned shard,
+                                                            const std::filesystem::path& filename) const;
+    [[nodiscard]] std::filesystem::path shardStagingTombstoneFile(unsigned shard,
+                                                                  const std::filesystem::path& tsmFilename) const;
+    [[nodiscard]] std::filesystem::path rebalanceWalTsmFile(unsigned targetShard, unsigned sourceShard,
+                                                            std::string_view walStem) const;
+    [[nodiscard]] std::filesystem::path rebalanceCollisionTsmFile(unsigned targetShard, uint64_t sequence) const;
+    [[nodiscard]] std::filesystem::path rebalanceSplitTsmFile(unsigned targetShard, uint64_t sequence) const;
+
+    [[nodiscard]] std::filesystem::path nativeIndexDir(unsigned shard) const;
+    [[nodiscard]] std::filesystem::path nativeManifestFile(unsigned shard) const;
+    [[nodiscard]] std::filesystem::path nativeManifestTemporaryFile(unsigned shard) const;
+    [[nodiscard]] std::filesystem::path nativeWalDir(unsigned shard) const;
+    [[nodiscard]] std::filesystem::path nativeWalFile(unsigned shard, uint64_t generation) const;
+    [[nodiscard]] std::filesystem::path nativeSstableFile(unsigned shard, uint64_t fileNumber) const;
+
+    [[nodiscard]] std::filesystem::path placementFile() const;
+    [[nodiscard]] std::filesystem::path shardCountMetadataFile() const;
+    [[nodiscard]] std::filesystem::path shardCountMetadataTemporaryFile() const;
+    [[nodiscard]] std::filesystem::path rebalanceStateFile() const;
+    [[nodiscard]] std::filesystem::path rebalanceStateTemporaryFile() const;
+
+    friend bool operator==(const StorageLayout& lhs, const StorageLayout& rhs) noexcept {
+        return lhs.root_ == rhs.root_;
+    }
+
+private:
+    [[nodiscard]] static std::filesystem::path normalizeRoot(std::filesystem::path root);
+    [[nodiscard]] std::filesystem::path underRoot(const std::filesystem::path& relative) const;
+    [[nodiscard]] static std::filesystem::path withSuffix(const std::filesystem::path& path, const char* suffix);
+    [[nodiscard]] static std::filesystem::path withExtension(const std::filesystem::path& path, const char* extension);
+    [[nodiscard]] static std::filesystem::path requireTsmFilename(const std::filesystem::path& filename);
+    [[nodiscard]] static std::string requireFilenameSegment(std::string_view segment, std::string_view field);
+
+    const std::filesystem::path root_;
+};
+
+}  // namespace timestar
