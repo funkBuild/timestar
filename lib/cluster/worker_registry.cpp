@@ -4,6 +4,8 @@
 
 #include <glaze/json.hpp>
 
+#include <xxhash.h>
+
 #include <algorithm>
 #include <cstdint>
 #include <limits>
@@ -137,9 +139,22 @@ WorkerRegistry fromJsonModel(const WorkerRegistryJson& json) {
     throw std::invalid_argument(std::string("invalid worker registry transition: ") + reason);
 }
 
+std::string encodeValidatedWorkerRegistryJson(const WorkerRegistry& registry) {
+    auto encoded = glz::write_json(toJsonModel(registry));
+    if (!encoded)
+        throw std::runtime_error("failed to encode worker registry JSON");
+    return *encoded;
+}
+
+WorkerRegistryFingerprint fingerprintValidatedWorkerRegistry(const WorkerRegistry& registry) {
+    const auto canonical = encodeValidatedWorkerRegistryJson(registry);
+    const auto fingerprint = XXH3_128bits(canonical.data(), canonical.size());
+    return {.low64 = fingerprint.low64, .high64 = fingerprint.high64};
+}
+
 }  // namespace
 
-void validateWorkerRegistry(const WorkerRegistry& registry) {
+ValidatedWorkerRegistryPlacement validateWorkerRegistryForPlacement(const WorkerRegistry& registry) {
     if (registry.formatVersion != WORKER_REGISTRY_FORMAT_VERSION)
         throw std::invalid_argument("unsupported worker registry format version");
     if (registry.localPlacementAlgorithmVersion != LOCAL_PLACEMENT_ALGORITHM_VERSION)
@@ -163,7 +178,12 @@ void validateWorkerRegistry(const WorkerRegistry& registry) {
     // This intentionally centralizes every Task 1 invariant, including ticket
     // limits, lifecycle values, an active worker, and non-zero VShard ownership
     // at the fixed placement granularity.
-    (void)DesiredLocalVShardPlacement::build(registry.workers);
+    return {.desiredPlacement = DesiredLocalVShardPlacement::build(registry.workers),
+            .fingerprint = fingerprintValidatedWorkerRegistry(registry)};
+}
+
+void validateWorkerRegistry(const WorkerRegistry& registry) {
+    (void)validateWorkerRegistryForPlacement(registry);
 }
 
 WorkerRegistry createWorkerRegistry(unsigned activeWorkerCount) {
@@ -280,10 +300,11 @@ WorkerRegistry reconcileWorkerRegistry(const WorkerRegistry& current, unsigned r
 
 std::string encodeWorkerRegistryJson(const WorkerRegistry& registry) {
     validateWorkerRegistry(registry);
-    auto encoded = glz::write_json(toJsonModel(registry));
-    if (!encoded)
-        throw std::runtime_error("failed to encode worker registry JSON");
-    return *encoded;
+    return encodeValidatedWorkerRegistryJson(registry);
+}
+
+WorkerRegistryFingerprint fingerprintWorkerRegistry(const WorkerRegistry& registry) {
+    return validateWorkerRegistryForPlacement(registry).fingerprint;
 }
 
 WorkerRegistry decodeWorkerRegistryJson(std::string_view json) {

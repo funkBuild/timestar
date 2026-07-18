@@ -1,6 +1,6 @@
 # Stable VShards and Local Storage Workers
 
-**Status:** Tasks 1, 2a, and 2b complete on `cluster-design`; Task 3 next
+**Status:** Tasks 1, 2a, 2b, and 3a complete on `cluster-design`; Task 3b next
 
 **Parent design:** [Cluster Architecture and Implementation Plan](clustering.md)
 
@@ -151,6 +151,49 @@ data unreachable.
 
 Gate: fault injection cannot produce two serving owners or an ownerless
 acknowledged generation.
+
+Task 3a implements the pure ownership state machine and codec, still
+disconnected from filesystem storage and live Engine routing:
+
+- An immutable `EffectiveVShardTarget` owns the exact accepted worker-registry
+  snapshot, its generation, and a 128-bit XXH3 fingerprint of its canonical
+  encoding. It calculates the 4,096-entry desired placement once, rather than
+  rebuilding rendezvous scores for every handoff.
+- The effective layout stores a monotonic layout revision, target registry
+  generation and fingerprint, and one `(owner, ownership generation)` entry per
+  VShard. The target names desired intent being reconciled; it does not claim
+  convergence. A registry target may jump forward across skipped intent while
+  old effective owners remain recorded.
+- One changed revision is either witness-only, without changing any ownership
+  generation, or changes exactly one mismatched owner to the current desired
+  Active worker and increments only that VShard generation. Impossible history
+  is rejected when an entry generation exceeds the layout revision or the sum
+  of ownership changes exceeds the available revision history.
+- Task 3a deliberately exposes no runtime authorizer or publication API. It
+  freezes the `(VShard, generation, owner)` fence data shape, but a raw decoded,
+  cached, or speculative layout cannot mint an accepted fence or authorize
+  work. Non-copyability alone would not prove uniqueness because callers could
+  construct two independent authorities from old and new snapshots.
+- Format v1 is a fixed 49,212-byte binary with frozen magic, explicit
+  little-endian header and entry fields, exactly 4,096 implicit/index-ordered
+  entries, exact-length/canonical re-encoding, and a trailing CRC-32/ISO-HDLC.
+  The CRC detects corruption; the registry fingerprint binds cross-file state;
+  neither supplies authenticity or detects coordinated whole-root rollback.
+
+The pure transition is only a proposal. It does not prove that an operation
+admitted under the old fence has finished, nor that the destination is ready.
+Task 5 must prepare the destination without serving requests; quiesce and drain
+reads, writes, deletes, compaction, retention, and all other background work at
+the prior fence; durably commit the ownership revision; publish it through the
+single current authority; activate the destination; and only then acknowledge
+the cutover. Task 3b/5 must make that authority root-bound and shared by every
+handle, with private construction requiring opaque accepted durable-state and
+quiesced-prior-fence capabilities. Task 3b must also allow generation-one
+creation only on a provably fresh root (or explicit migration), fail closed if
+authoritative ownership state unexpectedly disappears, serialize
+registry/layout updates, and reject same-revision divergence during crash
+recovery. Those rules prevent local fence ABA; a coordinated whole-root
+rollback still needs a future external epoch witness.
 
 ### Task 4: Complete VShard storage boundary
 
