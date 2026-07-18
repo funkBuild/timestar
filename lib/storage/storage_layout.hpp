@@ -7,8 +7,8 @@
 
 namespace timestar {
 
-// Immutable, lexical authority for every path in the current shard_N storage
-// format. It performs no filesystem I/O and does not read global configuration.
+// Immutable, lexical authority for every legacy shard_N and stable VShard
+// storage path. It performs no filesystem I/O and reads no global configuration.
 class StorageLayout final {
 public:
     explicit StorageLayout(std::filesystem::path root);
@@ -62,6 +62,16 @@ public:
     [[nodiscard]] std::filesystem::path placementFile() const;
     [[nodiscard]] std::filesystem::path workerRegistryFile() const;
     [[nodiscard]] std::filesystem::path workerRegistryTemporaryFile() const;
+    [[nodiscard]] std::filesystem::path vshardDataDir() const;
+    [[nodiscard]] std::filesystem::path vshardDir(uint16_t vshard) const;
+    [[nodiscard]] std::optional<uint16_t> parseVShardDirName(std::string_view name) const;
+    [[nodiscard]] std::filesystem::path effectiveVShardOwnershipDir() const;
+    [[nodiscard]] std::filesystem::path effectiveVShardOwnershipRevisionFile(uint64_t revision) const;
+    [[nodiscard]] std::filesystem::path effectiveVShardOwnershipRevisionTemporaryFile(uint64_t revision) const;
+    [[nodiscard]] std::optional<uint64_t> parseEffectiveVShardOwnershipRevisionFilename(std::string_view name) const;
+    [[nodiscard]] std::filesystem::path effectiveVShardOwnershipManifestFile() const;
+    [[nodiscard]] std::filesystem::path effectiveVShardOwnershipManifestTemporaryFile() const;
+    [[nodiscard]] std::filesystem::path effectiveVShardOwnershipInitializingMarkerFile() const;
     [[nodiscard]] std::filesystem::path shardCountMetadataFile() const;
     [[nodiscard]] std::filesystem::path shardCountMetadataTemporaryFile() const;
     [[nodiscard]] std::filesystem::path rebalanceStateFile() const;

@@ -1,6 +1,6 @@
 # Stable VShards and Local Storage Workers
 
-**Status:** Tasks 1, 2a, 2b, and 3a complete on `cluster-design`; Task 3b next
+**Status:** Tasks 1, 2a, 2b, 3a, and 3b1 complete on `cluster-design`; Task 3b2 next
 
 **Parent design:** [Cluster Architecture and Implementation Plan](clustering.md)
 
@@ -194,6 +194,30 @@ authoritative ownership state unexpectedly disappears, serialize
 registry/layout updates, and reject same-revision divergence during crash
 recovery. Those rules prevent local fence ABA; a coordinated whole-root
 rollback still needs a future external epoch witness.
+
+Task 3b is split at the persistence boundary. Task 3b1 freezes a
+rollback-detecting namespace before filesystem mutation is implemented:
+
+- VShard data directories use exactly `vshards/0000` through
+  `vshards/4095`. Ownership revisions are immutable files named
+  `vshard_ownership/owners.<20-digit-revision>.bin`; aliases, signs,
+  traversal, overflow, revision zero, and noncanonical padding are rejected.
+- The root-level `vshard_ownership.manifest` is the high-water witness. It
+  selects one immutable revision by exact revision, fixed byte size, and a
+  128-bit XXH3 digest of the canonical layout binary. Its own frozen binary
+  format has a corruption CRC. Replacing only the ownership directory with an
+  older snapshot therefore leaves the manifest pointing to a missing or
+  digest-mismatched revision and must fail closed.
+- Task 3b2 will atomically advance the root manifest only after the
+  new immutable revision is durable, and remove older revisions only after the
+  manifest is durable. Fresh initialization will require an opaque capability
+  bound to the locked root and an initializing record bound to the exact
+  generation-one worker registry. Registry recovery and ownership recovery
+  will share one metadata transaction serializer.
+
+The high-water manifest detects ownership-directory-only rollback. Coordinated
+rollback of both the root manifest and ownership namespace is still outside a
+local file format's evidence and requires a future external epoch witness.
 
 ### Task 4: Complete VShard storage boundary
 
