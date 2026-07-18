@@ -25,10 +25,13 @@
 
 namespace fs = std::filesystem;
 
-Engine::Engine() : index(seastar::this_shard_id()) {
-    shardId = seastar::this_shard_id();
+Engine::Engine()
+    : layout_(timestar::dataRootPath()),
+      shardId(seastar::this_shard_id()),
+      walFileManager(layout_, shardId),
+      index(shardId) {
     // Directory creation moved to init() to avoid blocking the reactor thread
-};
+}
 
 seastar::future<> Engine::init() {
     co_await createDirectoryStructure();
@@ -37,7 +40,7 @@ seastar::future<> Engine::init() {
     if (_schedulingGroupsCreated) {
         tsmFileManager.setCompactionGroup(_compactionGroup);
     }
-    co_await walFileManager.init(*this, tsmFileManager);
+    co_await walFileManager.init(tsmFileManager);
 
     // Register per-shard Prometheus metrics
     _metrics.setup(*this);
@@ -61,7 +64,7 @@ seastar::future<> Engine::createDirectoryStructure() {
 }
 
 std::string Engine::basePath() {
-    return timestar::shardDataPath(shardId);
+    return layout_.shardDir(shardId).string();
 }
 
 seastar::future<> Engine::stop() {

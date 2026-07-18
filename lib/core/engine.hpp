@@ -10,6 +10,7 @@
 #include "schema_update.hpp"
 #include "series_id.hpp"
 #include "shard_query.hpp"
+#include "storage_layout.hpp"
 #include "subscription_manager.hpp"
 #include "timestar_config.hpp"
 #include "timestar_value.hpp"
@@ -29,6 +30,8 @@
 
 class Engine {
 private:
+    const timestar::StorageLayout layout_;
+    const unsigned shardId;
     TSMFileManager tsmFileManager;
     WALFileManager walFileManager;
     timestar::index::NativeIndex index;
@@ -38,8 +41,6 @@ private:
     // Gate to block new inserts during shutdown. Closed early in stop() so
     // in-flight inserts finish but no new ones start.
     seastar::gate _insertGate;
-
-    unsigned shardId;
 
     // Back-reference to the sharded<Engine> container for cross-shard communication.
     // Used for schema broadcasts and cross-shard operations; metadata is indexed locally per-shard.

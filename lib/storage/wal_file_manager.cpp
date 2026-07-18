@@ -1,6 +1,5 @@
 #include "wal_file_manager.hpp"
 
-#include "engine.hpp"
 #include "logger.hpp"
 #include "logging_config.hpp"
 #include "series_id.hpp"
@@ -35,17 +34,16 @@ static std::optional<unsigned int> parseWalSeqNum(const std::string& path) {
     }
 }
 
-WALFileManager::WALFileManager() {
-    shardId = seastar::this_shard_id();
-}
+WALFileManager::WALFileManager(timestar::StorageLayout layout, unsigned workerId)
+    : layout_(std::move(layout)), shardId(workerId) {}
 
-seastar::future<> WALFileManager::init(Engine& engine, TSMFileManager& _tsmFileManager) {
+seastar::future<> WALFileManager::init(TSMFileManager& _tsmFileManager) {
     timestar::wal_log.info("WALFileManager::init starting for shard {}", shardId);
     tsmFileManager = &_tsmFileManager;
 
     // Search for existing WAL's
-    std::string path = engine.basePath() + '/';
-    timestar::wal_log.debug("Scanning for WAL files in {} on shard {}", path, shardId);
+    const auto path = layout_.shardDir(shardId);
+    timestar::wal_log.debug("Scanning for WAL files in {} on shard {}", path.string(), shardId);
 
     std::vector<std::string> walFiles;
 
@@ -56,7 +54,7 @@ seastar::future<> WALFileManager::init(Engine& engine, TSMFileManager& _tsmFileM
         if (fs::exists(path)) {
             for (const auto& entry : fs::directory_iterator(path)) {
                 if (endsWith(entry.path(), ".wal"))
-                    files.push_back(entry.path());
+                    files.push_back(entry.path().string());
             }
         }
         return files;
@@ -146,7 +144,7 @@ seastar::future<> WALFileManager::init(Engine& engine, TSMFileManager& _tsmFileM
         walSequenceInitialized_ = true;
 
         seastar::shared_ptr store = seastar::make_shared<MemoryStore>(currentWalSequenceNumber);
-        co_await store->initWAL();
+        co_await store->initWAL(layout_, shardId);
         memoryStores.push_back(store);
     }
 
@@ -318,7 +316,7 @@ seastar::future<> WALFileManager::rolloverMemoryStore() {
     // This ensures memoryStores[0] always points to an open store,
     // even if another insert coroutine runs during a co_await yield.
     auto store = seastar::make_shared<MemoryStore>(++currentWalSequenceNumber);
-    co_await store->initWAL();
+    co_await store->initWAL(layout_, shardId);
     memoryStores.insert(memoryStores.begin(), store);
 
     timestar::wal_log.info("New memory store {} created for shard {}", store->sequenceNumber, shardId);

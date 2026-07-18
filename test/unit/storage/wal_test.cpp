@@ -8,8 +8,11 @@
 
 #include <filesystem>
 #include <memory>
+#include <type_traits>
 
 namespace fs = std::filesystem;
+
+static const timestar::StorageLayout kDefaultWalTestLayout(".");
 
 class WALTest : public ::testing::Test {
 protected:
@@ -36,10 +39,17 @@ protected:
 };
 
 TEST_F(WALTest, SequenceNumberToFilename) {
-    EXPECT_EQ(WAL::sequenceNumberToFilename(1), "shard_0/0000000001.wal");
-    EXPECT_EQ(WAL::sequenceNumberToFilename(42), "shard_0/0000000042.wal");
-    EXPECT_EQ(WAL::sequenceNumberToFilename(999), "shard_0/0000000999.wal");
-    EXPECT_EQ(WAL::sequenceNumberToFilename(12345678), "shard_0/0012345678.wal");
+    EXPECT_EQ(WAL::sequenceNumberToFilename(kDefaultWalTestLayout, 0, 1), "shard_0/0000000001.wal");
+    EXPECT_EQ(WAL::sequenceNumberToFilename(kDefaultWalTestLayout, 0, 42), "shard_0/0000000042.wal");
+    EXPECT_EQ(WAL::sequenceNumberToFilename(kDefaultWalTestLayout, 0, 999), "shard_0/0000000999.wal");
+    EXPECT_EQ(WAL::sequenceNumberToFilename(kDefaultWalTestLayout, 0, 12345678), "shard_0/0012345678.wal");
+}
+
+TEST_F(WALTest, SequenceNumberToFilenameUsesInjectedRootAndWorker) {
+    const timestar::StorageLayout layout("tenant data/node-a");
+
+    EXPECT_EQ(WAL::sequenceNumberToFilename(layout, 7, 42), fs::path("tenant data/node-a/shard_7/0000000042.wal"));
+    static_assert(!std::is_constructible_v<WAL, unsigned int>);
 }
 
 // ---------------------------------------------------------------------------

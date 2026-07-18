@@ -11,6 +11,8 @@
 #include <seastar/core/thread.hh>
 #include <vector>
 
+static const timestar::StorageLayout kDefaultWalTestLayout(".");
+
 class WALBatchPerformanceTest : public ::testing::Test {
 protected:
     void SetUp() override {
@@ -33,7 +35,7 @@ TEST_F(WALBatchPerformanceTest, CompareSingleVsBatchInserts) {
 
         // Test 1: Single inserts with immediate flush (old behavior)
         {
-            WAL wal1(1000);
+            WAL wal1(kDefaultWalTestLayout, 0, 1000);
             MemoryStore store1(1000);
             wal1.init(&store1).get();
             wal1.setImmediateFlush(true);  // Old behavior
@@ -67,7 +69,7 @@ TEST_F(WALBatchPerformanceTest, CompareSingleVsBatchInserts) {
 
         // Test 2: Single inserts with batched flush (new behavior)
         {
-            WAL wal2(1001);
+            WAL wal2(kDefaultWalTestLayout, 0, 1001);
             MemoryStore store2(1001);
             wal2.init(&store2).get();
             wal2.setImmediateFlush(false);  // New behavior - batch flushes
@@ -106,7 +108,7 @@ TEST_F(WALBatchPerformanceTest, CompareSingleVsBatchInserts) {
 
         // Test 3: Batch inserts (new batch API)
         {
-            WAL wal3(1002);
+            WAL wal3(kDefaultWalTestLayout, 0, 1002);
             MemoryStore store3(1002);
             wal3.init(&store3).get();
 
@@ -163,7 +165,7 @@ TEST_F(WALBatchPerformanceTest, VerifyDataIntegrity) {
     seastar::async([]() {
         // Write data with batch API
         {
-            WAL wal(1003);
+            WAL wal(kDefaultWalTestLayout, 0, 1003);
             MemoryStore store(1003);
             wal.init(&store).get();
 
@@ -188,7 +190,7 @@ TEST_F(WALBatchPerformanceTest, VerifyDataIntegrity) {
         // Read back and verify
         {
             MemoryStore recoveredStore(1003);
-            WALReader reader(WAL::sequenceNumberToFilename(1003));
+            WALReader reader(WAL::sequenceNumberToFilename(kDefaultWalTestLayout, 0, 1003));
             reader.readAll(&recoveredStore).get();
 
             // Verify all series were recovered

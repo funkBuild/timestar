@@ -1,6 +1,7 @@
 #pragma once
 
 #include "memory_store.hpp"
+#include "storage_layout.hpp"
 #include "tsm_file_manager.hpp"
 
 #include <atomic>
@@ -36,7 +37,8 @@ struct MemoryStoreMatch {
 
 class WALFileManager {
 private:
-    int shardId;
+    const timestar::StorageLayout layout_;
+    const unsigned shardId;
     uint32_t currentWalSequenceNumber = 0;
     bool walSequenceInitialized_ = false;
     std::vector<seastar::shared_ptr<MemoryStore>> memoryStores;
@@ -46,9 +48,9 @@ private:
     seastar::semaphore _conversionSemaphore{1};  // Serialize background TSM conversions
 
 public:
-    WALFileManager();
+    WALFileManager(timestar::StorageLayout layout, unsigned workerId);
 
-    seastar::future<> init(Engine& engine, TSMFileManager& _tsmFileManager);
+    seastar::future<> init(TSMFileManager& _tsmFileManager);
     template <class T>
     seastar::future<> insert(TimeStarInsert<T>& insertRequest);
     template <class T>

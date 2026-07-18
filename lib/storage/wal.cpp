@@ -39,7 +39,8 @@ namespace fs = std::filesystem;
 
 // ------------------------ WAL ------------------------
 
-WAL::WAL(unsigned int _sequenceNumber) : sequenceNumber(_sequenceNumber) {}
+WAL::WAL(timestar::StorageLayout layout, unsigned shardId, unsigned int sequenceNumberValue)
+    : layout_(std::move(layout)), shardId_(shardId), sequenceNumber(sequenceNumberValue) {}
 
 WAL::~WAL() {
     if (!_closed) {
@@ -48,7 +49,7 @@ WAL::~WAL() {
 }
 
 seastar::future<> WAL::init(MemoryStore* /*store*/, bool isRecovery) {
-    std::string filename = sequenceNumberToFilename(sequenceNumber);
+    std::string filename = sequenceNumberToFilename(layout_, shardId_, sequenceNumber);
 
     // Ensure directory exists (blocking call, run off reactor thread)
     bool fileExisted = false;
@@ -134,12 +135,9 @@ seastar::future<> WAL::init(MemoryStore* /*store*/, bool isRecovery) {
     timestar::wal_log.debug("WAL stream init: pos={}, dma_alignment={}", currentSize, _dma_alignment);
 }
 
-std::string WAL::sequenceNumberToFilename(unsigned int sequenceNumber) {
-    std::string path = timestar::shardDataPath(seastar::this_shard_id()) + "/";
-    std::string sequenceNumStr = std::to_string(sequenceNumber);
-    size_t padLen = sequenceNumStr.length() >= 10 ? 0 : 10 - sequenceNumStr.length();
-    std::string filename = path + std::string(padLen, '0').append(sequenceNumStr).append(".wal");
-    return filename;
+std::string WAL::sequenceNumberToFilename(const timestar::StorageLayout& layout, unsigned shardId,
+                                          unsigned int sequenceNumber) {
+    return layout.walFile(shardId, sequenceNumber).string();
 }
 
 seastar::future<> WAL::finalFlush() {
@@ -222,7 +220,7 @@ seastar::future<> WAL::remove() {
     if (!_closed) {
         co_await close();
     }
-    std::string filename = WAL::sequenceNumberToFilename(sequenceNumber);
+    std::string filename = WAL::sequenceNumberToFilename(layout_, shardId_, sequenceNumber);
     co_await seastar::remove_file(filename);
 }
 
@@ -686,18 +684,6 @@ seastar::future<> WAL::deleteRange(const SeriesId128& seriesId, uint64_t startTi
                     "WAL deleteRange written: series={}, startTime={}, "
                     "endTime={}, size={} bytes",
                     seriesId.toHex(), startTime, endTime, n);
-}
-
-seastar::future<> WAL::remove(unsigned int sequenceNumber) {
-    std::string filename = WAL::sequenceNumberToFilename(sequenceNumber);
-
-    try {
-        co_await seastar::remove_file(filename);
-        timestar::wal_log.debug("WAL file {} deleted", filename);
-    } catch (const std::exception& e) {
-        // File may not exist; log but don't propagate
-        timestar::wal_log.debug("WAL file {} removal failed (may not exist): {}", filename, e.what());
-    }
 }
 
 // ------------------------ WALReader ------------------------

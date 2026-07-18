@@ -2,6 +2,7 @@
 
 #include "logger.hpp"
 #include "series_id.hpp"
+#include "storage_layout.hpp"
 #include "timestar_config.hpp"
 #include "timestar_value.hpp"
 #include "tsm.hpp"
@@ -133,7 +134,7 @@ public:
     }
     ~MemoryStore() { timestar::memory_log.debug("Memory store {} removed", sequenceNumber); }
 
-    seastar::future<> initWAL();
+    seastar::future<> initWAL(const timestar::StorageLayout& layout, unsigned shardId);
     seastar::future<> removeWAL();
     seastar::future<> initFromWAL(std::string filename);
     seastar::future<> close();

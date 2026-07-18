@@ -3,6 +3,7 @@
 #include "memory_store.hpp"
 #include "series_id.hpp"
 #include "slice_buffer.hpp"
+#include "storage_layout.hpp"
 #include "timestar_value.hpp"
 
 #include <chrono>
@@ -102,6 +103,8 @@ private:
     // WAL segment size limit — initialized from config in init()
     size_t maxWalSize_ = 16 * 1024 * 1024;  // default 16 MiB, overridden by config
     // Identity & file
+    const timestar::StorageLayout layout_;
+    const unsigned shardId_;
     unsigned int sequenceNumber;
     seastar::file walFile;
 
@@ -146,7 +149,7 @@ private:
     CompressionStats _compressionStats;
 
 public:
-    WAL(unsigned int _sequenceNumber);
+    WAL(timestar::StorageLayout layout, unsigned shardId, unsigned int sequenceNumberValue);
     ~WAL();  // Ensure caller invoked close()/finalFlush() before destruction
 
     seastar::future<> init(MemoryStore* store, bool isRecovery = false);
@@ -188,8 +191,8 @@ public:
     void setImmediateFlush(bool immediate) { requiresImmediateFlush = immediate; }
 
     // Utilities
-    static std::string sequenceNumberToFilename(unsigned int sequenceNumber);
-    static seastar::future<> remove(unsigned int sequenceNumber);
+    static std::string sequenceNumberToFilename(const timestar::StorageLayout& layout, unsigned shardId,
+                                                unsigned int sequenceNumber);
 };
 
 class WALReader {
