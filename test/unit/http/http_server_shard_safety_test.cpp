@@ -190,11 +190,10 @@ TEST_F(HttpServerShardSafetyTest, RegisterRoutesCalledInSetRoutes) {
     // r.add() calls.  Check that registerRoutes is called at least once per
     // handler, or that the endpoint URLs appear inline.
     bool hasRegisterRoutes = setRoutesBody.find("registerRoutes") != std::string::npos;
-    bool hasInlineRoutes = setRoutesBody.find("/write") != std::string::npos &&
-                           setRoutesBody.find("/query") != std::string::npos;
-    EXPECT_TRUE(hasRegisterRoutes || hasInlineRoutes)
-        << "set_routes must register routes for handlers either via "
-        << "registerRoutes() calls or inline r.add() calls.";
+    bool hasInlineRoutes =
+        setRoutesBody.find("/write") != std::string::npos && setRoutesBody.find("/query") != std::string::npos;
+    EXPECT_TRUE(hasRegisterRoutes || hasInlineRoutes) << "set_routes must register routes for handlers either via "
+                                                      << "registerRoutes() calls or inline r.add() calls.";
 }
 
 // ---------------------------------------------------------------------------
@@ -282,15 +281,14 @@ TEST_F(HttpServerShardSafetyTest, EngineStopGuardOnInitFailure) {
     ASSERT_FALSE(mainBody.empty()) << "Could not extract main function body";
 
     // g_engine.start() must be followed by a scope guard that calls stop()
-    auto startPos = mainBody.find("g_engine.start()");
-    ASSERT_NE(startPos, std::string::npos) << "g_engine.start() not found in main()";
+    auto startPos = mainBody.find("g_engine.start(storageLayout)");
+    ASSERT_NE(startPos, std::string::npos) << "g_engine.start(storageLayout) not found in main()";
 
     // Look for seastar::defer (the scope guard) after start()
     auto deferPos = mainBody.find("seastar::defer", startPos);
-    EXPECT_NE(deferPos, std::string::npos)
-        << "After g_engine.start(), a seastar::defer scope guard must ensure "
-        << "g_engine.stop() is called if initialization throws. "
-        << "Without this guard, Seastar's sharded<> destructor asserts.";
+    EXPECT_NE(deferPos, std::string::npos) << "After g_engine.start(), a seastar::defer scope guard must ensure "
+                                           << "g_engine.stop() is called if initialization throws. "
+                                           << "Without this guard, Seastar's sharded<> destructor asserts.";
 
     // The guard must call g_engine.stop() inside its lambda
     if (deferPos != std::string::npos) {

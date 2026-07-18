@@ -16,7 +16,7 @@ protected:
 
     void SetUp() override {
         cleanTestShardDirectories();
-        engine = std::make_unique<Engine>();
+        engine = std::make_unique<Engine>(timestar::StorageLayout("."));
 
         // Initialize engine in Seastar context
         seastar::async([this] { engine->init().get(); }).get();

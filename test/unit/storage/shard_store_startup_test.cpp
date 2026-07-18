@@ -142,6 +142,20 @@ std::string incrementDecimal(std::string value) {
     return value;
 }
 
+class CurrentPathGuard {
+public:
+    CurrentPathGuard() : original_(fs::current_path()) {}
+    ~CurrentPathGuard() {
+        std::error_code error;
+        fs::current_path(original_, error);
+    }
+
+    [[nodiscard]] const fs::path& original() const noexcept { return original_; }
+
+private:
+    fs::path original_;
+};
+
 class ShardStoreStartupTest : public ::testing::Test {
 protected:
     fs::path testDir;
@@ -182,7 +196,7 @@ protected:
     }
 
     void createCommittedStore(unsigned count) {
-        timestar::ShardStoreStartup startup(testDir);
+        timestar::ShardStoreStartup startup{timestar::StorageLayout(testDir)};
         auto lock = startup.acquireExclusiveLock();
         const auto fresh = startup.inspect(count, lock);
         ASSERT_EQ(fresh.status, timestar::ShardStoreStartupStatus::FreshStore);
@@ -192,7 +206,7 @@ protected:
 };
 
 TEST_F(ShardStoreStartupTest, FreshInspectionIsReadOnly) {
-    timestar::ShardStoreStartup startup(testDir);
+    timestar::ShardStoreStartup startup{timestar::StorageLayout(testDir)};
     auto lock = startup.acquireExclusiveLock();
 
     const auto result = startup.inspect(4, lock);
@@ -204,9 +218,34 @@ TEST_F(ShardStoreStartupTest, FreshInspectionIsReadOnly) {
     EXPECT_TRUE(fs::is_empty(testDir));
 }
 
+TEST_F(ShardStoreStartupTest, RelativeLayoutRemainsBoundToItsConstructionDirectory) {
+    const auto relativeRoot =
+        fs::path("shard startup relative root") /
+        (std::to_string(::getpid()) + "_" + ::testing::UnitTest::GetInstance()->current_test_info()->name());
+    fs::path expectedRoot;
+
+    {
+        CurrentPathGuard cwd;
+        expectedRoot = cwd.original() / relativeRoot;
+        fs::remove_all(expectedRoot);
+        fs::create_directories(testDir / "alternate cwd");
+
+        timestar::ShardStoreStartup startup{timestar::StorageLayout(relativeRoot)};
+        fs::current_path(testDir / "alternate cwd");
+        auto lock = startup.acquireExclusiveLock();
+        const auto result = startup.inspect(2, lock);
+
+        EXPECT_EQ(result.status, timestar::ShardStoreStartupStatus::FreshStore);
+        EXPECT_TRUE(fs::is_directory(expectedRoot));
+        EXPECT_FALSE(fs::exists(testDir / "alternate cwd" / relativeRoot));
+    }
+
+    fs::remove_all(expectedRoot);
+}
+
 TEST_F(ShardStoreStartupTest, LockCreatesMissingRootButInspectionCreatesNoStoreArtifacts) {
     fs::remove_all(testDir);
-    timestar::ShardStoreStartup startup(testDir);
+    timestar::ShardStoreStartup startup{timestar::StorageLayout(testDir)};
 
     auto lock = startup.acquireExclusiveLock();
     const auto result = startup.inspect(2, lock);
@@ -217,7 +256,7 @@ TEST_F(ShardStoreStartupTest, LockCreatesMissingRootButInspectionCreatesNoStoreA
 }
 
 TEST_F(ShardStoreStartupTest, ExclusiveRootLockRejectsASecondOwner) {
-    timestar::ShardStoreStartup startup(testDir);
+    timestar::ShardStoreStartup startup{timestar::StorageLayout(testDir)};
     auto first = startup.acquireExclusiveLock();
 
     EXPECT_THROW(
@@ -233,7 +272,7 @@ TEST_F(ShardStoreStartupTest, RootLockRejectsSymlinkedDataRoot) {
     fs::remove_all(testDir);
     fs::create_directories(realRoot);
     fs::create_directory_symlink(realRoot, testDir);
-    timestar::ShardStoreStartup startup(testDir);
+    timestar::ShardStoreStartup startup{timestar::StorageLayout(testDir)};
 
     EXPECT_THROW(
         {
@@ -247,7 +286,7 @@ TEST_F(ShardStoreStartupTest, RootLockRejectsSymlinkedDataRoot) {
 }
 
 TEST_F(ShardStoreStartupTest, InspectionRejectsAReplacedDataRootPath) {
-    timestar::ShardStoreStartup startup(testDir);
+    timestar::ShardStoreStartup startup{timestar::StorageLayout(testDir)};
     auto lock = startup.acquireExclusiveLock();
     const auto movedRoot = fs::path(testDir.string() + "_locked_inode");
     fs::remove_all(movedRoot);
@@ -264,7 +303,7 @@ TEST_F(ShardStoreStartupTest, InspectionRejectsAReplacedDataRootPath) {
 }
 
 TEST_F(ShardStoreStartupTest, FreshLayoutCommitsOnlyAfterCompleteShardStructureExists) {
-    timestar::ShardStoreStartup startup(testDir);
+    timestar::ShardStoreStartup startup{timestar::StorageLayout(testDir)};
     auto lock = startup.acquireExclusiveLock();
     const auto fresh = startup.inspect(2, lock);
     createCompleteShards(2);
@@ -277,7 +316,7 @@ TEST_F(ShardStoreStartupTest, FreshLayoutCommitsOnlyAfterCompleteShardStructureE
 }
 
 TEST_F(ShardStoreStartupTest, FreshCommitRejectsIncompleteEngineLayout) {
-    timestar::ShardStoreStartup startup(testDir);
+    timestar::ShardStoreStartup startup{timestar::StorageLayout(testDir)};
     auto lock = startup.acquireExclusiveLock();
     const auto fresh = startup.inspect(2, lock);
     fs::create_directories(testDir / "shard_0/tsm");
@@ -297,7 +336,7 @@ TEST_F(ShardStoreStartupTest, FreshCommitRejectsRebalanceStateInsertedAfterInspe
         SCOPED_TRACE(state);
         fs::remove_all(testDir);
         fs::create_directories(testDir);
-        timestar::ShardStoreStartup startup(testDir);
+        timestar::ShardStoreStartup startup{timestar::StorageLayout(testDir)};
         auto lock = startup.acquireExclusiveLock();
         const auto fresh = startup.inspect(2, lock);
         ASSERT_EQ(fresh.status, timestar::ShardStoreStartupStatus::FreshStore);
@@ -310,7 +349,7 @@ TEST_F(ShardStoreStartupTest, FreshCommitRejectsRebalanceStateInsertedAfterInspe
 }
 
 TEST_F(ShardStoreStartupTest, StartupSessionEnforcesInitializationCommitOrder) {
-    timestar::ShardStoreStartupSession session(testDir, 2);
+    timestar::ShardStoreStartupSession session(timestar::StorageLayout(testDir), 2);
     ASSERT_TRUE(session.canStart());
 
     EXPECT_THROW(session.commitEngineInitialization(), std::logic_error);
@@ -326,7 +365,7 @@ TEST_F(ShardStoreStartupTest, StartupSessionEnforcesInitializationCommitOrder) {
 }
 
 TEST_F(ShardStoreStartupTest, StartupSessionRevalidatesBeforeTheFirstMutation) {
-    timestar::ShardStoreStartupSession session(testDir, 2);
+    timestar::ShardStoreStartupSession session(timestar::StorageLayout(testDir), 2);
     ASSERT_TRUE(session.canStart());
     writeFile("shard_0.partial", "unexpected");
 
@@ -336,7 +375,7 @@ TEST_F(ShardStoreStartupTest, StartupSessionRevalidatesBeforeTheFirstMutation) {
 
 TEST_F(ShardStoreStartupTest, MatchingStoreCommitHookIsANoOp) {
     createCommittedStore(2);
-    timestar::ShardStoreStartup startup(testDir);
+    timestar::ShardStoreStartup startup{timestar::StorageLayout(testDir)};
     auto lock = startup.acquireExclusiveLock();
     const auto matching = startup.inspect(2, lock);
     ASSERT_EQ(matching.status, timestar::ShardStoreStartupStatus::MatchingShardCount);
@@ -362,7 +401,7 @@ TEST_F(ShardStoreStartupTest, MatchingStoreCommitRejectsRebalanceStateInsertedAf
         fs::remove_all(testDir);
         fs::create_directories(testDir);
         createCommittedStore(2);
-        timestar::ShardStoreStartupSession session(testDir, 2);
+        timestar::ShardStoreStartupSession session(timestar::StorageLayout(testDir), 2);
         ASSERT_TRUE(session.canStart());
         session.authorizeFirstStorageMutation();
         writeFile("rebalance.state", state);
@@ -374,7 +413,7 @@ TEST_F(ShardStoreStartupTest, MatchingStoreCommitRejectsRebalanceStateInsertedAf
 
 TEST_F(ShardStoreStartupTest, MatchingStoreCommitRejectsAReplacedDataRootPath) {
     createCommittedStore(1);
-    timestar::ShardStoreStartupSession session(testDir, 1);
+    timestar::ShardStoreStartupSession session(timestar::StorageLayout(testDir), 1);
     ASSERT_TRUE(session.canStart());
     session.authorizeFirstStorageMutation();
 
@@ -392,7 +431,7 @@ TEST_F(ShardStoreStartupTest, MatchingStoreCommitRejectsAReplacedDataRootPath) {
 
 TEST_F(ShardStoreStartupTest, UnsafeInspectionCannotBeCommitted) {
     createCommittedStore(2);
-    timestar::ShardStoreStartup startup(testDir);
+    timestar::ShardStoreStartup startup{timestar::StorageLayout(testDir)};
     auto lock = startup.acquireExclusiveLock();
     const auto mismatch = startup.inspect(4, lock);
 
@@ -401,7 +440,7 @@ TEST_F(ShardStoreStartupTest, UnsafeInspectionCannotBeCommitted) {
 
 TEST_F(ShardStoreStartupTest, PersistedMatchingCountAndStructureAreAccepted) {
     createCommittedStore(4);
-    timestar::ShardStoreStartup startup(testDir);
+    timestar::ShardStoreStartup startup{timestar::StorageLayout(testDir)};
 
     const auto result = inspect(startup, 4);
 
@@ -413,7 +452,7 @@ TEST_F(ShardStoreStartupTest, PersistedMatchingCountAndStructureAreAccepted) {
 TEST_F(ShardStoreStartupTest, CoreCountMismatchIsRejectedWithoutMutation) {
     createCommittedStore(2);
     writeFile("shard_0/tsm/sentinel.tsm", "unchanged-data");
-    timestar::ShardStoreStartup startup(testDir);
+    timestar::ShardStoreStartup startup{timestar::StorageLayout(testDir)};
 
     const auto result = inspect(startup, 4);
 
@@ -433,7 +472,7 @@ TEST_F(ShardStoreStartupTest, CoreCountMismatchIsRejectedWithoutMutation) {
 
 TEST_F(ShardStoreStartupTest, DirectoryOnlyStoreIsUncommittedNotMatching) {
     createCompleteShards(3);
-    timestar::ShardStoreStartup startup(testDir);
+    timestar::ShardStoreStartup startup{timestar::StorageLayout(testDir)};
 
     const auto result = inspect(startup, 3);
 
@@ -443,7 +482,7 @@ TEST_F(ShardStoreStartupTest, DirectoryOnlyStoreIsUncommittedNotMatching) {
 
 TEST_F(ShardStoreStartupTest, MetadataOnlyStoreIsIncompleteNotMatching) {
     writeFile("shard_count.meta", "3\n");
-    timestar::ShardStoreStartup startup(testDir);
+    timestar::ShardStoreStartup startup{timestar::StorageLayout(testDir)};
 
     const auto result = inspect(startup, 3);
 
@@ -456,7 +495,7 @@ TEST_F(ShardStoreStartupTest, MissingNativeIndexManifestIsIncomplete) {
     fs::create_directories(testDir / "shard_0/tsm");
     fs::create_directories(testDir / "shard_0/native_index");
     writeFile("shard_0/tsm/data.tsm", "data-needing-index");
-    timestar::ShardStoreStartup startup(testDir);
+    timestar::ShardStoreStartup startup{timestar::StorageLayout(testDir)};
 
     const auto result = inspect(startup, 1);
 
@@ -468,7 +507,7 @@ TEST_F(ShardStoreStartupTest, EmptyNativeIndexManifestIsIncomplete) {
     writeFile("shard_count.meta", "1\n");
     createCompleteShards(1);
     writeFile("shard_0/native_index/MANIFEST", "");
-    timestar::ShardStoreStartup startup(testDir);
+    timestar::ShardStoreStartup startup{timestar::StorageLayout(testDir)};
 
     const auto result = inspect(startup, 1);
 
@@ -480,7 +519,7 @@ TEST_F(ShardStoreStartupTest, RandomNativeIndexManifestIsIncomplete) {
     writeFile("shard_count.meta", "1\n");
     createCompleteShards(1);
     writeFile("shard_0/native_index/MANIFEST", "not-a-manifest");
-    timestar::ShardStoreStartup startup(testDir);
+    timestar::ShardStoreStartup startup{timestar::StorageLayout(testDir)};
 
     const auto result = inspect(startup, 1);
 
@@ -494,7 +533,7 @@ TEST_F(ShardStoreStartupTest, TruncatedNativeIndexManifestIsIncomplete) {
     auto manifest = emptyV2Manifest();
     manifest.pop_back();
     writeFile("shard_0/native_index/MANIFEST", manifest);
-    timestar::ShardStoreStartup startup(testDir);
+    timestar::ShardStoreStartup startup{timestar::StorageLayout(testDir)};
 
     const auto result = inspect(startup, 1);
 
@@ -508,7 +547,7 @@ TEST_F(ShardStoreStartupTest, UnsupportedNativeIndexManifestVersionIsIncomplete)
     auto manifest = emptyV2Manifest();
     manifest[4] = 99;
     writeFile("shard_0/native_index/MANIFEST", manifest);
-    timestar::ShardStoreStartup startup(testDir);
+    timestar::ShardStoreStartup startup{timestar::StorageLayout(testDir)};
 
     const auto result = inspect(startup, 1);
 
@@ -522,7 +561,7 @@ TEST_F(ShardStoreStartupTest, BadNativeIndexManifestCrcIsIncomplete) {
     auto manifest = emptyV2Manifest();
     manifest.back() ^= 0x5a;
     writeFile("shard_0/native_index/MANIFEST", manifest);
-    timestar::ShardStoreStartup startup(testDir);
+    timestar::ShardStoreStartup startup{timestar::StorageLayout(testDir)};
 
     const auto result = inspect(startup, 1);
 
@@ -559,7 +598,7 @@ TEST_F(ShardStoreStartupTest, CompleteLegacyNativeIndexManifestRemainsReadable) 
     writeFile("shard_count.meta", "1\n");
     createCompleteShards(1);
     writeFile("shard_0/native_index/MANIFEST", emptyLegacyManifest());
-    timestar::ShardStoreStartup startup(testDir);
+    timestar::ShardStoreStartup startup{timestar::StorageLayout(testDir)};
 
     const auto result = inspect(startup, 1);
 
@@ -608,7 +647,7 @@ TEST_F(ShardStoreStartupTest, HistoricalOneFileSnapshotCanStartACommittedStore) 
     createCompleteShards(1);
     writeFile("shard_0/native_index/MANIFEST", snapshotManifest(1, false, false));
     writeFile("shard_0/native_index/idx_000001.sst", std::string(3, 'x'));
-    timestar::ShardStoreStartup startup(testDir);
+    timestar::ShardStoreStartup startup{timestar::StorageLayout(testDir)};
 
     const auto result = inspect(startup, 1);
 
@@ -619,7 +658,7 @@ TEST_F(ShardStoreStartupTest, MissingManifestReferencedSstableIsIncomplete) {
     writeFile("shard_count.meta", "1\n");
     createCompleteShards(1);
     writeFile("shard_0/native_index/MANIFEST", v2ManifestReferencing(7, 123));
-    timestar::ShardStoreStartup startup(testDir);
+    timestar::ShardStoreStartup startup{timestar::StorageLayout(testDir)};
 
     const auto result = inspect(startup, 1);
 
@@ -633,7 +672,7 @@ TEST_F(ShardStoreStartupTest, ManifestReferencedSstableMustBeARegularFileOfTheCo
     createCompleteShards(1);
     writeFile("shard_0/native_index/MANIFEST", v2ManifestReferencing(7, 123));
     fs::create_directories(testDir / "shard_0/native_index/idx_000007.sst");
-    timestar::ShardStoreStartup startup(testDir);
+    timestar::ShardStoreStartup startup{timestar::StorageLayout(testDir)};
 
     auto result = inspect(startup, 1);
     EXPECT_EQ(result.status, timestar::ShardStoreStartupStatus::IncompleteStore);
@@ -647,7 +686,7 @@ TEST_F(ShardStoreStartupTest, ManifestReferencedSstableMustBeARegularFileOfTheCo
 }
 
 TEST_F(ShardStoreStartupTest, MalformedShardCountMetadataIsRejected) {
-    timestar::ShardStoreStartup startup(testDir);
+    timestar::ShardStoreStartup startup{timestar::StorageLayout(testDir)};
     const std::vector<std::string> invalidContents = {
         "",      "0\n",          "-1\n",
         "two\n", "2 trailing\n", incrementDecimal(std::to_string(std::numeric_limits<unsigned>::max())) + "\n",
@@ -664,7 +703,7 @@ TEST_F(ShardStoreStartupTest, MalformedShardCountMetadataIsRejected) {
 
 TEST_F(ShardStoreStartupTest, OversizedControlMetadataIsRejected) {
     writeFile("shard_count.meta", std::string(5000, '1'));
-    timestar::ShardStoreStartup startup(testDir);
+    timestar::ShardStoreStartup startup{timestar::StorageLayout(testDir)};
 
     const auto result = inspect(startup, 2);
 
@@ -675,7 +714,7 @@ TEST_F(ShardStoreStartupTest, OversizedControlMetadataIsRejected) {
 TEST_F(ShardStoreStartupTest, SymlinkedControlMetadataIsRejected) {
     writeFile("count-target", "2\n");
     fs::create_symlink(testDir / "count-target", testDir / "shard_count.meta");
-    timestar::ShardStoreStartup startup(testDir);
+    timestar::ShardStoreStartup startup{timestar::StorageLayout(testDir)};
 
     const auto result = inspect(startup, 2);
 
@@ -684,7 +723,7 @@ TEST_F(ShardStoreStartupTest, SymlinkedControlMetadataIsRejected) {
 }
 
 TEST_F(ShardStoreStartupTest, EveryLegacyRebalancePhaseBlocksStartup) {
-    timestar::ShardStoreStartup startup(testDir);
+    timestar::ShardStoreStartup startup{timestar::StorageLayout(testDir)};
     const std::vector<std::string> states = {
         "0 0 0\n",
         "1 2 4\n",
@@ -702,7 +741,7 @@ TEST_F(ShardStoreStartupTest, EveryLegacyRebalancePhaseBlocksStartup) {
 }
 
 TEST_F(ShardStoreStartupTest, MalformedLegacyRebalanceStateIsInvalidMetadata) {
-    timestar::ShardStoreStartup startup(testDir);
+    timestar::ShardStoreStartup startup{timestar::StorageLayout(testDir)};
     const std::vector<std::string> states = {
         "", "1 2\n", "4 2 4\n", "1 zero 4\n", "1 2 4 trailing\n",
     };
@@ -733,7 +772,7 @@ TEST_F(ShardStoreStartupTest, OrphanedLegacyArtifactsBlockStartup) {
         else
             fs::create_directories(testDir / artifact);
 
-        timestar::ShardStoreStartup startup(testDir);
+        timestar::ShardStoreStartup startup{timestar::StorageLayout(testDir)};
         const auto result = inspect(startup, 2);
         EXPECT_EQ(result.status, timestar::ShardStoreStartupStatus::InterruptedLegacyRebalance);
         EXPECT_FALSE(result.canStart());
@@ -751,7 +790,7 @@ TEST_F(ShardStoreStartupTest, UnknownReservedArtifactsAreRejected) {
         fs::create_directories(testDir);
         writeFile(artifact, "stranded");
 
-        timestar::ShardStoreStartup startup(testDir);
+        timestar::ShardStoreStartup startup{timestar::StorageLayout(testDir)};
         const auto result = inspect(startup, 2);
         EXPECT_EQ(result.status, timestar::ShardStoreStartupStatus::InvalidMetadata);
         EXPECT_NE(result.detail.find(artifact.string()), std::string::npos);
@@ -761,7 +800,7 @@ TEST_F(ShardStoreStartupTest, UnknownReservedArtifactsAreRejected) {
 TEST_F(ShardStoreStartupTest, SparseShardDirectoriesAreInvalid) {
     fs::create_directories(testDir / "shard_0/tsm");
     fs::create_directories(testDir / "shard_2/tsm");
-    timestar::ShardStoreStartup startup(testDir);
+    timestar::ShardStoreStartup startup{timestar::StorageLayout(testDir)};
 
     const auto result = inspect(startup, 3);
 
@@ -771,7 +810,7 @@ TEST_F(ShardStoreStartupTest, SparseShardDirectoriesAreInvalid) {
 
 TEST_F(ShardStoreStartupTest, NonCanonicalShardDirectoryIsInvalid) {
     fs::create_directories(testDir / "shard_00/tsm");
-    timestar::ShardStoreStartup startup(testDir);
+    timestar::ShardStoreStartup startup{timestar::StorageLayout(testDir)};
 
     const auto result = inspect(startup, 1);
 
@@ -784,7 +823,7 @@ TEST_F(ShardStoreStartupTest, SymlinkedShardDirectoryIsInvalid) {
     fs::rename(testDir / "shard_0", testDir / "real-shard");
     fs::create_directory_symlink(testDir / "real-shard", testDir / "shard_0");
     writeFile("shard_count.meta", "1\n");
-    timestar::ShardStoreStartup startup(testDir);
+    timestar::ShardStoreStartup startup{timestar::StorageLayout(testDir)};
 
     const auto result = inspect(startup, 1);
 
@@ -794,7 +833,7 @@ TEST_F(ShardStoreStartupTest, SymlinkedShardDirectoryIsInvalid) {
 
 TEST_F(ShardStoreStartupTest, ShardPathMustBeADirectory) {
     writeFile("shard_0", "not-a-directory");
-    timestar::ShardStoreStartup startup(testDir);
+    timestar::ShardStoreStartup startup{timestar::StorageLayout(testDir)};
 
     const auto result = inspect(startup, 1);
 
@@ -805,7 +844,7 @@ TEST_F(ShardStoreStartupTest, ShardPathMustBeADirectory) {
 TEST_F(ShardStoreStartupTest, MetadataMustAgreeWithActiveDirectories) {
     writeFile("shard_count.meta", "4\n");
     createCompleteShards(2);
-    timestar::ShardStoreStartup startup(testDir);
+    timestar::ShardStoreStartup startup{timestar::StorageLayout(testDir)};
 
     const auto result = inspect(startup, 4);
 
@@ -815,7 +854,7 @@ TEST_F(ShardStoreStartupTest, MetadataMustAgreeWithActiveDirectories) {
 }
 
 TEST_F(ShardStoreStartupTest, ZeroRequestedCountIsInvalid) {
-    timestar::ShardStoreStartup startup(testDir);
+    timestar::ShardStoreStartup startup{timestar::StorageLayout(testDir)};
 
     const auto result = inspect(startup, 0);
 
@@ -825,7 +864,7 @@ TEST_F(ShardStoreStartupTest, ZeroRequestedCountIsInvalid) {
 
 TEST_F(ShardStoreStartupTest, MismatchMessageNamesExactSafeCoreCount) {
     createCommittedStore(2);
-    timestar::ShardStoreStartup startup(testDir);
+    timestar::ShardStoreStartup startup{timestar::StorageLayout(testDir)};
     const auto result = inspect(startup, 4);
 
     const auto message = startup.failureMessage(result);
@@ -839,7 +878,7 @@ TEST_F(ShardStoreStartupTest, MismatchMessageNamesExactSafeCoreCount) {
 
 TEST_F(ShardStoreStartupTest, InvalidAndInterruptedMessagesDoNotClaimAnExistingTool) {
     writeFile("shard_count.meta", "broken");
-    timestar::ShardStoreStartup startup(testDir);
+    timestar::ShardStoreStartup startup{timestar::StorageLayout(testDir)};
     const auto invalid = inspect(startup, 2);
     const auto invalidMessage = startup.failureMessage(invalid);
     EXPECT_NE(invalidMessage.find("No automatic metadata repair or migration tool"), std::string::npos);
@@ -860,19 +899,22 @@ TEST_F(ShardStoreStartupTest, ServerUsesTheStatefulStartupSessionAroundEngineIni
     ASSERT_TRUE(source);
     const std::string text(std::istreambuf_iterator<char>(source), {});
 
-    const auto sessionPosition = text.find("ShardStoreStartupSession");
+    const auto layoutPosition = text.find("StorageLayout(timestar::dataRootPath()).anchored()");
+    const auto sessionPosition = text.find("ShardStoreStartupSession shardStoreStartup(storageLayout,");
     const auto authorizePosition = text.find("shardStoreStartup.authorizeFirstStorageMutation");
-    const auto placementWritePosition = text.find("savePlacement");
-    const auto engineStartPosition = text.find("g_engine.start().get()");
+    const auto placementWritePosition = text.find("savePlacement(storageLayout.placementFile().string())");
+    const auto engineStartPosition = text.find("g_engine.start(storageLayout).get()");
     const auto engineInitPosition = text.find("engine.init()");
     const auto commitPosition = text.find("shardStoreStartup.commitEngineInitialization");
 
+    ASSERT_NE(layoutPosition, std::string::npos);
     ASSERT_NE(sessionPosition, std::string::npos);
     ASSERT_NE(authorizePosition, std::string::npos);
     ASSERT_NE(placementWritePosition, std::string::npos);
     ASSERT_NE(engineStartPosition, std::string::npos);
     ASSERT_NE(engineInitPosition, std::string::npos);
     ASSERT_NE(commitPosition, std::string::npos);
+    EXPECT_LT(layoutPosition, sessionPosition);
     EXPECT_LT(sessionPosition, authorizePosition);
     EXPECT_LT(authorizePosition, placementWritePosition);
     EXPECT_LT(placementWritePosition, engineStartPosition);

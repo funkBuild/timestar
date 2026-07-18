@@ -25,8 +25,8 @@
 
 namespace fs = std::filesystem;
 
-Engine::Engine()
-    : layout_(timestar::StorageLayout(timestar::dataRootPath()).anchored()),
+Engine::Engine(timestar::StorageLayout layout)
+    : layout_(layout.anchored()),
       shardId(seastar::this_shard_id()),
       tsmFileManager(layout_, shardId),
       walFileManager(layout_, shardId),

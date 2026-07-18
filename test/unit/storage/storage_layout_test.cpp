@@ -126,6 +126,20 @@ TEST(StorageLayoutTest, NumericNamesCoverBoundariesWithoutTruncation) {
                   (std::to_string(maximumSequence) + "_" + std::to_string(maximumSequence) + ".tsm"));
 }
 
+TEST(StorageLayoutTest, CanonicalShardDirectoryParsingSharesTheLayoutGrammar) {
+    const timestar::StorageLayout layout("/var/lib/timestar");
+
+    EXPECT_EQ(layout.parseShardDirName("shard_0"), 0u);
+    EXPECT_EQ(layout.parseShardDirName("shard_17"), 17u);
+    EXPECT_EQ(layout.parseShardDirName("shard_4294967295"), std::numeric_limits<unsigned>::max());
+    EXPECT_FALSE(layout.parseShardDirName("shard_00").has_value());
+    EXPECT_FALSE(layout.parseShardDirName("shard_").has_value());
+    EXPECT_FALSE(layout.parseShardDirName("shard_1_new").has_value());
+    EXPECT_FALSE(layout.parseShardDirName("other_1").has_value());
+    EXPECT_TRUE(layout.isShardNamespaceEntry("shard_invalid"));
+    EXPECT_FALSE(layout.isShardNamespaceEntry("placement.json"));
+}
+
 TEST(StorageLayoutTest, EquivalentLexicalRootsProduceEqualValues) {
     const timestar::StorageLayout first("data/./tenant/../primary");
     const timestar::StorageLayout second("data/primary///");

@@ -27,7 +27,7 @@ protected:
 };
 
 SEASTAR_TEST_F(WritePathIntegrationTest, BasicWriteAndQuery) {
-    Engine engine;
+    Engine engine(timestar::StorageLayout("."));
 
     co_await engine.init();
     co_await engine.startBackgroundTasks();
@@ -106,7 +106,7 @@ SEASTAR_TEST_F(WritePathIntegrationTest, BasicWriteAndQuery) {
 }
 
 SEASTAR_TEST_F(WritePathIntegrationTest, MetadataIndexing) {
-    Engine engine;
+    Engine engine(timestar::StorageLayout("."));
 
     co_await engine.init();
 
@@ -154,7 +154,7 @@ SEASTAR_TEST_F(WritePathIntegrationTest, MetadataIndexing) {
 }
 
 SEASTAR_TEST_F(WritePathIntegrationTest, MultipleSeriesQuery) {
-    Engine engine;
+    Engine engine(timestar::StorageLayout("."));
 
     co_await engine.init();
     co_await engine.startBackgroundTasks();

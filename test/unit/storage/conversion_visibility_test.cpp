@@ -104,7 +104,7 @@ seastar::future<size_t> visibleAggregatedCount(Engine& engine, const std::string
 // return an incomplete result during rollover/conversion.
 // ---------------------------------------------------------------------------
 SEASTAR_TEST_F(ConversionVisibilityTest, FloatSeriesNeverInvisibleDuringConversion) {
-    Engine engine;
+    Engine engine(timestar::StorageLayout("."));
     std::exception_ptr failure;
     try {
         co_await engine.init();
@@ -189,7 +189,7 @@ SEASTAR_TEST_F(ConversionVisibilityTest, FloatSeriesNeverInvisibleDuringConversi
 // Guards the reported ">5s string invisibility after conversion" variant.
 // ---------------------------------------------------------------------------
 SEASTAR_TEST_F(ConversionVisibilityTest, StringSeriesNeverInvisibleDuringConversion) {
-    Engine engine;
+    Engine engine(timestar::StorageLayout("."));
     std::exception_ptr failure;
     try {
         co_await engine.init();

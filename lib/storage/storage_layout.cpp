@@ -1,5 +1,6 @@
 #include "storage_layout.hpp"
 
+#include <charconv>
 #include <format>
 #include <stdexcept>
 #include <string>
@@ -8,6 +9,11 @@
 namespace fs = std::filesystem;
 
 namespace timestar {
+namespace {
+
+constexpr std::string_view shardDirectoryPrefix = "shard_";
+
+}  // namespace
 
 StorageLayout::StorageLayout(fs::path root) : root_(normalizeRoot(std::move(root))) {}
 
@@ -65,7 +71,25 @@ std::string StorageLayout::requireFilenameSegment(std::string_view segment, std:
 }
 
 fs::path StorageLayout::shardDir(unsigned shard) const {
-    return underRoot("shard_" + std::to_string(shard));
+    return underRoot(std::string(shardDirectoryPrefix) + std::to_string(shard));
+}
+
+std::optional<unsigned> StorageLayout::parseShardDirName(std::string_view name) const {
+    if (!isShardNamespaceEntry(name))
+        return std::nullopt;
+
+    const auto numeric = name.substr(shardDirectoryPrefix.size());
+    unsigned shard = 0;
+    const auto result = std::from_chars(numeric.data(), numeric.data() + numeric.size(), shard);
+    if (numeric.empty() || result.ec != std::errc{} || result.ptr != numeric.data() + numeric.size() ||
+        name != shardDir(shard).filename().string()) {
+        return std::nullopt;
+    }
+    return shard;
+}
+
+bool StorageLayout::isShardNamespaceEntry(std::string_view name) const noexcept {
+    return name.starts_with(shardDirectoryPrefix);
 }
 
 fs::path StorageLayout::shardStagingDir(unsigned shard) const {

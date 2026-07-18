@@ -83,7 +83,7 @@ public:
     // Set the back-reference to the sharded<Engine> container.
     // Must be called on every shard after engine.start() and before any inserts.
     void setShardedRef(seastar::sharded<Engine>* ref) { shardedRef = ref; }
-    Engine();
+    explicit Engine(timestar::StorageLayout layout);
     seastar::future<> init();
     seastar::future<> stop();
     seastar::future<> startBackgroundTasks();

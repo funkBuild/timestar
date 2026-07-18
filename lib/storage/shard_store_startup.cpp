@@ -15,7 +15,6 @@
 #include <charconv>
 #include <cstring>
 #include <fstream>
-#include <iomanip>
 #include <limits>
 #include <optional>
 #include <regex>
@@ -194,8 +193,9 @@ ControlFile readControlFile(int directoryFd, std::string_view name) {
     return {.present = true, .valid = true, .contents = std::move(contents), .error = {}};
 }
 
-ParsedShardCount readShardCount(int directoryFd) {
-    auto file = readControlFile(directoryFd, "shard_count.meta");
+ParsedShardCount readShardCount(int directoryFd, const StorageLayout& layout) {
+    const auto filename = layout.shardCountMetadataFile().filename().string();
+    auto file = readControlFile(directoryFd, filename);
     if (!file.present)
         return {};
     if (!file.valid)
@@ -216,8 +216,9 @@ ParsedShardCount readShardCount(int directoryFd) {
     return {.present = true, .valid = true, .value = count, .error = {}};
 }
 
-LegacyStateInspection inspectLegacyStateFile(int directoryFd) {
-    auto file = readControlFile(directoryFd, "rebalance.state");
+LegacyStateInspection inspectLegacyStateFile(int directoryFd, const StorageLayout& layout) {
+    const auto filename = layout.rebalanceStateFile().filename().string();
+    auto file = readControlFile(directoryFd, filename);
     if (!file.present)
         return {};
     if (!file.valid)
@@ -257,10 +258,13 @@ LegacyStateInspection inspectLegacyStateFile(int directoryFd) {
                       std::to_string(oldCount) + " -> " + std::to_string(newCount) + ")"};
 }
 
-DirectoryScan scanShardDirectories(int directoryFd) {
+DirectoryScan scanShardDirectories(int directoryFd, const StorageLayout& layout) {
     DirectoryScan scan;
-    static const std::regex activePattern(R"(^shard_([0-9]+)$)");
     static const std::regex legacyPattern(R"(^shard_[0-9]+_(new|old)$)");
+    const auto shardCountName = layout.shardCountMetadataFile().filename().string();
+    const auto shardCountTemporaryName = layout.shardCountMetadataTemporaryFile().filename().string();
+    const auto rebalanceName = layout.rebalanceStateFile().filename().string();
+    const auto rebalanceTemporaryName = layout.rebalanceStateTemporaryFile().filename().string();
     std::vector<unsigned> shardIds;
 
     // openat(".") creates a new open-file description at directory offset 0.
@@ -287,32 +291,25 @@ DirectoryScan scanShardDirectories(int directoryFd) {
         if (name == "." || name == "..")
             continue;
 
-        if (name == "shard_count.meta" || name == "rebalance.state") {
+        if (name == shardCountName || name == rebalanceName) {
             // Validity is checked through O_NOFOLLOW file descriptors.
-        } else if (name == "rebalance.state.tmp" || name == "shard_count.meta.tmp" ||
+        } else if (name == rebalanceTemporaryName || name == shardCountTemporaryName ||
                    std::regex_match(name, legacyPattern)) {
             scan.legacyArtifact = name;
-        } else if (name.starts_with("shard_") || name.starts_with("shard_count.meta") ||
-                   name.starts_with("rebalance.state")) {
-            std::smatch match;
-            if (!std::regex_match(name, match, activePattern)) {
-                scan.invalidReservedArtifact = name;
-            } else {
-                struct stat info{};
-                if (::fstatat(directoryFd, name.c_str(), &info, AT_SYMLINK_NOFOLLOW) != 0 || !S_ISDIR(info.st_mode)) {
-                    scan.valid = false;
-                    scan.error = name + " is not a real directory";
-                    return scan;
-                }
-
-                unsigned shardId = 0;
-                if (!parseUnsigned(match[1].str(), shardId, true) || name != "shard_" + std::to_string(shardId)) {
-                    scan.valid = false;
-                    scan.error = "invalid shard directory name: " + name;
-                    return scan;
-                }
-                shardIds.push_back(shardId);
+        } else if (const auto shardId = layout.parseShardDirName(name)) {
+            struct stat info{};
+            if (::fstatat(directoryFd, name.c_str(), &info, AT_SYMLINK_NOFOLLOW) != 0 || !S_ISDIR(info.st_mode)) {
+                scan.valid = false;
+                scan.error = name + " is not a real directory";
+                return scan;
             }
+            shardIds.push_back(*shardId);
+        } else if (layout.isShardNamespaceEntry(name)) {
+            scan.valid = false;
+            scan.error = "invalid shard directory name: " + name;
+            return scan;
+        } else if (name.starts_with(shardCountName) || name.starts_with(rebalanceName)) {
+            scan.invalidReservedArtifact = name;
         }
         errno = 0;
     }
@@ -352,40 +349,45 @@ bool verifyRootBinding(int directoryFd, const fs::path& dataDir, std::string& er
     return true;
 }
 
-bool validateCommittedShardStructure(int directoryFd, unsigned shardCount, std::string& error) {
+bool validateCommittedShardStructure(int directoryFd, const StorageLayout& layout, unsigned shardCount,
+                                     std::string& error) {
     for (unsigned shard = 0; shard < shardCount; ++shard) {
-        const std::string shardName = "shard_" + std::to_string(shard);
+        const auto shardName = layout.shardDir(shard).filename().string();
+        const auto tsmName = layout.tsmDir(shard).filename().string();
+        const auto indexName = layout.nativeIndexDir(shard).filename().string();
+        const auto manifestName = layout.nativeManifestFile(shard).filename().string();
         ScopedFd shardFd(::openat(directoryFd, shardName.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW));
         if (shardFd.get() < 0) {
             error = shardName + " cannot be opened as a real directory: " + errnoMessage(errno);
             return false;
         }
 
-        ScopedFd tsmFd(::openat(shardFd.get(), "tsm", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW));
+        ScopedFd tsmFd(::openat(shardFd.get(), tsmName.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW));
         if (tsmFd.get() < 0) {
-            error = shardName + "/tsm is missing or not a real directory: " + errnoMessage(errno);
+            error = shardName + "/" + tsmName + " is missing or not a real directory: " + errnoMessage(errno);
             return false;
         }
 
-        ScopedFd indexFd(::openat(shardFd.get(), "native_index", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW));
+        ScopedFd indexFd(::openat(shardFd.get(), indexName.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW));
         if (indexFd.get() < 0) {
-            error = shardName + "/native_index is missing or not a real directory: " + errnoMessage(errno);
+            error = shardName + "/" + indexName + " is missing or not a real directory: " + errnoMessage(errno);
             return false;
         }
 
-        ScopedFd manifestFd(::openat(indexFd.get(), "MANIFEST", O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
+        ScopedFd manifestFd(::openat(indexFd.get(), manifestName.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
         if (manifestFd.get() < 0) {
-            error = shardName + "/native_index/MANIFEST is missing or is a symlink: " + errnoMessage(errno);
+            error = shardName + "/" + indexName + "/" + manifestName +
+                    " is missing or is a symlink: " + errnoMessage(errno);
             return false;
         }
         struct stat manifestInfo{};
         if (::fstat(manifestFd.get(), &manifestInfo) != 0 || !S_ISREG(manifestInfo.st_mode)) {
-            error = shardName + "/native_index/MANIFEST is not a regular file";
+            error = shardName + "/" + indexName + "/" + manifestName + " is not a regular file";
             return false;
         }
         if (manifestInfo.st_size <= 0 ||
             static_cast<uintmax_t>(manifestInfo.st_size) > std::numeric_limits<size_t>::max()) {
-            error = shardName + "/native_index/MANIFEST is empty or cannot fit in memory";
+            error = shardName + "/" + indexName + "/" + manifestName + " is empty or cannot fit in memory";
             return false;
         }
 
@@ -399,7 +401,7 @@ bool validateCommittedShardStructure(int directoryFd, unsigned shardCount, std::
             if (bytesRead < 0) {
                 if (errno == EINTR)
                     continue;
-                error = shardName + "/native_index/MANIFEST cannot be read: " + errnoMessage(errno);
+                error = shardName + "/" + indexName + "/" + manifestName + " cannot be read: " + errnoMessage(errno);
                 return false;
             }
             manifestContents.append(buffer, static_cast<size_t>(bytesRead));
@@ -409,35 +411,34 @@ bool validateCommittedShardStructure(int directoryFd, unsigned shardCount, std::
         if (::fstat(manifestFd.get(), &finalManifestInfo) != 0 || finalManifestInfo.st_dev != manifestInfo.st_dev ||
             finalManifestInfo.st_ino != manifestInfo.st_ino ||
             finalManifestInfo.st_size != static_cast<off_t>(manifestContents.size())) {
-            error = shardName + "/native_index/MANIFEST changed while startup inspected it";
+            error = shardName + "/" + indexName + "/" + manifestName + " changed while startup inspected it";
             return false;
         }
 
         const auto decoded = index::decodeManifest(manifestContents);
         if (!decoded.complete()) {
-            error = shardName + "/native_index/MANIFEST is not fully recoverable at offset " +
+            error = shardName + "/" + indexName + "/" + manifestName + " is not fully recoverable at offset " +
                     std::to_string(decoded.issueOffset) + ": " + decoded.issue;
             return false;
         }
 
         for (const auto& file : decoded.files) {
-            std::ostringstream filename;
-            filename << "idx_" << std::setfill('0') << std::setw(6) << file.fileNumber << ".sst";
-            ScopedFd sstableFd(::openat(indexFd.get(), filename.str().c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
+            const auto filename = layout.nativeSstableFile(shard, file.fileNumber).filename().string();
+            ScopedFd sstableFd(::openat(indexFd.get(), filename.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
             if (sstableFd.get() < 0) {
-                error = shardName + "/native_index/" + filename.str() +
+                error = shardName + "/" + indexName + "/" + filename +
                         " is referenced by MANIFEST but is missing or a symlink: " + errnoMessage(errno);
                 return false;
             }
             struct stat sstableInfo{};
             if (::fstat(sstableFd.get(), &sstableInfo) != 0 || !S_ISREG(sstableInfo.st_mode)) {
-                error = shardName + "/native_index/" + filename.str() +
+                error = shardName + "/" + indexName + "/" + filename +
                         " is referenced by MANIFEST but is not a regular file";
                 return false;
             }
             if (sstableInfo.st_size < 0 || static_cast<uint64_t>(sstableInfo.st_size) != file.fileSize) {
-                error = shardName + "/native_index/" + filename.str() +
-                        " size does not match the committed MANIFEST record";
+                error =
+                    shardName + "/" + indexName + "/" + filename + " size does not match the committed MANIFEST record";
                 return false;
             }
         }
@@ -498,37 +499,37 @@ ShardStoreLock::~ShardStoreLock() {
         ::close(directoryFd_);
 }
 
-ShardStoreStartup::ShardStoreStartup(fs::path dataDir)
-    : dataDir_((dataDir.empty() ? fs::path{"."} : std::move(dataDir)).lexically_normal()) {}
+ShardStoreStartup::ShardStoreStartup(StorageLayout layout) : layout_(layout.anchored()) {}
 
 ShardStoreLock ShardStoreStartup::acquireExclusiveLock() const {
-    fs::create_directories(dataDir_);
-    ScopedFd directory(::open(dataDir_.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW));
+    const auto& dataDir = layout_.root();
+    fs::create_directories(dataDir);
+    ScopedFd directory(::open(dataDir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW));
     if (directory.get() < 0) {
         throw std::system_error(errno, std::generic_category(),
-                                "cannot open legacy data root for exclusive ownership: " + dataDir_.string());
+                                "cannot open legacy data root for exclusive ownership: " + dataDir.string());
     }
     if (::flock(directory.get(), LOCK_EX | LOCK_NB) != 0) {
         const int error = errno;
         const std::string context = isLockContentionError(error)
                                         ? "legacy data root is already owned by another TimeStar process: "
                                         : "cannot lock legacy data root for exclusive ownership: ";
-        throw std::system_error(error, std::generic_category(), context + dataDir_.string());
+        throw std::system_error(error, std::generic_category(), context + dataDir.string());
     }
-    return ShardStoreLock(directory.release(), dataDir_);
+    return ShardStoreLock(directory.release(), dataDir);
 }
 
 ShardStoreInspection ShardStoreStartup::inspect(unsigned requestedShardCount, const ShardStoreLock& lock) const {
-    if (lock.directoryFd_ < 0 || lock.dataDir_ != dataDir_)
+    if (lock.directoryFd_ < 0 || lock.dataDir_ != layout_.root())
         throw std::invalid_argument("startup inspection requires the exclusive lock for this data root");
     if (requestedShardCount == 0)
         return invalidInspection(requestedShardCount, "requested shard count must be greater than zero");
 
     std::string rootError;
-    if (!verifyRootBinding(lock.directoryFd_, dataDir_, rootError))
+    if (!verifyRootBinding(lock.directoryFd_, layout_.root(), rootError))
         return invalidInspection(requestedShardCount, std::move(rootError));
 
-    const auto legacyState = inspectLegacyStateFile(lock.directoryFd_);
+    const auto legacyState = inspectLegacyStateFile(lock.directoryFd_, layout_);
     if (legacyState.present) {
         return {.status = legacyState.valid ? ShardStoreStartupStatus::InterruptedLegacyRebalance
                                             : ShardStoreStartupStatus::InvalidMetadata,
@@ -537,7 +538,7 @@ ShardStoreInspection ShardStoreStartup::inspect(unsigned requestedShardCount, co
                 .detail = legacyState.detail};
     }
 
-    const auto directories = scanShardDirectories(lock.directoryFd_);
+    const auto directories = scanShardDirectories(lock.directoryFd_, layout_);
     if (!directories.valid)
         return invalidInspection(requestedShardCount, directories.error);
     if (directories.invalidReservedArtifact) {
@@ -550,7 +551,7 @@ ShardStoreInspection ShardStoreStartup::inspect(unsigned requestedShardCount, co
                 .detail = "legacy rebalance artifact exists: " + *directories.legacyArtifact};
     }
 
-    const auto metadata = readShardCount(lock.directoryFd_);
+    const auto metadata = readShardCount(lock.directoryFd_, layout_);
     if (metadata.present && !metadata.valid)
         return invalidInspection(requestedShardCount, metadata.error);
 
@@ -576,7 +577,7 @@ ShardStoreInspection ShardStoreStartup::inspect(unsigned requestedShardCount, co
     }
 
     std::string structureError;
-    if (!validateCommittedShardStructure(lock.directoryFd_, previousShardCount, structureError)) {
+    if (!validateCommittedShardStructure(lock.directoryFd_, layout_, previousShardCount, structureError)) {
         return {.status = ShardStoreStartupStatus::IncompleteStore,
                 .previousShardCount = previousShardCount,
                 .requestedShardCount = requestedShardCount,
@@ -600,9 +601,9 @@ ShardStoreInspection ShardStoreStartup::inspect(unsigned requestedShardCount, co
 
 std::string ShardStoreStartup::failureMessage(const ShardStoreInspection& inspection) const {
     std::error_code ec;
-    auto activeRoot = fs::absolute(dataDir_, ec);
+    auto activeRoot = fs::absolute(layout_.root(), ec);
     if (ec)
-        activeRoot = dataDir_;
+        activeRoot = layout_.root();
 
     std::ostringstream message;
     message << "Unsafe TimeStar startup for active legacy storage root '" << activeRoot.lexically_normal().string()
@@ -642,7 +643,7 @@ std::string ShardStoreStartup::failureMessage(const ShardStoreInspection& inspec
 
 void ShardStoreStartup::commitAfterInitialization(const ShardStoreInspection& inspection,
                                                   const ShardStoreLock& lock) const {
-    if (lock.directoryFd_ < 0 || lock.dataDir_ != dataDir_)
+    if (lock.directoryFd_ < 0 || lock.dataDir_ != layout_.root())
         throw std::invalid_argument("startup commit requires the exclusive lock for this data root");
     if (inspection.status != ShardStoreStartupStatus::FreshStore &&
         inspection.status != ShardStoreStartupStatus::MatchingShardCount) {
@@ -662,32 +663,30 @@ void ShardStoreStartup::commitAfterInitialization(const ShardStoreInspection& in
     }
 
     std::string rootError;
-    if (!verifyRootBinding(lock.directoryFd_, dataDir_, rootError))
+    if (!verifyRootBinding(lock.directoryFd_, layout_.root(), rootError))
         throw std::runtime_error(std::move(rootError));
 
-    const auto legacyState = inspectLegacyStateFile(lock.directoryFd_);
+    const auto legacyState = inspectLegacyStateFile(lock.directoryFd_, layout_);
     if (legacyState.present) {
         throw std::runtime_error("rebalance.state appeared after fresh-store inspection: " + legacyState.detail);
     }
 
-    const auto metadata = readShardCount(lock.directoryFd_);
+    const auto metadata = readShardCount(lock.directoryFd_, layout_);
     if (metadata.present)
         throw std::runtime_error("shard_count.meta appeared after fresh-store inspection");
 
-    const auto directories = scanShardDirectories(lock.directoryFd_);
+    const auto directories = scanShardDirectories(lock.directoryFd_, layout_);
     if (!directories.valid || directories.legacyArtifact || directories.invalidReservedArtifact ||
         directories.shardCount != inspection.requestedShardCount) {
         throw std::runtime_error("Engine initialization did not produce the expected canonical shard directories");
     }
 
     std::string structureError;
-    if (!validateCommittedShardStructure(lock.directoryFd_, inspection.requestedShardCount, structureError))
+    if (!validateCommittedShardStructure(lock.directoryFd_, layout_, inspection.requestedShardCount, structureError))
         throw std::runtime_error("Engine initialization produced an incomplete shard layout: " + structureError);
 
-    constexpr std::string_view temporaryName = "shard_count.meta.tmp";
-    constexpr std::string_view finalName = "shard_count.meta";
-    const std::string tmp(temporaryName);
-    const std::string final(finalName);
+    const auto tmp = layout_.shardCountMetadataTemporaryFile().filename().string();
+    const auto final = layout_.shardCountMetadataFile().filename().string();
     bool renamed = false;
 
     try {
@@ -735,8 +734,8 @@ void ShardStoreStartup::commitAfterInitialization(const ShardStoreInspection& in
     }
 }
 
-ShardStoreStartupSession::ShardStoreStartupSession(fs::path dataDir, unsigned requestedShardCount)
-    : startup_(std::move(dataDir)), lock_(startup_.acquireExclusiveLock()) {
+ShardStoreStartupSession::ShardStoreStartupSession(StorageLayout layout, unsigned requestedShardCount)
+    : startup_(std::move(layout)), lock_(startup_.acquireExclusiveLock()) {
     inspection_ = startup_.inspect(requestedShardCount, lock_);
 }
 

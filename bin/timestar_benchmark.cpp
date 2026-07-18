@@ -171,7 +171,7 @@ struct TestData {
     }
 };
 
-seastar::future<> run_benchmark(seastar::sharded<Engine>& engine) {
+seastar::future<> run_benchmark(seastar::sharded<Engine>& engine, const timestar::StorageLayout& storageLayout) {
     const size_t NUM_INSERTS = 1000;
     const size_t NUM_QUERIES = 1000;
     const int BATCH_SIZE = 10;  // Points per insert
@@ -330,8 +330,8 @@ seastar::future<> run_benchmark(seastar::sharded<Engine>& engine) {
     size_t tsmFiles = 0;
     size_t walFiles = 0;
 
-    for (int i = 0; i < seastar::smp::count; ++i) {
-        std::string shardPath = "shard_" + std::to_string(i);
+    for (unsigned i = 0; i < seastar::smp::count; ++i) {
+        const auto shardPath = storageLayout.shardDir(i);
         if (fs::exists(shardPath)) {
             for (const auto& entry : fs::recursive_directory_iterator(shardPath)) {
                 if (fs::is_regular_file(entry)) {
@@ -377,9 +377,10 @@ int main(int argc, char** argv) {
         timestar::setGlobalPlacement(std::move(pt));
 
         seastar::sharded<Engine> engine;
+        const auto storageLayout = timestar::StorageLayout(".").anchored();
 
         // Initialize engine on all shards
-        co_await engine.start();
+        co_await engine.start(storageLayout);
         co_await engine.invoke_on_all([](Engine& e) { return e.init(); });
 
         // Set back-reference for cross-shard metadata indexing
@@ -391,7 +392,7 @@ int main(int argc, char** argv) {
         co_await engine.invoke_on_all([](Engine& e) { return e.startBackgroundTasks(); });
 
         // Run benchmark
-        co_await run_benchmark(engine);
+        co_await run_benchmark(engine, storageLayout);
 
         // Cleanup
         co_await engine.invoke_on_all([](Engine& e) { return e.stop(); });

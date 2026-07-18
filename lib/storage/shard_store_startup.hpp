@@ -1,5 +1,7 @@
 #pragma once
 
+#include "storage_layout.hpp"
+
 #include <filesystem>
 #include <string>
 
@@ -54,7 +56,7 @@ private:
 // the legacy mutating migration automatically.
 class ShardStoreStartup {
 public:
-    explicit ShardStoreStartup(std::filesystem::path dataDir);
+    explicit ShardStoreStartup(StorageLayout layout);
 
     // Creates the root when absent, acquires a non-blocking exclusive lock on
     // its directory inode, and rejects a symlinked root.
@@ -69,7 +71,7 @@ public:
     void commitAfterInitialization(const ShardStoreInspection& inspection, const ShardStoreLock& lock) const;
 
 private:
-    std::filesystem::path dataDir_;
+    const StorageLayout layout_;
 };
 
 // Stateful startup boundary used by the server. The session owns the root
@@ -78,7 +80,7 @@ private:
 // initialization, then commit the fresh-store marker.
 class ShardStoreStartupSession {
 public:
-    ShardStoreStartupSession(std::filesystem::path dataDir, unsigned requestedShardCount);
+    ShardStoreStartupSession(StorageLayout layout, unsigned requestedShardCount);
 
     [[nodiscard]] const ShardStoreInspection& inspection() const noexcept { return inspection_; }
     [[nodiscard]] bool canStart() const noexcept { return inspection_.canStart(); }

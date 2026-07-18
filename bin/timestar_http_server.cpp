@@ -285,13 +285,13 @@ int main(int argc, char** argv) {
             // Resolve the data root from [server] data_dir (default "." = CWD).
             // All shard directories (shard_N), placement.json and
             // shard_count.meta live under this directory.
-            const std::string dataRoot = timestar::dataRootPath();
-            timestar::http_log.info("Data directory: {}", std::filesystem::absolute(dataRoot).string());
+            const auto storageLayout = timestar::StorageLayout(timestar::dataRootPath()).anchored();
+            timestar::http_log.info("Data directory: {}", storageLayout.root().string());
 
             // STEP 0: Refuse unsafe legacy core-count changes before opening
             // storage. The old automatic rebalancer cannot preserve all series
             // metadata and is deliberately not part of normal startup.
-            timestar::ShardStoreStartupSession shardStoreStartup(dataRoot, seastar::smp::count);
+            timestar::ShardStoreStartupSession shardStoreStartup(storageLayout, seastar::smp::count);
             if (!shardStoreStartup.canStart())
                 throw std::runtime_error(shardStoreStartup.failureMessage());
 
@@ -303,11 +303,11 @@ int main(int argc, char** argv) {
             // Revalidate under the lifetime root lock immediately before the
             // first on-disk mutation and Engine open.
             shardStoreStartup.authorizeFirstStorageMutation();
-            timestar::savePlacement(dataRoot + "/placement.json");
+            timestar::savePlacement(storageLayout.placementFile().string());
 
             // STEP 1: Initialize the Engine on all shards
             timestar::http_log.info("Initializing Engine on all shards...");
-            g_engine.start().get();
+            g_engine.start(storageLayout).get();
 
             // Scope guard: Seastar's sharded<> asserts in its destructor if
             // stop() was not called after a successful start().  If any step

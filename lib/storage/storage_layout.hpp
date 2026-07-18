@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <string_view>
 
 namespace timestar {
@@ -18,6 +19,8 @@ public:
     [[nodiscard]] StorageLayout anchored() const;
 
     [[nodiscard]] std::filesystem::path shardDir(unsigned shard) const;
+    [[nodiscard]] std::optional<unsigned> parseShardDirName(std::string_view name) const;
+    [[nodiscard]] bool isShardNamespaceEntry(std::string_view name) const noexcept;
     [[nodiscard]] std::filesystem::path shardStagingDir(unsigned shard) const;
     [[nodiscard]] std::filesystem::path shardStagingTsmDir(unsigned shard) const;
     [[nodiscard]] std::filesystem::path shardStagingNativeIndexDir(unsigned shard) const;

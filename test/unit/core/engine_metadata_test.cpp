@@ -27,12 +27,12 @@ namespace fs = std::filesystem;
 // Multi-shard tests skip on developer boxes with a forced single shard, but
 // must never skip silently in CI (the runner pins -c 2, so a skip there means
 // the multi-shard paths lost coverage without anyone noticing).
-#define REQUIRE_MULTI_SHARD()                                                                 \
-    if (seastar::smp::count < 2) {                                                            \
-        if (std::getenv("CI")) {                                                              \
-            FAIL() << "Multi-shard test would be skipped in CI — run the suite with -c 2+";   \
-        }                                                                                     \
-        GTEST_SKIP() << "Need at least 2 shards for this test";                               \
+#define REQUIRE_MULTI_SHARD()                                                               \
+    if (seastar::smp::count < 2) {                                                          \
+        if (std::getenv("CI")) {                                                            \
+            FAIL() << "Multi-shard test would be skipped in CI — run the suite with -c 2+"; \
+        }                                                                                   \
+        GTEST_SKIP() << "Need at least 2 shards for this test";                             \
     }
 
 // ---------------------------------------------------------------------------
@@ -122,7 +122,7 @@ TEST_F(EngineMetadataTest, NoShardedRefNoCrash) {
         // Manually start without setting shardedRef to test graceful degradation.
         // Cannot use ScopedShardedEngine::start() since it now sets the ref automatically.
         seastar::sharded<Engine> rawEng;
-        rawEng.start().get();
+        rawEng.start(timestar::StorageLayout(".")).get();
         rawEng.invoke_on_all([](Engine& engine) { return engine.init(); }).get();
 
         auto cleanup = seastar::defer([&rawEng] {
