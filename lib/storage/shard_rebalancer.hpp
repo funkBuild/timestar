@@ -1,5 +1,7 @@
 #pragma once
 
+#include "storage_layout.hpp"
+
 #include <cstdint>
 #include <map>
 #include <seastar/core/future.hh>
@@ -34,7 +36,7 @@ struct TSMFileAction {
 
 class ShardRebalancer {
 public:
-    explicit ShardRebalancer(const std::string& dataDir);
+    explicit ShardRebalancer(StorageLayout layout);
 
     // Check if rebalancing is needed. Reads shard_count.meta and/or scans
     // for existing shard directories.
@@ -53,20 +55,14 @@ public:
 
     // Write the current shard count to shard_count.meta.
     // Called after successful engine startup or rebalance.
-    static void writeShardCountMeta(const std::string& dataDir, unsigned shardCount);
+    static void writeShardCountMeta(const StorageLayout& layout, unsigned shardCount);
 
     // Read the persisted shard count. Returns 0 if file doesn't exist.
-    static unsigned readShardCountMeta(const std::string& dataDir);
+    static unsigned readShardCountMeta(const StorageLayout& layout);
 
 private:
-    std::string _dataDir;
+    StorageLayout _layout;
     unsigned _oldShardCount = 0;
-
-    // Paths
-    std::string shardDir(unsigned shard) const;
-    std::string shardDirNew(unsigned shard) const;
-    std::string shardDirOld(unsigned shard) const;
-    std::string stateFilePath() const;
 
     // State file management
     void writeState(const RebalanceState& state);
@@ -75,6 +71,10 @@ private:
 
     // Detect old shard count by scanning directories
     unsigned detectShardCountFromDirs() const;
+
+    // Reject source entries that cannot be represented safely by StorageLayout
+    // before creating rebalance state or staging directories.
+    void validateSourceEntries(unsigned oldShardCount) const;
 
     // Create staging directories for new shard layout
     void createStagingDirs(unsigned newShardCount);
