@@ -11,7 +11,7 @@
 #include "http/http_stream_handler.hpp"
 #include "http/http_write_handler.hpp"
 #include "http/proto_converters.hpp"
-#include "storage/shard_rebalancer.hpp"
+#include "storage/shard_store_startup.hpp"
 #include "timestar/version.hpp"
 #include "utils/json_escape.hpp"
 #include "utils/logger.hpp"
@@ -286,31 +286,24 @@ int main(int argc, char** argv) {
             // All shard directories (shard_N), placement.json and
             // shard_count.meta live under this directory.
             const std::string dataRoot = timestar::dataRootPath();
-            std::filesystem::create_directories(dataRoot);
             timestar::http_log.info("Data directory: {}", std::filesystem::absolute(dataRoot).string());
 
-            // Initialize virtual shard placement table (Phase 5)
-            // Must be done BEFORE the rebalancer, which uses routeToCore().
+            // STEP 0: Refuse unsafe legacy core-count changes before opening
+            // storage. The old automatic rebalancer cannot preserve all series
+            // metadata and is deliberately not part of normal startup.
+            timestar::ShardStoreStartupSession shardStoreStartup(dataRoot, seastar::smp::count);
+            if (!shardStoreStartup.canStart())
+                throw std::runtime_error(shardStoreStartup.failureMessage());
+
+            // Initialize the local placement only after the read-only storage
+            // safety gate has accepted this core count.
             auto pt = timestar::PlacementTable::buildLocal(seastar::smp::count);
             timestar::setGlobalPlacement(std::move(pt));
+
+            // Revalidate under the lifetime root lock immediately before the
+            // first on-disk mutation and Engine open.
+            shardStoreStartup.authorizeFirstStorageMutation();
             timestar::savePlacement(dataRoot + "/placement.json");
-
-            // STEP 0: Check for shard rebalancing (CPU count change)
-            {
-                timestar::ShardRebalancer rebalancer(dataRoot);
-                // Recover from any previously interrupted rebalance first
-                rebalancer.recoverIfNeeded(seastar::smp::count).get();
-
-                if (rebalancer.isRebalanceNeeded(seastar::smp::count)) {
-                    timestar::http_log.info("Shard count changed from {} to {}, starting rebalance...",
-                                            rebalancer.previousShardCount(), seastar::smp::count);
-                    rebalancer.execute(seastar::smp::count).get();
-                    timestar::http_log.info("Shard rebalance complete");
-                } else {
-                    // Persist current shard count for next startup
-                    timestar::ShardRebalancer::writeShardCountMeta(dataRoot, seastar::smp::count);
-                }
-            }
 
             // STEP 1: Initialize the Engine on all shards
             timestar::http_log.info("Initializing Engine on all shards...");
@@ -363,8 +356,9 @@ int main(int argc, char** argv) {
                                })
                     .get();
 
-                // Persist shard count after successful init
-                timestar::ShardRebalancer::writeShardCountMeta(dataRoot, seastar::smp::count);
+                // Persist only after complete Engine initialization. A failed
+                // fresh startup therefore does not claim a completed layout.
+                shardStoreStartup.commitEngineInitialization();
                 timestar::http_log.info("Engine init completed on all shards");
             } catch (const std::bad_alloc& e) {
                 timestar::http_log.error("bad_alloc during Engine init: {}", e.what());

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "manifest_format.hpp"
 #include "sstable.hpp"
 
 #include <cstdint>
@@ -66,9 +67,9 @@ public:
     const std::string& directory() const { return directory_; }
 
     // v2 header: magic "TSMF" + version. Little-endian fixed32 encoding.
-    static constexpr uint32_t MANIFEST_MAGIC = 0x464D5354;  // "TSMF"
-    static constexpr uint32_t MANIFEST_VERSION = 2;
-    static constexpr size_t MANIFEST_HEADER_SIZE = 8;
+    static constexpr uint32_t MANIFEST_MAGIC = timestar::index::MANIFEST_MAGIC;
+    static constexpr uint32_t MANIFEST_VERSION = timestar::index::MANIFEST_VERSION;
+    static constexpr size_t MANIFEST_HEADER_SIZE = timestar::index::MANIFEST_HEADER_SIZE;
 
 private:
     Manifest() = default;
@@ -78,9 +79,6 @@ private:
 
     // Append one CRC-framed record ([len][crc][record]) to out.
     static void appendRecordFrame(std::string& out, const std::string& record);
-
-    // Apply a single decoded record (type byte + payload) to in-memory state.
-    void applyRecord(const char* rp, const char* rend);
 
     // Open (or reopen) the manifest file handle for appending.
     seastar::future<> openFileForAppend();

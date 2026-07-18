@@ -1,10 +1,19 @@
 # Cluster Starting Point: Storage Layout Foundation
 
-**Status:** Ready for implementation
+**Status:** In implementation on `cluster-design`
 
 **Parent design:** [Cluster Architecture and Implementation Plan](clustering.md)
 
 **Scope:** The first independently reviewable epic on the path to clustering
+
+## Baseline after merging main
+
+On 2026-07-18, `cluster-design` merged `main` at `bcd7f82`. Main now honours
+`server.data_dir` for the legacy shard paths and includes end-to-end coverage
+from `90c7ce3`. That behaviour is the baseline: this branch must preserve it.
+The remaining layout work replaces global path lookup with an injected,
+immutable path authority; it does not reimplement or temporarily disable the
+working configured root.
 
 ## Decision
 
@@ -18,7 +27,8 @@ This epic will:
    metadata undiscoverable.
 2. Introduce one immutable `StorageLayout` value that owns every persistent
    path.
-3. Make every persistent artifact honour `server.data_dir`.
+3. Preserve the now-working `server.data_dir` behaviour while replacing global
+   path lookup with an immutable, injected `StorageLayout`.
 4. Preserve the current `shard_N` on-disk layout under that root so this change
    does not also become a storage-format migration.
 5. Establish the seam needed for the later move from CPU-core shards to stable
@@ -30,15 +40,12 @@ addressed by the number of CPU cores in one process.
 
 ## Why this is the starting point
 
-The current repository has four concrete blockers below the proposed cluster
+The current repository has three concrete blockers below the proposed cluster
 protocol:
 
-- `server.data_dir` exists in configuration, but Engine, WAL, TSM, NativeIndex,
-  placement, and shard-count metadata still construct paths relative to the
-  process working directory.
-- Path construction is duplicated across storage components. A later VShard
-  migration would otherwise need to change every one of those components at
-  once.
+- `server.data_dir` is now wired through global helpers, but path construction
+  and configuration lookup remain implicit dependencies. A later VShard
+  migration would otherwise need to change many components at once.
 - Persistent ownership is encoded as `shard_N`, where N is a Seastar CPU core.
   CPU-core ownership is not a stable unit that can move between machines.
 - The startup core-count rebalancer creates an empty destination NativeIndex.
@@ -91,6 +98,14 @@ This epic does not:
 
 The rebalancer is disabled on unsafe core-count changes until a metadata-safe
 offline or VShard-aware migration is implemented.
+
+This is a temporary legacy-format guard, not the final scaling behaviour. In
+the VShard format, CPU shards become persisted OSD-like storage workers. Adding
+workers after a process restart will redistribute a proportional subset of
+stable VShard ownership, while replicas continue to use distinct machines as
+their failure domains. The parent design's
+[CPU storage-worker contract](clustering.md#cpu-shards-as-osd-like-storage-workers)
+defines the replacement path.
 
 ## Design rules
 
@@ -179,13 +194,12 @@ contents.
 Each step is intended to be a separate, reviewable pull request or commit. Do
 not combine later VShard or consensus code with these changes.
 
-### Step 0: Rebase the isolated branch
+### Step 0: Update the isolated branch from main — completed
 
-The `cluster-design` worktree was created from commit `1ca6507`; the main branch
-has since advanced. Rebase in the isolated worktree before implementation and
-resolve changes there. Several target storage and server files were touched by
-the warning-cleanup work, so starting from the current code reduces avoidable
-conflicts.
+The isolated worktree first rebased its documentation commits, then merged
+current `main` at `bcd7f82` as commit `a9506d4`. The only Task 1 conflict was in
+server startup; resolution retained main's `data_dir` wiring and replaced the
+unsafe normal-startup rebalancer path with the safety session.
 
 This operation must not check out, reset, clean, or modify the main worktree.
 
@@ -217,6 +231,11 @@ Required behaviour:
   not automatically resumed by normal server startup.
 - Missing or malformed metadata is treated conservatively when shard data is
   present.
+- A committed shard must have a fully decoded NativeIndex manifest with valid
+  framing and CRCs, and every referenced SSTable must exist as a regular file
+  of the committed size.
+- The configured root remains bound to the locked directory inode throughout
+  inspection and commit; root replacement fails closed.
 - The mutating legacy rebalancer may remain for tests or a future explicit
   offline tool, but normal startup must not call `execute()` or
   `recoverIfNeeded()`.
@@ -236,6 +255,18 @@ Tests:
 - malformed shard-count metadata;
 - interrupted legacy rebalance marker;
 - assertion that the failure path did not rename or create shard contents.
+- empty, random, truncated, unsupported-version, and bad-CRC manifests;
+- missing, wrong-type, and wrong-size manifest-referenced SSTables;
+- root replacement and control-file insertion between inspect and commit; and
+- behavioural enforcement of inspect → authorize mutation → initialize →
+  commit ordering.
+
+The lifetime directory lock is advisory. Operators must not run an older
+TimeStar binary, which does not participate in this locking protocol, against
+the same data root concurrently. The new startup path also uses descriptor-
+relative inspection and verifies the configured path still names the locked
+inode; the advisory-lock limitation is not presented as protection from a
+non-cooperating process.
 
 Exit criteria:
 
@@ -327,10 +358,10 @@ Exit criteria:
 - source inspection finds no independent `shard_` path construction outside
   `StorageLayout`, legacy-layout parsing/migration code, and tests.
 
-### Step 4: Activate `server.data_dir` for every artifact
+### Step 4: Preserve and centralize `server.data_dir`
 
-Once all consumers are injected, select the root from `server.data_dir` during
-startup and activate it atomically for:
+Main already activated the configured root. Once all consumers are injected,
+remove their global path lookup while preserving that root atomically for:
 
 - shard directories;
 - WAL files;
@@ -446,4 +477,7 @@ The starting epic is complete only when all of the following are true:
 
 Passing this gate does not make TimeStar clustered. It creates the safe local
 storage boundary on which the VShard and replicated-state-machine work can be
-built without immediately rewriting every storage component again.
+built without immediately rewriting every storage component again. The
+fail-closed rule remains for legacy `shard_N` data; the subsequent VShard
+storage epic replaces it with automatic storage-worker rebalancing for the new
+format.

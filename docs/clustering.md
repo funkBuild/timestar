@@ -100,9 +100,9 @@ The following are prerequisites, not networking tasks:
 1. `lib/core/placement_table.*` currently routes by `hash % coreCount`; the
    virtual-shard server mapping is derived locally and serialized assignments
    are not retained.
-2. `Engine::basePath()`, WAL, TSM, NativeIndex, and compaction paths are rooted
-   in `shard_N` CPU-core directories. The configured `server.data_dir` is not
-   consistently honoured.
+2. `Engine::basePath()`, WAL, TSM, NativeIndex, and compaction paths remain
+   rooted in `shard_N` CPU-core directories. `server.data_dir` is now honoured,
+   but through global path helpers rather than an immutable injected layout.
 3. A core-owned TSM file may contain series from many virtual shards. It cannot
    be transferred as one placement group without filtering and rewriting.
 4. The current core-count rebalancer deliberately creates an empty NativeIndex,
@@ -154,6 +154,9 @@ CPU or deployment isolation requires it; the protocol must not assume one.
 ## Terminology
 
 - **Virtual shard (VShard):** Stable hash bucket and placement unit.
+- **Storage worker:** Persisted node-local execution target hosted by one
+  Seastar reactor core. It is analogous to a Ceph OSD for placement and load
+  accounting, but not an independent replica failure domain.
 - **Replica group:** Raft state machine responsible for one VShard.
 - **Leader:** Voting replica that orders writes and supplies read barriers.
 - **Follower:** Voting replica that follows the committed log.
@@ -167,6 +170,44 @@ CPU or deployment isolation requires it; the protocol must not assume one.
 - **Term/index:** Raft identity and ordered log position within one VShard.
 - **Applied index:** Highest committed entry whose data and all query-visible
   indexes have been applied locally.
+
+### CPU shards as OSD-like storage workers
+
+Seastar reactor shards are fixed for the lifetime of a process, so reactor
+cores cannot be hot-added. They can still be modelled as persisted storage
+workers across a node restart:
+
+- Each worker has a stable node-local ID and owns many VShards. A worker ID is
+  mapped to a reactor core for the current process; reactor-core number is not
+  stored as the data identity.
+- Adding CPU capacity creates worker IDs and uses weighted rendezvous placement
+  to assign a proportional subset of the node's VShards to them. Removing a
+  worker drains its VShards before the worker record is retired.
+- The effective owner remains authoritative until a fenced local handoff has
+  quiesced writes, committed the new local ownership generation, and opened
+  the VShard on the destination worker. A request is never served by both
+  workers for the same ownership generation.
+- VShard files remain addressed by VShard identity. Reassigning execution on a
+  shared node-local volume should normally move ownership and in-memory state,
+  not rewrite TSM data. A deployment with worker-specific devices may copy the
+  VShard using the same snapshot protocol as cross-node movement.
+- CPU workers on one machine share a host, power, kernel, and process. They may
+  balance CPU and I/O load, but two such workers can never satisfy two replica
+  slots or increase the advertised failure-domain count.
+
+Placement is explicitly two-stage: first select distinct eligible hosts for a
+VShard's replicas, then select one storage worker within each chosen host.
+Worker weights can affect only the second stage and cannot weaken the
+host/rack-level replica constraint.
+
+Changing `--smp` therefore requires restarting that TimeStar process. In an
+RF=3 cluster, other replicas preserve service while the node restarts, rejoins,
+and performs local handoffs. Single-node mode has a restart outage but retains
+the same automatic ownership rebalance after startup. When CPU count shrinks,
+persisted workers that no longer have a dedicated reactor are temporarily
+co-scheduled on the surviving reactors, fenced and drained one at a time, and
+retired only after their VShards have new effective owners. A missing reactor
+must never make its old worker's data unreachable before the drain can run.
 
 ## Cluster and placement maps
 
@@ -308,8 +349,9 @@ Storage identity is VShard-based, not core-based. A possible physical layout is:
 ```text
 <data_dir>/
   node.json
+  workers.json
   cluster-map-cache/
-  journals/core_<n>/...
+  journals/worker_<id>/...
   vshards/<id>/
     raft.meta
     MANIFEST
@@ -708,7 +750,8 @@ file unless an external secret mechanism protects it.
 Begin with the independently reviewable
 [storage layout foundation](clustering-starting-point.md).
 
-- Honour `server.data_dir` throughout storage.
+- Preserve the working `server.data_dir` behaviour while centralizing its path
+  rules in an injected immutable layout.
 - Define and test durable local acknowledgement modes.
 - Fix or disable the current core-count rebalancer.
 - Make series metadata reconstructible before discarding any index.
@@ -722,12 +765,18 @@ core-count change cannot make an existing series undiscoverable.
 
 - Replace local modulo routing with a stored, versioned placement abstraction.
 - Decouple on-disk identity from Seastar core assignment.
+- Persist OSD-like storage-worker identities and map them to reactor cores at
+  startup.
+- Rebalance local VShard ownership proportionally when workers are added or
+  drained, using a crash-safe fenced ownership generation.
 - Add VShard-tagged journals, catalog, manifests, and VShard-partitioned TSM.
 - Add point revisions, block CRCs, file hashes, and rebuildable indexes.
 - Build the old-format migration tool.
 
-**Gate:** Reassigning a VShard changes no unrelated data, and changing local
-core count requires no data rewrite.
+**Gate:** Reassigning a VShard changes no unrelated data; increasing local core
+count balances work onto the new workers; changing local core count on shared
+storage requires no TSM rewrite; and no VShard is served by two local workers
+in one ownership generation.
 
 ### Phase 2: Multi-Raft prototype
 
