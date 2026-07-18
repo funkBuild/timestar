@@ -886,7 +886,7 @@ TEST(ProtoWriteFastPathGap, InvalidTagValueRejectsPoint) {
     ::timestar_pb::WriteRequest req;
     auto* wp = req.add_writes();
     wp->set_measurement("m");
-    (*wp->mutable_tags())["host"] = "bad,value";  // comma is invalid in tag values
+    (*wp->mutable_tags())["host"] = std::string("bad") + '\0' + "value";  // NUL is invalid
 
     ::timestar_pb::WriteField wf;
     wf.mutable_double_values()->add_values(1.0);
@@ -902,7 +902,9 @@ TEST(ProtoWriteFastPathGap, InvalidTagValueRejectsPoint) {
     EXPECT_NE(result.errors[0].find("Invalid tag value"), std::string::npos) << result.errors[0];
 }
 
-TEST(ProtoWriteFastPathGap, InvalidTagValueEqualsSign) {
+// '=' in a tag value is now accepted — buildSeriesKey escapes it, so the key
+// stays unambiguous.  (Previously this was rejected.)
+TEST(ProtoWriteFastPathGap, TagValueWithEqualsAccepted) {
     ::timestar_pb::WriteRequest req;
     auto* wp = req.add_writes();
     wp->set_measurement("m");
@@ -916,8 +918,9 @@ TEST(ProtoWriteFastPathGap, InvalidTagValueEqualsSign) {
     auto bytes = serialize(req);
     auto result = parseWriteRequestFast(bytes.data(), bytes.size(), 0);
 
-    EXPECT_EQ(result.inserts.size(), 0u);
-    EXPECT_EQ(result.failedWrites, 1);
+    EXPECT_EQ(result.inserts.size(), 1u);
+    EXPECT_EQ(result.failedWrites, 0);
+    EXPECT_TRUE(result.errors.empty());
 }
 
 // ============================================================================
@@ -929,7 +932,7 @@ TEST(ProtoWriteFastPathGap, ErrorListCappedAtTen) {
     const int kBadPoints = 25;
     for (int i = 0; i < kBadPoints; ++i) {
         auto* wp = req.add_writes();
-        wp->set_measurement("bad measurement");  // space is invalid
+        wp->set_measurement(std::string("bad") + '\0');  // NUL is invalid
         ::timestar_pb::WriteField wf;
         wf.mutable_double_values()->add_values(1.0);
         (*wp->mutable_fields())["f"] = wf;

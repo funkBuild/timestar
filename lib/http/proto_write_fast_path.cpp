@@ -48,23 +48,26 @@ namespace timestar::proto {
 // duplicated here as a file-local static).
 
 // Fast name validation — same rules as HttpWriteHandler::validateName.
+// Names may contain any byte except NUL (the index KV-key separator).  All
+// structural series-key characters (',', '=', ' ', '"', '\\') are backslash-
+// escaped by timestar::buildSeriesKey, so spaces and symbols are allowed.
 // Returns true if valid, false otherwise.
 static bool isValidName(const std::string& s) {
     if (s.empty())
         return false;
     for (char c : s) {
-        if (c == '\0' || c == ',' || c == '=' || c == ' ')
+        if (c == '\0')
             return false;
     }
     return true;
 }
 
-// Tag values allow spaces but not null/comma/equals.
+// Tag values: same rule — any byte except NUL.
 static bool isValidTagValue(const std::string& s) {
     if (s.empty())
         return false;
     for (char c : s) {
-        if (c == '\0' || c == ',' || c == '=')
+        if (c == '\0')
             return false;
     }
     return true;

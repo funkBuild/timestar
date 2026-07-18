@@ -216,9 +216,9 @@ std::string QueryParser::parseMeasurement(const std::string& query, size_t& pos)
     if (sv.find('\0') != std::string_view::npos) {
         throw QueryParseException("Measurement name cannot contain null bytes");
     }
-    if (sv.find_first_of(" \t\n\r") != std::string_view::npos) {
-        throw QueryParseException("Measurement name cannot contain whitespace: '" + std::string(sv) + "'");
-    }
+    // Spaces are allowed inside a measurement name (e.g. "Wash Down Bay System").
+    // The name is unambiguously delimited by '(' / '{' / a trailing " by" clause,
+    // so internal whitespace needs no rejection — it matches what /write accepts.
 
     return std::string(sv);
 }

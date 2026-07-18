@@ -182,52 +182,41 @@ HttpWriteHandler::HttpWriteHandler(seastar::sharded<Engine>* _engineSharded) : e
 }
 
 // Fast validity check — no allocation on the happy path.
-static bool hasReservedChar(const std::string& s, bool allowSpace) {
-    for (char c : s) {
-        if (c == '\0' || c == ',' || c == '=')
-            return true;
-        if (!allowSpace && c == ' ')
-            return true;
-    }
-    return false;
+//
+// Names and tag values may contain any byte EXCEPT NUL.  NUL is rejected because
+// it is the separator byte inside index KV keys.  Every structural series-key
+// character (',', '=', ' ', '"', '\\') is backslash-escaped by
+// timestar::buildSeriesKey, so it is safe inside a name — alphanumeric, spaces,
+// and symbols are all allowed.
+static inline bool hasNullByte(const std::string& s) {
+    return s.find('\0') != std::string::npos;
 }
 
 // Fast-path name validation: returns true if name is valid, false otherwise.
 // Avoids constructing context string on the fast path.
 static inline bool isValidName(const std::string& name) {
-    return !name.empty() && !hasReservedChar(name, false);
+    return !name.empty() && !hasNullByte(name);
 }
 
 static inline bool isValidTagValue(const std::string& value) {
-    return !value.empty() && !hasReservedChar(value, true);
+    return !value.empty() && !hasNullByte(value);
 }
 
-// Shared slow-path validator: hasReservedChar() already ran and returned true,
-// so walk the string to produce a specific error message.
-static std::string validateStringHelper(const std::string& s, const std::string& context, bool allowSpace) {
+// Shared slow-path validator: produces a specific error message ({} if valid).
+static std::string validateStringHelper(const std::string& s, const std::string& context) {
     if (s.empty())
         return context + " must not be empty";
-    if (!hasReservedChar(s, allowSpace))
-        return {};
-    for (char c : s) {
-        if (c == '\0')
-            return context + " must not contain null bytes";
-        if (c == ',')
-            return context + " must not contain commas";
-        if (c == '=')
-            return context + " must not contain equals signs";
-        if (!allowSpace && c == ' ')
-            return context + " must not contain spaces";
-    }
+    if (hasNullByte(s))
+        return context + " must not contain null bytes";
     return {};
 }
 
 std::string HttpWriteHandler::validateName(const std::string& name, const std::string& context) {
-    return validateStringHelper(name, context, false);
+    return validateStringHelper(name, context);
 }
 
 std::string HttpWriteHandler::validateTagValue(const std::string& value, const std::string& context) {
-    return validateStringHelper(value, context, true);
+    return validateStringHelper(value, context);
 }
 
 void HttpWriteHandler::parseAndValidateWritePoint(const std::string& json) {

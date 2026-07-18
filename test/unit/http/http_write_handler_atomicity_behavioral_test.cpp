@@ -232,11 +232,12 @@ TEST_F(HttpWriteHandlerAtomicityBehavioralTest, InvalidBatchEntryYieldsPartialAn
 
         HttpWriteHandler handler(&eng.eng);
 
-        // Middle entry has an invalid measurement name (commas are reserved
-        // series-key separators), so it is rejected at parse/validation time.
+        // Middle entry has an empty measurement name, still rejected at
+        // parse/validation time (spaces and symbols are now allowed; only empty
+        // and NUL names are invalid).
         std::string body = R"({"writes": [
             {"measurement": "atomic_ok_a", "tags": {"host": "h1"}, "fields": {"v": 1.0}, "timestamp": 1000},
-            {"measurement": "bad,name", "tags": {"host": "h1"}, "fields": {"v": 2.0}, "timestamp": 2000},
+            {"measurement": "", "tags": {"host": "h1"}, "fields": {"v": 2.0}, "timestamp": 2000},
             {"measurement": "atomic_ok_b", "tags": {"host": "h1"}, "fields": {"v": 3.0}, "timestamp": 3000}
         ]})";
 
