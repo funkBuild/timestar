@@ -46,6 +46,11 @@ using namespace httpd;
 // (Defined before set_routes, initialized in main.)
 seastar::sharded<Engine> g_engine;
 
+// Consecutive compaction failures on any one tier before /health reports
+// "degraded". One failure can be transient; a run of them means the tier is
+// wedged and its file count is growing without bound.
+static constexpr uint64_t HEALTH_COMPACTION_FAILURE_THRESHOLD = 5;
+
 // Per-shard stream handler pointer, used to call stop() during shutdown.
 static thread_local timestar::http::HttpStreamHandler* g_streamHandler = nullptr;
 
@@ -91,9 +96,23 @@ void set_routes(routes& r) {
                  std::unique_ptr<seastar::http::reply> rep) -> seastar::future<std::unique_ptr<seastar::http::reply>> {
                   auto resFmt = timestar::http::responseFormat(*req);
                   if (g_ready.load(std::memory_order_acquire)) {
+                      // A tier that cannot merge is invisible until the server starts
+                      // refusing writes: the production incident this guards against ran
+                      // 15 minutes with /health saying "healthy" while compaction failed
+                      // ~6x/second and the tier grew without bound. Report "degraded"
+                      // once a tier has failed repeatedly, while still serving traffic
+                      // (200) -- the data is readable, the store just isn't compacting.
+                      const uint64_t worstFailures = g_engine.local().getMaxConsecutiveCompactionFailures();
+                      const bool compactionStuck = worstFailures >= HEALTH_COMPACTION_FAILURE_THRESHOLD;
+
                       rep->set_status(seastar::http::reply::status_type::ok);
                       if (timestar::http::isProtobuf(resFmt)) {
-                          rep->_content = timestar::proto::formatHealthResponse("healthy");
+                          rep->_content =
+                              timestar::proto::formatHealthResponse(compactionStuck ? "degraded" : "healthy");
+                      } else if (compactionStuck) {
+                          rep->_content =
+                              "{\"status\":\"degraded\",\"reason\":\"compaction_failing\",\"consecutive_failures\":" +
+                              std::to_string(worstFailures) + "}";
                       } else {
                           rep->_content = "{\"status\":\"healthy\"}";
                       }

@@ -1,6 +1,7 @@
 // Tests for Phase 0 (tombstone per-block overlap check) and Phase 1 (universal block stats)
 
 #include "../../../lib/core/series_id.hpp"
+#include "../../../lib/encoding/integer_encoder.hpp"
 #include "../../../lib/encoding/string_encoder.hpp"
 #include "../../../lib/query/aggregator.hpp"
 #include "../../../lib/query/block_aggregator.hpp"
@@ -48,9 +49,11 @@ seastar::future<> testIntegerBlockStatsRoundTrip(std::string filename) {
 
     auto* entry = co_await tsm.getFullIndexEntry(seriesId);
     EXPECT_NE(entry, nullptr);
-    if (!entry) co_return;
+    if (!entry)
+        co_return;
     EXPECT_EQ(entry->indexBlocks.size(), 1u);
-    if (entry->indexBlocks.empty()) co_return;
+    if (entry->indexBlocks.empty())
+        co_return;
 
     const auto& block = entry->indexBlocks[0];
     EXPECT_EQ(block.blockCount, 5u);
@@ -169,9 +172,11 @@ seastar::future<> testBoolBlockStatsRoundTrip(std::string filename) {
 
     auto* entry = co_await tsm.getFullIndexEntry(seriesId);
     EXPECT_NE(entry, nullptr);
-    if (!entry) co_return;
+    if (!entry)
+        co_return;
     EXPECT_EQ(entry->indexBlocks.size(), 1u);
-    if (entry->indexBlocks.empty()) co_return;
+    if (entry->indexBlocks.empty())
+        co_return;
 
     const auto& block = entry->indexBlocks[0];
     EXPECT_EQ(block.blockCount, 5u);
@@ -180,9 +185,9 @@ seastar::future<> testBoolBlockStatsRoundTrip(std::string filename) {
     EXPECT_EQ(block.boolLatestValue, false);  // at maxTime=5000
     EXPECT_TRUE(block.hasExtendedStats);
     // Aggregator-compatible double fields
-    EXPECT_DOUBLE_EQ(block.blockSum, 3.0);    // trueCount
-    EXPECT_DOUBLE_EQ(block.blockMax, 1.0);    // has at least one true
-    EXPECT_DOUBLE_EQ(block.blockMin, 0.0);    // has at least one false
+    EXPECT_DOUBLE_EQ(block.blockSum, 3.0);          // trueCount
+    EXPECT_DOUBLE_EQ(block.blockMax, 1.0);          // has at least one true
+    EXPECT_DOUBLE_EQ(block.blockMin, 0.0);          // has at least one false
     EXPECT_DOUBLE_EQ(block.blockFirstValue, 1.0);   // true
     EXPECT_DOUBLE_EQ(block.blockLatestValue, 0.0);  // false
 
@@ -244,9 +249,11 @@ seastar::future<> testStringBlockCountRoundTrip(std::string filename) {
 
     auto* entry = co_await tsm.getFullIndexEntry(seriesId);
     EXPECT_NE(entry, nullptr);
-    if (!entry) co_return;
+    if (!entry)
+        co_return;
     EXPECT_EQ(entry->indexBlocks.size(), 1u);
-    if (entry->indexBlocks.empty()) co_return;
+    if (entry->indexBlocks.empty())
+        co_return;
 
     // String blocks should have blockCount set but no value stats
     const auto& block = entry->indexBlocks[0];
@@ -288,11 +295,54 @@ TEST_F(TSMUniversalStatsTest, StringAggregationReturnsZero) {
     seastar::async([&] { testStringAggregationReturnsZero(getTestFilePath("0_7.tsm")).get(); }).get();
 }
 
-// ==================== Phase 1: Version V2 ====================
+// ==================== Phase 1: Version V3 ====================
 
-TEST_F(TSMUniversalStatsTest, TSMVersionIsV2) {
-    EXPECT_EQ(TSM_VERSION, 2u);
-    EXPECT_EQ(TSM_VERSION_MIN, 1u);
+TEST_F(TSMUniversalStatsTest, TSMVersionIsV3) {
+    EXPECT_EQ(TSM_VERSION, 3u);
+    // V3 widened the per-series index block count from uint16 to uint32, which
+    // moves every subsequent byte in an index entry — V1/V2 files cannot be
+    // parsed by the V3 reader and are rejected on open rather than misread.
+    EXPECT_EQ(TSM_VERSION_MIN, 3u);
+}
+
+TEST_F(TSMUniversalStatsTest, IndexEntryHeaderIsSeriesIdTypeAndUint32Count) {
+    EXPECT_EQ(TSM_INDEX_ENTRY_HEADER_SIZE, 16u + 1u + 4u);
+}
+
+// The reader sanity-checks a block's decoded timestamp COUNT against its
+// compressed BYTE length before using the count to size allocations. That bound
+// must never reject data the encoder can legitimately produce.
+//
+// The densest possible encoding is the constant-delta fast path
+// (integer_encoder_ffor.cpp encodeBlock): up to kBlockSize=1024 values emitted
+// as a bare 2-word header, i.e. 1024 values in 16 bytes = 64 values/byte, with
+// no partition-level prefix. Perfectly regular timestamps -- the common case for
+// this database -- hit exactly that path, so the guard sits right on top of the
+// most ordinary workload there is. This pins the real ratio, so that tightening
+// the guard, or making the encoder denser, fails here instead of silently
+// dropping blocks at read time (several call sites return nullptr/0 rather than
+// throwing).
+TEST_F(TSMUniversalStatsTest, DensestTimestampEncodingStaysInsidePlausibilityBound) {
+    // Perfectly constant interval: delta-of-delta is all zeros -> fast path.
+    std::vector<uint64_t> timestamps;
+    timestamps.reserve(4096);
+    for (uint64_t i = 0; i < 4096; ++i) {
+        timestamps.push_back(1700000000000000000ull + i * 1000000ull);
+    }
+
+    AlignedBuffer buf;
+    const size_t encodedBytes = IntegerEncoder::encodeInto(timestamps, buf);
+    ASSERT_GT(encodedBytes, 0u);
+
+    // Observed density must not exceed the encoder's theoretical maximum.
+    const double valuesPerByte = static_cast<double>(timestamps.size()) / static_cast<double>(encodedBytes);
+    EXPECT_LE(valuesPerByte, 64.0) << "Encoder became denser than 64 values/byte (" << valuesPerByte
+                                   << "); the reader's timestampCountIsPlausible() bound must be widened to match, "
+                                      "or valid blocks will be silently rejected at read time.";
+
+    // And it must comfortably satisfy the guard as actually written (which
+    // carries a 4x slack factor on top of the 64:1 theoretical maximum).
+    EXPECT_LE(static_cast<uint64_t>(timestamps.size()), static_cast<uint64_t>(encodedBytes) * 64ull * 4ull);
 }
 
 TEST_F(TSMUniversalStatsTest, IndexBlockByteSizes) {
@@ -329,14 +379,16 @@ seastar::future<> testIntegerLatestFromSparse(std::string filename) {
     // Zero-I/O LATEST from sparse index
     auto latest = tsm.getLatestFromSparse(seriesId);
     EXPECT_TRUE(latest.has_value());
-    if (!latest.has_value()) co_return;
+    if (!latest.has_value())
+        co_return;
     EXPECT_EQ(latest->timestamp, 5000u);
     EXPECT_DOUBLE_EQ(latest->value, 500.0);
 
     // Zero-I/O FIRST from sparse index
     auto first = tsm.getFirstFromSparse(seriesId);
     EXPECT_TRUE(first.has_value());
-    if (!first.has_value()) co_return;
+    if (!first.has_value())
+        co_return;
     EXPECT_EQ(first->timestamp, 1000u);
     EXPECT_DOUBLE_EQ(first->value, 100.0);
 
@@ -374,7 +426,8 @@ seastar::future<> testTombstonePerBlockOverlap(std::string filename) {
     // Verify we have multiple blocks
     auto* entry = co_await tsm.getFullIndexEntry(seriesId);
     EXPECT_NE(entry, nullptr);
-    if (!entry) co_return;
+    if (!entry)
+        co_return;
     EXPECT_GE(entry->indexBlocks.size(), 2u) << "Need multiple blocks for per-block tombstone test";
 
     // All blocks should have stats
@@ -427,7 +480,8 @@ seastar::future<> testMultiBlockIntegerStats(std::string filename) {
 
     auto* entry = co_await tsm.getFullIndexEntry(seriesId);
     EXPECT_NE(entry, nullptr);
-    if (!entry) co_return;
+    if (!entry)
+        co_return;
 
     // All blocks should have integer stats
     for (const auto& block : entry->indexBlocks) {
@@ -553,9 +607,11 @@ seastar::future<> testStringDictionaryRoundTrip(std::string filename) {
     // Check dictionary was stored in the index
     auto* entry = co_await tsm.getFullIndexEntry(seriesId);
     EXPECT_NE(entry, nullptr);
-    if (!entry) co_return;
+    if (!entry)
+        co_return;
     EXPECT_TRUE(entry->stringDictionary != nullptr) << "Low-cardinality strings should use dictionary";
-    if (!entry->stringDictionary) co_return;
+    if (!entry->stringDictionary)
+        co_return;
     EXPECT_FALSE(entry->stringDictionary->empty()) << "Low-cardinality strings should use dictionary";
     EXPECT_EQ(entry->stringDictionary->size(), 3u);
 
@@ -656,4 +712,46 @@ TEST_F(TSMUniversalStatsTest, StringDictionarySerializeDeserialize) {
     EXPECT_EQ(deserialized.entries[0], "hello");
     EXPECT_EQ(deserialized.entries[1], "world");
     EXPECT_EQ(deserialized.entries[2], "test");
+}
+
+// An all-NaN Float block reports blockCount == 0, because NaN is skipped by every
+// block stat. An earlier version of compaction's coalescing gate sized its decode
+// from blockCount and therefore judged a sparse-but-FULL Float series to be empty,
+// routing hundreds of MB down the decode path and reintroducing std::bad_alloc.
+//
+// This pins the property that made that reasoning wrong, so the gate can never be
+// re-derived from blockCount without failing here: blockCount is a non-NaN count,
+// whereas the block's compressed SIZE reflects the real number of points.
+TEST_F(TSMUniversalStatsTest, NaNBlocksReportZeroCountButRealSize) {
+    const std::string filename = getTestFilePath("0_91.tsm");
+    SeriesId128 seriesId = SeriesId128::fromSeriesKey("test.all_nan");
+
+    seastar::async([&] {
+        {
+            TSMWriter writer(filename);
+            std::vector<uint64_t> timestamps;
+            std::vector<double> values;
+            for (int i = 0; i < 3000; ++i) {
+                timestamps.push_back(1000ull + static_cast<uint64_t>(i) * 1000ull);
+                values.push_back(std::numeric_limits<double>::quiet_NaN());
+            }
+            writer.writeSeries(TSMValueType::Float, seriesId, timestamps, values);
+            writer.writeIndex();
+            writer.close();
+        }
+
+        TSM tsm(filename);
+        tsm.open().get();
+        auto* entry = tsm.getFullIndexEntry(seriesId).get();
+        ASSERT_NE(entry, nullptr);
+        ASSERT_EQ(entry->indexBlocks.size(), 1u);
+
+        const auto& block = entry->indexBlocks[0];
+        // The trap: a FULL 3000-point block reports a count of zero.
+        EXPECT_EQ(block.blockCount, 0u) << "NaN policy changed; recheck anything sizing work from blockCount";
+        // The safe signal: compressed size still reflects a full block.
+        EXPECT_GT(block.size, 0u);
+
+        tsm.close().get();
+    }).get();
 }

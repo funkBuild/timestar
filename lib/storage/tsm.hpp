@@ -87,9 +87,13 @@ struct BlockBatch {
 
 // Sparse index entry for lazy loading
 struct SparseIndexEntry {
-    SeriesId128 seriesId;     // 16 bytes - for hash map key
-    uint64_t fileOffset;      // 8 bytes - where to read in file
-    uint32_t entrySize;       // 4 bytes - how much to read
+    SeriesId128 seriesId;  // 16 bytes - for hash map key
+    uint64_t fileOffset;   // 8 bytes - where to read in file
+    // In-memory only (not serialized). uint64 so it cannot become the real
+    // ceiling now that blockCount is uint32: as a uint32 it capped a series at
+    // UINT32_MAX/80 = ~53.7M blocks per file, 80x below what the widened
+    // blockCount field can express.
+    uint64_t entrySize;
     TSMValueType seriesType;  // series value type (captured during sparse index parse)
     // Per-series time bounds (parsed from first/last block during sparse index load).
     // Enables skipping entire files for time-filtered queries without loading the
@@ -139,8 +143,13 @@ struct CacheSizeEstimator<::TSMIndexEntry> {
 // TSM file format version.
 // V1: Float blocks have stats (80 bytes), non-Float blocks are base-only (28 bytes).
 // V2: All types have block stats (Float=80, Integer=72, Boolean=40, String=32).
-static constexpr uint8_t TSM_VERSION = 2;
-static constexpr uint8_t TSM_VERSION_MIN = 1;  // oldest version we can read
+// V3: per-series index block count widened from uint16 to uint32.
+static constexpr uint8_t TSM_VERSION = 3;
+static constexpr uint8_t TSM_VERSION_MIN = 3;  // oldest version we can read
+
+// Fixed part of an index entry: SeriesId128 (16) + type (1) + block count (4).
+// Blocks and the optional string dictionary follow.
+static constexpr uint32_t TSM_INDEX_ENTRY_HEADER_SIZE = 16 + 1 + 4;
 
 // Per-type index block byte size for V2 files.
 // V1 files: Float=80, all others=28 (no stats).
@@ -173,7 +182,9 @@ private:
     std::string filePath;
     seastar::file tsmFile;
     uint64_t length = 0;
-    uint8_t fileVersion = 1;
+    // Defaults to the current version: a truncated header must never leave this
+    // at 1 and silently select the V1 index-block layout.
+    uint8_t fileVersion = TSM_VERSION;
     // Set by scheduleDelete(): the on-disk file was unlinked but the fd must
     // stay open for in-flight snapshot readers; the destructor closes it.
     bool deferCloseOnDestroy_ = false;
@@ -194,7 +205,7 @@ private:
     // into a TSMIndexEntry.  The Slice must be positioned just after the series type
     // and block-count fields have already been read.  On return the Slice offset is
     // advanced past all block data and the optional string dictionary.
-    void parseIndexBlocksFromSlice(Slice& indexSlice, TSMIndexEntry& entry, uint16_t blockCount) const;
+    void parseIndexBlocksFromSlice(Slice& indexSlice, TSMIndexEntry& entry, uint32_t blockCount) const;
 
     // Value-type dispatch for pushdown aggregation: decode one block as the
     // series' runtime type (Float/Integer/Boolean) and hand the decoded points

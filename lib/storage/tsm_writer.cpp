@@ -35,10 +35,146 @@ TSMWriter::TSMWriter(std::string _filename) {
     writeHeader();
 }
 
+seastar::future<> TSMWriter::openStreamFileIfNeeded() {
+    if (aborted_) {
+        throw std::logic_error("TSMWriter: use after abortStream() for " + filename +
+                               " -- reopening would truncate the file and leave a zero hole before flushedBytes_");
+    }
+    if (streamFileOpen_) {
+        co_return;
+    }
+    std::string_view filenameView{filename};
+    streamFile_ = co_await seastar::open_file_dma(
+        filenameView, seastar::open_flags::wo | seastar::open_flags::create | seastar::open_flags::truncate);
+    streamFileOpen_ = true;
+}
+
+// Write out the buffer's DMA-aligned prefix and keep the remainder.
+//
+// dma_write requires an aligned file offset, so mid-file drains can only emit
+// whole multiples of the alignment; the tail is memmoved to the front so the
+// buffer's 4096-aligned base address (guaranteed by dma_default_init_allocator)
+// still applies to the next write. On the final drain there is no "next write",
+// so the tail is zero-padded out and the file truncated back to its logical
+// size afterwards.
+seastar::future<> TSMWriter::drainBuffer(bool finalDrain) {
+    if (buffer.size() == 0 && !finalDrain) {
+        co_return;
+    }
+
+    co_await openStreamFileIfNeeded();
+
+    const size_t dmaAlign = streamFile_.disk_write_dma_alignment();
+    const size_t bufferedBytes = buffer.size();
+
+    // Mid-stream: only emit whole alignment units. Final: emit everything,
+    // padded up, then truncate.
+    size_t bytesToWrite = finalDrain ? bufferedBytes : (bufferedBytes / dmaAlign) * dmaAlign;
+    if (bytesToWrite == 0) {
+        co_return;
+    }
+
+    const size_t paddedSize = finalDrain ? ((bytesToWrite + dmaAlign - 1) & ~(dmaAlign - 1)) : bytesToWrite;
+    if (paddedSize > buffer.data.size()) {
+        buffer.data.resize(paddedSize);
+    }
+    if (paddedSize > bytesToWrite) {
+        std::memset(buffer.data.data() + bytesToWrite, 0, paddedSize - bytesToWrite);
+    }
+
+    const char* writePtr = reinterpret_cast<const char*>(buffer.data.data());
+    size_t written = 0;
+    while (written < paddedSize) {
+        size_t n = co_await streamFile_.dma_write(flushedBytes_ + written, writePtr + written, paddedSize - written);
+        if (n == 0) {
+            throw std::runtime_error("TSMWriter::drainBuffer: dma_write returned 0 for " + filename);
+        }
+        written += n;
+    }
+
+    flushedBytes_ += bytesToWrite;
+
+    // Carry the unaligned tail (if any) into the next drain.
+    const size_t remainder = bufferedBytes - bytesToWrite;
+    if (remainder > 0) {
+        std::memmove(buffer.data.data(), buffer.data.data() + bytesToWrite, remainder);
+    }
+    buffer.clear();
+    if (remainder > 0) {
+        buffer.grow_uninit(remainder);  // re-establish the logical size of the carried tail
+    }
+}
+
+seastar::future<> TSMWriter::flushIfNeeded() {
+    if (buffer.size() < FLUSH_THRESHOLD) {
+        co_return;
+    }
+    co_await drainBuffer(/*finalDrain=*/false);
+}
+
 void TSMWriter::writeHeader() {
     std::string magic("TASM");
     buffer.write(magic);
-    buffer.write(TSM_VERSION);  // Version 2: universal block stats for all types
+    buffer.write(TSM_VERSION);  // V3: uint32 per-series block count (V2 added universal block stats)
+}
+
+// Build the series' index entry shell (and, for strings, its dictionary).
+// Shared by the buffered and streaming variants below.
+template <class T>
+TSMIndexEntry TSMWriter::beginSeriesEntry(TSMValueType seriesType, const SeriesId128& seriesId,
+                                          const std::vector<T>& values) {
+    TSMIndexEntry indexEntry;
+    indexEntry.seriesId = seriesId;
+    indexEntry.seriesType = seriesType;
+
+    // Phase 3: For String series, try building a dictionary from all values.
+    // If valid, blocks will use dictionary encoding (varint IDs instead of raw strings).
+    if constexpr (std::is_same_v<T, std::string>) {
+        StringEncoder::Dictionary stringDict = StringEncoder::buildDictionary(values);
+        if (stringDict.valid) {
+            indexEntry.stringDictionary =
+                std::make_shared<const std::vector<std::string>>(std::move(stringDict.entries));
+        }
+    }
+    return indexEntry;
+}
+
+// Emit exactly ONE block, [offset, offset+blockSize), into the output buffer.
+// Factored out so the streaming variant can drain between blocks; there must be
+// no suspension point inside it, because the block's compressed-timestamp length
+// is back-patched into bytes still held in the buffer.
+template <class T>
+void TSMWriter::writeSeriesBlockAt(TSMValueType seriesType, const SeriesId128& seriesId,
+                                   const std::vector<uint64_t>& timestamps, const std::vector<T>& values, size_t offset,
+                                   size_t blockSize, TSMIndexEntry& indexEntry) {
+    // Zero-copy: pass span sub-ranges directly to writeBlock, avoiding
+    // two vector copies per block (timestamps + values).
+    // vector<bool> is a bitset without .data(), so bool inlines its encoding.
+    if constexpr (std::is_same_v<T, bool>) {
+        // Bool path: vector<bool> can't create span, so encode inline
+        const size_t end = offset + blockSize;
+        std::span<const uint64_t> tsSpan(timestamps.data() + offset, blockSize);
+        std::vector<bool> blockValues(values.begin() + offset, values.begin() + end);
+        size_t blockStartOffset = currentOffset();
+        buffer.write((uint8_t)seriesType);
+        buffer.write((uint32_t)blockSize);
+        // Encode timestamps directly into the output buffer (see writeBlock).
+        const size_t tsLenOffset = buffer.size();
+        buffer.write((uint32_t)0);  // placeholder: compressed timestamp byte length
+        const size_t tsBytes = IntegerEncoder::encodeInto(tsSpan, buffer);
+        if (tsBytes > std::numeric_limits<uint32_t>::max()) [[unlikely]] {
+            throw std::runtime_error("Compressed timestamps would be truncated in the block header: " +
+                                     std::to_string(tsBytes));
+        }
+        buffer.writeAt<uint32_t>(tsLenOffset, (uint32_t)tsBytes);
+        BoolEncoderRLE::encodeInto(blockValues, buffer);
+
+        writeIndexBlock(tsSpan, values, offset, blockSize, indexEntry, blockStartOffset);
+    } else {
+        std::span<const uint64_t> tsSpan(timestamps.data() + offset, blockSize);
+        std::span<const T> valSpan(values.data() + offset, blockSize);
+        writeBlock(seriesType, seriesId, tsSpan, valSpan, indexEntry);
+    }
 }
 
 template <class T>
@@ -50,72 +186,55 @@ void TSMWriter::writeSeries(TSMValueType seriesType, const SeriesId128& seriesId
     }
     // serializes a single series into one or more blocks. After each block, append an index entry.
     // Block size is config-driven via storage.max_points_per_block (default 3000).
-    TSMIndexEntry indexEntry;
-    indexEntry.seriesId = seriesId;
-    indexEntry.seriesType = seriesType;
+    TSMIndexEntry indexEntry = beginSeriesEntry<T>(seriesType, seriesId, values);
 
-    // Phase 3: For String series, try building a dictionary from all values.
-    // If valid, blocks will use dictionary encoding (varint IDs instead of raw strings).
-    StringEncoder::Dictionary stringDict;
-    if constexpr (std::is_same_v<T, std::string>) {
-        stringDict = StringEncoder::buildDictionary(values);
-        if (stringDict.valid) {
-            indexEntry.stringDictionary =
-                std::make_shared<const std::vector<std::string>>(std::move(stringDict.entries));
-        }
-    }
+    LOG_INSERT_PATH(timestar::tsm_log, debug, "Creating blocks for series '{}' ({} total points, up to {} per block)",
+                    seriesId.toHex(), timestamps.size(), MaxPointsPerBlock());
 
-    size_t offset = 0;
-    size_t blockCount = 0;
-
-    while (offset < timestamps.size()) {
+    for (size_t offset = 0; offset < timestamps.size(); offset += MaxPointsPerBlock()) {
         const size_t end = std::min(timestamps.size(), (size_t)(offset + MaxPointsPerBlock()));
-        size_t blockSize = end - offset;
-
-        if (blockCount == 0) {
-            LOG_INSERT_PATH(timestar::tsm_log, debug,
-                            "Creating blocks for series '{}' ({} total points, up to {} per block)", seriesId.toHex(),
-                            timestamps.size(), MaxPointsPerBlock());
-        }
-
-        LOG_INSERT_PATH(timestar::tsm_log, trace, "Writing block {} ({} points)", blockCount, blockSize);
-        blockCount++;
-
-        // Zero-copy: pass span sub-ranges directly to writeBlock, avoiding
-        // two vector copies per block (timestamps + values).
-        // vector<bool> is a bitset without .data(), so bool inlines its encoding.
-        if constexpr (std::is_same_v<T, bool>) {
-            // Bool path: vector<bool> can't create span, so encode inline
-            std::span<const uint64_t> tsSpan(timestamps.data() + offset, blockSize);
-            std::vector<bool> blockValues(values.begin() + offset, values.begin() + end);
-            size_t blockStartOffset = buffer.size();
-            buffer.write((uint8_t)seriesType);
-            buffer.write((uint32_t)blockSize);
-            // Encode timestamps directly into the output buffer (see writeBlock).
-            const size_t tsLenOffset = buffer.size();
-            buffer.write((uint32_t)0);  // placeholder: compressed timestamp byte length
-            const size_t tsBytes = IntegerEncoder::encodeInto(tsSpan, buffer);
-            buffer.writeAt<uint32_t>(tsLenOffset, (uint32_t)tsBytes);
-            BoolEncoderRLE::encodeInto(blockValues, buffer);
-
-            writeIndexBlock(tsSpan, values, offset, blockSize, indexEntry, blockStartOffset);
-        } else {
-            std::span<const uint64_t> tsSpan(timestamps.data() + offset, blockSize);
-            std::span<const T> valSpan(values.data() + offset, blockSize);
-            writeBlock(seriesType, seriesId, tsSpan, valSpan, indexEntry);
-        }
-
-        offset += MaxPointsPerBlock();
+        writeSeriesBlockAt<T>(seriesType, seriesId, timestamps, values, offset, end - offset, indexEntry);
     }
 
     // Phase 4A: Insert into map (keeps sorted automatically)
     indexEntries[seriesId] = std::move(indexEntry);
 }
 
+// Streaming variant: identical output, but drains the buffer between blocks.
+//
+// writeSeries() emits every block of the series before returning, so a caller
+// can only flush AFTER the whole series is buffered -- a single high-volume
+// series then pins its entire encoded size in one contiguous allocation, which
+// is precisely the behaviour the streaming writer exists to remove. Compaction's
+// merge path must use this instead.
+template <class T>
+seastar::future<> TSMWriter::writeSeriesStreaming(TSMValueType seriesType, const SeriesId128& seriesId,
+                                                  const std::vector<uint64_t>& timestamps,
+                                                  const std::vector<T>& values) {
+    if (timestamps.size() != values.size()) {
+        throw std::invalid_argument("TSMWriter::writeSeriesStreaming: timestamps (" +
+                                    std::to_string(timestamps.size()) + ") and values (" +
+                                    std::to_string(values.size()) + ") size mismatch");
+    }
+    TSMIndexEntry indexEntry = beginSeriesEntry<T>(seriesType, seriesId, values);
+
+    LOG_INSERT_PATH(timestar::tsm_log, debug, "Streaming blocks for series '{}' ({} total points, up to {} per block)",
+                    seriesId.toHex(), timestamps.size(), MaxPointsPerBlock());
+
+    for (size_t offset = 0; offset < timestamps.size(); offset += MaxPointsPerBlock()) {
+        const size_t end = std::min(timestamps.size(), (size_t)(offset + MaxPointsPerBlock()));
+        writeSeriesBlockAt<T>(seriesType, seriesId, timestamps, values, offset, end - offset, indexEntry);
+        // Block boundary: the length back-patch for this block is complete.
+        co_await flushIfNeeded();
+    }
+
+    indexEntries[seriesId] = std::move(indexEntry);
+}
+
 template <class T>
 void TSMWriter::writeBlock(TSMValueType seriesType, [[maybe_unused]] const SeriesId128& seriesId,
                            std::span<const uint64_t> timestamps, std::span<const T> values, TSMIndexEntry& indexEntry) {
-    size_t blockStartOffset = buffer.size();
+    size_t blockStartOffset = currentOffset();
 
     buffer.write((uint8_t)seriesType);          // uint8_t fieldType
     buffer.write((uint32_t)timestamps.size());  // uint32_t timestamp entries count
@@ -126,6 +245,10 @@ void TSMWriter::writeBlock(TSMValueType seriesType, [[maybe_unused]] const Serie
     const size_t tsLenOffset = buffer.size();
     buffer.write((uint32_t)0);  // placeholder: compressed timestamp partition length in bytes
     const size_t tsBytes = IntegerEncoder::encodeInto(timestamps, buffer);
+    if (tsBytes > std::numeric_limits<uint32_t>::max()) [[unlikely]] {
+        throw std::runtime_error("Compressed timestamps would be truncated in the block header: " +
+                                 std::to_string(tsBytes));
+    }
     buffer.writeAt<uint32_t>(tsLenOffset, (uint32_t)tsBytes);
 
     if constexpr (std::is_same_v<T, double>) {
@@ -194,7 +317,7 @@ void TSMWriter::writeIndexBlock(std::span<const uint64_t> timestamps, TSMIndexEn
     assert(std::is_sorted(timestamps.begin(), timestamps.end()));
     const uint64_t blockMinTime = timestamps.front();
     const uint64_t blockMaxTime = timestamps.back();
-    size_t blockSize = buffer.size() - blockStartOffset;
+    size_t blockSize = currentOffset() - blockStartOffset;
 
     if (blockSize > std::numeric_limits<uint32_t>::max()) {
         throw std::overflow_error("TSM block size " + std::to_string(blockSize) + " exceeds uint32_t maximum (" +
@@ -225,7 +348,7 @@ void TSMWriter::writeIndexBlock(std::span<const uint64_t> timestamps, std::span<
     assert(std::is_sorted(timestamps.begin(), timestamps.end()));
     const uint64_t blockMinTime = timestamps.front();
     const uint64_t blockMaxTime = timestamps.back();
-    size_t blockSize = buffer.size() - blockStartOffset;
+    size_t blockSize = currentOffset() - blockStartOffset;
 
     if (blockSize > std::numeric_limits<uint32_t>::max()) {
         throw std::overflow_error("TSM block size " + std::to_string(blockSize) + " exceeds uint32_t maximum (" +
@@ -341,7 +464,7 @@ void TSMWriter::writeIndexBlock(std::span<const uint64_t> timestamps, std::span<
     assert(std::is_sorted(timestamps.begin(), timestamps.end()));
     const uint64_t blockMinTime = timestamps.front();
     const uint64_t blockMaxTime = timestamps.back();
-    size_t blockSize = buffer.size() - blockStartOffset;
+    size_t blockSize = currentOffset() - blockStartOffset;
     if (blockSize > std::numeric_limits<uint32_t>::max()) {
         throw std::overflow_error("TSM block size exceeds uint32_t maximum");
     }
@@ -391,7 +514,7 @@ void TSMWriter::writeIndexBlock(std::span<const uint64_t> timestamps, const std:
     assert(std::is_sorted(timestamps.begin(), timestamps.end()));
     const uint64_t blockMinTime = timestamps.front();
     const uint64_t blockMaxTime = timestamps.back();
-    size_t blockSize = buffer.size() - blockStartOffset;
+    size_t blockSize = currentOffset() - blockStartOffset;
     if (blockSize > std::numeric_limits<uint32_t>::max()) {
         throw std::overflow_error("TSM block size exceeds uint32_t maximum");
     }
@@ -456,7 +579,7 @@ void TSMWriter::writeIndexBlock(std::span<const uint64_t> timestamps, const std:
 void TSMWriter::writeCompressedBlockWithStats(TSMValueType seriesType, const SeriesId128& seriesId,
                                               seastar::temporary_buffer<uint8_t>&& compressedData,
                                               const TSMIndexBlock& srcBlock) {
-    size_t blockStartOffset = buffer.size();
+    size_t blockStartOffset = currentOffset();
     buffer.write_bytes(reinterpret_cast<const char*>(compressedData.get()), compressedData.size());
 
     auto& indexEntry = indexEntries[seriesId];
@@ -491,97 +614,120 @@ void TSMWriter::writeCompressedBlockWithStats(TSMValueType seriesType, const Ser
     indexEntry.indexBlocks.push_back(std::move(indexBlock));
 }
 
+// Serialise one series' index entry. Shared by writeIndex() and
+// writeIndexStreaming(); contains no suspension point, so a drain may happen
+// only between entries.
+void TSMWriter::writeIndexEntryFor(const TSMIndexEntry& indexEntry) {
+    // Write SeriesId128 as 16 bytes (no length prefix needed since it's fixed size).
+    // write_bytes straight from the raw 16-byte array avoids the per-series
+    // std::string that toBytes() would allocate.
+    const auto& seriesIdRaw = indexEntry.seriesId.getRawData();
+    buffer.write_bytes(reinterpret_cast<const char*>(seriesIdRaw.data()), seriesIdRaw.size());
+
+    // Block type
+    buffer.write((uint8_t)indexEntry.seriesType);  // uint8_t fieldType
+
+    // num of index entries (uint32: a uint16 here capped one series at
+    // 65,535 blocks per file, which high-volume single-series ingest reaches
+    // and then cannot compact past — the merge threw at writeIndex() time,
+    // after all the work had already been done)
+    if (indexEntry.indexBlocks.size() > std::numeric_limits<uint32_t>::max()) {
+        throw std::runtime_error("Too many blocks for series in TSM file: " +
+                                 std::to_string(indexEntry.indexBlocks.size()));
+    }
+    buffer.write(static_cast<uint32_t>(indexEntry.indexBlocks.size()));
+
+    // for each block — per-type stats (V2 format)
+    for (auto const& block : indexEntry.indexBlocks) {
+        buffer.write(block.minTime);  // minTime
+        buffer.write(block.maxTime);  // maxTime
+        buffer.write(block.offset);   // byte offset from start of file
+        buffer.write(block.size);     // block size
+        if (indexEntry.seriesType == TSMValueType::Float) {
+            // Float: 80 bytes (28 base + 52 stats)
+            buffer.write(block.blockSum);
+            buffer.write(block.blockMin);
+            buffer.write(block.blockMax);
+            buffer.write(block.blockCount);
+            buffer.write(block.blockM2);
+            buffer.write(block.blockFirstValue);
+            buffer.write(block.blockLatestValue);
+        } else if (indexEntry.seriesType == TSMValueType::Integer) {
+            // Integer: 72 bytes (28 base + count(4) + sum/min/max/first/latest as int64)
+            // Clamp double→int64 to avoid undefined behavior when values exceed INT64 range
+            // (blockSum of large int64 values can exceed 2^63, and values >= 2^53 lose precision)
+            auto safeToInt64 = [](double v) -> int64_t {
+                constexpr double maxSafe = static_cast<double>(std::numeric_limits<int64_t>::max());
+                constexpr double minSafe = static_cast<double>(std::numeric_limits<int64_t>::min());
+                if (v >= maxSafe)
+                    return std::numeric_limits<int64_t>::max();
+                if (v <= minSafe)
+                    return std::numeric_limits<int64_t>::min();
+                return static_cast<int64_t>(v);
+            };
+            buffer.write(block.blockCount);
+            buffer.write(safeToInt64(block.blockSum));
+            buffer.write(safeToInt64(block.blockMin));
+            buffer.write(safeToInt64(block.blockMax));
+            buffer.write(safeToInt64(block.blockFirstValue));
+            buffer.write(safeToInt64(block.blockLatestValue));
+        } else if (indexEntry.seriesType == TSMValueType::Boolean) {
+            // Boolean: 40 bytes (28 base + count(4) + trueCount(4) + first(1) + latest(1) + pad(2))
+            buffer.write(block.blockCount);
+            buffer.write(block.boolTrueCount);
+            buffer.write(static_cast<uint8_t>(block.boolFirstValue ? 1 : 0));
+            buffer.write(static_cast<uint8_t>(block.boolLatestValue ? 1 : 0));
+            buffer.write(static_cast<uint16_t>(0));  // padding
+        } else if (indexEntry.seriesType == TSMValueType::String) {
+            // String: 32 bytes (28 base + count(4))
+            buffer.write(block.blockCount);
+        }
+    }
+
+    // Phase 3: Write string dictionary after block metadata for String series.
+    // Format: dictSize(4) + dictData(dictSize bytes)
+    // dictSize == 0 means no dictionary (raw encoding used).
+    if (indexEntry.seriesType == TSMValueType::String) {
+        if (indexEntry.stringDictionary && !indexEntry.stringDictionary->empty()) {
+            StringEncoder::Dictionary dict;
+            dict.entries = *indexEntry.stringDictionary;
+            dict.valid = true;
+            AlignedBuffer serialized = StringEncoder::serializeDictionary(dict);
+            buffer.write(static_cast<uint32_t>(serialized.size()));
+            buffer.write(serialized);
+        } else {
+            buffer.write(static_cast<uint32_t>(0));  // no dictionary
+        }
+    }
+}
+
 void TSMWriter::writeIndex() {
     // std::map maintains sorted order automatically
-    size_t indexStartOffset = buffer.size();
+    size_t indexStartOffset = currentOffset();
     LOG_INSERT_PATH(timestar::tsm_log, debug, "Index starts at offset: {} ({:#x}), writing {} index entries",
                     indexStartOffset, indexStartOffset, indexEntries.size());
 
-    // Iterate directly - already sorted by SeriesId128
     for (auto const& [seriesId, indexEntry] : indexEntries) {
-        // Write SeriesId128 as 16 bytes (no length prefix needed since it's fixed size).
-        // write_bytes straight from the raw 16-byte array avoids the per-series
-        // std::string that toBytes() would allocate.
-        const auto& seriesIdRaw = indexEntry.seriesId.getRawData();
-        buffer.write_bytes(reinterpret_cast<const char*>(seriesIdRaw.data()), seriesIdRaw.size());
-
-        // Block type
-        buffer.write((uint8_t)indexEntry.seriesType);  // uint8_t fieldType
-
-        // num of index entries
-        if (indexEntry.indexBlocks.size() > std::numeric_limits<uint16_t>::max()) {
-            throw std::runtime_error("Too many blocks for series in TSM file: " +
-                                     std::to_string(indexEntry.indexBlocks.size()));
-        }
-        buffer.write(static_cast<uint16_t>(indexEntry.indexBlocks.size()));
-
-        // for each block — per-type stats (V2 format)
-        for (auto const& block : indexEntry.indexBlocks) {
-            buffer.write(block.minTime);  // minTime
-            buffer.write(block.maxTime);  // maxTime
-            buffer.write(block.offset);   // byte offset from start of file
-            buffer.write(block.size);     // block size
-            if (indexEntry.seriesType == TSMValueType::Float) {
-                // Float: 80 bytes (28 base + 52 stats)
-                buffer.write(block.blockSum);
-                buffer.write(block.blockMin);
-                buffer.write(block.blockMax);
-                buffer.write(block.blockCount);
-                buffer.write(block.blockM2);
-                buffer.write(block.blockFirstValue);
-                buffer.write(block.blockLatestValue);
-            } else if (indexEntry.seriesType == TSMValueType::Integer) {
-                // Integer: 72 bytes (28 base + count(4) + sum/min/max/first/latest as int64)
-                // Clamp double→int64 to avoid undefined behavior when values exceed INT64 range
-                // (blockSum of large int64 values can exceed 2^63, and values >= 2^53 lose precision)
-                auto safeToInt64 = [](double v) -> int64_t {
-                    constexpr double maxSafe = static_cast<double>(std::numeric_limits<int64_t>::max());
-                    constexpr double minSafe = static_cast<double>(std::numeric_limits<int64_t>::min());
-                    if (v >= maxSafe)
-                        return std::numeric_limits<int64_t>::max();
-                    if (v <= minSafe)
-                        return std::numeric_limits<int64_t>::min();
-                    return static_cast<int64_t>(v);
-                };
-                buffer.write(block.blockCount);
-                buffer.write(safeToInt64(block.blockSum));
-                buffer.write(safeToInt64(block.blockMin));
-                buffer.write(safeToInt64(block.blockMax));
-                buffer.write(safeToInt64(block.blockFirstValue));
-                buffer.write(safeToInt64(block.blockLatestValue));
-            } else if (indexEntry.seriesType == TSMValueType::Boolean) {
-                // Boolean: 40 bytes (28 base + count(4) + trueCount(4) + first(1) + latest(1) + pad(2))
-                buffer.write(block.blockCount);
-                buffer.write(block.boolTrueCount);
-                buffer.write(static_cast<uint8_t>(block.boolFirstValue ? 1 : 0));
-                buffer.write(static_cast<uint8_t>(block.boolLatestValue ? 1 : 0));
-                buffer.write(static_cast<uint16_t>(0));  // padding
-            } else if (indexEntry.seriesType == TSMValueType::String) {
-                // String: 32 bytes (28 base + count(4))
-                buffer.write(block.blockCount);
-            }
-        }
-
-        // Phase 3: Write string dictionary after block metadata for String series.
-        // Format: dictSize(4) + dictData(dictSize bytes)
-        // dictSize == 0 means no dictionary (raw encoding used).
-        if (indexEntry.seriesType == TSMValueType::String) {
-            if (indexEntry.stringDictionary && !indexEntry.stringDictionary->empty()) {
-                StringEncoder::Dictionary dict;
-                dict.entries = *indexEntry.stringDictionary;
-                dict.valid = true;
-                AlignedBuffer serialized = StringEncoder::serializeDictionary(dict);
-                buffer.write(static_cast<uint32_t>(serialized.size()));
-                buffer.write(serialized);
-            } else {
-                buffer.write(static_cast<uint32_t>(0));  // no dictionary
-            }
-        }
+        writeIndexEntryFor(indexEntry);
     }
 
     buffer.write(static_cast<uint64_t>(indexStartOffset));
     LOG_INSERT_PATH(timestar::tsm_log, debug, "Wrote index offset: {} ({:#x}), final buffer size: {}", indexStartOffset,
                     indexStartOffset, buffer.size());
+}
+
+seastar::future<> TSMWriter::writeIndexStreaming() {
+    size_t indexStartOffset = currentOffset();
+    LOG_INSERT_PATH(timestar::tsm_log, debug, "Index starts at offset: {} ({:#x}), streaming {} index entries",
+                    indexStartOffset, indexStartOffset, indexEntries.size());
+
+    for (auto const& [seriesId, indexEntry] : indexEntries) {
+        writeIndexEntryFor(indexEntry);
+        // Entry boundary: nothing is mid-write, so the buffer can be drained.
+        co_await flushIfNeeded();
+    }
+
+    buffer.write(static_cast<uint64_t>(indexStartOffset));
 }
 
 // fsync the parent directory to ensure a newly-created file's directory
@@ -600,6 +746,18 @@ static void fsyncParentDir(const std::string& filepath) {
 void TSMWriter::close() {
     LOG_INSERT_PATH(timestar::tsm_log, debug, "Writing file: {}, buffer size: {} ({:#x}), capacity: {}", filename,
                     buffer.size(), buffer.size(), buffer.capacity());
+
+    // The blocking path writes `buffer` as the whole file, so it cannot finish a
+    // stream that has already flushed part of itself to disk. Callers that use
+    // flushIfNeeded() must finalise with closeDMA().
+    // Guard on the stream being OPEN as well as on bytes having been written:
+    // openStreamFileIfNeeded() runs before any bytes are emitted, so a stream can
+    // be open with flushedBytes_ == 0 (e.g. the first dma_write failed, or the
+    // aligned prefix was empty). In that state this path would leak the DMA fd
+    // and write the file a second time via POSIX.
+    if (streamFileOpen_ || flushedBytes_ != 0) {
+        throw std::logic_error("TSMWriter::close() called on a streaming writer; use closeDMA() instead");
+    }
 
     // Use raw POSIX I/O instead of std::ofstream to avoid the C++ stdio
     // buffering layer (which chunks large writes into 8KB pieces internally).
@@ -659,79 +817,50 @@ void TSMWriter::close() {
     LOG_INSERT_PATH(timestar::tsm_log, debug, "File written successfully: {}", filename);
 }
 
-seastar::future<> TSMWriter::closeDMA() {
-    LOG_INSERT_PATH(timestar::tsm_log, debug, "DMA writing file: {}, buffer size: {} ({:#x}), capacity: {}", filename,
-                    buffer.size(), buffer.size(), buffer.capacity());
-
-    const size_t dataSize = buffer.size();
-
-    // Open the file for DMA writes (create or truncate, write-only)
-    std::string_view filenameView{filename};
-    auto file = co_await seastar::open_file_dma(
-        filenameView, seastar::open_flags::wo | seastar::open_flags::create | seastar::open_flags::truncate);
-
-    // Ensure we close the file on any exit path (success or exception).
-    // GCC 14 does not support co_await in catch blocks, so we use a
-    // scope guard pattern: capture any exception, close outside the
-    // handler, then rethrow.
-    std::exception_ptr writeError;
+seastar::future<> TSMWriter::abortStream() {
+    aborted_ = true;
+    if (!streamFileOpen_) {
+        co_return;
+    }
+    streamFileOpen_ = false;
     try {
-        const size_t dmaAlign = file.disk_write_dma_alignment();
+        co_await streamFile_.close();
+    } catch (...) {
+        // Best effort: the file is being discarded, and surfacing a close error
+        // here would mask the original failure that triggered the abort.
+    }
+}
 
-        // Pad the data size up to DMA alignment boundary.
-        // The file will contain extra zero bytes at the end, but TSM readers
-        // use the index offset (last 8 bytes of the *logical* data) to find
-        // the index, so they never read past the logical end.  After the
-        // write we truncate the file to the exact logical size.
-        const size_t paddedSize = (dataSize + dmaAlign - 1) & ~(dmaAlign - 1);
+seastar::future<> TSMWriter::closeDMA() {
+    LOG_INSERT_PATH(timestar::tsm_log, debug, "DMA finalising file: {}, buffered: {}, already flushed: {}", filename,
+                    buffer.size(), flushedBytes_);
 
-        // The AlignedBuffer's underlying vector uses dma_default_init_allocator
-        // which guarantees the base address is aligned to DMA_ALIGNMENT (4096).
-        // This satisfies Seastar's memory_dma_alignment requirement, so we can
-        // write directly from buffer.data without an intermediate memcpy.
-        //
-        // We only need to ensure the padding region (beyond dataSize, up to
-        // paddedSize) is accessible and zero-filled.  Resize the vector to
-        // the padded size -- the allocator default-initializes, so we must
-        // explicitly zero the padding bytes for deterministic content.
-        const size_t prevCapacity = buffer.data.size();
-        if (paddedSize > prevCapacity) {
-            buffer.data.resize(paddedSize);
+    // Drain whatever is left. If flushIfNeeded() was used during writing, most
+    // of the file is already on disk and this only emits the tail; if it was
+    // never called, this writes the whole thing exactly as before.
+    std::exception_ptr writeError;
+    uint64_t logicalSize = 0;
+    try {
+        const uint64_t bufferedBytes = buffer.size();
+        logicalSize = flushedBytes_ + bufferedBytes;
+        co_await drainBuffer(/*finalDrain=*/true);
+
+        // drainBuffer pads the final write up to DMA alignment, so the file on
+        // disk can be longer than the logical content. Trim back unconditionally
+        // (a no-op when sizes already match) so output stays byte-identical to
+        // the POSIX close() path and readers never see padding.
+        if (streamFileOpen_) {
+            co_await streamFile_.truncate(logicalSize);
+            co_await streamFile_.flush();
         }
-        if (paddedSize > dataSize) {
-            std::memset(buffer.data.data() + dataSize, 0, paddedSize - dataSize);
-        }
-
-        const char* writePtr = reinterpret_cast<const char*>(buffer.data.data());
-
-        // Write the entire buffer in a single DMA write.  Seastar's
-        // dma_write may return a short write count, so loop until all
-        // bytes are written.  In practice, for aligned writes up to
-        // disk_write_max_length (~1GB), this completes in one call.
-        size_t written = 0;
-        while (written < paddedSize) {
-            size_t n = co_await file.dma_write(written, writePtr + written, paddedSize - written);
-            if (n == 0) {
-                throw std::runtime_error("TSMWriter::closeDMA: dma_write returned 0 for " + filename);
-            }
-            written += n;
-        }
-
-        // Truncate to exact logical size to remove DMA padding bytes.
-        // This ensures the on-disk file is byte-identical to what close() produces.
-        if (paddedSize != dataSize) {
-            co_await file.truncate(dataSize);
-        }
-
-        // Flush for durability (equivalent to fsync)
-        co_await file.flush();
-
     } catch (...) {
         writeError = std::current_exception();
     }
 
-    // Always close the file handle
-    co_await file.close();
+    if (streamFileOpen_) {
+        co_await streamFile_.close();
+        streamFileOpen_ = false;
+    }
 
     if (writeError) {
         std::rethrow_exception(writeError);
@@ -850,3 +979,52 @@ template void TSMWriter::writeSeries<std::string>(TSMValueType seriesType, const
 template void TSMWriter::writeSeries<int64_t>(TSMValueType seriesType, const SeriesId128& seriesId,
                                               const std::vector<uint64_t>& timestamps,
                                               const std::vector<int64_t>& values);
+
+// Append a chunk to a series already (or not yet) present in the index.
+template <class T>
+seastar::future<> TSMWriter::appendSeriesChunk(TSMValueType seriesType, const SeriesId128& seriesId,
+                                               std::vector<uint64_t> timestamps, std::vector<T> values) {
+    if (timestamps.size() != values.size()) {
+        throw std::invalid_argument("TSMWriter::appendSeriesChunk: timestamps (" + std::to_string(timestamps.size()) +
+                                    ") and values (" + std::to_string(values.size()) + ") size mismatch");
+    }
+    if (timestamps.empty()) {
+        co_return;
+    }
+
+    // Look up (or create) the entry and APPEND to it -- never replace it.
+    auto& indexEntry = indexEntries[seriesId];
+    if (indexEntry.indexBlocks.empty()) {
+        indexEntry.seriesId = seriesId;
+        indexEntry.seriesType = seriesType;
+        // Deliberately no stringDictionary: see the declaration comment.
+    }
+
+    for (size_t offset = 0; offset < timestamps.size(); offset += MaxPointsPerBlock()) {
+        const size_t end = std::min(timestamps.size(), (size_t)(offset + MaxPointsPerBlock()));
+        writeSeriesBlockAt<T>(seriesType, seriesId, timestamps, values, offset, end - offset, indexEntry);
+        co_await flushIfNeeded();
+    }
+}
+
+// Streaming variants (compaction merge path)
+template seastar::future<> TSMWriter::writeSeriesStreaming<double>(TSMValueType, const SeriesId128&,
+                                                                   const std::vector<uint64_t>&,
+                                                                   const std::vector<double>&);
+template seastar::future<> TSMWriter::writeSeriesStreaming<bool>(TSMValueType, const SeriesId128&,
+                                                                 const std::vector<uint64_t>&,
+                                                                 const std::vector<bool>&);
+template seastar::future<> TSMWriter::writeSeriesStreaming<std::string>(TSMValueType, const SeriesId128&,
+                                                                        const std::vector<uint64_t>&,
+                                                                        const std::vector<std::string>&);
+template seastar::future<> TSMWriter::writeSeriesStreaming<int64_t>(TSMValueType, const SeriesId128&,
+                                                                    const std::vector<uint64_t>&,
+                                                                    const std::vector<int64_t>&);
+template seastar::future<> TSMWriter::appendSeriesChunk<double>(TSMValueType, const SeriesId128&, std::vector<uint64_t>,
+                                                                std::vector<double>);
+template seastar::future<> TSMWriter::appendSeriesChunk<bool>(TSMValueType, const SeriesId128&, std::vector<uint64_t>,
+                                                              std::vector<bool>);
+template seastar::future<> TSMWriter::appendSeriesChunk<std::string>(TSMValueType, const SeriesId128&,
+                                                                     std::vector<uint64_t>, std::vector<std::string>);
+template seastar::future<> TSMWriter::appendSeriesChunk<int64_t>(TSMValueType, const SeriesId128&,
+                                                                 std::vector<uint64_t>, std::vector<int64_t>);

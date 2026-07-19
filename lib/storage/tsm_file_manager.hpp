@@ -5,6 +5,7 @@
 #include "timestar_config.hpp"
 #include "tsm.hpp"
 
+#include <array>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -21,6 +22,8 @@ class TSMCompactor;
 class TSMFileManager {
 private:
     static constexpr size_t MAX_TIERS = 5;
+    // Upper bound on the per-tier retry backoff, in compaction cycles.
+    static constexpr uint64_t MAX_COMPACTION_BACKOFF_CYCLES = 64;
     static size_t filesPerCompaction() { return timestar::config().storage.compaction.tier0_min_files; }
 
     int shardId;
@@ -35,6 +38,17 @@ private:
 
     // Counter for completed compactions (read by Engine to update Prometheus metrics)
     uint64_t completedCompactions_ = 0;
+
+    // Per-tier failure tracking, used both for operator visibility and to back
+    // off retries. A failing compaction re-reads its whole input set before
+    // throwing, so retrying it at full speed burns CPU and disk continuously.
+    struct TierFailureState {
+        uint64_t consecutive = 0;
+        // Skip this many compaction cycles before trying this tier again.
+        uint64_t cooldownCycles = 0;
+    };
+    std::array<TierFailureState, MAX_TIERS> tierFailures_{};
+    uint64_t totalCompactionFailures_ = 0;
     std::optional<seastar::future<>> compactionTask;
 
     // I/O scheduling group for compaction (lower priority than queries).
@@ -79,6 +93,25 @@ public:
 
     // Number of compactions completed since startup (for Prometheus metrics)
     uint64_t getCompletedCompactions() const { return completedCompactions_; }
+
+    // --- Compaction health (for Prometheus / operator visibility) ---
+    // A tier that can never merge is otherwise invisible until the server
+    // starts refusing writes: /health kept reporting "healthy" while a tier
+    // grew without bound and the compactor retried ~6x/second forever.
+    uint64_t getConsecutiveFailures(uint64_t tier) const {
+        return tier < MAX_TIERS ? tierFailures_[tier].consecutive : 0;
+    }
+    uint64_t getTotalCompactionFailures() const { return totalCompactionFailures_; }
+    static constexpr uint64_t maxTiers() { return MAX_TIERS; }
+    // Deepest tier currently at or over its compaction threshold, -1 if none.
+    int getDeepestBackloggedTier() const {
+        for (int tier = static_cast<int>(MAX_TIERS) - 2; tier >= 0; --tier) {
+            if (shouldCompactTier(static_cast<uint64_t>(tier))) {
+                return tier;
+            }
+        }
+        return -1;
+    }
 
     // Set the I/O scheduling group for background compaction.
     void setCompactionGroup(seastar::scheduling_group sg) {

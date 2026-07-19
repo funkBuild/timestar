@@ -152,10 +152,9 @@ TEST_F(BugfixSourceInspectionTest, Bug8_WhenAllSucceedUsed) {
         // Check the surrounding context (allow when_all_succeed but not bare when_all)
         size_t lineStart = src.rfind('\n', pos);
         std::string line = src.substr(lineStart != std::string::npos ? lineStart : 0,
-                                       pos + 30 - (lineStart != std::string::npos ? lineStart : 0));
+                                      pos + 30 - (lineStart != std::string::npos ? lineStart : 0));
         if (line.find("when_all_succeed") == std::string::npos) {
-            FAIL() << "Found bare 'when_all(' (without _succeed) in tsm_compactor.cpp near: "
-                   << line;
+            FAIL() << "Found bare 'when_all(' (without _succeed) in tsm_compactor.cpp near: " << line;
         }
         pos += 9;
     }
@@ -168,9 +167,22 @@ TEST_F(BugfixSourceInspectionTest, Bug9_TempFileCleanupGuard) {
     std::string src = readFile(TSM_COMPACTOR_SOURCE_PATH);
     ASSERT_FALSE(src.empty()) << "Could not read tsm_compactor.cpp";
 
-    // The compact() function must clean up temp files on failure via catch block
-    EXPECT_NE(src.find("std::filesystem::remove(tempPath"), std::string::npos)
-        << "compact() must clean up temp files on failure in the catch block";
+    // compact() must clean up its temp file when the compaction fails, so a
+    // failed merge never leaves a partially-written .tsm behind.
+    //
+    // The cleanup used to be a blocking std::filesystem::remove() inside the
+    // catch block (GCC forbids co_await there). It is now done after the
+    // handler, via the async seastar::remove_file, preceded by closing the
+    // writer's streaming fd. Accept either spelling: the invariant under test
+    // is that the temp file is removed, not which API removes it.
+    const bool removesTempFile = src.find("seastar::remove_file(tempPath") != std::string::npos ||
+                                 src.find("std::filesystem::remove(tempPath") != std::string::npos;
+    EXPECT_TRUE(removesTempFile) << "compact() must clean up its temp file when compaction fails";
+
+    // The fd must be released before the unlink, otherwise the failure path
+    // leaks the open handle for the discarded output.
+    EXPECT_NE(src.find("abortStream()"), std::string::npos)
+        << "compact() must close the writer's streaming file handle on the failure path";
 }
 
 // ---------------------------------------------------------------------------
@@ -187,8 +199,7 @@ TEST_F(BugfixSourceInspectionTest, Bug10_WriteMemstoreUseTmpFile) {
     auto fnEnd = src.find("\nTSMFileManager::", fnStart + 30);
     std::string fnBody = src.substr(fnStart, fnEnd != std::string::npos ? fnEnd - fnStart : std::string::npos);
 
-    EXPECT_NE(fnBody.find(".tmp"), std::string::npos)
-        << "writeMemstore must write to a .tmp file first";
+    EXPECT_NE(fnBody.find(".tmp"), std::string::npos) << "writeMemstore must write to a .tmp file first";
     EXPECT_NE(fnBody.find("rename_file"), std::string::npos)
         << "writeMemstore must rename .tmp to final after successful write";
 }

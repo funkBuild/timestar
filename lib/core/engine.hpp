@@ -187,6 +187,20 @@ public:
     size_t getTSMFileCount() const { return tsmFileManager.getSequencedTsmFiles().size(); }
     uint64_t getCompletedCompactions() const { return tsmFileManager.getCompletedCompactions(); }
 
+    // Compaction health. A tier that can never merge is otherwise invisible from
+    // outside the process: the original production incident ran for 15 minutes
+    // with /health reporting "healthy" while the tier grew without bound and the
+    // server had already started rejecting writes.
+    uint64_t getCompactionFailures() const { return tsmFileManager.getTotalCompactionFailures(); }
+    int getDeepestBackloggedTier() const { return tsmFileManager.getDeepestBackloggedTier(); }
+    uint64_t getMaxConsecutiveCompactionFailures() const {
+        uint64_t worst = 0;
+        for (uint64_t tier = 0; tier < TSMFileManager::maxTiers(); ++tier) {
+            worst = std::max(worst, tsmFileManager.getConsecutiveFailures(tier));
+        }
+        return worst;
+    }
+
     // Set I/O scheduling groups (called from main after create_scheduling_group).
     // create_scheduling_group is a global operation, so groups must be created
     // once from any shard and then distributed via invoke_on_all.

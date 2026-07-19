@@ -10,6 +10,7 @@
 #include "tsm_writer.hpp"
 
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <seastar/core/coroutine.hh>
@@ -60,6 +61,9 @@ private:
     std::unique_ptr<CompactionStrategy> strategy;
     // lastCompactStats removed — compact() now returns stats via CompactionResult
     seastar::semaphore compactionSemaphore{2};  // Re-initialized in constructor from config
+    // Units are KiB of estimated decoded bytes; bounds total concurrent
+    // coalescing work across all series in flight on this shard.
+    seastar::semaphore coalesceBudget_{COALESCE_TOTAL_BUDGET_BYTES / 1024};
     bool compactionEnabled{true};
 
     // Per-series retention context built in compact(), passed to processSeriesForCompaction
@@ -89,14 +93,29 @@ private:
     static uint64_t maxDataSeqOf(const std::vector<seastar::shared_ptr<TSM>>& files);
 
     // Phase 3: Process series for compaction without writing (for parallel processing)
+    // Sink used to emit merged points incrementally. When supplied, the merge
+    // path hands off each bounded chunk instead of accumulating the whole
+    // series in SeriesCompactionData::timestamps/values.
+    template <typename T>
+    using PointChunkSink =
+        std::function<seastar::future<>(std::vector<uint64_t>&& timestamps, std::vector<T>&& values)>;
+
+    // Points buffered before a chunk is handed to the sink. 256K points is
+    // ~4 MB for double (8B ts + 8B value), i.e. bounded regardless of series
+    // size, and a comfortable multiple of MaxPointsPerBlock (3000).
+    static constexpr size_t MERGE_CHUNK_POINTS = 256 * 1024;
+
     template <typename T>
     seastar::future<SeriesCompactionData<T>> processSeriesForCompaction(
         const SeriesId128& seriesId, const std::vector<seastar::shared_ptr<TSM>>& sources,
-        const SeriesRetentionMap& seriesRetention);
+        const SeriesRetentionMap& seriesRetention, PointChunkSink<T> sink = nullptr);
 
     // Phase 3: Write pre-processed series data to TSMWriter
     template <typename T>
-    void writeSeriesCompactionData(TSMWriter& writer, SeriesCompactionData<T>&& data, CompactionStats& stats);
+    // Takes `data` BY VALUE: this is a coroutine that suspends on flushIfNeeded(),
+    // so an rvalue-reference parameter would dangle across the suspension.
+    seastar::future<> writeSeriesCompactionData(TSMWriter& writer, SeriesCompactionData<T> data,
+                                                CompactionStats& stats);
 
     // Get all unique series IDs from files
     std::vector<SeriesId128> getAllSeriesIds(const std::vector<seastar::shared_ptr<TSM>>& files);
@@ -138,6 +157,32 @@ public:
     seastar::future<CompactionResult> compact(const std::vector<seastar::shared_ptr<TSM>>& files) {
         return compact(files, 0, 0);
     }
+
+    // --- Under-full block coalescing ---
+    // A sparse, high-cardinality series gets a tiny block per memstore rollover,
+    // and the zero-copy carry preserves those forever: file count drops, block
+    // count never does. Re-encoding through the merge path re-chunks them at
+    // MaxPointsPerBlock.
+    //
+    // The gate must NOT be derived from TSMIndexBlock::blockCount: for Float that
+    // is the NON-NaN count (an all-NaN block reports 0), so a sparse series of
+    // FULL blocks would look empty and get decoded. Compressed block BYTES are
+    // NaN-independent and are what we use instead.
+    static constexpr size_t MIN_BLOCKS_TO_CONSIDER_COALESCING = 8;
+    // Blocks averaging under this many compressed bytes are considered under-full.
+    // A full 3000-point Float block measures ~4 KB in practice.
+    static constexpr uint64_t UNDERFULL_BLOCK_BYTES = 512;
+    // Ceiling on a single series' compressed bytes before we will re-encode it.
+    static constexpr uint64_t MAX_COALESCE_COMPRESSED_BYTES = 8ull << 20;  // 8 MB
+    // Observed decoded:compressed expansion is ~12x; 16x for headroom.
+    static constexpr uint64_t COALESCE_EXPANSION_ESTIMATE = 16;
+    // Shared byte budget so CONCURRENT series cannot each spend the per-series
+    // ceiling (up to 80 run at once: SERIES_BATCH_SIZE x 4 type pipelines).
+    static constexpr uint64_t COALESCE_TOTAL_BUDGET_BYTES = 128ull << 20;  // 128 MB
+
+    // Source blocks read in parallel per batch on the zero-copy carry path.
+    // Bounds resident block bytes while keeping the read pipeline full.
+    static constexpr size_t BLOCK_READ_BATCH = 16;
 
     // Create a compaction plan for given tier
     CompactionPlan planCompaction(uint64_t tier);
@@ -234,6 +279,11 @@ public:
             selected.resize(MAX_FILES_PER_TIER[tier]);
         }
 
+        // Deliberately NOT capped by input bytes. Compaction streams (bounded
+        // output buffer, one source block resident at a time), so peak memory no
+        // longer scales with the size of the input set -- and a byte cap would
+        // stop deep tiers from ever forming, which is the whole point of the
+        // tiering.
         return selected;
     }
 

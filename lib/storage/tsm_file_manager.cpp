@@ -112,7 +112,15 @@ seastar::future<> TSMFileManager::openTsmFile(std::string path) {
             }
         }
     } catch (const std::exception& e) {
-        timestar::tsm_log.error("Failed to open TSM file {}: {}", path, e.what());
+        // NOTE: this is a SKIP, not a failure. The file stays on disk but is never
+        // registered in sequencedTsmFiles/tiers, so its data silently disappears
+        // from query results and it is never compacted or reclaimed. Make that
+        // unmistakable in the log -- it is the difference between "one bad file"
+        // and "this node is serving incomplete data".
+        timestar::tsm_log.error(
+            "DATA UNAVAILABLE: failed to open TSM file {}: {}. This file's data will NOT be served by queries "
+            "and the file will not be compacted or deleted.",
+            path, e.what());
         co_return;
     }
 }
@@ -239,6 +247,17 @@ seastar::future<> TSMFileManager::removeTSMFiles(const std::vector<seastar::shar
 seastar::future<> TSMFileManager::checkAndTriggerCompaction() {
     for (uint64_t tier = 0; tier < MAX_TIERS - 1; tier++) {
         if (shouldCompactTier(tier)) {
+            // Back off after a failure instead of retrying immediately. A failed
+            // compaction re-reads and re-processes its entire input set before
+            // throwing, so an un-throttled retry loop (measured at ~6 attempts
+            // per second) starves foreground I/O for as long as the tier stays
+            // stuck -- which, once it is stuck, is forever.
+            auto& failureState = tierFailures_[tier];
+            if (failureState.cooldownCycles > 0) {
+                --failureState.cooldownCycles;
+                continue;
+            }
+
             timestar::compactor_log.info("Tier {} needs compaction ({} files)", tier, getFileCountInTier(tier));
 
             auto plan = compactor->planCompaction(tier);
@@ -256,11 +275,19 @@ seastar::future<> TSMFileManager::checkAndTriggerCompaction() {
                         stats = co_await compactor->executeCompaction(plan);
                     }
                     ++completedCompactions_;
+                    failureState.consecutive = 0;
+                    failureState.cooldownCycles = 0;
                     timestar::compactor_log.info("Compacted {} files from tier {} to tier {} in {}ms",
                                                  stats.filesCompacted, tier, tier + 1, stats.duration.count());
                 } catch (const std::exception& e) {
-                    timestar::compactor_log.error("Compaction failed for tier {}: {}. Will retry later.", tier,
-                                                  e.what());
+                    ++failureState.consecutive;
+                    ++totalCompactionFailures_;
+                    // Exponential backoff capped at MAX_COMPACTION_BACKOFF_CYCLES.
+                    failureState.cooldownCycles = std::min<uint64_t>(
+                        1ull << std::min<uint64_t>(failureState.consecutive, 10), MAX_COMPACTION_BACKOFF_CYCLES);
+                    timestar::compactor_log.error(
+                        "Compaction failed for tier {}: {}. Consecutive failures: {}. Backing off {} cycles.", tier,
+                        e.what(), failureState.consecutive, failureState.cooldownCycles);
                 }
             }
         }

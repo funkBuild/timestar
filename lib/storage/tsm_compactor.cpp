@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <limits>
 #include <seastar/core/reactor.hh>
+#include <seastar/core/seastar.hh>
 #include <seastar/core/sleep.hh>
 #include <seastar/core/when_all.hh>
 #include <seastar/util/defer.hh>
@@ -66,13 +67,69 @@ std::vector<SeriesId128> TSMCompactor::getAllSeriesIds(const std::vector<seastar
 template <typename T>
 seastar::future<SeriesCompactionData<T>> TSMCompactor::processSeriesForCompaction(
     const SeriesId128& seriesId, const std::vector<seastar::shared_ptr<TSM>>& sources,
-    const SeriesRetentionMap& seriesRetention) {
+    const SeriesRetentionMap& seriesRetention, PointChunkSink<T> sink) {
     SeriesCompactionData<T> result(seriesId, TSM::getValueType<T>());
 
-    // Load ALL blocks from ALL files
-    auto allBlocks = co_await BulkBlockLoader<T>::loadFromFiles(sources, seriesId);
+    // Index-only pass: figure out WHAT this series looks like before loading
+    // anything.  Decoding every block of the series from every input file up
+    // front made compaction memory scale with the DECOMPRESSED size of the
+    // series (~12x the on-disk size on real data), which is what made deep-tier
+    // merges throw std::bad_alloc while the files on disk were still small.
+    //
+    // The zero-copy path below never touches decoded data -- it re-reads the
+    // blocks compressed and passes them through -- so the overlap decision has
+    // to happen before any load, not after.  Only the merge path needs points.
+    // Block metadata is COPIED OUT here, in the same iteration that loaded the
+    // index entry, with no suspension in between.
+    //
+    // It must not be re-read later: getFullIndexEntry() populates a byte-budgeted
+    // LRU (TSM::fullIndexCache) that other concurrently-compacting series share,
+    // and getSeriesBlocks() returns a static EMPTY vector on a cache miss rather
+    // than signalling one. Loading every file first and reading the entries back
+    // afterwards therefore risks a mid-loop eviction turning into "this file has
+    // no blocks for this series" -- which would drop that file's data from the
+    // output while executeCompaction() still deletes the file. Silent data loss,
+    // and invisible in the stats, since points-read and points-written are both
+    // derived from the surviving blocks.
+    std::vector<seastar::shared_ptr<TSM>> filesWithSeries;
+    std::vector<BlockMetadata<T>> blockMeta;
+    filesWithSeries.reserve(sources.size());
+    for (const auto& file : sources) {
+        // Populates the full-index cache; no block data is read.
+        auto* indexEntry = co_await file->getFullIndexEntry(seriesId);
+        if (!indexEntry) {
+            continue;  // Series not in this file
+        }
+        // Read straight from the entry we just obtained, NOT via a second
+        // getSeriesBlocks() lookup that a later suspension could invalidate.
+        const auto& indexBlocks = indexEntry->indexBlocks;
+        if (indexBlocks.empty()) {
+            continue;
+        }
 
-    if (allBlocks.empty()) {
+        const size_t fileIdx = filesWithSeries.size();
+        filesWithSeries.push_back(file);
+        const uint64_t fileRank = file->dataRank();
+
+        blockMeta.reserve(blockMeta.size() + indexBlocks.size());
+        for (size_t blockIdx = 0; blockIdx < indexBlocks.size(); blockIdx++) {
+            const auto& indexBlock = indexBlocks[blockIdx];
+
+            BlockMetadata<T> meta;
+            meta.minTime = indexBlock.minTime;
+            meta.maxTime = indexBlock.maxTime;
+            meta.fileIndex = fileIdx;
+            meta.blockIndex = blockIdx;
+            meta.blockPtr = nullptr;  // only the merge path needs decoded points
+            meta.fileRank = fileRank;
+            meta.sourceFile = file;
+            meta.indexBlock = indexBlock;
+
+            blockMeta.push_back(meta);
+        }
+    }
+
+    if (filesWithSeries.empty()) {
         co_return result;  // Empty result
     }
 
@@ -107,33 +164,6 @@ seastar::future<SeriesCompactionData<T>> TSMCompactor::processSeriesForCompactio
         }
 
         tombstoneRanges = std::move(mergedRanges);
-    }
-
-    // Build metadata index from the actually-loaded blocks.
-    // allBlocks may have fewer entries than sources (files where the series
-    // has no data are skipped by BulkBlockLoader::loadFromFiles), so we must
-    // use each entry's source pointer -- NOT index into sources[].
-    std::vector<BlockMetadata<T>> blockMeta;
-
-    for (size_t fileIdx = 0; fileIdx < allBlocks.size(); fileIdx++) {
-        const auto& fileBlocks = allBlocks[fileIdx];
-        auto indexBlocks = fileBlocks.source->getSeriesBlocks(seriesId);
-
-        for (size_t blockIdx = 0; blockIdx < indexBlocks.size(); blockIdx++) {
-            const auto& indexBlock = indexBlocks[blockIdx];
-
-            BlockMetadata<T> meta;
-            meta.minTime = indexBlock.minTime;
-            meta.maxTime = indexBlock.maxTime;
-            meta.fileIndex = fileIdx;
-            meta.blockIndex = blockIdx;
-            meta.blockPtr = (blockIdx < fileBlocks.blocks.size()) ? fileBlocks.blocks[blockIdx].get() : nullptr;
-            meta.fileRank = fileBlocks.fileRank;
-            meta.sourceFile = fileBlocks.source;
-            meta.indexBlock = indexBlock;
-
-            blockMeta.push_back(meta);
-        }
     }
 
     // Sort blocks by timestamp
@@ -205,55 +235,74 @@ seastar::future<SeriesCompactionData<T>> TSMCompactor::processSeriesForCompactio
     std::shared_ptr<const std::vector<std::string>> carriedStringDict;
     if constexpr (std::is_same_v<T, std::string>) {
         size_t dictSources = 0;
-        for (const auto& fileBlocks : allBlocks) {
-            // Cheap: loadFromFiles already populated the full-index cache.
-            auto* entry = co_await fileBlocks.source->getFullIndexEntry(seriesId);
+        for (const auto& file : filesWithSeries) {
+            // Cheap: the index-only pass above already populated the cache.
+            auto* entry = co_await file->getFullIndexEntry(seriesId);
             if (entry && entry->stringDictionary && !entry->stringDictionary->empty()) {
                 ++dictSources;
                 carriedStringDict = entry->stringDictionary;
             }
         }
-        if (dictSources > 0 && allBlocks.size() > 1) {
+        if (dictSources > 0 && filesWithSeries.size() > 1) {
             stringDictForcesSlowPath = true;
             carriedStringDict = nullptr;
         }
     }
 
-    if (allBlocksNonOverlapping && !stringDictForcesSlowPath && !blockMeta.empty() && tombstoneRanges.empty() &&
-        !hasPerPointRetention) {
-        // ZERO-COPY PATH: Load compressed blocks in parallel
-        result.isZeroCopy = true;
-        result.compressedBlocks.reserve(blockMeta.size());
+    // Should this series be re-encoded to consolidate under-full blocks?
+    //
+    // Sized from COMPRESSED bytes, never from TSMIndexBlock::blockCount: for
+    // Float that field is the non-NaN count (an all-NaN block reports 0), so a
+    // sparse series of FULL blocks would look empty and get decoded -- which is
+    // how an earlier version of this gate reintroduced the very bad_alloc this
+    // work removes. Compressed bytes are NaN-independent and also correctly
+    // reflect string payloads, which sizeof(T) does not.
+    bool coalesceUnderfullBlocks = false;
+    uint64_t coalesceBudgetKiB = 0;
+    if (blockMeta.size() >= MIN_BLOCKS_TO_CONSIDER_COALESCING && tombstoneRanges.empty() && !hasPerPointRetention) {
+        uint64_t totalCompressedBytes = 0;
+        for (const auto& meta : blockMeta) {
+            totalCompressedBytes += meta.indexBlock.size;
+        }
+        const uint64_t avgBlockBytes = totalCompressedBytes / blockMeta.size();
 
-        std::vector<seastar::future<seastar::temporary_buffer<uint8_t>>> readFutures;
-        readFutures.reserve(blockMeta.size());
+        if (avgBlockBytes < UNDERFULL_BLOCK_BYTES && totalCompressedBytes <= MAX_COALESCE_COMPRESSED_BYTES) {
+            // Reserve the estimated decoded cost from the shard-wide budget, so
+            // concurrent series cannot each spend the per-series ceiling. If the
+            // budget is exhausted, skip coalescing -- it is an optimisation, and
+            // the zero-copy carry remains correct.
+            coalesceBudgetKiB = std::max<uint64_t>(1, totalCompressedBytes * COALESCE_EXPANSION_ESTIMATE / 1024);
+            if (coalesceBudgetKiB <= coalesceBudget_.current() && coalesceBudget_.try_wait(coalesceBudgetKiB)) {
+                coalesceUnderfullBlocks = true;
+            }
+        }
+    }
+    // Release the reservation however this coroutine exits.
+    auto releaseCoalesceBudget = seastar::defer([this, &coalesceUnderfullBlocks, coalesceBudgetKiB] {
+        if (coalesceUnderfullBlocks) {
+            coalesceBudget_.signal(coalesceBudgetKiB);
+        }
+    });
+
+    if (allBlocksNonOverlapping && !stringDictForcesSlowPath && !blockMeta.empty() && tombstoneRanges.empty() &&
+        !hasPerPointRetention && !coalesceUnderfullBlocks) {
+        // ZERO-COPY PATH: record where each block lives; do not read any of them.
+        // The writer streams them through one at a time, so this whole path now
+        // performs no block I/O and holds no block bytes.
+        result.isZeroCopy = true;
+        result.blockRefs.reserve(blockMeta.size());
 
         for (const auto& meta : blockMeta) {
-            readFutures.push_back(meta.sourceFile->readCompressedBlock(meta.indexBlock));
-        }
+            typename SeriesCompactionData<T>::BlockRef ref;
+            ref.sourceFile = meta.sourceFile;
+            ref.indexBlock = meta.indexBlock;
+            ref.minTime = meta.minTime;
+            ref.maxTime = meta.maxTime;
+            result.blockRefs.push_back(std::move(ref));
 
-        auto compressedData = co_await seastar::when_all_succeed(readFutures.begin(), readFutures.end());
-
-        for (size_t i = 0; i < blockMeta.size(); i++) {
-            typename SeriesCompactionData<T>::CompressedBlock block;
-            block.data = std::move(compressedData[i]);
-            block.minTime = blockMeta[i].minTime;
-            block.maxTime = blockMeta[i].maxTime;
-            block.blockSum = blockMeta[i].indexBlock.blockSum;
-            block.blockMin = blockMeta[i].indexBlock.blockMin;
-            block.blockMax = blockMeta[i].indexBlock.blockMax;
-            block.blockCount = blockMeta[i].indexBlock.blockCount;
-            block.blockM2 = blockMeta[i].indexBlock.blockM2;
-            block.blockFirstValue = blockMeta[i].indexBlock.blockFirstValue;
-            block.blockLatestValue = blockMeta[i].indexBlock.blockLatestValue;
-            block.hasExtendedStats = blockMeta[i].indexBlock.hasExtendedStats;
-            result.compressedBlocks.push_back(std::move(block));
-        }
-
-        // Track point stats for monitoring (zero-copy path)
-        for (const auto& cb : result.compressedBlocks) {
-            result.pointsRead += cb.blockCount;
-            result.pointsWritten += cb.blockCount;
+            // Stats come from the index, so they are known without reading.
+            result.pointsRead += meta.indexBlock.blockCount;
+            result.pointsWritten += meta.indexBlock.blockCount;
         }
 
         // Carry the single-source string dictionary so the output file's
@@ -263,13 +312,54 @@ seastar::future<SeriesCompactionData<T>> TSMCompactor::processSeriesForCompactio
         co_return result;
     }
 
-    // SLOW PATH: Decompress and merge (overlap, tombstones, or retention filtering)
+    // SLOW PATH: Decompress and merge (overlap, tombstones, or retention filtering).
+    // This is the ONLY path that needs decoded points, so the load happens here
+    // rather than up front -- a series that can be carried through zero-copy now
+    // costs nothing but its index entries.
+    // NOTE: the bulk load is deliberately NOT done here. When the blocks do not
+    // overlap -- which is the case whenever this path is entered only because of
+    // tombstones or retention, not because of genuinely interleaved data -- the
+    // points are consumed strictly in time order, so blocks can be decoded one at
+    // a time and released. Loading all of them first would hold the entire
+    // decoded series (~12x its on-disk size) resident for no reason.
+    // Only a real merge needs every block simultaneously; see the else-branch.
     result.isZeroCopy = false;
     result.timestamps.reserve(batchSize() * 10);  // Pre-allocate
     result.values.reserve(batchSize() * 10);
 
     uint64_t lastTimestamp = std::numeric_limits<uint64_t>::max();
     size_t ttlFiltered = 0;
+
+    // Incremental emission state. Downsampling needs the whole series at once
+    // (it partitions on a threshold and buckets across it), so chunking is only
+    // available when downsampling is off.
+    const bool chunkedEmit = static_cast<bool>(sink) && downsampleThreshold == 0;
+    size_t bufferedSinceSpill = 0;
+
+    // Hand everything buffered EXCEPT the final point to the sink.
+    //
+    // The last point is deliberately retained: processPoint resolves a duplicate
+    // timestamp by overwriting result.values.back(), so spilling the whole buffer
+    // would leave the next duplicate with nothing to overwrite and emit the point
+    // twice, breaking last-write-wins across a chunk boundary.
+    auto spill = [&]() -> seastar::future<> {
+        if (!chunkedEmit || result.timestamps.size() < 2) {
+            co_return;
+        }
+        const size_t keep = 1;
+        const size_t send = result.timestamps.size() - keep;
+
+        std::vector<uint64_t> chunkTs(result.timestamps.begin(), result.timestamps.begin() + send);
+        std::vector<T> chunkVals(std::make_move_iterator(result.values.begin()),
+                                 std::make_move_iterator(result.values.begin() + send));
+
+        result.timestamps.erase(result.timestamps.begin(), result.timestamps.begin() + send);
+        result.values.erase(result.values.begin(), result.values.begin() + send);
+        bufferedSinceSpill = 0;
+        result.emittedViaSink = true;
+
+        co_await sink(std::move(chunkTs), std::move(chunkVals));
+    };
 
     // Helper lambda: check tombstone + TTL for a single point, append if valid
     auto processPoint = [&](uint64_t ts, const T& val) {
@@ -311,6 +401,7 @@ seastar::future<SeriesCompactionData<T>> TSMCompactor::processSeriesForCompactio
             result.values.push_back(val);
             lastTimestamp = ts;
             result.pointsWritten++;
+            ++bufferedSinceSpill;
         } else {
             result.values.back() = val;
             result.duplicatesRemoved++;
@@ -328,37 +419,127 @@ seastar::future<SeriesCompactionData<T>> TSMCompactor::processSeriesForCompactio
         }
     };
 
-    // Process based on overlap
-    if (allBlocksNonOverlapping) {
-        for (const auto& meta : blockMeta) {
-            processBlock(meta.blockPtr);
-        }
-    } else {
-        // Slow path: full merge
-        size_t fileCount = allBlocks.size();
-        if (fileCount == 2) {
-            BulkMerger2Way<T> merger(allBlocks);
-            while (merger.hasNext()) {
-                auto [ts, val] = merger.next();
-                processPoint(ts, val);
+    // Decode a single block with its own file's string dictionary.
+    // Dictionaries are per-series-per-file, and the index entry can be evicted
+    // from the LRU across the read, so take a refcount rather than a raw pointer.
+    auto decodeBlockOf = [&](const BlockMetadata<T>& meta) -> seastar::future<std::unique_ptr<TSMBlock<T>>> {
+        [[maybe_unused]] std::shared_ptr<const std::vector<std::string>> dictRef;
+        const std::vector<std::string>* dict = nullptr;
+        if constexpr (std::is_same_v<T, std::string>) {
+            auto* entry = co_await meta.sourceFile->getFullIndexEntry(seriesId);
+            if (entry && entry->stringDictionary && !entry->stringDictionary->empty()) {
+                dictRef = entry->stringDictionary;
+                dict = dictRef.get();
             }
-        } else if (fileCount == 3) {
-            BulkMerger3Way<T> merger(allBlocks);
-            while (merger.hasNext()) {
-                auto [ts, val] = merger.next();
-                processPoint(ts, val);
+        }
+        co_return co_await meta.sourceFile->template readSingleBlock<T>(meta.indexBlock, 0,
+                                                                        std::numeric_limits<uint64_t>::max(), dict);
+    };
+
+    // Walk the (time-sorted) blocks in maximal TIME-CONNECTED GROUPS: a block
+    // joins the current group if it starts at or before the group's running max
+    // end time, otherwise it begins a new one. Groups are therefore disjoint in
+    // time and can be processed strictly in sequence.
+    //
+    // This is what bounds memory. Only a group's blocks need to be resident at
+    // once -- never the whole series -- and a series with no overlap at all
+    // degenerates to groups of one, i.e. exactly one decoded block at a time.
+    //
+    // Note this is deliberately NOT the `segments` split computed earlier: that
+    // marks runs by whether CONSECUTIVE blocks overlap, so a pair straddling a
+    // boundary (last block of one run overlapping the first of the next) would
+    // land in different runs and never be merged against each other -- silently
+    // dropping last-write-wins between them.
+    size_t groupStart = 0;
+    while (groupStart < blockMeta.size()) {
+        uint64_t groupMaxEnd = blockMeta[groupStart].maxTime;
+        size_t groupEnd = groupStart + 1;
+        while (groupEnd < blockMeta.size() && blockMeta[groupEnd].minTime <= groupMaxEnd) {
+            groupMaxEnd = std::max(groupMaxEnd, blockMeta[groupEnd].maxTime);
+            ++groupEnd;
+        }
+
+        if (groupEnd - groupStart == 1) {
+            // Lone block: no merge needed, decode and stream it.
+            auto block = co_await decodeBlockOf(blockMeta[groupStart]);
+            if (block && !block->timestamps.empty()) {
+                processBlock(block.get());
             }
         } else {
-            BulkMerger<T> merger(allBlocks);
-            while (merger.hasNext()) {
-                auto [ts, val] = merger.next();
-                processPoint(ts, val);
+            // Overlapping run: decode just this group and merge it. Blocks are
+            // grouped by source file because the mergers dedup by file rank
+            // (newest file wins a duplicate timestamp).
+            std::vector<SeriesBlocks<T>> groupSources;
+            for (size_t i = groupStart; i < groupEnd; ++i) {
+                const auto& meta = blockMeta[i];
+                auto block = co_await decodeBlockOf(meta);
+                if (!block || block->timestamps.empty()) {
+                    continue;
+                }
+
+                auto it = std::find_if(groupSources.begin(), groupSources.end(),
+                                       [&](const SeriesBlocks<T>& sb) { return sb.source == meta.sourceFile; });
+                if (it == groupSources.end()) {
+                    SeriesBlocks<T> sb(seriesId);
+                    sb.source = meta.sourceFile;
+                    sb.fileRank = meta.fileRank;
+                    groupSources.push_back(std::move(sb));
+                    it = groupSources.end() - 1;
+                }
+                // blockMeta is time-sorted, so each file's blocks are appended in
+                // ascending order -- which is what the merge cursors assume.
+                it->totalPoints += block->timestamps.size();
+                it->blockIndex.push_back(meta.indexBlock);
+                it->blocks.push_back(std::move(block));
             }
+
+            if (groupSources.size() == 1) {
+                for (const auto& block : groupSources[0].blocks) {
+                    processBlock(block.get());
+                }
+            } else if (groupSources.size() == 2) {
+                BulkMerger2Way<T> merger(groupSources);
+                while (merger.hasNext()) {
+                    auto [ts, val] = merger.next();
+                    processPoint(ts, val);
+                }
+            } else if (groupSources.size() == 3) {
+                BulkMerger3Way<T> merger(groupSources);
+                while (merger.hasNext()) {
+                    auto [ts, val] = merger.next();
+                    processPoint(ts, val);
+                }
+            } else if (groupSources.size() > 3) {
+                BulkMerger<T> merger(groupSources);
+                while (merger.hasNext()) {
+                    auto [ts, val] = merger.next();
+                    processPoint(ts, val);
+                }
+            }
+            // groupSources (and its decoded blocks) are released here.
         }
+
+        // Group boundary: a safe suspension point to hand off a chunk.
+        if (chunkedEmit && bufferedSinceSpill >= MERGE_CHUNK_POINTS) {
+            co_await spill();
+        }
+
+        groupStart = groupEnd;
     }
 
     if (ttlFiltered > 0) {
         timestar::compactor_log.info("TTL: Filtered {} expired points for series {}", ttlFiltered, seriesId.toHex());
+    }
+
+    // Hand off whatever is left. Once anything has been emitted through the sink
+    // the remainder must go the same way, otherwise the tail would be dropped
+    // (writeSeriesCompactionData skips a series flagged emittedViaSink).
+    if (chunkedEmit && result.emittedViaSink && !result.timestamps.empty()) {
+        auto tailTs = std::move(result.timestamps);
+        auto tailVals = std::move(result.values);
+        result.timestamps.clear();
+        result.values.clear();
+        co_await sink(std::move(tailTs), std::move(tailVals));
     }
 
     // Phase 4: Downsampling — only for numeric types (double and int64_t)
@@ -422,35 +603,64 @@ seastar::future<SeriesCompactionData<T>> TSMCompactor::processSeriesForCompactio
     co_return result;
 }
 
-// Phase 3: Write pre-processed series data to TSMWriter
+// Phase 3: Write pre-processed series data to TSMWriter.
+//
+// Drains the writer's buffer to disk as it goes: a single high-volume series can
+// contribute hundreds of MB, and without an intra-series flush point the whole
+// output file accumulates in one contiguous allocation.
 template <typename T>
-void TSMCompactor::writeSeriesCompactionData(TSMWriter& writer, SeriesCompactionData<T>&& data,
-                                             CompactionStats& stats) {
+seastar::future<> TSMCompactor::writeSeriesCompactionData(TSMWriter& writer, SeriesCompactionData<T> data,
+                                                          CompactionStats& stats) {
     if (data.isZeroCopy) {
-        // Zero-copy path: write compressed blocks directly, carrying forward stats
-        for (auto& block : data.compressedBlocks) {
-            TSMIndexBlock srcBlock;
-            srcBlock.minTime = block.minTime;
-            srcBlock.maxTime = block.maxTime;
-            srcBlock.blockSum = block.blockSum;
-            srcBlock.blockMin = block.blockMin;
-            srcBlock.blockMax = block.blockMax;
-            srcBlock.blockCount = block.blockCount;
-            srcBlock.blockM2 = block.blockM2;
-            srcBlock.blockFirstValue = block.blockFirstValue;
-            srcBlock.blockLatestValue = block.blockLatestValue;
-            srcBlock.hasExtendedStats = block.hasExtendedStats;
-            writer.writeCompressedBlockWithStats(data.seriesType, data.seriesId, std::move(block.data), srcBlock);
-        }
-        // String series: persist the carried dictionary into the output file's
-        // index entry — the carried STR2 blocks are undecodable without it.
-        if (data.stringDictionary && !data.compressedBlocks.empty()) {
+        // Zero-copy path: read each source block, hand it to the writer, drop it.
+        // Only one compressed block is resident at a time, so peak memory here is
+        // O(block size) rather than O(series size).
+        //
+        // The dictionary must be attached BEFORE any block is written, so a flush
+        // mid-series cannot land STR2 blocks in the file with no dictionary
+        // recorded for them yet.
+        if (data.stringDictionary && !data.blockRefs.empty()) {
             writer.setSeriesStringDictionary(data.seriesId, std::move(data.stringDictionary));
         }
+        // Read in bounded batches rather than one block at a time. This loop runs
+        // holding the single write semaphore, so a strictly sequential
+        // read-then-write would serialise every source read in the whole
+        // compaction behind the writer -- the reads were previously issued in
+        // parallel. A batch keeps the I/O pipeline full while capping resident
+        // block bytes at BLOCK_READ_BATCH blocks (~4 KB each in practice).
+        for (size_t i = 0; i < data.blockRefs.size(); i += BLOCK_READ_BATCH) {
+            const size_t batchEnd = std::min(i + BLOCK_READ_BATCH, data.blockRefs.size());
+
+            std::vector<seastar::future<seastar::temporary_buffer<uint8_t>>> reads;
+            reads.reserve(batchEnd - i);
+            for (size_t j = i; j < batchEnd; ++j) {
+                reads.push_back(data.blockRefs[j].sourceFile->readCompressedBlock(data.blockRefs[j].indexBlock));
+            }
+            auto blocks = co_await seastar::when_all_succeed(reads.begin(), reads.end());
+
+            for (size_t j = i; j < batchEnd; ++j) {
+                auto& ref = data.blockRefs[j];
+                TSMIndexBlock srcBlock = ref.indexBlock;
+                srcBlock.minTime = ref.minTime;
+                srcBlock.maxTime = ref.maxTime;
+                writer.writeCompressedBlockWithStats(data.seriesType, data.seriesId, std::move(blocks[j - i]),
+                                                     srcBlock);
+
+                // Block boundary: safe to drain (no back-patch is outstanding).
+                co_await writer.flushIfNeeded();
+            }
+        }
     } else {
-        // Slow path: write decompressed data
-        if (!data.timestamps.empty()) {
-            writer.writeSeries(data.seriesType, data.seriesId, data.timestamps, data.values);
+        // Slow path: write decompressed data.
+        // writeSeriesStreaming, NOT writeSeries: the latter emits every block of
+        // the series before returning, so the buffer could only be drained after
+        // the whole series was in memory -- which for one large series is the
+        // very allocation this path exists to avoid.
+        if (data.emittedViaSink) {
+            // Already written incrementally through the chunk sink; the vectors
+            // hold nothing that has not been emitted.
+        } else if (!data.timestamps.empty()) {
+            co_await writer.writeSeriesStreaming(data.seriesType, data.seriesId, data.timestamps, data.values);
         }
     }
 
@@ -484,22 +694,22 @@ seastar::future<CompactionResult> TSMCompactor::compact(
 
     // Create temporary file for writing
     std::string tempPath = outputPath + ".tmp";
+    // The writer is declared OUTSIDE the try so the failure path can still close
+    // its streaming file handle; it now owns an open fd for the duration of the
+    // compaction rather than opening one only at close time.
+    TSMWriter writer(tempPath);
+    std::exception_ptr compactionError;
+    CompactionResult compactionResult;
     try {
-        TSMWriter writer(tempPath);
         // Use higher zstd compression for deeper tiers (better ratio, acceptable speed)
         if (targetTier >= 1) {
             writer.setCompressionLevel(3);
         }
-        // Pre-reserve the output buffer: compacted output is bounded by the sum
-        // of the input file sizes (dedup/tombstones only shrink it). Avoids
-        // repeated geometric-doubling reallocs of the whole-file buffer.
-        {
-            uint64_t inputBytes = 0;
-            for (const auto& file : files) {
-                inputBytes += file->getFileSize();
-            }
-            writer.reserveBuffer(inputBytes);
-        }
+        // Do NOT pre-reserve the output buffer to the summed input size. The
+        // writer streams to disk (writeSeriesCompactionData drains it at block
+        // boundaries), so it only ever holds a bounded window; reserving the
+        // whole output up front would reinstate exactly the single large
+        // contiguous allocation this path exists to avoid.
 
         CompactionStats stats;
         stats.filesCompacted = files.size();
@@ -570,12 +780,48 @@ seastar::future<CompactionResult> TSMCompactor::compact(
             // Check ALL files for series type, not just the first file.
             // A series may only exist in files[1..N], so we must iterate
             // until we find a file that contains this series.
+            //
+            // SeriesId128 is derived from measurement+tags+field only -- the value
+            // type is not part of the key -- and the memstore's type-conflict
+            // check is scoped to a single LIVE store. So once a store flushes,
+            // the same field can be re-written with a different type, leaving
+            // file A holding Boolean blocks and file B holding Float blocks for
+            // one series id. Taking the type from the first file that has the
+            // series and decoding every other file as that type is what produced
+            // "TSM block type mismatch: block contains type 1 but reader expects
+            // type 0", failing the whole compaction repeatedly and wedging the
+            // tier. Detect the divergence here and skip just that series, so one
+            // bad series cannot block compaction of everything else.
             std::optional<TSMValueType> seriesType;
+            bool typeDiverges = false;
             for (const auto& file : files) {
-                seriesType = file->getSeriesType(seriesId);
-                if (seriesType.has_value()) {
+                auto fileType = file->getSeriesType(seriesId);
+                if (!fileType.has_value()) {
+                    continue;
+                }
+                if (!seriesType.has_value()) {
+                    seriesType = fileType;
+                } else if (*fileType != *seriesType) {
+                    typeDiverges = true;
                     break;
                 }
+            }
+            if (typeDiverges) {
+                // Fail the whole compaction rather than skipping the series.
+                // Skipping would be silent DATA LOSS: a successful compaction
+                // deletes its source files (executeCompaction -> removeTSMFiles),
+                // so any series omitted from the output is gone. The output
+                // format stores exactly one value type per series per file, so
+                // there is no way to carry both types through either.
+                //
+                // Failing keeps every input file intact and readable. The cost is
+                // that the tier cannot compact until the conflict is resolved --
+                // but that is now an explicit, named condition with a backoff,
+                // rather than an opaque decoder error retried forever.
+                throw std::runtime_error(
+                    "Series " + seriesId.toHex() +
+                    " has conflicting value types across input TSM files; refusing to compact (compacting would "
+                    "have to drop one type). Source files are left untouched.");
             }
             if (!seriesType.has_value()) {
                 continue;
@@ -615,13 +861,33 @@ seastar::future<CompactionResult> TSMCompactor::compact(
                     const auto& seriesId = seriesVec[j];
 
                     // Process series and write with serialization
+                    // Sink: emit merged points in bounded chunks straight into the
+                    // writer instead of letting one series accumulate whole. Takes
+                    // the write semaphore per chunk, so chunks from different
+                    // series interleave in the file -- which is fine, since the
+                    // index records each block's absolute offset.
+                    PointChunkSink<ValueType> chunkSink = [this, &writer, &writeSemaphore, seriesId](
+                                                              std::vector<uint64_t>&& ts,
+                                                              std::vector<ValueType>&& vals) -> seastar::future<> {
+                        return seastar::with_semaphore(
+                            writeSemaphore, 1,
+                            [this, &writer, seriesId, ts = std::move(ts), vals = std::move(vals)]() mutable {
+                                return writer.appendSeriesChunk(TSM::getValueType<ValueType>(), seriesId, std::move(ts),
+                                                                std::move(vals));
+                            });
+                    };
+
                     auto future =
-                        processSeriesForCompaction<ValueType>(seriesId, files, seriesRetention)
+                        processSeriesForCompaction<ValueType>(seriesId, files, seriesRetention, std::move(chunkSink))
                             .then([this, &writer, &writeSemaphore, &stats](SeriesCompactionData<ValueType> data) {
-                                // Serialize writes with semaphore
+                                // Serialize writes with semaphore. The write path is
+                                // now a coroutine (it drains the output buffer to
+                                // disk), so the semaphore is held across those
+                                // suspensions -- which is exactly what keeps the
+                                // single-writer invariant intact.
                                 return seastar::with_semaphore(
                                     writeSemaphore, 1, [this, &writer, &stats, data = std::move(data)]() mutable {
-                                        writeSeriesCompactionData(writer, std::move(data), stats);
+                                        return writeSeriesCompactionData(writer, std::move(data), stats);
                                     });
                             });
 
@@ -647,7 +913,7 @@ seastar::future<CompactionResult> TSMCompactor::compact(
         co_await seastar::when_all_succeed(typeFutures.begin(), typeFutures.end());
 
         // Finalize the file
-        writer.writeIndex();
+        co_await writer.writeIndexStreaming();
         co_await writer.closeDMA();
 
         // Calculate statistics
@@ -671,14 +937,28 @@ seastar::future<CompactionResult> TSMCompactor::compact(
             timestar::compactor_log.warn("Failed to fsync parent directory after compaction rename: {}", dir);
         }
 
-        co_return CompactionResult{outputPath, stats};
+        compactionResult = CompactionResult{outputPath, stats};
     } catch (...) {
-        // Clean up temp file — use blocking remove since we cannot co_await
-        // inside a catch handler in C++. This is the exception path only.
-        std::error_code ec;
-        std::filesystem::remove(tempPath, ec);
-        throw;
+        compactionError = std::current_exception();
     }
+
+    if (compactionError) {
+        // Clean up outside the handler so the work can be async: GCC does not
+        // allow co_await inside a catch block, which is why this used to be a
+        // blocking std::filesystem::remove on the reactor thread.
+        // Close the fd BEFORE unlinking so the partially-written temp file is
+        // not left open.
+        co_await writer.abortStream();
+        try {
+            co_await seastar::remove_file(tempPath);
+        } catch (...) {
+            // Best effort. A leftover .tmp is harmless: it fails the ".tsm"
+            // suffix check on startup and is deleted by TSMFileManager::init().
+        }
+        std::rethrow_exception(compactionError);
+    }
+
+    co_return compactionResult;
 }
 
 CompactionPlan TSMCompactor::planCompaction(uint64_t tier) {
@@ -884,29 +1164,32 @@ std::vector<CompactionStats> TSMCompactor::getActiveCompactionStats() const {
 // Phase 3: Parallel processing template instantiations
 template seastar::future<SeriesCompactionData<double>> TSMCompactor::processSeriesForCompaction<double>(
     const SeriesId128& seriesId, const std::vector<seastar::shared_ptr<TSM>>& sources,
-    const SeriesRetentionMap& seriesRetention);
+    const SeriesRetentionMap& seriesRetention, PointChunkSink<double> sink);
 
 template seastar::future<SeriesCompactionData<bool>> TSMCompactor::processSeriesForCompaction<bool>(
     const SeriesId128& seriesId, const std::vector<seastar::shared_ptr<TSM>>& sources,
-    const SeriesRetentionMap& seriesRetention);
+    const SeriesRetentionMap& seriesRetention, PointChunkSink<bool> sink);
 
 template seastar::future<SeriesCompactionData<std::string>> TSMCompactor::processSeriesForCompaction<std::string>(
     const SeriesId128& seriesId, const std::vector<seastar::shared_ptr<TSM>>& sources,
-    const SeriesRetentionMap& seriesRetention);
+    const SeriesRetentionMap& seriesRetention, PointChunkSink<std::string> sink);
 
-template void TSMCompactor::writeSeriesCompactionData<double>(TSMWriter& writer, SeriesCompactionData<double>&& data,
-                                                              CompactionStats& stats);
+template seastar::future<> TSMCompactor::writeSeriesCompactionData<double>(TSMWriter& writer,
+                                                                           SeriesCompactionData<double> data,
+                                                                           CompactionStats& stats);
 
-template void TSMCompactor::writeSeriesCompactionData<bool>(TSMWriter& writer, SeriesCompactionData<bool>&& data,
-                                                            CompactionStats& stats);
+template seastar::future<> TSMCompactor::writeSeriesCompactionData<bool>(TSMWriter& writer,
+                                                                         SeriesCompactionData<bool> data,
+                                                                         CompactionStats& stats);
 
-template void TSMCompactor::writeSeriesCompactionData<std::string>(TSMWriter& writer,
-                                                                   SeriesCompactionData<std::string>&& data,
-                                                                   CompactionStats& stats);
+template seastar::future<> TSMCompactor::writeSeriesCompactionData<std::string>(TSMWriter& writer,
+                                                                                SeriesCompactionData<std::string> data,
+                                                                                CompactionStats& stats);
 
 template seastar::future<SeriesCompactionData<int64_t>> TSMCompactor::processSeriesForCompaction<int64_t>(
     const SeriesId128& seriesId, const std::vector<seastar::shared_ptr<TSM>>& sources,
-    const SeriesRetentionMap& seriesRetention);
+    const SeriesRetentionMap& seriesRetention, PointChunkSink<int64_t> sink);
 
-template void TSMCompactor::writeSeriesCompactionData<int64_t>(TSMWriter& writer, SeriesCompactionData<int64_t>&& data,
-                                                               CompactionStats& stats);
+template seastar::future<> TSMCompactor::writeSeriesCompactionData<int64_t>(TSMWriter& writer,
+                                                                            SeriesCompactionData<int64_t> data,
+                                                                            CompactionStats& stats);
