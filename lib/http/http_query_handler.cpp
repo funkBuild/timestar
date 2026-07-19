@@ -144,7 +144,8 @@ static void bucketNonNumericResultLatest(timestar::SeriesResult& sr, uint64_t in
 static seastar::future<std::vector<PartialAggregationResult>> streamingGroupByAggregation(
     Engine& engine, std::vector<SeriesQueryContext>& contexts, const std::string& measurement, uint64_t startTime,
     uint64_t endTime, AggregationMethod aggregation, uint64_t aggregationInterval,
-    const std::vector<std::string>& groupByTags, std::vector<timestar::SeriesResult>& nonNumericResults) {
+    const std::vector<std::string>& groupByTags, std::vector<timestar::SeriesResult>& nonNumericResults,
+    size_t& droppedSeriesOut, std::string& firstDropReasonOut) {
     // ---- Phase 1: Pre-group series by groupKey ----
     struct GroupAccumulator {
         // One AggregationState per bucket; with interval == 0 the "bucket" is
@@ -273,9 +274,22 @@ static seastar::future<std::vector<PartialAggregationResult>> streamingGroupByAg
             std::optional<VariantQueryResult> optResult;
             try {
                 optResult = co_await engine.query(ctx.seriesKey, ctx.seriesId, startTime, endTime);
+            } catch (const SeriesNotFoundException&) {
+                // Expected: the series genuinely has no data here.
+                co_return;
             } catch (const std::exception& e) {
-                timestar::http_log.debug("Streaming fallback: skipping series {} due to error: {}", ctx.seriesKey,
-                                         e.what());
+                // NOT expected. Dropping a series here removes real data from an
+                // otherwise-successful response, so this must never be silent:
+                // it was previously logged at debug level and therefore invisible
+                // in production, which made a query that returned an empty result
+                // indistinguishable from one that legitimately found nothing.
+                timestar::http_log.error(
+                    "[QUERY] Dropping series '{}' from result: {}. The response will be INCOMPLETE.", ctx.seriesKey,
+                    e.what());
+                ++droppedSeriesOut;
+                if (firstDropReasonOut.empty()) {
+                    firstDropReasonOut = e.what();
+                }
                 co_return;
             }
 
@@ -784,11 +798,17 @@ struct ShardQueryResult {
     std::vector<PartialAggregationResult> partialResults;
     std::vector<SeriesResult> nonNumericResults;  // String/bool fields bypass aggregation
     double shardMs = 0.0;
+    // Series this shard could not read and therefore OMITTED from the result.
+    // Must be surfaced: a response missing series is not a successful response,
+    // and reporting one as success is indistinguishable from "no data".
+    size_t droppedSeries = 0;
+    std::string firstDropReason;
 };
 
 // Result of the shard query fan-out phase.
 struct ShardFanOutResult {
     std::vector<std::pair<unsigned, ShardQueryResult>> shardResults;
+    // Aggregated across shards; see ShardQueryResult::droppedSeries.
     bool timedOut = false;  // shard queries exceeded defaultQueryTimeout()
 };
 
@@ -805,6 +825,11 @@ static seastar::future<ShardQueryResult> executeShardQuery(Engine& engine, unsig
     auto shardStart = std::chrono::high_resolution_clock::now();
     LOG_QUERY_PATH(timestar::http_log, info, "[QUERY] Shard {} querying {} series keys in parallel", shardId,
                    contexts.size());
+
+    // Series this shard failed to read. Tracked so the caller can refuse to
+    // report an incomplete result as a success.
+    size_t droppedSeries = 0;
+    std::string firstDropReason;
 
     // Containers for pushdown results and fallback results
     std::vector<PartialAggregationResult> pushdownPartials;
@@ -898,9 +923,9 @@ static seastar::future<ShardQueryResult> executeShardQuery(Engine& engine, unsig
         // have resolved the numeric series into pushdownPartials and left only
         // the non-numeric ones in `contexts`.  Overwriting here silently
         // dropped every numeric field from such a response.
-        auto streamedPartials =
-            co_await streamingGroupByAggregation(engine, contexts, measurement, startTime, endTime, aggregation,
-                                                 aggregationInterval, groupByTags, nonNumericResults);
+        auto streamedPartials = co_await streamingGroupByAggregation(engine, contexts, measurement, startTime, endTime,
+                                                                     aggregation, aggregationInterval, groupByTags,
+                                                                     nonNumericResults, droppedSeries, firstDropReason);
         pushdownPartials.insert(pushdownPartials.end(), std::make_move_iterator(streamedPartials.begin()),
                                 std::make_move_iterator(streamedPartials.end()));
 
@@ -928,7 +953,8 @@ static seastar::future<ShardQueryResult> executeShardQuery(Engine& engine, unsig
             co_await seastar::max_concurrent_for_each(
                 contexts, MAX_CONCURRENT_SERIES_QUERIES,
                 [&engine, &pushdownPartials, &fallbackResults, &measurement, startTime, endTime, shardId,
-                 aggregationInterval, aggregation, &groupByTags](SeriesQueryContext& ctx) -> seastar::future<> {
+                 aggregationInterval, aggregation, &groupByTags, &droppedSeries,
+                 &firstDropReason](SeriesQueryContext& ctx) -> seastar::future<> {
                     // ---- PUSHDOWN PATH ----
                     // Try aggregating directly from TSM blocks, skipping the
                     // full TSMResult → QueryResult → SeriesResult pipeline.
@@ -981,10 +1007,18 @@ static seastar::future<ShardQueryResult> executeShardQuery(Engine& engine, unsig
                                        ctx.seriesKey, shardId);
                         co_return;
                     } catch (const std::exception& e) {
-                        LOG_QUERY_PATH(timestar::http_log, warn,
-                                       "[QUERY] Unexpected error querying series '{}' on shard "
-                                       "{}: {} - skipping",
-                                       ctx.seriesKey, shardId, e.what());
+                        // Unconditional, NOT LOG_QUERY_PATH: that macro compiles to
+                        // a no-op unless TIMESTAR_LOG_QUERY_PATH is set, so this
+                        // warning did not exist in a normal build and the series
+                        // vanished from the response with no trace at all.
+                        timestar::http_log.error(
+                            "[QUERY] Dropping series '{}' on shard {} from result: {}. The response will be "
+                            "INCOMPLETE.",
+                            ctx.seriesKey, shardId, e.what());
+                        ++droppedSeries;
+                        if (firstDropReason.empty()) {
+                            firstDropReason = e.what();
+                        }
                         co_return;
                     }
 
@@ -1086,6 +1120,8 @@ static seastar::future<ShardQueryResult> executeShardQuery(Engine& engine, unsig
     sqr.partialResults = std::move(partialResults);
     sqr.nonNumericResults = std::move(nonNumericResults);
     sqr.shardMs = shardMs;
+    sqr.droppedSeries = droppedSeries;
+    sqr.firstDropReason = std::move(firstDropReason);
     co_return sqr;
 }
 
@@ -1785,6 +1821,35 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(QueryRequest reque
         // Execute queries on each shard that has series
         auto shardQueriesStart = std::chrono::high_resolution_clock::now();
         ShardFanOutResult fanOut = co_await fanOutShardQueries(request, seriesByShard);
+
+        // Refuse to report an incomplete result as a success. A shard that could
+        // not read a series omits it entirely, so the response would otherwise be
+        // a plausible-looking answer computed over a subset of the data -- or, if
+        // every series failed, an empty result indistinguishable from "no data".
+        // That is exactly what a query spanning duplicate-timestamp data used to
+        // return: the aggregation pushdown declines when timestamps repeat across
+        // files, the fallback materialises the whole series to dedup it, and on a
+        // memory-constrained shard that throws std::bad_alloc.
+        {
+            size_t totalDropped = 0;
+            std::string reason;
+            for (const auto& [shardId, sr] : fanOut.shardResults) {
+                totalDropped += sr.droppedSeries;
+                if (reason.empty() && !sr.firstDropReason.empty()) {
+                    reason = sr.firstDropReason;
+                }
+            }
+            if (totalDropped > 0) {
+                QueryResponse incomplete;
+                incomplete.success = false;
+                incomplete.errorCode = "QUERY_INCOMPLETE";
+                incomplete.errorMessage = "Query could not read " + std::to_string(totalDropped) +
+                                          " series and would have returned an incomplete result" +
+                                          (reason.empty() ? std::string() : (": " + reason));
+                co_return incomplete;
+            }
+        }
+
         if (fanOut.timedOut) {
             QueryResponse timeoutResponse;
             timeoutResponse.success = false;
