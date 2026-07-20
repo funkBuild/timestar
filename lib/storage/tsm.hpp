@@ -19,6 +19,7 @@
 #include <seastar/core/file.hh>
 #include <seastar/core/semaphore.hh>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <tuple>
 #include <unordered_map>
@@ -123,6 +124,27 @@ struct TSMIndexEntry {
 };
 
 namespace timestar {
+
+// A block whose decoded value count does not match its timestamp count.
+//
+// THE CONTRACT, in one place: a block declares how many points it holds, the
+// timestamp decoder is trimmed to that count, and every value decoder is then
+// asked for exactly as many values as timestamps survived the time filter.
+//   produced > expected -> benign, truncate (a decoder that works in fixed-size
+//                          groups can legitimately overshoot the tail)
+//   produced < expected -> the block is corrupt or a decoder regressed. There is
+//                          no safe repair: pairing values[i] with timestamps[i]
+//                          past the shortfall MISPAIRS real data, which is worse
+//                          than returning nothing.
+//
+// Raised rather than silently dropping the block, because a short read that
+// still reports success is the silent-partial-answer failure this codebase
+// already rejects elsewhere (see QUERY_INCOMPLETE).
+class BlockDecodeError : public std::runtime_error {
+public:
+    explicit BlockDecodeError(const std::string& what) : std::runtime_error(what) {}
+};
+
 // Heap-size estimate for the byte-budgeted full-index LRU cache. Counts the
 // index-block array and any string-dictionary strings (the generic LRUCache
 // adds its own list-node/map overhead on top).

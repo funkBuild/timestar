@@ -1033,13 +1033,19 @@ seastar::future<std::unique_ptr<TSMBlock<T>>> TSM::readSingleBlock(const TSMInde
         }
     }
 
-    // Same invariant as decodeBlockFlat(): consumers index values by a timestamp
-    // index (TSMBlock::valueAt), so a desynced pair is an out-of-bounds read.
-    // Refuse to hand one up.
-    if (blockResults->timestamps.size() != blockResults->values.size()) {
-        timestar::tsm_log.error("[CORRUPT] single-block decode desync: {} timestamps but {} values; dropping block",
-                                blockResults->timestamps.size(), blockResults->values.size());
-        co_return nullptr;
+    // Same count contract as decodeBlockFlat(): these per-block decoders build a
+    // TSMBlock whose consumers index values by a TIMESTAMP index
+    // (TSMBlock::valueAt), so a desynced pair is an out-of-bounds read.
+    //
+    // Excess values are truncated (benign); a shortfall is raised, because the
+    // only alternatives are to mispair real data or to drop the block and report
+    // success -- a silent partial answer.
+    if (blockResults->values.size() > blockResults->timestamps.size()) {
+        blockResults->values.resize(blockResults->timestamps.size());
+    } else if (blockResults->values.size() < blockResults->timestamps.size()) {
+        throw timestar::BlockDecodeError("TSM block decode short: " + std::to_string(blockResults->values.size()) +
+                                         " values for " + std::to_string(blockResults->timestamps.size()) +
+                                         " timestamps");
     }
 
     co_return blockResults;
@@ -1236,12 +1242,19 @@ std::unique_ptr<TSMBlock<T>> TSM::decodeBlock(Slice& blockSlice, uint32_t blockS
         }
     }
 
-    // Same invariant as decodeBlockFlat(): consumers index values by a timestamp
-    // index (TSMBlock::valueAt), so a desynced pair is an out-of-bounds read.
-    if (blockResults->timestamps.size() != blockResults->values.size()) {
-        timestar::tsm_log.error("[CORRUPT] block decode desync: {} timestamps but {} values; dropping block",
-                                blockResults->timestamps.size(), blockResults->values.size());
-        return nullptr;
+    // Same count contract as decodeBlockFlat(): these per-block decoders build a
+    // TSMBlock whose consumers index values by a TIMESTAMP index
+    // (TSMBlock::valueAt), so a desynced pair is an out-of-bounds read.
+    //
+    // Excess values are truncated (benign); a shortfall is raised, because the
+    // only alternatives are to mispair real data or to drop the block and report
+    // success -- a silent partial answer.
+    if (blockResults->values.size() > blockResults->timestamps.size()) {
+        blockResults->values.resize(blockResults->timestamps.size());
+    } else if (blockResults->values.size() < blockResults->timestamps.size()) {
+        throw timestar::BlockDecodeError("TSM block decode short: " + std::to_string(blockResults->values.size()) +
+                                         " values for " + std::to_string(blockResults->timestamps.size()) +
+                                         " timestamps");
     }
 
     return blockResults;
@@ -1280,18 +1293,20 @@ static size_t decodeBlockFlat(const uint8_t* data, uint32_t blockSize, uint64_t 
         return 0;
     size_t valueByteSize = blockSize - timestampBytes - BLOCK_HEADER_SIZE;
 
+    size_t produced = 0;
     if constexpr (std::is_same_v<T, double>) {
         auto valuesSlice = blockSlice.getCompressedSlice(valueByteSize);
-        FloatDecoder::decode(valuesSlice, nSkipped, nTimestamps, outValues);
+        produced = FloatDecoder::decode(valuesSlice, nSkipped, nTimestamps, outValues);
     } else if constexpr (std::is_same_v<T, bool>) {
         auto valuesSlice = blockSlice.getSlice(valueByteSize);
-        BoolEncoderRLE::decode(valuesSlice, nSkipped, nTimestamps, outValues);
+        produced = BoolEncoderRLE::decode(valuesSlice, nSkipped, nTimestamps, outValues);
     } else if constexpr (std::is_same_v<T, std::string>) {
         auto valuesSlice = blockSlice.getSlice(valueByteSize);
         if (StringEncoder::isDictionaryEncoded(valuesSlice) && stringDict && !stringDict->empty()) {
-            StringEncoder::decodeDictionary(valuesSlice, timestampSize, nSkipped, nTimestamps, *stringDict, outValues);
+            produced = StringEncoder::decodeDictionary(valuesSlice, timestampSize, nSkipped, nTimestamps, *stringDict,
+                                                       outValues);
         } else {
-            StringEncoder::decode(valuesSlice, timestampSize, nSkipped, nTimestamps, outValues);
+            produced = StringEncoder::decode(valuesSlice, timestampSize, nSkipped, nTimestamps, outValues);
         }
     } else if constexpr (std::is_same_v<T, int64_t>) {
         auto valuesSlice = blockSlice.getSlice(valueByteSize);
@@ -1303,27 +1318,66 @@ static size_t decodeBlockFlat(const uint8_t* data, uint32_t blockSize, uint64_t 
         for (size_t i = nSkipped; i < end; ++i) {
             outValues.push_back(ZigZag::zigzagDecode(rawUintScratch[i]));
         }
+        produced = (end > nSkipped) ? (end - nSkipped) : 0;
     }
 
-    // INVARIANT: every value decoder APPENDS exactly as many values as the
-    // timestamp decoder appended timestamps.  Both vectors are shared across all
-    // blocks of a series, so a decoder that clears or short-decodes silently
-    // desyncs them -- and every downstream consumer indexes values[i] by a
-    // timestamp index.  That is not a wrong number, it is an out-of-bounds read:
-    // it surfaced as empty strings on a 200 response and as a segfaulted shard.
+    // ---- THE COUNT CONTRACT, enforced once for every value type ----
     //
-    // Roll the timestamps back to the last consistent state rather than handing
-    // up a desynced pair.  Dropping a block's points is a visible, bounded loss;
-    // a desynced pair corrupts memory.
-    const size_t timestampsAdded = outTimestamps.size() - timestampsBefore;
-    const size_t valuesAdded = outValues.size() - valuesBefore;
-    if (timestampsAdded != valuesAdded) {
-        timestar::tsm_log.error(
-            "[CORRUPT] block decode desync: {} timestamps but {} values; dropping this block's points", timestampsAdded,
-            valuesAdded);
+    // `expected` is what the block says it holds for this read: the timestamps
+    // that survived the time filter. Each decoder reports what it really
+    // produced (phase 1), so the three previously-divergent behaviours -- ALP
+    // trimmed, bool threw, string/int silently under-produced -- now converge
+    // here.
+    //
+    //   produced > expected : benign. A decoder working in fixed-size groups can
+    //                         overshoot the tail; truncate and carry on.
+    //   produced < expected : the block is corrupt or a decoder regressed. There
+    //                         is no safe repair -- pairing values[i] with
+    //                         timestamps[i] past the shortfall MISPAIRS real
+    //                         data, presenting a wrong point as a valid one.
+    const size_t expected = outTimestamps.size() - timestampsBefore;
+
+    // FIRST: the decoder must have APPENDED. Both vectors accumulate across every
+    // block of a series, so a decoder that clears or otherwise shrinks the output
+    // destroys earlier blocks' values while their timestamps remain.
+    //
+    // This check is what actually catches that, and trusting the decoder's own
+    // produced-count does NOT: the clobbering block reports produced == expected
+    // for ITS OWN points (1 value for 1 timestamp) and looks perfectly healthy,
+    // while 3000 previously-decoded values have silently vanished. Measuring the
+    // real growth of the buffer is the only view that sees it.
+    if (outValues.size() < valuesBefore) {
+        const size_t lost = valuesBefore - outValues.size();
+        outTimestamps.resize(timestampsBefore);
+        throw timestar::BlockDecodeError("value decoder shrank the output by " + std::to_string(lost) +
+                                         " values -- decoders must APPEND, never clear (block declares " +
+                                         std::to_string(timestampSize) + " points)");
+    }
+    const size_t appended = outValues.size() - valuesBefore;
+
+    if (appended > expected) {
+        outValues.resize(valuesBefore + expected);
+    } else if (appended < expected) {
+        // Roll the timestamps back so no caller can observe a desynced pair even
+        // if this exception is caught and the buffers reused.
         outTimestamps.resize(timestampsBefore);
         outValues.resize(valuesBefore);
-        return 0;
+        throw timestar::BlockDecodeError("TSM block decode short: appended " + std::to_string(appended) +
+                                         " values (decoder reported " + std::to_string(produced) + ") for " +
+                                         std::to_string(expected) + " timestamps (block declares " +
+                                         std::to_string(timestampSize) + " points)");
+    }
+
+    // Defence for the other direction: the timestamp decoder must never emit
+    // more than the block declares. Both FFOR paths clamp to `timestampSize`,
+    // but that is enforced inside the decoder -- this is the check at the
+    // consumer, and it is the ONLY thing standing between a future timestamp
+    // over-read and silently fabricated points.
+    if (expected > timestampSize) {
+        outTimestamps.resize(timestampsBefore);
+        outValues.resize(valuesBefore);
+        throw timestar::BlockDecodeError("TSM block decoded " + std::to_string(expected) +
+                                         " timestamps but declares only " + std::to_string(timestampSize));
     }
 
     return nTimestamps;

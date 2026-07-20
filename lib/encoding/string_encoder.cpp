@@ -450,8 +450,8 @@ size_t StringEncoder::encodeDictionaryInto(std::span<const std::string> values, 
     return target.size() - startPos;
 }
 
-void StringEncoder::decodeDictionary(Slice& encoded, size_t totalCount, size_t skipCount, size_t limitCount,
-                                     const std::vector<std::string>& dictEntries, std::vector<std::string>& out) {
+size_t StringEncoder::decodeDictionary(Slice& encoded, size_t totalCount, size_t skipCount, size_t limitCount,
+                                       const std::vector<std::string>& dictEntries, std::vector<std::string>& out) {
     if (encoded.offset > encoded.length_) {
         throw std::runtime_error("String decoder: slice offset past end");
     }
@@ -485,11 +485,11 @@ void StringEncoder::decodeDictionary(Slice& encoded, size_t totalCount, size_t s
         throw std::runtime_error("Dictionary-encoded block uncompressedSize exceeds limit");
     }
 
-    // Empty block: nothing to decompress — advance past compressed data and return.
-    // APPENDS (see the skip/limit decode() below): must not clear `out`.
+    // Empty block: nothing to decompress — advance past compressed data and
+    // return. APPENDS, so `out` must be left exactly as it was found.
     if (uncompressedSize == 0) {
         encoded.offset += compressedSize;
-        return;
+        return 0;
     }
 
     tlDecompBuf.resize(uncompressedSize);
@@ -515,6 +515,7 @@ void StringEncoder::decodeDictionary(Slice& encoded, size_t totalCount, size_t s
             break;
         }
     }
+    return produced;
 }
 
 bool StringEncoder::isDictionaryEncoded(Slice& slice) {
@@ -525,8 +526,8 @@ bool StringEncoder::isDictionaryEncoded(Slice& slice) {
     return magic == STR2_MAGIC;
 }
 
-void StringEncoder::decode(Slice& encoded, size_t totalCount, size_t skipCount, size_t limitCount,
-                           std::vector<std::string>& out) {
+size_t StringEncoder::decode(Slice& encoded, size_t totalCount, size_t skipCount, size_t limitCount,
+                             std::vector<std::string>& out) {
     if (encoded.offset > encoded.length_) {
         throw std::runtime_error("String decoder: slice offset past end");
     }
@@ -558,11 +559,11 @@ void StringEncoder::decode(Slice& encoded, size_t totalCount, size_t skipCount, 
         throw std::runtime_error("Invalid encoded buffer: size mismatch");
     }
 
-    // Empty block: nothing to decompress — advance past compressed data and return.
-    // APPENDS (see below): must not clear `out`.
+    // Empty block: nothing to decompress — advance past compressed data and
+    // return. APPENDS, so `out` must be left exactly as it was found.
     if (uncompressedSize == 0) {
         encoded.offset += compressedSize;
-        return;
+        return 0;
     }
 
     // Decompress (zstd doesn't support random access, so we must decompress the full block)
@@ -584,14 +585,12 @@ void StringEncoder::decode(Slice& encoded, size_t totalCount, size_t skipCount, 
 
     // Decode strings with skip/limit: skip the first skipCount strings without allocating,
     // then collect the next limitCount strings.
-    //
-    // APPENDS to `out` -- it must NOT be cleared.  decodeBlockFlat() decodes every
-    // block of a series into ONE shared flat vector (exactly as the float, bool and
-    // integer decoders do), so clearing here destroyed every previously decoded
-    // block's values while their timestamps remained.  A 6-block string series came
-    // back with 3600 timestamps and 600 values; the bucketed non-numeric reducer
-    // then indexed values[i] off the end of that vector, which returned empty
-    // strings on a 200 response and segfaulted the shard outright.
+    // APPENDS to `out` -- it must NOT be cleared. decodeBlockFlat() decodes every
+    // block of a series into ONE shared flat vector (exactly as the float, bool
+    // and integer decoders do), so clearing here destroyed every previously
+    // decoded block's values while their timestamps remained. TSM now rejects a
+    // decoder that shrinks the output, so this would fail the query loudly rather
+    // than corrupt memory -- but the contract still belongs here.
     Slice uncompSlice(uncompressed.data(), uncompressedSize);
     out.reserve(out.size() + limitCount);
 
@@ -615,4 +614,5 @@ void StringEncoder::decode(Slice& encoded, size_t totalCount, size_t skipCount, 
             break;
         }
     }
+    return produced;
 }

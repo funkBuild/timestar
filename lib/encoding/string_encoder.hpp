@@ -61,8 +61,10 @@ public:
     // flat value vector while the timestamps accumulate in a parallel vector.
     // Clearing here desyncs that pair, and consumers index values by a TIMESTAMP
     // index -- an out-of-bounds read, not merely a wrong answer.
-    static void decode(Slice& encoded, size_t totalCount, size_t skipCount, size_t limitCount,
-                       std::vector<std::string>& out);
+    // Returns the number of values ACTUALLY decoded (may be < limitCount if the
+    // block held fewer); the block-level caller enforces the count contract.
+    static size_t decode(Slice& encoded, size_t totalCount, size_t skipCount, size_t limitCount,
+                         std::vector<std::string>& out);
 
     // ==================== Dictionary Encoding (Phase 3) ====================
     // For low-cardinality string series, dictionary encoding stores varint IDs
@@ -102,8 +104,9 @@ public:
     // dictionary entries by const-ref (no per-block copy) — callers decoding
     // many blocks of one series reuse the same dictionary vector.
     // APPENDS to `out` — see the skip/limit decode() above for why.
-    static void decodeDictionary(Slice& encoded, size_t totalCount, size_t skipCount, size_t limitCount,
-                                 const std::vector<std::string>& dictEntries, std::vector<std::string>& out);
+    // Returns the number of values ACTUALLY decoded; see decode() above.
+    static size_t decodeDictionary(Slice& encoded, size_t totalCount, size_t skipCount, size_t limitCount,
+                                   const std::vector<std::string>& dictEntries, std::vector<std::string>& out);
 
     // Check if a block is dictionary-encoded by peeking at the magic bytes.
     static bool isDictionaryEncoded(Slice& slice);

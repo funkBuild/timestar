@@ -100,20 +100,23 @@ static void bucketNonNumericFieldLatest(std::vector<uint64_t>& timestamps, std::
     if (interval == 0 || timestamps.empty()) {
         return;
     }
-    // This loop indexes values[i] by a TIMESTAMP index, so a desynced pair is an
-    // out-of-bounds read, not merely a wrong answer -- it returned empty strings
-    // on a 200 response and segfaulted the shard.  The storage layer now refuses
-    // to emit a desynced pair (see decodeBlockFlat); this is the second line of
-    // defence, because reading past the end here corrupts memory silently.
-    const size_t n = std::min(timestamps.size(), values.size());
+    // This loop indexes values[i] by a TIMESTAMP index, so a desynced pair would
+    // be an out-of-bounds read. It cannot get one: TSM now refuses to emit a
+    // block whose value count does not match its timestamp count, failing the
+    // query instead (see BlockDecodeError).
+    //
+    // A clamp used to live here as a second line of defence. It was removed
+    // because truncating to min(size) does not make a desynced pair safe -- it
+    // MISPAIRS it. With 3001 timestamps and 1 surviving value, clamping emits
+    // timestamps[0] paired with a value belonging to point 3000: one
+    // confidently-wrong point presented as valid, which is worse than the
+    // out-of-bounds read it was preventing and far worse than a failed query.
     if (timestamps.size() != values.size()) {
-        timestar::http_log.error(
-            "[CORRUPT] non-numeric field has {} timestamps but {} values; truncating to {} to avoid an "
-            "out-of-bounds read",
-            timestamps.size(), values.size(), n);
-        timestamps.resize(n);
-        values.resize(n);
+        throw timestar::BlockDecodeError("non-numeric field has " + std::to_string(timestamps.size()) +
+                                         " timestamps but " + std::to_string(values.size()) +
+                                         " values; refusing to emit mispaired points");
     }
+    const size_t n = timestamps.size();
     std::vector<uint64_t> outTs;
     std::vector<V> outVals;
     for (size_t i = 0; i < n; ++i) {

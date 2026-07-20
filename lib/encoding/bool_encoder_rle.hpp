@@ -10,7 +10,9 @@ class BoolEncoderRLE {
 public:
     static AlignedBuffer encode(const std::vector<bool>& values);
     static size_t encodeInto(const std::vector<bool>& values, AlignedBuffer& target);
-    static void decode(Slice& encoded, size_t nToSkip, size_t length, std::vector<bool>& out);
+    // Returns the number of values ACTUALLY decoded (may be < length on a
+    // truncated stream); the block-level caller enforces the count contract.
+    static size_t decode(Slice& encoded, size_t nToSkip, size_t length, std::vector<bool>& out);
 
     // Decode straight to doubles (1.0/0.0) for the aggregation path.
     // Appends `length` values to `out` via bulk fill per run — avoids the
