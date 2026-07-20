@@ -395,7 +395,15 @@ seastar::future<QueryResult<T>> QueryRunner::queryTsm([[maybe_unused]] const std
                     } else {
                         result.values.insert(result.values.end(), block->values.begin(), block->values.end());
                     }
+                    // Release each source block as soon as it has been copied
+                    // out. Without this the decoded blocks stay alive alongside
+                    // the flattened copy for the rest of the function, doubling
+                    // the resident cost of the series -- and this runs up to
+                    // MAX_CONCURRENT_SERIES_QUERIES times in parallel, so the
+                    // waste is multiplied by the concurrency limit.
+                    block.reset();
                 }
+                tbr.result.blocks.clear();
             }
         } else {
             // Overlapping: fall back to the full N-way merge with dedup.
