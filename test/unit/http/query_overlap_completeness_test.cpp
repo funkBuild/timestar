@@ -241,3 +241,80 @@ TEST_F(QueryOverlapCompletenessTest, DroppedSeriesFailsTheQueryAndIsLoggedUncond
         (void)lineStart;
     }
 }
+
+// Efficiency, not just correctness: a rewritten point must not disqualify the
+// WHOLE series from statistics pushdown.
+//
+// Both overlap gates used to be all-or-nothing — one overlapping block pair, or
+// any TSM data inside the memory range, and queryTsmAggregated() declined for the
+// entire series. The fallback then materialised every point to dedup, which is
+// what threw std::bad_alloc on a large series. Overlap is normally localised (a
+// backfill of one window), so the gates now isolate the affected sub-ranges and
+// keep the zero-decode stats path for the rest.
+//
+// The observable consequence, and what this asserts: a series that is mostly
+// untouched with a small rewritten tail answers with exactly the same numbers as
+// one with no rewrites at all. On the real 20M-point repro this was the
+// difference between a 19.8 s failure and a 13 ms answer.
+TEST_F(QueryOverlapCompletenessTest, RewrittenTailDoesNotDisqualifyTheWholeSeries) {
+    seastar::thread([] {
+        ScopedShardedEngine eng;
+        eng.start();
+
+        HttpWriteHandler writeHandler(&eng.eng);
+        HttpQueryHandler queryHandler(&eng.eng);
+
+        // Two series over identical timestamps. "clean" is never rewritten;
+        // "dirty" has its last point rewritten, which is the only difference.
+        auto writeSeries = [&](const char* measurement, int count, double value, int from) {
+            std::string ts = "[";
+            std::string vs = "[";
+            for (int i = from; i < from + count; ++i) {
+                if (i > from) {
+                    ts += ",";
+                    vs += ",";
+                }
+                ts += std::to_string(kBase + static_cast<uint64_t>(i) * 1000 * kMs);
+                vs += std::to_string(value);
+            }
+            ts += "]";
+            vs += "]";
+            writeOk(writeHandler, std::string(R"({"measurement":")") + measurement +
+                                      R"(","tags":{"d":"a"},"fields":{"v":)" + vs + R"(},"timestamps":)" + ts + "}");
+        };
+
+        writeSeries("ovl_clean", 12, 1.0, 0);
+        writeSeries("ovl_dirty", 12, 1.0, 0);
+        // Rewrite only the final point of the dirty series, same timestamp.
+        writeSeries("ovl_dirty", 1, 5.0, 11);
+
+        const uint64_t start = kBase - 10000 * kMs;
+        const uint64_t end = kBase + 60000 * kMs;
+
+        auto cleanCount = singleValue(queryHandler, "count:ovl_clean(v){}", start, end, "365d");
+        auto dirtyCount = singleValue(queryHandler, "count:ovl_dirty(v){}", start, end, "365d");
+        ASSERT_TRUE(cleanCount.has_value());
+        ASSERT_TRUE(dirtyCount.has_value()) << "a rewritten tail must not make the series unqueryable";
+
+        // Identical point counts: the rewrite replaced a point, it did not add one.
+        EXPECT_DOUBLE_EQ(*cleanCount, 12.0);
+        EXPECT_DOUBLE_EQ(*dirtyCount, 12.0) << "rewritten point was double-counted or the series was dropped";
+
+        // The rewritten value wins: 11 x 1.0 + 1 x 5.0 = 16.
+        auto dirtySum = singleValue(queryHandler, "sum:ovl_dirty(v){}", start, end, "365d");
+        ASSERT_TRUE(dirtySum.has_value());
+        EXPECT_DOUBLE_EQ(*dirtySum, 16.0) << "last-write-wins broken for the rewritten tail";
+
+        // And the untouched region of the dirty series still agrees with clean,
+        // which is the part that must keep using the pushdown.
+        const uint64_t headEnd = kBase + 5000 * kMs;
+        auto cleanHead = singleValue(queryHandler, "sum:ovl_clean(v){}", start, headEnd, "365d");
+        auto dirtyHead = singleValue(queryHandler, "sum:ovl_dirty(v){}", start, headEnd, "365d");
+        ASSERT_TRUE(cleanHead.has_value());
+        ASSERT_TRUE(dirtyHead.has_value());
+        EXPECT_DOUBLE_EQ(*dirtyHead, *cleanHead)
+            << "the untouched part of a partially-rewritten series must aggregate identically";
+    })
+        .join()
+        .get();
+}

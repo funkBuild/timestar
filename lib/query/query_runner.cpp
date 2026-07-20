@@ -1104,10 +1104,19 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
     // would miss TSM-only points there (out-of-order flush), and a rewritten
     // point could fold its stale TSM copy alongside the memory value.  Fall
     // back to the dedup merge path.
+    //
+    // Same principle as the block-overlap handling further down: do not abandon
+    // the whole series, just remember that this SUB-RANGE needs the dedup merge.
+    // A rewrite of an already-flushed point leaves the stale copy in TSM and the
+    // new one in a memory store, so [fallbackStartTime, endTime] has to be
+    // merged rather than folded from each source independently -- but everything
+    // below fallbackStartTime is untouched by that and can still push down.
+    bool tsmOverlapsMemoryRange = false;
     if (needsFallback) {
         for (const auto& [rank, tsmFile] : seqFilesSnap) {
             if (tsmFile->seriesMayOverlapTime(seriesId, fallbackStartTime, endTime)) {
-                co_return std::nullopt;
+                tsmOverlapsMemoryRange = true;
+                break;
             }
         }
     }
@@ -1170,14 +1179,42 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
     // disqualifying: additive methods would double-count, and even
     // "idempotent" MIN/MAX could resurrect an overwritten value.  Fall back
     // to the dedup merge path, which resolves duplicates newest-write-first.
+    //
+    // Rather than abandoning the whole series on ANY overlap, isolate WHERE the
+    // overlap is. Blocks are grouped into maximal time-connected runs; a run
+    // containing an overlap needs the dedup merge, every other part of the range
+    // is still safe to push down from block statistics.
+    //
+    // This matters because the previous all-or-nothing gate meant one rewritten
+    // point anywhere disqualified the entire series: a 20M-point series with a
+    // 2M-point backfill materialised all 20M points to dedup, which is ~300 MB
+    // and throws std::bad_alloc on a memory-constrained shard. Now only the
+    // overlapping runs are materialised, one at a time, and the rest keeps the
+    // zero-decode stats path.
+    std::vector<std::pair<uint64_t, uint64_t>> overlapRuns;
     if (allBlockRanges.size() > 1) {
         std::sort(allBlockRanges.begin(), allBlockRanges.end());
-        uint64_t prevMax = 0;
-        for (size_t i = 0; i < allBlockRanges.size(); ++i) {
-            if (i > 0 && allBlockRanges[i].first <= prevMax) {
-                co_return std::nullopt;
+
+        uint64_t runLo = allBlockRanges[0].first;
+        uint64_t runMax = allBlockRanges[0].second;
+        bool runHasOverlap = false;
+        for (size_t i = 1; i < allBlockRanges.size(); ++i) {
+            if (allBlockRanges[i].first <= runMax) {
+                // Connected to the current run, and connected means the same
+                // timestamp can exist in both.
+                runHasOverlap = true;
+                runMax = std::max(runMax, allBlockRanges[i].second);
+            } else {
+                if (runHasOverlap) {
+                    overlapRuns.emplace_back(runLo, runMax);
+                }
+                runLo = allBlockRanges[i].first;
+                runMax = allBlockRanges[i].second;
+                runHasOverlap = false;
             }
-            prevMax = std::max(prevMax, allBlockRanges[i].second);
+        }
+        if (runHasOverlap) {
+            overlapRuns.emplace_back(runLo, runMax);
         }
     }
 
@@ -1200,14 +1237,65 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
     // Pass per-shard I/O semaphore to bound concurrent DMA reads across all
     // series being queried on this shard (prevents reactor stalls at scale).
     seastar::semaphore* ioSem = &fileManager->queryIoSem;
-    for (auto& ref : filesWithData) {
-        co_await ref.file->aggregateSeries(seriesId, startTime, tsmEndTime, aggregator, ioSem);
+    if (overlapRuns.empty()) {
+        for (auto& ref : filesWithData) {
+            co_await ref.file->aggregateSeries(seriesId, startTime, tsmEndTime, aggregator, ioSem);
+        }
+    } else {
+        // Push down the gaps BETWEEN overlap runs, and dedup-merge the runs
+        // themselves. Ranges are inclusive on both ends (overlappingBlockRange
+        // selects a block when maxTime >= start && minTime <= end), so the gaps
+        // stop one tick short of each run and resume one tick past it. Every
+        // point is therefore covered exactly once.
+        uint64_t cursor = startTime;
+        for (const auto& [runLo, runHi] : overlapRuns) {
+            if (runLo > cursor) {
+                const uint64_t gapHi = runLo - 1;
+                for (auto& ref : filesWithData) {
+                    co_await ref.file->aggregateSeries(seriesId, cursor, gapHi, aggregator, ioSem);
+                }
+            }
+
+            // Dedup-merge just this run. queryTsm applies last-write-wins across
+            // files; it also consults memory stores, but memory data starts at
+            // fallbackStartTime == tsmEndTime + 1 and runs never extend past
+            // tsmEndTime, so no memory point can be double-counted here.
+            const uint64_t mergeHi = std::min(runHi, tsmEndTime);
+            if (mergeHi >= runLo) {
+                auto merged = co_await queryTsm<double>(std::string{}, seriesId, runLo, mergeHi);
+                if (!merged.timestamps.empty()) {
+                    aggregator.addPoints(merged.timestamps, merged.values);
+                }
+                // `merged` is released here, before the next run is read, so peak
+                // memory is the largest single run rather than the whole series.
+            }
+
+            cursor = (runHi == std::numeric_limits<uint64_t>::max()) ? runHi : runHi + 1;
+            if (cursor > tsmEndTime) {
+                break;
+            }
+        }
+        if (cursor <= tsmEndTime) {
+            for (auto& ref : filesWithData) {
+                co_await ref.file->aggregateSeries(seriesId, cursor, tsmEndTime, aggregator, ioSem);
+            }
+        }
     }
 
     // Fallback: fold MemoryStore data directly into the aggregator
     // for the overlap range [fallbackStartTime, endTime].  This avoids
     // materialising intermediate QueryResult vectors.
-    if (needsFallback) {
+    if (tsmOverlapsMemoryRange) {
+        // TSM still holds stale copies of timestamps that were rewritten into a
+        // memory store. Folding both sources independently would count the point
+        // twice (or keep the stale value), so this range goes through the dedup
+        // merge, which resolves newest-write-first. Memory stores are bounded by
+        // their rollover threshold, so this materialises a bounded amount.
+        auto merged = co_await queryTsm<double>(std::string{}, seriesId, fallbackStartTime, endTime);
+        if (!merged.timestamps.empty()) {
+            aggregator.addPoints(merged.timestamps, merged.values);
+        }
+    } else if (needsFallback) {
         aggregateMemoryStores(pinnedStores, seriesId, fallbackStartTime, endTime, aggregator);
     }
 
