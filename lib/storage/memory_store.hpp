@@ -120,10 +120,38 @@ private:
     // provides a conservative upper bound for rollover decisions.
     size_t estimatedAccumulatedSize = 0;
 
+    // Resident-memory estimate, tracked separately from the WAL-byte estimate
+    // above. estimatedAccumulatedSize models COMPRESSED ON-DISK bytes, which is
+    // the right bound for the WAL but a wild under-count of RAM: it under-counts
+    // doubles ~3.5x, and highly-repetitive strings ~1000x (the per-string floor
+    // is 1 byte while the resident cost is the std::string plus its payload).
+    //
+    // It also ignores per-SERIES cost entirely, so a high-cardinality workload
+    // never reaches the threshold: 6,000 series x 20 points measured ~400 MB
+    // resident while the estimate stayed under 1 MB and the store never rolled
+    // over at all. Rollover now triggers on whichever estimate crosses first.
+    size_t residentBytesEstimate = 0;
+
+    // Rough per-series bookkeeping cost: robin_map slot (key + variant payload,
+    // at ~0.5 load factor) plus the two heap vector allocations.
+    static constexpr size_t PER_SERIES_OVERHEAD_BYTES = 448;
+
+public:
+    size_t getResidentBytesEstimate() const { return residentBytesEstimate; }
+
+private:
 public:
     // Threshold for WAL rollover decisions (based on estimated sizes).
     // Read from timestar::config().storage.wal_size_threshold at runtime.
     static size_t walSizeThreshold() { return timestar::config().storage.wal_size_threshold; }
+
+    // Resident-memory ceiling for one memory store. Deliberately a multiple of
+    // the WAL threshold rather than equal to it: the WAL threshold governs
+    // compressed on-disk bytes, and typical compression means a store that hits
+    // the WAL bound holds several times that in RAM. This is the backstop for
+    // the cases where compression is so effective (or cardinality so high) that
+    // the WAL bound is never reached at all.
+    static size_t residentBytesThreshold() { return timestar::config().storage.wal_size_threshold * 4; }
     const unsigned int sequenceNumber;
     // Use robin_map for O(1) lookups with better cache locality than std::unordered_map
     tsl::robin_map<SeriesId128, VariantInMemorySeries, SeriesId128::Hash> series;

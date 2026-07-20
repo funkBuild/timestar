@@ -182,6 +182,15 @@ FastPathResult parseWriteRequestFast(const void* data, size_t size, uint64_t def
                 ++result.failedWrites;
                 continue;  // skip the whole point — no usable timestamps
             }
+            // Drop any slack before the vector becomes long-lived. The decode
+            // reserve is sized from an upper bound, and moving into the shared_ptr
+            // PRESERVES capacity -- so without this, every series retains its
+            // over-reserved buffer for as long as the write is in flight, which
+            // at high cardinality is per-series resident waste rather than a
+            // transient spike.
+            if (timestamps.capacity() > timestamps.size()) {
+                timestamps.shrink_to_fit();
+            }
             sharedTimestamps = std::make_shared<const std::vector<uint64_t>>(std::move(timestamps));
         } else {
             const int tsCount = wp.timestamps_size();

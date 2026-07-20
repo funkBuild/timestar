@@ -579,10 +579,24 @@ std::pair<size_t, size_t> IntegerEncoderFFOR::decode(Slice& encoded, unsigned in
 
     size_t nSkipped = 0, nAdded = 0;
 
-    // Optimized memory allocation
+    // Optimized memory allocation.
+    //
+    // `timestampSize` is an UPPER BOUND supplied by the caller, not the real
+    // count. On the protobuf ingest path it is derived from the payload byte
+    // length (bytes * 64, the encoder's densest possible ratio), so a small
+    // highly-compressible payload claims a bound far above what it decodes to --
+    // a 16-byte constant-delta block bounds at 1024 values but yields 20. The
+    // vector is then retained at that inflated capacity, so the waste is not
+    // transient: it is per-series resident memory at high cardinality.
+    //
+    // Reserve a bounded prefix and let the vector grow into what actually
+    // decodes. Growth is amortised and the common case (bound == real count)
+    // still takes a single allocation.
+    static constexpr size_t kMaxInitialReserve = 64 * 1024;
     const size_t current_size = values.size();
-    if (values.capacity() < current_size + timestampSize) {
-        values.reserve(current_size + timestampSize + (timestampSize >> 2));
+    const size_t wanted = std::min(static_cast<size_t>(timestampSize), kMaxInitialReserve);
+    if (values.capacity() < current_size + wanted) {
+        values.reserve(current_size + wanted + (wanted >> 2));
     }
 
     // =========================================================================

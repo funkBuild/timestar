@@ -385,13 +385,23 @@ private:
     void trimMeasurementBloomCache();
 
     seastar::future<> updateHLL(const std::string& measurement, uint32_t localId);
+    // Per-tag-value cardinality sketch. Maintained ONLY once the tag value's
+    // exact bitmap reaches kTagHllMinCardinality: each sketch is 16 KB, so one
+    // per distinct value is ruinous for a high-cardinality tag, and below the
+    // threshold the exact bitmap is both cheaper and more accurate.
+    // `seedFrom`, when given, back-fills a newly created sketch from that bitmap.
     seastar::future<> updateTagHLL(const std::string& measurement, const std::string& tagKey,
-                                   const std::string& tagValue, uint32_t localId);
+                                   const std::string& tagValue, uint32_t localId,
+                                   const roaring::Roaring* seedFrom = nullptr);
     void flushDirtyHLLs(IndexWriteBatch& batch);
     seastar::future<> flushDirtyMeasurementBlooms(IndexWriteBatch& batch);
     // Step 7: Trim HLL cache after flush — evict non-dirty entries when too large
     void trimHllCache();
     static constexpr size_t MAX_HLL_CACHE_ENTRIES = 1000;
+    // Below this many series sharing one (measurement, tagKey, tagValue), the
+    // exact roaring bitmap answers cardinality queries directly, so a 16 KB
+    // sketch with ~0.8% error would cost memory to be LESS accurate.
+    static constexpr uint64_t kTagHllMinCardinality = 10000;
 
     // --- Phase 3: Time-scoped per-day bitmaps ---
     tsl::robin_map<std::string, BitmapEntry> dayBitmapCache_;

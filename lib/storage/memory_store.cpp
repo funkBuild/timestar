@@ -400,13 +400,30 @@ bool MemoryStore::isFull() const {
     // so relying only on actual size may never trigger rollover.
     size_t walSize = wal->getCurrentSize();
     size_t effectiveSize = std::max(walSize, estimatedAccumulatedSize);
-    return effectiveSize >= walSizeThreshold();
+    // ...and roll over on RESIDENT bytes too. The two estimates above are all
+    // about on-disk size; neither sees per-series overhead or uncompressed string
+    // payloads, so a high-cardinality or string-heavy store can hold hundreds of
+    // MB while they still read as near-zero.
+    return effectiveSize >= walSizeThreshold() || residentBytesEstimate >= residentBytesThreshold();
 }
 
 template <class T>
 void MemoryStore::insertMemory(TimeStarInsert<T>&& insertRequest) {
     // In-memory insert
     SeriesId128 seriesId = insertRequest.seriesId128();
+
+    // Account resident cost BEFORE inserting. Point cost is the real in-memory
+    // width (timestamp + value, plus the payload for strings), not the compressed
+    // WAL estimate; series cost is charged once, when the series first appears.
+    const size_t pointCount = insertRequest.getTimestamps().size();
+    size_t pointBytes = pointCount * (sizeof(uint64_t) + sizeof(T));
+    if constexpr (std::is_same_v<T, std::string>) {
+        for (const auto& v : insertRequest.values) {
+            pointBytes += v.capacity();
+        }
+    }
+    const bool isNewSeries = (series.find(seriesId) == series.end());
+    residentBytesEstimate += pointBytes + (isNewSeries ? PER_SERIES_OVERHEAD_BYTES : 0);
 
     // robin_map's operator[] returns a mutable reference, creating entry if needed.
     // Default-constructed variant will be InMemorySeries<double> (first alternative).

@@ -297,7 +297,13 @@ void StringEncoder::decode(Slice& encoded, size_t count, std::vector<std::string
     // Decode strings
     Slice uncompSlice(uncompressed.data(), uncompressedSize);
     out.clear();
-    out.reserve(count);
+    // `count` reaches here from a client-supplied protobuf field, so it must not
+    // be trusted to size an allocation: at 32 bytes per std::string a uint32 max
+    // asks for ~137 GB. The decoded data cannot contain more strings than the
+    // uncompressed buffer has room for -- each needs at least a 1-byte varint
+    // length -- so clamp to that. The loop below already stops at the real end of
+    // the buffer, so a too-large `count` simply yields fewer strings.
+    out.reserve(std::min(static_cast<size_t>(count), static_cast<size_t>(uncompressedSize)));
 
     for (size_t i = 0; i < count && uncompSlice.offset < uncompSlice.length_; i++) {
         uint32_t strLen = readVarInt(uncompSlice);

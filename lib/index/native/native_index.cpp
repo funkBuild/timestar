@@ -884,17 +884,32 @@ seastar::future<SeriesId128> NativeIndex::getOrCreateSeriesId(SeriesId128 series
     // Phase 2: Add local ID to dirty postings bitmaps (TAG_INDEX/GROUP_BY_INDEX removed in Phase 3)
     std::string bitmapCacheKey;
     bitmapCacheKey.reserve(measurement.size() + 1 + 32 + 1 + 32);
+    // Phase 4: Update cardinality HLLs.
+    //
+    // The per-tag-value HLL is maintained ONLY above a cardinality threshold.
+    // Each sketch is 16 KB (16384 registers), so one per distinct tag value is
+    // ruinous for a high-cardinality tag: 6,000 distinct values measured ~64 KB
+    // each once the sketch, its serialised copy and its KV entry are counted,
+    // and the shard hit std::bad_alloc at ~6,100 values. The same workload with
+    // 200,000 series but only 300 distinct tag values was fine -- the cost
+    // tracks distinct VALUES, not series.
+    //
+    // It is also poor value below the threshold: the exact roaring bitmap for
+    // the same (measurement, tagKey, tagValue) is maintained here anyway, and
+    // getTagValueCardinality() already falls back to bitmap->cardinality(),
+    // which is EXACT. A 16 KB sketch with 0.8% error to count something in the
+    // tens is strictly worse than the answer already on hand.
     for (const auto& [tagKey, tagValue] : tags) {
         buildBitmapCacheKey(bitmapCacheKey, measurement, tagKey, tagValue);
         auto* bitmap = co_await getOrLoadBitmapForInsert(bitmapCacheKey);
         bitmap->add(localId);
+
+        if (bitmap->cardinality() >= kTagHllMinCardinality) {
+            co_await updateTagHLL(measurement, tagKey, tagValue, localId, bitmap);
+        }
     }
 
-    // Phase 4: Update cardinality HLLs
     co_await updateHLL(measurement, localId);
-    for (const auto& [tagKey, tagValue] : tags) {
-        co_await updateTagHLL(measurement, tagKey, tagValue, localId);
-    }
     // Mark measurement bloom for rebuild on next flush
     dirtyMeasurementBlooms_.insert(measurement);
 
@@ -2693,7 +2708,8 @@ seastar::future<> NativeIndex::updateHLL(const std::string& measurement, uint32_
 }
 
 seastar::future<> NativeIndex::updateTagHLL(const std::string& measurement, const std::string& tagKey,
-                                            const std::string& tagValue, uint32_t localId) {
+                                            const std::string& tagValue, uint32_t localId,
+                                            const roaring::Roaring* seedFrom) {
     std::string key;
     key.reserve(measurement.size() + 1 + tagKey.size() + 1 + tagValue.size());
     key += measurement;
@@ -2714,6 +2730,15 @@ seastar::future<> NativeIndex::updateTagHLL(const std::string& measurement, cons
                 it = hllCache_.try_emplace(key, HyperLogLog::deserialize(*val)).first;
             } else {
                 it = hllCache_.try_emplace(key).first;
+                // This sketch is being created only now, because the tag value
+                // just crossed the cardinality threshold. Seed it from the exact
+                // bitmap: otherwise it would count only the IDs added from here
+                // on and under-report by roughly the threshold.
+                if (seedFrom != nullptr) {
+                    for (uint32_t existingId : *seedFrom) {
+                        it.value().add(existingId);
+                    }
+                }
             }
         }
     }
