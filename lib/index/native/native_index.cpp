@@ -17,6 +17,7 @@
 #include <filesystem>
 #include <format>
 #include <seastar/core/coroutine.hh>
+#include <seastar/core/memory.hh>
 #include <seastar/core/seastar.hh>
 #include <seastar/core/smp.hh>
 #include <seastar/core/thread.hh>
@@ -164,6 +165,31 @@ NativeIndex::~NativeIndex() {
 // ============================================================================
 
 seastar::future<> NativeIndex::open() {
+    // Fail loudly at startup if the configured memory budgets cannot fit this
+    // shard's arena. Previously the individual caches were fixed absolutes that
+    // summed to ~690 MB per shard regardless of how much memory the shard
+    // actually had, so an under-provisioned deployment did not find out until a
+    // std::bad_alloc hours later, from whichever allocation happened to be
+    // unlucky. A wrong number should be a config error, not a mystery crash.
+    {
+        const size_t shardTotal = seastar::memory::stats().total_memory();
+        const size_t indexBudget = indexCacheBudgetBytes();
+        const size_t memtables = timestar::config().index.write_buffer_size * 2;  // active + immutable
+        // NOTE: storage.compaction.max_memory is deliberately NOT counted here.
+        // It is currently dead config -- nothing reads it -- so counting it would
+        // overstate what is actually committed. Compaction's real footprint is
+        // bounded by its streaming writer, not by that setting.
+        const size_t committed = indexBudget + memtables;
+
+        if (shardTotal > 0 && committed > shardTotal / 2) {
+            ::native_index_log.warn(
+                "Shard {} memory budgets are large relative to its arena: index caches {} MB + memtables {} MB = "
+                "{} MB of {} MB ({}%). Reduce index.write_buffer_size, or give the shard more memory.",
+                shardId_, indexBudget >> 20, memtables >> 20, committed >> 20, shardTotal >> 20,
+                committed * 100 / shardTotal);
+        }
+    }
+
     // Note: std::filesystem::absolute() depends on the process CWD at call time.
     // This is fine because open() is called during startup before any CWD change.
     indexPath_ = std::filesystem::absolute(timestar::shardDataPath(shardId_) + "/native_index").string();
@@ -2288,6 +2314,35 @@ void NativeIndex::flushDirtyDayBitmaps(IndexWriteBatch& batch) {
     dayBitmapCacheDirtyKeys_.clear();
 }
 
+// Fraction of this shard's arena that ALL index caches together may occupy.
+// 25% leaves room for the memtables, the query working set, WAL buffers, TSM
+// sparse indexes and compaction, none of which draw from this budget.
+static constexpr double kIndexCacheFractionOfShard = 0.25;
+
+size_t NativeIndex::indexCacheBudgetBytes() {
+    const size_t shardTotal = seastar::memory::stats().total_memory();
+    const size_t budget = static_cast<size_t>(static_cast<double>(shardTotal) * kIndexCacheFractionOfShard);
+    // Floor so tiny test/dev shards still cache usefully; ceiling so a very large
+    // shard does not hand an unbounded budget to structures whose useful working
+    // set is far smaller.
+    constexpr size_t kMinBudget = 16u << 20;   // 16 MB
+    constexpr size_t kMaxBudget = 512u << 20;  // 512 MB
+    return std::clamp(budget, kMinBudget, kMaxBudget);
+}
+
+size_t NativeIndex::maxBitmapCacheBytes() {
+    return indexCacheBudgetBytes() * 40 / 100;
+}
+size_t NativeIndex::maxDayBitmapCacheBytes() {
+    return indexCacheBudgetBytes() * 20 / 100;
+}
+size_t NativeIndex::maxBloomCacheBytes() {
+    return indexCacheBudgetBytes() * 15 / 100;
+}
+size_t NativeIndex::maxHllCacheBytes() {
+    return indexCacheBudgetBytes() * 10 / 100;
+}
+
 void NativeIndex::trimBitmapCache() {
     // Check both entry count and byte budget
     bool overEntries = bitmapCache_.size() > MAX_BITMAP_CACHE_ENTRIES;
@@ -2298,7 +2353,7 @@ void NativeIndex::trimBitmapCache() {
         for (const auto& [key, entry] : bitmapCache_) {
             totalBytes += entry.approxBytes + key.size();
         }
-        overBytes = totalBytes > MAX_BITMAP_CACHE_BYTES;
+        overBytes = totalBytes > maxBitmapCacheBytes();
     }
     if (!overEntries && !overBytes)
         return;
@@ -2312,7 +2367,7 @@ void NativeIndex::trimBitmapCache() {
     // re-scan KV or it would persist a bloom missing the evicted keys
     // (false negatives = series silently invisible).
     const size_t entryTarget = MAX_BITMAP_CACHE_ENTRIES / 2;  // evict to 50% to avoid thrashing
-    const size_t byteTarget = MAX_BITMAP_CACHE_BYTES / 2;
+    const size_t byteTarget = maxBitmapCacheBytes() / 2;
     for (auto it = bitmapCache_.begin(); it != bitmapCache_.end();) {
         bool doneEntries = !overEntries || bitmapCache_.size() <= entryTarget;
         bool doneBytes = !overBytes || totalBytes <= byteTarget;
@@ -2341,14 +2396,14 @@ void NativeIndex::trimDayBitmapCache() {
         for (const auto& [key, entry] : dayBitmapCache_) {
             totalBytes += entry.approxBytes + key.size();
         }
-        overBytes = totalBytes > MAX_DAY_BITMAP_CACHE_BYTES;
+        overBytes = totalBytes > maxDayBitmapCacheBytes();
     }
     if (!overEntries && !overBytes)
         return;
 
     // Enforce the byte budget independently of the entry cap (see trimBitmapCache).
     const size_t entryTarget = MAX_DAY_BITMAP_CACHE_ENTRIES / 2;
-    const size_t byteTarget = MAX_DAY_BITMAP_CACHE_BYTES / 2;
+    const size_t byteTarget = maxDayBitmapCacheBytes() / 2;
     for (auto it = dayBitmapCache_.begin(); it != dayBitmapCache_.end();) {
         bool doneEntries = !overEntries || dayBitmapCache_.size() <= entryTarget;
         bool doneBytes = !overBytes || totalBytes <= byteTarget;
@@ -2431,13 +2486,32 @@ void NativeIndex::trimSchemaCaches() {
 }
 
 void NativeIndex::trimMeasurementBloomCache() {
-    if (measurementBloomCache_.size() <= MAX_BLOOM_CACHE_ENTRIES)
+    // Bound by BYTES as well as entry count. A bloom is sized from the number of
+    // distinct tag values in its measurement, so entries range from 8 KB to
+    // megabytes -- an entry count alone says nothing about the memory held. The
+    // byte budget is what actually protects the arena; the count cap remains as a
+    // cheap guard against pathological numbers of tiny measurements.
+    const size_t byteBudget = maxBloomCacheBytes();
+
+    auto totalBytes = [this]() {
+        size_t total = 0;
+        for (const auto& [key, bloom] : measurementBloomCache_) {
+            total += bloom.filterSize() + key.size();
+        }
+        return total;
+    };
+
+    size_t bytes = totalBytes();
+    if (measurementBloomCache_.size() <= MAX_BLOOM_CACHE_ENTRIES && bytes <= byteBudget) {
         return;
-    // Evict non-dirty entries first. If still over limit, evict all non-dirty.
+    }
+
+    // Evict non-dirty entries first; dirty ones still owe a flush.
     for (auto it = measurementBloomCache_.begin(); it != measurementBloomCache_.end();) {
-        if (measurementBloomCache_.size() <= MAX_BLOOM_CACHE_ENTRIES)
+        if (measurementBloomCache_.size() <= MAX_BLOOM_CACHE_ENTRIES && bytes <= byteBudget)
             break;
         if (dirtyMeasurementBlooms_.count(it->first) == 0) {
+            bytes -= std::min(bytes, it->second.filterSize() + it->first.size());
             bloomFullyBuilt_.erase(it->first);
             it = measurementBloomCache_.erase(it);
         } else {

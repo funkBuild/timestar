@@ -69,10 +69,26 @@ public:
     // WARNING: resize(nextId) default-constructs zero SeriesId128 entries for ALL slots.
     // If any local IDs are missing from persisted data (e.g., partial WAL truncation),
     // those slots will remain zero, creating "holes". Use isValid() to detect them.
+    // `nextId` comes from a 4-byte value read off disk with no range validation,
+    // and localToGlobal_ is 16 bytes per slot while globalToLocal_ is ~24 -- so a
+    // corrupt or truncated counter asks for up to 275 GB here. This runs on the
+    // STARTUP path, so unlike a query-time allocation failure the shard cannot
+    // recover by restarting.
+    //
+    // Clamp the up-front allocation. restoreEntry() grows the vector as real
+    // entries arrive, so a legitimately large counter still works; only the
+    // speculative pre-allocation is bounded.
+    static constexpr uint32_t kMaxReasonableLocalIds = 10'000'000;
+
     void restoreBegin(uint32_t nextId, uint32_t expectedCount) {
+        if (nextId > kMaxReasonableLocalIds) {
+            throw std::runtime_error("LocalIdMap: persisted local-id counter " + std::to_string(nextId) +
+                                     " exceeds the maximum of " + std::to_string(kMaxReasonableLocalIds) +
+                                     " -- index metadata is corrupt");
+        }
         nextId_ = nextId;
         localToGlobal_.resize(nextId);
-        globalToLocal_.reserve(expectedCount);
+        globalToLocal_.reserve(std::min(expectedCount, kMaxReasonableLocalIds));
     }
 
     // Add a single mapping during restore (call between restoreBegin/restoreEnd).
@@ -83,6 +99,13 @@ public:
     // persisted bitmaps still reference the old assignment.
     void restoreEntry(uint32_t localId, const SeriesId128& globalId) {
         if (localId >= nextId_) {
+            // Same exposure as restoreBegin: this id comes from a scan key on
+            // disk and drives a resize.
+            if (localId >= kMaxReasonableLocalIds) {
+                throw std::runtime_error("LocalIdMap: persisted local id " + std::to_string(localId) +
+                                         " exceeds the maximum of " + std::to_string(kMaxReasonableLocalIds) +
+                                         " -- index metadata is corrupt");
+            }
             nextId_ = localId + 1;
             localToGlobal_.resize(nextId_);
         }

@@ -303,7 +303,13 @@ private:
     std::string sstFilename(uint64_t fileNumber);
 
     // --- Application-level caches ---
-    static size_t defaultMaxSeriesCacheSize() { return timestar::config().index.series_cache_size; }
+    // Divided by shard count, like blockCache_/seriesMetadataCache_/discoveryCache_
+    // already are. Left undivided this was 1M entries PER SHARD (~40 B/entry,
+    // and two generations are live), so a 16-shard box held 32M entries / 1.28 GB
+    // for this one set while its three sibling caches were correctly scaled down.
+    static size_t defaultMaxSeriesCacheSize() {
+        return timestar::config().index.series_cache_size / std::max(1u, seastar::smp::count);
+    }
     static constexpr size_t EVICTION_BATCH_SIZE = 256;
     size_t maxSeriesCacheSize_ = defaultMaxSeriesCacheSize();
     std::unordered_set<SeriesId128, SeriesId128::Hash> indexedSeriesCache_;
@@ -380,8 +386,13 @@ private:
     // Per-measurement bloom filter of all LocalIds (for short-circuiting non-existent tag lookups)
     tsl::robin_map<std::string, BloomFilter> measurementBloomCache_;
     std::unordered_set<std::string> dirtyMeasurementBlooms_;
-    std::unordered_set<std::string> bloomFullyBuilt_;        // Measurements where bloom KV scan already done
-    static constexpr size_t MAX_BLOOM_CACHE_ENTRIES = 5000;  // ~40MB at 8KB per bloom
+    std::unordered_set<std::string> bloomFullyBuilt_;  // Measurements where bloom KV scan already done
+    // Count-bounding this was wrong: BloomFilter::build() sizes from the number
+    // of distinct tag values in the measurement, so one entry ranges from 8 KB to
+    // megabytes. At 5000 entries the "~40MB" assumed a fixed 8 KB entry; at the
+    // code's own stated "~100K keys in practice" it is 937 MB, i.e. the entire
+    // arena. Bounded by bytes now, like bitmapCache_ already is.
+    static constexpr size_t MAX_BLOOM_CACHE_ENTRIES = 5000;
     void trimMeasurementBloomCache();
 
     seastar::future<> updateHLL(const std::string& measurement, uint32_t localId);
@@ -416,10 +427,26 @@ private:
 
     // Step 7: Cache eviction — bounded by both entry count and byte budget.
     // Byte budget prevents high-cardinality bitmaps from consuming excessive memory.
+    // Cache budgets are a FRACTION OF THIS SHARD'S ARENA, not fixed absolutes.
+    //
+    // As fixed values these summed to ~690 MB per shard (bitmap 128 + day bitmap
+    // 64 + bloom 40 + series 80 + hll 16 + memtables 32 + metadata 48 + discovery
+    // 16 + block 8, plus 256 MB of compaction budget), which is ~69% of a 1 GB
+    // shard committed before a single point is read. Worse, most were not divided
+    // by shard count, so adding shards did not reduce them: per-shard footprint
+    // stayed flat while the per-shard arena shrank.
+    //
+    // Deriving from seastar::memory::stats().total_memory() makes them scale both
+    // ways -- small on a 1 GB shard, generous on a 16 GB one -- and keeps the
+    // total bounded by construction.
+    static size_t indexCacheBudgetBytes();
+    static size_t maxBitmapCacheBytes();     // 40% of the index budget
+    static size_t maxDayBitmapCacheBytes();  // 20%
+    static size_t maxBloomCacheBytes();      // 15%
+    static size_t maxHllCacheBytes();        // 10%
+
     static constexpr size_t MAX_BITMAP_CACHE_ENTRIES = 100000;
-    static constexpr size_t MAX_BITMAP_CACHE_BYTES = 128 * 1024 * 1024;  // 128MB per shard
     static constexpr size_t MAX_DAY_BITMAP_CACHE_ENTRIES = 50000;
-    static constexpr size_t MAX_DAY_BITMAP_CACHE_BYTES = 64 * 1024 * 1024;  // 64MB per shard
     void trimBitmapCache();
     void trimDayBitmapCache();
     // Step 6: Evict oldest tag values cache entries when over limit
