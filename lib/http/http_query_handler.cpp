@@ -141,6 +141,148 @@ static void bucketNonNumericResultLatest(timestar::SeriesResult& sr, uint64_t in
     }
 }
 
+// Bounded recovery for a series whose single-shot read exhausted memory.
+//
+// A non-numeric field queried WITH an aggregationInterval reduces to
+// LATEST-per-bucket, so its RESULT is O(buckets) -- but assembly asked
+// engine.query() for the whole range first, making peak memory O(points in
+// range).  A `latest:` over a multi-million-point string series therefore threw
+// std::bad_alloc while the answer it was building was a handful of values: the
+// output was bounded and only the assembly was not.
+//
+// Re-read the range in bucket-aligned chunks, reducing each chunk to
+// LATEST-per-bucket before the next is read, so peak memory is O(points in one
+// chunk) instead of O(points in range).  Chunk boundaries are multiples of the
+// interval, so a bucket never spans two chunks and the per-chunk reductions
+// compose by plain concatenation -- ascending chunks yield ascending, distinct
+// bucket starts.  A chunk that still cannot be allocated halves the width and
+// retries, down to a floor of one bucket.
+//
+// This runs ONLY after a failed single-shot attempt, so a query that fits today
+// keeps its exact current plan and cost.
+//
+// Returns nullopt when the series turns out to be NUMERIC: those fold through
+// AggregationState/BlockAggregator rather than this reduction, so the caller
+// records the drop exactly as before.  A returned SeriesResult with no fields
+// means "recovered, but the range holds no data" -- not a failure.
+namespace detail {
+
+seastar::future<std::optional<timestar::SeriesResult>> queryNonNumericBucketedChunked(
+    Engine& engine, std::string seriesKey, SeriesId128 seriesId, std::string field,
+    std::map<std::string, std::string> tags, std::string measurement, uint64_t startTime, uint64_t endTime,
+    uint64_t interval, uint64_t initialChunkWidth) {
+    if (interval == 0 || startTime > endTime) {
+        co_return std::nullopt;
+    }
+
+    // Chunk width is in TIME and subdivides freely -- it is NOT floored at one
+    // bucket.  A single bucket can itself hold millions of points (a 1h bucket
+    // over 1ms data holds 3.6M), so a one-bucket floor still cannot be
+    // materialised on a small shard, and whether the query survived came down to
+    // allocator luck rather than the query.
+    //
+    // Splitting inside a bucket is safe because the per-chunk reductions are
+    // merged by BUCKET with later-wins below, not concatenated: chunks ascend, so
+    // a later sub-chunk carrying the same bucket simply replaces that bucket's
+    // value, which is exactly LATEST-per-bucket.
+    //
+    // Start at 1/16 of the range and halve on failure. The initial split is only
+    // a guess -- correctness does not depend on it, because a chunk that cannot
+    // be allocated is retried narrower.
+    uint64_t chunkWidth =
+        initialChunkWidth > 0 ? initialChunkWidth : std::max<uint64_t>(1, (endTime - startTime) / 16 + 1);
+
+    std::vector<uint64_t> outTs;
+    std::vector<std::string> outStrs;
+    std::vector<bool> outBools;
+    bool sawString = false;
+    bool sawBool = false;
+
+    // Append one already-bucketed (timestamp, value) pair, merging into the last
+    // bucket when a chunk boundary split it.  Ascending chunks => later wins.
+    auto appendBucket = [&](uint64_t bucket, auto&& value) {
+        using V = std::decay_t<decltype(value)>;
+        if (!outTs.empty() && outTs.back() == bucket) {
+            if constexpr (std::is_same_v<V, std::string>) {
+                outStrs.back() = std::forward<decltype(value)>(value);
+            } else {
+                outBools.back() = value;
+            }
+            return;
+        }
+        outTs.push_back(bucket);
+        if constexpr (std::is_same_v<V, std::string>) {
+            outStrs.push_back(std::forward<decltype(value)>(value));
+        } else {
+            outBools.push_back(value);
+        }
+    };
+
+    uint64_t cur = startTime;
+    while (cur <= endTime) {
+        // chunkWidth >= 1 guarantees forward progress.
+        const uint64_t remaining = endTime - cur;
+        const uint64_t chunkEnd = (chunkWidth - 1 >= remaining) ? endTime : cur + chunkWidth - 1;
+
+        std::optional<VariantQueryResult> chunk;
+        try {
+            chunk = co_await engine.query(seriesKey, seriesId, cur, chunkEnd);
+        } catch (const std::bad_alloc&) {
+            if (chunkWidth > 1) {
+                chunkWidth /= 2;
+                continue;  // retry the same `cur` with a narrower chunk
+            }
+            throw;  // a single time unit will not fit; the caller reports the drop
+        }
+
+        if (!chunk.has_value()) {
+            cur = chunkEnd + 1;
+            continue;
+        }
+
+        bool numeric = false;
+        std::visit(
+            [&](auto&& result) {
+                using T = std::decay_t<decltype(result)>;
+                if constexpr (std::is_same_v<T, QueryResult<std::string>>) {
+                    sawString = true;
+                    bucketNonNumericFieldLatest(result.timestamps, result.values, interval);
+                    for (size_t i = 0; i < result.timestamps.size(); ++i) {
+                        appendBucket(result.timestamps[i], std::move(result.values[i]));
+                    }
+                } else if constexpr (std::is_same_v<T, QueryResult<bool>>) {
+                    sawBool = true;
+                    bucketNonNumericFieldLatest(result.timestamps, result.values, interval);
+                    for (size_t i = 0; i < result.timestamps.size(); ++i) {
+                        appendBucket(result.timestamps[i], result.values[i]);
+                    }
+                } else {
+                    numeric = true;
+                }
+            },
+            *chunk);
+
+        if (numeric) {
+            co_return std::nullopt;
+        }
+        cur = chunkEnd + 1;
+    }
+
+    timestar::SeriesResult sr;
+    sr.measurement = std::move(measurement);
+    sr.tags = std::move(tags);
+    // A series carries one value type (enforced on write), so exactly one of
+    // these is populated; a mixed pair would mean the type binding was violated.
+    if (sawString && !sawBool && !outTs.empty()) {
+        sr.fields[field] = std::make_pair(std::move(outTs), FieldValues(std::move(outStrs)));
+    } else if (sawBool && !sawString && !outTs.empty()) {
+        sr.fields[field] = std::make_pair(std::move(outTs), FieldValues(std::move(outBools)));
+    }
+    co_return sr;
+}
+
+}  // namespace detail
+
 // Streaming group-by coroutine.  Iterates each series context, folds the
 // per-series PushdownResult into a per-group accumulator, and returns
 // PartialAggregationResults in the same format the rest of the pipeline
@@ -310,12 +452,43 @@ static seastar::future<std::vector<PartialAggregationResult>> streamingGroupByAg
             // Memory store data is bounded in size so materializing one
             // series at a time is fine.
             std::optional<VariantQueryResult> optResult;
+            // co_await is not permitted inside a catch handler, so the failure is
+            // recorded here and handled after the try/catch.
+            bool readFailed = false;
+            std::string failReason;
             try {
                 optResult = co_await engine.query(ctx.seriesKey, ctx.seriesId, startTime, endTime);
             } catch (const SeriesNotFoundException&) {
                 // Expected: the series genuinely has no data here.
                 co_return;
             } catch (const std::exception& e) {
+                readFailed = true;
+                failReason = e.what();
+            }
+
+            if (readFailed) {
+                // Before giving up: a non-numeric field with an interval has a
+                // bounded RESULT even when its raw range does not fit, so retry
+                // it in bucket-aligned chunks rather than dropping it.
+                if (aggregationInterval > 0) {
+                    bool recoveredOk = false;
+                    try {
+                        auto recovered = co_await detail::queryNonNumericBucketedChunked(
+                            engine, ctx.seriesKey, ctx.seriesId, ctx.field, ctx.tags, measurement, startTime, endTime,
+                            aggregationInterval);
+                        if (recovered.has_value()) {
+                            if (!recovered->fields.empty()) {
+                                nonNumericResults.push_back(std::move(*recovered));
+                            }
+                            recoveredOk = true;
+                        }
+                    } catch (const std::exception&) {
+                        // Still not satisfiable -- fall through and report it.
+                    }
+                    if (recoveredOk) {
+                        co_return;
+                    }
+                }
                 // NOT expected. Dropping a series here removes real data from an
                 // otherwise-successful response, so this must never be silent:
                 // it was previously logged at debug level and therefore invisible
@@ -323,10 +496,10 @@ static seastar::future<std::vector<PartialAggregationResult>> streamingGroupByAg
                 // indistinguishable from one that legitimately found nothing.
                 timestar::http_log.error(
                     "[QUERY] Dropping series '{}' from result: {}. The response will be INCOMPLETE.", ctx.seriesKey,
-                    e.what());
+                    failReason);
                 ++droppedSeriesOut;
                 if (firstDropReasonOut.empty()) {
-                    firstDropReasonOut = e.what();
+                    firstDropReasonOut = failReason;
                 }
                 co_return;
             }
@@ -990,8 +1163,8 @@ static seastar::future<ShardQueryResult> executeShardQuery(Engine& engine, unsig
 
             co_await seastar::max_concurrent_for_each(
                 contexts, MAX_CONCURRENT_SERIES_QUERIES,
-                [&engine, &pushdownPartials, &fallbackResults, &measurement, startTime, endTime, shardId,
-                 aggregationInterval, aggregation, &groupByTags, &droppedSeries,
+                [&engine, &pushdownPartials, &fallbackResults, &nonNumericResults, &measurement, startTime, endTime,
+                 shardId, aggregationInterval, aggregation, &groupByTags, &droppedSeries,
                  &firstDropReason](SeriesQueryContext& ctx) -> seastar::future<> {
                     // ---- PUSHDOWN PATH ----
                     // Try aggregating directly from TSM blocks, skipping the
@@ -1038,6 +1211,10 @@ static seastar::future<ShardQueryResult> executeShardQuery(Engine& engine, unsig
                     // ---- FALLBACK PATH ----
                     // Pushdown not applicable (non-float, memory data, overlap).
                     std::optional<VariantQueryResult> optResult;
+                    // co_await is not permitted inside a catch handler, so the
+                    // failure is recorded here and handled after the try/catch.
+                    bool readFailed = false;
+                    std::string failReason;
                     try {
                         optResult = co_await engine.query(ctx.seriesKey, ctx.seriesId, startTime, endTime);
                     } catch (const SeriesNotFoundException&) {
@@ -1045,6 +1222,32 @@ static seastar::future<ShardQueryResult> executeShardQuery(Engine& engine, unsig
                                        ctx.seriesKey, shardId);
                         co_return;
                     } catch (const std::exception& e) {
+                        readFailed = true;
+                        failReason = e.what();
+                    }
+
+                    if (readFailed) {
+                        // Bounded retry before dropping -- see the streaming path
+                        // above and queryNonNumericBucketedChunked().
+                        if (aggregationInterval > 0) {
+                            bool recoveredOk = false;
+                            try {
+                                auto recovered = co_await detail::queryNonNumericBucketedChunked(
+                                    engine, ctx.seriesKey, ctx.seriesId, ctx.field, ctx.tags, measurement, startTime,
+                                    endTime, aggregationInterval);
+                                if (recovered.has_value()) {
+                                    if (!recovered->fields.empty()) {
+                                        nonNumericResults.push_back(std::move(*recovered));
+                                    }
+                                    recoveredOk = true;
+                                }
+                            } catch (const std::exception&) {
+                                // Still not satisfiable -- fall through and report it.
+                            }
+                            if (recoveredOk) {
+                                co_return;
+                            }
+                        }
                         // Unconditional, NOT LOG_QUERY_PATH: that macro compiles to
                         // a no-op unless TIMESTAR_LOG_QUERY_PATH is set, so this
                         // warning did not exist in a normal build and the series
@@ -1052,10 +1255,10 @@ static seastar::future<ShardQueryResult> executeShardQuery(Engine& engine, unsig
                         timestar::http_log.error(
                             "[QUERY] Dropping series '{}' on shard {} from result: {}. The response will be "
                             "INCOMPLETE.",
-                            ctx.seriesKey, shardId, e.what());
+                            ctx.seriesKey, shardId, failReason);
                         ++droppedSeries;
                         if (firstDropReason.empty()) {
-                            firstDropReason = e.what();
+                            firstDropReason = failReason;
                         }
                         co_return;
                     }
