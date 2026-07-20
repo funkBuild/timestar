@@ -114,13 +114,44 @@ Dimensions chosen because they are where the bugs actually lived:
    group-by (present/absent/unknown key) × range (inside, spanning, disjoint,
    boundary-exact, single-point).
 
-## Shrinking
+## Shrinking (phase 2 — implemented)
 
-Non-negotiable. A failure over 400 random points is not actionable. On failure,
-minimise greedily — drop series, halve point counts, narrow the range, simplify
-values (NaN → 1.0) — re-running the check each time, then emit the minimal
-reproducer as a runnable JSON workload plus the seed. Target: a failure report
-someone can paste into a test file.
+Non-negotiable. A failure over 3000 random points is not actionable.
+
+Everything the generator decides lives in a `Workload` struct, and
+`materialize()` is a pure function of it — that is what makes minimisation
+possible at all. On failure the shrinker simplifies one field at a time (binary
+search on `count`, then irregular→regular spacing, step→1s, string
+cardinality→1, values→simplest) and re-runs, keeping any change that still
+fails. It then emits a paste-ready reproducer plus the seed.
+
+Two things this got wrong first, both worth keeping:
+
+**Shrink must preserve the SAME failure.** The first version accepted *any*
+failure, walked from a real multi-block bug into an unrelated one, and reported a
+"minimal" case that never demonstrated the original problem. Candidates are now
+compared by failure *signature* (the message with digit runs collapsed, since
+counts legitimately change as the case shrinks).
+
+**Runs must not reuse a measurement name within a process.** Cleaning the shard
+directories is NOT sufficient isolation: recreating an engine over wiped
+directories leaves process-level state that makes a previously-seen measurement
+resolve to nothing. Measured directly — one name reused across 12 engine
+instances failed 11 times; unique names failed 0 times. Phase 1 accidentally
+avoided this because each iteration used a different measurement; the shrinker
+re-runs the same index, so every probe after the first came back empty and the
+shrinker read that as "still failing". Each run now appends a process-unique id.
+
+A worked result, with the string-decoder fix reverted:
+
+```
+original: type=string count=3001 stepSec=3 irregular=no strCard=35 valueSeed=20260755
+shrunk:   type=string count=3001 stepSec=1 irregular=no strCard=1  valueSeed=0
+```
+
+`count` is irreducible at 3001 — binary search proves 3000 and below pass — and
+3001 is `MaxPointsPerBlock() + 1`, the first two-block series. **The minimum is
+the diagnosis.**
 
 ## Execution
 

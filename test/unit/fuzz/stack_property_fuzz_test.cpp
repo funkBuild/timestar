@@ -58,8 +58,10 @@
 
 #include <gtest/gtest.h>
 
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
+#include <optional>
 #include <random>
 #include <seastar/core/sleep.hh>
 #include <seastar/core/thread.hh>
@@ -169,49 +171,69 @@ std::string canonicalNumber(double d) {
     return std::string(buf);
 }
 
-GeneratedSeries generateSeries(std::mt19937_64& rng, size_t index) {
-    GeneratedSeries g;
-    g.measurement = "fuzz_m" + std::to_string(index);
-    g.tagValue = "h" + std::to_string(rng() % 4);
+// ---------------------------------------------------------------------------
+// Workload: the complete, SHRINKABLE description of one generated case.
+//
+// Everything the generator decides lives here as a named field, and
+// materialize() is a pure function of it. That is what makes minimisation
+// possible: the shrinker simplifies one field at a time and re-runs, rather than
+// trying to reverse-engineer a random stream.
+// ---------------------------------------------------------------------------
+struct Workload {
+    FieldType type = FieldType::Float;
+    size_t count = 1;
+    uint64_t baseStepSec = 1;
+    bool irregular = false;
+    size_t stringCardinality = 8;
+    uint64_t valueSeed = 0;
+    size_t index = 0;  // names the measurement, keeps iterations distinct
 
-    const FieldType types[] = {FieldType::Float, FieldType::Integer, FieldType::Bool, FieldType::String};
-
-    // COVERAGE BY CONSTRUCTION for the known-risky axes. Pure random sampling
-    // left the (string x multi-block) cell -- the one that actually held a bug --
-    // unvisited in a default-length run. The first passes enumerate every
-    // (type x count) pair deterministically; later iterations sample randomly.
-    const auto counts = interestingCounts();
-    const size_t combos = 4 * counts.size();
-    size_t count;
-    if (index < combos) {
-        g.type = types[index % 4];
-        count = counts[(index / 4) % counts.size()];
-    } else {
-        g.type = types[rng() % 4];
-        count = (rng() % 2 == 0) ? counts[rng() % counts.size()] : (1 + (rng() % (3 * MaxPointsPerBlock())));
+    std::string describe() const {
+        return std::string("type=") + typeName(type) + " count=" + std::to_string(count) +
+               " stepSec=" + std::to_string(baseStepSec) + " irregular=" + (irregular ? "yes" : "no") +
+               " strCard=" + std::to_string(stringCardinality) + " valueSeed=" + std::to_string(valueSeed);
     }
 
-    // Spacing: sometimes regular, sometimes irregular, so blocks and buckets do
-    // not always align the same way.
-    const bool irregular = (rng() % 3) == 0;
-    const uint64_t baseStep = 1 + (rng() % 5);  // seconds
+    // A failure report someone can act on without re-deriving anything.
+    std::string reproducer() const {
+        std::string s = "\n--- MINIMAL REPRODUCER ---\n";
+        s += "  Workload w;\n";
+        s += std::string("  w.type = FieldType::") +
+             (type == FieldType::Float
+                  ? "Float"
+                  : (type == FieldType::Integer ? "Integer" : (type == FieldType::Bool ? "Bool" : "String"))) +
+             ";\n";
+        s += "  w.count = " + std::to_string(count) + ";\n";
+        s += "  w.baseStepSec = " + std::to_string(baseStepSec) + ";\n";
+        s += "  w.irregular = " + std::string(irregular ? "true" : "false") + ";\n";
+        s += "  w.stringCardinality = " + std::to_string(stringCardinality) + ";\n";
+        s += "  w.valueSeed = " + std::to_string(valueSeed) + ";\n";
+        s += "  w.index = " + std::to_string(index) + ";\n";
+        s += "  EXPECT_FALSE(runWorkload(w).has_value());\n";
+        s += "--------------------------\n";
+        return s;
+    }
+};
 
-    // Low cardinality (<= 50 uniques) takes the STR2 dictionary path; high
-    // cardinality takes the raw STRG path.  Both are real branches in
-    // decodeBlockFlat and the bug lived in code shared by them.
-    const size_t stringCardinality = (rng() % 2 == 0) ? (1 + rng() % 40) : 5000;
+// Pure: the same Workload always produces the same points.
+GeneratedSeries materialize(const Workload& w) {
+    std::mt19937_64 rng(w.valueSeed);
+    GeneratedSeries g;
+    g.measurement = "fuzz_m" + std::to_string(w.index);
+    g.tagValue = "h0";
+    g.type = w.type;
 
     uint64_t ts = kBase;
-    g.timestamps.reserve(count);
-    g.jsonValues.reserve(count);
-    g.canonical.reserve(count);
+    g.timestamps.reserve(w.count);
+    g.jsonValues.reserve(w.count);
+    g.canonical.reserve(w.count);
 
-    for (size_t i = 0; i < count; ++i) {
+    for (size_t i = 0; i < w.count; ++i) {
         g.timestamps.push_back(ts);
-        const uint64_t step = irregular ? (1 + (rng() % (baseStep * 3))) : baseStep;
+        const uint64_t step = w.irregular ? (1 + (rng() % (w.baseStepSec * 3))) : w.baseStepSec;
         ts += step * kSec;
 
-        switch (g.type) {
+        switch (w.type) {
             case FieldType::Float: {
                 const double d = static_cast<double>(static_cast<int64_t>(rng() % 20000) - 10000) / 2.0;
                 g.jsonValues.push_back(canonicalNumber(d));
@@ -231,7 +253,7 @@ GeneratedSeries generateSeries(std::mt19937_64& rng, size_t index) {
                 break;
             }
             case FieldType::String: {
-                const std::string s = "s_" + std::to_string(rng() % stringCardinality);
+                const std::string s = "s_" + std::to_string(rng() % w.stringCardinality);
                 g.jsonValues.push_back("\"" + s + "\"");
                 g.canonical.push_back(s);
                 break;
@@ -239,6 +261,35 @@ GeneratedSeries generateSeries(std::mt19937_64& rng, size_t index) {
         }
     }
     return g;
+}
+
+// COVERAGE BY CONSTRUCTION for the known-risky axes. Pure random sampling left
+// the (string x multi-block) cell -- the one that actually held a bug --
+// unvisited in a default-length run. The first pass enumerates every
+// (type x count) pair deterministically; later iterations sample randomly.
+Workload generateWorkload(size_t index, uint64_t seed) {
+    std::mt19937_64 rng(seed + index);
+    const FieldType types[] = {FieldType::Float, FieldType::Integer, FieldType::Bool, FieldType::String};
+    const auto counts = interestingCounts();
+    const size_t combos = 4 * counts.size();
+
+    Workload w;
+    w.index = index;
+    w.valueSeed = seed + index;
+    if (index < combos) {
+        w.type = types[index % 4];
+        w.count = counts[(index / 4) % counts.size()];
+    } else {
+        w.type = types[rng() % 4];
+        w.count = (rng() % 2 == 0) ? counts[rng() % counts.size()] : (1 + (rng() % (3 * MaxPointsPerBlock())));
+    }
+    w.irregular = (rng() % 3) == 0;
+    w.baseStepSec = 1 + (rng() % 5);
+    // Low cardinality (<= 50 uniques) takes the STR2 dictionary path; high
+    // cardinality takes the raw STRG path. Both are real branches in
+    // decodeBlockFlat.
+    w.stringCardinality = (rng() % 2 == 0) ? (1 + rng() % 40) : 5000;
+    return w;
 }
 
 // ---------------------------------------------------------------------------
@@ -252,9 +303,11 @@ std::unique_ptr<seastar::http::request> jsonRequest(const std::string& body) {
     return req;
 }
 
-// Writes the series in batches. Returns false (with reason) rather than
-// asserting, so the caller can attach the seed to the failure.
-bool writeSeries(HttpWriteHandler& handler, const GeneratedSeries& g, std::string& failure) {
+// Returns a failure description, or nullopt on success. NOTHING in the property
+// path uses ASSERT_*/EXPECT_*: a failing candidate must be an ordinary value so
+// the shrinker can re-run it, and only the final minimised case is reported to
+// gtest.
+std::optional<std::string> writeSeries(HttpWriteHandler& handler, const GeneratedSeries& g) {
     constexpr size_t kBatch = 400;
     for (size_t start = 0; start < g.timestamps.size(); start += kBatch) {
         const size_t end = std::min(g.timestamps.size(), start + kBatch);
@@ -278,11 +331,10 @@ bool writeSeries(HttpWriteHandler& handler, const GeneratedSeries& g, std::strin
                                  R"(":")" + typeName(g.type) + R"("},"timestamps":)" + ts + "}";
         auto rep = handler.handleWrite(jsonRequest(body)).get();
         if (rep->_status != seastar::http::reply::status_type::ok) {
-            failure = "write failed: " + std::string(rep->_content.substr(0, 200));
-            return false;
+            return "write failed: " + std::string(rep->_content.substr(0, 200));
         }
     }
-    return true;
+    return std::nullopt;
 }
 
 struct QueryResult {
@@ -290,11 +342,11 @@ struct QueryResult {
     std::string error;
     std::vector<uint64_t> timestamps;
     std::vector<std::string> values;  // canonical strings
-    size_t rawTimestampCount = 0;     // as reported by the response, before pairing
+    size_t rawTimestampCount = 0;     // as reported, before pairing
     size_t rawValueCount = 0;
 };
 
-// Canonicalise a JSON value so float/int/bool/string all compare as strings.
+// Canonicalise so float/int/bool/string all compare as strings.
 std::string canonicalOf(glz::generic& v) {
     if (v.holds<std::string>()) {
         return v.get<std::string>();
@@ -363,19 +415,13 @@ size_t tsmFileCount(seastar::sharded<Engine>& eng) {
         .get();
 }
 
-// Waits for the rollover to actually LAND a new TSM file, not merely for one to
-// exist. Iterations share the shard directories, so "files >= 1" was satisfied
-// instantly by a previous iteration's file and the data never moved -- which made
-// the placement-invariance property vacuous: it compared memstore against
-// memstore and passed no matter what the TSM path did.
+// Waits for the rollover to actually LAND data in TSM, not merely for a file to
+// have existed at some point. Iterations are isolated (shard dirs cleaned per
+// run), so "a file exists" means this run's data.
 //
-// Returns false if the data never reached TSM, so the caller can fail loudly
-// rather than silently assert nothing.
-//
-// Note it waits for a file to EXIST rather than for the count to increase: a
-// large series auto-rolls while it is still being written, so by flush time
-// there may be nothing left to convert. Iterations are isolated (shard dirs are
-// cleaned per iteration), so "a file exists" means this iteration's data.
+// It waits for existence rather than for the count to INCREASE because a large
+// series auto-rolls while it is still being written, so by flush time there may
+// be nothing left to convert.
 bool flushToTsm(seastar::sharded<Engine>& eng) {
     eng.invoke_on_all([](Engine& engine) { return engine.rolloverMemoryStore(); }).get();
     for (int attempt = 0; attempt < 200; ++attempt) {
@@ -388,25 +434,338 @@ bool flushToTsm(seastar::sharded<Engine>& eng) {
 }
 
 // ---------------------------------------------------------------------------
-// Properties
+// Properties -- each returns a failure description or nullopt
 // ---------------------------------------------------------------------------
 
 // P2: |timestamps| == |values|. A mismatch means a desynced pair reached the
 // API -- downstream code indexes values by a timestamp index, so this is an
 // out-of-bounds read, not merely a wrong number.
-void checkLengthCoherence(const QueryResult& r, const std::string& ctx) {
-    ASSERT_EQ(r.rawTimestampCount, r.rawValueCount)
-        << ctx << ": response carried " << r.rawTimestampCount << " timestamps but " << r.rawValueCount
-        << " values -- a desynced timestamp/value pair";
+std::optional<std::string> checkLengthCoherence(const QueryResult& r, const std::string& ctx) {
+    if (r.rawTimestampCount != r.rawValueCount) {
+        return ctx + ": response carried " + std::to_string(r.rawTimestampCount) + " timestamps but " +
+               std::to_string(r.rawValueCount) + " values -- a desynced timestamp/value pair";
+    }
+    return std::nullopt;
 }
 
 // P8: every returned timestamp was actually written.
-void checkNoPhantomTimestamps(const QueryResult& r, const std::set<uint64_t>& written, const std::string& ctx) {
+std::optional<std::string> checkNoPhantomTimestamps(const QueryResult& r, const std::set<uint64_t>& written,
+                                                    const std::string& ctx) {
     for (uint64_t ts : r.timestamps) {
-        ASSERT_TRUE(written.count(ts) == 1)
-            << ctx << ": returned timestamp " << ts
-            << " was never written -- a phantom point (decoded past the end of the encoded run)";
+        if (written.count(ts) == 0) {
+            return ctx + ": returned timestamp " + std::to_string(ts) +
+                   " was never written -- a phantom point (decoded past the end of the encoded run)";
+        }
     }
+    return std::nullopt;
+}
+
+std::optional<std::string> expectEqual(const std::vector<uint64_t>& got, const std::vector<uint64_t>& want,
+                                       const std::string& what) {
+    if (got == want) {
+        return std::nullopt;
+    }
+    return what + " (got " + std::to_string(got.size()) + " values, expected " + std::to_string(want.size()) + ")";
+}
+
+std::optional<std::string> expectEqual(const std::vector<std::string>& got, const std::vector<std::string>& want,
+                                       const std::string& what) {
+    if (got == want) {
+        return std::nullopt;
+    }
+    std::string detail =
+        what + " (got " + std::to_string(got.size()) + " values, expected " + std::to_string(want.size()) + ")";
+    for (size_t i = 0; i < std::min(got.size(), want.size()); ++i) {
+        if (got[i] != want[i]) {
+            detail += "; first difference at index " + std::to_string(i) + ": got '" + got[i] + "' expected '" +
+                      want[i] + "'";
+            break;
+        }
+    }
+    return detail;
+}
+
+// Runs every property against one workload. Returns the FIRST failure, or
+// nullopt. Self-contained: builds and tears down its own engine, so the shrinker
+// can call it freely.
+// Every run needs a measurement name no earlier run in this PROCESS has used.
+//
+// Cleaning the shard directories is not sufficient isolation: recreating an
+// engine over wiped directories leaves process-level state that makes a
+// previously-seen measurement resolve to nothing, so the second and later runs
+// of the same name return an empty result no matter what was written. Measured
+// directly: reusing one name across 12 engine instances failed 11 times; making
+// the name unique failed 0 times.
+//
+// This bit the shrinker before it was fixed: shrink probes re-ran the SAME
+// workload index, every probe after the first came back empty, and the shrinker
+// read that as "still fails" and happily minimised into a phantom bug.
+size_t nextRunId() {
+    static size_t counter = 0;
+    return counter++;
+}
+
+std::optional<std::string> runWorkload(const Workload& w) {
+    // Isolate runs: they otherwise share shard directories, so a previous run's
+    // TSM files make this one's flush check meaningless.
+    cleanTestShardDirectories();
+
+    ScopedShardedEngine eng;
+    eng.start();
+    HttpWriteHandler writeHandler(&eng.eng);
+    HttpQueryHandler queryHandler(&eng.eng);
+
+    GeneratedSeries g = materialize(w);
+    g.measurement += "_r" + std::to_string(nextRunId());
+    if (auto err = writeSeries(writeHandler, g)) {
+        return err;
+    }
+
+    const uint64_t first = g.timestamps.front();
+    // +1ns: the API requires startTime < endTime, and a single-point series
+    // would otherwise be an empty range. endTime is inclusive, so this cannot
+    // pull in points that were not written.
+    const uint64_t last = g.timestamps.back() + 1;
+    const std::set<uint64_t> written(g.timestamps.begin(), g.timestamps.end());
+
+    // ---- before flush (memory-resident) ----
+    auto rawBefore = runQuery(queryHandler, g.measurement, g.field, first, last, "");
+    if (!rawBefore.ok) {
+        return "raw/before: " + rawBefore.error;
+    }
+    if (auto e = checkLengthCoherence(rawBefore, "raw/before")) {
+        return e;
+    }
+    if (auto e = checkNoPhantomTimestamps(rawBefore, written, "raw/before")) {
+        return e;
+    }
+    if (auto e =
+            expectEqual(rawBefore.timestamps, g.timestamps, "raw/before: timestamps differ from what was written")) {
+        return e;
+    }
+    if (auto e = expectEqual(rawBefore.values, g.canonical, "raw/before: values differ from what was written")) {
+        return e;
+    }
+
+    auto bucketedBefore = runQuery(queryHandler, g.measurement, g.field, first, last, "1h");
+    if (!bucketedBefore.ok) {
+        return "bucketed/before: " + bucketedBefore.error;
+    }
+    if (auto e = checkLengthCoherence(bucketedBefore, "bucketed/before")) {
+        return e;
+    }
+
+    // ---- P3: range decomposition ----
+    // Splitting forces the FILTERED decode path for the sub-ranges while the
+    // whole-range read may not take it; only a split disagrees.
+    auto checkSplit = [&](const QueryResult& whole, const std::string& phase) -> std::optional<std::string> {
+        if (g.timestamps.size() < 4) {
+            return std::nullopt;
+        }
+        const uint64_t mid = g.timestamps[g.timestamps.size() / 2];
+        auto lower = runQuery(queryHandler, g.measurement, g.field, first, mid - 1, "");
+        auto upper = runQuery(queryHandler, g.measurement, g.field, mid, last, "");
+        if (!lower.ok) {
+            return phase + " split/lower: " + lower.error;
+        }
+        if (!upper.ok) {
+            return phase + " split/upper: " + upper.error;
+        }
+        if (auto e = checkLengthCoherence(lower, phase + " split/lower")) {
+            return e;
+        }
+        if (auto e = checkLengthCoherence(upper, phase + " split/upper")) {
+            return e;
+        }
+        if (auto e = checkNoPhantomTimestamps(lower, written, phase + " split/lower")) {
+            return e;
+        }
+        if (auto e = checkNoPhantomTimestamps(upper, written, phase + " split/upper")) {
+            return e;
+        }
+
+        std::vector<uint64_t> joinedTs = lower.timestamps;
+        joinedTs.insert(joinedTs.end(), upper.timestamps.begin(), upper.timestamps.end());
+        std::vector<std::string> joinedVals = lower.values;
+        joinedVals.insert(joinedVals.end(), upper.values.begin(), upper.values.end());
+
+        if (auto e = expectEqual(joinedTs, whole.timestamps, phase + ": [a,b] ++ (b,c] TIMESTAMPS differ from [a,c]")) {
+            return e;
+        }
+        if (auto e = expectEqual(joinedVals, whole.values, phase + ": [a,b] ++ (b,c] VALUES differ from [a,c]")) {
+            return e;
+        }
+        return std::nullopt;
+    };
+
+    if (auto e = checkSplit(rawBefore, "before flush")) {
+        return e;
+    }
+
+    // ---- flush: same data, different physical layout ----
+    // The placement property is only meaningful if the data actually moved.
+    if (!flushToTsm(eng.eng)) {
+        return "data never reached TSM after rollover -- the placement-invariance check would have "
+               "compared memstore against memstore and passed vacuously";
+    }
+
+    // ---- P1: placement invariance ----
+    auto rawAfter = runQuery(queryHandler, g.measurement, g.field, first, last, "");
+    if (!rawAfter.ok) {
+        return "raw/after: " + rawAfter.error;
+    }
+    if (auto e = checkLengthCoherence(rawAfter, "raw/after")) {
+        return e;
+    }
+    if (auto e = checkNoPhantomTimestamps(rawAfter, written, "raw/after")) {
+        return e;
+    }
+    if (auto e = expectEqual(rawAfter.timestamps, rawBefore.timestamps,
+                             "raw TIMESTAMPS changed across a TSM flush -- the answer depends on placement")) {
+        return e;
+    }
+    if (auto e = expectEqual(rawAfter.values, rawBefore.values,
+                             "raw VALUES changed across a TSM flush -- the answer depends on placement")) {
+        return e;
+    }
+
+    auto bucketedAfter = runQuery(queryHandler, g.measurement, g.field, first, last, "1h");
+    if (!bucketedAfter.ok) {
+        return "bucketed/after: " + bucketedAfter.error;
+    }
+    if (auto e = checkLengthCoherence(bucketedAfter, "bucketed/after")) {
+        return e;
+    }
+    if (auto e = expectEqual(bucketedAfter.timestamps, bucketedBefore.timestamps,
+                             "bucket TIMESTAMPS changed across a TSM flush")) {
+        return e;
+    }
+    if (auto e =
+            expectEqual(bucketedAfter.values, bucketedBefore.values, "bucketed VALUES changed across a TSM flush")) {
+        return e;
+    }
+
+    // ---- P3 again, now multi-block on disk ----
+    if (auto e = checkSplit(rawAfter, "after flush")) {
+        return e;
+    }
+
+    return std::nullopt;
+}
+
+// ---------------------------------------------------------------------------
+// Shrinking
+//
+// A failure over 3000 random points is not actionable. Minimise one field at a
+// time, keeping any change that still fails, and report only the reduced case.
+//
+// Every probe rebuilds an engine, so the budget is bounded; the count search is
+// a binary search rather than linear because count is the field that dominates
+// both the reproducer's size and the run time.
+// ---------------------------------------------------------------------------
+struct ShrinkStats {
+    size_t probes = 0;
+    size_t budget = 40;
+    bool exhausted() const { return probes >= budget; }
+};
+
+// Digits vary between runs ("got 3000 values, expected 3001"), so compare the
+// SHAPE of a failure rather than its text.
+std::string failureSignature(const std::string& msg) {
+    std::string out;
+    bool inNumber = false;
+    for (char c : msg) {
+        if (std::isdigit(static_cast<unsigned char>(c))) {
+            if (!inNumber) {
+                out += '#';
+                inNumber = true;
+            }
+        } else {
+            out += c;
+            inNumber = false;
+        }
+    }
+    return out;
+}
+
+// A candidate counts as "still failing" only when it fails THE SAME WAY.
+// Accepting any failure lets the shrinker walk into an unrelated bug and report
+// a minimal case that never demonstrated the original problem -- which is
+// exactly what happened before this check existed.
+bool stillFails(const Workload& w, const std::string& wantedSignature, ShrinkStats& stats) {
+    if (stats.exhausted()) {
+        return false;
+    }
+    ++stats.probes;
+    auto result = runWorkload(w);
+    return result.has_value() && failureSignature(*result) == wantedSignature;
+}
+
+Workload shrinkWorkload(const Workload& failing, const std::string& wantedSignature, ShrinkStats& stats) {
+    Workload best = failing;
+
+    // 1. count -- binary search for the smallest count that still fails. This
+    //    also LOCATES the boundary: a minimum that lands just past
+    //    MaxPointsPerBlock() is itself the diagnosis (multi-block).
+    if (best.count > 1) {
+        size_t lo = 1, hi = best.count;
+        while (lo < hi && !stats.exhausted()) {
+            const size_t mid = lo + (hi - lo) / 2;
+            Workload cand = best;
+            cand.count = mid;
+            if (stillFails(cand, wantedSignature, stats)) {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        if (hi < best.count) {
+            Workload cand = best;
+            cand.count = hi;
+            if (stillFails(cand, wantedSignature, stats)) {
+                best = cand;
+            }
+        }
+    }
+
+    // 2. irregular spacing -> regular
+    if (best.irregular) {
+        Workload cand = best;
+        cand.irregular = false;
+        if (stillFails(cand, wantedSignature, stats)) {
+            best = cand;
+        }
+    }
+
+    // 3. step -> 1s
+    if (best.baseStepSec > 1) {
+        Workload cand = best;
+        cand.baseStepSec = 1;
+        if (stillFails(cand, wantedSignature, stats)) {
+            best = cand;
+        }
+    }
+
+    // 4. string cardinality -> 1 (a single repeated value is the simplest case,
+    //    and also forces the STR2 dictionary path)
+    if (best.type == FieldType::String && best.stringCardinality > 1) {
+        Workload cand = best;
+        cand.stringCardinality = 1;
+        if (stillFails(cand, wantedSignature, stats)) {
+            best = cand;
+        }
+    }
+
+    // 5. simplest values
+    if (best.valueSeed != 0) {
+        Workload cand = best;
+        cand.valueSeed = 0;
+        if (stillFails(cand, wantedSignature, stats)) {
+            best = cand;
+        }
+    }
+
+    return best;
 }
 
 }  // namespace
@@ -417,8 +776,9 @@ protected:
     void TearDown() override { cleanTestShardDirectories(); }
 };
 
-// One iteration: generate a series, write it, and assert P1/P2/P3/P8 across a
-// TSM flush.
+// One iteration: generate a workload, run every property, and on failure shrink
+// it before reporting, so the message names a minimal case rather than the
+// random one that happened to trip.
 TEST_F(StackPropertyFuzzTest, WellFormedDataSurvivesPlacementAndRangeSplitting) {
     const size_t seed = envSize("TIMESTAR_FUZZ_SEED", 20260720);
     // Default covers the full (type x count) cross-product exactly once.
@@ -426,136 +786,28 @@ TEST_F(StackPropertyFuzzTest, WellFormedDataSurvivesPlacementAndRangeSplitting) 
 
     seastar::thread([seed, iterations] {
         for (size_t iter = 0; iter < iterations; ++iter) {
-            const size_t iterSeed = seed + iter;
-            std::mt19937_64 rng(iterSeed);
-
-            // Isolate iterations: they otherwise share shard directories, so a
-            // previous iteration's TSM files make this one's flush check
-            // meaningless (and its data visible to this iteration's queries).
-            cleanTestShardDirectories();
-
-            ScopedShardedEngine eng;
-            eng.start();
-            HttpWriteHandler writeHandler(&eng.eng);
-            HttpQueryHandler queryHandler(&eng.eng);
-
-            auto g = generateSeries(rng, iter);
-            const std::string repro = "SEED=" + std::to_string(iterSeed) + " (" + g.describe() + ")";
-
-            std::string failure;
-            ASSERT_TRUE(writeSeries(writeHandler, g, failure)) << repro << " " << failure;
-
-            const uint64_t first = g.timestamps.front();
-            // +1ns: the API requires startTime < endTime, and a single-point
-            // series would otherwise produce an empty range. endTime is
-            // inclusive, so this cannot pull in points that were not written.
-            const uint64_t last = g.timestamps.back() + 1;
-            const std::set<uint64_t> written(g.timestamps.begin(), g.timestamps.end());
-
-            // ---- before flush (memory-resident) ----
-            auto rawBefore = runQuery(queryHandler, g.measurement, g.field, first, last, "");
-            ASSERT_TRUE(rawBefore.ok) << repro << " raw/before: " << rawBefore.error;
-            checkLengthCoherence(rawBefore, repro + " raw/before");
-            checkNoPhantomTimestamps(rawBefore, written, repro + " raw/before");
-
-            auto bucketedBefore = runQuery(queryHandler, g.measurement, g.field, first, last, "1h");
-            ASSERT_TRUE(bucketedBefore.ok) << repro << " bucketed/before: " << bucketedBefore.error;
-            checkLengthCoherence(bucketedBefore, repro + " bucketed/before");
-
-            // A raw read must return every written point in range.
-            EXPECT_EQ(rawBefore.timestamps.size(), g.timestamps.size())
-                << repro << ": raw read returned " << rawBefore.timestamps.size() << " of " << g.timestamps.size()
-                << " written points";
-            EXPECT_EQ(rawBefore.values, g.canonical) << repro << ": raw read values differ from what was written";
-
-            // ---- P3: range decomposition (before flush) ----
-            // Splitting forces the FILTERED decode path for the sub-ranges while
-            // the whole-range read may not take it; only a split disagrees.
-            if (g.timestamps.size() >= 4) {
-                const size_t midIdx = g.timestamps.size() / 2;
-                const uint64_t mid = g.timestamps[midIdx];
-                auto lower = runQuery(queryHandler, g.measurement, g.field, first, mid - 1, "");
-                auto upper = runQuery(queryHandler, g.measurement, g.field, mid, last, "");
-                ASSERT_TRUE(lower.ok) << repro << " split/lower: " << lower.error;
-                ASSERT_TRUE(upper.ok) << repro << " split/upper: " << upper.error;
-                checkLengthCoherence(lower, repro + " split/lower");
-                checkLengthCoherence(upper, repro + " split/upper");
-                checkNoPhantomTimestamps(lower, written, repro + " split/lower");
-                checkNoPhantomTimestamps(upper, written, repro + " split/upper");
-
-                std::vector<uint64_t> joinedTs = lower.timestamps;
-                joinedTs.insert(joinedTs.end(), upper.timestamps.begin(), upper.timestamps.end());
-                std::vector<std::string> joinedVals = lower.values;
-                joinedVals.insert(joinedVals.end(), upper.values.begin(), upper.values.end());
-
-                EXPECT_EQ(joinedTs, rawBefore.timestamps)
-                    << repro << ": [a,b] ++ (b,c] timestamps differ from [a,c] (split at " << mid << ")";
-                EXPECT_EQ(joinedVals, rawBefore.values)
-                    << repro << ": [a,b] ++ (b,c] values differ from [a,c] (split at " << mid << ")";
+            const Workload w = generateWorkload(iter, seed);
+            auto failure = runWorkload(w);
+            if (!failure) {
+                continue;
             }
 
-            // ---- flush: same data, different physical layout ----
-            // The placement property is only meaningful if the data actually
-            // moved; assert that rather than assume it.
-            ASSERT_TRUE(flushToTsm(eng.eng))
-                << repro
-                << ": data never reached TSM after rollover -- the placement-invariance "
-                   "check below would have compared memstore against memstore and passed vacuously";
+            ShrinkStats stats;
+            const Workload minimal = shrinkWorkload(w, failureSignature(*failure), stats);
+            auto minimalFailure = runWorkload(minimal);
 
-            // ---- P1: placement invariance ----
-            auto rawAfter = runQuery(queryHandler, g.measurement, g.field, first, last, "");
-            ASSERT_TRUE(rawAfter.ok) << repro << " raw/after: " << rawAfter.error;
-            checkLengthCoherence(rawAfter, repro + " raw/after");
-            checkNoPhantomTimestamps(rawAfter, written, repro + " raw/after");
-
-            EXPECT_EQ(rawAfter.timestamps, rawBefore.timestamps)
-                << repro << ": raw TIMESTAMPS changed across a TSM flush -- the answer depends on placement";
-            EXPECT_EQ(rawAfter.values, rawBefore.values)
-                << repro << ": raw VALUES changed across a TSM flush -- the answer depends on placement";
-
-            auto bucketedAfter = runQuery(queryHandler, g.measurement, g.field, first, last, "1h");
-            ASSERT_TRUE(bucketedAfter.ok) << repro << " bucketed/after: " << bucketedAfter.error;
-            checkLengthCoherence(bucketedAfter, repro + " bucketed/after");
-            EXPECT_EQ(bucketedAfter.timestamps, bucketedBefore.timestamps)
-                << repro << ": bucket timestamps changed across a TSM flush";
-            EXPECT_EQ(bucketedAfter.values, bucketedBefore.values)
-                << repro << ": bucketed VALUES changed across a TSM flush";
-
-            // ---- P3 again, now multi-block on disk ----
-            if (g.timestamps.size() >= 4) {
-                const size_t midIdx = g.timestamps.size() / 2;
-                const uint64_t mid = g.timestamps[midIdx];
-                auto lower = runQuery(queryHandler, g.measurement, g.field, first, mid - 1, "");
-                auto upper = runQuery(queryHandler, g.measurement, g.field, mid, last, "");
-                ASSERT_TRUE(lower.ok) << repro << " split/lower after flush: " << lower.error;
-                ASSERT_TRUE(upper.ok) << repro << " split/upper after flush: " << upper.error;
-                checkLengthCoherence(lower, repro + " split/lower after flush");
-                checkLengthCoherence(upper, repro + " split/upper after flush");
-                checkNoPhantomTimestamps(lower, written, repro + " split/lower after flush");
-                checkNoPhantomTimestamps(upper, written, repro + " split/upper after flush");
-
-                std::vector<uint64_t> joinedTs = lower.timestamps;
-                joinedTs.insert(joinedTs.end(), upper.timestamps.begin(), upper.timestamps.end());
-                std::vector<std::string> joinedVals = lower.values;
-                joinedVals.insert(joinedVals.end(), upper.values.begin(), upper.values.end());
-
-                EXPECT_EQ(joinedTs, rawAfter.timestamps)
-                    << repro << ": after flush, [a,b] ++ (b,c] timestamps differ from [a,c]";
-                EXPECT_EQ(joinedVals, rawAfter.values)
-                    << repro << ": after flush, [a,b] ++ (b,c] values differ from [a,c]";
-            }
-
-            if (::testing::Test::HasFailure()) {
-                // Stop at the first failing iteration: the messages already name
-                // the seed, and continuing only buries it.
-                return;
-            }
+            ADD_FAILURE() << "property violated (seed=" << seed << " iteration=" << iter << ")\n"
+                          << "  original: " << w.describe() << "\n"
+                          << "    -> " << *failure << "\n"
+                          << "  shrunk:   " << minimal.describe() << " (" << stats.probes << " shrink probes)\n"
+                          << "    -> " << (minimalFailure ? *minimalFailure : std::string("(no longer fails)")) << "\n"
+                          << minimal.reproducer() << "Replay the whole run with: TIMESTAR_FUZZ_SEED=" << seed << "\n";
+            return;  // one failure is enough; continuing only buries it
         }
     })
         .join()
         .get();
 }
-
 // ---------------------------------------------------------------------------
 // Decoder-level property: a decoder must never emit more values than requested.
 //
