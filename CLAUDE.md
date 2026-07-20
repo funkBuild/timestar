@@ -776,6 +776,58 @@ pushdown, SIMD folds, and scalar folds all agree. Full policy in
   raw-bit exceptions). Aggregated results may normalize -0.0 to +0.0 (IEEE
   addition/comparison semantics) — documented behaviour, not a bug.
 
+### Incomplete Results Are Failures, Never Short Answers (canonical semantics)
+
+A response that is missing data must never report success. This applies at two
+levels, and the second changed behaviour in the decode-count-contract work.
+
+**Series level.** A series the query could not read fails the whole query with
+`QUERY_INCOMPLETE` (HTTP 500) naming the count and first reason, rather than
+being omitted from an otherwise-successful response. An empty result must mean
+"this range genuinely holds no data" and nothing else.
+
+**Block level (behaviour change).** A TSM block whose decoded value count does
+not match its timestamp count now raises `BlockDecodeError`, which routes into
+the same `QUERY_INCOMPLETE` path. Previously such a block was dropped and the
+query returned **HTTP 200 with fewer points** -- a silent partial answer.
+
+The contract enforced at `TSM::decodeBlockFlat` / `readSingleBlock` /
+`decodeBlock`:
+
+- `produced > expected` -- benign. A decoder working in fixed-size groups can
+  overshoot the tail; the excess is truncated.
+- `produced < expected` -- the block is corrupt or a decoder regressed. Raised.
+  There is no safe repair: pairing `values[i]` with `timestamps[i]` past the
+  shortfall MISPAIRS real data, presenting a wrong point as a valid one. That is
+  why the old consumer-side clamp was removed rather than kept as defence in
+  depth -- with 3001 timestamps and 1 surviving value it emitted `timestamps[0]`
+  against a value belonging to point 3000.
+- The decoder must have APPENDED. Both vectors accumulate across every block of
+  a series, so a decoder that clears the output destroys earlier blocks' values
+  while their timestamps remain. Trusting a decoder's own produced-count does
+  NOT catch this -- the clobbering block reports `produced == expected` for its
+  own points and looks healthy. Only the buffer's real growth reveals it.
+- Timestamps must not exceed the count the block declares. Both FFOR paths clamp
+  internally; this is the check at the consumer, and it is the only thing between
+  a future timestamp over-read and values being fabricated to match it.
+
+Value decoders (`ALPDecoder`, `BoolEncoderRLE`, both `StringEncoder` skip/limit
+overloads) return the number of values ACTUALLY decoded. They report; the
+block-level caller decides. They previously disagreed about how a shortfall even
+manifests -- ALP trimmed, bool threw, string and integer silently under-produced
+-- and that divergence is what let a desynced pair reach the query.
+
+**Client impact.** A caller that treats an error as "no data" now silently takes
+the wrong branch on corruption, where before it received a plausible-looking
+short answer. Both are wrong; the error is at least visible. `QUERY_INCOMPLETE`
+means *"this range may hold data that could not be read"* and must be
+distinguished from an empty success. Retrying will not help for a corrupt block
+-- the failure is deterministic until the file is repaired or compacted away.
+
+Pinned by `test/unit/storage/corrupt_block_fails_query_test.cpp` (end to end,
+via real file corruption) and `test/unit/encoding/decoder_produced_count_test.cpp`
+(the per-decoder report).
+
 ### Query Features
 
 - **Multi-shard coordination**: Queries automatically fan out to all relevant shards
