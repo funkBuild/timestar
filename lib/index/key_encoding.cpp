@@ -59,6 +59,14 @@ std::string encodeSeriesMetadataKey(const SeriesId128& seriesId) {
     return key;
 }
 
+std::string encodeSeriesValueTypeKey(const SeriesId128& seriesId) {
+    std::string key;
+    key.reserve(1 + 16);
+    key.push_back(static_cast<char>(SERIES_VALUE_TYPE));
+    seriesId.appendTo(key);
+    return key;
+}
+
 std::string encodeFieldTypeKey(const std::string& measurement, const std::string& field) {
     if (measurement.find('\0') != std::string::npos || field.find('\0') != std::string::npos) {
         throw std::invalid_argument("Key component must not contain null bytes");

@@ -110,6 +110,15 @@ public:
     seastar::future<std::vector<std::pair<SeriesId128, std::optional<SeriesMetadata>>>> getSeriesMetadataBatch(
         const std::vector<SeriesId128>& seriesIds) override;
 
+    // --- Per-series value-type binding (SERIES_VALUE_TYPE, 0x18) ---
+    //
+    // Not part of the IndexBackend interface: this is enforced by Engine on the
+    // owning shard, which holds a concrete NativeIndex. Shard-local, never
+    // broadcast — see index_backend.hpp for why the binding exists.
+    seastar::future<std::optional<TSMValueType>> getSeriesValueType(const SeriesId128& seriesId);
+    seastar::future<> putSeriesValueType(const SeriesId128& seriesId, TSMValueType type);
+    seastar::future<> removeSeriesValueType(const SeriesId128& seriesId);
+
     // --- Measurement metadata ---
     seastar::future<> setFieldType(const std::string& measurement, const std::string& field,
                                    const std::string& type) override;

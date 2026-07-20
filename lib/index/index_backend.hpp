@@ -71,6 +71,18 @@ enum IndexKeyType : uint8_t {
     // value is O(1) instead of re-encoding the whole value set (O(V²) write
     // amplification). Read path unions these with any legacy TAG_VALUES blob.
     TAG_VALUE_MARKER = 0x17,  // measurement+\0+tagKey+\0+tagValue -> (empty)
+
+    // Per-series value type binding, enforced on ingest.
+    //
+    // SeriesId128 hashes measurement+tags+field only, so the same id can be
+    // written as two different types. The memstore's type check only sees the
+    // LIVE store, so once it flushes the next write can re-type the series,
+    // leaving two TSM files that disagree and a tier that cannot compact.
+    // This binding is the durable answer to "what type is this series?".
+    //
+    // Shard-local: every reader and writer of an id routes to the same shard,
+    // so unlike FIELD_TYPE (0x09) this is never broadcast.
+    SERIES_VALUE_TYPE = 0x18,  // series_id -> 1 byte TSMValueType
 };
 
 // Metadata for a time series

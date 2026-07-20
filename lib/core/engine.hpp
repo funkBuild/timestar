@@ -51,6 +51,37 @@ private:
     // measurement count (tens to hundreds). No eviction needed.
     std::unordered_map<std::string, RetentionPolicy> _retentionPolicies;
 
+    // --- Per-series value-type bindings (shard-local) ---
+    //
+    // A series' id hashes measurement+tags+field only, so nothing about the id
+    // distinguishes a float series from a boolean one. This map is the hot-path
+    // cache in front of the durable SERIES_VALUE_TYPE (0x18) binding.
+    //
+    // A MISS HERE NEVER MEANS "NO BINDING". It means "ask the slower oracles"
+    // (memory stores, TSM files, then the index). Treating a miss as absence
+    // would let a mis-typed write through after a trim and re-open the bug this
+    // exists to close.
+    std::unordered_map<SeriesId128, TSMValueType, SeriesId128::Hash> _seriesTypeCache;
+    static constexpr size_t MAX_SERIES_TYPE_CACHE = 1'000'000;
+
+    // Resolve the type a series is bound to, cheapest oracle first. Returns
+    // nullopt only when the series is genuinely unknown everywhere, i.e. this
+    // is its first write.
+    seastar::future<std::optional<TSMValueType>> resolveSeriesType(const SeriesId128& seriesId);
+
+    // Bind a series to a type (first write) and populate the cache.
+    seastar::future<> bindSeriesType(const SeriesId128& seriesId, TSMValueType type);
+
+    // Populate the cache, clearing wholesale when it overflows. Dropping the
+    // whole map is safe precisely because a miss re-consults the durable
+    // oracles rather than being read as "unbound"; it mirrors how
+    // NativeIndex::trimSchemaCaches treats fieldTypeValues_.
+    void cacheSeriesType(const SeriesId128& seriesId, TSMValueType type) {
+        if (_seriesTypeCache.size() >= MAX_SERIES_TYPE_CACHE)
+            _seriesTypeCache.clear();
+        _seriesTypeCache[seriesId] = type;
+    }
+
     // --- Streaming subscription manager (per-shard) ---
     timestar::SubscriptionManager _subscriptionManager;
 
@@ -90,6 +121,17 @@ public:
     seastar::future<> insert(TimeStarInsert<T> insertRequest, bool skipMetadataIndexing = false);
     template <class T>
     seastar::future<WALTimingInfo> insertBatch(std::vector<TimeStarInsert<T>> insertRequests);
+
+    // Enforce each request's series type binding, converting losslessly where
+    // possible. Returns the subset whose type matches T; anything bound to a
+    // different type is converted and re-inserted through insertBatch<U>.
+    // Throws std::invalid_argument (-> HTTP 400) when a value cannot be
+    // converted without loss.
+    //
+    // Public only so tests can drive it directly; callers should use
+    // insertBatch, which invokes it.
+    template <class T>
+    seastar::future<std::vector<TimeStarInsert<T>>> enforceSeriesTypes(std::vector<TimeStarInsert<T>> requests);
     template <class T>
     seastar::future<SeriesId128> indexMetadata(TimeStarInsert<T> insertRequest);
     seastar::future<> indexMetadataBatch(const std::vector<MetadataOp>& ops);

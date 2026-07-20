@@ -186,6 +186,12 @@ inline size_t indexBlockBytes(TSMValueType type, uint8_t version) {
 }
 
 class TSM {
+public:
+    // Path of the backing file. Exposed so diagnostics can name the specific
+    // files involved in a fault (e.g. a type conflict between two inputs to a
+    // compaction) rather than leaving an operator to guess.
+    const std::string& getFilePath() const { return filePath; }
+
 private:
     std::string filePath;
     seastar::file tsmFile;

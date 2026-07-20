@@ -599,9 +599,20 @@ seastar::future<bool> MemoryStore::insertBatch(std::vector<TimeStarInsert<T>>& i
         try {
             insertMemory(std::move(insertRequest));
         } catch (const std::exception& e) {
-            timestar::memory_log.warn(
-                "insertMemory failed for series {}: {} — data is in WAL and will be recovered on restart", key,
-                e.what());
+            // Do NOT swallow this. The WAL already has the point, so it is
+            // durable and will reappear on restart — but it is absent from the
+            // memory store, so queries cannot see it until then. Reporting
+            // success here told the client the write landed when it had not,
+            // which is silent data loss from the caller's point of view.
+            //
+            // Rethrowing surfaces it through the per-shard partial-failure path
+            // in the write handler. A client retry is safe: duplicate points
+            // are last-write-wins, so replaying the same point is idempotent.
+            timestar::memory_log.error(
+                "insertMemory failed for series {}: {} — point is in the WAL but not queryable "
+                "until restart; reporting the write as failed",
+                key, e.what());
+            throw;
         }
     }
 #if TIMESTAR_LOG_INSERT_PATH

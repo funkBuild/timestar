@@ -89,9 +89,15 @@ TEST_F(BugfixSourceInspectionTest, Bug5_InsertBatchMetrics) {
     auto fnStart = src.find("Engine::insertBatch");
     ASSERT_NE(fnStart, std::string::npos);
 
-    // Check for metrics increment within the function body (up to the next Engine:: function)
-    auto fnEnd = src.find("\nEngine::", fnStart + 20);
-    std::string fnBody = src.substr(fnStart, fnEnd != std::string::npos ? fnEnd - fnStart : 500);
+    // Extract the function body up to the next definition. Definitions here are
+    // written as "<return type> Engine::name(...)", so the previous delimiter
+    // "\nEngine::" never matched and this silently fell back to a fixed 500-char
+    // window — which made the assertion depend on how much comment text happened
+    // to sit near the top of the function. Delimit on the next template header
+    // instead, with a generous fallback.
+    auto fnEnd = src.find("\ntemplate <class T>", fnStart + 20);
+    std::string fnBody = src.substr(fnStart, fnEnd != std::string::npos ? fnEnd - fnStart : 4000);
+    ASSERT_GT(fnBody.size(), 500u) << "Failed to extract a plausible insertBatch body";
 
     EXPECT_NE(fnBody.find("_metrics.inserts_total"), std::string::npos)
         << "insertBatch must increment _metrics.inserts_total";

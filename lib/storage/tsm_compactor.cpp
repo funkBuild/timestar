@@ -5,6 +5,7 @@
 #include "logger.hpp"
 #include "tsm_file_manager.hpp"
 #include "tsm_writer.hpp"
+#include "value_type_dispatch.hpp"  // valueTypeName for type-conflict diagnostics
 
 #include <chrono>
 #include <filesystem>
@@ -1071,6 +1072,12 @@ seastar::future<CompactionResult> TSMCompactor::compact(
             // bad series cannot block compaction of everything else.
             std::optional<TSMValueType> seriesType;
             bool typeDiverges = false;
+            // Remember where each side of a divergence came from. Without the
+            // type names and files, the error identifies only a 16-byte hash,
+            // which cannot be mapped back to a measurement/field by eye.
+            std::string firstFile;
+            std::string conflictFile;
+            TSMValueType conflictType = TSMValueType::Float;
             for (const auto& file : files) {
                 auto fileType = file->getSeriesType(seriesId);
                 if (!fileType.has_value()) {
@@ -1078,8 +1085,11 @@ seastar::future<CompactionResult> TSMCompactor::compact(
                 }
                 if (!seriesType.has_value()) {
                     seriesType = fileType;
+                    firstFile = file->getFilePath();
                 } else if (*fileType != *seriesType) {
                     typeDiverges = true;
+                    conflictType = *fileType;
+                    conflictFile = file->getFilePath();
                     break;
                 }
             }
@@ -1096,9 +1106,12 @@ seastar::future<CompactionResult> TSMCompactor::compact(
                 // but that is now an explicit, named condition with a backoff,
                 // rather than an opaque decoder error retried forever.
                 throw std::runtime_error(
-                    "Series " + seriesId.toHex() +
-                    " has conflicting value types across input TSM files; refusing to compact (compacting would "
-                    "have to drop one type). Source files are left untouched.");
+                    "Series " + seriesId.toHex() + " has conflicting value types across input TSM files: '" +
+                    std::string(timestar::valueTypeName(*seriesType)) + "' in " + firstFile + " vs '" +
+                    std::string(timestar::valueTypeName(conflictType)) + "' in " + conflictFile +
+                    "; refusing to compact (compacting would have to drop one type). Source files are left "
+                    "untouched. This means the same measurement+tags+field was written with two different value "
+                    "types -- the series id does not include the type, so both land on one series.");
             }
             if (!seriesType.has_value()) {
                 continue;

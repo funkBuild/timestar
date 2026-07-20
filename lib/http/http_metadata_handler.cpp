@@ -6,8 +6,10 @@
 #include "http_response.hpp"
 #include "http_routes.hpp"
 #include "native_index.hpp"
+#include "placement_table.hpp"  // routeToCore for the /series owner lookup
 #include "proto_converters.hpp"
 #include "scatter_gather.hpp"
+#include "value_type_dispatch.hpp"  // valueTypeName
 
 #include <glaze/json.hpp>
 
@@ -46,6 +48,17 @@ struct CardinalityResponse {
 struct FieldInfo {
     std::string name;
     std::string type;
+};
+
+// GET /series?id= — resolves an opaque SeriesId128 to something actionable.
+// value_type is empty when the series has no binding yet.
+struct SeriesLookupResponse {
+    std::string series_id;
+    std::string measurement;
+    std::string field;
+    std::map<std::string, std::string> tags;
+    std::string value_type;
+    unsigned shard;
 };
 
 struct FieldsResponse {
@@ -128,7 +141,12 @@ void HttpMetadataHandler::registerRoutes(seastar::httpd::routes& r, std::string_
         [this](std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply>)
             -> seastar::future<std::unique_ptr<seastar::http::reply>> { return handleCardinality(std::move(req)); });
 
-    timestar::http_log.info("Registered metadata endpoints: /measurements, /tags, /fields, /cardinality{}",
+    timestar::http::addJsonRoute(
+        r, op::GET, "/series", authToken,
+        [this](std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply>)
+            -> seastar::future<std::unique_ptr<seastar::http::reply>> { return handleSeriesLookup(std::move(req)); });
+
+    timestar::http_log.info("Registered metadata endpoints: /measurements, /tags, /fields, /cardinality, /series{}",
                             authToken.empty() ? "" : " (auth required)");
 }
 
@@ -401,6 +419,79 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::hand
                                     ? timestar::proto::formatErrorResponse("Internal server error", "INTERNAL_ERROR")
                                     : createErrorResponse("INTERNAL_ERROR", "Internal server error"));
         co_return rep;
+    }
+
+    timestar::http::setContentType(*rep, resFmt);
+    co_return rep;
+}
+
+seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::handleSeriesLookup(
+    std::unique_ptr<seastar::http::request> req) {
+    auto rep = std::make_unique<seastar::http::reply>();
+    auto resFmt = timestar::http::responseFormat(*req);
+
+    try {
+        std::string idHex = req->get_query_param("id");
+        if (idHex.empty()) {
+            static constexpr const char* kMsg = "Query parameter 'id' is required (32 hex characters)";
+            timestar::http::respond(*rep, seastar::http::reply::status_type::bad_request, resFmt,
+                                    timestar::http::isProtobuf(resFmt)
+                                        ? timestar::proto::formatErrorResponse(kMsg, "MISSING_PARAMETER")
+                                        : createErrorResponse("MISSING_PARAMETER", kMsg));
+            co_return rep;
+        }
+
+        SeriesId128 seriesId;
+        try {
+            seriesId = SeriesId128::fromHex(idHex);
+        } catch (const std::exception& e) {
+            std::string msg = std::string("Invalid series id: ") + e.what();
+            timestar::http::respond(*rep, seastar::http::reply::status_type::bad_request, resFmt,
+                                    timestar::http::isProtobuf(resFmt)
+                                        ? timestar::proto::formatErrorResponse(msg, "INVALID_PARAMETER")
+                                        : createErrorResponse("INVALID_PARAMETER", msg));
+            co_return rep;
+        }
+
+        // Series metadata and the type binding are shard-local, owned by the
+        // shard the id routes to. No fan-out needed.
+        unsigned owner = timestar::routeToCore(seriesId);
+        auto found = co_await engineSharded->invoke_on(
+            owner,
+            [seriesId](Engine& engine) -> seastar::future<std::pair<std::optional<SeriesMetadata>, std::string>> {
+                auto meta = co_await engine.getIndex().getSeriesMetadata(seriesId);
+                auto bound = co_await engine.getIndex().getSeriesValueType(seriesId);
+                co_return std::make_pair(std::move(meta),
+                                         bound.has_value() ? std::string(timestar::valueTypeName(*bound)) : "");
+            });
+
+        if (!found.first.has_value()) {
+            static constexpr const char* kMsg = "No series with that id on the owning shard";
+            timestar::http::respond(*rep, seastar::http::reply::status_type::not_found, resFmt,
+                                    timestar::http::isProtobuf(resFmt)
+                                        ? timestar::proto::formatErrorResponse(kMsg, "NOT_FOUND")
+                                        : createErrorResponse("NOT_FOUND", kMsg));
+            co_return rep;
+        }
+
+        SeriesLookupResponse response;
+        response.series_id = seriesId.toHex();
+        response.measurement = found.first->measurement;
+        response.field = found.first->field;
+        response.tags = std::map<std::string, std::string>(found.first->tags.begin(), found.first->tags.end());
+        response.value_type = found.second;
+        response.shard = owner;
+
+        std::string buffer;
+        (void)glz::write_json(response, buffer);
+        rep->set_status(seastar::http::reply::status_type::ok);
+        rep->_content = std::move(buffer);
+    } catch (const std::exception& e) {
+        timestar::http_log.error("Error in /series: {}", e.what());
+        timestar::http::respond(*rep, seastar::http::reply::status_type::internal_server_error, resFmt,
+                                timestar::http::isProtobuf(resFmt)
+                                    ? timestar::proto::formatErrorResponse(e.what(), "INTERNAL_ERROR")
+                                    : createErrorResponse("INTERNAL_ERROR", e.what()));
     }
 
     timestar::http::setContentType(*rep, resFmt);

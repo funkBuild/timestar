@@ -1067,6 +1067,34 @@ seastar::future<std::optional<SeriesMetadata>> NativeIndex::getSeriesMetadata(co
     co_return metadata;
 }
 
+// --- Per-series value-type binding (SERIES_VALUE_TYPE, 0x18) ---
+//
+// The durable answer to "what type is this series?". Ingest enforces it so a
+// series cannot be re-typed by a later write, which is what leaves two TSM
+// files disagreeing and wedges compaction. See index_backend.hpp.
+
+seastar::future<std::optional<TSMValueType>> NativeIndex::getSeriesValueType(const SeriesId128& seriesId) {
+    auto val = co_await kvGet(ke::encodeSeriesValueTypeKey(seriesId));
+    if (!val.has_value() || val->size() != 1)
+        co_return std::nullopt;
+    auto raw = static_cast<uint8_t>((*val)[0]);
+    if (raw > static_cast<uint8_t>(TSMValueType::Integer)) {
+        // A corrupt byte must not be silently trusted as Float (0).
+        ::native_index_log.warn("Series {} has an unrecognised value-type byte {}; ignoring binding", seriesId.toHex(),
+                                raw);
+        co_return std::nullopt;
+    }
+    co_return static_cast<TSMValueType>(raw);
+}
+
+seastar::future<> NativeIndex::putSeriesValueType(const SeriesId128& seriesId, TSMValueType type) {
+    co_await kvPut(ke::encodeSeriesValueTypeKey(seriesId), std::string(1, static_cast<char>(type)));
+}
+
+seastar::future<> NativeIndex::removeSeriesValueType(const SeriesId128& seriesId) {
+    co_await kvDelete(ke::encodeSeriesValueTypeKey(seriesId));
+}
+
 // Stage 3: Batch metadata resolution — inlines cache checks and avoids
 // N sequential getSeriesMetadata coroutine calls.
 seastar::future<std::vector<std::pair<SeriesId128, std::optional<SeriesMetadata>>>> NativeIndex::getSeriesMetadataBatch(
