@@ -592,9 +592,19 @@ std::pair<size_t, size_t> IntegerEncoderFFOR::decode(Slice& encoded, unsigned in
     // Reserve a bounded prefix and let the vector grow into what actually
     // decodes. Growth is amortised and the common case (bound == real count)
     // still takes a single allocation.
-    static constexpr size_t kMaxInitialReserve = 64 * 1024;
+    // Bound the reserve by what the PAYLOAD can actually contain, not by the
+    // claimed count and not by a flat constant. The densest this encoder can be
+    // is its constant-delta fast path: kBlockSize values per 16-byte header, so
+    // 64 values per byte. Anything above that is impossible, whatever the caller
+    // claims.
+    //
+    // A flat cap is not enough: a 40-byte payload with a claimed count of 4
+    // billion still reserved 81,920 slots (655 KB), and with one such reserve per
+    // point-group in a batched write that is hundreds of MB of pure waste.
+    static constexpr size_t kMaxValuesPerByte = kBlockSize / 16;  // 64
+    const size_t payloadMax = encoded.remaining() * kMaxValuesPerByte;
     const size_t current_size = values.size();
-    const size_t wanted = std::min(static_cast<size_t>(timestampSize), kMaxInitialReserve);
+    const size_t wanted = std::min(static_cast<size_t>(timestampSize), payloadMax);
     if (values.capacity() < current_size + wanted) {
         values.reserve(current_size + wanted + (wanted >> 2));
     }
