@@ -28,10 +28,13 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <filesystem>
 #include <seastar/core/future.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/thread.hh>
+#include <set>
+#include <unordered_map>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -162,6 +165,14 @@ seastar::future<> testChunkedMergePreservesAllPoints(TSMChunkedMergeTest* self) 
     }
     EXPECT_TRUE(ascending) << "chunked merge emitted out-of-order timestamps";
     EXPECT_FALSE(duplicates) << "chunked merge emitted duplicate timestamps across a chunk boundary";
+
+    // Spills are block-aligned: every block except the last must be exactly
+    // full. Unaligned spills used to leave a short (~MERGE_CHUNK_POINTS %
+    // MaxPointsPerBlock) tail block on EVERY spill — fragmentation the
+    // under-full coalescer never reclaims.
+    for (size_t b = 0; b + 1 < readback.blocks.size(); ++b) {
+        EXPECT_EQ(readback.blocks[b]->timestamps.size(), MaxPointsPerBlock()) << "short interior block at index " << b;
+    }
 
     // Last-write-wins across the whole overlap, including wherever a chunk
     // boundary happened to land inside it.
@@ -362,4 +373,117 @@ seastar::future<> testFullyOverlappingFilesLazyMerge(TSMChunkedMergeTest* self) 
 
 TEST_F(TSMChunkedMergeTest, FullyOverlappingFilesTakeLazyMergeAndKeepLastWriteWins) {
     seastar::async([&] { testFullyOverlappingFilesLazyMerge(this).get(); }).get();
+}
+
+// Downsampled series must STREAM through compaction. downsampleThreshold used
+// to disable chunked emission entirely, so every series of a measurement with
+// a downsample policy accumulated whole (the last remaining whole-series
+// decode path). The merged stream is ascending and the threshold fixed, so old
+// (< threshold) points are folded into a persistent bucket map at spill time
+// and the completed buckets are emitted before the first recent point — this
+// pins that the output is identical to the whole-series fold: bucketed old
+// segment (epoch-aligned starts, aggregated values), full-resolution recent
+// segment, ascending block order, on a series big enough to force multiple
+// spills through the fold.
+seastar::future<> testDownsampleStreamsThroughCompaction(TSMChunkedMergeTest* self) {
+    SeriesId128 seriesId = SeriesId128::fromSeriesKey("downsample.stream,host=a#value");
+
+    const uint64_t nowNs = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch())
+            .count());
+    const uint64_t kSecond = 1'000'000'000ull;
+    const uint64_t kIntervalNs = 60 * kSecond;  // 60s buckets
+    const uint64_t kAfterNs = 3600 * kSecond;   // downsample data older than 1h
+
+    // Old segment: 600K points at 1s spacing ending 2h ago — forces multiple
+    // 256K-point spills through the downsample fold. Recent: 3000 points in
+    // the last hour, kept at full resolution.
+    constexpr size_t kOldPoints = 600000;
+    constexpr size_t kRecentPoints = 3000;
+    const uint64_t oldEnd = nowNs - 7200 * kSecond;
+    const uint64_t oldStart = oldEnd - kOldPoints * kSecond;
+    const uint64_t recentStart = nowNs - 3500 * kSecond;
+
+    std::vector<uint64_t> ts;
+    std::vector<double> vals;
+    ts.reserve(kOldPoints + kRecentPoints);
+    vals.reserve(kOldPoints + kRecentPoints);
+    std::set<uint64_t> expectedBuckets;
+    for (size_t i = 0; i < kOldPoints; ++i) {
+        const uint64_t t = oldStart + i * kSecond;
+        ts.push_back(t);
+        vals.push_back(2.0);
+        expectedBuckets.insert((t / kIntervalNs) * kIntervalNs);
+    }
+    for (size_t i = 0; i < kRecentPoints; ++i) {
+        ts.push_back(recentStart + i * kSecond);
+        vals.push_back(5.0);
+    }
+
+    TSMChunkedMergeTest::writeFloatFile("shard_0/tsm/0_1.tsm", seriesId, ts, vals);
+
+    auto file = seastar::make_shared<TSM>("shard_0/tsm/0_1.tsm");
+    co_await file->open();
+
+    RetentionPolicy policy;
+    policy.measurement = "downsample.stream";
+    DownsamplePolicy ds;
+    ds.afterNanos = kAfterNs;
+    ds.intervalNanos = kIntervalNs;
+    ds.method = "avg";
+    policy.downsample = ds;
+
+    std::unordered_map<std::string, RetentionPolicy> policies{{policy.measurement, policy}};
+    std::unordered_map<SeriesId128, std::string, SeriesId128::Hash> seriesMap{{seriesId, policy.measurement}};
+
+    std::vector<seastar::shared_ptr<TSM>> files{file};
+    auto result = co_await self->compactor->compact(files, 1, 0, policies, seriesMap);
+    co_await file->close();
+    EXPECT_FALSE(result.outputPath.empty());
+    if (result.outputPath.empty()) {
+        co_return;
+    }
+
+    auto merged = seastar::make_shared<TSM>(result.outputPath);
+    co_await merged->open();
+
+    TSMResult<double> readback(0);
+    co_await merged->readSeries<double>(seriesId, 0, std::numeric_limits<uint64_t>::max(), readback);
+
+    size_t bucketed = 0;
+    size_t recent = 0;
+    uint64_t prevTs = 0;
+    bool ascending = true;
+    bool first = true;
+    for (const auto& block : readback.blocks) {
+        for (size_t i = 0; i < block->timestamps.size(); ++i) {
+            const uint64_t t = block->timestamps[i];
+            if (!first && t <= prevTs) {
+                ascending = false;
+            }
+            first = false;
+            prevTs = t;
+            if (t < oldEnd + kSecond) {
+                // Old segment: must be an expected bucket start with the
+                // aggregated (avg of constant 2.0) value.
+                EXPECT_EQ(t % kIntervalNs, 0u) << "old-segment timestamp not bucket-aligned: " << t;
+                EXPECT_EQ(expectedBuckets.count(t), 1u) << "unexpected bucket start " << t;
+                EXPECT_DOUBLE_EQ(block->values[i], 2.0) << "wrong aggregate at bucket " << t;
+                ++bucketed;
+            } else {
+                EXPECT_DOUBLE_EQ(block->values[i], 5.0) << "recent point altered at ts " << t;
+                ++recent;
+            }
+        }
+    }
+
+    EXPECT_TRUE(ascending) << "streamed downsample emitted out-of-order timestamps";
+    EXPECT_EQ(bucketed, expectedBuckets.size()) << "bucket count mismatch (lost or duplicated buckets)";
+    EXPECT_EQ(recent, kRecentPoints) << "recent segment must be kept at full resolution";
+
+    co_await merged->close();
+}
+
+TEST_F(TSMChunkedMergeTest, DownsampleStreamsThroughCompactionWithMultipleSpills) {
+    seastar::async([&] { testDownsampleStreamsThroughCompaction(this).get(); }).get();
 }

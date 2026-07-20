@@ -373,6 +373,19 @@ public:
         return ids;
     }
 
+    // Series count without materializing the id list (compaction sizing).
+    size_t getSeriesCount() const { return sparseIndex.size(); }
+
+    // Visit every series id without copying the list. At high cardinality
+    // getSeriesIds() is a 16 B x series allocation per call — the compaction
+    // set-union path used to pay it twice per file (once just for .size()).
+    template <typename Fn>
+    void forEachSeriesId(Fn&& fn) const {
+        for (const auto& [id, entry] : sparseIndex) {
+            fn(id);
+        }
+    }
+
     // Get file size for compaction planning
     uint64_t getFileSize() const { return length; }
 

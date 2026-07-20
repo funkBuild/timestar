@@ -46,18 +46,18 @@ std::vector<SeriesId128> TSMCompactor::getAllSeriesIds(const std::vector<seastar
     // At 100K series this is ~6x faster (see B6 benchmark).
     std::unordered_set<SeriesId128, SeriesId128::Hash> uniqueIds;
 
-    // Pre-size for expected cardinality to avoid rehashing
+    // Pre-size for expected cardinality to avoid rehashing. Count and visit
+    // without materializing per-file id vectors — getSeriesIds() is a
+    // 16 B x series copy per call, and this used to pay it TWICE per file
+    // (once discarded immediately for .size()).
     size_t totalEstimate = 0;
     for (const auto& file : files) {
-        totalEstimate += file->getSeriesIds().size();
+        totalEstimate += file->getSeriesCount();
     }
     uniqueIds.reserve(totalEstimate);
 
     for (const auto& file : files) {
-        auto ids = file->getSeriesIds();
-        for (const auto& id : ids) {
-            uniqueIds.insert(id);
-        }
+        file->forEachSeriesId([&](const SeriesId128& id) { uniqueIds.insert(id); });
     }
 
     return std::vector<SeriesId128>(uniqueIds.begin(), uniqueIds.end());
@@ -266,12 +266,16 @@ seastar::future<SeriesCompactionData<T>> TSMCompactor::processSeriesForCompactio
         }
         const uint64_t avgBlockBytes = totalCompressedBytes / blockMeta.size();
 
-        if (avgBlockBytes < UNDERFULL_BLOCK_BYTES && totalCompressedBytes <= MAX_COALESCE_COMPRESSED_BYTES) {
+        // Strings: bigger expansion estimate, smaller compressed cap — zstd on
+        // repetitive text can exceed the numeric ~12x by a wide margin.
+        const uint64_t coalesceCap =
+            std::is_same_v<T, std::string> ? MAX_COALESCE_COMPRESSED_BYTES_STRING : MAX_COALESCE_COMPRESSED_BYTES;
+        if (avgBlockBytes < UNDERFULL_BLOCK_BYTES && totalCompressedBytes <= coalesceCap) {
             // Reserve the estimated decoded cost from the shard-wide budget, so
             // concurrent series cannot each spend the per-series ceiling. If the
             // budget is exhausted, skip coalescing -- it is an optimisation, and
             // the zero-copy carry remains correct.
-            coalesceBudgetKiB = std::max<uint64_t>(1, totalCompressedBytes * COALESCE_EXPANSION_ESTIMATE / 1024);
+            coalesceBudgetKiB = std::max<uint64_t>(1, totalCompressedBytes * decodedExpansionEstimate<T>() / 1024);
             if (coalesceBudgetKiB <= coalesceBudget_.current() && coalesceBudget_.try_wait(coalesceBudgetKiB)) {
                 coalesceUnderfullBlocks = true;
             }
@@ -330,32 +334,150 @@ seastar::future<SeriesCompactionData<T>> TSMCompactor::processSeriesForCompactio
     uint64_t lastTimestamp = std::numeric_limits<uint64_t>::max();
     size_t ttlFiltered = 0;
 
-    // Incremental emission state. Downsampling needs the whole series at once
-    // (it partitions on a threshold and buckets across it), so chunking is only
-    // available when downsampling is off.
-    const bool chunkedEmit = static_cast<bool>(sink) && downsampleThreshold == 0;
+    // Incremental emission state. Chunking is available whenever a sink is
+    // supplied — including under a downsample policy: the merged stream is
+    // ascending and the threshold is fixed, so every old-segment
+    // (< threshold) point precedes every recent one. Old points are folded
+    // into a persistent bucket map at spill time (never handed to the sink),
+    // and the completed buckets are emitted the moment the first recent point
+    // reaches a spill — before any recent point is written, preserving
+    // ascending block order. Downsampling therefore no longer needs the whole
+    // series resident; it was the last remaining whole-series path.
+    const bool chunkedEmit = static_cast<bool>(sink);
     size_t bufferedSinceSpill = 0;
 
-    // Hand everything buffered EXCEPT the final point to the sink.
+    constexpr bool kTypeSupportsDownsample = std::is_same_v<T, double> || std::is_same_v<T, int64_t>;
+    const bool streamingDownsample =
+        chunkedEmit && kTypeSupportsDownsample && downsampleThreshold > 0 && downsampleInterval > 0;
+    std::map<uint64_t, timestar::AggregationState> dsBuckets;  // old-segment fold (streaming downsample)
+    bool dsFlushed = false;        // buckets have been emitted; stream is pure recent from here
+    size_t dsOldPointsFolded = 0;  // raw points folded, for pointsWritten accounting
+
+    // Fold result[0..count) into dsBuckets and drop them from the buffers.
+    // Only ever called with count <= the deduplicated prefix (the retained
+    // last point is excluded until the series is complete).
+    auto foldOldPrefixIntoBuckets = [&](size_t count) {
+        if constexpr (kTypeSupportsDownsample) {
+            for (size_t i = 0; i < count; ++i) {
+                uint64_t bucket = (result.timestamps[i] / downsampleInterval) * downsampleInterval;
+                dsBuckets[bucket].addValue(static_cast<double>(result.values[i]), result.timestamps[i]);
+            }
+            dsOldPointsFolded += count;
+            result.timestamps.erase(result.timestamps.begin(), result.timestamps.begin() + count);
+            result.values.erase(result.values.begin(), result.values.begin() + count);
+        } else {
+            (void)count;
+        }
+    };
+
+    // Emit the completed bucket map through the sink in bounded chunks
+    // (ascending by construction — std::map), then release it.
+    auto flushDsBuckets = [&]() -> seastar::future<> {
+        if constexpr (kTypeSupportsDownsample) {
+            if (!dsBuckets.empty()) {
+                const size_t bucketCount = dsBuckets.size();
+                std::vector<uint64_t> ts;
+                std::vector<T> vals;
+                ts.reserve(std::min(bucketCount, MERGE_CHUNK_POINTS));
+                vals.reserve(std::min(bucketCount, MERGE_CHUNK_POINTS));
+                for (auto& [bucket, state] : dsBuckets) {
+                    ts.push_back(bucket);
+                    double aggVal = state.getValue(downsampleMethod);
+                    if constexpr (std::is_same_v<T, double>) {
+                        vals.push_back(aggVal);
+                    } else {
+                        vals.push_back(static_cast<int64_t>(aggVal));
+                    }
+                    if (ts.size() >= MERGE_CHUNK_POINTS) {
+                        result.emittedViaSink = true;
+                        co_await sink(std::move(ts), std::move(vals));
+                        ts = {};
+                        vals = {};
+                    }
+                }
+                if (!ts.empty()) {
+                    result.emittedViaSink = true;
+                    co_await sink(std::move(ts), std::move(vals));
+                }
+                // processPoint counted every folded raw point as written;
+                // replace that with the bucket count actually emitted.
+                result.pointsWritten = result.pointsWritten - dsOldPointsFolded + bucketCount;
+                timestar::compactor_log.info("Downsample (streaming): {} old points -> {} buckets for series {}",
+                                             dsOldPointsFolded, bucketCount, seriesId.toHex());
+                dsBuckets.clear();
+            }
+        }
+        dsFlushed = true;
+    };
+
+    // Hand buffered points to the sink, always RETAINING at least the final
+    // point: processPoint resolves a duplicate timestamp by overwriting
+    // result.values.back(), so spilling the whole buffer would leave the next
+    // duplicate with nothing to overwrite and emit the point twice, breaking
+    // last-write-wins across a chunk boundary.
     //
-    // The last point is deliberately retained: processPoint resolves a duplicate
-    // timestamp by overwriting result.values.back(), so spilling the whole buffer
-    // would leave the next duplicate with nothing to overwrite and emit the point
-    // twice, breaking last-write-wins across a chunk boundary.
+    // Two deliberate refinements over the obvious copy-prefix-then-erase:
+    //  - The sent count is BLOCK-ALIGNED: appendSeriesChunk re-chunks each
+    //    call at MaxPointsPerBlock, so an unaligned spill left a short
+    //    (~MERGE_CHUNK_POINTS % block) tail block on EVERY spill — systematic
+    //    fragmentation the under-full coalescer never reclaims. Only the
+    //    series' final chunk may now end short.
+    //  - The buffers are MOVED into the chunk (the small unaligned tail is
+    //    re-seeded into fresh vectors), instead of copying the prefix and
+    //    erasing it — which transiently held ~2x the chunk per series.
+    const size_t blockPoints = MaxPointsPerBlock();
     auto spill = [&]() -> seastar::future<> {
         if (!chunkedEmit || result.timestamps.size() < 2) {
             co_return;
         }
-        const size_t keep = 1;
-        const size_t send = result.timestamps.size() - keep;
 
-        std::vector<uint64_t> chunkTs(result.timestamps.begin(), result.timestamps.begin() + send);
-        std::vector<T> chunkVals(std::make_move_iterator(result.values.begin()),
-                                 std::make_move_iterator(result.values.begin() + send));
+        if (streamingDownsample && !dsFlushed) {
+            // Fold the old-segment part of the deduplicated prefix (all but
+            // the retained last point) into the bucket map instead of sending
+            // it to the sink.
+            const size_t prefix = result.timestamps.size() - 1;
+            const size_t partIdx = static_cast<size_t>(
+                std::lower_bound(result.timestamps.begin(), result.timestamps.begin() + prefix, downsampleThreshold) -
+                result.timestamps.begin());
+            if (partIdx > 0) {
+                foldOldPrefixIntoBuckets(partIdx);
+            }
+            if (!result.timestamps.empty() && result.timestamps.front() >= downsampleThreshold) {
+                // A recent point reached a spill: the ascending stream proves
+                // the old segment is complete. Emit the buckets NOW, before
+                // any recent point is written, so block order stays ascending.
+                co_await flushDsBuckets();
+                // Fall through to the normal send below for the recent points.
+            } else {
+                // Everything spillable was old and is now folded; only the
+                // retained point remains.
+                bufferedSinceSpill = result.timestamps.size();
+                co_return;
+            }
+        }
 
-        result.timestamps.erase(result.timestamps.begin(), result.timestamps.begin() + send);
-        result.values.erase(result.values.begin(), result.values.begin() + send);
-        bufferedSinceSpill = 0;
+        // Largest block-aligned send that still retains >= 1 point.
+        const size_t send = ((result.timestamps.size() - 1) / blockPoints) * blockPoints;
+        if (send == 0) {
+            // Less than one full block buffered — nothing to hand off yet.
+            // Reset the trigger so every subsequent group boundary does not
+            // re-enter here (the downsample fold above can shrink a full
+            // buffer to a handful of points).
+            bufferedSinceSpill = result.timestamps.size();
+            co_return;
+        }
+
+        std::vector<uint64_t> tailTs(result.timestamps.begin() + send, result.timestamps.end());
+        std::vector<T> tailVals(std::make_move_iterator(result.values.begin() + send),
+                                std::make_move_iterator(result.values.end()));
+        result.timestamps.resize(send);
+        result.values.resize(send);
+
+        auto chunkTs = std::move(result.timestamps);
+        auto chunkVals = std::move(result.values);
+        result.timestamps = std::move(tailTs);
+        result.values = std::move(tailVals);
+        bufferedSinceSpill = result.timestamps.size();
         result.emittedViaSink = true;
 
         co_await sink(std::move(chunkTs), std::move(chunkVals));
@@ -459,18 +581,43 @@ seastar::future<SeriesCompactionData<T>> TSMCompactor::processSeriesForCompactio
             ++groupEnd;
         }
 
+        // Bulk (in-memory) merge admission: the group must be small in BLOCKS
+        // (per-series bound) AND fit a reservation in the SHARD-WIDE decode
+        // budget (concurrency bound — up to seriesBatchSize() x 4 pipelines
+        // merge at once, so per-series caps alone multiply into shard-killing
+        // totals on a small host). try_wait, never wait: a group that cannot
+        // reserve takes the lazy cursor merge, so this cannot deadlock.
+        uint64_t bulkReserveKiB = 0;
+        bool bulkReserved = false;
+        if (groupEnd - groupStart > 1 && groupEnd - groupStart <= MAX_BUFFERED_GROUP_BLOCKS) {
+            uint64_t groupCompressedBytes = 0;
+            for (size_t i = groupStart; i < groupEnd; ++i) {
+                groupCompressedBytes += blockMeta[i].indexBlock.size;
+            }
+            bulkReserveKiB = std::max<uint64_t>(1, groupCompressedBytes * decodedExpansionEstimate<T>() / 1024);
+            if (bulkReserveKiB <= mergeDecodeBudget_.current() && mergeDecodeBudget_.try_wait(bulkReserveKiB)) {
+                bulkReserved = true;
+            }
+        }
+        auto releaseBulkReserve = seastar::defer([this, &bulkReserved, &bulkReserveKiB] {
+            if (bulkReserved) {
+                mergeDecodeBudget_.signal(bulkReserveKiB);
+            }
+        });
+
         if (groupEnd - groupStart == 1) {
             // Lone block: no merge needed, decode and stream it.
             auto block = co_await decodeBlockOf(blockMeta[groupStart]);
             if (block && !block->timestamps.empty()) {
                 processBlock(block.get());
             }
-        } else if (groupEnd - groupStart > MAX_BUFFERED_GROUP_BLOCKS) {
-            // LAZY MERGE for oversized groups: N files that all span the same
-            // time range chain into ONE group that can be the entire series,
-            // and the bulk path below decodes every block of it simultaneously
-            // (~12x on-disk size) — the original compaction bad_alloc for
-            // backfill/rewrite inputs. Instead, merge over per-file BLOCK
+        } else if (!bulkReserved) {
+            // LAZY MERGE for groups that may not be decoded wholesale — either
+            // oversized (N files spanning the same time range chain into ONE
+            // group that can be the entire series; decoding it is the original
+            // compaction bad_alloc for backfill/rewrite inputs) or denied a
+            // shard-wide decode-budget reservation (too many concurrent bulk
+            // merges for this host's memory). Merge over per-file BLOCK
             // CURSORS: blockMeta is time-sorted and each file's blocks are
             // internally disjoint and ascending, so each file is a sorted
             // stream and only its CURRENT block needs to be decoded. This
@@ -510,12 +657,19 @@ seastar::future<SeriesCompactionData<T>> TSMCompactor::processSeriesForCompactio
                     }
                 }
             };
-            auto advanceCursor = [&](LazyCursor& c) -> seastar::future<> {
+            // Advance one point WITHOUT suspending; returns true when the
+            // cursor crossed a block boundary and needs an (async) refill.
+            // The merge loop advances per point, and a coroutine call per
+            // point allocates a frame each time — measured ~15x slower than
+            // the bulk mergers. A suspension is only genuinely needed once
+            // per ~MaxPointsPerBlock points per file.
+            auto advanceSync = [](LazyCursor& c) -> bool {
                 if (c.block && ++c.pointIdx >= c.block->timestamps.size()) {
                     c.block.reset();
                     c.pointIdx = 0;
-                    co_await refill(c);
+                    return true;  // block exhausted — refill required
                 }
+                return false;
             };
 
             for (auto& c : cursors) {
@@ -543,10 +697,14 @@ seastar::future<SeriesCompactionData<T>> TSMCompactor::processSeriesForCompactio
                 // Last copy at minTs within the winning file (legacy intra-file
                 // duplicates), mirroring BulkMergeContext::takeLastAtCurrentTs.
                 T value = winner->block->values[winner->pointIdx];
-                co_await advanceCursor(*winner);
+                if (advanceSync(*winner)) {
+                    co_await refill(*winner);
+                }
                 while (winner->block && winner->currentTs() == minTs) {
                     value = winner->block->values[winner->pointIdx];
-                    co_await advanceCursor(*winner);
+                    if (advanceSync(*winner)) {
+                        co_await refill(*winner);
+                    }
                 }
                 // Losing sources' duplicates at minTs are consumed (LWW).
                 for (auto& c : cursors) {
@@ -554,7 +712,9 @@ seastar::future<SeriesCompactionData<T>> TSMCompactor::processSeriesForCompactio
                         continue;
                     }
                     while (c.block && c.currentTs() == minTs) {
-                        co_await advanceCursor(c);
+                        if (advanceSync(c)) {
+                            co_await refill(c);
+                        }
                     }
                 }
 
@@ -634,6 +794,19 @@ seastar::future<SeriesCompactionData<T>> TSMCompactor::processSeriesForCompactio
         timestar::compactor_log.info("TTL: Filtered {} expired points for series {}", ttlFiltered, seriesId.toHex());
     }
 
+    // Streaming downsample completion: the series is finished, so the
+    // retained last point can be folded too (no more duplicates can arrive).
+    // Buckets are emitted BEFORE the recent tail below, keeping order.
+    if (streamingDownsample && !dsFlushed) {
+        const size_t partIdx = static_cast<size_t>(
+            std::lower_bound(result.timestamps.begin(), result.timestamps.end(), downsampleThreshold) -
+            result.timestamps.begin());
+        if (partIdx > 0) {
+            foldOldPrefixIntoBuckets(partIdx);
+        }
+        co_await flushDsBuckets();
+    }
+
     // Hand off whatever is left. Once anything has been emitted through the sink
     // the remainder must go the same way, otherwise the tail would be dropped
     // (writeSeriesCompactionData skips a series flagged emittedViaSink).
@@ -645,9 +818,10 @@ seastar::future<SeriesCompactionData<T>> TSMCompactor::processSeriesForCompactio
         co_await sink(std::move(tailTs), std::move(tailVals));
     }
 
-    // Phase 4: Downsampling — only for numeric types (double and int64_t)
+    // Phase 4: Downsampling for series processed WITHOUT a sink (direct
+    // callers/tests) — sink-driven series were folded incrementally above.
     if constexpr (std::is_same_v<T, double> || std::is_same_v<T, int64_t>) {
-        if (downsampleThreshold > 0 && downsampleInterval > 0 && !result.timestamps.empty()) {
+        if (!streamingDownsample && downsampleThreshold > 0 && downsampleInterval > 0 && !result.timestamps.empty()) {
             // Find partition point: first timestamp >= threshold
             auto partIt = std::lower_bound(result.timestamps.begin(), result.timestamps.end(), downsampleThreshold);
             size_t partIdx = static_cast<size_t>(partIt - result.timestamps.begin());
@@ -941,10 +1115,17 @@ seastar::future<CompactionResult> TSMCompactor::compact(
             }
         }
 
-        // Phase 3: Parallel series processing with batching
-        // Batch size tuned for performance vs memory tradeoff
-        // Testing shows: batch_size=10 → 651ms, batch_size=20 → 541ms, batch_size=50 → 2533ms (regression)
-        const size_t SERIES_BATCH_SIZE = 20;
+        // The id list is fully partitioned into the four type vectors; free
+        // the combined copy before processing starts. At high cardinality the
+        // duplicate list is 16 B x series held for the whole compaction.
+        allSeries.clear();
+        allSeries.shrink_to_fit();
+
+        // Phase 3: Parallel series processing with batching.
+        // Memory-adaptive: see seriesBatchSize() — benchmark-tuned 20 on big
+        // hosts, scaled down on small-memory shards where 80 concurrent
+        // series' chunk buffers alone would dominate the arena.
+        const size_t SERIES_BATCH_SIZE = seriesBatchSize();
 
         // Semaphore to serialize writes (TSMWriter not thread-safe)
         seastar::semaphore writeSemaphore{1};

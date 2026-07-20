@@ -9,12 +9,14 @@
 #include "tsm_result.hpp"
 #include "tsm_writer.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <functional>
 #include <memory>
 #include <optional>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
+#include <seastar/core/memory.hh>
 #include <seastar/core/semaphore.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <string>
@@ -114,6 +116,48 @@ private:
     // 256 blocks ≈ 768K points ≈ 12 MB of decoded doubles.
     static constexpr size_t MAX_BUFFERED_GROUP_BLOCKS = 256;
 
+    // Shard-wide budget (KiB units) for bytes DECODED by the bulk group
+    // mergers. The per-group block bound above caps one series, but up to
+    // seriesBatchSize() x 4 type pipelines merge concurrently, so per-series
+    // caps alone multiply into shard-killing totals on a small-memory host.
+    // Reservations are estimates (compressed bytes x expansion); a group that
+    // cannot reserve takes the lazy cursor merge instead of waiting, so this
+    // can never deadlock — only degrade to the bounded path.
+    static size_t mergeDecodeBudgetBytes() {
+        const size_t total = seastar::memory::stats().total_memory();
+        if (total == 0) {
+            return 128ull << 20;  // no seastar arena (unit tests) — safe default
+        }
+        return std::clamp<size_t>(total / 8, 32ull << 20, 256ull << 20);
+    }
+    seastar::semaphore mergeDecodeBudget_{mergeDecodeBudgetBytes() / 1024};
+
+    // Concurrent series per TYPE pipeline (4 pipelines run at once). 20 was
+    // benchmark-tuned for throughput (10 → 651ms, 20 → 541ms, 50 → 2533ms
+    // regression), but each in-flight series holds up to a ~4 MB chunk buffer
+    // plus decode state, so 80 concurrent series is untenable on a
+    // small-memory shard. Scale with the shard arena: full 20 at >= 4 GB
+    // (benchmark behavior unchanged), down to 4 on a ~1 GB shard.
+    static size_t seriesBatchSize() {
+        const size_t total = seastar::memory::stats().total_memory();
+        if (total == 0) {
+            return 20;  // no seastar arena (unit tests)
+        }
+        return std::clamp<size_t>(total / (200ull << 20), 4, 20);
+    }
+
+    // Estimated decoded:compressed expansion, used to size budget
+    // reservations from index-known compressed bytes. Observed numeric
+    // expansion is ~12x (16x for headroom). Strings routinely exceed that —
+    // zstd on repetitive text reaches far higher ratios — so they carry a
+    // larger factor AND a smaller per-series coalesce cap below.
+    static constexpr uint64_t COALESCE_EXPANSION_ESTIMATE = 16;
+    static constexpr uint64_t STRING_EXPANSION_ESTIMATE = 64;
+    template <typename T>
+    static constexpr uint64_t decodedExpansionEstimate() {
+        return std::is_same_v<T, std::string> ? STRING_EXPANSION_ESTIMATE : COALESCE_EXPANSION_ESTIMATE;
+    }
+
     template <typename T>
     seastar::future<SeriesCompactionData<T>> processSeriesForCompaction(
         const SeriesId128& seriesId, const std::vector<seastar::shared_ptr<TSM>>& sources,
@@ -182,11 +226,14 @@ public:
     // A full 3000-point Float block measures ~4 KB in practice.
     static constexpr uint64_t UNDERFULL_BLOCK_BYTES = 512;
     // Ceiling on a single series' compressed bytes before we will re-encode it.
-    static constexpr uint64_t MAX_COALESCE_COMPRESSED_BYTES = 8ull << 20;  // 8 MB
-    // Observed decoded:compressed expansion is ~12x; 16x for headroom.
-    static constexpr uint64_t COALESCE_EXPANSION_ESTIMATE = 16;
+    // Strings get a smaller cap: their expansion estimate carries much more
+    // uncertainty (see STRING_EXPANSION_ESTIMATE), so the worst-case decoded
+    // size of one string series is kept to ~128 MB of ESTIMATE rather than 8 MB
+    // of compressed input that could decode to far more.
+    static constexpr uint64_t MAX_COALESCE_COMPRESSED_BYTES = 8ull << 20;         // 8 MB
+    static constexpr uint64_t MAX_COALESCE_COMPRESSED_BYTES_STRING = 2ull << 20;  // 2 MB
     // Shared byte budget so CONCURRENT series cannot each spend the per-series
-    // ceiling (up to 80 run at once: SERIES_BATCH_SIZE x 4 type pipelines).
+    // ceiling (up to seriesBatchSize() x 4 type pipelines run at once).
     static constexpr uint64_t COALESCE_TOTAL_BUDGET_BYTES = 128ull << 20;  // 128 MB
 
     // Source blocks read in parallel per batch on the zero-copy carry path.
