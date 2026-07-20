@@ -59,8 +59,10 @@
 #include <gtest/gtest.h>
 
 #include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <optional>
 #include <random>
 #include <seastar/core/sleep.hh>
@@ -109,6 +111,48 @@ const char* typeName(FieldType t) {
     return "float";
 }
 
+// Query methods the fuzzer drives. Placement invariance holds for all of them;
+// only the comparison tolerance differs.
+enum class AggMethod { Latest, First, Min, Max, Count, Sum, Avg };
+
+const char* methodName(AggMethod m) {
+    switch (m) {
+        case AggMethod::Latest:
+            return "latest";
+        case AggMethod::First:
+            return "first";
+        case AggMethod::Min:
+            return "min";
+        case AggMethod::Max:
+            return "max";
+        case AggMethod::Count:
+            return "count";
+        case AggMethod::Sum:
+            return "sum";
+        case AggMethod::Avg:
+            return "avg";
+    }
+    return "latest";
+}
+
+// SUM and AVG accumulate, so different placements legitimately fold in a
+// different ORDER, and IEEE addition is not associative -- a last-bit difference
+// is correct behaviour, not a bug. Everything else either selects a stored value
+// (latest/first/min/max) or counts, and must be bit-identical.
+bool methodRequiresExactMatch(AggMethod m) {
+    return m != AggMethod::Sum && m != AggMethod::Avg;
+}
+
+// Non-numeric fields ignore the method entirely (raw passthrough, or
+// LATEST-per-bucket with an interval), so only latest/first are meaningful for
+// them; the others would be comparing against a different documented rule.
+bool methodAppliesTo(AggMethod m, FieldType t) {
+    if (t == FieldType::Float || t == FieldType::Integer) {
+        return true;
+    }
+    return m == AggMethod::Latest || m == AggMethod::First;
+}
+
 struct GeneratedSeries {
     std::string measurement;
     std::string field = "v";
@@ -117,6 +161,18 @@ struct GeneratedSeries {
     std::vector<uint64_t> timestamps;
     std::vector<std::string> jsonValues;  // literal as written
     std::vector<std::string> canonical;   // canonical form for comparison
+
+    // Second write that REWRITES a subset of the same timestamps. Duplicate
+    // points must overwrite (last-write-wins), so this exercises the dedup/merge
+    // path -- which has its own history of returning both copies, or the older
+    // one, depending on where the two copies physically landed.
+    std::vector<uint64_t> rewriteTs;
+    std::vector<std::string> rewriteJson;
+
+    // The state a query must see once everything is written: one value per
+    // distinct timestamp, newest wins.
+    std::vector<uint64_t> expectedTs;
+    std::vector<std::string> expectedCanonical;
 
     std::string describe() const {
         return measurement + " type=" + typeName(type) + " points=" + std::to_string(timestamps.size());
@@ -188,10 +244,22 @@ struct Workload {
     uint64_t valueSeed = 0;
     size_t index = 0;  // names the measurement, keeps iterations distinct
 
+    // How many of the written timestamps get rewritten with a new value (LWW).
+    size_t rewriteCount = 0;
+    // Float series only: mix in NaN / +Inf / -Inf / -0.0. NaN is "missing" and
+    // +/-Inf is valid data (docs/nan_policy.md), and both have had bugs.
+    bool includeSpecials = false;
+    // The query shape to check. Placement invariance needs no oracle, so the
+    // method can vary freely -- that is what widens the query space cheaply.
+    AggMethod method = AggMethod::Latest;
+    uint64_t intervalSec = 0;  // 0 = raw read
+
     std::string describe() const {
         return std::string("type=") + typeName(type) + " count=" + std::to_string(count) +
                " stepSec=" + std::to_string(baseStepSec) + " irregular=" + (irregular ? "yes" : "no") +
-               " strCard=" + std::to_string(stringCardinality) + " valueSeed=" + std::to_string(valueSeed);
+               " strCard=" + std::to_string(stringCardinality) + " rewrites=" + std::to_string(rewriteCount) +
+               " specials=" + (includeSpecials ? "yes" : "no") + " method=" + methodName(method) +
+               " intervalSec=" + std::to_string(intervalSec) + " valueSeed=" + std::to_string(valueSeed);
     }
 
     // A failure report someone can act on without re-deriving anything.
@@ -207,6 +275,18 @@ struct Workload {
         s += "  w.baseStepSec = " + std::to_string(baseStepSec) + ";\n";
         s += "  w.irregular = " + std::string(irregular ? "true" : "false") + ";\n";
         s += "  w.stringCardinality = " + std::to_string(stringCardinality) + ";\n";
+        s += "  w.rewriteCount = " + std::to_string(rewriteCount) + ";\n";
+        s += "  w.includeSpecials = " + std::string(includeSpecials ? "true" : "false") + ";\n";
+        s += std::string("  w.method = AggMethod::") +
+             (method == AggMethod::Latest  ? "Latest"
+              : method == AggMethod::First ? "First"
+              : method == AggMethod::Min   ? "Min"
+              : method == AggMethod::Max   ? "Max"
+              : method == AggMethod::Count ? "Count"
+              : method == AggMethod::Sum   ? "Sum"
+                                           : "Avg") +
+             ";\n";
+        s += "  w.intervalSec = " + std::to_string(intervalSec) + ";\n";
         s += "  w.valueSeed = " + std::to_string(valueSeed) + ";\n";
         s += "  w.index = " + std::to_string(index) + ";\n";
         s += "  EXPECT_FALSE(runWorkload(w).has_value());\n";
@@ -214,6 +294,49 @@ struct Workload {
         return s;
     }
 };
+
+// One generated value as (json literal, canonical form).
+//
+// NaN serialises as JSON null and reads back as null, so the canonical form for
+// NaN is "null" -- that is the documented wire representation, not a harness
+// fudge. +/-Inf are valid data and round-trip as numbers.
+std::pair<std::string, std::string> makeValue(const Workload& w, std::mt19937_64& rng) {
+    switch (w.type) {
+        case FieldType::Float: {
+            if (w.includeSpecials && (rng() % 8) == 0) {
+                // -0.0 is the only special value the JSON write path accepts.
+                //
+                // NaN and +/-Infinity are NOT writable over JSON, and this was
+                // verified against a live server rather than assumed: `null` in
+                // a value array is rejected both ways -- "Mixed types in field
+                // array" without field_types, "declared float but the value is
+                // not a number" with it. JSON has no Infinity literal either.
+                //
+                // That is by design, not a gap: the nodejs client always uses
+                // protobuf, which carries NaN natively (CLAUDE.md, "Special
+                // Float Values"). So NaN/Inf coverage belongs to the protobuf
+                // variant (phase 4) -- faking it here with e.g. 1e999 only
+                // produces a parse error and tests nothing.
+                return {"-0.0", canonicalNumber(-0.0)};
+            }
+            const double d = static_cast<double>(static_cast<int64_t>(rng() % 20000) - 10000) / 2.0;
+            return {canonicalNumber(d), canonicalNumber(d)};
+        }
+        case FieldType::Integer: {
+            const int64_t v = static_cast<int64_t>(rng() % 1000000) - 500000;
+            return {std::to_string(v), canonicalNumber(static_cast<double>(v))};
+        }
+        case FieldType::Bool: {
+            const bool b = (rng() % 2) == 0;
+            return {b ? "true" : "false", b ? "true" : "false"};
+        }
+        case FieldType::String: {
+            const std::string str = "s_" + std::to_string(rng() % w.stringCardinality);
+            return {"\"" + str + "\"", str};
+        }
+    }
+    return {"0", "0"};
+}
 
 // Pure: the same Workload always produces the same points.
 GeneratedSeries materialize(const Workload& w) {
@@ -233,33 +356,28 @@ GeneratedSeries materialize(const Workload& w) {
         const uint64_t step = w.irregular ? (1 + (rng() % (w.baseStepSec * 3))) : w.baseStepSec;
         ts += step * kSec;
 
-        switch (w.type) {
-            case FieldType::Float: {
-                const double d = static_cast<double>(static_cast<int64_t>(rng() % 20000) - 10000) / 2.0;
-                g.jsonValues.push_back(canonicalNumber(d));
-                g.canonical.push_back(canonicalNumber(d));
-                break;
-            }
-            case FieldType::Integer: {
-                const int64_t v = static_cast<int64_t>(rng() % 1000000) - 500000;
-                g.jsonValues.push_back(std::to_string(v));
-                g.canonical.push_back(canonicalNumber(static_cast<double>(v)));
-                break;
-            }
-            case FieldType::Bool: {
-                const bool b = (rng() % 2) == 0;
-                g.jsonValues.push_back(b ? "true" : "false");
-                g.canonical.push_back(b ? "true" : "false");
-                break;
-            }
-            case FieldType::String: {
-                const std::string s = "s_" + std::to_string(rng() % w.stringCardinality);
-                g.jsonValues.push_back("\"" + s + "\"");
-                g.canonical.push_back(s);
-                break;
-            }
-        }
+        auto [json, canon] = makeValue(w, rng);
+        g.jsonValues.push_back(std::move(json));
+        g.canonical.push_back(std::move(canon));
     }
+
+    // ---- rewrites: the same timestamps written again, newest must win ----
+    std::vector<std::string> finalCanonical = g.canonical;
+    const size_t rewrites = std::min(w.rewriteCount, w.count);
+    for (size_t i = 0; i < rewrites; ++i) {
+        // Spread the rewrites across the series rather than clustering at the
+        // front: a rewrite in the middle of a block exercises intra-block dedup,
+        // one at a block edge exercises the cross-block merge.
+        const size_t idx = (w.count == 0) ? 0 : ((i * 7 + 3) % w.count);
+        auto [json, canon] = makeValue(w, rng);
+        g.rewriteTs.push_back(g.timestamps[idx]);
+        g.rewriteJson.push_back(std::move(json));
+        finalCanonical[idx] = std::move(canon);
+    }
+
+    // ---- expected visible state: one value per distinct timestamp ----
+    g.expectedTs = g.timestamps;
+    g.expectedCanonical = std::move(finalCanonical);
     return g;
 }
 
@@ -289,6 +407,23 @@ Workload generateWorkload(size_t index, uint64_t seed) {
     // cardinality takes the raw STRG path. Both are real branches in
     // decodeBlockFlat.
     w.stringCardinality = (rng() % 2 == 0) ? (1 + rng() % 40) : 5000;
+
+    // Rewrites (last-write-wins) on a third of workloads.
+    w.rewriteCount = (rng() % 3 == 0) ? (1 + rng() % std::max<size_t>(1, w.count / 4)) : 0;
+    // Specials on half the float workloads.
+    w.includeSpecials = (w.type == FieldType::Float) && (rng() % 2 == 0);
+
+    // Query shape. Placement invariance holds for every method, so this widens
+    // the checked surface without needing an oracle for each one.
+    const AggMethod methods[] = {AggMethod::Latest, AggMethod::First, AggMethod::Min, AggMethod::Max,
+                                 AggMethod::Count,  AggMethod::Sum,   AggMethod::Avg};
+    do {
+        w.method = methods[rng() % 7];
+    } while (!methodAppliesTo(w.method, w.type));
+    // 0 = raw, otherwise an interval that is sometimes far smaller and sometimes
+    // far larger than the data's own span.
+    const uint64_t intervals[] = {0, 1, 60, 3600, 86400};
+    w.intervalSec = intervals[rng() % 5];
     return w;
 }
 
@@ -334,6 +469,31 @@ std::optional<std::string> writeSeries(HttpWriteHandler& handler, const Generate
             return "write failed: " + std::string(rep->_content.substr(0, 200));
         }
     }
+
+    // Second pass: rewrite a subset of the same timestamps. These must OVERWRITE
+    // (last-write-wins), not accumulate as duplicates.
+    for (size_t start = 0; start < g.rewriteTs.size(); start += kBatch) {
+        const size_t end = std::min(g.rewriteTs.size(), start + kBatch);
+        std::string ts = "[";
+        std::string vs = "[";
+        for (size_t i = start; i < end; ++i) {
+            if (i > start) {
+                ts += ",";
+                vs += ",";
+            }
+            ts += std::to_string(g.rewriteTs[i]);
+            vs += g.rewriteJson[i];
+        }
+        ts += "]";
+        vs += "]";
+        const std::string body = R"({"measurement":")" + g.measurement + R"(","tags":{"host":")" + g.tagValue +
+                                 R"("},"fields":{")" + g.field + R"(":)" + vs + R"(},"field_types":{")" + g.field +
+                                 R"(":")" + typeName(g.type) + R"("},"timestamps":)" + ts + "}";
+        auto rep = handler.handleWrite(jsonRequest(body)).get();
+        if (rep->_status != seastar::http::reply::status_type::ok) {
+            return "rewrite failed: " + std::string(rep->_content.substr(0, 200));
+        }
+    }
     return std::nullopt;
 }
 
@@ -361,10 +521,10 @@ std::string canonicalOf(glz::generic& v) {
 }
 
 QueryResult runQuery(HttpQueryHandler& handler, const std::string& measurement, const std::string& field,
-                     uint64_t start, uint64_t end, const std::string& interval) {
+                     uint64_t start, uint64_t end, const std::string& interval, AggMethod method = AggMethod::Latest) {
     QueryResult out;
-    std::string body = R"({"query":"latest:)" + measurement + "(" + field + R"(){}","startTime":)" +
-                       std::to_string(start) + R"(,"endTime":)" + std::to_string(end);
+    std::string body = R"({"query":")" + std::string(methodName(method)) + ":" + measurement + "(" + field +
+                       R"(){}","startTime":)" + std::to_string(start) + R"(,"endTime":)" + std::to_string(end);
     if (!interval.empty()) {
         body += R"(,"aggregationInterval":")" + interval + R"(")";
     }
@@ -488,6 +648,68 @@ std::optional<std::string> expectEqual(const std::vector<std::string>& got, cons
 // Runs every property against one workload. Returns the FIRST failure, or
 // nullopt. Self-contained: builds and tears down its own engine, so the shrinker
 // can call it freely.
+// Compare two value lists under the tolerance the METHOD deserves. SUM/AVG may
+// differ in the last bits across placements (different fold order, and IEEE
+// addition is not associative); everything else selects or counts and must match
+// exactly. Getting this backwards yields either false alarms or a blind spot.
+std::optional<std::string> compareValues(const std::vector<std::string>& got, const std::vector<std::string>& want,
+                                         AggMethod method, const std::string& what) {
+    if (got.size() != want.size()) {
+        return what + ": " + std::to_string(got.size()) + " values vs " + std::to_string(want.size());
+    }
+    const bool exact = methodRequiresExactMatch(method);
+    for (size_t i = 0; i < got.size(); ++i) {
+        if (got[i] == want[i]) {
+            continue;
+        }
+        if (exact) {
+            return what + ": index " + std::to_string(i) + " got '" + got[i] + "' expected '" + want[i] + "'";
+        }
+        // Accumulating method: allow a relative epsilon, but only between two
+        // finite numbers. null/inf mismatches are still real differences.
+        try {
+            const double a = std::stod(got[i]);
+            const double b = std::stod(want[i]);
+            if (std::isfinite(a) && std::isfinite(b)) {
+                const double scale = std::max({1.0, std::fabs(a), std::fabs(b)});
+                if (std::fabs(a - b) <= 1e-9 * scale) {
+                    continue;
+                }
+            }
+        } catch (const std::exception&) {
+            // not numeric -- fall through to report
+        }
+        return what + ": index " + std::to_string(i) + " got '" + got[i] + "' expected '" + want[i] +
+               "' (beyond accumulation tolerance)";
+    }
+    return std::nullopt;
+}
+
+// P4: bucket starts must be epoch-aligned, strictly ascending, unique, and
+// inside the queried range.
+std::optional<std::string> checkBucketWellFormed(const QueryResult& r, uint64_t intervalNs, uint64_t start,
+                                                 uint64_t end, const std::string& ctx) {
+    if (intervalNs == 0) {
+        return std::nullopt;
+    }
+    for (size_t i = 0; i < r.timestamps.size(); ++i) {
+        const uint64_t ts = r.timestamps[i];
+        if (ts % intervalNs != 0) {
+            return ctx + ": bucket start " + std::to_string(ts) + " is not aligned to the interval";
+        }
+        if (i > 0 && ts <= r.timestamps[i - 1]) {
+            return ctx + ": bucket starts are not strictly ascending at index " + std::to_string(i);
+        }
+        // The bucket CONTAINING start may begin before it; anything beyond end
+        // was never asked for.
+        if (ts > end) {
+            return ctx + ": bucket start " + std::to_string(ts) + " lies past endTime " + std::to_string(end);
+        }
+        (void)start;
+    }
+    return std::nullopt;
+}
+
 // Every run needs a measurement name no earlier run in this PROCESS has used.
 //
 // Cleaning the shard directories is not sufficient isolation: recreating an
@@ -528,7 +750,12 @@ std::optional<std::string> runWorkload(const Workload& w) {
     const uint64_t last = g.timestamps.back() + 1;
     const std::set<uint64_t> written(g.timestamps.begin(), g.timestamps.end());
 
+    const std::string intervalStr = w.intervalSec == 0 ? "" : (std::to_string(w.intervalSec) + "s");
+    const uint64_t intervalNs = w.intervalSec * kSec;
+
     // ---- before flush (memory-resident) ----
+    // The raw LATEST read is the one case with a known answer (stored values,
+    // verbatim), so it doubles as the LWW oracle below.
     auto rawBefore = runQuery(queryHandler, g.measurement, g.field, first, last, "");
     if (!rawBefore.ok) {
         return "raw/before: " + rawBefore.error;
@@ -539,19 +766,58 @@ std::optional<std::string> runWorkload(const Workload& w) {
     if (auto e = checkNoPhantomTimestamps(rawBefore, written, "raw/before")) {
         return e;
     }
-    if (auto e =
-            expectEqual(rawBefore.timestamps, g.timestamps, "raw/before: timestamps differ from what was written")) {
+    // P9 (LWW): one value per distinct timestamp, newest wins. Duplicates must
+    // overwrite -- never appear twice, never resurrect the older value.
+    if (auto e = expectEqual(rawBefore.timestamps, g.expectedTs,
+                             "raw/before: timestamps differ from what was written (duplicates not deduped?)")) {
         return e;
     }
-    if (auto e = expectEqual(rawBefore.values, g.canonical, "raw/before: values differ from what was written")) {
+    if (auto e = expectEqual(rawBefore.values, g.expectedCanonical,
+                             "raw/before: values differ from what was written (last-write-wins broken?)")) {
         return e;
     }
 
-    auto bucketedBefore = runQuery(queryHandler, g.measurement, g.field, first, last, "1h");
-    if (!bucketedBefore.ok) {
-        return "bucketed/before: " + bucketedBefore.error;
+    // P6 (idempotence): the same query twice must give the same answer.
+    auto rawRepeat = runQuery(queryHandler, g.measurement, g.field, first, last, "");
+    if (!rawRepeat.ok) {
+        return "raw/repeat: " + rawRepeat.error;
     }
-    if (auto e = checkLengthCoherence(bucketedBefore, "bucketed/before")) {
+    if (auto e = expectEqual(rawRepeat.timestamps, rawBefore.timestamps,
+                             "the same query returned different timestamps on a second run")) {
+        return e;
+    }
+    if (auto e = expectEqual(rawRepeat.values, rawBefore.values,
+                             "the same query returned different values on a second run")) {
+        return e;
+    }
+
+    // P7 (range monotonicity): a narrower range must not surface anything the
+    // wider range omitted.
+    if (g.timestamps.size() >= 4) {
+        const uint64_t mid = g.timestamps[g.timestamps.size() / 2];
+        auto narrow = runQuery(queryHandler, g.measurement, g.field, first, mid, "");
+        if (!narrow.ok) {
+            return "raw/narrow: " + narrow.error;
+        }
+        const std::set<uint64_t> wide(rawBefore.timestamps.begin(), rawBefore.timestamps.end());
+        for (uint64_t ts : narrow.timestamps) {
+            if (wide.count(ts) == 0) {
+                return "narrowing the range surfaced timestamp " + std::to_string(ts) +
+                       " that the wider range did not return";
+            }
+        }
+    }
+
+    // The workload's own query shape (method x interval). Placement invariance
+    // needs no oracle, which is what lets the method vary freely.
+    auto shapedBefore = runQuery(queryHandler, g.measurement, g.field, first, last, intervalStr, w.method);
+    if (!shapedBefore.ok) {
+        return "shaped/before: " + shapedBefore.error;
+    }
+    if (auto e = checkLengthCoherence(shapedBefore, "shaped/before")) {
+        return e;
+    }
+    if (auto e = checkBucketWellFormed(shapedBefore, intervalNs, first, last, "shaped/before")) {
         return e;
     }
 
@@ -629,19 +895,24 @@ std::optional<std::string> runWorkload(const Workload& w) {
         return e;
     }
 
-    auto bucketedAfter = runQuery(queryHandler, g.measurement, g.field, first, last, "1h");
-    if (!bucketedAfter.ok) {
-        return "bucketed/after: " + bucketedAfter.error;
+    auto shapedAfter = runQuery(queryHandler, g.measurement, g.field, first, last, intervalStr, w.method);
+    if (!shapedAfter.ok) {
+        return "shaped/after: " + shapedAfter.error;
     }
-    if (auto e = checkLengthCoherence(bucketedAfter, "bucketed/after")) {
+    if (auto e = checkLengthCoherence(shapedAfter, "shaped/after")) {
         return e;
     }
-    if (auto e = expectEqual(bucketedAfter.timestamps, bucketedBefore.timestamps,
-                             "bucket TIMESTAMPS changed across a TSM flush")) {
+    if (auto e = checkBucketWellFormed(shapedAfter, intervalNs, first, last, "shaped/after")) {
+        return e;
+    }
+    if (auto e = expectEqual(
+            shapedAfter.timestamps, shapedBefore.timestamps,
+            std::string("timestamps for method '") + methodName(w.method) + "' changed across a TSM flush")) {
         return e;
     }
     if (auto e =
-            expectEqual(bucketedAfter.values, bucketedBefore.values, "bucketed VALUES changed across a TSM flush")) {
+            compareValues(shapedAfter.values, shapedBefore.values, w.method,
+                          std::string("values for method '") + methodName(w.method) + "' changed across a TSM flush")) {
         return e;
     }
 

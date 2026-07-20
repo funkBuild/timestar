@@ -159,9 +159,37 @@ the diagnosis.**
   iteration counts can be high.
 - **HTTP-level** thin variant to cover JSON/protobuf parse + response
   serialisation, which the in-process path skips.
-- **ASAN.** The string bug was an out-of-bounds *read*; without ASAN it silently
-  returned empty strings and only sometimes crashed. The fuzzer must run under
-  `build-asan/` in CI or it will miss exactly the class it exists for.
+- **ASAN — working, with a caveat worth knowing.** `build-asan/` now builds and
+  runs the fuzzer clean. Three things had to be right, none obvious:
+  1. `CMAKE_BUILD_TYPE=Sanitize` (not `RelWithDebInfo`). Only the `Debug` and
+     `Sanitize` configs define `SEASTAR_DEFAULT_ALLOCATOR`, which disables
+     Seastar's custom allocator. Without it ASAN and Seastar both intercept
+     allocation and the binary segfaults in static init, before `main`, with no
+     output at all.
+  2. Override the config's optimisation level to `-O2`. `Sanitize` defaults to
+     `-Os`, at which GCC rejects Highway's AVX-512 shuffles ("the last argument
+     must be an 8-bit immediate") — nothing to do with sanitizers.
+  3. `-DCMAKE_GTEST_DISCOVER_TESTS_DISCOVERY_MODE=PRE_TEST`, or CMake runs the
+     binary at build time to enumerate tests and *deletes it* when that fails,
+     hiding the real problem.
+
+  Seastar also warns that ASan "doesn't fully support makecontext/swapcontext" —
+  its fiber switching can produce false positives, so treat a lone ASAN report
+  under Seastar with suspicion until reproduced.
+
+  **What ASAN does NOT buy here.** It was expected to catch the string bug's
+  out-of-bounds read. It does not, for two independent reasons, both verified by
+  reverting the fix and running under it:
+  - The read is `values[i]` past the vector's SIZE but within its CAPACITY. That
+    is undefined behaviour, but it touches validly-allocated heap, so plain ASAN
+    cannot see it. (`-D_GLIBCXX_ASSERTIONS` was tried too; it did not fire either.)
+  - More importantly, **the properties catch it first and more cheaply.** P2
+    (length coherence) reports "3001 timestamps but 1 values" at the API
+    boundary, on the raw read, before any code indexes past the end.
+
+  So ASAN is worth keeping for genuine heap overflows and use-after-free that no
+  property can observe — but it is not the safety net for THIS class. The
+  properties are. That inverts the original assumption in this document.
 - **Budget:** iteration count from env. CI: fixed seeds, ~30s. Nightly: random
   seeds, long run, failing seed reported.
 
@@ -176,6 +204,46 @@ Same generator, separate assertions, since `/derived` is numeric-only:
   every plan-dependence bug.
 - Transform functions: no crash, output length == input length where the
   function is elementwise, NaN propagation matches the documented rule.
+
+## Phase 3 status (implemented)
+
+Properties now live: P1, P2, P3, P4, P6, P7, P8, P9. Generator additions:
+duplicate timestamps (LWW rewrites), `-0.0`, and a query *shape* per workload
+(7 aggregation methods x 5 intervals, including raw).
+
+The trick that made the query space cheap: **placement invariance needs no
+oracle.** "before flush == after flush" is checkable for any method without
+knowing the right answer, so `method` and `intervalSec` can vary freely. Only
+the raw LATEST read is compared against known data — which is what makes it
+serve double duty as the LWW oracle.
+
+Tolerance is method-aware, as the float caveat above requires: SUM/AVG compare
+with a relative epsilon, everything else exactly.
+
+**NaN and +/-Infinity are deliberately NOT generated on the JSON path.** Verified
+against a live server rather than assumed: `null` in a value array is rejected
+both ways — "Mixed types in field array" without `field_types`, "declared float
+but the value is not a number" with it — and JSON has no Infinity literal. This
+is by design: the nodejs client always uses protobuf, which carries NaN natively.
+So NaN/Inf coverage belongs to the protobuf variant in phase 4, not to a fake
+JSON encoding.
+
+### Does it find NEW bugs, or only replay old ones?
+
+Measured, not asserted. After phase 3: **1150 iterations across 5 random seeds,
+zero new findings.** Phase 1 was 750 of those, phase 3 another 400 with the wider
+property set.
+
+That is an honest "not yet". The regression value is real and banked — reverting
+the string-decoder fix fails immediately with a minimal reproducer. But as a
+discovery tool it is still narrow, and more iterations is not the lever. The
+lever is coverage of what is still ungenerated:
+
+- compaction as a third placement state (only flush is exercised)
+- multiple series / multi-shard fan-out (every workload is a single series)
+- group-by, and unknown group-by keys
+- protobuf ingest — which is also the only way to reach NaN/Inf
+- derived queries and transform functions
 
 ## Phasing
 
