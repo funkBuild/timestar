@@ -104,10 +104,14 @@ static uint64_t parseStartTime(const std::optional<std::variant<uint64_t, std::s
 // --- Convert QueryResponse series to StreamingBatch objects ---
 
 std::vector<StreamingBatch> HttpStreamHandler::queryResponseToBatches(const std::vector<SeriesResult>& series,
-                                                                      const std::string& label) {
+                                                                      const std::string& label, size_t maxPoints) {
     std::vector<StreamingBatch> batches;
+    size_t emitted = 0;
 
     for (const auto& sr : series) {
+        if (emitted >= maxPoints) {
+            break;
+        }
         StreamingBatch batch;
         batch.label = label;
 
@@ -136,9 +140,20 @@ std::vector<StreamingBatch> HttpStreamHandler::queryResponseToBatches(const std:
                         }
 
                         batch.points.push_back(std::move(pt));
+                        if (++emitted >= maxPoints) {
+                            // Stop mid-conversion. The caller's budget check used
+                            // to run only AFTER the whole response was converted,
+                            // so a response bounded by max_total_points (10M)
+                            // could build ~1.4 GB of 128-byte StreamingDataPoints
+                            // before the 1M-point backfill cap was consulted.
+                            return;
+                        }
                     }
                 },
                 values);
+            if (emitted >= maxPoints) {
+                break;
+            }
         }
 
         if (!batch.points.empty()) {
@@ -882,7 +897,10 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpStreamHandler::handle
                 auto deadline = seastar::lowres_clock::now() + backfillTimeoutSeconds;
                 auto response = co_await seastar::with_timeout(deadline, backfillHandler.executeQuery(backfillReq));
                 if (response.success && !response.series.empty()) {
-                    auto batches = queryResponseToBatches(response.series, entry.label);
+                    // Convert only what still fits in the backfill budget.
+                    const size_t remaining =
+                        (totalBackfillPoints >= MAX_BACKFILL_POINTS) ? 0 : (MAX_BACKFILL_POINTS - totalBackfillPoints);
+                    auto batches = queryResponseToBatches(response.series, entry.label, remaining);
                     for (auto& b : batches) {
                         totalBackfillPoints += b.points.size();
                         backfillBatches.push_back(std::move(b));

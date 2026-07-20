@@ -134,7 +134,15 @@ inline void ensureArraySpace(std::string& buf, size_t pos, size_t count) {
     // Each element: up to MAX_NUM_LEN digits + 1 comma
     size_t need = count * (MAX_NUM_LEN + 1) + 2;  // + brackets
     if (pos + need > buf.size()) {
-        buf.resize(std::max(buf.size() * 2, pos + need));
+        // Grow to exactly what is needed rather than doubling.
+        //
+        // The initial estimate in format() now covers the true worst case, so
+        // reaching here at all is unusual. When it does happen, doubling a buffer
+        // that is already proportional to the response wastes up to half of it
+        // and, worse, transiently holds old + new: at the 10M-point limit that is
+        // ~560 MB live plus ~840 MB during the copy. Exact growth costs an extra
+        // realloc in the rare case and bounds the peak in all of them.
+        buf.resize(pos + need);
     }
 }
 
@@ -246,9 +254,16 @@ inline size_t appendFieldValues(std::string& buf, size_t pos, const FieldValues&
 // ──────────────────────────────────────────────────────────────────────
 
 std::string ResponseFormatter::format(QueryResponse& response) {
-    // Pre-allocate: ~28 bytes per point (19-digit timestamp + comma + ~8 char value + comma).
-    // Over-estimate slightly to avoid any reallocation for typical responses.
-    size_t estimate = static_cast<size_t>(response.statistics.pointCount) * 28 + 512;
+    // Pre-allocate for the WORST case each point can serialise to, so the buffer
+    // never has to grow.
+    //
+    // The old estimate of 28 bytes/point was not an over-estimate at all: a point
+    // emits TWO array elements (its timestamp and its value), and
+    // ensureArraySpace budgets MAX_NUM_LEN + 1 for each, i.e. 66 bytes/point. So
+    // every non-trivial response blew the estimate and hit the growth path, which
+    // then doubled -- 28N of estimate becoming 56N of buffer, with old and new
+    // both live during the copy.
+    size_t estimate = static_cast<size_t>(response.statistics.pointCount) * (2 * (MAX_NUM_LEN + 1)) + 512;
     std::string buf;
     buf.resize(estimate);
     size_t pos = 0;

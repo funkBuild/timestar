@@ -168,6 +168,13 @@ static seastar::future<std::vector<PartialAggregationResult>> streamingGroupByAg
     std::vector<GroupAccumulator*> contextGroupPtrs;
     contextGroupPtrs.reserve(contexts.size());
 
+    // Shard-wide ceiling on speculative bucket-map preallocation across ALL
+    // groups in this query. 1M slots is ~8 MB of hash-table storage, enough that
+    // a handful of wide-range groups still get their full reserve while a
+    // thousand-group query cannot allocate hundreds of MB of empty tables.
+    constexpr uint64_t kMaxTotalPreallocatedBuckets = 1'000'000;
+    uint64_t totalPreallocatedBuckets = 0;
+
     for (auto& ctx : contexts) {
         auto gkr = buildGroupKeyDirect(measurement, ctx.field, ctx.tags, groupByTags);
         PrehashedString pkey(gkr.key, gkr.hash);
@@ -179,14 +186,31 @@ static seastar::future<std::vector<PartialAggregationResult>> streamingGroupByAg
             it->second->groupKeyHash = gkr.hash;
             it->second->cachedTags = std::move(gkr.tags);
             it->second->fieldName = ctx.field;
-            // Pre-reserve bucket map for bucketed queries
-            if (aggregationInterval > 0 && endTime > startTime) {
+            // Pre-reserve bucket map for bucketed queries.
+            //
+            // The bucket count is a property of the query RANGE, not of how much
+            // data this group actually holds, and this reserve is PER GROUP. A
+            // day-long range at a 1s interval is 86,400 buckets = ~691 KB of
+            // hash-table slots; with a `by {host}` clause over 1,000 hosts that
+            // is ~691 MB of empty tables allocated before a single point is
+            // folded, and most groups never come close to filling them.
+            //
+            // Cap the total across groups rather than reserving the full range
+            // for each. Groups beyond the budget still work -- unordered_map
+            // grows on demand -- they just pay incremental rehashing, which is
+            // the right trade when there are enough groups for it to matter.
+            if (aggregationInterval > 0 && endTime > startTime &&
+                totalPreallocatedBuckets < kMaxTotalPreallocatedBuckets) {
                 uint64_t range = endTime - startTime;
                 uint64_t bucketCount = (range + aggregationInterval - 1) / aggregationInterval;
                 if (bucketCount > BlockAggregator::MAX_PREALLOCATED_BUCKETS) {
                     bucketCount = BlockAggregator::MAX_PREALLOCATED_BUCKETS;
                 }
-                it->second->bucketStates.reserve(static_cast<size_t>(bucketCount));
+                bucketCount = std::min<uint64_t>(bucketCount, kMaxTotalPreallocatedBuckets - totalPreallocatedBuckets);
+                if (bucketCount > 0) {
+                    it->second->bucketStates.reserve(static_cast<size_t>(bucketCount));
+                    totalPreallocatedBuckets += bucketCount;
+                }
             }
         }
         contextGroupPtrs.push_back(it->second.get());

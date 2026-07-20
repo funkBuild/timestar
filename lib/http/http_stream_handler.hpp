@@ -38,8 +38,12 @@ public:
     static std::string formatSSEBackfillEvent(const StreamingBatch& batch);
 
     // Convert query response series to StreamingBatch objects for SSE emission
+    // Converts at most `maxPoints` points. Bounded because a StreamingDataPoint
+    // is ~128 bytes: converting a whole response before checking the backfill
+    // budget could build ~1.4 GB from a response that was itself within limits.
     static std::vector<StreamingBatch> queryResponseToBatches(const std::vector<SeriesResult>& series,
-                                                              const std::string& label = "");
+                                                              const std::string& label = "",
+                                                              size_t maxPoints = SIZE_MAX);
 
     // Apply a formula expression to a streaming batch (per-series evaluation).
     // Each unique (measurement, tags, field) group is evaluated independently.

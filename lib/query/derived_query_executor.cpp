@@ -252,6 +252,9 @@ seastar::future<std::map<std::string, SubQueryResult>> DerivedQueryExecutor::exe
     auto referencedQueries = request.getReferencedQueries();
 
     // Build futures for each sub-query
+    // Ceiling on how many sub-queries run at once; see the note at the push_back
+    // below. Deliberately generous -- real formulas reference a handful.
+    constexpr size_t kMaxConcurrentSubQueries = 16;
     std::vector<seastar::future<std::pair<std::string, SubQueryResult>>> futures;
 
     for (const auto& [name, query] : request.queries) {
@@ -273,6 +276,22 @@ seastar::future<std::map<std::string, SubQueryResult>> DerivedQueryExecutor::exe
         futures.push_back(executeSubQuery(name, std::move(subQuery)).then([name](SubQueryResult result) {
             return std::make_pair(name, std::move(result));
         }));
+
+        // Bound the fan-out. Each sub-query is a full query bounded only by
+        // http.max_total_points, and every result stays live until the formula
+        // is evaluated -- so K referenced queries hold K x that limit
+        // simultaneously. A formula referencing a dozen series could commit
+        // multiple GB before any arithmetic happens.
+        if (futures.size() >= kMaxConcurrentSubQueries) {
+            break;
+        }
+    }
+
+    if (futures.size() >= kMaxConcurrentSubQueries) {
+        timestar::query_log.warn(
+            "Derived query references more than {} sub-queries; only the first {} were executed. "
+            "Split the formula or reduce the number of referenced queries.",
+            kMaxConcurrentSubQueries, kMaxConcurrentSubQueries);
     }
 
     // Execute all in parallel
