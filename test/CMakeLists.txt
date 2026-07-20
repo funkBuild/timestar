@@ -19,6 +19,10 @@ file(GLOB_RECURSE UNIT_QUERY_TESTS CONFIGURE_DEPENDS unit/query/*.cpp)
 file(GLOB_RECURSE UNIT_INDEX_TESTS CONFIGURE_DEPENDS unit/index/*.cpp)
 list(FILTER UNIT_INDEX_TESTS EXCLUDE REGEX ".*/deprecated/.*")
 file(GLOB_RECURSE UNIT_HTTP_TESTS CONFIGURE_DEPENDS unit/http/*.cpp)
+# Stack-level property fuzzing (see docs/fuzzer_design.md). Seeded and bounded by
+# default so it runs as an ordinary unit test; TIMESTAR_FUZZ_SEED /
+# TIMESTAR_FUZZ_ITERATIONS widen it for nightly runs.
+file(GLOB_RECURSE UNIT_FUZZ_TESTS CONFIGURE_DEPENDS unit/fuzz/*.cpp)
 # NOTE: the proto tests (proto_converter_test, proto_write_fast_path_test,
 # protobuf_integration_test) were historically excluded here and built as
 # standalone binaries to avoid ODR violations when the proto package was
@@ -57,6 +61,7 @@ set(TEST_SRCS
     ${UNIT_QUERY_TESTS}
     ${UNIT_INDEX_TESTS}
     ${UNIT_HTTP_TESTS}
+    ${UNIT_FUZZ_TESTS}
     ${UNIT_CORE_TESTS}
     ${UNIT_RETENTION_TESTS}
     ${UNIT_UTILS_TESTS}
@@ -124,6 +129,7 @@ set(UNIT_TEST_SRCS
     ${UNIT_QUERY_TESTS}
     ${UNIT_INDEX_TESTS}
     ${UNIT_HTTP_TESTS}
+    ${UNIT_FUZZ_TESTS}
     ${UNIT_CORE_TESTS}
     ${UNIT_RETENTION_TESTS}
     ${UNIT_UTILS_TESTS}
