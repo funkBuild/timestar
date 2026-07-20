@@ -271,3 +271,95 @@ seastar::future<> testInteriorOverlapWins(TSMChunkedMergeTest* self) {
 TEST_F(TSMChunkedMergeTest, InteriorOverlapStraddlingGroupBoundaryStillWins) {
     seastar::async([&] { testInteriorOverlapWins(this).get(); }).get();
 }
+
+// N files that ALL span the SAME time range (a repeated-rewrite/backfill
+// workload) chain into ONE time-connected group covering the whole series.
+// The bulk path decodes an entire group at once, so before the lazy cursor
+// merge this shape held every block of the series simultaneously (~12x the
+// on-disk size) — the original compaction std::bad_alloc. This pins:
+//   1. the group is big enough to take the lazy path
+//      (> TSMCompactor::MAX_BUFFERED_GROUP_BLOCKS blocks),
+//   2. every distinct timestamp survives exactly once, ascending,
+//   3. the NEWEST file's value wins at every timestamp (3-way LWW),
+//   4. spills inside the merge loop don't lose or duplicate seam points.
+seastar::future<> testFullyOverlappingFilesLazyMerge(TSMChunkedMergeTest* self) {
+    SeriesId128 seriesId = SeriesId128::fromSeriesKey("full.overlap,host=a#value");
+
+    // 400K points per file / ~3000 points per block ≈ 134 blocks per file;
+    // three fully-overlapping files ≈ 402 blocks in ONE group — past the
+    // MAX_BUFFERED_GROUP_BLOCKS (256) bulk-path bound, and past
+    // MERGE_CHUNK_POINTS (256K) so the lazy loop must spill mid-merge.
+    constexpr size_t kPoints = 400000;
+    static_assert(kPoints > 256 * 1024, "must exceed MERGE_CHUNK_POINTS to force mid-merge spills");
+
+    std::vector<uint64_t> ts;
+    ts.reserve(kPoints);
+    for (size_t i = 0; i < kPoints; ++i) {
+        ts.push_back(1000ull + static_cast<uint64_t>(i) * 1000ull);
+    }
+    const std::vector<double> valsOld(kPoints, 1.0);
+    const std::vector<double> valsMid(kPoints, 2.0);
+    const std::vector<double> valsNew(kPoints, 3.0);
+
+    // Same timestamps in every file; sequence number order = write order,
+    // so 0_3 is the newest generation and must win everywhere.
+    TSMChunkedMergeTest::writeFloatFile("shard_0/tsm/0_1.tsm", seriesId, ts, valsOld);
+    TSMChunkedMergeTest::writeFloatFile("shard_0/tsm/0_2.tsm", seriesId, ts, valsMid);
+    TSMChunkedMergeTest::writeFloatFile("shard_0/tsm/0_3.tsm", seriesId, ts, valsNew);
+
+    auto fileA = seastar::make_shared<TSM>("shard_0/tsm/0_1.tsm");
+    auto fileB = seastar::make_shared<TSM>("shard_0/tsm/0_2.tsm");
+    auto fileC = seastar::make_shared<TSM>("shard_0/tsm/0_3.tsm");
+    co_await fileA->open();
+    co_await fileB->open();
+    co_await fileC->open();
+
+    std::vector<seastar::shared_ptr<TSM>> files{fileA, fileB, fileC};
+    auto result = co_await self->compactor->compact(files);
+    co_await fileA->close();
+    co_await fileB->close();
+    co_await fileC->close();
+    EXPECT_FALSE(result.outputPath.empty());
+    if (result.outputPath.empty()) {
+        co_return;
+    }
+
+    auto merged = seastar::make_shared<TSM>(result.outputPath);
+    co_await merged->open();
+
+    TSMResult<double> readback(0);
+    co_await merged->readSeries<double>(seriesId, 0, std::numeric_limits<uint64_t>::max(), readback);
+
+    size_t total = 0;
+    uint64_t prevTs = 0;
+    bool ascending = true;
+    bool duplicates = false;
+    size_t staleValues = 0;
+    for (const auto& block : readback.blocks) {
+        for (size_t i = 0; i < block->timestamps.size(); ++i) {
+            const uint64_t t = block->timestamps[i];
+            if (total > 0) {
+                if (t < prevTs)
+                    ascending = false;
+                if (t == prevTs)
+                    duplicates = true;
+            }
+            prevTs = t;
+            if (block->values[i] != 3.0) {
+                ++staleValues;
+            }
+            ++total;
+        }
+    }
+
+    EXPECT_EQ(total, kPoints) << "lazy merge lost or duplicated points";
+    EXPECT_TRUE(ascending) << "lazy merge emitted out-of-order timestamps";
+    EXPECT_FALSE(duplicates) << "lazy merge emitted duplicate timestamps";
+    EXPECT_EQ(staleValues, 0u) << "a stale generation's value survived the 3-way LWW merge";
+
+    co_await merged->close();
+}
+
+TEST_F(TSMChunkedMergeTest, FullyOverlappingFilesTakeLazyMergeAndKeepLastWriteWins) {
+    seastar::async([&] { testFullyOverlappingFilesLazyMerge(this).get(); }).get();
+}

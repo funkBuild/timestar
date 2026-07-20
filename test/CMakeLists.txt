@@ -100,6 +100,8 @@ set(SOURCE_INSPECTION_DEFS
     MANIFEST_HPP_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/index/native/manifest.hpp"
     LINE_PARSER_HPP_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/utils/line_parser.hpp"
     WAL_FILE_MANAGER_HPP_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/storage/wal_file_manager.hpp"
+    NATIVE_INDEX_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/index/native/native_index.cpp"
+    NATIVE_INDEX_HPP_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/index/native/native_index.hpp"
 )
 
 # Main test executable with all tests

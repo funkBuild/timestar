@@ -105,6 +105,15 @@ private:
     // size, and a comfortable multiple of MaxPointsPerBlock (3000).
     static constexpr size_t MERGE_CHUNK_POINTS = 256 * 1024;
 
+    // Largest time-connected block group the in-memory bulk mergers may decode
+    // at once. A group is unbounded in principle: N input files that all span
+    // the same time range (backfill / rewrite workloads) chain into a single
+    // group covering the whole series, and decoding it wholesale is the
+    // original compaction bad_alloc. Groups above this bound take the lazy
+    // cursor merge instead, which holds ONE decoded block per source file.
+    // 256 blocks ≈ 768K points ≈ 12 MB of decoded doubles.
+    static constexpr size_t MAX_BUFFERED_GROUP_BLOCKS = 256;
+
     template <typename T>
     seastar::future<SeriesCompactionData<T>> processSeriesForCompaction(
         const SeriesId128& seriesId, const std::vector<seastar::shared_ptr<TSM>>& sources,

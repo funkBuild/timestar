@@ -219,3 +219,34 @@ TEST_F(BugfixSourceInspectionTest, Bug11_LineParserOwnsTags) {
     EXPECT_NE(src.find("map<std::string, std::string> tags"), std::string::npos)
         << "tags must use std::string to own tag data";
 }
+
+// ---------------------------------------------------------------------------
+// Bug 12: updateTagHLL must not take a raw bitmap pointer across its
+// suspension. It suspends on kvGet before seeding; a roaring::Roaring*
+// into bitmapCache_ (a robin_map) dangles across that suspension (rehash /
+// trim). The seed source is passed as the cache KEY and re-looked-up after
+// the co_await. Seeding must also run on the deserialize branch, so a stale
+// sketch persisted below the threshold by an older version is back-filled.
+// ---------------------------------------------------------------------------
+TEST_F(BugfixSourceInspectionTest, Bug12_UpdateTagHllSeedsByKeyNotPointer) {
+    std::string hppSrc = readFile(NATIVE_INDEX_HPP_SOURCE_PATH);
+    ASSERT_FALSE(hppSrc.empty()) << "Could not read native_index.hpp";
+
+    // The declaration must not carry a raw bitmap pointer parameter.
+    EXPECT_EQ(hppSrc.find("const roaring::Roaring* seedFrom"), std::string::npos)
+        << "updateTagHLL must not take a raw pointer into bitmapCache_ (dangles across kvGet)";
+    EXPECT_NE(hppSrc.find("const std::string& seedBitmapKey"), std::string::npos)
+        << "updateTagHLL must take the bitmap cache key and re-look it up after suspending";
+
+    std::string cppSrc = readFile(NATIVE_INDEX_SOURCE_PATH);
+    ASSERT_FALSE(cppSrc.empty()) << "Could not read native_index.cpp";
+
+    auto fnStart = cppSrc.find("NativeIndex::updateTagHLL");
+    ASSERT_NE(fnStart, std::string::npos);
+    auto fnEnd = cppSrc.find("\nseastar::future", fnStart + 10);
+    std::string fnBody = cppSrc.substr(fnStart, fnEnd != std::string::npos ? fnEnd - fnStart : std::string::npos);
+
+    // The bitmap must be re-found after the suspension, not captured before it.
+    EXPECT_NE(fnBody.find("bitmapCache_.find(seedBitmapKey)"), std::string::npos)
+        << "updateTagHLL must re-look up the seed bitmap after its kvGet suspension";
+}

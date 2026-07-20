@@ -253,14 +253,23 @@ seastar::future<> NativeIndex::open() {
         uint32_t nextId = ke::decodeLocalId(*counterVal);
         localIdMap_.restoreBegin(nextId, nextId);
         std::string fwdPrefix(1, static_cast<char>(LOCAL_ID_FORWARD));
+        size_t skippedRestoreEntries = 0;
         co_await kvPrefixScan(fwdPrefix, [&](std::string_view key, std::string_view value) {
             if (key.size() >= 5 && value.size() >= 16) {
                 uint32_t localId = ke::decodeLocalId(key.substr(1));
                 SeriesId128 globalId = SeriesId128::fromBytes(value.data(), 16);
-                localIdMap_.restoreEntry(localId, globalId);
+                if (!localIdMap_.restoreEntry(localId, globalId)) {
+                    ++skippedRestoreEntries;
+                }
             }
             return true;
         });
+        if (skippedRestoreEntries > 0) {
+            ::native_index_log.error(
+                "LocalIdMap restore: skipped {} forward entries with ids implausibly far past the persisted "
+                "counter {} — corrupt index keys; the affected series will be re-assigned on next write",
+                skippedRestoreEntries, localIdMap_.nextId());
+        }
         lastFlushedLocalId_ = localIdMap_.nextId();  // All restored IDs are already persisted
         ::native_index_log.info("Restored LocalIdMap: {} mappings", localIdMap_.size());
     } else {
@@ -931,7 +940,12 @@ seastar::future<SeriesId128> NativeIndex::getOrCreateSeriesId(SeriesId128 series
         bitmap->add(localId);
 
         if (bitmap->cardinality() >= kTagHllMinCardinality) {
-            co_await updateTagHLL(measurement, tagKey, tagValue, localId, bitmap);
+            // Pass the cache KEY, not `bitmap`: updateTagHLL suspends before
+            // seeding, and a raw pointer into bitmapCache_ dangles across
+            // suspensions (robin_map rehash/trim). It re-looks the bitmap up
+            // after its own co_await. The key buffer is reused next iteration
+            // only after this call completes.
+            co_await updateTagHLL(measurement, tagKey, tagValue, localId, bitmapCacheKey);
         }
     }
 
@@ -2424,10 +2438,16 @@ void NativeIndex::trimDayBitmapCache() {
 // Per-measurement HLLs (key = "measurement\0") stay warm; per-tag-value HLLs
 // (key = "measurement\0tagKey\0tagValue") are numerous and rarely queried.
 void NativeIndex::trimHllCache() {
-    if (hllCache_.size() <= MAX_HLL_CACHE_ENTRIES)
+    // Enforce BOTH the entry cap and the byte budget: each sketch is ~16 KB,
+    // so the entry cap alone permits ~16 MB regardless of the shard's memory
+    // budget — on a small shard the byte budget is the binding constraint.
+    constexpr size_t kHllEntryBytes = HyperLogLog::SERIALIZED_SIZE + 64;  // sketch + key/map overhead
+    const size_t maxEntriesByBytes = std::max<size_t>(1, maxHllCacheBytes() / kHllEntryBytes);
+    const size_t maxEntries = std::min<size_t>(MAX_HLL_CACHE_ENTRIES, maxEntriesByBytes);
+    if (hllCache_.size() <= maxEntries)
         return;
 
-    size_t toEvict = hllCache_.size() - MAX_HLL_CACHE_ENTRIES;
+    size_t toEvict = hllCache_.size() - maxEntries;
     for (auto it = hllCache_.begin(); it != hllCache_.end() && toEvict > 0;) {
         // Skip dirty entries (will be evicted after next flush)
         if (hllCacheDirty_.count(it->first)) {
@@ -2783,7 +2803,7 @@ seastar::future<> NativeIndex::updateHLL(const std::string& measurement, uint32_
 
 seastar::future<> NativeIndex::updateTagHLL(const std::string& measurement, const std::string& tagKey,
                                             const std::string& tagValue, uint32_t localId,
-                                            const roaring::Roaring* seedFrom) {
+                                            const std::string& seedBitmapKey) {
     std::string key;
     key.reserve(measurement.size() + 1 + tagKey.size() + 1 + tagValue.size());
     key += measurement;
@@ -2804,14 +2824,37 @@ seastar::future<> NativeIndex::updateTagHLL(const std::string& measurement, cons
                 it = hllCache_.try_emplace(key, HyperLogLog::deserialize(*val)).first;
             } else {
                 it = hllCache_.try_emplace(key).first;
-                // This sketch is being created only now, because the tag value
-                // just crossed the cardinality threshold. Seed it from the exact
-                // bitmap: otherwise it would count only the IDs added from here
-                // on and under-report by roughly the threshold.
-                if (seedFrom != nullptr) {
-                    for (uint32_t existingId : *seedFrom) {
-                        it.value().add(existingId);
-                    }
+            }
+            // Seed from the exact bitmap on BOTH branches (HLL adds are
+            // idempotent, so re-seeding is harmless):
+            //  - fresh sketch: the tag value just crossed the cardinality
+            //    threshold, and without seeding it would count only the ids
+            //    added from here on (under-reporting by ~the threshold);
+            //  - deserialized sketch: a sketch persisted below the threshold
+            //    by an older version stopped receiving ids when the threshold
+            //    was introduced; merging the bitmap back-fills the frozen gap.
+            // The bitmap is RE-LOOKED-UP here, after the kvGet suspension —
+            // the caller's pointer would have dangled across it (robin_map
+            // rehash/trim).
+            const roaring::Roaring* seedBitmap = nullptr;
+            auto bmIt = bitmapCache_.find(seedBitmapKey);
+            if (bmIt != bitmapCache_.end()) {
+                seedBitmap = &bmIt.value().bitmap;
+            } else {
+                // Evicted during the suspension (possible only if a flush
+                // cleared its dirty flag and a trim ran). Reload read-only;
+                // the returned pointer is valid until the next suspension,
+                // and the seed loop below does not suspend.
+                seedBitmap = co_await getPostingsBitmapByKey(seedBitmapKey);
+                // Re-find the sketch after suspending again.
+                it = hllCache_.find(key);
+                if (it == hllCache_.end()) {
+                    it = hllCache_.try_emplace(key).first;
+                }
+            }
+            if (seedBitmap != nullptr) {
+                for (uint32_t existingId : *seedBitmap) {
+                    it.value().add(existingId);
                 }
             }
         }
@@ -2963,23 +3006,37 @@ seastar::future<double> NativeIndex::estimateTagCardinality(const std::string& m
     key.push_back('\0');
     key += tagValue;
 
+    // A sketch is only trusted at or above kTagHllMinCardinality. Sketches
+    // are maintained only above the threshold, so a sub-threshold estimate
+    // means a stale sketch persisted by an older version that has since been
+    // frozen (no longer updated) — the exact bitmap is both available and
+    // correct there. Below the threshold, fall through to the bitmap.
     auto it = hllCache_.find(key);
     if (it != hllCache_.end()) {
-        co_return it->second.estimate();
-    }
-
-    // Try loading HLL from KV
-    auto kvKey = ke::encodeCardinalityHLLKey(measurement, tagKey, tagValue);
-    auto val = co_await kvGet(kvKey);
-    // Re-find after co_await (see estimateMeasurementCardinality).
-    if (auto post = hllCache_.find(key); post != hllCache_.end()) {
-        co_return post->second.estimate();
-    }
-    if (val.has_value() && val->size() >= HyperLogLog::SERIALIZED_SIZE) {
-        auto hll = HyperLogLog::deserialize(*val);
-        double est = hll.estimate();
-        hllCache_[key] = std::move(hll);
-        co_return est;
+        double est = it->second.estimate();
+        if (est >= static_cast<double>(kTagHllMinCardinality)) {
+            co_return est;
+        }
+    } else {
+        // Try loading HLL from KV
+        auto kvKey = ke::encodeCardinalityHLLKey(measurement, tagKey, tagValue);
+        auto val = co_await kvGet(kvKey);
+        // Re-find after co_await (see estimateMeasurementCardinality).
+        if (auto post = hllCache_.find(key); post != hllCache_.end()) {
+            double est = post->second.estimate();
+            if (est >= static_cast<double>(kTagHllMinCardinality)) {
+                co_return est;
+            }
+        } else if (val.has_value() && val->size() >= HyperLogLog::SERIALIZED_SIZE) {
+            auto hll = HyperLogLog::deserialize(*val);
+            double est = hll.estimate();
+            if (est >= static_cast<double>(kTagHllMinCardinality)) {
+                hllCache_[key] = std::move(hll);
+                co_return est;
+            }
+            // Sub-threshold stale sketch: do NOT cache it — updateTagHLL
+            // must see a cache miss later so it can seed from the bitmap.
+        }
     }
 
     // Fallback: check roaring bitmap cardinality (exact)

@@ -858,8 +858,11 @@ seastar::future<> TSMWriter::closeDMA() {
     }
 
     if (streamFileOpen_) {
-        co_await streamFile_.close();
+        // Mark closed BEFORE awaiting: if close() itself throws, leaving the
+        // flag set would make a later destructor/abort path double-close (or
+        // leak) the seastar::file handle.
         streamFileOpen_ = false;
+        co_await streamFile_.close();
     }
 
     if (writeError) {

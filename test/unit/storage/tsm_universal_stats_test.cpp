@@ -11,9 +11,12 @@
 
 #include <gtest/gtest.h>
 
+#include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/thread.hh>
+#include <sstream>
 
 namespace fs = std::filesystem;
 using timestar::AggregationMethod;
@@ -297,16 +300,193 @@ TEST_F(TSMUniversalStatsTest, StringAggregationReturnsZero) {
 
 // ==================== Phase 1: Version V3 ====================
 
-TEST_F(TSMUniversalStatsTest, TSMVersionIsV3) {
+TEST_F(TSMUniversalStatsTest, TSMVersionIsV3AndV2StaysReadable) {
     EXPECT_EQ(TSM_VERSION, 3u);
-    // V3 widened the per-series index block count from uint16 to uint32, which
-    // moves every subsequent byte in an index entry — V1/V2 files cannot be
-    // parsed by the V3 reader and are rejected on open rather than misread.
-    EXPECT_EQ(TSM_VERSION_MIN, 3u);
+    // V3 widened the per-series index block count from uint16 to uint32. V2
+    // files MUST remain readable: rejecting them on open would orphan every
+    // pre-upgrade file (data invisible to queries, never compacted or
+    // reclaimed). The reader parses the entry header by file version;
+    // compaction rewrites V2 files as V3.
+    EXPECT_EQ(TSM_VERSION_MIN, 2u);
 }
 
-TEST_F(TSMUniversalStatsTest, IndexEntryHeaderIsSeriesIdTypeAndUint32Count) {
+TEST_F(TSMUniversalStatsTest, IndexEntryHeaderIsSeriesIdTypeAndVersionSizedCount) {
     EXPECT_EQ(TSM_INDEX_ENTRY_HEADER_SIZE, 16u + 1u + 4u);
+    EXPECT_EQ(TSM_INDEX_ENTRY_HEADER_SIZE_V2, 16u + 1u + 2u);
+    EXPECT_EQ(tsmIndexEntryHeaderSize(3), TSM_INDEX_ENTRY_HEADER_SIZE);
+    EXPECT_EQ(tsmIndexEntryHeaderSize(2), TSM_INDEX_ENTRY_HEADER_SIZE_V2);
+}
+
+// A V2-format file must round-trip through the V3 reader: sparse index, full
+// index entry (stats), and raw reads all intact. The V2 file is synthesized
+// from a real V3 file written by the current writer, by narrowing each index
+// entry's block count from u32 to u16 and stamping the version byte — the
+// only two things V3 changed.
+seastar::future<> testV2FileRemainsReadable(std::string v3Path, std::string v2Path) {
+    SeriesId128 seriesId = SeriesId128::fromSeriesKey("test.v2_compat");
+    const std::vector<uint64_t> timestamps = {1000, 2000, 3000, 4000, 5000};
+    const std::vector<double> values = {1.5, 2.5, 3.5, 4.5, 5.5};
+
+    {
+        TSMWriter writer(v3Path);
+        std::vector<uint64_t> ts = timestamps;
+        std::vector<double> vs = values;
+        writer.writeSeries(TSMValueType::Float, seriesId, ts, vs);
+        writer.writeIndex();
+        writer.close();
+    }
+
+    // ---- Transform V3 -> V2 on the raw bytes ----
+    std::string v3Bytes;
+    {
+        std::ifstream in(v3Path, std::ios::binary);
+        std::ostringstream ss;
+        ss << in.rdbuf();
+        v3Bytes = ss.str();
+    }
+    EXPECT_GE(v3Bytes.size(), 16u);
+    if (v3Bytes.size() < 16u) {
+        co_return;
+    }
+    uint64_t indexOffset = 0;
+    std::memcpy(&indexOffset, v3Bytes.data() + v3Bytes.size() - 8, 8);
+    EXPECT_LT(indexOffset, v3Bytes.size());
+    if (indexOffset >= v3Bytes.size()) {
+        co_return;
+    }
+
+    std::string v2Bytes(v3Bytes.begin(), v3Bytes.begin() + static_cast<std::ptrdiff_t>(indexOffset));
+    v2Bytes[4] = 2;  // version byte follows the "TASM" magic
+
+    size_t off = indexOffset;
+    const size_t indexEnd = v3Bytes.size() - 8;
+    while (off < indexEnd) {
+        EXPECT_GE(indexEnd - off, static_cast<size_t>(TSM_INDEX_ENTRY_HEADER_SIZE));
+        if (indexEnd - off < TSM_INDEX_ENTRY_HEADER_SIZE) {
+            co_return;
+        }
+        v2Bytes.append(v3Bytes, off, 17);  // seriesId + type unchanged
+        const uint8_t type = static_cast<uint8_t>(v3Bytes[off + 16]);
+        uint32_t count = 0;
+        std::memcpy(&count, v3Bytes.data() + off + 17, 4);
+        EXPECT_LE(count, 0xFFFFu);
+        const uint16_t count16 = static_cast<uint16_t>(count);
+        v2Bytes.append(reinterpret_cast<const char*>(&count16), 2);
+        off += TSM_INDEX_ENTRY_HEADER_SIZE;
+
+        size_t blockBytes = count * indexBlockBytes(static_cast<TSMValueType>(type), 2);
+        if (static_cast<TSMValueType>(type) == TSMValueType::String) {
+            uint32_t dictBytes = 0;
+            std::memcpy(&dictBytes, v3Bytes.data() + off + blockBytes, 4);
+            blockBytes += 4 + dictBytes;
+        }
+        EXPECT_LE(blockBytes, indexEnd - off);
+        if (blockBytes > indexEnd - off) {
+            co_return;
+        }
+        v2Bytes.append(v3Bytes, off, blockBytes);
+        off += blockBytes;
+    }
+    // Index section start is unchanged; only its interior shrank.
+    v2Bytes.append(reinterpret_cast<const char*>(&indexOffset), 8);
+    {
+        std::ofstream out(v2Path, std::ios::binary | std::ios::trunc);
+        out.write(v2Bytes.data(), static_cast<std::streamsize>(v2Bytes.size()));
+    }
+
+    // ---- Read the V2 file through the current reader ----
+    TSM tsm(v2Path);
+    co_await tsm.open();
+
+    auto* entry = co_await tsm.getFullIndexEntry(seriesId);
+    EXPECT_NE(entry, nullptr);
+    if (entry && entry->indexBlocks.size() == 1u) {
+        EXPECT_EQ(entry->seriesType, TSMValueType::Float);
+        const auto& block = entry->indexBlocks[0];
+        EXPECT_EQ(block.blockCount, 5u);
+        EXPECT_DOUBLE_EQ(block.blockMin, 1.5);
+        EXPECT_DOUBLE_EQ(block.blockMax, 5.5);
+        EXPECT_DOUBLE_EQ(block.blockSum, 17.5);
+    } else if (entry) {
+        ADD_FAILURE() << "expected exactly 1 index block, got " << entry->indexBlocks.size();
+    }
+
+    TSMResult<double> result(0);
+    co_await tsm.readSeries(seriesId, 0, UINT64_MAX, result);
+    std::vector<uint64_t> readTs;
+    std::vector<double> readVals;
+    for (auto& block : result.blocks) {
+        readTs.insert(readTs.end(), block->timestamps.begin(), block->timestamps.end());
+        readVals.insert(readVals.end(), block->values.begin(), block->values.end());
+    }
+    EXPECT_EQ(readTs.size(), timestamps.size());
+    for (size_t i = 0; i < std::min(readTs.size(), timestamps.size()); ++i) {
+        EXPECT_EQ(readTs[i], timestamps[i]);
+        EXPECT_DOUBLE_EQ(readVals[i], values[i]);
+    }
+
+    co_await tsm.close();
+}
+
+TEST_F(TSMUniversalStatsTest, V2FileRemainsReadable) {
+    seastar::async([&] {
+        testV2FileRemainsReadable(getTestFilePath("0_90.tsm"), getTestFilePath("0_91.tsm")).get();
+    }).get();
+}
+
+// A truncated index must FAIL open(), never parse as a prefix. A silently
+// accepted prefix registers the file with only some of its series; a later
+// compaction of that file deletes the source, permanently destroying the
+// unparsed series' data instead of leaving it loudly unavailable.
+seastar::future<> testTruncatedIndexRejectsWholeFile(std::string goodPath, std::string badPath) {
+    SeriesId128 seriesId = SeriesId128::fromSeriesKey("test.trunc_idx");
+    {
+        TSMWriter writer(goodPath);
+        std::vector<uint64_t> ts = {1000, 2000, 3000};
+        std::vector<double> vs = {1.0, 2.0, 3.0};
+        writer.writeSeries(TSMValueType::Float, seriesId, ts, vs);
+        writer.writeIndex();
+        writer.close();
+    }
+
+    std::string bytes;
+    {
+        std::ifstream in(goodPath, std::ios::binary);
+        std::ostringstream ss;
+        ss << in.rdbuf();
+        bytes = ss.str();
+    }
+    // Inject a short garbage tail between the last index entry and the footer:
+    // the parse loop cannot consume it, so bytesLeft() lands in
+    // (0, headerSize) — exactly the truncation shape that used to be accepted.
+    const std::string footer = bytes.substr(bytes.size() - 8);
+    bytes.resize(bytes.size() - 8);
+    bytes.append("\x01\x02\x03\x04\x05", 5);
+    bytes.append(footer);
+    {
+        std::ofstream out(badPath, std::ios::binary | std::ios::trunc);
+        out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    }
+
+    TSM tsm(badPath);
+    bool threw = false;
+    try {
+        co_await tsm.open();
+    } catch (const std::exception& e) {
+        threw = true;
+        EXPECT_NE(std::string(e.what()).find("truncated"), std::string::npos) << e.what();
+    }
+    EXPECT_TRUE(threw) << "a truncated index parsed as a valid prefix — compaction of this file would "
+                          "permanently delete the unparsed series";
+    if (!threw) {
+        co_await tsm.close();
+    }
+}
+
+TEST_F(TSMUniversalStatsTest, TruncatedIndexRejectsWholeFile) {
+    seastar::async([&] {
+        testTruncatedIndexRejectsWholeFile(getTestFilePath("0_92.tsm"), getTestFilePath("0_93.tsm")).get();
+    }).get();
 }
 
 // The reader sanity-checks a block's decoded timestamp COUNT against its

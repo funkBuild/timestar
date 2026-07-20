@@ -15,6 +15,7 @@
 
 #include "proto_converters.hpp"
 #include "proto_write_fast_path.hpp"
+
 #include "timestar.pb.h"
 
 // Real encoders — the same ones parseWriteRequest uses to decode
@@ -166,8 +167,7 @@ TEST(ProtoCompressedWriteGap, CompressedZstdStringsRoundTripWithCount) {
 
     ::timestar_pb::WriteField wf;
     auto encoded = StringEncoder::encode(std::span<const std::string>(values));
-    wf.mutable_string_values()->set_compressed_zstd(reinterpret_cast<const char*>(encoded.data.data()),
-                                                    encoded.size());
+    wf.mutable_string_values()->set_compressed_zstd(reinterpret_cast<const char*>(encoded.data.data()), encoded.size());
     wf.mutable_string_values()->set_count(static_cast<uint32_t>(values.size()));
     (*wp->mutable_fields())["status"] = wf;
 
@@ -194,8 +194,7 @@ TEST(ProtoCompressedWriteGap, CompressedZstdStringsCountFallsBackToTimestampCoun
 
     ::timestar_pb::WriteField wf;
     auto encoded = StringEncoder::encode(std::span<const std::string>(values));
-    wf.mutable_string_values()->set_compressed_zstd(reinterpret_cast<const char*>(encoded.data.data()),
-                                                    encoded.size());
+    wf.mutable_string_values()->set_compressed_zstd(reinterpret_cast<const char*>(encoded.data.data()), encoded.size());
     // deliberately do NOT set count
     (*wp->mutable_fields())["status"] = wf;
 
@@ -228,8 +227,7 @@ TEST(ProtoCompressedWriteGap, CompressedFforInt64ZigZagRoundTrip) {
     ::timestar_pb::WriteRequest req;
     auto* wp = addPoint(req, ts);
     ::timestar_pb::WriteField wf;
-    wf.mutable_int64_values()->set_compressed_ffor(reinterpret_cast<const char*>(encoded.data.data()),
-                                                   encoded.size());
+    wf.mutable_int64_values()->set_compressed_ffor(reinterpret_cast<const char*>(encoded.data.data()), encoded.size());
     (*wp->mutable_fields())["counter"] = wf;
 
     auto bytes = serialize(req);
@@ -427,8 +425,7 @@ TEST(ProtoWriteFastPathCompressed, CompressedZstdStringsRoundTripWithCount) {
 
     ::timestar_pb::WriteField wf;
     auto encoded = StringEncoder::encode(std::span<const std::string>(values));
-    wf.mutable_string_values()->set_compressed_zstd(reinterpret_cast<const char*>(encoded.data.data()),
-                                                    encoded.size());
+    wf.mutable_string_values()->set_compressed_zstd(reinterpret_cast<const char*>(encoded.data.data()), encoded.size());
     wf.mutable_string_values()->set_count(static_cast<uint32_t>(values.size()));
     (*wp->mutable_fields())["status"] = wf;
 
@@ -456,8 +453,7 @@ TEST(ProtoWriteFastPathCompressed, CompressedZstdStringsCountFallsBackToTimestam
 
     ::timestar_pb::WriteField wf;
     auto encoded = StringEncoder::encode(std::span<const std::string>(values));
-    wf.mutable_string_values()->set_compressed_zstd(reinterpret_cast<const char*>(encoded.data.data()),
-                                                    encoded.size());
+    wf.mutable_string_values()->set_compressed_zstd(reinterpret_cast<const char*>(encoded.data.data()), encoded.size());
     // deliberately do NOT set count
     (*wp->mutable_fields())["status"] = wf;
 
@@ -486,8 +482,7 @@ TEST(ProtoWriteFastPathCompressed, CompressedFforInt64ZigZagRoundTrip) {
     ::timestar_pb::WriteRequest req;
     auto* wp = addPoint(req, ts);
     ::timestar_pb::WriteField wf;
-    wf.mutable_int64_values()->set_compressed_ffor(reinterpret_cast<const char*>(encoded.data.data()),
-                                                   encoded.size());
+    wf.mutable_int64_values()->set_compressed_ffor(reinterpret_cast<const char*>(encoded.data.data()), encoded.size());
     (*wp->mutable_fields())["counter"] = wf;
 
     auto bytes = serialize(req);
@@ -684,8 +679,7 @@ TEST(ProtoWriteFastPathCompressed, FastAndGenericParsersAgreeOnCompressedPoint) 
     wp->set_compressed_timestamps(tsEnc.data.data(), tsEnc.size());
     ::timestar_pb::WriteField wf;
     auto enc = FloatEncoder::encode(std::span<const double>(dv));
-    wf.mutable_double_values()->set_compressed_alp(reinterpret_cast<const char*>(enc.data.data()),
-                                                   enc.dataByteSize());
+    wf.mutable_double_values()->set_compressed_alp(reinterpret_cast<const char*>(enc.data.data()), enc.dataByteSize());
     (*wp->mutable_fields())["value"] = wf;
 
     auto bytes = serialize(req);
@@ -1005,4 +999,65 @@ TEST(ProtoWriteGap, TruncatedBytesNeverCrash) {
     // Sanity: at least some prefixes must be rejected as corrupt
     EXPECT_GT(genericThrows, 0u);
     EXPECT_GT(fastThrows, 0u);
+}
+
+// ============================================================================
+// Request-wide decode budgets: the uncompressed branches must be metered too
+// ============================================================================
+
+// The uncompressed `repeated uint64 timestamps` branch used to charge NOTHING
+// against the request decode budgets and had no per-point cap either. Packed
+// varint uint64s cost as little as one wire byte per value but 8 bytes
+// decoded, so a 64 MB body could materialize >1 GB before any store saw it —
+// the bad_alloc class the budgets exist to prevent. An over-cap point must be
+// rejected whole with a recorded error, never truncated or silently admitted.
+TEST(ProtoWriteFastPathBudget, UncompressedTimestampsRespectPerPointCap) {
+    ::timestar_pb::WriteRequest req;
+    auto* wp = req.add_writes();
+    wp->set_measurement("budget_metric");
+    (*wp->mutable_tags())["host"] = "server-01";
+    // Small values -> 1-5 byte varints; count just past the per-point cap.
+    const size_t count = kMaxCompressedPointsPerWritePoint + 1;
+    wp->mutable_timestamps()->Reserve(static_cast<int>(count));
+    for (size_t i = 0; i < count; ++i) {
+        wp->add_timestamps(i);
+    }
+    ::timestar_pb::WriteField wf;
+    wf.mutable_double_values()->add_values(1.0);
+    (*wp->mutable_fields())["v"] = wf;
+
+    auto bytes = serialize(req);
+    auto fast = parseWriteRequestFast(bytes.data(), bytes.size(), 0);
+
+    EXPECT_EQ(fast.failedWrites, 1);
+    EXPECT_TRUE(fast.inserts.empty()) << "an over-cap point must be rejected whole, not partially admitted";
+    ASSERT_FALSE(fast.errors.empty());
+    EXPECT_NE(fast.errors[0].find("max points per write point"), std::string::npos) << fast.errors[0];
+}
+
+// A point under every cap must still pass with the budget charges in place —
+// guards against the charge being wired to the wrong branch or double-counted
+// so tightly that ordinary writes fail.
+TEST(ProtoWriteFastPathBudget, UncompressedTimestampsUnderCapStillAccepted) {
+    ::timestar_pb::WriteRequest req;
+    auto* wp = req.add_writes();
+    wp->set_measurement("budget_metric_ok");
+    const size_t count = 1000;
+    for (size_t i = 0; i < count; ++i) {
+        wp->add_timestamps(1704067200000000000ULL + i);
+    }
+    ::timestar_pb::WriteField wf;
+    for (size_t i = 0; i < count; ++i) {
+        wf.mutable_double_values()->add_values(static_cast<double>(i));
+    }
+    (*wp->mutable_fields())["v"] = wf;
+
+    auto bytes = serialize(req);
+    auto fast = parseWriteRequestFast(bytes.data(), bytes.size(), 0);
+
+    EXPECT_EQ(fast.failedWrites, 0);
+    ASSERT_EQ(fast.inserts.size(), 1u);
+    EXPECT_EQ(fast.inserts[0].timestamps->size(), count);
+    EXPECT_EQ(fast.inserts[0].doubleValues.size(), count);
+    EXPECT_TRUE(fast.errors.empty());
 }

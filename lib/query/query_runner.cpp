@@ -1144,6 +1144,11 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
     }
 
     bool hasNonFloat = false;
+    // The dedup-merge paths below decode blocks through queryTsm<T>, and
+    // decodeBlock<T> throws on a block whose stored type differs from T —
+    // so the merges must dispatch on the series' ACTUAL type, captured here.
+    TSMValueType seriesValueType = TSMValueType::Float;
+    bool seriesTypeKnown = false;
     for (auto& tsmFile : gate2Candidates) {
         auto* indexEntry = co_await tsmFile->getFullIndexEntry(seriesId);
         if (!indexEntry)
@@ -1152,6 +1157,17 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
         // Float and Integer support pushdown; String and Boolean are
         // non-numeric and never aggregate arithmetically.
         if (isNonNumericValueType(indexEntry->seriesType)) {
+            hasNonFloat = true;
+            break;
+        }
+
+        if (!seriesTypeKnown) {
+            seriesValueType = indexEntry->seriesType;
+            seriesTypeKnown = true;
+        } else if (indexEntry->seriesType != seriesValueType) {
+            // Divergent value types across files for one series (corrupt or
+            // mid-repair state) — bail to the typed fallback path rather than
+            // decode with the wrong template type.
             hasNonFloat = true;
             break;
         }
@@ -1177,6 +1193,23 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
 
     if (filesWithData.empty() && !needsFallback) {
         co_return std::nullopt;  // No TSM data and no fallback needed
+    }
+
+    // No TSM index entry carried the type (series may live only in memory
+    // stores, reached via a bloom false positive on the TSM side) — resolve
+    // it from the memory stores so the dedup merge below decodes with the
+    // right type instead of silently matching nothing.
+    if (!seriesTypeKnown) {
+        for (const auto& store : pinnedStores) {
+            if (auto t = store->getSeriesType(seriesId)) {
+                seriesValueType = *t;
+                seriesTypeKnown = true;
+                break;
+            }
+        }
+        if (seriesTypeKnown && isNonNumericValueType(seriesValueType)) {
+            co_return std::nullopt;  // same rule as the TSM-side gate above
+        }
     }
 
     // Check for overlap: sort ranges by minTime and look for any
@@ -1241,6 +1274,29 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
         aggregator.enableFoldToSingleState();  // no collectRaw needed for streaming methods
     }
 
+    // Dedup-merge helper shared by the run merges and the memory-overlap
+    // merge below: reads [lo, hi] through queryTsm dispatched on the series'
+    // ACTUAL value type. decodeBlock<T> throws on a stored-type mismatch, so
+    // an Integer series must never be read as <double> — that failure mode
+    // surfaced whenever an integer series had a rewritten (duplicate) point
+    // across files. Awaited inline only; captures reference this frame.
+    auto dedupMergeInto = [&](uint64_t lo, uint64_t hi) -> seastar::future<> {
+        if (seriesValueType == TSMValueType::Integer) {
+            auto merged = co_await queryTsm<int64_t>(std::string{}, seriesId, lo, hi);
+            if (!merged.timestamps.empty()) {
+                std::vector<double> vals(merged.values.begin(), merged.values.end());
+                aggregator.addPoints(merged.timestamps, vals);
+            }
+        } else {
+            auto merged = co_await queryTsm<double>(std::string{}, seriesId, lo, hi);
+            if (!merged.timestamps.empty()) {
+                aggregator.addPoints(merged.timestamps, merged.values);
+            }
+        }
+        // `merged` is released here, before the next range is read, so
+        // peak memory is the largest single range rather than the series.
+    };
+
     // Default path: all aggregation methods other than LATEST/FIRST — read all blocks.
     // Pass per-shard I/O semaphore to bound concurrent DMA reads across all
     // series being queried on this shard (prevents reactor stalls at scale).
@@ -1268,14 +1324,15 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
             // files; it also consults memory stores, but memory data starts at
             // fallbackStartTime == tsmEndTime + 1 and runs never extend past
             // tsmEndTime, so no memory point can be double-counted here.
+            //
+            // BOTH bounds must be clamped to the query range: runLo/runHi are
+            // raw block bounds, and the earliest block of a run can straddle
+            // startTime — an unclamped merge would fold points from before the
+            // query into the aggregate (the aggregator does no range filtering).
+            const uint64_t mergeLo = std::max(runLo, startTime);
             const uint64_t mergeHi = std::min(runHi, tsmEndTime);
-            if (mergeHi >= runLo) {
-                auto merged = co_await queryTsm<double>(std::string{}, seriesId, runLo, mergeHi);
-                if (!merged.timestamps.empty()) {
-                    aggregator.addPoints(merged.timestamps, merged.values);
-                }
-                // `merged` is released here, before the next run is read, so peak
-                // memory is the largest single run rather than the whole series.
+            if (mergeHi >= mergeLo) {
+                co_await dedupMergeInto(mergeLo, mergeHi);
             }
 
             cursor = (runHi == std::numeric_limits<uint64_t>::max()) ? runHi : runHi + 1;
@@ -1299,10 +1356,7 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
         // twice (or keep the stale value), so this range goes through the dedup
         // merge, which resolves newest-write-first. Memory stores are bounded by
         // their rollover threshold, so this materialises a bounded amount.
-        auto merged = co_await queryTsm<double>(std::string{}, seriesId, fallbackStartTime, endTime);
-        if (!merged.timestamps.empty()) {
-            aggregator.addPoints(merged.timestamps, merged.values);
-        }
+        co_await dedupMergeInto(fallbackStartTime, endTime);
     } else if (needsFallback) {
         aggregateMemoryStores(pinnedStores, seriesId, fallbackStartTime, endTime, aggregator);
     }

@@ -205,6 +205,16 @@ inline constexpr size_t kMaxCompressedPointsPerWritePoint = 10'000'000;
 // reaches a store.
 inline constexpr size_t kMaxDecodedPointsPerWriteRequest = 50'000'000;
 
+// Ceiling on the TOTAL decoded BYTES one write request may materialize —
+// timestamps, numeric values, and decompressed string payloads together. The
+// points budget alone does not bound memory: packed varint timestamps cost as
+// little as one wire byte per point but 8 bytes decoded (a 64 MB body can
+// carry ~67M timestamps ≈ 536 MB), and compressed_zstd string fields allow up
+// to 256 MB decompressed per field while contributing almost nothing to the
+// point count. This is the actual memory bound for `result.inserts` on a
+// memory-constrained shard; requests that need more must be split.
+inline constexpr size_t kMaxDecodedBytesPerWriteRequest = 256 * 1024 * 1024;
+
 // Decode bound to pass to IntegerEncoder::decode for a compressed payload of
 // `bytes` bytes.  Structurally, one FFOR block consumes at least 16 bytes
 // (2-word header) and emits at most 1024 values, so a payload can never

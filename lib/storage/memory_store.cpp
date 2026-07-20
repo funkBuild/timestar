@@ -391,6 +391,14 @@ seastar::future<> MemoryStore::initFromWAL(std::string filename) {
 }
 
 bool MemoryStore::isFull() const {
+    // Resident bytes are checked independently of the WAL: the WAL estimates
+    // below are all about on-disk size; neither sees per-series overhead or
+    // uncompressed string payloads, so a high-cardinality or string-heavy
+    // store can hold hundreds of MB while they still read as near-zero.
+    if (residentBytesEstimate >= residentBytesThreshold()) {
+        return true;
+    }
+
     if (!wal) {
         return false;
     }
@@ -400,11 +408,7 @@ bool MemoryStore::isFull() const {
     // so relying only on actual size may never trigger rollover.
     size_t walSize = wal->getCurrentSize();
     size_t effectiveSize = std::max(walSize, estimatedAccumulatedSize);
-    // ...and roll over on RESIDENT bytes too. The two estimates above are all
-    // about on-disk size; neither sees per-series overhead or uncompressed string
-    // payloads, so a high-cardinality or string-heavy store can hold hundreds of
-    // MB while they still read as near-zero.
-    return effectiveSize >= walSizeThreshold() || residentBytesEstimate >= residentBytesThreshold();
+    return effectiveSize >= walSizeThreshold();
 }
 
 template <class T>
@@ -422,12 +426,14 @@ void MemoryStore::insertMemory(TimeStarInsert<T>&& insertRequest) {
             pointBytes += v.capacity();
         }
     }
-    const bool isNewSeries = (series.find(seriesId) == series.end());
-    residentBytesEstimate += pointBytes + (isNewSeries ? PER_SERIES_OVERHEAD_BYTES : 0);
-
     // robin_map's operator[] returns a mutable reference, creating entry if needed.
     // Default-constructed variant will be InMemorySeries<double> (first alternative).
+    // Newness is derived from the size delta — no separate find() probe on the
+    // hottest path in the system.
+    const size_t sizeBefore = series.size();
     auto& variantSeries = series[seriesId];
+    const bool isNewSeries = (series.size() != sizeBefore);
+    residentBytesEstimate += pointBytes + (isNewSeries ? PER_SERIES_OVERHEAD_BYTES : 0);
 
     // Single variant access: std::get_if returns a pointer if the type matches, nullptr otherwise.
     // This replaces the previous 2-3 separate variant accesses
@@ -459,12 +465,23 @@ bool MemoryStore::wouldExceedThreshold(TimeStarInsert<T>& insertRequest) {
 
 template <class T>
 bool MemoryStore::wouldExceedThreshold(TimeStarInsert<T>& insertRequest, size_t& outEstimatedSize) {
+    outEstimatedSize = wal ? wal->estimateInsertSize(insertRequest) : 0;
+
+    // Roll over on RESIDENT bytes first — deliberately not gated on the WAL.
+    // The WAL estimates below model compressed on-disk size, which wildly
+    // under-counts RAM for high-cardinality or string-heavy data (see
+    // residentBytesEstimate). The projection uses only the fixed point
+    // width — string payloads are charged as they land in insertMemory(),
+    // so at worst rollover triggers one insert late.
+    const size_t incomingResident = insertRequest.getTimestamps().size() * (sizeof(uint64_t) + sizeof(T));
+    if ((residentBytesEstimate + incomingResident) >= residentBytesThreshold()) {
+        return true;
+    }
+
     if (!wal) {
-        outEstimatedSize = 0;
         return false;
     }
 
-    outEstimatedSize = wal->estimateInsertSize(insertRequest);
     // Use the larger of actual WAL size and cumulative estimated size for
     // the base, ensuring rollover triggers even when compression is highly
     // effective and actual WAL size grows slowly.
@@ -536,6 +553,19 @@ seastar::future<bool> MemoryStore::insertBatch(std::vector<TimeStarInsert<T>>& i
     if (wal) {
         size_t effectiveSize = std::max(wal->getCurrentSize(), estimatedAccumulatedSize);
         needsRollover = (effectiveSize + batchEstimate) >= walSizeThreshold();
+    }
+    if (!needsRollover) {
+        // Roll over on RESIDENT bytes too — not gated on the WAL. The WAL
+        // estimate models compressed on-disk size and under-counts RAM badly
+        // for high-cardinality or string-heavy batches (see
+        // residentBytesEstimate). Fixed point width only; string payloads are
+        // charged as they land in insertMemory().
+        size_t batchPoints = 0;
+        for (const auto& insertRequest : insertRequests) {
+            batchPoints += insertRequest.getTimestamps().size();
+        }
+        const size_t batchResident = batchPoints * (sizeof(uint64_t) + sizeof(T));
+        needsRollover = (residentBytesEstimate + batchResident) >= residentBytesThreshold();
     }
     if (needsRollover) {
         // Don't insert - signal that rollover is needed

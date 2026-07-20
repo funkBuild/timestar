@@ -326,12 +326,26 @@ seastar::future<> WALFileManager::rolloverMemoryStore() {
     // Blocking the rollover here is what makes ingest feel the backlog instead
     // of accumulating it in memory.
     if (memoryStores.size() >= kMaxUnconvertedMemoryStores) {
-        timestar::wal_log.info("Shard {}: {} memory stores awaiting conversion, throttling rollover", shardId,
-                               memoryStores.size());
-        auto convUnits = co_await seastar::get_units(_conversionSemaphore, 1);
-        // Released immediately: holding it would deadlock the very conversion we
-        // are waiting on. Acquiring it at all is the wait -- it means the
-        // in-flight conversion finished and the backlog has drained by one.
+        timestar::wal_log.info(
+            "Shard {}: {} memory stores awaiting conversion (including the active store), "
+            "throttling rollover",
+            shardId, memoryStores.size());
+        // Loop, don't single-shot: acquiring the conversion semaphore proves a
+        // conversion SLOT is free, not that the backlog drained — during a
+        // failed conversion's retry backoff the semaphore is free while every
+        // store is still resident, so one acquire used to make the throttle a
+        // no-op for the whole failure window. Units are released immediately
+        // each round (holding them would deadlock the very conversion being
+        // waited on); the brief sleep stops the loop from spinning on a free
+        // semaphore while the backlog sits in retry backoff.
+        while (memoryStores.size() >= kMaxUnconvertedMemoryStores) {
+            {
+                auto convUnits = co_await seastar::get_units(_conversionSemaphore, 1);
+            }
+            if (memoryStores.size() >= kMaxUnconvertedMemoryStores) {
+                co_await seastar::sleep(std::chrono::milliseconds(100));
+            }
+        }
     }
 
     auto store = seastar::make_shared<MemoryStore>(++currentWalSequenceNumber);

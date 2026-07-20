@@ -43,6 +43,7 @@
 #include <gtest/gtest.h>
 
 #include <fstream>
+#include <seastar/core/sleep.hh>
 #include <seastar/core/thread.hh>
 #include <sstream>
 #include <string>
@@ -105,6 +106,23 @@ std::optional<double> singleValue(HttpQueryHandler& handler, const std::string& 
         }
     }
     return std::nullopt;
+}
+
+// Roll all memory stores over and wait for the async background conversion
+// to land at least `minFiles` TSM files, so subsequent queries exercise the
+// TSM overlap-run machinery rather than the memory store.
+void flushToTsm(seastar::sharded<Engine>& eng, size_t minFiles) {
+    eng.invoke_on_all([](Engine& engine) { return engine.rolloverMemoryStore(); }).get();
+    for (int attempt = 0; attempt < 100; ++attempt) {
+        size_t files =
+            eng.map_reduce0([](Engine& engine) { return engine.getTSMFileCount(); }, size_t{0}, std::plus<size_t>())
+                .get();
+        if (files >= minFiles) {
+            return;
+        }
+        seastar::sleep(std::chrono::milliseconds(100)).get();
+    }
+    FAIL() << "TSM conversion did not produce " << minFiles << " file(s) within 10s";
 }
 
 std::string readSourceFile(const std::string& relativePath) {
@@ -203,6 +221,118 @@ TEST_F(QueryOverlapCompletenessTest, QuerySpanningRewrittenPointsReturnsDedupedN
         auto windowSum = singleValue(queryHandler, "sum:ovl(v){}", kBase + 15000 * kMs, kBase + 19000 * kMs, "365d");
         ASSERT_TRUE(windowSum.has_value());
         EXPECT_DOUBLE_EQ(*windowSum, 10.0) << "rewritten window should be 5 points x 2.0";
+    })
+        .join()
+        .get();
+}
+
+// The overlap-run dedup merge must respect the query's startTime. Run bounds
+// come from RAW block time ranges, so the earliest block of a run can straddle
+// startTime; the merge used to read from the run's start and fold points from
+// BEFORE the query into the aggregate (the aggregator does no range
+// filtering) — a silent wrong answer that only appeared when the query began
+// mid-data. Every other test here starts before the data, which is exactly why
+// this one must not.
+TEST_F(QueryOverlapCompletenessTest, QueryStartingMidRunDoesNotFoldEarlierPoints) {
+    seastar::thread([] {
+        ScopedShardedEngine eng;
+        eng.start();
+
+        HttpWriteHandler writeHandler(&eng.eng);
+        HttpQueryHandler queryHandler(&eng.eng);
+
+        auto writeRange = [&](int from, int count, const char* value) {
+            std::string ts = "[";
+            std::string vs = "[";
+            for (int i = from; i < from + count; ++i) {
+                if (i > from) {
+                    ts += ",";
+                    vs += ",";
+                }
+                ts += std::to_string(kBase + static_cast<uint64_t>(i) * 1000 * kMs);
+                vs += value;
+            }
+            ts += "]";
+            vs += "]";
+            writeOk(writeHandler, R"({"measurement":"midrun","tags":{"d":"a"},"fields":{"v":)" + vs +
+                                      R"(},"timestamps":)" + ts + "}");
+        };
+
+        // File 1: points 0..19 at 1.0. File 2: points 5..14 rewritten to 2.0.
+        // The two files' block ranges overlap, forming one dedup run [0s,19s].
+        writeRange(0, 20, "1.0");
+        flushToTsm(eng.eng, 1);
+        writeRange(5, 10, "2.0");
+        flushToTsm(eng.eng, 2);
+
+        // Query starts at point 10 — INSIDE the overlap run. Only points
+        // 10..19 are in range: 10..14 are rewritten (2.0), 15..19 are 1.0.
+        const uint64_t start = kBase + 10000 * kMs;
+        const uint64_t end = kBase + 30000 * kMs;
+
+        auto count = singleValue(queryHandler, "count:midrun(v){}", start, end, "365d");
+        ASSERT_TRUE(count.has_value());
+        EXPECT_DOUBLE_EQ(*count, 10.0) << "points from before startTime leaked into the aggregate";
+
+        auto sum = singleValue(queryHandler, "sum:midrun(v){}", start, end, "365d");
+        ASSERT_TRUE(sum.has_value());
+        EXPECT_DOUBLE_EQ(*sum, 15.0) << "expected 5x2.0 + 5x1.0; run merge must clamp to startTime";
+    })
+        .join()
+        .get();
+}
+
+// Integer series must survive the dedup merges. Both merge paths used to
+// hard-code queryTsm<double>, and decodeBlock<double> THROWS on an Integer
+// block — so an integer series with any rewritten (duplicate) point across
+// TSM files failed the whole query until compaction happened to merge the
+// files, and an int series with a rewrite still in the memory store could
+// silently drop its memory points.
+TEST_F(QueryOverlapCompletenessTest, IntegerSeriesWithRewrittenPointsAggregatesCorrectly) {
+    seastar::thread([] {
+        ScopedShardedEngine eng;
+        eng.start();
+
+        HttpWriteHandler writeHandler(&eng.eng);
+        HttpQueryHandler queryHandler(&eng.eng);
+
+        auto writeRange = [&](int from, int count, const char* value) {
+            std::string ts = "[";
+            std::string vs = "[";
+            for (int i = from; i < from + count; ++i) {
+                if (i > from) {
+                    ts += ",";
+                    vs += ",";
+                }
+                ts += std::to_string(kBase + static_cast<uint64_t>(i) * 1000 * kMs);
+                vs += value;  // no decimal point -> detected as Integer
+            }
+            ts += "]";
+            vs += "]";
+            writeOk(writeHandler, R"({"measurement":"intovl","tags":{"d":"a"},"fields":{"v":)" + vs +
+                                      R"(},"timestamps":)" + ts + "}");
+        };
+
+        // File 1: 20 int points at 1. File 2: last 5 rewritten to 2.
+        writeRange(0, 20, "1");
+        flushToTsm(eng.eng, 1);
+        writeRange(15, 5, "2");
+        flushToTsm(eng.eng, 2);
+        // And one more rewrite left UNFLUSHED, so the TSM-vs-memory dedup
+        // merge path runs for an integer series too.
+        writeRange(19, 1, "7");
+
+        const uint64_t start = kBase - 10000 * kMs;
+        const uint64_t end = kBase + 60000 * kMs;
+
+        auto count = singleValue(queryHandler, "count:intovl(v){}", start, end, "365d");
+        ASSERT_TRUE(count.has_value()) << "integer series with rewritten points must not fail the query";
+        EXPECT_DOUBLE_EQ(*count, 20.0) << "duplicates not deduped, or memory points dropped";
+
+        // 15x1 + 4x2 + 1x7 = 30 (newest write wins at every timestamp).
+        auto sum = singleValue(queryHandler, "sum:intovl(v){}", start, end, "365d");
+        ASSERT_TRUE(sum.has_value());
+        EXPECT_DOUBLE_EQ(*sum, 30.0) << "last-write-wins broken for integer dedup merge";
     })
         .join()
         .get();

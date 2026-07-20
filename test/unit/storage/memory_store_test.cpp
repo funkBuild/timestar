@@ -168,6 +168,36 @@ TEST_F(MemoryStoreTest, EmptyStore) {
     EXPECT_FALSE(store->isEmpty());
 }
 
+TEST_F(MemoryStoreTest, ResidentBytesTriggerRollover) {
+    // Rollover must fire on RESIDENT memory growth even when the WAL-byte
+    // estimate stays tiny (high-cardinality / string-heavy data): the WAL
+    // estimate models compressed on-disk bytes and under-counts string
+    // payloads ~1000x. Regression test for the resident estimate being
+    // maintained but never consulted by the rollover decision.
+    const size_t threshold = MemoryStore::residentBytesThreshold();
+    const std::string payload(1 << 20, 'x');  // 1 MB per value
+
+    uint64_t ts = 1000;
+    int seriesNum = 0;
+    while (store->getResidentBytesEstimate() < threshold) {
+        TimeStarInsert<std::string> ins("resident", "s" + std::to_string(seriesNum++));
+        ins.addValue(ts++, payload);
+        store->insertMemory(std::move(ins));
+    }
+
+    EXPECT_TRUE(store->isFull());
+
+    // Both rollover entry points (single insert and batch) must see it.
+    TimeStarInsert<std::string> next("resident", "next");
+    next.addValue(ts, "v");
+    EXPECT_TRUE(store->wouldExceedThreshold(next));
+
+    std::vector<TimeStarInsert<std::string>> batch;
+    batch.emplace_back("resident", "batch");
+    batch.back().addValue(ts + 1, "v");
+    EXPECT_TRUE(store->insertBatch(batch).get());
+}
+
 TEST_F(MemoryStoreTest, SeriesKeyFormat) {
     // Test with tags
     TimeStarInsert<double> insert("weather", "temperature");

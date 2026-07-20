@@ -1,7 +1,7 @@
 # TSM File Format Specification
 
 **Version**: 3 (TSM_VERSION)
-**Minimum readable**: 3 (TSM_VERSION_MIN)
+**Minimum readable**: 2 (TSM_VERSION_MIN)
 
 ## Overview
 
@@ -33,14 +33,14 @@ All multi-byte integers are little-endian.
 | 0      | 4    | char[4] | `"TASM"` | Magic number (ASCII) |
 | 4      | 1    | uint8   | `3`      | Format version       |
 
-Files with version outside `[TSM_VERSION_MIN, TSM_VERSION]` (currently `[3, 3]`) are rejected on open.
+Files with version outside `[TSM_VERSION_MIN, TSM_VERSION]` (currently `[2, 3]`) are rejected on open.
 
 V3 widened the per-series index block count from uint16 to uint32, shifting every
-byte after offset 17 in an index entry. V1/V2 files cannot be parsed by the V3
-reader and are rejected on open rather than silently misread. Under uint16 a
-single series was capped at 65,535 blocks per file, which high-volume
-single-series ingest reaches; compaction then threw at `writeIndex()` time and
-the tier could never merge again.
+byte after offset 17 in an index entry. Under uint16 a single series was capped
+at 65,535 blocks per file, which high-volume single-series ingest reaches;
+compaction then threw at `writeIndex()` time and the tier could never merge
+again. The reader parses the entry header by file version (u16 count for V2,
+u32 for V3), so V2 files stay readable; compaction rewrites them as V3.
 
 ## Data Blocks
 
@@ -189,18 +189,16 @@ series in the same files are unaffected.
 
 ### V1/V2 Compatibility
 
-**V1 and V2 files are NOT readable by a V3 reader.** V3 widened the per-series index
-block count from uint16 to uint32, which shifts every byte after offset 17 of an index
-entry, so an older file cannot be parsed. `TSM_VERSION_MIN` is 3 and `TSM::open()`
-rejects anything below it rather than misreading it.
+**V2 files remain readable.** The only V3 change is the width of the per-series
+index block count (uint16 → uint32); the reader selects the entry-header size and
+count width by file version (`tsmIndexEntryHeaderSize()`), and all block-stat
+layouts are unchanged from V2. New files are always written as V3, and compaction
+naturally rewrites V2 inputs as V3 output, so V2 files age out of a live system.
+`TSM_VERSION_MIN` is 2; V1 files (pre-universal-stats) are rejected on open.
 
 Note that rejection happens per file, and `TSMFileManager::openTsmFile()` logs and skips
-files that fail to open — so on an upgrade, pre-V3 files are silently dropped from query
-results rather than surfacing an error. There is no migration tool.
-
-`indexBlockBytes(type, version)` retains a `version < 2` branch and the reader retains
-several `fileVersion >= 2` tests; with the accepted range at [3, 3] these are vestigial
-and always take the modern path.
+files that fail to open — so a V1 file's data is unavailable to queries until it is
+re-ingested. There is no migration tool.
 
 ## Footer (last 8 bytes)
 

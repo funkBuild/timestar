@@ -145,11 +145,19 @@ struct CacheSizeEstimator<::TSMIndexEntry> {
 // V2: All types have block stats (Float=80, Integer=72, Boolean=40, String=32).
 // V3: per-series index block count widened from uint16 to uint32.
 static constexpr uint8_t TSM_VERSION = 3;
-static constexpr uint8_t TSM_VERSION_MIN = 3;  // oldest version we can read
+// Oldest version we can READ. Dropping V2 readability would orphan every
+// pre-V3 file on upgrade (data invisible to queries, file never compacted or
+// reclaimed) — V2 files stay readable and are rewritten as V3 by compaction.
+static constexpr uint8_t TSM_VERSION_MIN = 2;
 
-// Fixed part of an index entry: SeriesId128 (16) + type (1) + block count (4).
-// Blocks and the optional string dictionary follow.
+// Fixed part of an index entry: SeriesId128 (16) + type (1) + block count.
+// Blocks and the optional string dictionary follow. V3 widened the block
+// count from uint16 to uint32; readers must size and parse by file version.
 static constexpr uint32_t TSM_INDEX_ENTRY_HEADER_SIZE = 16 + 1 + 4;
+static constexpr uint32_t TSM_INDEX_ENTRY_HEADER_SIZE_V2 = 16 + 1 + 2;
+inline uint32_t tsmIndexEntryHeaderSize(uint8_t fileVersion) {
+    return fileVersion >= 3 ? TSM_INDEX_ENTRY_HEADER_SIZE : TSM_INDEX_ENTRY_HEADER_SIZE_V2;
+}
 
 // Per-type index block byte size for V2 files.
 // V1 files: Float=80, all others=28 (no stats).

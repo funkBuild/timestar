@@ -465,6 +465,109 @@ seastar::future<SeriesCompactionData<T>> TSMCompactor::processSeriesForCompactio
             if (block && !block->timestamps.empty()) {
                 processBlock(block.get());
             }
+        } else if (groupEnd - groupStart > MAX_BUFFERED_GROUP_BLOCKS) {
+            // LAZY MERGE for oversized groups: N files that all span the same
+            // time range chain into ONE group that can be the entire series,
+            // and the bulk path below decodes every block of it simultaneously
+            // (~12x on-disk size) — the original compaction bad_alloc for
+            // backfill/rewrite inputs. Instead, merge over per-file BLOCK
+            // CURSORS: blockMeta is time-sorted and each file's blocks are
+            // internally disjoint and ascending, so each file is a sorted
+            // stream and only its CURRENT block needs to be decoded. This
+            // reproduces the bulk mergers' semantics exactly — one point per
+            // distinct timestamp, the newest file (highest rank) wins
+            // cross-file duplicates, the last copy wins within a file — while
+            // holding O(source files) decoded blocks instead of O(group).
+            struct LazyCursor {
+                std::vector<const BlockMetadata<T>*> metas;  // this file's blocks, ascending
+                size_t metaIdx = 0;
+                std::unique_ptr<TSMBlock<T>> block;  // current decoded block (null = exhausted)
+                size_t pointIdx = 0;
+                uint64_t fileRank = 0;
+                uint64_t currentTs() const { return block->timestamps[pointIdx]; }
+            };
+            std::vector<LazyCursor> cursors;
+            for (size_t i = groupStart; i < groupEnd; ++i) {
+                const auto& meta = blockMeta[i];
+                auto it = std::find_if(cursors.begin(), cursors.end(), [&](const LazyCursor& c) {
+                    return c.metas.front()->sourceFile == meta.sourceFile;
+                });
+                if (it == cursors.end()) {
+                    cursors.emplace_back();
+                    it = cursors.end() - 1;
+                    it->fileRank = meta.fileRank;
+                }
+                it->metas.push_back(&meta);
+            }
+
+            // Decode the next non-empty block when the current one is used up.
+            auto refill = [&](LazyCursor& c) -> seastar::future<> {
+                while (!c.block && c.metaIdx < c.metas.size()) {
+                    auto b = co_await decodeBlockOf(*c.metas[c.metaIdx++]);
+                    if (b && !b->timestamps.empty()) {
+                        c.block = std::move(b);
+                        c.pointIdx = 0;
+                    }
+                }
+            };
+            auto advanceCursor = [&](LazyCursor& c) -> seastar::future<> {
+                if (c.block && ++c.pointIdx >= c.block->timestamps.size()) {
+                    c.block.reset();
+                    c.pointIdx = 0;
+                    co_await refill(c);
+                }
+            };
+
+            for (auto& c : cursors) {
+                co_await refill(c);
+            }
+
+            while (true) {
+                // Winner: smallest current timestamp; newest file on a tie.
+                uint64_t minTs = std::numeric_limits<uint64_t>::max();
+                LazyCursor* winner = nullptr;
+                for (auto& c : cursors) {
+                    if (!c.block) {
+                        continue;
+                    }
+                    const uint64_t ts = c.currentTs();
+                    if (winner == nullptr || ts < minTs || (ts == minTs && c.fileRank > winner->fileRank)) {
+                        minTs = ts;
+                        winner = &c;
+                    }
+                }
+                if (winner == nullptr) {
+                    break;
+                }
+
+                // Last copy at minTs within the winning file (legacy intra-file
+                // duplicates), mirroring BulkMergeContext::takeLastAtCurrentTs.
+                T value = winner->block->values[winner->pointIdx];
+                co_await advanceCursor(*winner);
+                while (winner->block && winner->currentTs() == minTs) {
+                    value = winner->block->values[winner->pointIdx];
+                    co_await advanceCursor(*winner);
+                }
+                // Losing sources' duplicates at minTs are consumed (LWW).
+                for (auto& c : cursors) {
+                    if (&c == winner) {
+                        continue;
+                    }
+                    while (c.block && c.currentTs() == minTs) {
+                        co_await advanceCursor(c);
+                    }
+                }
+
+                processPoint(minTs, value);
+
+                // Spill INSIDE the merge: for this path the group itself is
+                // huge, so waiting for the group boundary would buffer the
+                // whole merged output. spill() retains the final point, so
+                // last-write-wins survives the chunk seam.
+                if (chunkedEmit && bufferedSinceSpill >= MERGE_CHUNK_POINTS) {
+                    co_await spill();
+                }
+            }
         } else {
             // Overlapping run: decode just this group and merge it. Blocks are
             // grouped by source file because the mergers dedup by file rank

@@ -307,8 +307,13 @@ private:
     // already are. Left undivided this was 1M entries PER SHARD (~40 B/entry,
     // and two generations are live), so a 16-shard box held 32M entries / 1.28 GB
     // for this one set while its three sibling caches were correctly scaled down.
+    //
+    // NOTE this re-interprets the config value as per-SERVER, not per-shard.
+    // Floored so a small configured value on a many-shard box cannot
+    // degenerate the two-generation cache to near-zero entries, where every
+    // insert would swap generations and re-run the kvExists metadata probe.
     static size_t defaultMaxSeriesCacheSize() {
-        return timestar::config().index.series_cache_size / std::max(1u, seastar::smp::count);
+        return std::max<size_t>(1024, timestar::config().index.series_cache_size / std::max(1u, seastar::smp::count));
     }
     static constexpr size_t EVICTION_BATCH_SIZE = 256;
     size_t maxSeriesCacheSize_ = defaultMaxSeriesCacheSize();
@@ -400,10 +405,15 @@ private:
     // exact bitmap reaches kTagHllMinCardinality: each sketch is 16 KB, so one
     // per distinct value is ruinous for a high-cardinality tag, and below the
     // threshold the exact bitmap is both cheaper and more accurate.
-    // `seedFrom`, when given, back-fills a newly created sketch from that bitmap.
+    // `seedBitmapKey` names the tag value's postings bitmap in bitmapCache_;
+    // when the sketch is not yet in hllCache_, the bitmap's ids are merged in
+    // (idempotent) so the sketch never under-counts ids that predate it. A
+    // KEY is passed rather than a Roaring* because this coroutine suspends
+    // before seeding — a raw pointer into bitmapCache_ (a robin_map) would
+    // dangle across the suspension (rehash/trim). The caller must co_await
+    // this call before mutating the key buffer.
     seastar::future<> updateTagHLL(const std::string& measurement, const std::string& tagKey,
-                                   const std::string& tagValue, uint32_t localId,
-                                   const roaring::Roaring* seedFrom = nullptr);
+                                   const std::string& tagValue, uint32_t localId, const std::string& seedBitmapKey);
     void flushDirtyHLLs(IndexWriteBatch& batch);
     seastar::future<> flushDirtyMeasurementBlooms(IndexWriteBatch& batch);
     // Step 7: Trim HLL cache after flush — evict non-dirty entries when too large

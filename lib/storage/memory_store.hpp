@@ -139,8 +139,6 @@ private:
 public:
     size_t getResidentBytesEstimate() const { return residentBytesEstimate; }
 
-private:
-public:
     // Threshold for WAL rollover decisions (based on estimated sizes).
     // Read from timestar::config().storage.wal_size_threshold at runtime.
     static size_t walSizeThreshold() { return timestar::config().storage.wal_size_threshold; }

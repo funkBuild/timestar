@@ -410,8 +410,9 @@ seastar::future<> TSM::readSparseIndex() {
     // Require a whole fixed header before touching it: SeriesId128::fromBytes
     // takes a raw pointer and does NOT bounds-check (unlike Slice::read), so a
     // few trailing bytes here would read past the buffer before the following
-    // read<uint32_t>() could throw.
-    while (indexSlice.bytesLeft() >= TSM_INDEX_ENTRY_HEADER_SIZE) {
+    // block-count read could throw.
+    const uint32_t entryHeaderSize = tsmIndexEntryHeaderSize(fileVersion);
+    while (indexSlice.bytesLeft() >= entryHeaderSize) {
         uint64_t entryStartOffset = indexOffset + indexSlice.offset;
 
         // Read series ID (16 bytes) — zero-copy from index buffer
@@ -419,9 +420,9 @@ seastar::future<> TSM::readSparseIndex() {
             SeriesId128::fromBytes(reinterpret_cast<const char*>(indexSlice.data + indexSlice.offset), 16);
         indexSlice.offset += 16;
 
-        // Read type (1 byte) and block count (4 bytes)
+        // Read type (1 byte) and block count (u32 in V3, u16 before)
         uint8_t type = indexSlice.read<uint8_t>();
-        uint32_t blockCount = indexSlice.read<uint32_t>();
+        uint32_t blockCount = (fileVersion >= 3) ? indexSlice.read<uint32_t>() : indexSlice.read<uint16_t>();
 
         // Block size depends on type and file version
         if (type > static_cast<uint8_t>(TSMValueType::Integer)) {
@@ -493,28 +494,34 @@ seastar::future<> TSM::readSparseIndex() {
         // Phase 3: Skip over string dictionary if present (V2 String series)
         uint32_t dictBytes = 0;
         if (seriesType == TSMValueType::String && fileVersion >= 2) {
-            if (indexSlice.offset + 4 <= indexSlice.length_) {
-                std::memcpy(&dictBytes, indexSlice.data + indexSlice.offset, 4);
-                if (dictBytes > 16 * 1024 * 1024) {
-                    throw std::runtime_error("Corrupt TSM: dictionary too large");
-                }
-                if (indexSlice.offset + 4 + dictBytes > indexSlice.length_) {
-                    // Dictionary extends past index end — can't find next entry.
-                    timestar::tsm_log.warn(
-                        "TSM sparse index: corrupt dictionary size {} at offset {} (index size {}), "
-                        "stopping parse after {} entries",
-                        dictBytes, indexSlice.offset, indexSlice.length_, sparseIndex.size());
-                    break;
-                }
-                indexSlice.offset += 4 + dictBytes;
+            if (indexSlice.offset + 4 > indexSlice.length_) {
+                // No room for the dictionary length — the entry is truncated.
+                // Must THROW, not tolerate: a partially parsed index registers
+                // the file with only a prefix of its series, and a later
+                // compaction of that file deletes the source — permanently
+                // destroying the unparsed series instead of leaving them
+                // loudly unavailable.
+                throw std::runtime_error("TSM index corrupt: string entry truncated before dictionary length");
             }
+            std::memcpy(&dictBytes, indexSlice.data + indexSlice.offset, 4);
+            if (dictBytes > 16 * 1024 * 1024) {
+                throw std::runtime_error("Corrupt TSM: dictionary too large");
+            }
+            if (indexSlice.offset + 4 + dictBytes > indexSlice.length_) {
+                // Dictionary extends past index end — same rule as above:
+                // reject the whole file rather than silently keeping a prefix.
+                throw std::runtime_error("TSM index corrupt: dictionary size " + std::to_string(dictBytes) +
+                                         " at offset " + std::to_string(indexSlice.offset) +
+                                         " extends past index end (" + std::to_string(indexSlice.length_) + ")");
+            }
+            indexSlice.offset += 4 + dictBytes;
         }
 
         // Calculate total entry size (header + blocks + optional dictionary).
         // entrySize is uint64 so it cannot cap the widened uint32 blockCount;
         // blockBytes is already bounded by the bytesLeft() check above, i.e. by
         // the real index size, so no separate overflow guard is needed.
-        uint64_t entrySize = TSM_INDEX_ENTRY_HEADER_SIZE + static_cast<uint64_t>(blockBytes);
+        uint64_t entrySize = entryHeaderSize + static_cast<uint64_t>(blockBytes);
         if (seriesType == TSMValueType::String && fileVersion >= 2) {
             entrySize += 4 + dictBytes;
         }
@@ -535,6 +542,18 @@ seastar::future<> TSM::readSparseIndex() {
 
         // Collect series ID for bloom filter
         seriesIds.push_back(seriesId);
+    }
+
+    // The loop exits cleanly only at EXACTLY zero bytes left. A short tail
+    // (0 < bytesLeft < header size) means the index is truncated: accepting
+    // the parsed prefix would register the file with only some of its series,
+    // and a later compaction of that file DELETES the source — permanently
+    // destroying the unparsed series' data. Reject the whole file instead
+    // (openTsmFile() logs it loudly and leaves the file on disk).
+    if (indexSlice.bytesLeft() != 0) {
+        throw std::runtime_error("TSM index corrupt: " + std::to_string(indexSlice.bytesLeft()) +
+                                 " trailing bytes after " + std::to_string(seriesIds.size()) +
+                                 " index entries — index is truncated: " + filePath);
     }
 
     // Now initialize bloom filter with the ACTUAL series count
@@ -692,7 +711,8 @@ seastar::future<TSMIndexEntry*> TSM::getFullIndexEntry(const SeriesId128& series
         }
         fullEntry.seriesType = static_cast<TSMValueType>(typeByte);
     }
-    uint32_t blockCount = entrySlice.read<uint32_t>();
+    // Block count is u32 in V3, u16 before.
+    uint32_t blockCount = (fileVersion >= 3) ? entrySlice.read<uint32_t>() : entrySlice.read<uint16_t>();
 
     // Parse all blocks and optional string dictionary
     parseIndexBlocksFromSlice(entrySlice, fullEntry, blockCount);
@@ -830,7 +850,8 @@ seastar::future<> TSM::prefetchFullIndexEntries(const std::vector<SeriesId128>& 
                 }
                 fullEntry.seriesType = static_cast<TSMValueType>(typeByte);
             }
-            uint32_t blockCount = entrySlice.read<uint32_t>();
+            // Block count is u32 in V3, u16 before.
+            uint32_t blockCount = (fileVersion >= 3) ? entrySlice.read<uint32_t>() : entrySlice.read<uint16_t>();
 
             // Parse all blocks and optional string dictionary
             parseIndexBlocksFromSlice(entrySlice, fullEntry, blockCount);

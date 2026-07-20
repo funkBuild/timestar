@@ -66,55 +66,64 @@ public:
     uint32_t size() const { return nextId_; }
 
     // Prepare for bulk restore: pre-allocate for expectedCount entries.
-    // WARNING: resize(nextId) default-constructs zero SeriesId128 entries for ALL slots.
+    // WARNING: pre-allocation default-constructs zero SeriesId128 entries.
     // If any local IDs are missing from persisted data (e.g., partial WAL truncation),
     // those slots will remain zero, creating "holes". Use isValid() to detect them.
+    //
     // `nextId` comes from a 4-byte value read off disk with no range validation,
     // and localToGlobal_ is 16 bytes per slot while globalToLocal_ is ~24 -- so a
-    // corrupt or truncated counter asks for up to 275 GB here. This runs on the
-    // STARTUP path, so unlike a query-time allocation failure the shard cannot
+    // corrupt or truncated counter could ask for up to 275 GB here. This runs on
+    // the STARTUP path, so unlike a query-time allocation failure the shard cannot
     // recover by restarting.
     //
-    // Clamp the up-front allocation. restoreEntry() grows the vector as real
-    // entries arrive, so a legitimately large counter still works; only the
-    // speculative pre-allocation is bounded.
-    static constexpr uint32_t kMaxReasonableLocalIds = 10'000'000;
+    // Only the SPECULATIVE pre-allocation is clamped — never the counter itself:
+    // getOrAssign() freely issues ids past this value at runtime, so throwing on
+    // a large counter at restore would brick a legitimately large shard on its
+    // next restart while it ran fine before. restoreEntry() grows the vector as
+    // real entries arrive, so growth is bounded by the data actually persisted.
+    static constexpr uint32_t kMaxSpeculativeRestoreIds = 10'000'000;
+
+    // Ids further than this past the restored counter are rejected as corrupt:
+    // forward keys and the counter are persisted in one atomic batch, so a real
+    // entry can never be meaningfully newer than the counter. Without a bound,
+    // one corrupt 4-byte scan key demands a resize of up to 64 GB.
+    static constexpr uint32_t kRestoreIdSlack = 1'048'576;
 
     void restoreBegin(uint32_t nextId, uint32_t expectedCount) {
-        if (nextId > kMaxReasonableLocalIds) {
-            throw std::runtime_error("LocalIdMap: persisted local-id counter " + std::to_string(nextId) +
-                                     " exceeds the maximum of " + std::to_string(kMaxReasonableLocalIds) +
-                                     " -- index metadata is corrupt");
-        }
         nextId_ = nextId;
-        localToGlobal_.resize(nextId);
-        globalToLocal_.reserve(std::min(expectedCount, kMaxReasonableLocalIds));
+        restoreCounterBase_ = nextId;
+        localToGlobal_.resize(std::min(nextId, kMaxSpeculativeRestoreIds));
+        globalToLocal_.reserve(std::min(expectedCount, kMaxSpeculativeRestoreIds));
     }
 
     // Add a single mapping during restore (call between restoreBegin/restoreEnd).
-    // Entries beyond the restored counter GROW the map instead of being dropped:
-    // series creation persists forward mappings individually, so a crash can
-    // leave forward entries newer than the last persisted counter value.
-    // Dropping them would re-assign those local IDs to different series while
-    // persisted bitmaps still reference the old assignment.
-    void restoreEntry(uint32_t localId, const SeriesId128& globalId) {
+    // Entries slightly beyond the restored counter GROW the map instead of being
+    // dropped: dropping them would re-assign those local IDs to different series
+    // while persisted bitmaps still reference the old assignment.
+    //
+    // Returns false when the id is implausibly far past the persisted counter
+    // (a corrupt scan key) — the entry is skipped and the caller should log it.
+    [[nodiscard]] bool restoreEntry(uint32_t localId, const SeriesId128& globalId) {
+        if (static_cast<uint64_t>(localId) >= static_cast<uint64_t>(restoreCounterBase_) + kRestoreIdSlack) {
+            return false;
+        }
         if (localId >= nextId_) {
-            // Same exposure as restoreBegin: this id comes from a scan key on
-            // disk and drives a resize.
-            if (localId >= kMaxReasonableLocalIds) {
-                throw std::runtime_error("LocalIdMap: persisted local id " + std::to_string(localId) +
-                                         " exceeds the maximum of " + std::to_string(kMaxReasonableLocalIds) +
-                                         " -- index metadata is corrupt");
-            }
             nextId_ = localId + 1;
-            localToGlobal_.resize(nextId_);
+        }
+        if (localId >= localToGlobal_.size()) {
+            // Grow only as far as this entry needs — NOT to nextId_, which may
+            // be a corrupt-huge counter whose speculative prealloc was capped.
+            localToGlobal_.resize(static_cast<size_t>(localId) + 1);
         }
         localToGlobal_[localId] = globalId;
         globalToLocal_.emplace(globalId, localId);
+        return true;
     }
 
 private:
     uint32_t nextId_ = 0;
+    // Counter value passed to restoreBegin(); plausibility bound for restoreEntry().
+    uint32_t restoreCounterBase_ = 0;
     tsl::robin_map<SeriesId128, uint32_t, SeriesId128::Hash> globalToLocal_;
     std::vector<SeriesId128> localToGlobal_;  // Indexed by local ID, O(1) reverse lookup
 };

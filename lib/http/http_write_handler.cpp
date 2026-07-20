@@ -1881,6 +1881,31 @@ seastar::future<bool> HttpWriteHandler::tryFastDoubleWrite(std::string_view body
         FastDoubleWritePoint fwp;
         auto fast_err = glz::read_json(fwp, body);
         if (!fast_err && !fwp.measurement.empty() && !fwp.fields.empty()) {
+            // The fast struct parses every numeric as double, erasing the
+            // int/float token distinction the DOM path uses for type detection
+            // ("10" -> Integer, "10.0" -> Float). The DOM path types a field
+            // from its FIRST value's token, so when that value is integral the
+            // two paths can disagree — and which path ran depended on nothing
+            // but body size (>256 bytes). A field written twice then flapped
+            // Float/Integer across writes, producing divergent-type TSM files
+            // for one series, which is unreadable (block type mismatch) and
+            // wedges compaction. Fall back to the DOM path for exact
+            // token-level detection; real float telemetry (fractional first
+            // value) keeps the fast path.
+            bool firstValueMaybeInt = false;
+            for (const auto& [fieldName, values] : fwp.fields) {
+                if (!values.empty()) {
+                    const double v0 = values.front();
+                    if (std::isfinite(v0) && v0 == std::trunc(v0)) {
+                        firstValueMaybeInt = true;
+                        break;
+                    }
+                }
+            }
+            if (firstValueMaybeInt) {
+                co_return false;
+            }
+
             // Fast path succeeded - yield after CPU-heavy parse
             co_await seastar::coroutine::maybe_yield();
 
