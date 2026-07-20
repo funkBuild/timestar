@@ -197,6 +197,14 @@ struct ForecastQueryResultData {
 // rejected loudly as a per-point error — never silently truncated to a prefix.
 inline constexpr size_t kMaxCompressedPointsPerWritePoint = 10'000'000;
 
+// Ceiling on the TOTAL decoded points in one write request, across all of its
+// write points. The per-write-point cap above bounds a single point group but
+// not their sum: compressed timestamps expand up to 64 values per byte, so a
+// body within max_write_body_size can describe billions of points spread over
+// many groups, and every group is held simultaneously before any of them
+// reaches a store.
+inline constexpr size_t kMaxDecodedPointsPerWriteRequest = 50'000'000;
+
 // Decode bound to pass to IntegerEncoder::decode for a compressed payload of
 // `bytes` bytes.  Structurally, one FFOR block consumes at least 16 bytes
 // (2-word header) and emits at most 1024 values, so a payload can never

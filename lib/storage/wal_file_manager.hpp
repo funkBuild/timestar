@@ -44,6 +44,10 @@ private:
     seastar::gate _backgroundGate;               // Tracks in-flight background TSM conversions
     seastar::semaphore compactionSemaphore{1};   // Only allow 1 rollover at a time
     seastar::semaphore _conversionSemaphore{1};  // Serialize background TSM conversions
+    // Rollover throttles once this many stores are awaiting TSM conversion.
+    // Each retained store holds its full uncompressed dataset, so an unbounded
+    // queue is an unbounded memory commitment.
+    static constexpr size_t kMaxUnconvertedMemoryStores = 4;
 
 public:
     WALFileManager();

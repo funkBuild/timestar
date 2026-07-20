@@ -317,6 +317,23 @@ seastar::future<> WALFileManager::rolloverMemoryStore() {
     // Create and init the new store FIRST, before closing the old one.
     // This ensures memoryStores[0] always points to an open store,
     // even if another insert coroutine runs during a co_await yield.
+    // Backpressure: wait if unconverted stores have already piled up.
+    //
+    // Conversion runs detached, serialised by _conversionSemaphore, and in the
+    // LOW-PRIORITY compaction scheduling group -- so under sustained write load
+    // (exactly when conversion is slowest) inserts never wait and retained
+    // stores queue without limit, each holding its full uncompressed dataset.
+    // Blocking the rollover here is what makes ingest feel the backlog instead
+    // of accumulating it in memory.
+    if (memoryStores.size() >= kMaxUnconvertedMemoryStores) {
+        timestar::wal_log.info("Shard {}: {} memory stores awaiting conversion, throttling rollover", shardId,
+                               memoryStores.size());
+        auto convUnits = co_await seastar::get_units(_conversionSemaphore, 1);
+        // Released immediately: holding it would deadlock the very conversion we
+        // are waiting on. Acquiring it at all is the wait -- it means the
+        // in-flight conversion finished and the backlog has drained by one.
+    }
+
     auto store = seastar::make_shared<MemoryStore>(++currentWalSequenceNumber);
     co_await store->initWAL();
     memoryStores.insert(memoryStores.begin(), store);

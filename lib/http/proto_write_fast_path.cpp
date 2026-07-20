@@ -93,6 +93,14 @@ FastPathResult parseWriteRequestFast(const void* data, size_t size, uint64_t def
     // Estimate: average 2 fields per write point
     result.inserts.reserve(static_cast<size_t>(request->writes_size()) * 2);
 
+    // Request-wide decoded-point budget. Compressed timestamps expand up to 64
+    // values per byte, so a body inside max_write_body_size can still describe
+    // billions of points spread across many write points -- and every one of
+    // them is held simultaneously in `result.inserts` before anything reaches a
+    // store. The per-write-point cap does not bound their sum.
+    const size_t maxPointsPerRequest = kMaxDecodedPointsPerWriteRequest;
+    size_t decodedPointBudget = 0;
+
     for (int wpIdx = 0; wpIdx < request->writes_size(); ++wpIdx) {
         const auto& wp = request->writes(wpIdx);
 
@@ -176,6 +184,23 @@ FastPathResult parseWriteRequestFast(const void* data, size_t size, uint64_t def
                     result.errors.push_back("compressed_timestamps decodes to more than " +
                                             std::to_string(kMaxCompressedPointsPerWritePoint) +
                                             " values (max points per write point)");
+                }
+            }
+            // ...and enforce a REQUEST-wide budget, not just a per-point one.
+            // The per-point cap bounds one write point; nothing bounded their sum.
+            // Compressed timestamps expand up to 64 values per byte, so a body
+            // within max_write_body_size can still describe billions of points
+            // across many write points, all held simultaneously before any of
+            // them reaches a store.
+            if (tsDecodeOk) {
+                decodedPointBudget += timestamps.size();
+                if (decodedPointBudget > maxPointsPerRequest) {
+                    tsDecodeOk = false;
+                    if (result.errors.size() < 10) {
+                        result.errors.push_back("write request decodes to more than " +
+                                                std::to_string(maxPointsPerRequest) +
+                                                " points in total (max points per request)");
+                    }
                 }
             }
             if (!tsDecodeOk) {
