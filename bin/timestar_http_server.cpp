@@ -13,6 +13,7 @@
 #include "http/proto_converters.hpp"
 #include "storage/shard_rebalancer.hpp"
 #include "timestar/version.hpp"
+#include "utils/data_dir_lock.hpp"
 #include "utils/json_escape.hpp"
 #include "utils/logger.hpp"
 #include "utils/stop_signal.hpp"
@@ -307,6 +308,21 @@ int main(int argc, char** argv) {
             const std::string dataRoot = timestar::dataRootPath();
             std::filesystem::create_directories(dataRoot);
             timestar::http_log.info("Data directory: {}", std::filesystem::absolute(dataRoot).string());
+
+            // Take an exclusive lock on the data directory before ANYTHING
+            // touches it. The shard rebalancer below rewrites shard layout on a
+            // CPU-count change, so a second instance starting here would
+            // corrupt the first one's data rather than merely race it.
+            //
+            // Held for the lifetime of the process; the kernel releases it on
+            // exit by any means, kill -9 included.
+            static timestar::DataDirLock dataDirLock;
+            try {
+                dataDirLock.acquire(dataRoot);
+            } catch (const std::exception& e) {
+                timestar::http_log.error("{}", e.what());
+                return 1;
+            }
 
             // Initialize virtual shard placement table (Phase 5)
             // Must be done BEFORE the rebalancer, which uses routeToCore().
