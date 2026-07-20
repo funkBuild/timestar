@@ -679,6 +679,23 @@ std::pair<size_t, size_t> IntegerEncoderFFOR::decode(Slice& encoded, unsigned in
     while (total_decoded < timestampSize && encoded.remaining() >= 16) {
         // Unpack one block into the stack-local buffer (L1-hot)
         const size_t block_count = decodeBlockInto(encoded, blockBuf);
+
+        // Clamp emission to the requested count, exactly as the unfiltered fast
+        // path above does.  The stream decodes in whole FFOR groups, so the final
+        // group can hold more entries than the caller asked for -- and this is the
+        // path where that is MOST likely, since a time-cut is precisely what makes
+        // a caller request fewer values than were encoded.
+        //
+        // Without this clamp the tail of the last group was reconstructed and
+        // emitted as real points.  Delta-of-delta reconstruction over that padding
+        // continues the arithmetic progression, so the phantom timestamps look
+        // entirely plausible and pass the time filter.  Worse, the inflated count
+        // is returned to the caller, which then asks the VALUE decoder for more
+        // values than the block contains -- desyncing the timestamp/value pair,
+        // whose consumers index values[i] by a timestamp index.  That is the same
+        // out-of-bounds corruption class as the string-decoder bug, reached by a
+        // different route.
+        const size_t emit_count = std::min(static_cast<size_t>(block_count), timestampSize - total_decoded);
         total_decoded += block_count;
 
         // Determine where to start consuming values within this block.
@@ -689,7 +706,7 @@ std::pair<size_t, size_t> IntegerEncoderFFOR::decode(Slice& encoded, unsigned in
         size_t local_i = 0;
 
         // Handle value[0] of the entire sequence (raw timestamp)
-        if (global_idx == 0 && local_i < block_count) {
+        if (global_idx == 0 && local_i < emit_count) {
             last_decoded = blockBuf[0];
             if (last_decoded < minTime) {
                 nSkipped++;
@@ -704,7 +721,7 @@ std::pair<size_t, size_t> IntegerEncoderFFOR::decode(Slice& encoded, unsigned in
         }
 
         // Handle value[1] of the entire sequence (zigzag(delta))
-        if (global_idx == 1 && local_i < block_count) {
+        if (global_idx == 1 && local_i < emit_count) {
             delta = ZigZag::zigzagDecode(blockBuf[local_i]);
             last_decoded = static_cast<uint64_t>(static_cast<int64_t>(last_decoded) + delta);
             if (last_decoded < minTime) {
@@ -721,7 +738,7 @@ std::pair<size_t, size_t> IntegerEncoderFFOR::decode(Slice& encoded, unsigned in
 
         // Main reconstruction loop (unrolled by 4) for zigzag(delta-of-delta) values.
         // blockBuf is L1-hot since we just wrote it via decodeBlockInto().
-        for (; local_i + 3 < block_count; local_i += 4) {
+        for (; local_i + 3 < emit_count; local_i += 4) {
             int64_t dd0 = ZigZag::zigzagDecode(blockBuf[local_i]);
             int64_t dd1 = ZigZag::zigzagDecode(blockBuf[local_i + 1]);
             int64_t dd2 = ZigZag::zigzagDecode(blockBuf[local_i + 2]);
@@ -773,7 +790,7 @@ std::pair<size_t, size_t> IntegerEncoderFFOR::decode(Slice& encoded, unsigned in
         }
 
         // Scalar tail for remaining values in this block
-        for (; local_i < block_count; ++local_i) {
+        for (; local_i < emit_count; ++local_i) {
             int64_t dd = ZigZag::zigzagDecode(blockBuf[local_i]);
             delta += dd;
             last_decoded = static_cast<uint64_t>(static_cast<int64_t>(last_decoded) + delta);
