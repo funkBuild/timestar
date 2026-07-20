@@ -100,9 +100,23 @@ static void bucketNonNumericFieldLatest(std::vector<uint64_t>& timestamps, std::
     if (interval == 0 || timestamps.empty()) {
         return;
     }
+    // This loop indexes values[i] by a TIMESTAMP index, so a desynced pair is an
+    // out-of-bounds read, not merely a wrong answer -- it returned empty strings
+    // on a 200 response and segfaulted the shard.  The storage layer now refuses
+    // to emit a desynced pair (see decodeBlockFlat); this is the second line of
+    // defence, because reading past the end here corrupts memory silently.
+    const size_t n = std::min(timestamps.size(), values.size());
+    if (timestamps.size() != values.size()) {
+        timestar::http_log.error(
+            "[CORRUPT] non-numeric field has {} timestamps but {} values; truncating to {} to avoid an "
+            "out-of-bounds read",
+            timestamps.size(), values.size(), n);
+        timestamps.resize(n);
+        values.resize(n);
+    }
     std::vector<uint64_t> outTs;
     std::vector<V> outVals;
-    for (size_t i = 0; i < timestamps.size(); ++i) {
+    for (size_t i = 0; i < n; ++i) {
         const uint64_t bucket = (timestamps[i] / interval) * interval;
         if (!outTs.empty() && outTs.back() == bucket) {
             // Same bucket: ascending input order means later value = latest.

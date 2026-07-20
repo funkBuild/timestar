@@ -55,6 +55,12 @@ public:
     // Decode with skip/count support - avoids allocating strings outside the [skipCount, skipCount+limitCount) range.
     // zstd decompression still happens on the full block (no random access), but individual string
     // copies are skipped for the first skipCount entries.
+    //
+    // APPENDS to `out` and never clears it, matching FloatDecoder/BoolEncoderRLE
+    // and the integer path: TSM decodes every block of a series into one shared
+    // flat value vector while the timestamps accumulate in a parallel vector.
+    // Clearing here desyncs that pair, and consumers index values by a TIMESTAMP
+    // index -- an out-of-bounds read, not merely a wrong answer.
     static void decode(Slice& encoded, size_t totalCount, size_t skipCount, size_t limitCount,
                        std::vector<std::string>& out);
 
@@ -95,6 +101,7 @@ public:
     // Decode dictionary-encoded block with skip/limit support. Takes the
     // dictionary entries by const-ref (no per-block copy) — callers decoding
     // many blocks of one series reuse the same dictionary vector.
+    // APPENDS to `out` — see the skip/limit decode() above for why.
     static void decodeDictionary(Slice& encoded, size_t totalCount, size_t skipCount, size_t limitCount,
                                  const std::vector<std::string>& dictEntries, std::vector<std::string>& out);
 

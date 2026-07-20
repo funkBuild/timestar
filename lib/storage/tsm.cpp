@@ -1033,6 +1033,15 @@ seastar::future<std::unique_ptr<TSMBlock<T>>> TSM::readSingleBlock(const TSMInde
         }
     }
 
+    // Same invariant as decodeBlockFlat(): consumers index values by a timestamp
+    // index (TSMBlock::valueAt), so a desynced pair is an out-of-bounds read.
+    // Refuse to hand one up.
+    if (blockResults->timestamps.size() != blockResults->values.size()) {
+        timestar::tsm_log.error("[CORRUPT] single-block decode desync: {} timestamps but {} values; dropping block",
+                                blockResults->timestamps.size(), blockResults->values.size());
+        co_return nullptr;
+    }
+
     co_return blockResults;
 }
 
@@ -1227,6 +1236,14 @@ std::unique_ptr<TSMBlock<T>> TSM::decodeBlock(Slice& blockSlice, uint32_t blockS
         }
     }
 
+    // Same invariant as decodeBlockFlat(): consumers index values by a timestamp
+    // index (TSMBlock::valueAt), so a desynced pair is an out-of-bounds read.
+    if (blockResults->timestamps.size() != blockResults->values.size()) {
+        timestar::tsm_log.error("[CORRUPT] block decode desync: {} timestamps but {} values; dropping block",
+                                blockResults->timestamps.size(), blockResults->values.size());
+        return nullptr;
+    }
+
     return blockResults;
 }
 
@@ -1251,6 +1268,8 @@ static size_t decodeBlockFlat(const uint8_t* data, uint32_t blockSize, uint64_t 
         return 0;
 
     auto timestampsSlice = blockSlice.getSlice(timestampBytes);
+    const size_t timestampsBefore = outTimestamps.size();
+    const size_t valuesBefore = outValues.size();
     auto [nSkipped, nTimestamps] =
         IntegerEncoder::decode(timestampsSlice, timestampSize, outTimestamps, startTime, endTime);
 
@@ -1284,6 +1303,27 @@ static size_t decodeBlockFlat(const uint8_t* data, uint32_t blockSize, uint64_t 
         for (size_t i = nSkipped; i < end; ++i) {
             outValues.push_back(ZigZag::zigzagDecode(rawUintScratch[i]));
         }
+    }
+
+    // INVARIANT: every value decoder APPENDS exactly as many values as the
+    // timestamp decoder appended timestamps.  Both vectors are shared across all
+    // blocks of a series, so a decoder that clears or short-decodes silently
+    // desyncs them -- and every downstream consumer indexes values[i] by a
+    // timestamp index.  That is not a wrong number, it is an out-of-bounds read:
+    // it surfaced as empty strings on a 200 response and as a segfaulted shard.
+    //
+    // Roll the timestamps back to the last consistent state rather than handing
+    // up a desynced pair.  Dropping a block's points is a visible, bounded loss;
+    // a desynced pair corrupts memory.
+    const size_t timestampsAdded = outTimestamps.size() - timestampsBefore;
+    const size_t valuesAdded = outValues.size() - valuesBefore;
+    if (timestampsAdded != valuesAdded) {
+        timestar::tsm_log.error(
+            "[CORRUPT] block decode desync: {} timestamps but {} values; dropping this block's points", timestampsAdded,
+            valuesAdded);
+        outTimestamps.resize(timestampsBefore);
+        outValues.resize(valuesBefore);
+        return 0;
     }
 
     return nTimestamps;

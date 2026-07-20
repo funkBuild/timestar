@@ -486,9 +486,9 @@ void StringEncoder::decodeDictionary(Slice& encoded, size_t totalCount, size_t s
     }
 
     // Empty block: nothing to decompress — advance past compressed data and return.
+    // APPENDS (see the skip/limit decode() below): must not clear `out`.
     if (uncompressedSize == 0) {
         encoded.offset += compressedSize;
-        out.clear();
         return;
     }
 
@@ -499,8 +499,7 @@ void StringEncoder::decodeDictionary(Slice& encoded, size_t totalCount, size_t s
     encoded.offset += compressedSize;
 
     Slice idSlice(tlDecompBuf.data(), uncompressedSize);
-    out.clear();
-    out.reserve(limitCount);
+    out.reserve(out.size() + limitCount);
     size_t produced = 0;
     for (size_t i = 0; i < totalCount && idSlice.offset < idSlice.length_; ++i) {
         uint32_t id = readVarInt(idSlice);
@@ -560,9 +559,9 @@ void StringEncoder::decode(Slice& encoded, size_t totalCount, size_t skipCount, 
     }
 
     // Empty block: nothing to decompress — advance past compressed data and return.
+    // APPENDS (see below): must not clear `out`.
     if (uncompressedSize == 0) {
         encoded.offset += compressedSize;
-        out.clear();
         return;
     }
 
@@ -585,9 +584,16 @@ void StringEncoder::decode(Slice& encoded, size_t totalCount, size_t skipCount, 
 
     // Decode strings with skip/limit: skip the first skipCount strings without allocating,
     // then collect the next limitCount strings.
+    //
+    // APPENDS to `out` -- it must NOT be cleared.  decodeBlockFlat() decodes every
+    // block of a series into ONE shared flat vector (exactly as the float, bool and
+    // integer decoders do), so clearing here destroyed every previously decoded
+    // block's values while their timestamps remained.  A 6-block string series came
+    // back with 3600 timestamps and 600 values; the bucketed non-numeric reducer
+    // then indexed values[i] off the end of that vector, which returned empty
+    // strings on a 200 response and segfaulted the shard outright.
     Slice uncompSlice(uncompressed.data(), uncompressedSize);
-    out.clear();
-    out.reserve(limitCount);
+    out.reserve(out.size() + limitCount);
 
     size_t produced = 0;
     for (size_t i = 0; i < totalCount && uncompSlice.offset < uncompSlice.length_; i++) {
