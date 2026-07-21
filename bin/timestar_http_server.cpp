@@ -480,7 +480,21 @@ int main(int argc, char** argv) {
                 promConfig.prefix = "timestar";
                 seastar::prometheus::add_prometheus_routes(server->server(), promConfig).get();
 
-                server->listen(port).get();
+                // Least-connections accept balancing, NOT the kernel-hash
+                // default. SO_REUSEPORT hashes the peer 4-tuple, and with a
+                // handful of client connections (especially over loopback) all
+                // of them routinely land on ONE shard. Measured in a 6GB soak:
+                // shard 0 took all 8 connections, its reactor saturated on
+                // request parsing (main at 1000 shares), its compaction fiber
+                // (ts_compact, 10 shares) got ~1% CPU and fell 116 tier-0
+                // files behind, and the accumulated sparse indexes exhausted
+                // the shard's memory pool into a bad_alloc storm -- while
+                // shard 1 sat healthy. connection_distribution sends each new
+                // connection to the least-loaded shard instead.
+                seastar::listen_options httpLo;
+                httpLo.lba = seastar::server_socket::load_balancing_algorithm::connection_distribution;
+                httpLo.reuse_address = true;
+                server->listen(seastar::socket_address(seastar::net::inet_address("0.0.0.0"), port), httpLo).get();
             } catch (const std::exception& e) {
                 timestar::http_log.error("Failed to start HTTP server: {}", e.what());
                 // Clean up engine before exiting
