@@ -22,9 +22,16 @@ struct CompactionConfig {
     uint32_t max_concurrent = 2;
     uint64_t max_memory = 256 * 1024 * 1024;
     uint32_t batch_size = 10000;
-    uint32_t tier0_min_files = 4;
-    uint32_t tier1_min_files = 4;
-    uint32_t tier2_min_files = 4;
+    // Files merged per compaction, uniform across ALL tiers (replaces the old
+    // tier0/1/2_min_files trio, of which only tier0's was ever read). Both the
+    // merge TRIGGER (a tier is eligible once it holds this many files) and the
+    // merge INPUT SIZE (exactly this many oldest files, never more): with 6
+    // files in a tier, the oldest 4 merge and the newest 2 wait for 2 more.
+    // Merging "whatever has accumulated" made tier-file sizes wander by 2-4x;
+    // fixed-count merges keep them geometrically consistent (a tier-N file is
+    // ~files_per_merge tier-(N-1) files), which is what makes tier depth a
+    // meaningful signal for block sizing and reclaim-rate scheduling.
+    uint32_t files_per_merge = 4;
     // Tier-0 file count at which compaction stops yielding to pending WAL->TSM
     // conversion. WAL drain normally wins (it frees disk and keeps ingest
     // flowing), but an unbounded tier 0 degrades every query on the shard, so
@@ -201,9 +208,8 @@ struct glz::meta<timestar::CompactionConfig> {
     using T = timestar::CompactionConfig;
     static constexpr auto value =
         object("max_concurrent", &T::max_concurrent, "max_memory", &T::max_memory, "batch_size", &T::batch_size,
-               "tier0_min_files", &T::tier0_min_files, "tier1_min_files", &T::tier1_min_files, "tier2_min_files",
-               &T::tier2_min_files, "tier0_starvation_ceiling", &T::tier0_starvation_ceiling, "deep_block_points_cap",
-               &T::deep_block_points_cap);
+               "files_per_merge", &T::files_per_merge, "tier0_starvation_ceiling", &T::tier0_starvation_ceiling,
+               "deep_block_points_cap", &T::deep_block_points_cap);
 };
 
 template <>

@@ -76,6 +76,11 @@ std::vector<std::string> TimestarConfig::validate() const {
     if (storage.conversion_concurrency == 0) {
         errors.emplace_back("storage.conversion_concurrency must be > 0");
     }
+    if (storage.compaction.files_per_merge < 2) {
+        // 1 would make every "merge" a same-tier rewrite of a single file --
+        // an infinite compaction loop that never consolidates anything.
+        errors.emplace_back("storage.compaction.files_per_merge must be >= 2");
+    }
     if (storage.wal_max_concurrent_encoders == 0) {
         errors.emplace_back("storage.wal_max_concurrent_encoders must be > 0");
     }
@@ -436,6 +441,7 @@ void applyEnvironmentOverrides(TimestarConfig& cfg) {
     // Compaction
     envU32("TIMESTAR_CONVERSION_CONCURRENCY", cfg.storage.conversion_concurrency);
     envU32("TIMESTAR_COMPACTION_MAX_CONCURRENT", cfg.storage.compaction.max_concurrent);
+    envU32("TIMESTAR_COMPACTION_FILES_PER_MERGE", cfg.storage.compaction.files_per_merge);
     envU64("TIMESTAR_COMPACTION_MAX_MEMORY", cfg.storage.compaction.max_memory);
     envU32("TIMESTAR_COMPACTION_BATCH_SIZE", cfg.storage.compaction.batch_size);
 

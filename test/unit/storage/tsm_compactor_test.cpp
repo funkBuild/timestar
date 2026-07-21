@@ -556,10 +556,12 @@ SEASTAR_TEST_F(TSMCompactorTest, CompactionPlanGeneration) {
 TEST_F(TSMCompactorTest, LeveledCompactionStrategy) {
     LeveledCompactionStrategy strategy;
 
-    // Test should compact logic
-    EXPECT_TRUE(strategy.shouldCompact(0, 4, 50 * 1024 * 1024));   // 4 files in tier 0
-    EXPECT_FALSE(strategy.shouldCompact(0, 3, 50 * 1024 * 1024));  // Only 3 files
-    EXPECT_TRUE(strategy.shouldCompact(0, 2, 200 * 1024 * 1024));  // Size exceeds limit
+    // Trigger is COUNT-based only: a full merge's worth of files (4), never a
+    // byte threshold -- byte-triggered merges of fewer files produced the
+    // inconsistent tier-file sizes fixed-count merges exist to prevent.
+    EXPECT_TRUE(strategy.shouldCompact(0, 4, 50 * 1024 * 1024));    // 4 files in tier 0
+    EXPECT_FALSE(strategy.shouldCompact(0, 3, 50 * 1024 * 1024));   // Only 3 files
+    EXPECT_FALSE(strategy.shouldCompact(0, 2, 200 * 1024 * 1024));  // Size alone never triggers
 
     // Test file selection
     std::vector<seastar::shared_ptr<TSM>> availableFiles;
@@ -571,13 +573,20 @@ TEST_F(TSMCompactorTest, LeveledCompactionStrategy) {
         availableFiles.push_back(tsm);
     }
 
+    // EXACTLY files_per_merge (4) oldest files -- with 10 available, the
+    // oldest 4 merge and the rest wait for the next cycle. Keeps every tier-N
+    // file at ~4 tier-(N-1) files, i.e. consistent sizes.
     auto selected = strategy.selectFiles(availableFiles, 0);
-    EXPECT_EQ(selected.size(), 8);  // Max files per tier for tier 0
+    EXPECT_EQ(selected.size(), 4);
 
     // Verify oldest files are selected first
     for (size_t i = 0; i < selected.size(); i++) {
         EXPECT_EQ(selected[i]->seqNum, i);
     }
+
+    // Below a full merge: select NOTHING (no runt merges).
+    std::vector<seastar::shared_ptr<TSM>> few(availableFiles.begin(), availableFiles.begin() + 3);
+    EXPECT_TRUE(strategy.selectFiles(few, 0).empty());
 
     // Test target tier calculation
     EXPECT_EQ(strategy.getTargetTier(0, 4), 1);  // Promote from 0 to 1

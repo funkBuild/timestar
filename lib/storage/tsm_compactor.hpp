@@ -237,7 +237,7 @@ public:
     // is the NON-NaN count (an all-NaN block reports 0), so a sparse series of
     // FULL blocks would look empty and get decoded. Compressed block BYTES are
     // NaN-independent and are what we use instead.
-    // 4, not 8: merges pull in filesPerCompaction() == 4 inputs, and on
+    // 4, not 8: merges pull in files_per_merge == 4 inputs, and on
     // high-cardinality workloads each input holds ONE tiny block per series.
     // At 8, a first-level merge of four 30-point blocks could never coalesce
     // -- the fragmentation survived into every deeper tier untouched.
@@ -319,25 +319,32 @@ public:
     virtual uint64_t getTargetTier(uint64_t sourceTier, size_t fileCount) const = 0;
 };
 
-// Leveled compaction strategy - similar to Cassandra/RocksDB
+// Leveled compaction strategy - similar to Cassandra/RocksDB.
+//
+// FIXED-COUNT merges: every compaction takes EXACTLY files_per_merge of the
+// oldest files in a tier (with 6 files, the oldest 4 merge and the newest 2
+// wait until 2 more accumulate). The old take-up-to-MAX behaviour (8, or 16 at
+// tier 3) merged whatever backlog had piled up, so tier-file sizes wandered by
+// 2-4x and compounded with depth. Consistent counts keep a tier-N file at
+// ~files_per_merge^N flush files, which is what makes tier depth a meaningful
+// signal for per-tier block sizing and reclaim-rate scheduling -- and each
+// merge's cost predictable for the scheduler that interleaves them with WAL
+// conversion.
 class LeveledCompactionStrategy : public CompactionStrategy {
 private:
     static constexpr size_t NUM_TIERS = 4;
-    static constexpr size_t MIN_FILES_PER_TIER[NUM_TIERS] = {4, 4, 4, 8};
-    static constexpr size_t MAX_FILES_PER_TIER[NUM_TIERS] = {8, 8, 8, 16};
-    static constexpr size_t MAX_BYTES_PER_TIER[NUM_TIERS] = {
-        100 * 1024 * 1024,         // 100MB for tier 0
-        1024 * 1024 * 1024,        // 1GB for tier 1
-        10L * 1024 * 1024 * 1024,  // 10GB for tier 2
-        UINT64_MAX                 // No limit for tier 3
-    };
+
+    static size_t filesPerMerge() { return timestar::config().storage.compaction.files_per_merge; }
 
 public:
-    bool shouldCompact(uint64_t tier, size_t fileCount, size_t totalSize) const override {
+    bool shouldCompact(uint64_t tier, size_t fileCount, size_t /*totalSize*/) const override {
         if (tier >= NUM_TIERS)
             return false;
-
-        return fileCount >= MIN_FILES_PER_TIER[tier] || totalSize >= MAX_BYTES_PER_TIER[tier];
+        // Count-based only. The old byte trigger (merge early past a per-tier
+        // byte ceiling) merged FEWER than files_per_merge files, producing
+        // exactly the inconsistent file sizes fixed-count merges exist to
+        // prevent.
+        return fileCount >= filesPerMerge();
     }
 
     std::vector<seastar::shared_ptr<TSM>> selectFiles(const std::vector<seastar::shared_ptr<TSM>>& availableFiles,
@@ -354,13 +361,21 @@ public:
             }
         }
 
+        const size_t mergeCount = filesPerMerge();
+        // Fewer than a full merge available (also reachable when eligible
+        // files are excluded because an in-flight compaction already claimed
+        // them): merge NOTHING rather than a runt set. A short merge produces
+        // an undersized tier file, defeating the size consistency, and in the
+        // 1-file case would be a pointless same-data rewrite.
+        if (selected.size() < mergeCount) {
+            return {};
+        }
+
         // Sort by sequence number (oldest first)
         std::sort(selected.begin(), selected.end(), [](const auto& a, const auto& b) { return a->seqNum < b->seqNum; });
 
-        // Take up to MAX_FILES_PER_TIER files
-        if (selected.size() > MAX_FILES_PER_TIER[tier]) {
-            selected.resize(MAX_FILES_PER_TIER[tier]);
-        }
+        // Take EXACTLY one merge's worth -- the oldest files.
+        selected.resize(mergeCount);
 
         // Deliberately NOT capped by input bytes. Compaction streams (bounded
         // output buffer, one source block resident at a time), so peak memory no
@@ -373,8 +388,15 @@ public:
     uint64_t getTargetTier(uint64_t sourceTier, size_t fileCount) const override {
         if (sourceTier >= NUM_TIERS)
             return sourceTier;
-        // Promote to next tier if we're compacting enough files
-        if (fileCount >= MIN_FILES_PER_TIER[sourceTier] && sourceTier < 3) {
+        // Promote only FULL merges. selectFiles() always hands over exactly
+        // files_per_merge, so scheduled compactions promote -- but direct
+        // compact() callers with fewer files (tombstone rewrites, retention
+        // rewrites of a single file) must stay in their own tier: a promoted
+        // rewrite would masquerade as a consolidation it never performed, and
+        // pick up the deeper tier's larger block cap to boot. Tier-3 merges
+        // stay in tier 3 (files_per_merge -> 1) to bound the deepest tier's
+        // file count.
+        if (fileCount >= filesPerMerge() && sourceTier < 3) {
             return sourceTier + 1;
         }
         return sourceTier;

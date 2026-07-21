@@ -226,8 +226,8 @@ bool TSMFileManager::shouldCompactTier(uint64_t tier) const {
 
     size_t fileCount = tiers[tier].size();
 
-    // Compact when we have at least filesPerCompaction() files
-    return fileCount >= filesPerCompaction();
+    // Compact when a full merge's worth of files has accumulated
+    return fileCount >= filesPerMerge();
 }
 
 seastar::future<> TSMFileManager::addTSMFile(seastar::shared_ptr<TSM> file) {

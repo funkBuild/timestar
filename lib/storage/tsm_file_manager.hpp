@@ -25,7 +25,9 @@ private:
     static constexpr size_t MAX_TIERS = 5;
     // Upper bound on the per-tier retry backoff, in compaction cycles.
     static constexpr uint64_t MAX_COMPACTION_BACKOFF_CYCLES = 64;
-    static size_t filesPerCompaction() { return timestar::config().storage.compaction.tier0_min_files; }
+    // Files merged per compaction, uniform across tiers -- both the trigger
+    // threshold and the exact input count (see CompactionConfig::files_per_merge).
+    static size_t filesPerMerge() { return timestar::config().storage.compaction.files_per_merge; }
 
     int shardId;
     // No atomic needed: TSMFileManager is a per-shard object in Seastar's shard-per-core model,

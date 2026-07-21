@@ -647,10 +647,11 @@ SEASTAR_TEST_F(TSMCompactorAsyncTest, ExecuteCompactionLifecycle) {
     EXPECT_EQ(self->fileManager->getFileCountInTier(0), 5);
     EXPECT_TRUE(self->compactor->shouldCompact(0));
 
-    // Plan and execute
+    // Plan and execute. Fixed-count merges: with 5 files available, EXACTLY
+    // files_per_merge (4) oldest are selected; the newest waits for 3 more.
     auto plan = self->compactor->planCompaction(0);
     EXPECT_TRUE(plan.isValid());
-    EXPECT_GE(plan.sourceFiles.size(), 4);
+    EXPECT_EQ(plan.sourceFiles.size(), 4);
     EXPECT_EQ(plan.targetTier, 1);
 
     auto stats = co_await self->compactor->executeCompaction(plan);
@@ -663,17 +664,18 @@ SEASTAR_TEST_F(TSMCompactorAsyncTest, ExecuteCompactionLifecycle) {
     // compaction legitimately completes in <1ms and reads 0.
     EXPECT_GE(stats.duration.count(), 0);
 
-    // Old tier-0 files should be removed, new tier-1 file should exist
-    EXPECT_LT(self->fileManager->getFileCountInTier(0), 5);
+    // The 4 oldest tier-0 files are consumed; the 5th remains for a future merge.
+    EXPECT_EQ(self->fileManager->getFileCountInTier(0), 1);
     EXPECT_GE(self->fileManager->getFileCountInTier(1), 1);
 
-    // The new tier-1 file should be readable and contain all data
+    // The new tier-1 file should be readable and contain the merged data
     auto tier1Files = self->fileManager->getFilesInTier(1);
     EXPECT_GE(tier1Files.size(), 1);
 
     auto data = co_await TSMCompactorAsyncTest::readAllFloatData(tier1Files[0], "lifecycle.0");
-    // 5 files x 30 points each, non-overlapping, so all 150 points preserved
-    EXPECT_EQ(data.size(), 150);
+    // 4 merged files x 30 points each, non-overlapping: 120 points in the
+    // output; the 5th file's 30 points still live in tier 0.
+    EXPECT_EQ(data.size(), 120);
 
     co_return;
 }
