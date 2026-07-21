@@ -107,8 +107,12 @@ static std::string buildPayload(uint64_t seed, int hostId, int rackId, uint64_t 
         for (size_t i = 0; i < count; ++i) {
             if (i)
                 buf += ',';
-            // 6 significant digits — enough for float64 round-trip at this range.
-            buf += fmt::format("{:.6g}", dist(rng));
+            // Fixed decimals, NEVER "{:.6g}": %g drops the decimal point on
+            // whole values ("42"), the server types the token shape (42 ->
+            // integer), and first-write-wins binding then REFUSES every float
+            // write to that series forever. A .6g run poisoned ~thousands of
+            // series and measured the speed of rejecting work.
+            buf += fmt::format("{:.3f}", dist(rng));
         }
         buf += ']';
     }
@@ -134,7 +138,8 @@ static std::string buildPayload(uint64_t seed, int hostId, int rackId, uint64_t 
  * ~hosts×racks×|fields| MultiWritePoints (O(100-1000) for typical settings).
  * Every value is deterministic given (seed, startTs, count).
  */
-static std::string buildPayloadJsonBatch(uint64_t seed, int numHosts, int numRacks, uint64_t startTs, size_t count) {
+static std::string buildPayloadJsonBatch(uint64_t seed, int numHosts, int numRacks, uint64_t startTs, size_t count,
+                                         size_t batchIdx) {
     std::mt19937_64 rng(seed ^ startTs);
     std::uniform_real_distribution<double> dist(0.0, 100.0);
 
@@ -143,14 +148,29 @@ static std::string buildPayloadJsonBatch(uint64_t seed, int numHosts, int numRac
     buf.reserve(count * 140 + 64);
 
     const size_t tagSets = static_cast<size_t>(numHosts) * static_cast<size_t>(numRacks);
+    const size_t numFields = FIELD_NAMES.size();
+    // Tagsets covered by one batch (each with all of its fields).
+    const size_t tagsetsPerBatch = std::max<size_t>(1, count / numFields);
 
     buf += R"({"writes":[)";
     for (size_t i = 0; i < count; ++i) {
         if (i)
             buf += ',';
-        const int hostId = static_cast<int>(i % static_cast<size_t>(numHosts)) + 1;
-        const int rackId = static_cast<int>((i / static_cast<size_t>(numHosts)) % static_cast<size_t>(numRacks)) + 1;
-        const char* fieldName = FIELD_NAMES[(i / tagSets) % FIELD_NAMES.size()];
+        // FIELD-MAJOR series mapping with a per-batch phase rotation.
+        //
+        // The old mapping picked the field from (i / tagSets), with i resetting
+        // every batch -- so unless one batch held tagSets * numFields points
+        // (over the server's 100k batch cap at high cardinality), fields beyond
+        // the first few were NEVER written and the intended series count was
+        // silently unreachable. Field-major keeps every batch full-fielded, and
+        // the phase walks the tagset window forward so consecutive batches
+        // cover the whole fleet in waves: full series coverage every
+        // ceil(tagSets / tagsetsPerBatch) batches regardless of batch size.
+        const size_t tagsetIdx = (i / numFields + batchIdx * tagsetsPerBatch) % tagSets;
+        const int hostId = static_cast<int>(tagsetIdx % static_cast<size_t>(numHosts)) + 1;
+        const int rackId =
+            static_cast<int>((tagsetIdx / static_cast<size_t>(numHosts)) % static_cast<size_t>(numRacks)) + 1;
+        const char* fieldName = FIELD_NAMES[i % numFields];
         const uint64_t ts = startTs + i * MINUTE_NS;
 
         buf += R"({"measurement":"server.metrics","tags":{"host":"host-)";
@@ -160,7 +180,9 @@ static std::string buildPayloadJsonBatch(uint64_t seed, int numHosts, int numRac
         buf += R"("},"fields":{")";
         buf += fieldName;
         buf += R"(":)";
-        buf += fmt::format("{:.6g}", dist(rng));
+        // Fixed decimals -- see the array-format comment: "{:.6g}" emits
+        // "42" for whole values and integer-poisons the series binding.
+        buf += fmt::format("{:.3f}", dist(rng));
         buf += R"(},"timestamp":)";
         buf += std::to_string(ts);
         buf += '}';
@@ -205,6 +227,50 @@ static std::string buildPayloadProto(uint64_t seed, int hostId, int rackId, uint
     return bytes;
 }
 
+/**
+ * Build a fleet-shaped protobuf WriteRequest: many scalar WritePoints, one per
+ * tagset, each carrying ONE timestamp and all 10 fields (10 points).
+ *
+ * Series mapping mirrors buildPayloadJsonBatch (same tagset window phase per
+ * batch), so json-batch and protobuf-batch runs are directly comparable: same
+ * cardinality, same coverage cadence, different wire format. This is the
+ * differential that separates parse cost from storage cost at high
+ * cardinality.
+ */
+static std::string buildPayloadProtoBatch(uint64_t seed, int numHosts, int numRacks, uint64_t startTs, size_t count,
+                                          size_t batchIdx) {
+    std::mt19937_64 rng(seed ^ startTs);
+    std::uniform_real_distribution<double> dist(0.0, 100.0);
+
+    const size_t tagSets = static_cast<size_t>(numHosts) * static_cast<size_t>(numRacks);
+    const size_t numFields = FIELD_NAMES.size();
+    const size_t writePoints = std::max<size_t>(1, count / numFields);
+    const size_t tagsetsPerBatch = writePoints;
+
+    ::timestar_pb::WriteRequest req;
+    for (size_t w = 0; w < writePoints; ++w) {
+        const size_t tagsetIdx = (w + batchIdx * tagsetsPerBatch) % tagSets;
+        const int hostId = static_cast<int>(tagsetIdx % static_cast<size_t>(numHosts)) + 1;
+        const int rackId =
+            static_cast<int>((tagsetIdx / static_cast<size_t>(numHosts)) % static_cast<size_t>(numRacks)) + 1;
+
+        auto* wp = req.add_writes();
+        wp->set_measurement("server.metrics");
+        (*wp->mutable_tags())[std::string("host")] = fmt::format("host-{:02d}", hostId);
+        (*wp->mutable_tags())[std::string("rack")] = fmt::format("rack-{}", rackId);
+        wp->add_timestamps(startTs + w * MINUTE_NS);
+        for (size_t f = 0; f < numFields; ++f) {
+            ::timestar_pb::WriteField wf;
+            wf.mutable_double_values()->add_values(dist(rng));
+            (*wp->mutable_fields())[std::string(FIELD_NAMES[f])] = wf;
+        }
+    }
+
+    std::string bytes;
+    req.SerializeToString(&bytes);
+    return bytes;
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // Latency histogram
 // ──────────────────────────────────────────────────────────────────────
@@ -241,9 +307,14 @@ static future<ShardResult> runBenchmark(socket_address addr, unsigned maxConn, s
     auto factory = std::make_unique<http::experimental::basic_connection_factory>(addr);
     auto client = std::make_unique<http_client>(std::move(factory), maxConn);
 
-    // Pre-generate all payloads so timing measures only server throughput.
+    // Pre-generate payloads for the array formats so timing measures only
+    // server throughput. json-batch payloads are generated LAZILY per request
+    // instead: high-cardinality endurance runs (30k batches x ~14MB) would
+    // need hundreds of GB pre-generated, which is exactly the client-side
+    // bad_alloc this loop produced at 130k batches. Lazy generation costs
+    // client CPU during the run, which only matters when benchmarking the
+    // server's peak rate -- use the array formats for that.
     std::vector<std::string> payloads;
-    payloads.reserve(batchCount);
 
     std::mt19937 rng(globalSeed);
     std::uniform_int_distribution<int> hostDist(1, numHosts);
@@ -251,29 +322,33 @@ static future<ShardResult> runBenchmark(socket_address addr, unsigned maxConn, s
 
     constexpr uint64_t BASE_TS = 1'000'000'000'000'000'000ULL;
 
-    for (size_t i = 0; i < batchCount; ++i) {
-        int hid = hostDist(rng);
-        int rid = rackDist(rng);
-        uint64_t startTs = BASE_TS + i * batchSize * MINUTE_NS;
-        if (format == WireFormat::Protobuf) {
-            payloads.push_back(buildPayloadProto(globalSeed, hid, rid, startTs, batchSize));
-        } else if (format == WireFormat::JsonBatch) {
-            payloads.push_back(buildPayloadJsonBatch(globalSeed, numHosts, numRacks, startTs, batchSize));
-        } else {
-            payloads.push_back(buildPayload(globalSeed, hid, rid, startTs, batchSize));
+    const bool lazyPayloads = (format == WireFormat::JsonBatch || format == WireFormat::ProtobufBatch);
+    if (!lazyPayloads) {
+        payloads.reserve(batchCount);
+        for (size_t i = 0; i < batchCount; ++i) {
+            int hid = hostDist(rng);
+            int rid = rackDist(rng);
+            uint64_t startTs = BASE_TS + i * batchSize * MINUTE_NS;
+            if (format == WireFormat::Protobuf) {
+                payloads.push_back(buildPayloadProto(globalSeed, hid, rid, startTs, batchSize));
+            } else {
+                payloads.push_back(buildPayload(globalSeed, hid, rid, startTs, batchSize));
+            }
         }
     }
 
     // Points per successful request: json-batch sends `batchSize` scalar
     // write points (one field each); the array formats send batchSize
     // timestamps × |FIELD_NAMES| fields.
-    const size_t pointsPerRequest = (format == WireFormat::JsonBatch) ? batchSize : batchSize * FIELD_NAMES.size();
+    const size_t pointsPerRequest = (format == WireFormat::JsonBatch || format == WireFormat::ProtobufBatch)
+                                        ? batchSize
+                                        : batchSize * FIELD_NAMES.size();
 
     // MIME type for HTTP requests.  Seastar's write_body() maps file-extension
     // strings to MIME types ("json" → "application/json").  For protobuf there
     // is no built-in mapping, so we call write_body("bin", ...) and then
     // override the Content-Type header directly via set_mime_type().
-    const bool useProto = (format == WireFormat::Protobuf);
+    const bool useProto = (format == WireFormat::Protobuf || format == WireFormat::ProtobufBatch);
 
     auto res = make_lw_shared<ShardResult>();
     auto sem = make_lw_shared<semaphore>(maxConn);
@@ -285,7 +360,20 @@ static future<ShardResult> runBenchmark(socket_address addr, unsigned maxConn, s
         auto t0 = clk::now();
 
         auto req = http::request::make("POST", sstring("localhost"), sstring("/write"));
-        if (useProto) {
+        // Lazy check FIRST: ProtobufBatch is both lazy and proto, and the
+        // pregenerated `payloads` vector is empty in lazy mode -- indexing it
+        // here was an instant segfault.
+        if (lazyPayloads) {
+            const uint64_t startTs = BASE_TS + i * batchSize * MINUTE_NS;
+            if (format == WireFormat::ProtobufBatch) {
+                req.write_body("bin",
+                               sstring(buildPayloadProtoBatch(globalSeed, numHosts, numRacks, startTs, batchSize, i)));
+                req.set_mime_type("application/x-protobuf");
+            } else {
+                req.write_body("json",
+                               sstring(buildPayloadJsonBatch(globalSeed, numHosts, numRacks, startTs, batchSize, i)));
+            }
+        } else if (useProto) {
             req.write_body("bin", sstring(payloads[i]));
             req.set_mime_type("application/x-protobuf");
         } else {
@@ -382,13 +470,18 @@ int main(int argc, char** argv) {
             format = WireFormat::Protobuf;
         } else if (formatStr == "json-batch" || formatStr == "jsonbatch") {
             format = WireFormat::JsonBatch;
+        } else if (formatStr == "protobuf-batch" || formatStr == "proto-batch") {
+            format = WireFormat::ProtobufBatch;
         } else if (formatStr != "json") {
-            fmt::print("ERROR: unknown format '{}'. Use 'json', 'json-batch' or 'protobuf'.\n", formatStr);
+            fmt::print("ERROR: unknown format '{}'. Use 'json', 'json-batch', 'protobuf' or 'protobuf-batch'.\n",
+                       formatStr);
             co_return;
         }
 
         const size_t fieldsPerRow = FIELD_NAMES.size();
-        const size_t pointsPerBatch = (format == WireFormat::JsonBatch) ? batchSize : batchSize * fieldsPerRow;
+        const size_t pointsPerBatch = (format == WireFormat::JsonBatch || format == WireFormat::ProtobufBatch)
+                                          ? batchSize
+                                          : batchSize * fieldsPerRow;
         const size_t totalPoints = batches * pointsPerBatch;
 
         auto addr = socket_address(net::inet_address(host), port);
@@ -398,11 +491,12 @@ int main(int argc, char** argv) {
         fmt::print(" TimeStar C++ Insert Benchmark (Seastar HTTP client)\n");
         fmt::print("{:=<70}\n", "");
         fmt::print("  Server:         {}:{}\n", host, port);
-        fmt::print("  Format:         {}\n", format == WireFormat::Protobuf    ? "protobuf"
-                                             : format == WireFormat::JsonBatch ? "json-batch"
-                                                                               : "json");
+        fmt::print("  Format:         {}\n", format == WireFormat::Protobuf        ? "protobuf"
+                                             : format == WireFormat::ProtobufBatch ? "protobuf-batch"
+                                             : format == WireFormat::JsonBatch     ? "json-batch"
+                                                                                   : "json");
         fmt::print("  Connections:    {} (concurrent HTTP connections)\n", maxConn);
-        if (format == WireFormat::JsonBatch) {
+        if (format == WireFormat::JsonBatch || format == WireFormat::ProtobufBatch) {
             fmt::print("  Batch size:     {} scalar write points per request\n", batchSize);
         } else {
             fmt::print("  Batch size:     {} timestamps x {} fields = {} pts\n", batchSize, fieldsPerRow,

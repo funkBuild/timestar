@@ -282,20 +282,40 @@ seastar::future<> WALFileManager::insertBatch(std::vector<TimeStarInsert<T>>& in
     if (needsRollover) {
         LOG_INSERT_PATH(timestar::wal_log, debug, "[WAL] Memory store rollover needed for batch of {} requests",
                         insertRequests.size());
-        // Rollover the WAL
-        co_await rolloverMemoryStore();
-
-        // Now retry the batch insert with the new memory store.
-        // Pass the same pre-computed size; it's still valid for the fresh WAL.
-        bool retryResult = co_await memoryStores[0]->insertBatch(insertRequests, totalEstimatedSize);
-        if (retryResult) {
-            // The batch still doesn't fit in a fresh WAL - it's too large.
-            // Re-use the already-computed totalEstimatedSize (each per-insert size
-            // is cached in the TimeStarInsert, so no re-iteration is needed).
-            timestar::wal_log.error("Batch insert of {} bytes too large for fresh WAL", totalEstimatedSize);
-            throw timestar::InsertTooLargeException("Insert batch too large - requested " +
-                                                    std::to_string(totalEstimatedSize) +
-                                                    " bytes, exceeds the WAL segment limit. Please reduce batch size.");
+        // Roll over and retry, LOOPING on concurrent fills. A single
+        // rollover-then-retry mistook "the fresh store was already filled by
+        // OTHER in-flight batches" for "this batch can never fit": with N
+        // concurrent high-cardinality batches racing into one fresh store,
+        // whichever retried third got a spurious 413 for a batch that fits an
+        // empty store easily. The two cases are distinguishable -- a batch is
+        // genuinely too large only if it fails against a store that was EMPTY
+        // when it tried.
+        constexpr int kMaxRolloverRetries = 8;
+        for (int attempt = 0;; ++attempt) {
+            co_await rolloverMemoryStore();
+            const bool storeWasEmpty = memoryStores[0]->isEmpty();
+            bool retryResult = co_await memoryStores[0]->insertBatch(insertRequests, totalEstimatedSize);
+            if (!retryResult) {
+                break;  // inserted (store may now be due another rollover; the next insert triggers it)
+            }
+            if (storeWasEmpty) {
+                // Failed against a genuinely fresh store: the batch itself is
+                // the problem. Re-use the already-computed totalEstimatedSize
+                // (each per-insert size is cached in the TimeStarInsert).
+                timestar::wal_log.error("Batch insert of {} bytes too large for fresh WAL", totalEstimatedSize);
+                throw timestar::InsertTooLargeException(
+                    "Insert batch too large - requested " + std::to_string(totalEstimatedSize) +
+                    " bytes, exceeds the WAL segment limit. Please reduce batch size.");
+            }
+            if (attempt >= kMaxRolloverRetries) {
+                // Persistent contention, not size: surface as retryable
+                // backpressure (503 + Retry-After), never as a 413 the client
+                // would respond to by shrinking a batch that is not too big.
+                throw timestar::IngestBacklogException("Shard " + std::to_string(shardId) +
+                                                       " rollover contention: fresh stores filled by concurrent "
+                                                       "batches " +
+                                                       std::to_string(attempt + 1) + " times in a row");
+            }
         }
     }
 
