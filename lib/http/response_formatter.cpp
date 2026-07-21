@@ -10,6 +10,8 @@
 
 #include <cmath>
 #include <cstring>
+#include <seastar/core/coroutine.hh>
+#include <seastar/coroutine/maybe_yield.hh>
 
 namespace timestar::http {
 
@@ -147,47 +149,52 @@ inline void ensureArraySpace(std::string& buf, size_t pos, size_t count) {
 }
 
 // ── Array serialisers ────────────────────────────────────────────────
+//
+// Arrays are written in element slices so the yielding format() coroutine can
+// hand the reactor back between slices — a single multi-million-point series
+// must not serialise as one task (observed as 124ms reactor stalls).  Each
+// slice writer emits elements [from, to), comma-joined, with a leading comma
+// when from > 0; the '[' / ']' brackets are written by the caller.
 
-// Write a uint64_t JSON array using glz::to_chars (digit-pair tables).
-inline size_t appendUint64Array(std::string& buf, size_t pos, const std::vector<uint64_t>& arr) {
-    ensureArraySpace(buf, pos, arr.size());
+// Yield to the reactor after roughly this many serialised elements.
+static constexpr size_t SLICE_ELEMENTS = 65536;
+
+// Write a uint64_t slice using glz::to_chars (digit-pair tables).
+inline size_t appendUint64Slice(std::string& buf, size_t pos, const std::vector<uint64_t>& arr, size_t from,
+                                size_t to) {
+    ensureArraySpace(buf, pos, to - from);
     char* p = buf.data() + pos;
-    *p++ = '[';
-    for (size_t i = 0; i < arr.size(); ++i) {
+    for (size_t i = from; i < to; ++i) {
         if (i > 0)
             *p++ = ',';
         p = glz::to_chars(p, arr[i]);
     }
-    *p++ = ']';
     return static_cast<size_t>(p - buf.data());
 }
 
-// Write a double JSON array using glz::to_chars (Dragonbox).
+// Write a double slice using glz::to_chars (Dragonbox).
 // NaN and Inf are written as JSON null.
-inline size_t appendDoubleArray(std::string& buf, size_t pos, const std::vector<double>& arr) {
-    ensureArraySpace(buf, pos, arr.size());
+inline size_t appendDoubleSlice(std::string& buf, size_t pos, const std::vector<double>& arr, size_t from, size_t to) {
+    ensureArraySpace(buf, pos, to - from);
     char* p = buf.data() + pos;
-    *p++ = '[';
-    for (size_t i = 0; i < arr.size(); ++i) {
+    for (size_t i = from; i < to; ++i) {
         if (i > 0)
             *p++ = ',';
         // Dragonbox handles NaN/Inf by writing "null" (4 bytes)
         p = glz::to_chars(p, arr[i]);
     }
-    *p++ = ']';
     return static_cast<size_t>(p - buf.data());
 }
 
-// Write a bool JSON array.
-inline size_t appendBoolArray(std::string& buf, size_t pos, const std::vector<bool>& arr) {
+// Write a bool slice.
+inline size_t appendBoolSlice(std::string& buf, size_t pos, const std::vector<bool>& arr, size_t from, size_t to) {
     // Max 6 bytes per element ("false,")
-    size_t need = arr.size() * 6 + 2;
+    size_t need = (to - from) * 6 + 2;
     if (pos + need > buf.size()) {
         buf.resize(std::max(buf.size() * 2, pos + need));
     }
     char* p = buf.data() + pos;
-    *p++ = '[';
-    for (size_t i = 0; i < arr.size(); ++i) {
+    for (size_t i = from; i < to; ++i) {
         if (i > 0)
             *p++ = ',';
         if (arr[i]) {
@@ -198,53 +205,67 @@ inline size_t appendBoolArray(std::string& buf, size_t pos, const std::vector<bo
             p += 5;
         }
     }
-    *p++ = ']';
     return static_cast<size_t>(p - buf.data());
 }
 
-// Write a string JSON array.
-inline size_t appendStringArray(std::string& buf, size_t pos, const std::vector<std::string>& arr) {
-    pos = appendChar(buf, pos, '[');
-    for (size_t i = 0; i < arr.size(); ++i) {
+// Write a string slice.
+inline size_t appendStringSlice(std::string& buf, size_t pos, const std::vector<std::string>& arr, size_t from,
+                                size_t to) {
+    for (size_t i = from; i < to; ++i) {
         if (i > 0)
             pos = appendChar(buf, pos, ',');
         pos = appendJsonString(buf, pos, arr[i]);
     }
-    pos = appendChar(buf, pos, ']');
     return pos;
 }
 
-// Write an int64_t JSON array using glz::to_chars.
-inline size_t appendInt64Array(std::string& buf, size_t pos, const std::vector<int64_t>& arr) {
-    ensureArraySpace(buf, pos, arr.size());
+// Write an int64_t slice using glz::to_chars.
+inline size_t appendInt64Slice(std::string& buf, size_t pos, const std::vector<int64_t>& arr, size_t from, size_t to) {
+    ensureArraySpace(buf, pos, to - from);
     char* p = buf.data() + pos;
-    *p++ = '[';
-    for (size_t i = 0; i < arr.size(); ++i) {
+    for (size_t i = from; i < to; ++i) {
         if (i > 0)
             *p++ = ',';
         p = glz::to_chars(p, arr[i]);
     }
-    *p++ = ']';
     return static_cast<size_t>(p - buf.data());
 }
 
-// Dispatch FieldValues variant to the correct array writer.
-inline size_t appendFieldValues(std::string& buf, size_t pos, const FieldValues& values) {
-    return std::visit(
-        [&](const auto& vec) -> size_t {
-            using T = std::decay_t<decltype(vec)>;
-            if constexpr (std::is_same_v<T, std::vector<double>>)
-                return appendDoubleArray(buf, pos, vec);
-            else if constexpr (std::is_same_v<T, std::vector<bool>>)
-                return appendBoolArray(buf, pos, vec);
-            else if constexpr (std::is_same_v<T, std::vector<std::string>>)
-                return appendStringArray(buf, pos, vec);
-            else if constexpr (std::is_same_v<T, std::vector<int64_t>>)
-                return appendInt64Array(buf, pos, vec);
-            else
-                static_assert(sizeof(T) == 0, "unhandled FieldValues alternative — update appendFieldValues");
-        },
-        values);
+// Write a full uint64_t array (brackets included) in yield-bounded slices.
+seastar::future<> appendUint64ArrayYielding(std::string& buf, size_t& pos, const std::vector<uint64_t>& arr) {
+    pos = appendChar(buf, pos, '[');
+    for (size_t from = 0; from < arr.size(); from += SLICE_ELEMENTS) {
+        pos = appendUint64Slice(buf, pos, arr, from, std::min(from + SLICE_ELEMENTS, arr.size()));
+        co_await seastar::coroutine::maybe_yield();
+    }
+    pos = appendChar(buf, pos, ']');
+}
+
+// Write full FieldValues (brackets included) in yield-bounded slices.
+seastar::future<> appendFieldValuesYielding(std::string& buf, size_t& pos, const FieldValues& values) {
+    pos = appendChar(buf, pos, '[');
+    const size_t n = std::visit([](const auto& vec) { return vec.size(); }, values);
+    for (size_t from = 0; from < n; from += SLICE_ELEMENTS) {
+        const size_t to = std::min(from + SLICE_ELEMENTS, n);
+        pos = std::visit(
+            [&](const auto& vec) -> size_t {
+                using T = std::decay_t<decltype(vec)>;
+                if constexpr (std::is_same_v<T, std::vector<double>>)
+                    return appendDoubleSlice(buf, pos, vec, from, to);
+                else if constexpr (std::is_same_v<T, std::vector<bool>>)
+                    return appendBoolSlice(buf, pos, vec, from, to);
+                else if constexpr (std::is_same_v<T, std::vector<std::string>>)
+                    return appendStringSlice(buf, pos, vec, from, to);
+                else if constexpr (std::is_same_v<T, std::vector<int64_t>>)
+                    return appendInt64Slice(buf, pos, vec, from, to);
+                else
+                    static_assert(sizeof(T) == 0,
+                                  "unhandled FieldValues alternative — update appendFieldValuesYielding");
+            },
+            values);
+        co_await seastar::coroutine::maybe_yield();
+    }
+    pos = appendChar(buf, pos, ']');
 }
 
 }  // anonymous namespace
@@ -253,7 +274,7 @@ inline size_t appendFieldValues(std::string& buf, size_t pos, const FieldValues&
 // Public API
 // ──────────────────────────────────────────────────────────────────────
 
-std::string ResponseFormatter::format(QueryResponse& response) {
+seastar::future<std::string> ResponseFormatter::format(QueryResponse& response) {
     // Pre-allocate for the WORST case each point can serialise to, so the buffer
     // never has to grow.
     //
@@ -265,7 +286,16 @@ std::string ResponseFormatter::format(QueryResponse& response) {
     // both live during the copy.
     size_t estimate = static_cast<size_t>(response.statistics.pointCount) * (2 * (MAX_NUM_LEN + 1)) + 512;
     std::string buf;
-    buf.resize(estimate);
+    // resize() zero-fills: one call for a 10M-point response memsets ~660MB in
+    // a single reactor task (observed as a 65ms stall at 3.5M points).  Grow in
+    // bounded steps with a preemption check between them — reserve() first so
+    // the steps never reallocate/copy, only zero-fill.
+    constexpr size_t RESIZE_STEP = 16 << 20;  // 16 MB per step (~4-8ms of zero-fill)
+    buf.reserve(estimate);
+    while (buf.size() < estimate) {
+        buf.resize(std::min(estimate, buf.size() + RESIZE_STEP));
+        co_await seastar::coroutine::maybe_yield();
+    }
     size_t pos = 0;
 
     // {"status":"success","series":[
@@ -330,9 +360,9 @@ std::string ResponseFormatter::format(QueryResponse& response) {
 
             pos = appendJsonString(buf, pos, fieldName);
             pos = appendRaw(buf, pos, R"(:{"timestamps":)");
-            pos = appendUint64Array(buf, pos, fieldData.first);
+            co_await appendUint64ArrayYielding(buf, pos, fieldData.first);
             pos = appendRaw(buf, pos, R"(,"values":)");
-            pos = appendFieldValues(buf, pos, fieldData.second);
+            co_await appendFieldValuesYielding(buf, pos, fieldData.second);
             pos = appendChar(buf, pos, '}');
         }
         pos = appendRaw(buf, pos, "}}");
@@ -359,7 +389,7 @@ std::string ResponseFormatter::format(QueryResponse& response) {
     pos = static_cast<size_t>(p - buf.data());
 
     buf.resize(pos);
-    return buf;
+    co_return buf;
 }
 
 std::string ResponseFormatter::formatError(const std::string& message, const std::string& code) {

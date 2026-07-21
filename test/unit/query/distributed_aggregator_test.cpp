@@ -134,7 +134,7 @@ TEST_F(DistributedAggregatorTest, CreatePartialAggregationsBasic) {
     SeriesResult sr = createSeriesResult("cpu", {{"host", "server1"}}, "usage", timestamps, values);
     std::vector<SeriesResult> seriesResults = {sr};
 
-    auto partials = Aggregator::createPartialAggregations(seriesResults, AggregationMethod::AVG, 0, {});
+    auto partials = Aggregator::createPartialAggregations(seriesResults, AggregationMethod::AVG, 0, {}).get();
 
     ASSERT_EQ(partials.size(), 1);
     EXPECT_EQ(partials[0].measurement, "cpu");
@@ -160,7 +160,7 @@ TEST_F(DistributedAggregatorTest, CreatePartialAggregationsWithInterval) {
     std::vector<SeriesResult> seriesResults = {sr};
 
     uint64_t interval = 2000000000;  // 2 second buckets
-    auto partials = Aggregator::createPartialAggregations(seriesResults, AggregationMethod::AVG, interval, {});
+    auto partials = Aggregator::createPartialAggregations(seriesResults, AggregationMethod::AVG, interval, {}).get();
 
     ASSERT_EQ(partials.size(), 1);
 
@@ -182,19 +182,34 @@ TEST_F(DistributedAggregatorTest, CreatePartialAggregationsWithGroupBy) {
 
     std::vector<SeriesResult> seriesResults = {sr1, sr2};
 
-    // Group by region (should merge server1 and server2 into one group)
-    auto partials = Aggregator::createPartialAggregations(seriesResults, AggregationMethod::AVG, 0, {"region"});
+    // Group by region: at interval == 0 the map phase emits one raw partial
+    // PER SERIES (never folding series into each other — the pre-fix
+    // incremental fold was O(K²·N) and caused reactor stalls); series that
+    // share a group share a groupKey, and the reduce phase merges them.
+    auto partials = Aggregator::createPartialAggregations(seriesResults, AggregationMethod::AVG, 0, {"region"}).get();
 
-    ASSERT_EQ(partials.size(), 1);  // Only one group (us-west)
-    // Tags are encoded in groupKey, not stored separately
-    auto parsedTags = PartialAggregationResult::parseTagsFromGroupKey(partials[0].groupKey);
-    EXPECT_EQ(parsedTags.size(), 1);
-    EXPECT_EQ(parsedTags["region"], "us-west");
-    EXPECT_EQ(partials[0].totalPoints, 6);  // 3 points from each series
+    ASSERT_EQ(partials.size(), 2);                          // One partial per series
+    EXPECT_EQ(partials[0].groupKey, partials[1].groupKey);  // Same group (us-west)
+    for (const auto& partial : partials) {
+        // Tags are encoded in groupKey, not stored separately
+        auto parsedTags = PartialAggregationResult::parseTagsFromGroupKey(partial.groupKey);
+        EXPECT_EQ(parsedTags.size(), 1);
+        EXPECT_EQ(parsedTags.at("region"), "us-west");
+        EXPECT_EQ(partial.totalPoints, 3);
 
-    // cachedTags should be populated by buildGroupKeyDirect()
-    EXPECT_EQ(partials[0].cachedTags.size(), 1);
-    EXPECT_EQ(partials[0].cachedTags["region"], "us-west");
+        // cachedTags should be populated by buildGroupKeyDirect()
+        EXPECT_EQ(partial.cachedTags.size(), 1);
+        EXPECT_EQ(partial.cachedTags.at("region"), "us-west");
+    }
+
+    // The reduce phase folds both series into the single us-west group:
+    // per-timestamp AVG across the two series at each shared timestamp.
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::AVG).get();
+    ASSERT_EQ(grouped.size(), 1);
+    ASSERT_EQ(grouped[0].points.size(), 3);
+    EXPECT_DOUBLE_EQ(grouped[0].points[0].value, 12.5);  // avg(10, 15)
+    EXPECT_DOUBLE_EQ(grouped[0].points[1].value, 22.5);  // avg(20, 25)
+    EXPECT_DOUBLE_EQ(grouped[0].points[2].value, 32.5);  // avg(30, 35)
 }
 
 TEST_F(DistributedAggregatorTest, CreatePartialAggregationsMultipleFields) {
@@ -210,7 +225,7 @@ TEST_F(DistributedAggregatorTest, CreatePartialAggregationsMultipleFields) {
 
     std::vector<SeriesResult> seriesResults = {sr};
 
-    auto partials = Aggregator::createPartialAggregations(seriesResults, AggregationMethod::AVG, 0, {});
+    auto partials = Aggregator::createPartialAggregations(seriesResults, AggregationMethod::AVG, 0, {}).get();
 
     // Should create separate partials for each field
     ASSERT_EQ(partials.size(), 2);
@@ -247,14 +262,14 @@ TEST_F(DistributedAggregatorTest, MergePartialAggregationsGroupedBasic) {
     std::vector<double> values2 = {30.0, 40.0};
     SeriesResult sr2 = createSeriesResult("cpu", {{"host", "server1"}}, "usage", timestamps2, values2);
 
-    auto partials1 = Aggregator::createPartialAggregations({sr1}, AggregationMethod::AVG, 0, {});
-    auto partials2 = Aggregator::createPartialAggregations({sr2}, AggregationMethod::AVG, 0, {});
+    auto partials1 = Aggregator::createPartialAggregations({sr1}, AggregationMethod::AVG, 0, {}).get();
+    auto partials2 = Aggregator::createPartialAggregations({sr2}, AggregationMethod::AVG, 0, {}).get();
 
     std::vector<PartialAggregationResult> allPartials;
     allPartials.insert(allPartials.end(), partials1.begin(), partials1.end());
     allPartials.insert(allPartials.end(), partials2.begin(), partials2.end());
 
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::AVG);
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::AVG).get();
 
     ASSERT_EQ(grouped.size(), 1);  // One group (same measurement/tags/field)
     EXPECT_EQ(grouped[0].measurement, "cpu");
@@ -282,14 +297,14 @@ TEST_F(DistributedAggregatorTest, MergePartialAggregationsGroupedWithBuckets) {
 
     uint64_t interval = 2000000000;  // 2 second buckets
 
-    auto partials1 = Aggregator::createPartialAggregations({sr1}, AggregationMethod::AVG, interval, {"host"});
-    auto partials2 = Aggregator::createPartialAggregations({sr2}, AggregationMethod::AVG, interval, {"host"});
+    auto partials1 = Aggregator::createPartialAggregations({sr1}, AggregationMethod::AVG, interval, {"host"}).get();
+    auto partials2 = Aggregator::createPartialAggregations({sr2}, AggregationMethod::AVG, interval, {"host"}).get();
 
     std::vector<PartialAggregationResult> allPartials;
     allPartials.insert(allPartials.end(), partials1.begin(), partials1.end());
     allPartials.insert(allPartials.end(), partials2.begin(), partials2.end());
 
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::AVG);
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::AVG).get();
 
     // Should have 2 groups (server1 and server2)
     ASSERT_EQ(grouped.size(), 2);
@@ -311,16 +326,16 @@ TEST_F(DistributedAggregatorTest, MergePartialAggregationsGroupedAVG) {
     SeriesResult sr2 = createSeriesResult("cpu", {}, "usage", timestamps, values2);
     SeriesResult sr3 = createSeriesResult("cpu", {}, "usage", timestamps, values3);
 
-    auto partials1 = Aggregator::createPartialAggregations({sr1}, AggregationMethod::AVG, 0, {});
-    auto partials2 = Aggregator::createPartialAggregations({sr2}, AggregationMethod::AVG, 0, {});
-    auto partials3 = Aggregator::createPartialAggregations({sr3}, AggregationMethod::AVG, 0, {});
+    auto partials1 = Aggregator::createPartialAggregations({sr1}, AggregationMethod::AVG, 0, {}).get();
+    auto partials2 = Aggregator::createPartialAggregations({sr2}, AggregationMethod::AVG, 0, {}).get();
+    auto partials3 = Aggregator::createPartialAggregations({sr3}, AggregationMethod::AVG, 0, {}).get();
 
     std::vector<PartialAggregationResult> allPartials;
     allPartials.insert(allPartials.end(), partials1.begin(), partials1.end());
     allPartials.insert(allPartials.end(), partials2.begin(), partials2.end());
     allPartials.insert(allPartials.end(), partials3.begin(), partials3.end());
 
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::AVG);
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::AVG).get();
 
     ASSERT_EQ(grouped.size(), 1);
     ASSERT_EQ(grouped[0].points.size(), 1);
@@ -338,16 +353,16 @@ TEST_F(DistributedAggregatorTest, MergePartialAggregationsGroupedMIN) {
     SeriesResult sr2 = createSeriesResult("cpu", {}, "usage", timestamps, values2);
     SeriesResult sr3 = createSeriesResult("cpu", {}, "usage", timestamps, values3);
 
-    auto partials1 = Aggregator::createPartialAggregations({sr1}, AggregationMethod::MIN, 0, {});
-    auto partials2 = Aggregator::createPartialAggregations({sr2}, AggregationMethod::MIN, 0, {});
-    auto partials3 = Aggregator::createPartialAggregations({sr3}, AggregationMethod::MIN, 0, {});
+    auto partials1 = Aggregator::createPartialAggregations({sr1}, AggregationMethod::MIN, 0, {}).get();
+    auto partials2 = Aggregator::createPartialAggregations({sr2}, AggregationMethod::MIN, 0, {}).get();
+    auto partials3 = Aggregator::createPartialAggregations({sr3}, AggregationMethod::MIN, 0, {}).get();
 
     std::vector<PartialAggregationResult> allPartials;
     allPartials.insert(allPartials.end(), partials1.begin(), partials1.end());
     allPartials.insert(allPartials.end(), partials2.begin(), partials2.end());
     allPartials.insert(allPartials.end(), partials3.begin(), partials3.end());
 
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::MIN);
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::MIN).get();
 
     ASSERT_EQ(grouped.size(), 1);
     ASSERT_EQ(grouped[0].points.size(), 1);
@@ -364,16 +379,16 @@ TEST_F(DistributedAggregatorTest, MergePartialAggregationsGroupedMAX) {
     SeriesResult sr2 = createSeriesResult("cpu", {}, "usage", timestamps, values2);
     SeriesResult sr3 = createSeriesResult("cpu", {}, "usage", timestamps, values3);
 
-    auto partials1 = Aggregator::createPartialAggregations({sr1}, AggregationMethod::MAX, 0, {});
-    auto partials2 = Aggregator::createPartialAggregations({sr2}, AggregationMethod::MAX, 0, {});
-    auto partials3 = Aggregator::createPartialAggregations({sr3}, AggregationMethod::MAX, 0, {});
+    auto partials1 = Aggregator::createPartialAggregations({sr1}, AggregationMethod::MAX, 0, {}).get();
+    auto partials2 = Aggregator::createPartialAggregations({sr2}, AggregationMethod::MAX, 0, {}).get();
+    auto partials3 = Aggregator::createPartialAggregations({sr3}, AggregationMethod::MAX, 0, {}).get();
 
     std::vector<PartialAggregationResult> allPartials;
     allPartials.insert(allPartials.end(), partials1.begin(), partials1.end());
     allPartials.insert(allPartials.end(), partials2.begin(), partials2.end());
     allPartials.insert(allPartials.end(), partials3.begin(), partials3.end());
 
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::MAX);
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::MAX).get();
 
     ASSERT_EQ(grouped.size(), 1);
     ASSERT_EQ(grouped[0].points.size(), 1);
@@ -390,16 +405,16 @@ TEST_F(DistributedAggregatorTest, MergePartialAggregationsGroupedSUM) {
     SeriesResult sr2 = createSeriesResult("cpu", {}, "usage", timestamps, values2);
     SeriesResult sr3 = createSeriesResult("cpu", {}, "usage", timestamps, values3);
 
-    auto partials1 = Aggregator::createPartialAggregations({sr1}, AggregationMethod::SUM, 0, {});
-    auto partials2 = Aggregator::createPartialAggregations({sr2}, AggregationMethod::SUM, 0, {});
-    auto partials3 = Aggregator::createPartialAggregations({sr3}, AggregationMethod::SUM, 0, {});
+    auto partials1 = Aggregator::createPartialAggregations({sr1}, AggregationMethod::SUM, 0, {}).get();
+    auto partials2 = Aggregator::createPartialAggregations({sr2}, AggregationMethod::SUM, 0, {}).get();
+    auto partials3 = Aggregator::createPartialAggregations({sr3}, AggregationMethod::SUM, 0, {}).get();
 
     std::vector<PartialAggregationResult> allPartials;
     allPartials.insert(allPartials.end(), partials1.begin(), partials1.end());
     allPartials.insert(allPartials.end(), partials2.begin(), partials2.end());
     allPartials.insert(allPartials.end(), partials3.begin(), partials3.end());
 
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::SUM);
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::SUM).get();
 
     ASSERT_EQ(grouped.size(), 1);
     ASSERT_EQ(grouped[0].points.size(), 1);
@@ -418,16 +433,16 @@ TEST_F(DistributedAggregatorTest, MergePartialAggregationsGroupedLATEST) {
     SeriesResult sr2 = createSeriesResult("cpu", {}, "usage", timestamps2, values2);
     SeriesResult sr3 = createSeriesResult("cpu", {}, "usage", timestamps3, values3);
 
-    auto partials1 = Aggregator::createPartialAggregations({sr1}, AggregationMethod::LATEST, 0, {});
-    auto partials2 = Aggregator::createPartialAggregations({sr2}, AggregationMethod::LATEST, 0, {});
-    auto partials3 = Aggregator::createPartialAggregations({sr3}, AggregationMethod::LATEST, 0, {});
+    auto partials1 = Aggregator::createPartialAggregations({sr1}, AggregationMethod::LATEST, 0, {}).get();
+    auto partials2 = Aggregator::createPartialAggregations({sr2}, AggregationMethod::LATEST, 0, {}).get();
+    auto partials3 = Aggregator::createPartialAggregations({sr3}, AggregationMethod::LATEST, 0, {}).get();
 
     std::vector<PartialAggregationResult> allPartials;
     allPartials.insert(allPartials.end(), partials1.begin(), partials1.end());
     allPartials.insert(allPartials.end(), partials2.begin(), partials2.end());
     allPartials.insert(allPartials.end(), partials3.begin(), partials3.end());
 
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::LATEST);
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::LATEST).get();
 
     ASSERT_EQ(grouped.size(), 1);
     // LATEST without an interval does NOT collapse: it is a cross-series
@@ -447,7 +462,7 @@ TEST_F(DistributedAggregatorTest, MergePartialAggregationsGroupedLATEST) {
 TEST_F(DistributedAggregatorTest, MergePartialAggregationsGroupedEmptyInput) {
     std::vector<PartialAggregationResult> emptyPartials;
 
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(emptyPartials, AggregationMethod::AVG);
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(emptyPartials, AggregationMethod::AVG).get();
 
     EXPECT_EQ(grouped.size(), 0);
 }
@@ -463,15 +478,15 @@ TEST_F(DistributedAggregatorTest, HashBasedGroupingConsistency) {
     SeriesResult sr2 =
         createSeriesResult("cpu", {{"host", "server1"}, {"region", "us-west"}}, "usage", timestamps, values);
 
-    auto partials1 = Aggregator::createPartialAggregations({sr1}, AggregationMethod::AVG, 0, {"host", "region"});
-    auto partials2 = Aggregator::createPartialAggregations({sr2}, AggregationMethod::AVG, 0, {"host", "region"});
+    auto partials1 = Aggregator::createPartialAggregations({sr1}, AggregationMethod::AVG, 0, {"host", "region"}).get();
+    auto partials2 = Aggregator::createPartialAggregations({sr2}, AggregationMethod::AVG, 0, {"host", "region"}).get();
 
     // Hash should be identical
     EXPECT_EQ(partials1[0].groupKeyHash, partials2[0].groupKeyHash);
 
     // Should merge into single group
     std::vector<PartialAggregationResult> allPartials = {partials1[0], partials2[0]};
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::AVG);
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::AVG).get();
 
     ASSERT_EQ(grouped.size(), 1);
 }

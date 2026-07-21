@@ -1,5 +1,5 @@
-#include "../../../lib/http/response_formatter.hpp"
 #include "../../../lib/http/http_query_handler.hpp"
+#include "../../../lib/http/response_formatter.hpp"
 
 #include <glaze/json.hpp>
 
@@ -32,7 +32,8 @@ struct SeriesParsed {
 template <>
 struct glz::meta<SeriesParsed> {
     using T = SeriesParsed;
-    static constexpr auto value = object("measurement", &T::measurement, "groupTags", &T::groupTags, "fields", &T::fields);
+    static constexpr auto value =
+        object("measurement", &T::measurement, "groupTags", &T::groupTags, "fields", &T::fields);
 };
 
 struct StatsParsed {
@@ -44,8 +45,8 @@ struct StatsParsed {
 template <>
 struct glz::meta<StatsParsed> {
     using T = StatsParsed;
-    static constexpr auto value =
-        object("series_count", &T::series_count, "point_count", &T::point_count, "execution_time_ms", &T::execution_time_ms);
+    static constexpr auto value = object("series_count", &T::series_count, "point_count", &T::point_count,
+                                         "execution_time_ms", &T::execution_time_ms);
 };
 
 struct FullResponseParsed {
@@ -84,7 +85,8 @@ static QueryResponse buildResponseWithTags(std::map<std::string, std::string> ta
 // JSON-level unescaping (which glaze already did for us).
 static std::pair<std::string, std::string> splitGroupTag(const std::string& tag) {
     auto eq = tag.find('=');
-    if (eq == std::string::npos) return {tag, ""};
+    if (eq == std::string::npos)
+        return {tag, ""};
     return {tag.substr(0, eq), tag.substr(eq + 1)};
 }
 
@@ -94,7 +96,7 @@ class ResponseFormatterTagEscapeTest : public ::testing::Test {};
 
 TEST_F(ResponseFormatterTagEscapeTest, TagValueWithDoubleQuoteProducesValidJson) {
     auto resp = buildResponseWithTags({{"host", "server-\"01\""}});
-    std::string json = ResponseFormatter::format(resp);
+    std::string json = ResponseFormatter::format(resp).get();
 
     // Must parse as valid JSON
     FullResponseParsed parsed;
@@ -111,7 +113,7 @@ TEST_F(ResponseFormatterTagEscapeTest, TagValueWithDoubleQuoteProducesValidJson)
 
 TEST_F(ResponseFormatterTagEscapeTest, TagValueWithBackslashProducesValidJson) {
     auto resp = buildResponseWithTags({{"path", R"(C:\data\tsm)"}});
-    std::string json = ResponseFormatter::format(resp);
+    std::string json = ResponseFormatter::format(resp).get();
 
     FullResponseParsed parsed;
     auto err = glz::read_json(parsed, json);
@@ -126,7 +128,7 @@ TEST_F(ResponseFormatterTagEscapeTest, TagValueWithBackslashProducesValidJson) {
 TEST_F(ResponseFormatterTagEscapeTest, TagValueWithControlCharsProducesValidJson) {
     std::string malicious = "val\x01ue\twith\nnewline";
     auto resp = buildResponseWithTags({{"tag", malicious}});
-    std::string json = ResponseFormatter::format(resp);
+    std::string json = ResponseFormatter::format(resp).get();
 
     // Raw control characters must not appear in the JSON output
     EXPECT_EQ(json.find('\x01'), std::string::npos) << "Raw 0x01 must be escaped";
@@ -144,7 +146,7 @@ TEST_F(ResponseFormatterTagEscapeTest, TagValueWithControlCharsProducesValidJson
 TEST_F(ResponseFormatterTagEscapeTest, TagKeyWithSpecialCharsProducesValidJson) {
     // Tag KEY containing quotes and backslashes
     auto resp = buildResponseWithTags({{R"(my"key\here)", "normal_value"}});
-    std::string json = ResponseFormatter::format(resp);
+    std::string json = ResponseFormatter::format(resp).get();
 
     FullResponseParsed parsed;
     auto err = glz::read_json(parsed, json);
@@ -158,7 +160,7 @@ TEST_F(ResponseFormatterTagEscapeTest, TagKeyWithSpecialCharsProducesValidJson) 
 
 TEST_F(ResponseFormatterTagEscapeTest, BothKeyAndValueNeedEscaping) {
     auto resp = buildResponseWithTags({{R"(k"1)", R"(v"2\3)"}});
-    std::string json = ResponseFormatter::format(resp);
+    std::string json = ResponseFormatter::format(resp).get();
 
     FullResponseParsed parsed;
     auto err = glz::read_json(parsed, json);
@@ -176,7 +178,7 @@ TEST_F(ResponseFormatterTagEscapeTest, MultipleTagsSomeNeedEscaping) {
         {"location", "us-west"},
     };
     auto resp = buildResponseWithTags(tags);
-    std::string json = ResponseFormatter::format(resp);
+    std::string json = ResponseFormatter::format(resp).get();
 
     FullResponseParsed parsed;
     auto err = glz::read_json(parsed, json);
@@ -198,7 +200,7 @@ TEST_F(ResponseFormatterTagEscapeTest, MultipleTagsSomeNeedEscaping) {
 
 TEST_F(ResponseFormatterTagEscapeTest, TagValueIsEntirelyQuotes) {
     auto resp = buildResponseWithTags({{"x", "\"\"\""}});
-    std::string json = ResponseFormatter::format(resp);
+    std::string json = ResponseFormatter::format(resp).get();
 
     FullResponseParsed parsed;
     auto err = glz::read_json(parsed, json);
@@ -213,7 +215,7 @@ TEST_F(ResponseFormatterTagEscapeTest, InjectionAttemptCannotBreakJson) {
     // Attempt to inject a new JSON key via tag value
     std::string injection = R"(val","injected":"evil)";
     auto resp = buildResponseWithTags({{"tag", injection}});
-    std::string json = ResponseFormatter::format(resp);
+    std::string json = ResponseFormatter::format(resp).get();
 
     FullResponseParsed parsed;
     auto err = glz::read_json(parsed, json);
@@ -222,7 +224,8 @@ TEST_F(ResponseFormatterTagEscapeTest, InjectionAttemptCannotBreakJson) {
     // The injected key must NOT appear as a real JSON key
     auto [key, value] = splitGroupTag(parsed.series[0].groupTags[0]);
     EXPECT_EQ(key, "tag");
-    EXPECT_EQ(value, injection) << "Injection payload must be preserved verbatim as a value, not interpreted as JSON structure";
+    EXPECT_EQ(value, injection)
+        << "Injection payload must be preserved verbatim as a value, not interpreted as JSON structure";
 
     // Double-check: there should be exactly one series with exactly one groupTag
     EXPECT_EQ(parsed.series.size(), 1u);
@@ -232,7 +235,7 @@ TEST_F(ResponseFormatterTagEscapeTest, InjectionAttemptCannotBreakJson) {
 TEST_F(ResponseFormatterTagEscapeTest, NormalTagsStillWorkAfterFix) {
     // Regression check: normal ASCII tags must still format correctly
     auto resp = buildResponseWithTags({{"host", "server-01"}, {"region", "us-east-1"}});
-    std::string json = ResponseFormatter::format(resp);
+    std::string json = ResponseFormatter::format(resp).get();
 
     FullResponseParsed parsed;
     auto err = glz::read_json(parsed, json);

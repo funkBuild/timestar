@@ -123,8 +123,8 @@ TEST_F(AggregatorTest, AggregateMultipleSeries) {
     auto series2 = AggregatorTestHelper::createSeries("test", {}, "value", {2000000000, 3000000000, 4000000000},
                                                       {15.0, 25.0, 35.0});
 
-    auto partials = Aggregator::createPartialAggregations({series1, series2}, AggregationMethod::AVG, 0, {});
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::AVG);
+    auto partials = Aggregator::createPartialAggregations({series1, series2}, AggregationMethod::AVG, 0, {}).get();
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::AVG).get();
 
     ASSERT_EQ(grouped.size(), 1);
     auto& points = grouped[0].points;
@@ -159,22 +159,27 @@ TEST_F(AggregatorTest, GroupByAggregation) {
 
     // Group by region
     auto partials =
-        Aggregator::createPartialAggregations({westSeries, eastSeries}, AggregationMethod::AVG, 0, {"region"});
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::AVG);
+        Aggregator::createPartialAggregations({westSeries, eastSeries}, AggregationMethod::AVG, 0, {"region"}).get();
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::AVG).get();
 
     ASSERT_EQ(grouped.size(), 2);  // Two groups
 
-    // Check both groups exist
+    // Check both groups exist.  Single-series groups come back as raw
+    // (timestamps, values) vectors — normalize via toPoints (same handling as
+    // the production HTTP handler).
     bool hasWest = false, hasEast = false;
     for (const auto& g : grouped) {
+        auto points = AggregatorTestHelper::toPoints(g);
         if (g.tags.at("region") == "us-west") {
             hasWest = true;
-            EXPECT_EQ(g.points.size(), 10);
-            EXPECT_DOUBLE_EQ(g.points[0].value, 10.0);
+            EXPECT_EQ(points.size(), 10);
+            ASSERT_FALSE(points.empty());
+            EXPECT_DOUBLE_EQ(points[0].value, 10.0);
         } else if (g.tags.at("region") == "us-east") {
             hasEast = true;
-            EXPECT_EQ(g.points.size(), 10);
-            EXPECT_DOUBLE_EQ(g.points[0].value, 20.0);
+            EXPECT_EQ(points.size(), 10);
+            ASSERT_FALSE(points.empty());
+            EXPECT_DOUBLE_EQ(points[0].value, 20.0);
         }
     }
     EXPECT_TRUE(hasWest && hasEast);
@@ -201,15 +206,16 @@ TEST_F(AggregatorTest, TimeIntervalWithMax) {
 }
 
 TEST_F(AggregatorTest, InvalidInput) {
-    // Mismatched sizes - distributed aggregation handles this gracefully
-    // Empty timestamps with values creates a group with no points
+    // Mismatched sizes - distributed aggregation handles this gracefully.
+    // A series with no timestamps carries no points, so it produces no
+    // partial and no group at all (production never emits an empty series:
+    // both the pushdown and fallback paths drop zero-point results).
     auto series = AggregatorTestHelper::createSeries("test", {}, "value", {}, {10.0, 20.0, 30.0});
-    auto partials = Aggregator::createPartialAggregations({series}, AggregationMethod::AVG, 0, {});
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::AVG);
+    auto partials = Aggregator::createPartialAggregations({series}, AggregationMethod::AVG, 0, {}).get();
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::AVG).get();
 
-    // Distributed aggregation creates a group even with no valid points
-    ASSERT_EQ(grouped.size(), 1);
-    EXPECT_EQ(grouped[0].points.size(), 0);
+    EXPECT_EQ(partials.size(), 0);
+    EXPECT_EQ(grouped.size(), 0);
 }
 
 TEST_F(AggregatorTest, TimeIntervalWithSum) {

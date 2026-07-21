@@ -82,7 +82,11 @@ add_library(libtimestar_proto_conv STATIC
     http/proto_write_fast_path.cpp
 )
 timestar_set_project_warnings(libtimestar_proto_conv)
-target_link_libraries(libtimestar_proto_conv PRIVATE timestar_proto)
+# Seastar::seastar: formatQueryResponseYielding() is a coroutine (yields to the
+# reactor between per-series compression passes).  Linking seastar here is safe
+# w.r.t. the ODR isolation above — the collision risk is between proto-generated
+# and internal TimeStar types, not seastar's.
+target_link_libraries(libtimestar_proto_conv PRIVATE timestar_proto Seastar::seastar)
 target_include_directories(libtimestar_proto_conv PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/http
     ${CMAKE_CURRENT_SOURCE_DIR}/core

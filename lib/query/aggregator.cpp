@@ -8,6 +8,8 @@
 #include <cmath>
 #include <limits>
 #include <queue>
+#include <seastar/core/coroutine.hh>
+#include <seastar/coroutine/maybe_yield.hh>
 #include <stdexcept>
 #include <unordered_map>
 
@@ -17,59 +19,11 @@ namespace timestar {
 // DISTRIBUTED AGGREGATION
 // ============================================================================
 
-// Merge sorted raw (timestamps, values) into an existing sorted (timestamps, states).
-// Both inputs must be sorted by timestamp. Duplicate timestamps are merged via
-// AggregationState::addValue. O(n+m) time, O(n+m) space for the output buffer.
-static void mergeSortedRawInto(std::vector<uint64_t>& baseTs, std::vector<AggregationState>& baseStates,
-                               const std::vector<uint64_t>& newTs, const std::vector<double>& newValues) {
-    // Inherit collectRaw from existing states so new states match
-    const bool needsRaw = !baseStates.empty() && baseStates[0].collectRaw;
-
-    std::vector<uint64_t> mergedTs;
-    std::vector<AggregationState> mergedStates;
-    mergedTs.reserve(baseTs.size() + newTs.size());
-    mergedStates.reserve(baseTs.size() + newTs.size());
-
-    size_t i = 0, j = 0;
-    while (i < baseTs.size() && j < newTs.size()) {
-        if (baseTs[i] < newTs[j]) {
-            mergedTs.push_back(baseTs[i]);
-            mergedStates.push_back(std::move(baseStates[i]));
-            i++;
-        } else if (baseTs[i] > newTs[j]) {
-            mergedTs.push_back(newTs[j]);
-            AggregationState s;
-            s.collectRaw = needsRaw;
-            s.addValue(newValues[j], newTs[j]);
-            mergedStates.push_back(s);
-            j++;
-        } else {
-            // Same timestamp: merge into existing state
-            mergedTs.push_back(baseTs[i]);
-            AggregationState s = std::move(baseStates[i]);
-            s.addValue(newValues[j], newTs[j]);
-            mergedStates.push_back(std::move(s));
-            i++;
-            j++;
-        }
-    }
-    while (i < baseTs.size()) {
-        mergedTs.push_back(baseTs[i]);
-        mergedStates.push_back(std::move(baseStates[i]));
-        i++;
-    }
-    while (j < newTs.size()) {
-        mergedTs.push_back(newTs[j]);
-        AggregationState s;
-        s.collectRaw = needsRaw;
-        s.addValue(newValues[j], newTs[j]);
-        mergedStates.push_back(s);
-        j++;
-    }
-
-    baseTs = std::move(mergedTs);
-    baseStates = std::move(mergedStates);
-}
+// Yield to the reactor after roughly this many processed points.  Chunked
+// (never per-point: a per-point co_await measured 15x slower on the insert
+// path) so seastar::coroutine::maybe_yield() is a cheap need_preempt() check
+// that only suspends at the scheduler's task quota.
+static constexpr size_t YIELD_CHUNK_POINTS = 65536;
 
 // ============================================================================
 // N-WAY MERGE (replaces O(K²N) pairwise merge with O(KN log K) heap merge)
@@ -91,9 +45,9 @@ static bool allTimestampsIdentical(const std::vector<PartialAggregationResult*>&
 // SIMD element-wise fold for aligned-timestamp raw-value partials.
 // Combines K value arrays into one using the aggregation method.
 // Outputs merged (timestamps, values, counts). O(N) time, zero merge overhead.
-static void foldAlignedRawValues(const std::vector<PartialAggregationResult*>& partials, AggregationMethod method,
-                                 std::vector<uint64_t>& outTs, std::vector<double>& outVals,
-                                 std::vector<size_t>& outCounts) {
+static seastar::future<> foldAlignedRawValues(const std::vector<PartialAggregationResult*>& partials,
+                                              AggregationMethod method, std::vector<uint64_t>& outTs,
+                                              std::vector<double>& outVals, std::vector<size_t>& outCounts) {
     const size_t N = partials[0]->sortedTimestamps.size();
     const size_t K = partials.size();
 
@@ -106,41 +60,46 @@ static void foldAlignedRawValues(const std::vector<PartialAggregationResult*>& p
         const double* src = partials[s]->sortedValues.data();
         double* dst = outVals.data();
 
-        // Element-wise fold. GCC -O3 auto-vectorizes these loops well.
-        // Highway SIMD dispatch overhead negates benefit for the simple add/min/max
-        // patterns here (measured: no improvement over auto-vectorized scalar).
-        switch (method) {
-            case AggregationMethod::AVG:
-            case AggregationMethod::SUM:
-                for (size_t i = 0; i < N; ++i)
-                    dst[i] += src[i];
-                break;
-            case AggregationMethod::COUNT:
-                // COUNT only needs to track the number of contributing partials
-                // per point (handled via outCounts), not accumulate values.
-                break;
-            case AggregationMethod::MIN:
-                for (size_t i = 0; i < N; ++i)
-                    dst[i] = std::min(dst[i], src[i]);
-                break;
-            case AggregationMethod::MAX:
-                for (size_t i = 0; i < N; ++i)
-                    dst[i] = std::max(dst[i], src[i]);
-                break;
-            case AggregationMethod::LATEST:
-                // Keep existing value (both partials have same timestamp)
-                break;
-            case AggregationMethod::FIRST:
-                break;
-            // These methods require full AggregationState; should not reach here.
-            case AggregationMethod::SPREAD:
-            case AggregationMethod::STDDEV:
-            case AggregationMethod::STDVAR:
-            case AggregationMethod::MEDIAN:
-            case AggregationMethod::EXACT_MEDIAN:
-                throw std::logic_error("foldAlignedRawValues called for unsupported method");
-            default:
-                throw std::logic_error("foldAlignedRawValues called for unknown method");
+        // Element-wise fold, in yield-bounded segments.  Within a segment the
+        // loops stay branch-free so GCC -O3 auto-vectorizes them well (Highway
+        // SIMD dispatch overhead negates benefit for simple add/min/max —
+        // measured: no improvement over auto-vectorized scalar).
+        for (size_t seg = 0; seg < N; seg += YIELD_CHUNK_POINTS) {
+            const size_t end = std::min(seg + YIELD_CHUNK_POINTS, N);
+            switch (method) {
+                case AggregationMethod::AVG:
+                case AggregationMethod::SUM:
+                    for (size_t i = seg; i < end; ++i)
+                        dst[i] += src[i];
+                    break;
+                case AggregationMethod::COUNT:
+                    // COUNT only needs to track the number of contributing partials
+                    // per point (handled via outCounts), not accumulate values.
+                    break;
+                case AggregationMethod::MIN:
+                    for (size_t i = seg; i < end; ++i)
+                        dst[i] = std::min(dst[i], src[i]);
+                    break;
+                case AggregationMethod::MAX:
+                    for (size_t i = seg; i < end; ++i)
+                        dst[i] = std::max(dst[i], src[i]);
+                    break;
+                case AggregationMethod::LATEST:
+                    // Keep existing value (both partials have same timestamp)
+                    break;
+                case AggregationMethod::FIRST:
+                    break;
+                // These methods require full AggregationState; should not reach here.
+                case AggregationMethod::SPREAD:
+                case AggregationMethod::STDDEV:
+                case AggregationMethod::STDVAR:
+                case AggregationMethod::MEDIAN:
+                case AggregationMethod::EXACT_MEDIAN:
+                    throw std::logic_error("foldAlignedRawValues called for unsupported method");
+                default:
+                    throw std::logic_error("foldAlignedRawValues called for unknown method");
+            }
+            co_await seastar::coroutine::maybe_yield();
         }
     }
 }
@@ -155,8 +114,9 @@ static void foldAlignedRawValues(const std::vector<PartialAggregationResult*>& p
 // Pulls per-partial elements off a min-heap ordered by timestamp; same
 // semantics as the unrolled nWayMerge* variants below.
 template <class Item, class Init, class Fold>
-static void nWayHeapMerge(const std::vector<PartialAggregationResult*>& partials, std::vector<uint64_t>& outTs,
-                          std::vector<Item>& outItems, Init init, Fold fold) {
+static seastar::future<> nWayHeapMerge(const std::vector<PartialAggregationResult*>& partials,
+                                       std::vector<uint64_t>& outTs, std::vector<Item>& outItems, Init init,
+                                       Fold fold) {
     const size_t K = partials.size();
 
     size_t totalSize = 0;
@@ -179,6 +139,7 @@ static void nWayHeapMerge(const std::vector<PartialAggregationResult*>& partials
         }
     }
 
+    size_t sinceYield = 0;
     while (!heap.empty()) {
         auto [ts, pIdx, pos] = heap.top();
         heap.pop();
@@ -194,15 +155,20 @@ static void nWayHeapMerge(const std::vector<PartialAggregationResult*>& partials
         if (nextPos < partials[pIdx]->sortedTimestamps.size()) {
             heap.push({partials[pIdx]->sortedTimestamps[nextPos], pIdx, nextPos});
         }
+
+        if (++sinceYield >= YIELD_CHUNK_POINTS) {
+            sinceYield = 0;
+            co_await seastar::coroutine::maybe_yield();
+        }
     }
 }
 
 // N-way heap merge for raw-value partials with mismatched timestamps.
 // On duplicate timestamps the value is folded per `method`; outCounts tracks
 // how many partials contributed at each output timestamp.
-static void nWayMergeRawValues(std::vector<PartialAggregationResult*>& partials, AggregationMethod method,
-                               std::vector<uint64_t>& outTs, std::vector<double>& outVals,
-                               std::vector<size_t>& outCounts) {
+static seastar::future<> nWayMergeRawValues(std::vector<PartialAggregationResult*>& partials, AggregationMethod method,
+                                            std::vector<uint64_t>& outTs, std::vector<double>& outVals,
+                                            std::vector<size_t>& outCounts) {
     outCounts.reserve(outTs.capacity());
     auto foldDuplicate = [method](double existing, double incoming) -> double {
         switch (method) {
@@ -230,22 +196,22 @@ static void nWayMergeRawValues(std::vector<PartialAggregationResult*>& partials,
                 return existing;
         }
     };
-    nWayHeapMerge<double>(
+    return nWayHeapMerge<double>(
         partials, outTs, outVals,
-        [&](const PartialAggregationResult& p, size_t pos) {
+        [&outCounts](const PartialAggregationResult& p, size_t pos) {
             outCounts.push_back(1);
             return p.sortedValues[pos];
         },
-        [&](double& item, const PartialAggregationResult& p, size_t pos) {
+        [&outCounts, foldDuplicate](double& item, const PartialAggregationResult& p, size_t pos) {
             item = foldDuplicate(item, p.sortedValues[pos]);
             outCounts.back()++;
         });
 }
 
 // N-way heap merge for AggregationState partials.
-static void nWayMergeStates(std::vector<PartialAggregationResult*>& partials, std::vector<uint64_t>& outTs,
-                            std::vector<AggregationState>& outStates, AggregationMethod method) {
-    nWayHeapMerge<AggregationState>(
+static seastar::future<> nWayMergeStates(std::vector<PartialAggregationResult*>& partials, std::vector<uint64_t>& outTs,
+                                         std::vector<AggregationState>& outStates, AggregationMethod method) {
+    return nWayHeapMerge<AggregationState>(
         partials, outTs, outStates,
         [](const PartialAggregationResult& p, size_t pos) {
             // The original implementation moved out of partials[pIdx]->sortedStates[pos];
@@ -258,9 +224,84 @@ static void nWayMergeStates(std::vector<PartialAggregationResult*>& partials, st
         });
 }
 
-std::vector<PartialAggregationResult> Aggregator::createPartialAggregations(
+seastar::future<std::vector<PartialAggregationResult>> Aggregator::createPartialAggregations(
     const std::vector<timestar::SeriesResult>& seriesResults, AggregationMethod method, uint64_t interval,
     const std::vector<std::string>& groupByTags) {
+    size_t pointsSinceYield = 0;
+
+    // ── interval == 0: one RAW partial per (series, field) ──────────────────
+    //
+    // Do NOT fold series that share a group into one partial here.  The pre-fix
+    // code merged each additional series into the group's accumulated state
+    // vector (re-copying it every time — O(K²·N) for K series in a group, the
+    // 980ms-reactor-stall incident of Jul 2026), and materialized a 120-byte
+    // AggregationState per point.  Emitting compact raw partials instead makes
+    // this pass O(N) copies, and hands the single K-way group merge to
+    // mergePartialAggregationsGrouped — exactly how partials produced by the
+    // pushdown path already flow.  Raw is correct for every method: the merge
+    // folds foldable methods from raw directly (methodCanFoldRaw) and builds
+    // AggregationStates itself for the ones that need them (SPREAD/STDDEV/
+    // STDVAR/MEDIAN), so the result cannot depend on which path produced the
+    // partial.
+    if (interval == 0) {
+        std::vector<PartialAggregationResult> result;
+        result.reserve(seriesResults.size());
+
+        for (const auto& series : seriesResults) {
+            for (const auto& [fieldName, fieldData] : series.fields) {
+                const auto& timestamps = fieldData.first;
+                const auto& values = fieldData.second;
+                if (timestamps.empty()) {
+                    continue;
+                }
+
+                // Extract numeric values as doubles for aggregation.
+                // Handles both native doubles and int64_t (cast to double;
+                // precision loss for values > 2^53 is a known trade-off).
+                std::vector<double> doubleValues;
+                if (std::holds_alternative<std::vector<double>>(values)) {
+                    doubleValues = std::get<std::vector<double>>(values);
+                } else if (std::holds_alternative<std::vector<int64_t>>(values)) {
+                    const auto& intValues = std::get<std::vector<int64_t>>(values);
+                    doubleValues.reserve(intValues.size());
+                    for (int64_t v : intValues) {
+                        doubleValues.push_back(static_cast<double>(v));
+                    }
+                } else {
+                    continue;  // Skip non-numeric types (string, bool)
+                }
+
+                // Build composite group key directly from allTags + groupByTags,
+                // avoiding intermediate std::map allocation for relevantTags
+                auto gkr = timestar::buildGroupKeyDirect(series.measurement, fieldName, series.tags, groupByTags);
+
+                PartialAggregationResult partial;
+                partial.measurement = series.measurement;
+                partial.fieldName = fieldName;
+                partial.groupKey = std::move(gkr.key);
+                partial.groupKeyHash = gkr.hash;
+                partial.cachedTags = std::move(gkr.tags);
+                partial.sortedTimestamps = timestamps;  // sorted per series (from queryTsm)
+                partial.sortedValues = std::move(doubleValues);
+                partial.totalPoints = partial.sortedTimestamps.size();
+
+                pointsSinceYield += partial.totalPoints;
+                result.push_back(std::move(partial));
+
+                if (pointsSinceYield >= YIELD_CHUNK_POINTS) {
+                    pointsSinceYield = 0;
+                    co_await seastar::coroutine::maybe_yield();
+                }
+            }
+        }
+        co_return result;
+    }
+
+    // ── interval > 0: bucketed accumulation, one partial per group ──────────
+    // Folding N points into (far fewer) epoch-aligned buckets on the shard is
+    // the right trade-off here — the per-point work is O(1) hash upserts, not
+    // the quadratic re-merge the interval==0 path had.
+    //
     // Use PrehashedString key to compute hash once and avoid redundant hashing
     std::unordered_map<PrehashedString, PartialAggregationResult, PrehashedStringHash, PrehashedStringEqual>
         partialResults;
@@ -271,8 +312,6 @@ std::vector<PartialAggregationResult> Aggregator::createPartialAggregations(
             const auto& values = fieldData.second;
 
             // Extract numeric values as doubles for aggregation.
-            // Handles both native doubles and int64_t (cast to double; precision
-            // loss for values > 2^53 is a known trade-off).
             std::vector<double> convertedValues;
             const std::vector<double>* doubleValuesPtr = nullptr;
 
@@ -306,51 +345,32 @@ std::vector<PartialAggregationResult> Aggregator::createPartialAggregations(
                 partial.groupKey = it->first.value;        // Read from the emplaced key
                 partial.groupKeyHash = keyHash;            // Reuse pre-computed hash
                 partial.cachedTags = std::move(gkr.tags);  // Cache parsed tags once
-                // Pre-reserve bucket map: at most one bucket per unique timestamp,
-                // so timestamps.size() is a safe upper bound that prevents rehashing
-                // for the typical case where this is the only series in the group.
-                if (interval > 0 && !timestamps.empty()) {
+                if (!timestamps.empty()) {
                     // Estimate bucket count from time range / interval rather than
                     // reserving one entry per timestamp (which over-allocates by 3-4 orders
                     // of magnitude for dense data with coarse intervals).
                     uint64_t timeRange = timestamps.back() - timestamps.front();
-                    size_t estimatedBuckets = (interval > 0) ? (timeRange / interval + 1) : timestamps.size();
+                    size_t estimatedBuckets = timeRange / interval + 1;
                     partial.bucketStates.reserve(std::min(estimatedBuckets, timestamps.size()));
                 }
             }
 
-            // PHASE 1 OPTIMIZATION: Two-phase aggregation - aggregate to states immediately
-            // Single pass, no reallocation, O(1) merge later.
+            // Bucketed aggregation - accumulate into AggregationState per bucket.
             // MEDIAN and EXACT_MEDIAN both use addValue with collectRaw=true.
             const bool needsRaw = (method == AggregationMethod::EXACT_MEDIAN || method == AggregationMethod::MEDIAN);
-            if (interval > 0) {
-                // Bucketed aggregation - accumulate into AggregationState per bucket
-                for (size_t i = 0; i < timestamps.size(); ++i) {
-                    uint64_t bucketTime = (timestamps[i] / interval) * interval;
-                    auto& state = partial.bucketStates[bucketTime];
-                    state.collectRaw = needsRaw;
-                    state.addValue(doubleValues[i], timestamps[i]);
-                    partial.totalPoints++;
-                }
-            } else {
-                // No interval - sorted vector aggregation by timestamp.
-                // Input timestamps are sorted (from queryTsm). Use sorted merge
-                // to avoid std::map's O(log n) insert + per-node heap allocation.
-                partial.totalPoints += timestamps.size();
-                if (partial.sortedTimestamps.empty()) {
-                    // First series for this group: direct populate (common case)
-                    partial.sortedTimestamps.reserve(timestamps.size());
-                    partial.sortedStates.reserve(timestamps.size());
-                    for (size_t i = 0; i < timestamps.size(); ++i) {
-                        partial.sortedTimestamps.push_back(timestamps[i]);
-                        AggregationState s;
-                        s.collectRaw = needsRaw;
-                        s.addValue(doubleValues[i], timestamps[i]);
-                        partial.sortedStates.push_back(std::move(s));
-                    }
-                } else {
-                    // Multiple series in same group: O(n+m) sorted merge
-                    mergeSortedRawInto(partial.sortedTimestamps, partial.sortedStates, timestamps, doubleValues);
+            for (size_t i = 0; i < timestamps.size(); ++i) {
+                uint64_t bucketTime = (timestamps[i] / interval) * interval;
+                auto& state = partial.bucketStates[bucketTime];
+                state.collectRaw = needsRaw;
+                state.addValue(doubleValues[i], timestamps[i]);
+                partial.totalPoints++;
+
+                if (++pointsSinceYield >= YIELD_CHUNK_POINTS) {
+                    pointsSinceYield = 0;
+                    // `partial` and the iteration state survive the suspension:
+                    // everything lives in this coroutine's frame, and the map is
+                    // only mutated from this coroutine.
+                    co_await seastar::coroutine::maybe_yield();
                 }
             }
         }
@@ -363,14 +383,15 @@ std::vector<PartialAggregationResult> Aggregator::createPartialAggregations(
         result.push_back(std::move(partial));
     }
 
-    return result;
+    co_return result;
 }
 
-std::vector<GroupedAggregationResult> Aggregator::mergePartialAggregationsGrouped(
+seastar::future<std::vector<GroupedAggregationResult>> Aggregator::mergePartialAggregationsGrouped(
     std::vector<PartialAggregationResult>& partialResults, AggregationMethod method) {
     if (partialResults.empty()) {
-        return {};
+        co_return std::vector<GroupedAggregationResult>{};
     }
+    size_t sinceYield = 0;
 
     std::vector<GroupedAggregationResult> result;
 
@@ -429,6 +450,10 @@ std::vector<GroupedAggregationResult> Aggregator::mergePartialAggregationsGroupe
                     if (!inserted) {
                         it->second.mergeForMethod(std::move(state), method);
                     }
+                    if (++sinceYield >= YIELD_CHUNK_POINTS) {
+                        sinceYield = 0;
+                        co_await seastar::coroutine::maybe_yield();
+                    }
                 }
             }
 
@@ -441,6 +466,10 @@ std::vector<GroupedAggregationResult> Aggregator::mergePartialAggregationsGroupe
                 point.count = state.count;
                 point.value = state.getValue(method);
                 groupedResult.points.push_back(point);
+                if (++sinceYield >= YIELD_CHUNK_POINTS) {
+                    sinceYield = 0;
+                    co_await seastar::coroutine::maybe_yield();
+                }
             }
 
             // Sort points by timestamp
@@ -520,9 +549,9 @@ std::vector<GroupedAggregationResult> Aggregator::mergePartialAggregationsGroupe
                         std::vector<size_t> mergedCounts;
 
                         if (allTimestampsIdentical(groupPartials)) {
-                            foldAlignedRawValues(groupPartials, method, mergedTs, mergedVals, mergedCounts);
+                            co_await foldAlignedRawValues(groupPartials, method, mergedTs, mergedVals, mergedCounts);
                         } else {
-                            nWayMergeRawValues(groupPartials, method, mergedTs, mergedVals, mergedCounts);
+                            co_await nWayMergeRawValues(groupPartials, method, mergedTs, mergedVals, mergedCounts);
                         }
 
                         groupedResult.points.reserve(mergedTs.size());
@@ -534,6 +563,10 @@ std::vector<GroupedAggregationResult> Aggregator::mergePartialAggregationsGroupe
                                 finalValue = static_cast<double>(mergedCounts[i]);
                             }
                             groupedResult.points.push_back({mergedTs[i], finalValue, mergedCounts[i]});
+                            if (++sinceYield >= YIELD_CHUNK_POINTS) {
+                                sinceYield = 0;
+                                co_await seastar::coroutine::maybe_yield();
+                            }
                         }
                     }
                 } else {
@@ -551,6 +584,10 @@ std::vector<GroupedAggregationResult> Aggregator::mergePartialAggregationsGroupe
                                 s.collectRaw = needsRaw;
                                 s.addValue(p->sortedValues[i], p->sortedTimestamps[i]);
                                 p->sortedStates.push_back(s);
+                                if (++sinceYield >= YIELD_CHUNK_POINTS) {
+                                    sinceYield = 0;
+                                    co_await seastar::coroutine::maybe_yield();
+                                }
                             }
                             p->sortedValues.clear();
                         }
@@ -565,16 +602,24 @@ std::vector<GroupedAggregationResult> Aggregator::mergePartialAggregationsGroupe
                         for (size_t i = 0; i < mergedTs.size(); ++i) {
                             groupedResult.points.push_back(
                                 {mergedTs[i], mergedStates[i].getValue(method), mergedStates[i].count});
+                            if (++sinceYield >= YIELD_CHUNK_POINTS) {
+                                sinceYield = 0;
+                                co_await seastar::coroutine::maybe_yield();
+                            }
                         }
                     } else {
                         std::vector<uint64_t> mergedTs;
                         std::vector<AggregationState> mergedStates;
-                        nWayMergeStates(groupPartials, mergedTs, mergedStates, method);
+                        co_await nWayMergeStates(groupPartials, mergedTs, mergedStates, method);
 
                         groupedResult.points.reserve(mergedTs.size());
                         for (size_t i = 0; i < mergedTs.size(); ++i) {
                             groupedResult.points.push_back(
                                 {mergedTs[i], mergedStates[i].getValue(method), mergedStates[i].count});
+                            if (++sinceYield >= YIELD_CHUNK_POINTS) {
+                                sinceYield = 0;
+                                co_await seastar::coroutine::maybe_yield();
+                            }
                         }
                     }
                 }
@@ -582,9 +627,14 @@ std::vector<GroupedAggregationResult> Aggregator::mergePartialAggregationsGroupe
         }
 
         result.push_back(std::move(groupedResult));
+
+        // Group boundary: cheap preemption check between groups so that
+        // many-group (`by {tag}`) merges cannot monopolize the reactor even
+        // when each individual group is small.
+        co_await seastar::coroutine::maybe_yield();
     }
 
-    return result;
+    co_return result;
 }
 
 // ============================================================================

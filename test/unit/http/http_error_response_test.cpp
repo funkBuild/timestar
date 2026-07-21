@@ -1,5 +1,5 @@
-#include "../../../lib/http/response_formatter.hpp"
 #include "../../../lib/http/http_query_handler.hpp"
+#include "../../../lib/http/response_formatter.hpp"
 
 #include <glaze/json.hpp>
 
@@ -97,8 +97,7 @@ TEST_F(HttpErrorResponseTest, ErrorMessageWithNewlineIsEscaped) {
     std::string json = ResponseFormatter::formatError(msg);
 
     // Raw newline must not appear in JSON output
-    EXPECT_EQ(json.find('\n'), std::string::npos)
-        << "Raw newline character must be escaped in JSON output";
+    EXPECT_EQ(json.find('\n'), std::string::npos) << "Raw newline character must be escaped in JSON output";
 
     ErrorResponseParsed parsed;
     auto err = glz::read_json(parsed, json);
@@ -170,7 +169,7 @@ TEST_F(HttpErrorResponseTest, SuccessResponseHasStatusSuccess) {
     response.statistics.pointCount = 0;
     response.statistics.executionTimeMs = 0.0;
 
-    std::string json = ResponseFormatter::format(response);
+    std::string json = ResponseFormatter::format(response).get();
 
     EXPECT_NE(json.find("\"status\":\"success\""), std::string::npos)
         << "format() output must contain \"status\":\"success\", got: " << json;

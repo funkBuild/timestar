@@ -12,6 +12,7 @@
 #include <map>
 #include <numeric>
 #include <optional>
+#include <seastar/core/future.hh>
 #include <string_view>
 #include <unordered_map>
 #include <vector>
@@ -508,13 +509,24 @@ public:
     // These functions implement map-reduce style distributed aggregation with
     // O(1) state merging for high-performance query execution.
 
-    // Create partial aggregation on shard (map phase)
-    static std::vector<PartialAggregationResult> createPartialAggregations(
+    // Create partial aggregation on shard (map phase).
+    //
+    // Coroutine: yields to the reactor every ~64k processed points so a large
+    // fallback result set cannot monopolize the shard (the Jul 2026 v1.2.4
+    // incident saw 980ms reactor stalls here).  At interval == 0 it emits ONE
+    // RAW PARTIAL PER (series, field) — the same compact shape the pushdown
+    // path produces — and leaves the K-way group merge to
+    // mergePartialAggregationsGrouped.  It must never fold series into each
+    // other incrementally: the pre-fix per-series re-merge was O(K²·N) for K
+    // series sharing a group.
+    static seastar::future<std::vector<PartialAggregationResult>> createPartialAggregations(
         const std::vector<timestar::SeriesResult>& seriesResults, AggregationMethod method, uint64_t interval,
         const std::vector<std::string>& groupByTags);
 
-    // Merge partial aggregations with metadata preserved (reduce phase)
-    static std::vector<GroupedAggregationResult> mergePartialAggregationsGrouped(
+    // Merge partial aggregations with metadata preserved (reduce phase).
+    // Coroutine: yields between groups and inside the per-point merge loops
+    // (same stall rationale as createPartialAggregations).
+    static seastar::future<std::vector<GroupedAggregationResult>> mergePartialAggregationsGrouped(
         std::vector<PartialAggregationResult>& partialResults, AggregationMethod method);
 
     // ========================================================================

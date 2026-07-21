@@ -112,14 +112,16 @@ public:
     // Finalize partial aggregation results from a single shard into the query response.
     // Each partial must have a unique groupKey; callers with duplicate groupKeys must use
     // the merge fallback path (mergePartialAggregationsGrouped) instead.
+    // Coroutine: yields every ~64k points (reactor-stall prevention).
     // Public static for testability.
-    static void finalizeSingleShardPartials(std::vector<PartialAggregationResult>& partials, AggregationMethod method,
-                                            QueryResponse& response);
+    static seastar::future<> finalizeSingleShardPartials(std::vector<PartialAggregationResult>& partials,
+                                                         AggregationMethod method, QueryResponse& response);
 
-    // Format response as JSON (public for testing)
+    // Format response as JSON (public for testing).
+    // Coroutine — see ResponseFormatter::format for the yielding policy.
     // Note: field filtering is performed in executeQuery(), so by the time this
     // function is called, response.series already contains only the requested fields.
-    std::string formatQueryResponse(QueryResponse& response);
+    seastar::future<std::string> formatQueryResponse(QueryResponse& response);
 
     // Create error response (public for testing)
     std::string createErrorResponse(const std::string& code, const std::string& message);
@@ -149,10 +151,12 @@ private:
 
     // Phase 3a/3b: partial merge + aggregation finalize into `response`.
     // Return std::nullopt on success; a complete error QueryResponse on early exit.
-    std::optional<QueryResponse> finalizeSingleShardResponse(const QueryRequest& request,
-                                                             std::pair<unsigned, ShardQueryResult>& shardResult,
-                                                             QueryTimingInfo& timing, QueryResponse& response);
-    std::optional<QueryResponse> finalizeMultiShardResponse(
+    // Coroutines: the merge and per-point loops yield periodically so a large
+    // result set cannot monopolize the coordinator's reactor.
+    seastar::future<std::optional<QueryResponse>> finalizeSingleShardResponse(
+        const QueryRequest& request, std::pair<unsigned, ShardQueryResult>& shardResult, QueryTimingInfo& timing,
+        QueryResponse& response);
+    seastar::future<std::optional<QueryResponse>> finalizeMultiShardResponse(
         const QueryRequest& request, std::vector<std::pair<unsigned, ShardQueryResult>>& shardResults,
         QueryTimingInfo& timing, QueryResponse& response);
 

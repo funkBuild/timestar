@@ -22,6 +22,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <seastar/core/future.hh>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -254,6 +255,13 @@ ParsedQueryRequest parseQueryRequest(const void* data, size_t size);
 
 // Format a QueryResponseData to serialized QueryResponse proto bytes.
 std::string formatQueryResponse(QueryResponseData& response);
+
+// Same wire format as formatQueryResponse, but yields to the reactor every
+// ~64k points during the per-series compression passes so a multi-million
+// point response cannot monopolize the reactor.  Production HTTP handlers
+// must use this variant; the synchronous one remains for tests and small
+// internal responses.
+seastar::future<std::string> formatQueryResponseYielding(QueryResponseData& response);
 
 // Format a query error response as serialized QueryResponse proto bytes.
 std::string formatQueryError(const std::string& code, const std::string& message);

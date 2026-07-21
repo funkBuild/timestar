@@ -420,14 +420,24 @@ protected:
         return sr;
     }
 
-    // Run the full aggregation pipeline for a single series, no buckets
+    // Run the full aggregation pipeline for a single series, no buckets.
+    // Single-partial groups come back as raw (timestamps, values) vectors —
+    // normalize to AggregatedPoints exactly like the production HTTP handler.
     static std::vector<AggregatedPoint> runPipeline(const std::vector<uint64_t>& timestamps,
                                                     const std::vector<double>& values, AggregationMethod method) {
         auto series = makeSeries("test", "value", timestamps, values);
-        auto partials = Aggregator::createPartialAggregations({series}, method, 0, {});
-        auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, method);
+        auto partials = Aggregator::createPartialAggregations({series}, method, 0, {}).get();
+        auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, method).get();
         if (grouped.empty())
             return {};
+        if (!grouped[0].rawTimestamps.empty()) {
+            std::vector<AggregatedPoint> points;
+            points.reserve(grouped[0].rawTimestamps.size());
+            for (size_t i = 0; i < grouped[0].rawTimestamps.size(); ++i) {
+                points.push_back({grouped[0].rawTimestamps[i], grouped[0].rawValues[i], 1});
+            }
+            return points;
+        }
         return {grouped[0].points.begin(), grouped[0].points.end()};
     }
 };
@@ -449,8 +459,8 @@ TEST_F(NewAggMethodPipelineTest, Count_WithBuckets) {
     std::vector<uint64_t> ts = {0, 1000, 2000, 3000, 4000, 5000};
     std::vector<double> vals = {1.0, 2.0, 3.0, 4.0, 5.0, 6.0};
     auto series = makeSeries("test", "value", ts, vals);
-    auto partials = Aggregator::createPartialAggregations({series}, AggregationMethod::COUNT, interval, {});
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::COUNT);
+    auto partials = Aggregator::createPartialAggregations({series}, AggregationMethod::COUNT, interval, {}).get();
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::COUNT).get();
     ASSERT_EQ(grouped.size(), 1u);
     // Two buckets: [0, 3000) with 3 points, [3000, 6000) with 3 points
     ASSERT_EQ(grouped[0].points.size(), 2u);
@@ -478,8 +488,8 @@ TEST_F(NewAggMethodPipelineTest, First_WithBuckets) {
     std::vector<uint64_t> ts = {0, 1000, 2000, 3000};
     std::vector<double> vals = {5.0, 9.0, 3.0, 7.0};
     auto series = makeSeries("test", "value", ts, vals);
-    auto partials = Aggregator::createPartialAggregations({series}, AggregationMethod::FIRST, interval, {});
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::FIRST);
+    auto partials = Aggregator::createPartialAggregations({series}, AggregationMethod::FIRST, interval, {}).get();
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::FIRST).get();
     ASSERT_EQ(grouped.size(), 1u);
     ASSERT_EQ(grouped[0].points.size(), 2u);
     // Bucket [0, 2000): values 5.0 @0, 9.0 @1000 — first is 5.0
@@ -496,8 +506,8 @@ TEST_F(NewAggMethodPipelineTest, Median_WithBuckets) {
     // Bucket 2: 9, 7, 8 -> sorted: 7, 8, 9 -> median ~ 8
     std::vector<double> vals = {3.0, 1.0, 2.0, 9.0, 7.0, 8.0};
     auto series = makeSeries("test", "value", ts, vals);
-    auto partials = Aggregator::createPartialAggregations({series}, AggregationMethod::MEDIAN, interval, {});
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::MEDIAN);
+    auto partials = Aggregator::createPartialAggregations({series}, AggregationMethod::MEDIAN, interval, {}).get();
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::MEDIAN).get();
     ASSERT_EQ(grouped.size(), 1u);
     ASSERT_EQ(grouped[0].points.size(), 2u);
     // T-digest is approximate; for 3 values the error is small.
@@ -511,8 +521,9 @@ TEST_F(NewAggMethodPipelineTest, ExactMedian_WithBuckets) {
     std::vector<uint64_t> ts = {0, 1000, 2000, 3000, 4000, 5000};
     std::vector<double> vals = {3.0, 1.0, 2.0, 9.0, 7.0, 8.0};
     auto series = makeSeries("test", "value", ts, vals);
-    auto partials = Aggregator::createPartialAggregations({series}, AggregationMethod::EXACT_MEDIAN, interval, {});
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::EXACT_MEDIAN);
+    auto partials =
+        Aggregator::createPartialAggregations({series}, AggregationMethod::EXACT_MEDIAN, interval, {}).get();
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::EXACT_MEDIAN).get();
     ASSERT_EQ(grouped.size(), 1u);
     ASSERT_EQ(grouped[0].points.size(), 2u);
     EXPECT_DOUBLE_EQ(grouped[0].points[0].value, 2.0);
@@ -527,8 +538,8 @@ TEST_F(NewAggMethodPipelineTest, Stddev_WithBuckets) {
     std::vector<uint64_t> ts = {0, 1000, 2000, 3000};
     std::vector<double> vals = {0.0, 10.0, 2.0, 2.0};
     auto series = makeSeries("test", "value", ts, vals);
-    auto partials = Aggregator::createPartialAggregations({series}, AggregationMethod::STDDEV, interval, {});
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::STDDEV);
+    auto partials = Aggregator::createPartialAggregations({series}, AggregationMethod::STDDEV, interval, {}).get();
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::STDDEV).get();
     ASSERT_EQ(grouped.size(), 1u);
     ASSERT_EQ(grouped[0].points.size(), 2u);
     EXPECT_NEAR(grouped[0].points[0].value, 5.0, 1e-10);
@@ -541,8 +552,8 @@ TEST_F(NewAggMethodPipelineTest, Stdvar_WithBuckets) {
     std::vector<uint64_t> ts = {0, 1000, 2000, 3000};
     std::vector<double> vals = {0.0, 10.0, 2.0, 2.0};
     auto series = makeSeries("test", "value", ts, vals);
-    auto partials = Aggregator::createPartialAggregations({series}, AggregationMethod::STDVAR, interval, {});
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::STDVAR);
+    auto partials = Aggregator::createPartialAggregations({series}, AggregationMethod::STDVAR, interval, {}).get();
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::STDVAR).get();
     ASSERT_EQ(grouped.size(), 1u);
     ASSERT_EQ(grouped[0].points.size(), 2u);
     EXPECT_NEAR(grouped[0].points[0].value, 25.0, 1e-10);  // variance of {0, 10}
@@ -557,8 +568,8 @@ TEST_F(NewAggMethodPipelineTest, Spread_WithBuckets) {
     // Bucket 2: 5, 5, 5  -> spread = 0
     std::vector<double> vals = {3.0, 10.0, 1.0, 5.0, 5.0, 5.0};
     auto series = makeSeries("test", "value", ts, vals);
-    auto partials = Aggregator::createPartialAggregations({series}, AggregationMethod::SPREAD, interval, {});
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::SPREAD);
+    auto partials = Aggregator::createPartialAggregations({series}, AggregationMethod::SPREAD, interval, {}).get();
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::SPREAD).get();
     ASSERT_EQ(grouped.size(), 1u);
     ASSERT_EQ(grouped[0].points.size(), 2u);
     EXPECT_DOUBLE_EQ(grouped[0].points[0].value, 9.0);

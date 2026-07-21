@@ -26,6 +26,7 @@
 #include <seastar/core/smp.hh>
 #include <seastar/core/when_all.hh>
 #include <seastar/core/with_timeout.hh>
+#include <seastar/coroutine/maybe_yield.hh>
 #include <sstream>
 #include <string_view>
 #include <unordered_map>
@@ -589,9 +590,14 @@ static seastar::future<std::vector<PartialAggregationResult>> streamingGroupByAg
 // same measurement+field+tags combination). When multiple series produce partials with the
 // same groupKey (e.g. non-group-by queries with multiple matching series), callers must use
 // the merge fallback path instead.
-void HttpQueryHandler::finalizeSingleShardPartials(std::vector<PartialAggregationResult>& partials,
-                                                   AggregationMethod method, QueryResponse& response) {
+seastar::future<> HttpQueryHandler::finalizeSingleShardPartials(std::vector<PartialAggregationResult>& partials,
+                                                                AggregationMethod method, QueryResponse& response) {
     response.series.reserve(partials.size());
+
+    // Yield to the reactor between partials once ~this many points have been
+    // finalized (reactor-stall prevention; chunked, never per-point).
+    constexpr size_t YIELD_CHUNK_POINTS = 65536;
+    size_t pointsSinceYield = 0;
 
     for (auto& partial : partials) {
         std::vector<uint64_t> timestamps;
@@ -666,10 +672,16 @@ void HttpQueryHandler::finalizeSingleShardPartials(std::vector<PartialAggregatio
         SeriesResult series;
         series.measurement = std::move(partial.measurement);
         series.tags = std::move(tags);
+        pointsSinceYield += timestamps.size();
         series.fields[std::move(partial.fieldName)] =
             std::make_pair(std::move(timestamps), FieldValues(std::move(values)));
 
         response.series.push_back(std::move(series));
+
+        if (pointsSinceYield >= YIELD_CHUNK_POINTS) {
+            pointsSinceYield = 0;
+            co_await seastar::coroutine::maybe_yield();
+        }
     }
 }
 
@@ -857,11 +869,15 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpQueryHandler::handleQ
                             std::make_pair(std::move(timestamps), std::move(protoValues));
                     }
                     protoResp.series.push_back(std::move(srd));
+
+                    // Series boundary: cheap preemption check — a multi-million
+                    // point response must not build in one reactor task.
+                    co_await seastar::coroutine::maybe_yield();
                 }
 
-                rep->_content = timestar::proto::formatQueryResponse(protoResp);
+                rep->_content = co_await timestar::proto::formatQueryResponseYielding(protoResp);
             } else {
-                rep->_content = formatQueryResponse(response);
+                rep->_content = co_await formatQueryResponse(response);
             }
         } else {
             rep->set_status(seastar::http::reply::status_type::internal_server_error);
@@ -1346,7 +1362,7 @@ static seastar::future<ShardQueryResult> executeShardQuery(Engine& engine, unsig
     // Run partial aggregation only on fallback numeric results
     auto partialAggStart = std::chrono::high_resolution_clock::now();
     auto partialResults =
-        Aggregator::createPartialAggregations(numericResults, aggregation, aggregationInterval, groupByTags);
+        co_await Aggregator::createPartialAggregations(numericResults, aggregation, aggregationInterval, groupByTags);
     // Combine pushdown partials with fallback partials
     partialResults.insert(partialResults.end(), std::make_move_iterator(pushdownPartials.begin()),
                           std::make_move_iterator(pushdownPartials.end()));
@@ -1443,6 +1459,10 @@ seastar::future<SeriesDiscoveryResult> HttpQueryHandler::discoverSeriesAcrossSha
 
                         result.contexts.reserve(swmPtr->size());
 
+                        // Context building copies strings + a tag map per series;
+                        // at high cardinality (thousands of series) this loop was
+                        // an observed 150ms reactor stall — yield periodically.
+                        size_t sinceYield = 0;
                         for (const auto& swm : *swmPtr) {
                             // Apply wildcard/regex scopes that the bitmap intersect could not.
                             if (!patternScopes.empty() && !SeriesMatcher::matches(swm.metadata.tags, patternScopes)) {
@@ -1455,6 +1475,11 @@ seastar::future<SeriesDiscoveryResult> HttpQueryHandler::discoverSeriesAcrossSha
                             ctx.field = swm.metadata.field;
                             ctx.tags = swm.metadata.tags;
                             result.contexts.push_back(std::move(ctx));
+
+                            if (++sinceYield >= 512) {
+                                sinceYield = 0;
+                                co_await seastar::coroutine::maybe_yield();
+                            }
                         }
 
                         co_return result;
@@ -1629,7 +1654,7 @@ void HttpQueryHandler::consolidateSeriesFields(std::vector<SeriesResult>& series
     seriesList = std::move(merged);
 }
 
-std::optional<QueryResponse> HttpQueryHandler::finalizeSingleShardResponse(
+seastar::future<std::optional<QueryResponse>> HttpQueryHandler::finalizeSingleShardResponse(
     const QueryRequest& request, std::pair<unsigned, ShardQueryResult>& shardResult, QueryTimingInfo& timing,
     QueryResponse& response) {
     auto& [singleShardId, sqr] = shardResult;
@@ -1660,7 +1685,7 @@ std::optional<QueryResponse> HttpQueryHandler::finalizeSingleShardResponse(
                                      " exceeds limit of " + std::to_string(maxTotalPoints());
         limitResponse.statistics.truncated = true;
         limitResponse.statistics.truncationReason = limitResponse.errorMessage;
-        return limitResponse;
+        co_return limitResponse;
     }
 
     auto aggregationStart = std::chrono::high_resolution_clock::now();
@@ -1683,10 +1708,11 @@ std::optional<QueryResponse> HttpQueryHandler::finalizeSingleShardResponse(
 
         if (!hasDuplicateGroupKeys) {
             // All groupKeys unique — direct finalization (no merge needed)
-            finalizeSingleShardPartials(sqr.partialResults, request.aggregation, response);
+            co_await finalizeSingleShardPartials(sqr.partialResults, request.aggregation, response);
         } else {
             // Duplicate groupKeys — must merge partials before finalizing
-            auto groupedResults = Aggregator::mergePartialAggregationsGrouped(sqr.partialResults, request.aggregation);
+            auto groupedResults =
+                co_await Aggregator::mergePartialAggregationsGrouped(sqr.partialResults, request.aggregation);
 
             response.series.reserve(groupedResults.size());
             for (auto& groupedResult : groupedResults) {
@@ -1698,9 +1724,14 @@ std::optional<QueryResponse> HttpQueryHandler::finalizeSingleShardResponse(
                 } else {
                     timestamps.reserve(groupedResult.points.size());
                     values.reserve(groupedResult.points.size());
+                    size_t sinceYield = 0;
                     for (const auto& point : groupedResult.points) {
                         timestamps.push_back(point.timestamp);
                         values.push_back(point.value);
+                        if (++sinceYield >= 65536) {
+                            sinceYield = 0;
+                            co_await seastar::coroutine::maybe_yield();
+                        }
                     }
                 }
 
@@ -1712,6 +1743,9 @@ std::optional<QueryResponse> HttpQueryHandler::finalizeSingleShardResponse(
                 series.fields[fieldName] = std::make_pair(std::move(timestamps), FieldValues(std::move(values)));
 
                 response.series.push_back(std::move(series));
+
+                // Series boundary: cheap preemption check (reactor-stall prevention)
+                co_await seastar::coroutine::maybe_yield();
             }
         }
     }
@@ -1753,13 +1787,13 @@ std::optional<QueryResponse> HttpQueryHandler::finalizeSingleShardResponse(
         response.success = false;
         response.errorCode = "TOO_MANY_POINTS";
         response.errorMessage = response.statistics.truncationReason;
-        return std::move(response);
+        co_return std::move(response);
     }
 
     auto aggregationEnd = std::chrono::high_resolution_clock::now();
     timing.aggregationMs = std::chrono::duration<double, std::milli>(aggregationEnd - aggregationStart).count();
 
-    return std::nullopt;
+    co_return std::nullopt;
 }
 
 // Phase 3b: multi-shard merge + aggregation finalize.
@@ -1767,7 +1801,7 @@ std::optional<QueryResponse> HttpQueryHandler::finalizeSingleShardResponse(
 // builds the response series.  Fills `response` in place and returns
 // std::nullopt on success; returns a complete error QueryResponse when a
 // limit was exceeded (the caller returns it as-is).
-std::optional<QueryResponse> HttpQueryHandler::finalizeMultiShardResponse(
+seastar::future<std::optional<QueryResponse>> HttpQueryHandler::finalizeMultiShardResponse(
     const QueryRequest& request, std::vector<std::pair<unsigned, ShardQueryResult>>& shardResults,
     QueryTimingInfo& timing, QueryResponse& response) {
     auto mergeStart = std::chrono::high_resolution_clock::now();
@@ -1828,7 +1862,7 @@ std::optional<QueryResponse> HttpQueryHandler::finalizeMultiShardResponse(
                                      " exceeds limit of " + std::to_string(maxTotalPoints());
         limitResponse.statistics.truncated = true;
         limitResponse.statistics.truncationReason = limitResponse.errorMessage;
-        return limitResponse;
+        co_return limitResponse;
     }
 
     // Merge partial aggregations from all shards into final aggregated points
@@ -1842,7 +1876,8 @@ std::optional<QueryResponse> HttpQueryHandler::finalizeMultiShardResponse(
                        allPartialResults.size(), timing.shardsQueried);
 
         // OPTIMIZATION & FIX: Use grouped merge to preserve metadata associations
-        auto groupedResults = Aggregator::mergePartialAggregationsGrouped(allPartialResults, request.aggregation);
+        auto groupedResults =
+            co_await Aggregator::mergePartialAggregationsGrouped(allPartialResults, request.aggregation);
 
         LOG_QUERY_PATH(timestar::http_log, info, "[QUERY] Merged into {} grouped results", groupedResults.size());
 
@@ -1861,9 +1896,14 @@ std::optional<QueryResponse> HttpQueryHandler::finalizeMultiShardResponse(
             } else {
                 timestamps.reserve(groupedResult.points.size());
                 values.reserve(groupedResult.points.size());
+                size_t sinceYield = 0;
                 for (const auto& point : groupedResult.points) {
                     timestamps.push_back(point.timestamp);
                     values.push_back(point.value);
+                    if (++sinceYield >= 65536) {
+                        sinceYield = 0;
+                        co_await seastar::coroutine::maybe_yield();
+                    }
                 }
             }
 
@@ -1875,6 +1915,9 @@ std::optional<QueryResponse> HttpQueryHandler::finalizeMultiShardResponse(
                 std::make_pair(std::move(timestamps), FieldValues(std::move(values)));
 
             response.series.push_back(std::move(series));
+
+            // Series boundary: cheap preemption check (reactor-stall prevention)
+            co_await seastar::coroutine::maybe_yield();
         }
     }
 
@@ -1919,13 +1962,13 @@ std::optional<QueryResponse> HttpQueryHandler::finalizeMultiShardResponse(
         response.success = false;
         response.errorCode = "TOO_MANY_POINTS";
         response.errorMessage = response.statistics.truncationReason;
-        return std::move(response);
+        co_return std::move(response);
     }
 
     auto aggregationEnd = std::chrono::high_resolution_clock::now();
     timing.aggregationMs = std::chrono::duration<double, std::milli>(aggregationEnd - aggregationStart).count();
 
-    return std::nullopt;
+    co_return std::nullopt;
 }
 
 // Phase 4: timing breakdown + slow-query logging.
@@ -2108,12 +2151,12 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(QueryRequest reque
         auto& shardResults = fanOut.shardResults;
         if (shardResults.size() == 1) {
             // === SINGLE-SHARD FAST PATH ===
-            if (auto earlyReturn = finalizeSingleShardResponse(request, shardResults[0], timing, response)) {
+            if (auto earlyReturn = co_await finalizeSingleShardResponse(request, shardResults[0], timing, response)) {
                 co_return std::move(*earlyReturn);
             }
         } else {
             // === MULTI-SHARD GENERAL PATH ===
-            if (auto earlyReturn = finalizeMultiShardResponse(request, shardResults, timing, response)) {
+            if (auto earlyReturn = co_await finalizeMultiShardResponse(request, shardResults, timing, response)) {
                 co_return std::move(*earlyReturn);
             }
         }
@@ -2132,7 +2175,7 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(QueryRequest reque
     co_return response;
 }
 
-std::string HttpQueryHandler::formatQueryResponse(QueryResponse& response) {
+seastar::future<std::string> HttpQueryHandler::formatQueryResponse(QueryResponse& response) {
     return ResponseFormatter::format(response);
 }
 

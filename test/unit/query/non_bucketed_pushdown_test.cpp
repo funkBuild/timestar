@@ -501,7 +501,7 @@ TEST(CollapsedStateMergeTest, MergeAllCollapsed_AVG) {
     partials.push_back(std::move(p1));
     partials.push_back(std::move(p2));
 
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::AVG);
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::AVG).get();
 
     ASSERT_EQ(grouped.size(), 1u);
     ASSERT_EQ(grouped[0].points.size(), 1u);
@@ -543,7 +543,7 @@ TEST(CollapsedStateMergeTest, MergeAllCollapsed_SUM) {
     partials.push_back(std::move(p1));
     partials.push_back(std::move(p2));
 
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::SUM);
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::SUM).get();
 
     ASSERT_EQ(grouped.size(), 1u);
     ASSERT_EQ(grouped[0].points.size(), 1u);
@@ -585,7 +585,7 @@ TEST(CollapsedStateMergeTest, MergeAllCollapsed_MIN) {
     partials.push_back(std::move(p1));
     partials.push_back(std::move(p2));
 
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::MIN);
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::MIN).get();
 
     ASSERT_EQ(grouped.size(), 1u);
     ASSERT_EQ(grouped[0].points.size(), 1u);
@@ -626,7 +626,7 @@ TEST(CollapsedStateMergeTest, MergeAllCollapsed_MAX) {
     partials.push_back(std::move(p1));
     partials.push_back(std::move(p2));
 
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::MAX);
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::MAX).get();
 
     ASSERT_EQ(grouped.size(), 1u);
     ASSERT_EQ(grouped[0].points.size(), 1u);
@@ -668,7 +668,7 @@ TEST(CollapsedStateMergeTest, MergeAllCollapsed_COUNT) {
     partials.push_back(std::move(p1));
     partials.push_back(std::move(p2));
 
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::COUNT);
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::COUNT).get();
 
     ASSERT_EQ(grouped.size(), 1u);
     ASSERT_EQ(grouped[0].points.size(), 1u);
@@ -709,7 +709,7 @@ TEST(CollapsedStateMergeTest, MergeAllCollapsed_SPREAD) {
     partials.push_back(std::move(p1));
     partials.push_back(std::move(p2));
 
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::SPREAD);
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::SPREAD).get();
 
     ASSERT_EQ(grouped.size(), 1u);
     ASSERT_EQ(grouped[0].points.size(), 1u);
@@ -759,7 +759,7 @@ TEST(CollapsedStateMergeTest, MixedCollapsedAndRaw_FallsBack) {
     partials.push_back(std::move(p2));
 
     // Should handle mixed partials gracefully (converts collapsed to single-element state)
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::SUM);
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::SUM).get();
 
     ASSERT_EQ(grouped.size(), 1u);
     // The merged result should have points (collapsed converted to a single-element state,

@@ -61,7 +61,7 @@ TEST_F(AggregatorMergeCorrectnessTest, AllTimestampsIdentical_FalsePositive_Diff
     auto p2 = makeRawPartial("test\0value", {100, 250, 300, 450, 500}, {2.0, 2.0, 2.0, 2.0, 2.0});
 
     std::vector<PartialAggregationResult> allPartials = {std::move(p1), std::move(p2)};
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::SUM);
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::SUM).get();
 
     ASSERT_EQ(grouped.size(), 1);
 
@@ -100,7 +100,7 @@ TEST_F(AggregatorMergeCorrectnessTest, AllTimestampsIdentical_FalsePositive_Sing
     auto p2 = makeRawPartial("test\0value", {10, 20, 30, 40, 50, 65, 70}, {2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0});
 
     std::vector<PartialAggregationResult> allPartials = {std::move(p1), std::move(p2)};
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::SUM);
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::SUM).get();
 
     ASSERT_EQ(grouped.size(), 1);
     // 6 shared timestamps + 2 unique (60, 65) = 8 output points
@@ -114,7 +114,7 @@ TEST_F(AggregatorMergeCorrectnessTest, AllTimestampsIdentical_TruePositive_FoldC
     auto p2 = makeRawPartial("test\0value", {100, 200, 300}, {1.0, 2.0, 3.0});
 
     std::vector<PartialAggregationResult> allPartials = {std::move(p1), std::move(p2)};
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::SUM);
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::SUM).get();
 
     ASSERT_EQ(grouped.size(), 1);
     ASSERT_EQ(grouped[0].points.size(), 3);
@@ -139,7 +139,7 @@ TEST_F(AggregatorMergeCorrectnessTest, LatestMerge_SameTimestamp_DoesNotReturnMa
     auto p2 = makeRawPartial("test\0value", {1000}, {99.0});
 
     std::vector<PartialAggregationResult> allPartials = {std::move(p1), std::move(p2)};
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::LATEST);
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::LATEST).get();
 
     ASSERT_EQ(grouped.size(), 1);
     ASSERT_EQ(grouped[0].points.size(), 1);
@@ -155,7 +155,7 @@ TEST_F(AggregatorMergeCorrectnessTest, LatestFoldAligned_SameTimestamps_DoesNotR
     auto p2 = makeRawPartial("test\0value", {100, 200, 300}, {10.0, 20.0, 30.0});
 
     std::vector<PartialAggregationResult> allPartials = {std::move(p1), std::move(p2)};
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::LATEST);
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::LATEST).get();
 
     ASSERT_EQ(grouped.size(), 1);
     ASSERT_EQ(grouped[0].points.size(), 3);
@@ -176,7 +176,7 @@ TEST_F(AggregatorMergeCorrectnessTest, LatestNWayMerge_SharedTimestamp_KeepsOneI
     auto p2 = makeRawPartial("test\0value", {200, 300, 400}, {50.0, 7.0, 30.0});
 
     std::vector<PartialAggregationResult> allPartials = {std::move(p1), std::move(p2)};
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::LATEST);
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::LATEST).get();
 
     ASSERT_EQ(grouped.size(), 1);
     ASSERT_EQ(grouped[0].points.size(), 4);  // ts: 100, 200, 300, 400
@@ -212,7 +212,7 @@ TEST_F(AggregatorMergeCorrectnessTest, LatestNWayMerge_NegativeValue_DoesNotRetu
     auto p2 = makeRawPartial("test\0value", {750, 1000}, {5.0, 5.0});
 
     std::vector<PartialAggregationResult> allPartials = {std::move(p1), std::move(p2)};
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::LATEST);
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::LATEST).get();
 
     ASSERT_EQ(grouped.size(), 1);
     ASSERT_EQ(grouped[0].points.size(), 3);  // ts: 500, 750, 1000
@@ -230,7 +230,7 @@ TEST_F(AggregatorMergeCorrectnessTest, LatestFoldAligned_ThreePartials_KeepsBase
     auto p3 = makeRawPartial("test\0value", {1000, 2000}, {50.0, 60.0});
 
     std::vector<PartialAggregationResult> allPartials = {std::move(p1), std::move(p2), std::move(p3)};
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::LATEST);
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::LATEST).get();
 
     ASSERT_EQ(grouped.size(), 1);
     ASSERT_EQ(grouped[0].points.size(), 2);
@@ -245,7 +245,7 @@ TEST_F(AggregatorMergeCorrectnessTest, MaxMerge_StillReturnsMaxValue) {
     auto p2 = makeRawPartial("test\0value", {1000}, {99.0});
 
     std::vector<PartialAggregationResult> allPartials = {std::move(p1), std::move(p2)};
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::MAX);
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::MAX).get();
 
     ASSERT_EQ(grouped.size(), 1);
     ASSERT_EQ(grouped[0].points.size(), 1);
@@ -259,7 +259,7 @@ TEST_F(AggregatorMergeCorrectnessTest, FirstFoldAligned_KeepsBaseValue) {
     auto p2 = makeRawPartial("test\0value", {100, 200}, {99.0, 88.0});
 
     std::vector<PartialAggregationResult> allPartials = {std::move(p1), std::move(p2)};
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::FIRST);
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::FIRST).get();
 
     ASSERT_EQ(grouped.size(), 1);
     ASSERT_EQ(grouped[0].points.size(), 2);
@@ -282,7 +282,7 @@ TEST_F(AggregatorMergeCorrectnessTest, SpreadMerge_RawValues_CorrectRange) {
     auto p2 = makeRawPartial("test\0value", {300, 400}, {2.0, 8.0});
 
     std::vector<PartialAggregationResult> allPartials = {std::move(p1), std::move(p2)};
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::SPREAD);
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::SPREAD).get();
 
     ASSERT_EQ(grouped.size(), 1);
     // With the C2 fix, SPREAD goes through AggregationState merge which tracks
@@ -312,7 +312,7 @@ TEST_F(AggregatorMergeCorrectnessTest, SpreadMerge_SharedTimestamp_CorrectRange)
     auto p2 = makeRawPartial("test\0value", {200, 300}, {8.0, 2.0});
 
     std::vector<PartialAggregationResult> allPartials = {std::move(p1), std::move(p2)};
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::SPREAD);
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::SPREAD).get();
 
     ASSERT_EQ(grouped.size(), 1);
     ASSERT_EQ(grouped[0].points.size(), 3);
@@ -346,7 +346,7 @@ TEST_F(AggregatorMergeCorrectnessTest, StddevMerge_RawValues_CorrectResult) {
     auto p2 = makeRawPartial("test\0value", {200, 300}, {20.0, 30.0});
 
     std::vector<PartialAggregationResult> allPartials = {std::move(p1), std::move(p2)};
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::STDDEV);
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::STDDEV).get();
 
     ASSERT_EQ(grouped.size(), 1);
     ASSERT_EQ(grouped[0].points.size(), 3);
@@ -374,7 +374,7 @@ TEST_F(AggregatorMergeCorrectnessTest, StdvarMerge_RawValues_CorrectResult) {
     auto p2 = makeRawPartial("test\0value", {200, 300}, {20.0, 30.0});
 
     std::vector<PartialAggregationResult> allPartials = {std::move(p1), std::move(p2)};
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::STDVAR);
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::STDVAR).get();
 
     ASSERT_EQ(grouped.size(), 1);
     ASSERT_EQ(grouped[0].points.size(), 3);
@@ -405,7 +405,7 @@ TEST_F(AggregatorMergeCorrectnessTest, StddevMerge_ThreePartials_WelfordMergeCor
     auto p3 = makeRawPartial("test\0value", {1000}, {6.0});
 
     std::vector<PartialAggregationResult> allPartials = {std::move(p1), std::move(p2), std::move(p3)};
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::STDDEV);
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::STDDEV).get();
 
     ASSERT_EQ(grouped.size(), 1);
     ASSERT_EQ(grouped[0].points.size(), 1);
@@ -422,7 +422,7 @@ TEST_F(AggregatorMergeCorrectnessTest, MedianMerge_RawValues_CorrectResult) {
     auto p2 = makeRawPartial("test\0value", {200, 300}, {20.0, 7.0});
 
     std::vector<PartialAggregationResult> allPartials = {std::move(p1), std::move(p2)};
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::MEDIAN);
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::MEDIAN).get();
 
     ASSERT_EQ(grouped.size(), 1);
     ASSERT_EQ(grouped[0].points.size(), 3);
@@ -450,7 +450,7 @@ TEST_F(AggregatorMergeCorrectnessTest, ExactMedianMerge_RawValues_CorrectResult)
     auto p2 = makeRawPartial("test\0value", {200, 300}, {20.0, 7.0});
 
     std::vector<PartialAggregationResult> allPartials = {std::move(p1), std::move(p2)};
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::EXACT_MEDIAN);
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::EXACT_MEDIAN).get();
 
     ASSERT_EQ(grouped.size(), 1);
     ASSERT_EQ(grouped[0].points.size(), 3);
@@ -477,7 +477,7 @@ TEST_F(AggregatorMergeCorrectnessTest, MedianMerge_ThreePartials_OddCount) {
     auto p3 = makeRawPartial("test\0value", {500}, {3.0});
 
     std::vector<PartialAggregationResult> allPartials = {std::move(p1), std::move(p2), std::move(p3)};
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::MEDIAN);
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::MEDIAN).get();
 
     ASSERT_EQ(grouped.size(), 1);
     ASSERT_EQ(grouped[0].points.size(), 1);
@@ -491,7 +491,7 @@ TEST_F(AggregatorMergeCorrectnessTest, ExactMedianMerge_ThreePartials_OddCount) 
     auto p3 = makeRawPartial("test\0value", {500}, {3.0});
 
     std::vector<PartialAggregationResult> allPartials = {std::move(p1), std::move(p2), std::move(p3)};
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::EXACT_MEDIAN);
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::EXACT_MEDIAN).get();
 
     ASSERT_EQ(grouped.size(), 1);
     ASSERT_EQ(grouped[0].points.size(), 1);

@@ -16,6 +16,8 @@
 #include "../encoding/string_encoder.hpp"
 
 #include <climits>
+#include <seastar/core/coroutine.hh>
+#include <seastar/coroutine/maybe_yield.hh>
 #include <stdexcept>
 
 namespace {
@@ -196,9 +198,74 @@ ParsedQueryRequest parseQueryRequest(const void* data, size_t size) {
     return result;
 }
 
-std::string formatQueryResponse(QueryResponseData& response) {
-    ::timestar_pb::QueryResponse resp;
+// Encode one series into the protobuf response — shared by the synchronous
+// formatQueryResponse and the yielding formatQueryResponseYielding so their
+// wire format cannot drift.  Returns the series' point count (for the caller's
+// yield accounting).
+static size_t appendSeriesToPb(::timestar_pb::QueryResponse& resp, SeriesResultData& sr) {
+    size_t points = 0;
+    auto* pbSeries = resp.add_series();
+    pbSeries->set_measurement(sr.measurement);
 
+    auto* pbTags = pbSeries->mutable_tags();
+    for (const auto& [k, v] : sr.tags) {
+        (*pbTags)[k] = v;
+    }
+
+    auto* pbFields = pbSeries->mutable_fields();
+    for (auto& [fieldName, fieldData] : sr.fields) {
+        auto& [timestamps, values] = fieldData;
+        ::timestar_pb::FieldData fd;
+        points += timestamps.size();
+
+        // Compress timestamps with FFOR
+        if (!timestamps.empty()) {
+            auto tsEncoded = IntegerEncoder::encode(std::span<const uint64_t>(timestamps));
+            fd.set_compressed_timestamps(tsEncoded.data.data(), tsEncoded.size());
+        }
+
+        // Compress values with type-appropriate codec
+        std::visit(
+            [&fd](auto& vec) {
+                using T = std::decay_t<decltype(vec)>;
+                if constexpr (std::is_same_v<T, std::vector<double>>) {
+                    if (!vec.empty()) {
+                        auto encoded = FloatEncoder::encode(std::span<const double>(vec));
+                        fd.mutable_double_values()->set_compressed_alp(encoded.data.data(), encoded.dataByteSize());
+                    }
+                } else if constexpr (std::is_same_v<T, std::vector<bool>>) {
+                    if (!vec.empty()) {
+                        auto encoded = BoolEncoderRLE::encode(vec);
+                        fd.mutable_bool_values()->set_compressed_rle(encoded.data.data(), encoded.size());
+                    }
+                } else if constexpr (std::is_same_v<T, std::vector<std::string>>) {
+                    if (!vec.empty()) {
+                        auto encoded = StringEncoder::encode(std::span<const std::string>(vec));
+                        fd.mutable_string_values()->set_compressed_zstd(encoded.data.data(), encoded.size());
+                        fd.mutable_string_values()->set_count(static_cast<uint32_t>(vec.size()));
+                    }
+                } else if constexpr (std::is_same_v<T, std::vector<int64_t>>) {
+                    if (!vec.empty()) {
+                        // ZigZag encode then FFOR
+                        std::vector<uint64_t> zz(vec.size());
+                        for (size_t i = 0; i < vec.size(); ++i) {
+                            zz[i] = (static_cast<uint64_t>(vec[i]) << 1) ^ static_cast<uint64_t>(vec[i] >> 63);
+                        }
+                        auto encoded = IntegerEncoder::encode(std::span<const uint64_t>(zz));
+                        fd.mutable_int64_values()->set_compressed_ffor(encoded.data.data(), encoded.size());
+                    }
+                }
+            },
+            values);
+
+        (*pbFields)[fieldName] = std::move(fd);
+    }
+
+    return points;
+}
+
+// Shared header/footer halves of the QueryResponse encode (see appendSeriesToPb).
+static void initPbQueryResponse(::timestar_pb::QueryResponse& resp, const QueryResponseData& response) {
     if (response.success) {
         resp.set_status("success");
     } else {
@@ -206,65 +273,9 @@ std::string formatQueryResponse(QueryResponseData& response) {
         resp.set_error_code(response.errorCode);
         resp.set_error_message(response.errorMessage);
     }
+}
 
-    for (auto& sr : response.series) {
-        auto* pbSeries = resp.add_series();
-        pbSeries->set_measurement(sr.measurement);
-
-        auto* pbTags = pbSeries->mutable_tags();
-        for (const auto& [k, v] : sr.tags) {
-            (*pbTags)[k] = v;
-        }
-
-        auto* pbFields = pbSeries->mutable_fields();
-        for (auto& [fieldName, fieldData] : sr.fields) {
-            auto& [timestamps, values] = fieldData;
-            ::timestar_pb::FieldData fd;
-
-            // Compress timestamps with FFOR
-            if (!timestamps.empty()) {
-                auto tsEncoded = IntegerEncoder::encode(std::span<const uint64_t>(timestamps));
-                fd.set_compressed_timestamps(tsEncoded.data.data(), tsEncoded.size());
-            }
-
-            // Compress values with type-appropriate codec
-            std::visit(
-                [&fd](auto& vec) {
-                    using T = std::decay_t<decltype(vec)>;
-                    if constexpr (std::is_same_v<T, std::vector<double>>) {
-                        if (!vec.empty()) {
-                            auto encoded = FloatEncoder::encode(std::span<const double>(vec));
-                            fd.mutable_double_values()->set_compressed_alp(encoded.data.data(), encoded.dataByteSize());
-                        }
-                    } else if constexpr (std::is_same_v<T, std::vector<bool>>) {
-                        if (!vec.empty()) {
-                            auto encoded = BoolEncoderRLE::encode(vec);
-                            fd.mutable_bool_values()->set_compressed_rle(encoded.data.data(), encoded.size());
-                        }
-                    } else if constexpr (std::is_same_v<T, std::vector<std::string>>) {
-                        if (!vec.empty()) {
-                            auto encoded = StringEncoder::encode(std::span<const std::string>(vec));
-                            fd.mutable_string_values()->set_compressed_zstd(encoded.data.data(), encoded.size());
-                            fd.mutable_string_values()->set_count(static_cast<uint32_t>(vec.size()));
-                        }
-                    } else if constexpr (std::is_same_v<T, std::vector<int64_t>>) {
-                        if (!vec.empty()) {
-                            // ZigZag encode then FFOR
-                            std::vector<uint64_t> zz(vec.size());
-                            for (size_t i = 0; i < vec.size(); ++i) {
-                                zz[i] = (static_cast<uint64_t>(vec[i]) << 1) ^ static_cast<uint64_t>(vec[i] >> 63);
-                            }
-                            auto encoded = IntegerEncoder::encode(std::span<const uint64_t>(zz));
-                            fd.mutable_int64_values()->set_compressed_ffor(encoded.data.data(), encoded.size());
-                        }
-                    }
-                },
-                values);
-
-            (*pbFields)[fieldName] = std::move(fd);
-        }
-    }
-
+static std::string finalizePbQueryResponse(::timestar_pb::QueryResponse& resp, const QueryResponseData& response) {
     auto* stats = resp.mutable_statistics();
     stats->set_series_count(response.statistics.seriesCount);
     stats->set_point_count(response.statistics.pointCount);
@@ -281,6 +292,38 @@ std::string formatQueryResponse(QueryResponseData& response) {
     std::string out;
     resp.SerializeToString(&out);
     return out;
+}
+
+std::string formatQueryResponse(QueryResponseData& response) {
+    ::timestar_pb::QueryResponse resp;
+    initPbQueryResponse(resp, response);
+    for (auto& sr : response.series) {
+        appendSeriesToPb(resp, sr);
+    }
+    return finalizePbQueryResponse(resp, response);
+}
+
+seastar::future<std::string> formatQueryResponseYielding(QueryResponseData& response) {
+    ::timestar_pb::QueryResponse resp;
+    initPbQueryResponse(resp, response);
+
+    // Yield between series once ~this many points have been compressed.  The
+    // per-series ALP/FFOR encode is the expensive part of the response build;
+    // without this a multi-million-point protobuf response encodes as a single
+    // reactor task (observed as 30-50ms+ stalls in the Jul 2026 incident).
+    constexpr size_t YIELD_CHUNK_POINTS = 65536;
+    size_t pointsSinceYield = 0;
+    for (auto& sr : response.series) {
+        pointsSinceYield += appendSeriesToPb(resp, sr);
+        if (pointsSinceYield >= YIELD_CHUNK_POINTS) {
+            pointsSinceYield = 0;
+            co_await seastar::coroutine::maybe_yield();
+        }
+    }
+
+    // The final SerializeToString is one pass but is dominated by memcpy of
+    // the already-compressed field payloads — cheap relative to the encode.
+    co_return finalizePbQueryResponse(resp, response);
 }
 
 std::string formatQueryError(const std::string& code, const std::string& message) {

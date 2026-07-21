@@ -2,6 +2,7 @@
 
 #include "http_query_handler.hpp"
 
+#include <seastar/core/future.hh>
 #include <string>
 
 namespace timestar::http {
@@ -20,7 +21,11 @@ class ResponseFormatter {
 public:
     // Format a successful query response as JSON.
     // The response is consumed (fields may be moved from).
-    static std::string format(QueryResponse& response);
+    // Coroutine: large value/timestamp arrays are written in ~64k-element
+    // slices with a reactor yield between slices, so a multi-million-point
+    // JSON response cannot monopolize the reactor (same policy as the
+    // aggregation path and proto::formatQueryResponseYielding).
+    static seastar::future<std::string> format(QueryResponse& response);
 
     // Format a JSON error response in the canonical shape (see http_error.hpp):
     //   {"status":"error","error_code":"...","message":"...","error":"..."}
