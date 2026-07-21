@@ -499,14 +499,14 @@ seastar::future<bool> MemoryStore::insert(TimeStarInsert<T>& insertRequest) {
     if (closed)
         throw std::runtime_error("MemoryStore is closed");
 
-    // Check if this insert would exceed the 16MB WAL threshold.
+    // Check if this insert would exceed the WAL segment threshold.
     // The estimated size is returned via outEstimatedSize to avoid
     // recomputing it below (eliminates double-estimation).
     size_t thisEstimatedSize = 0;
     bool needsRollover = wouldExceedThreshold(insertRequest, thisEstimatedSize);
     if (needsRollover) {
         // Don't insert - signal that rollover is needed
-        timestar::memory_log.debug("Insert would exceed 16MB WAL limit, signaling rollover needed");
+        timestar::memory_log.debug("Insert would exceed WAL segment limit, signaling rollover needed");
         co_return true;
     }
 

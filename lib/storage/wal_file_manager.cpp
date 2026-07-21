@@ -191,11 +191,11 @@ seastar::future<> WALFileManager::insert(TimeStarInsert<T>& insertRequest) {
         throw std::runtime_error("No memory stores available for insert");
     }
 
-    // First, estimate the size of this insert to check if it exceeds 16MB
+    // First, estimate the size of this insert against the WAL segment limit
     if (memoryStores[0] && memoryStores[0]->getWAL()) {
         size_t estimatedSize = memoryStores[0]->getWAL()->estimateInsertSize(insertRequest);
         if (estimatedSize > MemoryStore::walSizeThreshold()) {
-            // This single insert exceeds the entire 16MB WAL limit
+            // This single insert exceeds the entire WAL segment limit
             timestar::wal_log.error("Insert request of {} bytes exceeds maximum WAL size of {} bytes", estimatedSize,
                                     MemoryStore::walSizeThreshold());
             throw timestar::InsertTooLargeException("Insert batch too large - requested " +
@@ -220,7 +220,8 @@ seastar::future<> WALFileManager::insert(TimeStarInsert<T>& insertRequest) {
         if (retryResult) {
             // The insert still doesn't fit in a fresh WAL - it's too large
             size_t estimatedSize = memoryStores[0]->getWAL()->estimateInsertSize(insertRequest);
-            timestar::wal_log.error("Insert batch of {} bytes too large for fresh 16MB WAL", estimatedSize);
+            timestar::wal_log.error("Insert batch of {} bytes too large for fresh {} byte WAL", estimatedSize,
+                                    MemoryStore::walSizeThreshold());
             throw timestar::InsertTooLargeException("Insert batch too large - requested " +
                                                     std::to_string(estimatedSize) +
                                                     " bytes, exceeds the WAL segment limit. Please reduce batch size.");
@@ -355,7 +356,7 @@ seastar::future<> WALFileManager::rolloverMemoryStore() {
     }
 
     auto previousStore = memoryStores[0];
-    timestar::wal_log.info("Memory store {} full (16MB threshold reached), rolling over",
+    timestar::wal_log.info("Memory store {} full (WAL segment threshold reached), rolling over",
                            previousStore->sequenceNumber);
 
     // Create and init the new store FIRST, before closing the old one.

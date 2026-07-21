@@ -60,7 +60,16 @@ struct CompactionConfig {
 };
 
 struct StorageConfig {
-    uint64_t wal_size_threshold = 16 * 1024 * 1024;
+    // Per-store WAL segment size, which is also the store rollover trigger
+    // (with the resident-bytes ceiling at 4x this). 64MB, up from 16MB: at
+    // high cardinality the WAL estimate is dominated by ~120B/series-insert
+    // framing, so 16MB rolled a 128k-series store every couple of batches --
+    // constant conversion churn, ~2-point flush blocks, and 10x the rollover
+    // rate for no durability gain. 64MB is the value every validated
+    // endurance run used (3B pts / 128k series / 6GB: 21.1M pts/s import,
+    // zero errors, RSS ~1.1GB). Memory cost: retained stores are bounded by
+    // admission at 16 stores/shard worst case.
+    uint64_t wal_size_threshold = 64 * 1024 * 1024;
     uint32_t max_points_per_block = 3000;
     double tsm_bloom_fpr = 0.001;
     uint32_t tsm_cache_entries = 4096;

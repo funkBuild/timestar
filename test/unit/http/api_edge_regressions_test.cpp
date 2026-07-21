@@ -15,6 +15,12 @@
 //     (canonical rule, see CLAUDE.md "String Fields in Queries").  They used
 //     to be silently dropped from any query with an aggregationInterval.
 
+#include "../../../lib/core/engine.hpp"
+#include "../../../lib/http/http_metadata_handler.hpp"
+#include "../../../lib/http/http_query_handler.hpp"
+#include "../../../lib/http/http_write_handler.hpp"
+#include "../../test_helpers.hpp"
+
 #include <glaze/json.hpp>
 
 #include <gtest/gtest.h>
@@ -26,14 +32,9 @@
 #include <seastar/core/thread.hh>
 #include <seastar/http/reply.hh>
 #include <seastar/http/request.hh>
+#include <seastar/util/defer.hh>
 #include <string>
 #include <vector>
-
-#include "../../../lib/core/engine.hpp"
-#include "../../../lib/http/http_metadata_handler.hpp"
-#include "../../../lib/http/http_query_handler.hpp"
-#include "../../../lib/http/http_write_handler.hpp"
-#include "../../test_helpers.hpp"
 
 using namespace timestar;
 
@@ -126,11 +127,11 @@ TEST_F(ApiEdgeRegressionsTest, OversizedFieldAndTagIdentifiersRejected) {
         EXPECT_EQ(repField->_status, seastar::http::reply::status_type::bad_request) << repField->_content;
 
         const std::string longTagValue(1001, 't');
-        auto repTag = writeHandler
-                          .handleWrite(makeJsonRequest(R"({"measurement": "edge_m", "tags": {"host": ")" +
-                                                       longTagValue +
-                                                       R"("}, "fields": {"v": 1.0}, "timestamp": 1000000000})"))
-                          .get();
+        auto repTag =
+            writeHandler
+                .handleWrite(makeJsonRequest(R"({"measurement": "edge_m", "tags": {"host": ")" + longTagValue +
+                                             R"("}, "fields": {"v": 1.0}, "timestamp": 1000000000})"))
+                .get();
         EXPECT_EQ(repTag->_status, seastar::http::reply::status_type::bad_request) << repTag->_content;
     })
         .join()
@@ -143,6 +144,17 @@ TEST_F(ApiEdgeRegressionsTest, OversizedFieldAndTagIdentifiersRejected) {
 // ---------------------------------------------------------------------------
 TEST_F(ApiEdgeRegressionsTest, OversizedBatchReturns413) {
     seastar::thread([] {
+        // Pin the WAL segment threshold to 16MB for this test. The 413
+        // injection needs a request whose WAL estimate EXCEEDS the segment
+        // limit while its body stays under the 64MB HTTP body cap -- with the
+        // default threshold now also 64MB, no such request exists, so the
+        // test provides its own threshold instead of assuming the default.
+        auto savedCfg = timestar::config();
+        auto testCfg = savedCfg;
+        testCfg.storage.wal_size_threshold = 16 * 1024 * 1024;
+        timestar::setGlobalConfig(testCfg);
+        auto restoreCfg = seastar::defer([&] { timestar::setGlobalConfig(savedCfg); });
+
         ScopedShardedEngine eng;
         eng.start();
 
@@ -174,8 +186,8 @@ TEST_F(ApiEdgeRegressionsTest, OversizedBatchReturns413) {
 
         auto rep = writeHandler.handleWrite(makeJsonRequest(body)).get();
         EXPECT_EQ(rep->_status, seastar::http::reply::status_type::payload_too_large)
-            << "an oversized batch must be a 413 client error, got status "
-            << static_cast<int>(rep->_status) << " body: " << rep->_content.substr(0, 500);
+            << "an oversized batch must be a 413 client error, got status " << static_cast<int>(rep->_status)
+            << " body: " << rep->_content.substr(0, 500);
 
         // Flat error body: {"status":"error", ..., "error":"..."}
         glz::generic parsed;
@@ -216,9 +228,9 @@ TEST_F(ApiEdgeRegressionsTest, StringFieldsIncludedInIntervalQueriesAsLatestPerB
         ASSERT_EQ(wrep->_status, seastar::http::reply::status_type::ok) << wrep->_content;
 
         auto runQuery = [&](const std::string& interval) {
-            auto rep = queryHandler
-                           .handleQuery(makeQueryRequest("latest:edge_strint()", base, base + 4 * kSecond, interval))
-                           .get();
+            auto rep =
+                queryHandler.handleQuery(makeQueryRequest("latest:edge_strint()", base, base + 4 * kSecond, interval))
+                    .get();
             EXPECT_EQ(rep->_status, seastar::http::reply::status_type::ok) << rep->_content;
             glz::generic parsed;
             auto ec = glz::read_json(parsed, rep->_content);
@@ -287,7 +299,8 @@ TEST_F(ApiEdgeRegressionsTest, StringFieldsIncludedInIntervalQueriesAsLatestPerB
 
         // No interval: raw passthrough is unchanged (all 4 values).
         {
-            auto rep = queryHandler.handleQuery(makeQueryRequest("latest:edge_strint(s)", base, base + 4 * kSecond)).get();
+            auto rep =
+                queryHandler.handleQuery(makeQueryRequest("latest:edge_strint(s)", base, base + 4 * kSecond)).get();
             ASSERT_EQ(rep->_status, seastar::http::reply::status_type::ok) << rep->_content;
             glz::generic parsed;
             ASSERT_FALSE(glz::read_json(parsed, rep->_content));

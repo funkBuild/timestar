@@ -41,6 +41,7 @@
 #include <seastar/core/thread.hh>
 #include <seastar/http/reply.hh>
 #include <seastar/http/request.hh>
+#include <seastar/util/defer.hh>
 #include <string>
 
 class HttpWriteHandlerAtomicityBehavioralTest : public ::testing::Test {
@@ -121,16 +122,28 @@ TEST_F(HttpWriteHandlerAtomicityBehavioralTest, ShardFailureAccountingIsConsiste
     }
 
     seastar::thread([] {
+        // Pin the WAL segment threshold to 16MB for this test. The 413
+        // injection needs a request whose WAL estimate EXCEEDS the segment
+        // limit while its body stays under the 64MB HTTP body cap -- with the
+        // default threshold now also 64MB, no such request exists, so the
+        // test provides its own threshold instead of assuming the default.
+        auto savedCfg = timestar::config();
+        auto testCfg = savedCfg;
+        testCfg.storage.wal_size_threshold = 16 * 1024 * 1024;
+        timestar::setGlobalConfig(testCfg);
+        auto restoreCfg = seastar::defer([&] { timestar::setGlobalConfig(savedCfg); });
+
         ScopedShardedEngine eng;
         eng.start();
 
         HttpWriteHandler handler(&eng.eng);
 
-        // 42 string values of 1MB each => 42MB raw. The WAL batch estimator
-        // applies its initial string compression ratio of 0.40, giving a
-        // ~16.8MB estimate for one series — above the 16MB WAL threshold, so
-        // the owning shard's Engine::insertBatch throws before persisting.
-        constexpr int kBigValues = 42;
+        // Enough 1MB string values that the WAL batch estimate (initial string
+        // compression ratio 0.40) exceeds the CONFIGURED WAL segment threshold,
+        // whatever it is -- the old fixed 42 values assumed the 16MB default
+        // and silently stopped failing when the default became 64MB. +3 for
+        // margin over per-entry framing estimate wobble.
+        const int kBigValues = static_cast<int>(MemoryStore::walSizeThreshold() / (1024 * 1024 * 40 / 100)) + 3;
         const std::string bigValue(1024 * 1024, 'x');
 
         std::map<std::string, std::string> smallTags{{"host", "h1"}};
@@ -177,7 +190,7 @@ TEST_F(HttpWriteHandlerAtomicityBehavioralTest, ShardFailureAccountingIsConsiste
         }
         body += "]}";
 
-        constexpr double kTotalPoints = kBigValues + 3;  // 42 big + 3 small
+        const double kTotalPoints = kBigValues + 3;  // big values + 3 small
 
         auto rep = handler.handleWrite(makeWriteRequest(body)).get();
         ASSERT_EQ(rep->_status, seastar::http::reply::status_type::ok) << rep->_content;
@@ -227,6 +240,17 @@ TEST_F(HttpWriteHandlerAtomicityBehavioralTest, ShardFailureAccountingIsConsiste
 // ---------------------------------------------------------------------------
 TEST_F(HttpWriteHandlerAtomicityBehavioralTest, InvalidBatchEntryYieldsPartialAndKeepsValidPoints) {
     seastar::thread([] {
+        // Pin the WAL segment threshold to 16MB for this test. The 413
+        // injection needs a request whose WAL estimate EXCEEDS the segment
+        // limit while its body stays under the 64MB HTTP body cap -- with the
+        // default threshold now also 64MB, no such request exists, so the
+        // test provides its own threshold instead of assuming the default.
+        auto savedCfg = timestar::config();
+        auto testCfg = savedCfg;
+        testCfg.storage.wal_size_threshold = 16 * 1024 * 1024;
+        timestar::setGlobalConfig(testCfg);
+        auto restoreCfg = seastar::defer([&] { timestar::setGlobalConfig(savedCfg); });
+
         ScopedShardedEngine eng;
         eng.start();
 
@@ -266,6 +290,17 @@ TEST_F(HttpWriteHandlerAtomicityBehavioralTest, InvalidBatchEntryYieldsPartialAn
 // ---------------------------------------------------------------------------
 TEST_F(HttpWriteHandlerAtomicityBehavioralTest, LateWritesKeyBatchIsFullyProcessed) {
     seastar::thread([] {
+        // Pin the WAL segment threshold to 16MB for this test. The 413
+        // injection needs a request whose WAL estimate EXCEEDS the segment
+        // limit while its body stays under the 64MB HTTP body cap -- with the
+        // default threshold now also 64MB, no such request exists, so the
+        // test provides its own threshold instead of assuming the default.
+        auto savedCfg = timestar::config();
+        auto testCfg = savedCfg;
+        testCfg.storage.wal_size_threshold = 16 * 1024 * 1024;
+        timestar::setGlobalConfig(testCfg);
+        auto restoreCfg = seastar::defer([&] { timestar::setGlobalConfig(savedCfg); });
+
         ScopedShardedEngine eng;
         eng.start();
 

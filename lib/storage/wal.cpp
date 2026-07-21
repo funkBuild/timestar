@@ -358,7 +358,7 @@ size_t WAL::estimateInsertSize(TimeStarInsert<T>& insertRequest) {
         estimatedSize += estimatedValSize;
     }
 
-    // Apply safety margin to avoid underestimation near the 16MB WAL limit.
+    // Apply safety margin to avoid underestimation near the WAL segment limit.
     estimatedSize = static_cast<size_t>(static_cast<double>(estimatedSize) * CompressionStats::SAFETY_MARGIN);
 
     // Cache the result for subsequent calls on this insert
