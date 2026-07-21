@@ -22,6 +22,7 @@
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/gate.hh>
+#include <seastar/core/memory.hh>
 #include <seastar/core/scheduling.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/core/timer.hh>
@@ -110,18 +111,41 @@ private:
 
     seastar::future<> createDirectoryStructure();
 
-    // Shed load when the unconverted-store backlog reaches its ceiling.
-    // Throws IngestBacklogException (-> 503 + Retry-After). Called at the top
-    // of the insert paths, before anything durable happens, so a rejected write
-    // leaves no WAL record and no memstore entry.
+    // Shed load (503 + Retry-After via IngestBacklogException) when ANY stage
+    // of the pipeline is critically behind. Called at the top of the insert
+    // paths, before anything durable happens, so a rejected write leaves no
+    // WAL record and no memstore entry. Three independent ceilings, each a
+    // different backlog the front of the pipeline cannot see:
+    //
+    //  1. Retained memory stores -- conversion behind ingest (RAM).
+    //  2. Tier-0 file count -- MERGES behind conversion. Each tier-0 file at
+    //     high cardinality carries a multi-MB sparse index, so this backlog
+    //     is a memory commitment too; a soak that outran merges 3x grew it to
+    //     268 files and the pool exhausted into a bad_alloc storm with
+    //     shed=0 the whole way down, because admission only watched (1).
+    //  3. Free memory itself -- the backstop for every cause not enumerated
+    //     above. Once allocation fails INSIDE the pipeline (a conversion or
+    //     merge), the failure is data loss and a backlog that can no longer
+    //     drain; a shed request is retryable and costs nothing.
     void rejectIfIngestBacklogged() {
-        if (!walFileManager.isIngestBacklogged()) {
-            return;
+        if (walFileManager.isIngestBacklogged()) {
+            ++_metrics.inserts_rejected_backlog_total;
+            throw timestar::IngestBacklogException("Shard " + std::to_string(shardId) + " ingest backlog: " +
+                                                   std::to_string(walFileManager.retainedMemoryStoreCount()) +
+                                                   " memory stores awaiting TSM conversion");
         }
-        ++_metrics.inserts_rejected_backlog_total;
-        throw timestar::IngestBacklogException("Shard " + std::to_string(shardId) + " ingest backlog: " +
-                                               std::to_string(walFileManager.retainedMemoryStoreCount()) +
-                                               " memory stores awaiting TSM conversion");
+        const size_t tier0Files = tsmFileManager.getFileCountInTier(0);
+        if (tier0Files >= timestar::config().storage.compaction.tier0_shed_ceiling) {
+            ++_metrics.inserts_rejected_backlog_total;
+            throw timestar::IngestBacklogException("Shard " + std::to_string(shardId) + " compaction backlog: " +
+                                                   std::to_string(tier0Files) + " tier-0 files awaiting merge");
+        }
+        const size_t freeMem = seastar::memory::stats().free_memory();
+        if (freeMem < timestar::config().storage.ingest_min_free_bytes) {
+            ++_metrics.inserts_rejected_backlog_total;
+            throw timestar::IngestBacklogException("Shard " + std::to_string(shardId) +
+                                                   " memory pressure: " + std::to_string(freeMem >> 20) + "MB free");
+        }
     }
 
     // Internal delete implementation without gate acquisition.

@@ -37,6 +37,17 @@ struct CompactionConfig {
     // flowing), but an unbounded tier 0 degrades every query on the shard, so
     // this caps how far read amplification can drift during a long burst.
     uint32_t tier0_starvation_ceiling = 32;
+    // Tier-0 file count at which INGEST is shed (503 + Retry-After). At high
+    // cardinality every tier-0 file carries a multi-MB sparse index, so an
+    // unbounded backlog is an unbounded memory commitment: a soak at 3x the
+    // target rate grew tier 0 to 268 files, whose indexes exhausted the memory
+    // pool and turned merges and conversions themselves into bad_alloc
+    // failures -- at which point the backlog could never drain. Shedding at
+    // twice the starvation ceiling gives merges a full-priority window
+    // [starvation_ceiling .. this] to catch up before writes are refused; a
+    // client that honours Retry-After converges on the rate the WHOLE
+    // pipeline (parse + WAL + convert + merge) sustains, not just its front.
+    uint32_t tier0_shed_ceiling = 64;
     // Ceiling for the per-tier output block size: compaction writes tier-T
     // outputs with blocks of up to min(max_points_per_block << T, this).
     // High-cardinality workloads flush files whose per-series blocks hold only
@@ -78,6 +89,14 @@ struct StorageConfig {
     // RAM-backed I/O never blocks, so a single fiber keeps up. Re-measure on the
     // target storage before changing it.
     uint32_t conversion_concurrency = 6;
+    // Free-memory floor for accepting writes: below this per-shard free
+    // memory, ingest is shed with 503 + Retry-After. The last line of defence
+    // against bad_alloc storms of ANY origin -- once allocation fails inside
+    // the write path (or worse, inside a conversion or merge), the failure
+    // mode is data loss and a backlog that can no longer drain; a shed
+    // request is retryable and costs nothing. 256MB leaves room for the
+    // in-flight parse transients the parse budget already bounds.
+    uint64_t ingest_min_free_bytes = 256ull * 1024 * 1024;
     CompactionConfig compaction;
 };
 
@@ -224,17 +243,17 @@ struct glz::meta<timestar::CompactionConfig> {
     static constexpr auto value =
         object("max_concurrent", &T::max_concurrent, "max_memory", &T::max_memory, "batch_size", &T::batch_size,
                "files_per_merge", &T::files_per_merge, "tier0_starvation_ceiling", &T::tier0_starvation_ceiling,
-               "deep_block_points_cap", &T::deep_block_points_cap);
+               "tier0_shed_ceiling", &T::tier0_shed_ceiling, "deep_block_points_cap", &T::deep_block_points_cap);
 };
 
 template <>
 struct glz::meta<timestar::StorageConfig> {
     using T = timestar::StorageConfig;
-    static constexpr auto value =
-        object("wal_size_threshold", &T::wal_size_threshold, "max_points_per_block", &T::max_points_per_block,
-               "tsm_bloom_fpr", &T::tsm_bloom_fpr, "tsm_cache_entries", &T::tsm_cache_entries,
-               "wal_max_concurrent_encoders", &T::wal_max_concurrent_encoders, "conversion_concurrency",
-               &T::conversion_concurrency, "compaction", &T::compaction);
+    static constexpr auto value = object(
+        "wal_size_threshold", &T::wal_size_threshold, "max_points_per_block", &T::max_points_per_block, "tsm_bloom_fpr",
+        &T::tsm_bloom_fpr, "tsm_cache_entries", &T::tsm_cache_entries, "wal_max_concurrent_encoders",
+        &T::wal_max_concurrent_encoders, "conversion_concurrency", &T::conversion_concurrency, "ingest_min_free_bytes",
+        &T::ingest_min_free_bytes, "compaction", &T::compaction);
 };
 
 template <>
