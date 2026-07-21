@@ -113,13 +113,28 @@ struct StreamingConfig {
 // bandwidth under contention. When only one class has pending I/O, it gets
 // full bandwidth regardless of share count.
 struct IOPriorityConfig {
-    float query_shares = 100.0f;      // TSM/index reads during queries
-    float write_shares = 50.0f;       // WAL writes, memtable flushes
-    float compaction_shares = 10.0f;  // Background TSM/SSTable compaction
-    // WAL->TSM conversion. Well above compaction_shares: conversion is what
-    // releases WAL disk and drains the ingest backlog, so it must outrank tier
-    // merges. Well below `main` (1000) so foreground writes still preempt it.
-    float flush_shares = 200.0f;
+    float query_shares = 100.0f;  // TSM/index reads during queries
+    float write_shares = 50.0f;   // WAL writes, memtable flushes
+    // Background TSM/SSTable compaction. Shares are a PROPORTION under
+    // contention, not a cap: an idle reactor still gives compaction 100%.
+    // 333 holds ~25% against a saturated `main` (333/1333), ~22% with
+    // ts_flush also runnable (333/1533). The old value of 10 rounded to
+    // 0.8% under sustained foreground load -- effectively starvation: a
+    // parse-saturated shard completed 9 merges while conversions added ~25
+    // files/min, and the resulting tier-0 backlog's sparse indexes exhausted
+    // the shard's memory pool. A merge burst can still never take more than
+    // its proportional slice from a busy foreground, so the write-latency
+    // cost only appears when compaction genuinely has work during saturation
+    // -- exactly when falling behind is the worse outcome.
+    float compaction_shares = 333.0f;
+    // WAL->TSM conversion. Deliberately ABOVE compaction_shares: conversion
+    // frees retained-store RAM and WAL disk, so when merges and conversions
+    // genuinely contend (the tier-0 starvation-ceiling window, where the
+    // WAL-first policy deferral is bypassed) drain must still win. 500 holds
+    // ~33% against a saturated main. In normal operation the policy layer
+    // (compactionYieldReason) keeps merges out of conversion's way entirely;
+    // the share gap only matters when that policy is deliberately overridden.
+    float flush_shares = 500.0f;
 };
 
 struct EngineConfig {

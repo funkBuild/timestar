@@ -16,7 +16,9 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
+#include <limits>
 #include <vector>
 
 namespace {
@@ -27,12 +29,22 @@ double perCallMicros(F&& f, int iters) {
     for (int i = 0; i < 200; ++i) {
         f();
     }
-    auto t0 = std::chrono::steady_clock::now();
-    for (int i = 0; i < iters; ++i) {
-        f();
+    // MIN of several batches, not one long average: a mean absorbs every
+    // preemption and cache eviction the rest of the machine inflicts (this
+    // test once failed purely because a benchmark was saturating the box),
+    // while the fastest batch is a stable estimate of the code's own cost.
+    constexpr int kBatches = 5;
+    const int perBatch = iters / kBatches;
+    double best = std::numeric_limits<double>::infinity();
+    for (int b = 0; b < kBatches; ++b) {
+        auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < perBatch; ++i) {
+            f();
+        }
+        auto t1 = std::chrono::steady_clock::now();
+        best = std::min(best, std::chrono::duration<double, std::micro>(t1 - t0).count() / perBatch);
     }
-    auto t1 = std::chrono::steady_clock::now();
-    return std::chrono::duration<double, std::micro>(t1 - t0).count() / iters;
+    return best;
 }
 
 }  // namespace

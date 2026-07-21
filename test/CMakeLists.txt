@@ -116,7 +116,12 @@ target_include_directories(timestar_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_definitions(timestar_test PRIVATE ${SOURCE_INSPECTION_DEFS})
 
 # Discover tests for CTest
-gtest_discover_tests(timestar_test)
+# DISCOVERY_TIMEOUT: the post-build discovery step runs the binary to list its
+# ~3.5k tests; under load (e.g. a benchmark soaking the machine) the default 5s
+# is exceeded, CMake reports "Process terminated due to timeout", and make
+# DELETES the just-linked binary -- which presents as a baffling successful
+# build with no test executable.
+gtest_discover_tests(timestar_test DISCOVERY_TIMEOUT 120)
 
 # Optional: Create separate test executables for different categories
 # This allows running specific test categories independently
@@ -138,7 +143,7 @@ add_executable(timestar_unit_test ${UNIT_TEST_SRCS})
 target_link_libraries(timestar_unit_test libtimestar libtimestar_proto_conv timestar_proto gtest_main)
 target_include_directories(timestar_unit_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_definitions(timestar_unit_test PRIVATE ${SOURCE_INSPECTION_DEFS})
-gtest_discover_tests(timestar_unit_test)
+gtest_discover_tests(timestar_unit_test DISCOVERY_TIMEOUT 120)
 
 # Integration tests only
 if(INTEGRATION_TESTS)
