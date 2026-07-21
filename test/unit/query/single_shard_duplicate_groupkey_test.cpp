@@ -681,17 +681,12 @@ TEST_F(SingleShardDuplicateGroupKeyTest, CreatePartialAggregations_ProducesDupli
     // No group-by tags → all partials get the same groupKey
     auto partials = Aggregator::createPartialAggregations({sr1, sr2, sr3}, AggregationMethod::MIN, 0, {}).get();
 
-    // createPartialAggregations merges them into ONE partial (same groupKey)
-    // This is the fallback path behavior — it aggregates in the map phase.
-    // But the pushdown path creates separate partials per series.
-    // Either way, the merge must handle both patterns correctly.
-    ASSERT_GE(partials.size(), 1);
-
-    if (partials.size() > 1) {
-        // If separate partials were produced, they must share a groupKey
-        for (size_t i = 1; i < partials.size(); ++i) {
-            EXPECT_EQ(partials[0].groupKey, partials[i].groupKey);
-        }
+    // The map phase emits one raw partial PER SERIES (matching the pushdown
+    // path; it must never fold series into each other — the old incremental
+    // fold was O(K²·N)).  Same group → same groupKey; the reduce phase merges.
+    ASSERT_EQ(partials.size(), 3);
+    for (size_t i = 1; i < partials.size(); ++i) {
+        EXPECT_EQ(partials[0].groupKey, partials[i].groupKey);
     }
 }
 

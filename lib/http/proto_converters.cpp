@@ -7,6 +7,8 @@
 
 #include "proto_converters.hpp"
 
+#include "../core/yield_policy.hpp"
+
 #include "timestar.pb.h"
 
 // Compression encoders for Approach B compressed proto fields
@@ -311,11 +313,13 @@ seastar::future<std::string> formatQueryResponseYielding(QueryResponseData& resp
     // per-series ALP/FFOR encode is the expensive part of the response build;
     // without this a multi-million-point protobuf response encodes as a single
     // reactor task (observed as 30-50ms+ stalls in the Jul 2026 incident).
-    constexpr size_t YIELD_CHUNK_POINTS = 65536;
+    // appendSeriesToPb is atomic per series (ALP/FFOR are single-shot encodes),
+    // so one series' encode (~5-15ms at 3.5M points) is the residual floor;
+    // chunking below a series would require a wire-format change.
     size_t pointsSinceYield = 0;
     for (auto& sr : response.series) {
         pointsSinceYield += appendSeriesToPb(resp, sr);
-        if (pointsSinceYield >= YIELD_CHUNK_POINTS) {
+        if (pointsSinceYield >= ::timestar::kYieldChunkPoints) {
             pointsSinceYield = 0;
             co_await seastar::coroutine::maybe_yield();
         }

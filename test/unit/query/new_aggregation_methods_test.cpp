@@ -7,6 +7,7 @@
 #include "../../../lib/http/http_query_handler.hpp"
 #include "../../../lib/query/aggregator.hpp"
 #include "../../../lib/query/query_parser.hpp"
+#include "../../test_helpers/aggregator_test_helper.hpp"
 
 #include <gtest/gtest.h>
 
@@ -422,7 +423,7 @@ protected:
 
     // Run the full aggregation pipeline for a single series, no buckets.
     // Single-partial groups come back as raw (timestamps, values) vectors —
-    // normalize to AggregatedPoints exactly like the production HTTP handler.
+    // toPoints normalizes exactly like the production HTTP handler.
     static std::vector<AggregatedPoint> runPipeline(const std::vector<uint64_t>& timestamps,
                                                     const std::vector<double>& values, AggregationMethod method) {
         auto series = makeSeries("test", "value", timestamps, values);
@@ -430,15 +431,7 @@ protected:
         auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, method).get();
         if (grouped.empty())
             return {};
-        if (!grouped[0].rawTimestamps.empty()) {
-            std::vector<AggregatedPoint> points;
-            points.reserve(grouped[0].rawTimestamps.size());
-            for (size_t i = 0; i < grouped[0].rawTimestamps.size(); ++i) {
-                points.push_back({grouped[0].rawTimestamps[i], grouped[0].rawValues[i], 1});
-            }
-            return points;
-        }
-        return {grouped[0].points.begin(), grouped[0].points.end()};
+        return timestar::test::AggregatorTestHelper::toPoints(grouped[0]);
     }
 };
 

@@ -15,6 +15,7 @@
 #include "response_formatter.hpp"
 #include "series_key.hpp"
 #include "series_matcher.hpp"
+#include "yield_policy.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -594,9 +595,8 @@ seastar::future<> HttpQueryHandler::finalizeSingleShardPartials(std::vector<Part
                                                                 AggregationMethod method, QueryResponse& response) {
     response.series.reserve(partials.size());
 
-    // Yield to the reactor between partials once ~this many points have been
-    // finalized (reactor-stall prevention; chunked, never per-point).
-    constexpr size_t YIELD_CHUNK_POINTS = 65536;
+    // Yield cadence: see lib/core/yield_policy.hpp (reactor-stall prevention;
+    // chunked, never per-point).
     size_t pointsSinceYield = 0;
 
     for (auto& partial : partials) {
@@ -612,6 +612,10 @@ seastar::future<> HttpQueryHandler::finalizeSingleShardPartials(std::vector<Part
             tvPairs.reserve(n);
             for (auto& [ts, state] : partial.bucketStates) {
                 tvPairs.emplace_back(ts, state.getValue(method));
+                if (++pointsSinceYield >= kYieldChunkPoints) {
+                    pointsSinceYield = 0;
+                    co_await seastar::coroutine::maybe_yield();
+                }
             }
             std::sort(tvPairs.begin(), tvPairs.end());
             timestamps.reserve(n);
@@ -619,6 +623,10 @@ seastar::future<> HttpQueryHandler::finalizeSingleShardPartials(std::vector<Part
             for (auto& [ts, val] : tvPairs) {
                 timestamps.push_back(ts);
                 values.push_back(val);
+                if (++pointsSinceYield >= kYieldChunkPoints) {
+                    pointsSinceYield = 0;
+                    co_await seastar::coroutine::maybe_yield();
+                }
             }
         } else if (partial.collapsedState.has_value()) {
             // Non-bucketed streaming pushdown — single collapsed AggregationState
@@ -637,7 +645,18 @@ seastar::future<> HttpQueryHandler::finalizeSingleShardPartials(std::vector<Part
             // grouped and multi-shard paths, which fold properly.
             timestamps = std::move(partial.sortedTimestamps);
             if (method == AggregationMethod::COUNT) {
-                values.assign(timestamps.size(), 1.0);
+                // COUNT counts only non-NaN values (docs/nan_policy.md): a lone
+                // NaN point is an empty per-timestamp set → NaN, matching
+                // getValue() on a count-0 state.
+                values.reserve(timestamps.size());
+                for (size_t i = 0; i < timestamps.size(); ++i) {
+                    values.push_back(std::isnan(partial.sortedValues[i]) ? std::numeric_limits<double>::quiet_NaN()
+                                                                         : 1.0);
+                    if (++pointsSinceYield >= kYieldChunkPoints) {
+                        pointsSinceYield = 0;
+                        co_await seastar::coroutine::maybe_yield();
+                    }
+                }
             } else if (methodCanFoldRaw(method)) {
                 values = std::move(partial.sortedValues);
             } else {
@@ -647,6 +666,10 @@ seastar::future<> HttpQueryHandler::finalizeSingleShardPartials(std::vector<Part
                     s.collectRaw = (method == AggregationMethod::MEDIAN || method == AggregationMethod::EXACT_MEDIAN);
                     s.addValue(partial.sortedValues[i], timestamps[i]);
                     values.push_back(s.getValue(method));
+                    if (++pointsSinceYield >= kYieldChunkPoints) {
+                        pointsSinceYield = 0;
+                        co_await seastar::coroutine::maybe_yield();
+                    }
                 }
             }
         } else if (!partial.sortedStates.empty()) {
@@ -656,6 +679,10 @@ seastar::future<> HttpQueryHandler::finalizeSingleShardPartials(std::vector<Part
             for (size_t i = 0; i < partial.sortedStates.size(); ++i) {
                 timestamps.push_back(partial.sortedTimestamps[i]);
                 values.push_back(partial.sortedStates[i].getValue(method));
+                if (++pointsSinceYield >= kYieldChunkPoints) {
+                    pointsSinceYield = 0;
+                    co_await seastar::coroutine::maybe_yield();
+                }
             }
         } else {
             continue;
@@ -672,16 +699,14 @@ seastar::future<> HttpQueryHandler::finalizeSingleShardPartials(std::vector<Part
         SeriesResult series;
         series.measurement = std::move(partial.measurement);
         series.tags = std::move(tags);
-        pointsSinceYield += timestamps.size();
         series.fields[std::move(partial.fieldName)] =
             std::make_pair(std::move(timestamps), FieldValues(std::move(values)));
 
         response.series.push_back(std::move(series));
 
-        if (pointsSinceYield >= YIELD_CHUNK_POINTS) {
-            pointsSinceYield = 0;
-            co_await seastar::coroutine::maybe_yield();
-        }
+        // Partial boundary: cheap preemption check — covers the zero-copy move
+        // branch, whose per-point loops above never run.
+        co_await seastar::coroutine::maybe_yield();
     }
 }
 
@@ -1361,8 +1386,8 @@ static seastar::future<ShardQueryResult> executeShardQuery(Engine& engine, unsig
 
     // Run partial aggregation only on fallback numeric results
     auto partialAggStart = std::chrono::high_resolution_clock::now();
-    auto partialResults =
-        co_await Aggregator::createPartialAggregations(numericResults, aggregation, aggregationInterval, groupByTags);
+    auto partialResults = co_await Aggregator::createPartialAggregations(std::move(numericResults), aggregation,
+                                                                         aggregationInterval, groupByTags);
     // Combine pushdown partials with fallback partials
     partialResults.insert(partialResults.end(), std::make_move_iterator(pushdownPartials.begin()),
                           std::make_move_iterator(pushdownPartials.end()));
@@ -1728,7 +1753,7 @@ seastar::future<std::optional<QueryResponse>> HttpQueryHandler::finalizeSingleSh
                     for (const auto& point : groupedResult.points) {
                         timestamps.push_back(point.timestamp);
                         values.push_back(point.value);
-                        if (++sinceYield >= 65536) {
+                        if (++sinceYield >= kYieldChunkPoints) {
                             sinceYield = 0;
                             co_await seastar::coroutine::maybe_yield();
                         }
@@ -1900,7 +1925,7 @@ seastar::future<std::optional<QueryResponse>> HttpQueryHandler::finalizeMultiSha
                 for (const auto& point : groupedResult.points) {
                     timestamps.push_back(point.timestamp);
                     values.push_back(point.value);
-                    if (++sinceYield >= 65536) {
+                    if (++sinceYield >= kYieldChunkPoints) {
                         sinceYield = 0;
                         co_await seastar::coroutine::maybe_yield();
                     }

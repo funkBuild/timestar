@@ -519,8 +519,12 @@ public:
     // mergePartialAggregationsGrouped.  It must never fold series into each
     // other incrementally: the pre-fix per-series re-merge was O(K²·N) for K
     // series sharing a group.
+    // seriesResults is taken BY VALUE and consumed: the interval==0 path moves
+    // each series' timestamp/value vectors straight into its partial (for the
+    // incident shape that is ~56MB of memcpy avoided per shard).  Production
+    // std::moves its argument; tests may pass lvalues and eat the copy.
     static seastar::future<std::vector<PartialAggregationResult>> createPartialAggregations(
-        const std::vector<timestar::SeriesResult>& seriesResults, AggregationMethod method, uint64_t interval,
+        std::vector<timestar::SeriesResult> seriesResults, AggregationMethod method, uint64_t interval,
         const std::vector<std::string>& groupByTags);
 
     // Merge partial aggregations with metadata preserved (reduce phase).

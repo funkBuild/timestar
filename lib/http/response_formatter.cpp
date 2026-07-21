@@ -1,6 +1,7 @@
 #include "response_formatter.hpp"
 
 #include "http_error.hpp"
+#include "yield_policy.hpp"
 
 // Glaze's optimised number formatters:
 //   itoa: digit-pair lookup tables + 128-bit mul-shift division  (~2x std::to_chars)
@@ -156,8 +157,9 @@ inline void ensureArraySpace(std::string& buf, size_t pos, size_t count) {
 // slice writer emits elements [from, to), comma-joined, with a leading comma
 // when from > 0; the '[' / ']' brackets are written by the caller.
 
-// Yield to the reactor after roughly this many serialised elements.
-static constexpr size_t SLICE_ELEMENTS = 65536;
+// Yield to the reactor after roughly this many serialised elements
+// (lib/core/yield_policy.hpp — the shared chunk policy).
+static constexpr size_t SLICE_ELEMENTS = kYieldChunkPoints;
 
 // Write a uint64_t slice using glz::to_chars (digit-pair tables).
 inline size_t appendUint64Slice(std::string& buf, size_t pos, const std::vector<uint64_t>& arr, size_t from,

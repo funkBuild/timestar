@@ -2,6 +2,7 @@
 
 #include "group_key.hpp"
 #include "http_query_handler.hpp"  // For SeriesResult
+#include "yield_policy.hpp"
 
 #include <algorithm>
 #include <cassert>
@@ -19,11 +20,9 @@ namespace timestar {
 // DISTRIBUTED AGGREGATION
 // ============================================================================
 
-// Yield to the reactor after roughly this many processed points.  Chunked
-// (never per-point: a per-point co_await measured 15x slower on the insert
-// path) so seastar::coroutine::maybe_yield() is a cheap need_preempt() check
-// that only suspends at the scheduler's task quota.
-static constexpr size_t YIELD_CHUNK_POINTS = 65536;
+// Yield cadence: kYieldChunkPoints / kYieldChunkStates from
+// lib/core/yield_policy.hpp — the single definition shared by every
+// yield-chunked loop in the query and serialization paths.
 
 // ============================================================================
 // N-WAY MERGE (replaces O(K²N) pairwise merge with O(KN log K) heap merge)
@@ -42,7 +41,30 @@ static bool allTimestampsIdentical(const std::vector<PartialAggregationResult*>&
     return true;
 }
 
+// True when any partial's raw values contain a NaN.  Chunked scan; `v != v`
+// auto-vectorizes.  Used to keep foldAlignedRawValues branch-free: NaN inputs
+// (rare) are routed to the NaN-aware heap merge instead.
+static seastar::future<bool> anyRawNaN(const std::vector<PartialAggregationResult*>& partials) {
+    for (const auto* p : partials) {
+        const auto& vals = p->sortedValues;
+        for (size_t seg = 0; seg < vals.size(); seg += kYieldChunkPoints) {
+            const size_t end = std::min(seg + kYieldChunkPoints, vals.size());
+            bool found = false;
+            for (size_t i = seg; i < end; ++i) {
+                found |= std::isnan(vals[i]);
+            }
+            if (found) {
+                co_return true;
+            }
+            co_await seastar::coroutine::maybe_yield();
+        }
+    }
+    co_return false;
+}
+
 // SIMD element-wise fold for aligned-timestamp raw-value partials.
+// Callers must have excluded NaN inputs (see anyRawNaN) — the folds here are
+// deliberately branch-free and would poison sums / lose min-max on NaN.
 // Combines K value arrays into one using the aggregation method.
 // Outputs merged (timestamps, values, counts). O(N) time, zero merge overhead.
 static seastar::future<> foldAlignedRawValues(const std::vector<PartialAggregationResult*>& partials,
@@ -64,8 +86,8 @@ static seastar::future<> foldAlignedRawValues(const std::vector<PartialAggregati
         // loops stay branch-free so GCC -O3 auto-vectorizes them well (Highway
         // SIMD dispatch overhead negates benefit for simple add/min/max —
         // measured: no improvement over auto-vectorized scalar).
-        for (size_t seg = 0; seg < N; seg += YIELD_CHUNK_POINTS) {
-            const size_t end = std::min(seg + YIELD_CHUNK_POINTS, N);
+        for (size_t seg = 0; seg < N; seg += kYieldChunkPoints) {
+            const size_t end = std::min(seg + kYieldChunkPoints, N);
             switch (method) {
                 case AggregationMethod::AVG:
                 case AggregationMethod::SUM:
@@ -115,8 +137,8 @@ static seastar::future<> foldAlignedRawValues(const std::vector<PartialAggregati
 // semantics as the unrolled nWayMerge* variants below.
 template <class Item, class Init, class Fold>
 static seastar::future<> nWayHeapMerge(const std::vector<PartialAggregationResult*>& partials,
-                                       std::vector<uint64_t>& outTs, std::vector<Item>& outItems, Init init,
-                                       Fold fold) {
+                                       std::vector<uint64_t>& outTs, std::vector<Item>& outItems, Init init, Fold fold,
+                                       size_t yieldChunk = kYieldChunkPoints) {
     const size_t K = partials.size();
 
     size_t totalSize = 0;
@@ -156,7 +178,7 @@ static seastar::future<> nWayHeapMerge(const std::vector<PartialAggregationResul
             heap.push({partials[pIdx]->sortedTimestamps[nextPos], pIdx, nextPos});
         }
 
-        if (++sinceYield >= YIELD_CHUNK_POINTS) {
+        if (++sinceYield >= yieldChunk) {
             sinceYield = 0;
             co_await seastar::coroutine::maybe_yield();
         }
@@ -165,11 +187,21 @@ static seastar::future<> nWayHeapMerge(const std::vector<PartialAggregationResul
 
 // N-way heap merge for raw-value partials with mismatched timestamps.
 // On duplicate timestamps the value is folded per `method`; outCounts tracks
-// how many partials contributed at each output timestamp.
+// how many NON-NaN partials contributed at each output timestamp.
+//
+// NaN = missing data (docs/nan_policy.md): a NaN contribution never folds and
+// never counts — exactly like AggregationState::addValue, so the raw fold and
+// the state fold cannot disagree.  A timestamp whose contributions are all NaN
+// keeps value NaN with count 0, mirroring getValue() on an empty state.
 static seastar::future<> nWayMergeRawValues(std::vector<PartialAggregationResult*>& partials, AggregationMethod method,
                                             std::vector<uint64_t>& outTs, std::vector<double>& outVals,
                                             std::vector<size_t>& outCounts) {
-    outCounts.reserve(outTs.capacity());
+    {
+        size_t totalSize = 0;
+        for (const auto* p : partials)
+            totalSize += p->sortedTimestamps.size();
+        outCounts.reserve(totalSize);
+    }
     auto foldDuplicate = [method](double existing, double incoming) -> double {
         switch (method) {
             case AggregationMethod::AVG:
@@ -199,33 +231,62 @@ static seastar::future<> nWayMergeRawValues(std::vector<PartialAggregationResult
     return nWayHeapMerge<double>(
         partials, outTs, outVals,
         [&outCounts](const PartialAggregationResult& p, size_t pos) {
-            outCounts.push_back(1);
-            return p.sortedValues[pos];
+            const double v = p.sortedValues[pos];
+            // NaN as the first contribution: keep it as the slot value but
+            // count 0 — a later non-NaN contribution replaces it.
+            outCounts.push_back(std::isnan(v) ? 0 : 1);
+            return v;
         },
         [&outCounts, foldDuplicate](double& item, const PartialAggregationResult& p, size_t pos) {
-            item = foldDuplicate(item, p.sortedValues[pos]);
+            const double v = p.sortedValues[pos];
+            if (std::isnan(v)) [[unlikely]] {
+                return;  // missing — never folds, never counts
+            }
+            if (outCounts.back() == 0) [[unlikely]] {
+                item = v;  // slot held only NaN so far — replace, don't fold
+            } else {
+                item = foldDuplicate(item, v);
+            }
             outCounts.back()++;
         });
 }
 
-// N-way heap merge for AggregationState partials.
+// N-way heap merge producing AggregationStates from MIXED partials: raw
+// (sortedValues) and state (sortedStates) partials in the same group.  Raw
+// elements build and fold through addValue — which skips NaN, so the raw and
+// state routes cannot disagree — and no intermediate sortedStates vector is
+// materialized (the old convert-first pre-pass wrote ~420MB of transient
+// state for a 3.5M-point STDDEV merge).  Uses the smaller state yield chunk:
+// each element moves a 120-byte AggregationState.
 static seastar::future<> nWayMergeStates(std::vector<PartialAggregationResult*>& partials, std::vector<uint64_t>& outTs,
                                          std::vector<AggregationState>& outStates, AggregationMethod method) {
+    const bool needsRaw = (method == AggregationMethod::MEDIAN || method == AggregationMethod::EXACT_MEDIAN);
     return nWayHeapMerge<AggregationState>(
         partials, outTs, outStates,
-        [](const PartialAggregationResult& p, size_t pos) {
-            // The original implementation moved out of partials[pIdx]->sortedStates[pos];
-            // const_cast preserves that semantic (callers don't reuse the partials
-            // after merge).
-            return std::move(const_cast<PartialAggregationResult&>(p).sortedStates[pos]);
+        [needsRaw](const PartialAggregationResult& p, size_t pos) {
+            if (!p.sortedStates.empty()) {
+                // The original implementation moved out of partials[pIdx]->sortedStates[pos];
+                // const_cast preserves that semantic (callers don't reuse the partials
+                // after merge).
+                return std::move(const_cast<PartialAggregationResult&>(p).sortedStates[pos]);
+            }
+            AggregationState s;
+            s.collectRaw = needsRaw;
+            s.addValue(p.sortedValues[pos], p.sortedTimestamps[pos]);
+            return s;
         },
         [method](AggregationState& item, const PartialAggregationResult& p, size_t pos) {
-            item.mergeForMethod(std::move(const_cast<PartialAggregationResult&>(p).sortedStates[pos]), method);
-        });
+            if (!p.sortedStates.empty()) {
+                item.mergeForMethod(std::move(const_cast<PartialAggregationResult&>(p).sortedStates[pos]), method);
+            } else {
+                item.addValue(p.sortedValues[pos], p.sortedTimestamps[pos]);
+            }
+        },
+        kYieldChunkStates);
 }
 
 seastar::future<std::vector<PartialAggregationResult>> Aggregator::createPartialAggregations(
-    const std::vector<timestar::SeriesResult>& seriesResults, AggregationMethod method, uint64_t interval,
+    std::vector<timestar::SeriesResult> seriesResults, AggregationMethod method, uint64_t interval,
     const std::vector<std::string>& groupByTags) {
     size_t pointsSinceYield = 0;
 
@@ -239,18 +300,19 @@ seastar::future<std::vector<PartialAggregationResult>> Aggregator::createPartial
     // this pass O(N) copies, and hands the single K-way group merge to
     // mergePartialAggregationsGrouped — exactly how partials produced by the
     // pushdown path already flow.  Raw is correct for every method: the merge
-    // folds foldable methods from raw directly (methodCanFoldRaw) and builds
-    // AggregationStates itself for the ones that need them (SPREAD/STDDEV/
-    // STDVAR/MEDIAN), so the result cannot depend on which path produced the
-    // partial.
+    // folds foldable methods from raw directly (methodCanFoldRaw, NaN-aware —
+    // a NaN contribution never folds and never counts, docs/nan_policy.md) and
+    // builds AggregationStates itself for the ones that need them (SPREAD/
+    // STDDEV/STDVAR/MEDIAN, via addValue which skips NaN), so the result
+    // cannot depend on which path produced the partial.
     if (interval == 0) {
         std::vector<PartialAggregationResult> result;
         result.reserve(seriesResults.size());
 
-        for (const auto& series : seriesResults) {
-            for (const auto& [fieldName, fieldData] : series.fields) {
-                const auto& timestamps = fieldData.first;
-                const auto& values = fieldData.second;
+        for (auto& series : seriesResults) {
+            for (auto& [fieldName, fieldData] : series.fields) {
+                auto& timestamps = fieldData.first;
+                auto& values = fieldData.second;
                 if (timestamps.empty()) {
                     continue;
                 }
@@ -258,9 +320,11 @@ seastar::future<std::vector<PartialAggregationResult>> Aggregator::createPartial
                 // Extract numeric values as doubles for aggregation.
                 // Handles both native doubles and int64_t (cast to double;
                 // precision loss for values > 2^53 is a known trade-off).
+                // seriesResults is owned (by-value parameter), so the double
+                // and timestamp vectors are moved out rather than copied.
                 std::vector<double> doubleValues;
                 if (std::holds_alternative<std::vector<double>>(values)) {
-                    doubleValues = std::get<std::vector<double>>(values);
+                    doubleValues = std::move(std::get<std::vector<double>>(values));
                 } else if (std::holds_alternative<std::vector<int64_t>>(values)) {
                     const auto& intValues = std::get<std::vector<int64_t>>(values);
                     doubleValues.reserve(intValues.size());
@@ -281,14 +345,14 @@ seastar::future<std::vector<PartialAggregationResult>> Aggregator::createPartial
                 partial.groupKey = std::move(gkr.key);
                 partial.groupKeyHash = gkr.hash;
                 partial.cachedTags = std::move(gkr.tags);
-                partial.sortedTimestamps = timestamps;  // sorted per series (from queryTsm)
+                partial.sortedTimestamps = std::move(timestamps);  // sorted per series (from queryTsm)
                 partial.sortedValues = std::move(doubleValues);
                 partial.totalPoints = partial.sortedTimestamps.size();
 
                 pointsSinceYield += partial.totalPoints;
                 result.push_back(std::move(partial));
 
-                if (pointsSinceYield >= YIELD_CHUNK_POINTS) {
+                if (pointsSinceYield >= kYieldChunkPoints) {
                     pointsSinceYield = 0;
                     co_await seastar::coroutine::maybe_yield();
                 }
@@ -365,7 +429,7 @@ seastar::future<std::vector<PartialAggregationResult>> Aggregator::createPartial
                 state.addValue(doubleValues[i], timestamps[i]);
                 partial.totalPoints++;
 
-                if (++pointsSinceYield >= YIELD_CHUNK_POINTS) {
+                if (++pointsSinceYield >= kYieldChunkPoints) {
                     pointsSinceYield = 0;
                     // `partial` and the iteration state survive the suspension:
                     // everything lives in this coroutine's frame, and the map is
@@ -450,7 +514,7 @@ seastar::future<std::vector<GroupedAggregationResult>> Aggregator::mergePartialA
                     if (!inserted) {
                         it->second.mergeForMethod(std::move(state), method);
                     }
-                    if (++sinceYield >= YIELD_CHUNK_POINTS) {
+                    if (++sinceYield >= kYieldChunkPoints) {
                         sinceYield = 0;
                         co_await seastar::coroutine::maybe_yield();
                     }
@@ -466,7 +530,7 @@ seastar::future<std::vector<GroupedAggregationResult>> Aggregator::mergePartialA
                 point.count = state.count;
                 point.value = state.getValue(method);
                 groupedResult.points.push_back(point);
-                if (++sinceYield >= YIELD_CHUNK_POINTS) {
+                if (++sinceYield >= kYieldChunkPoints) {
                     sinceYield = 0;
                     co_await seastar::coroutine::maybe_yield();
                 }
@@ -532,9 +596,22 @@ seastar::future<std::vector<GroupedAggregationResult>> Aggregator::mergePartialA
                         // Single partial — zero-copy move, no merge needed.
                         if (method == AggregationMethod::COUNT) {
                             auto& ts = first->sortedTimestamps;
+                            auto& vals = first->sortedValues;
                             groupedResult.points.reserve(ts.size());
                             for (size_t i = 0; i < ts.size(); ++i) {
-                                groupedResult.points.push_back({ts[i], 1.0, 1});
+                                // COUNT counts only non-NaN values; a lone NaN
+                                // point is an empty per-timestamp set → NaN
+                                // (matches getValue() on a count-0 state).
+                                if (std::isnan(vals[i])) [[unlikely]] {
+                                    groupedResult.points.push_back(
+                                        {ts[i], std::numeric_limits<double>::quiet_NaN(), 0});
+                                } else {
+                                    groupedResult.points.push_back({ts[i], 1.0, 1});
+                                }
+                                if (++sinceYield >= kYieldChunkPoints) {
+                                    sinceYield = 0;
+                                    co_await seastar::coroutine::maybe_yield();
+                                }
                             }
                         } else {
                             groupedResult.rawTimestamps = std::move(first->sortedTimestamps);
@@ -548,7 +625,7 @@ seastar::future<std::vector<GroupedAggregationResult>> Aggregator::mergePartialA
                         std::vector<double> mergedVals;
                         std::vector<size_t> mergedCounts;
 
-                        if (allTimestampsIdentical(groupPartials)) {
+                        if (allTimestampsIdentical(groupPartials) && !co_await anyRawNaN(groupPartials)) {
                             co_await foldAlignedRawValues(groupPartials, method, mergedTs, mergedVals, mergedCounts);
                         } else {
                             co_await nWayMergeRawValues(groupPartials, method, mergedTs, mergedVals, mergedCounts);
@@ -557,44 +634,47 @@ seastar::future<std::vector<GroupedAggregationResult>> Aggregator::mergePartialA
                         groupedResult.points.reserve(mergedTs.size());
                         for (size_t i = 0; i < mergedTs.size(); ++i) {
                             double finalValue = mergedVals[i];
-                            if (method == AggregationMethod::AVG && mergedCounts[i] > 1) {
+                            if (mergedCounts[i] == 0) [[unlikely]] {
+                                // Every contribution at this timestamp was NaN:
+                                // the value slot already holds NaN and no method
+                                // computes over an empty set (getValue() on a
+                                // count-0 state is NaN) — COUNT included.
+                                finalValue = std::numeric_limits<double>::quiet_NaN();
+                            } else if (method == AggregationMethod::AVG && mergedCounts[i] > 1) {
                                 finalValue /= mergedCounts[i];
                             } else if (method == AggregationMethod::COUNT) {
                                 finalValue = static_cast<double>(mergedCounts[i]);
                             }
                             groupedResult.points.push_back({mergedTs[i], finalValue, mergedCounts[i]});
-                            if (++sinceYield >= YIELD_CHUNK_POINTS) {
+                            if (++sinceYield >= kYieldChunkPoints) {
                                 sinceYield = 0;
                                 co_await seastar::coroutine::maybe_yield();
                             }
                         }
                     }
                 } else {
-                    // Fallback: some partials have AggregationStates (from the
-                    // createPartialAggregations path). Convert any raw-value
-                    // partials to states, then merge normally.
-                    // Convert raw values to AggregationStates.
+                    // State-needing methods (SPREAD/STDDEV/STDVAR/MEDIAN), or a
+                    // mix of raw and state partials.  nWayMergeStates consumes
+                    // raw and state partials directly (raw elements fold via
+                    // addValue, which skips NaN) — no conversion pre-pass.
                     const bool needsRaw =
                         (method == AggregationMethod::MEDIAN || method == AggregationMethod::EXACT_MEDIAN);
-                    for (auto* p : groupPartials) {
-                        if (!p->sortedValues.empty() && p->sortedStates.empty()) {
-                            p->sortedStates.reserve(p->sortedTimestamps.size());
-                            for (size_t i = 0; i < p->sortedTimestamps.size(); ++i) {
-                                AggregationState s;
-                                s.collectRaw = needsRaw;
-                                s.addValue(p->sortedValues[i], p->sortedTimestamps[i]);
-                                p->sortedStates.push_back(s);
-                                if (++sinceYield >= YIELD_CHUNK_POINTS) {
-                                    sinceYield = 0;
-                                    co_await seastar::coroutine::maybe_yield();
-                                }
+                    if (groupPartials.size() == 1 && groupPartials[0]->sortedStates.empty()) {
+                        // Single RAW partial: finalize per point through a
+                        // singleton state — no merged state vector at all.
+                        auto* first = groupPartials[0];
+                        groupedResult.points.reserve(first->sortedTimestamps.size());
+                        for (size_t i = 0; i < first->sortedTimestamps.size(); ++i) {
+                            AggregationState s;
+                            s.collectRaw = needsRaw;
+                            s.addValue(first->sortedValues[i], first->sortedTimestamps[i]);
+                            groupedResult.points.push_back({first->sortedTimestamps[i], s.getValue(method), s.count});
+                            if (++sinceYield >= kYieldChunkPoints) {
+                                sinceYield = 0;
+                                co_await seastar::coroutine::maybe_yield();
                             }
-                            p->sortedValues.clear();
                         }
-                    }
-
-                    // N-way merge for AggregationState partials — O(KN log K)
-                    if (groupPartials.size() == 1) {
+                    } else if (groupPartials.size() == 1) {
                         auto* first = groupPartials[0];
                         std::vector<uint64_t> mergedTs = std::move(first->sortedTimestamps);
                         auto& mergedStates = first->sortedStates;
@@ -602,7 +682,7 @@ seastar::future<std::vector<GroupedAggregationResult>> Aggregator::mergePartialA
                         for (size_t i = 0; i < mergedTs.size(); ++i) {
                             groupedResult.points.push_back(
                                 {mergedTs[i], mergedStates[i].getValue(method), mergedStates[i].count});
-                            if (++sinceYield >= YIELD_CHUNK_POINTS) {
+                            if (++sinceYield >= kYieldChunkPoints) {
                                 sinceYield = 0;
                                 co_await seastar::coroutine::maybe_yield();
                             }
@@ -616,7 +696,7 @@ seastar::future<std::vector<GroupedAggregationResult>> Aggregator::mergePartialA
                         for (size_t i = 0; i < mergedTs.size(); ++i) {
                             groupedResult.points.push_back(
                                 {mergedTs[i], mergedStates[i].getValue(method), mergedStates[i].count});
-                            if (++sinceYield >= YIELD_CHUNK_POINTS) {
+                            if (++sinceYield >= kYieldChunkPoints) {
                                 sinceYield = 0;
                                 co_await seastar::coroutine::maybe_yield();
                             }

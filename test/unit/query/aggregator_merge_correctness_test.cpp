@@ -497,3 +497,127 @@ TEST_F(AggregatorMergeCorrectnessTest, ExactMedianMerge_ThreePartials_OddCount) 
     ASSERT_EQ(grouped[0].points.size(), 1);
     EXPECT_DOUBLE_EQ(grouped[0].points[0].value, 3.0);
 }
+
+// ============================================================================
+// NaN = missing data in the raw merge paths (docs/nan_policy.md)
+// ============================================================================
+//
+// The raw (sortedValues) partial format carries NaN verbatim — raw passthrough
+// reads must return it — so the MERGE is where NaN must be skipped: a NaN
+// contribution never folds and never counts, exactly like
+// AggregationState::addValue on the state path.  Pre-fix, one NaN poisoned the
+// whole timestamp (NaN + 5.0 = NaN) and inflated AVG's divisor.
+
+TEST_F(AggregatorMergeCorrectnessTest, NanNeverFolds_HeapMerge) {
+    // Mismatched timestamp sets force the N-way heap merge.
+    auto p1 = makeRawPartial("g", {100, 200, 350}, {std::nan(""), 3.0, 7.0});
+    auto p2 = makeRawPartial("g", {100, 200, 300}, {5.0, std::nan(""), 9.0});
+
+    std::vector<PartialAggregationResult> allPartials = {std::move(p1), std::move(p2)};
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::AVG).get();
+
+    ASSERT_EQ(grouped.size(), 1u);
+    auto& pts = grouped[0].points;
+    ASSERT_EQ(pts.size(), 4u);
+    EXPECT_EQ(pts[0].timestamp, 100u);
+    EXPECT_DOUBLE_EQ(pts[0].value, 5.0);  // NaN skipped, not folded
+    EXPECT_EQ(pts[0].count, 1u);          // and not counted (AVG divisor)
+    EXPECT_EQ(pts[1].timestamp, 200u);
+    EXPECT_DOUBLE_EQ(pts[1].value, 3.0);
+    EXPECT_EQ(pts[1].count, 1u);
+    EXPECT_DOUBLE_EQ(pts[2].value, 9.0);  // 300: single non-NaN contributor
+    EXPECT_DOUBLE_EQ(pts[3].value, 7.0);  // 350
+}
+
+TEST_F(AggregatorMergeCorrectnessTest, NanNeverFolds_IdenticalTimestamps) {
+    // Identical timestamp vectors would take the branch-free aligned fold —
+    // the NaN prescan must route this group to the NaN-aware heap merge.
+    auto p1 = makeRawPartial("g", {100, 200, 300}, {std::nan(""), 2.0, 4.0});
+    auto p2 = makeRawPartial("g", {100, 200, 300}, {6.0, std::nan(""), 8.0});
+
+    std::vector<PartialAggregationResult> allPartials = {std::move(p1), std::move(p2)};
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::AVG).get();
+
+    ASSERT_EQ(grouped.size(), 1u);
+    auto& pts = grouped[0].points;
+    ASSERT_EQ(pts.size(), 3u);
+    EXPECT_DOUBLE_EQ(pts[0].value, 6.0);
+    EXPECT_EQ(pts[0].count, 1u);
+    EXPECT_DOUBLE_EQ(pts[1].value, 2.0);
+    EXPECT_EQ(pts[1].count, 1u);
+    EXPECT_DOUBLE_EQ(pts[2].value, 6.0);  // avg(4, 8)
+    EXPECT_EQ(pts[2].count, 2u);
+}
+
+TEST_F(AggregatorMergeCorrectnessTest, NanFirstContributionDoesNotPoisonMin) {
+    // std::min(NaN, x) returns NaN when NaN is the accumulator — the merge
+    // must replace a NaN-only slot with the first real value instead.
+    auto p1 = makeRawPartial("g", {100}, {std::nan("")});
+    auto p2 = makeRawPartial("g", {100}, {42.0});
+    auto p3 = makeRawPartial("g", {100}, {17.0});
+
+    std::vector<PartialAggregationResult> allPartials = {std::move(p1), std::move(p2), std::move(p3)};
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::MIN).get();
+
+    ASSERT_EQ(grouped.size(), 1u);
+    ASSERT_EQ(grouped[0].points.size(), 1u);
+    EXPECT_DOUBLE_EQ(grouped[0].points[0].value, 17.0);
+    EXPECT_EQ(grouped[0].points[0].count, 2u);
+}
+
+TEST_F(AggregatorMergeCorrectnessTest, AllNanTimestampIsNanWithZeroCount) {
+    // Every contribution NaN → empty per-timestamp set: value NaN, count 0
+    // (mirrors getValue() on a count-0 AggregationState).
+    auto p1 = makeRawPartial("g", {100, 200}, {std::nan(""), 1.0});
+    auto p2 = makeRawPartial("g", {100, 200}, {std::nan(""), 2.0});
+
+    std::vector<PartialAggregationResult> allPartials = {std::move(p1), std::move(p2)};
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::SUM).get();
+
+    ASSERT_EQ(grouped.size(), 1u);
+    auto& pts = grouped[0].points;
+    ASSERT_EQ(pts.size(), 2u);
+    EXPECT_TRUE(std::isnan(pts[0].value));
+    EXPECT_EQ(pts[0].count, 0u);
+    EXPECT_DOUBLE_EQ(pts[1].value, 3.0);
+    EXPECT_EQ(pts[1].count, 2u);
+}
+
+TEST_F(AggregatorMergeCorrectnessTest, CountSkipsNan) {
+    // Multi-partial: COUNT counts only non-NaN contributors.
+    auto p1 = makeRawPartial("g", {100, 200}, {std::nan(""), 1.0});
+    auto p2 = makeRawPartial("g", {100, 200}, {5.0, 2.0});
+    std::vector<PartialAggregationResult> allPartials = {std::move(p1), std::move(p2)};
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::COUNT).get();
+    ASSERT_EQ(grouped.size(), 1u);
+    ASSERT_EQ(grouped[0].points.size(), 2u);
+    EXPECT_DOUBLE_EQ(grouped[0].points[0].value, 1.0);
+    EXPECT_DOUBLE_EQ(grouped[0].points[1].value, 2.0);
+
+    // Single partial: a lone NaN point is an empty set → NaN, not 1.
+    auto p3 = makeRawPartial("g", {100, 200}, {std::nan(""), 7.0});
+    std::vector<PartialAggregationResult> single = {std::move(p3)};
+    auto groupedSingle = Aggregator::mergePartialAggregationsGrouped(single, AggregationMethod::COUNT).get();
+    ASSERT_EQ(groupedSingle.size(), 1u);
+    ASSERT_EQ(groupedSingle[0].points.size(), 2u);
+    EXPECT_TRUE(std::isnan(groupedSingle[0].points[0].value));
+    EXPECT_EQ(groupedSingle[0].points[0].count, 0u);
+    EXPECT_DOUBLE_EQ(groupedSingle[0].points[1].value, 1.0);
+}
+
+TEST_F(AggregatorMergeCorrectnessTest, NanSkippedByStateNeedingMethods_RawPartials) {
+    // Non-foldable methods route raw partials through addValue (NaN-skipping)
+    // inside the raw-aware state merge — pin that a NaN contributor changes
+    // neither the value nor the count.
+    auto p1 = makeRawPartial("g", {100}, {std::nan("")});
+    auto p2 = makeRawPartial("g", {100}, {3.0});
+    auto p3 = makeRawPartial("g", {100}, {7.0});
+
+    std::vector<PartialAggregationResult> allPartials = {std::move(p1), std::move(p2), std::move(p3)};
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(allPartials, AggregationMethod::SPREAD).get();
+
+    ASSERT_EQ(grouped.size(), 1u);
+    ASSERT_EQ(grouped[0].points.size(), 1u);
+    EXPECT_DOUBLE_EQ(grouped[0].points[0].value, 4.0);  // spread(3, 7), NaN ignored
+    EXPECT_EQ(grouped[0].points[0].count, 2u);
+}

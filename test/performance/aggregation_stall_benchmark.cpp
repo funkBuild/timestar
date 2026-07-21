@@ -151,7 +151,9 @@ SEASTAR_TEST_F(AggregationStallBench, S1_CreatePartials_KScaling) {
 
             std::vector<PartialAggregationResult> partials;
             auto r = co_await measure([&]() -> seastar::future<> {
-                partials = co_await Aggregator::createPartialAggregations(series, method, /*interval=*/0,
+                // std::move matches production (executeShardQuery consumes its
+                // fallback results); the map phase moves vectors, not copies.
+                partials = co_await Aggregator::createPartialAggregations(std::move(series), method, /*interval=*/0,
                                                                           /*groupByTags=*/{});
             });
 
@@ -184,8 +186,8 @@ SEASTAR_TEST_F(AggregationStallBench, S2_IncidentPipeline_TwoShards) {
 
         std::vector<PartialAggregationResult> allPartials;
         auto shardPhase = co_await measure([&]() -> seastar::future<> {
-            auto pa = co_await Aggregator::createPartialAggregations(shardA, method, 0, {});
-            auto pb = co_await Aggregator::createPartialAggregations(shardB, method, 0, {});
+            auto pa = co_await Aggregator::createPartialAggregations(std::move(shardA), method, 0, {});
+            auto pb = co_await Aggregator::createPartialAggregations(std::move(shardB), method, 0, {});
             allPartials.reserve(pa.size() + pb.size());
             std::move(pa.begin(), pa.end(), std::back_inserter(allPartials));
             std::move(pb.begin(), pb.end(), std::back_inserter(allPartials));
