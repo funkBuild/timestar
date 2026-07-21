@@ -64,7 +64,6 @@ private:
 
     seastar::future<> openTsmFile(std::string path);
     std::string basePath();
-    seastar::future<> checkAndTriggerCompaction();
 
     // Compact one tier if it is eligible and not in failure backoff.
     // Returns true if a merge actually ran.

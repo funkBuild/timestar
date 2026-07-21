@@ -341,13 +341,6 @@ seastar::future<bool> TSMFileManager::compactOneTier(uint64_t tier) {
     co_return true;
 }
 
-seastar::future<> TSMFileManager::checkAndTriggerCompaction() {
-    for (uint64_t tier = 0; tier < MAX_TIERS - 1; tier++) {
-        (void)co_await compactOneTier(tier);
-    }
-    co_return;
-}
-
 void TSMFileManager::recordReclaimRate(uint64_t tier, uint64_t bytesRead, uint64_t bytesWritten, int64_t durationMs) {
     if (tier >= MAX_TIERS || durationMs <= 0 || bytesRead == 0) {
         return;

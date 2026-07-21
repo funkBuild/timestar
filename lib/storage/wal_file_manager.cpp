@@ -385,6 +385,13 @@ seastar::future<> WALFileManager::rolloverMemoryStore() {
     }
 
     auto store = seastar::make_shared<MemoryStore>(++currentWalSequenceNumber);
+    // Seed the series map's capacity from the retiring store: under steady
+    // ingest the same fleet reports into every store, so the fresh map will
+    // reach the same size again within seconds. Growing there from empty
+    // rehashed the full ~330B-slot flat table ~7 times per store cycle --
+    // every few seconds at high cardinality. The eventual footprint is
+    // identical either way; this only moves the allocation to creation time.
+    store->series.reserve(previousStore->series.size());
     co_await store->initWAL();
     memoryStores.insert(memoryStores.begin(), store);
 
