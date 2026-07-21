@@ -197,6 +197,8 @@ ParsedQueryRequest parseQueryRequest(const void* data, size_t size) {
     result.startTime = req.start_time();
     result.endTime = req.end_time();
     result.aggregationInterval = req.aggregation_interval();
+    result.bucketAlignment = req.bucket_alignment();
+    result.booleansAsNumeric = req.booleans_as_numeric();
     return result;
 }
 

@@ -287,7 +287,7 @@ static seastar::future<> nWayMergeStates(std::vector<PartialAggregationResult*>&
 
 seastar::future<std::vector<PartialAggregationResult>> Aggregator::createPartialAggregations(
     std::vector<timestar::SeriesResult> seriesResults, AggregationMethod method, uint64_t interval,
-    const std::vector<std::string>& groupByTags) {
+    const std::vector<std::string>& groupByTags, uint64_t bucketAnchor) {
     size_t pointsSinceYield = 0;
 
     // ── interval == 0: one RAW partial per (series, field) ──────────────────
@@ -423,7 +423,11 @@ seastar::future<std::vector<PartialAggregationResult>> Aggregator::createPartial
             // MEDIAN and EXACT_MEDIAN both use addValue with collectRaw=true.
             const bool needsRaw = (method == AggregationMethod::EXACT_MEDIAN || method == AggregationMethod::MEDIAN);
             for (size_t i = 0; i < timestamps.size(); ++i) {
-                uint64_t bucketTime = (timestamps[i] / interval) * interval;
+                // anchor == 0 is the epoch grid; a non-zero anchor shifts to
+                // start-aligned buckets.  Range filtering guarantees
+                // ts >= anchor; clamp defensively regardless.
+                const uint64_t rel = timestamps[i] >= bucketAnchor ? timestamps[i] - bucketAnchor : 0;
+                uint64_t bucketTime = bucketAnchor + (rel / interval) * interval;
                 auto& state = partial.bucketStates[bucketTime];
                 state.collectRaw = needsRaw;
                 state.addValue(doubleValues[i], timestamps[i]);

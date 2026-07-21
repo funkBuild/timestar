@@ -5,6 +5,7 @@
 // StreamingBatch, etc.) are NOT used because they collide with proto names.
 
 #include "proto_converters.hpp"
+
 #include "timestar.pb.h"
 
 // For decoding compressed (Approach B) response fields in format tests
@@ -282,6 +283,26 @@ TEST(ProtoConverterQuery, ParseQueryRequestMinimal) {
     EXPECT_EQ(parsed.startTime, 0u);
     EXPECT_EQ(parsed.endTime, 0u);
     EXPECT_TRUE(parsed.aggregationInterval.empty());
+    // Compat fields default off: epoch buckets, booleans non-numeric.
+    EXPECT_TRUE(parsed.bucketAlignment.empty());
+    EXPECT_FALSE(parsed.booleansAsNumeric);
+}
+
+TEST(ProtoConverterQuery, ParseQueryRequestCompatFields) {
+    ::timestar_pb::QueryRequest req;
+    req.set_query("avg:cpu(usage)");
+    req.set_start_time(3000000000ULL);
+    req.set_end_time(40000000000ULL);
+    req.set_aggregation_interval("10s");
+    req.set_bucket_alignment("start");
+    req.set_booleans_as_numeric(true);
+
+    std::string bytes;
+    req.SerializeToString(&bytes);
+
+    auto parsed = parseQueryRequest(bytes.data(), bytes.size());
+    EXPECT_EQ(parsed.bucketAlignment, "start");
+    EXPECT_TRUE(parsed.booleansAsNumeric);
 }
 
 TEST(ProtoConverterQuery, FormatQueryResponseDoubleValues) {
@@ -667,8 +688,7 @@ TEST(ProtoConverterMetadata, FormatCardinalityResponse) {
 
     std::map<std::string, double> parsedCard;
     for (int i = 0; i < resp.tag_cardinalities_size(); ++i) {
-        parsedCard[resp.tag_cardinalities(i).tag_key()] =
-            resp.tag_cardinalities(i).estimated_count();
+        parsedCard[resp.tag_cardinalities(i).tag_key()] = resp.tag_cardinalities(i).estimated_count();
     }
     EXPECT_DOUBLE_EQ(parsedCard["host"], 100.0);
     EXPECT_DOUBLE_EQ(parsedCard["region"], 5.0);

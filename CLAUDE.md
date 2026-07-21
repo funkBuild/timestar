@@ -403,9 +403,28 @@ The TimeStar provides a query endpoint with a simplified string-based query form
   "query": "aggregationMethod:measurement(fields){scopes} by {aggregationTagKeys}",
   "startTime": 1704067200000000000,  // Nanoseconds since epoch (Jan 1, 2024)
   "endTime": 1706745599000000000,    // Nanoseconds since epoch (Jan 31, 2024)
-  "aggregationInterval": 300000000000 // Optional: Time bucket interval in nanoseconds (5 minutes)
+  "aggregationInterval": 300000000000, // Optional: Time bucket interval in nanoseconds (5 minutes)
+  "bucketAlignment": "epoch",        // Optional: "epoch" (default) or "start" — see below
+  "booleansAsNumeric": false         // Optional: aggregate booleans as 1.0/0.0 — see below
 }
 ```
+
+**Migration-compat options** (both default OFF; also available on the protobuf
+`QueryRequest` as `bucket_alignment` / `booleans_as_numeric`; designed for
+rollup.js-style readers):
+- `"bucketAlignment": "start"` anchors the bucket grid at `startTime` instead
+  of the epoch: `bucket = startTime + floor((ts - startTime)/interval)*interval`.
+  Labels are still bucket starts and empty buckets are still omitted.  Any
+  value other than `"epoch"`/`"start"` is an `INVALID_QUERY` error.  Anchored
+  queries bypass the pushdown/batch/streaming fast paths (whose bucket math is
+  epoch-only) and take the fallback aggregation path on every placement, so
+  the answer cannot depend on the query plan.
+- `"booleansAsNumeric": true` converts boolean fields to `1.0`/`0.0` shard-side
+  BEFORE aggregation, so they participate arithmetically in every method
+  (`avg` of `[t,t,f,t,f]` = `0.6`) and are returned as numbers — including on
+  raw no-interval reads.  Strings remain non-numeric regardless.  A boolean
+  series that fails to read under this flag drops to `QUERY_INCOMPLETE` rather
+  than silently substituting the LATEST-per-bucket recovery answer.
 
 ### Query String Format
 
@@ -498,7 +517,10 @@ dropped:
 Booleans were previously coerced to `1.0`/`0.0` and aggregated arithmetically,
 which also dropped their series tags (only numeric fields route through the
 aggregator, which keeps group-by tags only). They now follow the string rule
-exactly — see `test/unit/http/dynamo_equivalence_test.cpp`.
+exactly — see `test/unit/http/dynamo_equivalence_test.cpp`.  The per-request
+opt-in `"booleansAsNumeric": true` (migration compat, see the request format)
+restores arithmetic aggregation for booleans on that query only, by converting
+them to doubles before the split — the canonical default is unchanged.
 
 `timestar::isNonNumericValueType()` (lib/storage/tsm.hpp) is the single
 definition of this rule at the `TSMValueType` level: every gate that keeps
@@ -687,9 +709,12 @@ are orthogonal — a `by {tags}` clause must never change the time axis. Only an
 definition) reduces the time axis.
 
 **With `aggregationInterval` (> 0):**
-- Buckets are **epoch-aligned**: each point lands in bucket
+- Buckets are **epoch-aligned** by default: each point lands in bucket
   `floor(timestamp / interval) * interval`. Bucket boundaries do NOT shift
-  with the query's startTime.
+  with the query's startTime.  The opt-in `"bucketAlignment": "start"`
+  (migration compat, see the request format above) anchors the grid at
+  startTime instead; every other rule in this section applies unchanged in
+  that mode.
 - `endTime` is inclusive; a range that ends exactly on a bucket boundary
   includes that boundary's bucket.
 - Empty buckets are omitted (no gap filling).

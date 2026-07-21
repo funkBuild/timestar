@@ -188,12 +188,10 @@ namespace detail {
 // parameter is read after each co_await. A caller passing a temporary (or any
 // object that does not outlive the whole chunk loop) would leave the coroutine
 // reading freed memory. Same rule as HttpQueryHandler::executeQuery.
-seastar::future<std::optional<SeriesResult>> queryNonNumericBucketedChunked(Engine& engine, std::string seriesKey,
-                                                                            SeriesId128 seriesId, std::string field,
-                                                                            std::map<std::string, std::string> tags,
-                                                                            std::string measurement, uint64_t startTime,
-                                                                            uint64_t endTime, uint64_t interval,
-                                                                            uint64_t initialChunkWidth = 0);
+seastar::future<std::optional<SeriesResult>> queryNonNumericBucketedChunked(
+    Engine& engine, std::string seriesKey, SeriesId128 seriesId, std::string field,
+    std::map<std::string, std::string> tags, std::string measurement, uint64_t startTime, uint64_t endTime,
+    uint64_t interval, uint64_t initialChunkWidth = 0, uint64_t bucketAnchor = 0);
 
 }  // namespace detail
 

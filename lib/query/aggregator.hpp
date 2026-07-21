@@ -523,9 +523,12 @@ public:
     // each series' timestamp/value vectors straight into its partial (for the
     // incident shape that is ~56MB of memcpy avoided per shard).  Production
     // std::moves its argument; tests may pass lvalues and eat the copy.
+    // bucketAnchor: 0 = epoch-aligned buckets (canonical default); non-zero
+    // anchors the bucket grid at that timestamp (start-aligned mode, see
+    // QueryRequest::bucketAnchor).  Ignored when interval == 0.
     static seastar::future<std::vector<PartialAggregationResult>> createPartialAggregations(
         std::vector<timestar::SeriesResult> seriesResults, AggregationMethod method, uint64_t interval,
-        const std::vector<std::string>& groupByTags);
+        const std::vector<std::string>& groupByTags, uint64_t bucketAnchor = 0);
 
     // Merge partial aggregations with metadata preserved (reduce phase).
     // Coroutine: yields between groups and inside the per-point merge loops

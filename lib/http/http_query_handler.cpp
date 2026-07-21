@@ -39,13 +39,18 @@ struct GlazeQueryRequest {
     std::variant<uint64_t, std::string> startTime;
     std::variant<uint64_t, std::string> endTime;
     std::optional<std::variant<uint64_t, std::string>> aggregationInterval;
+    // "epoch" (default) or "start" — see QueryRequest::bucketAnchor.
+    std::optional<std::string> bucketAlignment;
+    // Treat booleans as numeric 1.0/0.0 — see QueryRequest::booleansAsNumeric.
+    std::optional<bool> booleansAsNumeric;
 };
 
 template <>
 struct glz::meta<GlazeQueryRequest> {
     using T = GlazeQueryRequest;
     static constexpr auto value = object("query", &T::query, "startTime", &T::startTime, "endTime", &T::endTime,
-                                         "aggregationInterval", &T::aggregationInterval);
+                                         "aggregationInterval", &T::aggregationInterval, "bucketAlignment",
+                                         &T::bucketAlignment, "booleansAsNumeric", &T::booleansAsNumeric);
 };
 
 namespace timestar::http {
@@ -94,11 +99,13 @@ static bool canStreamAggregation(AggregationMethod method, const std::vector<std
 // ---------------------------------------------------------------------------
 
 // Reduce one raw non-numeric field (sorted ascending by timestamp) to
-// LATEST-per-bucket in place.  Bucket boundaries are epoch-aligned
-// (ts / interval * interval), identical to the numeric fold in
-// BlockAggregator / foldPoint below.
+// LATEST-per-bucket in place.  Bucket boundaries are epoch-aligned by default
+// (anchor == 0: ts / interval * interval, identical to the numeric fold in
+// BlockAggregator / foldPoint below); a non-zero anchor shifts the grid to
+// start-aligned buckets (QueryRequest::bucketAnchor).
 template <typename V>
-static void bucketNonNumericFieldLatest(std::vector<uint64_t>& timestamps, std::vector<V>& values, uint64_t interval) {
+static void bucketNonNumericFieldLatest(std::vector<uint64_t>& timestamps, std::vector<V>& values, uint64_t interval,
+                                        uint64_t anchor) {
     if (interval == 0 || timestamps.empty()) {
         return;
     }
@@ -122,7 +129,11 @@ static void bucketNonNumericFieldLatest(std::vector<uint64_t>& timestamps, std::
     std::vector<uint64_t> outTs;
     std::vector<V> outVals;
     for (size_t i = 0; i < n; ++i) {
-        const uint64_t bucket = (timestamps[i] / interval) * interval;
+        // anchor == 0 is the epoch grid; a non-zero anchor shifts the grid to
+        // start-aligned buckets (QueryRequest::bucketAnchor).  Range filtering
+        // guarantees ts >= anchor; clamp defensively regardless.
+        const uint64_t rel = timestamps[i] >= anchor ? timestamps[i] - anchor : 0;
+        const uint64_t bucket = anchor + (rel / interval) * interval;
         if (!outTs.empty() && outTs.back() == bucket) {
             // Same bucket: ascending input order means later value = latest.
             outVals.back() = std::move(values[i]);
@@ -136,12 +147,12 @@ static void bucketNonNumericFieldLatest(std::vector<uint64_t>& timestamps, std::
 }
 
 // Apply LATEST-per-bucket to every non-numeric field of a SeriesResult.
-static void bucketNonNumericResultLatest(timestar::SeriesResult& sr, uint64_t interval) {
+static void bucketNonNumericResultLatest(timestar::SeriesResult& sr, uint64_t interval, uint64_t anchor) {
     for (auto& [fieldName, fieldData] : sr.fields) {
         if (auto* strs = std::get_if<std::vector<std::string>>(&fieldData.second)) {
-            bucketNonNumericFieldLatest(fieldData.first, *strs, interval);
+            bucketNonNumericFieldLatest(fieldData.first, *strs, interval, anchor);
         } else if (auto* bools = std::get_if<std::vector<bool>>(&fieldData.second)) {
-            bucketNonNumericFieldLatest(fieldData.first, *bools, interval);
+            bucketNonNumericFieldLatest(fieldData.first, *bools, interval, anchor);
         }
     }
 }
@@ -175,7 +186,7 @@ namespace detail {
 seastar::future<std::optional<timestar::SeriesResult>> queryNonNumericBucketedChunked(
     Engine& engine, std::string seriesKey, SeriesId128 seriesId, std::string field,
     std::map<std::string, std::string> tags, std::string measurement, uint64_t startTime, uint64_t endTime,
-    uint64_t interval, uint64_t initialChunkWidth) {
+    uint64_t interval, uint64_t initialChunkWidth, uint64_t bucketAnchor) {
     if (interval == 0 || startTime > endTime) {
         co_return std::nullopt;
     }
@@ -251,13 +262,13 @@ seastar::future<std::optional<timestar::SeriesResult>> queryNonNumericBucketedCh
                 using T = std::decay_t<decltype(result)>;
                 if constexpr (std::is_same_v<T, QueryResult<std::string>>) {
                     sawString = true;
-                    bucketNonNumericFieldLatest(result.timestamps, result.values, interval);
+                    bucketNonNumericFieldLatest(result.timestamps, result.values, interval, bucketAnchor);
                     for (size_t i = 0; i < result.timestamps.size(); ++i) {
                         appendBucket(result.timestamps[i], std::move(result.values[i]));
                     }
                 } else if constexpr (std::is_same_v<T, QueryResult<bool>>) {
                     sawBool = true;
-                    bucketNonNumericFieldLatest(result.timestamps, result.values, interval);
+                    bucketNonNumericFieldLatest(result.timestamps, result.values, interval, bucketAnchor);
                     for (size_t i = 0; i < result.timestamps.size(); ++i) {
                         appendBucket(result.timestamps[i], result.values[i]);
                     }
@@ -811,6 +822,12 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpQueryHandler::handleQ
             if (!parsed.aggregationInterval.empty()) {
                 glazeRequest.aggregationInterval = parsed.aggregationInterval;
             }
+            if (!parsed.bucketAlignment.empty()) {
+                glazeRequest.bucketAlignment = parsed.bucketAlignment;
+            }
+            if (parsed.booleansAsNumeric) {
+                glazeRequest.booleansAsNumeric = true;
+            }
 
             try {
                 queryRequest = parseQueryRequest(glazeRequest);
@@ -1014,6 +1031,22 @@ QueryRequest HttpQueryHandler::parseQueryRequest(const GlazeQueryRequest& glazeR
     request.endTime = endTime;
     request.aggregationInterval = aggregationInterval;
 
+    // Bucket alignment: "epoch" (default) keeps the canonical epoch grid;
+    // "start" anchors the grid at startTime (rollup.js-compatible reads).
+    // Anchoring is meaningful only with an interval — without one there are
+    // no buckets, so the anchor stays 0 and the request is a plain raw read.
+    if (glazeReq.bucketAlignment.has_value() && !glazeReq.bucketAlignment->empty()) {
+        const std::string& alignment = *glazeReq.bucketAlignment;
+        if (alignment == "start") {
+            if (aggregationInterval > 0) {
+                request.bucketAnchor = startTime;
+            }
+        } else if (alignment != "epoch") {
+            throw QueryParseException("Invalid bucketAlignment '" + alignment + "': expected \"epoch\" or \"start\"");
+        }
+    }
+    request.booleansAsNumeric = glazeReq.booleansAsNumeric.value_or(false);
+
     return request;
 }
 
@@ -1071,12 +1104,10 @@ struct ShardFanOutResult {
 // owning shard (dispatched via invoke_on from fanOutShardQueries()).  Parameters
 // are taken by value: they are moved into the coroutine frame at invocation, so
 // they outlive every suspension point regardless of the caller's closure lifetime.
-static seastar::future<ShardQueryResult> executeShardQuery(Engine& engine, unsigned shardId,
-                                                           std::vector<SeriesQueryContext> contexts,
-                                                           std::string measurement, uint64_t startTime,
-                                                           uint64_t endTime, AggregationMethod aggregation,
-                                                           uint64_t aggregationInterval,
-                                                           std::vector<std::string> groupByTags) {
+static seastar::future<ShardQueryResult> executeShardQuery(
+    Engine& engine, unsigned shardId, std::vector<SeriesQueryContext> contexts, std::string measurement,
+    uint64_t startTime, uint64_t endTime, AggregationMethod aggregation, uint64_t aggregationInterval,
+    uint64_t bucketAnchor, bool booleansAsNumeric, std::vector<std::string> groupByTags) {
     auto shardStart = std::chrono::high_resolution_clock::now();
     LOG_QUERY_PATH(timestar::http_log, info, "[QUERY] Shard {} querying {} series keys in parallel", shardId,
                    contexts.size());
@@ -1114,8 +1145,11 @@ static seastar::future<ShardQueryResult> executeShardQuery(Engine& engine, unsig
     // interval == 0 is NOT eligible: LATEST/FIRST no longer collapse a range,
     // so there is no single point to seek to — every timestamp survives and
     // those queries take the normal per-series path.
-    const bool singleBucket =
-        aggregationInterval > 0 && (startTime / aggregationInterval) == (endTime / aggregationInterval);
+    // bucketAnchor != 0 is excluded: this fast path's single-bucket test and
+    // bucket stamping use the epoch grid.  Anchored queries take the standard
+    // fallback path below, which is anchor-aware.
+    const bool singleBucket = aggregationInterval > 0 && bucketAnchor == 0 &&
+                              (startTime / aggregationInterval) == (endTime / aggregationInterval);
     if (isLatestOrFirst && singleBucket) {
         const bool wantFirst = (aggregation == AggregationMethod::FIRST);
 
@@ -1167,7 +1201,8 @@ static seastar::future<ShardQueryResult> executeShardQuery(Engine& engine, unsig
 
     if (contexts.empty()) {
         // All series resolved by batch or streaming path — skip standard path.
-    } else if (canStreamAggregation(aggregation, groupByTags, aggregationInterval)) {
+    } else if (bucketAnchor == 0 && !booleansAsNumeric &&
+               canStreamAggregation(aggregation, groupByTags, aggregationInterval)) {
         // ---- STREAMING AGGREGATION PATH ----
         // Fold per-series results into accumulators without
         // materializing all raw data.  O(groups x buckets)
@@ -1208,8 +1243,8 @@ static seastar::future<ShardQueryResult> executeShardQuery(Engine& engine, unsig
             co_await seastar::max_concurrent_for_each(
                 contexts, MAX_CONCURRENT_SERIES_QUERIES,
                 [&engine, &pushdownPartials, &fallbackResults, &nonNumericResults, &measurement, startTime, endTime,
-                 shardId, aggregationInterval, aggregation, &groupByTags, &droppedSeries,
-                 &firstDropReason](SeriesQueryContext& ctx) -> seastar::future<> {
+                 shardId, aggregationInterval, bucketAnchor, booleansAsNumeric, aggregation, &groupByTags,
+                 &droppedSeries, &firstDropReason](SeriesQueryContext& ctx) -> seastar::future<> {
                     // ---- PUSHDOWN PATH ----
                     // Try aggregating directly from TSM blocks, skipping the
                     // full TSMResult → QueryResult → SeriesResult pipeline.
@@ -1222,9 +1257,17 @@ static seastar::future<ShardQueryResult> executeShardQuery(Engine& engine, unsig
                     // to make the response shape depend on data placement
                     // (memstore raw vs TSM collapsed).  LATEST/FIRST are
                     // handled by the batch fast path above and always collapse.
-                    auto pushdownResult =
-                        co_await engine.queryAggregated(ctx.seriesKey, ctx.seriesId, startTime, endTime,
-                                                        aggregationInterval, aggregation, /*foldNoInterval=*/false);
+                    // Anchored interval buckets bypass pushdown entirely: every
+                    // pushdown bucket computation (BlockAggregator, TSM block
+                    // stats, memory folds) uses the epoch grid.  Skipping the
+                    // attempt — not just its result — keeps anchored queries on
+                    // ONE path for every data placement.
+                    std::optional<timestar::PushdownResult> pushdownResult;
+                    if (bucketAnchor == 0 || aggregationInterval == 0) {
+                        pushdownResult =
+                            co_await engine.queryAggregated(ctx.seriesKey, ctx.seriesId, startTime, endTime,
+                                                            aggregationInterval, aggregation, /*foldNoInterval=*/false);
+                    }
 
                     if (pushdownResult.has_value()) {
                         // Build PartialAggregationResult directly from PushdownResult
@@ -1278,12 +1321,30 @@ static seastar::future<ShardQueryResult> executeShardQuery(Engine& engine, unsig
                             try {
                                 auto recovered = co_await detail::queryNonNumericBucketedChunked(
                                     engine, ctx.seriesKey, ctx.seriesId, ctx.field, ctx.tags, measurement, startTime,
-                                    endTime, aggregationInterval);
+                                    endTime, aggregationInterval, /*initialChunkWidth=*/0, bucketAnchor);
                                 if (recovered.has_value()) {
-                                    if (!recovered->fields.empty()) {
-                                        nonNumericResults.push_back(std::move(*recovered));
+                                    // Under booleansAsNumeric a boolean series must
+                                    // aggregate numerically with the requested
+                                    // method; this recovery reduces to
+                                    // LATEST-per-bucket, which would silently
+                                    // substitute the wrong answer.  Let such a
+                                    // series drop to QUERY_INCOMPLETE instead
+                                    // (strings still recover — they stay
+                                    // non-numeric under the flag).
+                                    bool boolUnderNumericFlag = false;
+                                    if (booleansAsNumeric) {
+                                        for (auto& [fn, fd] : recovered->fields) {
+                                            if (std::holds_alternative<std::vector<bool>>(fd.second)) {
+                                                boolUnderNumericFlag = true;
+                                            }
+                                        }
                                     }
-                                    recoveredOk = true;
+                                    if (!boolUnderNumericFlag) {
+                                        if (!recovered->fields.empty()) {
+                                            nonNumericResults.push_back(std::move(*recovered));
+                                        }
+                                        recoveredOk = true;
+                                    }
                                 }
                             } catch (const std::exception&) {
                                 // Still not satisfiable -- fall through and report it.
@@ -1358,6 +1419,23 @@ static seastar::future<ShardQueryResult> executeShardQuery(Engine& engine, unsig
     // does not depend on where the data happens to sit (memory vs TSM).
     std::vector<timestar::SeriesResult> numericResults;
     for (auto& sr : fallbackResults) {
+        // Migration compat (QueryRequest::booleansAsNumeric): booleans become
+        // numeric 1.0/0.0 here — before the numeric/non-numeric split — so
+        // they aggregate arithmetically on every method and bucket grid,
+        // exactly like a rollup.js reader expects.  Strings are unaffected.
+        if (booleansAsNumeric) {
+            for (auto& [fn, fd] : sr.fields) {
+                if (auto* boolVals = std::get_if<std::vector<bool>>(&fd.second)) {
+                    std::vector<double> numeric;
+                    numeric.reserve(boolVals->size());
+                    for (bool b : *boolVals) {
+                        numeric.push_back(b ? 1.0 : 0.0);
+                    }
+                    fd.second = FieldValues(std::move(numeric));
+                }
+            }
+            co_await seastar::coroutine::maybe_yield();
+        }
         bool hasNonNumericField = false;
         for (auto& [fn, fd] : sr.fields) {
             // Mirrors timestar::isNonNumericValueType at the variant level —
@@ -1380,14 +1458,14 @@ static seastar::future<ShardQueryResult> executeShardQuery(Engine& engine, unsig
     // fallback path so the result shape does not depend on the query plan.
     if (aggregationInterval > 0) {
         for (auto& sr : nonNumericResults) {
-            bucketNonNumericResultLatest(sr, aggregationInterval);
+            bucketNonNumericResultLatest(sr, aggregationInterval, bucketAnchor);
         }
     }
 
     // Run partial aggregation only on fallback numeric results
     auto partialAggStart = std::chrono::high_resolution_clock::now();
-    auto partialResults = co_await Aggregator::createPartialAggregations(std::move(numericResults), aggregation,
-                                                                         aggregationInterval, groupByTags);
+    auto partialResults = co_await Aggregator::createPartialAggregations(
+        std::move(numericResults), aggregation, aggregationInterval, groupByTags, bucketAnchor);
     // Combine pushdown partials with fallback partials
     partialResults.insert(partialResults.end(), std::make_move_iterator(pushdownPartials.begin()),
                           std::make_move_iterator(pushdownPartials.end()));
@@ -1580,20 +1658,22 @@ seastar::future<ShardFanOutResult> HttpQueryHandler::fanOutShardQueries(
         if (seriesByShard[shardId].empty())
             continue;
         auto& shardContexts = seriesByShard[shardId];
-        auto f = engineSharded
-                     ->invoke_on(shardId,
-                                 [shardId, contexts = std::move(shardContexts), startTime = request.startTime,
-                                  endTime = request.endTime, measurement = request.measurement,
-                                  aggregation = request.aggregation, aggregationInterval = request.aggregationInterval,
-                                  groupByTags = request.groupByTags](Engine& engine) mutable {
-                                     // executeShardQuery takes its parameters by value: they are moved
-                                     // into the coroutine frame at invocation, so the closure (and its
-                                     // captures) need not outlive the returned future.
-                                     return executeShardQuery(engine, shardId, std::move(contexts),
-                                                              std::move(measurement), startTime, endTime, aggregation,
-                                                              aggregationInterval, std::move(groupByTags));
-                                 })
-                     .then([shardId](ShardQueryResult result) { return std::make_pair(shardId, std::move(result)); });
+        auto f =
+            engineSharded
+                ->invoke_on(shardId,
+                            [shardId, contexts = std::move(shardContexts), startTime = request.startTime,
+                             endTime = request.endTime, measurement = request.measurement,
+                             aggregation = request.aggregation, aggregationInterval = request.aggregationInterval,
+                             bucketAnchor = request.bucketAnchor, booleansAsNumeric = request.booleansAsNumeric,
+                             groupByTags = request.groupByTags](Engine& engine) mutable {
+                                // executeShardQuery takes its parameters by value: they are moved
+                                // into the coroutine frame at invocation, so the closure (and its
+                                // captures) need not outlive the returned future.
+                                return executeShardQuery(engine, shardId, std::move(contexts), std::move(measurement),
+                                                         startTime, endTime, aggregation, aggregationInterval,
+                                                         bucketAnchor, booleansAsNumeric, std::move(groupByTags));
+                            })
+                .then([shardId](ShardQueryResult result) { return std::make_pair(shardId, std::move(result)); });
         futures.push_back(std::move(f));
     }
 

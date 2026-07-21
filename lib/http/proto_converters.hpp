@@ -248,6 +248,8 @@ struct ParsedQueryRequest {
     uint64_t startTime = 0;
     uint64_t endTime = 0;
     std::string aggregationInterval;
+    std::string bucketAlignment;     // "", "epoch", or "start" (see proto)
+    bool booleansAsNumeric = false;  // booleans aggregate as 1.0/0.0 (see proto)
 };
 
 // Parse a QueryRequest proto from raw bytes.

@@ -34,6 +34,29 @@ struct QueryRequest {
     uint64_t endTime = 0;              // Nanoseconds since epoch
     uint64_t aggregationInterval = 0;  // Nanoseconds, 0 means no time-based aggregation
 
+    // Anchor of the bucket grid for interval queries.  0 = epoch-aligned
+    // buckets (the canonical default: bucket = floor(ts/interval)*interval,
+    // boundaries never shift with the query range).  Non-zero = the grid is
+    // anchored at this timestamp instead (bucket = anchor +
+    // floor((ts-anchor)/interval)*interval) — requested via
+    // `"bucketAlignment": "start"`, which anchors at startTime.  This exists
+    // for migration compatibility with rollup.js-style readers, whose buckets
+    // are start-aligned; labels remain bucket starts and empty buckets are
+    // still omitted in both modes.  Anchored queries bypass the pushdown /
+    // batch / streaming fast paths (whose bucket math is epoch-only) and take
+    // the fallback aggregation path on every placement, so the answer cannot
+    // depend on the query plan.
+    uint64_t bucketAnchor = 0;
+
+    // Migration compatibility: treat boolean fields as numeric 1.0/0.0 so they
+    // participate in numeric aggregation (rollup.js readers expect
+    // avg([t,t,f,t,f]) == 0.6).  Default false — the canonical rule is that
+    // booleans are non-numeric and never aggregate arithmetically (see
+    // CLAUDE.md "Non-Numeric Fields in Queries"); this opt-in converts them
+    // shard-side BEFORE aggregation, so every method, bucket grid, and
+    // placement sees plain doubles.  Strings remain non-numeric regardless.
+    bool booleansAsNumeric = false;
+
     // Helper to check if query requests all fields
     bool requestsAllFields() const { return fields.empty(); }
 
