@@ -49,7 +49,20 @@ double perCallMicros(F&& f, int iters) {
 
 }  // namespace
 
+// The ceilings pin the OPTIMIZED code's cost.  Unoptimized/instrumented
+// builds (-O0, gcov coverage) run the encoders orders of magnitude slower —
+// the coverage CI job measured ~1000x — which both blows the ceiling and
+// burns half an hour on the measurement loops.  A cost pin on uninstrumented
+// machine code is the only meaningful reading, so skip everywhere else.
+#ifndef __OPTIMIZE__
+    #define SINGLE_POINT_COST_SKIP() \
+        GTEST_SKIP() << "cost ceilings are only meaningful in optimized builds (this is -O0/coverage)"
+#else
+    #define SINGLE_POINT_COST_SKIP() (void)0
+#endif
+
 TEST(SinglePointEncodeCost, IntegerEncoderSingleTimestamp) {
+    SINGLE_POINT_COST_SKIP();
     std::vector<uint64_t> ts{1'000'000'000'000'000'000ULL};
     AlignedBuffer buf;
     double us = perCallMicros(
@@ -63,6 +76,7 @@ TEST(SinglePointEncodeCost, IntegerEncoderSingleTimestamp) {
 }
 
 TEST(SinglePointEncodeCost, FloatEncoderSingleValue) {
+    SINGLE_POINT_COST_SKIP();
     std::vector<double> val{42.375};
     AlignedBuffer buf;
     double us = perCallMicros(
