@@ -68,7 +68,10 @@ std::vector<SeriesId128> TSMCompactor::getAllSeriesIds(const std::vector<seastar
 template <typename T>
 seastar::future<SeriesCompactionData<T>> TSMCompactor::processSeriesForCompaction(
     const SeriesId128& seriesId, const std::vector<seastar::shared_ptr<TSM>>& sources,
-    const SeriesRetentionMap& seriesRetention, PointChunkSink<T> sink) {
+    const SeriesRetentionMap& seriesRetention, PointChunkSink<T> sink, size_t blockAlign) {
+    if (blockAlign == 0) {
+        blockAlign = MaxPointsPerBlock();
+    }
     SeriesCompactionData<T> result(seriesId, TSM::getValueType<T>());
 
     // Index-only pass: figure out WHAT this series looks like before loading
@@ -271,7 +274,15 @@ seastar::future<SeriesCompactionData<T>> TSMCompactor::processSeriesForCompactio
         // repetitive text can exceed the numeric ~12x by a wide margin.
         const uint64_t coalesceCap =
             std::is_same_v<T, std::string> ? MAX_COALESCE_COMPRESSED_BYTES_STRING : MAX_COALESCE_COMPRESSED_BYTES;
-        if (avgBlockBytes < UNDERFULL_BLOCK_BYTES && totalCompressedBytes <= coalesceCap) {
+        // Scale "under-full" with the OUTPUT tier's block target. The absolute
+        // 512B threshold judges fullness against the flush-tier block size, so
+        // a deep merge whose target block is 8x larger stopped coalescing at
+        // ~1/8th full and small blocks survived every tier -- measured 62 B/pt
+        // on disk at 128k series, ~30x worse than the format achieves with
+        // full blocks. Compressed bytes remain the metric (blockCount is
+        // NaN-skewed for floats; see above).
+        const uint64_t underfullBytes = UNDERFULL_BLOCK_BYTES * std::max<size_t>(1, blockAlign / MaxPointsPerBlock());
+        if (avgBlockBytes < underfullBytes && totalCompressedBytes <= coalesceCap) {
             // Reserve the estimated decoded cost from the shard-wide budget, so
             // concurrent series cannot each spend the per-series ceiling. If the
             // budget is exhausted, skip coalescing -- it is an optimisation, and
@@ -426,7 +437,11 @@ seastar::future<SeriesCompactionData<T>> TSMCompactor::processSeriesForCompactio
     //  - The buffers are MOVED into the chunk (the small unaligned tail is
     //    re-seeded into fresh vectors), instead of copying the prefix and
     //    erasing it — which transiently held ~2x the chunk per series.
-    const size_t blockPoints = MaxPointsPerBlock();
+    // Align spills to the OUTPUT tier's block size (blockAlign), which the
+    // writer also uses in appendSeriesChunk -- a mismatch would leave a short
+    // tail block on every spill, exactly the systematic fragmentation this
+    // alignment exists to prevent.
+    const size_t blockPoints = blockAlign;
     auto spill = [&]() -> seastar::future<> {
         if (!chunkedEmit || result.timestamps.size() < 2) {
             co_return;
@@ -983,6 +998,10 @@ seastar::future<CompactionResult> TSMCompactor::compact(
         if (targetTier >= 1) {
             writer.setCompressionLevel(3);
         }
+        // Deeper tiers write bigger blocks (see blockCapForTier): merges are
+        // the only chance to consolidate the tiny per-series blocks that
+        // high-cardinality flushes produce.
+        writer.setMaxPointsPerBlock(blockCapForTier(targetTier));
         // Do NOT pre-reserve the output buffer to the summed input size. The
         // writer streams to disk (writeSeriesCompactionData drains it at block
         // boundaries), so it only ever holds a bounded window; reserving the
@@ -1175,7 +1194,8 @@ seastar::future<CompactionResult> TSMCompactor::compact(
                     };
 
                     auto future =
-                        processSeriesForCompaction<ValueType>(seriesId, files, seriesRetention, std::move(chunkSink))
+                        processSeriesForCompaction<ValueType>(seriesId, files, seriesRetention, std::move(chunkSink),
+                                                              blockCapForTier(targetTier))
                             .then([this, &writer, &writeSemaphore, &stats](SeriesCompactionData<ValueType> data) {
                                 // Serialize writes with semaphore. The write path is
                                 // now a coroutine (it drains the output buffer to
@@ -1485,15 +1505,15 @@ std::vector<CompactionStats> TSMCompactor::getActiveCompactionStats() const {
 // Phase 3: Parallel processing template instantiations
 template seastar::future<SeriesCompactionData<double>> TSMCompactor::processSeriesForCompaction<double>(
     const SeriesId128& seriesId, const std::vector<seastar::shared_ptr<TSM>>& sources,
-    const SeriesRetentionMap& seriesRetention, PointChunkSink<double> sink);
+    const SeriesRetentionMap& seriesRetention, PointChunkSink<double> sink, size_t blockAlign);
 
 template seastar::future<SeriesCompactionData<bool>> TSMCompactor::processSeriesForCompaction<bool>(
     const SeriesId128& seriesId, const std::vector<seastar::shared_ptr<TSM>>& sources,
-    const SeriesRetentionMap& seriesRetention, PointChunkSink<bool> sink);
+    const SeriesRetentionMap& seriesRetention, PointChunkSink<bool> sink, size_t blockAlign);
 
 template seastar::future<SeriesCompactionData<std::string>> TSMCompactor::processSeriesForCompaction<std::string>(
     const SeriesId128& seriesId, const std::vector<seastar::shared_ptr<TSM>>& sources,
-    const SeriesRetentionMap& seriesRetention, PointChunkSink<std::string> sink);
+    const SeriesRetentionMap& seriesRetention, PointChunkSink<std::string> sink, size_t blockAlign);
 
 template seastar::future<> TSMCompactor::writeSeriesCompactionData<double>(TSMWriter& writer,
                                                                            SeriesCompactionData<double> data,
@@ -1509,7 +1529,7 @@ template seastar::future<> TSMCompactor::writeSeriesCompactionData<std::string>(
 
 template seastar::future<SeriesCompactionData<int64_t>> TSMCompactor::processSeriesForCompaction<int64_t>(
     const SeriesId128& seriesId, const std::vector<seastar::shared_ptr<TSM>>& sources,
-    const SeriesRetentionMap& seriesRetention, PointChunkSink<int64_t> sink);
+    const SeriesRetentionMap& seriesRetention, PointChunkSink<int64_t> sink, size_t blockAlign);
 
 template seastar::future<> TSMCompactor::writeSeriesCompactionData<int64_t>(TSMWriter& writer,
                                                                             SeriesCompactionData<int64_t> data,

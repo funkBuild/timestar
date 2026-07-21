@@ -189,10 +189,10 @@ void TSMWriter::writeSeries(TSMValueType seriesType, const SeriesId128& seriesId
     TSMIndexEntry indexEntry = beginSeriesEntry<T>(seriesType, seriesId, values);
 
     LOG_INSERT_PATH(timestar::tsm_log, debug, "Creating blocks for series '{}' ({} total points, up to {} per block)",
-                    seriesId.toHex(), timestamps.size(), MaxPointsPerBlock());
+                    seriesId.toHex(), timestamps.size(), maxPointsPerBlock_);
 
-    for (size_t offset = 0; offset < timestamps.size(); offset += MaxPointsPerBlock()) {
-        const size_t end = std::min(timestamps.size(), (size_t)(offset + MaxPointsPerBlock()));
+    for (size_t offset = 0; offset < timestamps.size(); offset += maxPointsPerBlock_) {
+        const size_t end = std::min(timestamps.size(), (size_t)(offset + maxPointsPerBlock_));
         writeSeriesBlockAt<T>(seriesType, seriesId, timestamps, values, offset, end - offset, indexEntry);
     }
 
@@ -219,10 +219,10 @@ seastar::future<> TSMWriter::writeSeriesStreaming(TSMValueType seriesType, const
     TSMIndexEntry indexEntry = beginSeriesEntry<T>(seriesType, seriesId, values);
 
     LOG_INSERT_PATH(timestar::tsm_log, debug, "Streaming blocks for series '{}' ({} total points, up to {} per block)",
-                    seriesId.toHex(), timestamps.size(), MaxPointsPerBlock());
+                    seriesId.toHex(), timestamps.size(), maxPointsPerBlock_);
 
-    for (size_t offset = 0; offset < timestamps.size(); offset += MaxPointsPerBlock()) {
-        const size_t end = std::min(timestamps.size(), (size_t)(offset + MaxPointsPerBlock()));
+    for (size_t offset = 0; offset < timestamps.size(); offset += maxPointsPerBlock_) {
+        const size_t end = std::min(timestamps.size(), (size_t)(offset + maxPointsPerBlock_));
         writeSeriesBlockAt<T>(seriesType, seriesId, timestamps, values, offset, end - offset, indexEntry);
         // Block boundary: the length back-patch for this block is complete.
         co_await flushIfNeeded();
@@ -1003,8 +1003,8 @@ seastar::future<> TSMWriter::appendSeriesChunk(TSMValueType seriesType, const Se
         // Deliberately no stringDictionary: see the declaration comment.
     }
 
-    for (size_t offset = 0; offset < timestamps.size(); offset += MaxPointsPerBlock()) {
-        const size_t end = std::min(timestamps.size(), (size_t)(offset + MaxPointsPerBlock()));
+    for (size_t offset = 0; offset < timestamps.size(); offset += maxPointsPerBlock_) {
+        const size_t end = std::min(timestamps.size(), (size_t)(offset + maxPointsPerBlock_));
         writeSeriesBlockAt<T>(seriesType, seriesId, timestamps, values, offset, end - offset, indexEntry);
         co_await flushIfNeeded();
     }

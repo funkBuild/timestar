@@ -30,6 +30,15 @@ struct CompactionConfig {
     // flowing), but an unbounded tier 0 degrades every query on the shard, so
     // this caps how far read amplification can drift during a long burst.
     uint32_t tier0_starvation_ceiling = 32;
+    // Ceiling for the per-tier output block size: compaction writes tier-T
+    // outputs with blocks of up to min(max_points_per_block << T, this).
+    // High-cardinality workloads flush files whose per-series blocks hold only
+    // a few dozen points (128k series at a 64MB store = ~50 points/series);
+    // merges are the only chance to consolidate them, and deeper tiers hold
+    // data that is rewritten rarely but scanned a lot -- bigger blocks there
+    // buy compression ratio and fewer index entries. The ceiling bounds the
+    // decode cost of touching one block on the query path.
+    uint32_t deep_block_points_cap = 24000;
 };
 
 struct StorageConfig {
@@ -193,7 +202,8 @@ struct glz::meta<timestar::CompactionConfig> {
     static constexpr auto value =
         object("max_concurrent", &T::max_concurrent, "max_memory", &T::max_memory, "batch_size", &T::batch_size,
                "tier0_min_files", &T::tier0_min_files, "tier1_min_files", &T::tier1_min_files, "tier2_min_files",
-               &T::tier2_min_files, "tier0_starvation_ceiling", &T::tier0_starvation_ceiling);
+               &T::tier2_min_files, "tier0_starvation_ceiling", &T::tier0_starvation_ceiling, "deep_block_points_cap",
+               &T::deep_block_points_cap);
 };
 
 template <>

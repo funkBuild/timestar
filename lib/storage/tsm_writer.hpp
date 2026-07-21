@@ -29,6 +29,14 @@ private:
     std::string filename;
     int compressionLevel_ = 1;  // zstd level: 1=fast (fresh writes), 3=better ratio (compacted)
 
+    // Per-instance block size cap, defaulting to the config value. Compaction
+    // raises it for deep-tier outputs (see TSMCompactor::blockCapForTier):
+    // high-cardinality workloads flush files whose per-series blocks hold a
+    // few dozen points, and merges are the only chance to consolidate them --
+    // bigger blocks at deeper tiers mean better compression ratios and fewer
+    // index entries over data that is rewritten rarely and scanned much.
+    size_t maxPointsPerBlock_ = MaxPointsPerBlock();
+
     // --- Streaming output state ---
     // Bytes already flushed to disk. Every recorded block offset is absolute
     // (flushedBytes_ + buffer.size()), so the buffer can be drained at any block
@@ -74,6 +82,16 @@ public:
     // Set zstd compression level for string blocks (higher = better ratio, slower).
     // Call before writing any series. Default is 1 (fast).
     void setCompressionLevel(int level) { compressionLevel_ = level; }
+
+    // Override the per-block point cap for this writer's output (compaction
+    // passes a tier-scaled cap). Ignores zero to keep a misconfigured caller
+    // from producing an unwritable file.
+    void setMaxPointsPerBlock(size_t cap) {
+        if (cap > 0) {
+            maxPointsPerBlock_ = cap;
+        }
+    }
+    size_t maxPointsPerBlock() const { return maxPointsPerBlock_; }
 
     template <class T>
     void writeSeries(TSMValueType seriesType, const SeriesId128& seriesId, const std::vector<uint64_t>& timestamps,

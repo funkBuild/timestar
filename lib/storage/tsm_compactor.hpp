@@ -159,9 +159,25 @@ private:
     }
 
     template <typename T>
+    // blockAlign: target output block size in points, used for chunk-spill
+    // alignment and for scaling the under-full coalescing threshold. Pass
+    // blockCapForTier(targetTier); 0 falls back to the config block size.
     seastar::future<SeriesCompactionData<T>> processSeriesForCompaction(
         const SeriesId128& seriesId, const std::vector<seastar::shared_ptr<TSM>>& sources,
-        const SeriesRetentionMap& seriesRetention, PointChunkSink<T> sink = nullptr);
+        const SeriesRetentionMap& seriesRetention, PointChunkSink<T> sink = nullptr, size_t blockAlign = 0);
+
+    // Output block-size cap for a merge writing into `tier`: doubles per tier
+    // from the config base, bounded by deep_block_points_cap. Measured on the
+    // 128k-series fleet shape, flush blocks hold a few dozen points; without
+    // per-tier growth the under-full coalescer stops at the flush-size cap and
+    // deep tiers never reach the compression ratio the format is capable of.
+    static size_t blockCapForTier(uint64_t tier) {
+        const auto& cfg = timestar::config().storage;
+        const size_t base = cfg.max_points_per_block;
+        const size_t cap = std::max<size_t>(cfg.compaction.deep_block_points_cap, base);
+        const size_t shifted = tier < 8 ? (base << tier) : cap;
+        return std::min(shifted, cap);
+    }
 
     // Phase 3: Write pre-processed series data to TSMWriter
     template <typename T>
@@ -221,7 +237,11 @@ public:
     // is the NON-NaN count (an all-NaN block reports 0), so a sparse series of
     // FULL blocks would look empty and get decoded. Compressed block BYTES are
     // NaN-independent and are what we use instead.
-    static constexpr size_t MIN_BLOCKS_TO_CONSIDER_COALESCING = 8;
+    // 4, not 8: merges pull in filesPerCompaction() == 4 inputs, and on
+    // high-cardinality workloads each input holds ONE tiny block per series.
+    // At 8, a first-level merge of four 30-point blocks could never coalesce
+    // -- the fragmentation survived into every deeper tier untouched.
+    static constexpr size_t MIN_BLOCKS_TO_CONSIDER_COALESCING = 4;
     // Blocks averaging under this many compressed bytes are considered under-full.
     // A full 3000-point Float block measures ~4 KB in practice.
     static constexpr uint64_t UNDERFULL_BLOCK_BYTES = 512;
