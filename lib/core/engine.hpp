@@ -97,6 +97,11 @@ private:
     seastar::scheduling_group _queryGroup;
     seastar::scheduling_group _writeGroup;
     seastar::scheduling_group _compactionGroup;
+    // WAL->TSM conversion. Deliberately separate from _compactionGroup and at
+    // higher shares: draining a memory store to TSM is what releases WAL disk
+    // and drains the ingest backlog, so it must outrank tier merges rather
+    // than queue behind them.
+    seastar::scheduling_group _flushGroup;
     bool _schedulingGroupsCreated = false;
 
     // --- TTL background sweep infrastructure (shard 0 only) ---
@@ -104,6 +109,20 @@ private:
     seastar::timer<seastar::lowres_clock> _retentionTimer;
 
     seastar::future<> createDirectoryStructure();
+
+    // Shed load when the unconverted-store backlog reaches its ceiling.
+    // Throws IngestBacklogException (-> 503 + Retry-After). Called at the top
+    // of the insert paths, before anything durable happens, so a rejected write
+    // leaves no WAL record and no memstore entry.
+    void rejectIfIngestBacklogged() {
+        if (!walFileManager.isIngestBacklogged()) {
+            return;
+        }
+        ++_metrics.inserts_rejected_backlog_total;
+        throw timestar::IngestBacklogException("Shard " + std::to_string(shardId) + " ingest backlog: " +
+                                               std::to_string(walFileManager.retainedMemoryStoreCount()) +
+                                               " memory stores awaiting TSM conversion");
+    }
 
     // Internal delete implementation without gate acquisition.
     // Callers must already hold _insertGate.
@@ -116,6 +135,10 @@ public:
     Engine();
     seastar::future<> init();
     seastar::future<> stop();
+
+    // Start the background tier-compaction loop. Called after
+    // setIOSchedulingGroups() so merges land in ts_compact rather than main.
+    seastar::future<> startBackgroundCompaction();
     seastar::future<> startBackgroundTasks();
     template <class T>
     seastar::future<> insert(TimeStarInsert<T> insertRequest, bool skipMetadataIndexing = false);
@@ -228,6 +251,13 @@ public:
     // Gauge accessors for metrics
     size_t getTSMFileCount() const { return tsmFileManager.getSequencedTsmFiles().size(); }
     uint64_t getCompletedCompactions() const { return tsmFileManager.getCompletedCompactions(); }
+    size_t getRetainedMemoryStoreCount() const { return walFileManager.retainedMemoryStoreCount(); }
+
+    // Read-only view of compaction placement. Exposed so tests can assert that
+    // background work actually landed in its scheduling group -- the original
+    // bug was invisible precisely because nothing could observe this.
+    const TSMFileManager& getTSMFileManager() const { return tsmFileManager; }
+    const timestar::EngineMetrics& getMetrics() const { return _metrics; }
 
     // Compaction health. A tier that can never merge is otherwise invisible from
     // outside the process: the original production incident ran for 15 minutes
@@ -246,12 +276,24 @@ public:
     // Set I/O scheduling groups (called from main after create_scheduling_group).
     // create_scheduling_group is a global operation, so groups must be created
     // once from any shard and then distributed via invoke_on_all.
+    //
+    // The groups MUST be forwarded to tsmFileManager here and not only from
+    // init(). The server calls init() BEFORE creating the groups, so the
+    // init()-side guard never fired in production: _compactionGroupSet stayed
+    // false for the whole process lifetime, every with_scheduling_group site
+    // silently took its inline fallback, and all compaction ran in `main`
+    // alongside writes. A 76s tier merge was 76s of unavailability while
+    // ts_compact sat at zero runtime. Forwarding from both sides makes the
+    // handshake order-independent.
     void setIOSchedulingGroups(seastar::scheduling_group query, seastar::scheduling_group write,
-                               seastar::scheduling_group compaction) {
+                               seastar::scheduling_group compaction, seastar::scheduling_group flush) {
         _queryGroup = query;
         _writeGroup = write;
         _compactionGroup = compaction;
+        _flushGroup = flush;
         _schedulingGroupsCreated = true;
+        tsmFileManager.setCompactionGroup(compaction);
+        tsmFileManager.setFlushGroup(flush);
     }
 
     // Get reference to the subscription manager for this shard

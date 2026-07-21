@@ -370,13 +370,18 @@ int main(int argc, char** argv) {
                 auto queryGrp = seastar::create_scheduling_group("ts_query", ioCfg.query_shares).get();
                 auto writeGrp = seastar::create_scheduling_group("ts_write", ioCfg.write_shares).get();
                 auto compactGrp = seastar::create_scheduling_group("ts_compact", ioCfg.compaction_shares).get();
+                auto flushGrp = seastar::create_scheduling_group("ts_flush", ioCfg.flush_shares).get();
 
                 g_engine
-                    .invoke_on_all([queryGrp, writeGrp, compactGrp](Engine& engine) {
-                        engine.setIOSchedulingGroups(queryGrp, writeGrp, compactGrp);
+                    .invoke_on_all([queryGrp, writeGrp, compactGrp, flushGrp](Engine& engine) {
+                        engine.setIOSchedulingGroups(queryGrp, writeGrp, compactGrp, flushGrp);
                         return seastar::make_ready_future<>();
                     })
                     .get();
+
+                // Compaction placement depends on the groups above, so the loop
+                // starts only once they have been distributed to every shard.
+                g_engine.invoke_on_all([](Engine& engine) { return engine.startBackgroundCompaction(); }).get();
 
                 // Set back-reference so Engine can do cross-shard operations.
                 g_engine

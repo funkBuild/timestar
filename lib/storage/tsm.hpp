@@ -277,7 +277,11 @@ public:
     uint64_t tierNum;
     uint64_t seqNum;
     // Newest write generation contained in this file (last-write-wins dedup).
-    // Flush-created files: == seqNum (flush order == write order per shard).
+    // Flush-created files: == seqNum, reserved at ROLLOVER time (the last
+    // point where store write order is serialized) rather than at write time
+    // -- conversions run concurrently and finish out of order, so a
+    // write-time seq would let an older store outrank a newer one. See
+    // TSMFileManager::reserveSequenceId().
     // Compaction outputs: max(dataSeq) of the inputs, carried in the filename
     // as a `_d<N>` suffix — a fresh seqNum would wrongly outrank newer
     // tier-0 files whose data was written later.  Legacy files without the

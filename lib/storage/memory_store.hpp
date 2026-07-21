@@ -151,6 +151,15 @@ public:
     // the WAL bound is never reached at all.
     static size_t residentBytesThreshold() { return timestar::config().storage.wal_size_threshold * 4; }
     const unsigned int sequenceNumber;
+
+    // TSM sequence number reserved for this store's flush file, taken inside
+    // the rollover critical section so that TSM seq order == store write order
+    // even when conversions complete out of order (see
+    // TSMFileManager::reserveSequenceId). Unset for stores that never roll
+    // over through that path (startup recovery, tests); writeMemstore then
+    // falls back to assigning at write time, which is safe there because those
+    // paths convert sequentially.
+    std::optional<uint64_t> reservedTsmSeq;
     // Use robin_map for O(1) lookups with better cache locality than std::unordered_map
     tsl::robin_map<SeriesId128, VariantInMemorySeries, SeriesId128::Hash> series;
 
@@ -161,6 +170,11 @@ public:
 
     seastar::future<> initWAL();
     seastar::future<> removeWAL();
+
+    // On-disk size of this store's WAL segment. Read before removeWAL() to
+    // measure how much space the conversion to TSM reclaims. Defined in the
+    // .cpp because WAL is only forward-declared here.
+    size_t walSizeOnDisk() const;
     seastar::future<> initFromWAL(std::string filename);
     seastar::future<> close();
     template <class T>

@@ -376,6 +376,10 @@ seastar::future<> MemoryStore::initWAL() {
     co_await wal->init(this, false);  // false = not recovery, create fresh WAL
 }
 
+size_t MemoryStore::walSizeOnDisk() const {
+    return wal ? wal->getCurrentSize() : 0;
+}
+
 seastar::future<> MemoryStore::removeWAL() {
     if (wal) {
         co_await wal->remove();

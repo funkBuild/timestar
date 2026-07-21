@@ -73,6 +73,9 @@ std::vector<std::string> TimestarConfig::validate() const {
     if (storage.tsm_cache_entries == 0) {
         errors.emplace_back("storage.tsm_cache_entries must be > 0");
     }
+    if (storage.conversion_concurrency == 0) {
+        errors.emplace_back("storage.conversion_concurrency must be > 0");
+    }
     if (storage.wal_max_concurrent_encoders == 0) {
         errors.emplace_back("storage.wal_max_concurrent_encoders must be > 0");
     }
@@ -139,6 +142,7 @@ std::vector<std::string> TimestarConfig::validate() const {
     validateShares(engine.io_priority.query_shares, "query_shares");
     validateShares(engine.io_priority.write_shares, "write_shares");
     validateShares(engine.io_priority.compaction_shares, "compaction_shares");
+    validateShares(engine.io_priority.flush_shares, "flush_shares");
 
     if (streaming.output_queue_size == 0) {
         errors.emplace_back("streaming.output_queue_size must be > 0");
@@ -430,6 +434,7 @@ void applyEnvironmentOverrides(TimestarConfig& cfg) {
     envU32("TIMESTAR_TSM_CACHE_ENTRIES", cfg.storage.tsm_cache_entries);
 
     // Compaction
+    envU32("TIMESTAR_CONVERSION_CONCURRENCY", cfg.storage.conversion_concurrency);
     envU32("TIMESTAR_COMPACTION_MAX_CONCURRENT", cfg.storage.compaction.max_concurrent);
     envU64("TIMESTAR_COMPACTION_MAX_MEMORY", cfg.storage.compaction.max_memory);
     envU32("TIMESTAR_COMPACTION_BATCH_SIZE", cfg.storage.compaction.batch_size);
@@ -463,6 +468,7 @@ void applyEnvironmentOverrides(TimestarConfig& cfg) {
     envFlt("TIMESTAR_IO_QUERY_SHARES", cfg.engine.io_priority.query_shares);
     envFlt("TIMESTAR_IO_WRITE_SHARES", cfg.engine.io_priority.write_shares);
     envFlt("TIMESTAR_IO_COMPACTION_SHARES", cfg.engine.io_priority.compaction_shares);
+    envFlt("TIMESTAR_IO_FLUSH_SHARES", cfg.engine.io_priority.flush_shares);
 
     // Streaming
     envU32("TIMESTAR_STREAMING_MAX_SUBSCRIPTIONS", cfg.streaming.max_subscriptions_per_shard);

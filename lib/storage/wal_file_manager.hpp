@@ -22,6 +22,20 @@ class InsertTooLargeException : public std::length_error {
 public:
     explicit InsertTooLargeException(const std::string& what) : std::length_error(what) {}
 };
+
+// Thrown when the shard's unconverted memory-store backlog has reached its
+// ceiling. The HTTP layer maps this to 503 + Retry-After, so a client sees an
+// explicit, retryable signal.
+//
+// This is deliberately a REJECTION and never a block. The ingest path must not
+// stall: bursts are absorbed by letting stores accumulate, and only a sustained
+// overrun that would otherwise exhaust memory reaches this. Rejecting one write
+// keeps the shard alive; blocking it stalls every writer behind the capacity-1
+// rollover semaphore, and doing nothing gets the process OOM-killed.
+class IngestBacklogException : public std::runtime_error {
+public:
+    explicit IngestBacklogException(const std::string& what) : std::runtime_error(what) {}
+};
 }  // namespace timestar
 
 // Pairs a raw pointer to in-memory series data with the shared_ptr that
@@ -44,13 +58,33 @@ private:
     seastar::gate _backgroundGate;               // Tracks in-flight background TSM conversions
     seastar::semaphore compactionSemaphore{1};   // Only allow 1 rollover at a time
     seastar::semaphore _conversionSemaphore{1};  // Serialize background TSM conversions
-    // Rollover throttles once this many stores are awaiting TSM conversion.
-    // Each retained store holds its full uncompressed dataset, so an unbounded
-    // queue is an unbounded memory commitment.
+    // Backlog at which the burst is considered unabsorbed and logged. Rollover
+    // does NOT block here -- see rolloverMemoryStore(). Admission control lives
+    // at the request edge via isIngestBacklogged().
     static constexpr size_t kMaxUnconvertedMemoryStores = 4;
+
+    // Hard ceiling on retained stores. Each holds its full UNCOMPRESSED dataset
+    // in RAM (residentBytesThreshold() = wal_size_threshold * 4, ~64MB), so this
+    // is a memory commitment, not a disk one: absorbing a burst costs RAM until
+    // retained stores can be spilled to their WAL files. Sized so a shard tops
+    // out around 1GB of retained data. Past this, writes are rejected with 503
+    // rather than blocked -- a labelled rejection is recoverable for a client,
+    // an OOM kill of the whole shard is not.
+    static constexpr size_t kIngestRejectMemoryStores = 16;
 
 public:
     WALFileManager();
+
+    // True while any rolled-over store is still awaiting TSM conversion.
+    // Drives compaction's WAL-first priority.
+    bool hasPendingConversions() const { return memoryStores.size() > 1; }
+
+    // True once the retained-store backlog reaches the rejection ceiling.
+    // Consulted at the request edge to shed load without blocking.
+    bool isIngestBacklogged() const { return memoryStores.size() >= kIngestRejectMemoryStores; }
+
+    // Stores currently retained (including the active one), for metrics.
+    size_t retainedMemoryStoreCount() const { return memoryStores.size(); }
 
     seastar::future<> init(Engine& engine, TSMFileManager& _tsmFileManager);
     template <class T>

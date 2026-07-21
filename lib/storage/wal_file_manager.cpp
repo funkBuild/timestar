@@ -43,6 +43,30 @@ seastar::future<> WALFileManager::init(Engine& engine, TSMFileManager& _tsmFileM
     timestar::wal_log.info("WALFileManager::init starting for shard {}", shardId);
     tsmFileManager = &_tsmFileManager;
 
+    // Size the conversion pool from config. It starts at 1 (header default);
+    // adjust to match, using the same signal/consume resize as WAL::_encode_sem
+    // since seastar::semaphore has no capacity setter.
+    //
+    // Conversion concurrency, not tier-merge concurrency, is what sets the
+    // sustainable ingest rate: it is the only thing that frees retained-store
+    // RAM, and at capacity 1 the backlog hit its ceiling and shed 53% of writes
+    // at 5.8M pts/s while tier merges were idle.
+    auto maxConversions = static_cast<ssize_t>(timestar::config().storage.conversion_concurrency);
+    if (maxConversions < 1)
+        maxConversions = 1;
+    auto currentConversions = _conversionSemaphore.available_units();
+    if (maxConversions > currentConversions) {
+        _conversionSemaphore.signal(maxConversions - currentConversions);
+    } else if (maxConversions < currentConversions) {
+        _conversionSemaphore.consume(currentConversions - maxConversions);
+    }
+
+    // Let compaction see the WAL backlog so it can yield to conversion.
+    // Safe to capture `this`: TSMFileManager and WALFileManager are both
+    // members of the same Engine, and stopCompactionLoop() runs in
+    // Engine::stop() before either is destroyed.
+    tsmFileManager->setWalConversionProbe([this] { return hasPendingConversions(); });
+
     // Search for existing WAL's
     std::string path = engine.basePath() + '/';
     timestar::wal_log.debug("Scanning for WAL files in {} on shard {}", path, shardId);
@@ -317,35 +341,27 @@ seastar::future<> WALFileManager::rolloverMemoryStore() {
     // Create and init the new store FIRST, before closing the old one.
     // This ensures memoryStores[0] always points to an open store,
     // even if another insert coroutine runs during a co_await yield.
-    // Backpressure: wait if unconverted stores have already piled up.
+    // Backlog handling: absorb bursts, never block.
     //
-    // Conversion runs detached, serialised by _conversionSemaphore, and in the
-    // LOW-PRIORITY compaction scheduling group -- so under sustained write load
-    // (exactly when conversion is slowest) inserts never wait and retained
-    // stores queue without limit, each holding its full uncompressed dataset.
-    // Blocking the rollover here is what makes ingest feel the backlog instead
-    // of accumulating it in memory.
+    // This used to spin here until the backlog drained, which made ingest feel
+    // every conversion delay. Combined with inline tier compaction holding the
+    // single conversion slot for a whole deep merge, that produced multi-second
+    // rollover stalls and client write timeouts. Compaction no longer runs on
+    // the conversion fiber, so the backlog should now drain at TSM-write speed;
+    // when it does not, the policy is to accumulate rather than stall.
+    //
+    // Blocking is NOT reinstated as a fallback. A blocked rollover holds
+    // compactionSemaphore (capacity 1), so every other rollover on the shard
+    // queues behind it -- one slow conversion became a shard-wide write stall.
+    // Admission control belongs at the request edge, where it can reject a
+    // single write cheaply, not deep in the rollover path where it blocks all
+    // of them. Engine::insert consults isIngestBacklogged() and returns 503 +
+    // Retry-After at the ceiling.
     if (memoryStores.size() >= kMaxUnconvertedMemoryStores) {
         timestar::wal_log.info(
-            "Shard {}: {} memory stores awaiting conversion (including the active store), "
-            "throttling rollover",
+            "Shard {}: {} memory stores awaiting conversion (including the active store); "
+            "absorbing burst without throttling rollover",
             shardId, memoryStores.size());
-        // Loop, don't single-shot: acquiring the conversion semaphore proves a
-        // conversion SLOT is free, not that the backlog drained — during a
-        // failed conversion's retry backoff the semaphore is free while every
-        // store is still resident, so one acquire used to make the throttle a
-        // no-op for the whole failure window. Units are released immediately
-        // each round (holding them would deadlock the very conversion being
-        // waited on); the brief sleep stops the loop from spinning on a free
-        // semaphore while the backlog sits in retry backoff.
-        while (memoryStores.size() >= kMaxUnconvertedMemoryStores) {
-            {
-                auto convUnits = co_await seastar::get_units(_conversionSemaphore, 1);
-            }
-            if (memoryStores.size() >= kMaxUnconvertedMemoryStores) {
-                co_await seastar::sleep(std::chrono::milliseconds(100));
-            }
-        }
     }
 
     auto store = seastar::make_shared<MemoryStore>(++currentWalSequenceNumber);
@@ -353,6 +369,16 @@ seastar::future<> WALFileManager::rolloverMemoryStore() {
     memoryStores.insert(memoryStores.begin(), store);
 
     timestar::wal_log.info("New memory store {} created for shard {}", store->sequenceNumber, shardId);
+
+    // Fix the retiring store's TSM sequence number NOW, while rollovers are
+    // still serialized. Conversions run concurrently and complete out of
+    // order; if the seq were assigned at write time (writeMemstore), a newer
+    // store finishing first would take a lower seq and its data would lose
+    // last-write-wins conflicts to older stores. Rollover order IS write
+    // order, so this is the last point where the two can be bound together.
+    if (tsmFileManager != nullptr && !previousStore->isEmpty()) {
+        previousStore->reservedTsmSeq = tsmFileManager->reserveSequenceId();
+    }
 
     // -----------------------------------------------------------------------
     // Release the rollover semaphore early. The critical section is complete:
@@ -386,11 +412,13 @@ seastar::future<> WALFileManager::rolloverMemoryStore() {
             return seastar::get_units(_conversionSemaphore, 1).then([this, store](auto convUnits) {
                 return store->close().then([this, store, units = std::move(convUnits)]() mutable {
                     // Run the CPU-heavy encode + multi-MB DMA write in the
-                    // low-priority compaction scheduling group so background
-                    // flush does not compete head-on with foreground inserts
-                    // (the direct cause of warm-phase throughput degradation).
-                    if (tsmFileManager != nullptr && tsmFileManager->hasCompactionGroup()) {
-                        return seastar::with_scheduling_group(tsmFileManager->compactionGroup(),
+                    // dedicated FLUSH scheduling group -- not the compaction
+                    // group. Both are below `main` so foreground inserts still
+                    // preempt, but flush sits well above compaction: this work
+                    // is what unlinks the WAL file and drains the ingest
+                    // backlog, so it must not queue behind a deep tier merge.
+                    if (tsmFileManager != nullptr && tsmFileManager->hasFlushGroup()) {
+                        return seastar::with_scheduling_group(tsmFileManager->flushGroup(),
                                                               [this, store] { return convertWalToTsm(store); })
                             .finally([units = std::move(units)] {});
                     }
@@ -524,12 +552,13 @@ seastar::future<> WALFileManager::convertWalToTsm(seastar::shared_ptr<MemoryStor
                            largestSeriesPoints);
 #endif  // TIMESTAR_LOG_INSERT_PATH
 
+    uint64_t tsmBytesWritten = 0;
     try {
         timestar::wal_log.debug(
             "[TSM_WRITE_START] Calling tsmFileManager->writeMemstore for store {} "
             "on shard {}",
             store->sequenceNumber, shardId);
-        co_await tsmFileManager->writeMemstore(store);
+        tsmBytesWritten = co_await tsmFileManager->writeMemstore(store);
         timestar::wal_log.debug("[TSM_WRITE_SUCCESS] Successfully wrote TSM for store {} on shard {}",
                                 store->sequenceNumber, shardId);
     } catch (const std::bad_alloc& e) {
@@ -566,8 +595,18 @@ seastar::future<> WALFileManager::convertWalToTsm(seastar::shared_ptr<MemoryStor
         memoryStores.erase(it);
     }
 
+    // Capture the WAL's on-disk size BEFORE unlinking it. WAL->TSM is a format
+    // change (row-oriented, per-entry framed -> columnar, ALP/Simple8b/zstd),
+    // so it reclaims far more per byte processed than a tier merge, which only
+    // re-packs data that is already in TSM form. That asymmetry is what
+    // justifies prioritising conversion over merges, and this is the number
+    // that demonstrates it.
+    const uint64_t walBytes = store->walSizeOnDisk();
     co_await store->removeWAL();
-    timestar::wal_log.info("Successfully converted WAL {} to TSM on shard {}", store->sequenceNumber, shardId);
+    const double reclaimedPct =
+        walBytes > 0 ? 100.0 * (1.0 - static_cast<double>(tsmBytesWritten) / static_cast<double>(walBytes)) : 0.0;
+    timestar::wal_log.info("Successfully converted WAL {} to TSM on shard {} | {} -> {} bytes ({:.1f}% reclaimed)",
+                           store->sequenceNumber, shardId, walBytes, tsmBytesWritten, reclaimedPct);
 }
 
 seastar::future<> WALFileManager::close() {

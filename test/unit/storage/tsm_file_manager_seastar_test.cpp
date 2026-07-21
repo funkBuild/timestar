@@ -329,6 +329,71 @@ TEST_F(TSMFileManagerSeastarTest, WriteMemstore) {
 }
 
 // ---------------------------------------------------------------------------
+// Test: rollover-time seq reservations keep LWW rank in WRITE order even when
+// conversions complete out of order.
+//
+// Conversions run concurrently (conversion_concurrency > 1) and each store's
+// close() takes a different amount of time, so the order in which stores reach
+// writeMemstore() is not the order they were written in. A flush file's seqNum
+// IS its dataSeq (its last-write-wins rank), so assigning the seq inside
+// writeMemstore let a newer store take a lower seq -- and queries then
+// preferred the OLDER value on duplicate timestamps. The seq must come from the
+// reservation made at rollover time, where write order is still serialized.
+// ---------------------------------------------------------------------------
+seastar::future<> testFMReservedSeqSurvivesOutOfOrderConversion() {
+    TSMFileManager mgr;
+    co_await mgr.init();
+
+    // Two stores in write order: olderStore was written first.
+    auto olderStore = seastar::make_shared<MemoryStore>(1);
+    auto newerStore = seastar::make_shared<MemoryStore>(2);
+    {
+        TimeStarInsert<double> insert("temperature", "value");
+        insert.addValue(1000, 20.5);
+        olderStore->insertMemory(std::move(insert));
+    }
+    {
+        TimeStarInsert<double> insert("temperature", "value");
+        insert.addValue(1000, 99.9);  // overwrite of the same point
+        newerStore->insertMemory(std::move(insert));
+    }
+
+    // Reservations taken in write order (as rolloverMemoryStore does).
+    olderStore->reservedTsmSeq = mgr.reserveSequenceId();
+    newerStore->reservedTsmSeq = mgr.reserveSequenceId();
+
+    // Conversions complete in REVERSE order: the newer store lands first.
+    co_await mgr.writeMemstore(newerStore, 0);
+    co_await mgr.writeMemstore(olderStore, 0);
+
+    EXPECT_EQ(mgr.getSequencedTsmFiles().size(), 2);
+
+    // The newer store's file must outrank the older store's file regardless of
+    // conversion completion order.
+    seastar::shared_ptr<TSM> olderFile, newerFile;
+    for (const auto& [rank, tsm] : mgr.getSequencedTsmFiles()) {
+        if (tsm->seqNum == *olderStore->reservedTsmSeq) {
+            olderFile = tsm;
+        } else if (tsm->seqNum == *newerStore->reservedTsmSeq) {
+            newerFile = tsm;
+        }
+    }
+    EXPECT_TRUE(olderFile);
+    EXPECT_TRUE(newerFile);
+    if (!olderFile || !newerFile) {
+        co_return;
+    }
+    EXPECT_GT(newerFile->dataRank(), olderFile->dataRank())
+        << "Newer store's flush file ranks below the older store's: on duplicate timestamps, "
+           "last-write-wins would serve the OLD value. The TSM seq must be reserved at rollover "
+           "time, not assigned at conversion-completion time.";
+}
+
+TEST_F(TSMFileManagerSeastarTest, ReservedSeqSurvivesOutOfOrderConversion) {
+    testFMReservedSeqSurvivesOutOfOrderConversion().get();
+}
+
+// ---------------------------------------------------------------------------
 // Test: writeMemstore with specific tier
 // ---------------------------------------------------------------------------
 seastar::future<> testFMWriteMemstoreWithTier() {

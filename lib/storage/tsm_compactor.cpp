@@ -1287,7 +1287,7 @@ CompactionPlan TSMCompactor::planCompaction(uint64_t tier) {
     return plan;
 }
 
-seastar::future<CompactionStats> TSMCompactor::executeCompaction(const CompactionPlan& plan) {
+seastar::future<CompactionStats> TSMCompactor::executeCompaction(CompactionPlan plan) {
     if (!plan.isValid()) {
         co_return CompactionStats{};
     }
@@ -1304,14 +1304,29 @@ seastar::future<CompactionStats> TSMCompactor::executeCompaction(const Compactio
     // Scope guard: always remove from active list, even on exception.
     // Without this, a failed compaction permanently poisons the active set,
     // preventing those files from ever being compacted again.
-    auto removeActive = seastar::defer([this, &plan] {
-        std::erase_if(activeCompactions,
-                      [&](const ActiveCompaction& a) { return a.plan.targetPath == plan.targetPath; });
+    // Captures targetPath by value rather than `&plan`. Safe either way now
+    // that the frame owns the plan, but the guard runs after every suspension
+    // point in this coroutine, so it should not depend on that subtlety.
+    auto removeActive = seastar::defer([this, targetPath = plan.targetPath] {
+        std::erase_if(activeCompactions, [&](const ActiveCompaction& a) { return a.plan.targetPath == targetPath; });
     });
 
     // Perform compaction (passing pending retention context if any).
     // Use the plan's pre-allocated targetTier and targetSeqNum so the output
     // file path matches plan.targetPath (avoids wasting sequence IDs).
+    // bytesRead/bytesWritten exist on CompactionStats but were never assigned
+    // anywhere -- they read 0 on every path, which made "how much space does a
+    // tier merge actually reclaim?" unanswerable from outside the process.
+    // Sum the inputs HERE, before compact() and removeTSMFiles() run: once the
+    // sources are unlinked and closed their cached sizes are no longer
+    // trustworthy.
+    uint64_t sourceBytes = 0;
+    for (const auto& src : plan.sourceFiles) {
+        if (src) {
+            sourceBytes += src->getFileSize();
+        }
+    }
+
     // Move policies into locals so they survive across multiple executeCompaction calls
     // (e.g., forceFullCompaction calls executeCompaction per tier).
     auto localRetention = std::exchange(_pendingRetentionPolicies, {});
@@ -1337,6 +1352,15 @@ seastar::future<CompactionStats> TSMCompactor::executeCompaction(const Compactio
     CompactionStats finalStats = compactionResult.stats;
     auto endTime = std::chrono::steady_clock::now();
     finalStats.duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - active.startTime);
+
+    finalStats.bytesRead = sourceBytes;
+    if (!compactionResult.outputPath.empty()) {
+        try {
+            finalStats.bytesWritten = co_await seastar::file_size(compactionResult.outputPath);
+        } catch (...) {
+            // Reporting only; never fail a completed compaction over it.
+        }
+    }
 
     for (auto& ac : activeCompactions) {
         if (ac.plan.targetPath == plan.targetPath) {

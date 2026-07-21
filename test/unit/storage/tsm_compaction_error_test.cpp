@@ -191,19 +191,24 @@ TEST_F(CompactionErrorHandlingTest, RunCompactionLoopCatchBlockLogsError) {
 }
 
 // Test 3: checkAndTriggerCompaction has try/catch around executeCompaction
-TEST_F(CompactionErrorHandlingTest, CheckAndTriggerCompactionHasTryCatchAroundExecuteCompaction) {
-    std::string methodBody = extractMethodBody(fileManagerSource, "TSMFileManager::checkAndTriggerCompaction()");
-    ASSERT_FALSE(methodBody.empty()) << "Could not find TSMFileManager::checkAndTriggerCompaction() in source";
+// The executeCompaction call moved from checkAndTriggerCompaction() into
+// compactOneTier() when tier merges were taken off the WAL conversion fiber.
+// The invariant is unchanged and still load-bearing: a failed merge must not
+// escape. It no longer reaches a write (compaction is background-only now),
+// but it would still tear down the background loop's current cycle.
+TEST_F(CompactionErrorHandlingTest, CompactOneTierHasTryCatchAroundExecuteCompaction) {
+    std::string methodBody = extractMethodBody(fileManagerSource, "TSMFileManager::compactOneTier(uint64_t tier)");
+    ASSERT_FALSE(methodBody.empty()) << "Could not find TSMFileManager::compactOneTier() in source";
 
     // Verify executeCompaction is called
     ASSERT_NE(methodBody.find("executeCompaction"), std::string::npos)
-        << "checkAndTriggerCompaction() does not call executeCompaction()";
+        << "compactOneTier() does not call executeCompaction()";
 
     // Verify the executeCompaction call is inside a try block
     EXPECT_TRUE(hasTrappedCall(methodBody, "executeCompaction"))
-        << "executeCompaction() in checkAndTriggerCompaction() is NOT wrapped in a try/catch. "
-        << "A compaction failure during a write would cause the write endpoint to return an error "
-        << "to the client, even though the write itself succeeded.";
+        << "executeCompaction() in compactOneTier() is NOT wrapped in a try/catch. "
+        << "A compaction failure would escape into the background compaction loop, "
+        << "aborting the cycle instead of backing that tier off and moving on.";
 }
 
 // Test 4: The catch blocks do NOT rethrow (loop continues after error)
@@ -217,13 +222,13 @@ TEST_F(CompactionErrorHandlingTest, RunCompactionLoopContinuesAfterError) {
         << "so compaction can be retried on the next cycle.";
 }
 
-// Test 5: checkAndTriggerCompaction catch block does NOT rethrow
-TEST_F(CompactionErrorHandlingTest, CheckAndTriggerCompactionContinuesAfterError) {
-    std::string methodBody = extractMethodBody(fileManagerSource, "TSMFileManager::checkAndTriggerCompaction()");
+// Test 5: compactOneTier catch block does NOT rethrow
+TEST_F(CompactionErrorHandlingTest, CompactOneTierContinuesAfterError) {
+    std::string methodBody = extractMethodBody(fileManagerSource, "TSMFileManager::compactOneTier(uint64_t tier)");
     ASSERT_FALSE(methodBody.empty());
 
     EXPECT_TRUE(catchBlockDoesNotRethrow(methodBody, "executeCompaction"))
-        << "The catch block in checkAndTriggerCompaction() rethrows the exception. "
-        << "This would propagate the error to the write path caller, failing a write "
-        << "that already succeeded just because background compaction failed.";
+        << "The catch block in compactOneTier() rethrows the exception. "
+        << "A rethrow would skip the per-tier failure backoff and abort the "
+        << "background compaction cycle, leaving other tiers unmerged.";
 }

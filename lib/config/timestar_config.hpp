@@ -25,6 +25,11 @@ struct CompactionConfig {
     uint32_t tier0_min_files = 4;
     uint32_t tier1_min_files = 4;
     uint32_t tier2_min_files = 4;
+    // Tier-0 file count at which compaction stops yielding to pending WAL->TSM
+    // conversion. WAL drain normally wins (it frees disk and keeps ingest
+    // flowing), but an unbounded tier 0 degrades every query on the shard, so
+    // this caps how far read amplification can drift during a long burst.
+    uint32_t tier0_starvation_ceiling = 32;
 };
 
 struct StorageConfig {
@@ -33,6 +38,30 @@ struct StorageConfig {
     double tsm_bloom_fpr = 0.001;
     uint32_t tsm_cache_entries = 4096;
     uint32_t wal_max_concurrent_encoders = 4;  // Max concurrent WAL encoding coroutines per shard
+    // Concurrent WAL->TSM conversions per shard. Was hard-coded to 1, which made
+    // conversion the ingest ceiling: conversion is the only thing that frees
+    // retained-store RAM, so ITS throughput -- not tier-merge throughput -- sets
+    // the sustainable ingest rate.
+    //
+    // Measured, 1.3B points / 2 shards / 8 connections on NVMe, sweeping this
+    // value (13000 batches, accepted vs shed, latency over the whole run):
+    //
+    //    conv   pts/s   accepted   shed    p99      max
+    //      1    2.66M    3110/13000  76%   250ms    726ms
+    //      3    7.09M    8995/13000  31%   281ms    748ms
+    //      6    9.69M   11322/13000  13%    67ms    124ms   <-- optimum
+    //     12    8.45M   10796/13000  17%   325ms   1105ms
+    //
+    // A clear inverted U. Below the knee conversions serialise behind each
+    // other's I/O waits and the backlog forces writes to be shed; above it they
+    // contend for disk and CPU, and both latency and throughput regress. 6 wins
+    // on every axis simultaneously -- 3.6x the throughput of the old hard-coded
+    // 1, with p99 cut from 250ms to 67ms.
+    //
+    // This is disk-dependent: measured on tmpfs the sweep is flat, because
+    // RAM-backed I/O never blocks, so a single fiber keeps up. Re-measure on the
+    // target storage before changing it.
+    uint32_t conversion_concurrency = 6;
     CompactionConfig compaction;
 };
 
@@ -71,6 +100,10 @@ struct IOPriorityConfig {
     float query_shares = 100.0f;      // TSM/index reads during queries
     float write_shares = 50.0f;       // WAL writes, memtable flushes
     float compaction_shares = 10.0f;  // Background TSM/SSTable compaction
+    // WAL->TSM conversion. Well above compaction_shares: conversion is what
+    // releases WAL disk and drains the ingest backlog, so it must outrank tier
+    // merges. Well below `main` (1000) so foreground writes still preempt it.
+    float flush_shares = 200.0f;
 };
 
 struct EngineConfig {
@@ -160,7 +193,7 @@ struct glz::meta<timestar::CompactionConfig> {
     static constexpr auto value =
         object("max_concurrent", &T::max_concurrent, "max_memory", &T::max_memory, "batch_size", &T::batch_size,
                "tier0_min_files", &T::tier0_min_files, "tier1_min_files", &T::tier1_min_files, "tier2_min_files",
-               &T::tier2_min_files);
+               &T::tier2_min_files, "tier0_starvation_ceiling", &T::tier0_starvation_ceiling);
 };
 
 template <>
@@ -169,7 +202,8 @@ struct glz::meta<timestar::StorageConfig> {
     static constexpr auto value =
         object("wal_size_threshold", &T::wal_size_threshold, "max_points_per_block", &T::max_points_per_block,
                "tsm_bloom_fpr", &T::tsm_bloom_fpr, "tsm_cache_entries", &T::tsm_cache_entries,
-               "wal_max_concurrent_encoders", &T::wal_max_concurrent_encoders, "compaction", &T::compaction);
+               "wal_max_concurrent_encoders", &T::wal_max_concurrent_encoders, "conversion_concurrency",
+               &T::conversion_concurrency, "compaction", &T::compaction);
 };
 
 template <>
@@ -196,7 +230,7 @@ template <>
 struct glz::meta<timestar::IOPriorityConfig> {
     using T = timestar::IOPriorityConfig;
     static constexpr auto value = object("query_shares", &T::query_shares, "write_shares", &T::write_shares,
-                                         "compaction_shares", &T::compaction_shares);
+                                         "compaction_shares", &T::compaction_shares, "flush_shares", &T::flush_shares);
 };
 
 template <>

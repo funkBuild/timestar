@@ -36,8 +36,12 @@ seastar::future<> Engine::init() {
     co_await createDirectoryStructure();
     co_await index.open();
     co_await tsmFileManager.init();
+    // Order-independent handshake: the server creates scheduling groups AFTER
+    // init(), in which case setIOSchedulingGroups() does the forwarding. Tests
+    // and embedders that create them first are covered here.
     if (_schedulingGroupsCreated) {
         tsmFileManager.setCompactionGroup(_compactionGroup);
+        tsmFileManager.setFlushGroup(_flushGroup);
     }
     co_await walFileManager.init(*this, tsmFileManager);
 
@@ -47,13 +51,26 @@ seastar::future<> Engine::init() {
     // Retention policy loading is done post-startup via loadAndBroadcastRetentionPolicies()
     // after setShardedRef() has been called on all shards.
 
-    // Background compaction loop is optional - inline compaction is triggered automatically
-    // in TSMFileManager::writeMemstore() after each WAL rollover creates a new TSM file.
-    // When a tier reaches 4 files, they are compacted into 1 file at the next tier level.
-    // The background loop provides additional periodic checks but is not required for
-    // normal operation. Uncomment to enable periodic compaction checks:
-    // co_await tsmFileManager.startCompactionLoop();
+    // The background compaction loop is now REQUIRED, not optional. writeMemstore()
+    // no longer compacts inline (that coupling is what let a deep tier merge hold
+    // the WAL conversion slot and stall ingest), so this loop is the only thing
+    // that merges tiers. It is started by startBackgroundCompaction() rather than
+    // here, because it must not run until the scheduling groups exist -- otherwise
+    // merges would land in `main` and preempt foreground writes, which is exactly
+    // the failure being fixed.
 };
+
+seastar::future<> Engine::startBackgroundCompaction() {
+    if (!_schedulingGroupsCreated) {
+        // Refuse rather than silently running merges in `main`. Starting the
+        // loop before the groups exist reintroduces the exact regression this
+        // path was added to prevent.
+        timestar::compactor_log.warn("Shard {}: background compaction not started -- scheduling groups not yet set",
+                                     shardId);
+        co_return;
+    }
+    co_await tsmFileManager.startCompactionLoop();
+}
 
 seastar::future<> Engine::createDirectoryStructure() {
     std::string shardPath = basePath() + "/tsm";
@@ -115,6 +132,8 @@ seastar::future<> Engine::stop() {
 template <class T>
 seastar::future<> Engine::insert(TimeStarInsert<T> insertRequest, bool skipMetadataIndexing) {
     auto holder = _insertGate.hold();
+
+    rejectIfIngestBacklogged();
 
     ++_metrics.inserts_total;
     _metrics.insert_points_total += insertRequest.values.size();
@@ -338,6 +357,8 @@ seastar::future<WALTimingInfo> Engine::insertBatch(std::vector<TimeStarInsert<T>
     if (insertRequests.empty()) {
         co_return WALTimingInfo{};  // No work to do
     }
+
+    rejectIfIngestBacklogged();
 
     // Enforce the per-series type binding BEFORE anything durable happens, so a
     // rejected write leaves no WAL record and no memstore entry, and before

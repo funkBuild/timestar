@@ -2221,6 +2221,24 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleW
             rep->_content = createErrorResponse(e.what());
         }
         timestar::http::setContentType(*rep, resFmt);
+    } catch (const timestar::IngestBacklogException& e) {
+        // Shard cannot convert memory stores to TSM fast enough to keep up.
+        // 503 + Retry-After rather than a block: the ingest path must never
+        // stall (a stalled rollover holds a capacity-1 semaphore and takes the
+        // whole shard's writers down with it), and rather than nothing at all,
+        // because silently accumulating past this point exhausts memory and
+        // gets the process OOM-killed. A client that honours Retry-After
+        // converges on the sustainable rate on its own.
+        ++engineSharded->local().metrics().insert_errors_total;
+        timestar::http_log.warn("Write rejected, ingest backlog: {}", e.what());
+        rep->set_status(seastar::http::reply::status_type::service_unavailable);
+        rep->_headers["Retry-After"] = "1";
+        if (timestar::http::isProtobuf(resFmt)) {
+            rep->_content = timestar::proto::formatWriteResponse("error", 0, 0, {std::string(e.what())});
+        } else {
+            rep->_content = createErrorResponse(e.what());
+        }
+        timestar::http::setContentType(*rep, resFmt);
     } catch (const std::exception& e) {
         ++engineSharded->local().metrics().insert_errors_total;
         timestar::http_log.error("Error handling write request: {}", e.what());

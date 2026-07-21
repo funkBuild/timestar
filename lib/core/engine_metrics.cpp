@@ -43,6 +43,15 @@ void EngineMetrics::setup(Engine& engine) {
                 [&engine] { return static_cast<int64_t>(engine.getDeepestBackloggedTier()); },
                 sm::description("Deepest tier at or over its compaction threshold, -1 if none")),
             sm::make_gauge(
+                "ingest_retained_memory_stores",
+                [&engine] { return static_cast<int64_t>(engine.getRetainedMemoryStoreCount()); },
+                sm::description("Memory stores retained awaiting TSM conversion, including the active store. "
+                                "Rising means conversion is behind ingest; at the ceiling writes are shed with 503")),
+            sm::make_counter(
+                "ingest_rejected_backlog_total",
+                [&engine] { return engine.getMetrics().inserts_rejected_backlog_total; },
+                sm::description("Writes rejected with 503 because the ingest backlog reached its ceiling")),
+            sm::make_gauge(
                 "index_series_count",
                 [&engine] { return static_cast<int64_t>(engine.getIndex().getSeriesCountSync()); },
                 sm::description("Number of indexed series on this shard")),

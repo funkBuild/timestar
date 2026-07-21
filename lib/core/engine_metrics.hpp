@@ -22,6 +22,9 @@ struct EngineMetrics {
     uint64_t slow_queries_total = 0;
     uint64_t deletes_total = 0;
     uint64_t wal_rollovers_total = 0;
+    // Writes shed because the unconverted-store backlog hit its ceiling.
+    // Non-zero means ingest is sustainably above what this shard can convert.
+    uint64_t inserts_rejected_backlog_total = 0;
 
     // Seastar metrics registration (automatically deregisters on destruction)
     seastar::metrics::metric_groups _metrics;

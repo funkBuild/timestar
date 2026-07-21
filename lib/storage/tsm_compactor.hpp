@@ -244,7 +244,14 @@ public:
     CompactionPlan planCompaction(uint64_t tier);
 
     // Execute a compaction plan
-    seastar::future<CompactionStats> executeCompaction(const CompactionPlan& plan);
+    // Takes the plan BY VALUE, deliberately. This is a coroutine, so a
+    // reference parameter is stored in the frame as a reference: any caller
+    // whose plan dies at the first suspension leaves it dangling. That is
+    // exactly what happened at the with_scheduling_group call site, where the
+    // plan lived in a by-value parameter of a NON-coroutine lambda that
+    // returned as soon as this coroutine first suspended. By value, the frame
+    // owns the plan and every caller is safe by construction.
+    seastar::future<CompactionStats> executeCompaction(CompactionPlan plan);
 
     // Check if compaction is needed for a tier
     bool shouldCompact(uint64_t tier) const;
