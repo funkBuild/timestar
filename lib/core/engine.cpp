@@ -557,10 +557,15 @@ seastar::future<std::optional<VariantQueryResult>> Engine::query(std::string ser
 
 seastar::future<std::optional<timestar::PushdownResult>> Engine::queryAggregated(
     [[maybe_unused]] const std::string& seriesKey, const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime,
-    uint64_t aggregationInterval, timestar::AggregationMethod method, bool foldNoInterval) {
+    uint64_t aggregationInterval, timestar::AggregationMethod method, bool foldNoInterval, bool boolLatestAsNumeric) {
     QueryRunner runner(&tsmFileManager, &walFileManager);
     co_return co_await runner.queryTsmAggregated(seriesId, startTime, endTime, aggregationInterval, method,
-                                                 foldNoInterval);
+                                                 foldNoInterval, boolLatestAsNumeric);
+}
+
+std::optional<TSMValueType> Engine::localSeriesValueType(const SeriesId128& seriesId) {
+    QueryRunner runner(&tsmFileManager, &walFileManager);
+    return runner.localSeriesValueType(seriesId);
 }
 
 // True when a series is non-numeric (Boolean or String).  A series is exactly

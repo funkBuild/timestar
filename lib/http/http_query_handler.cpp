@@ -103,11 +103,17 @@ static bool canStreamAggregation(AggregationMethod method, const std::vector<std
 // (anchor == 0: ts / interval * interval, identical to the numeric fold in
 // BlockAggregator / foldPoint below); a non-zero anchor shifts the grid to
 // start-aligned buckets (QueryRequest::bucketAnchor).
+//
+// A coroutine with a chunked maybe_yield: this loop runs on the reactor for
+// every non-numeric series of a bucketed query, and at production sizes
+// (millions of raw bool points per series) the synchronous version WAS the
+// reactor stall — the Jul 22 v1.3.0 backtraces symbolize to exactly this
+// loop.  Yield cadence per lib/core/yield_policy.hpp.
 template <typename V>
-static void bucketNonNumericFieldLatest(std::vector<uint64_t>& timestamps, std::vector<V>& values, uint64_t interval,
-                                        uint64_t anchor) {
+static seastar::future<> bucketNonNumericFieldLatest(std::vector<uint64_t>& timestamps, std::vector<V>& values,
+                                                     uint64_t interval, uint64_t anchor) {
     if (interval == 0 || timestamps.empty()) {
-        return;
+        co_return;
     }
     // This loop indexes values[i] by a TIMESTAMP index, so a desynced pair would
     // be an out-of-bounds read. It cannot get one: TSM now refuses to emit a
@@ -128,6 +134,7 @@ static void bucketNonNumericFieldLatest(std::vector<uint64_t>& timestamps, std::
     const size_t n = timestamps.size();
     std::vector<uint64_t> outTs;
     std::vector<V> outVals;
+    size_t sinceYield = 0;
     for (size_t i = 0; i < n; ++i) {
         // anchor == 0 is the epoch grid; a non-zero anchor shifts the grid to
         // start-aligned buckets (QueryRequest::bucketAnchor).  Range filtering
@@ -141,18 +148,22 @@ static void bucketNonNumericFieldLatest(std::vector<uint64_t>& timestamps, std::
             outTs.push_back(bucket);
             outVals.push_back(std::move(values[i]));
         }
+        if (++sinceYield >= timestar::kYieldChunkPoints) {
+            sinceYield = 0;
+            co_await seastar::coroutine::maybe_yield();
+        }
     }
     timestamps = std::move(outTs);
     values = std::move(outVals);
 }
 
 // Apply LATEST-per-bucket to every non-numeric field of a SeriesResult.
-static void bucketNonNumericResultLatest(timestar::SeriesResult& sr, uint64_t interval, uint64_t anchor) {
+static seastar::future<> bucketNonNumericResultLatest(timestar::SeriesResult& sr, uint64_t interval, uint64_t anchor) {
     for (auto& [fieldName, fieldData] : sr.fields) {
         if (auto* strs = std::get_if<std::vector<std::string>>(&fieldData.second)) {
-            bucketNonNumericFieldLatest(fieldData.first, *strs, interval, anchor);
+            co_await bucketNonNumericFieldLatest(fieldData.first, *strs, interval, anchor);
         } else if (auto* bools = std::get_if<std::vector<bool>>(&fieldData.second)) {
-            bucketNonNumericFieldLatest(fieldData.first, *bools, interval, anchor);
+            co_await bucketNonNumericFieldLatest(fieldData.first, *bools, interval, anchor);
         }
     }
 }
@@ -256,30 +267,22 @@ seastar::future<std::optional<timestar::SeriesResult>> queryNonNumericBucketedCh
             continue;
         }
 
-        bool numeric = false;
-        std::visit(
-            [&](auto&& result) {
-                using T = std::decay_t<decltype(result)>;
-                if constexpr (std::is_same_v<T, QueryResult<std::string>>) {
-                    sawString = true;
-                    bucketNonNumericFieldLatest(result.timestamps, result.values, interval, bucketAnchor);
-                    for (size_t i = 0; i < result.timestamps.size(); ++i) {
-                        appendBucket(result.timestamps[i], std::move(result.values[i]));
-                    }
-                } else if constexpr (std::is_same_v<T, QueryResult<bool>>) {
-                    sawBool = true;
-                    bucketNonNumericFieldLatest(result.timestamps, result.values, interval, bucketAnchor);
-                    for (size_t i = 0; i < result.timestamps.size(); ++i) {
-                        appendBucket(result.timestamps[i], result.values[i]);
-                    }
-                } else {
-                    numeric = true;
-                }
-            },
-            *chunk);
-
-        if (numeric) {
-            co_return std::nullopt;
+        // Typed branches instead of std::visit: the reduction is a coroutine
+        // now (chunked yields) and co_await is not usable inside a visitor.
+        if (auto* strRes = std::get_if<QueryResult<std::string>>(&*chunk)) {
+            sawString = true;
+            co_await bucketNonNumericFieldLatest(strRes->timestamps, strRes->values, interval, bucketAnchor);
+            for (size_t i = 0; i < strRes->timestamps.size(); ++i) {
+                appendBucket(strRes->timestamps[i], std::move(strRes->values[i]));
+            }
+        } else if (auto* boolRes = std::get_if<QueryResult<bool>>(&*chunk)) {
+            sawBool = true;
+            co_await bucketNonNumericFieldLatest(boolRes->timestamps, boolRes->values, interval, bucketAnchor);
+            for (size_t i = 0; i < boolRes->timestamps.size(); ++i) {
+                appendBucket(boolRes->timestamps[i], static_cast<bool>(boolRes->values[i]));
+            }
+        } else {
+            co_return std::nullopt;  // numeric series — not this path's job
         }
         cur = chunkEnd + 1;
     }
@@ -293,6 +296,66 @@ seastar::future<std::optional<timestar::SeriesResult>> queryNonNumericBucketedCh
         sr.fields[field] = std::make_pair(std::move(outTs), FieldValues(std::move(outStrs)));
     } else if (sawBool && !sawString && !outTs.empty()) {
         sr.fields[field] = std::make_pair(std::move(outTs), FieldValues(std::move(outBools)));
+    }
+    co_return sr;
+}
+
+// Bucketed LATEST for a BOOLEAN series without materialisation: rides the
+// numeric bucketed-LATEST pushdown (reverse block scan with filledBuckets
+// early termination, sparse-stat single-point resolution — see
+// QueryRunner::queryTsmAggregated boolLatestAsNumeric) by folding true/false
+// as 1.0/0.0, then converts the selected per-bucket values back to bool.
+// LATEST only SELECTS a stored value, it never computes, so the round-trip is
+// exact and the response type is unchanged.
+//
+// This is what keeps a bool status series from materialising millions of raw
+// points to answer a handful of buckets: the Jul 22 production incident shape
+// (multi-second bucketed queries over bool-heavy measurements, reactor stalls
+// in the reduction loop).
+//
+// Returns nullopt when the fast path is not applicable (LWW overlap between
+// files or with memory data, string series, unknown series); the caller then
+// takes the bounded chunked read.  A returned SeriesResult with no fields
+// means "resolved: the range holds no data".
+seastar::future<std::optional<timestar::SeriesResult>> queryBoolLatestBucketed(
+    Engine& engine, const std::string& seriesKey, SeriesId128 seriesId, const std::string& field,
+    std::map<std::string, std::string> tags, std::string measurement, uint64_t startTime, uint64_t endTime,
+    uint64_t interval) {
+    auto pr = co_await engine.queryAggregated(seriesKey, seriesId, startTime, endTime, interval,
+                                              timestar::AggregationMethod::LATEST,
+                                              /*foldNoInterval=*/false, /*boolLatestAsNumeric=*/true);
+    if (!pr.has_value()) {
+        co_return std::nullopt;
+    }
+
+    std::vector<std::pair<uint64_t, bool>> buckets;
+    buckets.reserve(pr->bucketStates.size());
+    size_t sinceYield = 0;
+    for (auto& [bucketTs, state] : pr->bucketStates) {
+        if (state.count == 0) {
+            continue;  // empty buckets are omitted (no gap filling)
+        }
+        buckets.emplace_back(bucketTs, state.latest != 0.0);
+        if (++sinceYield >= timestar::kYieldChunkPoints) {
+            sinceYield = 0;
+            co_await seastar::coroutine::maybe_yield();
+        }
+    }
+    std::sort(buckets.begin(), buckets.end());
+
+    timestar::SeriesResult sr;
+    sr.measurement = std::move(measurement);
+    sr.tags = std::move(tags);
+    if (!buckets.empty()) {
+        std::vector<uint64_t> ts;
+        std::vector<bool> vals;
+        ts.reserve(buckets.size());
+        vals.reserve(buckets.size());
+        for (auto& [bucket, val] : buckets) {
+            ts.push_back(bucket);
+            vals.push_back(val);
+        }
+        sr.fields[field] = std::make_pair(std::move(ts), FieldValues(std::move(vals)));
     }
     co_return sr;
 }
@@ -447,6 +510,58 @@ static seastar::future<std::vector<PartialAggregationResult>> streamingGroupByAg
         pairs, MAX_CONCURRENT_SERIES_QUERIES, [&](ContextGroupPair& pair) -> seastar::future<> {
             auto& ctx = *pair.ctx;
             auto* group = pair.group;
+
+            // --- Non-numeric bounded path (interval > 0) ---
+            // Same routing as the standard path: bool/string series reduce to
+            // LATEST-per-bucket, so answer them from the bucketed-LATEST
+            // pushdown (bool) or the bounded chunked reader instead of
+            // materialising the full range below.  This path only runs with
+            // bucketAnchor == 0 and booleansAsNumeric == false (see the
+            // executeShardQuery dispatch), so no flag checks are needed.
+            if (aggregationInterval > 0) {
+                const auto localType = engine.localSeriesValueType(ctx.seriesId);
+                if (localType.has_value() && isNonNumericValueType(*localType)) {
+                    bool routedFailed = false;
+                    std::string routedReason;
+                    try {
+                        std::optional<timestar::SeriesResult> reduced;
+                        if (*localType == TSMValueType::Boolean) {
+                            reduced = co_await detail::queryBoolLatestBucketed(engine, ctx.seriesKey, ctx.seriesId,
+                                                                               ctx.field, ctx.tags, measurement,
+                                                                               startTime, endTime, aggregationInterval);
+                        }
+                        if (!reduced.has_value()) {
+                            const uint64_t range = endTime - startTime;
+                            const uint64_t fullWidth =
+                                (range == std::numeric_limits<uint64_t>::max()) ? range : range + 1;
+                            reduced = co_await detail::queryNonNumericBucketedChunked(
+                                engine, ctx.seriesKey, ctx.seriesId, ctx.field, ctx.tags, measurement, startTime,
+                                endTime, aggregationInterval, fullWidth);
+                        }
+                        if (reduced.has_value()) {
+                            if (!reduced->fields.empty()) {
+                                nonNumericResults.push_back(std::move(*reduced));
+                            }
+                            co_return;
+                        }
+                        // Series turned out numeric — fall through to the
+                        // standard flow below, which handles every type.
+                    } catch (const std::exception& e) {
+                        routedFailed = true;
+                        routedReason = e.what();
+                    }
+                    if (routedFailed) {
+                        timestar::http_log.error(
+                            "[QUERY] Dropping series '{}' from result: {}. The response will be INCOMPLETE.",
+                            ctx.seriesKey, routedReason);
+                        ++droppedSeriesOut;
+                        if (firstDropReasonOut.empty()) {
+                            firstDropReasonOut = routedReason;
+                        }
+                        co_return;
+                    }
+                }
+            }
 
             // --- Try pushdown path ---
             // foldNoInterval=false: with interval == 0 the group's time axis is
@@ -1245,6 +1360,76 @@ static seastar::future<ShardQueryResult> executeShardQuery(
                 [&engine, &pushdownPartials, &fallbackResults, &nonNumericResults, &measurement, startTime, endTime,
                  shardId, aggregationInterval, bucketAnchor, booleansAsNumeric, aggregation, &groupByTags,
                  &droppedSeries, &firstDropReason](SeriesQueryContext& ctx) -> seastar::future<> {
+                    // ---- NON-NUMERIC BOUNDED PATH (interval > 0) ----
+                    // A bool/string series with an interval reduces to
+                    // LATEST-per-bucket — an O(buckets) answer — yet the
+                    // fallback below materialises O(points in range) raw data
+                    // first and reduces afterwards.  At production sizes that
+                    // materialise-then-reduce WAS the Jul 22 incident: seconds
+                    // of decode plus a reactor-stalling reduction per bool
+                    // series.  Probe the type without I/O and take a bounded
+                    // path instead: the bucketed-LATEST pushdown for booleans
+                    // (reads only the blocks that decide buckets), else the
+                    // chunked reader (same total I/O as the single shot, but
+                    // peak memory of one chunk and yields throughout).
+                    //
+                    // Booleans under booleansAsNumeric skip this: they
+                    // aggregate arithmetically with the requested method, so
+                    // they need the numeric flow below.  Strings route here
+                    // regardless of that flag (they stay non-numeric).
+                    if (aggregationInterval > 0) {
+                        const auto localType = engine.localSeriesValueType(ctx.seriesId);
+                        const bool routeBool =
+                            localType.has_value() && *localType == TSMValueType::Boolean && !booleansAsNumeric;
+                        const bool routeString = localType.has_value() && *localType == TSMValueType::String;
+                        if (routeBool || routeString) {
+                            bool routedFailed = false;
+                            std::string routedReason;
+                            try {
+                                std::optional<timestar::SeriesResult> reduced;
+                                if (routeBool && bucketAnchor == 0) {
+                                    reduced = co_await detail::queryBoolLatestBucketed(
+                                        engine, ctx.seriesKey, ctx.seriesId, ctx.field, ctx.tags, measurement,
+                                        startTime, endTime, aggregationInterval);
+                                }
+                                if (!reduced.has_value()) {
+                                    // Full-range first chunk = the old single-shot
+                                    // read profile; bad_alloc halves it from there.
+                                    const uint64_t range = endTime - startTime;
+                                    const uint64_t fullWidth =
+                                        (range == std::numeric_limits<uint64_t>::max()) ? range : range + 1;
+                                    reduced = co_await detail::queryNonNumericBucketedChunked(
+                                        engine, ctx.seriesKey, ctx.seriesId, ctx.field, ctx.tags, measurement,
+                                        startTime, endTime, aggregationInterval, fullWidth, bucketAnchor);
+                                }
+                                if (reduced.has_value()) {
+                                    if (!reduced->fields.empty()) {
+                                        nonNumericResults.push_back(std::move(*reduced));
+                                    }
+                                    co_return;
+                                }
+                                // The read says the series is numeric after all
+                                // (type probe raced a concurrent write?) — fall
+                                // through to the standard flow, which handles
+                                // every type.
+                            } catch (const std::exception& e) {
+                                routedFailed = true;
+                                routedReason = e.what();
+                            }
+                            if (routedFailed) {
+                                timestar::http_log.error(
+                                    "[QUERY] Dropping series '{}' on shard {} from result: {}. The response will "
+                                    "be INCOMPLETE.",
+                                    ctx.seriesKey, shardId, routedReason);
+                                ++droppedSeries;
+                                if (firstDropReason.empty()) {
+                                    firstDropReason = routedReason;
+                                }
+                                co_return;
+                            }
+                        }
+                    }
+
                     // ---- PUSHDOWN PATH ----
                     // Try aggregating directly from TSM blocks, skipping the
                     // full TSMResult → QueryResult → SeriesResult pipeline.
@@ -1456,9 +1641,12 @@ static seastar::future<ShardQueryResult> executeShardQuery(
     // aligned to the same epoch buckets as the numeric aggregation.  Applied
     // uniformly to values collected on the streaming path and the standard
     // fallback path so the result shape does not depend on the query plan.
+    // Series routed through the bounded non-numeric paths arrive already
+    // bucketed; re-reducing bucketed data is the identity, so applying it
+    // uniformly here stays correct and keeps one rule for every source.
     if (aggregationInterval > 0) {
         for (auto& sr : nonNumericResults) {
-            bucketNonNumericResultLatest(sr, aggregationInterval, bucketAnchor);
+            co_await bucketNonNumericResultLatest(sr, aggregationInterval, bucketAnchor);
         }
     }
 

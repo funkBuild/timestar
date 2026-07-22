@@ -193,6 +193,18 @@ seastar::future<std::optional<SeriesResult>> queryNonNumericBucketedChunked(
     std::map<std::string, std::string> tags, std::string measurement, uint64_t startTime, uint64_t endTime,
     uint64_t interval, uint64_t initialChunkWidth = 0, uint64_t bucketAnchor = 0);
 
+// Bucketed LATEST for a BOOLEAN series via the numeric bucketed-LATEST
+// pushdown (true/false folded as 1.0/0.0, converted back on return — exact,
+// since LATEST selects rather than computes).  nullopt when the fast path is
+// not applicable (LWW overlap, string series, unknown series); the caller
+// falls back to the bounded chunked read.  Epoch grid only — anchored
+// (bucketAnchor != 0) queries must not call this.
+seastar::future<std::optional<SeriesResult>> queryBoolLatestBucketed(Engine& engine, const std::string& seriesKey,
+                                                                     SeriesId128 seriesId, const std::string& field,
+                                                                     std::map<std::string, std::string> tags,
+                                                                     std::string measurement, uint64_t startTime,
+                                                                     uint64_t endTime, uint64_t interval);
+
 }  // namespace detail
 
 }  // namespace timestar::http

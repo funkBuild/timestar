@@ -782,7 +782,13 @@ static size_t aggregateMemoryStores(const std::vector<seastar::shared_ptr<Memory
 
 seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAggregated(
     SeriesId128 seriesId, uint64_t startTime, uint64_t endTime, uint64_t aggregationInterval,
-    timestar::AggregationMethod method, bool foldNoInterval) {
+    timestar::AggregationMethod method, bool foldNoInterval, bool boolLatestAsNumeric) {
+    // The boolean relaxation exists only for the canonical non-numeric
+    // interval reduction (LATEST-per-bucket); any other shape must keep the
+    // full non-numeric gates, so the flag is dropped rather than trusted.
+    if (boolLatestAsNumeric && !(method == timestar::AggregationMethod::LATEST && aggregationInterval > 0)) {
+        boolLatestAsNumeric = false;
+    }
     // Gate 0.5: MEDIAN and EXACT_MEDIAN need all raw values — cannot use
     // pushdown aggregation.  T-digest is used at merge time for cross-shard
     // aggregation, not during per-value accumulation (rawValues is faster).
@@ -810,7 +816,20 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
     }
 
     // Non-numeric series (Boolean, String) never aggregate arithmetically.
-    if (seriesIsNonNumericInMemory(pinnedStores, seriesId)) {
+    // Exception: under boolLatestAsNumeric a BOOLEAN series may fold as
+    // 1.0/0.0 through the bucketed LATEST fast path (the caller converts the
+    // selected per-bucket values back to true/false — LATEST only selects,
+    // never computes, so the round-trip is exact).  Strings never pass.
+    if (boolLatestAsNumeric) {
+        for (const auto& store : pinnedStores) {
+            if (auto type = store->getSeriesType(seriesId)) {
+                if (*type == TSMValueType::String) {
+                    co_return std::nullopt;
+                }
+                break;
+            }
+        }
+    } else if (seriesIsNonNumericInMemory(pinnedStores, seriesId)) {
         co_return std::nullopt;
     }
 
@@ -909,7 +928,21 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
     // survives, exactly as for every other method (CLAUDE.md "Aggregation
     // Result Shape").  There is no single point to seek to, so those queries
     // fall through to the normal pushdown and return raw sorted vectors.
-    if ((isLatest || isFirst) && aggregationInterval > 0) {
+    //
+    // DENSE bucket grids do not come here either: the selective scan issues
+    // one DMA read PER BLOCK (early termination needs decode-as-you-go), so
+    // once the grid is fine enough that nearly every block decides some
+    // bucket, the scan degenerates into thousands of small random reads where
+    // the general pushdown below reads the same blocks in contiguous batched
+    // group reads (the R6 lesson: batch or pay per-op).  256 covers the
+    // dashboard shapes this path exists for (1..few hundred buckets) while
+    // dense analytics grids keep the batched plan.
+    constexpr size_t kSelectiveBucketScanMaxBuckets = 256;
+    const size_t plannedBuckets =
+        aggregationInterval > 0
+            ? static_cast<size_t>((tsmEndTime / aggregationInterval) - (startTime / aggregationInterval)) + 1
+            : 0;
+    if ((isLatest || isFirst) && aggregationInterval > 0 && plannedBuckets <= kSelectiveBucketScanMaxBuckets) {
         // Snapshot the TSM file map so that compaction cannot mutate it
         // mid-iteration across co_await suspension points.
         std::vector<std::pair<uint64_t, seastar::shared_ptr<TSM>>> seqFilesSnap(
@@ -927,8 +960,13 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
             // Float and Integer support pushdown aggregation.  String and
             // Boolean are non-numeric: they never aggregate arithmetically, so
             // they bypass pushdown and are returned in their written type by the
-            // caller (raw, or LATEST-per-bucket with an interval).
-            if (isNonNumericValueType(*type)) {
+            // caller (raw, or LATEST-per-bucket with an interval).  Under
+            // boolLatestAsNumeric a Boolean series IS admitted here: this fast
+            // path only SELECTS per-bucket points (never computes), so folding
+            // as 1.0/0.0 and converting back is exact — and it is what lets a
+            // bool status series answer from one block instead of a full-range
+            // materialisation.
+            if (isNonNumericValueType(*type) && !(boolLatestAsNumeric && *type == TSMValueType::Boolean)) {
                 co_return std::nullopt;
             }
             candidateFiles.push_back(tsmFile);
@@ -1155,8 +1193,14 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
             continue;
 
         // Float and Integer support pushdown; String and Boolean are
-        // non-numeric and never aggregate arithmetically.
-        if (isNonNumericValueType(indexEntry->seriesType)) {
+        // non-numeric and never aggregate arithmetically.  Under
+        // boolLatestAsNumeric a Boolean series is admitted (bucketed LATEST
+        // only selects per-bucket points — folding 1.0/0.0 and converting
+        // back is exact), which gives dense-bucket bool queries the same
+        // batched read plan as numeric fields instead of a full-range
+        // materialisation.
+        if (isNonNumericValueType(indexEntry->seriesType) &&
+            !(boolLatestAsNumeric && indexEntry->seriesType == TSMValueType::Boolean)) {
             hasNonFloat = true;
             break;
         }
@@ -1207,7 +1251,8 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
                 break;
             }
         }
-        if (seriesTypeKnown && isNonNumericValueType(seriesValueType)) {
+        if (seriesTypeKnown && isNonNumericValueType(seriesValueType) &&
+            !(boolLatestAsNumeric && seriesValueType == TSMValueType::Boolean)) {
             co_return std::nullopt;  // same rule as the TSM-side gate above
         }
     }
@@ -1285,6 +1330,19 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
             auto merged = co_await queryTsm<int64_t>(std::string{}, seriesId, lo, hi);
             if (!merged.timestamps.empty()) {
                 std::vector<double> vals(merged.values.begin(), merged.values.end());
+                aggregator.addPoints(merged.timestamps, vals);
+            }
+        } else if (seriesValueType == TSMValueType::Boolean) {
+            // Reached only under boolLatestAsNumeric (the type gates above
+            // refuse Boolean otherwise).  Decode with the real type — a
+            // <double> read of a bool block throws — then fold as 1.0/0.0.
+            auto merged = co_await queryTsm<bool>(std::string{}, seriesId, lo, hi);
+            if (!merged.timestamps.empty()) {
+                std::vector<double> vals;
+                vals.reserve(merged.values.size());
+                for (size_t i = 0; i < merged.values.size(); ++i) {
+                    vals.push_back(merged.values[i] ? 1.0 : 0.0);
+                }
                 aggregator.addPoints(merged.timestamps, vals);
             }
         } else {
@@ -1376,6 +1434,23 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
     }
 
     co_return result;
+}
+
+// No-I/O type probe: memory stores first (newest truth), then TSM sparse
+// indexes.  A series holds one type for its lifetime (enforced on write), so
+// the first source that knows it is authoritative.
+std::optional<TSMValueType> QueryRunner::localSeriesValueType(const SeriesId128& seriesId) {
+    for (const auto& store : walFileManager->pinMemoryStores()) {
+        if (auto type = store->getSeriesType(seriesId)) {
+            return type;
+        }
+    }
+    for (const auto& [seq, tsmFile] : fileManager->getSequencedTsmFiles()) {
+        if (auto type = tsmFile->getSeriesType(seriesId)) {
+            return type;
+        }
+    }
+    return std::nullopt;
 }
 
 // Template instantiations

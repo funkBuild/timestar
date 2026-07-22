@@ -230,10 +230,20 @@ public:
     // must survive, and LATEST/FIRST — the only methods that collapse by
     // definition — do so inside the runner regardless of this flag.  Both
     // production call sites pass false explicitly; no caller should need true.
+    //
+    // boolLatestAsNumeric admits BOOLEAN series to the bucketed LATEST fast
+    // path, folding true/false as 1.0/0.0 (LATEST selects, never computes, so
+    // the caller's conversion back to bool is exact).  Honoured only for
+    // method == LATEST with aggregationInterval > 0; see
+    // QueryRunner::queryTsmAggregated.
     seastar::future<std::optional<timestar::PushdownResult>> queryAggregated(
         const std::string& seriesKey, const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime,
         uint64_t aggregationInterval, timestar::AggregationMethod method = timestar::AggregationMethod::AVG,
-        bool foldNoInterval = false);
+        bool foldNoInterval = false, bool boolLatestAsNumeric = false);
+
+    // No-I/O probe of a series' value type from this shard's memory stores and
+    // TSM sparse indexes.  nullopt when the series is unknown on this shard.
+    std::optional<TSMValueType> localSeriesValueType(const SeriesId128& seriesId);
 
     // Batch LATEST/FIRST: resolve latest (or first) value for multiple series
     // in a single pass over TSM files and memory stores.  Avoids per-series
