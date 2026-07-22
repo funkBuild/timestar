@@ -15,6 +15,7 @@
 #include <seastar/core/fstream.hh>
 #include <seastar/core/loop.hh>
 #include <seastar/core/seastar.hh>
+#include <seastar/util/later.hh>
 #include <string_view>
 
 // Block header: uint8_t type + uint32_t timestampSize + uint32_t timestampBytes
@@ -686,9 +687,11 @@ seastar::future<TSMIndexEntry*> TSM::getFullIndexEntry(const SeriesId128& series
         co_return nullptr;
     }
 
-    // Step 4: Single DMA read for entire series entry
+    // Step 4: Single DMA read for entire series entry (through the read
+    // elevator: concurrent per-series index misses in the same reactor tick
+    // coalesce — index entries are adjacent in the index region).
     const auto& sparse = sparseIt->second;
-    auto entryBuf = co_await tsmFile.dma_read_exactly<uint8_t>(sparse.fileOffset, sparse.entrySize);
+    auto entryBuf = co_await coalescedDmaRead(sparse.fileOffset, sparse.entrySize);
 
     // Step 5: Parse the full entry
     Slice entrySlice(entryBuf.get(), entryBuf.size());
@@ -952,6 +955,86 @@ const std::vector<TSMIndexBlock>& TSM::getSeriesBlocks(const SeriesId128& series
     return empty;
 }
 
+// --- Read elevator (see the header for the full contract) ---
+
+seastar::future<seastar::temporary_buffer<uint8_t>> TSM::coalescedDmaRead(uint64_t offset, uint64_t size) {
+    auto pending = std::make_unique<PendingDmaRead>();
+    pending->offset = offset;
+    pending->size = size;
+    auto fut = pending->done.get_future();
+    _pendingDmaReads.push_back(std::move(pending));
+    if (!_dmaDispatchScheduled) {
+        _dmaDispatchScheduled = true;
+        // Defer to the back of the current task-queue run so every request
+        // from concurrently-runnable series lands in this dispatch round.
+        (void)seastar::yield().then([this] { return dispatchPendingDmaReads(); });
+    }
+    return fut;
+}
+
+seastar::future<> TSM::dispatchPendingDmaReads() {
+    _dmaDispatchScheduled = false;
+    auto pending = std::exchange(_pendingDmaReads, {});
+    if (pending.empty()) {
+        co_return;
+    }
+
+    std::sort(pending.begin(), pending.end(),
+              [](const std::unique_ptr<PendingDmaRead>& a, const std::unique_ptr<PendingDmaRead>& b) {
+                  return a->offset < b->offset;
+              });
+
+    // Merge requests whose gaps are cheaper to read through than to seek
+    // past.  Gap bytes cost sequential bandwidth; a separate request costs an
+    // IOP — on IOPS-billed volumes the 128KB trade is heavily in favour of
+    // reading through.  The cap bounds the transient buffer a merged read
+    // pins (every share() view holds the whole buffer alive until dropped).
+    static constexpr uint64_t kMergeGapBytes = 128 * 1024;
+    static constexpr uint64_t kMaxMergedRead = 8 * 1024 * 1024;
+
+    struct MergedRange {
+        uint64_t start = 0;
+        uint64_t end = 0;  // exclusive
+        size_t firstReq = 0;
+        size_t lastReq = 0;  // inclusive
+    };
+    std::vector<MergedRange> ranges;
+    ranges.push_back({pending[0]->offset, pending[0]->offset + pending[0]->size, 0, 0});
+    for (size_t i = 1; i < pending.size(); ++i) {
+        auto& cur = ranges.back();
+        const uint64_t reqStart = pending[i]->offset;
+        const uint64_t reqEnd = reqStart + pending[i]->size;
+        const uint64_t mergedEnd = std::max(cur.end, reqEnd);
+        if (reqStart <= cur.end + kMergeGapBytes && mergedEnd - cur.start <= kMaxMergedRead) {
+            cur.end = mergedEnd;
+            cur.lastReq = i;
+        } else {
+            ranges.push_back({reqStart, reqEnd, i, i});
+        }
+    }
+
+    co_await seastar::parallel_for_each(ranges, [this, &pending](const MergedRange& range) -> seastar::future<> {
+        std::exception_ptr ep;
+        seastar::temporary_buffer<uint8_t> buf;
+        try {
+            buf = co_await tsmFile.dma_read_exactly<uint8_t>(range.start, range.end - range.start);
+        } catch (...) {
+            ep = std::current_exception();
+        }
+        for (size_t i = range.firstReq; i <= range.lastReq; ++i) {
+            auto& req = *pending[i];
+            if (ep) {
+                req.done.set_exception(ep);
+            } else if (req.offset - range.start + req.size > buf.size()) {
+                req.done.set_exception(std::make_exception_ptr(
+                    std::runtime_error("coalesced DMA read came back short: file truncated under a live query")));
+            } else {
+                req.done.set_value(buf.share(req.offset - range.start, req.size));
+            }
+        }
+    });
+}
+
 // Rethrow the in-flight exception with this file's path appended (see the
 // declaration for the full contract: bad_alloc passes through, annotation is
 // idempotent, and the BlockDecodeError type is preserved so callers that
@@ -1006,7 +1089,7 @@ seastar::future<std::unique_ptr<TSMBlock<T>>> TSM::readSingleBlockImpl(const TSM
         endTime = UINT64_MAX;
     }
 
-    auto blockBuf = co_await tsmFile.dma_read_exactly<uint8_t>(indexBlock.offset, indexBlock.size);
+    auto blockBuf = co_await coalescedDmaRead(indexBlock.offset, indexBlock.size);
     Slice blockSlice(blockBuf.get(), blockBuf.size());
 
     if (indexBlock.size < BLOCK_HEADER_SIZE) {
@@ -1423,8 +1506,10 @@ static size_t decodeBlockFlat(const uint8_t* data, uint32_t blockSize, uint64_t 
 template <class T>
 seastar::future<> TSM::readBlockBatch(const BlockBatch& batch, uint64_t startTime, uint64_t endTime,
                                       TSMResult<T>& results, const std::vector<std::string>* stringDict) {
-    // Single large DMA read for entire batch
-    auto batchBuf = co_await tsmFile.dma_read_exactly<uint8_t>(batch.startOffset, batch.totalSize);
+    // Single large read for the entire batch, via the read elevator so that
+    // batches from OTHER series running in the same reactor tick merge into
+    // shared large reads (series regions sit back to back in the file).
+    auto batchBuf = co_await coalescedDmaRead(batch.startOffset, batch.totalSize);
 
     // Decode all blocks in this batch into a single flat TSMBlock.
     // Blocks within a batch are contiguous and sorted by offset (= time order),
@@ -1695,8 +1780,9 @@ seastar::future<size_t> TSM::aggregateSeriesImpl(const SeriesId128& seriesId, ui
             ioUnits = co_await seastar::get_units(*ioSem, 1);
         }
 
-        // Single DMA read for the entire batch
-        auto batchBuf = co_await tsmFile.dma_read_exactly<uint8_t>(batch.startOffset, batch.totalSize);
+        // Single read for the entire batch (elevator: merges with concurrent
+        // series' batch reads in the same dispatch round)
+        auto batchBuf = co_await coalescedDmaRead(batch.startOffset, batch.totalSize);
 
         // Release I/O semaphore after DMA completes — decode is CPU-only
         ioUnits.reset();

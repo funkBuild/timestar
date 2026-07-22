@@ -49,15 +49,20 @@ protected:
     // readSingleBlockImpl, so prefer that and fall back to the public name.
     std::string extractReadSingleBlock() const {
         auto pos = sourceCode.find("TSM::readSingleBlockImpl");
-        if (pos == std::string::npos) pos = sourceCode.find("TSM::readSingleBlock");
-        if (pos == std::string::npos) return "";
+        if (pos == std::string::npos)
+            pos = sourceCode.find("TSM::readSingleBlock");
+        if (pos == std::string::npos)
+            return "";
         auto braceStart = sourceCode.find('{', pos);
-        if (braceStart == std::string::npos) return "";
+        if (braceStart == std::string::npos)
+            return "";
         int depth = 1;
         size_t i = braceStart + 1;
         while (i < sourceCode.size() && depth > 0) {
-            if (sourceCode[i] == '{') depth++;
-            else if (sourceCode[i] == '}') depth--;
+            if (sourceCode[i] == '{')
+                depth++;
+            else if (sourceCode[i] == '}')
+                depth--;
             i++;
         }
         return sourceCode.substr(pos, i - pos);
@@ -80,15 +85,18 @@ TEST_F(TlStringDictStaleTest, LocalDictCapturedBeforeCoAwait) {
     std::string body = extractReadSingleBlock();
     ASSERT_FALSE(body.empty()) << "Could not find readSingleBlock function";
 
-    // Verify localDict is set from the explicit stringDict parameter before co_await.
+    // Verify localDict is set from the explicit stringDict parameter before
+    // the first suspension point (the block read — direct DMA or the read
+    // elevator's coalescedDmaRead).
     auto localDictPos = body.find("localDict = stringDict");
-    auto coAwaitPos = body.find("co_await tsmFile.dma_read_exactly");
+    auto coAwaitPos = body.find("co_await coalescedDmaRead");
+    if (coAwaitPos == std::string::npos) {
+        coAwaitPos = body.find("co_await tsmFile.dma_read_exactly");
+    }
     ASSERT_NE(localDictPos, std::string::npos)
         << "readSingleBlock must set localDict from stringDict param before co_await";
-    ASSERT_NE(coAwaitPos, std::string::npos)
-        << "readSingleBlock must contain a co_await dma_read_exactly call";
-    EXPECT_LT(localDictPos, coAwaitPos)
-        << "localDict must be set BEFORE the co_await suspension point";
+    ASSERT_NE(coAwaitPos, std::string::npos) << "readSingleBlock must contain the block-read co_await";
+    EXPECT_LT(localDictPos, coAwaitPos) << "localDict must be set BEFORE the co_await suspension point";
 }
 
 TEST_F(TlStringDictStaleTest, TlStringDictNotUsedInReadSingleBlock) {

@@ -285,6 +285,32 @@ private:
     // stack file suffixes.
     [[noreturn]] void rethrowWithFilePath() const;
 
+    // --- Cross-series DMA read coalescing (the read elevator) ---
+    // A many-series query runs up to 64 series concurrently, and each
+    // (series, file) pair issues its own data-block DMA read — thousands of
+    // small random reads per query on IOPS-billed storage, even though the
+    // wanted ranges are frequently adjacent in the file (series regions are
+    // laid out back to back).  coalescedDmaRead() queues the request and
+    // defers ONE dispatcher to the end of the current task-queue run: every
+    // read requested by concurrently-running series in that window is sorted
+    // by offset, merged across small gaps, and issued as a few large reads;
+    // each requester gets a zero-copy share() view of the merged buffer.
+    // Single-request rounds degenerate to exactly one read plus a yield hop.
+    //
+    // Lifetime: every pending request has a caller co_awaiting its future,
+    // and query callers hold shared_ptr<TSM> across that await, so `this`
+    // cannot die while the detached dispatch continuation is outstanding.
+    // The dispatcher resolves EVERY pending promise (value or exception).
+    struct PendingDmaRead {
+        uint64_t offset = 0;
+        uint64_t size = 0;
+        seastar::promise<seastar::temporary_buffer<uint8_t>> done;
+    };
+    std::vector<std::unique_ptr<PendingDmaRead>> _pendingDmaReads;
+    bool _dmaDispatchScheduled = false;
+    seastar::future<seastar::temporary_buffer<uint8_t>> coalescedDmaRead(uint64_t offset, uint64_t size);
+    seastar::future<> dispatchPendingDmaReads();
+
     // Un-annotated bodies of the public read entry points below.  The public
     // methods are thin wrappers that route any failure through
     // rethrowWithFilePath(); keeping the bodies separate avoids wrapping
