@@ -130,7 +130,10 @@ The codebase is organized around these key abstractions:
    - String values compressed using zstd compression with variable-length prefixes
 
 3. **WAL** (`lib/storage/wal.hpp/cpp`) - Write-Ahead Log for durability
-   - Ensures data persistence before acknowledgment
+   - Ensures data persistence before acknowledgment via group commit
+     (`[storage] wal_sync_mode = "always"`, the default: acks wait for a
+     shared flush+fdatasync round; `"interval"` bounds the loss window in
+     time instead; `"rollover"` is the legacy volatile-until-rotation mode)
    - Used to recover in-memory stores on restart
    - Supports write, delete, and delete-range operations
 

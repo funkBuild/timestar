@@ -15,6 +15,8 @@
 #include <seastar/core/iostream.hh>
 #include <seastar/core/seastar.hh>
 #include <seastar/core/semaphore.hh>
+#include <seastar/core/shared_future.hh>
+#include <seastar/core/timer.hh>
 #include <string>
 #include <vector>
 
@@ -127,6 +129,35 @@ private:
 
     // Flush controls
     bool requiresImmediateFlush = false;  // if true, flush after each write/batch
+
+    // --- Group commit (wal_sync_mode) ---
+    // An acknowledged write is only durable once its bytes have been drained
+    // to disk AND fdatasync'd.  The stream buffer alone is NOT durability: a
+    // SIGKILL loses the current partial buffer (up to 256KiB of ACKED bytes),
+    // and because the window is bytes — not time — an RLE-compressed bool
+    // series loses 10-100x more points than a float series, and a slow shard
+    // holds acked data volatile indefinitely (quantified Jul 22 2026).
+    enum class SyncMode : uint8_t { Always, Interval, Rollover };
+    SyncMode _syncMode = SyncMode::Always;
+
+    // Monotonic append ticket: bumped after every completed stream append.
+    // _syncedSeq is the ticket frontier known durable.  ensureDurable(t)
+    // returns once _syncedSeq >= t.
+    uint64_t _appendSeq = 0;
+    uint64_t _syncedSeq = 0;
+    // One flush round runs at a time; concurrent writers share it.  The
+    // leader pads + flushes everything appended so far; followers wait on the
+    // round's shared future and re-check (a follower whose bytes landed after
+    // the leader captured its target becomes the next leader).
+    bool _syncRunning = false;
+    std::optional<seastar::shared_promise<>> _syncRound;
+    // Waits until every append with ticket <= upTo is durable.  Throws if the
+    // flush fails — the caller must NOT ack in that case.
+    seastar::future<> ensureDurable(uint64_t upTo);
+
+    // Interval mode: periodic background flush (ack-immediate, bounded loss
+    // window).  Armed in init(), cancelled in close().
+    seastar::timer<> _flushTimer;
 
     // Concurrency control (split encoding from I/O for parallelism):
     //   _encode_sem: bounds concurrent encoding coroutines (memory control).

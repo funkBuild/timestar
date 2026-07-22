@@ -1,5 +1,6 @@
 // Seastar-based tests for WAL write and recovery operations
 
+#include "../../../lib/config/timestar_config.hpp"
 #include "../../../lib/core/timestar_value.hpp"
 #include "../../../lib/storage/memory_store.hpp"
 #include "../../../lib/storage/wal.hpp"
@@ -12,6 +13,7 @@
 #include <memory>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/when_all.hh>
+#include <seastar/util/defer.hh>
 
 namespace fs = std::filesystem;
 
@@ -422,6 +424,17 @@ TEST_F(WALSeastarTest, CRC32CorruptionDetection) {
 seastar::future<> testCRC32PartialCorruption() {
     unsigned int sequenceNumber = 202;
     auto store = std::make_shared<MemoryStore>(sequenceNumber);
+
+    // This test corrupts the file by RAW BYTE OFFSET, assuming entry 2 starts
+    // immediately after entry 1.  Group commit (wal_sync_mode="always", the
+    // default) inserts alignment padding between per-insert flush rounds,
+    // which would put the corruption inside padding instead of entry 2 — so
+    // pin the legacy contiguous layout for the duration of this test.
+    const auto savedConfig = timestar::config();
+    auto cfg = savedConfig;
+    cfg.storage.wal_sync_mode = "rollover";
+    timestar::setGlobalConfig(cfg);
+    auto restoreConfig = seastar::defer([&savedConfig]() noexcept { timestar::setGlobalConfig(savedConfig); });
 
     {
         WAL wal(sequenceNumber);
@@ -1059,9 +1072,7 @@ seastar::future<> testConcurrentInsertsNoDataLoss() {
                 TimeStarInsert<double> insert("concurrent_test", seriesKey);
                 // Each series gets 10 points with values derived from its index
                 for (int j = 0; j < 10; ++j) {
-                    insert.addValue(
-                        static_cast<uint64_t>(i * 1000 + j),
-                        static_cast<double>(i * 100 + j));
+                    insert.addValue(static_cast<uint64_t>(i * 1000 + j), static_cast<double>(i * 100 + j));
                 }
                 co_return co_await wal.insert(insert);
             }();
@@ -1101,8 +1112,7 @@ seastar::future<> testConcurrentInsertsNoDataLoss() {
             continue;
 
         auto& seriesData = std::get<InMemorySeries<double>>(it->second);
-        EXPECT_EQ(seriesData.values.size(), 10u)
-            << "Series " << seriesKey << " should have 10 points";
+        EXPECT_EQ(seriesData.values.size(), 10u) << "Series " << seriesKey << " should have 10 points";
         if (seriesData.values.size() != 10u)
             continue;
 

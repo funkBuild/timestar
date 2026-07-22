@@ -127,11 +127,44 @@ seastar::future<> WAL::init(MemoryStore* /*store*/, bool isRecovery) {
     seastar::file_output_stream_options opts;
     opts.buffer_size = 262144;  // 256 KiB — larger buffer reduces flush frequency under high write load
     opts.write_behind = 4;      // Allow 4 buffers in-flight concurrently to overlap I/O
-    opts.preallocation_size = 16 * 1024 * 1024;  // Pre-allocate 16 MiB (WAL max size) to reduce fragmentation
+    // Pre-allocate the full segment (matches wal_size_threshold; this was a
+    // stale 16 MiB after the threshold default moved to 64 MB).
+    opts.preallocation_size = maxWalSize_;
     auto s = co_await seastar::make_file_output_stream(walFile, opts);
     out.emplace(std::move(s));
 
-    timestar::wal_log.debug("WAL stream init: pos={}, dma_alignment={}", currentSize, _dma_alignment);
+    // Durability mode (see wal_sync_mode in timestar_config.hpp).  Validation
+    // already rejected unknown strings; default to the safe mode regardless.
+    const std::string& mode = timestar::config().storage.wal_sync_mode;
+    if (mode == "rollover") {
+        _syncMode = SyncMode::Rollover;
+    } else if (mode == "interval") {
+        _syncMode = SyncMode::Interval;
+        // Ack-immediate with a bounded loss window: a periodic round makes
+        // everything appended so far durable.  The callback only STARTS work;
+        // the round itself runs under the io gate so close() waits for it.
+        _flushTimer.set_callback([this] {
+            if (_closed || _syncRunning || _syncedSeq >= _appendSeq) {
+                return;
+            }
+            std::optional<seastar::gate::holder> holder;
+            try {
+                holder.emplace(_io_gate.hold());
+            } catch (...) {
+                return;  // gate closed — shutting down
+            }
+            (void)ensureDurable(_appendSeq)
+                .handle_exception(
+                    [](std::exception_ptr ep) { timestar::wal_log.error("WAL periodic flush failed: {}", ep); })
+                .finally([holder = std::move(holder)] {});
+        });
+        _flushTimer.arm_periodic(std::chrono::milliseconds(timestar::config().storage.wal_sync_interval_ms));
+    } else {
+        _syncMode = SyncMode::Always;
+    }
+
+    timestar::wal_log.debug("WAL stream init: pos={}, dma_alignment={}, sync_mode={}", currentSize, _dma_alignment,
+                            mode);
 }
 
 std::string WAL::sequenceNumberToFilename(unsigned int sequenceNumber) {
@@ -150,6 +183,7 @@ seastar::future<> WAL::finalFlush() {
         co_await padToAlignment();
         co_await out->flush();  // drains buffers and fsyncs the sink
         _unflushed_bytes = 0;
+        _syncedSeq = _appendSeq;
         timestar::wal_log.debug("WAL final flush completed, currentSize={}", currentSize);
     } catch (const std::exception& e) {
         timestar::wal_log.error("WAL final flush error: {}", e.what());
@@ -166,6 +200,11 @@ seastar::future<> WAL::close() {
     _closed = true;
     timestar::wal_log.debug("WAL seq={} starting close", sequenceNumber);
 
+    // Stop the periodic flusher before draining: its callback checks _closed,
+    // and any round it already launched holds the io gate, so the close()
+    // below waits for it.
+    _flushTimer.cancel();
+
     // Wait for all in-flight operations to complete before closing
     timestar::wal_log.debug("WAL seq={} waiting for in-flight operations to complete", sequenceNumber);
     co_await _io_gate.close();
@@ -180,6 +219,7 @@ seastar::future<> WAL::close() {
             co_await padToAlignment();
             co_await out->flush();
             _unflushed_bytes = 0;
+            _syncedSeq = _appendSeq;
             timestar::wal_log.debug("WAL seq={} final flush completed before close", sequenceNumber);
         } catch (const std::exception& e) {
             timestar::wal_log.error("WAL seq={} final flush error during close: {}", sequenceNumber, e.what());
@@ -286,6 +326,58 @@ seastar::future<> WAL::padToAlignment() {
 
     _unflushed_bytes += padding;
     currentSize += padding;
+}
+
+// Group commit: make every append with ticket <= upTo durable (drained to
+// disk + fdatasync'd), sharing one flush round across all concurrent waiters.
+//
+// The first waiter to find no round in flight becomes the LEADER: it takes
+// the stream lock (_io_sem — flush must never interleave with a write), then
+// captures the append frontier, so every write that finished before the lock
+// was granted is covered by this round.  Everyone else waits on the round's
+// shared future and re-checks: a writer whose bytes landed after the leader's
+// capture simply becomes the next leader.  Flush rate therefore self-limits
+// to one round per flush latency with NO artificial delay — under load, one
+// fdatasync covers every writer that arrived during the previous round.
+//
+// Padding: an O_DIRECT stream can only flush at DMA-aligned positions, so
+// each round pads the tail (recovery skips padding entries anywhere in the
+// file).  This is the same padding a requiresImmediateFlush write does; the
+// round structure just amortises it across the group.
+//
+// Throws when the flush fails; callers must NOT ack the write in that case
+// (the bytes may not be durable).  Followers of a failed round see the same
+// exception via the shared future.
+seastar::future<> WAL::ensureDurable(uint64_t upTo) {
+    while (_syncedSeq < upTo) {
+        if (_syncRunning) {
+            co_await _syncRound->get_shared_future();
+            continue;
+        }
+        _syncRunning = true;
+        _syncRound.emplace();
+        std::exception_ptr ep;
+        try {
+            auto io_units = co_await seastar::get_units(_io_sem, 1);
+            const uint64_t target = _appendSeq;
+            if (!out) {
+                throw std::runtime_error("WAL output stream is null in ensureDurable");
+            }
+            co_await padToAlignment();
+            co_await out->flush();  // drains write-behind buffers, then fdatasync
+            _unflushed_bytes = 0;
+            _syncedSeq = target;
+        } catch (...) {
+            ep = std::current_exception();
+        }
+        _syncRunning = false;
+        auto round = std::exchange(_syncRound, std::nullopt);
+        if (ep) {
+            round->set_exception(ep);
+            std::rethrow_exception(ep);
+        }
+        round->set_value();
+    }
 }
 
 template <class T>
@@ -527,6 +619,7 @@ seastar::future<WALInsertResult> WAL::insert(TimeStarInsert<T>& insertRequest) {
         co_return WALInsertResult::RolloverNeeded;
     }
 
+    uint64_t myTicket = 0;
     try {
         if (!out) {
             throw std::runtime_error("WAL output stream is null");
@@ -534,15 +627,25 @@ seastar::future<WALInsertResult> WAL::insert(TimeStarInsert<T>& insertRequest) {
         co_await out->write(reinterpret_cast<const char*>(buffer.data.data()), dataSize);
         currentSize += dataSize;
         _unflushed_bytes += dataSize;
+        myTicket = ++_appendSeq;
 
         if (requiresImmediateFlush) {
             co_await padToAlignment();
             co_await out->flush();
             _unflushed_bytes = 0;
+            _syncedSeq = _appendSeq;
         }
     } catch (const std::exception& e) {
         timestar::wal_log.error("WAL::insert write failed: {}", e.what());
         throw;
+    }
+
+    // Group commit: an acked write must be durable.  Release the stream lock
+    // first — the flush round acquires it itself, and holding it here would
+    // deadlock the leader.  See ensureDurable().
+    if (_syncMode == SyncMode::Always && _syncedSeq < myTicket) {
+        io_units.return_all();
+        co_await ensureDurable(myTicket);
     }
 
     co_return WALInsertResult::Success;
@@ -602,6 +705,7 @@ seastar::future<WALInsertResult> WAL::insertBatch(std::vector<TimeStarInsert<T>>
         co_return WALInsertResult::RolloverNeeded;
     }
 
+    uint64_t myTicket = 0;
     try {
         if (!out) {
             throw std::runtime_error("WAL output stream is null in insertBatch");
@@ -609,15 +713,23 @@ seastar::future<WALInsertResult> WAL::insertBatch(std::vector<TimeStarInsert<T>>
         co_await out->write(reinterpret_cast<const char*>(buffer.data.data()), totalSize);
         currentSize += totalSize;
         _unflushed_bytes += totalSize;
+        myTicket = ++_appendSeq;
 
         if (requiresImmediateFlush) {
             co_await padToAlignment();
             co_await out->flush();
             _unflushed_bytes = 0;
+            _syncedSeq = _appendSeq;
         }
     } catch (const std::exception& e) {
         timestar::wal_log.error("WAL::insertBatch write failed: {}", e.what());
         throw;
+    }
+
+    // Group commit — see insert() and ensureDurable().
+    if (_syncMode == SyncMode::Always && _syncedSeq < myTicket) {
+        io_units.return_all();
+        co_await ensureDurable(myTicket);
     }
 
     co_return WALInsertResult::Success;
@@ -663,6 +775,7 @@ seastar::future<> WAL::deleteRange(const SeriesId128& seriesId, uint64_t startTi
     auto gate_holder = _io_gate.hold();
     auto units = co_await seastar::get_units(_io_sem, 1);
 
+    uint64_t myTicket = 0;
     try {
         if (!out) {
             throw std::runtime_error("WAL output stream is null in deleteRange");
@@ -670,16 +783,25 @@ seastar::future<> WAL::deleteRange(const SeriesId128& seriesId, uint64_t startTi
         co_await out->write(reinterpret_cast<const char*>(buffer.data.data()), n);
         currentSize += n;
         _unflushed_bytes += n;
+        myTicket = ++_appendSeq;
 
         // Only flush immediately if configured for immediate mode
         if (requiresImmediateFlush) {
             co_await padToAlignment();
             co_await out->flush();
             _unflushed_bytes = 0;
+            _syncedSeq = _appendSeq;
         }
     } catch (const std::exception& e) {
         timestar::wal_log.error("WAL::deleteRange write failed: {}", e.what());
         throw;
+    }
+
+    // A delete is as durability-critical as a write: losing an acked delete
+    // resurrects data.  Same group commit as insert().
+    if (_syncMode == SyncMode::Always && _syncedSeq < myTicket) {
+        units.return_all();
+        co_await ensureDurable(myTicket);
     }
 
     LOG_INSERT_PATH(timestar::wal_log, debug,

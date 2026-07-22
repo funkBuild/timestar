@@ -106,6 +106,24 @@ struct StorageConfig {
     // request is retryable and costs nothing. 256MB leaves room for the
     // in-flight parse transients the parse budget already bounds.
     uint64_t ingest_min_free_bytes = 256ull * 1024 * 1024;
+    // WAL durability mode — when an acknowledged write is actually durable.
+    //   "always"   (default): group commit.  A write acks only after its bytes
+    //              are drained to disk and fdatasync'd; concurrent writers
+    //              share one flush round, so cost amortises under load.  This
+    //              is the mode that makes "persisted before acknowledgment"
+    //              true.
+    //   "interval": ack immediately; a per-WAL timer flushes+fsyncs every
+    //              wal_sync_interval_ms.  Bounds the crash-loss window in
+    //              TIME instead of bytes (the old behaviour's window was a
+    //              256KiB stream buffer that a slow shard might not fill for
+    //              hours — and it was BYTES, so RLE-compressed bool series
+    //              lost 10-100x more points than float series).
+    //   "rollover": legacy pre-Jul-2026 behaviour — durable only at segment
+    //              rollover/clean close.  An OOM-kill silently loses the
+    //              buffered tail of acked writes.  Kept for benchmarking, not
+    //              recommended for production.
+    std::string wal_sync_mode = "always";
+    uint32_t wal_sync_interval_ms = 100;  // flush cadence for "interval" mode
     CompactionConfig compaction;
 };
 
@@ -258,11 +276,12 @@ struct glz::meta<timestar::CompactionConfig> {
 template <>
 struct glz::meta<timestar::StorageConfig> {
     using T = timestar::StorageConfig;
-    static constexpr auto value = object(
-        "wal_size_threshold", &T::wal_size_threshold, "max_points_per_block", &T::max_points_per_block, "tsm_bloom_fpr",
-        &T::tsm_bloom_fpr, "tsm_cache_entries", &T::tsm_cache_entries, "wal_max_concurrent_encoders",
-        &T::wal_max_concurrent_encoders, "conversion_concurrency", &T::conversion_concurrency, "ingest_min_free_bytes",
-        &T::ingest_min_free_bytes, "compaction", &T::compaction);
+    static constexpr auto value =
+        object("wal_size_threshold", &T::wal_size_threshold, "max_points_per_block", &T::max_points_per_block,
+               "tsm_bloom_fpr", &T::tsm_bloom_fpr, "tsm_cache_entries", &T::tsm_cache_entries,
+               "wal_max_concurrent_encoders", &T::wal_max_concurrent_encoders, "conversion_concurrency",
+               &T::conversion_concurrency, "ingest_min_free_bytes", &T::ingest_min_free_bytes, "wal_sync_mode",
+               &T::wal_sync_mode, "wal_sync_interval_ms", &T::wal_sync_interval_ms, "compaction", &T::compaction);
 };
 
 template <>

@@ -76,6 +76,13 @@ std::vector<std::string> TimestarConfig::validate() const {
     if (storage.conversion_concurrency == 0) {
         errors.emplace_back("storage.conversion_concurrency must be > 0");
     }
+    if (storage.wal_sync_mode != "always" && storage.wal_sync_mode != "interval" &&
+        storage.wal_sync_mode != "rollover") {
+        errors.emplace_back("storage.wal_sync_mode must be one of: always, interval, rollover");
+    }
+    if (storage.wal_sync_interval_ms == 0) {
+        errors.emplace_back("storage.wal_sync_interval_ms must be > 0");
+    }
     if (storage.compaction.files_per_merge < 2) {
         // 1 would make every "merge" a same-tier rewrite of a single file --
         // an infinite compaction loop that never consolidates anything.
@@ -437,6 +444,8 @@ void applyEnvironmentOverrides(TimestarConfig& cfg) {
     envU32("TIMESTAR_MAX_POINTS_PER_BLOCK", cfg.storage.max_points_per_block);
     envDbl("TIMESTAR_TSM_BLOOM_FPR", cfg.storage.tsm_bloom_fpr);
     envU32("TIMESTAR_TSM_CACHE_ENTRIES", cfg.storage.tsm_cache_entries);
+    envString("TIMESTAR_WAL_SYNC_MODE", cfg.storage.wal_sync_mode);
+    envU32("TIMESTAR_WAL_SYNC_INTERVAL_MS", cfg.storage.wal_sync_interval_ms);
 
     // Compaction
     envU32("TIMESTAR_CONVERSION_CONCURRENCY", cfg.storage.conversion_concurrency);
