@@ -952,11 +952,45 @@ const std::vector<TSMIndexBlock>& TSM::getSeriesBlocks(const SeriesId128& series
     return empty;
 }
 
+// Rethrow the in-flight exception with this file's path appended (see the
+// declaration for the full contract: bad_alloc passes through, annotation is
+// idempotent, and the BlockDecodeError type is preserved so callers that
+// classify on it keep working).
+[[noreturn]] void TSM::rethrowWithFilePath() const {
+    constexpr std::string_view marker = " [tsm ";
+    try {
+        throw;
+    } catch (const std::bad_alloc&) {
+        throw;
+    } catch (const timestar::BlockDecodeError& e) {
+        if (std::string_view(e.what()).find(marker) != std::string_view::npos) {
+            throw;
+        }
+        throw timestar::BlockDecodeError(std::string(e.what()) + " [tsm " + filePath + "]");
+    } catch (const std::exception& e) {
+        if (std::string_view(e.what()).find(marker) != std::string_view::npos) {
+            throw;
+        }
+        throw std::runtime_error(std::string(e.what()) + " [tsm " + filePath + "]");
+    }
+}
+
 // Phase 1.1: Read a single block and return it (not appending to results)
 template <class T>
 seastar::future<std::unique_ptr<TSMBlock<T>>> TSM::readSingleBlock(const TSMIndexBlock& indexBlock, uint64_t startTime,
                                                                    uint64_t endTime,
                                                                    const std::vector<std::string>* stringDict) {
+    try {
+        co_return co_await readSingleBlockImpl<T>(indexBlock, startTime, endTime, stringDict);
+    } catch (...) {
+        rethrowWithFilePath();
+    }
+}
+
+template <class T>
+seastar::future<std::unique_ptr<TSMBlock<T>>> TSM::readSingleBlockImpl(const TSMIndexBlock& indexBlock,
+                                                                       uint64_t startTime, uint64_t endTime,
+                                                                       const std::vector<std::string>* stringDict) {
     // Capture the dictionary pointer before co_await.  All callers pass
     // coroutine-frame-local copies that survive DMA suspensions, so a shallow
     // pointer save is sufficient here.
@@ -1551,6 +1585,15 @@ seastar::future<> TSM::readBlockAndFold(const TSMIndexBlock& block, TSMValueType
 
 seastar::future<size_t> TSM::aggregateSeries(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime,
                                              timestar::BlockAggregator& aggregator, seastar::semaphore* ioSem) {
+    try {
+        co_return co_await aggregateSeriesImpl(seriesId, startTime, endTime, aggregator, ioSem);
+    } catch (...) {
+        rethrowWithFilePath();
+    }
+}
+
+seastar::future<size_t> TSM::aggregateSeriesImpl(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime,
+                                                 timestar::BlockAggregator& aggregator, seastar::semaphore* ioSem) {
     // Get full index entry (uses bloom filter + sparse index + lazy load)
     auto* indexEntry = co_await getFullIndexEntry(seriesId);
     if (!indexEntry) {
@@ -1729,6 +1772,16 @@ seastar::future<size_t> TSM::aggregateSeries(const SeriesId128& seriesId, uint64
 seastar::future<size_t> TSM::aggregateSeriesSelective(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime,
                                                       timestar::BlockAggregator& aggregator, bool reverse,
                                                       size_t maxPoints) {
+    try {
+        co_return co_await aggregateSeriesSelectiveImpl(seriesId, startTime, endTime, aggregator, reverse, maxPoints);
+    } catch (...) {
+        rethrowWithFilePath();
+    }
+}
+
+seastar::future<size_t> TSM::aggregateSeriesSelectiveImpl(const SeriesId128& seriesId, uint64_t startTime,
+                                                          uint64_t endTime, timestar::BlockAggregator& aggregator,
+                                                          bool reverse, size_t maxPoints) {
     auto* indexEntry = co_await getFullIndexEntry(seriesId);
     if (!indexEntry || indexEntry->seriesType == TSMValueType::String) {
         co_return 0;
@@ -1833,6 +1886,19 @@ seastar::future<size_t> TSM::aggregateSeriesBucketed(const SeriesId128& seriesId
                                                      timestar::BlockAggregator& aggregator, bool reverse,
                                                      uint64_t interval, std::unordered_set<uint64_t>& filledBuckets,
                                                      size_t totalBuckets) {
+    try {
+        co_return co_await aggregateSeriesBucketedImpl(seriesId, startTime, endTime, aggregator, reverse, interval,
+                                                       filledBuckets, totalBuckets);
+    } catch (...) {
+        rethrowWithFilePath();
+    }
+}
+
+seastar::future<size_t> TSM::aggregateSeriesBucketedImpl(const SeriesId128& seriesId, uint64_t startTime,
+                                                         uint64_t endTime, timestar::BlockAggregator& aggregator,
+                                                         bool reverse, uint64_t interval,
+                                                         std::unordered_set<uint64_t>& filledBuckets,
+                                                         size_t totalBuckets) {
     auto* indexEntry = co_await getFullIndexEntry(seriesId);
     if (!indexEntry || indexEntry->seriesType == TSMValueType::String) {
         co_return 0;

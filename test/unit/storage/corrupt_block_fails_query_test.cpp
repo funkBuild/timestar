@@ -246,6 +246,19 @@ TEST_F(CorruptBlockFailsQueryTest, CorruptBlockNeverYieldsASuccessfulShortAnswer
         // unhandled crash-shaped error.
         EXPECT_NE(damaged.body.find("QUERY_INCOMPLETE"), std::string::npos)
             << "corrupt block failed the query, but not with QUERY_INCOMPLETE: " << damaged.body;
+
+        // The failure must NAME THE FILE. The decoder that throws has no file
+        // context (slice_buffer sees only a byte span), so the TSM read
+        // boundary annotates the exception with its path — without it an
+        // operator seeing this error in production has no way to identify
+        // which TSM file to pull for investigation. Compare on the basename:
+        // the handler carries whatever path the TSM was opened with, which may
+        // be spelled relative or absolute.
+        const std::string corruptBasename = tsmFile.substr(tsmFile.find_last_of('/') + 1);
+        EXPECT_NE(damaged.body.find("[tsm "), std::string::npos)
+            << "drop reason does not carry the TSM file annotation: " << damaged.body;
+        EXPECT_NE(damaged.body.find(corruptBasename), std::string::npos)
+            << "drop reason names no file, or the wrong one (expected " << corruptBasename << "): " << damaged.body;
     })
         .join()
         .get();

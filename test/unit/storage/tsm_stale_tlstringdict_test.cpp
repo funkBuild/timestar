@@ -43,9 +43,13 @@ protected:
         }
     }
 
-    // Extract the readSingleBlock function body
+    // Extract the readSingleBlock function body.  The public readSingleBlock
+    // is a thin wrapper that only annotates errors with the file path (see
+    // rethrowWithFilePath); the decode body these tests pin lives in
+    // readSingleBlockImpl, so prefer that and fall back to the public name.
     std::string extractReadSingleBlock() const {
-        auto pos = sourceCode.find("TSM::readSingleBlock");
+        auto pos = sourceCode.find("TSM::readSingleBlockImpl");
+        if (pos == std::string::npos) pos = sourceCode.find("TSM::readSingleBlock");
         if (pos == std::string::npos) return "";
         auto braceStart = sourceCode.find('{', pos);
         if (braceStart == std::string::npos) return "";

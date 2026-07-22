@@ -273,6 +273,37 @@ private:
     // Helper to get tombstone file path
     std::string getTombstonePath() const;
 
+    // Rethrow the in-flight exception with this file's path appended, so a
+    // read/decode failure names the file it came from — without this, a
+    // corrupt-block error (e.g. "CompressedSlice - attempted to read beyond
+    // buffer bounds") reaches the query drop log with no way to identify
+    // which TSM file to pull for investigation.  bad_alloc passes through
+    // untouched: recovery paths key on its exact type (see
+    // queryNonNumericBucketedChunked).  Idempotent — a message that already
+    // carries a "[tsm " marker is rethrown unchanged, so nested annotated
+    // entry points (aggregateSeriesSelective over readSingleBlock) do not
+    // stack file suffixes.
+    [[noreturn]] void rethrowWithFilePath() const;
+
+    // Un-annotated bodies of the public read entry points below.  The public
+    // methods are thin wrappers that route any failure through
+    // rethrowWithFilePath(); keeping the bodies separate avoids wrapping
+    // hundreds of coroutine lines in try/catch.
+    template <class T>
+    seastar::future<std::unique_ptr<TSMBlock<T>>> readSingleBlockImpl(const TSMIndexBlock& indexBlock,
+                                                                      uint64_t startTime, uint64_t endTime,
+                                                                      const std::vector<std::string>* stringDict);
+    seastar::future<size_t> aggregateSeriesImpl(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime,
+                                                timestar::BlockAggregator& aggregator, seastar::semaphore* ioSem);
+    seastar::future<size_t> aggregateSeriesSelectiveImpl(const SeriesId128& seriesId, uint64_t startTime,
+                                                         uint64_t endTime, timestar::BlockAggregator& aggregator,
+                                                         bool reverse, size_t maxPoints);
+    seastar::future<size_t> aggregateSeriesBucketedImpl(const SeriesId128& seriesId, uint64_t startTime,
+                                                        uint64_t endTime, timestar::BlockAggregator& aggregator,
+                                                        bool reverse, uint64_t interval,
+                                                        std::unordered_set<uint64_t>& filledBuckets,
+                                                        size_t totalBuckets);
+
 public:
     uint64_t tierNum;
     uint64_t seqNum;
