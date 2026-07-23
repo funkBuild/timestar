@@ -12,6 +12,9 @@
 #include "util.hpp"
 #include "value_coercion.hpp"       // lossless coercion into a series' bound type
 #include "value_type_dispatch.hpp"  // dispatchValueType / valueTypeOf / valueTypeName
+#include "vshard_snapshot_builder.hpp"
+#include "vshard_snapshot_extents.hpp"
+#include "vshard_snapshot_read.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -151,6 +154,24 @@ void Engine::stampRevisions(TimeStarInsert<T>& req) {
     // sequence). Monotonic per shard, hence per VShard (a subsequence).
     const uint64_t rev = nextRevision_++;
     req.revisions.assign(count, rev);
+}
+
+seastar::future<timestar::VShardSnapshotManifest> Engine::createVShardSnapshot(timestar::VShardId vshard,
+                                                                               std::string catalogHash) {
+    // Snapshot this shard's flushed TSM files (the caller flushes memory first).
+    // Collect them with their rank as the extent file id.
+    std::vector<seastar::shared_ptr<::TSM>> files;
+    timestar::VShardExtentMap extents;
+    for (const auto& [rank, file] : tsmFileManager.getSequencedTsmFiles()) {
+        if (!file)
+            continue;
+        files.push_back(file);
+        co_await timestar::addTsmFileExtents(extents, rank, *file);
+    }
+
+    timestar::VShardSnapshotBuilder builder(vshard);
+    co_await timestar::feedVShardResolvedView(vshard, files, builder);
+    co_return builder.build(extents, std::move(catalogHash));
 }
 
 void Engine::restoreRevisionCounter() {

@@ -15,6 +15,8 @@
 #include "timestar_config.hpp"
 #include "timestar_value.hpp"
 #include "tsm_file_manager.hpp"
+#include "vshard.hpp"
+#include "vshard_snapshot_manifest.hpp"
 #include "wal.hpp"
 #include "wal_file_manager.hpp"
 
@@ -175,6 +177,14 @@ public:
     void setShardedRef(seastar::sharded<Engine>* ref) { shardedRef = ref; }
     explicit Engine(timestar::StorageLayout layout);
     seastar::future<> init();
+
+    // Create a snapshot manifest for one VShard from this shard's FLUSHED TSM
+    // files (Task 4d). Precondition: flush the memory store first (this reads TSM
+    // files only). Composes the reviewed snapshot pieces (extents + resolved-view
+    // verification hash + manifest). `catalogHash` is the caller's catalog-content
+    // hash (32 lowercase hex).
+    seastar::future<timestar::VShardSnapshotManifest> createVShardSnapshot(timestar::VShardId vshard,
+                                                                           std::string catalogHash);
 
     // Enable/disable per-point replicated revision assignment (cluster LWW).
     // Off by default; the server turns it on when cluster mode is configured.

@@ -2,6 +2,7 @@
 // Tests async lifecycle, multi-shard coordination, queries, deletes, and metadata indexing.
 
 #include "../../../lib/core/engine.hpp"
+#include "../../../lib/core/placement_table.hpp"
 #include "../../../lib/core/series_id.hpp"
 #include "../../../lib/core/timestar_value.hpp"
 #include "../../test_helpers.hpp"
@@ -15,6 +16,7 @@
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/sharded.hh>
+#include <seastar/core/sleep.hh>
 #include <seastar/core/smp.hh>
 #include <seastar/core/thread.hh>
 #include <set>
@@ -1111,6 +1113,43 @@ TEST_F(EngineSeastarTest, RevisionAssignmentAdvancesAndRestores) {
             // LWW to recovered data (adversarial-review finding).
             EXPECT_TRUE(eng2->revisionAssignmentEnabled()) << "recovered tracked data must re-enable assignment";
         }
+    })
+        .join()
+        .get();
+}
+
+// Engine-level snapshot creation: insert -> flush to TSM -> createVShardSnapshot
+// yields a valid manifest describing the flushed data (Task 4d lifecycle wiring).
+TEST_F(EngineSeastarTest, CreateVShardSnapshotFromFlushedData) {
+    seastar::thread([] {
+        ScopedEngine eng;
+        eng.init();
+        eng->setRevisionAssignment(true);  // stamp revisions so snapshotRevision > 0
+
+        TimeStarInsert<double> probe("snap", "value");
+        probe.addTag("host", "h1");
+        const SeriesId128 seriesId = probe.seriesId128();
+        const timestar::VShardId vshard{timestar::virtualShard(seriesId)};
+
+        {
+            TimeStarInsert<double> ins("snap", "value");
+            ins.addTag("host", "h1");
+            ins.addValue(1000, 1.5);
+            ins.addValue(2000, 2.5);
+            eng->insert(std::move(ins)).get();
+        }
+        eng->rolloverMemoryStore().get();
+        // Background TSM conversion is async; wait for the file to appear.
+        for (int i = 0; i < 300 && eng->getTSMFileCount() == 0; ++i)
+            seastar::sleep(std::chrono::milliseconds(100)).get();
+        ASSERT_GT(eng->getTSMFileCount(), 0u) << "flush did not produce a TSM file";
+
+        auto manifest = eng->createVShardSnapshot(vshard, std::string(32, 'c')).get();
+        EXPECT_TRUE(manifest.valid());
+        EXPECT_EQ(manifest.vshard, vshard);
+        EXPECT_EQ(manifest.verificationHash.size(), 32u);
+        EXPECT_FALSE(manifest.dataExtents.empty()) << "the flushed file must appear as a data extent";
+        EXPECT_GT(manifest.snapshotRevision, 0u) << "assigned revisions must survive into the snapshot watermark";
     })
         .join()
         .get();
