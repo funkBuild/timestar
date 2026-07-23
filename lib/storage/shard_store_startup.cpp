@@ -140,14 +140,23 @@ ShardStoreInspection ShardStoreStartup::inspect(unsigned requestedShardCount) co
         meta.state = MetaState::Absent;
     }
 
-    // 2. A recorded, non-zero previous count is authoritative.
+    // 2. A recorded, non-zero previous count is authoritative -- but only if the
+    //    shard directories on disk actually back it. A committed store always
+    //    has exactly shard_0..shard_{N-1}; a meta that disagrees with the
+    //    directory set (fewer/extra/gappy dirs, or none at all) is a corrupt or
+    //    partially-created store, not a clean count change, and must fail closed
+    //    rather than let Engine create fresh shards beside populated ones.
     if (meta.state == MetaState::Valid && meta.value != 0) {
         result.previousShardCount = meta.value;
-        if (meta.value == requestedShardCount) {
-            result.status = ShardStoreStartupStatus::MatchingShardCount;
-        } else {
-            result.status = ShardStoreStartupStatus::UnsafeShardCountChange;
+        const auto inferred = inferContiguousShardCount(scan.shardIndices);
+        if (!inferred || *inferred != meta.value) {
+            result.status = ShardStoreStartupStatus::InvalidMetadata;
+            result.detail = "shard_count.meta records " + std::to_string(meta.value) +
+                            " shards but the shard directories on disk are not a matching shard_0..shard_N-1 set";
+            return result;
         }
+        result.status = (meta.value == requestedShardCount) ? ShardStoreStartupStatus::MatchingShardCount
+                                                            : ShardStoreStartupStatus::UnsafeShardCountChange;
         return result;
     }
 

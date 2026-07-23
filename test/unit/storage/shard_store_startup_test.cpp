@@ -127,6 +127,27 @@ TEST_F(ShardStoreStartupTest, MatchingCountInferredFromShardDirsStartsWithoutMet
     EXPECT_EQ(inspection.previousShardCount, 4u);
 }
 
+TEST_F(ShardStoreStartupTest, RecordedCountThatDisagreesWithShardDirsFailsClosed) {
+    // A committed store always has exactly shard_0..shard_{N-1}. A meta that
+    // records more shards than exist on disk is a partial/corrupt store; even
+    // when the requested count matches the meta, startup must refuse rather than
+    // let Engine create the missing shards fresh beside the populated ones.
+    createShards(2);
+    writeFile("shard_count.meta", "4\n");
+
+    const auto inspection = inspect(4);
+    EXPECT_EQ(inspection.status, ShardStoreStartupStatus::InvalidMetadata);
+    EXPECT_FALSE(inspection.canStart());
+}
+
+TEST_F(ShardStoreStartupTest, RecordedCountWithNoShardDirsFailsClosed) {
+    writeFile("shard_count.meta", "2\n");  // meta present, but no shard data at all
+
+    const auto inspection = inspect(2);
+    EXPECT_EQ(inspection.status, ShardStoreStartupStatus::InvalidMetadata);
+    EXPECT_FALSE(inspection.canStart());
+}
+
 TEST_F(ShardStoreStartupTest, MalformedMetaOverShardDataFailsClosed) {
     createShards(2);
     writeFile("shard_count.meta", "not-a-number\n");

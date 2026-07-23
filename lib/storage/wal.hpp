@@ -228,7 +228,6 @@ public:
 
     // Utilities
     static std::string sequenceNumberToFilename(unsigned int sequenceNumber);
-    static seastar::future<> remove(unsigned int sequenceNumber);
 };
 
 class WALReader {

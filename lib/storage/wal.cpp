@@ -815,18 +815,6 @@ seastar::future<> WAL::deleteRange(const SeriesId128& seriesId, uint64_t startTi
                     seriesId.toHex(), startTime, endTime, n);
 }
 
-seastar::future<> WAL::remove(unsigned int sequenceNumber) {
-    std::string filename = WAL::sequenceNumberToFilename(sequenceNumber);
-
-    try {
-        co_await seastar::remove_file(filename);
-        timestar::wal_log.debug("WAL file {} deleted", filename);
-    } catch (const std::exception& e) {
-        // File may not exist; log but don't propagate
-        timestar::wal_log.debug("WAL file {} removal failed (may not exist): {}", filename, e.what());
-    }
-}
-
 // ------------------------ WALReader ------------------------
 
 WALReader::WALReader(std::string _filename) : filename(std::move(_filename)) {}

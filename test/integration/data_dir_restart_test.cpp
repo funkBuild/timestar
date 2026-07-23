@@ -73,9 +73,22 @@ SEASTAR_TEST_F(DataDirRestartTest, IngestRestartQueryUnderNonDefaultRoot) {
             first.addValue(baseTime + i * 1000000000LL, 20.0 + i);
         co_await engine.insert(first);
 
-        // Force the first batch out to a TSM file under the data root.
+        // Force the first batch out to a TSM file under the data root, and wait
+        // for the background WAL->TSM conversion to actually land a .tsm file so
+        // this proves TSM persistence, not merely that the tsm/ dir was created.
         co_await engine.rolloverMemoryStore();
-        co_await seastar::sleep(std::chrono::milliseconds(300));
+        bool firstBatchInTsm = false;
+        for (int attempt = 0; attempt < 60 && !firstBatchInTsm; ++attempt) {
+            co_await seastar::sleep(std::chrono::milliseconds(50));
+            std::error_code ec;
+            for (const auto& entry : fs::directory_iterator(layout.tsmDir(0), ec)) {
+                if (entry.path().extension() == ".tsm") {
+                    firstBatchInTsm = true;
+                    break;
+                }
+            }
+        }
+        EXPECT_TRUE(firstBatchInTsm) << "explicit rollover did not produce a .tsm file under " << layout.tsmDir(0);
 
         // The second batch stays in the active WAL, exercising WAL recovery on
         // the next startup rather than TSM open.

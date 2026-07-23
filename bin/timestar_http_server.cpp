@@ -341,7 +341,7 @@ int main(int argc, char** argv) {
             // Initialize virtual shard placement table (Phase 5).
             auto pt = timestar::PlacementTable::buildLocal(seastar::smp::count);
             timestar::setGlobalPlacement(std::move(pt));
-            timestar::savePlacement(dataRoot + "/placement.json");
+            timestar::savePlacement(storageLayout.placementFile().string());
 
             // STEP 1: Initialize the Engine on all shards
             timestar::http_log.info("Initializing Engine on all shards...");
