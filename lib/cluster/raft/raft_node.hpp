@@ -98,7 +98,7 @@ private:
     // Config derivation: the active config is the latest ConfigChange in the log,
     // above the snapshot-boundary base config.
     void recomputeConfigFromLog();
-    void maybeAppendLeaveJoint();  // leader: after Cold,new commits, append Cnew
+    bool maybeAppendLeaveJoint();  // leader: after Cold,new commits, append Cnew (true if appended)
 
     void becomeFollower(Term term, NodeId leader);
     void becomePreCandidate();

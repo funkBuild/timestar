@@ -327,8 +327,11 @@ void RaftNode::handleInstallSnapshot(NodeId from, const InstallSnapshot& is) {
         log_.restoreFromSnapshot(is.lastIncludedIndex, is.lastIncludedTerm);
 
     // The snapshot carries the boundary config; re-derive the active config from
-    // the new base plus any retained (keep-suffix) config entries.
-    baseConfig_ = is.config;
+    // the new base plus any retained (keep-suffix) config entries. Defensive: a
+    // config with no voters (only possible from corruption) would brick the
+    // group, so ignore it and keep our current base.
+    if (!is.config.voters.empty())
+        baseConfig_ = is.config;
     recomputeConfigFromLog();
 
     snapshot_.index = is.lastIncludedIndex;
@@ -413,37 +416,49 @@ void RaftNode::handleAppendEntriesReply(NodeId from, const AppendEntriesReply& r
 }
 
 void RaftNode::maybeAdvanceCommitAsLeader() {
-    // The highest index replicated on a majority. During a joint config it must
-    // be a majority in BOTH voting sets, so take the min of the two.
-    LogIndex majorityMatch = majorityMatchIndex(config_.voters);
-    if (config_.joint())
-        majorityMatch = std::min(majorityMatch, majorityMatchIndex(config_.votersOutgoing));
+    // Advance commit as far as majorities allow. This loops because appending the
+    // Cnew leave-joint entry can make a further index committable in the same
+    // pass (notably a single-voter final config, which has no follower to ack).
+    bool committedSomething = false;
+    for (;;) {
+        // The highest index replicated on a majority. During a joint config it
+        // must be a majority in BOTH voting sets, so take the min of the two.
+        LogIndex majorityMatch = majorityMatchIndex(config_.voters);
+        if (config_.joint())
+            majorityMatch = std::min(majorityMatch, majorityMatchIndex(config_.votersOutgoing));
 
-    // §5.4.2: only commit it if it is from the CURRENT term. Earlier-term entries
-    // ride along once a current-term entry above them commits.
-    if (majorityMatch > commitIndex_ && majorityMatch <= log_.lastIndex() &&
-        log_.term(majorityMatch) == std::optional<Term>(currentTerm_)) {
+        // §5.4.2: only commit it if it is from the CURRENT term. Earlier-term
+        // entries ride along once a current-term entry above them commits.
+        if (majorityMatch <= commitIndex_ || majorityMatch > log_.lastIndex() ||
+            log_.term(majorityMatch) != std::optional<Term>(currentTerm_))
+            break;
+
         commitIndex_ = majorityMatch;
-        maybeAppendLeaveJoint();  // may append Cnew if the joint config just committed
+        committedSomething = true;
+
+        if (maybeAppendLeaveJoint())
+            continue;  // the fresh Cnew entry may itself be committable now
+
         // If a committed membership change removed us from the (final) voter set,
         // step down -- we can no longer legitimately lead.
-        if (role_ == Role::Leader && !config_.joint() && !config_.isVoter(id_) &&
-            commitIndex_ >= latestConfigIndex_ && latestConfigIndex_ != kNoIndex) {
+        if (!config_.joint() && !config_.isVoter(id_) && latestConfigIndex_ != kNoIndex &&
+            commitIndex_ >= latestConfigIndex_) {
             becomeFollower(currentTerm_, kNoNode);
             return;
         }
-        bcastAppend();  // let followers learn the new commit promptly
     }
+    if (committedSomething)
+        bcastAppend();  // let followers learn the new commit promptly
 }
 
-void RaftNode::maybeAppendLeaveJoint() {
+bool RaftNode::maybeAppendLeaveJoint() {
     // Once the joint config entry (Cold,new) is committed, transition to the final
     // Cnew by appending a config entry that drops the outgoing voters. Only the
     // leader does this, and only once (config_ stops being joint afterward).
     if (role_ != Role::Leader || !config_.joint())
-        return;
+        return false;
     if (latestConfigIndex_ == kNoIndex || commitIndex_ < latestConfigIndex_)
-        return;  // the joint config is not committed yet
+        return false;  // the joint config is not committed yet
     Config finalCfg;
     finalCfg.voters = config_.voters;
     finalCfg.learners = config_.learners;  // votersOutgoing dropped
@@ -456,8 +471,7 @@ void RaftNode::maybeAppendLeaveJoint() {
     latestConfigIndex_ = log_.lastIndex();
     matchIndex_[id_] = log_.lastIndex();
     nextIndex_[id_] = log_.lastIndex() + 1;
-    // If we removed ourselves from the voters, we will step down once this
-    // commits; that is handled by normal commit + the leader-not-in-config check.
+    return true;
 }
 
 void RaftNode::bcastRequestVote(bool preVote) {
@@ -757,6 +771,8 @@ bool RaftNode::proposeConfChange(std::vector<NodeId> voters, std::vector<NodeId>
         return false;
     if (config_.joint())
         return false;  // one membership change at a time
+    if (voters.empty())
+        return false;  // a config with no voters would permanently wedge the group
 
     // Enter the joint configuration Cold,new: decisions now need a majority in
     // both the new voters and the current (outgoing) voters.

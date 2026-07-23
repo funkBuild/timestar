@@ -363,6 +363,37 @@ TEST(RaftClusterTest, JointConsensusReplacesAndRemovesAVoter) {
     EXPECT_EQ(net.applied(4).back(), "z");
 }
 
+TEST(RaftClusterTest, JointConsensusShrinkToSingleVoterCommits) {
+    // Regression: shrinking to a single-voter final config must still COMMIT the
+    // Cnew entry (no follower to ack it), so a later proposal commits at once.
+    Network net({1, 2, 3}, opts());
+    net.node(1).campaign();
+    net.run();
+    ASSERT_EQ(net.leader(), 1u);
+
+    ASSERT_TRUE(net.node(1).proposeConfChange({1}, {}));  // Cnew = {1}
+    net.run();
+    EXPECT_FALSE(net.node(1).config().joint());
+    EXPECT_EQ(net.node(1).config().voters, (std::vector<NodeId>{1}));
+    // The final config entry is committed; a fresh proposal commits immediately
+    // (node 1 is the whole quorum) with the other nodes gone.
+    net.isolate(2);
+    net.isolate(3);
+    EXPECT_TRUE(net.node(1).propose("solo"));
+    net.run();
+    EXPECT_EQ(net.applied(1).back(), "solo");
+}
+
+TEST(RaftClusterTest, ConfChangeRejectsEmptyVoters) {
+    Network net({1, 2, 3}, opts());
+    net.node(1).campaign();
+    net.run();
+    ASSERT_EQ(net.leader(), 1u);
+    EXPECT_FALSE(net.node(1).proposeConfChange({}, {}));  // would wedge the group
+    EXPECT_FALSE(net.node(1).config().joint());
+    EXPECT_EQ(net.node(1).config().voters, (std::vector<NodeId>{1, 2, 3}));
+}
+
 TEST(RaftClusterTest, LearnerReplicatesButDoesNotVoteOrCount) {
     // Voters {1,2}, learner {3}. Quorum is 2 (both voters), unaffected by 3.
     Network net({1, 2}, opts(), {3});
