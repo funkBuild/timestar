@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <exception>
 #include <format>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/fstream.hh>
@@ -66,27 +67,46 @@ seastar::future<std::vector<JournalRecord>> JournalWriter::open() {
 
     std::vector<JournalRecord> recovered;
     for (size_t i = 0; i < segments.size(); ++i) {
+        const bool isFinal = (i + 1 == segments.size());
         const auto path = dir_ / segmentFilename(segments[i]);
         const seastar::sstring bytes = co_await seastar::util::read_entire_file_contiguous(path);
         auto scan = scanJournalSegment(std::span<const char>(bytes.data(), bytes.size()));
+
         if (!scan) {
+            // No valid header. On the FINAL segment this is a crash before the
+            // header became durable -- it holds no records. DELETE it so a later
+            // recovery (once newer segments exist) does not see it as a fatal
+            // non-final corrupt segment. On a non-final segment it is genuine
+            // corruption: fail closed.
+            if (isFinal) {
+                co_await seastar::remove_file(path.string());
+                continue;
+            }
             fence("corrupt journal segment header: " + path.string());
             throw std::runtime_error(fenceReason_);
         }
-        // Only the final (highest-numbered) segment may be torn -- that is a
-        // crash mid-append. A torn tail on an earlier segment means a later
-        // segment was created before the earlier one finished: corruption.
-        if (scan->torn && i + 1 != segments.size()) {
-            fence("torn tail on a non-final journal segment: " + path.string());
-            throw std::runtime_error(fenceReason_);
+
+        if (scan->torn) {
+            // A torn tail is only legitimate on the final segment (crash
+            // mid-append). REPAIR it by truncating to the durable prefix, so
+            // recovery is idempotent: the segment is clean on the next open even
+            // after newer segments are created.
+            if (!isFinal) {
+                fence("torn tail on a non-final journal segment: " + path.string());
+                throw std::runtime_error(fenceReason_);
+            }
+            seastar::file f = co_await seastar::open_file_dma(path.string(), seastar::open_flags::rw);
+            co_await f.truncate(scan->durableBytes);
+            co_await f.flush();
+            co_await f.close();
         }
+
         for (auto& record : scan->records)
             recovered.push_back(std::move(record));
     }
 
-    // New appends go to a fresh segment (recovery stays read-only; a torn tail on
-    // the last old segment is simply never appended to and is re-skipped on any
-    // future recovery).
+    // New appends go to a fresh segment (segment numbers are never reused, even
+    // if the final old one was deleted above -- back() is the max seen).
     const uint64_t next = segments.empty() ? 0 : segments.back() + 1;
     co_await startSegment(next);
     opened_ = true;
@@ -114,6 +134,10 @@ seastar::future<> JournalWriter::startSegment(uint64_t segmentNumber) {
 
     co_await out_->write(headerBytes);
     currentBytes_ += headerBytes.size();
+    // NOTE: the header is buffered, not yet flushed -- flushing a sub-alignment
+    // amount and then continuing to append misbehaves on an O_DIRECT stream. A
+    // crash before the first barrier therefore leaves an un-headed segment;
+    // recovery handles that by discarding an un-headed FINAL segment (see open()).
 }
 
 seastar::future<> JournalWriter::append(const JournalRecord& record) {
@@ -128,11 +152,16 @@ seastar::future<> JournalWriter::append(const JournalRecord& record) {
     // only the header, so a single record always fits (payloads are bounded well
     // below segmentBytes by the write-batch limit).
     if (currentBytes_ + bytes.size() > segmentBytes_ && currentBytes_ > JournalSegmentHeader::kEncodedBytes) {
-        co_await barrier();  // make the closing segment durable before rotating
-        if (fenced_)
-            throw std::runtime_error("JournalWriter is fenced: " + fenceReason_);
-        co_await out_->close();
-        co_await startSegment(currentSegment_ + 1);
+        try {
+            co_await barrier();  // make the closing segment durable before rotating
+            co_await out_->close();
+            out_.reset();  // old segment closed; a startSegment failure leaves out_ empty, not double-closed
+            co_await startSegment(currentSegment_ + 1);
+        } catch (const std::exception& e) {
+            if (!fenced_)
+                fence(std::string("journal rotation failed: ") + e.what());
+            throw;
+        }
     }
 
     try {

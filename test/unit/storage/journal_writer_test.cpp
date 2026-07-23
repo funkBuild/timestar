@@ -156,6 +156,78 @@ TEST(JournalWriterTest, TornTailIsRecovered) {
     testTornTailIsRecovered().get();
 }
 
+// Regression for the recovery-idempotency bug: a legitimately torn final
+// segment must stay recoverable across MORE than one restart, even once newer
+// segments exist (recovery repairs the torn tail rather than leaving it).
+seastar::future<> testSecondReopenAfterTornDoesNotFence() {
+    const auto dir = tmpDir("torn2");
+    {
+        JournalWriter w(dir, header(), 1u << 20);
+        co_await w.open();
+        co_await w.append(rec(0, 1, "one"));
+        co_await w.append(rec(0, 2, "two"));
+        co_await w.barrier();
+        co_await w.close();
+    }
+    {
+        const auto seg0 = dir / JournalWriter::segmentFilename(0);
+        std::string partial = rec(0, 3, "torn").encode();
+        partial.resize(partial.size() / 2);
+        std::ofstream(seg0, std::ios::binary | std::ios::app) << partial;
+    }
+    // Run B: recover (this must REPAIR the torn tail) and create seg_1.
+    {
+        JournalWriter w(dir, header(), 1u << 20);
+        auto recovered = co_await w.open();
+        EXPECT_EQ(recovered.size(), 2u);
+        co_await w.close();
+    }
+    // Run C: seg_0 is now non-final (seg_1 exists). If Run B had left it torn,
+    // this would fence and throw. It must recover cleanly.
+    {
+        JournalWriter w(dir, header(), 1u << 20);
+        auto recovered = co_await w.open();
+        EXPECT_EQ(recovered.size(), 2u);
+        EXPECT_FALSE(w.fenced());
+        co_await w.close();
+    }
+    fs::remove_all(dir);
+}
+TEST(JournalWriterTest, SecondReopenAfterTornDoesNotFence) {
+    testSecondReopenAfterTornDoesNotFence().get();
+}
+
+// Regression: a segment created but crashed before its header was durable
+// (empty / un-headed) must be discarded on recovery, not treated as fatal
+// corruption.
+seastar::future<> testUnheadedFinalSegmentIsDiscarded() {
+    const auto dir = tmpDir("unheaded");
+    {
+        JournalWriter w(dir, header(), 1u << 20);
+        co_await w.open();
+        co_await w.append(rec(0, 1, "one"));
+        co_await w.append(rec(0, 2, "two"));
+        co_await w.barrier();
+        co_await w.close();
+    }
+    // A crash left an empty seg_1 (created, header not yet durable).
+    {
+        const auto seg1 = dir / JournalWriter::segmentFilename(1);
+        std::ofstream(seg1, std::ios::binary);  // zero-length
+    }
+    {
+        JournalWriter w(dir, header(), 1u << 20);
+        auto recovered = co_await w.open();
+        EXPECT_EQ(recovered.size(), 2u);  // seg_0's records; empty seg_1 discarded
+        EXPECT_FALSE(w.fenced());
+        co_await w.close();
+    }
+    fs::remove_all(dir);
+}
+TEST(JournalWriterTest, UnheadedFinalSegmentIsDiscarded) {
+    testUnheadedFinalSegmentIsDiscarded().get();
+}
+
 seastar::future<> testFreshOpenIsEmpty() {
     const auto dir = tmpDir("fresh");
     JournalWriter w(dir, header(), 1u << 20);
