@@ -1055,3 +1055,59 @@ TEST_F(EngineSeastarTest, ShardedMetadataConsistency) {
         .join()
         .get();
 }
+
+// ===========================================================================
+// Cluster LWW: per-shard replicated revision assignment (ADR 0003)
+// ===========================================================================
+
+// Disabled by default: no revision is consumed and inserts carry no column.
+TEST_F(EngineSeastarTest, RevisionAssignmentOffByDefault) {
+    seastar::thread([] {
+        ScopedEngine eng;
+        eng.init();
+        EXPECT_FALSE(eng->revisionAssignmentEnabled());
+        EXPECT_EQ(eng->nextRevision(), 1u);
+
+        TimeStarInsert<double> b("revoff", "v");
+        b.addValue(1000, 1.0);
+        eng->insert(std::move(b)).get();
+        EXPECT_EQ(eng->nextRevision(), 1u) << "no revision consumed when disabled";
+    })
+        .join()
+        .get();
+}
+
+// When enabled, each insert consumes the next monotonic revision, and after a
+// restart the counter is restored above every revision durable in the WAL --
+// so a post-restart write never inverts LWW against recovered data.
+TEST_F(EngineSeastarTest, RevisionAssignmentAdvancesAndRestores) {
+    seastar::thread([] {
+        {
+            ScopedEngine eng;
+            eng.init();
+            eng->setRevisionAssignment(true);
+            EXPECT_TRUE(eng->revisionAssignmentEnabled());
+            EXPECT_EQ(eng->nextRevision(), 1u);
+
+            TimeStarInsert<double> b1("revadv", "v");
+            b1.addValue(1000, 1.0);
+            eng->insert(std::move(b1)).get();
+            EXPECT_EQ(eng->nextRevision(), 2u) << "first insert consumed revision 1";
+
+            TimeStarInsert<double> b2("revadv", "v");
+            b2.addValue(2000, 2.0);
+            eng->insert(std::move(b2)).get();
+            EXPECT_EQ(eng->nextRevision(), 3u) << "second insert consumed revision 2";
+        }  // eng stops; the WAL persisted revisions 1 and 2
+
+        // Restart on the same data dir: recovery replays the WAL (restoring the
+        // revision column) and restoreRevisionCounter() resumes above the max.
+        {
+            ScopedEngine eng2;
+            eng2.init();
+            EXPECT_EQ(eng2->nextRevision(), 3u) << "counter restored above the max durable revision (2)";
+        }
+    })
+        .join()
+        .get();
+}

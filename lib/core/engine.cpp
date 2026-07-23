@@ -23,6 +23,7 @@
 #include <seastar/core/when_all.hh>
 #include <seastar/core/with_scheduling_group.hh>
 #include <unordered_set>
+#include <variant>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -48,6 +49,12 @@ seastar::future<> Engine::init() {
         tsmFileManager.setFlushGroup(_flushGroup);
     }
     co_await walFileManager.init(*this, tsmFileManager);
+
+    // Restore the per-shard revision counter above every revision already durable
+    // in the WAL-replayed memory stores and in the flushed TSM files, so a
+    // post-restart write can never be assigned a revision that loses the LWW to
+    // older data (ADR 0003). Cheap: TSM contributes its file-level trailer only.
+    restoreRevisionCounter();
 
     // Register per-shard Prometheus metrics
     _metrics.setup(*this);
@@ -134,6 +141,43 @@ seastar::future<> Engine::stop() {
 }
 
 template <class T>
+void Engine::stampRevisions(TimeStarInsert<T>& req) {
+    if (!assignRevisions_)
+        return;  // non-cluster: leave the revision column empty (zero overhead)
+    const size_t count = req.getTimestamps().size();
+    if (count == 0)
+        return;
+    // One replicated revision per insert (ADR 0003: a record's points share its
+    // sequence). Monotonic per shard, hence per VShard (a subsequence).
+    const uint64_t rev = nextRevision_++;
+    req.revisions.assign(count, rev);
+}
+
+void Engine::restoreRevisionCounter() {
+    uint64_t maxRev = 0;
+    // WAL-replayed memory (the un-flushed tail carries the highest revisions).
+    for (const auto& store : walFileManager.pinMemoryStores()) {
+        if (!store)
+            continue;
+        for (auto it = store->series.begin(); it != store->series.end(); ++it) {
+            std::visit(
+                [&](const auto& s) {
+                    for (uint64_t r : s.revisions)
+                        if (r > maxRev)
+                            maxRev = r;
+                },
+                it.value());
+        }
+    }
+    // Flushed data: the file-level max-revision trailer (cheap, no full-index load).
+    for (const auto& [rank, tsmFile] : tsmFileManager.getSequencedTsmFiles()) {
+        if (tsmFile && tsmFile->maxRevision() > maxRev)
+            maxRev = tsmFile->maxRevision();
+    }
+    nextRevision_ = maxRev + 1;  // == kFirstAssignedRevision (1) when nothing is tracked
+}
+
+template <class T>
 seastar::future<> Engine::insert(TimeStarInsert<T> insertRequest, bool skipMetadataIndexing) {
     auto holder = _insertGate.hold();
 
@@ -202,6 +246,11 @@ seastar::future<> Engine::insert(TimeStarInsert<T> insertRequest, bool skipMetad
             }
         }
     }
+
+    // Assign the replicated revision AFTER type enforcement (so a rejected write
+    // consumes no revision) and BEFORE the durable WAL+MemoryStore write, so the
+    // WAL persists it and the memory store tracks it (cluster LWW).
+    stampRevisions(insertRequest);
 
     LOG_INSERT_PATH(timestar::engine_log, debug, "[ENGINE] Starting WAL insert for single series");
     co_await walFileManager.insert(insertRequest);
@@ -420,6 +469,12 @@ seastar::future<WALTimingInfo> Engine::insertBatch(std::vector<TimeStarInsert<T>
                 }
             }
         }
+    }
+
+    // Assign the replicated revision to each request (one per batch element)
+    // before the durable write, so WAL + MemoryStore both carry it (cluster LWW).
+    for (auto& req : insertRequests) {
+        stampRevisions(req);
     }
 
     // Use WAL file manager batch insert

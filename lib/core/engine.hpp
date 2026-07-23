@@ -38,6 +38,19 @@ private:
     unsigned shardId;
     TSMFileManager tsmFileManager;
     WALFileManager walFileManager;
+
+    // Cluster LWW: when enabled, each insert batch is stamped with the next
+    // per-shard replicated revision (ADR 0003). Off by default so non-cluster
+    // deployments pay no per-point revision overhead. The counter is a per-shard
+    // monotonic u64 -- correct because a series never migrates cores while the
+    // core count is pinned by the fail-closed startup gate (each VShard's
+    // assignments stay a monotonic subsequence). Restored on init above every
+    // revision already durable in memory (WAL replay) and TSM (file trailer).
+    bool assignRevisions_ = false;
+    uint64_t nextRevision_ = 1;  // timestar::kFirstAssignedRevision
+    template <class T>
+    void stampRevisions(TimeStarInsert<T>& req);
+    void restoreRevisionCounter();
     timestar::index::NativeIndex index;
     timestar::EngineMetrics _metrics;
     // TSM conversion runs as background futures per rollover, tracked by WALFileManager's gate
@@ -162,6 +175,13 @@ public:
     void setShardedRef(seastar::sharded<Engine>* ref) { shardedRef = ref; }
     explicit Engine(timestar::StorageLayout layout);
     seastar::future<> init();
+
+    // Enable/disable per-point replicated revision assignment (cluster LWW).
+    // Off by default; the server turns it on when cluster mode is configured.
+    void setRevisionAssignment(bool on) { assignRevisions_ = on; }
+    [[nodiscard]] bool revisionAssignmentEnabled() const { return assignRevisions_; }
+    // The next revision this shard would assign (test/observability).
+    [[nodiscard]] uint64_t nextRevision() const { return nextRevision_; }
     seastar::future<> stop();
 
     // Start the background tier-compaction loop. Called after
