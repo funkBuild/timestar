@@ -106,6 +106,13 @@ RaftOptions opts() {
     return o;
 }
 
+RaftOptions optsPreVoteCheckQuorum() {
+    RaftOptions o = opts();
+    o.preVote = true;
+    o.checkQuorum = true;
+    return o;
+}
+
 }  // namespace
 
 TEST(RaftClusterTest, ElectsExactlyOneLeader) {
@@ -185,6 +192,69 @@ TEST(RaftClusterTest, NewLeaderCatchesUpALaggingFollower) {
     EXPECT_EQ(net.applied(3)[0], "a");
     EXPECT_EQ(net.applied(3)[2], "c");
     EXPECT_EQ(net.node(3).commitIndex(), net.node(1).commitIndex());
+}
+
+TEST(RaftClusterTest, PreVoteElectsALeaderAndReplicates) {
+    Network net({1, 2, 3}, optsPreVoteCheckQuorum());
+    net.node(1).campaign();  // -> PreCandidate, then Candidate, then Leader
+    net.run();
+    ASSERT_EQ(net.leaderCount(), 1);
+    ASSERT_EQ(net.leader(), 1u);
+    EXPECT_EQ(net.node(1).currentTerm(), 1u);  // exactly one real term bump
+    EXPECT_TRUE(net.node(1).propose("x"));
+    net.run();
+    for (NodeId id : {1u, 2u, 3u}) {
+        ASSERT_EQ(net.applied(id).size(), 1u) << "node " << id;
+        EXPECT_EQ(net.applied(id)[0], "x");
+    }
+}
+
+TEST(RaftClusterTest, PreVoteStopsAnIsolatedNodeFromInflatingTerm) {
+    Network net({1, 2, 3}, optsPreVoteCheckQuorum());
+    net.node(1).campaign();
+    net.run();
+    ASSERT_EQ(net.leader(), 1u);
+    const Term termBefore = net.node(2).currentTerm();
+
+    // Isolate node 3; it repeatedly times out and pre-campaigns, but its PreVotes
+    // reach no one, so it never bumps its own term or anyone else's.
+    net.isolate(3);
+    for (int i = 0; i < 5; ++i) {
+        net.node(3).tick();  // times out every 10 ticks... drive many
+        for (int j = 0; j < 12; ++j)
+            net.node(3).tick();
+        net.run();
+    }
+    // Node 3's term did not inflate past its starting term (PreVote never bumps).
+    EXPECT_EQ(net.node(3).currentTerm(), termBefore);
+    EXPECT_NE(net.node(3).role(), Role::Leader);
+
+    // Heal: node 3 rejoins as a follower without ever having disrupted the leader.
+    net.heal(3);
+    net.tickAll();
+    net.run();
+    EXPECT_EQ(net.leader(), 1u);
+    EXPECT_EQ(net.node(1).currentTerm(), termBefore);
+    EXPECT_EQ(net.node(3).role(), Role::Follower);
+}
+
+TEST(RaftClusterTest, CheckQuorumStepsDownIsolatedLeader) {
+    Network net({1, 2, 3}, optsPreVoteCheckQuorum());
+    net.node(1).campaign();
+    net.run();
+    ASSERT_EQ(net.leader(), 1u);
+
+    // Isolate the leader from both followers. CheckQuorum detects the lost
+    // majority within (up to) two election timeouts -- the first check still sees
+    // the pre-isolation contact window, the second sees silence -- and steps down.
+    net.isolate(1);
+    for (int i = 0; i < 25; ++i) {
+        net.node(1).tick();
+        net.run();
+        if (net.node(1).role() == Role::Follower)
+            break;
+    }
+    EXPECT_EQ(net.node(1).role(), Role::Follower);
 }
 
 TEST(RaftClusterTest, LeaderStepsDownWhenPartitionedFromMajority) {

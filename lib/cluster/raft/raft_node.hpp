@@ -8,6 +8,7 @@
 #include <map>
 #include <optional>
 #include <random>
+#include <set>
 #include <vector>
 
 namespace timestar::raft {
@@ -68,11 +69,13 @@ private:
     bool isVoter(NodeId n) const;
 
     void becomeFollower(Term term, NodeId leader);
+    void becomePreCandidate();
     void becomeCandidate();
     void becomeLeader();
     void resetElectionTimer();
     void send(Message m);
-    void bcastRequestVote();
+    void bcastRequestVote(bool preVote);
+    void checkQuorumOrStepDown();
 
     void handleRequestVote(NodeId from, const RequestVote& rv);
     void handleRequestVoteReply(NodeId from, const RequestVoteReply& rr);
@@ -111,6 +114,8 @@ private:
     // Leader-only replication progress, one per voter (self included).
     std::map<NodeId, LogIndex> nextIndex_;   // next index to send to the peer
     std::map<NodeId, LogIndex> matchIndex_;  // highest index known replicated on the peer
+    // CheckQuorum: voters we have heard from since the last quorum check.
+    std::set<NodeId> recentActive_;
 
     // Output accumulation.
     bool hsDirty_ = false;

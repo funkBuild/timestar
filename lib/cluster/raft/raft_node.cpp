@@ -75,7 +75,24 @@ void RaftNode::becomeFollower(Term term, NodeId leader) {
     votes_.clear();
     nextIndex_.clear();
     matchIndex_.clear();
+    recentActive_.clear();
     resetElectionTimer();
+}
+
+void RaftNode::becomePreCandidate() {
+    // A straw poll for term currentTerm_+1 that changes NO durable state (no term
+    // bump, no vote record) -- so losing it, or an isolated node running it
+    // repeatedly, never disturbs the cluster.
+    role_ = Role::PreCandidate;
+    leaderId_ = kNoNode;
+    votes_.clear();
+    votes_[id_] = true;  // we would vote for ourselves
+    resetElectionTimer();
+    if (countVotes(true) >= quorum()) {
+        becomeCandidate();  // trivial majority (single voter): go straight to real
+        return;
+    }
+    bcastRequestVote(/*preVote=*/true);
 }
 
 void RaftNode::becomeCandidate() {
@@ -92,7 +109,7 @@ void RaftNode::becomeCandidate() {
         becomeLeader();
         return;
     }
-    bcastRequestVote();
+    bcastRequestVote(/*preVote=*/false);
 }
 
 void RaftNode::becomeLeader() {
@@ -101,6 +118,7 @@ void RaftNode::becomeLeader() {
     electionElapsed_ = 0;
     heartbeatElapsed_ = 0;
     votes_.clear();
+    recentActive_.clear();  // fresh CheckQuorum window
 
     // Initialize replication progress: optimistically probe from our log end.
     nextIndex_.clear();
@@ -212,13 +230,14 @@ void RaftNode::maybeAdvanceCommitAsLeader() {
     }
 }
 
-void RaftNode::bcastRequestVote() {
+void RaftNode::bcastRequestVote(bool preVote) {
     for (NodeId peer : voters_) {
         if (peer == id_)
             continue;
         RequestVote rv;
-        rv.preVote = false;
-        rv.term = currentTerm_;
+        rv.preVote = preVote;
+        // A PreVote probes the NEXT term without adopting it; a real vote uses ours.
+        rv.term = preVote ? currentTerm_ + 1 : currentTerm_;
         rv.candidateId = id_;
         rv.lastLogIndex = log_.lastIndex();
         rv.lastLogTerm = log_.lastTerm();
@@ -227,7 +246,24 @@ void RaftNode::bcastRequestVote() {
 }
 
 void RaftNode::campaign() {
-    becomeCandidate();
+    if (opts_.preVote)
+        becomePreCandidate();
+    else
+        becomeCandidate();
+}
+
+void RaftNode::checkQuorumOrStepDown() {
+    // §CheckQuorum: a leader that has not heard from a majority within an election
+    // timeout has likely been partitioned away; it steps down so it stops serving
+    // stale leader reads and lets the majority side elect freely.
+    recentActive_.insert(id_);  // we are trivially in contact with ourselves
+    size_t active = 0;
+    for (NodeId v : voters_)
+        if (recentActive_.count(v))
+            ++active;
+    recentActive_.clear();
+    if (active < quorum())
+        becomeFollower(currentTerm_, kNoNode);
 }
 
 void RaftNode::tick() {
@@ -236,32 +272,48 @@ void RaftNode::tick() {
             heartbeatElapsed_ = 0;
             bcastAppend();  // heartbeat (an AppendEntries, possibly carrying entries)
         }
+        if (opts_.checkQuorum) {
+            if (++electionElapsed_ >= electionTimeout_) {
+                electionElapsed_ = 0;
+                checkQuorumOrStepDown();
+            }
+        }
         return;
     }
-    // Follower / candidate: advance the election clock.
+    // Follower / (pre)candidate: advance the election clock.
     ++electionElapsed_;
     if (electionElapsed_ >= electionTimeout_)
-        becomeCandidate();
+        campaign();  // PreVote-aware: pre-election first when enabled
 }
 
 void RaftNode::step(Message m) {
     const Term mTerm = messageTerm(m);
-    const bool preVoteMsg = std::holds_alternative<RequestVote>(m.payload) &&
-                            std::get<RequestVote>(m.payload).preVote;
+    // Messages whose higher term must NOT bump ours: a PreVote request (probes a
+    // future term) and a GRANTED PreVote reply (carries that future term). A
+    // REJECTED PreVote reply carries the responder's real term and does step us
+    // down.
+    const bool preVoteReq =
+        std::holds_alternative<RequestVote>(m.payload) && std::get<RequestVote>(m.payload).preVote;
+    const bool preVoteGrant = std::holds_alternative<RequestVoteReply>(m.payload) &&
+                              std::get<RequestVoteReply>(m.payload).preVote &&
+                              std::get<RequestVoteReply>(m.payload).voteGranted;
+
+    // CheckQuorum bookkeeping: as leader, note any voter we hear from.
+    if (role_ == Role::Leader && isVoter(m.from))
+        recentActive_.insert(m.from);
 
     if (mTerm > currentTerm_) {
         if (isVoteRequest(m.payload)) {
             // Disruption guard (CheckQuorum lease): a node that still hears from a
-            // valid leader refuses to grant votes / bump term. (Off until the
-            // CheckQuorum brick; harmless no-op while checkQuorum is false.)
+            // valid leader refuses to grant votes / bump term.
             const bool inLease =
                 opts_.checkQuorum && leaderId_ != kNoNode && electionElapsed_ < electionTimeout_;
             if (inLease) {
                 return;  // ignore; do not bump term
             }
         }
-        if (preVoteMsg) {
-            // A PreVote probe never changes our term.
+        if (preVoteReq || preVoteGrant) {
+            // Do not change our term for a probe or a straw-poll grant.
         } else {
             becomeFollower(mTerm, isLeaderMessage(m.payload) ? m.from : kNoNode);
         }
@@ -317,8 +369,11 @@ void RaftNode::handleRequestVote(NodeId from, const RequestVote& rv) {
 
     RequestVoteReply reply;
     reply.preVote = rv.preVote;
-    // A PreVote reply carries the probed term; a real vote reply carries ours.
-    reply.term = rv.preVote ? rv.term : currentTerm_;
+    // Only a PreVote GRANT echoes the probed (future) term, so the candidate can
+    // tally it without inflating anyone's term. A reject -- and every real vote --
+    // carries OUR actual term: if we are genuinely ahead the candidate steps down;
+    // if we are equal/behind it must NOT bump its term off a mere rejection.
+    reply.term = (rv.preVote && grant) ? rv.term : currentTerm_;
     reply.voteGranted = grant;
 
     if (grant && !rv.preVote) {
@@ -330,8 +385,20 @@ void RaftNode::handleRequestVote(NodeId from, const RequestVote& rv) {
 }
 
 void RaftNode::handleRequestVoteReply(NodeId from, const RequestVoteReply& rr) {
-    if (role_ != Role::Candidate || rr.preVote)
-        return;  // PreVote tallying is added in the pre-vote brick
+    if (!isVoter(from))
+        return;  // a stray/decommissioned replica's reply must never count toward quorum
+    if (rr.preVote) {
+        if (role_ != Role::PreCandidate)
+            return;  // we already advanced or stepped down
+        votes_[from] = rr.voteGranted;
+        if (countVotes(true) >= quorum())
+            becomeCandidate();  // straw poll won -> real election
+        else if (countVotes(false) >= quorum())
+            becomeFollower(currentTerm_, kNoNode);  // pre-election lost; back off
+        return;
+    }
+    if (role_ != Role::Candidate)
+        return;
     if (rr.term != currentTerm_)
         return;  // stale reply from another term
     votes_[from] = rr.voteGranted;
@@ -441,18 +508,27 @@ RaftNode::Ready RaftNode::ready() {
         }
     }
 
-    rd.messages = std::move(pendingMessages_);
-    pendingMessages_.clear();
+    rd.messages = pendingMessages_;  // copy; advance() drains what was reported
     return rd;
 }
 
+// advance() is the ONLY mutation point for output bookkeeping and MUST be called
+// immediately after the driver has made rd durable and sent rd.messages, with no
+// intervening step()/tick(). It advances persistence/apply watermarks from the
+// reported Ready and removes exactly the drained messages (front-erase, so any
+// message enqueued afterwards survives).
 void RaftNode::advance(const Ready& rd) {
     if (rd.hardState)
         hsDirty_ = false;
     if (!rd.entries.empty())
         unstableStart_ = std::max(unstableStart_, rd.entries.back().index + 1);
+    // commitIndex_ at ready() time == now (no interleaving under the contract);
+    // this also covers the compaction gap where committed entries were applied via
+    // a snapshot and rd.committed is therefore empty.
     if (commitIndex_ > lastApplied_)
         lastApplied_ = commitIndex_;
+    const size_t drained = std::min(rd.messages.size(), pendingMessages_.size());
+    pendingMessages_.erase(pendingMessages_.begin(), pendingMessages_.begin() + drained);
 }
 
 }  // namespace timestar::raft

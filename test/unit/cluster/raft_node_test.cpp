@@ -145,6 +145,20 @@ TEST(RaftNodeTest, CandidateWinsOnMajority) {
     EXPECT_EQ(n.leader(), 1u);
 }
 
+TEST(RaftNodeTest, VoteReplyFromNonVoterIsNotCounted) {
+    // A stray/decommissioned replica (id 7, not in the voter set) must never help
+    // a candidate reach quorum -- else it could win on fewer than a real majority.
+    RaftNode n(1, {1, 2, 3}, RaftLog{}, HardState{}, fixedTimeout(1));
+    n.tick();  // -> candidate term 1, self-vote (1 of 3)
+    ASSERT_EQ(n.role(), Role::Candidate);
+    drain(n);
+    n.step(Message{.to = 1, .from = 7, .payload = RequestVoteReply{false, 1, true}});
+    EXPECT_EQ(n.role(), Role::Candidate);  // still short of quorum, not leader
+    // A real voter then puts us over the top.
+    n.step(Message{.to = 1, .from = 2, .payload = RequestVoteReply{false, 1, true}});
+    EXPECT_EQ(n.role(), Role::Leader);
+}
+
 TEST(RaftNodeTest, CandidateStepsDownOnMajorityReject) {
     RaftNode n(1, {1, 2, 3}, RaftLog{}, HardState{}, fixedTimeout(1));
     n.tick();

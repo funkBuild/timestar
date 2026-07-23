@@ -15,7 +15,10 @@ inline constexpr Term kNoTerm = 0;
 inline constexpr LogIndex kNoIndex = 0;  // the empty-log / pre-first sentinel
 inline constexpr NodeId kNoNode = 0;     // votedFor == none
 
-enum class Role : uint8_t { Follower, Candidate, Leader };
+// PreCandidate runs a §PreVote straw poll (no term bump) before a real
+// candidacy, so a partitioned node cannot disrupt a stable leader by inflating
+// terms. It transitions to Candidate only once a majority would grant a real vote.
+enum class Role : uint8_t { Follower, PreCandidate, Candidate, Leader };
 
 // One replicated log entry. `data` is an opaque command (a journal payload in
 // this system); Raft never interprets it. The (term, index) pair is what the
