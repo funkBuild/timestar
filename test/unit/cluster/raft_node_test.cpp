@@ -255,6 +255,82 @@ TEST(RaftNodeTest, FollowerRejectsAppendOnTermConflictWithHint) {
     EXPECT_EQ(rep->conflictIndex, 3u);  // first index of term 2
 }
 
+TEST(RaftNodeTest, FollowerInstallsSnapshotAheadOfItsLog) {
+    RaftNode n(1, {1, 2, 3}, RaftLog{}, HardState{}, fixedTimeout(10));
+    InstallSnapshot is;
+    is.term = 2;
+    is.leaderId = 2;
+    is.lastIncludedIndex = 5;
+    is.lastIncludedTerm = 2;
+    is.data = "snap-bytes";
+    n.step(Message{.to = 1, .from = 2, .payload = is});
+
+    EXPECT_EQ(n.currentTerm(), 2u);
+    EXPECT_EQ(n.leader(), 2u);
+    EXPECT_EQ(n.log().snapshotIndex(), 5u);
+    EXPECT_EQ(n.log().lastIndex(), 5u);
+    EXPECT_EQ(n.commitIndex(), 5u);
+
+    RaftNode::Ready rd = drain(n);
+    ASSERT_TRUE(rd.snapshot.has_value());
+    EXPECT_EQ(rd.snapshot->index, 5u);
+    EXPECT_EQ(rd.snapshot->term, 2u);
+    EXPECT_EQ(rd.snapshot->data, "snap-bytes");
+    const InstallSnapshotReply* rep = nullptr;
+    for (const auto& m : rd.messages)
+        if ((rep = payloadIf<InstallSnapshotReply>(m)))
+            break;
+    ASSERT_NE(rep, nullptr);
+    EXPECT_EQ(rep->matchIndex, 5u);
+    EXPECT_FALSE(n.hasReady());  // fully drained
+
+    // A subsequent AppendEntries branches off the installed snapshot boundary.
+    AppendEntries ae;
+    ae.term = 2;
+    ae.leaderId = 2;
+    ae.prevLogIndex = 5;
+    ae.prevLogTerm = 2;
+    LogEntry e;
+    e.term = 2;
+    e.data = "post-snap";
+    ae.entries = {e};
+    ae.leaderCommit = 6;
+    n.step(Message{.to = 1, .from = 2, .payload = ae});
+    EXPECT_EQ(n.log().lastIndex(), 6u);
+    EXPECT_EQ(n.commitIndex(), 6u);
+}
+
+TEST(RaftNodeTest, StaleSnapshotIsIgnored) {
+    // A snapshot at or below our commit is already covered; we keep our log.
+    RaftNode n(1, {1, 2, 3}, logOfTerms({1, 1, 1}), HardState{1, kNoNode}, fixedTimeout(10));
+    // Push commit to 3 via an AppendEntries heartbeat from the leader.
+    AppendEntries ae;
+    ae.term = 1;
+    ae.leaderId = 2;
+    ae.prevLogIndex = 3;
+    ae.prevLogTerm = 1;
+    ae.leaderCommit = 3;
+    n.step(Message{.to = 1, .from = 2, .payload = ae});
+    drain(n);
+    ASSERT_EQ(n.commitIndex(), 3u);
+
+    InstallSnapshot is;
+    is.term = 1;
+    is.leaderId = 2;
+    is.lastIncludedIndex = 2;  // behind our commit
+    is.lastIncludedTerm = 1;
+    n.step(Message{.to = 1, .from = 2, .payload = is});
+    RaftNode::Ready rd = drain(n);
+    EXPECT_FALSE(rd.snapshot.has_value());  // not installed
+    EXPECT_EQ(n.log().lastIndex(), 3u);     // log intact
+    const InstallSnapshotReply* rep = nullptr;
+    for (const auto& m : rd.messages)
+        if ((rep = payloadIf<InstallSnapshotReply>(m)))
+            break;
+    ASSERT_NE(rep, nullptr);
+    EXPECT_EQ(rep->matchIndex, 3u);
+}
+
 TEST(RaftNodeTest, ReadyReportsEntriesOnceThenClears) {
     RaftNode n(1, {1, 2, 3}, RaftLog{}, HardState{}, fixedTimeout(10));
     AppendEntries ae;

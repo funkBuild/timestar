@@ -17,6 +17,32 @@ using namespace timestar::raft;
 
 namespace {
 
+std::vector<std::string> splitCommands(const std::string& data) {
+    std::vector<std::string> out;
+    std::string cur;
+    for (char c : data) {
+        if (c == '\n') {
+            if (!cur.empty())
+                out.push_back(cur);
+            cur.clear();
+        } else {
+            cur.push_back(c);
+        }
+    }
+    if (!cur.empty())
+        out.push_back(cur);
+    return out;
+}
+
+std::string joinCommands(const std::vector<std::string>& cmds) {
+    std::string out;
+    for (const auto& c : cmds) {
+        out += c;
+        out += '\n';
+    }
+    return out;
+}
+
 class Network {
 public:
     Network(std::vector<NodeId> ids, RaftOptions opts) : ids_(ids) {
@@ -42,6 +68,11 @@ public:
                     continue;
                 RaftNode::Ready rd = n.ready();
                 n.advance(rd);
+                if (rd.snapshot) {
+                    // The driver installs the snapshot as the new applied state.
+                    // Our payload encodes the command list joined by '\n'.
+                    applied_[id] = splitCommands(rd.snapshot->data);
+                }
                 for (auto& e : rd.committed) {
                     if (!e.data.empty())  // skip no-op commit markers
                         applied_[id].push_back(e.data);
@@ -255,6 +286,44 @@ TEST(RaftClusterTest, CheckQuorumStepsDownIsolatedLeader) {
             break;
     }
     EXPECT_EQ(net.node(1).role(), Role::Follower);
+}
+
+TEST(RaftClusterTest, LaggingFollowerCaughtUpByInstallSnapshot) {
+    Network net({1, 2, 3}, opts());
+    net.node(1).campaign();
+    net.run();
+    ASSERT_EQ(net.leader(), 1u);
+
+    // Node 3 misses a batch entirely.
+    net.isolate(3);
+    net.node(1).propose("a");
+    net.node(1).propose("b");
+    net.node(1).propose("c");
+    net.run();
+    ASSERT_EQ(net.applied(3).size(), 0u);
+
+    // Leader compacts its log past node 3's position -- so the entries node 3
+    // needs no longer exist as log entries, forcing an InstallSnapshot on rejoin.
+    const LogIndex commit = net.node(1).commitIndex();
+    net.node(1).compact(commit, joinCommands(net.applied(1)));
+    // The needed entries are now below the leader's snapshot boundary.
+    ASSERT_GT(net.node(1).log().snapshotIndex(), 0u);
+
+    net.heal(3);
+    net.tickAll();
+    net.run();
+
+    // Node 3 was caught up via the snapshot and holds the full command history.
+    ASSERT_EQ(net.applied(3).size(), 3u);
+    EXPECT_EQ(net.applied(3)[0], "a");
+    EXPECT_EQ(net.applied(3)[2], "c");
+    EXPECT_EQ(net.node(3).commitIndex(), net.node(1).commitIndex());
+
+    // And normal replication resumes on top of the snapshot.
+    net.node(1).propose("d");
+    net.run();
+    ASSERT_EQ(net.applied(3).size(), 4u);
+    EXPECT_EQ(net.applied(3)[3], "d");
 }
 
 TEST(RaftClusterTest, LeaderStepsDownWhenPartitionedFromMajority) {

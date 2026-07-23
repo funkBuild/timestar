@@ -41,4 +41,14 @@ struct HardState {
     friend bool operator==(const HardState&, const HardState&) = default;
 };
 
+// A point-in-time snapshot of the state machine covering the compacted log
+// prefix (§7). `data` is opaque to Raft -- a VShard snapshot payload in this
+// system; the driver reads/writes the actual bytes and the core only tracks the
+// (index, term) boundary and relays the payload. index==0 means "no snapshot".
+struct Snapshot {
+    LogIndex index = kNoIndex;
+    Term term = kNoTerm;
+    std::string data;
+};
+
 }  // namespace timestar::raft

@@ -33,11 +33,12 @@ class RaftNode {
 public:
     struct Ready {
         std::optional<HardState> hardState;  // persist (fsync) if present, before messages
+        std::optional<Snapshot> snapshot;    // a received snapshot to install (persist before messages)
         std::vector<LogEntry> entries;       // newly (re)written log entries to persist
         std::vector<LogEntry> committed;     // newly committed entries to apply, in order
-        std::vector<Message> messages;       // send only after hardState+entries are durable
+        std::vector<Message> messages;       // send only after hardState+snapshot+entries are durable
         bool empty() const {
-            return !hardState && entries.empty() && committed.empty() && messages.empty();
+            return !hardState && !snapshot && entries.empty() && committed.empty() && messages.empty();
         }
     };
 
@@ -48,6 +49,11 @@ public:
     void step(Message m);  // an incoming RPC for this group
     bool propose(std::string data);  // leader-only append; false if not leader (replication brick)
     void campaign();       // start an election now (bootstrap / TimeoutNow)
+
+    // Compact this node's log up to `upto` (<= commitIndex) and record the
+    // resulting snapshot so the leader can serve it to lagging followers. Called
+    // by the driver after it has durably written the snapshot payload.
+    void compact(LogIndex upto, std::string snapshotData);
 
     // Output draining (single-threaded: ready() -> persist+send+apply -> advance()).
     bool hasReady() const;
@@ -88,7 +94,10 @@ private:
     // Leader replication.
     void bcastAppend();
     void sendAppend(NodeId peer);
+    void sendInstallSnapshot(NodeId peer);
     void maybeAdvanceCommitAsLeader();
+    void handleInstallSnapshot(NodeId from, const InstallSnapshot& is);
+    void handleInstallSnapshotReply(NodeId from, const InstallSnapshotReply& rr);
 
     size_t countVotes(bool granted) const;
 
@@ -121,6 +130,8 @@ private:
     bool hsDirty_ = false;
     LogIndex unstableStart_ = kNoIndex;  // first log index not yet reported for persistence
     std::vector<Message> pendingMessages_;
+    Snapshot snapshot_;                        // the current snapshot we can serve (index 0 = none)
+    std::optional<Snapshot> pendingSnapshotApply_;  // a received snapshot to surface to the driver
 };
 
 }  // namespace timestar::raft

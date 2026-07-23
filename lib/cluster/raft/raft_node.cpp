@@ -139,6 +139,11 @@ void RaftNode::becomeLeader() {
     matchIndex_[id_] = log_.lastIndex();  // the leader trivially matches its own log
     nextIndex_[id_] = log_.lastIndex() + 1;
 
+    // A single-voter group has no followers to ack, so commit the no-op now;
+    // otherwise a write-idle RF=1 leader would never satisfy a "my current-term
+    // entry is committed" read-readiness gate. Multi-voter groups see no advance
+    // here (only self matches) and commit once followers ack.
+    maybeAdvanceCommitAsLeader();
     bcastAppend();  // replicate the no-op + serve as the first heartbeat
 }
 
@@ -147,9 +152,9 @@ void RaftNode::sendAppend(NodeId peer) {
     const LogIndex prevIndex = ni - 1;
     const auto prevTerm = log_.term(prevIndex);
     if (!prevTerm) {
-        // prevIndex is below our snapshot boundary -> the follower needs an
-        // InstallSnapshot, wired in the snapshot brick. Unreachable until
-        // leader-side compaction exists.
+        // prevIndex is below our compacted boundary: the follower is behind our
+        // snapshot and must be caught up with the snapshot itself.
+        sendInstallSnapshot(peer);
         return;
     }
     AppendEntries ae;
@@ -167,6 +172,78 @@ void RaftNode::bcastAppend() {
         if (peer != id_)
             sendAppend(peer);
     }
+}
+
+void RaftNode::sendInstallSnapshot(NodeId peer) {
+    if (snapshot_.index == kNoIndex)
+        return;  // nothing to serve (should not happen once compaction ran)
+    InstallSnapshot is;
+    is.term = currentTerm_;
+    is.leaderId = id_;
+    is.lastIncludedIndex = snapshot_.index;
+    is.lastIncludedTerm = snapshot_.term;
+    is.data = snapshot_.data;
+    // Optimistically assume the follower will accept through the snapshot end.
+    nextIndex_[peer] = snapshot_.index + 1;
+    send(Message{.to = peer, .from = id_, .payload = std::move(is)});
+}
+
+void RaftNode::compact(LogIndex upto, std::string snapshotData) {
+    if (upto > commitIndex_)
+        upto = commitIndex_;  // never compact past what is committed
+    log_.compactTo(upto);
+    snapshot_.index = log_.snapshotIndex();
+    snapshot_.term = log_.snapshotTerm();
+    snapshot_.data = std::move(snapshotData);
+}
+
+void RaftNode::handleInstallSnapshot(NodeId from, const InstallSnapshot& is) {
+    // Recognize the leader and reset the election clock (same as an AppendEntries).
+    if (role_ != Role::Follower)
+        becomeFollower(currentTerm_, is.leaderId);
+    else {
+        leaderId_ = is.leaderId;
+        electionElapsed_ = 0;
+    }
+
+    InstallSnapshotReply reply;
+    reply.term = currentTerm_;
+
+    if (is.lastIncludedIndex <= commitIndex_) {
+        // Stale: we already have everything the snapshot covers.
+        reply.matchIndex = commitIndex_;
+        send(Message{.to = from, .from = id_, .payload = reply});
+        return;
+    }
+
+    // Adopt the snapshot. If our log already holds a matching entry at the
+    // snapshot boundary, keep the consistent suffix; otherwise discard the log.
+    if (log_.matchTerm(is.lastIncludedIndex, is.lastIncludedTerm))
+        log_.compactTo(is.lastIncludedIndex);
+    else
+        log_.restoreFromSnapshot(is.lastIncludedIndex, is.lastIncludedTerm);
+
+    snapshot_.index = is.lastIncludedIndex;
+    snapshot_.term = is.lastIncludedTerm;
+    snapshot_.data = is.data;
+    commitIndex_ = std::max(commitIndex_, is.lastIncludedIndex);
+    lastApplied_ = is.lastIncludedIndex;  // the snapshot IS the applied state
+    unstableStart_ = std::max(unstableStart_, log_.lastIndex() + 1);
+    pendingSnapshotApply_ = snapshot_;  // surface to the driver to install
+
+    reply.matchIndex = is.lastIncludedIndex;
+    send(Message{.to = from, .from = id_, .payload = reply});
+}
+
+void RaftNode::handleInstallSnapshotReply(NodeId from, const InstallSnapshotReply& rr) {
+    if (role_ != Role::Leader || !isVoter(from))
+        return;
+    if (rr.matchIndex > matchIndex_[from])
+        matchIndex_[from] = rr.matchIndex;
+    nextIndex_[from] = std::max(nextIndex_[from], matchIndex_[from] + 1);
+    maybeAdvanceCommitAsLeader();
+    if (nextIndex_[from] <= log_.lastIndex())
+        sendAppend(from);
 }
 
 LogIndex RaftNode::lastIndexOfTerm(Term t) const {
@@ -187,7 +264,9 @@ void RaftNode::handleAppendEntriesReply(NodeId from, const AppendEntriesReply& r
     if (rr.success) {
         if (rr.matchIndex > matchIndex_[from])
             matchIndex_[from] = rr.matchIndex;
-        nextIndex_[from] = matchIndex_[from] + 1;
+        // Keep any optimistically-streamed higher nextIndex; never rewind on a
+        // reordered success (etcd semantics).
+        nextIndex_[from] = std::max(nextIndex_[from], matchIndex_[from] + 1);
         maybeAdvanceCommitAsLeader();
         // Keep streaming if the follower is still behind our log end.
         if (nextIndex_[from] <= log_.lastIndex())
@@ -348,12 +427,14 @@ void RaftNode::step(Message m) {
                 handleAppendEntries(m.from, p);
             } else if constexpr (std::is_same_v<T, AppendEntriesReply>) {
                 handleAppendEntriesReply(m.from, p);
+            } else if constexpr (std::is_same_v<T, InstallSnapshot>) {
+                handleInstallSnapshot(m.from, p);
+            } else if constexpr (std::is_same_v<T, InstallSnapshotReply>) {
+                handleInstallSnapshotReply(m.from, p);
             } else if constexpr (std::is_same_v<T, TimeoutNow>) {
                 if (isVoter(id_))
                     campaign();  // leader transfer: elect now
             }
-            // AppendEntriesReply / InstallSnapshot / InstallSnapshotReply are
-            // handled in the replication and snapshot bricks.
         },
         m.payload);
 }
@@ -485,14 +566,16 @@ bool RaftNode::propose(std::string data) {
 }
 
 bool RaftNode::hasReady() const {
-    return hsDirty_ || unstableStart_ <= log_.lastIndex() || commitIndex_ > lastApplied_ ||
-           !pendingMessages_.empty();
+    return hsDirty_ || pendingSnapshotApply_.has_value() || unstableStart_ <= log_.lastIndex() ||
+           commitIndex_ > lastApplied_ || !pendingMessages_.empty();
 }
 
 RaftNode::Ready RaftNode::ready() {
     Ready rd;
     if (hsDirty_)
         rd.hardState = HardState{currentTerm_, votedFor_};
+    if (pendingSnapshotApply_)
+        rd.snapshot = pendingSnapshotApply_;
 
     const LogIndex from = std::max(unstableStart_, log_.firstIndex());
     if (from <= log_.lastIndex())
@@ -520,6 +603,8 @@ RaftNode::Ready RaftNode::ready() {
 void RaftNode::advance(const Ready& rd) {
     if (rd.hardState)
         hsDirty_ = false;
+    if (rd.snapshot)
+        pendingSnapshotApply_.reset();
     if (!rd.entries.empty())
         unstableStart_ = std::max(unstableStart_, rd.entries.back().index + 1);
     // commitIndex_ at ready() time == now (no interleaving under the contract);
