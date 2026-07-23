@@ -18,13 +18,18 @@ namespace timestar {
 namespace {
 
 // Resolve one series' last-write-wins view across the given files (already sorted
-// oldest-first) into (timestamps, values), then write it to the output at the
-// migrated floor (no revisions). Returns whether anything was written.
+// oldest-first) into (timestamps, values), then STREAM it to the output at the
+// migrated floor (no revisions). `type` is the newest declared type; files where
+// the series carries a DIFFERENT type are skipped -- a type-flipped series keeps
+// only its newest-type data rather than aborting the whole migration on a block
+// type mismatch. Returns whether anything was written.
 template <class T>
 seastar::future<bool> migrateSeries(TSMValueType type, const SeriesId128& seriesId,
                                     const std::vector<seastar::shared_ptr<::TSM>>& files, TSMWriter& writer) {
     std::map<uint64_t, T> resolved;
     for (const auto& file : files) {
+        if (file->getSeriesType(seriesId) != type)
+            continue;  // series absent, or a stale different-typed generation -> ignore
         TSMResult<T> result(0);
         co_await file->readSeries<T>(seriesId, 0, UINT64_MAX, result);
         auto [timestamps, values] = result.getAllData();
@@ -42,8 +47,9 @@ seastar::future<bool> migrateSeries(TSMValueType type, const SeriesId128& series
         ts.push_back(t);
         vals.push_back(std::move(v));
     }
-    // No `revisions` argument -> migrated-floor [0,0] blocks.
-    writer.writeSeries(type, seriesId, ts, vals);
+    // No revision range -> migrated-floor [0,0] blocks. Streamed to bound memory
+    // and drain between blocks (offline migration may move a large VShard).
+    co_await writer.writeSeriesStreaming<T>(type, seriesId, ts, vals);
     co_return true;
 }
 
@@ -67,9 +73,11 @@ seastar::future<size_t> migrateVShardToFile(VShardId vshard, std::vector<seastar
     TSMWriter writer(outputPath);
     size_t written = 0;
     for (const auto& seriesId : series) {
+        // Resolve the type from the NEWEST file that declares the series (sources
+        // are oldest-first, so scan from the back) -- the LWW winner's type.
         std::optional<TSMValueType> type;
-        for (const auto& file : sourceFiles) {
-            if ((type = file->getSeriesType(seriesId)))
+        for (auto it = sourceFiles.rbegin(); it != sourceFiles.rend(); ++it) {
+            if ((type = (*it)->getSeriesType(seriesId)))
                 break;
         }
         if (!type)
@@ -94,8 +102,8 @@ seastar::future<size_t> migrateVShardToFile(VShardId vshard, std::vector<seastar
             ++written;
     }
 
-    writer.writeIndex();
-    writer.close();
+    co_await writer.writeIndexStreaming();
+    co_await writer.closeDMA();
     co_return written;
 }
 

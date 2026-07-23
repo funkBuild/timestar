@@ -20,6 +20,12 @@ namespace timestar {
 // Additive: it only reads existing files and writes a NEW file; it does not
 // mutate or delete the sources (the caller sequences delete-after-verify for
 // crash-atomicity). Returns the number of series written.
+//
+// Offline / one-VShard-at-a-time: it streams output (writeSeriesStreaming +
+// closeDMA) to bound memory and drain between blocks, so a large VShard does not
+// pin its whole encoded size in RAM. A series whose value type differs across
+// files (a corrupt type-flip) keeps only its NEWEST-type data; older,
+// different-typed generations are skipped rather than aborting the migration.
 seastar::future<size_t> migrateVShardToFile(VShardId vshard, std::vector<seastar::shared_ptr<::TSM>> sourceFiles,
                                             std::string outputPath);
 

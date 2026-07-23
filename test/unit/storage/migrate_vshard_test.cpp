@@ -108,4 +108,58 @@ TEST_F(MigrateVShardTest, MigrateResolvesAndFloorsRevisions) {
     seastar::async([&] { testMigrateResolvesAndFloorsRevisions(dir).get(); }).get();
 }
 
+// A type-flipped series (same key, different value type across files) must keep
+// only its NEWEST-type data and must NOT abort the migration with a block
+// type-mismatch throw (adversarial-review F1).
+seastar::future<> testTypeFlipKeepsNewestTypeNoThrow(std::string dir) {
+    const std::string key = "flip,loc=x v";
+    const auto s = SeriesId128::fromSeriesKey(key);
+    const uint16_t vs = timestar::virtualShard(s);
+
+    // Older file: series as FLOAT.
+    std::vector<SeriesData> floatFile;
+    floatFile.push_back(SeriesData{key, {100}, {1.0}});
+    seastar::shared_ptr<::TSM> f0 = co_await writeFile(dir + "/00_0000000000.tsm", 0, floatFile);
+    // Newer file: SAME series key as INTEGER (a corrupt type flip).
+    {
+        TSMWriter w(dir + "/00_0000000001.tsm");
+        std::vector<uint64_t> ts = {200};
+        std::vector<int64_t> vs2 = {7};
+        w.writeSeries(TSMValueType::Integer, s, ts, vs2);
+        w.writeIndex();
+        w.close();
+    }
+    auto f1 = seastar::make_shared<::TSM>(dir + "/00_0000000001.tsm");
+    f1->tierNum = 0;
+    f1->seqNum = 1;
+    co_await f1->open();
+    co_await f1->readSparseIndex();
+
+    const std::string outPath = dir + "/01_0000000000.tsm";
+    // co_await directly: a block type-mismatch throw would propagate and fail the
+    // test -- so reaching the assertion below IS the no-throw guarantee.
+    const size_t written = co_await timestar::migrateVShardToFile(timestar::VShardId{vs}, {f0, f1}, outPath);
+    EXPECT_EQ(written, 1u);
+
+    co_await f0->close();
+    co_await f1->close();
+
+    auto out = seastar::make_shared<::TSM>(outPath);
+    co_await out->open();
+    co_await out->readSparseIndex();
+    // Newest type (Integer) wins; the older Float generation is dropped.
+    auto t = out->getSeriesType(s);
+    EXPECT_TRUE(t.has_value() && *t == TSMValueType::Integer) << "newest-type (Integer) must win the flip";
+    TSMResult<int64_t> r(0);
+    co_await out->readSeries<int64_t>(s, 0, UINT64_MAX, r);
+    auto [rts, rvs] = r.getAllData();
+    EXPECT_EQ(rts, (std::vector<uint64_t>{200}));
+    EXPECT_EQ(rvs, (std::vector<int64_t>{7}));
+    co_await out->close();
+    co_return;
+}
+TEST_F(MigrateVShardTest, TypeFlipKeepsNewestTypeNoThrow) {
+    seastar::async([&] { testTypeFlipKeepsNewestTypeNoThrow(dir).get(); }).get();
+}
+
 }  // namespace
