@@ -20,6 +20,10 @@ std::string encodeMeasurementFieldsKey(const std::string& measurement);
 std::string encodeMeasurementTagsKey(const std::string& measurement);
 std::string encodeTagValuesKey(const std::string& measurement, const std::string& tagKey);
 std::string encodeSeriesMetadataKey(const SeriesId128& seriesId);
+// Prefix covering all SERIES_METADATA of one VShard: [type:1][vshard:2 BE].
+std::string encodeSeriesMetadataVShardPrefix(uint16_t vshard);
+// Byte offset of the SeriesId128 within a SERIES_METADATA key ([type][vshard]).
+inline constexpr size_t kSeriesMetadataKeyIdOffset = 1 + 2;
 // Per-series value-type binding (SERIES_VALUE_TYPE). Value is a single byte
 // holding the TSMValueType; see index_backend.hpp for why this exists.
 std::string encodeSeriesValueTypeKey(const SeriesId128& seriesId);

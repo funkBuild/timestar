@@ -1,5 +1,7 @@
 #include "../../../lib/index/key_encoding.hpp"
 
+#include "../../../lib/core/placement_table.hpp"
+
 #include <gtest/gtest.h>
 
 #include <string>
@@ -15,8 +17,17 @@ TEST(KeyEncodingTest, EncodeMeasurementFieldsKey) {
 TEST(KeyEncodingTest, EncodeSeriesMetadataKey) {
     auto id = SeriesId128::fromHex("0102030405060708090a0b0c0d0e0f10");
     auto key = encodeSeriesMetadataKey(id);
+    // Type-first-then-VShard: [type:1][vshard:2 BE][seriesId:16] (ADR 0002).
     EXPECT_EQ(key[0], static_cast<char>(SERIES_METADATA));
-    EXPECT_EQ(key.size(), 17u);  // 1 prefix + 16 bytes
+    EXPECT_EQ(key.size(), 1u + 2u + 16u);
+    // The embedded VShard equals virtualShard(id), big-endian.
+    const uint16_t vs = timestar::virtualShard(id);
+    EXPECT_EQ(static_cast<uint8_t>(key[1]), (vs >> 8) & 0xff);
+    EXPECT_EQ(static_cast<uint8_t>(key[2]), vs & 0xff);
+    // The seriesId follows at the documented offset.
+    EXPECT_EQ(key.substr(kSeriesMetadataKeyIdOffset), id.toBytes());
+    // The per-VShard prefix is the key's [type][vshard] head.
+    EXPECT_EQ(encodeSeriesMetadataVShardPrefix(vs), key.substr(0, kSeriesMetadataKeyIdOffset));
 }
 
 TEST(KeyEncodingTest, EncodeFieldTypeKey) {

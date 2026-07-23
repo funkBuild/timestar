@@ -1,5 +1,7 @@
 #include "key_encoding.hpp"
 
+#include "../core/placement_table.hpp"  // virtualShard (VShard-prefixed keys)
+
 #include <endian.h>
 
 #include <charconv>
@@ -51,12 +53,28 @@ std::string encodeTagValuesKey(const std::string& measurement, const std::string
     return key;
 }
 
+// SERIES_METADATA key layout is TYPE-first-then-VShard: [type:1][vshard:2 BE]
+// [seriesId:16]. Type-first preserves the by-type full scan (prefix [type]);
+// the VShard sub-prefix ([type][vshard]) makes per-VShard extraction a range
+// scan rather than a decode-and-filter over every series (ADR 0002).
 std::string encodeSeriesMetadataKey(const SeriesId128& seriesId) {
     std::string key;
-    key.reserve(1 + 16);
+    key.reserve(1 + 2 + 16);
     key.push_back(static_cast<char>(SERIES_METADATA));
+    const uint16_t vs = timestar::virtualShard(seriesId);
+    key.push_back(static_cast<char>((vs >> 8) & 0xff));  // big-endian, so key order groups by VShard
+    key.push_back(static_cast<char>(vs & 0xff));
     seriesId.appendTo(key);
     return key;
+}
+
+std::string encodeSeriesMetadataVShardPrefix(uint16_t vshard) {
+    std::string prefix;
+    prefix.reserve(1 + 2);
+    prefix.push_back(static_cast<char>(SERIES_METADATA));
+    prefix.push_back(static_cast<char>((vshard >> 8) & 0xff));
+    prefix.push_back(static_cast<char>(vshard & 0xff));
+    return prefix;
 }
 
 std::string encodeSeriesValueTypeKey(const SeriesId128& seriesId) {

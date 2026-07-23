@@ -1117,9 +1117,7 @@ seastar::future<std::vector<std::pair<SeriesId128, std::optional<SeriesMetadata>
         }
 
         // Cache miss — build key in reusable buffer
-        key.clear();
-        key.push_back(static_cast<char>(SERIES_METADATA));
-        id.appendTo(key);
+        key = ke::encodeSeriesMetadataKey(id);
 
         auto val = co_await kvGet(key);
         if (val.has_value()) {
@@ -1137,14 +1135,14 @@ seastar::future<std::vector<std::pair<SeriesId128, std::optional<SeriesMetadata>
 seastar::future<std::vector<std::pair<SeriesId128, SeriesMetadata>>> NativeIndex::extractVShardSeriesMetadata(
     uint16_t vshard) {
     std::vector<std::pair<SeriesId128, SeriesMetadata>> out;
-    // SERIES_METADATA key = [type:1][seriesId:16]. Scan the type, keep only the
-    // series that route to this VShard.
-    const std::string prefix(1, static_cast<char>(SERIES_METADATA));
+    // Key = [type:1][vshard:2 BE][seriesId:16]. The VShard sub-prefix makes this a
+    // true RANGE SCAN over only this VShard's series -- no decode-and-filter over
+    // the whole type (the point of the type-first-then-VShard layout).
+    const std::string prefix = ke::encodeSeriesMetadataVShardPrefix(vshard);
     co_await kvPrefixScan(prefix, [&](std::string_view key, std::string_view val) -> bool {
-        if (key.size() >= 1 + 16) {
-            SeriesId128 id = SeriesId128::fromBytes(key.substr(1, 16));
-            if (timestar::virtualShard(id) == vshard)
-                out.emplace_back(id, ke::decodeSeriesMetadata(val));
+        if (key.size() >= ke::kSeriesMetadataKeyIdOffset + 16) {
+            SeriesId128 id = SeriesId128::fromBytes(key.data() + ke::kSeriesMetadataKeyIdOffset, 16);
+            out.emplace_back(id, ke::decodeSeriesMetadata(val));
         }
         return true;  // continue the scan
     });
@@ -1480,9 +1478,7 @@ NativeIndex::findSeriesWithMetadata(const std::string& measurement,
             if (cached) {
                 meta = cached;
             } else {
-                key.clear();
-                key.push_back(static_cast<char>(SERIES_METADATA));
-                id.appendTo(key);
+                key = ke::encodeSeriesMetadataKey(id);
                 auto val = co_await kvGet(key);
                 if (val.has_value()) {
                     decoded.emplace(ke::decodeSeriesMetadata(*val));
@@ -1569,9 +1565,7 @@ NativeIndex::findSeriesWithMetadata(const std::string& measurement,
         if (cached) {
             meta = cached;
         } else {
-            key.clear();
-            key.push_back(static_cast<char>(SERIES_METADATA));
-            id.appendTo(key);
+            key = ke::encodeSeriesMetadataKey(id);
             auto val = co_await kvGet(key);
             if (val.has_value()) {
                 decoded.emplace(ke::decodeSeriesMetadata(*val));
@@ -2198,8 +2192,9 @@ seastar::future<> NativeIndex::migrateToLocalIds(IndexWriteBatch& batch) {
     // Scan all SERIES_METADATA entries to assign local IDs
     std::string metaPrefix(1, static_cast<char>(SERIES_METADATA));
     co_await kvPrefixScan(metaPrefix, [&](std::string_view key, std::string_view) {
-        if (key.size() >= 1 + 16) {
-            SeriesId128 globalId = SeriesId128::fromBytes(key.data() + 1, 16);
+        if (key.size() >= ke::kSeriesMetadataKeyIdOffset + 16) {
+            // Key = [type:1][vshard:2][seriesId:16]; the id follows the type+vshard.
+            SeriesId128 globalId = SeriesId128::fromBytes(key.data() + ke::kSeriesMetadataKeyIdOffset, 16);
             uint32_t localId = localIdMap_.getOrAssign(globalId);
             batch.put(ke::encodeLocalIdForwardKey(localId), globalId.toBytes());
         }
@@ -2754,9 +2749,7 @@ NativeIndex::findSeriesWithMetadataTimeScoped(const std::string& measurement,
         if (cached) {
             meta = cached;
         } else {
-            key.clear();
-            key.push_back(static_cast<char>(SERIES_METADATA));
-            id.appendTo(key);
+            key = ke::encodeSeriesMetadataKey(id);
             auto val = co_await kvGet(key);
             if (val.has_value()) {
                 decoded.emplace(ke::decodeSeriesMetadata(*val));
