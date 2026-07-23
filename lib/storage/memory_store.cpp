@@ -753,6 +753,13 @@ void MemoryStore::deleteRange(const SeriesId128& seriesId, uint64_t startTime, u
 
             timestamps.erase(timestamps.begin() + startIdx, timestamps.begin() + endIdx);
             values.erase(values.begin() + startIdx, values.begin() + endIdx);
+            // Keep the revision column parallel to values (invariant: empty, or
+            // size == values). Erasing the same sub-range preserves it; skipping
+            // this desyncs revisions and either aborts the next flush or mispairs
+            // revisions with values on a later insert.
+            auto& revisions = inMemorySeries.revisions;
+            if (!revisions.empty())
+                revisions.erase(revisions.begin() + startIdx, revisions.begin() + endIdx);
 
             // Invalidate running stats after deletion — they may no longer
             // reflect the actual data (min/max could have been in deleted range).

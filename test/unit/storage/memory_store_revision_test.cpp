@@ -82,4 +82,28 @@ TEST(MemoryStoreRevisionTest, TrackedThenUntrackedIncomingIsFloor) {
     EXPECT_EQ(s.revisions, (std::vector<uint64_t>{5, 0}));
 }
 
+// Regression (adversarial review FINDING 1): a partial range-delete must keep the
+// revision column parallel to values, else the next flush aborts or a later insert
+// mispairs revisions.
+TEST(MemoryStoreRevisionTest, DeleteRangeKeepsRevisionColumnParallel) {
+    MemoryStore store(/*sequenceNumber=*/1);
+    const SeriesId128 id = SeriesId128::fromSeriesKey("m.f");
+
+    // Route a tracked insert into the store's series map, then partial-delete.
+    {
+        InMemorySeries<double> tmp;
+        tmp.insert(makeInsert({10, 20, 30}, {1.0, 2.0, 3.0}, {5, 6, 7}));
+        store.series[id] = std::move(tmp);
+    }
+
+    store.deleteRange(id, 10, 20);  // removes ts 10 and 20, leaving ts 30
+
+    auto& variant = store.series.find(id)->second;
+    auto& s = std::get<InMemorySeries<double>>(variant);
+    ASSERT_EQ(s.timestamps, (std::vector<uint64_t>{30}));
+    ASSERT_EQ(s.values, (std::vector<double>{3.0}));
+    ASSERT_EQ(s.revisions.size(), s.values.size()) << "revision column desynced from values after delete";
+    EXPECT_EQ(s.revisions, (std::vector<uint64_t>{7})) << "surviving point kept its own revision, not a deleted one";
+}
+
 }  // namespace
