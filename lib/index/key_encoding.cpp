@@ -77,10 +77,14 @@ std::string encodeSeriesMetadataVShardPrefix(uint16_t vshard) {
     return prefix;
 }
 
+// Type-first-then-VShard, like SERIES_METADATA: [type:1][vshard:2 BE][seriesId:16].
 std::string encodeSeriesValueTypeKey(const SeriesId128& seriesId) {
     std::string key;
-    key.reserve(1 + 16);
+    key.reserve(1 + 2 + 16);
     key.push_back(static_cast<char>(SERIES_VALUE_TYPE));
+    const uint16_t vs = timestar::virtualShard(seriesId);
+    key.push_back(static_cast<char>((vs >> 8) & 0xff));
+    key.push_back(static_cast<char>(vs & 0xff));
     seriesId.appendTo(key);
     return key;
 }
