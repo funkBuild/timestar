@@ -1373,20 +1373,57 @@ seastar::future<CompactionStats> TSMCompactor::executeCompaction(CompactionPlan 
                                            [](const auto& f) { return f && f->hasTombstones(); });
     if (vshardPartition_ && localRetention.empty() && !anyTombstones && !plan.sourceFiles.empty()) {
         const uint64_t maxDataSeq = maxDataSeqOf(plan.sourceFiles);
+        // Write outputs to .tmp names first, so publishing is a crash-safe rename.
         auto pathFor = [this, tier = plan.targetTier, maxDataSeq](timestar::VShardId) {
-            return generateCompactedFilename(tier, fileManager->allocateSequenceId(), maxDataSeq);
+            return generateCompactedFilename(tier, fileManager->allocateSequenceId(), maxDataSeq) + ".tmp";
         };
         auto parts = co_await timestar::partitionByVShard(plan.sourceFiles, pathFor);
-        for (const auto& [vs, path] : parts) {
-            auto tsm = seastar::make_shared<TSM>(path);
+
+        // A delete acked WHILE partitionByVShard read the raw data would be
+        // resurrected (the partition path ignores tombstones). Re-check: if any
+        // source gained a tombstone during the read, discard the outputs and keep
+        // the sources -- the next cycle sees the tombstone and takes the merge
+        // path. Also keep the sources if nothing was produced (no data loss).
+        const bool raced = std::any_of(plan.sourceFiles.begin(), plan.sourceFiles.end(),
+                                       [](const auto& f) { return f && f->hasTombstones(); });
+        if (parts.empty() || raced) {
+            for (const auto& [vs, tmp] : parts)
+                co_await seastar::remove_file(tmp);
+            co_return CompactionStats{};  // sources untouched
+        }
+
+        // Publish: rename each .tmp -> final and register it, then fsync the tsm
+        // directory so the new entries are durable BEFORE the sources are removed
+        // (the ordering the normal path relies on to avoid crash data-loss).
+        uint64_t bytesWritten = 0;
+        std::string dirPath;
+        for (const auto& [vs, tmp] : parts) {
+            const std::string finalPath = tmp.substr(0, tmp.size() - 4);  // strip ".tmp"
+            co_await seastar::rename_file(tmp, finalPath);
+            auto tsm = seastar::make_shared<TSM>(finalPath);
             co_await tsm->open();
             co_await fileManager->addTSMFile(tsm);
+            bytesWritten += tsm->getFileSize();
+            if (dirPath.empty()) {
+                const auto slash = finalPath.rfind('/');
+                dirPath = (slash != std::string::npos) ? finalPath.substr(0, slash) : ".";
+            }
+        }
+        if (!dirPath.empty()) {
+            try {
+                auto d = co_await seastar::open_directory(dirPath);
+                co_await d.flush();
+                co_await d.close();
+            } catch (...) {
+                // best-effort directory sync
+            }
         }
         co_await fileManager->removeTSMFiles(plan.sourceFiles);
 
         CompactionStats finalStats;
         finalStats.filesCompacted = plan.sourceFiles.size();
         finalStats.bytesRead = sourceBytes;
+        finalStats.bytesWritten = bytesWritten;
         finalStats.duration =
             std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - active.startTime);
         co_return finalStats;

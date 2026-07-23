@@ -10,6 +10,7 @@
 #include <map>
 #include <optional>
 #include <seastar/core/coroutine.hh>
+#include <seastar/core/seastar.hh>
 #include <set>
 #include <string>
 #include <vector>
@@ -122,8 +123,13 @@ seastar::future<std::vector<std::pair<VShardId, std::string>>> partitionByVShard
         const VShardId id{vs};
         std::string path = pathForVShard(id);
         const size_t n = co_await compactVShardToFile(id, inputs, path);
-        if (n > 0)
+        if (n > 0) {
             out.emplace_back(id, std::move(path));
+        } else {
+            // No surviving series for this VShard: compactVShardToFile still wrote
+            // a header+index file. Remove it so it does not orphan on disk.
+            co_await seastar::remove_file(path);
+        }
     }
     co_return out;
 }
