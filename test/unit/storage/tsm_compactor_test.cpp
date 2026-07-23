@@ -877,3 +877,49 @@ SEASTAR_TEST_F(TSMCompactorTest, ZeroCopyCompactionPreservesRevisionRanges) {
     co_await checkRange(seriesB, 20u, 25u);
     co_return;
 }
+
+// V4 revision ranges must survive the MERGE (slow) compaction path too: two files
+// with the SAME series and overlapping timestamps force a merge/re-block, and the
+// compacted file's max-revision trailer must still reflect the inputs' max (else
+// compaction erases revisions and breaks recovery-counter restoration -- LWW
+// inversion after restart). Regression for the writeSeriesStreaming range-loss.
+SEASTAR_TEST_F(TSMCompactorTest, MergeCompactionPreservesMaxRevision) {
+    std::vector<seastar::shared_ptr<TSM>> files;
+    const SeriesId128 series = SeriesId128::fromSeriesKey("revmerge.value");
+
+    for (int i = 0; i < 2; ++i) {
+        char filename[256];
+        snprintf(filename, sizeof(filename), "shard_0/tsm/00_%010d.tsm", i);
+
+        std::vector<uint64_t> ts;
+        std::vector<double> vs;
+        std::vector<uint64_t> revs;
+        for (int p = 0; p < 50; ++p) {
+            ts.push_back(1000000 + p * 1000);  // SAME timestamps in both files -> overlap -> merge
+            vs.push_back(i * 100.0 + p);
+            revs.push_back(static_cast<uint64_t>(i * 1000 + p + 1));  // file 1 has the higher revisions
+        }
+        TSMWriter writer(filename);
+        writer.writeSeries(TSMValueType::Float, series, ts, vs, revs);
+        writer.writeIndex();
+        writer.close();
+
+        auto tsm = seastar::make_shared<TSM>(filename);
+        tsm->tierNum = 0;
+        tsm->seqNum = i;
+        co_await tsm->open();
+        co_await tsm->readSparseIndex();
+        files.push_back(tsm);
+    }
+
+    auto result = co_await self->compactor->compact(files);
+    EXPECT_FALSE(result.outputPath.empty());
+
+    auto out = seastar::make_shared<TSM>(result.outputPath);
+    co_await out->open();
+    // Inputs' max revision is 1049 (file 1: 1000 + 49 + 1 - 1 = 1049). The merge
+    // path must preserve it in the file-level trailer, not collapse to 0.
+    EXPECT_EQ(out->fileFormatVersion(), 4u);
+    EXPECT_GE(out->maxRevision(), 1049u) << "merge compaction erased revisions -> recovery counter would invert LWW";
+    co_return;
+}

@@ -301,6 +301,13 @@ seastar::future<SeriesCompactionData<T>> TSMCompactor::processSeriesForCompactio
         }
     });
 
+    // Union of every input block's revision range (used by the merge path to
+    // preserve the file-level max revision; see SeriesCompactionData::revRange).
+    for (const auto& meta : blockMeta) {
+        result.revRange.merge(
+            timestar::RevisionRange{meta.indexBlock.blockMinRev, meta.indexBlock.blockMaxRev, /*empty=*/false});
+    }
+
     if (allBlocksNonOverlapping && !stringDictForcesSlowPath && !blockMeta.empty() && tombstoneRanges.empty() &&
         !hasPerPointRetention && !coalesceUnderfullBlocks) {
         // ZERO-COPY PATH: record where each block lives; do not read any of them.
@@ -954,7 +961,8 @@ seastar::future<> TSMCompactor::writeSeriesCompactionData(TSMWriter& writer, Ser
             // Already written incrementally through the chunk sink; the vectors
             // hold nothing that has not been emitted.
         } else if (!data.timestamps.empty()) {
-            co_await writer.writeSeriesStreaming(data.seriesType, data.seriesId, data.timestamps, data.values);
+            co_await writer.writeSeriesStreaming(data.seriesType, data.seriesId, data.timestamps, data.values,
+                                                 data.revRange);
         }
     }
 

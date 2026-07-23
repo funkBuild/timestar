@@ -225,8 +225,8 @@ void TSMWriter::writeSeries(TSMValueType seriesType, const SeriesId128& seriesId
 // merge path must use this instead.
 template <class T>
 seastar::future<> TSMWriter::writeSeriesStreaming(TSMValueType seriesType, const SeriesId128& seriesId,
-                                                  const std::vector<uint64_t>& timestamps,
-                                                  const std::vector<T>& values) {
+                                                  const std::vector<uint64_t>& timestamps, const std::vector<T>& values,
+                                                  timestar::RevisionRange seriesRevRange) {
     if (timestamps.size() != values.size()) {
         throw std::invalid_argument("TSMWriter::writeSeriesStreaming: timestamps (" +
                                     std::to_string(timestamps.size()) + ") and values (" +
@@ -237,18 +237,21 @@ seastar::future<> TSMWriter::writeSeriesStreaming(TSMValueType seriesType, const
     LOG_INSERT_PATH(timestar::tsm_log, debug, "Streaming blocks for series '{}' ({} total points, up to {} per block)",
                     seriesId.toHex(), timestamps.size(), maxPointsPerBlock_);
 
-    // NOTE (V4 revision ranges): this is the compaction MERGE path. It re-blocks
-    // decoded points across inputs, so an output block does not correspond 1:1 to
-    // any input block and its [minRev, maxRev] cannot be carried forward here.
-    // Computing it correctly needs the per-point revision (the tier-0 revision
-    // column, ADR 0003 sec 4), which this signature does not yet carry -- so
-    // merged blocks are left at the migrated-floor [0,0]. This is benign only
-    // while no producer stamps non-zero revisions; the per-point column work must
-    // land the revision channel here at the same time it wires the producer. The
-    // zero-copy path (writeCompressedBlockWithStats) already preserves ranges.
+    // V4 revision ranges: this is the compaction MERGE path. It re-blocks decoded
+    // points across inputs, so an output block does not correspond 1:1 to any
+    // input block and per-point revisions are not available here. It therefore
+    // stamps the whole-series union range (from the inputs) on every output
+    // block -- coarser than per-block, but it conservatively PRESERVES the
+    // file-level max revision so compaction never erases revisions and breaks the
+    // recovery counter (ADR 0003). The zero-copy path keeps exact per-block ranges.
     for (size_t offset = 0; offset < timestamps.size(); offset += maxPointsPerBlock_) {
         const size_t end = std::min(timestamps.size(), (size_t)(offset + maxPointsPerBlock_));
         writeSeriesBlockAt<T>(seriesType, seriesId, timestamps, values, offset, end - offset, indexEntry);
+        if (!seriesRevRange.empty && !indexEntry.indexBlocks.empty()) {
+            auto& block = indexEntry.indexBlocks.back();
+            block.blockMinRev = seriesRevRange.minRev;
+            block.blockMaxRev = seriesRevRange.maxRev;
+        }
         // Block boundary: the length back-patch for this block is complete.
         co_await flushIfNeeded();
     }
@@ -1071,16 +1074,18 @@ seastar::future<> TSMWriter::appendSeriesChunk(TSMValueType seriesType, const Se
 // Streaming variants (compaction merge path)
 template seastar::future<> TSMWriter::writeSeriesStreaming<double>(TSMValueType, const SeriesId128&,
                                                                    const std::vector<uint64_t>&,
-                                                                   const std::vector<double>&);
+                                                                   const std::vector<double>&, timestar::RevisionRange);
 template seastar::future<> TSMWriter::writeSeriesStreaming<bool>(TSMValueType, const SeriesId128&,
-                                                                 const std::vector<uint64_t>&,
-                                                                 const std::vector<bool>&);
+                                                                 const std::vector<uint64_t>&, const std::vector<bool>&,
+                                                                 timestar::RevisionRange);
 template seastar::future<> TSMWriter::writeSeriesStreaming<std::string>(TSMValueType, const SeriesId128&,
                                                                         const std::vector<uint64_t>&,
-                                                                        const std::vector<std::string>&);
+                                                                        const std::vector<std::string>&,
+                                                                        timestar::RevisionRange);
 template seastar::future<> TSMWriter::writeSeriesStreaming<int64_t>(TSMValueType, const SeriesId128&,
                                                                     const std::vector<uint64_t>&,
-                                                                    const std::vector<int64_t>&);
+                                                                    const std::vector<int64_t>&,
+                                                                    timestar::RevisionRange);
 template seastar::future<> TSMWriter::appendSeriesChunk<double>(TSMValueType, const SeriesId128&, std::vector<uint64_t>,
                                                                 std::vector<double>);
 template seastar::future<> TSMWriter::appendSeriesChunk<bool>(TSMValueType, const SeriesId128&, std::vector<uint64_t>,

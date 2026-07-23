@@ -2,6 +2,7 @@
 
 #include "aligned_buffer.hpp"
 #include "memory_store.hpp"
+#include "point_revision.hpp"
 #include "series_id.hpp"
 #include "timestar_config.hpp"
 #include "tsm.hpp"
@@ -106,9 +107,14 @@ public:
     // Same output as writeSeries(), but drains the buffer between blocks so a
     // single large series cannot pin its whole encoded size in memory. Use this
     // wherever series size is unbounded (compaction's merge path).
+    // `seriesRevRange`, when non-empty, is stamped on EVERY output block (the
+    // merge path re-blocks decoded points and cannot recover per-point revisions,
+    // so it conservatively applies the whole-series range -- preserving the
+    // file-level max revision so compaction never erases revisions; ADR 0003).
     template <class T>
     seastar::future<> writeSeriesStreaming(TSMValueType seriesType, const SeriesId128& seriesId,
-                                           const std::vector<uint64_t>& timestamps, const std::vector<T>& values);
+                                           const std::vector<uint64_t>& timestamps, const std::vector<T>& values,
+                                           timestar::RevisionRange seriesRevRange = {});
 
     // APPEND one chunk of a series that is being emitted incrementally.
     //

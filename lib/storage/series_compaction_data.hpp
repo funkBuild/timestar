@@ -1,5 +1,6 @@
 #pragma once
 
+#include "point_revision.hpp"
 #include "series_id.hpp"
 #include "tsm.hpp"
 
@@ -29,6 +30,14 @@ struct SeriesCompactionData {
     };
     std::vector<BlockRef> blockRefs;
     bool isZeroCopy = false;
+
+    // Union of every input block's [minRev, maxRev]. The merge path re-blocks
+    // decoded points and cannot map them back to per-point revisions, so it
+    // stamps this whole-series range on its output blocks -- conservatively
+    // preserving the file-level max revision (ADR 0003) so compaction never
+    // erases revisions and breaks the recovery counter. Zero-copy blocks keep
+    // their exact per-block range instead.
+    timestar::RevisionRange revRange;
 
     // String series only: dictionary carried from the single source file when
     // the zero-copy path is taken. STR2 blocks store dictionary IDs, so the

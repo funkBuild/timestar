@@ -1104,8 +1104,12 @@ TEST_F(EngineSeastarTest, RevisionAssignmentAdvancesAndRestores) {
         // revision column) and restoreRevisionCounter() resumes above the max.
         {
             ScopedEngine eng2;
-            eng2.init();
+            eng2.init();  // did NOT call setRevisionAssignment
             EXPECT_EQ(eng2->nextRevision(), 3u) << "counter restored above the max durable revision (2)";
+            // Tracking is sticky: recovering revision-bearing data auto-enables
+            // assignment, so new writes don't drop to the migrated floor and lose
+            // LWW to recovered data (adversarial-review finding).
+            EXPECT_TRUE(eng2->revisionAssignmentEnabled()) << "recovered tracked data must re-enable assignment";
         }
     })
         .join()

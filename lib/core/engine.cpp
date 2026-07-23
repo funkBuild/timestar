@@ -175,6 +175,14 @@ void Engine::restoreRevisionCounter() {
             maxRev = tsmFile->maxRevision();
     }
     nextRevision_ = maxRev + 1;  // == kFirstAssignedRevision (1) when nothing is tracked
+
+    // Tracking is STICKY: if any durable data already carries a revision, this
+    // store is revision-tracked, so keep assigning -- otherwise new writes would
+    // land at the migrated floor (0) and LOSE the LWW to recovered data. This
+    // makes enablement a property of the data, not a runtime flag that a restart
+    // could forget (adversarial-review finding).
+    if (maxRev > 0)
+        assignRevisions_ = true;
 }
 
 template <class T>
