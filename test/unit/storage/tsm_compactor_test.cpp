@@ -1,6 +1,7 @@
 #include "../../../lib/storage/tsm_compactor.hpp"
 
 #include "../../../lib/core/engine.hpp"
+#include "../../../lib/core/placement_table.hpp"
 #include "../../../lib/core/series_id.hpp"
 #include "../../../lib/storage/memory_store.hpp"
 #include "../../../lib/storage/tsm_file_manager.hpp"
@@ -921,5 +922,60 @@ SEASTAR_TEST_F(TSMCompactorTest, MergeCompactionPreservesMaxRevision) {
     // path must preserve it in the file-level trailer, not collapse to 0.
     EXPECT_EQ(out->fileFormatVersion(), 4u);
     EXPECT_GE(out->maxRevision(), 1049u) << "merge compaction erased revisions -> recovery counter would invert LWW";
+    co_return;
+}
+
+// Background compaction with VShard-partitioning enabled produces VShard-PURE
+// output files (merge + partition), not one mixed file (Task 4c lifecycle).
+SEASTAR_TEST_F(TSMCompactorTest, VShardPartitionedBackgroundCompaction) {
+    self->compactor->setVShardPartitioning(true);
+    EXPECT_TRUE(self->compactor->vshardPartitioningEnabled());
+
+    // Two tier-0 files, several series spanning multiple VShards, no tombstones.
+    std::vector<seastar::shared_ptr<TSM>> sources;
+    for (int i = 0; i < 2; ++i) {
+        char fn[256];
+        snprintf(fn, sizeof(fn), "shard_0/tsm/00_%010d.tsm", i);
+        TSMWriter w(fn);
+        for (const char* h : {"a", "b", "c", "d"}) {
+            std::vector<uint64_t> ts = {static_cast<uint64_t>(1000 + i * 100)};
+            std::vector<double> vs = {static_cast<double>(i)};
+            w.writeSeries(TSMValueType::Float, SeriesId128::fromSeriesKey(std::string("part,host=") + h + " v"), ts,
+                          vs);
+        }
+        w.writeIndex();
+        w.close();
+        auto tsm = seastar::make_shared<TSM>(fn);
+        tsm->tierNum = 0;
+        tsm->seqNum = i;
+        co_await tsm->open();
+        co_await tsm->readSparseIndex();
+        co_await self->fileManager->addTSMFile(tsm);
+        sources.push_back(tsm);
+    }
+
+    CompactionPlan plan;
+    plan.sourceFiles = sources;
+    plan.targetTier = 1;
+    plan.targetSeqNum = self->fileManager->allocateSequenceId();
+    plan.targetPath = "shard_0/tsm/01_0000000099.tsm";  // non-empty for isValid; partition allocates its own outputs
+    EXPECT_TRUE(plan.isValid());
+    co_await self->compactor->executeCompaction(plan);
+
+    // After compaction: the tier-0 sources are gone; every surviving file is
+    // VShard-pure (all its series map to a single VShard).
+    size_t files = 0;
+    for (const auto& [rank, f] : self->fileManager->getSequencedTsmFiles()) {
+        if (!f)
+            continue;
+        ++files;
+        auto ids = f->getSeriesIds();
+        if (ids.empty())
+            continue;
+        const uint16_t vs = timestar::virtualShard(ids.front());
+        for (const auto& sid : ids)
+            EXPECT_EQ(timestar::virtualShard(sid), vs) << "background compaction output is not VShard-pure";
+    }
+    EXPECT_GT(files, 0u);
     co_return;
 }

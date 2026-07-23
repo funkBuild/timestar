@@ -2,11 +2,13 @@
 
 #include "aggregator.hpp"         // AggregationState for downsampling
 #include "bulk_block_loader.hpp"  // Phase A: Bulk loading optimization
+#include "compact_vshard.hpp"     // partitionByVShard (VShard-partitioned compaction)
 #include "logger.hpp"
 #include "tsm_file_manager.hpp"
 #include "tsm_writer.hpp"
 #include "value_type_dispatch.hpp"  // valueTypeName for type-conflict diagnostics
 
+#include <algorithm>
 #include <chrono>
 #include <filesystem>
 #include <limits>
@@ -1360,6 +1362,36 @@ seastar::future<CompactionStats> TSMCompactor::executeCompaction(CompactionPlan 
     // (e.g., forceFullCompaction calls executeCompaction per tier).
     auto localRetention = std::exchange(_pendingRetentionPolicies, {});
     auto localSeriesMap = std::exchange(_pendingSeriesMeasurementMap, {});
+
+    // Cluster VShard-partitioned compaction: merge + partition the inputs into one
+    // VShard-pure file per VShard (revision ranges preserved), instead of one mixed
+    // output. Only taken when there is nothing that needs the full merge path --
+    // no pending retention and no source tombstones (both are applied there, and
+    // partitionByVShard reads the raw resolved view, which would resurrect
+    // tombstoned points). Otherwise fall through to the normal merge.
+    const bool anyTombstones = std::any_of(plan.sourceFiles.begin(), plan.sourceFiles.end(),
+                                           [](const auto& f) { return f && f->hasTombstones(); });
+    if (vshardPartition_ && localRetention.empty() && !anyTombstones && !plan.sourceFiles.empty()) {
+        const uint64_t maxDataSeq = maxDataSeqOf(plan.sourceFiles);
+        auto pathFor = [this, tier = plan.targetTier, maxDataSeq](timestar::VShardId) {
+            return generateCompactedFilename(tier, fileManager->allocateSequenceId(), maxDataSeq);
+        };
+        auto parts = co_await timestar::partitionByVShard(plan.sourceFiles, pathFor);
+        for (const auto& [vs, path] : parts) {
+            auto tsm = seastar::make_shared<TSM>(path);
+            co_await tsm->open();
+            co_await fileManager->addTSMFile(tsm);
+        }
+        co_await fileManager->removeTSMFiles(plan.sourceFiles);
+
+        CompactionStats finalStats;
+        finalStats.filesCompacted = plan.sourceFiles.size();
+        finalStats.bytesRead = sourceBytes;
+        finalStats.duration =
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - active.startTime);
+        co_return finalStats;
+    }
+
     auto compactionResult =
         co_await compact(plan.sourceFiles, plan.targetTier, plan.targetSeqNum, localRetention, localSeriesMap);
 

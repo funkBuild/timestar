@@ -67,6 +67,7 @@ private:
     // coalescing work across all series in flight on this shard.
     seastar::semaphore coalesceBudget_{COALESCE_TOTAL_BUDGET_BYTES / 1024};
     bool compactionEnabled{true};
+    bool vshardPartition_ = false;  // cluster VShard-partitioned compaction (off by default)
 
     // Per-series retention context built in compact(), passed to processSeriesForCompaction
     struct SeriesRetentionContext {
@@ -192,6 +193,14 @@ private:
 public:
     explicit TSMCompactor(TSMFileManager* manager);
     ~TSMCompactor() = default;
+
+    // Cluster VShard-partitioned compaction (Task 4c): when enabled, a compaction
+    // whose inputs carry no pending retention and no tombstones is merged AND
+    // partitioned into one VShard-pure file per VShard (revision ranges preserved)
+    // instead of one mixed output. Off by default; the server enables it in
+    // cluster mode. Retention/tombstone compactions still take the full merge path.
+    void setVShardPartitioning(bool on) { vshardPartition_ = on; }
+    [[nodiscard]] bool vshardPartitioningEnabled() const { return vshardPartition_; }
 
     // Set retention policies and series->measurement map for the next compaction.
     // Called by Engine before triggering compaction so that TTL/downsampling
