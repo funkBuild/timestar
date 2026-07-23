@@ -2,11 +2,12 @@
 
 #include <algorithm>
 #include <charconv>
+#include <cstring>
 #include <exception>
 #include <format>
 #include <seastar/core/coroutine.hh>
-#include <seastar/core/fstream.hh>
 #include <seastar/core/seastar.hh>
+#include <seastar/core/temporary_buffer.hh>
 #include <seastar/core/thread.hh>
 #include <seastar/util/file.hh>
 #include <span>
@@ -113,31 +114,51 @@ seastar::future<std::vector<JournalRecord>> JournalWriter::open() {
     co_return recovered;
 }
 
+seastar::future<> JournalWriter::dmaWriteAligned(uint64_t offset, const char* src, size_t len) {
+    // offset and len are multiples of alignment_; bounce through aligned memory.
+    auto buf = seastar::temporary_buffer<char>::aligned(file_.memory_dma_alignment(), len);
+    std::memcpy(buf.get_write(), src, len);
+    size_t written = 0;
+    while (written < len) {
+        const size_t n = co_await file_.dma_write(offset + written, buf.get() + written, len - written);
+        if (n == 0 || (n & (alignment_ - 1)) != 0)
+            throw std::runtime_error("journal dma_write returned an unaligned/short count");
+        written += n;
+    }
+}
+
+seastar::future<> JournalWriter::writePaddedBlock(uint64_t offset, const char* src, size_t rem) {
+    // One block: `rem` (< alignment_) real bytes, zero-padded to alignment_. The
+    // padding is transient -- a later full/partial write at `offset` overwrites
+    // it -- except on the final block before a seal, which truncate() trims off.
+    auto buf = seastar::temporary_buffer<char>::aligned(file_.memory_dma_alignment(), alignment_);
+    std::memcpy(buf.get_write(), src, rem);
+    std::memset(buf.get_write() + rem, 0, alignment_ - rem);
+    size_t written = 0;
+    while (written < alignment_) {
+        const size_t n = co_await file_.dma_write(offset + written, buf.get() + written, alignment_ - written);
+        if (n == 0 || (n & (alignment_ - 1)) != 0)
+            throw std::runtime_error("journal dma_write returned an unaligned/short count");
+        written += n;
+    }
+}
+
 seastar::future<> JournalWriter::startSegment(uint64_t segmentNumber) {
     const auto path = dir_ / segmentFilename(segmentNumber);
     seastar::file file = co_await seastar::open_file_dma(
         path.string(), seastar::open_flags::rw | seastar::open_flags::create | seastar::open_flags::truncate);
 
-    seastar::file_output_stream_options opts;
-    opts.buffer_size = 131072;  // 128 KiB, a multiple of the DMA alignment
-    opts.preallocation_size = segmentBytes_;
-    auto stream = co_await seastar::make_file_output_stream(file, opts);
+    file_ = std::move(file);
+    alignment_ = file_.disk_write_dma_alignment();
+    currentSegment_ = segmentNumber;
+    alignedLen_ = 0;
 
     JournalSegmentHeader header = headerTemplate_;
     header.segmentNumber = segmentNumber;
-    const std::string headerBytes = header.encode();
-
-    file_ = std::move(file);
-    out_.emplace(std::move(stream));
-    currentSegment_ = segmentNumber;
-    currentBytes_ = 0;
-
-    co_await out_->write(headerBytes);
-    currentBytes_ += headerBytes.size();
-    // NOTE: the header is buffered, not yet flushed -- flushing a sub-alignment
-    // amount and then continuing to append misbehaves on an O_DIRECT stream. A
-    // crash before the first barrier therefore leaves an un-headed segment;
-    // recovery handles that by discarding an un-headed FINAL segment (see open()).
+    tail_ = header.encode();
+    // NOTE: the header is buffered in tail_, not yet on disk -- the first barrier
+    // makes it durable. A crash before that leaves an un-headed (empty) segment;
+    // recovery discards an un-headed FINAL segment (see open()).
 }
 
 seastar::future<> JournalWriter::append(const JournalRecord& record) {
@@ -151,11 +172,9 @@ seastar::future<> JournalWriter::append(const JournalRecord& record) {
     // its target (a record never straddles a segment). A fresh segment holds
     // only the header, so a single record always fits (payloads are bounded well
     // below segmentBytes by the write-batch limit).
-    if (currentBytes_ + bytes.size() > segmentBytes_ && currentBytes_ > JournalSegmentHeader::kEncodedBytes) {
+    if (logicalLen() + bytes.size() > segmentBytes_ && logicalLen() > JournalSegmentHeader::kEncodedBytes) {
         try {
-            co_await barrier();  // make the closing segment durable before rotating
-            co_await out_->close();
-            out_.reset();  // old segment closed; a startSegment failure leaves out_ empty, not double-closed
+            co_await sealCurrent();  // flush + truncate + close the full segment
             co_await startSegment(currentSegment_ + 1);
         } catch (const std::exception& e) {
             if (!fenced_)
@@ -164,13 +183,7 @@ seastar::future<> JournalWriter::append(const JournalRecord& record) {
         }
     }
 
-    try {
-        co_await out_->write(bytes);
-    } catch (const std::exception& e) {
-        fence(std::string("journal append failed: ") + e.what());
-        throw;
-    }
-    currentBytes_ += bytes.size();
+    tail_.append(bytes);  // buffered; made durable (and full blocks finalised) at the next barrier
 }
 
 seastar::future<> JournalWriter::barrier() {
@@ -179,28 +192,45 @@ seastar::future<> JournalWriter::barrier() {
     if (!opened_)
         throw std::logic_error("JournalWriter::barrier before open");
     try {
-        co_await out_->flush();
-        co_await file_.flush();
+        if (!tail_.empty()) {
+            const size_t full = (tail_.size() / alignment_) * alignment_;
+            const size_t rem = tail_.size() - full;
+            if (full > 0)
+                co_await dmaWriteAligned(alignedLen_, tail_.data(), full);  // these blocks are now final
+            if (rem > 0)
+                co_await writePaddedBlock(alignedLen_ + full, tail_.data() + full, rem);
+            alignedLen_ += full;
+            tail_.erase(0, full);  // keep only the unpadded sub-block remainder
+        }
+        co_await file_.flush();  // fdatasync: durable through logicalLen()
     } catch (const std::exception& e) {
         fence(std::string("journal barrier failed: ") + e.what());
         throw;
     }
 }
 
+seastar::future<> JournalWriter::sealCurrent() {
+    const uint64_t logical = logicalLen();
+    co_await barrier();                // flush the tail (as a padded block) durably
+    co_await file_.truncate(logical);  // trim the seal padding: sealed segments end at a record boundary
+    co_await file_.flush();
+    co_await file_.close();
+}
+
 seastar::future<> JournalWriter::close() {
-    if (!opened_ || !out_)
+    if (!opened_)
         co_return;
-    // Best-effort durable close; a fenced writer still releases its fd.
+    // Best-effort durable seal; a fenced writer still releases its fd.
     if (!fenced_) {
         try {
-            co_await out_->flush();
-            co_await file_.flush();
+            co_await sealCurrent();
+            opened_ = false;
+            co_return;
         } catch (...) {
-            // fall through to close
+            // fall through to release the fd
         }
     }
-    co_await out_->close();
-    out_.reset();
+    co_await file_.close();
     opened_ = false;
 }
 

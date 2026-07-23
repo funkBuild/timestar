@@ -8,7 +8,6 @@
 #include <optional>
 #include <seastar/core/file.hh>
 #include <seastar/core/future.hh>
-#include <seastar/core/iostream.hh>
 #include <string>
 #include <vector>
 
@@ -56,16 +55,29 @@ public:
 
 private:
     seastar::future<> startSegment(uint64_t segmentNumber);
+    seastar::future<> sealCurrent();  // flush the tail, truncate to logical size, close the file
+    // Write `len` bytes from `src` at an aligned file offset (bounce through an
+    // aligned buffer; `len` and `offset` must be multiples of alignment_).
+    seastar::future<> dmaWriteAligned(uint64_t offset, const char* src, size_t len);
+    // Write one padded block: `rem` (< alignment_) real bytes then zero fill.
+    seastar::future<> writePaddedBlock(uint64_t offset, const char* src, size_t rem);
     void fence(std::string why);
+
+    [[nodiscard]] uint64_t logicalLen() const noexcept { return alignedLen_ + tail_.size(); }
 
     std::filesystem::path dir_;
     JournalSegmentHeader headerTemplate_;
     size_t segmentBytes_;
 
     seastar::file file_;
-    std::optional<seastar::output_stream<char>> out_;
     uint64_t currentSegment_ = 0;
-    size_t currentBytes_ = 0;  // bytes written to the current segment (header + records)
+    // O_DIRECT forbids flush-then-continue on an output_stream (the sink asserts
+    // on an unaligned resumed offset), so the segment is written by hand: full
+    // aligned blocks are final once written; the sub-block remainder is rewritten
+    // (padded) on every barrier until it fills. logical size = alignedLen_ + tail_.
+    size_t alignment_ = 0;     // disk write DMA alignment of the current file
+    uint64_t alignedLen_ = 0;  // durable full-block prefix length (multiple of alignment_)
+    std::string tail_;         // logical bytes after alignedLen_ (unpadded; grows past a block between barriers)
     bool opened_ = false;
     bool fenced_ = false;
     std::string fenceReason_;

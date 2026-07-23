@@ -228,6 +228,74 @@ TEST(JournalWriterTest, UnheadedFinalSegmentIsDiscarded) {
     testUnheadedFinalSegmentIsDiscarded().get();
 }
 
+// Regression for the O_DIRECT group-commit crash: appending AFTER a barrier --
+// the normal group-commit loop -- must work. The old output_stream-based writer
+// SIGILLed here because flushing a sub-alignment amount and then continuing to
+// write tripped Seastar's aligned-resumed-offset assertion. A barrier after
+// every append also exercises the partial-block rewrite (each new record extends
+// and overwrites the prior barrier's padded tail block).
+seastar::future<> testGroupCommitAppendAfterBarrier() {
+    const auto dir = tmpDir("groupcommit");
+    std::vector<JournalRecord> records;
+    {
+        JournalWriter w(dir, header(), 1u << 20);
+        co_await w.open();
+        for (uint64_t s = 1; s <= 50; ++s) {
+            auto r = rec(static_cast<uint16_t>(s % 7), s, "payload-" + std::to_string(s));
+            records.push_back(r);
+            co_await w.append(r);
+            co_await w.barrier();  // barrier after EVERY append -- the crash pattern
+        }
+        co_await w.close();
+    }
+    {
+        JournalWriter w(dir, header(), 1u << 20);
+        auto recovered = co_await w.open();
+        EXPECT_EQ(recovered.size(), records.size());
+        for (size_t i = 0; i < records.size() && i < recovered.size(); ++i)
+            EXPECT_EQ(recovered[i], records[i]);  // byte-exact through the padded-block rewrites
+        co_await w.close();
+    }
+    fs::remove_all(dir);
+}
+TEST(JournalWriterTest, GroupCommitAppendAfterBarrier) {
+    testGroupCommitAppendAfterBarrier().get();
+}
+
+// Barriers interleaved with rotations: appends buffer across a seal (which
+// truncates the sealed segment to its record boundary) and barriers land on both
+// sides of a rotation. Every record must survive byte-exact.
+seastar::future<> testBarriersAcrossRotationRecover() {
+    const auto dir = tmpDir("barrot");
+    const size_t segBytes = JournalSegmentHeader::kEncodedBytes + 200;  // rotate every few records
+    std::vector<JournalRecord> records;
+    {
+        JournalWriter w(dir, header(), segBytes);
+        co_await w.open();
+        for (uint64_t s = 1; s <= 30; ++s) {
+            auto r = rec(1, s, "some-payload-data");
+            records.push_back(r);
+            co_await w.append(r);
+            if (s % 3 == 0)
+                co_await w.barrier();  // periodic barriers with rotations in between
+        }
+        co_await w.barrier();
+        co_await w.close();
+    }
+    {
+        JournalWriter w(dir, header(), segBytes);
+        auto recovered = co_await w.open();
+        EXPECT_EQ(recovered.size(), records.size());
+        for (size_t i = 0; i < records.size() && i < recovered.size(); ++i)
+            EXPECT_EQ(recovered[i], records[i]);
+        co_await w.close();
+    }
+    fs::remove_all(dir);
+}
+TEST(JournalWriterTest, BarriersAcrossRotationRecover) {
+    testBarriersAcrossRotationRecover().get();
+}
+
 seastar::future<> testFreshOpenIsEmpty() {
     const auto dir = tmpDir("fresh");
     JournalWriter w(dir, header(), 1u << 20);
