@@ -358,7 +358,10 @@ seastar::future<> testV2FileRemainsReadable(std::string v3Path, std::string v2Pa
     v2Bytes[4] = 2;  // version byte follows the "TASM" magic
 
     size_t off = indexOffset;
-    const size_t indexEnd = v3Bytes.size() - 8;
+    // V4 source has a 16-byte trailer: max-revision(8) + index-offset(8). The
+    // index section ends before both; the synthesized V2 file keeps only the
+    // 8-byte index offset (no max-revision trailer).
+    const size_t indexEnd = v3Bytes.size() - 16;
     while (off < indexEnd) {
         EXPECT_GE(indexEnd - off, static_cast<size_t>(TSM_INDEX_ENTRY_HEADER_SIZE));
         if (indexEnd - off < TSM_INDEX_ENTRY_HEADER_SIZE) {

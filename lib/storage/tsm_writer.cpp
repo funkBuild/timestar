@@ -736,6 +736,20 @@ void TSMWriter::writeIndexEntryFor(const TSMIndexEntry& indexEntry) {
     }
 }
 
+uint64_t TSMWriter::computeMaxRevision() const {
+    // File-level max of every block's revision range. Read cheaply at open() (V4
+    // trailer) so recovery can restore a per-shard revision counter above all
+    // flushed data without loading every index entry.
+    uint64_t maxRev = 0;
+    for (auto const& [seriesId, indexEntry] : indexEntries) {
+        for (auto const& block : indexEntry.indexBlocks) {
+            if (block.blockMaxRev > maxRev)
+                maxRev = block.blockMaxRev;
+        }
+    }
+    return maxRev;
+}
+
 void TSMWriter::writeIndex() {
     // std::map maintains sorted order automatically
     size_t indexStartOffset = currentOffset();
@@ -746,6 +760,9 @@ void TSMWriter::writeIndex() {
         writeIndexEntryFor(indexEntry);
     }
 
+    // V4 trailer: file-level max revision, written BEFORE the index offset (which
+    // stays the file's last 8 bytes, so its reader is unchanged).
+    buffer.write(computeMaxRevision());
     buffer.write(static_cast<uint64_t>(indexStartOffset));
     LOG_INSERT_PATH(timestar::tsm_log, debug, "Wrote index offset: {} ({:#x}), final buffer size: {}", indexStartOffset,
                     indexStartOffset, buffer.size());
@@ -762,6 +779,8 @@ seastar::future<> TSMWriter::writeIndexStreaming() {
         co_await flushIfNeeded();
     }
 
+    // V4 trailer: file-level max revision, before the index offset (see writeIndex).
+    buffer.write(computeMaxRevision());
     buffer.write(static_cast<uint64_t>(indexStartOffset));
 }
 

@@ -233,6 +233,11 @@ public:
     // for format-gated behaviour (e.g. V4 carries per-block revision ranges).
     uint8_t fileFormatVersion() const { return fileVersion; }
 
+    // File-level max revision (V4 trailer; 0 for pre-V4 files). Read from the
+    // trailer during readSparseIndex() so startup can restore a revision counter
+    // above all flushed data without loading every index entry (ADR 0003).
+    uint64_t maxRevision() const { return maxRevision_; }
+
 private:
     std::string filePath;
     seastar::file tsmFile;
@@ -240,6 +245,7 @@ private:
     // Defaults to the current version: a truncated header must never leave this
     // at 1 and silently select the V1 index-block layout.
     uint8_t fileVersion = TSM_VERSION;
+    uint64_t maxRevision_ = 0;  // V4 trailer, read in readSparseIndex()
     // Set by scheduleDelete(): the on-disk file was unlinked but the fd must
     // stay open for in-flight snapshot readers; the destructor closes it.
     bool deferCloseOnDestroy_ = false;

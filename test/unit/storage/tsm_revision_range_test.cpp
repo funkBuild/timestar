@@ -85,6 +85,50 @@ TEST_F(TSMRevisionRangeTest, NoRevisionsIsMigratedFloor) {
     seastar::async([&] { testNoRevisionsIsMigratedFloor(path("0_2.tsm")).get(); }).get();
 }
 
+// The file-level max-revision trailer (V4) is read cheaply at open() and equals
+// the maximum block revision across the whole file.
+seastar::future<> testMaxRevisionTrailer(std::string p) {
+    {
+        TSMWriter writer(p);
+        std::vector<uint64_t> ts1 = {10, 20, 30};
+        std::vector<double> vs1 = {1.0, 2.0, 3.0};
+        std::vector<uint64_t> rev1 = {5, 6, 7};
+        writer.writeSeries(TSMValueType::Float, SeriesId128::fromSeriesKey("mrt.a"), ts1, vs1, rev1);
+        std::vector<uint64_t> ts2 = {10, 20};
+        std::vector<double> vs2 = {1.0, 2.0};
+        std::vector<uint64_t> rev2 = {40, 42};
+        writer.writeSeries(TSMValueType::Float, SeriesId128::fromSeriesKey("mrt.b"), ts2, vs2, rev2);
+        writer.writeIndex();
+        writer.close();
+    }
+    TSM tsm(p);
+    co_await tsm.open();
+    EXPECT_EQ(tsm.fileFormatVersion(), 4u);
+    EXPECT_EQ(tsm.maxRevision(), 42u) << "file-level max across both series";
+    co_return;
+}
+TEST_F(TSMRevisionRangeTest, MaxRevisionTrailer) {
+    seastar::async([&] { testMaxRevisionTrailer(path("0_5.tsm")).get(); }).get();
+}
+
+seastar::future<> testMaxRevisionZeroWhenUntracked(std::string p) {
+    {
+        TSMWriter writer(p);
+        std::vector<uint64_t> ts = {10, 20};
+        std::vector<double> vs = {1.0, 2.0};
+        writer.writeSeries(TSMValueType::Float, SeriesId128::fromSeriesKey("mrz.a"), ts, vs);  // no revisions
+        writer.writeIndex();
+        writer.close();
+    }
+    TSM tsm(p);
+    co_await tsm.open();
+    EXPECT_EQ(tsm.maxRevision(), 0u) << "untracked file's max revision is the migrated floor";
+    co_return;
+}
+TEST_F(TSMRevisionRangeTest, MaxRevisionZeroWhenUntracked) {
+    seastar::async([&] { testMaxRevisionZeroWhenUntracked(path("0_6.tsm")).get(); }).get();
+}
+
 // A mismatched revisions length is rejected before any file is written.
 TEST_F(TSMRevisionRangeTest, MismatchedRevisionLengthThrows) {
     TSMWriter writer(path("0_3.tsm"));

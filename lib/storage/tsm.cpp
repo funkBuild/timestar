@@ -394,14 +394,26 @@ seastar::future<> TSM::readSparseIndex() {
     uint64_t indexOffset;
     std::memcpy(&indexOffset, indexOffsetBuf.get(), sizeof(uint64_t));
 
+    // V4 files carry a file-level max-revision trailer between the index and the
+    // index-offset (which stays the last 8 bytes). Read it, and exclude its 8
+    // bytes from the index section so the entry parse never sees it.
+    const size_t trailerBytes = (fileVersion >= 4) ? 2 * sizeof(uint64_t) : sizeof(uint64_t);
+    if (fileVersion >= 4) {
+        if (length < trailerBytes) {
+            throw std::runtime_error("Corrupted TSM file: too small for V4 trailer: " + filePath);
+        }
+        auto maxRevBuf = co_await tsmFile.dma_read_exactly<uint8_t>(length - trailerBytes, sizeof(uint64_t));
+        std::memcpy(&maxRevision_, maxRevBuf.get(), sizeof(uint64_t));
+    }
+
     // Validate indexOffset is within file bounds
-    if (indexOffset >= length - sizeof(uint64_t)) {
+    if (indexOffset >= length - trailerBytes) {
         throw std::runtime_error("Corrupted TSM file: indexOffset " + std::to_string(indexOffset) +
                                  " is out of bounds (file size: " + std::to_string(length) + "): " + filePath);
     }
 
-    // Read entire index section
-    auto indexBuf = co_await tsmFile.dma_read_exactly<uint8_t>(indexOffset, length - indexOffset - sizeof(uint64_t));
+    // Read entire index section (excluding the trailer: max-rev [V4] + index offset)
+    auto indexBuf = co_await tsmFile.dma_read_exactly<uint8_t>(indexOffset, length - indexOffset - trailerBytes);
     Slice indexSlice(indexBuf.get(), indexBuf.size());
 
     // First pass: Parse index to collect series and build sparse index
