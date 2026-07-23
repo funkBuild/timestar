@@ -63,6 +63,12 @@ class InMemorySeries {
 public:
     std::vector<uint64_t> timestamps;
     std::vector<T> values;
+    // Parallel per-point replicated revision (ADR 0003), carried through LWW so a
+    // flushed tier-0 block can emit its revision column and [minRev,maxRev]. It is
+    // EITHER empty (untracked -- non-cluster mode, zero memory/CPU overhead) OR
+    // exactly as long as `values`. The paired sort/merge/dedup ops maintain that
+    // invariant and are branch-guarded on emptiness so the untracked path is free.
+    std::vector<uint64_t> revisions;
 
     // Running stats — only valid for double series, updated on each insert.
     // Used by pushdown aggregation to skip per-point scanning when query

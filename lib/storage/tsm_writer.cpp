@@ -954,7 +954,9 @@ void TSMWriter::writeAllSeries(TSMWriter& writer, seastar::shared_ptr<MemoryStor
                 series.sort();
                 LOG_INSERT_PATH(timestar::tsm_log, trace, "Writing series '{}' (type {}) with {} points",
                                 seriesKey.toHex(), static_cast<int>(seriesType), series.timestamps.size());
-                writer.writeSeries(seriesType, seriesId, series.timestamps, series.values);
+                // series.revisions is empty (untracked) or parallel to values; it
+                // stamps each flushed block's [minRev,maxRev] (ADR 0003).
+                writer.writeSeries(seriesType, seriesId, series.timestamps, series.values, series.revisions);
             });
         } catch (const std::bad_alloc& e) {
             timestar::tsm_log.error("BAD_ALLOC when processing series '{}' with {} points", seriesKey.toHex(),

@@ -153,11 +153,17 @@ void InMemorySeries<T>::insert(TimeStarInsert<T>&& insertRequest) {
     // incoming value. Running stats are updated with the surviving new points
     // only, and fully recomputed when an existing point was overwritten.
 
+    // Per-point revisions are OPTIONAL and parallel to values. When present they
+    // must match the value count; an empty column means untracked (revision 0).
+    const bool srcHasRev = !insertRequest.revisions.empty();
+
     if (oldSize == 0) [[unlikely]] {
         // Series is empty -- take ownership of the entire vectors via move.
         // takeTimestamps() materializes shared timestamps into owned if needed.
         timestamps = insertRequest.takeTimestamps();
         values = std::move(insertRequest.values);
+        if (srcHasRev)
+            revisions = std::move(insertRequest.revisions);  // parallel to values
 
         // First insert -- check if already sorted using std::ranges::is_sorted.
         // In typical time-series workloads, data arrives chronologically, so this
@@ -181,10 +187,15 @@ void InMemorySeries<T>::insert(TimeStarInsert<T>&& insertRequest) {
     // here would leave capacity == size after every append, forcing the NEXT
     // append to realloc and memcpy the entire series — O(L) copied bytes per
     // batch instead of amortized O(1).
+    // A series becomes revision-tracked as soon as either it already is or this
+    // insert carries revisions; once tracked it stays parallel to values forever.
+    const bool trackRev = !revisions.empty() || srcHasRev;
     if (timestamps.capacity() < totalSize) {
         const size_t growCap = std::max(totalSize, oldSize * 2);
         timestamps.reserve(growCap);
         values.reserve(growCap);
+        if (trackRev)
+            revisions.reserve(growCap);
     }
 
     // Append new data. insert() with iterators is optimized by the STL to
@@ -192,6 +203,16 @@ void InMemorySeries<T>::insert(TimeStarInsert<T>&& insertRequest) {
     timestamps.insert(timestamps.end(), srcTimestamps.begin(), srcTimestamps.end());
     values.insert(values.end(), std::make_move_iterator(insertRequest.values.begin()),
                   std::make_move_iterator(insertRequest.values.end()));
+    if (trackRev) {
+        // Backfill the migrated-floor 0 for pre-existing points if the series was
+        // previously untracked (a transition), so revisions stays parallel.
+        if (revisions.empty() && oldSize > 0)
+            revisions.assign(oldSize, 0);
+        if (srcHasRev)
+            revisions.insert(revisions.end(), insertRequest.revisions.begin(), insertRequest.revisions.end());
+        else
+            revisions.insert(revisions.end(), newSize, 0);  // untracked incoming -> floor
+    }
 
     // Sort the suffix if needed. In typical time-series workloads new data
     // arrives in chronological order, so the is_sorted scan short-circuits
@@ -239,21 +260,28 @@ bool InMemorySeries<T>::dedupSuffixKeepLast(size_t from) {
 
     // Two-pointer compaction keeping the LAST value of each equal-timestamp
     // run. Stable sort preserved request order, so "last" == newest write.
+    const bool hasRev = !revisions.empty();  // invariant: empty, or size == values
     size_t w = from;
     for (size_t r = from + 1; r < n; ++r) {
         if (timestamps[r] == timestamps[w]) {
             values[w] = std::move(values[r]);
+            if (hasRev)
+                revisions[w] = revisions[r];  // keep the newest write's revision too
         } else {
             ++w;
             if (w != r) {
                 timestamps[w] = timestamps[r];
                 values[w] = std::move(values[r]);
+                if (hasRev)
+                    revisions[w] = revisions[r];
             }
         }
     }
     ++w;
     timestamps.resize(w);
     values.resize(w);
+    if (hasRev)
+        revisions.resize(w);
     return true;
 }
 
@@ -303,6 +331,15 @@ void InMemorySeries<T>::sortPaired(size_t from, size_t to) {
         }
         std::move(sortedVals.begin(), sortedVals.end(), values.begin() + from);
     }
+
+    // Apply the SAME permutation to the revision column when tracked.
+    if (!revisions.empty()) {
+        std::vector<uint64_t> sortedRev(count);
+        for (size_t i = 0; i < count; ++i) {
+            sortedRev[i] = revisions[indices[i]];
+        }
+        std::copy(sortedRev.begin(), sortedRev.end(), revisions.begin() + from);
+    }
 }
 
 template <class T>
@@ -323,21 +360,34 @@ bool InMemorySeries<T>::mergePaired(size_t midpoint) {
     mergedTs.reserve(n);
     mergedVals.reserve(n);
 
+    // Carry the revision column in lockstep when tracked. On an equal-timestamp
+    // collision the suffix run (newer write) wins for BOTH value and revision.
+    const bool hasRev = !revisions.empty();
+    std::vector<uint64_t> mergedRev;
+    if (hasRev)
+        mergedRev.reserve(n);
+
     bool overwrote = false;
     size_t i = 0, j = midpoint;
     while (i < midpoint && j < n) {
         if (timestamps[i] < timestamps[j]) {
             mergedTs.push_back(timestamps[i]);
             mergedVals.push_back(std::move(values[i]));
+            if (hasRev)
+                mergedRev.push_back(revisions[i]);
             ++i;
         } else if (timestamps[j] < timestamps[i]) {
             mergedTs.push_back(timestamps[j]);
             mergedVals.push_back(std::move(values[j]));
+            if (hasRev)
+                mergedRev.push_back(revisions[j]);
             ++j;
         } else {
-            // Equal timestamp: keep the incoming value, drop the old point.
+            // Equal timestamp: keep the incoming (suffix) value and revision.
             mergedTs.push_back(timestamps[j]);
             mergedVals.push_back(std::move(values[j]));
+            if (hasRev)
+                mergedRev.push_back(revisions[j]);
             ++i;
             ++j;
             overwrote = true;
@@ -347,16 +397,22 @@ bool InMemorySeries<T>::mergePaired(size_t midpoint) {
     while (i < midpoint) {
         mergedTs.push_back(timestamps[i]);
         mergedVals.push_back(std::move(values[i]));
+        if (hasRev)
+            mergedRev.push_back(revisions[i]);
         ++i;
     }
     while (j < n) {
         mergedTs.push_back(timestamps[j]);
         mergedVals.push_back(std::move(values[j]));
+        if (hasRev)
+            mergedRev.push_back(revisions[j]);
         ++j;
     }
 
     timestamps = std::move(mergedTs);
     values = std::move(mergedVals);
+    if (hasRev)
+        revisions = std::move(mergedRev);
     return overwrote;
 }
 
