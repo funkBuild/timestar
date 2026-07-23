@@ -1,6 +1,7 @@
 #include "native_index.hpp"
 
 #include "../key_encoding.hpp"
+#include "placement_table.hpp"      // for virtualShard (per-VShard extraction)
 #include "series_key.hpp"           // for buildSeriesKey
 #include "tsm.hpp"                  // for TSMValueType definition
 #include "value_type_dispatch.hpp"  // for valueTypeName
@@ -1131,6 +1132,23 @@ seastar::future<std::vector<std::pair<SeriesId128, std::optional<SeriesMetadata>
     }
 
     co_return results;
+}
+
+seastar::future<std::vector<std::pair<SeriesId128, SeriesMetadata>>> NativeIndex::extractVShardSeriesMetadata(
+    uint16_t vshard) {
+    std::vector<std::pair<SeriesId128, SeriesMetadata>> out;
+    // SERIES_METADATA key = [type:1][seriesId:16]. Scan the type, keep only the
+    // series that route to this VShard.
+    const std::string prefix(1, static_cast<char>(SERIES_METADATA));
+    co_await kvPrefixScan(prefix, [&](std::string_view key, std::string_view val) -> bool {
+        if (key.size() >= 1 + 16) {
+            SeriesId128 id = SeriesId128::fromBytes(key.substr(1, 16));
+            if (timestar::virtualShard(id) == vshard)
+                out.emplace_back(id, ke::decodeSeriesMetadata(val));
+        }
+        return true;  // continue the scan
+    });
+    co_return out;
 }
 
 // ============================================================================

@@ -111,6 +111,14 @@ public:
     seastar::future<std::vector<std::pair<SeriesId128, std::optional<SeriesMetadata>>>> getSeriesMetadataBatch(
         const std::vector<SeriesId128>& seriesIds) override;
 
+    // Per-VShard index extraction (Task 4c): the (seriesId, metadata) pairs whose
+    // series belong to `vshard` (virtualShard(seriesId) == vshard), by filtering
+    // the SERIES_METADATA entries. Read-only -- it enables extracting one VShard's
+    // index for a snapshot without a key-format change; the derived VShard id
+    // keeps extraction stable across core counts. Ordered by the index's key
+    // order (SeriesId128 bytes).
+    seastar::future<std::vector<std::pair<SeriesId128, SeriesMetadata>>> extractVShardSeriesMetadata(uint16_t vshard);
+
     // --- Per-series value-type binding (SERIES_VALUE_TYPE, 0x18) ---
     //
     // Not part of the IndexBackend interface: this is enforced by Engine on the
