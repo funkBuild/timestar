@@ -1,5 +1,7 @@
 #pragma once
 
+#include "../core/vshard.hpp"
+
 #include <cstdint>
 #include <filesystem>
 #include <optional>
@@ -74,6 +76,17 @@ public:
     [[nodiscard]] std::filesystem::path shardCountMetadataTemporaryFile() const;
     [[nodiscard]] std::filesystem::path rebalanceStateFile() const;
     [[nodiscard]] std::filesystem::path rebalanceStateTemporaryFile() const;
+
+    // Stable VShard namespace (Phase 1 / Task 4). Storage is addressed by VShard
+    // identity, not core: `vshards/0000`..`vshards/4095` (zero-padded, frozen at
+    // cluster creation). A VShard directory never encodes a core number -- the
+    // executing core is derived at startup (see assignCore in vshard.hpp). The
+    // internal per-VShard subtree (raft.meta / MANIFEST / catalog / tsm /
+    // tombstones / snapshots) is decided by the physical-layout ADR and added by
+    // Task 4c; this exposes only the frozen namespace boundary and its parsing.
+    [[nodiscard]] std::filesystem::path vshardDataDir() const;
+    [[nodiscard]] std::filesystem::path vshardDir(VShardId vshard) const;
+    [[nodiscard]] std::optional<VShardId> parseVShardDirName(std::string_view name) const;
 
     friend bool operator==(const StorageLayout& lhs, const StorageLayout& rhs) noexcept {
         return lhs.root_ == rhs.root_;
