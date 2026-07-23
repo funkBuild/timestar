@@ -211,10 +211,85 @@ seastar::future<> testHibernationSkipsIdleFollowersButStillReplicates() {
         co_await std::move(f);
 }
 
+seastar::future<> testManyGroupsFailOverWhenLeaderNodeCrashes() {
+    const std::vector<NodeId> voters = {1, 2, 3};
+    const std::map<NodeId, uint16_t> ports = {{1, 39180}, {2, 39181}, {3, 39182}};
+    const uint16_t kGroups = 20;
+    std::map<NodeId, NodeState> nodes;
+    auto optsFor = [](NodeId id) {
+        RaftOptions o;  // node 1 leads; node 2 is next-shortest so it wins after a crash
+        o.electionTimeoutMin = o.electionTimeoutMax = (id == 1 ? 2 : (id == 2 ? 6 : 25));
+        o.heartbeatTimeout = 1;
+        return o;
+    };
+    for (NodeId id : voters) {
+        NodeState st;
+        st.transport = std::make_unique<RaftRpcTransport>();
+        st.registry = std::make_unique<RaftGroupRegistry>(*st.transport, 5ms);
+        for (uint16_t g = 1; g <= kGroups; ++g) {
+            st.persistence.push_back(std::make_unique<NoopPersistence>());
+            st.sms.push_back(std::make_unique<RecordingSM>());
+            RaftNode node(id, voters, RaftLog{}, HardState{}, optsFor(id));
+            st.registry->addGroup(g, std::move(node), *st.persistence.back(), *st.sms.back());
+        }
+        nodes[id] = std::move(st);
+    }
+    for (NodeId id : voters) {
+        RaftGroupRegistry* reg = nodes[id].registry.get();
+        co_await nodes[id].transport->start(loopback(ports.at(id)),
+                                            [reg](Envelope e) { return reg->deliver(std::move(e)); });
+        for (NodeId peer : voters)
+            if (peer != id)
+                nodes[id].transport->addPeer(peer, loopback(ports.at(peer)));
+    }
+    for (NodeId id : voters)
+        nodes[id].registry->startTicking();
+
+    bool led = co_await waitFor([&] {
+        for (uint16_t g = 1; g <= kGroups; ++g)
+            if (!nodes[1].registry->group(g)->isLeader())
+                return false;
+        return true;
+    });
+    EXPECT_TRUE(led);
+
+    // CRASH the node that leads every group.
+    co_await nodes[1].registry->stop();
+    co_await nodes[1].transport->stop();
+
+    // Every group must re-elect a surviving leader within a bounded time -- even
+    // hibernated follower groups, via their periodic check-tick.
+    bool refailed = co_await waitFor([&] {
+        for (uint16_t g = 1; g <= kGroups; ++g) {
+            const bool has = nodes[2].registry->group(g)->isLeader() ||
+                             nodes[3].registry->group(g)->isLeader();
+            if (!has)
+                return false;
+        }
+        return true;
+    });
+    EXPECT_TRUE(refailed);
+
+    std::vector<seastar::future<>> stops;
+    for (NodeId id : {2u, 3u})
+        stops.push_back(nodes[id].registry->stop());
+    for (auto& f : stops)
+        co_await std::move(f);
+    std::vector<seastar::future<>> tstops;
+    for (NodeId id : {2u, 3u})
+        tstops.push_back(nodes[id].transport->stop());
+    for (auto& f : tstops)
+        co_await std::move(f);
+}
+
 }  // namespace
 
 TEST(RaftGroupRegistryTest, ManyGroupsMultiplexOverSharedTransportAndTimer) {
     testManyGroupsOverSharedTransport().get();
+}
+
+TEST(RaftGroupRegistryTest, ManyGroupsFailOverWhenLeaderNodeCrashes) {
+    testManyGroupsFailOverWhenLeaderNodeCrashes().get();
 }
 
 TEST(RaftGroupRegistryTest, HibernationSkipsIdleFollowersButStillReplicates) {
