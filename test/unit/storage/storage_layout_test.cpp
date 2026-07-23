@@ -52,19 +52,10 @@ TEST(StorageLayoutTest, DefaultRootExactlyPreservesLegacyNames) {
     EXPECT_EQ(layout.nativeWalFile(3, 7), "shard_3/native_index/wal/idx_000007.wal");
     EXPECT_EQ(layout.nativeSstableFile(3, 7), "shard_3/native_index/idx_000007.sst");
     EXPECT_EQ(layout.placementFile(), "placement.json");
-    EXPECT_EQ(layout.workerRegistryFile(), "workers.json");
-    EXPECT_EQ(layout.workerRegistryTemporaryFile(), "workers.json.tmp");
     EXPECT_EQ(layout.vshardDataDir(), "vshards");
     EXPECT_EQ(layout.vshardDir(0), "vshards/0000");
     EXPECT_EQ(layout.vshardDir(4095), "vshards/4095");
     EXPECT_THROW((void)layout.vshardDir(4096), std::out_of_range);
-    EXPECT_EQ(layout.effectiveVShardOwnershipDir(), "vshard_ownership");
-    EXPECT_EQ(layout.effectiveVShardOwnershipRevisionFile(1), "vshard_ownership/owners.00000000000000000001.bin");
-    EXPECT_EQ(layout.effectiveVShardOwnershipRevisionTemporaryFile(1),
-              "vshard_ownership/owners.00000000000000000001.bin.tmp");
-    EXPECT_EQ(layout.effectiveVShardOwnershipManifestFile(), "vshard_ownership.manifest");
-    EXPECT_EQ(layout.effectiveVShardOwnershipManifestTemporaryFile(), "vshard_ownership.manifest.tmp");
-    EXPECT_EQ(layout.effectiveVShardOwnershipInitializingMarkerFile(), "vshard_ownership.initializing");
     EXPECT_EQ(layout.shardCountMetadataFile(), "shard_count.meta");
     EXPECT_EQ(layout.shardCountMetadataTemporaryFile(), "shard_count.meta.tmp");
     EXPECT_EQ(layout.rebalanceStateFile(), "rebalance.state");
@@ -81,12 +72,7 @@ TEST(StorageLayoutTest, RelativeRootWithSpacesIsPreservedLexically) {
     EXPECT_EQ(layout.shardStagingTsmDir(1), "tenant data/primary/shard_1_new/tsm");
     EXPECT_EQ(layout.rebalanceSplitTsmFile(1, 44), "tenant data/primary/shard_1_new/tsm/0_split_44.tsm");
     EXPECT_EQ(layout.placementFile(), "tenant data/primary/placement.json");
-    EXPECT_EQ(layout.workerRegistryFile(), "tenant data/primary/workers.json");
-    EXPECT_EQ(layout.workerRegistryTemporaryFile(), "tenant data/primary/workers.json.tmp");
     EXPECT_EQ(layout.vshardDir(27), "tenant data/primary/vshards/0027");
-    EXPECT_EQ(layout.effectiveVShardOwnershipRevisionFile(27),
-              "tenant data/primary/vshard_ownership/owners.00000000000000000027.bin");
-    EXPECT_EQ(layout.effectiveVShardOwnershipManifestFile(), "tenant data/primary/vshard_ownership.manifest");
 }
 
 TEST(StorageLayoutTest, AnchoredRootIsAbsoluteAndStableAtTheOwnershipBoundary) {
@@ -176,26 +162,22 @@ TEST(StorageLayoutTest, CanonicalVShardDirectoryParsingRejectsAliasesAndEscapes)
     EXPECT_FALSE(layout.parseVShardDirName("0001/").has_value());
 }
 
-TEST(StorageLayoutTest, OwnershipRevisionFilenamesAreImmutableCanonicalAndRangeChecked) {
+TEST(StorageLayoutTest, DecommissionedWorkerArtifactNamesAreRecognizedExactly) {
     const timestar::StorageLayout layout("data");
-    const auto maximum = std::numeric_limits<uint64_t>::max();
 
-    EXPECT_THROW((void)layout.effectiveVShardOwnershipRevisionFile(0), std::out_of_range);
-    EXPECT_EQ(layout.effectiveVShardOwnershipRevisionFile(maximum),
-              "data/vshard_ownership/owners.18446744073709551615.bin");
-    EXPECT_EQ(layout.parseEffectiveVShardOwnershipRevisionFilename("owners.00000000000000000001.bin"), 1u);
-    EXPECT_EQ(layout.parseEffectiveVShardOwnershipRevisionFilename("owners.18446744073709551615.bin"), maximum);
-    EXPECT_FALSE(layout.parseEffectiveVShardOwnershipRevisionFilename("owners.00000000000000000000.bin").has_value());
-    EXPECT_FALSE(layout.parseEffectiveVShardOwnershipRevisionFilename("owners.1.bin").has_value());
-    EXPECT_FALSE(layout.parseEffectiveVShardOwnershipRevisionFilename("owners.+0000000000000000001.bin").has_value());
-    EXPECT_FALSE(layout.parseEffectiveVShardOwnershipRevisionFilename("owners.18446744073709551616.bin").has_value());
-    EXPECT_FALSE(
-        layout.parseEffectiveVShardOwnershipRevisionFilename("owners.00000000000000000001.bin.tmp").has_value());
-    EXPECT_FALSE(
-        layout.parseEffectiveVShardOwnershipRevisionFilename("../owners.00000000000000000001.bin").has_value());
-    EXPECT_FALSE(
-        layout.parseEffectiveVShardOwnershipRevisionFilename("vshard_ownership/owners.00000000000000000001.bin")
-            .has_value());
+    EXPECT_TRUE(layout.isDecommissionedWorkerArtifactName("workers.json"));
+    EXPECT_TRUE(layout.isDecommissionedWorkerArtifactName("workers.json.tmp"));
+    EXPECT_TRUE(layout.isDecommissionedWorkerArtifactName("vshard_ownership"));
+    EXPECT_TRUE(layout.isDecommissionedWorkerArtifactName("vshard_ownership.manifest"));
+    EXPECT_TRUE(layout.isDecommissionedWorkerArtifactName("vshard_ownership.manifest.tmp"));
+    EXPECT_TRUE(layout.isDecommissionedWorkerArtifactName("vshard_ownership.initializing"));
+
+    EXPECT_FALSE(layout.isDecommissionedWorkerArtifactName("vshards"));
+    EXPECT_FALSE(layout.isDecommissionedWorkerArtifactName("vshard_ownershipX"));
+    EXPECT_FALSE(layout.isDecommissionedWorkerArtifactName("workers.jsonX"));
+    EXPECT_FALSE(layout.isDecommissionedWorkerArtifactName("workers"));
+    EXPECT_FALSE(layout.isDecommissionedWorkerArtifactName("placement.json"));
+    EXPECT_FALSE(layout.isDecommissionedWorkerArtifactName(""));
 }
 
 TEST(StorageLayoutTest, EquivalentLexicalRootsProduceEqualValues) {

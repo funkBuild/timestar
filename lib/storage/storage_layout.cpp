@@ -14,8 +14,6 @@ namespace timestar {
 namespace {
 
 constexpr std::string_view shardDirectoryPrefix = "shard_";
-constexpr std::string_view effectiveVShardOwnershipRevisionPrefix = "owners.";
-constexpr std::string_view effectiveVShardOwnershipRevisionSuffix = ".bin";
 
 }  // namespace
 
@@ -206,14 +204,6 @@ fs::path StorageLayout::placementFile() const {
     return underRoot("placement.json");
 }
 
-fs::path StorageLayout::workerRegistryFile() const {
-    return underRoot("workers.json");
-}
-
-fs::path StorageLayout::workerRegistryTemporaryFile() const {
-    return withSuffix(workerRegistryFile(), ".tmp");
-}
-
 fs::path StorageLayout::vshardDataDir() const {
     return underRoot("vshards");
 }
@@ -234,48 +224,9 @@ std::optional<uint16_t> StorageLayout::parseVShardDirName(std::string_view name)
     return static_cast<uint16_t>(parsed);
 }
 
-fs::path StorageLayout::effectiveVShardOwnershipDir() const {
-    return underRoot("vshard_ownership");
-}
-
-fs::path StorageLayout::effectiveVShardOwnershipRevisionFile(uint64_t revision) const {
-    if (revision == 0)
-        throw std::out_of_range("effective VShard ownership revision zero is reserved");
-    return effectiveVShardOwnershipDir() / std::format("owners.{:020}.bin", revision);
-}
-
-fs::path StorageLayout::effectiveVShardOwnershipRevisionTemporaryFile(uint64_t revision) const {
-    return withSuffix(effectiveVShardOwnershipRevisionFile(revision), ".tmp");
-}
-
-std::optional<uint64_t> StorageLayout::parseEffectiveVShardOwnershipRevisionFilename(std::string_view name) const {
-    if (!name.starts_with(effectiveVShardOwnershipRevisionPrefix) ||
-        !name.ends_with(effectiveVShardOwnershipRevisionSuffix)) {
-        return std::nullopt;
-    }
-
-    const auto numeric = name.substr(
-        effectiveVShardOwnershipRevisionPrefix.size(),
-        name.size() - effectiveVShardOwnershipRevisionPrefix.size() - effectiveVShardOwnershipRevisionSuffix.size());
-    uint64_t revision = 0;
-    const auto result = std::from_chars(numeric.data(), numeric.data() + numeric.size(), revision);
-    if (numeric.empty() || result.ec != std::errc{} || result.ptr != numeric.data() + numeric.size() || revision == 0 ||
-        name != effectiveVShardOwnershipRevisionFile(revision).filename().string()) {
-        return std::nullopt;
-    }
-    return revision;
-}
-
-fs::path StorageLayout::effectiveVShardOwnershipManifestFile() const {
-    return underRoot("vshard_ownership.manifest");
-}
-
-fs::path StorageLayout::effectiveVShardOwnershipManifestTemporaryFile() const {
-    return withSuffix(effectiveVShardOwnershipManifestFile(), ".tmp");
-}
-
-fs::path StorageLayout::effectiveVShardOwnershipInitializingMarkerFile() const {
-    return underRoot("vshard_ownership.initializing");
+bool StorageLayout::isDecommissionedWorkerArtifactName(std::string_view name) const noexcept {
+    return name == "workers.json" || name.starts_with("workers.json.") || name == "vshard_ownership" ||
+           name.starts_with("vshard_ownership.");
 }
 
 fs::path StorageLayout::shardCountMetadataFile() const {

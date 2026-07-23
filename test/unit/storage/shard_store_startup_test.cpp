@@ -218,6 +218,37 @@ TEST_F(ShardStoreStartupTest, FreshInspectionIsReadOnly) {
     EXPECT_TRUE(fs::is_empty(testDir));
 }
 
+TEST_F(ShardStoreStartupTest, DecommissionedWorkerArtifactsFailClosed) {
+    const std::vector<std::string> artifacts = {"workers.json", "workers.json.tmp", "vshard_ownership.manifest",
+                                                "vshard_ownership.initializing"};
+    for (const auto& artifact : artifacts) {
+        SCOPED_TRACE(artifact);
+        fs::remove_all(testDir);
+        fs::create_directories(testDir);
+        writeFile(artifact, "left behind by a pre-release build");
+
+        timestar::ShardStoreStartup startup{timestar::StorageLayout(testDir)};
+        const auto result = inspect(startup, 2);
+
+        EXPECT_EQ(result.status, timestar::ShardStoreStartupStatus::InvalidMetadata);
+        EXPECT_FALSE(result.canStart());
+        EXPECT_NE(result.detail.find("decommissioned VShard-worker artifact"), std::string::npos) << result.detail;
+        EXPECT_NE(result.detail.find(artifact), std::string::npos) << result.detail;
+    }
+}
+
+TEST_F(ShardStoreStartupTest, DecommissionedOwnershipDirectoryFailsClosedEvenInACommittedStore) {
+    createCommittedStore(2);
+    fs::create_directories(testDir / "vshard_ownership");
+
+    timestar::ShardStoreStartup startup{timestar::StorageLayout(testDir)};
+    const auto result = inspect(startup, 2);
+
+    EXPECT_EQ(result.status, timestar::ShardStoreStartupStatus::InvalidMetadata);
+    EXPECT_FALSE(result.canStart());
+    EXPECT_NE(result.detail.find("vshard_ownership"), std::string::npos) << result.detail;
+}
+
 TEST_F(ShardStoreStartupTest, RelativeLayoutRemainsBoundToItsConstructionDirectory) {
     const auto relativeRoot =
         fs::path("shard startup relative root") /
@@ -241,6 +272,8 @@ TEST_F(ShardStoreStartupTest, RelativeLayoutRemainsBoundToItsConstructionDirecto
     }
 
     fs::remove_all(expectedRoot);
+    std::error_code cleanupEc;
+    fs::remove(expectedRoot.parent_path(), cleanupEc);  // parent is shared across param runs; drop it once empty
 }
 
 TEST_F(ShardStoreStartupTest, LockCreatesMissingRootButInspectionCreatesNoStoreArtifacts) {

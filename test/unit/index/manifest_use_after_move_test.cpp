@@ -32,57 +32,51 @@ protected:
 };
 
 TEST_F(ManifestUseAfterMoveTest, SourceInspection_NoUseAfterMove) {
-    // Find all occurrences of push_back(std::move(f)) and verify none are
-    // followed by f.fileNumber before the next closing brace '}' (staying in scope).
-    std::string pattern = "push_back(std::move(f))";
+    // For every push_back(std::move(<ident>)), the moved identifier must not
+    // be dereferenced again before the end of its scope window. Identifiers
+    // are extracted rather than hardcoded so a rename cannot silently turn
+    // this test into a no-op (it did once: `f` became `file`).
+    const std::string pattern = "push_back(std::move(";
     size_t pos = 0;
     int occurrences = 0;
 
     while ((pos = sourceCode.find(pattern, pos)) != std::string::npos) {
+        const size_t identBegin = pos + pattern.size();
+        const size_t identEnd = sourceCode.find(')', identBegin);
+        ASSERT_NE(identEnd, std::string::npos);
+        const std::string ident = sourceCode.substr(identBegin, identEnd - identBegin);
         ++occurrences;
-        size_t afterPos = pos + pattern.size();
 
         // Find the next closing brace (end of scope) or next 80 chars, whichever is first
-        size_t nextBrace = sourceCode.find('}', afterPos);
+        const size_t afterPos = identEnd;
+        const size_t nextBrace = sourceCode.find('}', afterPos);
         size_t checkEnd = std::min(afterPos + 80, sourceCode.size());
         if (nextBrace != std::string::npos && nextBrace < checkEnd) {
             checkEnd = nextBrace;
         }
 
-        auto afterMove = sourceCode.substr(afterPos, checkEnd - afterPos);
-
-        // There should NOT be f.fileNumber after the move in this window
-        EXPECT_EQ(afterMove.find("f.fileNumber"), std::string::npos)
-            << "Found access to f.fileNumber after std::move(f) "
-            << "(occurrence #" << occurrences << "). "
-            << "This is use-after-move undefined behavior.\n"
-            << "Code after move:\n" << afterMove;
-        pos += pattern.size();
+        const auto afterMove = sourceCode.substr(afterPos, checkEnd - afterPos);
+        EXPECT_EQ(afterMove.find(ident + "."), std::string::npos)
+            << "Found access to " << ident << " after std::move(" << ident << ") (occurrence #" << occurrences
+            << "). This is use-after-move undefined behavior.\n"
+            << "Code after move:\n"
+            << afterMove;
+        pos = identEnd;
     }
 
-    EXPECT_GE(occurrences, 1) << "Expected at least one push_back(std::move(f)) in manifest.cpp";
+    EXPECT_GE(occurrences, 1) << "Expected at least one push_back(std::move(...)) in manifest.cpp";
 }
 
-TEST_F(ManifestUseAfterMoveTest, SourceInspection_SavesFileNumberBeforeMove) {
-    // The fix pattern: save fileNumber to a local before the move.
-    // Look for "fn = f.fileNumber" appearing before the second push_back(std::move(f)).
-    // The second occurrence is in the recovery function where the bug was.
-
-    std::string pattern = "push_back(std::move(f))";
-    size_t firstPos = sourceCode.find(pattern);
-    ASSERT_NE(firstPos, std::string::npos);
-    size_t secondPos = sourceCode.find(pattern, firstPos + pattern.size());
-    ASSERT_NE(secondPos, std::string::npos) << "Expected at least two push_back(std::move(f))";
-
-    // Check the 200 chars before the second move for the saved variable
-    size_t start = (secondPos > 200) ? secondPos - 200 : 0;
-    auto beforeMove = sourceCode.substr(start, secondPos - start);
-
-    // Should find something like "fn = f.fileNumber"
-    bool savesFileNumber = (beforeMove.find("= f.fileNumber") != std::string::npos);
-    EXPECT_TRUE(savesFileNumber)
-        << "Should save f.fileNumber to a local variable before std::move(f) "
-        << "in the recovery function.\n"
-        << "Code before move:\n" << beforeMove;
+TEST_F(ManifestUseAfterMoveTest, SourceInspection_CompactionPathReadsFileNumberFromCopyOrSavedLocal) {
+    // The historical bug moved the new file into files_ and then read its
+    // fileNumber. The fixed compaction path pushes a copy and pins the
+    // fileNumber into a local before the removal lambda uses it; the new
+    // file must never be moved into files_.
+    EXPECT_NE(sourceCode.find("files_.push_back(newFile)"), std::string::npos)
+        << "Compaction path should push a copy of newFile";
+    EXPECT_NE(sourceCode.find("newFn = newFile.fileNumber"), std::string::npos)
+        << "Compaction path should pin newFile.fileNumber into a local for the removal lambda";
+    EXPECT_EQ(sourceCode.find("push_back(std::move(newFile))"), std::string::npos)
+        << "newFile is read after insertion and must not be moved into files_";
 }
 #endif

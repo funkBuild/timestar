@@ -88,6 +88,7 @@ struct DirectoryScan {
     unsigned shardCount = 0;
     std::optional<std::string> legacyArtifact;
     std::optional<std::string> invalidReservedArtifact;
+    std::optional<std::string> decommissionedWorkerArtifact;
     std::string error;
 };
 
@@ -308,6 +309,8 @@ DirectoryScan scanShardDirectories(int directoryFd, const StorageLayout& layout)
             scan.valid = false;
             scan.error = "invalid shard directory name: " + name;
             return scan;
+        } else if (layout.isDecommissionedWorkerArtifactName(name)) {
+            scan.decommissionedWorkerArtifact = name;
         } else if (name.starts_with(shardCountName) || name.starts_with(rebalanceName)) {
             scan.invalidReservedArtifact = name;
         }
@@ -545,6 +548,14 @@ ShardStoreInspection ShardStoreStartup::inspect(unsigned requestedShardCount, co
         return invalidInspection(requestedShardCount,
                                  "unknown reserved storage artifact: " + *directories.invalidReservedArtifact);
     }
+    if (directories.decommissionedWorkerArtifact) {
+        return invalidInspection(
+            requestedShardCount,
+            "decommissioned VShard-worker artifact exists: " + *directories.decommissionedWorkerArtifact +
+                ". The persisted worker/ownership machinery was removed (Task D0, "
+                "docs/clustering-vshard-workers.md); this root was touched by a pre-release build. Move the "
+                "artifact out of the data root after confirming it holds no needed state, then restart");
+    }
     if (directories.legacyArtifact) {
         return {.status = ShardStoreStartupStatus::InterruptedLegacyRebalance,
                 .requestedShardCount = requestedShardCount,
@@ -677,7 +688,7 @@ void ShardStoreStartup::commitAfterInitialization(const ShardStoreInspection& in
 
     const auto directories = scanShardDirectories(lock.directoryFd_, layout_);
     if (!directories.valid || directories.legacyArtifact || directories.invalidReservedArtifact ||
-        directories.shardCount != inspection.requestedShardCount) {
+        directories.decommissionedWorkerArtifact || directories.shardCount != inspection.requestedShardCount) {
         throw std::runtime_error("Engine initialization did not produce the expected canonical shard directories");
     }
 
