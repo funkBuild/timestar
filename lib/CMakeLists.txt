@@ -7,6 +7,7 @@ file(GLOB_RECURSE SRC_FILES CONFIGURE_DEPENDS
     query/*.cpp
     index/*.cpp
     http/*.cpp
+    cluster/*.cpp
     utils/*.cpp
     retention/*.cpp
     config/*.cpp

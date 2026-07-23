@@ -32,6 +32,7 @@ file(GLOB_RECURSE UNIT_FUZZ_TESTS CONFIGURE_DEPENDS unit/fuzz/*.cpp)
 # timestar_unit_test) to measure proto path coverage.  The main test targets
 # link timestar_proto so these TUs can include timestar.pb.h.
 file(GLOB_RECURSE UNIT_CORE_TESTS CONFIGURE_DEPENDS unit/core/*.cpp)
+file(GLOB_RECURSE UNIT_CLUSTER_TESTS CONFIGURE_DEPENDS unit/cluster/*.cpp)
 file(GLOB_RECURSE UNIT_RETENTION_TESTS CONFIGURE_DEPENDS unit/retention/*.cpp)
 file(GLOB_RECURSE UNIT_UTILS_TESTS CONFIGURE_DEPENDS unit/utils/*.cpp)
 file(GLOB_RECURSE INTEGRATION_TESTS CONFIGURE_DEPENDS integration/*.cpp)
@@ -63,6 +64,7 @@ set(TEST_SRCS
     ${UNIT_HTTP_TESTS}
     ${UNIT_FUZZ_TESTS}
     ${UNIT_CORE_TESTS}
+    ${UNIT_CLUSTER_TESTS}
     ${UNIT_RETENTION_TESTS}
     ${UNIT_UTILS_TESTS}
     ${INTEGRATION_TESTS}
@@ -136,6 +138,7 @@ set(UNIT_TEST_SRCS
     ${UNIT_HTTP_TESTS}
     ${UNIT_FUZZ_TESTS}
     ${UNIT_CORE_TESTS}
+    ${UNIT_CLUSTER_TESTS}
     ${UNIT_RETENTION_TESTS}
     ${UNIT_UTILS_TESTS}
 )
