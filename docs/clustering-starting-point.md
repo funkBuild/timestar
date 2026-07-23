@@ -1,6 +1,10 @@
 # Cluster Starting Point: Storage Layout Foundation
 
-**Status:** Completed on `cluster-design`
+**Status:** Completed on `cluster-design`, with two tracked residuals:
+`bin/timestar_benchmark.cpp` still constructs `StorageLayout(".")` rather than
+the configured root, and the non-default-root restart test runs at Engine
+granularity (`test/unit/core/data_dir_test.cpp`) rather than as a full
+server-process restart.
 
 **Parent design:** [Cluster Architecture and Implementation Plan](clustering.md)
 
@@ -34,7 +38,8 @@ This epic will:
 5. Establish the seam needed for the later move from CPU-core shards to stable
    virtual shards.
 
-Do not begin with Raft, etcd, node discovery, or cross-machine RPC. Those
+Do not begin with Raft, the group-0 control plane, node discovery, or
+cross-machine RPC. Those
 components would have no safe, movable replicated unit while files are still
 addressed by the number of CPU cores in one process.
 
@@ -65,7 +70,7 @@ storage owner or a complete durable state machine to apply into. A working
 network demo at this stage would give false confidence while leaving recovery
 and movement undefined.
 
-### Start with etcd and placement maps
+### Start with the control plane and placement maps
 
 Rejected as the first step. Desired placement is only control-plane intent. It
 cannot safely move a `shard_N` directory whose contents mix unrelated future
@@ -89,7 +94,7 @@ This epic does not:
 
 - change the TSM or WAL formats;
 - introduce VShard directories or move data between shards;
-- add Raft, cluster membership, network protocols, or etcd;
+- add Raft, cluster membership, network protocols, or the control plane;
 - claim replicated durability or high availability;
 - change series routing or query consistency;
 - make NativeIndex rebuildable from existing TSM data;
@@ -100,11 +105,12 @@ The rebalancer is disabled on unsafe core-count changes until a metadata-safe
 offline or VShard-aware migration is implemented.
 
 This is a temporary legacy-format guard, not the final scaling behaviour. In
-the VShard format, CPU shards become persisted OSD-like storage workers. Adding
-workers after a process restart will redistribute a proportional subset of
-stable VShard ownership, while replicas continue to use distinct machines as
-their failure domains. The parent design's
-[CPU storage-worker contract](clustering.md#cpu-shards-as-osd-like-storage-workers)
+the VShard format, storage is addressed by VShard identity and core execution
+is derived at startup from the live core count, so a core-count change is a
+restart plus a recomputed mapping — no migration and no persisted local
+ownership — while replicas continue to use distinct machines as their failure
+domains. The parent design's
+[derived local execution contract](clustering.md#cpu-shards-derived-local-execution-assignment)
 defines the replacement path.
 
 ## Design rules
@@ -404,14 +410,14 @@ VShards. Instead, record the requirements learned from layout injection and
 write the next implementation plan around an explicit stable VShard identity.
 
 The next epic is tracked in
-[Stable VShards and Local Storage Workers](clustering-vshard-workers.md). Its
-storage-boundary order is:
-
-1. define the local durable acknowledgement boundary and group-commit tests;
-2. make the series catalog durable and rebuildable;
-3. partition WAL, TSM, index visibility, deletes, and compaction by VShard;
-4. prove one VShard can snapshot, restore, and move locally; then
-5. put that complete state machine behind a Multi-Raft prototype.
+[Stable VShards and Derived Local Execution](clustering-vshard-workers.md);
+its task list is authoritative. (The epic was simplified on 2026-07-23: the
+persisted worker-registry and ownership-generation machinery originally built
+as its early tasks was dissolved in favour of boot-derived core assignment,
+and the epic now centres on decommissioning, derived assignment, the Task 4
+storage boundary — whose first slice, Task 4.0, is the durable
+acknowledgement boundary — and the Task 6 migration tool. Multi-Raft is the
+parent plan's Phase 2, not part of that epic.)
 
 ## Verification plan
 

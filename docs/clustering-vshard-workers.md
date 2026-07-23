@@ -1,6 +1,11 @@
-# Stable VShards and Local Storage Workers
+# Stable VShards and Derived Local Execution
 
-**Status:** Tasks 1, 2a, 2b, 3a, and 3b1 complete on `cluster-design`; Task 3b2 next
+**Status:** Rewritten 2026-07-23 after the simplification decision. The
+persisted worker-registry/ownership machinery originally specified here was
+implemented through Task 3b1 (with Task 3b2 in progress, uncommitted) and is
+now decommissioned — see "What was dissolved and why". The frozen
+`vshards/0000`–`vshards/4095` namespace survives. Next work: Task D0
+(decommission), then Task 1 (derived assignment), then Task 4.
 
 **Parent design:** [Cluster Architecture and Implementation Plan](clustering.md)
 
@@ -8,244 +13,162 @@
 
 ## Outcome
 
-This epic replaces CPU-core storage identity with stable VShard identity and
-persisted, OSD-like node-local storage workers. Adding one CPU worker after a
-restart should rebalance only its proportional share of VShards. Removing CPU
-capacity must keep every old worker addressable until its VShards have been
-fenced, handed off, and drained.
+This epic replaces CPU-core storage identity with stable VShard identity.
+Storage is addressed by VShard only; the reactor core that executes a VShard
+is derived at startup from the VShard ID and the live core count. A `--smp`
+change is a restart plus a recomputed mapping: no data movement, no drain, no
+persisted local ownership, and no possibility of two cores serving one VShard,
+because assignment happens exactly once per process, at startup.
 
-This does not make reactor cores replica failure domains. Replica placement is
-host-first; local worker selection is a separate second stage.
+Reactor cores are never replica failure domains. Replica placement is
+host-level and single-stage; core execution inside a host is invisible to
+placement, movement, and replication.
 
-## Non-negotiable state separation
+## What was dissolved and why
 
-Three maps have different authority and must not be collapsed:
+An earlier revision of this epic modelled cores as persisted OSD-like storage
+workers: a durable worker registry (`workers.json`), integer-ticket rendezvous
+for local placement, effective-ownership generations with a frozen
+49,212-byte layout binary, a high-water ownership manifest, and fenced
+runtime handoff. Tasks 1, 2a, 2b, 3a, and 3b1 of that revision were
+implemented and tested; Task 3b2 was in progress.
 
-1. **Desired local placement** says which active worker should eventually
-   execute each VShard. It is deterministic control-plane intent.
-2. **Effective local ownership** records the fenced ownership generation that
-   may currently serve each VShard. Requests route by this map during handoff.
-3. **Runtime worker mapping** assigns every persisted active or draining worker
-   to a reactor core for this process lifetime. It is execution state, not
-   storage identity or replica placement.
+That machinery defended exactly one capability the objectives do not require:
+rebalancing VShards between cores at runtime without a restart. Since `--smp`
+changes already require a restart, and Ceph likewise does not rebalance PGs
+across CPU threads, boot-derived assignment provides the same guarantees with
+no durable state. The two-owners hazard, the drain protocol, the ownership
+rollback witnesses, and both crash-safe metadata stores dissolve with it.
 
-A desired-placement delta is not an executable move plan. Later handoff code
-must quiesce the old owner, durably advance a generation, open the new owner,
-and only then change effective routing. No task in this epic may infer that a
-desired owner is already safe to serve.
+**Kept:**
 
-## Placement algorithm version 1
+- The `vshards/0000`–`vshards/4095` directory namespace and its
+  `StorageLayout` methods (Task 4 builds on them).
+- The root-lock and reserved-name fail-closed startup discipline.
+- The crash-safe atomic-install patterns and crash-injection test techniques,
+  which transfer directly to Task 4's catalog and manifest work.
+- The rendezvous implementation, reusable for node-level placement in the
+  control plane (parent plan, Phase 3).
 
-The cluster uses 4,096 fixed VShards. Local desired placement uses deterministic
-integer-ticket highest-random-weight rendezvous:
+**Removed (Task D0):**
 
-- A worker weight is a persisted **absolute number of capacity tickets**.
-- CPU workers initially receive one ticket each.
-- Tickets are numbered from zero through `weight - 1`.
-- For a VShard, every active worker ticket receives a frozen 64-bit score; the
-  worker holding the highest ticket owns the desired slot.
-- Draining workers remain registered and runtime-mapped but receive no desired
-  VShards.
+- `worker_registry.*`, `worker_registry_store.*`,
+  `effective_vshard_layout.*`, `effective_vshard_layout_store.*`,
+  `effective_vshard_manifest.*`, their tests, and the uncommitted Task 3b2
+  work (abandoned, not merged).
+- The `workers.json`, `vshard_ownership/`, `vshard_ownership.manifest`, and
+  `vshard_ownership.initializing` reserved artifacts: a new-format root must
+  not contain them, and startup fails closed if they appear.
+- `local_storage_placement.*` leaves the local path (parked for Phase 3 node
+  placement).
 
-With independent uniform scores, a worker's expected share is its ticket count
-divided by total tickets. Adding one ticket can only retain the old winner or
-move a VShard to the worker receiving that ticket. Removing a worker can only
-move VShards that worker won.
+Whole-root rollback detection, which the ownership manifest partially
+provided, is owned by the group-0 external epoch witness (parent plan,
+Phase 3): a node whose local generations regress relative to what group 0
+recorded for it is quarantined rather than trusted.
 
-Weights are deliberately not ratio-normalized: `1:2` and `10:20` have the same
-expected proportions but different candidate sets and therefore different
-placements. The weight quantum, algorithm version, 64-bit mixing constants,
-tuple encoding, ticket numbering, limits, and golden vectors are storage
-compatibility decisions. Changing any of them requires a versioned placement
-migration.
+## Derived assignment rules
 
-Version 1 bounds the model to 256 workers, 1,024 tickets per worker, and 8,192
-aggregate tickets. At 256 equal workers the expected minimum share is 16
-VShards. Placement also fails closed if any active worker actually receives
-zero VShards, because accepting a worker that cannot own load would make the
-scale-by-one claim false. Metadata outside these worker/ticket limits fails
-closed instead of causing unbounded startup work.
+- Assignment is a deterministic pure function
+  `core = assign(vshard_id, core_count)` with an even spread (for example
+  `vshard_id % core_count`); the exact function is defined in one place and
+  golden-tested, and changing it is a startup-behaviour change requiring its
+  own review, not a storage migration.
+- It is computed exactly once, at startup, before storage services open.
+  Nothing recomputes or reassigns mid-process.
+- Journals are per core; every record is VShard-tagged with a per-VShard
+  monotonic sequence. Startup replay routes each record to the current owning
+  core — the same routing crash recovery needs — so records written under a
+  previous core count remain recoverable.
+- Every VShard directory is opened by its assigned core; a VShard directory
+  never encodes a core number.
 
 ## Implementation tasks
 
-### Task 1: Pure desired placement and runtime mapping
+### Task D0: Decommission the worker machinery
 
-- Introduce stable `StorageWorkerId`, active/draining records, and versioned
-  integer-ticket rendezvous.
-- Produce a `DesiredPlacementDelta` by comparing desired placement with an
-  explicit effective-owner table.
-- Fail if an effective owner is absent from the worker registry; hard removal
-  is illegal until effective ownership is zero.
-- Map every persisted active or draining worker deterministically onto the
-  available reactor cores using capacity-ticket-balanced assignment, including
-  co-scheduling after `--smp` shrink.
-- Keep the model disconnected from `PlacementTable`, `placement.json`, Engine,
-  server startup, and legacy `shard_N` routing.
+Remove the dissolved components listed above, keep the survivors, and add a
+startup check that fails closed on legacy worker/ownership artifacts in a
+new-format root, with diagnostics pointing at this section.
 
-Gate: golden vectors are stable; input order is irrelevant; one-worker growth
-moves approximately `1/(N+1)` VShards and only to the new worker; draining
-moves only the draining worker's VShards; invalid or hard-removed ownership
-fails closed.
+Gate: build and full suite green with the code removed; startup fails closed
+with actionable diagnostics on roots containing legacy worker artifacts; the
+`vshards/` namespace tests still pass.
 
-### Task 2: Durable worker registry
+### Task 1: Derived assignment
 
-- Task 2a defines the pure registry state machine and canonical `workers.json`
-  codec. Format version 1 records the placement-algorithm version, generation,
-  next monotonic worker ID, sorted worker records, and checksum. The checksum is
-  CRC-32/ISO-HDLC over fixed-width little-endian fields and excludes the JSON
-  checksum field. Decoding accepts only the exact compact encoder output and is
-  bounded to 64 KiB before parsing, closing duplicate-key and alternate-JSON
-  ambiguities.
-- Task 2b places `workers.json` under `StorageLayout` and adds the locked,
-  descriptor-relative durable I/O protocol. Updates use an exclusive temporary
-  file, complete write, file fsync, close, atomic rename, and root-directory
-  fsync. Recovery re-fsyncs a complete valid next-generation temporary file
-  before rolling it forward, and re-fsyncs the directory before accepting a
-  final-only generation after an ambiguous crash. With a valid final file it
-  durably cleans partial or stale scratch state. Without a final file, invalid
-  temporary evidence is preserved and startup fails closed. Corrupt
-  authoritative state is never masked. Reserved names are opened nonblocking
-  and never followed, so a FIFO or symlink cannot hang or redirect startup.
-- The store reuses the server-lifetime root lock, checks the configured root
-  inode before and after namespace mutations, and rejects a mismatched or
-  replaced root. Rename and install-failure cleanup additionally require the
-  reserved pathname to still name the exact device/inode that this install
-  created or recovery validated. Rename also revalidates the exact canonical
-  bytes, not only the inode, for both the prepared source and the authoritative
-  destination immediately before replacement. After the last crash-test
-  observer the store repeats an unobservable file-and-directory fsync pass,
-  then rechecks root binding, identity, and contents before acknowledging
-  success. An `O_EXCL` collision or pathname substitution preserves the
-  pre-existing artifact and fails closed.
-- Process-crash injection covers every create/write/fsync/close/rename boundary
-  in installation and every fsync/remove/rename boundary in recovery. These
-  tests model process exit: each child independently acquires the root lock and
-  the recovering parent reacquires it after child exit. The ordered file and
-  directory fsync protocol supplies the power-loss durability contract. The
-  codec/store remain disconnected from live Engine routing.
-- Create worker IDs monotonically when CPU capacity grows; never recycle IDs.
-- On shrink, retain excess workers, co-schedule them, and mark them draining.
-- Install updates through fsync-plus-atomic-rename under the existing root lock.
-- Reject corrupt, duplicate, zero-ID, unsupported-version, or invalid-transition
-  state. A CRC detects corruption, not a valid historical rollback; freshness
-  is enforced by comparing candidates to the last accepted generation.
+- Implement the assignment function with golden vectors.
+- Wire startup to assign VShards to cores before storage services open.
+- Prove replay routing: journal records written under core count N replay
+  correctly under core count M.
 
-No local file format can detect rollback of an entire data-root snapshot when
-every generation witness is rolled back together. This phase detects rollback
-between the final and temporary candidates it can observe. A future replicated
-control plane must provide the external epoch witness needed to reject a
-coordinated whole-root rollback.
-
-Gate: crash injection at every write/rename/fsync boundary recovers one complete
-registry generation when one exists, and otherwise fails closed while
-preserving ambiguous evidence. A missing reactor never makes an old worker's
-data unreachable.
-
-### Task 3: VShard layout and effective ownership generations
-
-- Add VShard-addressed paths without reusing `shard_N` as identity.
-- Persist a checksummed effective owner and monotonically increasing ownership
-  generation for every VShard.
-- Fence opens and requests by `(VShardId, generation)`.
-- Refuse simultaneous service by old and new workers in one generation.
-
-Gate: fault injection cannot produce two serving owners or an ownerless
-acknowledged generation.
-
-Task 3a implements the pure ownership state machine and codec, still
-disconnected from filesystem storage and live Engine routing:
-
-- An immutable `EffectiveVShardTarget` owns the exact accepted worker-registry
-  snapshot, its generation, and a 128-bit XXH3 fingerprint of its canonical
-  encoding. It calculates the 4,096-entry desired placement once, rather than
-  rebuilding rendezvous scores for every handoff.
-- The effective layout stores a monotonic layout revision, target registry
-  generation and fingerprint, and one `(owner, ownership generation)` entry per
-  VShard. The target names desired intent being reconciled; it does not claim
-  convergence. A registry target may jump forward across skipped intent while
-  old effective owners remain recorded.
-- One changed revision is either witness-only, without changing any ownership
-  generation, or changes exactly one mismatched owner to the current desired
-  Active worker and increments only that VShard generation. Impossible history
-  is rejected when an entry generation exceeds the layout revision or the sum
-  of ownership changes exceeds the available revision history.
-- Task 3a deliberately exposes no runtime authorizer or publication API. It
-  freezes the `(VShard, generation, owner)` fence data shape, but a raw decoded,
-  cached, or speculative layout cannot mint an accepted fence or authorize
-  work. Non-copyability alone would not prove uniqueness because callers could
-  construct two independent authorities from old and new snapshots.
-- Format v1 is a fixed 49,212-byte binary with frozen magic, explicit
-  little-endian header and entry fields, exactly 4,096 implicit/index-ordered
-  entries, exact-length/canonical re-encoding, and a trailing CRC-32/ISO-HDLC.
-  The CRC detects corruption; the registry fingerprint binds cross-file state;
-  neither supplies authenticity or detects coordinated whole-root rollback.
-
-The pure transition is only a proposal. It does not prove that an operation
-admitted under the old fence has finished, nor that the destination is ready.
-Task 5 must prepare the destination without serving requests; quiesce and drain
-reads, writes, deletes, compaction, retention, and all other background work at
-the prior fence; durably commit the ownership revision; publish it through the
-single current authority; activate the destination; and only then acknowledge
-the cutover. Task 3b/5 must make that authority root-bound and shared by every
-handle, with private construction requiring opaque accepted durable-state and
-quiesced-prior-fence capabilities. Task 3b must also allow generation-one
-creation only on a provably fresh root (or explicit migration), fail closed if
-authoritative ownership state unexpectedly disappears, serialize
-registry/layout updates, and reject same-revision divergence during crash
-recovery. Those rules prevent local fence ABA; a coordinated whole-root
-rollback still needs a future external epoch witness.
-
-Task 3b is split at the persistence boundary. Task 3b1 freezes a
-rollback-detecting namespace before filesystem mutation is implemented:
-
-- VShard data directories use exactly `vshards/0000` through
-  `vshards/4095`. Ownership revisions are immutable files named
-  `vshard_ownership/owners.<20-digit-revision>.bin`; aliases, signs,
-  traversal, overflow, revision zero, and noncanonical padding are rejected.
-- The root-level `vshard_ownership.manifest` is the high-water witness. It
-  selects one immutable revision by exact revision, fixed byte size, and a
-  128-bit XXH3 digest of the canonical layout binary. Its own frozen binary
-  format has a corruption CRC. Replacing only the ownership directory with an
-  older snapshot therefore leaves the manifest pointing to a missing or
-  digest-mismatched revision and must fail closed.
-- Task 3b2 will atomically advance the root manifest only after the
-  new immutable revision is durable, and remove older revisions only after the
-  manifest is durable. Fresh initialization will require an opaque capability
-  bound to the locked root and an initializing record bound to the exact
-  generation-one worker registry. Registry recovery and ownership recovery
-  will share one metadata transaction serializer.
-
-The high-water manifest detects ownership-directory-only rollback. Coordinated
-rollback of both the root manifest and ownership namespace is still outside a
-local file format's evidence and requires a future external epoch witness.
+Gate: any core-count change followed by a restart yields identical query
+results with no data rewrite; assignment is identical for a fixed
+(vshard, core count) pair across processes and platforms.
 
 ### Task 4: Complete VShard storage boundary
 
-- Make the series catalog durable and rebuildable.
-- Partition journal/WAL, index visibility, deletes, retention, compaction, and
-  TSM manifests by VShard.
-- Define and test the durable acknowledgement boundary before replication.
-- Prove one VShard snapshot includes every query-visible state component.
+Task 4 is the largest storage rework in the plan and is split like the earlier
+tasks were. Three ADRs are prerequisites (see the parent plan's Phase 1):
+journal segmentation/retention, physical TSM/NativeIndex layout, and pre-Raft
+point-revision assignment. All sub-tasks follow the parent plan's multiplexed
+object model — per-core journals with `(vshard, sequence)` record headers,
+tier-0 TSM multiplexed with per-VShard extents converging to VShard-pure
+files at tier ≥ 1, and one per-core NativeIndex with VShard-prefixed keys.
 
-Gate: snapshot/restore preserves logical hashes and discovery metadata while
-unrelated VShards remain byte-for-byte untouched.
+- **Task 4.0 — durable acknowledgement boundary.** Merge main's
+  `wal_sync_mode` group commit and extend it to the core journal: an
+  acknowledged write is covered by a completed flush-plus-fsync barrier; any
+  journal I/O error latches the core's journal into a fenced failed state (no
+  catch-and-continue on the durability path); query storage failures become
+  explicit rather than omitted series. Power-loss tests for acknowledged
+  synchronous writes run here — this discharges the transferred Phase 0 gate.
+- **Task 4a — series catalog.** Durable, rebuildable catalog mapping
+  `SeriesId128` to measurement, ordered tags, field, and value type;
+  catalog-creation records travel in the same journal as data so the two can
+  never diverge durably; defined relationship to the existing 0x05 metadata
+  keys; rebuild source is journal replay plus catalog snapshots.
+- **Task 4b — journal partitioning.** Per-VShard record tagging, per-VShard
+  checkpoint/truncation watermarks, segment GC at the minimum resident
+  watermark with copy-forward for laggards, and per-VShard memory-store
+  accounting with a rollover trigger that does not require 4,096 independent
+  stores.
+- **Task 4c — TSM, index, and compaction partitioning.** VShard extents in
+  tier-0 manifests; VShard-pure files at tier ≥ 1; per-block
+  `[minRev, maxRev]` revision ranges replacing `_d<N>` dataSeq ranking inside
+  `vshards/`; VShard-prefixed index keys including day bitmaps and HLL
+  sketches; compaction scheduling across VShards within a core's existing
+  fiber budget; the read path merging per-VShard state without per-VShard
+  service instances.
+- **Task 4d — snapshot and restore.** One VShard snapshot includes catalog,
+  data extents, index extract (prefix range-scan; install is load, not
+  rebuild), tombstone objects, and nothing else; persistent pin files with
+  lease semantics; restore verifies the whole-snapshot verification hash
+  defined in the parent plan's anti-entropy section.
 
-### Task 5: Fenced local handoff and automatic rebalance
+Gate: snapshot/restore preserves the verification hash and discovery metadata
+while unrelated VShards remain logically untouched — their verification
+hashes and manifests unchanged, with shared tier-0 segment and multiplexed
+index bytes exempt from byte-identity.
 
-- Reconcile desired deltas one VShard at a time with bounded concurrency.
-- Quiesce writes, drain reads, persist the new generation, and transfer runtime
-  ownership without rewriting shared-volume TSM data.
-- Persist resumable jobs and enforce foreground load/disk-watermark backpressure.
-- Retire a draining worker only after effective ownership reaches zero.
+### Task 6: shard_N to VShard migration tool
 
-Gate: continuous ingest/query/delete tests survive crashes at every transition;
-adding one worker increases usable throughput and moves only its proportional
-share; shrinking preserves reachability until drain completes.
+Epic-sized and dependent on the Task 4 format; scheduled here so finishing
+Task 4 does not falsely close the epic. (Task numbering is kept from the
+earlier revision so parent-plan references stay valid; Tasks 2, 3, and 5 of
+that revision are dissolved.) Offline and exclusive under the root lock, with
+the free-space precondition, orphan-series quarantine policy, and
+cross-directory dataSeq fail-closed rule from the parent plan's migration
+section. Verification replays representative queries and compares the
+whole-snapshot verification hash.
+
+Gate: crash injection at every step chooses one complete generation; the old
+generation is preserved through a restart and grace period; orphaned series
+are quarantined and counted, never silently dropped.
 
 ## Boundary with multi-machine replication
 
-This epic is node-local. Multi-machine placement later chooses distinct hosts
-for each VShard replica, then chooses one eligible storage worker inside each
-host. Multiple workers on one host may improve CPU and I/O distribution, but
-they never satisfy multiple replica slots and never raise the advertised HA
-failure-domain count.
+This epic is node-local. Multi-machine placement chooses distinct hosts for
+each VShard replica; which core executes a VShard inside a host is derived
+locally and invisible to replication. Cores never satisfy replica slots and
+never raise the advertised failure-domain count.
