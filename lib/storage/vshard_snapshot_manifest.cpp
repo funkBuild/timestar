@@ -17,7 +17,10 @@ constexpr size_t kHashHexLen = 32;  // 128-bit hash as hex
 bool isHex32(const std::string& s) {
     if (s.size() != kHashHexLen)
         return false;
-    return std::all_of(s.begin(), s.end(), [](unsigned char c) { return std::isxdigit(c) != 0; });
+    // Canonical lowercase hex only (the verification hash is produced with %016llx,
+    // which is lowercase), so two case-variant hashes can't both be "valid".
+    return std::all_of(s.begin(), s.end(),
+                       [](unsigned char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); });
 }
 }  // namespace
 
@@ -101,7 +104,10 @@ std::optional<VShardSnapshotManifest> VShardSnapshotManifest::decode(std::string
     const uint32_t extentCount = r.u32();
     if (!r.ok())
         return std::nullopt;
-    m.dataExtents.reserve(extentCount);
+    // Do NOT reserve() off the untrusted count: a crafted huge count (with a
+    // recomputed CRC) would attempt a giant allocation and throw bad_alloc out of
+    // decode(), violating the nullopt-on-corruption contract. The per-iteration
+    // r.ok() check fails closed on the first short read instead.
     for (uint32_t i = 0; i < extentCount; ++i) {
         VShardExtent e;
         e.fileId = r.u64();
@@ -116,7 +122,7 @@ std::optional<VShardSnapshotManifest> VShardSnapshotManifest::decode(std::string
     const uint32_t tombCount = r.u32();
     if (!r.ok())
         return std::nullopt;
-    m.tombstoneObjectIds.reserve(tombCount);
+    // Same reasoning as extents above: no reserve() off an untrusted count.
     for (uint32_t i = 0; i < tombCount; ++i) {
         const uint64_t t = r.u64();
         if (!r.ok())

@@ -1,5 +1,7 @@
 #include "../../../lib/storage/vshard_snapshot_manifest.hpp"
 
+#include "../../../lib/utils/crc32.hpp"
+
 #include <gtest/gtest.h>
 
 #include <string>
@@ -55,6 +57,48 @@ TEST(VShardSnapshotManifestTest, ValidRejectsBadHashShape) {
     m = sample();
     m.catalogHash = std::string(32, 'z');  // 'z' is not hex
     EXPECT_FALSE(m.valid());
+    m = sample();
+    m.verificationHash = std::string(32, 'A');  // uppercase is not canonical (lowercase only)
+    EXPECT_FALSE(m.valid());
+}
+
+// A crafted oversized count must fail closed (nullopt), never throw bad_alloc
+// out of decode() from a giant reserve.
+TEST(VShardSnapshotManifestTest, DecodeRejectsOversizedCountWithoutThrowing) {
+    // Build a byte-valid header + hashes, then a bogus huge extent count, with a
+    // correct CRC so it passes the integrity check and reaches the loop.
+    std::string body;
+    auto putU32 = [&](uint32_t v) {
+        for (int i = 0; i < 4; ++i)
+            body.push_back(static_cast<char>((v >> (i * 8)) & 0xff));
+    };
+    auto putU16 = [&](uint16_t v) {
+        body.push_back(static_cast<char>(v & 0xff));
+        body.push_back(static_cast<char>((v >> 8) & 0xff));
+    };
+    auto putU64 = [&](uint64_t v) {
+        for (int i = 0; i < 8; ++i)
+            body.push_back(static_cast<char>((v >> (i * 8)) & 0xff));
+    };
+    auto putStr = [&](const std::string& s) {
+        putU32(static_cast<uint32_t>(s.size()));
+        body += s;
+    };
+    putU32(0x56534e50);            // magic "VSNP"
+    putU32(1);                     // version
+    putU16(1);                     // vshard
+    putU64(100);                   // snapshotRevision
+    putStr(std::string(32, 'a'));  // verificationHash
+    putStr(std::string(32, 'b'));  // catalogHash
+    putU32(0xFFFFFFFFu);           // extentCount -> would reserve ~100GB if trusted
+
+    // Append a correct CRC32 over the body so integrity passes.
+    const uint32_t crc = CRC32::compute(body.data(), body.size());
+    std::string bytes = body;
+    for (int i = 0; i < 4; ++i)
+        bytes.push_back(static_cast<char>((crc >> (i * 8)) & 0xff));
+
+    EXPECT_NO_THROW({ EXPECT_FALSE(VShardSnapshotManifest::decode(bytes).has_value()); });
 }
 
 TEST(VShardSnapshotManifestTest, ValidRejectsUnorderedExtentsAndOverWatermark) {

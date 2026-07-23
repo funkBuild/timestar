@@ -7,14 +7,16 @@
 namespace timestar {
 
 void MigrationPlan::assign(const SeriesId128& series) {
-    if (!assigned_.insert(series).second)
-        return;  // already assigned -- idempotent
+    if (!seen_.insert(series).second)
+        return;  // already classified (assigned or quarantined) -- first wins
     const uint16_t vs = timestar::virtualShard(series);
     byVShard_[vs].push_back(series);
     ++assignedCount_;
 }
 
 void MigrationPlan::quarantineOrphan(const SeriesId128& series, std::string reason) {
+    if (!seen_.insert(series).second)
+        return;  // already classified -- never both assigned and quarantined, no dup
     orphans_.push_back(Orphan{series, std::move(reason)});
 }
 

@@ -61,6 +61,28 @@ TEST(MigrationPlanTest, OrphansAreQuarantinedAndCountedNeverAssigned) {
     }
 }
 
+// A series is classified at most once: assign+quarantine of the same series does
+// not double-count, and the first classification wins (mutual exclusion).
+TEST(MigrationPlanTest, AssignAndQuarantineAreMutuallyExclusive) {
+    {
+        MigrationPlan plan;
+        const auto s = sid("dual,x=1 v");
+        plan.assign(s);
+        plan.quarantineOrphan(s, "late orphan claim");  // ignored: already assigned
+        EXPECT_EQ(plan.assignedCount(), 1u);
+        EXPECT_EQ(plan.orphanCount(), 0u) << "an already-assigned series must not also be an orphan";
+    }
+    {
+        MigrationPlan plan;
+        const auto s = sid("dual,x=2 v");
+        plan.quarantineOrphan(s, "orphan");
+        plan.quarantineOrphan(s, "again");  // idempotent
+        plan.assign(s);                     // ignored: already quarantined
+        EXPECT_EQ(plan.orphanCount(), 1u) << "duplicate orphan quarantine must not double-count";
+        EXPECT_EQ(plan.assignedCount(), 0u);
+    }
+}
+
 TEST(MigrationPlanTest, FreeSpacePreconditionRequiresBothGenerationsPlusHeadroom) {
     // legacy 100 + rewritten 80 + headroom 20 = 200 required.
     EXPECT_TRUE(MigrationPlan::freeSpaceSufficient(100, 80, 200, 20));

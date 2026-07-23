@@ -57,8 +57,11 @@ public:
                                                   uint64_t availableBytes, uint64_t headroomBytes);
 
 private:
-    std::map<uint16_t, std::vector<SeriesId128>> byVShard_;        // target vshard -> assigned series (insertion order)
-    std::unordered_set<SeriesId128, SeriesId128::Hash> assigned_;  // dedup: assign() is idempotent
+    std::map<uint16_t, std::vector<SeriesId128>> byVShard_;  // target vshard -> assigned series (insertion order)
+    // Every series is classified at most once, assigned OR quarantined: the first
+    // classification wins, so assign()/quarantineOrphan() are both idempotent and
+    // mutually exclusive (no series double-counted or in both sets).
+    std::unordered_set<SeriesId128, SeriesId128::Hash> seen_;
     std::vector<Orphan> orphans_;
     size_t assignedCount_ = 0;
 };
