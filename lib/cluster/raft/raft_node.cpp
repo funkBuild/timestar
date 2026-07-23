@@ -24,9 +24,11 @@ bool isLeaderMessage(const MessagePayload& p) {
 
 }  // namespace
 
-RaftNode::RaftNode(NodeId id, std::vector<NodeId> voters, RaftLog log, HardState hs, RaftOptions opts)
+RaftNode::RaftNode(NodeId id, std::vector<NodeId> voters, RaftLog log, HardState hs, RaftOptions opts,
+                   std::vector<NodeId> learners)
     : id_(id),
       voters_(std::move(voters)),
+      learners_(std::move(learners)),
       opts_(opts),
       currentTerm_(hs.currentTerm),
       votedFor_(hs.votedFor),
@@ -42,6 +44,10 @@ RaftNode::RaftNode(NodeId id, std::vector<NodeId> voters, RaftLog log, HardState
 
 bool RaftNode::isVoter(NodeId n) const {
     return std::find(voters_.begin(), voters_.end(), n) != voters_.end();
+}
+
+bool RaftNode::isLearner(NodeId n) const {
+    return std::find(learners_.begin(), learners_.end(), n) != learners_.end();
 }
 
 void RaftNode::resetElectionTimer() {
@@ -76,6 +82,7 @@ void RaftNode::becomeFollower(Term term, NodeId leader) {
     nextIndex_.clear();
     matchIndex_.clear();
     recentActive_.clear();
+    leadTransferee_ = kNoNode;
     resetElectionTimer();
 }
 
@@ -120,10 +127,17 @@ void RaftNode::becomeLeader() {
     votes_.clear();
     recentActive_.clear();  // fresh CheckQuorum window
 
-    // Initialize replication progress: optimistically probe from our log end.
+    leadTransferee_ = kNoNode;
+
+    // Initialize replication progress for every peer (voters AND learners):
+    // optimistically probe from our log end.
     nextIndex_.clear();
     matchIndex_.clear();
     for (NodeId peer : voters_) {
+        nextIndex_[peer] = log_.lastIndex() + 1;
+        matchIndex_[peer] = kNoIndex;
+    }
+    for (NodeId peer : learners_) {
         nextIndex_[peer] = log_.lastIndex() + 1;
         matchIndex_[peer] = kNoIndex;
     }
@@ -172,6 +186,8 @@ void RaftNode::bcastAppend() {
         if (peer != id_)
             sendAppend(peer);
     }
+    for (NodeId peer : learners_)  // learners receive replication but never vote
+        sendAppend(peer);
 }
 
 void RaftNode::sendInstallSnapshot(NodeId peer) {
@@ -236,7 +252,7 @@ void RaftNode::handleInstallSnapshot(NodeId from, const InstallSnapshot& is) {
 }
 
 void RaftNode::handleInstallSnapshotReply(NodeId from, const InstallSnapshotReply& rr) {
-    if (role_ != Role::Leader || !isVoter(from))
+    if (role_ != Role::Leader || !(isVoter(from) || isLearner(from)))
         return;
     if (rr.matchIndex > matchIndex_[from])
         matchIndex_[from] = rr.matchIndex;
@@ -258,7 +274,9 @@ LogIndex RaftNode::lastIndexOfTerm(Term t) const {
 }
 
 void RaftNode::handleAppendEntriesReply(NodeId from, const AppendEntriesReply& rr) {
-    if (role_ != Role::Leader || !isVoter(from))
+    // Accept acks from voters AND learners (learners replicate); only voters
+    // count toward commit, which maybeAdvanceCommitAsLeader enforces separately.
+    if (role_ != Role::Leader || !(isVoter(from) || isLearner(from)))
         return;
 
     if (rr.success) {
@@ -271,6 +289,12 @@ void RaftNode::handleAppendEntriesReply(NodeId from, const AppendEntriesReply& r
         // Keep streaming if the follower is still behind our log end.
         if (nextIndex_[from] <= log_.lastIndex())
             sendAppend(from);
+        // Leader transfer: once the transferee has fully caught up, tell it to
+        // elect immediately.
+        if (leadTransferee_ == from && matchIndex_[from] == log_.lastIndex()) {
+            sendTimeoutNow(from);
+            leadTransferee_ = kNoNode;
+        }
         return;
     }
 
@@ -331,6 +355,23 @@ void RaftNode::campaign() {
         becomeCandidate();
 }
 
+void RaftNode::sendTimeoutNow(NodeId target) {
+    TimeoutNow tn;
+    tn.term = currentTerm_;
+    tn.leaderId = id_;
+    send(Message{.to = target, .from = id_, .payload = tn});
+}
+
+void RaftNode::transferLeadership(NodeId target) {
+    if (role_ != Role::Leader || target == id_ || !isVoter(target))
+        return;
+    leadTransferee_ = target;
+    if (matchIndex_[target] == log_.lastIndex())
+        sendTimeoutNow(target);  // already caught up: elect now
+    else
+        sendAppend(target);  // catch it up first; TimeoutNow fires on the ack
+}
+
 void RaftNode::checkQuorumOrStepDown() {
     // §CheckQuorum: a leader that has not heard from a majority within an election
     // timeout has likely been partitioned away; it steps down so it stops serving
@@ -359,7 +400,10 @@ void RaftNode::tick() {
         }
         return;
     }
-    // Follower / (pre)candidate: advance the election clock.
+    // Follower / (pre)candidate: advance the election clock. Learners never
+    // campaign -- they are non-voting and can never become leader.
+    if (!isVoter(id_))
+        return;
     ++electionElapsed_;
     if (electionElapsed_ >= electionTimeout_)
         campaign();  // PreVote-aware: pre-election first when enabled
@@ -432,8 +476,11 @@ void RaftNode::step(Message m) {
             } else if constexpr (std::is_same_v<T, InstallSnapshotReply>) {
                 handleInstallSnapshotReply(m.from, p);
             } else if constexpr (std::is_same_v<T, TimeoutNow>) {
+                // Leader transfer: elect NOW, forcing a real election (skip the
+                // PreVote straw poll and any CheckQuorum lease) so leadership
+                // moves deterministically. Learners ignore it.
                 if (isVoter(id_))
-                    campaign();  // leader transfer: elect now
+                    becomeCandidate();
             }
         },
         m.payload);
@@ -446,7 +493,8 @@ void RaftNode::handleRequestVote(NodeId from, const RequestVote& rv) {
     // strictly higher term is always eligible (it changes no durable state).
     const bool canVote = (votedFor_ == from) || (votedFor_ == kNoNode && leaderId_ == kNoNode) ||
                          (rv.preVote && rv.term > currentTerm_);
-    const bool grant = canVote && log_.isUpToDate(rv.lastLogIndex, rv.lastLogTerm);
+    // A learner never grants a vote (it is not part of the voting configuration).
+    const bool grant = isVoter(id_) && canVote && log_.isUpToDate(rv.lastLogIndex, rv.lastLogTerm);
 
     RequestVoteReply reply;
     reply.preVote = rv.preVote;
@@ -553,6 +601,8 @@ void RaftNode::advanceCommitAsFollower(LogIndex leaderCommit, LogIndex lastNewIn
 bool RaftNode::propose(std::string data) {
     if (role_ != Role::Leader)
         return false;
+    if (leadTransferee_ != kNoNode)
+        return false;  // stop accepting writes while handing off leadership
     LogEntry e;
     e.term = currentTerm_;
     e.data = std::move(data);

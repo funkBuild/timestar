@@ -45,9 +45,12 @@ std::string joinCommands(const std::vector<std::string>& cmds) {
 
 class Network {
 public:
-    Network(std::vector<NodeId> ids, RaftOptions opts) : ids_(ids) {
-        for (NodeId id : ids) {
-            nodes_[id] = std::make_unique<RaftNode>(id, ids, RaftLog{}, HardState{}, opts);
+    Network(std::vector<NodeId> voters, RaftOptions opts, std::vector<NodeId> learners = {})
+        : ids_(voters) {
+        ids_.insert(ids_.end(), learners.begin(), learners.end());
+        for (NodeId id : ids_) {
+            nodes_[id] =
+                std::make_unique<RaftNode>(id, voters, RaftLog{}, HardState{}, opts, learners);
             applied_[id] = {};
         }
     }
@@ -286,6 +289,58 @@ TEST(RaftClusterTest, CheckQuorumStepsDownIsolatedLeader) {
             break;
     }
     EXPECT_EQ(net.node(1).role(), Role::Follower);
+}
+
+TEST(RaftClusterTest, LearnerReplicatesButDoesNotVoteOrCount) {
+    // Voters {1,2}, learner {3}. Quorum is 2 (both voters), unaffected by 3.
+    Network net({1, 2}, opts(), {3});
+    net.node(1).campaign();
+    net.run();
+    ASSERT_EQ(net.leader(), 1u);
+    EXPECT_EQ(net.node(3).role(), Role::Follower);  // learners never lead
+
+    net.node(1).propose("a");
+    net.run();
+    // The learner received and applied the entry (replication reaches it)...
+    EXPECT_EQ(net.applied(3).size(), 1u);
+    EXPECT_EQ(net.applied(3)[0], "a");
+
+    // ...but commit did not depend on it: isolate the learner and a proposal
+    // still commits on the two voters alone.
+    net.isolate(3);
+    net.node(1).propose("b");
+    net.run();
+    EXPECT_EQ(net.applied(1).size(), 2u);
+    EXPECT_EQ(net.applied(2).size(), 2u);
+
+    // A learner never times out into a candidacy, even isolated.
+    for (int i = 0; i < 50; ++i)
+        net.node(3).tick();
+    net.run();
+    EXPECT_NE(net.node(3).role(), Role::Candidate);
+    EXPECT_NE(net.node(3).role(), Role::Leader);
+}
+
+TEST(RaftClusterTest, LeaderTransferMovesLeadership) {
+    Network net({1, 2, 3}, opts());
+    net.node(1).campaign();
+    net.run();
+    ASSERT_EQ(net.leader(), 1u);
+    net.node(1).propose("x");
+    net.run();
+
+    // Hand leadership to node 2.
+    net.node(1).transferLeadership(2);
+    net.run();
+    EXPECT_EQ(net.node(2).role(), Role::Leader);
+    EXPECT_EQ(net.node(1).role(), Role::Follower);
+    EXPECT_GT(net.node(2).currentTerm(), 1u);
+
+    // The new leader serves writes; the old leader follows.
+    EXPECT_TRUE(net.node(2).propose("y"));
+    net.run();
+    EXPECT_EQ(net.applied(1).back(), "y");
+    EXPECT_EQ(net.applied(2).back(), "y");
 }
 
 TEST(RaftClusterTest, LaggingFollowerCaughtUpByInstallSnapshot) {

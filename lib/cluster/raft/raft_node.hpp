@@ -42,13 +42,22 @@ public:
         }
     };
 
-    RaftNode(NodeId id, std::vector<NodeId> voters, RaftLog log, HardState hs, RaftOptions opts);
+    // `learners` are non-voting members: they receive replication (to catch up
+    // before promotion) but never vote, never count toward quorum, and never
+    // start an election.
+    RaftNode(NodeId id, std::vector<NodeId> voters, RaftLog log, HardState hs, RaftOptions opts,
+             std::vector<NodeId> learners = {});
 
     // Inputs.
     void tick();          // one logical clock tick (driven by a seastar::timer)
     void step(Message m);  // an incoming RPC for this group
     bool propose(std::string data);  // leader-only append; false if not leader (replication brick)
     void campaign();       // start an election now (bootstrap / TimeoutNow)
+
+    // Leader transfer (§3.10): hand leadership to `target` (a voter). The current
+    // leader first ensures `target` is caught up, then sends it a TimeoutNow so it
+    // elects immediately. No-op if we are not the leader or target is not a voter.
+    void transferLeadership(NodeId target);
 
     // Compact this node's log up to `upto` (<= commitIndex) and record the
     // resulting snapshot so the leader can serve it to lagging followers. Called
@@ -70,9 +79,12 @@ public:
     const RaftLog& log() const { return log_; }
     unsigned electionTimeout() const { return electionTimeout_; }
 
+    bool isVoter(NodeId n) const;
+    bool isLearner(NodeId n) const;
+
 private:
     size_t quorum() const { return voters_.size() / 2 + 1; }
-    bool isVoter(NodeId n) const;
+    void sendTimeoutNow(NodeId target);
 
     void becomeFollower(Term term, NodeId leader);
     void becomePreCandidate();
@@ -103,6 +115,7 @@ private:
 
     NodeId id_;
     std::vector<NodeId> voters_;
+    std::vector<NodeId> learners_;
     RaftOptions opts_;
 
     Term currentTerm_ = kNoTerm;
@@ -125,6 +138,7 @@ private:
     std::map<NodeId, LogIndex> matchIndex_;  // highest index known replicated on the peer
     // CheckQuorum: voters we have heard from since the last quorum check.
     std::set<NodeId> recentActive_;
+    NodeId leadTransferee_ = kNoNode;  // in-flight leader-transfer target (0 = none)
 
     // Output accumulation.
     bool hsDirty_ = false;
