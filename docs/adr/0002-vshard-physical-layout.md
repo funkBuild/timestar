@@ -55,7 +55,7 @@ byte_length (u64)
 whole_file_hash (32 bytes) # BLAKE3/SHA-256 over the file's bytes
 ```
 
-TSM data blocks additionally gain a per-block `crc32c` so corruption is
+TSM data blocks additionally gain a per-block `crc32` so corruption is
 attributable to a block and repairable, not fatal to the whole file.
 
 The MANIFEST is the authority for which objects are live; an object present on
