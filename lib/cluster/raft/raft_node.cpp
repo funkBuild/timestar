@@ -1,5 +1,7 @@
 #include "raft_node.hpp"
 
+#include "raft_config.hpp"
+
 #include <algorithm>
 #include <functional>
 
@@ -27,13 +29,16 @@ bool isLeaderMessage(const MessagePayload& p) {
 RaftNode::RaftNode(NodeId id, std::vector<NodeId> voters, RaftLog log, HardState hs, RaftOptions opts,
                    std::vector<NodeId> learners)
     : id_(id),
-      voters_(std::move(voters)),
-      learners_(std::move(learners)),
       opts_(opts),
       currentTerm_(hs.currentTerm),
       votedFor_(hs.votedFor),
       log_(std::move(log)),
       rng_(opts.rngSeed != 0 ? opts.rngSeed : (id * 0x9E3779B97F4A7C15ull) + 1) {
+    // The passed voters/learners are the config at the snapshot boundary; any
+    // ConfigChange entries already in the log are folded on top.
+    baseConfig_ = Config{std::move(voters), {}, std::move(learners)};
+    config_ = baseConfig_;
+    recomputeConfigFromLog();
     // Committed entries at or below the snapshot boundary are already applied
     // (they live in the snapshot); start applying after it.
     commitIndex_ = log_.snapshotIndex();
@@ -43,11 +48,67 @@ RaftNode::RaftNode(NodeId id, std::vector<NodeId> voters, RaftLog log, HardState
 }
 
 bool RaftNode::isVoter(NodeId n) const {
-    return std::find(voters_.begin(), voters_.end(), n) != voters_.end();
+    return config_.isVoter(n);
 }
 
 bool RaftNode::isLearner(NodeId n) const {
-    return std::find(learners_.begin(), learners_.end(), n) != learners_.end();
+    return config_.isLearner(n);
+}
+
+namespace {
+
+size_t majSize(const std::vector<NodeId>& set) {
+    return set.size() / 2 + 1;
+}
+
+// The set of peers to replicate to / init progress for: both voting sets plus
+// learners, deduplicated, excluding self.
+std::vector<NodeId> replicationPeers(const Config& c, NodeId self) {
+    std::set<NodeId> s(c.voters.begin(), c.voters.end());
+    s.insert(c.votersOutgoing.begin(), c.votersOutgoing.end());
+    s.insert(c.learners.begin(), c.learners.end());
+    s.erase(self);
+    return {s.begin(), s.end()};
+}
+
+}  // namespace
+
+bool RaftNode::majorityOf(const std::vector<NodeId>& set, const std::set<NodeId>& acked) const {
+    if (set.empty())
+        return true;  // an empty (absent) config half imposes no constraint
+    size_t n = 0;
+    for (NodeId v : set)
+        if (acked.count(v))
+            ++n;
+    return n >= majSize(set);
+}
+
+LogIndex RaftNode::majorityMatchIndex(const std::vector<NodeId>& set) const {
+    if (set.empty())
+        return UINT64_MAX;  // absent half does not constrain the min() during joint
+    std::vector<LogIndex> m;
+    m.reserve(set.size());
+    for (NodeId v : set)
+        m.push_back(matchIndex_.count(v) ? matchIndex_.at(v) : kNoIndex);
+    std::sort(m.begin(), m.end(), std::greater<>());
+    return m[majSize(set) - 1];  // highest index replicated on a majority of this set
+}
+
+void RaftNode::recomputeConfigFromLog() {
+    // The active config is the latest ConfigChange entry in the materialized log,
+    // or the snapshot-boundary base config if there is none.
+    for (LogIndex i = log_.lastIndex(); i >= log_.firstIndex(); --i) {
+        const LogEntry* e = log_.entryAt(i);
+        if (e && e->type == EntryType::ConfigChange) {
+            config_ = decodeConfig(e->data);
+            latestConfigIndex_ = i;
+            return;
+        }
+        if (i == log_.firstIndex())
+            break;  // guard unsigned underflow
+    }
+    config_ = baseConfig_;
+    latestConfigIndex_ = kNoIndex;
 }
 
 void RaftNode::resetElectionTimer() {
@@ -62,12 +123,32 @@ void RaftNode::send(Message m) {
     pendingMessages_.push_back(std::move(m));
 }
 
-size_t RaftNode::countVotes(bool granted) const {
-    size_t n = 0;
+bool RaftNode::electionWon() const {
+    std::set<NodeId> granted;
     for (const auto& [node, g] : votes_)
-        if (g == granted)
-            ++n;
-    return n;
+        if (g)
+            granted.insert(node);
+    return majorityOf(config_.voters, granted) &&
+           (!config_.joint() || majorityOf(config_.votersOutgoing, granted));
+}
+
+bool RaftNode::electionLost() const {
+    std::set<NodeId> rejected;
+    for (const auto& [node, g] : votes_)
+        if (!g)
+            rejected.insert(node);
+    // A set is unwinnable once the number that COULD still grant (its size minus
+    // its known rejecters) drops below its majority threshold.
+    auto unwinnable = [&](const std::vector<NodeId>& set) {
+        if (set.empty())
+            return false;
+        size_t rej = 0;
+        for (NodeId v : set)
+            if (rejected.count(v))
+                ++rej;
+        return (set.size() - rej) < majSize(set);
+    };
+    return unwinnable(config_.voters) || (config_.joint() && unwinnable(config_.votersOutgoing));
 }
 
 void RaftNode::becomeFollower(Term term, NodeId leader) {
@@ -95,7 +176,7 @@ void RaftNode::becomePreCandidate() {
     votes_.clear();
     votes_[id_] = true;  // we would vote for ourselves
     resetElectionTimer();
-    if (countVotes(true) >= quorum()) {
+    if (electionWon()) {
         becomeCandidate();  // trivial majority (single voter): go straight to real
         return;
     }
@@ -112,7 +193,7 @@ void RaftNode::becomeCandidate() {
     votes_[id_] = true;
     resetElectionTimer();
     // A single-voter group elects itself immediately.
-    if (countVotes(true) >= quorum()) {
+    if (electionWon()) {
         becomeLeader();
         return;
     }
@@ -129,15 +210,11 @@ void RaftNode::becomeLeader() {
 
     leadTransferee_ = kNoNode;
 
-    // Initialize replication progress for every peer (voters AND learners):
-    // optimistically probe from our log end.
+    // Initialize replication progress for every peer (both voting sets AND
+    // learners): optimistically probe from our log end.
     nextIndex_.clear();
     matchIndex_.clear();
-    for (NodeId peer : voters_) {
-        nextIndex_[peer] = log_.lastIndex() + 1;
-        matchIndex_[peer] = kNoIndex;
-    }
-    for (NodeId peer : learners_) {
+    for (NodeId peer : replicationPeers(config_, id_)) {
         nextIndex_[peer] = log_.lastIndex() + 1;
         matchIndex_[peer] = kNoIndex;
     }
@@ -182,11 +259,7 @@ void RaftNode::sendAppend(NodeId peer) {
 }
 
 void RaftNode::bcastAppend() {
-    for (NodeId peer : voters_) {
-        if (peer != id_)
-            sendAppend(peer);
-    }
-    for (NodeId peer : learners_)  // learners receive replication but never vote
+    for (NodeId peer : replicationPeers(config_, id_))
         sendAppend(peer);
 }
 
@@ -198,6 +271,7 @@ void RaftNode::sendInstallSnapshot(NodeId peer) {
     is.leaderId = id_;
     is.lastIncludedIndex = snapshot_.index;
     is.lastIncludedTerm = snapshot_.term;
+    is.config = snapshot_.config;
     is.data = snapshot_.data;
     // Optimistically assume the follower will accept through the snapshot end.
     nextIndex_[peer] = snapshot_.index + 1;
@@ -210,9 +284,19 @@ void RaftNode::compact(LogIndex upto, std::string snapshotData) {
     // so this is the safe (and more defensive) bound.
     if (upto > lastApplied_)
         upto = lastApplied_;
+    // The boundary config folds in every ConfigChange up to `upto`.
+    Config base = baseConfig_;
+    for (LogIndex i = log_.firstIndex(); i <= upto && i <= log_.lastIndex(); ++i) {
+        const LogEntry* e = log_.entryAt(i);
+        if (e && e->type == EntryType::ConfigChange)
+            base = decodeConfig(e->data);
+    }
     log_.compactTo(upto);
+    baseConfig_ = base;
+    recomputeConfigFromLog();  // fix latestConfigIndex_/config_ if the latest was folded
     snapshot_.index = log_.snapshotIndex();
     snapshot_.term = log_.snapshotTerm();
+    snapshot_.config = baseConfig_;
     snapshot_.data = std::move(snapshotData);
 }
 
@@ -242,8 +326,14 @@ void RaftNode::handleInstallSnapshot(NodeId from, const InstallSnapshot& is) {
     else
         log_.restoreFromSnapshot(is.lastIncludedIndex, is.lastIncludedTerm);
 
+    // The snapshot carries the boundary config; re-derive the active config from
+    // the new base plus any retained (keep-suffix) config entries.
+    baseConfig_ = is.config;
+    recomputeConfigFromLog();
+
     snapshot_.index = is.lastIncludedIndex;
     snapshot_.term = is.lastIncludedTerm;
+    snapshot_.config = is.config;
     snapshot_.data = is.data;
     commitIndex_ = std::max(commitIndex_, is.lastIncludedIndex);
     lastApplied_ = is.lastIncludedIndex;  // the snapshot IS the applied state
@@ -323,25 +413,57 @@ void RaftNode::handleAppendEntriesReply(NodeId from, const AppendEntriesReply& r
 }
 
 void RaftNode::maybeAdvanceCommitAsLeader() {
-    // The highest index replicated on a majority of voters (§5.3): sort match
-    // indices descending; the quorum-th one is committed by count.
-    std::vector<LogIndex> matches;
-    matches.reserve(voters_.size());
-    for (NodeId v : voters_)
-        matches.push_back(matchIndex_.count(v) ? matchIndex_.at(v) : kNoIndex);
-    std::sort(matches.begin(), matches.end(), std::greater<>());
-    const LogIndex majorityMatch = matches[quorum() - 1];
+    // The highest index replicated on a majority. During a joint config it must
+    // be a majority in BOTH voting sets, so take the min of the two.
+    LogIndex majorityMatch = majorityMatchIndex(config_.voters);
+    if (config_.joint())
+        majorityMatch = std::min(majorityMatch, majorityMatchIndex(config_.votersOutgoing));
 
     // §5.4.2: only commit it if it is from the CURRENT term. Earlier-term entries
     // ride along once a current-term entry above them commits.
-    if (majorityMatch > commitIndex_ && log_.term(majorityMatch) == std::optional<Term>(currentTerm_)) {
+    if (majorityMatch > commitIndex_ && majorityMatch <= log_.lastIndex() &&
+        log_.term(majorityMatch) == std::optional<Term>(currentTerm_)) {
         commitIndex_ = majorityMatch;
+        maybeAppendLeaveJoint();  // may append Cnew if the joint config just committed
+        // If a committed membership change removed us from the (final) voter set,
+        // step down -- we can no longer legitimately lead.
+        if (role_ == Role::Leader && !config_.joint() && !config_.isVoter(id_) &&
+            commitIndex_ >= latestConfigIndex_ && latestConfigIndex_ != kNoIndex) {
+            becomeFollower(currentTerm_, kNoNode);
+            return;
+        }
         bcastAppend();  // let followers learn the new commit promptly
     }
 }
 
+void RaftNode::maybeAppendLeaveJoint() {
+    // Once the joint config entry (Cold,new) is committed, transition to the final
+    // Cnew by appending a config entry that drops the outgoing voters. Only the
+    // leader does this, and only once (config_ stops being joint afterward).
+    if (role_ != Role::Leader || !config_.joint())
+        return;
+    if (latestConfigIndex_ == kNoIndex || commitIndex_ < latestConfigIndex_)
+        return;  // the joint config is not committed yet
+    Config finalCfg;
+    finalCfg.voters = config_.voters;
+    finalCfg.learners = config_.learners;  // votersOutgoing dropped
+    LogEntry e;
+    e.term = currentTerm_;
+    e.type = EntryType::ConfigChange;
+    e.data = encodeConfig(finalCfg);
+    log_.append({e});
+    config_ = finalCfg;
+    latestConfigIndex_ = log_.lastIndex();
+    matchIndex_[id_] = log_.lastIndex();
+    nextIndex_[id_] = log_.lastIndex() + 1;
+    // If we removed ourselves from the voters, we will step down once this
+    // commits; that is handled by normal commit + the leader-not-in-config check.
+}
+
 void RaftNode::bcastRequestVote(bool preVote) {
-    for (NodeId peer : voters_) {
+    std::set<NodeId> asked(config_.voters.begin(), config_.voters.end());
+    asked.insert(config_.votersOutgoing.begin(), config_.votersOutgoing.end());
+    for (NodeId peer : asked) {
         if (peer == id_)
             continue;
         RequestVote rv;
@@ -384,12 +506,10 @@ void RaftNode::checkQuorumOrStepDown() {
     // timeout has likely been partitioned away; it steps down so it stops serving
     // stale leader reads and lets the majority side elect freely.
     recentActive_.insert(id_);  // we are trivially in contact with ourselves
-    size_t active = 0;
-    for (NodeId v : voters_)
-        if (recentActive_.count(v))
-            ++active;
+    const bool haveQuorum = majorityOf(config_.voters, recentActive_) &&
+                            (!config_.joint() || majorityOf(config_.votersOutgoing, recentActive_));
     recentActive_.clear();
-    if (active < quorum())
+    if (!haveQuorum)
         becomeFollower(currentTerm_, kNoNode);
 }
 
@@ -527,9 +647,9 @@ void RaftNode::handleRequestVoteReply(NodeId from, const RequestVoteReply& rr) {
         if (role_ != Role::PreCandidate)
             return;  // we already advanced or stepped down
         votes_[from] = rr.voteGranted;
-        if (countVotes(true) >= quorum())
+        if (electionWon())
             becomeCandidate();  // straw poll won -> real election
-        else if (countVotes(false) >= quorum())
+        else if (electionLost())
             becomeFollower(currentTerm_, kNoNode);  // pre-election lost; back off
         return;
     }
@@ -538,9 +658,9 @@ void RaftNode::handleRequestVoteReply(NodeId from, const RequestVoteReply& rr) {
     if (rr.term != currentTerm_)
         return;  // stale reply from another term
     votes_[from] = rr.voteGranted;
-    if (countVotes(true) >= quorum())
+    if (electionWon())
         becomeLeader();
-    else if (countVotes(false) >= quorum())
+    else if (electionLost())
         becomeFollower(currentTerm_, kNoNode);  // lost this election; wait to retry
 }
 
@@ -590,6 +710,16 @@ void RaftNode::handleAppendEntries(NodeId from, const AppendEntries& ae) {
     if (!ae.entries.empty())
         unstableStart_ = std::min(unstableStart_, ae.prevLogIndex + 1);
 
+    // Re-derive the active config only when this batch could have changed it: it
+    // carried a ConfigChange, or a truncation may have dropped the current one
+    // (the latest config entry sits above the branch point).
+    bool batchHadConfig = false;
+    for (const auto& e : ae.entries)
+        if (e.type == EntryType::ConfigChange)
+            batchHadConfig = true;
+    if (batchHadConfig || latestConfigIndex_ > ae.prevLogIndex)
+        recomputeConfigFromLog();
+
     advanceCommitAsFollower(ae.leaderCommit, lastNew);
 
     AppendEntriesReply r;
@@ -618,6 +748,40 @@ bool RaftNode::propose(std::string data) {
     nextIndex_[id_] = log_.lastIndex() + 1;
     // A single-voter leader commits immediately (its own match is a majority).
     maybeAdvanceCommitAsLeader();
+    bcastAppend();
+    return true;
+}
+
+bool RaftNode::proposeConfChange(std::vector<NodeId> voters, std::vector<NodeId> learners) {
+    if (role_ != Role::Leader || leadTransferee_ != kNoNode)
+        return false;
+    if (config_.joint())
+        return false;  // one membership change at a time
+
+    // Enter the joint configuration Cold,new: decisions now need a majority in
+    // both the new voters and the current (outgoing) voters.
+    Config joint;
+    joint.voters = std::move(voters);          // Cnew
+    joint.votersOutgoing = config_.voters;     // Cold
+    joint.learners = std::move(learners);
+    LogEntry e;
+    e.term = currentTerm_;
+    e.type = EntryType::ConfigChange;
+    e.data = encodeConfig(joint);
+    log_.append({e});
+    config_ = joint;  // config takes effect on append, not on commit
+    latestConfigIndex_ = log_.lastIndex();
+
+    // Track replication progress for any newly-added peers.
+    for (NodeId peer : replicationPeers(config_, id_)) {
+        if (!nextIndex_.count(peer)) {
+            nextIndex_[peer] = log_.lastIndex() + 1;
+            matchIndex_[peer] = kNoIndex;
+        }
+    }
+    matchIndex_[id_] = log_.lastIndex();
+    nextIndex_[id_] = log_.lastIndex() + 1;
+    maybeAdvanceCommitAsLeader();  // single-voter fast path (may leave joint at once)
     bcastAppend();
     return true;
 }

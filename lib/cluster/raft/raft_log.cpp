@@ -12,6 +12,12 @@ std::optional<Term> RaftLog::term(LogIndex index) const {
     return entries_[index - firstIndex()].term;
 }
 
+const LogEntry* RaftLog::entryAt(LogIndex index) const {
+    if (index < firstIndex() || index > lastIndex())
+        return nullptr;
+    return &entries_[index - firstIndex()];
+}
+
 bool RaftLog::matchTerm(LogIndex index, Term t) const {
     const auto have = term(index);
     return have && *have == t;

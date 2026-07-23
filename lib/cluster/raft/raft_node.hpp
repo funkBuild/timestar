@@ -1,5 +1,6 @@
 #pragma once
 
+#include "raft_config.hpp"
 #include "raft_log.hpp"
 #include "raft_messages.hpp"
 #include "raft_types.hpp"
@@ -81,10 +82,23 @@ public:
 
     bool isVoter(NodeId n) const;
     bool isLearner(NodeId n) const;
+    const Config& config() const { return config_; }
+
+    // Propose a §6 membership change to the given target voters/learners. The
+    // leader enters a joint configuration (Cold,new) immediately, and once that
+    // commits it auto-appends the final Cnew. false if not the leader or a change
+    // is already in flight.
+    bool proposeConfChange(std::vector<NodeId> voters, std::vector<NodeId> learners);
 
 private:
-    size_t quorum() const { return voters_.size() / 2 + 1; }
     void sendTimeoutNow(NodeId target);
+    // Majority helpers over the (possibly joint) configuration.
+    bool majorityOf(const std::vector<NodeId>& set, const std::set<NodeId>& acked) const;
+    LogIndex majorityMatchIndex(const std::vector<NodeId>& set) const;
+    // Config derivation: the active config is the latest ConfigChange in the log,
+    // above the snapshot-boundary base config.
+    void recomputeConfigFromLog();
+    void maybeAppendLeaveJoint();  // leader: after Cold,new commits, append Cnew
 
     void becomeFollower(Term term, NodeId leader);
     void becomePreCandidate();
@@ -111,11 +125,15 @@ private:
     void handleInstallSnapshot(NodeId from, const InstallSnapshot& is);
     void handleInstallSnapshotReply(NodeId from, const InstallSnapshotReply& rr);
 
-    size_t countVotes(bool granted) const;
+    // Election tally over the (possibly joint) configuration: won needs a
+    // majority grant in every voting set; lost means no set can still reach one.
+    bool electionWon() const;
+    bool electionLost() const;
 
     NodeId id_;
-    std::vector<NodeId> voters_;
-    std::vector<NodeId> learners_;
+    Config config_;                       // active membership (latest ConfigChange in log)
+    Config baseConfig_;                   // membership at the snapshot boundary (config floor)
+    LogIndex latestConfigIndex_ = kNoIndex;  // index of the highest ConfigChange in the log
     RaftOptions opts_;
 
     Term currentTerm_ = kNoTerm;

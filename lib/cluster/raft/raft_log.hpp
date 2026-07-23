@@ -39,6 +39,11 @@ public:
     // returns snapshotTerm(); at index 0 with no snapshot returns kNoTerm.
     std::optional<Term> term(LogIndex index) const;
 
+    // The materialized entry at `index`, or nullptr if it is compacted away
+    // (<= snapshotIndex()) or beyond lastIndex(). Used to read entry type/data
+    // (e.g. to find the latest ConfigChange).
+    const LogEntry* entryAt(LogIndex index) const;
+
     // True iff the log holds an entry at `index` whose term is `t` (the Raft
     // log-matching test). matchTerm(0, 0) is true (empty prefix).
     bool matchTerm(LogIndex index, Term t) const;

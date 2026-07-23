@@ -46,13 +46,22 @@ std::string joinCommands(const std::vector<std::string>& cmds) {
 class Network {
 public:
     Network(std::vector<NodeId> voters, RaftOptions opts, std::vector<NodeId> learners = {})
-        : ids_(voters) {
+        : opts_(opts), ids_(voters) {
         ids_.insert(ids_.end(), learners.begin(), learners.end());
         for (NodeId id : ids_) {
             nodes_[id] =
                 std::make_unique<RaftNode>(id, voters, RaftLog{}, HardState{}, opts, learners);
             applied_[id] = {};
         }
+    }
+
+    // Inject a node that starts OUTSIDE the voting config (an observer), so a
+    // membership change can bring it in. It knows the initial config only.
+    void addNode(NodeId id, std::vector<NodeId> knownVoters) {
+        ids_.push_back(id);
+        nodes_[id] =
+            std::make_unique<RaftNode>(id, knownVoters, RaftLog{}, HardState{}, opts_, std::vector<NodeId>{});
+        applied_[id] = {};
     }
 
     RaftNode& node(NodeId id) { return *nodes_.at(id); }
@@ -77,7 +86,9 @@ public:
                     applied_[id] = splitCommands(rd.snapshot->data);
                 }
                 for (auto& e : rd.committed) {
-                    if (!e.data.empty())  // skip no-op commit markers
+                    // Apply only real application commands: skip no-op commit
+                    // markers (empty data) and ConfigChange entries.
+                    if (e.type == EntryType::Normal && !e.data.empty())
                         applied_[id].push_back(e.data);
                 }
                 for (auto& m : rd.messages) {
@@ -125,6 +136,7 @@ private:
         return isolated_.count(from) == 0 && isolated_.count(to) == 0;
     }
 
+    RaftOptions opts_;
     std::vector<NodeId> ids_;
     std::map<NodeId, std::unique_ptr<RaftNode>> nodes_;
     std::map<NodeId, std::vector<std::string>> applied_;
@@ -289,6 +301,66 @@ TEST(RaftClusterTest, CheckQuorumStepsDownIsolatedLeader) {
             break;
     }
     EXPECT_EQ(net.node(1).role(), Role::Follower);
+}
+
+TEST(RaftClusterTest, JointConsensusAddsAVoter) {
+    Network net({1, 2, 3}, opts());
+    net.node(1).campaign();
+    net.run();
+    ASSERT_EQ(net.leader(), 1u);
+    net.node(1).propose("a");
+    net.run();
+
+    net.addNode(4, {1, 2, 3});  // observer, not yet in the config
+    // Grow the cluster to {1,2,3,4}.
+    ASSERT_TRUE(net.node(1).proposeConfChange({1, 2, 3, 4}, {}));
+    net.run();
+
+    // The change committed and left the joint state everywhere.
+    for (NodeId id : {1u, 2u, 3u, 4u}) {
+        EXPECT_FALSE(net.node(id).config().joint()) << "node " << id;
+        EXPECT_EQ(net.node(id).config().voters, (std::vector<NodeId>{1, 2, 3, 4})) << "node " << id;
+    }
+    // Node 4 caught up the earlier history.
+    ASSERT_EQ(net.applied(4).size(), 1u);
+    EXPECT_EQ(net.applied(4)[0], "a");
+
+    // A new proposal now needs a majority of FOUR (3 nodes). Isolate two voters:
+    // it must NOT commit with only two of four.
+    net.isolate(3);
+    net.isolate(4);
+    net.node(1).propose("b");
+    net.run();
+    EXPECT_EQ(net.applied(1).size(), 1u);  // "b" not committed (only 1,2 up = 2 of 4)
+
+    // Restore one: 3 of 4 is a majority, so it commits.
+    net.heal(3);
+    net.tickAll();
+    net.run();
+    EXPECT_EQ(net.applied(1).back(), "b");
+}
+
+TEST(RaftClusterTest, JointConsensusReplacesAndRemovesAVoter) {
+    Network net({1, 2, 3}, opts());
+    net.node(1).campaign();
+    net.run();
+    ASSERT_EQ(net.leader(), 1u);
+
+    net.addNode(4, {1, 2, 3});
+    // Replace node 3 with node 4: Cnew = {1,2,4}.
+    ASSERT_TRUE(net.node(1).proposeConfChange({1, 2, 4}, {}));
+    net.run();
+    for (NodeId id : {1u, 2u, 4u}) {
+        EXPECT_FALSE(net.node(id).config().joint());
+        EXPECT_EQ(net.node(id).config().voters, (std::vector<NodeId>{1, 2, 4}));
+    }
+
+    // With node 3 removed, {1,2,4} alone commits even if 3 is gone.
+    net.isolate(3);
+    net.node(1).propose("z");
+    net.run();
+    EXPECT_EQ(net.applied(1).back(), "z");
+    EXPECT_EQ(net.applied(4).back(), "z");
 }
 
 TEST(RaftClusterTest, LearnerReplicatesButDoesNotVoteOrCount) {

@@ -1,7 +1,9 @@
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace timestar::raft {
 
@@ -48,13 +50,38 @@ struct HardState {
     friend bool operator==(const HardState&, const HardState&) = default;
 };
 
+// The membership of a Raft group. During a §6 joint-consensus transition,
+// `votersOutgoing` holds the old voter set (Cold) while `voters` holds the new
+// one (Cnew); every decision (election, commit) then needs a majority in EACH
+// set independently. Outside a transition `votersOutgoing` is empty.
+struct Config {
+    std::vector<NodeId> voters;
+    std::vector<NodeId> votersOutgoing;
+    std::vector<NodeId> learners;
+
+    bool joint() const { return !votersOutgoing.empty(); }
+
+    static bool contains(const std::vector<NodeId>& v, NodeId n) {
+        return std::find(v.begin(), v.end(), n) != v.end();
+    }
+    // A voter is anyone in either voting set (both participate during a joint
+    // transition).
+    bool isVoter(NodeId n) const { return contains(voters, n) || contains(votersOutgoing, n); }
+    bool isLearner(NodeId n) const { return contains(learners, n); }
+
+    friend bool operator==(const Config&, const Config&) = default;
+};
+
 // A point-in-time snapshot of the state machine covering the compacted log
 // prefix (§7). `data` is opaque to Raft -- a VShard snapshot payload in this
 // system; the driver reads/writes the actual bytes and the core only tracks the
-// (index, term) boundary and relays the payload. index==0 means "no snapshot".
+// (index, term) boundary and relays the payload. `config` is the active
+// membership as of the boundary (config entries below it are folded in here).
+// index==0 means "no snapshot".
 struct Snapshot {
     LogIndex index = kNoIndex;
     Term term = kNoTerm;
+    Config config;
     std::string data;
 };
 

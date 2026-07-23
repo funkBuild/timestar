@@ -1,3 +1,4 @@
+#include "../../../lib/cluster/raft/raft_config.hpp"
 #include "../../../lib/cluster/raft/raft_node.hpp"
 
 #include <gtest/gtest.h>
@@ -40,6 +41,26 @@ const T* payloadIf(const Message& m) {
 }
 
 }  // namespace
+
+TEST(RaftConfigTest, EncodeDecodeRoundTrip) {
+    Config c;
+    c.voters = {1, 2, 3};
+    c.votersOutgoing = {4, 5};
+    c.learners = {9};
+    Config back = decodeConfig(encodeConfig(c));
+    EXPECT_EQ(back.voters, c.voters);
+    EXPECT_EQ(back.votersOutgoing, c.votersOutgoing);
+    EXPECT_EQ(back.learners, c.learners);
+    EXPECT_TRUE(back.joint());
+
+    Config simple;
+    simple.voters = {7};
+    Config back2 = decodeConfig(encodeConfig(simple));
+    EXPECT_EQ(back2.voters, (std::vector<NodeId>{7}));
+    EXPECT_TRUE(back2.votersOutgoing.empty());
+    EXPECT_TRUE(back2.learners.empty());
+    EXPECT_FALSE(back2.joint());
+}
 
 TEST(RaftNodeTest, SingleVoterElectsItselfImmediately) {
     RaftNode n(1, {1}, RaftLog{}, HardState{}, fixedTimeout(5));

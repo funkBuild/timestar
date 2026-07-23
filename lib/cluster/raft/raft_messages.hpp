@@ -61,6 +61,7 @@ struct InstallSnapshot {
     NodeId leaderId = kNoNode;
     LogIndex lastIncludedIndex = kNoIndex;
     Term lastIncludedTerm = kNoTerm;
+    Config config;  // membership as of the snapshot boundary
     std::string data;
 };
 
