@@ -52,6 +52,23 @@ seastar::future<> RaftGroupRegistry::tickAll() {
     for (auto& [gid, g] : groups_) {
         if (stopping_)
             co_return;
+        // Hibernate a quiescent follower: skip its tick for up to followerSkip_
+        // passes. A live leader's heartbeats (delivered via step, independent of
+        // this group's own ticking) keep it a follower; a dead leader stops
+        // heartbeating and the periodic check-tick still eventually times it out.
+        const bool quiescentFollower = g->role() == Role::Follower && g->leader() != kNoNode &&
+                                       !g->node().hasReady();
+        if (followerSkip_ != 0 && quiescentFollower) {
+            unsigned& s = skips_[gid];
+            if (s < followerSkip_) {
+                ++s;
+                ++skippedTicks_;
+                continue;
+            }
+            s = 0;  // time for a check-tick
+        } else {
+            skips_[gid] = 0;
+        }
         co_await g->tick();
     }
 }

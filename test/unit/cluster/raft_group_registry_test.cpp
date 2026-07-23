@@ -139,8 +139,84 @@ seastar::future<> testManyGroupsOverSharedTransport() {
         co_await std::move(f);
 }
 
+seastar::future<> testHibernationSkipsIdleFollowersButStillReplicates() {
+    const std::vector<NodeId> voters = {1, 2, 3};
+    const std::map<NodeId, uint16_t> ports = {{1, 39170}, {2, 39171}, {3, 39172}};
+    const uint16_t kGroups = 6;
+    std::map<NodeId, NodeState> nodes;
+    auto optsFor = [](NodeId id) {
+        RaftOptions o;
+        o.electionTimeoutMin = o.electionTimeoutMax = (id == 1 ? 2 : 30);
+        o.heartbeatTimeout = 1;
+        return o;
+    };
+    for (NodeId id : voters) {
+        NodeState st;
+        st.transport = std::make_unique<RaftRpcTransport>();
+        st.registry = std::make_unique<RaftGroupRegistry>(*st.transport, 5ms);
+        for (uint16_t g = 1; g <= kGroups; ++g) {
+            st.persistence.push_back(std::make_unique<NoopPersistence>());
+            st.sms.push_back(std::make_unique<RecordingSM>());
+            RaftNode node(id, voters, RaftLog{}, HardState{}, optsFor(id));
+            st.registry->addGroup(g, std::move(node), *st.persistence.back(), *st.sms.back());
+        }
+        nodes[id] = std::move(st);
+    }
+    for (NodeId id : voters) {
+        RaftGroupRegistry* reg = nodes[id].registry.get();
+        co_await nodes[id].transport->start(loopback(ports.at(id)),
+                                            [reg](Envelope e) { return reg->deliver(std::move(e)); });
+        for (NodeId peer : voters)
+            if (peer != id)
+                nodes[id].transport->addPeer(peer, loopback(ports.at(peer)));
+    }
+    for (NodeId id : voters)
+        nodes[id].registry->startTicking();
+
+    bool led = co_await waitFor([&] {
+        for (uint16_t g = 1; g <= kGroups; ++g)
+            if (!nodes[1].registry->group(g)->isLeader())
+                return false;
+        return true;
+    });
+    EXPECT_TRUE(led);
+
+    // Let the cluster idle so quiescent followers on nodes 2 and 3 hibernate.
+    co_await seastar::sleep(200ms);
+    EXPECT_GT(nodes[2].registry->skippedTicks(), 0u);  // idle followers were skipped
+    EXPECT_GT(nodes[3].registry->skippedTicks(), 0u);
+
+    // A hibernated follower still RECEIVES replication (deliver is independent of
+    // its own ticking): a proposal applies on all nodes.
+    co_await nodes[1].registry->group(3)->propose("live");
+    bool ok = co_await waitFor([&] {
+        for (NodeId id : voters)
+            if (nodes[id].sms[2]->applied.empty())
+                return false;
+        return true;
+    });
+    EXPECT_TRUE(ok);
+    if (ok)
+        EXPECT_EQ(nodes[3].sms[2]->applied[0], "live");
+
+    std::vector<seastar::future<>> stops;
+    for (NodeId id : voters)
+        stops.push_back(nodes[id].registry->stop());
+    for (auto& f : stops)
+        co_await std::move(f);
+    std::vector<seastar::future<>> tstops;
+    for (NodeId id : voters)
+        tstops.push_back(nodes[id].transport->stop());
+    for (auto& f : tstops)
+        co_await std::move(f);
+}
+
 }  // namespace
 
 TEST(RaftGroupRegistryTest, ManyGroupsMultiplexOverSharedTransportAndTimer) {
     testManyGroupsOverSharedTransport().get();
+}
+
+TEST(RaftGroupRegistryTest, HibernationSkipsIdleFollowersButStillReplicates) {
+    testHibernationSkipsIdleFollowersButStillReplicates().get();
 }
