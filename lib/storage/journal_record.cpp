@@ -2,6 +2,13 @@
 
 #include "crc32.hpp"
 
+#include <cassert>
+#include <cstdint>
+
+// decode() computes frameLen = kFrameHeaderBytes + bodyLen with bodyLen a u32;
+// this is overflow-safe only because size_t is wider than u32 on the target.
+static_assert(sizeof(size_t) >= 8, "journal record decode assumes a 64-bit size_t");
+
 namespace timestar {
 namespace {
 
@@ -41,6 +48,12 @@ uint64_t getU64(const char* p) {
 }  // namespace
 
 void JournalRecord::encodeInto(std::string& out) const {
+    // Write-side invariants (our own data): a record we produce must be one the
+    // decoder would accept. Out-of-range ids and >4 GiB payloads are programming
+    // errors, not untrusted input.
+    assert(vshard.valid() && "encoding a JournalRecord with an out-of-range VShard id");
+    assert(payload.size() <= static_cast<size_t>(UINT32_MAX) - kBodyHeaderBytes && "journal payload too large");
+
     std::string body;
     body.reserve(kBodyHeaderBytes + payload.size());
     putU16(body, vshard.value());
