@@ -29,9 +29,10 @@ TSMCompactor::TSMCompactor(TSMFileManager* manager)
 std::string TSMCompactor::generateCompactedFilename(uint64_t tier, uint64_t seqNum, uint64_t dataSeq) {
     // The `_d<dataSeq>` suffix records the newest write generation contained
     // in the output (max of the inputs' dataSeq) so last-write-wins dedup
-    // ranks this file by its data recency, not by its (fresh) seqNum.
-    return timestar::shardDataPath(seastar::this_shard_id()) + "/tsm/" + std::to_string(tier) + "_" +
-           std::to_string(seqNum) + "_d" + std::to_string(dataSeq) + ".tsm";
+    // ranks this file by its data recency, not by its (fresh) seqNum. The path
+    // comes from the owning file manager's injected layout so a compacted file
+    // lands in the same shard directory as its inputs, on any data root.
+    return fileManager->layout().compactedTsmFile(fileManager->shard(), tier, seqNum, dataSeq).string();
 }
 
 uint64_t TSMCompactor::maxDataSeqOf(const std::vector<seastar::shared_ptr<TSM>>& files) {

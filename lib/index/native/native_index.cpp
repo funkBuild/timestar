@@ -138,8 +138,9 @@ private:
 // Constructor / Destructor
 // ============================================================================
 
-NativeIndex::NativeIndex(int shardId)
-    : shardId_(shardId),
+NativeIndex::NativeIndex(timestar::StorageLayout layout, int shardId)
+    : layout_(std::move(layout)),
+      shardId_(shardId),
       blockCache_(timestar::config().index.block_cache_bytes / std::max(1u, seastar::smp::count)),
       seriesMetadataCache_(timestar::config().index.metadata_cache_bytes / std::max(1u, seastar::smp::count)),
       discoveryCache_(timestar::config().index.discovery_cache_bytes / std::max(1u, seastar::smp::count)) {}
@@ -192,7 +193,7 @@ seastar::future<> NativeIndex::open() {
 
     // Note: std::filesystem::absolute() depends on the process CWD at call time.
     // This is fine because open() is called during startup before any CWD change.
-    indexPath_ = std::filesystem::absolute(timestar::shardDataPath(shardId_) + "/native_index").string();
+    indexPath_ = std::filesystem::absolute(layout_.nativeIndexDir(shardId_)).string();
     co_await seastar::async([this] { std::filesystem::create_directories(indexPath_); });
 
     // Open manifest

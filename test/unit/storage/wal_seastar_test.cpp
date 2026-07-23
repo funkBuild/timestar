@@ -47,7 +47,7 @@ seastar::future<> testWALWriteAndRecoverFloat() {
     auto store = std::make_shared<MemoryStore>(sequenceNumber);
 
     {
-        WAL wal(sequenceNumber);
+        WAL wal(sequenceNumber, timestar::StorageLayout("."), seastar::this_shard_id());
         co_await wal.init(store.get());
 
         TimeStarInsert<double> insert("temperature", "sensor1");
@@ -90,7 +90,7 @@ seastar::future<> testWALWriteAndRecoverBoolean() {
     auto store = std::make_shared<MemoryStore>(sequenceNumber);
 
     {
-        WAL wal(sequenceNumber);
+        WAL wal(sequenceNumber, timestar::StorageLayout("."), seastar::this_shard_id());
         co_await wal.init(store.get());
 
         TimeStarInsert<bool> insert("door", "open");
@@ -135,7 +135,7 @@ seastar::future<> testWALWriteAndRecoverString() {
     auto store = std::make_shared<MemoryStore>(sequenceNumber);
 
     {
-        WAL wal(sequenceNumber);
+        WAL wal(sequenceNumber, timestar::StorageLayout("."), seastar::this_shard_id());
         co_await wal.init(store.get());
 
         TimeStarInsert<std::string> insert("message", "log");
@@ -178,7 +178,7 @@ seastar::future<> testWALBatchInsert() {
     auto store = std::make_shared<MemoryStore>(sequenceNumber);
 
     {
-        WAL wal(sequenceNumber);
+        WAL wal(sequenceNumber, timestar::StorageLayout("."), seastar::this_shard_id());
         co_await wal.init(store.get());
 
         std::vector<TimeStarInsert<double>> batch;
@@ -233,7 +233,7 @@ seastar::future<> testWALMultipleSeries() {
     auto store = std::make_shared<MemoryStore>(sequenceNumber);
 
     {
-        WAL wal(sequenceNumber);
+        WAL wal(sequenceNumber, timestar::StorageLayout("."), seastar::this_shard_id());
         co_await wal.init(store.get());
 
         TimeStarInsert<double> temp("weather", "temperature");
@@ -278,7 +278,7 @@ seastar::future<> testWALDeleteRange() {
     auto store = std::make_shared<MemoryStore>(sequenceNumber);
 
     {
-        WAL wal(sequenceNumber);
+        WAL wal(sequenceNumber, timestar::StorageLayout("."), seastar::this_shard_id());
         co_await wal.init(store.get());
 
         TimeStarInsert<double> insert("metrics", "value");
@@ -330,7 +330,7 @@ seastar::future<> testCRC32RoundtripFloat() {
     auto store = std::make_shared<MemoryStore>(sequenceNumber);
 
     {
-        WAL wal(sequenceNumber);
+        WAL wal(sequenceNumber, timestar::StorageLayout("."), seastar::this_shard_id());
         co_await wal.init(store.get());
 
         TimeStarInsert<double> insert("crc_test", "value");
@@ -374,7 +374,7 @@ seastar::future<> testCRC32CorruptionDetection() {
     auto store = std::make_shared<MemoryStore>(sequenceNumber);
 
     {
-        WAL wal(sequenceNumber);
+        WAL wal(sequenceNumber, timestar::StorageLayout("."), seastar::this_shard_id());
         co_await wal.init(store.get());
 
         TimeStarInsert<double> insert("corrupt_test", "value");
@@ -437,7 +437,7 @@ seastar::future<> testCRC32PartialCorruption() {
     auto restoreConfig = seastar::defer([&savedConfig]() noexcept { timestar::setGlobalConfig(savedConfig); });
 
     {
-        WAL wal(sequenceNumber);
+        WAL wal(sequenceNumber, timestar::StorageLayout("."), seastar::this_shard_id());
         co_await wal.init(store.get());
 
         // Write two entries
@@ -515,7 +515,7 @@ seastar::future<> testCRC32BatchInsertRoundtrip() {
     auto store = std::make_shared<MemoryStore>(sequenceNumber);
 
     {
-        WAL wal(sequenceNumber);
+        WAL wal(sequenceNumber, timestar::StorageLayout("."), seastar::this_shard_id());
         co_await wal.init(store.get());
 
         std::vector<TimeStarInsert<double>> batch;
@@ -575,7 +575,7 @@ seastar::future<> testCRC32DeleteRangeRoundtrip() {
     auto store = std::make_shared<MemoryStore>(sequenceNumber);
 
     {
-        WAL wal(sequenceNumber);
+        WAL wal(sequenceNumber, timestar::StorageLayout("."), seastar::this_shard_id());
         co_await wal.init(store.get());
 
         TimeStarInsert<double> insert("crc_del", "value");
@@ -628,7 +628,7 @@ seastar::future<> testPaddingRecoveryWithImmediateFlush() {
 
     const int numEntries = 5;
     {
-        WAL wal(sequenceNumber);
+        WAL wal(sequenceNumber, timestar::StorageLayout("."), seastar::this_shard_id());
         co_await wal.init(store.get());
         wal.setImmediateFlush(true);
 
@@ -667,7 +667,7 @@ seastar::future<> testPaddingRecoveryEntryLengthWithZeroLowByte() {
 
     const int numEntries = 256;
     {
-        WAL wal(sequenceNumber);
+        WAL wal(sequenceNumber, timestar::StorageLayout("."), seastar::this_shard_id());
         co_await wal.init(store.get());
         wal.setImmediateFlush(true);
 
@@ -707,7 +707,7 @@ seastar::future<> testPaddingRecoveryMixedTypes() {
     auto store = std::make_shared<MemoryStore>(sequenceNumber);
 
     {
-        WAL wal(sequenceNumber);
+        WAL wal(sequenceNumber, timestar::StorageLayout("."), seastar::this_shard_id());
         co_await wal.init(store.get());
         wal.setImmediateFlush(true);
 
@@ -812,7 +812,7 @@ seastar::future<> testFinalFlushAfterBufferedInserts() {
     auto store = std::make_shared<MemoryStore>(sequenceNumber);
 
     {
-        WAL wal(sequenceNumber);
+        WAL wal(sequenceNumber, timestar::StorageLayout("."), seastar::this_shard_id());
         co_await wal.init(store.get());
         // Do NOT set immediate flush — writes accumulate in the stream buffer.
         // _unflushed_bytes must be incremented by each insert() call so that
@@ -868,7 +868,7 @@ seastar::future<> testUnflushedBytesAccumulatesAcrossMultipleInserts() {
     const int N = 7;  // odd number to ensure non-zero remainder mod DMA alignment
 
     {
-        WAL wal(sequenceNumber);
+        WAL wal(sequenceNumber, timestar::StorageLayout("."), seastar::this_shard_id());
         co_await wal.init(store.get());
 
         for (int i = 0; i < N; i++) {
@@ -911,7 +911,7 @@ seastar::future<> testUnflushedBytesAfterBatchInsert() {
     auto store = std::make_shared<MemoryStore>(sequenceNumber);
 
     {
-        WAL wal(sequenceNumber);
+        WAL wal(sequenceNumber, timestar::StorageLayout("."), seastar::this_shard_id());
         co_await wal.init(store.get());
 
         std::vector<TimeStarInsert<double>> batch;
@@ -954,7 +954,7 @@ seastar::future<> testUnflushedBytesAfterDeleteRange() {
     auto store = std::make_shared<MemoryStore>(sequenceNumber);
 
     {
-        WAL wal(sequenceNumber);
+        WAL wal(sequenceNumber, timestar::StorageLayout("."), seastar::this_shard_id());
         co_await wal.init(store.get());
 
         TimeStarInsert<double> insert("del_range_unflushed", "value");
@@ -1007,7 +1007,7 @@ seastar::future<> testUnflushedBytesResetAndReaccumulate() {
     auto store = std::make_shared<MemoryStore>(sequenceNumber);
 
     {
-        WAL wal(sequenceNumber);
+        WAL wal(sequenceNumber, timestar::StorageLayout("."), seastar::this_shard_id());
         co_await wal.init(store.get());
 
         // First group of writes + flush
@@ -1058,7 +1058,7 @@ seastar::future<> testConcurrentInsertsNoDataLoss() {
     auto store = std::make_shared<MemoryStore>(sequenceNumber);
 
     {
-        WAL wal(sequenceNumber);
+        WAL wal(sequenceNumber, timestar::StorageLayout("."), seastar::this_shard_id());
         co_await wal.init(store.get());
 
         // Launch NUM_CONCURRENT insert coroutines simultaneously.

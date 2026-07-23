@@ -141,7 +141,7 @@ SEASTAR_TEST_F(TsmReadPathBenchmark, R1_NarrowRangeQuery_ManyFiles) {
     fmt::print("║  R1: Narrow-Range Query Over Many TSM Files                    ║\n");
     fmt::print("╚══════════════════════════════════════════════════════════════════╝\n");
 
-    Engine engine;
+    Engine engine(timestar::StorageLayout("."));
     co_await engine.init();
 
     constexpr int NUM_FILES = 10;
@@ -211,7 +211,7 @@ SEASTAR_TEST_F(TsmReadPathBenchmark, R2_IntegerNarrowRange) {
     fmt::print("║  R2: Integer Series Narrow-Range Query                         ║\n");
     fmt::print("╚══════════════════════════════════════════════════════════════════╝\n");
 
-    Engine engine;
+    Engine engine(timestar::StorageLayout("."));
     co_await engine.init();
 
     constexpr int NUM_FILES = 5;
@@ -280,7 +280,7 @@ SEASTAR_TEST_F(TsmReadPathBenchmark, R5_MultiSeriesNarrowRange) {
     fmt::print("║  R5: Multi-Series Narrow-Range Query Pipeline                  ║\n");
     fmt::print("╚══════════════════════════════════════════════════════════════════╝\n");
 
-    Engine engine;
+    Engine engine(timestar::StorageLayout("."));
     co_await engine.init();
 
     constexpr int NUM_FILES = 10;
@@ -351,7 +351,7 @@ SEASTAR_TEST_F(TsmReadPathBenchmark, R3_IntegerPushdownAggregation) {
     fmt::print("║  R3: Integer Pushdown Aggregation vs Full Materialization       ║\n");
     fmt::print("╚══════════════════════════════════════════════════════════════════╝\n");
 
-    Engine engine;
+    Engine engine(timestar::StorageLayout("."));
     co_await engine.init();
 
     constexpr int NUM_FILES = 5;
@@ -421,7 +421,7 @@ SEASTAR_TEST_F(TsmReadPathBenchmark, R6_StatsPushdownIOAmplification) {
     fmt::print("║  R6: Stats-Pushdown I/O Amplification (boundary-block decode)   ║\n");
     fmt::print("╚══════════════════════════════════════════════════════════════════╝\n");
 
-    Engine engine;
+    Engine engine(timestar::StorageLayout("."));
     co_await engine.init();
 
     // 1M points, one series, one file -> ~1000 contiguous blocks.
@@ -506,7 +506,7 @@ SEASTAR_TEST_F(TsmReadPathBenchmark, R7_StringDictReadPath) {
     fmt::print("║  R7: Dictionary-Encoded String Series Read Path                 ║\n");
     fmt::print("╚══════════════════════════════════════════════════════════════════╝\n");
 
-    Engine engine;
+    Engine engine(timestar::StorageLayout("."));
     co_await engine.init();
 
     constexpr size_t NUM_POINTS = 100'000;

@@ -322,7 +322,7 @@ public:
 SEASTAR_TEST_F(NativeIndexFaultInjectionTest, TornWalTailStillRecoversAckedSeries) {
     SeriesId128 idA, idB;
     {
-        NativeIndex index(0);
+        NativeIndex index(timestar::StorageLayout("."), 0);
         co_await index.open();
         idA = co_await index.getOrCreateSeriesId("fault_m", {{"host", "a"}}, "f");
         idB = co_await index.getOrCreateSeriesId("fault_m", {{"host", "b"}}, "f");
@@ -344,7 +344,7 @@ SEASTAR_TEST_F(NativeIndexFaultInjectionTest, TornWalTailStillRecoversAckedSerie
 
     SeriesId128 idC;
     {
-        NativeIndex index(0);
+        NativeIndex index(timestar::StorageLayout("."), 0);
         co_await index.open();
 
         auto metaA = co_await index.getSeriesMetadata(idA);
@@ -379,7 +379,7 @@ SEASTAR_TEST_F(NativeIndexFaultInjectionTest, TornWalTailStillRecoversAckedSerie
     // Everything survives a further clean reopen (recovered data now durable
     // in an SSTable, not resting on the WAL that carried the garbage).
     {
-        NativeIndex index(0);
+        NativeIndex index(timestar::StorageLayout("."), 0);
         co_await index.open();
         EXPECT_TRUE((co_await index.getSeriesMetadata(idA)).has_value());
         EXPECT_TRUE((co_await index.getSeriesMetadata(idB)).has_value());
@@ -395,7 +395,7 @@ SEASTAR_TEST_F(NativeIndexFaultInjectionTest, TornWalTailStillRecoversAckedSerie
 SEASTAR_TEST_F(NativeIndexFaultInjectionTest, OrphanPartialSSTableIgnoredAndAckedDataRecovered) {
     SeriesId128 idA, idB;
     {
-        NativeIndex index(0);
+        NativeIndex index(timestar::StorageLayout("."), 0);
         co_await index.open();
         idA = co_await index.getOrCreateSeriesId("orphan_m", {{"host", "a"}}, "f");
         idB = co_await index.getOrCreateSeriesId("orphan_m", {{"host", "b"}}, "f");
@@ -409,7 +409,7 @@ SEASTAR_TEST_F(NativeIndexFaultInjectionTest, OrphanPartialSSTableIgnoredAndAcke
     writeWholeFile("shard_0/native_index/idx_000042.sst", "partial sstable garbage");
 
     {
-        NativeIndex index(0);
+        NativeIndex index(timestar::StorageLayout("."), 0);
         // open() must not throw on the orphans (they are not in the manifest)
         // and must flush the WAL-replayed memtable to a real SSTable.
         co_await index.open();
@@ -434,7 +434,7 @@ SEASTAR_TEST_F(NativeIndexFaultInjectionTest, OrphanPartialSSTableIgnoredAndAcke
     // After the clean close the data lives in a real SSTable written over /
     // alongside the orphans. A further reopen must read it back fine.
     {
-        NativeIndex index(0);
+        NativeIndex index(timestar::StorageLayout("."), 0);
         co_await index.open();
         auto metaA = co_await index.getSeriesMetadata(idA);
         EXPECT_TRUE(metaA.has_value());

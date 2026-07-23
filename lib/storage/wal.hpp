@@ -3,6 +3,7 @@
 #include "memory_store.hpp"
 #include "series_id.hpp"
 #include "slice_buffer.hpp"
+#include "storage_layout.hpp"
 #include "timestar_value.hpp"
 
 #include <chrono>
@@ -105,6 +106,10 @@ private:
     size_t maxWalSize_ = 16 * 1024 * 1024;  // default 16 MiB, overridden by config
     // Identity & file
     unsigned int sequenceNumber;
+    // Injected path authority + owning shard, so this segment's filename is
+    // derived from the configured data root rather than the global config.
+    const timestar::StorageLayout layout_;
+    unsigned shardId_;
     seastar::file walFile;
 
     // Streamed, unaligned I/O (buffered internally by Seastar)
@@ -177,8 +182,11 @@ private:
     CompressionStats _compressionStats;
 
 public:
-    WAL(unsigned int _sequenceNumber);
+    WAL(unsigned int _sequenceNumber, timestar::StorageLayout layout, unsigned shardId);
     ~WAL();  // Ensure caller invoked close()/finalFlush() before destruction
+
+    // This segment's on-disk path, derived from the injected layout.
+    [[nodiscard]] std::string filename() const;
 
     seastar::future<> init(MemoryStore* store, bool isRecovery = false);
 

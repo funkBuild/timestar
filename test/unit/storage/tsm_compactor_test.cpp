@@ -50,7 +50,7 @@ public:
         fs::create_directories(testDir + "/shard_0/tsm");
         fs::current_path(testDir);
 
-        fileManager = std::make_unique<TSMFileManager>();
+        fileManager = std::make_unique<TSMFileManager>(timestar::StorageLayout("."), seastar::this_shard_id());
         compactor = std::make_unique<TSMCompactor>(fileManager.get());
     }
 

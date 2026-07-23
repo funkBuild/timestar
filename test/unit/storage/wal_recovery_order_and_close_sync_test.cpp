@@ -55,7 +55,7 @@ protected:
 seastar::future<> testWALRecoveryRespectsSequenceOrder() {
     // Create WAL file with sequence 5: insert 5 data points
     {
-        WAL wal(5);
+        WAL wal(5, timestar::StorageLayout("."), seastar::this_shard_id());
         co_await wal.init(nullptr);
 
         TimeStarInsert<double> insert("metrics", "value");
@@ -71,7 +71,7 @@ seastar::future<> testWALRecoveryRespectsSequenceOrder() {
 
     // Create WAL file with sequence 10: delete range [2000, 4000]
     {
-        WAL wal(10);
+        WAL wal(10, timestar::StorageLayout("."), seastar::this_shard_id());
         co_await wal.init(nullptr);
 
         TimeStarInsert<double> dummy("metrics", "value");
@@ -123,7 +123,7 @@ TEST_F(WALRecoveryOrderAndCloseSyncTest, RecoveryRespectsSequenceOrder) {
 seastar::future<> testWALReplayWrongOrderYieldsDifferentResult() {
     // Create WAL file with sequence 5: insert 5 data points
     {
-        WAL wal(5);
+        WAL wal(5, timestar::StorageLayout("."), seastar::this_shard_id());
         co_await wal.init(nullptr);
 
         TimeStarInsert<double> insert("metrics", "value");
@@ -139,7 +139,7 @@ seastar::future<> testWALReplayWrongOrderYieldsDifferentResult() {
 
     // Create WAL file with sequence 10: delete range [2000, 4000]
     {
-        WAL wal(10);
+        WAL wal(10, timestar::StorageLayout("."), seastar::this_shard_id());
         co_await wal.init(nullptr);
 
         TimeStarInsert<double> dummy("metrics", "value");
@@ -193,7 +193,7 @@ seastar::future<> testWALRecoveryMultipleFilesCorrectOrder() {
     // Create 3 WAL files with non-contiguous sequence numbers
     // Seq 2: insert data
     {
-        WAL wal(2);
+        WAL wal(2, timestar::StorageLayout("."), seastar::this_shard_id());
         co_await wal.init(nullptr);
 
         TimeStarInsert<double> insert("sensor", "temp");
@@ -206,7 +206,7 @@ seastar::future<> testWALRecoveryMultipleFilesCorrectOrder() {
 
     // Seq 7: insert more data for same series
     {
-        WAL wal(7);
+        WAL wal(7, timestar::StorageLayout("."), seastar::this_shard_id());
         co_await wal.init(nullptr);
 
         TimeStarInsert<double> insert("sensor", "temp");
@@ -218,7 +218,7 @@ seastar::future<> testWALRecoveryMultipleFilesCorrectOrder() {
 
     // Seq 15: delete range [2000, 4000] (should remove points from both seq 2 and 7)
     {
-        WAL wal(15);
+        WAL wal(15, timestar::StorageLayout("."), seastar::this_shard_id());
         co_await wal.init(nullptr);
 
         TimeStarInsert<double> dummy("sensor", "temp");
@@ -267,7 +267,7 @@ seastar::future<> testWALCloseFlushesData() {
     unsigned int sequenceNumber = 50;
 
     {
-        WAL wal(sequenceNumber);
+        WAL wal(sequenceNumber, timestar::StorageLayout("."), seastar::this_shard_id());
         co_await wal.init(nullptr);
 
         TimeStarInsert<double> insert("close_test", "value");
@@ -324,7 +324,7 @@ seastar::future<> testWALCloseFlushesMultipleInserts() {
     unsigned int sequenceNumber = 51;
 
     {
-        WAL wal(sequenceNumber);
+        WAL wal(sequenceNumber, timestar::StorageLayout("."), seastar::this_shard_id());
         co_await wal.init(nullptr);
 
         // Write 5 separate inserts (each adds to _unflushed_bytes)
@@ -360,7 +360,7 @@ seastar::future<> testWALCloseFlushesAfterBatchInsert() {
     unsigned int sequenceNumber = 52;
 
     {
-        WAL wal(sequenceNumber);
+        WAL wal(sequenceNumber, timestar::StorageLayout("."), seastar::this_shard_id());
         co_await wal.init(nullptr);
 
         std::vector<TimeStarInsert<double>> batch;
@@ -398,7 +398,7 @@ seastar::future<> testWALCloseFlushesAfterMixedOperations() {
     unsigned int sequenceNumber = 53;
 
     {
-        WAL wal(sequenceNumber);
+        WAL wal(sequenceNumber, timestar::StorageLayout("."), seastar::this_shard_id());
         co_await wal.init(nullptr);
 
         TimeStarInsert<double> insert("mixed_close", "value");
@@ -444,7 +444,7 @@ TEST_F(WALRecoveryOrderAndCloseSyncTest, CloseFlushesAfterMixedOperations) {
 seastar::future<> testWALDoubleCloseIsSafe() {
     unsigned int sequenceNumber = 54;
 
-    WAL wal(sequenceNumber);
+    WAL wal(sequenceNumber, timestar::StorageLayout("."), seastar::this_shard_id());
     co_await wal.init(nullptr);
 
     TimeStarInsert<double> insert("double_close", "value");

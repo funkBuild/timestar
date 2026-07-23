@@ -48,7 +48,7 @@ SEASTAR_TEST_F(NativeIndexCompactionGateTest, ManyFlushesKeepSSTableCountBounded
     constexpr int kPolicies = 2000;  // ~300KB of KV data → ~50+ flushes at a 4KB buffer
 
     {
-        NativeIndex index(0);
+        NativeIndex index(timestar::StorageLayout("."), 0);
         co_await index.open();
 
         for (int i = 0; i < kPolicies; ++i) {
@@ -92,7 +92,7 @@ SEASTAR_TEST_F(NativeIndexCompactionGateTest, ManyFlushesKeepSSTableCountBounded
     // Reopen: recovery must see the compacted state (manifest v2 + maxKey
     // pruning) and still return correct data.
     {
-        NativeIndex index(0);
+        NativeIndex index(timestar::StorageLayout("."), 0);
         co_await index.open();
         auto val = co_await index.getRetentionPolicy("gate_meas_00042");
         EXPECT_TRUE(val.has_value());

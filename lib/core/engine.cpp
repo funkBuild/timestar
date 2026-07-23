@@ -27,10 +27,14 @@
 
 namespace fs = std::filesystem;
 
-Engine::Engine() : index(seastar::this_shard_id()) {
-    shardId = seastar::this_shard_id();
-    // Directory creation moved to init() to avoid blocking the reactor thread
-};
+Engine::Engine(timestar::StorageLayout layout)
+    : layout_(std::move(layout)),
+      shardId(seastar::this_shard_id()),
+      tsmFileManager(layout_, shardId),
+      walFileManager(layout_, shardId),
+      index(layout_, static_cast<int>(shardId)) {
+          // Directory creation moved to init() to avoid blocking the reactor thread
+      };
 
 seastar::future<> Engine::init() {
     co_await createDirectoryStructure();
@@ -73,14 +77,14 @@ seastar::future<> Engine::startBackgroundCompaction() {
 }
 
 seastar::future<> Engine::createDirectoryStructure() {
-    std::string shardPath = basePath() + "/tsm";
+    std::string shardPath = layout_.tsmDir(shardId).string();
     // Wrap blocking std::filesystem call in seastar::async to avoid
     // blocking the Seastar reactor thread.
     co_await seastar::async([&shardPath]() { fs::create_directories(shardPath); });
 }
 
 std::string Engine::basePath() {
-    return timestar::shardDataPath(shardId);
+    return layout_.shardDir(shardId).string();
 }
 
 seastar::future<> Engine::stop() {

@@ -62,7 +62,7 @@ static seastar::future<> insertKnownValues(Engine& engine, int count = 10) {
 // AVG non-bucketed pushdown
 // ===========================================================================
 SEASTAR_TEST_F(NonBucketedPushdownTest, AVG_ReturnsCorrectAverage) {
-    Engine engine;
+    Engine engine(timestar::StorageLayout("."));
     co_await engine.init();
     co_await insertKnownValues(engine, 10);
 
@@ -95,7 +95,7 @@ SEASTAR_TEST_F(NonBucketedPushdownTest, AVG_ReturnsCorrectAverage) {
 // MIN non-bucketed pushdown
 // ===========================================================================
 SEASTAR_TEST_F(NonBucketedPushdownTest, MIN_ReturnsCorrectMinimum) {
-    Engine engine;
+    Engine engine(timestar::StorageLayout("."));
     co_await engine.init();
     co_await insertKnownValues(engine, 10);
 
@@ -127,7 +127,7 @@ SEASTAR_TEST_F(NonBucketedPushdownTest, MIN_ReturnsCorrectMinimum) {
 // MAX non-bucketed pushdown
 // ===========================================================================
 SEASTAR_TEST_F(NonBucketedPushdownTest, MAX_ReturnsCorrectMaximum) {
-    Engine engine;
+    Engine engine(timestar::StorageLayout("."));
     co_await engine.init();
     co_await insertKnownValues(engine, 10);
 
@@ -159,7 +159,7 @@ SEASTAR_TEST_F(NonBucketedPushdownTest, MAX_ReturnsCorrectMaximum) {
 // COUNT non-bucketed pushdown
 // ===========================================================================
 SEASTAR_TEST_F(NonBucketedPushdownTest, COUNT_ReturnsCorrectCount) {
-    Engine engine;
+    Engine engine(timestar::StorageLayout("."));
     co_await engine.init();
     co_await insertKnownValues(engine, 10);
 
@@ -191,7 +191,7 @@ SEASTAR_TEST_F(NonBucketedPushdownTest, COUNT_ReturnsCorrectCount) {
 // SUM non-bucketed pushdown
 // ===========================================================================
 SEASTAR_TEST_F(NonBucketedPushdownTest, SUM_ReturnsCorrectSum) {
-    Engine engine;
+    Engine engine(timestar::StorageLayout("."));
     co_await engine.init();
     co_await insertKnownValues(engine, 10);
 
@@ -224,7 +224,7 @@ SEASTAR_TEST_F(NonBucketedPushdownTest, SUM_ReturnsCorrectSum) {
 // SPREAD non-bucketed pushdown
 // ===========================================================================
 SEASTAR_TEST_F(NonBucketedPushdownTest, SPREAD_ReturnsCorrectSpread) {
-    Engine engine;
+    Engine engine(timestar::StorageLayout("."));
     co_await engine.init();
     co_await insertKnownValues(engine, 10);
 
@@ -256,7 +256,7 @@ SEASTAR_TEST_F(NonBucketedPushdownTest, SPREAD_ReturnsCorrectSpread) {
 // STDDEV non-bucketed pushdown
 // ===========================================================================
 SEASTAR_TEST_F(NonBucketedPushdownTest, STDDEV_ReturnsCorrectStdDev) {
-    Engine engine;
+    Engine engine(timestar::StorageLayout("."));
     co_await engine.init();
     co_await insertKnownValues(engine, 10);
 
@@ -291,7 +291,7 @@ SEASTAR_TEST_F(NonBucketedPushdownTest, STDDEV_ReturnsCorrectStdDev) {
 // STDVAR non-bucketed pushdown
 // ===========================================================================
 SEASTAR_TEST_F(NonBucketedPushdownTest, STDVAR_ReturnsCorrectVariance) {
-    Engine engine;
+    Engine engine(timestar::StorageLayout("."));
     co_await engine.init();
     co_await insertKnownValues(engine, 10);
 
@@ -324,7 +324,7 @@ SEASTAR_TEST_F(NonBucketedPushdownTest, STDVAR_ReturnsCorrectVariance) {
 // MEDIAN requires raw values — pushdown returns nullopt
 // ===========================================================================
 SEASTAR_TEST_F(NonBucketedPushdownTest, MEDIAN_ReturnsNullopt) {
-    Engine engine;
+    Engine engine(timestar::StorageLayout("."));
     co_await engine.init();
     co_await insertKnownValues(engine, 10);
 
@@ -345,7 +345,7 @@ SEASTAR_TEST_F(NonBucketedPushdownTest, MEDIAN_ReturnsNullopt) {
 // EXACT_MEDIAN falls back to nullopt (not streamable)
 // ===========================================================================
 SEASTAR_TEST_F(NonBucketedPushdownTest, EXACT_MEDIAN_FallsBackToNullopt) {
-    Engine engine;
+    Engine engine(timestar::StorageLayout("."));
     co_await engine.init();
     co_await insertKnownValues(engine, 10);
 

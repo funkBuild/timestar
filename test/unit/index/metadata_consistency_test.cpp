@@ -28,7 +28,7 @@ using namespace timestar::index;
 
 // Same (measurement, tags, field) always returns the same SeriesId128.
 SEASTAR_TEST_F(MetadataConsistencyTest, GetOrCreateReturnsSameIdForSameSeries) {
-    NativeIndex index(0);
+    NativeIndex index(timestar::StorageLayout("."), 0);
     co_await index.open();
 
     auto id1 = co_await index.getOrCreateSeriesId("cpu", {{"host", "s1"}}, "usage");
@@ -44,7 +44,7 @@ SEASTAR_TEST_F(MetadataConsistencyTest, GetOrCreateReturnsSameIdForSameSeries) {
 
 // Different series get unique IDs.
 SEASTAR_TEST_F(MetadataConsistencyTest, DifferentSeriesGetUniqueIds) {
-    NativeIndex index(0);
+    NativeIndex index(timestar::StorageLayout("."), 0);
     co_await index.open();
 
     std::set<SeriesId128, std::less<>> ids;
@@ -62,7 +62,7 @@ SEASTAR_TEST_F(MetadataConsistencyTest, DifferentSeriesGetUniqueIds) {
 
 // Metadata is consistent after memtable flush to SSTable.
 SEASTAR_TEST_F(MetadataConsistencyTest, MetadataConsistentAfterFlush) {
-    NativeIndex index(0);
+    NativeIndex index(timestar::StorageLayout("."), 0);
     co_await index.open();
 
     co_await index.getOrCreateSeriesId("weather", {{"loc", "nyc"}, {"sensor", "a1"}}, "temp");
@@ -94,7 +94,7 @@ SEASTAR_TEST_F(MetadataConsistencyTest, MetadataConsistentAfterFlush) {
 SEASTAR_TEST_F(MetadataConsistencyTest, MetadataConsistentAfterReopen) {
     // Phase 1: Insert and close
     {
-        NativeIndex index(0);
+        NativeIndex index(timestar::StorageLayout("."), 0);
         co_await index.open();
 
         co_await index.getOrCreateSeriesId("disk", {{"host", "prod-1"}}, "iops");
@@ -105,7 +105,7 @@ SEASTAR_TEST_F(MetadataConsistencyTest, MetadataConsistentAfterReopen) {
 
     // Phase 2: Reopen and verify
     {
-        NativeIndex index(0);
+        NativeIndex index(timestar::StorageLayout("."), 0);
         co_await index.open();
 
         auto measurements = co_await index.getAllMeasurements();
@@ -129,7 +129,7 @@ SEASTAR_TEST_F(MetadataConsistencyTest, MetadataConsistentAfterReopen) {
 
 // SchemaUpdate applied twice is idempotent.
 SEASTAR_TEST_F(MetadataConsistencyTest, SchemaUpdateIdempotent) {
-    NativeIndex index(0);
+    NativeIndex index(timestar::StorageLayout("."), 0);
     co_await index.open();
 
     SchemaUpdate update;
@@ -165,7 +165,7 @@ SEASTAR_TEST_F(MetadataConsistencyTest, SchemaUpdatePersistedAcrossReopen) {
     // Session 1: apply a broadcast delta for a measurement this shard does
     // not own (no getOrCreateSeriesId calls for it).
     {
-        NativeIndex index(0);
+        NativeIndex index(timestar::StorageLayout("."), 0);
         co_await index.open();
 
         SchemaUpdate update;
@@ -182,7 +182,7 @@ SEASTAR_TEST_F(MetadataConsistencyTest, SchemaUpdatePersistedAcrossReopen) {
 
     // Session 2: caches are empty — everything must come from the local KV.
     {
-        NativeIndex index(0);
+        NativeIndex index(timestar::StorageLayout("."), 0);
         co_await index.open();
 
         auto fields = co_await index.getFields("remote_meas");
@@ -207,7 +207,7 @@ SEASTAR_TEST_F(MetadataConsistencyTest, SchemaUpdatePersistedAcrossReopen) {
 // TASK A: incremental broadcast deltas must union with previously persisted
 // schema, not replace it.
 SEASTAR_TEST_F(MetadataConsistencyTest, SchemaUpdateIncrementalDeltasUnion) {
-    NativeIndex index(0);
+    NativeIndex index(timestar::StorageLayout("."), 0);
     co_await index.open();
 
     SchemaUpdate u1;
@@ -231,7 +231,7 @@ SEASTAR_TEST_F(MetadataConsistencyTest, SchemaUpdateIncrementalDeltasUnion) {
 // Phantom-measurement bug: getFields() negative-caches {} for nonexistent
 // measurements; getAllMeasurements() must not list those cache entries.
 SEASTAR_TEST_F(MetadataConsistencyTest, GetFieldsForTypoDoesNotCreatePhantomMeasurement) {
-    NativeIndex index(0);
+    NativeIndex index(timestar::StorageLayout("."), 0);
     co_await index.open();
 
     co_await index.getOrCreateSeriesId("real_meas", {{"t", "v"}}, "f");
@@ -252,7 +252,7 @@ SEASTAR_TEST_F(MetadataConsistencyTest, GetFieldsForTypoDoesNotCreatePhantomMeas
 SEASTAR_TEST_F(MetadataConsistencyTest, TagValueMarkersPersistAndUnionAcrossSessions) {
     // Session 1: three values
     {
-        NativeIndex index(0);
+        NativeIndex index(timestar::StorageLayout("."), 0);
         co_await index.open();
         for (const char* host : {"h1", "h2", "h3"}) {
             co_await index.getOrCreateSeriesId("tv_meas", {{"host", host}}, "value");
@@ -265,7 +265,7 @@ SEASTAR_TEST_F(MetadataConsistencyTest, TagValueMarkersPersistAndUnionAcrossSess
     // Session 2: add a fourth value; read must union persisted markers with
     // the new in-session value.
     {
-        NativeIndex index(0);
+        NativeIndex index(timestar::StorageLayout("."), 0);
         co_await index.open();
         co_await index.getOrCreateSeriesId("tv_meas", {{"host", "h4"}}, "value");
         auto values = co_await index.getTagValues("tv_meas", "host");
@@ -277,7 +277,7 @@ SEASTAR_TEST_F(MetadataConsistencyTest, TagValueMarkersPersistAndUnionAcrossSess
 
     // Session 3: all four values persisted
     {
-        NativeIndex index(0);
+        NativeIndex index(timestar::StorageLayout("."), 0);
         co_await index.open();
         auto values = co_await index.getTagValues("tv_meas", "host");
         EXPECT_EQ(values.size(), 4u);
@@ -291,7 +291,7 @@ SEASTAR_TEST_F(MetadataConsistencyTest, TagValueMarkersPersistAndUnionAcrossSess
 // TASK A+B: tag values arriving only via schema broadcast (shard owns no
 // series of the measurement) must be readable immediately and after reopen.
 SEASTAR_TEST_F(MetadataConsistencyTest, BroadcastTagValuesReadableImmediatelyAndAfterReopen) {
-    NativeIndex index(0);
+    NativeIndex index(timestar::StorageLayout("."), 0);
     co_await index.open();
 
     SchemaUpdate update;
@@ -326,7 +326,7 @@ SEASTAR_TEST_F(MetadataConsistencyTest, BroadcastTagValuesReadableImmediatelyAnd
 
 // Field type is set on first write and preserved.
 SEASTAR_TEST_F(MetadataConsistencyTest, FieldTypePreservedAfterFlush) {
-    NativeIndex index(0);
+    NativeIndex index(timestar::StorageLayout("."), 0);
     co_await index.open();
 
     co_await index.setFieldType("cpu", "usage", "float");
@@ -342,7 +342,7 @@ SEASTAR_TEST_F(MetadataConsistencyTest, FieldTypePreservedAfterFlush) {
 
 // Series count is accurate after multiple inserts.
 SEASTAR_TEST_F(MetadataConsistencyTest, SeriesCountAccurate) {
-    NativeIndex index(0);
+    NativeIndex index(timestar::StorageLayout("."), 0);
     co_await index.open();
 
     for (int i = 0; i < 50; ++i) {

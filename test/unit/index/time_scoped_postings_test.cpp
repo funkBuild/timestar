@@ -107,7 +107,7 @@ TEST(DayBitmapKeyEncoding, DecodeTooShortKeyThrows) {
 // ── Single-Day Insert and Query ──
 
 SEASTAR_TEST_F(TimeScopedPostingsTest, SingleDayInsertAndQuery) {
-    NativeIndex index(0);
+    NativeIndex index(timestar::StorageLayout("."), 0);
     co_await index.open();
 
     // Insert data for day 20000 (some arbitrary day)
@@ -136,7 +136,7 @@ SEASTAR_TEST_F(TimeScopedPostingsTest, SingleDayInsertAndQuery) {
 // ── Multi-Day Insert — Narrow Range Returns Only Active ──
 
 SEASTAR_TEST_F(TimeScopedPostingsTest, MultiDayNarrowQuery) {
-    NativeIndex index(0);
+    NativeIndex index(timestar::StorageLayout("."), 0);
     co_await index.open();
 
     uint64_t baseDay = 20000ULL * ke::NS_PER_DAY;
@@ -178,7 +178,7 @@ SEASTAR_TEST_F(TimeScopedPostingsTest, MultiDayNarrowQuery) {
 // ── Inactive Day Pruning ──
 
 SEASTAR_TEST_F(TimeScopedPostingsTest, InactiveDayReturnsEmpty) {
-    NativeIndex index(0);
+    NativeIndex index(timestar::StorageLayout("."), 0);
     co_await index.open();
 
     uint64_t day20000 = 20000ULL * ke::NS_PER_DAY;
@@ -199,7 +199,7 @@ SEASTAR_TEST_F(TimeScopedPostingsTest, InactiveDayReturnsEmpty) {
 // ── Time-Scoped with Tag Filter Intersection ──
 
 SEASTAR_TEST_F(TimeScopedPostingsTest, TimeScopedWithTagFilter) {
-    NativeIndex index(0);
+    NativeIndex index(timestar::StorageLayout("."), 0);
     co_await index.open();
 
     uint64_t day100 = 100ULL * ke::NS_PER_DAY;
@@ -245,7 +245,7 @@ SEASTAR_TEST_F(TimeScopedPostingsTest, PersistenceAfterFlushCompactReopen) {
     uint64_t day501 = 501ULL * ke::NS_PER_DAY;
 
     {
-        NativeIndex index(0);
+        NativeIndex index(timestar::StorageLayout("."), 0);
         co_await index.open();
 
         auto i1 = makeInsert<double>("disk", "iops", {{"host", "a"}}, {day500 + 1}, {100.0});
@@ -259,7 +259,7 @@ SEASTAR_TEST_F(TimeScopedPostingsTest, PersistenceAfterFlushCompactReopen) {
 
     // Reopen and verify
     {
-        NativeIndex index(0);
+        NativeIndex index(timestar::StorageLayout("."), 0);
         co_await index.open();
 
         // Query day 500 — should find only host a
@@ -283,7 +283,7 @@ SEASTAR_TEST_F(TimeScopedPostingsTest, PersistenceAfterFlushCompactReopen) {
 // ── Backfill Marks Historical Days ──
 
 SEASTAR_TEST_F(TimeScopedPostingsTest, BackfillMarksHistoricalDays) {
-    NativeIndex index(0);
+    NativeIndex index(timestar::StorageLayout("."), 0);
     co_await index.open();
 
     // Simulate backfill: insert data spanning 30 days in the past
@@ -317,7 +317,7 @@ SEASTAR_TEST_F(TimeScopedPostingsTest, BackfillMarksHistoricalDays) {
 // ── Retention Cleanup Removes Old Day Bitmaps ──
 
 SEASTAR_TEST_F(TimeScopedPostingsTest, RetentionCleanupRemovesOldDayBitmaps) {
-    NativeIndex index(0);
+    NativeIndex index(timestar::StorageLayout("."), 0);
     co_await index.open();
 
     uint64_t day100 = 100ULL * ke::NS_PER_DAY;
@@ -353,7 +353,7 @@ SEASTAR_TEST_F(TimeScopedPostingsTest, RetentionCleanupRemovesOldDayBitmaps) {
 // ── Fallback When No Day Bitmaps Exist (Pre-Phase-3 Data) ──
 
 SEASTAR_TEST_F(TimeScopedPostingsTest, FallbackWhenNoDayBitmaps) {
-    NativeIndex index(0);
+    NativeIndex index(timestar::StorageLayout("."), 0);
     co_await index.open();
 
     // Create series via getOrCreateSeriesId only (no indexInsert, no day bitmaps)
@@ -372,7 +372,7 @@ SEASTAR_TEST_F(TimeScopedPostingsTest, FallbackWhenNoDayBitmaps) {
 // ── Large-Scale: Narrow vs Wide Query Pruning ──
 
 SEASTAR_TEST_F(TimeScopedPostingsTest, LargeScaleNarrowVsWide) {
-    NativeIndex index(0);
+    NativeIndex index(timestar::StorageLayout("."), 0);
     co_await index.open();
 
     constexpr int NUM_SERIES = 200;
@@ -431,7 +431,7 @@ SEASTAR_TEST_F(TimeScopedPostingsTest, LargeScaleNarrowVsWide) {
 // ── Field Filter with Time Scoping ──
 
 SEASTAR_TEST_F(TimeScopedPostingsTest, FieldFilterWithTimeScope) {
-    NativeIndex index(0);
+    NativeIndex index(timestar::StorageLayout("."), 0);
     co_await index.open();
 
     uint64_t day1 = 1000ULL * ke::NS_PER_DAY;
@@ -454,7 +454,7 @@ SEASTAR_TEST_F(TimeScopedPostingsTest, FieldFilterWithTimeScope) {
 // ── Multi-Tag Intersection with Time Scoping ──
 
 SEASTAR_TEST_F(TimeScopedPostingsTest, MultiTagIntersectionWithTimeScope) {
-    NativeIndex index(0);
+    NativeIndex index(timestar::StorageLayout("."), 0);
     co_await index.open();
 
     uint64_t day300 = 300ULL * ke::NS_PER_DAY;
@@ -492,7 +492,7 @@ SEASTAR_TEST_F(TimeScopedPostingsTest, MultiTagIntersectionWithTimeScope) {
 // measurement they were wrongly pruned from time-scoped discovery) ──
 
 SEASTAR_TEST_F(TimeScopedPostingsTest, MetadataOpDaySpanCoversFirstBatch) {
-    NativeIndex index(0);
+    NativeIndex index(timestar::StorageLayout("."), 0);
     co_await index.open();
 
     uint64_t day21000 = 21000ULL * ke::NS_PER_DAY;
@@ -526,7 +526,7 @@ SEASTAR_TEST_F(TimeScopedPostingsTest, MetadataOpDaySpanCoversFirstBatch) {
 }
 
 SEASTAR_TEST_F(TimeScopedPostingsTest, RecordInsertDaysAddsLaterDays) {
-    NativeIndex index(0);
+    NativeIndex index(timestar::StorageLayout("."), 0);
     co_await index.open();
 
     uint64_t day22000 = 22000ULL * ke::NS_PER_DAY;
@@ -560,7 +560,7 @@ SEASTAR_TEST_F(TimeScopedPostingsTest, RecordInsertDaysAddsLaterDays) {
 // Two identical day-scoped discovery calls must be served from the discovery
 // cache (same shared vector) with consistent results.
 SEASTAR_TEST_F(TimeScopedPostingsTest, TimeScopedCachedServesSharedVector) {
-    NativeIndex index(0);
+    NativeIndex index(timestar::StorageLayout("."), 0);
     co_await index.open();
 
     uint64_t day23000 = 23000ULL * ke::NS_PER_DAY;
@@ -593,7 +593,7 @@ SEASTAR_TEST_F(TimeScopedPostingsTest, TimeScopedCachedServesSharedVector) {
 // When an EXISTING series first writes into a day inside a cached range, the
 // cached day-scoped result must be invalidated (addChecked → generation bump).
 SEASTAR_TEST_F(TimeScopedPostingsTest, TimeScopedCachedInvalidatedByNewDayMembership) {
-    NativeIndex index(0);
+    NativeIndex index(timestar::StorageLayout("."), 0);
     co_await index.open();
 
     uint64_t day24000 = 24000ULL * ke::NS_PER_DAY;

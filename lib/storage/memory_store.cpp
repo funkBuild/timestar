@@ -371,8 +371,8 @@ seastar::future<> MemoryStore::close() {
     }
 }
 
-seastar::future<> MemoryStore::initWAL() {
-    wal = std::make_unique<WAL>(sequenceNumber);
+seastar::future<> MemoryStore::initWAL(const timestar::StorageLayout& layout, unsigned shardId) {
+    wal = std::make_unique<WAL>(sequenceNumber, layout, shardId);
     co_await wal->init(this, false);  // false = not recovery, create fresh WAL
 }
 

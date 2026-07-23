@@ -21,7 +21,7 @@ protected:
 };
 
 seastar::future<> runIndexTest() {
-    timestar::index::NativeIndex index(0);  // Use shard 0 for testing
+    timestar::index::NativeIndex index(timestar::StorageLayout("."), 0);  // Use shard 0 for testing
 
     co_await index.open();
 
@@ -82,7 +82,7 @@ TEST_F(NativeIndexCrudTest, BasicIndexOperations) {
 
 // Additional integration tests for series ID generation
 seastar::future<> testSeriesIdGeneration() {
-    timestar::index::NativeIndex index(0);  // Use shard 0 for this test
+    timestar::index::NativeIndex index(timestar::StorageLayout("."), 0);  // Use shard 0 for this test
 
     co_await index.open();
 
@@ -118,7 +118,7 @@ seastar::future<> testSeriesIdGeneration() {
     co_await index.close();
 
     // Test 4: Persistence - reopen and verify IDs are consistent
-    timestar::index::NativeIndex index2(0);
+    timestar::index::NativeIndex index2(timestar::StorageLayout("."), 0);
     co_await index2.open();
 
     SeriesId128 id1_check = co_await index2.getOrCreateSeriesId(measurement, tags1, "idle");
@@ -136,7 +136,7 @@ TEST_F(NativeIndexCrudTest, SeriesIdGeneration) {
 
 // Test metadata indexing
 seastar::future<> testMetadataIndexing() {
-    timestar::index::NativeIndex index(0);  // Use shard 0 for this test
+    timestar::index::NativeIndex index(timestar::StorageLayout("."), 0);  // Use shard 0 for this test
 
     co_await index.open();
 
@@ -195,7 +195,7 @@ TEST_F(NativeIndexCrudTest, MetadataIndexing) {
 
 // Test series discovery methods
 seastar::future<> testFindSeries() {
-    timestar::index::NativeIndex index(0);
+    timestar::index::NativeIndex index(timestar::StorageLayout("."), 0);
 
     co_await index.open();
 
@@ -236,7 +236,7 @@ TEST_F(NativeIndexCrudTest, FindSeries) {
 
 // Test optimized single-tag lookup
 seastar::future<> testFindSeriesByTag() {
-    timestar::index::NativeIndex index(0);
+    timestar::index::NativeIndex index(timestar::StorageLayout("."), 0);
 
     co_await index.open();
 
@@ -272,7 +272,7 @@ TEST_F(NativeIndexCrudTest, FindSeriesByTag) {
 
 // Test grouping series by tag values
 seastar::future<> testGetSeriesGroupedByTag() {
-    timestar::index::NativeIndex index(0);
+    timestar::index::NativeIndex index(timestar::StorageLayout("."), 0);
 
     co_await index.open();
 
@@ -313,7 +313,7 @@ TEST_F(NativeIndexCrudTest, GetSeriesGroupedByTag) {
 
 // Test field type management
 seastar::future<> testFieldTypes() {
-    timestar::index::NativeIndex index(0);
+    timestar::index::NativeIndex index(timestar::StorageLayout("."), 0);
 
     co_await index.open();
 
@@ -349,7 +349,7 @@ TEST_F(NativeIndexCrudTest, FieldTypes) {
 
 // Test field statistics tracking
 seastar::future<> testFieldStatistics() {
-    timestar::index::NativeIndex index(0);
+    timestar::index::NativeIndex index(timestar::StorageLayout("."), 0);
 
     co_await index.open();
 
@@ -405,7 +405,7 @@ TEST_F(NativeIndexCrudTest, FieldStatistics) {
 
 // Test series metadata retrieval
 seastar::future<> testSeriesMetadata() {
-    timestar::index::NativeIndex index(0);
+    timestar::index::NativeIndex index(timestar::StorageLayout("."), 0);
 
     co_await index.open();
 
@@ -455,7 +455,7 @@ TEST_F(NativeIndexCrudTest, SeriesMetadata) {
 
 // Test getAllMeasurements
 seastar::future<> testGetAllMeasurements() {
-    timestar::index::NativeIndex index(0);
+    timestar::index::NativeIndex index(timestar::StorageLayout("."), 0);
 
     co_await index.open();
 
@@ -487,7 +487,7 @@ TEST_F(NativeIndexCrudTest, GetAllMeasurements) {
 seastar::future<> testOpenCloseLifecycle() {
     // Cycle 1: open, use, close
     {
-        timestar::index::NativeIndex index(0);
+        timestar::index::NativeIndex index(timestar::StorageLayout("."), 0);
         co_await index.open();
 
         auto id = co_await index.getOrCreateSeriesId("lifecycle_test", {{"tag", "value1"}}, "field1");
@@ -498,7 +498,7 @@ seastar::future<> testOpenCloseLifecycle() {
 
     // Cycle 2: reopen same path, use, close
     {
-        timestar::index::NativeIndex index(0);
+        timestar::index::NativeIndex index(timestar::StorageLayout("."), 0);
         co_await index.open();
 
         // Previously created series should still exist
@@ -513,7 +513,7 @@ seastar::future<> testOpenCloseLifecycle() {
 
     // Cycle 3: open and let destructor handle cleanup (no explicit close)
     {
-        timestar::index::NativeIndex index(0);
+        timestar::index::NativeIndex index(timestar::StorageLayout("."), 0);
         co_await index.open();
 
         co_await index.getOrCreateSeriesId("lifecycle_test", {{"tag", "value2"}}, "field2");
@@ -523,7 +523,7 @@ seastar::future<> testOpenCloseLifecycle() {
 
     // Cycle 4: reopen after destructor-based cleanup to verify integrity
     {
-        timestar::index::NativeIndex index(0);
+        timestar::index::NativeIndex index(timestar::StorageLayout("."), 0);
         co_await index.open();
 
         auto fields = co_await index.getFields("lifecycle_test");

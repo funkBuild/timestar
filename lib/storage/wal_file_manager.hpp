@@ -50,6 +50,7 @@ struct MemoryStoreMatch {
 
 class WALFileManager {
 private:
+    const timestar::StorageLayout layout_;
     int shardId;
     uint32_t currentWalSequenceNumber = 0;
     bool walSequenceInitialized_ = false;
@@ -73,7 +74,7 @@ private:
     static constexpr size_t kIngestRejectMemoryStores = 16;
 
 public:
-    WALFileManager();
+    WALFileManager(timestar::StorageLayout layout, unsigned shard);
 
     // True while any rolled-over store is still awaiting TSM conversion.
     // Drives compaction's WAL-first priority.

@@ -30,7 +30,7 @@ protected:
 // ---------------------------------------------------------------------------
 
 SEASTAR_TEST_F(NativeIndexBugfixTest, ApplySchemaUpdateFieldTypeImmutable) {
-    NativeIndex index(0);
+    NativeIndex index(timestar::StorageLayout("."), 0);
     co_await index.open();
 
     // First update: set "meas\0field" to "float"
@@ -54,7 +54,7 @@ SEASTAR_TEST_F(NativeIndexBugfixTest, ApplySchemaUpdateFieldTypeImmutable) {
 }
 
 SEASTAR_TEST_F(NativeIndexBugfixTest, ApplySchemaUpdateFieldTypeAcceptsNewKey) {
-    NativeIndex index(0);
+    NativeIndex index(timestar::StorageLayout("."), 0);
     co_await index.open();
 
     // First key
@@ -119,7 +119,7 @@ TEST_F(NativeIndexBugfixTest, SchemaUpdateMergeAcceptsNewKey) {
 // ---------------------------------------------------------------------------
 
 SEASTAR_TEST_F(NativeIndexBugfixTest, GetFieldStatsValidData) {
-    NativeIndex index(0);
+    NativeIndex index(timestar::StorageLayout("."), 0);
     co_await index.open();
 
     // Create a series to get a valid SeriesId128
@@ -143,7 +143,7 @@ SEASTAR_TEST_F(NativeIndexBugfixTest, GetFieldStatsValidData) {
 }
 
 SEASTAR_TEST_F(NativeIndexBugfixTest, GetFieldStatsNonexistentReturnsNullopt) {
-    NativeIndex index(0);
+    NativeIndex index(timestar::StorageLayout("."), 0);
     co_await index.open();
 
     SeriesId128 fakeSid;
@@ -158,7 +158,7 @@ SEASTAR_TEST_F(NativeIndexBugfixTest, GetFieldStatsNonexistentReturnsNullopt) {
 // ---------------------------------------------------------------------------
 
 SEASTAR_TEST_F(NativeIndexBugfixTest, DiscoveryCacheKeyDeterministic) {
-    NativeIndex index(0);
+    NativeIndex index(timestar::StorageLayout("."), 0);
     co_await index.open();
 
     // Create some series with multiple fields to populate the index
@@ -198,7 +198,7 @@ SEASTAR_TEST_F(NativeIndexBugfixTest, DiscoveryCacheKeyDeterministic) {
 }
 
 SEASTAR_TEST_F(NativeIndexBugfixTest, DiscoveryCacheDifferentFieldSetsMiss) {
-    NativeIndex index(0);
+    NativeIndex index(timestar::StorageLayout("."), 0);
     co_await index.open();
 
     TimeStarInsert<double> ins1("dcache2", "x");

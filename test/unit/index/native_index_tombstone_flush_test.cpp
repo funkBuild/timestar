@@ -36,7 +36,7 @@ SEASTAR_TEST_F(NativeIndexTombstoneFlushTest, DeletedRetentionPolicyDoesNotResur
 
     // Phase 1: Write policy and flush to SSTable via close/reopen
     {
-        NativeIndex index(0);
+        NativeIndex index(timestar::StorageLayout("."), 0);
         co_await index.open();
         co_await index.setRetentionPolicy(policy);
 
@@ -51,7 +51,7 @@ SEASTAR_TEST_F(NativeIndexTombstoneFlushTest, DeletedRetentionPolicyDoesNotResur
 
     // Phase 2: Reopen, delete the policy, close (flush tombstone to SSTable S2)
     {
-        NativeIndex index(0);
+        NativeIndex index(timestar::StorageLayout("."), 0);
         co_await index.open();
 
         // Verify policy survived reopen (read from SSTable)
@@ -72,7 +72,7 @@ SEASTAR_TEST_F(NativeIndexTombstoneFlushTest, DeletedRetentionPolicyDoesNotResur
 
     // Phase 3: Reopen — tombstone in S2 must suppress value in S1
     {
-        NativeIndex index(0);
+        NativeIndex index(timestar::StorageLayout("."), 0);
         co_await index.open();
 
         auto val = co_await index.getRetentionPolicy("test_meas");
@@ -101,7 +101,7 @@ SEASTAR_TEST_F(NativeIndexTombstoneFlushTest, ReinsertAfterDeleteAndFlushWorks) 
 
     // Write, close (flush to S1)
     {
-        NativeIndex index(0);
+        NativeIndex index(timestar::StorageLayout("."), 0);
         co_await index.open();
         co_await index.setRetentionPolicy(policy);
         co_await index.close();
@@ -109,7 +109,7 @@ SEASTAR_TEST_F(NativeIndexTombstoneFlushTest, ReinsertAfterDeleteAndFlushWorks) 
 
     // Delete, close (flush tombstone to S2)
     {
-        NativeIndex index(0);
+        NativeIndex index(timestar::StorageLayout("."), 0);
         co_await index.open();
         co_await index.deleteRetentionPolicy("reinsert_meas");
         co_await index.close();
@@ -117,7 +117,7 @@ SEASTAR_TEST_F(NativeIndexTombstoneFlushTest, ReinsertAfterDeleteAndFlushWorks) 
 
     // Re-insert with a new value, close (flush to S3)
     {
-        NativeIndex index(0);
+        NativeIndex index(timestar::StorageLayout("."), 0);
         co_await index.open();
         policy.ttl = "999s";
         policy.ttlNanos = 999'000'000'000ULL;
@@ -127,7 +127,7 @@ SEASTAR_TEST_F(NativeIndexTombstoneFlushTest, ReinsertAfterDeleteAndFlushWorks) 
 
     // Reopen — should see the re-inserted value, not the tombstone
     {
-        NativeIndex index(0);
+        NativeIndex index(timestar::StorageLayout("."), 0);
         co_await index.open();
 
         auto val = co_await index.getRetentionPolicy("reinsert_meas");
@@ -151,7 +151,7 @@ SEASTAR_TEST_F(NativeIndexTombstoneFlushTest, TombstoneOnlyFlushSuppressesOlderV
 
     // Write policy, close (flush to S1)
     {
-        NativeIndex index(0);
+        NativeIndex index(timestar::StorageLayout("."), 0);
         co_await index.open();
         co_await index.setRetentionPolicy(policyA);
         co_await index.close();
@@ -159,7 +159,7 @@ SEASTAR_TEST_F(NativeIndexTombstoneFlushTest, TombstoneOnlyFlushSuppressesOlderV
 
     // Delete with nothing else in memtable, close (tombstone-only flush to S2)
     {
-        NativeIndex index(0);
+        NativeIndex index(timestar::StorageLayout("."), 0);
         co_await index.open();
         co_await index.deleteRetentionPolicy("sole_meas");
         co_await index.close();
@@ -167,7 +167,7 @@ SEASTAR_TEST_F(NativeIndexTombstoneFlushTest, TombstoneOnlyFlushSuppressesOlderV
 
     // Reopen — must not find the policy
     {
-        NativeIndex index(0);
+        NativeIndex index(timestar::StorageLayout("."), 0);
         co_await index.open();
 
         auto val = co_await index.getRetentionPolicy("sole_meas");

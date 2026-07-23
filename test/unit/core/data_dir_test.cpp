@@ -16,11 +16,11 @@
 #include "../../test_helpers.hpp"
 
 #include <gtest/gtest.h>
+#include <unistd.h>
 
 #include <filesystem>
 #include <seastar/core/thread.hh>
 #include <string>
-#include <unistd.h>
 
 namespace fs = std::filesystem;
 
@@ -115,13 +115,17 @@ TEST_F(DataDirTest, EngineCreatesShardDataUnderConfiguredDataDir) {
             // The directory does not exist yet: the engine must create it.
             ScopedDataDir guard(tmpRoot.string() + "/");
 
-            ScopedEngine eng;
-            eng.init();
+            // The server builds the storage layout from the configured
+            // data_dir (dataRootPath()) and injects it into the Engine. Mirror
+            // that here so this exercises the whole
+            // config -> dataRootPath -> StorageLayout -> Engine wiring.
+            Engine engine(timestar::StorageLayout(timestar::dataRootPath()));
+            engine.init().get();
 
             TimeStarInsert<double> insert("datadir_metric", "value");
             insert.addValue(1000, 1.5);
             insert.addValue(2000, 2.5);
-            eng->insert(std::move(insert)).get();
+            engine.insert(std::move(insert)).get();
 
             const fs::path shardDir = tmpRoot / "shard_0";
             EXPECT_TRUE(fs::exists(shardDir)) << "missing " << shardDir;
@@ -143,8 +147,9 @@ TEST_F(DataDirTest, EngineCreatesShardDataUnderConfiguredDataDir) {
             // Nothing may leak into the CWD (the pre-fix behavior).
             EXPECT_FALSE(fs::exists("shard_0")) << "shard_0 leaked into the CWD despite data_dir";
 
-            // ScopedEngine stops the engine here, while the custom data_dir
-            // config is still installed (mirrors real shutdown ordering).
+            // Stop the engine while the custom data_dir config is still
+            // installed (mirrors real shutdown ordering).
+            engine.stop().get();
         }
 
         fs::remove_all(tmpRoot);

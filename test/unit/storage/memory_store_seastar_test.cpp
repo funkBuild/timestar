@@ -31,7 +31,7 @@ seastar::future<> testMemoryStoreInitWAL() {
     auto store = std::make_shared<MemoryStore>(sequenceNumber);
 
     // Initialize WAL
-    co_await store->initWAL();
+    co_await store->initWAL(timestar::StorageLayout("."), seastar::this_shard_id());
 
     // WAL should be created
     EXPECT_NE(store->getWAL(), nullptr);
@@ -64,7 +64,7 @@ seastar::future<> testMemoryStoreInitFromWAL() {
     // First, create a store and write data
     {
         auto store = std::make_shared<MemoryStore>(sequenceNumber);
-        co_await store->initWAL();
+        co_await store->initWAL(timestar::StorageLayout("."), seastar::this_shard_id());
 
         TimeStarInsert<double> insert1("cpu", "usage");
         insert1.addValue(1000, 25.5);
@@ -132,7 +132,7 @@ TEST_F(MemoryStoreSeastarTest, InitFromWAL) {
 seastar::future<> testMemoryStoreBatchInsert() {
     unsigned int sequenceNumber = 12;
     auto store = std::make_shared<MemoryStore>(sequenceNumber);
-    co_await store->initWAL();
+    co_await store->initWAL(timestar::StorageLayout("."), seastar::this_shard_id());
 
     // Insert multiple entries in batch
     for (int i = 0; i < 100; i++) {
@@ -162,7 +162,7 @@ TEST_F(MemoryStoreSeastarTest, BatchInsert) {
 seastar::future<> testMemoryStoreThresholdChecking() {
     unsigned int sequenceNumber = 13;
     auto store = std::make_shared<MemoryStore>(sequenceNumber);
-    co_await store->initWAL();
+    co_await store->initWAL(timestar::StorageLayout("."), seastar::this_shard_id());
 
     // Insert data up to threshold (16MB)
     // This would normally require a lot of data, so we just test the API

@@ -10,6 +10,7 @@
 #include "schema_update.hpp"
 #include "series_id.hpp"
 #include "shard_query.hpp"
+#include "storage_layout.hpp"
 #include "subscription_manager.hpp"
 #include "timestar_config.hpp"
 #include "timestar_value.hpp"
@@ -30,6 +31,11 @@
 
 class Engine {
 private:
+    // Injected, immutable path authority for this shard's storage. Declared
+    // first so it (and shardId) are constructed before the storage members that
+    // take them.
+    const timestar::StorageLayout layout_;
+    unsigned shardId;
     TSMFileManager tsmFileManager;
     WALFileManager walFileManager;
     timestar::index::NativeIndex index;
@@ -39,8 +45,6 @@ private:
     // Gate to block new inserts during shutdown. Closed early in stop() so
     // in-flight inserts finish but no new ones start.
     seastar::gate _insertGate;
-
-    unsigned shardId;
 
     // Back-reference to the sharded<Engine> container for cross-shard communication.
     // Used for schema broadcasts and cross-shard operations; metadata is indexed locally per-shard.
@@ -156,7 +160,7 @@ public:
     // Set the back-reference to the sharded<Engine> container.
     // Must be called on every shard after engine.start() and before any inserts.
     void setShardedRef(seastar::sharded<Engine>* ref) { shardedRef = ref; }
-    Engine();
+    explicit Engine(timestar::StorageLayout layout);
     seastar::future<> init();
     seastar::future<> stop();
 

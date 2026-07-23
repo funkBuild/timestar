@@ -70,7 +70,7 @@ class ScopedEngine {
 public:
     std::unique_ptr<Engine> engine;
 
-    ScopedEngine() : engine(std::make_unique<Engine>()) {}
+    ScopedEngine() : engine(std::make_unique<Engine>(timestar::StorageLayout("."))) {}
 
     void init() { engine->init().get(); }
 
@@ -118,7 +118,7 @@ public:
     ScopedShardedEngine() = default;
 
     void start() {
-        eng.start().get();
+        eng.start(timestar::StorageLayout(".")).get();
         eng.invoke_on_all([](Engine& engine) { return engine.init(); }).get();
         // Set back-reference for cross-shard metadata indexing
         eng.invoke_on_all([this](Engine& engine) {
@@ -129,7 +129,7 @@ public:
     }
 
     void startWithBackground() {
-        eng.start().get();
+        eng.start(timestar::StorageLayout(".")).get();
         eng.invoke_on_all([](Engine& engine) { return engine.init(); }).get();
         // Set back-reference for cross-shard metadata indexing
         eng.invoke_on_all([this](Engine& engine) {

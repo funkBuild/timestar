@@ -86,7 +86,7 @@ public:
 SEASTAR_TEST_F(WALGroupCommitTest, AlwaysModeAckImpliesOnDisk) {
     self->setSyncMode("always");
     auto store = std::make_shared<MemoryStore>(4200);
-    WAL wal(4200);
+    WAL wal(4200, timestar::StorageLayout("."), seastar::this_shard_id());
     co_await wal.init(store.get());
 
     auto ins = smallInsert("gc_always", 1'700'000'000'000'000'000ULL, 100);
@@ -104,7 +104,7 @@ SEASTAR_TEST_F(WALGroupCommitTest, AlwaysModeAckImpliesOnDisk) {
 SEASTAR_TEST_F(WALGroupCommitTest, AlwaysModeConcurrentWritersAllDurable) {
     self->setSyncMode("always");
     auto store = std::make_shared<MemoryStore>(4201);
-    WAL wal(4201);
+    WAL wal(4201, timestar::StorageLayout("."), seastar::this_shard_id());
     co_await wal.init(store.get());
 
     constexpr size_t kWriters = 32;
@@ -147,7 +147,7 @@ SEASTAR_TEST_F(WALGroupCommitTest, AlwaysModeConcurrentWritersAllDurable) {
 SEASTAR_TEST_F(WALGroupCommitTest, RolloverModeKeepsSmallAckedWritesVolatile) {
     self->setSyncMode("rollover");
     auto store = std::make_shared<MemoryStore>(4202);
-    WAL wal(4202);
+    WAL wal(4202, timestar::StorageLayout("."), seastar::this_shard_id());
     co_await wal.init(store.get());
 
     auto ins = smallInsert("gc_legacy", 1'700'000'000'000'000'000ULL, 100);
@@ -168,7 +168,7 @@ SEASTAR_TEST_F(WALGroupCommitTest, RolloverModeKeepsSmallAckedWritesVolatile) {
 SEASTAR_TEST_F(WALGroupCommitTest, IntervalModeFlushesWithinTheWindow) {
     self->setSyncMode("interval", /*intervalMs=*/25);
     auto store = std::make_shared<MemoryStore>(4203);
-    WAL wal(4203);
+    WAL wal(4203, timestar::StorageLayout("."), seastar::this_shard_id());
     co_await wal.init(store.get());
 
     auto ins = smallInsert("gc_interval", 1'700'000'000'000'000'000ULL, 100);

@@ -345,7 +345,7 @@ int main(int argc, char** argv) {
 
             // STEP 1: Initialize the Engine on all shards
             timestar::http_log.info("Initializing Engine on all shards...");
-            g_engine.start().get();
+            g_engine.start(storageLayout).get();
 
             // Scope guard: Seastar's sharded<> asserts in its destructor if
             // stop() was not called after a successful start().  If any step

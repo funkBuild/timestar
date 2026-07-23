@@ -2,6 +2,7 @@
 
 #include "aligned_buffer.hpp"
 #include "memory_store.hpp"
+#include "storage_layout.hpp"
 #include "timestar_config.hpp"
 #include "tsm.hpp"
 
@@ -29,6 +30,7 @@ private:
     // threshold and the exact input count (see CompactionConfig::files_per_merge).
     static size_t filesPerMerge() { return timestar::config().storage.compaction.files_per_merge; }
 
+    const timestar::StorageLayout layout_;
     int shardId;
     // No atomic needed: TSMFileManager is a per-shard object in Seastar's shard-per-core model,
     // only accessed from a single thread.
@@ -65,7 +67,6 @@ private:
     bool _flushGroupSet = false;
 
     seastar::future<> openTsmFile(std::string path);
-    std::string basePath();
 
     // Compact one tier if it is eligible and not in failure backoff.
     // Returns true if a merge actually ran.
@@ -144,8 +145,14 @@ public:
     // Direct insertion into the sequenced file map (for testing).
     void setSequencedTsmFile(uint64_t seq, seastar::shared_ptr<TSM> tsm) { sequencedTsmFiles[seq] = std::move(tsm); }
 
-    TSMFileManager();
+    TSMFileManager(timestar::StorageLayout layout, unsigned shard);
     ~TSMFileManager();  // Defined in .cpp where TSMCompactor is complete
+
+    // The injected path authority and this manager's shard, exposed so the
+    // owned TSMCompactor derives compacted-file paths from the same layout
+    // instead of reconstructing shard_N paths from the global configuration.
+    [[nodiscard]] const timestar::StorageLayout& layout() const { return layout_; }
+    [[nodiscard]] unsigned shard() const { return static_cast<unsigned>(shardId); }
 
     seastar::future<> init();
     seastar::future<> stop();

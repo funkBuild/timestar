@@ -281,9 +281,10 @@ TEST_F(HttpServerShardSafetyTest, EngineStopGuardOnInitFailure) {
     std::string mainBody = extractFunctionBody("int main(");
     ASSERT_FALSE(mainBody.empty()) << "Could not extract main function body";
 
-    // g_engine.start() must be followed by a scope guard that calls stop()
-    auto startPos = mainBody.find("g_engine.start()");
-    ASSERT_NE(startPos, std::string::npos) << "g_engine.start() not found in main()";
+    // g_engine.start(...) must be followed by a scope guard that calls stop().
+    // Matches the call regardless of arguments (the injected StorageLayout).
+    auto startPos = mainBody.find("g_engine.start(");
+    ASSERT_NE(startPos, std::string::npos) << "g_engine.start( not found in main()";
 
     // Look for seastar::defer (the scope guard) after start()
     auto deferPos = mainBody.find("seastar::defer", startPos);

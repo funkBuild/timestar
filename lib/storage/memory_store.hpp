@@ -19,6 +19,10 @@
 
 class WAL;
 
+namespace timestar {
+class StorageLayout;
+}
+
 // Running statistics for a float series in memory — maintained during insert.
 // Enables block-stats-like pushdown aggregation without per-point scanning
 // when the query range covers the entire series.
@@ -168,7 +172,9 @@ public:
     }
     ~MemoryStore() { timestar::memory_log.debug("Memory store {} removed", sequenceNumber); }
 
-    seastar::future<> initWAL();
+    // The owning WALFileManager injects its layout + shard so this store's WAL
+    // segment lands under the configured data root.
+    seastar::future<> initWAL(const timestar::StorageLayout& layout, unsigned shardId);
     seastar::future<> removeWAL();
 
     // On-disk size of this store's WAL segment. Read before removeWAL() to

@@ -378,8 +378,9 @@ int main(int argc, char** argv) {
 
         seastar::sharded<Engine> engine;
 
-        // Initialize engine on all shards
-        co_await engine.start();
+        // Initialize engine on all shards under the configured data root.
+        const auto layout = timestar::StorageLayout(timestar::dataRootPath()).anchored();
+        co_await engine.start(layout);
         co_await engine.invoke_on_all([](Engine& e) { return e.init(); });
 
         // Set back-reference for cross-shard metadata indexing

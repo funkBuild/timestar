@@ -35,9 +35,8 @@ static std::optional<unsigned int> parseWalSeqNum(const std::string& path) {
     }
 }
 
-WALFileManager::WALFileManager() {
-    shardId = seastar::this_shard_id();
-}
+WALFileManager::WALFileManager(timestar::StorageLayout layout, unsigned shard)
+    : layout_(std::move(layout)), shardId(static_cast<int>(shard)) {}
 
 seastar::future<> WALFileManager::init(Engine& engine, TSMFileManager& _tsmFileManager) {
     timestar::wal_log.info("WALFileManager::init starting for shard {}", shardId);
@@ -170,7 +169,7 @@ seastar::future<> WALFileManager::init(Engine& engine, TSMFileManager& _tsmFileM
         walSequenceInitialized_ = true;
 
         seastar::shared_ptr store = seastar::make_shared<MemoryStore>(currentWalSequenceNumber);
-        co_await store->initWAL();
+        co_await store->initWAL(layout_, shardId);
         memoryStores.push_back(store);
     }
 
@@ -393,7 +392,7 @@ seastar::future<> WALFileManager::rolloverMemoryStore() {
     // every few seconds at high cardinality. The eventual footprint is
     // identical either way; this only moves the allocation to creation time.
     store->series.reserve(previousStore->series.size());
-    co_await store->initWAL();
+    co_await store->initWAL(layout_, shardId);
     memoryStores.insert(memoryStores.begin(), store);
 
     timestar::wal_log.info("New memory store {} created for shard {}", store->sequenceNumber, shardId);

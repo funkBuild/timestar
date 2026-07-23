@@ -122,7 +122,7 @@ TEST_F(EngineMetadataTest, NoShardedRefNoCrash) {
         // Manually start without setting shardedRef to test graceful degradation.
         // Cannot use ScopedShardedEngine::start() since it now sets the ref automatically.
         seastar::sharded<Engine> rawEng;
-        rawEng.start().get();
+        rawEng.start(timestar::StorageLayout(".")).get();
         rawEng.invoke_on_all([](Engine& engine) { return engine.init(); }).get();
 
         auto cleanup = seastar::defer([&rawEng] {

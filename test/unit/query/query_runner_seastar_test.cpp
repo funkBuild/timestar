@@ -31,7 +31,7 @@ protected:
 // Ensures engine.stop() is always called, even on assertion failure.
 #define WITH_ENGINE(engine_var, body)        \
     do {                                     \
-        Engine engine_var;                   \
+        Engine engine_var(timestar::StorageLayout("."));                   \
         std::exception_ptr __ex;             \
         try {                                \
             co_await engine_var.init();      \

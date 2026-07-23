@@ -33,7 +33,7 @@ TEST_F(WALBatchPerformanceTest, CompareSingleVsBatchInserts) {
 
         // Test 1: Single inserts with immediate flush (old behavior)
         {
-            WAL wal1(1000);
+            WAL wal1(1000, timestar::StorageLayout("."), seastar::this_shard_id());
             MemoryStore store1(1000);
             wal1.init(&store1).get();
             wal1.setImmediateFlush(true);  // Old behavior
@@ -67,7 +67,7 @@ TEST_F(WALBatchPerformanceTest, CompareSingleVsBatchInserts) {
 
         // Test 2: Single inserts with batched flush (new behavior)
         {
-            WAL wal2(1001);
+            WAL wal2(1001, timestar::StorageLayout("."), seastar::this_shard_id());
             MemoryStore store2(1001);
             wal2.init(&store2).get();
             wal2.setImmediateFlush(false);  // New behavior - batch flushes
@@ -106,7 +106,7 @@ TEST_F(WALBatchPerformanceTest, CompareSingleVsBatchInserts) {
 
         // Test 3: Batch inserts (new batch API)
         {
-            WAL wal3(1002);
+            WAL wal3(1002, timestar::StorageLayout("."), seastar::this_shard_id());
             MemoryStore store3(1002);
             wal3.init(&store3).get();
 
@@ -163,7 +163,7 @@ TEST_F(WALBatchPerformanceTest, VerifyDataIntegrity) {
     seastar::async([]() {
         // Write data with batch API
         {
-            WAL wal(1003);
+            WAL wal(1003, timestar::StorageLayout("."), seastar::this_shard_id());
             MemoryStore store(1003);
             wal.init(&store).get();
 

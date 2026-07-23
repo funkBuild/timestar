@@ -39,7 +39,12 @@ namespace fs = std::filesystem;
 
 // ------------------------ WAL ------------------------
 
-WAL::WAL(unsigned int _sequenceNumber) : sequenceNumber(_sequenceNumber) {}
+WAL::WAL(unsigned int _sequenceNumber, timestar::StorageLayout layout, unsigned shardId)
+    : sequenceNumber(_sequenceNumber), layout_(std::move(layout)), shardId_(shardId) {}
+
+std::string WAL::filename() const {
+    return layout_.walFile(shardId_, sequenceNumber).string();
+}
 
 WAL::~WAL() {
     if (!_closed) {
@@ -48,7 +53,7 @@ WAL::~WAL() {
 }
 
 seastar::future<> WAL::init(MemoryStore* /*store*/, bool isRecovery) {
-    std::string filename = sequenceNumberToFilename(sequenceNumber);
+    std::string filename = this->filename();
 
     // Ensure directory exists (blocking call, run off reactor thread)
     bool fileExisted = false;
@@ -168,11 +173,11 @@ seastar::future<> WAL::init(MemoryStore* /*store*/, bool isRecovery) {
 }
 
 std::string WAL::sequenceNumberToFilename(unsigned int sequenceNumber) {
-    std::string path = timestar::shardDataPath(seastar::this_shard_id()) + "/";
-    std::string sequenceNumStr = std::to_string(sequenceNumber);
-    size_t padLen = sequenceNumStr.length() >= 10 ? 0 : 10 - sequenceNumStr.length();
-    std::string filename = path + std::string(padLen, '0').append(sequenceNumStr).append(".wal");
-    return filename;
+    // Test-only helper: production WAL paths come from the injected layout via
+    // the instance filename(). This static resolves against the default root so
+    // it reads no global configuration; it matches the instance path only for
+    // the default data root, which is all its (test) callers use.
+    return timestar::StorageLayout(".").walFile(seastar::this_shard_id(), sequenceNumber).string();
 }
 
 seastar::future<> WAL::finalFlush() {
@@ -262,7 +267,7 @@ seastar::future<> WAL::remove() {
     if (!_closed) {
         co_await close();
     }
-    std::string filename = WAL::sequenceNumberToFilename(sequenceNumber);
+    std::string filename = this->filename();
     co_await seastar::remove_file(filename);
 }
 

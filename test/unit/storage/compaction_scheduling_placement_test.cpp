@@ -45,7 +45,7 @@ protected:
 // code hasCompactionGroup() was false here for the whole process lifetime.
 // ---------------------------------------------------------------------------
 seastar::future<> testGroupsWiredWhenCreatedAfterInit() {
-    Engine engine;
+    Engine engine(timestar::StorageLayout("."));
     co_await engine.init();
 
     auto compactGrp = co_await seastar::create_scheduling_group("test_compact", 10);
@@ -87,7 +87,7 @@ seastar::future<> testGroupsWiredWhenCreatedBeforeInit() {
     auto queryGrp = co_await seastar::create_scheduling_group("test_query2", 100);
     auto writeGrp = co_await seastar::create_scheduling_group("test_write2", 50);
 
-    Engine engine;
+    Engine engine(timestar::StorageLayout("."));
     engine.setIOSchedulingGroups(queryGrp, writeGrp, compactGrp, flushGrp);
     co_await engine.init();
 
@@ -110,7 +110,7 @@ TEST_F(CompactionSchedulingPlacementTest, GroupsWiredWhenCreatedBeforeInit) {
 // regression: compaction at 1000 shares next to foreground writes.
 // ---------------------------------------------------------------------------
 seastar::future<> testBackgroundCompactionRefusesWithoutGroups() {
-    Engine engine;
+    Engine engine(timestar::StorageLayout("."));
     co_await engine.init();
 
     // No setIOSchedulingGroups() call.
