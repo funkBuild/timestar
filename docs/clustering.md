@@ -1291,22 +1291,36 @@ architecture's claims rather than demonstrate only happy paths.
 ## Open implementation decisions
 
 Decisions 2, 3, 5, and the journal-record/point-revision framing of decision 1
-are on the Phase 1 Task 4 critical path and require ADRs before Task 4 starts;
-the remainder require prototypes or ADRs before Phase 2:
+are on the Phase 1 Task 4 critical path and required ADRs before Task 4 starts.
+Those ADRs have landed (see [docs/adr/](adr/)); the remainder require prototypes
+or ADRs before Phase 2:
 
 1. Multi-Raft implementation/library and its integration with Seastar ownership,
-   DMA I/O, scheduling, and group commit.
-2. Journal segmentation and retention strategy for many multiplexed groups.
-3. Exact VShard-partitioned TSM and NativeIndex physical layout.
+   DMA I/O, scheduling, and group commit. (The point-revision framing of this
+   decision is **resolved** by [ADR 0003](adr/0003-point-revision-assignment.md):
+   revision = per-VShard log position, journal sequence pre-Raft continuing into
+   the Raft index. The Multi-Raft library choice remains a Phase 2 prototype.)
+2. **Resolved** — [ADR 0001](adr/0001-journal-segmentation-and-retention.md):
+   per-core multiplexed journals, 64 MiB segments, watermark-driven GC with
+   laggard copy-forward and a per-VShard byte cap.
+3. **Resolved** — [ADR 0002](adr/0002-vshard-physical-layout.md): VShard-pure
+   TSM at tier ≥ 1 over multiplexed tier-0 extents, one NativeIndex per core with
+   VShard-prefixed keys, object UUIDs/hashes/block CRCs.
 4. Resolved: v1 reads are leader reads behind ReadIndex — always
    linearizable, no modes, no commit tokens. Token representation returns as
    a design question only with post-v1 replica reads (Phase 6).
 5. Maximum supported node count for 4,096 fixed VShards and a future-compatible
-   identity for splitting placement groups. Partially foreclosed: Tasks 3a/3b1
-   already froze exactly-4,096 formats (ownership binary, `vshards/0000`–`4095`
-   namespace). Either reserve split-epoch bits in the VShard identity before
-   Task 4 bakes IDs into every data file, or record the accepted risk that
-   splitting requires a full versioned data migration.
+   identity for splitting placement groups. The `vshards/0000`–`4095` namespace
+   is frozen (the ownership-binary format was decommissioned with the
+   local-worker machinery). The Task-4-critical part — VShard identity before
+   Task 4 bakes IDs into every data file — is **resolved** by
+   [ADR 0002 §6](adr/0002-vshard-physical-layout.md): accept the risk that
+   splitting requires a versioned migration, made safe by stamping
+   `virtual_shard_count` + `format_version` on every immutable object (a split is
+   then a detectable format change, never a silent reinterpretation), with the
+   top 4 bits of the 16-bit on-disk VShard field reserved-zero as an escape
+   hatch. Maximum node count for placement remains a Phase 3 control-plane
+   question.
 6. Resolved: hot-series lanes are not in the first cluster release.
 7. Whether a later closed-timestamp/HLC mechanism should provide a cluster-wide
    query timestamp.

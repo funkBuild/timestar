@@ -109,9 +109,11 @@ results with no data rewrite; assignment is identical for a fixed
 ### Task 4: Complete VShard storage boundary
 
 Task 4 is the largest storage rework in the plan and is split like the earlier
-tasks were. Three ADRs are prerequisites (see the parent plan's Phase 1):
-journal segmentation/retention, physical TSM/NativeIndex layout, and pre-Raft
-point-revision assignment. All sub-tasks follow the parent plan's multiplexed
+tasks were. Three ADRs are prerequisites and have **landed**:
+[ADR 0001 journal segmentation/retention](adr/0001-journal-segmentation-and-retention.md),
+[ADR 0002 physical TSM/NativeIndex layout](adr/0002-vshard-physical-layout.md),
+and [ADR 0003 pre-Raft point-revision assignment](adr/0003-point-revision-assignment.md).
+All sub-tasks follow the parent plan's multiplexed
 object model — per-core journals with `(vshard, sequence)` record headers,
 tier-0 TSM multiplexed with per-VShard extents converging to VShard-pure
 files at tier ≥ 1, and one per-core NativeIndex with VShard-prefixed keys.
