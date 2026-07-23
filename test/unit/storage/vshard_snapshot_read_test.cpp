@@ -106,4 +106,39 @@ TEST_F(VShardSnapshotReadTest, IntraFileDuplicateKeepsLast) {
     seastar::async([&] { testIntraFileDuplicateKeepsLast(dir).get(); }).get();
 }
 
+// Restore verification: a snapshot created from files verifies against those same
+// files (hash matches); a manifest with a different hash is rejected.
+seastar::future<> testVerifyRoundTrip(std::string dir) {
+    const std::string key = "verify,loc=x v";
+    const auto series = SeriesId128::fromSeriesKey(key);
+    const timestar::VShardId vshard{timestar::virtualShard(series)};
+
+    seastar::shared_ptr<::TSM> f0, f1;
+    co_await writeFloatFile(dir + "/00_0000000000.tsm", 0, key, {100, 200}, {1.0, 2.0}, f0);
+    co_await writeFloatFile(dir + "/00_0000000001.tsm", 1, key, {200, 300}, {22.0, 3.0}, f1);
+    std::vector<seastar::shared_ptr<::TSM>> files = {f0, f1};
+
+    // Create the snapshot manifest from these files.
+    timestar::VShardSnapshotBuilder builder(vshard);
+    co_await timestar::feedVShardResolvedView(vshard, files, builder);
+    const auto manifest = builder.build(timestar::VShardExtentMap{}, std::string(32, 'c'));
+
+    // Verifying against the SAME files must succeed.
+    const bool ok = co_await timestar::verifyVShardSnapshot(manifest, files);
+    EXPECT_TRUE(ok) << "a snapshot must verify against the files it was created from";
+
+    // A manifest with a tampered hash must be rejected.
+    auto tampered = manifest;
+    tampered.verificationHash = std::string(32, 'f');  // wrong but valid-shaped
+    const bool bad = co_await timestar::verifyVShardSnapshot(tampered, files);
+    EXPECT_FALSE(bad) << "a mismatched verification hash must be rejected";
+
+    co_await f0->close();
+    co_await f1->close();
+    co_return;
+}
+TEST_F(VShardSnapshotReadTest, VerifyRoundTripAndTamperRejected) {
+    seastar::async([&] { testVerifyRoundTrip(dir).get(); }).get();
+}
+
 }  // namespace

@@ -34,4 +34,13 @@ namespace timestar {
 seastar::future<> feedVShardResolvedView(VShardId vshard, std::vector<seastar::shared_ptr<::TSM>> files,
                                          VShardSnapshotBuilder& builder);
 
+// Restore verification gate (Task 4d): re-derive the verification hash from the
+// (just-installed) `files` and compare it to `manifest.verificationHash`. Returns
+// true iff they match -- i.e. the installed data reproduces the snapshot's
+// resolved logical view exactly. A false result means the install is corrupt or
+// incomplete and must be rejected/quarantined, never served. Same precondition
+// as feedVShardResolvedView (flushed, delete-materialised files).
+seastar::future<bool> verifyVShardSnapshot(const VShardSnapshotManifest& manifest,
+                                           std::vector<seastar::shared_ptr<::TSM>> files);
+
 }  // namespace timestar

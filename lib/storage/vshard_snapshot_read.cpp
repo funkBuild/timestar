@@ -99,4 +99,11 @@ seastar::future<> feedVShardResolvedView(VShardId vshard, std::vector<seastar::s
     co_return;
 }
 
+seastar::future<bool> verifyVShardSnapshot(const VShardSnapshotManifest& manifest,
+                                           std::vector<seastar::shared_ptr<::TSM>> files) {
+    VShardSnapshotBuilder builder(manifest.vshard);
+    co_await feedVShardResolvedView(manifest.vshard, std::move(files), builder);
+    co_return builder.verificationHash() == manifest.verificationHash;
+}
+
 }  // namespace timestar

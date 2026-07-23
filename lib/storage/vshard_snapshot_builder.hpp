@@ -37,6 +37,11 @@ public:
         hash_.addString(series, ts, value);
     }
 
+    // The verification hash of the points folded so far (32 hex chars). Used by
+    // restore to re-derive the hash from installed files and compare it to the
+    // manifest without assembling a whole new manifest.
+    [[nodiscard]] std::string verificationHash() const { return hash_.digestHex(); }
+
     // Build the manifest. snapshotRevision = the VShard's max revision across its
     // extents (0 if none). Returns the assembled manifest; it satisfies valid().
     [[nodiscard]] VShardSnapshotManifest build(const VShardExtentMap& extents, std::string catalogHash,
