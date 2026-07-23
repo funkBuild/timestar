@@ -651,6 +651,12 @@ void TSM::parseIndexBlocksFromSlice(Slice& indexSlice, TSMIndexEntry& entry, uin
                 // No value stats for strings — blockCount enables COUNT pushdown
             }
         }
+        // V4: per-block revision range, appended after the per-type stats. Pre-V4
+        // files leave [0,0] (the migrated-floor default).
+        if (fileVersion >= 4) {
+            block.blockMinRev = indexSlice.read<uint64_t>();
+            block.blockMaxRev = indexSlice.read<uint64_t>();
+        }
         entry.indexBlocks.push_back(block);
     }
 

@@ -54,6 +54,13 @@ struct TSMIndexBlock {
     uint64_t minTime;
     uint64_t maxTime;
     uint64_t offset;
+    // Per-block replicated revision range [minRev, maxRev] (V4; ADR 0003 sec 4).
+    // Serialized after the per-type stats. 0 = migrated-floor default, which is
+    // also what pre-V4 files decode to. Drives the LWW read-path merge: two blocks
+    // whose ranges are disjoint resolve by range alone (higher wins, no per-point
+    // read); overlap falls back to per-point revisions.
+    uint64_t blockMinRev = 0;
+    uint64_t blockMaxRev = 0;
     // Block-level statistics (all types in V2; Float-only in V1)
     // For Float: native double values.
     // For Integer: int64 values stored as double (lossless up to 2^53).
@@ -166,7 +173,9 @@ struct CacheSizeEstimator<::TSMIndexEntry> {
 // V1: Float blocks have stats (80 bytes), non-Float blocks are base-only (28 bytes).
 // V2: All types have block stats (Float=80, Integer=72, Boolean=40, String=32).
 // V3: per-series index block count widened from uint16 to uint32.
-static constexpr uint8_t TSM_VERSION = 3;
+// V4: each index block carries a [minRev, maxRev] revision range (16 bytes,
+//     appended after the per-type stats) for replicated LWW (ADR 0003).
+static constexpr uint8_t TSM_VERSION = 4;
 // Oldest version we can READ. Dropping V2 readability would orphan every
 // pre-V3 file on upgrade (data invisible to queries, file never compacted or
 // reclaimed) — V2 files stay readable and are rewritten as V3 by compaction.
@@ -199,12 +208,18 @@ inline size_t indexBlockBytesV2(TSMValueType type) {
     }
 }
 
+// Per-block revision range [minRev, maxRev] added in V4 (appended after stats).
+static constexpr size_t TSM_BLOCK_REVISION_BYTES = 16;
+
 inline size_t indexBlockBytes(TSMValueType type, uint8_t version) {
     if (version < 2) {
         // V1: only Float has stats
         return (type == TSMValueType::Float) ? 80 : 28;
     }
-    return indexBlockBytesV2(type);
+    size_t bytes = indexBlockBytesV2(type);
+    if (version >= 4)
+        bytes += TSM_BLOCK_REVISION_BYTES;  // [minRev, maxRev]
+    return bytes;
 }
 
 class TSM {
@@ -213,6 +228,10 @@ public:
     // files involved in a fault (e.g. a type conflict between two inputs to a
     // compaction) rather than leaving an operator to guess.
     const std::string& getFilePath() const { return filePath; }
+
+    // On-disk format version of this file (set on open()). Exposed for tests and
+    // for format-gated behaviour (e.g. V4 carries per-block revision ranges).
+    uint8_t fileFormatVersion() const { return fileVersion; }
 
 private:
     std::string filePath;

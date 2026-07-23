@@ -300,13 +300,12 @@ TEST_F(TSMUniversalStatsTest, StringAggregationReturnsZero) {
 
 // ==================== Phase 1: Version V3 ====================
 
-TEST_F(TSMUniversalStatsTest, TSMVersionIsV3AndV2StaysReadable) {
-    EXPECT_EQ(TSM_VERSION, 3u);
-    // V3 widened the per-series index block count from uint16 to uint32. V2
-    // files MUST remain readable: rejecting them on open would orphan every
-    // pre-upgrade file (data invisible to queries, never compacted or
-    // reclaimed). The reader parses the entry header by file version;
-    // compaction rewrites V2 files as V3.
+TEST_F(TSMUniversalStatsTest, TSMVersionIsV4AndV2StaysReadable) {
+    EXPECT_EQ(TSM_VERSION, 4u);
+    // V4 appends a per-block [minRev, maxRev] revision range. V2/V3 files MUST
+    // remain readable: rejecting them on open would orphan every pre-upgrade file
+    // (data invisible to queries, never compacted or reclaimed). The reader parses
+    // by file version; compaction rewrites older files as V4.
     EXPECT_EQ(TSM_VERSION_MIN, 2u);
 }
 
@@ -374,18 +373,33 @@ seastar::future<> testV2FileRemainsReadable(std::string v3Path, std::string v2Pa
         v2Bytes.append(reinterpret_cast<const char*>(&count16), 2);
         off += TSM_INDEX_ENTRY_HEADER_SIZE;
 
-        size_t blockBytes = count * indexBlockBytes(static_cast<TSMValueType>(type), 2);
-        if (static_cast<TSMValueType>(type) == TSMValueType::String) {
-            uint32_t dictBytes = 0;
-            std::memcpy(&dictBytes, v3Bytes.data() + off + blockBytes, 4);
-            blockBytes += 4 + dictBytes;
-        }
-        EXPECT_LE(blockBytes, indexEnd - off);
-        if (blockBytes > indexEnd - off) {
+        // The source file is V4 (current writer): each block is V2 size + a
+        // trailing 16-byte [minRev,maxRev]. Convert to V2 by copying each block's
+        // V2-sized prefix and dropping the revision range.
+        const auto vtype = static_cast<TSMValueType>(type);
+        const size_t srcBlockBytes = indexBlockBytes(vtype, TSM_VERSION);
+        const size_t dstBlockBytes = indexBlockBytes(vtype, 2);
+        const size_t srcBlocksTotal = count * srcBlockBytes;
+        EXPECT_LE(srcBlocksTotal, indexEnd - off);
+        if (srcBlocksTotal > indexEnd - off) {
             co_return;
         }
-        v2Bytes.append(v3Bytes, off, blockBytes);
-        off += blockBytes;
+        for (uint32_t b = 0; b < count; ++b)
+            v2Bytes.append(v3Bytes, off + b * srcBlockBytes, dstBlockBytes);
+        off += srcBlocksTotal;
+
+        // String dictionary (dictSize(4) + data) follows the blocks, verbatim.
+        if (vtype == TSMValueType::String) {
+            uint32_t dictBytes = 0;
+            std::memcpy(&dictBytes, v3Bytes.data() + off, 4);
+            const size_t dictTotal = 4 + dictBytes;
+            EXPECT_LE(dictTotal, indexEnd - off);
+            if (dictTotal > indexEnd - off) {
+                co_return;
+            }
+            v2Bytes.append(v3Bytes, off, dictTotal);
+            off += dictTotal;
+        }
     }
     // Index section start is unchanged; only its interior shrank.
     v2Bytes.append(reinterpret_cast<const char*>(&indexOffset), 8);

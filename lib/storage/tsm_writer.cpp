@@ -6,6 +6,7 @@
 #include "integer_encoder.hpp"
 #include "logger.hpp"
 #include "logging_config.hpp"
+#include "point_revision.hpp"
 #include "series_id.hpp"
 #include "string_encoder.hpp"
 #include "tsm.hpp"
@@ -179,10 +180,15 @@ void TSMWriter::writeSeriesBlockAt(TSMValueType seriesType, const SeriesId128& s
 
 template <class T>
 void TSMWriter::writeSeries(TSMValueType seriesType, const SeriesId128& seriesId,
-                            const std::vector<uint64_t>& timestamps, const std::vector<T>& values) {
+                            const std::vector<uint64_t>& timestamps, const std::vector<T>& values,
+                            std::span<const uint64_t> revisions) {
     if (timestamps.size() != values.size()) {
         throw std::invalid_argument("TSMWriter::writeSeries: timestamps (" + std::to_string(timestamps.size()) +
                                     ") and values (" + std::to_string(values.size()) + ") size mismatch");
+    }
+    if (!revisions.empty() && revisions.size() != timestamps.size()) {
+        throw std::invalid_argument("TSMWriter::writeSeries: revisions (" + std::to_string(revisions.size()) +
+                                    ") and timestamps (" + std::to_string(timestamps.size()) + ") size mismatch");
     }
     // serializes a single series into one or more blocks. After each block, append an index entry.
     // Block size is config-driven via storage.max_points_per_block (default 3000).
@@ -194,6 +200,16 @@ void TSMWriter::writeSeries(TSMValueType seriesType, const SeriesId128& seriesId
     for (size_t offset = 0; offset < timestamps.size(); offset += maxPointsPerBlock_) {
         const size_t end = std::min(timestamps.size(), (size_t)(offset + maxPointsPerBlock_));
         writeSeriesBlockAt<T>(seriesType, seriesId, timestamps, values, offset, end - offset, indexEntry);
+        // The block just written is the last one appended to the entry; stamp its
+        // revision range from this block's points (ADR 0003 sec 4).
+        if (!revisions.empty() && !indexEntry.indexBlocks.empty()) {
+            timestar::RevisionRange range;
+            for (size_t i = offset; i < end; ++i)
+                range.extend(revisions[i]);
+            auto& block = indexEntry.indexBlocks.back();
+            block.blockMinRev = range.empty ? 0 : range.minRev;
+            block.blockMaxRev = range.empty ? 0 : range.maxRev;
+        }
     }
 
     // Phase 4A: Insert into map (keeps sorted automatically)
@@ -682,6 +698,10 @@ void TSMWriter::writeIndexEntryFor(const TSMIndexEntry& indexEntry) {
             // String: 32 bytes (28 base + count(4))
             buffer.write(block.blockCount);
         }
+        // V4: per-block revision range, appended after the per-type stats so the
+        // stat field offsets the sparse-index fast path reads stay unchanged.
+        buffer.write(block.blockMinRev);
+        buffer.write(block.blockMaxRev);
     }
 
     // Phase 3: Write string dictionary after block metadata for String series.
@@ -972,16 +992,18 @@ seastar::future<> TSMWriter::runAsync(seastar::shared_ptr<MemoryStore> store, st
 
 // Template instantiations
 template void TSMWriter::writeSeries<double>(TSMValueType seriesType, const SeriesId128& seriesId,
-                                             const std::vector<uint64_t>& timestamps,
-                                             const std::vector<double>& values);
+                                             const std::vector<uint64_t>& timestamps, const std::vector<double>& values,
+                                             std::span<const uint64_t> revisions);
 template void TSMWriter::writeSeries<bool>(TSMValueType seriesType, const SeriesId128& seriesId,
-                                           const std::vector<uint64_t>& timestamps, const std::vector<bool>& values);
+                                           const std::vector<uint64_t>& timestamps, const std::vector<bool>& values,
+                                           std::span<const uint64_t> revisions);
 template void TSMWriter::writeSeries<std::string>(TSMValueType seriesType, const SeriesId128& seriesId,
                                                   const std::vector<uint64_t>& timestamps,
-                                                  const std::vector<std::string>& values);
+                                                  const std::vector<std::string>& values,
+                                                  std::span<const uint64_t> revisions);
 template void TSMWriter::writeSeries<int64_t>(TSMValueType seriesType, const SeriesId128& seriesId,
                                               const std::vector<uint64_t>& timestamps,
-                                              const std::vector<int64_t>& values);
+                                              const std::vector<int64_t>& values, std::span<const uint64_t> revisions);
 
 // Append a chunk to a series already (or not yet) present in the index.
 template <class T>
