@@ -1,5 +1,6 @@
 #include "journal_replay.hpp"
 
+#include <cstdint>
 #include <stdexcept>
 
 namespace timestar {
@@ -32,7 +33,13 @@ bool JournalReplay::ingest(const JournalRecord& record) {
         lastSeqByVShard_.emplace(vs, record.vshardSeq);
     } else {
         // Every subsequent record must be the gap-free successor; a gap or a
-        // regression is loss/corruption and fails the whole replay closed.
+        // regression is loss/corruption and fails the whole replay closed. Guard
+        // the (physically unreachable) sequence-space exhaustion so the +1 below
+        // cannot wrap and mis-accept a seq-0 record as the successor of max.
+        if (it->second == UINT64_MAX) {
+            fail("VShard " + std::to_string(vs) + " sequence space exhausted");
+            return false;
+        }
         if (record.vshardSeq != it->second + 1) {
             fail("VShard " + std::to_string(vs) + " sequence discontinuity: expected " +
                  std::to_string(it->second + 1) + " but saw " + std::to_string(record.vshardSeq));
