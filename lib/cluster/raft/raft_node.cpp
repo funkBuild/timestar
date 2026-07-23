@@ -1,6 +1,7 @@
 #include "raft_node.hpp"
 
 #include <algorithm>
+#include <functional>
 
 namespace timestar::raft {
 
@@ -72,6 +73,8 @@ void RaftNode::becomeFollower(Term term, NodeId leader) {
     role_ = Role::Follower;
     leaderId_ = leader;
     votes_.clear();
+    nextIndex_.clear();
+    matchIndex_.clear();
     resetElectionTimer();
 }
 
@@ -96,9 +99,117 @@ void RaftNode::becomeLeader() {
     role_ = Role::Leader;
     leaderId_ = id_;
     electionElapsed_ = 0;
+    heartbeatElapsed_ = 0;
     votes_.clear();
-    // Log replication (no-op entry, nextIndex/matchIndex, heartbeats) is wired in
-    // the replication brick; a freshly elected leader here simply stops electing.
+
+    // Initialize replication progress: optimistically probe from our log end.
+    nextIndex_.clear();
+    matchIndex_.clear();
+    for (NodeId peer : voters_) {
+        nextIndex_[peer] = log_.lastIndex() + 1;
+        matchIndex_[peer] = kNoIndex;
+    }
+
+    // Append a no-op entry in the new term (§5.4.2): a leader may only advance
+    // commit once it has replicated an entry from ITS OWN term, so prior-term
+    // entries are never committed by vote count alone. Empty data == a marker the
+    // application ignores.
+    LogEntry noop;
+    noop.term = currentTerm_;
+    log_.append({noop});
+
+    matchIndex_[id_] = log_.lastIndex();  // the leader trivially matches its own log
+    nextIndex_[id_] = log_.lastIndex() + 1;
+
+    bcastAppend();  // replicate the no-op + serve as the first heartbeat
+}
+
+void RaftNode::sendAppend(NodeId peer) {
+    const LogIndex ni = nextIndex_[peer];
+    const LogIndex prevIndex = ni - 1;
+    const auto prevTerm = log_.term(prevIndex);
+    if (!prevTerm) {
+        // prevIndex is below our snapshot boundary -> the follower needs an
+        // InstallSnapshot, wired in the snapshot brick. Unreachable until
+        // leader-side compaction exists.
+        return;
+    }
+    AppendEntries ae;
+    ae.term = currentTerm_;
+    ae.leaderId = id_;
+    ae.prevLogIndex = prevIndex;
+    ae.prevLogTerm = *prevTerm;
+    ae.entries = log_.entriesFrom(ni);
+    ae.leaderCommit = commitIndex_;
+    send(Message{.to = peer, .from = id_, .payload = std::move(ae)});
+}
+
+void RaftNode::bcastAppend() {
+    for (NodeId peer : voters_) {
+        if (peer != id_)
+            sendAppend(peer);
+    }
+}
+
+LogIndex RaftNode::lastIndexOfTerm(Term t) const {
+    for (LogIndex i = log_.lastIndex(); i >= log_.firstIndex(); --i) {
+        const auto term = log_.term(i);
+        if (term && *term == t)
+            return i;
+        if (i == log_.firstIndex())
+            break;  // guard unsigned underflow
+    }
+    return kNoIndex;
+}
+
+void RaftNode::handleAppendEntriesReply(NodeId from, const AppendEntriesReply& rr) {
+    if (role_ != Role::Leader || !isVoter(from))
+        return;
+
+    if (rr.success) {
+        if (rr.matchIndex > matchIndex_[from])
+            matchIndex_[from] = rr.matchIndex;
+        nextIndex_[from] = matchIndex_[from] + 1;
+        maybeAdvanceCommitAsLeader();
+        // Keep streaming if the follower is still behind our log end.
+        if (nextIndex_[from] <= log_.lastIndex())
+            sendAppend(from);
+        return;
+    }
+
+    // Rejected: back nextIndex up using the conflict hint (one term per round trip).
+    LogIndex ni;
+    if (rr.conflictTerm == kNoTerm) {
+        ni = rr.conflictIndex;  // follower's log is shorter than prevLogIndex
+    } else {
+        const LogIndex ours = lastIndexOfTerm(rr.conflictTerm);
+        ni = (ours != kNoIndex) ? ours + 1 : rr.conflictIndex;
+    }
+    if (ni < 1)
+        ni = 1;
+    // Never rewind past what we already know is replicated, nor overshoot the log.
+    ni = std::max(ni, matchIndex_[from] + 1);
+    ni = std::min(ni, log_.lastIndex() + 1);
+    nextIndex_[from] = ni;
+    sendAppend(from);  // retry immediately from the backed-up point
+}
+
+void RaftNode::maybeAdvanceCommitAsLeader() {
+    // The highest index replicated on a majority of voters (§5.3): sort match
+    // indices descending; the quorum-th one is committed by count.
+    std::vector<LogIndex> matches;
+    matches.reserve(voters_.size());
+    for (NodeId v : voters_)
+        matches.push_back(matchIndex_.count(v) ? matchIndex_.at(v) : kNoIndex);
+    std::sort(matches.begin(), matches.end(), std::greater<>());
+    const LogIndex majorityMatch = matches[quorum() - 1];
+
+    // §5.4.2: only commit it if it is from the CURRENT term. Earlier-term entries
+    // ride along once a current-term entry above them commits.
+    if (majorityMatch > commitIndex_ && log_.term(majorityMatch) == std::optional<Term>(currentTerm_)) {
+        commitIndex_ = majorityMatch;
+        bcastAppend();  // let followers learn the new commit promptly
+    }
 }
 
 void RaftNode::bcastRequestVote() {
@@ -121,7 +232,10 @@ void RaftNode::campaign() {
 
 void RaftNode::tick() {
     if (role_ == Role::Leader) {
-        // Heartbeat emission is added in the replication brick.
+        if (++heartbeatElapsed_ >= opts_.heartbeatTimeout) {
+            heartbeatElapsed_ = 0;
+            bcastAppend();  // heartbeat (an AppendEntries, possibly carrying entries)
+        }
         return;
     }
     // Follower / candidate: advance the election clock.
@@ -180,6 +294,8 @@ void RaftNode::step(Message m) {
                 handleRequestVoteReply(m.from, p);
             } else if constexpr (std::is_same_v<T, AppendEntries>) {
                 handleAppendEntries(m.from, p);
+            } else if constexpr (std::is_same_v<T, AppendEntriesReply>) {
+                handleAppendEntriesReply(m.from, p);
             } else if constexpr (std::is_same_v<T, TimeoutNow>) {
                 if (isVoter(id_))
                     campaign();  // leader transfer: elect now
@@ -286,9 +402,19 @@ void RaftNode::advanceCommitAsFollower(LogIndex leaderCommit, LogIndex lastNewIn
         commitIndex_ = std::min(want, log_.lastIndex());
 }
 
-bool RaftNode::propose(std::string /*data*/) {
-    // Leader append + replication is wired in the replication brick.
-    return false;
+bool RaftNode::propose(std::string data) {
+    if (role_ != Role::Leader)
+        return false;
+    LogEntry e;
+    e.term = currentTerm_;
+    e.data = std::move(data);
+    log_.append({std::move(e)});
+    matchIndex_[id_] = log_.lastIndex();
+    nextIndex_[id_] = log_.lastIndex() + 1;
+    // A single-voter leader commits immediately (its own match is a majority).
+    maybeAdvanceCommitAsLeader();
+    bcastAppend();
+    return true;
 }
 
 bool RaftNode::hasReady() const {

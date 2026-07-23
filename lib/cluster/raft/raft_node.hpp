@@ -77,8 +77,15 @@ private:
     void handleRequestVote(NodeId from, const RequestVote& rv);
     void handleRequestVoteReply(NodeId from, const RequestVoteReply& rr);
     void handleAppendEntries(NodeId from, const AppendEntries& ae);
+    void handleAppendEntriesReply(NodeId from, const AppendEntriesReply& rr);
     void advanceCommitAsFollower(LogIndex leaderCommit, LogIndex lastNewIndex);
     LogIndex firstIndexOfTerm(Term t, LogIndex at) const;
+    LogIndex lastIndexOfTerm(Term t) const;
+
+    // Leader replication.
+    void bcastAppend();
+    void sendAppend(NodeId peer);
+    void maybeAdvanceCommitAsLeader();
 
     size_t countVotes(bool granted) const;
 
@@ -97,8 +104,13 @@ private:
 
     unsigned electionElapsed_ = 0;
     unsigned electionTimeout_ = 0;  // current randomized target
+    unsigned heartbeatElapsed_ = 0;  // leader heartbeat clock
     std::map<NodeId, bool> votes_;  // this election's replies (self included)
     std::mt19937_64 rng_;
+
+    // Leader-only replication progress, one per voter (self included).
+    std::map<NodeId, LogIndex> nextIndex_;   // next index to send to the peer
+    std::map<NodeId, LogIndex> matchIndex_;  // highest index known replicated on the peer
 
     // Output accumulation.
     bool hsDirty_ = false;
