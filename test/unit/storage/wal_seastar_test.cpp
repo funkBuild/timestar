@@ -1128,3 +1128,79 @@ seastar::future<> testConcurrentInsertsNoDataLoss() {
 TEST_F(WALSeastarTest, ConcurrentInsertsNoDataLoss) {
     testConcurrentInsertsNoDataLoss().get();
 }
+
+// Per-point revisions (ADR 0003) must survive a WAL write + recovery, so a
+// crash+replay restores revision tracking exactly (else a replayed WAL point --
+// which is NEWER than all flushed data -- would default to revision 0 and lose
+// the LWW to older flushed data).
+seastar::future<> testWALRecoversRevisions() {
+    unsigned int sequenceNumber = 91;
+    auto store = std::make_shared<MemoryStore>(sequenceNumber);
+    {
+        WAL wal(sequenceNumber, timestar::StorageLayout("."), seastar::this_shard_id());
+        co_await wal.init(store.get());
+
+        TimeStarInsert<double> insert("temperature", "rev1");
+        insert.addValue(1000, 20.5);
+        insert.addValue(2000, 21.0);
+        insert.addValue(3000, 21.5);
+        insert.revisions = {5, 6, 7};  // tracked
+        co_await wal.insert(insert);
+        co_await wal.close();
+    }
+
+    auto recovered = std::make_shared<MemoryStore>(sequenceNumber);
+    {
+        WALReader reader(WAL::sequenceNumberToFilename(sequenceNumber));
+        co_await reader.readAll(recovered.get());
+    }
+
+    TimeStarInsert<double> probe("temperature", "rev1");
+    auto it = recovered->series.find(probe.seriesId128());
+    EXPECT_NE(it, recovered->series.end());
+    if (it == recovered->series.end())
+        co_return;
+    auto& s = std::get<InMemorySeries<double>>(it->second);
+    EXPECT_EQ(s.values.size(), 3u);
+    EXPECT_EQ(s.revisions.size(), s.values.size()) << "revision column not restored parallel";
+    EXPECT_EQ(s.revisions, (std::vector<uint64_t>{5, 6, 7}));
+    co_return;
+}
+TEST_F(WALSeastarTest, RecoversRevisions) {
+    testWALRecoversRevisions().get();
+}
+
+// Back-compat: an untracked insert writes no revision block, and recovery leaves
+// the series untracked (revisions empty) -- exactly how old WAL files decode.
+seastar::future<> testWALUntrackedHasNoRevisions() {
+    unsigned int sequenceNumber = 92;
+    auto store = std::make_shared<MemoryStore>(sequenceNumber);
+    {
+        WAL wal(sequenceNumber, timestar::StorageLayout("."), seastar::this_shard_id());
+        co_await wal.init(store.get());
+        TimeStarInsert<double> insert("temperature", "norev1");
+        insert.addValue(1000, 1.0);
+        insert.addValue(2000, 2.0);
+        co_await wal.insert(insert);  // no revisions set
+        co_await wal.close();
+    }
+
+    auto recovered = std::make_shared<MemoryStore>(sequenceNumber);
+    {
+        WALReader reader(WAL::sequenceNumberToFilename(sequenceNumber));
+        co_await reader.readAll(recovered.get());
+    }
+
+    TimeStarInsert<double> probe("temperature", "norev1");
+    auto it = recovered->series.find(probe.seriesId128());
+    EXPECT_NE(it, recovered->series.end());
+    if (it == recovered->series.end())
+        co_return;
+    auto& s = std::get<InMemorySeries<double>>(it->second);
+    EXPECT_EQ(s.values.size(), 2u);
+    EXPECT_TRUE(s.revisions.empty()) << "untracked insert must not synthesize a revision column";
+    co_return;
+}
+TEST_F(WALSeastarTest, UntrackedInsertHasNoRevisions) {
+    testWALUntrackedHasNoRevisions().get();
+}
