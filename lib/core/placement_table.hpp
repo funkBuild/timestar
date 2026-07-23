@@ -1,6 +1,7 @@
 #pragma once
 
 #include "series_id.hpp"
+#include "vshard.hpp"
 
 #include <array>
 #include <cstdint>
@@ -8,7 +9,7 @@
 
 namespace timestar {
 
-static constexpr uint16_t VIRTUAL_SHARD_COUNT = 4096;
+// VIRTUAL_SHARD_COUNT is the canonical VShard constant defined in vshard.hpp.
 static constexpr uint16_t VIRTUAL_SHARD_MASK = VIRTUAL_SHARD_COUNT - 1;
 
 struct VShardMapping {
@@ -27,15 +28,18 @@ public:
     // Virtual shard number (for serialization / Phase 6)
     static uint16_t vshardForHash(size_t hash) { return static_cast<uint16_t>(hash & VIRTUAL_SHARD_MASK); }
 
-    // Virtual-shard -> mapping. Single-server round-robin (serverId 0,
-    // coreId = vshard % coreCount), derived on the fly. Previously this was a
-    // materialised std::array<VShardMapping, 4096> (16 KB/shard) that the hot
-    // router (coreForHash) never read — it routes by hash % coreCount directly.
-    // Deriving here drops the dead 16 KB while preserving the (round-robin)
-    // mapping semantics and JSON format. Phase 6 (per-vshard serverId) would
-    // reintroduce a stored table behind this same accessor.
+    // Virtual-shard -> mapping. Single-server round-robin (serverId 0, coreId =
+    // the derived local assignment assignCore(vshard, coreCount)), derived on
+    // the fly. Previously this was a materialised std::array<VShardMapping,
+    // 4096> (16 KB/shard) that the hot router (coreForHash) never read — it
+    // routes by hash % coreCount directly. Deriving here drops the dead 16 KB
+    // while preserving the (round-robin) mapping semantics and JSON format.
+    // Phase 6 (per-vshard serverId) would reintroduce a stored table behind this
+    // same accessor. The coreId comes from assignCore so there is one authority
+    // for the vshard->core rule.
     VShardMapping mapping(uint16_t vshard) const {
-        return VShardMapping{0, coreCount_ ? static_cast<uint16_t>(vshard % coreCount_) : uint16_t{0}};
+        return VShardMapping{
+            0, coreCount_ ? static_cast<uint16_t>(assignCore(VShardId{vshard}, coreCount_)) : uint16_t{0}};
     }
 
     // JSON serialization
