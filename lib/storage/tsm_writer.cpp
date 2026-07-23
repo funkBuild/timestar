@@ -237,6 +237,15 @@ seastar::future<> TSMWriter::writeSeriesStreaming(TSMValueType seriesType, const
     LOG_INSERT_PATH(timestar::tsm_log, debug, "Streaming blocks for series '{}' ({} total points, up to {} per block)",
                     seriesId.toHex(), timestamps.size(), maxPointsPerBlock_);
 
+    // NOTE (V4 revision ranges): this is the compaction MERGE path. It re-blocks
+    // decoded points across inputs, so an output block does not correspond 1:1 to
+    // any input block and its [minRev, maxRev] cannot be carried forward here.
+    // Computing it correctly needs the per-point revision (the tier-0 revision
+    // column, ADR 0003 sec 4), which this signature does not yet carry -- so
+    // merged blocks are left at the migrated-floor [0,0]. This is benign only
+    // while no producer stamps non-zero revisions; the per-point column work must
+    // land the revision channel here at the same time it wires the producer. The
+    // zero-copy path (writeCompressedBlockWithStats) already preserves ranges.
     for (size_t offset = 0; offset < timestamps.size(); offset += maxPointsPerBlock_) {
         const size_t end = std::min(timestamps.size(), (size_t)(offset + maxPointsPerBlock_));
         writeSeriesBlockAt<T>(seriesType, seriesId, timestamps, values, offset, end - offset, indexEntry);
@@ -626,6 +635,12 @@ void TSMWriter::writeCompressedBlockWithStats(TSMValueType seriesType, const Ser
     indexBlock.boolTrueCount = srcBlock.boolTrueCount;
     indexBlock.boolFirstValue = srcBlock.boolFirstValue;
     indexBlock.boolLatestValue = srcBlock.boolLatestValue;
+    // V4 revision range: this path copies the block's compressed bytes verbatim,
+    // so its points -- and hence its [minRev, maxRev] -- are unchanged. Carry the
+    // range forward (dropping it would let a later stale flush win the LWW merge
+    // outright; see ADR 0003 / point_revision.hpp rangeWinner).
+    indexBlock.blockMinRev = srcBlock.blockMinRev;
+    indexBlock.blockMaxRev = srcBlock.blockMaxRev;
 
     indexEntry.indexBlocks.push_back(std::move(indexBlock));
 }

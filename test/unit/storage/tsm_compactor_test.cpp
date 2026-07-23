@@ -812,3 +812,68 @@ SEASTAR_TEST_F(TSMCompactorTest, CompactionErrorHandling) {
 
     co_return;
 }
+
+// V4 revision ranges must survive the zero-copy compaction path: a block copied
+// verbatim keeps its exact [minRev, maxRev]. Two files each holding a distinct
+// single series take the zero-copy path (all blocks non-overlapping), so their
+// ranges must be preserved in the compacted output (regression for the
+// writeCompressedBlockWithStats range-drop bug).
+SEASTAR_TEST_F(TSMCompactorTest, ZeroCopyCompactionPreservesRevisionRanges) {
+    std::vector<seastar::shared_ptr<TSM>> files;
+    const SeriesId128 seriesA = SeriesId128::fromSeriesKey("revcompact.a");
+    const SeriesId128 seriesB = SeriesId128::fromSeriesKey("revcompact.b");
+
+    struct Spec {
+        const char* filename;
+        SeriesId128 series;
+        std::vector<uint64_t> revs;
+        uint64_t startTime;
+        int seq;
+    };
+    const std::vector<Spec> specs = {
+        {"shard_0/tsm/00_0000000000.tsm", seriesA, {10, 11, 12, 13, 14}, 1000000, 0},
+        {"shard_0/tsm/00_0000000001.tsm", seriesB, {20, 25, 22, 23, 21}, 5000000, 1},
+    };
+
+    for (const auto& spec : specs) {
+        std::vector<uint64_t> ts;
+        std::vector<double> vs;
+        for (int p = 0; p < 5; ++p) {
+            ts.push_back(spec.startTime + p * 1000);
+            vs.push_back(static_cast<double>(p));
+        }
+        TSMWriter writer(spec.filename);
+        writer.writeSeries(TSMValueType::Float, spec.series, ts, vs, spec.revs);
+        writer.writeIndex();
+        writer.close();
+
+        auto tsm = seastar::make_shared<TSM>(spec.filename);
+        tsm->tierNum = 0;
+        tsm->seqNum = spec.seq;
+        co_await tsm->open();
+        co_await tsm->readSparseIndex();
+        files.push_back(tsm);
+    }
+
+    auto compactedResult = co_await self->compactor->compact(files);
+    EXPECT_FALSE(compactedResult.outputPath.empty());
+
+    auto out = seastar::make_shared<TSM>(compactedResult.outputPath);
+    co_await out->open();
+    EXPECT_EQ(out->fileFormatVersion(), 4u);
+
+    auto checkRange = [&](const SeriesId128& series, uint64_t wantMin, uint64_t wantMax) -> seastar::future<> {
+        auto* entry = co_await out->getFullIndexEntry(series);
+        EXPECT_NE(entry, nullptr);
+        if (entry && !entry->indexBlocks.empty()) {
+            EXPECT_EQ(entry->indexBlocks[0].blockMinRev, wantMin);
+            EXPECT_EQ(entry->indexBlocks[0].blockMaxRev, wantMax);
+        } else {
+            ADD_FAILURE() << "missing index entry/blocks for series";
+        }
+        co_return;
+    };
+    co_await checkRange(seriesA, 10u, 14u);
+    co_await checkRange(seriesB, 20u, 25u);
+    co_return;
+}
