@@ -77,4 +77,33 @@ TEST_F(VShardSnapshotReadTest, ResolvedViewIsNewestWins) {
     seastar::async([&] { testResolvedViewIsNewestWins(dir).get(); }).get();
 }
 
+// Intra-file duplicate timestamps must resolve LAST-write-wins (keep-last),
+// matching the query path -- NOT keep-first. Regression for the emplace bug.
+seastar::future<> testIntraFileDuplicateKeepsLast(std::string dir) {
+    const std::string key = "dup,loc=x v";
+    const auto series = SeriesId128::fromSeriesKey(key);
+    const timestar::VShardId vshard{timestar::virtualShard(series)};
+
+    // One file whose series has a duplicate at ts 200: the later position (9.0)
+    // is the newer write and must win.
+    seastar::shared_ptr<::TSM> file;
+    co_await writeFloatFile(dir + "/00_0000000000.tsm", 0, key, {100, 200, 200, 300}, {1.0, 5.0, 9.0, 3.0}, file);
+
+    timestar::VShardSnapshotBuilder builder(vshard);
+    co_await timestar::feedVShardResolvedView(vshard, {file}, builder);
+    const auto manifest = builder.build(timestar::VShardExtentMap{}, std::string(32, 'c'));
+
+    timestar::VShardVerificationHash expected;
+    expected.addFloat(series, 100, 1.0);
+    expected.addFloat(series, 200, 9.0);  // keep-last, not 5.0
+    expected.addFloat(series, 300, 3.0);
+    EXPECT_EQ(manifest.verificationHash, expected.digestHex()) << "intra-file duplicate must keep the last write";
+
+    co_await file->close();
+    co_return;
+}
+TEST_F(VShardSnapshotReadTest, IntraFileDuplicateKeepsLast) {
+    seastar::async([&] { testIntraFileDuplicateKeepsLast(dir).get(); }).get();
+}
+
 }  // namespace
