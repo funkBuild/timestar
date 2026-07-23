@@ -35,13 +35,38 @@ TEST(VShardManifestTest, ReleasedNeverOutrunsApplied) {
     VShardManifest m;
     m.setApplied(VShardId{1}, 5);
     m.setReleased(VShardId{1}, 100);  // asks to release past what is applied
-    EXPECT_EQ(m.get(VShardId{1}).releasedSeq, 5u) << "released is clamped to applied";
+    EXPECT_EQ(m.get(VShardId{1}).releasedSeq, 5u) << "released is clamped to applied at set time";
 
-    // Raising applied lifts the clamped released up to the earlier intent.
+    // Advancing applied does NOT retroactively raise the clamped released -- the
+    // stored value is final, so reload stays behaviourally identical.
     m.setApplied(VShardId{1}, 40);
+    EXPECT_EQ(m.get(VShardId{1}).releasedSeq, 5u) << "no retroactive lift";
+
+    // The caller re-derives released each cycle; a fresh setReleased advances it,
+    // clamped to the now-higher applied.
+    m.setReleased(VShardId{1}, 100);
     EXPECT_EQ(m.get(VShardId{1}).releasedSeq, 40u);
-    m.setApplied(VShardId{1}, 200);
-    EXPECT_EQ(m.get(VShardId{1}).releasedSeq, 100u) << "clamp lifts no further than the intent";
+}
+
+// The persist boundary must not change behaviour: a decoded manifest must react
+// to a later setApplied/setReleased exactly as the live one would (regression
+// guard for the old clamp-on-encode intent-loss bug).
+TEST(VShardManifestTest, ReloadIsBehaviourallyIdentical) {
+    VShardManifest live;
+    live.setApplied(VShardId{1}, 5);
+    live.setReleased(VShardId{1}, 100);  // clamped to 5
+
+    auto reloaded = VShardManifest::decode(live.encode());
+    ASSERT_TRUE(reloaded.has_value());
+    EXPECT_EQ(reloaded->get(VShardId{1}), live.get(VShardId{1}));
+
+    // Apply the same further operations to both; they must stay identical.
+    for (VShardManifest* m : {&live, &*reloaded}) {
+        m->setApplied(VShardId{1}, 200);
+        m->setReleased(VShardId{1}, 150);
+    }
+    EXPECT_EQ(reloaded->get(VShardId{1}), live.get(VShardId{1}));
+    EXPECT_EQ(live.get(VShardId{1}), (VShardWatermarks{200, 150}));
 }
 
 TEST(VShardManifestTest, EncodeIsDeterministicAndOrderIndependent) {

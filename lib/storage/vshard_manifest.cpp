@@ -15,27 +15,26 @@ constexpr uint32_t kFormatVersion = 1;
 constexpr size_t kHeaderBytes = 12;
 constexpr size_t kEntryBytes = 2 + 8 + 8;  // vshard u16, appliedSeq u64, releasedSeq u64
 constexpr size_t kCrcBytes = 4;
-
-uint64_t clampReleased(uint64_t releasedRaw, uint64_t applied) {
-    return std::min(releasedRaw, applied);
-}
 }  // namespace
 
 void VShardManifest::setApplied(VShardId vshard, uint64_t appliedSeq) {
-    auto& raw = byVShard_[vshard.value()];
-    raw.appliedSeq = std::max(raw.appliedSeq, appliedSeq);
+    auto& wm = byVShard_[vshard.value()];
+    wm.appliedSeq = std::max(wm.appliedSeq, appliedSeq);
 }
 
 void VShardManifest::setReleased(VShardId vshard, uint64_t releasedSeq) {
-    auto& raw = byVShard_[vshard.value()];
-    raw.releasedSeqRaw = std::max(raw.releasedSeqRaw, releasedSeq);
+    auto& wm = byVShard_[vshard.value()];
+    // Monotonic, then clamped to the current applied: released can never outrun
+    // what is materialised. Clamping here (not at read) makes the stored value
+    // final, so a decoded manifest behaves identically to this one.
+    wm.releasedSeq = std::min(std::max(wm.releasedSeq, releasedSeq), wm.appliedSeq);
 }
 
 VShardWatermarks VShardManifest::get(VShardId vshard) const {
     auto it = byVShard_.find(vshard.value());
     if (it == byVShard_.end())
         return {};
-    return {it->second.appliedSeq, clampReleased(it->second.releasedSeqRaw, it->second.appliedSeq)};
+    return it->second;
 }
 
 std::string VShardManifest::encode() const {
@@ -44,10 +43,10 @@ std::string VShardManifest::encode() const {
     codec::putU32(out, kMagic);
     codec::putU32(out, kFormatVersion);
     codec::putU32(out, static_cast<uint32_t>(byVShard_.size()));
-    for (const auto& [vs, raw] : byVShard_) {  // std::map iterates in ascending key order
+    for (const auto& [vs, wm] : byVShard_) {  // std::map iterates in ascending key order
         codec::putU16(out, vs);
-        codec::putU64(out, raw.appliedSeq);
-        codec::putU64(out, clampReleased(raw.releasedSeqRaw, raw.appliedSeq));
+        codec::putU64(out, wm.appliedSeq);
+        codec::putU64(out, wm.releasedSeq);  // already <= appliedSeq
     }
     const uint32_t crc = CRC32::compute(out.data(), out.size());
     codec::putU32(out, crc);
@@ -92,7 +91,7 @@ std::optional<VShardManifest> VShardManifest::decode(std::string_view bytes) {
             return std::nullopt;  // encode() always clamps; a violation is corruption
         prevVs = vs;
         havePrev = true;
-        manifest.byVShard_[vs] = Raw{applied, released};
+        manifest.byVShard_[vs] = VShardWatermarks{applied, released};
     }
     if (!reader.exhausted())
         return std::nullopt;

@@ -30,14 +30,19 @@ struct VShardWatermarks {
 class VShardManifest {
 public:
     // Advance a VShard's applied watermark (monotonic; a regression is ignored).
+    // Advancing applied does NOT retroactively raise a previously clamped
+    // released -- the caller re-derives released each cycle -- so the stored state
+    // is exactly what persists.
     void setApplied(VShardId vshard, uint64_t appliedSeq);
-    // Advance a VShard's released watermark (monotonic; a regression is ignored).
-    // The stored value is clamped to appliedSeq on read/encode, so releasing past
-    // what is materialised is impossible even if a caller asks for it.
+    // Advance a VShard's released watermark. The effective value is
+    // max(current, releasedSeq) clamped to the CURRENT appliedSeq, so releasing
+    // past what is materialised is impossible. Because the clamp happens at set
+    // time (not at read/encode), the stored watermark is exactly what a later
+    // decode observes -- reload is behaviourally identical to the live manifest.
+    // (Advance applied before released within a cycle.)
     void setReleased(VShardId vshard, uint64_t releasedSeq);
 
-    // Watermarks for a VShard ({0,0} if untracked); releasedSeq is clamped to
-    // appliedSeq.
+    // Watermarks for a VShard ({0,0} if untracked).
     [[nodiscard]] VShardWatermarks get(VShardId vshard) const;
 
     // Number of tracked VShards.
@@ -50,11 +55,9 @@ public:
     [[nodiscard]] static std::optional<VShardManifest> decode(std::string_view bytes);
 
 private:
-    struct Raw {
-        uint64_t appliedSeq = 0;
-        uint64_t releasedSeqRaw = 0;  // pre-clamp; get()/encode() clamp to appliedSeq
-    };
-    std::map<uint16_t, Raw> byVShard_;  // ordered -> deterministic encode
+    // Both watermarks are stored already-effective: releasedSeq <= appliedSeq at
+    // all times (clamped in setReleased), so encode/decode round-trips exactly.
+    std::map<uint16_t, VShardWatermarks> byVShard_;  // ordered -> deterministic encode
 };
 
 }  // namespace timestar

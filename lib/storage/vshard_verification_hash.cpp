@@ -37,7 +37,7 @@ void VShardVerificationHash::addRecord(const SeriesId128& series, uint64_t times
     lastSeries_ = series;
     lastTimestamp_ = timestamp;
 
-    // Canonical record: series(16) | timestamp(8 BE) | typeTag(1) | value bits.
+    // Canonical record: series(16) | timestamp(8 LE) | typeTag(1) | value bits.
     std::string record;
     record.reserve(16 + 8 + 1 + valueBytes.size());
     series.appendTo(record);  // 16 raw id bytes
