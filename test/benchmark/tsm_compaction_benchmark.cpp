@@ -14,8 +14,6 @@
 
 namespace fs = std::filesystem;
 
-static const timestar::StorageLayout kDefaultTsmTestLayout(".");
-
 // Configuration for benchmark
 constexpr size_t NUM_FILES = 4;                        // Match TIER0_MIN_FILES threshold
 constexpr size_t TARGET_FILE_SIZE = 50 * 1024 * 1024;  // 50MB per file
@@ -174,7 +172,7 @@ seastar::future<CompactionStats> runCompactionBenchmark() {
 
     // Create compactor (without file manager for standalone benchmark)
     std::cout << "\nCreating compactor..." << std::endl;
-    TSMCompactor compactor(kDefaultTsmTestLayout, 0, nullptr);
+    TSMCompactor compactor(nullptr);
 
     std::cout << "\nCompaction input:" << std::endl;
     std::cout << "  Source files: " << benchState.loadedFiles.size() << std::endl;
@@ -187,9 +185,7 @@ seastar::future<CompactionStats> runCompactionBenchmark() {
     std::cout << "\nExecuting compaction..." << std::endl;
     std::string outputFile;
     try {
-        // setupBenchmark owns this clean directory and created sequences 0..3,
-        // so sequence 4 is explicitly reserved for this standalone output.
-        outputFile = (co_await compactor.compact(benchState.loadedFiles, 1, NUM_FILES)).outputPath;
+        outputFile = (co_await compactor.compact(benchState.loadedFiles)).outputPath;
         std::cout << "Compaction completed successfully" << std::endl;
         std::cout << "Output file: " << outputFile << std::endl;
     } catch (const std::exception& e) {

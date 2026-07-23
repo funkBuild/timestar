@@ -30,7 +30,7 @@ protected:
 };
 
 SEASTAR_TEST_F(NativeIndexEnhancedTest, FindSeriesByTag) {
-    timestar::index::NativeIndex index(timestar::StorageLayout("."), 0);
+    timestar::index::NativeIndex index(0);
 
     co_await index.open();
 
@@ -68,7 +68,7 @@ SEASTAR_TEST_F(NativeIndexEnhancedTest, FindSeriesByTag) {
 }
 
 SEASTAR_TEST_F(NativeIndexEnhancedTest, GetSeriesGroupedByTag) {
-    timestar::index::NativeIndex index(timestar::StorageLayout("."), 0);
+    timestar::index::NativeIndex index(0);
 
     co_await index.open();
 
@@ -109,7 +109,7 @@ SEASTAR_TEST_F(NativeIndexEnhancedTest, GetSeriesGroupedByTag) {
 }
 
 SEASTAR_TEST_F(NativeIndexEnhancedTest, FieldStatistics) {
-    timestar::index::NativeIndex index(timestar::StorageLayout("."), 0);
+    timestar::index::NativeIndex index(0);
 
     co_await index.open();
 
@@ -155,7 +155,7 @@ SEASTAR_TEST_F(NativeIndexEnhancedTest, FieldStatistics) {
 }
 
 SEASTAR_TEST_F(NativeIndexEnhancedTest, ComplexTagQueries) {
-    timestar::index::NativeIndex index(timestar::StorageLayout("."), 0);
+    timestar::index::NativeIndex index(0);
 
     co_await index.open();
 

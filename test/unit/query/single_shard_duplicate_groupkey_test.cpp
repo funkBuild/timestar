@@ -205,7 +205,7 @@ TEST_F(SingleShardDuplicateGroupKeyTest, MergeFallback_MIN_AcrossThreeSeries) {
     partials.push_back(std::move(pB));
     partials.push_back(std::move(pC));
 
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::MIN);
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::MIN).get();
 
     ASSERT_EQ(grouped.size(), 1) << "No group-by: all series should merge into one group";
     EXPECT_EQ(grouped[0].measurement, "measurement");
@@ -241,7 +241,7 @@ TEST_F(SingleShardDuplicateGroupKeyTest, MergeFallback_MAX_AcrossThreeSeries) {
     partials.push_back(std::move(pB));
     partials.push_back(std::move(pC));
 
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::MAX);
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::MAX).get();
 
     ASSERT_EQ(grouped.size(), 1);
     ASSERT_EQ(grouped[0].points.size(), 3);
@@ -267,7 +267,7 @@ TEST_F(SingleShardDuplicateGroupKeyTest, MergeFallback_AVG_AcrossThreeSeries) {
     partials.push_back(std::move(pB));
     partials.push_back(std::move(pC));
 
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::AVG);
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::AVG).get();
 
     ASSERT_EQ(grouped.size(), 1);
     ASSERT_EQ(grouped[0].points.size(), 2);
@@ -294,7 +294,7 @@ TEST_F(SingleShardDuplicateGroupKeyTest, MergeFallback_SUM_AcrossThreeSeries) {
     partials.push_back(std::move(pB));
     partials.push_back(std::move(pC));
 
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::SUM);
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::SUM).get();
 
     ASSERT_EQ(grouped.size(), 1);
     ASSERT_EQ(grouped[0].points.size(), 1);
@@ -313,7 +313,7 @@ TEST_F(SingleShardDuplicateGroupKeyTest, MergeFallback_COUNT_AcrossThreeSeries) 
     partials.push_back(std::move(pB));
     partials.push_back(std::move(pC));
 
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::COUNT);
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::COUNT).get();
 
     ASSERT_EQ(grouped.size(), 1);
     ASSERT_EQ(grouped[0].points.size(), 2);
@@ -339,7 +339,7 @@ TEST_F(SingleShardDuplicateGroupKeyTest, MergeFallback_LATEST_AcrossThreeSeries)
     partials.push_back(std::move(pB));
     partials.push_back(std::move(pC));
 
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::LATEST);
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::LATEST).get();
 
     ASSERT_EQ(grouped.size(), 1);
     // All unique timestamps merged, sorted
@@ -378,7 +378,7 @@ TEST_F(SingleShardDuplicateGroupKeyTest, BugReproducer_LastPartialOverwritesEarl
     partials.push_back(std::move(deviceC));
 
     // The merge fallback correctly aggregates across all series
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::MIN);
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::MIN).get();
 
     ASSERT_EQ(grouped.size(), 1);
     ASSERT_EQ(grouped[0].points.size(), 3);
@@ -413,7 +413,7 @@ TEST_F(SingleShardDuplicateGroupKeyTest, MergeFallback_BucketedMIN_AcrossThreeSe
     partials.push_back(std::move(pB));
     partials.push_back(std::move(pC));
 
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::MIN);
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::MIN).get();
 
     ASSERT_EQ(grouped.size(), 1);
     ASSERT_EQ(grouped[0].points.size(), 2);
@@ -435,7 +435,7 @@ TEST_F(SingleShardDuplicateGroupKeyTest, MergeFallback_BucketedAVG_AcrossThreeSe
     partials.push_back(std::move(pB));
     partials.push_back(std::move(pC));
 
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::AVG);
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::AVG).get();
 
     ASSERT_EQ(grouped.size(), 1);
     ASSERT_EQ(grouped[0].points.size(), 1);
@@ -480,7 +480,7 @@ TEST_F(SingleShardDuplicateGroupKeyTest, MixedDuplicateAndUniqueGroupKeys) {
     EXPECT_TRUE(hasDuplicateGroupKeys);
 
     // Merge should produce 2 groups: one for temperature (merged), one for humidity
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::MIN);
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::MIN).get();
 
     ASSERT_EQ(grouped.size(), 2);
 
@@ -528,7 +528,7 @@ TEST_F(SingleShardDuplicateGroupKeyTest, MergeFallback_TenSeries_MIN) {
         ASSERT_EQ(partials[0].groupKey, partials[i].groupKey);
     }
 
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::MIN);
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::MIN).get();
 
     ASSERT_EQ(grouped.size(), 1);
     ASSERT_EQ(grouped[0].points.size(), 2);
@@ -549,7 +549,7 @@ TEST_F(SingleShardDuplicateGroupKeyTest, MergeFallback_TenSeries_SUM) {
             makePushdownPartial("sensor", "value", {}, {1000}, {static_cast<double>(i + 1)}));  // values: 1, 2, ..., 10
     }
 
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::SUM);
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::SUM).get();
 
     ASSERT_EQ(grouped.size(), 1);
     ASSERT_EQ(grouped[0].points.size(), 1);
@@ -565,7 +565,7 @@ TEST_F(SingleShardDuplicateGroupKeyTest, MergeFallback_TenSeries_AVG) {
             makePushdownPartial("sensor", "value", {}, {1000}, {static_cast<double>(i + 1)}));  // values: 1, 2, ..., 10
     }
 
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::AVG);
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::AVG).get();
 
     ASSERT_EQ(grouped.size(), 1);
     ASSERT_EQ(grouped[0].points.size(), 1);
@@ -588,7 +588,7 @@ TEST_F(SingleShardDuplicateGroupKeyTest, TwoSeriesDifferentTimestamps_MIN) {
     partials.push_back(std::move(pA));
     partials.push_back(std::move(pB));
 
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::MIN);
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::MIN).get();
 
     ASSERT_EQ(grouped.size(), 1);
     // 4 unique timestamps → 4 points (no merging within timestamps)
@@ -612,7 +612,7 @@ TEST_F(SingleShardDuplicateGroupKeyTest, TwoSeriesPartialOverlap_AVG) {
     partials.push_back(std::move(pA));
     partials.push_back(std::move(pB));
 
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::AVG);
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::AVG).get();
 
     ASSERT_EQ(grouped.size(), 1);
     ASSERT_EQ(grouped[0].points.size(), 4);  // t=1000, 2000, 3000, 4000
@@ -646,7 +646,7 @@ TEST_F(SingleShardDuplicateGroupKeyTest, EmptyPartialsSkipped) {
     partials.push_back(std::move(pA));
     partials.push_back(std::move(pB));
 
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::MIN);
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::MIN).get();
 
     ASSERT_EQ(grouped.size(), 1);
     ASSERT_EQ(grouped[0].points.size(), 1);
@@ -679,19 +679,14 @@ TEST_F(SingleShardDuplicateGroupKeyTest, CreatePartialAggregations_ProducesDupli
         std::make_pair(std::vector<uint64_t>{1000, 2000}, FieldValues(std::vector<double>{50.0, 60.0}));
 
     // No group-by tags → all partials get the same groupKey
-    auto partials = Aggregator::createPartialAggregations({sr1, sr2, sr3}, AggregationMethod::MIN, 0, {});
+    auto partials = Aggregator::createPartialAggregations({sr1, sr2, sr3}, AggregationMethod::MIN, 0, {}).get();
 
-    // createPartialAggregations merges them into ONE partial (same groupKey)
-    // This is the fallback path behavior — it aggregates in the map phase.
-    // But the pushdown path creates separate partials per series.
-    // Either way, the merge must handle both patterns correctly.
-    ASSERT_GE(partials.size(), 1);
-
-    if (partials.size() > 1) {
-        // If separate partials were produced, they must share a groupKey
-        for (size_t i = 1; i < partials.size(); ++i) {
-            EXPECT_EQ(partials[0].groupKey, partials[i].groupKey);
-        }
+    // The map phase emits one raw partial PER SERIES (matching the pushdown
+    // path; it must never fold series into each other — the old incremental
+    // fold was O(K²·N)).  Same group → same groupKey; the reduce phase merges.
+    ASSERT_EQ(partials.size(), 3);
+    for (size_t i = 1; i < partials.size(); ++i) {
+        EXPECT_EQ(partials[0].groupKey, partials[i].groupKey);
     }
 }
 
@@ -731,7 +726,7 @@ TEST_F(SingleShardDuplicateGroupKeyTest, MergeFallback_SPREAD_AcrossThreeSeries)
     partials.push_back(std::move(pB));
     partials.push_back(std::move(pC));
 
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::SPREAD);
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::SPREAD).get();
 
     ASSERT_EQ(grouped.size(), 1);
     ASSERT_EQ(grouped[0].points.size(), 1);
@@ -751,7 +746,7 @@ TEST_F(SingleShardDuplicateGroupKeyTest, MergeFallback_FIRST_AcrossThreeSeries) 
     partials.push_back(std::move(pB));
     partials.push_back(std::move(pC));
 
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::FIRST);
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::FIRST).get();
 
     ASSERT_EQ(grouped.size(), 1);
     ASSERT_GE(grouped[0].points.size(), 1);

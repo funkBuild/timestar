@@ -37,7 +37,7 @@ static seastar::future<SeriesId128> createSeries(NativeIndex& index, const std::
 }
 
 SEASTAR_TEST_F(PostingsBitmapTest, SingleTagLookup) {
-    NativeIndex index(timestar::StorageLayout("."), 0);
+    NativeIndex index(0);
     co_await index.open();
 
     // Create 3 series with region=us-west, 2 with region=us-east
@@ -67,7 +67,7 @@ SEASTAR_TEST_F(PostingsBitmapTest, SingleTagLookup) {
 }
 
 SEASTAR_TEST_F(PostingsBitmapTest, MultiTagIntersection) {
-    NativeIndex index(timestar::StorageLayout("."), 0);
+    NativeIndex index(0);
     co_await index.open();
 
     // Create series with varying tags
@@ -99,7 +99,7 @@ SEASTAR_TEST_F(PostingsBitmapTest, MultiTagIntersection) {
 }
 
 SEASTAR_TEST_F(PostingsBitmapTest, MutablePostingsVisibleBeforeFlush) {
-    NativeIndex index(timestar::StorageLayout("."), 0);
+    NativeIndex index(0);
     co_await index.open();
 
     // Insert series — mutable postings should be visible immediately
@@ -112,7 +112,7 @@ SEASTAR_TEST_F(PostingsBitmapTest, MutablePostingsVisibleBeforeFlush) {
 }
 
 SEASTAR_TEST_F(PostingsBitmapTest, PersistsAfterFlushAndCompact) {
-    NativeIndex index(timestar::StorageLayout("."), 0);
+    NativeIndex index(0);
     co_await index.open();
 
     auto id1 = co_await createSeries(index, "disk", {{"host", "server-1"}, {"dc", "dc1"}}, "iops");
@@ -137,7 +137,7 @@ SEASTAR_TEST_F(PostingsBitmapTest, PersistsAcrossReopen) {
     std::vector<SeriesId128> ids;
 
     {
-        NativeIndex index(timestar::StorageLayout("."), 0);
+        NativeIndex index(0);
         co_await index.open();
         ids.push_back(co_await createSeries(index, "mem", {{"host", "a"}}, "used"));
         ids.push_back(co_await createSeries(index, "mem", {{"host", "b"}}, "used"));
@@ -146,7 +146,7 @@ SEASTAR_TEST_F(PostingsBitmapTest, PersistsAcrossReopen) {
     }
 
     {
-        NativeIndex index(timestar::StorageLayout("."), 0);
+        NativeIndex index(0);
         co_await index.open();
 
         auto result = co_await index.findSeriesByTag("mem", "host", "a");
@@ -161,7 +161,7 @@ SEASTAR_TEST_F(PostingsBitmapTest, PersistsAcrossReopen) {
 }
 
 SEASTAR_TEST_F(PostingsBitmapTest, GroupByTagViaBitmap) {
-    NativeIndex index(timestar::StorageLayout("."), 0);
+    NativeIndex index(0);
     co_await index.open();
 
     co_await createSeries(index, "net", {{"dc", "dc1"}, {"host", "h1"}}, "bytes");
@@ -186,7 +186,7 @@ SEASTAR_TEST_F(PostingsBitmapTest, GroupByTagViaBitmap) {
 }
 
 SEASTAR_TEST_F(PostingsBitmapTest, FindSeriesWithMetadataUsesBitmaps) {
-    NativeIndex index(timestar::StorageLayout("."), 0);
+    NativeIndex index(0);
     co_await index.open();
 
     co_await createSeries(index, "cpu", {{"host", "h1"}, {"region", "west"}}, "p50");
@@ -203,7 +203,7 @@ SEASTAR_TEST_F(PostingsBitmapTest, FindSeriesWithMetadataUsesBitmaps) {
 }
 
 SEASTAR_TEST_F(PostingsBitmapTest, EmptyTagLookup) {
-    NativeIndex index(timestar::StorageLayout("."), 0);
+    NativeIndex index(0);
     co_await index.open();
 
     co_await createSeries(index, "test", {{"key", "val"}}, "field");
@@ -220,7 +220,7 @@ SEASTAR_TEST_F(PostingsBitmapTest, EmptyTagLookup) {
 }
 
 SEASTAR_TEST_F(PostingsBitmapTest, LargeScaleBitmaps) {
-    NativeIndex index(timestar::StorageLayout("."), 0);
+    NativeIndex index(0);
     co_await index.open();
 
     // Create 200 series across 4 regions
@@ -251,7 +251,7 @@ SEASTAR_TEST_F(PostingsBitmapTest, LargeScaleBitmaps) {
 }
 
 SEASTAR_TEST_F(PostingsBitmapTest, BulkInsertWithMultipleFlushes) {
-    NativeIndex index(timestar::StorageLayout("."), 0);
+    NativeIndex index(0);
     co_await index.open();
 
     // Insert 4000 series across 10 measurements (same scale as benchmark)
@@ -298,7 +298,7 @@ SEASTAR_TEST_F(PostingsBitmapTest, MigrationFromPhase1) {
     std::vector<SeriesId128> ids;
 
     {
-        NativeIndex index(timestar::StorageLayout("."), 0);
+        NativeIndex index(0);
         co_await index.open();
         ids.push_back(co_await createSeries(index, "weather", {{"city", "nyc"}}, "temp"));
         ids.push_back(co_await createSeries(index, "weather", {{"city", "sf"}}, "temp"));
@@ -308,7 +308,7 @@ SEASTAR_TEST_F(PostingsBitmapTest, MigrationFromPhase1) {
 
     // Reopen — should restore LocalIdMap from persisted data
     {
-        NativeIndex index(timestar::StorageLayout("."), 0);
+        NativeIndex index(0);
         co_await index.open();
 
         auto nyc = co_await index.findSeriesByTag("weather", "city", "nyc");

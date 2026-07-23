@@ -89,9 +89,15 @@ TEST_F(BugfixSourceInspectionTest, Bug5_InsertBatchMetrics) {
     auto fnStart = src.find("Engine::insertBatch");
     ASSERT_NE(fnStart, std::string::npos);
 
-    // Check for metrics increment within the function body (up to the next Engine:: function)
-    auto fnEnd = src.find("\nEngine::", fnStart + 20);
-    std::string fnBody = src.substr(fnStart, fnEnd != std::string::npos ? fnEnd - fnStart : 500);
+    // Extract the function body up to the next definition. Definitions here are
+    // written as "<return type> Engine::name(...)", so the previous delimiter
+    // "\nEngine::" never matched and this silently fell back to a fixed 500-char
+    // window — which made the assertion depend on how much comment text happened
+    // to sit near the top of the function. Delimit on the next template header
+    // instead, with a generous fallback.
+    auto fnEnd = src.find("\ntemplate <class T>", fnStart + 20);
+    std::string fnBody = src.substr(fnStart, fnEnd != std::string::npos ? fnEnd - fnStart : 4000);
+    ASSERT_GT(fnBody.size(), 500u) << "Failed to extract a plausible insertBatch body";
 
     EXPECT_NE(fnBody.find("_metrics.inserts_total"), std::string::npos)
         << "insertBatch must increment _metrics.inserts_total";
@@ -152,10 +158,9 @@ TEST_F(BugfixSourceInspectionTest, Bug8_WhenAllSucceedUsed) {
         // Check the surrounding context (allow when_all_succeed but not bare when_all)
         size_t lineStart = src.rfind('\n', pos);
         std::string line = src.substr(lineStart != std::string::npos ? lineStart : 0,
-                                       pos + 30 - (lineStart != std::string::npos ? lineStart : 0));
+                                      pos + 30 - (lineStart != std::string::npos ? lineStart : 0));
         if (line.find("when_all_succeed") == std::string::npos) {
-            FAIL() << "Found bare 'when_all(' (without _succeed) in tsm_compactor.cpp near: "
-                   << line;
+            FAIL() << "Found bare 'when_all(' (without _succeed) in tsm_compactor.cpp near: " << line;
         }
         pos += 9;
     }
@@ -168,9 +173,22 @@ TEST_F(BugfixSourceInspectionTest, Bug9_TempFileCleanupGuard) {
     std::string src = readFile(TSM_COMPACTOR_SOURCE_PATH);
     ASSERT_FALSE(src.empty()) << "Could not read tsm_compactor.cpp";
 
-    // The compact() function must clean up temp files on failure via catch block
-    EXPECT_NE(src.find("std::filesystem::remove(tempPath"), std::string::npos)
-        << "compact() must clean up temp files on failure in the catch block";
+    // compact() must clean up its temp file when the compaction fails, so a
+    // failed merge never leaves a partially-written .tsm behind.
+    //
+    // The cleanup used to be a blocking std::filesystem::remove() inside the
+    // catch block (GCC forbids co_await there). It is now done after the
+    // handler, via the async seastar::remove_file, preceded by closing the
+    // writer's streaming fd. Accept either spelling: the invariant under test
+    // is that the temp file is removed, not which API removes it.
+    const bool removesTempFile = src.find("seastar::remove_file(tempPath") != std::string::npos ||
+                                 src.find("std::filesystem::remove(tempPath") != std::string::npos;
+    EXPECT_TRUE(removesTempFile) << "compact() must clean up its temp file when compaction fails";
+
+    // The fd must be released before the unlink, otherwise the failure path
+    // leaks the open handle for the discarded output.
+    EXPECT_NE(src.find("abortStream()"), std::string::npos)
+        << "compact() must close the writer's streaming file handle on the failure path";
 }
 
 // ---------------------------------------------------------------------------
@@ -187,8 +205,7 @@ TEST_F(BugfixSourceInspectionTest, Bug10_WriteMemstoreUseTmpFile) {
     auto fnEnd = src.find("\nTSMFileManager::", fnStart + 30);
     std::string fnBody = src.substr(fnStart, fnEnd != std::string::npos ? fnEnd - fnStart : std::string::npos);
 
-    EXPECT_NE(fnBody.find(".tmp"), std::string::npos)
-        << "writeMemstore must write to a .tmp file first";
+    EXPECT_NE(fnBody.find(".tmp"), std::string::npos) << "writeMemstore must write to a .tmp file first";
     EXPECT_NE(fnBody.find("rename_file"), std::string::npos)
         << "writeMemstore must rename .tmp to final after successful write";
 }
@@ -207,4 +224,35 @@ TEST_F(BugfixSourceInspectionTest, Bug11_LineParserOwnsTags) {
     // Must have owning std::string tags
     EXPECT_NE(src.find("map<std::string, std::string> tags"), std::string::npos)
         << "tags must use std::string to own tag data";
+}
+
+// ---------------------------------------------------------------------------
+// Bug 12: updateTagHLL must not take a raw bitmap pointer across its
+// suspension. It suspends on kvGet before seeding; a roaring::Roaring*
+// into bitmapCache_ (a robin_map) dangles across that suspension (rehash /
+// trim). The seed source is passed as the cache KEY and re-looked-up after
+// the co_await. Seeding must also run on the deserialize branch, so a stale
+// sketch persisted below the threshold by an older version is back-filled.
+// ---------------------------------------------------------------------------
+TEST_F(BugfixSourceInspectionTest, Bug12_UpdateTagHllSeedsByKeyNotPointer) {
+    std::string hppSrc = readFile(NATIVE_INDEX_HPP_SOURCE_PATH);
+    ASSERT_FALSE(hppSrc.empty()) << "Could not read native_index.hpp";
+
+    // The declaration must not carry a raw bitmap pointer parameter.
+    EXPECT_EQ(hppSrc.find("const roaring::Roaring* seedFrom"), std::string::npos)
+        << "updateTagHLL must not take a raw pointer into bitmapCache_ (dangles across kvGet)";
+    EXPECT_NE(hppSrc.find("const std::string& seedBitmapKey"), std::string::npos)
+        << "updateTagHLL must take the bitmap cache key and re-look it up after suspending";
+
+    std::string cppSrc = readFile(NATIVE_INDEX_SOURCE_PATH);
+    ASSERT_FALSE(cppSrc.empty()) << "Could not read native_index.cpp";
+
+    auto fnStart = cppSrc.find("NativeIndex::updateTagHLL");
+    ASSERT_NE(fnStart, std::string::npos);
+    auto fnEnd = cppSrc.find("\nseastar::future", fnStart + 10);
+    std::string fnBody = cppSrc.substr(fnStart, fnEnd != std::string::npos ? fnEnd - fnStart : std::string::npos);
+
+    // The bitmap must be re-found after the suspension, not captured before it.
+    EXPECT_NE(fnBody.find("bitmapCache_.find(seedBitmapKey)"), std::string::npos)
+        << "updateTagHLL must re-look up the seed bitmap after its kvGet suspension";
 }

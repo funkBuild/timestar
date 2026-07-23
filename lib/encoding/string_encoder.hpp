@@ -55,8 +55,16 @@ public:
     // Decode with skip/count support - avoids allocating strings outside the [skipCount, skipCount+limitCount) range.
     // zstd decompression still happens on the full block (no random access), but individual string
     // copies are skipped for the first skipCount entries.
-    static void decode(Slice& encoded, size_t totalCount, size_t skipCount, size_t limitCount,
-                       std::vector<std::string>& out);
+    //
+    // APPENDS to `out` and never clears it, matching FloatDecoder/BoolEncoderRLE
+    // and the integer path: TSM decodes every block of a series into one shared
+    // flat value vector while the timestamps accumulate in a parallel vector.
+    // Clearing here desyncs that pair, and consumers index values by a TIMESTAMP
+    // index -- an out-of-bounds read, not merely a wrong answer.
+    // Returns the number of values ACTUALLY decoded (may be < limitCount if the
+    // block held fewer); the block-level caller enforces the count contract.
+    static size_t decode(Slice& encoded, size_t totalCount, size_t skipCount, size_t limitCount,
+                         std::vector<std::string>& out);
 
     // ==================== Dictionary Encoding (Phase 3) ====================
     // For low-cardinality string series, dictionary encoding stores varint IDs
@@ -95,8 +103,10 @@ public:
     // Decode dictionary-encoded block with skip/limit support. Takes the
     // dictionary entries by const-ref (no per-block copy) — callers decoding
     // many blocks of one series reuse the same dictionary vector.
-    static void decodeDictionary(Slice& encoded, size_t totalCount, size_t skipCount, size_t limitCount,
-                                 const std::vector<std::string>& dictEntries, std::vector<std::string>& out);
+    // APPENDS to `out` — see the skip/limit decode() above for why.
+    // Returns the number of values ACTUALLY decoded; see decode() above.
+    static size_t decodeDictionary(Slice& encoded, size_t totalCount, size_t skipCount, size_t limitCount,
+                                   const std::vector<std::string>& dictEntries, std::vector<std::string>& out);
 
     // Check if a block is dictionary-encoded by peeking at the magic bytes.
     static bool isDictionaryEncoded(Slice& slice);

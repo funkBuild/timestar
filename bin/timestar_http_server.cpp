@@ -11,8 +11,9 @@
 #include "http/http_stream_handler.hpp"
 #include "http/http_write_handler.hpp"
 #include "http/proto_converters.hpp"
-#include "storage/shard_store_startup.hpp"
+#include "storage/shard_rebalancer.hpp"
 #include "timestar/version.hpp"
+#include "utils/data_dir_lock.hpp"
 #include "utils/json_escape.hpp"
 #include "utils/logger.hpp"
 #include "utils/stop_signal.hpp"
@@ -45,6 +46,11 @@ using namespace httpd;
 // Global sharded engine - declared here so set_routes() can reference it.
 // (Defined before set_routes, initialized in main.)
 seastar::sharded<Engine> g_engine;
+
+// Consecutive compaction failures on any one tier before /health reports
+// "degraded". One failure can be transient; a run of them means the tier is
+// wedged and its file count is growing without bound.
+static constexpr uint64_t HEALTH_COMPACTION_FAILURE_THRESHOLD = 5;
 
 // Per-shard stream handler pointer, used to call stop() during shutdown.
 static thread_local timestar::http::HttpStreamHandler* g_streamHandler = nullptr;
@@ -91,9 +97,23 @@ void set_routes(routes& r) {
                  std::unique_ptr<seastar::http::reply> rep) -> seastar::future<std::unique_ptr<seastar::http::reply>> {
                   auto resFmt = timestar::http::responseFormat(*req);
                   if (g_ready.load(std::memory_order_acquire)) {
+                      // A tier that cannot merge is invisible until the server starts
+                      // refusing writes: the production incident this guards against ran
+                      // 15 minutes with /health saying "healthy" while compaction failed
+                      // ~6x/second and the tier grew without bound. Report "degraded"
+                      // once a tier has failed repeatedly, while still serving traffic
+                      // (200) -- the data is readable, the store just isn't compacting.
+                      const uint64_t worstFailures = g_engine.local().getMaxConsecutiveCompactionFailures();
+                      const bool compactionStuck = worstFailures >= HEALTH_COMPACTION_FAILURE_THRESHOLD;
+
                       rep->set_status(seastar::http::reply::status_type::ok);
                       if (timestar::http::isProtobuf(resFmt)) {
-                          rep->_content = timestar::proto::formatHealthResponse("healthy");
+                          rep->_content =
+                              timestar::proto::formatHealthResponse(compactionStuck ? "degraded" : "healthy");
+                      } else if (compactionStuck) {
+                          rep->_content =
+                              "{\"status\":\"degraded\",\"reason\":\"compaction_failing\",\"consecutive_failures\":" +
+                              std::to_string(worstFailures) + "}";
                       } else {
                           rep->_content = "{\"status\":\"healthy\"}";
                       }
@@ -285,29 +305,51 @@ int main(int argc, char** argv) {
             // Resolve the data root from [server] data_dir (default "." = CWD).
             // All shard directories (shard_N), placement.json and
             // shard_count.meta live under this directory.
-            const auto storageLayout = timestar::StorageLayout(timestar::dataRootPath()).anchored();
-            timestar::http_log.info("Data directory: {}", storageLayout.root().string());
+            const std::string dataRoot = timestar::dataRootPath();
+            std::filesystem::create_directories(dataRoot);
+            timestar::http_log.info("Data directory: {}", std::filesystem::absolute(dataRoot).string());
 
-            // STEP 0: Refuse unsafe legacy core-count changes before opening
-            // storage. The old automatic rebalancer cannot preserve all series
-            // metadata and is deliberately not part of normal startup.
-            timestar::ShardStoreStartupSession shardStoreStartup(storageLayout, seastar::smp::count);
-            if (!shardStoreStartup.canStart())
-                throw std::runtime_error(shardStoreStartup.failureMessage());
+            // Take an exclusive lock on the data directory before ANYTHING
+            // touches it. The shard rebalancer below rewrites shard layout on a
+            // CPU-count change, so a second instance starting here would
+            // corrupt the first one's data rather than merely race it.
+            //
+            // Held for the lifetime of the process; the kernel releases it on
+            // exit by any means, kill -9 included.
+            static timestar::DataDirLock dataDirLock;
+            try {
+                dataDirLock.acquire(dataRoot);
+            } catch (const std::exception& e) {
+                timestar::http_log.error("{}", e.what());
+                return 1;
+            }
 
-            // Initialize the local placement only after the read-only storage
-            // safety gate has accepted this core count.
+            // Initialize virtual shard placement table (Phase 5)
+            // Must be done BEFORE the rebalancer, which uses routeToCore().
             auto pt = timestar::PlacementTable::buildLocal(seastar::smp::count);
             timestar::setGlobalPlacement(std::move(pt));
+            timestar::savePlacement(dataRoot + "/placement.json");
 
-            // Revalidate under the lifetime root lock immediately before the
-            // first on-disk mutation and Engine open.
-            shardStoreStartup.authorizeFirstStorageMutation();
-            timestar::savePlacement(storageLayout.placementFile().string());
+            // STEP 0: Check for shard rebalancing (CPU count change)
+            {
+                timestar::ShardRebalancer rebalancer(dataRoot);
+                // Recover from any previously interrupted rebalance first
+                rebalancer.recoverIfNeeded(seastar::smp::count).get();
+
+                if (rebalancer.isRebalanceNeeded(seastar::smp::count)) {
+                    timestar::http_log.info("Shard count changed from {} to {}, starting rebalance...",
+                                            rebalancer.previousShardCount(), seastar::smp::count);
+                    rebalancer.execute(seastar::smp::count).get();
+                    timestar::http_log.info("Shard rebalance complete");
+                } else {
+                    // Persist current shard count for next startup
+                    timestar::ShardRebalancer::writeShardCountMeta(dataRoot, seastar::smp::count);
+                }
+            }
 
             // STEP 1: Initialize the Engine on all shards
             timestar::http_log.info("Initializing Engine on all shards...");
-            g_engine.start(storageLayout).get();
+            g_engine.start().get();
 
             // Scope guard: Seastar's sharded<> asserts in its destructor if
             // stop() was not called after a successful start().  If any step
@@ -328,13 +370,18 @@ int main(int argc, char** argv) {
                 auto queryGrp = seastar::create_scheduling_group("ts_query", ioCfg.query_shares).get();
                 auto writeGrp = seastar::create_scheduling_group("ts_write", ioCfg.write_shares).get();
                 auto compactGrp = seastar::create_scheduling_group("ts_compact", ioCfg.compaction_shares).get();
+                auto flushGrp = seastar::create_scheduling_group("ts_flush", ioCfg.flush_shares).get();
 
                 g_engine
-                    .invoke_on_all([queryGrp, writeGrp, compactGrp](Engine& engine) {
-                        engine.setIOSchedulingGroups(queryGrp, writeGrp, compactGrp);
+                    .invoke_on_all([queryGrp, writeGrp, compactGrp, flushGrp](Engine& engine) {
+                        engine.setIOSchedulingGroups(queryGrp, writeGrp, compactGrp, flushGrp);
                         return seastar::make_ready_future<>();
                     })
                     .get();
+
+                // Compaction placement depends on the groups above, so the loop
+                // starts only once they have been distributed to every shard.
+                g_engine.invoke_on_all([](Engine& engine) { return engine.startBackgroundCompaction(); }).get();
 
                 // Set back-reference so Engine can do cross-shard operations.
                 g_engine
@@ -356,9 +403,8 @@ int main(int argc, char** argv) {
                                })
                     .get();
 
-                // Persist only after complete Engine initialization. A failed
-                // fresh startup therefore does not claim a completed layout.
-                shardStoreStartup.commitEngineInitialization();
+                // Persist shard count after successful init
+                timestar::ShardRebalancer::writeShardCountMeta(dataRoot, seastar::smp::count);
                 timestar::http_log.info("Engine init completed on all shards");
             } catch (const std::bad_alloc& e) {
                 timestar::http_log.error("bad_alloc during Engine init: {}", e.what());
@@ -434,7 +480,21 @@ int main(int argc, char** argv) {
                 promConfig.prefix = "timestar";
                 seastar::prometheus::add_prometheus_routes(server->server(), promConfig).get();
 
-                server->listen(port).get();
+                // Least-connections accept balancing, NOT the kernel-hash
+                // default. SO_REUSEPORT hashes the peer 4-tuple, and with a
+                // handful of client connections (especially over loopback) all
+                // of them routinely land on ONE shard. Measured in a 6GB soak:
+                // shard 0 took all 8 connections, its reactor saturated on
+                // request parsing (main at 1000 shares), its compaction fiber
+                // (ts_compact, 10 shares) got ~1% CPU and fell 116 tier-0
+                // files behind, and the accumulated sparse indexes exhausted
+                // the shard's memory pool into a bad_alloc storm -- while
+                // shard 1 sat healthy. connection_distribution sends each new
+                // connection to the least-loaded shard instead.
+                seastar::listen_options httpLo;
+                httpLo.lba = seastar::server_socket::load_balancing_algorithm::connection_distribution;
+                httpLo.reuse_address = true;
+                server->listen(seastar::socket_address(seastar::net::inet_address("0.0.0.0"), port), httpLo).get();
             } catch (const std::exception& e) {
                 timestar::http_log.error("Failed to start HTTP server: {}", e.what());
                 // Clean up engine before exiting

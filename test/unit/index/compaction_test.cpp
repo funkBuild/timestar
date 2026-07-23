@@ -1,17 +1,17 @@
 #include "../../../lib/index/native/compaction.hpp"
-
 #include "../../../lib/index/native/manifest.hpp"
 #include "../../../lib/index/native/sstable.hpp"
+
 #include "../../seastar_gtest.hpp"
 
 #include <gtest/gtest.h>
+#include <seastar/core/coroutine.hh>
 
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
 #include <format>
 #include <map>
-#include <seastar/core/coroutine.hh>
 #include <set>
 
 using namespace timestar::index;
@@ -19,19 +19,23 @@ using namespace timestar::index;
 class CompactionTest : public ::testing::Test {
 public:
     void SetUp() override {
-        std::filesystem::remove_all(layout_.root());
+        dir_ = std::filesystem::temp_directory_path() / "timestar_compaction_test";
+        std::filesystem::remove_all(dir_);
         std::filesystem::create_directories(dir_);
     }
-    void TearDown() override { std::filesystem::remove_all(layout_.root()); }
+    void TearDown() override { std::filesystem::remove_all(dir_); }
 
-    std::string sstFilename(uint64_t fileNumber) { return layout_.nativeSstableFile(0, fileNumber).string(); }
+    std::string sstFilename(uint64_t fileNumber) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "idx_%06lu.sst", fileNumber);
+        return dir_ + "/" + buf;
+    }
 
-    const timestar::StorageLayout layout_{std::filesystem::temp_directory_path() / "timestar_compaction_test"};
-    const std::string dir_ = layout_.nativeIndexDir(0).string();
+    std::string dir_;
 };
 
 SEASTAR_TEST_F(CompactionTest, CompactFourL0Files) {
-    auto manifest = co_await Manifest::open(self->layout_, 0);
+    auto manifest = co_await Manifest::open(self->dir_);
 
     // Create 4 L0 SSTable files with interleaved keys
     for (int fileIdx = 0; fileIdx < 4; ++fileIdx) {
@@ -54,7 +58,7 @@ SEASTAR_TEST_F(CompactionTest, CompactFourL0Files) {
     // Run compaction
     CompactionConfig config;
     config.level0Threshold = 4;
-    CompactionEngine compactor(self->layout_, 0, manifest, config);
+    CompactionEngine compactor(self->dir_, manifest, config);
     co_await compactor.maybeCompact();
 
     // Should now have 0 L0 files and 1 L1 file
@@ -80,7 +84,7 @@ SEASTAR_TEST_F(CompactionTest, CompactFourL0Files) {
 }
 
 SEASTAR_TEST_F(CompactionTest, CompactAll) {
-    auto manifest = co_await Manifest::open(self->layout_, 0);
+    auto manifest = co_await Manifest::open(self->dir_);
 
     // Create 2 files with overlapping keys
     for (int fileIdx = 0; fileIdx < 2; ++fileIdx) {
@@ -98,7 +102,7 @@ SEASTAR_TEST_F(CompactionTest, CompactAll) {
         co_await manifest.addFile(meta);
     }
 
-    CompactionEngine compactor(self->layout_, 0, manifest);
+    CompactionEngine compactor(self->dir_, manifest);
     co_await compactor.compactAll();
 
     // Should merge into single file
@@ -114,12 +118,12 @@ SEASTAR_TEST_F(CompactionTest, CompactAll) {
 // Before the tiered policy, L1 grew forever (one file per 4 flushes).
 // ---------------------------------------------------------------------------
 SEASTAR_TEST_F(CompactionTest, TieredCascadeKeepsLevelsBounded) {
-    auto manifest = co_await Manifest::open(self->layout_, 0);
+    auto manifest = co_await Manifest::open(self->dir_);
 
     CompactionConfig config;
     config.level0Threshold = 4;
     config.levelThreshold = 8;
-    CompactionEngine compactor(self->layout_, 0, manifest, config);
+    CompactionEngine compactor(self->dir_, manifest, config);
 
     constexpr int kFlushes = 40;
     constexpr int kKeysPerFlush = 20;
@@ -192,7 +196,7 @@ SEASTAR_TEST_F(CompactionTest, TieredCascadeKeepsLevelsBounded) {
 // sentinels ("\0") are dropped and the deleted keys stay dead.
 // ---------------------------------------------------------------------------
 SEASTAR_TEST_F(CompactionTest, TombstoneGCOnFullCompaction) {
-    auto manifest = co_await Manifest::open(self->layout_, 0);
+    auto manifest = co_await Manifest::open(self->dir_);
 
     const std::string tombstone("\0", 1);
     const uint64_t nowNs = static_cast<uint64_t>(
@@ -225,7 +229,7 @@ SEASTAR_TEST_F(CompactionTest, TombstoneGCOnFullCompaction) {
     CompactionConfig config;
     config.level0Threshold = 4;
     config.tombstoneGracePeriodMs = 10ULL * 24 * 3600 * 1000;  // 10 days
-    CompactionEngine compactor(self->layout_, 0, manifest, config);
+    CompactionEngine compactor(self->dir_, manifest, config);
     co_await compactor.maybeCompact();  // input = all 4 live files → full compaction
 
     EXPECT_EQ(manifest.files().size(), 1u);
@@ -264,7 +268,7 @@ SEASTAR_TEST_F(CompactionTest, TombstoneGCOnFullCompaction) {
 // retain tombstones, or deleted data in the excluded file would resurrect.
 // ---------------------------------------------------------------------------
 SEASTAR_TEST_F(CompactionTest, TombstonesRetainedInPartialCompaction) {
-    auto manifest = co_await Manifest::open(self->layout_, 0);
+    auto manifest = co_await Manifest::open(self->dir_);
 
     const std::string tombstone("\0", 1);
     const uint64_t agedTimestamp = 1'000'000'000ULL;  // ancient — grace period satisfied
@@ -299,7 +303,7 @@ SEASTAR_TEST_F(CompactionTest, TombstonesRetainedInPartialCompaction) {
 
     CompactionConfig config;
     config.level0Threshold = 4;
-    CompactionEngine compactor(self->layout_, 0, manifest, config);
+    CompactionEngine compactor(self->dir_, manifest, config);
     co_await compactor.maybeCompact();  // L0→L1 only; L2 file excluded → NOT full
 
     // The tombstone must survive into the L1 output so "doomed" stays deleted.
@@ -321,7 +325,7 @@ SEASTAR_TEST_F(CompactionTest, TombstonesRetainedInPartialCompaction) {
 }
 
 SEASTAR_TEST_F(CompactionTest, NoCompactionNeeded) {
-    auto manifest = co_await Manifest::open(self->layout_, 0);
+    auto manifest = co_await Manifest::open(self->dir_);
 
     // Only 2 files — below threshold of 4
     for (int i = 0; i < 2; ++i) {
@@ -335,7 +339,7 @@ SEASTAR_TEST_F(CompactionTest, NoCompactionNeeded) {
         co_await manifest.addFile(meta);
     }
 
-    CompactionEngine compactor(self->layout_, 0, manifest);
+    CompactionEngine compactor(self->dir_, manifest);
     co_await compactor.maybeCompact();
 
     // No compaction — still 2 L0 files

@@ -41,10 +41,16 @@ HTTP POST /query
 
 - Append-only log for crash recovery
 - One WAL per shard in `shard_N/wal/`
-- Rotated when size exceeds threshold (default 16 MB)
+- Rotated when size exceeds threshold (default 64 MB)
 - Supports write, delete, and delete-range operations
 - DMA-aligned writes for Seastar async I/O
 - Adaptive compression ratio tracking for accurate capacity checks
+- Group commit (`wal_sync_mode = "always"`, the default): a write is
+  acknowledged only after its bytes are flushed and fdatasync'd; concurrent
+  writers share one flush round, so durability costs ~nothing under load.
+  `"interval"` acks immediately and flushes every `wal_sync_interval_ms`
+  (bounded loss window); `"rollover"` is the legacy volatile-until-rotation
+  behaviour, kept for benchmarking
 
 ### Memory Store
 

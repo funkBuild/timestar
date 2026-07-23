@@ -147,6 +147,44 @@ Performance-sensitive changes should be checked against the perf gates in
 
 clang-tidy is configured for the project and is expected to be clean for new code.
 
+## Releases
+
+Releases are cut from a git tag; the tag is the single source of truth for the
+version. **Do not hand-edit the `VERSION` file as part of a release** — the
+release workflow stamps it for you.
+
+To publish `1.2.3`:
+
+```bash
+git tag v1.2.3 && git push origin v1.2.3
+# then publish a GitHub Release for that tag
+```
+
+Publishing the release triggers `.github/workflows/docker-publish.yml`, which:
+
+1. Validates the tag is `MAJOR.MINOR.PATCH[-PRERELEASE]`, rejecting it otherwise.
+2. Stamps the version and commit into the build via
+   `-DTIMESTAR_VERSION_OVERRIDE` / `-DTIMESTAR_GIT_COMMIT_OVERRIDE`, so the
+   compiled binary is versioned from the tag rather than from a checked-in file.
+3. Builds the image locally and runs `timestar_http_server --version` inside it,
+   **failing the deploy if the reported version does not match the tag.** Nothing
+   is pushed to Docker Hub until this passes.
+4. Pushes the image tags. Prereleases publish only their exact version — they do
+   not move `latest`, `MAJOR`, or `MAJOR.MINOR`.
+5. Commits `chore(release): X.Y.Z` back to the default branch so `VERSION` on
+   main always reflects the last published release.
+
+This exists because `VERSION` was previously bumped by hand: v1.2.2 shipped with
+`1.2.1` compiled into the binary. Step 3 is the gate that makes that class of
+mistake unshippable rather than merely discouraged.
+
+`TIMESTAR_VERSION_OVERRIDE` is a release-automation hook. Local builds should
+leave it unset and let cmake read `VERSION` and `git describe` as usual.
+
+To re-publish or rehearse an existing tag, run the workflow manually
+(`workflow_dispatch`) with that tag; tick **dry_run** to build and verify without
+pushing or touching main.
+
 ## Seastar Notes
 
 - All I/O returns `seastar::future<>` and uses `co_await`

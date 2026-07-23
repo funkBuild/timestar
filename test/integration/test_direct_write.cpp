@@ -15,7 +15,7 @@ protected:
 };
 
 seastar::future<> testDirectWriteLargeTimestamp() {
-    Engine engine(timestar::StorageLayout("."));
+    Engine engine;
     co_await engine.init();
 
     std::cout << "Testing direct engine write..." << std::endl;

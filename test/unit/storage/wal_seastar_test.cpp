@@ -1,5 +1,6 @@
 // Seastar-based tests for WAL write and recovery operations
 
+#include "../../../lib/config/timestar_config.hpp"
 #include "../../../lib/core/timestar_value.hpp"
 #include "../../../lib/storage/memory_store.hpp"
 #include "../../../lib/storage/wal.hpp"
@@ -12,10 +13,9 @@
 #include <memory>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/when_all.hh>
+#include <seastar/util/defer.hh>
 
 namespace fs = std::filesystem;
-
-static const timestar::StorageLayout kDefaultWalTestLayout(".");
 
 class WALSeastarTest : public ::testing::Test {
 protected:
@@ -47,7 +47,7 @@ seastar::future<> testWALWriteAndRecoverFloat() {
     auto store = std::make_shared<MemoryStore>(sequenceNumber);
 
     {
-        WAL wal(kDefaultWalTestLayout, 0, sequenceNumber);
+        WAL wal(sequenceNumber);
         co_await wal.init(store.get());
 
         TimeStarInsert<double> insert("temperature", "sensor1");
@@ -61,7 +61,7 @@ seastar::future<> testWALWriteAndRecoverFloat() {
 
     auto recoveredStore = std::make_shared<MemoryStore>(sequenceNumber);
     {
-        std::string walFile = WAL::sequenceNumberToFilename(kDefaultWalTestLayout, 0, sequenceNumber);
+        std::string walFile = WAL::sequenceNumberToFilename(sequenceNumber);
         WALReader reader(walFile);
         co_await reader.readAll(recoveredStore.get());
     }
@@ -85,40 +85,12 @@ TEST_F(WALSeastarTest, WriteAndRecoverFloatData) {
     testWALWriteAndRecoverFloat().get();
 }
 
-seastar::future<> testWALUsesInjectedRootAndWorkerForIO() {
-    const timestar::StorageLayout layout("tenant data/node-a");
-    constexpr unsigned workerId = 7;
-    constexpr unsigned sequenceNumber = 404;
-    auto store = std::make_shared<MemoryStore>(sequenceNumber);
-
-    co_await store->initWAL(layout, workerId);
-
-    TimeStarInsert<double> insert("injected_wal", "value");
-    insert.addValue(1000, 42.0);
-    const auto seriesId = insert.seriesId128();
-    EXPECT_FALSE(co_await store->insert(insert));
-    co_await store->close();
-
-    const auto walPath = layout.walFile(workerId, sequenceNumber);
-    EXPECT_TRUE(fs::is_regular_file(walPath));
-    EXPECT_FALSE(fs::exists("shard_7"));
-
-    auto recoveredStore = std::make_shared<MemoryStore>(sequenceNumber);
-    WALReader reader(walPath.string());
-    co_await reader.readAll(recoveredStore.get());
-    EXPECT_NE(recoveredStore->series.find(seriesId), recoveredStore->series.end());
-}
-
-TEST_F(WALSeastarTest, InjectedRootAndWorkerControlRealIO) {
-    testWALUsesInjectedRootAndWorkerForIO().get();
-}
-
 seastar::future<> testWALWriteAndRecoverBoolean() {
     unsigned int sequenceNumber = 2;
     auto store = std::make_shared<MemoryStore>(sequenceNumber);
 
     {
-        WAL wal(kDefaultWalTestLayout, 0, sequenceNumber);
+        WAL wal(sequenceNumber);
         co_await wal.init(store.get());
 
         TimeStarInsert<bool> insert("door", "open");
@@ -133,7 +105,7 @@ seastar::future<> testWALWriteAndRecoverBoolean() {
 
     auto recoveredStore = std::make_shared<MemoryStore>(sequenceNumber);
     {
-        std::string walFile = WAL::sequenceNumberToFilename(kDefaultWalTestLayout, 0, sequenceNumber);
+        std::string walFile = WAL::sequenceNumberToFilename(sequenceNumber);
         WALReader reader(walFile);
         co_await reader.readAll(recoveredStore.get());
     }
@@ -163,7 +135,7 @@ seastar::future<> testWALWriteAndRecoverString() {
     auto store = std::make_shared<MemoryStore>(sequenceNumber);
 
     {
-        WAL wal(kDefaultWalTestLayout, 0, sequenceNumber);
+        WAL wal(sequenceNumber);
         co_await wal.init(store.get());
 
         TimeStarInsert<std::string> insert("message", "log");
@@ -177,7 +149,7 @@ seastar::future<> testWALWriteAndRecoverString() {
 
     auto recoveredStore = std::make_shared<MemoryStore>(sequenceNumber);
     {
-        std::string walFile = WAL::sequenceNumberToFilename(kDefaultWalTestLayout, 0, sequenceNumber);
+        std::string walFile = WAL::sequenceNumberToFilename(sequenceNumber);
         WALReader reader(walFile);
         co_await reader.readAll(recoveredStore.get());
     }
@@ -206,7 +178,7 @@ seastar::future<> testWALBatchInsert() {
     auto store = std::make_shared<MemoryStore>(sequenceNumber);
 
     {
-        WAL wal(kDefaultWalTestLayout, 0, sequenceNumber);
+        WAL wal(sequenceNumber);
         co_await wal.init(store.get());
 
         std::vector<TimeStarInsert<double>> batch;
@@ -232,7 +204,7 @@ seastar::future<> testWALBatchInsert() {
 
     auto recoveredStore = std::make_shared<MemoryStore>(sequenceNumber);
     {
-        std::string walFile = WAL::sequenceNumberToFilename(kDefaultWalTestLayout, 0, sequenceNumber);
+        std::string walFile = WAL::sequenceNumberToFilename(sequenceNumber);
         WALReader reader(walFile);
         co_await reader.readAll(recoveredStore.get());
     }
@@ -261,7 +233,7 @@ seastar::future<> testWALMultipleSeries() {
     auto store = std::make_shared<MemoryStore>(sequenceNumber);
 
     {
-        WAL wal(kDefaultWalTestLayout, 0, sequenceNumber);
+        WAL wal(sequenceNumber);
         co_await wal.init(store.get());
 
         TimeStarInsert<double> temp("weather", "temperature");
@@ -287,7 +259,7 @@ seastar::future<> testWALMultipleSeries() {
 
     auto recoveredStore = std::make_shared<MemoryStore>(sequenceNumber);
     {
-        std::string walFile = WAL::sequenceNumberToFilename(kDefaultWalTestLayout, 0, sequenceNumber);
+        std::string walFile = WAL::sequenceNumberToFilename(sequenceNumber);
         WALReader reader(walFile);
         co_await reader.readAll(recoveredStore.get());
     }
@@ -306,7 +278,7 @@ seastar::future<> testWALDeleteRange() {
     auto store = std::make_shared<MemoryStore>(sequenceNumber);
 
     {
-        WAL wal(kDefaultWalTestLayout, 0, sequenceNumber);
+        WAL wal(sequenceNumber);
         co_await wal.init(store.get());
 
         TimeStarInsert<double> insert("metrics", "value");
@@ -325,7 +297,7 @@ seastar::future<> testWALDeleteRange() {
 
     auto recoveredStore = std::make_shared<MemoryStore>(sequenceNumber);
     {
-        std::string walFile = WAL::sequenceNumberToFilename(kDefaultWalTestLayout, 0, sequenceNumber);
+        std::string walFile = WAL::sequenceNumberToFilename(sequenceNumber);
         WALReader reader(walFile);
         co_await reader.readAll(recoveredStore.get());
     }
@@ -358,7 +330,7 @@ seastar::future<> testCRC32RoundtripFloat() {
     auto store = std::make_shared<MemoryStore>(sequenceNumber);
 
     {
-        WAL wal(kDefaultWalTestLayout, 0, sequenceNumber);
+        WAL wal(sequenceNumber);
         co_await wal.init(store.get());
 
         TimeStarInsert<double> insert("crc_test", "value");
@@ -373,7 +345,7 @@ seastar::future<> testCRC32RoundtripFloat() {
     // Recover and verify data integrity
     auto recoveredStore = std::make_shared<MemoryStore>(sequenceNumber);
     {
-        std::string walFile = WAL::sequenceNumberToFilename(kDefaultWalTestLayout, 0, sequenceNumber);
+        std::string walFile = WAL::sequenceNumberToFilename(sequenceNumber);
         WALReader reader(walFile);
         co_await reader.readAll(recoveredStore.get());
     }
@@ -402,7 +374,7 @@ seastar::future<> testCRC32CorruptionDetection() {
     auto store = std::make_shared<MemoryStore>(sequenceNumber);
 
     {
-        WAL wal(kDefaultWalTestLayout, 0, sequenceNumber);
+        WAL wal(sequenceNumber);
         co_await wal.init(store.get());
 
         TimeStarInsert<double> insert("corrupt_test", "value");
@@ -414,7 +386,7 @@ seastar::future<> testCRC32CorruptionDetection() {
 
     // Corrupt a payload byte in the WAL file
     {
-        std::string walFile = WAL::sequenceNumberToFilename(kDefaultWalTestLayout, 0, sequenceNumber);
+        std::string walFile = WAL::sequenceNumberToFilename(sequenceNumber);
         // Read the file, flip a byte in the payload area (after length + CRC = 8 bytes),
         // then write it back
         std::ifstream fin(walFile, std::ios::binary);
@@ -434,7 +406,7 @@ seastar::future<> testCRC32CorruptionDetection() {
     // Recovery should detect corruption and discard the entry
     auto recoveredStore = std::make_shared<MemoryStore>(sequenceNumber);
     {
-        std::string walFile = WAL::sequenceNumberToFilename(kDefaultWalTestLayout, 0, sequenceNumber);
+        std::string walFile = WAL::sequenceNumberToFilename(sequenceNumber);
         WALReader reader(walFile);
         co_await reader.readAll(recoveredStore.get());
     }
@@ -453,8 +425,19 @@ seastar::future<> testCRC32PartialCorruption() {
     unsigned int sequenceNumber = 202;
     auto store = std::make_shared<MemoryStore>(sequenceNumber);
 
+    // This test corrupts the file by RAW BYTE OFFSET, assuming entry 2 starts
+    // immediately after entry 1.  Group commit (wal_sync_mode="always", the
+    // default) inserts alignment padding between per-insert flush rounds,
+    // which would put the corruption inside padding instead of entry 2 — so
+    // pin the legacy contiguous layout for the duration of this test.
+    const auto savedConfig = timestar::config();
+    auto cfg = savedConfig;
+    cfg.storage.wal_sync_mode = "rollover";
+    timestar::setGlobalConfig(cfg);
+    auto restoreConfig = seastar::defer([&savedConfig]() noexcept { timestar::setGlobalConfig(savedConfig); });
+
     {
-        WAL wal(kDefaultWalTestLayout, 0, sequenceNumber);
+        WAL wal(sequenceNumber);
         co_await wal.init(store.get());
 
         // Write two entries
@@ -471,7 +454,7 @@ seastar::future<> testCRC32PartialCorruption() {
 
     // Corrupt only the second entry by finding its CRC and breaking it
     {
-        std::string walFile = WAL::sequenceNumberToFilename(kDefaultWalTestLayout, 0, sequenceNumber);
+        std::string walFile = WAL::sequenceNumberToFilename(sequenceNumber);
         std::ifstream fin(walFile, std::ios::binary);
         std::vector<char> contents((std::istreambuf_iterator<char>(fin)), std::istreambuf_iterator<char>());
         fin.close();
@@ -498,7 +481,7 @@ seastar::future<> testCRC32PartialCorruption() {
     // Recovery: first entry should survive, second should be discarded
     auto recoveredStore = std::make_shared<MemoryStore>(sequenceNumber);
     {
-        std::string walFile = WAL::sequenceNumberToFilename(kDefaultWalTestLayout, 0, sequenceNumber);
+        std::string walFile = WAL::sequenceNumberToFilename(sequenceNumber);
         WALReader reader(walFile);
         co_await reader.readAll(recoveredStore.get());
     }
@@ -532,7 +515,7 @@ seastar::future<> testCRC32BatchInsertRoundtrip() {
     auto store = std::make_shared<MemoryStore>(sequenceNumber);
 
     {
-        WAL wal(kDefaultWalTestLayout, 0, sequenceNumber);
+        WAL wal(sequenceNumber);
         co_await wal.init(store.get());
 
         std::vector<TimeStarInsert<double>> batch;
@@ -553,7 +536,7 @@ seastar::future<> testCRC32BatchInsertRoundtrip() {
 
     auto recoveredStore = std::make_shared<MemoryStore>(sequenceNumber);
     {
-        std::string walFile = WAL::sequenceNumberToFilename(kDefaultWalTestLayout, 0, sequenceNumber);
+        std::string walFile = WAL::sequenceNumberToFilename(sequenceNumber);
         WALReader reader(walFile);
         co_await reader.readAll(recoveredStore.get());
     }
@@ -592,7 +575,7 @@ seastar::future<> testCRC32DeleteRangeRoundtrip() {
     auto store = std::make_shared<MemoryStore>(sequenceNumber);
 
     {
-        WAL wal(kDefaultWalTestLayout, 0, sequenceNumber);
+        WAL wal(sequenceNumber);
         co_await wal.init(store.get());
 
         TimeStarInsert<double> insert("crc_del", "value");
@@ -609,7 +592,7 @@ seastar::future<> testCRC32DeleteRangeRoundtrip() {
 
     auto recoveredStore = std::make_shared<MemoryStore>(sequenceNumber);
     {
-        std::string walFile = WAL::sequenceNumberToFilename(kDefaultWalTestLayout, 0, sequenceNumber);
+        std::string walFile = WAL::sequenceNumberToFilename(sequenceNumber);
         WALReader reader(walFile);
         co_await reader.readAll(recoveredStore.get());
     }
@@ -645,7 +628,7 @@ seastar::future<> testPaddingRecoveryWithImmediateFlush() {
 
     const int numEntries = 5;
     {
-        WAL wal(kDefaultWalTestLayout, 0, sequenceNumber);
+        WAL wal(sequenceNumber);
         co_await wal.init(store.get());
         wal.setImmediateFlush(true);
 
@@ -659,7 +642,7 @@ seastar::future<> testPaddingRecoveryWithImmediateFlush() {
 
     auto recoveredStore = std::make_shared<MemoryStore>(sequenceNumber);
     {
-        std::string walFile = WAL::sequenceNumberToFilename(kDefaultWalTestLayout, 0, sequenceNumber);
+        std::string walFile = WAL::sequenceNumberToFilename(sequenceNumber);
         WALReader reader(walFile);
         co_await reader.readAll(recoveredStore.get());
     }
@@ -684,7 +667,7 @@ seastar::future<> testPaddingRecoveryEntryLengthWithZeroLowByte() {
 
     const int numEntries = 256;
     {
-        WAL wal(kDefaultWalTestLayout, 0, sequenceNumber);
+        WAL wal(sequenceNumber);
         co_await wal.init(store.get());
         wal.setImmediateFlush(true);
 
@@ -701,7 +684,7 @@ seastar::future<> testPaddingRecoveryEntryLengthWithZeroLowByte() {
 
     auto recoveredStore = std::make_shared<MemoryStore>(sequenceNumber);
     {
-        std::string walFile = WAL::sequenceNumberToFilename(kDefaultWalTestLayout, 0, sequenceNumber);
+        std::string walFile = WAL::sequenceNumberToFilename(sequenceNumber);
         WALReader reader(walFile);
         co_await reader.readAll(recoveredStore.get());
     }
@@ -724,7 +707,7 @@ seastar::future<> testPaddingRecoveryMixedTypes() {
     auto store = std::make_shared<MemoryStore>(sequenceNumber);
 
     {
-        WAL wal(kDefaultWalTestLayout, 0, sequenceNumber);
+        WAL wal(sequenceNumber);
         co_await wal.init(store.get());
         wal.setImmediateFlush(true);
 
@@ -749,7 +732,7 @@ seastar::future<> testPaddingRecoveryMixedTypes() {
 
     auto recoveredStore = std::make_shared<MemoryStore>(sequenceNumber);
     {
-        std::string walFile = WAL::sequenceNumberToFilename(kDefaultWalTestLayout, 0, sequenceNumber);
+        std::string walFile = WAL::sequenceNumberToFilename(sequenceNumber);
         WALReader reader(walFile);
         co_await reader.readAll(recoveredStore.get());
     }
@@ -829,7 +812,7 @@ seastar::future<> testFinalFlushAfterBufferedInserts() {
     auto store = std::make_shared<MemoryStore>(sequenceNumber);
 
     {
-        WAL wal(kDefaultWalTestLayout, 0, sequenceNumber);
+        WAL wal(sequenceNumber);
         co_await wal.init(store.get());
         // Do NOT set immediate flush — writes accumulate in the stream buffer.
         // _unflushed_bytes must be incremented by each insert() call so that
@@ -850,7 +833,7 @@ seastar::future<> testFinalFlushAfterBufferedInserts() {
 
     auto recoveredStore = std::make_shared<MemoryStore>(sequenceNumber);
     {
-        std::string walFile = WAL::sequenceNumberToFilename(kDefaultWalTestLayout, 0, sequenceNumber);
+        std::string walFile = WAL::sequenceNumberToFilename(sequenceNumber);
         WALReader reader(walFile);
         co_await reader.readAll(recoveredStore.get());
     }
@@ -885,7 +868,7 @@ seastar::future<> testUnflushedBytesAccumulatesAcrossMultipleInserts() {
     const int N = 7;  // odd number to ensure non-zero remainder mod DMA alignment
 
     {
-        WAL wal(kDefaultWalTestLayout, 0, sequenceNumber);
+        WAL wal(sequenceNumber);
         co_await wal.init(store.get());
 
         for (int i = 0; i < N; i++) {
@@ -904,7 +887,7 @@ seastar::future<> testUnflushedBytesAccumulatesAcrossMultipleInserts() {
 
     auto recoveredStore = std::make_shared<MemoryStore>(sequenceNumber);
     {
-        std::string walFile = WAL::sequenceNumberToFilename(kDefaultWalTestLayout, 0, sequenceNumber);
+        std::string walFile = WAL::sequenceNumberToFilename(sequenceNumber);
         WALReader reader(walFile);
         co_await reader.readAll(recoveredStore.get());
     }
@@ -928,7 +911,7 @@ seastar::future<> testUnflushedBytesAfterBatchInsert() {
     auto store = std::make_shared<MemoryStore>(sequenceNumber);
 
     {
-        WAL wal(kDefaultWalTestLayout, 0, sequenceNumber);
+        WAL wal(sequenceNumber);
         co_await wal.init(store.get());
 
         std::vector<TimeStarInsert<double>> batch;
@@ -948,7 +931,7 @@ seastar::future<> testUnflushedBytesAfterBatchInsert() {
 
     auto recoveredStore = std::make_shared<MemoryStore>(sequenceNumber);
     {
-        std::string walFile = WAL::sequenceNumberToFilename(kDefaultWalTestLayout, 0, sequenceNumber);
+        std::string walFile = WAL::sequenceNumberToFilename(sequenceNumber);
         WALReader reader(walFile);
         co_await reader.readAll(recoveredStore.get());
     }
@@ -971,7 +954,7 @@ seastar::future<> testUnflushedBytesAfterDeleteRange() {
     auto store = std::make_shared<MemoryStore>(sequenceNumber);
 
     {
-        WAL wal(kDefaultWalTestLayout, 0, sequenceNumber);
+        WAL wal(sequenceNumber);
         co_await wal.init(store.get());
 
         TimeStarInsert<double> insert("del_range_unflushed", "value");
@@ -992,7 +975,7 @@ seastar::future<> testUnflushedBytesAfterDeleteRange() {
 
     auto recoveredStore = std::make_shared<MemoryStore>(sequenceNumber);
     {
-        std::string walFile = WAL::sequenceNumberToFilename(kDefaultWalTestLayout, 0, sequenceNumber);
+        std::string walFile = WAL::sequenceNumberToFilename(sequenceNumber);
         WALReader reader(walFile);
         co_await reader.readAll(recoveredStore.get());
     }
@@ -1024,7 +1007,7 @@ seastar::future<> testUnflushedBytesResetAndReaccumulate() {
     auto store = std::make_shared<MemoryStore>(sequenceNumber);
 
     {
-        WAL wal(kDefaultWalTestLayout, 0, sequenceNumber);
+        WAL wal(sequenceNumber);
         co_await wal.init(store.get());
 
         // First group of writes + flush
@@ -1050,7 +1033,7 @@ seastar::future<> testUnflushedBytesResetAndReaccumulate() {
 
     auto recoveredStore = std::make_shared<MemoryStore>(sequenceNumber);
     {
-        std::string walFile = WAL::sequenceNumberToFilename(kDefaultWalTestLayout, 0, sequenceNumber);
+        std::string walFile = WAL::sequenceNumberToFilename(sequenceNumber);
         WALReader reader(walFile);
         co_await reader.readAll(recoveredStore.get());
     }
@@ -1075,7 +1058,7 @@ seastar::future<> testConcurrentInsertsNoDataLoss() {
     auto store = std::make_shared<MemoryStore>(sequenceNumber);
 
     {
-        WAL wal(kDefaultWalTestLayout, 0, sequenceNumber);
+        WAL wal(sequenceNumber);
         co_await wal.init(store.get());
 
         // Launch NUM_CONCURRENT insert coroutines simultaneously.
@@ -1107,7 +1090,7 @@ seastar::future<> testConcurrentInsertsNoDataLoss() {
     // Recover from the WAL and verify ALL series are present with correct data
     auto recoveredStore = std::make_shared<MemoryStore>(sequenceNumber);
     {
-        std::string walFile = WAL::sequenceNumberToFilename(kDefaultWalTestLayout, 0, sequenceNumber);
+        std::string walFile = WAL::sequenceNumberToFilename(sequenceNumber);
         WALReader reader(walFile);
         co_await reader.readAll(recoveredStore.get());
     }

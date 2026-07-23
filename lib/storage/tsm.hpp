@@ -19,6 +19,7 @@
 #include <seastar/core/file.hh>
 #include <seastar/core/semaphore.hh>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <tuple>
 #include <unordered_map>
@@ -87,9 +88,13 @@ struct BlockBatch {
 
 // Sparse index entry for lazy loading
 struct SparseIndexEntry {
-    SeriesId128 seriesId;     // 16 bytes - for hash map key
-    uint64_t fileOffset;      // 8 bytes - where to read in file
-    uint32_t entrySize;       // 4 bytes - how much to read
+    SeriesId128 seriesId;  // 16 bytes - for hash map key
+    uint64_t fileOffset;   // 8 bytes - where to read in file
+    // In-memory only (not serialized). uint64 so it cannot become the real
+    // ceiling now that blockCount is uint32: as a uint32 it capped a series at
+    // UINT32_MAX/80 = ~53.7M blocks per file, 80x below what the widened
+    // blockCount field can express.
+    uint64_t entrySize;
     TSMValueType seriesType;  // series value type (captured during sparse index parse)
     // Per-series time bounds (parsed from first/last block during sparse index load).
     // Enables skipping entire files for time-filtered queries without loading the
@@ -119,6 +124,27 @@ struct TSMIndexEntry {
 };
 
 namespace timestar {
+
+// A block whose decoded value count does not match its timestamp count.
+//
+// THE CONTRACT, in one place: a block declares how many points it holds, the
+// timestamp decoder is trimmed to that count, and every value decoder is then
+// asked for exactly as many values as timestamps survived the time filter.
+//   produced > expected -> benign, truncate (a decoder that works in fixed-size
+//                          groups can legitimately overshoot the tail)
+//   produced < expected -> the block is corrupt or a decoder regressed. There is
+//                          no safe repair: pairing values[i] with timestamps[i]
+//                          past the shortfall MISPAIRS real data, which is worse
+//                          than returning nothing.
+//
+// Raised rather than silently dropping the block, because a short read that
+// still reports success is the silent-partial-answer failure this codebase
+// already rejects elsewhere (see QUERY_INCOMPLETE).
+class BlockDecodeError : public std::runtime_error {
+public:
+    explicit BlockDecodeError(const std::string& what) : std::runtime_error(what) {}
+};
+
 // Heap-size estimate for the byte-budgeted full-index LRU cache. Counts the
 // index-block array and any string-dictionary strings (the generic LRUCache
 // adds its own list-node/map overhead on top).
@@ -139,8 +165,21 @@ struct CacheSizeEstimator<::TSMIndexEntry> {
 // TSM file format version.
 // V1: Float blocks have stats (80 bytes), non-Float blocks are base-only (28 bytes).
 // V2: All types have block stats (Float=80, Integer=72, Boolean=40, String=32).
-static constexpr uint8_t TSM_VERSION = 2;
-static constexpr uint8_t TSM_VERSION_MIN = 1;  // oldest version we can read
+// V3: per-series index block count widened from uint16 to uint32.
+static constexpr uint8_t TSM_VERSION = 3;
+// Oldest version we can READ. Dropping V2 readability would orphan every
+// pre-V3 file on upgrade (data invisible to queries, file never compacted or
+// reclaimed) — V2 files stay readable and are rewritten as V3 by compaction.
+static constexpr uint8_t TSM_VERSION_MIN = 2;
+
+// Fixed part of an index entry: SeriesId128 (16) + type (1) + block count.
+// Blocks and the optional string dictionary follow. V3 widened the block
+// count from uint16 to uint32; readers must size and parse by file version.
+static constexpr uint32_t TSM_INDEX_ENTRY_HEADER_SIZE = 16 + 1 + 4;
+static constexpr uint32_t TSM_INDEX_ENTRY_HEADER_SIZE_V2 = 16 + 1 + 2;
+inline uint32_t tsmIndexEntryHeaderSize(uint8_t fileVersion) {
+    return fileVersion >= 3 ? TSM_INDEX_ENTRY_HEADER_SIZE : TSM_INDEX_ENTRY_HEADER_SIZE_V2;
+}
 
 // Per-type index block byte size for V2 files.
 // V1 files: Float=80, all others=28 (no stats).
@@ -169,11 +208,19 @@ inline size_t indexBlockBytes(TSMValueType type, uint8_t version) {
 }
 
 class TSM {
+public:
+    // Path of the backing file. Exposed so diagnostics can name the specific
+    // files involved in a fault (e.g. a type conflict between two inputs to a
+    // compaction) rather than leaving an operator to guess.
+    const std::string& getFilePath() const { return filePath; }
+
 private:
     std::string filePath;
     seastar::file tsmFile;
     uint64_t length = 0;
-    uint8_t fileVersion = 1;
+    // Defaults to the current version: a truncated header must never leave this
+    // at 1 and silently select the V1 index-block layout.
+    uint8_t fileVersion = TSM_VERSION;
     // Set by scheduleDelete(): the on-disk file was unlinked but the fd must
     // stay open for in-flight snapshot readers; the destructor closes it.
     bool deferCloseOnDestroy_ = false;
@@ -194,7 +241,7 @@ private:
     // into a TSMIndexEntry.  The Slice must be positioned just after the series type
     // and block-count fields have already been read.  On return the Slice offset is
     // advanced past all block data and the optional string dictionary.
-    void parseIndexBlocksFromSlice(Slice& indexSlice, TSMIndexEntry& entry, uint16_t blockCount) const;
+    void parseIndexBlocksFromSlice(Slice& indexSlice, TSMIndexEntry& entry, uint32_t blockCount) const;
 
     // Value-type dispatch for pushdown aggregation: decode one block as the
     // series' runtime type (Float/Integer/Boolean) and hand the decoded points
@@ -226,11 +273,72 @@ private:
     // Helper to get tombstone file path
     std::string getTombstonePath() const;
 
+    // Rethrow the in-flight exception with this file's path appended, so a
+    // read/decode failure names the file it came from — without this, a
+    // corrupt-block error (e.g. "CompressedSlice - attempted to read beyond
+    // buffer bounds") reaches the query drop log with no way to identify
+    // which TSM file to pull for investigation.  bad_alloc passes through
+    // untouched: recovery paths key on its exact type (see
+    // queryNonNumericBucketedChunked).  Idempotent — a message that already
+    // carries a "[tsm " marker is rethrown unchanged, so nested annotated
+    // entry points (aggregateSeriesSelective over readSingleBlock) do not
+    // stack file suffixes.
+    [[noreturn]] void rethrowWithFilePath() const;
+
+    // --- Cross-series DMA read coalescing (the read elevator) ---
+    // A many-series query runs up to 64 series concurrently, and each
+    // (series, file) pair issues its own data-block DMA read — thousands of
+    // small random reads per query on IOPS-billed storage, even though the
+    // wanted ranges are frequently adjacent in the file (series regions are
+    // laid out back to back).  coalescedDmaRead() queues the request and
+    // defers ONE dispatcher to the end of the current task-queue run: every
+    // read requested by concurrently-running series in that window is sorted
+    // by offset, merged across small gaps, and issued as a few large reads;
+    // each requester gets a zero-copy share() view of the merged buffer.
+    // Single-request rounds degenerate to exactly one read plus a yield hop.
+    //
+    // Lifetime: every pending request has a caller co_awaiting its future,
+    // and query callers hold shared_ptr<TSM> across that await, so `this`
+    // cannot die while the detached dispatch continuation is outstanding.
+    // The dispatcher resolves EVERY pending promise (value or exception).
+    struct PendingDmaRead {
+        uint64_t offset = 0;
+        uint64_t size = 0;
+        seastar::promise<seastar::temporary_buffer<uint8_t>> done;
+    };
+    std::vector<std::unique_ptr<PendingDmaRead>> _pendingDmaReads;
+    bool _dmaDispatchScheduled = false;
+    seastar::future<seastar::temporary_buffer<uint8_t>> coalescedDmaRead(uint64_t offset, uint64_t size);
+    seastar::future<> dispatchPendingDmaReads();
+
+    // Un-annotated bodies of the public read entry points below.  The public
+    // methods are thin wrappers that route any failure through
+    // rethrowWithFilePath(); keeping the bodies separate avoids wrapping
+    // hundreds of coroutine lines in try/catch.
+    template <class T>
+    seastar::future<std::unique_ptr<TSMBlock<T>>> readSingleBlockImpl(const TSMIndexBlock& indexBlock,
+                                                                      uint64_t startTime, uint64_t endTime,
+                                                                      const std::vector<std::string>* stringDict);
+    seastar::future<size_t> aggregateSeriesImpl(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime,
+                                                timestar::BlockAggregator& aggregator, seastar::semaphore* ioSem);
+    seastar::future<size_t> aggregateSeriesSelectiveImpl(const SeriesId128& seriesId, uint64_t startTime,
+                                                         uint64_t endTime, timestar::BlockAggregator& aggregator,
+                                                         bool reverse, size_t maxPoints);
+    seastar::future<size_t> aggregateSeriesBucketedImpl(const SeriesId128& seriesId, uint64_t startTime,
+                                                        uint64_t endTime, timestar::BlockAggregator& aggregator,
+                                                        bool reverse, uint64_t interval,
+                                                        std::unordered_set<uint64_t>& filledBuckets,
+                                                        size_t totalBuckets);
+
 public:
     uint64_t tierNum;
     uint64_t seqNum;
     // Newest write generation contained in this file (last-write-wins dedup).
-    // Flush-created files: == seqNum (flush order == write order per shard).
+    // Flush-created files: == seqNum, reserved at ROLLOVER time (the last
+    // point where store write order is serialized) rather than at write time
+    // -- conversions run concurrently and finish out of order, so a
+    // write-time seq would let an older store outrank a newer one. See
+    // TSMFileManager::reserveSequenceId().
     // Compaction outputs: max(dataSeq) of the inputs, carried in the filename
     // as a `_d<N>` suffix — a fresh seqNum would wrongly outrank newer
     // tier-0 files whose data was written later.  Legacy files without the
@@ -352,6 +460,19 @@ public:
             ids.push_back(id);
         }
         return ids;
+    }
+
+    // Series count without materializing the id list (compaction sizing).
+    size_t getSeriesCount() const { return sparseIndex.size(); }
+
+    // Visit every series id without copying the list. At high cardinality
+    // getSeriesIds() is a 16 B x series allocation per call — the compaction
+    // set-union path used to pay it twice per file (once just for .size()).
+    template <typename Fn>
+    void forEachSeriesId(Fn&& fn) const {
+        for (const auto& [id, entry] : sparseIndex) {
+            fn(id);
+        }
     }
 
     // Get file size for compaction planning

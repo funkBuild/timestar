@@ -72,6 +72,11 @@ FROM deps AS builder
 
 ARG ENABLE_LTO=OFF
 
+# Release CI stamps these from the git tag and commit being released. Left empty
+# for local builds, where cmake falls back to the VERSION file and `git describe`.
+ARG TIMESTAR_VERSION=
+ARG TIMESTAR_GIT_COMMIT=
+
 WORKDIR /src
 COPY . .
 
@@ -89,6 +94,8 @@ RUN mkdir -p build && cd build && \
       -DTIMESTAR_ENABLE_LTO=${ENABLE_LTO} \
       -DTIMESTAR_NATIVE_ARCH=OFF \
       -DTIMESTAR_BUILD_TESTS=OFF \
+      -DTIMESTAR_VERSION_OVERRIDE="${TIMESTAR_VERSION}" \
+      -DTIMESTAR_GIT_COMMIT_OVERRIDE="${TIMESTAR_GIT_COMMIT}" \
     && ninja -j$(nproc) timestar_http_server
 
 # Strip debug symbols — shrinks binary from ~500 MB to ~20 MB

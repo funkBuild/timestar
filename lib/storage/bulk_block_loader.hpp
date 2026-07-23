@@ -29,6 +29,10 @@ template <typename T>
 struct SeriesBlocks {
     SeriesId128 seriesId;
     std::vector<std::unique_ptr<TSMBlock<T>>> blocks;  // All blocks loaded in memory
+    // Index entry for each RETAINED block, same order and length as `blocks`.
+    // Blocks that decode empty are dropped, so this is the only safe way to get
+    // a loaded block's time range -- do not index getSeriesBlocks() positionally.
+    std::vector<TSMIndexBlock> blockIndex;
     size_t totalPoints = 0;
     uint64_t fileRank = 0;            // For deduplication (higher rank = newer file)
     seastar::shared_ptr<TSM> source;  // Source TSM file (for index block lookup during compaction)
@@ -105,8 +109,17 @@ public:
 
         // Process results -- consume ALL futures to avoid Seastar assertion
         // on exceptional futures that are destroyed without being consumed.
+        //
+        // Blocks that decode empty (or fail) are DROPPED, so `blocks` can be
+        // shorter than `relevantBlocks`. Callers must therefore never pair the
+        // two by position: record each retained block's own index entry here so
+        // the pairing is by identity. Compaction previously indexed both lists
+        // with the same counter, which silently attached one block's data to
+        // another block's time range once anything was dropped.
+        result.blockIndex.reserve(relevantBlocks.size());
         std::exception_ptr firstError;
-        for (auto& future : blockResults) {
+        for (size_t i = 0; i < blockResults.size(); ++i) {
+            auto& future = blockResults[i];
             if (future.failed()) {
                 if (!firstError)
                     firstError = future.get_exception();
@@ -117,6 +130,7 @@ public:
                 if (block && !block->timestamps.empty()) {
                     result.totalPoints += block->timestamps.size();
                     result.blocks.push_back(std::move(block));
+                    result.blockIndex.push_back(relevantBlocks[i]);
                 }
             }
         }

@@ -141,3 +141,46 @@ TEST_F(CachePressureTest, BlockCacheStressEviction) {
     ASSERT_NE(v, nullptr);
     EXPECT_EQ(*v, "final-check");
 }
+
+// ---------------------------------------------------------------------------
+// Per-tag-value HyperLogLog sizing
+// ---------------------------------------------------------------------------
+//
+// A HyperLogLog is 16 KB (16384 registers). Maintaining one per distinct
+// (measurement, tagKey, tagValue) meant a high-cardinality tag cost 16 KB per
+// VALUE, plus its serialised copy and its KV entry — measured ~64 KB each. A
+// shard hit std::bad_alloc at ~6,100 distinct tag values, while the SAME
+// workload with 200,000 series but only 300 distinct tag values was fine: the
+// cost tracked distinct values, not series.
+//
+// The sketch is now only created once a tag value's exact roaring bitmap
+// reaches kTagHllMinCardinality. Below that the bitmap answers cardinality
+// directly and EXACTLY, so the sketch would cost 16 KB to be less accurate.
+//
+// This pins the arithmetic that makes the threshold necessary, so that lowering
+// it (or raising HLL precision) fails here rather than at ingest time.
+TEST_F(CachePressureTest, PerTagValueHllWouldBeRuinousBelowThreshold) {
+    constexpr size_t kHllBytes = 16384;  // HyperLogLog::SERIALIZED_SIZE
+
+    // What the ungated design cost at the cardinality that actually failed.
+    constexpr size_t kObservedFailureValues = 6100;
+    const size_t sketchesOnly = kHllBytes * kObservedFailureValues;
+    EXPECT_GT(sketchesOnly, 90u * 1024 * 1024)
+        << "one 16 KB sketch per distinct tag value is ~100 MB at only 6,100 values, "
+           "before its serialised copy and KV entry";
+
+    // And at a cardinality a time-series database should handle comfortably.
+    constexpr size_t kRoutineValues = 1'000'000;
+    const size_t atRoutineCardinality = kHllBytes * kRoutineValues;
+    EXPECT_GT(atRoutineCardinality, 15ull * 1024 * 1024 * 1024)
+        << "1M distinct tag values would need >15 GB of sketches alone";
+
+    // The threshold has to be high enough that the sketches which DO get
+    // created are few. A tag value shared by >= 10,000 series is rare by
+    // construction: with S series total, at most S/10000 such values can exist.
+    constexpr uint64_t kThreshold = 10000;  // NativeIndex::kTagHllMinCardinality
+    constexpr uint64_t kSeries = 10'000'000;
+    const uint64_t maxSketches = kSeries / kThreshold;
+    EXPECT_LE(maxSketches * kHllBytes, 32ull * 1024 * 1024)
+        << "even at 10M series, sketches above the threshold must stay a bounded, small cost";
+}

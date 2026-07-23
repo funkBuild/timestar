@@ -112,14 +112,16 @@ public:
     // Finalize partial aggregation results from a single shard into the query response.
     // Each partial must have a unique groupKey; callers with duplicate groupKeys must use
     // the merge fallback path (mergePartialAggregationsGrouped) instead.
+    // Coroutine: yields every ~64k points (reactor-stall prevention).
     // Public static for testability.
-    static void finalizeSingleShardPartials(std::vector<PartialAggregationResult>& partials, AggregationMethod method,
-                                            QueryResponse& response);
+    static seastar::future<> finalizeSingleShardPartials(std::vector<PartialAggregationResult>& partials,
+                                                         AggregationMethod method, QueryResponse& response);
 
-    // Format response as JSON (public for testing)
+    // Format response as JSON (public for testing).
+    // Coroutine — see ResponseFormatter::format for the yielding policy.
     // Note: field filtering is performed in executeQuery(), so by the time this
     // function is called, response.series already contains only the requested fields.
-    std::string formatQueryResponse(QueryResponse& response);
+    seastar::future<std::string> formatQueryResponse(QueryResponse& response);
 
     // Create error response (public for testing)
     std::string createErrorResponse(const std::string& code, const std::string& message);
@@ -149,10 +151,12 @@ private:
 
     // Phase 3a/3b: partial merge + aggregation finalize into `response`.
     // Return std::nullopt on success; a complete error QueryResponse on early exit.
-    std::optional<QueryResponse> finalizeSingleShardResponse(const QueryRequest& request,
-                                                             std::pair<unsigned, ShardQueryResult>& shardResult,
-                                                             QueryTimingInfo& timing, QueryResponse& response);
-    std::optional<QueryResponse> finalizeMultiShardResponse(
+    // Coroutines: the merge and per-point loops yield periodically so a large
+    // result set cannot monopolize the coordinator's reactor.
+    seastar::future<std::optional<QueryResponse>> finalizeSingleShardResponse(
+        const QueryRequest& request, std::pair<unsigned, ShardQueryResult>& shardResult, QueryTimingInfo& timing,
+        QueryResponse& response);
+    seastar::future<std::optional<QueryResponse>> finalizeMultiShardResponse(
         const QueryRequest& request, std::vector<std::pair<unsigned, ShardQueryResult>>& shardResults,
         QueryTimingInfo& timing, QueryResponse& response);
 
@@ -164,6 +168,44 @@ private:
     // Phase 4: timing breakdown + slow-query logging.
     void logQueryCompletion(const QueryRequest& request, QueryTimingInfo& timing);
 };
+
+// Internals exposed for testing.  Not part of the handler's public surface.
+namespace detail {
+
+// Bounded re-read of one non-numeric series, reducing to LATEST-per-bucket as it
+// goes so peak memory is O(points in one chunk) rather than O(points in range).
+// Production reaches this only as recovery after a single-shot read threw, but
+// its bucket-merge behaviour is worth testing directly -- see
+// nonnumeric_chunked_recovery_test.cpp.
+//
+// `initialChunkWidth` is the starting chunk width in nanoseconds; 0 selects the
+// default heuristic. Tests pass a small value to force many chunk boundaries,
+// which is what exercises the merge of a bucket split across chunks.
+//
+// Returns nullopt when the series is numeric (the caller then reports the drop).
+//
+// Parameters are BY VALUE, not by reference: this is a coroutine, so every
+// parameter is read after each co_await. A caller passing a temporary (or any
+// object that does not outlive the whole chunk loop) would leave the coroutine
+// reading freed memory. Same rule as HttpQueryHandler::executeQuery.
+seastar::future<std::optional<SeriesResult>> queryNonNumericBucketedChunked(
+    Engine& engine, std::string seriesKey, SeriesId128 seriesId, std::string field,
+    std::map<std::string, std::string> tags, std::string measurement, uint64_t startTime, uint64_t endTime,
+    uint64_t interval, uint64_t initialChunkWidth = 0, uint64_t bucketAnchor = 0);
+
+// Bucketed LATEST for a BOOLEAN series via the numeric bucketed-LATEST
+// pushdown (true/false folded as 1.0/0.0, converted back on return — exact,
+// since LATEST selects rather than computes).  nullopt when the fast path is
+// not applicable (LWW overlap, string series, unknown series); the caller
+// falls back to the bounded chunked read.  Epoch grid only — anchored
+// (bucketAnchor != 0) queries must not call this.
+seastar::future<std::optional<SeriesResult>> queryBoolLatestBucketed(Engine& engine, const std::string& seriesKey,
+                                                                     SeriesId128 seriesId, const std::string& field,
+                                                                     std::map<std::string, std::string> tags,
+                                                                     std::string measurement, uint64_t startTime,
+                                                                     uint64_t endTime, uint64_t interval);
+
+}  // namespace detail
 
 }  // namespace timestar::http
 

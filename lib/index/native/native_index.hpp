@@ -14,12 +14,10 @@
 #include "memtable.hpp"
 #include "merge_iterator.hpp"
 #include "sstable.hpp"
-#include "storage_layout.hpp"
 #include "timestar_config.hpp"
 #include "timestar_value.hpp"
 #include "write_batch.hpp"
 
-#include <filesystem>
 #include <map>
 #include <memory>
 #include <roaring.hh>
@@ -82,7 +80,7 @@ namespace timestar::index {
 // Uses DMA I/O with no thread-pool crossings.
 class NativeIndex : public IndexBackend {
 public:
-    NativeIndex(timestar::StorageLayout layout, unsigned workerId);
+    explicit NativeIndex(int shardId);
     ~NativeIndex() override;
 
     // Lifecycle
@@ -111,6 +109,15 @@ public:
 
     seastar::future<std::vector<std::pair<SeriesId128, std::optional<SeriesMetadata>>>> getSeriesMetadataBatch(
         const std::vector<SeriesId128>& seriesIds) override;
+
+    // --- Per-series value-type binding (SERIES_VALUE_TYPE, 0x18) ---
+    //
+    // Not part of the IndexBackend interface: this is enforced by Engine on the
+    // owning shard, which holds a concrete NativeIndex. Shard-local, never
+    // broadcast — see index_backend.hpp for why the binding exists.
+    seastar::future<std::optional<TSMValueType>> getSeriesValueType(const SeriesId128& seriesId);
+    seastar::future<> putSeriesValueType(const SeriesId128& seriesId, TSMValueType type);
+    seastar::future<> removeSeriesValueType(const SeriesId128& seriesId);
 
     // --- Measurement metadata ---
     seastar::future<> setFieldType(const std::string& measurement, const std::string& field,
@@ -229,9 +236,8 @@ public:
     seastar::future<> applySchemaUpdate(SchemaUpdate update);
 
 private:
-    const timestar::StorageLayout layout_;
-    const unsigned shardId_;
-    const std::filesystem::path indexPath_;
+    int shardId_;
+    std::string indexPath_;
 
     // --- LSM storage ---
     // shared_ptr: kvPrefixScan sources co-own the memtables so a background
@@ -306,7 +312,18 @@ private:
     std::string sstFilename(uint64_t fileNumber);
 
     // --- Application-level caches ---
-    static size_t defaultMaxSeriesCacheSize() { return timestar::config().index.series_cache_size; }
+    // Divided by shard count, like blockCache_/seriesMetadataCache_/discoveryCache_
+    // already are. Left undivided this was 1M entries PER SHARD (~40 B/entry,
+    // and two generations are live), so a 16-shard box held 32M entries / 1.28 GB
+    // for this one set while its three sibling caches were correctly scaled down.
+    //
+    // NOTE this re-interprets the config value as per-SERVER, not per-shard.
+    // Floored so a small configured value on a many-shard box cannot
+    // degenerate the two-generation cache to near-zero entries, where every
+    // insert would swap generations and re-run the kvExists metadata probe.
+    static size_t defaultMaxSeriesCacheSize() {
+        return std::max<size_t>(1024, timestar::config().index.series_cache_size / std::max(1u, seastar::smp::count));
+    }
     static constexpr size_t EVICTION_BATCH_SIZE = 256;
     size_t maxSeriesCacheSize_ = defaultMaxSeriesCacheSize();
     std::unordered_set<SeriesId128, SeriesId128::Hash> indexedSeriesCache_;
@@ -383,18 +400,38 @@ private:
     // Per-measurement bloom filter of all LocalIds (for short-circuiting non-existent tag lookups)
     tsl::robin_map<std::string, BloomFilter> measurementBloomCache_;
     std::unordered_set<std::string> dirtyMeasurementBlooms_;
-    std::unordered_set<std::string> bloomFullyBuilt_;        // Measurements where bloom KV scan already done
-    static constexpr size_t MAX_BLOOM_CACHE_ENTRIES = 5000;  // ~40MB at 8KB per bloom
+    std::unordered_set<std::string> bloomFullyBuilt_;  // Measurements where bloom KV scan already done
+    // Count-bounding this was wrong: BloomFilter::build() sizes from the number
+    // of distinct tag values in the measurement, so one entry ranges from 8 KB to
+    // megabytes. At 5000 entries the "~40MB" assumed a fixed 8 KB entry; at the
+    // code's own stated "~100K keys in practice" it is 937 MB, i.e. the entire
+    // arena. Bounded by bytes now, like bitmapCache_ already is.
+    static constexpr size_t MAX_BLOOM_CACHE_ENTRIES = 5000;
     void trimMeasurementBloomCache();
 
     seastar::future<> updateHLL(const std::string& measurement, uint32_t localId);
+    // Per-tag-value cardinality sketch. Maintained ONLY once the tag value's
+    // exact bitmap reaches kTagHllMinCardinality: each sketch is 16 KB, so one
+    // per distinct value is ruinous for a high-cardinality tag, and below the
+    // threshold the exact bitmap is both cheaper and more accurate.
+    // `seedBitmapKey` names the tag value's postings bitmap in bitmapCache_;
+    // when the sketch is not yet in hllCache_, the bitmap's ids are merged in
+    // (idempotent) so the sketch never under-counts ids that predate it. A
+    // KEY is passed rather than a Roaring* because this coroutine suspends
+    // before seeding — a raw pointer into bitmapCache_ (a robin_map) would
+    // dangle across the suspension (rehash/trim). The caller must co_await
+    // this call before mutating the key buffer.
     seastar::future<> updateTagHLL(const std::string& measurement, const std::string& tagKey,
-                                   const std::string& tagValue, uint32_t localId);
+                                   const std::string& tagValue, uint32_t localId, const std::string& seedBitmapKey);
     void flushDirtyHLLs(IndexWriteBatch& batch);
     seastar::future<> flushDirtyMeasurementBlooms(IndexWriteBatch& batch);
     // Step 7: Trim HLL cache after flush — evict non-dirty entries when too large
     void trimHllCache();
     static constexpr size_t MAX_HLL_CACHE_ENTRIES = 1000;
+    // Below this many series sharing one (measurement, tagKey, tagValue), the
+    // exact roaring bitmap answers cardinality queries directly, so a 16 KB
+    // sketch with ~0.8% error would cost memory to be LESS accurate.
+    static constexpr uint64_t kTagHllMinCardinality = 10000;
 
     // --- Phase 3: Time-scoped per-day bitmaps ---
     tsl::robin_map<std::string, BitmapEntry> dayBitmapCache_;
@@ -409,10 +446,26 @@ private:
 
     // Step 7: Cache eviction — bounded by both entry count and byte budget.
     // Byte budget prevents high-cardinality bitmaps from consuming excessive memory.
+    // Cache budgets are a FRACTION OF THIS SHARD'S ARENA, not fixed absolutes.
+    //
+    // As fixed values these summed to ~690 MB per shard (bitmap 128 + day bitmap
+    // 64 + bloom 40 + series 80 + hll 16 + memtables 32 + metadata 48 + discovery
+    // 16 + block 8, plus 256 MB of compaction budget), which is ~69% of a 1 GB
+    // shard committed before a single point is read. Worse, most were not divided
+    // by shard count, so adding shards did not reduce them: per-shard footprint
+    // stayed flat while the per-shard arena shrank.
+    //
+    // Deriving from seastar::memory::stats().total_memory() makes them scale both
+    // ways -- small on a 1 GB shard, generous on a 16 GB one -- and keeps the
+    // total bounded by construction.
+    static size_t indexCacheBudgetBytes();
+    static size_t maxBitmapCacheBytes();     // 40% of the index budget
+    static size_t maxDayBitmapCacheBytes();  // 20%
+    static size_t maxBloomCacheBytes();      // 15%
+    static size_t maxHllCacheBytes();        // 10%
+
     static constexpr size_t MAX_BITMAP_CACHE_ENTRIES = 100000;
-    static constexpr size_t MAX_BITMAP_CACHE_BYTES = 128 * 1024 * 1024;  // 128MB per shard
     static constexpr size_t MAX_DAY_BITMAP_CACHE_ENTRIES = 50000;
-    static constexpr size_t MAX_DAY_BITMAP_CACHE_BYTES = 64 * 1024 * 1024;  // 64MB per shard
     void trimBitmapCache();
     void trimDayBitmapCache();
     // Step 6: Evict oldest tag values cache entries when over limit

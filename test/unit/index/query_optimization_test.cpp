@@ -130,7 +130,7 @@ public:
 };
 
 SEASTAR_TEST_F(QueryOptimizationTest, MeasurementHLLUpdatedOnInsert) {
-    NativeIndex index(timestar::StorageLayout("."), 0);
+    NativeIndex index(0);
     co_await index.open();
 
     // Insert 100 series into "cpu" measurement
@@ -147,7 +147,7 @@ SEASTAR_TEST_F(QueryOptimizationTest, MeasurementHLLUpdatedOnInsert) {
 }
 
 SEASTAR_TEST_F(QueryOptimizationTest, TagHLLUpdatedOnInsert) {
-    NativeIndex index(timestar::StorageLayout("."), 0);
+    NativeIndex index(0);
     co_await index.open();
 
     // Insert 50 series with region=us-west
@@ -175,7 +175,7 @@ SEASTAR_TEST_F(QueryOptimizationTest, TagHLLUpdatedOnInsert) {
 SEASTAR_TEST_F(QueryOptimizationTest, HLLPersistsAcrossFlushCompactReopen) {
     // Phase 1: Insert data and close (triggers flush)
     {
-        NativeIndex index(timestar::StorageLayout("."), 0);
+        NativeIndex index(0);
         co_await index.open();
 
         for (int i = 0; i < 200; ++i) {
@@ -190,7 +190,7 @@ SEASTAR_TEST_F(QueryOptimizationTest, HLLPersistsAcrossFlushCompactReopen) {
 
     // Phase 2: Reopen and verify HLLs survived
     {
-        NativeIndex index(timestar::StorageLayout("."), 0);
+        NativeIndex index(0);
         co_await index.open();
 
         double est = co_await index.estimateMeasurementCardinality("temperature");
@@ -202,7 +202,7 @@ SEASTAR_TEST_F(QueryOptimizationTest, HLLPersistsAcrossFlushCompactReopen) {
 }
 
 SEASTAR_TEST_F(QueryOptimizationTest, NonExistentMeasurementReturnsZero) {
-    NativeIndex index(timestar::StorageLayout("."), 0);
+    NativeIndex index(0);
     co_await index.open();
 
     double est = co_await index.estimateMeasurementCardinality("nonexistent");
@@ -215,7 +215,7 @@ SEASTAR_TEST_F(QueryOptimizationTest, NonExistentMeasurementReturnsZero) {
 }
 
 SEASTAR_TEST_F(QueryOptimizationTest, MultipleMeasurementsIndependent) {
-    NativeIndex index(timestar::StorageLayout("."), 0);
+    NativeIndex index(0);
     co_await index.open();
 
     for (int i = 0; i < 100; ++i) {
@@ -239,7 +239,7 @@ SEASTAR_TEST_F(QueryOptimizationTest, MultipleMeasurementsIndependent) {
 }
 
 SEASTAR_TEST_F(QueryOptimizationTest, BloomFilterPreventsUnnecessaryLookups) {
-    NativeIndex index(timestar::StorageLayout("."), 0);
+    NativeIndex index(0);
     co_await index.open();
 
     // Insert series to populate bitmaps
@@ -260,7 +260,7 @@ SEASTAR_TEST_F(QueryOptimizationTest, BloomFilterPreventsUnnecessaryLookups) {
 }
 
 SEASTAR_TEST_F(QueryOptimizationTest, BloomFilterAllowsExistingTags) {
-    NativeIndex index(timestar::StorageLayout("."), 0);
+    NativeIndex index(0);
     co_await index.open();
 
     for (int i = 0; i < 20; ++i) {
@@ -279,7 +279,7 @@ SEASTAR_TEST_F(QueryOptimizationTest, BloomFilterAllowsExistingTags) {
 }
 
 SEASTAR_TEST_F(QueryOptimizationTest, CardinalityAfterMixedInserts) {
-    NativeIndex index(timestar::StorageLayout("."), 0);
+    NativeIndex index(0);
     co_await index.open();
 
     // Insert 3 measurements with overlapping tag keys

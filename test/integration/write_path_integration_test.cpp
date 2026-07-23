@@ -22,7 +22,7 @@ protected:
 
 // End-to-end test: Write data through Engine and read it back
 seastar::future<> testWriteAndRead() {
-    Engine engine(timestar::StorageLayout("."));
+    Engine engine;
     co_await engine.init();
     co_await engine.startBackgroundTasks();
 
@@ -142,7 +142,7 @@ TEST_F(WritePathEndToEndTest, WriteAndRead) {
 
 // Test metadata queries through Engine
 seastar::future<> testMetadataQueries() {
-    Engine engine(timestar::StorageLayout("."));
+    Engine engine;
     co_await engine.init();
 
     std::exception_ptr eptr;
@@ -208,7 +208,7 @@ TEST_F(WritePathEndToEndTest, MetadataQueries) {
 seastar::future<> testPersistence() {
     // Phase 1: Write data
     {
-        Engine engine(timestar::StorageLayout("."));
+        Engine engine;
         co_await engine.init();
 
         std::exception_ptr eptr;
@@ -237,7 +237,7 @@ seastar::future<> testPersistence() {
 
     // Phase 2: Read data after restart
     {
-        Engine engine(timestar::StorageLayout("."));
+        Engine engine;
         co_await engine.init();
 
         std::exception_ptr eptr;

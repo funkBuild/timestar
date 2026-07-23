@@ -33,7 +33,7 @@ static seastar::future<> shutdownShardedEngine(seastar::sharded<Engine>& engineS
 seastar::future<> testWriteThroughput(int numSeries, int pointsPerSeries) {
     seastar::sharded<Engine> engineSharded;
 
-    co_await engineSharded.start(timestar::StorageLayout("."));
+    co_await engineSharded.start();
     co_await engineSharded.invoke_on_all([](Engine& engine) { return engine.init(); });
     co_await engineSharded.invoke_on_all([](Engine& engine) { return engine.startBackgroundTasks(); });
 
@@ -121,7 +121,7 @@ TEST_F(WritePerformanceTest, BasicThroughput) {
 seastar::future<> testConcurrentWrites() {
     seastar::sharded<Engine> engineSharded;
 
-    co_await engineSharded.start(timestar::StorageLayout("."));
+    co_await engineSharded.start();
     co_await engineSharded.invoke_on_all([](Engine& engine) { return engine.init(); });
     co_await engineSharded.invoke_on_all([](Engine& engine) { return engine.startBackgroundTasks(); });
 
@@ -191,7 +191,7 @@ TEST_F(WritePerformanceTest, ConcurrentWrites) {
 seastar::future<> testBatchWritePerformance() {
     seastar::sharded<Engine> engineSharded;
 
-    co_await engineSharded.start(timestar::StorageLayout("."));
+    co_await engineSharded.start();
     co_await engineSharded.invoke_on_all([](Engine& engine) { return engine.init(); });
     co_await engineSharded.invoke_on_all([](Engine& engine) { return engine.startBackgroundTasks(); });
 

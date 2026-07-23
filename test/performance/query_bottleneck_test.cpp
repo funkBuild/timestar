@@ -63,7 +63,7 @@ static seastar::future<> insertAndFlush(Engine& engine, int numSeries, int point
 // should return PushdownResult with correct aggregate values.
 // ---------------------------------------------------------------------------
 SEASTAR_TEST_F(QueryBottleneckTest, RC3_QueryAggregatedPushdown) {
-    Engine engine(timestar::StorageLayout("."));
+    Engine engine;
     co_await engine.init();
 
     // Insert 10 series, 100 points each, flush to TSM
@@ -111,7 +111,7 @@ SEASTAR_TEST_F(QueryBottleneckTest, RC3_QueryAggregatedPushdown) {
 // against manually computed aggregates.
 // ---------------------------------------------------------------------------
 SEASTAR_TEST_F(QueryBottleneckTest, RC3_QueryAggregatedCorrectness) {
-    Engine engine(timestar::StorageLayout("."));
+    Engine engine;
     co_await engine.init();
 
     // Insert known values
@@ -158,7 +158,7 @@ SEASTAR_TEST_F(QueryBottleneckTest, RC3_QueryAggregatedCorrectness) {
 // Verifies that prefetch warms the TSM cache so subsequent queries are faster.
 // ---------------------------------------------------------------------------
 SEASTAR_TEST_F(QueryBottleneckTest, RC4_PrefetchSeriesIndices) {
-    Engine engine(timestar::StorageLayout("."));
+    Engine engine;
     co_await engine.init();
 
     // Insert 20 series, 50 points each
@@ -196,7 +196,7 @@ SEASTAR_TEST_F(QueryBottleneckTest, RC4_PrefetchSeriesIndices) {
 // pushdown (only reading the last block instead of all data).
 // ---------------------------------------------------------------------------
 SEASTAR_TEST_F(QueryBottleneckTest, RC5_LatestAggregation) {
-    Engine engine(timestar::StorageLayout("."));
+    Engine engine;
     co_await engine.init();
 
     // Insert 10 series with 200 points each (enough to span multiple TSM blocks)
@@ -257,7 +257,7 @@ SEASTAR_TEST_F(QueryBottleneckTest, RC5_LatestAggregation) {
 // Simulates the TSBS query flow: prefetch → pushdown aggregation for all series
 // ---------------------------------------------------------------------------
 SEASTAR_TEST_F(QueryBottleneckTest, FullPipeline_PrefetchThenPushdown) {
-    Engine engine(timestar::StorageLayout("."));
+    Engine engine;
     co_await engine.init();
 
     constexpr int NUM_SERIES = 30;

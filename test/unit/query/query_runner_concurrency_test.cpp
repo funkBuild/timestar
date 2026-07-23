@@ -96,7 +96,7 @@ void checkExactSeries(const QueryResult<double>& result, uint64_t startTs, size_
 //    series churn the engine.
 // ---------------------------------------------------------------------------
 SEASTAR_TEST_F(QueryRunnerConcurrencyTest, ConcurrentQueriesOverMultipleTsmFilesAreExact) {
-    Engine engine(timestar::StorageLayout("."));
+    Engine engine;
     std::exception_ptr failure;
     try {
         co_await engine.init();
@@ -170,7 +170,7 @@ SEASTAR_TEST_F(QueryRunnerConcurrencyTest, ConcurrentQueriesOverMultipleTsmFiles
 //    point count that never shrinks between successive queries.
 // ---------------------------------------------------------------------------
 SEASTAR_TEST_F(QueryRunnerConcurrencyTest, QueriesRacingSameSeriesInsertsSeeConsistentPrefix) {
-    Engine engine(timestar::StorageLayout("."));
+    Engine engine;
     std::exception_ptr failure;
     try {
         co_await engine.init();

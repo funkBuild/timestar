@@ -37,6 +37,13 @@ public:
     seastar::future<std::unique_ptr<seastar::http::reply>> handleCardinality(
         std::unique_ptr<seastar::http::request> req);
 
+    // GET /series?id=<32 hex chars> — resolve an opaque SeriesId128 back to its
+    // measurement/tags/field and its bound value type. Storage-layer errors
+    // (notably the compaction type-conflict failure) can only name the id, and
+    // the id is a hash, so this is the only way to act on one.
+    seastar::future<std::unique_ptr<seastar::http::reply>> handleSeriesLookup(
+        std::unique_ptr<seastar::http::request> req);
+
     std::string createErrorResponse(const std::string& code, const std::string& message);
     std::string formatMeasurementsResponse(const std::vector<std::string>& measurements, size_t total = 0);
     std::string formatTagsResponse(const std::string& measurement,

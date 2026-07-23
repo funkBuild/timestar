@@ -10,18 +10,25 @@
 using namespace timestar;
 
 // Glaze-compatible structure for JSON parsing (from http_query_handler.cpp)
+// MUST stay layout-identical to the production definition in
+// http_query_handler.cpp — parseQueryRequest takes it by reference, so a
+// field mismatch here reads garbage (this bit when the compat fields landed
+// without updating this mirror).
 struct GlazeQueryRequest {
     std::string query;
     std::variant<uint64_t, std::string> startTime;
     std::variant<uint64_t, std::string> endTime;
     std::optional<std::variant<uint64_t, std::string>> aggregationInterval;
+    std::optional<std::string> bucketAlignment;
+    std::optional<bool> booleansAsNumeric;
 };
 
 template <>
 struct glz::meta<GlazeQueryRequest> {
     using T = GlazeQueryRequest;
     static constexpr auto value = object("query", &T::query, "startTime", &T::startTime, "endTime", &T::endTime,
-                                         "aggregationInterval", &T::aggregationInterval);
+                                         "aggregationInterval", &T::aggregationInterval, "bucketAlignment",
+                                         &T::bucketAlignment, "booleansAsNumeric", &T::booleansAsNumeric);
 };
 
 // Glaze structures for parsing HTTP responses (matching http_query_handler.cpp structures)
@@ -115,7 +122,7 @@ TEST_F(HttpQueryHandlerTest, FormatEmptyResponse) {
     response.statistics.pointCount = 0;
     response.statistics.executionTimeMs = 5.5;
 
-    std::string json = handler.formatQueryResponse(response);
+    std::string json = handler.formatQueryResponse(response).get();
 
     // Parse and verify using Glaze
     GlazeQueryResponse parsedResponse;
@@ -150,7 +157,7 @@ TEST_F(HttpQueryHandlerTest, FormatResponseWithData) {
     response.statistics.pointCount = 3;
     response.statistics.executionTimeMs = 10.0;
 
-    std::string json = handler.formatQueryResponse(response);
+    std::string json = handler.formatQueryResponse(response).get();
 
     // Parse and verify using Glaze
     GlazeQueryResponse parsedResponse;
@@ -480,6 +487,48 @@ TEST_F(HttpQueryHandlerTest, ParseQueryRequestValidTimeRangeSucceeds) {
     EXPECT_EQ(request.endTime, 2000000000ULL);
 }
 
+TEST_F(HttpQueryHandlerTest, ParseQueryRequestCompatFields) {
+    HttpQueryHandler handler(nullptr);
+
+    GlazeQueryRequest glazeReq;
+    glazeReq.query = "avg:temperature()";
+    glazeReq.startTime = uint64_t(3000000000);
+    glazeReq.endTime = uint64_t(40000000000);
+    glazeReq.aggregationInterval = std::string("10s");
+    glazeReq.bucketAlignment = std::string("start");
+    glazeReq.booleansAsNumeric = true;
+
+    QueryRequest request = handler.parseQueryRequest(glazeReq);
+    EXPECT_EQ(request.bucketAnchor, 3000000000ULL);  // anchored at startTime
+    EXPECT_TRUE(request.booleansAsNumeric);
+
+    // Defaults: epoch grid (anchor 0), booleans non-numeric.
+    GlazeQueryRequest plain;
+    plain.query = "avg:temperature()";
+    plain.startTime = uint64_t(3000000000);
+    plain.endTime = uint64_t(40000000000);
+    QueryRequest plainReq = handler.parseQueryRequest(plain);
+    EXPECT_EQ(plainReq.bucketAnchor, 0u);
+    EXPECT_FALSE(plainReq.booleansAsNumeric);
+
+    // "start" without an interval is a no-op (no buckets to anchor).
+    GlazeQueryRequest noInterval;
+    noInterval.query = "avg:temperature()";
+    noInterval.startTime = uint64_t(3000000000);
+    noInterval.endTime = uint64_t(40000000000);
+    noInterval.bucketAlignment = std::string("start");
+    EXPECT_EQ(handler.parseQueryRequest(noInterval).bucketAnchor, 0u);
+
+    // Unknown alignment value throws (surfaced as INVALID_QUERY by the route).
+    GlazeQueryRequest bad;
+    bad.query = "avg:temperature()";
+    bad.startTime = uint64_t(3000000000);
+    bad.endTime = uint64_t(40000000000);
+    bad.aggregationInterval = std::string("10s");
+    bad.bucketAlignment = std::string("middle");
+    EXPECT_THROW(handler.parseQueryRequest(bad), QueryParseException);
+}
+
 TEST_F(HttpQueryHandlerTest, ParseQueryRequestWithStringInterval) {
     HttpQueryHandler handler(nullptr);
 
@@ -555,7 +604,7 @@ TEST_F(HttpQueryHandlerTest, FinalizeSingleShardPartialsBucketed) {
 
     QueryResponse response;
     response.success = true;
-    HttpQueryHandler::finalizeSingleShardPartials(partials, AggregationMethod::AVG, response);
+    HttpQueryHandler::finalizeSingleShardPartials(partials, AggregationMethod::AVG, response).get();
 
     ASSERT_EQ(response.series.size(), 1);
     EXPECT_EQ(response.series[0].measurement, "cpu");
@@ -599,7 +648,7 @@ TEST_F(HttpQueryHandlerTest, FinalizeSingleShardPartialsCollapsedState) {
 
     QueryResponse response;
     response.success = true;
-    HttpQueryHandler::finalizeSingleShardPartials(partials, AggregationMethod::LATEST, response);
+    HttpQueryHandler::finalizeSingleShardPartials(partials, AggregationMethod::LATEST, response).get();
 
     ASSERT_EQ(response.series.size(), 1);
     EXPECT_EQ(response.series[0].measurement, "temperature");
@@ -635,7 +684,7 @@ TEST_F(HttpQueryHandlerTest, FinalizeSingleShardPartialsCollapsedStateFirst) {
 
     QueryResponse response;
     response.success = true;
-    HttpQueryHandler::finalizeSingleShardPartials(partials, AggregationMethod::FIRST, response);
+    HttpQueryHandler::finalizeSingleShardPartials(partials, AggregationMethod::FIRST, response).get();
 
     ASSERT_EQ(response.series.size(), 1);
     auto& field = response.series[0].fields.at("value");
@@ -664,7 +713,7 @@ TEST_F(HttpQueryHandlerTest, FinalizeSingleShardPartialsCollapsedStateEmpty) {
 
     QueryResponse response;
     response.success = true;
-    HttpQueryHandler::finalizeSingleShardPartials(partials, AggregationMethod::AVG, response);
+    HttpQueryHandler::finalizeSingleShardPartials(partials, AggregationMethod::AVG, response).get();
 
     // count == 0 means the collapsed state is empty; should produce no series
     EXPECT_EQ(response.series.size(), 0);
@@ -686,7 +735,7 @@ TEST_F(HttpQueryHandlerTest, FinalizeSingleShardPartialsSortedValues) {
 
     QueryResponse response;
     response.success = true;
-    HttpQueryHandler::finalizeSingleShardPartials(partials, AggregationMethod::AVG, response);
+    HttpQueryHandler::finalizeSingleShardPartials(partials, AggregationMethod::AVG, response).get();
 
     ASSERT_EQ(response.series.size(), 1);
     EXPECT_EQ(response.series[0].measurement, "disk");
@@ -717,7 +766,7 @@ TEST_F(HttpQueryHandlerTest, FinalizeSingleShardPartialsSortedValuesCount) {
 
     QueryResponse response;
     response.success = true;
-    HttpQueryHandler::finalizeSingleShardPartials(partials, AggregationMethod::COUNT, response);
+    HttpQueryHandler::finalizeSingleShardPartials(partials, AggregationMethod::COUNT, response).get();
 
     ASSERT_EQ(response.series.size(), 1);
     auto& field = response.series[0].fields.at("count");
@@ -760,7 +809,7 @@ TEST_F(HttpQueryHandlerTest, FinalizeSingleShardPartialsSortedStates) {
 
     QueryResponse response;
     response.success = true;
-    HttpQueryHandler::finalizeSingleShardPartials(partials, AggregationMethod::SUM, response);
+    HttpQueryHandler::finalizeSingleShardPartials(partials, AggregationMethod::SUM, response).get();
 
     ASSERT_EQ(response.series.size(), 1);
     EXPECT_EQ(response.series[0].measurement, "memory");
@@ -784,7 +833,7 @@ TEST_F(HttpQueryHandlerTest, FinalizeSingleShardPartialsEmpty) {
 
     QueryResponse response;
     response.success = true;
-    HttpQueryHandler::finalizeSingleShardPartials(partials, AggregationMethod::AVG, response);
+    HttpQueryHandler::finalizeSingleShardPartials(partials, AggregationMethod::AVG, response).get();
 
     EXPECT_EQ(response.series.size(), 0);
 }
@@ -812,7 +861,7 @@ TEST_F(HttpQueryHandlerTest, FinalizeSingleShardPartialsSkipsEmptyPartial) {
 
     QueryResponse response;
     response.success = true;
-    HttpQueryHandler::finalizeSingleShardPartials(partials, AggregationMethod::AVG, response);
+    HttpQueryHandler::finalizeSingleShardPartials(partials, AggregationMethod::AVG, response).get();
 
     // Only the data-bearing partial should produce a series
     ASSERT_EQ(response.series.size(), 1);
@@ -847,7 +896,7 @@ TEST_F(HttpQueryHandlerTest, FinalizeSingleShardPartialsMultipleSeries) {
 
     QueryResponse response;
     response.success = true;
-    HttpQueryHandler::finalizeSingleShardPartials(partials, AggregationMethod::MAX, response);
+    HttpQueryHandler::finalizeSingleShardPartials(partials, AggregationMethod::MAX, response).get();
 
     ASSERT_EQ(response.series.size(), 2);
 
@@ -891,7 +940,7 @@ TEST_F(HttpQueryHandlerTest, FinalizeSingleShardPartialsBucketsSortedByTimestamp
 
     QueryResponse response;
     response.success = true;
-    HttpQueryHandler::finalizeSingleShardPartials(partials, AggregationMethod::SUM, response);
+    HttpQueryHandler::finalizeSingleShardPartials(partials, AggregationMethod::SUM, response).get();
 
     ASSERT_EQ(response.series.size(), 1);
     auto& field = response.series[0].fields.at("bytes");

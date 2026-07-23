@@ -79,11 +79,19 @@ protected:
 
     static std::unique_ptr<seastar::http::request> makeQueryRequest(const std::string& query, uint64_t startTime,
                                                                     uint64_t endTime,
-                                                                    const std::string& aggregationInterval = "") {
+                                                                    const std::string& aggregationInterval = "",
+                                                                    const std::string& bucketAlignment = "",
+                                                                    bool booleansAsNumeric = false) {
         std::string body = R"({"query":")" + query + R"(","startTime":)" + std::to_string(startTime) +
                            R"(,"endTime":)" + std::to_string(endTime);
         if (!aggregationInterval.empty()) {
             body += R"(,"aggregationInterval":")" + aggregationInterval + R"(")";
+        }
+        if (!bucketAlignment.empty()) {
+            body += R"(,"bucketAlignment":")" + bucketAlignment + R"(")";
+        }
+        if (booleansAsNumeric) {
+            body += R"(,"booleansAsNumeric":true)";
         }
         body += "}";
         return makeJsonRequest(body);
@@ -92,8 +100,13 @@ protected:
     // Run a query and decode every (series, field) pair, sorted by tags then
     // field so assertions do not depend on shard or hash ordering.
     static std::vector<DecodedSeries> runQuery(HttpQueryHandler& handler, const std::string& query, uint64_t startTime,
-                                               uint64_t endTime, const std::string& interval = "") {
-        auto rep = handler.handleQuery(makeQueryRequest(query, startTime, endTime, interval)).get();
+                                               uint64_t endTime, const std::string& interval = "",
+                                               const std::string& bucketAlignment = "",
+                                               bool booleansAsNumeric = false) {
+        auto rep =
+            handler
+                .handleQuery(makeQueryRequest(query, startTime, endTime, interval, bucketAlignment, booleansAsNumeric))
+                .get();
         EXPECT_EQ(rep->_status, seastar::http::reply::status_type::ok) << rep->_content;
 
         glz::generic parsed;
@@ -772,6 +785,278 @@ TEST_F(DynamoEquivalenceTest, UnknownGroupByTagReturnsNoSeries) {
             auto series = runQuery(queryHandler, "avg:dyn_t4(v){nosuchtag:x}", start, end, "1ms");
             EXPECT_TRUE(series.empty()) << "unknown scope tag must match no series";
         }
+    })
+        .join()
+        .get();
+}
+
+// ---------------------------------------------------------------------------
+// T11: bucketAlignment="start" anchors the bucket grid at startTime.
+//
+// rollup.js-style readers anchor buckets at the query's startTime; TimeStar's
+// canonical grid is epoch-aligned.  The migration compat mode must reproduce
+// the rollup labels, counts, and point membership exactly, while the default
+// stays epoch-aligned.  Mirrors the observed divergence: a query starting 3s
+// off a 10s boundary snapped to [0,10000,...] (epoch) where rollup produced
+// [3000,13000,...].
+// ---------------------------------------------------------------------------
+TEST_F(DynamoEquivalenceTest, StartAlignedBucketsAnchorAtStartTime) {
+    seastar::thread([] {
+        ScopedShardedEngine eng;
+        eng.start();
+
+        HttpWriteHandler writeHandler(&eng.eng);
+        HttpQueryHandler queryHandler(&eng.eng);
+
+        // One point per second for 40s starting at kBase (which sits ON a 10s
+        // epoch boundary), value == second index.
+        std::string ts = "[";
+        std::string vals = "[";
+        for (int i = 0; i < 40; ++i) {
+            if (i) {
+                ts += ",";
+                vals += ",";
+            }
+            ts += std::to_string(kBase + static_cast<uint64_t>(i) * 1000 * kMs);
+            vals += std::to_string(static_cast<double>(i));
+        }
+        ts += "]";
+        vals += "]";
+        writeOk(writeHandler,
+                R"({"measurement":"dyn_t11","tags":{"d":"a"},"fields":{"v":)" + vals + R"(},"timestamps":)" + ts + "}");
+
+        // Query [kBase+3s, kBase+36.999s] with a 10s interval — 3s off the
+        // epoch grid, exactly the divergence case.
+        const uint64_t start = kBase + 3000 * kMs;
+        const uint64_t end = kBase + 36999 * kMs;
+
+        // Default (epoch): buckets snap DOWN to the epoch grid — labels at
+        // +0s/+10s/+20s/+30s, with the first bucket partial (seconds 3-9).
+        {
+            auto series = runQuery(queryHandler, "avg:dyn_t11(v){}", start, end, "10s");
+            ASSERT_EQ(series.size(), 1u);
+            EXPECT_EQ(series[0].timestamps,
+                      (std::vector<uint64_t>{kBase, kBase + 10000 * kMs, kBase + 20000 * kMs, kBase + 30000 * kMs}));
+            // avg(3..9)=6, avg(10..19)=14.5, avg(20..29)=24.5, avg(30..36)=33
+            EXPECT_EQ(numbers(series[0]), (std::vector<double>{6.0, 14.5, 24.5, 33.0}));
+        }
+
+        // "start": the grid is anchored at startTime — labels at
+        // +3s/+13s/+23s/+33s and every bucket holds exactly 10 seconds of data
+        // (the last is partial: seconds 33-36).
+        {
+            auto series = runQuery(queryHandler, "avg:dyn_t11(v){}", start, end, "10s", "start");
+            ASSERT_EQ(series.size(), 1u);
+            EXPECT_EQ(series[0].timestamps, (std::vector<uint64_t>{kBase + 3000 * kMs, kBase + 13000 * kMs,
+                                                                   kBase + 23000 * kMs, kBase + 33000 * kMs}));
+            // avg(3..12)=7.5, avg(13..22)=17.5, avg(23..32)=27.5, avg(33..36)=34.5
+            EXPECT_EQ(numbers(series[0]), (std::vector<double>{7.5, 17.5, 27.5, 34.5}));
+        }
+
+        // Explicit "epoch" must equal the default.
+        {
+            auto series = runQuery(queryHandler, "avg:dyn_t11(v){}", start, end, "10s", "epoch");
+            ASSERT_EQ(series.size(), 1u);
+            EXPECT_EQ(series[0].timestamps,
+                      (std::vector<uint64_t>{kBase, kBase + 10000 * kMs, kBase + 20000 * kMs, kBase + 30000 * kMs}));
+        }
+    })
+        .join()
+        .get();
+}
+
+// ---------------------------------------------------------------------------
+// T12: start-aligned buckets are placement-independent and grouping-safe.
+//
+// Anchored queries bypass every epoch-only fast path (pushdown, batch
+// latest/first, streaming) and take the fallback on all placements — memory
+// store and TSM must answer identically, with and without a `by` clause, for
+// a fold method and for latest.
+// ---------------------------------------------------------------------------
+TEST_F(DynamoEquivalenceTest, StartAlignedBucketsArePlacementIndependent) {
+    seastar::thread([] {
+        ScopedShardedEngine eng;
+        eng.start();
+
+        HttpWriteHandler writeHandler(&eng.eng);
+        HttpQueryHandler queryHandler(&eng.eng);
+
+        const std::string ts = R"([)" + std::to_string(kBase + 4000 * kMs) + "," + std::to_string(kBase + 9000 * kMs) +
+                               "," + std::to_string(kBase + 14000 * kMs) + "]";
+        writeOk(writeHandler, R"({"measurement":"dyn_t12","tags":{"d":"a"},)"
+                              R"("fields":{"v":[1.0,2.0,4.0]},"timestamps":)" +
+                                  ts + "}");
+        writeOk(writeHandler, R"({"measurement":"dyn_t12","tags":{"d":"b"},)"
+                              R"("fields":{"v":[10.0,20.0,40.0]},"timestamps":)" +
+                                  ts + "}");
+
+        const uint64_t start = kBase + 4000 * kMs;  // anchored grid: +4s, +14s
+        const uint64_t end = kBase + 20000 * kMs;
+
+        auto runAll = [&](const char* phase) {
+            // sum across both series: bucket +4s holds ts 4s and 9s; +14s holds 14s.
+            {
+                auto series = runQuery(queryHandler, "sum:dyn_t12(v){}", start, end, "10s", "start");
+                ASSERT_EQ(series.size(), 1u) << phase;
+                EXPECT_EQ(series[0].timestamps, (std::vector<uint64_t>{kBase + 4000 * kMs, kBase + 14000 * kMs}))
+                    << phase;
+                EXPECT_EQ(numbers(series[0]), (std::vector<double>{33.0, 44.0})) << phase;
+            }
+            // by {d}: same anchored grid inside each group.
+            {
+                auto series = runQuery(queryHandler, "sum:dyn_t12(v){} by {d}", start, end, "10s", "start");
+                ASSERT_EQ(series.size(), 2u) << phase;
+                EXPECT_EQ(series[0].tags.at("d"), "a") << phase;
+                EXPECT_EQ(series[0].timestamps, (std::vector<uint64_t>{kBase + 4000 * kMs, kBase + 14000 * kMs}))
+                    << phase;
+                EXPECT_EQ(numbers(series[0]), (std::vector<double>{3.0, 4.0})) << phase;
+                EXPECT_EQ(numbers(series[1]), (std::vector<double>{30.0, 40.0})) << phase;
+            }
+            // latest with an interval: one point per anchored bucket (the batch
+            // fast path is epoch-only and must have been bypassed).
+            {
+                auto series = runQuery(queryHandler, "latest:dyn_t12(v){d:a}", start, end, "10s", "start");
+                ASSERT_EQ(series.size(), 1u) << phase;
+                EXPECT_EQ(series[0].timestamps, (std::vector<uint64_t>{kBase + 4000 * kMs, kBase + 14000 * kMs}))
+                    << phase;
+                EXPECT_EQ(numbers(series[0]), (std::vector<double>{2.0, 4.0})) << phase;
+            }
+        };
+
+        runAll("memory store");
+        flushToTsm(eng.eng);
+        runAll("TSM");
+    })
+        .join()
+        .get();
+}
+
+// ---------------------------------------------------------------------------
+// T13: non-numeric fields honour the anchored grid; bad alignment values are
+// rejected loudly.
+// ---------------------------------------------------------------------------
+TEST_F(DynamoEquivalenceTest, StartAlignedBucketsApplyToNonNumericAndRejectUnknownValues) {
+    seastar::thread([] {
+        ScopedShardedEngine eng;
+        eng.start();
+
+        HttpWriteHandler writeHandler(&eng.eng);
+        HttpQueryHandler queryHandler(&eng.eng);
+
+        const std::string ts = R"([)" + std::to_string(kBase + 4000 * kMs) + "," + std::to_string(kBase + 9000 * kMs) +
+                               "," + std::to_string(kBase + 14000 * kMs) + "]";
+        writeOk(writeHandler, R"({"measurement":"dyn_t13","tags":{"d":"a"},)"
+                              R"("fields":{"state":["boot","ready","serving"]},"timestamps":)" +
+                                  ts + "}");
+
+        const uint64_t start = kBase + 4000 * kMs;
+        const uint64_t end = kBase + 20000 * kMs;
+
+        // Strings reduce to LATEST-per-anchored-bucket: bucket +4s holds
+        // boot(4s) and ready(9s) → "ready"; bucket +14s → "serving".
+        {
+            auto series = runQuery(queryHandler, "avg:dyn_t13(state){}", start, end, "10s", "start");
+            ASSERT_EQ(series.size(), 1u);
+            EXPECT_EQ(series[0].timestamps, (std::vector<uint64_t>{kBase + 4000 * kMs, kBase + 14000 * kMs}));
+            EXPECT_EQ(strings(series[0]), (std::vector<std::string>{"ready", "serving"}));
+        }
+
+        // Unknown alignment value → INVALID_QUERY, never a silent epoch answer.
+        {
+            auto rep =
+                queryHandler.handleQuery(makeQueryRequest("avg:dyn_t13(state){}", start, end, "10s", "middle")).get();
+            EXPECT_EQ(rep->_status, seastar::http::reply::status_type::bad_request) << rep->_content;
+            EXPECT_NE(rep->_content.find("bucketAlignment"), std::string::npos) << rep->_content;
+        }
+    })
+        .join()
+        .get();
+}
+
+// ---------------------------------------------------------------------------
+// T14: booleansAsNumeric=true rolls booleans up as 1.0/0.0.
+//
+// The observed incompatibility: [t,t,f,t,f] averaged to `false` under
+// TimeStar's canonical LATEST-per-bucket boolean rule, where rollup.js
+// produces 0.6.  The opt-in converts shard-side before aggregation, so every
+// method, both bucket grids, and every placement see plain doubles.  The
+// default is untouched, and strings stay non-numeric under the flag.
+// ---------------------------------------------------------------------------
+TEST_F(DynamoEquivalenceTest, BooleansAsNumericRollUpArithmetically) {
+    seastar::thread([] {
+        ScopedShardedEngine eng;
+        eng.start();
+
+        HttpWriteHandler writeHandler(&eng.eng);
+        HttpQueryHandler queryHandler(&eng.eng);
+
+        // [t,t,f,t,f] one second apart, all inside one 10s bucket, plus a
+        // string field to prove the flag leaves strings alone.
+        std::string ts = "[";
+        for (int i = 0; i < 5; ++i) {
+            if (i)
+                ts += ",";
+            ts += std::to_string(kBase + static_cast<uint64_t>(i) * 1000 * kMs);
+        }
+        ts += "]";
+        writeOk(writeHandler, R"({"measurement":"dyn_t14","tags":{"d":"a"},)"
+                              R"("fields":{"on":[true,true,false,true,false],)"
+                              R"("state":["x","y","z","y","w"]},"timestamps":)" +
+                                  ts + "}");
+
+        const uint64_t start = kBase;
+        const uint64_t end = kBase + 9999 * kMs;
+
+        auto runAll = [&](const char* phase) {
+            // Default: booleans are non-numeric — LATEST-per-bucket, returned
+            // as JSON booleans (the canonical rule, unchanged).
+            {
+                auto series = runQuery(queryHandler, "avg:dyn_t14(on){}", start, end, "10s");
+                ASSERT_EQ(series.size(), 1u) << phase;
+                EXPECT_EQ(bools(series[0]), (std::vector<bool>{false})) << phase;
+            }
+            // Flag on: avg([1,1,0,1,0]) = 0.6 in the epoch bucket.
+            {
+                auto series = runQuery(queryHandler, "avg:dyn_t14(on){}", start, end, "10s", "", true);
+                ASSERT_EQ(series.size(), 1u) << phase;
+                EXPECT_EQ(series[0].timestamps, (std::vector<uint64_t>{kBase})) << phase;
+                EXPECT_EQ(numbers(series[0]), (std::vector<double>{0.6})) << phase;
+            }
+            // Flag + start alignment compose: same single bucket, anchored label.
+            {
+                auto series = runQuery(queryHandler, "avg:dyn_t14(on){}", start, end, "10s", "start", true);
+                ASSERT_EQ(series.size(), 1u) << phase;
+                EXPECT_EQ(series[0].timestamps, (std::vector<uint64_t>{kBase})) << phase;
+                EXPECT_EQ(numbers(series[0]), (std::vector<double>{0.6})) << phase;
+            }
+            // Other methods see plain numbers: sum=3, count=5, min=0, max=1.
+            {
+                auto series = runQuery(queryHandler, "sum:dyn_t14(on){}", start, end, "10s", "", true);
+                ASSERT_EQ(series.size(), 1u) << phase;
+                EXPECT_EQ(numbers(series[0]), (std::vector<double>{3.0})) << phase;
+            }
+            {
+                auto series = runQuery(queryHandler, "count:dyn_t14(on){}", start, end, "10s", "", true);
+                ASSERT_EQ(series.size(), 1u) << phase;
+                EXPECT_EQ(numbers(series[0]), (std::vector<double>{5.0})) << phase;
+            }
+            // No interval: raw read returns 1/0 doubles under the flag.
+            {
+                auto series = runQuery(queryHandler, "avg:dyn_t14(on){}", start, end, "", "", true);
+                ASSERT_EQ(series.size(), 1u) << phase;
+                EXPECT_EQ(numbers(series[0]), (std::vector<double>{1.0, 1.0, 0.0, 1.0, 0.0})) << phase;
+            }
+            // Strings are untouched by the flag: LATEST-per-bucket, as strings.
+            {
+                auto series = runQuery(queryHandler, "avg:dyn_t14(state){}", start, end, "10s", "", true);
+                ASSERT_EQ(series.size(), 1u) << phase;
+                EXPECT_EQ(strings(series[0]), (std::vector<std::string>{"w"})) << phase;
+            }
+        };
+
+        runAll("memory store");
+        flushToTsm(eng.eng);
+        runAll("TSM");
     })
         .join()
         .get();

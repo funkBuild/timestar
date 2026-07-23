@@ -62,7 +62,7 @@ static seastar::future<> insertKnownValues(Engine& engine, int count = 10) {
 // AVG non-bucketed pushdown
 // ===========================================================================
 SEASTAR_TEST_F(NonBucketedPushdownTest, AVG_ReturnsCorrectAverage) {
-    Engine engine(timestar::StorageLayout("."));
+    Engine engine;
     co_await engine.init();
     co_await insertKnownValues(engine, 10);
 
@@ -95,7 +95,7 @@ SEASTAR_TEST_F(NonBucketedPushdownTest, AVG_ReturnsCorrectAverage) {
 // MIN non-bucketed pushdown
 // ===========================================================================
 SEASTAR_TEST_F(NonBucketedPushdownTest, MIN_ReturnsCorrectMinimum) {
-    Engine engine(timestar::StorageLayout("."));
+    Engine engine;
     co_await engine.init();
     co_await insertKnownValues(engine, 10);
 
@@ -127,7 +127,7 @@ SEASTAR_TEST_F(NonBucketedPushdownTest, MIN_ReturnsCorrectMinimum) {
 // MAX non-bucketed pushdown
 // ===========================================================================
 SEASTAR_TEST_F(NonBucketedPushdownTest, MAX_ReturnsCorrectMaximum) {
-    Engine engine(timestar::StorageLayout("."));
+    Engine engine;
     co_await engine.init();
     co_await insertKnownValues(engine, 10);
 
@@ -159,7 +159,7 @@ SEASTAR_TEST_F(NonBucketedPushdownTest, MAX_ReturnsCorrectMaximum) {
 // COUNT non-bucketed pushdown
 // ===========================================================================
 SEASTAR_TEST_F(NonBucketedPushdownTest, COUNT_ReturnsCorrectCount) {
-    Engine engine(timestar::StorageLayout("."));
+    Engine engine;
     co_await engine.init();
     co_await insertKnownValues(engine, 10);
 
@@ -191,7 +191,7 @@ SEASTAR_TEST_F(NonBucketedPushdownTest, COUNT_ReturnsCorrectCount) {
 // SUM non-bucketed pushdown
 // ===========================================================================
 SEASTAR_TEST_F(NonBucketedPushdownTest, SUM_ReturnsCorrectSum) {
-    Engine engine(timestar::StorageLayout("."));
+    Engine engine;
     co_await engine.init();
     co_await insertKnownValues(engine, 10);
 
@@ -224,7 +224,7 @@ SEASTAR_TEST_F(NonBucketedPushdownTest, SUM_ReturnsCorrectSum) {
 // SPREAD non-bucketed pushdown
 // ===========================================================================
 SEASTAR_TEST_F(NonBucketedPushdownTest, SPREAD_ReturnsCorrectSpread) {
-    Engine engine(timestar::StorageLayout("."));
+    Engine engine;
     co_await engine.init();
     co_await insertKnownValues(engine, 10);
 
@@ -256,7 +256,7 @@ SEASTAR_TEST_F(NonBucketedPushdownTest, SPREAD_ReturnsCorrectSpread) {
 // STDDEV non-bucketed pushdown
 // ===========================================================================
 SEASTAR_TEST_F(NonBucketedPushdownTest, STDDEV_ReturnsCorrectStdDev) {
-    Engine engine(timestar::StorageLayout("."));
+    Engine engine;
     co_await engine.init();
     co_await insertKnownValues(engine, 10);
 
@@ -291,7 +291,7 @@ SEASTAR_TEST_F(NonBucketedPushdownTest, STDDEV_ReturnsCorrectStdDev) {
 // STDVAR non-bucketed pushdown
 // ===========================================================================
 SEASTAR_TEST_F(NonBucketedPushdownTest, STDVAR_ReturnsCorrectVariance) {
-    Engine engine(timestar::StorageLayout("."));
+    Engine engine;
     co_await engine.init();
     co_await insertKnownValues(engine, 10);
 
@@ -324,7 +324,7 @@ SEASTAR_TEST_F(NonBucketedPushdownTest, STDVAR_ReturnsCorrectVariance) {
 // MEDIAN requires raw values — pushdown returns nullopt
 // ===========================================================================
 SEASTAR_TEST_F(NonBucketedPushdownTest, MEDIAN_ReturnsNullopt) {
-    Engine engine(timestar::StorageLayout("."));
+    Engine engine;
     co_await engine.init();
     co_await insertKnownValues(engine, 10);
 
@@ -345,7 +345,7 @@ SEASTAR_TEST_F(NonBucketedPushdownTest, MEDIAN_ReturnsNullopt) {
 // EXACT_MEDIAN falls back to nullopt (not streamable)
 // ===========================================================================
 SEASTAR_TEST_F(NonBucketedPushdownTest, EXACT_MEDIAN_FallsBackToNullopt) {
-    Engine engine(timestar::StorageLayout("."));
+    Engine engine;
     co_await engine.init();
     co_await insertKnownValues(engine, 10);
 
@@ -501,7 +501,7 @@ TEST(CollapsedStateMergeTest, MergeAllCollapsed_AVG) {
     partials.push_back(std::move(p1));
     partials.push_back(std::move(p2));
 
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::AVG);
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::AVG).get();
 
     ASSERT_EQ(grouped.size(), 1u);
     ASSERT_EQ(grouped[0].points.size(), 1u);
@@ -543,7 +543,7 @@ TEST(CollapsedStateMergeTest, MergeAllCollapsed_SUM) {
     partials.push_back(std::move(p1));
     partials.push_back(std::move(p2));
 
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::SUM);
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::SUM).get();
 
     ASSERT_EQ(grouped.size(), 1u);
     ASSERT_EQ(grouped[0].points.size(), 1u);
@@ -585,7 +585,7 @@ TEST(CollapsedStateMergeTest, MergeAllCollapsed_MIN) {
     partials.push_back(std::move(p1));
     partials.push_back(std::move(p2));
 
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::MIN);
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::MIN).get();
 
     ASSERT_EQ(grouped.size(), 1u);
     ASSERT_EQ(grouped[0].points.size(), 1u);
@@ -626,7 +626,7 @@ TEST(CollapsedStateMergeTest, MergeAllCollapsed_MAX) {
     partials.push_back(std::move(p1));
     partials.push_back(std::move(p2));
 
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::MAX);
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::MAX).get();
 
     ASSERT_EQ(grouped.size(), 1u);
     ASSERT_EQ(grouped[0].points.size(), 1u);
@@ -668,7 +668,7 @@ TEST(CollapsedStateMergeTest, MergeAllCollapsed_COUNT) {
     partials.push_back(std::move(p1));
     partials.push_back(std::move(p2));
 
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::COUNT);
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::COUNT).get();
 
     ASSERT_EQ(grouped.size(), 1u);
     ASSERT_EQ(grouped[0].points.size(), 1u);
@@ -709,7 +709,7 @@ TEST(CollapsedStateMergeTest, MergeAllCollapsed_SPREAD) {
     partials.push_back(std::move(p1));
     partials.push_back(std::move(p2));
 
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::SPREAD);
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::SPREAD).get();
 
     ASSERT_EQ(grouped.size(), 1u);
     ASSERT_EQ(grouped[0].points.size(), 1u);
@@ -759,7 +759,7 @@ TEST(CollapsedStateMergeTest, MixedCollapsedAndRaw_FallsBack) {
     partials.push_back(std::move(p2));
 
     // Should handle mixed partials gracefully (converts collapsed to single-element state)
-    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::SUM);
+    auto grouped = Aggregator::mergePartialAggregationsGrouped(partials, AggregationMethod::SUM).get();
 
     ASSERT_EQ(grouped.size(), 1u);
     // The merged result should have points (collapsed converted to a single-element state,

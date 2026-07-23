@@ -1,4 +1,5 @@
 #include "../../../lib/index/native/local_id_map.hpp"
+
 #include "../../../lib/core/series_id.hpp"
 
 #include <gtest/gtest.h>
@@ -86,7 +87,7 @@ TEST_F(LocalIdMapTest, Restore) {
     LocalIdMap restored;
     restored.restoreBegin(50, 50);
     for (uint32_t i = 0; i < 50; ++i) {
-        restored.restoreEntry(i, ids[i]);
+        EXPECT_TRUE(restored.restoreEntry(i, ids[i]));
     }
 
     EXPECT_EQ(restored.size(), 50u);
@@ -104,6 +105,53 @@ TEST_F(LocalIdMapTest, Restore) {
     SeriesId128 newId = SeriesId128::fromSeriesKey("restore_series_50");
     uint32_t newLocal = restored.getOrAssign(newId);
     EXPECT_EQ(newLocal, 50u);
+}
+
+TEST_F(LocalIdMapTest, RestoreToleratesCounterAboveSpeculativeCap) {
+    // getOrAssign() issues ids up to UINT32_MAX at runtime and persists the
+    // counter; restore must accept the same range or a legitimately large
+    // shard runs fine until its next restart and then can never open again.
+    // Only the up-front pre-allocation is capped — entries grow the map.
+    const uint32_t bigCounter = LocalIdMap::kMaxSpeculativeRestoreIds + 5000;
+
+    LocalIdMap restored;
+    restored.restoreBegin(bigCounter, bigCounter);  // must not throw
+    EXPECT_EQ(restored.nextId(), bigCounter);
+
+    // Entries below AND above the speculative cap both restore.
+    SeriesId128 low = SeriesId128::fromSeriesKey("big_shard_low");
+    SeriesId128 high = SeriesId128::fromSeriesKey("big_shard_high");
+    EXPECT_TRUE(restored.restoreEntry(7, low));
+    EXPECT_TRUE(restored.restoreEntry(bigCounter - 1, high));
+
+    EXPECT_EQ(restored.getGlobalId(7), low);
+    EXPECT_EQ(restored.getGlobalId(bigCounter - 1), high);
+    EXPECT_TRUE(restored.isValid(bigCounter - 1));
+
+    // New assignments continue past the restored counter — no id reuse.
+    SeriesId128 fresh = SeriesId128::fromSeriesKey("big_shard_new");
+    EXPECT_EQ(restored.getOrAssign(fresh), bigCounter);
+}
+
+TEST_F(LocalIdMapTest, RestoreSkipsImplausiblyLargeEntryIds) {
+    // A forward-key id implausibly far past the persisted counter is a corrupt
+    // scan key: accepting it would drive a resize of up to 64 GB on the
+    // startup path. It must be skipped (returns false), not grow the map and
+    // not throw — one corrupt key must not brick the shard.
+    LocalIdMap restored;
+    restored.restoreBegin(100, 100);
+
+    SeriesId128 good = SeriesId128::fromSeriesKey("plausible");
+    SeriesId128 evil = SeriesId128::fromSeriesKey("corrupt_key");
+
+    // Within the slack past the counter: accepted (crash-window tolerance).
+    EXPECT_TRUE(restored.restoreEntry(100 + 10, good));
+    EXPECT_EQ(restored.nextId(), 111u);
+
+    // Far past the counter: rejected, state unchanged.
+    EXPECT_FALSE(restored.restoreEntry(100 + LocalIdMap::kRestoreIdSlack, evil));
+    EXPECT_EQ(restored.nextId(), 111u);
+    EXPECT_FALSE(restored.getLocalId(evil).has_value());
 }
 
 TEST_F(LocalIdMapTest, ManySeriesRoundTrip) {

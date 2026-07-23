@@ -10,18 +10,10 @@
 #include <seastar/util/log.hh>
 #include <stdexcept>
 #include <unordered_set>
-#include <utility>
 
 namespace timestar::index {
 
 static seastar::logger manifest_log("timestar.manifest");
-
-Manifest::Manifest(timestar::StorageLayout layout, unsigned workerId) {
-    const auto anchored = layout.anchored();
-    directory_ = anchored.nativeIndexDir(workerId).string();
-    manifestPath_ = anchored.nativeManifestFile(workerId).string();
-    manifestTemporaryPath_ = anchored.nativeManifestTemporaryFile(workerId).string();
-}
 
 static void encodeFixed32(std::string& out, uint32_t v) {
     char buf[4];
@@ -39,6 +31,20 @@ static void encodeFixed64(std::string& out, uint64_t v) {
     out.append(buf, 8);
 }
 
+static uint32_t decodeFixed32(const char* p) {
+    return static_cast<uint32_t>(static_cast<uint8_t>(p[0])) |
+           (static_cast<uint32_t>(static_cast<uint8_t>(p[1])) << 8) |
+           (static_cast<uint32_t>(static_cast<uint8_t>(p[2])) << 16) |
+           (static_cast<uint32_t>(static_cast<uint8_t>(p[3])) << 24);
+}
+
+static uint64_t decodeFixed64(const char* p) {
+    uint64_t r = 0;
+    for (int i = 0; i < 8; ++i)
+        r |= static_cast<uint64_t>(static_cast<uint8_t>(p[i])) << (i * 8);
+    return r;
+}
+
 seastar::future<> Manifest::openFileForAppend() {
     if (fileOpen_) {
         co_await file_.flush();
@@ -54,9 +60,12 @@ seastar::future<> Manifest::openFileForAppend() {
     writeOffset_ = co_await file_.size();
 }
 
-seastar::future<Manifest> Manifest::open(timestar::StorageLayout layout, unsigned workerId) {
-    Manifest m(std::move(layout), workerId);
-    co_await seastar::recursive_touch_directory(m.directory_);
+seastar::future<Manifest> Manifest::open(std::string directory) {
+    co_await seastar::recursive_touch_directory(directory);
+
+    Manifest m;
+    m.directory_ = directory;
+    m.manifestPath_ = directory + "/MANIFEST";
 
     bool exists = co_await seastar::file_exists(m.manifestPath_);
     bool needsRewrite = false;
@@ -271,7 +280,7 @@ seastar::future<> Manifest::writeSnapshot() {
     crcFraming_ = true;
 
     // Write atomically: write to temp file via DMA, fsync, then rename.
-    const auto& tmpPath = manifestTemporaryPath_;
+    auto tmpPath = manifestPath_ + ".tmp";
     auto tmpFile = co_await seastar::open_file_dma(
         tmpPath, seastar::open_flags::wo | seastar::open_flags::create | seastar::open_flags::truncate);
     auto tmpAlign = tmpFile.disk_write_dma_alignment();
@@ -337,31 +346,169 @@ seastar::future<> Manifest::recover() {
     auto fileBuf = co_await readFile.dma_read_bulk<char>(0, fileSize);
     co_await readFile.close();
 
-    const auto decoded = decodeManifest(std::string_view(fileBuf.get(), static_cast<size_t>(fileSize)));
-    if (decoded.status == ManifestDecodeStatus::Fatal) {
-        throw std::runtime_error("Manifest is invalid at offset " + std::to_string(decoded.issueOffset) + ": " +
-                                 decoded.issue + ": " + manifestPath_);
+    const char* p = fileBuf.get();
+    const char* end = p + fileSize;
+
+    // Detect the format: v2 manifests start with a magic+version header and
+    // CRC-framed records; legacy (v1) manifests start directly with
+    // [len][record] frames and carry no checksums.
+    if (static_cast<size_t>(end - p) >= MANIFEST_HEADER_SIZE && decodeFixed32(p) == MANIFEST_MAGIC) {
+        uint32_t version = decodeFixed32(p + 4);
+        if (version != MANIFEST_VERSION) {
+            throw std::runtime_error("Manifest unsupported version " + std::to_string(version) + ": " + manifestPath_);
+        }
+        crcFraming_ = true;
+        p += MANIFEST_HEADER_SIZE;
     }
 
-    crcFraming_ = decoded.format == ManifestDiskFormat::CrcV2;
-    recoveryTruncated_ = decoded.status == ManifestDecodeStatus::RecoverableTail;
-    nextFileNumber_ = decoded.nextFileNumber;
-    files_.reserve(decoded.files.size());
-    for (const auto& decodedFile : decoded.files) {
-        SSTableMetadata file;
-        file.fileNumber = decodedFile.fileNumber;
-        file.entryCount = decodedFile.entryCount;
-        file.fileSize = decodedFile.fileSize;
-        file.minKey = decodedFile.minKey;
-        file.maxKey = decodedFile.maxKey;
-        file.level = decodedFile.level;
-        file.writeTimestamp = decodedFile.writeTimestamp;
-        files_.push_back(std::move(file));
+    if (crcFraming_) {
+        // v2: [record_len(4)][record_crc(4)][record]
+        while (p + 8 <= end) {
+            uint32_t recordLen = decodeFixed32(p);
+            uint32_t storedCrc = decodeFixed32(p + 4);
+            if (p + 8 + recordLen > end) {
+                recoveryTruncated_ = true;  // torn tail from a crash mid-append
+                break;
+            }
+            p += 8;
+
+            uint32_t computedCrc = CRC32::compute(p, recordLen);
+            if (computedCrc != storedCrc) {
+                // Same policy as WAL replay: stop at the first corrupt record
+                // and keep everything recovered before it. open() rewrites a
+                // clean snapshot so the corrupt tail is discarded atomically.
+                manifest_log.error(
+                    "Manifest record CRC mismatch at offset {} in {} (stored {:#x}, computed {:#x}) — "
+                    "stopping recovery, {} trailing bytes discarded",
+                    static_cast<size_t>(p - 8 - fileBuf.get()), manifestPath_, storedCrc, computedCrc,
+                    static_cast<size_t>(end - p + 8));
+                recoveryTruncated_ = true;
+                break;
+            }
+
+            applyRecord(p, p + recordLen);
+            p += recordLen;
+        }
+        if (p < end && !recoveryTruncated_) {
+            recoveryTruncated_ = true;  // trailing partial length header
+        }
+        co_return;
     }
 
-    if (recoveryTruncated_) {
-        manifest_log.error("Manifest recovery stopped at offset {} in {}: {}", decoded.issueOffset, manifestPath_,
-                           decoded.issue);
+    // Legacy v1: [record_len(4)][record], no CRC. Legacy manifests are always
+    // rewritten as v2 snapshots by open(), which also discards any torn tail.
+    while (p + 4 <= end) {
+        uint32_t recordLen = decodeFixed32(p);
+        p += 4;
+        if (p + recordLen > end)
+            break;
+
+        applyRecord(p, p + recordLen);
+        p += recordLen;
+    }
+}
+
+// Apply one decoded record (type byte + payload) to the in-memory file set.
+void Manifest::applyRecord(const char* rp, const char* rend) {
+    if (rp >= rend)
+        return;
+    auto type = static_cast<RecordType>(*rp);
+    ++rp;
+
+    if (type == RecordType::Snapshot) {
+        files_.clear();
+        if (rp + 12 > rend)
+            return;
+        nextFileNumber_ = decodeFixed64(rp);
+        rp += 8;
+        uint32_t fileCount = decodeFixed32(rp);
+        rp += 4;
+
+        for (uint32_t i = 0; i < fileCount; ++i) {
+            if (rp + 28 > rend)
+                break;
+            SSTableMetadata f;
+            f.fileNumber = decodeFixed64(rp);
+            rp += 8;
+            f.level = static_cast<int>(decodeFixed32(rp));
+            rp += 4;
+            f.fileSize = decodeFixed64(rp);
+            rp += 8;
+            f.entryCount = decodeFixed64(rp);
+            rp += 8;
+
+            if (rp + 4 > rend)
+                break;
+            uint32_t minKeyLen = decodeFixed32(rp);
+            rp += 4;
+            if (rp + minKeyLen > rend)
+                break;
+            f.minKey.assign(rp, minKeyLen);
+            rp += minKeyLen;
+
+            if (rp + 4 > rend)
+                break;
+            uint32_t maxKeyLen = decodeFixed32(rp);
+            rp += 4;
+            if (rp + maxKeyLen > rend)
+                break;
+            f.maxKey.assign(rp, maxKeyLen);
+            rp += maxKeyLen;
+
+            // writeTimestamp (present in all snapshots written by this codebase).
+            if (rp + 8 <= rend) {
+                f.writeTimestamp = decodeFixed64(rp);
+                rp += 8;
+            }
+
+            files_.push_back(std::move(f));
+        }
+    } else if (type == RecordType::AddFile) {
+        if (rp + 28 > rend)
+            return;
+        SSTableMetadata f;
+        f.fileNumber = decodeFixed64(rp);
+        rp += 8;
+        f.level = static_cast<int>(decodeFixed32(rp));
+        rp += 4;
+        f.fileSize = decodeFixed64(rp);
+        rp += 8;
+        f.entryCount = decodeFixed64(rp);
+        rp += 8;
+
+        if (rp + 4 > rend)
+            return;
+        uint32_t minKeyLen = decodeFixed32(rp);
+        rp += 4;
+        if (rp + minKeyLen > rend)
+            return;
+        f.minKey.assign(rp, minKeyLen);
+        rp += minKeyLen;
+
+        if (rp + 4 > rend)
+            return;
+        uint32_t maxKeyLen = decodeFixed32(rp);
+        rp += 4;
+        if (rp + maxKeyLen > rend)
+            return;
+        f.maxKey.assign(rp, maxKeyLen);
+        rp += maxKeyLen;
+
+        // writeTimestamp (v2 extension, optional for backward compat)
+        if (rp + 8 <= rend) {
+            f.writeTimestamp = decodeFixed64(rp);
+            rp += 8;
+        }
+
+        uint64_t fn = f.fileNumber;
+        files_.push_back(std::move(f));
+        if (fn >= nextFileNumber_)
+            nextFileNumber_ = fn + 1;
+    } else if (type == RecordType::RemoveFile) {
+        if (rp + 8 > rend)
+            return;
+        uint64_t fn = decodeFixed64(rp);
+        std::erase_if(files_, [fn](const SSTableMetadata& ff) { return ff.fileNumber == fn; });
     }
 }
 

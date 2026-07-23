@@ -130,7 +130,10 @@ The codebase is organized around these key abstractions:
    - String values compressed using zstd compression with variable-length prefixes
 
 3. **WAL** (`lib/storage/wal.hpp/cpp`) - Write-Ahead Log for durability
-   - Ensures data persistence before acknowledgment
+   - Ensures data persistence before acknowledgment via group commit
+     (`[storage] wal_sync_mode = "always"`, the default: acks wait for a
+     shared flush+fdatasync round; `"interval"` bounds the loss window in
+     time instead; `"rollover"` is the legacy volatile-until-rotation mode)
    - Used to recover in-memory stores on restart
    - Supports write, delete, and delete-range operations
 
@@ -403,9 +406,28 @@ The TimeStar provides a query endpoint with a simplified string-based query form
   "query": "aggregationMethod:measurement(fields){scopes} by {aggregationTagKeys}",
   "startTime": 1704067200000000000,  // Nanoseconds since epoch (Jan 1, 2024)
   "endTime": 1706745599000000000,    // Nanoseconds since epoch (Jan 31, 2024)
-  "aggregationInterval": 300000000000 // Optional: Time bucket interval in nanoseconds (5 minutes)
+  "aggregationInterval": 300000000000, // Optional: Time bucket interval in nanoseconds (5 minutes)
+  "bucketAlignment": "epoch",        // Optional: "epoch" (default) or "start" — see below
+  "booleansAsNumeric": false         // Optional: aggregate booleans as 1.0/0.0 — see below
 }
 ```
+
+**Migration-compat options** (both default OFF; also available on the protobuf
+`QueryRequest` as `bucket_alignment` / `booleans_as_numeric`; designed for
+rollup.js-style readers):
+- `"bucketAlignment": "start"` anchors the bucket grid at `startTime` instead
+  of the epoch: `bucket = startTime + floor((ts - startTime)/interval)*interval`.
+  Labels are still bucket starts and empty buckets are still omitted.  Any
+  value other than `"epoch"`/`"start"` is an `INVALID_QUERY` error.  Anchored
+  queries bypass the pushdown/batch/streaming fast paths (whose bucket math is
+  epoch-only) and take the fallback aggregation path on every placement, so
+  the answer cannot depend on the query plan.
+- `"booleansAsNumeric": true` converts boolean fields to `1.0`/`0.0` shard-side
+  BEFORE aggregation, so they participate arithmetically in every method
+  (`avg` of `[t,t,f,t,f]` = `0.6`) and are returned as numbers — including on
+  raw no-interval reads.  Strings remain non-numeric regardless.  A boolean
+  series that fails to read under this flag drops to `QUERY_INCOMPLETE` rather
+  than silently substituting the LATEST-per-bucket recovery answer.
 
 ### Query String Format
 
@@ -498,7 +520,10 @@ dropped:
 Booleans were previously coerced to `1.0`/`0.0` and aggregated arithmetically,
 which also dropped their series tags (only numeric fields route through the
 aggregator, which keeps group-by tags only). They now follow the string rule
-exactly — see `test/unit/http/dynamo_equivalence_test.cpp`.
+exactly — see `test/unit/http/dynamo_equivalence_test.cpp`.  The per-request
+opt-in `"booleansAsNumeric": true` (migration compat, see the request format)
+restores arithmetic aggregation for booleans on that query only, by converting
+them to doubles before the split — the canonical default is unchanged.
 
 `timestar::isNonNumericValueType()` (lib/storage/tsm.hpp) is the single
 definition of this rule at the `TSMValueType` level: every gate that keeps
@@ -687,9 +712,12 @@ are orthogonal — a `by {tags}` clause must never change the time axis. Only an
 definition) reduces the time axis.
 
 **With `aggregationInterval` (> 0):**
-- Buckets are **epoch-aligned**: each point lands in bucket
+- Buckets are **epoch-aligned** by default: each point lands in bucket
   `floor(timestamp / interval) * interval`. Bucket boundaries do NOT shift
-  with the query's startTime.
+  with the query's startTime.  The opt-in `"bucketAlignment": "start"`
+  (migration compat, see the request format above) anchors the grid at
+  startTime instead; every other rule in this section applies unchanged in
+  that mode.
 - `endTime` is inclusive; a range that ends exactly on a bucket boundary
   includes that boundary's bucket.
 - Empty buckets are omitted (no gap filling).
@@ -775,6 +803,58 @@ pushdown, SIMD folds, and scalar folds all agree. Full policy in
 - **-0.0 round-trips raw reads bit-exactly** (ALP stores NaN/±Inf/-0.0 as
   raw-bit exceptions). Aggregated results may normalize -0.0 to +0.0 (IEEE
   addition/comparison semantics) — documented behaviour, not a bug.
+
+### Incomplete Results Are Failures, Never Short Answers (canonical semantics)
+
+A response that is missing data must never report success. This applies at two
+levels, and the second changed behaviour in the decode-count-contract work.
+
+**Series level.** A series the query could not read fails the whole query with
+`QUERY_INCOMPLETE` (HTTP 500) naming the count and first reason, rather than
+being omitted from an otherwise-successful response. An empty result must mean
+"this range genuinely holds no data" and nothing else.
+
+**Block level (behaviour change).** A TSM block whose decoded value count does
+not match its timestamp count now raises `BlockDecodeError`, which routes into
+the same `QUERY_INCOMPLETE` path. Previously such a block was dropped and the
+query returned **HTTP 200 with fewer points** -- a silent partial answer.
+
+The contract enforced at `TSM::decodeBlockFlat` / `readSingleBlock` /
+`decodeBlock`:
+
+- `produced > expected` -- benign. A decoder working in fixed-size groups can
+  overshoot the tail; the excess is truncated.
+- `produced < expected` -- the block is corrupt or a decoder regressed. Raised.
+  There is no safe repair: pairing `values[i]` with `timestamps[i]` past the
+  shortfall MISPAIRS real data, presenting a wrong point as a valid one. That is
+  why the old consumer-side clamp was removed rather than kept as defence in
+  depth -- with 3001 timestamps and 1 surviving value it emitted `timestamps[0]`
+  against a value belonging to point 3000.
+- The decoder must have APPENDED. Both vectors accumulate across every block of
+  a series, so a decoder that clears the output destroys earlier blocks' values
+  while their timestamps remain. Trusting a decoder's own produced-count does
+  NOT catch this -- the clobbering block reports `produced == expected` for its
+  own points and looks healthy. Only the buffer's real growth reveals it.
+- Timestamps must not exceed the count the block declares. Both FFOR paths clamp
+  internally; this is the check at the consumer, and it is the only thing between
+  a future timestamp over-read and values being fabricated to match it.
+
+Value decoders (`ALPDecoder`, `BoolEncoderRLE`, both `StringEncoder` skip/limit
+overloads) return the number of values ACTUALLY decoded. They report; the
+block-level caller decides. They previously disagreed about how a shortfall even
+manifests -- ALP trimmed, bool threw, string and integer silently under-produced
+-- and that divergence is what let a desynced pair reach the query.
+
+**Client impact.** A caller that treats an error as "no data" now silently takes
+the wrong branch on corruption, where before it received a plausible-looking
+short answer. Both are wrong; the error is at least visible. `QUERY_INCOMPLETE`
+means *"this range may hold data that could not be read"* and must be
+distinguished from an empty success. Retrying will not help for a corrupt block
+-- the failure is deterministic until the file is repaired or compacted away.
+
+Pinned by `test/unit/storage/corrupt_block_fails_query_test.cpp` (end to end,
+via real file corruption) and `test/unit/encoding/decoder_produced_count_test.cpp`
+(the per-decoder report).
 
 ### Query Features
 

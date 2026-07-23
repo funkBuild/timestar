@@ -91,7 +91,7 @@ public:
 
 // Single test that runs all phases sequentially
 SEASTAR_TEST_F(NativeIndexBench, FullBenchmark) {
-    NativeIndex index(timestar::StorageLayout("."), 0);
+    NativeIndex index(0);
     co_await index.open();
 
     fmt::print("\n╔══════════════════════════════════════════════════════════════════════╗\n");

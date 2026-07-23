@@ -337,9 +337,8 @@ TEST_F(StringEncoderTest, StringEncoder_Decode_InvalidLengthThrows) {
     // Zstd-compress the malformed payload.
     size_t maxCompLen = ZSTD_compressBound(uncompressed.size());
     std::vector<char> compressed(maxCompLen);
-    size_t compSize = ZSTD_compress(compressed.data(), maxCompLen,
-                                     reinterpret_cast<const char*>(uncompressed.data()),
-                                     uncompressed.size(), 1);
+    size_t compSize = ZSTD_compress(compressed.data(), maxCompLen, reinterpret_cast<const char*>(uncompressed.data()),
+                                    uncompressed.size(), 1);
     ASSERT_FALSE(ZSTD_isError(compSize));
 
     // Assemble the full encoded buffer with the standard 16-byte header.
@@ -379,9 +378,8 @@ TEST_F(StringEncoderTest, StringEncoder_Decode_VarIntTooLargeThrows) {
 
     size_t maxCompLen = ZSTD_compressBound(uncompressed.size());
     std::vector<char> compressed(maxCompLen);
-    size_t compSize = ZSTD_compress(compressed.data(), maxCompLen,
-                                     reinterpret_cast<const char*>(uncompressed.data()),
-                                     uncompressed.size(), 1);
+    size_t compSize = ZSTD_compress(compressed.data(), maxCompLen, reinterpret_cast<const char*>(uncompressed.data()),
+                                    uncompressed.size(), 1);
     ASSERT_FALSE(ZSTD_isError(compSize));
 
     // Build the 16-byte header + compressed payload.
@@ -399,4 +397,91 @@ TEST_F(StringEncoderTest, StringEncoder_Decode_VarIntTooLargeThrows) {
     // 5th byte, not silently truncate and return a garbage string length.
     std::vector<std::string> out;
     EXPECT_THROW(StringEncoder::decode(buf, 1, out), std::runtime_error);
+}
+// ---------------------------------------------------------------------------
+// The skip/limit decode overloads APPEND to `out`; they must never clear it.
+//
+// TSM::decodeBlockFlat() decodes every block of a series into ONE shared flat
+// value vector while IntegerEncoder appends that block's timestamps to a shared
+// timestamp vector -- the float, bool and integer decoders all append, and the
+// string decoders used to clear.  A multi-block string series therefore came
+// back with every block's timestamps but only the LAST block's values (observed:
+// 3600 timestamps, 600 values).  Downstream code indexes values[i] by a
+// timestamp index, so the desync was an out-of-bounds read: it surfaced as empty
+// strings on an HTTP 200 and as a segfaulted shard.
+//
+// These tests pin the contract at the encoder, where it is cheap to check.
+// ---------------------------------------------------------------------------
+
+TEST_F(StringEncoderTest, SkipLimitDecodeAppendsAcrossBlocks) {
+    const std::vector<std::string> blockA = {"a0", "a1", "a2"};
+    const std::vector<std::string> blockB = {"b0", "b1"};
+
+    auto encodedA = StringEncoder::encode(blockA);
+    auto encodedB = StringEncoder::encode(blockB);
+
+    std::vector<std::string> out;
+    Slice sliceA(encodedA.data.data(), encodedA.size());
+    StringEncoder::decode(sliceA, blockA.size(), 0, blockA.size(), out);
+    ASSERT_EQ(out.size(), blockA.size());
+
+    Slice sliceB(encodedB.data.data(), encodedB.size());
+    StringEncoder::decode(sliceB, blockB.size(), 0, blockB.size(), out);
+
+    ASSERT_EQ(out.size(), blockA.size() + blockB.size())
+        << "second block's decode dropped the first block's values -- decode() cleared `out` "
+           "instead of appending";
+    EXPECT_EQ(out[0], "a0");
+    EXPECT_EQ(out[1], "a1");
+    EXPECT_EQ(out[2], "a2");
+    EXPECT_EQ(out[3], "b0");
+    EXPECT_EQ(out[4], "b1");
+}
+
+// A prefilled `out` must be preserved: decodeBlockFlat hands in a vector that
+// already holds earlier blocks' values.
+TEST_F(StringEncoderTest, SkipLimitDecodePreservesPrefilledOutput) {
+    const std::vector<std::string> block = {"x", "y"};
+    auto encoded = StringEncoder::encode(block);
+
+    std::vector<std::string> out = {"pre0", "pre1"};
+    Slice slice(encoded.data.data(), encoded.size());
+    StringEncoder::decode(slice, block.size(), 0, block.size(), out);
+
+    ASSERT_EQ(out.size(), 4u) << "decode() clobbered values that were already in `out`";
+    EXPECT_EQ(out[0], "pre0");
+    EXPECT_EQ(out[1], "pre1");
+    EXPECT_EQ(out[2], "x");
+    EXPECT_EQ(out[3], "y");
+}
+
+// Skip/limit windows must also append, since a partially-overlapping block
+// decodes only the in-range slice of its values.
+TEST_F(StringEncoderTest, SkipLimitDecodeAppendsWindowedSlice) {
+    const std::vector<std::string> block = {"v0", "v1", "v2", "v3", "v4"};
+    auto encoded = StringEncoder::encode(block);
+
+    std::vector<std::string> out = {"kept"};
+    Slice slice(encoded.data.data(), encoded.size());
+    // Skip the first 2, take the next 2 => v2, v3
+    StringEncoder::decode(slice, block.size(), 2, 2, out);
+
+    ASSERT_EQ(out.size(), 3u);
+    EXPECT_EQ(out[0], "kept");
+    EXPECT_EQ(out[1], "v2");
+    EXPECT_EQ(out[2], "v3");
+}
+
+// An empty block must be a no-op on `out`, not a reset.
+TEST_F(StringEncoderTest, SkipLimitDecodeOfEmptyBlockKeepsExistingOutput) {
+    const std::vector<std::string> empty;
+    auto encoded = StringEncoder::encode(empty);
+
+    std::vector<std::string> out = {"before0", "before1"};
+    Slice slice(encoded.data.data(), encoded.size());
+    StringEncoder::decode(slice, 0, 0, 0, out);
+
+    ASSERT_EQ(out.size(), 2u) << "an empty block cleared previously decoded values";
+    EXPECT_EQ(out[0], "before0");
+    EXPECT_EQ(out[1], "before1");
 }

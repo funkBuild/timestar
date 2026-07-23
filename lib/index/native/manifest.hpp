@@ -1,8 +1,6 @@
 #pragma once
 
-#include "manifest_format.hpp"
 #include "sstable.hpp"
-#include "storage_layout.hpp"
 
 #include <cstdint>
 #include <optional>
@@ -39,10 +37,7 @@ namespace timestar::index {
 // All I/O uses Seastar's native async DMA file operations.
 class Manifest {
 public:
-    Manifest(Manifest&&) noexcept = default;
-    Manifest& operator=(Manifest&&) noexcept = delete;
-
-    static seastar::future<Manifest> open(timestar::StorageLayout layout, unsigned workerId);
+    static seastar::future<Manifest> open(std::string directory);
 
     // Current file set
     const std::vector<SSTableMetadata>& files() const { return files_; }
@@ -71,18 +66,21 @@ public:
     const std::string& directory() const { return directory_; }
 
     // v2 header: magic "TSMF" + version. Little-endian fixed32 encoding.
-    static constexpr uint32_t MANIFEST_MAGIC = timestar::index::MANIFEST_MAGIC;
-    static constexpr uint32_t MANIFEST_VERSION = timestar::index::MANIFEST_VERSION;
-    static constexpr size_t MANIFEST_HEADER_SIZE = timestar::index::MANIFEST_HEADER_SIZE;
+    static constexpr uint32_t MANIFEST_MAGIC = 0x464D5354;  // "TSMF"
+    static constexpr uint32_t MANIFEST_VERSION = 2;
+    static constexpr size_t MANIFEST_HEADER_SIZE = 8;
 
 private:
-    Manifest(timestar::StorageLayout layout, unsigned workerId);
+    Manifest() = default;
 
     // Append a length-prefixed frame to the manifest file using DMA I/O.
     seastar::future<> appendFrame(const std::string& frame);
 
     // Append one CRC-framed record ([len][crc][record]) to out.
     static void appendRecordFrame(std::string& out, const std::string& record);
+
+    // Apply a single decoded record (type byte + payload) to in-memory state.
+    void applyRecord(const char* rp, const char* rend);
 
     // Open (or reopen) the manifest file handle for appending.
     seastar::future<> openFileForAppend();
@@ -93,7 +91,6 @@ private:
 
     std::string directory_;
     std::string manifestPath_;
-    std::string manifestTemporaryPath_;
     uint64_t nextFileNumber_ = 1;
     std::vector<SSTableMetadata> files_;
 

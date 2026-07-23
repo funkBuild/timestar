@@ -11,7 +11,6 @@
 #include <seastar/core/smp.hh>
 #include <seastar/core/thread.hh>
 #include <string>
-#include <utility>
 
 namespace fs = std::filesystem;
 
@@ -71,8 +70,7 @@ class ScopedEngine {
 public:
     std::unique_ptr<Engine> engine;
 
-    explicit ScopedEngine(timestar::StorageLayout layout = timestar::StorageLayout("."))
-        : engine(std::make_unique<Engine>(std::move(layout))) {}
+    ScopedEngine() : engine(std::make_unique<Engine>()) {}
 
     void init() { engine->init().get(); }
 
@@ -117,11 +115,10 @@ class ScopedShardedEngine {
 public:
     seastar::sharded<Engine> eng;
 
-    explicit ScopedShardedEngine(timestar::StorageLayout layout = timestar::StorageLayout("."))
-        : layout_(layout.anchored()) {}
+    ScopedShardedEngine() = default;
 
     void start() {
-        eng.start(layout_).get();
+        eng.start().get();
         eng.invoke_on_all([](Engine& engine) { return engine.init(); }).get();
         // Set back-reference for cross-shard metadata indexing
         eng.invoke_on_all([this](Engine& engine) {
@@ -132,7 +129,7 @@ public:
     }
 
     void startWithBackground() {
-        eng.start(layout_).get();
+        eng.start().get();
         eng.invoke_on_all([](Engine& engine) { return engine.init(); }).get();
         // Set back-reference for cross-shard metadata indexing
         eng.invoke_on_all([this](Engine& engine) {
@@ -158,7 +155,4 @@ public:
     // Non-copyable, non-movable
     ScopedShardedEngine(const ScopedShardedEngine&) = delete;
     ScopedShardedEngine& operator=(const ScopedShardedEngine&) = delete;
-
-private:
-    const timestar::StorageLayout layout_;
 };

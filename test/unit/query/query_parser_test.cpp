@@ -108,6 +108,26 @@ TEST_F(QueryParserTest, ParseQueryWithWhitespace) {
     EXPECT_EQ(request.groupByTags[0], "sensor");
 }
 
+// Measurement and field names may contain spaces (real-world SCADA tag names).
+// The measurement is delimited by '(' so internal whitespace is unambiguous.
+TEST_F(QueryParserTest, ParseSpacedMeasurementAndField) {
+    QueryRequest request = QueryParser::parseQueryString("latest:Wash Down Bay System(Home 5 Flow)");
+    EXPECT_EQ(request.measurement, "Wash Down Bay System");
+    ASSERT_EQ(request.fields.size(), 1u);
+    EXPECT_EQ(request.fields[0], "Home 5 Flow");
+}
+
+TEST_F(QueryParserTest, ParseSpacedMeasurementWithScopeAndGroupBy) {
+    QueryRequest request =
+        QueryParser::parseQueryString("avg:Transfer Pump(Hill 1 Flow){site name:North Plant} by {unit}");
+    EXPECT_EQ(request.measurement, "Transfer Pump");
+    ASSERT_EQ(request.fields.size(), 1u);
+    EXPECT_EQ(request.fields[0], "Hill 1 Flow");
+    EXPECT_EQ(request.scopes.at("site name"), "North Plant");
+    ASSERT_EQ(request.groupByTags.size(), 1u);
+    EXPECT_EQ(request.groupByTags[0], "unit");
+}
+
 // Test time parsing
 TEST_F(QueryParserTest, ParseTimeFormat) {
     std::string timeStr = "15-03-2024 14:30:45";

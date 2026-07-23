@@ -20,13 +20,9 @@
 #include <seastar/core/sleep.hh>
 #include <seastar/core/thread.hh>
 #include <seastar/core/when_all.hh>
-#include <stdexcept>
 #include <thread>
-#include <type_traits>
 
 namespace fs = std::filesystem;
-
-static const timestar::StorageLayout kDefaultTsmTestLayout(".");
 
 class TSMCompactorTest : public ::testing::Test {
 public:
@@ -54,8 +50,8 @@ public:
         fs::create_directories(testDir + "/shard_0/tsm");
         fs::current_path(testDir);
 
-        fileManager = std::make_unique<TSMFileManager>(kDefaultTsmTestLayout, 0);
-        compactor = std::make_unique<TSMCompactor>(kDefaultTsmTestLayout, 0, fileManager.get());
+        fileManager = std::make_unique<TSMFileManager>();
+        compactor = std::make_unique<TSMCompactor>(fileManager.get());
     }
 
     void TearDown() override {
@@ -108,44 +104,6 @@ public:
         return fileSize > 0 && fileSize < 10 * 1024 * 1024;  // Less than 10MB
     }
 };
-
-SEASTAR_TEST_F(TSMCompactorTest, InjectedRootAndWorkerControlCompactionOutput) {
-    const timestar::StorageLayout layout("injected compactor layout/tenant-a");
-    constexpr unsigned workerId = 7;
-    co_await seastar::async([directory = layout.tsmDir(workerId)] { fs::create_directories(directory); });
-
-    std::vector<seastar::shared_ptr<TSM>> files;
-    for (uint64_t sequence = 1; sequence <= 2; ++sequence) {
-        const auto sourcePath = layout.tsmFile(workerId, 0, sequence);
-        TSMWriter writer(sourcePath.string());
-        const std::vector<uint64_t> timestamps{sequence * 1000};
-        const std::vector<double> values{static_cast<double>(sequence)};
-        writer.writeSeries(TSMValueType::Float, SeriesId128::fromSeriesKey("injected.series"), timestamps, values);
-        writer.writeIndex();
-        writer.close();
-
-        auto source = seastar::make_shared<TSM>(sourcePath.string());
-        co_await source->open();
-        files.push_back(source);
-    }
-
-    TSMCompactor injectedCompactor(layout, workerId, nullptr);
-    EXPECT_THROW(co_await injectedCompactor.compact(files), std::invalid_argument);
-
-    constexpr uint64_t reservedSequence = 3;
-    auto result = co_await injectedCompactor.compact(files, 0, reservedSequence);
-    const auto expected = layout.compactedTsmFile(workerId, 0, reservedSequence, 2);
-
-    EXPECT_EQ(result.outputPath, expected.string());
-    EXPECT_TRUE(fs::is_regular_file(expected));
-    EXPECT_FALSE(fs::exists(layout.compactedTsmTemporaryFile(workerId, 0, reservedSequence, 2)));
-    EXPECT_FALSE(fs::exists("shard_7"));
-    static_assert(!std::is_constructible_v<TSMCompactor, TSMFileManager*>);
-
-    for (auto& source : files) {
-        co_await source->close();
-    }
-}
 
 // Test basic compaction of multiple files
 SEASTAR_TEST_F(TSMCompactorTest, BasicCompaction) {
@@ -598,10 +556,12 @@ SEASTAR_TEST_F(TSMCompactorTest, CompactionPlanGeneration) {
 TEST_F(TSMCompactorTest, LeveledCompactionStrategy) {
     LeveledCompactionStrategy strategy;
 
-    // Test should compact logic
-    EXPECT_TRUE(strategy.shouldCompact(0, 4, 50 * 1024 * 1024));   // 4 files in tier 0
-    EXPECT_FALSE(strategy.shouldCompact(0, 3, 50 * 1024 * 1024));  // Only 3 files
-    EXPECT_TRUE(strategy.shouldCompact(0, 2, 200 * 1024 * 1024));  // Size exceeds limit
+    // Trigger is COUNT-based only: a full merge's worth of files (4), never a
+    // byte threshold -- byte-triggered merges of fewer files produced the
+    // inconsistent tier-file sizes fixed-count merges exist to prevent.
+    EXPECT_TRUE(strategy.shouldCompact(0, 4, 50 * 1024 * 1024));    // 4 files in tier 0
+    EXPECT_FALSE(strategy.shouldCompact(0, 3, 50 * 1024 * 1024));   // Only 3 files
+    EXPECT_FALSE(strategy.shouldCompact(0, 2, 200 * 1024 * 1024));  // Size alone never triggers
 
     // Test file selection
     std::vector<seastar::shared_ptr<TSM>> availableFiles;
@@ -613,13 +573,20 @@ TEST_F(TSMCompactorTest, LeveledCompactionStrategy) {
         availableFiles.push_back(tsm);
     }
 
+    // EXACTLY files_per_merge (4) oldest files -- with 10 available, the
+    // oldest 4 merge and the rest wait for the next cycle. Keeps every tier-N
+    // file at ~4 tier-(N-1) files, i.e. consistent sizes.
     auto selected = strategy.selectFiles(availableFiles, 0);
-    EXPECT_EQ(selected.size(), 8);  // Max files per tier for tier 0
+    EXPECT_EQ(selected.size(), 4);
 
     // Verify oldest files are selected first
     for (size_t i = 0; i < selected.size(); i++) {
         EXPECT_EQ(selected[i]->seqNum, i);
     }
+
+    // Below a full merge: select NOTHING (no runt merges).
+    std::vector<seastar::shared_ptr<TSM>> few(availableFiles.begin(), availableFiles.begin() + 3);
+    EXPECT_TRUE(strategy.selectFiles(few, 0).empty());
 
     // Test target tier calculation
     EXPECT_EQ(strategy.getTargetTier(0, 4), 1);  // Promote from 0 to 1

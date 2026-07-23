@@ -21,7 +21,7 @@ protected:
 };
 
 SEASTAR_TEST_F(NativeIndexMinimalTest, OpenAndClose) {
-    timestar::index::NativeIndex index(timestar::StorageLayout("."), 0);
+    timestar::index::NativeIndex index(0);
 
     std::cerr << "About to open index..." << std::endl;
     co_await index.open();
@@ -34,7 +34,7 @@ SEASTAR_TEST_F(NativeIndexMinimalTest, OpenAndClose) {
 }
 
 SEASTAR_TEST_F(NativeIndexMinimalTest, CreateSimpleSeries) {
-    timestar::index::NativeIndex index(timestar::StorageLayout("."), 0);
+    timestar::index::NativeIndex index(0);
 
     co_await index.open();
     std::cerr << "Index opened" << std::endl;
@@ -54,7 +54,7 @@ SEASTAR_TEST_F(NativeIndexMinimalTest, CreateSimpleSeries) {
 }
 
 SEASTAR_TEST_F(NativeIndexMinimalTest, CreateSeriesWithTags) {
-    timestar::index::NativeIndex index(timestar::StorageLayout("."), 0);
+    timestar::index::NativeIndex index(0);
 
     co_await index.open();
     std::cerr << "Index opened" << std::endl;

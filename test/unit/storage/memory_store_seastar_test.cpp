@@ -14,8 +14,6 @@
 
 namespace fs = std::filesystem;
 
-static const timestar::StorageLayout kDefaultWalTestLayout(".");
-
 class MemoryStoreSeastarTest : public ::testing::Test {
 protected:
     std::string testDir = "./test_memory_store_seastar";
@@ -33,7 +31,7 @@ seastar::future<> testMemoryStoreInitWAL() {
     auto store = std::make_shared<MemoryStore>(sequenceNumber);
 
     // Initialize WAL
-    co_await store->initWAL(kDefaultWalTestLayout, 0);
+    co_await store->initWAL();
 
     // WAL should be created
     EXPECT_NE(store->getWAL(), nullptr);
@@ -66,7 +64,7 @@ seastar::future<> testMemoryStoreInitFromWAL() {
     // First, create a store and write data
     {
         auto store = std::make_shared<MemoryStore>(sequenceNumber);
-        co_await store->initWAL(kDefaultWalTestLayout, 0);
+        co_await store->initWAL();
 
         TimeStarInsert<double> insert1("cpu", "usage");
         insert1.addValue(1000, 25.5);
@@ -89,7 +87,7 @@ seastar::future<> testMemoryStoreInitFromWAL() {
     // Now create a new store and recover from WAL
     {
         auto recoveredStore = std::make_shared<MemoryStore>(sequenceNumber);
-        std::string walFile = WAL::sequenceNumberToFilename(kDefaultWalTestLayout, 0, sequenceNumber);
+        std::string walFile = WAL::sequenceNumberToFilename(sequenceNumber);
 
         co_await recoveredStore->initFromWAL(walFile);
 
@@ -134,7 +132,7 @@ TEST_F(MemoryStoreSeastarTest, InitFromWAL) {
 seastar::future<> testMemoryStoreBatchInsert() {
     unsigned int sequenceNumber = 12;
     auto store = std::make_shared<MemoryStore>(sequenceNumber);
-    co_await store->initWAL(kDefaultWalTestLayout, 0);
+    co_await store->initWAL();
 
     // Insert multiple entries in batch
     for (int i = 0; i < 100; i++) {
@@ -164,7 +162,7 @@ TEST_F(MemoryStoreSeastarTest, BatchInsert) {
 seastar::future<> testMemoryStoreThresholdChecking() {
     unsigned int sequenceNumber = 13;
     auto store = std::make_shared<MemoryStore>(sequenceNumber);
-    co_await store->initWAL(kDefaultWalTestLayout, 0);
+    co_await store->initWAL();
 
     // Insert data up to threshold (16MB)
     // This would normally require a lot of data, so we just test the API

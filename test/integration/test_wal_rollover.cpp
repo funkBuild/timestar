@@ -59,7 +59,7 @@ seastar::future<> testWALRolloverAndTSMCreation() {
     std::cout << "WAL Rollover and TSM Creation Test" << std::endl;
     std::cout << "========================================\n" << std::endl;
 
-    Engine engine(timestar::StorageLayout("."));
+    Engine engine;
     std::cout << "Initializing engine..." << std::endl;
     co_await engine.init();
 

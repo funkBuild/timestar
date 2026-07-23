@@ -10,6 +10,8 @@
 #include "tsm_compactor.hpp"
 #include "tsm_writer.hpp"
 #include "util.hpp"
+#include "value_coercion.hpp"       // lossless coercion into a series' bound type
+#include "value_type_dispatch.hpp"  // dispatchValueType / valueTypeOf / valueTypeName
 
 #include <algorithm>
 #include <chrono>
@@ -25,23 +27,23 @@
 
 namespace fs = std::filesystem;
 
-Engine::Engine(timestar::StorageLayout layout)
-    : layout_(layout.anchored()),
-      shardId(seastar::this_shard_id()),
-      tsmFileManager(layout_, shardId),
-      walFileManager(layout_, shardId),
-      index(layout_, shardId) {
+Engine::Engine() : index(seastar::this_shard_id()) {
+    shardId = seastar::this_shard_id();
     // Directory creation moved to init() to avoid blocking the reactor thread
-}
+};
 
 seastar::future<> Engine::init() {
     co_await createDirectoryStructure();
     co_await index.open();
     co_await tsmFileManager.init();
+    // Order-independent handshake: the server creates scheduling groups AFTER
+    // init(), in which case setIOSchedulingGroups() does the forwarding. Tests
+    // and embedders that create them first are covered here.
     if (_schedulingGroupsCreated) {
         tsmFileManager.setCompactionGroup(_compactionGroup);
+        tsmFileManager.setFlushGroup(_flushGroup);
     }
-    co_await walFileManager.init(tsmFileManager);
+    co_await walFileManager.init(*this, tsmFileManager);
 
     // Register per-shard Prometheus metrics
     _metrics.setup(*this);
@@ -49,13 +51,26 @@ seastar::future<> Engine::init() {
     // Retention policy loading is done post-startup via loadAndBroadcastRetentionPolicies()
     // after setShardedRef() has been called on all shards.
 
-    // Background compaction loop is optional - inline compaction is triggered automatically
-    // in TSMFileManager::writeMemstore() after each WAL rollover creates a new TSM file.
-    // When a tier reaches 4 files, they are compacted into 1 file at the next tier level.
-    // The background loop provides additional periodic checks but is not required for
-    // normal operation. Uncomment to enable periodic compaction checks:
-    // co_await tsmFileManager.startCompactionLoop();
+    // The background compaction loop is now REQUIRED, not optional. writeMemstore()
+    // no longer compacts inline (that coupling is what let a deep tier merge hold
+    // the WAL conversion slot and stall ingest), so this loop is the only thing
+    // that merges tiers. It is started by startBackgroundCompaction() rather than
+    // here, because it must not run until the scheduling groups exist -- otherwise
+    // merges would land in `main` and preempt foreground writes, which is exactly
+    // the failure being fixed.
 };
+
+seastar::future<> Engine::startBackgroundCompaction() {
+    if (!_schedulingGroupsCreated) {
+        // Refuse rather than silently running merges in `main`. Starting the
+        // loop before the groups exist reintroduces the exact regression this
+        // path was added to prevent.
+        timestar::compactor_log.warn("Shard {}: background compaction not started -- scheduling groups not yet set",
+                                     shardId);
+        co_return;
+    }
+    co_await tsmFileManager.startCompactionLoop();
+}
 
 seastar::future<> Engine::createDirectoryStructure() {
     std::string shardPath = basePath() + "/tsm";
@@ -65,7 +80,7 @@ seastar::future<> Engine::createDirectoryStructure() {
 }
 
 std::string Engine::basePath() {
-    return layout_.shardDir(shardId).string();
+    return timestar::shardDataPath(shardId);
 }
 
 seastar::future<> Engine::stop() {
@@ -118,6 +133,8 @@ template <class T>
 seastar::future<> Engine::insert(TimeStarInsert<T> insertRequest, bool skipMetadataIndexing) {
     auto holder = _insertGate.hold();
 
+    rejectIfIngestBacklogged();
+
     ++_metrics.inserts_total;
     _metrics.insert_points_total += insertRequest.values.size();
 
@@ -125,6 +142,20 @@ seastar::future<> Engine::insert(TimeStarInsert<T> insertRequest, bool skipMetad
                     "[ENGINE] Insert called for series: '{}', measurement: '{}', field: '{}', {} values",
                     insertRequest.seriesKey(), insertRequest.measurement, insertRequest.field,
                     insertRequest.values.size());
+
+    // Enforce the series type binding here too. This overload has no production
+    // callers (everything routes through insertBatch), but leaving a public
+    // entry point unguarded is how the invariant gets lost later.
+    {
+        std::vector<TimeStarInsert<T>> one;
+        one.push_back(std::move(insertRequest));
+        auto kept = co_await enforceSeriesTypes<T>(std::move(one));
+        if (kept.empty()) {
+            // Converted into the bound type and already stored via insertBatch.
+            co_return;
+        }
+        insertRequest = std::move(kept.front());
+    }
 
     // Index metadata locally — each shard maintains its own NativeIndex
     // for the series it owns. Schema changes are broadcast via indexMetadataSync.
@@ -173,12 +204,170 @@ seastar::future<> Engine::insert(TimeStarInsert<T> insertRequest, bool skipMetad
     LOG_INSERT_PATH(timestar::engine_log, debug, "[ENGINE] WAL insert completed for single series");
 }
 
+seastar::future<std::optional<TSMValueType>> Engine::resolveSeriesType(const SeriesId128& seriesId) {
+    // 1. Hot path: shard-local cache, one hash lookup, no suspension.
+    if (auto it = _seriesTypeCache.find(seriesId); it != _seriesTypeCache.end()) {
+        co_return it->second;
+    }
+
+    // 2. Synchronous oracles. Same probe order as isNonNumericSeries(): memory
+    //    first because it is a pure hash lookup, then TSM (bloom + sparse
+    //    index, no disk I/O). A series is exactly one type per source, so the
+    //    first source that knows it decides.
+    if (auto t = walFileManager.getSeriesType(seriesId)) {
+        cacheSeriesType(seriesId, *t);
+        co_return t;
+    }
+    if (auto t = tsmFileManager.getSeriesType(seriesId)) {
+        cacheSeriesType(seriesId, *t);
+        co_return t;
+    }
+
+    // 3. Durable binding. Only reached for a series neither memory nor TSM can
+    //    see — e.g. one written on a previous boot whose data has since aged
+    //    out. Paying an LSM read solely here keeps the hot path suspension-free.
+    if (auto t = co_await index.getSeriesValueType(seriesId)) {
+        cacheSeriesType(seriesId, *t);
+        co_return t;
+    }
+
+    // 4. Genuinely unknown: first write for this series.
+    co_return std::nullopt;
+}
+
+seastar::future<> Engine::bindSeriesType(const SeriesId128& seriesId, TSMValueType type) {
+    co_await index.putSeriesValueType(seriesId, type);
+    cacheSeriesType(seriesId, type);
+}
+
+template <class T>
+seastar::future<std::vector<TimeStarInsert<T>>> Engine::enforceSeriesTypes(std::vector<TimeStarInsert<T>> requests) {
+    constexpr TSMValueType kIncoming = timestar::valueTypeOf<T>();
+
+    std::vector<TimeStarInsert<T>> kept;
+    kept.reserve(requests.size());
+
+    // Requests bound to some other type, grouped by that type. Converted and
+    // re-inserted below.
+    std::vector<TimeStarInsert<double>> asDouble;
+    std::vector<TimeStarInsert<bool>> asBool;
+    std::vector<TimeStarInsert<std::string>> asString;
+    std::vector<TimeStarInsert<int64_t>> asInteger;
+
+    std::vector<std::string> rejections;
+
+    // Bindings for series seen for the first time in THIS request. Held back
+    // until the whole request is known to be acceptable, so a rejected request
+    // leaves nothing behind — not even a binding. Consulted during the loop so
+    // that two elements for the same new series agree on one type rather than
+    // both claiming to be first.
+    std::unordered_map<SeriesId128, TSMValueType, SeriesId128::Hash> pendingBinds;
+
+    for (auto& req : requests) {
+        const SeriesId128 seriesId = req.seriesId128();
+        auto bound = co_await resolveSeriesType(seriesId);
+        if (!bound.has_value()) {
+            if (auto p = pendingBinds.find(seriesId); p != pendingBinds.end())
+                bound = p->second;
+        }
+
+        if (!bound.has_value()) {
+            // First write wins: this is what the series is from now on.
+            pendingBinds.emplace(seriesId, kIncoming);
+            kept.push_back(std::move(req));
+            continue;
+        }
+        if (*bound == kIncoming) {
+            kept.push_back(std::move(req));
+            continue;
+        }
+
+        // Bound to a different type. Convert losslessly or reject the whole
+        // series batch — part-accepting would leave the caller unable to tell
+        // which points landed.
+        auto convert = [&]<class U>() -> bool {
+            TimeStarInsert<U> out(req.measurement, req.field);
+            out.setSharedTags(std::make_shared<const std::map<std::string, std::string>>(req.getTags()));
+            out.setSharedTimestamps(std::make_shared<const std::vector<uint64_t>>(req.getTimestamps()));
+            out.setCachedSeriesId128(seriesId);
+            out.values.reserve(req.values.size());
+            for (size_t i = 0; i < req.values.size(); ++i) {
+                // Bind to T explicitly: std::vector<bool> yields a proxy
+                // reference, which would deduce the wrong source type.
+                const T v = req.values[i];
+                auto c = timestar::coerceValue<U>(v);
+                if (!c.has_value()) {
+                    rejections.push_back(
+                        fmt::format("{} {}: series is bound to type '{}', refusing '{}' value {} "
+                                    "(delete the series to re-type it)",
+                                    req.measurement, req.field, timestar::valueTypeName(*bound),
+                                    timestar::valueTypeName(kIncoming), timestar::describeValue(v)));
+                    return false;
+                }
+                out.values.push_back(std::move(*c));
+            }
+            if constexpr (std::is_same_v<U, double>)
+                asDouble.push_back(std::move(out));
+            else if constexpr (std::is_same_v<U, bool>)
+                asBool.push_back(std::move(out));
+            else if constexpr (std::is_same_v<U, std::string>)
+                asString.push_back(std::move(out));
+            else
+                asInteger.push_back(std::move(out));
+            return true;
+        };
+
+        timestar::dispatchValueType(*bound, convert);
+    }
+
+    if (!rejections.empty()) {
+        std::string msg = rejections.front();
+        if (rejections.size() > 1)
+            msg += fmt::format(" (and {} more type conflicts in this request)", rejections.size() - 1);
+        throw std::invalid_argument(msg);
+    }
+
+    // Request is acceptable — now make the first-write bindings durable.
+    for (const auto& [id, type] : pendingBinds) {
+        co_await bindSeriesType(id, type);
+    }
+
+    // Re-enter for each converted group. These terminate: a converted batch
+    // matches its binding by construction, so it takes the `kept` path.
+    if constexpr (!std::is_same_v<T, double>)
+        if (!asDouble.empty())
+            co_await insertBatch<double>(std::move(asDouble));
+    if constexpr (!std::is_same_v<T, bool>)
+        if (!asBool.empty())
+            co_await insertBatch<bool>(std::move(asBool));
+    if constexpr (!std::is_same_v<T, std::string>)
+        if (!asString.empty())
+            co_await insertBatch<std::string>(std::move(asString));
+    if constexpr (!std::is_same_v<T, int64_t>)
+        if (!asInteger.empty())
+            co_await insertBatch<int64_t>(std::move(asInteger));
+
+    co_return kept;
+}
+
 template <class T>
 seastar::future<WALTimingInfo> Engine::insertBatch(std::vector<TimeStarInsert<T>> insertRequests) {
     auto holder = _insertGate.hold();
 
     if (insertRequests.empty()) {
         co_return WALTimingInfo{};  // No work to do
+    }
+
+    rejectIfIngestBacklogged();
+
+    // Enforce the per-series type binding BEFORE anything durable happens, so a
+    // rejected write leaves no WAL record and no memstore entry, and before
+    // subscribers are notified, so a stream never sees a value the store
+    // rejected. Recovery is unaffected: WALReader::readAll calls
+    // MemoryStore::insertMemory directly and never reaches this method.
+    insertRequests = co_await enforceSeriesTypes<T>(std::move(insertRequests));
+    if (insertRequests.empty()) {
+        co_return WALTimingInfo{};  // everything was converted into other types
     }
 
     // Update Prometheus metrics for batch inserts
@@ -368,10 +557,15 @@ seastar::future<std::optional<VariantQueryResult>> Engine::query(std::string ser
 
 seastar::future<std::optional<timestar::PushdownResult>> Engine::queryAggregated(
     [[maybe_unused]] const std::string& seriesKey, const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime,
-    uint64_t aggregationInterval, timestar::AggregationMethod method, bool foldNoInterval) {
+    uint64_t aggregationInterval, timestar::AggregationMethod method, bool foldNoInterval, bool boolLatestAsNumeric) {
     QueryRunner runner(&tsmFileManager, &walFileManager);
     co_return co_await runner.queryTsmAggregated(seriesId, startTime, endTime, aggregationInterval, method,
-                                                 foldNoInterval);
+                                                 foldNoInterval, boolLatestAsNumeric);
+}
+
+std::optional<TSMValueType> Engine::localSeriesValueType(const SeriesId128& seriesId) {
+    QueryRunner runner(&tsmFileManager, &walFileManager);
+    return runner.localSeriesValueType(seriesId);
 }
 
 // True when a series is non-numeric (Boolean or String).  A series is exactly
@@ -706,6 +900,26 @@ seastar::future<bool> Engine::deleteRangeImpl(std::string seriesKey, uint64_t st
         }
     }
 
+    // A delete spanning all of time is how a series is dropped outright, so it
+    // releases the value-type binding and the series can be re-created with a
+    // different type. A bounded-range delete must NOT release it: the remaining
+    // points still have the old type, and re-typing around them is exactly the
+    // conflict that wedges compaction.
+    if (startTime == 0 && endTime == UINT64_MAX) {
+        // The trigger is syntactic, not a proof of emptiness — tombstoned TSM
+        // blocks survive until a rewrite materialises them. Record when we
+        // release a binding while a source still reports the series, since that
+        // is the window in which a re-type could still collide.
+        if (walFileManager.getSeriesType(seriesId).has_value() || tsmFileManager.getSeriesType(seriesId).has_value()) {
+            timestar::engine_log.warn(
+                "Releasing value-type binding for series {} while data is still reported by a storage source; "
+                "a re-type before compaction materialises the delete could conflict",
+                seriesId.toHex());
+        }
+        co_await index.removeSeriesValueType(seriesId);
+        _seriesTypeCache.erase(seriesId);
+    }
+
     co_return anyDeleted;
 }
 
@@ -816,6 +1030,12 @@ template seastar::future<WALTimingInfo> Engine::insertBatch<std::string>(
     std::vector<TimeStarInsert<std::string>> insertRequests);
 template seastar::future<WALTimingInfo> Engine::insertBatch<int64_t>(
     std::vector<TimeStarInsert<int64_t>> insertRequests);
+
+#define TIMESTAR_INST_ENFORCE(T)                                                            \
+    template seastar::future<std::vector<TimeStarInsert<T>>> Engine::enforceSeriesTypes<T>( \
+        std::vector<TimeStarInsert<T>>);
+TIMESTAR_INSTANTIATE_FOR_VALUE_TYPES(TIMESTAR_INST_ENFORCE)
+#undef TIMESTAR_INST_ENFORCE
 
 template seastar::future<SeriesId128> Engine::indexMetadata<bool>(TimeStarInsert<bool> insertRequest);
 template seastar::future<SeriesId128> Engine::indexMetadata<double>(TimeStarInsert<double> insertRequest);

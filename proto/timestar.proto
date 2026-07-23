@@ -123,6 +123,12 @@ message QueryRequest {
     uint64 start_time           = 2;  // Nanoseconds since epoch
     uint64 end_time             = 3;  // Nanoseconds since epoch
     string aggregation_interval = 4;  // Duration string (e.g. "5m") or numeric nanoseconds
+    // Bucket grid for interval queries: "" or "epoch" (default) = epoch-aligned
+    // buckets; "start" = grid anchored at start_time (rollup.js-compatible).
+    string bucket_alignment     = 5;
+    // Treat boolean fields as numeric 1.0/0.0 so they aggregate arithmetically
+    // (rollup.js-compatible).  Default false: booleans are non-numeric.
+    bool booleans_as_numeric    = 6;
 }
 
 // Per-field time series data in a query result

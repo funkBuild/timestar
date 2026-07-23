@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include <array>
+#include <cinttypes>
 #include <cstring>
 #include <filesystem>
 #include <seastar/core/coroutine.hh>
@@ -15,16 +16,10 @@
 #include <seastar/core/thread.hh>
 #include <seastar/util/log.hh>
 #include <stdexcept>
-#include <utility>
 
 namespace timestar::index {
 
 static seastar::logger index_wal_log("timestar.index_wal");
-
-IndexWAL::IndexWAL(timestar::StorageLayout layout, unsigned workerId)
-    : layout_(std::make_shared<const timestar::StorageLayout>(layout.anchored())),
-      workerId_(workerId),
-      directory_(layout_->nativeWalDir(workerId_).string()) {}
 
 // CRC32C using SSE 4.2 hardware intrinsics (Castagnoli polynomial).
 // Falls back to software table for non-x86 platforms.
@@ -102,6 +97,12 @@ static uint64_t decodeFixed64(const char* p) {
     for (int i = 0; i < 8; ++i)
         r |= static_cast<uint64_t>(static_cast<uint8_t>(p[i])) << (i * 8);
     return r;
+}
+
+std::string IndexWAL::walFileName(const std::string& dir, uint64_t generation) {
+    char buf[32];
+    snprintf(buf, sizeof(buf), "idx_%06" PRIu64 ".wal", generation);
+    return dir + "/" + buf;
 }
 
 IndexWAL::~IndexWAL() {
@@ -214,11 +215,9 @@ seastar::future<> IndexWAL::flushBuffer() {
     co_await walFile_->flush();
 }
 
-seastar::future<IndexWAL> IndexWAL::open(timestar::StorageLayout layout, unsigned workerId) {
-    IndexWAL wal(std::move(layout), workerId);
-
+seastar::future<IndexWAL> IndexWAL::open(std::string directory) {
     // Wrap blocking filesystem calls in seastar::async to avoid reactor stalls.
-    auto allGens = co_await seastar::async([directory = wal.directory_] {
+    auto [dir, allGens] = co_await seastar::async([directory] {
         std::filesystem::create_directories(directory);
 
         std::vector<uint64_t> gens;
@@ -234,18 +233,21 @@ seastar::future<IndexWAL> IndexWAL::open(timestar::StorageLayout layout, unsigne
             }
         }
         std::sort(gens.begin(), gens.end());
-        return gens;
+        return std::make_pair(directory, std::move(gens));
     });
+
+    IndexWAL wal;
+    wal.directory_ = dir;
 
     if (allGens.empty()) {
         wal.walGeneration_ = 0;
-        wal.currentPath_ = wal.layout_->nativeWalFile(wal.workerId_, 0).string();
+        wal.currentPath_ = walFileName(dir, 0);
     } else {
         wal.walGeneration_ = allGens.back();
-        wal.currentPath_ = wal.layout_->nativeWalFile(wal.workerId_, allGens.back()).string();
+        wal.currentPath_ = walFileName(dir, allGens.back());
         // All generations except the latest are old WAL files to replay first
         for (size_t i = 0; i + 1 < allGens.size(); ++i) {
-            wal.oldWalPaths_.push_back(wal.layout_->nativeWalFile(wal.workerId_, allGens[i]).string());
+            wal.oldWalPaths_.push_back(walFileName(dir, allGens[i]));
         }
     }
 
@@ -468,7 +470,7 @@ seastar::future<std::string> IndexWAL::rotate() {
 
     auto oldPath = currentPath_;
     ++walGeneration_;
-    currentPath_ = layout_->nativeWalFile(workerId_, walGeneration_).string();
+    currentPath_ = walFileName(directory_, walGeneration_);
 
     // File opened lazily on next append()
 

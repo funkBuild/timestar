@@ -48,23 +48,26 @@ namespace timestar::proto {
 // duplicated here as a file-local static).
 
 // Fast name validation — same rules as HttpWriteHandler::validateName.
+// Names may contain any byte except NUL (the index KV-key separator).  All
+// structural series-key characters (',', '=', ' ', '"', '\\') are backslash-
+// escaped by timestar::buildSeriesKey, so spaces and symbols are allowed.
 // Returns true if valid, false otherwise.
 static bool isValidName(const std::string& s) {
     if (s.empty())
         return false;
     for (char c : s) {
-        if (c == '\0' || c == ',' || c == '=' || c == ' ')
+        if (c == '\0')
             return false;
     }
     return true;
 }
 
-// Tag values allow spaces but not null/comma/equals.
+// Tag values: same rule — any byte except NUL.
 static bool isValidTagValue(const std::string& s) {
     if (s.empty())
         return false;
     for (char c : s) {
-        if (c == '\0' || c == ',' || c == '=')
+        if (c == '\0')
             return false;
     }
     return true;
@@ -87,8 +90,41 @@ FastPathResult parseWriteRequestFast(const void* data, size_t size, uint64_t def
     }
 
     FastPathResult result;
-    // Estimate: average 2 fields per write point
-    result.inserts.reserve(static_cast<size_t>(request->writes_size()) * 2);
+    // Estimate: average 2 fields per write point. Clamp the speculative
+    // reserve — writes_size is client-controlled and FastFieldInsert is
+    // ~264 bytes, so an unclamped reserve from a garbage count could commit
+    // gigabytes before any validation runs. push_back grows past the clamp.
+    result.inserts.reserve(std::min<size_t>(static_cast<size_t>(request->writes_size()) * 2, 65536));
+
+    // Request-wide decoded budgets, charged for every materialization: decoded
+    // compressed timestamps, uncompressed (packed) timestamps, values of every
+    // type, replicated/generated timestamps, and decompressed string bytes.
+    // The per-write-point cap bounds one point group but not their sum, and a
+    // points-only budget does not bound BYTES (packed varints cost ~1 wire
+    // byte per 8-byte decoded value; zstd string fields decompress to up to
+    // 256 MB while contributing almost nothing to the point count). Every
+    // decoded unit is held simultaneously in `result.inserts` before anything
+    // reaches a store, so these budgets are the request's real memory bound.
+    const size_t maxPointsPerRequest = kMaxDecodedPointsPerWriteRequest;
+    const size_t maxBytesPerRequest = kMaxDecodedBytesPerWriteRequest;
+    size_t decodedPointBudget = 0;
+    size_t decodedByteBudget = 0;
+    // Charge `points`/`bytes` against the request budgets. Returns false once
+    // either budget is exceeded; the caller rejects the current unit (field or
+    // whole write point) with a recorded error — never a silent truncation.
+    auto chargeBudget = [&](size_t points, size_t bytes) -> bool {
+        decodedPointBudget += points;
+        decodedByteBudget += bytes;
+        if (decodedPointBudget > maxPointsPerRequest || decodedByteBudget > maxBytesPerRequest) {
+            if (result.errors.size() < 10) {
+                result.errors.push_back("write request decodes to more than " + std::to_string(maxPointsPerRequest) +
+                                        " points or " + std::to_string(maxBytesPerRequest) +
+                                        " bytes in total (request-wide decode budget)");
+            }
+            return false;
+        }
+        return true;
+    };
 
     for (int wpIdx = 0; wpIdx < request->writes_size(); ++wpIdx) {
         const auto& wp = request->writes(wpIdx);
@@ -175,14 +211,43 @@ FastPathResult parseWriteRequestFast(const void* data, size_t size, uint64_t def
                                             " values (max points per write point)");
                 }
             }
+            // ...and enforce the REQUEST-wide budgets, not just per-point caps.
+            if (tsDecodeOk && !chargeBudget(timestamps.size(), timestamps.size() * sizeof(uint64_t))) {
+                tsDecodeOk = false;
+            }
             if (!tsDecodeOk) {
                 ++result.failedWrites;
                 continue;  // skip the whole point — no usable timestamps
+            }
+            // Drop any slack before the vector becomes long-lived. The decode
+            // reserve is sized from an upper bound, and moving into the shared_ptr
+            // PRESERVES capacity -- so without this, every series retains its
+            // over-reserved buffer for as long as the write is in flight, which
+            // at high cardinality is per-series resident waste rather than a
+            // transient spike.
+            if (timestamps.capacity() > timestamps.size()) {
+                timestamps.shrink_to_fit();
             }
             sharedTimestamps = std::make_shared<const std::vector<uint64_t>>(std::move(timestamps));
         } else {
             const int tsCount = wp.timestamps_size();
             if (tsCount > 0) {
+                // Charge the budgets on this branch too: packed varint uint64s
+                // cost as little as ONE wire byte each but 8 bytes decoded, so
+                // a 64 MB body can carry ~67M timestamps (>1 GB with the
+                // arena's RepeatedField copy) — the exact bad_alloc class the
+                // budgets exist to prevent. Same per-point cap as the
+                // compressed branch for consistency.
+                if (static_cast<size_t>(tsCount) > kMaxCompressedPointsPerWritePoint ||
+                    !chargeBudget(static_cast<size_t>(tsCount), static_cast<size_t>(tsCount) * sizeof(uint64_t))) {
+                    if (static_cast<size_t>(tsCount) > kMaxCompressedPointsPerWritePoint && result.errors.size() < 10) {
+                        result.errors.push_back("write point carries more than " +
+                                                std::to_string(kMaxCompressedPointsPerWritePoint) +
+                                                " timestamps (max points per write point)");
+                    }
+                    ++result.failedWrites;
+                    continue;  // skip the whole point — no usable timestamps
+                }
                 std::vector<uint64_t> timestamps(static_cast<size_t>(tsCount));
                 // RepeatedField<uint64_t>::data() gives direct pointer to packed data
                 std::memcpy(timestamps.data(), wp.timestamps().data(), static_cast<size_t>(tsCount) * sizeof(uint64_t));
@@ -393,21 +458,42 @@ FastPathResult parseWriteRequestFast(const void* data, size_t size, uint64_t def
                     continue;
             }
 
-            // Determine value count for this field
+            // Determine value count and retained bytes for this field
             size_t valueCount = 0;
+            size_t valueBytes = 0;
             switch (ffi.type) {
                 case FastFieldInsert::Type::DOUBLE:
                     valueCount = ffi.doubleValues.size();
+                    valueBytes = valueCount * sizeof(double);
                     break;
                 case FastFieldInsert::Type::BOOL:
                     valueCount = ffi.boolValues.size();
+                    valueBytes = valueCount;  // stored as bytes
                     break;
                 case FastFieldInsert::Type::STRING:
                     valueCount = ffi.stringValues.size();
+                    // Decompressed string payloads are the dominant bytes-hole:
+                    // a compressed_zstd field can expand to up to 256 MB while
+                    // contributing almost nothing to the point count.
+                    for (const auto& s : ffi.stringValues) {
+                        valueBytes += sizeof(std::string) + s.capacity();
+                    }
                     break;
                 case FastFieldInsert::Type::INTEGER:
                     valueCount = ffi.integerValues.size();
+                    valueBytes = valueCount * sizeof(int64_t);
                     break;
+            }
+
+            // Charge values against the request budgets. This is what bounds
+            // per-field materializations the timestamp charge cannot see:
+            // uncompressed value arrays, decompressed strings, and the
+            // replicated/generated timestamp cases below (tsAvail 0 or 1 with
+            // an unbounded per-field value count). One over-budget field is
+            // skipped whole — never truncated — and the client sees a partial
+            // failure with the budget error.
+            if (!chargeBudget(valueCount, valueBytes)) {
+                continue;
             }
 
             // Resolve timestamps for this field (shared_ptr assignment, no copy):
@@ -419,8 +505,12 @@ FastPathResult parseWriteRequestFast(const void* data, size_t size, uint64_t def
                 ffi.timestamps = sharedTimestamps;
             } else if (tsAvail == 1) {
                 // Replicate the single timestamp; reuse the allocation across
-                // fields with the same value count.
+                // fields with the same value count. The materialized array is
+                // charged as bytes (its point count is already charged above).
                 if (!replicatedTs || replicatedTs->size() != valueCount) {
+                    if (!chargeBudget(0, valueCount * sizeof(uint64_t))) {
+                        continue;
+                    }
                     replicatedTs = std::make_shared<const std::vector<uint64_t>>(valueCount, (*sharedTimestamps)[0]);
                 }
                 ffi.timestamps = replicatedTs;
@@ -428,6 +518,9 @@ FastPathResult parseWriteRequestFast(const void* data, size_t size, uint64_t def
                 // No timestamps provided — generate from default, 1ms apart;
                 // reuse the allocation across fields with the same value count.
                 if (!generatedTs || generatedTs->size() != valueCount) {
+                    if (!chargeBudget(0, valueCount * sizeof(uint64_t))) {
+                        continue;
+                    }
                     std::vector<uint64_t> gen;
                     gen.reserve(valueCount);
                     uint64_t ts = defaultTimestampNs;

@@ -17,12 +17,12 @@
 #include <filesystem>
 #include <format>
 #include <seastar/core/coroutine.hh>
+#include <seastar/core/memory.hh>
 #include <seastar/core/seastar.hh>
 #include <seastar/core/smp.hh>
 #include <seastar/core/thread.hh>
 #include <seastar/coroutine/maybe_yield.hh>
 #include <seastar/util/log.hh>
-#include <utility>
 
 // Use short namespace alias for key encoding
 namespace ke = timestar::index::keys;
@@ -138,10 +138,8 @@ private:
 // Constructor / Destructor
 // ============================================================================
 
-NativeIndex::NativeIndex(timestar::StorageLayout layout, unsigned workerId)
-    : layout_(layout.anchored()),
-      shardId_(workerId),
-      indexPath_(layout_.nativeIndexDir(workerId)),
+NativeIndex::NativeIndex(int shardId)
+    : shardId_(shardId),
       blockCache_(timestar::config().index.block_cache_bytes / std::max(1u, seastar::smp::count)),
       seriesMetadataCache_(timestar::config().index.metadata_cache_bytes / std::max(1u, seastar::smp::count)),
       discoveryCache_(timestar::config().index.discovery_cache_bytes / std::max(1u, seastar::smp::count)) {}
@@ -167,14 +165,42 @@ NativeIndex::~NativeIndex() {
 // ============================================================================
 
 seastar::future<> NativeIndex::open() {
-    co_await seastar::async([indexPath = indexPath_] { std::filesystem::create_directories(indexPath); });
+    // Fail loudly at startup if the configured memory budgets cannot fit this
+    // shard's arena. Previously the individual caches were fixed absolutes that
+    // summed to ~690 MB per shard regardless of how much memory the shard
+    // actually had, so an under-provisioned deployment did not find out until a
+    // std::bad_alloc hours later, from whichever allocation happened to be
+    // unlucky. A wrong number should be a config error, not a mystery crash.
+    {
+        const size_t shardTotal = seastar::memory::stats().total_memory();
+        const size_t indexBudget = indexCacheBudgetBytes();
+        const size_t memtables = timestar::config().index.write_buffer_size * 2;  // active + immutable
+        // NOTE: storage.compaction.max_memory is deliberately NOT counted here.
+        // It is currently dead config -- nothing reads it -- so counting it would
+        // overstate what is actually committed. Compaction's real footprint is
+        // bounded by its streaming writer, not by that setting.
+        const size_t committed = indexBudget + memtables;
+
+        if (shardTotal > 0 && committed > shardTotal / 2) {
+            ::native_index_log.warn(
+                "Shard {} memory budgets are large relative to its arena: index caches {} MB + memtables {} MB = "
+                "{} MB of {} MB ({}%). Reduce index.write_buffer_size, or give the shard more memory.",
+                shardId_, indexBudget >> 20, memtables >> 20, committed >> 20, shardTotal >> 20,
+                committed * 100 / shardTotal);
+        }
+    }
+
+    // Note: std::filesystem::absolute() depends on the process CWD at call time.
+    // This is fine because open() is called during startup before any CWD change.
+    indexPath_ = std::filesystem::absolute(timestar::shardDataPath(shardId_) + "/native_index").string();
+    co_await seastar::async([this] { std::filesystem::create_directories(indexPath_); });
 
     // Open manifest
-    manifest_ = std::make_unique<Manifest>(co_await Manifest::open(layout_, shardId_));
+    manifest_ = std::make_unique<Manifest>(co_await Manifest::open(indexPath_));
 
     // Open WAL and replay into MemTable
     memtable_ = std::make_shared<MemTable>();
-    wal_ = std::make_unique<IndexWAL>(co_await IndexWAL::open(layout_, shardId_));
+    wal_ = std::make_unique<IndexWAL>(co_await IndexWAL::open(indexPath_ + "/wal"));
     auto replayed = co_await wal_->replay(*memtable_);
     if (replayed > 0) {
         ::native_index_log.info("Replayed {} WAL records into MemTable", replayed);
@@ -191,7 +217,7 @@ seastar::future<> NativeIndex::open() {
     compCfg.blockSize = timestar::config().index.block_size;
     compCfg.bloomBitsPerKey = timestar::config().index.bloom_filter_bits;
     compCfg.rateLimitMBps = timestar::config().index.compaction_rate_limit_mbps;
-    compaction_ = std::make_unique<CompactionEngine>(layout_, shardId_, *manifest_, compCfg);
+    compaction_ = std::make_unique<CompactionEngine>(indexPath_, *manifest_, compCfg);
 
     // Durability: replayed WAL records exist only in the volatile memtable at
     // this point. Make them durable in an SSTable BEFORE the current WAL can
@@ -227,14 +253,23 @@ seastar::future<> NativeIndex::open() {
         uint32_t nextId = ke::decodeLocalId(*counterVal);
         localIdMap_.restoreBegin(nextId, nextId);
         std::string fwdPrefix(1, static_cast<char>(LOCAL_ID_FORWARD));
+        size_t skippedRestoreEntries = 0;
         co_await kvPrefixScan(fwdPrefix, [&](std::string_view key, std::string_view value) {
             if (key.size() >= 5 && value.size() >= 16) {
                 uint32_t localId = ke::decodeLocalId(key.substr(1));
                 SeriesId128 globalId = SeriesId128::fromBytes(value.data(), 16);
-                localIdMap_.restoreEntry(localId, globalId);
+                if (!localIdMap_.restoreEntry(localId, globalId)) {
+                    ++skippedRestoreEntries;
+                }
             }
             return true;
         });
+        if (skippedRestoreEntries > 0) {
+            ::native_index_log.error(
+                "LocalIdMap restore: skipped {} forward entries with ids implausibly far past the persisted "
+                "counter {} — corrupt index keys; the affected series will be re-assigned on next write",
+                skippedRestoreEntries, localIdMap_.nextId());
+        }
         lastFlushedLocalId_ = localIdMap_.nextId();  // All restored IDs are already persisted
         ::native_index_log.info("Restored LocalIdMap: {} mappings", localIdMap_.size());
     } else {
@@ -291,8 +326,8 @@ seastar::future<> NativeIndex::open() {
     // This avoids scanning all HLL/bloom KV entries at startup, which can stall for
     // 10K+ measurements.
 
-    ::native_index_log.info("NativeIndex opened at: {} ({} SSTables, {} MemTable entries, {} local IDs)",
-                            indexPath_.string(), manifest_->files().size(), memtable_->size(), localIdMap_.size());
+    ::native_index_log.info("NativeIndex opened at: {} ({} SSTables, {} MemTable entries, {} local IDs)", indexPath_,
+                            manifest_->files().size(), memtable_->size(), localIdMap_.size());
 }
 
 seastar::future<> NativeIndex::close() {
@@ -341,7 +376,7 @@ seastar::future<> NativeIndex::close() {
 // ============================================================================
 
 std::string NativeIndex::sstFilename(uint64_t fileNumber) {
-    return layout_.nativeSstableFile(shardId_, fileNumber).string();
+    return std::format("{}/idx_{:06}.sst", indexPath_, fileNumber);
 }
 
 // Step 4: Incremental SSTable refresh — only opens new files and closes removed ones.
@@ -884,17 +919,37 @@ seastar::future<SeriesId128> NativeIndex::getOrCreateSeriesId(SeriesId128 series
     // Phase 2: Add local ID to dirty postings bitmaps (TAG_INDEX/GROUP_BY_INDEX removed in Phase 3)
     std::string bitmapCacheKey;
     bitmapCacheKey.reserve(measurement.size() + 1 + 32 + 1 + 32);
+    // Phase 4: Update cardinality HLLs.
+    //
+    // The per-tag-value HLL is maintained ONLY above a cardinality threshold.
+    // Each sketch is 16 KB (16384 registers), so one per distinct tag value is
+    // ruinous for a high-cardinality tag: 6,000 distinct values measured ~64 KB
+    // each once the sketch, its serialised copy and its KV entry are counted,
+    // and the shard hit std::bad_alloc at ~6,100 values. The same workload with
+    // 200,000 series but only 300 distinct tag values was fine -- the cost
+    // tracks distinct VALUES, not series.
+    //
+    // It is also poor value below the threshold: the exact roaring bitmap for
+    // the same (measurement, tagKey, tagValue) is maintained here anyway, and
+    // getTagValueCardinality() already falls back to bitmap->cardinality(),
+    // which is EXACT. A 16 KB sketch with 0.8% error to count something in the
+    // tens is strictly worse than the answer already on hand.
     for (const auto& [tagKey, tagValue] : tags) {
         buildBitmapCacheKey(bitmapCacheKey, measurement, tagKey, tagValue);
         auto* bitmap = co_await getOrLoadBitmapForInsert(bitmapCacheKey);
         bitmap->add(localId);
+
+        if (bitmap->cardinality() >= kTagHllMinCardinality) {
+            // Pass the cache KEY, not `bitmap`: updateTagHLL suspends before
+            // seeding, and a raw pointer into bitmapCache_ dangles across
+            // suspensions (robin_map rehash/trim). It re-looks the bitmap up
+            // after its own co_await. The key buffer is reused next iteration
+            // only after this call completes.
+            co_await updateTagHLL(measurement, tagKey, tagValue, localId, bitmapCacheKey);
+        }
     }
 
-    // Phase 4: Update cardinality HLLs
     co_await updateHLL(measurement, localId);
-    for (const auto& [tagKey, tagValue] : tags) {
-        co_await updateTagHLL(measurement, tagKey, tagValue, localId);
-    }
     // Mark measurement bloom for rebuild on next flush
     dirtyMeasurementBlooms_.insert(measurement);
 
@@ -1010,6 +1065,34 @@ seastar::future<std::optional<SeriesMetadata>> NativeIndex::getSeriesMetadata(co
     auto metadata = ke::decodeSeriesMetadata(*val);
     seriesMetadataCache_.put(seriesId, metadata);
     co_return metadata;
+}
+
+// --- Per-series value-type binding (SERIES_VALUE_TYPE, 0x18) ---
+//
+// The durable answer to "what type is this series?". Ingest enforces it so a
+// series cannot be re-typed by a later write, which is what leaves two TSM
+// files disagreeing and wedges compaction. See index_backend.hpp.
+
+seastar::future<std::optional<TSMValueType>> NativeIndex::getSeriesValueType(const SeriesId128& seriesId) {
+    auto val = co_await kvGet(ke::encodeSeriesValueTypeKey(seriesId));
+    if (!val.has_value() || val->size() != 1)
+        co_return std::nullopt;
+    auto raw = static_cast<uint8_t>((*val)[0]);
+    if (raw > static_cast<uint8_t>(TSMValueType::Integer)) {
+        // A corrupt byte must not be silently trusted as Float (0).
+        ::native_index_log.warn("Series {} has an unrecognised value-type byte {}; ignoring binding", seriesId.toHex(),
+                                raw);
+        co_return std::nullopt;
+    }
+    co_return static_cast<TSMValueType>(raw);
+}
+
+seastar::future<> NativeIndex::putSeriesValueType(const SeriesId128& seriesId, TSMValueType type) {
+    co_await kvPut(ke::encodeSeriesValueTypeKey(seriesId), std::string(1, static_cast<char>(type)));
+}
+
+seastar::future<> NativeIndex::removeSeriesValueType(const SeriesId128& seriesId) {
+    co_await kvDelete(ke::encodeSeriesValueTypeKey(seriesId));
 }
 
 // Stage 3: Batch metadata resolution — inlines cache checks and avoids
@@ -2273,6 +2356,35 @@ void NativeIndex::flushDirtyDayBitmaps(IndexWriteBatch& batch) {
     dayBitmapCacheDirtyKeys_.clear();
 }
 
+// Fraction of this shard's arena that ALL index caches together may occupy.
+// 25% leaves room for the memtables, the query working set, WAL buffers, TSM
+// sparse indexes and compaction, none of which draw from this budget.
+static constexpr double kIndexCacheFractionOfShard = 0.25;
+
+size_t NativeIndex::indexCacheBudgetBytes() {
+    const size_t shardTotal = seastar::memory::stats().total_memory();
+    const size_t budget = static_cast<size_t>(static_cast<double>(shardTotal) * kIndexCacheFractionOfShard);
+    // Floor so tiny test/dev shards still cache usefully; ceiling so a very large
+    // shard does not hand an unbounded budget to structures whose useful working
+    // set is far smaller.
+    constexpr size_t kMinBudget = 16u << 20;   // 16 MB
+    constexpr size_t kMaxBudget = 512u << 20;  // 512 MB
+    return std::clamp(budget, kMinBudget, kMaxBudget);
+}
+
+size_t NativeIndex::maxBitmapCacheBytes() {
+    return indexCacheBudgetBytes() * 40 / 100;
+}
+size_t NativeIndex::maxDayBitmapCacheBytes() {
+    return indexCacheBudgetBytes() * 20 / 100;
+}
+size_t NativeIndex::maxBloomCacheBytes() {
+    return indexCacheBudgetBytes() * 15 / 100;
+}
+size_t NativeIndex::maxHllCacheBytes() {
+    return indexCacheBudgetBytes() * 10 / 100;
+}
+
 void NativeIndex::trimBitmapCache() {
     // Check both entry count and byte budget
     bool overEntries = bitmapCache_.size() > MAX_BITMAP_CACHE_ENTRIES;
@@ -2283,7 +2395,7 @@ void NativeIndex::trimBitmapCache() {
         for (const auto& [key, entry] : bitmapCache_) {
             totalBytes += entry.approxBytes + key.size();
         }
-        overBytes = totalBytes > MAX_BITMAP_CACHE_BYTES;
+        overBytes = totalBytes > maxBitmapCacheBytes();
     }
     if (!overEntries && !overBytes)
         return;
@@ -2297,7 +2409,7 @@ void NativeIndex::trimBitmapCache() {
     // re-scan KV or it would persist a bloom missing the evicted keys
     // (false negatives = series silently invisible).
     const size_t entryTarget = MAX_BITMAP_CACHE_ENTRIES / 2;  // evict to 50% to avoid thrashing
-    const size_t byteTarget = MAX_BITMAP_CACHE_BYTES / 2;
+    const size_t byteTarget = maxBitmapCacheBytes() / 2;
     for (auto it = bitmapCache_.begin(); it != bitmapCache_.end();) {
         bool doneEntries = !overEntries || bitmapCache_.size() <= entryTarget;
         bool doneBytes = !overBytes || totalBytes <= byteTarget;
@@ -2326,14 +2438,14 @@ void NativeIndex::trimDayBitmapCache() {
         for (const auto& [key, entry] : dayBitmapCache_) {
             totalBytes += entry.approxBytes + key.size();
         }
-        overBytes = totalBytes > MAX_DAY_BITMAP_CACHE_BYTES;
+        overBytes = totalBytes > maxDayBitmapCacheBytes();
     }
     if (!overEntries && !overBytes)
         return;
 
     // Enforce the byte budget independently of the entry cap (see trimBitmapCache).
     const size_t entryTarget = MAX_DAY_BITMAP_CACHE_ENTRIES / 2;
-    const size_t byteTarget = MAX_DAY_BITMAP_CACHE_BYTES / 2;
+    const size_t byteTarget = maxDayBitmapCacheBytes() / 2;
     for (auto it = dayBitmapCache_.begin(); it != dayBitmapCache_.end();) {
         bool doneEntries = !overEntries || dayBitmapCache_.size() <= entryTarget;
         bool doneBytes = !overBytes || totalBytes <= byteTarget;
@@ -2354,10 +2466,16 @@ void NativeIndex::trimDayBitmapCache() {
 // Per-measurement HLLs (key = "measurement\0") stay warm; per-tag-value HLLs
 // (key = "measurement\0tagKey\0tagValue") are numerous and rarely queried.
 void NativeIndex::trimHllCache() {
-    if (hllCache_.size() <= MAX_HLL_CACHE_ENTRIES)
+    // Enforce BOTH the entry cap and the byte budget: each sketch is ~16 KB,
+    // so the entry cap alone permits ~16 MB regardless of the shard's memory
+    // budget — on a small shard the byte budget is the binding constraint.
+    constexpr size_t kHllEntryBytes = HyperLogLog::SERIALIZED_SIZE + 64;  // sketch + key/map overhead
+    const size_t maxEntriesByBytes = std::max<size_t>(1, maxHllCacheBytes() / kHllEntryBytes);
+    const size_t maxEntries = std::min<size_t>(MAX_HLL_CACHE_ENTRIES, maxEntriesByBytes);
+    if (hllCache_.size() <= maxEntries)
         return;
 
-    size_t toEvict = hllCache_.size() - MAX_HLL_CACHE_ENTRIES;
+    size_t toEvict = hllCache_.size() - maxEntries;
     for (auto it = hllCache_.begin(); it != hllCache_.end() && toEvict > 0;) {
         // Skip dirty entries (will be evicted after next flush)
         if (hllCacheDirty_.count(it->first)) {
@@ -2416,13 +2534,32 @@ void NativeIndex::trimSchemaCaches() {
 }
 
 void NativeIndex::trimMeasurementBloomCache() {
-    if (measurementBloomCache_.size() <= MAX_BLOOM_CACHE_ENTRIES)
+    // Bound by BYTES as well as entry count. A bloom is sized from the number of
+    // distinct tag values in its measurement, so entries range from 8 KB to
+    // megabytes -- an entry count alone says nothing about the memory held. The
+    // byte budget is what actually protects the arena; the count cap remains as a
+    // cheap guard against pathological numbers of tiny measurements.
+    const size_t byteBudget = maxBloomCacheBytes();
+
+    auto totalBytes = [this]() {
+        size_t total = 0;
+        for (const auto& [key, bloom] : measurementBloomCache_) {
+            total += bloom.filterSize() + key.size();
+        }
+        return total;
+    };
+
+    size_t bytes = totalBytes();
+    if (measurementBloomCache_.size() <= MAX_BLOOM_CACHE_ENTRIES && bytes <= byteBudget) {
         return;
-    // Evict non-dirty entries first. If still over limit, evict all non-dirty.
+    }
+
+    // Evict non-dirty entries first; dirty ones still owe a flush.
     for (auto it = measurementBloomCache_.begin(); it != measurementBloomCache_.end();) {
-        if (measurementBloomCache_.size() <= MAX_BLOOM_CACHE_ENTRIES)
+        if (measurementBloomCache_.size() <= MAX_BLOOM_CACHE_ENTRIES && bytes <= byteBudget)
             break;
         if (dirtyMeasurementBlooms_.count(it->first) == 0) {
+            bytes -= std::min(bytes, it->second.filterSize() + it->first.size());
             bloomFullyBuilt_.erase(it->first);
             it = measurementBloomCache_.erase(it);
         } else {
@@ -2693,7 +2830,8 @@ seastar::future<> NativeIndex::updateHLL(const std::string& measurement, uint32_
 }
 
 seastar::future<> NativeIndex::updateTagHLL(const std::string& measurement, const std::string& tagKey,
-                                            const std::string& tagValue, uint32_t localId) {
+                                            const std::string& tagValue, uint32_t localId,
+                                            const std::string& seedBitmapKey) {
     std::string key;
     key.reserve(measurement.size() + 1 + tagKey.size() + 1 + tagValue.size());
     key += measurement;
@@ -2714,6 +2852,38 @@ seastar::future<> NativeIndex::updateTagHLL(const std::string& measurement, cons
                 it = hllCache_.try_emplace(key, HyperLogLog::deserialize(*val)).first;
             } else {
                 it = hllCache_.try_emplace(key).first;
+            }
+            // Seed from the exact bitmap on BOTH branches (HLL adds are
+            // idempotent, so re-seeding is harmless):
+            //  - fresh sketch: the tag value just crossed the cardinality
+            //    threshold, and without seeding it would count only the ids
+            //    added from here on (under-reporting by ~the threshold);
+            //  - deserialized sketch: a sketch persisted below the threshold
+            //    by an older version stopped receiving ids when the threshold
+            //    was introduced; merging the bitmap back-fills the frozen gap.
+            // The bitmap is RE-LOOKED-UP here, after the kvGet suspension —
+            // the caller's pointer would have dangled across it (robin_map
+            // rehash/trim).
+            const roaring::Roaring* seedBitmap = nullptr;
+            auto bmIt = bitmapCache_.find(seedBitmapKey);
+            if (bmIt != bitmapCache_.end()) {
+                seedBitmap = &bmIt.value().bitmap;
+            } else {
+                // Evicted during the suspension (possible only if a flush
+                // cleared its dirty flag and a trim ran). Reload read-only;
+                // the returned pointer is valid until the next suspension,
+                // and the seed loop below does not suspend.
+                seedBitmap = co_await getPostingsBitmapByKey(seedBitmapKey);
+                // Re-find the sketch after suspending again.
+                it = hllCache_.find(key);
+                if (it == hllCache_.end()) {
+                    it = hllCache_.try_emplace(key).first;
+                }
+            }
+            if (seedBitmap != nullptr) {
+                for (uint32_t existingId : *seedBitmap) {
+                    it.value().add(existingId);
+                }
             }
         }
     }
@@ -2864,23 +3034,37 @@ seastar::future<double> NativeIndex::estimateTagCardinality(const std::string& m
     key.push_back('\0');
     key += tagValue;
 
+    // A sketch is only trusted at or above kTagHllMinCardinality. Sketches
+    // are maintained only above the threshold, so a sub-threshold estimate
+    // means a stale sketch persisted by an older version that has since been
+    // frozen (no longer updated) — the exact bitmap is both available and
+    // correct there. Below the threshold, fall through to the bitmap.
     auto it = hllCache_.find(key);
     if (it != hllCache_.end()) {
-        co_return it->second.estimate();
-    }
-
-    // Try loading HLL from KV
-    auto kvKey = ke::encodeCardinalityHLLKey(measurement, tagKey, tagValue);
-    auto val = co_await kvGet(kvKey);
-    // Re-find after co_await (see estimateMeasurementCardinality).
-    if (auto post = hllCache_.find(key); post != hllCache_.end()) {
-        co_return post->second.estimate();
-    }
-    if (val.has_value() && val->size() >= HyperLogLog::SERIALIZED_SIZE) {
-        auto hll = HyperLogLog::deserialize(*val);
-        double est = hll.estimate();
-        hllCache_[key] = std::move(hll);
-        co_return est;
+        double est = it->second.estimate();
+        if (est >= static_cast<double>(kTagHllMinCardinality)) {
+            co_return est;
+        }
+    } else {
+        // Try loading HLL from KV
+        auto kvKey = ke::encodeCardinalityHLLKey(measurement, tagKey, tagValue);
+        auto val = co_await kvGet(kvKey);
+        // Re-find after co_await (see estimateMeasurementCardinality).
+        if (auto post = hllCache_.find(key); post != hllCache_.end()) {
+            double est = post->second.estimate();
+            if (est >= static_cast<double>(kTagHllMinCardinality)) {
+                co_return est;
+            }
+        } else if (val.has_value() && val->size() >= HyperLogLog::SERIALIZED_SIZE) {
+            auto hll = HyperLogLog::deserialize(*val);
+            double est = hll.estimate();
+            if (est >= static_cast<double>(kTagHllMinCardinality)) {
+                hllCache_[key] = std::move(hll);
+                co_return est;
+            }
+            // Sub-threshold stale sketch: do NOT cache it — updateTagHLL
+            // must see a cache miss later so it can seed from the bitmap.
+        }
     }
 
     // Fallback: check roaring bitmap cardinality (exact)

@@ -7,8 +7,8 @@
 // Covers:
 //   1. dataRootPath()/shardDataPath() derivation: default ".", empty value,
 //      absolute and relative roots, trailing-slash normalization.
-//   2. End-to-end: an Engine with an injected StorageLayout creates shard_0
-//      (tsm/, WAL, native_index/) there and ignores later global path changes.
+//   2. End-to-end: an Engine running with a custom data_dir creates shard_0
+//      (tsm/, WAL, native_index/) under that directory and NOT under the CWD.
 
 #include "../../../lib/config/timestar_config.hpp"
 #include "../../../lib/core/engine.hpp"
@@ -16,13 +16,11 @@
 #include "../../test_helpers.hpp"
 
 #include <gtest/gtest.h>
-#include <unistd.h>
 
-#include <algorithm>
 #include <filesystem>
 #include <seastar/core/thread.hh>
 #include <string>
-#include <type_traits>
+#include <unistd.h>
 
 namespace fs = std::filesystem;
 
@@ -55,7 +53,6 @@ protected:
 // ---------------------------------------------------------------------------
 
 TEST_F(DataDirTest, ServerConfigDefaultsToDot) {
-    static_assert(!std::is_default_constructible_v<Engine>);
     timestar::ServerConfig cfg{};
     EXPECT_EQ(cfg.data_dir, ".");
 }
@@ -105,29 +102,25 @@ TEST_F(DataDirTest, FilesystemRootIsPreserved) {
 }
 
 // ---------------------------------------------------------------------------
-// End-to-end: Engine writes all shard data under its injected layout and does
-// not re-read global path configuration after construction.
+// End-to-end: Engine writes all shard data under the configured data_dir
 // ---------------------------------------------------------------------------
 
-TEST_F(DataDirTest, EngineUsesInjectedDataDirDespiteGlobalConfigChanges) {
+TEST_F(DataDirTest, EngineCreatesShardDataUnderConfiguredDataDir) {
     seastar::thread([] {
         const fs::path tmpRoot = fs::temp_directory_path() / ("timestar_data_dir_test_" + std::to_string(::getpid()));
-        const fs::path decoyRoot = tmpRoot.string() + "_global_decoy";
         fs::remove_all(tmpRoot);
-        fs::remove_all(decoyRoot);
-        ScopedDataDir guard(decoyRoot.string());
-        std::string seriesKey;
 
         {
-            // Engine storage ownership is fixed by the injected layout. A
-            // later global-config change must not redirect any artifact.
-            ScopedEngine eng(timestar::StorageLayout(tmpRoot.string() + "/"));
+            // Trailing slash on purpose: exercises normalization end-to-end.
+            // The directory does not exist yet: the engine must create it.
+            ScopedDataDir guard(tmpRoot.string() + "/");
+
+            ScopedEngine eng;
             eng.init();
 
             TimeStarInsert<double> insert("datadir_metric", "value");
             insert.addValue(1000, 1.5);
             insert.addValue(2000, 2.5);
-            seriesKey = insert.seriesKey();
             eng->insert(std::move(insert)).get();
 
             const fs::path shardDir = tmpRoot / "shard_0";
@@ -147,31 +140,14 @@ TEST_F(DataDirTest, EngineUsesInjectedDataDirDespiteGlobalConfigChanges) {
             }
             EXPECT_TRUE(foundWal) << "no .wal file under " << shardDir;
 
-            // ScopedEngine stops the engine here while the conflicting global
-            // config is still installed.
+            // Nothing may leak into the CWD (the pre-fix behavior).
+            EXPECT_FALSE(fs::exists("shard_0")) << "shard_0 leaked into the CWD despite data_dir";
+
+            // ScopedEngine stops the engine here, while the custom data_dir
+            // config is still installed (mirrors real shutdown ordering).
         }
-
-        {
-            ScopedEngine restarted{timestar::StorageLayout(tmpRoot)};
-            restarted.init();
-
-            const auto result = restarted->query(seriesKey, 0, 3000).get();
-            ASSERT_TRUE(result.has_value());
-            ASSERT_TRUE(std::holds_alternative<QueryResult<double>>(*result));
-            const auto& points = std::get<QueryResult<double>>(*result);
-            EXPECT_EQ(points.timestamps, (std::vector<uint64_t>{1000, 2000}));
-            EXPECT_EQ(points.values, (std::vector<double>{1.5, 2.5}));
-
-            const auto measurements = restarted->getAllMeasurements().get();
-            EXPECT_NE(std::find(measurements.begin(), measurements.end(), "datadir_metric"), measurements.end());
-        }
-
-        EXPECT_FALSE(fs::exists("shard_0")) << "shard_0 leaked into the CWD despite data_dir";
-        EXPECT_FALSE(fs::exists(decoyRoot / "shard_0"))
-            << "Engine re-read the global data_dir after its layout was injected";
 
         fs::remove_all(tmpRoot);
-        fs::remove_all(decoyRoot);
     })
         .join()
         .get();

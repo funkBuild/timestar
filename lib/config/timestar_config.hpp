@@ -22,17 +22,108 @@ struct CompactionConfig {
     uint32_t max_concurrent = 2;
     uint64_t max_memory = 256 * 1024 * 1024;
     uint32_t batch_size = 10000;
-    uint32_t tier0_min_files = 4;
-    uint32_t tier1_min_files = 4;
-    uint32_t tier2_min_files = 4;
+    // Files merged per compaction, uniform across ALL tiers (replaces the old
+    // tier0/1/2_min_files trio, of which only tier0's was ever read). Both the
+    // merge TRIGGER (a tier is eligible once it holds this many files) and the
+    // merge INPUT SIZE (exactly this many oldest files, never more): with 6
+    // files in a tier, the oldest 4 merge and the newest 2 wait for 2 more.
+    // Merging "whatever has accumulated" made tier-file sizes wander by 2-4x;
+    // fixed-count merges keep them geometrically consistent (a tier-N file is
+    // ~files_per_merge tier-(N-1) files), which is what makes tier depth a
+    // meaningful signal for block sizing and reclaim-rate scheduling.
+    uint32_t files_per_merge = 4;
+    // Tier-0 file count at which compaction stops yielding to pending WAL->TSM
+    // conversion. WAL drain normally wins (it frees disk and keeps ingest
+    // flowing), but an unbounded tier 0 degrades every query on the shard, so
+    // this caps how far read amplification can drift during a long burst.
+    uint32_t tier0_starvation_ceiling = 32;
+    // Tier-0 file count at which INGEST is shed (503 + Retry-After). At high
+    // cardinality every tier-0 file carries a multi-MB sparse index, so an
+    // unbounded backlog is an unbounded memory commitment: a soak at 3x the
+    // target rate grew tier 0 to 268 files, whose indexes exhausted the memory
+    // pool and turned merges and conversions themselves into bad_alloc
+    // failures -- at which point the backlog could never drain. Shedding at
+    // twice the starvation ceiling gives merges a full-priority window
+    // [starvation_ceiling .. this] to catch up before writes are refused; a
+    // client that honours Retry-After converges on the rate the WHOLE
+    // pipeline (parse + WAL + convert + merge) sustains, not just its front.
+    uint32_t tier0_shed_ceiling = 64;
+    // Ceiling for the per-tier output block size: compaction writes tier-T
+    // outputs with blocks of up to min(max_points_per_block << T, this).
+    // High-cardinality workloads flush files whose per-series blocks hold only
+    // a few dozen points (128k series at a 64MB store = ~50 points/series);
+    // merges are the only chance to consolidate them, and deeper tiers hold
+    // data that is rewritten rarely but scanned a lot -- bigger blocks there
+    // buy compression ratio and fewer index entries. The ceiling bounds the
+    // decode cost of touching one block on the query path.
+    uint32_t deep_block_points_cap = 24000;
 };
 
 struct StorageConfig {
-    uint64_t wal_size_threshold = 16 * 1024 * 1024;
+    // Per-store WAL segment size, which is also the store rollover trigger
+    // (with the resident-bytes ceiling at 4x this). 64MB, up from 16MB: at
+    // high cardinality the WAL estimate is dominated by ~120B/series-insert
+    // framing, so 16MB rolled a 128k-series store every couple of batches --
+    // constant conversion churn, ~2-point flush blocks, and 10x the rollover
+    // rate for no durability gain. 64MB is the value every validated
+    // endurance run used (3B pts / 128k series / 6GB: 21.1M pts/s import,
+    // zero errors, RSS ~1.1GB). Memory cost: retained stores are bounded by
+    // admission at 16 stores/shard worst case.
+    uint64_t wal_size_threshold = 64 * 1024 * 1024;
     uint32_t max_points_per_block = 3000;
     double tsm_bloom_fpr = 0.001;
     uint32_t tsm_cache_entries = 4096;
     uint32_t wal_max_concurrent_encoders = 4;  // Max concurrent WAL encoding coroutines per shard
+    // Concurrent WAL->TSM conversions per shard. Was hard-coded to 1, which made
+    // conversion the ingest ceiling: conversion is the only thing that frees
+    // retained-store RAM, so ITS throughput -- not tier-merge throughput -- sets
+    // the sustainable ingest rate.
+    //
+    // Measured, 1.3B points / 2 shards / 8 connections on NVMe, sweeping this
+    // value (13000 batches, accepted vs shed, latency over the whole run):
+    //
+    //    conv   pts/s   accepted   shed    p99      max
+    //      1    2.66M    3110/13000  76%   250ms    726ms
+    //      3    7.09M    8995/13000  31%   281ms    748ms
+    //      6    9.69M   11322/13000  13%    67ms    124ms   <-- optimum
+    //     12    8.45M   10796/13000  17%   325ms   1105ms
+    //
+    // A clear inverted U. Below the knee conversions serialise behind each
+    // other's I/O waits and the backlog forces writes to be shed; above it they
+    // contend for disk and CPU, and both latency and throughput regress. 6 wins
+    // on every axis simultaneously -- 3.6x the throughput of the old hard-coded
+    // 1, with p99 cut from 250ms to 67ms.
+    //
+    // This is disk-dependent: measured on tmpfs the sweep is flat, because
+    // RAM-backed I/O never blocks, so a single fiber keeps up. Re-measure on the
+    // target storage before changing it.
+    uint32_t conversion_concurrency = 6;
+    // Free-memory floor for accepting writes: below this per-shard free
+    // memory, ingest is shed with 503 + Retry-After. The last line of defence
+    // against bad_alloc storms of ANY origin -- once allocation fails inside
+    // the write path (or worse, inside a conversion or merge), the failure
+    // mode is data loss and a backlog that can no longer drain; a shed
+    // request is retryable and costs nothing. 256MB leaves room for the
+    // in-flight parse transients the parse budget already bounds.
+    uint64_t ingest_min_free_bytes = 256ull * 1024 * 1024;
+    // WAL durability mode — when an acknowledged write is actually durable.
+    //   "always"   (default): group commit.  A write acks only after its bytes
+    //              are drained to disk and fdatasync'd; concurrent writers
+    //              share one flush round, so cost amortises under load.  This
+    //              is the mode that makes "persisted before acknowledgment"
+    //              true.
+    //   "interval": ack immediately; a per-WAL timer flushes+fsyncs every
+    //              wal_sync_interval_ms.  Bounds the crash-loss window in
+    //              TIME instead of bytes (the old behaviour's window was a
+    //              256KiB stream buffer that a slow shard might not fill for
+    //              hours — and it was BYTES, so RLE-compressed bool series
+    //              lost 10-100x more points than float series).
+    //   "rollover": legacy pre-Jul-2026 behaviour — durable only at segment
+    //              rollover/clean close.  An OOM-kill silently loses the
+    //              buffered tail of acked writes.  Kept for benchmarking, not
+    //              recommended for production.
+    std::string wal_sync_mode = "always";
+    uint32_t wal_sync_interval_ms = 100;  // flush cadence for "interval" mode
     CompactionConfig compaction;
 };
 
@@ -68,9 +159,28 @@ struct StreamingConfig {
 // bandwidth under contention. When only one class has pending I/O, it gets
 // full bandwidth regardless of share count.
 struct IOPriorityConfig {
-    float query_shares = 100.0f;      // TSM/index reads during queries
-    float write_shares = 50.0f;       // WAL writes, memtable flushes
-    float compaction_shares = 10.0f;  // Background TSM/SSTable compaction
+    float query_shares = 100.0f;  // TSM/index reads during queries
+    float write_shares = 50.0f;   // WAL writes, memtable flushes
+    // Background TSM/SSTable compaction. Shares are a PROPORTION under
+    // contention, not a cap: an idle reactor still gives compaction 100%.
+    // 333 holds ~25% against a saturated `main` (333/1333), ~22% with
+    // ts_flush also runnable (333/1533). The old value of 10 rounded to
+    // 0.8% under sustained foreground load -- effectively starvation: a
+    // parse-saturated shard completed 9 merges while conversions added ~25
+    // files/min, and the resulting tier-0 backlog's sparse indexes exhausted
+    // the shard's memory pool. A merge burst can still never take more than
+    // its proportional slice from a busy foreground, so the write-latency
+    // cost only appears when compaction genuinely has work during saturation
+    // -- exactly when falling behind is the worse outcome.
+    float compaction_shares = 333.0f;
+    // WAL->TSM conversion. Deliberately ABOVE compaction_shares: conversion
+    // frees retained-store RAM and WAL disk, so when merges and conversions
+    // genuinely contend (the tier-0 starvation-ceiling window, where the
+    // WAL-first policy deferral is bypassed) drain must still win. 500 holds
+    // ~33% against a saturated main. In normal operation the policy layer
+    // (compactionYieldReason) keeps merges out of conversion's way entirely;
+    // the share gap only matters when that policy is deliberately overridden.
+    float flush_shares = 500.0f;
 };
 
 struct EngineConfig {
@@ -159,8 +269,8 @@ struct glz::meta<timestar::CompactionConfig> {
     using T = timestar::CompactionConfig;
     static constexpr auto value =
         object("max_concurrent", &T::max_concurrent, "max_memory", &T::max_memory, "batch_size", &T::batch_size,
-               "tier0_min_files", &T::tier0_min_files, "tier1_min_files", &T::tier1_min_files, "tier2_min_files",
-               &T::tier2_min_files);
+               "files_per_merge", &T::files_per_merge, "tier0_starvation_ceiling", &T::tier0_starvation_ceiling,
+               "tier0_shed_ceiling", &T::tier0_shed_ceiling, "deep_block_points_cap", &T::deep_block_points_cap);
 };
 
 template <>
@@ -169,7 +279,9 @@ struct glz::meta<timestar::StorageConfig> {
     static constexpr auto value =
         object("wal_size_threshold", &T::wal_size_threshold, "max_points_per_block", &T::max_points_per_block,
                "tsm_bloom_fpr", &T::tsm_bloom_fpr, "tsm_cache_entries", &T::tsm_cache_entries,
-               "wal_max_concurrent_encoders", &T::wal_max_concurrent_encoders, "compaction", &T::compaction);
+               "wal_max_concurrent_encoders", &T::wal_max_concurrent_encoders, "conversion_concurrency",
+               &T::conversion_concurrency, "ingest_min_free_bytes", &T::ingest_min_free_bytes, "wal_sync_mode",
+               &T::wal_sync_mode, "wal_sync_interval_ms", &T::wal_sync_interval_ms, "compaction", &T::compaction);
 };
 
 template <>
@@ -196,7 +308,7 @@ template <>
 struct glz::meta<timestar::IOPriorityConfig> {
     using T = timestar::IOPriorityConfig;
     static constexpr auto value = object("query_shares", &T::query_shares, "write_shares", &T::write_shares,
-                                         "compaction_shares", &T::compaction_shares);
+                                         "compaction_shares", &T::compaction_shares, "flush_shares", &T::flush_shares);
 };
 
 template <>

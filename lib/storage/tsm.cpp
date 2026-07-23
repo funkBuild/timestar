@@ -15,6 +15,7 @@
 #include <seastar/core/fstream.hh>
 #include <seastar/core/loop.hh>
 #include <seastar/core/seastar.hh>
+#include <seastar/util/later.hh>
 #include <string_view>
 
 // Block header: uint8_t type + uint32_t timestampSize + uint32_t timestampBytes
@@ -89,6 +90,46 @@ struct BlockHeaderInfo {
 // Parse the block header and decode timestamps (filtered by [startTime, endTime], inclusive)
 // into `tsScratchOut` (cleared and reserved before decode). Returns nullopt on
 // malformed header. nTimestamps==0 is a valid result (no timestamps in range).
+// `timestampSize` is the decoded VALUE COUNT and is read raw from the block
+// header, then used to size allocations. `timestampBytes` (the compressed byte
+// length) is bounds-checked against the block, but the count never was -- so a
+// corrupt or truncated header turned directly into a reserve() of up to
+// UINT32_MAX * 8 bytes (~34 GB) and a std::bad_alloc far from the real fault.
+//
+// The two are cross-checkable. The densest the integer encoder can possibly be
+// is its constant-delta fast path (integer_encoder_ffor.cpp encodeBlock): a
+// block of up to kBlockSize=1024 values whose deltas are all equal emits ONLY a
+// 2-word header, i.e. 1024 values in 16 bytes = 64 values per byte, with no
+// partition-level prefix (encodeInto returns exactly the block bytes).
+//
+// 64:1 is therefore the true theoretical maximum -- and it is not a corner case,
+// it is the COMMON case for constant-interval timestamps. Checking against it
+// exactly would leave zero margin, so any future improvement to that encoding
+// would start silently rejecting valid blocks. Several callers of this predicate
+// return nullptr/nullopt/0 rather than throwing, so a false rejection is silent
+// data loss, not a visible error. Hence the deliberate 4x slack.
+//
+// This is a sanity check on a raw on-disk uint32, not a tight bound: its job is
+// to stop a corrupt count from driving a multi-GB reserve() (UINT32_MAX * 8
+// bytes is ~34 GB). At a typical 4 KB block even the slackened bound caps the
+// count around 1M, far below anything that could exhaust memory.
+inline constexpr uint64_t MAX_TIMESTAMP_VALUES_PER_BYTE = 64;  // encoder's theoretical best
+inline constexpr uint64_t TIMESTAMP_COUNT_SLACK_FACTOR = 4;    // margin against future encoders
+
+// Enforce the coupling the comment above describes: if kBlockSize grows, the
+// encoder gets denser and this bound must grow with it, or valid blocks start
+// being rejected. (kBlockSize values per 16-byte header = kBlockSize/16 values
+// per byte at the theoretical densest.)
+static_assert(IntegerEncoderFFOR::kBlockSize / 16 <= MAX_TIMESTAMP_VALUES_PER_BYTE * TIMESTAMP_COUNT_SLACK_FACTOR,
+              "Integer encoder can now emit more values per byte than the reader's plausibility bound allows; "
+              "raise MAX_TIMESTAMP_VALUES_PER_BYTE/TIMESTAMP_COUNT_SLACK_FACTOR or valid blocks will be dropped");
+
+[[nodiscard]] static bool timestampCountIsPlausible(uint32_t timestampSize, uint32_t timestampBytes) {
+    const uint64_t maxPlausible =
+        static_cast<uint64_t>(timestampBytes) * MAX_TIMESTAMP_VALUES_PER_BYTE * TIMESTAMP_COUNT_SLACK_FACTOR;
+    return static_cast<uint64_t>(timestampSize) <= maxPlausible;
+}
+
 static std::optional<BlockHeaderInfo> parseHeaderAndDecodeTimestamps(const uint8_t* data, uint32_t blockSize,
                                                                      uint64_t startTime, uint64_t endTime,
                                                                      std::vector<uint64_t>& tsScratchOut) {
@@ -102,6 +143,8 @@ static std::optional<BlockHeaderInfo> parseHeaderAndDecodeTimestamps(const uint8
     uint32_t timestampBytes = headerSlice.read<uint32_t>();
 
     if (timestampBytes > blockSize - BLOCK_HEADER_SIZE)
+        return std::nullopt;
+    if (!timestampCountIsPlausible(timestampSize, timestampBytes))
         return std::nullopt;
 
     tsScratchOut.clear();
@@ -365,7 +408,12 @@ seastar::future<> TSM::readSparseIndex() {
     // We need the actual count before initializing the bloom filter
     std::vector<SeriesId128> seriesIds;
 
-    while (indexSlice.offset < indexSlice.length_) {
+    // Require a whole fixed header before touching it: SeriesId128::fromBytes
+    // takes a raw pointer and does NOT bounds-check (unlike Slice::read), so a
+    // few trailing bytes here would read past the buffer before the following
+    // block-count read could throw.
+    const uint32_t entryHeaderSize = tsmIndexEntryHeaderSize(fileVersion);
+    while (indexSlice.bytesLeft() >= entryHeaderSize) {
         uint64_t entryStartOffset = indexOffset + indexSlice.offset;
 
         // Read series ID (16 bytes) — zero-copy from index buffer
@@ -373,9 +421,9 @@ seastar::future<> TSM::readSparseIndex() {
             SeriesId128::fromBytes(reinterpret_cast<const char*>(indexSlice.data + indexSlice.offset), 16);
         indexSlice.offset += 16;
 
-        // Read type (1 byte) and block count (2 bytes)
+        // Read type (1 byte) and block count (u32 in V3, u16 before)
         uint8_t type = indexSlice.read<uint8_t>();
-        uint16_t blockCount = indexSlice.read<uint16_t>();
+        uint32_t blockCount = (fileVersion >= 3) ? indexSlice.read<uint32_t>() : indexSlice.read<uint16_t>();
 
         // Block size depends on type and file version
         if (type > static_cast<uint8_t>(TSMValueType::Integer)) {
@@ -447,30 +495,34 @@ seastar::future<> TSM::readSparseIndex() {
         // Phase 3: Skip over string dictionary if present (V2 String series)
         uint32_t dictBytes = 0;
         if (seriesType == TSMValueType::String && fileVersion >= 2) {
-            if (indexSlice.offset + 4 <= indexSlice.length_) {
-                std::memcpy(&dictBytes, indexSlice.data + indexSlice.offset, 4);
-                if (dictBytes > 16 * 1024 * 1024) {
-                    throw std::runtime_error("Corrupt TSM: dictionary too large");
-                }
-                if (indexSlice.offset + 4 + dictBytes > indexSlice.length_) {
-                    // Dictionary extends past index end — can't find next entry.
-                    timestar::tsm_log.warn(
-                        "TSM sparse index: corrupt dictionary size {} at offset {} (index size {}), "
-                        "stopping parse after {} entries",
-                        dictBytes, indexSlice.offset, indexSlice.length_, sparseIndex.size());
-                    break;
-                }
-                indexSlice.offset += 4 + dictBytes;
+            if (indexSlice.offset + 4 > indexSlice.length_) {
+                // No room for the dictionary length — the entry is truncated.
+                // Must THROW, not tolerate: a partially parsed index registers
+                // the file with only a prefix of its series, and a later
+                // compaction of that file deletes the source — permanently
+                // destroying the unparsed series instead of leaving them
+                // loudly unavailable.
+                throw std::runtime_error("TSM index corrupt: string entry truncated before dictionary length");
             }
+            std::memcpy(&dictBytes, indexSlice.data + indexSlice.offset, 4);
+            if (dictBytes > 16 * 1024 * 1024) {
+                throw std::runtime_error("Corrupt TSM: dictionary too large");
+            }
+            if (indexSlice.offset + 4 + dictBytes > indexSlice.length_) {
+                // Dictionary extends past index end — same rule as above:
+                // reject the whole file rather than silently keeping a prefix.
+                throw std::runtime_error("TSM index corrupt: dictionary size " + std::to_string(dictBytes) +
+                                         " at offset " + std::to_string(indexSlice.offset) +
+                                         " extends past index end (" + std::to_string(indexSlice.length_) + ")");
+            }
+            indexSlice.offset += 4 + dictBytes;
         }
 
-        // Calculate total entry size (header + blocks + optional dictionary)
-        // blockBytes is bounded by uint16_t blockCount * perBlockBytes (max ~5.2M), fits in uint32_t
-        if (blockBytes > UINT32_MAX - 19) [[unlikely]] {
-            throw std::runtime_error("TSM index corrupt: blockBytes " + std::to_string(blockBytes) +
-                                     " exceeds uint32_t entry size limit");
-        }
-        uint32_t entrySize = 16 + 1 + 2 + static_cast<uint32_t>(blockBytes);
+        // Calculate total entry size (header + blocks + optional dictionary).
+        // entrySize is uint64 so it cannot cap the widened uint32 blockCount;
+        // blockBytes is already bounded by the bytesLeft() check above, i.e. by
+        // the real index size, so no separate overflow guard is needed.
+        uint64_t entrySize = entryHeaderSize + static_cast<uint64_t>(blockBytes);
         if (seriesType == TSMValueType::String && fileVersion >= 2) {
             entrySize += 4 + dictBytes;
         }
@@ -491,6 +543,18 @@ seastar::future<> TSM::readSparseIndex() {
 
         // Collect series ID for bloom filter
         seriesIds.push_back(seriesId);
+    }
+
+    // The loop exits cleanly only at EXACTLY zero bytes left. A short tail
+    // (0 < bytesLeft < header size) means the index is truncated: accepting
+    // the parsed prefix would register the file with only some of its series,
+    // and a later compaction of that file DELETES the source — permanently
+    // destroying the unparsed series' data. Reject the whole file instead
+    // (openTsmFile() logs it loudly and leaves the file on disk).
+    if (indexSlice.bytesLeft() != 0) {
+        throw std::runtime_error("TSM index corrupt: " + std::to_string(indexSlice.bytesLeft()) +
+                                 " trailing bytes after " + std::to_string(seriesIds.size()) +
+                                 " index entries — index is truncated: " + filePath);
     }
 
     // Now initialize bloom filter with the ACTUAL series count
@@ -516,9 +580,22 @@ seastar::future<> TSM::readSparseIndex() {
 // The caller must have already read the series ID, type byte, and block count from
 // the Slice before calling this.  On return the Slice offset is advanced past all
 // block data and the optional string dictionary.
-void TSM::parseIndexBlocksFromSlice(Slice& indexSlice, TSMIndexEntry& entry, uint16_t blockCount) const {
+void TSM::parseIndexBlocksFromSlice(Slice& indexSlice, TSMIndexEntry& entry, uint32_t blockCount) const {
+    // Bound the reserve against the bytes actually available before trusting the
+    // count. Reads are individually checked by Slice::read(), but the reserve
+    // happens first: a uint16 count could only ever ask for ~5.7 MB, whereas a
+    // corrupt uint32 count can ask for ~378 GB and throw std::bad_alloc before
+    // any read is attempted. The sparse-index path pre-validates this, but
+    // getFullIndexEntry()/prefetchFullIndexEntries() do not.
+    const size_t perBlockBytes = indexBlockBytes(entry.seriesType, fileVersion);
+    const size_t maxBlocks = perBlockBytes ? indexSlice.bytesLeft() / perBlockBytes : 0;
+    if (blockCount > maxBlocks) {
+        throw std::runtime_error("TSM index corrupt: blockCount " + std::to_string(blockCount) + " exceeds " +
+                                 std::to_string(maxBlocks) + " blocks available in " +
+                                 std::to_string(indexSlice.bytesLeft()) + " remaining bytes");
+    }
     entry.indexBlocks.reserve(blockCount);
-    for (uint16_t i = 0; i < blockCount; ++i) {
+    for (uint32_t i = 0; i < blockCount; ++i) {
         TSMIndexBlock block;
         block.minTime = indexSlice.read<uint64_t>();
         block.maxTime = indexSlice.read<uint64_t>();
@@ -610,9 +687,11 @@ seastar::future<TSMIndexEntry*> TSM::getFullIndexEntry(const SeriesId128& series
         co_return nullptr;
     }
 
-    // Step 4: Single DMA read for entire series entry
+    // Step 4: Single DMA read for entire series entry (through the read
+    // elevator: concurrent per-series index misses in the same reactor tick
+    // coalesce — index entries are adjacent in the index region).
     const auto& sparse = sparseIt->second;
-    auto entryBuf = co_await tsmFile.dma_read_exactly<uint8_t>(sparse.fileOffset, sparse.entrySize);
+    auto entryBuf = co_await coalescedDmaRead(sparse.fileOffset, sparse.entrySize);
 
     // Step 5: Parse the full entry
     Slice entrySlice(entryBuf.get(), entryBuf.size());
@@ -624,8 +703,19 @@ seastar::future<TSMIndexEntry*> TSM::getFullIndexEntry(const SeriesId128& series
     entrySlice.offset += 16;
 
     // Parse type and block count
-    fullEntry.seriesType = static_cast<TSMValueType>(entrySlice.read<uint8_t>());
-    uint16_t blockCount = entrySlice.read<uint16_t>();
+    // Validate before casting: an out-of-range type byte falls through every
+    // branch in parseIndexBlocksFromSlice, which then parses a 28-byte base
+    // while indexBlockBytes() computed a different stride -- a silent misparse
+    // instead of an error. The sparse-index path already checks this.
+    {
+        uint8_t typeByte = entrySlice.read<uint8_t>();
+        if (typeByte > static_cast<uint8_t>(TSMValueType::Integer)) {
+            throw std::runtime_error("TSM index corrupt: invalid type byte " + std::to_string(typeByte));
+        }
+        fullEntry.seriesType = static_cast<TSMValueType>(typeByte);
+    }
+    // Block count is u32 in V3, u16 before.
+    uint32_t blockCount = (fileVersion >= 3) ? entrySlice.read<uint32_t>() : entrySlice.read<uint16_t>();
 
     // Parse all blocks and optional string dictionary
     parseIndexBlocksFromSlice(entrySlice, fullEntry, blockCount);
@@ -668,7 +758,7 @@ seastar::future<> TSM::prefetchFullIndexEntries(const std::vector<SeriesId128>& 
     struct FetchEntry {
         SeriesId128 id;
         uint64_t offset;
-        uint32_t size;
+        uint64_t size;  // matches SparseIndexEntry::entrySize
     };
     std::vector<FetchEntry> toFetch;
     toFetch.reserve(seriesIds.size());
@@ -751,8 +841,20 @@ seastar::future<> TSM::prefetchFullIndexEntries(const std::vector<SeriesId128>& 
             fullEntry.seriesId =
                 SeriesId128::fromBytes(reinterpret_cast<const char*>(entrySlice.data + entrySlice.offset), 16);
             entrySlice.offset += 16;
-            fullEntry.seriesType = static_cast<TSMValueType>(entrySlice.read<uint8_t>());
-            uint16_t blockCount = entrySlice.read<uint16_t>();
+            {
+                uint8_t typeByte = entrySlice.read<uint8_t>();
+                if (typeByte > static_cast<uint8_t>(TSMValueType::Integer)) {
+                    // Prefetch is a best-effort cache warm; skip this entry rather
+                    // than aborting the prefetch (and the query) for every other
+                    // series in the batch. A real read of this series will fail
+                    // loudly via getFullIndexEntry().
+                    timestar::tsm_log.warn("Skipping prefetch of series with invalid type byte {}", typeByte);
+                    continue;
+                }
+                fullEntry.seriesType = static_cast<TSMValueType>(typeByte);
+            }
+            // Block count is u32 in V3, u16 before.
+            uint32_t blockCount = (fileVersion >= 3) ? entrySlice.read<uint32_t>() : entrySlice.read<uint16_t>();
 
             // Parse all blocks and optional string dictionary
             parseIndexBlocksFromSlice(entrySlice, fullEntry, blockCount);
@@ -853,11 +955,125 @@ const std::vector<TSMIndexBlock>& TSM::getSeriesBlocks(const SeriesId128& series
     return empty;
 }
 
+// --- Read elevator (see the header for the full contract) ---
+
+seastar::future<seastar::temporary_buffer<uint8_t>> TSM::coalescedDmaRead(uint64_t offset, uint64_t size) {
+    auto pending = std::make_unique<PendingDmaRead>();
+    pending->offset = offset;
+    pending->size = size;
+    auto fut = pending->done.get_future();
+    _pendingDmaReads.push_back(std::move(pending));
+    if (!_dmaDispatchScheduled) {
+        _dmaDispatchScheduled = true;
+        // Defer to the back of the current task-queue run so every request
+        // from concurrently-runnable series lands in this dispatch round.
+        (void)seastar::yield().then([this] { return dispatchPendingDmaReads(); });
+    }
+    return fut;
+}
+
+seastar::future<> TSM::dispatchPendingDmaReads() {
+    _dmaDispatchScheduled = false;
+    auto pending = std::exchange(_pendingDmaReads, {});
+    if (pending.empty()) {
+        co_return;
+    }
+
+    std::sort(pending.begin(), pending.end(),
+              [](const std::unique_ptr<PendingDmaRead>& a, const std::unique_ptr<PendingDmaRead>& b) {
+                  return a->offset < b->offset;
+              });
+
+    // Merge requests whose gaps are cheaper to read through than to seek
+    // past.  Gap bytes cost sequential bandwidth; a separate request costs an
+    // IOP — on IOPS-billed volumes the 128KB trade is heavily in favour of
+    // reading through.  The cap bounds the transient buffer a merged read
+    // pins (every share() view holds the whole buffer alive until dropped).
+    static constexpr uint64_t kMergeGapBytes = 128 * 1024;
+    static constexpr uint64_t kMaxMergedRead = 8 * 1024 * 1024;
+
+    struct MergedRange {
+        uint64_t start = 0;
+        uint64_t end = 0;  // exclusive
+        size_t firstReq = 0;
+        size_t lastReq = 0;  // inclusive
+    };
+    std::vector<MergedRange> ranges;
+    ranges.push_back({pending[0]->offset, pending[0]->offset + pending[0]->size, 0, 0});
+    for (size_t i = 1; i < pending.size(); ++i) {
+        auto& cur = ranges.back();
+        const uint64_t reqStart = pending[i]->offset;
+        const uint64_t reqEnd = reqStart + pending[i]->size;
+        const uint64_t mergedEnd = std::max(cur.end, reqEnd);
+        if (reqStart <= cur.end + kMergeGapBytes && mergedEnd - cur.start <= kMaxMergedRead) {
+            cur.end = mergedEnd;
+            cur.lastReq = i;
+        } else {
+            ranges.push_back({reqStart, reqEnd, i, i});
+        }
+    }
+
+    co_await seastar::parallel_for_each(ranges, [this, &pending](const MergedRange& range) -> seastar::future<> {
+        std::exception_ptr ep;
+        seastar::temporary_buffer<uint8_t> buf;
+        try {
+            buf = co_await tsmFile.dma_read_exactly<uint8_t>(range.start, range.end - range.start);
+        } catch (...) {
+            ep = std::current_exception();
+        }
+        for (size_t i = range.firstReq; i <= range.lastReq; ++i) {
+            auto& req = *pending[i];
+            if (ep) {
+                req.done.set_exception(ep);
+            } else if (req.offset - range.start + req.size > buf.size()) {
+                req.done.set_exception(std::make_exception_ptr(
+                    std::runtime_error("coalesced DMA read came back short: file truncated under a live query")));
+            } else {
+                req.done.set_value(buf.share(req.offset - range.start, req.size));
+            }
+        }
+    });
+}
+
+// Rethrow the in-flight exception with this file's path appended (see the
+// declaration for the full contract: bad_alloc passes through, annotation is
+// idempotent, and the BlockDecodeError type is preserved so callers that
+// classify on it keep working).
+[[noreturn]] void TSM::rethrowWithFilePath() const {
+    constexpr std::string_view marker = " [tsm ";
+    try {
+        throw;
+    } catch (const std::bad_alloc&) {
+        throw;
+    } catch (const timestar::BlockDecodeError& e) {
+        if (std::string_view(e.what()).find(marker) != std::string_view::npos) {
+            throw;
+        }
+        throw timestar::BlockDecodeError(std::string(e.what()) + " [tsm " + filePath + "]");
+    } catch (const std::exception& e) {
+        if (std::string_view(e.what()).find(marker) != std::string_view::npos) {
+            throw;
+        }
+        throw std::runtime_error(std::string(e.what()) + " [tsm " + filePath + "]");
+    }
+}
+
 // Phase 1.1: Read a single block and return it (not appending to results)
 template <class T>
 seastar::future<std::unique_ptr<TSMBlock<T>>> TSM::readSingleBlock(const TSMIndexBlock& indexBlock, uint64_t startTime,
                                                                    uint64_t endTime,
                                                                    const std::vector<std::string>* stringDict) {
+    try {
+        co_return co_await readSingleBlockImpl<T>(indexBlock, startTime, endTime, stringDict);
+    } catch (...) {
+        rethrowWithFilePath();
+    }
+}
+
+template <class T>
+seastar::future<std::unique_ptr<TSMBlock<T>>> TSM::readSingleBlockImpl(const TSMIndexBlock& indexBlock,
+                                                                       uint64_t startTime, uint64_t endTime,
+                                                                       const std::vector<std::string>* stringDict) {
     // Capture the dictionary pointer before co_await.  All callers pass
     // coroutine-frame-local copies that survive DMA suspensions, so a shallow
     // pointer save is sufficient here.
@@ -873,7 +1089,7 @@ seastar::future<std::unique_ptr<TSMBlock<T>>> TSM::readSingleBlock(const TSMInde
         endTime = UINT64_MAX;
     }
 
-    auto blockBuf = co_await tsmFile.dma_read_exactly<uint8_t>(indexBlock.offset, indexBlock.size);
+    auto blockBuf = co_await coalescedDmaRead(indexBlock.offset, indexBlock.size);
     Slice blockSlice(blockBuf.get(), blockBuf.size());
 
     if (indexBlock.size < BLOCK_HEADER_SIZE) {
@@ -887,6 +1103,10 @@ seastar::future<std::unique_ptr<TSMBlock<T>>> TSM::readSingleBlock(const TSMInde
 
     if (timestampBytes > indexBlock.size - BLOCK_HEADER_SIZE) {
         throw std::runtime_error("TSM block timestampBytes exceeds block size");
+    }
+    if (!timestampCountIsPlausible(timestampSize, timestampBytes)) {
+        throw std::runtime_error("TSM block timestampSize " + std::to_string(timestampSize) + " is impossible for " +
+                                 std::to_string(timestampBytes) + " compressed bytes");
     }
 
     // Validate that the block's stored type matches the template parameter
@@ -928,6 +1148,21 @@ seastar::future<std::unique_ptr<TSMBlock<T>>> TSM::readSingleBlock(const TSMInde
         for (size_t i = nSkipped; i < end; ++i) {
             blockResults->values.push_back(ZigZag::zigzagDecode(rawUintScratch[i]));
         }
+    }
+
+    // Same count contract as decodeBlockFlat(): these per-block decoders build a
+    // TSMBlock whose consumers index values by a TIMESTAMP index
+    // (TSMBlock::valueAt), so a desynced pair is an out-of-bounds read.
+    //
+    // Excess values are truncated (benign); a shortfall is raised, because the
+    // only alternatives are to mispair real data or to drop the block and report
+    // success -- a silent partial answer.
+    if (blockResults->values.size() > blockResults->timestamps.size()) {
+        blockResults->values.resize(blockResults->timestamps.size());
+    } else if (blockResults->values.size() < blockResults->timestamps.size()) {
+        throw timestar::BlockDecodeError("TSM block decode short: " + std::to_string(blockResults->values.size()) +
+                                         " values for " + std::to_string(blockResults->timestamps.size()) +
+                                         " timestamps");
     }
 
     co_return blockResults;
@@ -1075,6 +1310,13 @@ std::unique_ptr<TSMBlock<T>> TSM::decodeBlock(Slice& blockSlice, uint32_t blockS
                                 BLOCK_HEADER_SIZE);
         return nullptr;
     }
+    // ...and that the decoded COUNT is achievable from that many bytes, before
+    // it is used to size the block's two vectors.
+    if (!timestampCountIsPlausible(timestampSize, timestampBytes)) {
+        timestar::tsm_log.error("Timestamp count {} is impossible for {} compressed bytes", timestampSize,
+                                timestampBytes);
+        return nullptr;
+    }
 
     // Decode timestamps with time-range filtering
     auto blockResults = std::make_unique<TSMBlock<T>>(timestampSize);
@@ -1117,6 +1359,21 @@ std::unique_ptr<TSMBlock<T>> TSM::decodeBlock(Slice& blockSlice, uint32_t blockS
         }
     }
 
+    // Same count contract as decodeBlockFlat(): these per-block decoders build a
+    // TSMBlock whose consumers index values by a TIMESTAMP index
+    // (TSMBlock::valueAt), so a desynced pair is an out-of-bounds read.
+    //
+    // Excess values are truncated (benign); a shortfall is raised, because the
+    // only alternatives are to mispair real data or to drop the block and report
+    // success -- a silent partial answer.
+    if (blockResults->values.size() > blockResults->timestamps.size()) {
+        blockResults->values.resize(blockResults->timestamps.size());
+    } else if (blockResults->values.size() < blockResults->timestamps.size()) {
+        throw timestar::BlockDecodeError("TSM block decode short: " + std::to_string(blockResults->values.size()) +
+                                         " values for " + std::to_string(blockResults->timestamps.size()) +
+                                         " timestamps");
+    }
+
     return blockResults;
 }
 
@@ -1137,8 +1394,12 @@ static size_t decodeBlockFlat(const uint8_t* data, uint32_t blockSize, uint64_t 
 
     if (timestampBytes > blockSize - BLOCK_HEADER_SIZE)
         return 0;
+    if (!timestampCountIsPlausible(timestampSize, timestampBytes))
+        return 0;
 
     auto timestampsSlice = blockSlice.getSlice(timestampBytes);
+    const size_t timestampsBefore = outTimestamps.size();
+    const size_t valuesBefore = outValues.size();
     auto [nSkipped, nTimestamps] =
         IntegerEncoder::decode(timestampsSlice, timestampSize, outTimestamps, startTime, endTime);
 
@@ -1149,18 +1410,20 @@ static size_t decodeBlockFlat(const uint8_t* data, uint32_t blockSize, uint64_t 
         return 0;
     size_t valueByteSize = blockSize - timestampBytes - BLOCK_HEADER_SIZE;
 
+    size_t produced = 0;
     if constexpr (std::is_same_v<T, double>) {
         auto valuesSlice = blockSlice.getCompressedSlice(valueByteSize);
-        FloatDecoder::decode(valuesSlice, nSkipped, nTimestamps, outValues);
+        produced = FloatDecoder::decode(valuesSlice, nSkipped, nTimestamps, outValues);
     } else if constexpr (std::is_same_v<T, bool>) {
         auto valuesSlice = blockSlice.getSlice(valueByteSize);
-        BoolEncoderRLE::decode(valuesSlice, nSkipped, nTimestamps, outValues);
+        produced = BoolEncoderRLE::decode(valuesSlice, nSkipped, nTimestamps, outValues);
     } else if constexpr (std::is_same_v<T, std::string>) {
         auto valuesSlice = blockSlice.getSlice(valueByteSize);
         if (StringEncoder::isDictionaryEncoded(valuesSlice) && stringDict && !stringDict->empty()) {
-            StringEncoder::decodeDictionary(valuesSlice, timestampSize, nSkipped, nTimestamps, *stringDict, outValues);
+            produced = StringEncoder::decodeDictionary(valuesSlice, timestampSize, nSkipped, nTimestamps, *stringDict,
+                                                       outValues);
         } else {
-            StringEncoder::decode(valuesSlice, timestampSize, nSkipped, nTimestamps, outValues);
+            produced = StringEncoder::decode(valuesSlice, timestampSize, nSkipped, nTimestamps, outValues);
         }
     } else if constexpr (std::is_same_v<T, int64_t>) {
         auto valuesSlice = blockSlice.getSlice(valueByteSize);
@@ -1172,6 +1435,66 @@ static size_t decodeBlockFlat(const uint8_t* data, uint32_t blockSize, uint64_t 
         for (size_t i = nSkipped; i < end; ++i) {
             outValues.push_back(ZigZag::zigzagDecode(rawUintScratch[i]));
         }
+        produced = (end > nSkipped) ? (end - nSkipped) : 0;
+    }
+
+    // ---- THE COUNT CONTRACT, enforced once for every value type ----
+    //
+    // `expected` is what the block says it holds for this read: the timestamps
+    // that survived the time filter. Each decoder reports what it really
+    // produced (phase 1), so the three previously-divergent behaviours -- ALP
+    // trimmed, bool threw, string/int silently under-produced -- now converge
+    // here.
+    //
+    //   produced > expected : benign. A decoder working in fixed-size groups can
+    //                         overshoot the tail; truncate and carry on.
+    //   produced < expected : the block is corrupt or a decoder regressed. There
+    //                         is no safe repair -- pairing values[i] with
+    //                         timestamps[i] past the shortfall MISPAIRS real
+    //                         data, presenting a wrong point as a valid one.
+    const size_t expected = outTimestamps.size() - timestampsBefore;
+
+    // FIRST: the decoder must have APPENDED. Both vectors accumulate across every
+    // block of a series, so a decoder that clears or otherwise shrinks the output
+    // destroys earlier blocks' values while their timestamps remain.
+    //
+    // This check is what actually catches that, and trusting the decoder's own
+    // produced-count does NOT: the clobbering block reports produced == expected
+    // for ITS OWN points (1 value for 1 timestamp) and looks perfectly healthy,
+    // while 3000 previously-decoded values have silently vanished. Measuring the
+    // real growth of the buffer is the only view that sees it.
+    if (outValues.size() < valuesBefore) {
+        const size_t lost = valuesBefore - outValues.size();
+        outTimestamps.resize(timestampsBefore);
+        throw timestar::BlockDecodeError("value decoder shrank the output by " + std::to_string(lost) +
+                                         " values -- decoders must APPEND, never clear (block declares " +
+                                         std::to_string(timestampSize) + " points)");
+    }
+    const size_t appended = outValues.size() - valuesBefore;
+
+    if (appended > expected) {
+        outValues.resize(valuesBefore + expected);
+    } else if (appended < expected) {
+        // Roll the timestamps back so no caller can observe a desynced pair even
+        // if this exception is caught and the buffers reused.
+        outTimestamps.resize(timestampsBefore);
+        outValues.resize(valuesBefore);
+        throw timestar::BlockDecodeError("TSM block decode short: appended " + std::to_string(appended) +
+                                         " values (decoder reported " + std::to_string(produced) + ") for " +
+                                         std::to_string(expected) + " timestamps (block declares " +
+                                         std::to_string(timestampSize) + " points)");
+    }
+
+    // Defence for the other direction: the timestamp decoder must never emit
+    // more than the block declares. Both FFOR paths clamp to `timestampSize`,
+    // but that is enforced inside the decoder -- this is the check at the
+    // consumer, and it is the ONLY thing standing between a future timestamp
+    // over-read and silently fabricated points.
+    if (expected > timestampSize) {
+        outTimestamps.resize(timestampsBefore);
+        outValues.resize(valuesBefore);
+        throw timestar::BlockDecodeError("TSM block decoded " + std::to_string(expected) +
+                                         " timestamps but declares only " + std::to_string(timestampSize));
     }
 
     return nTimestamps;
@@ -1183,8 +1506,10 @@ static size_t decodeBlockFlat(const uint8_t* data, uint32_t blockSize, uint64_t 
 template <class T>
 seastar::future<> TSM::readBlockBatch(const BlockBatch& batch, uint64_t startTime, uint64_t endTime,
                                       TSMResult<T>& results, const std::vector<std::string>* stringDict) {
-    // Single large DMA read for entire batch
-    auto batchBuf = co_await tsmFile.dma_read_exactly<uint8_t>(batch.startOffset, batch.totalSize);
+    // Single large read for the entire batch, via the read elevator so that
+    // batches from OTHER series running in the same reactor tick merge into
+    // shared large reads (series regions sit back to back in the file).
+    auto batchBuf = co_await coalescedDmaRead(batch.startOffset, batch.totalSize);
 
     // Decode all blocks in this batch into a single flat TSMBlock.
     // Blocks within a batch are contiguous and sorted by offset (= time order),
@@ -1345,6 +1670,15 @@ seastar::future<> TSM::readBlockAndFold(const TSMIndexBlock& block, TSMValueType
 
 seastar::future<size_t> TSM::aggregateSeries(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime,
                                              timestar::BlockAggregator& aggregator, seastar::semaphore* ioSem) {
+    try {
+        co_return co_await aggregateSeriesImpl(seriesId, startTime, endTime, aggregator, ioSem);
+    } catch (...) {
+        rethrowWithFilePath();
+    }
+}
+
+seastar::future<size_t> TSM::aggregateSeriesImpl(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime,
+                                                 timestar::BlockAggregator& aggregator, seastar::semaphore* ioSem) {
     // Get full index entry (uses bloom filter + sparse index + lazy load)
     auto* indexEntry = co_await getFullIndexEntry(seriesId);
     if (!indexEntry) {
@@ -1446,8 +1780,9 @@ seastar::future<size_t> TSM::aggregateSeries(const SeriesId128& seriesId, uint64
             ioUnits = co_await seastar::get_units(*ioSem, 1);
         }
 
-        // Single DMA read for the entire batch
-        auto batchBuf = co_await tsmFile.dma_read_exactly<uint8_t>(batch.startOffset, batch.totalSize);
+        // Single read for the entire batch (elevator: merges with concurrent
+        // series' batch reads in the same dispatch round)
+        auto batchBuf = co_await coalescedDmaRead(batch.startOffset, batch.totalSize);
 
         // Release I/O semaphore after DMA completes — decode is CPU-only
         ioUnits.reset();
@@ -1523,6 +1858,16 @@ seastar::future<size_t> TSM::aggregateSeries(const SeriesId128& seriesId, uint64
 seastar::future<size_t> TSM::aggregateSeriesSelective(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime,
                                                       timestar::BlockAggregator& aggregator, bool reverse,
                                                       size_t maxPoints) {
+    try {
+        co_return co_await aggregateSeriesSelectiveImpl(seriesId, startTime, endTime, aggregator, reverse, maxPoints);
+    } catch (...) {
+        rethrowWithFilePath();
+    }
+}
+
+seastar::future<size_t> TSM::aggregateSeriesSelectiveImpl(const SeriesId128& seriesId, uint64_t startTime,
+                                                          uint64_t endTime, timestar::BlockAggregator& aggregator,
+                                                          bool reverse, size_t maxPoints) {
     auto* indexEntry = co_await getFullIndexEntry(seriesId);
     if (!indexEntry || indexEntry->seriesType == TSMValueType::String) {
         co_return 0;
@@ -1627,6 +1972,19 @@ seastar::future<size_t> TSM::aggregateSeriesBucketed(const SeriesId128& seriesId
                                                      timestar::BlockAggregator& aggregator, bool reverse,
                                                      uint64_t interval, std::unordered_set<uint64_t>& filledBuckets,
                                                      size_t totalBuckets) {
+    try {
+        co_return co_await aggregateSeriesBucketedImpl(seriesId, startTime, endTime, aggregator, reverse, interval,
+                                                       filledBuckets, totalBuckets);
+    } catch (...) {
+        rethrowWithFilePath();
+    }
+}
+
+seastar::future<size_t> TSM::aggregateSeriesBucketedImpl(const SeriesId128& seriesId, uint64_t startTime,
+                                                         uint64_t endTime, timestar::BlockAggregator& aggregator,
+                                                         bool reverse, uint64_t interval,
+                                                         std::unordered_set<uint64_t>& filledBuckets,
+                                                         size_t totalBuckets) {
     auto* indexEntry = co_await getFullIndexEntry(seriesId);
     if (!indexEntry || indexEntry->seriesType == TSMValueType::String) {
         co_return 0;

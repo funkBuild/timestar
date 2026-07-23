@@ -1,32 +1,21 @@
 #include "../../../lib/storage/shard_rebalancer.hpp"
 
-#include "../../../lib/core/placement_table.hpp"
 #include "../../../lib/core/series_id.hpp"
 #include "../../../lib/storage/memory_store.hpp"
 #include "../../../lib/storage/tsm.hpp"
-#include "../../../lib/storage/tsm_tombstone.hpp"
 #include "../../../lib/storage/tsm_writer.hpp"
 
 #include <gtest/gtest.h>
-#include <unistd.h>
 
-#include <array>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
-#include <iterator>
-#include <seastar/util/defer.hh>
-#include <type_traits>
 
 namespace fs = std::filesystem;
 
-static_assert(!std::is_constructible_v<timestar::ShardRebalancer, std::string>);
-
 class ShardRebalancerTest : public ::testing::Test {
 protected:
-    fs::path testDir = fs::temp_directory_path() /
-                       ("timestar rebalancer layout " + std::to_string(static_cast<unsigned long>(::getpid())));
-    timestar::StorageLayout layout{testDir};
+    std::string testDir = "./test_rebalancer_data";
 
     void SetUp() override {
         fs::remove_all(testDir);
@@ -38,8 +27,9 @@ protected:
     // Helper to create a shard directory structure with TSM files
     void createShardWithTSM(unsigned shardId, const std::vector<std::string>& seriesKeys,
                             uint64_t baseTime = 1000000000, int numPoints = 100) {
-        fs::create_directories(layout.tsmDir(shardId));
-        fs::create_directories(layout.nativeIndexDir(shardId));
+        std::string shardPath = testDir + "/shard_" + std::to_string(shardId);
+        fs::create_directories(shardPath + "/tsm");
+        fs::create_directories(shardPath + "/index");
 
         // Create a MemoryStore with data for each series
         auto store = seastar::make_shared<MemoryStore>(0);
@@ -55,12 +45,12 @@ protected:
         }
 
         // Write TSM file using blocking close
-        const auto tsmPath = layout.tsmFile(shardId, 0, 0);
-        TSMWriter::run(store, tsmPath.string());
+        std::string tsmPath = shardPath + "/tsm/0_0.tsm";
+        TSMWriter::run(store, tsmPath);
     }
 
     // Helper to write shard_count.meta
-    void writeMetaFile(unsigned count) { timestar::ShardRebalancer::writeShardCountMeta(layout, count); }
+    void writeMetaFile(unsigned count) { timestar::ShardRebalancer::writeShardCountMeta(testDir, count); }
 };
 
 // ---------------------------------------------------------------------------
@@ -68,22 +58,20 @@ protected:
 // ---------------------------------------------------------------------------
 
 TEST_F(ShardRebalancerTest, WriteAndReadShardCountMeta) {
-    timestar::ShardRebalancer::writeShardCountMeta(layout, 4);
-    unsigned count = timestar::ShardRebalancer::readShardCountMeta(layout);
+    timestar::ShardRebalancer::writeShardCountMeta(testDir, 4);
+    unsigned count = timestar::ShardRebalancer::readShardCountMeta(testDir);
     EXPECT_EQ(count, 4u);
-    EXPECT_TRUE(fs::exists(layout.shardCountMetadataFile()));
-    EXPECT_FALSE(fs::exists(layout.shardCountMetadataTemporaryFile()));
 }
 
 TEST_F(ShardRebalancerTest, ReadMissingMetaReturnsZero) {
-    unsigned count = timestar::ShardRebalancer::readShardCountMeta(layout);
+    unsigned count = timestar::ShardRebalancer::readShardCountMeta(testDir);
     EXPECT_EQ(count, 0u);
 }
 
 TEST_F(ShardRebalancerTest, OverwriteShardCountMeta) {
-    timestar::ShardRebalancer::writeShardCountMeta(layout, 4);
-    timestar::ShardRebalancer::writeShardCountMeta(layout, 8);
-    unsigned count = timestar::ShardRebalancer::readShardCountMeta(layout);
+    timestar::ShardRebalancer::writeShardCountMeta(testDir, 4);
+    timestar::ShardRebalancer::writeShardCountMeta(testDir, 8);
+    unsigned count = timestar::ShardRebalancer::readShardCountMeta(testDir);
     EXPECT_EQ(count, 8u);
 }
 
@@ -93,50 +81,50 @@ TEST_F(ShardRebalancerTest, OverwriteShardCountMeta) {
 
 TEST_F(ShardRebalancerTest, FreshInstallNoRebalanceNeeded) {
     // No shard directories, no meta file
-    timestar::ShardRebalancer rebalancer(layout);
+    timestar::ShardRebalancer rebalancer(testDir);
     EXPECT_FALSE(rebalancer.isRebalanceNeeded(4));
 }
 
 TEST_F(ShardRebalancerTest, SameShardCountNoRebalance) {
     writeMetaFile(4);
-    timestar::ShardRebalancer rebalancer(layout);
+    timestar::ShardRebalancer rebalancer(testDir);
     EXPECT_FALSE(rebalancer.isRebalanceNeeded(4));
 }
 
 TEST_F(ShardRebalancerTest, DifferentShardCountNeedsRebalance) {
     writeMetaFile(4);
-    timestar::ShardRebalancer rebalancer(layout);
+    timestar::ShardRebalancer rebalancer(testDir);
     EXPECT_TRUE(rebalancer.isRebalanceNeeded(8));
     EXPECT_EQ(rebalancer.previousShardCount(), 4u);
 }
 
 TEST_F(ShardRebalancerTest, ScaleDownNeedsRebalance) {
     writeMetaFile(8);
-    timestar::ShardRebalancer rebalancer(layout);
+    timestar::ShardRebalancer rebalancer(testDir);
     EXPECT_TRUE(rebalancer.isRebalanceNeeded(4));
     EXPECT_EQ(rebalancer.previousShardCount(), 8u);
 }
 
 TEST_F(ShardRebalancerTest, DetectShardCountFromDirectories) {
     // No meta file, but shard directories exist
-    fs::create_directories(layout.tsmDir(0));
-    fs::create_directories(layout.tsmDir(1));
-    fs::create_directories(layout.tsmDir(2));
-    fs::create_directories(layout.tsmDir(3));
+    fs::create_directories(testDir + "/shard_0/tsm");
+    fs::create_directories(testDir + "/shard_1/tsm");
+    fs::create_directories(testDir + "/shard_2/tsm");
+    fs::create_directories(testDir + "/shard_3/tsm");
 
-    timestar::ShardRebalancer rebalancer(layout);
+    timestar::ShardRebalancer rebalancer(testDir);
     EXPECT_TRUE(rebalancer.isRebalanceNeeded(8));
     EXPECT_EQ(rebalancer.previousShardCount(), 4u);
 }
 
 TEST_F(ShardRebalancerTest, DetectShardCountIgnoresOldAndNewDirs) {
     // Leftover _old and _new dirs should not confuse detection
-    fs::create_directories(layout.tsmDir(0));
-    fs::create_directories(layout.tsmDir(1));
-    fs::create_directories(layout.shardRetiredDir(0));
-    fs::create_directories(layout.shardStagingDir(0));
+    fs::create_directories(testDir + "/shard_0/tsm");
+    fs::create_directories(testDir + "/shard_1/tsm");
+    fs::create_directories(testDir + "/shard_0_old");
+    fs::create_directories(testDir + "/shard_0_new");
 
-    timestar::ShardRebalancer rebalancer(layout);
+    timestar::ShardRebalancer rebalancer(testDir);
     // Should only count shard_0 and shard_1 (regex matches exact "shard_N" pattern)
     EXPECT_TRUE(rebalancer.isRebalanceNeeded(4));
     EXPECT_EQ(rebalancer.previousShardCount(), 2u);
@@ -148,135 +136,14 @@ TEST_F(ShardRebalancerTest, DetectShardCountIgnoresOldAndNewDirs) {
 
 TEST_F(ShardRebalancerTest, InProgressStateTriggersRebalance) {
     // Simulate a crash during rebalance: write an InProgress state file
-    std::ofstream ofs(layout.rebalanceStateFile());
+    std::string stateFile = testDir + "/rebalance.state";
+    std::ofstream ofs(stateFile);
     ofs << "1 4 8\n";  // InProgress, old=4, new=8
     ofs.close();
 
-    timestar::ShardRebalancer rebalancer(layout);
+    timestar::ShardRebalancer rebalancer(testDir);
     EXPECT_TRUE(rebalancer.isRebalanceNeeded(8));
     EXPECT_EQ(rebalancer.previousShardCount(), 4u);
-}
-
-TEST_F(ShardRebalancerTest, ExecuteUsesInjectedLayoutForSplitCutoverAndControlFiles) {
-    const auto previousCoreCount = timestar::placement().coreCount();
-    auto restorePlacement = seastar::defer(
-        [previousCoreCount] { timestar::setGlobalPlacement(timestar::PlacementTable::buildLocal(previousCoreCount)); });
-    timestar::setGlobalPlacement(timestar::PlacementTable::buildLocal(2));
-
-    std::array<bool, 2> represented{};
-    std::vector<std::string> seriesKeys;
-    for (unsigned i = 0; i < 100 && (!represented[0] || !represented[1]); ++i) {
-        auto key = "layout.integration.series." + std::to_string(i);
-        const auto target = timestar::routeToCore(SeriesId128::fromSeriesKey(key));
-        represented[target] = true;
-        seriesKeys.push_back(std::move(key));
-    }
-    ASSERT_TRUE(represented[0]);
-    ASSERT_TRUE(represented[1]);
-
-    createShardWithTSM(0, seriesKeys, 1000000000, 3);
-    writeMetaFile(1);
-
-    timestar::ShardRebalancer rebalancer(layout);
-    ASSERT_TRUE(rebalancer.isRebalanceNeeded(2));
-    rebalancer.execute(2).get();
-
-    EXPECT_EQ(timestar::ShardRebalancer::readShardCountMeta(layout), 2u);
-    EXPECT_FALSE(fs::exists(layout.shardCountMetadataTemporaryFile()));
-    EXPECT_FALSE(fs::exists(layout.rebalanceStateFile()));
-    EXPECT_FALSE(fs::exists(layout.rebalanceStateTemporaryFile()));
-    for (unsigned shard = 0; shard < 2; ++shard) {
-        EXPECT_TRUE(fs::exists(layout.shardDir(shard)));
-        EXPECT_TRUE(fs::exists(layout.nativeIndexDir(shard)));
-        EXPECT_TRUE(fs::exists(layout.tsmFile(shard, "0_split_0.tsm")));
-        EXPECT_FALSE(fs::exists(layout.shardStagingDir(shard)));
-        EXPECT_FALSE(fs::exists(layout.shardRetiredDir(shard)));
-    }
-}
-
-TEST_F(ShardRebalancerTest, ExecuteMovePreservesTombstoneUnderInjectedLayout) {
-    const auto previousCoreCount = timestar::placement().coreCount();
-    auto restorePlacement = seastar::defer(
-        [previousCoreCount] { timestar::setGlobalPlacement(timestar::PlacementTable::buildLocal(previousCoreCount)); });
-    timestar::setGlobalPlacement(timestar::PlacementTable::buildLocal(2));
-
-    std::string seriesKey;
-    unsigned targetShard = 0;
-    for (unsigned i = 0; i < 100; ++i) {
-        auto candidate = "layout.move.series." + std::to_string(i);
-        const auto candidateTarget = timestar::routeToCore(SeriesId128::fromSeriesKey(candidate));
-        if (candidateTarget == 1) {
-            seriesKey = std::move(candidate);
-            targetShard = candidateTarget;
-            break;
-        }
-    }
-    ASSERT_FALSE(seriesKey.empty());
-
-    createShardWithTSM(0, {seriesKey}, 1000000000, 3);
-    const auto seriesId = SeriesId128::fromSeriesKey(seriesKey);
-    const auto sourceTombstone = layout.tsmTombstoneFile(0, 0, 0);
-    {
-        timestar::TSMTombstone tombstone(sourceTombstone.string());
-        ASSERT_TRUE(tombstone.addTombstone(seriesId, 1000000000, 1000000000).get());
-        tombstone.flush().get();
-    }
-    std::ifstream sourceBytes(sourceTombstone, std::ios::binary);
-    const std::string tombstoneContents{std::istreambuf_iterator<char>(sourceBytes), std::istreambuf_iterator<char>()};
-    ASSERT_FALSE(tombstoneContents.empty());
-    writeMetaFile(1);
-
-    timestar::ShardRebalancer rebalancer(layout);
-    ASSERT_TRUE(rebalancer.isRebalanceNeeded(2));
-    rebalancer.execute(2).get();
-
-    const auto destinationTsm = layout.tsmFile(targetShard, 0, 0);
-    const auto destinationTombstone = layout.tsmTombstoneFile(targetShard, 0, 0);
-    EXPECT_TRUE(fs::exists(destinationTsm));
-    ASSERT_TRUE(fs::exists(destinationTombstone));
-    std::ifstream tombstone(destinationTombstone, std::ios::binary);
-    EXPECT_EQ(std::string(std::istreambuf_iterator<char>(tombstone), std::istreambuf_iterator<char>()),
-              tombstoneContents);
-    timestar::TSMTombstone loaded(destinationTombstone.string());
-    loaded.load().get();
-    EXPECT_TRUE(loaded.isDeleted(seriesId, 1000000000));
-}
-
-TEST_F(ShardRebalancerTest, SymlinkedTsmFailsBeforeAnyRebalanceMutation) {
-    const auto outsideDir = testDir / "outside";
-    const std::string seriesKey = "layout.symlink.series";
-    const auto seriesId = SeriesId128::fromSeriesKey(seriesKey);
-    fs::create_directories(outsideDir);
-    createShardWithTSM(0, {seriesKey}, 1000000000, 3);
-
-    const auto outsideTsm = outsideDir / "0_0.tsm";
-    const auto outsideTombstone = outsideDir / "0_0.tombstone";
-    fs::rename(layout.tsmFile(0, 0, 0), outsideTsm);
-    {
-        timestar::TSMTombstone tombstone(outsideTombstone.string());
-        ASSERT_TRUE(tombstone.addTombstone(seriesId, 1000000000, 1000000000).get());
-        tombstone.flush().get();
-    }
-    fs::create_symlink(outsideTsm, layout.tsmFile(0, "link.tsm"));
-    writeMetaFile(1);
-
-    timestar::ShardRebalancer rebalancer(layout);
-    ASSERT_TRUE(rebalancer.isRebalanceNeeded(2));
-    EXPECT_THROW(rebalancer.execute(2).get(), std::runtime_error);
-
-    EXPECT_TRUE(fs::is_symlink(layout.tsmFile(0, "link.tsm")));
-    EXPECT_TRUE(fs::exists(outsideTsm));
-    EXPECT_TRUE(fs::exists(outsideTombstone));
-    timestar::TSMTombstone loaded(outsideTombstone.string());
-    loaded.load().get();
-    EXPECT_TRUE(loaded.isDeleted(seriesId, 1000000000));
-    EXPECT_EQ(timestar::ShardRebalancer::readShardCountMeta(layout), 1u);
-    EXPECT_FALSE(fs::exists(layout.rebalanceStateFile()));
-    EXPECT_FALSE(fs::exists(layout.rebalanceStateTemporaryFile()));
-    EXPECT_FALSE(fs::exists(layout.shardStagingDir(0)));
-    EXPECT_FALSE(fs::exists(layout.shardStagingDir(1)));
-    EXPECT_FALSE(fs::exists(layout.shardRetiredDir(0)));
-    EXPECT_TRUE(fs::exists(layout.shardDir(0)));
 }
 
 // ---------------------------------------------------------------------------
@@ -290,7 +157,7 @@ TEST_F(ShardRebalancerTest, SingleSeriesTSMCanBeMoved) {
     writeMetaFile(1);
 
     // Verify the TSM file was created
-    EXPECT_TRUE(fs::exists(layout.tsmFile(0, 0, 0)));
+    EXPECT_TRUE(fs::exists(testDir + "/shard_0/tsm/0_0.tsm"));
 }
 
 TEST_F(ShardRebalancerTest, MultipleSeriesSameTargetCanBeMoved) {
@@ -313,7 +180,7 @@ TEST_F(ShardRebalancerTest, MultipleSeriesSameTargetCanBeMoved) {
     writeMetaFile(1);
 
     // Verify TSM file exists
-    EXPECT_TRUE(fs::exists(layout.tsmFile(0, 0, 0)));
+    EXPECT_TRUE(fs::exists(testDir + "/shard_0/tsm/0_0.tsm"));
 }
 
 // ---------------------------------------------------------------------------
@@ -359,10 +226,11 @@ TEST_F(ShardRebalancerTest, StagingDirectoryLayout) {
     // (We can't run execute() without Seastar, but we can test the layout logic)
     unsigned newShardCount = 4;
     for (unsigned s = 0; s < newShardCount; ++s) {
-        fs::create_directories(layout.shardStagingTsmDir(s));
-        fs::create_directories(layout.shardStagingNativeIndexDir(s));
-        EXPECT_TRUE(fs::exists(layout.shardStagingTsmDir(s)));
-        EXPECT_TRUE(fs::exists(layout.shardStagingNativeIndexDir(s)));
+        std::string newDir = testDir + "/shard_" + std::to_string(s) + "_new";
+        fs::create_directories(newDir + "/tsm");
+        fs::create_directories(newDir + "/index");
+        EXPECT_TRUE(fs::exists(newDir + "/tsm"));
+        EXPECT_TRUE(fs::exists(newDir + "/index"));
     }
 }
 
@@ -373,29 +241,29 @@ TEST_F(ShardRebalancerTest, CutoverRenameSimulation) {
 
     // Create old shard dirs
     for (unsigned s = 0; s < oldCount; ++s) {
-        fs::create_directories(layout.tsmDir(s));
+        fs::create_directories(testDir + "/shard_" + std::to_string(s) + "/tsm");
     }
     // Create new staging dirs
     for (unsigned s = 0; s < newCount; ++s) {
-        fs::create_directories(layout.shardStagingTsmDir(s));
+        fs::create_directories(testDir + "/shard_" + std::to_string(s) + "_new/tsm");
     }
 
     // Simulate rename: old -> _old
     for (unsigned s = 0; s < oldCount; ++s) {
-        fs::rename(layout.shardDir(s), layout.shardRetiredDir(s));
+        fs::rename(testDir + "/shard_" + std::to_string(s), testDir + "/shard_" + std::to_string(s) + "_old");
     }
     // Simulate rename: _new -> final
     for (unsigned s = 0; s < newCount; ++s) {
-        fs::rename(layout.shardStagingDir(s), layout.shardDir(s));
+        fs::rename(testDir + "/shard_" + std::to_string(s) + "_new", testDir + "/shard_" + std::to_string(s));
     }
 
     // Verify final state
     for (unsigned s = 0; s < newCount; ++s) {
-        EXPECT_TRUE(fs::exists(layout.shardDir(s)));
+        EXPECT_TRUE(fs::exists(testDir + "/shard_" + std::to_string(s)));
     }
     for (unsigned s = 0; s < oldCount; ++s) {
-        EXPECT_TRUE(fs::exists(layout.shardRetiredDir(s)));
-        EXPECT_FALSE(fs::exists(layout.shardStagingDir(s)));
+        EXPECT_TRUE(fs::exists(testDir + "/shard_" + std::to_string(s) + "_old"));
+        EXPECT_FALSE(fs::exists(testDir + "/shard_" + std::to_string(s) + "_new"));
     }
 }
 

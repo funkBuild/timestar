@@ -395,7 +395,15 @@ seastar::future<QueryResult<T>> QueryRunner::queryTsm([[maybe_unused]] const std
                     } else {
                         result.values.insert(result.values.end(), block->values.begin(), block->values.end());
                     }
+                    // Release each source block as soon as it has been copied
+                    // out. Without this the decoded blocks stay alive alongside
+                    // the flattened copy for the rest of the function, doubling
+                    // the resident cost of the series -- and this runs up to
+                    // MAX_CONCURRENT_SERIES_QUERIES times in parallel, so the
+                    // waste is multiplied by the concurrency limit.
+                    block.reset();
                 }
+                tbr.result.blocks.clear();
             }
         } else {
             // Overlapping: fall back to the full N-way merge with dedup.
@@ -774,7 +782,13 @@ static size_t aggregateMemoryStores(const std::vector<seastar::shared_ptr<Memory
 
 seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAggregated(
     SeriesId128 seriesId, uint64_t startTime, uint64_t endTime, uint64_t aggregationInterval,
-    timestar::AggregationMethod method, bool foldNoInterval) {
+    timestar::AggregationMethod method, bool foldNoInterval, bool boolLatestAsNumeric) {
+    // The boolean relaxation exists only for the canonical non-numeric
+    // interval reduction (LATEST-per-bucket); any other shape must keep the
+    // full non-numeric gates, so the flag is dropped rather than trusted.
+    if (boolLatestAsNumeric && !(method == timestar::AggregationMethod::LATEST && aggregationInterval > 0)) {
+        boolLatestAsNumeric = false;
+    }
     // Gate 0.5: MEDIAN and EXACT_MEDIAN need all raw values — cannot use
     // pushdown aggregation.  T-digest is used at merge time for cross-shard
     // aggregation, not during per-value accumulation (rawValues is faster).
@@ -802,7 +816,20 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
     }
 
     // Non-numeric series (Boolean, String) never aggregate arithmetically.
-    if (seriesIsNonNumericInMemory(pinnedStores, seriesId)) {
+    // Exception: under boolLatestAsNumeric a BOOLEAN series may fold as
+    // 1.0/0.0 through the bucketed LATEST fast path (the caller converts the
+    // selected per-bucket values back to true/false — LATEST only selects,
+    // never computes, so the round-trip is exact).  Strings never pass.
+    if (boolLatestAsNumeric) {
+        for (const auto& store : pinnedStores) {
+            if (auto type = store->getSeriesType(seriesId)) {
+                if (*type == TSMValueType::String) {
+                    co_return std::nullopt;
+                }
+                break;
+            }
+        }
+    } else if (seriesIsNonNumericInMemory(pinnedStores, seriesId)) {
         co_return std::nullopt;
     }
 
@@ -901,7 +928,21 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
     // survives, exactly as for every other method (CLAUDE.md "Aggregation
     // Result Shape").  There is no single point to seek to, so those queries
     // fall through to the normal pushdown and return raw sorted vectors.
-    if ((isLatest || isFirst) && aggregationInterval > 0) {
+    //
+    // DENSE bucket grids do not come here either: the selective scan issues
+    // one DMA read PER BLOCK (early termination needs decode-as-you-go), so
+    // once the grid is fine enough that nearly every block decides some
+    // bucket, the scan degenerates into thousands of small random reads where
+    // the general pushdown below reads the same blocks in contiguous batched
+    // group reads (the R6 lesson: batch or pay per-op).  256 covers the
+    // dashboard shapes this path exists for (1..few hundred buckets) while
+    // dense analytics grids keep the batched plan.
+    constexpr size_t kSelectiveBucketScanMaxBuckets = 256;
+    const size_t plannedBuckets =
+        aggregationInterval > 0
+            ? static_cast<size_t>((tsmEndTime / aggregationInterval) - (startTime / aggregationInterval)) + 1
+            : 0;
+    if ((isLatest || isFirst) && aggregationInterval > 0 && plannedBuckets <= kSelectiveBucketScanMaxBuckets) {
         // Snapshot the TSM file map so that compaction cannot mutate it
         // mid-iteration across co_await suspension points.
         std::vector<std::pair<uint64_t, seastar::shared_ptr<TSM>>> seqFilesSnap(
@@ -919,8 +960,13 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
             // Float and Integer support pushdown aggregation.  String and
             // Boolean are non-numeric: they never aggregate arithmetically, so
             // they bypass pushdown and are returned in their written type by the
-            // caller (raw, or LATEST-per-bucket with an interval).
-            if (isNonNumericValueType(*type)) {
+            // caller (raw, or LATEST-per-bucket with an interval).  Under
+            // boolLatestAsNumeric a Boolean series IS admitted here: this fast
+            // path only SELECTS per-bucket points (never computes), so folding
+            // as 1.0/0.0 and converting back is exact — and it is what lets a
+            // bool status series answer from one block instead of a full-range
+            // materialisation.
+            if (isNonNumericValueType(*type) && !(boolLatestAsNumeric && *type == TSMValueType::Boolean)) {
                 co_return std::nullopt;
             }
             candidateFiles.push_back(tsmFile);
@@ -1104,10 +1150,19 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
     // would miss TSM-only points there (out-of-order flush), and a rewritten
     // point could fold its stale TSM copy alongside the memory value.  Fall
     // back to the dedup merge path.
+    //
+    // Same principle as the block-overlap handling further down: do not abandon
+    // the whole series, just remember that this SUB-RANGE needs the dedup merge.
+    // A rewrite of an already-flushed point leaves the stale copy in TSM and the
+    // new one in a memory store, so [fallbackStartTime, endTime] has to be
+    // merged rather than folded from each source independently -- but everything
+    // below fallbackStartTime is untouched by that and can still push down.
+    bool tsmOverlapsMemoryRange = false;
     if (needsFallback) {
         for (const auto& [rank, tsmFile] : seqFilesSnap) {
             if (tsmFile->seriesMayOverlapTime(seriesId, fallbackStartTime, endTime)) {
-                co_return std::nullopt;
+                tsmOverlapsMemoryRange = true;
+                break;
             }
         }
     }
@@ -1127,14 +1182,36 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
     }
 
     bool hasNonFloat = false;
+    // The dedup-merge paths below decode blocks through queryTsm<T>, and
+    // decodeBlock<T> throws on a block whose stored type differs from T —
+    // so the merges must dispatch on the series' ACTUAL type, captured here.
+    TSMValueType seriesValueType = TSMValueType::Float;
+    bool seriesTypeKnown = false;
     for (auto& tsmFile : gate2Candidates) {
         auto* indexEntry = co_await tsmFile->getFullIndexEntry(seriesId);
         if (!indexEntry)
             continue;
 
         // Float and Integer support pushdown; String and Boolean are
-        // non-numeric and never aggregate arithmetically.
-        if (isNonNumericValueType(indexEntry->seriesType)) {
+        // non-numeric and never aggregate arithmetically.  Under
+        // boolLatestAsNumeric a Boolean series is admitted (bucketed LATEST
+        // only selects per-bucket points — folding 1.0/0.0 and converting
+        // back is exact), which gives dense-bucket bool queries the same
+        // batched read plan as numeric fields instead of a full-range
+        // materialisation.
+        if (isNonNumericValueType(indexEntry->seriesType) &&
+            !(boolLatestAsNumeric && indexEntry->seriesType == TSMValueType::Boolean)) {
+            hasNonFloat = true;
+            break;
+        }
+
+        if (!seriesTypeKnown) {
+            seriesValueType = indexEntry->seriesType;
+            seriesTypeKnown = true;
+        } else if (indexEntry->seriesType != seriesValueType) {
+            // Divergent value types across files for one series (corrupt or
+            // mid-repair state) — bail to the typed fallback path rather than
+            // decode with the wrong template type.
             hasNonFloat = true;
             break;
         }
@@ -1162,6 +1239,24 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
         co_return std::nullopt;  // No TSM data and no fallback needed
     }
 
+    // No TSM index entry carried the type (series may live only in memory
+    // stores, reached via a bloom false positive on the TSM side) — resolve
+    // it from the memory stores so the dedup merge below decodes with the
+    // right type instead of silently matching nothing.
+    if (!seriesTypeKnown) {
+        for (const auto& store : pinnedStores) {
+            if (auto t = store->getSeriesType(seriesId)) {
+                seriesValueType = *t;
+                seriesTypeKnown = true;
+                break;
+            }
+        }
+        if (seriesTypeKnown && isNonNumericValueType(seriesValueType) &&
+            !(boolLatestAsNumeric && seriesValueType == TSMValueType::Boolean)) {
+            co_return std::nullopt;  // same rule as the TSM-side gate above
+        }
+    }
+
     // Check for overlap: sort ranges by minTime and look for any
     // block whose minTime falls inside the previous block's span.
     // Overlapping blocks mean the same timestamp may exist in more than one
@@ -1170,14 +1265,42 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
     // disqualifying: additive methods would double-count, and even
     // "idempotent" MIN/MAX could resurrect an overwritten value.  Fall back
     // to the dedup merge path, which resolves duplicates newest-write-first.
+    //
+    // Rather than abandoning the whole series on ANY overlap, isolate WHERE the
+    // overlap is. Blocks are grouped into maximal time-connected runs; a run
+    // containing an overlap needs the dedup merge, every other part of the range
+    // is still safe to push down from block statistics.
+    //
+    // This matters because the previous all-or-nothing gate meant one rewritten
+    // point anywhere disqualified the entire series: a 20M-point series with a
+    // 2M-point backfill materialised all 20M points to dedup, which is ~300 MB
+    // and throws std::bad_alloc on a memory-constrained shard. Now only the
+    // overlapping runs are materialised, one at a time, and the rest keeps the
+    // zero-decode stats path.
+    std::vector<std::pair<uint64_t, uint64_t>> overlapRuns;
     if (allBlockRanges.size() > 1) {
         std::sort(allBlockRanges.begin(), allBlockRanges.end());
-        uint64_t prevMax = 0;
-        for (size_t i = 0; i < allBlockRanges.size(); ++i) {
-            if (i > 0 && allBlockRanges[i].first <= prevMax) {
-                co_return std::nullopt;
+
+        uint64_t runLo = allBlockRanges[0].first;
+        uint64_t runMax = allBlockRanges[0].second;
+        bool runHasOverlap = false;
+        for (size_t i = 1; i < allBlockRanges.size(); ++i) {
+            if (allBlockRanges[i].first <= runMax) {
+                // Connected to the current run, and connected means the same
+                // timestamp can exist in both.
+                runHasOverlap = true;
+                runMax = std::max(runMax, allBlockRanges[i].second);
+            } else {
+                if (runHasOverlap) {
+                    overlapRuns.emplace_back(runLo, runMax);
+                }
+                runLo = allBlockRanges[i].first;
+                runMax = allBlockRanges[i].second;
+                runHasOverlap = false;
             }
-            prevMax = std::max(prevMax, allBlockRanges[i].second);
+        }
+        if (runHasOverlap) {
+            overlapRuns.emplace_back(runLo, runMax);
         }
     }
 
@@ -1196,18 +1319,103 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
         aggregator.enableFoldToSingleState();  // no collectRaw needed for streaming methods
     }
 
+    // Dedup-merge helper shared by the run merges and the memory-overlap
+    // merge below: reads [lo, hi] through queryTsm dispatched on the series'
+    // ACTUAL value type. decodeBlock<T> throws on a stored-type mismatch, so
+    // an Integer series must never be read as <double> — that failure mode
+    // surfaced whenever an integer series had a rewritten (duplicate) point
+    // across files. Awaited inline only; captures reference this frame.
+    auto dedupMergeInto = [&](uint64_t lo, uint64_t hi) -> seastar::future<> {
+        if (seriesValueType == TSMValueType::Integer) {
+            auto merged = co_await queryTsm<int64_t>(std::string{}, seriesId, lo, hi);
+            if (!merged.timestamps.empty()) {
+                std::vector<double> vals(merged.values.begin(), merged.values.end());
+                aggregator.addPoints(merged.timestamps, vals);
+            }
+        } else if (seriesValueType == TSMValueType::Boolean) {
+            // Reached only under boolLatestAsNumeric (the type gates above
+            // refuse Boolean otherwise).  Decode with the real type — a
+            // <double> read of a bool block throws — then fold as 1.0/0.0.
+            auto merged = co_await queryTsm<bool>(std::string{}, seriesId, lo, hi);
+            if (!merged.timestamps.empty()) {
+                std::vector<double> vals;
+                vals.reserve(merged.values.size());
+                for (size_t i = 0; i < merged.values.size(); ++i) {
+                    vals.push_back(merged.values[i] ? 1.0 : 0.0);
+                }
+                aggregator.addPoints(merged.timestamps, vals);
+            }
+        } else {
+            auto merged = co_await queryTsm<double>(std::string{}, seriesId, lo, hi);
+            if (!merged.timestamps.empty()) {
+                aggregator.addPoints(merged.timestamps, merged.values);
+            }
+        }
+        // `merged` is released here, before the next range is read, so
+        // peak memory is the largest single range rather than the series.
+    };
+
     // Default path: all aggregation methods other than LATEST/FIRST — read all blocks.
     // Pass per-shard I/O semaphore to bound concurrent DMA reads across all
     // series being queried on this shard (prevents reactor stalls at scale).
     seastar::semaphore* ioSem = &fileManager->queryIoSem;
-    for (auto& ref : filesWithData) {
-        co_await ref.file->aggregateSeries(seriesId, startTime, tsmEndTime, aggregator, ioSem);
+    if (overlapRuns.empty()) {
+        for (auto& ref : filesWithData) {
+            co_await ref.file->aggregateSeries(seriesId, startTime, tsmEndTime, aggregator, ioSem);
+        }
+    } else {
+        // Push down the gaps BETWEEN overlap runs, and dedup-merge the runs
+        // themselves. Ranges are inclusive on both ends (overlappingBlockRange
+        // selects a block when maxTime >= start && minTime <= end), so the gaps
+        // stop one tick short of each run and resume one tick past it. Every
+        // point is therefore covered exactly once.
+        uint64_t cursor = startTime;
+        for (const auto& [runLo, runHi] : overlapRuns) {
+            if (runLo > cursor) {
+                const uint64_t gapHi = runLo - 1;
+                for (auto& ref : filesWithData) {
+                    co_await ref.file->aggregateSeries(seriesId, cursor, gapHi, aggregator, ioSem);
+                }
+            }
+
+            // Dedup-merge just this run. queryTsm applies last-write-wins across
+            // files; it also consults memory stores, but memory data starts at
+            // fallbackStartTime == tsmEndTime + 1 and runs never extend past
+            // tsmEndTime, so no memory point can be double-counted here.
+            //
+            // BOTH bounds must be clamped to the query range: runLo/runHi are
+            // raw block bounds, and the earliest block of a run can straddle
+            // startTime — an unclamped merge would fold points from before the
+            // query into the aggregate (the aggregator does no range filtering).
+            const uint64_t mergeLo = std::max(runLo, startTime);
+            const uint64_t mergeHi = std::min(runHi, tsmEndTime);
+            if (mergeHi >= mergeLo) {
+                co_await dedupMergeInto(mergeLo, mergeHi);
+            }
+
+            cursor = (runHi == std::numeric_limits<uint64_t>::max()) ? runHi : runHi + 1;
+            if (cursor > tsmEndTime) {
+                break;
+            }
+        }
+        if (cursor <= tsmEndTime) {
+            for (auto& ref : filesWithData) {
+                co_await ref.file->aggregateSeries(seriesId, cursor, tsmEndTime, aggregator, ioSem);
+            }
+        }
     }
 
     // Fallback: fold MemoryStore data directly into the aggregator
     // for the overlap range [fallbackStartTime, endTime].  This avoids
     // materialising intermediate QueryResult vectors.
-    if (needsFallback) {
+    if (tsmOverlapsMemoryRange) {
+        // TSM still holds stale copies of timestamps that were rewritten into a
+        // memory store. Folding both sources independently would count the point
+        // twice (or keep the stale value), so this range goes through the dedup
+        // merge, which resolves newest-write-first. Memory stores are bounded by
+        // their rollover threshold, so this materialises a bounded amount.
+        co_await dedupMergeInto(fallbackStartTime, endTime);
+    } else if (needsFallback) {
         aggregateMemoryStores(pinnedStores, seriesId, fallbackStartTime, endTime, aggregator);
     }
 
@@ -1226,6 +1434,23 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
     }
 
     co_return result;
+}
+
+// No-I/O type probe: memory stores first (newest truth), then TSM sparse
+// indexes.  A series holds one type for its lifetime (enforced on write), so
+// the first source that knows it is authoritative.
+std::optional<TSMValueType> QueryRunner::localSeriesValueType(const SeriesId128& seriesId) {
+    for (const auto& store : walFileManager->pinMemoryStores()) {
+        if (auto type = store->getSeriesType(seriesId)) {
+            return type;
+        }
+    }
+    for (const auto& [seq, tsmFile] : fileManager->getSequencedTsmFiles()) {
+        if (auto type = tsmFile->getSeriesType(seriesId)) {
+            return type;
+        }
+    }
+    return std::nullopt;
 }
 
 // Template instantiations

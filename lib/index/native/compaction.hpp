@@ -2,7 +2,6 @@
 
 #include "manifest.hpp"
 #include "sstable.hpp"
-#include "storage_layout.hpp"
 
 #include <cstdint>
 #include <seastar/core/future.hh>
@@ -31,8 +30,7 @@ struct CompactionConfig {
 // Runs as a Seastar coroutine in the background.
 class CompactionEngine {
 public:
-    CompactionEngine(timestar::StorageLayout layout, unsigned workerId, Manifest& manifest,
-                     CompactionConfig config = {});
+    CompactionEngine(std::string dataDir, Manifest& manifest, CompactionConfig config = {});
 
     // Check if compaction is needed and perform it if so.
     // Called after each MemTable flush.
@@ -56,8 +54,7 @@ private:
     // Build the SSTable filename from a file number.
     std::string sstFilename(uint64_t fileNumber);
 
-    const timestar::StorageLayout layout_;
-    const unsigned workerId_;
+    std::string dataDir_;
     Manifest& manifest_;
     CompactionConfig config_;
 };

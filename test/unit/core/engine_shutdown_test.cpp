@@ -192,7 +192,7 @@ TEST_F(EngineShutdownTest, DataSurvivesShutdownViaWALFlush) {
     seastar::thread([] {
         // Phase 1: init, insert, then explicitly stop (which flushes WAL to TSM).
         {
-            Engine eng(timestar::StorageLayout("."));
+            Engine eng;
             eng.init().get();
 
             TimeStarInsert<double> insert("sensor", "temperature");
@@ -208,7 +208,7 @@ TEST_F(EngineShutdownTest, DataSurvivesShutdownViaWALFlush) {
 
         // Phase 2: re-open the same shard directory and verify data is present.
         {
-            Engine eng(timestar::StorageLayout("."));
+            Engine eng;
             // Re-init reads the persisted TSM/WAL files.
             eng.init().get();
 
@@ -269,7 +269,7 @@ TEST_F(EngineShutdownTest, InsertCompletesBeforeStopDrainsGate) {
         eng.engine.reset();
 
         // Re-open the engine (reads TSM files flushed during stop).
-        Engine eng2(timestar::StorageLayout("."));
+        Engine eng2;
         eng2.init().get();
 
         auto result = eng2.query("drain_test value", 0, UINT64_MAX).get();
@@ -296,7 +296,7 @@ TEST_F(EngineShutdownTest, ShardedEngineStopIsSafe) {
     seastar::thread([] {
         // Start a sharded engine with background tasks.
         seastar::sharded<Engine> rawEng;
-        rawEng.start(timestar::StorageLayout(".")).get();
+        rawEng.start().get();
         rawEng.invoke_on_all([](Engine& engine) { return engine.init(); }).get();
         rawEng
             .invoke_on_all([&rawEng](Engine& engine) {

@@ -22,6 +22,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <seastar/core/future.hh>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -197,6 +198,24 @@ struct ForecastQueryResultData {
 // rejected loudly as a per-point error — never silently truncated to a prefix.
 inline constexpr size_t kMaxCompressedPointsPerWritePoint = 10'000'000;
 
+// Ceiling on the TOTAL decoded points in one write request, across all of its
+// write points. The per-write-point cap above bounds a single point group but
+// not their sum: compressed timestamps expand up to 64 values per byte, so a
+// body within max_write_body_size can describe billions of points spread over
+// many groups, and every group is held simultaneously before any of them
+// reaches a store.
+inline constexpr size_t kMaxDecodedPointsPerWriteRequest = 50'000'000;
+
+// Ceiling on the TOTAL decoded BYTES one write request may materialize —
+// timestamps, numeric values, and decompressed string payloads together. The
+// points budget alone does not bound memory: packed varint timestamps cost as
+// little as one wire byte per point but 8 bytes decoded (a 64 MB body can
+// carry ~67M timestamps ≈ 536 MB), and compressed_zstd string fields allow up
+// to 256 MB decompressed per field while contributing almost nothing to the
+// point count. This is the actual memory bound for `result.inserts` on a
+// memory-constrained shard; requests that need more must be split.
+inline constexpr size_t kMaxDecodedBytesPerWriteRequest = 256 * 1024 * 1024;
+
 // Decode bound to pass to IntegerEncoder::decode for a compressed payload of
 // `bytes` bytes.  Structurally, one FFOR block consumes at least 16 bytes
 // (2-word header) and emits at most 1024 values, so a payload can never
@@ -229,6 +248,8 @@ struct ParsedQueryRequest {
     uint64_t startTime = 0;
     uint64_t endTime = 0;
     std::string aggregationInterval;
+    std::string bucketAlignment;     // "", "epoch", or "start" (see proto)
+    bool booleansAsNumeric = false;  // booleans aggregate as 1.0/0.0 (see proto)
 };
 
 // Parse a QueryRequest proto from raw bytes.
@@ -236,6 +257,13 @@ ParsedQueryRequest parseQueryRequest(const void* data, size_t size);
 
 // Format a QueryResponseData to serialized QueryResponse proto bytes.
 std::string formatQueryResponse(QueryResponseData& response);
+
+// Same wire format as formatQueryResponse, but yields to the reactor every
+// ~64k points during the per-series compression passes so a multi-million
+// point response cannot monopolize the reactor.  Production HTTP handlers
+// must use this variant; the synchronous one remains for tests and small
+// internal responses.
+seastar::future<std::string> formatQueryResponseYielding(QueryResponseData& response);
 
 // Format a query error response as serialized QueryResponse proto bytes.
 std::string formatQueryError(const std::string& code, const std::string& message);

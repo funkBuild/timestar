@@ -3,14 +3,11 @@
 #include "../../seastar_gtest.hpp"
 
 #include <gtest/gtest.h>
+#include <seastar/core/coroutine.hh>
 
 #include <filesystem>
 #include <format>
-#include <memory>
-#include <seastar/core/coroutine.hh>
-#include <seastar/util/defer.hh>
 #include <string>
-#include <type_traits>
 
 using namespace timestar::index;
 
@@ -19,66 +16,21 @@ public:
     void SetUp() override {
         // Clean up any leftover data from previous test runs
         std::filesystem::remove_all("shard_0/native_index");
-        std::filesystem::remove_all("native index injected");
-        std::filesystem::remove_all("native index alternate cwd");
     }
-    void TearDown() override {
-        std::filesystem::remove_all("shard_0/native_index");
-        std::filesystem::remove_all("native index injected");
-        std::filesystem::remove_all("native index alternate cwd");
-    }
+    void TearDown() override { std::filesystem::remove_all("shard_0/native_index"); }
 };
 
 SEASTAR_TEST_F(NativeIndexTest, OpenAndClose) {
-    NativeIndex index(timestar::StorageLayout("."), 0);
+    NativeIndex index(0);
     co_await index.open();
     co_await index.close();
-}
-
-SEASTAR_TEST_F(NativeIndexTest, InjectedRootAndWorkerRemainStableAfterCwdChange) {
-    const timestar::StorageLayout layout("native index injected/tenant-a");
-    constexpr unsigned workerId = 7;
-    const auto originalCwd = std::make_shared<const std::filesystem::path>(std::filesystem::current_path());
-    const auto alternateCwd = *originalCwd / "native index alternate cwd";
-    std::filesystem::create_directories(alternateCwd);
-    auto restoreCwd = seastar::defer([originalCwd] noexcept {
-        std::error_code error;
-        std::filesystem::current_path(*originalCwd, error);
-    });
-    SeriesId128 seriesId;
-
-    {
-        NativeIndex index(layout, workerId);
-        co_await index.open();
-        std::filesystem::current_path(alternateCwd);
-        seriesId = co_await index.getOrCreateSeriesId("injected_index", {{"host", "a"}}, "value");
-        co_await index.close();
-        std::filesystem::current_path(*originalCwd);
-    }
-
-    EXPECT_TRUE(std::filesystem::is_regular_file(layout.nativeManifestFile(workerId)));
-    EXPECT_TRUE(std::filesystem::is_directory(layout.nativeWalDir(workerId)));
-    EXPECT_TRUE(std::filesystem::is_regular_file(layout.nativeSstableFile(workerId, 1)));
-    EXPECT_FALSE(std::filesystem::exists("shard_7"));
-    EXPECT_FALSE(std::filesystem::exists(alternateCwd / "shard_7"));
-    static_assert(!std::is_constructible_v<NativeIndex, int>);
-
-    {
-        NativeIndex reopened(layout, workerId);
-        co_await reopened.open();
-        const auto metadata = co_await reopened.getSeriesMetadata(seriesId);
-        EXPECT_TRUE(metadata.has_value());
-        EXPECT_EQ(metadata ? metadata->measurement : "", "injected_index");
-        EXPECT_EQ(metadata ? metadata->field : "", "value");
-        co_await reopened.close();
-    }
 }
 
 SEASTAR_TEST_F(NativeIndexTest, CrashWindowPostingsRepair) {
     // Session 1: create a series and close cleanly — postings bitmaps and the
     // postings watermark are flushed.
     {
-        NativeIndex index(timestar::StorageLayout("."), 0);
+        NativeIndex index(0);
         co_await index.open();
         co_await index.getOrCreateSeriesId("repair_m", {{"host", "a"}}, "f");
         co_await index.close();
@@ -89,7 +41,7 @@ SEASTAR_TEST_F(NativeIndexTest, CrashWindowPostingsRepair) {
     // postings-bitmap membership lives only in RAM.
     SeriesId128 idB;
     {
-        NativeIndex index(timestar::StorageLayout("."), 0);
+        NativeIndex index(0);
         co_await index.open();
         idB = co_await index.getOrCreateSeriesId("repair_m", {{"host", "b"}}, "f");
         // no close() — simulated crash
@@ -98,7 +50,7 @@ SEASTAR_TEST_F(NativeIndexTest, CrashWindowPostingsRepair) {
     // Session 3: open() must repair postings for the crash window — the
     // series must be visible to tag-filtered queries again.
     {
-        NativeIndex index(timestar::StorageLayout("."), 0);
+        NativeIndex index(0);
         co_await index.open();
         auto ids = co_await index.findSeriesByTag("repair_m", "host", "b");
         EXPECT_EQ(ids.size(), 1u);
@@ -118,7 +70,7 @@ SEASTAR_TEST_F(NativeIndexTest, WalRecoverySurvivesReopenAndSecondCrash) {
     // exactly the state a crashed process leaves behind.
     SeriesId128 id1;
     {
-        NativeIndex index(timestar::StorageLayout("."), 0);
+        NativeIndex index(0);
         co_await index.open();
         id1 = co_await index.getOrCreateSeriesId("crash_m", {{"host", "a"}}, "f");
         // no close() — simulated crash
@@ -128,7 +80,7 @@ SEASTAR_TEST_F(NativeIndexTest, WalRecoverySurvivesReopenAndSecondCrash) {
     // in an SSTable before the WAL can be truncated or purged.
     SeriesId128 id2;
     {
-        NativeIndex index(timestar::StorageLayout("."), 0);
+        NativeIndex index(0);
         co_await index.open();
         auto meta = co_await index.getSeriesMetadata(id1);
         EXPECT_TRUE(meta.has_value());
@@ -142,7 +94,7 @@ SEASTAR_TEST_F(NativeIndexTest, WalRecoverySurvivesReopenAndSecondCrash) {
 
     // Both the recovered series and the post-recovery series must survive.
     {
-        NativeIndex index(timestar::StorageLayout("."), 0);
+        NativeIndex index(0);
         co_await index.open();
         auto meta1 = co_await index.getSeriesMetadata(id1);
         EXPECT_TRUE(meta1.has_value());
@@ -155,7 +107,7 @@ SEASTAR_TEST_F(NativeIndexTest, WalRecoverySurvivesReopenAndSecondCrash) {
 }
 
 SEASTAR_TEST_F(NativeIndexTest, CreateAndRetrieveSeries) {
-    NativeIndex index(timestar::StorageLayout("."), 0);
+    NativeIndex index(0);
     co_await index.open();
 
     auto id = co_await index.getOrCreateSeriesId("weather", {{"location", "us-west"}}, "temperature");
@@ -173,7 +125,7 @@ SEASTAR_TEST_F(NativeIndexTest, CreateAndRetrieveSeries) {
 }
 
 SEASTAR_TEST_F(NativeIndexTest, GetSeriesMetadata) {
-    NativeIndex index(timestar::StorageLayout("."), 0);
+    NativeIndex index(0);
     co_await index.open();
 
     auto id = co_await index.getOrCreateSeriesId("cpu", {{"host", "server01"}, {"region", "us"}}, "usage");
@@ -190,7 +142,7 @@ SEASTAR_TEST_F(NativeIndexTest, GetSeriesMetadata) {
 }
 
 SEASTAR_TEST_F(NativeIndexTest, FieldsAndTags) {
-    NativeIndex index(timestar::StorageLayout("."), 0);
+    NativeIndex index(0);
     co_await index.open();
 
     co_await index.getOrCreateSeriesId("weather", {{"location", "us-west"}}, "temperature");
@@ -214,7 +166,7 @@ SEASTAR_TEST_F(NativeIndexTest, FieldsAndTags) {
 }
 
 SEASTAR_TEST_F(NativeIndexTest, FieldType) {
-    NativeIndex index(timestar::StorageLayout("."), 0);
+    NativeIndex index(0);
     co_await index.open();
 
     co_await index.setFieldType("weather", "temperature", "float");
@@ -225,7 +177,7 @@ SEASTAR_TEST_F(NativeIndexTest, FieldType) {
 }
 
 SEASTAR_TEST_F(NativeIndexTest, FindSeriesByTag) {
-    NativeIndex index(timestar::StorageLayout("."), 0);
+    NativeIndex index(0);
     co_await index.open();
 
     auto id1 = co_await index.getOrCreateSeriesId("weather", {{"location", "us-west"}}, "temp");
@@ -240,7 +192,7 @@ SEASTAR_TEST_F(NativeIndexTest, FindSeriesByTag) {
 }
 
 SEASTAR_TEST_F(NativeIndexTest, GetAllSeriesForMeasurement) {
-    NativeIndex index(timestar::StorageLayout("."), 0);
+    NativeIndex index(0);
     co_await index.open();
 
     co_await index.getOrCreateSeriesId("cpu", {{"host", "h1"}}, "usage");
@@ -255,14 +207,15 @@ SEASTAR_TEST_F(NativeIndexTest, GetAllSeriesForMeasurement) {
 }
 
 SEASTAR_TEST_F(NativeIndexTest, FindSeriesWithMetadata) {
-    NativeIndex index(timestar::StorageLayout("."), 0);
+    NativeIndex index(0);
     co_await index.open();
 
     co_await index.getOrCreateSeriesId("weather", {{"location", "us-west"}}, "temp");
     co_await index.getOrCreateSeriesId("weather", {{"location", "us-west"}}, "humidity");
     co_await index.getOrCreateSeriesId("weather", {{"location", "us-east"}}, "temp");
 
-    auto result = co_await index.findSeriesWithMetadata("weather", {{"location", "us-west"}}, {"temp"});
+    auto result =
+        co_await index.findSeriesWithMetadata("weather", {{"location", "us-west"}}, {"temp"});
     EXPECT_TRUE(result.has_value());
     EXPECT_EQ(result->size(), 1u);
     EXPECT_EQ(result->at(0).metadata.field, "temp");
@@ -271,7 +224,7 @@ SEASTAR_TEST_F(NativeIndexTest, FindSeriesWithMetadata) {
 }
 
 SEASTAR_TEST_F(NativeIndexTest, AllMeasurements) {
-    NativeIndex index(timestar::StorageLayout("."), 0);
+    NativeIndex index(0);
     co_await index.open();
 
     co_await index.getOrCreateSeriesId("cpu", {{"host", "h1"}}, "usage");
@@ -286,7 +239,7 @@ SEASTAR_TEST_F(NativeIndexTest, AllMeasurements) {
 }
 
 SEASTAR_TEST_F(NativeIndexTest, FieldStats) {
-    NativeIndex index(timestar::StorageLayout("."), 0);
+    NativeIndex index(0);
     co_await index.open();
 
     auto id = co_await index.getOrCreateSeriesId("weather", {{"loc", "us"}}, "temp");
@@ -305,7 +258,7 @@ SEASTAR_TEST_F(NativeIndexTest, FieldStats) {
 }
 
 SEASTAR_TEST_F(NativeIndexTest, SeriesCount) {
-    NativeIndex index(timestar::StorageLayout("."), 0);
+    NativeIndex index(0);
     co_await index.open();
 
     co_await index.getOrCreateSeriesId("m1", {{"t", "v1"}}, "f1");
@@ -319,7 +272,7 @@ SEASTAR_TEST_F(NativeIndexTest, SeriesCount) {
 }
 
 SEASTAR_TEST_F(NativeIndexTest, RetentionPolicy) {
-    NativeIndex index(timestar::StorageLayout("."), 0);
+    NativeIndex index(0);
     co_await index.open();
 
     RetentionPolicy policy;
@@ -349,7 +302,7 @@ SEASTAR_TEST_F(NativeIndexTest, NonZeroShardCanIndexAndQuery) {
     // Clean up shard 1 directory
     std::filesystem::remove_all("shard_1/native_index");
 
-    NativeIndex index(timestar::StorageLayout("."), 1);  // Non-zero shard — should now be fully operational
+    NativeIndex index(1);  // Non-zero shard — should now be fully operational
     co_await index.open();
 
     // Can create series
@@ -377,7 +330,7 @@ SEASTAR_TEST_F(NativeIndexTest, NonZeroShardCanIndexAndQuery) {
 }
 
 SEASTAR_TEST_F(NativeIndexTest, ManySeries) {
-    NativeIndex index(timestar::StorageLayout("."), 0);
+    NativeIndex index(0);
     co_await index.open();
 
     const int N = 100;
@@ -396,7 +349,7 @@ SEASTAR_TEST_F(NativeIndexTest, ManySeries) {
 }
 
 SEASTAR_TEST_F(NativeIndexTest, CompactThenQuery) {
-    NativeIndex index(timestar::StorageLayout("."), 0);
+    NativeIndex index(0);
     co_await index.open();
 
     // Insert enough data to trigger flush + compaction

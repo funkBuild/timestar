@@ -35,8 +35,6 @@
 
 namespace fs = std::filesystem;
 
-static const timestar::StorageLayout kDefaultTsmTestLayout(".");
-
 class TSMCompactionStringDictTest : public ::testing::Test {
 public:
     std::string testDir = "./test_compaction_string_dict";
@@ -54,8 +52,8 @@ public:
         fs::create_directories(testDir + "/shard_0/tsm");
         fs::current_path(testDir);
 
-        fileManager = std::make_unique<TSMFileManager>(kDefaultTsmTestLayout, 0);
-        compactor = std::make_unique<TSMCompactor>(kDefaultTsmTestLayout, 0, fileManager.get());
+        fileManager = std::make_unique<TSMFileManager>();
+        compactor = std::make_unique<TSMCompactor>(fileManager.get());
     }
 
     void TearDown() override {
@@ -67,8 +65,9 @@ public:
 
     // Write a TSM file containing the given string series (and optionally a
     // float series so multi-file compactions have numeric content too).
-    static void writeFile(const std::string& filename, const SeriesId128& stringSeries, const std::vector<uint64_t>& ts,
-                          const std::vector<std::string>& vals, bool includeFloatSeries = false) {
+    static void writeFile(const std::string& filename, const SeriesId128& stringSeries,
+                          const std::vector<uint64_t>& ts, const std::vector<std::string>& vals,
+                          bool includeFloatSeries = false) {
         TSMWriter writer(filename);
         if (!ts.empty()) {
             writer.writeSeries(TSMValueType::String, stringSeries, ts, vals);
@@ -185,8 +184,8 @@ SEASTAR_TEST_F(TSMCompactionStringDictTest, MultiSourceDictionariesReencodeCorre
     std::vector<std::string> valsA, valsB;
     for (int i = 0; i < 6; ++i) {
         tsA.push_back(1000 + i * 1000);
-        valsA.push_back(i % 2 == 0 ? "alpha" : "bravo");    // dict A: {alpha, bravo}
-        tsB.push_back(1000000 + i * 1000);                  // disjoint, later range
+        valsA.push_back(i % 2 == 0 ? "alpha" : "bravo");  // dict A: {alpha, bravo}
+        tsB.push_back(1000000 + i * 1000);                // disjoint, later range
         valsB.push_back(i % 2 == 0 ? "charlie" : "delta");  // dict B: {charlie, delta}
     }
     TSMCompactionStringDictTest::writeFile("shard_0/tsm/0_1.tsm", sid, tsA, valsA);

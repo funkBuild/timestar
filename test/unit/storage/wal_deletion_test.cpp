@@ -50,7 +50,7 @@ static seastar::future<std::optional<VariantQueryResult>> safeQuery(Engine& engi
 }
 
 seastar::future<> test_partial_field_deletion_does_not_corrupt_other_fields() {
-    Engine engine(timestar::StorageLayout("."));
+    Engine engine;
     std::exception_ptr ex;
 
     try {
@@ -113,7 +113,7 @@ seastar::future<> test_wal_replay_preserves_partial_field_deletion() {
 
     // First phase: Insert data and delete fieldA
     {
-        Engine engine(timestar::StorageLayout("."));
+        Engine engine;
         std::exception_ptr ex;
 
         try {
@@ -145,7 +145,7 @@ seastar::future<> test_wal_replay_preserves_partial_field_deletion() {
 
     // Second phase: Restart engine and verify WAL replay behavior
     {
-        Engine engine2(timestar::StorageLayout("."));
+        Engine engine2;
         std::exception_ptr ex;
 
         try {

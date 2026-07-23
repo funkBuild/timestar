@@ -1,5 +1,6 @@
 #include "wal_file_manager.hpp"
 
+#include "engine.hpp"
 #include "logger.hpp"
 #include "logging_config.hpp"
 #include "series_id.hpp"
@@ -34,16 +35,41 @@ static std::optional<unsigned int> parseWalSeqNum(const std::string& path) {
     }
 }
 
-WALFileManager::WALFileManager(timestar::StorageLayout layout, unsigned workerId)
-    : layout_(std::move(layout)), shardId(workerId) {}
+WALFileManager::WALFileManager() {
+    shardId = seastar::this_shard_id();
+}
 
-seastar::future<> WALFileManager::init(TSMFileManager& _tsmFileManager) {
+seastar::future<> WALFileManager::init(Engine& engine, TSMFileManager& _tsmFileManager) {
     timestar::wal_log.info("WALFileManager::init starting for shard {}", shardId);
     tsmFileManager = &_tsmFileManager;
 
+    // Size the conversion pool from config. It starts at 1 (header default);
+    // adjust to match, using the same signal/consume resize as WAL::_encode_sem
+    // since seastar::semaphore has no capacity setter.
+    //
+    // Conversion concurrency, not tier-merge concurrency, is what sets the
+    // sustainable ingest rate: it is the only thing that frees retained-store
+    // RAM, and at capacity 1 the backlog hit its ceiling and shed 53% of writes
+    // at 5.8M pts/s while tier merges were idle.
+    auto maxConversions = static_cast<ssize_t>(timestar::config().storage.conversion_concurrency);
+    if (maxConversions < 1)
+        maxConversions = 1;
+    auto currentConversions = _conversionSemaphore.available_units();
+    if (maxConversions > currentConversions) {
+        _conversionSemaphore.signal(maxConversions - currentConversions);
+    } else if (maxConversions < currentConversions) {
+        _conversionSemaphore.consume(currentConversions - maxConversions);
+    }
+
+    // Let compaction see the WAL backlog so it can yield to conversion.
+    // Safe to capture `this`: TSMFileManager and WALFileManager are both
+    // members of the same Engine, and stopCompactionLoop() runs in
+    // Engine::stop() before either is destroyed.
+    tsmFileManager->setWalConversionProbe([this] { return hasPendingConversions(); });
+
     // Search for existing WAL's
-    const auto path = layout_.shardDir(shardId);
-    timestar::wal_log.debug("Scanning for WAL files in {} on shard {}", path.string(), shardId);
+    std::string path = engine.basePath() + '/';
+    timestar::wal_log.debug("Scanning for WAL files in {} on shard {}", path, shardId);
 
     std::vector<std::string> walFiles;
 
@@ -54,7 +80,7 @@ seastar::future<> WALFileManager::init(TSMFileManager& _tsmFileManager) {
         if (fs::exists(path)) {
             for (const auto& entry : fs::directory_iterator(path)) {
                 if (endsWith(entry.path(), ".wal"))
-                    files.push_back(entry.path().string());
+                    files.push_back(entry.path());
             }
         }
         return files;
@@ -144,7 +170,7 @@ seastar::future<> WALFileManager::init(TSMFileManager& _tsmFileManager) {
         walSequenceInitialized_ = true;
 
         seastar::shared_ptr store = seastar::make_shared<MemoryStore>(currentWalSequenceNumber);
-        co_await store->initWAL(layout_, shardId);
+        co_await store->initWAL();
         memoryStores.push_back(store);
     }
 
@@ -165,11 +191,11 @@ seastar::future<> WALFileManager::insert(TimeStarInsert<T>& insertRequest) {
         throw std::runtime_error("No memory stores available for insert");
     }
 
-    // First, estimate the size of this insert to check if it exceeds 16MB
+    // First, estimate the size of this insert against the WAL segment limit
     if (memoryStores[0] && memoryStores[0]->getWAL()) {
         size_t estimatedSize = memoryStores[0]->getWAL()->estimateInsertSize(insertRequest);
         if (estimatedSize > MemoryStore::walSizeThreshold()) {
-            // This single insert exceeds the entire 16MB WAL limit
+            // This single insert exceeds the entire WAL segment limit
             timestar::wal_log.error("Insert request of {} bytes exceeds maximum WAL size of {} bytes", estimatedSize,
                                     MemoryStore::walSizeThreshold());
             throw timestar::InsertTooLargeException("Insert batch too large - requested " +
@@ -194,7 +220,8 @@ seastar::future<> WALFileManager::insert(TimeStarInsert<T>& insertRequest) {
         if (retryResult) {
             // The insert still doesn't fit in a fresh WAL - it's too large
             size_t estimatedSize = memoryStores[0]->getWAL()->estimateInsertSize(insertRequest);
-            timestar::wal_log.error("Insert batch of {} bytes too large for fresh 16MB WAL", estimatedSize);
+            timestar::wal_log.error("Insert batch of {} bytes too large for fresh {} byte WAL", estimatedSize,
+                                    MemoryStore::walSizeThreshold());
             throw timestar::InsertTooLargeException("Insert batch too large - requested " +
                                                     std::to_string(estimatedSize) +
                                                     " bytes, exceeds the WAL segment limit. Please reduce batch size.");
@@ -256,20 +283,40 @@ seastar::future<> WALFileManager::insertBatch(std::vector<TimeStarInsert<T>>& in
     if (needsRollover) {
         LOG_INSERT_PATH(timestar::wal_log, debug, "[WAL] Memory store rollover needed for batch of {} requests",
                         insertRequests.size());
-        // Rollover the WAL
-        co_await rolloverMemoryStore();
-
-        // Now retry the batch insert with the new memory store.
-        // Pass the same pre-computed size; it's still valid for the fresh WAL.
-        bool retryResult = co_await memoryStores[0]->insertBatch(insertRequests, totalEstimatedSize);
-        if (retryResult) {
-            // The batch still doesn't fit in a fresh WAL - it's too large.
-            // Re-use the already-computed totalEstimatedSize (each per-insert size
-            // is cached in the TimeStarInsert, so no re-iteration is needed).
-            timestar::wal_log.error("Batch insert of {} bytes too large for fresh WAL", totalEstimatedSize);
-            throw timestar::InsertTooLargeException("Insert batch too large - requested " +
-                                                    std::to_string(totalEstimatedSize) +
-                                                    " bytes, exceeds the WAL segment limit. Please reduce batch size.");
+        // Roll over and retry, LOOPING on concurrent fills. A single
+        // rollover-then-retry mistook "the fresh store was already filled by
+        // OTHER in-flight batches" for "this batch can never fit": with N
+        // concurrent high-cardinality batches racing into one fresh store,
+        // whichever retried third got a spurious 413 for a batch that fits an
+        // empty store easily. The two cases are distinguishable -- a batch is
+        // genuinely too large only if it fails against a store that was EMPTY
+        // when it tried.
+        constexpr int kMaxRolloverRetries = 8;
+        for (int attempt = 0;; ++attempt) {
+            co_await rolloverMemoryStore();
+            const bool storeWasEmpty = memoryStores[0]->isEmpty();
+            bool retryResult = co_await memoryStores[0]->insertBatch(insertRequests, totalEstimatedSize);
+            if (!retryResult) {
+                break;  // inserted (store may now be due another rollover; the next insert triggers it)
+            }
+            if (storeWasEmpty) {
+                // Failed against a genuinely fresh store: the batch itself is
+                // the problem. Re-use the already-computed totalEstimatedSize
+                // (each per-insert size is cached in the TimeStarInsert).
+                timestar::wal_log.error("Batch insert of {} bytes too large for fresh WAL", totalEstimatedSize);
+                throw timestar::InsertTooLargeException(
+                    "Insert batch too large - requested " + std::to_string(totalEstimatedSize) +
+                    " bytes, exceeds the WAL segment limit. Please reduce batch size.");
+            }
+            if (attempt >= kMaxRolloverRetries) {
+                // Persistent contention, not size: surface as retryable
+                // backpressure (503 + Retry-After), never as a 413 the client
+                // would respond to by shrinking a batch that is not too big.
+                throw timestar::IngestBacklogException("Shard " + std::to_string(shardId) +
+                                                       " rollover contention: fresh stores filled by concurrent "
+                                                       "batches " +
+                                                       std::to_string(attempt + 1) + " times in a row");
+            }
         }
     }
 
@@ -309,17 +356,57 @@ seastar::future<> WALFileManager::rolloverMemoryStore() {
     }
 
     auto previousStore = memoryStores[0];
-    timestar::wal_log.info("Memory store {} full (16MB threshold reached), rolling over",
+    timestar::wal_log.info("Memory store {} full (WAL segment threshold reached), rolling over",
                            previousStore->sequenceNumber);
 
     // Create and init the new store FIRST, before closing the old one.
     // This ensures memoryStores[0] always points to an open store,
     // even if another insert coroutine runs during a co_await yield.
+    // Backlog handling: absorb bursts, never block.
+    //
+    // This used to spin here until the backlog drained, which made ingest feel
+    // every conversion delay. Combined with inline tier compaction holding the
+    // single conversion slot for a whole deep merge, that produced multi-second
+    // rollover stalls and client write timeouts. Compaction no longer runs on
+    // the conversion fiber, so the backlog should now drain at TSM-write speed;
+    // when it does not, the policy is to accumulate rather than stall.
+    //
+    // Blocking is NOT reinstated as a fallback. A blocked rollover holds
+    // compactionSemaphore (capacity 1), so every other rollover on the shard
+    // queues behind it -- one slow conversion became a shard-wide write stall.
+    // Admission control belongs at the request edge, where it can reject a
+    // single write cheaply, not deep in the rollover path where it blocks all
+    // of them. Engine::insert consults isIngestBacklogged() and returns 503 +
+    // Retry-After at the ceiling.
+    if (memoryStores.size() >= kMaxUnconvertedMemoryStores) {
+        timestar::wal_log.info(
+            "Shard {}: {} memory stores awaiting conversion (including the active store); "
+            "absorbing burst without throttling rollover",
+            shardId, memoryStores.size());
+    }
+
     auto store = seastar::make_shared<MemoryStore>(++currentWalSequenceNumber);
-    co_await store->initWAL(layout_, shardId);
+    // Seed the series map's capacity from the retiring store: under steady
+    // ingest the same fleet reports into every store, so the fresh map will
+    // reach the same size again within seconds. Growing there from empty
+    // rehashed the full ~330B-slot flat table ~7 times per store cycle --
+    // every few seconds at high cardinality. The eventual footprint is
+    // identical either way; this only moves the allocation to creation time.
+    store->series.reserve(previousStore->series.size());
+    co_await store->initWAL();
     memoryStores.insert(memoryStores.begin(), store);
 
     timestar::wal_log.info("New memory store {} created for shard {}", store->sequenceNumber, shardId);
+
+    // Fix the retiring store's TSM sequence number NOW, while rollovers are
+    // still serialized. Conversions run concurrently and complete out of
+    // order; if the seq were assigned at write time (writeMemstore), a newer
+    // store finishing first would take a lower seq and its data would lose
+    // last-write-wins conflicts to older stores. Rollover order IS write
+    // order, so this is the last point where the two can be bound together.
+    if (tsmFileManager != nullptr && !previousStore->isEmpty()) {
+        previousStore->reservedTsmSeq = tsmFileManager->reserveSequenceId();
+    }
 
     // -----------------------------------------------------------------------
     // Release the rollover semaphore early. The critical section is complete:
@@ -353,11 +440,13 @@ seastar::future<> WALFileManager::rolloverMemoryStore() {
             return seastar::get_units(_conversionSemaphore, 1).then([this, store](auto convUnits) {
                 return store->close().then([this, store, units = std::move(convUnits)]() mutable {
                     // Run the CPU-heavy encode + multi-MB DMA write in the
-                    // low-priority compaction scheduling group so background
-                    // flush does not compete head-on with foreground inserts
-                    // (the direct cause of warm-phase throughput degradation).
-                    if (tsmFileManager != nullptr && tsmFileManager->hasCompactionGroup()) {
-                        return seastar::with_scheduling_group(tsmFileManager->compactionGroup(),
+                    // dedicated FLUSH scheduling group -- not the compaction
+                    // group. Both are below `main` so foreground inserts still
+                    // preempt, but flush sits well above compaction: this work
+                    // is what unlinks the WAL file and drains the ingest
+                    // backlog, so it must not queue behind a deep tier merge.
+                    if (tsmFileManager != nullptr && tsmFileManager->hasFlushGroup()) {
+                        return seastar::with_scheduling_group(tsmFileManager->flushGroup(),
                                                               [this, store] { return convertWalToTsm(store); })
                             .finally([units = std::move(units)] {});
                     }
@@ -491,12 +580,13 @@ seastar::future<> WALFileManager::convertWalToTsm(seastar::shared_ptr<MemoryStor
                            largestSeriesPoints);
 #endif  // TIMESTAR_LOG_INSERT_PATH
 
+    uint64_t tsmBytesWritten = 0;
     try {
         timestar::wal_log.debug(
             "[TSM_WRITE_START] Calling tsmFileManager->writeMemstore for store {} "
             "on shard {}",
             store->sequenceNumber, shardId);
-        co_await tsmFileManager->writeMemstore(store);
+        tsmBytesWritten = co_await tsmFileManager->writeMemstore(store);
         timestar::wal_log.debug("[TSM_WRITE_SUCCESS] Successfully wrote TSM for store {} on shard {}",
                                 store->sequenceNumber, shardId);
     } catch (const std::bad_alloc& e) {
@@ -533,8 +623,18 @@ seastar::future<> WALFileManager::convertWalToTsm(seastar::shared_ptr<MemoryStor
         memoryStores.erase(it);
     }
 
+    // Capture the WAL's on-disk size BEFORE unlinking it. WAL->TSM is a format
+    // change (row-oriented, per-entry framed -> columnar, ALP/Simple8b/zstd),
+    // so it reclaims far more per byte processed than a tier merge, which only
+    // re-packs data that is already in TSM form. That asymmetry is what
+    // justifies prioritising conversion over merges, and this is the number
+    // that demonstrates it.
+    const uint64_t walBytes = store->walSizeOnDisk();
     co_await store->removeWAL();
-    timestar::wal_log.info("Successfully converted WAL {} to TSM on shard {}", store->sequenceNumber, shardId);
+    const double reclaimedPct =
+        walBytes > 0 ? 100.0 * (1.0 - static_cast<double>(tsmBytesWritten) / static_cast<double>(walBytes)) : 0.0;
+    timestar::wal_log.info("Successfully converted WAL {} to TSM on shard {} | {} -> {} bytes ({:.1f}% reclaimed)",
+                           store->sequenceNumber, shardId, walBytes, tsmBytesWritten, reclaimedPct);
 }
 
 seastar::future<> WALFileManager::close() {

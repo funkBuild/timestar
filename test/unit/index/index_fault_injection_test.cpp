@@ -42,16 +42,6 @@ void writeWholeFile(const std::string& path, const std::string& data) {
     out.write(data.data(), static_cast<std::streamsize>(data.size()));
 }
 
-std::string indexWalFile(const std::string& root, uint64_t generation) {
-    return timestar::StorageLayout(root).nativeWalFile(0, generation).string();
-}
-
-void writeIndexWalFile(const std::string& root, uint64_t generation, const std::string& data) {
-    const timestar::StorageLayout layout(root);
-    std::filesystem::create_directories(layout.nativeWalDir(0));
-    writeWholeFile(layout.nativeWalFile(0, generation).string(), data);
-}
-
 void appendLE32(std::string& out, uint32_t v) {
     char buf[4];
     for (int i = 0; i < 4; ++i)
@@ -109,20 +99,20 @@ public:
 
     // Write `n` records into a fresh WAL dir and return the raw file bytes.
     seastar::future<std::string> buildPristineWal(std::string dir, int n) {
-        auto wal = co_await IndexWAL::open(timestar::StorageLayout(dir), 0);
+        auto wal = co_await IndexWAL::open(dir);
         for (int i = 0; i < n; ++i) {
             IndexWriteBatch b;
             b.put(testKey(i), testValue(i));
             co_await wal.append(b);
         }
         co_await wal.close();
-        co_return readWholeFile(indexWalFile(dir, 0));
+        co_return readWholeFile(dir + "/idx_000000.wal");
     }
 
     // Replay the WAL in `dir` and assert exactly records [0, expected) are
     // present with correct values, and later records are absent.
     seastar::future<> assertReplayPrefix(std::string dir, uint64_t expected, int total, std::string what) {
-        auto wal = co_await IndexWAL::open(timestar::StorageLayout(dir), 0);
+        auto wal = co_await IndexWAL::open(dir);
         MemTable mt;
         auto count = co_await wal.replay(mt);
         EXPECT_EQ(count, expected) << what;
@@ -185,7 +175,7 @@ SEASTAR_TEST_F(IndexWalFaultInjectionTest, TruncationAtEveryStructuralBoundaryRe
     for (const auto& cut : cuts) {
         auto dir = self->root_ + std::format("/case_{:03d}", caseNum++);
         std::filesystem::create_directories(dir);
-        writeIndexWalFile(dir, 0, pristine.substr(0, cut.offset));
+        writeWholeFile(dir + "/idx_000000.wal", pristine.substr(0, cut.offset));
         co_await self->assertReplayPrefix(dir, cut.expected, kRecords, cut.what);
     }
 }
@@ -247,7 +237,7 @@ SEASTAR_TEST_F(IndexWalFaultInjectionTest, GarbageTailAfterSyncedRecordsIsDiscar
     for (const auto& tail : tails) {
         auto dir = self->root_ + std::format("/tail_{:03d}", caseNum++);
         std::filesystem::create_directories(dir);
-        writeIndexWalFile(dir, 0, pristine + tail.bytes);
+        writeWholeFile(dir + "/idx_000000.wal", pristine + tail.bytes);
         co_await self->assertReplayPrefix(dir, kRecords, kRecords, tail.what);
     }
 }
@@ -260,14 +250,14 @@ SEASTAR_TEST_F(IndexWalFaultInjectionTest, OldGenerationIntactNewGenerationTorn)
     auto dir = self->root_ + "/multigen";
     std::filesystem::create_directories(dir);
     {
-        auto wal = co_await IndexWAL::open(timestar::StorageLayout(dir), 0);
+        auto wal = co_await IndexWAL::open(dir);
         for (int i = 0; i < 2; ++i) {
             IndexWriteBatch b;
             b.put(testKey(i), testValue(i));
             co_await wal.append(b);
         }
         auto oldPath = co_await wal.rotate();  // gen 0 sealed, intact
-        EXPECT_EQ(oldPath, indexWalFile(dir, 0));
+        EXPECT_EQ(oldPath, dir + "/idx_000000.wal");
         for (int i = 2; i < 4; ++i) {
             IndexWriteBatch b;
             b.put(testKey(i), testValue(i));
@@ -277,7 +267,7 @@ SEASTAR_TEST_F(IndexWalFaultInjectionTest, OldGenerationIntactNewGenerationTorn)
     }
 
     // Tear the CURRENT generation: keep record 2 whole, cut record 3 mid-frame.
-    auto gen1Path = indexWalFile(dir, 1);
+    auto gen1Path = dir + "/idx_000001.wal";
     auto gen1 = readWholeFile(gen1Path);
     auto starts = parseWalBoundaries(gen1);
     EXPECT_EQ(starts.size(), 2u);
@@ -285,7 +275,7 @@ SEASTAR_TEST_F(IndexWalFaultInjectionTest, OldGenerationIntactNewGenerationTorn)
         co_return;
     writeWholeFile(gen1Path, gen1.substr(0, starts[1] + 7));
 
-    auto wal = co_await IndexWAL::open(timestar::StorageLayout(dir), 0);
+    auto wal = co_await IndexWAL::open(dir);
     MemTable mt;
     auto count = co_await wal.replay(mt);
     EXPECT_EQ(count, 3u);
@@ -299,7 +289,7 @@ SEASTAR_TEST_F(IndexWalFaultInjectionTest, OldGenerationIntactNewGenerationTorn)
     EXPECT_FALSE(mt.get(testKey(3)).has_value());
 
     // Replayed data is volatile until flushed — files must survive replay.
-    EXPECT_TRUE(std::filesystem::exists(indexWalFile(dir, 0)));
+    EXPECT_TRUE(std::filesystem::exists(dir + "/idx_000000.wal"));
     EXPECT_TRUE(std::filesystem::exists(gen1Path));
     co_await wal.close();
 }
@@ -332,7 +322,7 @@ public:
 SEASTAR_TEST_F(NativeIndexFaultInjectionTest, TornWalTailStillRecoversAckedSeries) {
     SeriesId128 idA, idB;
     {
-        NativeIndex index(timestar::StorageLayout("."), 0);
+        NativeIndex index(0);
         co_await index.open();
         idA = co_await index.getOrCreateSeriesId("fault_m", {{"host", "a"}}, "f");
         idB = co_await index.getOrCreateSeriesId("fault_m", {{"host", "b"}}, "f");
@@ -354,7 +344,7 @@ SEASTAR_TEST_F(NativeIndexFaultInjectionTest, TornWalTailStillRecoversAckedSerie
 
     SeriesId128 idC;
     {
-        NativeIndex index(timestar::StorageLayout("."), 0);
+        NativeIndex index(0);
         co_await index.open();
 
         auto metaA = co_await index.getSeriesMetadata(idA);
@@ -389,7 +379,7 @@ SEASTAR_TEST_F(NativeIndexFaultInjectionTest, TornWalTailStillRecoversAckedSerie
     // Everything survives a further clean reopen (recovered data now durable
     // in an SSTable, not resting on the WAL that carried the garbage).
     {
-        NativeIndex index(timestar::StorageLayout("."), 0);
+        NativeIndex index(0);
         co_await index.open();
         EXPECT_TRUE((co_await index.getSeriesMetadata(idA)).has_value());
         EXPECT_TRUE((co_await index.getSeriesMetadata(idB)).has_value());
@@ -405,7 +395,7 @@ SEASTAR_TEST_F(NativeIndexFaultInjectionTest, TornWalTailStillRecoversAckedSerie
 SEASTAR_TEST_F(NativeIndexFaultInjectionTest, OrphanPartialSSTableIgnoredAndAckedDataRecovered) {
     SeriesId128 idA, idB;
     {
-        NativeIndex index(timestar::StorageLayout("."), 0);
+        NativeIndex index(0);
         co_await index.open();
         idA = co_await index.getOrCreateSeriesId("orphan_m", {{"host", "a"}}, "f");
         idB = co_await index.getOrCreateSeriesId("orphan_m", {{"host", "b"}}, "f");
@@ -419,7 +409,7 @@ SEASTAR_TEST_F(NativeIndexFaultInjectionTest, OrphanPartialSSTableIgnoredAndAcke
     writeWholeFile("shard_0/native_index/idx_000042.sst", "partial sstable garbage");
 
     {
-        NativeIndex index(timestar::StorageLayout("."), 0);
+        NativeIndex index(0);
         // open() must not throw on the orphans (they are not in the manifest)
         // and must flush the WAL-replayed memtable to a real SSTable.
         co_await index.open();
@@ -444,7 +434,7 @@ SEASTAR_TEST_F(NativeIndexFaultInjectionTest, OrphanPartialSSTableIgnoredAndAcke
     // After the clean close the data lives in a real SSTable written over /
     // alongside the orphans. A further reopen must read it back fine.
     {
-        NativeIndex index(timestar::StorageLayout("."), 0);
+        NativeIndex index(0);
         co_await index.open();
         auto metaA = co_await index.getSeriesMetadata(idA);
         EXPECT_TRUE(metaA.has_value());
@@ -467,13 +457,12 @@ SEASTAR_TEST_F(NativeIndexFaultInjectionTest, OrphanPartialSSTableIgnoredAndAcke
 class ManifestFaultInjectionTest : public ::testing::Test {
 public:
     void SetUp() override {
-        std::filesystem::remove_all(layout_.root());
+        dir_ = (std::filesystem::temp_directory_path() / "timestar_manifest_fault_test").string();
+        std::filesystem::remove_all(dir_);
         std::filesystem::create_directories(dir_);
     }
-    void TearDown() override { std::filesystem::remove_all(layout_.root()); }
-    const timestar::StorageLayout layout_{std::filesystem::temp_directory_path() /
-                                          "timestar_manifest_fault_test"};
-    const std::string dir_ = layout_.nativeIndexDir(0).string();
+    void TearDown() override { std::filesystem::remove_all(dir_); }
+    std::string dir_;
 };
 
 // ENOSPC (or power cut) during a manifest append can persist FEWER than the
@@ -483,7 +472,7 @@ public:
 // keep all prior records, rewrite itself clean, and stay appendable.
 SEASTAR_TEST_F(ManifestFaultInjectionTest, PartialFrameHeaderTailDiscardedOnRecovery) {
     {
-        auto m = co_await Manifest::open(self->layout_, 0);
+        auto m = co_await Manifest::open(self->dir_);
         SSTableMetadata f1;
         f1.fileNumber = m.nextFileNumber();
         f1.level = 0;
@@ -507,7 +496,7 @@ SEASTAR_TEST_F(ManifestFaultInjectionTest, PartialFrameHeaderTailDiscardedOnReco
     writeWholeFile(path, data + std::string("\x13\x37\x00\xff\x42", 5));
 
     {
-        auto m = co_await Manifest::open(self->layout_, 0);
+        auto m = co_await Manifest::open(self->dir_);
         EXPECT_EQ(m.files().size(), 2u) << "records before the torn header lost";
         if (m.files().size() == 2) {
             EXPECT_EQ(m.files()[0].fileNumber, 1u);
@@ -520,7 +509,7 @@ SEASTAR_TEST_F(ManifestFaultInjectionTest, PartialFrameHeaderTailDiscardedOnReco
 
     // open() rewrote a clean snapshot: no garbage remains, appends still work.
     {
-        auto m = co_await Manifest::open(self->layout_, 0);
+        auto m = co_await Manifest::open(self->dir_);
         EXPECT_EQ(m.files().size(), 2u);
         SSTableMetadata f3;
         f3.fileNumber = m.nextFileNumber();
@@ -529,7 +518,7 @@ SEASTAR_TEST_F(ManifestFaultInjectionTest, PartialFrameHeaderTailDiscardedOnReco
         co_await m.close();
     }
     {
-        auto m = co_await Manifest::open(self->layout_, 0);
+        auto m = co_await Manifest::open(self->dir_);
         EXPECT_EQ(m.files().size(), 3u);
         co_await m.close();
     }

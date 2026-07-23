@@ -155,7 +155,20 @@ public:
     size_t capacity() const { return data.capacity(); }
 
     // Reserve capacity upfront when size is known
-    void reserve(size_t capacity) { data.reserve(capacity); }
+    // Geometric growth, ALWAYS -- never forward a raw request to
+    // vector::reserve. vector::reserve reallocates to EXACTLY the request, so
+    // a caller that reserves "current size + a little headroom" before each
+    // append (ALPEncoder::encodeInto does, per entry) defeats amortized
+    // growth: once the buffer passes its initial reservation, EVERY append
+    // reallocates and re-copies the entire buffer. In the WAL batch encode
+    // loop that was ~100GB of memcpy per 50k-entry request -- 1.5s of CPU per
+    // batch, measured -- and capped scalar fleet-write ingest at ~90k pts/s.
+    void reserve(size_t capacity) {
+        if (capacity <= data.capacity()) {
+            return;
+        }
+        data.reserve(std::max(capacity, data.capacity() * GROWTH_FACTOR));
+    }
 
     // Clear the buffer but keep allocated memory
     void clear() { current_size = 0; }

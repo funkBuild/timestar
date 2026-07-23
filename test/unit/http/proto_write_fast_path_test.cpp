@@ -400,7 +400,7 @@ TEST(ProtoWriteFastPath, SeriesKeyMultipleTags) {
 TEST(ProtoWriteFastPath, InvalidMeasurementName) {
     ::timestar_pb::WriteRequest req;
     auto* wp = req.add_writes();
-    wp->set_measurement("cpu,bad");  // comma not allowed
+    wp->set_measurement(std::string("cpu") + '\0' + "bad");  // NUL is the only rejected character
     wp->add_timestamps(1000ULL);
 
     ::timestar_pb::WriteField wf;
@@ -436,7 +436,7 @@ TEST(ProtoWriteFastPath, InvalidTagKey) {
     ::timestar_pb::WriteRequest req;
     auto* wp = req.add_writes();
     wp->set_measurement("cpu");
-    (*wp->mutable_tags())["bad=key"] = "value";
+    (*wp->mutable_tags())[std::string("bad") + '\0' + "key"] = "value";  // NUL is invalid
     wp->add_timestamps(1000ULL);
 
     ::timestar_pb::WriteField wf;
@@ -458,7 +458,7 @@ TEST(ProtoWriteFastPath, InvalidFieldName) {
 
     ::timestar_pb::WriteField wf;
     wf.mutable_double_values()->add_values(50.0);
-    (*wp->mutable_fields())["bad field"] = wf;  // space not allowed in field name
+    (*wp->mutable_fields())[std::string("bad") + '\0' + "field"] = wf;  // NUL is invalid
 
     auto bytes = serialize(req);
     auto result = parseWriteRequestFast(bytes.data(), bytes.size(), DEFAULT_TS);
@@ -467,6 +467,27 @@ TEST(ProtoWriteFastPath, InvalidFieldName) {
     // unless all fields fail
     EXPECT_TRUE(result.inserts.empty());
     EXPECT_FALSE(result.errors.empty());
+}
+
+// Spaces and other symbols in the measurement and field names are accepted
+// (the escaping fix): the exact shape from the logs must produce a valid insert.
+TEST(ProtoWriteFastPath, SpacedMeasurementAndFieldAccepted) {
+    ::timestar_pb::WriteRequest req;
+    auto* wp = req.add_writes();
+    wp->set_measurement("Wash Down Bay System");
+    (*wp->mutable_tags())["site name"] = "North Plant";
+    wp->add_timestamps(1000ULL);
+
+    ::timestar_pb::WriteField wf;
+    wf.mutable_double_values()->add_values(50.0);
+    (*wp->mutable_fields())["Home 5 Flow"] = wf;
+
+    auto bytes = serialize(req);
+    auto result = parseWriteRequestFast(bytes.data(), bytes.size(), DEFAULT_TS);
+
+    EXPECT_EQ(result.failedWrites, 0);
+    EXPECT_TRUE(result.errors.empty());
+    ASSERT_EQ(result.inserts.size(), 1u);
 }
 
 TEST(ProtoWriteFastPath, InvalidProtobufBytes) {

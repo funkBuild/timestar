@@ -182,52 +182,41 @@ HttpWriteHandler::HttpWriteHandler(seastar::sharded<Engine>* _engineSharded) : e
 }
 
 // Fast validity check — no allocation on the happy path.
-static bool hasReservedChar(const std::string& s, bool allowSpace) {
-    for (char c : s) {
-        if (c == '\0' || c == ',' || c == '=')
-            return true;
-        if (!allowSpace && c == ' ')
-            return true;
-    }
-    return false;
+//
+// Names and tag values may contain any byte EXCEPT NUL.  NUL is rejected because
+// it is the separator byte inside index KV keys.  Every structural series-key
+// character (',', '=', ' ', '"', '\\') is backslash-escaped by
+// timestar::buildSeriesKey, so it is safe inside a name — alphanumeric, spaces,
+// and symbols are all allowed.
+static inline bool hasNullByte(const std::string& s) {
+    return s.find('\0') != std::string::npos;
 }
 
 // Fast-path name validation: returns true if name is valid, false otherwise.
 // Avoids constructing context string on the fast path.
 static inline bool isValidName(const std::string& name) {
-    return !name.empty() && !hasReservedChar(name, false);
+    return !name.empty() && !hasNullByte(name);
 }
 
 static inline bool isValidTagValue(const std::string& value) {
-    return !value.empty() && !hasReservedChar(value, true);
+    return !value.empty() && !hasNullByte(value);
 }
 
-// Shared slow-path validator: hasReservedChar() already ran and returned true,
-// so walk the string to produce a specific error message.
-static std::string validateStringHelper(const std::string& s, const std::string& context, bool allowSpace) {
+// Shared slow-path validator: produces a specific error message ({} if valid).
+static std::string validateStringHelper(const std::string& s, const std::string& context) {
     if (s.empty())
         return context + " must not be empty";
-    if (!hasReservedChar(s, allowSpace))
-        return {};
-    for (char c : s) {
-        if (c == '\0')
-            return context + " must not contain null bytes";
-        if (c == ',')
-            return context + " must not contain commas";
-        if (c == '=')
-            return context + " must not contain equals signs";
-        if (!allowSpace && c == ' ')
-            return context + " must not contain spaces";
-    }
+    if (hasNullByte(s))
+        return context + " must not contain null bytes";
     return {};
 }
 
 std::string HttpWriteHandler::validateName(const std::string& name, const std::string& context) {
-    return validateStringHelper(name, context, false);
+    return validateStringHelper(name, context);
 }
 
 std::string HttpWriteHandler::validateTagValue(const std::string& value, const std::string& context) {
-    return validateStringHelper(value, context, true);
+    return validateStringHelper(value, context);
 }
 
 void HttpWriteHandler::parseAndValidateWritePoint(const std::string& json) {
@@ -750,12 +739,18 @@ tsl::robin_map<std::string, HttpWriteHandler::CoalesceCandidate> HttpWriteHandle
     // open-addressing with Robin Hood probing keeps entries in a flat array,
     // avoiding per-bucket linked-list pointer chasing of std::unordered_map.
     tsl::robin_map<std::string, CoalesceCandidate> candidates;
-    // Pre-allocate for the expected number of unique series keys.
-    // A typical write point has 1-3 fields, so estimate writes * 2.
-    // Cap the reservation: robin_map at load factor 0.5 with ~330-byte slots
-    // would zero ~22MB for a 10K-write batch, yet unique series are almost
-    // always far fewer than writes. Beyond the cap the map grows naturally.
-    candidates.reserve(std::min(writes_array.size() * 2, size_t(1024)));
+    // Pre-allocate for the expected number of unique series keys, ADAPTIVELY.
+    // The old fixed 1024 cap assumed "unique series are almost always far
+    // fewer than writes" -- false for fleet telemetry, where a 100k-write
+    // batch carries 100k unique series and the map rehashed its ~330-byte
+    // flat slots ~7 times per request. Remember the previous batch's actual
+    // unique count (per-shard: one reactor per shard, so thread_local is per
+    // shard) and reserve to ~125% of it; the floor keeps small batches at the
+    // old behaviour, and the writes*2 bound keeps a cardinality DROP from
+    // permanently over-reserving.
+    static thread_local size_t lastUniqueSeries = 0;
+    candidates.reserve(
+        std::min(writes_array.size() * 2, std::max<size_t>(1024, lastUniqueSeries + lastUniqueSeries / 4)));
 
     LOG_INSERT_PATH(timestar::http_log, debug, "[COALESCE] Processing {} writes for coalescing", writes_array.size());
 
@@ -893,7 +888,9 @@ tsl::robin_map<std::string, HttpWriteHandler::CoalesceCandidate> HttpWriteHandle
         return true;
     };
 
-    std::string seriesKey;  // hoisted: reused capacity across fields/writes
+    std::string seriesKey;             // hoisted: reused capacity across fields/writes
+    std::vector<uint64_t> timestamps;  // hoisted: scalar writes put ONE element here --
+                                       // per-iteration construction was a heap alloc per write
 
     // Parse writes directly from JSON objects for better performance
     for (const auto& write : writes_array) {
@@ -922,7 +919,7 @@ tsl::robin_map<std::string, HttpWriteHandler::CoalesceCandidate> HttpWriteHandle
             // For scalar fields, we use timestamps[0]. For array fields, timestamps must
             // match the array length. This unified extraction handles all write formats
             // in a single pass without requiring callers to pre-detect array vs scalar.
-            std::vector<uint64_t> timestamps;
+            timestamps.clear();  // hoisted above the loop; only ever read below, never moved
             auto timestampsArrIt = writeObj.find("timestamps");
             auto singleTimestampIt = writeObj.find("timestamp");
 
@@ -1173,6 +1170,7 @@ tsl::robin_map<std::string, HttpWriteHandler::CoalesceCandidate> HttpWriteHandle
         }
     }
 
+    lastUniqueSeries = candidates.size();
     return candidates;
 }
 
@@ -1892,6 +1890,31 @@ seastar::future<bool> HttpWriteHandler::tryFastDoubleWrite(std::string_view body
         FastDoubleWritePoint fwp;
         auto fast_err = glz::read_json(fwp, body);
         if (!fast_err && !fwp.measurement.empty() && !fwp.fields.empty()) {
+            // The fast struct parses every numeric as double, erasing the
+            // int/float token distinction the DOM path uses for type detection
+            // ("10" -> Integer, "10.0" -> Float). The DOM path types a field
+            // from its FIRST value's token, so when that value is integral the
+            // two paths can disagree — and which path ran depended on nothing
+            // but body size (>256 bytes). A field written twice then flapped
+            // Float/Integer across writes, producing divergent-type TSM files
+            // for one series, which is unreadable (block type mismatch) and
+            // wedges compaction. Fall back to the DOM path for exact
+            // token-level detection; real float telemetry (fractional first
+            // value) keeps the fast path.
+            bool firstValueMaybeInt = false;
+            for (const auto& [fieldName, values] : fwp.fields) {
+                if (!values.empty()) {
+                    const double v0 = values.front();
+                    if (std::isfinite(v0) && v0 == std::trunc(v0)) {
+                        firstValueMaybeInt = true;
+                        break;
+                    }
+                }
+            }
+            if (firstValueMaybeInt) {
+                co_return false;
+            }
+
             // Fast path succeeded - yield after CPU-heavy parse
             co_await seastar::coroutine::maybe_yield();
 
@@ -2107,6 +2130,24 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleW
 
         // ─── Standard DOM path (batch writes + mixed-type single writes) ───
         if (!fastPathHandled) {
+            // Bound the MEMORY of concurrent DOM parses, not just their count.
+            // A glz::json_t DOM runs ~10-15x the body size (measured: a 14MB
+            // 100k-write batch DOM'd to ~150-200MB), so N concurrent large
+            // batches transiently need N x that -- which is what exhausted a
+            // 6GB instance mid-soak and turned into raw std::bad_alloc write
+            // failures once steady-state memory (sparse indexes, memory
+            // stores) had claimed the headroom. Charging body bytes against a
+            // per-shard budget QUEUES excess concurrency instead: large
+            // batches wait their turn and the failure mode disappears.
+            //
+            // thread_local == per-shard (one reactor thread per shard). The
+            // per-request charge is capped at half the budget so a single
+            // outsized body can never deadlock against the semaphore.
+            static constexpr size_t kParseBudgetBytes = 48 << 20;
+            static thread_local seastar::semaphore parseBudget{kParseBudgetBytes};
+            const size_t parseCharge = std::min(body.size(), kParseBudgetBytes / 2);
+            auto parseUnits = co_await seastar::get_units(parseBudget, parseCharge);
+
             // Parse JSON using Glaze with u64 number mode to preserve integer precision.
             json_value_t doc{};
             auto parse_error = glz::read_json(doc, body);
@@ -2201,6 +2242,24 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleW
         ++engineSharded->local().metrics().insert_errors_total;
         timestar::http_log.debug("Write too large: {}", e.what());
         rep->set_status(seastar::http::reply::status_type::payload_too_large);
+        if (timestar::http::isProtobuf(resFmt)) {
+            rep->_content = timestar::proto::formatWriteResponse("error", 0, 0, {std::string(e.what())});
+        } else {
+            rep->_content = createErrorResponse(e.what());
+        }
+        timestar::http::setContentType(*rep, resFmt);
+    } catch (const timestar::IngestBacklogException& e) {
+        // Shard cannot convert memory stores to TSM fast enough to keep up.
+        // 503 + Retry-After rather than a block: the ingest path must never
+        // stall (a stalled rollover holds a capacity-1 semaphore and takes the
+        // whole shard's writers down with it), and rather than nothing at all,
+        // because silently accumulating past this point exhausts memory and
+        // gets the process OOM-killed. A client that honours Retry-After
+        // converges on the sustainable rate on its own.
+        ++engineSharded->local().metrics().insert_errors_total;
+        timestar::http_log.warn("Write rejected, ingest backlog: {}", e.what());
+        rep->set_status(seastar::http::reply::status_type::service_unavailable);
+        rep->_headers["Retry-After"] = "1";
         if (timestar::http::isProtobuf(resFmt)) {
             rep->_content = timestar::proto::formatWriteResponse("error", 0, 0, {std::string(e.what())});
         } else {

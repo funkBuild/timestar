@@ -305,9 +305,16 @@ TEST_F(QueryE2ETest, LatestAggregationQuery) {
         // Assuming numeric values for these tests
 
         auto& values = std::get<std::vector<double>>(valuesVariant);
-        // LATEST without interval returns the single most recent value per series
-        EXPECT_EQ(timestamps.size(), 1);
-        EXPECT_EQ(values.size(), 1);
+        // With no interval, aggregates by timestamp - returns all points.
+        //
+        // LATEST/FIRST are NOT exceptions: they are cross-series tie-breaks at
+        // each timestamp, not reductions over time, so for a single series they
+        // are raw passthrough (see CLAUDE.md "Aggregation Result Shape" and
+        // DynamoEquivalenceTest.LatestAndFirstKeepEveryTimestampWithoutAnInterval).
+        // This expectation still encoded the pre-change "collapse to one point"
+        // behaviour and had been failing since that semantics fix landed.
+        EXPECT_EQ(timestamps.size(), 10);
+        EXPECT_EQ(values.size(), 10);
     }
 }
 

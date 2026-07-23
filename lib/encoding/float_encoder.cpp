@@ -16,6 +16,6 @@ size_t FloatEncoder::encodeInto(std::span<const double> values, AlignedBuffer& t
     return ALPEncoder::encodeInto(values, target);
 }
 
-void FloatDecoder::decode(CompressedSlice& encoded, size_t nToSkip, size_t length, std::vector<double>& out) {
-    ALPDecoder::decode(encoded, nToSkip, length, out);
+size_t FloatDecoder::decode(CompressedSlice& encoded, size_t nToSkip, size_t length, std::vector<double>& out) {
+    return ALPDecoder::decode(encoded, nToSkip, length, out);
 }

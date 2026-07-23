@@ -43,7 +43,7 @@ protected:
 // Helper: run a block of async test code with Engine lifecycle management.
 #define WITH_ENGINE(engine_var, body)        \
     do {                                     \
-        Engine engine_var(timestar::StorageLayout("."));                   \
+        Engine engine_var;                   \
         std::exception_ptr __ex;             \
         try {                                \
             co_await engine_var.init();      \

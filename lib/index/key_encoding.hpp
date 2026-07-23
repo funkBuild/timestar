@@ -20,6 +20,9 @@ std::string encodeMeasurementFieldsKey(const std::string& measurement);
 std::string encodeMeasurementTagsKey(const std::string& measurement);
 std::string encodeTagValuesKey(const std::string& measurement, const std::string& tagKey);
 std::string encodeSeriesMetadataKey(const SeriesId128& seriesId);
+// Per-series value-type binding (SERIES_VALUE_TYPE). Value is a single byte
+// holding the TSMValueType; see index_backend.hpp for why this exists.
+std::string encodeSeriesValueTypeKey(const SeriesId128& seriesId);
 std::string encodeFieldTypeKey(const std::string& measurement, const std::string& field);
 std::string encodeMeasurementSeriesKey(const std::string& measurement, const SeriesId128& seriesId);
 std::string encodeMeasurementSeriesPrefix(const std::string& measurement);

@@ -40,5 +40,7 @@ public:
     /**
      * Decode compressed data back to doubles.
      */
-    static void decode(CompressedSlice& encoded, size_t nToSkip, size_t length, std::vector<double>& out);
+    // Returns the number of values ACTUALLY decoded (may be < length on a
+    // truncated stream); the block-level caller enforces the count contract.
+    static size_t decode(CompressedSlice& encoded, size_t nToSkip, size_t length, std::vector<double>& out);
 };

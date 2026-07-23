@@ -121,7 +121,7 @@ seastar::future<> verifyCompleteReadback(Engine& engine, std::string measurement
 // 1. Inserts racing a rollover: every point must land, none may throw.
 // ---------------------------------------------------------------------------
 SEASTAR_TEST_F(WALRolloverRaceTest, InsertsDuringRolloverNeverHitClosedStore) {
-    Engine engine(timestar::StorageLayout("."));
+    Engine engine;
     std::exception_ptr failure;
     try {
         co_await engine.init();
@@ -153,7 +153,7 @@ SEASTAR_TEST_F(WALRolloverRaceTest, InsertsDuringRolloverNeverHitClosedStore) {
 //    inserts must never observe a closed or missing store.
 // ---------------------------------------------------------------------------
 SEASTAR_TEST_F(WALRolloverRaceTest, ConcurrentRolloversWithInsertsAreSafe) {
-    Engine engine(timestar::StorageLayout("."));
+    Engine engine;
     std::exception_ptr failure;
     try {
         co_await engine.init();

@@ -104,7 +104,14 @@ seastar::future<TSMResult<T>> TSM::queryWithTombstones(const SeriesId128& series
     // First, perform the regular query using optimized batched reads.
     // Rank = duplicate-resolution priority (last-write-wins across files).
     TSMResult<T> result(dataRank());
-    co_await readSeriesBatched<T>(seriesId, startTime, endTime, result);
+    try {
+        co_await readSeriesBatched<T>(seriesId, startTime, endTime, result);
+    } catch (...) {
+        // Name the file in the error: this is the message the query handler's
+        // dropped-series log and QUERY_INCOMPLETE reason ultimately print, and
+        // without the path a corrupt block cannot be traced to its TSM file.
+        rethrowWithFilePath();
+    }
 
     // hasTombstones() is O(1): checks both null and entry count == 0.
     // Skips the per-series map lookup and result.empty() check when no

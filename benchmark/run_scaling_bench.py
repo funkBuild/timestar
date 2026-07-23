@@ -64,6 +64,16 @@ INFLUX_IMAGE = "influxdb:2.7"
 
 # ── InfluxDB 3 Core Docker settings ──────────────────────────────────
 
+INFLUX3_QUERY_FILE_LIMIT = 100000
+# Uncompacted Parquet scans in Core are slow enough that the default 60s client
+# timeout turns a real (if terrible) latency into a recorded failure. A count
+# over 2M rows measured ~4 minutes.
+INFLUX3_QUERY_TIMEOUT_S = 900
+# ...and slow enough that running the full iteration count for every query would
+# take hours per core count. Wide queries get fewer samples; narrow ones are
+# fast and keep the full count.
+INFLUX3_MAX_ITERATIONS = 3
+
 INFLUX3_CONTAINER = "timestar-scaling-bench-influxdb3"
 INFLUX3_PORT = 8188
 INFLUX3_DB = "bench"
@@ -215,6 +225,19 @@ def stop_influxdb():
     subprocess.run(["docker", "rm", "-f", INFLUX_CONTAINER], capture_output=True)
 
 
+def _parse_size_to_bytes(s):
+    """'8g' -> 8589934592. Accepts g/gb/m/mb/k/kb suffixes or a bare byte count."""
+    s = str(s).strip().lower().rstrip("b")
+    mult = 1
+    if s.endswith("g"):
+        mult, s = 1024 ** 3, s[:-1]
+    elif s.endswith("m"):
+        mult, s = 1024 ** 2, s[:-1]
+    elif s.endswith("k"):
+        mult, s = 1024, s[:-1]
+    return int(float(s) * mult)
+
+
 def start_influxdb3(cores, memory="8g"):
     """Start fresh InfluxDB 3 Core container."""
     subprocess.run(
@@ -222,6 +245,19 @@ def start_influxdb3(cores, memory="8g"):
         capture_output=True,
     )
     _clear_port(INFLUX3_PORT)
+
+    # InfluxDB 3's memory knobs default to PERCENTAGES (force-snapshot 50%,
+    # exec pool 20%, parquet cache 20%) resolved against the HOST's memory, not
+    # the container's cgroup limit. On a 123 GB box with --memory 8g it happily
+    # buffers toward ~61 GB and the kernel OOM-kills it (exit 137) partway
+    # through ingest: 568/700 batches accepted, the rest dropped with
+    # "RemoteDisconnected", and the data directory left effectively empty.
+    # Pin them to absolute sizes derived from the limit we actually granted.
+    mem_bytes = _parse_size_to_bytes(memory)
+    snapshot_thresh = max(256 * 1024 ** 2, mem_bytes // 8)   # 12.5%
+    exec_pool = max(256 * 1024 ** 2, mem_bytes // 8)         # 12.5%
+    parquet_cache = max(128 * 1024 ** 2, mem_bytes // 16)    # 6.25%
+
     subprocess.run([
         "docker", "run", "-d",
         "--name", INFLUX3_CONTAINER,
@@ -234,6 +270,16 @@ def start_influxdb3(cores, memory="8g"):
         "--object-store=file",
         "--data-dir=/var/lib/influxdb3/data",
         "--without-auth",
+        f"--force-snapshot-mem-threshold={snapshot_thresh}",
+        f"--exec-mem-pool-bytes={exec_pool}",
+        f"--parquet-mem-cache-size={parquet_cache}",
+        # Core does not compact (only Enterprise does), so a full-range scan
+        # touches every Parquet file written during ingest and trips the default
+        # file cap with "Query would scan N Parquet files". Raise it so the
+        # wide queries return a real measurement instead of an error — the cost
+        # of scanning uncompacted files is a genuine property of Core and is
+        # what the resulting latency reflects.
+        f"--query-file-limit={INFLUX3_QUERY_FILE_LIMIT}",
     ], check=True, capture_output=True)
 
     for _ in range(30):
@@ -605,10 +651,10 @@ def run_query_influx3(name, sql_query, iterations):
     url = f"http://127.0.0.1:{INFLUX3_PORT}/api/v3/query_sql"
     def req():
         r = requests.post(url, json={"db": INFLUX3_DB, "q": sql_query, "format": "json"},
-                          timeout=60)
+                          timeout=INFLUX3_QUERY_TIMEOUT_S)
         ok = 200 <= r.status_code < 300
         return ok, len(r.content), "" if ok else f"HTTP {r.status_code}: {r.text[:200]}"
-    return _run_query_generic(name, iterations, req)
+    return _run_query_generic(name, min(iterations, INFLUX3_MAX_ITERATIONS), req)
 
 
 # ── Per-config round ───────────────────────────────────────────────────
@@ -733,7 +779,10 @@ def run_round(cores, batches, batch_size, num_hosts, num_racks,
         run_query_ts(name, ts_req, 3)
         run_query_influx(name, flux_q, 3)
         if not no_influx3:
-            run_query_influx3(name, sql_q, 3)
+            # One warmup pass only. Core's uncompacted wide scans run in the
+            # tens of seconds even on small datasets, so a 3-iteration warmup
+            # costs more wall-clock than the entire rest of the round.
+            run_query_influx3(name, sql_q, 1)
 
     # Timed queries
     print(f"  QUERY benchmark ({len(suite)} queries):")
@@ -752,10 +801,24 @@ def run_round(cores, batches, batch_size, num_hosts, num_racks,
         if ix3_qr:
             ix3_total += ix3_qr.total_ms
 
-        line = f"    {name:<30s}  TS={ts_avg:>8.2f}  IX2={ix_avg:>8.2f}"
+        # A query that never succeeded has avg_ms == 0, which printed as
+        # "0.00" and read as "infinitely fast" — that is how a completely
+        # broken InfluxDB 3 round was once mistaken for a good result. Show
+        # failures as ERR, and say why at least once.
+        def _fmt(qr):
+            if qr is None:
+                return f"{0.0:>8.2f}"
+            if qr.successes == 0:
+                return f"{'ERR':>8s}"
+            return f"{qr.avg_ms:>8.2f}"
+
+        line = f"    {name:<30s}  TS={_fmt(ts_qr)}  IX2={_fmt(ix_qr)}"
         if ix3_qr:
-            line += f"  IX3={ix3_avg:>8.2f}"
+            line += f"  IX3={_fmt(ix3_qr)}"
         print(line + " ms")
+        for label, qr in (("TS", ts_qr), ("IX2", ix_qr), ("IX3", ix3_qr)):
+            if qr is not None and qr.successes == 0 and qr.error:
+                print(f"      {label} failed: {qr.error[:160]}")
 
         result.ts_queries.append(_query_dict(ts_qr))
         result.ix_queries.append(_query_dict(ix_qr))

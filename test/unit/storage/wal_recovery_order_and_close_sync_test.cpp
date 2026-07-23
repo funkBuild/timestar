@@ -21,8 +21,6 @@
 
 namespace fs = std::filesystem;
 
-static const timestar::StorageLayout kDefaultWalTestLayout(".");
-
 class WALRecoveryOrderAndCloseSyncTest : public ::testing::Test {
 protected:
     std::string testDir = "./test_wal_order_sync";
@@ -57,7 +55,7 @@ protected:
 seastar::future<> testWALRecoveryRespectsSequenceOrder() {
     // Create WAL file with sequence 5: insert 5 data points
     {
-        WAL wal(kDefaultWalTestLayout, 0, 5);
+        WAL wal(5);
         co_await wal.init(nullptr);
 
         TimeStarInsert<double> insert("metrics", "value");
@@ -73,7 +71,7 @@ seastar::future<> testWALRecoveryRespectsSequenceOrder() {
 
     // Create WAL file with sequence 10: delete range [2000, 4000]
     {
-        WAL wal(kDefaultWalTestLayout, 0, 10);
+        WAL wal(10);
         co_await wal.init(nullptr);
 
         TimeStarInsert<double> dummy("metrics", "value");
@@ -84,8 +82,8 @@ seastar::future<> testWALRecoveryRespectsSequenceOrder() {
     }
 
     // Verify both WAL files exist
-    std::string wal5 = WAL::sequenceNumberToFilename(kDefaultWalTestLayout, 0, 5);
-    std::string wal10 = WAL::sequenceNumberToFilename(kDefaultWalTestLayout, 0, 10);
+    std::string wal5 = WAL::sequenceNumberToFilename(5);
+    std::string wal10 = WAL::sequenceNumberToFilename(10);
     EXPECT_TRUE(fs::exists(wal5)) << "WAL file for sequence 5 should exist";
     EXPECT_TRUE(fs::exists(wal10)) << "WAL file for sequence 10 should exist";
 
@@ -125,7 +123,7 @@ TEST_F(WALRecoveryOrderAndCloseSyncTest, RecoveryRespectsSequenceOrder) {
 seastar::future<> testWALReplayWrongOrderYieldsDifferentResult() {
     // Create WAL file with sequence 5: insert 5 data points
     {
-        WAL wal(kDefaultWalTestLayout, 0, 5);
+        WAL wal(5);
         co_await wal.init(nullptr);
 
         TimeStarInsert<double> insert("metrics", "value");
@@ -141,7 +139,7 @@ seastar::future<> testWALReplayWrongOrderYieldsDifferentResult() {
 
     // Create WAL file with sequence 10: delete range [2000, 4000]
     {
-        WAL wal(kDefaultWalTestLayout, 0, 10);
+        WAL wal(10);
         co_await wal.init(nullptr);
 
         TimeStarInsert<double> dummy("metrics", "value");
@@ -154,12 +152,12 @@ seastar::future<> testWALReplayWrongOrderYieldsDifferentResult() {
     // Replay in WRONG order (10 then 5): delete first, then insert
     auto wrongOrderStore = std::make_shared<MemoryStore>(200);
     {
-        std::string wal10 = WAL::sequenceNumberToFilename(kDefaultWalTestLayout, 0, 10);
+        std::string wal10 = WAL::sequenceNumberToFilename(10);
         WALReader reader10(wal10);
         co_await reader10.readAll(wrongOrderStore.get());
     }
     {
-        std::string wal5 = WAL::sequenceNumberToFilename(kDefaultWalTestLayout, 0, 5);
+        std::string wal5 = WAL::sequenceNumberToFilename(5);
         WALReader reader5(wal5);
         co_await reader5.readAll(wrongOrderStore.get());
     }
@@ -174,8 +172,9 @@ seastar::future<> testWALReplayWrongOrderYieldsDifferentResult() {
 
     // Wrong order: the delete ran on an empty store (no-op), then the insert
     // added all 5 points. All data survives incorrectly.
-    EXPECT_EQ(wrongData.values.size(), 5u) << "Wrong replay order should produce different (incorrect) results, "
-                                              "demonstrating why sequence sorting is critical";
+    EXPECT_EQ(wrongData.values.size(), 5u)
+        << "Wrong replay order should produce different (incorrect) results, "
+           "demonstrating why sequence sorting is critical";
 
     co_return;
 }
@@ -194,7 +193,7 @@ seastar::future<> testWALRecoveryMultipleFilesCorrectOrder() {
     // Create 3 WAL files with non-contiguous sequence numbers
     // Seq 2: insert data
     {
-        WAL wal(kDefaultWalTestLayout, 0, 2);
+        WAL wal(2);
         co_await wal.init(nullptr);
 
         TimeStarInsert<double> insert("sensor", "temp");
@@ -207,7 +206,7 @@ seastar::future<> testWALRecoveryMultipleFilesCorrectOrder() {
 
     // Seq 7: insert more data for same series
     {
-        WAL wal(kDefaultWalTestLayout, 0, 7);
+        WAL wal(7);
         co_await wal.init(nullptr);
 
         TimeStarInsert<double> insert("sensor", "temp");
@@ -219,7 +218,7 @@ seastar::future<> testWALRecoveryMultipleFilesCorrectOrder() {
 
     // Seq 15: delete range [2000, 4000] (should remove points from both seq 2 and 7)
     {
-        WAL wal(kDefaultWalTestLayout, 0, 15);
+        WAL wal(15);
         co_await wal.init(nullptr);
 
         TimeStarInsert<double> dummy("sensor", "temp");
@@ -231,7 +230,7 @@ seastar::future<> testWALRecoveryMultipleFilesCorrectOrder() {
     // Replay in correct order: 2, 7, 15
     auto store = std::make_shared<MemoryStore>(99);
     for (unsigned seq : {2u, 7u, 15u}) {
-        std::string walFile = WAL::sequenceNumberToFilename(kDefaultWalTestLayout, 0, seq);
+        std::string walFile = WAL::sequenceNumberToFilename(seq);
         WALReader reader(walFile);
         co_await reader.readAll(store.get());
     }
@@ -268,7 +267,7 @@ seastar::future<> testWALCloseFlushesData() {
     unsigned int sequenceNumber = 50;
 
     {
-        WAL wal(kDefaultWalTestLayout, 0, sequenceNumber);
+        WAL wal(sequenceNumber);
         co_await wal.init(nullptr);
 
         TimeStarInsert<double> insert("close_test", "value");
@@ -286,7 +285,7 @@ seastar::future<> testWALCloseFlushesData() {
     }
 
     // Verify the WAL file has non-zero size
-    std::string walFile = WAL::sequenceNumberToFilename(kDefaultWalTestLayout, 0, sequenceNumber);
+    std::string walFile = WAL::sequenceNumberToFilename(sequenceNumber);
     EXPECT_TRUE(fs::exists(walFile)) << "WAL file should exist after close()";
     auto fileSize = fs::file_size(walFile);
     EXPECT_GT(fileSize, 0u) << "WAL file should have non-zero size after close()";
@@ -325,7 +324,7 @@ seastar::future<> testWALCloseFlushesMultipleInserts() {
     unsigned int sequenceNumber = 51;
 
     {
-        WAL wal(kDefaultWalTestLayout, 0, sequenceNumber);
+        WAL wal(sequenceNumber);
         co_await wal.init(nullptr);
 
         // Write 5 separate inserts (each adds to _unflushed_bytes)
@@ -339,7 +338,7 @@ seastar::future<> testWALCloseFlushesMultipleInserts() {
         co_await wal.close();
     }
 
-    std::string walFile = WAL::sequenceNumberToFilename(kDefaultWalTestLayout, 0, sequenceNumber);
+    std::string walFile = WAL::sequenceNumberToFilename(sequenceNumber);
     auto recoveredStore = std::make_shared<MemoryStore>(sequenceNumber);
     {
         WALReader reader(walFile);
@@ -361,7 +360,7 @@ seastar::future<> testWALCloseFlushesAfterBatchInsert() {
     unsigned int sequenceNumber = 52;
 
     {
-        WAL wal(kDefaultWalTestLayout, 0, sequenceNumber);
+        WAL wal(sequenceNumber);
         co_await wal.init(nullptr);
 
         std::vector<TimeStarInsert<double>> batch;
@@ -377,7 +376,7 @@ seastar::future<> testWALCloseFlushesAfterBatchInsert() {
         co_await wal.close();
     }
 
-    std::string walFile = WAL::sequenceNumberToFilename(kDefaultWalTestLayout, 0, sequenceNumber);
+    std::string walFile = WAL::sequenceNumberToFilename(sequenceNumber);
     auto recoveredStore = std::make_shared<MemoryStore>(sequenceNumber);
     {
         WALReader reader(walFile);
@@ -399,7 +398,7 @@ seastar::future<> testWALCloseFlushesAfterMixedOperations() {
     unsigned int sequenceNumber = 53;
 
     {
-        WAL wal(kDefaultWalTestLayout, 0, sequenceNumber);
+        WAL wal(sequenceNumber);
         co_await wal.init(nullptr);
 
         TimeStarInsert<double> insert("mixed_close", "value");
@@ -416,7 +415,7 @@ seastar::future<> testWALCloseFlushesAfterMixedOperations() {
         co_await wal.close();
     }
 
-    std::string walFile = WAL::sequenceNumberToFilename(kDefaultWalTestLayout, 0, sequenceNumber);
+    std::string walFile = WAL::sequenceNumberToFilename(sequenceNumber);
     auto recoveredStore = std::make_shared<MemoryStore>(sequenceNumber);
     {
         WALReader reader(walFile);
@@ -445,7 +444,7 @@ TEST_F(WALRecoveryOrderAndCloseSyncTest, CloseFlushesAfterMixedOperations) {
 seastar::future<> testWALDoubleCloseIsSafe() {
     unsigned int sequenceNumber = 54;
 
-    WAL wal(kDefaultWalTestLayout, 0, sequenceNumber);
+    WAL wal(sequenceNumber);
     co_await wal.init(nullptr);
 
     TimeStarInsert<double> insert("double_close", "value");
@@ -457,7 +456,7 @@ seastar::future<> testWALDoubleCloseIsSafe() {
     co_await wal.close();
 
     // Data should still be recoverable
-    std::string walFile = WAL::sequenceNumberToFilename(kDefaultWalTestLayout, 0, sequenceNumber);
+    std::string walFile = WAL::sequenceNumberToFilename(sequenceNumber);
     auto recoveredStore = std::make_shared<MemoryStore>(sequenceNumber);
     {
         WALReader reader(walFile);

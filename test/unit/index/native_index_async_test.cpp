@@ -33,7 +33,7 @@ protected:
 };
 
 SEASTAR_TEST_F(NativeIndexAsyncTest, BasicIndexOperations) {
-    timestar::index::NativeIndex index(timestar::StorageLayout("."), 0);  // Use shard 999 for testing
+    timestar::index::NativeIndex index(0);  // Use shard 999 for testing
 
     co_await index.open();
 
@@ -80,7 +80,7 @@ SEASTAR_TEST_F(NativeIndexAsyncTest, BasicIndexOperations) {
 }
 
 SEASTAR_TEST_F(NativeIndexAsyncTest, SeriesIdGeneration) {
-    timestar::index::NativeIndex index(timestar::StorageLayout("."), 0);  // Use shard 998 for this test
+    timestar::index::NativeIndex index(0);  // Use shard 998 for this test
 
     co_await index.open();
 
@@ -120,7 +120,7 @@ SEASTAR_TEST_F(NativeIndexAsyncTest, Persistence) {
 
     // Phase 1: Create series and close
     {
-        auto index = std::make_unique<timestar::index::NativeIndex>(timestar::StorageLayout("."), 0);
+        auto index = std::make_unique<timestar::index::NativeIndex>(0);
         co_await index->open();
         originalId = co_await index->getOrCreateSeriesId(measurement, tags, field);
         EXPECT_FALSE(originalId.isZero());
@@ -129,7 +129,7 @@ SEASTAR_TEST_F(NativeIndexAsyncTest, Persistence) {
 
     // Phase 2: Reopen and verify
     {
-        auto index = std::make_unique<timestar::index::NativeIndex>(timestar::StorageLayout("."), 0);
+        auto index = std::make_unique<timestar::index::NativeIndex>(0);
         co_await index->open();
         SeriesId128 newId = co_await index->getOrCreateSeriesId(measurement, tags, field);
         EXPECT_EQ(originalId, newId);

@@ -216,9 +216,9 @@ size_t BoolEncoderRLE::encodeInto(const std::vector<bool>& values, AlignedBuffer
     return target.size() - startPos;
 }
 
-void BoolEncoderRLE::decode(Slice& encoded, size_t nToSkip, size_t length, std::vector<bool>& out) {
+size_t BoolEncoderRLE::decode(Slice& encoded, size_t nToSkip, size_t length, std::vector<bool>& out) {
     if (length == 0) [[unlikely]]
-        return;
+        return 0;
 
     bool currentValue = encoded.read<uint8_t>() != 0;
 
@@ -264,10 +264,16 @@ void BoolEncoderRLE::decode(Slice& encoded, size_t nToSkip, size_t length, std::
         currentValue = !currentValue;
     }
 
+    // A short stream used to throw from here. It now trims and REPORTS instead,
+    // so every decoder signals a shortfall the same way and the block-level
+    // caller makes one decision for all of them. (Throwing from inside one
+    // decoder while the others silently trimmed was the inconsistency that let
+    // the string desync go unnoticed.)
+    const size_t produced = writePos - basePos;
     if (writePos != out.size()) {
-        throw std::runtime_error("BoolEncoderRLE::decode: emitted " + std::to_string(writePos - basePos) +
-                                 " values, expected " + std::to_string(out.size() - basePos));
+        out.resize(writePos);
     }
+    return produced;
 }
 
 void BoolEncoderRLE::decodeToDouble(Slice& encoded, size_t nToSkip, size_t length, std::vector<double>& out) {

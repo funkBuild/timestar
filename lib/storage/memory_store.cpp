@@ -371,9 +371,13 @@ seastar::future<> MemoryStore::close() {
     }
 }
 
-seastar::future<> MemoryStore::initWAL(const timestar::StorageLayout& layout, unsigned shardId) {
-    wal = std::make_unique<WAL>(layout, shardId, sequenceNumber);
+seastar::future<> MemoryStore::initWAL() {
+    wal = std::make_unique<WAL>(sequenceNumber);
     co_await wal->init(this, false);  // false = not recovery, create fresh WAL
+}
+
+size_t MemoryStore::walSizeOnDisk() const {
+    return wal ? wal->getCurrentSize() : 0;
 }
 
 seastar::future<> MemoryStore::removeWAL() {
@@ -391,6 +395,14 @@ seastar::future<> MemoryStore::initFromWAL(std::string filename) {
 }
 
 bool MemoryStore::isFull() const {
+    // Resident bytes are checked independently of the WAL: the WAL estimates
+    // below are all about on-disk size; neither sees per-series overhead or
+    // uncompressed string payloads, so a high-cardinality or string-heavy
+    // store can hold hundreds of MB while they still read as near-zero.
+    if (residentBytesEstimate >= residentBytesThreshold()) {
+        return true;
+    }
+
     if (!wal) {
         return false;
     }
@@ -408,9 +420,24 @@ void MemoryStore::insertMemory(TimeStarInsert<T>&& insertRequest) {
     // In-memory insert
     SeriesId128 seriesId = insertRequest.seriesId128();
 
+    // Account resident cost BEFORE inserting. Point cost is the real in-memory
+    // width (timestamp + value, plus the payload for strings), not the compressed
+    // WAL estimate; series cost is charged once, when the series first appears.
+    const size_t pointCount = insertRequest.getTimestamps().size();
+    size_t pointBytes = pointCount * (sizeof(uint64_t) + sizeof(T));
+    if constexpr (std::is_same_v<T, std::string>) {
+        for (const auto& v : insertRequest.values) {
+            pointBytes += v.capacity();
+        }
+    }
     // robin_map's operator[] returns a mutable reference, creating entry if needed.
     // Default-constructed variant will be InMemorySeries<double> (first alternative).
+    // Newness is derived from the size delta — no separate find() probe on the
+    // hottest path in the system.
+    const size_t sizeBefore = series.size();
     auto& variantSeries = series[seriesId];
+    const bool isNewSeries = (series.size() != sizeBefore);
+    residentBytesEstimate += pointBytes + (isNewSeries ? PER_SERIES_OVERHEAD_BYTES : 0);
 
     // Single variant access: std::get_if returns a pointer if the type matches, nullptr otherwise.
     // This replaces the previous 2-3 separate variant accesses
@@ -442,12 +469,23 @@ bool MemoryStore::wouldExceedThreshold(TimeStarInsert<T>& insertRequest) {
 
 template <class T>
 bool MemoryStore::wouldExceedThreshold(TimeStarInsert<T>& insertRequest, size_t& outEstimatedSize) {
+    outEstimatedSize = wal ? wal->estimateInsertSize(insertRequest) : 0;
+
+    // Roll over on RESIDENT bytes first — deliberately not gated on the WAL.
+    // The WAL estimates below model compressed on-disk size, which wildly
+    // under-counts RAM for high-cardinality or string-heavy data (see
+    // residentBytesEstimate). The projection uses only the fixed point
+    // width — string payloads are charged as they land in insertMemory(),
+    // so at worst rollover triggers one insert late.
+    const size_t incomingResident = insertRequest.getTimestamps().size() * (sizeof(uint64_t) + sizeof(T));
+    if ((residentBytesEstimate + incomingResident) >= residentBytesThreshold()) {
+        return true;
+    }
+
     if (!wal) {
-        outEstimatedSize = 0;
         return false;
     }
 
-    outEstimatedSize = wal->estimateInsertSize(insertRequest);
     // Use the larger of actual WAL size and cumulative estimated size for
     // the base, ensuring rollover triggers even when compression is highly
     // effective and actual WAL size grows slowly.
@@ -461,14 +499,14 @@ seastar::future<bool> MemoryStore::insert(TimeStarInsert<T>& insertRequest) {
     if (closed)
         throw std::runtime_error("MemoryStore is closed");
 
-    // Check if this insert would exceed the 16MB WAL threshold.
+    // Check if this insert would exceed the WAL segment threshold.
     // The estimated size is returned via outEstimatedSize to avoid
     // recomputing it below (eliminates double-estimation).
     size_t thisEstimatedSize = 0;
     bool needsRollover = wouldExceedThreshold(insertRequest, thisEstimatedSize);
     if (needsRollover) {
         // Don't insert - signal that rollover is needed
-        timestar::memory_log.debug("Insert would exceed 16MB WAL limit, signaling rollover needed");
+        timestar::memory_log.debug("Insert would exceed WAL segment limit, signaling rollover needed");
         co_return true;
     }
 
@@ -520,6 +558,19 @@ seastar::future<bool> MemoryStore::insertBatch(std::vector<TimeStarInsert<T>>& i
         size_t effectiveSize = std::max(wal->getCurrentSize(), estimatedAccumulatedSize);
         needsRollover = (effectiveSize + batchEstimate) >= walSizeThreshold();
     }
+    if (!needsRollover) {
+        // Roll over on RESIDENT bytes too — not gated on the WAL. The WAL
+        // estimate models compressed on-disk size and under-counts RAM badly
+        // for high-cardinality or string-heavy batches (see
+        // residentBytesEstimate). Fixed point width only; string payloads are
+        // charged as they land in insertMemory().
+        size_t batchPoints = 0;
+        for (const auto& insertRequest : insertRequests) {
+            batchPoints += insertRequest.getTimestamps().size();
+        }
+        const size_t batchResident = batchPoints * (sizeof(uint64_t) + sizeof(T));
+        needsRollover = (residentBytesEstimate + batchResident) >= residentBytesThreshold();
+    }
     if (needsRollover) {
         // Don't insert - signal that rollover is needed
         LOG_INSERT_PATH(timestar::memory_log, debug, "Batch insert would exceed WAL limit, signaling rollover needed");
@@ -552,9 +603,20 @@ seastar::future<bool> MemoryStore::insertBatch(std::vector<TimeStarInsert<T>>& i
         try {
             insertMemory(std::move(insertRequest));
         } catch (const std::exception& e) {
-            timestar::memory_log.warn(
-                "insertMemory failed for series {}: {} — data is in WAL and will be recovered on restart", key,
-                e.what());
+            // Do NOT swallow this. The WAL already has the point, so it is
+            // durable and will reappear on restart — but it is absent from the
+            // memory store, so queries cannot see it until then. Reporting
+            // success here told the client the write landed when it had not,
+            // which is silent data loss from the caller's point of view.
+            //
+            // Rethrowing surfaces it through the per-shard partial-failure path
+            // in the write handler. A client retry is safe: duplicate points
+            // are last-write-wins, so replaying the same point is idempotent.
+            timestar::memory_log.error(
+                "insertMemory failed for series {}: {} — point is in the WAL but not queryable "
+                "until restart; reporting the write as failed",
+                key, e.what());
+            throw;
         }
     }
 #if TIMESTAR_LOG_INSERT_PATH

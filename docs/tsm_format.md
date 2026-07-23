@@ -1,7 +1,7 @@
 # TSM File Format Specification
 
-**Version**: 2 (TSM_VERSION)
-**Minimum readable**: 1 (TSM_VERSION_MIN)
+**Version**: 3 (TSM_VERSION)
+**Minimum readable**: 2 (TSM_VERSION_MIN)
 
 ## Overview
 
@@ -31,9 +31,16 @@ All multi-byte integers are little-endian.
 | Offset | Size | Type    | Value    | Description          |
 |--------|------|---------|----------|----------------------|
 | 0      | 4    | char[4] | `"TASM"` | Magic number (ASCII) |
-| 4      | 1    | uint8   | `2`      | Format version       |
+| 4      | 1    | uint8   | `3`      | Format version       |
 
-Files with version outside `[TSM_VERSION_MIN, TSM_VERSION]` (currently `[1, 2]`) are rejected on open.
+Files with version outside `[TSM_VERSION_MIN, TSM_VERSION]` (currently `[2, 3]`) are rejected on open.
+
+V3 widened the per-series index block count from uint16 to uint32, shifting every
+byte after offset 17 in an index entry. Under uint16 a single series was capped
+at 65,535 blocks per file, which high-volume single-series ingest reaches;
+compaction then threw at `writeIndex()` time and the tier could never merge
+again. The reader parses the entry header by file version (u16 count for V2,
+u32 for V3), so V2 files stay readable; compaction rewrites them as V3.
 
 ## Data Blocks
 
@@ -54,13 +61,23 @@ Each block stores up to `max_points_per_block` (default 3000, configurable via `
 | 0     | Float   | `double`  | ALP               |
 | 1     | Boolean | `bool`    | RLE bitpacking    |
 | 2     | String  | `string`  | zstd + varint LEB |
-| 3     | Integer | `int64_t` | ZigZag + Simple8b |
+| 3     | Integer | `int64_t` | ZigZag + FFOR     |
 
 ### Block Body
 
 After the 9-byte header:
 
-1. **Compressed timestamps** (size given by header field) -- Simple8b with delta-of-delta + ZigZag encoding.
+1. **Compressed timestamps** (size given by header field) -- FFOR (frame-of-reference
+   bit-packing) with delta-of-delta + ZigZag encoding, in blocks of up to
+   `kBlockSize` = 1024 values. A block whose deltas are all equal is emitted as a bare
+   2-word (16-byte) header, so the densest possible encoding is 1024 values in 16 bytes
+   = **64 values per byte**.
+
+   The reader enforces this as a format constraint: a block whose declared timestamp
+   COUNT exceeds `timestampBytes * 64 * 4` (the theoretical maximum plus a 4x safety
+   margin) is rejected, so a corrupt count cannot drive a multi-GB allocation. Any
+   encoder change that beats 64 values/byte must raise that bound first — a
+   `static_assert` in `tsm.cpp` ties it to `kBlockSize`.
 2. **Compressed values** (remaining bytes to end of block) -- encoding depends on value type.
 
 ## Index Section
@@ -73,8 +90,8 @@ Immediately follows the last data block. Contains one entry per series, sorted b
 |--------|------|----------|------------------------------------|
 | 0      | 16   | byte[16] | SeriesId128 (XXH3_128bits hash)    |
 | 16     | 1    | uint8    | Value type (`TSMValueType`)        |
-| 17     | 2    | uint16   | Block count (N)                    |
-| 19     | var  | Block[N] | N block metadata entries (below)   |
+| 17     | 4    | uint32   | Block count (N)                    |
+| 21     | var  | Block[N] | N block metadata entries (below)   |
 
 ### Index Block -- Base Fields (28 bytes, all types)
 
@@ -170,9 +187,18 @@ dictionary in its TSM index entry"); the dictionary bytes were never written,
 so no repair is possible — affected string data must be re-ingested. Numeric
 series in the same files are unaffected.
 
-### V1 Backward Compatibility
+### V1/V2 Compatibility
 
-V1 files have stats only for Float blocks (80 bytes). All other types use the 28-byte base only. The reader selects the per-block byte size via `indexBlockBytes(type, version)`.
+**V2 files remain readable.** The only V3 change is the width of the per-series
+index block count (uint16 → uint32); the reader selects the entry-header size and
+count width by file version (`tsmIndexEntryHeaderSize()`), and all block-stat
+layouts are unchanged from V2. New files are always written as V3, and compaction
+naturally rewrites V2 inputs as V3 output, so V2 files age out of a live system.
+`TSM_VERSION_MIN` is 2; V1 files (pre-universal-stats) are rejected on open.
+
+Note that rejection happens per file, and `TSMFileManager::openTsmFile()` logs and skips
+files that fail to open — so a V1 file's data is unavailable to queries until it is
+re-ingested. There is no migration tool.
 
 ## Footer (last 8 bytes)
 

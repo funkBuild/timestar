@@ -47,9 +47,9 @@ static ALPScratchBuffers& getScratch() {
 
 }  // anonymous namespace
 
-void ALPDecoder::decode(CompressedSlice& encoded, size_t nToSkip, size_t length, std::vector<double>& out) {
+size_t ALPDecoder::decode(CompressedSlice& encoded, size_t nToSkip, size_t length, std::vector<double>& out) {
     if (length == 0) [[unlikely]]
-        return;
+        return 0;
 
     // Pre-allocate output -- exact size, no over-reserve since length is known
     const size_t current_size = out.size();
@@ -393,8 +393,11 @@ void ALPDecoder::decode(CompressedSlice& encoded, size_t nToSkip, size_t length,
         }
     }
 
-    // If we decoded fewer than requested (shouldn't happen with valid data), trim
+    // Fewer than requested means the stream ran out early: trim to what was
+    // really decoded and REPORT it. The caller owns the decision -- a short
+    // block is a corrupt block, not something to paper over here.
     if (output_remaining > 0) [[unlikely]] {
         out.resize(required - output_remaining);
     }
+    return length - output_remaining;
 }

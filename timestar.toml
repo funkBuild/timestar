@@ -21,9 +21,20 @@ log_level = "info"
 # auth_token = "my-secret-api-key"
 
 [storage]
-# wal_size_threshold = 16777216     # 16 MiB
+# wal_size_threshold = 67108864     # 64 MiB (default)
 # max_points_per_block = 3000
 # tsm_bloom_fpr = 0.01
+
+# WAL durability: when an acknowledged write is actually on disk.
+#   "always"   (default) group commit — a write acks only after its bytes are
+#              flushed + fdatasync'd; concurrent writers share one flush, so
+#              the cost amortises under load (measured ~0% throughput impact).
+#   "interval" ack immediately, flush every wal_sync_interval_ms — bounds the
+#              crash-loss window in time; for fsync-hostile storage.
+#   "rollover" legacy: durable only at segment rollover/clean shutdown. An
+#              OOM-kill silently loses the buffered tail of acked writes.
+# wal_sync_mode = "always"
+# wal_sync_interval_ms = 100
 
 # [storage.compaction]
 # max_concurrent = 2

@@ -32,6 +32,19 @@ public:
     // Maximum number of per-timestamp entries in non-bucketed mode.
     static constexpr size_t MAX_UNBUCKETED_STATES = 10'000'000;
 
+    // Single enforcement point for the non-bucketed growth cap.
+    //
+    // The check used to live inline in addPoint() and addPoints() only, while
+    // addTimestampsOnly() (the COUNT path) and addPointsRange() (the memory-store
+    // path) grew the same two vectors with no check at all -- so a query whose
+    // data sat in the memstore bypassed the guard entirely. Routing all four
+    // through one helper is what makes the cap actually hold.
+    void checkUnbucketedCapacity(size_t adding) const {
+        if (timestamps_.size() + adding > MAX_UNBUCKETED_STATES) [[unlikely]] {
+            throw std::runtime_error("Non-bucketed aggregation exceeded " + std::to_string(MAX_UNBUCKETED_STATES) +
+                                     " states; use an aggregationInterval to reduce cardinality");
+        }
+    }
     explicit BlockAggregator(uint64_t interval)
         : interval_(interval), method_(AggregationMethod::AVG), methodAware_(false) {}
 
@@ -183,6 +196,7 @@ public:
                 return;
             }
             // Non-bucketed: store timestamps with zero values for result pipeline
+            checkUnbucketedCapacity(timestamps.size());
             timestamps_.insert(timestamps_.end(), timestamps.begin(), timestamps.end());
             rawValues_.resize(rawValues_.size() + timestamps.size(), 0.0);
         } else if (singleBucketState_ && !timestamps.empty() && inSingleBucket(timestamps.front()) &&
@@ -214,10 +228,7 @@ public:
                 addToState(singleState_, value, timestamp);
                 return;
             }
-            if (timestamps_.size() >= MAX_UNBUCKETED_STATES) [[unlikely]] {
-                throw std::runtime_error("Non-bucketed aggregation exceeded " + std::to_string(MAX_UNBUCKETED_STATES) +
-                                         " states; use an aggregationInterval to reduce cardinality");
-            }
+            checkUnbucketedCapacity(1);
             timestamps_.push_back(timestamp);
             rawValues_.push_back(value);
         } else if (singleBucketState_ && inSingleBucket(timestamp)) {
@@ -247,6 +258,7 @@ public:
                 }
                 return;
             }
+            checkUnbucketedCapacity(endIdx - startIdx);
             timestamps_.insert(timestamps_.end(), timestamps.begin() + startIdx, timestamps.begin() + endIdx);
             rawValues_.insert(rawValues_.end(), values.begin() + startIdx, values.begin() + endIdx);
         } else if (singleBucketState_ && inSingleBucket(timestamps[startIdx]) &&
@@ -278,10 +290,7 @@ public:
                 }
                 return;
             }
-            if (timestamps_.size() + n > MAX_UNBUCKETED_STATES) [[unlikely]] {
-                throw std::runtime_error("Non-bucketed aggregation exceeded " + std::to_string(MAX_UNBUCKETED_STATES) +
-                                         " states; use an aggregationInterval to reduce cardinality");
-            }
+            checkUnbucketedCapacity(n);
             // Store raw (timestamp, value) pairs — 16 bytes/point vs 96 bytes
             // with AggregationState. States are constructed lazily at merge time.
             timestamps_.insert(timestamps_.end(), timestamps.begin(), timestamps.end());

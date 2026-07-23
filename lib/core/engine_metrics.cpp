@@ -31,6 +31,27 @@ void EngineMetrics::setup(Engine& engine) {
                 "tsm_file_count", [&engine] { return static_cast<int64_t>(engine.getTSMFileCount()); },
                 sm::description("Number of TSM files on this shard")),
             sm::make_gauge(
+                "compaction_failures_total", [&engine] { return static_cast<int64_t>(engine.getCompactionFailures()); },
+                sm::description("Total compaction attempts that failed since startup")),
+            sm::make_gauge(
+                "compaction_consecutive_failures",
+                [&engine] { return static_cast<int64_t>(engine.getMaxConsecutiveCompactionFailures()); },
+                sm::description("Highest consecutive-failure count across tiers; non-zero means a tier is not "
+                                "merging and is growing without bound")),
+            sm::make_gauge(
+                "compaction_deepest_backlogged_tier",
+                [&engine] { return static_cast<int64_t>(engine.getDeepestBackloggedTier()); },
+                sm::description("Deepest tier at or over its compaction threshold, -1 if none")),
+            sm::make_gauge(
+                "ingest_retained_memory_stores",
+                [&engine] { return static_cast<int64_t>(engine.getRetainedMemoryStoreCount()); },
+                sm::description("Memory stores retained awaiting TSM conversion, including the active store. "
+                                "Rising means conversion is behind ingest; at the ceiling writes are shed with 503")),
+            sm::make_counter(
+                "ingest_rejected_backlog_total",
+                [&engine] { return engine.getMetrics().inserts_rejected_backlog_total; },
+                sm::description("Writes rejected with 503 because the ingest backlog reached its ceiling")),
+            sm::make_gauge(
                 "index_series_count",
                 [&engine] { return static_cast<int64_t>(engine.getIndex().getSeriesCountSync()); },
                 sm::description("Number of indexed series on this shard")),
