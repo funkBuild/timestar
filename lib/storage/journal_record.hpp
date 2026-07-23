@@ -21,7 +21,8 @@ enum class JournalRecordKind : uint8_t {
     HardState = 3,      // Raft term / vote
     Config = 4,         // membership / configuration generation
     Retention = 5,      // retention cutoff
-    MaxKind = 6,        // sentinel; not a real kind
+    Snapshot = 6,       // Raft snapshot boundary (lastIncludedIndex/Term + config + data)
+    MaxKind = 7,        // sentinel; not a real kind
 };
 
 // One record in a per-core multiplexed journal (ADR 0001 sec 1). Every record is

@@ -39,6 +39,7 @@ public:
     seastar::future<> persistHardState(HardState) override { return seastar::make_ready_future<>(); }
     seastar::future<> persistEntries(std::vector<LogEntry>) override { return seastar::make_ready_future<>(); }
     seastar::future<> persistSnapshot(Snapshot) override { return seastar::make_ready_future<>(); }
+    seastar::future<> sync() override { return seastar::make_ready_future<>(); }
 };
 
 class RecordingSM : public RaftStateMachine {

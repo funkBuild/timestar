@@ -10,14 +10,24 @@ seastar::future<> RaftGroup::drainReady() {
     while (node_.hasReady()) {
         RaftNode::Ready rd = node_.ready();
 
-        // 1. Make durable BEFORE anything observable. Snapshot first (it may
-        //    supersede the log), then hard state, then the new log entries.
-        if (rd.snapshot)
+        // 1. Make durable BEFORE anything observable. Append snapshot first (it
+        //    may supersede the log), then hard state, then the new log entries,
+        //    then one sync() -- a single fsync makes the whole Ready durable.
+        bool persisted = false;
+        if (rd.snapshot) {
             co_await persistence_.persistSnapshot(*rd.snapshot);
-        if (rd.hardState)
+            persisted = true;
+        }
+        if (rd.hardState) {
             co_await persistence_.persistHardState(*rd.hardState);
-        if (!rd.entries.empty())
+            persisted = true;
+        }
+        if (!rd.entries.empty()) {
             co_await persistence_.persistEntries(rd.entries);
+            persisted = true;
+        }
+        if (persisted)
+            co_await persistence_.sync();
 
         // 2. Only now may we tell peers what we have committed to durably.
         for (auto& m : rd.messages)
