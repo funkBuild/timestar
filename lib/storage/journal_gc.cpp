@@ -72,6 +72,9 @@ seastar::future<JournalGc::Result> JournalGc::collect(fs::path dir, uint64_t act
         }
 
         co_await seastar::remove_file(path.string());
+        // Make the deletion durable: an un-synced directory entry could resurrect
+        // a "deleted" segment after a crash, reintroducing a duplicate record.
+        co_await seastar::sync_directory(dir.string());
         result.deletedSegments.push_back(seg);
     }
 

@@ -81,6 +81,7 @@ seastar::future<std::vector<JournalRecord>> JournalWriter::open() {
             // corruption: fail closed.
             if (isFinal) {
                 co_await seastar::remove_file(path.string());
+                co_await seastar::sync_directory(dir_.string());  // make the deletion durable
                 continue;
             }
             fence("corrupt journal segment header: " + path.string());
@@ -114,17 +115,30 @@ seastar::future<std::vector<JournalRecord>> JournalWriter::open() {
     co_return recovered;
 }
 
+seastar::future<> JournalWriter::dmaWriteBuffer(uint64_t offset, seastar::temporary_buffer<char> buf) {
+    // offset and buf.size() are multiples of alignment_, and buf is allocated at
+    // memory_dma_alignment(). On a short write we memmove the remainder to the
+    // FRONT of the aligned buffer (rather than advancing the pointer) so the
+    // source memory stays aligned -- required when memory alignment exceeds disk
+    // alignment (a legal Seastar combination that would otherwise EINVAL).
+    uint64_t pos = offset;
+    size_t remaining = buf.size();
+    while (remaining > 0) {
+        const size_t n = co_await file_.dma_write(pos, buf.get(), remaining);
+        if (n == 0 || (n & (alignment_ - 1)) != 0)
+            throw std::runtime_error("journal dma_write returned an unaligned/short count");
+        pos += n;
+        remaining -= n;
+        if (remaining > 0)
+            std::memmove(buf.get_write(), buf.get() + n, remaining);
+    }
+}
+
 seastar::future<> JournalWriter::dmaWriteAligned(uint64_t offset, const char* src, size_t len) {
     // offset and len are multiples of alignment_; bounce through aligned memory.
     auto buf = seastar::temporary_buffer<char>::aligned(file_.memory_dma_alignment(), len);
     std::memcpy(buf.get_write(), src, len);
-    size_t written = 0;
-    while (written < len) {
-        const size_t n = co_await file_.dma_write(offset + written, buf.get() + written, len - written);
-        if (n == 0 || (n & (alignment_ - 1)) != 0)
-            throw std::runtime_error("journal dma_write returned an unaligned/short count");
-        written += n;
-    }
+    co_await dmaWriteBuffer(offset, std::move(buf));
 }
 
 seastar::future<> JournalWriter::writePaddedBlock(uint64_t offset, const char* src, size_t rem) {
@@ -134,13 +148,7 @@ seastar::future<> JournalWriter::writePaddedBlock(uint64_t offset, const char* s
     auto buf = seastar::temporary_buffer<char>::aligned(file_.memory_dma_alignment(), alignment_);
     std::memcpy(buf.get_write(), src, rem);
     std::memset(buf.get_write() + rem, 0, alignment_ - rem);
-    size_t written = 0;
-    while (written < alignment_) {
-        const size_t n = co_await file_.dma_write(offset + written, buf.get() + written, alignment_ - written);
-        if (n == 0 || (n & (alignment_ - 1)) != 0)
-            throw std::runtime_error("journal dma_write returned an unaligned/short count");
-        written += n;
-    }
+    co_await dmaWriteBuffer(offset, std::move(buf));
 }
 
 seastar::future<> JournalWriter::startSegment(uint64_t segmentNumber) {
@@ -152,6 +160,10 @@ seastar::future<> JournalWriter::startSegment(uint64_t segmentNumber) {
     alignment_ = file_.disk_write_dma_alignment();
     currentSegment_ = segmentNumber;
     alignedLen_ = 0;
+    // fsync the parent directory so the new segment's directory entry is durable
+    // before any barrier promises its records are (fdatasync alone syncs file
+    // contents, not the directory that names the file).
+    co_await seastar::sync_directory(dir_.string());
 
     JournalSegmentHeader header = headerTemplate_;
     header.segmentNumber = segmentNumber;

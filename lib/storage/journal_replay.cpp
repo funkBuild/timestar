@@ -1,5 +1,6 @@
 #include "journal_replay.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <stdexcept>
 
@@ -19,42 +20,77 @@ void JournalReplay::fail(std::string detail) {
 bool JournalReplay::ingest(const JournalRecord& record) {
     if (failed_)
         return false;
+    if (finalized_)
+        throw std::logic_error("JournalReplay::ingest after finalize");
 
     if (!record.vshard.valid()) {
         fail("out-of-range VShard id in journal record");
         return false;
     }
 
-    const uint16_t vs = record.vshard.value();
-    auto it = lastSeqByVShard_.find(vs);
-    if (it == lastSeqByVShard_.end()) {
-        // First record for this VShard in the retained stream establishes the
-        // baseline (the retained log may start mid-sequence after GC).
-        lastSeqByVShard_.emplace(vs, record.vshardSeq);
-    } else {
-        // Every subsequent record must be the gap-free successor; a gap or a
-        // regression is loss/corruption and fails the whole replay closed. Guard
-        // the (physically unreachable) sequence-space exhaustion so the +1 below
-        // cannot wrap and mis-accept a seq-0 record as the successor of max.
-        if (it->second == UINT64_MAX) {
-            fail("VShard " + std::to_string(vs) + " sequence space exhausted");
-            return false;
-        }
-        if (record.vshardSeq != it->second + 1) {
-            fail("VShard " + std::to_string(vs) + " sequence discontinuity: expected " +
-                 std::to_string(it->second + 1) + " but saw " + std::to_string(record.vshardSeq));
-            return false;
-        }
-        it->second = record.vshardSeq;
-    }
+    buffered_[record.vshard.value()].push_back(record);
+    return true;
+}
 
-    byCore_[ownerCore(record.vshard)].push_back(record);
+bool JournalReplay::finalize() {
+    if (failed_)
+        return false;
+    if (finalized_)
+        return true;
+    finalized_ = true;
+
+    // Process VShards in ascending id order for a deterministic routed layout.
+    std::vector<uint16_t> vshards;
+    vshards.reserve(buffered_.size());
+    for (const auto& [vs, records] : buffered_)
+        vshards.push_back(vs);
+    std::sort(vshards.begin(), vshards.end());
+
+    for (uint16_t vs : vshards) {
+        auto& records = buffered_[vs];
+        // Order by sequence; physical order is not authoritative (copy-forward).
+        std::stable_sort(records.begin(), records.end(),
+                         [](const JournalRecord& a, const JournalRecord& b) { return a.vshardSeq < b.vshardSeq; });
+
+        auto& out = byCore_[ownerCore(VShardId{vs})];
+        bool first = true;
+        uint64_t prevSeq = 0;
+        for (const JournalRecord& record : records) {
+            if (!first && record.vshardSeq == prevSeq) {
+                // Duplicate sequence. A copy-forward (or its crash-window twin) is
+                // a byte-identical copy -> drop it. Anything else is corruption.
+                if (record != out.back()) {
+                    fail("VShard " + std::to_string(vs) + " conflicting duplicate at sequence " +
+                         std::to_string(record.vshardSeq));
+                    return false;
+                }
+                continue;  // exact duplicate: dedupe
+            }
+            if (!first) {
+                // Guard the (physically unreachable) sequence-space top so prevSeq+1
+                // cannot wrap; records are sorted and de-duplicated, so any next
+                // record here is strictly greater than prevSeq.
+                if (prevSeq == UINT64_MAX) {
+                    fail("VShard " + std::to_string(vs) + " sequence space exhausted");
+                    return false;
+                }
+                if (record.vshardSeq != prevSeq + 1) {
+                    fail("VShard " + std::to_string(vs) + " sequence discontinuity: expected " +
+                         std::to_string(prevSeq + 1) + " but saw " + std::to_string(record.vshardSeq));
+                    return false;
+                }
+            }
+            out.push_back(record);
+            prevSeq = record.vshardSeq;
+            first = false;
+        }
+    }
     return true;
 }
 
 const std::vector<JournalRecord>& JournalReplay::recordsForCore(unsigned core) const {
     static const std::vector<JournalRecord> empty;
-    if (core >= byCore_.size())
+    if (failed_ || core >= byCore_.size())
         return empty;
     return byCore_[core];
 }

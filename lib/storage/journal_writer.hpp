@@ -8,6 +8,7 @@
 #include <optional>
 #include <seastar/core/file.hh>
 #include <seastar/core/future.hh>
+#include <seastar/core/temporary_buffer.hh>
 #include <string>
 #include <vector>
 
@@ -56,6 +57,9 @@ public:
 private:
     seastar::future<> startSegment(uint64_t segmentNumber);
     seastar::future<> sealCurrent();  // flush the tail, truncate to logical size, close the file
+    // Write a whole aligned buffer at an aligned offset, keeping the source memory
+    // aligned across short writes (consumes the buffer).
+    seastar::future<> dmaWriteBuffer(uint64_t offset, seastar::temporary_buffer<char> buf);
     // Write `len` bytes from `src` at an aligned file offset (bounce through an
     // aligned buffer; `len` and `offset` must be multiples of alignment_).
     seastar::future<> dmaWriteAligned(uint64_t offset, const char* src, size_t len);

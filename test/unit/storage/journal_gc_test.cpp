@@ -1,5 +1,6 @@
 #include "../../../lib/storage/journal_gc.hpp"
 
+#include "../../../lib/storage/journal_replay.hpp"
 #include "../../../lib/storage/journal_retention.hpp"
 #include "../../../lib/storage/journal_writer.hpp"
 
@@ -115,20 +116,27 @@ seastar::future<> testLaggardRecordsAreCopiedForwardAndSurvive() {
     EXPECT_FALSE(result.copyForwardSegments.empty());
     co_await w.close();
 
-    // Reopen and recover: every VShard-2 record must survive; VShard-1 records
-    // that lived only in reclaimed segments are gone.
+    // Reopen and recover, then route the recovered stream through the REAL replay
+    // layer (not a manual sort): copy-forward relocates vs2's older records behind
+    // its newer ones, so replay MUST sort by sequence and still validate gap-free.
     JournalWriter w2(dir, header(), kSmallSegBytes);
     auto recovered = co_await w2.open();
+    co_await w2.close();
+
+    timestar::JournalReplay replay(1);
+    for (const auto& r : recovered)
+        EXPECT_TRUE(replay.ingest(r));
+    EXPECT_TRUE(replay.finalize()) << "recovery must not fail closed: " << replay.failureDetail();
+
     std::vector<uint64_t> vs2Seqs;
-    for (const auto& r : recovered) {
+    for (const auto& r : replay.recordsForCore(replay.ownerCore(VShardId{2}))) {
         if (r.vshard.value() == 2) {
             EXPECT_EQ(r.payload, "vs2-live");
             vs2Seqs.push_back(r.vshardSeq);
         }
     }
-    std::sort(vs2Seqs.begin(), vs2Seqs.end());
-    EXPECT_EQ(vs2Seqs, (std::vector<uint64_t>{1, 2, 3, 4, 5, 6})) << "no laggard record may be lost";
-    co_await w2.close();
+    // Already in sequence order out of replay; no laggard record may be lost.
+    EXPECT_EQ(vs2Seqs, (std::vector<uint64_t>{1, 2, 3, 4, 5, 6}));
     fs::remove_all(dir);
 }
 TEST(JournalGcTest, LaggardRecordsAreCopiedForwardAndSurvive) {
