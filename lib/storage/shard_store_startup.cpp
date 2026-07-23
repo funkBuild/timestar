@@ -6,6 +6,8 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
+#include <cstring>
 #include <format>
 #include <fstream>
 #include <optional>
@@ -29,9 +31,16 @@ struct MetaRead {
 };
 
 MetaRead readShardCountMeta(const fs::path& path) {
+    // Distinguish "genuinely not present" from "present but unreadable". Only the
+    // former is Absent (a possibly-fresh store); an I/O/permission error over a
+    // file that exists is Malformed so it fails closed rather than being read as
+    // a fresh store.
+    std::error_code ec;
+    if (!fs::exists(path, ec))
+        return {MetaState::Absent, 0};
     std::ifstream ifs(path);
     if (!ifs)
-        return {MetaState::Absent, 0};
+        return {MetaState::Malformed, 0};
     unsigned count = 0;
     if (!(ifs >> count))
         return {MetaState::Malformed, 0};
@@ -39,6 +48,8 @@ MetaRead readShardCountMeta(const fs::path& path) {
 }
 
 struct RootScan {
+    bool ioError = false;  // the root could not be scanned safely -> fail closed
+    std::string errorDetail;
     std::vector<unsigned> shardIndices;
     std::optional<std::string> stagingArtifact;  // shard_N_new / shard_N_old left by an interrupted rebalance
 };
@@ -46,17 +57,47 @@ struct RootScan {
 RootScan scanRoot(const StorageLayout& layout) {
     RootScan scan;
     DIR* dir = ::opendir(layout.root().c_str());
-    if (dir == nullptr)
-        return scan;  // A missing root is an empty (fresh) store.
+    if (dir == nullptr) {
+        // A genuinely missing root is an empty (fresh) store. Any other failure
+        // (unreadable directory, root is a regular file, ...) must NOT be read
+        // as "fresh" -- that would let a populated-but-inaccessible store be
+        // reinitialised. Fail closed instead.
+        if (errno == ENOENT)
+            return scan;
+        scan.ioError = true;
+        scan.errorDetail = "cannot scan data root '" + layout.root().string() + "': " + std::strerror(errno);
+        return scan;
+    }
 
-    while (const dirent* entry = ::readdir(dir)) {
+    while (true) {
+        // readdir() returns null on BOTH end-of-directory and error, so errno
+        // must be cleared before each call and checked after a null result: a
+        // read error mid-scan must fail closed rather than look like a complete
+        // (and possibly empty/partial) directory.
+        errno = 0;
+        const dirent* entry = ::readdir(dir);
+        if (entry == nullptr) {
+            if (errno != 0) {
+                scan.ioError = true;
+                scan.errorDetail = "cannot read data root '" + layout.root().string() + "': " + std::strerror(errno);
+            }
+            break;
+        }
+
         const std::string name = entry->d_name;
         if (name == "." || name == "..")
             continue;
 
         if (const auto shard = layout.parseShardDirName(name)) {
             struct stat st{};
-            if (::stat((layout.root() / name).c_str(), &st) == 0 && S_ISDIR(st.st_mode))
+            if (::stat((layout.root() / name).c_str(), &st) != 0) {
+                // A shard-named entry we cannot stat must not be silently
+                // dropped (that could make a populated store look empty).
+                scan.ioError = true;
+                scan.errorDetail = "cannot stat '" + name + "': " + std::strerror(errno);
+                break;
+            }
+            if (S_ISDIR(st.st_mode))
                 scan.shardIndices.push_back(*shard);
         } else if (name.starts_with("shard_") && (name.ends_with("_new") || name.ends_with("_old"))) {
             scan.stagingArtifact = name;
@@ -113,14 +154,20 @@ ShardStoreInspection ShardStoreStartup::inspect(unsigned requestedShardCount) co
     result.requestedShardCount = requestedShardCount;
 
     // 1. An interrupted rebalance (state file or leftover staging directory) is
-    //    never resumed automatically by normal startup.
-    if (std::ifstream(layout_.rebalanceStateFile())) {
+    //    never resumed automatically by normal startup. Detect the state file by
+    //    EXISTENCE, not openability, so an unreadable one still fails closed.
+    if (std::error_code ec; fs::exists(layout_.rebalanceStateFile(), ec)) {
         result.status = ShardStoreStartupStatus::InterruptedLegacyRebalance;
         result.detail = "found " + layout_.rebalanceStateFile().string();
         return result;
     }
 
     const RootScan scan = scanRoot(layout_);
+    if (scan.ioError) {
+        result.status = ShardStoreStartupStatus::InvalidMetadata;
+        result.detail = scan.errorDetail;
+        return result;
+    }
     if (scan.stagingArtifact) {
         result.status = ShardStoreStartupStatus::InterruptedLegacyRebalance;
         result.detail = "found leftover rebalance staging directory " + *scan.stagingArtifact;

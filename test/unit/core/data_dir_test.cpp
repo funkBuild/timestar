@@ -5,7 +5,7 @@
 // hardcoded CWD-relative "shard_N/..." paths, so the key was silently ignored.
 //
 // Covers:
-//   1. dataRootPath()/shardDataPath() derivation: default ".", empty value,
+//   1. dataRootPath() derivation + StorageLayout(dataRootPath()) shard-path composition: default ".", empty value,
 //      absolute and relative roots, trailing-slash normalization.
 //   2. End-to-end: an Engine running with a custom data_dir creates shard_0
 //      (tsm/, WAL, native_index/) under that directory and NOT under the CWD.
@@ -13,6 +13,7 @@
 #include "../../../lib/config/timestar_config.hpp"
 #include "../../../lib/core/engine.hpp"
 #include "../../../lib/core/timestar_value.hpp"
+#include "../../../lib/storage/storage_layout.hpp"
 #include "../../test_helpers.hpp"
 
 #include <gtest/gtest.h>
@@ -61,44 +62,44 @@ TEST_F(DataDirTest, DefaultDataDirKeepsLegacyCwdRelativePaths) {
     ScopedDataDir guard(".");
     EXPECT_EQ(timestar::dataRootPath(), ".");
     // Legacy behavior: no "./" prefix, exactly the strings used before the fix.
-    EXPECT_EQ(timestar::shardDataPath(0), "shard_0");
-    EXPECT_EQ(timestar::shardDataPath(17), "shard_17");
+    EXPECT_EQ(timestar::StorageLayout(timestar::dataRootPath()).shardDir(0).string(), "shard_0");
+    EXPECT_EQ(timestar::StorageLayout(timestar::dataRootPath()).shardDir(17).string(), "shard_17");
 }
 
 TEST_F(DataDirTest, EmptyDataDirNormalizesToCwd) {
     ScopedDataDir guard("");
     EXPECT_EQ(timestar::dataRootPath(), ".");
-    EXPECT_EQ(timestar::shardDataPath(3), "shard_3");
+    EXPECT_EQ(timestar::StorageLayout(timestar::dataRootPath()).shardDir(3).string(), "shard_3");
 }
 
 TEST_F(DataDirTest, DotWithTrailingSlashBehavesLikeDefault) {
     ScopedDataDir guard("./");
     EXPECT_EQ(timestar::dataRootPath(), ".");
-    EXPECT_EQ(timestar::shardDataPath(0), "shard_0");
+    EXPECT_EQ(timestar::StorageLayout(timestar::dataRootPath()).shardDir(0).string(), "shard_0");
 }
 
 TEST_F(DataDirTest, AbsoluteDataDir) {
     ScopedDataDir guard("/var/lib/timestar");
     EXPECT_EQ(timestar::dataRootPath(), "/var/lib/timestar");
-    EXPECT_EQ(timestar::shardDataPath(2), "/var/lib/timestar/shard_2");
+    EXPECT_EQ(timestar::StorageLayout(timestar::dataRootPath()).shardDir(2).string(), "/var/lib/timestar/shard_2");
 }
 
 TEST_F(DataDirTest, TrailingSlashesAreStripped) {
     ScopedDataDir guard("/var/lib/timestar///");
     EXPECT_EQ(timestar::dataRootPath(), "/var/lib/timestar");
-    EXPECT_EQ(timestar::shardDataPath(0), "/var/lib/timestar/shard_0");
+    EXPECT_EQ(timestar::StorageLayout(timestar::dataRootPath()).shardDir(0).string(), "/var/lib/timestar/shard_0");
 }
 
 TEST_F(DataDirTest, RelativeDataDir) {
     ScopedDataDir guard("data/ts");
     EXPECT_EQ(timestar::dataRootPath(), "data/ts");
-    EXPECT_EQ(timestar::shardDataPath(1), "data/ts/shard_1");
+    EXPECT_EQ(timestar::StorageLayout(timestar::dataRootPath()).shardDir(1).string(), "data/ts/shard_1");
 }
 
 TEST_F(DataDirTest, FilesystemRootIsPreserved) {
     ScopedDataDir guard("/");
     EXPECT_EQ(timestar::dataRootPath(), "/");
-    EXPECT_EQ(timestar::shardDataPath(0), "/shard_0");
+    EXPECT_EQ(timestar::StorageLayout(timestar::dataRootPath()).shardDir(0).string(), "/shard_0");
 }
 
 // ---------------------------------------------------------------------------

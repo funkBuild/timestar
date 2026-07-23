@@ -247,11 +247,6 @@ const TimestarConfig& config();
 // normalizes to "." (the process working directory). Never empty.
 std::string dataRootPath();
 
-// Directory holding one shard's data: "<data_dir>/shard_<id>".
-// With the default data_dir of "." this returns the legacy CWD-relative
-// "shard_<id>" so existing deployments and tests are unaffected.
-std::string shardDataPath(unsigned shardId);
-
 }  // namespace timestar
 
 // Glaze metadata for TOML serialization

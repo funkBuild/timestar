@@ -325,13 +325,16 @@ seastar::future<> run_benchmark(seastar::sharded<Engine>& engine) {
     std::cout << "\n### RESOURCE USAGE ###" << std::endl;
     std::cout << "Shards used:     " << seastar::smp::count << std::endl;
 
-    // Check disk usage
+    // Check disk usage. Scan the shard directories through the same layout the
+    // Engine was started with, so a non-default data_dir is reported correctly
+    // rather than looking for shard_N in the working directory.
     size_t totalDiskUsage = 0;
     size_t tsmFiles = 0;
     size_t walFiles = 0;
 
-    for (int i = 0; i < seastar::smp::count; ++i) {
-        std::string shardPath = "shard_" + std::to_string(i);
+    const auto layout = timestar::StorageLayout(timestar::dataRootPath()).anchored();
+    for (unsigned i = 0; i < seastar::smp::count; ++i) {
+        const std::string shardPath = layout.shardDir(i).string();
         if (fs::exists(shardPath)) {
             for (const auto& entry : fs::recursive_directory_iterator(shardPath)) {
                 if (fs::is_regular_file(entry)) {

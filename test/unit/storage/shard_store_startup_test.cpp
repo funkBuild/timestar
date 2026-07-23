@@ -1,6 +1,7 @@
 #include "../../../lib/storage/shard_store_startup.hpp"
 
 #include <gtest/gtest.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -170,6 +171,34 @@ TEST_F(ShardStoreStartupTest, NonContiguousShardDirsAreInvalidWithoutMeta) {
 
     const auto inspection = inspect(3);
     EXPECT_EQ(inspection.status, ShardStoreStartupStatus::InvalidMetadata);
+}
+
+TEST_F(ShardStoreStartupTest, RootThatCannotBeScannedFailsClosed) {
+    // A root that is a regular file (or otherwise un-scannable) must NOT be read
+    // as a fresh store -- opendir fails with something other than ENOENT.
+    const auto rootFile = testDir / "not_a_directory";
+    { std::ofstream(rootFile) << "x"; }
+
+    ShardStoreStartup startup{StorageLayout(rootFile)};
+    const auto inspection = startup.inspect(2);
+    EXPECT_EQ(inspection.status, ShardStoreStartupStatus::InvalidMetadata);
+    EXPECT_FALSE(inspection.canStart());
+}
+
+TEST_F(ShardStoreStartupTest, UnreadableRebalanceStateStillFailsClosed) {
+    if (::geteuid() == 0)
+        GTEST_SKIP() << "an unreadable-file test is meaningless when running as root";
+    createShards(2);
+    writeFile("shard_count.meta", "2\n");
+    writeFile("rebalance.state", "1 2 4\n");
+    // Presence, not readability, must trigger the fail-closed refusal.
+    ASSERT_EQ(::chmod((testDir / "rebalance.state").c_str(), 0), 0);
+
+    const auto inspection = inspect(2);
+    ::chmod((testDir / "rebalance.state").c_str(), 0644);  // restore so TearDown can clean up
+
+    EXPECT_EQ(inspection.status, ShardStoreStartupStatus::InterruptedLegacyRebalance);
+    EXPECT_FALSE(inspection.canStart());
 }
 
 TEST_F(ShardStoreStartupTest, InterruptedRebalanceStateFileFailsClosed) {

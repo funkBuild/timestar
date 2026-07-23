@@ -32,6 +32,11 @@ fs::path StorageLayout::normalizeRoot(fs::path root) {
     auto normalized = root.lexically_normal();
     while (normalized != normalized.root_path() && normalized.filename().empty())
         normalized = normalized.parent_path();
+    // A bare "//" is an implementation-defined POSIX root that may name a
+    // different path than "/". The configured-root helper (dataRootPath)
+    // collapses it to "/", so match that here to keep the two in agreement.
+    if (normalized.native() == "//")
+        normalized = fs::path("/");
     return normalized;
 }
 

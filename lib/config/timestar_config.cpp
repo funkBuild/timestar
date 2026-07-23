@@ -42,21 +42,6 @@ std::string dataRootPath() {
     return dir;
 }
 
-std::string shardDataPath(unsigned shardId) {
-    std::string root = dataRootPath();
-    std::string shardDir = "shard_" + std::to_string(shardId);
-    if (root == ".") {
-        // Legacy behavior: paths relative to the working directory,
-        // without a "./" prefix (matches on-disk strings used before
-        // data_dir was wired through).
-        return shardDir;
-    }
-    if (root.back() == '/') {  // root == "/"
-        return root + shardDir;
-    }
-    return root + "/" + shardDir;
-}
-
 std::vector<std::string> TimestarConfig::validate() const {
     std::vector<std::string> errors;
 

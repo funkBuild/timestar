@@ -1,10 +1,32 @@
 # Cluster Starting Point: Storage Layout Foundation
 
-**Status:** Completed on `cluster-design`, with two tracked residuals:
-`bin/timestar_benchmark.cpp` still constructs `StorageLayout(".")` rather than
-the configured root, and the non-default-root restart test runs at Engine
-granularity (`test/unit/core/data_dir_test.cpp`) rather than as a full
-server-process restart.
+**Status:** Completed on `cluster-design` (re-implemented against current `main`
+after the original injection branch was discarded in a merge). Tracked
+residuals — deliberate, reviewed deferrals rather than omissions:
+
+- **Deep NativeIndex validation is deferred to Task 4a.** The startup gate makes
+  the core-count safety decision (fresh / matching / unsafe-change / interrupted
+  rebalance / invalid-metadata), cross-checks `shard_count.meta` against the
+  shard directories, and fails closed on any scan/read I/O error. It does **not**
+  yet decode each shard's NativeIndex manifest (framing/CRC) or verify referenced
+  SSTables exist at their committed size — Step 1's "fully decoded manifest"
+  clause. The parent plan reassigns metadata-reconstructability to the Task 4a
+  series catalog ("the Task 4a series catalog owns this; until then the startup
+  gate prevents discarding"), and the implemented core-count gate is the
+  "prevents discarding" part. Note: `Manifest::open` currently truncates a
+  torn/bad-CRC tail on its own, so a bit-rotted manifest is a residual
+  data-availability risk this gate does not yet catch.
+- **Root inode-binding is not implemented.** Step 1 asks for descriptor-relative
+  (`openat`) inspection that verifies the configured path still names the locked
+  inode across inspect→commit. The gate instead relies on the process-lifetime
+  advisory `DataDirLock` (a `flock` on `<root>/.lock`) acquired before it runs;
+  a root swap during the startup window is not detected.
+- The non-default-root restart test runs at Engine granularity
+  (`test/unit/core/data_dir_test.cpp`, `test/integration/data_dir_restart_test.cpp`)
+  rather than as a full server-process restart.
+
+(The earlier `bin/timestar_benchmark.cpp` `StorageLayout(".")` residual is
+resolved — it now derives its layout from the configured `data_dir`.)
 
 **Parent design:** [Cluster Architecture and Implementation Plan](clustering.md)
 
