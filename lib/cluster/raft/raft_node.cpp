@@ -205,8 +205,11 @@ void RaftNode::sendInstallSnapshot(NodeId peer) {
 }
 
 void RaftNode::compact(LogIndex upto, std::string snapshotData) {
-    if (upto > commitIndex_)
-        upto = commitIndex_;  // never compact past what is committed
+    // Never compact past applied state: the snapshot payload must reflect what the
+    // state machine has actually applied, and lastApplied_ <= commitIndex_ always,
+    // so this is the safe (and more defensive) bound.
+    if (upto > lastApplied_)
+        upto = lastApplied_;
     log_.compactTo(upto);
     snapshot_.index = log_.snapshotIndex();
     snapshot_.term = log_.snapshotTerm();
@@ -244,7 +247,11 @@ void RaftNode::handleInstallSnapshot(NodeId from, const InstallSnapshot& is) {
     snapshot_.data = is.data;
     commitIndex_ = std::max(commitIndex_, is.lastIncludedIndex);
     lastApplied_ = is.lastIncludedIndex;  // the snapshot IS the applied state
-    unstableStart_ = std::max(unstableStart_, log_.lastIndex() + 1);
+    // Only the snapshot boundary is now durable via the payload. Any retained
+    // tail ABOVE it (the keep-suffix path) is still unpersisted and MUST remain
+    // reportable -- advancing to lastIndex()+1 here would silently un-persist it
+    // (it is not in the snapshot payload), losing committed entries on restart.
+    unstableStart_ = std::max(unstableStart_, is.lastIncludedIndex + 1);
     pendingSnapshotApply_ = snapshot_;  // surface to the driver to install
 
     reply.matchIndex = is.lastIncludedIndex;

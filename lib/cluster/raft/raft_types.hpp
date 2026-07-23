@@ -20,12 +20,19 @@ inline constexpr NodeId kNoNode = 0;     // votedFor == none
 // terms. It transitions to Candidate only once a majority would grant a real vote.
 enum class Role : uint8_t { Follower, PreCandidate, Candidate, Leader };
 
-// One replicated log entry. `data` is an opaque command (a journal payload in
-// this system); Raft never interprets it. The (term, index) pair is what the
-// consensus invariants are stated over.
+// Normal entries carry an opaque application command; ConfigChange entries carry
+// a serialized Config (§6 membership change) that Raft DOES interpret -- a
+// replica's active configuration is the latest ConfigChange in its log, applied
+// as soon as it is appended (not when committed).
+enum class EntryType : uint8_t { Normal = 0, ConfigChange = 1 };
+
+// One replicated log entry. For Normal entries `data` is opaque to Raft; for
+// ConfigChange entries it is a serialized Config. The (term, index) pair is what
+// the consensus invariants are stated over.
 struct LogEntry {
     Term term = kNoTerm;
     LogIndex index = kNoIndex;
+    EntryType type = EntryType::Normal;
     std::string data;
 
     friend bool operator==(const LogEntry&, const LogEntry&) = default;

@@ -300,6 +300,46 @@ TEST(RaftNodeTest, FollowerInstallsSnapshotAheadOfItsLog) {
     EXPECT_EQ(n.commitIndex(), 6u);
 }
 
+TEST(RaftNodeTest, KeepSuffixInstallStillPersistsPendingTail) {
+    // Regression: a snapshot that keeps a suffix must NOT advance the persistence
+    // watermark past retained tail entries -- they are not in the snapshot payload
+    // and would be silently lost on restart otherwise.
+    RaftNode n(1, {1, 2, 3}, RaftLog{}, HardState{}, fixedTimeout(10));
+    AppendEntries ae;
+    ae.term = 1;
+    ae.leaderId = 2;
+    ae.prevLogIndex = 0;
+    ae.prevLogTerm = 0;
+    for (int i = 0; i < 5; ++i) {
+        LogEntry e;
+        e.term = 1;
+        e.data = "e" + std::to_string(i + 1);
+        ae.entries.push_back(e);
+    }
+    ae.leaderCommit = 0;  // nothing committed yet
+    n.step(Message{.to = 1, .from = 2, .payload = ae});
+    // Deliberately do NOT drain: entries 1..5 are pending persistence.
+
+    InstallSnapshot is;
+    is.term = 1;
+    is.leaderId = 2;
+    is.lastIncludedIndex = 3;
+    is.lastIncludedTerm = 1;  // matches our entry 3 -> keep-suffix path
+    is.data = "snap@3";
+    n.step(Message{.to = 1, .from = 2, .payload = is});
+
+    ASSERT_EQ(n.log().snapshotIndex(), 3u);
+    ASSERT_EQ(n.log().lastIndex(), 5u);  // entries 4,5 retained
+
+    RaftNode::Ready rd = n.ready();
+    ASSERT_TRUE(rd.snapshot.has_value());
+    // The retained tail (4,5) MUST still be surfaced for persistence.
+    ASSERT_EQ(rd.entries.size(), 2u);
+    EXPECT_EQ(rd.entries[0].index, 4u);
+    EXPECT_EQ(rd.entries[0].data, "e4");
+    EXPECT_EQ(rd.entries[1].index, 5u);
+}
+
 TEST(RaftNodeTest, StaleSnapshotIsIgnored) {
     // A snapshot at or below our commit is already covered; we keep our log.
     RaftNode n(1, {1, 2, 3}, logOfTerms({1, 1, 1}), HardState{1, kNoNode}, fixedTimeout(10));
