@@ -125,7 +125,7 @@ seastar::future<> JournalWriter::dmaWriteBuffer(uint64_t offset, seastar::tempor
     size_t remaining = buf.size();
     while (remaining > 0) {
         const size_t n = co_await file_.dma_write(pos, buf.get(), remaining);
-        if (n == 0 || (n & (alignment_ - 1)) != 0)
+        if (n == 0 || n > remaining || (n & (alignment_ - 1)) != 0)
             throw std::runtime_error("journal dma_write returned an unaligned/short count");
         pos += n;
         remaining -= n;
