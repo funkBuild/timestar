@@ -4,8 +4,10 @@
 #include "key_encoding.hpp"
 #include "logger.hpp"
 #include "logging_config.hpp"
+#include "migrate_vshard.hpp"
 #include "placement_table.hpp"
 #include "query_runner.hpp"
+#include "restore_vshard.hpp"
 #include "series_key.hpp"
 #include "tsm_compactor.hpp"
 #include "tsm_writer.hpp"
@@ -172,6 +174,51 @@ seastar::future<timestar::VShardSnapshotManifest> Engine::createVShardSnapshot(t
     timestar::VShardSnapshotBuilder builder(vshard);
     co_await timestar::feedVShardResolvedView(vshard, files, builder);
     co_return builder.build(extents, std::move(catalogHash));
+}
+
+namespace {
+// Open a TSM file by path (its ctor parses tier/seq from the filename, so
+// dataRank ordering is correct) and load its sparse index.
+seastar::future<seastar::shared_ptr<::TSM>> openTsmForVShardOp(std::string path) {
+    auto tsm = seastar::make_shared<::TSM>(path);
+    co_await tsm->open();
+    co_await tsm->readSparseIndex();
+    co_return tsm;
+}
+}  // namespace
+
+seastar::future<bool> Engine::restoreVShardSnapshot(const timestar::VShardSnapshotManifest& manifest,
+                                                    std::vector<std::string> sourcePaths,
+                                                    std::vector<std::string> targetNames) {
+    if (sourcePaths.size() != targetNames.size())
+        throw std::invalid_argument("Engine::restoreVShardSnapshot: sourcePaths/targetNames size mismatch");
+
+    std::vector<seastar::shared_ptr<::TSM>> files;
+    for (auto& p : sourcePaths)
+        files.push_back(co_await openTsmForVShardOp(std::move(p)));
+
+    std::vector<std::string> targets;
+    targets.reserve(targetNames.size());
+    for (const auto& name : targetNames)
+        targets.push_back((layout_.tsmDir(shardId) / name).string());
+
+    const bool ok = co_await timestar::restoreVShardSnapshot(manifest, files, std::move(targets));
+    for (const auto& f : files)
+        co_await f->close();
+    co_return ok;
+}
+
+seastar::future<size_t> Engine::migrateVShard(timestar::VShardId vshard, std::vector<std::string> sourcePaths,
+                                              std::string outputName) {
+    std::vector<seastar::shared_ptr<::TSM>> files;
+    for (auto& p : sourcePaths)
+        files.push_back(co_await openTsmForVShardOp(std::move(p)));
+
+    const std::string out = (layout_.tsmDir(shardId) / outputName).string();
+    const size_t n = co_await timestar::migrateVShardToFile(vshard, files, out);
+    for (const auto& f : files)
+        co_await f->close();
+    co_return n;
 }
 
 void Engine::restoreRevisionCounter() {

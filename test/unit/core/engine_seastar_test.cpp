@@ -5,6 +5,8 @@
 #include "../../../lib/core/placement_table.hpp"
 #include "../../../lib/core/series_id.hpp"
 #include "../../../lib/core/timestar_value.hpp"
+#include "../../../lib/storage/tsm_result.hpp"
+#include "../../../lib/storage/tsm_writer.hpp"
 #include "../../test_helpers.hpp"
 
 #include <gtest/gtest.h>
@@ -1150,6 +1152,47 @@ TEST_F(EngineSeastarTest, CreateVShardSnapshotFromFlushedData) {
         EXPECT_EQ(manifest.verificationHash.size(), 32u);
         EXPECT_FALSE(manifest.dataExtents.empty()) << "the flushed file must appear as a data extent";
         EXPECT_GT(manifest.snapshotRevision, 0u) << "assigned revisions must survive into the snapshot watermark";
+    })
+        .join()
+        .get();
+}
+
+// Engine-level migration: legacy TSM files -> a VShard-pure file in this shard's
+// tsm dir at the migrated floor (Task 6 lifecycle wiring).
+TEST_F(EngineSeastarTest, MigrateVShardViaEngine) {
+    seastar::thread([] {
+        fs::remove_all("legacy_src");
+        fs::create_directories("legacy_src");
+        const std::string key = "leg,host=h1 v";
+        const auto s = SeriesId128::fromSeriesKey(key);
+        const timestar::VShardId vshard{timestar::virtualShard(s)};
+        {
+            TSMWriter w("legacy_src/00_0000000000.tsm");
+            std::vector<uint64_t> ts = {100, 200};
+            std::vector<double> vs = {1.0, 2.0};
+            w.writeSeries(TSMValueType::Float, s, ts, vs);
+            w.writeIndex();
+            w.close();
+        }
+
+        ScopedEngine eng;
+        eng.init();
+        const size_t n =
+            eng->migrateVShard(vshard, {std::string("legacy_src/00_0000000000.tsm")}, "09_0000000000.tsm").get();
+        EXPECT_EQ(n, 1u);
+
+        // The migrated file lands in the engine's tsm dir at the migrated floor.
+        auto out = seastar::make_shared<::TSM>("shard_0/tsm/09_0000000000.tsm");
+        out->open().get();
+        out->readSparseIndex().get();
+        EXPECT_EQ(out->maxRevision(), 0u) << "migrated data sits at the migrated floor";
+        TSMResult<double> r(0);
+        out->readSeries<double>(s, 0, UINT64_MAX, r).get();
+        auto [rts, rvs] = r.getAllData();
+        EXPECT_EQ(rts, (std::vector<uint64_t>{100, 200}));
+        EXPECT_EQ(rvs, (std::vector<double>{1.0, 2.0}));
+        out->close().get();
+        fs::remove_all("legacy_src");
     })
         .join()
         .get();

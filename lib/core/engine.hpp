@@ -186,6 +186,20 @@ public:
     seastar::future<timestar::VShardSnapshotManifest> createVShardSnapshot(timestar::VShardId vshard,
                                                                            std::string catalogHash);
 
+    // Restore a VShard snapshot into this shard (Task 4d lifecycle): open the
+    // `sourcePaths`, verify them against `manifest`, and -- only on match --
+    // install them all-or-nothing into this shard's tsm dir under `targetNames`.
+    // Returns true iff installed. sourcePaths/targetNames must be equal length.
+    seastar::future<bool> restoreVShardSnapshot(const timestar::VShardSnapshotManifest& manifest,
+                                                std::vector<std::string> sourcePaths,
+                                                std::vector<std::string> targetNames);
+
+    // Migrate a VShard's data from legacy `sourcePaths` into a VShard-pure file
+    // `outputName` in this shard's tsm dir at the migrated floor (Task 6). Returns
+    // the number of series written.
+    seastar::future<size_t> migrateVShard(timestar::VShardId vshard, std::vector<std::string> sourcePaths,
+                                          std::string outputName);
+
     // Enable/disable per-point replicated revision assignment (cluster LWW).
     // Off by default; the server turns it on when cluster mode is configured.
     void setRevisionAssignment(bool on) { assignRevisions_ = on; }
