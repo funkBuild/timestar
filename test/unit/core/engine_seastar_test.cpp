@@ -1197,3 +1197,37 @@ TEST_F(EngineSeastarTest, MigrateVShardViaEngine) {
         .join()
         .get();
 }
+
+// Engine-level VShard-partitioned compaction: flushed data repartitioned into
+// VShard-pure files (Task 4c lifecycle wiring).
+TEST_F(EngineSeastarTest, RepartitionByVShardViaEngine) {
+    seastar::thread([] {
+        ScopedEngine eng;
+        eng.init();
+
+        for (const char* host : {"a", "b", "c"}) {
+            TimeStarInsert<double> ins("part", "value");
+            ins.addTag("host", host);
+            ins.addValue(1000, 1.0);
+            ins.addValue(2000, 2.0);
+            eng->insert(std::move(ins)).get();
+        }
+        eng->rolloverMemoryStore().get();
+        for (int i = 0; i < 300 && eng->getTSMFileCount() == 0; ++i)
+            seastar::sleep(std::chrono::milliseconds(100)).get();
+        ASSERT_GT(eng->getTSMFileCount(), 0u);
+
+        auto parts = eng->repartitionByVShard().get();
+        EXPECT_FALSE(parts.empty()) << "repartition must produce at least one VShard-pure file";
+        for (const auto& [vs, path] : parts) {
+            auto tsm = seastar::make_shared<::TSM>(path);
+            tsm->open().get();
+            tsm->readSparseIndex().get();
+            for (const auto& sid : tsm->getSeriesIds())
+                EXPECT_EQ(timestar::virtualShard(sid), vs.value()) << "partition output must be VShard-pure";
+            tsm->close().get();
+        }
+    })
+        .join()
+        .get();
+}

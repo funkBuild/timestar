@@ -1,6 +1,7 @@
 #include "engine.hpp"
 
 #include "aggregator.hpp"
+#include "compact_vshard.hpp"
 #include "key_encoding.hpp"
 #include "logger.hpp"
 #include "logging_config.hpp"
@@ -20,6 +21,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <filesystem>
 #include <ranges>
 #include <seastar/core/reactor.hh>
@@ -219,6 +221,21 @@ seastar::future<size_t> Engine::migrateVShard(timestar::VShardId vshard, std::ve
     for (const auto& f : files)
         co_await f->close();
     co_return n;
+}
+
+seastar::future<std::vector<std::pair<timestar::VShardId, std::string>>> Engine::repartitionByVShard() {
+    std::vector<seastar::shared_ptr<::TSM>> files;
+    for (const auto& [rank, file] : tsmFileManager.getSequencedTsmFiles()) {
+        if (file)
+            files.push_back(file);
+    }
+    const auto tsmDir = layout_.tsmDir(shardId);
+    auto pathFor = [tsmDir](timestar::VShardId vs) {
+        char name[64];
+        std::snprintf(name, sizeof(name), "09_%010u.tsm", static_cast<unsigned>(vs.value()));
+        return (tsmDir / name).string();
+    };
+    co_return co_await timestar::partitionByVShard(std::move(files), pathFor);
 }
 
 void Engine::restoreRevisionCounter() {
