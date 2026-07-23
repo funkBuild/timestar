@@ -21,12 +21,17 @@ RaftGroup* RaftGroupRegistry::group(uint16_t groupId) {
 }
 
 seastar::future<> RaftGroupRegistry::deliver(Envelope env) {
-    if (stopping_)
+    if (stopping_ || gate_.is_closed())
         return seastar::make_ready_future<>();
     auto it = groups_.find(env.groupId);
     if (it == groups_.end())
         return seastar::make_ready_future<>();  // no such group here; drop
-    return it->second->step(std::move(env.message));
+    // Run the step under the gate so stop()'s gate.close() waits for it -- the
+    // group must not be destroyed while a delivery is mid-flight in its step().
+    RaftGroup* g = it->second.get();
+    return seastar::with_gate(gate_, [g, m = std::move(env.message)]() mutable {
+        return g->step(std::move(m));
+    });
 }
 
 void RaftGroupRegistry::startTicking() {

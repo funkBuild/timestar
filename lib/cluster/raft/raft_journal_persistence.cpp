@@ -22,7 +22,7 @@ uint64_t getU64(const char* p) {
     return v;
 }
 
-// Snapshot payload: [index u64][term u64][configLen u32][config bytes][data...].
+// Snapshot payload: [index u64][term u64][configLen u64][config bytes][data...].
 std::string encodeSnapshotPayload(const Snapshot& s) {
     std::string out;
     putU64(out, s.index);
@@ -32,6 +32,23 @@ std::string encodeSnapshotPayload(const Snapshot& s) {
     out += cfg;
     out += s.data;
     return out;
+}
+
+// Inverse of encodeSnapshotPayload. Returns nullopt on any malformed/truncated
+// payload (fail closed). `index`/`term` are taken from the record header by the
+// caller and cross-checked against the payload.
+std::optional<Snapshot> decodeSnapshotPayload(const std::string& p) {
+    if (p.size() < 24)
+        return std::nullopt;  // index + term + configLen
+    Snapshot s;
+    s.index = getU64(p.data());
+    s.term = getU64(p.data() + 8);
+    const uint64_t cfgLen = getU64(p.data() + 16);
+    if (24 + cfgLen > p.size())
+        return std::nullopt;
+    s.config = decodeConfig(p.substr(24, cfgLen));
+    s.data = p.substr(24 + cfgLen);
+    return s;
 }
 
 }  // namespace
@@ -122,12 +139,24 @@ RecoveredRaftState recoverRaftState(const std::vector<JournalRecord>& records, V
                 }
                 break;
             }
-            case JournalRecordKind::Snapshot:
+            case JournalRecordKind::Snapshot: {
                 snapIndex = r->raftIndex;
                 snapTerm = r->raftTerm;
+                // Decode the full snapshot (config + state-machine data), not just
+                // the header -- the boundary membership and applied state live
+                // only here once their entries are compacted away.
+                if (auto snap = decodeSnapshotPayload(r->payload))
+                    out.snapshot = std::move(*snap);
+                else {
+                    Snapshot s;  // fall back to header-only if the payload is bad
+                    s.index = snapIndex;
+                    s.term = snapTerm;
+                    out.snapshot = std::move(s);
+                }
                 // Entries at or below the snapshot boundary are compacted away.
                 entries.erase(entries.begin(), entries.upper_bound(snapIndex));
                 break;
+            }
             default:
                 break;  // CatalogCreate/Retention are not Raft state
         }

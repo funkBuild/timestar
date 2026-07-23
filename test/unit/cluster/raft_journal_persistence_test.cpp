@@ -151,6 +151,13 @@ seastar::future<> testSnapshotRecover() {
         EXPECT_EQ(st.log.snapshotTerm(), 2u);
         EXPECT_EQ(st.log.firstIndex(), 6u);
         EXPECT_EQ(st.log.lastIndex(), 6u);
+        // The snapshot's config AND state-machine data must survive recovery.
+        EXPECT_TRUE(st.snapshot.has_value());
+        if (st.snapshot) {
+            EXPECT_EQ(st.snapshot->index, 5u);
+            EXPECT_EQ(st.snapshot->config.voters, (std::vector<NodeId>{1, 2, 3}));
+            EXPECT_EQ(st.snapshot->data, "state@5");
+        }
         auto tail = st.log.entriesFrom(6);
         EXPECT_EQ(tail.size(), 1u);
         if (tail.size() == 1u)

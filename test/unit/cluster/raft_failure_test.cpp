@@ -119,7 +119,15 @@ struct NodeBox {
         RecoveredRaftState st = recoverRaftState(recovered, VShardId{1});
         persistence = std::make_unique<JournalRaftPersistence>(*writer, VShardId{1}, st.nextSeq);
         sm = std::make_unique<RecordingSM>();
-        RaftNode node(id, voters, std::move(st.log), st.hardState, opts);
+        // A recovered snapshot supplies the base membership + the applied state.
+        std::vector<NodeId> baseVoters = voters;
+        std::vector<NodeId> baseLearners;
+        if (st.snapshot) {
+            baseVoters = st.snapshot->config.voters;
+            baseLearners = st.snapshot->config.learners;
+            co_await sm->applySnapshot(*st.snapshot);
+        }
+        RaftNode node(id, baseVoters, std::move(st.log), st.hardState, opts, baseLearners);
         group = std::make_unique<RaftGroup>(1, std::move(node), *persistence, *transport, *sm);
         router->setGroup(id, group.get());
     }

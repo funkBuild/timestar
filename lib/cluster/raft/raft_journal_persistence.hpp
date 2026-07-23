@@ -8,6 +8,7 @@
 #include "raft_types.hpp"
 
 #include <cstdint>
+#include <optional>
 #include <seastar/core/future.hh>
 #include <vector>
 
@@ -46,6 +47,11 @@ private:
 struct RecoveredRaftState {
     HardState hardState;
     RaftLog log;
+    // If the log was compacted, the snapshot at its boundary. The caller must
+    // apply snapshot->data to its state machine AND pass snapshot->config as the
+    // RaftNode's base config (the membership as of the boundary lives ONLY here
+    // once its ConfigChange entries are compacted away).
+    std::optional<Snapshot> snapshot;
     uint64_t nextSeq = 1;  // resume point for a new JournalRaftPersistence
 };
 
