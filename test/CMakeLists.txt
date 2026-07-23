@@ -33,6 +33,15 @@ file(GLOB_RECURSE UNIT_FUZZ_TESTS CONFIGURE_DEPENDS unit/fuzz/*.cpp)
 # link timestar_proto so these TUs can include timestar.pb.h.
 file(GLOB_RECURSE UNIT_CORE_TESTS CONFIGURE_DEPENDS unit/core/*.cpp)
 file(GLOB_RECURSE UNIT_CLUSTER_TESTS CONFIGURE_DEPENDS unit/cluster/*.cpp)
+# The real-socket cluster tests (seastar::rpc over loopback) are split into their
+# own executable: real sockets do not coexist with the thousands of other tests
+# in one gtest process (accumulated fds/reactor state make loopback bind/connect
+# hang late in the run). They still run in CI as a separate binary.
+set(UNIT_CLUSTER_SOCKET_TESTS
+    ${CMAKE_CURRENT_SOURCE_DIR}/unit/cluster/raft_rpc_transport_test.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/unit/cluster/raft_group_registry_test.cpp
+)
+list(REMOVE_ITEM UNIT_CLUSTER_TESTS ${UNIT_CLUSTER_SOCKET_TESTS})
 file(GLOB_RECURSE UNIT_RETENTION_TESTS CONFIGURE_DEPENDS unit/retention/*.cpp)
 file(GLOB_RECURSE UNIT_UTILS_TESTS CONFIGURE_DEPENDS unit/utils/*.cpp)
 file(GLOB_RECURSE INTEGRATION_TESTS CONFIGURE_DEPENDS integration/*.cpp)
@@ -147,6 +156,13 @@ target_link_libraries(timestar_unit_test libtimestar libtimestar_proto_conv time
 target_include_directories(timestar_unit_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_definitions(timestar_unit_test PRIVATE ${SOURCE_INSPECTION_DEFS})
 gtest_discover_tests(timestar_unit_test DISCOVERY_TIMEOUT 120)
+
+# Real-socket cluster tests, in their own process (see the split above).
+add_executable(timestar_cluster_socket_test main.cpp ${UNIT_CLUSTER_SOCKET_TESTS})
+target_link_libraries(timestar_cluster_socket_test libtimestar libtimestar_proto_conv timestar_proto gtest_main)
+target_include_directories(timestar_cluster_socket_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_definitions(timestar_cluster_socket_test PRIVATE ${SOURCE_INSPECTION_DEFS})
+gtest_discover_tests(timestar_cluster_socket_test DISCOVERY_TIMEOUT 120)
 
 # Integration tests only
 if(INTEGRATION_TESTS)
