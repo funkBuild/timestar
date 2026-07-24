@@ -149,7 +149,7 @@ EXPOSE 8086
 ENV TIMESTAR_OVERPROVISIONED=true
 
 HEALTHCHECK --interval=10s --timeout=5s --start-period=30s --retries=3 \
-    CMD wget -q --spider http://localhost:8086/health || exit 1
+    CMD wget -q -O /dev/null http://127.0.0.1:8086/health || exit 1
 
 USER timestar
 
