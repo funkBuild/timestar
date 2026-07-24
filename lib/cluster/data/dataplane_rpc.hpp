@@ -56,6 +56,18 @@ public:
     // the transport.
     void setProposeSink(ProposeSink& sink);
 
+    // The leader-reach target incoming leaderReadIndex/leaderCommitIndex RPCs dispatch
+    // into (M4 replica reads). Must be set before a peer sends them; outlives the
+    // transport.
+    void setReadIndexSink(ReadIndexSink& sink);
+
+    // M4 replica-read leader-reach client calls: confirm a linearizable ReadIndex /
+    // fetch the commit index for `vshard` at peer `to` (which must be its leader). The
+    // peer's rejection (not-leader / not-hosted / no-quorum) propagates as a thrown
+    // exception -- the caller treats it as a partition/redirect, never a stale value.
+    seastar::future<raft::LogIndex> leaderReadIndex(NodeId to, uint16_t vshard);
+    seastar::future<raft::LogIndex> leaderCommitIndex(NodeId to, uint16_t vshard);
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

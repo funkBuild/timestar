@@ -8,7 +8,9 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <optional>
 #include <seastar/core/coroutine.hh>
+#include <seastar/core/future-util.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/sstring.hh>
 #include <seastar/net/api.hh>
@@ -42,6 +44,32 @@ constexpr uint64_t kForwardWriteBatch = 3;  // sstring -> sstring (enriched Writ
 constexpr uint64_t kQueryNode = 4;          // sstring -> sstring (enriched NodeQueryRequest, waited: partial)
 constexpr uint64_t kQueryMetadata = 5;      // sstring -> sstring (MetadataRequest, waited: MetadataResult)
 constexpr uint64_t kProposeWrite = 6;       // sstring -> sstring (WriteBatch, waited: "1"/"0" committed)
+constexpr uint64_t kLeaderReadIndex = 7;    // sstring(u16 vshard) -> sstring(u64 readIndex); throws if not leader
+constexpr uint64_t kLeaderCommitIndex = 8;  // sstring(u16 vshard) -> sstring(u64 commitIndex); throws if not leader
+
+seastar::sstring encU16(uint16_t v) {
+    char b[2] = {static_cast<char>(v & 0xff), static_cast<char>((v >> 8) & 0xff)};
+    return seastar::sstring(b, 2);
+}
+std::optional<uint16_t> decU16(const seastar::sstring& s) {
+    if (s.size() != 2)
+        return std::nullopt;
+    return static_cast<uint16_t>(static_cast<uint8_t>(s[0]) | (static_cast<uint16_t>(static_cast<uint8_t>(s[1])) << 8));
+}
+seastar::sstring encU64(uint64_t v) {
+    char b[8];
+    for (int i = 0; i < 8; ++i)
+        b[i] = static_cast<char>((v >> (8 * i)) & 0xff);
+    return seastar::sstring(b, 8);
+}
+std::optional<uint64_t> decU64(const seastar::sstring& s) {
+    if (s.size() != 8)
+        return std::nullopt;
+    uint64_t v = 0;
+    for (int i = 0; i < 8; ++i)
+        v |= static_cast<uint64_t>(static_cast<uint8_t>(s[i])) << (8 * i);
+    return v;
+}
 
 }  // namespace
 
@@ -53,7 +81,8 @@ struct DataPlaneRpc::Impl {
     std::map<NodeId, std::unique_ptr<Client>> clients;
     LocalStore* sink = nullptr;         // legacy DataPoint path
     NodeStore* nodeSink = nullptr;      // enriched WriteBatch path (F.4)
-    ProposeSink* proposeSink = nullptr;  // RF=3 Raft propose target (M3)
+    ProposeSink* proposeSink = nullptr;      // RF=3 Raft propose target (M3)
+    ReadIndexSink* readIndexSink = nullptr;  // replica-read leader-reach target (M4)
     bool stopping = false;
     // Client stubs are created ONCE (a stub allocated per concurrent call can
     // corrupt reply routing / message-id bookkeeping). Reused for every call.
@@ -63,6 +92,8 @@ struct DataPlaneRpc::Impl {
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> queryNodeStub;
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> queryMetadataStub;
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> proposeWriteStub;
+    std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> leaderReadIndexStub;
+    std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> leaderCommitIndexStub;
 
     seastar::rpc::protocol<DpSerializer>::client* clientFor(NodeId to) {
         if (auto it = clients.find(to); it != clients.end())
@@ -86,6 +117,8 @@ struct DataPlaneRpc::Impl {
         queryNodeStub = proto.make_client<seastar::sstring(seastar::sstring)>(kQueryNode);
         queryMetadataStub = proto.make_client<seastar::sstring(seastar::sstring)>(kQueryMetadata);
         proposeWriteStub = proto.make_client<seastar::sstring(seastar::sstring)>(kProposeWrite);
+        leaderReadIndexStub = proto.make_client<seastar::sstring(seastar::sstring)>(kLeaderReadIndex);
+        leaderCommitIndexStub = proto.make_client<seastar::sstring(seastar::sstring)>(kLeaderCommitIndex);
     }
 
     // Pin the listening socket to THIS shard. seastar's default listen policy
@@ -192,6 +225,31 @@ seastar::future<> DataPlaneRpc::start(seastar::socket_address local, NodeStore& 
             return seastar::sstring(ok ? "1" : "0");
         });
     });
+    impl_->proto.register_handler(kLeaderReadIndex, [this](seastar::sstring data) {
+        if (!impl_->readIndexSink)
+            return seastar::make_exception_future<seastar::sstring>(
+                std::runtime_error("dataplane: no read-index sink (node not RF>1)"));
+        auto vs = decU16(data);
+        if (!vs)
+            return seastar::make_exception_future<seastar::sstring>(
+                std::runtime_error("dataplane: malformed leaderReadIndex request"));
+        // futurize_invoke turns a SYNCHRONOUS throw (not-hosted) into an exceptional
+        // future, so a reject reaches the client the same way a non-leader readBarrier
+        // rejection does.
+        return seastar::futurize_invoke([this, vs = *vs] { return impl_->readIndexSink->leaderReadIndex(vs); })
+            .then([](raft::LogIndex idx) { return encU64(idx); });
+    });
+    impl_->proto.register_handler(kLeaderCommitIndex, [this](seastar::sstring data) {
+        if (!impl_->readIndexSink)
+            return seastar::make_exception_future<seastar::sstring>(
+                std::runtime_error("dataplane: no read-index sink (node not RF>1)"));
+        auto vs = decU16(data);
+        if (!vs)
+            return seastar::make_exception_future<seastar::sstring>(
+                std::runtime_error("dataplane: malformed leaderCommitIndex request"));
+        return seastar::futurize_invoke([this, vs = *vs] { return impl_->readIndexSink->leaderCommitIndex(vs); })
+            .then([](raft::LogIndex idx) { return encU64(idx); });
+    });
     impl_->makeStubs();
     impl_->listenServer(local);
     return seastar::make_ready_future<>();
@@ -199,6 +257,36 @@ seastar::future<> DataPlaneRpc::start(seastar::socket_address local, NodeStore& 
 
 void DataPlaneRpc::setProposeSink(ProposeSink& sink) {
     impl_->proposeSink = &sink;
+}
+
+void DataPlaneRpc::setReadIndexSink(ReadIndexSink& sink) {
+    impl_->readIndexSink = &sink;
+}
+
+seastar::future<raft::LogIndex> DataPlaneRpc::leaderReadIndex(NodeId to, uint16_t vshard) {
+    if (impl_->stopping)
+        throw std::runtime_error("dataplane: shutting down");
+    auto* conn = impl_->clientFor(to);
+    if (!conn)
+        throw std::runtime_error("dataplane: unknown peer");
+    seastar::sstring reply = co_await impl_->leaderReadIndexStub(*conn, encU16(vshard));
+    auto idx = decU64(reply);
+    if (!idx)
+        throw std::runtime_error("dataplane: malformed leaderReadIndex reply");
+    co_return *idx;
+}
+
+seastar::future<raft::LogIndex> DataPlaneRpc::leaderCommitIndex(NodeId to, uint16_t vshard) {
+    if (impl_->stopping)
+        throw std::runtime_error("dataplane: shutting down");
+    auto* conn = impl_->clientFor(to);
+    if (!conn)
+        throw std::runtime_error("dataplane: unknown peer");
+    seastar::sstring reply = co_await impl_->leaderCommitIndexStub(*conn, encU16(vshard));
+    auto idx = decU64(reply);
+    if (!idx)
+        throw std::runtime_error("dataplane: malformed leaderCommitIndex reply");
+    co_return *idx;
 }
 
 seastar::future<> DataPlaneRpc::forwardWrites(NodeId to, std::vector<DataPoint> points) {

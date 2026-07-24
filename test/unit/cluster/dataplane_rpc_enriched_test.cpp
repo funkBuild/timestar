@@ -106,6 +106,29 @@ data::WriteBatch oneFloatBatch() {
         series("m", {{"host", "h1"}}, "v", TSMValueType::Float, {BASE}, std::vector<double>{1.0}));
     return b;
 }
+
+// A ReadIndexSink double: returns configured indices, or rejects (as a non-leader
+// would) when asked. Records the VShard it was asked about.
+class RecordingReadIndexSink : public data::ReadIndexSink {
+public:
+    raft::LogIndex readIdx = 0;
+    raft::LogIndex commitIdx = 0;
+    bool rejectRead = false;
+    bool rejectCommit = false;
+    uint16_t lastVshard = 0xffff;
+    seastar::future<raft::LogIndex> leaderReadIndex(uint16_t vs) override {
+        lastVshard = vs;
+        if (rejectRead)
+            return seastar::make_exception_future<raft::LogIndex>(std::runtime_error("not leader"));
+        return seastar::make_ready_future<raft::LogIndex>(readIdx);
+    }
+    seastar::future<raft::LogIndex> leaderCommitIndex(uint16_t vs) override {
+        lastVshard = vs;
+        if (rejectCommit)
+            return seastar::make_exception_future<raft::LogIndex>(std::runtime_error("not leader"));
+        return seastar::make_ready_future<raft::LogIndex>(commitIdx);
+    }
+};
 }  // namespace
 
 TEST_F(DataPlaneRpcEnrichedTest, WriteBatchAndQueryNodeOverRealSocket) {
@@ -264,6 +287,61 @@ TEST_F(DataPlaneRpcEnrichedTest, ProposeWriteForwardsToSinkAndReturnsResult) {
         EXPECT_FALSE(rpc.proposeWrite(self, oneFloatBatch()).get());
         EXPECT_EQ(propose.calls, 2);
 
+        rpc.stop().get();
+    }).get();
+}
+
+// M4: leaderReadIndex/leaderCommitIndex reach a peer's ReadIndexSink over the wire,
+// returning the index; a non-leader rejection propagates as a thrown exception (the
+// caller's partition/redirect signal, never a stale value).
+TEST_F(DataPlaneRpcEnrichedTest, LeaderReachVerbsForwardToSinkOverSocket) {
+    seastar::async([] {
+        const uint16_t port = 39317;
+        const data::NodeId self = 1;
+        ThrowingNodeStore sink;
+        RecordingReadIndexSink ri;
+        data::DataPlaneRpc rpc;
+        rpc.setReadIndexSink(ri);
+        rpc.start(loopback(port), sink).get();
+        rpc.addPeer(self, loopback(port));
+
+        ri.readIdx = 7;
+        ri.commitIdx = 9;
+        EXPECT_EQ(rpc.leaderReadIndex(self, 5).get(), 7u);
+        EXPECT_EQ(ri.lastVshard, 5u) << "the requested VShard reaches the sink";
+        EXPECT_EQ(rpc.leaderCommitIndex(self, 42).get(), 9u);
+        EXPECT_EQ(ri.lastVshard, 42u);
+
+        // A non-leader rejection surfaces as a throw on the client.
+        ri.rejectRead = true;
+        bool threw = false;
+        try {
+            rpc.leaderReadIndex(self, 5).get();
+        } catch (const std::exception&) {
+            threw = true;
+        }
+        EXPECT_TRUE(threw) << "a rejected read-index must throw, not return a stale value";
+
+        rpc.stop().get();
+    }).get();
+}
+
+// A node with NO read-index sink set fails leader-reach cleanly (fail-closed).
+TEST_F(DataPlaneRpcEnrichedTest, LeaderReachWithoutSinkFailsClosed) {
+    seastar::async([] {
+        const uint16_t port = 39318;
+        const data::NodeId self = 1;
+        ThrowingNodeStore sink;
+        data::DataPlaneRpc rpc;
+        rpc.start(loopback(port), sink).get();  // no setReadIndexSink
+        rpc.addPeer(self, loopback(port));
+        bool threw = false;
+        try {
+            rpc.leaderReadIndex(self, 5).get();
+        } catch (const std::exception&) {
+            threw = true;
+        }
+        EXPECT_TRUE(threw) << "leader-reach without a sink must fail, not hang/crash";
         rpc.stop().get();
     }).get();
 }
