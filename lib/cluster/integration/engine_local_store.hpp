@@ -3,6 +3,7 @@
 #include "../../core/engine.hpp"
 #include "../data/node_query.hpp"
 #include "../data/node_store.hpp"
+#include "../data/snapshot_payload.hpp"
 #include "../data/write_record.hpp"
 
 #include <cstdint>
@@ -35,6 +36,17 @@ public:
 
     seastar::future<bool> applyDelete(std::string seriesKey, uint64_t start, uint64_t end) override;
     seastar::future<> applyRetention(std::string measurement, uint64_t cutoff);
+
+    // Build a self-contained InstallSnapshot payload for one VShard (M3). Precondition:
+    // vshardsCohesiveOnCores(smp::count) -- a VShard's data must live entirely on
+    // assignCore(vshard); this throws otherwise rather than ship a partial snapshot.
+    // Dispatches to that core. catalogHash is a data-only sentinel (catalog reconciles
+    // via schema broadcast, not the snapshot).
+    seastar::future<data::SnapshotPayload> buildVShardSnapshot(VShardId vshard);
+
+    // Install a received VShard snapshot (consumer side of the above). Same cohesion
+    // precondition; dispatches to assignCore(vshard). Returns true iff installed.
+    seastar::future<bool> installVShardSnapshot(VShardId vshard, data::SnapshotPayload payload);
 
     // Run the node's local query (the real HTTP query pipeline over this node's
     // engines) and return the per-series results as a NodeQueryPartial. In a

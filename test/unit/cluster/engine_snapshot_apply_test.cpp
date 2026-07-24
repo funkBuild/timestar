@@ -1,0 +1,122 @@
+// Integration M3 (snapshots): the full consumer chain. EngineLocalStore::
+// buildVShardSnapshot produces a self-contained payload; EngineDataStateMachine::
+// applySnapshot decodes it and installs it into a FRESH replica's Engine, and a
+// query reproduces the data. A malformed payload is fail-stop. The series is
+// chosen so its VShard maps to core 0, keeping the internal invoke_on(assignCore)
+// inline (no cross-shard payload transfer) exactly as the real apply path -- which
+// runs ON the VShard's core -- guarantees. Source and dest engines are scoped so
+// only one exists at a time.
+#include "../../../lib/cluster/data/snapshot_payload.hpp"
+#include "../../../lib/cluster/integration/engine_data_state_machine.hpp"
+#include "../../../lib/cluster/integration/engine_local_store.hpp"
+#include "../../../lib/core/placement_table.hpp"  // virtualShard
+#include "../../../lib/core/vshard.hpp"           // assignCore
+#include "../../../lib/utils/series_key.hpp"
+#include "../../test_helpers.hpp"
+
+#include <gtest/gtest.h>
+
+#include <chrono>
+#include <seastar/core/sleep.hh>
+#include <seastar/core/thread.hh>
+
+using namespace timestar;
+
+namespace {
+constexpr uint64_t BASE = 1'700'000'000'000'000'000ULL;
+
+// A float series whose VShard maps to core 0 under the current smp::count, so the
+// snapshot build/install (which invoke_on assignCore(vshard)) run inline on shard 0.
+data::WriteSeries seriesOnCore0(std::string* outKey, SeriesId128* outSid, VShardId* outVs) {
+    for (int i = 0;; ++i) {
+        std::string key = buildSeriesKey("snapsm", {{"host", "h" + std::to_string(i)}}, "value");
+        const auto sid = SeriesId128::fromSeriesKey(key);
+        const uint16_t vs = virtualShard(sid);
+        if (assignCore(VShardId{vs}, seastar::smp::count) == 0) {
+            *outKey = key;
+            *outSid = sid;
+            *outVs = VShardId{vs};
+            data::WriteSeries s;
+            s.seriesKey = key;
+            s.type = TSMValueType::Float;
+            s.timestamps = {BASE, BASE + 1000};
+            s.values = std::vector<double>{7.0, 8.0};
+            return s;
+        }
+    }
+}
+}  // namespace
+
+TEST(EngineSnapshotApply, ApplySnapshotInstallsDataOnFreshReplica) {
+    seastar::thread([] {
+        std::filesystem::remove_all("snapsm_src");
+        std::filesystem::remove_all("snapsm_dst");
+
+        std::string key;
+        SeriesId128 sid;
+        VShardId vs{0};
+        data::SnapshotPayload payload;
+
+        // --- SOURCE: write + flush + build snapshot (engine destroyed before dest) ---
+        {
+            ScopedShardedEngine srcEng;
+            srcEng.startAt("snapsm_src");
+            (*srcEng)
+                .invoke_on_all([](Engine& e) {
+                    e.setRevisionAssignment(true);
+                    return seastar::make_ready_future<>();
+                })
+                .get();
+            cluster::EngineLocalStore srcStore(*srcEng);
+
+            data::WriteBatch b;
+            b.series = {seriesOnCore0(&key, &sid, &vs)};
+            srcStore.applyWrites(std::move(b)).get();
+
+            (*srcEng).invoke_on_all([](Engine& e) { return e.rolloverMemoryStore(); }).get();
+            for (int i = 0; i < 300; ++i) {
+                auto n = (*srcEng).invoke_on(0u, [](Engine& e) { return e.getTSMFileCount(); }).get();
+                if (n > 0)
+                    break;
+                seastar::sleep(std::chrono::milliseconds(100)).get();
+            }
+            payload = srcStore.buildVShardSnapshot(vs).get();
+        }
+        ASSERT_FALSE(payload.files.empty()) << "flushed data must be shipped";
+
+        // --- DEST: fresh replica installs via the state machine ---
+        {
+            ScopedShardedEngine dstEng;
+            dstEng.startAt("snapsm_dst");
+            cluster::EngineLocalStore dstStore(*dstEng);
+            cluster::EngineDataStateMachine sm(dstStore, vs);
+
+            raft::Snapshot snap;
+            snap.index = 42;
+            snap.data = data::encodeSnapshotPayload(payload);
+            sm.applySnapshot(snap).get();
+            EXPECT_EQ(sm.appliedIndex(), 42u) << "applied watermark advances to the snapshot index";
+
+            // The data is now queryable by seriesId on the VShard's core (0).
+            auto resultOpt =
+                (*dstEng).invoke_on(0u, [key, sid](Engine& e) { return e.query(key, sid, 0, UINT64_MAX); }).get();
+            ASSERT_TRUE(resultOpt.has_value());
+            auto& result = std::get<QueryResult<double>>(resultOpt.value());
+            EXPECT_EQ(result.timestamps, (std::vector<uint64_t>{BASE, BASE + 1000}));
+            ASSERT_EQ(result.values.size(), 2u);
+            EXPECT_DOUBLE_EQ(result.values[0], 7.0);
+            EXPECT_DOUBLE_EQ(result.values[1], 8.0);
+
+            // Fail-stop: a malformed payload must throw, not silently drop state.
+            raft::Snapshot bad;
+            bad.index = 43;
+            bad.data = "this is not a valid snapshot payload";
+            EXPECT_THROW(sm.applySnapshot(bad).get(), std::runtime_error);
+        }
+
+        std::filesystem::remove_all("snapsm_src");
+        std::filesystem::remove_all("snapsm_dst");
+    })
+        .join()
+        .get();
+}

@@ -14,6 +14,37 @@ using ::MetadataOp;  // MetadataOp is in the global namespace (like TSMValueType
 
 EngineLocalStore::EngineLocalStore(seastar::sharded<Engine>& engines) : engines_(engines) {}
 
+seastar::future<data::SnapshotPayload> EngineLocalStore::buildVShardSnapshot(VShardId vshard) {
+    if (!timestar::vshardsCohesiveOnCores(seastar::smp::count))
+        throw std::runtime_error(
+            "buildVShardSnapshot: core count is not VShard-cohesive; a single-core snapshot would omit "
+            "series that scatter across cores (refusing to ship a partial snapshot)");
+    const unsigned core = timestar::assignCore(vshard, seastar::smp::count);
+    auto built = co_await engines_.invoke_on(
+        core, [vshard](Engine& e) { return e.buildVShardSnapshotFiles(vshard, std::string(32, '0')); });
+    data::SnapshotPayload payload;
+    payload.manifest = std::move(built.first);
+    payload.files.reserve(built.second.size());
+    for (auto& [name, bytes] : built.second)
+        payload.files.push_back(data::SnapshotFile{std::move(name), std::move(bytes)});
+    co_return payload;
+}
+
+seastar::future<bool> EngineLocalStore::installVShardSnapshot(VShardId vshard, data::SnapshotPayload payload) {
+    if (!timestar::vshardsCohesiveOnCores(seastar::smp::count))
+        throw std::runtime_error("installVShardSnapshot: core count is not VShard-cohesive");
+    const unsigned core = timestar::assignCore(vshard, seastar::smp::count);
+    // The replicated apply path already runs on assignCore(vshard), so this invoke_on
+    // is inline (no cross-core transfer of the payload's strings).
+    co_return co_await engines_.invoke_on(core, [payload = std::move(payload)](Engine& e) mutable {
+        std::vector<std::pair<std::string, std::string>> files;
+        files.reserve(payload.files.size());
+        for (auto& f : payload.files)
+            files.emplace_back(std::move(f.name), std::move(f.bytes));
+        return e.installVShardSnapshotFiles(payload.manifest, std::move(files));
+    });
+}
+
 unsigned EngineLocalStore::coreFor(const SeriesId128& id) const {
     // MUST match the routing authority the metadata/query path uses:
     // Engine::indexMetadataSync routes each op by routeToCore(id), and query

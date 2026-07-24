@@ -39,13 +39,21 @@ seastar::future<> EngineDataStateMachine::apply(raft::LogEntry entry) {
 }
 
 seastar::future<> EngineDataStateMachine::applySnapshot(raft::Snapshot snap) {
-    // Production snapshots are Engine::createVShardSnapshot manifests installed via
-    // restoreVShardSnapshot (plan M3 §"snapshot()"); wiring the InstallSnapshot
-    // payload as a manifest + object stream is a later M3 task. Until then a snapshot
-    // install is refused rather than silently dropping state.
-    (void)snap;
-    return seastar::make_exception_future<>(
-        std::runtime_error("EngineDataStateMachine: snapshot install not yet wired (M3)"));
+    // Decode the self-contained InstallSnapshot payload (manifest + TSM file bytes) and
+    // install it into this VShard's Engine core, verify-then-install all-or-nothing. A
+    // malformed payload or a failed verification is FAIL-STOP (throws) -- never a silent
+    // partial install, which would leave this replica diverged.
+    auto payload = data::decodeSnapshotPayload(snap.data);
+    if (!payload)
+        throw std::runtime_error("EngineDataStateMachine::applySnapshot: undecodable snapshot payload (fail-stop)");
+    const bool installed = co_await store_.installVShardSnapshot(vshard_, std::move(*payload));
+    if (!installed)
+        throw std::runtime_error(
+            "EngineDataStateMachine::applySnapshot: snapshot failed verification and was not installed (fail-stop)");
+    // The snapshot subsumes the log up to snap.index; advance the applied watermark so a
+    // subsequent apply() of the post-snapshot suffix is correctly ordered.
+    appliedIndex_ = snap.index;
+    co_return;
 }
 
 }  // namespace timestar::cluster

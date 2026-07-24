@@ -73,7 +73,7 @@ TEST_F(EngineDataRaftTest, ProposeThroughRaftAppliesToEngine) {
         ScopedShardedEngine eng;
         eng.start();
         cluster::EngineLocalStore store(*eng);
-        cluster::EngineDataStateMachine sm(store);
+        cluster::EngineDataStateMachine sm(store, timestar::VShardId{0});
 
         // Single-voter Raft group over the real Engine's state machine.
         fs::path dir = tmpDir();

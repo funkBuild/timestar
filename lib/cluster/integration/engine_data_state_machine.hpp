@@ -42,7 +42,7 @@ namespace timestar::cluster {
 //     coarser hint, e.g. for read-catch-up).
 class EngineDataStateMachine : public raft::RaftStateMachine {
 public:
-    explicit EngineDataStateMachine(EngineLocalStore& store) : store_(store) {}
+    EngineDataStateMachine(EngineLocalStore& store, VShardId vshard) : store_(store), vshard_(vshard) {}
 
     seastar::future<> apply(raft::LogEntry entry) override;
     seastar::future<> applySnapshot(raft::Snapshot snap) override;
@@ -51,6 +51,7 @@ public:
 
 private:
     EngineLocalStore& store_;
+    VShardId vshard_;
     uint64_t appliedIndex_ = 0;
 };
 

@@ -55,7 +55,7 @@ seastar::future<> ReplicatedVShardHost::addVShard(uint16_t vshard, std::vector<N
     }
 
     vs.persistence = std::make_unique<raft::JournalRaftPersistence>(*vs.writer, VShardId{vshard}, st.nextSeq);
-    vs.sm = std::make_unique<EngineDataStateMachine>(store_);
+    vs.sm = std::make_unique<EngineDataStateMachine>(store_, VShardId{vshard});
     raft::RaftNode node(self_, baseVoters, std::move(st.log), st.hardState, opts, baseLearners);
     registry_.addGroup(vshard, std::move(node), *vs.persistence, *vs.sm);
     vshards_[vshard] = std::move(vs);

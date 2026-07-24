@@ -164,7 +164,7 @@ TEST_F(EngineRf3Test, ThreeRealEnginesConvergeUnderPartition) {
             r.engine = std::make_unique<ScopedShardedEngine>();
             r.engine->startAt(edir.string());
             r.store = std::make_unique<cluster::EngineLocalStore>(**r.engine);
-            r.sm = std::make_unique<cluster::EngineDataStateMachine>(*r.store);
+            r.sm = std::make_unique<cluster::EngineDataStateMachine>(*r.store, timestar::VShardId{0});
             fs::path jdir = tmpDir("j" + std::to_string(id));
             journalDirs.push_back(jdir);
             r.writer = std::make_unique<JournalWriter>(jdir, header(), 1u << 20);

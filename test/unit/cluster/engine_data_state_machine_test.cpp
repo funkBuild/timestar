@@ -59,7 +59,7 @@ TEST_F(EngineDataStateMachineTest, AppliesWriteDeleteAndLwwFromLog) {
         ScopedShardedEngine eng;
         eng.start();
         cluster::EngineLocalStore store(*eng);
-        cluster::EngineDataStateMachine sm(store);
+        cluster::EngineDataStateMachine sm(store, timestar::VShardId{0});
 
         const std::string key = buildSeriesKey("temp", {{"host", "h1"}}, "value");
 
@@ -91,7 +91,7 @@ TEST_F(EngineDataStateMachineTest, UndecodableCommittedEntryIsFailStop) {
         ScopedShardedEngine eng;
         eng.start();
         cluster::EngineLocalStore store(*eng);
-        cluster::EngineDataStateMachine sm(store);
+        cluster::EngineDataStateMachine sm(store, timestar::VShardId{0});
 
         raft::LogEntry bad;
         bad.index = 3;
@@ -124,7 +124,7 @@ TEST_F(EngineDataStateMachineTest, AppliedRevisionsAreNotReStampedByEngineCounte
             .get();
 
         cluster::EngineLocalStore store(*eng);
-        cluster::EngineDataStateMachine sm(store);
+        cluster::EngineDataStateMachine sm(store, timestar::VShardId{0});
 
         const std::string key = buildSeriesKey("temp", {{"host", "h1"}}, "value");
         const unsigned core = timestar::routeToCore(SeriesId128::fromSeriesKey(key));
