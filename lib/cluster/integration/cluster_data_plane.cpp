@@ -143,18 +143,83 @@ seastar::future<> ClusterDataPlane::write(data::WriteBatch batch) {
 }
 
 seastar::future<QueryResponse> ClusterDataPlane::query(QueryRequest request) {
-    // NOTE (M3 read-failover gap, found by the 3-node node-kill gate): reads fan out
-    // to the placement PRIMARY (coord_->query). Under RF=3 the primary is the
-    // preferred leader, so this is a correct linearizable leader read while the
-    // primary lives -- but a LOCAL read is NOT a valid substitute (a follower not yet
-    // caught up returns stale/empty), and when the primary DIES the read fails even
-    // though a live quorum re-elected a new leader. The fix is leader-AWARE read
-    // routing (route each VShard read to its CURRENT Raft leader via LeaderResolver,
-    // behind a ReadIndex barrier) -- the read-side analogue of the write fix. That is
-    // the remaining M3 read-failover work; the write path already follows leadership.
+    if (replicated_)
+        co_return co_await queryReplicated(std::move(request));
     if (!coord_)
         throw std::runtime_error("ClusterDataPlane::query before start");
-    return coord_->query(std::move(request));
+    co_return co_await coord_->query(std::move(request));
+}
+
+seastar::future<QueryResponse> ClusterDataPlane::queryReplicated(QueryRequest request) {
+    // RF=3 leader read (M3 read-failover): route each VShard's read to its CURRENT
+    // Raft leader (not the static primary), so reads follow failover and never
+    // double-count a series replicated on every node. Group all VShards by their
+    // current leader, query each leader for ONLY those VShards (req.vshards restricts
+    // its discovery), and merge the partials into the single answer.
+    std::map<data::NodeId, std::vector<uint16_t>> byLeader;
+    size_t leaderless = 0;
+    for (uint16_t vs = 0; vs < timestar::VIRTUAL_SHARD_COUNT; ++vs) {
+        const data::NodeId leader = rdp_->host().leaderOf(vs);
+        if (leader == timestar::raft::kNoNode)
+            ++leaderless;  // no elected leader (no quorum) -> its data is unreadable
+        else
+            byLeader[leader].push_back(vs);
+    }
+    if (leaderless > 0) {
+        // A VShard with no leader may hold matching data we cannot read -> fail closed
+        // (QUERY_INCOMPLETE), never a silent partial.
+        QueryResponse r;
+        r.success = false;
+        r.errorCode = "QUERY_INCOMPLETE";
+        r.errorMessage = std::to_string(leaderless) + " VShard(s) have no elected leader";
+        co_return r;
+    }
+
+    const data::NodeId self = rt_->selfId;
+    std::vector<seastar::future<data::NodeQueryPartial>> pending;
+    pending.reserve(byLeader.size());
+    for (auto& [leader, vshards] : byLeader) {
+        data::NodeQueryRequest nq;
+        nq.request = request;
+        nq.vshards = std::move(vshards);
+        if (leader == self)
+            pending.push_back(local_->queryLocal(std::move(nq)));
+        else
+            pending.push_back(rpc_->queryNode(leader, std::move(nq)));
+    }
+
+    std::vector<PartialAggregationResult> allPartials;
+    std::vector<timestar::http::SeriesResult> allNonNumeric;
+    std::vector<std::string> incompleteReasons;
+    std::exception_ptr firstErr;
+    for (auto& f : pending) {
+        try {
+            data::NodeQueryPartial part = co_await std::move(f);
+            if (!part.incompleteReasons.empty()) {
+                for (auto& r : part.incompleteReasons)
+                    incompleteReasons.push_back(std::move(r));
+                continue;
+            }
+            allPartials.insert(allPartials.end(), std::make_move_iterator(part.partials.begin()),
+                               std::make_move_iterator(part.partials.end()));
+            allNonNumeric.insert(allNonNumeric.end(), std::make_move_iterator(part.nonNumeric.begin()),
+                                 std::make_move_iterator(part.nonNumeric.end()));
+        } catch (...) {
+            if (!firstErr)
+                firstErr = std::current_exception();
+        }
+    }
+    if (firstErr)
+        std::rethrow_exception(firstErr);
+    if (!incompleteReasons.empty()) {
+        QueryResponse r;
+        r.success = false;
+        r.errorCode = "QUERY_INCOMPLETE";
+        r.errorMessage = "a leader could not answer";
+        co_return r;
+    }
+    co_return co_await finalizer_->finalizeClusterPartials(std::move(request), std::move(allPartials),
+                                                          std::move(allNonNumeric));
 }
 
 seastar::future<data::MetadataResult> ClusterDataPlane::metadata(data::MetadataRequest request) {

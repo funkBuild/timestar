@@ -58,6 +58,9 @@ public:
     const data::VShardDirectory& directory() const { return *dir_; }
 
 private:
+    // RF=3 leader read: fan out per-VShard-leader (see .cpp).
+    seastar::future<QueryResponse> queryReplicated(QueryRequest request);
+
     std::optional<ClusterRuntime> rt_;
     // Declared in dependency order: deps before the router/coordinator that reference
     // them, so destruction (reverse order) tears the referrers down first.

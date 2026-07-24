@@ -4,6 +4,7 @@
 #include "block_aggregator.hpp"
 #include "content_negotiation.hpp"
 #include "engine.hpp"
+#include "placement_table.hpp"  // virtualShard
 #include "group_key.hpp"
 #include "http_auth.hpp"
 #include "http_routes.hpp"
@@ -2477,7 +2478,8 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(QueryRequest reque
     co_return response;
 }
 
-seastar::future<HttpQueryHandler::NodePartials> HttpQueryHandler::queryLocalPartials(QueryRequest request) {
+seastar::future<HttpQueryHandler::NodePartials> HttpQueryHandler::queryLocalPartials(
+    QueryRequest request, const std::set<uint16_t>* vshardFilter) {
     // The produce half of executeQuery: same discovery + fan-out + incomplete/limit
     // contracts, but it stops BEFORE merge/finalize and returns the flattened
     // per-core partials instead. Any early-exit condition executeQuery would map to
@@ -2515,6 +2517,14 @@ seastar::future<HttpQueryHandler::NodePartials> HttpQueryHandler::queryLocalPart
         }
 
         auto& seriesByShard = discoveryResult.seriesByShard;
+        // RF=3 read: keep only series whose VShard this node was asked for (leads), so
+        // a series replicated on every node is counted once cluster-wide.
+        if (vshardFilter) {
+            for (auto& contexts : seriesByShard)
+                std::erase_if(contexts, [&](const SeriesQueryContext& c) {
+                    return vshardFilter->count(timestar::virtualShard(c.seriesId)) == 0;
+                });
+        }
         size_t totalSeriesFound = 0;
         for (const auto& contexts : seriesByShard)
             totalSeriesFound += contexts.size();

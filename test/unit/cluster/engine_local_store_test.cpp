@@ -3,6 +3,7 @@
 // flat DataPoint could NOT represent) is applied, then read back through the real
 // HTTP query pipeline, proving the enriched command is lossless end to end.
 #include "../../../lib/cluster/integration/engine_local_store.hpp"
+#include "../../../lib/core/placement_table.hpp"  // virtualShard
 #include "../../../lib/http/http_query_handler.hpp"
 #include "../../../lib/utils/series_key.hpp"
 #include "../../test_helpers.hpp"
@@ -155,6 +156,55 @@ TEST_F(EngineLocalStoreTest, ApplyWritesAllTypesVisibleViaRealQuery) {
             ASSERT_TRUE(r.success) << r.errorMessage;
             EXPECT_TRUE(r.series.empty());  // gone
         }
+    }).get();
+}
+
+// M3 RF=3 read: queryLocal restricted to req.vshards returns ONLY series in those
+// VShards, so a series replicated on every node is counted once cluster-wide (the
+// coordinator asks each leader for only the VShards it leads). The correctness-
+// critical anti-double-count piece.
+TEST_F(EngineLocalStoreTest, QueryLocalHonorsVShardFilter) {
+    seastar::async([] {
+        ScopedShardedEngine eng;
+        eng.start();
+        cluster::EngineLocalStore store(*eng);
+
+        // Two measurements whose series land in (distinct) VShards.
+        const std::string keyA = buildSeriesKey("mA", {{"h", "1"}}, "value");
+        const std::string keyB = buildSeriesKey("mB", {{"h", "1"}}, "value");
+        const uint16_t vsA = timestar::virtualShard(SeriesId128::fromSeriesKey(keyA));
+        const uint16_t vsB = timestar::virtualShard(SeriesId128::fromSeriesKey(keyB));
+        ASSERT_NE(vsA, vsB);
+
+        data::WriteBatch b;
+        b.series.push_back(floatS());  // temp/value (some vshard)
+        {
+            data::WriteSeries a;
+            a.seriesKey = keyA;
+            a.type = TSMValueType::Float;
+            a.timestamps = {BASE};
+            a.values = std::vector<double>{7.0};
+            b.series.push_back(std::move(a));
+        }
+        store.applyWrites(std::move(b)).get();
+
+        auto q = [&](const std::string& m, std::vector<uint16_t> vshards) {
+            data::NodeQueryRequest nq;
+            nq.request.aggregation = AggregationMethod::LATEST;
+            nq.request.measurement = m;
+            nq.request.fields = {"value"};
+            nq.request.startTime = BASE - 1'000'000'000ULL;
+            nq.request.endTime = BASE + 1'000'000'000ULL;
+            nq.vshards = std::move(vshards);
+            return store.queryLocal(std::move(nq)).get();
+        };
+
+        // Filter = {vsA} -> mA's series is included.
+        auto inA = q("mA", {vsA});
+        EXPECT_EQ(inA.partials.size() + inA.nonNumeric.size(), 1u) << "mA in-filter must be present";
+        // Filter = {vsB} (NOT mA's vshard) -> mA is dropped (empty).
+        auto outA = q("mA", {vsB});
+        EXPECT_TRUE(outA.partials.empty() && outA.nonNumeric.empty()) << "mA out-of-filter must be excluded";
     }).get();
 }
 

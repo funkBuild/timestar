@@ -167,7 +167,14 @@ seastar::future<data::NodeQueryPartial> EngineLocalStore::queryLocal(data::NodeQ
     // correct. A local early-exit (incomplete/timeout/limit) becomes an
     // incompleteReason, fail-closed -- never a silent empty success.
     http::HttpQueryHandler handler(&engines_);
-    http::HttpQueryHandler::NodePartials np = co_await handler.queryLocalPartials(std::move(req.request));
+    // RF=3: req.vshards names the VShards this node must answer for (the ones it
+    // leads); restrict discovery to them so a replicated series is not double-counted
+    // across replicas. Empty => no restriction (RF=1/M2 disjoint placement).
+    std::optional<std::set<uint16_t>> filter;
+    if (!req.vshards.empty())
+        filter.emplace(req.vshards.begin(), req.vshards.end());
+    http::HttpQueryHandler::NodePartials np =
+        co_await handler.queryLocalPartials(std::move(req.request), filter ? &*filter : nullptr);
     data::NodeQueryPartial partial;
     if (!np.ok) {
         partial.incompleteReasons.push_back(

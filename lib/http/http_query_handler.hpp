@@ -129,7 +129,13 @@ public:
     // Produce this node's NodePartials (integration plan F.5b). Under RF=1 each node's
     // Engine holds only its owned VShards' series, so local discovery already returns
     // a disjoint contribution; the coordinator unions every owner's partials.
-    seastar::future<NodePartials> queryLocalPartials(QueryRequest request);
+    //
+    // `vshardFilter` (M3 RF=3 read): when non-null, discovered series whose VShard is
+    // NOT in the set are dropped, so this node contributes ONLY the VShards it was
+    // asked for (the ones it currently LEADS). This is what makes an RF=3 leader read
+    // over replicated data avoid double-counting a series that lives on every replica.
+    seastar::future<NodePartials> queryLocalPartials(QueryRequest request,
+                                                     const std::set<uint16_t>* vshardFilter = nullptr);
 
     // Merge a UNION of node partials (this node's + peers') into the final response,
     // reusing the exact multi-shard merge+finalize path so the cluster answer equals
