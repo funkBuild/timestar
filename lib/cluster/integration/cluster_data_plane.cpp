@@ -1,5 +1,7 @@
 #include "cluster_data_plane.hpp"
 
+#include "../../utils/logger.hpp"  // timestar::http_log
+
 #include <seastar/core/coroutine.hh>
 #include <seastar/net/dns.hh>
 #include <seastar/net/inet_address.hh>
@@ -55,13 +57,24 @@ seastar::future<> ClusterDataPlane::start(const ClusterConfig& cfg, seastar::sha
     co_await rpc_->start(seastar::socket_address(selfAddr, static_cast<uint16_t>(self.port + kDataPlanePortOffset)),
                          *local_);
 
-    // Register every OTHER node as a peer at its data-plane address.
+    // Register every OTHER node as a peer at its data-plane address. Resolution is
+    // BEST-EFFORT: a peer that is not yet up (rolling start) must not fail THIS
+    // node's startup. A skipped peer surfaces later as a routing error to that
+    // owner, not a boot failure. (The connection itself is lazy in DataPlaneRpc.)
     for (const auto& [id, addr] : rt_->peerAddresses) {
         if (id == rt_->selfId)
             continue;
         const HostPort hp = parseHostPort(addr);
-        seastar::net::inet_address a = co_await resolveHost(hp.host);
-        rpc_->addPeer(id, seastar::socket_address(a, static_cast<uint16_t>(hp.port + kDataPlanePortOffset)));
+        std::optional<seastar::net::inet_address> a;
+        try {
+            a = co_await resolveHost(hp.host);
+        } catch (const std::exception& e) {
+            timestar::http_log.warn(
+                "cluster data plane: peer {} ({}) unresolved at startup: {} (will error on route)", id, addr,
+                e.what());
+            continue;
+        }
+        rpc_->addPeer(id, seastar::socket_address(*a, static_cast<uint16_t>(hp.port + kDataPlanePortOffset)));
     }
 
     finalizer_ = std::make_unique<http::HttpQueryHandler>(&engines);

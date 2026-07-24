@@ -1,3 +1,4 @@
+#include "cluster/integration/cluster_data_plane.hpp"
 #include "config/timestar_config.hpp"
 #include "core/engine.hpp"
 #include "core/placement_table.hpp"
@@ -47,6 +48,13 @@ using namespace httpd;
 // Global sharded engine - declared here so set_routes() can reference it.
 // (Defined before set_routes, initialized in main.)
 seastar::sharded<Engine> g_engine;
+
+// The M2 VShard-partitioned data plane, live only when [cluster] enabled +
+// partitioned. Lives on shard 0 (started in main's shard-0 lambda); the HTTP
+// handlers reach it via invoke_on(0). Inert (never started) otherwise, so single-
+// node and M1 full-replication clusters are byte-identical.
+timestar::cluster::ClusterDataPlane g_clusterDataPlane;
+bool g_clusterPartitioned = false;
 
 // Consecutive compaction failures on any one tier before /health reports
 // "degraded". One failure can be transient; a run of them means the tier is
@@ -312,7 +320,10 @@ int main(int argc, char** argv) {
 
             {
                 const auto& cc = timestar::config().cluster;
-                if (cc.enabled)
+                if (cc.enabled && cc.partitioned)
+                    timestar::http_log.info("Cluster mode ENABLED: node {} of {} peers (VShard-partitioned RF=1)",
+                                            cc.node_id, cc.peers.size());
+                else if (cc.enabled)
                     timestar::http_log.info("Cluster mode ENABLED: node {} of {} peers (full replication)",
                                             cc.node_id, cc.peers.size());
                 else
@@ -433,6 +444,20 @@ int main(int argc, char** argv) {
             timestar::http_log.info("Starting background tasks on all shards...");
             g_engine.invoke_on_all([](Engine& engine) { return engine.startBackgroundTasks(); }).get();
 
+            // M2: start the VShard-partitioned data plane (RPC listener + router +
+            // coordinator) on shard 0. Gated on enabled+partitioned so single-node
+            // and M1 clusters never start it. A start failure (e.g. a bad address)
+            // fails the boot -- a partitioned node that cannot serve its own VShards
+            // must not come up pretending to.
+            {
+                const auto& cc = timestar::config().cluster;
+                if (cc.enabled && cc.partitioned) {
+                    g_clusterDataPlane.start(cc, g_engine).get();
+                    g_clusterPartitioned = true;
+                    timestar::http_log.info("VShard-partitioned data plane started (node {})", cc.node_id);
+                }
+            }
+
             timestar::http_log.info("Engine initialized successfully with background tasks");
             g_ready.store(true, std::memory_order_release);
 
@@ -539,6 +564,10 @@ int main(int argc, char** argv) {
                         return g_streamHandler->stop();
                     return seastar::make_ready_future<>();
                 });
+                // Stop the data plane (peer clients + RPC server) BEFORE the engine,
+                // so no forwarded write/query can arrive after the Engine is gone.
+                if (g_clusterPartitioned)
+                    co_await g_clusterDataPlane.stop();
                 co_await g_engine.invoke_on_all([](Engine& engine) { return engine.stop(); });
                 co_await g_engine.stop();
             };
