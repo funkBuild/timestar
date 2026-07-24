@@ -103,6 +103,30 @@ public:
     // puts the copy in the parameter, before the coroutine body can suspend.
     seastar::future<QueryResponse> executeQuery(QueryRequest request);
 
+    // This node's UNFINALIZED contribution to a (possibly cluster-wide) query: the
+    // per-core partial aggregations plus non-numeric series, produced by exactly the
+    // same discovery + fan-out phases executeQuery runs, but stopped BEFORE the
+    // merge/finalize. `ok == false` carries a ready error QueryResponse (null engine,
+    // timeout, too-many-series, QUERY_INCOMPLETE) that must fail the whole query.
+    struct NodePartials {
+        std::vector<PartialAggregationResult> partials;
+        std::vector<SeriesResult> nonNumeric;
+        bool ok = true;
+        QueryResponse errorResponse;
+    };
+
+    // Produce this node's NodePartials (integration plan F.5b). Under RF=1 each node's
+    // Engine holds only its owned VShards' series, so local discovery already returns
+    // a disjoint contribution; the coordinator unions every owner's partials.
+    seastar::future<NodePartials> queryLocalPartials(QueryRequest request);
+
+    // Merge a UNION of node partials (this node's + peers') into the final response,
+    // reusing the exact multi-shard merge+finalize path so the cluster answer equals
+    // the single-node answer for every method (spread/stddev group-by included).
+    seastar::future<QueryResponse> finalizeClusterPartials(QueryRequest request,
+                                                           std::vector<PartialAggregationResult> partials,
+                                                           std::vector<SeriesResult> nonNumeric);
+
     // Parse JSON request body (public for testing)
     QueryRequest parseQueryRequest(const GlazeQueryRequest& glazeReq);
 

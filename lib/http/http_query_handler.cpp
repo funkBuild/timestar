@@ -2468,6 +2468,134 @@ seastar::future<QueryResponse> HttpQueryHandler::executeQuery(QueryRequest reque
     co_return response;
 }
 
+seastar::future<HttpQueryHandler::NodePartials> HttpQueryHandler::queryLocalPartials(QueryRequest request) {
+    // The produce half of executeQuery: same discovery + fan-out + incomplete/limit
+    // contracts, but it stops BEFORE merge/finalize and returns the flattened
+    // per-core partials instead. Any early-exit condition executeQuery would map to
+    // an error response is carried in out.errorResponse with out.ok == false, so the
+    // coordinator fails the whole query rather than merging a partial contribution.
+    NodePartials out;
+    QueryResponse& err = out.errorResponse;
+    QueryTimingInfo timing;
+    timing.startTime = std::chrono::high_resolution_clock::now();
+    try {
+        if (!engineSharded) {
+            out.ok = false;
+            err.success = false;
+            err.errorCode = "NULL_ENGINE";
+            err.errorMessage = "Engine pointer is null";
+            co_return out;
+        }
+
+        SeriesDiscoveryResult discoveryResult = co_await discoverSeriesAcrossShards(request);
+        if (discoveryResult.timedOut) {
+            out.ok = false;
+            err.success = false;
+            err.errorCode = "QUERY_TIMEOUT";
+            err.errorMessage =
+                "Discovery phase timed out after " + std::to_string(defaultQueryTimeout().count()) + " seconds";
+            co_return out;
+        }
+        if (discoveryResult.limitExceeded) {
+            out.ok = false;
+            err.success = false;
+            err.errorCode = "TOO_MANY_SERIES";
+            err.errorMessage = "Too many series: " + std::to_string(discoveryResult.discovered) +
+                               " exceeds limit of " + std::to_string(discoveryResult.limit);
+            co_return out;
+        }
+
+        auto& seriesByShard = discoveryResult.seriesByShard;
+        size_t totalSeriesFound = 0;
+        for (const auto& contexts : seriesByShard)
+            totalSeriesFound += contexts.size();
+        if (totalSeriesFound > maxSeriesCount()) {
+            out.ok = false;
+            err.success = false;
+            err.errorCode = "TOO_MANY_SERIES";
+            err.errorMessage = "Too many series: " + std::to_string(totalSeriesFound) + " exceeds limit of " +
+                               std::to_string(maxSeriesCount());
+            co_return out;
+        }
+
+        ShardFanOutResult fanOut = co_await fanOutShardQueries(request, seriesByShard);
+
+        // Incomplete contract: a series a shard could not read fails the whole query
+        // (never a silent partial), identical to executeQuery.
+        {
+            size_t totalDropped = 0;
+            std::string reason;
+            for (const auto& [shardId, sr] : fanOut.shardResults) {
+                totalDropped += sr.droppedSeries;
+                if (reason.empty() && !sr.firstDropReason.empty())
+                    reason = sr.firstDropReason;
+            }
+            if (totalDropped > 0) {
+                out.ok = false;
+                err.success = false;
+                err.errorCode = "QUERY_INCOMPLETE";
+                err.errorMessage = "Query could not read " + std::to_string(totalDropped) +
+                                   " series and would have returned an incomplete result" +
+                                   (reason.empty() ? std::string() : (": " + reason));
+                co_return out;
+            }
+        }
+        if (fanOut.timedOut) {
+            out.ok = false;
+            err.success = false;
+            err.errorCode = "QUERY_TIMEOUT";
+            err.errorMessage =
+                "Query timed out after " + std::to_string(defaultQueryTimeout().count()) + " seconds";
+            co_return out;
+        }
+
+        // Flatten every core's partials + non-numeric results into this node's
+        // contribution (the coordinator unions these across owner nodes).
+        for (auto& [shardId, sqr] : fanOut.shardResults) {
+            out.partials.insert(out.partials.end(), std::make_move_iterator(sqr.partialResults.begin()),
+                                std::make_move_iterator(sqr.partialResults.end()));
+            out.nonNumeric.insert(out.nonNumeric.end(), std::make_move_iterator(sqr.nonNumericResults.begin()),
+                                  std::make_move_iterator(sqr.nonNumericResults.end()));
+        }
+    } catch (const std::exception& e) {
+        out.ok = false;
+        err.success = false;
+        err.errorCode = "QUERY_EXECUTION_ERROR";
+        err.errorMessage = "Query execution failed";
+        timestar::http_log.error("queryLocalPartials failed: {}", e.what());
+    }
+    co_return out;
+}
+
+seastar::future<QueryResponse> HttpQueryHandler::finalizeClusterPartials(
+    QueryRequest request, std::vector<PartialAggregationResult> partials, std::vector<SeriesResult> nonNumeric) {
+    // Reuse the EXACT multi-shard finalize by presenting the union of node partials
+    // as a single synthetic shard. finalizeMultiShardResponse always merges via
+    // mergePartialAggregationsGrouped (never the single-shard fast path), so the
+    // fold-of-one-non-identity methods (spread/stddev) and cross-node group-by are
+    // correct: the cluster answer is the single-node answer.
+    QueryResponse response;
+    response.success = true;
+    QueryTimingInfo timing;
+    timing.startTime = std::chrono::high_resolution_clock::now();
+    try {
+        ShardQueryResult sqr;
+        sqr.partialResults = std::move(partials);
+        sqr.nonNumericResults = std::move(nonNumeric);
+        std::vector<std::pair<unsigned, ShardQueryResult>> shardResults;
+        shardResults.emplace_back(0u, std::move(sqr));
+        if (auto early = co_await finalizeMultiShardResponse(request, shardResults, timing, response))
+            co_return std::move(*early);
+        response.statistics.seriesCount = response.series.size();
+    } catch (const std::exception& e) {
+        response.success = false;
+        response.errorCode = "QUERY_EXECUTION_ERROR";
+        response.errorMessage = "Query execution failed";
+        timestar::http_log.error("finalizeClusterPartials failed: {}", e.what());
+    }
+    co_return response;
+}
+
 seastar::future<std::string> HttpQueryHandler::formatQueryResponse(QueryResponse& response) {
     return ResponseFormatter::format(response);
 }
