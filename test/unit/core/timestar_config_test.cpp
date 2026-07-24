@@ -174,6 +174,33 @@ static std::vector<std::string> errorsMatching(const std::vector<std::string>& e
 }
 
 // ===========================================================================
+// cluster.partitioned (M2 gate — off by default, requires cluster.enabled)
+// ===========================================================================
+
+TEST(TimestarConfigValidateTest, ClusterPartitionedDefaultsOff) {
+    timestar::TimestarConfig cfg;
+    EXPECT_FALSE(cfg.cluster.partitioned);  // M1 full-replication path is the default
+}
+
+TEST(TimestarConfigValidateTest, ClusterPartitionedWithoutEnabledIsError) {
+    timestar::TimestarConfig cfg;
+    cfg.cluster.enabled = false;
+    cfg.cluster.partitioned = true;
+    auto errs = errorsMatching(cfg.validate(), "cluster.partitioned");
+    EXPECT_FALSE(errs.empty()) << "partitioned without enabled must be rejected";
+}
+
+TEST(TimestarConfigValidateTest, ClusterPartitionedWithEnabledPasses) {
+    timestar::TimestarConfig cfg;
+    cfg.cluster.enabled = true;
+    cfg.cluster.partitioned = true;
+    cfg.cluster.node_id = 1;
+    cfg.cluster.peers = {"127.0.0.1:8086"};
+    auto errs = errorsMatching(cfg.validate(), "cluster.partitioned");
+    EXPECT_TRUE(errs.empty()) << "partitioned with a valid enabled cluster must pass";
+}
+
+// ===========================================================================
 // server.port
 // ===========================================================================
 

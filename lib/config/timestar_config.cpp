@@ -56,6 +56,8 @@ std::vector<std::string> TimestarConfig::validate() const {
         if (cluster.node_id == 0 || cluster.node_id > cluster.peers.size()) {
             errors.emplace_back("cluster.node_id must be in [1, len(cluster.peers)]");
         }
+    } else if (cluster.partitioned) {
+        errors.emplace_back("cluster.partitioned requires cluster.enabled");
     }
 
     if (storage.wal_size_threshold == 0) {
@@ -487,6 +489,7 @@ void applyEnvironmentOverrides(TimestarConfig& cfg) {
 
     // Cluster
     envBool("TIMESTAR_CLUSTER_ENABLED", cfg.cluster.enabled);
+    envBool("TIMESTAR_CLUSTER_PARTITIONED", cfg.cluster.partitioned);
     envU16("TIMESTAR_CLUSTER_NODE_ID", cfg.cluster.node_id);
     // TIMESTAR_CLUSTER_PEERS is a comma-separated list of "host:port" in node-id
     // order (index 0 == node 1), including this node's own address.

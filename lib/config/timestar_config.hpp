@@ -202,6 +202,13 @@ struct ClusterConfig {
     // Every node's "host:port" address, in id order (index 0 == node 1). Includes
     // self; peers to contact are all entries except this node's own.
     std::vector<std::string> peers;
+    // VShard-PARTITIONED data plane (integration plan M2). When false (default),
+    // cluster mode is M1 full replication (every write broadcast to all peers).
+    // When true, data is partitioned by VShard owner: writes route to the owner
+    // node and queries fan out + merge. Off by default so an existing M1 cluster is
+    // byte-identical; requires `enabled`. A partitioned cluster additionally starts
+    // the data-plane RPC listener (HTTP port + 1000).
+    bool partitioned = false;
 };
 
 // Seastar settings parsed from [seastar] TOML section.
@@ -341,7 +348,8 @@ struct glz::meta<timestar::StreamingConfig> {
 template <>
 struct glz::meta<timestar::ClusterConfig> {
     using T = timestar::ClusterConfig;
-    static constexpr auto value = object("enabled", &T::enabled, "node_id", &T::node_id, "peers", &T::peers);
+    static constexpr auto value =
+        object("enabled", &T::enabled, "node_id", &T::node_id, "peers", &T::peers, "partitioned", &T::partitioned);
 };
 
 template <>
