@@ -81,16 +81,62 @@ seastar::future<> ClusterDataPlane::start(const ClusterConfig& cfg, seastar::sha
     finalizer_ = std::make_unique<http::HttpQueryHandler>(&engines);
     router_ = std::make_unique<data::NodeWriteRouter>(*dir_, *local_, *rpc_);
     coord_ = std::make_unique<data::NodeQueryCoordinator>(*dir_, *local_, *rpc_, *finalizer_);
+
+    // RF=3 replicated write path (integration plan M3). Composition proven by
+    // replicated_data_plane_test; here we wire the REAL transports. Reads still fan
+    // out via coord_ (v1 leader reads land on the primary, == the leader under the
+    // placement model). Group instantiation is the real prod cost: RF*4096/N groups
+    // per node (see the group-granularity note in the plan).
+    if (cfg.replication_factor > 1) {
+        raftTransport_ = std::make_unique<raft::RaftRpcTransport>();
+        std::filesystem::path journalRoot = timestar::dataRootPath();
+        journalRoot /= "cluster_raft";
+        rdp_ = std::make_unique<ReplicatedDataPlane>(*local_, *raftTransport_, *rpc_, *dir_, rt_->selfId, journalRoot);
+        rpc_->setProposeSink(rdp_->proposeSink());
+
+        // Serve Raft on this node's own Raft address; each envelope routes to its
+        // group via the host's registry.
+        seastar::net::inet_address rAddr = co_await resolveHost(self.host);
+        co_await raftTransport_->start(
+            seastar::socket_address(rAddr, static_cast<uint16_t>(self.port + kRaftPortOffset)),
+            [this](raft::Envelope env) { return rdp_->host().registry().deliver(std::move(env)); });
+        for (const auto& [id, addr] : rt_->peerAddresses) {
+            if (id == rt_->selfId)
+                continue;
+            const HostPort hp = parseHostPort(addr);
+            try {
+                seastar::net::inet_address a = co_await resolveHost(hp.host);
+                raftTransport_->addPeer(id, seastar::socket_address(a, static_cast<uint16_t>(hp.port + kRaftPortOffset)));
+            } catch (const std::exception& e) {
+                timestar::http_log.warn("cluster raft: peer {} ({}) unresolved at startup: {}", id, addr, e.what());
+            }
+        }
+
+        // Instantiate this node's replicated VShard groups from placement.
+        for (const auto& [vshard, voters] : rt_->localReplicaGroups())
+            co_await rdp_->addVShard(vshard, voters);
+        rdp_->startTicking();
+        replicated_ = true;
+    }
     co_return;
 }
 
 seastar::future<> ClusterDataPlane::stop() {
+    // rdp_ (Raft groups + tick timer) BEFORE the transports it uses.
+    if (rdp_)
+        co_await rdp_->stop();
+    if (raftTransport_)
+        co_await raftTransport_->stop();
     if (rpc_)
         co_await rpc_->stop();
     co_return;
 }
 
 seastar::future<> ClusterDataPlane::write(data::WriteBatch batch) {
+    // RF=3: replicate to each VShard's Raft leader (durable quorum commit). RF=1/M2:
+    // apply directly on the owner.
+    if (replicated_)
+        return rdp_->write(std::move(batch));
     if (!router_)
         throw std::runtime_error("ClusterDataPlane::write before start");
     return router_->write(std::move(batch));

@@ -6,8 +6,10 @@
 #include "../data/dataplane_rpc.hpp"
 #include "../data/node_query_coordinator.hpp"
 #include "../data/node_write_router.hpp"
+#include "../raft/raft_rpc_transport.hpp"
 #include "cluster_runtime.hpp"
 #include "engine_local_store.hpp"
+#include "replicated_data_plane.hpp"
 
 #include <memory>
 #include <optional>
@@ -20,6 +22,8 @@ namespace timestar::cluster {
 // [cluster] peers list carries HTTP host:port; the partitioned data plane needs its
 // own listener). HTTP 8086 -> data-plane 9086.
 inline constexpr uint16_t kDataPlanePortOffset = 1000;
+// The Raft (replica<->replica) RPC listener port offset. HTTP 8086 -> Raft 10086.
+inline constexpr uint16_t kRaftPortOffset = 2000;
 
 // The node-level composition that wires every M2 brick into one live service
 // (integration plan M2): ClusterRuntime placement -> EngineLocalStore sink ->
@@ -63,6 +67,12 @@ private:
     std::unique_ptr<http::HttpQueryHandler> finalizer_;
     std::unique_ptr<data::NodeWriteRouter> router_;
     std::unique_ptr<data::NodeQueryCoordinator> coord_;
+    // RF=3 replicated path (replication_factor > 1); null in the RF=1/M2 mode.
+    // Declared LAST so rdp_ (which borrows rpc_, raftTransport_, dir_, local_) tears
+    // down first.
+    std::unique_ptr<raft::RaftRpcTransport> raftTransport_;
+    std::unique_ptr<ReplicatedDataPlane> rdp_;
+    bool replicated_ = false;
 };
 
 }  // namespace timestar::cluster
