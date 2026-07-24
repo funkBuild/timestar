@@ -1,0 +1,158 @@
+#include "engine_local_store.hpp"
+
+#include "../../core/placement_table.hpp"
+#include "../../core/vshard.hpp"
+#include "../../index/index_backend.hpp"
+
+#include <map>
+#include <seastar/core/coroutine.hh>
+#include <utility>
+
+namespace timestar::cluster {
+
+using ::MetadataOp;  // MetadataOp is in the global namespace (like TSMValueType/SeriesId128)
+
+EngineLocalStore::EngineLocalStore(seastar::sharded<Engine>& engines, bool vshardCohesiveRouting)
+    : engines_(engines), vshardCohesive_(vshardCohesiveRouting), cores_(seastar::smp::count) {}
+
+unsigned EngineLocalStore::coreFor(const SeriesId128& id) const {
+    if (vshardCohesive_)
+        return timestar::assignCore(timestar::VShardId{timestar::virtualShard(id)}, cores_);
+    return timestar::routeToCore(id);
+}
+
+namespace {
+// Build a typed TimeStarInsert<T> from a WriteSeries (already known to be
+// consistent). fromSeriesKey parses measurement/field/tags; the cached key/id
+// skip a rebuild+rehash downstream.
+template <typename T>
+TimeStarInsert<T> makeInsert(const data::WriteSeries& s, const SeriesId128& id, std::vector<T> values) {
+    TimeStarInsert<T> ins = TimeStarInsert<T>::fromSeriesKey(s.seriesKey);
+    ins.timestamps = s.timestamps;
+    ins.values = std::move(values);
+    ins.revisions = s.revisions;  // pass-through; Engine must not re-stamp a non-empty vector
+    ins.setCachedSeriesKey(s.seriesKey);
+    ins.setCachedSeriesId128(id);
+    return ins;
+}
+}  // namespace
+
+seastar::future<> EngineLocalStore::applyWrites(data::WriteBatch batch) {
+    std::map<unsigned, std::vector<TimeStarInsert<double>>> doubles;
+    std::map<unsigned, std::vector<TimeStarInsert<int64_t>>> ints;
+    std::map<unsigned, std::vector<TimeStarInsert<bool>>> bools;
+    std::map<unsigned, std::vector<TimeStarInsert<std::string>>> strings;
+    std::vector<MetadataOp> metaOps;
+    metaOps.reserve(batch.series.size());
+
+    for (auto& s : batch.series) {
+        if (!s.consistent())
+            throw std::runtime_error("cluster applyWrites: inconsistent WriteSeries");
+        const SeriesId128 id = SeriesId128::fromSeriesKey(s.seriesKey);
+        const unsigned core = coreFor(id);
+        uint64_t minTs = 0, maxTs = 0;
+        if (!s.timestamps.empty()) {
+            minTs = s.timestamps.front();
+            maxTs = s.timestamps.front();
+            for (uint64_t t : s.timestamps) {
+                minTs = std::min(minTs, t);
+                maxTs = std::max(maxTs, t);
+            }
+        }
+        std::string measurement, field;
+        std::map<std::string, std::string> tags;
+        switch (s.type) {
+            case TSMValueType::Float: {
+                auto ins = makeInsert<double>(s, id, std::get<0>(s.values));
+                measurement = ins.measurement;
+                field = ins.field;
+                tags = ins.tags;
+                doubles[core].push_back(std::move(ins));
+                break;
+            }
+            case TSMValueType::Integer: {
+                auto ins = makeInsert<int64_t>(s, id, std::get<1>(s.values));
+                measurement = ins.measurement;
+                field = ins.field;
+                tags = ins.tags;
+                ints[core].push_back(std::move(ins));
+                break;
+            }
+            case TSMValueType::Boolean: {
+                auto ins = makeInsert<bool>(s, id, std::get<2>(s.values));
+                measurement = ins.measurement;
+                field = ins.field;
+                tags = ins.tags;
+                bools[core].push_back(std::move(ins));
+                break;
+            }
+            case TSMValueType::String: {
+                auto ins = makeInsert<std::string>(s, id, std::get<3>(s.values));
+                measurement = ins.measurement;
+                field = ins.field;
+                tags = ins.tags;
+                strings[core].push_back(std::move(ins));
+                break;
+            }
+        }
+        MetadataOp op;
+        op.valueType = s.type;
+        op.measurement = std::move(measurement);
+        op.fieldName = std::move(field);
+        op.tags = std::move(tags);
+        op.minTs = minTs;
+        op.maxTs = maxTs;
+        op.seriesId = id;
+        metaOps.push_back(std::move(op));
+    }
+
+    // Dispatch each per-core typed batch to its owning core, concurrently, then
+    // await all. Data first, then the schema sync (mirrors the write handler).
+    std::vector<seastar::future<>> pending;
+    for (auto& [core, v] : doubles)
+        pending.push_back(engines_.invoke_on(
+            core, [v = std::move(v)](Engine& e) mutable { return e.insertBatch<double>(std::move(v)).discard_result(); }));
+    for (auto& [core, v] : ints)
+        pending.push_back(engines_.invoke_on(
+            core, [v = std::move(v)](Engine& e) mutable { return e.insertBatch<int64_t>(std::move(v)).discard_result(); }));
+    for (auto& [core, v] : bools)
+        pending.push_back(engines_.invoke_on(
+            core, [v = std::move(v)](Engine& e) mutable { return e.insertBatch<bool>(std::move(v)).discard_result(); }));
+    for (auto& [core, v] : strings)
+        pending.push_back(engines_.invoke_on(core, [v = std::move(v)](Engine& e) mutable {
+            return e.insertBatch<std::string>(std::move(v)).discard_result();
+        }));
+
+    std::exception_ptr firstErr;
+    for (auto& f : pending) {
+        try {
+            co_await std::move(f);
+        } catch (...) {
+            if (!firstErr)
+                firstErr = std::current_exception();
+        }
+    }
+    if (firstErr)
+        std::rethrow_exception(firstErr);
+
+    if (!metaOps.empty())
+        co_await engines_.local().indexMetadataSync(std::move(metaOps));
+    co_return;
+}
+
+seastar::future<bool> EngineLocalStore::applyDelete(std::string seriesKey, uint64_t start, uint64_t end) {
+    const SeriesId128 id = SeriesId128::fromSeriesKey(seriesKey);
+    const unsigned core = coreFor(id);
+    co_return co_await engines_.invoke_on(
+        core, [seriesKey = std::move(seriesKey), start, end](Engine& e) mutable {
+            return e.deleteRange(std::move(seriesKey), start, end);
+        });
+}
+
+seastar::future<> EngineLocalStore::applyRetention(std::string, uint64_t) {
+    // Retention-cutoff application is wired in a later milestone (M1.x/M6); the
+    // command type carries it, but the M2 write path does not use it yet.
+    co_return;
+}
+
+}  // namespace timestar::cluster
