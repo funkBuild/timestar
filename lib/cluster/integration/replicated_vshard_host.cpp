@@ -69,6 +69,23 @@ seastar::future<bool> ReplicatedVShardHost::propose(uint16_t vshard, const data:
     return g->proposeAndAwaitApplied(data::encodeReplicatedCommand(cmd));
 }
 
+seastar::future<uint64_t> ReplicatedVShardHost::snapshotVShard(uint16_t vshard) {
+    raft::RaftGroup* g = registry_.group(vshard);
+    if (!g)
+        co_return 0;  // not hosted here
+    // Capture only FLUSHED (TSM) data. manifest.snapshotRevision is the highest
+    // revision the snapshot reproduces; since revisions are stamped from the log index
+    // (ADR 0003), it is a safe log-truncation boundary. Entries after it may hold data
+    // that lives only in the memory store, so they MUST stay in the log -- compacting to
+    // appliedIndex would truncate them and lose unflushed data on restart.
+    auto payload = co_await store_.buildVShardSnapshot(VShardId{vshard});
+    const uint64_t upto = payload.manifest.snapshotRevision;
+    if (upto == 0)
+        co_return 0;  // no flushed data yet -> nothing to compact
+    co_await g->compact(upto, data::encodeSnapshotPayload(std::move(payload)));
+    co_return upto;
+}
+
 seastar::future<bool> ReplicatedVShardHost::proposeBatch(data::WriteBatch batch) {
     // Group the batch's series by VShard (a series routes to its VShard by hash,
     // same authority every replica uses). schemaVersion is carried per group.

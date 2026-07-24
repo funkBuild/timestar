@@ -65,6 +65,16 @@ public:
     // Cross-group atomicity is out of scope for v1.
     seastar::future<bool> proposeBatch(data::WriteBatch batch) override;
 
+    // Compact this node's Raft log for `vshard` by snapshotting its FLUSHED data and
+    // handing the payload to RaftGroup::compact (the M3 snapshot PRODUCER). Truncates
+    // the log only up to the snapshot's covered revision (== the log index, ADR 0003):
+    // entries whose data is still in the memory store (revision > that) are RETAINED,
+    // so no unflushed data is lost -- compacting to appliedIndex instead would truncate
+    // them. Returns the revision compacted to (0 if the VShard is not hosted here or
+    // has no flushed data yet). Any replica may compact its own log (not leader-only).
+    // Requires a VShard-cohesive core count (buildVShardSnapshot throws otherwise).
+    seastar::future<uint64_t> snapshotVShard(uint16_t vshard);
+
     raft::RaftGroup* group(uint16_t vshard);
     // LeaderResolver: the current Raft leader of `vshard` per this node's local group
     // (kNoNode if not hosted here or no leader elected yet).

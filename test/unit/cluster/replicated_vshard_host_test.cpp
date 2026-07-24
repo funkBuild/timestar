@@ -5,6 +5,7 @@
 // hosting/management layer (the multi-engine RF=3 convergence is proven separately
 // in engine_rf3_test).
 #include "../../../lib/cluster/integration/replicated_vshard_host.hpp"
+#include "../../../lib/core/placement_table.hpp"  // virtualShard
 #include "../../../lib/core/vshard.hpp"
 #include "../../../lib/http/http_query_handler.hpp"
 #include "../../../lib/utils/series_key.hpp"
@@ -14,8 +15,10 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <chrono>
 #include <filesystem>
 #include <seastar/core/coroutine.hh>
+#include <seastar/core/sleep.hh>
 #include <seastar/core/thread.hh>
 #include <set>
 
@@ -183,6 +186,105 @@ TEST_F(ReplicatedVShardHostTest, ProposeBatchSplitsAcrossVShards) {
         };
         EXPECT_DOUBLE_EQ(latest("a"), 10.0);
         EXPECT_DOUBLE_EQ(latest("b"), 20.0);
+
+        host.stop().get();
+        fs::remove_all(jroot);
+    }).get();
+}
+
+// M3 snapshot PRODUCER: after committing writes and flushing to TSM, snapshotVShard
+// builds the payload and hands it to RaftGroup::compact, truncating the log to the
+// snapshot's covered revision. Before any flush there is nothing to compact; the
+// compaction never exceeds applied state and never loses committed data. On a
+// non-cohesive core count it refuses (throws) rather than shipping a partial.
+TEST_F(ReplicatedVShardHostTest, SnapshotVShardCompactsLogOverFlushedData) {
+    seastar::async([] {
+        ScopedShardedEngine eng;
+        eng.start();
+        cluster::EngineLocalStore store(*eng);
+        NoopTransport transport;
+        fs::path jroot = tmpDir();
+        cluster::ReplicatedVShardHost host(store, transport, /*self=*/1, jroot);
+
+        RaftOptions opts;
+        opts.electionTimeoutMin = opts.electionTimeoutMax = 1;
+        opts.heartbeatTimeout = 1;
+
+        // Pick a series whose VShard maps to core 0 so buildVShardSnapshot's internal
+        // invoke_on(assignCore) is inline on this shard (no cross-shard payload move),
+        // exactly as the production apply path -- which runs on the VShard's core --
+        // guarantees.
+        std::string key;
+        uint16_t vs = 0;
+        for (int i = 0;; ++i) {
+            key = buildSeriesKey("snapprod", {{"host", "h" + std::to_string(i)}}, "value");
+            vs = timestar::virtualShard(SeriesId128::fromSeriesKey(key));
+            if (timestar::assignCore(VShardId{vs}, seastar::smp::count) == 0)
+                break;
+        }
+        const unsigned core0 = 0;
+
+        host.addVShard(vs, {1}, opts).get();
+        RaftGroup* g = host.group(vs);
+        ASSERT_NE(g, nullptr);
+        for (int i = 0; i < 10 && !g->isLeader(); ++i)
+            g->tick().get();
+        ASSERT_TRUE(g->isLeader());
+
+        // Commit two writes to this VShard's group.
+        for (double v : {1.0, 2.0}) {
+            data::WriteSeries s;
+            s.seriesKey = key;
+            s.type = TSMValueType::Float;
+            s.timestamps = {BASE + static_cast<uint64_t>(v)};
+            s.values = std::vector<double>{v};
+            data::WriteBatch b;
+            b.series = {std::move(s)};
+            auto f = host.proposeBatch(std::move(b));
+            for (int i = 0; i < 20 && !f.available(); ++i)
+                g->tick().get();
+            EXPECT_TRUE(f.get());
+        }
+        const uint64_t appliedBefore = g->appliedIndex();
+        EXPECT_GT(appliedBefore, 0u);
+
+        if (!timestar::vshardsCohesiveOnCores(seastar::smp::count)) {
+            // Flush then attempt: a non-cohesive core count must REFUSE, not ship partial.
+            (*eng).invoke_on_all([](Engine& e) { return e.rolloverMemoryStore(); }).get();
+            EXPECT_THROW(host.snapshotVShard(vs).get(), std::runtime_error);
+            host.stop().get();
+            fs::remove_all(jroot);
+            return;
+        }
+
+        // Before any flush: no TSM data -> nothing to compact, log untouched.
+        EXPECT_EQ(host.snapshotVShard(vs).get(), 0u);
+        EXPECT_EQ(g->node().log().snapshotIndex(), 0u);
+
+        // Flush to TSM, then snapshot compacts the log.
+        (*eng).invoke_on_all([](Engine& e) { return e.rolloverMemoryStore(); }).get();
+        for (int i = 0; i < 300; ++i) {
+            auto n = (*eng).invoke_on(core0, [](Engine& e) { return e.getTSMFileCount(); }).get();
+            if (n > 0)
+                break;
+            seastar::sleep(std::chrono::milliseconds(100)).get();
+        }
+
+        const uint64_t compacted = host.snapshotVShard(vs).get();
+        EXPECT_GT(compacted, 0u) << "flushed data must be snapshotted";
+        EXPECT_LE(compacted, appliedBefore) << "compact only over flushed (<= applied) data";
+        EXPECT_EQ(g->node().log().snapshotIndex(), compacted) << "log truncated to the snapshot boundary";
+
+        // Committed data survives compaction (queryable by seriesId on the VShard core).
+        auto rq = (*eng)
+                      .invoke_on(core0,
+                                 [key](Engine& e) {
+                                     const auto sid = SeriesId128::fromSeriesKey(key);
+                                     return e.query(key, sid, 0, UINT64_MAX);
+                                 })
+                      .get();
+        ASSERT_TRUE(rq.has_value());
+        EXPECT_EQ(std::get<QueryResult<double>>(rq.value()).values.size(), 2u);
 
         host.stop().get();
         fs::remove_all(jroot);
