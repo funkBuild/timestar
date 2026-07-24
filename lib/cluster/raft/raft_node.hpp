@@ -32,14 +32,24 @@ struct RaftOptions {
 // and apply `committed` only after it is durable.
 class RaftNode {
 public:
+    // A confirmed ReadIndex: once applied() >= readIndex, the leader may serve the
+    // read for `context` linearizably (the barrier the plan requires for leader
+    // reads and for reconciling missed group-0 notifications).
+    struct ReadState {
+        uint64_t context = 0;
+        LogIndex readIndex = kNoIndex;
+    };
+
     struct Ready {
         std::optional<HardState> hardState;  // persist (fsync) if present, before messages
         std::optional<Snapshot> snapshot;    // a received snapshot to install (persist before messages)
         std::vector<LogEntry> entries;       // newly (re)written log entries to persist
         std::vector<LogEntry> committed;     // newly committed entries to apply, in order
         std::vector<Message> messages;       // send only after hardState+snapshot+entries are durable
+        std::vector<ReadState> readStates;   // ReadIndex barriers confirmed this cycle
         bool empty() const {
-            return !hardState && !snapshot && entries.empty() && committed.empty() && messages.empty();
+            return !hardState && !snapshot && entries.empty() && committed.empty() &&
+                   messages.empty() && readStates.empty();
         }
     };
 
@@ -59,6 +69,12 @@ public:
     // leader first ensures `target` is caught up, then sends it a TimeoutNow so it
     // elects immediately. No-op if we are not the leader or target is not a voter.
     void transferLeadership(NodeId target);
+
+    // Request a linearizable ReadIndex barrier for `context` (leader only). Starts
+    // a heartbeat confirmation round; the barrier surfaces in Ready.readStates
+    // once a quorum has confirmed current-term leadership AFTER this request.
+    // Returns false (no barrier) if not the leader -- the caller redirects.
+    bool requestReadIndex(uint64_t context);
 
     // Compact this node's log up to `upto` (<= commitIndex) and record the
     // resulting snapshot so the leader can serve it to lagging followers. Called
@@ -122,6 +138,7 @@ private:
     void sendAppend(NodeId peer);
     void sendInstallSnapshot(NodeId peer);
     void maybeAdvanceCommitAsLeader();
+    void confirmReads();  // move quorum-confirmed pending reads to confirmedReads_
     void handleInstallSnapshot(NodeId from, const InstallSnapshot& is);
     void handleInstallSnapshotReply(NodeId from, const InstallSnapshotReply& rr);
 
@@ -157,6 +174,16 @@ private:
     // CheckQuorum: voters we have heard from since the last quorum check.
     std::set<NodeId> recentActive_;
     NodeId leadTransferee_ = kNoNode;  // in-flight leader-transfer target (0 = none)
+
+    // ReadIndex tracking (leader).
+    uint64_t readSeq_ = 0;  // monotonic heartbeat sequence for read confirmation
+    struct PendingRead {
+        uint64_t context;
+        uint64_t atSeq;  // readSeq at request; confirmed once a quorum echoes >= this
+    };
+    std::vector<PendingRead> pendingReads_;
+    std::map<NodeId, uint64_t> ackedReadSeq_;  // highest readSeq each voter has echoed
+    std::vector<ReadState> confirmedReads_;    // drained via Ready.readStates
 
     // Output accumulation.
     bool hsDirty_ = false;

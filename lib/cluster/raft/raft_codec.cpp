@@ -158,6 +158,7 @@ std::string encodeEnvelope(const Envelope& env) {
                 w.u64(p.prevLogIndex);
                 w.u64(p.prevLogTerm);
                 w.u64(p.leaderCommit);
+                w.u64(p.readSeq);
                 w.u32(static_cast<uint32_t>(p.entries.size()));
                 for (const auto& e : p.entries)
                     writeEntry(w, e);
@@ -168,6 +169,7 @@ std::string encodeEnvelope(const Envelope& env) {
                 w.u64(p.matchIndex);
                 w.u64(p.conflictIndex);
                 w.u64(p.conflictTerm);
+                w.u64(p.readSeq);
             } else if constexpr (std::is_same_v<T, InstallSnapshot>) {
                 w.u8(kInstallSnapshot);
                 w.u64(p.term);
@@ -224,6 +226,7 @@ std::optional<Envelope> decodeEnvelope(const std::string& bytes) {
             p.prevLogIndex = r.u64();
             p.prevLogTerm = r.u64();
             p.leaderCommit = r.u64();
+            p.readSeq = r.u64();
             uint32_t n = r.u32();
             // Guard against a bogus count before reserving/allocating.
             if (!r.ok || !r.avail(static_cast<size_t>(n)))  // each entry is >= 1 byte
@@ -243,6 +246,7 @@ std::optional<Envelope> decodeEnvelope(const std::string& bytes) {
             p.matchIndex = r.u64();
             p.conflictIndex = r.u64();
             p.conflictTerm = r.u64();
+            p.readSeq = r.u64();
             env.message.payload = p;
             break;
         }

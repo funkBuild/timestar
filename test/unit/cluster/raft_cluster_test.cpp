@@ -66,6 +66,10 @@ public:
 
     RaftNode& node(NodeId id) { return *nodes_.at(id); }
     const std::vector<std::string>& applied(NodeId id) const { return applied_.at(id); }
+    std::vector<RaftNode::ReadState> reads(NodeId id) {
+        auto it = reads_.find(id);
+        return it == reads_.end() ? std::vector<RaftNode::ReadState>{} : it->second;
+    }
 
     // Drain every node's Ready, route messages to reachable peers, apply
     // committed entries, and repeat until the system is quiescent.
@@ -91,6 +95,8 @@ public:
                     if (e.type == EntryType::Normal && !e.data.empty())
                         applied_[id].push_back(e.data);
                 }
+                for (auto& rs : rd.readStates)
+                    reads_[id].push_back(rs);
                 for (auto& m : rd.messages) {
                     if (reachable(m.from, m.to))
                         inflight_.push_back(m);
@@ -140,6 +146,7 @@ private:
     std::vector<NodeId> ids_;
     std::map<NodeId, std::unique_ptr<RaftNode>> nodes_;
     std::map<NodeId, std::vector<std::string>> applied_;
+    std::map<NodeId, std::vector<RaftNode::ReadState>> reads_;
     std::set<NodeId> isolated_;
     std::deque<Message> inflight_;
 };
@@ -444,6 +451,50 @@ TEST(RaftClusterTest, LeaderTransferMovesLeadership) {
     net.run();
     EXPECT_EQ(net.applied(1).back(), "y");
     EXPECT_EQ(net.applied(2).back(), "y");
+}
+
+TEST(RaftClusterTest, ReadIndexConfirmsAfterQuorumHeartbeat) {
+    Network net({1, 2, 3}, opts());
+    net.node(1).campaign();
+    net.run();
+    ASSERT_EQ(net.leader(), 1u);
+    net.node(1).propose("v1");
+    net.run();
+    const LogIndex commit = net.node(1).commitIndex();
+
+    // Request a ReadIndex on the leader; it confirms once a quorum echoes the
+    // heartbeat round (proving current-term leadership after the request).
+    EXPECT_TRUE(net.node(1).requestReadIndex(/*context=*/77));
+    net.run();
+    bool found = false;
+    for (const auto& rs : net.reads(1)) {
+        if (rs.context == 77u) {
+            found = true;
+            EXPECT_GE(rs.readIndex, commit);  // barrier at/after the committed state
+        }
+    }
+    EXPECT_TRUE(found);
+
+    // A follower cannot serve a ReadIndex (redirect to leader).
+    EXPECT_FALSE(net.node(2).requestReadIndex(88));
+}
+
+TEST(RaftClusterTest, ReadIndexNotConfirmedWhilePartitionedFromQuorum) {
+    Network net({1, 2, 3}, opts());
+    net.node(1).campaign();
+    net.run();
+    ASSERT_EQ(net.leader(), 1u);
+    net.node(1).propose("x");
+    net.run();
+
+    // Isolate the leader from both followers: it can no longer confirm a read
+    // (no quorum echo), so no ReadState is produced.
+    net.isolate(2);
+    net.isolate(3);
+    EXPECT_TRUE(net.node(1).requestReadIndex(5));
+    net.run();
+    for (const auto& rs : net.reads(1))
+        EXPECT_NE(rs.context, 5u);  // never confirmed while partitioned
 }
 
 TEST(RaftClusterTest, LaggingFollowerCaughtUpByInstallSnapshot) {

@@ -38,6 +38,10 @@ struct AppendEntries {
     Term prevLogTerm = kNoTerm;
     std::vector<LogEntry> entries;
     LogIndex leaderCommit = kNoIndex;
+    // ReadIndex barrier: a monotonic heartbeat sequence the follower echoes back
+    // so the leader can confirm current-term leadership AFTER a read request (a
+    // stale in-flight ack carries an older readSeq and cannot falsely confirm).
+    uint64_t readSeq = 0;
 };
 
 struct AppendEntriesReply {
@@ -52,6 +56,8 @@ struct AppendEntriesReply {
     // than prevLogIndex"; conflictIndex is then our lastIndex()+1.
     LogIndex conflictIndex = kNoIndex;
     Term conflictTerm = kNoTerm;
+    // Echoed AppendEntries.readSeq (for the ReadIndex confirmation round).
+    uint64_t readSeq = 0;
 };
 
 // §7 snapshot install, when the follower has fallen behind the leader's

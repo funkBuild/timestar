@@ -164,6 +164,8 @@ void RaftNode::becomeFollower(Term term, NodeId leader) {
     matchIndex_.clear();
     recentActive_.clear();
     leadTransferee_ = kNoNode;
+    pendingReads_.clear();  // drop unconfirmed reads; the caller retries at the new leader
+    ackedReadSeq_.clear();
     resetElectionTimer();
 }
 
@@ -209,6 +211,9 @@ void RaftNode::becomeLeader() {
     recentActive_.clear();  // fresh CheckQuorum window
 
     leadTransferee_ = kNoNode;
+    pendingReads_.clear();  // fresh ReadIndex tracking under this term
+    ackedReadSeq_.clear();
+    ackedReadSeq_[id_] = readSeq_;
 
     // Initialize replication progress for every peer (both voting sets AND
     // learners): optimistically probe from our log end.
@@ -255,6 +260,7 @@ void RaftNode::sendAppend(NodeId peer) {
     ae.prevLogTerm = *prevTerm;
     ae.entries = log_.entriesFrom(ni);
     ae.leaderCommit = commitIndex_;
+    ae.readSeq = readSeq_;  // followers echo this for ReadIndex confirmation
     send(Message{.to = peer, .from = id_, .payload = std::move(ae)});
 }
 
@@ -379,6 +385,12 @@ void RaftNode::handleAppendEntriesReply(NodeId from, const AppendEntriesReply& r
     if (role_ != Role::Leader || !(isVoter(from) || isLearner(from)))
         return;
 
+    // ReadIndex: record the highest readSeq this voter has echoed, then re-check
+    // whether any pending read is now quorum-confirmed.
+    if (rr.readSeq > ackedReadSeq_[from])
+        ackedReadSeq_[from] = rr.readSeq;
+    confirmReads();
+
     if (rr.success) {
         if (rr.matchIndex > matchIndex_[from])
             matchIndex_[from] = rr.matchIndex;
@@ -447,8 +459,10 @@ void RaftNode::maybeAdvanceCommitAsLeader() {
             return;
         }
     }
-    if (committedSomething)
-        bcastAppend();  // let followers learn the new commit promptly
+    if (committedSomething) {
+        confirmReads();  // a current-term commit may release reads held for the no-op
+        bcastAppend();   // let followers learn the new commit promptly
+    }
 }
 
 bool RaftNode::maybeAppendLeaveJoint() {
@@ -704,6 +718,7 @@ void RaftNode::handleAppendEntries(NodeId from, const AppendEntries& ae) {
         AppendEntriesReply r;
         r.term = currentTerm_;
         r.success = false;
+        r.readSeq = ae.readSeq;  // echo for ReadIndex confirmation
         if (log_.lastIndex() < ae.prevLogIndex) {
             // Our log is too short: tell the leader to back up to our end.
             r.conflictTerm = kNoTerm;
@@ -740,6 +755,7 @@ void RaftNode::handleAppendEntries(NodeId from, const AppendEntries& ae) {
     r.term = currentTerm_;
     r.success = true;
     r.matchIndex = lastNew;
+    r.readSeq = ae.readSeq;  // echo for ReadIndex confirmation
     send(Message{.to = from, .from = id_, .payload = r});
 }
 
@@ -747,6 +763,60 @@ void RaftNode::advanceCommitAsFollower(LogIndex leaderCommit, LogIndex lastNewIn
     const LogIndex want = std::min(leaderCommit, lastNewIndex);
     if (want > commitIndex_)
         commitIndex_ = std::min(want, log_.lastIndex());
+}
+
+bool RaftNode::requestReadIndex(uint64_t context) {
+    if (role_ != Role::Leader)
+        return false;
+    // Start a fresh confirmation round: bump the heartbeat sequence, record the
+    // read against it, self-ack, and heartbeat. A quorum echoing this (or a
+    // higher) seq proves current-term leadership AFTER this request.
+    ++readSeq_;
+    ackedReadSeq_[id_] = readSeq_;
+    pendingReads_.push_back({context, readSeq_});
+    confirmReads();  // single-voter groups confirm immediately
+    if (!pendingReads_.empty())
+        bcastAppend();
+    return true;
+}
+
+void RaftNode::confirmReads() {
+    if (role_ != Role::Leader || pendingReads_.empty())
+        return;
+    // A read is only linearizable once the leader has committed an entry in its
+    // CURRENT term (so commitIndex reflects real committed state, not a stale
+    // prior-term value). becomeLeader's no-op guarantees this shortly after
+    // election; until then, hold the reads.
+    if (log_.term(commitIndex_) != std::optional<Term>(currentTerm_))
+        return;
+
+    // The highest readSeq a quorum of voters has echoed.
+    std::vector<uint64_t> seqs;
+    seqs.reserve(config_.voters.size());
+    for (NodeId v : config_.voters)
+        seqs.push_back(ackedReadSeq_.count(v) ? ackedReadSeq_.at(v) : 0);
+    std::sort(seqs.begin(), seqs.end(), std::greater<>());
+    uint64_t quorumSeq = seqs.empty() ? 0 : seqs[majSize(config_.voters) - 1];
+    if (config_.joint()) {  // during a transition, need both majorities
+        std::vector<uint64_t> oseqs;
+        for (NodeId v : config_.votersOutgoing)
+            oseqs.push_back(ackedReadSeq_.count(v) ? ackedReadSeq_.at(v) : 0);
+        std::sort(oseqs.begin(), oseqs.end(), std::greater<>());
+        const uint64_t oSeq = oseqs.empty() ? 0 : oseqs[majSize(config_.votersOutgoing) - 1];
+        quorumSeq = std::min(quorumSeq, oSeq);
+    }
+
+    // Confirm every pending read whose round is covered, capturing the CURRENT
+    // commit index as its barrier (>= the commit at request time; still
+    // linearizable, and guaranteed to include a current-term entry).
+    std::vector<PendingRead> stillPending;
+    for (const auto& pr : pendingReads_) {
+        if (pr.atSeq <= quorumSeq)
+            confirmedReads_.push_back(ReadState{pr.context, commitIndex_});
+        else
+            stillPending.push_back(pr);
+    }
+    pendingReads_ = std::move(stillPending);
 }
 
 bool RaftNode::propose(std::string data) {
@@ -804,7 +874,7 @@ bool RaftNode::proposeConfChange(std::vector<NodeId> voters, std::vector<NodeId>
 
 bool RaftNode::hasReady() const {
     return hsDirty_ || pendingSnapshotApply_.has_value() || unstableStart_ <= log_.lastIndex() ||
-           commitIndex_ > lastApplied_ || !pendingMessages_.empty();
+           commitIndex_ > lastApplied_ || !pendingMessages_.empty() || !confirmedReads_.empty();
 }
 
 RaftNode::Ready RaftNode::ready() {
@@ -829,6 +899,7 @@ RaftNode::Ready RaftNode::ready() {
     }
 
     rd.messages = pendingMessages_;  // copy; advance() drains what was reported
+    rd.readStates = confirmedReads_;
     return rd;
 }
 
@@ -851,6 +922,8 @@ void RaftNode::advance(const Ready& rd) {
         lastApplied_ = commitIndex_;
     const size_t drained = std::min(rd.messages.size(), pendingMessages_.size());
     pendingMessages_.erase(pendingMessages_.begin(), pendingMessages_.begin() + drained);
+    const size_t readsDrained = std::min(rd.readStates.size(), confirmedReads_.size());
+    confirmedReads_.erase(confirmedReads_.begin(), confirmedReads_.begin() + readsDrained);
 }
 
 }  // namespace timestar::raft
