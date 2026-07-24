@@ -634,21 +634,30 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::hand
                           return engine.getIndex().estimateMeasurementCardinality(measurement);
                       });
 
-            // Get tag keys from local schema cache, then estimate per-tag-key cardinality
+            // Per-tag-key cardinality = number of DISTINCT values for that key. In
+            // partitioned mode the tag keys and their value sets are scattered +
+            // unioned across owners (so the count is the cluster-wide distinct count);
+            // else read from the local schema cache.
             auto& localEngine = engineSharded->local();
-            auto tagKeys = co_await localEngine.getMeasurementTags(measurement);
-
-            // Fetch all tag-key cardinalities in parallel (not sequentially)
-            std::unordered_map<std::string, double> tagCardinalities;
-            std::vector<seastar::future<std::set<std::string>>> tagFutures;
-            tagFutures.reserve(tagKeys.size());
-            std::vector<std::string> tagKeysCopy(tagKeys.begin(), tagKeys.end());
-            for (const auto& tk : tagKeysCopy) {
-                tagFutures.push_back(localEngine.getTagValues(measurement, tk));
+            std::vector<std::string> tagKeysCopy;
+            if (clusterMetadataHook) {
+                tagKeysCopy = (co_await clusterMetadataHook({timestar::data::MetadataKind::TagKeys, measurement, "", ""}))
+                                  .items;
+            } else {
+                auto tagKeys = co_await localEngine.getMeasurementTags(measurement);
+                tagKeysCopy.assign(tagKeys.begin(), tagKeys.end());
             }
-            auto tagResults = co_await seastar::when_all_succeed(tagFutures.begin(), tagFutures.end());
-            for (size_t i = 0; i < tagKeysCopy.size(); ++i) {
-                tagCardinalities[tagKeysCopy[i]] = static_cast<double>(tagResults[i].size());
+            std::unordered_map<std::string, double> tagCardinalities;
+            for (const auto& tk : tagKeysCopy) {
+                size_t distinct;
+                if (clusterMetadataHook) {
+                    distinct = (co_await clusterMetadataHook(
+                                    {timestar::data::MetadataKind::TagValues, measurement, tk, ""}))
+                                   .items.size();
+                } else {
+                    distinct = (co_await localEngine.getTagValues(measurement, tk)).size();
+                }
+                tagCardinalities[tk] = static_cast<double>(distinct);
             }
 
             rep->set_status(seastar::http::reply::status_type::ok);
