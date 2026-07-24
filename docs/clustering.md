@@ -591,6 +591,23 @@ carry no durable state. This idempotency is a standing invariant: any future
 operation type that is not naturally idempotent must ship its own dedup
 design first.
 
+Idempotency here means *replica convergence*, not *retry-invisibility across
+intervening operations*. Because a retry re-enters the log at a new, later
+position, it is ordered against whatever committed in the gap since the original
+proposal — exactly as the same operation issued once at that position would be.
+A retried delete therefore removes writes ordered before it and is superseded by
+writes ordered after it; a retried write likewise reappears after an intervening
+delete (resurrection). Both are valid linearizations: the client never received
+the first ack, so its operation is *concurrent* with anything that committed in
+the gap, and either order is legal. Consequently a `delete` acknowledgement does
+not mean data is destroyed forever while a concurrent write is still in flight,
+and the RF gate's "no acknowledged data loss" is failure-induced loss — never a
+write superseded by a later-ordered delete. Implemented in the per-VShard data
+state machine (`lib/cluster/data/data_state_machine.cpp`), where point revisions
+are assigned in log order and delete/write visibility is decided by revision;
+identical-range tombstones coalesce so repeated retries cannot grow state without
+bound.
+
 The schema path uses a group-0 compare-and-set only when a measurement/field
 is first observed or changed. Normal writes validate against cached schema.
 Field type conflicts are rejected; lexicographic conflict resolution is not

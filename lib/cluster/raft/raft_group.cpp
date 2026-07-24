@@ -52,6 +52,9 @@ seastar::future<> RaftGroup::drainReady() {
         for (const auto& rs : rd.readStates)
             confirmedReads_[rs.context] = rs.readIndex;
         releaseReadBarriers();
+        // Resolve write waiters whose entry we have now applied (or fail them all
+        // if we just lost leadership).
+        releaseApplyWaiters();
 
         // 4. Acknowledge: advance persistence/apply watermarks and drain messages.
         node_.advance(rd);
@@ -79,6 +82,50 @@ void RaftGroup::releaseReadBarriers() {
             ++it;
         }
     }
+}
+
+void RaftGroup::releaseApplyWaiters() {
+    if (!node_.isLeader()) {
+        // Leadership lost: the entry may or may not have committed. Fail every
+        // waiter so the caller retries the whole (idempotent) batch against the
+        // new leader -- an un-acknowledged write is never lost, and LWW makes a
+        // re-applied batch harmless. Never hang.
+        for (auto& [idx, p] : applyWaiters_)
+            p.set_exception(std::make_exception_ptr(std::runtime_error("propose: leadership lost before commit")));
+        applyWaiters_.clear();
+        return;
+    }
+    for (auto it = applyWaiters_.begin(); it != applyWaiters_.end();) {
+        if (appliedIndex_ >= it->first) {
+            it->second.set_value(true);
+            it = applyWaiters_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+seastar::future<bool> RaftGroup::proposeAndAwaitApplied(std::string data) {
+    // Register the waiter INSIDE the lock (mirroring readBarrier): capture the
+    // proposed entry's index and register its promise before any drainReady can
+    // observe it, so a leader flap cannot resolve or fail a half-created waiter.
+    std::optional<seastar::future<bool>> fut;
+    bool notLeader = false;
+    co_await seastar::with_semaphore(lock_, 1,
+                                     [this, data = std::move(data), &fut, &notLeader]() mutable -> seastar::future<> {
+                                         if (!node_.propose(std::move(data))) {
+                                             notLeader = true;
+                                             co_return;  // not the leader: fut stays empty
+                                         }
+                                         const LogIndex idx = node_.log().lastIndex();  // the entry we just appended
+                                         seastar::promise<bool> promise;
+                                         fut = promise.get_future();
+                                         applyWaiters_.emplace_back(idx, std::move(promise));
+                                         co_await drainReady();  // may already commit+apply (single voter) and resolve
+                                     });
+    if (notLeader)
+        co_return false;
+    co_return co_await std::move(*fut);
 }
 
 seastar::future<LogIndex> RaftGroup::readBarrier() {
@@ -149,11 +196,11 @@ seastar::future<> RaftGroup::transferLeadership(NodeId target) {
 }
 
 seastar::future<> RaftGroup::compact(LogIndex upto, std::string snapshotData) {
-    return seastar::with_semaphore(
-        lock_, 1, [this, upto, snapshotData = std::move(snapshotData)]() mutable -> seastar::future<> {
-            node_.compact(upto, std::move(snapshotData));
-            co_await drainReady();
-        });
+    return seastar::with_semaphore(lock_, 1,
+                                   [this, upto, snapshotData = std::move(snapshotData)]() mutable -> seastar::future<> {
+                                       node_.compact(upto, std::move(snapshotData));
+                                       co_await drainReady();
+                                   });
 }
 
 }  // namespace timestar::raft

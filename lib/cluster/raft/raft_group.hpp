@@ -26,6 +26,15 @@ public:
     seastar::future<> step(Message m);
     seastar::future<> tick();
     seastar::future<bool> propose(std::string data);
+    // Propose `data` and resolve only once THIS entry is committed AND applied on
+    // this node -- the commit/apply acknowledgement `propose()` does not give.
+    // Returns true when applied while continuously leader (a durable, quorum-
+    // committed write). Returns false if this node is not the leader at propose
+    // time (the caller redirects to the leader). Throws "propose: leadership lost
+    // before commit" if leadership is lost before the entry applies -- the entry
+    // may or may not have committed, so the caller retries the whole idempotent
+    // batch (LWW re-application is harmless; an un-acked write is never lost).
+    seastar::future<bool> proposeAndAwaitApplied(std::string data);
     seastar::future<> campaign();
     seastar::future<bool> proposeConfChange(std::vector<NodeId> voters, std::vector<NodeId> learners);
     seastar::future<> transferLeadership(NodeId target);
@@ -55,6 +64,9 @@ private:
 
     // Resolve any read barriers whose ReadIndex this node has now applied through.
     void releaseReadBarriers();
+    // Resolve any proposeAndAwaitApplied waiters whose entry this node has now
+    // applied; fail all of them on leadership loss (same contract as read barriers).
+    void releaseApplyWaiters();
 
     uint16_t groupId_;
     RaftNode node_;
@@ -64,10 +76,14 @@ private:
     seastar::semaphore lock_{1};  // serializes all node mutation on this core
 
     // Read-barrier tracking.
-    uint64_t appliedIndex_ = 0;              // highest entry index applied to the SM
+    uint64_t appliedIndex_ = 0;  // highest entry index applied to the SM
     uint64_t nextReadCtx_ = 1;
-    std::map<uint64_t, LogIndex> confirmedReads_;              // ctx -> ReadIndex (awaiting apply)
+    std::map<uint64_t, LogIndex> confirmedReads_;                 // ctx -> ReadIndex (awaiting apply)
     std::map<uint64_t, seastar::promise<LogIndex>> readWaiters_;  // ctx -> caller promise
+
+    // proposeAndAwaitApplied tracking: (entry index -> caller promise). Resolved
+    // true once appliedIndex_ >= index while leader; failed on leadership loss.
+    std::vector<std::pair<LogIndex, seastar::promise<bool>>> applyWaiters_;
 };
 
 }  // namespace timestar::raft

@@ -54,30 +54,59 @@ Status legend: **[ ]** open · **[~]** partial (a proxy exists) · **[x]** done.
 
 ## Phase 4 — multi-node data plane
 
-### [~] Verify the data-plane RPC transport (DataPlaneRpc) over real loopback sockets
+### [x] Verify the data-plane RPC transport (DataPlaneRpc) over real loopback sockets — DONE
 - **What:** an end-to-end socket test that a write forwarded to a VShard owner and
   a query fanned out across nodes — both over `seastar::rpc` — return the same
   answer as a single node.
-- **What exists instead:** the data-plane CORRECTNESS (RF=1 == single-node for raw
-  + every aggregation, `QUERY_INCOMPLETE` on an unassigned VShard, no partial
-  write, the subscribe cluster-guard, the operator surface) is proven
-  transport-agnostically in `timestar_unit_test`
-  (`DataPlaneRf1Test`, `DataPlaneCodecTest`, `SubscribePolicyTest`,
-  `ClusterInspectorTest`) via the injected `LocalStore`/`DataPlaneClient`. The
-  transport (`lib/cluster/data/dataplane_rpc.cpp`) compiles and its wire codec is
-  unit-tested; its `start()` succeeds over loopback.
-- **Why deferred:** the *waited* request/response path (forwardWrites/queryRemote)
-  or the transport `stop()` hangs over loopback in this environment, and the
-  socket-test binary tooling was too unstable this session to isolate whether it
-  is a real `seastar::rpc` waited-verb integration bug or a shutdown-ordering
-  deadlock (the Raft transport had a similar `stop()` deadlock, fixed with a gate
-  + no_wait). Needs a working interactive debug environment to resolve. The gate
-  property does not depend on the wire — it is proven above.
-- **Value now:** MEDIUM (wire-level confidence). **Action:** re-run
-  `timestar_cluster_socket_test` with the DataPlaneRpc test re-added
-  (`test/CMakeLists.txt` UNIT_CLUSTER_SOCKET_TESTS) once a stable socket-test
-  environment is available; compare stop() against the working
-  `raft_rpc_transport` shutdown pattern.
+- **Resolved:** `DataPlaneRpcTest.WriteForwardAndQueryFanoutOverRpc`
+  (`test/unit/cluster/dataplane_rpc_test.cpp`, in the
+  `timestar_cluster_socket_test` binary) passes under full default SMP: node 1
+  routes 30 writes to their VShard owners over RPC, then node 2 (which only
+  received inbound forwards) fans a query out to nodes 1 and 3 and merges 30
+  per-series partials, matching single-node.
+- **Root cause of the earlier hang:** the rpc server's listen socket used
+  seastar's default `connection_distribution` load-balancing, which scatters
+  inbound connections across **every** shard — but the rpc server object lives on
+  a single shard, so a connection accepted on any other shard had no server behind
+  it and the peer's *waited* call hung forever (nondeterministically, by shard
+  load; sometimes surfaced as SIGILL). The Raft transport dodged this only because
+  it is `no_wait` — a dropped connection was silently retried, never awaited.
+- **Fix:** pin the listen socket to the server's own shard with
+  `listen_options::set_fixed_cpu(this_shard_id())` (`dataplane_rpc.cpp` `start()`).
+
+### [ ] (Phase 5 note) Production Engine ↔ DataStateMachine adapter + cross-node leader-routing wiring
+- **What:** wire the replicated data path (`lib/cluster/data/replicated_vshard.hpp`,
+  `data_state_machine.*`, `replicated_router.hpp`) into the real Engine and a
+  live cross-node coordinator: a production `VShardLeader` that forwards to the
+  leader NODE over RPC (the `LeaderResolver` returns a remote forwarder, not just
+  a local facade), a per-node registry of `ReplicatedVShard`s, and the
+  Engine-backed apply of committed commands into real TSM/NativeIndex storage.
+- **What exists instead:** the replication CORRECTNESS is proven with the
+  deterministic in-memory `ReplicatedVShardStore` reference model — the RF=3 gate
+  (`replicated_rf3_test.cpp`: fail-stop / failover-no-dup / partition-no-split-
+  brain over real Raft + journals) and the leader-routing logic
+  (`replicated_router_test.cpp`) are green. This is the SAME discipline as Phase 4
+  (no production `LocalStore`/Engine adapter exists yet — only test stores).
+- **Value now:** the gate is met transport/engine-agnostically; this is the
+  production integration, shared with the Phase-4 Engine-adapter gap above.
+
+### [ ] (Phase 5 note) Tombstone GC during compaction
+- **What:** identical-range tombstones now coalesce in the live state machine
+  (`applyDeleteRange`), bounding per-range growth, but distinct historical delete
+  ranges still accumulate. Compaction should physically drop points a tombstone
+  covers and retire fully-superseded tombstones, per the plan's tombstone model.
+- **Value now:** LOW (correctness unaffected; a long-lived VShard with many
+  distinct delete ranges grows the tombstone set until compaction reclaims it).
+
+### [x] (Phase 5 note) Strict retry-invisibility for delete/write races — NOT NEEDED
+- A retried delete/write is log-ordered against ops that committed in the gap
+  (superseding writes / resurrecting points). Two independent reviews confirmed
+  this is a **valid linearization of concurrent operations**, not data loss — the
+  client never got the first ack, so its op is concurrent. Matches the plan's
+  "applied identically on every replica → replicas cannot diverge" (convergence,
+  not retry-invisibility) and real TSDB delete semantics. No op-ID-free fix
+  exists and none is needed. Pinned by `DataStateMachineTest.RetryLogOrderSemantics`
+  and documented in `docs/clustering.md` §"Write path" + `data_command.hpp`.
 
 ### [ ] mTLS + protobuf wire, batching/pools/deadlines/cancellation/backpressure, cert rotation
 - **What:** the plan names mTLS-protected protobuf RPC with connection pools,
@@ -89,8 +118,9 @@ Status legend: **[ ]** open · **[~]** partial (a proxy exists) · **[x]** done.
 
 ### [ ] Multi-host distributed insert/query benchmarks
 - **What:** extend `timestar_insert_bench` / `timestar_query_bench` to drive
-  multiple hosts. Deferred with the transport verification above.
-- **Value now:** LOW until the transport loopback path is verified.
+  multiple hosts.
+- **Value now:** LOW. The transport loopback path is now verified (above), so this
+  is unblocked; it remains a benchmarking-coverage task, not a correctness gap.
 
 ---
 
