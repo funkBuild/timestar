@@ -32,6 +32,7 @@ struct NodeQueryRequest {
 struct NodeQueryPartial {
     std::vector<PartialAggregationResult> partials;
     std::vector<timestar::http::SeriesResult> nonNumeric;
+    uint64_t seriesFound = 0;                     // series this node discovered (coordinator sums for maxSeriesCount)
     std::vector<std::string> incompleteReasons;  // non-empty => QUERY_INCOMPLETE
 };
 

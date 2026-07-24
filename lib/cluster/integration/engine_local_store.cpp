@@ -175,6 +175,7 @@ seastar::future<data::NodeQueryPartial> EngineLocalStore::queryLocal(data::NodeQ
     }
     partial.partials = std::move(np.partials);
     partial.nonNumeric = std::move(np.nonNumeric);
+    partial.seriesFound = np.seriesFound;
     co_return partial;
 }
 

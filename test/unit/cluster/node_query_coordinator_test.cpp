@@ -124,6 +124,30 @@ TEST_F(NodeQueryCoordinatorTest, NodeIncompleteFailsTheWholeQuery) {
     }).get();
 }
 
+TEST_F(NodeQueryCoordinatorTest, UnionSeriesCountEnforcesMaxSeriesCount) {
+    seastar::async([] {
+        ScopedShardedEngine eng;
+        eng.start();
+        timestar::http::HttpQueryHandler finalizer(&*eng);
+
+        // Each node individually is under the limit, but their union exceeds it -- a
+        // cluster must fail exactly like a single node holding all the series.
+        const uint64_t limit = timestar::http::HttpQueryHandler::maxSeriesCount();
+        Canned node1, node2;
+        node1.answer.partials = slicePartials("h1", 10.0);
+        node1.answer.seriesFound = limit;  // at the limit alone
+        node2.answer.partials = slicePartials("h2", 30.0);
+        node2.answer.seriesFound = limit;  // union = 2*limit > limit
+
+        VShardDirectory dir(1, rf1Map(2));
+        NodeQueryCoordinator coord(dir, node1, node2, finalizer);
+
+        QueryResponse resp = coord.query(spreadByRegion()).get();
+        EXPECT_FALSE(resp.success);
+        EXPECT_EQ(resp.errorCode, "TOO_MANY_SERIES");
+    }).get();
+}
+
 TEST_F(NodeQueryCoordinatorTest, UnassignedVShardIsIncomplete) {
     seastar::async([] {
         ScopedShardedEngine eng;

@@ -111,6 +111,9 @@ public:
     struct NodePartials {
         std::vector<PartialAggregationResult> partials;
         std::vector<SeriesResult> nonNumeric;
+        size_t seriesFound = 0;  // series this node discovered — the coordinator sums these to
+                                 // enforce maxSeriesCount() over the UNION (a per-node check alone
+                                 // lets a cluster succeed where single-node would fail).
         bool ok = true;
         QueryResponse errorResponse;
     };

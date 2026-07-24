@@ -33,6 +33,19 @@ seastar::future<QueryResponse> NodeQueryCoordinator::query(QueryRequest request)
     const NodeId self = dir_.self();
     const uint64_t epoch = dir_.epoch();
 
+    // DEFERRED to M3 (RF>1 / migration), correct under static RF=1 today:
+    //   - nq.vshards is left empty: each node answers from ALL its local series.
+    //     Under RF=1 a node's Engine holds ONLY its owned VShards (disjoint
+    //     placement), so the union is exactly the single-node set with no overlap.
+    //     Once RF>1 or an in-flight move leaves replica/stale data on a node that is
+    //     ALSO primary for other VShards, that node must be restricted to req.vshards
+    //     or its extra data double-counts in the merge. queryLocal must honour
+    //     req.vshards (vshard-restricted discovery) before that lands.
+    //   - nq.mapEpoch is pinned but not yet fenced by the node; harmless while the
+    //     completeness pre-check + disjoint placement hold, an epoch-fence is an M3
+    //     reconfiguration concern.
+    // Cross-node grouping also assumes a homogeneous cluster binary (groupKeyHash is
+    // std::hash<string>, unseeded but stdlib/version-dependent).
     std::vector<seastar::future<NodeQueryPartial>> pending;
     pending.reserve(targets.size());
     for (NodeId t : targets) {
@@ -49,6 +62,7 @@ seastar::future<QueryResponse> NodeQueryCoordinator::query(QueryRequest request)
     std::vector<PartialAggregationResult> allPartials;
     std::vector<timestar::http::SeriesResult> allNonNumeric;
     std::vector<std::string> incompleteReasons;
+    uint64_t totalSeriesFound = 0;
     std::exception_ptr firstErr;
     for (auto& f : pending) {
         try {
@@ -58,6 +72,7 @@ seastar::future<QueryResponse> NodeQueryCoordinator::query(QueryRequest request)
                     incompleteReasons.push_back(std::move(r));
                 continue;  // fail-closed below; keep draining the rest
             }
+            totalSeriesFound += part.seriesFound;
             allPartials.insert(allPartials.end(), std::make_move_iterator(part.partials.begin()),
                                std::make_move_iterator(part.partials.end()));
             allNonNumeric.insert(allNonNumeric.end(), std::make_move_iterator(part.nonNumeric.begin()),
@@ -77,6 +92,18 @@ seastar::future<QueryResponse> NodeQueryCoordinator::query(QueryRequest request)
             joined += r;
         }
         co_return incompleteResponse("a node could not answer: " + joined);
+    }
+
+    // Enforce maxSeriesCount over the UNION: each node passes its own cardinality
+    // check in queryLocalPartials, but the cluster's total could still exceed the
+    // limit that single-node executeQuery enforces. Same error shape/code.
+    if (totalSeriesFound > http::HttpQueryHandler::maxSeriesCount()) {
+        QueryResponse r;
+        r.success = false;
+        r.errorCode = "TOO_MANY_SERIES";
+        r.errorMessage = "Too many series: " + std::to_string(totalSeriesFound) + " exceeds limit of " +
+                         std::to_string(http::HttpQueryHandler::maxSeriesCount());
+        co_return r;
     }
 
     // One merge+finalize over the union -- identical to the single-node multi-shard

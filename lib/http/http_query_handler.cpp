@@ -2509,6 +2509,9 @@ seastar::future<HttpQueryHandler::NodePartials> HttpQueryHandler::queryLocalPart
         size_t totalSeriesFound = 0;
         for (const auto& contexts : seriesByShard)
             totalSeriesFound += contexts.size();
+        out.seriesFound = totalSeriesFound;
+        // Per-node limit (a single node's cardinality). The coordinator additionally
+        // enforces the limit over the union of nodes' seriesFound.
         if (totalSeriesFound > maxSeriesCount()) {
             out.ok = false;
             err.success = false;

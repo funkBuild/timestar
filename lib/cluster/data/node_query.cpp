@@ -300,6 +300,7 @@ std::string encodeNodeQueryPartial(const NodeQueryPartial& partial) {
             encodeFieldValues(w, tv.second);
         }
     }
+    w.u64(partial.seriesFound);
     w.strvec(partial.incompleteReasons);
     return finish(w);
 }
@@ -351,6 +352,7 @@ std::optional<NodeQueryPartial> decodeNodeQueryPartial(const std::string& bytes)
             return std::nullopt;
         partial.nonNumeric.push_back(std::move(s));
     }
+    partial.seriesFound = r.u64();
     partial.incompleteReasons = r.strvec();
     if (!r.ok || r.p != r.end)
         return std::nullopt;
