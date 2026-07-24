@@ -321,8 +321,8 @@ int main(int argc, char** argv) {
             {
                 const auto& cc = timestar::config().cluster;
                 if (cc.enabled && cc.partitioned)
-                    timestar::http_log.info("Cluster mode ENABLED: node {} of {} peers (VShard-partitioned RF=1)",
-                                            cc.node_id, cc.peers.size());
+                    timestar::http_log.info("Cluster mode ENABLED: node {} of {} peers (VShard-partitioned RF={})",
+                                            cc.node_id, cc.peers.size(), cc.replication_factor);
                 else if (cc.enabled)
                     timestar::http_log.info("Cluster mode ENABLED: node {} of {} peers (full replication)",
                                             cc.node_id, cc.peers.size());
