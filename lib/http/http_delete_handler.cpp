@@ -1,5 +1,6 @@
 #include "http_delete_handler.hpp"
 
+#include "../cluster/integration/cluster_gateway.hpp"
 #include "content_negotiation.hpp"
 #include "http_auth.hpp"
 #include "http_error.hpp"
@@ -166,6 +167,15 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDeleteHandler::handle
     auto reply = std::make_unique<seastar::http::reply>();
     auto reqFmt = timestar::http::requestFormat(*req);
     auto resFmt = timestar::http::responseFormat(*req);
+
+    // Cluster: replicate an accepted delete to peers (M1) so the deletion applies
+    // cluster-wide, not just on the accepting node. A forwarded delete is applied
+    // locally only (loop guard).
+    const bool shouldReplicate =
+        !timestar::cluster::ClusterGateway::isForwarded(*req) && timestar::cluster::shardGateway().enabled();
+    std::string replBody = shouldReplicate ? std::string(req->content) : std::string();
+    const std::string replMime =
+        timestar::http::isProtobuf(reqFmt) ? "application/x-protobuf" : "application/json";
 
     if (!engineSharded) {
         reply->set_status(seastar::http::reply::status_type::internal_server_error);
@@ -494,6 +504,11 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDeleteHandler::handle
     }
 
     timestar::http::setContentType(*reply, resFmt);
+
+    // Cluster: replicate the accepted delete to peers (2xx only).
+    if (shouldReplicate && static_cast<int>(reply->_status) / 100 == 2)
+        co_await timestar::cluster::shardGateway().replicateDelete(replMime, std::move(replBody));
+
     co_return reply;
 }
 

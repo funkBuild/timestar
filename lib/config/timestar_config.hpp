@@ -192,6 +192,18 @@ struct EngineConfig {
     IOPriorityConfig io_priority;
 };
 
+// Multi-node cluster settings parsed from the [cluster] TOML section (or
+// TIMESTAR_CLUSTER_* env vars). When enabled, this node participates in a cluster:
+// writes it accepts are replicated to its peers, so any node serves any read.
+struct ClusterConfig {
+    bool enabled = false;
+    // This node's 1-based id. `peers[node_id - 1]` is this node's own address.
+    uint16_t node_id = 0;
+    // Every node's "host:port" address, in id order (index 0 == node 1). Includes
+    // self; peers to contact are all entries except this node's own.
+    std::vector<std::string> peers;
+};
+
 // Seastar settings parsed from [seastar] TOML section.
 // Stored as string key-value pairs; only keys present in the file are set.
 // Keys use underscore naming (matching TOML), and are converted to Seastar's
@@ -211,6 +223,7 @@ struct TimestarConfigParseable {
     IndexConfig index;
     EngineConfig engine;
     StreamingConfig streaming;
+    ClusterConfig cluster;
 };
 
 struct TimestarConfig {
@@ -220,6 +233,7 @@ struct TimestarConfig {
     IndexConfig index;
     EngineConfig engine;
     StreamingConfig streaming;
+    ClusterConfig cluster;
     SeastarConfig seastar;
 
     // Validate config values. Returns a list of error strings (empty = valid).
@@ -325,8 +339,15 @@ struct glz::meta<timestar::StreamingConfig> {
 };
 
 template <>
+struct glz::meta<timestar::ClusterConfig> {
+    using T = timestar::ClusterConfig;
+    static constexpr auto value = object("enabled", &T::enabled, "node_id", &T::node_id, "peers", &T::peers);
+};
+
+template <>
 struct glz::meta<timestar::TimestarConfigParseable> {
     using T = timestar::TimestarConfigParseable;
-    static constexpr auto value = object("server", &T::server, "storage", &T::storage, "http", &T::http, "index",
-                                         &T::index, "engine", &T::engine, "streaming", &T::streaming);
+    static constexpr auto value =
+        object("server", &T::server, "storage", &T::storage, "http", &T::http, "index", &T::index, "engine",
+               &T::engine, "streaming", &T::streaming, "cluster", &T::cluster);
 };

@@ -1,0 +1,58 @@
+# A 3-node TimeStar cluster (Milestone 1: full replication).
+#
+# Every node accepts writes and replicates them to its peers, so any node serves
+# any read. Bring it up with:
+#
+#   docker compose -f docker-compose.cluster.yml up --build
+#
+# Then write to any node and read from any other:
+#   curl -XPOST localhost:8086/write -d '{"measurement":"t","fields":{"v":1},"timestamp":1700000000000000000}'
+#   curl -XPOST localhost:8087/query -d '{"query":"latest:t()","startTime":1699999999000000000,"endTime":1700000001000000000}'
+
+x-node: &node
+  build: .
+  image: funkbuild/timestar:latest
+  restart: unless-stopped
+  environment: &node-env
+    TIMESTAR_CLUSTER_ENABLED: "true"
+    # All nodes, in node-id order (index 0 == node 1). Docker DNS resolves the
+    # service names on the shared network.
+    TIMESTAR_CLUSTER_PEERS: "timestar1:8086,timestar2:8086,timestar3:8086"
+    TIMESTAR_OVERPROVISIONED: "true"
+    TIMESTAR_SMP: "2"
+
+services:
+  timestar1:
+    <<: *node
+    environment:
+      <<: *node-env
+      TIMESTAR_CLUSTER_NODE_ID: "1"
+    ports:
+      - "8086:8086"
+    volumes:
+      - timestar1-data:/var/lib/timestar
+
+  timestar2:
+    <<: *node
+    environment:
+      <<: *node-env
+      TIMESTAR_CLUSTER_NODE_ID: "2"
+    ports:
+      - "8087:8086"
+    volumes:
+      - timestar2-data:/var/lib/timestar
+
+  timestar3:
+    <<: *node
+    environment:
+      <<: *node-env
+      TIMESTAR_CLUSTER_NODE_ID: "3"
+    ports:
+      - "8088:8086"
+    volumes:
+      - timestar3-data:/var/lib/timestar
+
+volumes:
+  timestar1-data:
+  timestar2-data:
+  timestar3-data:

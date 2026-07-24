@@ -1,5 +1,6 @@
 #include "http_write_handler.hpp"
 
+#include "../cluster/integration/cluster_gateway.hpp"
 #include "content_negotiation.hpp"
 #include "http_auth.hpp"
 #include "http_error.hpp"
@@ -2090,6 +2091,17 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleW
     auto reqFmt = timestar::http::requestFormat(*req);
     auto resFmt = timestar::http::responseFormat(*req);
 
+    // Cluster: a locally-accepted write is replicated to peers (M1 full
+    // replication) so any node can serve any read. A FORWARDED write (already
+    // replicated by the accepting node) is applied locally only -- never
+    // re-forwarded (loop guard). We capture the raw body when the local apply
+    // succeeds and replicate once, after the try, on a 2xx status.
+    const bool shouldReplicate =
+        !timestar::cluster::ClusterGateway::isForwarded(*req) && timestar::cluster::shardGateway().enabled();
+    std::string replBody;
+    const std::string replMime =
+        timestar::http::isProtobuf(reqFmt) ? "application/x-protobuf" : "application/json";
+
     try {
         // Phase 1: read the body (buffered or streamed) and enforce size
         // limits. On failure the error response is already assembled in rep.
@@ -2100,6 +2112,10 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleW
         }
 
         LOG_INSERT_PATH(timestar::http_log, debug, "Received write request: {} bytes", body.size());
+
+        // Capture the raw body for replication before it is processed/consumed.
+        if (shouldReplicate)
+            replBody.assign(body.data(), body.size());
 
         int64_t pointsWritten = 0;
 #if TIMESTAR_LOG_INSERT_PATH
@@ -2115,6 +2131,9 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleW
         // error — is fully assembled into rep by the phase method.
         if (timestar::http::isProtobuf(reqFmt)) {
             co_await handleProtobufWrite(body, defaultTimestampNs, resFmt, *rep);
+            if (shouldReplicate && static_cast<int>(rep->_status) / 100 == 2)
+                co_await timestar::cluster::shardGateway().replicateWrite("application/x-protobuf",
+                                                                          std::string(body));
             co_return rep;
         }
 
@@ -2277,6 +2296,11 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleW
         }
         timestar::http::setContentType(*rep, resFmt);
     }
+
+    // Cluster: replicate an accepted JSON/fast-path write to peers (2xx only). The
+    // protobuf path replicated inline and returned earlier, so it never reaches here.
+    if (shouldReplicate && static_cast<int>(rep->_status) / 100 == 2)
+        co_await timestar::cluster::shardGateway().replicateWrite(replMime, std::move(replBody));
 
     co_return rep;
 }

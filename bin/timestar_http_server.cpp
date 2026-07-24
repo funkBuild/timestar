@@ -310,6 +310,15 @@ int main(int argc, char** argv) {
             std::filesystem::create_directories(dataRoot);
             timestar::http_log.info("Data directory: {}", std::filesystem::absolute(dataRoot).string());
 
+            {
+                const auto& cc = timestar::config().cluster;
+                if (cc.enabled)
+                    timestar::http_log.info("Cluster mode ENABLED: node {} of {} peers (full replication)",
+                                            cc.node_id, cc.peers.size());
+                else
+                    timestar::http_log.info("Cluster mode disabled (single node)");
+            }
+
             // Take an exclusive lock on the data directory before ANYTHING
             // touches it, so a second instance cannot race the first one's
             // storage. Held for the lifetime of the process; the kernel

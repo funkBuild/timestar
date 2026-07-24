@@ -49,6 +49,15 @@ std::vector<std::string> TimestarConfig::validate() const {
         errors.emplace_back("server.port must be > 0");
     }
 
+    if (cluster.enabled) {
+        if (cluster.peers.empty()) {
+            errors.emplace_back("cluster.peers must be non-empty when cluster.enabled");
+        }
+        if (cluster.node_id == 0 || cluster.node_id > cluster.peers.size()) {
+            errors.emplace_back("cluster.node_id must be in [1, len(cluster.peers)]");
+        }
+    }
+
     if (storage.wal_size_threshold == 0) {
         errors.emplace_back("storage.wal_size_threshold must be > 0");
     }
@@ -286,6 +295,7 @@ TimestarConfig loadConfigFile(const std::string& path) {
     cfg.index = parsed.index;
     cfg.engine = parsed.engine;
     cfg.streaming = parsed.streaming;
+    cfg.cluster = parsed.cluster;
 
     // Parse [seastar] section manually
     cfg.seastar = parseSeastarSection(content);
@@ -474,6 +484,31 @@ void applyEnvironmentOverrides(TimestarConfig& cfg) {
     envU32("TIMESTAR_STREAMING_MAX_SUBSCRIPTIONS", cfg.streaming.max_subscriptions_per_shard);
     envU32("TIMESTAR_STREAMING_OUTPUT_QUEUE_SIZE", cfg.streaming.output_queue_size);
     envU32("TIMESTAR_STREAMING_HEARTBEAT_INTERVAL_SECONDS", cfg.streaming.heartbeat_interval_seconds);
+
+    // Cluster
+    envBool("TIMESTAR_CLUSTER_ENABLED", cfg.cluster.enabled);
+    envU16("TIMESTAR_CLUSTER_NODE_ID", cfg.cluster.node_id);
+    // TIMESTAR_CLUSTER_PEERS is a comma-separated list of "host:port" in node-id
+    // order (index 0 == node 1), including this node's own address.
+    if (auto v = envStr("TIMESTAR_CLUSTER_PEERS")) {
+        cfg.cluster.peers.clear();
+        std::string_view s(v);
+        size_t start = 0;
+        while (start <= s.size()) {
+            size_t comma = s.find(',', start);
+            std::string_view tok = s.substr(start, comma == std::string_view::npos ? s.size() - start : comma - start);
+            // trim spaces
+            while (!tok.empty() && tok.front() == ' ')
+                tok.remove_prefix(1);
+            while (!tok.empty() && tok.back() == ' ')
+                tok.remove_suffix(1);
+            if (!tok.empty())
+                cfg.cluster.peers.emplace_back(tok);
+            if (comma == std::string_view::npos)
+                break;
+            start = comma + 1;
+        }
+    }
 
     // Seastar — these go into the string map
     auto envSeastar = [&](const char* envName, const char* key) {
