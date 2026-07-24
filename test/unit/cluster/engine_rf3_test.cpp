@@ -4,6 +4,7 @@
 // (2/3 quorum), and the partitioned node catches up on heal -- no acknowledged loss,
 // no duplicate, no split brain. This is the Phase-5 RF=3 gate re-proven with the
 // enriched command over the real Engine (not the toy store).
+#include "../../../lib/cluster/integration/controller_job_driver.hpp"
 #include "../../../lib/cluster/integration/engine_data_state_machine.hpp"
 #include "../../../lib/cluster/integration/raft_move_executor.hpp"
 #include "../../../lib/cluster/movement/movement_throttle.hpp"
@@ -736,6 +737,94 @@ TEST_F(EngineRf3Test, ThrottlePausesMoveSafeForwardThenResumes) {
         auto finalVoters = reps[leader].group->node().config().voters;
         std::sort(finalVoters.begin(), finalVoters.end());
         EXPECT_EQ(finalVoters, (std::vector<NodeId>{1, 2, 4})) << "resumed move completes the replace";
+
+        for (auto& [id, r] : reps) {
+            router.setGroup(id, nullptr);
+            r.group.reset();
+            r.persistence.reset();
+            r.writer->close().get();
+        }
+        reps.clear();
+        for (auto& d : journalDirs)
+            fs::remove_all(d);
+        for (auto& d : engineDirs)
+            fs::remove_all(d);
+    }).get();
+}
+
+// M5 controller job-driver gate (in-process): a persisted group-0 MoveJob is driven
+// to completion via the Mover over live Raft, and each advanced step is reported back
+// as an updated control::Job (the group-0 UpsertJob the next controller resumes from).
+// Proves the bridge from a persisted job to a real membership change.
+TEST_F(EngineRf3Test, ControllerDrivesPersistedMoveJobToCompletion) {
+    seastar::async([] {
+        const std::vector<NodeId> voters = {1, 2, 3};
+        const std::vector<NodeId> allNodes = {1, 2, 3, 4};
+        const NodeId leader = 1;
+        Router router;
+        std::map<NodeId, Replica> reps;
+        std::vector<fs::path> journalDirs, engineDirs;
+
+        auto tickAll = [&] {
+            for (auto& [id, r] : reps)
+                if (r.group)
+                    r.group->tick().get();
+            router.pump().get();
+        };
+        auto tick = [&](int rounds) {
+            for (int i = 0; i < rounds; ++i)
+                tickAll();
+        };
+
+        for (NodeId id : allNodes) {
+            Replica r;
+            fs::path edir = tmpDir("cjdeng" + std::to_string(id));
+            engineDirs.push_back(edir);
+            r.engine = std::make_unique<ScopedShardedEngine>();
+            r.engine->startAt(edir.string());
+            r.store = std::make_unique<cluster::EngineLocalStore>(**r.engine);
+            r.sm = std::make_unique<cluster::EngineDataStateMachine>(*r.store, timestar::VShardId{1});
+            fs::path jdir = tmpDir("cjdj" + std::to_string(id));
+            journalDirs.push_back(jdir);
+            r.writer = std::make_unique<JournalWriter>(jdir, header(), 1u << 20);
+            auto recovered = r.writer->open().get();
+            RecoveredRaftState st = recoverRaftState(recovered, VShardId{1});
+            r.persistence = std::make_unique<JournalRaftPersistence>(*r.writer, VShardId{1}, st.nextSeq);
+            r.transport = std::make_unique<RouterTransport>(router);
+            RaftNode node(id, voters, std::move(st.log), st.hardState, optsFor(id, leader), {});
+            r.group = std::make_unique<RaftGroup>(1, std::move(node), *r.persistence, *r.transport, *r.sm);
+            router.setGroup(id, r.group.get());
+            reps[id] = std::move(r);
+        }
+        tick(40);
+        ASSERT_TRUE(reps[leader].group->isLeader());
+
+        // A persisted group-0 Job carrying a replace-move 3 -> 4.
+        movement::MoveJob mj(movement::MovePlan{/*vshard=*/1, /*dest=*/4, /*victim=*/3});
+        control::Job job{"job-move-1", 0, false, mj.encode()};
+
+        std::vector<control::Job> persisted;
+        auto persistJob = [&persisted](control::Job j) {
+            persisted.push_back(std::move(j));
+            return seastar::make_ready_future<>();
+        };
+
+        auto df = cluster::ControllerJobDriver::driveMoveJob(job, *reps[leader].group, /*minRf=*/3, persistJob);
+        for (int i = 0; i < 8000 && !df.available(); ++i)
+            tickAll();
+        const bool done = df.get();
+        EXPECT_TRUE(done) << "the driver ran the persisted job to completion";
+
+        auto finalVoters = reps[leader].group->node().config().voters;
+        std::sort(finalVoters.begin(), finalVoters.end());
+        EXPECT_EQ(finalVoters, (std::vector<NodeId>{1, 2, 4}));
+
+        // The driver persisted advancing steps, ending done -- what the next controller
+        // would resume from (and see already complete).
+        ASSERT_FALSE(persisted.empty());
+        EXPECT_EQ(persisted.back().id, "job-move-1");
+        EXPECT_TRUE(persisted.back().done);
+        EXPECT_EQ(persisted.back().step, static_cast<uint32_t>(movement::MoveStep::Done));
 
         for (auto& [id, r] : reps) {
             router.setGroup(id, nullptr);
