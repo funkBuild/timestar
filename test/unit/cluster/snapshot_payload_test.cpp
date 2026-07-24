@@ -1,0 +1,74 @@
+// Integration M3 (snapshots): the monolithic Raft InstallSnapshot payload codec --
+// a VShardSnapshotManifest plus its data files, self-contained so a lagging replica
+// installs the whole VShard state. Round-trips, and rejects truncation / a flipped
+// checksum / a corrupt inner manifest.
+#include "../../../lib/cluster/data/snapshot_payload.hpp"
+
+#include <gtest/gtest.h>
+
+using namespace timestar::data;
+using timestar::VShardId;
+using timestar::VShardSnapshotManifest;
+
+namespace {
+VShardSnapshotManifest validManifest() {
+    VShardSnapshotManifest m;
+    m.vshard = VShardId{5};
+    m.snapshotRevision = 100;
+    m.verificationHash = std::string(32, 'a');  // 32 hex chars
+    m.catalogHash = std::string(32, 'b');
+    // empty extents/tombstones -> trivially valid
+    EXPECT_TRUE(m.valid());
+    return m;
+}
+}  // namespace
+
+TEST(SnapshotPayloadCodec, RoundTripsManifestAndFiles) {
+    SnapshotPayload p;
+    p.manifest = validManifest();
+    p.files = {{"0_0.tsm", std::string("\x00\x01\x02binary tsm bytes", 20)},
+               {"1_0.tsm", "another file's contents"}};
+
+    auto back = decodeSnapshotPayload(encodeSnapshotPayload(p));
+    ASSERT_TRUE(back.has_value());
+    EXPECT_EQ(back->manifest, p.manifest);
+    ASSERT_EQ(back->files.size(), 2u);
+    EXPECT_EQ(back->files[0].name, "0_0.tsm");
+    EXPECT_EQ(back->files[0].bytes, p.files[0].bytes);  // binary bytes preserved
+    EXPECT_EQ(back->files[1].bytes, "another file's contents");
+}
+
+TEST(SnapshotPayloadCodec, EmptyFileListRoundTrips) {
+    SnapshotPayload p;
+    p.manifest = validManifest();
+    auto back = decodeSnapshotPayload(encodeSnapshotPayload(p));
+    ASSERT_TRUE(back.has_value());
+    EXPECT_TRUE(back->files.empty());
+    EXPECT_EQ(back->manifest.vshard, VShardId{5});
+}
+
+TEST(SnapshotPayloadCodec, TruncationAndCorruptionRejected) {
+    SnapshotPayload p;
+    p.manifest = validManifest();
+    p.files = {{"f", "data"}};
+    std::string full = encodeSnapshotPayload(p);
+    ASSERT_TRUE(decodeSnapshotPayload(full).has_value());
+    for (size_t n = 0; n < full.size(); ++n)
+        EXPECT_FALSE(decodeSnapshotPayload(full.substr(0, n)).has_value()) << "prefix " << n;
+    std::string bad = full;
+    bad[bad.size() - 1] ^= 0xff;  // flip FNV trailer
+    EXPECT_FALSE(decodeSnapshotPayload(bad).has_value());
+    // Corrupt the inner manifest blob (byte 8 is inside the manifest's own encoding):
+    // its CRC must reject it, so the whole payload is rejected.
+    std::string badManifest = full;
+    badManifest[10] ^= 0xff;
+    // re-stamp the outer FNV so only the inner manifest CRC catches it
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i + 8 < badManifest.size(); ++i) {
+        h ^= static_cast<uint8_t>(badManifest[i]);
+        h *= 1099511628211ull;
+    }
+    for (int i = 0; i < 8; ++i)
+        badManifest[badManifest.size() - 8 + i] = static_cast<char>((h >> (8 * i)) & 0xff);
+    EXPECT_FALSE(decodeSnapshotPayload(badManifest).has_value()) << "corrupt inner manifest must be rejected";
+}
