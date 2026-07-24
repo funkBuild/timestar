@@ -271,23 +271,34 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::hand
         std::unordered_map<std::string, std::set<std::string>> allTagsResults;
         auto& localEngine = engineSharded->local();
 
+        // In partitioned cluster mode, tag keys/values are scattered across owner
+        // nodes and unioned; else read from the local schema cache.
         if (specificTag.empty()) {
-            // Get all tags for measurement, then fetch values in parallel
-            auto tagKeys = co_await localEngine.getMeasurementTags(measurement);
-            std::vector<seastar::future<std::set<std::string>>> futures;
-            futures.reserve(tagKeys.size());
-            std::vector<std::string> keyVec(tagKeys.begin(), tagKeys.end());
-            for (const auto& tagKey : keyVec) {
-                futures.push_back(localEngine.getTagValues(measurement, tagKey));
+            std::vector<std::string> keyVec;
+            if (clusterMetadataHook) {
+                keyVec = (co_await clusterMetadataHook({timestar::data::MetadataKind::TagKeys, measurement, "", ""}))
+                             .items;
+            } else {
+                auto tagKeys = co_await localEngine.getMeasurementTags(measurement);
+                keyVec.assign(tagKeys.begin(), tagKeys.end());
             }
-            auto allValues = co_await seastar::when_all_succeed(futures.begin(), futures.end());
-            for (size_t i = 0; i < keyVec.size(); ++i) {
-                allTagsResults[keyVec[i]] = std::move(allValues[i]);
+            for (const auto& tagKey : keyVec) {
+                if (clusterMetadataHook) {
+                    auto vals =
+                        co_await clusterMetadataHook({timestar::data::MetadataKind::TagValues, measurement, tagKey, ""});
+                    allTagsResults[tagKey] = std::set<std::string>(vals.items.begin(), vals.items.end());
+                } else {
+                    allTagsResults[tagKey] = co_await localEngine.getTagValues(measurement, tagKey);
+                }
             }
         } else {
-            // Get values for specific tag
-            auto tagValues = co_await localEngine.getTagValues(measurement, specificTag);
-            allTagsResults[specificTag] = tagValues;
+            if (clusterMetadataHook) {
+                auto vals = co_await clusterMetadataHook(
+                    {timestar::data::MetadataKind::TagValues, measurement, specificTag, ""});
+                allTagsResults[specificTag] = std::set<std::string>(vals.items.begin(), vals.items.end());
+            } else {
+                allTagsResults[specificTag] = co_await localEngine.getTagValues(measurement, specificTag);
+            }
         }
 
         // Convert sets to vectors for response formatting
