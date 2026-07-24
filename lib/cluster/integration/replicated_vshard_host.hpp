@@ -28,7 +28,7 @@ using timestar::raft::NodeId;
 // EngineDataStateMachine over the shared EngineLocalStore, and adds the RaftGroup to
 // the registry. propose() replicates a ReplicatedCommand to a VShard's group and
 // resolves only on durable-quorum commit + apply.
-class ReplicatedVShardHost : public data::ProposeSink {
+class ReplicatedVShardHost : public data::ProposeSink, public data::LeaderResolver {
 public:
     ReplicatedVShardHost(EngineLocalStore& store, raft::RaftTransport& transport, NodeId self,
                          std::filesystem::path journalRoot,
@@ -66,6 +66,9 @@ public:
     seastar::future<bool> proposeBatch(data::WriteBatch batch) override;
 
     raft::RaftGroup* group(uint16_t vshard);
+    // LeaderResolver: the current Raft leader of `vshard` per this node's local group
+    // (kNoNode if not hosted here or no leader elected yet).
+    NodeId leaderOf(uint16_t vshard) const override;
     raft::RaftGroupRegistry& registry() { return registry_; }
     size_t vshardCount() const { return vshards_.size(); }
 

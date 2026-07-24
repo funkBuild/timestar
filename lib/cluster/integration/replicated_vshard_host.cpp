@@ -94,6 +94,11 @@ raft::RaftGroup* ReplicatedVShardHost::group(uint16_t vshard) {
     return registry_.group(vshard);
 }
 
+NodeId ReplicatedVShardHost::leaderOf(uint16_t vshard) const {
+    raft::RaftGroup* g = const_cast<raft::RaftGroupRegistry&>(registry_).group(vshard);
+    return g ? g->leader() : raft::kNoNode;
+}
+
 seastar::future<> ReplicatedVShardHost::stop() {
     if (stopped_)
         co_return;

@@ -69,4 +69,16 @@ public:
     virtual seastar::future<bool> proposeBatch(WriteBatch batch) = 0;
 };
 
+// Resolves the CURRENT Raft leader of a VShard (M3). ReplicatedVShardHost implements
+// it from its local group's Raft view, so routing follows leadership across failover
+// -- not the static placement primary (which breaks writes when the primary dies but
+// a live quorum re-elects among the survivors). kNoNode = leader unknown here (no
+// local group, or no leader elected yet); the router falls back to the placement
+// primary as a hint.
+class LeaderResolver {
+public:
+    virtual ~LeaderResolver() = default;
+    virtual NodeId leaderOf(uint16_t vshard) const = 0;
+};
+
 }  // namespace timestar::data

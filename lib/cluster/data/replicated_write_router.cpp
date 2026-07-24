@@ -15,9 +15,14 @@ seastar::future<> ReplicatedBatchWriteRouter::write(WriteBatch batch) {
     std::map<NodeId, WriteBatch> byLeader;
     for (auto& s : batch.series) {
         const uint16_t vs = timestar::virtualShard(SeriesId128::fromSeriesKey(s.seriesKey));
-        const NodeId leader = dir_.ownerOf(vs);  // placement primary = leader hint
-        if (leader == kNoNode)
+        if (dir_.ownerOf(vs) == kNoNode)
             throw std::runtime_error("ReplicatedBatchWriteRouter: VShard unassigned for series");
+        // Route to the CURRENT Raft leader (follows failover); fall back to the
+        // placement primary when the leader is not locally known (a stale primary
+        // then returns not-leader -> retry).
+        NodeId leader = leaders_.leaderOf(vs);
+        if (leader == kNoNode)
+            leader = dir_.ownerOf(vs);
         WriteBatch& dest = byLeader[leader];
         dest.schemaVersion = batch.schemaVersion;
         dest.series.push_back(std::move(s));

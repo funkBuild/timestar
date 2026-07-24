@@ -143,6 +143,15 @@ seastar::future<> ClusterDataPlane::write(data::WriteBatch batch) {
 }
 
 seastar::future<QueryResponse> ClusterDataPlane::query(QueryRequest request) {
+    // NOTE (M3 read-failover gap, found by the 3-node node-kill gate): reads fan out
+    // to the placement PRIMARY (coord_->query). Under RF=3 the primary is the
+    // preferred leader, so this is a correct linearizable leader read while the
+    // primary lives -- but a LOCAL read is NOT a valid substitute (a follower not yet
+    // caught up returns stale/empty), and when the primary DIES the read fails even
+    // though a live quorum re-elected a new leader. The fix is leader-AWARE read
+    // routing (route each VShard read to its CURRENT Raft leader via LeaderResolver,
+    // behind a ReadIndex barrier) -- the read-side analogue of the write fix. That is
+    // the remaining M3 read-failover work; the write path already follows leadership.
     if (!coord_)
         throw std::runtime_error("ClusterDataPlane::query before start");
     return coord_->query(std::move(request));

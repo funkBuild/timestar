@@ -23,7 +23,7 @@ public:
     ReplicatedDataPlane(EngineLocalStore& store, raft::RaftTransport& raftTransport, data::NodeTransport& client,
                         const data::VShardDirectory& dir, data::NodeId self, std::filesystem::path journalRoot,
                         std::chrono::milliseconds tick = std::chrono::milliseconds(20))
-        : host_(store, raftTransport, self, std::move(journalRoot), tick), router_(dir, host_, client) {}
+        : host_(store, raftTransport, self, std::move(journalRoot), tick), router_(dir, host_, client, host_) {}
 
     // Instantiate the local Raft groups this node replicates (one per entry of
     // ClusterRuntime::localReplicaGroups()).

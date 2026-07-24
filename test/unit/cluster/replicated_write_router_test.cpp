@@ -49,6 +49,13 @@ public:
     }
 };
 
+// Leader unknown -> the router falls back to the placement primary (exercises the
+// primary-routing path these tests assert).
+class NoLeaderResolver : public LeaderResolver {
+public:
+    NodeId leaderOf(uint16_t) const override { return timestar::raft::kNoNode; }
+};
+
 ControlMap rf3Map(unsigned n) {
     ControlMap m;
     m.epoch = 1;
@@ -79,7 +86,8 @@ seastar::future<> testRoutesToLeaders() {
     VShardDirectory dir(1, rf3Map(N));  // self = node 1
     LocalSink local;
     RemoteTransport client;
-    ReplicatedBatchWriteRouter router(dir, local, client);
+    NoLeaderResolver leaders;
+    ReplicatedBatchWriteRouter router(dir, local, client, leaders);
 
     WriteBatch batch = manySeries(90);
     // Expected split by leader (primary), computed independently from the directory.
@@ -113,7 +121,8 @@ seastar::future<> testStaleLeaderFailsWrite() {
     LocalSink local;
     local.committed = false;  // local leader stale (not actually leader)
     RemoteTransport client;
-    ReplicatedBatchWriteRouter router(dir, local, client);
+    NoLeaderResolver leaders;
+    ReplicatedBatchWriteRouter router(dir, local, client, leaders);
     bool threw = false;
     try {
         co_await router.write(manySeries(30));
@@ -129,7 +138,8 @@ seastar::future<> testUnassignedRejects() {
     VShardDirectory dir(1, empty);
     LocalSink local;
     RemoteTransport client;
-    ReplicatedBatchWriteRouter router(dir, local, client);
+    NoLeaderResolver leaders;
+    ReplicatedBatchWriteRouter router(dir, local, client, leaders);
     bool threw = false;
     try {
         co_await router.write(manySeries(10));

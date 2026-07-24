@@ -29,8 +29,9 @@ namespace timestar::data {
 // this REPLICATES through Raft on the leader, acking only on durable quorum commit.
 class ReplicatedBatchWriteRouter {
 public:
-    ReplicatedBatchWriteRouter(const VShardDirectory& dir, ProposeSink& local, NodeTransport& client)
-        : dir_(dir), local_(local), client_(client) {}
+    ReplicatedBatchWriteRouter(const VShardDirectory& dir, ProposeSink& local, NodeTransport& client,
+                               const LeaderResolver& leaders)
+        : dir_(dir), local_(local), client_(client), leaders_(leaders) {}
 
     // Route + replicate. Resolves when every VShard-leader group has durably committed
     // on quorum. Throws if any series' VShard is unassigned (before dispatch), if a
@@ -41,6 +42,7 @@ private:
     const VShardDirectory& dir_;
     ProposeSink& local_;
     NodeTransport& client_;
+    const LeaderResolver& leaders_;
 };
 
 }  // namespace timestar::data
