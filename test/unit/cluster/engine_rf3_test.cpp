@@ -6,6 +6,7 @@
 // enriched command over the real Engine (not the toy store).
 #include "../../../lib/cluster/integration/engine_data_state_machine.hpp"
 #include "../../../lib/cluster/integration/raft_move_executor.hpp"
+#include "../../../lib/cluster/movement/movement_throttle.hpp"
 #include "../../../lib/cluster/movement/placement_balancer.hpp"
 #include "../../../lib/cluster/integration/replica_engine_coordinator.hpp"
 #include "../../../lib/cluster/integration/replica_engine_reader.hpp"
@@ -630,6 +631,111 @@ TEST_F(EngineRf3Test, BalancerSelectedMoveExecutesEndToEnd) {
         std::sort(finalVoters.begin(), finalVoters.end());
         EXPECT_EQ(finalVoters, (std::vector<NodeId>{1, 2, 4}))
             << "the balancer-selected move rebalanced the overloaded node's replica to the free node";
+
+        for (auto& [id, r] : reps) {
+            router.setGroup(id, nullptr);
+            r.group.reset();
+            r.persistence.reset();
+            r.writer->close().get();
+        }
+        reps.clear();
+        for (auto& d : journalDirs)
+            fs::remove_all(d);
+        for (auto& d : engineDirs)
+            fs::remove_all(d);
+    }).get();
+}
+
+// M5 throttle-safe-forward gate (in-process): a move paused by the SLO throttle mid-
+// flight STOPS at a safe forward-committed step -- RF never dropped, no voter removed
+// before its replacement -- and resuming re-runs the same job to completion. Also
+// confirms MovementThrottle trips on an SLO breach and recovers after the hysteresis
+// cool-down (the source of the Mover's mayProceed gate in production).
+TEST_F(EngineRf3Test, ThrottlePausesMoveSafeForwardThenResumes) {
+    seastar::async([] {
+        // The throttle wiring: healthy -> proceed; a breach auto-pauses instantly;
+        // it only resumes after `hysteresis` consecutive healthy samples.
+        movement::MovementThrottle throttle(movement::SloBudgets{}, /*resumeHysteresisTicks=*/2);
+        EXPECT_TRUE(throttle.update(movement::ForegroundSignals{}));  // healthy
+        movement::ForegroundSignals breach;
+        breach.p99LatencyMs = 600;  // > 500 budget
+        EXPECT_FALSE(throttle.update(breach)) << "movement auto-pauses on an SLO breach";
+        EXPECT_FALSE(throttle.update(movement::ForegroundSignals{})) << "one good sample is not enough";
+        EXPECT_TRUE(throttle.update(movement::ForegroundSignals{})) << "resumes after the hysteresis cool-down";
+
+        const std::vector<NodeId> voters = {1, 2, 3};
+        const std::vector<NodeId> allNodes = {1, 2, 3, 4};
+        const NodeId leader = 1;
+        Router router;
+        std::map<NodeId, Replica> reps;
+        std::vector<fs::path> journalDirs, engineDirs;
+
+        auto tickAll = [&] {
+            for (auto& [id, r] : reps)
+                if (r.group)
+                    r.group->tick().get();
+            router.pump().get();
+        };
+        auto tick = [&](int rounds) {
+            for (int i = 0; i < rounds; ++i)
+                tickAll();
+        };
+
+        for (NodeId id : allNodes) {
+            Replica r;
+            fs::path edir = tmpDir("threng" + std::to_string(id));
+            engineDirs.push_back(edir);
+            r.engine = std::make_unique<ScopedShardedEngine>();
+            r.engine->startAt(edir.string());
+            r.store = std::make_unique<cluster::EngineLocalStore>(**r.engine);
+            r.sm = std::make_unique<cluster::EngineDataStateMachine>(*r.store, timestar::VShardId{1});
+            fs::path jdir = tmpDir("thrj" + std::to_string(id));
+            journalDirs.push_back(jdir);
+            r.writer = std::make_unique<JournalWriter>(jdir, header(), 1u << 20);
+            auto recovered = r.writer->open().get();
+            RecoveredRaftState st = recoverRaftState(recovered, VShardId{1});
+            r.persistence = std::make_unique<JournalRaftPersistence>(*r.writer, VShardId{1}, st.nextSeq);
+            r.transport = std::make_unique<RouterTransport>(router);
+            RaftNode node(id, voters, std::move(st.log), st.hardState, optsFor(id, leader), {});
+            r.group = std::make_unique<RaftGroup>(1, std::move(node), *r.persistence, *r.transport, *r.sm);
+            router.setGroup(id, r.group.get());
+            reps[id] = std::move(r);
+        }
+        tick(40);
+        ASSERT_TRUE(reps[leader].group->isLeader());
+
+        cluster::RaftGroupMoveExecutor exec(
+            *reps[leader].group, [](const movement::MoveJob&) { return seastar::make_ready_future<>(); });
+        movement::MoveJob job(movement::MovePlan{/*vshard=*/1, /*dest=*/4, /*victim=*/3});
+        movement::Mover mover(/*minRf=*/3);
+
+        // Run 1: pause AFTER the learner is added (mayProceed false on the 2nd check),
+        // so the move stops with the learner committed but no voter yet removed.
+        int checks = 0;
+        auto pausingMayProceed = [&checks] { return ++checks < 2; };
+        auto mf1 = mover.run(job, exec, pausingMayProceed);
+        for (int i = 0; i < 8000 && !mf1.available(); ++i)
+            tickAll();
+        mf1.get();
+        EXPECT_FALSE(job.done()) << "the throttle paused the move";
+        EXPECT_EQ(job.step(), movement::MoveStep::LearnerAdded);
+        // SAFE FORWARD: the original voters are all still voters (RF never dropped), and
+        // the destination is a committed learner catching up.
+        auto midVoters = reps[leader].group->node().config().voters;
+        std::sort(midVoters.begin(), midVoters.end());
+        EXPECT_EQ(midVoters, (std::vector<NodeId>{1, 2, 3})) << "RF preserved: no voter removed while paused";
+        const auto& learners = reps[leader].group->node().config().learners;
+        EXPECT_NE(std::find(learners.begin(), learners.end(), 4u), learners.end()) << "learner added before pause";
+
+        // Run 2: resume (mayProceed always true) -> the SAME job completes.
+        auto mf2 = mover.run(job, exec, [] { return true; });
+        for (int i = 0; i < 8000 && !mf2.available(); ++i)
+            tickAll();
+        mf2.get();
+        ASSERT_TRUE(job.done());
+        auto finalVoters = reps[leader].group->node().config().voters;
+        std::sort(finalVoters.begin(), finalVoters.end());
+        EXPECT_EQ(finalVoters, (std::vector<NodeId>{1, 2, 4})) << "resumed move completes the replace";
 
         for (auto& [id, r] : reps) {
             router.setGroup(id, nullptr);
