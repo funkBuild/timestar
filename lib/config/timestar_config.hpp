@@ -209,6 +209,12 @@ struct ClusterConfig {
     // byte-identical; requires `enabled`. A partitioned cluster additionally starts
     // the data-plane RPC listener (HTTP port + 1000).
     bool partitioned = false;
+    // RF=3 REPLICATION (integration plan M3). The number of Raft voters per VShard.
+    // 1 (default) = partitioned RF=1 (M2, single owner per VShard, no consensus).
+    // >1 = each VShard is a Raft group of this many replicas; a write is acked only
+    // after durable quorum commit. Must be ODD (Raft majority) and <= the node count.
+    // Requires `partitioned`. Off by default so M2 clusters are unchanged.
+    uint16_t replication_factor = 1;
 };
 
 // Seastar settings parsed from [seastar] TOML section.
@@ -348,8 +354,8 @@ struct glz::meta<timestar::StreamingConfig> {
 template <>
 struct glz::meta<timestar::ClusterConfig> {
     using T = timestar::ClusterConfig;
-    static constexpr auto value =
-        object("enabled", &T::enabled, "node_id", &T::node_id, "peers", &T::peers, "partitioned", &T::partitioned);
+    static constexpr auto value = object("enabled", &T::enabled, "node_id", &T::node_id, "peers", &T::peers,
+                                         "partitioned", &T::partitioned, "replication_factor", &T::replication_factor);
 };
 
 template <>

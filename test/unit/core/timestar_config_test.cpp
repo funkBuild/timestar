@@ -201,6 +201,59 @@ TEST(TimestarConfigValidateTest, ClusterPartitionedWithEnabledPasses) {
 }
 
 // ===========================================================================
+// cluster.replication_factor (M3 RF=3 gate)
+// ===========================================================================
+
+TEST(TimestarConfigValidateTest, ReplicationFactorDefaultsToOne) {
+    timestar::TimestarConfig cfg;
+    EXPECT_EQ(cfg.cluster.replication_factor, 1);  // partitioned RF=1 / M2 default
+}
+
+TEST(TimestarConfigValidateTest, ReplicationFactorRequiresPartitioned) {
+    timestar::TimestarConfig cfg;
+    cfg.cluster.enabled = true;
+    cfg.cluster.partitioned = false;
+    cfg.cluster.node_id = 1;
+    cfg.cluster.peers = {"a:1", "b:2", "c:3"};
+    cfg.cluster.replication_factor = 3;
+    auto errs = errorsMatching(cfg.validate(), "cluster.replication_factor");
+    EXPECT_FALSE(errs.empty());
+}
+
+TEST(TimestarConfigValidateTest, ReplicationFactorMustBeOdd) {
+    timestar::TimestarConfig cfg;
+    cfg.cluster.enabled = true;
+    cfg.cluster.partitioned = true;
+    cfg.cluster.node_id = 1;
+    cfg.cluster.peers = {"a:1", "b:2", "c:3", "d:4"};
+    cfg.cluster.replication_factor = 2;  // even -> no Raft majority
+    auto errs = errorsMatching(cfg.validate(), "must be odd");
+    EXPECT_FALSE(errs.empty());
+}
+
+TEST(TimestarConfigValidateTest, ReplicationFactorMustNotExceedNodeCount) {
+    timestar::TimestarConfig cfg;
+    cfg.cluster.enabled = true;
+    cfg.cluster.partitioned = true;
+    cfg.cluster.node_id = 1;
+    cfg.cluster.peers = {"a:1"};  // 1 node
+    cfg.cluster.replication_factor = 3;
+    auto errs = errorsMatching(cfg.validate(), "exceed the number of nodes");
+    EXPECT_FALSE(errs.empty());
+}
+
+TEST(TimestarConfigValidateTest, ReplicationFactorThreeWithThreeNodesPasses) {
+    timestar::TimestarConfig cfg;
+    cfg.cluster.enabled = true;
+    cfg.cluster.partitioned = true;
+    cfg.cluster.node_id = 1;
+    cfg.cluster.peers = {"a:1", "b:2", "c:3"};
+    cfg.cluster.replication_factor = 3;
+    auto errs = errorsMatching(cfg.validate(), "replication_factor");
+    EXPECT_TRUE(errs.empty());
+}
+
+// ===========================================================================
 // server.port
 // ===========================================================================
 
