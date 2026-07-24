@@ -172,8 +172,10 @@ TEST_F(EngineLocalStoreTest, QueryMetadataReturnsOwnedSchema) {
         std::sort(meas.items.begin(), meas.items.end());
         EXPECT_EQ(meas.items, (std::vector<std::string>{"log", "temp"}));
 
+        // Fields carries "name\x1ftype" so the coordinator union preserves the type.
         auto fields = store.queryMetadata({data::MetadataKind::Fields, "temp", "", ""}).get();
-        EXPECT_EQ(fields.items, (std::vector<std::string>{"value"}));
+        ASSERT_EQ(fields.items.size(), 1u);
+        EXPECT_EQ(fields.items[0].substr(0, fields.items[0].find('\x1f')), "value");
 
         auto card = store.queryMetadata({data::MetadataKind::MeasurementCardinality, "temp", "", ""}).get();
         EXPECT_GE(card.cardinality, 1.0);  // at least the one series

@@ -192,8 +192,14 @@ seastar::future<data::MetadataResult> EngineLocalStore::queryMetadata(data::Meta
             break;
         }
         case data::MetadataKind::Fields: {
+            // Carry the field TYPE alongside the name as "name\x1ftype" so the
+            // coordinator's set-union preserves it (a field has one global type, so
+            // identical pairs dedup). The handler splits on \x1f.
             auto s = co_await e.getMeasurementFields(req.measurement);
-            out.items.assign(s.begin(), s.end());
+            for (const auto& f : s) {
+                std::string type = co_await e.getIndex().getFieldType(req.measurement, f);
+                out.items.push_back(f + std::string(1, '\x1f') + type);
+            }
             break;
         }
         case data::MetadataKind::TagKeys: {

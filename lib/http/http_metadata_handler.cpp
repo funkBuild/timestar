@@ -405,20 +405,30 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::hand
             }
         }
 
-        // Schema caches are populated on all shards via broadcast, so query locally
-        auto& localEngine = engineSharded->local();
-        auto allFields = co_await localEngine.getMeasurementFields(measurement);
-
         std::unordered_map<std::string, std::string> fieldsWithTypes;
-        std::vector<std::string> fieldVec(allFields.begin(), allFields.end());
-        std::vector<seastar::future<std::string>> typeFutures;
-        typeFutures.reserve(fieldVec.size());
-        for (const auto& field : fieldVec) {
-            typeFutures.push_back(localEngine.getIndex().getFieldType(measurement, field));
-        }
-        auto allTypes = co_await seastar::when_all_succeed(typeFutures.begin(), typeFutures.end());
-        for (size_t i = 0; i < fieldVec.size(); ++i) {
-            fieldsWithTypes[fieldVec[i]] = allTypes[i].empty() ? "float" : std::move(allTypes[i]);
+        if (clusterMetadataHook) {
+            // Partitioned: union "name\x1ftype" pairs across owner nodes.
+            auto res = co_await clusterMetadataHook({timestar::data::MetadataKind::Fields, measurement, "", ""});
+            for (const auto& item : res.items) {
+                auto sep = item.find('\x1f');
+                std::string name = sep == std::string::npos ? item : item.substr(0, sep);
+                std::string type = sep == std::string::npos ? std::string("float") : item.substr(sep + 1);
+                fieldsWithTypes[name] = type.empty() ? "float" : std::move(type);
+            }
+        } else {
+            // Schema caches are populated on all shards via broadcast, so query locally
+            auto& localEngine = engineSharded->local();
+            auto allFields = co_await localEngine.getMeasurementFields(measurement);
+            std::vector<std::string> fieldVec(allFields.begin(), allFields.end());
+            std::vector<seastar::future<std::string>> typeFutures;
+            typeFutures.reserve(fieldVec.size());
+            for (const auto& field : fieldVec) {
+                typeFutures.push_back(localEngine.getIndex().getFieldType(measurement, field));
+            }
+            auto allTypes = co_await seastar::when_all_succeed(typeFutures.begin(), typeFutures.end());
+            for (size_t i = 0; i < fieldVec.size(); ++i) {
+                fieldsWithTypes[fieldVec[i]] = allTypes[i].empty() ? "float" : std::move(allTypes[i]);
+            }
         }
 
         rep->set_status(seastar::http::reply::status_type::ok);
@@ -428,7 +438,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::hand
             rep->_content = formatFieldsResponse(measurement, fieldsWithTypes, tagFilters);
         }
 
-        timestar::http_log.debug("Returning {} fields for measurement: {}", allFields.size(), measurement);
+        timestar::http_log.debug("Returning {} fields for measurement: {}", fieldsWithTypes.size(), measurement);
 
     } catch (const std::exception& e) {
         timestar::http_log.error("Error processing /fields: {}", e.what());
