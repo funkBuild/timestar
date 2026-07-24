@@ -6,8 +6,10 @@
 namespace timestar::cluster {
 
 seastar::future<> EngineDataStateMachine::apply(raft::LogEntry entry) {
-    // appliedIndex advances for EVERY committed entry (including non-Normal control
-    // entries the data machine does not act on), so the watermark tracks the log.
+    // The RaftGroup only calls apply() for Normal, non-empty entries, so this
+    // watermark tracks the last DATA entry applied (see appliedIndex() in the
+    // header). The type guard below is defensive -- an empty-data entry would decode
+    // to nullopt and fail-stop, which we must not do for a control entry.
     appliedIndex_ = entry.index;
     if (entry.type != raft::EntryType::Normal)
         co_return;

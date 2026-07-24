@@ -24,12 +24,22 @@ namespace timestar::cluster {
 //
 // Contracts:
 //   - A committed-but-undecodable entry is FAIL-STOP (throws), never skipped:
-//     skipping would diverge this replica from the others.
-//   - Backpressure must NOT fire inside apply -- admission happens at PROPOSE time
-//     (the leader rejects if ingest-backlogged); a follower behind on apply is lag,
-//     handled by Raft flow control. So apply must retry on transient pressure rather
-//     than skip. (v1 relies on EngineLocalStore not raising IngestBacklogException on
-//     the apply path.)
+//     skipping would diverge this replica from the others. RaftGroup::drainReady
+//     propagates the throw BEFORE advancing the applied index, so the entry is not
+//     marked applied -- the replica halts/retries rather than skipping.
+//   - Backpressure: admission is meant to happen at PROPOSE time (the leader rejects
+//     if ingest-backlogged). apply() itself can still throw IngestBacklogException
+//     today because it routes through Engine::insertBatch, which calls
+//     rejectIfIngestBacklogged unconditionally -- a follower applying a large
+//     catch-up burst that outruns background flush. That throw does NOT diverge
+//     (RaftGroup retries the whole Ready, and re-apply is idempotent), but it can
+//     stall a lagging replica's recovery; a proper apply-path bypass (insert without
+//     admission control) is a follow-on. Do not read this as "never fires".
+//   - appliedIndex(): the SM's watermark tracks the last DATA entry apply() ran on.
+//     The RaftGroup only invokes apply() for Normal non-empty entries, so a trailing
+//     config-change or empty term-start no-op is NOT counted here; the authoritative
+//     applied index for commit/apply-ack waiters is RaftGroup's own (this is a
+//     coarser hint, e.g. for read-catch-up).
 class EngineDataStateMachine : public raft::RaftStateMachine {
 public:
     explicit EngineDataStateMachine(EngineLocalStore& store) : store_(store) {}

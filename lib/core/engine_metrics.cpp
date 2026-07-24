@@ -62,9 +62,14 @@ void EngineMetrics::setup(Engine& engine) {
                 [&engine] { return static_cast<int64_t>(engine.getIndex().getSeriesCountSync()); },
                 sm::description("Number of indexed series on this shard")),
             });
-    } catch (const std::exception&) {
-        // Duplicate registration by a second in-process Engine on this shard
-        // (RF=3 test harness). Never happens with one Engine per process.
+    } catch (const std::exception& e) {
+        // ONLY tolerate the duplicate-registration collision from a second in-process
+        // Engine on this shard (RF=3 test harness). Any OTHER registration failure --
+        // which in production (one Engine per process) is the only kind that can occur
+        // -- must still surface, not be silently swallowed into a metrics-less engine.
+        const std::string msg = e.what();
+        if (msg.find("twice") == std::string::npos && msg.find("registered") == std::string::npos)
+            throw;
     }
 }
 

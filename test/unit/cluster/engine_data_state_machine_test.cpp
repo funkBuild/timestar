@@ -3,6 +3,7 @@
 // visibly, a DeleteRangeKey removes it, log-ordered LWW holds (a higher-index write
 // wins), and an undecodable committed entry is fail-stop.
 #include "../../../lib/cluster/integration/engine_data_state_machine.hpp"
+#include "../../../lib/core/placement_table.hpp"  // routeToCore
 #include "../../../lib/http/http_query_handler.hpp"
 #include "../../../lib/utils/series_key.hpp"
 #include "../../test_helpers.hpp"
@@ -103,5 +104,42 @@ TEST_F(EngineDataStateMachineTest, UndecodableCommittedEntryIsFailStop) {
             threw = true;
         }
         EXPECT_TRUE(threw) << "an undecodable committed entry must fail-stop, not be skipped";
+    }).get();
+}
+
+// Regression for the review's HIGH-1: after a restart flips assignRevisions_ on, the
+// Engine must NOT re-stamp the state machine's log-index revisions with its local
+// per-shard counter -- doing so breaks the ADR-0003 "revision = log index, identical
+// on every replica" contract. Observable: applying a log-index-revision write leaves
+// the per-shard revision counter UNCHANGED (the stamp guard skipped it).
+TEST_F(EngineDataStateMachineTest, AppliedRevisionsAreNotReStampedByEngineCounter) {
+    seastar::async([] {
+        ScopedShardedEngine eng;
+        eng.start();
+        // Simulate the post-restart state: revision assignment enabled on every shard.
+        eng->invoke_on_all([](Engine& e) {
+               e.setRevisionAssignment(true);
+               return seastar::make_ready_future<>();
+           })
+            .get();
+
+        cluster::EngineLocalStore store(*eng);
+        cluster::EngineDataStateMachine sm(store);
+
+        const std::string key = buildSeriesKey("temp", {{"host", "h1"}}, "value");
+        const unsigned core = timestar::routeToCore(SeriesId128::fromSeriesKey(key));
+        const uint64_t before =
+            eng->invoke_on(core, [](Engine& e) { return e.nextRevision(); }).get();
+
+        // Apply a committed entry at log index 77 -> the state machine stamps
+        // revision = 77 on the point and passes it through.
+        sm.apply(writeEntry(77, key, 42.5)).get();
+        EXPECT_DOUBLE_EQ(latest(*eng, "temp", "value"), 42.5);
+
+        const uint64_t after =
+            eng->invoke_on(core, [](Engine& e) { return e.nextRevision(); }).get();
+        // The local counter must be untouched: the log-index revision was honored, not
+        // clobbered. (Pre-fix, insertBatch would have burned a counter value here.)
+        EXPECT_EQ(after, before) << "Engine re-stamped a caller-provided (log-index) revision";
     }).get();
 }

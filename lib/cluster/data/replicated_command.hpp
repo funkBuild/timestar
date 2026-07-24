@@ -19,14 +19,21 @@ namespace timestar::data {
 
 // Delete every point of the series identified by `seriesKey` (the lossless string
 // whose hash routes it -- not a one-way DataPoint SeriesId128) in [startTime,
-// endTime] inclusive whose revision precedes the tombstone's apply-assigned revision.
+// endTime] inclusive. Applied as a physical range delete on every replica (NOT
+// revision-bounded in v1 -- EngineDataStateMachine passes no revision floor). It
+// still converges: strict log-order apply means a write ordered AFTER the delete is
+// re-applied after it and survives, a write BEFORE is removed -- the log order is the
+// linearization. A revision-bounded tombstone is a later refinement.
 struct DeleteRangeKey {
     std::string seriesKey;
     uint64_t startTime = 0;
     uint64_t endTime = 0;  // inclusive
 };
 
-// Drop every point older than `cutoffTime` across the VShard. Monotonic.
+// Drop every point older than `cutoffTime` across the VShard. Monotonic. NOTE: in v1
+// EngineDataStateMachine's apply of this command is a NO-OP (EngineLocalStore::
+// applyRetention is a stub, wired in M1.x/M6) -- it is a uniform no-op on every
+// replica (not divergent), but replicated retention is not yet functional.
 struct RetentionCutoffCmd {
     uint64_t cutoffTime = 0;
 };

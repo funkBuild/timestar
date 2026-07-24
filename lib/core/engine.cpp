@@ -151,6 +151,14 @@ template <class T>
 void Engine::stampRevisions(TimeStarInsert<T>& req) {
     if (!assignRevisions_)
         return;  // non-cluster: leave the revision column empty (zero overhead)
+    // Honor caller-provided revisions: the replicated apply path
+    // (EngineDataStateMachine) stamps revision = Raft log index so a value is a pure
+    // function of the log and identical on every replica (ADR 0003). Re-stamping
+    // those with the local per-shard counter would break cross-replica determinism
+    // after a restart (which flips assignRevisions_ on via restoreRevisionCounter).
+    // See write_record.hpp: "the Engine must not re-stamp a non-empty revision vector".
+    if (!req.revisions.empty())
+        return;
     const size_t count = req.getTimestamps().size();
     if (count == 0)
         return;
