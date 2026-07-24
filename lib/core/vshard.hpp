@@ -53,4 +53,22 @@ private:
     return static_cast<unsigned>(vshard.value() % coreCount);
 }
 
+// True iff every series of every VShard lands on that VShard's assignCore() core,
+// i.e. the hot per-series router routeToCore() = hash % coreCount agrees with
+// assignCore(virtualShard) = (hash & (VIRTUAL_SHARD_COUNT-1)) % coreCount for ALL
+// hashes. That holds exactly when coreCount divides VIRTUAL_SHARD_COUNT:
+//   hash % c == (hash & 4095) % c  for all hash
+//   <=> (hash & ~4095) % c == 0     for all hash   (the two differ by a multiple of 4096)
+//   <=> every multiple of 4096 is a multiple of c
+//   <=> c | 4096  <=> c is a power of two <= VIRTUAL_SHARD_COUNT.
+// This is the precondition a single-core VShard snapshot depends on: when it holds,
+// a VShard's data lives entirely on one core (assignCore), so createVShardSnapshot on
+// that core captures the WHOLE VShard. When it does NOT hold, a VShard's series
+// scatter across cores and a single-core snapshot would silently omit some -- see
+// memory snapshot-wiring-blocker. Callers MUST gate on this before treating a
+// per-core snapshot as complete.
+[[nodiscard]] constexpr bool vshardsCohesiveOnCores(unsigned coreCount) noexcept {
+    return coreCount != 0 && (VIRTUAL_SHARD_COUNT % coreCount == 0);
+}
+
 }  // namespace timestar
