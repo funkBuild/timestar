@@ -8,6 +8,7 @@
 #include "../../../lib/cluster/integration/engine_data_state_machine.hpp"
 #include "../../../lib/cluster/integration/raft_move_executor.hpp"
 #include "../../../lib/cluster/features/operator_surface.hpp"
+#include "../../../lib/cluster/features/stream_subscription.hpp"
 #include "../../../lib/cluster/movement/movement_throttle.hpp"
 #include "../../../lib/cluster/movement/placement_balancer.hpp"
 #include "../../../lib/cluster/integration/replica_engine_coordinator.hpp"
@@ -933,5 +934,119 @@ TEST_F(EngineRf3Test, OperatorPauseResumeGovernsRealMove) {
             fs::remove_all(d);
         for (auto& d : engineDirs)
             fs::remove_all(d);
+    }).get();
+}
+
+// M6 cluster-aware streaming gate (in-process): a subscription over a REPLICATED
+// VShard backfills committed writes through a barrier, goes live, and -- across a
+// real LEADER FAILOVER (a placement change bumping the Raft term) -- resumes from its
+// cursor with NO LOSS and NO DUPLICATE, deduping on the real Raft commit index. Each
+// write's (term, commitIndex) is the actual Raft position it committed at.
+TEST_F(EngineRf3Test, StreamingSurvivesFailoverNoLossNoDup) {
+    seastar::async([] {
+        const std::vector<NodeId> voters = {1, 2, 3};
+        NodeId leader = 1;
+        Router router;
+        std::map<NodeId, Replica> reps;
+        std::vector<fs::path> journalDirs, engineDirs;
+
+        auto tickAll = [&] {
+            for (auto& [id, r] : reps)
+                if (r.group)
+                    r.group->tick().get();
+            router.pump().get();
+        };
+        auto tick = [&](int rounds) {
+            for (int i = 0; i < rounds; ++i)
+                tickAll();
+        };
+        auto drive = [&](auto& f, int rounds) {
+            for (int i = 0; i < rounds && !f.available(); ++i) {
+                router.pump().get();
+                tickAll();
+            }
+        };
+
+        for (NodeId id : voters) {
+            Replica r;
+            fs::path edir = tmpDir("streng" + std::to_string(id));
+            engineDirs.push_back(edir);
+            r.engine = std::make_unique<ScopedShardedEngine>();
+            r.engine->startAt(edir.string());
+            r.store = std::make_unique<cluster::EngineLocalStore>(**r.engine);
+            r.sm = std::make_unique<cluster::EngineDataStateMachine>(*r.store, timestar::VShardId{1});
+            fs::path jdir = tmpDir("strj" + std::to_string(id));
+            journalDirs.push_back(jdir);
+            r.writer = std::make_unique<JournalWriter>(jdir, header(), 1u << 20);
+            auto recovered = r.writer->open().get();
+            RecoveredRaftState st = recoverRaftState(recovered, VShardId{1});
+            r.persistence = std::make_unique<JournalRaftPersistence>(*r.writer, VShardId{1}, st.nextSeq);
+            r.transport = std::make_unique<RouterTransport>(router);
+            RaftNode node(id, voters, std::move(st.log), st.hardState, optsFor(id, leader), {});
+            r.group = std::make_unique<RaftGroup>(1, std::move(node), *r.persistence, *r.transport, *r.sm);
+            router.setGroup(id, r.group.get());
+            reps[id] = std::move(r);
+        }
+        tick(40);
+        ASSERT_TRUE(reps[leader].group->isLeader());
+
+        using features::StreamEvent;
+        // Commit a write and capture the REAL (term, commitIndex) it landed at.
+        auto commitWrite = [&](const std::string& m, double v) -> StreamEvent {
+            auto f = reps[leader].group->proposeAndAwaitApplied(writeCmd(buildSeriesKey(m, {{"h", "1"}}, "v"), v));
+            drive(f, 80);
+            EXPECT_TRUE(f.get());
+            tick(10);
+            return StreamEvent{.vshard = 1,
+                               .term = reps[leader].group->currentTerm(),
+                               .index = reps[leader].group->commitIndex(),
+                               .payload = m};
+        };
+
+        StreamEvent a = commitWrite("a", 1), b = commitWrite("b", 2);
+        const uint64_t barrier = reps[leader].group->commitIndex();
+        StreamEvent c = commitWrite("c", 3);  // live, arrives after the barrier is taken
+
+        // Fresh subscription: backfill (<= barrier) then live.
+        features::SubscriptionCursor cursor;
+        auto delivered = features::BackfillLiveStream::deliver(cursor, barrier, {a, b}, {c});
+        std::vector<std::string> seen;
+        for (auto& e : delivered)
+            seen.push_back(e.payload);
+        EXPECT_EQ(seen, (std::vector<std::string>{"a", "b", "c"})) << "backfill+live delivers each write once";
+
+        // FAILOVER: partition the leader; a survivor wins a NEW term (placement change).
+        router.partition(leader);
+        tick(80);
+        NodeId newLeader = 0;
+        for (NodeId id : voters)
+            if (id != leader && reps[id].group->isLeader())
+                newLeader = id;
+        ASSERT_NE(newLeader, 0u) << "a survivor must take leadership";
+        EXPECT_GT(reps[newLeader].group->currentTerm(), a.term) << "failover bumped the term";
+        leader = newLeader;
+
+        StreamEvent d = commitWrite("d", 4);  // committed under the new term
+
+        // Resume the SAME cursor: the new event is delivered; re-sent old events (a,b,c,
+        // e.g. a redelivery after re-registering on the new leader) are all deduped.
+        auto afterFailover = features::BackfillLiveStream::deliver(cursor, d.index, {a, b, c}, {d});
+        std::vector<std::string> seen2;
+        for (auto& e : afterFailover)
+            seen2.push_back(e.payload);
+        EXPECT_EQ(seen2, (std::vector<std::string>{"d"})) << "no loss (d delivered), no dup (a,b,c deduped)";
+        EXPECT_GT(d.index, c.index) << "commit index is monotonic across failover";
+
+        for (auto& [id, r] : reps) {
+            router.setGroup(id, nullptr);
+            r.group.reset();
+            r.persistence.reset();
+            r.writer->close().get();
+        }
+        reps.clear();
+        for (auto& dd : journalDirs)
+            fs::remove_all(dd);
+        for (auto& dd : engineDirs)
+            fs::remove_all(dd);
     }).get();
 }
