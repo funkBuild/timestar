@@ -100,6 +100,15 @@ public:
     bool isLearner(NodeId n) const;
     const Config& config() const { return config_; }
 
+    // Highest log index this leader knows is replicated on `peer` (0 if unknown --
+    // no entry acked yet, or `peer` is not a member). Meaningful only on the leader.
+    // The move executor's catchUp() polls this to know when a freshly-added learner
+    // has caught up enough to be promoted safely (integration plan M5).
+    LogIndex matchIndexOf(NodeId peer) const {
+        auto it = matchIndex_.find(peer);
+        return it == matchIndex_.end() ? kNoIndex : it->second;
+    }
+
     // Propose a §6 membership change to the given target voters/learners. The
     // leader enters a joint configuration (Cold,new) immediately, and once that
     // commits it auto-appends the final Cnew. false if not the leader or a change

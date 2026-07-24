@@ -68,6 +68,8 @@ public:
     Term currentTerm() const { return node_.currentTerm(); }
     NodeId leader() const { return node_.leader(); }
     LogIndex commitIndex() const { return node_.commitIndex(); }
+    // Highest index this leader knows replicated on `peer` (M5 move catchUp signal).
+    LogIndex matchIndexOf(NodeId peer) const { return node_.matchIndexOf(peer); }
     const RaftNode& node() const { return node_; }
 
 private:

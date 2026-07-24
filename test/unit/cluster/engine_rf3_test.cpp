@@ -351,3 +351,86 @@ TEST_F(EngineRf3Test, ReplicaReadServesFromFollowerAcrossNodes) {
             fs::remove_all(d);
     }).get();
 }
+
+// M5 foundation: on the leader, matchIndexOf(peer) reports how far a peer has
+// replicated -- the signal a move's catchUp() polls to know a freshly-added learner
+// is caught up before promoting it. After a committed write, every follower's match
+// index reaches the leader's commit; an unknown node reports kNoIndex.
+TEST_F(EngineRf3Test, LeaderTracksPeerMatchIndex) {
+    seastar::async([] {
+        const std::vector<NodeId> voters = {1, 2, 3};
+        const NodeId leader = 1;
+        Router router;
+        std::map<NodeId, Replica> reps;
+        std::vector<fs::path> journalDirs, engineDirs;
+
+        auto tick = [&](int rounds) {
+            for (int i = 0; i < rounds; ++i) {
+                for (auto& [id, r] : reps)
+                    if (r.group)
+                        r.group->tick().get();
+                router.pump().get();
+            }
+        };
+        auto drive = [&](auto& f, int rounds) {
+            for (int i = 0; i < rounds && !f.available(); ++i) {
+                router.pump().get();
+                for (auto& [id, r] : reps)
+                    if (r.group)
+                        r.group->tick().get();
+                router.pump().get();
+            }
+        };
+
+        for (NodeId id : voters) {
+            Replica r;
+            fs::path edir = tmpDir("mieng" + std::to_string(id));
+            engineDirs.push_back(edir);
+            r.engine = std::make_unique<ScopedShardedEngine>();
+            r.engine->startAt(edir.string());
+            r.store = std::make_unique<cluster::EngineLocalStore>(**r.engine);
+            r.sm = std::make_unique<cluster::EngineDataStateMachine>(*r.store, timestar::VShardId{1});
+            fs::path jdir = tmpDir("mij" + std::to_string(id));
+            journalDirs.push_back(jdir);
+            r.writer = std::make_unique<JournalWriter>(jdir, header(), 1u << 20);
+            auto recovered = r.writer->open().get();
+            RecoveredRaftState st = recoverRaftState(recovered, VShardId{1});
+            r.persistence = std::make_unique<JournalRaftPersistence>(*r.writer, VShardId{1}, st.nextSeq);
+            r.transport = std::make_unique<RouterTransport>(router);
+            RaftNode node(id, voters, std::move(st.log), st.hardState, optsFor(id, leader), {});
+            r.group = std::make_unique<RaftGroup>(1, std::move(node), *r.persistence, *r.transport, *r.sm);
+            router.setGroup(id, r.group.get());
+            reps[id] = std::move(r);
+        }
+        tick(40);
+        ASSERT_TRUE(reps[leader].group->isLeader());
+
+        {
+            const std::string key = buildSeriesKey("mi", {{"host", "h1"}}, "value");
+            auto f = reps[leader].group->proposeAndAwaitApplied(writeCmd(key, 1.0));
+            drive(f, 60);
+            ASSERT_TRUE(f.get());
+            tick(30);
+        }
+
+        const auto commit = reps[leader].group->commitIndex();
+        EXPECT_GT(commit, 0u);
+        // Both followers have replicated up to at least the committed index.
+        EXPECT_GE(reps[leader].group->matchIndexOf(2), commit) << "follower 2 caught up";
+        EXPECT_GE(reps[leader].group->matchIndexOf(3), commit) << "follower 3 caught up";
+        // A node that is not a member is unknown (kNoIndex == 0).
+        EXPECT_EQ(reps[leader].group->matchIndexOf(99), 0u);
+
+        for (auto& [id, r] : reps) {
+            router.setGroup(id, nullptr);
+            r.group.reset();
+            r.persistence.reset();
+            r.writer->close().get();
+        }
+        reps.clear();
+        for (auto& d : journalDirs)
+            fs::remove_all(d);
+        for (auto& d : engineDirs)
+            fs::remove_all(d);
+    }).get();
+}
