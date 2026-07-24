@@ -460,6 +460,11 @@ int main(int argc, char** argv) {
                         return seastar::smp::submit_to(
                             0u, [q = std::move(q)]() mutable { return g_clusterDataPlane.query(std::move(q)); });
                     };
+                    // Route /write through the data plane (per-series owner routing).
+                    timestar::http::HttpWriteHandler::clusterWriteHook = [](timestar::data::WriteBatch b) {
+                        return seastar::smp::submit_to(
+                            0u, [b = std::move(b)]() mutable { return g_clusterDataPlane.write(std::move(b)); });
+                    };
                     timestar::http_log.info("VShard-partitioned data plane started (node {})", cc.node_id);
                 }
             }

@@ -13,6 +13,7 @@
 #include <tsl/robin_map.h>
 
 #include <chrono>
+#include <functional>
 #include <memory>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
@@ -24,6 +25,10 @@
 #include <string>
 #include <unordered_set>
 #include <variant>
+
+namespace timestar::data {
+struct WriteBatch;
+}
 
 /*
  * JSON Schema for Write Requests:
@@ -304,6 +309,14 @@ private:
 
 public:
     HttpWriteHandler(seastar::sharded<Engine>* _engineSharded);
+
+    // Partitioned-cluster hook (integration plan M2). When set (by the server in
+    // cluster.partitioned mode), a built per-shard insert batch is routed to VShard
+    // owners via the data plane (ClusterDataPlane::write) INSTEAD of the local
+    // insert, and local metadata indexing is skipped -- the owner node indexes when
+    // it applies. Unset (default) => single-node / M1 path, unchanged.
+    static inline std::function<seastar::future<>(timestar::data::WriteBatch)> clusterWriteHook{};
+    static bool partitioned() { return static_cast<bool>(clusterWriteHook); }
 
     // Main handler for write requests
     seastar::future<std::unique_ptr<seastar::http::reply>> handleWrite(std::unique_ptr<seastar::http::request> req);

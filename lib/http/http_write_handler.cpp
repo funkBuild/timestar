@@ -1,6 +1,8 @@
 #include "http_write_handler.hpp"
 
+#include "../cluster/data/write_record.hpp"
 #include "../cluster/integration/cluster_gateway.hpp"
+#include "../cluster/integration/cluster_write.hpp"
 #include "content_negotiation.hpp"
 #include "http_auth.hpp"
 #include "http_error.hpp"
@@ -156,6 +158,14 @@ static bool validateFieldNameLimit(const std::string& fieldName, std::string& er
 static seastar::future<> syncMetadataUnpoisonOnFailure(seastar::sharded<Engine>* engineSharded,
                                                        std::vector<MetadataOp> ops) {
     if (ops.empty()) {
+        co_return;
+    }
+    // Partitioned cluster (M2): the owner node indexes metadata when it applies the
+    // routed WriteBatch (EngineLocalStore::applyWrites -> indexMetadataSync), so the
+    // accepting node must NOT index locally -- doing so would register series it does
+    // not own. Single-node partitioned masks this (accepter == owner); it is a real
+    // divergence only across nodes, which is why it is gated here at the source.
+    if (HttpWriteHandler::partitioned()) {
         co_return;
     }
     std::vector<SeriesId128> ids;
@@ -689,6 +699,18 @@ seastar::future<HttpWriteHandler::AggregatedTimingInfo> HttpWriteHandler::dispat
     seastar::sharded<Engine>* engineSharded, unsigned shard, std::vector<TimeStarInsert<double>> doubles,
     std::vector<TimeStarInsert<bool>> bools, std::vector<TimeStarInsert<std::string>> strings,
     std::vector<TimeStarInsert<int64_t>> integers) {
+    // Partitioned cluster (integration plan M2): route these inserts to their VShard
+    // owners via the data plane instead of inserting on this local shard. The
+    // WriteBatch's per-series owner routing subsumes the shard split -- a series
+    // owned by a remote node is forwarded; a locally-owned one is applied through
+    // EngineLocalStore. Local metadata indexing is skipped (see
+    // syncMetadataUnpoisonOnFailure): the OWNER indexes when it applies, so the
+    // accepting node must not index series it does not own.
+    if (clusterWriteHook) {
+        data::WriteBatch batch;
+        cluster::appendInsertsToBatch(batch, doubles, bools, strings, integers);
+        return clusterWriteHook(std::move(batch)).then([] { return AggregatedTimingInfo{}; });
+    }
     // Local shard: direct call, avoiding cross-shard message-queue overhead.
     if (shard == seastar::this_shard_id()) {
         return insertAllTypes(engineSharded->local(), std::move(doubles), std::move(bools), std::move(strings),
@@ -2096,8 +2118,11 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleW
     // replicated by the accepting node) is applied locally only -- never
     // re-forwarded (loop guard). We capture the raw body when the local apply
     // succeeds and replicate once, after the try, on a 2xx status.
-    const bool shouldReplicate =
-        !timestar::cluster::ClusterGateway::isForwarded(*req) && timestar::cluster::shardGateway().enabled();
+    // In partitioned mode (M2) writes are routed to VShard owners, NOT broadcast, so
+    // the M1 full-replication path is disabled -- otherwise every write would be both
+    // partitioned AND replicated (doubly applied).
+    const bool shouldReplicate = !timestar::cluster::ClusterGateway::isForwarded(*req) &&
+                                 timestar::cluster::shardGateway().enabled() && !HttpWriteHandler::partitioned();
     std::string replBody;
     const std::string replMime =
         timestar::http::isProtobuf(reqFmt) ? "application/x-protobuf" : "application/json";
