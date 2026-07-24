@@ -1,7 +1,6 @@
 #include "engine_local_store.hpp"
 
 #include "../../core/placement_table.hpp"
-#include "../../core/vshard.hpp"
 #include "../../index/index_backend.hpp"
 
 #include <map>
@@ -12,12 +11,19 @@ namespace timestar::cluster {
 
 using ::MetadataOp;  // MetadataOp is in the global namespace (like TSMValueType/SeriesId128)
 
-EngineLocalStore::EngineLocalStore(seastar::sharded<Engine>& engines, bool vshardCohesiveRouting)
-    : engines_(engines), vshardCohesive_(vshardCohesiveRouting), cores_(seastar::smp::count) {}
+EngineLocalStore::EngineLocalStore(seastar::sharded<Engine>& engines) : engines_(engines) {}
 
 unsigned EngineLocalStore::coreFor(const SeriesId128& id) const {
-    if (vshardCohesive_)
-        return timestar::assignCore(timestar::VShardId{timestar::virtualShard(id)}, cores_);
+    // MUST match the routing authority the metadata/query path uses:
+    // Engine::indexMetadataSync routes each op by routeToCore(id), and query
+    // discovery is per-core-local, so data and its index entry must co-locate on
+    // routeToCore's core. Choosing assignCore(virtualShard) here instead splits a
+    // new series' data and index across cores whenever routeToCore != assignCore
+    // (they diverge for non-power-of-2 core counts, hash >= 4096) -> the series is
+    // invisible to queries. VShard-cohesive single-core placement (the M3
+    // per-VShard-Raft precondition) must therefore be a GLOBAL routeToCore change
+    // in cluster mode, not an adapter-local one; the adapter always follows
+    // routeToCore so it stays consistent with the rest of the node.
     return timestar::routeToCore(id);
 }
 
@@ -48,6 +54,11 @@ seastar::future<> EngineLocalStore::applyWrites(data::WriteBatch batch) {
     for (auto& s : batch.series) {
         if (!s.consistent())
             throw std::runtime_error("cluster applyWrites: inconsistent WriteSeries");
+        // A point-less series carries no data; emitting a MetadataOp for it would
+        // register a phantom measurement/field/tag schema the normal write path
+        // (every point has a value) can never produce. Skip it entirely.
+        if (s.timestamps.empty())
+            continue;
         const SeriesId128 id = SeriesId128::fromSeriesKey(s.seriesKey);
         const unsigned core = coreFor(id);
         uint64_t minTs = 0, maxTs = 0;

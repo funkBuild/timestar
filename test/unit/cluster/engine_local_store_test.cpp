@@ -76,7 +76,7 @@ TEST_F(EngineLocalStoreTest, ApplyWritesAllTypesVisibleViaRealQuery) {
     seastar::async([] {
         ScopedShardedEngine eng;
         eng.start();
-        cluster::EngineLocalStore store(*eng, /*vshardCohesiveRouting=*/true);
+        cluster::EngineLocalStore store(*eng);
 
         data::WriteBatch b;
         b.series = {floatS(), intS(), boolS(), stringS()};

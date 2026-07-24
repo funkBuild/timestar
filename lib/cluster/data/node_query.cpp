@@ -144,7 +144,13 @@ void encodeRequest(Writer& w, const timestar::QueryRequest& q) {
 }
 
 bool decodeRequest(Reader& r, timestar::QueryRequest& q) {
-    q.aggregation = static_cast<timestar::AggregationMethod>(r.u8());
+    // Range-check the method: a hostile (but checksum-valid) byte must not hand
+    // executeQuery an out-of-range scoped-enum value. SPREAD is the last method;
+    // referencing it keeps the bound correct if methods are added.
+    uint8_t method = r.u8();
+    if (!r.ok || method > static_cast<uint8_t>(timestar::AggregationMethod::SPREAD))
+        return false;
+    q.aggregation = static_cast<timestar::AggregationMethod>(method);
     q.measurement = r.str();
     q.fields = r.strvec();
     q.scopes = r.strmap();
@@ -299,7 +305,9 @@ std::optional<NodeQueryPartial> decodeNodeQueryPartial(const std::string& bytes)
     Reader r{bytes.data(), bytes.data() + bodyLen};
     NodeQueryPartial partial;
     uint32_t ns = r.u32();
-    if (!r.ok || ns > static_cast<uint64_t>(r.end - r.p) / 8)
+    // Min bytes per SeriesResult: measurement len(4) + tags count(4) + fields
+    // count(4) = 12. Bounds the reserve; every field read below is still avail-checked.
+    if (!r.ok || ns > static_cast<uint64_t>(r.end - r.p) / 12)
         return std::nullopt;
     partial.series.reserve(ns);
     for (uint32_t i = 0; i < ns; ++i) {
@@ -307,7 +315,8 @@ std::optional<NodeQueryPartial> decodeNodeQueryPartial(const std::string& bytes)
         s.measurement = r.str();
         s.tags = r.strmap();
         uint32_t nf = r.u32();
-        if (!r.ok || nf > static_cast<uint64_t>(r.end - r.p) / 8)
+        // Min bytes per field: name len(4) + nts(4) + type byte(1) = 9.
+        if (!r.ok || nf > static_cast<uint64_t>(r.end - r.p) / 9)
             return std::nullopt;
         for (uint32_t f = 0; f < nf; ++f) {
             std::string name = r.str();
