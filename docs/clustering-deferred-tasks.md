@@ -124,6 +124,41 @@ Status legend: **[ ]** open · **[~]** partial (a proxy exists) · **[x]** done.
 
 ---
 
+## Phase 8 — feature completion
+
+The named deliverables are implemented as reviewed bricks (`lib/cluster/features/`):
+cluster-aware streaming (`stream_subscription.hpp`: backfill→live at one barrier,
+dedup by commit position, resumable, term-safe re-registration — the streaming
+gate: no loss, no silent duplication); backup/restore (`backup_restore.hpp`:
+per-VShard snapshot export, restore into a fresh cluster UUID as generation-one
+state with scrubbed membership, fail-closed hash verification); rolling-upgrade
+feature gating (`feature_gate.hpp`: version-range negotiation, a format activates
+only when every voter supports it); conservative routing summaries + hierarchical
+merge (`routing_summary.hpp`: unknown measurement fans out to all — no false
+negatives; tree merge == flat merge); operator surface (`operator_surface.hpp`:
+rebalance status/pause/resume, repair status, replica-decision trace, atop the
+Phase-4 cluster status / vshard describe / placement explain). Replica reads =
+done in Phase 6; hot-series lanes = out of the first release (decision 6).
+
+### [ ] Production wiring for the Phase 8 features
+- **What:** wire the streaming bricks into the SSE `/subscribe` handler (replacing
+  the Phase-4 node-local guard with a real cluster-aware coordinator that
+  registers tasks against VShard leaders and takes the backfill/live barrier via
+  `RaftGroup::readBarrier`); wire backup export/restore to real snapshot streaming
+  + on-disk generation-one bootstrap; carry `VersionRange` in the mTLS handshake
+  and gate real storage/log formats through a committed group-0 command; populate
+  the `RoutingSummary` from the live index and expose the operator surface over
+  HTTP/CLI (`node join/drain/remove/replace`, `vshard move/transfer-leader`, etc.).
+- **What exists instead:** every mechanism is a reviewed, gate-tested brick with
+  injected abstractions -- the same discipline as Phases 4-7.
+
+### [ ] Official client-binding update for the idempotent-retry contract
+- **What:** update the published client libraries (JS/Python bindings) to
+  implement "retry the whole batch on failure or timeout" per the documented
+  contract. External to this repo's core; the contract is documented in
+  `docs/clustering.md` §"Write path".
+- **Value now:** LOW for the gate; needed before GA.
+
 ## Phase 7 — online join, move, repair, balance
 
 The core mechanisms are implemented and the growth gate is proven
