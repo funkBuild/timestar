@@ -16,11 +16,20 @@ namespace timestar::data {
 // returns false (not-leader) and the whole write fails so the caller retries against
 // the advanced map -- no silent partial commit.
 //
+// v1 LIMITATION (documented, not a bug): the hint is the placement PRIMARY, and a
+// not-leader `false` carries NO hint of the actual leader back to the caller. This is
+// safe only under the model invariant "placement primary == Raft leader" (see
+// vshard_directory.hpp): a primary that FAILS is replaced by a placement/epoch change
+// the caller re-reads, and proposing to a dead primary throws (transport error, also
+// retried). The narrow uncovered case is a primary that is alive but no longer leader
+// with NO map change -- the caller would re-route to the same stale primary and spin.
+// Propagating the real leader on `false` (a leader-hint field) is a later refinement.
+//
 // Contrast with the M2 NodeWriteRouter (RF=1): that applies directly on the owner;
 // this REPLICATES through Raft on the leader, acking only on durable quorum commit.
-class ReplicatedWriteRouter {
+class ReplicatedBatchWriteRouter {
 public:
-    ReplicatedWriteRouter(const VShardDirectory& dir, ProposeSink& local, NodeTransport& client)
+    ReplicatedBatchWriteRouter(const VShardDirectory& dir, ProposeSink& local, NodeTransport& client)
         : dir_(dir), local_(local), client_(client) {}
 
     // Route + replicate. Resolves when every VShard-leader group has durably committed

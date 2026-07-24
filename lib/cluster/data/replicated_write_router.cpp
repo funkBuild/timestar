@@ -9,7 +9,7 @@
 
 namespace timestar::data {
 
-seastar::future<> ReplicatedWriteRouter::write(WriteBatch batch) {
+seastar::future<> ReplicatedBatchWriteRouter::write(WriteBatch batch) {
     // Group by VShard-leader node. Resolve every leader BEFORE dispatch: a single
     // unassigned VShard rejects the whole batch (no partial replication).
     std::map<NodeId, WriteBatch> byLeader;
@@ -17,7 +17,7 @@ seastar::future<> ReplicatedWriteRouter::write(WriteBatch batch) {
         const uint16_t vs = timestar::virtualShard(SeriesId128::fromSeriesKey(s.seriesKey));
         const NodeId leader = dir_.ownerOf(vs);  // placement primary = leader hint
         if (leader == kNoNode)
-            throw std::runtime_error("ReplicatedWriteRouter: VShard unassigned for series");
+            throw std::runtime_error("ReplicatedBatchWriteRouter: VShard unassigned for series");
         WriteBatch& dest = byLeader[leader];
         dest.schemaVersion = batch.schemaVersion;
         dest.series.push_back(std::move(s));
@@ -52,7 +52,7 @@ seastar::future<> ReplicatedWriteRouter::write(WriteBatch batch) {
     if (firstErr)
         std::rethrow_exception(firstErr);
     if (!allCommitted)
-        throw std::runtime_error("ReplicatedWriteRouter: a VShard leader was stale (retry)");
+        throw std::runtime_error("ReplicatedBatchWriteRouter: a VShard leader was stale (retry)");
 }
 
 }  // namespace timestar::data

@@ -1,4 +1,4 @@
-// Integration M3: ReplicatedWriteRouter routes a WriteBatch to each VShard's LEADER
+// Integration M3: ReplicatedBatchWriteRouter routes a WriteBatch to each VShard's LEADER
 // (local ProposeSink vs remote proposeWrite), commits on quorum, and fails the whole
 // write (for the caller to retry) if a leader is stale or a VShard is unassigned.
 // In-memory doubles (no sockets/Raft).
@@ -79,7 +79,7 @@ seastar::future<> testRoutesToLeaders() {
     VShardDirectory dir(1, rf3Map(N));  // self = node 1
     LocalSink local;
     RemoteTransport client;
-    ReplicatedWriteRouter router(dir, local, client);
+    ReplicatedBatchWriteRouter router(dir, local, client);
 
     WriteBatch batch = manySeries(90);
     // Expected split by leader (primary), computed independently from the directory.
@@ -113,7 +113,7 @@ seastar::future<> testStaleLeaderFailsWrite() {
     LocalSink local;
     local.committed = false;  // local leader stale (not actually leader)
     RemoteTransport client;
-    ReplicatedWriteRouter router(dir, local, client);
+    ReplicatedBatchWriteRouter router(dir, local, client);
     bool threw = false;
     try {
         co_await router.write(manySeries(30));
@@ -129,7 +129,7 @@ seastar::future<> testUnassignedRejects() {
     VShardDirectory dir(1, empty);
     LocalSink local;
     RemoteTransport client;
-    ReplicatedWriteRouter router(dir, local, client);
+    ReplicatedBatchWriteRouter router(dir, local, client);
     bool threw = false;
     try {
         co_await router.write(manySeries(10));
@@ -143,6 +143,6 @@ seastar::future<> testUnassignedRejects() {
 
 }  // namespace
 
-TEST(ReplicatedWriteRouterTest, RoutesEachSeriesToItsVShardLeader) { testRoutesToLeaders().get(); }
-TEST(ReplicatedWriteRouterTest, StaleLeaderFailsWholeWrite) { testStaleLeaderFailsWrite().get(); }
-TEST(ReplicatedWriteRouterTest, UnassignedVShardRejects) { testUnassignedRejects().get(); }
+TEST(ReplicatedBatchWriteRouterTest, RoutesEachSeriesToItsVShardLeader) { testRoutesToLeaders().get(); }
+TEST(ReplicatedBatchWriteRouterTest, StaleLeaderFailsWholeWrite) { testStaleLeaderFailsWrite().get(); }
+TEST(ReplicatedBatchWriteRouterTest, UnassignedVShardRejects) { testUnassignedRejects().get(); }

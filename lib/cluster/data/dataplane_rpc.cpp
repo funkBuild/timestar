@@ -271,7 +271,12 @@ seastar::future<bool> DataPlaneRpc::proposeWrite(NodeId to, WriteBatch batch) {
         throw std::runtime_error("dataplane: unknown peer");
     std::string bytes = encodeWriteBatch(batch);
     seastar::sstring reply = co_await impl_->proposeWriteStub(*conn, seastar::sstring(bytes.data(), bytes.size()));
-    co_return !reply.empty() && reply[0] == '1';  // committed on the leader
+    // "1" = committed on the leader, "0" = not-leader (caller redirects). Anything
+    // else is a framing/corruption fault -- THROW (like the other verbs) rather than
+    // silently reading it as not-leader, which would retry a corrupt path forever.
+    if (reply.size() != 1 || (reply[0] != '1' && reply[0] != '0'))
+        throw std::runtime_error("dataplane: malformed propose reply");
+    co_return reply[0] == '1';
 }
 
 seastar::future<> DataPlaneRpc::stop() {

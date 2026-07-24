@@ -268,6 +268,27 @@ TEST_F(DataPlaneRpcEnrichedTest, ProposeWriteForwardsToSinkAndReturnsResult) {
     }).get();
 }
 
+// A NodeStore-started node with NO propose sink set fails proposeWrite cleanly
+// (fail-closed) rather than hanging or crashing.
+TEST_F(DataPlaneRpcEnrichedTest, ProposeWriteWithoutSinkFailsClosed) {
+    seastar::async([] {
+        const uint16_t port = 39316;
+        const data::NodeId self = 1;
+        ThrowingNodeStore sink;
+        data::DataPlaneRpc rpc;
+        rpc.start(loopback(port), sink).get();  // no setProposeSink
+        rpc.addPeer(self, loopback(port));
+        bool threw = false;
+        try {
+            rpc.proposeWrite(self, oneFloatBatch()).get();
+        } catch (const std::exception&) {
+            threw = true;
+        }
+        EXPECT_TRUE(threw) << "proposeWrite without a sink must fail, not hang/crash";
+        rpc.stop().get();
+    }).get();
+}
+
 // start() is not idempotent -- a second call throws loudly before mutating state.
 TEST_F(DataPlaneRpcEnrichedTest, StartTwiceThrows) {
     seastar::async([] {
