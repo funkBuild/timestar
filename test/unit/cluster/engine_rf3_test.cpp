@@ -6,6 +6,7 @@
 // enriched command over the real Engine (not the toy store).
 #include "../../../lib/cluster/integration/engine_data_state_machine.hpp"
 #include "../../../lib/cluster/integration/raft_move_executor.hpp"
+#include "../../../lib/cluster/movement/placement_balancer.hpp"
 #include "../../../lib/cluster/integration/replica_engine_coordinator.hpp"
 #include "../../../lib/cluster/integration/replica_engine_reader.hpp"
 #include "../../../lib/cluster/raft/raft_group.hpp"
@@ -534,6 +535,101 @@ TEST_F(EngineRf3Test, MoverReplacesFollowerAcrossFourNodes) {
         // The job persisted forward steps through Promoted/OldRemoved to Done.
         EXPECT_FALSE(persisted.empty());
         EXPECT_EQ(persisted.back(), movement::MoveStep::Done);
+
+        for (auto& [id, r] : reps) {
+            router.setGroup(id, nullptr);
+            r.group.reset();
+            r.persistence.reset();
+            r.writer->close().get();
+        }
+        reps.clear();
+        for (auto& d : journalDirs)
+            fs::remove_all(d);
+        for (auto& d : engineDirs)
+            fs::remove_all(d);
+    }).get();
+}
+
+// M5 balancing-loop gate (in-process): the PlacementBalancer SELECTS a move from
+// load telemetry (respecting failure-domain anti-affinity + disk watermark), and the
+// RaftGroupMoveExecutor EXECUTES it over live Raft -- the two M5 bricks composed end
+// to end. Node 3 is overloaded, node 4 is free in a distinct domain, so the balancer
+// moves VShard 1's replica 3 -> 4, and the group converges to voters {1,2,4}.
+TEST_F(EngineRf3Test, BalancerSelectedMoveExecutesEndToEnd) {
+    seastar::async([] {
+        const std::vector<NodeId> voters = {1, 2, 3};
+        const std::vector<NodeId> allNodes = {1, 2, 3, 4};
+        const NodeId leader = 1;
+        Router router;
+        std::map<NodeId, Replica> reps;
+        std::vector<fs::path> journalDirs, engineDirs;
+
+        auto tickAll = [&] {
+            for (auto& [id, r] : reps)
+                if (r.group)
+                    r.group->tick().get();
+            router.pump().get();
+        };
+        auto tick = [&](int rounds) {
+            for (int i = 0; i < rounds; ++i)
+                tickAll();
+        };
+
+        for (NodeId id : allNodes) {
+            Replica r;
+            fs::path edir = tmpDir("baleng" + std::to_string(id));
+            engineDirs.push_back(edir);
+            r.engine = std::make_unique<ScopedShardedEngine>();
+            r.engine->startAt(edir.string());
+            r.store = std::make_unique<cluster::EngineLocalStore>(**r.engine);
+            r.sm = std::make_unique<cluster::EngineDataStateMachine>(*r.store, timestar::VShardId{1});
+            fs::path jdir = tmpDir("balj" + std::to_string(id));
+            journalDirs.push_back(jdir);
+            r.writer = std::make_unique<JournalWriter>(jdir, header(), 1u << 20);
+            auto recovered = r.writer->open().get();
+            RecoveredRaftState st = recoverRaftState(recovered, VShardId{1});
+            r.persistence = std::make_unique<JournalRaftPersistence>(*r.writer, VShardId{1}, st.nextSeq);
+            r.transport = std::make_unique<RouterTransport>(router);
+            RaftNode node(id, voters, std::move(st.log), st.hardState, optsFor(id, leader), {});
+            r.group = std::make_unique<RaftGroup>(1, std::move(node), *r.persistence, *r.transport, *r.sm);
+            router.setGroup(id, r.group.get());
+            reps[id] = std::move(r);
+        }
+        tick(40);
+        ASSERT_TRUE(reps[leader].group->isLeader());
+
+        // Telemetry: node 3 is heavily loaded; node 4 is empty with headroom. Each node
+        // is in its own failure domain so anti-affinity permits 3 -> 4.
+        using movement::NodeLoad;
+        std::map<NodeId, NodeLoad> loads = {
+            {1, NodeLoad{1, "a", 1.0, 100.0, 1}},
+            {2, NodeLoad{2, "b", 1.0, 100.0, 1}},
+            {3, NodeLoad{3, "c", 1.0, 100.0, 10}},  // overloaded
+            {4, NodeLoad{4, "d", 1.0, 100.0, 0}},   // free destination
+        };
+        std::map<uint16_t, std::vector<NodeId>> placement = {{1, {1, 2, 3}}};
+
+        auto plan = movement::PlacementBalancer::planOneMove(placement, loads, movement::BalancerConfig{});
+        ASSERT_TRUE(plan.has_value()) << "balancer must propose a move off the overloaded node";
+        EXPECT_EQ(plan->dest, 4u);
+        EXPECT_EQ(plan->victim, 3u) << "the overloaded node's replica is the one moved";
+        EXPECT_EQ(plan->vshard, 1u);
+
+        // Execute the balancer's chosen move over live Raft.
+        cluster::RaftGroupMoveExecutor exec(
+            *reps[leader].group, [](const movement::MoveJob&) { return seastar::make_ready_future<>(); });
+        movement::MoveJob job(*plan);
+        movement::Mover mover(/*minRf=*/3);
+        auto mf = mover.run(job, exec);
+        for (int i = 0; i < 8000 && !mf.available(); ++i)
+            tickAll();
+        mf.get();
+        ASSERT_TRUE(job.done());
+
+        auto finalVoters = reps[leader].group->node().config().voters;
+        std::sort(finalVoters.begin(), finalVoters.end());
+        EXPECT_EQ(finalVoters, (std::vector<NodeId>{1, 2, 4}))
+            << "the balancer-selected move rebalanced the overloaded node's replica to the free node";
 
         for (auto& [id, r] : reps) {
             router.setGroup(id, nullptr);
