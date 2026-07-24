@@ -1,0 +1,139 @@
+#include "replicated_command.hpp"
+
+#include <cstring>
+
+namespace timestar::data {
+
+namespace {
+
+uint64_t fnv1a(const char* p, size_t n) {
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < n; ++i) {
+        h ^= static_cast<uint8_t>(p[i]);
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+void putU32(std::string& out, uint32_t v) {
+    for (int i = 0; i < 4; ++i)
+        out.push_back(static_cast<char>((v >> (8 * i)) & 0xff));
+}
+void putU64(std::string& out, uint64_t v) {
+    for (int i = 0; i < 8; ++i)
+        out.push_back(static_cast<char>((v >> (8 * i)) & 0xff));
+}
+void putStr(std::string& out, const std::string& s) {
+    putU32(out, static_cast<uint32_t>(s.size()));
+    out.append(s);
+}
+
+struct Reader {
+    const char* p;
+    const char* end;
+    bool ok = true;
+    bool avail(size_t n) const { return static_cast<size_t>(end - p) >= n; }
+    uint8_t u8() {
+        if (!ok || !avail(1)) {
+            ok = false;
+            return 0;
+        }
+        return static_cast<uint8_t>(*p++);
+    }
+    uint32_t u32() {
+        uint32_t v = 0;
+        for (int i = 0; i < 4; ++i)
+            v |= static_cast<uint32_t>(u8()) << (8 * i);
+        return v;
+    }
+    uint64_t u64() {
+        uint64_t v = 0;
+        for (int i = 0; i < 8; ++i)
+            v |= static_cast<uint64_t>(u8()) << (8 * i);
+        return v;
+    }
+    std::string str() {
+        uint32_t n = u32();
+        if (!ok || !avail(n)) {
+            ok = false;
+            return {};
+        }
+        std::string s(p, n);
+        p += n;
+        return s;
+    }
+};
+
+constexpr uint8_t kWrite = 0;
+constexpr uint8_t kDelete = 1;
+constexpr uint8_t kRetention = 2;
+
+}  // namespace
+
+std::string encodeReplicatedCommand(const ReplicatedCommand& cmd) {
+    std::string out;
+    if (const auto* w = std::get_if<WriteBatch>(&cmd)) {
+        out.push_back(static_cast<char>(kWrite));
+        // WriteBatch arm reuses the tested encoder as a length-prefixed sub-blob
+        // (it carries its own FNV; the outer trailer covers the tag + blob).
+        putStr(out, encodeWriteBatch(*w));
+    } else if (const auto* d = std::get_if<DeleteRangeKey>(&cmd)) {
+        out.push_back(static_cast<char>(kDelete));
+        putStr(out, d->seriesKey);
+        putU64(out, d->startTime);
+        putU64(out, d->endTime);
+    } else {
+        const auto& r = std::get<RetentionCutoffCmd>(cmd);
+        out.push_back(static_cast<char>(kRetention));
+        putU64(out, r.cutoffTime);
+    }
+    putU64(out, fnv1a(out.data(), out.size()));
+    return out;
+}
+
+std::optional<ReplicatedCommand> decodeReplicatedCommand(const std::string& bytes) {
+    if (bytes.size() < 8)
+        return std::nullopt;
+    const size_t bodyLen = bytes.size() - 8;
+    uint64_t stored = 0;
+    for (int i = 0; i < 8; ++i)
+        stored |= static_cast<uint64_t>(static_cast<uint8_t>(bytes[bodyLen + i])) << (8 * i);
+    if (fnv1a(bytes.data(), bodyLen) != stored)
+        return std::nullopt;
+
+    Reader r{bytes.data(), bytes.data() + bodyLen};
+    uint8_t tag = r.u8();
+    if (!r.ok)
+        return std::nullopt;
+    ReplicatedCommand cmd;
+    if (tag == kWrite) {
+        std::string blob = r.str();
+        if (!r.ok)
+            return std::nullopt;
+        auto batch = decodeWriteBatch(blob);
+        if (!batch)
+            return std::nullopt;
+        cmd = std::move(*batch);
+    } else if (tag == kDelete) {
+        DeleteRangeKey d;
+        d.seriesKey = r.str();
+        d.startTime = r.u64();
+        d.endTime = r.u64();
+        if (!r.ok)
+            return std::nullopt;
+        cmd = std::move(d);
+    } else if (tag == kRetention) {
+        RetentionCutoffCmd rc;
+        rc.cutoffTime = r.u64();
+        if (!r.ok)
+            return std::nullopt;
+        cmd = rc;
+    } else {
+        return std::nullopt;  // unknown kind
+    }
+    if (!r.ok || r.p != r.end)
+        return std::nullopt;
+    return cmd;
+}
+
+}  // namespace timestar::data
