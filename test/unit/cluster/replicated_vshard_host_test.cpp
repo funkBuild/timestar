@@ -102,6 +102,27 @@ TEST_F(ReplicatedVShardHostTest, HostsVShardAndReplicatesThroughRaft) {
     }).get();
 }
 
+TEST_F(ReplicatedVShardHostTest, ReAddingAVShardIsRejected) {
+    seastar::async([] {
+        ScopedShardedEngine eng;
+        eng.start();
+        cluster::EngineLocalStore store(*eng);
+        NoopTransport transport;
+        fs::path jroot = tmpDir();
+        cluster::ReplicatedVShardHost host(store, transport, 1, jroot);
+        host.addVShard(7, {1}).get();
+        bool threw = false;
+        try {
+            host.addVShard(7, {1}).get();  // re-add same vshard -> reject (no double writer)
+        } catch (const std::exception&) {
+            threw = true;
+        }
+        EXPECT_TRUE(threw);
+        host.stop().get();
+        fs::remove_all(jroot);
+    }).get();
+}
+
 TEST_F(ReplicatedVShardHostTest, ProposeBatchSplitsAcrossVShards) {
     seastar::async([] {
         ScopedShardedEngine eng;
@@ -121,6 +142,7 @@ TEST_F(ReplicatedVShardHostTest, ProposeBatchSplitsAcrossVShards) {
         const std::string k2 = buildSeriesKey("b", {{"host", "h2"}}, "value");
         std::set<uint16_t> vshards = {timestar::virtualShard(SeriesId128::fromSeriesKey(k1)),
                                       timestar::virtualShard(SeriesId128::fromSeriesKey(k2))};
+        ASSERT_EQ(vshards.size(), 2u) << "keys must map to distinct VShards to exercise the split";
         for (uint16_t vs : vshards) {
             host.addVShard(vs, {1}, opts).get();
             RaftGroup* g = host.group(vs);

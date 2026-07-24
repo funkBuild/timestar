@@ -47,10 +47,21 @@ public:
 
     // The write-path entry point: split a WriteBatch by VShard and replicate each
     // group through its Raft group. This node must LEAD every VShard in the batch
-    // (the write router groups by leader node before forwarding here). Resolves true
-    // only if every group committed; a false from any group (leadership lost) makes
-    // the caller retry against the current leader. Series whose VShard this node does
-    // not host are a routing error (throws).
+    // (the write router groups by leader node before forwarding here). Series whose
+    // VShard this node does not host are a routing error (throws, atomically -- the
+    // membership check runs before any replication).
+    //
+    // NOT an atomic multi-group commit: groups are proposed sequentially, so a slice
+    // that commits is durably applied and VISIBLE before the whole batch acks. Returns
+    // true only if EVERY group committed; a false/throw from a later group leaves
+    // earlier slices applied and makes the caller retry the WHOLE batch. Re-proposing
+    // an already-applied slice commits at a NEW log index -> a HIGHER revision; for
+    // identical data that is idempotent under LWW (same value). CAVEAT: if a
+    // concurrent client wrote a NEWER value to the same (series, timestamp) into an
+    // already-committed group between the first commit and the retry, the retry
+    // re-applies the OLD batch value at the higher revision and clobbers it -- a
+    // narrow LWW inversion inherent to per-group (not cross-group-atomic) commit.
+    // Cross-group atomicity is out of scope for v1.
     seastar::future<bool> proposeBatch(data::WriteBatch batch);
 
     raft::RaftGroup* group(uint16_t vshard);
@@ -70,8 +81,12 @@ private:
     EngineLocalStore& store_;
     NodeId self_;
     std::filesystem::path journalRoot_;
-    raft::RaftGroupRegistry registry_;
+    // DECLARATION ORDER IS LOAD-BEARING: registry_ holds RaftGroups that BORROW
+    // (RaftPersistence&/RaftStateMachine&) into vshards_' unique_ptrs, so registry_
+    // (and its groups) MUST tear down before vshards_. Members destruct in reverse
+    // declaration order, so vshards_ is declared FIRST and registry_ LAST.
     std::map<uint16_t, VShardState> vshards_;
+    raft::RaftGroupRegistry registry_;
     bool stopped_ = false;
 };
 

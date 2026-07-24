@@ -2,6 +2,7 @@
 
 #include "../../core/placement_table.hpp"  // virtualShard
 #include "../../core/vshard.hpp"
+#include "../../utils/logger.hpp"  // timestar::http_log
 #include "../raft/raft_node.hpp"
 
 #include <seastar/core/coroutine.hh>
@@ -16,9 +17,22 @@ ReplicatedVShardHost::ReplicatedVShardHost(EngineLocalStore& store, raft::RaftTr
                                            std::filesystem::path journalRoot, std::chrono::milliseconds tick)
     : store_(store), self_(self), journalRoot_(std::move(journalRoot)), registry_(transport, tick) {}
 
-ReplicatedVShardHost::~ReplicatedVShardHost() = default;
+ReplicatedVShardHost::~ReplicatedVShardHost() {
+    // stop() (async: drains ticks, closes journal writers) MUST be called before
+    // destruction. Destruction alone tears down the registry (groups) before
+    // vshards_ (per the declaration order), which is UAF-safe, but skips writer
+    // close() -> fd leak. Warn loudly rather than fail silently.
+    if (!stopped_ && !vshards_.empty())
+        timestar::http_log.warn(
+            "ReplicatedVShardHost destroyed without stop(): {} VShard journal(s) not closed (fd leak)",
+            vshards_.size());
+}
 
 seastar::future<> ReplicatedVShardHost::addVShard(uint16_t vshard, std::vector<NodeId> voters, raft::RaftOptions opts) {
+    // A VShard is hosted at most once: re-adding would open a second JournalWriter on
+    // the same dir (two recoverers over one journal) and leak the old writer's fd.
+    if (registry_.group(vshard))
+        throw std::runtime_error("ReplicatedVShardHost::addVShard: VShard already hosted");
     VShardState vs;
     fs::path dir = journalRoot_ / ("vshard_" + std::to_string(vshard));
     fs::create_directories(dir);
