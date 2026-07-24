@@ -83,6 +83,8 @@ enum : uint8_t {
     kCasPolicy = 6,
     kSetControllerTerm = 7,
     kUpsertJob = 8,
+    kMintJoinToken = 9,
+    kAdmitWithToken = 10,
 };
 
 void writeNode(Writer& w, const NodeRecord& r) {
@@ -142,6 +144,13 @@ std::string encodeCommand(const ControlCommand& cmd) {
                 w.u64(c.step);
                 w.u8(c.done ? 1 : 0);
                 w.str(c.payload);
+            } else if constexpr (std::is_same_v<T, MintJoinToken>) {
+                w.u8(kMintJoinToken);
+                w.str(c.token);
+            } else if constexpr (std::is_same_v<T, AdmitWithToken>) {
+                w.u8(kAdmitWithToken);
+                writeNode(w, c.record);
+                w.str(c.token);
             }
         },
         cmd);
@@ -206,6 +215,19 @@ std::optional<ControlCommand> decodeCommand(const std::string& bytes) {
             c.step = static_cast<uint32_t>(r.u64());
             c.done = r.u8() != 0;
             c.payload = r.str();
+            cmd = std::move(c);
+            break;
+        }
+        case kMintJoinToken: {
+            MintJoinToken c;
+            c.token = r.str();
+            cmd = std::move(c);
+            break;
+        }
+        case kAdmitWithToken: {
+            AdmitWithToken c;
+            c.record = readNode(r);
+            c.token = r.str();
             cmd = std::move(c);
             break;
         }

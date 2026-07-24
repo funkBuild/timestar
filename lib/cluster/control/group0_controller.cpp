@@ -29,6 +29,17 @@ seastar::future<> Group0Controller::admitNode(NodeRecord record) {
     co_await proposeCommand(UpsertNode{record});
 }
 
+seastar::future<bool> Group0Controller::mintJoinToken(std::string token) {
+    co_return co_await proposeCommand(MintJoinToken{std::move(token)});
+}
+
+seastar::future<bool> Group0Controller::admitNodeWithToken(NodeRecord record, std::string token) {
+    // The token is validated + consumed atomically at apply time; the command
+    // is a no-op if the token is invalid. Reconcile runs as a separate step.
+    record.state = NodeState::Active;
+    co_return co_await proposeCommand(AdmitWithToken{std::move(record), std::move(token)});
+}
+
 seastar::future<bool> Group0Controller::reconcileMetaVoters() {
     if (!g0_.isLeader())
         co_return false;

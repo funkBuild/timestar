@@ -127,6 +127,20 @@ bool Group0StateMachine::applyCommand(const ControlCommand& cmd) {
                 }
                 if (c.done)
                     j.done = true;
+            } else if constexpr (std::is_same_v<T, MintJoinToken>) {
+                state_.joinTokens.insert(c.token);
+            } else if constexpr (std::is_same_v<T, AdmitWithToken>) {
+                // Admit ONLY on a valid unused token, consumed atomically. An
+                // invalid/replayed token is a no-op (never implicitly initialize).
+                auto it = state_.joinTokens.find(c.token);
+                if (it != state_.joinTokens.end()) {
+                    state_.joinTokens.erase(it);
+                    NodeRecord rec = c.record;
+                    rec.state = NodeState::Active;
+                    state_.nodes[rec.raftId] = std::move(rec);
+                } else {
+                    ok = false;  // rejected: no such token
+                }
             }
         },
         cmd);
@@ -182,6 +196,9 @@ std::string Group0StateMachine::snapshot() const {
         w.u8(j.done ? 1 : 0);
         w.str(j.payload);
     }
+    w.u64(state_.joinTokens.size());
+    for (const auto& t : state_.joinTokens)  // std::set: canonical order
+        w.str(t);
     return std::move(w.out);
 }
 
@@ -226,6 +243,9 @@ bool Group0StateMachine::loadSnapshot(const std::string& data) {
         j.payload = r.str();
         s.jobs[j.id] = std::move(j);
     }
+    uint64_t nTok = r.u64();
+    for (uint64_t i = 0; i < nTok && r.ok; ++i)
+        s.joinTokens.insert(r.str());
     if (!r.ok)
         return false;  // ignore a corrupt snapshot rather than half-apply
     state_ = std::move(s);

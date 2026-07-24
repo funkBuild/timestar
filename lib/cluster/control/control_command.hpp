@@ -62,8 +62,23 @@ struct UpsertJob {
     std::string payload;
 };
 
-using ControlCommand = std::variant<InitCluster, UpsertNode, SetNodeState, SetDesiredPlacement,
-                                     SetMetaVoters, CasPolicy, SetControllerTerm, UpsertJob>;
+// Mint a group-0 join token (the operator/controller issues it out of band).
+struct MintJoinToken {
+    std::string token;
+};
+
+// Admit a node ONLY if it presents a valid unused join token: atomically
+// consumes the token and records the node Active. If the token is absent
+// (invalid/replayed), the command is a no-op -- the node is never implicitly
+// initialized into the cluster.
+struct AdmitWithToken {
+    NodeRecord record;
+    std::string token;
+};
+
+using ControlCommand =
+    std::variant<InitCluster, UpsertNode, SetNodeState, SetDesiredPlacement, SetMetaVoters, CasPolicy,
+                 SetControllerTerm, UpsertJob, MintJoinToken, AdmitWithToken>;
 
 // Wire serialization for a command (the Raft entry payload). Length-prefixed,
 // self-delimiting; decode returns nullopt on any malformed/truncated input.

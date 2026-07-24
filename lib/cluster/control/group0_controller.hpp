@@ -33,6 +33,12 @@ public:
     // voter set (which may promote it to a group-0 voter).
     seastar::future<> admitNode(NodeRecord record);
 
+    // Mint a group-0 join token (leader only) that a joining node must present.
+    seastar::future<bool> mintJoinToken(std::string token);
+    // Admit a node ONLY if it presents a valid unused token; the token is
+    // consumed atomically. Reconcile is a separate step (as with admitNode).
+    seastar::future<bool> admitNodeWithToken(NodeRecord record, std::string token);
+
     // Recompute the desired meta voters and, if they differ from the current
     // group-0 configuration, drive a joint-consensus membership change and mirror
     // the new set into the state machine. Returns true iff a change was proposed.

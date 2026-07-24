@@ -32,6 +32,8 @@ TEST(ControlCommandCodecTest, RoundTripAllCommands) {
         CasPolicy{"schema/m/f", 0, "float"},
         SetControllerTerm{9, 3},
         UpsertJob{"job-1", 5, true, "move v42"},
+        MintJoinToken{"tok-abc"},
+        AdmitWithToken{node(8, "u8", "rack-h"), "tok-abc"},
     };
     for (const auto& c : cmds) {
         auto back = decodeCommand(encodeCommand(c));
@@ -128,6 +130,23 @@ TEST(Group0StateMachineTest, JobsAreIdempotentAndMonotonic) {
     EXPECT_TRUE(sm.state().jobs.at("j1").done);
 }
 
+TEST(Group0StateMachineTest, JoinTokenGatesAdmission) {
+    Group0StateMachine sm;
+    NodeRecord n = node(5, "u5", "rack-e", NodeState::Joining);
+    // Without a minted token, admission is rejected (never implicit init).
+    EXPECT_FALSE(sm.applyCommand(AdmitWithToken{n, "tok-1"}));
+    EXPECT_EQ(sm.state().nodes.count(5), 0u);
+    // Mint the token, then admit -> node recorded Active, token consumed.
+    sm.applyCommand(MintJoinToken{"tok-1"});
+    EXPECT_EQ(sm.state().joinTokens.count("tok-1"), 1u);
+    EXPECT_TRUE(sm.applyCommand(AdmitWithToken{n, "tok-1"}));
+    EXPECT_EQ(sm.state().nodes.at(5).state, NodeState::Active);
+    EXPECT_EQ(sm.state().joinTokens.count("tok-1"), 0u);  // single-use
+    // Replaying the same token is rejected (already consumed).
+    EXPECT_FALSE(sm.applyCommand(AdmitWithToken{node(6, "u6", "rack-f"), "tok-1"}));
+    EXPECT_EQ(sm.state().nodes.count(6), 0u);
+}
+
 TEST(Group0StateMachineTest, FailedCasDoesNotCreatePhantomCell) {
     Group0StateMachine sm;
     // CAS with a non-zero expected version on an absent key must fail AND leave
@@ -166,6 +185,7 @@ TEST(Group0StateMachineTest, SnapshotRoundTrip) {
     sm.applyCommand(CasPolicy{"schema/m/f", 0, "float"});
     sm.applyCommand(SetControllerTerm{4, 1});
     sm.applyCommand(UpsertJob{"j1", 2, true, "done"});
+    sm.applyCommand(MintJoinToken{"pending-token"});
 
     const std::string blob = sm.snapshot();
     Group0StateMachine restored;

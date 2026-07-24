@@ -215,10 +215,52 @@ seastar::future<> testReadBarrierReconcilesControlMap() {
     EXPECT_TRUE(rejected);
 }
 
+seastar::future<> testJoinTokenGatesAdmission() {
+    Router router;
+    std::vector<std::unique_ptr<RouterTransport>> transports;
+    std::map<NodeId, NodeBox> nodes;
+    auto makeNode = [&](NodeId id) {
+        transports.push_back(std::make_unique<RouterTransport>(router));
+        NodeBox box;
+        box.persistence = std::make_unique<NoopPersistence>();
+        box.sm = std::make_unique<Group0StateMachine>();
+        RaftNode rn(id, {1}, RaftLog{}, HardState{}, optsFor(id));
+        box.group = std::make_unique<RaftGroup>(0, std::move(rn), *box.persistence, *transports.back(),
+                                                *box.sm);
+        router.setGroup(id, box.group.get());
+        nodes[id] = std::move(box);
+    };
+    makeNode(1);
+
+    Group0Controller controller(*nodes[1].group, *nodes[1].sm, 3);
+    co_await nodes[1].group->campaign();
+    co_await router.pump();
+    co_await controller.initCluster("c1", rec(1, "rack-a"));
+    co_await router.pump();
+
+    // A node presenting an UNMINTED token is rejected.
+    co_await controller.admitNodeWithToken(rec(9, "rack-x"), "bad-token");
+    co_await router.pump();
+    EXPECT_EQ(nodes[1].sm->state().nodes.count(9), 0u);
+
+    // Mint a token, then the node joins with it -> admitted, token consumed.
+    co_await controller.mintJoinToken("join-42");
+    co_await router.pump();
+    co_await controller.admitNodeWithToken(rec(2, "rack-b"), "join-42");
+    co_await router.pump();
+    EXPECT_EQ(nodes[1].sm->state().nodes.count(2), 1u);
+    EXPECT_EQ(nodes[1].sm->state().nodes.at(2).state, NodeState::Active);
+    EXPECT_EQ(nodes[1].sm->state().joinTokens.count("join-42"), 0u);
+}
+
 }  // namespace
 
 TEST(Group0ControllerTest, ClusterInitGrowsMetaVotersAcrossFailureDomains) {
     testClusterInitGrowsMetaVotersAcrossDomains().get();
+}
+
+TEST(Group0ControllerTest, JoinTokenGatesAdmission) {
+    testJoinTokenGatesAdmission().get();
 }
 
 TEST(Group0ControllerTest, ReadBarrierReconcilesControlMap) {
