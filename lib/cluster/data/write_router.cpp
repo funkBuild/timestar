@@ -19,7 +19,7 @@ seastar::future<> WriteRouter::write(std::vector<DataPoint> points) {
     }
 
     // Dispatch: the local group directly, remote groups via one RPC each. Start
-    // all remote forwards, then await them (fan-out concurrency).
+    // all groups concurrently.
     const NodeId self = dir_.self();
     std::vector<seastar::future<>> pending;
     for (auto& [owner, group] : byOwner) {
@@ -28,8 +28,23 @@ seastar::future<> WriteRouter::write(std::vector<DataPoint> points) {
         else
             pending.push_back(client_.forwardWrites(owner, std::move(group)));
     }
-    for (auto& f : pending)
-        co_await std::move(f);
+    // Await ALL dispatches (never abandon an in-flight forward), then propagate
+    // the first failure. NOTE: on a mid-fan-out failure, groups that already
+    // succeeded stay applied -- there is no cross-node atomic commit here. That is
+    // safe under the global last-write-wins invariant (an identical retried point
+    // overwrites), but a caller retrying a batch with DIFFERENT values for the
+    // same (series, timestamp) must be aware the earlier groups were applied.
+    std::exception_ptr firstErr;
+    for (auto& f : pending) {
+        try {
+            co_await std::move(f);
+        } catch (...) {
+            if (!firstErr)
+                firstErr = std::current_exception();
+        }
+    }
+    if (firstErr)
+        std::rethrow_exception(firstErr);
 }
 
 }  // namespace timestar::data

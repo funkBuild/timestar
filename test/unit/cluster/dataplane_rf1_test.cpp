@@ -169,10 +169,48 @@ seastar::future<> testUnassignedVShardRejectsWrite() {
     EXPECT_TRUE(store.points.empty());  // no partial write
 }
 
+seastar::future<> testQueryIncompleteOnUnassignedVShard() {
+    // A partial control map (only VShard 0 assigned) -> an unfiltered query must
+    // fail with QueryIncomplete rather than return a silent empty success.
+    ControlMap map;
+    map.epoch = 1;
+    map.placement[0] = {1};
+    MemStore store;
+    MemClient client;
+    client.stores[1] = &store;
+    VShardDirectory dir(1, map);
+    QueryCoordinator coord(dir, store, client);
+
+    bool incomplete = false;
+    try {
+        co_await coord.query(QuerySpec{0, 100000, AggMethod::Raw, {}});
+    } catch (const QueryIncomplete&) {
+        incomplete = true;
+    }
+    EXPECT_TRUE(incomplete);
+
+    // A query filtered to a series whose VShard IS assigned succeeds.
+    SeriesId128 s0;
+    for (int i = 0;; ++i) {  // find a series that hashes to VShard 0
+        SeriesId128 cand = SeriesId128::fromSeriesKey("m,h=" + std::to_string(i) + " v");
+        if (timestar::virtualShard(cand) == 0) {
+            s0 = cand;
+            break;
+        }
+    }
+    co_await store.applyWrites({{s0, 5, 1.0}});
+    QueryPartial got = co_await coord.query(QuerySpec{0, 100000, AggMethod::Raw, {s0}});
+    EXPECT_EQ(got.raw.size(), 1u);
+}
+
 }  // namespace
 
 TEST(DataPlaneRf1Test, MultiNodeMatchesSingleNode) {
     testRf1MatchesSingleNode().get();
+}
+
+TEST(DataPlaneRf1Test, QueryIncompleteOnUnassignedVShard) {
+    testQueryIncompleteOnUnassignedVShard().get();
 }
 
 TEST(DataPlaneRf1Test, UnassignedVShardRejectsWrite) {

@@ -26,6 +26,10 @@ public:
 
     NodeId self() const { return self_; }
     uint64_t epoch() const { return map_.epoch; }
+    // The live control map. A caller MUST NOT retain this reference (or an
+    // iterator into it) across a co_await: updateMap() move-reassigns map_, so a
+    // reference held across a suspension can dangle. The router/coordinator
+    // snapshot everything they need before their first await.
     const ControlMap& map() const { return map_; }
 
     // Owning (RF=1: sole-replica, == leader) node of a VShard; kNoNode if unassigned.

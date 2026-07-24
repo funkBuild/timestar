@@ -7,9 +7,19 @@
 #include <cstdint>
 #include <map>
 #include <seastar/core/future.hh>
+#include <stdexcept>
 #include <vector>
 
 namespace timestar::data {
+
+// A query could not be answered completely -- some VShard that could hold
+// matching data is unassigned or unreachable. The plan forbids serving this as an
+// empty SUCCESS ("could-not-read" must be distinguishable from "genuinely empty"),
+// so the coordinator throws this instead, mapped to QUERY_INCOMPLETE at the edge.
+class QueryIncomplete : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
 
 using ::SeriesId128;  // SeriesId128 lives in the global namespace
 using timestar::raft::NodeId;
