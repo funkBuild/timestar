@@ -991,9 +991,11 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpQueryHandler::handleQ
             }
         }
 
-        // Execute query
+        // Execute query. In partitioned cluster mode the hook fans out to VShard
+        // owners and merges; otherwise the local executeQuery runs.
         auto startTime = std::chrono::high_resolution_clock::now();
-        QueryResponse response = co_await executeQuery(queryRequest);
+        QueryResponse response =
+            clusterQueryHook ? co_await clusterQueryHook(queryRequest) : co_await executeQuery(queryRequest);
         auto endTime = std::chrono::high_resolution_clock::now();
 
         // Calculate execution time

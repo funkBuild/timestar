@@ -9,6 +9,7 @@
 #include <glaze/json.hpp>
 
 #include <chrono>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <seastar/core/future.hh>
@@ -102,6 +103,13 @@ public:
     // future, so on a backfill timeout that local dies mid-flight.  By-value
     // puts the copy in the parameter, before the coroutine body can suspend.
     seastar::future<QueryResponse> executeQuery(QueryRequest request);
+
+    // Partitioned-cluster hook (integration plan M2). When set (by the server in
+    // cluster.partitioned mode), /query routes through this instead of the local
+    // executeQuery -- the cluster coordinator fans out to VShard owners and merges
+    // to the single-node answer. The server's hook hops to the shard that owns the
+    // data plane. Unset (default) => single-node / M1 path, unchanged.
+    static inline std::function<seastar::future<QueryResponse>(QueryRequest)> clusterQueryHook{};
 
     // This node's UNFINALIZED contribution to a (possibly cluster-wide) query: the
     // per-core partial aggregations plus non-numeric series, produced by exactly the

@@ -454,6 +454,12 @@ int main(int argc, char** argv) {
                 if (cc.enabled && cc.partitioned) {
                     g_clusterDataPlane.start(cc, g_engine).get();
                     g_clusterPartitioned = true;
+                    // Route /query through the data plane (fan out to owners + merge).
+                    // The data plane lives on shard 0; hop there from the request shard.
+                    timestar::http::HttpQueryHandler::clusterQueryHook = [](timestar::QueryRequest q) {
+                        return seastar::smp::submit_to(
+                            0u, [q = std::move(q)]() mutable { return g_clusterDataPlane.query(std::move(q)); });
+                    };
                     timestar::http_log.info("VShard-partitioned data plane started (node {})", cc.node_id);
                 }
             }
