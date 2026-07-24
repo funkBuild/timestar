@@ -1,7 +1,9 @@
 #include "raft_group.hpp"
 
+#include <algorithm>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/semaphore.hh>
+#include <stdexcept>
 
 namespace timestar::raft {
 
@@ -34,16 +36,70 @@ seastar::future<> RaftGroup::drainReady() {
             co_await transport_.send(Envelope{groupId_, m});
 
         // 3. Apply committed output to the state machine (snapshot install first).
-        if (rd.snapshot)
+        if (rd.snapshot) {
             co_await sm_.applySnapshot(*rd.snapshot);
+            appliedIndex_ = std::max<uint64_t>(appliedIndex_, rd.snapshot->index);
+        }
         for (auto& e : rd.committed) {
             if (e.type == EntryType::Normal && !e.data.empty())
                 co_await sm_.apply(e);
+            appliedIndex_ = std::max<uint64_t>(appliedIndex_, e.index);
         }
+
+        // Record newly-confirmed read barriers, then release any whose ReadIndex
+        // we have now applied through.
+        for (const auto& rs : rd.readStates)
+            confirmedReads_[rs.context] = rs.readIndex;
+        releaseReadBarriers();
 
         // 4. Acknowledge: advance persistence/apply watermarks and drain messages.
         node_.advance(rd);
     }
+}
+
+void RaftGroup::releaseReadBarriers() {
+    if (!node_.isLeader()) {
+        // Leadership lost: no barrier can be confirmed here. Fail every waiter so
+        // the caller redirects to the new leader (never hang).
+        for (auto& [ctx, p] : readWaiters_)
+            p.set_exception(std::make_exception_ptr(std::runtime_error("readBarrier: leadership lost")));
+        readWaiters_.clear();
+        confirmedReads_.clear();
+        return;
+    }
+    for (auto it = confirmedReads_.begin(); it != confirmedReads_.end();) {
+        if (appliedIndex_ >= it->second) {
+            if (auto w = readWaiters_.find(it->first); w != readWaiters_.end()) {
+                w->second.set_value(it->second);
+                readWaiters_.erase(w);
+            }
+            it = confirmedReads_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+seastar::future<LogIndex> RaftGroup::readBarrier() {
+    const uint64_t ctx = nextReadCtx_++;
+    seastar::promise<LogIndex> promise;
+    auto fut = promise.get_future();
+    readWaiters_.emplace(ctx, std::move(promise));
+
+    co_await seastar::with_semaphore(lock_, 1, [this, ctx]() -> seastar::future<> {
+        if (!node_.isLeader()) {
+            // Not the leader: fail the barrier so the caller redirects.
+            if (auto w = readWaiters_.find(ctx); w != readWaiters_.end()) {
+                w->second.set_exception(
+                    std::make_exception_ptr(std::runtime_error("readBarrier: not leader")));
+                readWaiters_.erase(w);
+            }
+            co_return;
+        }
+        node_.requestReadIndex(ctx);
+        co_await drainReady();  // heartbeats out; confirmation arrives on later steps
+    });
+    co_return co_await std::move(fut);
 }
 
 seastar::future<> RaftGroup::step(Message m) {

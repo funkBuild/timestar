@@ -4,6 +4,7 @@
 #include "raft_node.hpp"
 
 #include <cstdint>
+#include <map>
 #include <seastar/core/future.hh>
 #include <seastar/core/semaphore.hh>
 #include <string>
@@ -32,6 +33,12 @@ public:
     // opaque payload (the caller produced it from its state machine).
     seastar::future<> compact(LogIndex upto, std::string snapshotData);
 
+    // Linearizable read barrier: resolves with a ReadIndex once a quorum has
+    // confirmed current-term leadership AND this node has applied through that
+    // index. The caller may then read committed state (e.g. the group-0 map)
+    // linearizably. Fails if this node is not the leader (redirect to the leader).
+    seastar::future<LogIndex> readBarrier();
+
     // Observers (safe to read between async operations on the same core).
     uint16_t groupId() const { return groupId_; }
     Role role() const { return node_.role(); }
@@ -46,12 +53,21 @@ private:
     // no step()/tick()/propose() interleaves a ready()..advance() pair.
     seastar::future<> drainReady();
 
+    // Resolve any read barriers whose ReadIndex this node has now applied through.
+    void releaseReadBarriers();
+
     uint16_t groupId_;
     RaftNode node_;
     RaftPersistence& persistence_;
     RaftTransport& transport_;
     RaftStateMachine& sm_;
     seastar::semaphore lock_{1};  // serializes all node mutation on this core
+
+    // Read-barrier tracking.
+    uint64_t appliedIndex_ = 0;              // highest entry index applied to the SM
+    uint64_t nextReadCtx_ = 1;
+    std::map<uint64_t, LogIndex> confirmedReads_;              // ctx -> ReadIndex (awaiting apply)
+    std::map<uint64_t, seastar::promise<LogIndex>> readWaiters_;  // ctx -> caller promise
 };
 
 }  // namespace timestar::raft

@@ -163,8 +163,64 @@ seastar::future<> testClusterInitGrowsMetaVotersAcrossDomains() {
     EXPECT_GT(nodes[1].sm->state().controllerTerm, 0u);
 }
 
+seastar::future<> testReadBarrierReconcilesControlMap() {
+    Router router;
+    std::vector<std::unique_ptr<RouterTransport>> transports;
+    std::map<NodeId, NodeBox> nodes;
+    auto makeNode = [&](NodeId id, std::vector<NodeId> knownVoters) {
+        transports.push_back(std::make_unique<RouterTransport>(router));
+        NodeBox box;
+        box.persistence = std::make_unique<NoopPersistence>();
+        box.sm = std::make_unique<Group0StateMachine>();
+        RaftNode rn(id, knownVoters, RaftLog{}, HardState{}, optsFor(id));
+        box.group = std::make_unique<RaftGroup>(0, std::move(rn), *box.persistence, *transports.back(),
+                                                *box.sm);
+        router.setGroup(id, box.group.get());
+        nodes[id] = std::move(box);
+    };
+    makeNode(1, {1, 2, 3});
+    makeNode(2, {1, 2, 3});
+    makeNode(3, {1, 2, 3});
+
+    Group0Controller controller(*nodes[1].group, *nodes[1].sm, 3);
+    co_await nodes[1].group->campaign();
+    co_await router.pump();
+    EXPECT_TRUE(nodes[1].group->isLeader());
+    co_await controller.initCluster("c1", rec(1, "rack-a"));
+    co_await router.pump();
+
+    // A committed topology change bumps the map epoch.
+    co_await controller.proposeCommand(SetDesiredPlacement{5, {1, 2, 3}});
+    co_await router.pump();
+    const uint64_t epoch = nodes[1].sm->state().mapEpoch;
+    EXPECT_GE(epoch, 1u);
+
+    // Reconcile via a ReadIndex barrier: start it, drive the confirmation round,
+    // then await it. The barrier index is at least the committed placement, and
+    // the state read behind it reflects the new epoch (linearizable).
+    auto rb = nodes[1].group->readBarrier();  // enqueues the heartbeat round
+    co_await router.pump();                    // deliver heartbeats + replies -> confirm
+    timestar::raft::LogIndex readIndex = co_await std::move(rb);
+    EXPECT_GT(readIndex, 0u);
+    EXPECT_EQ(nodes[1].sm->state().mapEpoch, epoch);
+    EXPECT_EQ(nodes[1].sm->state().desiredPlacement.at(5), (std::vector<NodeId>{1, 2, 3}));
+
+    // A follower's read barrier is rejected (redirect to the leader).
+    bool rejected = false;
+    try {
+        co_await nodes[2].group->readBarrier();
+    } catch (const std::runtime_error&) {
+        rejected = true;
+    }
+    EXPECT_TRUE(rejected);
+}
+
 }  // namespace
 
 TEST(Group0ControllerTest, ClusterInitGrowsMetaVotersAcrossFailureDomains) {
     testClusterInitGrowsMetaVotersAcrossDomains().get();
+}
+
+TEST(Group0ControllerTest, ReadBarrierReconcilesControlMap) {
+    testReadBarrierReconcilesControlMap().get();
 }
