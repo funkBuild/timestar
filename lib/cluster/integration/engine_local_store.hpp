@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../../core/engine.hpp"
+#include "../data/node_query.hpp"
 #include "../data/write_record.hpp"
 
 #include <cstdint>
@@ -31,6 +32,14 @@ public:
 
     seastar::future<bool> applyDelete(std::string seriesKey, uint64_t start, uint64_t end);
     seastar::future<> applyRetention(std::string measurement, uint64_t cutoff);
+
+    // Run the node's local query (the real HTTP query pipeline over this node's
+    // engines) and return the per-series results as a NodeQueryPartial. In a
+    // partitioned cluster the node only stores its owned VShards' series, so a
+    // local query naturally returns only this node's contribution; the coordinator
+    // merges partials across nodes. A failed local query surfaces as an
+    // incompleteReason (fail-closed), never a silent empty success.
+    seastar::future<data::NodeQueryPartial> queryLocal(data::NodeQueryRequest req);
 
     // Routing helper (public for tests): the core that owns `id`.
     unsigned coreFor(const SeriesId128& id) const;

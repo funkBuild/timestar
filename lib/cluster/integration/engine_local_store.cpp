@@ -149,6 +149,19 @@ seastar::future<bool> EngineLocalStore::applyDelete(std::string seriesKey, uint6
         });
 }
 
+seastar::future<data::NodeQueryPartial> EngineLocalStore::queryLocal(data::NodeQueryRequest req) {
+    http::HttpQueryHandler handler(&engines_);
+    QueryResponse resp = co_await handler.executeQuery(std::move(req.request));
+    data::NodeQueryPartial partial;
+    if (!resp.success) {
+        partial.incompleteReasons.push_back(resp.errorMessage.empty() ? std::string("query failed")
+                                                                       : resp.errorMessage);
+        co_return partial;
+    }
+    partial.series = std::move(resp.series);
+    co_return partial;
+}
+
 seastar::future<> EngineLocalStore::applyRetention(std::string, uint64_t) {
     // Retention-cutoff application is wired in a later milestone (M1.x/M6); the
     // command type carries it, but the M2 write path does not use it yet.

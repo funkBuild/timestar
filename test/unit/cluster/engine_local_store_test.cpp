@@ -128,6 +128,24 @@ TEST_F(EngineLocalStoreTest, ApplyWritesAllTypesVisibleViaRealQuery) {
             EXPECT_TRUE((*v)[0]);
         }
 
+        // queryLocal runs the real query pipeline and returns the node's series as
+        // a NodeQueryPartial (the coordinator merges these across nodes in M2).
+        {
+            data::NodeQueryRequest nq;
+            nq.request.aggregation = AggregationMethod::LATEST;
+            nq.request.measurement = "log";  // the string series
+            nq.request.fields = {"msg"};
+            nq.request.startTime = BASE - 1'000'000'000ULL;
+            nq.request.endTime = BASE + 1'000'000'000ULL;
+            data::NodeQueryPartial partial = store.queryLocal(std::move(nq)).get();
+            EXPECT_TRUE(partial.incompleteReasons.empty());
+            ASSERT_EQ(partial.series.size(), 1u);
+            auto& f = partial.series[0].fields.at("msg");
+            auto* v = std::get_if<std::vector<std::string>>(&f.second);
+            ASSERT_NE(v, nullptr);
+            EXPECT_EQ((*v)[0], "a lossless UTF-8 message");
+        }
+
         // applyDelete removes the series (routed to the same owning core).
         bool deleted = store.applyDelete(buildSeriesKey("temp", {{"host", "h1"}}, "value"), BASE - 1, BASE + 1).get();
         EXPECT_TRUE(deleted);
