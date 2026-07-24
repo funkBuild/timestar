@@ -1,8 +1,10 @@
 #pragma once
 
+#include "../features/feature_gate.hpp"  // VersionRange
 #include "data_plane.hpp"
 #include "node_store.hpp"
 
+#include <cstdint>
 #include <memory>
 #include <seastar/core/future.hh>
 #include <seastar/net/socket_defs.hh>
@@ -67,6 +69,16 @@ public:
     // exception -- the caller treats it as a partition/redirect, never a stale value.
     seastar::future<raft::LogIndex> leaderReadIndex(NodeId to, uint16_t vshard);
     seastar::future<raft::LogIndex> leaderCommitIndex(NodeId to, uint16_t vshard);
+
+    // This node's supported wire-version range (rolling-upgrade / compatibility, M6/X).
+    // Default {1,1}. Set before serving so peers negotiate against the real range.
+    void setLocalVersion(features::VersionRange range);
+
+    // Negotiate the wire version to speak with peer `to`: the highest version BOTH
+    // support (features::negotiate over the exchanged ranges). THROWS if the ranges do
+    // not overlap -- an incompatible peer is refused rather than silently mis-framed,
+    // so a node never talks a format the other cannot read (decision 8).
+    seastar::future<uint32_t> negotiateVersion(NodeId to);
 
 private:
     struct Impl;

@@ -326,6 +326,51 @@ TEST_F(DataPlaneRpcEnrichedTest, LeaderReachVerbsForwardToSinkOverSocket) {
     }).get();
 }
 
+// M6/X: wire-version negotiation over the socket. Compatible ranges agree on the
+// highest common version; a non-overlapping peer is REFUSED (thrown), never
+// silently mis-framed.
+TEST_F(DataPlaneRpcEnrichedTest, VersionNegotiationAgreesOrRefuses) {
+    seastar::async([] {
+        const uint16_t port = 39319;
+        const data::NodeId self = 1;
+        ThrowingNodeStore sink;
+        data::DataPlaneRpc rpc;
+        rpc.setLocalVersion(features::VersionRange{1, 3});  // this node speaks 1..3
+        rpc.start(loopback(port), sink).get();
+        rpc.addPeer(self, loopback(port));
+
+        // Self-negotiation (both ranges 1..3): agree on the highest common = 3.
+        EXPECT_EQ(rpc.negotiateVersion(self).get(), 3u);
+
+        rpc.stop().get();
+    }).get();
+}
+
+TEST_F(DataPlaneRpcEnrichedTest, VersionNegotiationRefusesIncompatiblePeer) {
+    seastar::async([] {
+        const uint16_t serverPort = 39320, clientPort = 39321;
+        const data::NodeId server = 2;
+        ThrowingNodeStore s1, s2;
+        data::DataPlaneRpc srv, cli;
+        srv.setLocalVersion(features::VersionRange{5, 6});  // server speaks 5..6
+        cli.setLocalVersion(features::VersionRange{1, 2});  // client speaks 1..2 (no overlap)
+        srv.start(loopback(serverPort), s1).get();
+        cli.start(loopback(clientPort), s2).get();
+        cli.addPeer(server, loopback(serverPort));
+
+        bool threw = false;
+        try {
+            cli.negotiateVersion(server).get();
+        } catch (const std::exception&) {
+            threw = true;
+        }
+        EXPECT_TRUE(threw) << "incompatible wire versions must be refused, not silently downgraded";
+
+        cli.stop().get();
+        srv.stop().get();
+    }).get();
+}
+
 // A node with NO read-index sink set fails leader-reach cleanly (fail-closed).
 TEST_F(DataPlaneRpcEnrichedTest, LeaderReachWithoutSinkFailsClosed) {
     seastar::async([] {

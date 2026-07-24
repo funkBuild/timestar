@@ -46,6 +46,22 @@ constexpr uint64_t kQueryMetadata = 5;      // sstring -> sstring (MetadataReque
 constexpr uint64_t kProposeWrite = 6;       // sstring -> sstring (WriteBatch, waited: "1"/"0" committed)
 constexpr uint64_t kLeaderReadIndex = 7;    // sstring(u16 vshard) -> sstring(u64 readIndex); throws if not leader
 constexpr uint64_t kLeaderCommitIndex = 8;  // sstring(u16 vshard) -> sstring(u64 commitIndex); throws if not leader
+constexpr uint64_t kNegotiateVersion = 9;   // sstring(u32 min,u32 max) -> sstring(u32 agreed); throws if incompatible
+
+seastar::sstring encU32(uint32_t v) {
+    char b[4];
+    for (int i = 0; i < 4; ++i)
+        b[i] = static_cast<char>((v >> (8 * i)) & 0xff);
+    return seastar::sstring(b, 4);
+}
+std::optional<uint32_t> decU32At(const seastar::sstring& s, size_t off) {
+    if (s.size() < off + 4)
+        return std::nullopt;
+    uint32_t v = 0;
+    for (int i = 0; i < 4; ++i)
+        v |= static_cast<uint32_t>(static_cast<uint8_t>(s[off + i])) << (8 * i);
+    return v;
+}
 
 seastar::sstring encU16(uint16_t v) {
     char b[2] = {static_cast<char>(v & 0xff), static_cast<char>((v >> 8) & 0xff)};
@@ -83,6 +99,7 @@ struct DataPlaneRpc::Impl {
     NodeStore* nodeSink = nullptr;      // enriched WriteBatch path (F.4)
     ProposeSink* proposeSink = nullptr;      // RF=3 Raft propose target (M3)
     ReadIndexSink* readIndexSink = nullptr;  // replica-read leader-reach target (M4)
+    features::VersionRange localVersion{};   // wire-version range this node supports (M6/X)
     bool stopping = false;
     // Client stubs are created ONCE (a stub allocated per concurrent call can
     // corrupt reply routing / message-id bookkeeping). Reused for every call.
@@ -94,6 +111,7 @@ struct DataPlaneRpc::Impl {
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> proposeWriteStub;
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> leaderReadIndexStub;
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> leaderCommitIndexStub;
+    std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> negotiateVersionStub;
 
     seastar::rpc::protocol<DpSerializer>::client* clientFor(NodeId to) {
         if (auto it = clients.find(to); it != clients.end())
@@ -119,6 +137,7 @@ struct DataPlaneRpc::Impl {
         proposeWriteStub = proto.make_client<seastar::sstring(seastar::sstring)>(kProposeWrite);
         leaderReadIndexStub = proto.make_client<seastar::sstring(seastar::sstring)>(kLeaderReadIndex);
         leaderCommitIndexStub = proto.make_client<seastar::sstring(seastar::sstring)>(kLeaderCommitIndex);
+        negotiateVersionStub = proto.make_client<seastar::sstring(seastar::sstring)>(kNegotiateVersion);
     }
 
     // Pin the listening socket to THIS shard. seastar's default listen policy
@@ -250,6 +269,20 @@ seastar::future<> DataPlaneRpc::start(seastar::socket_address local, NodeStore& 
         return seastar::futurize_invoke([this, vs = *vs] { return impl_->readIndexSink->leaderCommitIndex(vs); })
             .then([](raft::LogIndex idx) { return encU64(idx); });
     });
+    impl_->proto.register_handler(kNegotiateVersion, [this](seastar::sstring data) {
+        auto peerMin = decU32At(data, 0);
+        auto peerMax = decU32At(data, 4);
+        if (!peerMin || !peerMax || *peerMin > *peerMax)
+            return seastar::make_exception_future<seastar::sstring>(
+                std::runtime_error("dataplane: malformed negotiateVersion request"));
+        auto agreed = features::negotiate(impl_->localVersion, features::VersionRange{*peerMin, *peerMax});
+        if (!agreed)
+            // No overlapping version: refuse the peer rather than mis-frame a format it
+            // cannot read (rolling-upgrade safety, decision 8).
+            return seastar::make_exception_future<seastar::sstring>(std::runtime_error(
+                "dataplane: incompatible wire versions (no overlap with peer)"));
+        return seastar::make_ready_future<seastar::sstring>(encU32(*agreed));
+    });
     impl_->makeStubs();
     impl_->listenServer(local);
     return seastar::make_ready_future<>();
@@ -261,6 +294,26 @@ void DataPlaneRpc::setProposeSink(ProposeSink& sink) {
 
 void DataPlaneRpc::setReadIndexSink(ReadIndexSink& sink) {
     impl_->readIndexSink = &sink;
+}
+
+void DataPlaneRpc::setLocalVersion(features::VersionRange range) {
+    impl_->localVersion = range;
+}
+
+seastar::future<uint32_t> DataPlaneRpc::negotiateVersion(NodeId to) {
+    if (impl_->stopping)
+        throw std::runtime_error("dataplane: shutting down");
+    auto* conn = impl_->clientFor(to);
+    if (!conn)
+        throw std::runtime_error("dataplane: unknown peer");
+    seastar::sstring req = encU32(impl_->localVersion.min) + encU32(impl_->localVersion.max);
+    // A non-overlapping peer throws server-side; that exception propagates here so the
+    // caller refuses the peer (never falls back to a silently-mismatched version).
+    seastar::sstring reply = co_await impl_->negotiateVersionStub(*conn, req);
+    auto agreed = decU32At(reply, 0);
+    if (!agreed)
+        throw std::runtime_error("dataplane: malformed negotiateVersion reply");
+    co_return *agreed;
 }
 
 seastar::future<raft::LogIndex> DataPlaneRpc::leaderReadIndex(NodeId to, uint16_t vshard) {
