@@ -62,6 +62,7 @@ struct Group0State {
     std::map<std::string, PolicyCell> policies;          // schema/retention CAS cells
     std::map<std::string, Job> jobs;                      // jobs/<uuid>
     std::set<std::string> joinTokens;                     // valid unused group-0-minted join tokens
+    uint32_t activeFormatVersion = 1;                     // active wire/storage format (rolling upgrade)
 
     friend bool operator==(const Group0State&, const Group0State&) = default;
 };

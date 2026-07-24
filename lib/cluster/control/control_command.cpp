@@ -85,6 +85,7 @@ enum : uint8_t {
     kUpsertJob = 8,
     kMintJoinToken = 9,
     kAdmitWithToken = 10,
+    kSetActiveVersion = 11,
 };
 
 void writeNode(Writer& w, const NodeRecord& r) {
@@ -151,6 +152,9 @@ std::string encodeCommand(const ControlCommand& cmd) {
                 w.u8(kAdmitWithToken);
                 writeNode(w, c.record);
                 w.str(c.token);
+            } else if constexpr (std::is_same_v<T, SetActiveVersion>) {
+                w.u8(kSetActiveVersion);
+                w.u64(c.version);
             }
         },
         cmd);
@@ -228,6 +232,12 @@ std::optional<ControlCommand> decodeCommand(const std::string& bytes) {
             AdmitWithToken c;
             c.record = readNode(r);
             c.token = r.str();
+            cmd = std::move(c);
+            break;
+        }
+        case kSetActiveVersion: {
+            SetActiveVersion c;
+            c.version = static_cast<uint32_t>(r.u64());
             cmd = std::move(c);
             break;
         }

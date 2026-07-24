@@ -253,7 +253,53 @@ seastar::future<> testJoinTokenGatesAdmission() {
     EXPECT_EQ(nodes[1].sm->state().joinTokens.count("join-42"), 0u);
 }
 
+// M6 rolling-upgrade format activation: activateFormat commits a new active version
+// ONLY if every voter can read it, monotonically; an unsupported version is refused.
+seastar::future<> testFormatActivationGatedByVoterSupport() {
+    Router router;
+    std::vector<std::unique_ptr<RouterTransport>> transports;
+    std::map<NodeId, NodeBox> nodes;
+    auto makeNode = [&](NodeId id) {
+        transports.push_back(std::make_unique<RouterTransport>(router));
+        NodeBox box;
+        box.persistence = std::make_unique<NoopPersistence>();
+        box.sm = std::make_unique<Group0StateMachine>();
+        RaftNode rn(id, {1}, RaftLog{}, HardState{}, optsFor(id));
+        box.group = std::make_unique<RaftGroup>(0, std::move(rn), *box.persistence, *transports.back(), *box.sm);
+        router.setGroup(id, box.group.get());
+        nodes[id] = std::move(box);
+    };
+    makeNode(1);
+
+    Group0Controller controller(*nodes[1].group, *nodes[1].sm, 3);
+    co_await nodes[1].group->campaign();
+    co_await router.pump();
+    co_await controller.initCluster("c1", rec(1, "rack-a"));
+    co_await router.pump();
+    EXPECT_EQ(nodes[1].sm->state().activeFormatVersion, 1u) << "starts at format 1";
+
+    // Every voter supports 1..3 -> activate 3 succeeds.
+    EXPECT_TRUE(co_await controller.activateFormat(3, {timestar::features::VersionRange{1, 3}}));
+    co_await router.pump();
+    EXPECT_EQ(nodes[1].sm->state().activeFormatVersion, 3u);
+
+    // Version 5 exceeds the voter's max (3) -> REFUSED, no proposal, version unchanged.
+    EXPECT_FALSE(co_await controller.activateFormat(5, {timestar::features::VersionRange{1, 3}}));
+    co_await router.pump();
+    EXPECT_EQ(nodes[1].sm->state().activeFormatVersion, 3u) << "unsupported version must not activate";
+
+    // A second voter that only speaks 1..2 blocks activating 3 (not all can read it).
+    EXPECT_FALSE(co_await controller.activateFormat(
+        4, {timestar::features::VersionRange{1, 4}, timestar::features::VersionRange{1, 2}}));
+    co_await router.pump();
+    EXPECT_EQ(nodes[1].sm->state().activeFormatVersion, 3u) << "one lagging voter blocks activation";
+}
+
 }  // namespace
+
+TEST(Group0ControllerTest, FormatActivationGatedByVoterSupport) {
+    testFormatActivationGatedByVoterSupport().get();
+}
 
 TEST(Group0ControllerTest, ClusterInitGrowsMetaVotersAcrossFailureDomains) {
     testClusterInitGrowsMetaVotersAcrossDomains().get();

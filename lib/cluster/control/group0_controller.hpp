@@ -1,12 +1,15 @@
 #pragma once
 
+#include "../features/feature_gate.hpp"  // FeatureGate, VersionRange
 #include "../raft/raft_group.hpp"
 #include "control_command.hpp"
 #include "group0_state_machine.hpp"
 #include "meta_voters.hpp"
 
+#include <cstdint>
 #include <seastar/core/future.hh>
 #include <string>
+#include <vector>
 
 namespace timestar::control {
 
@@ -50,6 +53,13 @@ public:
 
     // Propose a single control command (leader only). Returns false if not leader.
     seastar::future<bool> proposeCommand(const ControlCommand& cmd);
+
+    // Activate wire/storage format `version` cluster-wide (rolling upgrade, decision
+    // 8) ONLY if every current group-0 voter's supported range covers it (FeatureGate::
+    // canActivate over `voterVersions`, one range per current voter in order). Refuses
+    // (returns false, no proposal) if any voter cannot read it -- a node is never sent a
+    // format it cannot decode. Also false if not leader or not an advance.
+    seastar::future<bool> activateFormat(uint32_t version, const std::vector<features::VersionRange>& voterVersions);
 
 private:
     raft::RaftGroup& g0_;

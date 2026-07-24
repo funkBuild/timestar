@@ -76,9 +76,17 @@ struct AdmitWithToken {
     std::string token;
 };
 
+// Activate a storage/log wire-format version cluster-wide (rolling-upgrade, decision
+// 8). The controller proposes this ONLY after FeatureGate::canActivate confirms every
+// current voter can read `version`; apply advances the active version MONOTONICALLY
+// (a stale/replayed lower version is ignored) so a node never regresses formats.
+struct SetActiveVersion {
+    uint32_t version = 1;
+};
+
 using ControlCommand =
     std::variant<InitCluster, UpsertNode, SetNodeState, SetDesiredPlacement, SetMetaVoters, CasPolicy,
-                 SetControllerTerm, UpsertJob, MintJoinToken, AdmitWithToken>;
+                 SetControllerTerm, UpsertJob, MintJoinToken, AdmitWithToken, SetActiveVersion>;
 
 // Wire serialization for a command (the Raft entry payload). Length-prefixed,
 // self-delimiting; decode returns nullopt on any malformed/truncated input.

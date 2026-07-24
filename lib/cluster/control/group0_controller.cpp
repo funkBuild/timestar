@@ -10,6 +10,18 @@ seastar::future<bool> Group0Controller::proposeCommand(const ControlCommand& cmd
     co_return co_await g0_.propose(encodeCommand(cmd));
 }
 
+seastar::future<bool> Group0Controller::activateFormat(uint32_t version,
+                                                       const std::vector<features::VersionRange>& voterVersions) {
+    if (!g0_.isLeader())
+        co_return false;
+    // SAFETY GATE (decision 8): activate ONLY if every current voter can read the
+    // format, so no node is ever sent data in a format it cannot decode. Refuse
+    // otherwise -- the incompatible voter must be upgraded first.
+    if (!features::FeatureGate::canActivate(version, voterVersions))
+        co_return false;
+    co_return co_await proposeCommand(SetActiveVersion{version});
+}
+
 seastar::future<> Group0Controller::initCluster(std::string clusterUuid, NodeRecord selfRecord) {
     // A fresh group 0 is already a group of one (self is the sole voter). Record
     // the cluster identity, this node (Active), and mirror the sole-voter set.

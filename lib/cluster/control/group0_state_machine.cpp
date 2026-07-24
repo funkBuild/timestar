@@ -141,6 +141,15 @@ bool Group0StateMachine::applyCommand(const ControlCommand& cmd) {
                 } else {
                     ok = false;  // rejected: no such token
                 }
+            } else if constexpr (std::is_same_v<T, SetActiveVersion>) {
+                // Monotonic: a stale/replayed lower version must never regress the
+                // active format (nodes only ever move formats forward). The safety
+                // check (every voter can read it) is enforced by the controller BEFORE
+                // proposing; apply is the durable, monotonic record.
+                if (c.version > state_.activeFormatVersion)
+                    state_.activeFormatVersion = c.version;
+                else
+                    ok = false;  // no-op: not an advance
             }
         },
         cmd);
@@ -199,6 +208,7 @@ std::string Group0StateMachine::snapshot() const {
     w.u64(state_.joinTokens.size());
     for (const auto& t : state_.joinTokens)  // std::set: canonical order
         w.str(t);
+    w.u64(state_.activeFormatVersion);  // trailing (back-compat: read only if present)
     return std::move(w.out);
 }
 
@@ -246,6 +256,10 @@ bool Group0StateMachine::loadSnapshot(const std::string& data) {
     uint64_t nTok = r.u64();
     for (uint64_t i = 0; i < nTok && r.ok; ++i)
         s.joinTokens.insert(r.str());
+    // Trailing, optional for backward compatibility: a pre-format-version snapshot has
+    // no field here, so default to 1 (s.activeFormatVersion's default) rather than fail.
+    if (r.ok && r.avail(8))
+        s.activeFormatVersion = static_cast<uint32_t>(r.u64());
     if (!r.ok)
         return false;  // ignore a corrupt snapshot rather than half-apply
     state_ = std::move(s);
