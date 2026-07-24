@@ -1,5 +1,33 @@
 # Clustering: deferred tasks
 
+## Integration status (wiring the bricks into the running server)
+
+The Phase 4-8 bricks are gate-proven in isolation. Wiring them into the live
+`timestar_http_server`:
+
+- **Milestone 1 — DONE (`ef38b1e`): a Docker-deployable 3-node cluster** via
+  full-replication HTTP request forwarding. `[cluster]` config
+  (`TIMESTAR_CLUSTER_ENABLED`/`_NODE_ID`/`_PEERS`) + `lib/cluster/integration/
+  cluster_gateway` replicate every accepted `/write` and `/delete` to peers (the
+  flat `DataPoint` model cannot carry a real write, so raw payloads are
+  forwarded, preserving all four value types + identity). `docker-compose.cluster.yml`
+  (or plain `docker run` on a shared network) brings up 3 nodes. VERIFIED on
+  Docker: write/delete on any node replicate to all; **183/184 jest API tests
+  pass** (the one failure is a subscription-cleanup test whose 35s window is too
+  tight in Docker — it fails identically on a SINGLE non-cluster container, so it
+  is a pre-existing environment-timing quirk, not a cluster defect). Async
+  best-effort replication, no consensus.
+- **M1.x:** replicate retention/schema mutations too (only write+delete wired).
+- **M2:** VShard-partitioned RF=1 (Phase 4 model) — forward each series to its
+  owner node; query fan-out returning MERGEABLE partials (aggregation merge
+  across nodes).
+- **M3:** Raft-replicated RF=3 — wire `ReplicatedVShard` on the real Engine;
+  needs an enriched inter-node command type (close the `DataPoint` gap) +
+  group-0 bootstrap.
+
+---
+
+
 Tasks that were consciously **deferred** out of the completed clustering phases,
 recorded here so the decisions aren't lost. This is the authoritative backlog for
 "things we chose not to do yet in a phase we called done."
