@@ -124,6 +124,41 @@ Status legend: **[ ]** open · **[~]** partial (a proxy exists) · **[x]** done.
 
 ---
 
+## Phase 7 — online join, move, repair, balance
+
+The core mechanisms are implemented and the growth gate is proven
+(`lib/cluster/movement/`). Done: the move step machine (`move_job.hpp`) + Mover
+(add learner → snapshot install + replay catch-up → promote → remove old voter,
+RF never drops, one member at a time, voter removed only after replacement
+committed, crash-resumable, SLO-pause/cancel = safe forward stop); the N→N+1
+growth gate over real Raft + journals (`movement_growth_test.cpp`: RF stays ≥3 at
+every committed step, destination byte-identical to source after snapshot +
+concurrent-write replay); placement + leadership balancers (hard failure-domain /
+disk-watermark constraints over load, hysteresis); movement throttle (auto-pause
+on p99/error/stall/queue/disk budgets, manual pause/cancel); scrubber (hash
+verify → quarantine → re-replication request); resumable verified snapshot
+streaming (`snapshot_stream.hpp`).
+
+### [ ] Production wiring for movement/balance/repair
+- **What:** wire the Mover + a controller-side job driver into `Group0Controller`
+  (advance a persisted `Job` across MoveJob steps via `UpsertJob`, resuming on
+  crash) and `RaftGroupRegistry`; feed the balancers real telemetry (add
+  capacity/disk/weight to `NodeRecord`, wire queue-depth/write-rate signals);
+  schedule the scrubber as a background loop feeding the movement path; source the
+  throttle's `ForegroundSignals` from real reactor/query/write metrics.
+- **What exists instead:** every mechanism is a reviewed, tested brick with
+  injected abstractions; the growth gate is proven end-to-end on the async
+  RaftGroup + journal harness. This is the production integration, mirroring the
+  Phase 4-6 Engine/RPC-wiring deferrals.
+
+### [ ] Chunked InstallSnapshot on the wire
+- **What:** `raft_messages.hpp` `InstallSnapshot` carries the whole payload in one
+  field; `snapshot_stream.hpp` implements resumable chunk hashing + whole-snapshot
+  verification as a standalone brick. Wiring the chunk stream into the actual
+  InstallSnapshot RPC (offset/outstanding-window) is production hardening.
+- **Value now:** LOW; the monolithic path is correct and the growth gate installs
+  a real snapshot through it.
+
 ## Phase 6 — replica reads (built ahead of its post-v1 schedule)
 
 The plan schedules replica reads as a post-v1 extension, but the core mechanisms
