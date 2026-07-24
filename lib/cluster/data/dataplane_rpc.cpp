@@ -41,6 +41,7 @@ constexpr uint64_t kQueryRemote = 2;        // sstring -> sstring (legacy DataPo
 constexpr uint64_t kForwardWriteBatch = 3;  // sstring -> sstring (enriched WriteBatch, waited: applied)
 constexpr uint64_t kQueryNode = 4;          // sstring -> sstring (enriched NodeQueryRequest, waited: partial)
 constexpr uint64_t kQueryMetadata = 5;      // sstring -> sstring (MetadataRequest, waited: MetadataResult)
+constexpr uint64_t kProposeWrite = 6;       // sstring -> sstring (WriteBatch, waited: "1"/"0" committed)
 
 }  // namespace
 
@@ -50,8 +51,9 @@ struct DataPlaneRpc::Impl {
     std::unique_ptr<seastar::rpc::protocol<DpSerializer>::server> server;
     std::map<NodeId, seastar::socket_address> peers;
     std::map<NodeId, std::unique_ptr<Client>> clients;
-    LocalStore* sink = nullptr;       // legacy DataPoint path
-    NodeStore* nodeSink = nullptr;    // enriched WriteBatch path (F.4)
+    LocalStore* sink = nullptr;         // legacy DataPoint path
+    NodeStore* nodeSink = nullptr;      // enriched WriteBatch path (F.4)
+    ProposeSink* proposeSink = nullptr;  // RF=3 Raft propose target (M3)
     bool stopping = false;
     // Client stubs are created ONCE (a stub allocated per concurrent call can
     // corrupt reply routing / message-id bookkeeping). Reused for every call.
@@ -60,6 +62,7 @@ struct DataPlaneRpc::Impl {
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> forwardBatchStub;
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> queryNodeStub;
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> queryMetadataStub;
+    std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> proposeWriteStub;
 
     seastar::rpc::protocol<DpSerializer>::client* clientFor(NodeId to) {
         if (auto it = clients.find(to); it != clients.end())
@@ -82,6 +85,7 @@ struct DataPlaneRpc::Impl {
         forwardBatchStub = proto.make_client<seastar::sstring(seastar::sstring)>(kForwardWriteBatch);
         queryNodeStub = proto.make_client<seastar::sstring(seastar::sstring)>(kQueryNode);
         queryMetadataStub = proto.make_client<seastar::sstring(seastar::sstring)>(kQueryMetadata);
+        proposeWriteStub = proto.make_client<seastar::sstring(seastar::sstring)>(kProposeWrite);
     }
 
     // Pin the listening socket to THIS shard. seastar's default listen policy
@@ -176,9 +180,25 @@ seastar::future<> DataPlaneRpc::start(seastar::socket_address local, NodeStore& 
             return seastar::sstring(enc.data(), enc.size());
         });
     });
+    impl_->proto.register_handler(kProposeWrite, [this](seastar::sstring data) {
+        if (!impl_->proposeSink)
+            return seastar::make_exception_future<seastar::sstring>(
+                std::runtime_error("dataplane: no propose sink (node not RF>1)"));
+        auto batch = decodeWriteBatch(std::string(data.data(), data.size()));
+        if (!batch)
+            return seastar::make_exception_future<seastar::sstring>(
+                std::runtime_error("dataplane: malformed propose batch"));
+        return impl_->proposeSink->proposeBatch(std::move(*batch)).then([](bool ok) {
+            return seastar::sstring(ok ? "1" : "0");
+        });
+    });
     impl_->makeStubs();
     impl_->listenServer(local);
     return seastar::make_ready_future<>();
+}
+
+void DataPlaneRpc::setProposeSink(ProposeSink& sink) {
+    impl_->proposeSink = &sink;
 }
 
 seastar::future<> DataPlaneRpc::forwardWrites(NodeId to, std::vector<DataPoint> points) {
@@ -241,6 +261,17 @@ seastar::future<MetadataResult> DataPlaneRpc::queryMetadata(NodeId to, MetadataR
     if (!res)
         throw std::runtime_error("dataplane: malformed metadata result");
     co_return std::move(*res);
+}
+
+seastar::future<bool> DataPlaneRpc::proposeWrite(NodeId to, WriteBatch batch) {
+    if (impl_->stopping)
+        throw std::runtime_error("dataplane: shutting down");
+    auto* conn = impl_->clientFor(to);
+    if (!conn)
+        throw std::runtime_error("dataplane: unknown peer");
+    std::string bytes = encodeWriteBatch(batch);
+    seastar::sstring reply = co_await impl_->proposeWriteStub(*conn, seastar::sstring(bytes.data(), bytes.size()));
+    co_return !reply.empty() && reply[0] == '1';  // committed on the leader
 }
 
 seastar::future<> DataPlaneRpc::stop() {

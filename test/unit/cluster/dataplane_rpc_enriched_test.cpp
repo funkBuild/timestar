@@ -86,6 +86,20 @@ public:
     }
 };
 
+// A ProposeSink double: records the batch, returns a configurable committed result
+// (true = leader committed on quorum, false = not the leader).
+class RecordingProposeSink : public data::ProposeSink {
+public:
+    bool committed = true;
+    int calls = 0;
+    size_t lastSeriesCount = 0;
+    seastar::future<bool> proposeBatch(data::WriteBatch batch) override {
+        ++calls;
+        lastSeriesCount = batch.series.size();
+        return seastar::make_ready_future<bool>(committed);
+    }
+};
+
 data::WriteBatch oneFloatBatch() {
     data::WriteBatch b;
     b.series.push_back(
@@ -222,6 +236,35 @@ TEST_F(DataPlaneRpcEnrichedTest, EnrichedVerbToLegacyPeerFailsCleanly) {
         EXPECT_TRUE(threw) << "enriched verb to a legacy-only peer must fail, not hang";
         cli.stop().get();
         srv.stop().get();
+    }).get();
+}
+
+// M3: proposeWrite forwards a WriteBatch to a peer's Raft propose sink over the wire,
+// returning the leader's committed/not-leader result.
+TEST_F(DataPlaneRpcEnrichedTest, ProposeWriteForwardsToSinkAndReturnsResult) {
+    seastar::async([] {
+        const uint16_t port = 39315;
+        const data::NodeId self = 1;
+        ThrowingNodeStore sink;  // node store (unused by proposeWrite)
+        RecordingProposeSink propose;
+        data::DataPlaneRpc rpc;
+        rpc.setProposeSink(propose);
+        rpc.start(loopback(port), sink).get();
+        rpc.addPeer(self, loopback(port));
+
+        // Leader commits -> true, and the sink saw the batch.
+        propose.committed = true;
+        bool ok = rpc.proposeWrite(self, oneFloatBatch()).get();
+        EXPECT_TRUE(ok);
+        EXPECT_EQ(propose.calls, 1);
+        EXPECT_EQ(propose.lastSeriesCount, 1u);
+
+        // Not the leader -> false (caller redirects).
+        propose.committed = false;
+        EXPECT_FALSE(rpc.proposeWrite(self, oneFloatBatch()).get());
+        EXPECT_EQ(propose.calls, 2);
+
+        rpc.stop().get();
     }).get();
 }
 

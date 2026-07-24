@@ -49,6 +49,12 @@ public:
     seastar::future<> forwardWriteBatch(NodeId to, WriteBatch batch) override;
     seastar::future<NodeQueryPartial> queryNode(NodeId to, NodeQueryRequest req) override;
     seastar::future<MetadataResult> queryMetadata(NodeId to, MetadataRequest req) override;
+    seastar::future<bool> proposeWrite(NodeId to, WriteBatch batch) override;
+
+    // The Raft propose target incoming proposeWrite RPCs dispatch into (the node's
+    // ReplicatedVShardHost). Must be set before a peer sends proposeWrite; outlives
+    // the transport.
+    void setProposeSink(ProposeSink& sink);
 
 private:
     struct Impl;

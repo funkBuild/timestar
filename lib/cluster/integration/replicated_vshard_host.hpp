@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../../storage/journal_segment.hpp"
+#include "../data/node_store.hpp"  // ProposeSink
 #include "../data/replicated_command.hpp"
 #include "../raft/raft_group_registry.hpp"
 #include "../raft/raft_journal_persistence.hpp"
@@ -27,7 +28,7 @@ using timestar::raft::NodeId;
 // EngineDataStateMachine over the shared EngineLocalStore, and adds the RaftGroup to
 // the registry. propose() replicates a ReplicatedCommand to a VShard's group and
 // resolves only on durable-quorum commit + apply.
-class ReplicatedVShardHost {
+class ReplicatedVShardHost : public data::ProposeSink {
 public:
     ReplicatedVShardHost(EngineLocalStore& store, raft::RaftTransport& transport, NodeId self,
                          std::filesystem::path journalRoot,
@@ -62,7 +63,7 @@ public:
     // re-applies the OLD batch value at the higher revision and clobbers it -- a
     // narrow LWW inversion inherent to per-group (not cross-group-atomic) commit.
     // Cross-group atomicity is out of scope for v1.
-    seastar::future<bool> proposeBatch(data::WriteBatch batch);
+    seastar::future<bool> proposeBatch(data::WriteBatch batch) override;
 
     raft::RaftGroup* group(uint16_t vshard);
     raft::RaftGroupRegistry& registry() { return registry_; }
