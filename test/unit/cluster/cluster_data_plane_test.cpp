@@ -1,0 +1,98 @@
+// Integration M2: the ClusterDataPlane composition service the server instantiates.
+// A single-node instance starts its real DataPlaneRpc listener, routes a WriteBatch
+// through NodeWriteRouter into the real Engine, and answers query() through the
+// NodeQueryCoordinator -- proving the whole M2 brick composition works end to end as
+// one service (the cross-NODE socket forwarding is proven by dataplane_rpc_enriched_test;
+// here every VShard is local, exercising the service wiring + lifecycle).
+#include "../../../lib/cluster/integration/cluster_data_plane.hpp"
+#include "../../../lib/utils/series_key.hpp"
+#include "../../test_helpers.hpp"
+
+#include <gtest/gtest.h>
+
+#include <seastar/core/thread.hh>
+
+using namespace timestar;
+
+namespace {
+constexpr uint64_t BASE = 1'700'000'000'000'000'000ULL;
+
+class ClusterDataPlaneTest : public ::testing::Test {
+protected:
+    void SetUp() override { cleanTestShardDirectories(); }
+    void TearDown() override { cleanTestShardDirectories(); }
+};
+
+data::WriteSeries series(const std::string& m, std::map<std::string, std::string> tags, const std::string& f,
+                         TSMValueType type, std::vector<uint64_t> ts,
+                         std::variant<std::vector<double>, std::vector<int64_t>, std::vector<bool>,
+                                      std::vector<std::string>>
+                             vals) {
+    data::WriteSeries s;
+    s.seriesKey = buildSeriesKey(m, tags, f);
+    s.type = type;
+    s.timestamps = std::move(ts);
+    s.values = std::move(vals);
+    return s;
+}
+}  // namespace
+
+TEST_F(ClusterDataPlaneTest, SingleNodeStartWriteQuery) {
+    seastar::async([] {
+        ScopedShardedEngine eng;
+        eng.start();
+
+        ClusterConfig cfg;
+        cfg.enabled = true;
+        cfg.node_id = 1;
+        cfg.peers = {"127.0.0.1:18099"};  // data-plane listener binds 127.0.0.1:19099
+
+        cluster::ClusterDataPlane cdp;
+        cdp.start(cfg, *eng).get();
+        EXPECT_EQ(cdp.selfId(), 1);
+
+        // Write a float and a string series through the service.
+        data::WriteBatch b;
+        b.series.push_back(series("temp", {{"host", "h1"}}, "value", TSMValueType::Float, {BASE},
+                                  std::vector<double>{42.5}));
+        b.series.push_back(series("log", {{"host", "h1"}}, "msg", TSMValueType::String, {BASE},
+                                  std::vector<std::string>{"through the service"}));
+        cdp.write(std::move(b)).get();
+
+        auto query = [&](const std::string& m, const std::string& f) {
+            QueryRequest q;
+            q.aggregation = AggregationMethod::LATEST;
+            q.measurement = m;
+            q.fields = {f};
+            q.startTime = BASE - 1'000'000'000ULL;
+            q.endTime = BASE + 1'000'000'000ULL;
+            return cdp.query(q).get();
+        };
+
+        auto rd = query("temp", "value");
+        ASSERT_TRUE(rd.success) << rd.errorMessage;
+        ASSERT_EQ(rd.series.size(), 1u);
+        EXPECT_EQ(std::get<std::vector<double>>(rd.series[0].fields.at("value").second)[0], 42.5);
+
+        auto rs = query("log", "msg");
+        ASSERT_TRUE(rs.success) << rs.errorMessage;
+        ASSERT_EQ(rs.series.size(), 1u);
+        EXPECT_EQ(std::get<std::vector<std::string>>(rs.series[0].fields.at("msg").second)[0], "through the service");
+
+        cdp.stop().get();
+    }).get();
+}
+
+TEST_F(ClusterDataPlaneTest, MisconfiguredFailsToStart) {
+    seastar::async([] {
+        ScopedShardedEngine eng;
+        eng.start();
+        ClusterConfig cfg;
+        cfg.enabled = true;
+        cfg.node_id = 5;              // out of range for a 1-peer cluster
+        cfg.peers = {"127.0.0.1:18098"};
+        cluster::ClusterDataPlane cdp;
+        EXPECT_THROW(cdp.start(cfg, *eng).get(), std::invalid_argument);
+        cdp.stop().get();
+    }).get();
+}
