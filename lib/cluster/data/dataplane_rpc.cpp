@@ -105,6 +105,11 @@ void DataPlaneRpc::addPeer(NodeId id, seastar::socket_address addr) {
 }
 
 seastar::future<> DataPlaneRpc::start(seastar::socket_address local, LocalStore& sink) {
+    // start() is not idempotent: a second call would re-register verbs (throws) or
+    // re-listen on the bound addr (throws) AFTER mutating sink/handler state, leaving
+    // half-started state. Fail loudly and early instead, in release builds too.
+    if (impl_->server)
+        throw std::logic_error("DataPlaneRpc::start called more than once");
     impl_->sink = &sink;
     // Forwarded writes: apply into the local sink and ack (waited), so the sender
     // only considers the write accepted once the owner has stored it. The ack is a
@@ -133,6 +138,8 @@ seastar::future<> DataPlaneRpc::start(seastar::socket_address local, LocalStore&
 }
 
 seastar::future<> DataPlaneRpc::start(seastar::socket_address local, NodeStore& sink) {
+    if (impl_->server)
+        throw std::logic_error("DataPlaneRpc::start called more than once");
     impl_->nodeSink = &sink;
     // Enriched forwarded writes: decode the lossless WriteBatch and apply into the
     // node sink, acking only after a durable apply (waited). A malformed frame or

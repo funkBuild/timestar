@@ -60,6 +60,38 @@ std::vector<std::string> stringsOf(const timestar::http::SeriesResult& r, const 
     auto* v = std::get_if<std::vector<std::string>>(&it->second.second);
     return v ? *v : std::vector<std::string>{};
 }
+
+// A NodeStore whose apply always fails -- to prove a failed owner-apply surfaces
+// to the forwarding caller as a failed RPC (fail-closed), never a silent ack.
+class ThrowingNodeStore : public data::NodeStore {
+public:
+    seastar::future<> applyWrites(data::WriteBatch) override {
+        return seastar::make_exception_future<>(std::runtime_error("apply boom"));
+    }
+    seastar::future<bool> applyDelete(std::string, uint64_t, uint64_t) override {
+        return seastar::make_exception_future<bool>(std::runtime_error("delete boom"));
+    }
+    seastar::future<data::NodeQueryPartial> queryLocal(data::NodeQueryRequest) override {
+        return seastar::make_exception_future<data::NodeQueryPartial>(std::runtime_error("query boom"));
+    }
+};
+
+// Minimal legacy DataPoint sink, so a node can be started on the LEGACY path and
+// we can prove an enriched verb sent to it fails cleanly (unknown verb), not hangs.
+class LegacyMemStore : public data::LocalStore {
+public:
+    seastar::future<> applyWrites(std::vector<data::DataPoint>) override { return seastar::make_ready_future<>(); }
+    seastar::future<data::QueryPartial> queryLocal(data::QuerySpec) override {
+        return seastar::make_ready_future<data::QueryPartial>();
+    }
+};
+
+data::WriteBatch oneFloatBatch() {
+    data::WriteBatch b;
+    b.series.push_back(
+        series("m", {{"host", "h1"}}, "v", TSMValueType::Float, {BASE}, std::vector<double>{1.0}));
+    return b;
+}
 }  // namespace
 
 TEST_F(DataPlaneRpcEnrichedTest, WriteBatchAndQueryNodeOverRealSocket) {
@@ -135,6 +167,71 @@ TEST_F(DataPlaneRpcEnrichedTest, WriteBatchAndQueryNodeOverRealSocket) {
             EXPECT_EQ(doublesOf(viaSocket.series[0], "v"), doublesOf(inProcess.series[0], "v"));
         }
 
+        rpc.stop().get();
+    }).get();
+}
+
+// Fail-closed: a failed owner-apply propagates to the forwarding caller as a
+// failed RPC, never a silent success (the plan's "no silent partial" contract).
+TEST_F(DataPlaneRpcEnrichedTest, OwnerApplyFailureSurfacesToCaller) {
+    seastar::async([] {
+        const uint16_t port = 39311;
+        const data::NodeId self = 1;
+        ThrowingNodeStore sink;
+        data::DataPlaneRpc rpc;
+        rpc.start(loopback(port), sink).get();
+        rpc.addPeer(self, loopback(port));
+
+        bool threw = false;
+        try {
+            rpc.forwardWriteBatch(self, oneFloatBatch()).get();
+        } catch (const std::exception&) {
+            threw = true;
+        }
+        EXPECT_TRUE(threw) << "a failed owner-apply must fail the forwarding RPC";
+        rpc.stop().get();
+    }).get();
+}
+
+// Coexistence safety: an enriched verb sent to a peer serving only the LEGACY
+// path fails cleanly (unknown verb) rather than hanging forever on a waited call.
+TEST_F(DataPlaneRpcEnrichedTest, EnrichedVerbToLegacyPeerFailsCleanly) {
+    seastar::async([] {
+        const uint16_t serverPort = 39312, clientPort = 39313;
+        const data::NodeId server = 1;
+        LegacyMemStore legacy;
+        ThrowingNodeStore unused;  // the client's own sink (never invoked here)
+        data::DataPlaneRpc srv, cli;
+        srv.start(loopback(serverPort), legacy).get();   // legacy path only (verbs 1/2)
+        cli.start(loopback(clientPort), unused).get();   // enriched path
+        cli.addPeer(server, loopback(serverPort));
+
+        bool threw = false;
+        try {
+            cli.forwardWriteBatch(server, oneFloatBatch()).get();  // verb 3 -> unknown on srv
+        } catch (const std::exception&) {
+            threw = true;
+        }
+        EXPECT_TRUE(threw) << "enriched verb to a legacy-only peer must fail, not hang";
+        cli.stop().get();
+        srv.stop().get();
+    }).get();
+}
+
+// start() is not idempotent -- a second call throws loudly before mutating state.
+TEST_F(DataPlaneRpcEnrichedTest, StartTwiceThrows) {
+    seastar::async([] {
+        const uint16_t port = 39314;
+        ThrowingNodeStore sink;
+        data::DataPlaneRpc rpc;
+        rpc.start(loopback(port), sink).get();
+        bool threw = false;
+        try {
+            rpc.start(loopback(port), sink).get();
+        } catch (const std::logic_error&) {
+            threw = true;
+        }
+        EXPECT_TRUE(threw);
         rpc.stop().get();
     }).get();
 }
