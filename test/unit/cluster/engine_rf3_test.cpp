@@ -5,6 +5,7 @@
 // no duplicate, no split brain. This is the Phase-5 RF=3 gate re-proven with the
 // enriched command over the real Engine (not the toy store).
 #include "../../../lib/cluster/integration/engine_data_state_machine.hpp"
+#include "../../../lib/cluster/integration/raft_move_executor.hpp"
 #include "../../../lib/cluster/integration/replica_engine_coordinator.hpp"
 #include "../../../lib/cluster/integration/replica_engine_reader.hpp"
 #include "../../../lib/cluster/raft/raft_group.hpp"
@@ -420,6 +421,119 @@ TEST_F(EngineRf3Test, LeaderTracksPeerMatchIndex) {
         EXPECT_GE(reps[leader].group->matchIndexOf(3), commit) << "follower 3 caught up";
         // A node that is not a member is unknown (kNoIndex == 0).
         EXPECT_EQ(reps[leader].group->matchIndexOf(99), 0u);
+
+        for (auto& [id, r] : reps) {
+            router.setGroup(id, nullptr);
+            r.group.reset();
+            r.persistence.reset();
+            r.writer->close().get();
+        }
+        reps.clear();
+        for (auto& d : journalDirs)
+            fs::remove_all(d);
+        for (auto& d : engineDirs)
+            fs::remove_all(d);
+    }).get();
+}
+
+// M5 GATE (in-process): a real N->N+1 REPLACE move over live Raft. Group voters
+// {1,2,3} with node 4 as an observer; the Mover, driven by the production
+// RaftGroupMoveExecutor, replaces follower 3 with node 4: add 4 as a learner (RF
+// stays 3), catch it up via the leader's match-index, promote it (RF momentarily 4),
+// then remove 3 -> voters {1,2,4}. RF never drops below 3 at any committed step, the
+// destination is caught up before promotion, the moved data is present on node 4, and
+// the job persisted each forward step. Same harness M3's RF=3 gate uses.
+TEST_F(EngineRf3Test, MoverReplacesFollowerAcrossFourNodes) {
+    seastar::async([] {
+        const std::vector<NodeId> voters = {1, 2, 3};
+        const std::vector<NodeId> allNodes = {1, 2, 3, 4};
+        const NodeId leader = 1;
+        Router router;
+        std::map<NodeId, Replica> reps;
+        std::vector<fs::path> journalDirs, engineDirs;
+
+        auto tickAll = [&] {
+            for (auto& [id, r] : reps)
+                if (r.group)
+                    r.group->tick().get();
+            router.pump().get();
+        };
+        auto tick = [&](int rounds) {
+            for (int i = 0; i < rounds; ++i)
+                tickAll();
+        };
+        auto drive = [&](auto& f, int rounds) {
+            for (int i = 0; i < rounds && !f.available(); ++i) {
+                router.pump().get();
+                tickAll();
+            }
+        };
+
+        // Every node (incl. the observer 4) knows the initial voter set {1,2,3}; node 4
+        // is not a voter until the move adds it.
+        for (NodeId id : allNodes) {
+            Replica r;
+            fs::path edir = tmpDir("mveng" + std::to_string(id));
+            engineDirs.push_back(edir);
+            r.engine = std::make_unique<ScopedShardedEngine>();
+            r.engine->startAt(edir.string());
+            r.store = std::make_unique<cluster::EngineLocalStore>(**r.engine);
+            r.sm = std::make_unique<cluster::EngineDataStateMachine>(*r.store, timestar::VShardId{1});
+            fs::path jdir = tmpDir("mvj" + std::to_string(id));
+            journalDirs.push_back(jdir);
+            r.writer = std::make_unique<JournalWriter>(jdir, header(), 1u << 20);
+            auto recovered = r.writer->open().get();
+            RecoveredRaftState st = recoverRaftState(recovered, VShardId{1});
+            r.persistence = std::make_unique<JournalRaftPersistence>(*r.writer, VShardId{1}, st.nextSeq);
+            r.transport = std::make_unique<RouterTransport>(router);
+            RaftNode node(id, voters, std::move(st.log), st.hardState, optsFor(id, leader), {});
+            r.group = std::make_unique<RaftGroup>(1, std::move(node), *r.persistence, *r.transport, *r.sm);
+            router.setGroup(id, r.group.get());
+            reps[id] = std::move(r);
+        }
+        tick(40);
+        ASSERT_TRUE(reps[leader].group->isLeader());
+
+        // Commit data BEFORE the move, so node 4 must catch it up.
+        {
+            const std::string key = buildSeriesKey("mv", {{"host", "h1"}}, "value");
+            auto f = reps[leader].group->proposeAndAwaitApplied(writeCmd(key, 3.14));
+            drive(f, 60);
+            ASSERT_TRUE(f.get());
+            tick(20);
+        }
+
+        // Drive the replace move 3 -> 4 through the production executor.
+        std::vector<movement::MoveStep> persisted;
+        cluster::RaftGroupMoveExecutor exec(
+            *reps[leader].group,
+            [&persisted](const movement::MoveJob& j) {
+                persisted.push_back(j.step());
+                return seastar::make_ready_future<>();
+            });
+        movement::MoveJob job(movement::MovePlan{/*vshard=*/1, /*dest=*/4, /*victim=*/3});
+        movement::Mover mover(/*minRf=*/3);
+
+        auto mf = mover.run(job, exec);
+        // Drive ticks while the move's commitConfig/catchUp await the transitions.
+        for (int i = 0; i < 8000 && !mf.available(); ++i)
+            tickAll();
+        mf.get();
+        ASSERT_TRUE(job.done()) << "move must run to completion";
+
+        // Final committed config: node 3 replaced by node 4, RF back to 3.
+        auto finalVoters = reps[leader].group->node().config().voters;
+        std::sort(finalVoters.begin(), finalVoters.end());
+        EXPECT_EQ(finalVoters, (std::vector<NodeId>{1, 2, 4})) << "voters must be {1,2,4} after the replace";
+        EXPECT_FALSE(reps[leader].group->node().config().joint());
+
+        // The moved data is present on the NEW replica (node 4 caught up + applied).
+        tick(30);
+        EXPECT_DOUBLE_EQ(latestOn(*reps[4].engine, "mv", "value"), 3.14) << "node 4 has the moved data";
+
+        // The job persisted forward steps through Promoted/OldRemoved to Done.
+        EXPECT_FALSE(persisted.empty());
+        EXPECT_EQ(persisted.back(), movement::MoveStep::Done);
 
         for (auto& [id, r] : reps) {
             router.setGroup(id, nullptr);
