@@ -92,6 +92,55 @@ TEST_F(ClusterDataPlaneTest, SingleNodeStartWriteQuery) {
     }).get();
 }
 
+// M4: every read-consistency mode returns the SAME correct answer through the
+// cluster query path. A leader read satisfies linearizable ⊇ session ⊇ bounded, so
+// until replica routing offloads reads for SCALING, non-leader modes are served
+// correctly (never rejected or mis-served) -- the field is handled, not ignored in a
+// way that breaks the query.
+TEST_F(ClusterDataPlaneTest, ReadConsistencyModesAllReturnCorrectAnswer) {
+    seastar::async([] {
+        ScopedShardedEngine eng;
+        eng.start();
+
+        ClusterConfig cfg;
+        cfg.enabled = true;
+        cfg.node_id = 1;
+        cfg.peers = {"127.0.0.1:18097"};  // data-plane listener binds 127.0.0.1:19097
+
+        cluster::ClusterDataPlane cdp;
+        cdp.start(cfg, *eng).get();
+
+        data::WriteBatch b;
+        b.series.push_back(series("cm", {{"host", "h1"}}, "value", TSMValueType::Float, {BASE},
+                                  std::vector<double>{5.5}));
+        cdp.write(std::move(b)).get();
+
+        auto queryAt = [&](ReadConsistencyMode mode, uint64_t maxLag) {
+            QueryRequest q;
+            q.aggregation = AggregationMethod::LATEST;
+            q.measurement = "cm";
+            q.fields = {"value"};
+            q.startTime = BASE - 1'000'000'000ULL;
+            q.endTime = BASE + 1'000'000'000ULL;
+            q.readConsistency = mode;
+            q.maxReadLagIndex = maxLag;
+            return cdp.query(q).get();
+        };
+
+        for (auto [mode, lag] : {std::pair{ReadConsistencyMode::Leader, uint64_t{0}},
+                                 std::pair{ReadConsistencyMode::Session, uint64_t{0}},
+                                 std::pair{ReadConsistencyMode::BoundedStaleness, uint64_t{1000}}}) {
+            auto r = queryAt(mode, lag);
+            ASSERT_TRUE(r.success) << r.errorMessage << " (mode " << static_cast<int>(mode) << ")";
+            ASSERT_EQ(r.series.size(), 1u);
+            EXPECT_DOUBLE_EQ(std::get<std::vector<double>>(r.series[0].fields.at("value").second)[0], 5.5)
+                << "mode " << static_cast<int>(mode);
+        }
+
+        cdp.stop().get();
+    }).get();
+}
+
 TEST_F(ClusterDataPlaneTest, MisconfiguredFailsToStart) {
     seastar::async([] {
         ScopedShardedEngine eng;
