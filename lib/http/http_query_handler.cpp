@@ -991,11 +991,11 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpQueryHandler::handleQ
             }
         }
 
-        // Execute query. In partitioned cluster mode the hook fans out to VShard
-        // owners and merges; otherwise the local executeQuery runs.
+        // Execute query (executeQuery itself routes through the cluster in
+        // partitioned mode, so every caller -- /query AND /derived sub-queries -- fans
+        // out and merges).
         auto startTime = std::chrono::high_resolution_clock::now();
-        QueryResponse response =
-            clusterQueryHook ? co_await clusterQueryHook(queryRequest) : co_await executeQuery(queryRequest);
+        QueryResponse response = co_await executeQuery(queryRequest);
         auto endTime = std::chrono::high_resolution_clock::now();
 
         // Calculate execution time
@@ -2298,6 +2298,13 @@ void HttpQueryHandler::logQueryCompletion(const QueryRequest& request, QueryTimi
 }
 
 seastar::future<QueryResponse> HttpQueryHandler::executeQuery(QueryRequest request) {
+    // Partitioned cluster (M2): route through the data plane -- fan out to VShard
+    // owners and merge. Placed here (not in handleQuery) so EVERY caller routes,
+    // including the /derived executor's sub-queries. No recursion: the coordinator's
+    // per-node path uses queryLocalPartials/finalizeClusterPartials, never executeQuery.
+    if (clusterQueryHook)
+        co_return co_await clusterQueryHook(std::move(request));
+
     // `request` is BY VALUE (see the header): a reference parameter would be
     // read after every co_await while the caller's object may already be gone
     // — the SSE backfill loop passes a loop-body local through
