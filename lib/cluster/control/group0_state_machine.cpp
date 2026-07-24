@@ -1,6 +1,7 @@
 #include "group0_state_machine.hpp"
 
 #include <seastar/core/coroutine.hh>
+#include <stdexcept>
 
 namespace timestar::control {
 
@@ -65,10 +66,12 @@ struct SR {
     std::vector<NodeId> ids() {
         uint64_t n = u64();
         std::vector<NodeId> v;
-        if (!ok || !avail(n * 8)) {
+        // Non-wrapping bounds check (n*8 could overflow to bypass avail()).
+        if (!ok || n > static_cast<uint64_t>(end - p) / 8) {
             ok = false;
             return v;
         }
+        v.reserve(n);
         for (uint64_t i = 0; i < n; ++i)
             v.push_back(u64());
         return v;
@@ -96,8 +99,12 @@ bool Group0StateMachine::applyCommand(const ControlCommand& cmd) {
             } else if constexpr (std::is_same_v<T, SetMetaVoters>) {
                 state_.metaVoters = c.voters;
             } else if constexpr (std::is_same_v<T, CasPolicy>) {
-                PolicyCell& cell = state_.policies[c.key];
-                if (cell.version == c.expectedVersion) {
+                // Read the current version WITHOUT inserting -- a failed CAS must
+                // leave state exactly unchanged (no phantom version-0 cell).
+                auto it = state_.policies.find(c.key);
+                const uint64_t curVer = (it == state_.policies.end()) ? 0 : it->second.version;
+                if (curVer == c.expectedVersion) {
+                    PolicyCell& cell = state_.policies[c.key];  // insert only on success
                     ++cell.version;
                     cell.value = c.value;
                 } else {
@@ -111,12 +118,15 @@ bool Group0StateMachine::applyCommand(const ControlCommand& cmd) {
             } else if constexpr (std::is_same_v<T, UpsertJob>) {
                 Job& j = state_.jobs[c.jobId];
                 j.id = c.jobId;
-                // Idempotent step: never move a job backwards or un-complete it.
-                if (c.step >= j.step)
+                // Idempotent step: never move a job backwards, and keep the
+                // payload paired with the RETAINED step (an out-of-order replay of
+                // an older step must not overwrite the newer payload).
+                if (c.step >= j.step) {
                     j.step = c.step;
+                    j.payload = c.payload;
+                }
                 if (c.done)
                     j.done = true;
-                j.payload = c.payload;
             }
         },
         cmd);
@@ -124,10 +134,16 @@ bool Group0StateMachine::applyCommand(const ControlCommand& cmd) {
 }
 
 seastar::future<> Group0StateMachine::apply(raft::LogEntry entry) {
-    if (auto cmd = decodeCommand(entry.data))
-        applyCommand(*cmd);
-    // A malformed command is a hard fault in a real deployment; here we skip it
-    // rather than crash the reactor. appliedIndex tracks committed control state.
+    auto cmd = decodeCommand(entry.data);
+    if (!cmd) {
+        // A COMMITTED group-0 entry that this binary cannot decode is fatal: it
+        // means a peer applied a command we don't understand (a version/format
+        // mismatch), and silently skipping it while advancing appliedIndex would
+        // diverge this replica from the others. Fail-stop instead (the driver
+        // should quarantine the group rather than serve divergent control state).
+        throw std::runtime_error("group0: undecodable committed control command");
+    }
+    applyCommand(*cmd);
     state_.appliedIndex = entry.index;
     return seastar::make_ready_future<>();
 }

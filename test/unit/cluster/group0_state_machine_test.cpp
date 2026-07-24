@@ -128,6 +128,34 @@ TEST(Group0StateMachineTest, JobsAreIdempotentAndMonotonic) {
     EXPECT_TRUE(sm.state().jobs.at("j1").done);
 }
 
+TEST(Group0StateMachineTest, FailedCasDoesNotCreatePhantomCell) {
+    Group0StateMachine sm;
+    // CAS with a non-zero expected version on an absent key must fail AND leave
+    // no trace (no phantom version-0 cell).
+    EXPECT_FALSE(sm.applyCommand(CasPolicy{"absent", 5, "v"}));
+    EXPECT_EQ(sm.state().policies.count("absent"), 0u);
+    EXPECT_TRUE(sm.state().policies.empty());
+}
+
+TEST(Group0StateMachineTest, JobPayloadDoesNotRegressOnOldReplay) {
+    Group0StateMachine sm;
+    sm.applyCommand(UpsertJob{"j", 3, false, "new"});
+    EXPECT_EQ(sm.state().jobs.at("j").payload, "new");
+    // An out-of-order replay of an older step must not overwrite the newer payload.
+    sm.applyCommand(UpsertJob{"j", 1, false, "old"});
+    EXPECT_EQ(sm.state().jobs.at("j").step, 3u);
+    EXPECT_EQ(sm.state().jobs.at("j").payload, "new");
+}
+
+TEST(Group0StateMachineTest, UndecodableCommittedCommandIsFatal) {
+    Group0StateMachine sm;
+    timestar::raft::LogEntry e;
+    e.index = 1;
+    e.type = timestar::raft::EntryType::Normal;
+    e.data = std::string(1, static_cast<char>(0xEE));  // unknown command tag
+    EXPECT_THROW((void)sm.apply(e), std::runtime_error);
+}
+
 TEST(Group0StateMachineTest, SnapshotRoundTrip) {
     Group0StateMachine sm;
     sm.applyCommand(InitCluster{"cluster-x"});

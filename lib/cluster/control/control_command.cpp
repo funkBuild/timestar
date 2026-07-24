@@ -61,7 +61,9 @@ struct Reader {
     std::vector<NodeId> ids() {
         uint64_t n = u64();
         std::vector<NodeId> v;
-        if (!ok || !avail(n * 8)) {
+        // Non-wrapping bounds check: n*8 could overflow, so compare against the
+        // remaining byte budget divided by 8 instead of multiplying.
+        if (!ok || n > static_cast<uint64_t>(end - p) / 8) {
             ok = false;
             return v;
         }
