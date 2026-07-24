@@ -52,6 +52,48 @@ Status legend: **[ ]** open · **[~]** partial (a proxy exists) · **[x]** done.
 
 ---
 
+## Phase 4 — multi-node data plane
+
+### [~] Verify the data-plane RPC transport (DataPlaneRpc) over real loopback sockets
+- **What:** an end-to-end socket test that a write forwarded to a VShard owner and
+  a query fanned out across nodes — both over `seastar::rpc` — return the same
+  answer as a single node.
+- **What exists instead:** the data-plane CORRECTNESS (RF=1 == single-node for raw
+  + every aggregation, `QUERY_INCOMPLETE` on an unassigned VShard, no partial
+  write, the subscribe cluster-guard, the operator surface) is proven
+  transport-agnostically in `timestar_unit_test`
+  (`DataPlaneRf1Test`, `DataPlaneCodecTest`, `SubscribePolicyTest`,
+  `ClusterInspectorTest`) via the injected `LocalStore`/`DataPlaneClient`. The
+  transport (`lib/cluster/data/dataplane_rpc.cpp`) compiles and its wire codec is
+  unit-tested; its `start()` succeeds over loopback.
+- **Why deferred:** the *waited* request/response path (forwardWrites/queryRemote)
+  or the transport `stop()` hangs over loopback in this environment, and the
+  socket-test binary tooling was too unstable this session to isolate whether it
+  is a real `seastar::rpc` waited-verb integration bug or a shutdown-ordering
+  deadlock (the Raft transport had a similar `stop()` deadlock, fixed with a gate
+  + no_wait). Needs a working interactive debug environment to resolve. The gate
+  property does not depend on the wire — it is proven above.
+- **Value now:** MEDIUM (wire-level confidence). **Action:** re-run
+  `timestar_cluster_socket_test` with the DataPlaneRpc test re-added
+  (`test/CMakeLists.txt` UNIT_CLUSTER_SOCKET_TESTS) once a stable socket-test
+  environment is available; compare stop() against the working
+  `raft_rpc_transport` shutdown pattern.
+
+### [ ] mTLS + protobuf wire, batching/pools/deadlines/cancellation/backpressure, cert rotation
+- **What:** the plan names mTLS-protected protobuf RPC with connection pools,
+  deadlines, cancellation, backpressure, and certificate-rotation mechanics.
+- **What exists instead:** the data-plane RPC carries the same payloads over
+  `seastar::rpc` with a compact bounds-checked codec (one connection per peer
+  host). mTLS/protobuf/pool-tuning are transport hardening, not gate-correctness.
+- **Value now:** LOW for the static gate; required for production hardening.
+
+### [ ] Multi-host distributed insert/query benchmarks
+- **What:** extend `timestar_insert_bench` / `timestar_query_bench` to drive
+  multiple hosts. Deferred with the transport verification above.
+- **Value now:** LOW until the transport loopback path is verified.
+
+---
+
 ## Phase 3 — control plane
 
 ### [ ] Live notification-stream RPC subscription (map-epoch / policy "watch")
