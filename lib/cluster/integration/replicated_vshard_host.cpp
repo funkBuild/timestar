@@ -116,6 +116,27 @@ NodeId ReplicatedVShardHost::leaderOf(uint16_t vshard) const {
     return g ? g->leader() : raft::kNoNode;
 }
 
+seastar::future<raft::LogIndex> ReplicatedVShardHost::leaderReadIndex(uint16_t vshard) {
+    raft::RaftGroup* g = registry_.group(vshard);
+    if (!g)
+        throw std::runtime_error("ReplicatedVShardHost::leaderReadIndex: VShard not hosted here");
+    // readBarrier() runs a quorum-confirmed ReadIndex round and REJECTS (throws) if this
+    // node is not the current-term leader -- exactly the partition/redirect signal the
+    // reaching replica needs, so no forwarding of stale barriers.
+    return g->readBarrier();
+}
+
+seastar::future<raft::LogIndex> ReplicatedVShardHost::leaderCommitIndex(uint16_t vshard) {
+    raft::RaftGroup* g = registry_.group(vshard);
+    if (!g)
+        throw std::runtime_error("ReplicatedVShardHost::leaderCommitIndex: VShard not hosted here");
+    if (!g->isLeader())
+        // Bounded-staleness freshness must come from the leader's commit index; a
+        // follower's is itself possibly stale, so reject rather than mislead.
+        throw std::runtime_error("ReplicatedVShardHost::leaderCommitIndex: not the leader for this VShard");
+    return seastar::make_ready_future<raft::LogIndex>(g->commitIndex());
+}
+
 seastar::future<> ReplicatedVShardHost::stop() {
     if (stopped_)
         co_return;

@@ -290,3 +290,56 @@ TEST_F(ReplicatedVShardHostTest, SnapshotVShardCompactsLogOverFlushedData) {
         fs::remove_all(jroot);
     }).get();
 }
+
+// M4 leader-reach sink: ReadIndexSink over the local Raft group. A non-leader (or
+// unhosted VShard) rejects; the leader confirms a quorum ReadIndex and reports its
+// commit index, with commit >= the confirmed read index.
+TEST_F(ReplicatedVShardHostTest, LeaderReachSinkConfirmsReadIndexAndRejectsNonLeader) {
+    seastar::async([] {
+        ScopedShardedEngine eng;
+        eng.start();
+        cluster::EngineLocalStore store(*eng);
+        NoopTransport transport;
+        fs::path jroot = tmpDir();
+        cluster::ReplicatedVShardHost host(store, transport, /*self=*/1, jroot);
+
+        RaftOptions opts;
+        opts.electionTimeoutMin = opts.electionTimeoutMax = 1;
+        opts.heartbeatTimeout = 1;
+        const uint16_t V = 11;
+        host.addVShard(V, {1}, opts).get();
+        RaftGroup* g = host.group(V);
+        ASSERT_NE(g, nullptr);
+
+        // Before leadership: leaderCommitIndex rejects (this node is not the leader).
+        EXPECT_THROW(host.leaderCommitIndex(V).get(), std::runtime_error);
+        // Unhosted VShard: both reject.
+        EXPECT_THROW(host.leaderReadIndex(999).get(), std::runtime_error);
+        EXPECT_THROW(host.leaderCommitIndex(999).get(), std::runtime_error);
+
+        // Drive to leadership and commit a write.
+        for (int i = 0; i < 10 && !g->isLeader(); ++i)
+            g->tick().get();
+        ASSERT_TRUE(g->isLeader());
+        auto f = host.propose(V, writeCmd(buildSeriesKey("temp", {{"host", "h1"}}, "value"), 1.0));
+        for (int i = 0; i < 20 && !f.available(); ++i)
+            g->tick().get();
+        EXPECT_TRUE(f.get());
+
+        // Leader reports a commit index > 0.
+        const auto ci = host.leaderCommitIndex(V).get();
+        EXPECT_GT(ci, 0u);
+
+        // Leader confirms a linearizable ReadIndex (single-voter quorum = self; drive
+        // ticks so the confirmation round completes).
+        auto rb = host.leaderReadIndex(V);
+        for (int i = 0; i < 20 && !rb.available(); ++i)
+            g->tick().get();
+        const auto ri = rb.get();
+        EXPECT_GT(ri, 0u);
+        EXPECT_GE(ci, ri) << "commit index is at least the confirmed read index";
+
+        host.stop().get();
+        fs::remove_all(jroot);
+    }).get();
+}

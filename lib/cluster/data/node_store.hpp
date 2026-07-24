@@ -81,4 +81,21 @@ public:
     virtual NodeId leaderOf(uint16_t vshard) const = 0;
 };
 
+// The node-local LEADER-REACH target for replica reads (M4). A follower/learner
+// replica of a VShard confirms freshness at the CURRENT leader before serving a
+// linearizable or bounded-staleness read (the ReplicaVShard `LeaderReadIndexFn`/
+// `LeaderCommitFn`); DataPlaneRpc's leaderReadIndex/leaderCommitIndex verbs dispatch
+// the RPC into this sink on the leader node. ReplicatedVShardHost implements it.
+class ReadIndexSink {
+public:
+    virtual ~ReadIndexSink() = default;
+    // A quorum-confirmed linearizable ReadIndex for `vshard` at THIS node. MUST reject
+    // (throw) if this node is not the current leader or cannot confirm a quorum, so a
+    // partitioned/deposed node never hands out a stale barrier.
+    virtual seastar::future<raft::LogIndex> leaderReadIndex(uint16_t vshard) = 0;
+    // This node's current commit index for `vshard` (cheap, no quorum round) for
+    // bounded-staleness freshness. MUST reject (throw) if this node is not the leader.
+    virtual seastar::future<raft::LogIndex> leaderCommitIndex(uint16_t vshard) = 0;
+};
+
 }  // namespace timestar::data
