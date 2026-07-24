@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../raft/raft_types.hpp"  // NodeId
+#include "node_metadata.hpp"
 #include "node_query.hpp"
 #include "write_record.hpp"
 
@@ -22,6 +23,13 @@ public:
     virtual seastar::future<> applyWrites(WriteBatch batch) = 0;
     virtual seastar::future<bool> applyDelete(std::string seriesKey, uint64_t start, uint64_t end) = 0;
     virtual seastar::future<NodeQueryPartial> queryLocal(NodeQueryRequest req) = 0;
+
+    // This node's contribution to a scattered metadata request (M2). Default returns
+    // empty so test doubles need not implement it; EngineLocalStore serves the real
+    // schema/cardinality of its owned series.
+    virtual seastar::future<MetadataResult> queryMetadata(MetadataRequest) {
+        return seastar::make_ready_future<MetadataResult>();
+    }
 };
 
 // The peer-facing client seam for the enriched command path (the client side of

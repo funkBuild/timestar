@@ -2,6 +2,7 @@
 
 #include "../../core/placement_table.hpp"
 #include "../../index/index_backend.hpp"
+#include "../scatter_gather.hpp"
 
 #include <map>
 #include <seastar/core/coroutine.hh>
@@ -177,6 +178,48 @@ seastar::future<data::NodeQueryPartial> EngineLocalStore::queryLocal(data::NodeQ
     partial.nonNumeric = std::move(np.nonNumeric);
     partial.seriesFound = np.seriesFound;
     co_return partial;
+}
+
+seastar::future<data::MetadataResult> EngineLocalStore::queryMetadata(data::MetadataRequest req) {
+    // Schema getters read the node's local schema cache (broadcast across its shards),
+    // so one local() call yields this node's full owned-series schema. Cardinality is
+    // per-shard HLL, summed across this node's shards.
+    data::MetadataResult out;
+    Engine& e = engines_.local();
+    switch (req.kind) {
+        case data::MetadataKind::Measurements: {
+            out.items = co_await e.getAllMeasurements();
+            break;
+        }
+        case data::MetadataKind::Fields: {
+            auto s = co_await e.getMeasurementFields(req.measurement);
+            out.items.assign(s.begin(), s.end());
+            break;
+        }
+        case data::MetadataKind::TagKeys: {
+            auto s = co_await e.getMeasurementTags(req.measurement);
+            out.items.assign(s.begin(), s.end());
+            break;
+        }
+        case data::MetadataKind::TagValues: {
+            auto s = co_await e.getTagValues(req.measurement, req.tagKey);
+            out.items.assign(s.begin(), s.end());
+            break;
+        }
+        case data::MetadataKind::MeasurementCardinality: {
+            out.cardinality = co_await timestar::cluster::scatterAndSum(
+                engines_, [m = req.measurement](Engine& eng) { return eng.getIndex().estimateMeasurementCardinality(m); });
+            break;
+        }
+        case data::MetadataKind::TagCardinality: {
+            out.cardinality = co_await timestar::cluster::scatterAndSum(
+                engines_, [m = req.measurement, k = req.tagKey, v = req.tagValue](Engine& eng) {
+                    return eng.getIndex().estimateTagCardinality(m, k, v);
+                });
+            break;
+        }
+    }
+    co_return out;
 }
 
 seastar::future<> EngineLocalStore::applyRetention(std::string, uint64_t) {

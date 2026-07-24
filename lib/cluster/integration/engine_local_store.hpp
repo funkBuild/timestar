@@ -44,6 +44,10 @@ public:
     // incompleteReason (fail-closed), never a silent empty success.
     seastar::future<data::NodeQueryPartial> queryLocal(data::NodeQueryRequest req) override;
 
+    // This node's schema/cardinality for its owned series (M2 metadata scatter): the
+    // coordinator unions items and sums cardinality across owners.
+    seastar::future<data::MetadataResult> queryMetadata(data::MetadataRequest req) override;
+
     // Routing helper (public for tests): the core that owns `id`.
     unsigned coreFor(const SeriesId128& id) const;
 

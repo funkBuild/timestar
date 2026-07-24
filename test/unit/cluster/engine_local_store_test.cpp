@@ -157,3 +157,25 @@ TEST_F(EngineLocalStoreTest, ApplyWritesAllTypesVisibleViaRealQuery) {
         }
     }).get();
 }
+
+TEST_F(EngineLocalStoreTest, QueryMetadataReturnsOwnedSchema) {
+    seastar::async([] {
+        ScopedShardedEngine eng;
+        eng.start();
+        cluster::EngineLocalStore store(*eng);
+
+        data::WriteBatch b;
+        b.series = {floatS(), stringS()};  // measurements "temp"/value and "log"/msg
+        store.applyWrites(std::move(b)).get();
+
+        auto meas = store.queryMetadata({data::MetadataKind::Measurements, "", "", ""}).get();
+        std::sort(meas.items.begin(), meas.items.end());
+        EXPECT_EQ(meas.items, (std::vector<std::string>{"log", "temp"}));
+
+        auto fields = store.queryMetadata({data::MetadataKind::Fields, "temp", "", ""}).get();
+        EXPECT_EQ(fields.items, (std::vector<std::string>{"value"}));
+
+        auto card = store.queryMetadata({data::MetadataKind::MeasurementCardinality, "temp", "", ""}).get();
+        EXPECT_GE(card.cardinality, 1.0);  // at least the one series
+    }).get();
+}
