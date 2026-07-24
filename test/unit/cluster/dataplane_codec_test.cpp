@@ -30,6 +30,19 @@ TEST(DataPlaneCodecTest, QuerySpecRoundTrip) {
     EXPECT_EQ(back->series.size(), 2u);
 }
 
+TEST(DataPlaneCodecTest, QuerySpecBogusMethodRejected) {
+    // A frame whose method byte is past AggMethod::Max(5) must decode to nullopt,
+    // never an out-of-range enumerator reaching queryLocal.
+    std::string wire = encodeQuerySpec(QuerySpec{10, 20, AggMethod::Max, {}});
+    wire[16] = static_cast<char>(200);  // method byte = after startTime(8)+endTime(8)
+    EXPECT_FALSE(decodeQuerySpec(wire).has_value());
+    wire[16] = static_cast<char>(6);  // one past Max
+    EXPECT_FALSE(decodeQuerySpec(wire).has_value());
+    wire[16] = static_cast<char>(5);  // Max is still valid
+    ASSERT_TRUE(decodeQuerySpec(wire).has_value());
+    EXPECT_EQ(decodeQuerySpec(wire)->method, AggMethod::Max);
+}
+
 TEST(DataPlaneCodecTest, QueryPartialRoundTrip) {
     QueryPartial part;
     part.raw = {{sid("x"), 1, 2.0}};

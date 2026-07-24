@@ -40,6 +40,7 @@ file(GLOB_RECURSE UNIT_CLUSTER_TESTS CONFIGURE_DEPENDS unit/cluster/*.cpp)
 set(UNIT_CLUSTER_SOCKET_TESTS
     ${CMAKE_CURRENT_SOURCE_DIR}/unit/cluster/raft_rpc_transport_test.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/unit/cluster/raft_group_registry_test.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/unit/cluster/dataplane_rpc_test.cpp
 )
 list(REMOVE_ITEM UNIT_CLUSTER_TESTS ${UNIT_CLUSTER_SOCKET_TESTS})
 file(GLOB_RECURSE UNIT_RETENTION_TESTS CONFIGURE_DEPENDS unit/retention/*.cpp)

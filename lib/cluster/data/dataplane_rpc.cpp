@@ -3,9 +3,12 @@
 #include "dataplane_codec.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <seastar/core/coroutine.hh>
+#include <seastar/core/reactor.hh>
 #include <seastar/core/sstring.hh>
+#include <seastar/net/api.hh>
 #include <seastar/rpc/rpc.hh>
 #include <stdexcept>
 
@@ -36,12 +39,17 @@ constexpr uint64_t kQueryRemote = 2;    // sstring -> sstring (waited: returns p
 }  // namespace
 
 struct DataPlaneRpc::Impl {
+    using Client = seastar::rpc::protocol<DpSerializer>::client;
     seastar::rpc::protocol<DpSerializer> proto{DpSerializer{}};
     std::unique_ptr<seastar::rpc::protocol<DpSerializer>::server> server;
     std::map<NodeId, seastar::socket_address> peers;
-    std::map<NodeId, std::unique_ptr<seastar::rpc::protocol<DpSerializer>::client>> clients;
+    std::map<NodeId, std::unique_ptr<Client>> clients;
     LocalStore* sink = nullptr;
     bool stopping = false;
+    // Client stubs are created ONCE (a stub allocated per concurrent call can
+    // corrupt reply routing / message-id bookkeeping). Reused for every call.
+    std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> forwardStub;
+    std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> queryStub;
 
     seastar::rpc::protocol<DpSerializer>::client* clientFor(NodeId to) {
         if (auto it = clients.find(to); it != clients.end())
@@ -86,8 +94,22 @@ seastar::future<> DataPlaneRpc::start(seastar::socket_address local, LocalStore&
             return seastar::sstring(enc.data(), enc.size());
         });
     });
-    impl_->server =
-        std::make_unique<seastar::rpc::protocol<DpSerializer>::server>(impl_->proto, local);
+    impl_->forwardStub = impl_->proto.make_client<seastar::sstring(seastar::sstring)>(kForwardWrites);
+    impl_->queryStub = impl_->proto.make_client<seastar::sstring(seastar::sstring)>(kQueryRemote);
+    // Pin the listening socket to THIS shard. seastar's default listen policy
+    // (connection_distribution) scatters incoming connections across every shard,
+    // but this rpc server object lives on one shard only -- a connection accepted
+    // on any other shard has no server behind it and the peer's WAITED call hangs
+    // forever (nondeterministically, since the scatter is by shard load). Fixing
+    // the accept CPU to the server's shard keeps every connection on the shard
+    // that can actually answer. (Raft's transport dodged this only because it is
+    // no_wait -- it never blocks on a reply -- so a dropped connection was silently
+    // retried instead of hanging.)
+    seastar::listen_options lo;
+    lo.reuse_address = true;
+    lo.set_fixed_cpu(seastar::this_shard_id());
+    impl_->server = std::make_unique<seastar::rpc::protocol<DpSerializer>::server>(
+        impl_->proto, seastar::listen(local, lo));
     return seastar::make_ready_future<>();
 }
 
@@ -98,8 +120,7 @@ seastar::future<> DataPlaneRpc::forwardWrites(NodeId to, std::vector<DataPoint> 
     if (!conn)
         throw std::runtime_error("dataplane: unknown peer");
     std::string bytes = encodePoints(points);
-    auto call = impl_->proto.make_client<seastar::sstring(seastar::sstring)>(kForwardWrites);
-    co_await call(*conn, seastar::sstring(bytes.data(), bytes.size()));  // waited: applied on peer
+    co_await impl_->forwardStub(*conn, seastar::sstring(bytes.data(), bytes.size()));  // waited
 }
 
 seastar::future<QueryPartial> DataPlaneRpc::queryRemote(NodeId to, QuerySpec spec) {
@@ -109,8 +130,7 @@ seastar::future<QueryPartial> DataPlaneRpc::queryRemote(NodeId to, QuerySpec spe
     if (!conn)
         throw std::runtime_error("dataplane: unknown peer");
     std::string bytes = encodeQuerySpec(spec);
-    auto call = impl_->proto.make_client<seastar::sstring(seastar::sstring)>(kQueryRemote);
-    seastar::sstring reply = co_await call(*conn, seastar::sstring(bytes.data(), bytes.size()));
+    seastar::sstring reply = co_await impl_->queryStub(*conn, seastar::sstring(bytes.data(), bytes.size()));
     auto part = decodeQueryPartial(std::string(reply.data(), reply.size()));
     if (!part)
         throw std::runtime_error("dataplane: malformed query partial");

@@ -119,7 +119,14 @@ std::optional<QuerySpec> decodeQuerySpec(const std::string& bytes) {
     QuerySpec spec;
     spec.startTime = r.u64();
     spec.endTime = r.u64();
-    spec.method = static_cast<AggMethod>(r.u8());
+    // Validate the method byte before casting: the codec's contract is that a
+    // corrupt/hostile frame can never fabricate an out-of-range enum. AggMethod
+    // runs Raw(0)..Max(5); reject anything past it rather than let it reach
+    // queryLocal as an undefined enumerator.
+    uint8_t methodByte = r.u8();
+    if (!r.ok || methodByte > static_cast<uint8_t>(AggMethod::Max))
+        return std::nullopt;
+    spec.method = static_cast<AggMethod>(methodByte);
     uint32_t n = r.u32();
     if (!r.ok || n > static_cast<uint64_t>(r.end - r.p) / 16)
         return std::nullopt;
