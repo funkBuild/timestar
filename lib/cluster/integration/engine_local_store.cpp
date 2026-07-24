@@ -161,15 +161,20 @@ seastar::future<bool> EngineLocalStore::applyDelete(std::string seriesKey, uint6
 }
 
 seastar::future<data::NodeQueryPartial> EngineLocalStore::queryLocal(data::NodeQueryRequest req) {
+    // Produce this node's UNFINALIZED partials (F.5b): the coordinator unions them
+    // with peers' partials and finalizes ONCE, so cross-node group-by / spread are
+    // correct. A local early-exit (incomplete/timeout/limit) becomes an
+    // incompleteReason, fail-closed -- never a silent empty success.
     http::HttpQueryHandler handler(&engines_);
-    QueryResponse resp = co_await handler.executeQuery(std::move(req.request));
+    http::HttpQueryHandler::NodePartials np = co_await handler.queryLocalPartials(std::move(req.request));
     data::NodeQueryPartial partial;
-    if (!resp.success) {
-        partial.incompleteReasons.push_back(resp.errorMessage.empty() ? std::string("query failed")
-                                                                       : resp.errorMessage);
+    if (!np.ok) {
+        partial.incompleteReasons.push_back(
+            np.errorResponse.errorMessage.empty() ? std::string("query failed") : np.errorResponse.errorMessage);
         co_return partial;
     }
-    partial.series = std::move(resp.series);
+    partial.partials = std::move(np.partials);
+    partial.nonNumeric = std::move(np.nonNumeric);
     co_return partial;
 }
 

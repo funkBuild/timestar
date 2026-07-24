@@ -124,6 +124,18 @@ TEST_F(DataPlaneRpcEnrichedTest, WriteBatchAndQueryNodeOverRealSocket) {
         // Forward over the socket; resolves only after the owner durably applied.
         rpc.forwardWriteBatch(self, batch).get();
 
+        http::HttpQueryHandler handler(&*eng);
+        // queryNode returns UNFINALIZED partials; the coordinator finalizes them. We
+        // finalize here and assert the socket-shipped partials produce the same
+        // answer as executeQuery would -- the real F.5b cluster query round-trip.
+        auto finalizeSocket = [&](data::NodeQueryRequest req) {
+            data::NodeQueryPartial viaSocket = rpc.queryNode(self, req).get();
+            EXPECT_TRUE(viaSocket.incompleteReasons.empty());
+            return handler
+                .finalizeClusterPartials(req.request, std::move(viaSocket.partials), std::move(viaSocket.nonNumeric))
+                .get();
+        };
+
         // (1) Non-numeric read over the socket == the string written.
         {
             data::NodeQueryRequest req;
@@ -133,20 +145,18 @@ TEST_F(DataPlaneRpcEnrichedTest, WriteBatchAndQueryNodeOverRealSocket) {
             req.request.startTime = BASE - 1'000'000'000ULL;
             req.request.endTime = BASE + 1'000'000'000ULL;
 
-            data::NodeQueryPartial viaSocket = rpc.queryNode(self, req).get();
-            data::NodeQueryPartial inProcess = store.queryLocal(req).get();
-
-            EXPECT_TRUE(viaSocket.incompleteReasons.empty());
-            ASSERT_EQ(viaSocket.series.size(), 1u);
-            ASSERT_EQ(inProcess.series.size(), 1u);
-            EXPECT_EQ(stringsOf(viaSocket.series[0], "msg"), (std::vector<std::string>{"over the wire"}));
-            // Socket answer is byte-for-byte the in-process answer.
-            EXPECT_EQ(stringsOf(viaSocket.series[0], "msg"), stringsOf(inProcess.series[0], "msg"));
+            QueryResponse got = finalizeSocket(req);
+            QueryResponse direct = handler.executeQuery(req.request).get();
+            ASSERT_TRUE(got.success) << got.errorMessage;
+            ASSERT_EQ(got.series.size(), 1u);
+            EXPECT_EQ(stringsOf(got.series[0], "msg"), (std::vector<std::string>{"over the wire"}));
+            ASSERT_EQ(direct.series.size(), 1u);
+            EXPECT_EQ(stringsOf(got.series[0], "msg"), stringsOf(direct.series[0], "msg"));
         }
 
-        // (2) spread by {region}: max-min across the two series at BASE = 20, and the
-        // socket answer equals the in-process answer (the round-trip must not change
-        // a fold-of-one-non-identity method).
+        // (2) spread by {region}: max-min across the two series at BASE = 20, over the
+        // wire -- the cross-series/cross-node fold-of-one-non-identity method that
+        // finalized SeriesResult partials could NOT express.
         {
             data::NodeQueryRequest req;
             req.request.aggregation = AggregationMethod::SPREAD;
@@ -156,15 +166,12 @@ TEST_F(DataPlaneRpcEnrichedTest, WriteBatchAndQueryNodeOverRealSocket) {
             req.request.startTime = BASE - 1'000'000'000ULL;
             req.request.endTime = BASE + 1'000'000'000ULL;
 
-            data::NodeQueryPartial viaSocket = rpc.queryNode(self, req).get();
-            data::NodeQueryPartial inProcess = store.queryLocal(req).get();
-
-            EXPECT_TRUE(viaSocket.incompleteReasons.empty());
-            ASSERT_EQ(viaSocket.series.size(), 1u);
-            EXPECT_EQ(viaSocket.series[0].tags.at("region"), "west");
-            ASSERT_EQ(doublesOf(viaSocket.series[0], "v").size(), 1u);
-            EXPECT_DOUBLE_EQ(doublesOf(viaSocket.series[0], "v")[0], 20.0);
-            EXPECT_EQ(doublesOf(viaSocket.series[0], "v"), doublesOf(inProcess.series[0], "v"));
+            QueryResponse got = finalizeSocket(req);
+            ASSERT_TRUE(got.success) << got.errorMessage;
+            ASSERT_EQ(got.series.size(), 1u);
+            EXPECT_EQ(got.series[0].tags.at("region"), "west");
+            ASSERT_EQ(doublesOf(got.series[0], "v").size(), 1u);
+            EXPECT_DOUBLE_EQ(doublesOf(got.series[0], "v")[0], 20.0);
         }
 
         rpc.stop().get();

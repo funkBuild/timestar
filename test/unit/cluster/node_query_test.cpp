@@ -43,26 +43,41 @@ TEST(NodeQueryCodec, RequestRoundTripIncludingCompatFields) {
     EXPECT_EQ(back->mapEpoch, 7u);
 }
 
-TEST(NodeQueryCodec, PartialRoundTripsAllFieldValueTypes) {
+TEST(NodeQueryCodec, PartialRoundTripsPartialsAndNonNumeric) {
     NodeQueryPartial p;
+    // A numeric partial (the unfinalized wire form) in the partials vector.
+    timestar::PartialAggregationResult pa;
+    pa.measurement = "m";
+    pa.fieldName = "v";
+    pa.groupKey = std::string("m\0region=west\0v", 15);
+    pa.groupKeyHash = std::hash<std::string>{}(pa.groupKey);
+    pa.cachedTags = {{"region", "west"}};
+    {
+        timestar::AggregationState st;
+        st.addValue(10.0, 5);
+        st.addValue(30.0, 5);
+        pa.bucketStates[5] = st;
+    }
+    p.partials.push_back(pa);
+    // Non-numeric (string/bool) series pass through untouched.
     SeriesResult s;
     s.measurement = "m";
     s.tags = {{"host", "h1"}};
-    s.fields["f_dbl"] = {{10, 20}, FieldValues{std::vector<double>{1.5, -2.5}}};
-    s.fields["f_int"] = {{10}, FieldValues{std::vector<int64_t>{9007199254740993LL}}};
     s.fields["f_str"] = {{10}, FieldValues{std::vector<std::string>{"hello, cluster"}}};
     s.fields["f_bool"] = {{10, 20, 30}, FieldValues{std::vector<bool>{true, false, true}}};
-    p.series.push_back(s);
+    p.nonNumeric.push_back(s);
     p.incompleteReasons.push_back("vshard 9 unreachable");
 
     auto back = decodeNodeQueryPartial(encodeNodeQueryPartial(p));
     ASSERT_TRUE(back.has_value());
-    ASSERT_EQ(back->series.size(), 1u);
-    const auto& r = back->series[0];
-    EXPECT_EQ(r.measurement, "m");
+    ASSERT_EQ(back->partials.size(), 1u);
+    EXPECT_EQ(back->partials[0].groupKey, pa.groupKey);
+    EXPECT_EQ(back->partials[0].cachedTags.at("region"), "west");
+    ASSERT_EQ(back->partials[0].bucketStates.count(5), 1u);
+    EXPECT_EQ(back->partials[0].bucketStates.at(5).count, 2u);
+    ASSERT_EQ(back->nonNumeric.size(), 1u);
+    const auto& r = back->nonNumeric[0];
     EXPECT_EQ(r.tags.at("host"), "h1");
-    EXPECT_EQ(std::get<std::vector<double>>(r.fields.at("f_dbl").second)[1], -2.5);
-    EXPECT_EQ(std::get<std::vector<int64_t>>(r.fields.at("f_int").second)[0], 9007199254740993LL);
     EXPECT_EQ(std::get<std::vector<std::string>>(r.fields.at("f_str").second)[0], "hello, cluster");
     EXPECT_EQ(std::get<std::vector<bool>>(r.fields.at("f_bool").second).size(), 3u);
     EXPECT_EQ(back->incompleteReasons, (std::vector<std::string>{"vshard 9 unreachable"}));
@@ -80,8 +95,8 @@ TEST(NodeQueryCodec, TruncationRejected) {
     NodeQueryPartial p;
     SeriesResult s;
     s.measurement = "m";
-    s.fields["v"] = {{1}, FieldValues{std::vector<double>{1.0}}};
-    p.series.push_back(s);
+    s.fields["v"] = {{1}, FieldValues{std::vector<std::string>{"x"}}};
+    p.nonNumeric.push_back(s);
     std::string pfull = encodeNodeQueryPartial(p);
     ASSERT_TRUE(decodeNodeQueryPartial(pfull).has_value());
     for (size_t n = 0; n < pfull.size(); ++n)

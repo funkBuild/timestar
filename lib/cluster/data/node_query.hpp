@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../../http/http_query_handler.hpp"  // http::SeriesResult, QueryResponse
+#include "../../query/aggregator.hpp"          // PartialAggregationResult
 #include "../../query/query_parser.hpp"        // QueryRequest, AggregationMethod
 
 #include <cstdint>
@@ -9,6 +10,8 @@
 #include <vector>
 
 namespace timestar::data {
+
+using timestar::PartialAggregationResult;
 
 // The inter-node query request (integration plan F.2). Production cluster queries
 // fan out the REAL parsed query (measurement, scopes, fields, groupBy, interval,
@@ -21,10 +24,14 @@ struct NodeQueryRequest {
     uint64_t mapEpoch = 0;          // pinned placement epoch
 };
 
-// One node's partial answer: its local per-series results (the same SeriesResult
-// the HTTP handler produces) plus fail-closed accounting.
+// One node's UNFINALIZED partial answer (integration plan F.5b): its per-core
+// numeric partials (merged coordinator-side via mergePartialAggregationsGrouped so
+// cross-node group-by / spread are correct) plus non-numeric series (passthrough)
+// plus fail-closed accounting. This replaces the earlier finalized-SeriesResult
+// form, which could not express a cross-node aggregation partial.
 struct NodeQueryPartial {
-    std::vector<timestar::http::SeriesResult> series;
+    std::vector<PartialAggregationResult> partials;
+    std::vector<timestar::http::SeriesResult> nonNumeric;
     std::vector<std::string> incompleteReasons;  // non-empty => QUERY_INCOMPLETE
 };
 

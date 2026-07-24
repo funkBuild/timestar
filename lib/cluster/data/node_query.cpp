@@ -1,6 +1,7 @@
 #include "node_query.hpp"
 
 #include "../../core/field_values.hpp"  // FieldValues
+#include "agg_partial_codec.hpp"        // encodePartials/decodePartials
 
 #include <cstring>
 
@@ -281,8 +282,13 @@ std::optional<NodeQueryRequest> decodeNodeQueryRequest(const std::string& bytes)
 
 std::string encodeNodeQueryPartial(const NodeQueryPartial& partial) {
     Writer w;
-    w.u32(static_cast<uint32_t>(partial.series.size()));
-    for (const auto& s : partial.series) {
+    // Numeric partials as a length-prefixed sub-blob (encodePartials carries its
+    // own FNV; str() gives it a bounds-checked length prefix here).
+    w.str(encodePartials(partial.partials));
+    // Non-numeric series (passthrough, one field per series), same wire shape as
+    // before.
+    w.u32(static_cast<uint32_t>(partial.nonNumeric.size()));
+    for (const auto& s : partial.nonNumeric) {
         w.str(s.measurement);
         w.strmap(s.tags);
         w.u32(static_cast<uint32_t>(s.fields.size()));
@@ -304,12 +310,21 @@ std::optional<NodeQueryPartial> decodeNodeQueryPartial(const std::string& bytes)
         return std::nullopt;
     Reader r{bytes.data(), bytes.data() + bodyLen};
     NodeQueryPartial partial;
+    // Numeric partials sub-blob (its own FNV verified inside decodePartials).
+    std::string partialsBlob = r.str();
+    if (!r.ok)
+        return std::nullopt;
+    auto decodedPartials = decodePartials(partialsBlob);
+    if (!decodedPartials)
+        return std::nullopt;
+    partial.partials = std::move(*decodedPartials);
+
     uint32_t ns = r.u32();
     // Min bytes per SeriesResult: measurement len(4) + tags count(4) + fields
     // count(4) = 12. Bounds the reserve; every field read below is still avail-checked.
     if (!r.ok || ns > static_cast<uint64_t>(r.end - r.p) / 12)
         return std::nullopt;
-    partial.series.reserve(ns);
+    partial.nonNumeric.reserve(ns);
     for (uint32_t i = 0; i < ns; ++i) {
         timestar::http::SeriesResult s;
         s.measurement = r.str();
@@ -334,7 +349,7 @@ std::optional<NodeQueryPartial> decodeNodeQueryPartial(const std::string& bytes)
         }
         if (!r.ok)
             return std::nullopt;
-        partial.series.push_back(std::move(s));
+        partial.nonNumeric.push_back(std::move(s));
     }
     partial.incompleteReasons = r.strvec();
     if (!r.ok || r.p != r.end)
