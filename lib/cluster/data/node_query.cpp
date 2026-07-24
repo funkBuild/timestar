@@ -142,6 +142,11 @@ void encodeRequest(Writer& w, const timestar::QueryRequest& q) {
     w.u64(q.aggregationInterval);
     w.u64(q.bucketAnchor);
     w.u8(q.booleansAsNumeric ? 1 : 0);
+    // Read consistency (M4): the serving node needs the mode to decide whether it may
+    // answer as a replica and how fresh it must be, so it MUST cross the wire (like
+    // every other field that changes behaviour).
+    w.u8(static_cast<uint8_t>(q.readConsistency));
+    w.u64(q.maxReadLagIndex);
 }
 
 bool decodeRequest(Reader& r, timestar::QueryRequest& q) {
@@ -161,6 +166,13 @@ bool decodeRequest(Reader& r, timestar::QueryRequest& q) {
     q.aggregationInterval = r.u64();
     q.bucketAnchor = r.u64();
     q.booleansAsNumeric = r.u8() != 0;
+    // Range-check the consistency mode like the method: a checksum-valid but hostile
+    // byte must not yield an out-of-range scoped enum. BoundedStaleness is the last.
+    uint8_t consistency = r.u8();
+    if (!r.ok || consistency > static_cast<uint8_t>(timestar::ReadConsistencyMode::BoundedStaleness))
+        return false;
+    q.readConsistency = static_cast<timestar::ReadConsistencyMode>(consistency);
+    q.maxReadLagIndex = r.u64();
     return r.ok;
 }
 
