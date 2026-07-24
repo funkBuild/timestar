@@ -23,12 +23,15 @@
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <ranges>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/sleep.hh>
 #include <seastar/core/thread.hh>
 #include <seastar/core/when_all.hh>
 #include <seastar/core/with_scheduling_group.hh>
+#include <seastar/util/file.hh>
+#include <set>
 #include <unordered_set>
 #include <variant>
 #include <vector>
@@ -215,6 +218,95 @@ seastar::future<bool> Engine::restoreVShardSnapshot(const timestar::VShardSnapsh
     const bool ok = co_await timestar::restoreVShardSnapshot(manifest, files, std::move(targets));
     for (const auto& f : files)
         co_await f->close();
+    co_return ok;
+}
+
+seastar::future<std::pair<timestar::VShardSnapshotManifest, std::vector<std::pair<std::string, std::string>>>>
+Engine::buildVShardSnapshotFiles(timestar::VShardId vshard, std::string catalogHash) {
+    // The manifest already carries the resolved-view verification hash and the extents
+    // (one fileId per contributing file for this VShard). We then read each referenced
+    // file's raw bytes so the snapshot is self-contained on the wire.
+    auto manifest = co_await createVShardSnapshot(vshard, std::move(catalogHash));
+
+    const auto& sequenced = tsmFileManager.getSequencedTsmFiles();
+    std::vector<std::pair<std::string, std::string>> files;
+    std::set<uint64_t> seen;  // extents are one-per-file for a VShard, but dedupe defensively
+    for (const auto& ext : manifest.dataExtents) {
+        if (!seen.insert(ext.fileId).second)
+            continue;
+        auto it = sequenced.find(ext.fileId);
+        if (it == sequenced.end() || !it->second)
+            // The manifest was just built from this same file set; a missing fileId
+            // means a file vanished mid-snapshot. Fail rather than ship a partial.
+            throw std::runtime_error("buildVShardSnapshotFiles: manifest references missing fileId " +
+                                     std::to_string(ext.fileId));
+        const std::string path = it->second->getFilePath();
+        std::string name = std::filesystem::path(path).filename().string();
+        seastar::sstring bytes = co_await seastar::util::read_entire_file_contiguous(path);
+        files.emplace_back(std::move(name), std::string(bytes.data(), bytes.size()));
+    }
+    co_return std::make_pair(std::move(manifest), std::move(files));
+}
+
+seastar::future<bool> Engine::installVShardSnapshotFiles(
+    const timestar::VShardSnapshotManifest& manifest,
+    std::vector<std::pair<std::string, std::string>> files) {
+    const auto tsmDir = layout_.tsmDir(shardId);
+    // Stage each shipped file in a temp SUBDIR under its ORIGINAL name: restore opens
+    // the source path as a ::TSM, whose ctor parses tier/seq from the FILENAME, so a
+    // mangled temp name (e.g. a ".tmp" suffix) would corrupt that parse and fail
+    // verification. A dedicated subdir keeps the staged copy from colliding with the
+    // install target (tsmDir/name). restoreVShardSnapshot COPIES source->target (does
+    // not consume the source), so we always remove the staging dir afterwards.
+    const auto stageDir = tsmDir / "snapin_tmp";
+    co_await seastar::async([&stageDir] {
+        std::error_code ec;
+        std::filesystem::remove_all(stageDir, ec);  // clear any stale staging from a prior crash
+        std::filesystem::create_directories(stageDir);
+    });
+    std::vector<std::string> tempPaths;
+    std::vector<std::string> names;
+    tempPaths.reserve(files.size());
+    names.reserve(files.size());
+    for (auto& [name, bytes] : files) {
+        const std::string tmp = (stageDir / name).string();
+        co_await seastar::async([&tmp, &bytes] {
+            std::ofstream o(tmp, std::ios::binary | std::ios::trunc);
+            if (!o)
+                throw std::runtime_error("installVShardSnapshotFiles: cannot open temp " + tmp);
+            o.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+            o.flush();
+            if (!o)
+                throw std::runtime_error("installVShardSnapshotFiles: write failed for " + tmp);
+        });
+        tempPaths.push_back(tmp);
+        names.push_back(name);
+    }
+
+    bool ok = false;
+    std::exception_ptr err;
+    try {
+        ok = co_await restoreVShardSnapshot(manifest, tempPaths, names);
+        if (ok)
+            // restoreVShardSnapshot only writes the files to disk; a running Engine
+            // does not see them until they are registered in the TSMFileManager (this
+            // is what Engine::init does for pre-existing files). Without this, an
+            // installed snapshot is invisible to queries. Open each installed target
+            // (open + sparse index) and hand it to the manager.
+            for (const auto& name : names) {
+                auto tsm = co_await openTsmForVShardOp((tsmDir / name).string());
+                co_await tsmFileManager.addTSMFile(tsm);
+            }
+    } catch (...) {
+        err = std::current_exception();
+    }
+    // Always clean up the staging dir (restore copied, not moved).
+    co_await seastar::async([&stageDir] {
+        std::error_code ec;
+        std::filesystem::remove_all(stageDir, ec);
+    });
+    if (err)
+        std::rethrow_exception(err);
     co_return ok;
 }
 
