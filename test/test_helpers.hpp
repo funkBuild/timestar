@@ -128,6 +128,20 @@ public:
             .get();
     }
 
+    // Start with an ISOLATED data root (its own dir/shard_N tree) so multiple
+    // engines can coexist in one process -- required for RF=3 tests where each
+    // replica is a real Engine and replicas cannot share shard_N directories.
+    void startAt(const std::string& dir) {
+        std::filesystem::create_directories(dir);
+        eng.start(timestar::StorageLayout(dir).anchored()).get();
+        eng.invoke_on_all([](Engine& engine) { return engine.init(); }).get();
+        eng.invoke_on_all([this](Engine& engine) {
+               engine.setShardedRef(&eng);
+               return seastar::make_ready_future<>();
+           })
+            .get();
+    }
+
     void startWithBackground() {
         eng.start(timestar::StorageLayout(".")).get();
         eng.invoke_on_all([](Engine& engine) { return engine.init(); }).get();

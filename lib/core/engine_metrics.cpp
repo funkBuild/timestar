@@ -7,9 +7,15 @@ namespace sm = seastar::metrics;
 namespace timestar {
 
 void EngineMetrics::setup(Engine& engine) {
-    _metrics.add_group(
-        "timestar",
-        {
+    // Seastar metric names are unique per shard's registry. In production exactly one
+    // Engine exists per process, so this registers cleanly. Multi-engine-in-process
+    // (RF=3 tests instantiate one real Engine per replica) would re-register the same
+    // names on a shard and throw; the first registration wins and later replicas keep
+    // their own live counters without exporting them. Swallow only that collision.
+    try {
+        _metrics.add_group(
+            "timestar",
+            {
             // Counters
             sm::make_counter("inserts_total", inserts_total, sm::description("Total insert operations")),
             sm::make_counter("insert_points_total", insert_points_total, sm::description("Total data points inserted")),
@@ -55,7 +61,11 @@ void EngineMetrics::setup(Engine& engine) {
                 "index_series_count",
                 [&engine] { return static_cast<int64_t>(engine.getIndex().getSeriesCountSync()); },
                 sm::description("Number of indexed series on this shard")),
-        });
+            });
+    } catch (const std::exception&) {
+        // Duplicate registration by a second in-process Engine on this shard
+        // (RF=3 test harness). Never happens with one Engine per process.
+    }
 }
 
 }  // namespace timestar
