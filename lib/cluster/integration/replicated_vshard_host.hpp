@@ -45,6 +45,14 @@ public:
     // + apply, false if this node is not the leader (caller redirects to the leader).
     seastar::future<bool> propose(uint16_t vshard, const data::ReplicatedCommand& cmd);
 
+    // The write-path entry point: split a WriteBatch by VShard and replicate each
+    // group through its Raft group. This node must LEAD every VShard in the batch
+    // (the write router groups by leader node before forwarding here). Resolves true
+    // only if every group committed; a false from any group (leadership lost) makes
+    // the caller retry against the current leader. Series whose VShard this node does
+    // not host are a routing error (throws).
+    seastar::future<bool> proposeBatch(data::WriteBatch batch);
+
     raft::RaftGroup* group(uint16_t vshard);
     raft::RaftGroupRegistry& registry() { return registry_; }
     size_t vshardCount() const { return vshards_.size(); }

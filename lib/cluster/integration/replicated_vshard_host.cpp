@@ -1,5 +1,7 @@
 #include "replicated_vshard_host.hpp"
 
+#include "../../core/placement_table.hpp"  // virtualShard
+#include "../../core/vshard.hpp"
 #include "../raft/raft_node.hpp"
 
 #include <seastar/core/coroutine.hh>
@@ -51,6 +53,27 @@ seastar::future<bool> ReplicatedVShardHost::propose(uint16_t vshard, const data:
     if (!g)
         throw std::runtime_error("ReplicatedVShardHost::propose: VShard not hosted here");
     return g->proposeAndAwaitApplied(data::encodeReplicatedCommand(cmd));
+}
+
+seastar::future<bool> ReplicatedVShardHost::proposeBatch(data::WriteBatch batch) {
+    // Group the batch's series by VShard (a series routes to its VShard by hash,
+    // same authority every replica uses). schemaVersion is carried per group.
+    std::map<uint16_t, data::WriteBatch> byVShard;
+    for (auto& s : batch.series) {
+        const uint16_t vs = timestar::virtualShard(SeriesId128::fromSeriesKey(s.seriesKey));
+        if (!registry_.group(vs))
+            throw std::runtime_error("ReplicatedVShardHost::proposeBatch: VShard not led here");
+        data::WriteBatch& dest = byVShard[vs];
+        dest.schemaVersion = batch.schemaVersion;
+        dest.series.push_back(std::move(s));
+    }
+    // Replicate each VShard group; every group must commit for the batch to ack.
+    bool allOk = true;
+    for (auto& [vs, b] : byVShard) {
+        const bool ok = co_await propose(vs, data::ReplicatedCommand{std::move(b)});
+        allOk = allOk && ok;
+    }
+    co_return allOk;
 }
 
 raft::RaftGroup* ReplicatedVShardHost::group(uint16_t vshard) {
