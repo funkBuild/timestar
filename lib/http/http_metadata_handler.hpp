@@ -3,6 +3,9 @@
 #include "engine.hpp"
 #include "logger.hpp"
 
+#include "../cluster/data/node_metadata.hpp"
+
+#include <functional>
 #include <memory>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
@@ -24,6 +27,15 @@ public:
     };
 
     HttpMetadataHandler(seastar::sharded<Engine>* _engineSharded);
+
+    // Partitioned-cluster metadata hook (M2). When set (by the server in
+    // cluster.partitioned mode), the metadata endpoints source their data by
+    // scattering to VShard owners + merging, instead of reading the local schema
+    // (which in partitioned mode only covers this node's owned series). Unset
+    // (default) => single-node / M1 path, unchanged.
+    static inline std::function<seastar::future<timestar::data::MetadataResult>(timestar::data::MetadataRequest)>
+        clusterMetadataHook{};
+    static bool partitioned() { return static_cast<bool>(clusterMetadataHook); }
 
     void registerRoutes(seastar::httpd::routes& r, std::string_view authToken = "");
 

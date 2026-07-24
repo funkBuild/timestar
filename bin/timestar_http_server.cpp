@@ -465,6 +465,11 @@ int main(int argc, char** argv) {
                         return seastar::smp::submit_to(
                             0u, [b = std::move(b)]() mutable { return g_clusterDataPlane.write(std::move(b)); });
                     };
+                    // Route metadata endpoints through the scatter+merge.
+                    timestar::http::HttpMetadataHandler::clusterMetadataHook = [](timestar::data::MetadataRequest r) {
+                        return seastar::smp::submit_to(
+                            0u, [r = std::move(r)]() mutable { return g_clusterDataPlane.metadata(std::move(r)); });
+                    };
                     timestar::http_log.info("VShard-partitioned data plane started (node {})", cc.node_id);
                 }
             }

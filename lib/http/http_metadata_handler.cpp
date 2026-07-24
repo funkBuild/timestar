@@ -158,8 +158,15 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::hand
     try {
         timestar::http_log.debug("Processing /measurements request");
 
-        // Schema caches are populated on all shards via broadcast, so query locally
-        auto measurements = co_await engineSharded->local().getAllMeasurements();
+        // Partitioned cluster: union measurements across owner nodes; else local
+        // (schema caches are populated on all shards via broadcast).
+        std::vector<std::string> measurements;
+        if (clusterMetadataHook) {
+            auto res = co_await clusterMetadataHook({timestar::data::MetadataKind::Measurements, "", "", ""});
+            measurements = std::move(res.items);
+        } else {
+            measurements = co_await engineSharded->local().getAllMeasurements();
+        }
 
         // Apply filters if specified
         // Note: prefix is only used for starts_with comparison, so null bytes or other
