@@ -5,8 +5,11 @@
 // no duplicate, no split brain. This is the Phase-5 RF=3 gate re-proven with the
 // enriched command over the real Engine (not the toy store).
 #include "../../../lib/cluster/integration/engine_data_state_machine.hpp"
+#include "../../../lib/cluster/integration/replica_engine_coordinator.hpp"
+#include "../../../lib/cluster/integration/replica_engine_reader.hpp"
 #include "../../../lib/cluster/raft/raft_group.hpp"
 #include "../../../lib/cluster/raft/raft_journal_persistence.hpp"
+#include "../../../lib/core/placement_table.hpp"  // virtualShard
 #include "../../../lib/http/http_query_handler.hpp"
 #include "../../../lib/storage/journal_segment.hpp"
 #include "../../../lib/utils/series_key.hpp"
@@ -221,6 +224,127 @@ TEST_F(EngineRf3Test, ThreeRealEnginesConvergeUnderPartition) {
             r.writer->close().get();
         }
         reps.clear();  // engines stopped in ScopedShardedEngine dtor
+        for (auto& d : journalDirs)
+            fs::remove_all(d);
+        for (auto& d : engineDirs)
+            fs::remove_all(d);
+    }).get();
+}
+
+// M4 cross-node gate (in-process, the same harness style M3 was proven on): a
+// FOLLOWER replica serves a linearizable read after confirming the leader's
+// ReadIndex, coordinated across nodes with exactly-once contribution. Proves the
+// replica-read path end to end over three real engines + Raft groups -- the multi-
+// node behaviour the docker suite gates, verified here without sockets.
+TEST_F(EngineRf3Test, ReplicaReadServesFromFollowerAcrossNodes) {
+    seastar::async([] {
+        const std::vector<NodeId> voters = {1, 2, 3};
+        const NodeId leader = 1;
+        Router router;
+        std::map<NodeId, Replica> reps;
+        std::vector<fs::path> journalDirs, engineDirs;
+
+        auto tick = [&](int rounds) {
+            for (int i = 0; i < rounds; ++i) {
+                for (auto& [id, r] : reps)
+                    if (r.group)
+                        r.group->tick().get();
+                router.pump().get();
+            }
+        };
+        auto drive = [&](auto& f, int rounds) {
+            for (int i = 0; i < rounds && !f.available(); ++i) {
+                router.pump().get();
+                for (auto& [id, r] : reps)
+                    if (r.group)
+                        r.group->tick().get();
+                router.pump().get();
+            }
+        };
+
+        for (NodeId id : voters) {
+            Replica r;
+            fs::path edir = tmpDir("rreng" + std::to_string(id));
+            engineDirs.push_back(edir);
+            r.engine = std::make_unique<ScopedShardedEngine>();
+            r.engine->startAt(edir.string());
+            r.store = std::make_unique<cluster::EngineLocalStore>(**r.engine);
+            r.sm = std::make_unique<cluster::EngineDataStateMachine>(*r.store, timestar::VShardId{1});
+            fs::path jdir = tmpDir("rrj" + std::to_string(id));
+            journalDirs.push_back(jdir);
+            r.writer = std::make_unique<JournalWriter>(jdir, header(), 1u << 20);
+            auto recovered = r.writer->open().get();
+            RecoveredRaftState st = recoverRaftState(recovered, VShardId{1});
+            r.persistence = std::make_unique<JournalRaftPersistence>(*r.writer, VShardId{1}, st.nextSeq);
+            r.transport = std::make_unique<RouterTransport>(router);
+            RaftNode node(id, voters, std::move(st.log), st.hardState, optsFor(id, leader), {});
+            r.group = std::make_unique<RaftGroup>(1, std::move(node), *r.persistence, *r.transport, *r.sm);
+            router.setGroup(id, r.group.get());
+            reps[id] = std::move(r);
+        }
+
+        tick(40);
+        ASSERT_TRUE(reps[leader].group->isLeader());
+
+        // A series whose VShard is 1 (the group's VShard), so the readers' VShard-
+        // restricted queries return it.
+        std::string key;
+        for (int i = 0;; ++i) {
+            key = buildSeriesKey("rrm", {{"host", "h" + std::to_string(i)}}, "value");
+            if (timestar::virtualShard(SeriesId128::fromSeriesKey(key)) == 1)
+                break;
+        }
+        {
+            auto f = reps[leader].group->proposeAndAwaitApplied(writeCmd(key, 7.25));
+            drive(f, 60);
+            ASSERT_TRUE(f.get());
+            tick(30);  // followers apply
+        }
+
+        // Leader-reach fns confirm at the current leader (node 1's group), driven by the
+        // outer tick loop. Readers are the two FOLLOWERS only, to PROVE a follower serves.
+        auto leaderReadIndex = [&] { return reps[leader].group->readBarrier(); };
+        auto leaderCommit = [&] {
+            return seastar::make_ready_future<raft::LogIndex>(reps[leader].group->commitIndex());
+        };
+        cluster::ReplicaEngineReader reader2(*reps[2].group, *reps[2].store, 1, leaderReadIndex, leaderCommit);
+        cluster::ReplicaEngineReader reader3(*reps[3].group, *reps[3].store, 1, leaderReadIndex, leaderCommit);
+
+        cluster::ReplicaEngineQueryCoordinator coord(
+            {{1, {&reader2, &reader3}}}, /*hedgeWidth=*/1, /*allowPartial=*/false);
+
+        data::NodeQueryRequest nq;
+        nq.request.aggregation = AggregationMethod::LATEST;
+        nq.request.measurement = "rrm";
+        nq.request.fields = {"value"};
+        nq.request.startTime = BASE - 1'000'000'000ULL;
+        nq.request.endTime = BASE + 1'000'000'000ULL;
+
+        // Linearizable read: the follower confirms the leader ReadIndex, waits applied,
+        // and serves. Drive ticks while the ReadIndex round completes.
+        auto qf = coord.query(nq, data::ReadConsistency::Linearizable, {}, 0);
+        drive(qf, 80);
+        auto res = qf.get();
+        EXPECT_TRUE(res.partial.incompleteReasons.empty());
+        EXPECT_TRUE(res.missing.empty());
+        EXPECT_GT(res.partial.seriesFound, 0u) << "a follower served the linearizable cross-node read";
+
+        // Finalize to confirm the actual value round-trips from the follower.
+        http::HttpQueryHandler fin(&**reps[2].engine);
+        auto resp = fin.finalizeClusterPartials(nq.request, std::move(res.partial.partials),
+                                                std::move(res.partial.nonNumeric))
+                        .get();
+        ASSERT_TRUE(resp.success) << resp.errorMessage;
+        ASSERT_EQ(resp.series.size(), 1u);
+        EXPECT_DOUBLE_EQ(std::get<std::vector<double>>(resp.series[0].fields.at("value").second)[0], 7.25);
+
+        for (auto& [id, r] : reps) {
+            router.setGroup(id, nullptr);
+            r.group.reset();
+            r.persistence.reset();
+            r.writer->close().get();
+        }
+        reps.clear();
         for (auto& d : journalDirs)
             fs::remove_all(d);
         for (auto& d : engineDirs)

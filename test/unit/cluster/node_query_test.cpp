@@ -24,7 +24,7 @@ TEST(NodeQueryCodec, RequestRoundTripIncludingCompatFields) {
     req.request.aggregationInterval = 300;
     req.request.bucketAnchor = 1000;         // "start" alignment (compat)
     req.request.booleansAsNumeric = true;    // compat
-    req.request.readConsistency = ReadConsistencyMode::BoundedStaleness;  // M4
+    req.request.readConsistency = timestar::ReadConsistencyMode::BoundedStaleness;  // M4
     req.request.maxReadLagIndex = 500;                                    // M4
     req.vshards = {3, 17, 4090};
     req.taskId = 42;
@@ -40,7 +40,7 @@ TEST(NodeQueryCodec, RequestRoundTripIncludingCompatFields) {
     EXPECT_EQ(back->request.aggregationInterval, 300u);
     EXPECT_EQ(back->request.bucketAnchor, 1000u);
     EXPECT_TRUE(back->request.booleansAsNumeric);
-    EXPECT_EQ(back->request.readConsistency, ReadConsistencyMode::BoundedStaleness);
+    EXPECT_EQ(back->request.readConsistency, timestar::ReadConsistencyMode::BoundedStaleness);
     EXPECT_EQ(back->request.maxReadLagIndex, 500u);
     EXPECT_EQ(back->vshards, (std::vector<uint16_t>{3, 17, 4090}));
     EXPECT_EQ(back->taskId, 42u);
