@@ -21,14 +21,17 @@ struct GlazeQueryRequest {
     std::optional<std::variant<uint64_t, std::string>> aggregationInterval;
     std::optional<std::string> bucketAlignment;
     std::optional<bool> booleansAsNumeric;
+    std::optional<std::string> consistency;
+    std::optional<uint64_t> maxLagIndex;
 };
 
 template <>
 struct glz::meta<GlazeQueryRequest> {
     using T = GlazeQueryRequest;
-    static constexpr auto value = object("query", &T::query, "startTime", &T::startTime, "endTime", &T::endTime,
-                                         "aggregationInterval", &T::aggregationInterval, "bucketAlignment",
-                                         &T::bucketAlignment, "booleansAsNumeric", &T::booleansAsNumeric);
+    static constexpr auto value =
+        object("query", &T::query, "startTime", &T::startTime, "endTime", &T::endTime, "aggregationInterval",
+               &T::aggregationInterval, "bucketAlignment", &T::bucketAlignment, "booleansAsNumeric",
+               &T::booleansAsNumeric, "consistency", &T::consistency, "maxLagIndex", &T::maxLagIndex);
 };
 
 // Glaze structures for parsing HTTP responses (matching http_query_handler.cpp structures)
@@ -955,4 +958,29 @@ TEST_F(HttpQueryHandlerTest, FinalizeSingleShardPartialsBucketsSortedByTimestamp
     EXPECT_DOUBLE_EQ(values[0], 100.0);
     EXPECT_DOUBLE_EQ(values[1], 200.0);
     EXPECT_DOUBLE_EQ(values[2], 300.0);
+}
+// M4: read consistency modes parse from the JSON /query request; unknown values are
+// rejected (never silently downgraded).
+TEST_F(HttpQueryHandlerTest, ParseReadConsistencyModes) {
+    HttpQueryHandler handler(nullptr);
+    auto base = [](const char* cons) {
+        GlazeQueryRequest r;
+        r.query = "avg:m(value)";
+        r.startTime = static_cast<uint64_t>(1000);
+        r.endTime = static_cast<uint64_t>(2000);
+        if (cons)
+            r.consistency = std::string(cons);
+        return r;
+    };
+    EXPECT_EQ(handler.parseQueryRequest(base(nullptr)).readConsistency, ReadConsistencyMode::Leader);
+    EXPECT_EQ(handler.parseQueryRequest(base("leader")).readConsistency, ReadConsistencyMode::Leader);
+    EXPECT_EQ(handler.parseQueryRequest(base("session")).readConsistency, ReadConsistencyMode::Session);
+    {
+        auto g = base("bounded_staleness");
+        g.maxLagIndex = 500u;
+        auto req = handler.parseQueryRequest(g);
+        EXPECT_EQ(req.readConsistency, ReadConsistencyMode::BoundedStaleness);
+        EXPECT_EQ(req.maxReadLagIndex, 500u);
+    }
+    EXPECT_THROW(handler.parseQueryRequest(base("quorum")), QueryParseException);
 }

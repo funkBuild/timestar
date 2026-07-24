@@ -44,14 +44,19 @@ struct GlazeQueryRequest {
     std::optional<std::string> bucketAlignment;
     // Treat booleans as numeric 1.0/0.0 — see QueryRequest::booleansAsNumeric.
     std::optional<bool> booleansAsNumeric;
+    // Cluster read consistency (M4): "leader"(default)|"session"|"bounded_staleness".
+    std::optional<std::string> consistency;
+    // BoundedStaleness bound (max leaderCommit-localApplied). Ignored in other modes.
+    std::optional<uint64_t> maxLagIndex;
 };
 
 template <>
 struct glz::meta<GlazeQueryRequest> {
     using T = GlazeQueryRequest;
-    static constexpr auto value = object("query", &T::query, "startTime", &T::startTime, "endTime", &T::endTime,
-                                         "aggregationInterval", &T::aggregationInterval, "bucketAlignment",
-                                         &T::bucketAlignment, "booleansAsNumeric", &T::booleansAsNumeric);
+    static constexpr auto value =
+        object("query", &T::query, "startTime", &T::startTime, "endTime", &T::endTime, "aggregationInterval",
+               &T::aggregationInterval, "bucketAlignment", &T::bucketAlignment, "booleansAsNumeric",
+               &T::booleansAsNumeric, "consistency", &T::consistency, "maxLagIndex", &T::maxLagIndex);
 };
 
 namespace timestar::http {
@@ -1164,6 +1169,23 @@ QueryRequest HttpQueryHandler::parseQueryRequest(const GlazeQueryRequest& glazeR
         }
     }
     request.booleansAsNumeric = glazeReq.booleansAsNumeric.value_or(false);
+
+    // Cluster read consistency (M4). Unknown values are rejected rather than silently
+    // downgraded, so a client that asks for a mode this build does not know fails loudly.
+    if (glazeReq.consistency.has_value() && !glazeReq.consistency->empty()) {
+        const std::string& c = *glazeReq.consistency;
+        if (c == "leader") {
+            request.readConsistency = ReadConsistencyMode::Leader;
+        } else if (c == "session") {
+            request.readConsistency = ReadConsistencyMode::Session;
+        } else if (c == "bounded_staleness") {
+            request.readConsistency = ReadConsistencyMode::BoundedStaleness;
+        } else {
+            throw QueryParseException("Invalid consistency '" + c +
+                                      "': expected \"leader\", \"session\", or \"bounded_staleness\"");
+        }
+    }
+    request.maxReadLagIndex = glazeReq.maxLagIndex.value_or(0);
 
     return request;
 }

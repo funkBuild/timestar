@@ -24,6 +24,16 @@ enum class AggregationMethod {
     SPREAD         // max - min range
 };
 
+// Read consistency for cluster replica reads (integration plan M4). Leader (the
+// default, and the only mode before M4) is served by the current leader and is
+// linearizable; Session (read-your-writes) and BoundedStaleness are opt-in
+// read-scaling hints the cluster replica coordinator honors by routing to a
+// follower/learner. A leader read SATISFIES all three (linearizable ⊇ session ⊇
+// bounded), so anywhere replica routing is not active the read is served by the
+// leader -- at least as fresh as requested, never mis-served; the modes only decide
+// where a read MAY be served for scaling, not a weaker correctness contract.
+enum class ReadConsistencyMode : uint8_t { Leader = 0, Session = 1, BoundedStaleness = 2 };
+
 struct QueryRequest {
     AggregationMethod aggregation = AggregationMethod::AVG;
     std::string measurement;
@@ -56,6 +66,11 @@ struct QueryRequest {
     // shard-side BEFORE aggregation, so every method, bucket grid, and
     // placement sees plain doubles.  Strings remain non-numeric regardless.
     bool booleansAsNumeric = false;
+
+    // Cluster read-scaling (M4). readConsistency defaults to Leader; maxReadLagIndex
+    // bounds staleness only under BoundedStaleness. See ReadConsistencyMode.
+    ReadConsistencyMode readConsistency = ReadConsistencyMode::Leader;
+    uint64_t maxReadLagIndex = 0;
 
     // Helper to check if query requests all fields
     bool requestsAllFields() const { return fields.empty(); }
