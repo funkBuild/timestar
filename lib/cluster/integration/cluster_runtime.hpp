@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <map>
 #include <string>
+#include <vector>
 
 namespace timestar::cluster {
 
@@ -28,6 +29,10 @@ struct ClusterRuntime {
     std::map<NodeId, std::string> peerAddresses;   // NodeId -> "host:port" (1-based, includes self)
 
     VShardDirectory directory() const { return VShardDirectory(selfId, map); }
+
+    // The VShards this node replicates (is a voter of), each with its full voter set.
+    // ReplicatedVShardHost instantiates one Raft group per entry.
+    std::map<uint16_t, std::vector<NodeId>> localReplicaGroups() const;
 
     // Build from the parsed [cluster] config. Throws std::invalid_argument if the
     // config is inconsistent (empty peers, node_id out of [1, N]) -- a
