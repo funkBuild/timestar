@@ -48,6 +48,19 @@ public:
     // linearizably. Fails if this node is not the leader (redirect to the leader).
     seastar::future<LogIndex> readBarrier();
 
+    // Resolve once THIS node has applied through `index`, regardless of role.
+    // Unlike proposeAndAwaitApplied it neither requires nor tracks leadership: a
+    // follower or non-voting read replica uses it to wait for replication to reach
+    // a leader-confirmed ReadIndex before serving a linearizable replica read, and
+    // for read-your-writes it waits for a session token's index. It never fails on
+    // a role change -- a replica that never catches up is a failed read the caller
+    // bounds with a timeout, not a hang. Resolves immediately if already applied.
+    seastar::future<> waitApplied(LogIndex index);
+
+    // Highest log index this node has applied to its state machine (any role) --
+    // the freshness signal a bounded-staleness replica read reports and compares.
+    LogIndex appliedIndex() const { return appliedIndex_; }
+
     // Observers (safe to read between async operations on the same core).
     uint16_t groupId() const { return groupId_; }
     Role role() const { return node_.role(); }
@@ -67,6 +80,9 @@ private:
     // Resolve any proposeAndAwaitApplied waiters whose entry this node has now
     // applied; fail all of them on leadership loss (same contract as read barriers).
     void releaseApplyWaiters();
+    // Resolve any waitApplied waiters this node has now applied through (any role;
+    // never failed on role change).
+    void releaseAppliedWaiters();
 
     uint16_t groupId_;
     RaftNode node_;
@@ -84,6 +100,10 @@ private:
     // proposeAndAwaitApplied tracking: (entry index -> caller promise). Resolved
     // true once appliedIndex_ >= index while leader; failed on leadership loss.
     std::vector<std::pair<LogIndex, seastar::promise<bool>>> applyWaiters_;
+
+    // waitApplied tracking: (index -> caller promise). Resolved (value) once
+    // appliedIndex_ >= index, regardless of role; never failed on role change.
+    std::vector<std::pair<LogIndex, seastar::promise<>>> appliedWaiters_;
 };
 
 }  // namespace timestar::raft

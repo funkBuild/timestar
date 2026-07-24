@@ -124,6 +124,37 @@ Status legend: **[ ]** open · **[~]** partial (a proxy exists) · **[x]** done.
 
 ---
 
+## Phase 6 — replica reads (built ahead of its post-v1 schedule)
+
+The plan schedules replica reads as a post-v1 extension, but the core mechanisms
+are now implemented and gate-tested (`lib/cluster/data/replica_read.hpp`,
+`replica_coordinator.hpp`; `RaftGroup::waitApplied`). Done: linearizable
+follower / non-voting-read-replica reads (leader ReadIndex + local apply-wait,
+no new Raft protocol), Session (read-your-writes) and BoundedStaleness modes,
+per-query replica selection (eligibility/lag/locality/queue/error-rate), hedging
++ retry with exactly-once-per-VShard and no combining of two attempts,
+fail-closed / allow_partial, pinned placement. GATE proven under lag, retries,
+placement changes, mid-query failures, partition-reject, delayed-apply
+(`replica_read_test.cpp`, `replica_coordinator_test.cpp`).
+
+### [ ] Production wiring for the leader-reach step (RPC) + read-routing balancing loop
+- **What:** `LeaderReadIndexFn`/`LeaderCommitFn` are injected (a local leader group
+  in tests). Production needs the RPC to the leader node, plus a health/telemetry
+  feed for the selector, plus the read-routing balancing loop (per-replica queue
+  depth, lag, locality) that distributes reads across replicas over time.
+- **What exists instead:** per-QUERY selection + hedging are complete and tested;
+  the standing balancing LOOP consumes the same telemetry Phase 7 balancing
+  exports and lands with it.
+- **Value now:** the gate mechanisms are proven; this is production integration
+  and the standing control loop.
+
+### [ ] Time-bounded (not index-lag) staleness
+- **What:** BoundedStaleness currently bounds by applied-index lag vs a reachable
+  leader's commit, and rejects on partition. A strict TIME bound (serve iff
+  quorum-confirmed-fresh within T) is a lease-like read entangled with the
+  deferred clock-error-bound decision (open decision 7), which the plan defers.
+- **Value now:** LOW; index-lag + partition-reject is the defensible subset.
+
 ## Phase 3 — control plane
 
 ### [ ] Live notification-stream RPC subscription (map-epoch / policy "watch")

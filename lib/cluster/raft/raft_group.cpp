@@ -55,6 +55,8 @@ seastar::future<> RaftGroup::drainReady() {
         // Resolve write waiters whose entry we have now applied (or fail them all
         // if we just lost leadership).
         releaseApplyWaiters();
+        // Resolve role-agnostic apply waiters (replica reads) we have caught up to.
+        releaseAppliedWaiters();
 
         // 4. Acknowledge: advance persistence/apply watermarks and drain messages.
         node_.advance(rd);
@@ -103,6 +105,35 @@ void RaftGroup::releaseApplyWaiters() {
             ++it;
         }
     }
+}
+
+void RaftGroup::releaseAppliedWaiters() {
+    for (auto it = appliedWaiters_.begin(); it != appliedWaiters_.end();) {
+        if (appliedIndex_ >= it->first) {
+            it->second.set_value();
+            it = appliedWaiters_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+seastar::future<> RaftGroup::waitApplied(LogIndex index) {
+    // Register the waiter under the lock so no concurrent drainReady observes a
+    // half-created waiter. Resolve immediately if we have already applied through
+    // `index` (common for a caught-up replica). No leadership requirement.
+    std::optional<seastar::future<>> fut;
+    co_await seastar::with_semaphore(lock_, 1, [this, index, &fut]() -> seastar::future<> {
+        if (appliedIndex_ >= index) {
+            fut = seastar::make_ready_future<>();
+            co_return;
+        }
+        seastar::promise<> promise;
+        fut = promise.get_future();
+        appliedWaiters_.emplace_back(index, std::move(promise));
+        co_return;
+    });
+    co_await std::move(*fut);
 }
 
 seastar::future<bool> RaftGroup::proposeAndAwaitApplied(std::string data) {
