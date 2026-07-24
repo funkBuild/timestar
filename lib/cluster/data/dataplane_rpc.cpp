@@ -14,6 +14,7 @@
 #include <seastar/core/reactor.hh>
 #include <seastar/core/sstring.hh>
 #include <seastar/net/api.hh>
+#include <seastar/net/tls.hh>
 #include <seastar/rpc/rpc.hh>
 #include <stdexcept>
 
@@ -100,6 +101,13 @@ struct DataPlaneRpc::Impl {
     ProposeSink* proposeSink = nullptr;      // RF=3 Raft propose target (M3)
     ReadIndexSink* readIndexSink = nullptr;  // replica-read leader-reach target (M4)
     features::VersionRange localVersion{};   // wire-version range this node supports (M6/X)
+    // Mutual TLS (X1b): null unless setTlsCredentials was called. serverCreds requires a
+    // client cert; clientCreds presents ours + trusts the CA; peerName is the SAN we
+    // verify the server against.
+    seastar::shared_ptr<seastar::tls::server_credentials> serverCreds;
+    seastar::shared_ptr<seastar::tls::certificate_credentials> clientCreds;
+    std::string tlsPeerName;
+    bool tlsEnabled = false;
     bool stopping = false;
     // Client stubs are created ONCE (a stub allocated per concurrent call can
     // corrupt reply routing / message-id bookkeeping). Reused for every call.
@@ -119,7 +127,16 @@ struct DataPlaneRpc::Impl {
         auto pit = peers.find(to);
         if (pit == peers.end())
             return nullptr;
-        auto c = std::make_unique<seastar::rpc::protocol<DpSerializer>::client>(proto, pit->second);
+        std::unique_ptr<seastar::rpc::protocol<DpSerializer>::client> c;
+        if (tlsEnabled) {
+            // Present our cert + verify the peer's against tlsPeerName over TLS.
+            seastar::tls::tls_options topts;
+            topts.server_name = seastar::sstring(tlsPeerName);
+            c = std::make_unique<seastar::rpc::protocol<DpSerializer>::client>(
+                proto, seastar::tls::socket(clientCreds, topts), pit->second);
+        } else {
+            c = std::make_unique<seastar::rpc::protocol<DpSerializer>::client>(proto, pit->second);
+        }
         auto* p = c.get();
         clients[to] = std::move(c);
         return p;
@@ -153,7 +170,10 @@ struct DataPlaneRpc::Impl {
         seastar::listen_options lo;
         lo.reuse_address = true;
         lo.set_fixed_cpu(seastar::this_shard_id());
-        server = std::make_unique<seastar::rpc::protocol<DpSerializer>::server>(proto, seastar::listen(local, lo));
+        seastar::server_socket ss =
+            tlsEnabled ? seastar::tls::listen(serverCreds, local, lo) : seastar::listen(local, lo);
+        server =
+            std::make_unique<seastar::rpc::protocol<DpSerializer>::server>(proto, std::move(ss));
     }
 };
 
@@ -294,6 +314,21 @@ void DataPlaneRpc::setProposeSink(ProposeSink& sink) {
 
 void DataPlaneRpc::setReadIndexSink(ReadIndexSink& sink) {
     impl_->readIndexSink = &sink;
+}
+
+void DataPlaneRpc::setTlsCredentials(std::string certPem, std::string keyPem, std::string caPem,
+                                    std::string expectedPeerName) {
+    seastar::tls::credentials_builder b;
+    b.set_x509_trust(seastar::tls::blob(caPem.data(), caPem.size()), seastar::tls::x509_crt_format::PEM);
+    b.set_x509_key(seastar::tls::blob(certPem.data(), certPem.size()),
+                   seastar::tls::blob(keyPem.data(), keyPem.size()), seastar::tls::x509_crt_format::PEM);
+    // Mutual TLS: the server REQUIRES a client certificate (a plaintext or
+    // wrong-CA peer cannot connect).
+    b.set_client_auth(seastar::tls::client_auth::REQUIRE);
+    impl_->serverCreds = b.build_server_credentials();
+    impl_->clientCreds = b.build_certificate_credentials();
+    impl_->tlsPeerName = std::move(expectedPeerName);
+    impl_->tlsEnabled = true;
 }
 
 void DataPlaneRpc::setLocalVersion(features::VersionRange range) {

@@ -70,6 +70,15 @@ public:
     seastar::future<raft::LogIndex> leaderReadIndex(NodeId to, uint16_t vshard);
     seastar::future<raft::LogIndex> leaderCommitIndex(NodeId to, uint16_t vshard);
 
+    // Enable mutual TLS on this transport (X1b, required before GA): the server
+    // requires a client certificate and both sides trust `caPem`; each presents
+    // (certPem, keyPem). MUST be called before start(). `expectedPeerName` is the SAN
+    // the client verifies the server's cert against (cluster-UUID-bound node name in
+    // production). With TLS on, a plaintext peer -- or one whose cert the CA does not
+    // sign -- cannot connect. All PEM (x509).
+    void setTlsCredentials(std::string certPem, std::string keyPem, std::string caPem,
+                           std::string expectedPeerName);
+
     // This node's supported wire-version range (rolling-upgrade / compatibility, M6/X).
     // Default {1,1}. Set before serving so peers negotiate against the real range.
     void setLocalVersion(features::VersionRange range);

@@ -326,6 +326,117 @@ TEST_F(DataPlaneRpcEnrichedTest, LeaderReachVerbsForwardToSinkOverSocket) {
     }).get();
 }
 
+namespace tlscerts {
+// Self-signed test CA + a node cert/key signed by it (SAN DNS:timestar-node). Test
+// fixtures only -- never real credentials.
+const char* kCa = R"PEM(-----BEGIN CERTIFICATE-----
+MIIDFzCCAf+gAwIBAgIUBq8rloDXJSRUJOwe8AF/EDkSOr8wDQYJKoZIhvcNAQEL
+BQAwGzEZMBcGA1UEAwwQdGltZXN0YXItdGVzdC1jYTAeFw0yNjA3MjQxNTU5MDha
+Fw0zNjA3MjExNTU5MDhaMBsxGTAXBgNVBAMMEHRpbWVzdGFyLXRlc3QtY2EwggEi
+MA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQC3/r9c/AC9i4mQg+Tjpyg0v7F3
+HmtukTpJ0Rmc5Sl8YuFaCAHfH5GX2DAGFaUu5i4PCJ7caIuZiiHXv0i0Tapyskrh
+JfupHSwimM0WIsDLFA7Pi9RV1b7AQEbW7fD6E3+sCaInMvgkrLus6OqkvoKzWxYK
+nN+9vewfeJePswkh855HNNBZYT8KE1GvfLN7TrlwNoHVZjHvWEs/IGvZqY21jGPw
+bCQXb9FOuJbwAlMZpE8Matqcz0jCBLxjxOW06IqcDbIsg0FGXgnNWke75a6Ylcml
+BIVLk6Uhc8BVdNbovVPvS+S8B5Ef7SAgClqRHtnYxYV13EL9upO18tvdg1+XAgMB
+AAGjUzBRMB0GA1UdDgQWBBRMntfiSA12YS9aT9AHtsXeWyvrWTAfBgNVHSMEGDAW
+gBRMntfiSA12YS9aT9AHtsXeWyvrWTAPBgNVHRMBAf8EBTADAQH/MA0GCSqGSIb3
+DQEBCwUAA4IBAQA8UDOmC27SHHEw/KEKRItEbRBuWdhQZ5FslWABIuUXIatI7hRk
+VYAxr2wk9mIgeTDfE2gaeQLvHwSEv7RUXGiSx5QMpoiFAxdmBPUlk/b/UlBeTf9Q
+ia9McvMMhVby98LM7cNpQ8kAs8yTArlYdM8G6BOWqagyKfZwwlgFjVl6zRdpZLm6
+MogYwDdoSeQzg9IO6uRzXiHka+8hGKuhqLF0dBPt8jjBk+NqLec872pV1ngQ1OVV
+tF/flqKYZucrkeWQOVgspaEGGB7fje5H4rRoQW5nVcvNqWJNWrNqG9VmMn/zzSL4
+46RvYefIltLS/44+eFO97YLfs95OK+mBHN6C
+-----END CERTIFICATE-----
+)PEM";
+const char* kNodeCrt = R"PEM(-----BEGIN CERTIFICATE-----
+MIIDHTCCAgWgAwIBAgIUTwYHB1Ll4oY11uXWrowgT5AxBAkwDQYJKoZIhvcNAQEL
+BQAwGzEZMBcGA1UEAwwQdGltZXN0YXItdGVzdC1jYTAeFw0yNjA3MjQxNTU5MDha
+Fw0zNjA3MjExNTU5MDhaMBgxFjAUBgNVBAMMDXRpbWVzdGFyLW5vZGUwggEiMA0G
+CSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQDzkpQzIvPJ5J+Id8KnGTAdkj2GrDAH
+cAgYWtO3/A3ivrYbESQ1Pa/4ntJe2bxeaXszDskcKm/xSdTnHZLN+OwJTjr4eUfb
+/yApKr2lQF2XQRDgXjf03mn9T5EjwQqeQQXydM62j7c3WcrRZMQLqYZdnDaxjtrV
+5As03uM8Dd1puy9Oupnibq/cflvdA/a0j1aaYb6yfZOcLgfLt8+3S4saaWfFaIoS
+al/xcyL96lFAqHy4iqVOFo3WxpHhY8+gbMOVRhDd2MW0Nx26nKe/eGni8Rcji0F8
+Tj4aaC2wTtMNbEIiM6kYRWPXdwosuzCIyA+SjtCBcADwt3U9plAoLgpFAgMBAAGj
+XDBaMBgGA1UdEQQRMA+CDXRpbWVzdGFyLW5vZGUwHQYDVR0OBBYEFFteVJBO8d7w
+gCS6MI7bCCQXwa0SMB8GA1UdIwQYMBaAFEye1+JIDXZhL1pP0Ae2xd5bK+tZMA0G
+CSqGSIb3DQEBCwUAA4IBAQAOmDLsu2EJ3f2kcFARyh8xfkvMVWNF/dxzNThylW0k
+epIeUXsbAAXDoMOiL2RoVDSRWYxZwdnlumPTOEjXhSu6FiG+xmfOYMAsBMZlG1fG
+zEjEgSkiQbaAyL118PKiOxJlAiAp1OQxxhAG23pkjuNJhpRAmNRUFHks8F4LVoE6
+aWCj1TUhmkzQn0dEmAM4nf/wM3z3VCxZkPtjwswpMQAUNoihXW/Gtib1ta4dijQd
+q4FQIhy+FgY3RKbYe9aFi3NlvCdaxRnBfQE4dM9Bxf7sK9hsM2kWuJdTL51iZOFC
+wocgUBxjCAQE5PYSDFaLOKuXaquJs6SPESNakEfhYru6
+-----END CERTIFICATE-----
+)PEM";
+const char* kNodeKey = R"PEM(-----BEGIN PRIVATE KEY-----
+MIIEvwIBADANBgkqhkiG9w0BAQEFAASCBKkwggSlAgEAAoIBAQDzkpQzIvPJ5J+I
+d8KnGTAdkj2GrDAHcAgYWtO3/A3ivrYbESQ1Pa/4ntJe2bxeaXszDskcKm/xSdTn
+HZLN+OwJTjr4eUfb/yApKr2lQF2XQRDgXjf03mn9T5EjwQqeQQXydM62j7c3WcrR
+ZMQLqYZdnDaxjtrV5As03uM8Dd1puy9Oupnibq/cflvdA/a0j1aaYb6yfZOcLgfL
+t8+3S4saaWfFaIoSal/xcyL96lFAqHy4iqVOFo3WxpHhY8+gbMOVRhDd2MW0Nx26
+nKe/eGni8Rcji0F8Tj4aaC2wTtMNbEIiM6kYRWPXdwosuzCIyA+SjtCBcADwt3U9
+plAoLgpFAgMBAAECggEAIc6LN9LG3BOZqfcXYxp9oWkaFY5iJzIfSYQXxT5cjgdy
+3qxhJmueuEcRA128xazlzucjNj/UpDyfaomiBekiF8OOL00kEm6lf9lBE8Xsh5Ee
+HsotAZV6SBCqYDhLuT3krauVQmUNpMbXffs6s7Suo+EJ/ViK2qupe4fhKcVx4Rn2
+63H3+pYj1tJJC3fgwhIjCjedbGTxOCMiyaHSUfJTvm9vdkOr5whQ0v/LAKGrjKP9
+7OC2yZd3wNyKlfW+Ayscl4E/mLO1xRoJuF2V+6Q4XdI6xysiBMTLukiQL6yPLyDF
+OJujYzBWutQJKbchNaCFfBMBXd1qetSVwqNxpZKssQKBgQD8Kh00Lue+bBZVnPur
+pMEcSL7J6T1k1jrFsUPDDEuOIZEP13AnfGB4nV2kfTRttaHxkS0Z6lUEQrIvosN9
+okJin2w93RS/rObek+jAL8RrJvRm43fqs8e/+jid1DXzOECdlePBh/yEWhM9hYCU
+flF+1PvYqv+HHrQOgSbN5pzClQKBgQD3RwJgz070K4r2FOQAvH1jvj6vIXv4Zdgo
+fgWWdTaxluTMwvTMlSyWYtIgLM9ahJKP/4RyvAOGLYmjUb9ezsLsTzfJDkB7VfkK
+yTOYf/x+Dd/zgk6BX8mi1GFVo2jI4F2molad7I+LJWuCz9FR5Y+BIA/7qWp6h/V+
+8o5RfXRs8QKBgQDsbXQaRExGj0NVnC2fnobtRQuVdpl4nSBX0T+Odk21AqXnK4Dd
+lNFC5ZEyM65fmugu/YZDASIbL4mv/jS669LAc2dijZHxsWR5lkapQ2Avc0O94FLD
+/TIxPqOs35aB5+E1n57/CshpM6dMjIqlL9arS3iiipmxD8mUu+UtMqcSDQKBgQDL
+YJ32HcukS4PZbckxSdYfiUNpKzMZVDp641uZKgK4AZFhUB+jfDXV4qVMTU6l9k/N
+G61F6JlFbIK9zuiFA62SSn1pYc1rI4TXeDB1hx6WVrcRQuVqxuvCfscndmUiglbE
+TNTMwto06awJRP+2SgbDfylmJSssaFJj/P9MytBNIQKBgQDvS4YbqHAdl9uJUBGa
+AtLKNjWdB4UkivX2JiRnK4/7bbxk3MrF08Mtn5+2Kg1rzcRSTyBQm6BLx7nrXsEK
+hkAVmqv4oLvkQgg9T2s1UHLvRtXnouGU+8Mq0uc5ZX9NHGPCAR3StHTWfeNQYYSo
+wCW8O9DtnlnIieWNH0yv5/HZ+A==
+-----END PRIVATE KEY-----
+)PEM";
+}  // namespace tlscerts
+
+// X1b: mutual TLS on the data-plane transport. A TLS-authenticated peer negotiates
+// normally; a PLAINTEXT client to a TLS server cannot complete an RPC.
+TEST_F(DataPlaneRpcEnrichedTest, MutualTlsAllowsAuthedPeerRejectsPlaintext) {
+    seastar::async([] {
+        const uint16_t port = 39322;
+        const data::NodeId self = 1;
+        ThrowingNodeStore sink;
+        data::DataPlaneRpc srv;
+        srv.setTlsCredentials(tlscerts::kNodeCrt, tlscerts::kNodeKey, tlscerts::kCa, "timestar-node");
+        srv.setLocalVersion(features::VersionRange{1, 2});
+        srv.start(loopback(port), sink).get();
+        srv.addPeer(self, loopback(port));  // self-loop: TLS client to our own TLS server
+
+        // Mutual TLS handshake succeeds -> the verb round-trips.
+        EXPECT_EQ(srv.negotiateVersion(self).get(), 2u);
+        srv.stop().get();
+
+        // A plaintext client to a TLS server: the RPC must fail (no plaintext bypass).
+        data::DataPlaneRpc tlsSrv, plainCli;
+        tlsSrv.setTlsCredentials(tlscerts::kNodeCrt, tlscerts::kNodeKey, tlscerts::kCa, "timestar-node");
+        ThrowingNodeStore s2, s3;
+        const uint16_t port2 = 39323;
+        tlsSrv.start(loopback(port2), s2).get();
+        plainCli.start(loopback(39324), s3).get();  // no TLS
+        plainCli.addPeer(2, loopback(port2));
+        bool threw = false;
+        try {
+            plainCli.negotiateVersion(2).get();
+        } catch (...) {
+            threw = true;
+        }
+        EXPECT_TRUE(threw) << "a plaintext client must not complete an RPC to a TLS server";
+        plainCli.stop().get();
+        tlsSrv.stop().get();
+    }).get();
+}
+
 // M6/X: wire-version negotiation over the socket. Compatible ranges agree on the
 // highest common version; a non-overlapping peer is REFUSED (thrown), never
 // silently mis-framed.
