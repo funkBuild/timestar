@@ -1,6 +1,7 @@
 #include "raft_group.hpp"
 
 #include <algorithm>
+#include <optional>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/semaphore.hh>
 #include <stdexcept>
@@ -81,25 +82,24 @@ void RaftGroup::releaseReadBarriers() {
 }
 
 seastar::future<LogIndex> RaftGroup::readBarrier() {
-    const uint64_t ctx = nextReadCtx_++;
-    seastar::promise<LogIndex> promise;
-    auto fut = promise.get_future();
-    readWaiters_.emplace(ctx, std::move(promise));
-
-    co_await seastar::with_semaphore(lock_, 1, [this, ctx]() -> seastar::future<> {
-        if (!node_.isLeader()) {
-            // Not the leader: fail the barrier so the caller redirects.
-            if (auto w = readWaiters_.find(ctx); w != readWaiters_.end()) {
-                w->second.set_exception(
-                    std::make_exception_ptr(std::runtime_error("readBarrier: not leader")));
-                readWaiters_.erase(w);
-            }
-            co_return;
-        }
+    // Register the waiter INSIDE the lock (with requestReadIndex), so no
+    // concurrent drainReady can observe/fail a half-created waiter and so a
+    // leader->follower->leader flap between here and acquiring the lock cannot
+    // spuriously fail a barrier we could still satisfy.
+    std::optional<seastar::future<LogIndex>> fut;
+    co_await seastar::with_semaphore(lock_, 1, [this, &fut]() -> seastar::future<> {
+        if (!node_.isLeader())
+            co_return;  // fut stays empty -> not leader
+        const uint64_t ctx = nextReadCtx_++;
+        seastar::promise<LogIndex> promise;
+        fut = promise.get_future();
+        readWaiters_.emplace(ctx, std::move(promise));
         node_.requestReadIndex(ctx);
         co_await drainReady();  // heartbeats out; confirmation arrives on later steps
     });
-    co_return co_await std::move(fut);
+    if (!fut)
+        throw std::runtime_error("readBarrier: not leader");  // caller redirects to the leader
+    co_return co_await std::move(*fut);
 }
 
 seastar::future<> RaftGroup::step(Message m) {

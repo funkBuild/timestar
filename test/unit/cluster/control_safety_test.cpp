@@ -71,6 +71,10 @@ TEST(ControlMapCacheTest, UpdatesForwardNeverRegresses) {
     EXPECT_EQ(c.current().placement.at(5), (std::vector<NodeId>{2, 3, 4}));
     // Same epoch, same content -> no change reported.
     EXPECT_FALSE(c.update({2, {{5, {2, 3, 4}}}}));
+    // Same epoch, DIFFERENT placement -> rejected (epoch is immutable), so two
+    // nodes can never end on different placements at the same epoch.
+    EXPECT_FALSE(c.update({2, {{5, {7, 8, 9}}}}));
+    EXPECT_EQ(c.current().placement.at(5), (std::vector<NodeId>{2, 3, 4}));
 }
 
 TEST(ControlMapCacheTest, SurvivesRestart) {

@@ -26,13 +26,15 @@ struct ControlMap {
 // the cheap first line of defence behind the epoch-regression guard.
 class ControlMapCache {
 public:
-    // Adopt a fresh map iff its epoch is >= the cached epoch. Returns true if the
-    // cache changed.
+    // Adopt a fresh map iff its epoch is strictly AHEAD of the cached one.
+    // Returns true if the cache changed. A same-epoch update is IMMUTABLE: the map
+    // epoch uniquely determines the placement, so a same-epoch notification with a
+    // different placement (a notifier race, retransmit, or an epoch-reusing
+    // restore) is rejected rather than adopted -- otherwise two nodes could end on
+    // different placements at the same epoch and both believe themselves current.
     bool update(ControlMap fresh) {
-        if (fresh.epoch < map_.epoch)
-            return false;  // never regress
-        if (fresh.epoch == map_.epoch && fresh.placement == map_.placement)
-            return false;  // no change
+        if (fresh.epoch <= map_.epoch)
+            return false;  // never regress; same epoch is immutable
         map_ = std::move(fresh);
         return true;
     }

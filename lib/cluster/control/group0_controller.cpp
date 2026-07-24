@@ -32,7 +32,8 @@ seastar::future<> Group0Controller::admitNode(NodeRecord record) {
 seastar::future<bool> Group0Controller::reconcileMetaVoters() {
     if (!g0_.isLeader())
         co_return false;
-    const std::vector<NodeId>& current = g0_.node().config().voters;
+    // Copy (not alias) the live config: proposeConfChange mutates it on append.
+    const std::vector<NodeId> current = g0_.node().config().voters;
     const std::vector<NodeId> desired = selectMetaVoters(sm_.state().nodes, current, metaTarget_);
     if (desired.empty() || !metaVotersDiffer(current, desired))
         co_return false;
