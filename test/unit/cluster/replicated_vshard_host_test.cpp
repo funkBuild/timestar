@@ -4,6 +4,7 @@
 // EngineDataStateMachine into the Engine, and is queryable. Proves the per-VShard
 // hosting/management layer (the multi-engine RF=3 convergence is proven separately
 // in engine_rf3_test).
+#include "../../../lib/cluster/integration/replica_engine_reader.hpp"
 #include "../../../lib/cluster/integration/replicated_vshard_host.hpp"
 #include "../../../lib/core/placement_table.hpp"  // virtualShard
 #include "../../../lib/core/vshard.hpp"
@@ -338,6 +339,113 @@ TEST_F(ReplicatedVShardHostTest, LeaderReachSinkConfirmsReadIndexAndRejectsNonLe
         const auto ri = rb.get();
         EXPECT_GT(ri, 0u);
         EXPECT_GE(ci, ri) << "commit index is at least the confirmed read index";
+
+        host.stop().get();
+        fs::remove_all(jroot);
+    }).get();
+}
+
+// M4 production replica reader: ReplicaEngineReader serves reads from the real Engine
+// at each consistency mode, gated by the Raft group's freshness, restricted to its
+// VShard. Linearizable confirms a leader ReadIndex; Session waits the token; a
+// partitioned leader-reach (throwing fn) rejects rather than serving stale.
+TEST_F(ReplicatedVShardHostTest, ReplicaEngineReaderServesAtEachConsistency) {
+    seastar::async([] {
+        ScopedShardedEngine eng;
+        eng.start();
+        cluster::EngineLocalStore store(*eng);
+        NoopTransport transport;
+        fs::path jroot = tmpDir();
+        cluster::ReplicatedVShardHost host(store, transport, /*self=*/1, jroot);
+
+        RaftOptions opts;
+        opts.electionTimeoutMin = opts.electionTimeoutMax = 1;
+        opts.heartbeatTimeout = 1;
+
+        const std::string key = buildSeriesKey("rr", {{"host", "h1"}}, "value");
+        const uint16_t V = timestar::virtualShard(SeriesId128::fromSeriesKey(key));
+        host.addVShard(V, {1}, opts).get();
+        RaftGroup* g = host.group(V);
+        for (int i = 0; i < 10 && !g->isLeader(); ++i)
+            g->tick().get();
+        ASSERT_TRUE(g->isLeader());
+
+        // Commit a write into this VShard's group.
+        {
+            data::WriteSeries s;
+            s.seriesKey = key;
+            s.type = TSMValueType::Float;
+            s.timestamps = {BASE};
+            s.values = std::vector<double>{3.5};
+            data::WriteBatch b;
+            b.series = {std::move(s)};
+            auto f = host.proposeBatch(std::move(b));
+            for (int i = 0; i < 20 && !f.available(); ++i)
+                g->tick().get();
+            EXPECT_TRUE(f.get());
+        }
+
+        auto nq = [&] {
+            data::NodeQueryRequest r;
+            r.request.aggregation = AggregationMethod::LATEST;
+            r.request.measurement = "rr";
+            r.request.fields = {"value"};
+            r.request.startTime = BASE - 1'000'000'000ULL;
+            r.request.endTime = BASE + 1'000'000'000ULL;
+            return r;
+        };
+
+        cluster::ReplicaEngineReader reader(
+            *g, store, V, [&host, V] { return host.leaderReadIndex(V); },
+            [&host, V] { return host.leaderCommitIndex(V); });
+
+        // Linearizable: confirms a leader ReadIndex (drive ticks for the round).
+        {
+            auto rf = reader.read(nq(), data::ReadConsistency::Linearizable, {}, 0);
+            for (int i = 0; i < 30 && !rf.available(); ++i)
+                g->tick().get();
+            auto res = rf.get();
+            EXPECT_TRUE(res.partial.incompleteReasons.empty());
+            EXPECT_GT(res.partial.seriesFound, 0u) << "linearizable read finds the VShard's series";
+            EXPECT_EQ(res.envelope.vshard, V);
+            EXPECT_GT(res.envelope.appliedIndex, 0u);
+        }
+
+        // Session: wait the token (already applied) and serve.
+        {
+            data::ReadEnvelope token{V, g->currentTerm(), g->appliedIndex()};
+            auto res = reader.read(nq(), data::ReadConsistency::Session, token, 0).get();
+            EXPECT_TRUE(res.partial.incompleteReasons.empty());
+            EXPECT_GT(res.partial.seriesFound, 0u);
+        }
+
+        // BoundedStaleness within a generous bound serves local state.
+        {
+            auto res =
+                reader.read(nq(), data::ReadConsistency::BoundedStaleness, {}, /*maxLagIndex=*/1'000'000).get();
+            EXPECT_GT(res.partial.seriesFound, 0u);
+        }
+
+        // A partitioned leader-reach (throwing fn) rejects the linearizable read.
+        {
+            cluster::ReplicaEngineReader partitioned(
+                *g, store, V,
+                [] {
+                    return seastar::make_exception_future<raft::LogIndex>(
+                        std::runtime_error("leader unreachable"));
+                },
+                [] {
+                    return seastar::make_exception_future<raft::LogIndex>(
+                        std::runtime_error("leader unreachable"));
+                });
+            bool threw = false;
+            try {
+                partitioned.read(nq(), data::ReadConsistency::Linearizable, {}, 0).get();
+            } catch (const std::exception&) {
+                threw = true;
+            }
+            EXPECT_TRUE(threw) << "a replica that cannot reach the leader must reject, not serve stale";
+        }
 
         host.stop().get();
         fs::remove_all(jroot);
