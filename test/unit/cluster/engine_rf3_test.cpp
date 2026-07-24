@@ -7,6 +7,7 @@
 #include "../../../lib/cluster/integration/controller_job_driver.hpp"
 #include "../../../lib/cluster/integration/engine_data_state_machine.hpp"
 #include "../../../lib/cluster/integration/raft_move_executor.hpp"
+#include "../../../lib/cluster/features/operator_surface.hpp"
 #include "../../../lib/cluster/movement/movement_throttle.hpp"
 #include "../../../lib/cluster/movement/placement_balancer.hpp"
 #include "../../../lib/cluster/integration/replica_engine_coordinator.hpp"
@@ -825,6 +826,101 @@ TEST_F(EngineRf3Test, ControllerDrivesPersistedMoveJobToCompletion) {
         EXPECT_EQ(persisted.back().id, "job-move-1");
         EXPECT_TRUE(persisted.back().done);
         EXPECT_EQ(persisted.back().step, static_cast<uint32_t>(movement::MoveStep::Done));
+
+        for (auto& [id, r] : reps) {
+            router.setGroup(id, nullptr);
+            r.group.reset();
+            r.persistence.reset();
+            r.writer->close().get();
+        }
+        reps.clear();
+        for (auto& d : journalDirs)
+            fs::remove_all(d);
+        for (auto& d : engineDirs)
+            fs::remove_all(d);
+    }).get();
+}
+
+// M5 operator-surface gate (in-process): RebalanceOps (the operator `rebalance
+// pause/resume/status` verbs) drives the SLO throttle that gates real movement. An
+// operator PAUSE prevents a move from proceeding; RESUME lets the same job complete
+// over live Raft. Proves the operator control surface actually governs movement.
+TEST_F(EngineRf3Test, OperatorPauseResumeGovernsRealMove) {
+    seastar::async([] {
+        movement::MovementThrottle throttle(movement::SloBudgets{});
+        features::RebalanceOps ops(throttle);
+
+        const std::vector<NodeId> voters = {1, 2, 3};
+        const std::vector<NodeId> allNodes = {1, 2, 3, 4};
+        const NodeId leader = 1;
+        Router router;
+        std::map<NodeId, Replica> reps;
+        std::vector<fs::path> journalDirs, engineDirs;
+
+        auto tickAll = [&] {
+            for (auto& [id, r] : reps)
+                if (r.group)
+                    r.group->tick().get();
+            router.pump().get();
+        };
+        auto tick = [&](int rounds) {
+            for (int i = 0; i < rounds; ++i)
+                tickAll();
+        };
+
+        for (NodeId id : allNodes) {
+            Replica r;
+            fs::path edir = tmpDir("openg" + std::to_string(id));
+            engineDirs.push_back(edir);
+            r.engine = std::make_unique<ScopedShardedEngine>();
+            r.engine->startAt(edir.string());
+            r.store = std::make_unique<cluster::EngineLocalStore>(**r.engine);
+            r.sm = std::make_unique<cluster::EngineDataStateMachine>(*r.store, timestar::VShardId{1});
+            fs::path jdir = tmpDir("opj" + std::to_string(id));
+            journalDirs.push_back(jdir);
+            r.writer = std::make_unique<JournalWriter>(jdir, header(), 1u << 20);
+            auto recovered = r.writer->open().get();
+            RecoveredRaftState st = recoverRaftState(recovered, VShardId{1});
+            r.persistence = std::make_unique<JournalRaftPersistence>(*r.writer, VShardId{1}, st.nextSeq);
+            r.transport = std::make_unique<RouterTransport>(router);
+            RaftNode node(id, voters, std::move(st.log), st.hardState, optsFor(id, leader), {});
+            r.group = std::make_unique<RaftGroup>(1, std::move(node), *r.persistence, *r.transport, *r.sm);
+            router.setGroup(id, r.group.get());
+            reps[id] = std::move(r);
+        }
+        tick(40);
+        ASSERT_TRUE(reps[leader].group->isLeader());
+
+        cluster::RaftGroupMoveExecutor exec(
+            *reps[leader].group, [](const movement::MoveJob&) { return seastar::make_ready_future<>(); });
+        movement::Mover mover(/*minRf=*/3);
+        auto mayProceed = [&throttle] { return throttle.mayProceed(); };
+
+        // Operator PAUSE: movement must not proceed; a move started now does nothing.
+        ops.pause();
+        EXPECT_FALSE(ops.status().running);
+        movement::MoveJob job(movement::MovePlan{/*vshard=*/1, /*dest=*/4, /*victim=*/3});
+        auto paused = mover.run(job, exec, mayProceed);
+        for (int i = 0; i < 200 && !paused.available(); ++i)
+            tickAll();
+        paused.get();
+        EXPECT_FALSE(job.done());
+        EXPECT_EQ(job.step(), movement::MoveStep::Planned) << "paused: nothing committed";
+        auto pv = reps[leader].group->node().config().voters;
+        std::sort(pv.begin(), pv.end());
+        EXPECT_EQ(pv, (std::vector<NodeId>{1, 2, 3})) << "no membership change while paused";
+
+        // Operator RESUME: the same job now completes.
+        ops.resume();
+        EXPECT_TRUE(ops.status().running);
+        auto resumed = mover.run(job, exec, mayProceed);
+        for (int i = 0; i < 8000 && !resumed.available(); ++i)
+            tickAll();
+        resumed.get();
+        ASSERT_TRUE(job.done());
+        auto fv = reps[leader].group->node().config().voters;
+        std::sort(fv.begin(), fv.end());
+        EXPECT_EQ(fv, (std::vector<NodeId>{1, 2, 4})) << "resumed move completes under operator control";
 
         for (auto& [id, r] : reps) {
             router.setGroup(id, nullptr);
