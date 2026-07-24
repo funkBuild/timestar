@@ -4,10 +4,8 @@
 
 namespace timestar::cluster {
 
-seastar::future<ReplicaEngineReader::Result> ReplicaEngineReader::read(data::NodeQueryRequest req,
-                                                                       data::ReadConsistency mode,
-                                                                       data::ReadEnvelope token,
-                                                                       uint64_t maxLagIndex) {
+seastar::future<ReplicaReadOutcome> ReplicaEngineReader::read(data::NodeQueryRequest req, data::ReadConsistency mode,
+                                                             data::ReadEnvelope token, uint64_t maxLagIndex) {
     // Bind everything reached through `this` to frame-locals BEFORE any co_await, so an
     // in-flight read survives the facade being destroyed (the coroutine-lifetime rule).
     auto& group = group_;
@@ -42,8 +40,8 @@ seastar::future<ReplicaEngineReader::Result> ReplicaEngineReader::read(data::Nod
     // VShard, and an unrestricted read would double-count under RF>1).
     req.vshards = {vshard};
     data::NodeQueryPartial partial = co_await store.queryLocal(std::move(req));
-    co_return Result{std::move(partial),
-                     data::ReadEnvelope{group.groupId(), group.currentTerm(), group.appliedIndex()}};
+    co_return ReplicaReadOutcome{std::move(partial),
+                                 data::ReadEnvelope{group.groupId(), group.currentTerm(), group.appliedIndex()}};
 }
 
 }  // namespace timestar::cluster

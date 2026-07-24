@@ -11,6 +11,23 @@
 
 namespace timestar::cluster {
 
+// One replica's answer for a VShard: the node-local partial plus the freshness
+// envelope it was served at (== the next Session token).
+struct ReplicaReadOutcome {
+    data::NodeQueryPartial partial;
+    data::ReadEnvelope envelope;
+};
+
+// The read face a coordinator fans out over: the production ReplicaEngineReader, or a
+// double in tests. read() throws (leader-reach failure / staleness) rather than ever
+// serving below the requested freshness.
+class EngineReplicaReadFace {
+public:
+    virtual ~EngineReplicaReadFace() = default;
+    virtual seastar::future<ReplicaReadOutcome> read(data::NodeQueryRequest req, data::ReadConsistency mode,
+                                                     data::ReadEnvelope token, uint64_t maxLagIndex) = 0;
+};
+
 // Serves reads from ONE replica of a VShard over the REAL Engine (integration plan
 // M4). This is the production analogue of the Phase-6 data::ReplicaVShard, which
 // serves from the toy DataStateMachine's in-memory query; here the freshness gate is
@@ -23,7 +40,7 @@ namespace timestar::cluster {
 // leads, else an RPC to the leader), wait until THIS replica has applied through it,
 // then serve locally. The leader-reach fn THROWS if no leader can confirm, so a
 // partitioned replica rejects rather than serving stale.
-class ReplicaEngineReader {
+class ReplicaEngineReader : public EngineReplicaReadFace {
 public:
     // Confirm a linearizable ReadIndex at the current leader (throws on partition).
     using LeaderReadIndexFn = std::function<seastar::future<raft::LogIndex>()>;
@@ -38,16 +55,11 @@ public:
           leaderReadIndex_(std::move(leaderReadIndex)),
           leaderCommit_(std::move(leaderCommit)) {}
 
-    struct Result {
-        data::NodeQueryPartial partial;
-        data::ReadEnvelope envelope;  // freshness served at (== next Session token)
-    };
-
     // Serve `req` at `mode` freshness. `token` is used for Session; `maxLagIndex` for
     // BoundedStaleness. Throws (leader-reach failure or ReplicaReadUnavailable) rather
     // than ever serving below the requested freshness.
-    seastar::future<Result> read(data::NodeQueryRequest req, data::ReadConsistency mode,
-                                 data::ReadEnvelope token, uint64_t maxLagIndex);
+    seastar::future<ReplicaReadOutcome> read(data::NodeQueryRequest req, data::ReadConsistency mode,
+                                             data::ReadEnvelope token, uint64_t maxLagIndex) override;
 
     // Current freshness without serving (selection / eligibility).
     data::ReadEnvelope envelope() const {
