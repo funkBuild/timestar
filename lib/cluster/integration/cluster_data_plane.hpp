@@ -46,6 +46,10 @@ public:
     seastar::future<> write(data::WriteBatch batch);
     seastar::future<QueryResponse> query(QueryRequest request);
 
+    // Scatter a metadata request to every VShard owner and merge: string-set union
+    // for list kinds, SUM for cardinality (RF=1 disjoint series => exact).
+    seastar::future<data::MetadataResult> metadata(data::MetadataRequest request);
+
     NodeId selfId() const { return rt_ ? rt_->selfId : 0; }
     const data::VShardDirectory& directory() const { return *dir_; }
 

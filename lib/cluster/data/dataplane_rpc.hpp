@@ -48,6 +48,7 @@ public:
     // NodeQueryPartial. Both awaited.
     seastar::future<> forwardWriteBatch(NodeId to, WriteBatch batch) override;
     seastar::future<NodeQueryPartial> queryNode(NodeId to, NodeQueryRequest req) override;
+    seastar::future<MetadataResult> queryMetadata(NodeId to, MetadataRequest req) override;
 
 private:
     struct Impl;

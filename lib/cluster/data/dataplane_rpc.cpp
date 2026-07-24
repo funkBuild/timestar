@@ -1,6 +1,7 @@
 #include "dataplane_rpc.hpp"
 
 #include "dataplane_codec.hpp"
+#include "node_metadata.hpp"
 #include "node_query.hpp"
 #include "write_record.hpp"
 
@@ -39,6 +40,7 @@ constexpr uint64_t kForwardWrites = 1;      // sstring -> sstring (legacy DataPo
 constexpr uint64_t kQueryRemote = 2;        // sstring -> sstring (legacy DataPoint, waited: partial)
 constexpr uint64_t kForwardWriteBatch = 3;  // sstring -> sstring (enriched WriteBatch, waited: applied)
 constexpr uint64_t kQueryNode = 4;          // sstring -> sstring (enriched NodeQueryRequest, waited: partial)
+constexpr uint64_t kQueryMetadata = 5;      // sstring -> sstring (MetadataRequest, waited: MetadataResult)
 
 }  // namespace
 
@@ -57,6 +59,7 @@ struct DataPlaneRpc::Impl {
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> queryStub;
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> forwardBatchStub;
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> queryNodeStub;
+    std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> queryMetadataStub;
 
     seastar::rpc::protocol<DpSerializer>::client* clientFor(NodeId to) {
         if (auto it = clients.find(to); it != clients.end())
@@ -78,6 +81,7 @@ struct DataPlaneRpc::Impl {
         queryStub = proto.make_client<seastar::sstring(seastar::sstring)>(kQueryRemote);
         forwardBatchStub = proto.make_client<seastar::sstring(seastar::sstring)>(kForwardWriteBatch);
         queryNodeStub = proto.make_client<seastar::sstring(seastar::sstring)>(kQueryNode);
+        queryMetadataStub = proto.make_client<seastar::sstring(seastar::sstring)>(kQueryMetadata);
     }
 
     // Pin the listening socket to THIS shard. seastar's default listen policy
@@ -162,6 +166,16 @@ seastar::future<> DataPlaneRpc::start(seastar::socket_address local, NodeStore& 
             return seastar::sstring(enc.data(), enc.size());
         });
     });
+    impl_->proto.register_handler(kQueryMetadata, [this](seastar::sstring data) {
+        auto req = decodeMetadataRequest(std::string(data.data(), data.size()));
+        if (!req)
+            return seastar::make_exception_future<seastar::sstring>(
+                std::runtime_error("dataplane: malformed metadata request"));
+        return impl_->nodeSink->queryMetadata(std::move(*req)).then([](MetadataResult res) {
+            std::string enc = encodeMetadataResult(res);
+            return seastar::sstring(enc.data(), enc.size());
+        });
+    });
     impl_->makeStubs();
     impl_->listenServer(local);
     return seastar::make_ready_future<>();
@@ -213,6 +227,20 @@ seastar::future<NodeQueryPartial> DataPlaneRpc::queryNode(NodeId to, NodeQueryRe
     if (!part)
         throw std::runtime_error("dataplane: malformed node query partial");
     co_return std::move(*part);
+}
+
+seastar::future<MetadataResult> DataPlaneRpc::queryMetadata(NodeId to, MetadataRequest req) {
+    if (impl_->stopping)
+        throw std::runtime_error("dataplane: shutting down");
+    auto* conn = impl_->clientFor(to);
+    if (!conn)
+        throw std::runtime_error("dataplane: unknown peer");
+    std::string bytes = encodeMetadataRequest(req);
+    seastar::sstring reply = co_await impl_->queryMetadataStub(*conn, seastar::sstring(bytes.data(), bytes.size()));
+    auto res = decodeMetadataResult(std::string(reply.data(), reply.size()));
+    if (!res)
+        throw std::runtime_error("dataplane: malformed metadata result");
+    co_return std::move(*res);
 }
 
 seastar::future<> DataPlaneRpc::stop() {

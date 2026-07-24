@@ -4,6 +4,7 @@
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/net/dns.hh>
+#include <set>
 #include <seastar/net/inet_address.hh>
 #include <stdexcept>
 #include <string>
@@ -99,6 +100,43 @@ seastar::future<QueryResponse> ClusterDataPlane::query(QueryRequest request) {
     if (!coord_)
         throw std::runtime_error("ClusterDataPlane::query before start");
     return coord_->query(std::move(request));
+}
+
+seastar::future<data::MetadataResult> ClusterDataPlane::metadata(data::MetadataRequest request) {
+    if (!dir_)
+        throw std::runtime_error("ClusterDataPlane::metadata before start");
+    // Scatter to every owner node (self served in-process), await all, then union
+    // items / sum cardinality. A node failure fails the whole request (a partial
+    // metadata answer would be silently incomplete, same contract as queries).
+    const std::set<NodeId> targets = dir_->ownerNodes();
+    const NodeId self = rt_->selfId;
+    std::vector<seastar::future<data::MetadataResult>> pending;
+    pending.reserve(targets.size());
+    for (NodeId t : targets) {
+        if (t == self)
+            pending.push_back(local_->queryMetadata(request));
+        else
+            pending.push_back(rpc_->queryMetadata(t, request));
+    }
+    std::set<std::string> items;
+    double cardinality = 0.0;
+    std::exception_ptr firstErr;
+    for (auto& f : pending) {
+        try {
+            data::MetadataResult r = co_await std::move(f);
+            items.insert(r.items.begin(), r.items.end());
+            cardinality += r.cardinality;
+        } catch (...) {
+            if (!firstErr)
+                firstErr = std::current_exception();
+        }
+    }
+    if (firstErr)
+        std::rethrow_exception(firstErr);
+    data::MetadataResult out;
+    out.items.assign(items.begin(), items.end());
+    out.cardinality = cardinality;
+    co_return out;
 }
 
 }  // namespace timestar::cluster

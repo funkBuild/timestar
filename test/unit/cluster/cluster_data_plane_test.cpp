@@ -79,6 +79,15 @@ TEST_F(ClusterDataPlaneTest, SingleNodeStartWriteQuery) {
         ASSERT_EQ(rs.series.size(), 1u);
         EXPECT_EQ(std::get<std::vector<std::string>>(rs.series[0].fields.at("msg").second)[0], "through the service");
 
+        // Metadata scatter (single node: this node's owned schema).
+        {
+            auto meas = cdp.metadata({data::MetadataKind::Measurements, "", "", ""}).get();
+            std::sort(meas.items.begin(), meas.items.end());
+            EXPECT_EQ(meas.items, (std::vector<std::string>{"log", "temp"}));
+            auto card = cdp.metadata({data::MetadataKind::MeasurementCardinality, "temp", "", ""}).get();
+            EXPECT_GE(card.cardinality, 1.0);
+        }
+
         cdp.stop().get();
     }).get();
 }

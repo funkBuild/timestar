@@ -44,6 +44,12 @@ public:
     virtual ~NodeTransport() = default;
     virtual seastar::future<> forwardWriteBatch(NodeId to, WriteBatch batch) = 0;
     virtual seastar::future<NodeQueryPartial> queryNode(NodeId to, NodeQueryRequest req) = 0;
+
+    // Fetch a peer's metadata contribution (M2 scatter). Default empty so test
+    // doubles need not implement it; DataPlaneRpc serves it over the wire.
+    virtual seastar::future<MetadataResult> queryMetadata(NodeId, MetadataRequest) {
+        return seastar::make_ready_future<MetadataResult>();
+    }
 };
 
 }  // namespace timestar::data
