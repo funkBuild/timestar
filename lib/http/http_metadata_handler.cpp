@@ -589,11 +589,17 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::hand
         // different LocalIds, so summing is correct for the cross-shard total.
 
         if (!tagKey.empty() && !tagValue.empty()) {
-            // Specific tag combination cardinality
-            double total = co_await timestar::cluster::scatterAndSum(
-                *engineSharded, [measurement, tagKey, tagValue](Engine& engine) {
-                    return engine.getIndex().estimateTagCardinality(measurement, tagKey, tagValue);
-                });
+            // Specific tag combination cardinality. Partitioned: sum across owner
+            // nodes (RF=1 disjoint series => exact); else sum across local shards.
+            double total =
+                clusterMetadataHook
+                    ? (co_await clusterMetadataHook(
+                           {timestar::data::MetadataKind::TagCardinality, measurement, tagKey, tagValue}))
+                          .cardinality
+                    : co_await timestar::cluster::scatterAndSum(
+                          *engineSharded, [measurement, tagKey, tagValue](Engine& engine) {
+                              return engine.getIndex().estimateTagCardinality(measurement, tagKey, tagValue);
+                          });
 
             std::unordered_map<std::string, double> tagCard;
             tagCard[tagKey + ":" + tagValue] = total;
@@ -605,11 +611,18 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::hand
                 rep->_content = formatCardinalityResponse(measurement, total, tagCard);
             }
         } else {
-            // Measurement-level cardinality plus per-tag-key cardinalities
+            // Measurement-level cardinality plus per-tag-key cardinalities.
+            // Partitioned: the measurement TOTAL sums across owner nodes; the
+            // per-tag-key breakdown below remains local (a documented partial until
+            // per-key cardinality is added to the scatter).
             double totalEstimate =
-                co_await timestar::cluster::scatterAndSum(*engineSharded, [measurement](Engine& engine) {
-                    return engine.getIndex().estimateMeasurementCardinality(measurement);
-                });
+                clusterMetadataHook
+                    ? (co_await clusterMetadataHook(
+                           {timestar::data::MetadataKind::MeasurementCardinality, measurement, "", ""}))
+                          .cardinality
+                    : co_await timestar::cluster::scatterAndSum(*engineSharded, [measurement](Engine& engine) {
+                          return engine.getIndex().estimateMeasurementCardinality(measurement);
+                      });
 
             // Get tag keys from local schema cache, then estimate per-tag-key cardinality
             auto& localEngine = engineSharded->local();
