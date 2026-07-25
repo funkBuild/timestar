@@ -129,9 +129,9 @@ seastar::future<> ClusterDataPlane::start(const ClusterConfig& cfg, seastar::sha
         // ~1s window instead of 200ms. Followers still see 5-10 heartbeats per election
         // window, so leadership stays stable.
         raft::RaftOptions ropts;
-        ropts.heartbeatTimeout = 10;    // 200ms at the 20ms tick
-        ropts.electionTimeoutMin = 50;  // 1s
-        ropts.electionTimeoutMax = 100;  // 2s (randomized per group -> spreads campaigns)
+        ropts.heartbeatTimeout = 25;     // 500ms at the 20ms tick
+        ropts.electionTimeoutMin = 125;  // 2.5s
+        ropts.electionTimeoutMax = 250;  // 5s (randomized per group -> spreads campaigns)
         for (const auto& [vshard, voters] : rt_->localReplicaGroups())
             co_await rdp_->addVShard(vshard, voters, ropts);
         rdp_->startTicking();
