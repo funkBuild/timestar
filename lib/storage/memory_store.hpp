@@ -160,6 +160,26 @@ public:
     // the cases where compression is so effective (or cardinality so high) that
     // the WAL bound is never reached at all.
     static size_t residentBytesThreshold() { return timestar::config().storage.wal_size_threshold * 4; }
+
+    // True when durability for this shard's writes is already provided OUTSIDE the
+    // per-shard WAL, so writing the WAL too would be a second fsync of the same data
+    // (the "double WAL"). That is exactly replicated cluster mode: every write reaches
+    // the Engine only by being committed through its VShard's Raft group, which has
+    // already appended it to the Raft journal and fsync'd it.
+    //
+    // Safe because the Raft log is never compacted past what is durable in TSM:
+    // ReplicatedVShardHost::snapshotVShard compacts only up to the snapshot's
+    // FLUSHED-TSM revision, and RaftNode's constructor resets lastApplied_ to
+    // log_.snapshotIndex() -- so on restart every entry above that boundary is
+    // RE-APPLIED. Anything the memory store lost is therefore replayed from the Raft
+    // log. Re-application is idempotent (revisions are the log index, LWW).
+    //
+    // Flush cadence is unaffected: estimatedAccumulatedSize still advances per batch
+    // and rollover triggers on max(wal size, estimated) as well as resident bytes.
+    static bool externalDurability() {
+        const auto& c = timestar::config();
+        return c.cluster.enabled && c.cluster.partitioned && c.cluster.replication_factor > 1;
+    }
     const unsigned int sequenceNumber;
 
     // TSM sequence number reserved for this store's flush file, taken inside

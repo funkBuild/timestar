@@ -636,7 +636,11 @@ seastar::future<bool> MemoryStore::insertBatch(std::vector<TimeStarInsert<T>>& i
 #if TIMESTAR_LOG_INSERT_PATH
     auto start_wal_insert = std::chrono::high_resolution_clock::now();
 #endif
-    if (wal) {
+    // Skip the WAL write when durability is already provided externally (replicated
+    // cluster mode: the point is only here because its VShard's Raft group already
+    // journalled and fsync'd it). Writing it again is a second fsync of the same data
+    // -- see MemoryStore::externalDurability() for why replay makes this safe.
+    if (wal && !externalDurability()) {
         auto walResult = co_await wal->insertBatch(insertRequests);
         if (walResult == WALInsertResult::RolloverNeeded) [[unlikely]] {
             co_return true;
@@ -659,8 +663,9 @@ seastar::future<bool> MemoryStore::insertBatch(std::vector<TimeStarInsert<T>>& i
         try {
             insertMemory(std::move(insertRequest));
         } catch (const std::exception& e) {
-            // Do NOT swallow this. The WAL already has the point, so it is
-            // durable and will reappear on restart — but it is absent from the
+            // Do NOT swallow this. The point is already durable — in the WAL, or
+            // under externalDurability() in the Raft log that delivered it here —
+            // so it will reappear on restart, but it is absent from the
             // memory store, so queries cannot see it until then. Reporting
             // success here told the client the write landed when it had not,
             // which is silent data loss from the caller's point of view.
