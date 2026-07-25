@@ -5,12 +5,15 @@
 #include "node_query.hpp"
 #include "write_record.hpp"
 
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <map>
 #include <optional>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future-util.hh>
+#include <seastar/core/gate.hh>
+#include <seastar/core/lowres_clock.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/sstring.hh>
 #include <seastar/net/api.hh>
@@ -48,6 +51,11 @@ constexpr uint64_t kProposeWrite = 6;       // sstring -> sstring (WriteBatch, w
 constexpr uint64_t kLeaderReadIndex = 7;    // sstring(u16 vshard) -> sstring(u64 readIndex); throws if not leader
 constexpr uint64_t kLeaderCommitIndex = 8;  // sstring(u16 vshard) -> sstring(u64 commitIndex); throws if not leader
 constexpr uint64_t kNegotiateVersion = 9;   // sstring(u32 min,u32 max) -> sstring(u32 agreed); throws if incompatible
+
+// How long before re-attempting a peer connection that died. seastar's rpc::client
+// never reconnects itself, so we replace it -- but bounded, so a burst of concurrent
+// requests to a down peer does not spawn a connect attempt each.
+constexpr std::chrono::milliseconds kReconnectBackoff{200};
 
 seastar::sstring encU32(uint32_t v) {
     char b[4];
@@ -109,6 +117,10 @@ struct DataPlaneRpc::Impl {
     std::string tlsPeerName;
     bool tlsEnabled = false;
     bool stopping = false;
+    // Earliest time a peer whose connection died may be re-attempted (see clientFor).
+    std::map<NodeId, seastar::lowres_clock::time_point> nextRetry;
+    // Keeps background stops of retired (dead) connections alive across shutdown.
+    seastar::gate retireGate;
     // Client stubs are created ONCE (a stub allocated per concurrent call can
     // corrupt reply routing / message-id bookkeeping). Reused for every call.
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> forwardStub;
@@ -121,9 +133,43 @@ struct DataPlaneRpc::Impl {
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> leaderCommitIndexStub;
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> negotiateVersionStub;
 
+    // Retire a dead connection without blocking the caller: stop it in the background
+    // under a gate, keeping it alive until stop resolves.
+    void retire(std::unique_ptr<Client> dead) {
+        if (!dead || retireGate.is_closed())
+            return;
+        auto* raw = dead.get();
+        (void)seastar::with_gate(retireGate, [raw, d = std::move(dead)]() mutable {
+            return raw->stop().handle_exception([](std::exception_ptr) {}).finally([d = std::move(d)] {});
+        });
+    }
+
+    // Open (and cache) the one connection to a peer, RECONNECTING a dead one.
+    //
+    // seastar's rpc::client connects once and latches error() on failure -- it never
+    // reconnects. Without this, a peer that goes away (restart, transient network
+    // failure) leaves a permanently dead cached client, so THIS node can never reach
+    // it again: forwarded writes to VShards it owns fail forever and every scatter-
+    // gather query fails, even though the peer is healthy. (Live-verified: killing and
+    // restarting one node broke inserts AND queries on its peers indefinitely.)
+    //
+    // A dead client is retired and replaced. Between attempts we hand back the dead
+    // client rather than a fresh one, so a burst of concurrent requests fails fast on
+    // the existing connection instead of spawning a connect per request; the retry
+    // cadence is bounded by kReconnectBackoff.
     seastar::rpc::protocol<DpSerializer>::client* clientFor(NodeId to) {
-        if (auto it = clients.find(to); it != clients.end())
-            return it->second.get();
+        auto it = clients.find(to);
+        if (it != clients.end()) {
+            if (!it->second->error())
+                return it->second.get();
+            const auto now = seastar::lowres_clock::now();
+            auto rit = nextRetry.find(to);
+            if (rit != nextRetry.end() && now < rit->second)
+                return it->second.get();  // backing off: fail fast on the dead connection
+            nextRetry[to] = now + kReconnectBackoff;
+            retire(std::move(it->second));
+            clients.erase(it);
+        }
         auto pit = peers.find(to);
         if (pit == peers.end())
             return nullptr;
@@ -463,6 +509,9 @@ seastar::future<> DataPlaneRpc::stop() {
     impl_->stopping = true;
     for (auto& [id, c] : impl_->clients)
         co_await c->stop();
+    // Drain any background stops of retired (reconnected-away) connections before the
+    // clients they reference are destroyed.
+    co_await impl_->retireGate.close();
     impl_->clients.clear();
     if (impl_->server)
         co_await impl_->server->stop();
