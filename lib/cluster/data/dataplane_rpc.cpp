@@ -1,6 +1,7 @@
-#include "../../utils/logger.hpp"
 #include "dataplane_rpc.hpp"
 
+#include "../../utils/logger.hpp"
+#include "../reconnect_policy.hpp"
 #include "dataplane_codec.hpp"
 #include "node_metadata.hpp"
 #include "node_query.hpp"
@@ -76,8 +77,40 @@ constexpr uint64_t kProposeWriteHinted = 10;
 
 // How long before re-attempting a peer connection that died. seastar's rpc::client
 // never reconnects itself, so we replace it -- but bounded, so a burst of concurrent
-// requests to a down peer does not spawn a connect attempt each.
-constexpr std::chrono::milliseconds kReconnectBackoff{200};
+// requests to a down peer does not spawn a connect attempt each. The window (and its
+// jitter) is now shared with the Raft transport and, crucially, with the WRITE RETRY
+// SCHEDULE that has to outlast it -- see lib/cluster/reconnect_policy.hpp and the
+// static_assert in write_errors.hpp (write-scaleout 4a/4b).
+using cluster::kReconnectBackoff;
+
+// TCP keepalive on every peer connection (write-scaleout 4b-ii).
+//
+// A data-plane connection is idle whenever this shard happens to own no leader for the
+// series a client is writing, which on a 4096-VShard cluster is common and bursty. A
+// connection that dies while idle -- peer reboot that never sent a FIN, a NAT/conntrack
+// entry expiring, a middlebox dropping the flow -- stays OPEN as far as this side is
+// concerned, and is discovered only when a write finally uses it and hangs to its
+// attempt deadline. Keepalive turns that into a proactive retirement: the kernel probes
+// the flow, the socket errors, `clientFor` sees `error()` and re-dials on the next use.
+//
+// Deliberately built on seastar's own `client_options.keepalive` (which sets
+// SO_KEEPALIVE + TCP_KEEPIDLE/INTVL/CNT on the fd) rather than an application-level ping
+// verb: an app ping needs a timer per peer per shard, a verb the peer must implement in
+// both wire versions, and its own timeout policy, and it cannot detect a flow the kernel
+// has already given up on any faster than the kernel does.
+//
+// 5s idle / 2s interval / 3 probes => a dead flow is detected in ~11s, well inside the
+// hibernation-idle periods this is aimed at, and far above the write deadline so a
+// merely-slow peer is never killed by it. Keepalive granularity is whole seconds.
+constexpr std::chrono::seconds kKeepaliveIdle{5};
+constexpr std::chrono::seconds kKeepaliveInterval{2};
+constexpr unsigned kKeepaliveCount = 3;
+
+seastar::rpc::client_options peerClientOptions() {
+    seastar::rpc::client_options opts;
+    opts.keepalive = seastar::net::tcp_keepalive_params{kKeepaliveIdle, kKeepaliveInterval, kKeepaliveCount};
+    return opts;
+}
 
 // Inbound frame admission (rpc::resource_limits). Without these, seastar's default is
 // rpc_semaphore::max_counter() -- effectively unbounded -- so a peer could hold
@@ -240,8 +273,8 @@ struct DataPlaneRpc::Impl {
     std::unique_ptr<seastar::rpc::protocol<DpSerializer>::server> server;
     std::map<NodeId, seastar::socket_address> peers;
     std::map<NodeId, std::unique_ptr<Client>> clients;
-    LocalStore* sink = nullptr;         // legacy DataPoint path
-    NodeStore* nodeSink = nullptr;      // enriched WriteBatch path (F.4)
+    LocalStore* sink = nullptr;              // legacy DataPoint path
+    NodeStore* nodeSink = nullptr;           // enriched WriteBatch path (F.4)
     ProposeSink* proposeSink = nullptr;      // RF=3 Raft propose target (M3)
     ReadIndexSink* readIndexSink = nullptr;  // replica-read leader-reach target (M4)
     // Wire-version range this node supports (M6/X). The max is the newest WriteBatch
@@ -325,7 +358,10 @@ struct DataPlaneRpc::Impl {
             auto rit = nextRetry.find(to);
             if (rit != nextRetry.end() && now < rit->second)
                 return it->second.get();  // backing off: fail fast on the dead connection
-            nextRetry[to] = now + kReconnectBackoff;
+            // Jittered (4b-i): without it every shard's client to a restarting peer
+            // re-dials on the same 200 ms grid, so the whole node hammers the peer in
+            // lockstep and re-synchronizes on each failure.
+            nextRetry[to] = cluster::nextReconnectAt(now);
             retire(std::move(it->second));
             clients.erase(it);
             // A reconnect may reach a RESTARTED peer running a different binary --
@@ -336,14 +372,15 @@ struct DataPlaneRpc::Impl {
         if (pit == peers.end())
             return nullptr;
         std::unique_ptr<seastar::rpc::protocol<DpSerializer>::client> c;
+        const seastar::rpc::client_options copts = peerClientOptions();
         if (tlsEnabled) {
             // Present our cert + verify the peer's against tlsPeerName over TLS.
             seastar::tls::tls_options topts;
             topts.server_name = seastar::sstring(tlsPeerName);
             c = std::make_unique<seastar::rpc::protocol<DpSerializer>::client>(
-                proto, seastar::tls::socket(clientCreds, topts), pit->second);
+                proto, copts, seastar::tls::socket(clientCreds, topts), pit->second);
         } else {
-            c = std::make_unique<seastar::rpc::protocol<DpSerializer>::client>(proto, pit->second);
+            c = std::make_unique<seastar::rpc::protocol<DpSerializer>::client>(proto, copts, pit->second);
         }
         auto* p = c.get();
         clients[to] = std::move(c);
@@ -564,8 +601,8 @@ seastar::future<> DataPlaneRpc::start(seastar::socket_address local, NodeStore& 
         if (!agreed)
             // No overlapping version: refuse the peer rather than mis-frame a format it
             // cannot read (rolling-upgrade safety, decision 8).
-            return seastar::make_exception_future<seastar::sstring>(std::runtime_error(
-                "dataplane: incompatible wire versions (no overlap with peer)"));
+            return seastar::make_exception_future<seastar::sstring>(
+                std::runtime_error("dataplane: incompatible wire versions (no overlap with peer)"));
         return seastar::make_ready_future<seastar::sstring>(encU32(*agreed));
     });
     impl_->makeStubs();
@@ -589,11 +626,11 @@ void DataPlaneRpc::setReadIndexSink(ReadIndexSink& sink) {
 }
 
 void DataPlaneRpc::setTlsCredentials(std::string certPem, std::string keyPem, std::string caPem,
-                                    std::string expectedPeerName) {
+                                     std::string expectedPeerName) {
     seastar::tls::credentials_builder b;
     b.set_x509_trust(seastar::tls::blob(caPem.data(), caPem.size()), seastar::tls::x509_crt_format::PEM);
-    b.set_x509_key(seastar::tls::blob(certPem.data(), certPem.size()),
-                   seastar::tls::blob(keyPem.data(), keyPem.size()), seastar::tls::x509_crt_format::PEM);
+    b.set_x509_key(seastar::tls::blob(certPem.data(), certPem.size()), seastar::tls::blob(keyPem.data(), keyPem.size()),
+                   seastar::tls::x509_crt_format::PEM);
     // Mutual TLS: the server REQUIRES a client certificate (a plaintext or
     // wrong-CA peer cannot connect).
     b.set_client_auth(seastar::tls::client_auth::REQUIRE);

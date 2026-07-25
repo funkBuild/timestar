@@ -1,5 +1,6 @@
 #include "raft_rpc_transport.hpp"
 
+#include "../reconnect_policy.hpp"
 #include "raft_codec.hpp"
 
 #include <chrono>
@@ -43,7 +44,23 @@ constexpr uint64_t kDeliverVerb = 1;
 // would hammer a genuinely-down peer with thousands of connects per second. Raft is
 // retry-driven (the next tick re-sends), so dropping messages between attempts is
 // safe; this only bounds how fast we retry.
-constexpr std::chrono::milliseconds kReconnectBackoff{200};
+//
+// The window and its JITTER are now shared with the data plane
+// (lib/cluster/reconnect_policy.hpp, write-scaleout 4b-i): un-jittered, every shard's
+// client to a restarting peer re-dials on the same 200 ms grid, so a peer reboot is met
+// by N_shards simultaneous connects each round -- and because they all fail together
+// they stay in lockstep for the whole outage.
+using timestar::cluster::kReconnectBackoff;
+
+// TCP keepalive on Raft peer connections, same parameters and same reasoning as the data
+// plane (dataplane_rpc.cpp): a Raft connection to a hibernated follower can be idle for
+// long stretches, and a flow that dies while idle is otherwise only noticed when the next
+// append silently vanishes into it.
+seastar::rpc::client_options peerClientOptions() {
+    seastar::rpc::client_options opts;
+    opts.keepalive = seastar::net::tcp_keepalive_params{std::chrono::seconds(5), std::chrono::seconds(2), 3};
+    return opts;
+}
 
 }  // namespace
 
@@ -98,14 +115,14 @@ struct RaftRpcTransport::Impl {
             auto rit = nextRetry.find(to);
             if (rit != nextRetry.end() && now < rit->second)
                 return nullptr;  // backing off: drop this message, Raft re-sends
-            nextRetry[to] = now + kReconnectBackoff;
+            nextRetry[to] = timestar::cluster::nextReconnectAt(now);
             retire(std::move(it->second));
             clients.erase(it);
         }
         auto pit = peers.find(to);
         if (pit == peers.end())
             return nullptr;
-        auto c = std::make_unique<Client>(proto, pit->second);
+        auto c = std::make_unique<Client>(proto, peerClientOptions(), pit->second);
         auto* p = c.get();
         clients[to] = std::move(c);
         return p;
@@ -119,8 +136,7 @@ void RaftRpcTransport::addPeer(NodeId id, seastar::socket_address addr) {
     impl_->peers[id] = addr;
 }
 
-seastar::future<> RaftRpcTransport::start(seastar::socket_address local, DeliverFn onDeliver,
-                                          bool perShardListener) {
+seastar::future<> RaftRpcTransport::start(seastar::socket_address local, DeliverFn onDeliver, bool perShardListener) {
     impl_->onDeliver = std::move(onDeliver);
     // A no_wait handler: the sender never awaits a reply (Raft is fire-and-forget
     // and retries via heartbeats), so a send to a slow/dead peer can never block

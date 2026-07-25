@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../../config/timestar_config.hpp"   // ClusterConfig
+#include "../../config/timestar_config.hpp"  // ClusterConfig
 #include "../../core/engine.hpp"
 #include "../../http/http_query_handler.hpp"  // HttpQueryHandler, QueryResponse
 #include "../data/dataplane_rpc.hpp"
@@ -135,6 +135,14 @@ private:
     // vshard -> current leader, gathered from every shard (groups live across cores).
     seastar::future<std::map<uint16_t, data::NodeId>> gatherLeaders() const;
 
+    // Peer registration (write-scaleout 4b-iii). ONE DNS resolution per peer feeds EVERY
+    // plane that needs it; a peer that fails to resolve is retried until it does, instead
+    // of being a permanent, silent hole. See the .cpp for what the two independent
+    // try-guarded loops these replace could get wrong.
+    seastar::future<bool> registerPeer(NodeId id, const std::string& addr, bool replicated);
+    seastar::future<> registerAllPeers(bool replicated);
+    void startPeerResolver(bool replicated);
+
     std::optional<ClusterRuntime> rt_;
     seastar::sharded<Engine>* enginesPtr_ = nullptr;
     // Applied to this object's transport AND to every per-shard transport in start().
@@ -182,6 +190,13 @@ private:
     seastar::gate balanceGate_;
     bool balanceRunning_ = false;
     void startLeadershipBalancer();
+
+    // Peers whose address did not resolve yet (rolling start, DNS not populated). Retried
+    // by peerResolveTimer_ until empty, at which point the timer cancels itself.
+    std::map<NodeId, std::string> unresolvedPeers_;
+    seastar::timer<> peerResolveTimer_;
+    seastar::gate peerResolveGate_;
+    bool peerResolveRunning_ = false;
 };
 
 }  // namespace timestar::cluster

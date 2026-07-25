@@ -28,8 +28,7 @@ HostPort parseHostPort(const std::string& s) {
     hp.host = s.substr(0, colon);
     try {
         hp.port = static_cast<uint16_t>(std::stoul(s.substr(colon + 1)));
-    } catch (...) {
-    }
+    } catch (...) {}
     return hp;
 }
 
@@ -64,8 +63,7 @@ seastar::future<> ClusterDataPlane::start(const ClusterConfig& cfg, seastar::sha
     // Bind the RPC server to this node's own data-plane address.
     const HostPort self = parseHostPort(rt_->peerAddresses.at(rt_->selfId));
     seastar::net::inet_address selfAddr = co_await resolveHost(self.host);
-    const seastar::socket_address dataPlaneAddr(selfAddr,
-                                                static_cast<uint16_t>(self.port + kDataPlanePortOffset));
+    const seastar::socket_address dataPlaneAddr(selfAddr, static_cast<uint16_t>(self.port + kDataPlanePortOffset));
     // Peer-facing settings must be applied BEFORE start() on every transport that talks
     // to a peer. This instance is the shard-0 query/metadata client; the per-shard
     // instances (started below) are the listeners and the write path's clients, and they
@@ -80,29 +78,16 @@ seastar::future<> ClusterDataPlane::start(const ClusterConfig& cfg, seastar::sha
     else
         co_await rpc_->start(dataPlaneAddr, *local_);
 
-    // Register every OTHER node as a peer at its data-plane address. Resolution is
-    // BEST-EFFORT: a peer that is not yet up (rolling start) must not fail THIS
-    // node's startup. A skipped peer surfaces later as a routing error to that
-    // owner, not a boot failure. (The connection itself is lazy in DataPlaneRpc.)
-    for (const auto& [id, addr] : rt_->peerAddresses) {
-        if (id == rt_->selfId)
-            continue;
-        const HostPort hp = parseHostPort(addr);
-        std::optional<seastar::net::inet_address> a;
-        try {
-            a = co_await resolveHost(hp.host);
-        } catch (const std::exception& e) {
-            timestar::http_log.warn(
-                "cluster data plane: peer {} ({}) unresolved at startup: {} (will error on route)", id, addr,
-                e.what());
-            continue;
-        }
-        rpc_->addPeer(id, seastar::socket_address(*a, static_cast<uint16_t>(hp.port + kDataPlanePortOffset)));
-    }
+    // Peers are registered AFTER the per-shard transports exist (below), from ONE
+    // resolution each -- see registerPeer / the registration block in the replicated
+    // section. Registering here as well is what created the asymmetry this replaces.
 
     finalizer_ = std::make_unique<http::HttpQueryHandler>(&engines);
     router_ = std::make_unique<data::NodeWriteRouter>(*dir_, *local_, *rpc_);
     coord_ = std::make_unique<data::NodeQueryCoordinator>(*dir_, *local_, *rpc_, *finalizer_);
+
+    if (!replicated)
+        co_await registerAllPeers(false);
 
     // RF=3 replicated write path (integration plan M3). Composition proven by
     // replicated_data_plane_test; here we wire the REAL transports. Reads still fan
@@ -152,23 +137,9 @@ seastar::future<> ClusterDataPlane::start(const ClusterConfig& cfg, seastar::sha
         const seastar::socket_address raftAddr(rAddr, static_cast<uint16_t>(self.port + kRaftPortOffset));
         co_await shards_.invoke_on_all([raftAddr](ShardRaftPlane& p) { return p.startTransport(raftAddr); });
 
-        for (const auto& [id, addr] : rt_->peerAddresses) {
-            if (id == rt_->selfId)
-                continue;
-            const HostPort hp = parseHostPort(addr);
-            try {
-                seastar::net::inet_address a = co_await resolveHost(hp.host);
-                const seastar::socket_address peerAddr(a, static_cast<uint16_t>(hp.port + kRaftPortOffset));
-                const seastar::socket_address peerDataAddr(a,
-                                                           static_cast<uint16_t>(hp.port + kDataPlanePortOffset));
-                co_await shards_.invoke_on_all([id, peerAddr, peerDataAddr](ShardRaftPlane& p) {
-                    p.addRaftPeer(id, peerAddr);
-                    p.addDataPeer(id, peerDataAddr);
-                });
-            } catch (const std::exception& e) {
-                timestar::http_log.warn("cluster raft: peer {} ({}) unresolved at startup: {}", id, addr, e.what());
-            }
-        }
+        // Register peers on BOTH planes, from ONE resolution each, now that every
+        // transport that needs them exists (write-scaleout 4b-iii).
+        co_await registerAllPeers(true);
 
         // Instantiate each VShard's group ON ITS OWNING SHARD (see the many-group
         // timing note below).
@@ -207,11 +178,12 @@ seastar::future<> ClusterDataPlane::start(const ClusterConfig& cfg, seastar::sha
             for (const auto& [vshard, voters] : rt_->localReplicaGroups())
                 byShard[shardForVShard(vshard)].push_back({vshard, voters});
             for (auto& [shard, groups] : byShard) {
-                co_await shards_.invoke_on(shard, [g = std::move(groups), ropts](ShardRaftPlane& p) -> seastar::future<> {
-                    for (const auto& [vs, voters] : g)
-                        co_await p.addVShard(vs, voters, ropts);
-                    co_return;
-                });
+                co_await shards_.invoke_on(shard,
+                                           [g = std::move(groups), ropts](ShardRaftPlane& p) -> seastar::future<> {
+                                               for (const auto& [vs, voters] : g)
+                                                   co_await p.addVShard(vs, voters, ropts);
+                                               co_return;
+                                           });
             }
         }
         co_await shards_.invoke_on_all([](ShardRaftPlane& p) {
@@ -224,7 +196,90 @@ seastar::future<> ClusterDataPlane::start(const ClusterConfig& cfg, seastar::sha
     co_return;
 }
 
+// Register ONE peer on EVERY plane it belongs to, from a SINGLE DNS resolution
+// (write-scaleout 4b-iii).
+//
+// This used to be two independent loops, each with its own try/catch around its own
+// `resolveHost` call: one registered the data-plane address on the shard-0 client, the
+// other registered the Raft address AND the per-shard data address. A DNS hiccup that hit
+// one loop and not the other -- entirely possible, they are separate lookups seconds apart
+// during a rolling start -- left the node with an ASYMMETRIC view of that peer: e.g. Raft
+// replicating to it while every forwarded write reported "unknown peer", or the reverse.
+// Nothing ever re-resolved, so the asymmetry was permanent until a restart, and it was
+// invisible: both loops only warn.
+//
+// One resolution, one registration of every plane, all-or-nothing per peer.
+seastar::future<bool> ClusterDataPlane::registerPeer(NodeId id, const std::string& addr, bool replicated) {
+    const HostPort hp = parseHostPort(addr);
+    std::optional<seastar::net::inet_address> a;
+    try {
+        a = co_await resolveHost(hp.host);
+    } catch (const std::exception& e) {
+        timestar::http_log.warn("cluster: peer {} ({}) unresolved: {} (will retry; routes to it fail meanwhile)", id,
+                                addr, e.what());
+        co_return false;
+    }
+    const seastar::socket_address dataAddr(*a, static_cast<uint16_t>(hp.port + kDataPlanePortOffset));
+    // The shard-0 client-only instance (query/metadata fan-out) always needs it.
+    rpc_->addPeer(id, dataAddr);
+    if (replicated) {
+        const seastar::socket_address raftAddr(*a, static_cast<uint16_t>(hp.port + kRaftPortOffset));
+        co_await shards_.invoke_on_all([id, raftAddr, dataAddr](ShardRaftPlane& p) {
+            p.addRaftPeer(id, raftAddr);
+            p.addDataPeer(id, dataAddr);
+        });
+    }
+    co_return true;
+}
+
+seastar::future<> ClusterDataPlane::registerAllPeers(bool replicated) {
+    unresolvedPeers_.clear();
+    for (const auto& [id, addr] : rt_->peerAddresses) {
+        if (id == rt_->selfId)
+            continue;
+        if (!co_await registerPeer(id, addr, replicated))
+            unresolvedPeers_[id] = addr;
+    }
+    if (!unresolvedPeers_.empty())
+        startPeerResolver(replicated);
+    co_return;
+}
+
+void ClusterDataPlane::startPeerResolver(bool replicated) {
+    // Resolution is BEST-EFFORT at startup -- a peer that is not yet up during a rolling
+    // start must not fail THIS node's boot. But "best effort, once, forever" is what made
+    // an unresolved peer a permanent hole: the address was never looked up again, so a
+    // peer whose DNS record appeared thirty seconds later stayed unreachable for the
+    // lifetime of the process. This retries until every peer is registered, then stops.
+    static constexpr auto kInterval = std::chrono::seconds(5);
+    peerResolveTimer_.set_callback([this, replicated] {
+        if (peerResolveRunning_ || peerResolveGate_.is_closed())
+            return;
+        peerResolveRunning_ = true;
+        (void)seastar::with_gate(peerResolveGate_, [this, replicated]() -> seastar::future<> {
+            // `unresolvedPeers_` is a member, so nothing from this lambda's frame is
+            // borrowed across the suspensions below.
+            std::map<NodeId, std::string> still;
+            for (const auto& [id, addr] : unresolvedPeers_) {
+                if (!co_await registerPeer(id, addr, replicated))
+                    still[id] = addr;
+                else
+                    timestar::http_log.info("cluster: peer {} ({}) resolved and registered on retry", id, addr);
+            }
+            unresolvedPeers_ = std::move(still);
+            if (unresolvedPeers_.empty())
+                peerResolveTimer_.cancel();
+            co_return;
+        }).finally([this] { peerResolveRunning_ = false; });
+    });
+    peerResolveTimer_.arm_periodic(kInterval);
+}
+
 seastar::future<> ClusterDataPlane::stop() {
+    // The peer re-resolution loop touches rpc_ and shards_; quiesce it first.
+    peerResolveTimer_.cancel();
+    if (!peerResolveGate_.is_closed())
+        co_await peerResolveGate_.close();
     // Stop the balancing loop FIRST and drain any in-flight pass: it touches the Raft
     // groups, so it must be quiescent before rdp_ tears them down.
     balanceTimer_.cancel();
@@ -362,8 +417,8 @@ seastar::future<QueryResponse> ClusterDataPlane::queryReplicated(QueryRequest re
         QueryResponse r;
         r.success = false;
         r.errorCode = "QUERY_INCOMPLETE";
-        r.errorMessage = "leader node(s) " + nodes +
-                         " unreachable; their VShards were woken to re-elect -- retry shortly";
+        r.errorMessage =
+            "leader node(s) " + nodes + " unreachable; their VShards were woken to re-elect -- retry shortly";
         co_return r;
     }
     if (firstErr)
@@ -376,7 +431,7 @@ seastar::future<QueryResponse> ClusterDataPlane::queryReplicated(QueryRequest re
         co_return r;
     }
     co_return co_await finalizer_->finalizeClusterPartials(std::move(request), std::move(allPartials),
-                                                          std::move(allNonNumeric));
+                                                           std::move(allNonNumeric));
 }
 
 seastar::future<ClusterDataPlane::Status> ClusterDataPlane::status() const {
