@@ -181,8 +181,8 @@ std::optional<ProposeOutcome> decodeProposeOutcome(const seastar::sstring& s) {
         return s.size() == 1 ? std::optional<ProposeOutcome>(ProposeOutcome{true, {}}) : std::nullopt;
     if (s[0] != '0' || s.size() < 3)
         return std::nullopt;
-    const size_t n = static_cast<size_t>(static_cast<uint8_t>(s[1])) |
-                     (static_cast<size_t>(static_cast<uint8_t>(s[2])) << 8);
+    const size_t n =
+        static_cast<size_t>(static_cast<uint8_t>(s[1])) | (static_cast<size_t>(static_cast<uint8_t>(s[2])) << 8);
     if (s.size() != 3 + n * 11)
         return std::nullopt;
     out.rejects.reserve(n);
@@ -741,7 +741,8 @@ seastar::future<ProposeOutcome> DataPlaneRpc::proposeWriteHinted(NodeId to, VSha
                 out.rejects.push_back(SliceReject{vs, kNoNode, WriteFailure::NotLeader});
         co_return out;
     }
-    seastar::sstring reply = co_await impl_->proposeWriteHintedStub(*conn, seastar::sstring(bytes.data(), bytes.size()));
+    seastar::sstring reply =
+        co_await impl_->proposeWriteHintedStub(*conn, seastar::sstring(bytes.data(), bytes.size()));
     auto out = decodeProposeOutcome(reply);
     if (!out)
         throw std::runtime_error("dataplane: malformed hinted propose reply");

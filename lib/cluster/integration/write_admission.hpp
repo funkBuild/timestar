@@ -44,8 +44,7 @@ public:
                     const unsigned long long v = std::stoull(e);
                     if (v > 0)
                         return static_cast<size_t>(v);
-                } catch (...) {
-                }
+                } catch (...) {}
             }
             return static_cast<size_t>(32u << 20);
         }();
@@ -64,9 +63,8 @@ public:
     void acquire(size_t bytes) {
         if (inFlight_ != 0 && inFlight_ + bytes > limitBytes()) {
             ++rejected_;
-            throw data::WriteOverloadedError("cluster: shard write buffer full (" + std::to_string(inFlight_) +
-                                             " of " + std::to_string(limitBytes()) +
-                                             " bytes in flight); retry this write");
+            throw data::WriteOverloadedError("cluster: shard write buffer full (" + std::to_string(inFlight_) + " of " +
+                                             std::to_string(limitBytes()) + " bytes in flight); retry this write");
         }
         inFlight_ += bytes;
         if (inFlight_ > peak_)

@@ -2361,11 +2361,11 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleW
         // Caught as one clause because all four map to the same answer; the message names
         // which. Everything else still becomes an opaque 500 -- deliberately, since an
         // unrecognised failure is a bug and must not be dressed up as backpressure.
-        const bool retryable = dynamic_cast<const timestar::data::RetryableWriteError*>(&e) != nullptr ||
-                               dynamic_cast<const timestar::data::WriteOverloadedError*>(&e) != nullptr ||
-                               dynamic_cast<const timestar::data::UnassignedVShardError*>(&e) != nullptr ||
-                               std::string_view(e.what()).find("shard data plane is stopping") !=
-                                   std::string_view::npos;
+        const bool retryable =
+            dynamic_cast<const timestar::data::RetryableWriteError*>(&e) != nullptr ||
+            dynamic_cast<const timestar::data::WriteOverloadedError*>(&e) != nullptr ||
+            dynamic_cast<const timestar::data::UnassignedVShardError*>(&e) != nullptr ||
+            std::string_view(e.what()).find("shard data plane is stopping") != std::string_view::npos;
         ++engineSharded->local().metrics().insert_errors_total;
         if (retryable) {
             timestar::http_log.warn("Write rejected, retryable cluster condition: {}", e.what());

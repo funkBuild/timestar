@@ -1,13 +1,12 @@
 #pragma once
 
-#include <seastar/core/gate.hh>
 #include "../../core/placement_table.hpp"  // virtualShard
-#include "../../core/vshard.hpp"  // assignCore
+#include "../../core/vshard.hpp"           // assignCore
 #include "../data/dataplane_rpc.hpp"
 #include "../data/node_store.hpp"
 #include "../features/feature_gate.hpp"  // VersionRange
-#include "../raft/raft_codec.hpp"  // decodeEnvelope
-#include "../raft/raft_driver.hpp"  // RaftTransport
+#include "../raft/raft_codec.hpp"        // decodeEnvelope
+#include "../raft/raft_driver.hpp"       // RaftTransport
 #include "../raft/raft_rpc_transport.hpp"
 #include "engine_local_store.hpp"
 #include "replicated_data_plane.hpp"
@@ -22,6 +21,7 @@
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/do_with.hh>
 #include <seastar/core/future.hh>
+#include <seastar/core/gate.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/core/smp.hh>
 #include <string>
@@ -459,8 +459,8 @@ inline seastar::future<bool> proposeSlicesToOwningShards(seastar::sharded<ShardR
 // A shard that fails for a RETRYABLE reason (its plane is stopping) contributes rejects
 // rather than an exception, because from the forwarding node's side that is a redirect,
 // not a fault. Anything else still propagates -- a bug must not be laundered into a retry.
-inline seastar::future<data::ProposeOutcome> proposeSlicesToOwningShardsHinted(
-    seastar::sharded<ShardRaftPlane>& shards, data::WriteBatch batch) {
+inline seastar::future<data::ProposeOutcome> proposeSlicesToOwningShardsHinted(seastar::sharded<ShardRaftPlane>& shards,
+                                                                               data::WriteBatch batch) {
     std::map<unsigned, data::VShardBatches> byShard;
     for (auto& g : data::splitByVShard(std::move(batch)))
         byShard[shardForVShard(g.first)].push_back(std::move(g));
@@ -477,8 +477,7 @@ inline seastar::future<data::ProposeOutcome> proposeSlicesToOwningShardsHinted(
         pendingVShards.push_back(std::move(vs));
         pending.push_back(shards.invoke_on(shard, [b = std::move(slice)](ShardRaftPlane& p) mutable {
             if (!p.ready())  // see the note in writeSlicesToOwningShards
-                return seastar::make_exception_future<data::ProposeOutcome>(
-                    std::runtime_error(kShardStoppingError));
+                return seastar::make_exception_future<data::ProposeOutcome>(std::runtime_error(kShardStoppingError));
             // The groups are owned by do_with (moved across the shard boundary) and the
             // returned future is awaited before they are freed, so the view is safe.
             // `pp` is captured BY VALUE: `p` is a reference parameter living in this

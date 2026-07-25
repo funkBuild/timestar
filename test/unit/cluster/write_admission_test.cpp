@@ -1,8 +1,9 @@
 // write-scaleout 3b/3d: the write-path failure TAXONOMY and the per-shard in-flight
 // byte bound. Pure logic -- no sockets, no Raft.
+#include "../../../lib/cluster/integration/write_admission.hpp"
+
 #include "../../../lib/cluster/data/write_errors.hpp"
 #include "../../../lib/cluster/data/write_record.hpp"
-#include "../../../lib/cluster/integration/write_admission.hpp"
 #include "../../../lib/utils/series_key.hpp"
 
 #include <gtest/gtest.h>
@@ -65,9 +66,9 @@ TEST(WriteFailureTaxonomyTest, LocalClassificationIsConservative) {
     EXPECT_EQ(cls(std::make_exception_ptr(data::WriteOverloadedError("full"))), WriteFailure::Overloaded);
     EXPECT_EQ(cls(std::make_exception_ptr(data::UnassignedVShardError("none"))), WriteFailure::Unassigned);
     EXPECT_EQ(cls(std::make_exception_ptr(data::WriteFrameTooLargeError("big"))), WriteFailure::Fatal);
-    EXPECT_EQ(cls(std::make_exception_ptr(
-                  std::runtime_error("cluster: shard data plane is stopping; retry this write"))),
-              WriteFailure::ShardStopping);
+    EXPECT_EQ(
+        cls(std::make_exception_ptr(std::runtime_error("cluster: shard data plane is stopping; retry this write"))),
+        WriteFailure::ShardStopping);
     EXPECT_EQ(cls(std::make_exception_ptr(std::runtime_error("journal write failed: EIO"))), WriteFailure::Fatal)
         << "an unrecognised local failure must NOT be retried";
 }

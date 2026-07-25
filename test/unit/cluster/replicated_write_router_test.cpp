@@ -4,6 +4,7 @@
 // and fails the whole write retryably when the budget is spent -- never a silent partial
 // ack. In-memory doubles (no sockets/Raft).
 #include "../../../lib/cluster/data/replicated_write_router.hpp"
+
 #include "../../../lib/core/placement_table.hpp"
 #include "../../../lib/utils/series_key.hpp"
 
@@ -365,14 +366,22 @@ seastar::future<> testTransportErrorRetriesAgainstTheAdvancedMap() {
 }  // namespace
 
 TEST(ReplicatedBatchWriteRouterTest, RoutesEachSeriesToItsVShardLeader) { testRoutesToLeaders().get(); }
-TEST(ReplicatedBatchWriteRouterTest, StaleLeaderFailsWholeWriteRetryably) { testStaleLeaderFailsWrite().get(); }
+TEST(ReplicatedBatchWriteRouterTest, StaleLeaderFailsWholeWriteRetryably) {
+    testStaleLeaderFailsWrite().get();
+}
 TEST(ReplicatedBatchWriteRouterTest, UnassignedVShardRejects) { testUnassignedRejects().get(); }
-TEST(ReplicatedBatchWriteRouterTest, LeaderHintRedirectsTheRetry) { testLeaderHintRedirectsTheRetry().get(); }
-TEST(ReplicatedBatchWriteRouterTest, RetriesOnlyTheFailedSlice) { testRetriesOnlyTheFailedSlice().get(); }
+TEST(ReplicatedBatchWriteRouterTest, LeaderHintRedirectsTheRetry) {
+    testLeaderHintRedirectsTheRetry().get();
+}
+TEST(ReplicatedBatchWriteRouterTest, RetriesOnlyTheFailedSlice) {
+    testRetriesOnlyTheFailedSlice().get();
+}
 TEST(ReplicatedBatchWriteRouterTest, AmbiguousLeadershipLossIsRetried) {
     testAmbiguousLeadershipLossIsRetried().get();
 }
-TEST(ReplicatedBatchWriteRouterTest, FatalFailureIsNotRetried) { testFatalFailureIsNotRetried().get(); }
+TEST(ReplicatedBatchWriteRouterTest, FatalFailureIsNotRetried) {
+    testFatalFailureIsNotRetried().get();
+}
 TEST(ReplicatedBatchWriteRouterTest, TransportErrorRetriesAgainstTheAdvancedMap) {
     testTransportErrorRetriesAgainstTheAdvancedMap().get();
 }
