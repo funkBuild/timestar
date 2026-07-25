@@ -311,8 +311,7 @@ seastar::future<> NativeIndex::open() {
                 continue;
             for (const auto& [tagKey, tagValue] : meta->tags) {
                 buildBitmapCacheKey(bitmapCacheKey, meta->measurement, tagKey, tagValue);
-                auto* bitmap = co_await getOrLoadBitmapForInsert(bitmapCacheKey);
-                bitmap->add(id);
+                (void)co_await addToPostingsBitmapForInsert(bitmapCacheKey, id);
             }
             dirtyMeasurementBlooms_.insert(meta->measurement);
             ++repaired;
@@ -938,11 +937,13 @@ seastar::future<SeriesId128> NativeIndex::getOrCreateSeriesId(SeriesId128 series
     // tens is strictly worse than the answer already on hand.
     for (const auto& [tagKey, tagValue] : tags) {
         buildBitmapCacheKey(bitmapCacheKey, measurement, tagKey, tagValue);
-        auto* bitmap = co_await getOrLoadBitmapForInsert(bitmapCacheKey);
-        bitmap->add(localId);
+        // The add happens INSIDE, and the cardinality comes back as a VALUE: a
+        // `roaring::Roaring*` into bitmapCache_ must never outlive the call that
+        // produced it (robin_map rehash / trim). See addToPostingsBitmapForInsert.
+        const uint64_t card = co_await addToPostingsBitmapForInsert(bitmapCacheKey, localId);
 
-        if (bitmap->cardinality() >= kTagHllMinCardinality) {
-            // Pass the cache KEY, not `bitmap`: updateTagHLL suspends before
+        if (card >= kTagHllMinCardinality) {
+            // Pass the cache KEY, not a bitmap pointer: updateTagHLL suspends before
             // seeding, and a raw pointer into bitmapCache_ dangles across
             // suspensions (robin_map rehash/trim). It re-looks the bitmap up
             // after its own co_await. The key buffer is reused next iteration
@@ -1349,7 +1350,7 @@ seastar::future<> NativeIndex::recordDaySpan(const std::string& measurement, con
         buildDayBitmapCacheKey(dayCacheKey, measurement, day);
         // addChecked: day-scoped discovery results cached under the current
         // generation go stale when an EXISTING series first appears in a day.
-        if ((co_await getOrLoadDayBitmapForInsert(dayCacheKey))->addChecked(localId)) {
+        if (co_await addToDayBitmapForInsert(dayCacheKey, localId)) {
             newDayMembership = true;
         }
     }
@@ -1376,7 +1377,7 @@ seastar::future<> NativeIndex::recordInsertDays(const std::string& measurement, 
             buildDayBitmapCacheKey(dayCacheKey, measurement, day);
             // addChecked: invalidate cached day-scoped discovery when an
             // existing series first appears in a day (see recordDaySpan).
-            if ((co_await getOrLoadDayBitmapForInsert(dayCacheKey))->addChecked(localId)) {
+            if (co_await addToDayBitmapForInsert(dayCacheKey, localId)) {
                 newDayMembership = true;
             }
             lastDay = day;
@@ -2154,12 +2155,14 @@ seastar::future<const roaring::Roaring*> NativeIndex::getPostingsBitmapByKey(con
     co_return nullptr;
 }
 
-seastar::future<roaring::Roaring*> NativeIndex::getOrLoadBitmapForInsert(std::string& cacheKey) {
+seastar::future<uint64_t> NativeIndex::addToPostingsBitmapForInsert(std::string& cacheKey, uint32_t localId) {
     auto it = bitmapCache_.find(cacheKey);
     if (it != bitmapCache_.end()) {
         it.value().dirty = true;
         bitmapCacheDirtyKeys_.insert(cacheKey);
-        co_return &it.value().bitmap;
+        // Cache hit: no suspension at all, so the reference cannot go stale.
+        it.value().bitmap.add(localId);
+        co_return it.value().bitmap.cardinality();
     }
 
     // Cache miss — cold load from KV store
@@ -2185,7 +2188,13 @@ seastar::future<roaring::Roaring*> NativeIndex::getOrLoadBitmapForInsert(std::st
         entry.bitmap |= roaring::Roaring::readSafe(existing->data(), existing->size());
         entry.approxBytes = existing->size();
     }
-    co_return &entry.bitmap;
+    // RE-MARK DIRTY: a flush during the suspension clears the flag, and the add below
+    // would then never be persisted (see addToDayBitmapForInsert).
+    entry.dirty = true;
+    bitmapCacheDirtyKeys_.insert(cacheKey);
+    // The add happens HERE, with no suspension between it and the re-find above.
+    entry.bitmap.add(localId);
+    co_return entry.bitmap.cardinality();
 }
 
 seastar::future<> NativeIndex::migrateToLocalIds(IndexWriteBatch& batch) {
@@ -2273,12 +2282,13 @@ void NativeIndex::buildDayBitmapCacheKey(std::string& out, const std::string& me
     out.append(reinterpret_cast<const char*>(&dayBE), 4);
 }
 
-seastar::future<roaring::Roaring*> NativeIndex::getOrLoadDayBitmapForInsert(std::string& cacheKey) {
+seastar::future<bool> NativeIndex::addToDayBitmapForInsert(std::string& cacheKey, uint32_t localId) {
     auto it = dayBitmapCache_.find(cacheKey);
     if (it != dayBitmapCache_.end()) {
         it.value().dirty = true;
         dayBitmapCacheDirtyKeys_.insert(cacheKey);
-        co_return &it.value().bitmap;
+        // Cache hit: no suspension at all, so the reference cannot go stale.
+        co_return it.value().bitmap.addChecked(localId);
     }
 
     // Cache miss — cold load from KV store
@@ -2299,7 +2309,14 @@ seastar::future<roaring::Roaring*> NativeIndex::getOrLoadDayBitmapForInsert(std:
         entry.bitmap |= roaring::Roaring::readSafe(existing->data(), existing->size());
         entry.approxBytes = existing->size();
     }
-    co_return &entry.bitmap;
+    // RE-MARK DIRTY. A flush during the suspension above clears every dirty flag and
+    // empties the dirty-key set; the add below would then never be persisted and the
+    // series would silently vanish from that day's discovery bitmap.
+    entry.dirty = true;
+    dayBitmapCacheDirtyKeys_.insert(cacheKey);
+    // The add happens HERE, with NOTHING between it and the re-find above. See the
+    // header note on why this function mutates instead of returning a pointer.
+    co_return entry.bitmap.addChecked(localId);
 }
 
 seastar::future<const roaring::Roaring*> NativeIndex::getDayBitmapByKey(const std::string& cacheKey) {
@@ -3114,7 +3131,7 @@ seastar::future<SeriesId128> NativeIndex::indexInsert(const TimeStarInsert<T>& i
                 buildDayBitmapCacheKey(dayCacheKey, insert.measurement, day);
                 // addChecked: invalidate cached day-scoped discovery when an
                 // existing series first appears in a day (see recordDaySpan).
-                if ((co_await getOrLoadDayBitmapForInsert(dayCacheKey))->addChecked(localId)) {
+                if (co_await addToDayBitmapForInsert(dayCacheKey, localId)) {
                     newDayMembership = true;
                 }
                 lastDay = day;

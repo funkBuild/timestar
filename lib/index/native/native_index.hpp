@@ -391,10 +391,42 @@ private:
 
     // Get or load a bitmap (read-only). Returns nullptr if not found anywhere.
     // Uses pre-built cache key to avoid double string construction.
+    //
+    // CALLER CONTRACT: the returned pointer is valid ONLY until the next suspension
+    // point, and strictly speaking not even that -- it is computed inside a coroutine
+    // that may have suspended, so a rehash or a trim can land between the `co_return`
+    // and the caller's resumption (see addToPostingsBitmapForInsert for the mechanism).
+    // Every caller must consume it -- copy it, OR it into an accumulator -- as the first
+    // thing it does, and must never store it. The WRITE paths no longer take this risk;
+    // hardening the read paths the same way is filed in docs/write-scaleout-plan.md.
     seastar::future<const roaring::Roaring*> getPostingsBitmapByKey(const std::string& cacheKey);
-    // Get or load a bitmap for insert (mutable). Marks entry dirty.
-    // cacheKey is consumed on cache miss (moved into map).
-    seastar::future<roaring::Roaring*> getOrLoadBitmapForInsert(std::string& cacheKey);
+    // Load (if cold) the postings bitmap named by `cacheKey` and ADD `localId` to it,
+    // returning the resulting cardinality. Marks the entry dirty.
+    //
+    // IT MUTATES INSIDE ON PURPOSE. This was `getOrLoadBitmapForInsert`, which returned
+    // a `roaring::Roaring*` pointing INTO `bitmapCache_` and let the caller write
+    // through it. That pointer is not safe to hold for even one reactor task:
+    //
+    //   * `bitmapCache_` is a tsl::robin_map -- OPEN ADDRESSING -- holding
+    //     `BitmapEntry` (and hence `roaring::Roaring`) BY VALUE. Any insert that
+    //     rehashes RELOCATES every bitmap; every outstanding pointer dangles.
+    //   * `trimBitmapCache()` erases entries outright, destroying the `Roaring`, and
+    //     `flushDirtyBitmaps()` clears the `dirty` flag that protects an entry from
+    //     eviction (and calls runOptimize/shrinkToFit, which reallocates the
+    //     containers) in the same non-suspending region immediately before it.
+    //
+    // On the cold path the accessor suspends in `kvGet`, so its `co_return &entry.bitmap`
+    // and the caller's dereference are in DIFFERENT reactor tasks. Any other insert
+    // coroutine on the shard -- or the flush+trim that memory pressure makes routine --
+    // runs in between. That is a use-after-free that faults inside
+    // `roaring_bitmap_add`, which is exactly the crash reported against these batches
+    // (thousands of distinct series, ~40 concurrent, garbage `si_addr` right after
+    // seastar's memory-pressure dump; it vanishes when the same BYTES arrive as few
+    // series with many timestamps, i.e. when the cache stops rehashing).
+    //
+    // Returning the cardinality by VALUE removes the last reason a caller needed the
+    // pointer. The same discipline `updateTagHLL` already documented for itself.
+    seastar::future<uint64_t> addToPostingsBitmapForInsert(std::string& cacheKey, uint32_t localId);
     // Flush dirty bitmaps + batched LOCAL_ID_FORWARD entries into the KV store.
     void flushDirtyBitmaps(IndexWriteBatch& batch);
     // Migration: build LocalIdMap + bitmaps from existing TAG_INDEX data on first open.
@@ -448,7 +480,12 @@ private:
     std::unordered_set<std::string> dayBitmapCacheDirtyKeys_;  // see bitmapCacheDirtyKeys_
 
     static void buildDayBitmapCacheKey(std::string& out, const std::string& measurement, uint32_t day);
-    seastar::future<roaring::Roaring*> getOrLoadDayBitmapForInsert(std::string& cacheKey);
+    // Add `localId` to the (measurement, day) bitmap named by `cacheKey`, loading it if
+    // cold. Returns true if it was NOT already present (which invalidates day-scoped
+    // discovery caches). Mutates INSIDE for the reason spelled out on
+    // addToPostingsBitmapForInsert -- this is the path the reported crash was on, being
+    // the only one entered once per series per day per BATCH.
+    seastar::future<bool> addToDayBitmapForInsert(std::string& cacheKey, uint32_t localId);
     seastar::future<const roaring::Roaring*> getDayBitmapByKey(const std::string& cacheKey);
     void flushDirtyDayBitmaps(IndexWriteBatch& batch);
     seastar::future<roaring::Roaring> buildActiveSeriesBitmap(const std::string& measurement, uint32_t startDay,
