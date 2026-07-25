@@ -264,19 +264,75 @@ TEST_F(ShardRaftPlaneTest, ProposeOverSocketSplitsAcrossOwningShardsAndFailsClea
                 << "both slices must have been applied -- one value missing means a shard's "
                 << "slice never committed";
 
+            // (a2) The PRODUCTION listener is per-shard-distributing. Several peer
+            // connections must be SERVED by more than one shard: this is what pins
+            // ShardRaftPlane::startDataPlane's perShardListener=true. Flipping it to
+            // false pins every accepted connection onto shard 0 (reuseport is disabled
+            // here, so set_fixed_cpu means "give shard 0 every fd"), and this fails --
+            // whereas the rest of the test still passes, because correctness never
+            // depended on WHICH shard served.
+            {
+                const size_t kConns = std::min<size_t>(8, seastar::smp::count * 2);
+                std::vector<std::unique_ptr<data::DataPlaneRpc>> peers;
+                for (size_t i = 0; i < kConns; ++i) {
+                    auto c = std::make_unique<data::DataPlaneRpc>();
+                    c->addPeer(self, addr);
+                    c->startClientOnly().get();
+                    data::WriteBatch b;
+                    b.series = {floatSeries(k1, 1.0 + static_cast<double>(i), BASE + 10'000'000'000ULL)};
+                    EXPECT_TRUE(c->proposeWrite(self, std::move(b)).get());
+                    peers.push_back(std::move(c));
+                }
+                size_t served = 0, shardsThatServed = 0;
+                for (unsigned s = 0; s < seastar::smp::count; ++s) {
+                    const uint64_t n =
+                        shards.invoke_on(s, [](cluster::ShardRaftPlane& p) { return p.inboundProposals(); }).get();
+                    served += n;
+                    if (n > 0)
+                        ++shardsThatServed;
+                }
+                EXPECT_EQ(served, kConns + 1) << "every inbound proposal must be served exactly once";
+                EXPECT_GT(shardsThatServed, 1u)
+                    << "all " << (kConns + 1) << " inbound proposals were served by ONE shard -- the per-shard "
+                    << "data-plane listeners are not distributing (perShardListener must be true)";
+                for (auto& c : peers)
+                    c->stop().get();
+            }
+
             // (b) The shutdown race. Tear down ONLY the shard owning vs2 -- exactly the state
             // sharded<>::stop() produces transiently, since it stops every shard
             // concurrently -- and route a write there. It must raise a retryable error, not
             // dereference the null plane and crash the node.
             shards.invoke_on(cluster::shardForVShard(vs2), [](cluster::ShardRaftPlane& p) { return p.stop(); }).get();
 
-            data::WriteBatch afterStop;
-            afterStop.series = {floatSeries(k2, 33.0)};
-            EXPECT_THROW(cluster::writeSlicesToOwningShards(shards, std::move(afterStop)).get(), std::runtime_error);
-
-            data::WriteBatch afterStop2;
-            afterStop2.series = {floatSeries(k2, 44.0)};
-            EXPECT_THROW(cluster::proposeSlicesToOwningShards(shards, std::move(afterStop2)).get(), std::runtime_error);
+            // The error must be the RETRYABLE shard-stopping one specifically -- any
+            // other runtime_error here (a null deref turned into a generic failure, a
+            // routing error) would be a different, non-retryable bug wearing the same
+            // exception type.
+            auto expectShardStopping = [](auto&& fn, const char* what) {
+                try {
+                    fn();
+                    ADD_FAILURE() << what << " must throw while the owning shard is stopping";
+                } catch (const std::runtime_error& e) {
+                    EXPECT_STREQ(e.what(), cluster::kShardStoppingError) << what;
+                } catch (...) {
+                    ADD_FAILURE() << what << " threw a non-runtime_error";
+                }
+            };
+            expectShardStopping(
+                [&] {
+                    data::WriteBatch afterStop;
+                    afterStop.series = {floatSeries(k2, 33.0)};
+                    cluster::writeSlicesToOwningShards(shards, std::move(afterStop)).get();
+                },
+                "writeSlicesToOwningShards");
+            expectShardStopping(
+                [&] {
+                    data::WriteBatch afterStop2;
+                    afterStop2.series = {floatSeries(k2, 44.0)};
+                    cluster::proposeSlicesToOwningShards(shards, std::move(afterStop2)).get();
+                },
+                "proposeSlicesToOwningShards");
 
             // The still-live shard keeps working -- the failure is scoped to the stopped one.
             data::WriteBatch stillLive;

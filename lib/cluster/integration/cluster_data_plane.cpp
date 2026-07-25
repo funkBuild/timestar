@@ -122,7 +122,9 @@ seastar::future<> ClusterDataPlane::start(const ClusterConfig& cfg, seastar::sha
         }
 
         // Serve the DATA plane on this node's data-plane address FROM EVERY SHARD
-        // (SO_REUSEPORT), and give every shard its own peer clients. Previously one
+        // (connection_distribution, not SO_REUSEPORT -- this seastar disables reuseport,
+        // so shard 0 owns the one socket and hands each accepted fd to the shard the
+        // listen options pick), and give every shard its own peer clients. Previously one
         // DataPlaneRpc on shard 0 carried every forwarded write in BOTH directions, so
         // each shard's remote leader-forwards hopped to shard 0 and back and every
         // peer's inbound proposal landed there: shard 0's Raft profile stayed ~10-20x
@@ -137,8 +139,10 @@ seastar::future<> ClusterDataPlane::start(const ClusterConfig& cfg, seastar::sha
             return p.startDataPlane(dataPlaneAddr, tls, ver);
         });
 
-        // Serve Raft on this node's own Raft address FROM EVERY SHARD (SO_REUSEPORT).
-        // Each shard decodes and routes to the shard owning the addressed group.
+        // Serve Raft on this node's own Raft address FROM EVERY SHARD (again
+        // connection_distribution, see above). Whichever shard accepts a connection
+        // peeks each envelope's group id and routes it to the shard owning that group,
+        // which then decodes it.
         seastar::net::inet_address rAddr = co_await resolveHost(self.host);
         const seastar::socket_address raftAddr(rAddr, static_cast<uint16_t>(self.port + kRaftPortOffset));
         co_await shards_.invoke_on_all([raftAddr](ShardRaftPlane& p) { return p.startTransport(raftAddr); });
@@ -207,9 +211,10 @@ seastar::future<> ClusterDataPlane::stop() {
 
 seastar::future<> ClusterDataPlane::write(data::WriteBatch batch) {
     // RF=3: replicate to each VShard's Raft leader (durable quorum commit). RF=1/M2:
-    // apply directly on the owner.
+    // apply directly on the owner. The replicated path is writeFromShard's -- the two
+    // were separate functions with identical bodies once Phase 1c let any shard write.
     if (replicated_)
-        return writeReplicated(std::move(batch));
+        return writeFromShard(std::move(batch));
     if (!router_)
         throw std::runtime_error("ClusterDataPlane::write before start");
     return router_->write(std::move(batch));
@@ -412,15 +417,16 @@ seastar::future<size_t> ClusterDataPlane::rebalanceLeadership(size_t maxTransfer
 }
 
 seastar::future<> ClusterDataPlane::writeFromShard(data::WriteBatch batch) {
-    // Same work as writeReplicated, but safe to call from the shard the HTTP request
-    // arrived on (see the header): the split and dispatch touch only `shards_`.
-    return writeSlicesToOwningShards(shards_, std::move(batch));
-}
-
-seastar::future<> ClusterDataPlane::writeReplicated(data::WriteBatch batch) {
-    // Group the series by the shard that owns their VShard's Raft group, then hand
-    // each slice to that shard's plane (which resolves the leader for its own
-    // VShards locally and forwards to a remote leader when needed).
+    // Split the series by the shard that owns their VShard's Raft group, then hand each
+    // slice to that shard's plane (which resolves the leader for its own VShards
+    // locally and forwards to a remote leader when needed). Safe to call from the shard
+    // the HTTP request arrived on (see the header): it touches only `shards_`.
+    //
+    // Guard the documented precondition the way write()/metadata() guard theirs: called
+    // before start(), or on an RF=1 node, `shards_` holds no planes and every slice
+    // would silently resolve against a null one.
+    if (!replicated_ || !shardsStarted_)
+        throw std::runtime_error("ClusterDataPlane::writeFromShard requires replicated mode after start()");
     return writeSlicesToOwningShards(shards_, std::move(batch));
 }
 

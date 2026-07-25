@@ -184,7 +184,23 @@ public:
     }
 
     ReplicatedDataPlane& plane() { return *plane_; }
-    bool ready() const { return plane_ != nullptr; }
+
+    // Whether this shard's plane may still take work. `plane_ != nullptr` alone is too
+    // weak: stop() tears the plane down only AFTER draining its RPC server, so between
+    // the two there is a window in which the plane is still non-null but is about to
+    // stop ticking -- a slice admitted there waits on a commit that will never be
+    // driven, which shows up as a shutdown hang bounded only by the process's shutdown
+    // timeout. `stopping_` closes that window at the very top of stop(). Work already
+    // in flight is unaffected (it awaits a plane that keeps ticking until plane_->stop()
+    // runs); only NEW slices are turned away, with the retryable kShardStoppingError.
+    bool ready() const { return plane_ != nullptr && !stopping_; }
+
+    // Peer proposals this shard's data-plane listener has SERVED (write-scaleout 1b/2):
+    // it counts on the shard the connection was accepted on, not on the shards that own
+    // the VShards, so it is the node's per-core inbound-ingress distribution. Pins the
+    // production perShardListener=true: with the listener pinned instead, every peer
+    // connection lands on shard 0 and this is 0 everywhere else.
+    uint64_t inboundProposals() const { return inboundProposals_; }
 
     // This shard's slice of the cluster-wide leadership picture.
     struct Counts {
@@ -288,6 +304,10 @@ public:
     }
 
     seastar::future<> stop() {
+        // Refuse NEW slices from this instant (see ready()), before anything is torn
+        // down: sharded<>::stop() runs every shard's stop() concurrently, so a shard
+        // that has not started stopping can still route a slice here.
+        stopping_ = true;
         // STOP SERVING FIRST. This shard's DataPlaneRpc is one of the node's real
         // data-plane servers, and its handlers reach the plane (proposeBatch ->
         // p.plane()). Tearing the plane down first left a window in which an inbound
@@ -316,6 +336,8 @@ private:
     seastar::sharded<ShardRaftPlane>* peers_ = nullptr;
     std::unique_ptr<data::DataPlaneRpc> rpc_;  // this shard's own data-plane listener + peer clients
     std::unique_ptr<ReplicatedDataPlane> plane_;
+    bool stopping_ = false;          // set at the top of stop(); see ready()
+    uint64_t inboundProposals_ = 0;  // peer proposals served BY THIS SHARD's listener
 };
 
 // Split `batch` by the shard that OWNS each series' VShard Raft group and dispatch
@@ -399,6 +421,7 @@ inline seastar::future<bool> proposeSlicesToOwningShards(seastar::sharded<ShardR
 }
 
 inline seastar::future<bool> ShardRaftPlane::proposeBatch(data::WriteBatch batch) {
+    ++inboundProposals_;  // served on THIS shard, whichever shards end up owning the slices
     return proposeSlicesToOwningShards(*peers_, std::move(batch));
 }
 

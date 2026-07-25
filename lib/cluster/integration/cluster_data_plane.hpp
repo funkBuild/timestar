@@ -127,9 +127,6 @@ public:
 private:
     // RF=3 leader read: fan out per-VShard-leader (see .cpp).
     seastar::future<QueryResponse> queryReplicated(QueryRequest request);
-    // Split a batch by the shard owning each series' VShard and replicate each slice
-    // on that shard's Raft plane.
-    seastar::future<> writeReplicated(data::WriteBatch batch);
     // vshard -> current leader, gathered from every shard (groups live across cores).
     seastar::future<std::map<uint16_t, data::NodeId>> gatherLeaders() const;
 
