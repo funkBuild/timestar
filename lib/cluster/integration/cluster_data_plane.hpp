@@ -11,6 +11,7 @@
 #include "engine_local_store.hpp"
 #include "replicated_data_plane.hpp"
 
+#include <map>
 #include <memory>
 #include <optional>
 #include <seastar/core/future.hh>
@@ -57,6 +58,23 @@ public:
     NodeId selfId() const { return rt_ ? rt_->selfId : 0; }
     const data::VShardDirectory& directory() const { return *dir_; }
 
+    // Operator visibility (integration plan M5/M6 operator surface). A snapshot of
+    // what this node believes about the cluster, for `GET /cluster/status`.
+    // leaderless > 0 on a replicated cluster means those VShards cannot be read or
+    // written -- the single most useful signal when a cluster is misbehaving (it had
+    // to be inferred from query errors and `ss` output before this existed).
+    struct Status {
+        NodeId self = 0;
+        uint16_t replicationFactor = 1;
+        bool replicated = false;
+        std::map<NodeId, std::string> peers;  // node id -> "host:port"
+        // Replicated mode only (all zero otherwise):
+        size_t vshardsHostedHere = 0;  // Raft groups this node replicates
+        size_t vshardsLedHere = 0;     // of those, ones this node currently leads
+        size_t vshardsLeaderless = 0;  // VShards with NO elected leader anywhere
+    };
+    Status status() const;
+
 private:
     // RF=3 leader read: fan out per-VShard-leader (see .cpp).
     seastar::future<QueryResponse> queryReplicated(QueryRequest request);
@@ -76,6 +94,7 @@ private:
     std::unique_ptr<raft::RaftRpcTransport> raftTransport_;
     std::unique_ptr<ReplicatedDataPlane> rdp_;
     bool replicated_ = false;
+    uint16_t rf_ = 1;  // configured replication factor (reported by status())
 };
 
 }  // namespace timestar::cluster

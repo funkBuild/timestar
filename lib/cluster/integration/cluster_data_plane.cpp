@@ -48,6 +48,7 @@ seastar::future<seastar::net::inet_address> resolveHost(const std::string& host)
 
 seastar::future<> ClusterDataPlane::start(const ClusterConfig& cfg, seastar::sharded<Engine>& engines) {
     rt_ = ClusterRuntime::fromConfig(cfg);  // throws (fail-closed) on misconfig
+    rf_ = cfg.replication_factor < 1 ? 1 : cfg.replication_factor;
     dir_ = std::make_unique<data::VShardDirectory>(rt_->directory());
     local_ = std::make_unique<EngineLocalStore>(engines);
     rpc_ = std::make_unique<data::DataPlaneRpc>();
@@ -238,6 +239,30 @@ seastar::future<QueryResponse> ClusterDataPlane::queryReplicated(QueryRequest re
     }
     co_return co_await finalizer_->finalizeClusterPartials(std::move(request), std::move(allPartials),
                                                           std::move(allNonNumeric));
+}
+
+ClusterDataPlane::Status ClusterDataPlane::status() const {
+    Status s;
+    if (!rt_)
+        return s;
+    s.self = rt_->selfId;
+    s.peers = rt_->peerAddresses;
+    s.replicated = replicated_;
+    s.replicationFactor = rf_;
+    if (!replicated_ || !rdp_)
+        return s;
+    // Walk every VShard once: how many this node hosts, how many it leads, and how
+    // many have no leader anywhere (the read/write-blocking condition).
+    auto& host = const_cast<ReplicatedDataPlane*>(rdp_.get())->host();
+    s.vshardsHostedHere = host.vshardCount();
+    for (uint16_t vs = 0; vs < timestar::VIRTUAL_SHARD_COUNT; ++vs) {
+        const data::NodeId leader = host.leaderOf(vs);
+        if (leader == timestar::raft::kNoNode)
+            ++s.vshardsLeaderless;
+        else if (leader == rt_->selfId)
+            ++s.vshardsLedHere;
+    }
+    return s;
 }
 
 seastar::future<data::MetadataResult> ClusterDataPlane::metadata(data::MetadataRequest request) {

@@ -100,6 +100,45 @@ void set_routes(routes& r) {
     r.add(operation_type::GET, url("/test"),
           new function_handler([](const_req /*req*/) { return "Hello from TimeStar HTTP Server!"; }));
 
+    // Operator visibility for a clustered deployment (integration plan M5/M6 operator
+    // surface). Reports this node's identity/peers and, when replicated, how many
+    // VShards it hosts, leads, and -- critically -- how many have NO elected leader.
+    // A non-zero leaderless count is exactly the condition that makes reads and writes
+    // fail, and before this it could only be inferred from query errors.
+    r.add(operation_type::GET, url("/cluster/status"),
+          new function_handler(
+              [](std::unique_ptr<seastar::http::request> /*req*/,
+                 std::unique_ptr<seastar::http::reply> rep) -> seastar::future<std::unique_ptr<seastar::http::reply>> {
+                  rep->set_status(seastar::http::reply::status_type::ok);
+                  rep->set_content_type("json");
+                  if (!g_clusterPartitioned) {
+                      rep->_content = R"({"clustered":false})";
+                      co_return std::move(rep);
+                  }
+                  // The data plane lives on shard 0; hop there for its view.
+                  auto st = co_await seastar::smp::submit_to(0u, [] { return g_clusterDataPlane.status(); });
+                  std::string peers;
+                  for (const auto& [id, addr] : st.peers) {
+                      if (!peers.empty())
+                          peers += ",";
+                      peers += "{\"node\":" + std::to_string(id) + ",\"address\":\"" + addr + "\"}";
+                  }
+                  std::string body = "{\"clustered\":true,\"node_id\":" + std::to_string(st.self) +
+                                     ",\"replication_factor\":" + std::to_string(st.replicationFactor) +
+                                     ",\"replicated\":" + (st.replicated ? "true" : "false") + ",\"peers\":[" + peers +
+                                     "]";
+                  if (st.replicated) {
+                      body += ",\"vshards_hosted\":" + std::to_string(st.vshardsHostedHere) +
+                              ",\"vshards_led\":" + std::to_string(st.vshardsLedHere) +
+                              ",\"vshards_leaderless\":" + std::to_string(st.vshardsLeaderless) +
+                              ",\"healthy\":" + (st.vshardsLeaderless == 0 ? "true" : "false");
+                  }
+                  body += "}";
+                  rep->_content = std::move(body);
+                  co_return std::move(rep);
+              },
+              "json"));
+
     r.add(operation_type::GET, url("/health"),
           new function_handler(
               [](std::unique_ptr<seastar::http::request> req,
