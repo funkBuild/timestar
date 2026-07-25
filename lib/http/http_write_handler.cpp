@@ -2063,6 +2063,12 @@ seastar::future<bool> HttpWriteHandler::processBatchWrites(const json_value_t::a
         } catch (const timestar::data::WriteOverloadedError&) {
             if (!clusterError)
                 clusterError = std::current_exception();
+        } catch (const timestar::data::ShardStoppingError&) {
+            // Was falling into the generic handler below and being counted as
+            // failedWrites -> HTTP 200 {"status":"partial"}: a silent partial batch on a
+            // node that simply was not accepting the write.
+            if (!clusterError)
+                clusterError = std::current_exception();
         } catch (const timestar::data::UnassignedVShardError&) {
             if (!clusterError)
                 clusterError = std::current_exception();
@@ -2347,25 +2353,42 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleW
             rep->_content = createErrorResponse(e.what());
         }
         timestar::http::setContentType(*rep, resFmt);
+    } catch (const timestar::data::UnassignedVShardError& e) {
+        // NOT retryable, and the status must say so. This VShard has no owner in the
+        // current placement map: the cluster is misconfigured or mid-reconfiguration, and
+        // (unlike a moved leader) no amount of client retrying resolves it -- which is
+        // exactly what isRetryableWriteFailure(Unassigned) == false already asserts. It
+        // was in the 503 + Retry-After disjunction, contradicting the enum and inviting a
+        // client to retry-loop against a condition only an operator can clear. 500 with
+        // the REAL message, not the opaque one: it is a server-side fault, but a
+        // diagnosable one.
+        ++engineSharded->local().metrics().insert_errors_total;
+        timestar::http_log.error("Write rejected, VShard unassigned (fail-closed): {}", e.what());
+        rep->set_status(seastar::http::reply::status_type::internal_server_error);
+        if (timestar::http::isProtobuf(resFmt)) {
+            rep->_content = timestar::proto::formatWriteResponse("error", 0, 0, {std::string(e.what())});
+        } else {
+            rep->_content = createErrorResponse(e.what());
+        }
+        timestar::http::setContentType(*rep, resFmt);
     } catch (const std::exception& e) {
         // Cluster write failures that the CLIENT should retry -- a leader that moved and
         // outlived the coordinator's retry budget, a shard shutting down, an admission or
-        // in-flight-bytes rejection, an unassigned VShard -- are availability, not faults.
-        // They used to fall into the catch-all below and be reported as "Internal server
-        // error" 500: indistinguishable from a genuine bug, and it told a client that
-        // retrying was pointless when retrying was exactly right. 503 + Retry-After is the
-        // convention the single-node ingest backlog already uses (see IngestBacklogException
-        // above) and what the rolling-rebalance gate needs in order to be a latency event
-        // rather than a client error.
+        // in-flight-bytes rejection -- are availability, not faults. They used to fall
+        // into the catch-all below and be reported as "Internal server error" 500:
+        // indistinguishable from a genuine bug, and it told a client that retrying was
+        // pointless when retrying was exactly right. 503 + Retry-After is the convention
+        // the single-node ingest backlog already uses (see IngestBacklogException above)
+        // and what the rolling-rebalance gate needs in order to be a latency event rather
+        // than a client error.
         //
-        // Caught as one clause because all four map to the same answer; the message names
-        // which. Everything else still becomes an opaque 500 -- deliberately, since an
+        // The set here is exactly the retryable half of the WriteFailure taxonomy
+        // (write_errors.hpp); Unassigned is handled above precisely because it is NOT in
+        // it. Everything else still becomes an opaque 500 -- deliberately, since an
         // unrecognised failure is a bug and must not be dressed up as backpressure.
-        const bool retryable =
-            dynamic_cast<const timestar::data::RetryableWriteError*>(&e) != nullptr ||
-            dynamic_cast<const timestar::data::WriteOverloadedError*>(&e) != nullptr ||
-            dynamic_cast<const timestar::data::UnassignedVShardError*>(&e) != nullptr ||
-            std::string_view(e.what()).find("shard data plane is stopping") != std::string_view::npos;
+        const bool retryable = dynamic_cast<const timestar::data::RetryableWriteError*>(&e) != nullptr ||
+                               dynamic_cast<const timestar::data::WriteOverloadedError*>(&e) != nullptr ||
+                               dynamic_cast<const timestar::data::ShardStoppingError*>(&e) != nullptr;
         ++engineSharded->local().metrics().insert_errors_total;
         if (retryable) {
             timestar::http_log.warn("Write rejected, retryable cluster condition: {}", e.what());

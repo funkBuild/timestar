@@ -6,10 +6,17 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <seastar/core/future.hh>
 #include <seastar/net/socket_defs.hh>
+#include <seastar/rpc/rpc_types.hh>  // rpc_clock_type
 
 namespace timestar::data {
+
+// OptDeadline (node_store.hpp): a wall-clock point past which an awaited data-plane RPC
+// must give up. std::nullopt = no timeout, the pre-3f behaviour, kept for callers with no
+// deadline of their own (tests, the legacy verbs). seastar's rpc clock is lowres_clock,
+// so it is the same clock the router measures its budget in.
 
 // The data-plane inter-node transport over seastar::rpc. It is BOTH the server
 // (dispatching forwarded writes/queries into this node's storage sink) and the
@@ -75,7 +82,7 @@ public:
     // and returns per-VShard rejects carrying the peer's view of the real leader. Speaks
     // the hinted verb only when the negotiated version says the peer answers it,
     // otherwise falls back to the v1-shaped reply with hintless rejects.
-    seastar::future<ProposeOutcome> proposeWriteHinted(NodeId to, VShardBatchView view) override;
+    seastar::future<ProposeOutcome> proposeWriteHinted(NodeId to, VShardBatchView view, OptDeadline deadline) override;
 
     // The Raft propose target incoming proposeWrite RPCs dispatch into (the node's
     // ReplicatedVShardHost). Must be set before a peer sends proposeWrite; outlives
@@ -107,18 +114,26 @@ public:
     // Defaults to {1, kWriteBatchFormatMax} -- everything this binary can read and
     // write. Set before serving to narrow it (a test pinning an old peer's range).
     void setLocalVersion(features::VersionRange range);
+    // What this transport will ADVERTISE in the handshake. Exposed so a test can assert
+    // the real value rather than grep the source for a literal.
+    features::VersionRange localVersion() const;
 
     // The WriteBatch format agreed with peer `to`, handshaked once per connection and
     // cached. Forwarded writes and proposes encode at this version, so a mixed-version
     // cluster silently speaks v1 while an INCOMPATIBLE peer (no overlapping range)
     // throws -- fail closed, never a mis-framed batch.
     seastar::future<uint32_t> versionFor(NodeId to);
+    seastar::future<uint32_t> versionFor(NodeId to, OptDeadline deadline);
 
     // Negotiate the wire version to speak with peer `to`: the highest version BOTH
     // support (features::negotiate over the exchanged ranges). THROWS if the ranges do
     // not overlap -- an incompatible peer is refused rather than silently mis-framed,
     // so a node never talks a format the other cannot read (decision 8).
     seastar::future<uint32_t> negotiateVersion(NodeId to);
+    // ... bounded by `deadline`. The handshake precedes the write it gates and talks to
+    // the same peer, so leaving it unbounded put an untimed suspension in front of a
+    // timed one -- a black-holed peer hung the caller before the batch was even encoded.
+    seastar::future<uint32_t> negotiateVersion(NodeId to, OptDeadline deadline);
 
 private:
     struct Impl;

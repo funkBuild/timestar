@@ -83,6 +83,11 @@ public:
     std::vector<std::exception_ptr> throwOnAttempt;  // index = attempt-1; null = no throw
     unsigned attempts = 0;
     std::vector<std::vector<uint16_t>> seen;  // VShards proposed, per attempt
+    // Reproduce ReplicatedVShardHost's membership-check shape: propose NOTHING and name
+    // only ONE VShard in the reject list. Every other double here models the (false)
+    // assumption "rejects == everything uncommitted"; this one models what the real sink
+    // actually does, which is what made the reject-set contract unsafe.
+    bool subsetRejectProposeNothing = false;
 
     seastar::future<bool> proposeBatch(WriteBatch) override {
         return seastar::make_exception_future<bool>(std::runtime_error("unused"));
@@ -96,12 +101,27 @@ public:
         if (attempt <= throwOnAttempt.size() && throwOnAttempt[attempt - 1])
             return seastar::make_exception_future<ProposeOutcome>(throwOnAttempt[attempt - 1]);
         ProposeOutcome out;
+        if (subsetRejectProposeNothing && attempt == 1) {
+            // ATTEMPT 1 ONLY: committedVShards stays EMPTY -- nothing was proposed --
+            // while `rejects` names a single VShard. A caller that subtracts rejects acks
+            // the other 59 here and then commits the named one on attempt 2, so the WRITE
+            // SUCCEEDS having replicated 1 of 60 slices. Rejecting forever would only
+            // show a wrong retry set; failing on attempt 2 is what makes the bogus ACK
+            // observable.
+            if (!view.empty())
+                out.rejects.push_back(
+                    SliceReject{view.front()->first, timestar::raft::kNoNode, WriteFailure::NotLeader});
+            out.committed = false;
+            return seastar::make_ready_future<ProposeOutcome>(std::move(out));
+        }
         for (const auto* g : view) {
             auto it = rejectUntilAttempt.find(g->first);
             if (it != rejectUntilAttempt.end() && attempt < it->second) {
                 const auto k = kindFor.count(g->first) ? kindFor.at(g->first) : WriteFailure::NotLeader;
                 const NodeId h = hintFor.count(g->first) ? hintFor.at(g->first) : timestar::raft::kNoNode;
                 out.rejects.push_back(SliceReject{g->first, h, k});
+            } else {
+                out.committedVShards.push_back(g->first);  // the AUTHORITATIVE half
             }
         }
         out.committed = out.rejects.empty();
@@ -121,16 +141,20 @@ public:
     seastar::future<NodeQueryPartial> queryNode(NodeId, NodeQueryRequest) override {
         return seastar::make_exception_future<NodeQueryPartial>(std::runtime_error("unused"));
     }
-    seastar::future<ProposeOutcome> proposeWriteHinted(NodeId to, VShardBatchView view) override {
+    seastar::future<ProposeOutcome> proposeWriteHinted(NodeId to, VShardBatchView view, OptDeadline) override {
         ++calls;
         for (const auto* g : view)
             received[to].push_back(g->first);
         if (deadNodes.count(to))
             return seastar::make_exception_future<ProposeOutcome>(std::runtime_error("connection is closed"));
         ProposeOutcome out;
-        if (notLeaderOf.count(to))
+        if (notLeaderOf.count(to)) {
             for (const auto* g : view)
                 out.rejects.push_back(SliceReject{g->first, timestar::raft::kNoNode, WriteFailure::NotLeader});
+        } else {
+            for (const auto* g : view)
+                out.committedVShards.push_back(g->first);
+        }
         out.committed = out.rejects.empty();
         return seastar::make_ready_future<ProposeOutcome>(std::move(out));
     }
@@ -363,8 +387,97 @@ seastar::future<> testTransportErrorRetriesAgainstTheAdvancedMap() {
     EXPECT_EQ(local.attempts, 0u);
 }
 
+// F1 REGRESSION. A sink that reports a STRICT-SUBSET reject list while committing
+// NOTHING must fail the whole write -- never ack the slices it merely failed to mention.
+//
+// This is the shape ReplicatedVShardHost's membership check produces by construction: it
+// finds one group it does not host, proposes NONE of them, and names only that one. The
+// router used to derive "uncommitted == rejects", so it retried that single VShard and
+// ACKED the other 59 having never replicated a byte of them -- ack-without-commit, silent
+// data loss. It is reachable in production because ClusterDataPlane::start opens the
+// data-plane listener before instantiating the groups, so a joining or restarting node
+// serves proposes for seconds while hosting only some of them.
+//
+// The old matched==0 guard did not catch it: one reject DID match the view, so `matched`
+// was 1 and the partial sailed through. Pre-fix this test observed acked=true with 60
+// VShards in the batch and 1 proposed.
+seastar::future<> testStrictSubsetRejectNeverAcks() {
+    VShardDirectory dir(1, allLocalMap());
+    WriteBatch batch = manySeries(60);
+    const auto vs = vshardsOf(batch);
+    EXPECT_GE(vs.size(), 3u) << "the batch must span several VShards for this to be a real test";
+
+    ScriptedLocalSink local;
+    ScriptedTransport client;
+    MapLeaderResolver leaders;
+    local.subsetRejectProposeNothing = true;  // commits nothing, names exactly one VShard
+    ReplicatedBatchWriteRouter router(dir, local, client, leaders);
+
+    bool acked = false;
+    try {
+        co_await router.write(std::move(batch));
+        acked = true;
+    } catch (const RetryableWriteError&) {}
+
+    // THE ASSERTION: an ack is only honest if every VShard in the batch was actually
+    // proposed on the attempt that committed it. Attempt 1 proposed NOTHING, so a `true`
+    // here means 59 slices were acked without ever reaching Raft.
+    std::set<uint16_t> everCommitted;
+    if (local.seen.size() >= 2)
+        everCommitted.insert(local.seen.back().begin(), local.seen.back().end());
+    EXPECT_TRUE(!acked || everCommitted.size() == vs.size())
+        << "ACKED with " << vs.size() << " VShards in the batch but only " << everCommitted.size()
+        << " ever proposed -- the reject list was trusted as the complete uncommitted set";
+    EXPECT_TRUE(acked) << "with the committed-set contract the retry re-dispatches all " << vs.size()
+                       << " slices and the write legitimately succeeds";
+}
+
+// The hostile/buggy-peer variant: a reply naming VShards that were never in the view must
+// not remove anything from the retry set.
+seastar::future<> testRejectsOutsideTheViewCannotAck() {
+    VShardDirectory dir(1, allLocalMap());
+    WriteBatch batch = manySeries(20);
+    const auto vs = vshardsOf(batch);
+
+    class LyingSink : public ProposeSink {
+    public:
+        unsigned attempts = 0;
+        seastar::future<bool> proposeBatch(WriteBatch) override {
+            return seastar::make_exception_future<bool>(std::runtime_error("unused"));
+        }
+        seastar::future<ProposeOutcome> proposeVShardBatchesHinted(VShardBatchView view) override {
+            ++attempts;
+            ProposeOutcome out;
+            out.committed = false;
+            // Claims to have committed VShards it was never asked about, and rejects one
+            // that is not in the view either.
+            out.committedVShards = {60000, 60001, 60002};
+            out.rejects.push_back(SliceReject{59999, 4, WriteFailure::NotLeader});
+            (void)view;
+            return seastar::make_ready_future<ProposeOutcome>(std::move(out));
+        }
+    } local;
+    ScriptedTransport client;
+    MapLeaderResolver leaders;
+    ReplicatedBatchWriteRouter router(dir, local, client, leaders);
+
+    bool acked = false;
+    try {
+        co_await router.write(std::move(batch));
+        acked = true;
+    } catch (const RetryableWriteError&) {}
+    EXPECT_FALSE(acked) << "a reply naming VShards outside the view must not ack anything";
+    EXPECT_GE(vs.size(), 1u);
+}
+
 }  // namespace
 
+TEST(ReplicatedBatchWriteRouterTest, StrictSubsetRejectNeverAcks) {
+    testStrictSubsetRejectNeverAcks().get();
+}
+TEST(ReplicatedBatchWriteRouterTest, RejectsOutsideTheViewCannotAck) {
+    testRejectsOutsideTheViewCannotAck().get();
+}
 TEST(ReplicatedBatchWriteRouterTest, RoutesEachSeriesToItsVShardLeader) { testRoutesToLeaders().get(); }
 TEST(ReplicatedBatchWriteRouterTest, StaleLeaderFailsWholeWriteRetryably) {
     testStaleLeaderFailsWrite().get();

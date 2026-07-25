@@ -852,6 +852,8 @@ public:
             lastVShards.push_back(g.first);
             if (g.first == rejectVShard)
                 out.rejects.push_back(data::SliceReject{g.first, hint, data::WriteFailure::NotLeader});
+            else
+                out.committedVShards.push_back(g.first);  // AUTHORITATIVE half
         }
         out.committed = out.rejects.empty();
         return seastar::make_ready_future<data::ProposeOutcome>(std::move(out));
@@ -882,8 +884,11 @@ TEST_F(DataPlaneRpcEnrichedTest, HintedProposeCarriesTheRealLeaderBack) {
         rpc.addPeer(self, loopback(port));
 
         data::VShardBatches groups = data::splitByVShard(std::move(batch));
-        data::ProposeOutcome out = rpc.proposeWriteHinted(self, data::viewOf(groups)).get();
+        data::ProposeOutcome out = rpc.proposeWriteHinted(self, data::viewOf(groups), std::nullopt).get();
         EXPECT_FALSE(out.committed);
+        // The AUTHORITATIVE half must survive the wire: nothing committed here, and the
+        // caller must be able to see that without inferring it from the reject list.
+        EXPECT_TRUE(out.committedVShards.empty());
         ASSERT_EQ(out.rejects.size(), 1u);
         EXPECT_EQ(out.rejects[0].vshard, vs);
         EXPECT_EQ(out.rejects[0].leaderHint, 7u) << "a not-leader reply must carry the real leader";
@@ -893,9 +898,12 @@ TEST_F(DataPlaneRpcEnrichedTest, HintedProposeCarriesTheRealLeaderBack) {
         // The same call once the sink leads it: a full commit, and the reply is the
         // byte-identical "1" the old verb used.
         sink.rejectVShard = 0xffff;
-        data::ProposeOutcome ok = rpc.proposeWriteHinted(self, data::viewOf(groups)).get();
+        data::ProposeOutcome ok = rpc.proposeWriteHinted(self, data::viewOf(groups), std::nullopt).get();
         EXPECT_TRUE(ok.committed);
         EXPECT_TRUE(ok.rejects.empty());
+        // A '1' reply names no VShards on the wire; the client fills in what it asked
+        // for, so the caller's committed-set arithmetic works uniformly.
+        EXPECT_EQ(ok.committedVShards, std::vector<uint16_t>{vs});
         rpc.stop().get();
     }).get();
 }
@@ -914,8 +922,11 @@ TEST_F(DataPlaneRpcEnrichedTest, HintedProposeFallsBackForAPeerBelowV3) {
 
         EXPECT_EQ(cli.versionFor(server).get(), data::kWriteBatchFormatV2);
         data::VShardBatches groups = data::splitByVShard(oneFloatBatch());
-        data::ProposeOutcome out = cli.proposeWriteHinted(server, data::viewOf(groups)).get();
+        data::ProposeOutcome out = cli.proposeWriteHinted(server, data::viewOf(groups), std::nullopt).get();
         EXPECT_TRUE(out.committed) << "the tap answers verb 6 with a commit";
+        EXPECT_EQ(out.committedVShards.size(), groups.size())
+            << "a pre-v3 'committed' must still name what it committed, or the caller "
+               "cannot tell a full commit from an empty one";
         ASSERT_EQ(tap.captured.size(), 1u) << "the pre-v3 peer must be reached on verb 6";
         EXPECT_EQ(tap.captured[0].compare(0, 4, "TSW2"), 0) << "the PAYLOAD version is unaffected by v3";
         cli.stop().get();
@@ -955,7 +966,7 @@ TEST_F(DataPlaneRpcEnrichedTest, OversizedSliceIsRefusedLocallyAsTooLarge) {
 
         bool tooLarge = false;
         try {
-            rpc.proposeWriteHinted(self, data::viewOf(groups)).get();
+            rpc.proposeWriteHinted(self, data::viewOf(groups), std::nullopt).get();
         } catch (const data::WriteFrameTooLargeError&) {
             tooLarge = true;
         } catch (const std::exception& e) {

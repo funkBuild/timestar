@@ -56,6 +56,11 @@ public:
     // path stayed plaintext -- queries fail loudly, writes go silently unencrypted.
     void setTlsCredentials(DataPlaneTls creds) { tls_ = std::move(creds); }
     void setLocalVersion(features::VersionRange range) { localVersion_ = range; }
+    // What this NODE advertises to peers (pushed to every per-shard transport in
+    // start()). Exposed so a test can read the real value back instead of grepping for a
+    // literal: a grep cannot see a regression in DataPlaneRpc's own default, a third
+    // advertiser, or a setLocalVersion() call that overrides the initializer.
+    features::VersionRange localVersion() const { return localVersion_; }
 
     // Route a partitioned write to VShard owners (local applied directly, remote
     // forwarded), and a query fanned out to owners then merged to the single-node

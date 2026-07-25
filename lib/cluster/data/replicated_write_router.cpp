@@ -3,6 +3,7 @@
 #include "../../core/placement_table.hpp"  // virtualShard
 #include "../../utils/logger.hpp"
 
+#include <algorithm>
 #include <map>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/lowres_clock.hh>
@@ -77,10 +78,15 @@ seastar::future<> ReplicatedBatchWriteRouter::write(VShardBatches groups) {
             pendingViews.push_back(&localView);
             pending.push_back(local_.proposeVShardBatchesHinted(localView));
         }
+        // The attempt's own deadline: never past the overall one, and never longer than a
+        // single attempt is allowed to take. Pushed INTO the RPC, because a deadline
+        // checked only between attempts cannot stop an attempt that never returns.
+        const auto attemptDeadline =
+            std::min(deadline, seastar::lowres_clock::now() + ReplicatedBatchWriteRouter::kAttemptTimeout);
         for (auto& [leader, lview] : byLeader) {
             pendingTargets.push_back(leader);
             pendingViews.push_back(&lview);
-            pending.push_back(client_.proposeWriteHinted(leader, lview));
+            pending.push_back(client_.proposeWriteHinted(leader, lview, attemptDeadline));
         }
 
         // Await ALL (never abandon an in-flight replication) and collect the slices that
@@ -94,27 +100,29 @@ seastar::future<> ReplicatedBatchWriteRouter::write(VShardBatches groups) {
                 ProposeOutcome out = co_await std::move(pending[i]);
                 if (out.committed)
                     continue;
-                size_t matched = 0;
+                // COMMITTED-SET, not reject-set (see ProposeOutcome). Everything this
+                // target was asked for is uncommitted UNLESS it is explicitly named
+                // committed. Deriving the uncommitted set by subtracting `rejects` acked
+                // slices that were never replicated whenever a sink answered with a
+                // strict-subset reject list -- which ReplicatedVShardHost's membership
+                // check does by construction, having proposed nothing at all.
+                //
+                // Only VShards WE dispatched to this target can be crossed off, so a
+                // reply naming VShards outside the view (a buggy or hostile peer) cannot
+                // remove anything from the retry set.
+                std::set<uint16_t> committedHere(out.committedVShards.begin(), out.committedVShards.end());
+                for (const auto* g : *pendingViews[i])
+                    if (!committedHere.count(g->first))
+                        failed[g->first] = g;
+                // Rejects are advisory: they carry the leader hint and the reason, and
+                // nothing else. A reject for a VShard outside the view is ignored.
                 for (const auto& r : out.rejects) {
                     lastKind = r.kind;
-                    for (const auto* g : *pendingViews[i])
-                        if (g->first == r.vshard) {
-                            failed[r.vshard] = g;
-                            ++matched;
-                        }
-                    if (r.leaderHint != kNoNode)
+                    if (r.leaderHint != kNoNode && failed.count(r.vshard))
                         nextHints[r.vshard] = r.leaderHint;
                 }
-                // `committed == false` with no reject we can attribute (an empty list, or
-                // VShards not in the view) must NOT read as success -- that is the silent
-                // partial ack the whole contract exists to prevent. Fall back to retrying
-                // the entire target's slice.
-                if (matched == 0) {
-                    if (lastKind == WriteFailure::None)
-                        lastKind = WriteFailure::NotLeader;
-                    for (const auto* g : *pendingViews[i])
-                        failed[g->first] = g;
-                }
+                if (lastKind == WriteFailure::None)
+                    lastKind = WriteFailure::NotLeader;
             } catch (...) {
                 const auto kind = isLocal ? classifyLocalWriteFailure(std::current_exception())
                                           : classifyRemoteWriteFailure(std::current_exception());

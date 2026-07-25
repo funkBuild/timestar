@@ -1,12 +1,13 @@
 #include "cluster_data_plane.hpp"
 
 #include "../../utils/logger.hpp"  // timestar::http_log
+#include "write_admission.hpp"
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/sleep.hh>
 #include <seastar/net/dns.hh>
-#include <set>
 #include <seastar/net/inet_address.hh>
+#include <set>
 #include <stdexcept>
 #include <string>
 
@@ -48,6 +49,10 @@ seastar::future<seastar::net::inet_address> resolveHost(const std::string& host)
 }  // namespace
 
 seastar::future<> ClusterDataPlane::start(const ClusterConfig& cfg, seastar::sharded<Engine>& engines) {
+    // Force the in-flight write budget to resolve (and LOG itself) during startup rather
+    // than on the first write, so a mis-set TIMESTAR_CLUSTER_WRITE_INFLIGHT_BYTES is
+    // visible in the boot log instead of being inferred from a wall of 503s.
+    (void)WriteAdmission::limitBytes();
     rt_ = ClusterRuntime::fromConfig(cfg);  // throws (fail-closed) on misconfig
     enginesPtr_ = &engines;
     rf_ = cfg.replication_factor < 1 ? 1 : cfg.replication_factor;

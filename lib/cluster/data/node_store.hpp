@@ -7,15 +7,21 @@
 #include "write_record.hpp"
 
 #include <cstdint>
+#include <optional>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/do_with.hh>
 #include <seastar/core/future.hh>
+#include <seastar/rpc/rpc_types.hh>  // rpc_clock_type
 #include <string>
 #include <vector>
 
 namespace timestar::data {
 
 using timestar::raft::NodeId;
+
+// See dataplane_rpc.hpp -- declared here too so NodeTransport can name it without
+// depending on the concrete transport.
+using OptDeadline = std::optional<seastar::rpc::rpc_clock_type::time_point>;
 
 // One VShard slice that did NOT commit, and everything the coordinator needs to route
 // its retry (write-scaleout 3a/3b).
@@ -29,13 +35,33 @@ struct SliceReject {
     WriteFailure kind = WriteFailure::NotLeader;
 };
 
-// The result of proposing a set of VShard slices. `committed` is true only when EVERY
-// slice durably committed on quorum; otherwise `rejects` names each slice that did not,
-// so the caller re-dispatches ONLY those (never the ones that committed -- re-proposing
-// a committed slice is safe but pointless, and doing it for a whole batch would multiply
-// the work a leadership transfer costs).
+// The result of proposing a set of VShard slices.
+//
+// THE CONTRACT IS A COMMITTED-SET, NOT A REJECT-SET, and that is a correctness
+// requirement rather than a style choice. `committed == true` means every slice in the
+// view durably committed on quorum. Otherwise the caller must treat EVERY VShard in the
+// view it dispatched as UNCOMMITTED except those named in `committedVShards` -- it must
+// NOT derive the uncommitted set by subtracting `rejects`.
+//
+// Why: a sink can legitimately answer with a reject list that is a STRICT SUBSET of what
+// it failed to commit. ReplicatedVShardHost's membership check does exactly that -- it
+// finds one group it does not host, proposes NOTHING, and names only that group -- so a
+// caller subtracting rejects would ack every other slice in the batch having never
+// replicated it. That is ack-without-commit: silent data loss, and it is REACHABLE, since
+// ClusterDataPlane::start opens the data-plane listener before instantiating the groups,
+// so a joining or restarting node serves proposes for seconds while hosting only some of
+// them. Inverting the contract also disarms the hostile/buggy-peer variant, where a reply
+// names VShards that were never in the view.
+//
+// `rejects` therefore carries only ADVISORY routing information -- who leads a slice now,
+// and why it failed -- never the authoritative set.
 struct ProposeOutcome {
     bool committed = false;
+    // AUTHORITATIVE: exactly the VShards that durably committed on quorum. Ignored when
+    // `committed` is true (which means "all of them").
+    std::vector<uint16_t> committedVShards;
+    // ADVISORY: hints and reasons. May be empty, partial, or (from a hostile peer) name
+    // VShards outside the view. Never used to decide what was committed.
     std::vector<SliceReject> rejects;
 };
 
@@ -92,7 +118,14 @@ public:
     // The default forwards to proposeWrite, copying the view into a WriteBatch and
     // reporting hintless rejects, so an in-memory double that only implements
     // proposeWrite keeps working (and so does a peer too old to answer the hinted verb).
-    virtual seastar::future<ProposeOutcome> proposeWriteHinted(NodeId to, VShardBatchView view) {
+    // `deadline` bounds the whole call (handshake included); std::nullopt means no
+    // bound. The in-memory default ignores it -- a double answers instantly -- but the
+    // real transport MUST honour it: the router only checks its budget BETWEEN attempts,
+    // so an unbounded attempt holds its in-flight-bytes charge for as long as a peer
+    // cares to stay silent, and every other write on that shard queues behind it.
+    virtual seastar::future<ProposeOutcome> proposeWriteHinted(NodeId to, VShardBatchView view,
+                                                               OptDeadline deadline = std::nullopt) {
+        (void)deadline;
         std::vector<uint16_t> vshards;
         WriteBatch merged;
         for (const auto* g : view) {
@@ -103,7 +136,12 @@ public:
         return proposeWrite(to, std::move(merged)).then([vshards = std::move(vshards)](bool ok) {
             ProposeOutcome out;
             out.committed = ok;
-            if (!ok)
+            // A bool answer cannot name a partial commit, so on failure NOTHING is
+            // reported committed and the caller retries the whole view -- which is the
+            // safe reading, and the only one available from a pre-v3 peer.
+            if (ok)
+                out.committedVShards = vshards;
+            else
                 for (uint16_t vs : vshards)
                     out.rejects.push_back(SliceReject{vs, kNoNode, WriteFailure::NotLeader});
             return out;
@@ -148,7 +186,9 @@ public:
         return proposeVShardBatches(std::move(copy)).then([vshards = std::move(vshards)](bool ok) {
             ProposeOutcome out;
             out.committed = ok;
-            if (!ok)
+            if (ok)
+                out.committedVShards = vshards;
+            else
                 for (uint16_t vs : vshards)
                     out.rejects.push_back(SliceReject{vs, kNoNode, WriteFailure::NotLeader});
             return out;

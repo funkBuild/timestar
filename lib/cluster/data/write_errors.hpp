@@ -51,8 +51,17 @@ using timestar::raft::NodeId;
 //   operations OVERLAP in real time and either order is correct. An acked-then-reverted
 //   sequence is impossible, because a slice that returned success is never retried.
 //
-//   Deletes and retention cutoffs are NOT re-proposed by this machinery (the retry
-//   lives in the WriteBatch router only), so the non-idempotent commands never see it.
+//   Deletes and retention cutoffs are NOT re-proposed by this machinery (the retry lives
+//   in the WriteBatch router only), so the non-idempotent commands never see it.
+//
+//   FOR WHOEVER REPLICATES DELETES (M6): that immunity is incidental, not designed. A
+//   delete is not idempotent against a concurrent write to the same point -- re-applying
+//   one at a HIGHER revision would erase a write that legitimately landed after the
+//   original delete committed, resurrecting nothing and losing real data. Today
+//   DeleteRangeKey never reaches this retry loop because deletes are not routed through
+//   Raft on the write path at all. The moment they are, this audit must be redone: either
+//   deletes get revision-bounded tombstones (so a re-apply cannot outrank a later write),
+//   or they must be excluded from the ambiguous-retry classes explicitly.
 //
 // `Unassigned` and `Fatal` are terminal: no amount of retrying fixes an unowned VShard
 // or a journal I/O error, and hiding either behind a retry budget only delays the
@@ -137,6 +146,18 @@ public:
     explicit RetryableWriteError(const std::string& what) : std::runtime_error(what) {}
 };
 
+// A slice was routed to a shard whose data plane is tearing down (shutdown in progress).
+// The write never reached Raft, so nothing was committed and it is safe to re-route.
+//
+// It has a real type because two things depended on recognising it and both were doing so
+// by MESSAGE: the failure classifier, and http_write_handler's batch path -- which did NOT
+// match it at all, so a shutting-down shard turned into HTTP 200 {"status":"partial"}, a
+// silent partial batch of exactly the kind the ack contract forbids.
+class ShardStoppingError : public std::runtime_error {
+public:
+    explicit ShardStoppingError(const std::string& what) : std::runtime_error(what) {}
+};
+
 // This node's own in-flight write budget is full (write-scaleout 3d). Explicit
 // pushback, so overload degrades to a 503 the client can pace against rather than to
 // unbounded queueing and timeout storms.
@@ -163,20 +184,14 @@ inline WriteFailure classifyLocalWriteFailure(const std::exception_ptr& e) {
         std::rethrow_exception(e);
     } catch (const raft::LeadershipLostError&) {
         return WriteFailure::LeadershipLost;
+    } catch (const ShardStoppingError&) {
+        return WriteFailure::ShardStopping;
     } catch (const WriteOverloadedError&) {
         return WriteFailure::Overloaded;
     } catch (const WriteFrameTooLargeError&) {
         return WriteFailure::Fatal;
     } catch (const UnassignedVShardError&) {
         return WriteFailure::Unassigned;
-    } catch (const std::exception& ex) {
-        // The one string match we cannot avoid: kShardStoppingError is raised as a plain
-        // runtime_error from a `seastar::make_exception_future` inside an invoke_on
-        // lambda, where a richer type would have to cross a shard boundary.
-        const std::string what = ex.what();
-        if (what.find("shard data plane is stopping") != std::string::npos)
-            return WriteFailure::ShardStopping;
-        return WriteFailure::Fatal;
     } catch (...) {
         return WriteFailure::Fatal;
     }

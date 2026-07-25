@@ -138,12 +138,24 @@ seastar::future<data::ProposeOutcome> ReplicatedVShardHost::proposeVShardBatches
     // bool overload): a routing error rejects atomically rather than after some groups
     // committed. Reported as rejects rather than thrown so the coordinator can re-resolve
     // and retry -- a group that is briefly not hosted here IS a routing miss, not a bug.
-    for (const auto* g : view) {
+    //
+    // When it fires NOTHING is proposed, so EVERY group in the view is uncommitted and
+    // every one of them is named. Naming only the not-hosted groups (as this first did)
+    // made the reject list a strict subset of the truth, and a caller that derived
+    // "uncommitted == rejects" then acked slices this node never replicated. The
+    // committed-set contract in node_store.hpp is the caller-side half of the same fix;
+    // both halves are needed, because either alone leaves the other's mistake fatal.
+    bool anyMissing = false;
+    for (const auto* g : view)
         if (!registry_.group(g->first))
-            out.rejects.push_back(data::SliceReject{g->first, raft::kNoNode, data::WriteFailure::NotLeader});
+            anyMissing = true;
+    if (anyMissing) {
+        for (const auto* g : view)
+            out.rejects.push_back(data::SliceReject{
+                g->first, registry_.group(g->first) ? registry_.group(g->first)->leader() : raft::kNoNode,
+                data::WriteFailure::NotLeader});
+        co_return out;  // committedVShards stays empty: nothing was proposed
     }
-    if (!out.rejects.empty())
-        co_return out;
 
     // Replicate every group CONCURRENTLY (see proposeVShardBatches for why serialising
     // them cost a full quorum round trip per VShard).
@@ -164,7 +176,9 @@ seastar::future<data::ProposeOutcome> ReplicatedVShardHost::proposeVShardBatches
     for (size_t i = 0; i < pending.size(); ++i) {
         const uint16_t vs = view[i]->first;
         try {
-            if (!co_await std::move(pending[i])) {
+            if (co_await std::move(pending[i])) {
+                out.committedVShards.push_back(vs);  // durable quorum commit -- the ONLY way in
+            } else {
                 raft::RaftGroup* g = registry_.group(vs);
                 out.rejects.push_back(
                     data::SliceReject{vs, g ? g->leader() : raft::kNoNode, data::WriteFailure::NotLeader});
@@ -182,7 +196,8 @@ seastar::future<data::ProposeOutcome> ReplicatedVShardHost::proposeVShardBatches
     }
     if (fatalErr)
         std::rethrow_exception(fatalErr);
-    out.committed = out.rejects.empty();
+    // Derived from what actually committed, never from what was rejected.
+    out.committed = out.committedVShards.size() == view.size();
     co_return out;
 }
 

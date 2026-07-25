@@ -1,11 +1,15 @@
 #pragma once
 
+#include "../../utils/logger.hpp"
 #include "../data/write_errors.hpp"
 
+#include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <string>
+#include <string_view>
+#include <system_error>
 
 namespace timestar::cluster {
 
@@ -37,16 +41,34 @@ public:
     // one ~90 ms quorum round), so it never trips on healthy load, while still bounding a
     // pathological client to something a node can hold. Overridable so the backpressure
     // gate can drive it deliberately.
+    static constexpr size_t kDefaultLimitBytes = 32u << 20;
+
     static size_t limitBytes() {
         static const size_t lim = [] {
-            if (const char* e = std::getenv("TIMESTAR_CLUSTER_WRITE_INFLIGHT_BYTES")) {
-                try {
-                    const unsigned long long v = std::stoull(e);
-                    if (v > 0)
-                        return static_cast<size_t>(v);
-                } catch (...) {}
+            const char* e = std::getenv("TIMESTAR_CLUSTER_WRITE_INFLIGHT_BYTES");
+            if (!e || !*e) {
+                timestar::http_log.info("cluster write in-flight budget: {} bytes/shard (default)", kDefaultLimitBytes);
+                return kDefaultLimitBytes;
             }
-            return static_cast<size_t>(32u << 20);
+            // STRICT parse. std::stoull stops at the first non-digit, so "32MiB" silently
+            // became a 32-BYTE budget -- a node that 503s essentially every write -- and
+            // "-1" wrapped to SIZE_MAX, i.e. no bound at all, the exact opposite of what
+            // was asked for. Both are configuration mistakes that must be refused loudly
+            // rather than obeyed.
+            const std::string_view sv(e);
+            unsigned long long v = 0;
+            const auto res = std::from_chars(sv.data(), sv.data() + sv.size(), v);
+            if (res.ec != std::errc{} || res.ptr != sv.data() + sv.size() || v == 0) {
+                timestar::http_log.error(
+                    "TIMESTAR_CLUSTER_WRITE_INFLIGHT_BYTES='{}' is not a positive count of BYTES "
+                    "(digits only -- no units, no sign); falling back to the {}-byte/shard default",
+                    e, kDefaultLimitBytes);
+                return kDefaultLimitBytes;
+            }
+            timestar::http_log.info(
+                "cluster write in-flight budget: {} bytes/shard (TIMESTAR_CLUSTER_WRITE_INFLIGHT_BYTES)",
+                static_cast<size_t>(v));
+            return static_cast<size_t>(v);
         }();
         return lim;
     }

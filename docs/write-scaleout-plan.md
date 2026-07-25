@@ -13,7 +13,12 @@ Retry-After instead of unbounded queueing, and every retryable cluster failure
 is a 503 naming its cause rather than an opaque 500. Ack-at-commit (3c) was
 measured and CLOSED — the commit→apply gap is 0.21 ms p50 against a 31 ms
 commit latency. The [D6] collapse window is narrowed but alive (1 rejected run
-in 9, against 2 in 6): Phase 4a is still required.
+in 9, against 2 in 6): Phase 4a is still required. An adversarial review round after
+implementation found and closed one CRITICAL ack-without-commit regression introduced by
+3a's own reject-list contract, plus four majors -- see the Phase 3 gate outcomes.
+
+Live gates now live in `test/cluster_gates/` and FAIL (exit 1) rather than print
+warnings, including an anti-vacuity assertion on `transfers_initiated`.
 
 Phase 1 result: RF=3 3.98M -> 4.55M pts/s (+14%), median batch latency 129ms -> 104ms,
 shard 0's RAFT_PROFILE outlier ratios cut 2-6x (persist 3.6x -> 2.06x, in_lock 17x ->
@@ -240,6 +245,21 @@ node-kill mid-bench (bounded errors, full catch-up) and kill -9 of the whole clu
     is the row above. Acking earlier would buy ~0.2 ms and cost the
     read-your-writes story (session tokens ride `appliedIndex`), so it is
     closed rather than deferred.
+3d-scope. **What the in-flight bound actually covers, honestly.** `WriteAdmission` is
+    charged in `writeSlicesToOwningShards`, i.e. on the REQUEST shard of the RF>1
+    replicated path only. It does NOT cover:
+    - **peer ingress** (`ShardRaftPlane::proposeBatch{,Hinted}`): a batch forwarded by
+      another node is bounded only by `rpc::resource_limits`, which caps a single frame
+      (~10.67 MiB) and total estimated in-flight RPC memory, not this node's write
+      pipeline. On a 3-node RF=3 cluster ~2/3 of all replication arrives this way, so the
+      majority of write memory is outside the budget;
+    - **RF=1** (`NodeWriteRouter`), which has no bound at all.
+    Extending it to both is deliberately deferred: the ingress side needs the charge to
+    be released on the SERVING shard rather than the owning ones, which is a different
+    accounting shape, and doing it half-way would give a number that looks like a
+    node-wide bound while being a third of one. Until then, read the bound as "what this
+    node ORIGINATES", not "what this node holds".
+
 3d. **Backpressure**: bounded in-flight bytes per shard on the data plane
     (the Raft send gate `8192` exists; the data plane has none) surfacing as
     HTTP 503, wired to the existing single-node 503 backpressure convention —
@@ -290,6 +310,32 @@ Gate outcomes (2026-07-25):
   real transport outage a write now blocks up to the deadline instead of
   failing fast, so [D6] costs latency where it used to cost 500s. Phase 4a is
   still required.
+- **Adversarial review round (post-implementation), 5 defects fixed:**
+  - **CRITICAL, a Phase-3 regression:** `ProposeOutcome` was a REJECT-set, and
+    `ReplicatedVShardHost`'s membership check answered with a reject list that was a
+    strict SUBSET of what it failed to commit (it proposes nothing, but named only the
+    not-hosted VShards). The router derived "uncommitted == rejects" and acked the
+    rest — **ack-without-commit**, demonstrated at 60 VShards in a batch with 1 ever
+    proposed. Reachable in production because `ClusterDataPlane::start` opens the
+    data-plane listener before instantiating the groups, so a joining or restarting node
+    serves proposes for seconds while hosting only some of them. Fixed at BOTH levels:
+    the host now names every group in the view, and the contract is inverted to a
+    **committed-set** (everything dispatched is uncommitted unless explicitly named
+    committed), which also disarms a peer naming VShards outside the view. Pinned by
+    `ReplicatedBatchWriteRouterTest.StrictSubsetRejectNeverAcks`.
+  - `kShardStoppingError` was a bare `runtime_error`, so the `{"writes":[...]}` path did
+    not recognise it and reported it as HTTP 200 `"partial"` — a silent partial batch. It
+    is now `data::ShardStoppingError`, which also removes the classifier's string match.
+  - The 1.5 s deadline was checked only BETWEEN attempts and no RPC carried a timeout, so
+    a black-holed peer could hold one attempt (and its in-flight-bytes charge) for
+    minutes. Attempts now carry a deadline into `seastar::rpc`'s time_point overload,
+    handshake included.
+  - `UnassignedVShardError` was mapped to 503 + Retry-After while
+    `isRetryableWriteFailure(Unassigned)` is false; now a 500-family status matching the
+    enum.
+  - `std::stoull` parsed `TIMESTAR_CLUSTER_WRITE_INFLIGHT_BYTES="32MiB"` as **32 bytes**
+    and `"-1"` as SIZE_MAX; strict `from_chars` with full-consumption, and the effective
+    budget is logged at startup.
 - **Pre-existing bug found, NOT introduced here (for Phase 4):** 40 concurrent
   1.3 MB `{"writes":[...]}` batches segfault every node (`si_addr 0x22` on one,
   SI_KERNEL on another). Reproduces identically on the pre-Phase-3 binary

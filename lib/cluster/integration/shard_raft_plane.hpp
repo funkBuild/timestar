@@ -64,6 +64,9 @@ inline unsigned shardForVShard(uint16_t vshard) {
 // so nothing was committed and the caller may safely re-route it -- and it must be an
 // error rather than a silent drop, or a shutting-down node would ack writes it discarded.
 inline constexpr const char* kShardStoppingError = "cluster: shard data plane is stopping; retry this write";
+// ... raised as data::ShardStoppingError, NOT a bare runtime_error: every consumer that
+// has to recognise it (the failure classifier, the HTTP status mapping, and the batch
+// path that previously reported it as a 200 "partial") matches on the TYPE.
 
 // Mutual-TLS material for the per-shard data-plane transports. Set on ClusterDataPlane
 // before start(); it is pushed to EVERY shard's DataPlaneRpc, because in replicated
@@ -399,7 +402,7 @@ inline seastar::future<> writeSlicesToOwningShards(seastar::sharded<ShardRaftPla
             // has already torn its plane down can be invoked from one that has not --
             // no timing luck needed. Fail retryably instead of dereferencing null.
             if (!p.ready())
-                return seastar::make_exception_future<>(std::runtime_error(kShardStoppingError));
+                return seastar::make_exception_future<>(data::ShardStoppingError(kShardStoppingError));
             return p.plane().write(std::move(b));
         }));
 
@@ -431,7 +434,7 @@ inline seastar::future<bool> proposeSlicesToOwningShards(seastar::sharded<ShardR
     for (auto& [shard, slice] : byShard)
         pending.push_back(shards.invoke_on(shard, [b = std::move(slice)](ShardRaftPlane& p) mutable {
             if (!p.ready())  // see the note in writeSlicesToOwningShards
-                return seastar::make_exception_future<bool>(std::runtime_error(kShardStoppingError));
+                return seastar::make_exception_future<bool>(data::ShardStoppingError(kShardStoppingError));
             return p.plane().host().proposeVShardBatches(std::move(b));
         }));
 
@@ -477,7 +480,8 @@ inline seastar::future<data::ProposeOutcome> proposeSlicesToOwningShardsHinted(s
         pendingVShards.push_back(std::move(vs));
         pending.push_back(shards.invoke_on(shard, [b = std::move(slice)](ShardRaftPlane& p) mutable {
             if (!p.ready())  // see the note in writeSlicesToOwningShards
-                return seastar::make_exception_future<data::ProposeOutcome>(std::runtime_error(kShardStoppingError));
+                return seastar::make_exception_future<data::ProposeOutcome>(
+                    data::ShardStoppingError(kShardStoppingError));
             // The groups are owned by do_with (moved across the shard boundary) and the
             // returned future is awaited before they are freed, so the view is safe.
             // `pp` is captured BY VALUE: `p` is a reference parameter living in this
@@ -493,6 +497,14 @@ inline seastar::future<data::ProposeOutcome> proposeSlicesToOwningShardsHinted(s
     for (size_t i = 0; i < pending.size(); ++i) {
         try {
             data::ProposeOutcome r = co_await std::move(pending[i]);
+            // Union BOTH sets. A shard reporting committed==true means all of ITS
+            // slices committed; otherwise only the ones it names did.
+            if (r.committed)
+                out.committedVShards.insert(out.committedVShards.end(), pendingVShards[i].begin(),
+                                            pendingVShards[i].end());
+            else
+                out.committedVShards.insert(out.committedVShards.end(), r.committedVShards.begin(),
+                                            r.committedVShards.end());
             out.rejects.insert(out.rejects.end(), r.rejects.begin(), r.rejects.end());
         } catch (...) {
             const auto kind = data::classifyLocalWriteFailure(std::current_exception());
@@ -507,7 +519,12 @@ inline seastar::future<data::ProposeOutcome> proposeSlicesToOwningShardsHinted(s
     }
     if (fatalErr)
         std::rethrow_exception(fatalErr);
-    out.committed = out.rejects.empty();
+    // From the committed set, never from the absence of rejects: a shard that failed
+    // retryably contributes no rejects for slices it never even reached.
+    size_t total = 0;
+    for (const auto& v : pendingVShards)
+        total += v.size();
+    out.committed = out.committedVShards.size() == total;
     co_return out;
 }
 
@@ -524,7 +541,7 @@ inline seastar::future<data::ProposeOutcome> ShardRaftPlane::proposeBatchHinted(
 inline seastar::future<raft::LogIndex> ShardRaftPlane::leaderReadIndex(uint16_t vshard) {
     return peers_->invoke_on(shardForVShard(vshard), [vshard](ShardRaftPlane& p) {
         if (!p.ready())
-            return seastar::make_exception_future<raft::LogIndex>(std::runtime_error(kShardStoppingError));
+            return seastar::make_exception_future<raft::LogIndex>(data::ShardStoppingError(kShardStoppingError));
         return p.plane().host().leaderReadIndex(vshard);
     });
 }
@@ -532,7 +549,7 @@ inline seastar::future<raft::LogIndex> ShardRaftPlane::leaderReadIndex(uint16_t 
 inline seastar::future<raft::LogIndex> ShardRaftPlane::leaderCommitIndex(uint16_t vshard) {
     return peers_->invoke_on(shardForVShard(vshard), [vshard](ShardRaftPlane& p) {
         if (!p.ready())
-            return seastar::make_exception_future<raft::LogIndex>(std::runtime_error(kShardStoppingError));
+            return seastar::make_exception_future<raft::LogIndex>(data::ShardStoppingError(kShardStoppingError));
         return p.plane().host().leaderCommitIndex(vshard);
     });
 }

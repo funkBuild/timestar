@@ -54,6 +54,14 @@ public:
     static constexpr unsigned kMaxAttempts = 6;  // 1 initial + 5 retries
     static constexpr auto kRetryDelay = std::chrono::milliseconds(20);
     static constexpr auto kDeadline = std::chrono::milliseconds(1500);
+    // Per-ATTEMPT bound, pushed down into the RPC itself (write-scaleout 3f). The overall
+    // deadline alone is not enough: it is only checked BETWEEN attempts, so an attempt
+    // against a peer that accepts the connection and then goes silent never returns, the
+    // batch holds its WriteAdmission charge indefinitely, and the shard starts 503-ing
+    // behind it. Sized well above the measured p99 batch latency (~180 ms) so a merely
+    // slow quorum round is never cut off, and small enough that the overall deadline
+    // still admits several attempts.
+    static constexpr auto kAttemptTimeout = std::chrono::milliseconds(600);
 
     ReplicatedBatchWriteRouter(const VShardDirectory& dir, ProposeSink& local, NodeTransport& client,
                                const LeaderResolver& leaders)

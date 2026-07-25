@@ -53,9 +53,9 @@ constexpr uint64_t kLeaderReadIndex = 7;    // sstring(u16 vshard) -> sstring(u6
 constexpr uint64_t kLeaderCommitIndex = 8;  // sstring(u16 vshard) -> sstring(u64 commitIndex); throws if not leader
 constexpr uint64_t kNegotiateVersion = 9;   // sstring(u32 min,u32 max) -> sstring(u32 agreed); throws if incompatible
 // write-scaleout 3a. Same request as kProposeWrite (an encoded WriteBatch); the reply
-// carries the LEADER HINT for each rejected VShard:
-//     '1'                                        -> every slice committed
-//     '0' u16 rejectCount { u16 vshard u64 leader u8 kind }*
+// carries the COMMITTED SET plus a LEADER HINT per rejected VShard:
+//     '1'  -> every slice committed
+//     '0' u16 committedCount {u16 vshard}* u16 rejectCount {u16 vshard u64 leader u8 kind}*
 // It is a SEPARATE verb rather than a widened kProposeWrite reply because a reply shape
 // is chosen by the SERVER, which does not know which version it negotiated with the
 // caller (the handshake is cached client-side, per connection). An old client would
@@ -149,21 +149,31 @@ std::optional<uint64_t> decU64(const seastar::sstring& s) {
     return v;
 }
 
-// The kProposeWriteHinted reply (see the verb comment for the layout). '1' with no body
-// is byte-identical to the old kProposeWrite success reply, deliberately: the two verbs
-// then agree on the common case and only diverge where there is something extra to say.
+// The kProposeWriteHinted reply. '1' with no body is byte-identical to the old
+// kProposeWrite success reply, deliberately: the two verbs agree on the common case and
+// diverge only where there is something extra to say. Otherwise:
+//     '0' u16 committedCount {u16 vshard}* u16 rejectCount {u16 vshard u64 leader u8 kind}*
+// The COMMITTED list is the authoritative part (see ProposeOutcome); the rejects are
+// advisory hints. Carrying the committed set explicitly is what lets the caller treat
+// everything it is not told about as uncommitted, instead of inferring it from a reject
+// list a sink is under no obligation to make complete.
 seastar::sstring encodeProposeOutcome(const ProposeOutcome& out) {
     if (out.committed)
         return seastar::sstring("1", 1);
     std::string s;
-    s.reserve(1 + 2 + out.rejects.size() * 11);
+    s.reserve(1 + 2 + out.committedVShards.size() * 2 + 2 + out.rejects.size() * 11);
     s.push_back('0');
-    const seastar::sstring n = encU16(static_cast<uint16_t>(out.rejects.size()));
-    s.append(n.data(), n.size());
+    auto appendU16 = [&s](uint16_t v) {
+        const seastar::sstring b = encU16(v);
+        s.append(b.data(), b.size());
+    };
+    appendU16(static_cast<uint16_t>(out.committedVShards.size()));
+    for (uint16_t vs : out.committedVShards)
+        appendU16(vs);
+    appendU16(static_cast<uint16_t>(out.rejects.size()));
     for (const auto& r : out.rejects) {
-        const seastar::sstring vs = encU16(r.vshard);
+        appendU16(r.vshard);
         const seastar::sstring ld = encU64(r.leaderHint);
-        s.append(vs.data(), vs.size());
         s.append(ld.data(), ld.size());
         s.push_back(static_cast<char>(static_cast<uint8_t>(r.kind)));
     }
@@ -171,26 +181,35 @@ seastar::sstring encodeProposeOutcome(const ProposeOutcome& out) {
 }
 
 // Parse it back. nullopt on ANY malformed shape -- a garbled reply must never read as a
-// plausible set of leader hints, which would send the retry to a node chosen by
-// corruption.
+// plausible set of committed slices (which would ack a write that was never replicated)
+// or of leader hints (which would send the retry to a node chosen by corruption).
 std::optional<ProposeOutcome> decodeProposeOutcome(const seastar::sstring& s) {
     if (s.empty())
         return std::nullopt;
     ProposeOutcome out;
     if (s[0] == '1')
-        return s.size() == 1 ? std::optional<ProposeOutcome>(ProposeOutcome{true, {}}) : std::nullopt;
+        return s.size() == 1 ? std::optional<ProposeOutcome>(ProposeOutcome{true, {}, {}}) : std::nullopt;
     if (s[0] != '0' || s.size() < 3)
         return std::nullopt;
-    const size_t n =
-        static_cast<size_t>(static_cast<uint8_t>(s[1])) | (static_cast<size_t>(static_cast<uint8_t>(s[2])) << 8);
-    if (s.size() != 3 + n * 11)
+    auto u16At = [&s](size_t off) {
+        return static_cast<uint16_t>(static_cast<uint8_t>(s[off]) |
+                                     (static_cast<uint16_t>(static_cast<uint8_t>(s[off + 1])) << 8));
+    };
+    const size_t nc = u16At(1);
+    if (s.size() < 3 + nc * 2 + 2)
         return std::nullopt;
-    out.rejects.reserve(n);
-    for (size_t i = 0; i < n; ++i) {
-        const size_t off = 3 + i * 11;
+    out.committedVShards.reserve(nc);
+    for (size_t i = 0; i < nc; ++i)
+        out.committedVShards.push_back(u16At(3 + i * 2));
+    const size_t rejOff = 3 + nc * 2;
+    const size_t nr = u16At(rejOff);
+    if (s.size() != rejOff + 2 + nr * 11)
+        return std::nullopt;
+    out.rejects.reserve(nr);
+    for (size_t i = 0; i < nr; ++i) {
+        const size_t off = rejOff + 2 + i * 11;
         SliceReject r;
-        r.vshard = static_cast<uint16_t>(static_cast<uint8_t>(s[off]) |
-                                         (static_cast<uint16_t>(static_cast<uint8_t>(s[off + 1])) << 8));
+        r.vshard = u16At(off);
         uint64_t leader = 0;
         for (int b = 0; b < 8; ++b)
             leader |= static_cast<uint64_t>(static_cast<uint8_t>(s[off + 2 + b])) << (8 * b);
@@ -244,6 +263,22 @@ struct DataPlaneRpc::Impl {
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> queryMetadataStub;
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> proposeWriteStub;
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> proposeWriteHintedStub;
+    // DEADLINE-CARRYING variants of the three verbs the write path awaits
+    // (write-scaleout 3f). seastar's rpc client stub has a time_point overload; without
+    // it an awaited call has NO timeout at all, so a peer that accepts the connection and
+    // then black-holes it (a half-dead TCP path, a wedged reactor) blocks the caller
+    // indefinitely -- the router's deadline is only checked BETWEEN attempts, so a single
+    // attempt could hold its WriteAdmission charge for minutes and take the whole shard
+    // to 503 behind it. That amplifies exactly the [D6] window Phase 4 is meant to close.
+    std::function<seastar::future<seastar::sstring>(Client&, seastar::rpc::rpc_clock_type::time_point,
+                                                    seastar::sstring)>
+        proposeWriteTimedStub;
+    std::function<seastar::future<seastar::sstring>(Client&, seastar::rpc::rpc_clock_type::time_point,
+                                                    seastar::sstring)>
+        proposeWriteHintedTimedStub;
+    std::function<seastar::future<seastar::sstring>(Client&, seastar::rpc::rpc_clock_type::time_point,
+                                                    seastar::sstring)>
+        negotiateVersionTimedStub;
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> leaderReadIndexStub;
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> leaderCommitIndexStub;
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> negotiateVersionStub;
@@ -317,6 +352,9 @@ struct DataPlaneRpc::Impl {
         queryMetadataStub = proto.make_client<seastar::sstring(seastar::sstring)>(kQueryMetadata);
         proposeWriteStub = proto.make_client<seastar::sstring(seastar::sstring)>(kProposeWrite);
         proposeWriteHintedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kProposeWriteHinted);
+        proposeWriteTimedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kProposeWrite);
+        proposeWriteHintedTimedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kProposeWriteHinted);
+        negotiateVersionTimedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kNegotiateVersion);
         leaderReadIndexStub = proto.make_client<seastar::sstring(seastar::sstring)>(kLeaderReadIndex);
         leaderCommitIndexStub = proto.make_client<seastar::sstring(seastar::sstring)>(kLeaderCommitIndex);
         negotiateVersionStub = proto.make_client<seastar::sstring(seastar::sstring)>(kNegotiateVersion);
@@ -560,7 +598,15 @@ void DataPlaneRpc::setLocalVersion(features::VersionRange range) {
     impl_->localVersion = range;
 }
 
+features::VersionRange DataPlaneRpc::localVersion() const {
+    return impl_->localVersion;
+}
+
 seastar::future<uint32_t> DataPlaneRpc::negotiateVersion(NodeId to) {
+    return negotiateVersion(to, std::nullopt);
+}
+
+seastar::future<uint32_t> DataPlaneRpc::negotiateVersion(NodeId to, OptDeadline deadline) {
     if (impl_->stopping)
         throw std::runtime_error("dataplane: shutting down");
     auto* conn = impl_->clientFor(to);
@@ -569,7 +615,13 @@ seastar::future<uint32_t> DataPlaneRpc::negotiateVersion(NodeId to) {
     seastar::sstring req = encU32(impl_->localVersion.min) + encU32(impl_->localVersion.max);
     // A non-overlapping peer throws server-side; that exception propagates here so the
     // caller refuses the peer (never falls back to a silently-mismatched version).
-    seastar::sstring reply = co_await impl_->negotiateVersionStub(*conn, req);
+    //
+    // The handshake is bounded by the SAME deadline as the write it precedes: it is an
+    // awaited round trip to the same peer, so a black-holed connection would otherwise
+    // hang here, before a single byte of the batch was even encoded -- an unbounded
+    // suspension in front of a bounded one.
+    seastar::sstring reply = deadline ? co_await impl_->negotiateVersionTimedStub(*conn, *deadline, req)
+                                      : co_await impl_->negotiateVersionStub(*conn, req);
     auto agreed = decU32At(reply, 0);
     if (!agreed)
         throw std::runtime_error("dataplane: malformed negotiateVersion reply");
@@ -627,6 +679,10 @@ seastar::future<QueryPartial> DataPlaneRpc::queryRemote(NodeId to, QuerySpec spe
 }
 
 seastar::future<uint32_t> DataPlaneRpc::versionFor(NodeId to) {
+    return versionFor(to, std::nullopt);
+}
+
+seastar::future<uint32_t> DataPlaneRpc::versionFor(NodeId to, OptDeadline deadline) {
     // The WriteBatch format to speak with this peer. Handshake once per connection and
     // cache it; a peer that cannot read anything we can write THROWS out of
     // negotiateVersion (no overlapping range), which fails the write closed instead of
@@ -645,7 +701,7 @@ seastar::future<uint32_t> DataPlaneRpc::versionFor(NodeId to) {
     auto it = impl_->agreedVersion.find(to);
     if (it != impl_->agreedVersion.end())
         co_return it->second;
-    const uint32_t agreed = co_await negotiateVersion(to);
+    const uint32_t agreed = co_await negotiateVersion(to, deadline);
     impl_->agreedVersion[to] = agreed;
     co_return agreed;
 }
@@ -706,18 +762,20 @@ seastar::future<MetadataResult> DataPlaneRpc::queryMetadata(NodeId to, MetadataR
     co_return std::move(*res);
 }
 
-seastar::future<ProposeOutcome> DataPlaneRpc::proposeWriteHinted(NodeId to, VShardBatchView view) {
-    // `view` borrows the CALLER's groups (the retry loop keeps them so it can
-    // re-dispatch only what failed). It is read here and by encodeWriteBatch before the
-    // first co_await that could outlive it; the caller awaits this future, so the
-    // pointees stay alive throughout.
+seastar::future<ProposeOutcome> DataPlaneRpc::proposeWriteHinted(NodeId to, VShardBatchView view,
+                                                                 OptDeadline deadline) {
+    // `view` borrows the CALLER's groups (the retry loop keeps them so it can re-dispatch
+    // only what failed). It is read across the awaits below; the caller awaits this
+    // future before its groups die, so the pointees stay valid throughout -- the read is
+    // NOT confined to before the first suspension, and must not be assumed to be.
     if (impl_->stopping)
         throw std::runtime_error("dataplane: shutting down");
     std::vector<uint16_t> vshards;
     vshards.reserve(view.size());
     for (const auto* g : view)
         vshards.push_back(g->first);
-    const uint32_t version = co_await versionFor(to);
+    // Bounded by the SAME deadline as the propose it gates -- see negotiateVersion.
+    const uint32_t version = co_await versionFor(to, deadline);
     auto* conn = impl_->clientFor(to);
     if (!conn)
         throw std::runtime_error("dataplane: unknown peer");
@@ -727,25 +785,34 @@ seastar::future<ProposeOutcome> DataPlaneRpc::proposeWriteHinted(NodeId to, VSha
         throw WriteFrameTooLargeError("dataplane: encoded write slice of " + std::to_string(bytes.size()) +
                                       " bytes exceeds the " + std::to_string(kMaxOutboundFrameBytes) +
                                       "-byte inter-node frame limit; split the batch");
+    const seastar::sstring frame(bytes.data(), bytes.size());
     if (version < kWriteBatchFormatV3) {
-        // The peer predates the hinted verb: use the v1-shaped one and report hintless
-        // rejects. Correctness is unchanged (the caller still retries against a
-        // re-resolved leader), only the routing is blind -- exactly the v1 behaviour.
-        seastar::sstring old = co_await impl_->proposeWriteStub(*conn, seastar::sstring(bytes.data(), bytes.size()));
+        // The peer predates the hinted verb: use the v1-shaped one and report NOTHING
+        // committed on failure. Correctness is unchanged (the caller still retries the
+        // whole view against a re-resolved leader), only the routing is blind -- exactly
+        // the v1 behaviour.
+        seastar::sstring old = deadline ? co_await impl_->proposeWriteTimedStub(*conn, *deadline, frame)
+                                        : co_await impl_->proposeWriteStub(*conn, frame);
         if (old.size() != 1 || (old[0] != '1' && old[0] != '0'))
             throw std::runtime_error("dataplane: malformed propose reply");
         ProposeOutcome out;
         out.committed = old[0] == '1';
-        if (!out.committed)
+        if (out.committed)
+            out.committedVShards = std::move(vshards);
+        else
             for (uint16_t vs : vshards)
                 out.rejects.push_back(SliceReject{vs, kNoNode, WriteFailure::NotLeader});
         co_return out;
     }
-    seastar::sstring reply =
-        co_await impl_->proposeWriteHintedStub(*conn, seastar::sstring(bytes.data(), bytes.size()));
+    seastar::sstring reply = deadline ? co_await impl_->proposeWriteHintedTimedStub(*conn, *deadline, frame)
+                                      : co_await impl_->proposeWriteHintedStub(*conn, frame);
     auto out = decodeProposeOutcome(reply);
     if (!out)
         throw std::runtime_error("dataplane: malformed hinted propose reply");
+    // A peer answering '1' names no VShards; fill in what we asked it for, so the caller's
+    // committed-set arithmetic works uniformly.
+    if (out->committed)
+        out->committedVShards = std::move(vshards);
     co_return std::move(*out);
 }
 

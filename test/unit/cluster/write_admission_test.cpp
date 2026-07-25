@@ -2,14 +2,14 @@
 // byte bound. Pure logic -- no sockets, no Raft.
 #include "../../../lib/cluster/integration/write_admission.hpp"
 
+#include "../../../lib/cluster/data/dataplane_rpc.hpp"
 #include "../../../lib/cluster/data/write_errors.hpp"
 #include "../../../lib/cluster/data/write_record.hpp"
+#include "../../../lib/cluster/integration/cluster_data_plane.hpp"
 #include "../../../lib/utils/series_key.hpp"
 
 #include <gtest/gtest.h>
 
-#include <fstream>
-#include <sstream>
 #include <stdexcept>
 
 using namespace timestar;
@@ -66,9 +66,15 @@ TEST(WriteFailureTaxonomyTest, LocalClassificationIsConservative) {
     EXPECT_EQ(cls(std::make_exception_ptr(data::WriteOverloadedError("full"))), WriteFailure::Overloaded);
     EXPECT_EQ(cls(std::make_exception_ptr(data::UnassignedVShardError("none"))), WriteFailure::Unassigned);
     EXPECT_EQ(cls(std::make_exception_ptr(data::WriteFrameTooLargeError("big"))), WriteFailure::Fatal);
+    EXPECT_EQ(cls(std::make_exception_ptr(data::ShardStoppingError("shard data plane is stopping"))),
+              WriteFailure::ShardStopping);
+    // Matched by TYPE now, not by message. A plain runtime_error wearing the same words is
+    // NOT a shard-stopping condition and must stay Fatal -- the string match it replaced
+    // was the classifier's one remaining wart, and it was also why the HTTP batch path
+    // could not recognise the condition at all.
     EXPECT_EQ(
         cls(std::make_exception_ptr(std::runtime_error("cluster: shard data plane is stopping; retry this write"))),
-        WriteFailure::ShardStopping);
+        WriteFailure::Fatal);
     EXPECT_EQ(cls(std::make_exception_ptr(std::runtime_error("journal write failed: EIO"))), WriteFailure::Fatal)
         << "an unrecognised local failure must NOT be retried";
 }
@@ -129,32 +135,39 @@ TEST(WriteAdmissionTest, ResidentEstimateTracksThePayload) {
     EXPECT_EQ(data::approxResidentBytes(data::viewOf(groups)), data::approxResidentBytes(floatBatch(20, 100)));
 }
 
-// A node must advertise the NEWEST wire version this binary supports, not a literal
-// that happened to be current when the line was written.
+// A node must advertise the NEWEST wire version this binary supports, and this asserts
+// the ADVERTISED VALUE, not the source text that produces it.
 //
-// This is a source-inspection test because the bug it guards is invisible to every
-// behavioural test: unit and socket tests build their own DataPlaneRpc (whose default
-// was already correct), while the PRODUCTION node advertises ClusterDataPlane's
-// localVersion_ -- which was still spelled kWriteBatchFormatV2 after v3 landed. Every
-// negotiation therefore capped at 2, no peer ever spoke the hinted-propose verb, and
-// the whole 3a leader-hint path was dead in production with a fully green suite. Only a
-// 5-node deposed-primary cluster run caught it.
-TEST(WriteAdmissionTest, NodeAdvertisesTheNewestSupportedWireVersion) {
-    auto readSource = [](const std::string& rel) {
-        for (const std::string& prefix : {"", "../", "../../", "../../../"}) {
-            std::ifstream in(prefix + rel);
-            if (in.good()) {
-                std::ostringstream ss;
-                ss << in.rdbuf();
-                return ss.str();
-            }
-        }
-        return std::string();
-    };
-    const std::string src = readSource("lib/cluster/integration/cluster_data_plane.hpp");
-    ASSERT_FALSE(src.empty()) << "could not locate cluster_data_plane.hpp";
-    EXPECT_NE(src.find("localVersion_{1, data::kWriteBatchFormatMax}"), std::string::npos)
-        << "ClusterDataPlane must advertise kWriteBatchFormatMax; pinning a literal version "
-           "silently disables every protocol step newer than it, cluster-wide";
+// The bug it guards: ClusterDataPlane::localVersion_ still said kWriteBatchFormatV2 after
+// v3 landed, so every negotiation capped at 2, no peer spoke the hinted-propose verb, and
+// the whole leader-hint path was dead in production with a green suite -- unit and socket
+// tests build their own DataPlaneRpc, whose default was already correct.
+//
+// A source grep for the initializer (the first version of this test) was too weak: it
+// cannot see DataPlaneRpc's own default regressing, a third advertiser appearing, or a
+// setLocalVersion({1,2}) overriding the initializer afterwards. Reading the value back
+// from each advertiser sees all three.
+TEST(WriteAdmissionTest, EveryAdvertiserOffersTheNewestSupportedWireVersion) {
+    // Advertiser 1: the transport's own default (what a peer handshakes against).
+    data::DataPlaneRpc rpc;
+    EXPECT_EQ(rpc.localVersion().min, 1u);
+    EXPECT_EQ(rpc.localVersion().max, data::kWriteBatchFormatMax)
+        << "DataPlaneRpc must advertise the newest format this binary can write";
+
+    // Advertiser 2: the NODE, which pushes its range to every per-shard transport in
+    // start(). This is the one that regressed.
+    cluster::ClusterDataPlane node;
+    EXPECT_EQ(node.localVersion().min, 1u);
+    EXPECT_EQ(node.localVersion().max, data::kWriteBatchFormatMax)
+        << "ClusterDataPlane must advertise the newest format this binary can write; "
+           "pinning a literal silently disables every protocol step newer than it, cluster-wide";
+
+    // ... and a narrowed range still round-trips, so the getter reads the live value
+    // rather than a constant (a getter returning kWriteBatchFormatMax unconditionally
+    // would pass everything above and prove nothing).
+    rpc.setLocalVersion(features::VersionRange{1, 1});
+    EXPECT_EQ(rpc.localVersion().max, 1u);
+
+    // The protocol step the hinted-propose verb is gated on must be the newest one.
     EXPECT_EQ(data::kWriteBatchFormatMax, data::kWriteBatchFormatV3);
 }
