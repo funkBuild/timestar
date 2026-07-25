@@ -1,6 +1,23 @@
 # Cluster Write Scale-Out Plan
 
-Status: PLANNED (no phase implemented). Branch `cluster-design`, 2026-07-25.
+Status: Phase 1 IMPLEMENTED (1a/1b/1c, 2026-07-25); Phases 2-6 planned.
+Branch `cluster-design`.
+
+Phase 1 result: RF=3 3.98M -> 4.55M pts/s (+14%), median batch latency 129ms -> 104ms,
+shard 0's RAFT_PROFILE outlier ratios cut 2-6x (persist 3.6x -> 2.06x, in_lock 17x ->
+2.79x, apply 14x -> 2.39x, commit 4.1x -> 1.62x of the other shards). The 5.5M target
+was NOT reached and in_lock/apply are still slightly outside the "within ~2x" gate --
+the remaining levers are Phase 2 (route/copy/encode once) and the Raft listener, which
+has the same non-distributing-listener defect Phase 1b fixed for the data plane (see
+below). The write-collapse HTTP 500 bursts [D6] reproduce identically on the
+pre-Phase-1 binary and remain for Phase 4.
+
+Correction to a premise used in §4-1b and in commit b98c1d1: this seastar hardcodes
+`posix_reuseport_available() { return false; }`, so "every shard listens on the port
+with SO_REUSEPORT" does not hold. Shard 0 owns the only socket and hands each accepted
+fd to the shard the listen options name, so a per-shard listener distributes only under
+`connection_distribution` -- `set_fixed_cpu` keeps everything on shard 0. Phase 1b
+fixed this for the data plane; the Raft transport still pins.
 Companion to `docs/query-scaleout-plan.md`, `docs/clustering.md`,
 `docs/clustering-integration-plan.md`.
 
