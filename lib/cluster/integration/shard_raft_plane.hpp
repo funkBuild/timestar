@@ -3,7 +3,9 @@
 #include <seastar/core/gate.hh>
 #include "../../core/vshard.hpp"  // assignCore
 #include "../data/node_store.hpp"
+#include "../raft/raft_codec.hpp"  // decodeEnvelope
 #include "../raft/raft_driver.hpp"  // RaftTransport
+#include "../raft/raft_rpc_transport.hpp"
 #include "engine_local_store.hpp"
 #include "replicated_data_plane.hpp"
 
@@ -21,59 +23,20 @@ namespace timestar::cluster {
 // applies -- enough to saturate it, diverge that node's leadership view and make its
 // queries fail. Spreading them divides that work by the core count.
 //
-// The node still has exactly ONE Raft listener and ONE data-plane RPC client set,
-// both on shard 0 (a single port per node, and one connection per peer). These two
-// thin proxies let a group running on any shard use them: outbound calls hop to
-// shard 0, and shard 0 routes each inbound envelope to its group's owning shard.
+// The Raft transport is now PER SHARD: every shard listens on the node's single Raft
+// port (SO_REUSEPORT, the same pattern the HTTP server uses) and keeps its own peer
+// clients. Previously one transport on shard 0 carried the whole node's Raft traffic,
+// which made shard 0 the write bottleneck -- it showed ~10x the journal-sync latency
+// of the other shards while all cores sat ~25% idle. Egress is now entirely local; an
+// inbound envelope still hops to the shard owning its group, but the accept/read work
+// is spread by the kernel instead of landing on one core.
+//
+// The data-plane RPC client set is still single, on shard 0, behind the proxy below.
 
 // The shard that owns a VShard's Raft group.
 inline unsigned shardForVShard(uint16_t vshard) {
     return timestar::assignCore(timestar::VShardId{vshard}, seastar::smp::count);
 }
-
-// Forwards a group's outbound Raft message to the node's real transport on shard 0.
-class ShardRoutingRaftTransport : public raft::RaftTransport {
-public:
-    explicit ShardRoutingRaftTransport(raft::RaftTransport* home) : home_(home) {}
-
-    seastar::future<> send(raft::Envelope env) override {
-        if (seastar::this_shard_id() == 0)
-            return home_->send(std::move(env));
-        // Do NOT await the cross-shard hop. RaftGroup::drainReady() sends while
-        // holding the group lock, so awaiting put a cross-core round trip -- plus
-        // shard 0's whole queue depth -- on the critical path of every proposal.
-        // Profiling a 3-node RF=3 write bench showed shards 1..3 spending 135-225ms
-        // per proposal in send() while shard 0 was busy persisting, with all cores
-        // only ~25% utilised: the node was waiting on shard 0, not computing.
-        //
-        // Backgrounding it is safe because the shard-0 transport is ITSELF
-        // fire-and-forget (it queues the RPC under its own gate and swallows errors)
-        // -- so awaiting only ever confirmed hand-off, never delivery. Raft already
-        // tolerates dropped and reordered messages: an unacknowledged AppendEntries
-        // is retried from nextIndex on the next heartbeat.
-        if (inflight_ >= kMaxInflight)
-            return seastar::make_ready_future<>();  // shard 0 is backed up: drop, Raft retries
-        ++inflight_;
-        (void)seastar::with_gate(gate_, [this, env = std::move(env)]() mutable {
-            return seastar::smp::submit_to(0u,
-                                           [h = home_, env = std::move(env)]() mutable { return h->send(std::move(env)); })
-                .handle_exception([](std::exception_ptr) {})
-                .finally([this] { --inflight_; });
-        });
-        return seastar::make_ready_future<>();
-    }
-
-    // Drain background hops before the owning plane tears the transport down.
-    seastar::future<> stop() { return gate_.is_closed() ? seastar::make_ready_future<>() : gate_.close(); }
-
-private:
-    raft::RaftTransport* home_;  // owned by ClusterDataPlane on shard 0
-    seastar::gate gate_;
-    size_t inflight_ = 0;
-    // Bounds the queue when shard 0 cannot keep up. Generous: normal depth is a
-    // handful per shard, and dropping a live AppendEntries costs a heartbeat.
-    static constexpr size_t kMaxInflight = 8192;
-};
 
 // Forwards a shard's peer-facing data-plane calls (leader forwarding of proposes) to
 // the node's real DataPlaneRpc on shard 0.
@@ -123,17 +86,46 @@ private:
 class ShardRaftPlane {
 public:
     // `homeRaft` / `homeClient` point at the node's single transports on shard 0.
-    seastar::future<> init(seastar::sharded<Engine>* engines, raft::RaftTransport* homeRaft,
+    seastar::future<> init(seastar::sharded<Engine>* engines, seastar::sharded<ShardRaftPlane>* peers,
                            data::NodeTransport* homeClient, const data::VShardDirectory* dir, data::NodeId self,
                            std::string journalRoot, std::chrono::milliseconds tick) {
         store_ = std::make_unique<EngineLocalStore>(*engines);
-        raftProxy_ = std::make_unique<ShardRoutingRaftTransport>(homeRaft);
+        peers_ = peers;
+        transport_ = std::make_unique<raft::RaftRpcTransport>();
         clientProxy_ = std::make_unique<ShardRoutingNodeTransport>(homeClient);
         // Journals are per-VShard directories under this root, and each VShard belongs
         // to exactly one shard, so shards never contend for the same journal.
-        plane_ = std::make_unique<ReplicatedDataPlane>(*store_, *raftProxy_, *clientProxy_, *dir, self,
+        plane_ = std::make_unique<ReplicatedDataPlane>(*store_, *transport_, *clientProxy_, *dir, self,
                                                        std::filesystem::path(journalRoot), tick);
         return seastar::make_ready_future<>();
+    }
+
+    // Listen on the node's Raft port from THIS shard. Every shard binds the same
+    // address; seastar uses SO_REUSEPORT so each gets its own socket and the kernel
+    // distributes connections. Envelopes are decoded on the shard owning the group.
+    seastar::future<> startTransport(seastar::socket_address local) {
+        co_await transport_->start(local, [](raft::Envelope) { return seastar::make_ready_future<>(); });
+        transport_->setRawDeliver([this](uint16_t groupId, const char* bytes, size_t len) {
+            const unsigned owner = shardForVShard(groupId);
+            if (owner == seastar::this_shard_id())
+                return deliverDecoded(bytes, len);
+            // The bytes stay owned by this shard; the target only READS them, and
+            // submit_to is awaited, so they outlive the read.
+            auto* peers = peers_;
+            return seastar::smp::submit_to(owner,
+                                           [peers, bytes, len] { return peers->local().deliverDecoded(bytes, len); });
+        });
+        co_return;
+    }
+
+    void addRaftPeer(data::NodeId id, seastar::socket_address addr) { transport_->addPeer(id, addr); }
+
+    // Decode on THIS shard and hand to the local group registry.
+    seastar::future<> deliverDecoded(const char* bytes, size_t len) {
+        auto env = raft::decodeEnvelope(std::string(bytes, len));
+        if (!env || !plane_)
+            return seastar::make_ready_future<>();
+        return plane_->host().registry().deliver(std::move(*env));
     }
 
     // Add a VShard group -- only called on the shard that owns it.
@@ -255,11 +247,9 @@ public:
             co_await plane_->stop();
         plane_.reset();
         clientProxy_.reset();
-        // Close the proxy's gate before destroying it: a backgrounded cross-shard
-        // send still references it.
-        if (raftProxy_)
-            co_await raftProxy_->stop();
-        raftProxy_.reset();
+        if (transport_)
+            co_await transport_->stop();
+        transport_.reset();
         store_.reset();
         co_return;
     }
@@ -267,7 +257,8 @@ public:
 private:
     // Declared so plane_ (which borrows the others) is destroyed FIRST.
     std::unique_ptr<EngineLocalStore> store_;
-    std::unique_ptr<ShardRoutingRaftTransport> raftProxy_;
+    std::unique_ptr<raft::RaftRpcTransport> transport_;  // this shard's own listener + peer clients
+    seastar::sharded<ShardRaftPlane>* peers_ = nullptr;
     std::unique_ptr<ShardRoutingNodeTransport> clientProxy_;
     std::unique_ptr<ReplicatedDataPlane> plane_;
 };

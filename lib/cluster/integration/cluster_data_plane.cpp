@@ -91,7 +91,6 @@ seastar::future<> ClusterDataPlane::start(const ClusterConfig& cfg, seastar::sha
     // placement model). Group instantiation is the real prod cost: RF*4096/N groups
     // per node (see the group-granularity note in the plan).
     if (cfg.replication_factor > 1) {
-        raftTransport_ = std::make_unique<raft::RaftRpcTransport>();
         std::filesystem::path journalRoot = timestar::dataRootPath();
         journalRoot /= "cluster_raft";
         // Start a Raft plane on EVERY shard; each will own only the VShards that
@@ -101,49 +100,22 @@ seastar::future<> ClusterDataPlane::start(const ClusterConfig& cfg, seastar::sha
         {
             const std::string jroot = journalRoot.string();
             const data::NodeId selfId = rt_->selfId;
-            raft::RaftTransport* homeRaft = raftTransport_.get();
             data::NodeTransport* homeClient = rpc_.get();
             const data::VShardDirectory* dirp = dir_.get();
-            co_await shards_.invoke_on_all([enginesPtr = enginesPtr_, homeRaft, homeClient, dirp, selfId, jroot](ShardRaftPlane& p) {
-                return p.init(enginesPtr, homeRaft, homeClient, dirp, selfId, jroot,
-                              std::chrono::milliseconds(20));
+            auto* peers = &shards_;
+            co_await shards_.invoke_on_all([enginesPtr = enginesPtr_, peers, homeClient, dirp, selfId, jroot](ShardRaftPlane& p) {
+                return p.init(enginesPtr, peers, homeClient, dirp, selfId, jroot, std::chrono::milliseconds(20));
             });
         }
         // Incoming proposeWrite RPCs land on shard 0; route each batch to the shards
         // owning its VShards.
         rpc_->setProposeSink(*this);
 
-        // Serve Raft on this node's own Raft address. Envelopes are routed to the
-        // shard that owns the addressed group.
+        // Serve Raft on this node's own Raft address FROM EVERY SHARD (SO_REUSEPORT).
+        // Each shard decodes and routes to the shard owning the addressed group.
         seastar::net::inet_address rAddr = co_await resolveHost(self.host);
-        co_await raftTransport_->start(
-            seastar::socket_address(rAddr, static_cast<uint16_t>(self.port + kRaftPortOffset)),
-            [this](raft::Envelope env) {
-                const unsigned owner = shardForVShard(env.groupId);
-                if (owner == seastar::this_shard_id())
-                    return shards_.local().plane().host().registry().deliver(std::move(env));
-                return seastar::smp::submit_to(owner, [this, env = std::move(env)]() mutable {
-                    return shards_.local().plane().host().registry().deliver(std::move(env));
-                });
-            });
-        // Decode on the OWNING shard, not on the listening shard. The bytes stay
-        // owned by (and are freed on) the listening shard; the target shard only
-        // reads them, and `submit_to` is awaited so they outlive the read.
-        raftTransport_->setRawDeliver([this](uint16_t groupId, const char* bytes, size_t len) {
-            const unsigned owner = shardForVShard(groupId);
-            if (owner == seastar::this_shard_id()) {
-                auto env = raft::decodeEnvelope(std::string(bytes, len));
-                if (!env)
-                    return seastar::make_ready_future<>();
-                return shards_.local().plane().host().registry().deliver(std::move(*env));
-            }
-            return seastar::smp::submit_to(owner, [this, bytes, len] {
-                auto env = raft::decodeEnvelope(std::string(bytes, len));
-                if (!env)
-                    return seastar::make_ready_future<>();
-                return shards_.local().plane().host().registry().deliver(std::move(*env));
-            });
-        });
+        const seastar::socket_address raftAddr(rAddr, static_cast<uint16_t>(self.port + kRaftPortOffset));
+        co_await shards_.invoke_on_all([raftAddr](ShardRaftPlane& p) { return p.startTransport(raftAddr); });
 
         for (const auto& [id, addr] : rt_->peerAddresses) {
             if (id == rt_->selfId)
@@ -151,7 +123,9 @@ seastar::future<> ClusterDataPlane::start(const ClusterConfig& cfg, seastar::sha
             const HostPort hp = parseHostPort(addr);
             try {
                 seastar::net::inet_address a = co_await resolveHost(hp.host);
-                raftTransport_->addPeer(id, seastar::socket_address(a, static_cast<uint16_t>(hp.port + kRaftPortOffset)));
+                const seastar::socket_address peerAddr(a, static_cast<uint16_t>(hp.port + kRaftPortOffset));
+                co_await shards_.invoke_on_all(
+                    [id, peerAddr](ShardRaftPlane& p) { p.addRaftPeer(id, peerAddr); });
             } catch (const std::exception& e) {
                 timestar::http_log.warn("cluster raft: peer {} ({}) unresolved at startup: {}", id, addr, e.what());
             }
@@ -196,8 +170,6 @@ seastar::future<> ClusterDataPlane::stop() {
         co_await shards_.stop();
         shardsStarted_ = false;
     }
-    if (raftTransport_)
-        co_await raftTransport_->stop();
     if (rpc_)
         co_await rpc_->stop();
     co_return;

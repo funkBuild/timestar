@@ -117,9 +117,8 @@ private:
     std::unique_ptr<data::NodeWriteRouter> router_;
     std::unique_ptr<data::NodeQueryCoordinator> coord_;
     // RF=3 replicated path (replication_factor > 1); null in the RF=1/M2 mode.
-    // Declared LAST so rdp_ (which borrows rpc_, raftTransport_, dir_, local_) tears
+    // Declared LAST so rdp_ (which borrows rpc_, dir_, local_) tears
     // down first.
-    std::unique_ptr<raft::RaftRpcTransport> raftTransport_;
     // Per-shard Raft planes: shard S owns the VShards with assignCore(vs)==S, so the
     // group tick/step/apply work is spread over all cores instead of saturating
     // shard 0. Only shard 0 holds the listener and the peer clients; the per-shard
