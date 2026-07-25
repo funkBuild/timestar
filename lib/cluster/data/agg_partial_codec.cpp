@@ -18,13 +18,21 @@ uint64_t fnv1a(const char* p, size_t n) {
 struct Writer {
     std::string out;
     void u8(uint8_t v) { out.push_back(static_cast<char>(v)); }
+    // Little-endian, byte-for-byte identical to the previous per-byte loops -- this
+    // only removes 4/8 separate bounds-checked push_back calls per field. A grouped
+    // full-range cluster query ships ~730k points of partials from the remote nodes,
+    // and unlike the write path query CPU is on the critical path.
     void u32(uint32_t v) {
+        char b[4];
         for (int i = 0; i < 4; ++i)
-            u8((v >> (8 * i)) & 0xff);
+            b[i] = static_cast<char>((v >> (8 * i)) & 0xff);
+        out.append(b, 4);
     }
     void u64(uint64_t v) {
+        char b[8];
         for (int i = 0; i < 8; ++i)
-            u8((v >> (8 * i)) & 0xff);
+            b[i] = static_cast<char>((v >> (8 * i)) & 0xff);
+        out.append(b, 8);
     }
     void dbl(double v) {
         uint64_t b;
@@ -59,16 +67,28 @@ struct Reader {
         }
         return static_cast<uint8_t>(*p++);
     }
+    // One bounds check per field instead of one per byte. Same little-endian layout,
+    // and the same ok=false / zero result on a short buffer.
     uint32_t u32() {
+        if (!ok || !avail(4)) {
+            ok = false;
+            return 0;
+        }
         uint32_t v = 0;
         for (int i = 0; i < 4; ++i)
-            v |= static_cast<uint32_t>(u8()) << (8 * i);
+            v |= static_cast<uint32_t>(static_cast<unsigned char>(p[i])) << (8 * i);
+        p += 4;
         return v;
     }
     uint64_t u64() {
+        if (!ok || !avail(8)) {
+            ok = false;
+            return 0;
+        }
         uint64_t v = 0;
         for (int i = 0; i < 8; ++i)
-            v |= static_cast<uint64_t>(u8()) << (8 * i);
+            v |= static_cast<uint64_t>(static_cast<unsigned char>(p[i])) << (8 * i);
+        p += 8;
         return v;
     }
     double dbl() {
