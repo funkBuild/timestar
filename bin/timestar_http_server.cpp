@@ -171,11 +171,11 @@ void set_routes(routes& r) {
                       co_return std::move(rep);
                   }
                   const size_t before =
-                      co_await seastar::smp::submit_to(0u, [] { return g_clusterDataPlane.status().vshardsLedHere; });
+                      (co_await seastar::smp::submit_to(0u, [] { return g_clusterDataPlane.status(); })).vshardsLedHere;
                   const size_t moved = co_await seastar::smp::submit_to(
                       0u, [maxTransfers] { return g_clusterDataPlane.rebalanceLeadership(maxTransfers); });
                   const size_t after =
-                      co_await seastar::smp::submit_to(0u, [] { return g_clusterDataPlane.status().vshardsLedHere; });
+                      (co_await seastar::smp::submit_to(0u, [] { return g_clusterDataPlane.status(); })).vshardsLedHere;
                   rep->set_status(seastar::http::reply::status_type::ok);
                   // Raft leadership transfer is a REQUEST (TimeoutNow): the target only
                   // becomes leader if it can campaign successfully. Report the actual

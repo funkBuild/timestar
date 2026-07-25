@@ -10,6 +10,7 @@
 #include "cluster_runtime.hpp"
 #include "engine_local_store.hpp"
 #include "replicated_data_plane.hpp"
+#include "shard_raft_plane.hpp"
 
 #include <map>
 #include <memory>
@@ -35,7 +36,7 @@ inline constexpr uint16_t kRaftPortOffset = 2000;
 // shard) when [cluster].enabled; the HTTP handlers route partitioned writes/queries
 // through write()/query(). Lives on one shard; cross-shard handlers reach it via the
 // server's global accessor + invoke_on.
-class ClusterDataPlane {
+class ClusterDataPlane : public data::ProposeSink {
 public:
     ClusterDataPlane() = default;
     ClusterDataPlane(const ClusterDataPlane&) = delete;
@@ -80,7 +81,7 @@ public:
         // RaftNode::transferLeadership only sends TimeoutNow to a caught-up target.
         std::map<NodeId, size_t> peerCaughtUp;
     };
-    Status status() const;
+    seastar::future<Status> status() const;
 
     // Operator action (integration plan M5 leadership balancing, which is also v1's
     // READ balancing since reads go to leaders). Hands leadership of up to
@@ -92,11 +93,21 @@ public:
     // fresh cluster puts ALL write coordination on one node until this runs.
     seastar::future<size_t> rebalanceLeadership(size_t maxTransfers);
 
+    // ProposeSink: a peer forwarded a batch for VShards THIS node leads. Split it by
+    // the shard owning each VShard's Raft group and replicate each slice there.
+    seastar::future<bool> proposeBatch(data::WriteBatch batch) override;
+
 private:
     // RF=3 leader read: fan out per-VShard-leader (see .cpp).
     seastar::future<QueryResponse> queryReplicated(QueryRequest request);
+    // Split a batch by the shard owning each series' VShard and replicate each slice
+    // on that shard's Raft plane.
+    seastar::future<> writeReplicated(data::WriteBatch batch);
+    // vshard -> current leader, gathered from every shard (groups live across cores).
+    seastar::future<std::map<uint16_t, data::NodeId>> gatherLeaders() const;
 
     std::optional<ClusterRuntime> rt_;
+    seastar::sharded<Engine>* enginesPtr_ = nullptr;
     // Declared in dependency order: deps before the router/coordinator that reference
     // them, so destruction (reverse order) tears the referrers down first.
     std::unique_ptr<data::VShardDirectory> dir_;
@@ -109,7 +120,12 @@ private:
     // Declared LAST so rdp_ (which borrows rpc_, raftTransport_, dir_, local_) tears
     // down first.
     std::unique_ptr<raft::RaftRpcTransport> raftTransport_;
-    std::unique_ptr<ReplicatedDataPlane> rdp_;
+    // Per-shard Raft planes: shard S owns the VShards with assignCore(vs)==S, so the
+    // group tick/step/apply work is spread over all cores instead of saturating
+    // shard 0. Only shard 0 holds the listener and the peer clients; the per-shard
+    // planes reach them through the proxies in shard_raft_plane.hpp.
+    seastar::sharded<ShardRaftPlane> shards_;
+    bool shardsStarted_ = false;
     bool replicated_ = false;
     uint16_t rf_ = 1;  // configured replication factor (reported by status())
 

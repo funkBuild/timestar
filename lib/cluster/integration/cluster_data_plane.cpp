@@ -48,6 +48,7 @@ seastar::future<seastar::net::inet_address> resolveHost(const std::string& host)
 
 seastar::future<> ClusterDataPlane::start(const ClusterConfig& cfg, seastar::sharded<Engine>& engines) {
     rt_ = ClusterRuntime::fromConfig(cfg);  // throws (fail-closed) on misconfig
+    enginesPtr_ = &engines;
     rf_ = cfg.replication_factor < 1 ? 1 : cfg.replication_factor;
     dir_ = std::make_unique<data::VShardDirectory>(rt_->directory());
     local_ = std::make_unique<EngineLocalStore>(engines);
@@ -92,15 +93,38 @@ seastar::future<> ClusterDataPlane::start(const ClusterConfig& cfg, seastar::sha
         raftTransport_ = std::make_unique<raft::RaftRpcTransport>();
         std::filesystem::path journalRoot = timestar::dataRootPath();
         journalRoot /= "cluster_raft";
-        rdp_ = std::make_unique<ReplicatedDataPlane>(*local_, *raftTransport_, *rpc_, *dir_, rt_->selfId, journalRoot);
-        rpc_->setProposeSink(rdp_->proposeSink());
+        // Start a Raft plane on EVERY shard; each will own only the VShards that
+        // assignCore maps to it, so the group work spreads across all cores.
+        co_await shards_.start();
+        shardsStarted_ = true;
+        {
+            const std::string jroot = journalRoot.string();
+            const data::NodeId selfId = rt_->selfId;
+            raft::RaftTransport* homeRaft = raftTransport_.get();
+            data::NodeTransport* homeClient = rpc_.get();
+            const data::VShardDirectory* dirp = dir_.get();
+            co_await shards_.invoke_on_all([enginesPtr = enginesPtr_, homeRaft, homeClient, dirp, selfId, jroot](ShardRaftPlane& p) {
+                return p.init(enginesPtr, homeRaft, homeClient, dirp, selfId, jroot,
+                              std::chrono::milliseconds(20));
+            });
+        }
+        // Incoming proposeWrite RPCs land on shard 0; route each batch to the shards
+        // owning its VShards.
+        rpc_->setProposeSink(*this);
 
-        // Serve Raft on this node's own Raft address; each envelope routes to its
-        // group via the host's registry.
+        // Serve Raft on this node's own Raft address. Envelopes are routed to the
+        // shard that owns the addressed group.
         seastar::net::inet_address rAddr = co_await resolveHost(self.host);
         co_await raftTransport_->start(
             seastar::socket_address(rAddr, static_cast<uint16_t>(self.port + kRaftPortOffset)),
-            [this](raft::Envelope env) { return rdp_->host().registry().deliver(std::move(env)); });
+            [this](raft::Envelope env) {
+                const unsigned owner = shardForVShard(env.groupId);
+                if (owner == seastar::this_shard_id())
+                    return shards_.local().plane().host().registry().deliver(std::move(env));
+                return seastar::smp::submit_to(owner, [this, env = std::move(env)]() mutable {
+                    return shards_.local().plane().host().registry().deliver(std::move(env));
+                });
+            });
         for (const auto& [id, addr] : rt_->peerAddresses) {
             if (id == rt_->selfId)
                 continue;
@@ -113,28 +137,28 @@ seastar::future<> ClusterDataPlane::start(const ClusterConfig& cfg, seastar::sha
             }
         }
 
-        // Instantiate this node's replicated VShard groups from placement.
-        //
-        // MANY-GROUP TIMING. A node hosts RF*4096/N per-VShard Raft groups (every
-        // VShard when RF==N) on ONE shard. The brick defaults are tuned for a handful
-        // of groups: heartbeat EVERY 20ms tick and an election timeout of only 10-20
-        // ticks (200-400ms). At this group count that is two separate floods:
-        //   - steady state: ~1365 leaders * 2 followers / 20ms ~= 136k msgs/s, which
-        //     saturates the reactor ("Too long queue accumulated for main") until the
-        //     node stops answering HTTP at all;
-        //   - startup: every group's first election times out inside the same 200ms
-        //     window, so thousands of campaigns collide and split votes.
-        // Standard Raft practice (heartbeat ~200ms, election ~1-2s, widely randomized)
-        // fixes both: 10x less steady traffic, and the initial campaigns spread over a
-        // ~1s window instead of 200ms. Followers still see 5-10 heartbeats per election
-        // window, so leadership stays stable.
+        // Instantiate each VShard's group ON ITS OWNING SHARD (see the many-group
+        // timing note below).
         raft::RaftOptions ropts;
         ropts.heartbeatTimeout = 25;     // 500ms at the 20ms tick
         ropts.electionTimeoutMin = 125;  // 2.5s
-        ropts.electionTimeoutMax = 250;  // 5s (randomized per group -> spreads campaigns)
-        for (const auto& [vshard, voters] : rt_->localReplicaGroups())
-            co_await rdp_->addVShard(vshard, voters, ropts);
-        rdp_->startTicking();
+        ropts.electionTimeoutMax = 250;  // 5s (randomized -> spreads campaigns)
+        {
+            std::map<unsigned, std::vector<std::pair<uint16_t, std::vector<data::NodeId>>>> byShard;
+            for (const auto& [vshard, voters] : rt_->localReplicaGroups())
+                byShard[shardForVShard(vshard)].push_back({vshard, voters});
+            for (auto& [shard, groups] : byShard) {
+                co_await shards_.invoke_on(shard, [g = std::move(groups), ropts](ShardRaftPlane& p) -> seastar::future<> {
+                    for (const auto& [vs, voters] : g)
+                        co_await p.addVShard(vs, voters, ropts);
+                    co_return;
+                });
+            }
+        }
+        co_await shards_.invoke_on_all([](ShardRaftPlane& p) {
+            p.startTicking();
+            return seastar::make_ready_future<>();
+        });
         replicated_ = true;
         startLeadershipBalancer();
     }
@@ -147,9 +171,11 @@ seastar::future<> ClusterDataPlane::stop() {
     balanceTimer_.cancel();
     if (!balanceGate_.is_closed())
         co_await balanceGate_.close();
-    // rdp_ (Raft groups + tick timer) BEFORE the transports it uses.
-    if (rdp_)
-        co_await rdp_->stop();
+    // The per-shard Raft planes (groups + tick timers) BEFORE the transports they use.
+    if (shardsStarted_) {
+        co_await shards_.stop();
+        shardsStarted_ = false;
+    }
     if (raftTransport_)
         co_await raftTransport_->stop();
     if (rpc_)
@@ -161,7 +187,7 @@ seastar::future<> ClusterDataPlane::write(data::WriteBatch batch) {
     // RF=3: replicate to each VShard's Raft leader (durable quorum commit). RF=1/M2:
     // apply directly on the owner.
     if (replicated_)
-        return rdp_->write(std::move(batch));
+        return writeReplicated(std::move(batch));
     if (!router_)
         throw std::runtime_error("ClusterDataPlane::write before start");
     return router_->write(std::move(batch));
@@ -183,8 +209,9 @@ seastar::future<QueryResponse> ClusterDataPlane::queryReplicated(QueryRequest re
     // its discovery), and merge the partials into the single answer.
     std::map<data::NodeId, std::vector<uint16_t>> byLeader;
     size_t leaderless = 0;
-    for (uint16_t vs = 0; vs < timestar::VIRTUAL_SHARD_COUNT; ++vs) {
-        const data::NodeId leader = rdp_->host().leaderOf(vs);
+    // Groups live across cores now, so collect each shard's leadership view.
+    const auto leaders = co_await gatherLeaders();
+    for (const auto& [vs, leader] : leaders) {
         if (leader == timestar::raft::kNoNode)
             ++leaderless;  // no elected leader (no quorum) -> its data is unreadable
         else
@@ -247,49 +274,36 @@ seastar::future<QueryResponse> ClusterDataPlane::queryReplicated(QueryRequest re
                                                           std::move(allNonNumeric));
 }
 
-ClusterDataPlane::Status ClusterDataPlane::status() const {
-    Status s;
+seastar::future<ClusterDataPlane::Status> ClusterDataPlane::status() const {
+    Status st;
     if (!rt_)
-        return s;
-    s.self = rt_->selfId;
-    s.peers = rt_->peerAddresses;
-    s.replicated = replicated_;
-    s.replicationFactor = rf_;
-    if (!replicated_ || !rdp_)
-        return s;
-    // Walk every VShard once: how many this node hosts, how many it leads, and how
-    // many have no leader anywhere (the read/write-blocking condition).
-    auto& host = const_cast<ReplicatedDataPlane*>(rdp_.get())->host();
-    s.vshardsHostedHere = host.vshardCount();
-    for (uint16_t vs = 0; vs < timestar::VIRTUAL_SHARD_COUNT; ++vs) {
-        const data::NodeId leader = host.leaderOf(vs);
-        if (leader == timestar::raft::kNoNode) {
-            ++s.vshardsLeaderless;
-            continue;
-        }
-        if (leader != rt_->selfId)
-            continue;
-        ++s.vshardsLedHere;
-        // We lead this group: record which peers have fully replicated it.
-        raft::RaftGroup* g = host.group(vs);
-        if (!g)
-            continue;
-        const auto last = g->node().log().lastIndex();
-        for (const auto& [peer, addr] : rt_->peerAddresses) {
-            if (peer == rt_->selfId)
-                continue;
-            if (g->matchIndexOf(peer) >= last)
-                ++s.peerCaughtUp[peer];
-        }
+        co_return st;
+    st.self = rt_->selfId;
+    st.peers = rt_->peerAddresses;
+    st.replicated = replicated_;
+    st.replicationFactor = rf_;
+    if (!replicated_ || !shardsStarted_)
+        co_return st;
+    std::vector<data::NodeId> peers;
+    for (const auto& [id, addr] : rt_->peerAddresses)
+        peers.push_back(id);
+    const data::NodeId self = rt_->selfId;
+    auto& shards = const_cast<seastar::sharded<ShardRaftPlane>&>(shards_);
+    for (unsigned sh = 0; sh < seastar::smp::count; ++sh) {
+        auto c = co_await shards.invoke_on(sh, [self, peers](ShardRaftPlane& p) { return p.counts(self, peers); });
+        st.vshardsHostedHere += c.hosted;
+        st.vshardsLedHere += c.led;
+        st.vshardsLeaderless += c.leaderless;
+        for (const auto& [peer, n] : c.peerCaughtUp)
+            st.peerCaughtUp[peer] += n;
     }
-    return s;
+    co_return st;
 }
 
 void ClusterDataPlane::startLeadershipBalancer() {
-    // A bounded pass every few seconds. Sized so a worst-case cluster (one node
-    // holding all 4096 leaderships after a cold start) levels out in ~a minute
-    // without ever running a long pass: 256 transfers take a few ms of local work,
-    // and the actual elections happen asynchronously in Raft.
+    // A bounded pass every few seconds, split across shards. Without it a fresh
+    // cluster leaves ALL leadership on the first node to start (it wins every
+    // election), putting all write coordination and leader-reads on one node.
     static constexpr auto kInterval = std::chrono::seconds(5);
     static constexpr size_t kBudget = 256;
     balanceTimer_.set_callback([this] {
@@ -297,15 +311,11 @@ void ClusterDataPlane::startLeadershipBalancer() {
             return;  // never overlap passes
         balanceRunning_ = true;
         // NOT a coroutine lambda: with_gate invokes a TEMPORARY closure, and a
-        // coroutine lambda's frame keeps referencing that closure after it dies (so
-        // `this` reads freed memory). That bug left balanceRunning_ stuck true after a
-        // couple of passes and the loop silently stopped. A plain continuation chain
-        // owns everything it needs.
+        // coroutine lambda's frame keeps referencing it after destruction (reads freed
+        // memory, and the flag never clears so the loop silently dies).
         (void)seastar::with_gate(balanceGate_, [this] {
             return rebalanceLeadership(kBudget).then_wrapped([this](seastar::future<size_t> f) {
-                // Best-effort background work: a failed pass must never take the node
-                // down, and must still clear the flag or the loop stops forever.
-                f.ignore_ready_future();
+                f.ignore_ready_future();  // best effort; next tick retries
                 balanceRunning_ = false;
             });
         });
@@ -314,70 +324,88 @@ void ClusterDataPlane::startLeadershipBalancer() {
 }
 
 seastar::future<size_t> ClusterDataPlane::rebalanceLeadership(size_t maxTransfers) {
-    if (!replicated_ || !rdp_ || maxTransfers == 0)
+    if (!replicated_ || !shardsStarted_ || maxTransfers == 0)
         co_return 0;
-    auto& host = rdp_->host();
+    std::vector<data::NodeId> peers;
+    for (const auto& [id, addr] : rt_->peerAddresses)
+        peers.push_back(id);
     const data::NodeId self = rt_->selfId;
-
-    // One pass over the map: who leads what, and which of them are ours.
-    std::map<data::NodeId, size_t> led;
-    std::vector<uint16_t> mine;
-    size_t totalLed = 0;
-    for (uint16_t vs = 0; vs < timestar::VIRTUAL_SHARD_COUNT; ++vs) {
-        const data::NodeId leader = host.leaderOf(vs);
-        if (leader == timestar::raft::kNoNode)
-            continue;
-        ++led[leader];
-        ++totalLed;
-        if (leader == self)
-            mine.push_back(vs);
+    // Each shard balances its own VShards. assignCore spreads VShards evenly over
+    // shards and every shard sees the same node set, so per-shard balance == cluster
+    // balance. Split the budget so a pass stays bounded overall.
+    const size_t per = std::max<size_t>(1, maxTransfers / seastar::smp::count);
+    size_t total = 0;
+    for (unsigned sh = 0; sh < seastar::smp::count; ++sh) {
+        total += co_await shards_.invoke_on(
+            sh, [per, self, peers](ShardRaftPlane& p) { return p.rebalance(per, self, peers); });
     }
-    const size_t nodes = rt_->peerAddresses.empty() ? 1 : rt_->peerAddresses.size();
-    const size_t fair = totalLed / nodes;
-    if (mine.size() <= fair)
-        co_return 0;  // already at or below our share
+    co_return total;
+}
 
-    // Targets: peers currently under the fair share, with the deficit each can absorb.
-    std::vector<std::pair<data::NodeId, size_t>> targets;
-    for (const auto& [id, addr] : rt_->peerAddresses) {
-        if (id == self)
-            continue;
-        const size_t have = led.count(id) ? led.at(id) : 0;
-        if (have < fair)
-            targets.push_back({id, fair - have});
+seastar::future<> ClusterDataPlane::writeReplicated(data::WriteBatch batch) {
+    // Group the series by the shard that owns their VShard's Raft group, then hand
+    // each slice to that shard's plane (which resolves the leader for its own
+    // VShards locally and forwards to a remote leader when needed).
+    std::map<unsigned, data::WriteBatch> byShard;
+    for (auto& sref : batch.series) {
+        const uint16_t vs = timestar::virtualShard(SeriesId128::fromSeriesKey(sref.seriesKey));
+        byShard[shardForVShard(vs)].series.push_back(std::move(sref));
     }
-    if (targets.empty())
-        co_return 0;
-
-    const size_t budget = std::min(maxTransfers, mine.size() - fair);
-    size_t done = 0, ti = 0;
-    for (uint16_t vs : mine) {
-        if (done >= budget)
-            break;
-        // Round-robin over targets that still have deficit.
-        size_t tried = 0;
-        while (tried < targets.size() && targets[ti % targets.size()].second == 0) {
-            ++ti;
-            ++tried;
-        }
-        if (tried == targets.size())
-            break;  // every target is satisfied
-        auto& [target, deficit] = targets[ti % targets.size()];
-        raft::RaftGroup* g = host.group(vs);
-        if (!g || !g->isLeader())
-            continue;  // lost leadership since the scan; skip
+    std::exception_ptr firstErr;
+    for (auto& [shard, slice] : byShard) {
         try {
-            co_await g->transferLeadership(target);
-            --deficit;
-            ++done;
-            ++ti;
+            co_await shards_.invoke_on(shard, [b = std::move(slice)](ShardRaftPlane& p) mutable {
+                return p.plane().write(std::move(b));
+            });
         } catch (...) {
-            // A transfer that cannot start (target lagging, leadership lost) is not
-            // fatal -- the next pass retries. Never fail the whole operator request.
-            ++ti;
+            if (!firstErr)
+                firstErr = std::current_exception();
         }
     }
-    co_return done;
+    if (firstErr)
+        std::rethrow_exception(firstErr);
+    co_return;
+}
+
+seastar::future<bool> ClusterDataPlane::proposeBatch(data::WriteBatch batch) {
+    // A peer forwarded this batch because we lead those VShards. Replicate each
+    // slice through the Raft group on its owning shard.
+    std::map<unsigned, data::WriteBatch> byShard;
+    for (auto& sref : batch.series) {
+        const uint16_t vs = timestar::virtualShard(SeriesId128::fromSeriesKey(sref.seriesKey));
+        byShard[shardForVShard(vs)].series.push_back(std::move(sref));
+    }
+    bool all = true;
+    for (auto& [shard, slice] : byShard) {
+        const bool ok = co_await shards_.invoke_on(shard, [b = std::move(slice)](ShardRaftPlane& p) mutable {
+            return p.plane().host().proposeBatch(std::move(b));
+        });
+        if (!ok)
+            all = false;  // not the leader for that slice; caller redirects/retries
+    }
+    co_return all;
+}
+
+seastar::future<std::map<uint16_t, data::NodeId>> ClusterDataPlane::gatherLeaders() const {
+    std::map<uint16_t, NodeId> leaders;
+    auto& shards = const_cast<seastar::sharded<ShardRaftPlane>&>(shards_);
+    for (unsigned sh = 0; sh < seastar::smp::count; ++sh) {
+        auto part = co_await shards.invoke_on(sh, [](ShardRaftPlane& p) {
+            std::map<uint16_t, data::NodeId> out;
+            if (!p.ready())
+                return out;
+            auto& host = p.plane().host();
+            for (uint16_t vs = 0; vs < timestar::VIRTUAL_SHARD_COUNT; ++vs) {
+                if (shardForVShard(vs) != seastar::this_shard_id())
+                    continue;
+                out[vs] = host.leaderOf(vs);
+            }
+            return out;
+        });
+        for (const auto& [vs, l] : part)
+            leaders[vs] = l;
+    }
+    co_return leaders;
 }
 
 seastar::future<data::MetadataResult> ClusterDataPlane::metadata(data::MetadataRequest request) {
