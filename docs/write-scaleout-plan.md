@@ -348,6 +348,26 @@ Gate outcomes (2026-07-25):
   - `std::stoull` parsed `TIMESTAR_CLUSTER_WRITE_INFLIGHT_BYTES="32MiB"` as **32 bytes**
     and `"-1"` as SIZE_MAX; strict `from_chars` with full-consumption, and the effective
     budget is logged at startup.
+- **Pre-existing balancer bug found at RF < N, NOT introduced here (for M5 / the
+  movement owner):** on a completely IDLE 5-node RF=3 cluster leadership moves
+  **~319 VShards every 2 seconds, indefinitely** — it never converges. Cause is in
+  `ShardRaftPlane::rebalance`: `host.leaderOf(vs)` returns `kNoNode` for a VShard
+  this node does not HOST, so those VShards are skipped from both `totalLed` and
+  the per-peer `led[]` tally. At RF < N each node therefore computes
+  `fair = totalLed / peers.size()` from only the ~RF/N of VShards it replicates,
+  its target lands ~40% low, every node believes it is permanently above fair
+  share, and transfers are issued forever (many to nodes that are not even voters
+  for that VShard, where `transferLeadership` silently no-ops). At RF == N — the
+  production 3-node config, and every gate that ran before this one — each node
+  hosts every VShard, `totalLed` is the true total, and the arithmetic is correct;
+  that is why it has never shown up. It is the same `leaderOf`-returns-kNoNode
+  root cause as the RF < N read failure noted below.
+
+  Consequence for the deposed-primary gate: a 5-node cluster is never quiet, so a
+  small number of writes land on a VShard that is genuinely mid-transfer. The gate
+  therefore asserts on **zero server-side 500s** (the property Phase 3 changed:
+  pre-Phase-3 answered ~29% opaque 500s) plus a bounded 5xx rate, rather than on
+  zero 5xx.
 - **Pre-existing crash found, NOT introduced here (for Phase 4 / the index owner):**
   a `{"writes":[...]}` batch carrying thousands of DISTINCT SERIES, under
   concurrency, segfaults the node. Symbolized: **`roaring_bitmap_add`**, faulting

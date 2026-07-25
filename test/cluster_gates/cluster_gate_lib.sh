@@ -103,6 +103,46 @@ wait_balanced() {
     return 1
 }
 
+# wait_leadership_settled "PORT..." MAX_POLLS -- the led-per-node vector is IDENTICAL
+# across two consecutive polls, i.e. no VShard changed hands in the interval.
+#
+# A rebalance storm leaves VShards mid-transfer for a while, and a write to one of those
+# is momentarily leaderless -- a real condition, but it is the ROLLING-REBALANCE gate's
+# subject, not this one. A DEPOSED PRIMARY is a steady state: the primary is alive, some
+# other node leads, and nothing is moving. Measuring before leadership settles conflates
+# the two and makes the deposed-primary result depend on how much churn the storm
+# happened to leave behind.
+#
+# It doubles as a check on leader stability: if leadership never stops moving on an idle
+# cluster (e.g. spurious checkQuorum step-downs), this never settles and the gate fails
+# here rather than silently blaming the write path.
+# "Settled" is a TOLERANCE, not exact equality: the background leadership balancer runs
+# every few seconds over 4096 groups and never stops nudging, so an exact repeat of the
+# per-node led vector may never occur. What distinguishes settled from churning is the
+# SIZE of the movement -- single digits per poll versus the hundreds a rebalance storm
+# produces.
+wait_leadership_settled() {
+    local ports="$1" polls="${2:-40}" tol="${3:-32}" prev="" cur delta
+    for _ in $(seq 1 "$polls"); do
+        sleep 2
+        cur=""
+        for p in $ports; do cur="$cur $(status_field "$(cluster_status "$p")" vshards_led)"; done
+        case "$cur" in *[0-9]*) ;; *) continue ;; esac
+        if [ -n "$prev" ]; then
+            local before="$prev"
+            delta=$(awk -v a="$prev" -v b="$cur" 'BEGIN{na=split(a,A," ");split(b,B," ");d=0;
+                for(i=1;i<=na;i++){x=A[i]-B[i]; if(x<0)x=-x; d+=x} print d}')
+            if [ "${delta:-9999}" -le "$tol" ]; then
+                echo "  leadership settled at [$cur] (moved $delta VShards in the last 2s)"
+                return 0
+            fi
+        fi
+        prev="$cur"
+    done
+    gate_fail "leadership never settled within $((polls * 2))s -- the last two samples differ by ${delta:-?} VShards, i.e. leaders are still moving in bulk on an idle cluster"
+    return 1
+}
+
 # Refuse to start if ANYTHING is still listening on the ports this gate uses.
 #
 # A survivor from an earlier run does not merely conflict: seastar exits on the failed
