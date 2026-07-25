@@ -32,14 +32,21 @@ namespace timestar::cluster {
 // queries fail. Spreading them divides that work by the core count.
 //
 // BOTH inter-node transports are now PER SHARD: every shard listens on the node's
-// single Raft port AND on its single data-plane port (SO_REUSEPORT, the same pattern
-// the HTTP server uses) and keeps its own peer clients for each. Previously one
-// transport of each kind lived on shard 0 and carried the whole node's traffic, which
-// made shard 0 the write bottleneck -- it showed ~10x the journal-sync latency of the
-// other shards while all cores sat ~25% idle. Egress is now entirely local; an inbound
-// Raft envelope still hops to the shard owning its group, and an inbound proposeWrite
-// is split across the shards owning its VShards, but the accept/read work is spread by
-// the kernel instead of landing on one core.
+// single Raft port AND on its single data-plane port, and keeps its own peer clients
+// for each. Previously one transport of each kind lived on shard 0 and carried the
+// whole node's traffic, which made shard 0 the write bottleneck -- it showed ~10x the
+// journal-sync latency of the other shards while all cores sat ~25% idle. Egress is now
+// entirely local; an inbound Raft envelope still hops to the shard owning its group,
+// and an inbound proposeWrite is split across the shards owning its VShards.
+//
+// The per-shard listen is NOT SO_REUSEPORT, despite what the surrounding comments used
+// to claim: this seastar hardcodes posix_reuseport_available() to false, so shard 0
+// owns the one real socket and each accepted fd is handed to the shard the listen
+// options name. The data-plane listener therefore asks for connection_distribution
+// (see DataPlaneRpc::start's perShardListener). The RAFT listener still pins itself
+// per shard, which means shard 0 accepts and reads ALL inbound Raft traffic -- latent,
+// pre-existing, and worth the same fix; it is safe there only because Raft's verb is
+// no_wait, so nothing hangs waiting on a reply.
 
 // The shard that owns a VShard's Raft group.
 inline unsigned shardForVShard(uint16_t vshard) {
@@ -75,7 +82,7 @@ public:
     // VShards by proposeBatch() below.
     seastar::future<> startDataPlane(seastar::socket_address local) {
         rpc_->setProposeSink(*this);
-        return rpc_->start(local, *store_);
+        return rpc_->start(local, *store_, /*perShardListener=*/true);
     }
 
     void addDataPeer(data::NodeId id, seastar::socket_address addr) { rpc_->addPeer(id, addr); }

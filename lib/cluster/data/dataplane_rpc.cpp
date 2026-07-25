@@ -204,19 +204,33 @@ struct DataPlaneRpc::Impl {
         negotiateVersionStub = proto.make_client<seastar::sstring(seastar::sstring)>(kNegotiateVersion);
     }
 
-    // Pin the listening socket to THIS shard. seastar's default listen policy
-    // (connection_distribution) scatters incoming connections across every shard,
-    // but this rpc server object lives on one shard only -- a connection accepted
-    // on any other shard has no server behind it and the peer's WAITED call hangs
-    // forever (nondeterministically, since the scatter is by shard load). Fixing
-    // the accept CPU to the server's shard keeps every connection on the shard
-    // that can actually answer. (Raft's transport dodged this only because it is
-    // no_wait -- it never blocks on a reply -- so a dropped connection was silently
-    // retried instead of hanging.)
-    void listenServer(seastar::socket_address local) {
+    // Where inbound connections are accepted.
+    //
+    // `perShard == false` (one instance, on one shard) PINS the listener to this shard.
+    // seastar's default policy scatters incoming connections across every shard, but a
+    // connection accepted on a shard with no server behind it leaves the peer's WAITED
+    // call hanging forever (nondeterministically, since the scatter is by shard load).
+    // (Raft's transport dodged this only because it is no_wait -- it never blocks on a
+    // reply -- so a dropped connection was silently retried instead of hanging.)
+    //
+    // `perShard == true` means EVERY shard has started an instance on this same
+    // address, so any shard can answer and pinning is exactly wrong: it would keep the
+    // node's entire inbound data plane on one core. Note this is NOT SO_REUSEPORT --
+    // this seastar hardcodes `posix_reuseport_available() { return false; }` ("FIXME:
+    // reuseport currently leads to heavy load imbalance"), so the per-shard listen()
+    // calls do NOT each get their own socket. Shard 0 owns the one real socket and
+    // posix_server_socket_impl::accept() hands each accepted fd to the shard the load
+    // balancer picks (posix_ap_server_socket_impl::move_connected_socket), where the
+    // per-shard server picks it up. connection_distribution therefore distributes and
+    // set_fixed_cpu does not -- which is why shard 0 stayed the profile outlier while
+    // every "per-shard SO_REUSEPORT listener" in this tree quietly served nothing.
+    void listenServer(seastar::socket_address local, bool perShard) {
         seastar::listen_options lo;
         lo.reuse_address = true;
-        lo.set_fixed_cpu(seastar::this_shard_id());
+        if (perShard)
+            lo.lba = seastar::server_socket::load_balancing_algorithm::connection_distribution;
+        else
+            lo.set_fixed_cpu(seastar::this_shard_id());
         seastar::server_socket ss =
             tlsEnabled ? seastar::tls::listen(serverCreds, local, lo) : seastar::listen(local, lo);
         server =
@@ -260,11 +274,11 @@ seastar::future<> DataPlaneRpc::start(seastar::socket_address local, LocalStore&
         });
     });
     impl_->makeStubs();
-    impl_->listenServer(local);
+    impl_->listenServer(local, false);
     return seastar::make_ready_future<>();
 }
 
-seastar::future<> DataPlaneRpc::start(seastar::socket_address local, NodeStore& sink) {
+seastar::future<> DataPlaneRpc::start(seastar::socket_address local, NodeStore& sink, bool perShardListener) {
     if (impl_->server)
         throw std::logic_error("DataPlaneRpc::start called more than once");
     impl_->nodeSink = &sink;
@@ -377,7 +391,7 @@ seastar::future<> DataPlaneRpc::start(seastar::socket_address local, NodeStore& 
         return seastar::make_ready_future<seastar::sstring>(encU32(*agreed));
     });
     impl_->makeStubs();
-    impl_->listenServer(local);
+    impl_->listenServer(local, perShardListener);
     return seastar::make_ready_future<>();
 }
 

@@ -37,7 +37,16 @@ public:
     // node's storage). `sink` must outlive the transport. The two overloads select
     // the command path this node serves; both must not be called on one instance.
     seastar::future<> start(seastar::socket_address local, LocalStore& sink);
-    seastar::future<> start(seastar::socket_address local, NodeStore& sink);
+    // `perShardListener` declares that EVERY shard starts an instance on this same
+    // address. It selects where inbound connections are accepted: pinned to the
+    // starting shard (false -- a single instance must answer every connection itself,
+    // or a peer's WAITED call hangs on a shard with no server) versus distributed
+    // across shards (true). It is NOT SO_REUSEPORT: this seastar disables reuseport
+    // outright, so shard 0 owns the only socket and hands each accepted fd to the
+    // chosen shard's listener. Passing false while every shard listens quietly keeps
+    // the node's whole inbound data plane on one core; passing true with only one
+    // instance HANGS peers. See listenServer().
+    seastar::future<> start(seastar::socket_address local, NodeStore& sink, bool perShardListener = false);
     // Start CLIENT-ONLY: create the peer stubs, but serve nothing. Used when some
     // OTHER instance already listens on this node's data-plane address (in replicated
     // mode every shard owns a listener via SO_REUSEPORT) while this instance is still
