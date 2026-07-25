@@ -564,9 +564,8 @@ int main(int argc, char** argv) {
                         [replicatedWrites](timestar::data::WriteBatch b) {
                             if (replicatedWrites)
                                 return g_clusterDataPlane.writeFromShard(std::move(b));
-                            return seastar::smp::submit_to(0u, [b = std::move(b)]() mutable {
-                                return g_clusterDataPlane.write(std::move(b));
-                            });
+                            return seastar::smp::submit_to(
+                                0u, [b = std::move(b)]() mutable { return g_clusterDataPlane.write(std::move(b)); });
                         };
                     // Route metadata endpoints through the scatter+merge.
                     timestar::http::HttpMetadataHandler::clusterMetadataHook = [](timestar::data::MetadataRequest r) {
