@@ -98,12 +98,36 @@ seastar::future<bool> ReplicatedVShardHost::proposeBatch(data::WriteBatch batch)
         dest.schemaVersion = batch.schemaVersion;
         dest.series.push_back(std::move(s));
     }
-    // Replicate each VShard group; every group must commit for the batch to ack.
+    // Replicate every VShard group CONCURRENTLY; every group must commit for the
+    // batch to ack.
+    //
+    // These are independent Raft groups with no ordering between them (this was never
+    // an atomic multi-group commit -- see the header contract), but they used to be
+    // proposed ONE AT A TIME, so a batch spanning N VShards serialised N full quorum
+    // round trips (durable append + replicate + commit + apply) end to end. That was
+    // the dominant write latency: measured at ~187ms average per 10k-point batch,
+    // matching ~20 VShards x ~9ms. Issuing them together overlaps the network and
+    // fsync waits instead of stacking them.
+    std::vector<seastar::future<bool>> pending;
+    pending.reserve(byVShard.size());
+    for (auto& [vs, b] : byVShard)
+        pending.push_back(propose(vs, data::ReplicatedCommand{std::move(b)}));
+
+    // Await EVERY proposal even after one fails -- abandoning an in-flight future
+    // would let its group's commit land on a destroyed continuation.
     bool allOk = true;
-    for (auto& [vs, b] : byVShard) {
-        const bool ok = co_await propose(vs, data::ReplicatedCommand{std::move(b)});
-        allOk = allOk && ok;
+    std::exception_ptr firstErr;
+    for (auto& f : pending) {
+        try {
+            const bool ok = co_await std::move(f);
+            allOk = allOk && ok;
+        } catch (...) {
+            if (!firstErr)
+                firstErr = std::current_exception();
+        }
     }
+    if (firstErr)
+        std::rethrow_exception(firstErr);
     co_return allOk;
 }
 
