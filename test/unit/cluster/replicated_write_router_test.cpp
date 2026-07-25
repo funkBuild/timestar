@@ -470,8 +470,65 @@ seastar::future<> testRejectsOutsideTheViewCannotAck() {
     EXPECT_GE(vs.size(), 1u);
 }
 
+// write-scaleout 3f: the router must push a DEADLINE into every remote attempt.
+//
+// The overall budget is only checked BETWEEN attempts, so without this a peer that accepts
+// the connection and then goes silent holds one attempt open indefinitely -- and the batch
+// holds its WriteAdmission charge for as long as it does, taking the whole shard to 503
+// behind it. The transport's own honouring of the deadline is seastar rpc's time_point
+// overload; what is asserted here is that a deadline is SET, and set to the per-attempt
+// bound rather than the whole 1.5s budget.
+seastar::future<> testRemoteAttemptsCarryADeadline() {
+    VShardDirectory dir(1, rf3Map(3));
+
+    class DeadlineRecordingTransport : public NodeTransport {
+    public:
+        std::vector<OptDeadline> deadlines;
+        seastar::future<> forwardWriteBatch(NodeId, WriteBatch) override { return seastar::make_ready_future<>(); }
+        seastar::future<NodeQueryPartial> queryNode(NodeId, NodeQueryRequest) override {
+            return seastar::make_exception_future<NodeQueryPartial>(std::runtime_error("unused"));
+        }
+        seastar::future<ProposeOutcome> proposeWriteHinted(NodeId, VShardBatchView view,
+                                                           OptDeadline deadline) override {
+            deadlines.push_back(deadline);
+            ProposeOutcome out;
+            for (const auto* g : view)
+                out.committedVShards.push_back(g->first);
+            out.committed = true;
+            return seastar::make_ready_future<ProposeOutcome>(std::move(out));
+        }
+    } client;
+    ScriptedLocalSink local;
+    MapLeaderResolver leaders;
+    ReplicatedBatchWriteRouter router(dir, local, client, leaders);
+
+    const auto before = seastar::lowres_clock::now();
+    co_await router.write(manySeries(60));
+
+    EXPECT_FALSE(client.deadlines.empty()) << "the batch must have reached remote leaders";
+    for (const auto& d : client.deadlines) {
+        EXPECT_TRUE(d.has_value()) << "a remote attempt with NO deadline can hang forever";
+        if (!d)
+            continue;
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(*d - before).count();
+        EXPECT_GT(ms, 0) << "the deadline is already in the past";
+        EXPECT_LE(
+            ms,
+            std::chrono::duration_cast<std::chrono::milliseconds>(ReplicatedBatchWriteRouter::kAttemptTimeout).count() +
+                50)
+            << "an attempt got " << ms << "ms, i.e. more than the per-attempt bound -- one silent peer "
+            << "would then hold the whole write budget";
+        EXPECT_LE(ms,
+                  std::chrono::duration_cast<std::chrono::milliseconds>(ReplicatedBatchWriteRouter::kDeadline).count())
+            << "an attempt deadline may never exceed the overall one";
+    }
+}
+
 }  // namespace
 
+TEST(ReplicatedBatchWriteRouterTest, RemoteAttemptsCarryADeadline) {
+    testRemoteAttemptsCarryADeadline().get();
+}
 TEST(ReplicatedBatchWriteRouterTest, StrictSubsetRejectNeverAcks) {
     testStrictSubsetRejectNeverAcks().get();
 }
