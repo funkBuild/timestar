@@ -52,6 +52,18 @@ constexpr uint64_t kProposeWrite = 6;       // sstring -> sstring (WriteBatch, w
 constexpr uint64_t kLeaderReadIndex = 7;    // sstring(u16 vshard) -> sstring(u64 readIndex); throws if not leader
 constexpr uint64_t kLeaderCommitIndex = 8;  // sstring(u16 vshard) -> sstring(u64 commitIndex); throws if not leader
 constexpr uint64_t kNegotiateVersion = 9;   // sstring(u32 min,u32 max) -> sstring(u32 agreed); throws if incompatible
+// write-scaleout 3a. Same request as kProposeWrite (an encoded WriteBatch); the reply
+// carries the LEADER HINT for each rejected VShard:
+//     '1'                                        -> every slice committed
+//     '0' u16 rejectCount { u16 vshard u64 leader u8 kind }*
+// It is a SEPARATE verb rather than a widened kProposeWrite reply because a reply shape
+// is chosen by the SERVER, which does not know which version it negotiated with the
+// caller (the handshake is cached client-side, per connection). An old client would
+// therefore have read an extended reply as "malformed propose reply" and turned a clean
+// not-leader into a 5xx during a rolling upgrade. A new verb inverts the choice: the
+// CLIENT picks it, and only once the negotiated version says the peer answers it, so
+// both directions of a mixed-version cluster keep working unchanged.
+constexpr uint64_t kProposeWriteHinted = 10;
 
 // How long before re-attempting a peer connection that died. seastar's rpc::client
 // never reconnects itself, so we replace it -- but bounded, so a burst of concurrent
@@ -82,6 +94,14 @@ constexpr std::chrono::milliseconds kReconnectBackoff{200};
 // so this is several times the real maximum while still refusing the amplifying shape.
 constexpr size_t kMaxInboundRpcMemory = 128u << 20;  // 128 MiB of estimated in-flight
 constexpr unsigned kInboundBloatFactor = 12;
+
+// The largest frame this node will SEND on the data plane: the inbound admission ceiling
+// above (max_memory / bloat_factor ~= 10.67 MiB), which every peer in a homogeneous
+// cluster shares. Checking it CLIENT-side turns "the peer refused an oversized frame" --
+// which arrives as an opaque remote error, gets retried pointlessly against every other
+// leader, and is finally reported as an internal 500 -- into a local, terminal failure
+// naming the actual size, which the HTTP layer maps to 413 (write-scaleout 3d).
+constexpr size_t kMaxOutboundFrameBytes = kMaxInboundRpcMemory / kInboundBloatFactor;
 
 seastar::rpc::resource_limits inboundLimits() {
     seastar::rpc::resource_limits lim;
@@ -129,6 +149,61 @@ std::optional<uint64_t> decU64(const seastar::sstring& s) {
     return v;
 }
 
+// The kProposeWriteHinted reply (see the verb comment for the layout). '1' with no body
+// is byte-identical to the old kProposeWrite success reply, deliberately: the two verbs
+// then agree on the common case and only diverge where there is something extra to say.
+seastar::sstring encodeProposeOutcome(const ProposeOutcome& out) {
+    if (out.committed)
+        return seastar::sstring("1", 1);
+    std::string s;
+    s.reserve(1 + 2 + out.rejects.size() * 11);
+    s.push_back('0');
+    const seastar::sstring n = encU16(static_cast<uint16_t>(out.rejects.size()));
+    s.append(n.data(), n.size());
+    for (const auto& r : out.rejects) {
+        const seastar::sstring vs = encU16(r.vshard);
+        const seastar::sstring ld = encU64(r.leaderHint);
+        s.append(vs.data(), vs.size());
+        s.append(ld.data(), ld.size());
+        s.push_back(static_cast<char>(static_cast<uint8_t>(r.kind)));
+    }
+    return seastar::sstring(s.data(), s.size());
+}
+
+// Parse it back. nullopt on ANY malformed shape -- a garbled reply must never read as a
+// plausible set of leader hints, which would send the retry to a node chosen by
+// corruption.
+std::optional<ProposeOutcome> decodeProposeOutcome(const seastar::sstring& s) {
+    if (s.empty())
+        return std::nullopt;
+    ProposeOutcome out;
+    if (s[0] == '1')
+        return s.size() == 1 ? std::optional<ProposeOutcome>(ProposeOutcome{true, {}}) : std::nullopt;
+    if (s[0] != '0' || s.size() < 3)
+        return std::nullopt;
+    const size_t n = static_cast<size_t>(static_cast<uint8_t>(s[1])) |
+                     (static_cast<size_t>(static_cast<uint8_t>(s[2])) << 8);
+    if (s.size() != 3 + n * 11)
+        return std::nullopt;
+    out.rejects.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        const size_t off = 3 + i * 11;
+        SliceReject r;
+        r.vshard = static_cast<uint16_t>(static_cast<uint8_t>(s[off]) |
+                                         (static_cast<uint16_t>(static_cast<uint8_t>(s[off + 1])) << 8));
+        uint64_t leader = 0;
+        for (int b = 0; b < 8; ++b)
+            leader |= static_cast<uint64_t>(static_cast<uint8_t>(s[off + 2 + b])) << (8 * b);
+        r.leaderHint = leader;
+        const uint8_t kind = static_cast<uint8_t>(s[off + 10]);
+        if (kind > static_cast<uint8_t>(WriteFailure::Fatal))
+            return std::nullopt;
+        r.kind = static_cast<WriteFailure>(kind);
+        out.rejects.push_back(r);
+    }
+    return out;
+}
+
 }  // namespace
 
 struct DataPlaneRpc::Impl {
@@ -143,7 +218,7 @@ struct DataPlaneRpc::Impl {
     ReadIndexSink* readIndexSink = nullptr;  // replica-read leader-reach target (M4)
     // Wire-version range this node supports (M6/X). The max is the newest WriteBatch
     // format this binary can WRITE; peers negotiate down to the highest both know.
-    features::VersionRange localVersion{1, kWriteBatchFormatV2};
+    features::VersionRange localVersion{1, kWriteBatchFormatV3};
     // Version agreed with each peer (kNegotiateVersion), cached per connection: a
     // handshake per peer, not per write. Dropped when a connection is retired, because
     // the peer may come back on a different binary.
@@ -168,6 +243,7 @@ struct DataPlaneRpc::Impl {
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> queryNodeStub;
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> queryMetadataStub;
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> proposeWriteStub;
+    std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> proposeWriteHintedStub;
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> leaderReadIndexStub;
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> leaderCommitIndexStub;
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> negotiateVersionStub;
@@ -240,6 +316,7 @@ struct DataPlaneRpc::Impl {
         queryNodeStub = proto.make_client<seastar::sstring(seastar::sstring)>(kQueryNode);
         queryMetadataStub = proto.make_client<seastar::sstring(seastar::sstring)>(kQueryMetadata);
         proposeWriteStub = proto.make_client<seastar::sstring(seastar::sstring)>(kProposeWrite);
+        proposeWriteHintedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kProposeWriteHinted);
         leaderReadIndexStub = proto.make_client<seastar::sstring(seastar::sstring)>(kLeaderReadIndex);
         leaderCommitIndexStub = proto.make_client<seastar::sstring(seastar::sstring)>(kLeaderCommitIndex);
         negotiateVersionStub = proto.make_client<seastar::sstring(seastar::sstring)>(kNegotiateVersion);
@@ -391,6 +468,18 @@ seastar::future<> DataPlaneRpc::start(seastar::socket_address local, NodeStore& 
                 std::runtime_error("dataplane: malformed propose batch"));
         return impl_->proposeSink->proposeBatch(std::move(*batch)).then([](bool ok) {
             return seastar::sstring(ok ? "1" : "0");
+        });
+    });
+    impl_->proto.register_handler(kProposeWriteHinted, [this](seastar::sstring data) {
+        if (!impl_->proposeSink)
+            return seastar::make_exception_future<seastar::sstring>(
+                std::runtime_error("dataplane: no propose sink (node not RF>1)"));
+        auto batch = decodeWriteBatch(std::string(data.data(), data.size()));
+        if (!batch)
+            return seastar::make_exception_future<seastar::sstring>(
+                std::runtime_error("dataplane: malformed propose batch"));
+        return impl_->proposeSink->proposeBatchHinted(std::move(*batch)).then([](ProposeOutcome out) {
+            return encodeProposeOutcome(out);
         });
     });
     impl_->proto.register_handler(kLeaderReadIndex, [this](seastar::sstring data) {
@@ -617,6 +706,48 @@ seastar::future<MetadataResult> DataPlaneRpc::queryMetadata(NodeId to, MetadataR
     co_return std::move(*res);
 }
 
+seastar::future<ProposeOutcome> DataPlaneRpc::proposeWriteHinted(NodeId to, VShardBatchView view) {
+    // `view` borrows the CALLER's groups (the retry loop keeps them so it can
+    // re-dispatch only what failed). It is read here and by encodeWriteBatch before the
+    // first co_await that could outlive it; the caller awaits this future, so the
+    // pointees stay alive throughout.
+    if (impl_->stopping)
+        throw std::runtime_error("dataplane: shutting down");
+    std::vector<uint16_t> vshards;
+    vshards.reserve(view.size());
+    for (const auto* g : view)
+        vshards.push_back(g->first);
+    const uint32_t version = co_await versionFor(to);
+    auto* conn = impl_->clientFor(to);
+    if (!conn)
+        throw std::runtime_error("dataplane: unknown peer");
+    // Encode straight from the borrowed groups -- no mergeVShardBatches allocation.
+    std::string bytes = encodeWriteBatch(view, version);
+    if (bytes.size() > kMaxOutboundFrameBytes)
+        throw WriteFrameTooLargeError("dataplane: encoded write slice of " + std::to_string(bytes.size()) +
+                                      " bytes exceeds the " + std::to_string(kMaxOutboundFrameBytes) +
+                                      "-byte inter-node frame limit; split the batch");
+    if (version < kWriteBatchFormatV3) {
+        // The peer predates the hinted verb: use the v1-shaped one and report hintless
+        // rejects. Correctness is unchanged (the caller still retries against a
+        // re-resolved leader), only the routing is blind -- exactly the v1 behaviour.
+        seastar::sstring old = co_await impl_->proposeWriteStub(*conn, seastar::sstring(bytes.data(), bytes.size()));
+        if (old.size() != 1 || (old[0] != '1' && old[0] != '0'))
+            throw std::runtime_error("dataplane: malformed propose reply");
+        ProposeOutcome out;
+        out.committed = old[0] == '1';
+        if (!out.committed)
+            for (uint16_t vs : vshards)
+                out.rejects.push_back(SliceReject{vs, kNoNode, WriteFailure::NotLeader});
+        co_return out;
+    }
+    seastar::sstring reply = co_await impl_->proposeWriteHintedStub(*conn, seastar::sstring(bytes.data(), bytes.size()));
+    auto out = decodeProposeOutcome(reply);
+    if (!out)
+        throw std::runtime_error("dataplane: malformed hinted propose reply");
+    co_return std::move(*out);
+}
+
 seastar::future<bool> DataPlaneRpc::proposeWrite(NodeId to, WriteBatch batch) {
     if (impl_->stopping)
         throw std::runtime_error("dataplane: shutting down");
@@ -625,6 +756,10 @@ seastar::future<bool> DataPlaneRpc::proposeWrite(NodeId to, WriteBatch batch) {
     if (!conn)
         throw std::runtime_error("dataplane: unknown peer");
     std::string bytes = encodeWriteBatch(batch, version);
+    if (bytes.size() > kMaxOutboundFrameBytes)
+        throw WriteFrameTooLargeError("dataplane: encoded write slice of " + std::to_string(bytes.size()) +
+                                      " bytes exceeds the " + std::to_string(kMaxOutboundFrameBytes) +
+                                      "-byte inter-node frame limit; split the batch");
     seastar::sstring reply = co_await impl_->proposeWriteStub(*conn, seastar::sstring(bytes.data(), bytes.size()));
     // "1" = committed on the leader, "0" = not-leader (caller redirects). Anything
     // else is a framing/corruption fault -- THROW (like the other verbs) rather than

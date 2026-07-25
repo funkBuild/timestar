@@ -70,6 +70,12 @@ public:
     seastar::future<NodeQueryPartial> queryNode(NodeId to, NodeQueryRequest req) override;
     seastar::future<MetadataResult> queryMetadata(NodeId to, MetadataRequest req) override;
     seastar::future<bool> proposeWrite(NodeId to, WriteBatch batch) override;
+    // The production remote propose (write-scaleout 3a/3b): borrows the caller's groups
+    // (no merge allocation, and the caller keeps them so it can retry the failed ones)
+    // and returns per-VShard rejects carrying the peer's view of the real leader. Speaks
+    // the hinted verb only when the negotiated version says the peer answers it,
+    // otherwise falls back to the v1-shaped reply with hintless rejects.
+    seastar::future<ProposeOutcome> proposeWriteHinted(NodeId to, VShardBatchView view) override;
 
     // The Raft propose target incoming proposeWrite RPCs dispatch into (the node's
     // ReplicatedVShardHost). Must be set before a peer sends proposeWrite; outlives

@@ -508,6 +508,50 @@ WriteBatch mergeVShardBatches(VShardBatches groups) {
     return out;
 }
 
+VShardBatchView viewOf(const VShardBatches& groups) {
+    VShardBatchView view;
+    view.reserve(groups.size());
+    for (const auto& g : groups)
+        view.push_back(&g);
+    return view;
+}
+
+namespace {
+size_t seriesResidentBytes(const WriteSeries& s) {
+    size_t n = s.seriesKey.size() + s.timestamps.size() * 8 + s.revisions.size() * 8;
+    switch (s.type) {
+        case TSMValueType::Float:
+            n += std::get<0>(s.values).size() * 8;
+            break;
+        case TSMValueType::Integer:
+            n += std::get<1>(s.values).size() * 8;
+            break;
+        case TSMValueType::Boolean:
+            n += std::get<2>(s.values).size();
+            break;
+        case TSMValueType::String:
+            for (const std::string& v : std::get<3>(s.values))
+                n += v.size() + sizeof(std::string);
+            break;
+    }
+    return n;
+}
+}  // namespace
+
+size_t approxResidentBytes(const WriteBatch& batch) {
+    size_t n = 0;
+    for (const auto& s : batch.series)
+        n += seriesResidentBytes(s);
+    return n;
+}
+
+size_t approxResidentBytes(const VShardBatchView& view) {
+    size_t n = 0;
+    for (const auto* g : view)
+        n += approxResidentBytes(g->second);
+    return n;
+}
+
 std::string encodeWriteBatch(const WriteBatch& batch) {
     return encodeWriteBatch(batch, kWriteBatchFormatV1);
 }
@@ -525,6 +569,29 @@ std::string encodeWriteBatch(const WriteBatch& batch, uint32_t version) {
     w.u32(static_cast<uint32_t>(batch.series.size()));
     for (const auto& s : batch.series)
         encodeSeries(w, s, v);
+    w.u64(fnv1a(w.out.data(), w.out.size()));
+    return std::move(w.out);
+}
+
+std::string encodeWriteBatch(const VShardBatchView& view, uint32_t version) {
+    const uint32_t v = version >= kWriteBatchFormatV2 ? kWriteBatchFormatV2 : kWriteBatchFormatV1;
+    size_t nSeries = 0, reserve = 8 + 4 + kTrailerBytes;
+    uint64_t schemaVersion = 0;
+    for (const auto* g : view) {
+        nSeries += g->second.series.size();
+        // Identical across the groups of one batch (splitByVShard copies it into each).
+        schemaVersion = g->second.schemaVersion;
+        reserve += v1EncodedSize(g->second) - (8 + 4 + kTrailerBytes);
+    }
+    Writer w;
+    w.out.reserve(reserve);
+    if (v >= kWriteBatchFormatV2)
+        w.out.append(kV2Magic, sizeof(kV2Magic));
+    w.u64(schemaVersion);
+    w.u32(static_cast<uint32_t>(nSeries));
+    for (const auto* g : view)
+        for (const auto& s : g->second.series)
+            encodeSeries(w, s, v);
     w.u64(fnv1a(w.out.data(), w.out.size()));
     return std::move(w.out);
 }

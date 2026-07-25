@@ -132,6 +132,60 @@ seastar::future<bool> ReplicatedVShardHost::proposeVShardBatches(data::VShardBat
     co_return allOk;
 }
 
+seastar::future<data::ProposeOutcome> ReplicatedVShardHost::proposeVShardBatchesHinted(data::VShardBatchView view) {
+    data::ProposeOutcome out;
+    // Membership check for the WHOLE view BEFORE any replication (same contract as the
+    // bool overload): a routing error rejects atomically rather than after some groups
+    // committed. Reported as rejects rather than thrown so the coordinator can re-resolve
+    // and retry -- a group that is briefly not hosted here IS a routing miss, not a bug.
+    for (const auto* g : view) {
+        if (!registry_.group(g->first))
+            out.rejects.push_back(data::SliceReject{g->first, raft::kNoNode, data::WriteFailure::NotLeader});
+    }
+    if (!out.rejects.empty())
+        co_return out;
+
+    // Replicate every group CONCURRENTLY (see proposeVShardBatches for why serialising
+    // them cost a full quorum round trip per VShard).
+    std::vector<seastar::future<bool>> pending;
+    pending.reserve(view.size());
+    for (const auto* g : view) {
+        raft::RaftGroup* grp = registry_.group(g->first);
+        // encodeWriteCommand rather than propose(vshard, ReplicatedCommand{...}): filling
+        // the variant would COPY the slice, which the pre-3b path avoided only by moving
+        // it (and so losing it). The retry needs the groups kept, so the copy is removed
+        // instead of paid.
+        pending.push_back(grp->proposeAndAwaitApplied(data::encodeWriteCommand(g->second)));
+    }
+
+    // Await EVERY proposal even after one fails -- abandoning an in-flight future would
+    // let its group's commit land on a destroyed continuation.
+    std::exception_ptr fatalErr;
+    for (size_t i = 0; i < pending.size(); ++i) {
+        const uint16_t vs = view[i]->first;
+        try {
+            if (!co_await std::move(pending[i])) {
+                raft::RaftGroup* g = registry_.group(vs);
+                out.rejects.push_back(
+                    data::SliceReject{vs, g ? g->leader() : raft::kNoNode, data::WriteFailure::NotLeader});
+            }
+        } catch (...) {
+            const auto kind = data::classifyLocalWriteFailure(std::current_exception());
+            if (!data::isRetryableWriteFailure(kind)) {
+                if (!fatalErr)
+                    fatalErr = std::current_exception();
+                continue;
+            }
+            raft::RaftGroup* g = registry_.group(vs);
+            out.rejects.push_back(data::SliceReject{vs, g ? g->leader() : raft::kNoNode, kind});
+        }
+    }
+    if (fatalErr)
+        std::rethrow_exception(fatalErr);
+    out.committed = out.rejects.empty();
+    co_return out;
+}
+
 raft::RaftGroup* ReplicatedVShardHost::group(uint16_t vshard) {
     return registry_.group(vshard);
 }

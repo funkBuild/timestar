@@ -147,7 +147,7 @@ void RaftGroup::releaseApplyWaiters() {
         // new leader -- an un-acknowledged write is never lost, and LWW makes a
         // re-applied batch harmless. Never hang.
         for (auto& [idx, p] : applyWaiters_)
-            p.set_exception(std::make_exception_ptr(std::runtime_error("propose: leadership lost before commit")));
+            p.set_exception(std::make_exception_ptr(LeadershipLostError("propose: leadership lost before commit")));
         applyWaiters_.clear();
         return;
     }

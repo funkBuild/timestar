@@ -2,10 +2,24 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace timestar::raft {
+
+// Thrown at a proposal waiter when this node stops leading before the entry it
+// appended was observed to commit (write-scaleout 3b). It is the ONE Raft failure a
+// write coordinator must treat as AMBIGUOUS: the entry is already in this node's log
+// and may well be committed by the successor, so the outcome is unknown -- but it is
+// also the routine outcome of a leadership TRANSFER, so it has to be retryable rather
+// than a client 5xx. A distinct type exists so the classifier never has to match on a
+// message string; see classifyWriteFailure in cluster/data/write_errors.hpp for why
+// re-proposing an ambiguous slice is safe (LWW re-apply, ADR 0003).
+class LeadershipLostError : public std::runtime_error {
+public:
+    explicit LeadershipLostError(const std::string& what) : std::runtime_error(what) {}
+};
 
 // Core Raft scalar types (Phase 2 / Stage 3). A group is one VShard's replicated
 // log; these are shared by the log, the node state machine, and the RPCs.

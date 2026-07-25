@@ -19,6 +19,7 @@
 #include <memory>
 #include <optional>
 #include <seastar/core/coroutine.hh>
+#include <seastar/core/do_with.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/core/smp.hh>
@@ -123,6 +124,11 @@ public:
     // connection landed on whichever shard the kernel gave it, which is unrelated to
     // which shards own the VShards -- so split and replicate each slice on its owner.
     seastar::future<bool> proposeBatch(data::WriteBatch batch) override;
+
+    // The hinted twin (write-scaleout 3a): same fan-out, but each owning shard reports
+    // per-VShard rejects with ITS group's current leader, so the forwarding coordinator
+    // learns where the leadership actually went instead of only that it guessed wrong.
+    seastar::future<data::ProposeOutcome> proposeBatchHinted(data::WriteBatch batch) override;
 
     // ReadIndexSink: a replica is confirming freshness at the leader (M4 replica reads).
     // Same story as proposeBatch -- the connection landed on an arbitrary shard, so hop
@@ -420,9 +426,75 @@ inline seastar::future<bool> proposeSlicesToOwningShards(seastar::sharded<ShardR
     co_return all;
 }
 
+// The hinted twin of proposeSlicesToOwningShards (write-scaleout 3a): each owning shard
+// answers with per-VShard rejects, and the rejects are UNIONED rather than collapsed to a
+// bool, so a batch that lost only one VShard's leadership costs the caller one slice's
+// retry instead of the whole batch's.
+//
+// A shard that fails for a RETRYABLE reason (its plane is stopping) contributes rejects
+// rather than an exception, because from the forwarding node's side that is a redirect,
+// not a fault. Anything else still propagates -- a bug must not be laundered into a retry.
+inline seastar::future<data::ProposeOutcome> proposeSlicesToOwningShardsHinted(
+    seastar::sharded<ShardRaftPlane>& shards, data::WriteBatch batch) {
+    std::map<unsigned, data::VShardBatches> byShard;
+    for (auto& g : data::splitByVShard(std::move(batch)))
+        byShard[shardForVShard(g.first)].push_back(std::move(g));
+
+    std::vector<seastar::future<data::ProposeOutcome>> pending;
+    std::vector<std::vector<uint16_t>> pendingVShards;  // parallel to `pending`
+    pending.reserve(byShard.size());
+    pendingVShards.reserve(byShard.size());
+    for (auto& [shard, slice] : byShard) {
+        std::vector<uint16_t> vs;
+        vs.reserve(slice.size());
+        for (const auto& g : slice)
+            vs.push_back(g.first);
+        pendingVShards.push_back(std::move(vs));
+        pending.push_back(shards.invoke_on(shard, [b = std::move(slice)](ShardRaftPlane& p) mutable {
+            if (!p.ready())  // see the note in writeSlicesToOwningShards
+                return seastar::make_exception_future<data::ProposeOutcome>(
+                    std::runtime_error(kShardStoppingError));
+            // The groups are owned by do_with (moved across the shard boundary) and the
+            // returned future is awaited before they are freed, so the view is safe.
+            // `pp` is captured BY VALUE: `p` is a reference parameter living in this
+            // lambda's frame, and a `&p` capture would dangle the moment it returns.
+            return seastar::do_with(std::move(b), [pp = &p](data::VShardBatches& groups) {
+                return pp->plane().host().proposeVShardBatchesHinted(data::viewOf(groups));
+            });
+        }));
+    }
+
+    data::ProposeOutcome out;
+    std::exception_ptr fatalErr;
+    for (size_t i = 0; i < pending.size(); ++i) {
+        try {
+            data::ProposeOutcome r = co_await std::move(pending[i]);
+            out.rejects.insert(out.rejects.end(), r.rejects.begin(), r.rejects.end());
+        } catch (...) {
+            const auto kind = data::classifyLocalWriteFailure(std::current_exception());
+            if (!data::isRetryableWriteFailure(kind)) {
+                if (!fatalErr)
+                    fatalErr = std::current_exception();
+                continue;
+            }
+            for (uint16_t vs : pendingVShards[i])
+                out.rejects.push_back(data::SliceReject{vs, timestar::raft::kNoNode, kind});
+        }
+    }
+    if (fatalErr)
+        std::rethrow_exception(fatalErr);
+    out.committed = out.rejects.empty();
+    co_return out;
+}
+
 inline seastar::future<bool> ShardRaftPlane::proposeBatch(data::WriteBatch batch) {
     ++inboundProposals_;  // served on THIS shard, whichever shards end up owning the slices
     return proposeSlicesToOwningShards(*peers_, std::move(batch));
+}
+
+inline seastar::future<data::ProposeOutcome> ShardRaftPlane::proposeBatchHinted(data::WriteBatch batch) {
+    ++inboundProposals_;
+    return proposeSlicesToOwningShardsHinted(*peers_, std::move(batch));
 }
 
 inline seastar::future<raft::LogIndex> ShardRaftPlane::leaderReadIndex(uint16_t vshard) {

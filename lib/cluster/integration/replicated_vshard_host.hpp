@@ -73,6 +73,20 @@ public:
     // including the atomic membership check before any replication.
     seastar::future<bool> proposeVShardBatches(data::VShardBatches groups) override;
 
+    // The production entry (write-scaleout 3a/3b): propose a BORROWED selection of
+    // groups and report per-VShard which did not commit, with THIS node's current view
+    // of who leads them. Two things differ from the bool overloads and both matter:
+    //
+    //  * the groups are not consumed, so the coordinator can re-dispatch exactly the
+    //    slices that failed without having copied the batch on the happy path;
+    //  * a rejection carries `g->leader()`, which is what turns "your guess was wrong"
+    //    into "node N leads it now" -- the alive-but-deposed primary case that had no
+    //    covered failover path in v1.
+    //
+    // A group this node does not HOST is reported as a hintless reject and NOTHING in
+    // the view is proposed, preserving the atomic membership check of the bool overload.
+    seastar::future<data::ProposeOutcome> proposeVShardBatchesHinted(data::VShardBatchView view) override;
+
     // Compact this node's Raft log for `vshard` by snapshotting its FLUSHED data and
     // handing the payload to RaftGroup::compact (the M3 snapshot PRODUCER). Truncates
     // the log only up to the snapshot's covered revision (== the log index, ADR 0003):

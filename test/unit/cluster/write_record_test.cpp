@@ -461,3 +461,32 @@ TEST(WriteRecordCodec, InflatedCountDoesNotAmplifyMemory) {
     EXPECT_LT(after - before, 32u << 10) << "decoding a 16 MiB frame grew peak RSS by " << (after - before)
                                          << " KiB -- the declared count is being trusted for allocation again";
 }
+
+// write-scaleout 3b: encoding a BORROWED view of groups is byte-for-byte what encoding
+// the merged batch produced. The remote propose path stopped merging (it must not
+// consume groups it may need to re-dispatch), so this is the equality that says the
+// wire did not change when the allocation went away.
+TEST(WriteRecordCodec, ViewEncodingEqualsTheMergedEncoding) {
+    for (uint32_t version : {kWriteBatchFormatV1, kWriteBatchFormatV2}) {
+        VShardBatches groups = splitByVShard(kitchenSink());
+        ASSERT_GE(groups.size(), 2u) << "the fixture must span several VShards to be a real test";
+        const std::string viaView = encodeWriteBatch(viewOf(groups), version);
+        const std::string viaMerge = encodeWriteBatch(mergeVShardBatches(std::move(groups)), version);
+        EXPECT_EQ(viaView, viaMerge) << "version " << version;
+        // ... and it still decodes to the same batch.
+        auto a = decodeWriteBatch(viaView);
+        ASSERT_TRUE(a.has_value());
+        EXPECT_EQ(a->series.size(), kitchenSink().series.size());
+    }
+}
+
+// A subset view encodes only that subset -- which is what makes "retry the failed slices
+// only" possible without rebuilding a batch.
+TEST(WriteRecordCodec, ViewEncodingCarriesOnlyTheSelectedGroups) {
+    VShardBatches groups = splitByVShard(kitchenSink());
+    ASSERT_GE(groups.size(), 2u);
+    VShardBatchView one{&groups[0]};
+    auto decoded = decodeWriteBatch(encodeWriteBatch(one, kWriteBatchFormatV2));
+    ASSERT_TRUE(decoded.has_value());
+    EXPECT_EQ(decoded->series.size(), groups[0].second.series.size());
+}

@@ -70,6 +70,14 @@ constexpr uint8_t kRetention = 2;
 
 }  // namespace
 
+std::string encodeWriteCommand(const WriteBatch& batch) {
+    std::string out;
+    out.push_back(static_cast<char>(kWrite));
+    putStr(out, encodeWriteBatch(batch, kWriteBatchFormatV1));  // pinned -- see encodeReplicatedCommand
+    putU64(out, fnv1a(out.data(), out.size()));
+    return out;
+}
+
 std::string encodeReplicatedCommand(const ReplicatedCommand& cmd) {
     std::string out;
     if (const auto* w = std::get_if<WriteBatch>(&cmd)) {

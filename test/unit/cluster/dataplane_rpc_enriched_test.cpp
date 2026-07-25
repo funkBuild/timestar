@@ -686,7 +686,10 @@ TEST_F(DataPlaneRpcEnrichedTest, ForwardedWritesSpeakTheNegotiatedWireVersion) {
             rpc.setProposeSink(propose);
             rpc.start(loopback(port), sink).get();
             rpc.addPeer(self, loopback(port));
-            EXPECT_EQ(rpc.versionFor(self).get(), data::kWriteBatchFormatV2);
+            // v3 is a PROTOCOL step (the hinted propose verb), not a payload format:
+            // the negotiated version is 3 while the BYTES are still v2 (asserted by the
+            // wire-tap legs below).
+            EXPECT_EQ(rpc.versionFor(self).get(), data::kWriteBatchFormatV3);
             EXPECT_TRUE(rpc.proposeWrite(self, oneFloatBatch()).get());
             EXPECT_EQ(propose.lastSeriesCount, 1u);
             rpc.stop().get();
@@ -817,5 +820,149 @@ TEST_F(DataPlaneRpcEnrichedTest, OversizedInboundFrameIsRefusedWithoutAmplifying
 
         cli.stop();
         srv.stop().get();
+    }).get();
+}
+
+// ---------------------------------------------------------------------------
+// write-scaleout 3a: the hinted propose verb over a real socket.
+
+namespace {
+// A ProposeSink that answers the HINTED entry point: rejects a configured VShard and
+// names the node that really leads it, commits everything else.
+class HintingProposeSink : public data::ProposeSink {
+public:
+    uint16_t rejectVShard = 0xffff;
+    data::NodeId hint = 0;
+    int hintedCalls = 0;
+    int plainCalls = 0;
+    std::vector<uint16_t> lastVShards;
+
+    seastar::future<bool> proposeBatch(data::WriteBatch batch) override {
+        ++plainCalls;
+        for (auto& g : data::splitByVShard(std::move(batch)))
+            if (g.first == rejectVShard)
+                return seastar::make_ready_future<bool>(false);
+        return seastar::make_ready_future<bool>(true);
+    }
+    seastar::future<data::ProposeOutcome> proposeBatchHinted(data::WriteBatch batch) override {
+        ++hintedCalls;
+        data::ProposeOutcome out;
+        lastVShards.clear();
+        for (auto& g : data::splitByVShard(std::move(batch))) {
+            lastVShards.push_back(g.first);
+            if (g.first == rejectVShard)
+                out.rejects.push_back(data::SliceReject{g.first, hint, data::WriteFailure::NotLeader});
+        }
+        out.committed = out.rejects.empty();
+        return seastar::make_ready_future<data::ProposeOutcome>(std::move(out));
+    }
+};
+
+uint16_t vshardOfBatch(const data::WriteBatch& b) {
+    data::WriteSeries copy = b.series.front();
+    return data::vshardOf(copy);
+}
+}  // namespace
+
+// A not-leader rejection now names the ACTUAL leader, end to end over the socket. This
+// is the v1 gap: a bare "0" left the coordinator re-routing to the same stale primary.
+TEST_F(DataPlaneRpcEnrichedTest, HintedProposeCarriesTheRealLeaderBack) {
+    seastar::async([] {
+        const uint16_t port = 39360;
+        const data::NodeId self = 1;
+        HintingProposeSink sink;
+        ThrowingNodeStore store;
+        data::DataPlaneRpc rpc;
+        auto batch = oneFloatBatch();
+        const uint16_t vs = vshardOfBatch(batch);
+        sink.rejectVShard = vs;
+        sink.hint = 7;  // "node 7 leads it now"
+        rpc.setProposeSink(sink);
+        rpc.start(loopback(port), store).get();
+        rpc.addPeer(self, loopback(port));
+
+        data::VShardBatches groups = data::splitByVShard(std::move(batch));
+        data::ProposeOutcome out = rpc.proposeWriteHinted(self, data::viewOf(groups)).get();
+        EXPECT_FALSE(out.committed);
+        ASSERT_EQ(out.rejects.size(), 1u);
+        EXPECT_EQ(out.rejects[0].vshard, vs);
+        EXPECT_EQ(out.rejects[0].leaderHint, 7u) << "a not-leader reply must carry the real leader";
+        EXPECT_EQ(sink.hintedCalls, 1);
+        EXPECT_EQ(sink.plainCalls, 0) << "a v3 peer must be served by the hinted verb";
+
+        // The same call once the sink leads it: a full commit, and the reply is the
+        // byte-identical "1" the old verb used.
+        sink.rejectVShard = 0xffff;
+        data::ProposeOutcome ok = rpc.proposeWriteHinted(self, data::viewOf(groups)).get();
+        EXPECT_TRUE(ok.committed);
+        EXPECT_TRUE(ok.rejects.empty());
+        rpc.stop().get();
+    }).get();
+}
+
+// A peer that predates v3 keeps getting the v1-shaped verb, with hintless rejects --
+// a rolling upgrade must not turn a clean not-leader into a malformed-reply 5xx.
+TEST_F(DataPlaneRpcEnrichedTest, HintedProposeFallsBackForAPeerBelowV3) {
+    seastar::async([] {
+        const uint16_t serverPort = 39362, clientPort = 39363;
+        const data::NodeId server = 2;
+        WireTapPeer tap(loopback(serverPort), /*agreedVersion=*/2);  // knows verb 6 only
+        ThrowingNodeStore s2;
+        data::DataPlaneRpc cli;
+        cli.start(loopback(clientPort), s2).get();
+        cli.addPeer(server, loopback(serverPort));
+
+        EXPECT_EQ(cli.versionFor(server).get(), data::kWriteBatchFormatV2);
+        data::VShardBatches groups = data::splitByVShard(oneFloatBatch());
+        data::ProposeOutcome out = cli.proposeWriteHinted(server, data::viewOf(groups)).get();
+        EXPECT_TRUE(out.committed) << "the tap answers verb 6 with a commit";
+        ASSERT_EQ(tap.captured.size(), 1u) << "the pre-v3 peer must be reached on verb 6";
+        EXPECT_EQ(tap.captured[0].compare(0, 4, "TSW2"), 0) << "the PAYLOAD version is unaffected by v3";
+        cli.stop().get();
+        tap.stop();
+    }).get();
+}
+
+// An encoded slice larger than any peer's inbound admission fails LOCALLY and
+// terminally (413-shaped), instead of being sent, refused opaquely, and retried.
+TEST_F(DataPlaneRpcEnrichedTest, OversizedSliceIsRefusedLocallyAsTooLarge) {
+    seastar::async([] {
+        const uint16_t port = 39364;
+        const data::NodeId self = 1;
+        HintingProposeSink sink;
+        ThrowingNodeStore store;
+        data::DataPlaneRpc rpc;
+        rpc.setProposeSink(sink);
+        rpc.start(loopback(port), store).get();
+        rpc.addPeer(self, loopback(port));
+
+        // ~12 MiB of float points in one series: over the ~10.67 MiB ceiling.
+        data::WriteBatch big;
+        data::WriteSeries s;
+        s.seriesKey = buildSeriesKey("m", {{"host", "h1"}}, "v");
+        s.type = TSMValueType::Float;
+        const size_t n = 1'400'000;  // 8B ts (v2 delta ~2B) + 8B value
+        s.timestamps.reserve(n);
+        std::vector<double> vals;
+        vals.reserve(n);
+        for (size_t i = 0; i < n; ++i) {
+            s.timestamps.push_back(BASE + i * 1'000'000'000ULL);
+            vals.push_back(static_cast<double>(i));
+        }
+        s.values = std::move(vals);
+        big.series.push_back(std::move(s));
+        data::VShardBatches groups = data::splitByVShard(std::move(big));
+
+        bool tooLarge = false;
+        try {
+            rpc.proposeWriteHinted(self, data::viewOf(groups)).get();
+        } catch (const data::WriteFrameTooLargeError&) {
+            tooLarge = true;
+        } catch (const std::exception& e) {
+            ADD_FAILURE() << "expected WriteFrameTooLargeError, got: " << e.what();
+        }
+        EXPECT_TRUE(tooLarge);
+        EXPECT_EQ(sink.hintedCalls, 0) << "the frame must never have been sent";
+        rpc.stop().get();
     }).get();
 }

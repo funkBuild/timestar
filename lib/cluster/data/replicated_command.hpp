@@ -45,6 +45,12 @@ using ReplicatedCommand = std::variant<WriteBatch, DeleteRangeKey, RetentionCuto
 // ANY malformed/truncated/checksum-mismatched input so a corrupt frame can never
 // fabricate a command.
 std::string encodeReplicatedCommand(const ReplicatedCommand& cmd);
+// The WriteBatch arm WITHOUT materialising a ReplicatedCommand (write-scaleout 3b).
+// Byte-identical to encodeReplicatedCommand(ReplicatedCommand{batch}); it exists so the
+// replicated write path can propose a slice it does not own -- the retry loop keeps the
+// groups so it can re-dispatch the failed ones -- without paying a WriteBatch copy per
+// proposal just to fill the variant.
+std::string encodeWriteCommand(const WriteBatch& batch);
 std::optional<ReplicatedCommand> decodeReplicatedCommand(const std::string& bytes);
 
 }  // namespace timestar::data
