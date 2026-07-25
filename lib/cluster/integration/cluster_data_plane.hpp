@@ -15,7 +15,9 @@
 #include <memory>
 #include <optional>
 #include <seastar/core/future.hh>
+#include <seastar/core/gate.hh>
 #include <seastar/core/sharded.hh>
+#include <seastar/core/timer.hh>
 
 namespace timestar::cluster {
 
@@ -110,6 +112,15 @@ private:
     std::unique_ptr<ReplicatedDataPlane> rdp_;
     bool replicated_ = false;
     uint16_t rf_ = 1;  // configured replication factor (reported by status())
+
+    // Standing leadership-balancing loop (M5). Without it a fresh cluster leaves ALL
+    // leadership on the first node to start, since it wins every election. Runs a
+    // bounded pass periodically so the cluster self-levels; each pass is small enough
+    // that it never monopolises the reactor, and passes never overlap.
+    seastar::timer<> balanceTimer_;
+    seastar::gate balanceGate_;
+    bool balanceRunning_ = false;
+    void startLeadershipBalancer();
 };
 
 }  // namespace timestar::cluster

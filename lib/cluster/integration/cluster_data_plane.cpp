@@ -136,11 +136,17 @@ seastar::future<> ClusterDataPlane::start(const ClusterConfig& cfg, seastar::sha
             co_await rdp_->addVShard(vshard, voters, ropts);
         rdp_->startTicking();
         replicated_ = true;
+        startLeadershipBalancer();
     }
     co_return;
 }
 
 seastar::future<> ClusterDataPlane::stop() {
+    // Stop the balancing loop FIRST and drain any in-flight pass: it touches the Raft
+    // groups, so it must be quiescent before rdp_ tears them down.
+    balanceTimer_.cancel();
+    if (!balanceGate_.is_closed())
+        co_await balanceGate_.close();
     // rdp_ (Raft groups + tick timer) BEFORE the transports it uses.
     if (rdp_)
         co_await rdp_->stop();
@@ -277,6 +283,34 @@ ClusterDataPlane::Status ClusterDataPlane::status() const {
         }
     }
     return s;
+}
+
+void ClusterDataPlane::startLeadershipBalancer() {
+    // A bounded pass every few seconds. Sized so a worst-case cluster (one node
+    // holding all 4096 leaderships after a cold start) levels out in ~a minute
+    // without ever running a long pass: 256 transfers take a few ms of local work,
+    // and the actual elections happen asynchronously in Raft.
+    static constexpr auto kInterval = std::chrono::seconds(5);
+    static constexpr size_t kBudget = 256;
+    balanceTimer_.set_callback([this] {
+        if (balanceRunning_ || balanceGate_.is_closed())
+            return;  // never overlap passes
+        balanceRunning_ = true;
+        // NOT a coroutine lambda: with_gate invokes a TEMPORARY closure, and a
+        // coroutine lambda's frame keeps referencing that closure after it dies (so
+        // `this` reads freed memory). That bug left balanceRunning_ stuck true after a
+        // couple of passes and the loop silently stopped. A plain continuation chain
+        // owns everything it needs.
+        (void)seastar::with_gate(balanceGate_, [this] {
+            return rebalanceLeadership(kBudget).then_wrapped([this](seastar::future<size_t> f) {
+                // Best-effort background work: a failed pass must never take the node
+                // down, and must still clear the flag or the loop stops forever.
+                f.ignore_ready_future();
+                balanceRunning_ = false;
+            });
+        });
+    });
+    balanceTimer_.arm_periodic(kInterval);
 }
 
 seastar::future<size_t> ClusterDataPlane::rebalanceLeadership(size_t maxTransfers) {
