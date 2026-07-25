@@ -3,11 +3,86 @@
 // truncated / checksum-broken / type-inconsistent frame.
 #include "../../../lib/cluster/data/write_record.hpp"
 
+#include <cmath>
+#include <cstring>
 #include <gtest/gtest.h>
+#include <limits>
 
 using namespace timestar::data;  // brings in TSMValueType (re-exported here)
 
 namespace {
+// The ORIGINAL (pre-write-scaleout-2c) v1 writer, preserved verbatim as the
+// backward-compatibility oracle: the Raft journal stores encoded commands, so a
+// cluster restarting on a new binary replays entries these exact bytes produced.
+// Every byte is a separate push_back, exactly as it was.
+struct LegacyWriter {
+    std::string out;
+    void u8(uint8_t v) { out.push_back(static_cast<char>(v)); }
+    void u32(uint32_t v) {
+        for (int i = 0; i < 4; ++i)
+            u8((v >> (8 * i)) & 0xff);
+    }
+    void u64(uint64_t v) {
+        for (int i = 0; i < 8; ++i)
+            u8((v >> (8 * i)) & 0xff);
+    }
+    void dbl(double v) {
+        uint64_t b;
+        std::memcpy(&b, &v, 8);
+        u64(b);
+    }
+    void str(const std::string& s) {
+        u32(static_cast<uint32_t>(s.size()));
+        out.append(s);
+    }
+};
+
+uint64_t legacyFnv1a(const char* p, size_t n) {
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < n; ++i) {
+        h ^= static_cast<uint8_t>(p[i]);
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+std::string legacyEncodeWriteBatch(const WriteBatch& batch) {
+    LegacyWriter w;
+    w.u64(batch.schemaVersion);
+    w.u32(static_cast<uint32_t>(batch.series.size()));
+    for (const auto& s : batch.series) {
+        w.u8(static_cast<uint8_t>(s.type));
+        w.str(s.seriesKey);
+        const uint32_t count = static_cast<uint32_t>(s.timestamps.size());
+        w.u32(count);
+        for (uint64_t ts : s.timestamps)
+            w.u64(ts);
+        switch (s.type) {
+            case TSMValueType::Float:
+                for (double v : std::get<0>(s.values))
+                    w.dbl(v);
+                break;
+            case TSMValueType::Integer:
+                for (int64_t v : std::get<1>(s.values))
+                    w.u64(static_cast<uint64_t>(v));
+                break;
+            case TSMValueType::Boolean:
+                for (bool v : std::get<2>(s.values))
+                    w.u8(v ? 1 : 0);
+                break;
+            case TSMValueType::String:
+                for (const std::string& v : std::get<3>(s.values))
+                    w.str(v);
+                break;
+        }
+        w.u32(static_cast<uint32_t>(s.revisions.size()));
+        for (uint64_t r : s.revisions)
+            w.u64(r);
+    }
+    w.u64(legacyFnv1a(w.out.data(), w.out.size()));
+    return std::move(w.out);
+}
+
 WriteSeries floatSeries() {
     WriteSeries s;
     s.seriesKey = "cpu,host=h1 load";
@@ -109,4 +184,212 @@ TEST(WriteRecordCodec, ConsistencyEnforced) {
     EXPECT_FALSE(r.consistent());
     // A well-formed one is consistent.
     EXPECT_TRUE(floatSeries().consistent());
+}
+
+// ---------------------------------------------------------------------------
+// write-scaleout 2c: bulk codec + the v2 (delta-varint timestamp) wire format.
+// ---------------------------------------------------------------------------
+
+namespace {
+// One batch touching every value type, every special float, non-monotone and
+// huge-gap timestamps, empty series, and revisions.
+WriteBatch kitchenSink() {
+    WriteBatch b;
+    b.schemaVersion = 0xDEADBEEFCAFEull;
+
+    WriteSeries f;
+    f.seriesKey = "cpu,host=h1 load";
+    f.type = TSMValueType::Float;
+    // Monotone with a large first value (the varint-delta case), then a BACKWARDS
+    // step (zigzag), then a repeat (delta 0).
+    f.timestamps = {1700000000000000000ull, 1700000000000000001ull, 1700000000000000501ull,
+                    1700000000000000400ull, 1700000000000000400ull};
+    f.values = std::vector<double>{std::numeric_limits<double>::quiet_NaN(),
+                                  std::numeric_limits<double>::infinity(),
+                                  -std::numeric_limits<double>::infinity(),
+                                  -0.0,
+                                  3.141592653589793};
+    f.revisions = {1, 2, 3, 4, 5};
+    b.series.push_back(f);
+
+    WriteSeries i;
+    i.seriesKey = "m,host=h2 bytes";
+    i.type = TSMValueType::Integer;
+    i.timestamps = {0, 1, 2};
+    i.values = std::vector<int64_t>{std::numeric_limits<int64_t>::min(), std::numeric_limits<int64_t>::max(),
+                                   9007199254740993LL};
+    b.series.push_back(i);
+
+    WriteSeries s;
+    s.seriesKey = "log,host=h3 msg";
+    s.type = TSMValueType::String;
+    s.timestamps = {5, 6, 7};
+    s.values = std::vector<std::string>{"", "a UTF-8 \xE2\x9C\x93 string, with commas", std::string(1000, 'x')};
+    b.series.push_back(s);
+
+    WriteSeries bo;
+    bo.seriesKey = "up,host=h4 state";
+    bo.type = TSMValueType::Boolean;
+    bo.timestamps = {1, 2, 3, 4};
+    bo.values = std::vector<bool>{true, false, false, true};
+    b.series.push_back(bo);
+
+    WriteSeries empty;  // a series with no points at all
+    empty.seriesKey = "empty,host=h5 v";
+    empty.type = TSMValueType::Float;
+    empty.values = std::vector<double>{};
+    b.series.push_back(empty);
+    return b;
+}
+
+// Bit-exact comparison: -0.0 == 0.0 and NaN != NaN under ==, so compare the bits.
+void expectSameBits(double a, double d) {
+    uint64_t ba, bd;
+    std::memcpy(&ba, &a, 8);
+    std::memcpy(&bd, &d, 8);
+    EXPECT_EQ(ba, bd);
+}
+
+void expectSameBatch(const WriteBatch& a, const WriteBatch& b) {
+    ASSERT_EQ(a.schemaVersion, b.schemaVersion);
+    ASSERT_EQ(a.series.size(), b.series.size());
+    for (size_t i = 0; i < a.series.size(); ++i) {
+        const auto& x = a.series[i];
+        const auto& y = b.series[i];
+        EXPECT_EQ(x.seriesKey, y.seriesKey);
+        EXPECT_EQ(static_cast<int>(x.type), static_cast<int>(y.type));
+        EXPECT_EQ(x.timestamps, y.timestamps);
+        EXPECT_EQ(x.revisions, y.revisions);
+        ASSERT_EQ(x.values.index(), y.values.index());
+        if (x.type == TSMValueType::Float) {
+            const auto& xv = std::get<0>(x.values);
+            const auto& yv = std::get<0>(y.values);
+            ASSERT_EQ(xv.size(), yv.size());
+            for (size_t k = 0; k < xv.size(); ++k)
+                expectSameBits(xv[k], yv[k]);
+        } else {
+            EXPECT_TRUE(x.values == y.values);
+        }
+    }
+}
+}  // namespace
+
+// Every value type round-trips through BOTH emitted formats, bit-exactly --
+// NaN / +-Inf / -0.0 included, int64 at the extremes, strings with embedded
+// UTF-8, and timestamps that go backwards or repeat.
+TEST(WriteRecordCodec, RoundTripsEveryTypeInBothWireVersions) {
+    const WriteBatch b = kitchenSink();
+    for (uint32_t version : {kWriteBatchFormatV1, kWriteBatchFormatV2}) {
+        auto back = decodeWriteBatch(encodeWriteBatch(b, version));
+        ASSERT_TRUE(back.has_value()) << "version " << version;
+        expectSameBatch(b, *back);
+    }
+}
+
+// The v1 encoder is BYTE-IDENTICAL to the pre-2c per-byte writer. This is the
+// contract that lets the bulk rewrite touch the journal path at all: existing
+// journals hold exactly these bytes.
+TEST(WriteRecordCodec, V1EncodingIsByteIdenticalToTheLegacyWriter) {
+    const WriteBatch b = kitchenSink();
+    EXPECT_EQ(encodeWriteBatch(b), legacyEncodeWriteBatch(b));
+    EXPECT_EQ(encodeWriteBatch(b, kWriteBatchFormatV1), legacyEncodeWriteBatch(b));
+    WriteBatch empty;
+    EXPECT_EQ(encodeWriteBatch(empty), legacyEncodeWriteBatch(empty));
+}
+
+// Bytes written by the OLD writer still decode on the NEW reader (the journal
+// back-compat contract, pinned in-process).
+TEST(WriteRecordCodec, LegacyBytesDecodeOnTheNewReader) {
+    const WriteBatch b = kitchenSink();
+    auto back = decodeWriteBatch(legacyEncodeWriteBatch(b));
+    ASSERT_TRUE(back.has_value());
+    expectSameBatch(b, *back);
+}
+
+// v2 is self-identifying and smaller; v1 has no version field at all, so the
+// decoder must not need to be told which it is holding.
+TEST(WriteRecordCodec, V2IsTaggedSelfDescribingAndSmaller) {
+    WriteBatch b;
+    WriteSeries s;
+    s.seriesKey = "cpu,host=h1 load";
+    s.type = TSMValueType::Float;
+    for (uint64_t i = 0; i < 1000; ++i) {
+        s.timestamps.push_back(1700000000000000000ull + i * 1000000ull);  // 1ms apart
+    }
+    s.values = std::vector<double>(1000, 1.5);
+    b.series.push_back(s);
+
+    const std::string v1 = encodeWriteBatch(b, kWriteBatchFormatV1);
+    const std::string v2 = encodeWriteBatch(b, kWriteBatchFormatV2);
+    EXPECT_EQ(v2.compare(0, 4, "TSW2"), 0);
+    EXPECT_NE(v1.compare(0, 4, "TSW2"), 0);
+    // 8 bytes/timestamp -> a 4-byte varint delta for a 1ms step.
+    EXPECT_LT(v2.size(), v1.size());
+    EXPECT_TRUE(decodeWriteBatch(v1).has_value());
+    EXPECT_TRUE(decodeWriteBatch(v2).has_value());
+    // An unknown FUTURE version degrades to the newest format we can write, never
+    // to an unreadable frame.
+    EXPECT_EQ(encodeWriteBatch(b, 99u), v2);
+}
+
+// Truncation/corruption of a v2 frame is rejected exactly like v1 -- including the
+// case where the magic survives but the body does not.
+TEST(WriteRecordCodec, V2TruncationAndCorruptionRejected) {
+    WriteBatch b;
+    b.series.push_back(floatSeries());
+    const std::string full = encodeWriteBatch(b, kWriteBatchFormatV2);
+    ASSERT_TRUE(decodeWriteBatch(full).has_value());
+    for (size_t n = 0; n < full.size(); ++n)
+        EXPECT_FALSE(decodeWriteBatch(full.substr(0, n)).has_value()) << "prefix " << n;
+    std::string flipped = full;
+    flipped[full.size() - 12] ^= 0xff;  // inside the body, past the magic
+    EXPECT_FALSE(decodeWriteBatch(flipped).has_value());
+    std::string badsum = full;
+    badsum[badsum.size() - 1] ^= 0xff;
+    EXPECT_FALSE(decodeWriteBatch(badsum).has_value());
+}
+
+// splitByVShard / vshardOf (write-scaleout 2a/2b): the routing hint is derived
+// from the series KEY and never carried on the wire, so a decoded series is
+// unrouted and re-derives the same VShard the sender computed.
+TEST(WriteRecordCodec, VShardHintIsDerivedFromTheKeyAndNeverOnTheWire) {
+    WriteBatch b;
+    b.series.push_back(floatSeries());
+    const uint16_t expected = timestar::virtualShard(SeriesId128::fromSeriesKey(b.series[0].seriesKey));
+
+    WriteSeries fresh = floatSeries();
+    EXPECT_EQ(fresh.vshard, WriteSeries::kUnroutedVShard);
+    EXPECT_EQ(vshardOf(fresh), expected);
+
+    // A LIE about the vshard does not survive encoding: the field is not on the
+    // wire, so the receiver re-derives it from the canonical key.
+    b.series[0].vshard = 7;
+    auto back = decodeWriteBatch(encodeWriteBatch(b, kWriteBatchFormatV2));
+    ASSERT_TRUE(back.has_value());
+    EXPECT_EQ(back->series[0].vshard, WriteSeries::kUnroutedVShard);
+    EXPECT_EQ(vshardOf(back->series[0]), expected);
+}
+
+TEST(WriteRecordCodec, SplitByVShardMovesEachSeriesOnce) {
+    WriteBatch b;
+    b.schemaVersion = 42;
+    for (int i = 0; i < 50; ++i) {
+        WriteSeries s = floatSeries();
+        s.seriesKey = "cpu,host=h" + std::to_string(i) + " load";
+        b.series.push_back(std::move(s));
+    }
+    auto groups = splitByVShard(b);
+    size_t total = 0;
+    for (auto& [vs, group] : groups) {
+        EXPECT_EQ(group.schemaVersion, 42u);
+        for (auto& s : group.series) {
+            EXPECT_EQ(vshardOf(s), vs);  // every series is in ITS OWN VShard's group
+            ++total;
+        }
+    }
+    EXPECT_EQ(total, 50u);
+    // Merging back preserves the batch (order within a group preserved).
+    auto merged = mergeVShardBatches(std::move(groups));
+    EXPECT_EQ(merged.series.size(), 50u);
+    EXPECT_EQ(merged.schemaVersion, 42u);
 }

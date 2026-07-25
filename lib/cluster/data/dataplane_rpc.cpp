@@ -109,7 +109,13 @@ struct DataPlaneRpc::Impl {
     NodeStore* nodeSink = nullptr;      // enriched WriteBatch path (F.4)
     ProposeSink* proposeSink = nullptr;      // RF=3 Raft propose target (M3)
     ReadIndexSink* readIndexSink = nullptr;  // replica-read leader-reach target (M4)
-    features::VersionRange localVersion{};   // wire-version range this node supports (M6/X)
+    // Wire-version range this node supports (M6/X). The max is the newest WriteBatch
+    // format this binary can WRITE; peers negotiate down to the highest both know.
+    features::VersionRange localVersion{1, kWriteBatchFormatV2};
+    // Version agreed with each peer (kNegotiateVersion), cached per connection: a
+    // handshake per peer, not per write. Dropped when a connection is retired, because
+    // the peer may come back on a different binary.
+    std::map<NodeId, uint32_t> agreedVersion;
     // Mutual TLS (X1b): null unless setTlsCredentials was called. serverCreds requires a
     // client cert; clientCreds presents ours + trusts the CA; peerName is the SAN we
     // verify the server against.
@@ -170,6 +176,9 @@ struct DataPlaneRpc::Impl {
             nextRetry[to] = now + kReconnectBackoff;
             retire(std::move(it->second));
             clients.erase(it);
+            // A reconnect may reach a RESTARTED peer running a different binary --
+            // re-handshake rather than keep speaking the old connection's version.
+            agreedVersion.erase(to);
         }
         auto pit = peers.find(to);
         if (pit == peers.end())
@@ -495,13 +504,28 @@ seastar::future<QueryPartial> DataPlaneRpc::queryRemote(NodeId to, QuerySpec spe
     co_return std::move(*part);
 }
 
+seastar::future<uint32_t> DataPlaneRpc::versionFor(NodeId to) {
+    // The WriteBatch format to speak with this peer. Handshake once per connection and
+    // cache it; a peer that cannot read anything we can write THROWS out of
+    // negotiateVersion (no overlapping range), which fails the write closed instead of
+    // shipping it a frame it would misparse. Failures are not cached, so the next
+    // attempt re-handshakes.
+    auto it = impl_->agreedVersion.find(to);
+    if (it != impl_->agreedVersion.end())
+        co_return it->second;
+    const uint32_t agreed = co_await negotiateVersion(to);
+    impl_->agreedVersion[to] = agreed;
+    co_return agreed;
+}
+
 seastar::future<> DataPlaneRpc::forwardWriteBatch(NodeId to, WriteBatch batch) {
     if (impl_->stopping)
         throw std::runtime_error("dataplane: shutting down");
+    const uint32_t version = co_await versionFor(to);
     auto* conn = impl_->clientFor(to);
     if (!conn)
         throw std::runtime_error("dataplane: unknown peer");
-    std::string bytes = encodeWriteBatch(batch);
+    std::string bytes = encodeWriteBatch(batch, version);
     co_await impl_->forwardBatchStub(*conn, seastar::sstring(bytes.data(), bytes.size()));  // waited
 }
 
@@ -553,10 +577,11 @@ seastar::future<MetadataResult> DataPlaneRpc::queryMetadata(NodeId to, MetadataR
 seastar::future<bool> DataPlaneRpc::proposeWrite(NodeId to, WriteBatch batch) {
     if (impl_->stopping)
         throw std::runtime_error("dataplane: shutting down");
+    const uint32_t version = co_await versionFor(to);
     auto* conn = impl_->clientFor(to);
     if (!conn)
         throw std::runtime_error("dataplane: unknown peer");
-    std::string bytes = encodeWriteBatch(batch);
+    std::string bytes = encodeWriteBatch(batch, version);
     seastar::sstring reply = co_await impl_->proposeWriteStub(*conn, seastar::sstring(bytes.data(), bytes.size()));
     // "1" = committed on the leader, "0" = not-leader (caller redirects). Anything
     // else is a framing/corruption fault -- THROW (like the other verbs) rather than

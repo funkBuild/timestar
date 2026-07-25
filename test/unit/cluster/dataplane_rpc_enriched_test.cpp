@@ -540,3 +540,73 @@ TEST_F(DataPlaneRpcEnrichedTest, StartTwiceThrows) {
         rpc.stop().get();
     }).get();
 }
+
+// write-scaleout 2c: a forwarded write is encoded at the version negotiated with
+// THAT peer, so a mixed-version cluster degrades to v1 and an incompatible peer
+// fails closed -- it must never receive a frame it cannot parse.
+TEST_F(DataPlaneRpcEnrichedTest, ForwardedWritesSpeakTheNegotiatedWireVersion) {
+    seastar::async([] {
+        // Both nodes on this binary: negotiate the newest format, and the batch
+        // survives the round trip through it.
+        {
+            const uint16_t port = 39325;
+            const data::NodeId self = 1;
+            RecordingProposeSink propose;
+            ThrowingNodeStore sink;
+            data::DataPlaneRpc rpc;
+            rpc.setProposeSink(propose);
+            rpc.start(loopback(port), sink).get();
+            rpc.addPeer(self, loopback(port));
+            EXPECT_EQ(rpc.versionFor(self).get(), data::kWriteBatchFormatV2);
+            EXPECT_TRUE(rpc.proposeWrite(self, oneFloatBatch()).get());
+            EXPECT_EQ(propose.lastSeriesCount, 1u);
+            rpc.stop().get();
+        }
+        // A peer that only speaks v1 (an un-upgraded node): we negotiate DOWN to 1
+        // and the write still lands. Nothing about the payload changes.
+        {
+            const uint16_t serverPort = 39326, clientPort = 39327;
+            const data::NodeId server = 2;
+            RecordingProposeSink propose;
+            ThrowingNodeStore s1, s2;
+            data::DataPlaneRpc srv, cli;
+            srv.setLocalVersion(features::VersionRange{1, 1});  // old binary
+            srv.setProposeSink(propose);
+            srv.start(loopback(serverPort), s1).get();
+            cli.start(loopback(clientPort), s2).get();
+            cli.addPeer(server, loopback(serverPort));
+
+            EXPECT_EQ(cli.versionFor(server).get(), data::kWriteBatchFormatV1);
+            EXPECT_TRUE(cli.proposeWrite(server, oneFloatBatch()).get());
+            EXPECT_EQ(propose.calls, 1);
+            EXPECT_EQ(propose.lastSeriesCount, 1u);
+            cli.stop().get();
+            srv.stop().get();
+        }
+        // No overlapping version: the write FAILS rather than being mis-framed, and
+        // the peer's sink never sees it.
+        {
+            const uint16_t serverPort = 39328, clientPort = 39329;
+            const data::NodeId server = 2;
+            RecordingProposeSink propose;
+            ThrowingNodeStore s1, s2;
+            data::DataPlaneRpc srv, cli;
+            srv.setLocalVersion(features::VersionRange{7, 8});  // nothing in common
+            srv.setProposeSink(propose);
+            srv.start(loopback(serverPort), s1).get();
+            cli.start(loopback(clientPort), s2).get();
+            cli.addPeer(server, loopback(serverPort));
+
+            bool threw = false;
+            try {
+                cli.proposeWrite(server, oneFloatBatch()).get();
+            } catch (const std::exception&) {
+                threw = true;
+            }
+            EXPECT_TRUE(threw) << "an incompatible peer must fail the write closed";
+            EXPECT_EQ(propose.calls, 0) << "nothing may be applied on an incompatible peer";
+            cli.stop().get();
+            srv.stop().get();
+        }
+    }).get();
+}

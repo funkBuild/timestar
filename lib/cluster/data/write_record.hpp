@@ -88,10 +88,36 @@ VShardBatches splitByVShard(WriteBatch batch);
 // forwarded propose, and the fallback for ProposeSinks that do their own splitting).
 WriteBatch mergeVShardBatches(VShardBatches groups);
 
+// Wire/journal format versions this codec can EMIT (write-scaleout 2c).
+//
+// v1 is the original fixed-width layout. v2 keeps it but delta-varints a series'
+// timestamps, which are monotone per series on the canonical path -- ~6 bytes off
+// every point.
+//
+// FORMAT SAFETY: decodeWriteBatch reads BOTH, always, and that is not optional.
+// The Raft journal stores encoded commands, so a cluster restarting on a newer
+// binary replays entries an older one wrote; and a Raft entry is replicated to
+// replicas that never take part in the pairwise data-plane handshake. Emission is
+// therefore version-GATED per destination:
+//   - the data-plane wire (forwardWriteBatch / proposeWrite) emits the version
+//     negotiated with that specific peer via kNegotiateVersion, so a mixed-version
+//     cluster degrades to v1 and an INCOMPATIBLE peer fails closed rather than
+//     misparsing;
+//   - the Raft command path (and hence the journal) still emits v1
+//     unconditionally. Raising it needs a CLUSTER-wide gate -- every voter able to
+//     read v2 -- which is what group-0's committed format activation
+//     (activeFormatVersion / features::FeatureGate) exists for; wiring that to this
+//     codec is the remaining step, and until then no v2 byte can reach a journal.
+constexpr uint32_t kWriteBatchFormatV1 = 1;
+constexpr uint32_t kWriteBatchFormatV2 = 2;
+
 // Wire codec (bounds-checked; decode returns nullopt on ANY malformed/truncated/
 // inconsistent input so a hostile frame can never fabricate a batch). FNV-checksum
-// trailer, same discipline as data_command.
+// trailer, same discipline as data_command. The no-version overload emits v1; the
+// versioned one emits the highest format it knows that is <= `version` (so a caller
+// can pass a negotiated version straight through).
 std::string encodeWriteBatch(const WriteBatch& batch);
+std::string encodeWriteBatch(const WriteBatch& batch, uint32_t version);
 std::optional<WriteBatch> decodeWriteBatch(const std::string& bytes);
 
 }  // namespace timestar::data

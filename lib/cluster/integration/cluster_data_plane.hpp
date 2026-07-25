@@ -137,7 +137,11 @@ private:
     seastar::sharded<Engine>* enginesPtr_ = nullptr;
     // Applied to this object's transport AND to every per-shard transport in start().
     std::optional<DataPlaneTls> tls_;
-    features::VersionRange localVersion_{};
+    // Everything this binary can read and write. Pushed to every per-shard transport
+    // in start(), so peers negotiate against the node's REAL capability; leaving it at
+    // the VersionRange default {1,1} would pin the whole cluster to the v1 wire format
+    // no matter what the binaries support.
+    features::VersionRange localVersion_{1, data::kWriteBatchFormatV2};
     // Declared in dependency order: deps before the router/coordinator that reference
     // them, so destruction (reverse order) tears the referrers down first.
     std::unique_ptr<data::VShardDirectory> dir_;

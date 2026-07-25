@@ -96,8 +96,15 @@ public:
                            std::string expectedPeerName);
 
     // This node's supported wire-version range (rolling-upgrade / compatibility, M6/X).
-    // Default {1,1}. Set before serving so peers negotiate against the real range.
+    // Defaults to {1, kWriteBatchFormatV2} -- everything this binary can read and
+    // write. Set before serving to narrow it (a test pinning an old peer's range).
     void setLocalVersion(features::VersionRange range);
+
+    // The WriteBatch format agreed with peer `to`, handshaked once per connection and
+    // cached. Forwarded writes and proposes encode at this version, so a mixed-version
+    // cluster silently speaks v1 while an INCOMPATIBLE peer (no overlapping range)
+    // throws -- fail closed, never a mis-framed batch.
+    seastar::future<uint32_t> versionFor(NodeId to);
 
     // Negotiate the wire version to speak with peer `to`: the highest version BOTH
     // support (features::negotiate over the exchanged ranges). THROWS if the ranges do
