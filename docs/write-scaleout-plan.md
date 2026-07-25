@@ -291,12 +291,24 @@ Gate outcomes (2026-07-25):
   this gate storming an ALREADY-balanced cluster was vacuous — the endpoint
   only hands away leadership held above fair share, so it initiated zero
   transfers. The script now records `transfers_initiated` and says so.)
-- **Backpressure:** at a deliberately small 2 MiB/shard budget, 24 connections
-  → 196/200 rejected with `503` + `Retry-After: 1` naming the budget
-  ("shard write buffer full (2080675 of 2097152 bytes in flight)"), **0 500s,
-  0 timeouts**; the same cluster at 4 connections → **200/200 OK at
-  4.26 M pts/s**, i.e. throughput recovers. At the 32 MiB default the canonical
-  bench never approaches the bound.
+- **Backpressure** (`test/cluster_gates/backpressure_gate.sh`): at a deliberately
+  small 1 MB/shard budget, 16 concurrent batches → **7 x 503, every one carrying
+  `Retry-After`, 0 x 500**; a 12-connection bench → 200/200 rejected with the
+  budget named in the message ("shard write buffer full (… of 1000000 bytes in
+  flight)"), **0 server-side 500s, 0 timeouts, 0 crashes**, and a single small
+  write still succeeds throughout. Restarted at the **default** 32 MiB budget the
+  same cluster runs the canonical bench clean: **200/200 OK, 5.12 M pts/s, zero
+  admission rejections**.
+
+  Sizing this gate is not arbitrary and the script says so: the budget is charged
+  on the REQUEST shard (whichever the HTTP connection landed on), so four
+  concurrent probes across four shards never collide — sixteen do, by pigeonhole.
+  A probe must also be one SERIES (a multi-series batch splits its charge across
+  shards) and under the handler's own batch-entry cap (a 160k-entry request is a
+  400, not a 503). And recovery cannot be shown by lowering the load on the
+  artificial budget, because the bench pipelines several batches even at
+  `--connections 1`; it is shown at the default budget instead, which is the
+  number an operator actually needs.
 - **Node kill mid-bench:** 277 OK / 23 bounded 503s (`last: transport`, after
   the retry budget against a genuinely dead node), restart → full catch-up
   (`peer_caught_up` == `vshards_led` on all three). **kill -9 of the whole
