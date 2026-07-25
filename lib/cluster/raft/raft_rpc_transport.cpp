@@ -64,6 +64,7 @@ struct RaftRpcTransport::Impl {
     // The deliver stub is created ONCE. Allocating one per send (as this used to)
     // burns an allocation on every Raft message -- and a node ticking thousands of
     // groups sends a great many of them.
+    RaftRpcTransport::DeliverRawFn onDeliverRaw;
     std::function<seastar::future<>(Client&, seastar::sstring)> deliverStub =
         proto.make_client<seastar::rpc::no_wait_type(seastar::sstring)>(kDeliverVerb);
 
@@ -126,6 +127,19 @@ seastar::future<> RaftRpcTransport::start(seastar::socket_address local, Deliver
     // the Ready loop or shutdown. The handler body still runs to completion.
     impl_->proto.register_handler(
         kDeliverVerb, [this](seastar::sstring data) -> seastar::future<seastar::rpc::no_wait_type> {
+            // Fast path: route by group id without decoding, so the (potentially
+            // 100s of KB) AppendEntries payload is decoded on the shard that owns
+            // the group rather than on this single listening shard. groupId is the
+            // first field encodeEnvelope writes: u16, little-endian, at offset 0.
+            if (impl_->onDeliverRaw) {
+                if (data.size() < 2)
+                    co_return seastar::rpc::no_wait;
+                const uint16_t gid = static_cast<uint16_t>(static_cast<unsigned char>(data[0])) |
+                                     static_cast<uint16_t>(static_cast<unsigned char>(data[1]) << 8);
+                // `data` outlives the call: we await before it is destroyed.
+                co_await impl_->onDeliverRaw(gid, data.data(), data.size());
+                co_return seastar::rpc::no_wait;
+            }
             auto env = decodeEnvelope(std::string(data.data(), data.size()));
             if (env && impl_->onDeliver)
                 co_await impl_->onDeliver(std::move(*env));
@@ -169,6 +183,10 @@ seastar::future<> RaftRpcTransport::send(Envelope env) {
         return impl_->deliverStub(*conn, std::move(data)).handle_exception([](std::exception_ptr) {});
     });
     return seastar::make_ready_future<>();
+}
+
+void RaftRpcTransport::setRawDeliver(DeliverRawFn onDeliverRaw) {
+    impl_->onDeliverRaw = std::move(onDeliverRaw);
 }
 
 seastar::future<> RaftRpcTransport::stop() {

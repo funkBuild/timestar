@@ -126,6 +126,25 @@ seastar::future<> ClusterDataPlane::start(const ClusterConfig& cfg, seastar::sha
                     return shards_.local().plane().host().registry().deliver(std::move(env));
                 });
             });
+        // Decode on the OWNING shard, not on the listening shard. The bytes stay
+        // owned by (and are freed on) the listening shard; the target shard only
+        // reads them, and `submit_to` is awaited so they outlive the read.
+        raftTransport_->setRawDeliver([this](uint16_t groupId, const char* bytes, size_t len) {
+            const unsigned owner = shardForVShard(groupId);
+            if (owner == seastar::this_shard_id()) {
+                auto env = raft::decodeEnvelope(std::string(bytes, len));
+                if (!env)
+                    return seastar::make_ready_future<>();
+                return shards_.local().plane().host().registry().deliver(std::move(*env));
+            }
+            return seastar::smp::submit_to(owner, [this, bytes, len] {
+                auto env = raft::decodeEnvelope(std::string(bytes, len));
+                if (!env)
+                    return seastar::make_ready_future<>();
+                return shards_.local().plane().host().registry().deliver(std::move(*env));
+            });
+        });
+
         for (const auto& [id, addr] : rt_->peerAddresses) {
             if (id == rt_->selfId)
                 continue;
