@@ -139,6 +139,47 @@ void set_routes(routes& r) {
               },
               "json"));
 
+    // Operator action: hand leadership of VShards this node leads beyond its fair
+    // share to lighter peers (M5 leadership balancing == v1 read balancing). Bounded
+    // per call via ?max=N (default 256); call repeatedly to converge.
+    r.add(operation_type::POST, url("/cluster/rebalance-leadership"),
+          new function_handler(
+              [](std::unique_ptr<seastar::http::request> req,
+                 std::unique_ptr<seastar::http::reply> rep) -> seastar::future<std::unique_ptr<seastar::http::reply>> {
+                  size_t maxTransfers = 256;
+                  if (req->query_parameters.contains("max")) {
+                      try {
+                          maxTransfers = std::stoul(req->query_parameters.at("max"));
+                      } catch (...) {
+                          rep->set_status(seastar::http::reply::status_type::bad_request);
+                          rep->_content = R"({"status":"error","message":"max must be a number"})";
+                          co_return std::move(rep);
+                      }
+                  }
+                  if (!g_clusterPartitioned) {
+                      rep->set_status(seastar::http::reply::status_type::bad_request);
+                      rep->_content = R"({"status":"error","message":"node is not clustered"})";
+                      co_return std::move(rep);
+                  }
+                  const size_t before =
+                      co_await seastar::smp::submit_to(0u, [] { return g_clusterDataPlane.status().vshardsLedHere; });
+                  const size_t moved = co_await seastar::smp::submit_to(
+                      0u, [maxTransfers] { return g_clusterDataPlane.rebalanceLeadership(maxTransfers); });
+                  const size_t after =
+                      co_await seastar::smp::submit_to(0u, [] { return g_clusterDataPlane.status().vshardsLedHere; });
+                  rep->set_status(seastar::http::reply::status_type::ok);
+                  // Raft leadership transfer is a REQUEST (TimeoutNow): the target only
+                  // becomes leader if it can campaign successfully. Report the actual
+                  // before/after so an operator can see when transfers are initiated but
+                  // not taking effect (e.g. a target too loaded to run an election)
+                  // instead of reading "success" and assuming the cluster rebalanced.
+                  rep->_content = "{\"status\":\"success\",\"transfers_initiated\":" + std::to_string(moved) +
+                                  ",\"vshards_led_before\":" + std::to_string(before) +
+                                  ",\"vshards_led_after\":" + std::to_string(after) + "}";
+                  co_return std::move(rep);
+              },
+              "json"));
+
     r.add(operation_type::GET, url("/health"),
           new function_handler(
               [](std::unique_ptr<seastar::http::request> req,

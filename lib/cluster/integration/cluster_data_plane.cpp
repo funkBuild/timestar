@@ -265,6 +265,73 @@ ClusterDataPlane::Status ClusterDataPlane::status() const {
     return s;
 }
 
+seastar::future<size_t> ClusterDataPlane::rebalanceLeadership(size_t maxTransfers) {
+    if (!replicated_ || !rdp_ || maxTransfers == 0)
+        co_return 0;
+    auto& host = rdp_->host();
+    const data::NodeId self = rt_->selfId;
+
+    // One pass over the map: who leads what, and which of them are ours.
+    std::map<data::NodeId, size_t> led;
+    std::vector<uint16_t> mine;
+    size_t totalLed = 0;
+    for (uint16_t vs = 0; vs < timestar::VIRTUAL_SHARD_COUNT; ++vs) {
+        const data::NodeId leader = host.leaderOf(vs);
+        if (leader == timestar::raft::kNoNode)
+            continue;
+        ++led[leader];
+        ++totalLed;
+        if (leader == self)
+            mine.push_back(vs);
+    }
+    const size_t nodes = rt_->peerAddresses.empty() ? 1 : rt_->peerAddresses.size();
+    const size_t fair = totalLed / nodes;
+    if (mine.size() <= fair)
+        co_return 0;  // already at or below our share
+
+    // Targets: peers currently under the fair share, with the deficit each can absorb.
+    std::vector<std::pair<data::NodeId, size_t>> targets;
+    for (const auto& [id, addr] : rt_->peerAddresses) {
+        if (id == self)
+            continue;
+        const size_t have = led.count(id) ? led.at(id) : 0;
+        if (have < fair)
+            targets.push_back({id, fair - have});
+    }
+    if (targets.empty())
+        co_return 0;
+
+    const size_t budget = std::min(maxTransfers, mine.size() - fair);
+    size_t done = 0, ti = 0;
+    for (uint16_t vs : mine) {
+        if (done >= budget)
+            break;
+        // Round-robin over targets that still have deficit.
+        size_t tried = 0;
+        while (tried < targets.size() && targets[ti % targets.size()].second == 0) {
+            ++ti;
+            ++tried;
+        }
+        if (tried == targets.size())
+            break;  // every target is satisfied
+        auto& [target, deficit] = targets[ti % targets.size()];
+        raft::RaftGroup* g = host.group(vs);
+        if (!g || !g->isLeader())
+            continue;  // lost leadership since the scan; skip
+        try {
+            co_await g->transferLeadership(target);
+            --deficit;
+            ++done;
+            ++ti;
+        } catch (...) {
+            // A transfer that cannot start (target lagging, leadership lost) is not
+            // fatal -- the next pass retries. Never fail the whole operator request.
+            ++ti;
+        }
+    }
+    co_return done;
+}
+
 seastar::future<data::MetadataResult> ClusterDataPlane::metadata(data::MetadataRequest request) {
     if (!dir_)
         throw std::runtime_error("ClusterDataPlane::metadata before start");

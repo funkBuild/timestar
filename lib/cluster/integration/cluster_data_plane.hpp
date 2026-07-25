@@ -75,6 +75,16 @@ public:
     };
     Status status() const;
 
+    // Operator action (integration plan M5 leadership balancing, which is also v1's
+    // READ balancing since reads go to leaders). Hands leadership of up to
+    // `maxTransfers` VShards this node leads beyond its fair share to peer replicas
+    // that are under it. Bounded per call so an operator request never runs long; call
+    // repeatedly to converge. Returns the number of transfers initiated.
+    //
+    // This matters in practice: the first node to start wins every election, so a
+    // fresh cluster puts ALL write coordination on one node until this runs.
+    seastar::future<size_t> rebalanceLeadership(size_t maxTransfers);
+
 private:
     // RF=3 leader read: fan out per-VShard-leader (see .cpp).
     seastar::future<QueryResponse> queryReplicated(QueryRequest request);
