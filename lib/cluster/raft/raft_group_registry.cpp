@@ -48,6 +48,24 @@ void RaftGroupRegistry::startTicking() {
     timer_.arm_periodic(tickInterval_);
 }
 
+size_t RaftGroupRegistry::wakeFollowersOf(NodeId leader) {
+    if (leader == kNoNode)
+        return 0;
+    size_t woken = 0;
+    for (auto& [gid, g] : groups_) {
+        if (g->leader() != leader)
+            continue;
+        // Tick at FULL rate for a bounded window. Note that zeroing skips_ would do
+        // the opposite -- it restarts the skip countdown, delaying the next
+        // check-tick. The window must comfortably exceed the election timeout
+        // (125-250 passes) so the group actually times out and campaigns; it then
+        // stops being a quiescent follower and hibernation resumes naturally.
+        awakeFor_[gid] = kWakePasses;
+        ++woken;
+    }
+    return woken;
+}
+
 seastar::future<> RaftGroupRegistry::tickAll() {
     for (auto& [gid, g] : groups_) {
         if (stopping_)
@@ -58,7 +76,18 @@ seastar::future<> RaftGroupRegistry::tickAll() {
         // heartbeating and the periodic check-tick still eventually times it out.
         const bool quiescentFollower = g->role() == Role::Follower && g->leader() != kNoNode &&
                                        !g->node().hasReady();
-        if (followerSkip_ != 0 && quiescentFollower) {
+        // A group woken by wakeFollowersOf() bypasses hibernation until its window
+        // expires (self-limiting, so a wake can never pin a group awake forever).
+        bool forcedAwake = false;
+        if (auto w = awakeFor_.find(gid); w != awakeFor_.end()) {
+            if (w->second > 0) {
+                --w->second;
+                forcedAwake = true;
+            } else {
+                awakeFor_.erase(w);
+            }
+        }
+        if (followerSkip_ != 0 && quiescentFollower && !forcedAwake) {
             unsigned& s = skips_[gid];
             if (s < followerSkip_) {
                 ++s;

@@ -50,13 +50,29 @@ public:
     void setHibernation(unsigned followerSkip) { followerSkip_ = followerSkip; }
     uint64_t skippedTicks() const { return skippedTicks_; }
 
+    // Un-hibernate every group that still believes `leader` leads it, so it ticks at
+    // full rate and reaches its election timeout promptly. Returns how many woke.
+    //
+    // Hibernation stretches an idle follower's election timeout by ~followerSkip
+    // (10x by default: 2.5-5s becomes 25-50s). That was deemed acceptable because an
+    // idle group has no pending writes -- but READS route by leader across ALL
+    // VShards, so a few hundred idle groups still pointing at a dead node fail every
+    // query cluster-wide for the whole stretched timeout. The read path calls this
+    // when a leader turns out to be unreachable, which collapses that window back to
+    // a normal election timeout. It only resets the skip counter -- no forced
+    // election, so it cannot disturb a healthy group.
+    size_t wakeFollowersOf(NodeId leader);
+
 private:
     seastar::future<> tickAll();
 
     RaftTransport& transport_;
     std::chrono::milliseconds tickInterval_;
     std::map<uint16_t, std::unique_ptr<RaftGroup>> groups_;
-    std::map<uint16_t, unsigned> skips_;  // consecutive passes a group has been skipped
+    std::map<uint16_t, unsigned> skips_;      // consecutive passes a group has been skipped
+    std::map<uint16_t, unsigned> awakeFor_;  // passes left of forced full-rate ticking
+    // Must exceed the election timeout in passes (125-250) so a woken group campaigns.
+    static constexpr unsigned kWakePasses = 400;
     seastar::timer<> timer_;
     seastar::gate gate_;
     unsigned followerSkip_ = 9;  // idle followers tick every 10th pass by default

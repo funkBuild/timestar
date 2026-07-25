@@ -128,6 +128,13 @@ public:
         return plane_->host().registry().deliver(std::move(*env));
     }
 
+    // Un-hibernate this shard's groups that still believe `leader` leads them.
+    size_t wakeFollowersOf(data::NodeId leader) {
+        if (!plane_)
+            return 0;
+        return plane_->host().registry().wakeFollowersOf(leader);
+    }
+
     // Add a VShard group -- only called on the shard that owns it.
     seastar::future<> addVShard(uint16_t vshard, std::vector<data::NodeId> voters, raft::RaftOptions opts) {
         return plane_->addVShard(vshard, std::move(voters), opts);

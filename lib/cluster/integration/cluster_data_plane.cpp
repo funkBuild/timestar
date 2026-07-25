@@ -237,11 +237,14 @@ seastar::future<QueryResponse> ClusterDataPlane::queryReplicated(QueryRequest re
 
     const data::NodeId self = rt_->selfId;
     std::vector<seastar::future<data::NodeQueryPartial>> pending;
+    std::vector<data::NodeId> pendingLeaders;  // parallel to `pending`
     pending.reserve(byLeader.size());
+    pendingLeaders.reserve(byLeader.size());
     for (auto& [leader, vshards] : byLeader) {
         data::NodeQueryRequest nq;
         nq.request = request;
         nq.vshards = std::move(vshards);
+        pendingLeaders.push_back(leader);
         if (leader == self)
             pending.push_back(local_->queryLocal(std::move(nq)));
         else
@@ -252,7 +255,9 @@ seastar::future<QueryResponse> ClusterDataPlane::queryReplicated(QueryRequest re
     std::vector<timestar::http::SeriesResult> allNonNumeric;
     std::vector<std::string> incompleteReasons;
     std::exception_ptr firstErr;
-    for (auto& f : pending) {
+    std::set<data::NodeId> unreachableLeaders;
+    for (size_t i = 0; i < pending.size(); ++i) {
+        auto& f = pending[i];
         try {
             data::NodeQueryPartial part = co_await std::move(f);
             if (!part.incompleteReasons.empty()) {
@@ -265,9 +270,35 @@ seastar::future<QueryResponse> ClusterDataPlane::queryReplicated(QueryRequest re
             allNonNumeric.insert(allNonNumeric.end(), std::make_move_iterator(part.nonNumeric.begin()),
                                  std::make_move_iterator(part.nonNumeric.end()));
         } catch (...) {
-            if (!firstErr)
+            // A REMOTE leader we could not reach is an availability problem, not an
+            // internal error: the node is down (or partitioned) but its VShards have
+            // live replicas that will elect a new leader. Record it so we can wake
+            // those groups and answer honestly. A failure of our own LOCAL read is a
+            // genuine internal error and still propagates.
+            if (pendingLeaders[i] != self)
+                unreachableLeaders.insert(pendingLeaders[i]);
+            else if (!firstErr)
                 firstErr = std::current_exception();
         }
+    }
+
+    if (!unreachableLeaders.empty()) {
+        // Those VShards are hibernating behind a dead leader, so their election
+        // timeout is stretched ~10x (25-50s of cluster-wide read failure, measured).
+        // Wake them so they campaign at the normal timeout instead, then report
+        // QUERY_INCOMPLETE -- distinguishable from an empty result and from an
+        // internal error, and correct to retry. Waking is idempotent and bounded.
+        for (data::NodeId dead : unreachableLeaders)
+            co_await shards_.invoke_on_all([dead](ShardRaftPlane& p) { (void)p.wakeFollowersOf(dead); });
+        std::string nodes;
+        for (data::NodeId d : unreachableLeaders)
+            nodes += (nodes.empty() ? "" : ",") + std::to_string(d);
+        QueryResponse r;
+        r.success = false;
+        r.errorCode = "QUERY_INCOMPLETE";
+        r.errorMessage = "leader node(s) " + nodes +
+                         " unreachable; their VShards were woken to re-elect -- retry shortly";
+        co_return r;
     }
     if (firstErr)
         std::rethrow_exception(firstErr);
