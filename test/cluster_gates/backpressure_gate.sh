@@ -56,12 +56,17 @@ echo "=== A: 24 connections against a $LIMIT-byte/shard budget (must PUSH BACK) 
 #
 # The probe payload must be big enough to be REFUSED: admission is all-or-nothing on the
 # batch's own size, so a single-point write slips into the headroom under a nearly-full
-# budget (correctly -- a 60-byte write is not the memory problem). ~6000 points (~350 KB
-# charged) is refused against a 2 MiB budget already ~1.9 MB full, and is a quarter of the
-# size that trips the pre-existing crash. Sequential, not concurrent, for the same reason.
+# budget (correctly -- a 60-byte write is not the memory problem).
+#
+# It is deliberately BYTE-heavy but SERIES-light: 6000 timestamps on FOUR series, not 6000
+# distinct ones. A probe with thousands of unique series triggers a metadata/day-bitmap
+# storm that kills the node inside CRoaring (`roaring_bitmap_add` dereferencing a failed
+# allocation, right after seastar's memory-pressure dump) -- a pre-existing defect in the
+# INDEX path, nothing to do with write routing, and not what this gate is testing. Same
+# bytes, no index storm.
 python3 - >/tmp/tsgate_bp_probe.json <<'PY'
 import json
-w = [{"measurement": "bpp", "tags": {"host": "h%d" % i}, "fields": {"v": float(i)},
+w = [{"measurement": "bpp", "tags": {"host": "h%d" % (i % 4)}, "fields": {"v": float(i)},
       "timestamp": 1700000000000000000 + i * 1000000} for i in range(6000)]
 print(json.dumps({"writes": w}))
 PY

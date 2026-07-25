@@ -336,11 +336,18 @@ Gate outcomes (2026-07-25):
   - `std::stoull` parsed `TIMESTAR_CLUSTER_WRITE_INFLIGHT_BYTES="32MiB"` as **32 bytes**
     and `"-1"` as SIZE_MAX; strict `from_chars` with full-consumption, and the effective
     budget is logged at startup.
-- **Pre-existing bug found, NOT introduced here (for Phase 4):** 40 concurrent
-  1.3 MB `{"writes":[...]}` batches segfault every node (`si_addr 0x22` on one,
-  SI_KERNEL on another). Reproduces identically on the pre-Phase-3 binary
-  (8079fa6), so it is not Phase-3 fallout; it is the json-batch path under
-  burst concurrency and plausibly the same family as [D6].
+- **Pre-existing crash found, NOT introduced here (for Phase 4 / the index owner):**
+  a `{"writes":[...]}` batch carrying thousands of DISTINCT SERIES, under
+  concurrency, segfaults the node. Symbolized: **`roaring_bitmap_add`**, faulting
+  on a garbage address (`si_code 1`), immediately after seastar's memory-pressure
+  dump ("Too long queue accumulated") — i.e. CRoaring dereferencing a failed
+  allocation in the day-bitmap/postings path, which uses `malloc` and cannot
+  throw. It is the INDEX path under memory pressure, not the write path: it
+  reproduces on the pre-Phase-3 binary (8079fa6) at 40 x 1.3 MB, and it vanishes
+  when the same BYTES are sent as few series with many timestamps. The
+  backpressure gate's probe payload is deliberately byte-heavy and series-light
+  for exactly this reason — a gate must not depend on the thing it is not
+  testing.
 
 ### Phase 4 — HA hardening: kill the collapse window [D6]
 
