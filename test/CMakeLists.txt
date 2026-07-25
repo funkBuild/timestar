@@ -43,6 +43,7 @@ set(UNIT_CLUSTER_SOCKET_TESTS
     ${CMAKE_CURRENT_SOURCE_DIR}/unit/cluster/dataplane_rpc_test.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/unit/cluster/dataplane_rpc_enriched_test.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/unit/cluster/cluster_data_plane_test.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/unit/cluster/shard_raft_plane_test.cpp
 )
 list(REMOVE_ITEM UNIT_CLUSTER_TESTS ${UNIT_CLUSTER_SOCKET_TESTS})
 file(GLOB_RECURSE UNIT_RETENTION_TESTS CONFIGURE_DEPENDS unit/retention/*.cpp)

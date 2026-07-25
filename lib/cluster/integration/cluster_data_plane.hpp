@@ -48,6 +48,15 @@ public:
     seastar::future<> start(const ClusterConfig& cfg, seastar::sharded<Engine>& engines);
     seastar::future<> stop();
 
+    // Peer-facing transport settings. MUST be set before start(), which is what pushes
+    // them to EVERY data-plane transport this node owns -- in replicated mode that is
+    // the per-shard listeners and peer clients, not just this object's own (client-only)
+    // instance. Configuring one instance and not the others is the failure that matters:
+    // shard-0 clients would speak TLS while every per-shard listener and the whole write
+    // path stayed plaintext -- queries fail loudly, writes go silently unencrypted.
+    void setTlsCredentials(DataPlaneTls creds) { tls_ = std::move(creds); }
+    void setLocalVersion(features::VersionRange range) { localVersion_ = range; }
+
     // Route a partitioned write to VShard owners (local applied directly, remote
     // forwarded), and a query fanned out to owners then merged to the single-node
     // answer.
@@ -126,6 +135,9 @@ private:
 
     std::optional<ClusterRuntime> rt_;
     seastar::sharded<Engine>* enginesPtr_ = nullptr;
+    // Applied to this object's transport AND to every per-shard transport in start().
+    std::optional<DataPlaneTls> tls_;
+    features::VersionRange localVersion_{};
     // Declared in dependency order: deps before the router/coordinator that reference
     // them, so destruction (reverse order) tears the referrers down first.
     std::unique_ptr<data::VShardDirectory> dir_;
@@ -140,7 +152,10 @@ private:
     // Per-shard Raft planes: shard S owns the VShards with assignCore(vs)==S, so the
     // group tick/step/apply work is spread over all cores instead of saturating
     // shard 0. Each plane also owns its OWN Raft and data-plane transports (listener +
-    // peer clients), so no inter-node byte transits shard 0.
+    // peer clients). No DATA-plane byte transits shard 0 any more; inbound RAFT traffic
+    // still does, because that listener pins itself to its shard and reuseport is
+    // disabled in this seastar (see shard_raft_plane.hpp's header note) -- egress is
+    // per-shard for both.
     seastar::sharded<ShardRaftPlane> shards_;
     bool shardsStarted_ = false;
     bool replicated_ = false;

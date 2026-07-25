@@ -5,6 +5,7 @@
 #include "../../core/vshard.hpp"  // assignCore
 #include "../data/dataplane_rpc.hpp"
 #include "../data/node_store.hpp"
+#include "../features/feature_gate.hpp"  // VersionRange
 #include "../raft/raft_codec.hpp"  // decodeEnvelope
 #include "../raft/raft_driver.hpp"  // RaftTransport
 #include "../raft/raft_rpc_transport.hpp"
@@ -16,10 +17,12 @@
 #include <filesystem>
 #include <map>
 #include <memory>
+#include <optional>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/core/smp.hh>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -53,10 +56,28 @@ inline unsigned shardForVShard(uint16_t vshard) {
     return timestar::assignCore(timestar::VShardId{vshard}, seastar::smp::count);
 }
 
+// Raised when a slice is routed to a shard whose plane has already been torn down
+// (shutdown in progress). It is a RETRYABLE condition -- the write never reached Raft,
+// so nothing was committed and the caller may safely re-route it -- and it must be an
+// error rather than a silent drop, or a shutting-down node would ack writes it discarded.
+inline constexpr const char* kShardStoppingError = "cluster: shard data plane is stopping; retry this write";
+
+// Mutual-TLS material for the per-shard data-plane transports. Set on ClusterDataPlane
+// before start(); it is pushed to EVERY shard's DataPlaneRpc, because in replicated
+// mode those -- not ClusterDataPlane's own client-only instance -- are the node's
+// listeners AND the write path's peer clients. Configuring only the shard-0 instance
+// would leave the whole data plane plaintext while queries went TLS.
+struct DataPlaneTls {
+    std::string certPem;
+    std::string keyPem;
+    std::string caPem;
+    std::string expectedPeerName;
+};
+
 // One shard's slice of the replicated data plane: a full ReplicatedDataPlane holding
 // only the VShards this shard owns. Constructed on every shard via
 // seastar::sharded<ShardRaftPlane>, so each reactor ticks only its own groups.
-class ShardRaftPlane : public data::ProposeSink {
+class ShardRaftPlane : public data::ProposeSink, public data::ReadIndexSink {
 public:
     seastar::future<> init(seastar::sharded<Engine>* engines, seastar::sharded<ShardRaftPlane>* peers,
                            const data::VShardDirectory* dir, data::NodeId self, std::string journalRoot,
@@ -65,8 +86,8 @@ public:
         peers_ = peers;
         transport_ = std::make_unique<raft::RaftRpcTransport>();
         // This shard's OWN data-plane transport: its listener on the node's data-plane
-        // port (SO_REUSEPORT) and its own peer clients. Every remote leader forward
-        // this shard makes now leaves from this core; nothing hops to shard 0.
+        // port and its own peer clients. Every remote leader forward this shard makes
+        // now leaves from this core; nothing hops to shard 0.
         rpc_ = std::make_unique<data::DataPlaneRpc>();
         // Journals are per-VShard directories under this root, and each VShard belongs
         // to exactly one shard, so shards never contend for the same journal.
@@ -75,13 +96,23 @@ public:
         return seastar::make_ready_future<>();
     }
 
-    // Listen for peer data-plane traffic on the node's data-plane port from THIS shard
-    // (SO_REUSEPORT, as with the Raft port above). Inbound forwarded writes/queries are
-    // served by this shard's EngineLocalStore, which dispatches to the owning engine
-    // core itself; an inbound proposeWrite is split across the shards owning its
-    // VShards by proposeBatch() below.
-    seastar::future<> startDataPlane(seastar::socket_address local) {
+    // Listen for peer data-plane traffic on the node's data-plane port from THIS shard.
+    // Inbound forwarded writes/queries are served by this shard's EngineLocalStore,
+    // which dispatches to the owning engine core itself; an inbound proposeWrite is
+    // split across the shards owning its VShards by proposeBatch() below, and an
+    // inbound leaderReadIndex/leaderCommitIndex is routed to the VShard's owning shard
+    // by the ReadIndexSink overrides.
+    //
+    // Every peer-facing SETTING must be applied here, not just to ClusterDataPlane's
+    // instance: in replicated mode these are the node's only data-plane servers and the
+    // write path's only peer clients.
+    seastar::future<> startDataPlane(seastar::socket_address local, const std::optional<DataPlaneTls>& tls,
+                                     features::VersionRange localVersion) {
+        if (tls)
+            rpc_->setTlsCredentials(tls->certPem, tls->keyPem, tls->caPem, tls->expectedPeerName);
+        rpc_->setLocalVersion(localVersion);
         rpc_->setProposeSink(*this);
+        rpc_->setReadIndexSink(*this);
         return rpc_->start(local, *store_, /*perShardListener=*/true);
     }
 
@@ -92,9 +123,19 @@ public:
     // which shards own the VShards -- so split and replicate each slice on its owner.
     seastar::future<bool> proposeBatch(data::WriteBatch batch) override;
 
-    // Listen on the node's Raft port from THIS shard. Every shard binds the same
-    // address; seastar uses SO_REUSEPORT so each gets its own socket and the kernel
-    // distributes connections. Envelopes are decoded on the shard owning the group.
+    // ReadIndexSink: a replica is confirming freshness at the leader (M4 replica reads).
+    // Same story as proposeBatch -- the connection landed on an arbitrary shard, so hop
+    // to the one that owns this VShard's group and answer from there. The host rejects
+    // (throws) if this node is not the current-term leader, which is what the reaching
+    // replica needs; that rejection propagates unchanged.
+    seastar::future<raft::LogIndex> leaderReadIndex(uint16_t vshard) override;
+    seastar::future<raft::LogIndex> leaderCommitIndex(uint16_t vshard) override;
+
+    // Listen on the node's Raft port from THIS shard. Every shard calls listen() on the
+    // same address; envelopes are decoded on the shard owning the group. NOTE: this
+    // listener still pins itself (set_fixed_cpu inside RaftRpcTransport), so with
+    // reuseport disabled shard 0 in fact accepts and reads all inbound Raft traffic --
+    // see the file header.
     seastar::future<> startTransport(seastar::socket_address local) {
         co_await transport_->start(local, [](raft::Envelope) { return seastar::make_ready_future<>(); });
         transport_->setRawDeliver([this](uint16_t groupId, const char* bytes, size_t len) {
@@ -242,13 +283,19 @@ public:
     }
 
     seastar::future<> stop() {
-        // The plane first (it borrows both transports), then the transports, then the
-        // store they dispatch into.
+        // STOP SERVING FIRST. This shard's DataPlaneRpc is one of the node's real
+        // data-plane servers, and its handlers reach the plane (proposeBatch ->
+        // p.plane()). Tearing the plane down first left a window in which an inbound
+        // peer proposeWrite dereferenced a null plane_ and crashed the node -- during a
+        // rolling restart under write load, exactly when it hurts. Stopping the server
+        // first also lets in-flight handlers finish against a still-ticking Raft plane
+        // rather than being cut off mid-commit. rpc_ itself is only DESTROYED after
+        // plane_, which borrows it.
+        if (rpc_)
+            co_await rpc_->stop();
         if (plane_)
             co_await plane_->stop();
         plane_.reset();
-        if (rpc_)
-            co_await rpc_->stop();
         rpc_.reset();
         if (transport_)
             co_await transport_->stop();
@@ -289,8 +336,14 @@ inline seastar::future<> writeSlicesToOwningShards(seastar::sharded<ShardRaftPla
     std::vector<seastar::future<>> pending;
     pending.reserve(byShard.size());
     for (auto& [shard, slice] : byShard)
-        pending.push_back(shards.invoke_on(
-            shard, [b = std::move(slice)](ShardRaftPlane& p) mutable { return p.plane().write(std::move(b)); }));
+        pending.push_back(shards.invoke_on(shard, [b = std::move(slice)](ShardRaftPlane& p) mutable {
+            // sharded<>::stop() runs every shard's stop() CONCURRENTLY, so a shard that
+            // has already torn its plane down can be invoked from one that has not --
+            // no timing luck needed. Fail retryably instead of dereferencing null.
+            if (!p.ready())
+                return seastar::make_exception_future<>(std::runtime_error(kShardStoppingError));
+            return p.plane().write(std::move(b));
+        }));
 
     std::exception_ptr firstErr;
     for (auto& f : pending) {
@@ -322,6 +375,8 @@ inline seastar::future<bool> proposeSlicesToOwningShards(seastar::sharded<ShardR
     pending.reserve(byShard.size());
     for (auto& [shard, slice] : byShard)
         pending.push_back(shards.invoke_on(shard, [b = std::move(slice)](ShardRaftPlane& p) mutable {
+            if (!p.ready())  // see the note in writeSlicesToOwningShards
+                return seastar::make_exception_future<bool>(std::runtime_error(kShardStoppingError));
             return p.plane().host().proposeBatch(std::move(b));
         }));
 
@@ -343,6 +398,22 @@ inline seastar::future<bool> proposeSlicesToOwningShards(seastar::sharded<ShardR
 
 inline seastar::future<bool> ShardRaftPlane::proposeBatch(data::WriteBatch batch) {
     return proposeSlicesToOwningShards(*peers_, std::move(batch));
+}
+
+inline seastar::future<raft::LogIndex> ShardRaftPlane::leaderReadIndex(uint16_t vshard) {
+    return peers_->invoke_on(shardForVShard(vshard), [vshard](ShardRaftPlane& p) {
+        if (!p.ready())
+            return seastar::make_exception_future<raft::LogIndex>(std::runtime_error(kShardStoppingError));
+        return p.plane().host().leaderReadIndex(vshard);
+    });
+}
+
+inline seastar::future<raft::LogIndex> ShardRaftPlane::leaderCommitIndex(uint16_t vshard) {
+    return peers_->invoke_on(shardForVShard(vshard), [vshard](ShardRaftPlane& p) {
+        if (!p.ready())
+            return seastar::make_exception_future<raft::LogIndex>(std::runtime_error(kShardStoppingError));
+        return p.plane().host().leaderCommitIndex(vshard);
+    });
 }
 
 }  // namespace timestar::cluster

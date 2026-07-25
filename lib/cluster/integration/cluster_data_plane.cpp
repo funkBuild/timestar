@@ -61,6 +61,13 @@ seastar::future<> ClusterDataPlane::start(const ClusterConfig& cfg, seastar::sha
     seastar::net::inet_address selfAddr = co_await resolveHost(self.host);
     const seastar::socket_address dataPlaneAddr(selfAddr,
                                                 static_cast<uint16_t>(self.port + kDataPlanePortOffset));
+    // Peer-facing settings must be applied BEFORE start() on every transport that talks
+    // to a peer. This instance is the shard-0 query/metadata client; the per-shard
+    // instances (started below) are the listeners and the write path's clients, and they
+    // get the identical settings.
+    if (tls_)
+        rpc_->setTlsCredentials(tls_->certPem, tls_->keyPem, tls_->caPem, tls_->expectedPeerName);
+    rpc_->setLocalVersion(localVersion_);
     if (replicated)
         // Replicated mode serves the data plane from EVERY shard (see below); this
         // instance stays client-only, for the shard-0 query/metadata fan-out.
@@ -123,8 +130,12 @@ seastar::future<> ClusterDataPlane::start(const ClusterConfig& cfg, seastar::sha
         // An inbound proposeWrite is split across the shards owning its VShards by
         // ShardRaftPlane::proposeBatch, so which shard the kernel handed the connection
         // to no longer decides where the work runs.
-        co_await shards_.invoke_on_all(
-            [dataPlaneAddr](ShardRaftPlane& p) { return p.startDataPlane(dataPlaneAddr); });
+        co_await shards_.invoke_on_all([dataPlaneAddr, tls = tls_, ver = localVersion_](ShardRaftPlane& p) {
+            // `tls` is read from this shard's copy and the PEM strings are copied into
+            // each shard's own credentials -- setTlsCredentials takes them by value, so
+            // nothing cross-shard is retained.
+            return p.startDataPlane(dataPlaneAddr, tls, ver);
+        });
 
         // Serve Raft on this node's own Raft address FROM EVERY SHARD (SO_REUSEPORT).
         // Each shard decodes and routes to the shard owning the addressed group.
