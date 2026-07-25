@@ -3,10 +3,12 @@
 #include "raft_codec.hpp"
 
 
+#include <chrono>
 #include <cstdint>
 #include <map>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/gate.hh>
+#include <seastar/core/lowres_clock.hh>
 #include <seastar/core/sstring.hh>
 #include <seastar/rpc/rpc.hh>
 
@@ -36,25 +38,74 @@ seastar::sstring read(RaftSerializer, Input& in, seastar::rpc::type<seastar::sst
 
 constexpr uint64_t kDeliverVerb = 1;
 
+// How long to wait before re-attempting a peer connection that failed. seastar's
+// rpc::client never reconnects itself, so we recreate it -- but a node runs
+// thousands of Raft groups all ticking, so an unthrottled "recreate on every send"
+// would hammer a genuinely-down peer with thousands of connects per second. Raft is
+// retry-driven (the next tick re-sends), so dropping messages between attempts is
+// safe; this only bounds how fast we retry.
+constexpr std::chrono::milliseconds kReconnectBackoff{200};
+
 }  // namespace
 
 struct RaftRpcTransport::Impl {
+    using Client = seastar::rpc::protocol<RaftSerializer>::client;
+
     seastar::rpc::protocol<RaftSerializer> proto{RaftSerializer{}};
     std::unique_ptr<seastar::rpc::protocol<RaftSerializer>::server> server;
     std::map<NodeId, seastar::socket_address> peers;
-    std::map<NodeId, std::unique_ptr<seastar::rpc::protocol<RaftSerializer>::client>> clients;
+    std::map<NodeId, std::unique_ptr<Client>> clients;
+    // Earliest time we may re-attempt a peer whose connection died (see kReconnectBackoff).
+    std::map<NodeId, seastar::lowres_clock::time_point> nextRetry;
     DeliverFn onDeliver;
     seastar::gate gate;
     bool stopping = false;
 
-    // Lazily open (and cache) the one connection to a peer host.
-    seastar::rpc::protocol<RaftSerializer>::client* clientFor(NodeId to) {
-        if (auto it = clients.find(to); it != clients.end())
-            return it->second.get();
+    // The deliver stub is created ONCE. Allocating one per send (as this used to)
+    // burns an allocation on every Raft message -- and a node ticking thousands of
+    // groups sends a great many of them.
+    std::function<seastar::future<>(Client&, seastar::sstring)> deliverStub =
+        proto.make_client<seastar::rpc::no_wait_type(seastar::sstring)>(kDeliverVerb);
+
+    // Retire a dead connection without blocking the caller: stop it in the background
+    // (under the gate) so its resources are released, keeping it alive until stop
+    // resolves.
+    void retire(std::unique_ptr<Client> dead) {
+        if (!dead || gate.is_closed())
+            return;  // shutting down: stop() will not run; just drop it
+        auto* raw = dead.get();
+        (void)seastar::with_gate(gate, [raw, d = std::move(dead)]() mutable {
+            return raw->stop().handle_exception([](std::exception_ptr) {}).finally([d = std::move(d)] {});
+        });
+    }
+
+    // Open (and cache) the one connection to a peer host, RECONNECTING a dead one.
+    //
+    // seastar's rpc::client connects exactly once, in the background, and latches
+    // error() on failure -- it never reconnects. Raft starts sending the instant the
+    // groups tick, which during a rolling start is BEFORE the peers are listening, so
+    // the first connection attempt to a not-yet-up peer fails and the cached client is
+    // permanently dead. Every later heartbeat/vote to that peer is silently discarded,
+    // so its groups never elect a leader (the cluster reports every VShard leaderless
+    // forever). Detect the dead client, retire it, and build a fresh one -- throttled
+    // by kReconnectBackoff so a genuinely-down peer is not hammered.
+    Client* clientFor(NodeId to) {
+        auto it = clients.find(to);
+        if (it != clients.end()) {
+            if (!it->second->error())
+                return it->second.get();
+            const auto now = seastar::lowres_clock::now();
+            auto rit = nextRetry.find(to);
+            if (rit != nextRetry.end() && now < rit->second)
+                return nullptr;  // backing off: drop this message, Raft re-sends
+            nextRetry[to] = now + kReconnectBackoff;
+            retire(std::move(it->second));
+            clients.erase(it);
+        }
         auto pit = peers.find(to);
         if (pit == peers.end())
             return nullptr;
-        auto c = std::make_unique<seastar::rpc::protocol<RaftSerializer>::client>(proto, pit->second);
+        auto c = std::make_unique<Client>(proto, pit->second);
         auto* p = c.get();
         clients[to] = std::move(c);
         return p;
@@ -94,15 +145,13 @@ seastar::future<> RaftRpcTransport::send(Envelope env) {
 
     std::string bytes = encodeEnvelope(env);
     seastar::sstring data(bytes.data(), bytes.size());
-    // no_wait client signature: the returned future resolves once the request is
-    // written, never waiting for a reply.
-    auto call = impl_->proto.make_client<seastar::rpc::no_wait_type(seastar::sstring)>(kDeliverVerb);
 
     // Fire-and-forget: run the RPC in the background under the gate so the Ready
-    // loop is never blocked on the network. Transport errors are swallowed.
-    (void)seastar::with_gate(impl_->gate, [conn, call = std::move(call),
-                                           data = std::move(data)]() mutable {
-        return call(*conn, std::move(data)).handle_exception([](std::exception_ptr) {});
+    // loop is never blocked on the network. Transport errors are swallowed -- a
+    // failed send marks the client errored, and the next send reconnects it
+    // (clientFor), so a dropped message is just a Raft retry.
+    (void)seastar::with_gate(impl_->gate, [this, conn, data = std::move(data)]() mutable {
+        return impl_->deliverStub(*conn, std::move(data)).handle_exception([](std::exception_ptr) {});
     });
     return seastar::make_ready_future<>();
 }

@@ -113,8 +113,26 @@ seastar::future<> ClusterDataPlane::start(const ClusterConfig& cfg, seastar::sha
         }
 
         // Instantiate this node's replicated VShard groups from placement.
+        //
+        // MANY-GROUP TIMING. A node hosts RF*4096/N per-VShard Raft groups (every
+        // VShard when RF==N) on ONE shard. The brick defaults are tuned for a handful
+        // of groups: heartbeat EVERY 20ms tick and an election timeout of only 10-20
+        // ticks (200-400ms). At this group count that is two separate floods:
+        //   - steady state: ~1365 leaders * 2 followers / 20ms ~= 136k msgs/s, which
+        //     saturates the reactor ("Too long queue accumulated for main") until the
+        //     node stops answering HTTP at all;
+        //   - startup: every group's first election times out inside the same 200ms
+        //     window, so thousands of campaigns collide and split votes.
+        // Standard Raft practice (heartbeat ~200ms, election ~1-2s, widely randomized)
+        // fixes both: 10x less steady traffic, and the initial campaigns spread over a
+        // ~1s window instead of 200ms. Followers still see 5-10 heartbeats per election
+        // window, so leadership stays stable.
+        raft::RaftOptions ropts;
+        ropts.heartbeatTimeout = 10;    // 200ms at the 20ms tick
+        ropts.electionTimeoutMin = 50;  // 1s
+        ropts.electionTimeoutMax = 100;  // 2s (randomized per group -> spreads campaigns)
         for (const auto& [vshard, voters] : rt_->localReplicaGroups())
-            co_await rdp_->addVShard(vshard, voters);
+            co_await rdp_->addVShard(vshard, voters, ropts);
         rdp_->startTicking();
         replicated_ = true;
     }
