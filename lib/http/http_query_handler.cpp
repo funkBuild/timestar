@@ -2557,7 +2557,14 @@ seastar::future<HttpQueryHandler::NodePartials> HttpQueryHandler::queryLocalPart
             co_return out;
         }
 
+        const bool lprof = queryProfileEnabled();
+        const auto tL0 = std::chrono::high_resolution_clock::now();
+        double discMs = 0, filtMs = 0, fanMs = 0;
+        size_t seriesBeforeFilter = 0;
+
         SeriesDiscoveryResult discoveryResult = co_await discoverSeriesAcrossShards(request);
+        if (lprof)
+            discMs = msSince(tL0);
         if (discoveryResult.timedOut) {
             out.ok = false;
             err.success = false;
@@ -2576,6 +2583,9 @@ seastar::future<HttpQueryHandler::NodePartials> HttpQueryHandler::queryLocalPart
         }
 
         auto& seriesByShard = discoveryResult.seriesByShard;
+        if (lprof)
+            for (const auto& c : seriesByShard)
+                seriesBeforeFilter += c.size();
         // RF=3 read: keep only series whose VShard this node was asked for (leads), so
         // a series replicated on every node is counted once cluster-wide.
         if (vshardFilter) {
@@ -2584,6 +2594,8 @@ seastar::future<HttpQueryHandler::NodePartials> HttpQueryHandler::queryLocalPart
                     return vshardFilter->count(timestar::virtualShard(c.seriesId)) == 0;
                 });
         }
+        if (lprof)
+            filtMs = msSince(tL0) - discMs;
         size_t totalSeriesFound = 0;
         for (const auto& contexts : seriesByShard)
             totalSeriesFound += contexts.size();
@@ -2600,6 +2612,13 @@ seastar::future<HttpQueryHandler::NodePartials> HttpQueryHandler::queryLocalPart
         }
 
         ShardFanOutResult fanOut = co_await fanOutShardQueries(request, seriesByShard);
+        if (lprof) {
+            fanMs = msSince(tL0) - discMs - filtMs;
+            timestar::http_log.info(
+                "[LOCAL_PROFILE] vshard_filtered={} series_before={} series_after={} discovery={:.1f}ms "
+                "vshard_filter={:.1f}ms fanout={:.1f}ms",
+                vshardFilter ? vshardFilter->size() : 0, seriesBeforeFilter, totalSeriesFound, discMs, filtMs, fanMs);
+        }
 
         // Incomplete contract: a series a shard could not read fails the whole query
         // (never a silent partial), identical to executeQuery.
