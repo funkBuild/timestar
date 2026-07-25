@@ -54,6 +54,20 @@ public:
     seastar::future<> write(data::WriteBatch batch);
     seastar::future<QueryResponse> query(QueryRequest request);
 
+    // The REPLICATED write entry point, callable from ANY shard -- the HTTP request
+    // shard calls it directly instead of shipping the whole batch to shard 0.
+    //
+    // It touches only `shards_`, a seastar::sharded<> whose instance table is fixed
+    // once start() has returned (and start() completes before the HTTP server accepts),
+    // so there is no shard-0-owned mutable state on this path. The request shard splits
+    // the batch by owning shard and dispatches every slice concurrently; the owning
+    // shard resolves the VShard's current leader and, when that leader is remote,
+    // forwards from ITS OWN peer client. Nothing rendezvouses on shard 0.
+    //
+    // PRECONDITION: replicated mode (replication_factor > 1). RF=1 still routes through
+    // write() on shard 0.
+    seastar::future<> writeFromShard(data::WriteBatch batch);
+
     // Scatter a metadata request to every VShard owner and merge: string-set union
     // for list kinds, SUM for cardinality (RF=1 disjoint series => exact).
     seastar::future<data::MetadataResult> metadata(data::MetadataRequest request);

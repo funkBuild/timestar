@@ -550,10 +550,24 @@ int main(int argc, char** argv) {
                             0u, [q = std::move(q)]() mutable { return g_clusterDataPlane.query(std::move(q)); });
                     };
                     // Route /write through the data plane (per-series owner routing).
-                    timestar::http::HttpWriteHandler::clusterWriteHook = [](timestar::data::WriteBatch b) {
-                        return seastar::smp::submit_to(
-                            0u, [b = std::move(b)]() mutable { return g_clusterDataPlane.write(std::move(b)); });
-                    };
+                    //
+                    // A REPLICATED write never rendezvouses on shard 0: the request
+                    // shard splits the batch by owning shard and dispatches straight to
+                    // those shards' Raft planes, which forward remote leaders from their
+                    // own peer clients. Shipping the whole batch to shard 0 first made
+                    // that one core hash, group and re-own every point the node wrote,
+                    // and it stayed the profile outlier (persist 132ms vs 3-7ms) after
+                    // both transports were sharded. RF=1 still routes through shard 0 --
+                    // its router and its peer clients are single instances there.
+                    const bool replicatedWrites = cc.replication_factor > 1;
+                    timestar::http::HttpWriteHandler::clusterWriteHook =
+                        [replicatedWrites](timestar::data::WriteBatch b) {
+                            if (replicatedWrites)
+                                return g_clusterDataPlane.writeFromShard(std::move(b));
+                            return seastar::smp::submit_to(0u, [b = std::move(b)]() mutable {
+                                return g_clusterDataPlane.write(std::move(b));
+                            });
+                        };
                     // Route metadata endpoints through the scatter+merge.
                     timestar::http::HttpMetadataHandler::clusterMetadataHook = [](timestar::data::MetadataRequest r) {
                         return seastar::smp::submit_to(

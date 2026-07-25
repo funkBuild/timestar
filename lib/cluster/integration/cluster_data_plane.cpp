@@ -400,6 +400,12 @@ seastar::future<size_t> ClusterDataPlane::rebalanceLeadership(size_t maxTransfer
     co_return total;
 }
 
+seastar::future<> ClusterDataPlane::writeFromShard(data::WriteBatch batch) {
+    // Same work as writeReplicated, but safe to call from the shard the HTTP request
+    // arrived on (see the header): the split and dispatch touch only `shards_`.
+    return writeSlicesToOwningShards(shards_, std::move(batch));
+}
+
 seastar::future<> ClusterDataPlane::writeReplicated(data::WriteBatch batch) {
     // Group the series by the shard that owns their VShard's Raft group, then hand
     // each slice to that shard's plane (which resolves the leader for its own
