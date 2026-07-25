@@ -3,6 +3,7 @@
 #include "../../utils/logger.hpp"  // timestar::http_log
 
 #include <seastar/core/coroutine.hh>
+#include <seastar/core/sleep.hh>
 #include <seastar/net/dns.hh>
 #include <set>
 #include <seastar/net/inet_address.hh>
@@ -210,12 +211,28 @@ seastar::future<QueryResponse> ClusterDataPlane::queryReplicated(QueryRequest re
     std::map<data::NodeId, std::vector<uint16_t>> byLeader;
     size_t leaderless = 0;
     // Groups live across cores now, so collect each shard's leadership view.
-    const auto leaders = co_await gatherLeaders();
-    for (const auto& [vs, leader] : leaders) {
-        if (leader == timestar::raft::kNoNode)
-            ++leaderless;  // no elected leader (no quorum) -> its data is unreadable
-        else
-            byLeader[leader].push_back(vs);
+    // A VShard is momentarily leaderless during a leadership TRANSFER (the old leader
+    // has stepped down, the new one has not yet won). Failing the query outright there
+    // turns routine background rebalancing into user-visible read errors -- measured at
+    // ~4.6% of queries while the balancer was actively moving leadership. Re-gather a
+    // few times first: a transfer completes in milliseconds, so this converts a
+    // transient window into a small latency bump. A genuinely leaderless VShard (lost
+    // quorum) still fails closed after the retries.
+    static constexpr int kLeaderRetries = 4;
+    static constexpr auto kLeaderRetryDelay = std::chrono::milliseconds(25);
+    for (int attempt = 0; attempt <= kLeaderRetries; ++attempt) {
+        byLeader.clear();
+        leaderless = 0;
+        const auto leaders = co_await gatherLeaders();
+        for (const auto& [vs, leader] : leaders) {
+            if (leader == timestar::raft::kNoNode)
+                ++leaderless;  // no elected leader right now
+            else
+                byLeader[leader].push_back(vs);
+        }
+        if (leaderless == 0 || attempt == kLeaderRetries)
+            break;
+        co_await seastar::sleep(kLeaderRetryDelay);
     }
     if (leaderless > 0) {
         // A VShard with no leader may hold matching data we cannot read -> fail closed

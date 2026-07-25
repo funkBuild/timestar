@@ -230,8 +230,8 @@ static std::vector<QueryDef> buildQuerySuite(WireFormat format = WireFormat::Jso
                   q("latest:server.metrics(temperature){host:host-03}", BASE_TS, END_TS), 50});
 
     // Set the wire format on all entries.
-    for (auto& q : qs) {
-        q.format = format;
+    for (auto& entry : qs) {
+        entry.format = format;
     }
 
     return qs;
