@@ -73,16 +73,20 @@ seastar::future<> ReplicatedBatchWriteRouter::write(VShardBatches groups) {
         pending.reserve(byLeader.size() + 1);
         pendingTargets.reserve(byLeader.size() + 1);
         pendingViews.reserve(byLeader.size() + 1);
+        // The attempt's own deadline: never past the overall one, and never longer than a
+        // single attempt is allowed to take. It is computed BEFORE any dispatch and passed
+        // to EVERY target, local included. The local leg needs it just as much as a remote
+        // one -- arguably more: a locally-led VShard that has lost quorum suspends its Raft
+        // waiter forever (see RaftGroup::proposeAndAwaitApplied), which is the unbounded
+        // version of the remote black-hole this deadline exists for, and a deadline checked
+        // only BETWEEN attempts cannot stop an attempt that never returns.
+        const auto attemptDeadline =
+            std::min(deadline, seastar::lowres_clock::now() + ReplicatedBatchWriteRouter::kAttemptTimeout);
         if (!localView.empty()) {
             pendingTargets.push_back(self);
             pendingViews.push_back(&localView);
-            pending.push_back(local_.proposeVShardBatchesHinted(localView));
+            pending.push_back(local_.proposeVShardBatchesHinted(localView, attemptDeadline));
         }
-        // The attempt's own deadline: never past the overall one, and never longer than a
-        // single attempt is allowed to take. Pushed INTO the RPC, because a deadline
-        // checked only between attempts cannot stop an attempt that never returns.
-        const auto attemptDeadline =
-            std::min(deadline, seastar::lowres_clock::now() + ReplicatedBatchWriteRouter::kAttemptTimeout);
         for (auto& [leader, lview] : byLeader) {
             pendingTargets.push_back(leader);
             pendingViews.push_back(&lview);
@@ -115,10 +119,16 @@ seastar::future<> ReplicatedBatchWriteRouter::write(VShardBatches groups) {
                     if (!committedHere.count(g->first))
                         failed[g->first] = g;
                 // Rejects are advisory: they carry the leader hint and the reason, and
-                // nothing else. A reject for a VShard outside the view is ignored.
+                // nothing else. A hint is accepted only for a VShard THIS target was
+                // actually asked about -- checking against the accumulated `failed` map
+                // would let a peer processed later inject a hint for a slice a DIFFERENT
+                // target failed, steering someone else's retry.
+                std::set<uint16_t> askedHere;
+                for (const auto* g : *pendingViews[i])
+                    askedHere.insert(g->first);
                 for (const auto& r : out.rejects) {
                     lastKind = r.kind;
-                    if (r.leaderHint != kNoNode && failed.count(r.vshard))
+                    if (r.leaderHint != kNoNode && askedHere.count(r.vshard))
                         nextHints[r.vshard] = r.leaderHint;
                 }
                 if (lastKind == WriteFailure::None)

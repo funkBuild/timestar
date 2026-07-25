@@ -5,7 +5,9 @@
 
 #include <cstdint>
 #include <map>
+#include <optional>
 #include <seastar/core/future.hh>
+#include <seastar/core/lowres_clock.hh>
 #include <seastar/core/semaphore.hh>
 #include <string>
 
@@ -35,6 +37,33 @@ public:
     // may or may not have committed, so the caller retries the whole idempotent
     // batch (LWW re-application is harmless; an un-acked write is never lost).
     seastar::future<bool> proposeAndAwaitApplied(std::string data);
+    // ... bounded by `deadline` (std::nullopt == unbounded, the overload above).
+    //
+    // WHY A WAITER NEEDS A DEADLINE AT ALL: the waiter is resolved by drainReady, and
+    // drainReady only runs when something drives this group. A leader that has LOST
+    // QUORUM -- two of three replicas down or partitioned -- keeps ticking but can never
+    // commit, and with checkQuorum off it never steps down either, so nothing ever
+    // resolves or fails the waiter. It suspends FOREVER. Every resource the caller holds
+    // for the duration (the coordinator's in-flight-byte charge, an inbound RPC slot)
+    // is held forever with it, and a between-attempts deadline one layer up cannot help:
+    // the attempt never returns to be timed out. RF=3 with two nodes down must FAIL the
+    // write, not hang -- that is the fail-closed contract.
+    //
+    // On expiry this throws seastar::timed_out_error. The outcome is genuinely AMBIGUOUS
+    // (the entry is appended here and a later quorum may still commit it), so callers
+    // must classify it as retryable-ambiguous, exactly like a transport failure; LWW
+    // re-application makes the retry harmless (see cluster/data/write_errors.hpp).
+    //
+    // The entry's waiter is deliberately LEFT in applyWaiters_ rather than erased:
+    // removing it would race drainReady, which walks and resolves that list under the
+    // group lock while this coroutine is suspended outside it. Instead the underlying
+    // future is kept alive by with_timeout and its result discarded, so a later apply
+    // resolves a promise that is still valid. Waiters that will never resolve are
+    // reclaimed when leadership is lost (releaseApplyWaiters fails them all), which is
+    // why the data plane also enables checkQuorum -- a partitioned leader steps down
+    // within an election timeout and drains them.
+    seastar::future<bool> proposeAndAwaitApplied(std::string data,
+                                                 std::optional<seastar::lowres_clock::time_point> deadline);
     seastar::future<> campaign();
     seastar::future<bool> proposeConfChange(std::vector<NodeId> voters, std::vector<NodeId> learners);
     seastar::future<> transferLeadership(NodeId target);

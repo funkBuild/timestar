@@ -85,7 +85,8 @@ public:
     //
     // A group this node does not HOST is reported as a hintless reject and NOTHING in
     // the view is proposed, preserving the atomic membership check of the bool overload.
-    seastar::future<data::ProposeOutcome> proposeVShardBatchesHinted(data::VShardBatchView view) override;
+    seastar::future<data::ProposeOutcome> proposeVShardBatchesHinted(data::VShardBatchView view,
+                                                                     data::OptDeadline deadline) override;
 
     // Compact this node's Raft log for `vshard` by snapshotting its FLUSHED data and
     // handing the payload to RaftGroup::compact (the M3 snapshot PRODUCER). Truncates

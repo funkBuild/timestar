@@ -44,15 +44,29 @@ assert_le "vshards_hosted on the coordinator" "$HOSTED" 3500
 
 # Drive leadership away from the placement primaries. Primaries do not move, so most
 # VShards end up led by someone other than their primary: the deposed state.
+TRANSFERS=0
 for _ in $(seq 1 10); do
     for p in $PORTS; do
-        curl -s -m5 -X POST "http://127.0.0.1:$p/cluster/rebalance-leadership?max=512" >/dev/null 2>&1
+        R=$(curl -s -m5 -X POST "http://127.0.0.1:$p/cluster/rebalance-leadership?max=512" 2>/dev/null)
+        N=$(printf '%s' "$R" | grep -o '"transfers_initiated":[0-9]*' | cut -d: -f2)
+        TRANSFERS=$((TRANSFERS + ${N:-0}))
     done
     sleep 1
 done
 sleep 3
-LEDS=""; for p in $PORTS; do LEDS="$LEDS $(status_field "$(cluster_status "$p")" vshards_led)"; done
-echo "  leadership after rebalance (fair share 819): [$LEDS]"
+LEDS=""; MINLED=999999
+for p in $PORTS; do
+    L=$(status_field "$(cluster_status "$p")" vshards_led)
+    LEDS="$LEDS ${L:-0}"
+    [ "${L:-0}" -lt "$MINLED" ] && MINLED=${L:-0}
+done
+echo "  leadership after rebalance (fair share 819): [$LEDS], $TRANSFERS transfers initiated"
+
+# ANTI-VACUITY. Without these, a run in which every rebalance call no-ops still reports
+# 300/300 and "passes" -- while never once routing a write at a DEPOSED primary, which is
+# the entire point of the gate. Leadership must actually have moved off the primaries.
+assert_ge "leadership transfers initiated" "$TRANSFERS" 400
+assert_ge "least-loaded node's leadership share (fair = 819)" "$MINLED" 490
 
 echo "=== $WRITES writes to node 1, against deposed primaries ==="
 BASE_TS=1700000000000000000

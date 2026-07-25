@@ -132,7 +132,8 @@ seastar::future<bool> ReplicatedVShardHost::proposeVShardBatches(data::VShardBat
     co_return allOk;
 }
 
-seastar::future<data::ProposeOutcome> ReplicatedVShardHost::proposeVShardBatchesHinted(data::VShardBatchView view) {
+seastar::future<data::ProposeOutcome> ReplicatedVShardHost::proposeVShardBatchesHinted(data::VShardBatchView view,
+                                                                                       data::OptDeadline deadline) {
     data::ProposeOutcome out;
     // Membership check for the WHOLE view BEFORE any replication (same contract as the
     // bool overload): a routing error rejects atomically rather than after some groups
@@ -167,7 +168,7 @@ seastar::future<data::ProposeOutcome> ReplicatedVShardHost::proposeVShardBatches
         // the variant would COPY the slice, which the pre-3b path avoided only by moving
         // it (and so losing it). The retry needs the groups kept, so the copy is removed
         // instead of paid.
-        pending.push_back(grp->proposeAndAwaitApplied(data::encodeWriteCommand(g->second)));
+        pending.push_back(grp->proposeAndAwaitApplied(data::encodeWriteCommand(g->second), deadline));
     }
 
     // Await EVERY proposal even after one fails -- abandoning an in-flight future would

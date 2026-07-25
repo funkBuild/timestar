@@ -487,7 +487,7 @@ inline seastar::future<data::ProposeOutcome> proposeSlicesToOwningShardsHinted(s
             // `pp` is captured BY VALUE: `p` is a reference parameter living in this
             // lambda's frame, and a `&p` capture would dangle the moment it returns.
             return seastar::do_with(std::move(b), [pp = &p](data::VShardBatches& groups) {
-                return pp->plane().host().proposeVShardBatchesHinted(data::viewOf(groups));
+                return pp->plane().host().proposeVShardBatchesHinted(data::viewOf(groups), std::nullopt);
             });
         }));
     }

@@ -175,7 +175,13 @@ public:
     //
     // The default copies and falls back to proposeVShardBatches, so a test double needs
     // no change; ReplicatedVShardHost overrides it to report per-group truth.
-    virtual seastar::future<ProposeOutcome> proposeVShardBatchesHinted(VShardBatchView view) {
+    // `deadline` bounds the propose (std::nullopt == unbounded). It is NOT optional in
+    // practice on the coordinator path: a locally-led VShard that has lost quorum can
+    // suspend a Raft waiter forever (see RaftGroup::proposeAndAwaitApplied), and the
+    // router's between-attempt deadline cannot rescue an attempt that never returns.
+    virtual seastar::future<ProposeOutcome> proposeVShardBatchesHinted(VShardBatchView view,
+                                                                       OptDeadline deadline = std::nullopt) {
+        (void)deadline;
         VShardBatches copy;
         std::vector<uint16_t> vshards;
         copy.reserve(view.size());
@@ -198,9 +204,13 @@ public:
     // The peer-ingress entry for the hinted verb: a forwarded batch arrives flat, so it
     // is split here and answered per VShard. The default splits and delegates; the
     // per-shard plane overrides it to fan the slices out to their owning shards.
+    // Peer INGRESS: the forwarding node bounds this call with its own RPC deadline, and
+    // the propose inherits no deadline here. Giving ingress its own bound belongs with
+    // the ingress admission work the plan defers (3d-scope).
     virtual seastar::future<ProposeOutcome> proposeBatchHinted(WriteBatch batch) {
-        return seastar::do_with(splitByVShard(std::move(batch)),
-                                [this](VShardBatches& groups) { return proposeVShardBatchesHinted(viewOf(groups)); });
+        return seastar::do_with(splitByVShard(std::move(batch)), [this](VShardBatches& groups) {
+            return proposeVShardBatchesHinted(viewOf(groups), std::nullopt);
+        });
     }
 };
 

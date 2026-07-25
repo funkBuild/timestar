@@ -171,3 +171,72 @@ TEST(WriteAdmissionTest, EveryAdvertiserOffersTheNewestSupportedWireVersion) {
     // The protocol step the hinted-propose verb is gated on must be the newest one.
     EXPECT_EQ(data::kWriteBatchFormatMax, data::kWriteBatchFormatV3);
 }
+
+// ... and the list of advertisers must be EXHAUSTIVE.
+//
+// Reading the value back from the two known advertisers cannot see a THIRD one appearing,
+// nor a setLocalVersion() call that overrides a correct initializer after start(). Both
+// are how the original bug would come back. So: enumerate every site in the tree that
+// declares or sets an advertised range, and require it to be one of the reviewed ones. A
+// new site fails this test and has to be added deliberately -- which is the point.
+TEST(WriteAdmissionTest, TheAdvertiserListIsExhaustive) {
+    auto readSource = [](const std::string& rel) {
+        for (const std::string& prefix : {"", "../", "../../", "../../../"}) {
+            std::ifstream in(prefix + rel);
+            if (in.good()) {
+                std::ostringstream ss;
+                ss << in.rdbuf();
+                return ss.str();
+            }
+        }
+        return std::string();
+    };
+    // (file, needle, why it is allowed to exist)
+    const std::vector<std::array<std::string, 2>> reviewed = {
+        // The two DEFAULTS, both of which must name kWriteBatchFormatMax.
+        {"lib/cluster/data/dataplane_rpc.cpp", "features::VersionRange localVersion{1, kWriteBatchFormatMax};"},
+        {"lib/cluster/integration/cluster_data_plane.hpp", "localVersion_{1, data::kWriteBatchFormatMax}"},
+        // The one PROPAGATION path: the node pushes its range to every per-shard
+        // transport. It forwards a value, it does not invent one.
+        {"lib/cluster/integration/cluster_data_plane.cpp", "rpc_->setLocalVersion(localVersion_)"},
+        {"lib/cluster/integration/shard_raft_plane.hpp", "rpc_->setLocalVersion(localVersion)"},
+    };
+    for (const auto& [file, needle] : reviewed) {
+        const std::string src = readSource(file);
+        ASSERT_FALSE(src.empty()) << "could not locate " << file;
+        EXPECT_NE(src.find(needle), std::string::npos)
+            << file << " no longer contains the reviewed advertiser/propagation: " << needle;
+    }
+
+    // Now the exhaustiveness half: no OTHER file may declare or set an advertised range.
+    const std::vector<std::string> allowed = {
+        "lib/cluster/data/dataplane_rpc.cpp", "lib/cluster/data/dataplane_rpc.hpp",
+        "lib/cluster/integration/cluster_data_plane.cpp", "lib/cluster/integration/cluster_data_plane.hpp",
+        "lib/cluster/integration/shard_raft_plane.hpp"};
+    for (const std::string& prefix : {"", "../", "../../", "../../../"}) {
+        if (!std::filesystem::exists(prefix + std::string("lib/cluster")))
+            continue;
+        std::vector<std::string> offenders;
+        for (auto& e : std::filesystem::recursive_directory_iterator(prefix + std::string("lib"))) {
+            if (!e.is_regular_file())
+                continue;
+            const std::string ext = e.path().extension().string();
+            if (ext != ".cpp" && ext != ".hpp")
+                continue;
+            std::string rel = e.path().string().substr(std::string(prefix).size());
+            std::ifstream in(e.path());
+            std::ostringstream ss;
+            ss << in.rdbuf();
+            const std::string body = ss.str();
+            const bool touches = body.find("setLocalVersion(") != std::string::npos ||
+                                 body.find("VersionRange localVersion") != std::string::npos;
+            if (touches && std::find(allowed.begin(), allowed.end(), rel) == allowed.end())
+                offenders.push_back(rel);
+        }
+        EXPECT_TRUE(offenders.empty())
+            << "a NEW wire-version advertiser appeared and was not reviewed: " << offenders.front()
+            << " -- add it to this list only after checking it advertises kWriteBatchFormatMax";
+        return;  // one prefix resolved; done
+    }
+    GTEST_SKIP() << "could not locate the lib tree from the test's working directory";
+}

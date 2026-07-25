@@ -176,6 +176,13 @@ seastar::future<> ClusterDataPlane::start(const ClusterConfig& cfg, seastar::sha
         ropts.heartbeatTimeout = 25;     // 500ms at the 20ms tick
         ropts.electionTimeoutMin = 125;  // 2.5s
         ropts.electionTimeoutMax = 250;  // 5s (randomized -> spreads campaigns)
+        // A leader that stops hearing from a majority STEPS DOWN within an election
+        // timeout. Without it a partitioned or quorum-less leader keeps believing it
+        // leads, keeps accepting proposals it can never commit, and never fails their
+        // waiters -- so every such write hangs until its own deadline and the applyWaiters
+        // list grows for as long as the partition lasts. It is the belt to the deadline's
+        // braces: the deadline bounds each write, this bounds the condition.
+        ropts.checkQuorum = true;
         {
             std::map<unsigned, std::vector<std::pair<uint16_t, std::vector<data::NodeId>>>> byShard;
             for (const auto& [vshard, voters] : rt_->localReplicaGroups())

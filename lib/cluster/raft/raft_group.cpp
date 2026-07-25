@@ -1,12 +1,13 @@
 #include "raft_group.hpp"
 
+#include "../../utils/logger.hpp"
+
 #include <algorithm>
 #include <optional>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/semaphore.hh>
+#include <seastar/core/with_timeout.hh>
 #include <stdexcept>
-
-#include "../../utils/logger.hpp"
 
 namespace timestar::raft {
 
@@ -191,6 +192,11 @@ seastar::future<> RaftGroup::waitApplied(LogIndex index) {
 }
 
 seastar::future<bool> RaftGroup::proposeAndAwaitApplied(std::string data) {
+    return proposeAndAwaitApplied(std::move(data), std::nullopt);
+}
+
+seastar::future<bool> RaftGroup::proposeAndAwaitApplied(std::string data,
+                                                        std::optional<seastar::lowres_clock::time_point> deadline) {
     const uint64_t tEnter = profileEnabled() ? nowNs() : 0;
     // Register the waiter INSIDE the lock (mirroring readBarrier): capture the
     // proposed entry's index and register its promise before any drainReady can
@@ -231,7 +237,11 @@ seastar::future<bool> RaftGroup::proposeAndAwaitApplied(std::string data) {
                                      });
     if (notLeader)
         co_return false;
-    const bool ok = co_await std::move(*fut);
+    // with_timeout does NOT cancel or abandon the inner future: it keeps it alive under a
+    // then_wrapped and discards the late result. That is exactly what is needed here --
+    // the waiter's promise stays registered in applyWaiters_ and a later apply resolves a
+    // promise that is still valid, instead of one destroyed out from under drainReady.
+    const bool ok = deadline ? co_await seastar::with_timeout(*deadline, std::move(*fut)) : co_await std::move(*fut);
     if (profileEnabled()) {
         g_prof.appliedNs += nowNs() - tEnter;
         ++g_prof.proposals;

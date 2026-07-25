@@ -56,6 +56,15 @@ constexpr uint64_t kNegotiateVersion = 9;   // sstring(u32 min,u32 max) -> sstri
 // carries the COMMITTED SET plus a LEADER HINT per rejected VShard:
 //     '1'  -> every slice committed
 //     '0' u16 committedCount {u16 vshard}* u16 rejectCount {u16 vshard u64 leader u8 kind}*
+// THE REPLY SHAPE IS NOW FROZEN UNDER v3. It was changed once after v3 was introduced
+// (the committed set was added to what had been a reject-only reply) WITHOUT a version
+// bump, and that was safe for exactly one reason: v3 has never been released -- no tag
+// contains the commit that introduced it, so no peer anywhere speaks the old shape. A
+// mixed-version cluster would NOT have failed closed on it: both shapes start with the
+// same '1'/'0' byte and the old decoder read the new reply's committed-count as its reject
+// count, which only happens to be rejected by the trailing-length arithmetic. That is luck,
+// not a mechanism. ANY further change to this reply requires a new negotiated version.
+//
 // It is a SEPARATE verb rather than a widened kProposeWrite reply because a reply shape
 // is chosen by the SERVER, which does not know which version it negotiated with the
 // caller (the handshake is cached client-side, per connection). An old client would

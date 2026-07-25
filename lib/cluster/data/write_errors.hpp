@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <exception>
+#include <seastar/core/timed_out_error.hh>
 #include <stdexcept>
 #include <string>
 
@@ -186,6 +187,12 @@ inline WriteFailure classifyLocalWriteFailure(const std::exception_ptr& e) {
         return WriteFailure::LeadershipLost;
     } catch (const ShardStoppingError&) {
         return WriteFailure::ShardStopping;
+    } catch (const seastar::timed_out_error&) {
+        // A Raft waiter that hit its deadline. AMBIGUOUS in the strongest sense: the entry
+        // is already appended locally and a later quorum may still commit it, so this is
+        // classified exactly like a transport failure and is safe to retry only because
+        // re-application is LWW-idempotent (see the audit above).
+        return WriteFailure::Transport;
     } catch (const WriteOverloadedError&) {
         return WriteFailure::Overloaded;
     } catch (const WriteFrameTooLargeError&) {

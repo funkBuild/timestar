@@ -92,7 +92,7 @@ public:
     seastar::future<bool> proposeBatch(WriteBatch) override {
         return seastar::make_exception_future<bool>(std::runtime_error("unused"));
     }
-    seastar::future<ProposeOutcome> proposeVShardBatchesHinted(VShardBatchView view) override {
+    seastar::future<ProposeOutcome> proposeVShardBatchesHinted(VShardBatchView view, OptDeadline) override {
         const unsigned attempt = ++attempts;
         std::vector<uint16_t> vs;
         for (const auto* g : view)
@@ -445,7 +445,7 @@ seastar::future<> testRejectsOutsideTheViewCannotAck() {
         seastar::future<bool> proposeBatch(WriteBatch) override {
             return seastar::make_exception_future<bool>(std::runtime_error("unused"));
         }
-        seastar::future<ProposeOutcome> proposeVShardBatchesHinted(VShardBatchView view) override {
+        seastar::future<ProposeOutcome> proposeVShardBatchesHinted(VShardBatchView view, OptDeadline) override {
             ++attempts;
             ProposeOutcome out;
             out.committed = false;
