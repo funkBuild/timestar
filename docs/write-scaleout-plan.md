@@ -1,7 +1,19 @@
 # Cluster Write Scale-Out Plan
 
-Status: Phases 1 and 2 IMPLEMENTED (2026-07-25); Phases 3-6 planned.
+Status: Phases 1, 2 and 3 IMPLEMENTED (2026-07-25); Phases 4-6 planned.
 Branch `cluster-design`.
+
+Phase 3 result: the availability phase, not a throughput phase — and it did not
+move throughput (median 4.98M vs Phase 2's 5.06M, flat within noise), which is
+the expected shape for work that changes what happens when routing is WRONG.
+What it changed is the answer a client gets: a deposed-but-alive primary went
+from ~29% HTTP 500 to 0, a 2216-transfer leadership rebalance under sustained
+writes now costs latency instead of errors, overload degrades to 503 +
+Retry-After instead of unbounded queueing, and every retryable cluster failure
+is a 503 naming its cause rather than an opaque 500. Ack-at-commit (3c) was
+measured and CLOSED — the commit→apply gap is 0.21 ms p50 against a 31 ms
+commit latency. The [D6] collapse window is narrowed but alive (1 rejected run
+in 9, against 2 in 6): Phase 4a is still required.
 
 Phase 1 result: RF=3 3.98M -> 4.55M pts/s (+14%), median batch latency 129ms -> 104ms,
 shard 0's RAFT_PROFILE outlier ratios cut 2-6x (persist 3.6x -> 2.06x, in_lock 17x ->
@@ -208,13 +220,26 @@ node-kill mid-bench (bounded errors, full catch-up) and kill -9 of the whole clu
     Idempotency makes the retry safe: revisions are stamped once at propose
     (log-index LWW), and a retried batch that already committed re-applies as
     a no-op overwrite.
-3c. **Evaluate ack-at-commit vs ack-at-apply**: `proposeAndAwaitApplied`
-    resolves waiters at APPLY; durability exists at COMMIT. Measure the gap
-    first (profiler apply stage) — only pursue if it is a real term, and only
-    with a documented read-your-writes story (session tokens ride
-    appliedIndex; leader reads already sit behind ReadIndex + apply barriers,
-    so linearizable reads stay correct either way). If the gap is small,
-    explicitly close this as not-worth-it.
+3c. **Evaluate ack-at-commit vs ack-at-apply**: **CLOSED — NOT WORTH IT, not
+    implemented.** `proposeAndAwaitApplied` resolves waiters at APPLY;
+    durability exists at COMMIT, so the theoretical saving is the commit→apply
+    gap. Measured on the canonical bench with `TIMESTAR_RAFT_PROFILE=1`
+    (3 nodes x 4 shards, 37 profile samples):
+
+    | quantity                                   | p50      | p95     | max     |
+    |--------------------------------------------|----------|---------|---------|
+    | commit latency per proposal (what a client waits) | 30.95 ms | 54.46 ms | 64.76 ms |
+    | **commit→apply gap (apply per drain)**     | **0.21 ms** | 1.63 ms | 1.81 ms |
+
+    The gap is **0.7% of the p50 a client actually waits** — far under the
+    ~5 ms bar. Note the profiler's raw `apply=` field is per-proposal-SAMPLED
+    but accumulates EVERY drain's apply work on that shard (6-60x more drains
+    than sampled proposals, including follower-role applies for groups the
+    shard replicates but does not lead), so it reads ~36% of commit latency and
+    is the wrong denominator; a single waiter's gap is one drain's apply, which
+    is the row above. Acking earlier would buy ~0.2 ms and cost the
+    read-your-writes story (session tokens ride `appliedIndex`), so it is
+    closed rather than deferred.
 3d. **Backpressure**: bounded in-flight bytes per shard on the data plane
     (the Raft send gate `8192` exists; the data plane has none) surfacing as
     HTTP 503, wired to the existing single-node 503 backpressure convention —
@@ -224,6 +249,52 @@ node-kill mid-bench (bounded errors, full catch-up) and kill -9 of the whole clu
 Gates: rolling leadership rebalance under sustained writes → zero client
 errors; deposed-primary test (transfer leadership away, no placement change,
 write must succeed via hint/retry).
+
+Gate outcomes (2026-07-25):
+
+- **Deposed primary — THE discriminating gate.** At RF=3 on THREE nodes every
+  node hosts every group, so the router's `LeaderResolver` always knows the
+  real leader locally and the stale-primary path is UNREACHABLE; a 3-node
+  rebalance storm passes on the pre-Phase-3 binary too. At RF=3 on FIVE nodes a
+  coordinator hosts only 2458 of 4096 VShards and falls back to the placement
+  primary for the rest, most of which are deposed once leadership balances.
+  300 writes to such a node: pre-Phase-3 **207-216/300 accepted (~29% HTTP
+  500)**; with 3a+3b **300/300, 0 5xx**. This gate is also what caught the
+  advertised-version bug (`b596f2d`) that left the whole hint path dead in
+  production with a green suite.
+- **Rolling rebalance under sustained writes:** node 3 joined a converged
+  2-node cluster (so nodes 1-2 held ~2048 leaderships each against a fair share
+  of 1365), then all three nodes were stormed with
+  `rebalance-leadership?max=512` for the whole bench. **2216 leadership
+  transfers initiated mid-bench, 600/600 requests OK, 0 HTTP errors**,
+  4.78 M pts/s, leadership converged to [1364 1368 1364]. (A first version of
+  this gate storming an ALREADY-balanced cluster was vacuous — the endpoint
+  only hands away leadership held above fair share, so it initiated zero
+  transfers. The script now records `transfers_initiated` and says so.)
+- **Backpressure:** at a deliberately small 2 MiB/shard budget, 24 connections
+  → 196/200 rejected with `503` + `Retry-After: 1` naming the budget
+  ("shard write buffer full (2080675 of 2097152 bytes in flight)"), **0 500s,
+  0 timeouts**; the same cluster at 4 connections → **200/200 OK at
+  4.26 M pts/s**, i.e. throughput recovers. At the 32 MiB default the canonical
+  bench never approaches the bound.
+- **Node kill mid-bench:** 277 OK / 23 bounded 503s (`last: transport`, after
+  the retry budget against a genuinely dead node), restart → full catch-up
+  (`peer_caught_up` == `vshards_led` on all three). **kill -9 of the whole
+  cluster:** 200/200 acked points readable on every node after restart.
+- **Canonical bench (9 runs, 8 accepted):** median **4.98 M pts/s**, p50
+  **93.5 ms** — Phase 2 was 5.06 M / 92 ms, i.e. flat within a run-to-run
+  spread of 4.33-5.13 M. **Rejected-run rate 1 in 9, against Phase 2's 2 in 6**:
+  3b's transport retry absorbs part of the [D6] window, but not all of it — the
+  one rejected run showed max latency 1471 ms, i.e. requests that burned the
+  full 1.5 s retry deadline and then failed. That is the deliberate trade: in a
+  real transport outage a write now blocks up to the deadline instead of
+  failing fast, so [D6] costs latency where it used to cost 500s. Phase 4a is
+  still required.
+- **Pre-existing bug found, NOT introduced here (for Phase 4):** 40 concurrent
+  1.3 MB `{"writes":[...]}` batches segfault every node (`si_addr 0x22` on one,
+  SI_KERNEL on another). Reproduces identically on the pre-Phase-3 binary
+  (8079fa6), so it is not Phase-3 fallout; it is the json-batch path under
+  burst concurrency and plausibly the same family as [D6].
 
 ### Phase 4 — HA hardening: kill the collapse window [D6]
 
