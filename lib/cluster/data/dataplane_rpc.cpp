@@ -218,7 +218,7 @@ struct DataPlaneRpc::Impl {
     ReadIndexSink* readIndexSink = nullptr;  // replica-read leader-reach target (M4)
     // Wire-version range this node supports (M6/X). The max is the newest WriteBatch
     // format this binary can WRITE; peers negotiate down to the highest both know.
-    features::VersionRange localVersion{1, kWriteBatchFormatV3};
+    features::VersionRange localVersion{1, kWriteBatchFormatMax};
     // Version agreed with each peer (kNegotiateVersion), cached per connection: a
     // handshake per peer, not per write. Dropped when a connection is retired, because
     // the peer may come back on a different binary.

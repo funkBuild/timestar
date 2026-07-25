@@ -7,6 +7,8 @@
 
 #include <gtest/gtest.h>
 
+#include <fstream>
+#include <sstream>
 #include <stdexcept>
 
 using namespace timestar;
@@ -124,4 +126,34 @@ TEST(WriteAdmissionTest, ResidentEstimateTracksThePayload) {
 
     data::VShardBatches groups = data::splitByVShard(floatBatch(20, 100));
     EXPECT_EQ(data::approxResidentBytes(data::viewOf(groups)), data::approxResidentBytes(floatBatch(20, 100)));
+}
+
+// A node must advertise the NEWEST wire version this binary supports, not a literal
+// that happened to be current when the line was written.
+//
+// This is a source-inspection test because the bug it guards is invisible to every
+// behavioural test: unit and socket tests build their own DataPlaneRpc (whose default
+// was already correct), while the PRODUCTION node advertises ClusterDataPlane's
+// localVersion_ -- which was still spelled kWriteBatchFormatV2 after v3 landed. Every
+// negotiation therefore capped at 2, no peer ever spoke the hinted-propose verb, and
+// the whole 3a leader-hint path was dead in production with a fully green suite. Only a
+// 5-node deposed-primary cluster run caught it.
+TEST(WriteAdmissionTest, NodeAdvertisesTheNewestSupportedWireVersion) {
+    auto readSource = [](const std::string& rel) {
+        for (const std::string& prefix : {"", "../", "../../", "../../../"}) {
+            std::ifstream in(prefix + rel);
+            if (in.good()) {
+                std::ostringstream ss;
+                ss << in.rdbuf();
+                return ss.str();
+            }
+        }
+        return std::string();
+    };
+    const std::string src = readSource("lib/cluster/integration/cluster_data_plane.hpp");
+    ASSERT_FALSE(src.empty()) << "could not locate cluster_data_plane.hpp";
+    EXPECT_NE(src.find("localVersion_{1, data::kWriteBatchFormatMax}"), std::string::npos)
+        << "ClusterDataPlane must advertise kWriteBatchFormatMax; pinning a literal version "
+           "silently disables every protocol step newer than it, cluster-wide";
+    EXPECT_EQ(data::kWriteBatchFormatMax, data::kWriteBatchFormatV3);
 }

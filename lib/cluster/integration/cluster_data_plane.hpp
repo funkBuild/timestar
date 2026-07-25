@@ -138,7 +138,14 @@ private:
     // in start(), so peers negotiate against the node's REAL capability; leaving it at
     // the VersionRange default {1,1} would pin the whole cluster to the v1 wire format
     // no matter what the binaries support.
-    features::VersionRange localVersion_{1, data::kWriteBatchFormatV2};
+    //
+    // It MUST track the newest version this binary supports, not a literal that happens
+    // to be current. Spelling v2 here after v3 landed silently capped every negotiation
+    // at 2, so no peer ever spoke the hinted-propose verb and the whole 3a leader-hint
+    // path was dead in production while every unit and socket test passed (they build
+    // their own DataPlaneRpc, whose own default was already v3). The 5-node
+    // deposed-primary gate is what caught it. Track kWriteBatchFormatMax.
+    features::VersionRange localVersion_{1, data::kWriteBatchFormatMax};
     // Declared in dependency order: deps before the router/coordinator that reference
     // them, so destruction (reverse order) tears the referrers down first.
     std::unique_ptr<data::VShardDirectory> dir_;

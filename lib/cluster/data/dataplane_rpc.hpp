@@ -104,7 +104,7 @@ public:
                            std::string expectedPeerName);
 
     // This node's supported wire-version range (rolling-upgrade / compatibility, M6/X).
-    // Defaults to {1, kWriteBatchFormatV2} -- everything this binary can read and
+    // Defaults to {1, kWriteBatchFormatMax} -- everything this binary can read and
     // write. Set before serving to narrow it (a test pinning an old peer's range).
     void setLocalVersion(features::VersionRange range);
 
