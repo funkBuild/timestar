@@ -45,11 +45,12 @@ namespace timestar::cluster {
 // The per-shard listen is NOT SO_REUSEPORT, despite what the surrounding comments used
 // to claim: this seastar hardcodes posix_reuseport_available() to false, so shard 0
 // owns the one real socket and each accepted fd is handed to the shard the listen
-// options name. The data-plane listener therefore asks for connection_distribution
-// (see DataPlaneRpc::start's perShardListener). The RAFT listener still pins itself
-// per shard, which means shard 0 accepts and reads ALL inbound Raft traffic -- latent,
-// pre-existing, and worth the same fix; it is safe there only because Raft's verb is
-// no_wait, so nothing hangs waiting on a reply.
+// options name. BOTH listeners therefore ask for connection_distribution (the
+// perShardListener flag on DataPlaneRpc::start and RaftRpcTransport::start). The Raft
+// listener used to pin itself per shard, so shard 0 accepted and read ALL inbound Raft
+// traffic and ran every peek/route hop while shards 1..N held accept promises that
+// never resolved -- invisible rather than fatal only because Raft's verb is no_wait, so
+// nothing hung waiting on a reply.
 
 // The shard that owns a VShard's Raft group.
 inline unsigned shardForVShard(uint16_t vshard) {
@@ -132,12 +133,14 @@ public:
     seastar::future<raft::LogIndex> leaderCommitIndex(uint16_t vshard) override;
 
     // Listen on the node's Raft port from THIS shard. Every shard calls listen() on the
-    // same address; envelopes are decoded on the shard owning the group. NOTE: this
-    // listener still pins itself (set_fixed_cpu inside RaftRpcTransport), so with
-    // reuseport disabled shard 0 in fact accepts and reads all inbound Raft traffic --
-    // see the file header.
+    // same address with connection_distribution, so accepted connections spread over
+    // the shards instead of piling onto shard 0 (reuseport is disabled here -- see the
+    // file header); envelopes are then decoded on the shard owning the group.
+    //
+    // The raw deliver hook is installed BEFORE listening: a connection accepted between
+    // start() and setRawDeliver would fall through to the no-op DeliverFn and drop its
+    // envelope (Raft would retry, but there is no reason to allow the window).
     seastar::future<> startTransport(seastar::socket_address local) {
-        co_await transport_->start(local, [](raft::Envelope) { return seastar::make_ready_future<>(); });
         transport_->setRawDeliver([this](uint16_t groupId, const char* bytes, size_t len) {
             const unsigned owner = shardForVShard(groupId);
             if (owner == seastar::this_shard_id())
@@ -148,6 +151,8 @@ public:
             return seastar::smp::submit_to(owner,
                                            [peers, bytes, len] { return peers->local().deliverDecoded(bytes, len); });
         });
+        co_await transport_->start(
+            local, [](raft::Envelope) { return seastar::make_ready_future<>(); }, /*perShardListener=*/true);
         co_return;
     }
 

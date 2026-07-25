@@ -30,7 +30,17 @@ public:
 
     // Begin serving on `local`; each decoded incoming envelope is handed to
     // `onDeliver` (which routes it to the addressed group on this core).
-    seastar::future<> start(seastar::socket_address local, DeliverFn onDeliver);
+    //
+    // `perShardListener` declares that EVERY shard starts an instance on this same
+    // address, exactly as DataPlaneRpc::start does. It selects where inbound
+    // connections are ACCEPTED: pinned to the starting shard (false -- a single
+    // instance must answer every connection itself) versus spread across shards
+    // (true). It is NOT SO_REUSEPORT: this seastar disables reuseport outright, so
+    // shard 0 owns the only socket and hands each accepted fd to the shard the listen
+    // options name. Passing false while every shard listens quietly keeps the node's
+    // whole inbound Raft ingress -- accept, read, and the peek/route hop -- on one
+    // core. See listenServer() in the .cpp.
+    seastar::future<> start(seastar::socket_address local, DeliverFn onDeliver, bool perShardListener = false);
     // Optional: when set, takes precedence over the DeliverFn given to start().
     // The node's single Raft listener lives on one shard, so decoding every inbound
     // AppendEntries there made that shard the bottleneck (a follower's shard 0 showed

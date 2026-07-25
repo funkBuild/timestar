@@ -120,7 +120,8 @@ void RaftRpcTransport::addPeer(NodeId id, seastar::socket_address addr) {
     impl_->peers[id] = addr;
 }
 
-seastar::future<> RaftRpcTransport::start(seastar::socket_address local, DeliverFn onDeliver) {
+seastar::future<> RaftRpcTransport::start(seastar::socket_address local, DeliverFn onDeliver,
+                                          bool perShardListener) {
     impl_->onDeliver = std::move(onDeliver);
     // A no_wait handler: the sender never awaits a reply (Raft is fire-and-forget
     // and retries via heartbeats), so a send to a slow/dead peer can never block
@@ -145,10 +146,13 @@ seastar::future<> RaftRpcTransport::start(seastar::socket_address local, Deliver
                 co_await impl_->onDeliver(std::move(*env));
             co_return seastar::rpc::no_wait;
         });
-    // Pin the listening socket to THIS shard. The Raft server and its group registry
-    // live on one shard, but seastar's default accept policy scatters incoming
-    // connections across ALL shards -- a connection accepted on a shard with no server
-    // behind it has its messages silently discarded forever.
+    // Where inbound connections are accepted.
+    //
+    // `perShardListener == false` (a single instance, on one shard) PINS the listening
+    // socket to THIS shard. The Raft server and its group registry live on one shard,
+    // but seastar's default accept policy scatters incoming connections across ALL
+    // shards -- a connection accepted on a shard with no server behind it has its
+    // messages silently discarded forever.
     //
     // This verb is no_wait, so the SENDER never hangs; the failure is invisible and
     // ASYMMETRIC. Observed: node 1 (leader of all 4096 groups) saw node 2 caught up on
@@ -157,9 +161,23 @@ seastar::future<> RaftRpcTransport::start(seastar::socket_address local, Deliver
     // TimeoutNow (RaftNode::transferLeadership only sends it to a caught-up target).
     // Which peer is affected is per-connection luck, which is why it looks like one
     // "bad" node.
+    //
+    // `perShardListener == true` means EVERY shard has started an instance on this
+    // address (ShardRaftPlane), so any shard can answer and pinning is exactly wrong:
+    // reuseport is disabled in this seastar, so shard 0 owns the one real socket and
+    // set_fixed_cpu(this_shard_id()) makes it hand EVERY accepted fd to shard 0 --
+    // shards 1..N sit on accept promises that never resolve while shard 0 reads all
+    // inbound Raft traffic and runs every peek/route hop. connection_distribution
+    // spreads the accepted fds instead. Safe for any handler here because the raw
+    // deliver path already routes each envelope to the shard owning its group (the
+    // group id is peeked from the frame), and this transport registers exactly one
+    // verb, which is no_wait -- there is no reply routing to get wrong.
     seastar::listen_options lo;
     lo.reuse_address = true;
-    lo.set_fixed_cpu(seastar::this_shard_id());
+    if (perShardListener)
+        lo.lba = seastar::server_socket::load_balancing_algorithm::connection_distribution;
+    else
+        lo.set_fixed_cpu(seastar::this_shard_id());
     impl_->server = std::make_unique<seastar::rpc::protocol<RaftSerializer>::server>(
         impl_->proto, seastar::listen(local, lo));
     return seastar::make_ready_future<>();
