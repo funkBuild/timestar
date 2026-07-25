@@ -2,6 +2,7 @@
 
 #include "../../core/placement_table.hpp"  // virtualShard
 #include "../../utils/logger.hpp"
+#include "../reconnect_policy.hpp"  // jitteredDelay
 
 #include <algorithm>
 #include <map>
@@ -46,6 +47,15 @@ seastar::future<> ReplicatedBatchWriteRouter::write(VShardBatches groups) {
     WriteFailure lastKind = WriteFailure::None;
 
     for (unsigned attempt = 1;; ++attempt) {
+        // The pause BEFORE the next attempt, chosen by the failure classes this attempt
+        // actually saw (write-scaleout 4a). Taking the MAXIMUM over the classes matters
+        // for a mixed batch: if any slice failed on the transport, the whole retry must
+        // wait out the reconnect window, or that slice burns the budget fast-failing on a
+        // dead client while the not-leader slices are the only ones making progress.
+        std::chrono::milliseconds retryDelay{0};
+        auto noteKind = [&retryDelay, attempt](WriteFailure k) {
+            retryDelay = std::max(retryDelay, writeFailureRetryDelay(k, attempt));
+        };
         // Bucket the outstanding groups by the leader NODE we now believe leads them:
         // a hint from a reject wins; else this node's live Raft view; else the placement
         // primary (which a stale primary answers with the real leader, closing the loop).
@@ -128,11 +138,15 @@ seastar::future<> ReplicatedBatchWriteRouter::write(VShardBatches groups) {
                     askedHere.insert(g->first);
                 for (const auto& r : out.rejects) {
                     lastKind = r.kind;
+                    noteKind(r.kind);
                     if (r.leaderHint != kNoNode && askedHere.count(r.vshard))
                         nextHints[r.vshard] = r.leaderHint;
                 }
                 if (lastKind == WriteFailure::None)
                     lastKind = WriteFailure::NotLeader;
+                // A target that named no reason at all is treated as a plain not-leader:
+                // the slices are uncommitted and the retry goes elsewhere immediately.
+                noteKind(WriteFailure::NotLeader);
             } catch (...) {
                 const auto kind = isLocal ? classifyLocalWriteFailure(std::current_exception())
                                           : classifyRemoteWriteFailure(std::current_exception());
@@ -145,6 +159,7 @@ seastar::future<> ReplicatedBatchWriteRouter::write(VShardBatches groups) {
                     continue;
                 }
                 lastKind = kind;
+                noteKind(kind);
                 for (const auto* g : *pendingViews[i])
                     failed[g->first] = g;
             }
@@ -165,7 +180,11 @@ seastar::future<> ReplicatedBatchWriteRouter::write(VShardBatches groups) {
         for (const auto& [vs, g] : failed)
             outstanding.push_back(g);
         hints = std::move(nextHints);
-        co_await seastar::sleep(kRetryDelay);
+        // Jittered so that N concurrent batches (and, at RF=3, N shards x N peers) do not
+        // all re-dial the same peer on the same 20/40/80 ms grid -- the write-side half of
+        // the reconnect thundering herd 4b jitters on the transport side.
+        co_await seastar::sleep(
+            cluster::jitteredDelay(retryDelay <= std::chrono::milliseconds(0) ? kRetryDelay : retryDelay, 25));
     }
 }
 

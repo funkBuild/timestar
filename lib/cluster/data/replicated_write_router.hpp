@@ -52,7 +52,14 @@ public:
     // converts the transfer window into a latency bump; a genuinely dead peer still fails
     // the write inside the deadline, and fail-closed is preserved.
     static constexpr unsigned kMaxAttempts = 6;  // 1 initial + 5 retries
-    static constexpr auto kRetryDelay = std::chrono::milliseconds(20);
+    // The pause between attempts is no longer a single number: it is chosen per failure
+    // CLASS by `writeFailureRetryDelay` (write_errors.hpp, write-scaleout 4a), because a
+    // stale leader and a dead connection want opposite pacing. A NotLeader retry goes to a
+    // different node and wants to be immediate; a Transport failure must OUTLAST the
+    // transport's own reconnect backoff or every attempt fast-fails on the same dead
+    // client. `kRetryDelay` is what the leader-shaped classes still use, and remains the
+    // base the geometric schedule grows from.
+    static constexpr auto kRetryDelay = kWriteRetryDelayBase;
     static constexpr auto kDeadline = std::chrono::milliseconds(1500);
     // Per-ATTEMPT bound, pushed down into the RPC itself (write-scaleout 3f). The overall
     // deadline alone is not enough: it is only checked BETWEEN attempts, so an attempt

@@ -1,7 +1,10 @@
 #pragma once
 
-#include "../raft/raft_types.hpp"  // NodeId, kNoNode, LeadershipLostError
+#include "../raft/raft_types.hpp"   // NodeId, kNoNode, LeadershipLostError
+#include "../reconnect_policy.hpp"  // kReconnectBackoff -- the window the pacing must span
 
+#include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <exception>
 #include <seastar/core/timed_out_error.hh>
@@ -95,6 +98,74 @@ constexpr bool isRetryableWriteFailure(WriteFailure f) {
     }
     return false;
 }
+
+// ---------------------------------------------------------------------------
+// The retry PACING table (write-scaleout 4a). This is the extension the enum was built
+// for: not every retryable class wants the same delay, and one of them is coupled to a
+// constant in the TRANSPORT.
+//
+// THE BUG THIS FIXES. `DataPlaneRpc::clientFor` hands back the DEAD client for
+// `cluster::kReconnectBackoff` (200 ms) after a connection dies -- a deliberate fast-fail
+// so a burst of writes to a down peer costs one dial, not one per write. The Phase-3b
+// retry loop paused a flat 20 ms between attempts, so its whole budget (5 pauses = 100 ms)
+// fit INSIDE that one window: all six attempts fast-failed against the same dead
+// connection, the transport was never asked to re-dial, and a 200 ms TCP blip became a
+// client-visible 5xx even though the peer was healthy the whole time. That is [D6]: the
+// retry existed but could not reach the thing it was retrying.
+//
+// THE FIX. `Transport` (and `Overloaded`, whose cure is also "wait for something to
+// drain") back off geometrically from the same 20 ms base, capped, so the five pauses span
+// ~620 ms -- crossing the reconnect window about three times inside the 1.5 s write
+// deadline, and giving the peer's own listener time to come back. The static_assert below
+// pins that relationship, so shortening the schedule or lengthening the backoff cannot
+// silently re-create the bug.
+//
+// The OTHER classes keep the flat 20 ms on purpose. A `NotLeader` retry goes to a
+// DIFFERENT node (the hint from 3a), so nothing about waiting longer helps; a leadership
+// transfer completes in single-digit milliseconds, and backing off would turn every
+// routine rebalance into hundreds of milliseconds of added p99 for no availability gain.
+// Same for `ShardStopping`: the slice is re-routed, not re-dialed.
+inline constexpr std::chrono::milliseconds kWriteRetryDelayBase{20};
+inline constexpr std::chrono::milliseconds kWriteRetryDelayMax{320};
+
+// Delay before retry number `attempt`+1, given what the previous attempt failed with.
+// `attempt` is 1-based (the attempt that just failed).
+constexpr std::chrono::milliseconds writeFailureRetryDelay(WriteFailure f, unsigned attempt) {
+    switch (f) {
+        case WriteFailure::Transport:
+        case WriteFailure::Overloaded: {
+            // Geometric from the base: 20, 40, 80, 160, 320, 320...
+            int64_t ms = kWriteRetryDelayBase.count();
+            for (unsigned i = 1; i < attempt && ms < kWriteRetryDelayMax.count(); ++i)
+                ms *= 2;
+            return std::chrono::milliseconds(ms < kWriteRetryDelayMax.count() ? ms : kWriteRetryDelayMax.count());
+        }
+        case WriteFailure::None:
+        case WriteFailure::NotLeader:
+        case WriteFailure::LeadershipLost:
+        case WriteFailure::ShardStopping:
+        case WriteFailure::Unassigned:
+        case WriteFailure::Fatal:
+            break;
+    }
+    return kWriteRetryDelayBase;
+}
+
+// Total time the pauses of a full `attempts`-attempt budget cover for class `f`, ignoring
+// the attempts themselves (which fast-fail on a dead connection -- that is the whole
+// problem). Used by the static_assert below and by the test that pins it.
+constexpr std::chrono::milliseconds writeRetryScheduleSpan(WriteFailure f, unsigned attempts) {
+    int64_t total = 0;
+    for (unsigned a = 1; a < attempts; ++a)
+        total += writeFailureRetryDelay(f, a).count();
+    return std::chrono::milliseconds(total);
+}
+
+// The coupling, checked by the compiler rather than by comment: six attempts' worth of
+// Transport pauses must outlast the transport's reconnect window with room for more than
+// one re-dial, or a blip is once again retried entirely against a dead client.
+static_assert(writeRetryScheduleSpan(WriteFailure::Transport, 6) > 2 * cluster::kReconnectBackoff,
+              "the write retry schedule must span several transport reconnect windows [write-scaleout 4a]");
 
 // Whether the slice's outcome is UNKNOWN (the proposal may have committed). Recorded
 // for the audit above and for reporting; it does not change the policy, because a

@@ -5,6 +5,7 @@
 // ack. In-memory doubles (no sockets/Raft).
 #include "../../../lib/cluster/data/replicated_write_router.hpp"
 
+#include "../../../lib/cluster/reconnect_policy.hpp"
 #include "../../../lib/core/placement_table.hpp"
 #include "../../../lib/utils/series_key.hpp"
 
@@ -524,7 +525,113 @@ seastar::future<> testRemoteAttemptsCarryADeadline() {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// write-scaleout 4a: the retry schedule must OUTLAST the transport's reconnect backoff.
+//
+// `DataPlaneRpc::clientFor` hands back the DEAD client for `cluster::kReconnectBackoff`
+// after a connection dies, so every attempt inside that window fast-fails on the same
+// dead socket without the transport ever being asked to re-dial. With the pre-4a flat
+// 20 ms pause the whole 6-attempt budget (5 x 20 = 100 ms) fitted INSIDE one 200 ms
+// window: the retry loop existed but could not reach the thing it was retrying, and a
+// TCP blip against a healthy peer became a client 5xx. [D6]
+//
+// This transport models exactly that: it throws for the first `blip` of wall-clock time
+// and commits after. It is failing PURELY on elapsed time, so it measures the schedule.
+class BlipTransport : public NodeTransport {
+public:
+    std::chrono::milliseconds blip{0};
+    seastar::lowres_clock::time_point start;
+    unsigned attempts = 0;
+
+    seastar::future<> forwardWriteBatch(NodeId, WriteBatch) override { return seastar::make_ready_future<>(); }
+    seastar::future<NodeQueryPartial> queryNode(NodeId, NodeQueryRequest) override {
+        return seastar::make_exception_future<NodeQueryPartial>(std::runtime_error("unused"));
+    }
+    seastar::future<ProposeOutcome> proposeWriteHinted(NodeId, VShardBatchView view, OptDeadline) override {
+        ++attempts;
+        if (seastar::lowres_clock::now() < start + blip)
+            return seastar::make_exception_future<ProposeOutcome>(std::runtime_error("connection is closed"));
+        ProposeOutcome out;
+        for (const auto* g : view)
+            out.committedVShards.push_back(g->first);
+        out.committed = true;
+        return seastar::make_ready_future<ProposeOutcome>(std::move(out));
+    }
+};
+
+seastar::future<> testBlipLongerThanTheBackoffIsAbsorbed() {
+    VShardDirectory dir(1, rf3Map(3));
+    BlipTransport client;
+    // A blip strictly LONGER than one reconnect window. Under the pre-4a flat schedule
+    // the six attempts are all spent before this elapses and the write fails.
+    client.blip = timestar::cluster::kReconnectBackoff + std::chrono::milliseconds(60);
+    client.start = seastar::lowres_clock::now();
+    ScriptedLocalSink local;
+    MapLeaderResolver leaders;
+    ReplicatedBatchWriteRouter router(dir, local, client, leaders);
+
+    // Must NOT throw: a transient reset resolves inside the write deadline.
+    co_await router.write(manySeries(60));
+    EXPECT_GT(client.attempts, 1u) << "the blip must actually have been retried";
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(seastar::lowres_clock::now() -
+                                                                              client.start);
+    EXPECT_LE(elapsed.count(),
+              std::chrono::duration_cast<std::chrono::milliseconds>(ReplicatedBatchWriteRouter::kDeadline).count())
+        << "absorbing the blip must still respect the write deadline";
+}
+
 }  // namespace
+
+// The pacing table itself, checked as arithmetic rather than by running the clock. This is
+// the invariant that makes the behavioural test above possible; if someone shortens the
+// schedule or lengthens the transport backoff, THIS is what says so.
+TEST(WriteRetryPacingTest, TransportScheduleOutlastsTheReconnectBackoff) {
+    using namespace timestar::data;
+    const auto span = writeRetryScheduleSpan(WriteFailure::Transport, ReplicatedBatchWriteRouter::kMaxAttempts);
+    EXPECT_GT(span.count(), 2 * timestar::cluster::kReconnectBackoff.count())
+        << "a full retry budget must cover several reconnect windows, or every attempt "
+        << "fast-fails on the same dead client (write-scaleout 4a / [D6])";
+    EXPECT_LT(span.count(),
+              std::chrono::duration_cast<std::chrono::milliseconds>(ReplicatedBatchWriteRouter::kDeadline).count())
+        << "the pauses alone must not exhaust the write deadline -- the attempts need room too";
+    // The pre-4a schedule, stated so the regression is legible: a FLAT base delay on every
+    // attempt covers (kMaxAttempts-1) x 20 ms = 100 ms, which is HALF a reconnect window.
+    // That is the whole of [D6] in one line of arithmetic.
+    const auto flatSpan = kWriteRetryDelayBase * (ReplicatedBatchWriteRouter::kMaxAttempts - 1);
+    EXPECT_LT(flatSpan.count(), timestar::cluster::kReconnectBackoff.count())
+        << "sanity: the flat schedule this replaced really did fit inside one backoff window";
+}
+
+TEST(WriteRetryPacingTest, LeaderShapedFailuresStayFast) {
+    using namespace timestar::data;
+    // A not-leader retry goes to a DIFFERENT node; backing off would add hundreds of ms of
+    // p99 to every routine leadership transfer for no availability gain.
+    for (unsigned a = 1; a <= ReplicatedBatchWriteRouter::kMaxAttempts; ++a) {
+        EXPECT_EQ(writeFailureRetryDelay(WriteFailure::NotLeader, a), kWriteRetryDelayBase);
+        EXPECT_EQ(writeFailureRetryDelay(WriteFailure::LeadershipLost, a), kWriteRetryDelayBase);
+        EXPECT_EQ(writeFailureRetryDelay(WriteFailure::ShardStopping, a), kWriteRetryDelayBase);
+    }
+    // ... while transport-shaped ones grow, and are capped.
+    EXPECT_EQ(writeFailureRetryDelay(WriteFailure::Transport, 1), kWriteRetryDelayBase);
+    EXPECT_GT(writeFailureRetryDelay(WriteFailure::Transport, 3), writeFailureRetryDelay(WriteFailure::Transport, 1));
+    EXPECT_EQ(writeFailureRetryDelay(WriteFailure::Transport, 99), kWriteRetryDelayMax);
+}
+
+TEST(WriteRetryPacingTest, AmbiguityTaxonomyIsUnchangedByThePacing) {
+    using namespace timestar::data;
+    // 4a changes WHEN a class is retried, never WHETHER. The 3b taxonomy is the contract.
+    EXPECT_TRUE(isRetryableWriteFailure(WriteFailure::Transport));
+    EXPECT_TRUE(isRetryableWriteFailure(WriteFailure::LeadershipLost));
+    EXPECT_TRUE(isAmbiguousWriteFailure(WriteFailure::Transport));
+    EXPECT_TRUE(isAmbiguousWriteFailure(WriteFailure::LeadershipLost));
+    EXPECT_FALSE(isRetryableWriteFailure(WriteFailure::Unassigned));
+    EXPECT_FALSE(isRetryableWriteFailure(WriteFailure::Fatal));
+}
+
+TEST(ReplicatedBatchWriteRouterTest, BlipLongerThanTheReconnectBackoffIsAbsorbed) {
+    testBlipLongerThanTheBackoffIsAbsorbed().get();
+}
 
 TEST(ReplicatedBatchWriteRouterTest, RemoteAttemptsCarryADeadline) {
     testRemoteAttemptsCarryADeadline().get();
