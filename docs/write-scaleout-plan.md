@@ -1,6 +1,6 @@
 # Cluster Write Scale-Out Plan
 
-Status: Phase 1 IMPLEMENTED (1a/1b/1c, 2026-07-25); Phases 2-6 planned.
+Status: Phases 1 and 2 IMPLEMENTED (2026-07-25); Phases 3-6 planned.
 Branch `cluster-design`.
 
 Phase 1 result: RF=3 3.98M -> 4.55M pts/s (+14%), median batch latency 129ms -> 104ms,
@@ -11,6 +11,32 @@ the remaining levers are Phase 2 (route/copy/encode once) and the Raft listener,
 has the same non-distributing-listener defect Phase 1b fixed for the data plane (see
 below). The write-collapse HTTP 500 bursts [D6] reproduce identically on the
 pre-Phase-1 binary and remain for Phase 4.
+
+Phase 2 result: RF=3 4.55-4.61M -> **5.03-5.09M pts/s** (median of 4 accepted runs
+5.06M, +10%), median batch latency 102ms -> **92ms**. **The shard-0 profile outlier is
+GONE**: in_lock 2.79x -> 1.09x, apply 2.39x -> 1.00x, persist 2.06x -> 0.82x, commit
+1.62x -> 1.03x of the other shards -- the "within ~2x" gate now passes on every stage,
+and the single lever that did it was 2-pre (the Raft listener, the last funnel onto
+shard 0). 2a/2b (hash once, split once) and 2c (bulk codec) each measured flat within
+run-to-run noise, which is the expected shape of a system that is NOT CPU-bound (§1):
+they remove real work from the critical path but the limiter is elsewhere.
+
+Phase 2 did NOT reach 5.5M, and p50 is 92ms against the 60ms target. With shard 0 no
+longer an outlier and CPU still ~80% idle, the remaining wait is the quorum round
+itself and the ack path -- i.e. Phase 3 (leader hints, bounded retry, ack-at-commit
+evaluation, backpressure) and Phase 5b (per-shard fsync coalescing, disk-only), not
+more routing surgery. The [D6] collapse window is still live: 2 of 6 canonical runs
+took 2-3 HTTP 500s (Phase 4).
+
+Codec status after 2c: `decodeWriteBatch` reads both v1 and the new v2 (delta-varint
+timestamps) forever; the DATA-PLANE wire emits the version negotiated with each peer,
+but the RAFT command path -- and hence the journal -- still emits v1 unconditionally,
+because a log entry is replicated to voters that never take part in the pairwise
+data-plane handshake. Raising it needs the cluster-wide gate group-0's committed format
+activation (`activeFormatVersion` / `features::FeatureGate`) already provides; wiring
+that to the codec is the one piece of 2c left open, and until then no v2 byte can reach
+a journal. Journal back-compat was gate-proven end to end (old binary writes, kill -9,
+restart on the new binary, all data readable, zero undecodable entries).
 
 Correction to a premise used in §4-1b and in commit b98c1d1: this seastar hardcodes
 `posix_reuseport_available() { return false; }`, so "every shard listens on the port
@@ -127,9 +153,16 @@ persist/in_lock/apply within ~2x of other shards; connection-scaling probe
 (latency must flatten); RF=3 node-kill mid-bench gate (no loss / no dup);
 "400 OK, 0 HTTP errors" rule on every accepted number.
 
-### Phase 2 — Route once, copy once, encode once
+### Phase 2 — Route once, copy once, encode once  [IMPLEMENTED]
 
 Target: cut per-batch critical-path latency; RF=3 p50 @ conns=8 ≤ 60 ms.
+
+2-pre. **Raft listener distribution** (found while implementing Phase 1, fixed here):
+    `RaftRpcTransport` pinned its listener per shard, so with reuseport disabled shard
+    0 accepted and read ALL inbound Raft traffic and ran every peek/route hop while
+    shards 1..N held accept promises that never resolved. Same fix as 1b
+    (`connection_distribution`), gated on the same `perShardListener` flag so the
+    single-instance users keep the pin. THIS is what closed the shard-0 profile gap.
 
 2a. **Hash once** [D3]: compute `SeriesId128`/`virtualShard` at HTTP parse and
     carry `vshard` on the series ref; every later grouping becomes an integer
@@ -148,6 +181,18 @@ Target: cut per-batch critical-path latency; RF=3 p50 @ conns=8 ≤ 60 ms.
 Gates: byte-equal apply results vs old codec (round-trip test per value
 type, NaN/±Inf/-0.0 included); RAFT_PROFILE in_lock; mixed-version
 fail-closed test.
+
+Gate outcomes: v1 encoding proven BYTE-IDENTICAL to the preserved pre-2c writer
+(the contract that makes it safe to touch a path whose output is already on disk);
+round-trip per type in both formats incl. NaN/±Inf/-0.0/int64 extremes/non-monotone
+timestamps; legacy bytes decode on the new reader; socket test proving a forwarded
+write speaks the negotiated version (v2 with a current peer, v1 with a peer pinned
+to {1,1}, fail-closed with NOTHING applied against a peer with no overlapping
+range); live journal back-compat (write on 8514eca at RF=3 incl. 2M bench points,
+kill -9 all three, restart on the Phase-2 binary -> 200/200 points readable on every
+node, 0 undecodable/fail-stop entries); RAFT_PROFILE within 1.1x on every stage;
+node-kill mid-bench (bounded errors, full catch-up) and kill -9 of the whole cluster
+(all acked writes survive).
 
 ### Phase 3 — Ack path and retry semantics (latency + availability)
 
