@@ -1,3 +1,4 @@
+#include "../../utils/logger.hpp"
 #include "dataplane_rpc.hpp"
 
 #include "dataplane_codec.hpp"
@@ -278,13 +279,39 @@ seastar::future<> DataPlaneRpc::start(seastar::socket_address local, NodeStore& 
                 std::runtime_error("dataplane: malformed write batch"));
         return impl_->nodeSink->applyWrites(std::move(*batch)).then([] { return seastar::sstring("k"); });
     });
+    // TEMPORARY: TIMESTAR_QUERY_PROFILE=1 reports encode/decode cost and wire size of
+    // query partials. ~375ms of a 476ms grouped cluster query is unaccounted for by
+    // the leader-side and merge profilers, leaving exactly this hop.
     impl_->proto.register_handler(kQueryNode, [this](seastar::sstring data) {
         auto req = decodeNodeQueryRequest(std::string(data.data(), data.size()));
         if (!req)
             return seastar::make_exception_future<seastar::sstring>(
                 std::runtime_error("dataplane: malformed node query request"));
         return impl_->nodeSink->queryLocal(std::move(*req)).then([](NodeQueryPartial part) {
+            const bool prof = [] {
+                static const bool on = [] {
+                    const char* e = std::getenv("TIMESTAR_QUERY_PROFILE");
+                    return e && e[0] == '1';
+                }();
+                return on;
+            }();
+            const auto t0 = std::chrono::high_resolution_clock::now();
             std::string enc = encodeNodeQueryPartial(part);
+            if (prof) {
+                size_t pts = 0, nStates = 0, nRaw = 0, nBucket = 0;
+                for (const auto& pr : part.partials) {
+                    pts += pr.sortedTimestamps.size() + pr.bucketStates.size();
+                    nStates += pr.sortedStates.size();
+                    nRaw += pr.sortedValues.size();
+                    nBucket += pr.bucketStates.size();
+                }
+                timestar::http_log.info(
+                    "[WIRE_PROFILE] encode partial: {} partials {} pts (states={} rawvals={} buckets={}, "
+                    "sizeof(AggregationState)={}) -> {} bytes ({:.1f} B/pt) in {:.1f}ms",
+                    part.partials.size(), pts, nStates, nRaw, nBucket, sizeof(timestar::AggregationState), enc.size(),
+                    pts ? static_cast<double>(enc.size()) / static_cast<double>(pts) : 0.0,
+                    std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t0).count());
+            }
             return seastar::sstring(enc.data(), enc.size());
         });
     });
@@ -464,8 +491,25 @@ seastar::future<NodeQueryPartial> DataPlaneRpc::queryNode(NodeId to, NodeQueryRe
     if (!conn)
         throw std::runtime_error("dataplane: unknown peer");
     std::string bytes = encodeNodeQueryRequest(req);
+    const bool prof = [] {
+        static const bool on = [] {
+            const char* e = std::getenv("TIMESTAR_QUERY_PROFILE");
+            return e && e[0] == '1';
+        }();
+        return on;
+    }();
+    const auto tRpc0 = std::chrono::high_resolution_clock::now();
     seastar::sstring reply = co_await impl_->queryNodeStub(*conn, seastar::sstring(bytes.data(), bytes.size()));
+    const double rpcMs =
+        std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - tRpc0).count();
+    const auto tDec0 = std::chrono::high_resolution_clock::now();
     auto part = decodeNodeQueryPartial(std::string(reply.data(), reply.size()));
+    if (prof) {
+        timestar::http_log.info(
+            "[WIRE_PROFILE] queryNode(node {}): rpc_roundtrip={:.1f}ms reply={} bytes decode={:.1f}ms", to, rpcMs,
+            reply.size(),
+            std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - tDec0).count());
+    }
     if (!part)
         throw std::runtime_error("dataplane: malformed node query partial");
     co_return std::move(*part);
