@@ -2119,6 +2119,22 @@ seastar::future<std::optional<QueryResponse>> HttpQueryHandler::finalizeSingleSh
 // builds the response series.  Fills `response` in place and returns
 // std::nullopt on success; returns a complete error QueryResponse when a
 // limit was exceeded (the caller returns it as-is).
+// TEMPORARY query-merge profiling, enabled with TIMESTAR_QUERY_PROFILE=1. Values are
+// plain locals of this coroutine -- never pass references into a continuation, see the
+// dangling-frame segfault noted in raft_group.cpp.
+namespace {
+bool queryProfileEnabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("TIMESTAR_QUERY_PROFILE");
+        return e && e[0] == '1';
+    }();
+    return on;
+}
+inline double msSince(std::chrono::high_resolution_clock::time_point t) {
+    return std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t).count();
+}
+}  // namespace
+
 seastar::future<std::optional<QueryResponse>> HttpQueryHandler::finalizeMultiShardResponse(
     const QueryRequest& request, std::vector<std::pair<unsigned, ShardQueryResult>>& shardResults,
     QueryTimingInfo& timing, QueryResponse& response) {
@@ -2189,6 +2205,11 @@ seastar::future<std::optional<QueryResponse>> HttpQueryHandler::finalizeMultiSha
     // Build field filter set once, shared by both numeric and string result paths
     std::unordered_set<std::string> requestedFieldSet(request.fields.begin(), request.fields.end());
 
+    const bool qprof = queryProfileEnabled();
+    const auto tProf0 = std::chrono::high_resolution_clock::now();
+    double mergeMs = 0, buildMs = 0;
+    size_t nPartials = allPartialResults.size(), nGroups = 0, nRawFast = 0, nPoints = 0;
+
     if (!allPartialResults.empty()) {
         LOG_QUERY_PATH(timestar::http_log, info, "[QUERY] Merging {} partial aggregations from {} shards",
                        allPartialResults.size(), timing.shardsQueried);
@@ -2196,6 +2217,15 @@ seastar::future<std::optional<QueryResponse>> HttpQueryHandler::finalizeMultiSha
         // OPTIMIZATION & FIX: Use grouped merge to preserve metadata associations
         auto groupedResults =
             co_await Aggregator::mergePartialAggregationsGrouped(allPartialResults, request.aggregation);
+        if (qprof) {
+            mergeMs = msSince(tProf0);
+            nGroups = groupedResults.size();
+            for (const auto& g : groupedResults) {
+                if (!g.rawTimestamps.empty())
+                    ++nRawFast;
+                nPoints += g.rawTimestamps.empty() ? g.points.size() : g.rawTimestamps.size();
+            }
+        }
 
         LOG_QUERY_PATH(timestar::http_log, info, "[QUERY] Merged into {} grouped results", groupedResults.size());
 
@@ -2237,6 +2267,13 @@ seastar::future<std::optional<QueryResponse>> HttpQueryHandler::finalizeMultiSha
             // Series boundary: cheap preemption check (reactor-stall prevention)
             co_await seastar::coroutine::maybe_yield();
         }
+        if (qprof)
+            buildMs = msSince(tProf0) - mergeMs;
+    }
+    if (qprof) {
+        timestar::http_log.info(
+            "[QUERY_PROFILE] partials={} groups={} raw_fastpath={} points={} merge={:.1f}ms build={:.1f}ms",
+            nPartials, nGroups, nRawFast, nPoints, mergeMs, buildMs);
     }
 
     // Non-numeric (string/bool) results bypassed aggregation and arrive one
