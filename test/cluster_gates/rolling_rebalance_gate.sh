@@ -76,4 +76,12 @@ assert_eq "client connection failures" "${CONN_FAILS:-missing}" 0
 assert_eq "server-side 500s" "$(cat /tmp/tsgate_rr*/s.log | grep -c 'Error handling write request')" 0
 assert_eq "node crashes" "$(grep -l 'Segmentation fault' /tmp/tsgate_rr*/s.log 2>/dev/null | wc -l)" 0
 
+# The cluster must go QUIET once the storm stops. At RF == N the balancer converges, so
+# leadership settling is a real property -- and it is the one that catches a transfer
+# mechanism that has become slow or lossy. A CheckQuorum-style regression (transfers
+# needing a full election timeout, each with a leaderless window) shows up here as
+# leadership still moving in bulk long after the last rebalance call.
+# (registers its own gate_fail if leadership never stops moving)
+wait_leadership_settled "$PORTS" 40
+
 gate_exit

@@ -176,13 +176,32 @@ seastar::future<> ClusterDataPlane::start(const ClusterConfig& cfg, seastar::sha
         ropts.heartbeatTimeout = 25;     // 500ms at the 20ms tick
         ropts.electionTimeoutMin = 125;  // 2.5s
         ropts.electionTimeoutMax = 250;  // 5s (randomized -> spreads campaigns)
-        // A leader that stops hearing from a majority STEPS DOWN within an election
-        // timeout. Without it a partitioned or quorum-less leader keeps believing it
-        // leads, keeps accepting proposals it can never commit, and never fails their
-        // waiters -- so every such write hangs until its own deadline and the applyWaiters
-        // list grows for as long as the partition lasts. It is the belt to the deadline's
-        // braces: the deadline bounds each write, this bounds the condition.
-        ropts.checkQuorum = true;
+        // ropts.checkQuorum STAYS OFF. DO NOT ENABLE IT HERE -- it looks free and it is
+        // not: with CheckQuorum on, LEADERSHIP TRANSFER BREAKS.
+        //
+        // TimeoutNow lets the TRANSFEREE skip its own lease and campaign immediately
+        // (raft_node.cpp, the TimeoutNow arm), but the vote it then sends is an ordinary
+        // RequestVote -- our RequestVote carries no transfer/force marker (raft_messages.hpp).
+        // Every OTHER voter is still hearing the old leader's heartbeats, so
+        // `opts_.checkQuorum && leaderId_ != kNoNode && electionElapsed_ < electionTimeout_`
+        // holds and the disruption guard SILENTLY DROPS the transferee's vote without even
+        // bumping its term. Measured: a transfer that completes in 0 tick rounds with
+        // CheckQuorum off needs a full election timeout via term escalation with it on --
+        // 2.5-5 s at the production 20 ms tick, each with a leaderless window in it.
+        //
+        // That is not a corner case here: the leadership balancer fires every 5 s across
+        // 4096 groups, queryReplicated fails reads closed after ~125 ms of leaderlessness,
+        // and the operator rebalance endpoint storms transfers deliberately.
+        //
+        // Enabling it requires the etcd-style fix FIRST: a campaignTransfer flag on
+        // RequestVote that the inLease check honours. That is a Raft WIRE FORMAT change
+        // with a mixed-version hazard, so it belongs with the consensus work in Phase 5,
+        // not here. See docs/write-scaleout-plan.md Phase 5.
+        //
+        // Nothing depends on it for safety: the per-write propose deadline
+        // (RaftGroup::proposeAndAwaitApplied) already delivers the fail-closed property it
+        // was added as a belt for -- every write is bounded, and expired-waiter
+        // accumulation is bounded by (write deadline x retry budget) either way.
         {
             std::map<unsigned, std::vector<std::pair<uint16_t, std::vector<data::NodeId>>>> byShard;
             for (const auto& [vshard, voters] : rt_->localReplicaGroups())

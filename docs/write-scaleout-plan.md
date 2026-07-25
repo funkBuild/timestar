@@ -424,6 +424,25 @@ Only now is the Raft layer plausibly the limiter; re-profile first.
     INVISIBLE on tmpfs benches — validate on a real-disk box or accept it as
     disk-only insurance; ordering contract unchanged (send only after the
     coalesced sync covering the entry completes).
+5d. **CheckQuorum needs a leader-transfer bypass before it can be enabled.**
+    CheckQuorum is the natural way to stop a partitioned leader from accepting
+    proposals it can never commit, and Phase 3 tried to enable it for the data
+    plane as a belt to the per-write propose deadline. It had to be reverted:
+    with it on, LEADERSHIP TRANSFER BREAKS. TimeoutNow lets the transferee skip
+    its own lease, but the vote it sends is an ordinary RequestVote and ours
+    carries no transfer/force marker, so every other voter -- still hearing the
+    old leader -- hits the disruption guard and silently drops the vote without
+    bumping its term. Measured: a transfer completing in 0 tick rounds with
+    CheckQuorum off needs a full election timeout via term escalation with it on
+    (2.5-5 s at the production 20 ms tick, each with a leaderless window). With
+    the balancer firing every 5 s over 4096 groups and reads failing closed after
+    ~125 ms of leaderlessness, that is a live availability problem, not a corner
+    case. The fix is etcd's: a `campaignTransfer` flag on RequestVote that the
+    inLease check honours. It is a Raft WIRE FORMAT change with a mixed-version
+    hazard, which is why it belongs here and not in a Phase 3 tail fix. Nothing
+    depends on CheckQuorum for safety today -- the propose deadline already
+    bounds every write and bounds waiter accumulation.
+
 5c. **(Deferred, design-only) VShard:group consolidation**: hosting 4096 Raft
     groups per node is the root of per-proposal and heartbeat overhead; a
     16:1 VShard-to-group mapping would cut it 16x but coarsens movement
