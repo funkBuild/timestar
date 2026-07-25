@@ -87,17 +87,18 @@ seastar::future<uint64_t> ReplicatedVShardHost::snapshotVShard(uint16_t vshard) 
 }
 
 seastar::future<bool> ReplicatedVShardHost::proposeBatch(data::WriteBatch batch) {
-    // Group the batch's series by VShard (a series routes to its VShard by hash,
-    // same authority every replica uses). schemaVersion is carried per group.
-    std::map<uint16_t, data::WriteBatch> byVShard;
-    for (auto& s : batch.series) {
-        const uint16_t vs = timestar::virtualShard(SeriesId128::fromSeriesKey(s.seriesKey));
+    // Group the batch's series by VShard (a series routes to its VShard by hash, same
+    // authority every replica uses -- see WriteSeries::vshard). schemaVersion is
+    // carried per group.
+    return proposeVShardBatches(data::splitByVShard(std::move(batch)));
+}
+
+seastar::future<bool> ReplicatedVShardHost::proposeVShardBatches(data::VShardBatches byVShard) {
+    // Membership check for the WHOLE batch BEFORE any replication, so a routing error
+    // fails atomically (nothing proposed) rather than after some groups committed.
+    for (const auto& [vs, b] : byVShard)
         if (!registry_.group(vs))
             throw std::runtime_error("ReplicatedVShardHost::proposeBatch: VShard not led here");
-        data::WriteBatch& dest = byVShard[vs];
-        dest.schemaVersion = batch.schemaVersion;
-        dest.series.push_back(std::move(s));
-    }
     // Replicate every VShard group CONCURRENTLY; every group must commit for the
     // batch to ack.
     //

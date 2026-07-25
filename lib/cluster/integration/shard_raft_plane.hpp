@@ -331,13 +331,13 @@ private:
 // surfaces as a retryable failure rather than a silent partial success.
 inline seastar::future<> writeSlicesToOwningShards(seastar::sharded<ShardRaftPlane>& shards,
                                                    data::WriteBatch batch) {
-    std::map<unsigned, data::WriteBatch> byShard;
-    for (auto& sref : batch.series) {
-        const uint16_t vs = timestar::virtualShard(SeriesId128::fromSeriesKey(sref.seriesKey));
-        data::WriteBatch& dest = byShard[shardForVShard(vs)];
-        dest.schemaVersion = batch.schemaVersion;  // carried per slice
-        dest.series.push_back(std::move(sref));
-    }
+    // Split by VShard ONCE (write-scaleout 2b) and bucket the resulting groups by
+    // owning shard. Everything below -- the leader-node bucketing in the router and
+    // the per-group propose -- re-buckets these same groups, so each series is moved
+    // once and its key hashed once (write-scaleout 2a).
+    std::map<unsigned, data::VShardBatches> byShard;
+    for (auto& g : data::splitByVShard(std::move(batch)))
+        byShard[shardForVShard(g.first)].push_back(std::move(g));
     std::vector<seastar::future<>> pending;
     pending.reserve(byShard.size());
     for (auto& [shard, slice] : byShard)
@@ -369,20 +369,17 @@ inline seastar::future<> writeSlicesToOwningShards(seastar::sharded<ShardRaftPla
 // so the caller redirects/retries -- never a silent partial commit.
 inline seastar::future<bool> proposeSlicesToOwningShards(seastar::sharded<ShardRaftPlane>& shards,
                                                          data::WriteBatch batch) {
-    std::map<unsigned, data::WriteBatch> byShard;
-    for (auto& sref : batch.series) {
-        const uint16_t vs = timestar::virtualShard(SeriesId128::fromSeriesKey(sref.seriesKey));
-        data::WriteBatch& dest = byShard[shardForVShard(vs)];
-        dest.schemaVersion = batch.schemaVersion;
-        dest.series.push_back(std::move(sref));
-    }
+    // One split, buckets of groups -- same shape as writeSlicesToOwningShards.
+    std::map<unsigned, data::VShardBatches> byShard;
+    for (auto& g : data::splitByVShard(std::move(batch)))
+        byShard[shardForVShard(g.first)].push_back(std::move(g));
     std::vector<seastar::future<bool>> pending;
     pending.reserve(byShard.size());
     for (auto& [shard, slice] : byShard)
         pending.push_back(shards.invoke_on(shard, [b = std::move(slice)](ShardRaftPlane& p) mutable {
             if (!p.ready())  // see the note in writeSlicesToOwningShards
                 return seastar::make_exception_future<bool>(std::runtime_error(kShardStoppingError));
-            return p.plane().host().proposeBatch(std::move(b));
+            return p.plane().host().proposeVShardBatches(std::move(b));
         }));
 
     bool all = true;

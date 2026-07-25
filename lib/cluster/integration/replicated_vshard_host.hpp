@@ -67,6 +67,12 @@ public:
     // Cross-group atomicity is out of scope for v1.
     seastar::future<bool> proposeBatch(data::WriteBatch batch) override;
 
+    // The same, for a batch already split by VShard (write-scaleout 2b). This is what
+    // proposeBatch reduces to, and what the write router calls directly for the groups
+    // this node leads -- the split happened once at ingress. Identical semantics,
+    // including the atomic membership check before any replication.
+    seastar::future<bool> proposeVShardBatches(data::VShardBatches groups) override;
+
     // Compact this node's Raft log for `vshard` by snapshotting its FLUSHED data and
     // handing the payload to RaftGroup::compact (the M3 snapshot PRODUCER). Truncates
     // the log only up to the snapshot's covered revision (== the log index, ADR 0003):

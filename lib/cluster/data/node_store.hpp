@@ -67,6 +67,17 @@ class ProposeSink {
 public:
     virtual ~ProposeSink() = default;
     virtual seastar::future<bool> proposeBatch(WriteBatch batch) = 0;
+
+    // The same work when the CALLER has already split the batch by VShard
+    // (write-scaleout 2b): the replicated write path splits once at ingress and every
+    // layer below re-buckets those groups, so handing them over avoids merging them
+    // back into one WriteBatch only for the sink to split it again. The default does
+    // exactly that merge, so a sink that does its own splitting (or a test double)
+    // needs no change; ReplicatedVShardHost overrides it to propose each group
+    // straight to its Raft group.
+    virtual seastar::future<bool> proposeVShardBatches(VShardBatches groups) {
+        return proposeBatch(mergeVShardBatches(std::move(groups)));
+    }
 };
 
 // Resolves the CURRENT Raft leader of a VShard (M3). ReplicatedVShardHost implements

@@ -1,5 +1,6 @@
 #include "write_record.hpp"
 
+#include <algorithm>
 #include <cstring>
 
 namespace timestar::data {
@@ -98,6 +99,42 @@ bool WriteSeries::consistent() const {
     return false;
 }
 
+VShardBatches splitByVShard(WriteBatch batch) {
+    VShardBatches out;
+    if (batch.series.empty())
+        return out;
+    // vshard -> index into `out`. A direct-indexed table (4096 x int32 = 16 KB, one
+    // fill per split) rather than a hash map: a 10k-point HTTP batch can touch a
+    // thousand distinct VShards, and this runs once per batch now.
+    std::vector<int32_t> slot(timestar::VIRTUAL_SHARD_COUNT, -1);
+    out.reserve(std::min<size_t>(batch.series.size(), timestar::VIRTUAL_SHARD_COUNT));
+    for (auto& s : batch.series) {
+        const uint16_t vs = vshardOf(s);
+        int32_t& idx = slot[vs];
+        if (idx < 0) {
+            idx = static_cast<int32_t>(out.size());
+            out.push_back({vs, WriteBatch{}});
+            out.back().second.schemaVersion = batch.schemaVersion;
+        }
+        out[static_cast<size_t>(idx)].second.series.push_back(std::move(s));
+    }
+    return out;
+}
+
+WriteBatch mergeVShardBatches(VShardBatches groups) {
+    WriteBatch out;
+    size_t n = 0;
+    for (const auto& [vs, b] : groups)
+        n += b.series.size();
+    out.series.reserve(n);
+    for (auto& [vs, b] : groups) {
+        out.schemaVersion = b.schemaVersion;  // identical across groups of one batch
+        for (auto& s : b.series)
+            out.series.push_back(std::move(s));
+    }
+    return out;
+}
+
 std::string encodeWriteBatch(const WriteBatch& batch) {
     Writer w;
     w.u64(batch.schemaVersion);
@@ -154,6 +191,8 @@ std::optional<WriteBatch> decodeWriteBatch(const std::string& bytes) {
         return std::nullopt;
     batch.series.reserve(ns);
     for (uint32_t i = 0; i < ns; ++i) {
+        // s.vshard stays kUnroutedVShard: the routing hint is never on the wire, so a
+        // decoded series is routed by re-deriving it from seriesKey (see vshardOf).
         WriteSeries s;
         uint8_t t = r.u8();
         if (!r.ok || t > static_cast<uint8_t>(TSMValueType::Integer))

@@ -10,13 +10,13 @@ namespace timestar::data {
 seastar::future<> NodeWriteRouter::write(WriteBatch batch) {
     // Group by owner node first, so each destination gets ONE batched WriteBatch.
     // Resolve every owner and validate the whole batch BEFORE dispatching anything:
-    // a single unassigned VShard rejects the batch (no partial write). Each series'
-    // seriesKey is hashed once here (the plan's noted hot-path cost); the owner is
-    // hash -> VShard -> node.
+    // a single unassigned VShard rejects the batch (no partial write). The owner is
+    // VShard -> node, and the VShard comes from the series' cached routing hint
+    // (computed at HTTP parse, or derived here on first use -- write-scaleout 2a), so
+    // the key string is not re-hashed on this path either.
     std::map<NodeId, WriteBatch> byOwner;
     for (auto& s : batch.series) {
-        const SeriesId128 id = SeriesId128::fromSeriesKey(s.seriesKey);
-        const NodeId owner = dir_.ownerOfSeries(id);
+        const NodeId owner = dir_.ownerOf(vshardOf(s));
         if (owner == kNoNode)
             throw std::runtime_error("NodeWriteRouter: VShard unassigned for series");
         WriteBatch& dest = byOwner[owner];

@@ -37,6 +37,10 @@ public:
     // on quorum. Throws if any series' VShard is unassigned (before dispatch), if a
     // leader is stale (a group returned not-leader), or on a transport error.
     seastar::future<> write(WriteBatch batch);
+    // Same, for a batch the caller already split by VShard (write-scaleout 2b): the
+    // production path splits ONCE at ingress and every layer below only re-buckets
+    // those groups. Identical semantics; the WriteBatch overload just splits first.
+    seastar::future<> write(VShardBatches groups);
 
 private:
     const VShardDirectory& dir_;

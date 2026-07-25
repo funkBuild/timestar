@@ -31,8 +31,12 @@ public:
         return host_.addVShard(vshard, std::move(voters), opts);
     }
 
-    // Route + replicate a write to each VShard's leader (durable quorum commit).
+    // Route + replicate a write to each VShard's leader (durable quorum commit). The
+    // VShardBatches overload takes a batch the caller already split by VShard
+    // (write-scaleout 2b) -- the production path, since the request shard splits once
+    // and buckets the groups by owning shard.
     seastar::future<> write(data::WriteBatch batch) { return router_.write(std::move(batch)); }
+    seastar::future<> write(data::VShardBatches groups) { return router_.write(std::move(groups)); }
 
     // The Raft propose target incoming proposeWrite RPCs dispatch into (host_ is the
     // ProposeSink). The server wires DataPlaneRpc::setProposeSink to this.

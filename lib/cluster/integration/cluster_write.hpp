@@ -39,6 +39,10 @@ template <typename T>
 data::WriteSeries writeSeriesFromInsert(const TimeStarInsert<T>& ins) {
     data::WriteSeries s;
     s.seriesKey = ins.seriesKey();
+    // Hash ONCE, here at HTTP parse (write-scaleout 2a). TimeStarInsert caches its
+    // SeriesId128, and the routing hint rides the series all the way down, so no layer
+    // below re-hashes the key string to group by VShard.
+    s.vshard = timestar::virtualShard(ins.seriesId128());
     s.type = clusterInsertValueType<T>();
     s.timestamps = ins.getTimestamps();
     s.values = ins.values;        // vector<T> selects the matching WriteSeries variant slot
