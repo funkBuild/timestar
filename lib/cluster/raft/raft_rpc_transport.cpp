@@ -131,8 +131,23 @@ seastar::future<> RaftRpcTransport::start(seastar::socket_address local, Deliver
                 co_await impl_->onDeliver(std::move(*env));
             co_return seastar::rpc::no_wait;
         });
-    impl_->server =
-        std::make_unique<seastar::rpc::protocol<RaftSerializer>::server>(impl_->proto, local);
+    // Pin the listening socket to THIS shard. The Raft server and its group registry
+    // live on one shard, but seastar's default accept policy scatters incoming
+    // connections across ALL shards -- a connection accepted on a shard with no server
+    // behind it has its messages silently discarded forever.
+    //
+    // This verb is no_wait, so the SENDER never hangs; the failure is invisible and
+    // ASYMMETRIC. Observed: node 1 (leader of all 4096 groups) saw node 2 caught up on
+    // 4096 and node 3 caught up on ZERO -- node 3's append acks never arrived, so
+    // matchIndex_[3] stayed 0 and leadership transfer to node 3 could never fire its
+    // TimeoutNow (RaftNode::transferLeadership only sends it to a caught-up target).
+    // Which peer is affected is per-connection luck, which is why it looks like one
+    // "bad" node.
+    seastar::listen_options lo;
+    lo.reuse_address = true;
+    lo.set_fixed_cpu(seastar::this_shard_id());
+    impl_->server = std::make_unique<seastar::rpc::protocol<RaftSerializer>::server>(
+        impl_->proto, seastar::listen(local, lo));
     return seastar::make_ready_future<>();
 }
 

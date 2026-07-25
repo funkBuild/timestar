@@ -132,6 +132,15 @@ void set_routes(routes& r) {
                               ",\"vshards_led\":" + std::to_string(st.vshardsLedHere) +
                               ",\"vshards_leaderless\":" + std::to_string(st.vshardsLeaderless) +
                               ",\"healthy\":" + (st.vshardsLeaderless == 0 ? "true" : "false");
+                      // Replication progress of each peer for the groups we lead. A peer
+                      // far below vshards_led is not acking our appends.
+                      std::string caught;
+                      for (const auto& [peer, n] : st.peerCaughtUp) {
+                          if (!caught.empty())
+                              caught += ",";
+                          caught += "\"" + std::to_string(peer) + "\":" + std::to_string(n);
+                      }
+                      body += ",\"peer_caught_up\":{" + caught + "}";
                   }
                   body += "}";
                   rep->_content = std::move(body);

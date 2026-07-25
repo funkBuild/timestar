@@ -257,10 +257,24 @@ ClusterDataPlane::Status ClusterDataPlane::status() const {
     s.vshardsHostedHere = host.vshardCount();
     for (uint16_t vs = 0; vs < timestar::VIRTUAL_SHARD_COUNT; ++vs) {
         const data::NodeId leader = host.leaderOf(vs);
-        if (leader == timestar::raft::kNoNode)
+        if (leader == timestar::raft::kNoNode) {
             ++s.vshardsLeaderless;
-        else if (leader == rt_->selfId)
-            ++s.vshardsLedHere;
+            continue;
+        }
+        if (leader != rt_->selfId)
+            continue;
+        ++s.vshardsLedHere;
+        // We lead this group: record which peers have fully replicated it.
+        raft::RaftGroup* g = host.group(vs);
+        if (!g)
+            continue;
+        const auto last = g->node().log().lastIndex();
+        for (const auto& [peer, addr] : rt_->peerAddresses) {
+            if (peer == rt_->selfId)
+                continue;
+            if (g->matchIndexOf(peer) >= last)
+                ++s.peerCaughtUp[peer];
+        }
     }
     return s;
 }

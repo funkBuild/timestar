@@ -72,6 +72,11 @@ public:
         size_t vshardsHostedHere = 0;  // Raft groups this node replicates
         size_t vshardsLedHere = 0;     // of those, ones this node currently leads
         size_t vshardsLeaderless = 0;  // VShards with NO elected leader anywhere
+        // Among the VShards this node LEADS, how many each peer has fully replicated
+        // (matchIndex >= our lastIndex). A peer stuck near 0 here is not acking our
+        // appends -- which also silently blocks leadership transfer to it, since
+        // RaftNode::transferLeadership only sends TimeoutNow to a caught-up target.
+        std::map<NodeId, size_t> peerCaughtUp;
     };
     Status status() const;
 
