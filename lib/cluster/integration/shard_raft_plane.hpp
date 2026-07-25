@@ -1,7 +1,9 @@
 #pragma once
 
 #include <seastar/core/gate.hh>
+#include "../../core/placement_table.hpp"  // virtualShard
 #include "../../core/vshard.hpp"  // assignCore
+#include "../data/dataplane_rpc.hpp"
 #include "../data/node_store.hpp"
 #include "../raft/raft_codec.hpp"  // decodeEnvelope
 #include "../raft/raft_driver.hpp"  // RaftTransport
@@ -10,10 +12,16 @@
 #include "replicated_data_plane.hpp"
 
 #include <chrono>
+#include <exception>
 #include <filesystem>
+#include <map>
 #include <memory>
+#include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
+#include <seastar/core/sharded.hh>
 #include <seastar/core/smp.hh>
+#include <utility>
+#include <vector>
 
 namespace timestar::cluster {
 
@@ -23,82 +31,59 @@ namespace timestar::cluster {
 // applies -- enough to saturate it, diverge that node's leadership view and make its
 // queries fail. Spreading them divides that work by the core count.
 //
-// The Raft transport is now PER SHARD: every shard listens on the node's single Raft
-// port (SO_REUSEPORT, the same pattern the HTTP server uses) and keeps its own peer
-// clients. Previously one transport on shard 0 carried the whole node's Raft traffic,
-// which made shard 0 the write bottleneck -- it showed ~10x the journal-sync latency
-// of the other shards while all cores sat ~25% idle. Egress is now entirely local; an
-// inbound envelope still hops to the shard owning its group, but the accept/read work
-// is spread by the kernel instead of landing on one core.
-//
-// The data-plane RPC client set is still single, on shard 0, behind the proxy below.
+// BOTH inter-node transports are now PER SHARD: every shard listens on the node's
+// single Raft port AND on its single data-plane port (SO_REUSEPORT, the same pattern
+// the HTTP server uses) and keeps its own peer clients for each. Previously one
+// transport of each kind lived on shard 0 and carried the whole node's traffic, which
+// made shard 0 the write bottleneck -- it showed ~10x the journal-sync latency of the
+// other shards while all cores sat ~25% idle. Egress is now entirely local; an inbound
+// Raft envelope still hops to the shard owning its group, and an inbound proposeWrite
+// is split across the shards owning its VShards, but the accept/read work is spread by
+// the kernel instead of landing on one core.
 
 // The shard that owns a VShard's Raft group.
 inline unsigned shardForVShard(uint16_t vshard) {
     return timestar::assignCore(timestar::VShardId{vshard}, seastar::smp::count);
 }
 
-// Forwards a shard's peer-facing data-plane calls (leader forwarding of proposes) to
-// the node's real DataPlaneRpc on shard 0.
-class ShardRoutingNodeTransport : public data::NodeTransport {
-public:
-    explicit ShardRoutingNodeTransport(data::NodeTransport* home) : home_(home) {}
-
-    seastar::future<> forwardWriteBatch(data::NodeId to, data::WriteBatch batch) override {
-        if (seastar::this_shard_id() == 0)
-            return home_->forwardWriteBatch(to, std::move(batch));
-        return seastar::smp::submit_to(0u, [h = home_, to, b = std::move(batch)]() mutable {
-            return h->forwardWriteBatch(to, std::move(b));
-        });
-    }
-
-    seastar::future<data::NodeQueryPartial> queryNode(data::NodeId to, data::NodeQueryRequest req) override {
-        if (seastar::this_shard_id() == 0)
-            return home_->queryNode(to, std::move(req));
-        return seastar::smp::submit_to(0u, [h = home_, to, r = std::move(req)]() mutable {
-            return h->queryNode(to, std::move(r));
-        });
-    }
-
-    seastar::future<data::MetadataResult> queryMetadata(data::NodeId to, data::MetadataRequest req) override {
-        if (seastar::this_shard_id() == 0)
-            return home_->queryMetadata(to, std::move(req));
-        return seastar::smp::submit_to(0u, [h = home_, to, r = std::move(req)]() mutable {
-            return h->queryMetadata(to, std::move(r));
-        });
-    }
-
-    seastar::future<bool> proposeWrite(data::NodeId to, data::WriteBatch batch) override {
-        if (seastar::this_shard_id() == 0)
-            return home_->proposeWrite(to, std::move(batch));
-        return seastar::smp::submit_to(0u, [h = home_, to, b = std::move(batch)]() mutable {
-            return h->proposeWrite(to, std::move(b));
-        });
-    }
-
-private:
-    data::NodeTransport* home_;  // owned by ClusterDataPlane on shard 0
-};
-
 // One shard's slice of the replicated data plane: a full ReplicatedDataPlane holding
 // only the VShards this shard owns. Constructed on every shard via
 // seastar::sharded<ShardRaftPlane>, so each reactor ticks only its own groups.
-class ShardRaftPlane {
+class ShardRaftPlane : public data::ProposeSink {
 public:
-    // `homeRaft` / `homeClient` point at the node's single transports on shard 0.
     seastar::future<> init(seastar::sharded<Engine>* engines, seastar::sharded<ShardRaftPlane>* peers,
-                           data::NodeTransport* homeClient, const data::VShardDirectory* dir, data::NodeId self,
-                           std::string journalRoot, std::chrono::milliseconds tick) {
+                           const data::VShardDirectory* dir, data::NodeId self, std::string journalRoot,
+                           std::chrono::milliseconds tick) {
         store_ = std::make_unique<EngineLocalStore>(*engines);
         peers_ = peers;
         transport_ = std::make_unique<raft::RaftRpcTransport>();
-        clientProxy_ = std::make_unique<ShardRoutingNodeTransport>(homeClient);
+        // This shard's OWN data-plane transport: its listener on the node's data-plane
+        // port (SO_REUSEPORT) and its own peer clients. Every remote leader forward
+        // this shard makes now leaves from this core; nothing hops to shard 0.
+        rpc_ = std::make_unique<data::DataPlaneRpc>();
         // Journals are per-VShard directories under this root, and each VShard belongs
         // to exactly one shard, so shards never contend for the same journal.
-        plane_ = std::make_unique<ReplicatedDataPlane>(*store_, *transport_, *clientProxy_, *dir, self,
+        plane_ = std::make_unique<ReplicatedDataPlane>(*store_, *transport_, *rpc_, *dir, self,
                                                        std::filesystem::path(journalRoot), tick);
         return seastar::make_ready_future<>();
     }
+
+    // Listen for peer data-plane traffic on the node's data-plane port from THIS shard
+    // (SO_REUSEPORT, as with the Raft port above). Inbound forwarded writes/queries are
+    // served by this shard's EngineLocalStore, which dispatches to the owning engine
+    // core itself; an inbound proposeWrite is split across the shards owning its
+    // VShards by proposeBatch() below.
+    seastar::future<> startDataPlane(seastar::socket_address local) {
+        rpc_->setProposeSink(*this);
+        return rpc_->start(local, *store_);
+    }
+
+    void addDataPeer(data::NodeId id, seastar::socket_address addr) { rpc_->addPeer(id, addr); }
+
+    // ProposeSink: a peer forwarded a batch because this NODE leads those VShards. The
+    // connection landed on whichever shard the kernel gave it, which is unrelated to
+    // which shards own the VShards -- so split and replicate each slice on its owner.
+    seastar::future<bool> proposeBatch(data::WriteBatch batch) override;
 
     // Listen on the node's Raft port from THIS shard. Every shard binds the same
     // address; seastar uses SO_REUSEPORT so each gets its own socket and the kernel
@@ -250,10 +235,14 @@ public:
     }
 
     seastar::future<> stop() {
+        // The plane first (it borrows both transports), then the transports, then the
+        // store they dispatch into.
         if (plane_)
             co_await plane_->stop();
         plane_.reset();
-        clientProxy_.reset();
+        if (rpc_)
+            co_await rpc_->stop();
+        rpc_.reset();
         if (transport_)
             co_await transport_->stop();
         transport_.reset();
@@ -264,10 +253,89 @@ public:
 private:
     // Declared so plane_ (which borrows the others) is destroyed FIRST.
     std::unique_ptr<EngineLocalStore> store_;
-    std::unique_ptr<raft::RaftRpcTransport> transport_;  // this shard's own listener + peer clients
+    std::unique_ptr<raft::RaftRpcTransport> transport_;  // this shard's own Raft listener + peer clients
     seastar::sharded<ShardRaftPlane>* peers_ = nullptr;
-    std::unique_ptr<ShardRoutingNodeTransport> clientProxy_;
+    std::unique_ptr<data::DataPlaneRpc> rpc_;  // this shard's own data-plane listener + peer clients
     std::unique_ptr<ReplicatedDataPlane> plane_;
 };
+
+// Split `batch` by the shard that OWNS each series' VShard Raft group and dispatch
+// every slice CONCURRENTLY, then await them all.
+//
+// The slices used to be awaited one at a time inside the grouping loop, so a batch
+// spanning S shards paid the SUM of S full quorum round trips (durable append +
+// replicate + commit + apply) rather than the max -- the same defect
+// ReplicatedVShardHost::proposeBatch already fixed one layer down, at the per-VShard
+// level. All-must-commit semantics are unchanged: EVERY dispatched future is awaited
+// even after one fails (abandoning an in-flight one would let its commit land on a
+// destroyed continuation), and the first error is rethrown so a partial batch always
+// surfaces as a retryable failure rather than a silent partial success.
+inline seastar::future<> writeSlicesToOwningShards(seastar::sharded<ShardRaftPlane>& shards,
+                                                   data::WriteBatch batch) {
+    std::map<unsigned, data::WriteBatch> byShard;
+    for (auto& sref : batch.series) {
+        const uint16_t vs = timestar::virtualShard(SeriesId128::fromSeriesKey(sref.seriesKey));
+        data::WriteBatch& dest = byShard[shardForVShard(vs)];
+        dest.schemaVersion = batch.schemaVersion;  // carried per slice
+        dest.series.push_back(std::move(sref));
+    }
+    std::vector<seastar::future<>> pending;
+    pending.reserve(byShard.size());
+    for (auto& [shard, slice] : byShard)
+        pending.push_back(shards.invoke_on(
+            shard, [b = std::move(slice)](ShardRaftPlane& p) mutable { return p.plane().write(std::move(b)); }));
+
+    std::exception_ptr firstErr;
+    for (auto& f : pending) {
+        try {
+            co_await std::move(f);
+        } catch (...) {
+            if (!firstErr)
+                firstErr = std::current_exception();
+        }
+    }
+    if (firstErr)
+        std::rethrow_exception(firstErr);
+    co_return;
+}
+
+// The peer-ingress twin of the above: replicate each slice through the Raft group on
+// its owning shard. `false` (not the leader for some slice) makes the WHOLE batch fail
+// so the caller redirects/retries -- never a silent partial commit.
+inline seastar::future<bool> proposeSlicesToOwningShards(seastar::sharded<ShardRaftPlane>& shards,
+                                                         data::WriteBatch batch) {
+    std::map<unsigned, data::WriteBatch> byShard;
+    for (auto& sref : batch.series) {
+        const uint16_t vs = timestar::virtualShard(SeriesId128::fromSeriesKey(sref.seriesKey));
+        data::WriteBatch& dest = byShard[shardForVShard(vs)];
+        dest.schemaVersion = batch.schemaVersion;
+        dest.series.push_back(std::move(sref));
+    }
+    std::vector<seastar::future<bool>> pending;
+    pending.reserve(byShard.size());
+    for (auto& [shard, slice] : byShard)
+        pending.push_back(shards.invoke_on(shard, [b = std::move(slice)](ShardRaftPlane& p) mutable {
+            return p.plane().host().proposeBatch(std::move(b));
+        }));
+
+    bool all = true;
+    std::exception_ptr firstErr;
+    for (auto& f : pending) {
+        try {
+            const bool ok = co_await std::move(f);
+            all = all && ok;
+        } catch (...) {
+            if (!firstErr)
+                firstErr = std::current_exception();
+        }
+    }
+    if (firstErr)
+        std::rethrow_exception(firstErr);
+    co_return all;
+}
+
+inline seastar::future<bool> ShardRaftPlane::proposeBatch(data::WriteBatch batch) {
+    return proposeSlicesToOwningShards(*peers_, std::move(batch));
+}
 
 }  // namespace timestar::cluster

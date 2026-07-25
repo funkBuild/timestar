@@ -55,11 +55,18 @@ seastar::future<> ClusterDataPlane::start(const ClusterConfig& cfg, seastar::sha
     local_ = std::make_unique<EngineLocalStore>(engines);
     rpc_ = std::make_unique<data::DataPlaneRpc>();
 
+    const bool replicated = cfg.replication_factor > 1;
     // Bind the RPC server to this node's own data-plane address.
     const HostPort self = parseHostPort(rt_->peerAddresses.at(rt_->selfId));
     seastar::net::inet_address selfAddr = co_await resolveHost(self.host);
-    co_await rpc_->start(seastar::socket_address(selfAddr, static_cast<uint16_t>(self.port + kDataPlanePortOffset)),
-                         *local_);
+    const seastar::socket_address dataPlaneAddr(selfAddr,
+                                                static_cast<uint16_t>(self.port + kDataPlanePortOffset));
+    if (replicated)
+        // Replicated mode serves the data plane from EVERY shard (see below); this
+        // instance stays client-only, for the shard-0 query/metadata fan-out.
+        co_await rpc_->startClientOnly();
+    else
+        co_await rpc_->start(dataPlaneAddr, *local_);
 
     // Register every OTHER node as a peer at its data-plane address. Resolution is
     // BEST-EFFORT: a peer that is not yet up (rolling start) must not fail THIS
@@ -90,7 +97,7 @@ seastar::future<> ClusterDataPlane::start(const ClusterConfig& cfg, seastar::sha
     // out via coord_ (v1 leader reads land on the primary, == the leader under the
     // placement model). Group instantiation is the real prod cost: RF*4096/N groups
     // per node (see the group-granularity note in the plan).
-    if (cfg.replication_factor > 1) {
+    if (replicated) {
         std::filesystem::path journalRoot = timestar::dataRootPath();
         journalRoot /= "cluster_raft";
         // Start a Raft plane on EVERY shard; each will own only the VShards that
@@ -100,16 +107,24 @@ seastar::future<> ClusterDataPlane::start(const ClusterConfig& cfg, seastar::sha
         {
             const std::string jroot = journalRoot.string();
             const data::NodeId selfId = rt_->selfId;
-            data::NodeTransport* homeClient = rpc_.get();
             const data::VShardDirectory* dirp = dir_.get();
             auto* peers = &shards_;
-            co_await shards_.invoke_on_all([enginesPtr = enginesPtr_, peers, homeClient, dirp, selfId, jroot](ShardRaftPlane& p) {
-                return p.init(enginesPtr, peers, homeClient, dirp, selfId, jroot, std::chrono::milliseconds(20));
+            co_await shards_.invoke_on_all([enginesPtr = enginesPtr_, peers, dirp, selfId, jroot](ShardRaftPlane& p) {
+                return p.init(enginesPtr, peers, dirp, selfId, jroot, std::chrono::milliseconds(20));
             });
         }
-        // Incoming proposeWrite RPCs land on shard 0; route each batch to the shards
-        // owning its VShards.
-        rpc_->setProposeSink(*this);
+
+        // Serve the DATA plane on this node's data-plane address FROM EVERY SHARD
+        // (SO_REUSEPORT), and give every shard its own peer clients. Previously one
+        // DataPlaneRpc on shard 0 carried every forwarded write in BOTH directions, so
+        // each shard's remote leader-forwards hopped to shard 0 and back and every
+        // peer's inbound proposal landed there: shard 0's Raft profile stayed ~10-20x
+        // the other shards' long after the Raft transport itself was sharded (b98c1d1).
+        // An inbound proposeWrite is split across the shards owning its VShards by
+        // ShardRaftPlane::proposeBatch, so which shard the kernel handed the connection
+        // to no longer decides where the work runs.
+        co_await shards_.invoke_on_all(
+            [dataPlaneAddr](ShardRaftPlane& p) { return p.startDataPlane(dataPlaneAddr); });
 
         // Serve Raft on this node's own Raft address FROM EVERY SHARD (SO_REUSEPORT).
         // Each shard decodes and routes to the shard owning the addressed group.
@@ -124,8 +139,12 @@ seastar::future<> ClusterDataPlane::start(const ClusterConfig& cfg, seastar::sha
             try {
                 seastar::net::inet_address a = co_await resolveHost(hp.host);
                 const seastar::socket_address peerAddr(a, static_cast<uint16_t>(hp.port + kRaftPortOffset));
-                co_await shards_.invoke_on_all(
-                    [id, peerAddr](ShardRaftPlane& p) { p.addRaftPeer(id, peerAddr); });
+                const seastar::socket_address peerDataAddr(a,
+                                                           static_cast<uint16_t>(hp.port + kDataPlanePortOffset));
+                co_await shards_.invoke_on_all([id, peerAddr, peerDataAddr](ShardRaftPlane& p) {
+                    p.addRaftPeer(id, peerAddr);
+                    p.addDataPeer(id, peerDataAddr);
+                });
             } catch (const std::exception& e) {
                 timestar::http_log.warn("cluster raft: peer {} ({}) unresolved at startup: {}", id, addr, e.what());
             }
@@ -385,44 +404,13 @@ seastar::future<> ClusterDataPlane::writeReplicated(data::WriteBatch batch) {
     // Group the series by the shard that owns their VShard's Raft group, then hand
     // each slice to that shard's plane (which resolves the leader for its own
     // VShards locally and forwards to a remote leader when needed).
-    std::map<unsigned, data::WriteBatch> byShard;
-    for (auto& sref : batch.series) {
-        const uint16_t vs = timestar::virtualShard(SeriesId128::fromSeriesKey(sref.seriesKey));
-        byShard[shardForVShard(vs)].series.push_back(std::move(sref));
-    }
-    std::exception_ptr firstErr;
-    for (auto& [shard, slice] : byShard) {
-        try {
-            co_await shards_.invoke_on(shard, [b = std::move(slice)](ShardRaftPlane& p) mutable {
-                return p.plane().write(std::move(b));
-            });
-        } catch (...) {
-            if (!firstErr)
-                firstErr = std::current_exception();
-        }
-    }
-    if (firstErr)
-        std::rethrow_exception(firstErr);
-    co_return;
+    return writeSlicesToOwningShards(shards_, std::move(batch));
 }
 
 seastar::future<bool> ClusterDataPlane::proposeBatch(data::WriteBatch batch) {
     // A peer forwarded this batch because we lead those VShards. Replicate each
     // slice through the Raft group on its owning shard.
-    std::map<unsigned, data::WriteBatch> byShard;
-    for (auto& sref : batch.series) {
-        const uint16_t vs = timestar::virtualShard(SeriesId128::fromSeriesKey(sref.seriesKey));
-        byShard[shardForVShard(vs)].series.push_back(std::move(sref));
-    }
-    bool all = true;
-    for (auto& [shard, slice] : byShard) {
-        const bool ok = co_await shards_.invoke_on(shard, [b = std::move(slice)](ShardRaftPlane& p) mutable {
-            return p.plane().host().proposeBatch(std::move(b));
-        });
-        if (!ok)
-            all = false;  // not the leader for that slice; caller redirects/retries
-    }
-    co_return all;
+    return proposeSlicesToOwningShards(shards_, std::move(batch));
 }
 
 seastar::future<std::map<uint16_t, data::NodeId>> ClusterDataPlane::gatherLeaders() const {

@@ -95,6 +95,10 @@ public:
 
     // ProposeSink: a peer forwarded a batch for VShards THIS node leads. Split it by
     // the shard owning each VShard's Raft group and replicate each slice there.
+    // NOTE: in replicated mode the peer-facing listeners are the PER-SHARD ones, whose
+    // sink is ShardRaftPlane itself (same split, from whichever shard accepted the
+    // connection); this instance is client-only there. Kept as the composition's
+    // ProposeSink for tests and for any single-instance embedding.
     seastar::future<bool> proposeBatch(data::WriteBatch batch) override;
 
 private:
@@ -121,8 +125,8 @@ private:
     // down first.
     // Per-shard Raft planes: shard S owns the VShards with assignCore(vs)==S, so the
     // group tick/step/apply work is spread over all cores instead of saturating
-    // shard 0. Only shard 0 holds the listener and the peer clients; the per-shard
-    // planes reach them through the proxies in shard_raft_plane.hpp.
+    // shard 0. Each plane also owns its OWN Raft and data-plane transports (listener +
+    // peer clients), so no inter-node byte transits shard 0.
     seastar::sharded<ShardRaftPlane> shards_;
     bool shardsStarted_ = false;
     bool replicated_ = false;

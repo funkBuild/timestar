@@ -38,6 +38,13 @@ public:
     // the command path this node serves; both must not be called on one instance.
     seastar::future<> start(seastar::socket_address local, LocalStore& sink);
     seastar::future<> start(seastar::socket_address local, NodeStore& sink);
+    // Start CLIENT-ONLY: create the peer stubs, but serve nothing. Used when some
+    // OTHER instance already listens on this node's data-plane address (in replicated
+    // mode every shard owns a listener via SO_REUSEPORT) while this instance is still
+    // needed to REACH peers -- e.g. the shard-0 query/metadata fan-out. Serving verbs
+    // from a second instance on the same shard would only steal a share of the node's
+    // inbound connections back onto that one core.
+    seastar::future<> startClientOnly();
     seastar::future<> stop();
     void addPeer(NodeId id, seastar::socket_address addr);
 

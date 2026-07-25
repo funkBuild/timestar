@@ -381,6 +381,13 @@ seastar::future<> DataPlaneRpc::start(seastar::socket_address local, NodeStore& 
     return seastar::make_ready_future<>();
 }
 
+seastar::future<> DataPlaneRpc::startClientOnly() {
+    if (impl_->server)
+        throw std::logic_error("DataPlaneRpc::startClientOnly after start");
+    impl_->makeStubs();
+    return seastar::make_ready_future<>();
+}
+
 void DataPlaneRpc::setProposeSink(ProposeSink& sink) {
     impl_->proposeSink = &sink;
 }
