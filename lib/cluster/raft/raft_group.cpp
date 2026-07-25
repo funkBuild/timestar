@@ -152,7 +152,24 @@ seastar::future<bool> RaftGroup::proposeAndAwaitApplied(std::string data) {
                                          seastar::promise<bool> promise;
                                          fut = promise.get_future();
                                          applyWaiters_.emplace_back(idx, std::move(promise));
-                                         co_await drainReady();  // may already commit+apply (single voter) and resolve
+                                         // GROUP COMMIT. drainReady() makes the whole pending Ready
+                                         // durable with ONE fsync, so when several writes are queued on
+                                         // this group it is far cheaper to let them all append first and
+                                         // flush once than to fsync per proposal. If callers are already
+                                         // waiting on lock_, skip our drain: each of them appends in turn
+                                         // and the LAST one (which sees no waiters) flushes everyone's
+                                         // entries together.
+                                         //
+                                         // Safety: skipping leaves the entry in the IN-MEMORY log only --
+                                         // nothing is persisted, sent to peers, or applied -- so the
+                                         // "durable before observable" ordering is untouched. Progress is
+                                         // guaranteed because tick() and step() also drain under this same
+                                         // lock, so a deferred entry is flushed within one tick at worst.
+                                         // Latency is unaffected in practice: the proposal has to await a
+                                         // quorum round trip regardless, and the deferral only lasts until
+                                         // the already-queued callers finish appending.
+                                         if (lock_.waiters() == 0)
+                                             co_await drainReady();  // may commit+apply (single voter) and resolve
                                      });
     if (notLeader)
         co_return false;
