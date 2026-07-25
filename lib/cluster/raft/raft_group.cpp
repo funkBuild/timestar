@@ -6,7 +6,50 @@
 #include <seastar/core/semaphore.hh>
 #include <stdexcept>
 
+#include "../../utils/logger.hpp"
+
 namespace timestar::raft {
+
+// TEMPORARY write-path profiling, enabled with TIMESTAR_RAFT_PROFILE=1.
+// NOTE: accumulate ONLY into these shard-local counters. An earlier version passed
+// references to the caller's coroutine frame into the with_semaphore lambda; the
+// lambda outlives the frame when the caller's future is abandoned, so it wrote
+// through dangling pointers and segfaulted shard 0 under load.
+namespace {
+struct ProfileCounters {
+    uint64_t proposals = 0, drains = 0;
+    uint64_t appliedNs = 0;  // propose entry -> apply-waiter resolved
+    uint64_t inLockNs = 0;   // lock acquisition + append + (maybe) drain
+    uint64_t persistNs = 0;  // persistEntries + sync
+    uint64_t applyNs = 0;    // state-machine apply
+    uint64_t sendNs = 0;     // transport sends
+};
+thread_local ProfileCounters g_prof;
+bool profileEnabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("TIMESTAR_RAFT_PROFILE");
+        return e && e[0] == '1';
+    }();
+    return on;
+}
+inline uint64_t nowNs() {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+}
+void maybeReport() {
+    auto& p = g_prof;
+    if (p.proposals < 25)
+        return;
+    const double n = static_cast<double>(p.proposals);
+    timestar::timestar_log.info(
+        "[RAFT_PROFILE] n={} drains={} commit_latency={:.2f}ms in_lock={:.2f}ms "
+        "persist={:.2f}ms apply={:.2f}ms send={:.2f}ms (per proposal)",
+        p.proposals, p.drains, p.appliedNs / n / 1e6, p.inLockNs / n / 1e6, p.persistNs / n / 1e6, p.applyNs / n / 1e6,
+        p.sendNs / n / 1e6);
+    p = ProfileCounters{};
+}
+}  // namespace
 
 seastar::future<> RaftGroup::drainReady() {
     // Precondition: caller holds lock_. Drain every pending Ready in order.
@@ -29,23 +72,34 @@ seastar::future<> RaftGroup::drainReady() {
             co_await persistence_.persistEntries(rd.entries);
             persisted = true;
         }
+        const uint64_t tP0 = profileEnabled() ? nowNs() : 0;
         if (persisted)
             co_await persistence_.sync();
+        if (profileEnabled()) {
+            g_prof.persistNs += nowNs() - tP0;
+            ++g_prof.drains;
+        }
 
         // 2. Only now may we tell peers what we have committed to durably.
+        const uint64_t tS0 = profileEnabled() ? nowNs() : 0;
         for (auto& m : rd.messages)
             co_await transport_.send(Envelope{groupId_, m});
+        if (profileEnabled())
+            g_prof.sendNs += nowNs() - tS0;
 
         // 3. Apply committed output to the state machine (snapshot install first).
         if (rd.snapshot) {
             co_await sm_.applySnapshot(*rd.snapshot);
             appliedIndex_ = std::max<uint64_t>(appliedIndex_, rd.snapshot->index);
         }
+        const uint64_t tA0 = profileEnabled() ? nowNs() : 0;
         for (auto& e : rd.committed) {
             if (e.type == EntryType::Normal && !e.data.empty())
                 co_await sm_.apply(e);
             appliedIndex_ = std::max<uint64_t>(appliedIndex_, e.index);
         }
+        if (profileEnabled())
+            g_prof.applyNs += nowNs() - tA0;
 
         // Record newly-confirmed read barriers, then release any whose ReadIndex
         // we have now applied through.
@@ -137,6 +191,7 @@ seastar::future<> RaftGroup::waitApplied(LogIndex index) {
 }
 
 seastar::future<bool> RaftGroup::proposeAndAwaitApplied(std::string data) {
+    const uint64_t tEnter = profileEnabled() ? nowNs() : 0;
     // Register the waiter INSIDE the lock (mirroring readBarrier): capture the
     // proposed entry's index and register its promise before any drainReady can
     // observe it, so a leader flap cannot resolve or fail a half-created waiter.
@@ -144,6 +199,7 @@ seastar::future<bool> RaftGroup::proposeAndAwaitApplied(std::string data) {
     bool notLeader = false;
     co_await seastar::with_semaphore(lock_, 1,
                                      [this, data = std::move(data), &fut, &notLeader]() mutable -> seastar::future<> {
+                                         const uint64_t tL0 = profileEnabled() ? nowNs() : 0;
                                          if (!node_.propose(std::move(data))) {
                                              notLeader = true;
                                              co_return;  // not the leader: fut stays empty
@@ -170,10 +226,18 @@ seastar::future<bool> RaftGroup::proposeAndAwaitApplied(std::string data) {
                                          // the already-queued callers finish appending.
                                          if (lock_.waiters() == 0)
                                              co_await drainReady();  // may commit+apply (single voter) and resolve
+                                         if (profileEnabled())
+                                             g_prof.inLockNs += nowNs() - tL0;
                                      });
     if (notLeader)
         co_return false;
-    co_return co_await std::move(*fut);
+    const bool ok = co_await std::move(*fut);
+    if (profileEnabled()) {
+        g_prof.appliedNs += nowNs() - tEnter;
+        ++g_prof.proposals;
+        maybeReport();
+    }
+    co_return ok;
 }
 
 seastar::future<LogIndex> RaftGroup::readBarrier() {

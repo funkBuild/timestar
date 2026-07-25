@@ -1,5 +1,6 @@
 #pragma once
 
+#include <seastar/core/gate.hh>
 #include "../../core/vshard.hpp"  // assignCore
 #include "../data/node_store.hpp"
 #include "../raft/raft_driver.hpp"  // RaftTransport
@@ -38,14 +39,40 @@ public:
     seastar::future<> send(raft::Envelope env) override {
         if (seastar::this_shard_id() == 0)
             return home_->send(std::move(env));
-        // `home_` is only ever dereferenced on shard 0, where it lives.
-        return seastar::smp::submit_to(0u, [h = home_, env = std::move(env)]() mutable {
-            return h->send(std::move(env));
+        // Do NOT await the cross-shard hop. RaftGroup::drainReady() sends while
+        // holding the group lock, so awaiting put a cross-core round trip -- plus
+        // shard 0's whole queue depth -- on the critical path of every proposal.
+        // Profiling a 3-node RF=3 write bench showed shards 1..3 spending 135-225ms
+        // per proposal in send() while shard 0 was busy persisting, with all cores
+        // only ~25% utilised: the node was waiting on shard 0, not computing.
+        //
+        // Backgrounding it is safe because the shard-0 transport is ITSELF
+        // fire-and-forget (it queues the RPC under its own gate and swallows errors)
+        // -- so awaiting only ever confirmed hand-off, never delivery. Raft already
+        // tolerates dropped and reordered messages: an unacknowledged AppendEntries
+        // is retried from nextIndex on the next heartbeat.
+        if (inflight_ >= kMaxInflight)
+            return seastar::make_ready_future<>();  // shard 0 is backed up: drop, Raft retries
+        ++inflight_;
+        (void)seastar::with_gate(gate_, [this, env = std::move(env)]() mutable {
+            return seastar::smp::submit_to(0u,
+                                           [h = home_, env = std::move(env)]() mutable { return h->send(std::move(env)); })
+                .handle_exception([](std::exception_ptr) {})
+                .finally([this] { --inflight_; });
         });
+        return seastar::make_ready_future<>();
     }
+
+    // Drain background hops before the owning plane tears the transport down.
+    seastar::future<> stop() { return gate_.is_closed() ? seastar::make_ready_future<>() : gate_.close(); }
 
 private:
     raft::RaftTransport* home_;  // owned by ClusterDataPlane on shard 0
+    seastar::gate gate_;
+    size_t inflight_ = 0;
+    // Bounds the queue when shard 0 cannot keep up. Generous: normal depth is a
+    // handful per shard, and dropping a live AppendEntries costs a heartbeat.
+    static constexpr size_t kMaxInflight = 8192;
 };
 
 // Forwards a shard's peer-facing data-plane calls (leader forwarding of proposes) to
@@ -228,6 +255,10 @@ public:
             co_await plane_->stop();
         plane_.reset();
         clientProxy_.reset();
+        // Close the proxy's gate before destroying it: a backgrounded cross-shard
+        // send still references it.
+        if (raftProxy_)
+            co_await raftProxy_->stop();
         raftProxy_.reset();
         store_.reset();
         co_return;
