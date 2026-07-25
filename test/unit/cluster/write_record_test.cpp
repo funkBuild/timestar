@@ -4,7 +4,9 @@
 #include "../../../lib/cluster/data/write_record.hpp"
 
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <gtest/gtest.h>
 #include <limits>
 
@@ -392,4 +394,70 @@ TEST(WriteRecordCodec, SplitByVShardMovesEachSeriesOnce) {
     auto merged = mergeVShardBatches(std::move(groups));
     EXPECT_EQ(merged.series.size(), 50u);
     EXPECT_EQ(merged.schemaVersion, 42u);
+}
+
+namespace {
+// Peak resident set (VmHWM), in KiB. Monotone, so a delta across a decode is exactly
+// "how much memory did that decode force us to touch".
+size_t peakRssKb() {
+    std::ifstream f("/proc/self/status");
+    std::string line;
+    while (std::getline(f, line))
+        if (line.rfind("VmHWM:", 0) == 0)
+            return static_cast<size_t>(std::strtoul(line.c_str() + 6, nullptr, 10));
+    return 0;
+}
+
+// A checksum-VALID v2 frame whose single series declares `declaredCount` timestamps
+// while the body is just `bodyBytes` of filler. The count passes the bytes-remaining
+// bound (a delta is >= 1 wire byte) but is a lie about how much there is to decode.
+std::string inflatedCountV2Frame(size_t bodyBytes, uint32_t declaredCount) {
+    auto u32 = [](std::string& o, uint32_t v) {
+        for (int i = 0; i < 4; ++i)
+            o.push_back(static_cast<char>((v >> (8 * i)) & 0xff));
+    };
+    auto u64 = [](std::string& o, uint64_t v) {
+        for (int i = 0; i < 8; ++i)
+            o.push_back(static_cast<char>((v >> (8 * i)) & 0xff));
+    };
+    std::string s;
+    s.append("TSW2", 4);
+    u64(s, 0);  // schemaVersion
+    u32(s, 1);  // one series
+    s.push_back(static_cast<char>(TSMValueType::Float));
+    const std::string key = "cpu,host=h1 v";
+    u32(s, static_cast<uint32_t>(key.size()));
+    s.append(key);
+    u32(s, declaredCount);
+    s.append(bodyBytes, '\x01');  // filler deltas; decoding runs out long before the count
+    uint64_t h = 1469598103934665603ull;
+    for (char c : s) {
+        h ^= static_cast<uint8_t>(c);
+        h *= 1099511628211ull;
+    }
+    u64(s, h);
+    return s;
+}
+}  // namespace
+
+// A declared count is bound-checked against the bytes remaining, which stops an
+// over-READ but not an over-ALLOCATION: a v2 delta timestamp is >= 1 wire byte but 8
+// bytes resident. A 16 MiB frame declaring ~16.7M timestamps used to reserve ~134 MB
+// (8x the frame) before decoding a single delta -- and an inbound RPC frame is not
+// size-limited today. The reserve is now capped and grown as bytes are really
+// consumed, so a lying frame is rejected having allocated ~32 KB.
+TEST(WriteRecordCodec, InflatedCountDoesNotAmplifyMemory) {
+    constexpr size_t kFrameBytes = 16u << 20;
+    const std::string frame = inflatedCountV2Frame(kFrameBytes, kFrameBytes - 25);
+
+    const size_t before = peakRssKb();
+    ASSERT_GT(before, 0u) << "no /proc/self/status VmHWM";
+    auto decoded = decodeWriteBatch(frame);
+    const size_t after = peakRssKb();
+
+    EXPECT_FALSE(decoded.has_value()) << "a frame that lies about its count must be rejected";
+    // Generous bound: the pre-fix reserve alone was ~134 MB (8x the frame). Anything
+    // near the frame's own size is fine; an 8x blow-up is not.
+    EXPECT_LT(after - before, 32u << 10) << "decoding a 16 MiB frame grew peak RSS by " << (after - before)
+                                         << " KiB -- the declared count is being trusted for allocation again";
 }

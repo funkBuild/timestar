@@ -16,6 +16,7 @@
 
 #include <seastar/core/thread.hh>
 #include <seastar/net/socket_defs.hh>
+#include <seastar/rpc/rpc.hh>
 
 using namespace timestar;
 
@@ -106,6 +107,62 @@ data::WriteBatch oneFloatBatch() {
         series("m", {{"host", "h1"}}, "v", TSMValueType::Float, {BASE}, std::vector<double>{1.0}));
     return b;
 }
+
+// A raw seastar::rpc peer that speaks the data plane's wire framing but is NOT a
+// DataPlaneRpc: it answers the version-negotiation verb with whatever version the test
+// names, and CAPTURES the raw propose frame instead of decoding it. That is the only
+// way to assert what was actually put on the wire -- a real DataPlaneRpc decodes both
+// formats no matter which range it advertises, so it cannot tell a gated encoder from
+// one that ignores the negotiation.
+//
+// The serializer must be byte-compatible with DataPlaneRpc's (u32 length + bytes) and
+// the verb ids must match dataplane_rpc.cpp: 6 = proposeWrite, 9 = negotiateVersion.
+struct TapSerializer {};
+template <typename Output>
+void write(TapSerializer, Output& out, const seastar::sstring& v) {
+    const uint32_t n = static_cast<uint32_t>(v.size());
+    out.write(reinterpret_cast<const char*>(&n), sizeof(n));
+    out.write(v.data(), v.size());
+}
+template <typename Input>
+seastar::sstring read(TapSerializer, Input& in, seastar::rpc::type<seastar::sstring>) {
+    uint32_t n = 0;
+    in.read(reinterpret_cast<char*>(&n), sizeof(n));
+    seastar::sstring s = seastar::uninitialized_string(n);
+    in.read(s.data(), n);
+    return s;
+}
+
+class WireTapPeer {
+public:
+    std::vector<std::string> captured;  // raw proposeWrite frames, in arrival order
+
+    WireTapPeer(seastar::socket_address addr, uint32_t agreedVersion) {
+        proto_.register_handler(9, [agreedVersion](seastar::sstring) {
+            char b[4];
+            for (int i = 0; i < 4; ++i)
+                b[i] = static_cast<char>((agreedVersion >> (8 * i)) & 0xff);
+            return seastar::make_ready_future<seastar::sstring>(seastar::sstring(b, 4));
+        });
+        proto_.register_handler(6, [this](seastar::sstring data) {
+            captured.emplace_back(data.data(), data.size());
+            return seastar::make_ready_future<seastar::sstring>(seastar::sstring("1"));  // committed
+        });
+        seastar::listen_options lo;
+        lo.reuse_address = true;
+        lo.set_fixed_cpu(seastar::this_shard_id());
+        server_ = std::make_unique<seastar::rpc::protocol<TapSerializer>::server>(proto_, seastar::listen(addr, lo));
+    }
+    void stop() {
+        if (server_)
+            server_->stop().get();
+        server_.reset();
+    }
+
+private:
+    seastar::rpc::protocol<TapSerializer> proto_{TapSerializer{}};
+    std::unique_ptr<seastar::rpc::protocol<TapSerializer>::server> server_;
+};
 
 // A ReadIndexSink double: returns configured indices, or rejects (as a non-leader
 // would) when asked. Records the VShard it was asked about.
@@ -564,24 +621,50 @@ TEST_F(DataPlaneRpcEnrichedTest, ForwardedWritesSpeakTheNegotiatedWireVersion) {
         }
         // A peer that only speaks v1 (an un-upgraded node): we negotiate DOWN to 1
         // and the write still lands. Nothing about the payload changes.
+        //
+        // The peer is a WIRE TAP, not another DataPlaneRpc pinned to {1,1}: a
+        // DataPlaneRpc decodes v2 perfectly well whatever range it advertises, so a
+        // regression that ignored the negotiated version and always emitted v2 would
+        // pass against one. The tap answers the negotiate verb itself and captures the
+        // RAW propose frame, so the assertion is on the bytes actually sent.
         {
             const uint16_t serverPort = 39326, clientPort = 39327;
             const data::NodeId server = 2;
-            RecordingProposeSink propose;
-            ThrowingNodeStore s1, s2;
-            data::DataPlaneRpc srv, cli;
-            srv.setLocalVersion(features::VersionRange{1, 1});  // old binary
-            srv.setProposeSink(propose);
-            srv.start(loopback(serverPort), s1).get();
+            WireTapPeer tap(loopback(serverPort), /*agreedVersion=*/1);
+            ThrowingNodeStore s2;
+            data::DataPlaneRpc cli;
             cli.start(loopback(clientPort), s2).get();
             cli.addPeer(server, loopback(serverPort));
 
             EXPECT_EQ(cli.versionFor(server).get(), data::kWriteBatchFormatV1);
             EXPECT_TRUE(cli.proposeWrite(server, oneFloatBatch()).get());
-            EXPECT_EQ(propose.calls, 1);
-            EXPECT_EQ(propose.lastSeriesCount, 1u);
+            ASSERT_EQ(tap.captured.size(), 1u);
+            EXPECT_NE(tap.captured[0].compare(0, 4, "TSW2"), 0)
+                << "a peer that negotiated v1 must NOT be sent a v2-tagged frame";
+            // ... and it is a frame that peer's decoder really accepts.
+            EXPECT_TRUE(data::decodeWriteBatch(tap.captured[0]).has_value());
             cli.stop().get();
-            srv.stop().get();
+            tap.stop();
+        }
+        // The same tap agreeing on v2 DOES get a v2-tagged frame -- proving the leg
+        // above is testing the gate and not merely a codec that never emits v2.
+        {
+            const uint16_t serverPort = 39330, clientPort = 39331;
+            const data::NodeId server = 2;
+            WireTapPeer tap(loopback(serverPort), /*agreedVersion=*/2);
+            ThrowingNodeStore s2;
+            data::DataPlaneRpc cli;
+            cli.start(loopback(clientPort), s2).get();
+            cli.addPeer(server, loopback(serverPort));
+
+            EXPECT_EQ(cli.versionFor(server).get(), data::kWriteBatchFormatV2);
+            EXPECT_TRUE(cli.proposeWrite(server, oneFloatBatch()).get());
+            ASSERT_EQ(tap.captured.size(), 1u);
+            EXPECT_EQ(tap.captured[0].compare(0, 4, "TSW2"), 0)
+                << "a peer that negotiated v2 must be sent the v2 format";
+            EXPECT_TRUE(data::decodeWriteBatch(tap.captured[0]).has_value());
+            cli.stop().get();
+            tap.stop();
         }
         // No overlapping version: the write FAILS rather than being mis-framed, and
         // the peer's sink never sees it.

@@ -112,7 +112,13 @@ constexpr uint32_t kWriteBatchFormatV1 = 1;
 constexpr uint32_t kWriteBatchFormatV2 = 2;
 
 // Wire codec (bounds-checked; decode returns nullopt on ANY malformed/truncated/
-// inconsistent input so a hostile frame can never fabricate a batch). FNV-checksum
+// inconsistent input so a hostile frame can never fabricate a batch). Bounds-checking
+// a declared count against the bytes remaining stops an over-READ but NOT an
+// over-ALLOCATION -- an element can be far larger resident than on the wire -- so
+// element reserves are additionally capped and grown as bytes are really consumed
+// (kMaxPrereserveElems in the .cpp). Note that an inbound RPC frame itself is
+// currently unbounded: neither DataPlaneRpc nor RaftRpcTransport sets
+// seastar::rpc::resource_limits. FNV-checksum
 // trailer, same discipline as data_command. The no-version overload emits v1; the
 // versioned one emits the highest format it knows that is <= `version` (so a caller
 // can pass a negotiated version straight through).

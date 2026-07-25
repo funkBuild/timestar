@@ -104,10 +104,31 @@ struct Writer {
     void zigzag(int64_t v) { varint((static_cast<uint64_t>(v) << 1) ^ static_cast<uint64_t>(v >> 63)); }
 };
 
+// How many elements a decoder may pre-reserve on the STRENGTH OF A DECLARED COUNT
+// alone, before the bytes backing them have actually been consumed.
+//
+// A count is bound-checked against the bytes remaining, which stops an over-READ but
+// NOT an over-ALLOCATION whenever the in-memory element is bigger than its minimum
+// wire footprint: a v2 delta timestamp is >= 1 wire byte but 8 bytes resident (8x),
+// and a string is >= 4 wire bytes but sizeof(std::string) = 32 resident (8x). A
+// checksum-valid 16 MiB v2 frame declaring 16.7M timestamps allocated ~134 MB up
+// front -- the frame's own size is the only thing an inbound RPC bounds, and neither
+// DataPlaneRpc nor RaftRpcTransport sets rpc::resource_limits today.
+//
+// So: reserve at most this many elements up front and let push_back grow
+// geometrically as bytes are ACTUALLY consumed. Peak allocation then tracks what was
+// really decoded (within the vector's own 2x growth slack) instead of what a frame
+// merely claimed, and a frame that lies is rejected having allocated ~32 KB. The
+// residual 8-bytes-resident-per-wire-byte ratio of a genuinely dense v2 frame is
+// inherent to delta encoding and is a matter for an inbound frame-size limit, not for
+// the decoder.
+constexpr size_t kMaxPrereserveElems = 4096;
+
 // Bulk reader: ONE bounds check per field (or per column) instead of one per
 // byte, and the same ok=false / zero-result contract on a short buffer. Every
-// count is bound-checked against the bytes actually remaining BEFORE it is used
-// to reserve or loop, so a hostile frame can neither over-allocate nor over-read.
+// count is bound-checked against the bytes actually remaining BEFORE it is used to
+// loop -- and every element-count reserve is ADDITIONALLY capped (see
+// kMaxPrereserveElems), because the bounds check alone does not bound memory.
 struct Reader {
     const char* p;
     const char* end;
@@ -290,6 +311,35 @@ void encodeSeries(Writer& w, const WriteSeries& s, uint32_t version) {
     w.u64Column(s.revisions.data(), s.revisions.size());
 }
 
+// The minimum number of WIRE bytes one POINT of this series costs -- timestamp plus
+// value, which is what a declared count must actually be paid for.
+//
+// Bounding the count by the timestamp alone is what let a v2 frame amplify: a delta is
+// >= 1 wire byte but 8 bytes resident, so a 16 MiB frame could declare 16.7M
+// timestamps, build 134 MB of them, and only THEN fail on the value column it could
+// never have contained. Every point owes a value too, so charge for it up front: a
+// float point is >= 9 v2 wire bytes, and the same frame can now declare at most ~1.86M
+// of them. This rejects nothing legitimate -- it is a true lower bound on what the
+// format requires -- and it caps resident growth at ~2x the frame for the densest
+// legal v2 frame (16 resident bytes per >= 9 wire bytes) instead of 8x.
+size_t minWireBytesPerPoint(TSMValueType type, uint32_t version) {
+    const size_t ts = version >= kWriteBatchFormatV2 ? 1 : 8;  // varint delta vs fixed u64
+    size_t value = 0;
+    switch (type) {
+        case TSMValueType::Float:
+        case TSMValueType::Integer:
+            value = 8;
+            break;
+        case TSMValueType::Boolean:
+            value = 1;
+            break;
+        case TSMValueType::String:
+            value = 4;  // the length prefix; the bytes themselves may be empty
+            break;
+    }
+    return ts + value;
+}
+
 // One series' body. Returns false on any malformed/inconsistent input.
 bool decodeSeries(Reader& r, WriteSeries& s, uint32_t version) {
     uint8_t t = r.u8();
@@ -298,11 +348,14 @@ bool decodeSeries(Reader& r, WriteSeries& s, uint32_t version) {
     s.type = static_cast<TSMValueType>(t);
     s.seriesKey = r.str();
     uint32_t count = r.u32();
+    // Charge the count for a whole POINT (timestamp + value), not just its timestamp:
+    // see minWireBytesPerPoint. The reserve is ALSO capped and grown as bytes are
+    // really consumed (kMaxPrereserveElems), so neither the bound nor the reserve
+    // trusts a declared count on its own.
+    if (!r.boundCount(count, minWireBytesPerPoint(s.type, version)))
+        return false;
     if (version >= kWriteBatchFormatV2) {
-        // A delta is >= 1 byte, so the count cannot exceed the bytes remaining.
-        if (!r.boundCount(count, 1))
-            return false;
-        s.timestamps.reserve(count);
+        s.timestamps.reserve(std::min<size_t>(count, kMaxPrereserveElems));
         uint64_t prev = 0;
         for (uint32_t k = 0; k < count; ++k) {
             prev = (k == 0) ? r.u64() : prev + static_cast<uint64_t>(r.zigzag());
@@ -311,8 +364,6 @@ bool decodeSeries(Reader& r, WriteSeries& s, uint32_t version) {
             s.timestamps.push_back(prev);
         }
     } else {
-        if (!r.boundCount(count, 8))  // each ts is 8B (floor bound)
-            return false;
         r.u64Column(s.timestamps, count);
     }
     switch (s.type) {
@@ -345,9 +396,8 @@ bool decodeSeries(Reader& r, WriteSeries& s, uint32_t version) {
         }
         case TSMValueType::String: {
             std::vector<std::string> v;
-            if (!r.boundCount(count, 4))  // each string carries a 4-byte length prefix
-                return false;
-            v.reserve(count);
+            // 4 wire bytes (the length prefix) buys 32 resident, so cap the reserve.
+            v.reserve(std::min<size_t>(count, kMaxPrereserveElems));
             for (uint32_t k = 0; k < count; ++k)
                 v.push_back(r.str());
             s.values = std::move(v);
@@ -366,10 +416,11 @@ std::optional<WriteBatch> decodeBody(const char* body, size_t bodyLen, uint32_t 
     WriteBatch batch;
     batch.schemaVersion = r.u64();
     uint32_t ns = r.u32();
-    // Each series needs at least type(1)+keyLen(4)+count(4)+revCount(4) = 13 bytes.
+    // Each series needs at least type(1)+keyLen(4)+count(4)+revCount(4) = 13 bytes --
+    // against sizeof(WriteSeries) = 144 resident, so this reserve is capped too.
     if (!r.boundCount(ns, 13))
         return std::nullopt;
-    batch.series.reserve(ns);
+    batch.series.reserve(std::min<size_t>(ns, kMaxPrereserveElems));
     for (uint32_t i = 0; i < ns; ++i) {
         // s.vshard stays kUnroutedVShard: the routing hint is never on the wire, so a
         // decoded series is routed by re-deriving it from seriesKey (see vshardOf).

@@ -76,7 +76,18 @@ std::string encodeReplicatedCommand(const ReplicatedCommand& cmd) {
         out.push_back(static_cast<char>(kWrite));
         // WriteBatch arm reuses the tested encoder as a length-prefixed sub-blob
         // (it carries its own FNV; the outer trailer covers the tag + blob).
-        putStr(out, encodeWriteBatch(*w));
+        //
+        // The version is PINNED EXPLICITLY, not left to the encoder's default. These
+        // bytes become a Raft log entry: they are replicated to every voter and written
+        // to each one's journal, so the format must be one that EVERY voter -- and every
+        // future binary replaying that journal -- can read. Voters take no part in the
+        // pairwise data-plane version handshake, so per-peer negotiation cannot gate
+        // this; raising it needs the cluster-wide gate group-0's committed format
+        // activation provides (activeFormatVersion / features::FeatureGate, see
+        // write_record.hpp). Spelling v1 out here means a change to the encoder's
+        // DEFAULT can never silently promote the journal format
+        // (docs/write-scaleout-plan.md §6).
+        putStr(out, encodeWriteBatch(*w, kWriteBatchFormatV1));
     } else if (const auto* d = std::get_if<DeleteRangeKey>(&cmd)) {
         out.push_back(static_cast<char>(kDelete));
         putStr(out, d->seriesKey);

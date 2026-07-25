@@ -510,6 +510,16 @@ seastar::future<uint32_t> DataPlaneRpc::versionFor(NodeId to) {
     // negotiateVersion (no overlapping range), which fails the write closed instead of
     // shipping it a frame it would misparse. Failures are not cached, so the next
     // attempt re-handshakes.
+    //
+    // Resolve the CONNECTION FIRST, before reading the cache. clientFor is what notices
+    // a dead client, retires it and drops the cached version with it -- so reading the
+    // cache first would hand back the DEAD connection's version and send exactly one
+    // frame at it over the fresh connection. That is the rolling-DOWNGRADE case this
+    // handshake exists for: a peer restarting on an older binary would get one v2 frame
+    // (a spurious client 5xx rather than corruption, since it fails closed -- but it is
+    // the case the gate is for).
+    if (!impl_->clientFor(to))
+        throw std::runtime_error("dataplane: unknown peer");
     auto it = impl_->agreedVersion.find(to);
     if (it != impl_->agreedVersion.end())
         co_return it->second;

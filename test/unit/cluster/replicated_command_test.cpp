@@ -67,3 +67,39 @@ TEST(ReplicatedCommandCodec, TruncationAndCorruptionRejected) {
     unk[0] = 0x7f;  // invalid kind (checksum now wrong too -> rejected either way)
     EXPECT_FALSE(decodeReplicatedCommand(unk).has_value());
 }
+
+// write-scaleout 2c FORMAT PIN: these bytes become a Raft log entry -- replicated to
+// every voter and written to every journal -- so the WriteBatch sub-blob must be v1
+// unconditionally. Voters take no part in the pairwise data-plane version handshake,
+// so nothing negotiates this; promoting it needs group-0's committed format activation
+// (docs/write-scaleout-plan.md §6). Without this test, changing encodeWriteBatch's
+// DEFAULT version would silently promote every journal entry.
+TEST(ReplicatedCommandCodec, WriteBatchArmIsPinnedToTheV1JournalFormat) {
+    WriteBatch b;
+    b.series = {floatSeries()};
+    // Many points, so v2 would be a large and obvious size win -- i.e. exactly the
+    // batch a future "just use the newest format" change would target.
+    b.series[0].timestamps.clear();
+    std::vector<double> vals;
+    for (uint64_t i = 0; i < 500; ++i) {
+        b.series[0].timestamps.push_back(1700000000000000000ull + i * 1000000ull);
+        vals.push_back(static_cast<double>(i));
+    }
+    b.series[0].values = vals;
+
+    const std::string enc = encodeReplicatedCommand(ReplicatedCommand{b});
+    // Layout: u8 tag | u32 subBlobLen | subBlob | u64 fnv. The sub-blob starts at 5.
+    ASSERT_GT(enc.size(), 9u);
+    EXPECT_NE(enc.compare(5, 4, "TSW2"), 0)
+        << "the Raft/journal command must carry a v1 WriteBatch -- a v2 blob here would "
+           "be written to journals no older binary (and no un-upgraded voter) can read";
+    // It must still be the real, decodable command.
+    auto back = decodeReplicatedCommand(enc);
+    ASSERT_TRUE(back.has_value());
+    ASSERT_TRUE(std::holds_alternative<WriteBatch>(*back));
+    EXPECT_EQ(std::get<WriteBatch>(*back).series[0].timestamps.size(), 500u);
+    // And it is byte-for-byte what the explicitly-v1 encoder produces.
+    EXPECT_EQ(enc.compare(5, encodeWriteBatch(b, kWriteBatchFormatV1).size(),
+                          encodeWriteBatch(b, kWriteBatchFormatV1)),
+              0);
+}
