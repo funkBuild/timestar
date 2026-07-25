@@ -11,6 +11,7 @@
 #include "../raft/raft_rpc_transport.hpp"
 #include "engine_local_store.hpp"
 #include "replicated_data_plane.hpp"
+#include "write_admission.hpp"
 
 #include <chrono>
 #include <exception>
@@ -357,8 +358,32 @@ private:
 // even after one fails (abandoning an in-flight one would let its commit land on a
 // destroyed continuation), and the first error is rethrown so a partial batch always
 // surfaces as a retryable failure rather than a silent partial success.
-inline seastar::future<> writeSlicesToOwningShards(seastar::sharded<ShardRaftPlane>& shards,
-                                                   data::WriteBatch batch) {
+//
+// `dir` is optional (null in the unit tests that exercise only the shard fan-out). When
+// present the WHOLE batch is validated against it BEFORE any slice is dispatched
+// (write-scaleout 3d): the per-shard router also fail-closes on an unassigned VShard, but
+// it only sees ITS OWN slice, so a batch whose unassigned VShard happened to land on the
+// last shard could durably commit the other shards' slices and only then fail the client
+// -- a partial commit reported as an error, which is precisely the state the ack contract
+// forbids. The directory is immutable after start() and is already shared with every
+// shard's router, so reading it here is the same access those do.
+inline seastar::future<> writeSlicesToOwningShards(seastar::sharded<ShardRaftPlane>& shards, data::WriteBatch batch,
+                                                   const data::VShardDirectory* dir = nullptr) {
+    if (dir) {
+        for (auto& s : batch.series) {
+            const uint16_t vs = data::vshardOf(s);
+            if (dir->ownerOf(vs) == data::kNoNode)
+                throw data::UnassignedVShardError("cluster: VShard " + std::to_string(vs) +
+                                                  " is unassigned in the current placement map");
+        }
+    }
+    // Charge this batch against THIS shard's in-flight write budget for the whole
+    // coordination (write-scaleout 3d). It is taken here, on the request shard, because
+    // this is where a batch's memory is held from: the slices, the retries and every
+    // awaited quorum round hang off this frame. Over budget -> WriteOverloadedError,
+    // which the HTTP layer turns into 503 + Retry-After; the guard releases on every
+    // exit path.
+    WriteAdmissionGuard admission(data::approxResidentBytes(batch));
     // Split by VShard ONCE (write-scaleout 2b) and bucket the resulting groups by
     // owning shard. Everything below -- the leader-node bucketing in the router and
     // the per-group propose -- re-buckets these same groups, so each series is moved

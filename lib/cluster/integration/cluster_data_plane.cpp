@@ -427,7 +427,7 @@ seastar::future<> ClusterDataPlane::writeFromShard(data::WriteBatch batch) {
     // would silently resolve against a null one.
     if (!replicated_ || !shardsStarted_)
         throw std::runtime_error("ClusterDataPlane::writeFromShard requires replicated mode after start()");
-    return writeSlicesToOwningShards(shards_, std::move(batch));
+    return writeSlicesToOwningShards(shards_, std::move(batch), dir_.get());
 }
 
 seastar::future<bool> ClusterDataPlane::proposeBatch(data::WriteBatch batch) {

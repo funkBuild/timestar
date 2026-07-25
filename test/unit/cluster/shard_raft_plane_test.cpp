@@ -347,3 +347,64 @@ TEST_F(ShardRaftPlaneTest, ProposeOverSocketSplitsAcrossOwningShardsAndFailsClea
     }).get();
 }
 
+// write-scaleout 3d: the WHOLE batch is validated against the placement map on the
+// REQUEST shard, before a single slice is dispatched.
+//
+// The per-shard router also fail-closes on an unassigned VShard, but it only ever sees
+// its own slice -- so a batch whose one unassigned VShard happened to land on the last
+// shard could durably commit every other shard's slice and only then fail the client.
+// That is a partial commit reported as an error, which the ack contract forbids.
+//
+// The discriminator is the exception TYPE: with the check, UnassignedVShardError before
+// any dispatch; without it, the slices reach the (uninitialised, hence not-ready) planes
+// and the caller sees kShardStoppingError instead.
+TEST_F(ShardRaftPlaneTest, UnassignedVShardFailsTheWholeBatchBeforeAnyDispatch) {
+    seastar::async([] {
+        seastar::sharded<cluster::ShardRaftPlane> shards;
+        shards.start().get();
+
+        data::WriteBatch batch;
+        for (int i = 0; i < 64; ++i)
+            batch.series.push_back(floatSeries(buildSeriesKey("m", {{"host", "h" + std::to_string(i)}}, "v"), 1.0));
+
+        // A full map, minus the VShard of the LAST series -- so every earlier slice is
+        // routable and would commit if the check were per-shard.
+        data::WriteSeries last = batch.series.back();
+        const uint16_t orphan = data::vshardOf(last);
+        ControlMap m;
+        m.epoch = 1;
+        for (uint16_t v = 0; v < timestar::VIRTUAL_SHARD_COUNT; ++v)
+            if (v != orphan)
+                m.placement[v] = {1, 2, 3};
+        data::VShardDirectory dir(1, m);
+
+        try {
+            data::WriteBatch copy;
+            copy.series = batch.series;
+            cluster::writeSlicesToOwningShards(shards, std::move(copy), &dir).get();
+            ADD_FAILURE() << "a batch touching an unassigned VShard must be refused";
+        } catch (const data::UnassignedVShardError&) {
+            // exactly right: fail-closed, nothing dispatched
+        } catch (const std::exception& e) {
+            ADD_FAILURE() << "expected UnassignedVShardError (pre-dispatch), got: " << e.what();
+        }
+
+        // A fully-assigned map gets past the check and fails LATER, at the (not-ready)
+        // planes -- proving the check above is the thing that fired, not a broken harness.
+        ControlMap full;
+        full.epoch = 1;
+        for (uint16_t v = 0; v < timestar::VIRTUAL_SHARD_COUNT; ++v)
+            full.placement[v] = {1, 2, 3};
+        data::VShardDirectory fullDir(1, full);
+        try {
+            cluster::writeSlicesToOwningShards(shards, std::move(batch), &fullDir).get();
+            ADD_FAILURE() << "the planes are not started; this must fail";
+        } catch (const data::UnassignedVShardError& e) {
+            ADD_FAILURE() << "a fully-assigned map must pass the placement check: " << e.what();
+        } catch (const std::runtime_error& e) {
+            EXPECT_STREQ(e.what(), cluster::kShardStoppingError);
+        }
+
+        shards.stop().get();
+    }).get();
+}

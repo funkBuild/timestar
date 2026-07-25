@@ -1,5 +1,6 @@
 #include "http_write_handler.hpp"
 
+#include "../cluster/data/write_errors.hpp"
 #include "../cluster/data/write_record.hpp"
 #include "../cluster/integration/cluster_gateway.hpp"
 #include "../cluster/integration/cluster_write.hpp"
@@ -2047,9 +2048,27 @@ seastar::future<bool> HttpWriteHandler::processBatchWrites(const json_value_t::a
     int64_t failedWrites = 0;
     std::vector<std::string> writeErrors;
     std::optional<std::string> tooLargeError;
+    // A cluster availability failure is NOT a per-point problem, so it must not be folded
+    // into a 200 "partial": the batch failed for a reason the client can act on, and the
+    // whole write is safe to re-send (LWW). Captured here and rethrown below so the
+    // top-level handler maps it to 503/413 rather than reporting a partial success whose
+    // missing points nobody will ever retry.
+    std::exception_ptr clusterError;
     for (size_t i = 0; i < shardResults.size(); ++i) {
         try {
             shardResults[i].get();
+        } catch (const timestar::data::RetryableWriteError&) {
+            if (!clusterError)
+                clusterError = std::current_exception();
+        } catch (const timestar::data::WriteOverloadedError&) {
+            if (!clusterError)
+                clusterError = std::current_exception();
+        } catch (const timestar::data::UnassignedVShardError&) {
+            if (!clusterError)
+                clusterError = std::current_exception();
+        } catch (const timestar::data::WriteFrameTooLargeError&) {
+            if (!clusterError)
+                clusterError = std::current_exception();
         } catch (const timestar::InsertTooLargeException& e) {
             const unsigned shard = activeShards[i];
             timestar::http_log.warn("Batch too large for WAL segment on shard {}: {}", shard, e.what());
@@ -2077,6 +2096,10 @@ seastar::future<bool> HttpWriteHandler::processBatchWrites(const json_value_t::a
     if (tooLargeError.has_value() && pointsWritten == 0) {
         unpoisonKnownSeries(acc.metaOps);
         throw timestar::InsertTooLargeException(*tooLargeError);
+    }
+    if (clusterError) {
+        unpoisonKnownSeries(acc.metaOps);
+        std::rethrow_exception(clusterError);
     }
 
 #if TIMESTAR_LOG_INSERT_PATH
@@ -2310,14 +2333,57 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleW
             rep->_content = createErrorResponse(e.what());
         }
         timestar::http::setContentType(*rep, resFmt);
-    } catch (const std::exception& e) {
+    } catch (const timestar::data::WriteFrameTooLargeError& e) {
+        // A single encoded inter-node slice is bigger than any peer will admit. That is a
+        // property of the REQUEST, not a server fault, and no retry can shrink it -- so
+        // 413, alongside the WAL-segment case above, rather than the opaque 500 it used
+        // to become.
         ++engineSharded->local().metrics().insert_errors_total;
-        timestar::http_log.error("Error handling write request: {}", e.what());
-        rep->set_status(seastar::http::reply::status_type::internal_server_error);
+        timestar::http_log.warn("Write rejected, inter-node frame too large: {}", e.what());
+        rep->set_status(seastar::http::reply::status_type::payload_too_large);
         if (timestar::http::isProtobuf(resFmt)) {
-            rep->_content = timestar::proto::formatWriteResponse("error", 0, 0, {"Internal server error"});
+            rep->_content = timestar::proto::formatWriteResponse("error", 0, 0, {std::string(e.what())});
         } else {
-            rep->_content = createErrorResponse("Internal server error");
+            rep->_content = createErrorResponse(e.what());
+        }
+        timestar::http::setContentType(*rep, resFmt);
+    } catch (const std::exception& e) {
+        // Cluster write failures that the CLIENT should retry -- a leader that moved and
+        // outlived the coordinator's retry budget, a shard shutting down, an admission or
+        // in-flight-bytes rejection, an unassigned VShard -- are availability, not faults.
+        // They used to fall into the catch-all below and be reported as "Internal server
+        // error" 500: indistinguishable from a genuine bug, and it told a client that
+        // retrying was pointless when retrying was exactly right. 503 + Retry-After is the
+        // convention the single-node ingest backlog already uses (see IngestBacklogException
+        // above) and what the rolling-rebalance gate needs in order to be a latency event
+        // rather than a client error.
+        //
+        // Caught as one clause because all four map to the same answer; the message names
+        // which. Everything else still becomes an opaque 500 -- deliberately, since an
+        // unrecognised failure is a bug and must not be dressed up as backpressure.
+        const bool retryable = dynamic_cast<const timestar::data::RetryableWriteError*>(&e) != nullptr ||
+                               dynamic_cast<const timestar::data::WriteOverloadedError*>(&e) != nullptr ||
+                               dynamic_cast<const timestar::data::UnassignedVShardError*>(&e) != nullptr ||
+                               std::string_view(e.what()).find("shard data plane is stopping") !=
+                                   std::string_view::npos;
+        ++engineSharded->local().metrics().insert_errors_total;
+        if (retryable) {
+            timestar::http_log.warn("Write rejected, retryable cluster condition: {}", e.what());
+            rep->set_status(seastar::http::reply::status_type::service_unavailable);
+            rep->_headers["Retry-After"] = "1";
+            if (timestar::http::isProtobuf(resFmt)) {
+                rep->_content = timestar::proto::formatWriteResponse("error", 0, 0, {std::string(e.what())});
+            } else {
+                rep->_content = createErrorResponse(e.what());
+            }
+        } else {
+            timestar::http_log.error("Error handling write request: {}", e.what());
+            rep->set_status(seastar::http::reply::status_type::internal_server_error);
+            if (timestar::http::isProtobuf(resFmt)) {
+                rep->_content = timestar::proto::formatWriteResponse("error", 0, 0, {"Internal server error"});
+            } else {
+                rep->_content = createErrorResponse("Internal server error");
+            }
         }
         timestar::http::setContentType(*rep, resFmt);
     }
