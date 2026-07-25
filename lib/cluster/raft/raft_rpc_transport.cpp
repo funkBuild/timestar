@@ -2,7 +2,6 @@
 
 #include "raft_codec.hpp"
 
-
 #include <chrono>
 #include <cstdint>
 #include <map>
@@ -178,8 +177,27 @@ seastar::future<> RaftRpcTransport::start(seastar::socket_address local, Deliver
         lo.lba = seastar::server_socket::load_balancing_algorithm::connection_distribution;
     else
         lo.set_fixed_cpu(seastar::this_shard_id());
-    impl_->server = std::make_unique<seastar::rpc::protocol<RaftSerializer>::server>(
-        impl_->proto, seastar::listen(local, lo));
+    // Bound inbound admission. Without resource_limits seastar admits an unbounded
+    // amount of in-flight request memory, so a peer (mTLS is optional on this
+    // transport) can spend this node's memory for it.
+    //
+    // This bound is deliberately LOOSE, unlike the data plane's, and it must stay that
+    // way until two producers stop being unbounded: a catch-up AppendEntries carries
+    // `log_.entriesFrom(nextIndex)` -- the WHOLE log tail in one message -- and an
+    // InstallSnapshot carries an entire VShard snapshot payload (TSM bytes). Both are
+    // legitimate and can be large. The verb is also no_wait, so an over-limit message
+    // is DROPPED with no reply rather than error-replied: too tight a bound would make a
+    // lagging follower retry the same oversized append forever and never catch up,
+    // silently. Capping those two producers (chunked append / chunked snapshot) is the
+    // prerequisite for tightening this, and is Phase-5 work.
+    //
+    // bloat_factor stays 1: entry bytes are persisted roughly 1:1 here. The amplifying
+    // WriteBatch decode happens later, at APPLY, which is behind commit -- i.e. behind
+    // the Raft protocol itself, not reachable by an unsolicited frame.
+    seastar::rpc::resource_limits lim;
+    lim.max_memory = size_t{1} << 30;  // 1 GiB of in-flight inbound Raft traffic
+    impl_->server =
+        std::make_unique<seastar::rpc::protocol<RaftSerializer>::server>(impl_->proto, seastar::listen(local, lo), lim);
     return seastar::make_ready_future<>();
 }
 

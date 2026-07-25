@@ -88,9 +88,14 @@ TEST(ReplicatedCommandCodec, WriteBatchArmIsPinnedToTheV1JournalFormat) {
     b.series[0].values = vals;
 
     const std::string enc = encodeReplicatedCommand(ReplicatedCommand{b});
-    // Layout: u8 tag | u32 subBlobLen | subBlob | u64 fnv. The sub-blob starts at 5.
-    ASSERT_GT(enc.size(), 9u);
-    EXPECT_NE(enc.compare(5, 4, "TSW2"), 0)
+    // Layout: u8 arm tag | u32 subBlobLen | subBlob | u64 fnv trailer.
+    constexpr size_t kArmTagBytes = 1;
+    constexpr size_t kLenPrefixBytes = 4;
+    constexpr size_t kSubBlobOffset = kArmTagBytes + kLenPrefixBytes;
+    constexpr size_t kMagicBytes = 4;
+    const std::string v1 = encodeWriteBatch(b, kWriteBatchFormatV1);
+    ASSERT_GT(enc.size(), kSubBlobOffset + kMagicBytes);
+    EXPECT_NE(enc.compare(kSubBlobOffset, kMagicBytes, "TSW2"), 0)
         << "the Raft/journal command must carry a v1 WriteBatch -- a v2 blob here would "
            "be written to journals no older binary (and no un-upgraded voter) can read";
     // It must still be the real, decodable command.
@@ -99,7 +104,5 @@ TEST(ReplicatedCommandCodec, WriteBatchArmIsPinnedToTheV1JournalFormat) {
     ASSERT_TRUE(std::holds_alternative<WriteBatch>(*back));
     EXPECT_EQ(std::get<WriteBatch>(*back).series[0].timestamps.size(), 500u);
     // And it is byte-for-byte what the explicitly-v1 encoder produces.
-    EXPECT_EQ(enc.compare(5, encodeWriteBatch(b, kWriteBatchFormatV1).size(),
-                          encodeWriteBatch(b, kWriteBatchFormatV1)),
-              0);
+    EXPECT_EQ(enc.compare(kSubBlobOffset, v1.size(), v1), 0);
 }

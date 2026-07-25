@@ -322,6 +322,13 @@ void encodeSeries(Writer& w, const WriteSeries& s, uint32_t version) {
 // of them. This rejects nothing legitimate -- it is a true lower bound on what the
 // format requires -- and it caps resident growth at ~2x the frame for the densest
 // legal v2 frame (16 resident bytes per >= 9 wire bytes) instead of 8x.
+//
+// It is EXACTLY TIGHT for all eight (type, version) pairs: a densest-legal frame pays
+// precisely this many bytes per point (the first timestamp costs 8 rather than 1, which
+// only ever leaves slack). DO NOT RAISE IT. In particular do not add the revision
+// column's 8 bytes: revisions are OPTIONAL (`nrev == 0 || nrev == count`), and a batch
+// on the write path carries none at all -- charging for them would reject every real
+// pre-apply frame. Any addition here must be something EVERY point provably pays for.
 size_t minWireBytesPerPoint(TSMValueType type, uint32_t version) {
     const size_t ts = version >= kWriteBatchFormatV2 ? 1 : 8;  // varint delta vs fixed u64
     size_t value = 0;

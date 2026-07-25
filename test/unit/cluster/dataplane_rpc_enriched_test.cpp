@@ -18,6 +18,9 @@
 #include <seastar/net/socket_defs.hh>
 #include <seastar/rpc/rpc.hh>
 
+#include <cstdlib>
+#include <fstream>
+
 using namespace timestar;
 
 namespace {
@@ -131,6 +134,75 @@ seastar::sstring read(TapSerializer, Input& in, seastar::rpc::type<seastar::sstr
     seastar::sstring s = seastar::uninitialized_string(n);
     in.read(s.data(), n);
     return s;
+}
+
+// A raw CLIENT on the same framing: lets a test put ARBITRARY bytes on a data-plane
+// verb, which is the only way to exercise inbound admission against a frame no
+// DataPlaneRpc would ever encode.
+class RawPeerClient {
+public:
+    explicit RawPeerClient(seastar::socket_address addr) : client_(proto_, addr) {
+        send_ = proto_.make_client<seastar::sstring(seastar::sstring)>(3);  // kForwardWriteBatch
+    }
+    seastar::sstring sendRaw(const std::string& bytes) {
+        return send_(client_, seastar::sstring(bytes.data(), bytes.size())).get();
+    }
+    void stop() { client_.stop().get(); }
+
+private:
+    seastar::rpc::protocol<TapSerializer> proto_{TapSerializer{}};
+    seastar::rpc::protocol<TapSerializer>::client client_;
+    std::function<seastar::future<seastar::sstring>(seastar::rpc::protocol<TapSerializer>::client&, seastar::sstring)>
+        send_;
+};
+
+// Peak resident set (VmHWM) in KiB -- monotone, so a delta across one call is what that
+// call forced us to touch.
+size_t peakRssKb() {
+    std::ifstream f("/proc/self/status");
+    std::string line;
+    while (std::getline(f, line))
+        if (line.rfind("VmHWM:", 0) == 0)
+            return static_cast<size_t>(std::strtoul(line.c_str() + 6, nullptr, 10));
+    return 0;
+}
+
+// A checksum-valid v1 WriteBatch frame of `n` EMPTY Float series. Each costs exactly the
+// 13 wire bytes the decoder charges for (type + zero keyLen + zero count + zero
+// revCount) and 144 bytes resident -- an 11x structural ratio no decoder change can
+// alter, which is why inbound admission is the lever. Built as raw bytes, so the test
+// itself never materialises the 458 MB it is about to refuse.
+std::string emptySeriesFrame(size_t n) {
+    auto u32 = [](std::string& o, uint32_t v) {
+        for (int i = 0; i < 4; ++i)
+            o.push_back(static_cast<char>((v >> (8 * i)) & 0xff));
+    };
+    auto u64 = [](std::string& o, uint64_t v) {
+        for (int i = 0; i < 8; ++i)
+            o.push_back(static_cast<char>((v >> (8 * i)) & 0xff));
+    };
+    std::string s;
+    s.reserve(n * 13 + 24);
+    u64(s, 0);                            // schemaVersion
+    u32(s, static_cast<uint32_t>(n));     // series count
+    for (size_t i = 0; i < n; ++i) {
+        s.push_back(static_cast<char>(TSMValueType::Float));
+        u32(s, 0);  // empty seriesKey
+        u32(s, 0);  // zero points
+        u32(s, 0);  // zero revisions
+    }
+    uint64_t h = 1469598103934665603ull;
+    for (char c : s) {
+        h ^= static_cast<uint8_t>(c);
+        h *= 1099511628211ull;
+    }
+    u64(s, h);
+    return s;
+}
+
+// A small, legal frame -- used to prove a connection still works after a refusal.
+std::string encodeWriteBatchForTest() {
+    return data::encodeWriteBatch(oneFloatBatch(), data::kWriteBatchFormatV1);
 }
 
 class WireTapPeer {
@@ -691,5 +763,59 @@ TEST_F(DataPlaneRpcEnrichedTest, ForwardedWritesSpeakTheNegotiatedWireVersion) {
             cli.stop().get();
             srv.stop().get();
         }
+    }).get();
+}
+
+// Inbound admission is bounded (rpc::resource_limits). The shape that matters is LEGAL
+// and so cannot be rejected by any decoder bound: ~1.29M empty Float series, each
+// exactly the 13 wire bytes the codec charges for and 144 bytes resident, is a
+// checksum-valid 16 MiB frame that used to decode into ~458 MB and be RETAINED (handed
+// to applyWrites) -- unauthenticated remote memory exhaustion whenever mTLS is not
+// configured. seastar refuses it before the handler runs, on a connection that stays up,
+// so the caller sees a clean retryable failure.
+TEST_F(DataPlaneRpcEnrichedTest, OversizedInboundFrameIsRefusedWithoutAmplifying) {
+    seastar::async([] {
+        const uint16_t port = 39332;
+        ThrowingNodeStore sink;  // would throw "apply boom" IF the frame ever reached it
+        data::DataPlaneRpc srv;
+        srv.start(loopback(port), sink).get();
+
+        // 1.29M series x 13B = ~16 MiB on the wire, ~458 MB resident if decoded.
+        const std::string frame = emptySeriesFrame(1290554);
+        ASSERT_GT(frame.size(), 16u << 20);
+
+        RawPeerClient cli(loopback(port));
+        const size_t before = peakRssKb();
+        ASSERT_GT(before, 0u) << "no /proc/self/status VmHWM";
+        std::string err;
+        try {
+            cli.sendRaw(frame);
+            ADD_FAILURE() << "an over-budget frame must be refused";
+        } catch (const std::exception& e) {
+            err = e.what();
+        }
+        const size_t after = peakRssKb();
+
+        // Refused by ADMISSION, not by the sink: "apply boom" would mean the frame was
+        // decoded first (and the 458 MB already spent).
+        EXPECT_NE(err.find("memory limit"), std::string::npos)
+            << "expected an admission rejection, got: " << err;
+        EXPECT_EQ(err.find("apply boom"), std::string::npos) << "the frame reached the handler: " << err;
+        EXPECT_LT(after - before, 64u << 10) << "refusing a 16 MiB frame grew peak RSS by " << (after - before)
+                                             << " KiB -- inbound admission is not bounding decode amplification";
+
+        // The connection is NOT wedged: a normal write on the SAME connection still
+        // works, so this is a retryable error rather than a dead peer.
+        bool threwOnGood = false;
+        try {
+            cli.sendRaw(encodeWriteBatchForTest());
+        } catch (const std::exception& e) {
+            // ThrowingNodeStore always throws -- what matters is that it REACHED it.
+            threwOnGood = std::string(e.what()).find("apply boom") != std::string::npos;
+        }
+        EXPECT_TRUE(threwOnGood) << "the connection must survive a refused frame";
+
+        cli.stop();
+        srv.stop().get();
     }).get();
 }
