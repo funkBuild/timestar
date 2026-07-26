@@ -53,7 +53,11 @@ public:
     // drainReady only runs when something drives this group. A leader that has LOST
     // QUORUM -- two of three replicas down or partitioned -- keeps ticking but can never
     // commit, and with checkQuorum off it never steps down either, so nothing ever
-    // resolves or fails the waiter. It suspends FOREVER. Every resource the caller holds
+    // resolves or fails the waiter. It suspends FOREVER. (The data plane now runs WITH
+    // checkQuorum -- debt D-9 -- but that is a belt, not a replacement: it bounds the
+    // CONDITION, in units of one election timeout, while this deadline bounds each
+    // WAITER. A caller passing nullopt still gets an unbounded wait, and every group
+    // built by a caller that leaves checkQuorum off still needs this.) Every resource the caller holds
     // for the duration (the coordinator's in-flight-byte charge, an inbound RPC slot)
     // is held forever with it, and a between-attempts deadline one layer up cannot help:
     // the attempt never returns to be timed out. RF=3 with two nodes down must FAIL the

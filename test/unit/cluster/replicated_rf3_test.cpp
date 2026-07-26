@@ -193,7 +193,9 @@ seastar::future<T> drive(seastar::future<T> f, Nodes& nodes, Router& router, int
 }
 
 // The real current leader is the one reporting leadership with the HIGHEST term.
-// A partitioned stale leader still self-reports isLeader() (checkQuorum is off),
+// A partitioned stale leader still self-reports isLeader() (this harness's options leave
+// checkQuorum off -- the production data plane now enables it, so there the step-down
+// happens within an election timeout; the tie-break below must hold either way),
 // but at a lower term and unable to commit -- so term breaks the tie. That two
 // nodes can momentarily self-report leader at different terms is not split brain:
 // only the higher-term one can gather a quorum and acknowledge a write.

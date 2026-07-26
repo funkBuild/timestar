@@ -154,32 +154,60 @@ seastar::future<> ClusterDataPlane::start(const ClusterConfig& cfg, seastar::sha
         // bound, not the send bound, because the transport measures the encoded envelope
         // and `maxMessageBytes` is compared against the snapshot payload alone.
         ropts.maxMessageBytes = raft::kMaxRaftPayloadBytes;
-        // ropts.checkQuorum STAYS OFF. DO NOT ENABLE IT HERE -- it looks free and it is
-        // not: with CheckQuorum on, LEADERSHIP TRANSFER BREAKS.
+        // CheckQuorum is ON, and it took a revert and a wire-format change to get here.
+        // READ THIS BEFORE TOUCHING IT, in either direction.
         //
-        // TimeoutNow lets the TRANSFEREE skip its own lease and campaign immediately
-        // (raft_node.cpp, the TimeoutNow arm), but the vote it then sends is an ordinary
-        // RequestVote -- our RequestVote carries no transfer/force marker (raft_messages.hpp).
-        // Every OTHER voter is still hearing the old leader's heartbeats, so
-        // `opts_.checkQuorum && leaderId_ != kNoNode && electionElapsed_ < electionTimeout_`
-        // holds and the disruption guard SILENTLY DROPS the transferee's vote without even
-        // bumping its term. Measured: a transfer that completes in 0 tick rounds with
-        // CheckQuorum off needs a full election timeout via term escalation with it on --
-        // 2.5-5 s at the production 20 ms tick, each with a leaderless window in it.
+        // WHY IT WAS OFF (1f2e752, which reverted the commit before it). With CheckQuorum
+        // on and no transfer marker, LEADERSHIP TRANSFER BREAKS. TimeoutNow lets the
+        // TRANSFEREE skip its own lease and campaign immediately, but the vote it then
+        // broadcast was an ordinary RequestVote, and every OTHER voter was still hearing
+        // the outgoing leader's heartbeats -- so
+        // `checkQuorum && leaderId_ != kNoNode && electionElapsed_ < electionTimeout_`
+        // held on all of them and the disruption guard SILENTLY DROPPED the transferee's
+        // vote without even bumping a term. Measured: a transfer that completes in 0 tick
+        // rounds with CheckQuorum off needed a full election timeout with it on -- 2.5-5 s
+        // at this 20 ms tick, each with a leaderless window inside it. That is not a
+        // corner case here: the balancer below fires every 5 s across 4096 groups,
+        // queryReplicated fails reads CLOSED after ~125 ms of leaderlessness, and the
+        // operator rebalance endpoint storms transfers deliberately (2216 in one gate).
         //
-        // That is not a corner case here: the leadership balancer fires every 5 s across
-        // 4096 groups, queryReplicated fails reads closed after ~125 ms of leaderlessness,
-        // and the operator rebalance endpoint storms transfers deliberately.
+        // WHAT MAKES IT SAFE NOW (ADR 0005, debt D-9). `RequestVote::campaignTransfer`,
+        // set only by a campaign started FROM a TimeoutNow, and honoured at the inLease
+        // check in RaftNode::step: a transfer vote stands the lease down and buys nothing
+        // else -- the log check, one-vote-per-term and term ordering all still apply. It
+        // rides its own message-type byte (kRequestVoteTransfer), so a peer too old to
+        // know it DROPS the envelope rather than misparsing it, and that transfer degrades
+        // to the old slow path instead of corrupting an election.
         //
-        // Enabling it requires the etcd-style fix FIRST: a campaignTransfer flag on
-        // RequestVote that the inLease check honours. That is a Raft WIRE FORMAT change
-        // with a mixed-version hazard, so it belongs with the consensus work in Phase 5,
-        // not here. See docs/write-scaleout-plan.md Phase 5.
+        // Pinned by, in order of how directly they would catch a regression here:
+        //   RaftClusterTest.LeaderTransferUnderCheckQuorumCompletesInZeroTickRounds
+        //     -- the direct regression test for 1f2e752; it advances NO clock, so a
+        //        transfer that needs an election timeout cannot pass it
+        //   RaftClusterTest.CheckQuorumStillRefusesAnUnsolicitedCampaign
+        //   RaftNodeTest.TransferVote{StillObeysTheLogUpToDateCheck,StillObeysOneVotePer
+        //     Term,AtAStaleTermIsRejectedWithOurTerm} -- vote safety, stated separately
+        //   RaftCodecTest.AnOldDecoderDropsTheTransferVoteAndStillReadsAnOrdinaryOne
+        //   RaftProposeDeadlineTest.CheckQuorumFailsAQuorumLessWriteOnItsOwn
+        //     -- the behaviour CheckQuorum is wanted FOR; it builds its own RaftOptions
+        //        and is no longer describing a non-production setting
+        // and live: rolling_rebalance (thousands of transfers under sustained writes),
+        // deposed_primary, node_kill_round, fault_injection.
         //
-        // Nothing depends on it for safety: the per-write propose deadline
-        // (RaftGroup::proposeAndAwaitApplied) already delivers the fail-closed property it
-        // was added as a belt for -- every write is bounded, and expired-waiter
-        // accumulation is bounded by (write deadline x retry budget) either way.
+        // WHAT IT BUYS. Not safety -- Raft's safety never depended on it, a partitioned
+        // leader cannot commit without a quorum ack, and the per-write propose deadline
+        // (RaftGroup::proposeAndAwaitApplied) already bounds every write and bounds
+        // expired-waiter accumulation by (deadline x retry budget) either way. This is the
+        // BELT to that deadline's braces: a stale or partitioned leader now steps down
+        // within one election timeout instead of discovering it one write at a time, so it
+        // stops accepting proposals it can never commit, its applyWaiters list stops
+        // growing, and leader-only reads on the losing side of a partition converge on
+        // "not leader" promptly rather than per request.
+        //
+        // WHAT IS STILL OPEN: ADR mechanism (c), gating activation on the cluster-wide
+        // committed format version, so this cannot be on while a peer is too old to read a
+        // transfer vote. Until that lands, a MIXED-VERSION rolling window has slow
+        // transfers (the pre-bypass behaviour) -- degraded, never unsafe.
+        ropts.checkQuorum = true;
         {
             std::map<unsigned, std::vector<std::pair<uint16_t, std::vector<data::NodeId>>>> byShard;
             for (const auto& [vshard, voters] : rt_->localReplicaGroups())
