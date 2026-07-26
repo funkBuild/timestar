@@ -1755,13 +1755,25 @@ seastar::future<std::map<std::string, std::vector<SeriesId128>>> NativeIndex::ge
         }
         return true;
     });
-    // Batch-insert cache misses (may rehash bitmapCache_)
+    // Batch-insert cache misses (may rehash bitmapCache_).
+    //
+    // MERGE, AND NEVER CLEAR `dirty` (write-scaleout debt D-2). The miss was
+    // decided inside the kvPrefixScan callback above, and the scan SUSPENDS
+    // (SSTable block reads) before this loop runs. A concurrent insert can
+    // therefore have created — and dirtied — an entry for this very key in the
+    // interim. `entry->bitmap = readSafe(...)` overwrote its adds, and
+    // `entry->dirty = false` then made flushDirtyBitmaps skip the entry (the
+    // dirty-key set still named it), so the local IDs were lost from memory AND
+    // never persisted: the series silently disappeared from tag discovery.
+    //
+    // A genuinely fresh entry starts empty and clean, so `|=` plus leaving the
+    // flag alone is exactly the old behaviour on the intended path.
     for (auto& [tagValue, value] : toLoad) {
         fullCacheKey.assign(cachePrefix);
         fullCacheKey.append(tagValue);
         auto entry = ensureEntry(bitmapCache_, fullCacheKey);
-        entry->bitmap = roaring::Roaring::readSafe(value.data(), value.size());
-        entry->dirty = false;
+        entry->bitmap |= roaring::Roaring::readSafe(value.data(), value.size());
+        entry->approxBytes = value.size();
         cacheHitValues.push_back(std::move(tagValue));
     }
 
