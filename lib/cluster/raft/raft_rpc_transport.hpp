@@ -53,6 +53,25 @@ public:
 
     seastar::future<> send(Envelope env) override;
 
+    // Message-rate counters (write-scaleout 5-pre / 5a). `envelopesSent / framesSent` is
+    // the batching ratio: 1.0 means every Raft message paid for its own RPC frame, which
+    // is what this transport did before 5a. Always maintained; TIMESTAR_RAFT_PROFILE=1
+    // additionally logs the rate every 5 s.
+    struct Stats {
+        uint64_t envelopesSent = 0;
+        uint64_t framesSent = 0;
+        uint64_t bytesSent = 0;
+        uint64_t envelopesRecv = 0;
+        uint64_t framesRecv = 0;
+        uint64_t dropped = 0;  // no known peer, or inside a reconnect backoff
+    };
+    [[nodiscard]] Stats stats() const;
+
+    // Test seam: force the pre-5a behaviour (one envelope per frame) regardless of what
+    // the peer supports. Not a production knob -- it exists so a test can prove the
+    // batched and unbatched paths deliver the same thing.
+    void setBatchingEnabled(bool enabled);
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

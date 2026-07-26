@@ -7,12 +7,15 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <map>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/gate.hh>
 #include <seastar/core/lowres_clock.hh>
 #include <seastar/core/sstring.hh>
 #include <seastar/rpc/rpc.hh>
+#include <seastar/util/later.hh>
+#include <vector>
 
 namespace timestar::raft {
 
@@ -38,56 +41,75 @@ seastar::sstring read(RaftSerializer, Input& in, seastar::rpc::type<seastar::sst
     return s;
 }
 
+// ...and a bare u32, for the capability probe's reply. Every type crossing this
+// transport needs its own write/read here; there is no default.
+template <typename Output>
+void write(RaftSerializer, Output& out, uint32_t v) {
+    out.write(reinterpret_cast<const char*>(&v), sizeof(v));
+}
+
+template <typename Input>
+uint32_t read(RaftSerializer, Input& in, seastar::rpc::type<uint32_t>) {
+    uint32_t v = 0;
+    in.read(reinterpret_cast<char*>(&v), sizeof(v));
+    return v;
+}
+
 constexpr uint64_t kDeliverVerb = 1;
-
-// Raft message-rate instrumentation (write-scaleout 5-pre / 5a), enabled with
-// TIMESTAR_RAFT_PROFILE=1 alongside the RaftGroup stage profiler. It is the only way to
-// answer "how much of this node's work is heartbeat traffic" -- the stage profiler
-// samples PROPOSALS, and a group that is merely ticking never proposes anything.
+// MULTI-ENVELOPE FRAME (write-scaleout 5a). Payload is a concatenation of
+// [u32 len LE][envelope bytes] records; the receiver routes each by group id exactly as
+// the single-envelope path does. A node ticking ~1000 groups per shard sends thousands of
+// separate RPCs per second to the same peer, each with its own frame header, its own
+// resource permit and its own write; a tick that produces messages for many groups can
+// carry them in one.
+constexpr uint64_t kDeliverBatchVerb = 2;
+// CAPABILITY PROBE. This transport has NO version negotiation -- the single deliver verb
+// has been the whole protocol -- and an unknown verb on seastar's rpc is answered with an
+// unknown-verb reply that a no_wait sender IGNORES. So an old peer sent a batch frame
+// would silently discard every Raft message in it: no error, no reply, just a node whose
+// groups never hear from their leader. The sender therefore has to KNOW before it batches.
 //
-// Counters are shard-local (thread_local) and reported from send()/deliver() on a time
-// bucket, so no timer is needed and a shard that sends nothing prints nothing. The
-// report is per shard: every shard runs its own transport instance.
-struct TransportCounters {
-    uint64_t envelopesSent = 0;  // Raft messages handed to send()
-    uint64_t framesSent = 0;     // RPC calls actually issued (== envelopesSent until 5a)
-    uint64_t bytesSent = 0;      // encoded envelope bytes
-    uint64_t envelopesRecv = 0;  // Raft messages delivered inbound
-    uint64_t framesRecv = 0;     // inbound RPC calls
-    uint64_t dropped = 0;        // no peer / backing off
-    seastar::lowres_clock::time_point windowStart{};
-};
-thread_local TransportCounters g_tx;
+// A waited verb is the mechanism, because only a reply can distinguish "peer understands
+// this" from "peer dropped it": a new peer answers with its capability bits, an old peer
+// fails the call with unknown_verb_error, and either way the sender learns the truth
+// before the first batch frame. Fail-closed: unknown or failed probe == no batching, and
+// the probe is redone for every new connection (a peer can be RESTARTED into an older
+// binary on the same address).
+constexpr uint64_t kCapabilitiesVerb = 3;
+constexpr uint32_t kCapBatchedDeliver = 1u << 0;
 
+// Flush thresholds for the per-peer batch buffer. The normal flush is one reactor
+// task-queue round later (`seastar::yield()`), which is what lets one tick's worth of
+// group messages accumulate; these bound the buffer when a single round produces an
+// unusual amount (e.g. a catch-up burst) so a frame never approaches the rpc frame limit.
+constexpr size_t kMaxBatchBytes = 256 * 1024;
+constexpr size_t kMaxBatchEnvelopes = 512;
+
+// Inbound admission bound for this transport, and its SEND-SIDE MIRROR (write-scaleout
+// 5.4). They are one pair of constants on purpose: seastar answers an over-limit `no_wait`
+// request by dropping it with no reply, so a sender that exceeds the receiver's bound
+// produces a silent, permanently-retried black hole. Refusing (and logging) on the send
+// side turns that into a visible error naming the group.
+//
+// The number is sized for the one producer still unbounded -- InstallSnapshot, which
+// carries a whole VShard snapshot -- not for appends, which 5.4 caps at 1 MiB of entries.
+constexpr size_t kMaxInboundRaftMemory = size_t{128} << 20;  // 128 MiB in flight
+constexpr size_t kMaxRaftMessageBytes = size_t{96} << 20;    // refuse to SEND above this
+
+// Raft message-rate instrumentation (write-scaleout 5-pre / 5a). The counters are
+// unconditional -- they are a handful of increments on a path that already does an
+// allocation and a syscall, and 5a's whole claim ("N envelopes now ride one frame") is
+// only checkable if something counts both. TIMESTAR_RAFT_PROFILE=1 additionally LOGS them
+// on a 5 s window, alongside the RaftGroup stage profiler.
+//
+// They live on the Impl, not in a thread_local: production runs one transport per shard,
+// but a test runs several in one reactor, and a shared counter would conflate them.
 bool transportProfileEnabled() {
     static const bool on = [] {
         const char* e = std::getenv("TIMESTAR_RAFT_PROFILE");
         return e && e[0] == '1';
     }();
     return on;
-}
-
-// Report at most once per window, and only when something moved.
-void maybeReportTransport() {
-    if (!transportProfileEnabled())
-        return;
-    constexpr auto kWindow = std::chrono::seconds(5);
-    const auto now = seastar::lowres_clock::now();
-    if (g_tx.windowStart == seastar::lowres_clock::time_point{}) {
-        g_tx.windowStart = now;
-        return;
-    }
-    if (now - g_tx.windowStart < kWindow)
-        return;
-    const double secs = std::chrono::duration<double>(now - g_tx.windowStart).count();
-    timestar::timestar_log.info(
-        "[RAFT_MSGRATE] shard={} window={:.1f}s out_env/s={:.0f} out_frames/s={:.0f} "
-        "env_per_frame={:.2f} out_MB/s={:.2f} in_env/s={:.0f} in_frames/s={:.0f} dropped/s={:.0f}",
-        seastar::this_shard_id(), secs, g_tx.envelopesSent / secs, g_tx.framesSent / secs,
-        g_tx.framesSent ? static_cast<double>(g_tx.envelopesSent) / static_cast<double>(g_tx.framesSent) : 0.0,
-        g_tx.bytesSent / secs / 1e6, g_tx.envelopesRecv / secs, g_tx.framesRecv / secs, g_tx.dropped / secs);
-    g_tx = TransportCounters{};
-    g_tx.windowStart = now;
 }
 
 // How long to wait before re-attempting a peer connection that failed. seastar's
@@ -136,6 +158,176 @@ struct RaftRpcTransport::Impl {
     RaftRpcTransport::DeliverRawFn onDeliverRaw;
     std::function<seastar::future<>(Client&, seastar::sstring)> deliverStub =
         proto.make_client<seastar::rpc::no_wait_type(seastar::sstring)>(kDeliverVerb);
+    std::function<seastar::future<>(Client&, seastar::sstring)> deliverBatchStub =
+        proto.make_client<seastar::rpc::no_wait_type(seastar::sstring)>(kDeliverBatchVerb);
+    std::function<seastar::future<uint32_t>(Client&)> capabilitiesStub =
+        proto.make_client<uint32_t()>(kCapabilitiesVerb);
+
+    // --- write-scaleout 5a: per-peer outbound batching ---
+    struct PeerCaps {
+        // Which connection these bits describe. clientFor() bumps the generation when it
+        // builds a new client, so a probe reply that lands after a reconnect is ignored
+        // rather than applied to a connection it never spoke to (a peer can restart into
+        // an older binary on the same address).
+        uint64_t generation = 0;
+        bool known = false;
+        uint32_t bits = 0;
+    };
+    struct PendingFrames {
+        std::vector<seastar::sstring> envelopes;
+        size_t bytes = 0;
+    };
+    std::map<NodeId, PeerCaps> caps;
+    std::map<NodeId, PendingFrames> pending;
+    uint64_t nextGeneration = 1;
+    bool flushScheduled = false;
+    bool batchingEnabled = true;
+
+    RaftRpcTransport::Stats stats;
+    seastar::lowres_clock::time_point windowStart{};
+    RaftRpcTransport::Stats windowBase;
+
+    // Log the rate over the last window, when the profile flag is set. Called from the
+    // send/deliver paths so no timer is needed and an idle transport prints nothing.
+    void maybeReport() {
+        if (!transportProfileEnabled())
+            return;
+        constexpr auto kWindow = std::chrono::seconds(5);
+        const auto now = seastar::lowres_clock::now();
+        if (windowStart == seastar::lowres_clock::time_point{}) {
+            windowStart = now;
+            windowBase = stats;
+            return;
+        }
+        if (now - windowStart < kWindow)
+            return;
+        const double secs = std::chrono::duration<double>(now - windowStart).count();
+        const auto env = stats.envelopesSent - windowBase.envelopesSent;
+        const auto frames = stats.framesSent - windowBase.framesSent;
+        timestar::timestar_log.info(
+            "[RAFT_MSGRATE] shard={} window={:.1f}s out_env/s={:.0f} out_frames/s={:.0f} "
+            "env_per_frame={:.2f} out_MB/s={:.2f} in_env/s={:.0f} in_frames/s={:.0f} dropped/s={:.0f}",
+            seastar::this_shard_id(), secs, env / secs, frames / secs,
+            frames ? static_cast<double>(env) / static_cast<double>(frames) : 0.0,
+            (stats.bytesSent - windowBase.bytesSent) / secs / 1e6,
+            (stats.envelopesRecv - windowBase.envelopesRecv) / secs, (stats.framesRecv - windowBase.framesRecv) / secs,
+            (stats.dropped - windowBase.dropped) / secs);
+        windowStart = now;
+        windowBase = stats;
+    }
+
+    bool peerSupportsBatch(NodeId to) const {
+        auto it = caps.find(to);
+        return it != caps.end() && it->second.known && (it->second.bits & kCapBatchedDeliver) != 0;
+    }
+
+    // Ask a freshly-built connection what it understands. Fail-closed on ANY error --
+    // unknown verb (an old peer), a dead connection, a timeout -- because "not known to
+    // support batching" and "known not to" must behave identically.
+    void probeCapabilities(NodeId to, Client* conn, uint64_t generation) {
+        if (gate.is_closed())
+            return;
+        (void)seastar::with_gate(gate, [this, to, conn, generation] {
+            return capabilitiesStub(*conn).then_wrapped([this, to, generation](seastar::future<uint32_t> f) {
+                uint32_t bits = 0;
+                if (f.failed())
+                    f.ignore_ready_future();
+                else
+                    bits = f.get();
+                auto it = caps.find(to);
+                if (it != caps.end() && it->second.generation == generation) {
+                    it->second.known = true;
+                    it->second.bits = bits;
+                }
+            });
+        });
+    }
+
+    // Queue an encoded envelope for `to`, flushing eagerly if the buffer is already large.
+    void enqueue(NodeId to, seastar::sstring data) {
+        auto& p = pending[to];
+        p.bytes += data.size();
+        p.envelopes.push_back(std::move(data));
+        if (p.bytes >= kMaxBatchBytes || p.envelopes.size() >= kMaxBatchEnvelopes) {
+            flushPeer(to, p);
+            return;
+        }
+        scheduleFlush();
+    }
+
+    // Flush at the END of the current task-queue round. `yield()` is what gives one
+    // shard's tick -- which drains ~1000 groups -- a chance to fill the buffer before
+    // anything goes on the wire, and it bounds the added latency to a single round.
+    //
+    // The continuation captures only `this` (the Impl, which outlives every task the gate
+    // holds open) and is a PLAIN lambda, not a coroutine lambda: a coroutine lambda's
+    // captures live in the closure object, which dies at the end of the full expression
+    // while the coroutine is still suspended.
+    void scheduleFlush() {
+        if (flushScheduled || gate.is_closed())
+            return;
+        flushScheduled = true;
+        (void)seastar::with_gate(gate, [this] {
+            return seastar::yield().then([this] {
+                flushScheduled = false;
+                flushAll();
+            });
+        });
+    }
+
+    void flushAll() {
+        for (auto& [to, p] : pending) {
+            if (!p.envelopes.empty())
+                flushPeer(to, p);
+        }
+    }
+
+    // Dispatch everything buffered for one peer. Does not suspend, so the buffer cannot
+    // be mutated underneath it.
+    void flushPeer(NodeId to, PendingFrames& p) {
+        std::vector<seastar::sstring> envelopes;
+        envelopes.swap(p.envelopes);
+        p.bytes = 0;
+        if (stopping || gate.is_closed())
+            return;
+        auto* conn = clientFor(to);
+        if (!conn) {
+            stats.dropped += envelopes.size();
+            return;  // unknown/backing-off peer: drop (Raft retries)
+        }
+        const bool batch = batchingEnabled && envelopes.size() > 1 && peerSupportsBatch(to);
+        if (batch) {
+            size_t total = 0;
+            for (const auto& e : envelopes)
+                total += e.size() + sizeof(uint32_t);
+            seastar::sstring frame = seastar::uninitialized_string(total);
+            char* out = frame.data();
+            for (const auto& e : envelopes) {
+                const uint32_t n = static_cast<uint32_t>(e.size());
+                std::memcpy(out, &n, sizeof(n));
+                out += sizeof(n);
+                std::memcpy(out, e.data(), e.size());
+                out += e.size();
+            }
+            stats.envelopesSent += envelopes.size();
+            ++stats.framesSent;
+            stats.bytesSent += frame.size();
+            maybeReport();
+            (void)seastar::with_gate(gate, [this, conn, frame = std::move(frame)]() mutable {
+                return deliverBatchStub(*conn, std::move(frame)).handle_exception([](std::exception_ptr) {});
+            });
+            return;
+        }
+        for (auto& e : envelopes) {
+            ++stats.envelopesSent;
+            ++stats.framesSent;
+            stats.bytesSent += e.size();
+            maybeReport();
+            (void)seastar::with_gate(gate, [this, conn, data = std::move(e)]() mutable {
+                return deliverStub(*conn, std::move(data)).handle_exception([](std::exception_ptr) {});
+            });
+        }
+    }
 
     // Retire a dead connection without blocking the caller: stop it in the background
     // (under the gate) so its resources are released, keeping it alive until stop
@@ -178,6 +370,13 @@ struct RaftRpcTransport::Impl {
         auto c = std::make_unique<Client>(proto, peerClientOptions(), pit->second);
         auto* p = c.get();
         clients[to] = std::move(c);
+        // A NEW connection knows nothing until it answers: reset to "unknown" (which is
+        // "no batching") and probe. Never carry the old connection's bits forward.
+        auto& cap = caps[to];
+        cap.generation = nextGeneration++;
+        cap.known = false;
+        cap.bits = 0;
+        probeCapabilities(to, p, cap.generation);
         return p;
     }
 };
@@ -200,11 +399,9 @@ seastar::future<> RaftRpcTransport::start(seastar::socket_address local, Deliver
             // 100s of KB) AppendEntries payload is decoded on the shard that owns
             // the group rather than on this single listening shard. groupId is the
             // first field encodeEnvelope writes: u16, little-endian, at offset 0.
-            if (transportProfileEnabled()) {
-                ++g_tx.framesRecv;
-                ++g_tx.envelopesRecv;
-                maybeReportTransport();
-            }
+            ++impl_->stats.framesRecv;
+            ++impl_->stats.envelopesRecv;
+            impl_->maybeReport();
             if (impl_->onDeliverRaw) {
                 if (data.size() < 2)
                     co_return seastar::rpc::no_wait;
@@ -219,6 +416,47 @@ seastar::future<> RaftRpcTransport::start(seastar::socket_address local, Deliver
                 co_await impl_->onDeliver(std::move(*env));
             co_return seastar::rpc::no_wait;
         });
+    // Multi-envelope frame (write-scaleout 5a): [u32 len][envelope] repeated. Each
+    // envelope takes exactly the same route as a single-envelope frame -- routed by the
+    // group id peeked from its first two bytes, decoded on the owning shard -- so the two
+    // verbs cannot diverge in how a message is handled, only in how it arrived.
+    //
+    // A malformed frame (truncated length, length past the end) STOPS at the bad record
+    // and delivers everything before it. Raft re-sends what a peer did not acknowledge, so
+    // dropping a suffix is safe; guessing at the rest is not.
+    impl_->proto.register_handler(
+        kDeliverBatchVerb, [this](seastar::sstring data) -> seastar::future<seastar::rpc::no_wait_type> {
+            ++impl_->stats.framesRecv;
+            impl_->maybeReport();
+            size_t off = 0;
+            while (off + sizeof(uint32_t) <= data.size()) {
+                uint32_t n = 0;
+                std::memcpy(&n, data.data() + off, sizeof(n));
+                off += sizeof(n);
+                if (n > data.size() - off)
+                    break;  // truncated record: deliver the prefix, drop the rest
+                const char* bytes = data.data() + off;
+                off += n;
+                ++impl_->stats.envelopesRecv;
+                if (n < 2)
+                    continue;
+                if (impl_->onDeliverRaw) {
+                    const uint16_t gid = static_cast<uint16_t>(static_cast<unsigned char>(bytes[0])) |
+                                         static_cast<uint16_t>(static_cast<unsigned char>(bytes[1]) << 8);
+                    // `data` outlives every await here, so the pointer stays valid.
+                    co_await impl_->onDeliverRaw(gid, bytes, n);
+                } else {
+                    auto env = decodeEnvelope(std::string(bytes, n));
+                    if (env && impl_->onDeliver)
+                        co_await impl_->onDeliver(std::move(*env));
+                }
+            }
+            co_return seastar::rpc::no_wait;
+        });
+    // The capability probe. Stateless and constant, so it does not matter which shard's
+    // server instance answers it under connection_distribution.
+    impl_->proto.register_handler(kCapabilitiesVerb,
+                                  [] { return seastar::make_ready_future<uint32_t>(kCapBatchedDeliver); });
     // Where inbound connections are accepted.
     //
     // `perShardListener == false` (a single instance, on one shard) PINS the listening
@@ -255,21 +493,28 @@ seastar::future<> RaftRpcTransport::start(seastar::socket_address local, Deliver
     // amount of in-flight request memory, so a peer (mTLS is optional on this
     // transport) can spend this node's memory for it.
     //
-    // This bound is deliberately LOOSE, unlike the data plane's, and it must stay that
-    // way until two producers stop being unbounded: a catch-up AppendEntries carries
-    // `log_.entriesFrom(nextIndex)` -- the WHOLE log tail in one message -- and an
-    // InstallSnapshot carries an entire VShard snapshot payload (TSM bytes). Both are
-    // legitimate and can be large. The verb is also no_wait, so an over-limit message
-    // is DROPPED with no reply rather than error-replied: too tight a bound would make a
-    // lagging follower retry the same oversized append forever and never catch up,
-    // silently. Capping those two producers (chunked append / chunked snapshot) is the
-    // prerequisite for tightening this, and is Phase-5 work.
+    // TIGHTENED from 1 GiB in write-scaleout 5.4, and what made that possible was capping
+    // the producer that needed the slack: a catch-up AppendEntries used to carry
+    // `log_.entriesFrom(nextIndex)`, the WHOLE log tail in one message, so after a big
+    // write campaign a returning follower's first append could be arbitrarily large.
+    // Since the deliver verb is `no_wait`, an over-limit message is DROPPED WITH NO REPLY
+    // -- the follower would retry the same oversized append forever and never catch up,
+    // silently -- so the bound had to exceed anything the leader might produce.
+    // RaftOptions::maxAppendEntries/maxAppendBytes now bound it (1 MiB of entries), and
+    // the batch frames 5a introduces are capped at 256 KB.
+    //
+    // What is STILL unbounded is InstallSnapshot: it carries an entire VShard snapshot
+    // payload (TSM bytes) in one message, and chunking it is a protocol change (offset +
+    // done, receiver-side reassembly, a resumable boundary) rather than a producer cap.
+    // So this bound is sized for SNAPSHOTS, not for appends, and `kMaxRaftMessageBytes`
+    // below is the send-side mirror of it: a payload that would be dropped is logged as
+    // an error rather than vanishing.
     //
     // bloat_factor stays 1: entry bytes are persisted roughly 1:1 here. The amplifying
     // WriteBatch decode happens later, at APPLY, which is behind commit -- i.e. behind
     // the Raft protocol itself, not reachable by an unsolicited frame.
     seastar::rpc::resource_limits lim;
-    lim.max_memory = size_t{1} << 30;  // 1 GiB of in-flight inbound Raft traffic
+    lim.max_memory = kMaxInboundRaftMemory;
     impl_->server =
         std::make_unique<seastar::rpc::protocol<RaftSerializer>::server>(impl_->proto, seastar::listen(local, lo), lim);
     return seastar::make_ready_future<>();
@@ -278,30 +523,37 @@ seastar::future<> RaftRpcTransport::start(seastar::socket_address local, Deliver
 seastar::future<> RaftRpcTransport::send(Envelope env) {
     if (impl_->stopping || impl_->gate.is_closed())
         return seastar::make_ready_future<>();
-    auto* conn = impl_->clientFor(env.message.to);
-    if (!conn) {
-        if (transportProfileEnabled())
-            ++g_tx.dropped;
-        return seastar::make_ready_future<>();  // unknown peer: drop (Raft retries)
-    }
-
+    // Encode now, dispatch at the end of this task-queue round (write-scaleout 5a).
+    // Buffering here rather than calling clientFor()/deliverStub() per envelope is what
+    // lets one shard's tick -- which drains up to ~1000 groups -- put many groups'
+    // messages into one frame to the same peer. Fire-and-forget semantics are unchanged:
+    // the Ready loop is never blocked on the network, and a dropped message is a Raft
+    // retry.
     std::string bytes = encodeEnvelope(env);
-    seastar::sstring data(bytes.data(), bytes.size());
-    if (transportProfileEnabled()) {
-        ++g_tx.envelopesSent;
-        ++g_tx.framesSent;
-        g_tx.bytesSent += data.size();
-        maybeReportTransport();
+    // Refuse, LOUDLY, what the peer's admission bound would drop silently (5.4). The
+    // deliver verb is no_wait: an over-limit frame gets no reply, so the sender would keep
+    // re-sending it forever and the group would simply never make progress with that peer.
+    // The only producer that can reach this today is InstallSnapshot (appends are capped
+    // by RaftOptions); an operator seeing this needs to know a VShard snapshot is too big
+    // to replicate, not to watch a follower hang.
+    if (bytes.size() > kMaxRaftMessageBytes) {
+        ++impl_->stats.dropped;
+        timestar::timestar_log.error(
+            "[RAFT] refusing to send a {} byte message for group {} to node {}: over the {} byte peer admission "
+            "bound (an InstallSnapshot this large cannot be delivered; chunked snapshot streaming is the fix)",
+            bytes.size(), env.groupId, env.message.to, kMaxRaftMessageBytes);
+        return seastar::make_ready_future<>();
     }
-
-    // Fire-and-forget: run the RPC in the background under the gate so the Ready
-    // loop is never blocked on the network. Transport errors are swallowed -- a
-    // failed send marks the client errored, and the next send reconnects it
-    // (clientFor), so a dropped message is just a Raft retry.
-    (void)seastar::with_gate(impl_->gate, [this, conn, data = std::move(data)]() mutable {
-        return impl_->deliverStub(*conn, std::move(data)).handle_exception([](std::exception_ptr) {});
-    });
+    impl_->enqueue(env.message.to, seastar::sstring(bytes.data(), bytes.size()));
     return seastar::make_ready_future<>();
+}
+
+RaftRpcTransport::Stats RaftRpcTransport::stats() const {
+    return impl_->stats;
+}
+
+void RaftRpcTransport::setBatchingEnabled(bool enabled) {
+    impl_->batchingEnabled = enabled;
 }
 
 void RaftRpcTransport::setRawDeliver(DeliverRawFn onDeliverRaw) {
@@ -314,6 +566,10 @@ seastar::future<> RaftRpcTransport::stop() {
     // already-stopped peer would keep the gate from ever closing. Only then is it
     // safe to close the gate (no task still references a client) and clear them.
     impl_->stopping = true;
+    // Anything still buffered is a Raft message that will simply be re-sent by whoever
+    // still needs it; there is nothing to flush on the way out (and flushing would open
+    // new background sends just as we are trying to drain them).
+    impl_->pending.clear();
     for (auto& [id, c] : impl_->clients)
         co_await c->stop();
     co_await impl_->gate.close();
