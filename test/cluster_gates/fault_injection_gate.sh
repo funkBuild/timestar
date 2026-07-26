@@ -40,8 +40,21 @@ command -v python3 >/dev/null || { echo "python3 required for the reset proxy"; 
 PORTS="49310 49311 49312"
 # Minimum resets the run must actually have injected. Without this the gate is vacuous:
 # a proxy that never fired, or a bench that finished before the storm started, would pass.
-MIN_RESET_ROUNDS="${GATE_MIN_RESET_ROUNDS:-8}"
-MIN_RESET_CONNS="${GATE_MIN_RESET_CONNS:-8}"
+#
+# THESE FLOORS ARE SET AGAINST THE OBSERVED STORM, not against zero (debt D-4). They used
+# to be 8 and 8 -- about 5% of what a real run injects (147 rounds destroying 392-400
+# connections), which is barely more than the vacuity check they replaced: a storm that
+# fired 9 times would have satisfied them while proving almost nothing about a burst.
+# They are now ~50% of observed, which is the largest fraction that still leaves room for
+# a slower box (the resetter fires on a fixed 0.3 s clock while the bench length is
+# machine-dependent, so a machine that finishes the bench in half the time legitimately
+# injects half the rounds). A run that comes in under these is not a pass and is not a
+# failure of the property either -- it is a run that did not test it, and it must say so.
+#
+# If a genuinely slower/faster box needs a different number, override rather than edit:
+# GATE_MIN_RESET_ROUNDS / GATE_MIN_RESET_CONNS. Record the observed counts when you do.
+MIN_RESET_ROUNDS="${GATE_MIN_RESET_ROUNDS:-70}"
+MIN_RESET_CONNS="${GATE_MIN_RESET_CONNS:-180}"
 # The dip bound, as a percentage of the quiet-through-the-proxy baseline.
 MIN_DIP_PCT="${GATE_MIN_DIP_PCT:-40}"
 

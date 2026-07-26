@@ -11,6 +11,7 @@ not probes, so they can be run from CI or a release checklist.
 | `backpressure_gate.sh` | the per-shard in-flight write bound degrades to 503 + `Retry-After`, never to 500s or timeouts, and the DEFAULT budget never gets in the way |
 | `fault_injection_gate.sh` | a BURST of TCP connection resets between two live nodes costs latency, not client errors, and loses/duplicates nothing (write-scaleout 4c) |
 | `restart_catchup_gate.sh` | a follower that was DOWN through a large write campaign catches up when it returns, under the tightened Raft admission bound (write-scaleout 5.4) |
+| `fault_injection_ab.sh` | **(expensive, on-demand — not a CI gate)** that `fault_injection_gate.sh` DISCRIMINATES: builds the 4a-reverted binary and asserts it fails the same storm HEAD passes |
 
 All of them take an optional server binary as `$1` (default
 `build/bin/timestar_http_server`), so a "before" binary can be measured the same way.
@@ -104,6 +105,13 @@ exactly that). The cluster planes only ever dial `port+1000` / `port+2000`.
    gated the resetter on the bench still running, and the bench finished in under a
    second, so the storm never fired and every "0 errors" assertion passed vacuously. The
    bench, the resetter and the probe now run decoupled.
+   **The floors are 70 rounds / 180 connections**, roughly half of what a real run
+   injects here (147 rounds destroying 392-400 connections). They were 8/8 — about 5% of
+   observed, i.e. barely a vacuity check — until D-4. Half leaves room for a faster or
+   slower box: the resetter fires on a fixed 0.3 s wall clock while the bench length is
+   machine-dependent, so a machine that finishes the bench in half the time legitimately
+   injects half the rounds. Override with `GATE_MIN_RESET_ROUNDS` /
+   `GATE_MIN_RESET_CONNS` rather than editing, and record the observed counts when you do.
 2. Node 3 must LEAD at least 800 VShards. The first node to start wins every election, and
    a converged-but-skewed cluster left node 3 leading 128 of 4096 — 3% of traffic crossing
    the fault. The gate rebalances and waits for fair share first.
@@ -115,14 +123,42 @@ forwarder is not a server number, so the dip is asserted against a QUIET baselin
 through the same proxy — not against an unproxied figure. (In practice the handicap is
 small: 4.96 M pts/s baseline vs 5.0-5.1 M unproxied.)
 
-**It is a discriminating gate, proven by A/B.** The same tree with only the three 4a
-files reverted to `ad77cf3` (`write_errors.hpp`, `replicated_write_router.{cpp,hpp}` —
-so 4b's jitter and keepalive are still present) FAILS it, under an identical fault:
-147 reset rounds destroying 400 peer connections → **9 bench HTTP errors + 1 probe 5xx**,
-every one of them `RetryableWriteError: N VShard slice(s) uncommitted after 6 attempt(s)
-(last: transport)` — the [D6] signature verbatim. The Phase-4 binary takes the identical
-storm (147 rounds, 392 connections) with zero. Throughput was 92% of baseline before and
-94% after, i.e. the fix converts errors into a little latency and costs nothing else.
+**It is a discriminating gate, and `fault_injection_ab.sh` re-proves that on demand.**
+The same tree with only the three 4a files reverted to `ad77cf3` (`write_errors.hpp`,
+`replicated_write_router.{cpp,hpp}` — so 4b's jitter and keepalive, which live in
+`reconnect_policy.hpp`, are still present) FAILS it, under an identical fault: 147 reset
+rounds destroying 400 peer connections → **9 bench HTTP errors + 1 probe 5xx**, every one
+of them `RetryableWriteError: N VShard slice(s) uncommitted after 6 attempt(s) (last:
+transport)` — the [D6] signature verbatim. The Phase-4 binary takes the identical storm
+(147 rounds, 392 connections) with zero. Throughput was 92% of baseline before and 94%
+after, i.e. the fix converts errors into a little latency and costs nothing else.
+
+That was a hand-run session claim with no way to re-check it. It is now scripted
+(D-4). `fault_injection_ab.sh` creates a `git worktree`, applies
+
+```
+git checkout fcb2a94^ -- lib/cluster/data/write_errors.hpp \
+                         lib/cluster/data/replicated_write_router.cpp \
+                         lib/cluster/data/replicated_write_router.hpp
+```
+
+builds `timestar_http_server` in its own build dir, runs the storm gate against both
+binaries in turn, and asserts the reverted one produces client errors **carrying the
+[D6] signature** while HEAD produces zero — plus that both runs took a comparable storm
+(within 2x), since comparing a heavy storm to a light one says nothing.
+
+Two things to know before running it:
+
+- **It is expensive and it is NOT a CI gate.** A fresh comparison build dir builds
+  seastar too (tens of minutes); then it runs the full storm gate twice. Keep
+  `GATE_AB_BUILD_DIR` between runs to make the rebuild incremental. CI runs
+  `fault_injection_gate.sh`; this validates that gate, on demand.
+- **The revert reaches past 4a.** A hunk-level `git revert fcb2a94` conflicts — two later
+  commits (`d101c07`, `c052253`) touch the same lines — so the whole-file checkout also
+  drops those. That is why the script asserts the *signature* and not merely that errors
+  appeared: `last: transport` is specific to the retry-pacing defect.
+
+It never touches your working tree; the revert happens in the worktree.
 
 **Result on the Phase-4 binary:** 147 reset rounds destroying 392 peer connections
 mid-bench → **2000/2000 bench requests OK, 200/200 probe writes OK, 0 HTTP errors, 0
