@@ -13,6 +13,7 @@
 #include "replicated_data_plane.hpp"
 #include "write_admission.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <exception>
 #include <filesystem>
@@ -287,140 +288,196 @@ public:
         return c;
     }
 
+    // May `target` be handed leadership of `g` right now? (Extracted so the balancer's
+    // candidate loop can try the NEXT peer when this one is ineligible instead of giving
+    // up on the group -- see rebalance.)
+    //
+    // NEVER hand leadership to a peer that is not CAUGHT UP on this group.
+    //
+    // A leader with a transfer in flight refuses every proposal until the
+    // transferee acks up to lastIndex, so targeting a peer that cannot ack costs
+    // the group its write availability for the whole transfer window. And a DEAD
+    // peer is the MOST attractive target this loop has: it leads nothing, so its
+    // deficit is the largest on every pass. Measured on the restart-catch-up
+    // gate: with one of three nodes down, ~26% of writes failed with
+    // "1 VShard slice(s) uncommitted ... (last: not-leader)" for as long as it
+    // stayed down, against a perfectly healthy 2-of-3 quorum.
+    //
+    // RaftNode::tick now abandons a transfer after one election timeout, so this
+    // is no longer unbounded -- but a bounded write outage repeated every
+    // balancer pass is still an outage, and a caught-up target is also the only
+    // one that transfers IMMEDIATELY (transferLeadership sends TimeoutNow at
+    // once rather than waiting on a catch-up round trip).
+    //
+    // THE GUARD USED TO BE EXACT EQUALITY (matchIndex == lastIndex) and that made
+    // the balancer LOAD-DEPENDENT (debt D-1). On a group taking writes, matchIndex
+    // trails lastIndex by whatever is in flight essentially all of the time -- the
+    // leader appends locally, then replicates -- so a perfectly healthy peer failed
+    // the test on nearly every pass. The balancer converged when the cluster was
+    // quiet and could only move COLD groups when it was busy, which is exactly
+    // backwards: hot groups are the ones whose leadership placement matters.
+    //
+    // Two independent gates replace it, and BOTH must hold:
+    //
+    //   1. LAG BOUND -- within kMaxTransferLagEntries of our log end. This is the
+    //      "the handoff will complete promptly" half. 64 entries is about one
+    //      AppendEntries round trip of in-flight work at this batch size, so a
+    //      peer keeping up passes continuously while one genuinely behind (a
+    //      restarted node still streaming its backlog) does not. TimeoutNow then
+    //      fires on the very next ack rather than after a catch-up campaign.
+    //
+    //   2. LIVENESS -- replied within the LAST HEARTBEAT ROUND. This is the "the
+    //      target is actually there" half, and it is the one a pure lag bound
+    //      CANNOT provide. On an IDLE group a dead peer sits at lag ZERO forever:
+    //      it was caught up when it died and lastIndex never moves again, so it
+    //      passes any delta check, including the old exact-equality one. (That
+    //      hole is therefore not new here -- it is pre-existing, and this closes
+    //      it.) The heartbeat gives an independent decaying signal: the leader
+    //      bcastAppends every heartbeatTimeout ticks whether or not there is
+    //      anything to send, and a live peer answers within an RTT.
+    //
+    // THE LIVENESS WINDOW IS ONE HEARTBEAT ROUND, AND IT IS THIS TIGHT FOR A
+    // MEASURED REASON. It was three rounds (1.5 s at the production 25-tick
+    // heartbeat) and `fault_injection_gate.sh` regressed: 1 of 2000 bench writes
+    // failed `RetryableWriteError ... (last: transport)` where the same tree
+    // without this change took a marginally HEAVIER storm (167 rounds / 457
+    // connections vs 165 / 442) with zero. The mechanism is specific and it is
+    // this loop's: the periodic balancer could target a peer whose connection had
+    // just been RST, because the ack clock had not yet decayed past three rounds
+    // and the lag bound still held. `transferLeadership` then pins
+    // `leadTransferee_` and the group refuses EVERY proposal until the transferee
+    // acks -- and the abandon bound is one ELECTION timeout (2.5-5 s), far longer
+    // than the 1.5 s write deadline. So one mis-aimed transfer is one failed
+    // batch. The old exact-equality guard was accidentally immune: a peer whose
+    // acks stopped fell behind a growing lastIndex immediately.
+    //
+    // One round is the tightest bound a HEALTHY peer still satisfies -- it answers
+    // every heartbeat within an RTT, so its clock resets long before the next
+    // round -- and it cuts the post-reset eligibility window from 1.5 s to 0.5 s.
+    //
+    // Residual exposure, bounded and now deliberate: a peer that dies inside the
+    // current heartbeat round can still be targeted on a pass that races it. That
+    // costs the group its proposals for one election timeout, after which
+    // RaftNode::tick abandons the transfer (§3.10) and writes resume; the peer
+    // then reads stale on every later pass and is skipped. One bounded window on
+    // the pass that races the death, not a window per pass forever -- which is
+    // what the abandon fix alone left on the table. Shrinking it further means
+    // shortening the ABANDON window (a consensus-timing change, not a target
+    // filter) -- see the debt register.
+    static bool transferrableTo(raft::RaftGroup& g, data::NodeId target) {
+        constexpr raft::LogIndex kMaxTransferLagEntries = 64;
+        const auto lastIdx = g.node().log().lastIndex();
+        const auto match = g.matchIndexOf(target);
+        const bool caughtUp = match >= lastIdx || (lastIdx - match) <= kMaxTransferLagEntries;
+        const uint64_t kMaxTransferAckStaleTicks = g.heartbeatTimeout();
+        const bool live = g.ticksSinceAck(target) <= kMaxTransferAckStaleTicks;
+        return caughtUp && live;
+    }
+
     // Rebalance leadership among THIS shard's groups. Because assignCore spreads
     // VShards evenly over shards and every shard sees the same node set, balancing
     // each shard's slice independently balances the cluster as a whole.
+    //
+    // FAIR SHARE IS PER-NODE AND MEMBERSHIP-WEIGHTED, NOT totalLed/N (debt D-12). A node
+    // can only lead a group it REPLICATES, so at RF < N the nodes are not
+    // interchangeable: of the groups THIS shard hosts, we are a voter in all of them and
+    // a given peer in only some. The old `fair = totalLed / peers.size()` divided our
+    // hosted count by the whole cluster, which at RF=3 on 5 nodes is ~40% of the truth --
+    // so every node believed itself permanently above fair share and shed leadership on
+    // every pass, forever. MEASURED on an idle 5-node RF=3 cluster before this fix: after
+    // 12 minutes with no writes the balancer was still moving 26-114 VShards per 30 s and
+    // the spread had stalled at ~300 of a fair 819 (min 666, max 980) instead of closing.
+    //
+    // The correct expectation for node v over the groups we host is the sum of 1/|voters|
+    // over those groups v is a voter of: with uniform RF it is |hosted|/RF for us and
+    // |hosted ∩ hosted(v)|/RF for a peer. At RF == N every group has every node as a
+    // voter, so expected[v] == hosted/N for all v -- exactly the old formula, which is
+    // why the RF == N behaviour (production, the 3-node gates) is unchanged.
     seastar::future<size_t> rebalance(size_t maxTransfers, data::NodeId self, std::vector<data::NodeId> peers) {
         if (!plane_ || maxTransfers == 0 || peers.empty())
             co_return 0;
         auto& host = plane_->host();
-        std::map<data::NodeId, size_t> led;
+        std::map<data::NodeId, size_t> led;       // leadership we can SEE (over our hosted groups)
+        std::map<data::NodeId, double> expected;  // fair share of that same set, by membership
+        std::map<uint16_t, std::vector<data::NodeId>> votersOf;
         std::vector<uint16_t> mine;
-        size_t totalLed = 0;
         for (uint16_t vs = 0; vs < timestar::VIRTUAL_SHARD_COUNT; ++vs) {
             if (shardForVShard(vs) != seastar::this_shard_id())
                 continue;
+            // A group we do not REPLICATE tells us nothing: leaderOf reads kNoNode for it
+            // whether or not it has a leader, and it can never be ours to give away.
+            if (!host.hosts(vs))
+                continue;
+            raft::RaftGroup* g = host.group(vs);
+            if (!g)
+                continue;
+            const auto& voters = g->node().config().voters;
+            if (voters.empty())
+                continue;
+            for (data::NodeId v : voters)
+                expected[v] += 1.0 / static_cast<double>(voters.size());
+            votersOf[vs].assign(voters.begin(), voters.end());
             const data::NodeId leader = host.leaderOf(vs);
             if (leader == timestar::raft::kNoNode)
                 continue;
             ++led[leader];
-            ++totalLed;
             if (leader == self)
                 mine.push_back(vs);
         }
-        const size_t fair = totalLed / peers.size();
-        if (mine.size() <= fair)
+        const double fairSelf = expected.count(self) ? expected.at(self) : 0.0;
+        if (static_cast<double>(mine.size()) <= fairSelf)
             co_return 0;
 
         std::vector<std::pair<data::NodeId, size_t>> targets;
         for (data::NodeId id : peers) {
             if (id == self)
                 continue;
+            const double fairPeer = expected.count(id) ? expected.at(id) : 0.0;
             const size_t have = led.count(id) ? led.at(id) : 0;
-            if (have < fair)
-                targets.push_back({id, fair - have});
+            if (static_cast<double>(have) < fairPeer)
+                targets.push_back({id, static_cast<size_t>(fairPeer) - have});
         }
         if (targets.empty())
             co_return 0;
 
-        const size_t budget = std::min(maxTransfers, mine.size() - fair);
+        const size_t budget = std::min(maxTransfers, mine.size() - static_cast<size_t>(fairSelf));
         size_t done = 0, ti = 0;
         for (uint16_t vs : mine) {
             if (done >= budget)
                 break;
-            size_t tried = 0;
-            while (tried < targets.size() && targets[ti % targets.size()].second == 0) {
-                ++ti;
-                ++tried;
-            }
-            if (tried == targets.size())
-                break;
-            auto& [target, deficit] = targets[ti % targets.size()];
             raft::RaftGroup* g = host.group(vs);
             if (!g || !g->isLeader())
                 continue;
-            // NEVER hand leadership to a peer that is not CAUGHT UP on this group.
+            const auto& voters = votersOf[vs];
+            // Pick the first ELIGIBLE target for THIS group, starting from the
+            // round-robin cursor, rather than taking whatever the cursor points at and
+            // giving up on the group if it does not fit.
             //
-            // A leader with a transfer in flight refuses every proposal until the
-            // transferee acks up to lastIndex, so targeting a peer that cannot ack costs
-            // the group its write availability for the whole transfer window. And a DEAD
-            // peer is the MOST attractive target this loop has: it leads nothing, so its
-            // deficit is the largest on every pass. Measured on the restart-catch-up
-            // gate: with one of three nodes down, ~26% of writes failed with
-            // "1 VShard slice(s) uncommitted ... (last: not-leader)" for as long as it
-            // stayed down, against a perfectly healthy 2-of-3 quorum.
-            //
-            // RaftNode::tick now abandons a transfer after one election timeout, so this
-            // is no longer unbounded -- but a bounded write outage repeated every
-            // balancer pass is still an outage, and a caught-up target is also the only
-            // one that transfers IMMEDIATELY (transferLeadership sends TimeoutNow at
-            // once rather than waiting on a catch-up round trip).
-            //
-            // THE GUARD USED TO BE EXACT EQUALITY (matchIndex == lastIndex) and that made
-            // the balancer LOAD-DEPENDENT (debt D-1). On a group taking writes, matchIndex
-            // trails lastIndex by whatever is in flight essentially all of the time -- the
-            // leader appends locally, then replicates -- so a perfectly healthy peer failed
-            // the test on nearly every pass. The balancer converged when the cluster was
-            // quiet and could only move COLD groups when it was busy, which is exactly
-            // backwards: hot groups are the ones whose leadership placement matters.
-            //
-            // Two independent gates replace it, and BOTH must hold:
-            //
-            //   1. LAG BOUND -- within kMaxTransferLagEntries of our log end. This is the
-            //      "the handoff will complete promptly" half. 64 entries is about one
-            //      AppendEntries round trip of in-flight work at this batch size, so a
-            //      peer keeping up passes continuously while one genuinely behind (a
-            //      restarted node still streaming its backlog) does not. TimeoutNow then
-            //      fires on the very next ack rather than after a catch-up campaign.
-            //
-            //   2. LIVENESS -- replied within the LAST HEARTBEAT ROUND. This is the "the
-            //      target is actually there" half, and it is the one a pure lag bound
-            //      CANNOT provide. On an IDLE group a dead peer sits at lag ZERO forever:
-            //      it was caught up when it died and lastIndex never moves again, so it
-            //      passes any delta check, including the old exact-equality one. (That
-            //      hole is therefore not new here -- it is pre-existing, and this closes
-            //      it.) The heartbeat gives an independent decaying signal: the leader
-            //      bcastAppends every heartbeatTimeout ticks whether or not there is
-            //      anything to send, and a live peer answers within an RTT.
-            //
-            // THE LIVENESS WINDOW IS ONE HEARTBEAT ROUND, AND IT IS THIS TIGHT FOR A
-            // MEASURED REASON. It was three rounds (1.5 s at the production 25-tick
-            // heartbeat) and `fault_injection_gate.sh` regressed: 1 of 2000 bench writes
-            // failed `RetryableWriteError ... (last: transport)` where the same tree
-            // without this change took a marginally HEAVIER storm (167 rounds / 457
-            // connections vs 165 / 442) with zero. The mechanism is specific and it is
-            // this loop's: the periodic balancer could target a peer whose connection had
-            // just been RST, because the ack clock had not yet decayed past three rounds
-            // and the lag bound still held. `transferLeadership` then pins
-            // `leadTransferee_` and the group refuses EVERY proposal until the transferee
-            // acks -- and the abandon bound is one ELECTION timeout (2.5-5 s), far longer
-            // than the 1.5 s write deadline. So one mis-aimed transfer is one failed
-            // batch. The old exact-equality guard was accidentally immune: a peer whose
-            // acks stopped fell behind a growing lastIndex immediately.
-            //
-            // One round is the tightest bound a HEALTHY peer still satisfies -- it answers
-            // every heartbeat within an RTT, so its clock resets long before the next
-            // round -- and it cuts the post-reset eligibility window from 1.5 s to 0.5 s.
-            //
-            // Residual exposure, bounded and now deliberate: a peer that dies inside the
-            // current heartbeat round can still be targeted on a pass that races it. That
-            // costs the group its proposals for one election timeout, after which
-            // RaftNode::tick abandons the transfer (§3.10) and writes resume; the peer
-            // then reads stale on every later pass and is skipped. One bounded window on
-            // the pass that races the death, not a window per pass forever -- which is
-            // what the abandon fix alone left on the table. Shrinking it further means
-            // shortening the ABANDON window (a consensus-timing change, not a target
-            // filter) -- see the debt register.
-            constexpr raft::LogIndex kMaxTransferLagEntries = 64;
-            const auto lastIdx = g->node().log().lastIndex();
-            const auto match = g->matchIndexOf(target);
-            const bool caughtUp = match >= lastIdx || (lastIdx - match) <= kMaxTransferLagEntries;
-            const uint64_t kMaxTransferAckStaleTicks = g->heartbeatTimeout();
-            const bool live = g->ticksSinceAck(target) <= kMaxTransferAckStaleTicks;
-            if (!caughtUp || !live) {
-                ++ti;
-                continue;
+            // A NON-VOTER OF THIS GROUP IS NOT A CANDIDATE AT ALL (debt D-12).
+            // `RaftNode::transferLeadership` returns silently for a target that is not a
+            // voter, so aiming at one is a NO-OP that this loop nonetheless counted as a
+            // transfer: at RF=3 on 5 nodes, 2 of the 4 peers replicate any given group,
+            // so about half of every pass's budget was spent on transfers that could not
+            // happen -- and `transfers_initiated` reported them. MEASURED before the fix
+            // on an idle 5-node RF=3 cluster: 114 961 transfers "initiated" over five
+            // minutes of operator storms against roughly 1 500 VShards that actually
+            // changed hands.
+            size_t chosen = targets.size();
+            for (size_t k = 0; k < targets.size(); ++k) {
+                const size_t idx = (ti + k) % targets.size();
+                auto& [cand, deficit] = targets[idx];
+                if (deficit == 0)
+                    continue;
+                if (std::find(voters.begin(), voters.end(), cand) == voters.end())
+                    continue;
+                if (!transferrableTo(*g, cand))
+                    continue;
+                chosen = idx;
+                break;
             }
+            if (chosen == targets.size())
+                continue;  // no peer can take this group right now; try the next one
+            auto& [target, deficit] = targets[chosen];
             try {
                 co_await g->transferLeadership(target);
                 --deficit;
