@@ -1,6 +1,23 @@
 # Cluster Write Scale-Out Plan
 
-Status: Phases 1, 2, 3, 4 and 5 IMPLEMENTED (Phase 5: 2026-07-26); Phase 6 planned.
+Status: Phases 1-5 IMPLEMENTED; **Phase 6 (acceptance) RUN AND RECORDED, 2026-07-26.
+The plan is closed.**
+
+Phase 6 result: **the availability targets are met, the throughput targets are not, and
+the reason is measured.** RF=3 sits at **4.91 M pts/s median (6 runs, 0 errors in 6),
+p50 95.9 ms**, against a §4 target of 6.5 M and 60 ms that was written before anything had
+profiled the limiter. Phase 5 established what the limiter is — the quorum round trip, on
+a cluster ~80 % CPU-idle — and this phase's connection probe confirms it directly:
+conns 2 -> 16 doubles points-in-flight and doubles latency at each step while throughput
+moves ±3 % and CPU stays flat at 17-20 %. Adding concurrency buys queueing, not service,
+so no amount of routing, wire or consensus work inside this plan could have reached 6.5 M.
+What DID land: all five live gates green in isolation, `kill -9` mid-bench / rolling
+restart / whole-cluster `kill -9` all losing nothing and answering with bounded retryable
+503s rather than 500s, all five suites green (4107 / 46 / 33 / 184 / 187), and the
+single-node non-clustered path un-regressed at 12.38 M. Campaign arc: **3.9 M @ 155 ms
+with a ~1-in-3 500-burst rate -> ~4.9-5.3 M @ ~96 ms with 0 bursts in 30+ recorded runs.**
+Full numbers, the targets-vs-achieved table, and the complete carried-debt register are in
+"Phase 6 outcome" below.
 
 Phase 5 result: **the consensus layer is not the limiter either, and this phase measured
 that rather than assuming it.** Re-profiling first (5-pre) found the cluster still ~80 %
@@ -1089,6 +1106,8 @@ restart-catch-up gate. Unchanged from the Phase-4 debt entry.
 
 ### Phase 6 — Acceptance
 
+The targets this phase was written against, unedited:
+
 - Canonical bench targets: RF=3 ≥ 6.5M pts/s (≥84% of RF=1's 7.75M — one
   quorum round of pipelined overhead, not 2x), RF=1 ≥ 9M (its own funnel
   fixes apply too); CPU utilization must RISE with load (the waiting-bound
@@ -1100,6 +1119,275 @@ restart-catch-up gate. Unchanged from the Phase-4 debt entry.
   deadline-expired failures during a true node outage.
 - Full five suites; update `cluster_write_perf_jul25` memory and
   `final_perf_figures` with the new canonical table.
+
+### Phase 6 outcome (2026-07-26) — RUN AND RECORDED
+
+**The availability targets are met and the throughput targets are not, and the reason
+they are not is now measured rather than argued.** Every HA property this plan set out
+to establish holds under injected faults; the 6.5 M figure was set in §4 before anything
+had profiled the limiter, and Phase 5's re-profile (5-pre) established what it is: the
+quorum round trip, on a cluster ~80 % CPU-idle. Nothing in routing, wire format, or
+consensus efficiency shortens a round trip, so nothing in Phases 1-5 could have closed
+that gap, and the acceptance run confirms it did not.
+
+#### Acceptance table — targets vs achieved
+
+| target (§4, as written)                        | achieved                                     | verdict |
+|------------------------------------------------|----------------------------------------------|---------|
+| RF=3 ≥ 6.5 M pts/s                              | **4.91 M** median of 6 runs (4.87-5.02)      | **NOT MET** — see "Why the gap is structural" |
+| RF=1 (3 nodes, partitioned) ≥ 9 M               | not re-measured this phase (last: 7.75 M, §1)| NOT MEASURED |
+| CPU utilization must RISE with load             | flat **17-20 %** of 4 cores at conns 2/4/8/16 | **NOT MET** (and it is the finding, not a miss) |
+| p50 ≤ 60 ms @ conns=8                           | **95.9 ms** median (93.1-101.2)              | **NOT MET** (from 155 ms at Phase 0) |
+| adding connections raises throughput till CPU saturates | throughput flat ±3 %, latency exactly linear | **NOT MET** — RTT-bound, measured below |
+| HA rounds: 0 HTTP errors except bounded deadline-expired during a true outage | all five live gates PASS; fault injection, rebalance, deposed-primary, backpressure **0 errors**; node-outage rounds give **bounded retryable 503s, never 500s, never loss** | **MET for the fault rounds; QUALIFIED for the outage rounds** (see HA below) |
+| Full five suites                                | 4107 unit / 46 perf / 33 socket / 184 jest / 187 vitest, **all green** | **MET** |
+| single-node non-clustered not regressed         | **12.38 M** median vs an 11.6 M baseline      | **MET** |
+
+#### 1. Canonical bench campaign (6 runs, RF=3 on 3 nodes)
+
+Fresh data dirs per run, leadership converged AND balanced before each, 100 x 10k,
+hosts=1000, conns=8, `--smp 4`, `--verify 0`, 10 warmup batches. CPU from
+`/proc/<pid>/stat` deltas across the timed run.
+
+| run | pts/s     | p50 ms | p95 ms | p99 ms | max ms | HTTP errors | server 500s | quota fences |
+|-----|-----------|--------|--------|--------|--------|-------------|-------------|--------------|
+| 1   | 4 870 692 | 101.2  | 135.5  | 148.4  | 164.5  | 0           | 0           | 0            |
+| 2   | 4 913 943 |  97.9  | 141.5  | 198.6  | 200.6  | 0           | 0           | 0            |
+| 3   | 4 905 239 |  93.1  | 125.9  | 130.4  | 137.5  | 0           | 0           | 0            |
+| 4   | 4 960 074 |  93.5  | 145.2  | 159.5  | 194.2  | 0           | 0           | 0            |
+| 5   | 4 908 328 |  96.6  | 140.7  | 146.0  | 147.4  | 0           | 0           | 0            |
+| 6   | 5 019 692 |  95.3  | 128.4  | 145.9  | 146.1  | 0           | 0           | 0            |
+
+**Median 4.91 M pts/s, median p50 95.9 ms, zero-error rate 6 of 6.** Node CPU 16.5-20.6 %
+of 4 cores on every run. The acceptance bar for this campaign (0-error ≥ 5/6) is met; the
+median-≥5.0 M bar is missed by 2 %.
+
+**Same-session A/B, because cross-session medians are not comparable on this box** (the
+5a lesson: idle CPU on an unchanging idle cluster drifted 4 % -> 8 % within one session).
+The pre-Phase-6 binary `11fc459`, rebuilt and re-benched in THIS session, three runs:
+**4.958 / 4.967 / 4.917 M, median 4.958 M**, p50 91.3-94.4 ms. So this session's box is
+worth ~4.95 M and Phase 6's two commits (a constant and an unreachable catch clause)
+change nothing — the 5 % shortfall against Phase 5's recorded 5.18 M is drift, exactly the
+effect 5a documented. **Do not read the phase-to-phase medians in the summary table below
+as a trend; only the same-session A/B rows are evidence.**
+
+#### 2. Connection-scaling probe
+
+Same cluster shape, conns 2/4/8/16, one run each.
+
+| conns | pts/s     | p50 ms | p99 ms | node CPU (% of 4 cores) | points in flight (thr x p50) |
+|-------|-----------|--------|--------|-------------------------|------------------------------|
+| 2     | 4 364 455 |  28.0  |  45.4  | 19.2 / 18.1 / 16.3      | 122 k                        |
+| 4     | 4 721 678 |  49.9  |  86.2  | 19.5 / 17.6 / 17.4      | 235 k                        |
+| 8     | 4 874 935 |  96.0  | 166.7  | 20.2 / 17.3 / 18.1      | 468 k                        |
+| 16    | 4 802 504 | 189.6  | 303.7  | 20.1 / 17.2 / 18.2      | 911 k                        |
+
+**Read it honestly: throughput is flat from conns=4 onward (+3 %, then -1.5 %), latency
+doubles with every doubling of connections, and CPU does not move at all.** The last
+column is the tell — the number of points the system is holding doubles each time, and
+the time to get them through doubles with it. Added connections buy queueing, not
+service. The plan's acceptance sentence ("adding connections increases throughput until
+CPU saturates") describes a CPU-bound system; this one is not, has never been within this
+plan's measurements, and 5-pre said so before this probe was run.
+
+At conns=2 the p50 (28 ms) is within noise of the quorum commit latency Phase 3 measured
+directly (30.95 ms p50). That is the whole story of the number: **one batch costs one
+quorum round, and the round rate is what is fixed.**
+
+#### 3. Live gates — all five PASS, each run in isolation on the final binary
+
+Free space checked ≥ 30 G before each and data dirs deleted after, per the two recorded
+measurement hazards. No run logged `Disk quota exceeded`.
+
+| gate | result |
+|---|---|
+| `fault_injection` | **PASS** — 147 reset rounds destroying 400 peer connections mid-bench -> 2000/2000 bench + 200/200 probe, **0 HTTP errors, 0 server 500s, 0 crashes**; 4.61 M under the storm vs a 4.98 M proxied baseline (**92 %**); all 200 acked probe points readable on all three nodes |
+| `rolling_rebalance` | **PASS** — **2216 transfers** initiated mid-bench over 102 rebalance calls, **600/600 OK, 0 errors**, 4.85 M pts/s, converged to [1364 1368 1364] and settled (0 VShards moving) |
+| `deposed_primary` (5 nodes, RF=3) | **PASS** — **18 767 transfers**, **300/300 accepted, 0 5xx, 0 500s**, coordinator hosting 2458/4096 (so the stale-primary path is genuinely exercised) |
+| `backpressure` | **PASS** — at the artificial 1 MB/shard budget 200/200 rejected with the budget named and **0 500s**, every 503 carrying `Retry-After`, a single small write still succeeding; restarted at the default budget the same cluster runs **200/200 OK at 5.04 M** with zero admission rejections |
+| `restart_catchup` | **PASS** — node 3 down through a 400-batch campaign, restarted -> caught up on **100 %** of both peers' leaderships, probe point readable on the restarted node, **0 oversized-message refusals, 0 quota fences, 0 server 500s**. Client 503s during the outage: 137/400 (ADVISORY by design — see below and the gate README) |
+
+#### 4. HA rounds
+
+**(a) `kill -9` of one node mid-bench.** 200 batches against node 1, node 3 killed at
+t+3 s, 50 probe writes sent during the outage, then node 3 restarted.
+**167 OK / 33 bounded 503s**, every one
+`"N VShard slice(s) uncommitted after 6 attempt(s) (last: transport)"`; **0 server-side
+500s, 0 crashes**; **50/50 probe writes acked while the node was down**; after restart and
+leadership settling, node 3 was caught up on **1040/1040 and 2048/2048** of the two
+survivors' leaderships and the probe's 50 points were readable **on the restarted node**.
+
+**(b) Rolling restart under sustained writes (SIGTERM, one node at a time, catch-up
+between).** Nodes 2 and 3 restarted while a 900-batch bench drove node 1. Each exited on
+SIGTERM in **2 s** and caught up fully after restart (node 2: 129/129 and 127/127; node 3:
+656/656 and 3072/3072). Client result: **567 OK / 333 HTTP errors, all bounded retryable
+503s (`last: transport`), 0 server-side 500s, 0 connection failures, 0 crashes.**
+Restarting the node the bench itself is holding (node 1), measured separately, adds
+72 connection failures — a load-balancer property, not a write-path one.
+
+**"Zero client errors" was the expectation and it is NOT what happens. The reason is
+structural and worth stating, because it also explains the restart-catch-up gate's
+advisory 503 band (50-201 of 400, and 111/400 on the pre-Phase-5 binary):**
+
+- A quorum of 2 of 3 survives one node leaving, so a group whose leader is alive keeps
+  committing. What does not survive is the *leadership* the departing node held — ~1/3 of
+  4096 groups — and each of those needs a fresh election (2.5-5 s at the 20 ms tick)
+  against a 1.5 s per-write deadline.
+- **A batch fails if ANY of its slices fails.** The canonical batch (10k points,
+  hosts=1000) touches on the order of a thousand VShards, so a per-VShard unavailability
+  of even 0.1 % during the election window makes batch failure near-certain. The
+  all-or-nothing rule is deliberate (§3: "no silent partial batch") and correct — but it
+  means the *client-visible* error rate during a node outage is amplified by batch
+  fan-out, and a "0 errors" acceptance bar phrased per REQUEST can never be met by a
+  system that fails a request when one of a thousand slices misses a deadline.
+- The contract that matters is intact throughout: 503 (retryable) not 500, `Retry-After`
+  where the cause is overload, no loss, no duplication, no split brain, and full catch-up
+  afterwards. A client that honours the 503 loses nothing.
+
+This is the honest reading of the plan's own qualifier ("except bounded deadline-expired
+failures during a true node outage"): those failures are bounded and deadline-expired, and
+there are more of them than the sentence implies.
+
+**(c) `kill -9` of the whole cluster.** 200 points written and acked, all three nodes
+killed -9, all three restarted: **200/200 readable on every node** (49210, 49211, 49212),
+matching pre-kill.
+
+#### 5. Suites — all five green
+
+| suite | result |
+|---|---|
+| `./test/timestar_unit_test` (from the build root) | **4107 tests / 419 suites, all passed** (1 disabled — the index-flush durability repro, see debt D-3) |
+| `./test/timestar_perf_test` | **46 tests / 12 suites, all passed** (rebuilt first: the binary predated this phase's lib changes) |
+| `./test/timestar_cluster_socket_test` | **33 tests / 8 suites, all passed** |
+| `test_api` jest | **184 tests / 13 suites, all passed** |
+| `timestar-nodejs` vitest | **166/166 correctness + 21/21 integration, all passed** |
+
+The JS servers ran single-node and NON-clustered, on ports 18086 and 58086 rather than the
+conventional 8086: this box has the user's own docker cluster (`timestar1/2/3`) bound to
+8086-8088, and answering a suite from a different binary's server is the stale-test-server
+trap. Both suites honour `TIMESTAR_HOST`/`TIMESTAR_PORT`; the correctness suite also needs
+`TIMESTAR_DATA_DIR` pointing at its server's directory, without which its flush-verified
+placements silently degrade to memory-store-only tests (it fails closed on that, which is
+how it was caught).
+
+#### 6. Single-node regression check
+
+Non-clustered, same bench shape: **11.87 / 12.38 / 12.39 M pts/s (median 12.38 M)**, p50
+6.9-7.9 ms, 0 errors. Against the 11.6 M baseline in §1, the non-clustered path is **not
+regressed** by any of this campaign — it is marginally faster, which is box variation, not
+a claim.
+
+The pair of numbers is also the cleanest statement of what replication costs today:
+**12.38 M @ 7.5 ms single-node vs 4.91 M @ 95.9 ms at RF=3** — 2.5x the throughput and
+13x the latency.
+
+#### Why the 6.5 M gap is structural, not a missing optimization
+
+The target assumed RF=3 should cost "one quorum round of pipelined overhead, not 2x". The
+measurements say the first half is right and the second does not follow:
+
+1. **The limiter is the round trip, and the cluster is idle while it waits.** 5-pre:
+   ~80 % of every core idle at peak, commit latency 19-66 ms, and — the decisive one —
+   the Raft message RATE is IDENTICAL idle and saturated (~2724 envelopes/s/shard). Load
+   makes messages bigger, not more numerous. There is no CPU wall to move.
+2. **Concurrency does not convert into throughput** (§2 above). Points-in-flight and
+   latency both double from conns=2 to 16 while throughput moves ±3 %. So the system is
+   not short of offered concurrency; the rate at which quorum rounds complete is fixed,
+   and every added connection joins the existing rounds instead of creating new ones.
+3. **Therefore throughput ≈ (batch size x rounds in flight) / round time**, and this plan
+   changed neither term. Phases 1-2 removed serialization *around* the round (the shard-0
+   funnel, the scatter loops, the re-hashes, the codec), which is why they bought
+   4.03 -> 5.06 M and 155 -> 92 ms and then stopped buying anything. Phases 3-5 bought
+   availability and correctness, which is what they were for.
+4. What this phase did NOT separate: whether the round rate is bounded by the tick/drain
+   cadence, by the journal barrier, or by the loopback RTT itself. Phase 5's profile
+   points at persist (~1.6 ms per sync, the largest stage, on tmpfs) but 1.6 ms does not
+   explain a 28 ms round. **Someone should measure the round's own budget before the next
+   throughput attempt** — that decomposition is the missing experiment in this whole
+   campaign, and every remaining lever below is a guess without it.
+
+#### What would actually move it (all measured or designed, none available cheaply)
+
+- **A real 5b — one journal writer per SHARD with group-commit coalescing.** The only
+  lever still inside the round with a measured cost behind it (`persist` is the largest
+  stage). Not implemented because the premise 5b was written on is false: `JournalWriter`
+  is per VSHARD, so there is nothing to coalesce onto. The work is spelled out in 5.3,
+  and its real price is cluster-wide journal retention interacting with movement.
+- **Ack-at-commit instead of at-apply.** MEASURED and CLOSED (3c): the commit->apply gap
+  is 0.21 ms p50 against a ~31 ms commit — 0.7 % of what a client waits, and it costs the
+  read-your-writes story. Not worth it at any point on this curve.
+- **VShard:group consolidation (ADR 0004).** Divides by K everything that scales with
+  GROUP count and nothing that scales with data. On a node that is 80 % CPU-idle, removing
+  CPU work cannot raise throughput. Rejected FOR THROUGHPUT; its real argument is the
+  journal, which the shared per-shard writer addresses more cheaply.
+- **Deeper client pipelining.** Out of scope by §5 — and §2 above is the measurement that
+  matters: 8x more concurrency at the client produced 10 % more throughput and 6.8x the
+  latency. More in-flight work at the client is not the missing ingredient.
+- **Fewer, larger batches, or clients spread across nodes.** Not attempted here. The bench
+  drives ONE node, which is therefore coordinator and replica simultaneously (5-pre found
+  its stages run 2-3x the other nodes'); a real fleet spreads. This is the cheapest
+  untested hypothesis on the list and it is a BENCH change, not a server change.
+
+#### Campaign summary (Phase 0 -> Phase 6)
+
+Canonical bench throughout: RF=3, 3 nodes, `--smp 4`, 100 x 10k, hosts=1000, conns=8,
+fresh dirs, leadership converged. **Medians across phases are NOT strictly comparable
+(box drift, see 5a); the same-session A/B rows are the evidence.**
+
+| phase | median pts/s | p50 | rejected-run rate | what it bought |
+|-------|--------------|-----|-------------------|----------------|
+| 0 (baseline) | 3.83-4.03 M | 155 ms | ~1 in 3 (500 bursts) | — |
+| 1 — funnel removal | 4.55 M | 104 ms | — | shard-0 profile outliers cut 2-6x |
+| 2 — route/copy/encode once | 5.06 M | 92 ms | 2 in 6 | shard-0 outlier GONE (2-pre, the Raft listener) |
+| 3 — ack path + retry semantics | 4.98 M | 93.5 ms | 1 in 9 | deposed primary 29 % 500s -> 0; 503+Retry-After; every retryable failure named |
+| 4 — HA hardening [D6] | 5.34 M | 82.7 ms | **0 in 8** | the collapse window CLOSED, and proven by injected RSTs rather than statistics |
+| 5 — consensus efficiency | 5.18 M (same-session base 5.16 M) | 89-100 ms | 0 in 3 | throughput-NEUTRAL by design; UAF closed structurally, catch-up chunked, stuck-transfer defect fixed |
+| **6 — acceptance** | **4.91 M** (same-session base 4.96 M) | **95.9 ms** | **0 in 6** | the numbers above, honestly recorded |
+
+The arc, stated without decoration: **throughput 3.9 M -> 4.9-5.3 M (~+27 %), p50 155 ms
+-> ~96 ms (-38 %), and a ~1-in-3 chance of a 500-burst -> 0 in 30+ recorded runs across
+Phases 4-6.** The availability work is the campaign's real product; the throughput work
+finished in Phase 2 and everything after it confirmed why.
+
+#### Debt closed in this phase
+
+- **Snapshot envelope headroom** (`401a980`). `sendInstallSnapshot` (raft_node.cpp:283)
+  and `snapshotVShard` (replicated_vshard_host.cpp:93) compared a RAW PAYLOAD against
+  `kMaxRaftSendBytes` while the transport refuses on the ENCODED ENVELOPE, so a snapshot
+  in the band between passed both producer checks and was refused on the wire —
+  reinstating the nextIndex hot loop F3a existed to remove, and (for the compaction case)
+  after the log prefix had already been discarded. `kMaxRaftPayloadBytes` now states the
+  4 MiB reserve once and all three producers take it; a codec test measures the framing
+  rather than asserting the constant.
+- **`ProposalTooLargeError` -> 413** (`a0633dc`), matching `WriteFrameTooLargeError` and
+  `InsertTooLargeException`. It reached the handler and fell through to an opaque 500 —
+  and in the `{"writes":[...]}` path to a 200 `"partial"`. Unreachable today; fixed
+  because what makes it reachable (a larger batch cap, or the snapshot trigger being
+  wired) will not arrive with a reminder.
+
+#### Carried debt register (complete, as of Phase 6)
+
+Everything filed across Phases 3-5 and still open, in one list. Nothing here is a
+regression from this campaign unless it says so.
+
+| # | item | pointer | owner / note |
+|---|---|---|---|
+| D-1 | **F4 — the balancer's caught-up guard is exact equality**, so under sustained writes a healthy peer is almost never "caught up" and leadership balancing becomes load-dependent (converges when quiet, stalls when busy). Wanted: a bounded matchIndex lag or a last-ack timestamp. | `lib/cluster/integration/shard_raft_plane.hpp:319` | movement/M5. Changes balancer behaviour under load; wants its own rolling-rebalance measurement |
+| D-2 | **F5 — read-path clobber in the index.** The batch-insert of KV scan misses does `entry->bitmap = readSafe(...); entry->dirty = false;` on an entry a concurrent insert may have created and dirtied during the scan's suspension — overwriting its adds and clearing the flag that would have persisted them. Fix is `\|=` and leaving `dirty` alone. | `lib/index/native/native_index.cpp:1763-1764` (`getSeriesGroupedByTag`) | index owner. Pre-existing |
+| D-3 | **Index-flush durability defect**: correct in memory, short by ~one chunk after close+reopen, needing BOTH concurrency and frequent flushes. `maybeFlushMemTable` clears every `dirty` flag then SUSPENDS TWICE before `applyTo(*memtable_)`, and the trims can evict now-clean entries inside that window; the background fiber resets `immutableMemtable_` before `maybeCompact`/`refreshSSTables`. Cause not confirmed; the day-bitmap framing is the symptom. | `native_index.cpp:707-716` (twin at `:755-763`), `:738`; repro `test/unit/index/day_bitmap_concurrent_insert_test.cpp:301` (DISABLED) | index owner. Pre-existing |
+| D-4 | **Fault-gate hardening not done**: floors still 8 rounds / 8 connections against 147/400 observed, the A/B against a 4a-reverted binary is still manual (revert set named in the gate README, not scripted), and there is no combined reset+rebalance+high-connection gate. | `test/cluster_gates/fault_injection_gate.sh` | write-path owner. Deferred twice (Phase 4, Phase 5.6) |
+| D-5 | **InstallSnapshot is unchunked** — the one Raft producer 5.4 did not cap. Chunking is a protocol change (offset/done, receiver-side reassembly, a resumable boundary). Until then the 128 MiB inbound admission bound is sized around it, and an oversized snapshot fails VISIBLY (refused + counted) rather than silently. | `lib/cluster/raft/raft_node.cpp:275-295`; bound `raft_types.hpp:74` | snapshot owner |
+| D-6 | **The snapshot producer trigger is still unwired** — `snapshotVShard` has no production caller, so log compaction never runs on the data plane. F3c and the Phase-6 headroom fix both protect a path nothing calls yet. | `lib/cluster/integration/replicated_vshard_host.cpp:72` (only definition) | snapshot owner. See the snapshot-wiring history |
+| D-7 | **Journal still emits codec v1 unconditionally.** The data-plane wire negotiates v2 per peer, but the Raft command path does not (a log entry goes to voters that never did the pairwise handshake). Raising it needs group-0's committed format activation wired to the codec. Until then no v2 byte can reach a journal — which is also why nothing is at risk today. | `lib/cluster/data/write_record.hpp:128-142`; gate exists at `lib/cluster/control/group0_state.hpp:65` (`activeFormatVersion`) | 2c tail |
+| D-8 | **The in-flight write bound covers only what a node ORIGINATES.** `WriteAdmission` is charged on the request shard of the RF>1 path; peer INGRESS (`ShardRaftPlane::proposeBatch{,Hinted}` — ~2/3 of replication traffic on a 3-node RF=3 cluster) is bounded only by `rpc::resource_limits`, and RF=1 (`NodeWriteRouter`) has no bound at all. Extending it needs the charge released on the SERVING shard, a different accounting shape. | charge at `lib/cluster/integration/shard_raft_plane.hpp:408`; scope note in §3d-scope | write-path owner. Deliberate (3d-scope) |
+| D-9 | **CheckQuorum cannot be enabled until the transfer bypass lands** (ADR 0005): a new message-type byte for the transfer vote PLUS gating activation on the cluster-wide committed format version — neither alone suffices, and `encodeEnvelope` has no version field, so adding a byte to `RequestVote` is a silent-misparse hazard. Nothing depends on CheckQuorum for safety today. | `docs/adr/0005-checkquorum-transfer-bypass.md` | consensus owner |
+| D-10 | **A real 5b (shared per-shard journal writer + group-commit coalescing)** — the largest measured stage, and the ONE remaining lever inside the quorum round. Design and its real cost (cluster-wide journal retention vs per-VShard directory deletion on movement) written up in 5.3. | plan §5.3 | perf owner |
+| D-11 | **VShard:group consolidation** — ADR written, recommendation "not now, and not for throughput". One concrete thing to do TODAY regardless: put an explicit group id in the VShard directory, which is the difference between a rolling migration and a rebuild later. | `docs/adr/0004-vshard-group-consolidation.md` | placement owner |
+| D-12 | **Leadership balancing arithmetic at RF < N.** `rebalance` computes `fair = totalLed / peers.size()` where `totalLed` counts only HOSTED VShards while `mine` is full leadership, so at RF < N every node believes it is permanently above fair share. Correct at RF == N (production and every gate here). CODE READING, not a confirmed measurement — the run that prompted it was confounded by CheckQuorum, and the withdrawal is recorded in Phase 3. | `lib/cluster/integration/shard_raft_plane.hpp` (`rebalance`) | movement/M5 |
+| D-13 | **Reads fail on RF < N clusters** (`gatherLeaders`), same hosted-vs-led accounting as D-12, which is also why `vshards_leaderless` is meaningless at RF < N and why the gate library refuses to use it. | gate README "Run them ONE AT A TIME" section; query plan owns the fix | query plan |
+| D-14 | **Bounded 503s during a genuine one-node outage, amplified by batch fan-out.** Correctly labelled since F1 (`LeaderRefused` vs `NotLeader`, no self-naming hints) and never a 500, never a loss. Measured again this phase: 33/200 (kill -9 mid-bench), 137/400 (restart gate), 333/900 (rolling restart). The amplifier is that a ~1000-VShard batch fails if any one slice misses the 1.5 s deadline while ~1/3 of groups re-elect. Not a defect to "fix" without changing either the all-or-nothing batch rule or the election window — both of which are load-bearing. | §Phase 6 HA (b); `replicated_write_router.cpp` retry budget; election timings in `cluster_data_plane.cpp:147-151` | write-path owner. Pre-existing (111/400 on the pre-Phase-5 binary) |
+| D-15 | **The batched-send RECEIVE path was never optimized**, because batching shipped default-off after the A/B: the handler walks a frame's envelopes and `co_await`s each cross-shard delivery in turn, serializing what the single-envelope verb does one per frame. If `TIMESTAR_RAFT_BATCH_SENDS=1` is ever made default, start here. | `lib/cluster/raft/raft_rpc_transport.cpp:455-482` | perf owner |
+| D-16 | **Two pre-existing clang-format violations** in `http_write_handler.cpp` (a `replMime` ternary and a `replicateWrite` call, both in the M1 replication path) — CI gates the tree with `--Werror`, and they are on the branch already, not introduced here. | `lib/http/http_write_handler.cpp` ~:2161, ~:2193 | anyone; one command |
 
 ## 5. Explicitly out of scope
 
