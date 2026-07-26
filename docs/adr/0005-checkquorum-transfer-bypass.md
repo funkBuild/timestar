@@ -1,6 +1,23 @@
 # ADR 0005 — A leader-transfer bypass for the CheckQuorum disruption guard
 
-**Status:** Proposed — design only, NOT implemented (write-scaleout Phase 5d)
+**Status:** ACCEPTED and IMPLEMENTED (`82591a9` bypass, `5bdaa03` enable, `277e110` the
+interaction this ADR did not predict). CheckQuorum is ON. Mechanism (b) shipped;
+mechanism (c) — cluster-wide gated activation — did NOT, and is carried as debt D-30.
+
+**What the gates added to this design.** The bypass was necessary and sufficient for
+TRANSFERS (2216 of them under sustained writes, zero client errors, leadership settling
+at 0 moved), but enabling CheckQuorum then broke something this ADR never considered:
+**hibernation stretches the lease**. An idle follower ticks 1-in-10, so its disruption
+guard lasts 25-50 s rather than 2.5-5 s, and a group whose leader has DIED cannot be
+voted into a new one for that whole window. Same-session A/B on `node_kill_round.sh`:
+49/400 failed batches and an 8 s recovery with CheckQuorum off, **153/400 and 43 s** with
+it on. Fixed by waking a group that DROPS a vote under the lease (`277e110`), which
+brings the band back to 62-69/400 and a 12 s recovery. The residual — one extra campaign
+cycle, because the wake fires on the first dropped vote — is debt D-29.
+
+The lesson for the next reader of this ADR: the lease is not only about what the wire
+carries. Any mechanism that slows a group's TICK also slows its lease, and this codebase
+has one.
 
 **Parent design:** [Cluster Architecture and Implementation Plan](../clustering.md),
 [Cluster Write Scale-Out Plan](../write-scaleout-plan.md) §4 Phase 5d
