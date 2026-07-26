@@ -46,8 +46,12 @@ struct RaftOptions {
     size_t maxAppendEntries = 256;
     size_t maxAppendBytes = 1u << 20;  // 1 MiB of entry payload per AppendEntries
 
-    // The largest single message this group may PRODUCE, mirroring the transport's peer
-    // admission bound. 0 disables the check (tests, and any driver with no such bound).
+    // The largest PAYLOAD this group may put in a single message. 0 disables the check
+    // (tests, and any driver with no such bound). It is NOT the transport's send bound:
+    // that one is enforced on the encoded envelope, so a driver mirroring it must pass
+    // `kMaxRaftPayloadBytes` (the send bound less the envelope's headroom) rather than
+    // `kMaxRaftSendBytes`, or a snapshot in the band between them passes here and is
+    // refused on the wire -- reinstating the very hot loop below.
     //
     // It exists for InstallSnapshot, the one producer 5.4 did not cap: it carries an
     // entire VShard snapshot in one message. Over the bound, the transport refuses to send

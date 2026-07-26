@@ -90,12 +90,12 @@ seastar::future<uint64_t> ReplicatedVShardHost::snapshotVShard(uint16_t vshard) 
     // can never be caught up at all -- and the log entries that would have done it are
     // gone. Declining to compact leaves the group exactly as it was: larger log, working
     // replication.
-    if (encoded.size() > raft::kMaxRaftSendBytes) {
+    if (encoded.size() > raft::kMaxRaftPayloadBytes) {
         timestar::http_log.error(
-            "cluster: NOT compacting VShard {}: its snapshot is {} bytes, over the {} byte Raft send bound, so no "
+            "cluster: NOT compacting VShard {}: its snapshot is {} bytes, over the {} byte Raft payload bound, so no "
             "follower could be caught up from it. The log is kept instead (it will keep growing). Chunked "
             "InstallSnapshot streaming is the fix.",
-            vshard, encoded.size(), raft::kMaxRaftSendBytes);
+            vshard, encoded.size(), raft::kMaxRaftPayloadBytes);
         co_return 0;
     }
     co_await g->compact(upto, std::move(encoded));

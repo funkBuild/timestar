@@ -1,5 +1,7 @@
 #include "../../../lib/cluster/raft/raft_codec.hpp"
 
+#include "../../../lib/cluster/raft/raft_group.hpp"  // kMaxProposalBytes
+
 #include <gtest/gtest.h>
 
 using namespace timestar::raft;
@@ -148,4 +150,55 @@ TEST(RaftCodecTest, UnknownTagAndBogusEntryCountRejected) {
     good[good.size() - 4] = static_cast<char>(0xff);
     good[good.size() - 3] = static_cast<char>(0xff);
     EXPECT_FALSE(decodeEnvelope(good).has_value());
+}
+
+// The transport refuses on the ENCODED ENVELOPE; every producer checks a RAW PAYLOAD.
+// The gap between the two is what `kRaftEnvelopeHeadroomBytes` reserves, and this pins
+// that the reserve actually covers the framing -- otherwise a snapshot in the band
+// between the payload bound and the send bound passes `sendInstallSnapshot`'s check and
+// is refused on the wire, which is exactly the nextIndex hot loop F3a removed.
+TEST(RaftCodecTest, EnvelopeHeadroomCoversTheFramingOfEveryPayloadProducer) {
+    static_assert(kMaxRaftPayloadBytes + kRaftEnvelopeHeadroomBytes == kMaxRaftSendBytes);
+    static_assert(kMaxRaftPayloadBytes < kMaxRaftSendBytes);
+    static_assert(RaftGroup::kMaxProposalBytes == kMaxRaftPayloadBytes,
+                  "the proposal producer must share the one payload bound");
+
+    // A config far larger than any placement this system builds (RF is single digits),
+    // so the measured overhead is a pessimistic bound on the real one.
+    Config fat;
+    for (NodeId n = 1; n <= 4096; ++n) {
+        fat.voters.push_back(n);
+        fat.votersOutgoing.push_back(n + 100000);
+        fat.learners.push_back(n + 200000);
+    }
+
+    const std::string payload(1u << 20, 'x');  // 1 MiB stand-in for the real payload
+
+    InstallSnapshot is;
+    is.term = 9;
+    is.leaderId = 1;
+    is.lastIncludedIndex = 1u << 30;
+    is.lastIncludedTerm = 7;
+    is.config = fat;
+    is.data = payload;
+    const size_t isOverhead = encodeEnvelope(wrap(4095, 2, 1, is)).size() - payload.size();
+    EXPECT_LE(isOverhead, kRaftEnvelopeHeadroomBytes)
+        << "an InstallSnapshot at kMaxRaftPayloadBytes would encode over kMaxRaftSendBytes";
+
+    // The proposal producer's framing: one entry carrying the payload, inside an
+    // AppendEntries, inside an envelope.
+    AppendEntries ae;
+    ae.term = 9;
+    ae.leaderId = 1;
+    ae.prevLogIndex = 1u << 30;
+    ae.prevLogTerm = 7;
+    ae.leaderCommit = 1u << 30;
+    LogEntry entry;
+    entry.term = 9;
+    entry.index = (1u << 30) + 1;
+    entry.data = payload;
+    ae.entries.push_back(std::move(entry));
+    const size_t aeOverhead = encodeEnvelope(wrap(4095, 2, 1, ae)).size() - payload.size();
+    EXPECT_LE(aeOverhead, kRaftEnvelopeHeadroomBytes)
+        << "a proposal at kMaxProposalBytes would encode over kMaxRaftSendBytes";
 }

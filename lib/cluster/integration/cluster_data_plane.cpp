@@ -149,8 +149,10 @@ seastar::future<> ClusterDataPlane::start(const ClusterConfig& cfg, seastar::sha
         ropts.electionTimeoutMax = 250;  // 5s (randomized -> spreads campaigns)
         // Mirror the transport's send bound INTO the core, so an InstallSnapshot that
         // could not be delivered is never built and never moves nextIndex (write-scaleout
-        // 5 review, F3a). One definition, in raft_types.hpp.
-        ropts.maxMessageBytes = raft::kMaxRaftSendBytes;
+        // 5 review, F3a). One definition, in raft_types.hpp -- and it is the PAYLOAD
+        // bound, not the send bound, because the transport measures the encoded envelope
+        // and `maxMessageBytes` is compared against the snapshot payload alone.
+        ropts.maxMessageBytes = raft::kMaxRaftPayloadBytes;
         // ropts.checkQuorum STAYS OFF. DO NOT ENABLE IT HERE -- it looks free and it is
         // not: with CheckQuorum on, LEADERSHIP TRANSFER BREAKS.
         //

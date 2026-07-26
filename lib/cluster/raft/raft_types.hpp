@@ -73,6 +73,23 @@ public:
 // have to include a transport header to know it.
 inline constexpr size_t kMaxRaftSendBytes = size_t{96} << 20;
 
+// The bound above is enforced by the transport on the ENCODED ENVELOPE -- message type,
+// group id, term, leader id, prev/commit indexes, the config's voter list, and the
+// framing around the payload -- not on the payload a producer holds. A producer that
+// compares its raw payload against `kMaxRaftSendBytes` therefore passes its own check and
+// is refused on the wire, which is precisely the case F3a was written to remove: for
+// InstallSnapshot that refusal reinstates the nextIndex hot loop, and for
+// `snapshotVShard` it means compaction discards the log prefix in favour of a snapshot
+// nothing can carry.
+//
+// So payload producers size themselves against `kMaxRaftPayloadBytes` and leave the
+// envelope its headroom. The reserve is the same one `RaftGroup::kMaxProposalBytes`
+// already took, now stated once and shared: generous rather than tight, because the
+// envelope's largest term (the config) has no small fixed bound and being 4 MiB
+// conservative on a 96 MiB ceiling costs nothing anybody can observe.
+inline constexpr size_t kRaftEnvelopeHeadroomBytes = size_t{4} << 20;
+inline constexpr size_t kMaxRaftPayloadBytes = kMaxRaftSendBytes - kRaftEnvelopeHeadroomBytes;
+
 // The Raft-persistent voting state (durably fsync'd before any RPC that depends
 // on it, per the journal safety contract). commitIndex is volatile and NOT part
 // of hard state.

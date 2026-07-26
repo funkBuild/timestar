@@ -33,8 +33,9 @@ public:
     // Failing the write CLOSED at propose is strictly cheaper than discovering that
     // afterwards, and it is where the caller can still be told (write-scaleout 5 review,
     // F3b). Sized under the transport's send mirror to leave room for the envelope header
-    // and the AppendEntries framing around the entry.
-    static constexpr size_t kMaxProposalBytes = kMaxRaftSendBytes - (size_t{4} << 20);
+    // and the AppendEntries framing around the entry -- the one payload bound every
+    // producer shares (raft_types.hpp).
+    static constexpr size_t kMaxProposalBytes = kMaxRaftPayloadBytes;
 
     seastar::future<bool> propose(std::string data);
     // Propose `data` and resolve only once THIS entry is committed AND applied on
