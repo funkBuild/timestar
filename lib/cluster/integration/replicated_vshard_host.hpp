@@ -101,6 +101,11 @@ public:
     // LeaderResolver: the current Raft leader of `vshard` per this node's local group
     // (kNoNode if not hosted here or no leader elected yet).
     NodeId leaderOf(uint16_t vshard) const override;
+    // Does this node hold a REPLICA of `vshard` at all? leaderOf() alone cannot answer
+    // that -- it returns kNoNode both for "hosted, no election yet" and for "not mine"
+    // -- and conflating the two is what made every read fail on an RF < N cluster
+    // (debt D-13). Every accounting of leaderlessness must gate on this first.
+    bool hosts(uint16_t vshard) const { return vshards_.count(vshard) != 0; }
 
     // ReadIndexSink (M4 replica-read leader-reach): confirm a linearizable ReadIndex /
     // report the commit index for `vshard`. Both throw if this VShard is not hosted here

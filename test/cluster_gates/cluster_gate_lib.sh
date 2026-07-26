@@ -73,12 +73,15 @@ status_field() { printf '%s' "$1" | grep -o "\"$2\":[0-9]*" | cut -d: -f2; }
 # fresh 5-node RF=3 cluster the background balancer needs minutes to reach fair shares,
 # and waiting for that is not what the gate is testing.
 #
-# It deliberately does NOT look at `vshards_leaderless`. That counter is only meaningful
-# at RF == N: a node reports every VShard it does not HOST as leaderless (counts() reads
-# kNoNode from its own registry), so on a 5-node RF=3 cluster each node reports ~1638 and
-# the sum never falls. Same pre-existing accounting that makes gatherLeaders() fail reads
-# on RF < N clusters; it belongs to the query plan, not here. The summed vshards_led IS
-# sound -- a node only ever claims leadership it actually holds.
+# It deliberately does NOT look at `vshards_leaderless`, which is now conservatism rather
+# than necessity. That counter USED to be meaningful only at RF == N: a node reported
+# every VShard it does not HOST as leaderless (counts() read kNoNode from its own
+# registry), so on a 5-node RF=3 cluster each node reported ~1638 and the sum never fell.
+# D-13 fixed the accounting at its source -- counts() now skips VShards this node does not
+# host, exactly as gatherLeaders() does. It is still a PER-NODE count of that node's own
+# replicas, so at RF < N a leaderless VShard is reported by each of its RF holders and a
+# cross-node SUM over-counts by up to RF; wait_all_led wants a cluster-wide total, which
+# the summed vshards_led gives exactly (a node only ever claims leadership it holds).
 wait_all_led() {
     local ports="$1" total="$2" polls="${3:-120}"
     for _ in $(seq 1 "$polls"); do

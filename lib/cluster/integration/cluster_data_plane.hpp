@@ -133,7 +133,20 @@ private:
     // RF=3 leader read: fan out per-VShard-leader (see .cpp).
     seastar::future<QueryResponse> queryReplicated(QueryRequest request);
     // vshard -> current leader, gathered from every shard (groups live across cores).
+    // Contains ONLY the VShards this node HOSTS: a missing key means "not ours, ask the
+    // placement directory", a present kNoNode means "ours, and leaderless" (debt D-13).
     seastar::future<std::map<uint16_t, data::NodeId>> gatherLeaders() const;
+
+    // Leaders learned from a peer's read REDIRECT, for VShards this node does not host
+    // and therefore cannot resolve itself (debt D-13). Purely an optimisation: a hit
+    // saves the redirect round trip, a miss or a stale entry costs one and is corrected
+    // by the redirect it provokes. It is never consulted for a VShard we DO host --
+    // there the live Raft view is authoritative and re-read on every attempt, which is
+    // what keeps a cached hint from surviving a leadership transfer.
+    //
+    // Bounded by VIRTUAL_SHARD_COUNT entries. ClusterDataPlane lives on one shard, so
+    // concurrent queries mutate this from one reactor thread only.
+    std::map<uint16_t, data::NodeId> readLeaderHints_;
 
     // Peer registration (write-scaleout 4b-iii). ONE DNS resolution per peer feeds EVERY
     // plane that needs it; a peer that fails to resolve is retried until it does, instead

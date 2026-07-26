@@ -1,6 +1,7 @@
 #include "cluster_data_plane.hpp"
 
 #include "../../utils/logger.hpp"  // timestar::http_log
+#include "../data/read_routing.hpp"
 #include "write_admission.hpp"
 
 #include <seastar/core/coroutine.hh>
@@ -351,9 +352,39 @@ seastar::future<QueryResponse> ClusterDataPlane::queryReplicated(QueryRequest re
     // double-count a series replicated on every node. Group all VShards by their
     // current leader, query each leader for ONLY those VShards (req.vshards restricts
     // its discovery), and merge the partials into the single answer.
-    std::map<data::NodeId, std::vector<uint16_t>> byLeader;
-    size_t leaderless = 0;
-    // Groups live across cores now, so collect each shard's leadership view.
+    //
+    // RF < N (debt D-13). This node can only resolve the leader of a VShard it HOSTS --
+    // a group it does not replicate is absent from its Raft registry, and `leaderOf`
+    // answers kNoNode for it, which is indistinguishable from "hosted, no leader
+    // elected". Counting those as leaderless failed EVERY read on any cluster where a
+    // node does not host everything: a 5-node RF=3 coordinator hosts ~2458 of 4096, so
+    // ~1638 VShards were permanently "leaderless" and the query failed
+    // QUERY_INCOMPLETE after its retries, forever.
+    //
+    // The fix mirrors the WRITE path. A VShard we do not host is routed by the
+    // PLACEMENT DIRECTORY (its primary replica, or a leader we learned earlier), and
+    // that node -- which does host it, so its own registry knows -- either answers or
+    // REDIRECTS us to the real leader, exactly as a stale-primary write reject carries
+    // a leader hint. Leaderless therefore keeps its original meaning: a node that HOSTS
+    // the group reports no elected leader, or no holder is reachable at all. Both still
+    // fail the read closed.
+    //
+    // What does NOT change: at RF == N every VShard is hosted here, no VShard is ever
+    // handed to the directory, no request carries a resolve list, and the loop below is
+    // the pre-D-13 one instruction for instruction.
+    const data::NodeId self = rt_->selfId;
+    std::vector<PartialAggregationResult> allPartials;
+    std::vector<timestar::http::SeriesResult> allNonNumeric;
+    std::vector<std::string> incompleteReasons;
+    std::exception_ptr firstErr;
+    std::set<data::NodeId> unreachableLeaders;
+
+    // Every VShard still owing an answer. Each one leaves this set exactly once -- when
+    // a target answers for it -- so no VShard is dropped and none is asked twice.
+    std::set<uint16_t> outstanding;
+    for (uint16_t vs = 0; vs < timestar::VIRTUAL_SHARD_COUNT; ++vs)
+        outstanding.insert(vs);
+
     // A VShard is momentarily leaderless during a leadership TRANSFER (the old leader
     // has stepped down, the new one has not yet won). Failing the query outright there
     // turns routine background rebalancing into user-visible read errors -- measured at
@@ -363,75 +394,134 @@ seastar::future<QueryResponse> ClusterDataPlane::queryReplicated(QueryRequest re
     // quorum) still fails closed after the retries.
     static constexpr int kLeaderRetries = 4;
     static constexpr auto kLeaderRetryDelay = std::chrono::milliseconds(25);
-    for (int attempt = 0; attempt <= kLeaderRetries; ++attempt) {
-        byLeader.clear();
+    // Rounds spent following REDIRECTS rather than waiting for an election. They are a
+    // separate budget because they are not the same event: a redirect is progress (we
+    // learned where the leader is and re-ask immediately, no sleep), whereas a
+    // leaderless retry is a wait. Charging redirects to kLeaderRetries would let a
+    // cluster that redirects once -- the ordinary RF < N cold-cache case -- spend most
+    // of its election tolerance before the first election even mattered. Two rounds is
+    // enough for hint -> leader; a hint war beyond that fails closed like any other
+    // unresolvable read.
+    static constexpr int kRedirectRounds = 2;
+
+    int leaderlessRetries = 0, redirectRounds = 0;
+    size_t leaderless = 0;
+    std::vector<uint16_t> unassigned;
+    while (true) {
         leaderless = 0;
+        unassigned.clear();
+        // Groups live across cores now, so collect each shard's leadership view. Only
+        // VShards this node HOSTS appear -- see gatherLeaders.
         const auto leaders = co_await gatherLeaders();
-        for (const auto& [vs, leader] : leaders) {
-            if (leader == timestar::raft::kNoNode)
-                ++leaderless;  // no elected leader right now
+        // The routing decision itself is a pure function of (outstanding, our live
+        // leadership view, the hints we have learned, the placement map) -- extracted
+        // so it can be unit-tested against a directory where this node hosts a strict
+        // subset, which is the configuration that was permanently broken.
+        data::ReadRouting plan = data::planReadRouting(outstanding, leaders, readLeaderHints_, *dir_, self);
+        leaderless = plan.leaderless;
+        unassigned = plan.unassigned;
+        auto& byLeader = plan.byNode;
+        auto& resolveAt = plan.resolveAt;
+
+        if (!unassigned.empty())
+            break;  // fail closed below; retrying cannot assign a VShard
+        if (leaderless > 0 && leaderlessRetries < kLeaderRetries) {
+            ++leaderlessRetries;
+            co_await seastar::sleep(kLeaderRetryDelay);
+            continue;  // re-gather before dispatching anything
+        }
+        if (leaderless > 0)
+            break;  // budget spent: fail closed below
+
+        std::vector<seastar::future<data::NodeQueryPartial>> pending;
+        std::vector<data::NodeId> pendingLeaders;           // parallel to `pending`
+        std::vector<std::vector<uint16_t>> pendingVShards;  // parallel to `pending`
+        pending.reserve(byLeader.size());
+        pendingLeaders.reserve(byLeader.size());
+        pendingVShards.reserve(byLeader.size());
+        for (auto& [leader, vshards] : byLeader) {
+            data::NodeQueryRequest nq;
+            nq.request = request;
+            nq.vshards = vshards;
+            if (auto r = resolveAt.find(leader); r != resolveAt.end())
+                nq.resolveVShards = std::move(r->second);
+            pendingLeaders.push_back(leader);
+            pendingVShards.push_back(std::move(vshards));
+            if (leader == self)
+                pending.push_back(local_->queryLocal(std::move(nq)));
             else
-                byLeader[leader].push_back(vs);
+                pending.push_back(rpc_->queryNode(leader, std::move(nq)));
         }
-        if (leaderless == 0 || attempt == kLeaderRetries)
-            break;
-        co_await seastar::sleep(kLeaderRetryDelay);
-    }
-    if (leaderless > 0) {
-        // A VShard with no leader may hold matching data we cannot read -> fail closed
-        // (QUERY_INCOMPLETE), never a silent partial.
-        QueryResponse r;
-        r.success = false;
-        r.errorCode = "QUERY_INCOMPLETE";
-        r.errorMessage = std::to_string(leaderless) + " VShard(s) have no elected leader";
-        co_return r;
-    }
 
-    const data::NodeId self = rt_->selfId;
-    std::vector<seastar::future<data::NodeQueryPartial>> pending;
-    std::vector<data::NodeId> pendingLeaders;  // parallel to `pending`
-    pending.reserve(byLeader.size());
-    pendingLeaders.reserve(byLeader.size());
-    for (auto& [leader, vshards] : byLeader) {
-        data::NodeQueryRequest nq;
-        nq.request = request;
-        nq.vshards = std::move(vshards);
-        pendingLeaders.push_back(leader);
-        if (leader == self)
-            pending.push_back(local_->queryLocal(std::move(nq)));
-        else
-            pending.push_back(rpc_->queryNode(leader, std::move(nq)));
-    }
-
-    std::vector<PartialAggregationResult> allPartials;
-    std::vector<timestar::http::SeriesResult> allNonNumeric;
-    std::vector<std::string> incompleteReasons;
-    std::exception_ptr firstErr;
-    std::set<data::NodeId> unreachableLeaders;
-    for (size_t i = 0; i < pending.size(); ++i) {
-        auto& f = pending[i];
-        try {
-            data::NodeQueryPartial part = co_await std::move(f);
-            if (!part.incompleteReasons.empty()) {
-                for (auto& r : part.incompleteReasons)
-                    incompleteReasons.push_back(std::move(r));
-                continue;
+        bool learnedHint = false;
+        for (size_t i = 0; i < pending.size(); ++i) {
+            auto& f = pending[i];
+            try {
+                data::NodeQueryPartial part = co_await std::move(f);
+                if (!part.incompleteReasons.empty()) {
+                    for (auto& r : part.incompleteReasons)
+                        incompleteReasons.push_back(std::move(r));
+                    continue;
+                }
+                // A redirected VShard is NOT in this node's partials (its read filter
+                // excluded it), so it stays outstanding and is re-asked at the node
+                // named. Everything else this target was asked for is answered, once.
+                // Only VShards WE asked this target about can be redirected by it: a
+                // reply naming anything else (a buggy or hostile peer) must not steer
+                // another target's slice or hold a VShard outstanding forever. Same
+                // rule the write router applies to leader hints.
+                std::set<uint16_t> askedHere(pendingVShards[i].begin(), pendingVShards[i].end());
+                std::set<uint16_t> redirected;
+                for (const auto& rd : part.redirects) {
+                    if (!askedHere.count(rd.vshard))
+                        continue;
+                    redirected.insert(rd.vshard);
+                    if (rd.hosted && rd.leader != timestar::raft::kNoNode && rd.leader != pendingLeaders[i]) {
+                        readLeaderHints_[rd.vshard] = rd.leader;
+                        learnedHint = true;
+                    } else {
+                        // Hosted with no elected leader, or the holder does not host it
+                        // after all (placement skew). Drop any stale hint so the next
+                        // round re-resolves from the directory, and let the retry
+                        // budget decide between an election in progress and a genuine
+                        // outage.
+                        readLeaderHints_.erase(rd.vshard);
+                    }
+                }
+                for (uint16_t vs : pendingVShards[i])
+                    if (!redirected.count(vs))
+                        outstanding.erase(vs);
+                allPartials.insert(allPartials.end(), std::make_move_iterator(part.partials.begin()),
+                                   std::make_move_iterator(part.partials.end()));
+                allNonNumeric.insert(allNonNumeric.end(), std::make_move_iterator(part.nonNumeric.begin()),
+                                     std::make_move_iterator(part.nonNumeric.end()));
+            } catch (...) {
+                // A REMOTE leader we could not reach is an availability problem, not an
+                // internal error: the node is down (or partitioned) but its VShards have
+                // live replicas that will elect a new leader. Record it so we can wake
+                // those groups and answer honestly. A failure of our own LOCAL read is a
+                // genuine internal error and still propagates.
+                if (pendingLeaders[i] != self)
+                    unreachableLeaders.insert(pendingLeaders[i]);
+                else if (!firstErr)
+                    firstErr = std::current_exception();
             }
-            allPartials.insert(allPartials.end(), std::make_move_iterator(part.partials.begin()),
-                               std::make_move_iterator(part.partials.end()));
-            allNonNumeric.insert(allNonNumeric.end(), std::make_move_iterator(part.nonNumeric.begin()),
-                                 std::make_move_iterator(part.nonNumeric.end()));
-        } catch (...) {
-            // A REMOTE leader we could not reach is an availability problem, not an
-            // internal error: the node is down (or partitioned) but its VShards have
-            // live replicas that will elect a new leader. Record it so we can wake
-            // those groups and answer honestly. A failure of our own LOCAL read is a
-            // genuine internal error and still propagates.
-            if (pendingLeaders[i] != self)
-                unreachableLeaders.insert(pendingLeaders[i]);
-            else if (!firstErr)
-                firstErr = std::current_exception();
         }
+
+        if (!unreachableLeaders.empty() || firstErr || !incompleteReasons.empty())
+            break;  // answered below; retrying an incomplete/unreachable read is the caller's job
+        if (outstanding.empty())
+            break;  // every VShard answered exactly once
+        if (learnedHint && redirectRounds < kRedirectRounds) {
+            ++redirectRounds;
+            continue;  // we know somewhere new to ask -- no reason to sleep first
+        }
+        if (leaderlessRetries < kLeaderRetries) {
+            ++leaderlessRetries;
+            co_await seastar::sleep(kLeaderRetryDelay);
+            continue;
+        }
+        break;  // budget spent with VShards still unanswered: fail closed below
     }
 
     if (!unreachableLeaders.empty()) {
@@ -459,6 +549,24 @@ seastar::future<QueryResponse> ClusterDataPlane::queryReplicated(QueryRequest re
         r.success = false;
         r.errorCode = "QUERY_INCOMPLETE";
         r.errorMessage = "a leader could not answer";
+        co_return r;
+    }
+    if (!unassigned.empty()) {
+        QueryResponse r;
+        r.success = false;
+        r.errorCode = "QUERY_INCOMPLETE";
+        r.errorMessage = std::to_string(unassigned.size()) + " VShard(s) are unassigned in the placement map (first: " +
+                         std::to_string(unassigned.front()) + ")";
+        co_return r;
+    }
+    if (leaderless > 0 || !outstanding.empty()) {
+        // A VShard with no leader (or one no holder would answer for) may hold matching
+        // data we cannot read -> fail closed (QUERY_INCOMPLETE), never a silent partial.
+        QueryResponse r;
+        r.success = false;
+        r.errorCode = "QUERY_INCOMPLETE";
+        r.errorMessage =
+            std::to_string(leaderless > 0 ? leaderless : outstanding.size()) + " VShard(s) have no elected leader";
         co_return r;
     }
     co_return co_await finalizer_->finalizeClusterPartials(std::move(request), std::move(allPartials),
@@ -564,6 +672,15 @@ seastar::future<std::map<uint16_t, data::NodeId>> ClusterDataPlane::gatherLeader
             auto& host = p.plane().host();
             for (uint16_t vs = 0; vs < timestar::VIRTUAL_SHARD_COUNT; ++vs) {
                 if (shardForVShard(vs) != seastar::this_shard_id())
+                    continue;
+                // ONLY VShards this node HOSTS (debt D-13). `leaderOf` returns kNoNode
+                // for a group we do not replicate, which reads identically to "hosted,
+                // no leader elected" -- and the caller must not confuse the two: at
+                // RF < N most of the map is simply not ours, and treating it as
+                // leaderless failed every read on the cluster. An ABSENT key means "ask
+                // the placement directory"; a present kNoNode means "we hold a replica
+                // and there is no leader", which is fail-closed.
+                if (!host.hosts(vs))
                     continue;
                 out[vs] = host.leaderOf(vs);
             }

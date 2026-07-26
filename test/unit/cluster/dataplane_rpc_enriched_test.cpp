@@ -8,6 +8,7 @@
 //     cross-series `spread ... by {tag}` aggregation (a method whose fold-of-one is
 //     not the identity, so it must survive the round-trip through real aggregation).
 #include "../../../lib/cluster/data/dataplane_rpc.hpp"
+#include "../../../lib/cluster/data/leader_filtered_node_store.hpp"
 #include "../../../lib/cluster/integration/engine_local_store.hpp"
 #include "../../../lib/utils/series_key.hpp"
 #include "../../test_helpers.hpp"
@@ -974,6 +975,96 @@ TEST_F(DataPlaneRpcEnrichedTest, OversizedSliceIsRefusedLocallyAsTooLarge) {
         }
         EXPECT_TRUE(tooLarge);
         EXPECT_EQ(sink.hintedCalls, 0) << "the frame must never have been sent";
+        rpc.stop().get();
+    }).get();
+}
+
+// Debt D-13, the wire half: a coordinator that does not HOST a VShard cannot resolve
+// its leader, so it names it for the HOLDER to resolve. The holder answers for what it
+// leads and REDIRECTS the rest, and both the resolve list and the redirects have to
+// survive the socket -- they are optional tails on the two frames.
+//
+// The redirected VShard must NOT also appear in the partials: the coordinator is about
+// to ask another node for it, and data returned twice is a double count of a replicated
+// series, which is the one thing a leader read exists to prevent.
+TEST_F(DataPlaneRpcEnrichedTest, ResolveVShardsAndRedirectsCrossTheSocket) {
+    seastar::async([] {
+        ScopedShardedEngine eng;
+        eng.start();
+        cluster::EngineLocalStore inner(*eng);
+
+        // Two series that land in DIFFERENT VShards; we "lead" one and not the other.
+        data::WriteSeries ledSeries =
+            series("rdr", {{"host", "led"}}, "v", TSMValueType::Float, {BASE}, std::vector<double>{11.0});
+        data::WriteSeries otherSeries =
+            series("rdr", {{"host", "other"}}, "v", TSMValueType::Float, {BASE}, std::vector<double>{22.0});
+        const uint16_t ledVs = data::vshardOf(ledSeries);
+        const uint16_t otherVs = data::vshardOf(otherSeries);
+        ASSERT_NE(ledVs, otherVs) << "fixture needs two distinct VShards";
+
+        const data::NodeId self = 1, realLeader = 4;
+        data::LeaderFilteredNodeStore store(inner, self, [&](std::vector<uint16_t> vshards) {
+            std::vector<data::VShardRedirect> out;
+            for (uint16_t vs : vshards)
+                out.push_back(vs == ledVs ? data::VShardRedirect{vs, self, true}
+                                          : data::VShardRedirect{vs, realLeader, true});
+            return seastar::make_ready_future<std::vector<data::VShardRedirect>>(std::move(out));
+        });
+
+        const uint16_t port = 39366;
+        data::DataPlaneRpc rpc;
+        rpc.start(loopback(port), store).get();
+        rpc.addPeer(self, loopback(port));
+
+        data::WriteBatch batch;
+        batch.series.push_back(ledSeries);
+        batch.series.push_back(otherSeries);
+        rpc.forwardWriteBatch(self, batch).get();
+
+        data::NodeQueryRequest req;
+        // SUM, not LATEST: the two series share a timestamp, and the cluster rule is
+        // "aggregate ACROSS SERIES at equal timestamps", so LATEST would tie-break to
+        // one value and hide which VShards actually contributed.
+        req.request.aggregation = AggregationMethod::SUM;
+        req.request.measurement = "rdr";
+        req.request.fields = {"v"};
+        req.request.startTime = BASE - 1'000'000'000ULL;
+        req.request.endTime = BASE + 1'000'000'000ULL;
+        req.vshards = {ledVs, otherVs};
+        req.resolveVShards = {ledVs, otherVs};
+
+        data::NodeQueryPartial part = rpc.queryNode(self, req).get();
+        ASSERT_TRUE(part.incompleteReasons.empty());
+        ASSERT_EQ(part.redirects.size(), 1u) << "exactly the VShard we do not lead comes back";
+        EXPECT_EQ(part.redirects[0].vshard, otherVs);
+        EXPECT_EQ(part.redirects[0].leader, realLeader);
+        EXPECT_TRUE(part.redirects[0].hosted);
+
+        http::HttpQueryHandler handler(&*eng);
+        auto answer =
+            handler.finalizeClusterPartials(req.request, std::move(part.partials), std::move(part.nonNumeric)).get();
+        ASSERT_TRUE(answer.success) << answer.errorMessage;
+        // Only the LED VShard's series is in the answer -- 22.0 belongs to the node the
+        // coordinator was redirected to.
+        double sum = 0.0;
+        for (const auto& s : answer.series)
+            for (double d : doublesOf(s, "v"))
+                sum += d;
+        EXPECT_DOUBLE_EQ(sum, 11.0);
+
+        // ... and with no resolve list the SAME request returns both, unchanged: the
+        // RF == N path is untouched by any of this.
+        req.resolveVShards.clear();
+        data::NodeQueryPartial both = rpc.queryNode(self, req).get();
+        EXPECT_TRUE(both.redirects.empty());
+        auto answerBoth =
+            handler.finalizeClusterPartials(req.request, std::move(both.partials), std::move(both.nonNumeric)).get();
+        double sumBoth = 0.0;
+        for (const auto& s : answerBoth.series)
+            for (double d : doublesOf(s, "v"))
+                sumBoth += d;
+        EXPECT_DOUBLE_EQ(sumBoth, 33.0);
+
         rpc.stop().get();
     }).get();
 }

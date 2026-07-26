@@ -133,3 +133,82 @@ TEST(NodeQueryCodec, OutOfRangeAggregationMethodRejected) {
         f[f.size() - 8 + i] = static_cast<char>((h >> (8 * i)) & 0xff);
     EXPECT_FALSE(decodeNodeQueryRequest(f).has_value()) << "out-of-range method must be rejected";
 }
+
+// --- debt D-13: the RF < N leader-resolution fields ---------------------------------
+//
+// A coordinator can only resolve the leader of a VShard it HOSTS, so at RF < N it names
+// the rest for the HOLDER to resolve (`resolveVShards`) and the holder answers for what
+// it leads, redirecting the rest (`redirects`). Both are OPTIONAL TAILS: a request that
+// resolves everything locally -- which is every request an RF == N cluster sends, and
+// every request a pre-D-13 peer sends -- must encode byte-for-byte as before, or a
+// mixed-version cluster stops talking.
+
+TEST(NodeQueryCodec, ResolveVShardsRoundTripAndAbsentWhenEmpty) {
+    NodeQueryRequest req;
+    req.request.measurement = "m";
+    req.vshards = {1, 2, 3, 4};
+    const std::string withoutTail = encodeNodeQueryRequest(req);
+
+    req.resolveVShards = {2, 4};
+    const std::string withTail = encodeNodeQueryRequest(req);
+    EXPECT_NE(withTail, withoutTail) << "the tail must actually be written";
+
+    auto back = decodeNodeQueryRequest(withTail);
+    ASSERT_TRUE(back.has_value());
+    EXPECT_EQ(back->vshards, (std::vector<uint16_t>{1, 2, 3, 4}));
+    EXPECT_EQ(back->resolveVShards, (std::vector<uint16_t>{2, 4}));
+
+    // The pre-D-13 encoding still decodes, and to an EMPTY resolve list -- i.e. "answer
+    // everything named, no leadership check", which is the old behaviour exactly.
+    auto old = decodeNodeQueryRequest(withoutTail);
+    ASSERT_TRUE(old.has_value());
+    EXPECT_TRUE(old->resolveVShards.empty());
+    NodeQueryRequest same = req;
+    same.resolveVShards.clear();
+    EXPECT_EQ(encodeNodeQueryRequest(same), withoutTail) << "empty resolve list must not change the bytes";
+}
+
+TEST(NodeQueryCodec, RedirectsRoundTripAndAbsentWhenEmpty) {
+    NodeQueryPartial p;
+    p.seriesFound = 3;
+    const std::string withoutTail = encodeNodeQueryPartial(p);
+
+    p.redirects.push_back(VShardRedirect{7, 4, true});     // hosted, node 4 leads it
+    p.redirects.push_back(VShardRedirect{9, 0, true});     // hosted, no elected leader
+    p.redirects.push_back(VShardRedirect{11, 0, false});   // not hosted here at all
+    const std::string withTail = encodeNodeQueryPartial(p);
+    EXPECT_NE(withTail, withoutTail);
+
+    auto back = decodeNodeQueryPartial(withTail);
+    ASSERT_TRUE(back.has_value());
+    ASSERT_EQ(back->redirects.size(), 3u);
+    EXPECT_EQ(back->redirects[0].vshard, 7);
+    EXPECT_EQ(back->redirects[0].leader, 4u);
+    EXPECT_TRUE(back->redirects[0].hosted);
+    EXPECT_EQ(back->redirects[1].leader, 0u);
+    EXPECT_TRUE(back->redirects[1].hosted);
+    EXPECT_FALSE(back->redirects[2].hosted);
+    EXPECT_EQ(back->seriesFound, 3u);
+
+    auto old = decodeNodeQueryPartial(withoutTail);
+    ASSERT_TRUE(old.has_value());
+    EXPECT_TRUE(old->redirects.empty());
+}
+
+TEST(NodeQueryCodec, TruncatedRedirectTailIsRejected) {
+    NodeQueryPartial p;
+    p.redirects.push_back(VShardRedirect{7, 4, true});
+    std::string bytes = encodeNodeQueryPartial(p);
+    // Drop one byte of the tail and re-checksum, so the failure is the LENGTH check and
+    // not the FNV -- a padded/truncated tail must not decode as a short redirect list.
+    ASSERT_GT(bytes.size(), 9u);
+    std::string body = bytes.substr(0, bytes.size() - 9);
+    uint64_t h = 1469598103934665603ull;
+    for (char c : body) {
+        h ^= static_cast<uint8_t>(c);
+        h *= 1099511628211ull;
+    }
+    for (int i = 0; i < 8; ++i)
+        body.push_back(static_cast<char>((h >> (8 * i)) & 0xff));
+    EXPECT_FALSE(decodeNodeQueryPartial(body).has_value());
+}

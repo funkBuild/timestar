@@ -3,6 +3,7 @@
 #include "../../core/placement_table.hpp"  // virtualShard
 #include "../../core/vshard.hpp"           // assignCore
 #include "../data/dataplane_rpc.hpp"
+#include "../data/leader_filtered_node_store.hpp"
 #include "../data/node_store.hpp"
 #include "../features/feature_gate.hpp"  // VersionRange
 #include "../raft/raft_codec.hpp"        // decodeEnvelope
@@ -90,6 +91,12 @@ public:
                            std::chrono::milliseconds tick) {
         store_ = std::make_unique<EngineLocalStore>(*engines);
         peers_ = peers;
+        // What peers actually read through (debt D-13): the real store, wrapped so a
+        // VShard the coordinator could not resolve itself is answered only if we LEAD
+        // it and REDIRECTED otherwise. Inert unless the request names VShards to
+        // resolve, which only an RF < N coordinator does.
+        queryStore_ = std::make_unique<data::LeaderFilteredNodeStore>(
+            *store_, self, [this](std::vector<uint16_t> vshards) { return resolveLeaders(std::move(vshards)); });
         transport_ = std::make_unique<raft::RaftRpcTransport>();
         // This shard's OWN data-plane transport: its listener on the node's data-plane
         // port and its own peer clients. Every remote leader forward this shard makes
@@ -119,7 +126,7 @@ public:
         rpc_->setLocalVersion(localVersion);
         rpc_->setProposeSink(*this);
         rpc_->setReadIndexSink(*this);
-        return rpc_->start(local, *store_, /*perShardListener=*/true);
+        return rpc_->start(local, *queryStore_, /*perShardListener=*/true);
     }
 
     void addDataPeer(data::NodeId id, seastar::socket_address addr) { rpc_->addPeer(id, addr); }
@@ -141,6 +148,32 @@ public:
     // replica needs; that rejection propagates unchanged.
     seastar::future<raft::LogIndex> leaderReadIndex(uint16_t vshard) override;
     seastar::future<raft::LogIndex> leaderCommitIndex(uint16_t vshard) override;
+
+    // Leadership of `vshards` as THIS NODE sees it (debt D-13). One entry per input,
+    // carrying both halves of the question a coordinator cannot answer for a VShard it
+    // does not host: do we hold a replica at all (`hosted`), and who leads it
+    // (`leader`, kNoNode when no election has completed). Groups live on the shard that
+    // owns them, so this hops to each owning shard -- at most smp::count hops however
+    // many VShards are asked about.
+    seastar::future<std::vector<data::VShardRedirect>> resolveLeaders(std::vector<uint16_t> vshards);
+
+    // This shard's slice of the same question, answered locally (no hop). Public so the
+    // fan-out above can invoke it on a sibling.
+    std::vector<data::VShardRedirect> resolveLeadersLocal(const std::vector<uint16_t>& vshards) const {
+        std::vector<data::VShardRedirect> out;
+        out.reserve(vshards.size());
+        if (!plane_)
+            return out;
+        auto& host = const_cast<ReplicatedDataPlane*>(plane_.get())->host();
+        for (uint16_t vs : vshards) {
+            data::VShardRedirect r;
+            r.vshard = vs;
+            r.hosted = host.hosts(vs);
+            r.leader = r.hosted ? host.leaderOf(vs) : raft::kNoNode;
+            out.push_back(r);
+        }
+        return out;
+    }
 
     // Listen on the node's Raft port from THIS shard. Every shard calls listen() on the
     // same address with connection_distribution, so accepted connections spread over
@@ -229,6 +262,12 @@ public:
         for (uint16_t vs = 0; vs < timestar::VIRTUAL_SHARD_COUNT; ++vs) {
             if (shardForVShard(vs) != seastar::this_shard_id())
                 continue;  // not ours
+            // A VShard we do not HOST is not leaderless, it is someone else's (debt
+            // D-13). Counting it here is what made `vshards_leaderless` meaningless at
+            // RF < N -- each node reported ~1638 of 4096 on a 5-node RF=3 cluster and
+            // the gates had to refuse to look at it.
+            if (!host.hosts(vs))
+                continue;
             const data::NodeId leader = host.leaderOf(vs);
             if (leader == timestar::raft::kNoNode) {
                 ++c.leaderless;
@@ -423,6 +462,8 @@ public:
 private:
     // Declared so plane_ (which borrows the others) is destroyed FIRST.
     std::unique_ptr<EngineLocalStore> store_;
+    // Borrows store_ and `this`; destroyed before store_ (declared after it).
+    std::unique_ptr<data::LeaderFilteredNodeStore> queryStore_;
     std::unique_ptr<raft::RaftRpcTransport> transport_;  // this shard's own Raft listener + peer clients
     seastar::sharded<ShardRaftPlane>* peers_ = nullptr;
     std::unique_ptr<data::DataPlaneRpc> rpc_;  // this shard's own data-plane listener + peer clients
@@ -625,6 +666,33 @@ inline seastar::future<raft::LogIndex> ShardRaftPlane::leaderReadIndex(uint16_t 
             return seastar::make_exception_future<raft::LogIndex>(data::ShardStoppingError(kShardStoppingError));
         return p.plane().host().leaderReadIndex(vshard);
     });
+}
+
+inline seastar::future<std::vector<data::VShardRedirect>> ShardRaftPlane::resolveLeaders(
+    std::vector<uint16_t> vshards) {
+    std::map<unsigned, std::vector<uint16_t>> byShard;
+    for (uint16_t vs : vshards)
+        byShard[shardForVShard(vs)].push_back(vs);
+    std::vector<data::VShardRedirect> out;
+    out.reserve(vshards.size());
+    for (auto& [shard, list] : byShard) {
+        if (shard == seastar::this_shard_id()) {
+            auto part = resolveLeadersLocal(list);
+            out.insert(out.end(), part.begin(), part.end());
+            continue;
+        }
+        // A sibling shard that has already torn its plane down answers with nothing for
+        // its slice; those VShards come back to the coordinator as unresolved
+        // (hosted=false) and fail its read closed -- never silently answered from here.
+        auto part = co_await peers_->invoke_on(shard, [l = list](ShardRaftPlane& p) {
+            std::vector<data::VShardRedirect> r;
+            if (p.ready())
+                r = p.resolveLeadersLocal(l);
+            return r;
+        });
+        out.insert(out.end(), part.begin(), part.end());
+    }
+    co_return out;
 }
 
 inline seastar::future<raft::LogIndex> ShardRaftPlane::leaderCommitIndex(uint16_t vshard) {

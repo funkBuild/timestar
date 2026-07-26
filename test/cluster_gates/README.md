@@ -6,7 +6,7 @@ not probes, so they can be run from CI or a release checklist.
 
 | script | proves |
 |---|---|
-| `deposed_primary_gate.sh` | a write to a VShard whose PLACEMENT PRIMARY is alive but no longer leader is answered with a retryable 503 at worst and NEVER an opaque 500 (write-scaleout 3a/3b) |
+| `deposed_primary_gate.sh` | a write to a VShard whose PLACEMENT PRIMARY is alive but no longer leader is answered with a retryable 503 at worst and NEVER an opaque 500 (write-scaleout 3a/3b), **and** that reads work at all at RF < N: every node answers the same scatter-gather count (debt D-13) |
 | `rolling_rebalance_gate.sh` | a leadership rebalance under sustained writes costs latency, not client errors |
 | `backpressure_gate.sh` | the per-shard in-flight write bound degrades to 503 + `Retry-After`, never to 500s or timeouts, and the DEFAULT budget never gets in the way |
 | `fault_injection_gate.sh` | a BURST of TCP connection resets between two live nodes costs latency, not client errors, and loses/duplicates nothing (write-scaleout 4c) |
@@ -43,7 +43,16 @@ consensus) is filed in the plan doc's Phase 5 outcome.
 every node hosts every Raft group, so the router's `LeaderResolver` always knows the real
 leader locally and the stale-primary path is unreachable — a 3-node run passes even on a
 binary with no leader hint at all. With five nodes a coordinator hosts only ~3/5 of the
-VShards and must fall back to the placement primary for the rest.
+VShards (2458 of 4096, measured) and must fall back to the placement primary for the rest.
+
+That same topology is why this gate now asserts on READS (debt D-13). Until D-13 an
+RF < N cluster could not serve a read at all: `gatherLeaders` recorded `leaderOf(vs)` for
+every VShard, and that answers kNoNode for a group the node does not replicate — the same
+value as "hosted, no leader elected" — so ~1638 VShards counted as leaderless and every
+query failed `QUERY_INCOMPLETE` after its retries. The gate could not assert reads, which
+is precisely how the defect survived to be found by code reading. The assertion is
+DISCRIMINATING, and was re-checked that way: the pre-D-13 binary fails it on all five
+nodes with `1638 VShard(s) have no elected leader`, HEAD returns 300/300 from each.
 
 `backpressure_gate.sh` is fussy about sizing, and the script explains each choice
 inline. The budget is charged on the REQUEST shard (whichever the HTTP connection
