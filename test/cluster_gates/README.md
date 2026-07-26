@@ -56,9 +56,13 @@ enough for curl to trip.
 
 `deposed_primary_gate.sh` hard-asserts only what Phase 3 owns -- zero server-side 500s,
 zero crashes, and enough real leadership transfers for the run to be non-vacuous. The
-accepted-write count is ADVISORY, because the leadership balancer does not converge at
-RF < N (~319 VShards move every 2s on an idle 5-node cluster; see the plan doc), so a few
-writes always meet a genuinely mid-transfer VShard. Pre-Phase-3 this gate produced ~29%
+accepted-write count is ADVISORY, because a rebalance storm leaves VShards genuinely
+mid-transfer and a batch that touches one meets a leader that is standing down (the
+`LeaderRefused` band; see the plan doc's D-14 for why batch fan-out makes a small
+per-VShard window a visible per-request rate). An earlier version of this note blamed
+"~319 VShards moving every 2s at RF < N" -- that figure is WITHDRAWN in the plan doc
+(:404): it was measured with CheckQuorum temporarily enabled, and re-measured with it off
+the balancer converges, slowly (deltas 586 -> 454 -> 258). Pre-Phase-3 this gate produced ~29%
 opaque HTTP 500s; it now produces zero 500s and a small number of honest 503s.
 
 `rolling_rebalance_gate.sh` starts the third node LAST. `/cluster/rebalance-leadership`

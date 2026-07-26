@@ -23,8 +23,8 @@ Phase 5 result: **the consensus layer is not the limiter either, and this phase 
 that rather than assuming it.** Re-profiling first (5-pre) found the cluster still ~80 %
 CPU-idle at peak with commit latency dominated by the quorum round trip, and the Raft
 message rate IDENTICAL idle and under saturation -- so nothing in the phase could have
-moved throughput, and nothing did (median 5.16 M pts/s, against a pre-Phase-5 binary
-re-benched in the same session at 5.16 M). What the phase delivered is correctness:
+moved throughput, and nothing did (median 5.18 M pts/s on the final post-review binary,
+against a pre-Phase-5 binary re-benched in the same session at 5.16 M). What the phase delivered is correctness:
 the read-side bitmap-cache use-after-free is closed structurally (5.1), catch-up appends
 are bounded so the Raft admission bound could drop 1 GiB -> 128 MiB (5.4), and a leader
 transfer aimed at a dead peer -- which made a group refuse writes FOREVER -- is now
@@ -954,7 +954,13 @@ A stale-leader-map hypothesis was also refuted directly: `leaderOf` is consulted
 every attempt, so a stale map cannot survive a retry — only a hint can, which is exactly
 what did.
 
-Fixed here (the fix is diagnostic and routing, not consensus):
+Fixed here (the fix is diagnostic and routing, not consensus) — and note what it does NOT
+change: **F1 fixes the LABEL and the wasted local retry loop, not the RATE.** A write
+whose group is genuinely mid-transfer or mid-election still fails after the budget; what
+changes is that its attempts now re-resolve instead of re-asking the same refusing group,
+and the answer names `LeaderRefused` instead of a manufactured `not-leader`. Phase 6
+measured the same 503 band afterwards and identified what sets its size: election windows
+multiplied by batch fan-out (D-14), which no relabelling touches.
 
 - a distinct `WriteFailure::LeaderRefused`, so "the leader refused, mid-transfer" can no
   longer be reported as "not-leader";
@@ -1159,8 +1165,9 @@ hosts=1000, conns=8, `--smp 4`, `--verify 0`, 10 warmup batches. CPU from
 | 6   | 5 019 692 |  95.3  | 128.4  | 145.9  | 146.1  | 0           | 0           | 0            |
 
 **Median 4.91 M pts/s, median p50 95.9 ms, zero-error rate 6 of 6.** Node CPU 16.5-20.6 %
-of 4 cores on every run. The acceptance bar for this campaign (0-error ≥ 5/6) is met; the
-median-≥5.0 M bar is missed by 2 %.
+of 4 cores on every run. Against the bars the Phase-6 battery brief set for THIS campaign
+(0-error rate ≥ 5/6, median ≥ 5.0 M — not §4's targets, which are the table above): the
+error bar is met, the median bar is missed by 2 %.
 
 **Same-session A/B, because cross-session medians are not comparable on this box** (the
 5a lesson: idle CPU on an unchanging idle cluster drifted 4 % -> 8 % within one session).
