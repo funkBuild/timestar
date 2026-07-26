@@ -89,8 +89,12 @@ public:
     //     for an election; the 4a schedule already spans the reconnect window inside the
     //     1.5 s deadline, and stretching it would hold a batch (and its in-flight-bytes
     //     charge) for 6 s against a peer that is simply gone. [D6] keeps its own budget.
-    //     The test is applied PER ATTEMPT, so a batch that meets a transport failure at
-    //     any point immediately reverts to the 1.5 s deadline.
+    //     The test is applied PER ATTEMPT and is NOT sticky in either direction: the
+    //     budget is recomputed from the classes of the attempt that just finished, so an
+    //     attempt whose failures are all election-shaped gets the long deadline and the
+    //     very next attempt that sees a transport failure is judged against the 1.5 s one
+    //     again (a black-holed peer therefore revokes the window on every attempt). What
+    //     it does NOT do is grant a window that a later attempt cannot take back.
     //   * it does NOT extend for `Overloaded`: the cure there is for something to drain,
     //     and waiting 6 s while holding admission bytes is the opposite of that.
     //   * it does NOT make a dead cluster wait forever. Quorum loss keeps every group

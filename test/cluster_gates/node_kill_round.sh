@@ -112,6 +112,13 @@ assert_ge "batches accepted (anti-vacuity)" "${OK_REQS:-0}" "$((BATCHES / 4))"
 
 # NO ACKNOWLEDGED LOSS: every probe write that was ACKED while the node was down must be
 # readable from both survivors.
+#
+# ANTI-VACUITY FIRST: `readable == PROBE_OK` passes trivially at 0 == 0, i.e. a run in which
+# every probe FAILED would report "no loss" having stored nothing. The floor makes the
+# assertion mean something. Measured on the fixed binary: 42 of 50 acked (the rest are the
+# honest bounded 503s of the failover window), so 10 leaves plenty of room for a slower box
+# while still failing a run that acked essentially nothing.
+assert_ge "probe writes acked during the outage (anti-vacuity)" "$PROBE_OK" 10
 sleep 3
 for p in 49610 49611; do
     R=$(curl -s -m20 -X POST "http://127.0.0.1:$p/query" -H 'Content-Type: application/json' \

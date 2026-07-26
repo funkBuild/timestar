@@ -222,3 +222,75 @@ TEST(ReadRouting, RfEqualsNRoutesEntirelyFromTheLocalView) {
     }
     EXPECT_EQ(routed, static_cast<size_t>(kVShards));
 }
+
+// --- one round's bookkeeping ----------------------------------------------------------
+//
+// These pin the parts of ClusterDataPlane::queryReplicated's loop that nothing but the live
+// 5-node gate covered: which VShards a target's answer retires, which hints survive it, and
+// -- the F1 defect -- what happens to a hint whose target has died.
+
+TEST(ReadRoundBookkeeping, AnAnswerRetiresOnlyTheVShardsItDidNotRedirect) {
+    std::set<uint16_t> outstanding{1, 2, 3, 4};
+    std::map<uint16_t, NodeId> hints;
+    std::vector<VShardRedirect> redirects{
+        {2, 5, true},  // node 5 leads it: keep it outstanding, remember where to go
+        {3, 0, true},  // hosted, leaderless: keep it outstanding, remember nothing
+    };
+    const bool learned = applyReadRedirects(/*target=*/4, {1, 2, 3, 4}, redirects, outstanding, hints);
+    EXPECT_TRUE(learned);
+    EXPECT_EQ(outstanding, (std::set<uint16_t>{2, 3}));
+    EXPECT_EQ(hints.at(2), 5u);
+    EXPECT_EQ(hints.count(3), 0u);
+}
+
+TEST(ReadRoundBookkeeping, ARedirectForAVShardWeDidNotAskAboutIsIgnored) {
+    std::set<uint16_t> outstanding{1, 2};
+    std::map<uint16_t, NodeId> hints{{99, 3}};
+    // A hostile/buggy peer names a VShard outside its view, and names ITSELF for one it has.
+    std::vector<VShardRedirect> redirects{{99, 7, true}, {1, 4, true}};
+    applyReadRedirects(/*target=*/4, {1, 2}, redirects, outstanding, hints);
+    EXPECT_EQ(hints.at(99), 3u) << "a peer steered a slice it was never asked about";
+    EXPECT_EQ(hints.count(1), 0u) << "a target naming ITSELF is not a hint";
+    EXPECT_EQ(outstanding, (std::set<uint16_t>{1})) << "VShard 1 was redirected, so it stays outstanding";
+}
+
+// THE F1 REGRESSION TEST. A hint is otherwise only ever dropped on a REPLY, and a dead node
+// cannot reply -- so a cached redirect naming a node that then died pinned every subsequent
+// read to a corpse: planReadRouting preferred the hint, the RPC threw, and the whole query
+// failed QUERY_INCOMPLETE naming that node, permanently (the placement map is immutable and
+// the cache has no TTL). Removing the erase inside applyReadTargetUnreachable fails this.
+TEST(ReadRoundBookkeeping, AnUnreachableTargetsHintsAreForgottenSoTheNextRoundReResolves) {
+    ControlMap map;
+    map.epoch = 1;
+    map.placement[7] = {3, 4, 5};  // primary 3; we (node 2) hold no replica
+    VShardDirectory dir(kSelf, map);
+
+    // A redirect earlier taught us that node 5 leads VShard 7, so that is where we go.
+    std::map<uint16_t, NodeId> hints{{7, 5}};
+    ReadRouting first = planReadRouting({7}, /*hostedLeaders=*/{}, hints, dir, kSelf);
+    ASSERT_EQ(first.byNode.size(), 1u);
+    ASSERT_EQ(first.byNode.begin()->first, 5u) << "the hint must be preferred while it is plausible";
+
+    // Node 5 is now unreachable.
+    applyReadTargetUnreachable(/*target=*/5, {7}, hints);
+    EXPECT_EQ(hints.count(7), 0u) << "the hint pointing at the dead node survived";
+
+    // ...so the NEXT round falls back to the placement directory instead of asking the
+    // corpse again. Without the erase this re-routes to node 5 forever.
+    ReadRouting second = planReadRouting({7}, /*hostedLeaders=*/{}, hints, dir, kSelf);
+    ASSERT_EQ(second.byNode.size(), 1u);
+    EXPECT_EQ(second.byNode.begin()->first, dir.ownerOf(7))
+        << "the read is still pinned to the unreachable node -- this is a permanent outage, not a retry";
+    EXPECT_NE(second.byNode.begin()->first, 5u);
+    EXPECT_EQ(second.leaderless, 0u);
+    EXPECT_TRUE(second.unassigned.empty());
+}
+
+// Only hints that pointed AT the unreachable node are forgotten: an unrelated VShard's hint
+// is still good, and throwing it away would cost a redirect round for no reason.
+TEST(ReadRoundBookkeeping, UnreachabilityDoesNotForgetOtherNodesHints) {
+    std::map<uint16_t, NodeId> hints{{7, 5}, {8, 4}};
+    applyReadTargetUnreachable(/*target=*/5, {7, 8}, hints);
+    EXPECT_EQ(hints.count(7), 0u);
+    EXPECT_EQ(hints.at(8), 4u);
+}

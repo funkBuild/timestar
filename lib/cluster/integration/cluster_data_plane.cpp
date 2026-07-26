@@ -442,6 +442,12 @@ seastar::future<QueryResponse> ClusterDataPlane::queryReplicated(QueryRequest re
         for (auto& [leader, vshards] : byLeader) {
             data::NodeQueryRequest nq;
             nq.request = request;
+            // COPY, and it must stay a copy that happens BEFORE the move into
+            // pendingVShards below: an empty `vshards` means "no restriction" at the far
+            // end (EngineLocalStore::queryLocal), so moving out of `vshards` first would
+            // ask this target for its WHOLE local answer -- every VShard it holds, most of
+            // which the coordinator is simultaneously asking someone else about. That is a
+            // silent double count of every replicated series, one line away.
             nq.vshards = vshards;
             if (auto r = resolveAt.find(leader); r != resolveAt.end())
                 nq.resolveVShards = std::move(r->second);
@@ -466,31 +472,11 @@ seastar::future<QueryResponse> ClusterDataPlane::queryReplicated(QueryRequest re
                 // A redirected VShard is NOT in this node's partials (its read filter
                 // excluded it), so it stays outstanding and is re-asked at the node
                 // named. Everything else this target was asked for is answered, once.
-                // Only VShards WE asked this target about can be redirected by it: a
-                // reply naming anything else (a buggy or hostile peer) must not steer
-                // another target's slice or hold a VShard outstanding forever. Same
-                // rule the write router applies to leader hints.
-                std::set<uint16_t> askedHere(pendingVShards[i].begin(), pendingVShards[i].end());
-                std::set<uint16_t> redirected;
-                for (const auto& rd : part.redirects) {
-                    if (!askedHere.count(rd.vshard))
-                        continue;
-                    redirected.insert(rd.vshard);
-                    if (rd.hosted && rd.leader != timestar::raft::kNoNode && rd.leader != pendingLeaders[i]) {
-                        readLeaderHints_[rd.vshard] = rd.leader;
-                        learnedHint = true;
-                    } else {
-                        // Hosted with no elected leader, or the holder does not host it
-                        // after all (placement skew). Drop any stale hint so the next
-                        // round re-resolves from the directory, and let the retry
-                        // budget decide between an election in progress and a genuine
-                        // outage.
-                        readLeaderHints_.erase(rd.vshard);
-                    }
-                }
-                for (uint16_t vs : pendingVShards[i])
-                    if (!redirected.count(vs))
-                        outstanding.erase(vs);
+                // Redirect bookkeeping (which VShards this target answered, which hints
+                // to keep) is in data::applyReadRedirects, where it is unit-tested.
+                if (data::applyReadRedirects(pendingLeaders[i], pendingVShards[i], part.redirects, outstanding,
+                                             readLeaderHints_))
+                    learnedHint = true;
                 allPartials.insert(allPartials.end(), std::make_move_iterator(part.partials.begin()),
                                    std::make_move_iterator(part.partials.end()));
                 allNonNumeric.insert(allNonNumeric.end(), std::make_move_iterator(part.nonNumeric.begin()),
@@ -501,10 +487,16 @@ seastar::future<QueryResponse> ClusterDataPlane::queryReplicated(QueryRequest re
                 // live replicas that will elect a new leader. Record it so we can wake
                 // those groups and answer honestly. A failure of our own LOCAL read is a
                 // genuine internal error and still propagates.
-                if (pendingLeaders[i] != self)
+                if (pendingLeaders[i] != self) {
                     unreachableLeaders.insert(pendingLeaders[i]);
-                else if (!firstErr)
+                    // AND FORGET EVERY HINT THAT POINTED AT IT. A hint is otherwise only
+                    // dropped on a reply, which a dead node cannot send, so a cached
+                    // redirect naming a node that then died failed every subsequent read
+                    // permanently. See applyReadTargetUnreachable for the full note.
+                    data::applyReadTargetUnreachable(pendingLeaders[i], pendingVShards[i], readLeaderHints_);
+                } else if (!firstErr) {
                     firstErr = std::current_exception();
+                }
             }
         }
 

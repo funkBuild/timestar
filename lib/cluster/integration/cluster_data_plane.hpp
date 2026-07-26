@@ -138,11 +138,20 @@ private:
     seastar::future<std::map<uint16_t, data::NodeId>> gatherLeaders() const;
 
     // Leaders learned from a peer's read REDIRECT, for VShards this node does not host
-    // and therefore cannot resolve itself (debt D-13). Purely an optimisation: a hit
-    // saves the redirect round trip, a miss or a stale entry costs one and is corrected
-    // by the redirect it provokes. It is never consulted for a VShard we DO host --
-    // there the live Raft view is authoritative and re-read on every attempt, which is
-    // what keeps a cached hint from surviving a leadership transfer.
+    // and therefore cannot resolve itself (debt D-13). A hit saves a redirect round trip;
+    // a hint that is merely WRONG costs one and is corrected by the redirect it provokes.
+    // It is never consulted for a VShard we DO host -- there the live Raft view is
+    // authoritative and re-read on every attempt, which is what keeps a cached hint from
+    // surviving a leadership transfer.
+    //
+    // IT IS NOT A PURE OPTIMISATION, and calling it one is how the review found a
+    // permanent-outage bug here. A hint whose target is UNREACHABLE cannot be corrected by
+    // a reply -- a dead node does not send one -- so it has to be invalidated explicitly
+    // when a read fails against it (`data::applyReadTargetUnreachable`, called from
+    // queryReplicated's catch). Without that the cache pins every subsequent read to a
+    // corpse: the placement map is immutable and there is no TTL, so the query fails
+    // QUERY_INCOMPLETE naming the dead node forever. Pinned by
+    // ReadRoundBookkeeping.AnUnreachableTargetsHintsAreForgottenSoTheNextRoundReResolves.
     //
     // Bounded by VIRTUAL_SHARD_COUNT entries. ClusterDataPlane lives on one shard, so
     // concurrent queries mutate this from one reactor thread only.

@@ -390,9 +390,15 @@ public:
     //
     // The correct expectation for node v over the groups we host is the sum of 1/|voters|
     // over those groups v is a voter of: with uniform RF it is |hosted|/RF for us and
-    // |hosted ∩ hosted(v)|/RF for a peer. At RF == N every group has every node as a
-    // voter, so expected[v] == hosted/N for all v -- exactly the old formula, which is
-    // why the RF == N behaviour (production, the 3-node gates) is unchanged.
+    // |hosted ∩ hosted(v)|/RF for a peer. At RF == N every group has every node as a voter,
+    // so expected[v] == hosted/N for every v -- the old formula's shape, and behaviourally
+    // the same target, which is why RF == N (production, the 3-node gates) is unchanged.
+    // It is not literally the same arithmetic: the old divisor counted only groups that had
+    // a LEADER (leaderless ones were skipped before the count) and divided in integers,
+    // where this counts every hosted group and divides in doubles. Both differences are
+    // sub-one-VShard on a converged cluster and neither changes which side of fair share a
+    // node lands on -- the 3-node gates measure identically before and after -- but "reduces
+    // exactly to the old formula" would be too strong a claim.
     seastar::future<size_t> rebalance(size_t maxTransfers, data::NodeId self, std::vector<data::NodeId> peers) {
         if (!plane_ || maxTransfers == 0 || peers.empty())
             co_return 0;
