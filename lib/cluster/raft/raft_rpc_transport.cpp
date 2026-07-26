@@ -181,7 +181,26 @@ struct RaftRpcTransport::Impl {
     std::map<NodeId, PendingFrames> pending;
     uint64_t nextGeneration = 1;
     bool flushScheduled = false;
-    bool batchingEnabled = true;
+    // OFF BY DEFAULT, and the measurement that made it so is recorded in
+    // docs/write-scaleout-plan.md Phase 5. Batching does what it says -- it cut idle RPC
+    // frames per shard from 2724/s to ~700/s -- but on this cluster that is not a
+    // resource under pressure, and the buffering it costs IS: measured against the
+    // pre-Phase-5 binary on the same box, minutes apart, idle CPU went 4% -> 7-8% per
+    // node and canonical-bench median throughput 5.16 -> 4.90 M pts/s.
+    //
+    // That is the Phase-2 lesson restated: removing work from a system that is ~80% CPU
+    // idle cannot raise its throughput, but ADDING per-message work (a buffer insert, a
+    // gate hold and a `yield()`-scheduled flush task per round) can lower it. The
+    // capability, its wire format and its tests stay; the default does not.
+    //
+    // TIMESTAR_RAFT_BATCH_SENDS=1 turns it on for a deployment where the frame rate is
+    // the binding cost (many more peers, or a NIC/syscall-bound node) -- and where it is
+    // on, `send()` takes the buffered path; where it is off, `send()` dispatches
+    // immediately exactly as it did before 5a, so the default costs nothing at all.
+    bool batchingEnabled = [] {
+        const char* e = std::getenv("TIMESTAR_RAFT_BATCH_SENDS");
+        return e && e[0] == '1';
+    }();
 
     RaftRpcTransport::Stats stats;
     seastar::lowres_clock::time_point windowStart{};
@@ -243,8 +262,15 @@ struct RaftRpcTransport::Impl {
         });
     }
 
+    // Dispatch one envelope straight to the peer -- the pre-5a path, and the default.
+    void sendNow(NodeId to, seastar::sstring data);
+
     // Queue an encoded envelope for `to`, flushing eagerly if the buffer is already large.
     void enqueue(NodeId to, seastar::sstring data) {
+        if (!batchingEnabled) {
+            sendNow(to, std::move(data));  // pre-5a path: no buffer, no deferred flush
+            return;
+        }
         auto& p = pending[to];
         p.bytes += data.size();
         p.envelopes.push_back(std::move(data));
@@ -523,12 +549,12 @@ seastar::future<> RaftRpcTransport::start(seastar::socket_address local, Deliver
 seastar::future<> RaftRpcTransport::send(Envelope env) {
     if (impl_->stopping || impl_->gate.is_closed())
         return seastar::make_ready_future<>();
-    // Encode now, dispatch at the end of this task-queue round (write-scaleout 5a).
-    // Buffering here rather than calling clientFor()/deliverStub() per envelope is what
-    // lets one shard's tick -- which drains up to ~1000 groups -- put many groups'
-    // messages into one frame to the same peer. Fire-and-forget semantics are unchanged:
-    // the Ready loop is never blocked on the network, and a dropped message is a Raft
-    // retry.
+    // Encode now, and either dispatch immediately (the default) or buffer for the end of
+    // this task-queue round (write-scaleout 5a, opt-in -- see `batchingEnabled`).
+    // Buffering is what lets one shard's tick -- which drains up to ~1000 groups -- put
+    // many groups' messages into one frame to the same peer. Fire-and-forget semantics
+    // are identical either way: the Ready loop is never blocked on the network, and a
+    // dropped message is a Raft retry.
     std::string bytes = encodeEnvelope(env);
     // Refuse, LOUDLY, what the peer's admission bound would drop silently (5.4). The
     // deliver verb is no_wait: an over-limit frame gets no reply, so the sender would keep
@@ -546,6 +572,21 @@ seastar::future<> RaftRpcTransport::send(Envelope env) {
     }
     impl_->enqueue(env.message.to, seastar::sstring(bytes.data(), bytes.size()));
     return seastar::make_ready_future<>();
+}
+
+void RaftRpcTransport::Impl::sendNow(NodeId to, seastar::sstring data) {
+    auto* conn = clientFor(to);
+    if (!conn) {
+        ++stats.dropped;
+        return;  // unknown/backing-off peer: drop (Raft retries)
+    }
+    ++stats.envelopesSent;
+    ++stats.framesSent;
+    stats.bytesSent += data.size();
+    maybeReport();
+    (void)seastar::with_gate(gate, [this, conn, data = std::move(data)]() mutable {
+        return deliverStub(*conn, std::move(data)).handle_exception([](std::exception_ptr) {});
+    });
 }
 
 RaftRpcTransport::Stats RaftRpcTransport::stats() const {

@@ -165,7 +165,7 @@ seastar::future<> testBatchedDelivery(bool batchingEnabled) {
         return seastar::make_ready_future<>();
     });
     co_await sender->start(loopback(txPort), [](Envelope) { return seastar::make_ready_future<>(); });
-    sender->setBatchingEnabled(batchingEnabled);
+    sender->setBatchingEnabled(batchingEnabled);  // OFF by default since Phase 5; see the header
     sender->addPeer(2, loopback(rxPort));
 
     // First send opens the connection and fires the capability probe; batching only
@@ -254,6 +254,10 @@ seastar::future<> testLegacyPeerGetsNoBatchFrames() {
 
     auto sender = std::make_unique<RaftRpcTransport>();
     co_await sender->start(loopback(39165), [](Envelope) { return seastar::make_ready_future<>(); });
+    // Batching is OFF by default since Phase 5 (it cost more CPU than the frames it saved
+    // -- see the transport header). Turn it ON here on purpose: the point of this test is
+    // that even a sender WILLING to batch must not batch to a peer that cannot decode it.
+    sender->setBatchingEnabled(true);
     sender->addPeer(2, loopback(kPort));
 
     constexpr int kGroups = 32;
