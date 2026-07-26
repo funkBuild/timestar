@@ -125,10 +125,6 @@ private:
     // The ready/persist/send/apply/advance loop. MUST run under the group lock so
     // no step()/tick()/propose() interleaves a ready()..advance() pair.
     seastar::future<> drainReady();
-    // compact()'s body, under the group lock. A named member coroutine rather than a
-    // coroutine lambda because it suspends more than once -- see compact() for why that
-    // distinction is a correctness one here and not a style one.
-    seastar::future<> compactLocked(LogIndex upto, std::string snapshotData);
 
     // Resolve any read barriers whose ReadIndex this node has now applied through.
     void releaseReadBarriers();
@@ -144,7 +140,12 @@ private:
     RaftPersistence& persistence_;
     RaftTransport& transport_;
     RaftStateMachine& sm_;
-    seastar::semaphore lock_{1};  // serializes all node mutation on this core
+    // Serializes all node mutation on this core. ALWAYS taken with
+    // `seastar::get_units` inside the method's OWN coroutine body -- never with
+    // `with_semaphore(lambda)`, whose closure dies at the lambda's first suspension
+    // while the coroutine frame is still pointing into it (rule at the top of
+    // raft_group.cpp; debt D-33).
+    seastar::semaphore lock_{1};
 
     // Read-barrier tracking.
     uint64_t appliedIndex_ = 0;  // highest entry index applied to the SM

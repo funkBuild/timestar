@@ -11,6 +11,31 @@
 
 namespace timestar::raft {
 
+// THE GROUP LOCK IS TAKEN WITH `get_units`, NEVER WITH `with_semaphore` -- and that is a
+// correctness rule, not a style one (debt D-33).
+//
+// `seastar::with_semaphore` moves `func` into a `.then` continuation and invokes it
+// there; that continuation -- and with it the CLOSURE -- is destroyed as soon as the
+// invocation returns a future, i.e. AT THE FIRST SUSPENSION. A coroutine lambda's frame
+// does not copy its captures, it holds a POINTER to the closure, so every capture
+// (`this` included) read after a `co_await` is read out of freed memory. Every body in
+// this file suspends: `co_await drainReady()` is the whole point of them.
+//
+// It used to be written that way throughout and survived only because each body touched
+// its captures EXCLUSIVELY BEFORE its single suspension -- a property nothing stated,
+// nothing tested, and any edit could break. `compact()` DID break it: a second
+// suspension made `RaftNode::ready()` copy a garbage `Snapshot` out of the dead closure
+// (std::bad_alloc on a vector with a nonsense length, D-6).
+//
+// `auto units = co_await seastar::get_units(lock_, 1);` has no closure at all. The
+// method IS the coroutine, so its parameters, its locals and the units themselves live
+// in the frame that awaits, and the frame outlives every suspension by construction.
+// `units` releases the lock when it leaves scope -- including on an exception and on an
+// early `co_return` -- so the three methods that must wait OUTSIDE the lock
+// (`proposeAndAwaitApplied`, `readBarrier`, `waitApplied`) scope it in an explicit block
+// and await their waiter after it. Adding a suspension anywhere here is now safe; the
+// only rule left is not to hold `units` across a wait for another group's work.
+//
 // TEMPORARY write-path profiling, enabled with TIMESTAR_RAFT_PROFILE=1.
 // NOTE: accumulate ONLY into these shard-local counters. An earlier version passed
 // references to the caller's coroutine frame into the with_semaphore lambda; the
@@ -178,16 +203,16 @@ seastar::future<> RaftGroup::waitApplied(LogIndex index) {
     // half-created waiter. Resolve immediately if we have already applied through
     // `index` (common for a caught-up replica). No leadership requirement.
     std::optional<seastar::future<>> fut;
-    co_await seastar::with_semaphore(lock_, 1, [this, index, &fut]() -> seastar::future<> {
+    {
+        auto units = co_await seastar::get_units(lock_, 1);
         if (appliedIndex_ >= index) {
             fut = seastar::make_ready_future<>();
-            co_return;
+        } else {
+            seastar::promise<> promise;
+            fut = promise.get_future();
+            appliedWaiters_.emplace_back(index, std::move(promise));
         }
-        seastar::promise<> promise;
-        fut = promise.get_future();
-        appliedWaiters_.emplace_back(index, std::move(promise));
-        co_return;
-    });
+    }  // lock released here -- the wait below must NOT hold it
     co_await std::move(*fut);
 }
 
@@ -212,41 +237,34 @@ seastar::future<bool> RaftGroup::proposeAndAwaitApplied(std::string data,
     // proposed entry's index and register its promise before any drainReady can
     // observe it, so a leader flap cannot resolve or fail a half-created waiter.
     std::optional<seastar::future<bool>> fut;
-    bool notLeader = false;
-    co_await seastar::with_semaphore(lock_, 1,
-                                     [this, data = std::move(data), &fut, &notLeader]() mutable -> seastar::future<> {
-                                         const uint64_t tL0 = profileEnabled() ? nowNs() : 0;
-                                         if (!node_.propose(std::move(data))) {
-                                             notLeader = true;
-                                             co_return;  // not the leader: fut stays empty
-                                         }
-                                         const LogIndex idx = node_.log().lastIndex();  // the entry we just appended
-                                         seastar::promise<bool> promise;
-                                         fut = promise.get_future();
-                                         applyWaiters_.emplace_back(idx, std::move(promise));
-                                         // GROUP COMMIT. drainReady() makes the whole pending Ready
-                                         // durable with ONE fsync, so when several writes are queued on
-                                         // this group it is far cheaper to let them all append first and
-                                         // flush once than to fsync per proposal. If callers are already
-                                         // waiting on lock_, skip our drain: each of them appends in turn
-                                         // and the LAST one (which sees no waiters) flushes everyone's
-                                         // entries together.
-                                         //
-                                         // Safety: skipping leaves the entry in the IN-MEMORY log only --
-                                         // nothing is persisted, sent to peers, or applied -- so the
-                                         // "durable before observable" ordering is untouched. Progress is
-                                         // guaranteed because tick() and step() also drain under this same
-                                         // lock, so a deferred entry is flushed within one tick at worst.
-                                         // Latency is unaffected in practice: the proposal has to await a
-                                         // quorum round trip regardless, and the deferral only lasts until
-                                         // the already-queued callers finish appending.
-                                         if (lock_.waiters() == 0)
-                                             co_await drainReady();  // may commit+apply (single voter) and resolve
-                                         if (profileEnabled())
-                                             g_prof.inLockNs += nowNs() - tL0;
-                                     });
-    if (notLeader)
-        co_return false;
+    {
+        auto units = co_await seastar::get_units(lock_, 1);
+        const uint64_t tL0 = profileEnabled() ? nowNs() : 0;
+        if (!node_.propose(std::move(data)))
+            co_return false;                           // not the leader (units released by the frame's unwind)
+        const LogIndex idx = node_.log().lastIndex();  // the entry we just appended
+        seastar::promise<bool> promise;
+        fut = promise.get_future();
+        applyWaiters_.emplace_back(idx, std::move(promise));
+        // GROUP COMMIT. drainReady() makes the whole pending Ready durable with ONE
+        // fsync, so when several writes are queued on this group it is far cheaper to
+        // let them all append first and flush once than to fsync per proposal. If
+        // callers are already waiting on lock_, skip our drain: each of them appends in
+        // turn and the LAST one (which sees no waiters) flushes everyone's entries
+        // together.
+        //
+        // Safety: skipping leaves the entry in the IN-MEMORY log only -- nothing is
+        // persisted, sent to peers, or applied -- so the "durable before observable"
+        // ordering is untouched. Progress is guaranteed because tick() and step() also
+        // drain under this same lock, so a deferred entry is flushed within one tick at
+        // worst. Latency is unaffected in practice: the proposal has to await a quorum
+        // round trip regardless, and the deferral only lasts until the already-queued
+        // callers finish appending.
+        if (lock_.waiters() == 0)
+            co_await drainReady();  // may commit+apply (single voter) and resolve
+        if (profileEnabled())
+            g_prof.inLockNs += nowNs() - tL0;
+    }  // lock released here -- the apply wait below must NOT hold it
     // with_timeout does NOT cancel or abandon the inner future: it keeps it alive under a
     // then_wrapped and discards the late result. That is exactly what is needed here --
     // the waiter's promise stays registered in applyWaiters_ and a later apply resolves a
@@ -266,95 +284,68 @@ seastar::future<LogIndex> RaftGroup::readBarrier() {
     // leader->follower->leader flap between here and acquiring the lock cannot
     // spuriously fail a barrier we could still satisfy.
     std::optional<seastar::future<LogIndex>> fut;
-    co_await seastar::with_semaphore(lock_, 1, [this, &fut]() -> seastar::future<> {
-        if (!node_.isLeader())
-            co_return;  // fut stays empty -> not leader
-        const uint64_t ctx = nextReadCtx_++;
-        seastar::promise<LogIndex> promise;
-        fut = promise.get_future();
-        readWaiters_.emplace(ctx, std::move(promise));
-        node_.requestReadIndex(ctx);
-        co_await drainReady();  // heartbeats out; confirmation arrives on later steps
-    });
+    {
+        auto units = co_await seastar::get_units(lock_, 1);
+        if (node_.isLeader()) {  // otherwise fut stays empty -> not leader
+            const uint64_t ctx = nextReadCtx_++;
+            seastar::promise<LogIndex> promise;
+            fut = promise.get_future();
+            readWaiters_.emplace(ctx, std::move(promise));
+            node_.requestReadIndex(ctx);
+            co_await drainReady();  // heartbeats out; confirmation arrives on later steps
+        }
+    }  // lock released here -- the barrier wait below must NOT hold it
     if (!fut)
         throw std::runtime_error("readBarrier: not leader");  // caller redirects to the leader
     co_return co_await std::move(*fut);
 }
 
 seastar::future<> RaftGroup::step(Message m) {
-    return seastar::with_semaphore(lock_, 1, [this, m = std::move(m)]() mutable -> seastar::future<> {
-        node_.step(std::move(m));
-        co_await drainReady();
-    });
+    auto units = co_await seastar::get_units(lock_, 1);
+    node_.step(std::move(m));
+    co_await drainReady();
 }
 
 seastar::future<> RaftGroup::tick(unsigned passes) {
-    return seastar::with_semaphore(lock_, 1, [this, passes]() -> seastar::future<> {
-        node_.tick(passes);
-        co_await drainReady();
-    });
+    auto units = co_await seastar::get_units(lock_, 1);
+    node_.tick(passes);
+    co_await drainReady();
 }
 
 seastar::future<bool> RaftGroup::propose(std::string data) {
+    // Refused BEFORE the lock, as it always was: the throw becomes this coroutine's
+    // exceptional future, which is what `make_exception_future` produced here before.
     if (data.size() > kMaxProposalBytes)
-        return seastar::make_exception_future<bool>(ProposalTooLargeError(
-            "raft: proposal of " + std::to_string(data.size()) + " bytes exceeds the deliverable maximum of " +
-            std::to_string(kMaxProposalBytes) + " bytes for group " + std::to_string(groupId_)));
-    return seastar::with_semaphore(lock_, 1, [this, data = std::move(data)]() mutable -> seastar::future<bool> {
-        const bool ok = node_.propose(std::move(data));
-        co_await drainReady();
-        co_return ok;
-    });
+        throw ProposalTooLargeError("raft: proposal of " + std::to_string(data.size()) +
+                                    " bytes exceeds the deliverable maximum of " + std::to_string(kMaxProposalBytes) +
+                                    " bytes for group " + std::to_string(groupId_));
+    auto units = co_await seastar::get_units(lock_, 1);
+    const bool ok = node_.propose(std::move(data));
+    co_await drainReady();
+    co_return ok;
 }
 
 seastar::future<> RaftGroup::campaign() {
-    return seastar::with_semaphore(lock_, 1, [this]() -> seastar::future<> {
-        node_.campaign();
-        co_await drainReady();
-    });
+    auto units = co_await seastar::get_units(lock_, 1);
+    node_.campaign();
+    co_await drainReady();
 }
 
 seastar::future<bool> RaftGroup::proposeConfChange(std::vector<NodeId> voters, std::vector<NodeId> learners) {
-    return seastar::with_semaphore(
-        lock_, 1,
-        [this, voters = std::move(voters), learners = std::move(learners)]() mutable -> seastar::future<bool> {
-            const bool ok = node_.proposeConfChange(std::move(voters), std::move(learners));
-            co_await drainReady();
-            co_return ok;
-        });
+    auto units = co_await seastar::get_units(lock_, 1);
+    const bool ok = node_.proposeConfChange(std::move(voters), std::move(learners));
+    co_await drainReady();
+    co_return ok;
 }
 
 seastar::future<> RaftGroup::transferLeadership(NodeId target) {
-    return seastar::with_semaphore(lock_, 1, [this, target]() -> seastar::future<> {
-        node_.transferLeadership(target);
-        co_await drainReady();
-    });
+    auto units = co_await seastar::get_units(lock_, 1);
+    node_.transferLeadership(target);
+    co_await drainReady();
 }
 
 seastar::future<> RaftGroup::compact(LogIndex upto, std::string snapshotData) {
-    // THE LAMBDA HERE IS DELIBERATELY NOT A COROUTINE, and this is not a style choice.
-    //
-    // `seastar::with_semaphore` moves `func` into a `.then` continuation and invokes it
-    // there; that continuation -- and with it the CLOSURE -- is destroyed as soon as the
-    // invocation returns a future, i.e. AT THE FIRST SUSPENSION. A coroutine lambda's frame
-    // does not copy its captures; it holds a pointer to the closure. So any capture
-    // (`this` included) read AFTER a `co_await` is read out of freed memory.
-    //
-    // Every other with_semaphore body in this file happens to be safe only because it
-    // touches its captures EXCLUSIVELY BEFORE its single `co_await drainReady()` -- a
-    // fragile property nothing enforces (filed as debt D-33). This body cannot be: it
-    // suspends on persistSnapshot and then needs `persistence_` and `this` again. Written
-    // as a coroutine lambda it read a destroyed closure and `RaftNode::ready()` copied a
-    // garbage `Snapshot` out of it -- a std::bad_alloc on a vector with a nonsense length,
-    // caught by the recovery test rather than by reasoning.
-    return seastar::with_semaphore(lock_, 1, [this, upto, data = std::move(snapshotData)]() mutable {
-        return compactLocked(upto, std::move(data));
-    });
-}
-
-// Precondition: the caller holds lock_. A NAMED MEMBER COROUTINE, so `upto`,
-// `snapshotData` and `this` live in this coroutine's own frame (see compact()).
-seastar::future<> RaftGroup::compactLocked(LogIndex upto, std::string snapshotData) {
+    auto units = co_await seastar::get_units(lock_, 1);
     const LogIndex before = node_.log().snapshotIndex();
     node_.compact(upto, std::move(snapshotData));
     // PERSIST THE PRODUCED SNAPSHOT (debt D-6). Found by the recovery test the moment the
