@@ -40,6 +40,28 @@ static seastar::logger native_index_log("timestar.native_index");
 
 namespace timestar::index {
 
+// Fold a serialized roaring bitmap into a cached one.
+//
+// MERGE, never assign, whenever `dst` might already hold something: every
+// cold-load site in this file resumes from a `co_await kvGet` into a cache entry
+// a concurrent insert may have created and added to during the suspension, and
+// an assignment there silently drops those adds (write-scaleout debt D-2).
+//
+// The empty case is not a special case for correctness -- `|=` into an empty
+// bitmap is already right -- it is there for cost: `|=` deep-copies every
+// container out of the freshly deserialized value, where an assignment MOVES
+// them. An entry that is empty has nothing to preserve, and on the cold-load
+// paths that is the common case, so this keeps the old assign's cost while
+// keeping the merge's semantics.
+static void mergeSerializedBitmapInto(roaring::Roaring& dst, const char* data, size_t size) {
+    auto loaded = roaring::Roaring::readSafe(data, size);
+    if (dst.isEmpty()) {
+        dst = std::move(loaded);
+    } else {
+        dst |= loaded;
+    }
+}
+
 // Computes the exclusive upper bound for all keys starting with `prefix`:
 // the prefix with its last byte incremented (trailing 0xFF bytes are dropped
 // first). Returns an empty string when the bound is unbounded (empty or
@@ -341,15 +363,17 @@ seastar::future<> NativeIndex::close() {
 
     // Wait for any in-flight background flush, then flush remaining data.
     //
-    // UNCONDITIONALLY (write-scaleout debt D-3). This used to be guarded on
-    // `!memtable_->empty()`, but the memtable is not the only thing
-    // flushMemTable() makes durable: it is also the ONLY caller of
-    // flushDirtyBitmaps / flushDirtyDayBitmaps / flushDirtyHLLs /
-    // flushDirtyMeasurementBlooms, and those caches are mutated WITHOUT touching
-    // the memtable at all (a day-bitmap add for an already-known series writes no
-    // KV entry). So an empty memtable does not mean there is nothing to persist —
-    // and it is exactly what the last maybeFlushMemTable() leaves behind, since
-    // it swaps the active memtable out and installs a fresh empty one.
+    // The `!memtable_->empty()` half of the old guard is GONE (write-scaleout
+    // debt D-3). The memtable is not the only thing flushMemTable() makes
+    // durable: flushMemTable() and maybeFlushMemTable() are the only two callers
+    // of flushDirtyBitmaps / flushDirtyDayBitmaps / flushDirtyHLLs /
+    // flushDirtyMeasurementBlooms, maybeFlushMemTable() only ever runs when the
+    // memtable crosses its threshold, and those caches are mutated WITHOUT
+    // touching the memtable at all (a day-bitmap add for an already-known series
+    // writes no KV entry). So an empty memtable does not mean there is nothing to
+    // persist — and it is exactly what the last maybeFlushMemTable() leaves
+    // behind, since it swaps the active memtable out and installs a fresh empty
+    // one, which is why close() was the last chance and missed it.
     //
     // That is the whole of the reported defect: under concurrency plus a small
     // write buffer, the final threshold flush fired while the last chunk of
@@ -364,9 +388,19 @@ seastar::future<> NativeIndex::close() {
     //
     // flushMemTable() already short-circuits on an empty memtable — but only
     // AFTER draining the caches, which is the point.
+    //
+    // The NULL check stays. `memtable_` is only created by open(), and close()
+    // runs on indexes that never opened: bin/timestar_http_server.cpp's engine
+    // guard stops every shard's Engine when `invoke_on_all(init)` throws, and
+    // Engine::init creates its directories BEFORE index.open() — so an
+    // unwritable data dir or ENOSPC reaches here with a null memtable_, which
+    // flushMemTable() dereferences. Dropping it turned a clean "startup failed"
+    // diagnostic into a SIGSEGV that also aborts the sibling shards' cleanup.
     try {
         co_await waitForFlush();
-        co_await flushMemTable();
+        if (memtable_) {
+            co_await flushMemTable();
+        }
     } catch (const std::exception& e) {
         ::native_index_log.warn("Failed to flush MemTable on close: {} — data preserved in WAL", e.what());
     }
@@ -1808,7 +1842,7 @@ seastar::future<std::map<std::string, std::vector<SeriesId128>>> NativeIndex::ge
         fullCacheKey.assign(cachePrefix);
         fullCacheKey.append(tagValue);
         auto entry = ensureEntry(bitmapCache_, fullCacheKey);
-        entry->bitmap |= roaring::Roaring::readSafe(value.data(), value.size());
+        mergeSerializedBitmapInto(entry->bitmap, value.data(), value.size());
         entry->approxBytes = value.size();
         cacheHitValues.push_back(std::move(tagValue));
     }
@@ -2051,11 +2085,15 @@ size_t NativeIndex::getSeriesCountSync() const {
 
 seastar::future<> NativeIndex::compact() {
     // Wait for any in-flight background flush, then flush active memtable.
-    // Unconditional for the reason spelled out in close(): flushMemTable() is
-    // also the only thing that drains the dirty bitmap/day-bitmap/HLL/bloom
-    // caches, and those can hold unpersisted state while the memtable is empty.
+    // Not guarded on `!memtable_->empty()`, for the reason spelled out in
+    // close(): flushMemTable() is also what drains the dirty
+    // bitmap/day-bitmap/HLL/bloom caches, and those can hold unpersisted state
+    // while the memtable is empty. The null check is close()'s, for the same
+    // reason: this must not fault on an index that never opened.
     co_await waitForFlush();
-    co_await flushMemTable();
+    if (memtable_) {
+        co_await flushMemTable();
+    }
 
     // Retire all readers before compaction (compaction deletes files). Deferred
     // close: an in-flight scan may still hold a snapshot of these readers.
@@ -2198,7 +2236,7 @@ seastar::future<NativeIndex::BitmapHandle> NativeIndex::getPostingsBitmapByKey(c
     auto post = bitmapCache_.find(cacheKey);
     if (post != bitmapCache_.end()) {
         if (val.has_value()) {
-            post.value()->bitmap |= roaring::Roaring::readSafe(val->data(), val->size());
+            mergeSerializedBitmapInto(post.value()->bitmap, val->data(), val->size());
             post.value()->approxBytes = val->size();
         }
         co_return post->second;
@@ -2247,7 +2285,7 @@ seastar::future<uint64_t> NativeIndex::addToPostingsBitmapForInsert(std::string&
         // rather than replacing it. During the co_await above, concurrent
         // coroutines may have added local IDs to the pre-inserted empty bitmap.
         // A plain assignment would silently discard those concurrent adds.
-        entry->bitmap |= roaring::Roaring::readSafe(existing->data(), existing->size());
+        mergeSerializedBitmapInto(entry->bitmap, existing->data(), existing->size());
         entry->approxBytes = existing->size();
     }
     if (entry != pin) {
@@ -2375,7 +2413,7 @@ seastar::future<bool> NativeIndex::addToDayBitmapForInsert(std::string& cacheKey
     auto entry = ensureEntry(dayBitmapCache_, cacheKey);
     if (existing.has_value()) {
         // Merge (OR) to preserve concurrent adds during the co_await suspension.
-        entry->bitmap |= roaring::Roaring::readSafe(existing->data(), existing->size());
+        mergeSerializedBitmapInto(entry->bitmap, existing->data(), existing->size());
         entry->approxBytes = existing->size();
     }
     if (entry != pin)
@@ -2409,7 +2447,7 @@ seastar::future<NativeIndex::BitmapHandle> NativeIndex::getDayBitmapByKey(const 
     auto post = dayBitmapCache_.find(cacheKey);
     if (post != dayBitmapCache_.end()) {
         if (val.has_value()) {
-            post.value()->bitmap |= roaring::Roaring::readSafe(val->data(), val->size());
+            mergeSerializedBitmapInto(post.value()->bitmap, val->data(), val->size());
             post.value()->approxBytes = val->size();
         }
         co_return post->second;

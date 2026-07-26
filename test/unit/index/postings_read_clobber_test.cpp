@@ -134,8 +134,24 @@ SEASTAR_TEST_F(PostingsReadClobberTest, GroupedByTagLoadDoesNotClobberAConcurren
         pending.reserve(second.size());
         for (const auto& ins : second)
             pending.push_back(index.indexInsert(ins));
-        co_await seastar::when_all_succeed(pending.begin(), pending.end());
+        // The window this test needs is "the scan has made its miss decisions
+        // but has not reached its batch load". Nothing enforces that but the
+        // head-start sleep and the scan's own length, so ASSERT the scan is
+        // still running with every insert already in flight: the batch load runs
+        // at the very END of the scan, so an entry created from here on is
+        // created INSIDE the window. If the scan ever wins the race, this test
+        // stops covering the defect and must say so rather than pass on an empty
+        // window.
+        //
+        // Checked here and not after the inserts finish: an insert does more
+        // work after its postings add (day bitmaps, field types), so it outlives
+        // the scan by design — it is the ADD, not the whole insert, that has to
+        // land inside the window.
+        EXPECT_FALSE(scan.available()) << "the scan finished before the inserts were even in flight — the clobber "
+                                       << "window was never open, so this test proved nothing. Lengthen the scan "
+                                       << "(more filler tag values) or shorten the head start.";
 
+        co_await seastar::when_all_succeed(pending.begin(), pending.end());
         co_await std::move(scan);
 
         // (1) IN MEMORY. Each insert above completed before this read, so the

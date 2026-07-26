@@ -295,9 +295,11 @@ TEST(DayBitmapSourceInspection, NoBitmapPointerEscapesASuspendingCoroutine) {
 // 64 KB buffer the loss disappeared.
 //
 // THE CAUSE, and it is not the day bitmaps. `close()` guarded its final flush on
-// `!memtable_->empty()`, but `flushMemTable()` is the ONLY caller of
-// flushDirtyBitmaps / flushDirtyDayBitmaps / flushDirtyHLLs / flushDirtyMeasurementBlooms,
-// and those caches are mutated WITHOUT touching the memtable -- a day-bitmap add for an
+// `!memtable_->empty()`, but `flushMemTable()` and `maybeFlushMemTable()` are the only two
+// callers of flushDirtyBitmaps / flushDirtyDayBitmaps / flushDirtyHLLs /
+// flushDirtyMeasurementBlooms -- and maybeFlushMemTable() only runs when the memtable
+// crosses its threshold, so close() was the last chance. Those caches are mutated WITHOUT
+// touching the memtable -- a day-bitmap add for an
 // already-known series writes no KV entry. An empty memtable is in fact exactly what the
 // last threshold flush leaves behind (it swaps the active memtable out and installs a
 // fresh one), so the tail of a concurrent chunk landed its day-bitmap adds after that
@@ -348,4 +350,18 @@ SEASTAR_TEST_F(DayBitmapConcurrentInsertTest, ConcurrentInsertsWithTinyWriteBuff
         EXPECT_EQ(found, static_cast<size_t>(kSeries)) << "day-bitmap membership lost between memory and disk";
         co_await index.close();
     }
+}
+
+// The other half of the guard the fix above touched. `close()` no longer asks whether the
+// memtable is EMPTY -- but it still has to ask whether it EXISTS, because `memtable_` is
+// created by open() and close() is called on indexes that never opened: the HTTP server's
+// engine guard stops every shard's Engine when `invoke_on_all(init)` throws, and
+// Engine::init creates its directories BEFORE index.open(), so an unwritable data dir or
+// ENOSPC lands here with a null memtable_. flushMemTable() dereferences it. Without the
+// null check this is a SIGSEGV during startup-failure cleanup -- which also aborts the
+// sibling shards' cleanup and replaces a legible diagnostic with a crash.
+SEASTAR_TEST_F(DayBitmapConcurrentInsertTest, CloseWithoutOpenDoesNotFault) {
+    NativeIndex index(timestar::StorageLayout("."), 0);
+    co_await index.close();
+    SUCCEED();
 }
