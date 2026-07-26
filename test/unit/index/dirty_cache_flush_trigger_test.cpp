@@ -317,10 +317,18 @@ SEASTAR_TEST_F(DirtyCacheFlushTriggerTest, ByteEstimateTracksBitmapsGrowingInPla
     for (int i = kWarm; i < kTotal; ++i)
         co_await insertField(i);
 
-    // No flush may have intervened, or the delta would be measuring a reset.
+    // No flush may have intervened, or the delta would be measuring a reset. Both
+    // guards matter: the key count catches a flush that changed the working set,
+    // and the byte comparison catches one that merely zeroed the estimate -- an
+    // unguarded subtraction would then UNDERFLOW to a huge size_t and sail past
+    // the assertion below, turning this gate into a no-op exactly when the
+    // measurement had become meaningless.
+    const size_t bytesNow = index.dirtyIndexCacheBytes();
     EXPECT_EQ(index.dirtyIndexCacheKeys(), keysAfterWarm)
         << "the dirty key set changed between probes -- a flush ran and this measurement is meaningless";
-    const size_t grown = index.dirtyIndexCacheBytes() - bytesAfterWarm;
+    EXPECT_GE(bytesNow, bytesAfterWarm)
+        << "the byte estimate went DOWN between probes -- a flush zeroed it and this measurement is meaningless";
+    const size_t grown = bytesNow >= bytesAfterWarm ? bytesNow - bytesAfterWarm : 0;
 
     // (kTotal - kWarm) series each add one id to the shared postings bitmap and
     // one to the day bitmap: 3600 in-place changes. At the 4-byte charge that is

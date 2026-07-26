@@ -791,11 +791,21 @@ seastar::future<> NativeIndex::flushDirtyCaches() {
     // Enter when either cache is POPULATED (so the local-ID counter/watermark are
     // refreshed and, more importantly, the trims run — a read-heavy shard fills
     // these caches with clean entries and is exactly where the byte budgets must
-    // bite) or when anything is DIRTY. The second half is not redundant:
-    // removeExpiredDayBitmaps can leave keys in a dirty set whose cache entries
-    // are gone, and without it an empty-cache/non-empty-set state would return
-    // early forever while the periodic flush took flushMutex_ once an interval to
-    // achieve nothing.
+    // bite) or when anything is DIRTY. The second half is not redundant, because a
+    // dirty KEY can outlive its cache ENTRY:
+    //
+    //   * A serializer clears `entry.dirty` as it writes key K. If a concurrent
+    //     insert re-added K to the (fresh) member set just BEFORE the serializer
+    //     reached it, K stays in the set while its entry is now clean — and a clean
+    //     entry is exactly what the trims are allowed to evict.
+    //   * `lastFlushedLocalId_ < localIdMap_.nextId()` is a dirty state with no
+    //     cache entry at all: ids assigned by the repair path for a series whose
+    //     tags produced no bitmap.
+    //
+    // Either leaves an empty-cache/non-empty-set pair, which without this clause
+    // returns early forever while the periodic flush takes flushMutex_ once an
+    // interval to achieve nothing. (`removeExpiredDayBitmaps` used to be a third
+    // way in; it now erases the dirty key with the entry.)
     if (bitmapCache_.empty() && dayBitmapCache_.empty() && !hasDirtyCacheState())
         co_return;
 
@@ -883,6 +893,13 @@ void NativeIndex::noteBitmapChanged(std::unordered_set<std::string>& dirtyKeys, 
 
 void NativeIndex::chargeDirtyCacheBytes(size_t bytes) {
     dirtyCacheBytes_ += bytes;
+}
+
+void NativeIndex::dischargeDirtyCacheBytesIfClean() {
+    if (bitmapCacheDirtyKeys_.empty() && dayBitmapCacheDirtyKeys_.empty() && hllCacheDirty_.empty() &&
+        dirtyMeasurementBlooms_.empty()) {
+        dirtyCacheBytes_ = 0;
+    }
 }
 
 seastar::future<> NativeIndex::flushDirtyCachesUnderMutex() {
@@ -2259,10 +2276,13 @@ void NativeIndex::buildBitmapCacheKey(std::string& out, const std::string& measu
 // serializes up to 10,000 roaring bitmaps, and the periodic flush can now reach
 // it without any memtable pressure — 10,000 runOptimize+shrinkToFit+write calls
 // in one non-preemptible block is a reactor stall (this project has a gate for
-// those). The yields are safe only because the dirty set is EXCHANGED out first:
-// a concurrent insert re-dirtying a key during a yield lands in the fresh member
-// set and is flushed next round, where a trailing `clear()` would have DROPPED it
-// — the D-2 shape. It also stops a set rehash from invalidating the iterator.
+// those). What is added is a PREEMPTION POINT every 64 keys, not a suspension:
+// maybe_yield() suspends only once the reactor's task quota is exhausted, so an
+// uncontended flush still runs straight through for the cost of a need_preempt()
+// check. Suspending there is safe only because the dirty set is EXCHANGED out
+// first: a concurrent insert re-dirtying a key lands in the fresh member set and
+// is flushed next round, where a trailing `clear()` would have DROPPED it — the
+// D-2 shape. It also stops a set rehash from invalidating the iterator.
 seastar::future<> NativeIndex::flushDirtyBitmaps(IndexWriteBatch& batch) {
     // Read the watermark ONCE, before the first yield. It claims that every local
     // ID below it has its bitmap membership in this batch; an ID assigned during a
@@ -2283,7 +2303,13 @@ seastar::future<> NativeIndex::flushDirtyBitmaps(IndexWriteBatch& batch) {
         if ((id & 0xFF) == 0xFF)
             co_await seastar::coroutine::maybe_yield();
     }
-    lastFlushedLocalId_ = watermark;
+    // MONOTONIC, never a plain assignment. The loop above can suspend, and
+    // getOrCreateSeriesId advances this same field past the id it just persisted
+    // in its own batch (:1226, which uses std::max for exactly this reason). A
+    // series created during one of those yields would otherwise be pushed back
+    // BELOW the value it already published, and the next flush would re-put a
+    // LOCAL_ID_FORWARD entry it had already written.
+    lastFlushedLocalId_ = std::max(lastFlushedLocalId_, watermark);
 
     // Advance the postings watermark: every local ID below it has its bitmap
     // membership included in this batch. On restart, open() re-adds postings only
@@ -2949,6 +2975,17 @@ seastar::future<> NativeIndex::removeExpiredDayBitmaps(const std::string& measur
         dayBitmapCacheDirtyKeys_.erase(k);
         dayBitmapCache_.erase(k);
     }
+    // ...and discharge the bytes those keys were charged. Erasing the key alone
+    // left the estimate holding a charge for state that no longer exists, and a
+    // stale charge at or above maxDirtyCacheBytes_ makes maybeFlushDirtyCaches()
+    // take flushMutex_ on EVERY insert (only to find nothing to do) until an
+    // unrelated memtable flush or close() zeroes it.
+    //
+    // Restoring the invariant is simpler and more robust than subtracting a
+    // per-entry figure: the estimate answers "bytes the next flush will write",
+    // so with every dirty set empty the only correct value is 0. This is the one
+    // place a key leaves a dirty set other than a flush.
+    dischargeDirtyCacheBytesIfClean();
 
     if (!batch.empty()) {
         co_await kvWriteBatch(batch);

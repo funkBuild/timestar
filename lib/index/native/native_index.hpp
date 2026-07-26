@@ -385,6 +385,12 @@ private:
     // BitmapEntry is defined; it is the single place where the `dirty` flag, the
     // dirty-key set and the byte estimate stay consistent.
     void chargeDirtyCacheBytes(size_t bytes);
+    // Restore the invariant "no dirty state => nothing for the next flush to
+    // write" after a key leaves a dirty set outside a flush. Called by the
+    // retention eviction, which is the only such site; without it a stale charge
+    // at or above the threshold makes maybeFlushDirtyCaches() take flushMutex_ on
+    // every insert, finding nothing to do, until an unrelated flush zeroes it.
+    void dischargeDirtyCacheBytesIfClean();
 
     // WHAT THIS COUNTS, precisely: the serialized bytes the next dirty-cache
     // flush will write. A roaring bitmap's serialized size tracks its container
@@ -404,12 +410,23 @@ private:
     //     bitmap, so its transition charge is a few bytes of key no matter how
     //     many million ids then land in it.
     //
-    // WHAT IT IS NOT: an accountant for the arena. It is charged and only ever
-    // discharged by a flush, and the per-change constant over-estimates a dense
-    // bitmap. Over-counting only makes the next flush earlier; under-counting
-    // would let the trigger go silent, which is the failure mode that matters. The
-    // HLL charge is exact (HyperLogLog::SERIALIZED_SIZE); the bloom charge is a
-    // documented floor.
+    // WHAT IT IS NOT: an accountant for the arena. Three of its four known
+    // inaccuracies OVER-count, which only makes the next flush earlier; the fourth
+    // under-counts by a bounded amount. Listed so nobody has to rediscover them
+    // while chasing a flush that fired early:
+    //   * the per-change constant over-states a dense bitmap (4 bytes for an add
+    //     that grows a bitmap container by nothing at all);
+    //   * a key re-dirtied while a serializer is mid-round is charged its FULL
+    //     size again in the next round, though the current round already wrote it;
+    //   * a cold load charges the merged KV payload on top of the transition
+    //     charge taken against the pre-inserted empty entry;
+    //   * the HLL charge is exact (HyperLogLog::SERIALIZED_SIZE), but the bloom
+    //     charge is a floor, so a measurement with many distinct tag values is
+    //     under-stated — the one under-counting source, bounded by
+    //     kDirtyBloomBytesEstimate per measurement.
+    // The one place a charge could otherwise become permanently STALE — a dirty
+    // entry erased outside a flush, i.e. retention — restores the invariant
+    // instead (see dischargeDirtyCacheBytesIfClean).
     //
     // It is also NOT, on its own, what catches a day rollover on a large shard: at
     // a 512 MB budget the threshold is ~51 MB, which one rollover need never
@@ -426,8 +443,10 @@ private:
     // MAX_DAY_BITMAP_CACHE_ENTRIES, so at most 10% of the postings cache and 20%
     // of the day-bitmap cache can be trim-exempt at once and the entry-count trims
     // below keep their meaning. It also caps a single flush round's work, which
-    // matters now that the periodic flush can reach it: the serializers yield
-    // every 64 keys, so 10K bitmaps is bounded latency rather than a stall.
+    // matters now that the periodic flush can reach it: the serializers offer a
+    // preemption point every 64 keys (maybe_yield() suspends only when the task
+    // quota is exhausted, so an uncontended flush still runs straight through), so
+    // 10K bitmaps is bounded latency rather than a stall.
     static constexpr size_t kMaxDirtyCacheKeys = 10000;
     // Share of the index cache budget that the dirty entries' SERIALIZED size may
     // reach before a flush is forced. 10% is the slice maxHllCacheBytes() already
@@ -605,9 +624,11 @@ private:
     // pointer. The same discipline `updateTagHLL` already documented for itself.
     seastar::future<uint64_t> addToPostingsBitmapForInsert(std::string& cacheKey, uint32_t localId);
     // Flush dirty bitmaps + batched LOCAL_ID_FORWARD entries into the KV store.
-    // Preemptible: yields every 64 keys, after exchanging the dirty set out so a
-    // concurrent re-dirty during a yield survives into the NEXT round instead of
-    // being dropped by a trailing clear() (the D-2 shape).
+    // Preemptible: a preemption point every 64 keys — maybe_yield() suspends only
+    // when the reactor's task quota is exhausted, so this costs a need_preempt()
+    // check on an uncontended flush. Safe only because the dirty set is exchanged
+    // out first, so a concurrent re-dirty during a suspension survives into the
+    // NEXT round instead of being dropped by a trailing clear() (the D-2 shape).
     seastar::future<> flushDirtyBitmaps(IndexWriteBatch& batch);
     // Migration: build LocalIdMap + bitmaps from existing TAG_INDEX data on first open.
     seastar::future<> migrateToLocalIds(IndexWriteBatch& batch);
