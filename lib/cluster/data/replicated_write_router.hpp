@@ -70,6 +70,24 @@ public:
     // still admits several attempts.
     static constexpr auto kAttemptTimeout = std::chrono::milliseconds(600);
 
+    // THE COUPLING, checked by the compiler rather than by comment, and against the REAL
+    // attempt count: the pauses of a full Transport-class budget must outlast the
+    // transport's own reconnect backoff, or every attempt fast-fails on the same dead
+    // client and a TCP blip becomes a client 5xx ([D6], write-scaleout 4a).
+    //
+    // Both sides are taken at their PESSIMAL jittered values -- shortest possible retry
+    // span against longest possible backoff window -- because the nominal comparison
+    // (620 ms vs 200 ms, three windows) is not what has to hold; the unlucky draw is.
+    // Pessimal is 465 ms vs 300 ms, i.e. at least one guaranteed re-dial inside the
+    // budget even on the worst draw, against ZERO before 4a.
+    //
+    // It is asserted HERE and not in write_errors.hpp because kMaxAttempts lives here:
+    // asserting against a literal 6 let someone drop kMaxAttempts to 4, restore [D6], and
+    // still compile.
+    static_assert(worstCaseWriteRetrySpan(WriteFailure::Transport, kMaxAttempts) > cluster::worstCaseReconnectBackoff(),
+                  "the write retry schedule must outlast the transport reconnect window even on the "
+                  "worst jitter draw [write-scaleout 4a]");
+
     ReplicatedBatchWriteRouter(const VShardDirectory& dir, ProposeSink& local, NodeTransport& client,
                                const LeaderResolver& leaders)
         : dir_(dir), local_(local), client_(client), leaders_(leaders) {}

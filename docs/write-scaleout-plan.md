@@ -476,9 +476,41 @@ catch-up verified (existing gate).
     `tcp_reset_proxy.py`). See the gate README for the topology and the three
     anti-vacuity assertions, each of which a real earlier run of the gate failed.
 
+Review round (2026-07-26, post-implementation), 2 blockers + 5 items fixed:
+
+- **CRITICAL: `startPeerResolver` passed a COROUTINE LAMBDA as a temporary to
+  `with_gate`.** A lambda-coroutine keeps its captures in the CLOSURE OBJECT, which dies
+  at the end of the full expression while the coroutine is suspended -- and this one is
+  ALWAYS suspended, because `unresolvedPeers_` holds hostnames precisely because they did
+  not resolve. On resume it read `this` and `replicated` from freed stack; at RF=1 a
+  garbage `replicated` reading true dispatches `invoke_on_all` into a
+  `sharded<ShardRaftPlane>` that was never started. This is verbatim the hazard documented
+  at cluster_data_plane.cpp's own `startLeadershipBalancer`, which obeys it. Fixed the way
+  that comment prescribes: a NAMED member coroutine (`resolvePendingPeers`) launched by a
+  plain lambda, whose frame the gate keeps alive. Same function: the discarded possibly-
+  exceptional future is now consumed via `then_wrapped` + `ignore_ready_future` (leaving
+  the flag set would also have silently killed the loop), and `registerPeer` takes its
+  address BY VALUE -- callers passed a reference into a member map the same pass rewrites.
+- **MAJOR: the second instance of the 4d defect, in `updateTagHLL`** -- see 4d below.
+- The retry sleep is clamped to the remaining deadline: a 320 ms + jitter pause starting
+  at t=1499 ms slept ~400 ms past the 1.5 s deadline and then dispatched a 6th attempt the
+  between-attempts check was guaranteed to reject. The client outcome was already correct;
+  the DEADLINE was not.
+- The coupling `static_assert` moved to `replicated_write_router.hpp` so it binds to
+  `kMaxAttempts` rather than a literal 6 (dropping it to 4 restores [D6] and used to still
+  compile -- verified that it now fails to), and it compares the PESSIMAL jittered values
+  (retry span x0.75 = 465 ms vs backoff x1.5 = 300 ms) rather than the nominal ones.
+- `jitteredDelay`'s RNG was seeded from the shard id ALONE, so node1/shard2 and
+  node2/shard2 drew identical sequences -- the CROSS-NODE herd the jitter exists to break
+  was not spread at all. Now mixed with pid + steady_clock at first use.
+- Keepalive parameters moved into `reconnect_policy.hpp`, shared by both transports
+  instead of duplicated literals.
+
 Gate outcomes (2026-07-26):
 
-- **Fault injection (the new discriminating gate).** 147 reset rounds destroying 392 peer
+- **Fault injection (the new discriminating gate).** Re-run after the review round: 148
+  reset rounds destroying 400 peer connections -> 2000/2000 + 200/200, 0 errors, 92% of a
+  4.99 M baseline. Original run: 147 reset rounds destroying 392 peer
   connections mid-bench -> **2000/2000 bench requests OK, 200/200 probe writes OK, 0 HTTP
   errors, 0 server-side 500s, 0 crashes**; 94% of the proxied baseline throughput
   retained; all 200 acked probe points readable **on every node**. The same tree with only
@@ -547,9 +579,28 @@ asserts on that count for this reason).
 
     FIX: `addToDayBitmapForInsert` / `addToPostingsBitmapForInsert` mutate INSIDE, after
     re-finding the entry, with no suspension in between, and re-mark the entry dirty.
-    Cardinality comes back BY VALUE. Pinned by
-    `DayBitmapSourceInspection.NoBitmapPointerEscapesASuspendingCoroutine`, which fails on
-    the pre-fix file (verified by reverting it and re-running).
+    Cardinality comes back BY VALUE.
+
+    **PROOF, and it is behavioural, not textual.** Reverting `native_index.cpp` to
+    `ad77cf3` and running the (enabled) concurrent-insert test reproduces the PRODUCTION
+    SEGFAULT SIGNATURE -- a fault on a garbage `si_addr` -- on the pre-fix code, and the
+    same test passes on the fix. That is the demonstration; the structural test
+    (`DayBitmapSourceInspection.NoBitmapPointerEscapesASuspendingCoroutine`) is a
+    regression fence on the SHAPE, not the evidence for the diagnosis, and is written that
+    way because the fault is a race between reactor tasks that no unit test can schedule
+    on demand.
+
+    **A SECOND INSTANCE of the same defect, on the same hot path, fixed in the review
+    round:** `updateTagHLL` bound the result of `co_await getPostingsBitmapByKey(...)` to a
+    pointer and then iterated it, justified in-code by "the seed loop below does not
+    suspend" -- the exact argument this diagnosis refutes, since the loop runs in a
+    different reactor task than the `co_return` that produced the pointer. It is the worse
+    of the two: `getPostingsBitmapByKey`'s cold-load branch inserts with `dirty = false`,
+    i.e. IMMEDIATELY trim-eligible, and the function is reachable from
+    `getOrCreateSeriesId` on the hot write path under exactly the memory pressure the
+    production crash needed. The seed is now taken BY VALUE after a re-find (a one-time
+    copy, only when a tag value first crosses `kTagHllMinCardinality`). The structural test
+    pins that shape too.
 
     **The CRoaring allocator hook was considered and RULED OUT, with evidence.** It would
     not have prevented this crash -- the fault is a UAF, not an OOM -- and it cannot
@@ -571,15 +622,37 @@ asserts on that count for this reason).
 
 **Filed for the index owner (found during 4d, NOT fixed here):**
 
-- **Day-bitmap membership is lost between memory and disk under concurrency + frequent
-  flushes.** With a 4 KB write buffer and concurrent inserts, the warm pre-close
-  time-scoped count is EXACTLY right (600/600) and the count after close+reopen is short
-  by roughly one chunk (559/600, evenly across days). It needs BOTH concurrency and
-  frequent flushes -- the same workload run sequentially persists everything, and at a
-  64 KB buffer the loss disappears -- so it is in the flush/compaction path, not the add
-  path 4d fixed. It reproduces IDENTICALLY on the pre-4d index code. One-command repro:
+- **An INDEX-FLUSH DURABILITY defect: data that is correct in memory does not survive a
+  close+reopen, under concurrency + frequent flushes. Cause NOT yet confirmed; the
+  day-bitmap framing below is the symptom, not the diagnosis.** With a 4 KB write buffer
+  and concurrent inserts, the warm pre-close time-scoped count is EXACTLY right (600/600)
+  and the count after close+reopen is short by roughly one chunk (559/600, evenly across
+  days). It needs BOTH concurrency and frequent flushes -- sequentially the same workload
+  persists everything, and at a 64 KB buffer the loss disappears.
+
+  It is probably NOT the day bitmaps themselves. The repro uses ONE measurement, so there
+  are only four day-bitmap entries; all four are dirty (hence trim-proof) and are flushed
+  at close. The drop conditions in `findSeriesWithMetadataTimeScoped`
+  (native_index.cpp ~:2755-2778) make a lost `LOCAL_ID_FORWARD` or `SERIES_METADATA` entry
+  the likelier cause -- i.e. the loss is in the memtable flush path generally, and the day
+  bitmap is merely how it becomes visible.
+
+  Concrete lead for whoever picks this up: `maybeFlushMemTable` clears every `dirty` flag
+  in `flushDirtyDayBitmaps` (:707) and then SUSPENDS TWICE (`flushDirtyMeasurementBlooms`,
+  `wal_->append`) before `applyTo(*memtable_)` at :712 -- dirty is cleared BEFORE
+  durability, and the trims at :715-716 can evict now-clean entries inside that window.
+  Separately, the background flush fiber resets `immutableMemtable_` (:738) before
+  `maybeCompact` / `refreshSSTables` (:739-740).
+
+  Reproduces on the pre-4d index code as well -- but note that pre-4d code SEGFAULTS on
+  this workload shape, so "identical" is not measurable; what is established is that the
+  loss is not something 4d introduced. One-command repro on the current binary:
   `./test/timestar_unit_test --gtest_also_run_disabled_tests --gtest_filter=
   '*DISABLED_ConcurrentInsertsWithTinyWriteBufferLoseDayMembership'`.
+- **PHASE 5 DEBT (agreed, not to be fixed inside Phase 4): heap-stable bitmap cache
+  values + an eviction pin**, which would retire the read-side "consume immediately"
+  contract entirely rather than documenting it; and fault-gate hardening (floor raises, a
+  scripted A/B against a pre-4a binary, a combined reset+rebalance gate).
 - **The READ-side bitmap accessors still escape.** `getPostingsBitmapByKey` /
   `getDayBitmapByKey` still return `const roaring::Roaring*` out of a suspending
   coroutine, with the same rehash/trim hazard. Their declarations now state the

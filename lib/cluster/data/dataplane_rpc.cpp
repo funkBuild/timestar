@@ -83,32 +83,11 @@ constexpr uint64_t kProposeWriteHinted = 10;
 // static_assert in write_errors.hpp (write-scaleout 4a/4b).
 using cluster::kReconnectBackoff;
 
-// TCP keepalive on every peer connection (write-scaleout 4b-ii).
-//
-// A data-plane connection is idle whenever this shard happens to own no leader for the
-// series a client is writing, which on a 4096-VShard cluster is common and bursty. A
-// connection that dies while idle -- peer reboot that never sent a FIN, a NAT/conntrack
-// entry expiring, a middlebox dropping the flow -- stays OPEN as far as this side is
-// concerned, and is discovered only when a write finally uses it and hangs to its
-// attempt deadline. Keepalive turns that into a proactive retirement: the kernel probes
-// the flow, the socket errors, `clientFor` sees `error()` and re-dials on the next use.
-//
-// Deliberately built on seastar's own `client_options.keepalive` (which sets
-// SO_KEEPALIVE + TCP_KEEPIDLE/INTVL/CNT on the fd) rather than an application-level ping
-// verb: an app ping needs a timer per peer per shard, a verb the peer must implement in
-// both wire versions, and its own timeout policy, and it cannot detect a flow the kernel
-// has already given up on any faster than the kernel does.
-//
-// 5s idle / 2s interval / 3 probes => a dead flow is detected in ~11s, well inside the
-// hibernation-idle periods this is aimed at, and far above the write deadline so a
-// merely-slow peer is never killed by it. Keepalive granularity is whole seconds.
-constexpr std::chrono::seconds kKeepaliveIdle{5};
-constexpr std::chrono::seconds kKeepaliveInterval{2};
-constexpr unsigned kKeepaliveCount = 3;
-
+// Peer client options. Keepalive parameters are shared with the Raft transport
+// (lib/cluster/reconnect_policy.hpp) so the two cannot drift apart.
 seastar::rpc::client_options peerClientOptions() {
     seastar::rpc::client_options opts;
-    opts.keepalive = seastar::net::tcp_keepalive_params{kKeepaliveIdle, kKeepaliveInterval, kKeepaliveCount};
+    opts.keepalive = cluster::keepaliveParams();
     return opts;
 }
 

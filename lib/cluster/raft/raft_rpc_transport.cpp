@@ -52,13 +52,14 @@ constexpr uint64_t kDeliverVerb = 1;
 // they stay in lockstep for the whole outage.
 using timestar::cluster::kReconnectBackoff;
 
-// TCP keepalive on Raft peer connections, same parameters and same reasoning as the data
-// plane (dataplane_rpc.cpp): a Raft connection to a hibernated follower can be idle for
-// long stretches, and a flow that dies while idle is otherwise only noticed when the next
-// append silently vanishes into it.
+// TCP keepalive on Raft peer connections. The PARAMETERS live in reconnect_policy.hpp
+// alongside the data plane's, so the two transports cannot drift apart -- the reasoning
+// (a hibernated follower's connection is idle for long stretches, and a flow that dies
+// while idle is otherwise only noticed when the next append vanishes into it) is
+// identical and is recorded there.
 seastar::rpc::client_options peerClientOptions() {
     seastar::rpc::client_options opts;
-    opts.keepalive = seastar::net::tcp_keepalive_params{std::chrono::seconds(5), std::chrono::seconds(2), 3};
+    opts.keepalive = timestar::cluster::keepaliveParams();
     return opts;
 }
 

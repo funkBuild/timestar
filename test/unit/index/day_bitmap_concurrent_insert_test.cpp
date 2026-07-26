@@ -216,22 +216,57 @@ TEST(DayBitmapSourceInspection, NoBitmapPointerEscapesASuspendingCoroutine) {
     ss << in.rdbuf();
     const std::string src = ss.str();
 
-    // A MUTABLE bitmap pointer must never leave one of these coroutines. The read-side
-    // accessors return `const roaring::Roaring*` and are held to a
-    // consume-immediately contract documented on their declarations (hardening those the
-    // same way is filed in docs/write-scaleout-plan.md); the WRITE side has no excuse,
-    // because the mutation can simply happen inside.
-    EXPECT_EQ(src.find("seastar::future<roaring::Roaring*>"), std::string::npos)
-        << "native_index.cpp hands a MUTABLE `roaring::Roaring*` out of a coroutine. The "
-        << "caller dereferences it in a LATER reactor task, by which point a robin_map "
-        << "rehash or a flush+trim can have moved or freed the entry -- the use-after-free "
-        << "that faults inside roaring_bitmap_add (write-scaleout 4d). Do the mutation "
-        << "inside the accessor (see addToDayBitmapForInsert) instead.";
+    // (1) A MUTABLE bitmap pointer must never leave one of these coroutines. The read-side
+    // accessors return `const roaring::Roaring*` and are held to a consume-immediately
+    // contract documented on their declarations (retiring that contract by making the
+    // cache values heap-stable is Phase-5 debt); the WRITE side has no excuse, because the
+    // mutation can simply happen inside. Both spellings are checked -- clang-format
+    // produces the unspaced one, but a hand-written `Roaring *` would slip past a single
+    // literal.
+    for (const char* spelling : {"seastar::future<roaring::Roaring*>", "seastar::future<roaring::Roaring *>"}) {
+        EXPECT_EQ(src.find(spelling), std::string::npos)
+            << "native_index.cpp hands a MUTABLE `roaring::Roaring*` out of a coroutine (" << spelling
+            << "). The caller dereferences it in a LATER reactor task, by which "
+            << "point a robin_map rehash or a flush+trim can have moved or freed the entry "
+            << "-- the use-after-free that faults inside roaring_bitmap_add "
+            << "(write-scaleout 4d). Do the mutation inside the accessor (see "
+            << "addToDayBitmapForInsert) instead.";
+    }
 
     // ... and the replacements are actually there, so the check above cannot pass simply
     // because someone deleted the insert path.
     EXPECT_NE(src.find("NativeIndex::addToDayBitmapForInsert"), std::string::npos);
     EXPECT_NE(src.find("NativeIndex::addToPostingsBitmapForInsert"), std::string::npos);
+
+    // (2) `updateTagHLL` is the one INSERT-PATH function that consumes a read-side
+    // accessor, and it had the identical defect: it BOUND the result of
+    // `co_await getPostingsBitmapByKey(...)` to a pointer and then iterated it, on the
+    // argument that "the seed loop below does not suspend" -- the exact model (1) exists
+    // to refute. It is the worse instance, because that accessor's cold-load branch
+    // inserts the entry with `dirty = false`, i.e. immediately trim-eligible, and the
+    // function is reachable from `getOrCreateSeriesId` on the hot write path.
+    //
+    // Structural rather than behavioural on purpose: the fault is a RACE between reactor
+    // tasks, so no unit test can schedule it on demand (the same reason 4d itself is
+    // pinned this way). What IS deterministic is the shape, and this pins the shape: the
+    // result must be DISCARDED and the bitmap re-found by key, never bound and walked.
+    const size_t fnStart = src.find("NativeIndex::updateTagHLL");
+    ASSERT_NE(fnStart, std::string::npos) << "updateTagHLL not found -- this check has rotted";
+    const size_t fnEnd = src.find("\n}\n", fnStart);
+    ASSERT_NE(fnEnd, std::string::npos);
+    const std::string body = src.substr(fnStart, fnEnd - fnStart);
+
+    EXPECT_EQ(body.find("= co_await getPostingsBitmapByKey"), std::string::npos)
+        << "updateTagHLL binds the result of getPostingsBitmapByKey to a variable. That "
+        << "pointer is computed inside a coroutine that suspended, so anything done with "
+        << "it runs in a different reactor task -- a rehash or a flush+trim in between "
+        << "makes it a use-after-free on the hot write path (write-scaleout 4d, blocker 2). "
+        << "Discard the result and re-find the entry by key, then COPY the bitmap.";
+    if (body.find("getPostingsBitmapByKey") != std::string::npos) {
+        EXPECT_NE(body.find("(void)co_await getPostingsBitmapByKey"), std::string::npos)
+            << "updateTagHLL must call getPostingsBitmapByKey only for its side effect of "
+            << "repopulating bitmapCache_, and re-find the entry by key afterwards.";
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -171,7 +171,19 @@ seastar::future<> ReplicatedBatchWriteRouter::write(VShardBatches groups) {
 
         // Slices remain. Retry ONLY those -- a slice that committed is never re-proposed,
         // which keeps a leadership blip on one VShard from re-running the whole batch.
-        if (attempt >= kMaxAttempts || seastar::lowres_clock::now() >= deadline)
+        //
+        // The pause is jittered so that N concurrent batches (and, at RF=3, N shards x N
+        // peers) do not all re-dial the same peer on the same 20/40/80 ms grid -- the
+        // write-side half of the herd 4b jitters on the transport side.
+        const auto pause = cluster::jitteredDelay(retryDelay <= std::chrono::milliseconds(0) ? kRetryDelay : retryDelay,
+                                                  kWriteRetryJitterPercent);
+        const auto now = seastar::lowres_clock::now();
+        // Give up if the budget is spent OR IF THE PAUSE ITSELF WOULD OUTLAST IT. The
+        // second half matters now that pauses reach 320 ms: without it a pause starting at
+        // t=1499 ms sleeps past the deadline and then dispatches an attempt that the
+        // between-attempts check is guaranteed to reject, so the caller waits ~400 ms
+        // longer than the deadline it was promised for an answer that cannot change.
+        if (attempt >= kMaxAttempts || now >= deadline || (deadline - now) <= pause)
             throw RetryableWriteError("ReplicatedBatchWriteRouter: " + std::to_string(failed.size()) +
                                       " VShard slice(s) uncommitted after " + std::to_string(attempt) +
                                       " attempt(s) (last: " + writeFailureName(lastKind) + "); retry the write");
@@ -180,11 +192,7 @@ seastar::future<> ReplicatedBatchWriteRouter::write(VShardBatches groups) {
         for (const auto& [vs, g] : failed)
             outstanding.push_back(g);
         hints = std::move(nextHints);
-        // Jittered so that N concurrent batches (and, at RF=3, N shards x N peers) do not
-        // all re-dial the same peer on the same 20/40/80 ms grid -- the write-side half of
-        // the reconnect thundering herd 4b jitters on the transport side.
-        co_await seastar::sleep(
-            cluster::jitteredDelay(retryDelay <= std::chrono::milliseconds(0) ? kRetryDelay : retryDelay, 25));
+        co_await seastar::sleep(pause);
     }
 }
 

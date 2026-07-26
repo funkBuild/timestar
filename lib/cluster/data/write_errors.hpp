@@ -161,11 +161,21 @@ constexpr std::chrono::milliseconds writeRetryScheduleSpan(WriteFailure f, unsig
     return std::chrono::milliseconds(total);
 }
 
-// The coupling, checked by the compiler rather than by comment: six attempts' worth of
-// Transport pauses must outlast the transport's reconnect window with room for more than
-// one re-dial, or a blip is once again retried entirely against a dead client.
-static_assert(writeRetryScheduleSpan(WriteFailure::Transport, 6) > 2 * cluster::kReconnectBackoff,
-              "the write retry schedule must span several transport reconnect windows [write-scaleout 4a]");
+// Jitter applied to each retry pause, so N concurrent batches do not re-dial the same peer
+// on the same 20/40/80 ms grid. It SHORTENS a pause as often as it lengthens it, which is
+// why the coupling assertion below has to reason about the pessimal case.
+inline constexpr unsigned kWriteRetryJitterPercent = 25;
+
+// The SHORTEST the pauses of an `attempts`-attempt budget can be once jitter has had its
+// worst say. This -- not the nominal span -- is what has to outlast the reconnect window.
+constexpr std::chrono::milliseconds worstCaseWriteRetrySpan(WriteFailure f, unsigned attempts) {
+    return writeRetryScheduleSpan(f, attempts) * (100 - kWriteRetryJitterPercent) / 100;
+}
+
+// The coupling is asserted where BOTH numbers are visible -- in replicated_write_router.hpp,
+// against `ReplicatedBatchWriteRouter::kMaxAttempts` rather than a literal. Asserting a
+// hardcoded attempt count here would have let someone drop kMaxAttempts to 4, restore
+// [D6], and still compile.
 
 // Whether the slice's outcome is UNKNOWN (the proposal may have committed). Recorded
 // for the audit above and for reporting; it does not change the policy, because a

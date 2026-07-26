@@ -139,8 +139,13 @@ private:
     // plane that needs it; a peer that fails to resolve is retried until it does, instead
     // of being a permanent, silent hole. See the .cpp for what the two independent
     // try-guarded loops these replace could get wrong.
-    seastar::future<bool> registerPeer(NodeId id, const std::string& addr, bool replicated);
+    // `addr` BY VALUE: this coroutine suspends in DNS, and every caller passes a reference
+    // into a member map that the same pass rewrites.
+    seastar::future<bool> registerPeer(NodeId id, std::string addr, bool replicated);
     seastar::future<> registerAllPeers(bool replicated);
+    // One re-resolution pass. Named (not a lambda-coroutine) so its captures live in a
+    // coroutine frame the gate keeps alive -- see startPeerResolver.
+    seastar::future<> resolvePendingPeers(bool replicated);
     void startPeerResolver(bool replicated);
 
     std::optional<ClusterRuntime> rt_;

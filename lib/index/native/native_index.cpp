@@ -2890,27 +2890,54 @@ seastar::future<> NativeIndex::updateTagHLL(const std::string& measurement, cons
             //  - deserialized sketch: a sketch persisted below the threshold
             //    by an older version stopped receiving ids when the threshold
             //    was introduced; merging the bitmap back-fills the frozen gap.
-            // The bitmap is RE-LOOKED-UP here, after the kvGet suspension —
-            // the caller's pointer would have dangled across it (robin_map
-            // rehash/trim).
-            const roaring::Roaring* seedBitmap = nullptr;
+            // The seed is taken BY VALUE, and that is the whole point.
+            //
+            // This used to hold a `const roaring::Roaring*` into bitmapCache_ across a
+            // `co_await getPostingsBitmapByKey(...)` and then iterate it, on the argument
+            // that "the seed loop below does not suspend". That argument is exactly the
+            // one write-scaleout 4d disproved: the pointer is computed INSIDE a coroutine
+            // that suspended, so the loop runs in a DIFFERENT reactor task than the
+            // `co_return` that produced it, and any other insert on this shard can rehash
+            // bitmapCache_ (open addressing, Roaring by value -- every bitmap moves) or
+            // flush+trim the entry in between.
+            //
+            // It is the worse instance of the two, because getPostingsBitmapByKey's
+            // cold-load branch inserts the entry with `dirty = false`, i.e. IMMEDIATELY
+            // trim-eligible; and it sits on the hot write path (getOrCreateSeriesId ->
+            // updateTagHLL) under exactly the memory pressure the production crash needed.
+            //
+            // The copy is a one-time cost: this branch runs only when a tag value first
+            // crosses kTagHllMinCardinality, or when an old sub-threshold sketch is
+            // back-filled. Correctness beats a few KB there.
+            roaring::Roaring seed;
+            bool haveSeed = false;
             auto bmIt = bitmapCache_.find(seedBitmapKey);
             if (bmIt != bitmapCache_.end()) {
-                seedBitmap = &bmIt.value().bitmap;
+                seed = bmIt.value().bitmap;  // no suspension since the find
+                haveSeed = true;
             } else {
-                // Evicted during the suspension (possible only if a flush
-                // cleared its dirty flag and a trim ran). Reload read-only;
-                // the returned pointer is valid until the next suspension,
-                // and the seed loop below does not suspend.
-                seedBitmap = co_await getPostingsBitmapByKey(seedBitmapKey);
+                // Evicted during the suspension (a flush cleared its dirty flag and a trim
+                // ran). Reload it -- for its SIDE EFFECT of repopulating bitmapCache_ --
+                // and then RE-FIND by key. The returned pointer is deliberately discarded
+                // and never dereferenced: it belongs to the task that produced it.
+                (void)co_await getPostingsBitmapByKey(seedBitmapKey);
                 // Re-find the sketch after suspending again.
                 it = hllCache_.find(key);
                 if (it == hllCache_.end()) {
                     it = hllCache_.try_emplace(key).first;
                 }
+                auto reIt = bitmapCache_.find(seedBitmapKey);
+                if (reIt != bitmapCache_.end()) {
+                    seed = reIt.value().bitmap;
+                    haveSeed = true;
+                }
+                // Still absent means it was evicted AGAIN in that window, or the key has
+                // no postings on disk. Skip seeding, exactly as the old null-pointer path
+                // did: an unseeded sketch under-reports until the next add, which is a
+                // recoverable estimate error, not memory corruption.
             }
-            if (seedBitmap != nullptr) {
-                for (uint32_t existingId : *seedBitmap) {
+            if (haveSeed) {
+                for (uint32_t existingId : seed) {
                     it.value().add(existingId);
                 }
             }

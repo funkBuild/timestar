@@ -209,7 +209,7 @@ seastar::future<> ClusterDataPlane::start(const ClusterConfig& cfg, seastar::sha
 // invisible: both loops only warn.
 //
 // One resolution, one registration of every plane, all-or-nothing per peer.
-seastar::future<bool> ClusterDataPlane::registerPeer(NodeId id, const std::string& addr, bool replicated) {
+seastar::future<bool> ClusterDataPlane::registerPeer(NodeId id, std::string addr, bool replicated) {
     const HostPort hp = parseHostPort(addr);
     std::optional<seastar::net::inet_address> a;
     try {
@@ -245,6 +245,26 @@ seastar::future<> ClusterDataPlane::registerAllPeers(bool replicated) {
     co_return;
 }
 
+// One pass of the re-resolution loop. A NAMED MEMBER COROUTINE, deliberately -- see
+// startPeerResolver.
+seastar::future<> ClusterDataPlane::resolvePendingPeers(bool replicated) {
+    // Iterate a COPY. The pass suspends in DNS on every entry, and `unresolvedPeers_` is a
+    // member that this same pass rewrites at the end; iterating it directly would hold an
+    // iterator (and a reference to its key/value) across those suspensions.
+    std::map<NodeId, std::string> pending = unresolvedPeers_;
+    std::map<NodeId, std::string> still;
+    for (const auto& [id, addr] : pending) {
+        if (!co_await registerPeer(id, addr, replicated))
+            still[id] = addr;
+        else
+            timestar::http_log.info("cluster: peer {} ({}) resolved and registered on retry", id, addr);
+    }
+    unresolvedPeers_ = std::move(still);
+    if (unresolvedPeers_.empty())
+        peerResolveTimer_.cancel();
+    co_return;
+}
+
 void ClusterDataPlane::startPeerResolver(bool replicated) {
     // Resolution is BEST-EFFORT at startup -- a peer that is not yet up during a rolling
     // start must not fail THIS node's boot. But "best effort, once, forever" is what made
@@ -254,23 +274,28 @@ void ClusterDataPlane::startPeerResolver(bool replicated) {
     static constexpr auto kInterval = std::chrono::seconds(5);
     peerResolveTimer_.set_callback([this, replicated] {
         if (peerResolveRunning_ || peerResolveGate_.is_closed())
-            return;
+            return;  // never overlap passes
         peerResolveRunning_ = true;
-        (void)seastar::with_gate(peerResolveGate_, [this, replicated]() -> seastar::future<> {
-            // `unresolvedPeers_` is a member, so nothing from this lambda's frame is
-            // borrowed across the suspensions below.
-            std::map<NodeId, std::string> still;
-            for (const auto& [id, addr] : unresolvedPeers_) {
-                if (!co_await registerPeer(id, addr, replicated))
-                    still[id] = addr;
-                else
-                    timestar::http_log.info("cluster: peer {} ({}) resolved and registered on retry", id, addr);
-            }
-            unresolvedPeers_ = std::move(still);
-            if (unresolvedPeers_.empty())
-                peerResolveTimer_.cancel();
-            co_return;
-        }).finally([this] { peerResolveRunning_ = false; });
+        // NOT a coroutine lambda -- the same rule startLeadershipBalancer obeys, and for
+        // the same reason. `with_gate` invokes a TEMPORARY closure; a lambda-coroutine
+        // keeps its captures in the CLOSURE OBJECT, which dies at the end of the full
+        // expression while the coroutine is still suspended in DNS (and it is ALWAYS
+        // suspended -- unresolvedPeers_ holds hostnames precisely because they did not
+        // resolve). On resume it would read `this` and `replicated` from freed stack.
+        // At RF=1 a garbage `replicated` reading true is worse than a crash: it dispatches
+        // invoke_on_all into a sharded<ShardRaftPlane> that was never started.
+        //
+        // A named member coroutine keeps its captures in its own frame, which the gate
+        // holds alive; the closure below is a plain lambda that only launches it.
+        (void)seastar::with_gate(peerResolveGate_, [this, replicated] {
+            return resolvePendingPeers(replicated).then_wrapped([this](seastar::future<> f) {
+                // Consume the result: a DNS failure inside the pass is expected (that is
+                // what the retry is for) and must not surface as an ignored exceptional
+                // future. Leaving the flag set would also silently kill the loop.
+                f.ignore_ready_future();
+                peerResolveRunning_ = false;
+            });
+        });
     });
     peerResolveTimer_.arm_periodic(kInterval);
 }
