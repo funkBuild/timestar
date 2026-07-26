@@ -251,8 +251,7 @@ public:
     // Rebalance leadership among THIS shard's groups. Because assignCore spreads
     // VShards evenly over shards and every shard sees the same node set, balancing
     // each shard's slice independently balances the cluster as a whole.
-    seastar::future<size_t> rebalance(size_t maxTransfers, data::NodeId self,
-                                      std::vector<data::NodeId> peers) {
+    seastar::future<size_t> rebalance(size_t maxTransfers, data::NodeId self, std::vector<data::NodeId> peers) {
         if (!plane_ || maxTransfers == 0 || peers.empty())
             co_return 0;
         auto& host = plane_->host();
@@ -301,6 +300,26 @@ public:
             raft::RaftGroup* g = host.group(vs);
             if (!g || !g->isLeader())
                 continue;
+            // NEVER hand leadership to a peer that is not CAUGHT UP on this group.
+            //
+            // A leader with a transfer in flight refuses every proposal until the
+            // transferee acks up to lastIndex, so targeting a peer that cannot ack costs
+            // the group its write availability for the whole transfer window. And a DEAD
+            // peer is the MOST attractive target this loop has: it leads nothing, so its
+            // deficit is the largest on every pass. Measured on the restart-catch-up
+            // gate: with one of three nodes down, ~26% of writes failed with
+            // "1 VShard slice(s) uncommitted ... (last: not-leader)" for as long as it
+            // stayed down, against a perfectly healthy 2-of-3 quorum.
+            //
+            // RaftNode::tick now abandons a transfer after one election timeout, so this
+            // is no longer unbounded -- but a bounded write outage repeated every
+            // balancer pass is still an outage, and a caught-up target is also the only
+            // one that transfers IMMEDIATELY (transferLeadership sends TimeoutNow at
+            // once rather than waiting on a catch-up round trip).
+            if (g->matchIndexOf(target) < g->node().log().lastIndex()) {
+                ++ti;
+                continue;
+            }
             try {
                 co_await g->transferLeadership(target);
                 --deficit;

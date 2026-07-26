@@ -526,6 +526,7 @@ void RaftNode::transferLeadership(NodeId target) {
     if (role_ != Role::Leader || target == id_ || !isVoter(target))
         return;
     leadTransferee_ = target;
+    transferElapsed_ = 0;
     if (matchIndex_[target] == log_.lastIndex())
         sendTimeoutNow(target);  // already caught up: elect now
     else
@@ -546,6 +547,27 @@ void RaftNode::checkQuorumOrStepDown() {
 
 void RaftNode::tick() {
     if (role_ == Role::Leader) {
+        // ABANDON A STUCK LEADER TRANSFER (§3.10). While `leadTransferee_` is set the
+        // leader refuses EVERY proposal (see propose()), which is correct for a handoff
+        // that is about to complete and catastrophic for one that never will: a transfer
+        // to a peer that is down leaves matchIndex frozen below lastIndex, so the
+        // TimeoutNow in handleAppendEntriesReply never fires, `leadTransferee_` is never
+        // cleared, and the group refuses writes FOREVER while remaining leader (so no
+        // election ever rescues it either).
+        //
+        // That is reachable in production without any operator action: the leadership
+        // balancer picks the peer with the largest deficit, and a DEAD peer leads
+        // nothing, so it is the most attractive target on every pass. Observed on the
+        // restart-catch-up gate as a sustained ~26% of writes failing with
+        // "1 VShard slice(s) uncommitted after 6 attempt(s) (last: not-leader)" for as
+        // long as one of three nodes was down -- with a healthy 2-of-3 quorum available.
+        //
+        // etcd bounds it the same way: one election timeout, then give up and resume
+        // accepting writes. The transfer is merely not completed; nothing is unsafe.
+        if (leadTransferee_ != kNoNode && ++transferElapsed_ >= electionTimeout_) {
+            leadTransferee_ = kNoNode;
+            transferElapsed_ = 0;
+        }
         if (++heartbeatElapsed_ >= opts_.heartbeatTimeout) {
             heartbeatElapsed_ = 0;
             bcastAppend();  // heartbeat (an AppendEntries, possibly carrying entries)

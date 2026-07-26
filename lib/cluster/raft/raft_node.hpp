@@ -205,6 +205,11 @@ private:
     // CheckQuorum: voters we have heard from since the last quorum check.
     std::set<NodeId> recentActive_;
     NodeId leadTransferee_ = kNoNode;  // in-flight leader-transfer target (0 = none)
+    // Ticks since the in-flight transfer began. A transfer to a target that never
+    // finishes catching up must be ABANDONED (§3.10): while `leadTransferee_` is set the
+    // leader refuses every proposal, so a transfer to a DEAD peer wedges the group's
+    // writes permanently. See tick().
+    unsigned transferElapsed_ = 0;
 
     // ReadIndex tracking (leader).
     uint64_t readSeq_ = 0;  // monotonic heartbeat sequence for read confirmation
