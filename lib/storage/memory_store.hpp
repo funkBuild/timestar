@@ -10,6 +10,7 @@
 #include <tsl/robin_map.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -146,6 +147,10 @@ private:
     // at ~0.5 load factor) plus the two heap vector allocations.
     static constexpr size_t PER_SERIES_OVERHEAD_BYTES = 448;
 
+    // Presence bitmap over the 4096 virtual shards (debt D-35); see noteVShard().
+    // 64 words == 512 bytes, zero-initialised, never grows, never allocates.
+    std::array<uint64_t, 64> vshardBits_{};
+
 public:
     size_t getResidentBytesEstimate() const { return residentBytesEstimate; }
 
@@ -192,6 +197,40 @@ public:
     std::optional<uint64_t> reservedTsmSeq;
     // Use robin_map for O(1) lookups with better cache locality than std::unordered_map
     tsl::robin_map<SeriesId128, VariantInMemorySeries, SeriesId128::Hash> series;
+
+    // ---- which VShards this store holds data for (debt D-35) ----
+    //
+    // A presence BITMAP over the 4096 virtual shards -- 512 bytes per store, one bit
+    // set per insert (`hash & 4095`, a pure function of the series id). It exists to
+    // make the snapshot producer's "is this VShard's flushed data a contiguous prefix?"
+    // question answerable PER VSHARD instead of per shard.
+    //
+    // The old answer was `WALFileManager::hasPendingConversions()` -- "does ANY rolled
+    // store on this shard still await TSM conversion?" -- which is correct (see
+    // EngineLocalStore::hasUnconvertedStores) and blunt: under sustained load a shard
+    // may never have zero pending conversions, and then EVERY group on it keeps its
+    // whole Raft log forever. The precise condition is the one this bitmap answers:
+    // does any UNCONVERTED rolled store hold data for THIS VShard? If none does, then
+    // all of that VShard's rolled data is already in TSM and the only unflushed
+    // remainder is in the ACTIVE store, which by construction holds a contiguous
+    // SUFFIX of the VShard's revisions -- which is exactly what makes the manifest's
+    // max flushed revision a safe truncation boundary.
+    //
+    // Set on the ONE lowest-level insertion path (insertMemory), so WAL replay
+    // (initFromWAL -> WALReader::readAll -> insertMemory) populates it identically to
+    // a live write. A bitmap rather than a set because it must never allocate on the
+    // insert path and must be O(1) to probe from the snapshot sweep.
+    void noteVShard(uint16_t vshard) noexcept { vshardBits_[vshard >> 6] |= (uint64_t{1} << (vshard & 63)); }
+    [[nodiscard]] bool touchesVShard(uint16_t vshard) const noexcept {
+        return (vshardBits_[vshard >> 6] & (uint64_t{1} << (vshard & 63))) != 0;
+    }
+    // How many VShards this store has seen (diagnostics; O(64)).
+    [[nodiscard]] size_t vshardsTouched() const noexcept {
+        size_t n = 0;
+        for (uint64_t w : vshardBits_)
+            n += static_cast<size_t>(__builtin_popcountll(w));
+        return n;
+    }
 
     MemoryStore(unsigned int _sequenceNumber) : sequenceNumber(_sequenceNumber) {
         timestar::memory_log.debug("Memory store {} created", sequenceNumber);

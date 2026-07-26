@@ -365,6 +365,13 @@ public:
     // complete out of order), and re-spelling it as `count > 1` elsewhere invites the two
     // to drift the moment `memoryStores`' shape changes.
     bool hasPendingWalConversions() const { return walFileManager.hasPendingConversions(); }
+    // The per-VShard refinement of the same predicate (debt D-35): does an unconverted
+    // rolled store hold data for THIS VShard? See
+    // WALFileManager::hasPendingConversionsForVShard for why the per-shard answer above
+    // is safe but blunt, and why narrowing it preserves the safety argument verbatim.
+    bool hasPendingWalConversionsForVShard(uint16_t vshard) const {
+        return walFileManager.hasPendingConversionsForVShard(vshard);
+    }
 
     // Read-only view of compaction placement. Exposed so tests can assert that
     // background work actually landed in its scheduling group -- the original

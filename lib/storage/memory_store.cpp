@@ -1,5 +1,6 @@
 #include "memory_store.hpp"
 
+#include "../core/placement_table.hpp"  // timestar::virtualShard (debt D-35)
 #include "logger.hpp"
 #include "logging_config.hpp"
 #include "simd_aggregator.hpp"
@@ -475,6 +476,13 @@ template <class T>
 void MemoryStore::insertMemory(TimeStarInsert<T>&& insertRequest) {
     // In-memory insert
     SeriesId128 seriesId = insertRequest.seriesId128();
+
+    // Record which VShard this store now holds data for (debt D-35). One hash
+    // (already computed and cached on the insert), a mask and an OR -- and it is
+    // what lets the snapshot producer ask "is THIS VShard's rolled data all in
+    // TSM?" instead of "is EVERY VShard's rolled data all in TSM?". Placed on the
+    // single lowest-level insertion path so WAL replay populates it identically.
+    noteVShard(timestar::virtualShard(seriesId));
 
     // Account resident cost BEFORE inserting. Point cost is the real in-memory
     // width (timestamp + value, plus the payload for strings), not the compressed

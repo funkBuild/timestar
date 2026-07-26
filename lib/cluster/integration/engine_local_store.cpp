@@ -32,11 +32,19 @@ seastar::future<data::SnapshotPayload> EngineLocalStore::buildVShardSnapshot(VSh
 
 seastar::future<bool> EngineLocalStore::hasUnconvertedStores(VShardId vshard) {
     const unsigned core = timestar::assignCore(vshard, seastar::smp::count);
-    // ONE predicate, one spelling (review F7): `WALFileManager::hasPendingConversions` is
-    // the authority on "a rolled store has not reached TSM yet", and re-deriving it from
-    // the retained count here would drift the moment that vector's shape changes. See the
-    // header for why compaction must wait on it.
-    co_return co_await engines_.invoke_on(core, [](Engine& e) { return e.hasPendingWalConversions(); });
+    // ONE predicate, one spelling (review F7): `WALFileManager` is the authority on "a
+    // rolled store has not reached TSM yet", and re-deriving it from the retained count
+    // here would drift the moment that vector's shape changes. See the header for why
+    // compaction must wait on it.
+    //
+    // NARROWED TO THIS VSHARD (debt D-35). It used to ask the per-SHARD question -- "does
+    // ANY rolled store on this core still await conversion?" -- which is the same answer
+    // for all ~1365 groups on the core, so a shard under sustained ingest (never at zero
+    // pending conversions) let NONE of them compact. The bit probe below asks whether an
+    // unconverted store holds THIS VShard's data, which is the condition the safety
+    // argument actually needs; see WALFileManager::hasPendingConversionsForVShard.
+    const uint16_t vs = vshard.value();
+    co_return co_await engines_.invoke_on(core, [vs](Engine& e) { return e.hasPendingWalConversionsForVShard(vs); });
 }
 
 seastar::future<bool> EngineLocalStore::installVShardSnapshot(VShardId vshard, data::SnapshotPayload payload) {

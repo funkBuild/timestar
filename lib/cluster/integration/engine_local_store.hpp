@@ -44,8 +44,8 @@ public:
     // via schema broadcast, not the snapshot).
     seastar::future<data::SnapshotPayload> buildVShardSnapshot(VShardId vshard);
 
-    // Are there rolled-over memory stores on this VShard's core that have NOT yet been
-    // converted to TSM? (debt D-6.)
+    // Are there rolled-over memory stores holding THIS VSHARD's data that have NOT yet
+    // been converted to TSM? (debt D-6, narrowed from per-shard to per-VShard by D-35.)
     //
     // THE SNAPSHOT PRODUCER MUST NOT COMPACT WHILE THIS IS TRUE, and the reason is
     // measured rather than theoretical -- it cost the snapshot-durability gate 7 of 200
@@ -66,10 +66,23 @@ public:
     // revisions -- so the max flushed revision has every revision below it in TSM, which is
     // what makes it a boundary at all.
     //
-    // Conservative in the safe direction: under sustained write load a shard may rarely
-    // have zero pending conversions, and a group then keeps its log until it does. A larger
-    // log is a cost; a truncated log is data loss. Residual D-35 wants the precise
-    // per-VShard flushed watermark so compaction need not wait for a quiet moment.
+    // PER-VSHARD SINCE D-35, and the narrowing is what makes this usable under load. The
+    // predicate was originally per-SHARD ("does ANY rolled store still await conversion?"),
+    // which gave all ~1365 groups on a core the same answer: a shard under sustained ingest
+    // is never at zero pending conversions, so no group on it ever compacted and every one
+    // of them kept its whole log. Each MemoryStore now carries a 512-byte presence bitmap
+    // over the 4096 VShards (MemoryStore::noteVShard), so the question narrows to "does an
+    // unconverted rolled store hold data for THIS VShard?".
+    //
+    // The safety argument is unchanged, not weakened: if no unconverted rolled store holds
+    // VShard V, every rolled point of V is already in TSM and the only unflushed remainder
+    // of V lives in the ACTIVE store -- a contiguous suffix of V's revisions. That is
+    // exactly the property the max-flushed-revision boundary needs, and it never depended
+    // on the OTHER VShards' stores.
+    //
+    // Still conservative in the safe direction: a VShard whose own data is converting
+    // continuously keeps its log until a conversion lands. A larger log is a cost; a
+    // truncated log is data loss.
     seastar::future<bool> hasUnconvertedStores(VShardId vshard);
 
     // Install a received VShard snapshot (consumer side of the above). Same cohesion

@@ -80,6 +80,48 @@ public:
     // Drives compaction's WAL-first priority.
     bool hasPendingConversions() const { return memoryStores.size() > 1; }
 
+    // The same question, asked about ONE VShard (debt D-35): is there a rolled-over
+    // store still awaiting TSM conversion that holds data for `vshard`?
+    //
+    // `memoryStores[0]` is the ACTIVE store (rolloverMemoryStore inserts the fresh
+    // store at the front); every later element is a rolled store whose TSM file has
+    // not been registered yet -- conversion erases the store from this vector only
+    // AFTER `addTSMFile` (see convertWalToTsm), which is the same visibility ordering
+    // queries rely on. So the rolled set is exactly `[1, size)`, and the answer is a
+    // bit probe per element of a vector that is at most kIngestRejectMemoryStores (16)
+    // long.
+    //
+    // WHY THIS IS THE RIGHT REFINEMENT, not merely a cheaper one. The blunt predicate
+    // above is a per-SHARD stand-in for a per-VSHARD condition: it refuses to let ANY
+    // group compact while ANY store is converting, so a shard under sustained ingest
+    // (which is never at zero pending conversions) keeps every one of its ~1365 groups'
+    // Raft logs in full. Restricting the question to the stores that actually hold the
+    // VShard's data preserves the safety argument exactly -- if no unconverted rolled
+    // store holds VShard V, then every rolled point of V is in TSM and the only
+    // unflushed remainder of V is in the active store, i.e. a contiguous SUFFIX of V's
+    // revisions -- while letting the other 1364 groups compact.
+    //
+    // INHERITED HOLE, unchanged and called out so it is not mistaken for a new one:
+    // a store whose conversion fails twice is ERASED from this vector with its data
+    // still only in its WAL file on disk. Both predicates then read "nothing pending"
+    // for it. That is pre-existing (hasPendingConversions has always had it) and is
+    // tracked with the conversion-failure path, not here.
+    bool hasPendingConversionsForVShard(uint16_t vshard) const {
+        return pendingConversionForVShard(memoryStores, vshard);
+    }
+
+    // The rule above as a pure function of the store list, so it can be tested against a
+    // hand-built (active, rolled...) vector rather than only through a live shard whose
+    // background conversions finish when they please.
+    static bool pendingConversionForVShard(const std::vector<seastar::shared_ptr<MemoryStore>>& stores,
+                                           uint16_t vshard) {
+        for (size_t i = 1; i < stores.size(); ++i) {  // [0] is the ACTIVE store
+            if (stores[i] && stores[i]->touchesVShard(vshard))
+                return true;
+        }
+        return false;
+    }
+
     // True once the retained-store backlog reaches the rejection ceiling.
     // Consulted at the request edge to shed load without blocking.
     bool isIngestBacklogged() const { return memoryStores.size() >= kIngestRejectMemoryStores; }
