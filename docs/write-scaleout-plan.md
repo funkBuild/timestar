@@ -1,6 +1,20 @@
 # Cluster Write Scale-Out Plan
 
-Status: Phases 1, 2, 3 and 4 IMPLEMENTED (Phase 4: 2026-07-26); Phases 5-6 planned.
+Status: Phases 1, 2, 3, 4 and 5 IMPLEMENTED (Phase 5: 2026-07-26); Phase 6 planned.
+
+Phase 5 result: **the consensus layer is not the limiter either, and this phase measured
+that rather than assuming it.** Re-profiling first (5-pre) found the cluster still ~80 %
+CPU-idle at peak with commit latency dominated by the quorum round trip, and the Raft
+message rate IDENTICAL idle and under saturation -- so nothing in the phase could have
+moved throughput, and nothing did (median 5.16 M pts/s, against a pre-Phase-5 binary
+re-benched in the same session at 5.16 M). What the phase delivered is correctness:
+the read-side bitmap-cache use-after-free is closed structurally (5.1), catch-up appends
+are bounded so the Raft admission bound could drop 1 GiB -> 128 MiB (5.4), and a leader
+transfer aimed at a dead peer -- which made a group refuse writes FOREVER -- is now
+abandoned. 5a shipped as opt-in AFTER a same-session A/B showed it cost ~5 % of
+throughput and nearly doubled idle CPU to buy a frame-rate reduction nothing needed; 5b
+was NOT implemented because its premise (a shared per-shard journal writer) does not hold
+in the current wiring. Two ADRs (0004, 0005) cover 5c and 5d.
 Branch `cluster-design`.
 
 Phase 4 result: **[D6] is closed on the measurement it was defined by.** The canonical
@@ -786,14 +800,36 @@ task-queue round (`seastar::yield()`), which is the natural window: a shard's ti
 ~1000 groups in one go. Bounded at 256 KB / 512 envelopes; the added delay is one
 task-queue round.
 
-**MEASURED: idle frames/s per shard 2724 -> ~700 (envelopes per frame 1.00 -> 3.9, and
-12-66 on shards whose peers hibernate in step); under sustained load ~650-720 frames/s at
-2450-2790 envelopes/s.** Throughput unchanged (5.13 M median vs 5.17 M, inside a
-4.95-5.33 M spread), as 5-pre predicted. Per-node CPU under sustained load 10.18/9.05/
-9.04 core-s vs 10.20/9.24/9.20 before — slightly lower, within noise. Idle CPU measured
-slightly HIGHER (10.9 core-s/60 s vs 9.1-9.7 before, i.e. 5 % vs 4 % of 4 cores);
-recorded rather than explained, because at that level the buffering work and ambient
-noise are the same size.
+**It works, and it is DEFAULT OFF, because it cost more than it saved.** Batching does
+what 5a claimed: idle frames/s per shard 2724 -> ~700 (envelopes per frame 1.00 -> 3.9,
+and 12-85 on shards whose peers hibernate in step). But frame count is not a resource
+under pressure here, and the per-message buffering that buys it is. A/B on the SAME BOX,
+back to back, four canonical runs each:
+
+| binary                          | idle CPU / node | canonical median |
+|---------------------------------|-----------------|------------------|
+| pre-Phase-5 (`c052253`)         | 4 %             | 5.16 M pts/s     |
+| Phase 5, batching ON            | 7-8 %           | 4.90 M pts/s     |
+| Phase 5, batching OFF (default) | 4 %             | 5.16 M pts/s     |
+
+A buffer insert, a gate hold and a `yield()`-scheduled flush task per round, at ~2724
+messages/s/shard, nearly DOUBLED idle CPU and cost 5 % of throughput. Turning the default
+off restores the baseline exactly, on both numbers.
+
+**How this was nearly missed, which is the transferable part.** The first reading of 5a
+was "flat within noise" (5.13 M median vs 5.17 M) — and it was taken hours after its
+baseline, during which the box drifted (idle CPU on an UNCHANGING idle cluster read 4 %,
+then 5 %, then 7 %, then 8 % across the session). Throughput alone could not resolve a
+5 % effect against that drift. **Idle CPU with a fixed idle workload is the sensitive
+instrument on this box, and a same-session A/B against the previous binary is the only
+way to read it.** Any future phase measuring a few-percent effect should re-bench the
+baseline binary in the same session, not compare against a recorded number.
+
+OFF means the pre-5a path EXACTLY — `send()` dispatches immediately, no buffer, no
+deferred flush — so the default costs nothing rather than costing a disabled feature's
+bookkeeping. The capability verb, wire format, fail-closed probe and all three socket
+tests stay; `TIMESTAR_RAFT_BATCH_SENDS=1` turns it on for a deployment where the frame
+rate IS the binding cost (many more peers, or a syscall-bound node).
 
 **Mixed versions.** The Raft transport has no negotiation — one deliver verb was the
 entire protocol — and seastar answers an unknown verb with a reply a `no_wait` sender
@@ -940,8 +976,25 @@ restart-catch-up gate. Unchanged from the Phase-4 debt entry.
 #### Phase 5 gate outcomes (2026-07-26)
 
 - **Suites: 4103 unit tests / 419 suites green** (from 4097/417: +3 chunked-catch-up,
-  +3 transfer-abort, -3 replaced structural assertions), **33 socket tests green** (from
-  30: +3 transport batching/legacy-peer).
+  +3 transfer-abort), **33 socket tests green** (from 30: +3 transport
+  batching/legacy-peer).
+- **All five live gates green on the final binary**, each run in ISOLATION:
+  `fault_injection` (146 reset rounds destroying 398 peer connections -> 2000/2000 +
+  200/200, 0 errors, 93 % of the proxied baseline, all 200 probe points readable on every
+  node -- against Phase 4's 147/392 and 94 %), `rolling_rebalance` (2216 transfers
+  mid-bench, 600/600 OK, 4.87 M pts/s, converged to fair share), `deposed_primary`
+  (18088 transfers, 300/300 accepted, 0 5xx, 0 500s), `backpressure` (200/200 rejected
+  with the artificial budget named, then 200/200 OK at 5.04 M on the default budget), and
+  the new `restart_catchup`.
+
+  **MEASUREMENT HAZARD, second instance.** Run back-to-back as a battery, the fault gate
+  FAILED (929/2000 errors, 8 % of baseline throughput, 794 reset rounds) purely because
+  free space had fallen 39 G -> 13 G across the preceding gates. Re-run alone with space
+  free it passes with 153 rounds and zero errors. The failure mode is self-amplifying and
+  therefore very convincing: less headroom -> slower bench -> the 0.3 s resetter fires
+  more rounds -> slower still. The Phase-4 note about `Disk quota exceeded` covers the
+  quota-fence case; this is the same hazard SHORT of a fence. Run these gates one at a
+  time, with the previous run's data dirs deleted.
 - **Restart catch-up (new gate, `test/cluster_gates/restart_catchup_gate.sh`):** node 3
   down through 4 M points, then restarted -> caught up on 100 % of the VShards its peers
   lead (on every one of five runs), the probe point readable ON THE RESTARTED NODE, zero
@@ -950,10 +1003,19 @@ restart-catch-up gate. Unchanged from the Phase-4 debt entry.
   the old 1 GiB bound — so it is a REGRESSION FENCE on the 8x-tightened bound, not a
   demonstration that chunking was required at this scale. It is also what found the
   stuck-transfer defect and the pre-existing coordinator-side 503s above.
-- Canonical bench across the phase, three accepted runs each (0 HTTP errors, 0 server 500s,
-  0 quota fences every time): baseline 5.06/5.18/5.33 M -> after 5.1 4.99/5.17/5.33 M ->
-  after 5a 4.95/5.13/5.28 M. Median 5.18 -> 5.17 -> 5.13 M, p50 ~84-94 ms. Flat, which is
-  the correct outcome for a phase that removed work from a system that is not CPU-bound.
+- **Canonical bench, FINAL binary, four accepted runs** (0 HTTP errors, 0 server-side
+  500s, 0 quota fences on every run): **5.02 / 5.08 / 5.30 / 5.24 M pts/s, median
+  5.16 M**, p50 83-96 ms, idle CPU 4 % per node. The pre-Phase-5 binary re-benched in the
+  SAME session: 4.85 / 5.04 / 5.35 / 5.28 M, **median 5.16 M**, idle CPU 4 % per node.
+  **Phase 5 is throughput-neutral, measured against a same-session baseline rather than a
+  recorded one** — which is the only way this was resolvable, see 5a above.
+- **kill -9 of the whole cluster:** 200/200 acked points readable on every node after
+  restart, 0 journal quota fences.
+- Intermediate readings, kept because the drift is the lesson: baseline 5.06/5.18/5.33 M
+  -> after 5.1 4.99/5.17/5.33 M -> after 5a (batching ON) 4.95/5.13/5.28 M and later
+  4.65-5.00 M. Those were taken hours apart from their baselines and are NOT comparable
+  across rows; the idle-CPU column is what exposed that (4 % -> 8 % on an unchanging idle
+  cluster).
 
 ### Phase 6 — Acceptance
 

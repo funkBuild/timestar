@@ -15,6 +15,18 @@ not probes, so they can be run from CI or a release checklist.
 All of them take an optional server binary as `$1` (default
 `build/bin/timestar_http_server`), so a "before" binary can be measured the same way.
 
+## Run them ONE AT A TIME, with the previous run's data dirs deleted
+
+These gates are disk-hungry (the plan doc's MEASUREMENT HAZARD covers the quota-fence
+case). Run back-to-back as a battery, `fault_injection_gate.sh` FAILED -- 929/2000 client
+errors, 8% of baseline throughput, 794 reset rounds -- purely because free space had
+fallen 39 G to 13 G across the preceding gates. Run alone with space free, the same binary
+passes with 146 rounds and zero errors.
+
+The failure mode is self-amplifying, which makes it very convincing as a "regression":
+less headroom -> slower bench -> the 0.3 s resetter fires more rounds -> slower still. If
+a gate fails, re-run it ALONE before believing it.
+
 `restart_catchup_gate.sh` is a REGRESSION FENCE, and it says so in its own header: the
 pre-5.4 binary passes it, because at 400 batches the log tail still fits under the old
 1 GiB admission bound. What it fences is the 8x-tightened 128 MiB bound. Its client-error
