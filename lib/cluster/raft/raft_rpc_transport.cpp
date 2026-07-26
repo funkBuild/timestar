@@ -4,6 +4,7 @@
 #include "../reconnect_policy.hpp"
 #include "raft_codec.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -11,10 +12,12 @@
 #include <map>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/gate.hh>
+#include <seastar/core/loop.hh>
 #include <seastar/core/lowres_clock.hh>
 #include <seastar/core/sstring.hh>
 #include <seastar/rpc/rpc.hh>
 #include <seastar/util/later.hh>
+#include <utility>
 #include <vector>
 
 namespace timestar::raft {
@@ -84,6 +87,22 @@ constexpr uint32_t kCapBatchedDeliver = 1u << 0;
 // unusual amount (e.g. a catch-up burst) so a frame never approaches the rpc frame limit.
 constexpr size_t kMaxBatchBytes = 256 * 1024;
 constexpr size_t kMaxBatchEnvelopes = 512;
+
+// One envelope inside a received batch frame: where its bytes are (into the frame,
+// which outlives the handler's awaits) and which group they address.
+struct BatchRecord {
+    const char* bytes;
+    uint32_t len;
+    uint16_t gid;
+};
+
+// How many per-group delivery chains a single batch frame may have in flight (debt
+// D-15). Chains fan out to at most `smp::count` distinct shards, so the ceiling that
+// buys anything is the shard count -- 16 covers every box this runs on while keeping
+// the peak cross-shard tasks a single frame can spawn a fixed, small number rather
+// than kMaxBatchEnvelopes. Beyond the shard count the extra concurrency only pipelines
+// submit_to round trips into a shard that processes them serially anyway.
+constexpr size_t kMaxConcurrentDeliverChains = 16;
 
 // Inbound admission bound for this transport, and its SEND-SIDE MIRROR (write-scaleout
 // 5.4). They are one pair of constants on purpose: seastar answers an over-limit `no_wait`
@@ -452,10 +471,31 @@ seastar::future<> RaftRpcTransport::start(seastar::socket_address local, Deliver
     // A malformed frame (truncated length, length past the end) STOPS at the bad record
     // and delivers everything before it. Raft re-sends what a peer did not acknowledge, so
     // dropping a suffix is safe; guessing at the rest is not.
+    //
+    // DISPATCH IS CONCURRENT ACROSS GROUPS AND SEQUENTIAL WITHIN ONE (debt D-15). The
+    // first version of this handler `co_await`ed every envelope in turn, so a full frame
+    // was up to kMaxBatchEnvelopes SEQUENTIAL cross-shard hops inside one handler --
+    // each one a submit_to round trip whose latency the next envelope paid for. That is
+    // the opposite of what batching is for, and a plausible share of the measured
+    // batching-ON regression that shipped this feature default-off.
+    //
+    // ORDERING IS THE CONSTRAINT, and it is per GROUP, not per frame. Raft messages
+    // within a group are order-sensitive (an AppendEntries and the heartbeat behind it
+    // must not swap); messages for DIFFERENT groups are wholly independent -- they land
+    // in different RaftNodes, often on different shards. So the frame is partitioned
+    // into one chain per group id, each chain delivered strictly in frame order, and the
+    // chains run concurrently under a bound. Since group -> shard is a function, a
+    // per-group partition is a refinement of a per-shard one: no two chains can
+    // interleave deliveries into the same node.
     impl_->proto.register_handler(
         kDeliverBatchVerb, [this](seastar::sstring data) -> seastar::future<seastar::rpc::no_wait_type> {
             ++impl_->stats.framesRecv;
             impl_->maybeReport();
+
+            // Pass 1: walk the frame once, recording each envelope's extent. Pointers
+            // are into `data`, which lives in this coroutine's frame and outlives every
+            // await below.
+            std::vector<BatchRecord> recs;
             size_t off = 0;
             while (off + sizeof(uint32_t) <= data.size()) {
                 uint32_t n = 0;
@@ -468,17 +508,50 @@ seastar::future<> RaftRpcTransport::start(seastar::socket_address local, Deliver
                 ++impl_->stats.envelopesRecv;
                 if (n < 2)
                     continue;
-                if (impl_->onDeliverRaw) {
-                    const uint16_t gid = static_cast<uint16_t>(static_cast<unsigned char>(bytes[0])) |
-                                         static_cast<uint16_t>(static_cast<unsigned char>(bytes[1]) << 8);
-                    // `data` outlives every await here, so the pointer stays valid.
-                    co_await impl_->onDeliverRaw(gid, bytes, n);
-                } else {
-                    auto env = decodeEnvelope(std::string(bytes, n));
+                const uint16_t gid = static_cast<uint16_t>(static_cast<unsigned char>(bytes[0])) |
+                                     static_cast<uint16_t>(static_cast<unsigned char>(bytes[1]) << 8);
+                recs.push_back(BatchRecord{bytes, n, gid});
+            }
+            if (recs.empty())
+                co_return seastar::rpc::no_wait;
+
+            // The decode-here fallback (no raw hook installed) stays SEQUENTIAL. It does
+            // no cross-shard hop -- it decodes and delivers on this shard -- so there is
+            // no round-trip latency to hide, and keeping it serial keeps whole-frame
+            // order for the callers that rely on it.
+            if (!impl_->onDeliverRaw) {
+                for (const auto& r : recs) {
+                    auto env = decodeEnvelope(std::string(r.bytes, r.len));
                     if (env && impl_->onDeliver)
                         co_await impl_->onDeliver(std::move(*env));
                 }
+                co_return seastar::rpc::no_wait;
             }
+
+            // Pass 2: partition into per-group chains. A STABLE sort by group id makes
+            // each group's records contiguous while preserving their frame order within
+            // the group -- which is exactly the ordering guarantee owed. O(E log E) on at
+            // most kMaxBatchEnvelopes records; a linear group-map probe would be O(E^2)
+            // on the common frame where nearly every envelope is a different group.
+            std::stable_sort(recs.begin(), recs.end(),
+                             [](const BatchRecord& a, const BatchRecord& b) { return a.gid < b.gid; });
+            std::vector<std::pair<size_t, size_t>> chains;  // [begin, end) runs of one gid
+            for (size_t i = 0; i < recs.size();) {
+                size_t j = i + 1;
+                while (j < recs.size() && recs[j].gid == recs[i].gid)
+                    ++j;
+                chains.emplace_back(i, j);
+                i = j;
+            }
+
+            // `recs` and `chains` are frame locals and the loop is awaited, so both
+            // outlive every reference the chain bodies take.
+            co_await seastar::max_concurrent_for_each(
+                chains, kMaxConcurrentDeliverChains,
+                [this, &recs](const std::pair<size_t, size_t>& run) -> seastar::future<> {
+                    for (size_t i = run.first; i < run.second; ++i)
+                        co_await impl_->onDeliverRaw(recs[i].gid, recs[i].bytes, recs[i].len);
+                });
             co_return seastar::rpc::no_wait;
         });
     // The capability probe. Stateless and constant, so it does not matter which shard's

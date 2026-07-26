@@ -216,6 +216,112 @@ seastar::future<> testBatchedDelivery(bool batchingEnabled) {
     co_await receiver->stop();
 }
 
+// --- debt D-15: how a batch frame's envelopes are DISPATCHED --------------------------
+//
+// The receive handler used to `co_await` every envelope in a frame in turn -- up to 512
+// SEQUENTIAL cross-shard hops in one handler, each paying the previous one's round trip.
+// It now runs one chain per group id, concurrently under a bound.
+//
+// TWO PROPERTIES, and they pull against each other, which is why both are pinned here:
+//
+//   1. SAME-GROUP ORDER IS PRESERVED. Raft messages within a group are order-sensitive.
+//   2. DIFFERENT GROUPS PROGRESS CONCURRENTLY. A slow delivery for one group must not
+//      hold up the groups behind it in the same frame -- that is the whole defect.
+//
+// (2) is measured by making group 1's FIRST delivery block on a real sleep. Under the old
+// sequential handler nothing else in the frame could complete until it finished; the
+// assertion is that something does.
+seastar::future<> testBatchDispatchIsPerGroupOrderedAndCrossGroupConcurrent() {
+    auto sender = std::make_unique<RaftRpcTransport>();
+    auto receiver = std::make_unique<RaftRpcTransport>();
+
+    constexpr uint16_t kRxPort = 39164;
+    constexpr uint16_t kTxPort = 39165;
+    constexpr uint16_t kSlowGroup = 1;
+    constexpr int kGroups = 8;  // <= the handler's concurrency bound, so all chains start
+    constexpr int kPerGroup = 3;
+
+    // Per-group arrival order, and the global order in which deliveries COMPLETED.
+    std::map<uint16_t, std::vector<LogIndex>> perGroup;
+    std::vector<uint16_t> completionOrder;
+    size_t warmCount = 0;
+
+    co_await receiver->start(loopback(kRxPort), [](Envelope) { return seastar::make_ready_future<>(); });
+    receiver->setRawDeliver([&](uint16_t gid, const char* bytes, size_t len) -> seastar::future<> {
+        auto env = decodeEnvelope(std::string(bytes, len));
+        if (!env) {
+            EXPECT_TRUE(false) << "undecodable envelope in a batch frame";
+            co_return;
+        }
+        const auto* rv = std::get_if<RequestVote>(&env->message.payload);
+        if (!rv) {  // the warm-up TimeoutNow that opens the connection
+            ++warmCount;
+            co_return;
+        }
+        // Group 1's first message is SLOW. Everything else is immediate.
+        if (gid == kSlowGroup && rv->lastLogIndex == 1)
+            co_await seastar::sleep(40ms);
+        perGroup[gid].push_back(rv->lastLogIndex);
+        completionOrder.push_back(gid);
+        co_return;
+    });
+
+    co_await sender->start(loopback(kTxPort), [](Envelope) { return seastar::make_ready_future<>(); });
+    sender->setBatchingEnabled(true);
+    sender->addPeer(2, loopback(kRxPort));
+
+    // Open the connection and let the capability probe land: batching only engages once
+    // the peer has answered it.
+    Envelope warm;
+    warm.groupId = 0;
+    warm.message = Message{.to = 2, .from = 1, .payload = TimeoutNow{1, 1}};
+    co_await sender->send(warm);
+    co_await waitFor([&] { return warmCount > 0; });
+    const uint64_t framesBefore = receiver->stats().framesRecv;
+
+    // ONE reactor task: every send buffers into the same round, so the batcher flushes
+    // them as a single frame. The slow group goes FIRST -- under sequential dispatch it
+    // would gate every envelope behind it.
+    for (int i = 1; i <= kPerGroup; ++i) {
+        for (int g = kSlowGroup; g <= kGroups; ++g) {
+            Envelope env;
+            env.groupId = static_cast<uint16_t>(g);
+            env.message =
+                Message{.to = 2, .from = 1, .payload = RequestVote{false, 7, 1, static_cast<LogIndex>(i), 2}};
+            co_await sender->send(env);
+        }
+    }
+
+    const size_t expected = static_cast<size_t>(kGroups) * kPerGroup;
+    const bool all = co_await waitFor([&] { return completionOrder.size() >= expected; });
+    EXPECT_TRUE(all) << "delivered " << completionOrder.size() << " of " << expected;
+
+    // The properties below are about dispatch WITHIN one frame, so the burst has to have
+    // travelled as one.
+    EXPECT_EQ(receiver->stats().framesRecv - framesBefore, 1u)
+        << "the burst split across frames; the concurrency assertion would not be measuring this handler";
+
+    // (1) SAME-GROUP ORDER. Each group's three messages arrive 1, 2, 3 -- never resorted
+    // by the stable partition, never interleaved with themselves.
+    for (int g = kSlowGroup; g <= kGroups; ++g) {
+        const auto& seq = perGroup[static_cast<uint16_t>(g)];
+        EXPECT_EQ(seq.size(), static_cast<size_t>(kPerGroup)) << "group " << g;
+        for (size_t i = 0; i < seq.size(); ++i)
+            EXPECT_EQ(seq[i], static_cast<LogIndex>(i + 1)) << "group " << g << " message " << i << " out of order";
+    }
+
+    // (2) CROSS-GROUP CONCURRENCY. The slow group's first message was the first envelope
+    // in the frame; if any other group completed before it, the chains really did run
+    // side by side.
+    EXPECT_FALSE(completionOrder.empty());
+    if (!completionOrder.empty())
+        EXPECT_NE(completionOrder.front(), kSlowGroup)
+            << "the frame was dispatched sequentially: the 40ms group gated everything behind it";
+
+    co_await sender->stop();
+    co_await receiver->stop();
+}
+
 // A peer that speaks only the ORIGINAL protocol: one handler, kDeliverVerb, and nothing
 // else. This is the mixed-version case the capability probe exists for. seastar answers an
 // unknown verb with an unknown-verb reply that a no_wait sender IGNORES, so a sender that
@@ -293,6 +399,10 @@ TEST(RaftRpcTransportTest, ManyGroupMessagesToOnePeerShareFrames) {
 
 TEST(RaftRpcTransportTest, BatchingOffIsOneFramePerEnvelope) {
     testBatchedDelivery(/*batchingEnabled=*/false).get();
+}
+
+TEST(RaftRpcTransportTest, BatchDispatchKeepsGroupOrderAndRunsGroupsConcurrently) {
+    testBatchDispatchIsPerGroupOrderedAndCrossGroupConcurrent().get();
 }
 
 TEST(RaftRpcTransportTest, LegacyPeerNeverReceivesABatchFrame) {
