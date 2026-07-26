@@ -6,6 +6,7 @@
 #include <cstring>
 #include <map>
 #include <seastar/core/coroutine.hh>
+#include <stdexcept>
 
 namespace timestar::raft {
 
@@ -83,7 +84,19 @@ JournalRaftPersistence::JournalRaftPersistence(JournalWriter& writer, VShardId v
 JournalRaftPersistence::JournalRaftPersistence(JournalSink& sink, VShardId vshard, uint64_t startSeq)
     : sink_(sink), vshard_(vshard), nextSeq_(startSeq == 0 ? 1 : startSeq) {}
 
-uint64_t JournalRaftPersistence::releasedSeq() const {
+seastar::future<> JournalRaftPersistence::appendFenced(const JournalRecord& r) {
+    // A failed append means the bookkeeping above already counted a record that is not in
+    // the buffer, so no later sync may promote a sample derived from it. Freeze the floor
+    // (debt D-34); the writer fences itself for the durability half.
+    try {
+        co_await sink_.append(r);
+    } catch (...) {
+        fenced_ = true;
+        throw;
+    }
+}
+
+uint64_t JournalRaftPersistence::intendedFloor() const {
     // Nothing is releasable until a snapshot exists: without one the whole log is
     // live, and its very first record is the log's own beginning.
     if (lastSnapshotSeq_ == 0)
@@ -100,6 +113,9 @@ void JournalRaftPersistence::seedRetention(JournalRetentionSeed seed) {
     lastHardStateSeq_ = seed.latestHardStateSeq;
     lastSnapshotSeq_ = seed.latestSnapshotSeq;
     entrySeqs_.assign(seed.entrySeqs.begin(), seed.entrySeqs.end());
+    // Recovered records ARE durable -- they were read back off the disk -- so the seeded
+    // floor is immediately reportable, without waiting for this incarnation to sync.
+    durableFloor_ = std::max(durableFloor_, intendedFloor());
 }
 
 seastar::future<> JournalRaftPersistence::persistHardState(HardState hs) {
@@ -111,9 +127,15 @@ seastar::future<> JournalRaftPersistence::persistHardState(HardState hs) {
     r.raftTerm = hs.currentTerm;
     r.payload.reserve(8);
     putU64(r.payload, hs.votedFor);
-    return sink_.append(r);
+    co_await appendFenced(r);
 }
 
+// NOTE FOR A FUTURE EDITOR (debt D-34). `JournalRecordKind::Truncation` has NO producer
+// in this tree -- a suffix truncation is expressed as a RE-APPEND at the lower index, and
+// that is what the pop_back below mirrors. If anyone ever adds a real Truncation producer
+// it MUST also drop entrySeqs_ at/above the truncation index, exactly as recoverRaftState's
+// Truncation case erases `entrySeq`; forgetting to would leave dead records pinning the
+// floor (harmless) or, if the mirror drifted the other way, release live ones (not).
 seastar::future<> JournalRaftPersistence::persistEntries(std::vector<LogEntry> entries) {
     for (const auto& e : entries) {
         JournalRecord r;
@@ -129,7 +151,7 @@ seastar::future<> JournalRaftPersistence::persistEntries(std::vector<LogEntry> e
         while (!entrySeqs_.empty() && entrySeqs_.back().first >= e.index)
             entrySeqs_.pop_back();
         entrySeqs_.emplace_back(e.index, r.vshardSeq);
-        co_await sink_.append(r);
+        co_await appendFenced(r);
     }
 }
 
@@ -142,15 +164,34 @@ seastar::future<> JournalRaftPersistence::persistSnapshot(Snapshot snap, bool re
     r.raftTerm = snap.term;
     r.raftIndex = snap.index;
     // Entries at or below the boundary are compacted away, so their records stop
-    // pinning the reclaim floor (D-34). This is the ONLY thing that ever advances it.
+    // pinning the reclaim floor (D-34). This is what usually lets the INTENDED floor
+    // move; only a successful sync() promotes it into the reported one.
     while (!entrySeqs_.empty() && entrySeqs_.front().first <= snap.index)
         entrySeqs_.pop_front();
     r.payload = encodeSnapshotPayload(snap, receivedFromPeer);
-    return sink_.append(r);
+    co_await appendFenced(r);
 }
 
 seastar::future<> JournalRaftPersistence::sync() {
-    return sink_.sync();
+    // SAMPLE THE FLOOR BEFORE THE BARRIER, PROMOTE IT AFTER (debt D-34). At this point
+    // every append of this Ready has been awaited, so the records the sample depends on
+    // are already in the writer's buffer and barrier() -- a whole-buffer flush -- is
+    // guaranteed to cover them. Anything appended AFTER this line lands in a later
+    // sample, which is the conservative direction.
+    const uint64_t candidate = intendedFloor();
+    if (fenced_)
+        throw std::runtime_error("JournalRaftPersistence: journal fenced; the reclaim floor is frozen");
+    try {
+        co_await sink_.sync();
+    } catch (...) {
+        // The sync did NOT happen. Freeze the floor permanently rather than let a later
+        // success promote a sample that assumed these records landed. The writer fences
+        // itself too, so every subsequent append/sync throws anyway -- this makes the
+        // floor's own invariant independent of that.
+        fenced_ = true;
+        throw;
+    }
+    durableFloor_ = std::max(durableFloor_, candidate);
 }
 
 RecoveredRaftState recoverRaftState(const std::vector<JournalRecord>& records, VShardId vshard) {

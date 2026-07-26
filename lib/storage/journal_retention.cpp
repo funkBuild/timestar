@@ -1,12 +1,17 @@
 #include "journal_retention.hpp"
 
 #include <algorithm>
+#include <cstddef>
 
 namespace timestar {
 
 void JournalRetention::setReleased(VShardId vshard, uint64_t releasedSeq) {
     auto& current = released_[vshard.value()];
     current = std::max(current, releasedSeq);  // monotonic; ignore a regression
+}
+
+void JournalRetention::clearReleased(VShardId vshard) {
+    released_.erase(vshard.value());  // see the header: movement MUST call this on teardown
 }
 
 uint64_t JournalRetention::released(VShardId vshard) const {

@@ -206,7 +206,9 @@ seastar::future<> testDeleteOnlyPinsASegmentWithLiveRecords() {
     auto result = co_await JournalGc::collect(dir, active, w, ret, JournalGc::Options{.copyForward = false});
     EXPECT_TRUE(result.deletedSegments.empty()) << "a segment holding un-snapshotted state must survive";
     EXPECT_EQ(result.copiedRecords, 0u) << "delete-only must never write to the journal";
-    EXPECT_EQ(result.pinnedSegments.size(), before - 1);
+    // GC STOPS at the first segment it cannot reclaim rather than skipping ahead, so what
+    // survives is a physical suffix -- exactly ONE pin is reported, and it is the oldest.
+    EXPECT_EQ(result.pinnedSegments.size(), 1u);
     EXPECT_EQ(segmentFileCount(dir), before);
     co_await w.close();
 
@@ -271,7 +273,8 @@ seastar::future<> testCopyForwardRespectsItsBudget() {
                                               JournalGc::Options{.copyForward = true, .maxCopyForwardRecords = 0});
     EXPECT_EQ(result.copiedRecords, 0u);
     EXPECT_TRUE(result.deletedSegments.empty());
-    EXPECT_EQ(result.pinnedSegments.size(), before - 1);
+    EXPECT_EQ(result.pinnedSegments.size(), 1u) << "GC stops at the first over-budget segment";
+    EXPECT_EQ(segmentFileCount(dir), before);
     co_await w.close();
     fs::remove_all(dir);
 }
@@ -279,71 +282,12 @@ TEST(JournalGcTest, CopyForwardRespectsItsBudget) {
     testCopyForwardRespectsItsBudget().get();
 }
 
-// CRASH BETWEEN THE COPY-FORWARD BARRIER AND THE UNLINK. That window is not avoidable --
-// two files cannot be made durable and removed atomically -- so the design pays for it
-// with a byte-identical DUPLICATE and requires recovery to absorb one. Modelled by taking
-// the segment's bytes before the collect and putting the file back afterwards, which is
-// exactly the on-disk state a kill -9 in that window leaves.
-seastar::future<> testCrashBetweenTheCopyBarrierAndTheUnlinkRecovers() {
-    const auto dir = tmpDir("crashgc");
-    JournalWriter w(dir, header(), kSmallSegBytes);
-    co_await w.open();
-    for (uint64_t s = 1; s <= 6; ++s) {
-        co_await w.append(rec(1, s, "vs1"));
-        co_await w.append(rec(2, s, "vs2-live"));
-    }
-    co_await w.barrier();
-    const uint64_t active = w.currentSegmentNumber();
-
-    // Snapshot every sealed segment's bytes: these are the files GC is about to remove.
-    std::vector<std::pair<fs::path, std::string>> saved;
-    for (const auto& e : fs::directory_iterator(dir)) {
-        auto n = JournalWriter::parseSegmentFilename(e.path().filename().string());
-        if (n && *n < active) {
-            const seastar::sstring bytes = co_await seastar::util::read_entire_file_contiguous(e.path());
-            saved.emplace_back(e.path(), std::string(bytes.data(), bytes.size()));
-        }
-    }
-    ASSERT_TRUE_OR_RETURN(!saved.empty());
-
-    JournalRetention ret;
-    ret.setReleased(VShardId{1}, 1000);
-    ret.setReleased(VShardId{2}, 0);
-    auto result = co_await JournalGc::collect(dir, active, w, ret);
-    EXPECT_GT(result.copiedRecords, 0u);
-    co_await w.close();
-
-    // "The crash": the unlink never became durable, so the old segments are still there
-    // alongside the copies that were just made durable in the active segment.
-    for (const auto& [path, bytes] : saved) {
-        std::ofstream out(path, std::ios::binary | std::ios::trunc);
-        out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
-    }
-
-    JournalWriter w2(dir, header(), kSmallSegBytes);
-    auto recovered = co_await w2.open();
-    co_await w2.close();
-
-    timestar::JournalReplay replay(1);
-    for (const auto& r : recovered)
-        EXPECT_TRUE(replay.ingest(r));
-    EXPECT_TRUE(replay.finalize()) << "a duplicated record must be absorbed, not fail recovery: "
-                                   << replay.failureDetail();
-    std::vector<uint64_t> vs2Seqs;
-    for (const auto& r : replay.recordsForCore(replay.ownerCore(VShardId{2})))
-        if (r.vshard.value() == 2)
-            vs2Seqs.push_back(r.vshardSeq);
-    EXPECT_EQ(vs2Seqs, (std::vector<uint64_t>{1, 2, 3, 4, 5, 6})) << "exactly one copy of every laggard record";
-    fs::remove_all(dir);
-}
-TEST(JournalGcTest, CrashBetweenTheCopyBarrierAndTheUnlinkRecovers) {
-    testCrashBetweenTheCopyBarrierAndTheUnlinkRecovers().get();
-}
-
 // A PARTIALLY-DELETED SEQUENCE RECOVERS. GC deletes oldest-first, one segment at a time,
-// so a crash mid-run leaves a prefix removed and the rest present. Each deletion removes
-// only records at or below a released watermark, so what survives is still a gap-free
-// suffix per VShard -- which is what recovery validates.
+// and STOPS at the first segment it cannot reclaim, so a crash mid-run leaves a prefix
+// removed and the rest present -- a physical SUFFIX of the segment sequence, and therefore
+// a gap-free suffix per VShard. (The crash window between a copy-forward barrier and its
+// unlink is asserted separately, against the production recovery path, in
+// journal_reclaim_floor_test.cpp.)
 seastar::future<> testAPartiallyDeletedSequenceRecovers() {
     const auto dir = tmpDir("partial");
     JournalWriter w(dir, header(), kSmallSegBytes);

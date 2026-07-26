@@ -338,11 +338,6 @@ seastar::future<uint64_t> ReplicatedVShardHost::snapshotVShard(uint16_t vshard) 
 // Journal segment reclamation (debt D-34)
 // ---------------------------------------------------------------------------
 
-seastar::future<> ReplicatedVShardHost::collectSharedSegments(std::filesystem::path dir, uint64_t activeSegment,
-                                                              JournalGc::Result* out) {
-    *out = co_await JournalGc::collect(std::move(dir), activeSegment, *sharedWriter_, retention_, JournalGc::Options{});
-}
-
 size_t ReplicatedVShardHost::publishReclaimFloors() {
     size_t advanced = 0;
     for (const auto& [vs, state] : vshards_) {
@@ -363,8 +358,13 @@ size_t ReplicatedVShardHost::publishReclaimFloors() {
 seastar::future<size_t> ReplicatedVShardHost::reclaimJournalSegments() {
     // One pass at a time: a pass suspends over file I/O, and two concurrent passes over
     // the same directory would both plan against the same segment and race the unlink.
-    if (stopped_ || journalGcRunning_)
+    if (stopped_ || journalGcRunning_ || snapshotGate_.is_closed())
         co_return 0;
+    // UNDER THE SAME GATE AS THE SWEEP. This is a public entry (tests, and an operator
+    // action later), so it can be called from outside snapshotSweep(); without the hold, a
+    // pass in flight when stop() runs would keep unlinking against writers that stop() is
+    // closing. stop() closes this gate before it touches the writers.
+    auto held = snapshotGate_.hold();
     journalGcRunning_ = true;
     size_t deleted = 0;
     std::exception_ptr err;
@@ -380,13 +380,13 @@ seastar::future<size_t> ReplicatedVShardHost::reclaimJournalSegments() {
             // it APPENDS to the same writer every group is group-committing through.
             const fs::path dir = journalRoot_ / ("shard_" + std::to_string(seastar::this_shard_id()));
             const uint64_t active = sharedWriter_->currentSegmentNumber();
-            JournalGc::Result result;
-            // A PLAIN lambda returning the future of a NAMED member coroutine -- the
-            // standing rule in this tree. A coroutine lambda here would put its frame's
-            // captures in a closure the helper owns, and `&result` points into THIS
-            // frame, which is what the coroutine writes through.
-            co_await sharedSink_->runExclusive(
-                [this, dir, active, out = &result] { return collectSharedSegments(dir, active, out); });
+            // The sink is handed IN rather than wrapped around the whole collect: reading
+            // and scanning each sealed segment is the expensive part and needs no lock (a
+            // sealed segment is immutable), so only the bounded copy-forward write runs
+            // inside runExclusive. Wrapping the whole call would hold every group on the
+            // reactor off its group-commit for the length of a directory walk.
+            auto result = co_await JournalGc::collect(dir, active, *sharedWriter_, retention_, JournalGc::Options{},
+                                                      sharedSink_.get());
             deleted += result.deletedSegments.size();
             journalSegmentsPinned_ += result.pinnedSegments.size();
             journalRecordsCopiedForward_ += result.copiedRecords;
@@ -470,11 +470,14 @@ seastar::future<> ReplicatedVShardHost::snapshotSweep() {
     try {
         co_await maybeSnapshotOnce();
         // RECLAIM ON THE SNAPSHOT SWEEP'S TIMER, at a slower cadence (debt D-34).
-        // Compaction is what MOVES a floor, so there is nothing to collect that a
-        // snapshot did not cause -- but the collect reads whole sealed segments, so it
-        // gets its own (longer) interval rather than running every 5 s. Failures inside
-        // it are caught here with the snapshot failure: nothing was deleted (the unlink
-        // is the last step of each segment) and the next pass retries.
+        // Compaction is the DOMINANT thing that moves a floor -- but not the only one: the
+        // floor is `min(newest HardState, newest Snapshot, oldest live entry) - 1`, so a
+        // group whose hard state was the binding term also advances when an election
+        // re-persists it. Neither happens often enough to want a 5 s cadence, and the
+        // collect reads whole sealed segments, so it gets its own longer interval and
+        // piggy-backs on this timer rather than owning one. Failures are caught here with
+        // the snapshot failure: nothing was deleted (the unlink is the last step of each
+        // segment) and the next pass retries.
         const auto now = seastar::lowres_clock::now();
         if (lastJournalGc_.time_since_epoch().count() == 0 || now - lastJournalGc_ >= kJournalGcInterval) {
             lastJournalGc_ = now;

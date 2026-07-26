@@ -1,6 +1,7 @@
 #include "journal_gc.hpp"
 
 #include "journal_segment.hpp"
+#include "journal_sink.hpp"
 
 #include <algorithm>
 #include <seastar/core/coroutine.hh>
@@ -14,8 +15,27 @@ namespace fs = std::filesystem;
 
 namespace timestar {
 
+seastar::future<> JournalGc::copyForward(JournalWriter& writer, uint64_t oldestKeptSegment,
+                                         std::vector<JournalRecord> records, Result* out) {
+    // RE-VALIDATE INSIDE THE EXCLUSIVE SECTION. The plan above was made without the lock,
+    // so the writer may have rotated since. What must still hold is that the segment being
+    // COPIED INTO is strictly newer than the one about to be unlinked -- otherwise the
+    // copy would land in the file it is meant to rescue.
+    if (writer.currentSegmentNumber() <= oldestKeptSegment)
+        throw std::runtime_error("JournalGc: the writer's active segment is not above the segment being reclaimed");
+    if (writer.fenced())
+        throw std::runtime_error("JournalGc: the journal writer is fenced; refusing to copy records forward");
+    for (const auto& record : records) {
+        co_await writer.append(record);
+        out->copiedRecords += 1;
+        out->copiedBytes += record.payload.size();
+    }
+    co_await writer.barrier();
+}
+
 seastar::future<JournalGc::Result> JournalGc::collect(fs::path dir, uint64_t activeSegment, JournalWriter& writer,
-                                                      const JournalRetention& retention, Options opts) {
+                                                      const JournalRetention& retention, Options opts,
+                                                      SharedShardJournal* exclusive) {
     Result result;
 
     // Enumerate sealed segments (strictly older than the active one), oldest
@@ -35,6 +55,10 @@ seastar::future<JournalGc::Result> JournalGc::collect(fs::path dir, uint64_t act
     });
 
     for (uint64_t seg : segments) {
+        // READ AND PLAN OUTSIDE ANY EXCLUSION. A sealed segment is immutable -- the writer
+        // never touches a segment below its active one -- so this needs no lock, and it is
+        // the expensive part (a whole file read plus a full record scan). Only the copy
+        // below is a write into the shared buffer, and only that takes the lock.
         const auto path = dir / JournalWriter::segmentFilename(seg);
         const seastar::sstring bytes = co_await seastar::util::read_entire_file_contiguous(path);
         auto scan = scanJournalSegment(std::span<const char>(bytes.data(), bytes.size()));
@@ -49,25 +73,35 @@ seastar::future<JournalGc::Result> JournalGc::collect(fs::path dir, uint64_t act
 
         const auto gc = retention.planSegment(scan->records);
 
-        // Nothing reclaimable in this segment (every record still live): leave it
-        // untouched. Copying a fully-live segment forward would only churn bytes
-        // and reorder records for no retention gain.
-        if (!gc.reclaimable && gc.liveRecordIndices.size() == scan->records.size()) {
+        // ------------------------------------------------------------------
+        // STOP AT THE FIRST SEGMENT THAT CANNOT BE RECLAIMED.
+        //
+        // A segment is unreclaimable when it still holds live records and they cannot (or
+        // should not) be copied forward: copy-forward is off (the per-VShard layout, where
+        // GC must never touch the writer), or the live set exceeds the budget, or the
+        // segment is entirely live and copying it would churn every byte for no gain.
+        //
+        // Having decided that, GC STOPS rather than skipping ahead, so what survives on
+        // disk is always a physical SUFFIX of the segment sequence. That is stronger than
+        // it needs to be for safety and it is deliberate. Deleting a LATER fully-released
+        // segment while an earlier one is pinned is safe for the records that matter --
+        // everything above a VShard's floor is live by definition, so a fully-released
+        // segment can only contain records the group is finished with -- but it can strand
+        // a NON-CONTIGUOUS set of already-dead records: a pinned segment holding VShard V
+        // at seq 10 (dead, pinned by some other VShard's live records), a later released
+        // segment holding V at 11, and V at 12 further on, leaves {10, 12} with a hole.
+        // Harmless for recovery as it stands (recoverRaftState replays by vshard_seq and
+        // re-applies idempotently, and dead records below the boundary are erased by the
+        // Snapshot record anyway), but it is a trap for anything that later validates
+        // continuity -- `JournalReplay::finalize` already fails closed on a gap, and it is
+        // the ADR's intended recovery path even though nothing calls it today. Stopping at
+        // the pin costs a delayed reclaim; the alternative costs a future recovery.
+        // ------------------------------------------------------------------
+        const bool wholeSegmentLive = gc.liveRecordIndices.size() == scan->records.size();
+        const bool overBudget = gc.liveRecordIndices.size() > opts.maxCopyForwardRecords;
+        if (!gc.reclaimable && (wholeSegmentLive || !opts.copyForward || overBudget)) {
             result.pinnedSegments.push_back(seg);
-            continue;
-        }
-
-        // PIN rather than copy when copy-forward is off, or when the live set is too
-        // big to be worth (or to bound) the rewrite. Pinning is always safe: the
-        // segment keeps the only copy of records somebody still needs, which is
-        // precisely why it must not be deleted. Note that a LATER segment may still
-        // be fully released and deleted -- that removes only records at or below some
-        // VShard's released watermark, so what survives is still a prefix-free,
-        // gap-free sequence per VShard (JournalReplay::finalize validates exactly
-        // that).
-        if (!gc.reclaimable && (!opts.copyForward || gc.liveRecordIndices.size() > opts.maxCopyForwardRecords)) {
-            result.pinnedSegments.push_back(seg);
-            continue;
+            break;
         }
 
         if (!gc.reclaimable) {
@@ -75,14 +109,21 @@ seastar::future<JournalGc::Result> JournalGc::collect(fs::path dir, uint64_t act
             // durable, THEN delete the old segment. Order is the crash-atomicity
             // guarantee: a crash before the barrier keeps the old segment; a
             // crash after the barrier but before the delete leaves a durable
-            // duplicate that the recovery apply layer resolves by vshard_seq.
-            for (size_t idx : gc.liveRecordIndices) {
-                const auto& record = scan->records[idx];
-                co_await writer.append(record);
-                result.copiedRecords += 1;
-                result.copiedBytes += record.payload.size();
+            // BYTE-IDENTICAL duplicate, which recovery absorbs -- see the header.
+            std::vector<JournalRecord> live;
+            live.reserve(gc.liveRecordIndices.size());
+            for (size_t idx : gc.liveRecordIndices)
+                live.push_back(scan->records[idx]);
+            // THE ONLY PART THAT NEEDS EXCLUSION, and it is bounded by
+            // maxCopyForwardRecords rather than by the size of the directory.
+            if (exclusive) {
+                co_await exclusive->runExclusive(
+                    [&writer, seg, recs = std::move(live), out = &result]() mutable -> seastar::future<> {
+                        return copyForward(writer, seg, std::move(recs), out);
+                    });
+            } else {
+                co_await copyForward(writer, seg, std::move(live), &result);
             }
-            co_await writer.barrier();
             result.copyForwardSegments.push_back(seg);
         }
 

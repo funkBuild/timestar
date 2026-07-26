@@ -57,11 +57,11 @@ public:
 
     // Journal segment ROTATION TARGET, per layout. Must be set before addVShard.
     //
-    // A knob rather than a constant because segment reclamation (debt D-34) only ever
-    // acts on SEALED segments: with the production 1 MiB per-VShard target, proving a
-    // reclaim means writing a megabyte of Raft entries through a quorum, which is not a
-    // unit test. It is also the honest operator knob for a deployment whose entries are
-    // much larger or much smaller than this tree assumes.
+    // A TEST SEAM, and nothing more -- there is no config key behind it and no operator
+    // can reach it. Segment reclamation (debt D-34) only ever acts on SEALED segments, and
+    // at the production 1 MiB per-VShard target proving a reclaim means pushing a megabyte
+    // of Raft entries through a quorum, which is not a unit test. If an operator ever does
+    // need this, wire it to `timestar.toml` rather than promoting the setter.
     void setJournalSegmentBytes(size_t perVShard, size_t shared) {
         journalSegmentBytes_ = perVShard;
         sharedJournalSegmentBytes_ = shared;
@@ -237,12 +237,16 @@ public:
     //
     // CRASH DURING GC IS SAFE BY ORDERING, not by luck: copy the live records forward,
     // BARRIER, then unlink, then sync the directory. Every crash window leaves at least
-    // one complete generation, and the overlap window leaves a byte-identical DUPLICATE,
-    // which recovery resolves -- `recoverRaftState` replays in vshard_seq order and a
-    // repeated record re-applies identically, and `JournalReplay::finalize` drops exact
-    // duplicates outright while failing closed on a conflicting one. A partially-deleted
-    // sequence is likewise fine: each segment is an independent step and what survives is
-    // still a gap-free suffix per VShard.
+    // one complete generation, and the overlap window leaves a BYTE-IDENTICAL duplicate.
+    // What absorbs that duplicate is the PRODUCTION recovery path and nothing else:
+    // `JournalWriter::open()` hands its record set to `recoverRaftState`, which sorts one
+    // VShard's records by vshard_seq and replays them, so a repeat re-applies the same
+    // HardState / re-places the same entry at the same index / re-decodes the same
+    // Snapshot and the reconstructed state is identical. (`JournalReplay::finalize` is
+    // stricter -- it dedupes and validates continuity -- but it has NO production caller,
+    // so it is not what makes this safe.) A partially-deleted sequence is fine for the
+    // same reason: each segment is an independent step, and GC stops at the first pinned
+    // segment so what survives is always a physical SUFFIX of the sequence.
     static constexpr std::chrono::seconds kJournalGcInterval{60};
     // Run one reclamation pass now (publish floors, then collect). Returns the number of
     // segment files deleted. Exposed for tests and for an operator action; the sweep
@@ -334,10 +338,6 @@ private:
     // coroutine frame captured by a with_gate temporary outlives the frame it referenced
     // (the standing rule in this tree, learned the hard way in raft_group.cpp).
     seastar::future<> snapshotSweep();
-    // The shared-journal collect, as a NAMED member coroutine (debt D-34): it is handed
-    // to SharedShardJournal::runExclusive, and a coroutine lambda there would leave its
-    // frame pointing at a closure the helper owns.
-    seastar::future<> collectSharedSegments(std::filesystem::path dir, uint64_t activeSegment, JournalGc::Result* out);
     seastar::timer<seastar::lowres_clock> snapshotTimer_;
     seastar::gate snapshotGate_;
     bool snapshotSweepRunning_ = false;  // one sweep at a time; the timer skips if busy

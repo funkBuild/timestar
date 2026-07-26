@@ -17,14 +17,22 @@
 #include <filesystem>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
-#include <seastar/core/sleep.hh>
 #include <seastar/core/when_all.hh>
 #include <seastar/util/file.hh>
+#include <seastar/util/later.hh>
 #include <span>
 #include <string>
 #include <vector>
 
 namespace fs = std::filesystem;
+
+// ASSERT_* cannot early-return from a coroutine; guard explicitly.
+#define ASSERT_TRUE_OR_RETURN(cond) \
+    do {                            \
+        EXPECT_TRUE(cond);          \
+        if (!(cond))                \
+            co_return;              \
+    } while (0)
 
 namespace {
 
@@ -251,47 +259,68 @@ TEST(JournalSinkTest, SyncAfterStopFailsRatherThanHangs) {
 //
 // Copy-forward APPENDS relocated records to the very writer every group on the shard is
 // group-committing through, and then barriers. Interleaving that with a round is not a
-// tidiness question: an append landing inside a barrier is written at an offset computed
-// before it existed and then erased from `tail_` as though it had been flushed. So the
-// exclusion must hold for the WHOLE of the copy, not per call -- a round that barriered
+// tidiness question: an append that lands inside a barrier is written at an offset
+// computed before it existed and then erased from `tail_` as though it had been flushed.
+// So the exclusion must hold for the WHOLE copy, not per call -- a round that barriered
 // between two relocated records would report them durable while the source segment is
 // about to be unlinked.
+//
+// ASSERTED WITH AN ORDERING TOKEN, not a clock. Both sides stamp a shared monotonic step
+// counter; the exclusive section's stamps must come out CONTIGUOUS, i.e. no round stamp
+// ever falls between them. A sleep-versus-fdatasync race would pass against broken code
+// on slow storage; a contiguity check cannot -- it is a statement about the sequence, and
+// the yield loop below hands the reactor many chances to violate it.
 seastar::future<> testRunExclusiveHoldsOffGroupCommitRounds() {
     const auto dir = tmpDir("exclusive");
     JournalWriter w(dir, header(), 1u << 20);
     co_await w.open();
     SharedShardJournal sink(w);
 
-    bool insideExclusive = false;
-    bool exclusiveDone = false;
-    bool syncResolved = false;
-    bool syncSawExclusiveRunning = false;
+    unsigned step = 0;
+    std::vector<unsigned> exclusiveSteps;
+    std::vector<unsigned> roundSteps;
+    uint64_t roundsAtEntry = 0;
+    uint64_t roundsAtExit = 0;
 
     auto ex = sink.runExclusive([&]() -> seastar::future<> {
-        insideExclusive = true;
-        // Two suspensions, i.e. exactly the shape of a multi-record copy-forward: a
-        // per-call lock would let a round in here.
+        roundsAtEntry = sink.rounds();
+        exclusiveSteps.push_back(++step);
         co_await w.append(rec(1, 1, "relocated-a"));
-        co_await seastar::sleep(std::chrono::milliseconds(1));
+        exclusiveSteps.push_back(++step);
+        // Hand the reactor many chances to run a queued round. `yield()` ALWAYS defers --
+        // `coroutine::maybe_yield` does not (it only yields under preemption pressure, so
+        // in a tight loop it is a no-op and the round never gets a turn, which made an
+        // earlier version of this test pass against the unlocked code). No wall-clock is
+        // involved: this is a count of scheduling turns, so slower storage makes the test
+        // MORE adversarial, never less.
+        for (int i = 0; i < 256; ++i)
+            co_await seastar::yield();
+        exclusiveSteps.push_back(++step);
         co_await w.append(rec(1, 2, "relocated-b"));
         co_await w.barrier();
-        exclusiveDone = true;
-        insideExclusive = false;
+        exclusiveSteps.push_back(++step);
+        roundsAtExit = sink.rounds();
     });
 
     // A group tries to group-commit while the copy is in flight.
     co_await sink.append(rec(2, 1, "group"));
-    auto s = sink.sync().then([&] {
-        syncResolved = true;
-        syncSawExclusiveRunning = insideExclusive;
-    });
+    auto s = sink.sync().then([&] { roundSteps.push_back(++step); });
 
     co_await std::move(ex);
-    EXPECT_TRUE(exclusiveDone);
-    EXPECT_FALSE(syncResolved) << "a group-commit round must not complete while the copy-forward holds the writer";
     co_await std::move(s);
-    EXPECT_TRUE(syncResolved);
-    EXPECT_FALSE(syncSawExclusiveRunning) << "the round's barrier ran strictly after the exclusive section";
+
+    // 1. The exclusive section's stamps are CONTIGUOUS: nothing else stamped between them.
+    ASSERT_TRUE_OR_RETURN(exclusiveSteps.size() == 4);
+    for (size_t i = 1; i < exclusiveSteps.size(); ++i)
+        EXPECT_EQ(exclusiveSteps[i], exclusiveSteps[i - 1] + 1)
+            << "a group-commit round stamped between two steps of the copy-forward";
+    // 2. The round's stamp is strictly after the whole section.
+    ASSERT_TRUE_OR_RETURN(roundSteps.size() == 1);
+    EXPECT_GT(roundSteps[0], exclusiveSteps.back());
+    // 3. And no round's BARRIER completed while the section held the writer -- the round
+    //    counter is bumped immediately after the barrier attempt, so this is the direct
+    //    statement of "no other fdatasync ran against this buffer".
+    EXPECT_EQ(roundsAtExit, roundsAtEntry) << "a group-commit barrier ran inside the exclusive section";
 
     co_await sink.stop();
     co_await w.close();

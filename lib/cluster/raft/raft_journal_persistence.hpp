@@ -100,7 +100,41 @@ public:
     // forever, which is why RaftGroup::compact RE-PERSISTS the current hard state right
     // after the snapshot: one ~40-byte record moves that pin to the new boundary, and
     // replaying it is idempotent (same term, same vote).
-    [[nodiscard]] uint64_t releasedSeq() const;
+    //
+    // ================= IT IS A DURABILITY WATERMARK, NOT AN INTENT ONE =================
+    //
+    // What this returns is derived ONLY from records an fsync has already covered. That
+    // distinction is the difference between reclaiming disk and destroying a replica, and
+    // it is not theoretical -- the append path advances the underlying bookkeeping
+    // SYNCHRONOUSLY, before `sink_.append()` has even copied the bytes into the writer's
+    // buffer, let alone before a barrier has run:
+    //
+    //   compact() appends Snapshot(seq S) and HardState(seq S+1) -> sync() -> the barrier
+    //   throws EIO -> snapshotSweep catches, logs and carries on -> if the floor had
+    //   already moved to S-1, the next GC pass (<= 60 s later) would delete every sealed
+    //   segment below it, INCLUDING the group's only HardState record, while S and S+1
+    //   never reached the disk. That replica restarts with no vote (a Raft safety
+    //   violation), no snapshot and no log.
+    //
+    // So there are two states. The APPEND-TIME bookkeeping tracks what the group intends
+    // to be true; `durableFloor_` is advanced ONLY by a sync() that returned successfully,
+    // and only to the value computed at that sync's entry -- at which point every append
+    // it covers is provably in the writer's buffer (the driver awaits each append before
+    // calling sync, and barrier() is a whole-buffer flush). A failed append or sync FENCES
+    // this object as well as the writer, so the floor can never advance again on evidence
+    // that no longer holds; it stays at the last value an fsync proved, which remains
+    // correct because the records that made everything above it live are themselves
+    // durable.
+    //
+    // The same reasoning covers the no-error crash window: drainReady appends and syncs
+    // later, so a concurrent publishReclaimFloors() between the two sees the pre-append
+    // floor, which is exactly right.
+    // ===================================================================================
+    [[nodiscard]] uint64_t releasedSeq() const { return durableFloor_; }
+
+    // Has a durability failure fenced this group's floor? (Observability; the floor is
+    // frozen from here on either way.)
+    [[nodiscard]] bool floorFenced() const { return fenced_; }
 
     // Seed the above from a recovered journal. MANDATORY after recovery and not an
     // optimisation: a fresh object knows none of the seqs of the records already on
@@ -116,7 +150,16 @@ private:
     VShardId vshard_;
     uint64_t nextSeq_;
 
+    // The floor implied by everything APPENDED so far, durable or not. Never returned to
+    // a caller; only sampled at sync() entry and promoted into durableFloor_ once that
+    // sync succeeds. See releasedSeq().
+    [[nodiscard]] uint64_t intendedFloor() const;
+    // sink_.append(), with a floor fence on failure. `r` must outlive the returned future.
+    seastar::future<> appendFenced(const JournalRecord& r);
+
     // ---- reclaim-floor state (debt D-34); see releasedSeq() ----
+    uint64_t durableFloor_ = 0;  // the ONLY value releasedSeq() ever reports
+    bool fenced_ = false;        // an append or sync threw: the floor is frozen for good
     uint64_t lastHardStateSeq_ = 0;
     uint64_t lastSnapshotSeq_ = 0;
     // (raftIndex, vshard_seq) of the log entries whose records are still needed,
