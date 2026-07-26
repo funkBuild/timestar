@@ -784,26 +784,34 @@ seastar::future<> NativeIndex::waitForFlush() {
 // this clears every `dirty` flag, and between that and the applyTo() below the
 // batch is the ONLY copy of those adds.
 //
-// The entry guard is deliberately LOOSER than hasDirtyCacheState(): a populated
-// but clean bitmap cache still gets its local-ID counter and postings watermark
-// re-persisted, and — the part that matters — still gets trimmed. Tightening it
-// to "something is dirty" would stop the trims running on a read-heavy shard,
-// which populates these caches with clean entries and is exactly where the byte
-// budgets need to bite.
+// It SUSPENDS in several places (the serializers yield, the bloom rebuild scans
+// KV), so it must not be entered twice concurrently — hence the mutex, not merely
+// convention.
 seastar::future<> NativeIndex::flushDirtyCaches() {
-    if (bitmapCache_.empty() && dayBitmapCache_.empty() && hllCacheDirty_.empty() && dirtyMeasurementBlooms_.empty())
+    // Enter when either cache is POPULATED (so the local-ID counter/watermark are
+    // refreshed and, more importantly, the trims run — a read-heavy shard fills
+    // these caches with clean entries and is exactly where the byte budgets must
+    // bite) or when anything is DIRTY. The second half is not redundant:
+    // removeExpiredDayBitmaps can leave keys in a dirty set whose cache entries
+    // are gone, and without it an empty-cache/non-empty-set state would return
+    // early forever while the periodic flush took flushMutex_ once an interval to
+    // achieve nothing.
+    if (bitmapCache_.empty() && dayBitmapCache_.empty() && !hasDirtyCacheState())
         co_return;
 
-    IndexWriteBatch postingsBatch;
-    flushDirtyBitmaps(postingsBatch);
-    flushDirtyDayBitmaps(postingsBatch);
-    flushDirtyHLLs(postingsBatch);
-    // Zero the byte accounting HERE, not at the end: the three serializers above
-    // are synchronous and have emptied their dirty sets, so from this point a
-    // concurrent insert re-dirtying a key goes through the clean→dirty
-    // transition again and re-accumulates. flushDirtyMeasurementBlooms() below
-    // suspends, which is precisely when that happens.
+    // Zero the write estimate up front. Everything charged before this point is
+    // in a dirty set that one of the serializers below EXCHANGES out, so all of it
+    // is covered by this batch; anything charged after (a concurrent insert during
+    // one of the yields, or during the bloom rebuild's kvPrefixScan) lands in a
+    // fresh set and re-accumulates. The bias is therefore towards OVER-counting,
+    // which only makes the next flush earlier — never towards under-counting,
+    // which would let the trigger go silent.
     dirtyCacheBytes_ = 0;
+
+    IndexWriteBatch postingsBatch;
+    co_await flushDirtyBitmaps(postingsBatch);
+    co_await flushDirtyDayBitmaps(postingsBatch);
+    co_await flushDirtyHLLs(postingsBatch);
     co_await flushDirtyMeasurementBlooms(postingsBatch);
     if (!postingsBatch.empty()) {
         // Apply BEFORE the append, matching kvWriteBatch's documented rule.
@@ -835,6 +843,10 @@ size_t NativeIndex::dirtyIndexCacheKeys() const {
            dirtyMeasurementBlooms_.size();
 }
 
+size_t NativeIndex::dirtyIndexCacheBytes() const {
+    return dirtyCacheBytes_;
+}
+
 size_t NativeIndex::maxDirtyIndexCacheKeys() {
     return kMaxDirtyCacheKeys;
 }
@@ -843,10 +855,34 @@ std::chrono::milliseconds NativeIndex::dirtyIndexCacheFlushInterval() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(kDirtyCacheFlushInterval);
 }
 
-void NativeIndex::noteDirtyBitmapKey(std::unordered_set<std::string>& dirtyKeys, const std::string& cacheKey,
-                                     size_t entryBytes) {
-    if (dirtyKeys.insert(cacheKey).second)
-        dirtyCacheBytes_ += cacheKey.size() + entryBytes;
+uint64_t NativeIndex::indexWalSequence() const {
+    return wal_ ? wal_->sequenceNumber() : 0;
+}
+
+void NativeIndex::noteBitmapChanged(std::unordered_set<std::string>& dirtyKeys, const std::string& cacheKey,
+                                    BitmapEntry& entry) {
+    entry.dirty = true;
+    if (dirtyKeys.insert(cacheKey).second) {
+        // CLEAN -> DIRTY. Read the bitmap rather than trusting the cached
+        // `approxBytes`: authoritative, and O(containers) (~16 for a million ids)
+        // at most once per key per flush interval, not per add.
+        dirtyCacheBytes_ += cacheKey.size() + entry.bitmap.getSizeInBytes();
+    } else {
+        // ALREADY DIRTY, GROWING IN PLACE -- and this branch is what makes the
+        // byte bound mean anything. A day rollover creates an EMPTY day bitmap, so
+        // the transition above charges a few bytes of key however many million ids
+        // then arrive; without a per-change charge the estimate stayed at ~0 on the
+        // exact workload the bound exists for. A flat constant rather than another
+        // getSizeInBytes() because this is the hottest path in the index: one add
+        // grows a roaring array container by 2 bytes and can promote or split one,
+        // so 4 over-estimates for dense bitmaps -- deliberately, since
+        // over-counting only makes the next flush earlier.
+        dirtyCacheBytes_ += kDirtyBitmapAddBytes;
+    }
+}
+
+void NativeIndex::chargeDirtyCacheBytes(size_t bytes) {
+    dirtyCacheBytes_ += bytes;
 }
 
 seastar::future<> NativeIndex::flushDirtyCachesUnderMutex() {
@@ -2219,29 +2255,47 @@ void NativeIndex::buildBitmapCacheKey(std::string& out, const std::string& measu
     out += tagValue;
 }
 
-void NativeIndex::flushDirtyBitmaps(IndexWriteBatch& batch) {
+// PREEMPTIBLE, and that is load-bearing. At the D-17 dirty-key bound this loop
+// serializes up to 10,000 roaring bitmaps, and the periodic flush can now reach
+// it without any memtable pressure — 10,000 runOptimize+shrinkToFit+write calls
+// in one non-preemptible block is a reactor stall (this project has a gate for
+// those). The yields are safe only because the dirty set is EXCHANGED out first:
+// a concurrent insert re-dirtying a key during a yield lands in the fresh member
+// set and is flushed next round, where a trailing `clear()` would have DROPPED it
+// — the D-2 shape. It also stops a set rehash from invalidating the iterator.
+seastar::future<> NativeIndex::flushDirtyBitmaps(IndexWriteBatch& batch) {
+    // Read the watermark ONCE, before the first yield. It claims that every local
+    // ID below it has its bitmap membership in this batch; an ID assigned during a
+    // yield does not, and must stay ABOVE the recorded value so open()'s
+    // crash-window repair still rebuilds its postings from metadata.
+    const uint32_t watermark = localIdMap_.nextId();
+
     // Persist the local ID counter once per flush
     if (localIdMap_.size() > 0) {
-        batch.put(ke::encodeLocalIdCounterKey(), ke::encodeLocalId(localIdMap_.nextId()));
+        batch.put(ke::encodeLocalIdCounterKey(), ke::encodeLocalId(watermark));
     }
 
     // Batch-persist LOCAL_ID_FORWARD entries for IDs assigned since last flush
     // (normally none — series creation persists its own mapping — but this
-    // covers IDs assigned by repair/migration paths).
-    for (uint32_t id = lastFlushedLocalId_; id < localIdMap_.nextId(); ++id) {
+    // covers IDs assigned by repair/migration paths, where it can be millions).
+    for (uint32_t id = lastFlushedLocalId_; id < watermark; ++id) {
         batch.put(ke::encodeLocalIdForwardKey(id), localIdMap_.getGlobalId(id).toBytes());
+        if ((id & 0xFF) == 0xFF)
+            co_await seastar::coroutine::maybe_yield();
     }
-    lastFlushedLocalId_ = localIdMap_.nextId();
+    lastFlushedLocalId_ = watermark;
 
-    // Advance the postings watermark: every local ID below nextId() has its
-    // bitmap membership included in this batch. On restart, open() re-adds
-    // postings only for IDs at/after the persisted watermark (crash window).
-    batch.put(ke::encodePostingsWatermarkKey(), ke::encodeLocalId(localIdMap_.nextId()));
+    // Advance the postings watermark: every local ID below it has its bitmap
+    // membership included in this batch. On restart, open() re-adds postings only
+    // for IDs at/after the persisted watermark (crash window).
+    batch.put(ke::encodePostingsWatermarkKey(), ke::encodeLocalId(watermark));
 
     // Serialize dirty bitmaps — iterate the dirty-key set, not the whole
     // cache (up to 100K entries walked per flush previously).
+    auto pending = std::exchange(bitmapCacheDirtyKeys_, {});
     std::string bitmapKey;
-    for (const auto& cacheKey : bitmapCacheDirtyKeys_) {
+    size_t done = 0;
+    for (const auto& cacheKey : pending) {
         auto it = bitmapCache_.find(cacheKey);
         if (it == bitmapCache_.end())
             continue;
@@ -2263,14 +2317,17 @@ void NativeIndex::flushDirtyBitmaps(IndexWriteBatch& batch) {
 
         bitmapKey.clear();
         bitmapKey.push_back(static_cast<char>(POSTINGS_BITMAP));
-        bitmapKey.append(it->first);
+        bitmapKey.append(cacheKey);
         size_t serializedSize = bitmap.getSizeInBytes();
         entry.approxBytes = serializedSize;
         std::string serialized(serializedSize, '\0');
         bitmap.write(serialized.data());
         batch.put(bitmapKey, serialized);
+        // Yield with NO iterator or entry reference live: `it` dies here, and the
+        // next iteration re-finds by key (the map may rehash during the yield).
+        if ((++done & 0x3F) == 0)
+            co_await seastar::coroutine::maybe_yield();
     }
-    bitmapCacheDirtyKeys_.clear();
 }
 
 // Materialize a cache entry. `operator[]` on a BitmapCache inserts a NULL handle, which
@@ -2361,10 +2418,8 @@ seastar::future<uint64_t> NativeIndex::addToPostingsBitmapForInsert(std::string&
         // safe precisely because there is no suspension here: on the cold path
         // below, a flush during the load can clear the flag, so that path still
         // re-marks unconditionally.
-        if (it.value()->bitmap.addChecked(localId)) {
-            it.value()->dirty = true;
-            noteDirtyBitmapKey(bitmapCacheDirtyKeys_, cacheKey, it.value()->approxBytes);
-        }
+        if (it.value()->bitmap.addChecked(localId))
+            noteBitmapChanged(bitmapCacheDirtyKeys_, cacheKey, *it.value());
         co_return it.value()->bitmap.cardinality();
     }
 
@@ -2381,12 +2436,16 @@ seastar::future<uint64_t> NativeIndex::addToPostingsBitmapForInsert(std::string&
     // because a concurrent trim may have dropped the entry from the MAP and a later
     // reader would then be looking at a different one.
     auto pin = ensureEntry(bitmapCache_, cacheKey);
-    pin->dirty = true;
-    noteDirtyBitmapKey(bitmapCacheDirtyKeys_, cacheKey, pin->approxBytes);
+    noteBitmapChanged(bitmapCacheDirtyKeys_, cacheKey, *pin);
     auto existing = co_await kvGet(bitmapKvKey);
     // Re-find after co_await: whatever is in the map NOW is what future readers see.
     auto entry = ensureEntry(bitmapCache_, cacheKey);
     if (existing.has_value()) {
+        // Charge the merged-in payload explicitly. The clean->dirty transition
+        // above was charged against an EMPTY pre-inserted bitmap, and the
+        // re-mark below finds the key already in the set, so without this the
+        // KV content a cold load pulls in would never be accounted at all.
+        chargeDirtyCacheBytes(existing->size());
         // IMPORTANT: Merge (OR) the KV-loaded bitmap into the existing entry
         // rather than replacing it. During the co_await above, concurrent
         // coroutines may have added local IDs to the pre-inserted empty bitmap.
@@ -2403,8 +2462,7 @@ seastar::future<uint64_t> NativeIndex::addToPostingsBitmapForInsert(std::string&
     // would then never be persisted (see addToDayBitmapForInsert). Unconditional,
     // unlike the cache-hit path above — the flag may have been cleared while ids
     // this coroutine cannot see were added to the pinned entry.
-    entry->dirty = true;
-    noteDirtyBitmapKey(bitmapCacheDirtyKeys_, cacheKey, entry->approxBytes);
+    noteBitmapChanged(bitmapCacheDirtyKeys_, cacheKey, *entry);
     // The add happens HERE, with no suspension between it and the re-find above.
     entry->bitmap.add(localId);
     co_return entry->bitmap.cardinality();
@@ -2505,10 +2563,8 @@ seastar::future<bool> NativeIndex::addToDayBitmapForInsert(std::string& cacheKey
         // forever without changing, so it is where the unbounded dirty state of
         // write-scaleout debt D-17 came from.
         const bool added = it.value()->bitmap.addChecked(localId);
-        if (added) {
-            it.value()->dirty = true;
-            noteDirtyBitmapKey(dayBitmapCacheDirtyKeys_, cacheKey, it.value()->approxBytes);
-        }
+        if (added)
+            noteBitmapChanged(dayBitmapCacheDirtyKeys_, cacheKey, *it.value());
         co_return added;
     }
 
@@ -2522,13 +2578,13 @@ seastar::future<bool> NativeIndex::addToDayBitmapForInsert(std::string& cacheKey
     // can start adding local IDs immediately. The handle also PINS the entry against
     // eviction for the duration of the load (write-scaleout 5.1).
     auto pin = ensureEntry(dayBitmapCache_, cacheKey);
-    pin->dirty = true;
-    noteDirtyBitmapKey(dayBitmapCacheDirtyKeys_, cacheKey, pin->approxBytes);
+    noteBitmapChanged(dayBitmapCacheDirtyKeys_, cacheKey, *pin);
     auto existing = co_await kvGet(kvKey);
     // Re-find after co_await: whatever is in the map NOW is what future readers see.
     auto entry = ensureEntry(dayBitmapCache_, cacheKey);
     if (existing.has_value()) {
         // Merge (OR) to preserve concurrent adds during the co_await suspension.
+        chargeDirtyCacheBytes(existing->size());  // see addToPostingsBitmapForInsert
         mergeSerializedBitmapInto(entry->bitmap, existing->data(), existing->size());
         entry->approxBytes = existing->size();
     }
@@ -2537,8 +2593,7 @@ seastar::future<bool> NativeIndex::addToDayBitmapForInsert(std::string& cacheKey
     // RE-MARK DIRTY. A flush during the suspension above clears every dirty flag and
     // empties the dirty-key set; the add below would then never be persisted and the
     // series would silently vanish from that day's discovery bitmap.
-    entry->dirty = true;
-    noteDirtyBitmapKey(dayBitmapCacheDirtyKeys_, cacheKey, entry->approxBytes);
+    noteBitmapChanged(dayBitmapCacheDirtyKeys_, cacheKey, *entry);
     // The add happens HERE, with NOTHING between it and the re-find above. See the
     // header note on why this function mutates instead of returning a pointer.
     co_return entry->bitmap.addChecked(localId);
@@ -2579,10 +2634,13 @@ seastar::future<NativeIndex::BitmapHandle> NativeIndex::getDayBitmapByKey(const 
     co_return BitmapHandle{};
 }
 
-void NativeIndex::flushDirtyDayBitmaps(IndexWriteBatch& batch) {
-    // Iterate the dirty-key set, not the whole cache (see flushDirtyBitmaps).
+seastar::future<> NativeIndex::flushDirtyDayBitmaps(IndexWriteBatch& batch) {
+    // Iterate the dirty-key set, not the whole cache, and exchange it out before
+    // yielding — see flushDirtyBitmaps for why both matter.
+    auto pending = std::exchange(dayBitmapCacheDirtyKeys_, {});
     std::string kvKey;
-    for (const auto& cacheKey : dayBitmapCacheDirtyKeys_) {
+    size_t done = 0;
+    for (const auto& cacheKey : pending) {
         auto it = dayBitmapCache_.find(cacheKey);
         if (it == dayBitmapCache_.end())
             continue;
@@ -2602,14 +2660,15 @@ void NativeIndex::flushDirtyDayBitmaps(IndexWriteBatch& batch) {
 
         kvKey.clear();
         kvKey.push_back(static_cast<char>(TIME_SERIES_DAY));
-        kvKey.append(it->first);
+        kvKey.append(cacheKey);
         size_t serializedSize = bitmap.getSizeInBytes();
         entry.approxBytes = serializedSize;
         std::string serialized(serializedSize, '\0');
         bitmap.write(serialized.data());
         batch.put(kvKey, serialized);
+        if ((++done & 0x3F) == 0)
+            co_await seastar::coroutine::maybe_yield();
     }
-    dayBitmapCacheDirtyKeys_.clear();
 }
 
 // Fraction of this shard's arena that ALL index caches together may occupy.
@@ -2878,6 +2937,16 @@ seastar::future<> NativeIndex::removeExpiredDayBitmaps(const std::string& measur
     // retired. The reader finishes on a snapshot of an expiring day, which is the same
     // answer it would have got had it started a moment earlier.
     for (const auto& k : toEvict) {
+        // Drop the dirty-set entry with the cache entry. This is the ONE erase
+        // site that removes DIRTY entries (the trims all skip them, so their keys
+        // are never in the set), and leaving the key behind left the D-17 gauge
+        // and byte estimate reading state that no longer exists — and, if both
+        // caches ended up empty, an empty-cache/non-empty-set pair that
+        // flushDirtyCaches() would refuse to enter, so the periodic flush would
+        // take flushMutex_ once an interval forever to accomplish nothing. Not a
+        // durability question: the day is being retired and its KV key deleted in
+        // the same batch, so there is nothing left to persist.
+        dayBitmapCacheDirtyKeys_.erase(k);
         dayBitmapCache_.erase(k);
     }
 
@@ -3170,8 +3239,12 @@ seastar::future<> NativeIndex::updateTagHLL(const std::string& measurement, cons
         dirtyCacheBytes_ += key.size() + HyperLogLog::SERIALIZED_SIZE;
 }
 
-void NativeIndex::flushDirtyHLLs(IndexWriteBatch& batch) {
-    for (const auto& cacheKey : hllCacheDirty_) {
+seastar::future<> NativeIndex::flushDirtyHLLs(IndexWriteBatch& batch) {
+    // Exchange-then-iterate, as flushDirtyBitmaps does: each sketch serializes
+    // 16 KB, so a full round is ~16 MB of memcpy that must not run unpreempted.
+    auto pending = std::exchange(hllCacheDirty_, {});
+    size_t done = 0;
+    for (const auto& cacheKey : pending) {
         auto it = hllCache_.find(cacheKey);
         if (it == hllCache_.end() || it->second.empty())
             continue;
@@ -3185,8 +3258,9 @@ void NativeIndex::flushDirtyHLLs(IndexWriteBatch& batch) {
         serialized.reserve(HyperLogLog::SERIALIZED_SIZE);
         it->second.serialize(serialized);
         batch.put(kvKey, serialized);
+        if ((++done & 0x0F) == 0)
+            co_await seastar::coroutine::maybe_yield();
     }
-    hllCacheDirty_.clear();
 }
 
 seastar::future<> NativeIndex::flushDirtyMeasurementBlooms(IndexWriteBatch& batch) {

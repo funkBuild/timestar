@@ -112,10 +112,19 @@ SEASTAR_TEST_F(DirtyCacheFlushTriggerTest, SizeTriggerBoundsDirtyCachesWithoutMe
             peak = std::max(peak, index.dirtyIndexCacheKeys());
         }
 
-        EXPECT_LE(peak, bound) << "dirty index-cache keys peaked at " << peak << " while walking " << days
-                               << " days with a 64 MB write buffer: the memtable threshold never came close, so "
-                               << "nothing drained the caches (write-scaleout debt D-17). The bound is " << bound
-                               << ".";
+        // The bound is checked once per CALL, not once per dirtied key, so a
+        // single call's day loop may legally overshoot it. `recordDaySpan` caps
+        // its loop at kMaxDaySpan = 366 days and the batch paths at the batch's
+        // distinct-day count; 366 is the documented worst case and is what this
+        // gate allows. (This workload dirties exactly one key per call, so the
+        // observed peak is the bound itself -- the slack exists so the gate does
+        // not fail on behaviour the register calls legal.)
+        constexpr size_t kLegalOvershoot = 366;
+        EXPECT_LE(peak, bound + kLegalOvershoot)
+            << "dirty index-cache keys peaked at " << peak << " while walking " << days
+            << " days with a 64 MB write buffer: the memtable threshold never came close, so "
+            << "nothing drained the caches (write-scaleout debt D-17). The bound is " << bound << " (+"
+            << kLegalOvershoot << " legal per-call overshoot).";
         // Belt and braces: the loop really did dirty more keys than the bound, so
         // the assertion above is not passing vacuously.
         EXPECT_GT(days, bound) << "test no longer exceeds the bound it is meant to exercise";
@@ -146,30 +155,96 @@ SEASTAR_TEST_F(DirtyCacheFlushTriggerTest, SizeTriggerBoundsDirtyCachesWithoutMe
 // memtable threshold — which, on a fixed fleet, may be never. Polls rather than
 // sleeping the full interval blind, so the test costs about one interval.
 SEASTAR_TEST_F(DirtyCacheFlushTriggerTest, AgeTriggerFlushesDirtyCachesWithNoFurtherWrites) {
+    constexpr int kSeries = 8;
+    const uint64_t ts = 31000ULL * ke::NS_PER_DAY;
+    const auto interval = NativeIndex::dirtyIndexCacheFlushInterval();
+
+    {
+        NativeIndex index(timestar::StorageLayout("."), 0);
+        co_await index.open();
+
+        for (int i = 0; i < kSeries; ++i) {
+            auto insert = makeDayInsert("dirtyage", "h" + std::to_string(i), ts);
+            co_await index.indexInsert(insert);
+        }
+
+        EXPECT_GT(index.dirtyIndexCacheKeys(), 0u) << "nothing was dirtied -- the test cannot observe the age trigger";
+        EXPECT_LT(index.dirtyIndexCacheKeys(), NativeIndex::maxDirtyIndexCacheKeys())
+            << kSeries << " series must stay well under the size bound, or this test measures the wrong trigger";
+
+        // Deadline is a generous multiple of the interval: the assertion is "it
+        // fires on its own", not "it fires within a tight window".
+        const auto deadline = std::chrono::steady_clock::now() + interval * 4;
+        while (index.dirtyIndexCacheKeys() > 0 && std::chrono::steady_clock::now() < deadline) {
+            co_await seastar::sleep(std::chrono::milliseconds(50));
+        }
+        EXPECT_EQ(index.dirtyIndexCacheKeys(), 0u)
+            << "dirty index-cache state survived " << (interval * 4).count()
+            << " ms with no further writes: nothing bounds its AGE, so a day rollover's membership can sit only in "
+            << "RAM until an unrelated memtable flush happens to run (write-scaleout debt D-17)";
+
+        // WHY THIS STILL PINS THE TIMER'S DURABILITY despite a clean close. The
+        // assertion above established that the dirty sets are EMPTY before
+        // close() runs, so close()'s own flush has nothing left to serialize --
+        // whatever the reopen below finds must have been written by the TIMER.
+        // Had the timer cleared the dirty flags without its batch reaching the
+        // memtable and WAL (the D-2/D-3 shape), close() would serialize nothing,
+        // the SSTable would carry no day-bitmap keys, and the reopen would come
+        // back empty.
+        //
+        // A crash simulation (destroy without close, as
+        // index_fault_injection_test.cpp does) would be the sharper instrument,
+        // but it is not a supported path for an index with armed timers: the
+        // destructor cancels both timers and cannot drain their gates, so a body
+        // still in flight traps in ~gate(). Filed as D-38.
+        co_await index.close();
+    }
+
+    {
+        NativeIndex index(timestar::StorageLayout("."), 0);
+        co_await index.open();
+        auto r = co_await index.findSeriesWithMetadataTimeScoped("dirtyage", {}, {}, ts, ts + ke::NS_PER_DAY - 1);
+        EXPECT_EQ(r.has_value() ? r->size() : 0u, static_cast<size_t>(kSeries))
+            << "the periodic flush emptied the dirty sets but the membership is not on disk: it cleared the dirty "
+            << "flags without its batch reaching the memtable and WAL (the D-2/D-3 bug class), and close() then had "
+            << "nothing left to persist. A counter reaching zero is not evidence of durability.";
+        co_await index.close();
+    }
+}
+
+// The periodic flush must be free when there is nothing to persist. This is not
+// a micro-optimisation: `flushDirtyCaches()` deliberately enters on a POPULATED
+// cache (so the trims run), and it unconditionally re-puts the local-ID counter
+// and the postings watermark. Were the timer to use that guard instead of the
+// stricter `hasDirtyCacheState()`, an idle shard would append two KV entries to
+// the memtable and the WAL every interval, forever -- growing a memtable that
+// nothing is writing to and eventually flushing SSTables out of pure idleness.
+//
+// Asserted on the index WAL's append sequence rather than on any cache counter,
+// because "no write happened" is precisely what the cache counters cannot say.
+SEASTAR_TEST_F(DirtyCacheFlushTriggerTest, IdleIndexWithWarmCachesWritesNothingOnTheTimer) {
     NativeIndex index(timestar::StorageLayout("."), 0);
     co_await index.open();
 
-    const uint64_t ts = 31000ULL * ke::NS_PER_DAY;
-    for (int i = 0; i < 8; ++i) {
-        auto insert = makeDayInsert("dirtyage", "h" + std::to_string(i), ts);
+    const uint64_t ts = 33000ULL * ke::NS_PER_DAY;
+    for (int i = 0; i < 4; ++i) {
+        auto insert = makeDayInsert("dirtyidle", "h" + std::to_string(i), ts);
         co_await index.indexInsert(insert);
     }
+    // Drain, leaving the caches POPULATED BUT CLEAN -- the state whose handling
+    // this test is about.
+    co_await index.compact();
+    EXPECT_EQ(index.dirtyIndexCacheKeys(), 0u);
 
-    EXPECT_GT(index.dirtyIndexCacheKeys(), 0u) << "nothing was dirtied -- the test cannot observe the age trigger";
-    EXPECT_LT(index.dirtyIndexCacheKeys(), NativeIndex::maxDirtyIndexCacheKeys())
-        << "8 series must stay well under the size bound, or this test is measuring the wrong trigger";
-
-    // Deadline is a generous multiple of the interval: the assertion is "it fires
-    // on its own", not "it fires within a tight window".
+    const uint64_t seqAfterDrain = index.indexWalSequence();
     const auto interval = NativeIndex::dirtyIndexCacheFlushInterval();
-    const auto deadline = std::chrono::steady_clock::now() + interval * 10;
-    while (index.dirtyIndexCacheKeys() > 0 && std::chrono::steady_clock::now() < deadline) {
-        co_await seastar::sleep(std::chrono::milliseconds(50));
-    }
-    EXPECT_EQ(index.dirtyIndexCacheKeys(), 0u)
-        << "dirty index-cache state survived " << (interval * 10).count()
-        << " ms with no further writes: nothing bounds its AGE, so a day rollover's membership can sit only in "
-        << "RAM until an unrelated memtable flush happens to run (write-scaleout debt D-17)";
+    co_await seastar::sleep(interval * 2 + std::chrono::milliseconds(300));
+
+    EXPECT_EQ(index.indexWalSequence(), seqAfterDrain)
+        << "an idle index appended to its WAL across two dirty-cache flush intervals. The periodic flush must "
+        << "consult hasDirtyCacheState(), not flushDirtyCaches()'s populated-cache guard, or every shard writes "
+        << "the local-ID counter and postings watermark forever at " << interval.count() << " ms.";
+    EXPECT_EQ(index.dirtyIndexCacheKeys(), 0u);
 
     co_await index.close();
 }
@@ -203,6 +278,56 @@ SEASTAR_TEST_F(DirtyCacheFlushTriggerTest, RepeatedIdenticalInsertsDirtyNothing)
         << "500 re-inserts of an already-recorded (series, day) dirtied the caches even though not one bit "
         << "changed. Those entries are then trim-exempt for as long as the workload continues, and every "
         << "periodic flush rewrites bitmaps identical to the ones already on disk.";
+
+    co_await index.close();
+}
+
+// The byte estimate has to track a bitmap GROWING IN PLACE, not just the size it
+// had when it was first dirtied. A day rollover creates an EMPTY day bitmap: its
+// clean->dirty transition is worth a few bytes of key no matter how many million
+// ids then land in it, so an estimate charged only at the transition reads ~0 on
+// precisely the workload the bound exists for -- a byte trigger that can never
+// fire before the key trigger is not a second bound, it is decoration.
+//
+// Measured as a DELTA between two probes with no flush in between, so the result
+// does not depend on the HLL or bloom charges (both already paid by the first
+// probe) or on any key-size arithmetic. One postings key and one day-bitmap key
+// are involved throughout: all series share the tag value and the day, and differ
+// only by field name.
+SEASTAR_TEST_F(DirtyCacheFlushTriggerTest, ByteEstimateTracksBitmapsGrowingInPlace) {
+    NativeIndex index(timestar::StorageLayout("."), 0);
+    co_await index.open();
+
+    const uint64_t ts = 34000ULL * ke::NS_PER_DAY;
+    auto insertField = [&](int i) -> seastar::future<> {
+        TimeStarInsert<double> insert("dirtygrow", "f" + std::to_string(i));
+        insert.tags = {{"rack", "r0"}};
+        insert.timestamps = {ts};
+        insert.values = {1.0};
+        co_await index.indexInsert(insert);
+    };
+
+    constexpr int kWarm = 200;
+    constexpr int kTotal = 2000;
+    for (int i = 0; i < kWarm; ++i)
+        co_await insertField(i);
+    const size_t bytesAfterWarm = index.dirtyIndexCacheBytes();
+    const size_t keysAfterWarm = index.dirtyIndexCacheKeys();
+
+    for (int i = kWarm; i < kTotal; ++i)
+        co_await insertField(i);
+
+    // No flush may have intervened, or the delta would be measuring a reset.
+    EXPECT_EQ(index.dirtyIndexCacheKeys(), keysAfterWarm)
+        << "the dirty key set changed between probes -- a flush ran and this measurement is meaningless";
+    const size_t grown = index.dirtyIndexCacheBytes() - bytesAfterWarm;
+
+    // (kTotal - kWarm) series each add one id to the shared postings bitmap and
+    // one to the day bitmap: 3600 in-place changes. At the 4-byte charge that is
+    // ~14 KB; charged only at the transition it is exactly 0.
+    EXPECT_GT(grown, 4096u) << "1800 further series grew two already-dirty bitmaps by 3600 ids and the byte estimate "
+                            << "moved " << grown << " bytes. Charged only on the clean->dirty transition it cannot "
+                            << "see in-place growth, which is every day rollover (write-scaleout debt D-17).";
 
     co_await index.close();
 }

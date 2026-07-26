@@ -213,9 +213,17 @@ public:
     // dirty-cache flush trigger below (write-scaleout debt D-17).
     size_t dirtyIndexCacheKeys() const;
     static size_t maxDirtyIndexCacheKeys();
+    // The companion byte estimate. Read the note on dirtyCacheBytes_ for exactly
+    // what it counts -- it is a write-volume estimate, not an arena accountant.
+    size_t dirtyIndexCacheBytes() const;
     // Period of the background dirty-cache flush, i.e. the bound on how long
     // index-cache state can live only in RAM once no further writes arrive.
     static std::chrono::milliseconds dirtyIndexCacheFlushInterval();
+    // The index WAL's append sequence, which advances only when this index
+    // actually writes. Lets a caller assert that an IDLE shard performs no index
+    // write at all — the property the periodic flush's strict guard exists to
+    // preserve, and one that no cache counter can express. 0 before open().
+    uint64_t indexWalSequence() const;
 
     // Non-virtual: insert indexing (template)
     template <class T>
@@ -373,21 +381,40 @@ private:
     // an idle shard with populated-but-clean caches does not rewrite the local-ID
     // counter and watermark, and dirty the memtable, once a second forever.
     bool hasDirtyCacheState() const;
-    // Record a bitmap/day-bitmap cache key ENTERING its dirty set, charging the
-    // bytes its flush will write. Only the clean→dirty transition is charged:
-    // re-dirtying an already-dirty key adds no new work for the next flush.
-    void noteDirtyBitmapKey(std::unordered_set<std::string>& dirtyKeys, const std::string& cacheKey, size_t entryBytes);
+    // noteBitmapChanged() is declared with the bitmap caches below, where
+    // BitmapEntry is defined; it is the single place where the `dirty` flag, the
+    // dirty-key set and the byte estimate stay consistent.
+    void chargeDirtyCacheBytes(size_t bytes);
 
-    // Estimated bytes the next dirty-cache flush will write. Maintained O(1) at
-    // the dirty-transition sites (see noteDirtyBitmapKey); zeroed by
-    // flushDirtyCaches() once the synchronous serializers have emptied the dirty
-    // sets, so anything a concurrent insert dirties during the bloom rebuild's
-    // suspension re-accumulates through the normal path.
+    // WHAT THIS COUNTS, precisely: the serialized bytes the next dirty-cache
+    // flush will write. A roaring bitmap's serialized size tracks its container
+    // footprint closely, so it also approximates the memory the dirty — and
+    // therefore TRIM-EXEMPT — entries hold, which is why the bound exists at all.
     //
-    // It does NOT track a bitmap growing in place while already dirty — that
-    // costs a per-add branch on the hottest path in the index and would still be
-    // an estimate. The AGE bound covers it: an in-place-growing bitmap is by
-    // definition being changed, so it is flushed within one interval.
+    // Charged in two places, and the SECOND is the load-bearing one:
+    //   * clean→dirty transition — `bitmap.getSizeInBytes()`, the entry's real
+    //     current size. (The cached `approxBytes` is usually equal to it, since a
+    //     bitmap can no longer grow while clean, but it is a figure four separate
+    //     sites must remember to maintain and one of them already understates it
+    //     after a concurrent cold-load merge. Reading the bitmap is authoritative
+    //     and costs one container walk per key per flush interval.)
+    //   * every subsequent change while the entry STAYS dirty —
+    //     kDirtyBitmapAddBytes. Without this the estimate was inert on exactly the
+    //     workloads the bound exists for: a day rollover creates an EMPTY day
+    //     bitmap, so its transition charge is a few bytes of key no matter how
+    //     many million ids then land in it.
+    //
+    // WHAT IT IS NOT: an accountant for the arena. It is charged and only ever
+    // discharged by a flush, and the per-change constant over-estimates a dense
+    // bitmap. Over-counting only makes the next flush earlier; under-counting
+    // would let the trigger go silent, which is the failure mode that matters. The
+    // HLL charge is exact (HyperLogLog::SERIALIZED_SIZE); the bloom charge is a
+    // documented floor.
+    //
+    // It is also NOT, on its own, what catches a day rollover on a large shard: at
+    // a 512 MB budget the threshold is ~51 MB, which one rollover need never
+    // reach. The AGE bound covers that case. The two are complements, not
+    // redundant spellings of one idea.
     size_t dirtyCacheBytes_ = 0;
     // Resolved once in open(): indexCacheBudgetBytes() reads
     // seastar::memory::stats(), and this is consulted per insert batch. 0 before
@@ -395,28 +422,39 @@ private:
     // caches to dirty yet.
     size_t maxDirtyCacheBytes_ = 0;
 
-    // ONE TENTH of MAX_BITMAP_CACHE_ENTRIES (and one fifth of
-    // MAX_DAY_BITMAP_CACHE_ENTRIES), so at most ~10-20% of either cache can be
-    // trim-exempt at once and the entry-count trims below keep their meaning.
-    // It is also a sane single write batch: 10K serialized bitmaps is the same
-    // order as one memtable flush, not a stall.
+    // ONE TENTH of MAX_BITMAP_CACHE_ENTRIES, one fifth of
+    // MAX_DAY_BITMAP_CACHE_ENTRIES, so at most 10% of the postings cache and 20%
+    // of the day-bitmap cache can be trim-exempt at once and the entry-count trims
+    // below keep their meaning. It also caps a single flush round's work, which
+    // matters now that the periodic flush can reach it: the serializers yield
+    // every 64 keys, so 10K bitmaps is bounded latency rather than a stall.
     static constexpr size_t kMaxDirtyCacheKeys = 10000;
-    // Share of the whole index cache budget that may be dirty, hence
-    // unreclaimable by the trims. 10% is the slice maxHllCacheBytes() already
-    // gets: ~51 MB at the 512 MB budget ceiling, ~1.6 MB at the 16 MB floor.
+    // Share of the index cache budget that the dirty entries' SERIALIZED size may
+    // reach before a flush is forced. 10% is the slice maxHllCacheBytes() already
+    // gets: ~51 MB at the 512 MB budget ceiling, ~1.6 MB at the 16 MB floor. Read
+    // the note on dirtyCacheBytes_ for what that figure does and does not measure.
     static constexpr size_t kDirtyCacheBudgetPercent = 10;
+    // Charged per change to an ALREADY-dirty bitmap. One add grows a roaring array
+    // container by 2 bytes and can promote or split a container; 4 over-estimates
+    // for dense bitmaps, which is the safe direction (an earlier flush).
+    static constexpr size_t kDirtyBitmapAddBytes = 4;
     // Charged for a newly dirtied measurement bloom. BloomFilter::build() sizes
     // from the measurement's distinct tag values, so the real figure ranges from
     // 8 KB to megabytes; 8 KB is its floor, which keeps the estimate a LOWER
     // bound on what the flush writes rather than an optimistic guess.
     static constexpr size_t kDirtyBloomBytesEstimate = 8192;
-    // 10x kWalSyncInterval. The WAL sync flushes a user-space buffer and
-    // fdatasyncs; this serializes every CHANGED bitmap into a batch, so it is
-    // deliberately an order of magnitude coarser. It costs nothing when nothing
-    // changed (hasDirtyCacheState() is four empty-checks), and it is what puts
-    // the day-bitmap loss window — the one with no repair path on open — in the
-    // same league as the WAL's instead of unbounded.
-    static constexpr std::chrono::seconds kDirtyCacheFlushInterval{1};
+    // 50x kWalSyncInterval. The WAL sync flushes a user-space buffer and
+    // fdatasyncs; this re-serializes every CHANGED bitmap in full, so it is
+    // deliberately two orders of magnitude coarser, and the interval is a direct
+    // multiplier on write amplification: a continuously-growing day bitmap for a
+    // 1M-series measurement serializes ~128 KB per round, i.e. ~26 KB/s at 5 s
+    // against ~128 KB/s at 1 s. It costs nothing when nothing changed
+    // (hasDirtyCacheState() is four empty-checks plus an integer compare, and an
+    // unchanged bitmap is no longer marked dirty at all), and 5 s sits well inside
+    // the server's 30 s shutdown budget, so even the timeout `_Exit(1)` path loses
+    // at most one interval of day-bitmap membership — the state with no repair
+    // path on open — instead of everything since the last memtable flush.
+    static constexpr std::chrono::seconds kDirtyCacheFlushInterval{5};
     seastar::timer<> dirtyCacheTimer_;
     seastar::gate dirtyCacheGate_;
 
@@ -515,6 +553,10 @@ private:
     using BitmapHandle = seastar::lw_shared_ptr<BitmapEntry>;
     using BitmapCache = tsl::robin_map<std::string, BitmapHandle>;
     static BitmapHandle ensureEntry(BitmapCache& cache, const std::string& key);
+    // Mark an entry dirty after an add that actually CHANGED it, record its key,
+    // and charge the D-17 write estimate. See dirtyCacheBytes_ above for what the
+    // clean→dirty transition charges and why it is not `approxBytes`.
+    void noteBitmapChanged(std::unordered_set<std::string>& dirtyKeys, const std::string& cacheKey, BitmapEntry& entry);
 
     // In-memory bitmap cache. Key: "measurement\0tagKey\0tagValue"
     // Populated lazily on first access (insert or query), flushed before memtable swap.
@@ -563,7 +605,10 @@ private:
     // pointer. The same discipline `updateTagHLL` already documented for itself.
     seastar::future<uint64_t> addToPostingsBitmapForInsert(std::string& cacheKey, uint32_t localId);
     // Flush dirty bitmaps + batched LOCAL_ID_FORWARD entries into the KV store.
-    void flushDirtyBitmaps(IndexWriteBatch& batch);
+    // Preemptible: yields every 64 keys, after exchanging the dirty set out so a
+    // concurrent re-dirty during a yield survives into the NEXT round instead of
+    // being dropped by a trailing clear() (the D-2 shape).
+    seastar::future<> flushDirtyBitmaps(IndexWriteBatch& batch);
     // Migration: build LocalIdMap + bitmaps from existing TAG_INDEX data on first open.
     seastar::future<> migrateToLocalIds(IndexWriteBatch& batch);
     // Build a bitmap cache key: "measurement\0tagKey\0tagValue"
@@ -600,7 +645,7 @@ private:
     // this call before mutating the key buffer.
     seastar::future<> updateTagHLL(const std::string& measurement, const std::string& tagKey,
                                    const std::string& tagValue, uint32_t localId, const std::string& seedBitmapKey);
-    void flushDirtyHLLs(IndexWriteBatch& batch);
+    seastar::future<> flushDirtyHLLs(IndexWriteBatch& batch);  // preemptible, see flushDirtyBitmaps
     seastar::future<> flushDirtyMeasurementBlooms(IndexWriteBatch& batch);
     // Step 7: Trim HLL cache after flush — evict non-dirty entries when too large
     void trimHllCache();
@@ -625,7 +670,7 @@ private:
     seastar::future<bool> addToDayBitmapForInsert(std::string& cacheKey, uint32_t localId);
     // Read-only accessor; see getPostingsBitmapByKey for what the handle guarantees.
     seastar::future<BitmapHandle> getDayBitmapByKey(const std::string& cacheKey);
-    void flushDirtyDayBitmaps(IndexWriteBatch& batch);
+    seastar::future<> flushDirtyDayBitmaps(IndexWriteBatch& batch);  // preemptible, see flushDirtyBitmaps
     seastar::future<roaring::Roaring> buildActiveSeriesBitmap(const std::string& measurement, uint32_t startDay,
                                                               uint32_t endDay);
 
