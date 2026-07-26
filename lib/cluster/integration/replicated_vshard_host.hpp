@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../../storage/journal_segment.hpp"
+#include "../../storage/journal_sink.hpp"
 #include "../data/node_store.hpp"  // ProposeSink
 #include "../data/replicated_command.hpp"
 #include "../raft/raft_group_registry.hpp"
@@ -40,9 +41,22 @@ public:
     ReplicatedVShardHost(const ReplicatedVShardHost&) = delete;
     ReplicatedVShardHost& operator=(const ReplicatedVShardHost&) = delete;
 
+    // Is this host appending into ONE shared per-shard journal (debt D-10) rather
+    // than a journal per VShard? Opt-in via TIMESTAR_CLUSTER_SHARED_JOURNAL=1;
+    // DEFAULT OFF. Resolved once per process.
+    static bool sharedJournalEnabled();
+
+    // fdatasyncs issued and sync() requests served across this shard's journals.
+    // Their RATIO is the coalescing factor, and it is the only measurable evidence
+    // of D-10 on a tmpfs box (where the elapsed-time win is invisible by
+    // construction -- plan 5.3). ~1.0 per-VShard; > 1 shared.
+    uint64_t journalFsyncs() const;
+    uint64_t journalSyncRequests() const;
+
     // Instantiate the Raft group for `vshard` with `voters`. `opts` tunes election
-    // timing (production: uniform; tests: preferred leader). Journal lives under
-    // journalRoot/vshard_<id>.
+    // timing (production: uniform; tests: preferred leader). The journal lives
+    // under journalRoot/vshard_<id> (default) or, with the shared journal enabled,
+    // journalRoot/shard_<core> shared by every group on this reactor.
     seastar::future<> addVShard(uint16_t vshard, std::vector<NodeId> voters, raft::RaftOptions opts = {});
 
     // Replicate a command to a VShard's group; resolves true on durable quorum commit
@@ -208,6 +222,19 @@ private:
     EngineLocalStore& store_;
     NodeId self_;
     std::filesystem::path journalRoot_;
+    // ---- shared per-shard journal (debt D-10), null unless opted in ----
+    //
+    // Opened lazily on the first addVShard and shared by every group on this
+    // reactor. `sharedRecovered_` is the ONE recovered record set; each group
+    // filters it with recoverRaftState(records, vshard), which already does exactly
+    // that (it sorts by vshard_seq, so physical interleaving is irrelevant).
+    //
+    // DECLARATION ORDER: sharedSink_ borrows sharedWriter_, and vshards_' persistence
+    // objects borrow sharedSink_; members destruct in reverse declaration order, so
+    // the writer is declared FIRST and the sink after it, both BEFORE vshards_.
+    std::unique_ptr<JournalWriter> sharedWriter_;
+    std::unique_ptr<SharedShardJournal> sharedSink_;
+    std::vector<JournalRecord> sharedRecovered_;
     // DECLARATION ORDER IS LOAD-BEARING: registry_ holds RaftGroups that BORROW
     // (RaftPersistence&/RaftStateMachine&) into vshards_' unique_ptrs, so registry_
     // (and its groups) MUST tear down before vshards_. Members destruct in reverse

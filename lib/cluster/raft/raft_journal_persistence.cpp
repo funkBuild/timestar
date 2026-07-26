@@ -78,7 +78,10 @@ std::optional<Snapshot> decodeSnapshotPayload(const std::string& p, bool* receiv
 }  // namespace
 
 JournalRaftPersistence::JournalRaftPersistence(JournalWriter& writer, VShardId vshard, uint64_t startSeq)
-    : writer_(writer), vshard_(vshard), nextSeq_(startSeq == 0 ? 1 : startSeq) {}
+    : owned_(std::in_place, writer), sink_(*owned_), vshard_(vshard), nextSeq_(startSeq == 0 ? 1 : startSeq) {}
+
+JournalRaftPersistence::JournalRaftPersistence(JournalSink& sink, VShardId vshard, uint64_t startSeq)
+    : sink_(sink), vshard_(vshard), nextSeq_(startSeq == 0 ? 1 : startSeq) {}
 
 seastar::future<> JournalRaftPersistence::persistHardState(HardState hs) {
     JournalRecord r;
@@ -88,7 +91,7 @@ seastar::future<> JournalRaftPersistence::persistHardState(HardState hs) {
     r.raftTerm = hs.currentTerm;
     r.payload.reserve(8);
     putU64(r.payload, hs.votedFor);
-    return writer_.append(r);
+    return sink_.append(r);
 }
 
 seastar::future<> JournalRaftPersistence::persistEntries(std::vector<LogEntry> entries) {
@@ -100,7 +103,7 @@ seastar::future<> JournalRaftPersistence::persistEntries(std::vector<LogEntry> e
         r.raftTerm = e.term;
         r.raftIndex = e.index;
         r.payload = e.data;
-        co_await writer_.append(r);
+        co_await sink_.append(r);
     }
 }
 
@@ -112,11 +115,11 @@ seastar::future<> JournalRaftPersistence::persistSnapshot(Snapshot snap, bool re
     r.raftTerm = snap.term;
     r.raftIndex = snap.index;
     r.payload = encodeSnapshotPayload(snap, receivedFromPeer);
-    return writer_.append(r);
+    return sink_.append(r);
 }
 
 seastar::future<> JournalRaftPersistence::sync() {
-    return writer_.barrier();
+    return sink_.sync();
 }
 
 RecoveredRaftState recoverRaftState(const std::vector<JournalRecord>& records, VShardId vshard) {

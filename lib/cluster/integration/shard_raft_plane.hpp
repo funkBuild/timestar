@@ -300,6 +300,28 @@ public:
         bool triggerEnabled = false;
     };
 
+    // Journal fsync accounting (debt D-10). `syncRequests / fsyncs` is the
+    // COALESCING FACTOR: 1.0 with a journal per VShard (each group syncs alone to
+    // its own fd), > 1 with the shared per-shard journal. It is the only evidence
+    // of D-10 that is measurable on a tmpfs box, where the elapsed-time win the
+    // change is actually for is invisible by construction (plan 5.3).
+    struct JournalCounts {
+        uint64_t fsyncs = 0;
+        uint64_t syncRequests = 0;
+        bool shared = false;
+    };
+
+    JournalCounts journalCounts() const {
+        JournalCounts c;
+        if (!plane_)
+            return c;
+        auto& host = const_cast<ReplicatedDataPlane*>(plane_.get())->host();
+        c.fsyncs = host.journalFsyncs();
+        c.syncRequests = host.journalSyncRequests();
+        c.shared = ReplicatedVShardHost::sharedJournalEnabled();
+        return c;
+    }
+
     SnapshotCounts snapshotCounts() const {
         SnapshotCounts c;
         if (!plane_)

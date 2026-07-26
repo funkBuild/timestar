@@ -46,6 +46,13 @@ public:
 
     seastar::future<> close();
 
+    // fdatasync calls issued by this writer (barriers, including the ones a
+    // rotation or a seal performs internally). The DISK win of a shared per-shard
+    // journal (debt D-10) is invisible on a tmpfs bench, so this ratio -- sync
+    // REQUESTS per fsync, see JournalSink -- is the only honest evidence of
+    // coalescing available on this box.
+    [[nodiscard]] uint64_t fsyncs() const noexcept { return fsyncs_; }
+
     [[nodiscard]] bool fenced() const noexcept { return fenced_; }
     [[nodiscard]] uint64_t currentSegmentNumber() const noexcept { return currentSegment_; }
 
@@ -82,6 +89,7 @@ private:
     size_t alignment_ = 0;     // disk write DMA alignment of the current file
     uint64_t alignedLen_ = 0;  // durable full-block prefix length (multiple of alignment_)
     std::string tail_;         // logical bytes after alignedLen_ (unpadded; grows past a block between barriers)
+    uint64_t fsyncs_ = 0;      // fdatasyncs issued (see fsyncs())
     bool opened_ = false;
     bool fenced_ = false;
     std::string fenceReason_;

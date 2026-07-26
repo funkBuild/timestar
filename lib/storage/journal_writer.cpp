@@ -214,6 +214,7 @@ seastar::future<> JournalWriter::barrier() {
             alignedLen_ += full;
             tail_.erase(0, full);  // keep only the unpadded sub-block remainder
         }
+        ++fsyncs_;
         co_await file_.flush();  // fdatasync: durable through logicalLen()
     } catch (const std::exception& e) {
         fence(std::string("journal barrier failed: ") + e.what());
@@ -225,6 +226,7 @@ seastar::future<> JournalWriter::sealCurrent() {
     const uint64_t logical = logicalLen();
     co_await barrier();                // flush the tail (as a padded block) durably
     co_await file_.truncate(logical);  // trim the seal padding: sealed segments end at a record boundary
+    ++fsyncs_;
     co_await file_.flush();
     co_await file_.close();
 }

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../../storage/journal_record.hpp"
+#include "../../storage/journal_sink.hpp"
 #include "../../storage/journal_writer.hpp"
 #include "../core/vshard.hpp"
 #include "raft_driver.hpp"
@@ -15,20 +16,35 @@
 namespace timestar::raft {
 
 // Journal-backed Raft persistence for ONE group. Records are appended to a
-// per-core JournalWriter (shared by every group on the core, tagged with the
-// group's VShard) and made durable by sync() -> writer.barrier() (the group
-// commit fdatasync). Honours the journal safety contract from ADR 0001: appends
+// JournalSink tagged with the group's VShard, and made durable by sync().
+// Honours the journal safety contract from ADR 0001: appends
 // are ordered by a per-VShard vshard_seq, hard state and truncations are
 // ordinary appended records (never in-place edits), and any writer I/O error
 // fences it so the driver stops.
 //
-// The writer is SHARED and its barrier makes ALL groups' pending appends on the
-// core durable in one fsync -- so many groups committing in the same tick cost a
-// single fdatasync (bounded fsync count, per the Phase 2 gate).
+// WHETHER THE WRITER IS SHARED IS A DEPLOYMENT CHOICE (debt D-10), and this class
+// no longer claims to know. It appends into a `JournalSink`:
+//
+//   * DirectJournalSink -- this VShard's OWN JournalWriter, sync() == its barrier.
+//     The DEFAULT, and what every cluster runs today: each group syncs alone, to
+//     its own fd, so there is one fdatasync per drained Ready per group.
+//   * SharedShardJournal -- one writer per reactor shard with group-commit
+//     coalescing, so many groups committing in the same window cost ONE fdatasync.
+//
+// The header used to assert the second unconditionally ("the writer is SHARED and
+// its barrier makes ALL groups' pending appends on the core durable in one fsync
+// -- bounded fsync count, per the Phase 2 gate"). That was never true of the
+// wiring: `addVShard` has always created one writer per VShard directory. Plan 5.3
+// is where the discrepancy was found and D-10 is where it is being closed.
 class JournalRaftPersistence : public RaftPersistence {
 public:
     // `startSeq` is the next vshard_seq to assign (recovered max + 1, or 1 fresh).
+    // This overload OWNS a DirectJournalSink over `writer` -- today's shape, and
+    // what the tests construct.
     JournalRaftPersistence(JournalWriter& writer, VShardId vshard, uint64_t startSeq = 1);
+    // Append into a sink the caller owns (a per-shard SharedShardJournal). The sink
+    // must outlive this object.
+    JournalRaftPersistence(JournalSink& sink, VShardId vshard, uint64_t startSeq = 1);
 
     seastar::future<> persistHardState(HardState hs) override;
     seastar::future<> persistEntries(std::vector<LogEntry> entries) override;
@@ -36,9 +52,13 @@ public:
     seastar::future<> sync() override;
 
     uint64_t nextSeq() const { return nextSeq_; }
+    // sync() calls this group made (debt D-10 evidence; see JournalSink::fsyncs).
+    uint64_t syncRequests() const { return sink_.syncRequests(); }
 
 private:
-    JournalWriter& writer_;
+    // DECLARATION ORDER IS LOAD-BEARING: sink_ may reference owned_.
+    std::optional<DirectJournalSink> owned_;
+    JournalSink& sink_;
     VShardId vshard_;
     uint64_t nextSeq_;
 };

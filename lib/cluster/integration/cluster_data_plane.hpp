@@ -129,6 +129,12 @@ public:
         uint64_t snapshotTransfersRestarted = 0;
         uint64_t snapshotTransfersAbandoned = 0;
         bool snapshotTriggerEnabled = false;
+        // Raft journal fsync accounting (debt D-10). journalSyncRequests /
+        // journalFsyncs is the coalescing factor -- 1.0 for the default per-VShard
+        // journal, > 1 when the shared per-shard journal is enabled.
+        uint64_t journalFsyncs = 0;
+        uint64_t journalSyncRequests = 0;
+        bool journalShared = false;
     };
     seastar::future<Status> status() const;
 

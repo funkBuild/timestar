@@ -6,6 +6,7 @@
 #include "../raft/raft_node.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/reactor.hh>
 #include <stdexcept>
@@ -29,6 +30,43 @@ ReplicatedVShardHost::~ReplicatedVShardHost() {
             vshards_.size());
 }
 
+bool ReplicatedVShardHost::sharedJournalEnabled() {
+    // DEFAULT OFF, and the default is the decision, not an oversight (debt D-10).
+    // The ordering contract on SharedShardJournal is airtight as reasoned and as
+    // unit-tested, but a shared journal changes the FENCE BLAST RADIUS (one bad
+    // fdatasync stops every group on the reactor, not one), it makes segment
+    // retention cluster-wide (D-34's bricks were written for exactly this layout
+    // and still have no caller), and its win is DISK-only -- invisible on the tmpfs
+    // box every gate in this tree runs on. Shipping it on by default would trade a
+    // measured-at-zero benefit here for a real change to the durability path, which
+    // is the wrong side of that bet. Opt in with TIMESTAR_CLUSTER_SHARED_JOURNAL=1.
+    static const bool on = [] {
+        const char* e = std::getenv("TIMESTAR_CLUSTER_SHARED_JOURNAL");
+        return e && e[0] == '1';
+    }();
+    return on;
+}
+
+uint64_t ReplicatedVShardHost::journalFsyncs() const {
+    if (sharedWriter_)
+        return sharedWriter_->fsyncs();
+    uint64_t n = 0;
+    for (const auto& [vs, state] : vshards_)
+        if (state.writer)
+            n += state.writer->fsyncs();
+    return n;
+}
+
+uint64_t ReplicatedVShardHost::journalSyncRequests() const {
+    uint64_t n = 0;
+    if (sharedSink_)
+        return sharedSink_->syncRequests();
+    for (const auto& [vs, state] : vshards_)
+        if (state.persistence)
+            n += state.persistence->syncRequests();
+    return n;
+}
+
 seastar::future<> ReplicatedVShardHost::addVShard(uint16_t vshard, std::vector<NodeId> voters, raft::RaftOptions opts) {
     // AN IDENTITY-ASSUMING SITE, deliberately left so (debt D-11, ADR 0004). Three
     // things below are keyed by the VShard id AS a group id:
@@ -48,15 +86,47 @@ seastar::future<> ReplicatedVShardHost::addVShard(uint16_t vshard, std::vector<N
     if (registry_.group(vshard))
         throw std::runtime_error("ReplicatedVShardHost::addVShard: VShard already hosted");
     VShardState vs;
-    fs::path dir = journalRoot_ / ("vshard_" + std::to_string(vshard));
-    fs::create_directories(dir);
-
     JournalSegmentHeader hdr;
     hdr.clusterUuid.fill(0x11);  // TODO(M3 group-0): the real cluster UUID from node.json
     hdr.coreNumber = static_cast<uint16_t>(seastar::this_shard_id());
     hdr.bootId.fill(0x44);
-    vs.writer = std::make_unique<JournalWriter>(dir, hdr, 1u << 20);
-    auto recovered = co_await vs.writer->open();
+
+    // ONE journal per shard (debt D-10, opt-in) or one per VShard (default).
+    //
+    // Recovery is the SAME code either way: recoverRaftState(records, vshard)
+    // filters a record set by VShard and replays it in vshard_seq order, so an
+    // interleaved shared stream reconstructs each group's log exactly as a
+    // dedicated one does. Physical order never mattered -- ADR 0001 made
+    // vshard_seq the ordering key precisely because segment-GC copy-forward can
+    // relocate a laggard's records behind its own newer ones.
+    if (sharedJournalEnabled()) {
+        if (!sharedWriter_) {
+            fs::path dir = journalRoot_ / ("shard_" + std::to_string(seastar::this_shard_id()));
+            fs::create_directories(dir);
+            // A larger rotation target than the per-VShard 1 MiB: this file carries
+            // every group on the reactor (~1365 at 4096/3 shards), so the per-VShard
+            // size would rotate -- and seal, and fsync, and sync_directory --
+            // constantly.
+            sharedWriter_ = std::make_unique<JournalWriter>(dir, hdr, 1u << 26);
+            sharedRecovered_ = co_await sharedWriter_->open();
+            sharedSink_ = std::make_unique<SharedShardJournal>(*sharedWriter_);
+            timestar::http_log.info(
+                "cluster: shard {} opened a SHARED Raft journal at {} ({} record(s) recovered); every group on this "
+                "reactor now group-commits through one fdatasync (debt D-10)",
+                seastar::this_shard_id(), dir.string(), sharedRecovered_.size());
+        }
+    }
+    std::vector<JournalRecord> ownRecovered;
+    if (!sharedSink_) {
+        fs::path dir = journalRoot_ / ("vshard_" + std::to_string(vshard));
+        fs::create_directories(dir);
+        vs.writer = std::make_unique<JournalWriter>(dir, hdr, 1u << 20);
+        ownRecovered = co_await vs.writer->open();
+    }
+    // Shared mode reads the ONE recovered set (never copied -- it is ~1365 groups'
+    // records and every addVShard on this shard needs it); per-VShard mode reads
+    // this VShard's own, which is dropped at the end of this frame.
+    const std::vector<JournalRecord>& recovered = sharedSink_ ? sharedRecovered_ : ownRecovered;
     raft::RecoveredRaftState st = raft::recoverRaftState(recovered, VShardId{vshard});
 
     std::vector<NodeId> baseVoters = voters;
@@ -69,7 +139,10 @@ seastar::future<> ReplicatedVShardHost::addVShard(uint16_t vshard, std::vector<N
         baseLearners = st.snapshot->config.learners;
     }
 
-    vs.persistence = std::make_unique<raft::JournalRaftPersistence>(*vs.writer, VShardId{vshard}, st.nextSeq);
+    vs.persistence = sharedSink_
+                         ? std::make_unique<raft::JournalRaftPersistence>(static_cast<JournalSink&>(*sharedSink_),
+                                                                          VShardId{vshard}, st.nextSeq)
+                         : std::make_unique<raft::JournalRaftPersistence>(*vs.writer, VShardId{vshard}, st.nextSeq);
     vs.sm = std::make_unique<EngineDataStateMachine>(store_, VShardId{vshard});
     raft::RaftNode node(self_, baseVoters, std::move(st.log), st.hardState, opts, baseLearners);
     if (st.snapshot && st.snapshotFromPeer) {
@@ -558,10 +631,19 @@ seastar::future<> ReplicatedVShardHost::stop() {
     if (!snapshotGate_.is_closed())
         co_await snapshotGate_.close();
     co_await registry_.stop();  // stops the tick loop + drains
+    // The shared sink first: a round in flight holds a reference to the writer, and
+    // a waiter it has not yet resolved must be failed rather than left hanging.
+    if (sharedSink_)
+        co_await sharedSink_->stop();
     for (auto& [vs, state] : vshards_)
         if (state.writer)
             co_await state.writer->close();
     vshards_.clear();
+    if (sharedWriter_)
+        co_await sharedWriter_->close();
+    sharedSink_.reset();
+    sharedWriter_.reset();
+    sharedRecovered_.clear();
 }
 
 }  // namespace timestar::cluster
