@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <functional>
+#include <limits>
 
 namespace timestar::raft {
 
@@ -162,7 +163,8 @@ void RaftNode::becomeFollower(Term term, NodeId leader) {
     nextIndex_.clear();
     matchIndex_.clear();
     recentActive_.clear();
-    lastAckTick_.clear();  // liveness is per-term; see ticksSinceAck()
+    lastAckTick_.clear();    // liveness is per-term; see ticksSinceAck()
+    snapTransfers_.clear();  // chunked-snapshot progress is per-term too (D-5)
     leadTransferee_ = kNoNode;
     pendingReads_.clear();  // drop unconfirmed reads; the caller retries at the new leader
     ackedReadSeq_.clear();
@@ -224,6 +226,9 @@ void RaftNode::becomeLeader() {
     // heartbeatTimeout away). That errs toward "not live", which is the safe
     // direction for every consumer -- the balancer simply skips a pass.
     lastAckTick_.clear();
+    // No transfer this term has begun. A stale record would let a fresh leader believe a
+    // chunk is in flight and so decline to start the transfer the peer actually needs.
+    snapTransfers_.clear();
     for (NodeId peer : replicationPeers(config_, id_)) {
         nextIndex_[peer] = log_.lastIndex() + 1;
         matchIndex_[peer] = kNoIndex;
@@ -281,25 +286,117 @@ void RaftNode::bcastAppend() {
 void RaftNode::sendInstallSnapshot(NodeId peer) {
     if (snapshot_.index == kNoIndex)
         return;  // nothing to serve (should not happen once compaction ran)
-    // REFUSE, WITHOUT ADVANCING nextIndex_, a snapshot the transport cannot carry
-    // (write-scaleout 5 review, F3a). The optimistic advance below is what turns a
-    // refused send into a hot loop -- advance, follower rejects the next append, rewind,
-    // re-encode the whole snapshot, refuse again -- so the check has to come BEFORE it.
-    // The peer stays uncaught-up, which is the truth, and the counter says why.
-    if (opts_.maxMessageBytes != 0 && snapshot_.data.size() > opts_.maxMessageBytes) {
+    const uint64_t total = snapshot_.data.size();
+    // 0 == chunking disabled: one message carries the whole payload (pre-D-5 behaviour,
+    // and what the core unit tests exercise).
+    const size_t chunk =
+        opts_.maxSnapshotChunkBytes == 0 ? std::numeric_limits<size_t>::max() : opts_.maxSnapshotChunkBytes;
+
+    // REFUSE, WITHOUT ADVANCING nextIndex_ AND WITHOUT CREATING ANY TRANSFER STATE, a
+    // snapshot this node cannot deliver (write-scaleout 5 review, F3a -- the discipline is
+    // unchanged, only what "cannot deliver" means has moved).
+    //
+    // Two independent bounds, and the ORDER matters: both are checked before anything is
+    // recorded, so a refusal leaves the peer's progress and this node's state exactly as
+    // they were. The peer stays uncaught-up, which is the truth, and the counter says why.
+    //
+    //  (1) the TOTAL payload against opts_.maxSnapshotBytes -- a memory bound now that
+    //      chunking removed the message one (see kMaxVShardSnapshotBytes);
+    //  (2) the FIRST CHUNK against opts_.maxMessageBytes. With chunking on this can only
+    //      fire on a misconfiguration (chunk > message bound); with chunking OFF the first
+    //      chunk IS the whole payload, so this reproduces the original F3a check exactly.
+    if (opts_.maxSnapshotBytes != 0 && total > opts_.maxSnapshotBytes) {
         ++undeliverableSnapshots_;
         return;
     }
+    if (opts_.maxMessageBytes != 0 && std::min<uint64_t>(chunk, total) > opts_.maxMessageBytes) {
+        ++undeliverableSnapshots_;
+        return;
+    }
+
+    // FLOW CONTROL. A transfer already in flight for THIS snapshot is left alone: the
+    // reply-driven pipeline carries it and the tick sweep recovers it. Without this the
+    // heartbeat (bcastAppend -> sendAppend -> here, every heartbeatTimeout) would restart
+    // every transfer from offset 0 forever and no snapshot would ever complete.
+    if (auto it = snapTransfers_.find(peer); it != snapTransfers_.end()) {
+        if (it->second.index == snapshot_.index && it->second.term == snapshot_.term)
+            return;
+        // The snapshot moved on under us (a newer compaction). The peer's staging is keyed
+        // by (index, term) and will discard its partial on the first chunk of the new one.
+        snapTransfers_.erase(it);
+    }
+    SnapshotTransfer t;
+    t.index = snapshot_.index;
+    t.term = snapshot_.term;
+    snapTransfers_[peer] = t;
+    sendSnapshotChunk(peer, 0, chunk);
+}
+
+void RaftNode::sendSnapshotChunk(NodeId peer, uint64_t offset, size_t chunkLen) {
+    const uint64_t total = snapshot_.data.size();
+    if (offset > total)
+        offset = total;  // defensive: a peer cannot make us read past the payload
+    const size_t len = static_cast<size_t>(std::min<uint64_t>(chunkLen, total - offset));
+
     InstallSnapshot is;
     is.term = currentTerm_;
     is.leaderId = id_;
     is.lastIncludedIndex = snapshot_.index;
     is.lastIncludedTerm = snapshot_.term;
-    is.config = snapshot_.config;
-    is.data = snapshot_.data;
-    // Optimistically assume the follower will accept through the snapshot end.
-    nextIndex_[peer] = snapshot_.index + 1;
+    is.config = snapshot_.config;  // the boundary config rides every chunk
+    is.data = snapshot_.data.substr(static_cast<size_t>(offset), len);
+    is.offset = offset;
+    is.totalBytes = total;
+    is.done = (offset + len == total);
+
+    if (auto it = snapTransfers_.find(peer); it != snapTransfers_.end()) {
+        it->second.offset = offset;
+        it->second.idleTicks = 0;
+    }
+    ++snapshotChunksSent_;
+    // NOTHING OPTIMISTIC HERE. `nextIndex_[peer]` is advanced ONLY by the reply that says
+    // the follower installed (handleInstallSnapshotReply), which is what makes abandoning
+    // a transfer a no-op and makes a dropped final chunk cost a retry rather than a lie.
+    // The pre-D-5 code advanced before the send, and that is what turned a refused send
+    // into the F3a hot loop.
     send(Message{.to = peer, .from = id_, .payload = std::move(is)});
+}
+
+void RaftNode::sweepStalledSnapshotTransfers(unsigned passes) {
+    // A DROPPED CHUNK IS SILENT. The deliver verb is `no_wait`, so a chunk lost to an
+    // over-budget peer, a reset connection or a restarted follower produces no reply and
+    // no error -- and because at most one chunk per peer is in flight, silence means the
+    // transfer is simply stopped. This timer is the only thing that notices.
+    for (auto it = snapTransfers_.begin(); it != snapTransfers_.end();) {
+        SnapshotTransfer& t = it->second;
+        t.idleTicks += passes;
+        if (opts_.snapshotChunkTimeout == 0 || t.idleTicks < opts_.snapshotChunkTimeout) {
+            ++it;
+            continue;
+        }
+        if (t.resends >= opts_.maxSnapshotResends) {
+            // ABANDON. Nothing to unwind: no nextIndex_ was moved on this transfer's
+            // behalf, so the peer is left exactly as far behind as it really is and the
+            // next heartbeat's sendAppend starts a fresh transfer from offset 0. The
+            // counter is the operator's signal that a peer cannot be snapshot-caught-up
+            // (a dropped-chunk storm, or a peer that predates the chunk tag).
+            ++snapshotTransfersAbandoned_;
+            it = snapTransfers_.erase(it);
+            continue;
+        }
+        ++t.resends;
+        ++snapshotTransfersRestarted_;
+        // Resume from what the peer last CONFIRMED it has staged, not from where we think
+        // we were: if our chunk arrived and only the reply was lost, `acked` is stale and
+        // the peer answers the duplicate with its real offset (its staged prefix is the
+        // only state it keeps, so a duplicate chunk is idempotent by construction).
+        const size_t chunk =
+            opts_.maxSnapshotChunkBytes == 0 ? std::numeric_limits<size_t>::max() : opts_.maxSnapshotChunkBytes;
+        const NodeId peer = it->first;
+        const uint64_t resumeAt = t.acked;
+        ++it;  // sendSnapshotChunk mutates only this peer's record, but advance first anyway
+        sendSnapshotChunk(peer, resumeAt, chunk);
+    }
 }
 
 void RaftNode::compact(LogIndex upto, std::string snapshotData) {
@@ -337,48 +434,172 @@ void RaftNode::handleInstallSnapshot(NodeId from, const InstallSnapshot& is) {
     reply.term = currentTerm_;
 
     if (is.lastIncludedIndex <= commitIndex_) {
-        // Stale: we already have everything the snapshot covers.
+        // Stale: we already have everything the snapshot covers. Drop any partial we were
+        // staging FOR IT -- it can never be needed and holding it wastes the buffer.
+        if (snapStaging_ && snapStaging_->index == is.lastIncludedIndex)
+            snapStaging_.reset();
         reply.matchIndex = commitIndex_;
         send(Message{.to = from, .from = id_, .payload = reply});
         return;
     }
 
+    // ---- STAGE THE CHUNK (debt D-5). ----
+    //
+    // The decoder normalizes a one-message snapshot to (offset 0, total == data.size(),
+    // done), so there is ONE path here whether or not the sender chunks.
+    //
+    // A PARTIAL SNAPSHOT IS NEVER INSTALLED: everything below only appends to
+    // `snapStaging_`, and the install happens exactly once, on the chunk that completes
+    // the payload. Nothing in the staging path touches the log, the config, commitIndex_
+    // or the state machine.
+    const uint64_t total = is.totalBytes == 0 ? is.data.size() : is.totalBytes;
+
+    // Refuse a payload we will not hold in memory. Defence in depth: a correctly
+    // configured leader refuses to BUILD one (sendInstallSnapshot), so reaching this needs
+    // a mismatched or hostile peer. Answer with an install-shaped reply carrying our real
+    // commitIndex, which tells the leader nothing was installed and lets it fall back to
+    // appends; the counter is what makes the stall diagnosable.
+    if (opts_.maxSnapshotBytes != 0 && total > opts_.maxSnapshotBytes) {
+        ++snapshotsRefusedTooLarge_;
+        snapStaging_.reset();
+        reply.matchIndex = commitIndex_;
+        send(Message{.to = from, .from = id_, .payload = reply});
+        return;
+    }
+
+    // A chunk for a DIFFERENT boundary discards what we hold. Keying the partial by
+    // (index, term) is what stops one snapshot's bytes being spliced onto another's --
+    // which is reachable without any malice: the leader compacts again mid-transfer, or
+    // leadership moves and the new leader's snapshot boundary differs.
+    if (snapStaging_ && (snapStaging_->index != is.lastIncludedIndex || snapStaging_->term != is.lastIncludedTerm))
+        snapStaging_.reset();
+
+    if (is.offset == 0) {
+        // A fresh OR RESTARTED transfer. Discarding here unconditionally is what makes the
+        // leader's restart idempotent: it may resend chunk 0 at any time, and the result
+        // is always a clean transfer rather than a splice onto a stale prefix.
+        SnapshotStaging fresh;
+        fresh.index = is.lastIncludedIndex;
+        fresh.term = is.lastIncludedTerm;
+        fresh.totalBytes = total;
+        snapStaging_ = std::move(fresh);
+    } else if (!snapStaging_) {
+        // A chunk from the middle with nothing staged: we restarted, or the leader's
+        // earlier chunks were dropped. Say we have zero so it starts over.
+        reply.matchIndex = commitIndex_;
+        reply.pendingSnapshotIndex = is.lastIncludedIndex;
+        reply.stagedBytes = 0;
+        send(Message{.to = from, .from = id_, .payload = reply});
+        return;
+    }
+
+    if (is.offset != snapStaging_->data.size() || total != snapStaging_->totalBytes) {
+        // Out of order, or a DUPLICATE of a chunk we already hold. Neither is applied;
+        // both are answered with where we actually are, so the leader resumes from the
+        // truth instead of from its own (possibly stale) idea of it.
+        reply.matchIndex = commitIndex_;
+        reply.pendingSnapshotIndex = snapStaging_->index;
+        reply.stagedBytes = snapStaging_->data.size();
+        send(Message{.to = from, .from = id_, .payload = reply});
+        return;
+    }
+
+    snapStaging_->config = is.config;  // the boundary config rides every chunk
+    snapStaging_->data.append(is.data);
+
+    if (!is.done) {
+        // Mid-transfer ack. This is the per-chunk reply the leader paces on: exactly one
+        // chunk is in flight at a time, so this is what releases the next one.
+        reply.matchIndex = commitIndex_;
+        reply.pendingSnapshotIndex = snapStaging_->index;
+        reply.stagedBytes = snapStaging_->data.size();
+        send(Message{.to = from, .from = id_, .payload = reply});
+        return;
+    }
+
+    // FINAL CHUNK: the payload is complete, so install it -- atomically, and only now.
+    Snapshot full;
+    full.index = snapStaging_->index;
+    full.term = snapStaging_->term;
+    full.config = std::move(snapStaging_->config);
+    full.data = std::move(snapStaging_->data);
+    snapStaging_.reset();
+    installReceivedSnapshot(std::move(full), reply);
+    send(Message{.to = from, .from = id_, .payload = reply});
+}
+
+// The ONE point at which a received snapshot becomes this replica's state, reached only
+// from the chunk that COMPLETES the payload. Everything before it is staging.
+void RaftNode::installReceivedSnapshot(Snapshot full, InstallSnapshotReply& reply) {
     // Adopt the snapshot. If our log already holds a matching entry at the
     // snapshot boundary, keep the consistent suffix; otherwise discard the log.
-    if (log_.matchTerm(is.lastIncludedIndex, is.lastIncludedTerm))
-        log_.compactTo(is.lastIncludedIndex);
+    if (log_.matchTerm(full.index, full.term))
+        log_.compactTo(full.index);
     else
-        log_.restoreFromSnapshot(is.lastIncludedIndex, is.lastIncludedTerm);
+        log_.restoreFromSnapshot(full.index, full.term);
 
     // The snapshot carries the boundary config; re-derive the active config from
     // the new base plus any retained (keep-suffix) config entries. Defensive: a
     // config with no voters (only possible from corruption) would brick the
     // group, so ignore it and keep our current base.
-    if (!is.config.voters.empty())
-        baseConfig_ = is.config;
+    if (!full.config.voters.empty())
+        baseConfig_ = full.config;
     recomputeConfigFromLog();
 
-    snapshot_.index = is.lastIncludedIndex;
-    snapshot_.term = is.lastIncludedTerm;
-    snapshot_.config = is.config;
-    snapshot_.data = is.data;
-    commitIndex_ = std::max(commitIndex_, is.lastIncludedIndex);
-    lastApplied_ = is.lastIncludedIndex;  // the snapshot IS the applied state
+    commitIndex_ = std::max(commitIndex_, full.index);
+    lastApplied_ = full.index;  // the snapshot IS the applied state
     // Only the snapshot boundary is now durable via the payload. Any retained
     // tail ABOVE it (the keep-suffix path) is still unpersisted and MUST remain
     // reportable -- advancing to lastIndex()+1 here would silently un-persist it
     // (it is not in the snapshot payload), losing committed entries on restart.
-    unstableStart_ = std::max(unstableStart_, is.lastIncludedIndex + 1);
-    pendingSnapshotApply_ = snapshot_;  // surface to the driver to install
+    unstableStart_ = std::max(unstableStart_, full.index + 1);
+    reply.matchIndex = full.index;
+    ++snapshotsInstalled_;
 
-    reply.matchIndex = is.lastIncludedIndex;
-    send(Message{.to = from, .from = id_, .payload = reply});
+    snapshot_ = std::move(full);
+    pendingSnapshotApply_ = snapshot_;  // surface to the driver to install
 }
 
 void RaftNode::handleInstallSnapshotReply(NodeId from, const InstallSnapshotReply& rr) {
     if (role_ != Role::Leader || !(isVoter(from) || isLearner(from)))
         return;
     lastAckTick_[from] = tick_;  // any reply is a liveness proof; see ticksSinceAck()
+
+    if (!rr.isInstallOutcome()) {
+        // MID-TRANSFER PROGRESS (debt D-5): the peer has staged `stagedBytes` and installed
+        // NOTHING, so nothing here may touch matchIndex_/nextIndex_ or advance commit --
+        // treating this as an install is exactly the "reports match for data it does not
+        // have" failure the separate reply shape exists to prevent.
+        auto it = snapTransfers_.find(from);
+        if (it == snapTransfers_.end() || it->second.index != rr.pendingSnapshotIndex)
+            return;  // progress on a transfer we are no longer running: ignore
+        SnapshotTransfer& t = it->second;
+        t.idleTicks = 0;
+        if (rr.stagedBytes > t.acked) {
+            t.acked = rr.stagedBytes;
+            t.resends = 0;  // real progress clears the stall budget
+        }
+        if (t.index != snapshot_.index || t.term != snapshot_.term) {
+            // Our snapshot moved on (a newer compaction) -- stop feeding the old one; the
+            // next sendAppend starts a transfer for the current boundary.
+            snapTransfers_.erase(it);
+            return;
+        }
+        // Release the NEXT chunk, from where the peer says it actually is. This reply is
+        // the whole flow-control mechanism: one chunk in flight per peer, each released by
+        // the ack of the one before it -- the same pipeline shape as the bounded
+        // AppendEntries catch-up, which is what makes it safe on a fire-and-forget
+        // transport (a burst of chunks could exceed the peer's admission budget and be
+        // dropped in silence).
+        const size_t chunk =
+            opts_.maxSnapshotChunkBytes == 0 ? std::numeric_limits<size_t>::max() : opts_.maxSnapshotChunkBytes;
+        sendSnapshotChunk(from, t.acked, chunk);
+        return;
+    }
+
+    // An install OUTCOME (or a stale-snapshot answer, or any reply from a peer that
+    // predates chunking): the transfer, if any, is over.
+    snapTransfers_.erase(from);
     if (rr.matchIndex > matchIndex_[from])
         matchIndex_[from] = rr.matchIndex;
     nextIndex_[from] = std::max(nextIndex_[from], matchIndex_[from] + 1);
@@ -624,6 +845,10 @@ void RaftNode::tick(unsigned passes) {
             leadTransferee_ = kNoNode;
             transferElapsed_ = 0;
         }
+        // Recover chunked snapshot transfers whose in-flight chunk was dropped (D-5).
+        // BEFORE the heartbeat, so a transfer this sweep abandons is restarted by the very
+        // next bcastAppend rather than waiting another heartbeat interval.
+        sweepStalledSnapshotTransfers(passes);
         if ((heartbeatElapsed_ += passes) >= opts_.heartbeatTimeout) {
             heartbeatElapsed_ = 0;
             bcastAppend();  // heartbeat (an AppendEntries, possibly carrying entries)

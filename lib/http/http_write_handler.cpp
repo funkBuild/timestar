@@ -2364,9 +2364,16 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleW
         // never becomes durable (write-scaleout 5 review, F3b). `classifyLocalWriteFailure`
         // already calls it Fatal, and a Fatal failure propagates the original exception,
         // so it arrives here -- where it used to fall through to the opaque 500 despite
-        // being the same client-fixable condition as the frame case above. Unreachable
-        // today (`kMaxProposalBytes` is 92 MiB and the handler caps a batch long before
-        // that), which is why it is a cosmetic fix and not a bug fix.
+        // being the same client-fixable condition as the frame case above.
+        //
+        // NO LONGER UNREACHABLE. It was, while `kMaxProposalBytes` was 92 MiB and the
+        // handler capped a body long before that. D-5 retuned the Raft size chain and the
+        // bound is now 28 MiB, which a >28 MiB ENCODED single-VShard slice reaches -- so a
+        // 64 MiB body (the `max_write_body_size` default) whose points all hash to one of
+        // 4096 VShards now gets this 413 instead of producing a 28+ MiB Raft entry that
+        // three nodes must fsync, ship, stage and apply atomically. A legitimate batch
+        // spreads over many VShards and never comes near it. See raft_types.hpp for the
+        // chain, and debt D-31 for splitting an oversized slice instead of refusing it.
         ++engineSharded->local().metrics().insert_errors_total;
         timestar::http_log.warn("Write rejected, Raft proposal too large: {}", e.what());
         rep->set_status(seastar::http::reply::status_type::payload_too_large);

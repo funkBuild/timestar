@@ -115,6 +115,34 @@ enum : uint8_t {
     // CheckQuorum on gets slow transfers during the rolling window (see the register row
     // for D-9).
     kRequestVoteTransfer = 8,
+    // A CHUNK of an InstallSnapshot, and its progress reply (debt D-5). Same reasoning as
+    // tag 8, and here it is not a nicety but the whole mixed-version story.
+    //
+    // The chunk fields could NOT be appended inside kInstallSnapshot's body. `data` is the
+    // last field of that body and `decodeEnvelope` does not require the reader to have
+    // consumed every byte, so an old decoder handed a chunked message would parse the
+    // header, read `data`, IGNORE the offset/total/done trailer entirely -- and install a
+    // PARTIAL snapshot as if it were complete. That is state corruption, not a misparse:
+    // the follower would report `matchIndex == lastIncludedIndex` for data it does not
+    // have. An unknown TYPE instead falls into `decodeEnvelope`'s `default:` and the
+    // envelope is dropped whole.
+    //
+    // So an old follower FAILS CLOSED on a chunked transfer: it never sees the chunk,
+    // never replies, and the leader's stall timer restarts the transfer forever (visibly
+    // -- `snapshotTransfersRestarted`) while the follower stays uncaught-up. Slow and
+    // counted, never wrong.
+    //
+    // AND THE COMMON CASE STILL INTEROPERATES, which is the point of `isWholePayload()`:
+    // a snapshot that fits in ONE chunk is emitted under the OLD tag with the OLD body,
+    // byte-for-byte, so an un-upgraded peer is caught up normally. Only a genuinely
+    // multi-chunk transfer needs a peer that knows tag 9.
+    //
+    // The reply is tagged in the same spirit, and the pairing is exact: a tag-9 request
+    // is answered with tag 10, a tag-5 request with tag 6. A completed install always
+    // answers under tag 6 (both progress fields are at their defaults), so the ONE reply
+    // an old leader must be able to read is the one it can.
+    kInstallSnapshotChunk = 9,
+    kInstallSnapshotChunkReply = 10,
 };
 
 void writeConfig(Writer& w, const Config& c) {
@@ -194,17 +222,33 @@ std::string encodeEnvelope(const Envelope& env) {
                 w.u64(p.conflictTerm);
                 w.u64(p.readSeq);
             } else if constexpr (std::is_same_v<T, InstallSnapshot>) {
-                w.u8(kInstallSnapshot);
+                // A one-message snapshot keeps the ORIGINAL tag and body so an
+                // un-upgraded peer can still install it; only a real chunk needs tag 9.
+                const bool whole = p.isWholePayload();
+                w.u8(whole ? kInstallSnapshot : kInstallSnapshotChunk);
                 w.u64(p.term);
                 w.u64(p.leaderId);
                 w.u64(p.lastIncludedIndex);
                 w.u64(p.lastIncludedTerm);
                 writeConfig(w, p.config);
                 w.str(p.data);
+                if (!whole) {
+                    w.u64(p.offset);
+                    w.u64(p.totalBytes);
+                    w.u8(p.done ? 1 : 0);
+                }
             } else if constexpr (std::is_same_v<T, InstallSnapshotReply>) {
-                w.u8(kInstallSnapshotReply);
+                // An install OUTCOME (or a stale-snapshot answer) is the original
+                // two-field reply, which an old leader reads; only mid-transfer progress
+                // needs tag 10.
+                const bool outcome = p.isInstallOutcome();
+                w.u8(outcome ? kInstallSnapshotReply : kInstallSnapshotChunkReply);
                 w.u64(p.term);
                 w.u64(p.matchIndex);
+                if (!outcome) {
+                    w.u64(p.pendingSnapshotIndex);
+                    w.u64(p.stagedBytes);
+                }
             } else if constexpr (std::is_same_v<T, TimeoutNow>) {
                 w.u8(kTimeoutNow);
                 w.u64(p.term);
@@ -282,7 +326,8 @@ std::optional<Envelope> decodeEnvelope(const std::string& bytes) {
             env.message.payload = p;
             break;
         }
-        case kInstallSnapshot: {
+        case kInstallSnapshot:
+        case kInstallSnapshotChunk: {
             InstallSnapshot p;
             p.term = r.u64();
             p.leaderId = r.u64();
@@ -290,13 +335,46 @@ std::optional<Envelope> decodeEnvelope(const std::string& bytes) {
             p.lastIncludedTerm = r.u64();
             p.config = readConfig(r);
             p.data = r.str();
+            if (tag == kInstallSnapshotChunk) {
+                p.offset = r.u64();
+                p.totalBytes = r.u64();
+                p.done = r.u8() != 0;
+                // A chunk that claims to run past the payload it declares is malformed:
+                // the receiver sizes its staging buffer from `totalBytes`, so trusting
+                // this pair unchecked is how a hostile peer would make it allocate
+                // without bound. Reject the envelope rather than clamp -- a chunked
+                // transfer that has to be guessed at is one the leader should restart.
+                if (p.totalBytes < p.offset || p.data.size() > p.totalBytes - p.offset)
+                    return std::nullopt;
+                // `done` must agree with the arithmetic, for the same reason: it is what
+                // triggers the INSTALL, and a peer must not be able to say "complete" of
+                // a prefix.
+                if (p.done != (p.offset + p.data.size() == p.totalBytes))
+                    return std::nullopt;
+            } else {
+                // The one-message shape: normalize to the chunked representation so the
+                // node only ever handles one form.
+                p.offset = 0;
+                p.totalBytes = p.data.size();
+                p.done = true;
+            }
             env.message.payload = std::move(p);
             break;
         }
-        case kInstallSnapshotReply: {
+        case kInstallSnapshotReply:
+        case kInstallSnapshotChunkReply: {
             InstallSnapshotReply p;
             p.term = r.u64();
             p.matchIndex = r.u64();
+            if (tag == kInstallSnapshotChunkReply) {
+                p.pendingSnapshotIndex = r.u64();
+                p.stagedBytes = r.u64();
+                // Tag 10 exists ONLY to carry progress; an "outcome-shaped" tag-10 reply
+                // is a peer contradicting itself, and letting it through would have the
+                // leader treat a mid-transfer ack as a completed install.
+                if (p.isInstallOutcome())
+                    return std::nullopt;
+            }
             env.message.payload = p;
             break;
         }

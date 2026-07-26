@@ -219,12 +219,43 @@ seastar::future<> ClusterDataPlane::start(const ClusterConfig& cfg, seastar::sha
         ropts.heartbeatTimeout = 25;     // 500ms at the 20ms tick
         ropts.electionTimeoutMin = 125;  // 2.5s
         ropts.electionTimeoutMax = 250;  // 5s (randomized -> spreads campaigns)
-        // Mirror the transport's send bound INTO the core, so an InstallSnapshot that
-        // could not be delivered is never built and never moves nextIndex (write-scaleout
-        // 5 review, F3a). One definition, in raft_types.hpp -- and it is the PAYLOAD
-        // bound, not the send bound, because the transport measures the encoded envelope
-        // and `maxMessageBytes` is compared against the snapshot payload alone.
+        // Mirror the transport's send bound INTO the core, so a message that could not be
+        // delivered is never built and never moves nextIndex (write-scaleout 5 review,
+        // F3a). One definition, in raft_types.hpp -- and it is the PAYLOAD bound, not the
+        // send bound, because the transport measures the encoded envelope while
+        // `maxMessageBytes` is compared against the payload alone.
         ropts.maxMessageBytes = raft::kMaxRaftPayloadBytes;
+        // CHUNKED INstallSnapshot (debt D-5). The chunk size is what the whole size chain
+        // above is now sized against; the total bound is a MEMORY bound (the payload is
+        // materialized in RAM on the producer, held by the leader, and staged in RAM by the
+        // receiver) and it is also the threshold `snapshotVShard` refuses to compact over.
+        ropts.maxSnapshotChunkBytes = raft::kMaxSnapshotChunkBytes;
+        ropts.maxSnapshotBytes = raft::kMaxVShardSnapshotBytes;
+        // Two heartbeat intervals (25 ticks each at the 20 ms tick) with no reply before an
+        // in-flight chunk is resent -- the transport is fire-and-forget, so this timer is
+        // the only thing that notices a dropped chunk.
+        //
+        // THE ORDERING OF THESE THREE TIMEOUTS IS LOAD-BEARING, and it is the one thing
+        // about chunking that is easy to get wrong:
+        //
+        //     heartbeatTimeout 25  <  snapshotChunkTimeout 50  <<  electionTimeoutMin 125
+        //
+        // While a transfer is in flight, that peer is served snapshot CHUNKS INSTEAD OF
+        // HEARTBEATS -- `sendAppend` hands off to `sendInstallSnapshot`, which is a no-op
+        // while a chunk is unacked (that is the flow control). So a chunk, or the resend of
+        // a lost one, is the ONLY thing resetting that follower's election clock during an
+        // install. If `snapshotChunkTimeout` ever approached `electionTimeoutMin`, a single
+        // dropped chunk would let a follower campaign against a perfectly healthy leader
+        // mid-install. Pinned as a property (not as these numbers) by
+        // `RaftSnapshotChunkingTest.AFollowerBeingFedChunksDoesNotCampaignAgainstItsLeader`.
+        ropts.snapshotChunkTimeout = 2 * ropts.heartbeatTimeout;
+        if (ropts.snapshotChunkTimeout >= ropts.electionTimeoutMin)
+            // Fail closed at startup rather than discover it as an election storm during a
+            // rebalance: a future edit to any of the three numbers must keep the ordering.
+            throw std::runtime_error(
+                "cluster: Raft snapshotChunkTimeout must be well below electionTimeoutMin -- a follower being fed "
+                "snapshot chunks receives no heartbeats, so a chunk resend slower than an election timeout lets it "
+                "campaign against a healthy leader mid-install");
         // CHECKQUORUM IS OFF, AND EVERYTHING NEEDED TO TURN IT ON IS IN THIS BINARY.
         // That combination is deliberate; it is a RELEASE-ORDERING decision, not an
         // unfinished one. Read this before flipping `kCheckQuorumDefault` in either

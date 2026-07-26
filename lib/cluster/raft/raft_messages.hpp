@@ -80,18 +80,48 @@ struct AppendEntriesReply {
 
 // §7 snapshot install, when the follower has fallen behind the leader's
 // compacted prefix. `data` is opaque to Raft (a VShard snapshot payload here).
+//
+// CHUNKED (debt D-5). `data` is a SLICE of the payload at byte `offset` of `totalBytes`,
+// and `done` marks the last one. The receiver accumulates slices into a staging buffer
+// and installs only on `done`, so no single message has to carry a whole VShard snapshot
+// -- which is what let the size chain in raft_types.hpp come down by 3x.
+//
+// The defaults describe the pre-D-5 shape (one message, whole payload), so a
+// positionally- or partially-initialized InstallSnapshot still means what it always did;
+// `isWholePayload()` is what the codec uses to keep emitting the OLD wire tag for a
+// snapshot that fits in one chunk, which is what keeps an un-upgraded peer working.
 struct InstallSnapshot {
     Term term = kNoTerm;
     NodeId leaderId = kNoNode;
     LogIndex lastIncludedIndex = kNoIndex;
     Term lastIncludedTerm = kNoTerm;
-    Config config;  // membership as of the snapshot boundary
+    Config config;  // membership as of the snapshot boundary (rides EVERY chunk)
     std::string data;
+    uint64_t offset = 0;      // byte offset of `data` within the whole payload
+    uint64_t totalBytes = 0;  // whole payload size (0 == "data is the whole payload")
+    bool done = true;         // `data` ends the payload
+
+    // Is this the single-message shape a pre-D-5 peer understands? (Also the shape a
+    // pre-D-5 peer PRODUCES, since it can set none of the three fields above.)
+    bool isWholePayload() const { return offset == 0 && done && (totalBytes == 0 || totalBytes == data.size()); }
 };
 
 struct InstallSnapshotReply {
     Term term = kNoTerm;
     LogIndex matchIndex = kNoIndex;  // follower's log end after install
+    // Chunked-transfer progress (D-5). `pendingSnapshotIndex != kNoIndex` means "I have
+    // NOT installed anything; I am STAGING that snapshot and hold `stagedBytes` of it --
+    // send me the bytes from there". It is the per-chunk ack the leader paces on and the
+    // resume point it restarts from, and it is what makes a dropped chunk recoverable at
+    // all on a fire-and-forget transport: without it the only signal would be silence.
+    //
+    // A COMPLETED install (or any reply from a pre-D-5 peer) leaves both at their
+    // defaults, which is exactly the old two-field reply -- see the codec for why that
+    // matters for mixed versions.
+    LogIndex pendingSnapshotIndex = kNoIndex;
+    uint64_t stagedBytes = 0;
+
+    bool isInstallOutcome() const { return pendingSnapshotIndex == kNoIndex && stagedBytes == 0; }
 };
 
 // §3.10 leader transfer: the current leader tells `to` to start an election

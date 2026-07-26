@@ -54,14 +54,45 @@ struct RaftOptions {
     // `kMaxRaftSendBytes`, or a snapshot in the band between them passes here and is
     // refused on the wire -- reinstating the very hot loop below.
     //
-    // It exists for InstallSnapshot, the one producer 5.4 did not cap: it carries an
+    // It existed for InstallSnapshot, the one producer 5.4 did not cap: it carried an
     // entire VShard snapshot in one message. Over the bound, the transport refuses to send
     // it -- and `sendInstallSnapshot` used to advance `nextIndex_[peer]` BEFORE the send,
     // so a refusal became a hot loop: optimistic advance -> follower rejects the next
     // append -> rewind -> re-encode the whole snapshot -> refuse -> repeat, once per round
     // trip, with an error log each time. Checking here means the doomed message is never
     // built and `nextIndex_` is never moved on its behalf.
+    //
+    // Since D-5 chunked the snapshot this is compared against the CHUNK, so it no longer
+    // binds a snapshot at all in production -- it remains as the per-message belt (and as
+    // the whole-payload check when chunking is disabled below).
     size_t maxMessageBytes = 0;
+
+    // ---- chunked InstallSnapshot (debt D-5) ----
+    //
+    // The largest slice of a snapshot payload one InstallSnapshot may carry. 0 disables
+    // chunking (one message per snapshot, the pre-D-5 behaviour), which is what the core
+    // unit tests use: their payloads are bytes, so chunking would be untestably invisible
+    // there, and the unchunked path must keep working for a peer that predates tag 9.
+    size_t maxSnapshotChunkBytes = kMaxSnapshotChunkBytes;
+
+    // The largest TOTAL snapshot payload this node will serve or stage. 0 == no bound
+    // (tests). Over it, `sendInstallSnapshot` refuses WITHOUT advancing nextIndex_ and
+    // counts `undeliverableSnapshots()` -- the F3a discipline, now keyed on memory rather
+    // than on message size (see kMaxVShardSnapshotBytes).
+    size_t maxSnapshotBytes = 0;
+
+    // Ticks with NO reply from a peer mid-transfer before the in-flight chunk is RESENT.
+    // The transport is fire-and-forget, so a dropped chunk is SILENT: this timer is the
+    // only thing that notices. Two heartbeat intervals by default -- long enough that a
+    // chunk in flight over a slow link is not resent under itself, short enough that a
+    // transfer does not stall for an election timeout.
+    unsigned snapshotChunkTimeout = 50;
+
+    // Consecutive resends of the same chunk with NO progress before the transfer is
+    // ABANDONED. Abandonment is safe by construction here: nothing about a chunked
+    // transfer advances nextIndex_, so giving up leaves the peer exactly as far behind as
+    // it truly is and the next heartbeat starts a fresh transfer.
+    unsigned maxSnapshotResends = 6;
 };
 
 // One replica of one Raft group (one VShard). Deterministic and reactor-free:
@@ -140,10 +171,33 @@ public:
     // leader" from "I am the leader and I am standing down" -- the two want opposite
     // retries (write-scaleout 5 review, F1).
     bool transferInFlight() const { return leadTransferee_ != kNoNode; }
-    // Snapshots this node declined to send because they exceed opts_.maxMessageBytes.
-    // Non-zero means a follower CANNOT be caught up by snapshot and needs chunked
-    // InstallSnapshot (or a smaller snapshot) before it can rejoin.
+    // Snapshots this node declined to send because they exceed opts_.maxSnapshotBytes (or,
+    // with chunking disabled, opts_.maxMessageBytes). Non-zero means a follower CANNOT be
+    // caught up by snapshot and needs a SMALLER snapshot before it can rejoin -- since
+    // D-5 chunked the transfer, the remaining reason is memory, not message size.
     uint64_t undeliverableSnapshots() const { return undeliverableSnapshots_; }
+
+    // ---- chunked-transfer observability (debt D-5) ----
+    // These are the counters a gate asserts on to prove a catch-up really went through
+    // the SNAPSHOT path rather than through ordinary appends. Without them "the follower
+    // caught up" is indistinguishable between the two.
+    //
+    // Chunks this leader has put on the wire (a one-message snapshot counts as one).
+    uint64_t snapshotChunksSent() const { return snapshotChunksSent_; }
+    // Snapshots this node has INSTALLED as a follower (final chunk received and applied).
+    uint64_t snapshotsInstalled() const { return snapshotsInstalled_; }
+    // Transfers restarted because a chunk went unacked for opts_.snapshotChunkTimeout
+    // ticks. Steady non-zero means chunks are being dropped (or the peer predates tag 9).
+    uint64_t snapshotTransfersRestarted() const { return snapshotTransfersRestarted_; }
+    // Transfers given up on after opts_.maxSnapshotResends stalls. The peer is left
+    // exactly as far behind as it is; the next heartbeat starts over.
+    uint64_t snapshotTransfersAbandoned() const { return snapshotTransfersAbandoned_; }
+    // Received snapshots refused because their declared total exceeds what we will stage.
+    uint64_t snapshotsRefusedTooLarge() const { return snapshotsRefusedTooLarge_; }
+    // Is a chunked transfer to `peer` in flight? (Leader-only; test/inspection aid.)
+    bool snapshotTransferInFlight(NodeId peer) const { return snapTransfers_.count(peer) != 0; }
+    // Bytes of a partial snapshot currently staged as a follower (0 == none).
+    uint64_t stagedSnapshotBytes() const { return snapStaging_ ? snapStaging_->data.size() : 0; }
     LogIndex commitIndex() const { return commitIndex_; }
     const RaftLog& log() const { return log_; }
     unsigned electionTimeout() const { return electionTimeout_; }
@@ -226,10 +280,17 @@ private:
     void bcastAppend();
     void sendAppend(NodeId peer);
     void sendInstallSnapshot(NodeId peer);
+    // Put the chunk at `offset` (up to `chunkLen` bytes of the current snapshot) on the
+    // wire to `peer` and record it as in flight. Never touches nextIndex_.
+    void sendSnapshotChunk(NodeId peer, uint64_t offset, size_t chunkLen);
+    // Resend / abandon transfers whose in-flight chunk has gone unacked (leader, per tick).
+    void sweepStalledSnapshotTransfers(unsigned passes);
     void maybeAdvanceCommitAsLeader();
     void confirmReads();  // move quorum-confirmed pending reads to confirmedReads_
     void handleInstallSnapshot(NodeId from, const InstallSnapshot& is);
     void handleInstallSnapshotReply(NodeId from, const InstallSnapshotReply& rr);
+    // Adopt a fully-received snapshot (the final chunk's payload) and fill in `reply`.
+    void installReceivedSnapshot(Snapshot full, InstallSnapshotReply& reply);
 
     // Election tally over the (possibly joint) configuration: won needs a
     // majority grant in every voting set; lost means no set can still reach one.
@@ -275,6 +336,53 @@ private:
     // writes permanently. See tick().
     unsigned transferElapsed_ = 0;
     uint64_t undeliverableSnapshots_ = 0;  // see undeliverableSnapshots()
+
+    // ---- chunked InstallSnapshot, leader side (debt D-5) ----
+    //
+    // One record per peer currently being caught up by snapshot. Its EXISTENCE is the flow
+    // control: `sendInstallSnapshot` is a no-op while a transfer for the current snapshot
+    // is in flight, so the heartbeat cannot re-blast chunk 0 every round and at most ONE
+    // unacked chunk per peer is ever on the wire. The pipeline is driven by replies
+    // (handleInstallSnapshotReply) exactly as the bounded AppendEntries catch-up is, with
+    // the tick sweep as the only recovery from a dropped chunk.
+    //
+    // Cleared on every role change, like matchIndex_/lastAckTick_: progress is per-term.
+    struct SnapshotTransfer {
+        LogIndex index = kNoIndex;  // the snapshot boundary being shipped
+        Term term = kNoTerm;        // ... and its term; the pair keys the peer's staging
+        uint64_t offset = 0;        // offset of the chunk currently in flight
+        uint64_t acked = 0;         // bytes the peer has confirmed staged
+        unsigned idleTicks = 0;     // tick passes since the in-flight chunk was sent
+        unsigned resends = 0;       // consecutive resends with no acked progress
+    };
+    std::map<NodeId, SnapshotTransfer> snapTransfers_;
+    uint64_t snapshotChunksSent_ = 0;
+    uint64_t snapshotTransfersRestarted_ = 0;
+    uint64_t snapshotTransfersAbandoned_ = 0;
+
+    // ---- chunked InstallSnapshot, follower side (debt D-5) ----
+    //
+    // The staging area. A partial snapshot lives HERE and nowhere else until its final
+    // chunk arrives, which is what makes a half-installed snapshot unreachable: the
+    // install is one atomic step at the end, and this buffer is DELIBERATELY VOLATILE --
+    // it is never persisted, so a follower that dies mid-transfer comes back with no
+    // partial at all and the leader simply starts over. (Persisting it would buy a resume
+    // across restarts and cost the invariant: a durable partial is a thing a buggy
+    // recovery path could install.)
+    //
+    // Keyed by (index, term): a chunk for any other snapshot boundary DISCARDS what is
+    // staged rather than being spliced onto it. `data.size()` is the resume point, so it
+    // is also the only thing the leader is told.
+    struct SnapshotStaging {
+        LogIndex index = kNoIndex;
+        Term term = kNoTerm;
+        Config config;  // the boundary config, refreshed by every chunk
+        uint64_t totalBytes = 0;
+        std::string data;  // the contiguous prefix received so far
+    };
+    std::optional<SnapshotStaging> snapStaging_;
+    uint64_t snapshotsInstalled_ = 0;
+    uint64_t snapshotsRefusedTooLarge_ = 0;
 
     // ReadIndex tracking (leader).
     uint64_t readSeq_ = 0;  // monotonic heartbeat sequence for read confirmation

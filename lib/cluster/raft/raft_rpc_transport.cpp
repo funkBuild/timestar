@@ -110,10 +110,20 @@ constexpr size_t kMaxConcurrentDeliverChains = 16;
 // produces a silent, permanently-retried black hole. Refusing (and logging) on the send
 // side turns that into a visible error naming the group.
 //
-// The number is sized for the one producer still unbounded -- InstallSnapshot, which
-// carries a whole VShard snapshot -- not for appends, which 5.4 caps at 1 MiB of entries.
-constexpr size_t kMaxInboundRaftMemory = size_t{128} << 20;  // 128 MiB in flight
-constexpr size_t kMaxRaftMessageBytes = kMaxRaftSendBytes;   // refuse to SEND above this
+// TIGHTENED FROM 128 MiB BY D-5, and what made that possible was chunking the producer
+// that needed the slack. Before D-5 the number was sized for InstallSnapshot carrying a
+// WHOLE VShard snapshot in one message -- i.e. for "however big a VShard's flushed data
+// happens to be", which is not a bound. It is now sized for the biggest APPEND (a single
+// log entry, `RaftGroup::kMaxProposalBytes`); a snapshot chunk is 4 MiB. The full
+// arithmetic chain, and why every link of it must hold, is stated once in raft_types.hpp.
+//
+// 2x the send bound rather than 1x: `max_memory` bounds TOTAL in-flight request memory,
+// and a request whose estimate exceeds it can never be admitted at all, so it must exceed
+// the largest single frame with room for concurrent ones. At 4 MiB per snapshot chunk and
+// one unacked chunk per peer, this holds 16 simultaneous chunk transfers before frames
+// merely queue on the semaphore (they are not dropped -- only an over-max_memory frame is).
+constexpr size_t kMaxInboundRaftMemory = size_t{64} << 20;  // 64 MiB in flight
+constexpr size_t kMaxRaftMessageBytes = kMaxRaftSendBytes;  // refuse to SEND above this
 
 // Raft message-rate instrumentation (write-scaleout 5-pre / 5a). The counters are
 // unconditional -- they are a handful of increments on a path that already does an
@@ -604,12 +614,13 @@ seastar::future<> RaftRpcTransport::start(seastar::socket_address local, Deliver
     // RaftOptions::maxAppendEntries/maxAppendBytes now bound it (1 MiB of entries), and
     // the batch frames 5a introduces are capped at 256 KB.
     //
-    // What is STILL unbounded is InstallSnapshot: it carries an entire VShard snapshot
-    // payload (TSM bytes) in one message, and chunking it is a protocol change (offset +
-    // done, receiver-side reassembly, a resumable boundary) rather than a producer cap.
-    // So this bound is sized for SNAPSHOTS, not for appends, and `kMaxRaftMessageBytes`
-    // below is the send-side mirror of it: a payload that would be dropped is logged as
-    // an error rather than vanishing.
+    // TIGHTENED AGAIN, from 128 MiB to 64 MiB, by D-5 -- for the same reason and by the
+    // same method. InstallSnapshot was the last unbounded producer (a whole VShard
+    // snapshot in one message); it is now chunked at `kMaxSnapshotChunkBytes` with
+    // receiver-side staging and a resumable offset, so this bound is sized for the biggest
+    // APPEND rather than for the biggest snapshot. `kMaxRaftMessageBytes` above is the
+    // send-side mirror of it: a payload that would be dropped is logged as an error rather
+    // than vanishing.
     //
     // bloat_factor stays 1: entry bytes are persisted roughly 1:1 here. The amplifying
     // WriteBatch decode happens later, at APPLY, which is behind commit -- i.e. behind

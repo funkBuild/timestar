@@ -86,16 +86,27 @@ seastar::future<uint64_t> ReplicatedVShardHost::snapshotVShard(uint16_t vshard) 
     // REFUSE TO COMPACT INTO A SNAPSHOT NOBODY CAN RECEIVE (write-scaleout 5 review, F3c).
     // Compaction is the point of no return: it DISCARDS the log prefix this snapshot
     // replaces, so a follower that later needs catching up has only the snapshot to be
-    // caught up WITH. If that snapshot is over the transport's send bound, the follower
-    // can never be caught up at all -- and the log entries that would have done it are
-    // gone. Declining to compact leaves the group exactly as it was: larger log, working
-    // replication.
-    if (encoded.size() > raft::kMaxRaftPayloadBytes) {
+    // caught up WITH. If that snapshot cannot be delivered, the follower can never be
+    // caught up at all -- and the log entries that would have done it are gone. Declining
+    // to compact leaves the group exactly as it was: larger log, working replication.
+    //
+    // RECONCILED WITH CHUNKING (D-5/D-6). The threshold was `kMaxRaftPayloadBytes`, i.e.
+    // "no single message could carry it". Chunking removed that limit, and the retuned size
+    // chain would have DROPPED that number to 28 MiB -- so leaving the check as it stood
+    // would have made compaction refuse MORE often after the fix meant to enable it.
+    //
+    // It is now `kMaxVShardSnapshotBytes` (128 MiB), which is a MEMORY bound rather than a
+    // message bound: `buildVShardSnapshot` materializes the whole payload in RAM here, the
+    // leader holds it for as long as it is servable, and the receiver stages it in RAM
+    // before installing. Three copies of an unbounded payload on a reactor with a fixed
+    // memory pool is an OOM. That is a ~4.5x RISE over the old effective ceiling, so
+    // snapshots that used to block compaction now ship -- as a pipeline of 4 MiB chunks.
+    if (encoded.size() > raft::kMaxVShardSnapshotBytes) {
         timestar::http_log.error(
-            "cluster: NOT compacting VShard {}: its snapshot is {} bytes, over the {} byte Raft payload bound, so no "
-            "follower could be caught up from it. The log is kept instead (it will keep growing). Chunked "
-            "InstallSnapshot streaming is the fix.",
-            vshard, encoded.size(), raft::kMaxRaftPayloadBytes);
+            "cluster: NOT compacting VShard {}: its snapshot is {} bytes, over the {} byte total-snapshot bound, so it "
+            "cannot be held in memory to serve (chunking bounds the MESSAGE, not the payload). The log is kept instead "
+            "(it will keep growing). Streaming the payload via disk rather than staging it in RAM is the fix (D-32).",
+            vshard, encoded.size(), raft::kMaxVShardSnapshotBytes);
         co_return 0;
     }
     co_await g->compact(upto, std::move(encoded));

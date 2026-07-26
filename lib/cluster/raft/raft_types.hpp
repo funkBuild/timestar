@@ -63,32 +63,96 @@ public:
     explicit ProposalTooLargeError(const std::string& what) : std::runtime_error(what) {}
 };
 
-// THE ONE DEFINITION of the largest single Raft message that may be produced or sent
-// (write-scaleout 5 review, F3). The transport enforces it on the way out and mirrors the
-// peer's inbound admission bound with it; the producers (RaftGroup::kMaxProposalBytes,
-// RaftOptions::maxMessageBytes, the snapshot builder) size themselves against it, so an
-// undeliverable message is refused where it is BUILT rather than discovered on the wire.
+// ===========================================================================
+// THE RAFT MESSAGE-SIZE ARITHMETIC CHAIN (write-scaleout 5 review F3; retuned by D-5)
+// ===========================================================================
 //
-// It lives here, in the shared types header, precisely so the deterministic core does not
-// have to include a transport header to know it.
-inline constexpr size_t kMaxRaftSendBytes = size_t{96} << 20;
-
-// The bound above is enforced by the transport on the ENCODED ENVELOPE -- message type,
-// group id, term, leader id, prev/commit indexes, the config's voter list, and the
-// framing around the payload -- not on the payload a producer holds. A producer that
-// compares its raw payload against `kMaxRaftSendBytes` therefore passes its own check and
-// is refused on the wire, which is precisely the case F3a was written to remove: for
-// InstallSnapshot that refusal reinstates the nextIndex hot loop, and for
-// `snapshotVShard` it means compaction discards the log prefix in favour of a snapshot
-// nothing can carry.
+// One chain, four numbers, each a consequence of the one above it:
 //
-// So payload producers size themselves against `kMaxRaftPayloadBytes` and leave the
-// envelope its headroom. The reserve is the same one `RaftGroup::kMaxProposalBytes`
-// already took, now stated once and shared: generous rather than tight, because the
-// envelope's largest term (the config) has no small fixed bound and being 4 MiB
-// conservative on a 96 MiB ceiling costs nothing anybody can observe.
+//     largest producer PAYLOAD          28 MiB   kMaxRaftPayloadBytes
+//   + envelope/framing headroom        + 4 MiB   kRaftEnvelopeHeadroomBytes
+//   ------------------------------------------
+//   <= transport SEND refusal           32 MiB   kMaxRaftSendBytes
+//   <= peer inbound ADMISSION           64 MiB   kMaxInboundRaftMemory (raft_rpc_transport.cpp)
+//
+// WHY IT HAS TO BE A CHAIN AND NOT FOUR OPINIONS. The Raft deliver verb is seastar
+// `no_wait`: a frame whose estimated cost exceeds the receiver's `max_memory` is
+// DROPPED WITH NO REPLY. A sender that can build something the receiver will drop
+// produces a silent, permanently-retried black hole, so every link must hold or the
+// group loses a replica invisibly. The transport measures the ENCODED ENVELOPE
+// (message type, group id, term, leader id, prev/commit indexes, the config's voter
+// lists, the framing) while every producer measures the RAW payload it holds, and
+// `kRaftEnvelopeHeadroomBytes` is the reserve that closes exactly that gap -- pinned
+// by `RaftCodecTest.EnvelopeHeadroomCoversTheFramingOfEveryPayloadProducer`.
+//
+// WHAT D-5 CHANGED, AND WHY THE NUMBERS COULD COME DOWN. Before chunking, the biggest
+// producer was InstallSnapshot: it carried an ENTIRE VShard snapshot in one message,
+// so the whole chain had to be sized around "however big a VShard's flushed data
+// happens to be" -- 96 MiB send / 128 MiB admission, which is not a bound so much as a
+// hope, and `snapshotVShard` had to REFUSE TO COMPACT above it (compaction discards the
+// log prefix the snapshot replaces, so an undeliverable snapshot means a follower that
+// can never be caught up by anything). InstallSnapshot is now chunked at
+// `kMaxSnapshotChunkBytes`, so it is no longer the binding producer and the chain is
+// sized for an APPEND instead:
+//
+//   * one AppendEntries is bounded by RaftOptions::maxAppendBytes (1 MiB of entries)
+//     EXCEPT that at least one entry is always sent, so its true bound is the largest
+//     single log ENTRY, i.e. `RaftGroup::kMaxProposalBytes`;
+//   * one InstallSnapshot is bounded by `kMaxSnapshotChunkBytes` (4 MiB).
+//
+// So `kMaxProposalBytes` is what the chain is now sized for, and 28 MiB is generous for
+// it: a log entry is ONE VShard's slice of ONE write batch, and the data-plane forward
+// path already refuses a slice over ~10.67 MiB (`kMaxOutboundFrameBytes`, a 413). Only
+// the LOCAL propose path -- coordinator and leader on the same node -- had no
+// equivalent cap, and reaching 28 MiB there needs a >28 MiB encoded slice concentrated
+// on a single VShard out of 4096, which a legitimate client's batch does not do. The
+// adversarial case now gets a clean 413 instead of a 92 MiB Raft entry that three nodes
+// must fsync, ship, stage and apply atomically -- an improvement, not a regression.
+//
+// RESIDUAL (D-31): 28 MiB is still 7x what a chunk needs, and the gap is entirely the
+// PROPOSAL bound's. Closing it means splitting an oversized single-VShard slice into
+// several proposals, which is a write-path change (the slice stops being one atomic
+// entry), so it is filed rather than done here.
+//
+// These live in the shared types header, not in a transport header, precisely so the
+// deterministic core can know them without depending on I/O.
+inline constexpr size_t kMaxRaftSendBytes = size_t{32} << 20;
 inline constexpr size_t kRaftEnvelopeHeadroomBytes = size_t{4} << 20;
 inline constexpr size_t kMaxRaftPayloadBytes = kMaxRaftSendBytes - kRaftEnvelopeHeadroomBytes;
+
+// The largest slice of a snapshot payload one InstallSnapshot may carry (D-5).
+//
+// WHY 4 MiB. It is the same order as the bounds the other Raft producers already live
+// under -- 1 MiB of entries per AppendEntries, 256 KiB per batched transport frame --
+// so it needs no separate allowance anywhere in the chain above, and it is large enough
+// that the per-message envelope, RPC framing and reply round trip are amortized to
+// noise (the envelope overhead measured against a fat 4096-voter config is under
+// 100 KiB, i.e. ~2%). Smaller would multiply round trips on a large snapshot for no
+// gain; larger would drag the whole chain back up, which is the thing D-5 exists to
+// stop. The transfer is paced at ONE unacked chunk per peer (see
+// RaftNode::sendInstallSnapshot), so the wire cost of a transfer is one chunk, not the
+// snapshot.
+inline constexpr size_t kMaxSnapshotChunkBytes = size_t{4} << 20;
+
+// The largest TOTAL snapshot payload this node will build, serve, or stage (D-5/D-6).
+//
+// Chunking removed the MESSAGE limit on a snapshot; it did not remove the MEMORY one.
+// `EngineLocalStore::buildVShardSnapshot` materializes the whole payload (manifest plus
+// every referenced TSM file's bytes) in RAM on the producer, `RaftNode` holds it in
+// `snapshot_` for as long as it is servable, and the receiver stages the whole thing in
+// RAM before installing it. Three copies of an unbounded payload on a reactor with a
+// fixed memory pool is an OOM, not a slow transfer.
+//
+// So the compaction refusal SURVIVES D-5 but changes meaning and RISES: it was
+// "> kMaxRaftPayloadBytes, because no single message could carry it" (which after the
+// retuning above would have FALLEN to 28 MiB); it is now "> kMaxVShardSnapshotBytes,
+// because we will not hold this much of one VShard in memory three times over". 128 MiB
+// is ~4.5x the old effective ceiling and 32 chunks, which is a real rise -- big
+// snapshots that used to block compaction now ship.
+//
+// RESIDUAL (D-32): the honest fix is to stream the payload to and from DISK rather than
+// staging it in RAM, after which this bound is a disk bound and can be far larger.
+inline constexpr size_t kMaxVShardSnapshotBytes = size_t{128} << 20;
 
 // The Raft-persistent voting state (durably fsync'd before any RPC that depends
 // on it, per the journal safety contract). commitIndex is volatile and NOT part
