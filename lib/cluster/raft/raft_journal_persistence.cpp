@@ -122,8 +122,7 @@ RecoveredRaftState recoverRaftState(const std::vector<JournalRecord>& records, V
                 LogEntry e;
                 e.term = r->raftTerm;
                 e.index = r->raftIndex;
-                e.type = (r->kind == JournalRecordKind::Config) ? EntryType::ConfigChange
-                                                                : EntryType::Normal;
+                e.type = (r->kind == JournalRecordKind::Config) ? EntryType::ConfigChange : EntryType::Normal;
                 e.data = r->payload;
                 // Drop any entries above this index that a prior append left; a
                 // lower-index re-append means the higher suffix was superseded.

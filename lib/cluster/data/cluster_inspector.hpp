@@ -31,11 +31,11 @@ struct VShardDescribe {
 struct ClusterStatus {
     NodeId self = kNoNode;
     uint64_t mapEpoch = 0;
-    size_t nodeCount = 0;             // distinct owner nodes
-    size_t assignedVShards = 0;       // VShards with a placement
-    std::vector<NodeId> metaVoters;   // group-0 voters (supplied by the caller)
+    size_t nodeCount = 0;                      // distinct owner nodes
+    size_t assignedVShards = 0;                // VShards with a placement
+    std::vector<NodeId> metaVoters;            // group-0 voters (supplied by the caller)
     bool controlPlaneHighlyAvailable = false;  // >= 3 meta voters
-    bool clustered = false;           // any VShard owned off this node
+    bool clustered = false;                    // any VShard owned off this node
 };
 
 class ClusterInspector {

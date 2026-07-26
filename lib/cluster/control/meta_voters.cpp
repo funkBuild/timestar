@@ -6,8 +6,8 @@
 
 namespace timestar::control {
 
-std::vector<NodeId> selectMetaVoters(const std::map<NodeId, NodeRecord>& nodes,
-                                     const std::vector<NodeId>& current, unsigned target) {
+std::vector<NodeId> selectMetaVoters(const std::map<NodeId, NodeRecord>& nodes, const std::vector<NodeId>& current,
+                                     unsigned target) {
     if (target == 0)
         return {};
     const std::set<NodeId> currentSet(current.begin(), current.end());
@@ -25,8 +25,7 @@ std::vector<NodeId> selectMetaVoters(const std::map<NodeId, NodeRecord>& nodes,
     // Within each domain, prefer nodes that are CURRENTLY voters (churn
     // minimization), then by ascending id. `nodes` already gave us ascending id.
     for (auto& [dom, ids] : byDomain) {
-        std::stable_partition(ids.begin(), ids.end(),
-                              [&](NodeId id) { return currentSet.count(id) != 0; });
+        std::stable_partition(ids.begin(), ids.end(), [&](NodeId id) { return currentSet.count(id) != 0; });
     }
 
     // Order domains: those already hosting a current voter first (stability),
@@ -71,8 +70,7 @@ std::vector<NodeId> selectMetaVoters(const std::map<NodeId, NodeRecord>& nodes,
 }
 
 bool metaVotersDiffer(const std::vector<NodeId>& current, const std::vector<NodeId>& desired) {
-    return std::set<NodeId>(current.begin(), current.end()) !=
-           std::set<NodeId>(desired.begin(), desired.end());
+    return std::set<NodeId>(current.begin(), current.end()) != std::set<NodeId>(desired.begin(), desired.end());
 }
 
 }  // namespace timestar::control

@@ -107,8 +107,7 @@ public:
     // the client verifies the server's cert against (cluster-UUID-bound node name in
     // production). With TLS on, a plaintext peer -- or one whose cert the CA does not
     // sign -- cannot connect. All PEM (x509).
-    void setTlsCredentials(std::string certPem, std::string keyPem, std::string caPem,
-                           std::string expectedPeerName);
+    void setTlsCredentials(std::string certPem, std::string keyPem, std::string caPem, std::string expectedPeerName);
 
     // This node's supported wire-version range (rolling-upgrade / compatibility, M6/X).
     // Defaults to {1, kWriteBatchFormatMax} -- everything this binary can read and

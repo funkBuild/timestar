@@ -202,17 +202,15 @@ public:
     // only THIS shard's files, so the caller MUST run it on the VShard's assignCore
     // and only when vshardsCohesiveOnCores() holds (else the VShard's series scatter
     // across cores and the file set is incomplete).
-    seastar::future<
-        std::pair<timestar::VShardSnapshotManifest, std::vector<std::pair<std::string, std::string>>>>
+    seastar::future<std::pair<timestar::VShardSnapshotManifest, std::vector<std::pair<std::string, std::string>>>>
     buildVShardSnapshotFiles(timestar::VShardId vshard, std::string catalogHash);
 
     // Install a received VShard snapshot (the consumer side of the above): write each
     // (name, bytes) to a temp file in this shard's tsm dir, then verify-then-install
     // all-or-nothing via restoreVShardSnapshot. The temp files are always cleaned up.
     // Returns true iff installed (verification passed).
-    seastar::future<bool> installVShardSnapshotFiles(
-        const timestar::VShardSnapshotManifest& manifest,
-        std::vector<std::pair<std::string, std::string>> files);
+    seastar::future<bool> installVShardSnapshotFiles(const timestar::VShardSnapshotManifest& manifest,
+                                                     std::vector<std::pair<std::string, std::string>> files);
 
     // Migrate a VShard's data from legacy `sourcePaths` into a VShard-pure file
     // `outputName` in this shard's tsm dir at the migrated floor (Task 6). Returns

@@ -14,12 +14,12 @@ namespace timestar::data {
 // string-set union for the list kinds and a SUM for cardinality (disjoint => exact,
 // no HLL sketch needed on the wire).
 enum class MetadataKind : uint8_t {
-    Measurements = 0,          // all measurement names
-    Fields = 1,                // field names of `measurement`
-    TagKeys = 2,               // tag keys of `measurement`
-    TagValues = 3,             // values of `measurement`/`tagKey`
+    Measurements = 0,            // all measurement names
+    Fields = 1,                  // field names of `measurement`
+    TagKeys = 2,                 // tag keys of `measurement`
+    TagValues = 3,               // values of `measurement`/`tagKey`
     MeasurementCardinality = 4,  // series-count estimate of `measurement`
-    TagCardinality = 5,        // series-count estimate of `measurement`/`tagKey`=`tagValue`
+    TagCardinality = 5,          // series-count estimate of `measurement`/`tagKey`=`tagValue`
 };
 
 struct MetadataRequest {

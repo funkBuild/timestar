@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../../core/placement_table.hpp"  // virtualShard, SeriesId128
+#include "../../core/placement_table.hpp"    // virtualShard, SeriesId128
 #include "../control/control_map_cache.hpp"  // ControlMap
 #include "../raft/raft_types.hpp"            // NodeId
 
@@ -39,9 +39,7 @@ public:
             return kNoNode;
         return it->second.front();  // RF=1 owner; RF>1 primary is replica[0]
     }
-    NodeId ownerOfSeries(const SeriesId128& id) const {
-        return ownerOf(timestar::virtualShard(id));
-    }
+    NodeId ownerOfSeries(const SeriesId128& id) const { return ownerOf(timestar::virtualShard(id)); }
 
     bool isLocal(uint16_t vshard) const { return ownerOf(vshard) == self_; }
     bool isLocalSeries(const SeriesId128& id) const { return ownerOfSeries(id) == self_; }

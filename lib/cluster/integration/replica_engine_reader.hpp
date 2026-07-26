@@ -62,9 +62,7 @@ public:
                                              data::ReadEnvelope token, uint64_t maxLagIndex) override;
 
     // Current freshness without serving (selection / eligibility).
-    data::ReadEnvelope envelope() const {
-        return {group_.groupId(), group_.currentTerm(), group_.appliedIndex()};
-    }
+    data::ReadEnvelope envelope() const { return {group_.groupId(), group_.currentTerm(), group_.appliedIndex()}; }
 
 private:
     raft::RaftGroup& group_;

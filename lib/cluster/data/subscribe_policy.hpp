@@ -38,8 +38,9 @@ inline SubscribeDecision evaluateSubscribe(bool clustered, bool rejectInCluster)
     if (rejectInCluster)
         return {.rejected = true,
                 .nodeLocalOnly = false,
-                .reason = "subscriptions are node-local only in cluster mode; use /query for "
-                          "cluster-wide reads"};
+                .reason =
+                    "subscriptions are node-local only in cluster mode; use /query for "
+                    "cluster-wide reads"};
     return {.rejected = false,
             .nodeLocalOnly = true,
             .reason = "node-local subscription: this stream covers only series owned by this node"};

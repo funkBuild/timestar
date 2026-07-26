@@ -107,9 +107,7 @@ public:
     // REPLICATED through Raft there (M3 RF=3). Resolves true on durable quorum commit,
     // false if the peer is not the leader (caller redirects). Default false so doubles
     // need not implement it.
-    virtual seastar::future<bool> proposeWrite(NodeId, WriteBatch) {
-        return seastar::make_ready_future<bool>(false);
-    }
+    virtual seastar::future<bool> proposeWrite(NodeId, WriteBatch) { return seastar::make_ready_future<bool>(false); }
 
     // proposeWrite with LEADER HINTS and without consuming the caller's groups
     // (write-scaleout 3a/3b) -- the production remote path. `view` borrows groups the

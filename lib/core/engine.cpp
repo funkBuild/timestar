@@ -248,9 +248,8 @@ Engine::buildVShardSnapshotFiles(timestar::VShardId vshard, std::string catalogH
     co_return std::make_pair(std::move(manifest), std::move(files));
 }
 
-seastar::future<bool> Engine::installVShardSnapshotFiles(
-    const timestar::VShardSnapshotManifest& manifest,
-    std::vector<std::pair<std::string, std::string>> files) {
+seastar::future<bool> Engine::installVShardSnapshotFiles(const timestar::VShardSnapshotManifest& manifest,
+                                                         std::vector<std::pair<std::string, std::string>> files) {
     const auto tsmDir = layout_.tsmDir(shardId);
     // Stage each shipped file in a temp SUBDIR under its ORIGINAL name: restore opens
     // the source path as a ::TSM, whose ctor parses tier/seq from the FILENAME, so a

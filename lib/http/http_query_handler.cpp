@@ -4,12 +4,12 @@
 #include "block_aggregator.hpp"
 #include "content_negotiation.hpp"
 #include "engine.hpp"
-#include "placement_table.hpp"  // virtualShard
 #include "group_key.hpp"
 #include "http_auth.hpp"
 #include "http_routes.hpp"
 #include "logger.hpp"
 #include "logging_config.hpp"
+#include "placement_table.hpp"  // virtualShard
 #include "proto_converters.hpp"
 #include "query_parser.hpp"
 #include "query_runner.hpp"
@@ -2272,8 +2272,8 @@ seastar::future<std::optional<QueryResponse>> HttpQueryHandler::finalizeMultiSha
     }
     if (qprof) {
         timestar::http_log.info(
-            "[QUERY_PROFILE] partials={} groups={} raw_fastpath={} points={} merge={:.1f}ms build={:.1f}ms",
-            nPartials, nGroups, nRawFast, nPoints, mergeMs, buildMs);
+            "[QUERY_PROFILE] partials={} groups={} raw_fastpath={} points={} merge={:.1f}ms build={:.1f}ms", nPartials,
+            nGroups, nRawFast, nPoints, mergeMs, buildMs);
     }
 
     // Non-numeric (string/bool) results bypassed aggregation and arrive one
@@ -2577,8 +2577,8 @@ seastar::future<HttpQueryHandler::NodePartials> HttpQueryHandler::queryLocalPart
             out.ok = false;
             err.success = false;
             err.errorCode = "TOO_MANY_SERIES";
-            err.errorMessage = "Too many series: " + std::to_string(discoveryResult.discovered) +
-                               " exceeds limit of " + std::to_string(discoveryResult.limit);
+            err.errorMessage = "Too many series: " + std::to_string(discoveryResult.discovered) + " exceeds limit of " +
+                               std::to_string(discoveryResult.limit);
             co_return out;
         }
 
@@ -2644,8 +2644,7 @@ seastar::future<HttpQueryHandler::NodePartials> HttpQueryHandler::queryLocalPart
             out.ok = false;
             err.success = false;
             err.errorCode = "QUERY_TIMEOUT";
-            err.errorMessage =
-                "Query timed out after " + std::to_string(defaultQueryTimeout().count()) + " seconds";
+            err.errorMessage = "Query timed out after " + std::to_string(defaultQueryTimeout().count()) + " seconds";
             co_return out;
         }
 
@@ -2667,8 +2666,9 @@ seastar::future<HttpQueryHandler::NodePartials> HttpQueryHandler::queryLocalPart
     co_return out;
 }
 
-seastar::future<QueryResponse> HttpQueryHandler::finalizeClusterPartials(
-    QueryRequest request, std::vector<PartialAggregationResult> partials, std::vector<SeriesResult> nonNumeric) {
+seastar::future<QueryResponse> HttpQueryHandler::finalizeClusterPartials(QueryRequest request,
+                                                                         std::vector<PartialAggregationResult> partials,
+                                                                         std::vector<SeriesResult> nonNumeric) {
     // Reuse the EXACT multi-shard finalize by presenting the union of node partials
     // as a single synthetic shard. finalizeMultiShardResponse always merges via
     // mergePartialAggregationsGrouped (never the single-shard fast path), so the

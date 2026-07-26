@@ -28,8 +28,7 @@ struct WriteSeries {
     std::vector<uint64_t> timestamps;
     // Exactly one alternative is active, selected by `type` (Float->double,
     // Integer->int64, Boolean->bool, String->string). Its size == timestamps.size().
-    std::variant<std::vector<double>, std::vector<int64_t>, std::vector<bool>, std::vector<std::string>>
-        values;
+    std::variant<std::vector<double>, std::vector<int64_t>, std::vector<bool>, std::vector<std::string>> values;
     // Per-point replicated revision (ADR 0003), parallel to values. Empty == not
     // yet assigned (RF=1 Engine stamps at insert; RF=3 state machine fills these
     // from the log so the Engine must not re-stamp).

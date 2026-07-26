@@ -27,8 +27,7 @@ HostPort parseHostPort(const std::string& s) {
     uint16_t port = 8086;
     try {
         port = static_cast<uint16_t>(std::stoul(s.substr(colon + 1)));
-    } catch (...) {
-    }
+    } catch (...) {}
     return {host, port};
 }
 }  // namespace
@@ -107,24 +106,25 @@ seastar::future<> ClusterGateway::replicate(std::string path, std::string mimeTy
         const std::string host = peers_[i].host;
         const uint16_t port = peers_[i].port;
         // Best-effort: a peer outage must never fail the client's write (M1).
-        sends.push_back(clients_[i]
-                            ->make_request(std::move(req),
-                                           [](const seastar::http::reply&,
-                                              seastar::input_stream<char>&& body_in) -> seastar::future<> {
-                                               auto b = std::move(body_in);
-                                               auto buf = co_await b.read();
-                                               while (!buf.empty())
-                                                   buf = co_await b.read();  // drain
-                                               co_return;
-                                           },
-                                           std::nullopt)
-                            .handle_exception([host, port](std::exception_ptr e) {
-                                try {
-                                    std::rethrow_exception(e);
-                                } catch (const std::exception& ex) {
-                                    glog.warn("cluster replicate to {}:{} failed: {}", host, port, ex.what());
-                                }
-                            }));
+        sends.push_back(
+            clients_[i]
+                ->make_request(
+                    std::move(req),
+                    [](const seastar::http::reply&, seastar::input_stream<char>&& body_in) -> seastar::future<> {
+                        auto b = std::move(body_in);
+                        auto buf = co_await b.read();
+                        while (!buf.empty())
+                            buf = co_await b.read();  // drain
+                        co_return;
+                    },
+                    std::nullopt)
+                .handle_exception([host, port](std::exception_ptr e) {
+                    try {
+                        std::rethrow_exception(e);
+                    } catch (const std::exception& ex) {
+                        glog.warn("cluster replicate to {}:{} failed: {}", host, port, ex.what());
+                    }
+                }));
     }
     // Each send already handles its own exceptions, so awaiting them (they are
     // in flight concurrently) collects all without throwing.

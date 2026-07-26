@@ -413,8 +413,8 @@ int main(int argc, char** argv) {
                     timestar::http_log.info("Cluster mode ENABLED: node {} of {} peers (VShard-partitioned RF={})",
                                             cc.node_id, cc.peers.size(), cc.replication_factor);
                 else if (cc.enabled)
-                    timestar::http_log.info("Cluster mode ENABLED: node {} of {} peers (full replication)",
-                                            cc.node_id, cc.peers.size());
+                    timestar::http_log.info("Cluster mode ENABLED: node {} of {} peers (full replication)", cc.node_id,
+                                            cc.peers.size());
                 else
                     timestar::http_log.info("Cluster mode disabled (single node)");
             }

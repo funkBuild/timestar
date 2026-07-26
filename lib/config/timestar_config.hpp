@@ -362,6 +362,6 @@ template <>
 struct glz::meta<timestar::TimestarConfigParseable> {
     using T = timestar::TimestarConfigParseable;
     static constexpr auto value =
-        object("server", &T::server, "storage", &T::storage, "http", &T::http, "index", &T::index, "engine",
-               &T::engine, "streaming", &T::streaming, "cluster", &T::cluster);
+        object("server", &T::server, "storage", &T::storage, "http", &T::http, "index", &T::index, "engine", &T::engine,
+               "streaming", &T::streaming, "cluster", &T::cluster);
 };

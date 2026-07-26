@@ -26,8 +26,7 @@ public:
     // Add a group. Its RaftGroup shares this registry's transport (so its sends
     // multiplex over the same per-host connections). persistence/sm are borrowed
     // and must outlive the registry.
-    RaftGroup& addGroup(uint16_t groupId, RaftNode node, RaftPersistence& persistence,
-                        RaftStateMachine& sm);
+    RaftGroup& addGroup(uint16_t groupId, RaftNode node, RaftPersistence& persistence, RaftStateMachine& sm);
     RaftGroup* group(uint16_t groupId);
     size_t size() const { return groups_.size(); }
 
@@ -69,7 +68,7 @@ private:
     RaftTransport& transport_;
     std::chrono::milliseconds tickInterval_;
     std::map<uint16_t, std::unique_ptr<RaftGroup>> groups_;
-    std::map<uint16_t, unsigned> skips_;      // consecutive passes a group has been skipped
+    std::map<uint16_t, unsigned> skips_;     // consecutive passes a group has been skipped
     std::map<uint16_t, unsigned> awakeFor_;  // passes left of forced full-rate ticking
     // Must exceed the election timeout in passes (125-250) so a woken group campaigns.
     static constexpr unsigned kWakePasses = 400;

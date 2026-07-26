@@ -2161,8 +2161,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleW
     const bool shouldReplicate = !timestar::cluster::ClusterGateway::isForwarded(*req) &&
                                  timestar::cluster::shardGateway().enabled() && !HttpWriteHandler::partitioned();
     std::string replBody;
-    const std::string replMime =
-        timestar::http::isProtobuf(reqFmt) ? "application/x-protobuf" : "application/json";
+    const std::string replMime = timestar::http::isProtobuf(reqFmt) ? "application/x-protobuf" : "application/json";
 
     try {
         // Phase 1: read the body (buffered or streamed) and enforce size
@@ -2194,8 +2193,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleW
         if (timestar::http::isProtobuf(reqFmt)) {
             co_await handleProtobufWrite(body, defaultTimestampNs, resFmt, *rep);
             if (shouldReplicate && static_cast<int>(rep->_status) / 100 == 2)
-                co_await timestar::cluster::shardGateway().replicateWrite("application/x-protobuf",
-                                                                          std::string(body));
+                co_await timestar::cluster::shardGateway().replicateWrite("application/x-protobuf", std::string(body));
             co_return rep;
         }
 

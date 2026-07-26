@@ -25,8 +25,8 @@ using timestar::data::VShardDirectory;
 // reconfiguration through group 0).
 struct ClusterRuntime {
     NodeId selfId = 0;
-    ControlMap map;                                // epoch 1, all 4096 VShards assigned
-    std::map<NodeId, std::string> peerAddresses;   // NodeId -> "host:port" (1-based, includes self)
+    ControlMap map;                               // epoch 1, all 4096 VShards assigned
+    std::map<NodeId, std::string> peerAddresses;  // NodeId -> "host:port" (1-based, includes self)
 
     VShardDirectory directory() const { return VShardDirectory(selfId, map); }
 

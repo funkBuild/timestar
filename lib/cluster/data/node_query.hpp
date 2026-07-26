@@ -1,8 +1,8 @@
 #pragma once
 
 #include "../../http/http_query_handler.hpp"  // http::SeriesResult, QueryResponse
-#include "../../query/aggregator.hpp"          // PartialAggregationResult
-#include "../../query/query_parser.hpp"        // QueryRequest, AggregationMethod
+#include "../../query/aggregator.hpp"         // PartialAggregationResult
+#include "../../query/query_parser.hpp"       // QueryRequest, AggregationMethod
 
 #include <cstdint>
 #include <optional>
@@ -32,7 +32,7 @@ struct NodeQueryRequest {
 struct NodeQueryPartial {
     std::vector<PartialAggregationResult> partials;
     std::vector<timestar::http::SeriesResult> nonNumeric;
-    uint64_t seriesFound = 0;                     // series this node discovered (coordinator sums for maxSeriesCount)
+    uint64_t seriesFound = 0;                    // series this node discovered (coordinator sums for maxSeriesCount)
     std::vector<std::string> incompleteReasons;  // non-empty => QUERY_INCOMPLETE
 };
 

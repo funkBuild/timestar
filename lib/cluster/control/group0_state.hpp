@@ -21,7 +21,7 @@ enum class NodeState : uint8_t { Joining = 0, Active = 1, Draining = 2, Down = 3
 struct NodeRecord {
     NodeId raftId = 0;
     std::string uuid;
-    std::string address;       // inter-node RPC address
+    std::string address;  // inter-node RPC address
     std::string failureDomain;
     NodeState state = NodeState::Joining;
 
@@ -51,18 +51,18 @@ struct PolicyCell {
 // The full replicated group-0 control state. This is a deterministic function of
 // the committed command log; every field is rebuilt identically on every node.
 struct Group0State {
-    std::string clusterUuid;                              // meta
-    uint64_t mapEpoch = 0;                                // topology/policy version
-    uint64_t appliedIndex = 0;                            // last group-0 log index applied
-    uint64_t controllerTerm = 0;                          // controller epoch (group-0 term)
-    NodeId controllerLeader = 0;                          // node that owns controllerTerm
-    std::map<NodeId, NodeRecord> nodes;                   // nodes/<uuid>
+    std::string clusterUuid;                                   // meta
+    uint64_t mapEpoch = 0;                                     // topology/policy version
+    uint64_t appliedIndex = 0;                                 // last group-0 log index applied
+    uint64_t controllerTerm = 0;                               // controller epoch (group-0 term)
+    NodeId controllerLeader = 0;                               // node that owns controllerTerm
+    std::map<NodeId, NodeRecord> nodes;                        // nodes/<uuid>
     std::map<uint16_t, std::vector<NodeId>> desiredPlacement;  // desired-placement/<vshard>
-    std::vector<NodeId> metaVoters;                       // group-0 voter set (self-managed)
-    std::map<std::string, PolicyCell> policies;          // schema/retention CAS cells
-    std::map<std::string, Job> jobs;                      // jobs/<uuid>
-    std::set<std::string> joinTokens;                     // valid unused group-0-minted join tokens
-    uint32_t activeFormatVersion = 1;                     // active wire/storage format (rolling upgrade)
+    std::vector<NodeId> metaVoters;                            // group-0 voter set (self-managed)
+    std::map<std::string, PolicyCell> policies;                // schema/retention CAS cells
+    std::map<std::string, Job> jobs;                           // jobs/<uuid>
+    std::set<std::string> joinTokens;                          // valid unused group-0-minted join tokens
+    uint32_t activeFormatVersion = 1;                          // active wire/storage format (rolling upgrade)
 
     friend bool operator==(const Group0State&, const Group0State&) = default;
 };

@@ -29,9 +29,7 @@ seastar::future<> RaftGroupRegistry::deliver(Envelope env) {
     // Run the step under the gate so stop()'s gate.close() waits for it -- the
     // group must not be destroyed while a delivery is mid-flight in its step().
     RaftGroup* g = it->second.get();
-    return seastar::with_gate(gate_, [g, m = std::move(env.message)]() mutable {
-        return g->step(std::move(m));
-    });
+    return seastar::with_gate(gate_, [g, m = std::move(env.message)]() mutable { return g->step(std::move(m)); });
 }
 
 void RaftGroupRegistry::startTicking() {
@@ -41,9 +39,8 @@ void RaftGroupRegistry::startTicking() {
         if (ticking_ || stopping_ || gate_.is_closed())
             return;
         ticking_ = true;
-        (void)seastar::with_gate(gate_, [this]() -> seastar::future<> {
-            return tickAll().finally([this] { ticking_ = false; });
-        });
+        (void)seastar::with_gate(
+            gate_, [this]() -> seastar::future<> { return tickAll().finally([this] { ticking_ = false; }); });
     });
     timer_.arm_periodic(tickInterval_);
 }
@@ -74,8 +71,7 @@ seastar::future<> RaftGroupRegistry::tickAll() {
         // passes. A live leader's heartbeats (delivered via step, independent of
         // this group's own ticking) keep it a follower; a dead leader stops
         // heartbeating and the periodic check-tick still eventually times it out.
-        const bool quiescentFollower = g->role() == Role::Follower && g->leader() != kNoNode &&
-                                       !g->node().hasReady();
+        const bool quiescentFollower = g->role() == Role::Follower && g->leader() != kNoNode && !g->node().hasReady();
         // A group woken by wakeFollowersOf() bypasses hibernation until its window
         // expires (self-limiting, so a wake can never pin a group awake forever).
         bool forcedAwake = false;

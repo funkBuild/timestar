@@ -174,8 +174,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDeleteHandler::handle
     const bool shouldReplicate =
         !timestar::cluster::ClusterGateway::isForwarded(*req) && timestar::cluster::shardGateway().enabled();
     std::string replBody = shouldReplicate ? std::string(req->content) : std::string();
-    const std::string replMime =
-        timestar::http::isProtobuf(reqFmt) ? "application/x-protobuf" : "application/json";
+    const std::string replMime = timestar::http::isProtobuf(reqFmt) ? "application/x-protobuf" : "application/json";
 
     if (!engineSharded) {
         reply->set_status(seastar::http::reply::status_type::internal_server_error);

@@ -153,14 +153,17 @@ seastar::future<> EngineLocalStore::applyWrites(data::WriteBatch batch) {
     // await all. Data first, then the schema sync (mirrors the write handler).
     std::vector<seastar::future<>> pending;
     for (auto& [core, v] : doubles)
-        pending.push_back(engines_.invoke_on(
-            core, [v = std::move(v)](Engine& e) mutable { return e.insertBatch<double>(std::move(v)).discard_result(); }));
+        pending.push_back(engines_.invoke_on(core, [v = std::move(v)](Engine& e) mutable {
+            return e.insertBatch<double>(std::move(v)).discard_result();
+        }));
     for (auto& [core, v] : ints)
-        pending.push_back(engines_.invoke_on(
-            core, [v = std::move(v)](Engine& e) mutable { return e.insertBatch<int64_t>(std::move(v)).discard_result(); }));
+        pending.push_back(engines_.invoke_on(core, [v = std::move(v)](Engine& e) mutable {
+            return e.insertBatch<int64_t>(std::move(v)).discard_result();
+        }));
     for (auto& [core, v] : bools)
-        pending.push_back(engines_.invoke_on(
-            core, [v = std::move(v)](Engine& e) mutable { return e.insertBatch<bool>(std::move(v)).discard_result(); }));
+        pending.push_back(engines_.invoke_on(core, [v = std::move(v)](Engine& e) mutable {
+            return e.insertBatch<bool>(std::move(v)).discard_result();
+        }));
     for (auto& [core, v] : strings)
         pending.push_back(engines_.invoke_on(core, [v = std::move(v)](Engine& e) mutable {
             return e.insertBatch<std::string>(std::move(v)).discard_result();
@@ -186,10 +189,9 @@ seastar::future<> EngineLocalStore::applyWrites(data::WriteBatch batch) {
 seastar::future<bool> EngineLocalStore::applyDelete(std::string seriesKey, uint64_t start, uint64_t end) {
     const SeriesId128 id = SeriesId128::fromSeriesKey(seriesKey);
     const unsigned core = coreFor(id);
-    co_return co_await engines_.invoke_on(
-        core, [seriesKey = std::move(seriesKey), start, end](Engine& e) mutable {
-            return e.deleteRange(std::move(seriesKey), start, end);
-        });
+    co_return co_await engines_.invoke_on(core, [seriesKey = std::move(seriesKey), start, end](Engine& e) mutable {
+        return e.deleteRange(std::move(seriesKey), start, end);
+    });
 }
 
 seastar::future<data::NodeQueryPartial> EngineLocalStore::queryLocal(data::NodeQueryRequest req) {
@@ -208,8 +210,8 @@ seastar::future<data::NodeQueryPartial> EngineLocalStore::queryLocal(data::NodeQ
         co_await handler.queryLocalPartials(std::move(req.request), filter ? &*filter : nullptr);
     data::NodeQueryPartial partial;
     if (!np.ok) {
-        partial.incompleteReasons.push_back(
-            np.errorResponse.errorMessage.empty() ? std::string("query failed") : np.errorResponse.errorMessage);
+        partial.incompleteReasons.push_back(np.errorResponse.errorMessage.empty() ? std::string("query failed")
+                                                                                  : np.errorResponse.errorMessage);
         co_return partial;
     }
     partial.partials = std::move(np.partials);
@@ -251,8 +253,9 @@ seastar::future<data::MetadataResult> EngineLocalStore::queryMetadata(data::Meta
             break;
         }
         case data::MetadataKind::MeasurementCardinality: {
-            out.cardinality = co_await timestar::cluster::scatterAndSum(
-                engines_, [m = req.measurement](Engine& eng) { return eng.getIndex().estimateMeasurementCardinality(m); });
+            out.cardinality = co_await timestar::cluster::scatterAndSum(engines_, [m = req.measurement](Engine& eng) {
+                return eng.getIndex().estimateMeasurementCardinality(m);
+            });
             break;
         }
         case data::MetadataKind::TagCardinality: {

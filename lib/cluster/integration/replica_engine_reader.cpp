@@ -5,7 +5,7 @@
 namespace timestar::cluster {
 
 seastar::future<ReplicaReadOutcome> ReplicaEngineReader::read(data::NodeQueryRequest req, data::ReadConsistency mode,
-                                                             data::ReadEnvelope token, uint64_t maxLagIndex) {
+                                                              data::ReadEnvelope token, uint64_t maxLagIndex) {
     // Bind everything reached through `this` to frame-locals BEFORE any co_await, so an
     // in-flight read survives the facade being destroyed (the coroutine-lifetime rule).
     auto& group = group_;

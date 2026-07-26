@@ -21,8 +21,8 @@ struct EngineVShardReplicas {
 };
 
 struct EngineReplicaQueryResult {
-    data::NodeQueryPartial partial;      // union of each VShard's one served partial
-    std::vector<uint16_t> missing;       // VShards no replica could serve (allowPartial only)
+    data::NodeQueryPartial partial;  // union of each VShard's one served partial
+    std::vector<uint16_t> missing;   // VShards no replica could serve (allowPartial only)
 };
 
 // The production analogue of data::ReplicaQueryCoordinator (which merges the toy

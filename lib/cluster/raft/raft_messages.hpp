@@ -83,8 +83,8 @@ struct TimeoutNow {
     NodeId leaderId = kNoNode;
 };
 
-using MessagePayload = std::variant<RequestVote, RequestVoteReply, AppendEntries, AppendEntriesReply,
-                                    InstallSnapshot, InstallSnapshotReply, TimeoutNow>;
+using MessagePayload = std::variant<RequestVote, RequestVoteReply, AppendEntries, AppendEntriesReply, InstallSnapshot,
+                                    InstallSnapshotReply, TimeoutNow>;
 
 // An addressed message the core emits or receives. `to`/`from` are node ids
 // within the group; the group id lives in the transport envelope.

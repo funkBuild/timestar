@@ -276,16 +276,16 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::hand
         if (specificTag.empty()) {
             std::vector<std::string> keyVec;
             if (clusterMetadataHook) {
-                keyVec = (co_await clusterMetadataHook({timestar::data::MetadataKind::TagKeys, measurement, "", ""}))
-                             .items;
+                keyVec =
+                    (co_await clusterMetadataHook({timestar::data::MetadataKind::TagKeys, measurement, "", ""})).items;
             } else {
                 auto tagKeys = co_await localEngine.getMeasurementTags(measurement);
                 keyVec.assign(tagKeys.begin(), tagKeys.end());
             }
             for (const auto& tagKey : keyVec) {
                 if (clusterMetadataHook) {
-                    auto vals =
-                        co_await clusterMetadataHook({timestar::data::MetadataKind::TagValues, measurement, tagKey, ""});
+                    auto vals = co_await clusterMetadataHook(
+                        {timestar::data::MetadataKind::TagValues, measurement, tagKey, ""});
                     allTagsResults[tagKey] = std::set<std::string>(vals.items.begin(), vals.items.end());
                 } else {
                     allTagsResults[tagKey] = co_await localEngine.getTagValues(measurement, tagKey);
@@ -601,15 +601,14 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::hand
         if (!tagKey.empty() && !tagValue.empty()) {
             // Specific tag combination cardinality. Partitioned: sum across owner
             // nodes (RF=1 disjoint series => exact); else sum across local shards.
-            double total =
-                clusterMetadataHook
-                    ? (co_await clusterMetadataHook(
-                           {timestar::data::MetadataKind::TagCardinality, measurement, tagKey, tagValue}))
-                          .cardinality
-                    : co_await timestar::cluster::scatterAndSum(
-                          *engineSharded, [measurement, tagKey, tagValue](Engine& engine) {
-                              return engine.getIndex().estimateTagCardinality(measurement, tagKey, tagValue);
-                          });
+            double total = clusterMetadataHook
+                               ? (co_await clusterMetadataHook(
+                                      {timestar::data::MetadataKind::TagCardinality, measurement, tagKey, tagValue}))
+                                     .cardinality
+                               : co_await timestar::cluster::scatterAndSum(
+                                     *engineSharded, [measurement, tagKey, tagValue](Engine& engine) {
+                                         return engine.getIndex().estimateTagCardinality(measurement, tagKey, tagValue);
+                                     });
 
             std::unordered_map<std::string, double> tagCard;
             tagCard[tagKey + ":" + tagValue] = total;
@@ -641,8 +640,8 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::hand
             auto& localEngine = engineSharded->local();
             std::vector<std::string> tagKeysCopy;
             if (clusterMetadataHook) {
-                tagKeysCopy = (co_await clusterMetadataHook({timestar::data::MetadataKind::TagKeys, measurement, "", ""}))
-                                  .items;
+                tagKeysCopy =
+                    (co_await clusterMetadataHook({timestar::data::MetadataKind::TagKeys, measurement, "", ""})).items;
             } else {
                 auto tagKeys = co_await localEngine.getMeasurementTags(measurement);
                 tagKeysCopy.assign(tagKeys.begin(), tagKeys.end());
@@ -651,9 +650,9 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpMetadataHandler::hand
             for (const auto& tk : tagKeysCopy) {
                 size_t distinct;
                 if (clusterMetadataHook) {
-                    distinct = (co_await clusterMetadataHook(
-                                    {timestar::data::MetadataKind::TagValues, measurement, tk, ""}))
-                                   .items.size();
+                    distinct =
+                        (co_await clusterMetadataHook({timestar::data::MetadataKind::TagValues, measurement, tk, ""}))
+                            .items.size();
                 } else {
                     distinct = (co_await localEngine.getTagValues(measurement, tk)).size();
                 }

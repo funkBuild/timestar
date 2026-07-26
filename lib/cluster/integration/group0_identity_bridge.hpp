@@ -1,7 +1,7 @@
 #pragma once
 
 #include "../control/group0_state.hpp"  // NodeRecord, NodeState
-#include "../raft/raft_types.hpp"        // NodeId
+#include "../raft/raft_types.hpp"       // NodeId
 #include "node_identity.hpp"
 
 #include <filesystem>
@@ -19,9 +19,8 @@ namespace timestar::cluster {
 // `raftId` is the stable Raft replica id (from config / group-0 assignment),
 // `address` the inter-node RPC endpoint, `failureDomain` the rack/az that drives
 // cross-domain meta-voter selection.
-control::NodeRecord nodeRecordFrom(const NodeIdentity& identity, raft::NodeId raftId,
-                                   std::string address, std::string failureDomain,
-                                   control::NodeState state = control::NodeState::Active);
+control::NodeRecord nodeRecordFrom(const NodeIdentity& identity, raft::NodeId raftId, std::string address,
+                                   std::string failureDomain, control::NodeState state = control::NodeState::Active);
 
 // Close the bootstrap loop: after this node initializes or joins a cluster and
 // group-0 reports the authoritative `clusterUuid`, bind it into node.json so a
@@ -30,7 +29,6 @@ control::NodeRecord nodeRecordFrom(const NodeIdentity& identity, raft::NodeId ra
 // a data-dir cross-wire, not a legitimate re-init, and silently overwriting it
 // would splice this node's data into the wrong cluster. Idempotent when the bound
 // uuid already matches. Returns true iff node.json was (re)written.
-bool bindClusterUuid(NodeIdentity& identity, const std::filesystem::path& dataDir,
-                     const std::string& clusterUuid);
+bool bindClusterUuid(NodeIdentity& identity, const std::filesystem::path& dataDir, const std::string& clusterUuid);
 
 }  // namespace timestar::cluster

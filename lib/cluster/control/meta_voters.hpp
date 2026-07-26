@@ -18,8 +18,8 @@ namespace timestar::control {
 //
 // Fewer eligible nodes/domains than `target` returns the best available smaller
 // set (the caller reports reduced HA). `current` is the present voter set.
-std::vector<NodeId> selectMetaVoters(const std::map<NodeId, NodeRecord>& nodes,
-                                     const std::vector<NodeId>& current, unsigned target);
+std::vector<NodeId> selectMetaVoters(const std::map<NodeId, NodeRecord>& nodes, const std::vector<NodeId>& current,
+                                     unsigned target);
 
 // True iff `desired` differs from `current` as a SET (order-independent), i.e. a
 // joint-consensus membership change is warranted.

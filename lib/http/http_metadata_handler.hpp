@@ -1,9 +1,8 @@
 #pragma once
 
+#include "../cluster/data/node_metadata.hpp"
 #include "engine.hpp"
 #include "logger.hpp"
-
-#include "../cluster/data/node_metadata.hpp"
 
 #include <functional>
 #include <memory>
