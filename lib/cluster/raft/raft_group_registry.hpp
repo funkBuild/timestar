@@ -41,31 +41,37 @@ public:
     // Hibernation: a quiescent FOLLOWER group (has a leader, no pending Ready) is
     // skipped for up to `followerSkip` consecutive passes before a check-tick,
     //
-    // NOTE, because it is not obvious and it cost a measured availability regression: the
-    // skip stretches every TICK-DRIVEN clock in that group by ~followerSkip, and with
-    // CheckQuorum on that includes the disruption-guard LEASE. `deliver()` therefore wakes
-    // a group that DROPPED a vote under that lease -- see the comment there for the
-    // mechanism, the numbers, and why the trigger is the drop and not the vote.
+    // The skip changes how often a group is RUN and must not change what time it thinks it
+    // is: `tickAll` credits the skipped passes to the next tick (`RaftNode::tick(passes)`),
+    // so the election timeout -- and, with CheckQuorum on, the disruption-guard LEASE that
+    // shares its counter -- still expire in REAL time. Advancing by one after skipping nine
+    // stretched both tenfold and cost a measured availability regression; see tickAll.
     // since a live leader's heartbeats keep it a follower regardless of its own
-    // ticking and a dead leader is still detected by the periodic check-tick
-    // (failover for idle groups is slower by ~followerSkip, which is fine -- they
-    // have no pending writes). Leaders and candidates always tick. This is what
-    // keeps the per-tick cost of thousands of idle groups on one core low.
+    // ticking and a dead leader is still detected by the periodic check-tick.
+    // Leaders and candidates always tick. This is what keeps the per-tick cost of
+    // thousands of idle groups on one core low.
     // followerSkip == 0 disables hibernation. Default keeps it on.
     void setHibernation(unsigned followerSkip) { followerSkip_ = followerSkip; }
     uint64_t skippedTicks() const { return skippedTicks_; }
 
     // Un-hibernate every group that still believes `leader` leads it, so it ticks at
-    // full rate and reaches its election timeout promptly. Returns how many woke.
+    // full rate. Returns how many woke.
     //
-    // Hibernation stretches an idle follower's election timeout by ~followerSkip
-    // (10x by default: 2.5-5s becomes 25-50s). That was deemed acceptable because an
-    // idle group has no pending writes -- but READS route by leader across ALL
-    // VShards, so a few hundred idle groups still pointing at a dead node fail every
-    // query cluster-wide for the whole stretched timeout. The read path calls this
-    // when a leader turns out to be unreachable, which collapses that window back to
-    // a normal election timeout. It only resets the skip counter -- no forced
-    // election, so it cannot disturb a healthy group.
+    // WHAT THIS IS STILL FOR, now that skipped passes are credited (D-29(b)): granularity,
+    // not magnitude. A hibernating follower's election timeout expires on schedule in real
+    // time, but it can only NOTICE at its next check-tick, so detection lands up to
+    // followerSkip passes (~200 ms in production) late and the group's own Ready work is
+    // deferred with it. Waking removes that lag for the groups behind a peer we already
+    // know is unreachable, which is what the read and write paths do before answering
+    // QUERY_INCOMPLETE or giving up on a batch.
+    //
+    // It used to be load-bearing for a much bigger number -- hibernation stretched the
+    // timeout ITSELF tenfold (2.5-5 s -> 25-50 s), so a few hundred idle groups pointing at
+    // a dead node failed every query cluster-wide for the whole stretched window. That is
+    // fixed at the source in tickAll; this remains as the latency trim.
+    //
+    // It only resets the skip counter -- no forced election, so it cannot disturb a healthy
+    // group.
     size_t wakeFollowersOf(NodeId leader);
 
 private:

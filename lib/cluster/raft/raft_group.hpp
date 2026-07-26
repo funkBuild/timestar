@@ -26,7 +26,8 @@ public:
 
     // Inputs. Each mutates the node then drains its Ready under the group lock.
     seastar::future<> step(Message m);
-    seastar::future<> tick();
+    // Forwarded to RaftNode::tick -- `passes` > 1 credits hibernation-skipped intervals.
+    seastar::future<> tick(unsigned passes = 1);
     // An entry larger than this can be appended and COMMITTED and then never delivered
     // to a follower -- the transport refuses it, the follower can never catch up, and the
     // group is permanently one replica short with the offending entry already durable.

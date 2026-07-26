@@ -1,7 +1,6 @@
 #include "raft_group_registry.hpp"
 
 #include <seastar/core/coroutine.hh>
-#include <variant>
 
 namespace timestar::raft {
 
@@ -30,39 +29,7 @@ seastar::future<> RaftGroupRegistry::deliver(Envelope env) {
     // Run the step under the gate so stop()'s gate.close() waits for it -- the
     // group must not be destroyed while a delivery is mid-flight in its step().
     RaftGroup* g = it->second.get();
-    // A VOTE THE LEASE DROPPED UN-HIBERNATES THE VOTER, and with CheckQuorum on this is
-    // load bearing rather than an optimisation (debt D-9).
-    //
-    // Hibernation ticks a quiescent follower 1-in-`followerSkip_`, which stretches every
-    // tick-driven clock in the group by that factor -- including, once CheckQuorum is on,
-    // the disruption-guard lease: 2.5-5 s becomes 25-50 s. A vote arriving inside that
-    // stretched lease is dropped SILENTLY (no reply, no term bump), so a group whose leader
-    // has DIED cannot be voted into a new one until the VOTER's stretched lease expires,
-    // while the candidate -- which the write path has usually already woken via
-    // wakeFollowersOf -- campaigns and is refused every time.
-    //
-    // MEASURED on node_kill_round.sh (3-node RF=3, kill -9 mid-bench, same session, only
-    // CheckQuorum differing): without this, enabling CheckQuorum moved the band from
-    // 49/400 failed batches and an 8 s recovery to 153/400 and 43 s, every failure
-    // "(last: transport)" -- with the election stalled the coordinator had no leader for
-    // those groups and fell back to the placement primary, which was the dead node.
-    //
-    // THE TRIGGER IS THE DROP, NOT THE VOTE, and the difference is the whole design. Waking
-    // on any RequestVote also wakes for every ordinary election and every leadership
-    // TRANSFER -- and the balancer transfers thousands of groups every few seconds, so that
-    // version kept most of the map awake and gave back the CPU hibernation exists to save
-    // (it failed HibernationSkipsIdleFollowersButStillReplicates outright). A vote the lease
-    // DROPPED is exactly the pathological case: a transfer vote bypasses the lease and is
-    // never counted, and a vote arriving after the lease has expired is never counted
-    // either. Waking changes no Raft state -- the group only gets its own clock back.
-    const uint64_t droppedBefore = g->node().leaseDroppedVotes();
-    const uint16_t gid = env.groupId;
-    return seastar::with_gate(gate_, [this, g, gid, droppedBefore, m = std::move(env.message)]() mutable {
-        return g->step(std::move(m)).then([this, g, gid, droppedBefore] {
-            if (g->node().leaseDroppedVotes() != droppedBefore)
-                awakeFor_[gid] = kWakePasses;
-        });
-    });
+    return seastar::with_gate(gate_, [g, m = std::move(env.message)]() mutable { return g->step(std::move(m)); });
 }
 
 void RaftGroupRegistry::startTicking() {
@@ -123,11 +90,35 @@ seastar::future<> RaftGroupRegistry::tickAll() {
                 ++skippedTicks_;
                 continue;
             }
-            s = 0;  // time for a check-tick
-        } else {
-            skips_[gid] = 0;
         }
-        co_await g->tick();
+        // TICK FOR THE PASSES WE SKIPPED, NOT JUST FOR THIS ONE (debt D-29(b)). Hibernation
+        // is about how often we RUN a group, and it must not change what time that group
+        // thinks it is: every clock in RaftNode::tick is tick-driven, and with CheckQuorum
+        // on one of them is the disruption-guard LEASE. Skipping nine passes and then
+        // advancing by one stretched that lease tenfold (2.5-5 s -> 25-50 s), so a group
+        // whose leader had DIED refused the very votes that would have replaced it --
+        // measured as 153/400 failed batches and a 43 s recovery on node_kill_round.sh
+        // against 49/400 and 8 s with CheckQuorum off. Crediting the skipped passes makes
+        // the lease, and the election timeout behind it, expire in REAL time; hibernation
+        // still saves exactly the same work, because the saving is the calls we did not
+        // make, not the time we pretended had not passed.
+        //
+        // The credit is also paid to a group that has STOPPED being quiescent (the counter
+        // is only cleared here), so a follower that becomes a candidate or takes a proposal
+        // does not silently forget the interval it spent hibernating.
+        //
+        // ELECTION-STORM NOTE: a crediting tick can cross the election timeout by up to
+        // followerSkip_ passes rather than landing exactly on it, so crossings quantise to
+        // every followerSkip_+1-th pass. That coarsens the randomized timeout
+        // (electionTimeoutMin..Max, 125-250 passes in production) but does not defeat it --
+        // 126 distinct timeouts still spread over ~13 distinct check-tick passes, and the
+        // gates that would show a storm (rolling_rebalance under sustained writes,
+        // node_kill_round) are green. If followerSkip_ ever approaches the timeout SPREAD,
+        // that stops being true and the crossings need explicit jitter.
+        unsigned& skipped = skips_[gid];
+        const unsigned passes = 1 + skipped;
+        skipped = 0;
+        co_await g->tick(passes);
     }
 }
 

@@ -582,8 +582,26 @@ void RaftNode::checkQuorumOrStepDown() {
         becomeFollower(currentTerm_, kNoNode);
 }
 
-void RaftNode::tick() {
-    ++tick_;  // monotonic clock behind ticksSinceAck(); see raft_node.hpp
+void RaftNode::tick(unsigned passes) {
+    // `passes` is how many tick INTERVALS this call stands for. It is 1 for a group the
+    // driver ticks every pass, and >1 when the driver has been HIBERNATING this group and
+    // is now crediting the passes it skipped (debt D-29(b), RaftGroupRegistry::tickAll).
+    //
+    // Every clock below is therefore advanced by `passes`, not by one, which is what makes
+    // them measure REAL time rather than "times the driver got round to us". That matters
+    // for one clock in particular: with CheckQuorum on, `electionElapsed_` is also the
+    // DISRUPTION-GUARD LEASE, and a 1-in-10 hibernation used to stretch it from 2.5-5 s to
+    // 25-50 s -- so a group whose leader had DIED sat refusing the votes that would have
+    // replaced it. Measured at 153/400 failed batches and a 43 s recovery on
+    // node_kill_round.sh, against 49/400 and 8 s with CheckQuorum off.
+    //
+    // Hibernation itself is unaffected: a live leader's heartbeats arrive through step()
+    // regardless of ticking and reset electionElapsed_ every heartbeatTimeout, which is far
+    // shorter than any election timeout, so an idle follower with a live leader still never
+    // campaigns and still re-hibernates on its own.
+    if (passes == 0)
+        return;
+    tick_ += passes;  // monotonic clock behind ticksSinceAck(); see raft_node.hpp
     if (role_ == Role::Leader) {
         // ABANDON A STUCK LEADER TRANSFER (§3.10). While `leadTransferee_` is set the
         // leader refuses EVERY proposal (see propose()), which is correct for a handoff
@@ -602,16 +620,16 @@ void RaftNode::tick() {
         //
         // etcd bounds it the same way: one election timeout, then give up and resume
         // accepting writes. The transfer is merely not completed; nothing is unsafe.
-        if (leadTransferee_ != kNoNode && ++transferElapsed_ >= electionTimeout_) {
+        if (leadTransferee_ != kNoNode && (transferElapsed_ += passes) >= electionTimeout_) {
             leadTransferee_ = kNoNode;
             transferElapsed_ = 0;
         }
-        if (++heartbeatElapsed_ >= opts_.heartbeatTimeout) {
+        if ((heartbeatElapsed_ += passes) >= opts_.heartbeatTimeout) {
             heartbeatElapsed_ = 0;
             bcastAppend();  // heartbeat (an AppendEntries, possibly carrying entries)
         }
         if (opts_.checkQuorum) {
-            if (++electionElapsed_ >= electionTimeout_) {
+            if ((electionElapsed_ += passes) >= electionTimeout_) {
                 electionElapsed_ = 0;
                 checkQuorumOrStepDown();
             }
@@ -622,7 +640,7 @@ void RaftNode::tick() {
     // campaign -- they are non-voting and can never become leader.
     if (!isVoter(id_))
         return;
-    ++electionElapsed_;
+    electionElapsed_ += passes;
     if (electionElapsed_ >= electionTimeout_)
         campaign();  // PreVote-aware: pre-election first when enabled
 }
@@ -642,6 +660,36 @@ void RaftNode::step(Message m) {
     if (role_ == Role::Leader && isVoter(m.from))
         recentActive_.insert(m.from);
 
+    // A TIMEOUTNOW IS ONLY EVER LEGITIMATE FROM THE LEADER WE CURRENTLY FOLLOW, and this
+    // check is what makes the campaignTransfer flag self-limiting (ADR 0005 / debt D-9
+    // review, F1). It has to be evaluated HERE, against the PRE-STEP leader belief, and it
+    // must drop the message outright:
+    //
+    //   * `isLeaderMessage` counts TimeoutNow, so a forge at a HIGHER term used to reach
+    //     `becomeFollower(mTerm, m.from)` first -- which INSTALLED the forger as our leader
+    //     -- and the arm below then read `leaderId_ == m.from` and campaigned with the
+    //     transfer flag. Checking the arm against the post-step belief is therefore no
+    //     check at all;
+    //   * a forge at the SAME term reached the arm regardless.
+    //
+    // Vote safety was never at risk (the log check and one-vote-per-term are untouched),
+    // but with CheckQuorum on, the disruption GUARD became bypassable at will by any buggy
+    // or hostile peer: forge a TimeoutNow, get a transfer-flagged campaign, and every
+    // voter's lease stands aside. Demonstrated in review, pinned by the forge tests in
+    // raft_node_test.cpp.
+    //
+    // Legitimate transfers are unaffected: a leader only ever sends TimeoutNow to a
+    // follower that is already following it (transferLeadership requires
+    // `matchIndex`/AppendEntries progress with that peer), and a follower that is BEHIND
+    // its leader still passes, because the believed leader is the sender even when the
+    // sender's term is newer. Dropping it also refuses the second half of the forge -- a
+    // higher-term TimeoutNow from a non-leader no longer bumps our term, installs a false
+    // leader, or resets our election timer, i.e. it cannot buy the forger a lease over us
+    // either. The cost of a false negative is one abandoned transfer (RaftNode::tick gives
+    // up after an election timeout and the group elects normally), never a wedge.
+    if (std::holds_alternative<TimeoutNow>(m.payload) && (leaderId_ == kNoNode || m.from != leaderId_))
+        return;
+
     if (mTerm > currentTerm_) {
         if (isVoteRequest(m.payload)) {
             // Disruption guard (CheckQuorum lease): a node that still hears from a
@@ -656,23 +704,25 @@ void RaftNode::step(Message m) {
             // the production tick) with it on. That is what forced the revert in
             // 1f2e752; this is the etcd fix that lets CheckQuorum come back.
             //
-            // The flag is a HINT, not an assertion we can verify -- and it does not need
-            // to be. It stands the lease down and does nothing else: the vote still has
-            // to pass §5.4.1's log check and the one-vote-per-term rule below, so the
-            // most a lying peer buys is the situation that shipped for months with
-            // CheckQuorum off. It is also self-limiting, because only the current leader
-            // sends TimeoutNow, and a TimeoutNow is only honoured from the believed
-            // leader at the current term.
+            // The flag is a HINT, not an assertion this voter can verify -- and it does
+            // not need to be. It stands the lease down and does nothing else: the vote
+            // still has to pass §5.4.1's log check and the one-vote-per-term rule below,
+            // so the most a lying peer buys is the situation that shipped for months with
+            // CheckQuorum off.
+            //
+            // What limits WHO can set it is a check on the CANDIDATE's side, not this one:
+            // a transfer-flagged campaign is only ever started from a TimeoutNow whose
+            // sender was already the believed leader (the guard near the top of step()).
+            // That guard is load-bearing and was missing when the flag first landed --
+            // without it a forged TimeoutNow, at the same term or a higher one, produced a
+            // transfer-flagged campaign from any peer, so "only the incumbent can cause
+            // one" was simply untrue and this lease was bypassable at will (F1). A voter
+            // receiving a flagged vote still cannot tell the difference; the property is
+            // enforced where it can be.
             const bool transferVote = std::get<RequestVote>(m.payload).campaignTransfer;
             const bool inLease =
                 opts_.checkQuorum && leaderId_ != kNoNode && electionElapsed_ < electionTimeout_ && !transferVote;
             if (inLease) {
-                // COUNTED, because the drop is invisible otherwise (no reply, no term
-                // bump) and the DRIVER needs to know it happened: a hibernating group
-                // ticks 1-in-10, which stretches this lease 10x, and the driver's cure is
-                // to un-hibernate the group so the lease expires in real time. See
-                // RaftGroupRegistry::deliver.
-                ++leaseDroppedVotes_;
                 return;  // ignore; do not bump term
             }
         }
@@ -723,10 +773,14 @@ void RaftNode::step(Message m) {
                 // `transfer=true` marks the vote requests this campaign sends, so the
                 // OTHER voters' leases stand aside too (ADR 0005). Skipping only our own
                 // is what made CheckQuorum break transfers: we campaigned instantly and
-                // then nobody answered. This is the ONLY site that sets the flag -- a
-                // node cannot elect itself with it, only be elected with it by the
-                // incumbent, because this arm is reached only for a TimeoutNow accepted
-                // from the leader we follow at the current term.
+                // then nobody answered.
+                //
+                // This is the ONLY site that sets the flag, and it is reachable only for a
+                // TimeoutNow whose sender was ALREADY our believed leader before this step
+                // -- see the guard near the top of step(), which is what makes that true.
+                // Until that guard existed the "only the incumbent can cause a
+                // transfer-flagged campaign" claim was FALSE for a forged TimeoutNow, at
+                // the same term or a higher one (F1).
                 if (isVoter(id_))
                     becomeCandidate(/*transfer=*/true);
             }

@@ -171,13 +171,25 @@ seastar::future<> ClusterDataPlane::start(const ClusterConfig& cfg, seastar::sha
         // queryReplicated fails reads CLOSED after ~125 ms of leaderlessness, and the
         // operator rebalance endpoint storms transfers deliberately (2216 in one gate).
         //
-        // WHAT MAKES IT SAFE NOW (ADR 0005, debt D-9). `RequestVote::campaignTransfer`,
-        // set only by a campaign started FROM a TimeoutNow, and honoured at the inLease
-        // check in RaftNode::step: a transfer vote stands the lease down and buys nothing
-        // else -- the log check, one-vote-per-term and term ordering all still apply. It
-        // rides its own message-type byte (kRequestVoteTransfer), so a peer too old to
-        // know it DROPS the envelope rather than misparsing it, and that transfer degrades
-        // to the old slow path instead of corrupting an election.
+        // WHAT MAKES IT SAFE NOW -- THREE THINGS, not one (ADR 0005, debt D-9/D-29).
+        //   1. `RequestVote::campaignTransfer`, set only by a campaign started FROM a
+        //      TimeoutNow, honoured at the inLease check in RaftNode::step. A transfer vote
+        //      stands the lease down and buys nothing else: the log check,
+        //      one-vote-per-term and term ordering all still apply.
+        //   2. That campaign is reachable only for a TimeoutNow whose sender was ALREADY
+        //      our believed leader (the guard at the top of RaftNode::step). Without it a
+        //      FORGED TimeoutNow -- same term or higher, since a higher-term leader message
+        //      installs its sender as leader first -- let any peer produce a
+        //      transfer-flagged campaign and stand every voter's lease down at will (F1).
+        //      Vote safety was never affected; the disruption guard was.
+        //   3. Hibernation credits the passes it skips (RaftGroupRegistry::tickAll ->
+        //      RaftNode::tick(passes)), so the lease expires in REAL time. Without that, an
+        //      idle follower's lease ran 10x long and a DEAD leader's groups refused the
+        //      votes that would have replaced them: node_kill_round went from 49/400 failed
+        //      batches and an 8 s recovery to 153/400 and 43 s.
+        // The wire is safe on its own terms too: a transfer vote rides its own message-type
+        // byte (kRequestVoteTransfer), so a peer too old to know it DROPS the envelope
+        // rather than misparsing it, and that transfer degrades to the old slow path.
         //
         // Pinned by, in order of how directly they would catch a regression here:
         //   RaftClusterTest.LeaderTransferUnderCheckQuorumCompletesInZeroTickRounds

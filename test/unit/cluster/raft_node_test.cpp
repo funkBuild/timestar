@@ -1,5 +1,6 @@
-#include "../../../lib/cluster/raft/raft_config.hpp"
 #include "../../../lib/cluster/raft/raft_node.hpp"
+
+#include "../../../lib/cluster/raft/raft_config.hpp"
 
 #include <gtest/gtest.h>
 
@@ -118,12 +119,10 @@ TEST(RaftNodeTest, GrantsVoteToUpToDateCandidateAndPersistsIt) {
 
 TEST(RaftNodeTest, RejectsSecondCandidateSameTerm) {
     RaftNode n(1, {1, 2, 3}, logOfTerms({5, 5}), HardState{5, kNoNode}, fixedTimeout(10));
-    n.step(Message{.to = 1, .from = 2,
-                   .payload = RequestVote{false, 5, 2, 2, 5}});
+    n.step(Message{.to = 1, .from = 2, .payload = RequestVote{false, 5, 2, 2, 5}});
     drain(n);
     // Node 3 asks for the same term after we voted for 2.
-    n.step(Message{.to = 1, .from = 3,
-                   .payload = RequestVote{false, 5, 3, 2, 5}});
+    n.step(Message{.to = 1, .from = 3, .payload = RequestVote{false, 5, 3, 2, 5}});
     RaftNode::Ready rd = drain(n);
     ASSERT_EQ(rd.messages.size(), 1u);
     const auto* reply = payloadIf<RequestVoteReply>(rd.messages[0]);
@@ -134,8 +133,7 @@ TEST(RaftNodeTest, RejectsSecondCandidateSameTerm) {
 TEST(RaftNodeTest, RejectsCandidateWithStaleLog) {
     // Our log ends at term 5; candidate's ends at term 4 -> not up to date.
     RaftNode n(1, {1, 2, 3}, logOfTerms({5, 5}), HardState{5, kNoNode}, fixedTimeout(10));
-    n.step(Message{.to = 1, .from = 2,
-                   .payload = RequestVote{false, 5, 2, 9, 4}});
+    n.step(Message{.to = 1, .from = 2, .payload = RequestVote{false, 5, 2, 9, 4}});
     RaftNode::Ready rd = drain(n);
     ASSERT_EQ(rd.messages.size(), 1u);
     EXPECT_FALSE(payloadIf<RequestVoteReply>(rd.messages[0])->voteGranted);
@@ -143,14 +141,13 @@ TEST(RaftNodeTest, RejectsCandidateWithStaleLog) {
 
 TEST(RaftNodeTest, LowerTermVoteRequestRejectedWithOurTerm) {
     RaftNode n(1, {1, 2, 3}, logOfTerms({5}), HardState{5, kNoNode}, fixedTimeout(10));
-    n.step(Message{.to = 1, .from = 2,
-                   .payload = RequestVote{false, 3, 2, 1, 3}});
+    n.step(Message{.to = 1, .from = 2, .payload = RequestVote{false, 3, 2, 1, 3}});
     RaftNode::Ready rd = drain(n);
     ASSERT_EQ(rd.messages.size(), 1u);
     const auto* reply = payloadIf<RequestVoteReply>(rd.messages[0]);
     ASSERT_NE(reply, nullptr);
     EXPECT_FALSE(reply->voteGranted);
-    EXPECT_EQ(reply->term, 5u);  // tells the stale candidate the real term
+    EXPECT_EQ(reply->term, 5u);      // tells the stale candidate the real term
     EXPECT_EQ(n.currentTerm(), 5u);  // we did NOT adopt term 3
 }
 
@@ -270,8 +267,7 @@ TEST(RaftNodeTest, CandidateWinsOnMajority) {
     ASSERT_EQ(n.role(), Role::Candidate);
     drain(n);
     // One grant from node 2 reaches quorum (2 of 3, self + 2).
-    n.step(Message{.to = 1, .from = 2,
-                   .payload = RequestVoteReply{false, 1, true}});
+    n.step(Message{.to = 1, .from = 2, .payload = RequestVoteReply{false, 1, true}});
     EXPECT_EQ(n.role(), Role::Leader);
     EXPECT_EQ(n.leader(), 1u);
 }
@@ -305,8 +301,7 @@ TEST(RaftNodeTest, HigherTermStepsLeaderDown) {
     n.campaign();
     ASSERT_EQ(n.role(), Role::Leader);
     // A vote request at a higher term forces us to follower.
-    n.step(Message{.to = 1, .from = 2,
-                   .payload = RequestVote{false, 9, 2, 0, 0}});
+    n.step(Message{.to = 1, .from = 2, .payload = RequestVote{false, 9, 2, 0, 0}});
     EXPECT_EQ(n.role(), Role::Follower);
     EXPECT_EQ(n.currentTerm(), 9u);
 }
@@ -334,7 +329,7 @@ TEST(RaftNodeTest, FollowerAppendsEntriesAndAdvancesCommit) {
     EXPECT_EQ(n.commitIndex(), 1u);
 
     RaftNode::Ready rd = drain(n);
-    ASSERT_EQ(rd.entries.size(), 2u);  // to persist
+    ASSERT_EQ(rd.entries.size(), 2u);    // to persist
     ASSERT_EQ(rd.committed.size(), 1u);  // index 1 committed -> apply
     EXPECT_EQ(rd.committed[0].data, "x");
     // A success reply with the new match index.
@@ -362,8 +357,8 @@ TEST(RaftNodeTest, FollowerRejectsAppendOnShortLogWithHint) {
             break;
     ASSERT_NE(rep, nullptr);
     EXPECT_FALSE(rep->success);
-    EXPECT_EQ(rep->conflictTerm, 0u);       // "log too short"
-    EXPECT_EQ(rep->conflictIndex, 2u);      // our lastIndex()+1
+    EXPECT_EQ(rep->conflictTerm, 0u);   // "log too short"
+    EXPECT_EQ(rep->conflictIndex, 2u);  // our lastIndex()+1
 }
 
 TEST(RaftNodeTest, FollowerRejectsAppendOnTermConflictWithHint) {
@@ -517,4 +512,81 @@ TEST(RaftNodeTest, ReadyReportsEntriesOnceThenClears) {
     EXPECT_FALSE(n.hasReady());  // nothing left after advance
     RaftNode::Ready rd2 = n.ready();
     EXPECT_TRUE(rd2.entries.empty());
+}
+
+// ---------------------------------------------------------------------------
+// A FORGED TimeoutNow MUST NOT PRODUCE A TRANSFER-FLAGGED CAMPAIGN (D-9 review, F1).
+//
+// The campaignTransfer flag's whole containment story is "only the incumbent can cause
+// one", and that was FALSE until the guard in step() existed: `isLeaderMessage` counts
+// TimeoutNow, so a higher-term forge installed the forger as our leader via becomeFollower
+// and the arm then saw `leaderId_ == m.from`; a same-term forge reached the arm anyway.
+// Vote safety held throughout -- what leaked was the CheckQuorum lease, which any peer
+// could then stand down at will across the cluster.
+//
+// These assert the outcome that matters (did we campaign, and did the vote carry the
+// flag?) rather than the mechanism, so they keep their meaning if the guard moves.
+namespace {
+
+// The transfer-flagged vote requests a node emitted, if any.
+size_t transferVotesIn(const RaftNode::Ready& rd) {
+    size_t n = 0;
+    for (const auto& m : rd.messages)
+        if (const auto* rv = std::get_if<RequestVote>(&m.payload); rv && rv->campaignTransfer)
+            ++n;
+    return n;
+}
+
+}  // namespace
+
+TEST(RaftNodeTest, ATimeoutNowFromTheBelievedLeaderCampaignsWithTheFlag) {
+    // The positive control: without this the two forge tests below could pass on a node
+    // that simply never campaigns.
+    RaftNode n(1, {1, 2, 3}, logOfTerms({5, 5}), HardState{5, kNoNode}, checkQuorumTimeout(10));
+    hearFromLeader(n, 2, 5, 2, 5);
+    n.step(Message{.to = 1, .from = 2, .payload = TimeoutNow{5, 2}});
+    RaftNode::Ready rd = drain(n);
+    EXPECT_EQ(n.role(), Role::Candidate);
+    EXPECT_EQ(n.currentTerm(), 6u);
+    EXPECT_EQ(transferVotesIn(rd), 2u) << "both peers must get a transfer-flagged vote";
+}
+
+TEST(RaftNodeTest, AForgedSameTermTimeoutNowIsIgnored) {
+    RaftNode n(1, {1, 2, 3}, logOfTerms({5, 5}), HardState{5, kNoNode}, checkQuorumTimeout(10));
+    hearFromLeader(n, 2, 5, 2, 5);
+    // Node 3 is a voter, but it is NOT the leader we follow.
+    n.step(Message{.to = 1, .from = 3, .payload = TimeoutNow{5, 3}});
+    RaftNode::Ready rd = drain(n);
+    EXPECT_EQ(n.role(), Role::Follower);
+    EXPECT_EQ(n.leader(), 2u) << "the forger must not become our leader";
+    EXPECT_EQ(n.currentTerm(), 5u);
+    EXPECT_EQ(transferVotesIn(rd), 0u) << "a forged TimeoutNow bought a lease-bypassing campaign";
+}
+
+TEST(RaftNodeTest, AForgedHigherTermTimeoutNowIsIgnored) {
+    // The harder half: a higher term used to be adopted FIRST (becomeFollower installs the
+    // sender as leader for a leader-shaped message), which is why the arm cannot be gated
+    // on the post-step leader belief.
+    RaftNode n(1, {1, 2, 3}, logOfTerms({5, 5}), HardState{5, kNoNode}, checkQuorumTimeout(10));
+    hearFromLeader(n, 2, 5, 2, 5);
+    n.step(Message{.to = 1, .from = 3, .payload = TimeoutNow{9, 3}});
+    RaftNode::Ready rd = drain(n);
+    EXPECT_EQ(n.role(), Role::Follower);
+    EXPECT_EQ(n.currentTerm(), 5u) << "a forged TimeoutNow must not even move our term";
+    EXPECT_EQ(n.leader(), 2u) << "the forger must not become our leader";
+    EXPECT_EQ(transferVotesIn(rd), 0u);
+    EXPECT_TRUE(rd.messages.empty()) << "nothing is owed to a forger";
+}
+
+// A follower that is BEHIND its leader still accepts that leader's TimeoutNow: the sender
+// is the believed leader even though its term is newer, which is the ordinary case after a
+// missed heartbeat round and must not be caught by the forge guard.
+TEST(RaftNodeTest, ABehindFollowerStillAcceptsItsLeadersTimeoutNow) {
+    RaftNode n(1, {1, 2, 3}, logOfTerms({5, 5}), HardState{5, kNoNode}, checkQuorumTimeout(10));
+    hearFromLeader(n, 2, 5, 2, 5);
+    n.step(Message{.to = 1, .from = 2, .payload = TimeoutNow{7, 2}});  // leader moved on to term 7
+    RaftNode::Ready rd = drain(n);
+    EXPECT_EQ(n.role(), Role::Candidate);
+    EXPECT_GT(n.currentTerm(), 7u);
+    EXPECT_EQ(transferVotesIn(rd), 2u);
 }

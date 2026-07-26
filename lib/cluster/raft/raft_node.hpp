@@ -99,7 +99,11 @@ public:
              std::vector<NodeId> learners = {});
 
     // Inputs.
-    void tick();                     // one logical clock tick (driven by a seastar::timer)
+    // Advance this group's logical clock by `passes` tick intervals (driven by a
+    // seastar::timer). `passes` > 1 is the driver crediting intervals it SKIPPED while
+    // hibernating this group, so every clock in here measures real time rather than
+    // driver attention -- load-bearing for the CheckQuorum lease, see tick()'s body.
+    void tick(unsigned passes = 1);
     void step(Message m);            // an incoming RPC for this group
     bool propose(std::string data);  // leader-only append; false if not leader (replication brick)
     void campaign();                 // start an election now (bootstrap / TimeoutNow)
@@ -136,11 +140,6 @@ public:
     // leader" from "I am the leader and I am standing down" -- the two want opposite
     // retries (write-scaleout 5 review, F1).
     bool transferInFlight() const { return leadTransferee_ != kNoNode; }
-    // Vote requests this node DROPPED under the CheckQuorum lease (the disruption guard).
-    // Such a drop is otherwise invisible -- no reply, no term bump -- and the driver needs
-    // to see it, because a hibernating group's lease is stretched by its tick divisor and
-    // the cure is to stop hibernating it (RaftGroupRegistry::deliver, debt D-9).
-    uint64_t leaseDroppedVotes() const { return leaseDroppedVotes_; }
     // Snapshots this node declined to send because they exceed opts_.maxMessageBytes.
     // Non-zero means a follower CANNOT be caught up by snapshot and needs chunked
     // InstallSnapshot (or a smaller snapshot) before it can rejoin.
@@ -276,7 +275,6 @@ private:
     // writes permanently. See tick().
     unsigned transferElapsed_ = 0;
     uint64_t undeliverableSnapshots_ = 0;  // see undeliverableSnapshots()
-    uint64_t leaseDroppedVotes_ = 0;       // see leaseDroppedVotes()
 
     // ReadIndex tracking (leader).
     uint64_t readSeq_ = 0;  // monotonic heartbeat sequence for read confirmation

@@ -288,9 +288,9 @@ seastar::future<> RaftGroup::step(Message m) {
     });
 }
 
-seastar::future<> RaftGroup::tick() {
-    return seastar::with_semaphore(lock_, 1, [this]() -> seastar::future<> {
-        node_.tick();
+seastar::future<> RaftGroup::tick(unsigned passes) {
+    return seastar::with_semaphore(lock_, 1, [this, passes]() -> seastar::future<> {
+        node_.tick(passes);
         co_await drainReady();
     });
 }
