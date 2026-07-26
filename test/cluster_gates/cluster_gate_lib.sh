@@ -37,17 +37,28 @@ gate_exit() {
 
 kill_cluster() { # $1 = port prefix used by this gate, e.g. 492
     # MATCH ON THE PORT, NOT THE BINARY NAME. Every gate takes an optional server binary
-    # as $1 so a "before" binary can be measured the same way -- and that binary is
-    # usually NOT called timestar_http_server (a comparison build, a saved copy). The old
-    # pattern `timestar_http_server.*--port $1` silently matched nothing in exactly that
-    # case, so a run with a custom binary left its three servers alive and the NEXT gate
-    # aborted on `ports still in use`. That is precisely the A/B workflow
-    # fault_injection_ab.sh depends on, where the two runs are back to back.
+    # as $1 so a "before" binary can be measured the same way. The old pattern
+    # `timestar_http_server.*--port $1` matched only binaries still CALLED
+    # timestar_http_server, so a run against a saved or renamed comparison binary left its
+    # three servers alive and the NEXT gate aborted on "ports still in use". Measured
+    # exactly that way while A/B-ing D-1 against a copy saved as `ts_pre_d1`.
     #
-    # The port prefix is unique per gate (492/493/...), so this cannot reach another
-    # gate's cluster. Safe to match loosely here because this lives in a SCRIPT FILE: the
-    # same pattern inlined into `bash -c` would match the invoking shell's own argv and
-    # kill it mid-command (see the note at the top of this file).
+    # (fault_injection_ab.sh is NOT an example: it builds a real
+    # `<build>/bin/timestar_http_server` and launches it by full path, so the old pattern
+    # did match it. The fix is for hand-saved binaries, which is how people actually
+    # measure a "before".)
+    #
+    # THE PREFIX IS NOT UNIQUE PER GATE -- 493 covers both fault_injection (49310-49312)
+    # and deposed_primary (49310-49314), 492 covers both backpressure and
+    # rolling_rebalance -- so this DOES reach a same-band gate's cluster. That is fine,
+    # and it is why the README's "run them ONE AT A TIME" rule is a rule: with only one
+    # gate live, anything else in the band is a stray from a crashed run and killing it is
+    # the cleanup you want. Do not read this as licence to run two gates at once; they
+    # would fight over ports and data dirs long before they fought over this pkill.
+    #
+    # Safe to match loosely here because this lives in a SCRIPT FILE: the same pattern
+    # inlined into `bash -c` would match the invoking shell's own argv and kill it
+    # mid-command (see the note at the top of this file).
     pkill -u "$(id -u)" -9 -f -- "--port $1" 2>/dev/null
     pkill -u "$(id -u)" -9 -f 'timestar_insert_bench' 2>/dev/null
     sleep 2

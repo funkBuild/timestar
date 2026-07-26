@@ -64,6 +64,19 @@ if [ "${FREE_G:-0}" -lt 30 ]; then
     exit 2
 fi
 
+# THE TWO ARMS MUST DIFFER ONLY BY THE REVERT. The reverted arm is built from a clean
+# worktree at HEAD; the HEAD arm is whatever `$BUILD_DIR/bin/timestar_http_server`
+# currently is, i.e. the WORKING TREE. Uncommitted changes therefore land in one arm and
+# not the other, and the A/B silently measures them too. Refuse rather than report a
+# difference that is not the one named.
+DIRTY=$(git -C "$REPO" status --porcelain --untracked-files=no)
+if [ -n "$DIRTY" ]; then
+    echo "ABORT: working tree is dirty; the two arms would differ by more than the revert."
+    printf '%s\n' "$DIRTY" | sed 's/^/  /'
+    echo "  Commit or stash, rebuild \$BUILD_DIR, and re-run."
+    exit 2
+fi
+
 cleanup_ab() {
     if [ "${GATE_AB_KEEP:-0}" != "1" ]; then
         git -C "$REPO" worktree remove --force "$AB_WORKTREE" 2>/dev/null
@@ -89,11 +102,17 @@ git -C "$AB_WORKTREE" checkout "$REVERT_AT" -- $REVERT_FILES || {
 # and every assertion below compares a thing to itself. The reverted run would then
 # produce zero errors and this script would "fail to prove discrimination" for a reason
 # that has nothing to do with the server. Catch it here, where the message is honest.
-CHANGED=$(git -C "$AB_WORKTREE" diff --name-only HEAD -- | wc -l)
+CHANGED_LIST=$(git -C "$AB_WORKTREE" diff --name-only HEAD -- | sort)
+CHANGED=$(printf '%s\n' "$CHANGED_LIST" | grep -c .)
+EXPECTED_LIST=$(printf '%s\n' $REVERT_FILES | sort)
 echo "  reverted $CHANGED file(s) to $REVERT_AT"
-if [ "$CHANGED" -eq 0 ]; then
-    echo "ABORT: reverting $REVERT_AT produced NO diff -- the comparison binary would be HEAD."
-    echo "       The 4a fix has moved; update REVERT_AT/REVERT_FILES in this script."
+if [ "$CHANGED_LIST" != "$EXPECTED_LIST" ]; then
+    echo "ABORT: the revert did not touch exactly the three 4a files."
+    echo "       expected:"; printf '         %s\n' $EXPECTED_LIST
+    echo "       got:"; printf '%s\n' "$CHANGED_LIST" | sed 's/^/         /'
+    echo "       Zero files means the comparison binary would BE HEAD and every assertion"
+    echo "       below would compare a thing to itself. A different set means the 4a fix"
+    echo "       has moved; update REVERT_AT/REVERT_FILES in this script."
     exit 2
 fi
 
