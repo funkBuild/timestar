@@ -4,6 +4,7 @@
 #include "../data/read_routing.hpp"
 #include "write_admission.hpp"
 
+#include <cstdlib>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/sleep.hh>
 #include <seastar/net/dns.hh>
@@ -31,6 +32,43 @@ HostPort parseHostPort(const std::string& s) {
         hp.port = static_cast<uint16_t>(std::stoul(s.substr(colon + 1)));
     } catch (...) {}
     return hp;
+}
+
+// CheckQuorum, and the ONE-WAY switch an operator has over it (debt D-9/D-30).
+//
+// Default ON. `TIMESTAR_CLUSTER_CHECKQUORUM` can only turn it OFF -- see the construction
+// site for why an enable knob would reproduce the exact mixed-version hazard ADR 0005 is
+// about. Anything unrecognised is refused loudly and the default stands, on the same
+// principle as the write-budget parse: a configuration mistake must not be obeyed silently.
+// Logged either way, because "why is this node behaving differently from its peers" is the
+// question this knob creates.
+bool checkQuorumEnabled() {
+    const char* e = std::getenv("TIMESTAR_CLUSTER_CHECKQUORUM");
+    if (!e || !*e)
+        return true;
+    const std::string v(e);
+    if (v == "0" || v == "false" || v == "no" || v == "off") {
+        timestar::http_log.warn(
+            "cluster: Raft CheckQUORUM DISABLED on this node by TIMESTAR_CLUSTER_CHECKQUORUM='{}'. A partitioned "
+            "or stale leader will now keep accepting proposals it cannot commit until each one's own deadline, and "
+            "leader-only reads on the losing side of a partition converge per request rather than promptly. Nothing "
+            "is unsafe (commit still needs a quorum ack); this is the configuration that shipped before debt D-9.",
+            e);
+        return false;
+    }
+    if (v == "1" || v == "true" || v == "yes" || v == "on") {
+        timestar::http_log.warn(
+            "cluster: TIMESTAR_CLUSTER_CHECKQUORUM='{}' is ignored -- the override is DISABLE-ONLY and CheckQuorum "
+            "is already on. Enabling it per node is exactly the mixed-version hazard ADR 0005 exists to prevent "
+            "(one node running the disruption guard while an older peer drops its transfer votes).",
+            e);
+        return true;
+    }
+    timestar::http_log.error(
+        "cluster: TIMESTAR_CLUSTER_CHECKQUORUM='{}' is not a boolean (0/false/no/off disable; nothing enables); "
+        "leaving CheckQuorum ON",
+        e);
+    return true;
 }
 
 // Resolve "host" to an address (numeric dotted-quad parses directly; a hostname --
@@ -217,9 +255,19 @@ seastar::future<> ClusterDataPlane::start(const ClusterConfig& cfg, seastar::sha
         //
         // WHAT IS STILL OPEN: ADR mechanism (c), gating activation on the cluster-wide
         // committed format version, so this cannot be on while a peer is too old to read a
-        // transfer vote. Until that lands, a MIXED-VERSION rolling window has slow
-        // transfers (the pre-bypass behaviour) -- degraded, never unsafe.
-        ropts.checkQuorum = true;
+        // transfer vote (debt D-30). Until that lands, a MIXED-VERSION rolling window has
+        // slow transfers (the pre-bypass behaviour) -- degraded, never unsafe.
+        //
+        // THE OVERRIDE IS DISABLE-ONLY, DELIBERATELY. `TIMESTAR_CLUSTER_CHECKQUORUM=0`
+        // (also `false`/`no`/`off`) turns it off on this node; nothing turns it ON where
+        // the build has it off. An operator who finds a CheckQuorum-shaped incident at 3am
+        // needs a way out that does not involve a rebuild, and disabling is always safe --
+        // it is the configuration that shipped for months and it costs nothing but a
+        // partitioned leader's promptness. An ENABLE knob would be the opposite: with (c)
+        // unbuilt it is exactly the per-node enable ADR 0005 warns about, one node running
+        // the guard while an old peer drops its transfer votes, which is the hazard this
+        // whole design exists to avoid. So the knob only ever points the safe way.
+        ropts.checkQuorum = checkQuorumEnabled();
         {
             std::map<unsigned, std::vector<std::pair<uint16_t, std::vector<data::NodeId>>>> byShard;
             for (const auto& [vshard, voters] : rt_->localReplicaGroups())
