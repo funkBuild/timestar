@@ -952,7 +952,10 @@ Fixed here (the fix is diagnostic and routing, not consensus):
 
 Pinned by `ReplicatedBatchWriteRouterTest.SelfNamingHintIsIgnored` (verified
 discriminating: reverting the router condition fails it) and
-`.RefusalReasonIsReportedNotManufactured`.
+`.RefusalReasonIsReportedNotManufactured`. Re-gated live afterwards on the two
+transfer/hint-sensitive gates: `deposed_primary` (18507 transfers, 300/300 accepted, 0
+5xx, 0 500s) and `rolling_rebalance` (2216 transfers mid-bench, 600/600 OK, 4.98 M pts/s,
+converged to [1364 1368 1364]).
 
 The gate therefore hard-asserts what it is FOR — catch-up, zero server-side 500s, zero
 crashes, and an anti-vacuity floor on batches accepted — and reports the 503 count as
@@ -1069,9 +1072,10 @@ restart-catch-up gate. Unchanged from the Phase-4 debt entry.
   the old 1 GiB bound — so it is a REGRESSION FENCE on the 8x-tightened bound, not a
   demonstration that chunking was required at this scale. It is also what found the
   stuck-transfer defect and the pre-existing coordinator-side 503s above.
-- **Canonical bench, FINAL binary, four accepted runs** (0 HTTP errors, 0 server-side
-  500s, 0 quota fences on every run): **5.02 / 5.08 / 5.30 / 5.24 M pts/s, median
-  5.16 M**, p50 83-96 ms, idle CPU 4 % per node. The pre-Phase-5 binary re-benched in the
+- **Canonical bench, FINAL binary (post-review), three accepted runs** (0 HTTP errors,
+  0 server-side 500s, 0 quota fences on every run): **4.80 / 5.18 / 5.23 M pts/s, median
+  5.18 M**, p50 89-100 ms, idle CPU 4 % per node. Before the review fixes, four runs:
+  5.02 / 5.08 / 5.30 / 5.24 M, median 5.16 M. The pre-Phase-5 binary re-benched in the
   SAME session: 4.85 / 5.04 / 5.35 / 5.28 M, **median 5.16 M**, idle CPU 4 % per node.
   **Phase 5 is throughput-neutral, measured against a same-session baseline rather than a
   recorded one** — which is the only way this was resolvable, see 5a above.
