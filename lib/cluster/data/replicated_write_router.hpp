@@ -6,7 +6,9 @@
 #include "write_record.hpp"
 
 #include <chrono>
+#include <map>
 #include <seastar/core/future.hh>
+#include <seastar/core/lowres_clock.hh>
 
 namespace timestar::data {
 
@@ -70,6 +72,45 @@ public:
     // still admits several attempts.
     static constexpr auto kAttemptTimeout = std::chrono::milliseconds(600);
 
+    // THE ELECTION WINDOW (debt D-14). A batch whose only remaining problem is that some
+    // group has no leader yet is waiting on a Raft election, and an election takes 2.5-5 s
+    // at the production timing while the deadline above is 1.5 s. So the batch failed --
+    // not because anything was wrong with it, but because it asked before the cluster had
+    // finished choosing. With ~1000 VShards per batch and ~1/3 of groups re-electing after
+    // a node dies, essentially every batch in that window failed: that is the measured
+    // one-node-down 503 band (33/200, 137/400, 333/900).
+    //
+    // When -- and ONLY when -- every failure of an attempt is election-shaped
+    // (`isElectionWaitFailure`), the batch may keep retrying to this longer deadline, with
+    // a bigger attempt budget to match the 400 ms election-class pacing.
+    //
+    // WHAT THIS DELIBERATELY DOES NOT DO:
+    //   * it does NOT extend for `Transport`. A dead or reset connection is not waiting
+    //     for an election; the 4a schedule already spans the reconnect window inside the
+    //     1.5 s deadline, and stretching it would hold a batch (and its in-flight-bytes
+    //     charge) for 6 s against a peer that is simply gone. [D6] keeps its own budget.
+    //     The test is applied PER ATTEMPT, so a batch that meets a transport failure at
+    //     any point immediately reverts to the 1.5 s deadline.
+    //   * it does NOT extend for `Overloaded`: the cure there is for something to drain,
+    //     and waiting 6 s while holding admission bytes is the opposite of that.
+    //   * it does NOT make a dead cluster wait forever. Quorum loss keeps every group
+    //     leaderless, which IS election-shaped, so the batch waits out this cap and then
+    //     fails closed with the usual RetryableWriteError -- 6 s, not 1.5 s, and not
+    //     unbounded.
+    //
+    // THE COST, stated because it is real: during a failover, batches that used to fail at
+    // 1.5 s now succeed at up to ~5 s, so p99 write latency during the window is worse and
+    // each waiting batch holds its WriteAdmission charge for longer, which can push
+    // CONCURRENT writes into 503-Overloaded sooner. That is the right trade for a write
+    // path whose failure mode is "the client must retry the whole batch", but it is a
+    // trade.
+    static constexpr auto kElectionDeadline = std::chrono::milliseconds(6000);
+    // 3 fast retries (20 ms) + the rest at kElectionRetryDelay (400 ms) spans ~5.3 s, so
+    // the deadline above is what actually bounds the wait, not the attempt count.
+    static constexpr unsigned kMaxElectionAttempts = 16;
+    static_assert(kElectionDeadline > kDeadline, "the election window must extend the base deadline");
+    static_assert(kMaxElectionAttempts > kMaxAttempts, "an extended deadline needs attempts left to use it");
+
     // THE COUPLING, checked by the compiler rather than by comment, and against the REAL
     // attempt count: the pauses of a full Transport-class budget must outlast the
     // transport's own reconnect backoff, or every attempt fast-fails on the same dead
@@ -104,10 +145,19 @@ public:
     seastar::future<> write(VShardBatches groups);
 
 private:
+    // Ask the local Raft plane to un-hibernate the groups that still believe `node` leads
+    // them, after an RPC to it failed on the transport (debt D-14). RATE-LIMITED per node:
+    // the wake is O(groups on this shard) and its effect lasts several seconds, so calling
+    // it on every failed attempt of every concurrent batch would be pure overhead.
+    void wakeGroupsBehind(NodeId node);
+
     const VShardDirectory& dir_;
     ProposeSink& local_;
     NodeTransport& client_;
     const LeaderResolver& leaders_;
+    // Last time we asked the plane to wake groups behind a given peer.
+    std::map<NodeId, seastar::lowres_clock::time_point> lastWake_;
+    static constexpr auto kWakeInterval = std::chrono::milliseconds(500);
 };
 
 }  // namespace timestar::data

@@ -16,6 +16,26 @@
 
 namespace timestar::data {
 
+void ReplicatedBatchWriteRouter::wakeGroupsBehind(NodeId node) {
+    if (node == kNoNode)
+        return;
+    const auto now = seastar::lowres_clock::now();
+    auto it = lastWake_.find(node);
+    if (it != lastWake_.end() && now - it->second < kWakeInterval)
+        return;
+    lastWake_[node] = now;
+    // Local and synchronous: the router and the Raft groups it is talking about live on the
+    // SAME shard (ReplicatedDataPlane owns both), so this needs no cross-shard hop and
+    // cannot suspend. Other shards' routers wake their own groups when their own slices
+    // fail, which is what makes per-shard coverage complete without a fan-out.
+    const size_t woken = local_.wakeGroupsLedBy(node);
+    if (woken > 0)
+        timestar::http_log.info(
+            "cluster: node {} unreachable for writes; woke {} group(s) that still believe it "
+            "leads them, so they campaign at the normal election timeout",
+            node, woken);
+}
+
 seastar::future<> ReplicatedBatchWriteRouter::write(WriteBatch batch) {
     // Entry for callers that still hold an unsplit batch (RF=3 tests, the RF=1-shaped
     // seams). The production path arrives already split -- see the overload.
@@ -43,7 +63,9 @@ seastar::future<> ReplicatedBatchWriteRouter::write(VShardBatches groups) {
     // 3a payoff: without it a deposed-but-alive primary is re-selected every time and the
     // retry budget is spent re-asking the same wrong node.
     std::map<uint16_t, NodeId> hints;
-    const auto deadline = seastar::lowres_clock::now() + kDeadline;
+    const auto started = seastar::lowres_clock::now();
+    const auto deadline = started + kDeadline;
+    const auto electionDeadline = started + kElectionDeadline;
     WriteFailure lastKind = WriteFailure::None;
 
     for (unsigned attempt = 1;; ++attempt) {
@@ -53,8 +75,15 @@ seastar::future<> ReplicatedBatchWriteRouter::write(VShardBatches groups) {
         // wait out the reconnect window, or that slice burns the budget fast-failing on a
         // dead client while the not-leader slices are the only ones making progress.
         std::chrono::milliseconds retryDelay{0};
-        auto noteKind = [&retryDelay, attempt](WriteFailure k) {
+        // Is EVERY failure of this attempt one that a wait can cure (debt D-14)? Decided
+        // per attempt, and pessimistically: one transport failure anywhere in the batch
+        // puts the whole batch back on the 1.5 s deadline, because that slice is not
+        // waiting for an election and the [D6] schedule already covers it.
+        bool electionWaitOnly = true;
+        auto noteKind = [&retryDelay, &electionWaitOnly, attempt](WriteFailure k) {
             retryDelay = std::max(retryDelay, writeFailureRetryDelay(k, attempt));
+            if (!isElectionWaitFailure(k))
+                electionWaitOnly = false;
         };
         // Bucket the outstanding groups by the leader NODE we now believe leads them:
         // a hint from a reject wins; else this node's live Raft view; else the placement
@@ -173,6 +202,8 @@ seastar::future<> ReplicatedBatchWriteRouter::write(VShardBatches groups) {
                 }
                 lastKind = kind;
                 noteKind(kind);
+                if (kind == WriteFailure::Transport && !isLocal)
+                    wakeGroupsBehind(pendingTargets[i]);
                 for (const auto* g : *pendingViews[i])
                     failed[g->first] = g;
             }
@@ -191,12 +222,19 @@ seastar::future<> ReplicatedBatchWriteRouter::write(VShardBatches groups) {
         const auto pause = cluster::jitteredDelay(retryDelay <= std::chrono::milliseconds(0) ? kRetryDelay : retryDelay,
                                                   kWriteRetryJitterPercent);
         const auto now = seastar::lowres_clock::now();
+        // The budget for THIS decision: the election window only while every failure of
+        // the attempt just finished was election-shaped (debt D-14). Nothing here is
+        // sticky -- a later transport failure drops straight back to the base deadline and
+        // the base attempt count, so a batch cannot buy 6 s of patience with one
+        // leaderless slice and then spend it on a dead peer.
+        const auto effDeadline = electionWaitOnly ? electionDeadline : deadline;
+        const unsigned effMaxAttempts = electionWaitOnly ? kMaxElectionAttempts : kMaxAttempts;
         // Give up if the budget is spent OR IF THE PAUSE ITSELF WOULD OUTLAST IT. The
         // second half matters now that pauses reach 320 ms: without it a pause starting at
         // t=1499 ms sleeps past the deadline and then dispatches an attempt that the
         // between-attempts check is guaranteed to reject, so the caller waits ~400 ms
         // longer than the deadline it was promised for an answer that cannot change.
-        if (attempt >= kMaxAttempts || now >= deadline || (deadline - now) <= pause)
+        if (attempt >= effMaxAttempts || now >= effDeadline || (effDeadline - now) <= pause)
             throw RetryableWriteError("ReplicatedBatchWriteRouter: " + std::to_string(failed.size()) +
                                       " VShard slice(s) uncommitted after " + std::to_string(attempt) +
                                       " attempt(s) (last: " + writeFailureName(lastKind) + "); retry the write");

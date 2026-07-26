@@ -177,6 +177,19 @@ public:
     // practice on the coordinator path: a locally-led VShard that has lost quorum can
     // suspend a Raft waiter forever (see RaftGroup::proposeAndAwaitApplied), and the
     // router's between-attempt deadline cannot rescue an attempt that never returns.
+    // A peer this node was routing writes to is UNREACHABLE; un-hibernate the local
+    // groups that still believe it leads them, so they campaign at the normal election
+    // timeout instead of the hibernation-stretched one (debt D-14).
+    //
+    // Idle followers tick at 1-in-10 (RaftGroupRegistry's hibernation), which stretches a
+    // 2.5-5 s election timeout to 25-50 s -- MEASURED, and it is why the read path already
+    // wakes groups behind an unreachable leader before answering QUERY_INCOMPLETE. The
+    // write path had no equivalent, so after a node was killed its groups sat hibernating
+    // and every batch touching one failed for tens of seconds rather than for the length
+    // of an election. Returns the number woken (0 for a sink with no Raft groups, which is
+    // why the default is a no-op rather than pure virtual).
+    virtual size_t wakeGroupsLedBy(NodeId) { return 0; }
+
     virtual seastar::future<ProposeOutcome> proposeVShardBatchesHinted(VShardBatchView view,
                                                                        OptDeadline deadline = std::nullopt) {
         (void)deadline;

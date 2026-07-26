@@ -700,12 +700,21 @@ TEST(WriteRetryPacingTest, TransportScheduleOutlastsTheReconnectBackoff) {
 TEST(WriteRetryPacingTest, LeaderShapedFailuresStayFast) {
     using namespace timestar::data;
     // A not-leader retry goes to a DIFFERENT node; backing off would add hundreds of ms of
-    // p99 to every routine leadership transfer for no availability gain.
-    for (unsigned a = 1; a <= ReplicatedBatchWriteRouter::kMaxAttempts; ++a) {
+    // p99 to every routine leadership transfer for no availability gain. That is why the
+    // FIRST retries stay at the base delay -- a transfer completes in single-digit ms, so
+    // it is always absorbed inside this window.
+    //
+    // (Past kFastLeaderRetries the same classes DO escalate, to span an election rather
+    // than a transfer -- debt D-14, pinned by
+    // WriteRetryPacing.ElectionShapedClassesEscalateAfterTheFastRetries. This test owns the
+    // fast half.)
+    for (unsigned a = 1; a <= kFastLeaderRetries; ++a) {
         EXPECT_EQ(writeFailureRetryDelay(WriteFailure::NotLeader, a), kWriteRetryDelayBase);
         EXPECT_EQ(writeFailureRetryDelay(WriteFailure::LeadershipLost, a), kWriteRetryDelayBase);
-        EXPECT_EQ(writeFailureRetryDelay(WriteFailure::ShardStopping, a), kWriteRetryDelayBase);
     }
+    // ShardStopping is a pure RE-ROUTE, so it never escalates at all.
+    for (unsigned a = 1; a <= ReplicatedBatchWriteRouter::kMaxElectionAttempts; ++a)
+        EXPECT_EQ(writeFailureRetryDelay(WriteFailure::ShardStopping, a), kWriteRetryDelayBase);
     // ... while transport-shaped ones grow, and are capped.
     EXPECT_EQ(writeFailureRetryDelay(WriteFailure::Transport, 1), kWriteRetryDelayBase);
     EXPECT_GT(writeFailureRetryDelay(WriteFailure::Transport, 3), writeFailureRetryDelay(WriteFailure::Transport, 1));
@@ -763,6 +772,181 @@ TEST(ReplicatedBatchWriteRouterTest, AmbiguousLeadershipLossIsRetried) {
 TEST(ReplicatedBatchWriteRouterTest, FatalFailureIsNotRetried) {
     testFatalFailureIsNotRetried().get();
 }
+
+// --- debt D-14: the election window -------------------------------------------------
+//
+// A batch whose only remaining problem is that a group has no leader YET is waiting on an
+// election (2.5-5 s at production timing) against a 1.5 s deadline, so it failed -- and
+// with ~1000 VShards per batch and ~1/3 of groups re-electing after a node dies, nearly
+// every batch in that window failed. That is the measured one-node-down 503 band.
+
+// An election-shaped failure may outlast the BASE budget: 8 attempts is past kMaxAttempts
+// (6) and the pacing past the third retry is 400 ms, so this write only completes if both
+// halves of the extension are in place.
+seastar::future<> testElectionShapedFailureOutlastsTheBaseBudget() {
+    VShardDirectory dir(1, allLocalMap());
+    WriteBatch batch = manySeries(4);
+    const auto vs = vshardsOf(batch);
+    ScriptedLocalSink local;
+    ScriptedTransport client;
+    MapLeaderResolver leaders;
+    for (uint16_t v : vs) {
+        leaders.leaders[v] = 1;  // we lead it; nobody else to ask
+        local.rejectUntilAttempt[v] = 8;
+        local.kindFor[v] = WriteFailure::NotLeader;  // "no leader yet" -- an election is running
+    }
+    ReplicatedBatchWriteRouter router(dir, local, client, leaders);
+
+    const auto t0 = std::chrono::steady_clock::now();
+    co_await router.write(std::move(batch));  // must NOT throw
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+
+    EXPECT_EQ(local.attempts, 8u) << "the batch gave up before the election could complete";
+    EXPECT_GT(local.attempts, ReplicatedBatchWriteRouter::kMaxAttempts)
+        << "it committed inside the BASE attempt budget, so this proves nothing about the extension";
+    // Elapsed is asserted only as an UPPER bound: the pauses are jittered +/-25%, so a
+    // lower bound on wall-clock time would be a flaky way to say what the attempt count
+    // above says exactly.
+    EXPECT_LT(std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count(),
+              ReplicatedBatchWriteRouter::kElectionDeadline.count())
+        << "the wait must stay inside the election cap";
+}
+
+// THE OTHER HALF, and the one that keeps [D6] intact: a TRANSPORT failure must NOT buy the
+// extended window. A dead peer is not waiting for an election, and holding the batch (and
+// its in-flight-bytes charge) for 6 s against a peer that is simply gone is the opposite of
+// what 4a is for.
+seastar::future<> testTransportFailureDoesNotGetTheElectionWindow() {
+    VShardDirectory dir(1, rf3Map(3));
+    WriteBatch batch = manySeries(30);
+    ScriptedLocalSink local;
+    ScriptedTransport client;
+    client.deadNodes = {2, 3};  // every remote slice fails on the transport, forever
+    NoLeaderResolver leaders;   // route by placement primary
+    for (uint16_t v : vshardsOf(batch))
+        local.rejectUntilAttempt[v] = 0;  // our own slices commit; only the remote ones fail
+
+    ReplicatedBatchWriteRouter router(dir, local, client, leaders);
+    const auto t0 = std::chrono::steady_clock::now();
+    bool threw = false;
+    try {
+        co_await router.write(std::move(batch));
+    } catch (const RetryableWriteError& e) {
+        threw = true;
+        EXPECT_NE(std::string(e.what()).find("transport"), std::string::npos) << e.what();
+    }
+    const auto ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    EXPECT_TRUE(threw) << "a permanently dead peer must still fail the batch closed";
+    EXPECT_LT(ms, ReplicatedBatchWriteRouter::kElectionDeadline.count())
+        << "a transport failure was granted the election window (" << ms << " ms) -- [D6] regressed";
+    EXPECT_LT(ms, 2500) << "it should fail at the BASE deadline (~1.5 s), not the extended one";
+}
+
+// A MIXED batch is judged pessimistically: one transport failure puts the WHOLE batch back
+// on the base deadline. Otherwise a single leaderless slice would buy 6 s of patience that
+// a dead peer then spends.
+seastar::future<> testOneTransportFailureRevokesTheElectionWindow() {
+    VShardDirectory dir(1, rf3Map(3));
+    WriteBatch batch = manySeries(30);
+    ScriptedLocalSink local;
+    ScriptedTransport client;
+    client.deadNodes = {3};  // node 3's slices: transport
+    NoLeaderResolver leaders;
+    for (uint16_t v : vshardsOf(batch)) {
+        local.rejectUntilAttempt[v] = 1000;  // our slices: election-shaped, forever
+        local.kindFor[v] = WriteFailure::NotLeader;
+    }
+    ReplicatedBatchWriteRouter router(dir, local, client, leaders);
+    const auto t0 = std::chrono::steady_clock::now();
+    EXPECT_THROW(co_await router.write(std::move(batch)), RetryableWriteError);
+    const auto ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    EXPECT_LT(ms, 2500) << "the mixed batch was granted the election window (" << ms << " ms)";
+}
+
+// The wake seam: a transport failure to a peer asks the local plane to un-hibernate the
+// groups that still believe that peer leads them, so the election runs at the normal
+// timeout rather than the 1-in-10 hibernation-stretched one. Rate-limited, so a burst of
+// failed attempts is one wake, not one per attempt.
+class WakeCountingSink : public ScriptedLocalSink {
+public:
+    std::map<NodeId, size_t> wakes;
+    size_t wakeGroupsLedBy(NodeId n) override {
+        ++wakes[n];
+        return 7;  // pretend some groups were woken, so the log line is exercised too
+    }
+};
+
+seastar::future<> testUnreachablePeerWakesItsGroups() {
+    VShardDirectory dir(1, rf3Map(3));
+    WriteBatch batch = manySeries(30);
+    WakeCountingSink local;
+    ScriptedTransport client;
+    client.deadNodes = {2, 3};
+    NoLeaderResolver leaders;
+    ReplicatedBatchWriteRouter router(dir, local, client, leaders);
+    EXPECT_THROW(co_await router.write(std::move(batch)), RetryableWriteError);
+
+    EXPECT_GE(local.wakes[2] + local.wakes[3], 1u) << "an unreachable peer's groups were never woken";
+    // Rate limit: the batch makes 6 attempts inside ~600 ms, so at most a couple of wakes
+    // per peer -- not one per attempt.
+    EXPECT_LE(local.wakes[2], 2u);
+    EXPECT_LE(local.wakes[3], 2u);
+}
+
+// A LOCAL failure must not wake anything: there is no unreachable peer to wake groups
+// behind, and the node we would name is ourselves.
+seastar::future<> testLocalFailureDoesNotWake() {
+    VShardDirectory dir(1, allLocalMap());
+    WriteBatch batch = manySeries(4);
+    WakeCountingSink local;
+    ScriptedTransport client;
+    MapLeaderResolver leaders;
+    for (uint16_t v : vshardsOf(batch)) {
+        leaders.leaders[v] = 1;
+        local.rejectUntilAttempt[v] = 2;
+        local.kindFor[v] = WriteFailure::NotLeader;
+    }
+    ReplicatedBatchWriteRouter router(dir, local, client, leaders);
+    co_await router.write(std::move(batch));
+    EXPECT_TRUE(local.wakes.empty());
+}
+
+// The pacing table itself: fast while a transfer is plausible, then spanning an election.
+TEST(WriteRetryPacing, ElectionShapedClassesEscalateAfterTheFastRetries) {
+    for (auto f : {WriteFailure::NotLeader, WriteFailure::LeaderRefused, WriteFailure::LeadershipLost}) {
+        EXPECT_TRUE(isElectionWaitFailure(f));
+        for (unsigned a = 1; a <= kFastLeaderRetries; ++a)
+            EXPECT_EQ(writeFailureRetryDelay(f, a), kWriteRetryDelayBase) << "attempt " << a;
+        EXPECT_EQ(writeFailureRetryDelay(f, kFastLeaderRetries + 1), kElectionRetryDelay);
+        EXPECT_EQ(writeFailureRetryDelay(f, 12), kElectionRetryDelay);
+    }
+    // Transport is untouched -- it keeps the 4a geometric schedule.
+    EXPECT_FALSE(isElectionWaitFailure(WriteFailure::Transport));
+    EXPECT_FALSE(isElectionWaitFailure(WriteFailure::Overloaded));
+    EXPECT_EQ(writeFailureRetryDelay(WriteFailure::Transport, 1), kWriteRetryDelayBase);
+    EXPECT_EQ(writeFailureRetryDelay(WriteFailure::Transport, 6), kWriteRetryDelayMax);
+    // ShardStopping is a re-route, not a wait.
+    EXPECT_EQ(writeFailureRetryDelay(WriteFailure::ShardStopping, 9), kWriteRetryDelayBase);
+}
+
+TEST(ReplicatedBatchWriteRouterTest, ElectionShapedFailureOutlastsTheBaseBudget) {
+    testElectionShapedFailureOutlastsTheBaseBudget().get();
+}
+TEST(ReplicatedBatchWriteRouterTest, TransportFailureDoesNotGetTheElectionWindow) {
+    testTransportFailureDoesNotGetTheElectionWindow().get();
+}
+TEST(ReplicatedBatchWriteRouterTest, OneTransportFailureRevokesTheElectionWindow) {
+    testOneTransportFailureRevokesTheElectionWindow().get();
+}
+TEST(ReplicatedBatchWriteRouterTest, UnreachablePeerWakesItsGroups) {
+    testUnreachablePeerWakesItsGroups().get();
+}
+TEST(ReplicatedBatchWriteRouterTest, LocalFailureDoesNotWake) {
+    testLocalFailureDoesNotWake().get();
+}
+
 TEST(ReplicatedBatchWriteRouterTest, TransportErrorRetriesAgainstTheAdvancedMap) {
     testTransportErrorRetriesAgainstTheAdvancedMap().get();
 }

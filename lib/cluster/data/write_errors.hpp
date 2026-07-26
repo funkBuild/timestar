@@ -136,13 +136,46 @@ constexpr bool isRetryableWriteFailure(WriteFailure f) {
 // pins that relationship, so shortening the schedule or lengthening the backoff cannot
 // silently re-create the bug.
 //
-// The OTHER classes keep the flat 20 ms on purpose. A `NotLeader` retry goes to a
-// DIFFERENT node (the hint from 3a), so nothing about waiting longer helps; a leadership
-// transfer completes in single-digit milliseconds, and backing off would turn every
+// The leader-shaped classes START flat at 20 ms for the same reason they always did -- a
+// `NotLeader` retry goes to a DIFFERENT node (the hint from 3a) and a leadership transfer
+// completes in single-digit milliseconds, so backing off immediately would turn every
 // routine rebalance into hundreds of milliseconds of added p99 for no availability gain.
-// Same for `ShardStopping`: the slice is re-routed, not re-dialed.
+// What changed in D-14 is what happens AFTER those fast retries fail: see
+// `isElectionWaitFailure` / `kElectionRetryDelay` below. `ShardStopping` keeps the flat
+// 20 ms unconditionally: the slice is re-routed, not re-dialed and not waited on.
 inline constexpr std::chrono::milliseconds kWriteRetryDelayBase{20};
 inline constexpr std::chrono::milliseconds kWriteRetryDelayMax{320};
+
+// ELECTION-SHAPED failures: the slice has no leader to go to until a Raft election (or a
+// leadership transfer) completes. They share a POLICY, and it is not the transport one
+// (debt D-14).
+//
+// A leadership transfer completes in single-digit milliseconds, so the first few retries
+// stay fast -- that is what keeps routine background rebalancing a latency bump rather
+// than an error. But if those fast retries did not find a leader, what the slice is
+// waiting for is an ELECTION, and an election at the production timing takes 2.5-5 s
+// (electionTimeoutMin/Max, 125-250 ticks at 20 ms). Continuing to poll every 20 ms only
+// burns the attempt budget ~120 ms into a multi-second wait and then reports failure --
+// which is most of the one-node-down 503 band: a ~1000-VShard batch fails if ANY slice is
+// still leaderless, and every slice whose leader died is leaderless for seconds.
+//
+// So: fast while a transfer is plausible, then paced to span the election.
+inline constexpr unsigned kFastLeaderRetries = 3;
+inline constexpr std::chrono::milliseconds kElectionRetryDelay{400};
+
+// Is this failure "waiting for a leader to be elected/settled"? Waiting is the CURE for
+// these three and for no others -- `Transport` means the peer is gone (re-dial, do not
+// wait longer than the reconnect window), `Overloaded` means something must drain, and
+// the terminal classes never retry at all.
+//
+// LeadershipLost is included and is the subtle one: the entry was appended here and then
+// this node stopped leading, so a successor election is exactly what the slice is waiting
+// on. It is AMBIGUOUS (the successor may commit the original entry), which is already
+// safe to retry for the reason audited above -- re-application is value-idempotent under
+// LWW -- and waiting does not change that.
+constexpr bool isElectionWaitFailure(WriteFailure f) {
+    return f == WriteFailure::NotLeader || f == WriteFailure::LeaderRefused || f == WriteFailure::LeadershipLost;
+}
 
 // Delay before retry number `attempt`+1, given what the previous attempt failed with.
 // `attempt` is 1-based (the attempt that just failed).
@@ -156,10 +189,15 @@ constexpr std::chrono::milliseconds writeFailureRetryDelay(WriteFailure f, unsig
                 ms *= 2;
             return std::chrono::milliseconds(ms < kWriteRetryDelayMax.count() ? ms : kWriteRetryDelayMax.count());
         }
-        case WriteFailure::None:
         case WriteFailure::NotLeader:
         case WriteFailure::LeaderRefused:
         case WriteFailure::LeadershipLost:
+            // Fast while a leadership TRANSFER is the plausible cause, then paced to span
+            // an ELECTION (debt D-14). The step is deliberate rather than geometric: the
+            // two causes have wildly different timescales (milliseconds vs seconds) and
+            // there is nothing in between worth interpolating.
+            return attempt <= kFastLeaderRetries ? kWriteRetryDelayBase : kElectionRetryDelay;
+        case WriteFailure::None:
         case WriteFailure::ShardStopping:
         case WriteFailure::Unassigned:
         case WriteFailure::Fatal:

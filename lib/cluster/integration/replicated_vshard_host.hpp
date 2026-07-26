@@ -97,6 +97,12 @@ public:
     // Requires a VShard-cohesive core count (buildVShardSnapshot throws otherwise).
     seastar::future<uint64_t> snapshotVShard(uint16_t vshard);
 
+    // ProposeSink (debt D-14): un-hibernate the groups on THIS shard that still believe
+    // `node` leads them, so a killed leader costs an election rather than a
+    // hibernation-stretched one. Same remedy the read path applies to an unreachable
+    // leader; idempotent and self-limiting (the wake window expires on its own).
+    size_t wakeGroupsLedBy(NodeId node) override { return registry_.wakeFollowersOf(node); }
+
     raft::RaftGroup* group(uint16_t vshard);
     // LeaderResolver: the current Raft leader of `vshard` per this node's local group
     // (kNoNode if not hosted here or no leader elected yet).
