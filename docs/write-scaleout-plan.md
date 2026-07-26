@@ -704,6 +704,257 @@ Only now is the Raft layer plausibly the limiter; re-profile first.
 Gates: re-profile with RAFT_PROFILE under saturation; idle-cluster message
 rate; no election-storm regressions (hibernation + wake interactions).
 
+### Phase 5 outcome (2026-07-26) — IMPLEMENTED (5.1, 5a, 5.4); 5b DEFERRED with cause; 5c/5d ADRs
+
+#### 5-pre. Re-profile: what the limiter is now
+
+3 nodes, RF=3, `--smp 4`, canonical bench (100 x 10k, hosts=1000, conns=8), fresh dirs,
+leadership balanced first. CPU from `/proc/<pid>/stat` DELTAS (utime+stime), not `ps`
+`%cpu`, which is a lifetime average.
+
+| quantity                          | idle (60 s)  | canonical run | sustained (600 batches) |
+|-----------------------------------|--------------|---------------|-------------------------|
+| node CPU (of 4 cores)             | 4-5 %        | 17-20 %       | 19-21 %                 |
+| Raft envelopes out / shard         | 2724 /s      | ~2724 /s      | 2450-2790 /s            |
+| Raft envelopes out / node          | ~10.9 k/s    | ~10.9 k/s     | ~10.6 k/s               |
+| Raft bytes out / shard             | 0.18 MB/s    | 0.18 MB/s     | 6-41 MB/s               |
+| envelopes per RPC frame            | 1.00         | 1.00          | 1.00                    |
+
+RaftGroup stage profile per proposal (node 1 is the bench's only HTTP target, so it is
+coordinator AND replica; nodes 2-3 are replicas only):
+
+| stage (per proposal)  | node 1        | nodes 2-3   |
+|-----------------------|---------------|-------------|
+| commit latency        | 19-66 ms      | 6-30 ms     |
+| in_lock               | 9-30 ms       | 3-14 ms     |
+| persist (sync only, summed over ALL drains) | 30-111 ms | 4-27 ms |
+| apply (summed over all drains)              | 9-48 ms   | 1-17 ms |
+| send                  | 0.3-3.0 ms    | 0.3-1.3 ms  |
+
+**Read of the limiter, stated plainly because it bounds what this phase could deliver:
+the cluster is still NOT CPU-bound (~80 % of every core idle at peak) and commit latency
+is still dominated by the quorum round trip.** Nothing in Phase 5 shortens a round trip,
+so no Phase-5 item could have been expected to move throughput, and none did — exactly
+the shape Phase 2's 2a/2b/2c produced for the same reason. Three specific findings:
+
+1. **The Raft message RATE does not respond to load at all** — ~2724 envelopes/s per
+   shard idle and under saturation. Load makes messages BIGGER (0.18 -> 6-41 MB/s), not
+   more numerous. So heartbeat traffic is a *standing* cost, and 5a's premise ("measure
+   what remains under LOAD, where every group with in-flight proposals heartbeats at full
+   rate") is wrong in a useful way: there is no load-driven increment to remove. What
+   there is, is a constant ~10.9 k envelopes/s per node that hibernation has already cut
+   to ~2.7 % of the naive 4096-groups-x-2-peers-x-50 Hz figure.
+2. **`persist` is the largest stage, on tmpfs, where fdatasync should be nearly free.**
+   Dividing by drains gives ~1.6 ms per sync. That is the 5b target — and see below for
+   why 5b could not be implemented as written.
+3. **Node 1's stages run 2-3x nodes 2-3's.** That is a BENCH artifact (the bench drives
+   one node, which is then coordinator and replica), not a code asymmetry; real clients
+   spread. Not chased.
+
+#### 5.1 (P0). Heap-stable bitmap cache values + an eviction pin — DONE
+
+The Phase-4 review left the READ-side accessors in `native_index.cpp` returning a
+`const roaring::Roaring*` into a `tsl::robin_map<std::string, BitmapEntry>` (open
+addressing, entries by value) out of a coroutine that suspends, under a documented
+"consume it immediately" contract. **The contract is unsatisfiable and that is the whole
+point**: the invalidating event (rehash, or flush+trim) happens BEFORE the caller
+resumes, so there is no instant in which a caller could have consumed it safely. Eight
+call sites depended on it.
+
+Fixed structurally: the caches now hold `seastar::lw_shared_ptr<BitmapEntry>`, so a
+rehash moves 8-byte handles and never an entry (this kills the rehash half for every
+holder at once, including ones not yet written), and the handle IS the eviction pin — a
+holder keeps its entry alive even if the map drops it. The trims additionally skip
+entries whose handle is not `owned()`, which is a COHERENCE requirement rather than a
+lifetime one: an evicted-but-held entry would leave a reader and a concurrent writer on
+divergent copies of the same key, and the reader's adds would be the ones lost.
+`ensureEntry()` replaces `operator[]`, which would insert a null handle.
+
+The structural test moved with the fix: it now pins the cache's VALUE TYPE (revert that
+and `co_return &entry.bitmap` is lethal again with no signature change), forbids raw
+const pointers as well as mutable ones, requires both trims to consult `owned()`, and
+forbids `operator[]` on the caches.
+
+**Perf: no change.** The day-bitmap path is on the hot insert path and the extra pointer
+hop was expected to be noise; it is. Canonical bench 4.99/5.17/5.33 M (median 5.17 M)
+against 5.06/5.18/5.33 M (median 5.18 M) before, i.e. the same numbers.
+
+#### 5.2 / 5a. Multi-envelope frames per (peer, shard) — DONE
+
+`send()` buffers the encoded envelope per peer and flushes at the end of the reactor
+task-queue round (`seastar::yield()`), which is the natural window: a shard's tick drains
+~1000 groups in one go. Bounded at 256 KB / 512 envelopes; the added delay is one
+task-queue round.
+
+**MEASURED: idle frames/s per shard 2724 -> ~700 (envelopes per frame 1.00 -> 3.9, and
+12-66 on shards whose peers hibernate in step); under sustained load ~650-720 frames/s at
+2450-2790 envelopes/s.** Throughput unchanged (5.13 M median vs 5.17 M, inside a
+4.95-5.33 M spread), as 5-pre predicted. Per-node CPU under sustained load 10.18/9.05/
+9.04 core-s vs 10.20/9.24/9.20 before — slightly lower, within noise. Idle CPU measured
+slightly HIGHER (10.9 core-s/60 s vs 9.1-9.7 before, i.e. 5 % vs 4 % of 4 cores);
+recorded rather than explained, because at that level the buffering work and ambient
+noise are the same size.
+
+**Mixed versions.** The Raft transport has no negotiation — one deliver verb was the
+entire protocol — and seastar answers an unknown verb with a reply a `no_wait` sender
+IGNORES. A batch frame sent to an old peer would therefore discard every Raft message in
+it *silently*. A new verb id is necessary but NOT sufficient; the sender has to know. So
+batching is gated on a WAITED capability verb, probed per CONNECTION (a peer can restart
+into an older binary at the same address) and fail-closed on any error. Pinned by a
+socket test in which the "peer" registers only the original verb and must receive every
+message, one frame each.
+
+#### 5.3 / 5b. Shard-level fsync coalescing — NOT IMPLEMENTED; the premise does not hold
+
+**`JournalWriter` is per VSHARD, not per shard.** `ReplicatedVShardHost::addVShard`
+creates one writer per VShard directory (`journalRoot/vshard_N/`), so
+`JournalRaftPersistence::sync()` -> `writer.barrier()` is a DMA write plus an fdatasync on
+**that VShard's own file**. There is nothing to coalesce onto: each group already syncs
+alone, to its own fd. The design 5b describes — "one fdatasync round serving all groups
+that drained in the window" — requires a SHARED per-shard writer, which is what
+`JournalWriter`'s own header claims exists (*"a per-core JournalWriter (shared by every
+group on the core, tagged with the group's VShard)"*) and what the wiring does not do.
+
+This was NOT rushed, deliberately: 5b's ordering contract is the sharpest knife in the
+phase, and the correct response to "the premise is false" is to say so rather than ship a
+coalescer that coalesces nothing.
+
+**What a real 5b would be, for whoever picks it up.** The recovery path already supports a
+shared journal: every record carries its VShard tag and per-VShard sequence, and
+`recoverRaftState(records, vshard)` filters a core-wide record set by VShard. So the work
+is (a) one writer per shard, opened once, its recovered record set reused by every
+`addVShard` on that shard; (b) a coalescer with the WAL group-commit shape — a waiter
+joins the NEXT round, the round takes the waiter set and calls `barrier()` in the SAME
+reactor task (no suspension between taking the set and entering the barrier), so every
+waiter's appends provably precede the barrier that satisfies it; (c) journal retention,
+which becomes cluster-wide: a segment can only be dropped once EVERY VShard's records in
+it are compacted away, where today a VShard's directory can be deleted outright when it
+moves. (c) is the real cost, and it interacts with movement.
+
+Also note the profile: `persist` is the largest stage here at ~1.6 ms per sync **on
+tmpfs**. The plan's standing caveat ("INVISIBLE on tmpfs benches") turns out to be too
+pessimistic — the O_DIRECT padded-block rewrite that every barrier performs is not free
+even when the fsync is. A real 5b is likely worth more than "disk-only insurance".
+
+#### 5.4. Chunked catch-up + tightened Raft admission — DONE, and it found a defect
+
+`sendAppend` put `log_.entriesFrom(nextIndex)` — the entire remaining tail — into ONE
+AppendEntries, so a follower returning after a large campaign got a message the size of
+the backlog. Since the deliver verb is `no_wait`, an over-limit message is DROPPED WITH NO
+REPLY, and the leader re-sends the same oversized append forever: a silent, permanent
+one-replica-short group. That is why the inbound bound was 1 GiB, i.e. not a bound.
+
+Capping the append side needs no protocol change — a follower acks the prefix, and
+`handleAppendEntriesReply` sends the next chunk while `nextIndex <= lastIndex`.
+`RaftOptions::maxAppendEntries` (256) / `maxAppendBytes` (1 MiB) bound it, with the first
+entry of a chunk always included so an oversized single entry still replicates. Admission
+tightened **1 GiB -> 128 MiB**, sized now for the one producer still unbounded:
+InstallSnapshot, which carries a whole VShard snapshot and whose chunking is a protocol
+change (offset/done, receiver-side reassembly, a resumable boundary) left for the snapshot
+owner. A send-side mirror at 96 MiB refuses and LOGS such a message, so the remaining case
+fails visibly instead of vanishing.
+
+**A PRE-EXISTING CONSENSUS DEFECT, found by the new gate and fixed here.**
+`RaftNode::propose` returns false while `leadTransferee_` is set — correct, a handoff is
+in progress. But `handleAppendEntriesReply` clears it ONLY when the target's matchIndex
+reaches lastIndex, so a transfer aimed at a DOWN peer left it set **forever**: the group
+keeps its leadership, so no election ever rescues it, and it refuses every write
+permanently. There was no abort of any kind. Two fixes:
+
+- `RaftNode::tick()` abandons a transfer after one election timeout (etcd's rule).
+  Nothing about it is unsafe — the transfer simply did not happen, and the leader must go
+  back to accepting writes. `transferElapsed_` restarts per transfer.
+- `ShardRaftPlane::rebalance` targets the peer with the largest leadership deficit, and a
+  DEAD peer leads nothing, so it is the most attractive target on EVERY 5 s balancer pass.
+  It now refuses to target a peer that is not caught up on that group — also the only
+  target that transfers immediately (`transferLeadership` sends TimeoutNow at once rather
+  than waiting on a catch-up round trip). Without this, the abort above would convert a
+  permanent outage into one repeated every balancer pass.
+
+Both are pinned by deterministic unit tests (`raft_transfer_abort_test.cpp`), which is
+where the evidence for the fix lives. Neither is a Phase-5 regression: nothing in this
+phase touches the balancer, transfer, or propose paths.
+
+**A SECOND, SEPARATE PROBLEM THE SAME GATE EXPOSED — NOT diagnosed, NOT fixed, and the
+one thing in this phase a reviewer should pick up first.** Writing to a 3-node RF=3
+cluster with ONE NODE DOWN produces a run-to-run-variable share of bounded 503s —
+`N VShard slice(s) uncommitted after 6 attempt(s) (last: not-leader)` — measured at
+106/400, 107/400, 50/400 and 91/400 across four runs of this gate. Facts established:
+
+- every rejection is logged on the COORDINATOR (the node the bench writes to) and **zero**
+  on the node that actually holds the leadership. So the write path is repeatedly
+  proposing to the wrong place and exhausting its retry budget, six attempts deep; this is
+  a leader-RESOLUTION problem, not a consensus one;
+- **it is PRE-EXISTING, and that is measured rather than assumed.** The same gate run
+  against the pre-Phase-5 binary (`c052253`, `lib/` checked out and rebuilt) gives
+  **111/400** — squarely inside the Phase-5 binary's 50-201 range. So Phase 5 neither
+  caused it nor demonstrably fixed it;
+- the two transfer fixes above are correct by construction and proven by unit test, but
+  their effect ON THIS NUMBER is **not** established: run-to-run variance exceeds any
+  difference between binaries. Do not read 26 % -> 12 % as a result. It is not one. (An
+  early hypothesis that it tracks leadership skew is also dead: the worst run, 201/400,
+  settled EVENLY at [2169 1927], and the baseline run settled at the same [256 3840] as a
+  Phase-5 run that scored half its errors.)
+
+**This is the first thing a reviewer should pick up.** A quarter to a half of writes
+failing while one of three nodes is down, with a healthy quorum and the leadership known
+locally, is a live availability defect — it is simply not one this phase created or was
+scoped to fix.
+
+The gate therefore hard-asserts what it is FOR — catch-up, zero server-side 500s, zero
+crashes, and an anti-vacuity floor on batches accepted — and reports the 503 count as
+ADVISORY, the same way `deposed_primary_gate.sh` treats its accepted-write count and for
+the same reason.
+
+#### 5.5. ADRs (design only)
+
+- `docs/adr/0004-vshard-group-consolidation.md` [5c]. Recommendation: **not now, and not
+  for throughput.** Consolidation divides by K everything that scales with GROUP count and
+  nothing that scales with data; the node is 80 % CPU-idle, so removing CPU work cannot
+  raise throughput here. Its strongest argument is the journal (1024 writers per shard ->
+  64), and that is better addressed by the shared per-shard journal above, which is a
+  smaller change the journal format was already designed for. The price of consolidation
+  is movement granularity — the VShard is the unit of placement/movement/repair/snapshot,
+  and consolidating stops the group and the VShard coinciding. One concrete
+  recommendation for today: **put an explicit group id in the VShard directory now**; that
+  single field is the difference between a rolling migration and a rebuild later.
+- `docs/adr/0005-checkquorum-transfer-bypass.md` [5d]. Designs the `campaignTransfer`
+  flag, and answers the compatibility question the plan flagged: `encodeEnvelope` has NO
+  version field anywhere, so adding a byte to `RequestVote` is a silent-misparse hazard,
+  not a compile error. Recommendation: a NEW MESSAGE TYPE byte (an old decoder rejects an
+  unknown type and drops the envelope — fail-closed at the wire with no negotiation),
+  **plus** gating CheckQuorum's activation on the cluster-wide committed format version
+  (`features::FeatureGate`), so the guard is never on while a peer would drop transfer
+  votes. Neither alone suffices. Note the ADR also corrects the plan's mechanism
+  description: the transferee does not escape the guard by term escalation (the guard
+  ignores term entirely) — it waits for the old leader to stop heartbeating.
+
+#### 5.6. Fault-gate hardening — NOT DONE, recorded as debt
+
+The floors in `fault_injection_gate.sh` are still 8 rounds / 8 connections against 147/392
+observed, the scripted A/B against a 4a-reverted binary is still manual (the revert set is
+named in the gate README but not scripted), and there is no combined
+reset+rebalance+high-connection gate. Displaced by 5.4's defect and by writing the new
+restart-catch-up gate. Unchanged from the Phase-4 debt entry.
+
+#### Phase 5 gate outcomes (2026-07-26)
+
+- **Suites: 4103 unit tests / 419 suites green** (from 4097/417: +3 chunked-catch-up,
+  +3 transfer-abort, -3 replaced structural assertions), **33 socket tests green** (from
+  30: +3 transport batching/legacy-peer).
+- **Restart catch-up (new gate, `test/cluster_gates/restart_catchup_gate.sh`):** node 3
+  down through 4 M points, then restarted -> caught up on 100 % of the VShards its peers
+  lead (on every one of five runs), the probe point readable ON THE RESTARTED NODE, zero
+  oversized-message refusals, zero server-side 500s, zero crashes. **Scope, stated
+  honestly: the pre-5.4 binary passes it too** — at 400 batches the tail still fit under
+  the old 1 GiB bound — so it is a REGRESSION FENCE on the 8x-tightened bound, not a
+  demonstration that chunking was required at this scale. It is also what found the
+  stuck-transfer defect and the pre-existing coordinator-side 503s above.
+- Canonical bench across the phase, three accepted runs each (0 HTTP errors, 0 server 500s,
+  0 quota fences every time): baseline 5.06/5.18/5.33 M -> after 5.1 4.99/5.17/5.33 M ->
+  after 5a 4.95/5.13/5.28 M. Median 5.18 -> 5.17 -> 5.13 M, p50 ~84-94 ms. Flat, which is
+  the correct outcome for a phase that removed work from a system that is not CPU-bound.
+
 ### Phase 6 — Acceptance
 
 - Canonical bench targets: RF=3 ≥ 6.5M pts/s (≥84% of RF=1's 7.75M — one
