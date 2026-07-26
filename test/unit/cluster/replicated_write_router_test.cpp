@@ -865,10 +865,9 @@ seastar::future<> testOneTransportFailureRevokesTheElectionWindow() {
     EXPECT_LT(ms, 2500) << "the mixed batch was granted the election window (" << ms << " ms)";
 }
 
-// The wake seam: a transport failure to a peer asks the local plane to un-hibernate the
-// groups that still believe that peer leads them, so the election runs at the normal
-// timeout rather than the 1-in-10 hibernation-stretched one. Rate-limited, so a burst of
-// failed attempts is one wake, not one per attempt.
+// The wake seam: a write that GIVES UP with a peer unreachable asks the local plane to
+// un-hibernate the groups that still believe that peer leads them, so the election runs at
+// the normal timeout rather than the 1-in-10 hibernation-stretched one.
 class WakeCountingSink : public ScriptedLocalSink {
 public:
     std::map<NodeId, size_t> wakes;
@@ -889,10 +888,36 @@ seastar::future<> testUnreachablePeerWakesItsGroups() {
     EXPECT_THROW(co_await router.write(std::move(batch)), RetryableWriteError);
 
     EXPECT_GE(local.wakes[2] + local.wakes[3], 1u) << "an unreachable peer's groups were never woken";
-    // Rate limit: the batch makes 6 attempts inside ~600 ms, so at most a couple of wakes
-    // per peer -- not one per attempt.
-    EXPECT_LE(local.wakes[2], 2u);
-    EXPECT_LE(local.wakes[3], 2u);
+    // ONE wake per peer for the whole write: it happens at give-up, not per attempt.
+    EXPECT_EQ(local.wakes[2], 1u);
+    EXPECT_EQ(local.wakes[3], 1u);
+}
+
+// THE [D6] SHAPE: a connection that dies and comes back is absorbed by the retry budget,
+// and must leave the Raft groups completely alone. Waking here put a third of the map on
+// full-rate ticking during a reset storm, and followers ticking at full rate through
+// dropped heartbeats campaign against a leader that is perfectly alive -- measured as 3
+// bench 503s on the reset gate.
+class RecoveringTransport : public ScriptedTransport {
+public:
+    unsigned failAttempts = 2;
+    unsigned seen = 0;
+    seastar::future<ProposeOutcome> proposeWriteHinted(NodeId to, VShardBatchView view, OptDeadline d) override {
+        if (++seen <= failAttempts)
+            return seastar::make_exception_future<ProposeOutcome>(std::runtime_error("connection is closed"));
+        return ScriptedTransport::proposeWriteHinted(to, view, d);
+    }
+};
+
+seastar::future<> testRecoveredBlipNeverWakes() {
+    VShardDirectory dir(1, rf3Map(3));
+    WriteBatch batch = manySeries(30);
+    WakeCountingSink local;
+    RecoveringTransport client;
+    NoLeaderResolver leaders;
+    ReplicatedBatchWriteRouter router(dir, local, client, leaders);
+    co_await router.write(std::move(batch));  // recovers inside the budget
+    EXPECT_TRUE(local.wakes.empty()) << "a blip that the retry absorbed still disturbed the Raft groups";
 }
 
 // A LOCAL failure must not wake anything: there is no unreachable peer to wake groups
@@ -945,6 +970,9 @@ TEST(ReplicatedBatchWriteRouterTest, UnreachablePeerWakesItsGroups) {
 }
 TEST(ReplicatedBatchWriteRouterTest, LocalFailureDoesNotWake) {
     testLocalFailureDoesNotWake().get();
+}
+TEST(ReplicatedBatchWriteRouterTest, RecoveredBlipNeverWakes) {
+    testRecoveredBlipNeverWakes().get();
 }
 
 TEST(ReplicatedBatchWriteRouterTest, TransportErrorRetriesAgainstTheAdvancedMap) {

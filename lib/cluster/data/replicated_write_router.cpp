@@ -16,6 +16,19 @@
 
 namespace timestar::data {
 
+// Called ONLY when a write has exhausted its budget with a peer still unreachable, which
+// is the distinction that keeps [D6] intact (write-scaleout 4c).
+//
+// A RESET connection to a HEALTHY peer is absorbed inside the retry budget -- that is
+// exactly what 4a's schedule is for -- so it never reaches here and never touches Raft. A
+// peer that is really GONE fails the batch, and only then do we un-hibernate the groups
+// behind it.
+//
+// Waking on every failed ATTEMPT instead was measured to cost errors on the reset gate: it
+// puts ~1364 groups (a third of the map) on full-rate ticking for 8 s, and a follower
+// ticking at full rate through a storm of dropped heartbeats times out its election and
+// campaigns against a leader that is perfectly alive. 151 reset rounds -> 3 bench 503s
+// carrying the [D6] signature, against 0 with the wake at give-up time.
 void ReplicatedBatchWriteRouter::wakeGroupsBehind(NodeId node) {
     if (node == kNoNode)
         return;
@@ -63,6 +76,9 @@ seastar::future<> ReplicatedBatchWriteRouter::write(VShardBatches groups) {
     // 3a payoff: without it a deposed-but-alive primary is re-selected every time and the
     // retry budget is spent re-asking the same wrong node.
     std::map<uint16_t, NodeId> hints;
+    // Peers that failed on the transport during this write. Used only if the write gives
+    // up -- a blip absorbed by the retry budget must leave no trace (see wakeGroupsBehind).
+    std::set<NodeId> unreachable;
     const auto started = seastar::lowres_clock::now();
     const auto deadline = started + kDeadline;
     const auto electionDeadline = started + kElectionDeadline;
@@ -202,8 +218,10 @@ seastar::future<> ReplicatedBatchWriteRouter::write(VShardBatches groups) {
                 }
                 lastKind = kind;
                 noteKind(kind);
+                // Remember WHO was unreachable; whether to wake the groups behind it is
+                // decided at give-up time, not here (see wakeGroupsBehind).
                 if (kind == WriteFailure::Transport && !isLocal)
-                    wakeGroupsBehind(pendingTargets[i]);
+                    unreachable.insert(pendingTargets[i]);
                 for (const auto* g : *pendingViews[i])
                     failed[g->first] = g;
             }
@@ -234,10 +252,16 @@ seastar::future<> ReplicatedBatchWriteRouter::write(VShardBatches groups) {
         // t=1499 ms sleeps past the deadline and then dispatches an attempt that the
         // between-attempts check is guaranteed to reject, so the caller waits ~400 ms
         // longer than the deadline it was promised for an answer that cannot change.
-        if (attempt >= effMaxAttempts || now >= effDeadline || (effDeadline - now) <= pause)
+        if (attempt >= effMaxAttempts || now >= effDeadline || (effDeadline - now) <= pause) {
+            // GIVING UP. This is the moment a transport failure means "that peer is gone",
+            // not "that connection blipped" -- see wakeGroupsBehind for why the difference
+            // decides whether we touch the Raft groups at all.
+            for (NodeId n : unreachable)
+                wakeGroupsBehind(n);
             throw RetryableWriteError("ReplicatedBatchWriteRouter: " + std::to_string(failed.size()) +
                                       " VShard slice(s) uncommitted after " + std::to_string(attempt) +
                                       " attempt(s) (last: " + writeFailureName(lastKind) + "); retry the write");
+        }
         outstanding.clear();
         outstanding.reserve(failed.size());
         for (const auto& [vs, g] : failed)

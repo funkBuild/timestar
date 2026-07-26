@@ -146,9 +146,11 @@ public:
 
 private:
     // Ask the local Raft plane to un-hibernate the groups that still believe `node` leads
-    // them, after an RPC to it failed on the transport (debt D-14). RATE-LIMITED per node:
-    // the wake is O(groups on this shard) and its effect lasts several seconds, so calling
-    // it on every failed attempt of every concurrent batch would be pure overhead.
+    // them, after this write GAVE UP with `node` unreachable (debt D-14). Called at
+    // give-up time and not per failed attempt, which is what keeps a mere connection reset
+    // -- absorbed inside the retry budget by design -- from provoking spurious elections
+    // against a healthy peer; the .cpp has the measurement. RATE-LIMITED per node: the
+    // wake is O(groups on this shard) and its effect lasts seconds.
     void wakeGroupsBehind(NodeId node);
 
     const VShardDirectory& dir_;

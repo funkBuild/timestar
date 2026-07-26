@@ -53,13 +53,15 @@ for _ in $(seq 1 10); do
     done
     sleep 1
 done
-# NOTE: this gate does not wait for leadership to go quiet. At RF < N the background
-# balancer keeps moving leadership in bulk for a while after a storm (it converges, but
-# slowly -- and its fair-share arithmetic looks wrong at RF < N; see
-# docs/write-scaleout-plan.md), so a write can still meet a genuinely mid-transfer VShard.
-# That is the rolling-rebalance gate's subject, not this one, which is why the HARD write
-# assertion below is on 500s -- the thing Phase 3 changed -- with the accepted count
-# advisory. In practice this run is 300/300 with zero 5xx.
+# NOTE: this gate does not wait for leadership to go quiet, and it does not need to. Since
+# debt D-12 the balancer's fair share is per-node and membership-weighted, so at RF < N it
+# CONVERGES: measured on an idle 5-node RF=3 cluster, ~60 s to [820 818 820 820 818]
+# (fair 819) and then zero movement. Before that fix it never converged -- 26-114 VShards
+# still moving per 30 s after 12 minutes, spread stalled at ~300 -- which is why this gate
+# used to explain its residual 5xx as balancer churn. A write can still meet a genuinely
+# mid-transfer VShard during the storm above, so the HARD write assertion stays on 500s --
+# the thing Phase 3 changed -- with the accepted count advisory. In practice this run is
+# 300/300 with zero 5xx.
 LEDS=""; MINLED=999999
 for p in $PORTS; do
     L=$(status_field "$(cluster_status "$p")" vshards_led)
@@ -72,9 +74,10 @@ echo "  leadership after rebalance (fair share 819): [$LEDS], $TRANSFERS transfe
 # 300/300 and "passes" -- while never once routing a write at a DEPOSED primary, which is
 # the entire point of the gate. Leadership must actually have moved off the primaries.
 assert_ge "leadership transfers initiated" "$TRANSFERS" 400
-# ADVISORY, not an assertion: the balancer does not converge at RF < N (see above), so the
-# spread is whatever the churn happens to leave. Reported because a LOW value means more
-# writes will meet a mid-transfer VShard, which explains the 5xx count below.
+# ADVISORY, not an assertion: the storm above deliberately leaves the cluster mid-reshuffle,
+# so the spread is whatever that pass happened to leave (it converges from here -- see the
+# D-12 note above). Reported because a LOW value means more writes will meet a mid-transfer
+# VShard, which explains the 5xx count below.
 echo "  (advisory) least-loaded node leads $MINLED of a fair 819 -- low values mean more churn"
 
 echo "=== $WRITES writes to node 1, against deposed primaries ==="
@@ -99,9 +102,9 @@ echo "  result: $OK accepted, $E5XX 5xx, $OTHER other"
 # number of retryable 503s from VShards caught mid-transfer.
 assert_eq "server-side 500s" "$(cat /tmp/tsgate_dp*/s.log | grep -c 'Error handling write request')" 0
 assert_eq "non-HTTP failures" "$OTHER" 0
-# ADVISORY: the 5xx here are retryable 503s from VShards caught mid-transfer by the
-# non-converging balancer, and their count tracks that churn rather than anything Phase 3
-# owns. Measured 274-300 of 300 across runs. The HARD assertion is the 500 count above.
+# ADVISORY: the 5xx here are retryable 503s from VShards caught mid-transfer by the storm,
+# and their count tracks that churn rather than anything Phase 3 owns. Measured 274-300 of
+# 300 across runs. The HARD assertion is the 500 count above.
 echo "  (advisory) $OK/$WRITES accepted, $E5XX retryable 5xx -- see the balancer note above"
 if [ "$E5XX" -gt 0 ]; then
     echo "  (advisory) first 5xx must be a 503 naming a retryable condition, never an opaque 500"

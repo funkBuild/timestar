@@ -12,6 +12,7 @@ not probes, so they can be run from CI or a release checklist.
 | `fault_injection_gate.sh` | a BURST of TCP connection resets between two live nodes costs latency, not client errors, and loses/duplicates nothing (write-scaleout 4c) |
 | `restart_catchup_gate.sh` | a follower that was DOWN through a large write campaign catches up when it returns, under the tightened Raft admission bound (write-scaleout 5.4) |
 | `fault_injection_ab.sh` | **(expensive, on-demand — not a CI gate)** that `fault_injection_gate.sh` DISCRIMINATES: builds the 4a-reverted binary and asserts it fails the same storm HEAD passes |
+| `node_kill_round.sh` | `kill -9` of one node MID-BENCH: no 500s, no crashes, every ACKED write readable afterwards on both survivors — and it prints the one-node-down 503 band (debt D-14), which stays advisory |
 
 All of them take an optional server binary as `$1` (default
 `build/bin/timestar_http_server`), so a "before" binary can be measured the same way.
@@ -64,15 +65,17 @@ lowering the load on the artificial one: the insert bench pipelines several batc
 even at `--connections 1`, so "the load dropped" is not expressible at a budget small
 enough for curl to trip.
 
-`deposed_primary_gate.sh` hard-asserts only what Phase 3 owns -- zero server-side 500s,
-zero crashes, and enough real leadership transfers for the run to be non-vacuous. The
-accepted-write count is ADVISORY, because a rebalance storm leaves VShards genuinely
-mid-transfer and a batch that touches one meets a leader that is standing down (the
-`LeaderRefused` band; see the plan doc's D-14 for why batch fan-out makes a small
-per-VShard window a visible per-request rate). An earlier version of this note blamed
-"~319 VShards moving every 2s at RF < N" -- that figure is WITHDRAWN in the plan doc
-(:404): it was measured with CheckQuorum temporarily enabled, and re-measured with it off
-the balancer converges, slowly (deltas 586 -> 454 -> 258). Pre-Phase-3 this gate produced ~29%
+`deposed_primary_gate.sh` hard-asserts what Phase 3 owns -- zero server-side 500s, zero
+crashes, and enough real leadership transfers for the run to be non-vacuous -- plus, since
+D-13, that reads work. The accepted-write count is ADVISORY, because a rebalance storm
+leaves VShards genuinely mid-transfer and a batch that touches one meets a leader that is
+standing down (the `LeaderRefused` band; see the plan doc's D-14 for why batch fan-out
+makes a small per-VShard window a visible per-request rate). An earlier version of this
+note blamed "~319 VShards moving every 2s at RF < N" -- that figure is WITHDRAWN in the
+plan doc (:404): it was measured with CheckQuorum temporarily enabled. Re-measured with it
+off, the balancer did NOT converge (26-114 VShards moving per 30 s after 12 idle minutes,
+spread stalled at ~300 of a fair 819) -- and that is now FIXED and measured in D-12: it
+converges in ~60 s to a spread of 2-3 and then stops. Pre-Phase-3 this gate produced ~29%
 opaque HTTP 500s; it now produces zero 500s and a small number of honest 503s.
 
 `rolling_rebalance_gate.sh` starts the third node LAST. `/cluster/rebalance-leadership`
@@ -168,6 +171,14 @@ Two things to know before running it:
   appeared: `last: transport` is specific to the retry-pacing defect.
 
 It never touches your working tree; the revert happens in the worktree.
+
+**Run it more than once before believing either answer (debt D-20).** Measured while
+gating D-14: three consecutive runs of this gate on the SAME HEAD binary gave 3 errors, 3
+errors, then 0 — with a comparable storm every time (147-151 rounds, 396-405 connections)
+— and the pre-batch control binary in the same session produced 6 storm errors, 2 probe
+5xx, and 257 errors in its QUIET baseline run (the one with no fault injected at all).
+A single failing run does not identify a regression here, and a single passing run does not
+clear one.
 
 **Result on the Phase-4 binary:** 147 reset rounds destroying 392 peer connections
 mid-bench → **2000/2000 bench requests OK, 200/200 probe writes OK, 0 HTTP errors, 0
