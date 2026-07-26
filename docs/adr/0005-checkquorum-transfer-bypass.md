@@ -1,23 +1,36 @@
 # ADR 0005 — A leader-transfer bypass for the CheckQuorum disruption guard
 
-**Status:** ACCEPTED and IMPLEMENTED (`82591a9` bypass, `5bdaa03` enable, `277e110` the
-interaction this ADR did not predict). CheckQuorum is ON. Mechanism (b) shipped;
-mechanism (c) — cluster-wide gated activation — did NOT, and is carried as debt D-30.
+**Status:** ACCEPTED and IMPLEMENTED. CheckQuorum is ON. Mechanism (b) — the new
+message-type byte — shipped; mechanism (c) — cluster-wide gated activation — did NOT, and
+is carried as debt D-30.
 
-**What the gates added to this design.** The bypass was necessary and sufficient for
-TRANSFERS (2216 of them under sustained writes, zero client errors, leadership settling
-at 0 moved), but enabling CheckQuorum then broke something this ADR never considered:
-**hibernation stretches the lease**. An idle follower ticks 1-in-10, so its disruption
-guard lasts 25-50 s rather than 2.5-5 s, and a group whose leader has DIED cannot be
-voted into a new one for that whole window. Same-session A/B on `node_kill_round.sh`:
-49/400 failed batches and an 8 s recovery with CheckQuorum off, **153/400 and 43 s** with
-it on. Fixed by waking a group that DROPS a vote under the lease (`277e110`), which
-brings the band back to 62-69/400 and a 12 s recovery. The residual — one extra campaign
-cycle, because the wake fires on the first dropped vote — is debt D-29.
+**Also fix the "self-limiting" claim under *Decision*: it was false as written.** See (1)
+below.
 
-The lesson for the next reader of this ADR: the lease is not only about what the wire
-carries. Any mechanism that slows a group's TICK also slows its lease, and this codebase
-has one.
+**Two things this ADR got wrong, both found after it was accepted. Read them before
+trusting the design section below.**
+
+**1. "Self-limiting" was FALSE as written** (the claim under *Decision*, that only the
+incumbent can cause a `campaignTransfer` campaign). Nothing checked that a `TimeoutNow`
+came from the believed leader. `isLeaderMessage` counts `TimeoutNow`, so a forge at a
+HIGHER term installed its sender as leader via `becomeFollower` and the transfer arm then
+agreed the sender was the leader; a forge at the SAME term reached the arm anyway. Vote
+safety was never affected — the log check and one-vote-per-term are untouched — but the
+disruption GUARD was bypassable at will by any buggy or hostile peer. Fixed by dropping a
+`TimeoutNow` whose sender is not the pre-step believed leader; pinned by the forge tests in
+`raft_node_test.cpp`. The property the flag needs is enforced on the CANDIDATE's side; a
+voter receiving a flagged vote still cannot verify anything, and does not need to.
+
+**2. Hibernation stretches the lease**, which this ADR never considered. An idle follower
+ticks 1-in-10, so its disruption guard lasted 25-50 s rather than 2.5-5 s, and a group
+whose leader had DIED could not be voted into a new one for that whole window. Same-session
+A/B on `node_kill_round.sh`: 49/400 failed batches and an 8 s recovery with CheckQuorum
+off, **153/400 and 43 s** with it on. Fixed at the source — the driver now credits the
+passes it skipped (`RaftNode::tick(passes)`), so every tick-driven clock, the lease
+included, expires in REAL time.
+
+The lesson for the next reader: the lease is not only about what the wire carries. Any
+mechanism that slows a group's TICK also slows its lease, and this codebase has one.
 
 **Parent design:** [Cluster Architecture and Implementation Plan](../clustering.md),
 [Cluster Write Scale-Out Plan](../write-scaleout-plan.md) §4 Phase 5d
@@ -26,6 +39,9 @@ has one.
 transfer") and the DO-NOT-ENABLE comment at `cluster_data_plane.cpp:150`
 
 ## Context
+
+*(Written while CheckQuorum was OFF; kept in the present tense of that moment, because it
+is the record of the decision. For what shipped, see the status block above.)*
 
 CheckQuorum is off. It was enabled during Phase 3 as a belt-and-braces companion to the
 per-write propose deadline and had to be reverted, because with it on **leadership
@@ -134,6 +150,15 @@ campaign, because only the leader sends `TimeoutNow`, and a `TimeoutNow` is acce
 only from the believed leader at a current term. A node cannot elect itself with the
 flag; it can only be elected with it by the incumbent.
 
+> **THIS PARAGRAPH WAS FALSE WHEN WRITTEN, and it is the one claim in this ADR that had to
+> be MADE true rather than merely implemented.** "A `TimeoutNow` is accepted only from the
+> believed leader" described no code: nothing checked the sender. A forge at a higher term
+> was worse than a same-term one, because `becomeFollower` installs the sender of a
+> leader-shaped message as leader BEFORE the transfer arm runs, so the arm's own view of
+> "the believed leader" was already the forger's. The check now exists, evaluated against
+> the PRE-step belief, and a `TimeoutNow` from anyone else is dropped without touching term
+> or leader state. Only with that check is the rest of this paragraph true.
+
 ### The compatibility story — the hard part
 
 **There is no version negotiation on the Raft transport.** `encodeEnvelope` writes a
@@ -181,6 +206,11 @@ operator enable it on one node during a rolling upgrade and reproduce the exact 
 this ADR exists to prevent. It should live beside the codec activation that Phase 2's
 2c left open (`activeFormatVersion`), and probably land with it.
 
+*(As shipped: activation is a BUILD decision, not a committed one — debt D-30 — and the
+only runtime knob is `TIMESTAR_CLUSTER_CHECKQUORUM`, which is **disable-only** for exactly
+the reason above. Turning it off per node is always safe; turning it on per node is the
+hazard, so nothing does.)*
+
 ## Consequences
 
 ### Tests required before enabling
@@ -194,6 +224,16 @@ this ADR exists to prevent. It should live beside the codec activation that Phas
      lease bypass" claim, stated as three tests;
    - a partitioned leader with `checkQuorum = true` steps down within an election
      timeout, and the majority side elects — the property being bought.
+     **PARTIALLY SATISFIED.** The step-down half is pinned twice, at both levels:
+     `RaftClusterTest.CheckQuorumStepsDownIsolatedLeader` (deterministic core) and
+     `RaftProposeDeadlineTest.CheckQuorumFailsAQuorumLessWriteOnItsOwn` (real
+     `RaftGroup`s over a partitionable router, asserting the waiter is drained and the
+     node stops believing it leads). The "and the majority side elects" half is NOT
+     asserted under `checkQuorum` in the same test — the deterministic-core partition
+     tests elect on the majority side with CheckQuorum OFF, and the live gates cover
+     failover-and-elect under the production setting (`node_kill_round.sh`). Wants the
+     one extra assertion; it is cheap and it is the half that would catch a disruption
+     guard that refuses the REPLACEMENT election too.
 2. **Codec** (`raft_codec_test.cpp`): round-trip of the new type; and an OLD-format
    `RequestVote` still decoding; and a new-format `RequestVote` presented to the old
    decoder DROPPING rather than misparsing (this is mechanism (b)'s whole claim, and it
