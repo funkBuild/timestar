@@ -34,16 +34,33 @@ HostPort parseHostPort(const std::string& s) {
     return hp;
 }
 
-// CheckQuorum, and the ONE-WAY switch an operator has over it (debt D-9/D-30).
+// CheckQuorum: the BUILD default, and the ONE-WAY switch an operator has over it
+// (debt D-9/D-29/D-30).
 //
-// Default ON. `TIMESTAR_CLUSTER_CHECKQUORUM` can only turn it OFF -- see the construction
-// site for why an enable knob would reproduce the exact mixed-version hazard ADR 0005 is
-// about. Anything unrecognised is refused loudly and the default stands, on the same
-// principle as the write-budget parse: a configuration mistake must not be obeyed silently.
-// Logged either way, because "why is this node behaving differently from its peers" is the
-// question this knob creates.
+// THE DEFAULT IS OFF FOR THIS RELEASE, and flipping it is this one line plus a re-run of
+// node_kill_round -- see the construction site for the measurement that decided it and for
+// the release ordering that makes flipping it safe next time.
+//
+// `TIMESTAR_CLUSTER_CHECKQUORUM` can only ever turn it OFF. It is retained while the
+// default is off (where it is a no-op) precisely so it is already in place, already logged
+// and already documented on the release that enables the guard -- an operator meeting a
+// CheckQuorum-shaped incident at 3am should not be the first person to use this knob. An
+// ENABLE knob is refused on purpose: with ADR 0005's mechanism (c) unbuilt, enabling per
+// node is exactly the mixed-version hazard that ADR exists to prevent.
+inline constexpr bool kCheckQuorumDefault = false;
+
 bool checkQuorumEnabled() {
     const char* e = std::getenv("TIMESTAR_CLUSTER_CHECKQUORUM");
+    if (!kCheckQuorumDefault) {
+        // Nothing to disable, and nothing may enable. Say so if someone tried, so the
+        // knob's absence of effect is visible rather than mysterious.
+        if (e && *e)
+            timestar::http_log.info(
+                "cluster: TIMESTAR_CLUSTER_CHECKQUORUM='{}' has no effect -- Raft CheckQuorum is OFF in this build "
+                "(debt D-9/D-29) and this override is disable-only",
+                e);
+        return false;
+    }
     if (!e || !*e)
         return true;
     const std::string v(e);
@@ -192,81 +209,74 @@ seastar::future<> ClusterDataPlane::start(const ClusterConfig& cfg, seastar::sha
         // bound, not the send bound, because the transport measures the encoded envelope
         // and `maxMessageBytes` is compared against the snapshot payload alone.
         ropts.maxMessageBytes = raft::kMaxRaftPayloadBytes;
-        // CheckQuorum is ON, and it took a revert and a wire-format change to get here.
-        // READ THIS BEFORE TOUCHING IT, in either direction.
+        // CHECKQUORUM IS OFF, AND EVERYTHING NEEDED TO TURN IT ON IS IN THIS BINARY.
+        // That combination is deliberate; it is a RELEASE-ORDERING decision, not an
+        // unfinished one. Read this before flipping `kCheckQuorumDefault` in either
+        // direction.
         //
-        // WHY IT WAS OFF (1f2e752, which reverted the commit before it). With CheckQuorum
+        // WHY IT WAS OFF BEFORE (1f2e752, reverting the commit before it): with CheckQuorum
         // on and no transfer marker, LEADERSHIP TRANSFER BREAKS. TimeoutNow lets the
-        // TRANSFEREE skip its own lease and campaign immediately, but the vote it then
-        // broadcast was an ordinary RequestVote, and every OTHER voter was still hearing
-        // the outgoing leader's heartbeats -- so
-        // `checkQuorum && leaderId_ != kNoNode && electionElapsed_ < electionTimeout_`
-        // held on all of them and the disruption guard SILENTLY DROPPED the transferee's
-        // vote without even bumping a term. Measured: a transfer that completes in 0 tick
-        // rounds with CheckQuorum off needed a full election timeout with it on -- 2.5-5 s
-        // at this 20 ms tick, each with a leaderless window inside it. That is not a
-        // corner case here: the balancer below fires every 5 s across 4096 groups,
-        // queryReplicated fails reads CLOSED after ~125 ms of leaderlessness, and the
-        // operator rebalance endpoint storms transfers deliberately (2216 in one gate).
+        // TRANSFEREE skip its own lease, but the vote it broadcast was an ordinary
+        // RequestVote and every OTHER voter was still hearing the outgoing leader, so
+        // `checkQuorum && leaderId_ != kNoNode && electionElapsed_ < electionTimeout_` held
+        // on all of them and the disruption guard SILENTLY DROPPED the vote without even
+        // bumping a term. A transfer that takes 0 tick rounds became a full election
+        // timeout -- 2.5-5 s of leaderlessness, thousands of times per rebalance storm.
         //
-        // WHAT MAKES IT SAFE NOW -- THREE THINGS, not one (ADR 0005, debt D-9/D-29).
-        //   1. `RequestVote::campaignTransfer`, set only by a campaign started FROM a
-        //      TimeoutNow, honoured at the inLease check in RaftNode::step. A transfer vote
-        //      stands the lease down and buys nothing else: the log check,
-        //      one-vote-per-term and term ordering all still apply.
-        //   2. That campaign is reachable only for a TimeoutNow whose sender was ALREADY
-        //      our believed leader (the guard at the top of RaftNode::step). Without it a
-        //      FORGED TimeoutNow -- same term or higher, since a higher-term leader message
-        //      installs its sender as leader first -- let any peer produce a
-        //      transfer-flagged campaign and stand every voter's lease down at will (F1).
-        //      Vote safety was never affected; the disruption guard was.
+        // WHAT IS FIXED NOW, all three tested and all three staying in:
+        //   1. `RequestVote::campaignTransfer` (ADR 0005 mechanism (b)), honoured at the
+        //      inLease check, riding its OWN message-type byte so an older peer DROPS the
+        //      envelope rather than misparsing it. Transfers under CheckQuorum measured at
+        //      2216 in one rolling_rebalance storm, 600/600 OK, leadership settling at 0
+        //      moved.
+        //   2. A TimeoutNow is honoured only from the PRE-STEP believed leader
+        //      (RaftNode::step). Without it a forged TimeoutNow -- same term or higher --
+        //      produced a transfer-flagged campaign from any peer and stood every voter's
+        //      lease down at will (F1).
         //   3. Hibernation credits the passes it skips (RaftGroupRegistry::tickAll ->
-        //      RaftNode::tick(passes)), so the lease expires in REAL time. Without that, an
-        //      idle follower's lease ran 10x long and a DEAD leader's groups refused the
-        //      votes that would have replaced them: node_kill_round went from 49/400 failed
-        //      batches and an 8 s recovery to 153/400 and 43 s.
-        // The wire is safe on its own terms too: a transfer vote rides its own message-type
-        // byte (kRequestVoteTransfer), so a peer too old to know it DROPS the envelope
-        // rather than misparsing it, and that transfer degrades to the old slow path.
+        //      RaftNode::tick(passes)), so the lease expires in REAL time instead of 10x
+        //      long. This one is a WIN IN ITS OWN RIGHT, independent of CheckQuorum: with
+        //      the guard off it took node_kill_round's band from 49/400 to 32/400 and the
+        //      recovery from 8 s to 7 s, because a dead leader's idle groups no longer wait
+        //      out a stretched election timeout.
         //
-        // Pinned by, in order of how directly they would catch a regression here:
+        // WHY IT IS STILL OFF -- THE MEASUREMENT. Same binary, same session,
+        // node_kill_round.sh (3-node RF=3, kill -9 of the node leading 1364 of 4096
+        // mid-bench), flag the only difference (via the override below):
+        //
+        //     OFF  32/400 failed batches, 7 s recovery, 3.88 M pts/s   (twice, identical)
+        //     ON   50/400 / 11 s / 2.60 M   and   59/400 / 13 s / 2.12 M
+        //
+        // So the guard still costs ~1.6-1.8x on the client-visible one-node-down band and
+        // ~4-6 s of extra failover. It buys no safety (Raft never depended on it; commit
+        // needs a quorum ack, and RaftGroup::proposeAndAwaitApplied already bounds every
+        // write and bounds waiter accumulation). What it buys is PROMPTNESS under partition:
+        // a stale leader stops accepting proposals it cannot commit within one election
+        // timeout instead of one deadline per write, and leader-only reads on the losing
+        // side converge on "not leader" promptly rather than per request. That is worth
+        // having, and it is not worth a worse single-node failure -- which is the far more
+        // common event. Residual filed as D-29.
+        //
+        // WHY THE CODE SHIPS ANYWAY, and this is the point: the tag-8 decoder ships in THIS
+        // release, so every node in a rolling upgrade to the release AFTER this one can
+        // already READ a transfer vote. Enabling the guard then needs no wire change and no
+        // mixed-version window -- it becomes exactly the one-line flip above, plus a
+        // re-run of node_kill_round to confirm the band. Enabling it in the same release as
+        // the decoder is what would have required ADR mechanism (c) (D-30) to be built
+        // first. Shipping the reader first is the cheaper half of that design.
+        //
+        // Pinned, so none of the three can rot while the flag is off:
         //   RaftClusterTest.LeaderTransferUnderCheckQuorumCompletesInZeroTickRounds
-        //     -- the direct regression test for 1f2e752; it advances NO clock, so a
-        //        transfer that needs an election timeout cannot pass it
-        //   RaftClusterTest.CheckQuorumStillRefusesAnUnsolicitedCampaign
-        //   RaftNodeTest.TransferVote{StillObeysTheLogUpToDateCheck,StillObeysOneVotePer
-        //     Term,AtAStaleTermIsRejectedWithOurTerm} -- vote safety, stated separately
+        //     -- the direct regression test for 1f2e752; it advances NO clock
+        //   RaftClusterTest.{CheckQuorumStillRefusesAnUnsolicitedCampaign,
+        //     CheckQuorumStepsDownIsolatedLeader}
+        //   RaftNodeTest.TransferVote{StillObeysTheLogUpToDateCheck,
+        //     StillObeysOneVotePerTerm,AtAStaleTermIsRejectedWithOurTerm} -- vote safety
+        //   RaftNodeTest.AForged{SameTerm,HigherTerm}TimeoutNowIsIgnored -- (2)
+        //   RaftGroupRegistryTest.HibernationDoesNotStretchTheLease -- (3)
         //   RaftCodecTest.AnOldDecoderDropsTheTransferVoteAndStillReadsAnOrdinaryOne
-        //   RaftProposeDeadlineTest.CheckQuorumFailsAQuorumLessWriteOnItsOwn
-        //     -- the behaviour CheckQuorum is wanted FOR; it builds its own RaftOptions
-        //        and is no longer describing a non-production setting
-        // and live: rolling_rebalance (thousands of transfers under sustained writes),
-        // deposed_primary, node_kill_round, fault_injection.
-        //
-        // WHAT IT BUYS. Not safety -- Raft's safety never depended on it, a partitioned
-        // leader cannot commit without a quorum ack, and the per-write propose deadline
-        // (RaftGroup::proposeAndAwaitApplied) already bounds every write and bounds
-        // expired-waiter accumulation by (deadline x retry budget) either way. This is the
-        // BELT to that deadline's braces: a stale or partitioned leader now steps down
-        // within one election timeout instead of discovering it one write at a time, so it
-        // stops accepting proposals it can never commit, its applyWaiters list stops
-        // growing, and leader-only reads on the losing side of a partition converge on
-        // "not leader" promptly rather than per request.
-        //
-        // WHAT IS STILL OPEN: ADR mechanism (c), gating activation on the cluster-wide
-        // committed format version, so this cannot be on while a peer is too old to read a
-        // transfer vote (debt D-30). Until that lands, a MIXED-VERSION rolling window has
-        // slow transfers (the pre-bypass behaviour) -- degraded, never unsafe.
-        //
-        // THE OVERRIDE IS DISABLE-ONLY, DELIBERATELY. `TIMESTAR_CLUSTER_CHECKQUORUM=0`
-        // (also `false`/`no`/`off`) turns it off on this node; nothing turns it ON where
-        // the build has it off. An operator who finds a CheckQuorum-shaped incident at 3am
-        // needs a way out that does not involve a rebuild, and disabling is always safe --
-        // it is the configuration that shipped for months and it costs nothing but a
-        // partitioned leader's promptness. An ENABLE knob would be the opposite: with (c)
-        // unbuilt it is exactly the per-node enable ADR 0005 warns about, one node running
-        // the guard while an old peer drops its transfer votes, which is the hazard this
-        // whole design exists to avoid. So the knob only ever points the safe way.
+        //   RaftProposeDeadlineTest.CheckQuorumFailsAQuorumLessWriteOnItsOwn -- the
+        //     property the guard is wanted FOR, on its own RaftOptions
         ropts.checkQuorum = checkQuorumEnabled();
         {
             std::map<unsigned, std::vector<std::pair<uint16_t, std::vector<data::NodeId>>>> byShard;
