@@ -4,6 +4,8 @@
 #include "../data/read_routing.hpp"
 #include "write_admission.hpp"
 
+#include <algorithm>
+#include <cctype>
 #include <cstdlib>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/sleep.hh>
@@ -63,10 +65,24 @@ bool checkQuorumEnabled() {
     }
     if (!e || !*e)
         return true;
-    const std::string v(e);
+    // TRIM AND LOWERCASE BEFORE COMPARING. This is an operator's only lever over the
+    // guard and it is reached at 3am: `FALSE`, `Off` and a value with a stray space or
+    // trailing newline (trivially produced by a shell here-doc, a docker-compose YAML
+    // scalar, or an env file) must all mean what they obviously mean. A case-SENSITIVE
+    // exact match silently fell through to the "not a boolean" arm below and left the
+    // guard ON -- i.e. the one outcome the operator was trying to avoid.
+    std::string v(e);
+    v.erase(0, v.find_first_not_of(" \t\r\n"));
+    if (const auto last = v.find_last_not_of(" \t\r\n"); last != std::string::npos)
+        v.erase(last + 1);
+    else
+        v.clear();
+    std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (v.empty())
+        return true;  // whitespace only == unset
     if (v == "0" || v == "false" || v == "no" || v == "off") {
         timestar::http_log.warn(
-            "cluster: Raft CheckQUORUM DISABLED on this node by TIMESTAR_CLUSTER_CHECKQUORUM='{}'. A partitioned "
+            "cluster: Raft CheckQuorum DISABLED on this node by TIMESTAR_CLUSTER_CHECKQUORUM='{}'. A partitioned "
             "or stale leader will now keep accepting proposals it cannot commit until each one's own deadline, and "
             "leader-only reads on the losing side of a partition converge per request rather than promptly. Nothing "
             "is unsafe (commit still needs a quorum ack); this is the configuration that shipped before debt D-9.",
@@ -82,8 +98,8 @@ bool checkQuorumEnabled() {
         return true;
     }
     timestar::http_log.error(
-        "cluster: TIMESTAR_CLUSTER_CHECKQUORUM='{}' is not a boolean (0/false/no/off disable; nothing enables); "
-        "leaving CheckQuorum ON",
+        "cluster: TIMESTAR_CLUSTER_CHECKQUORUM='{}' is not a boolean (0/false/no/off disable, case- and "
+        "whitespace-insensitive; nothing enables); leaving CheckQuorum ON",
         e);
     return true;
 }

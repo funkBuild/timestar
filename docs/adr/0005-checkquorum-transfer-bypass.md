@@ -15,9 +15,6 @@ failover is the wrong trade — single-node failure is the commoner event. The d
 shipping now with the guard off is what makes enabling it later a one-line flip with no
 mixed-version window. Residual: debt D-29.
 
-**Also fix the "self-limiting" claim under *Decision*: it was false as written.** See (1)
-below.
-
 **Two things this ADR got wrong, both found after it was accepted. Read them before
 trusting the design section below.**
 
