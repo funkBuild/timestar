@@ -36,7 +36,19 @@ gate_exit() {
 }
 
 kill_cluster() { # $1 = port prefix used by this gate, e.g. 492
-    pkill -u "$(id -u)" -9 -f "timestar_http_server.*--port $1" 2>/dev/null
+    # MATCH ON THE PORT, NOT THE BINARY NAME. Every gate takes an optional server binary
+    # as $1 so a "before" binary can be measured the same way -- and that binary is
+    # usually NOT called timestar_http_server (a comparison build, a saved copy). The old
+    # pattern `timestar_http_server.*--port $1` silently matched nothing in exactly that
+    # case, so a run with a custom binary left its three servers alive and the NEXT gate
+    # aborted on `ports still in use`. That is precisely the A/B workflow
+    # fault_injection_ab.sh depends on, where the two runs are back to back.
+    #
+    # The port prefix is unique per gate (492/493/...), so this cannot reach another
+    # gate's cluster. Safe to match loosely here because this lives in a SCRIPT FILE: the
+    # same pattern inlined into `bash -c` would match the invoking shell's own argv and
+    # kill it mid-command (see the note at the top of this file).
+    pkill -u "$(id -u)" -9 -f -- "--port $1" 2>/dev/null
     pkill -u "$(id -u)" -9 -f 'timestar_insert_bench' 2>/dev/null
     sleep 2
 }
