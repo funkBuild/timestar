@@ -1,5 +1,7 @@
 #pragma once
 
+#include "../../storage/journal_gc.hpp"
+#include "../../storage/journal_retention.hpp"
 #include "../../storage/journal_segment.hpp"
 #include "../../storage/journal_sink.hpp"
 #include "../data/node_store.hpp"  // ProposeSink
@@ -52,6 +54,18 @@ public:
     // construction -- plan 5.3). ~1.0 per-VShard; > 1 shared.
     uint64_t journalFsyncs() const;
     uint64_t journalSyncRequests() const;
+
+    // Journal segment ROTATION TARGET, per layout. Must be set before addVShard.
+    //
+    // A knob rather than a constant because segment reclamation (debt D-34) only ever
+    // acts on SEALED segments: with the production 1 MiB per-VShard target, proving a
+    // reclaim means writing a megabyte of Raft entries through a quorum, which is not a
+    // unit test. It is also the honest operator knob for a deployment whose entries are
+    // much larger or much smaller than this tree assumes.
+    void setJournalSegmentBytes(size_t perVShard, size_t shared) {
+        journalSegmentBytes_ = perVShard;
+        sharedJournalSegmentBytes_ = shared;
+    }
 
     // Instantiate the Raft group for `vshard` with `voters`. `opts` tunes election
     // timing (production: uniform; tests: preferred leader). The journal lives
@@ -189,6 +203,61 @@ public:
     // action later); the periodic timer just calls it.
     seastar::future<size_t> maybeSnapshotOnce();
 
+    // ---- journal SEGMENT reclamation (debt D-34) ----
+    //
+    // D-6 made the snapshot boundary real (the log is compacted and the boundary
+    // survives a restart), so replay is bounded. It did NOT reclaim a byte of disk: the
+    // sealed segments holding the compacted-away records were still there, and
+    // `cluster_raft/` grew without limit however often a node snapshotted.
+    //
+    // This turns the boundary into deleted files, in three steps:
+    //
+    //  1. PUBLISH THE FLOOR. Every group's JournalRaftPersistence knows the highest
+    //     vshard_seq it no longer needs (releasedSeq(), which is NOT simply the snapshot
+    //     record's seq -- read that comment). publishReclaimFloors() copies those into
+    //     `retention_`, whose watermarks advance monotonically.
+    //  2. PLAN. `JournalRetention::planSegment` decides per SEALED segment: fully
+    //     released -> delete; otherwise it is pinned by whoever still needs it.
+    //  3. RECLAIM. `JournalGc` does the I/O, oldest segment first, never touching the
+    //     active one.
+    //
+    // BOTH LAYOUTS, DIFFERENT SHAPES, same rule:
+    //   * per-VShard journals (the DEFAULT): a segment holds exactly one group's
+    //     records, so "fully released" is decided by that group alone and copy-forward
+    //     could gain at most the one partially-released 1 MiB segment. It runs
+    //     DELETE-ONLY, which means it never touches the writer and so needs no exclusion
+    //     against the group's own appends. Only VShards whose floor ADVANCED since their
+    //     last pass are visited, so an idle node does not scan ~1365 directories.
+    //   * shared per-shard journal (`TIMESTAR_CLUSTER_SHARED_JOURNAL=1`, D-10): a
+    //     segment holds every group on the reactor, so one laggard pins 64 MiB for
+    //     everyone. Copy-forward is what the bricks were written for and it is enabled,
+    //     under `SharedShardJournal::runExclusive` -- appending relocated records
+    //     concurrently with a group-commit barrier would write them at an offset
+    //     computed before they existed.
+    //
+    // CRASH DURING GC IS SAFE BY ORDERING, not by luck: copy the live records forward,
+    // BARRIER, then unlink, then sync the directory. Every crash window leaves at least
+    // one complete generation, and the overlap window leaves a byte-identical DUPLICATE,
+    // which recovery resolves -- `recoverRaftState` replays in vshard_seq order and a
+    // repeated record re-applies identically, and `JournalReplay::finalize` drops exact
+    // duplicates outright while failing closed on a conflicting one. A partially-deleted
+    // sequence is likewise fine: each segment is an independent step and what survives is
+    // still a gap-free suffix per VShard.
+    static constexpr std::chrono::seconds kJournalGcInterval{60};
+    // Run one reclamation pass now (publish floors, then collect). Returns the number of
+    // segment files deleted. Exposed for tests and for an operator action; the sweep
+    // calls it on its own cadence.
+    seastar::future<size_t> reclaimJournalSegments();
+    // Copy every group's current reclaim floor into `retention_`. Returns how many
+    // advanced. Separated from the collect so a test can assert the floor itself.
+    size_t publishReclaimFloors();
+    const JournalRetention& journalRetention() const { return retention_; }
+
+    uint64_t journalSegmentsDeleted() const { return journalSegmentsDeleted_; }
+    uint64_t journalSegmentsPinned() const { return journalSegmentsPinned_; }
+    uint64_t journalRecordsCopiedForward() const { return journalRecordsCopiedForward_; }
+    uint64_t journalGcPasses() const { return journalGcPasses_; }
+
     // Observability for the gate and for `/cluster/status`.
     uint64_t snapshotsTaken() const { return snapshotsTaken_; }
     uint64_t snapshotsRefusedTooLarge() const { return snapshotsRefusedTooLarge_; }
@@ -217,6 +286,12 @@ private:
         // When this group was last snapshotted (default-constructed == never), for
         // kMinSnapshotInterval.
         seastar::lowres_clock::time_point lastSnapshot{};
+        // The reclaim floor this VShard's journal directory was last collected at
+        // (debt D-34, per-VShard layout only). A pass whose floor has not moved would
+        // re-scan the directory and re-read its sealed segments to reach the same
+        // decision, so it is skipped -- that is what keeps a ~1365-group node from
+        // doing 1365 directory walks every minute.
+        uint64_t lastGcFloor = 0;
     };
 
     EngineLocalStore& store_;
@@ -232,6 +307,12 @@ private:
     // DECLARATION ORDER: sharedSink_ borrows sharedWriter_, and vshards_' persistence
     // objects borrow sharedSink_; members destruct in reverse declaration order, so
     // the writer is declared FIRST and the sink after it, both BEFORE vshards_.
+    // Segment rotation targets; see setJournalSegmentBytes(). The shared journal
+    // carries every group on the reactor (~1365 at 4096 VShards / 3 shards), so the
+    // per-VShard target would rotate -- and seal, and fsync, and sync_directory --
+    // constantly.
+    size_t journalSegmentBytes_ = 1u << 20;
+    size_t sharedJournalSegmentBytes_ = 1u << 26;
     std::unique_ptr<JournalWriter> sharedWriter_;
     std::unique_ptr<SharedShardJournal> sharedSink_;
     std::vector<JournalRecord> sharedRecovered_;
@@ -253,6 +334,10 @@ private:
     // coroutine frame captured by a with_gate temporary outlives the frame it referenced
     // (the standing rule in this tree, learned the hard way in raft_group.cpp).
     seastar::future<> snapshotSweep();
+    // The shared-journal collect, as a NAMED member coroutine (debt D-34): it is handed
+    // to SharedShardJournal::runExclusive, and a coroutine lambda there would leave its
+    // frame pointing at a closure the helper owns.
+    seastar::future<> collectSharedSegments(std::filesystem::path dir, uint64_t activeSegment, JournalGc::Result* out);
     seastar::timer<seastar::lowres_clock> snapshotTimer_;
     seastar::gate snapshotGate_;
     bool snapshotSweepRunning_ = false;  // one sweep at a time; the timer skips if busy
@@ -271,6 +356,15 @@ private:
     uint64_t snapshotsSkippedNoAdvance_ = 0;
     uint64_t snapshotSweeps_ = 0;
     uint64_t snapshotMaxEntriesSinceSeen_ = 0;
+
+    // ---- journal segment reclamation state (debt D-34) ----
+    JournalRetention retention_;
+    seastar::lowres_clock::time_point lastJournalGc_{};
+    bool journalGcRunning_ = false;  // one pass at a time (it suspends over file I/O)
+    uint64_t journalSegmentsDeleted_ = 0;
+    uint64_t journalSegmentsPinned_ = 0;
+    uint64_t journalRecordsCopiedForward_ = 0;
+    uint64_t journalGcPasses_ = 0;
 };
 
 }  // namespace timestar::cluster

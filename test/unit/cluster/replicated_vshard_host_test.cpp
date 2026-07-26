@@ -4,10 +4,10 @@
 // EngineDataStateMachine into the Engine, and is queryable. Proves the per-VShard
 // hosting/management layer (the multi-engine RF=3 convergence is proven separately
 // in engine_rf3_test).
-#include "../../../lib/cluster/integration/replica_engine_reader.hpp"
 #include "../../../lib/cluster/integration/replicated_vshard_host.hpp"
 
 #include "../../../lib/cluster/data/snapshot_payload.hpp"
+#include "../../../lib/cluster/integration/replica_engine_reader.hpp"
 #include "../../../lib/cluster/raft/raft_journal_persistence.hpp"
 #include "../../../lib/core/placement_table.hpp"  // virtualShard
 #include "../../../lib/core/vshard.hpp"
@@ -424,8 +424,7 @@ TEST_F(ReplicatedVShardHostTest, ReplicaEngineReaderServesAtEachConsistency) {
 
         // BoundedStaleness within a generous bound serves local state.
         {
-            auto res =
-                reader.read(nq(), data::ReadConsistency::BoundedStaleness, {}, /*maxLagIndex=*/1'000'000).get();
+            auto res = reader.read(nq(), data::ReadConsistency::BoundedStaleness, {}, /*maxLagIndex=*/1'000'000).get();
             EXPECT_GT(res.partial.seriesFound, 0u);
         }
 
@@ -433,13 +432,9 @@ TEST_F(ReplicatedVShardHostTest, ReplicaEngineReaderServesAtEachConsistency) {
         {
             cluster::ReplicaEngineReader partitioned(
                 *g, store, V,
+                [] { return seastar::make_exception_future<raft::LogIndex>(std::runtime_error("leader unreachable")); },
                 [] {
-                    return seastar::make_exception_future<raft::LogIndex>(
-                        std::runtime_error("leader unreachable"));
-                },
-                [] {
-                    return seastar::make_exception_future<raft::LogIndex>(
-                        std::runtime_error("leader unreachable"));
+                    return seastar::make_exception_future<raft::LogIndex>(std::runtime_error("leader unreachable"));
                 });
             bool threw = false;
             try {
@@ -733,10 +728,10 @@ TEST_F(ReplicatedVShardHostTest, ACompactedJournalIsRecoveredWithoutReinstalling
             // the same file twice and counting its points twice in every query.
             for (int i = 0; i < 10 && !g2->isLeader(); ++i)
                 g2->tick().get();
-            auto rq = (*eng)
-                          .invoke_on(0u,
-                                     [key = series.key, sid](Engine& e) { return e.query(key, sid, 0, UINT64_MAX); })
-                          .get();
+            auto rq =
+                (*eng)
+                    .invoke_on(0u, [key = series.key, sid](Engine& e) { return e.query(key, sid, 0, UINT64_MAX); })
+                    .get();
             ASSERT_TRUE(rq.has_value());
             EXPECT_EQ(std::get<QueryResult<double>>(rq.value()).values.size(), 4u)
                 << "recovery must not double-register the snapshot's TSM files";
@@ -844,9 +839,10 @@ TEST_F(ReplicatedVShardHostTest, ARecoveredRECEIVEDSnapshotIsReinstalledBecauseI
         recvEng.start();
         cluster::EngineLocalStore recvStore(*recvEng);
         {
-            auto pre = (*recvEng)
-                           .invoke_on(0u, [key = series.key, sid](Engine& e) { return e.query(key, sid, 0, UINT64_MAX); })
-                           .get();
+            auto pre =
+                (*recvEng)
+                    .invoke_on(0u, [key = series.key, sid](Engine& e) { return e.query(key, sid, 0, UINT64_MAX); })
+                    .get();
             const size_t n = pre.has_value() ? std::get<QueryResult<double>>(pre.value()).values.size() : 0;
             ASSERT_EQ(n, 0u) << "the receiving Engine must start with none of the donor's data";
         }
@@ -868,6 +864,169 @@ TEST_F(ReplicatedVShardHostTest, ARecoveredRECEIVEDSnapshotIsReinstalledBecauseI
             << "the replica must hold the snapshot's data, not merely its boundary";
 
         receiver.stop().get();
+        fs::remove_all(jroot);
+    }).get();
+}
+
+// ---------------------------------------------------------------------------
+// JOURNAL SEGMENT RECLAMATION (debt D-34)
+// ---------------------------------------------------------------------------
+//
+// D-6 made the snapshot boundary real, so restart replay is bounded. It reclaimed no
+// disk: the sealed segments holding the compacted-away records were still there, and
+// `cluster_raft/` grew without limit however often a node snapshotted. These tests drive
+// the WHOLE wiring -- write, flush, snapshot, publish the floor, collect -- and assert
+// both directions: a segment below the boundary goes, a segment above it does not, and
+// the group still recovers from what is left.
+
+namespace {
+// Segment small enough that a handful of Raft entries seals several of them. The
+// production target is 1 MiB, which no unit test is going to fill through a quorum.
+constexpr size_t kTinySegBytes = 512;
+
+size_t journalSegmentCount(const fs::path& jroot, uint16_t vshard) {
+    const fs::path dir = jroot / ("vshard_" + std::to_string(vshard));
+    size_t n = 0;
+    if (!fs::exists(dir))
+        return 0;
+    for (const auto& e : fs::directory_iterator(dir))
+        if (timestar::JournalWriter::parseSegmentFilename(e.path().filename().string()))
+            ++n;
+    return n;
+}
+}  // namespace
+
+TEST_F(ReplicatedVShardHostTest, SealedSegmentsBelowTheSnapshotBoundaryAreReclaimed) {
+    seastar::async([] {
+        if (!timestar::vshardsCohesiveOnCores(seastar::smp::count))
+            GTEST_SKIP() << "core count is not VShard-cohesive; the producer is disabled by design";
+        ScopedShardedEngine eng;
+        eng.start();
+        cluster::EngineLocalStore store(*eng);
+        NoopTransport transport;
+        fs::path jroot = tmpDir();
+        RaftOptions opts;
+        opts.electionTimeoutMin = opts.electionTimeoutMax = 1;
+        opts.heartbeatTimeout = 1;
+        const auto series = core0Series("d34reclaim");
+
+        {
+            cluster::ReplicatedVShardHost host(store, transport, /*self=*/1, jroot);
+            host.setJournalSegmentBytes(kTinySegBytes, kTinySegBytes);
+            host.addVShard(series.vshard, {1}, opts).get();
+            RaftGroup* g = host.group(series.vshard);
+            ASSERT_NE(g, nullptr);
+            for (int i = 0; i < 10 && !g->isLeader(); ++i)
+                g->tick().get();
+            ASSERT_TRUE(g->isLeader());
+            commitWrites(host, g, series.key, series.vshard, 24);
+
+            const size_t sealedBefore = journalSegmentCount(jroot, series.vshard);
+            ASSERT_GT(sealedBefore, 1u) << "the writes must have sealed at least one segment";
+
+            // BEFORE ANY SNAPSHOT: nothing is released, so nothing may be deleted. This is
+            // the negative half and it is the one that would be data loss if it failed --
+            // every record here is the only copy of an un-snapshotted log entry.
+            EXPECT_EQ(host.publishReclaimFloors(), 0u) << "an uncompacted group releases nothing";
+            EXPECT_EQ(host.reclaimJournalSegments().get(), 0u);
+            EXPECT_EQ(journalSegmentCount(jroot, series.vshard), sealedBefore);
+
+            // Flush to TSM and compact: now the boundary has passed most of the log.
+            flushToTsm(eng);
+            ASSERT_GT(host.snapshotVShard(series.vshard).get(), 0u);
+            EXPECT_EQ(host.publishReclaimFloors(), 1u) << "compaction must move this group's floor";
+            EXPECT_GT(host.journalRetention().released(VShardId{series.vshard}), 0u);
+
+            const size_t deleted = host.reclaimJournalSegments().get();
+            EXPECT_GT(deleted, 0u) << "sealed segments below the boundary must be reclaimed";
+            EXPECT_LT(journalSegmentCount(jroot, series.vshard), sealedBefore);
+            EXPECT_EQ(host.journalSegmentsDeleted(), deleted);
+            // The default (per-VShard) layout is DELETE-ONLY: GC never touches the writer,
+            // which is what makes it safe to run alongside the group's own appends.
+            EXPECT_EQ(host.journalRecordsCopiedForward(), 0u);
+
+            // A SECOND PASS AT THE SAME FLOOR IS A NO-OP, not a re-scan: the per-VShard
+            // arm skips a group whose floor has not moved.
+            EXPECT_EQ(host.reclaimJournalSegments().get(), 0u);
+            host.stop().get();
+        }
+
+        // AND THE GROUP STILL RECOVERS from what is left. This is the whole safety claim:
+        // the deleted segments held only records at or below the reclaim floor, so the
+        // boundary, the hard state and the retained log suffix are all still on disk.
+        {
+            cluster::ReplicatedVShardHost host2(store, transport, /*self=*/1, jroot);
+            host2.setJournalSegmentBytes(kTinySegBytes, kTinySegBytes);
+            ASSERT_NO_THROW(host2.addVShard(series.vshard, {1}, opts).get());
+            RaftGroup* g2 = host2.group(series.vshard);
+            ASSERT_NE(g2, nullptr);
+            EXPECT_GT(g2->node().log().snapshotIndex(), 0u) << "the boundary must survive reclamation";
+            for (int i = 0; i < 10 && !g2->isLeader(); ++i)
+                g2->tick().get();
+            auto rq = (*eng)
+                          .invoke_on(0u,
+                                     [key = series.key](Engine& e) {
+                                         return e.query(key, SeriesId128::fromSeriesKey(key), 0, UINT64_MAX);
+                                     })
+                          .get();
+            ASSERT_TRUE(rq.has_value());
+            EXPECT_EQ(std::get<QueryResult<double>>(rq.value()).values.size(), 24u)
+                << "every acknowledged point must survive segment reclamation";
+            host2.stop().get();
+        }
+        fs::remove_all(jroot);
+    }).get();
+}
+
+// A LAGGARD GROUP PINS ITS SEGMENTS while a caught-up group on the same shard reclaims
+// its own. In the per-VShard layout the two never share a file, so this is the shape the
+// floors themselves must produce: one advances, the other stays at zero.
+TEST_F(ReplicatedVShardHostTest, ALaggardGroupPinsItsOwnSegmentsWhileOthersReclaim) {
+    seastar::async([] {
+        if (!timestar::vshardsCohesiveOnCores(seastar::smp::count))
+            GTEST_SKIP() << "core count is not VShard-cohesive";
+        ScopedShardedEngine eng;
+        eng.start();
+        cluster::EngineLocalStore store(*eng);
+        NoopTransport transport;
+        fs::path jroot = tmpDir();
+        RaftOptions opts;
+        opts.electionTimeoutMin = opts.electionTimeoutMax = 1;
+        opts.heartbeatTimeout = 1;
+
+        const auto a = core0Series("d34lag_a");
+        Core0Series b = core0Series("d34lag_b");
+        for (int i = 0; b.vshard == a.vshard; ++i)
+            b = core0Series("d34lag_b" + std::to_string(i));
+        ASSERT_NE(a.vshard, b.vshard);
+
+        cluster::ReplicatedVShardHost host(store, transport, /*self=*/1, jroot);
+        host.setJournalSegmentBytes(kTinySegBytes, kTinySegBytes);
+        host.addVShard(a.vshard, {1}, opts).get();
+        host.addVShard(b.vshard, {1}, opts).get();
+        RaftGroup* ga = host.group(a.vshard);
+        RaftGroup* gb = host.group(b.vshard);
+        for (int i = 0; i < 10 && !(ga->isLeader() && gb->isLeader()); ++i) {
+            ga->tick().get();
+            gb->tick().get();
+        }
+        ASSERT_TRUE(ga->isLeader());
+        ASSERT_TRUE(gb->isLeader());
+        commitWrites(host, ga, a.key, a.vshard, 24);
+        commitWrites(host, gb, b.key, b.vshard, 24);
+        const size_t bBefore = journalSegmentCount(jroot, b.vshard);
+        ASSERT_GT(bBefore, 1u);
+
+        // Flush, then compact ONLY group a. Group b is the laggard.
+        flushToTsm(eng);
+        ASSERT_GT(host.snapshotVShard(a.vshard).get(), 0u);
+        host.publishReclaimFloors();
+        EXPECT_GT(host.journalRetention().released(VShardId{a.vshard}), 0u);
+        EXPECT_EQ(host.journalRetention().released(VShardId{b.vshard}), 0u) << "the laggard releases nothing";
+
+        EXPECT_GT(host.reclaimJournalSegments().get(), 0u);
+        EXPECT_EQ(journalSegmentCount(jroot, b.vshard), bBefore) << "the laggard's segments must be untouched";
+        host.stop().get();
         fs::remove_all(jroot);
     }).get();
 }

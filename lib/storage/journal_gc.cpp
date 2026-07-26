@@ -15,7 +15,7 @@ namespace fs = std::filesystem;
 namespace timestar {
 
 seastar::future<JournalGc::Result> JournalGc::collect(fs::path dir, uint64_t activeSegment, JournalWriter& writer,
-                                                      const JournalRetention& retention) {
+                                                      const JournalRetention& retention, Options opts) {
     Result result;
 
     // Enumerate sealed segments (strictly older than the active one), oldest
@@ -52,8 +52,23 @@ seastar::future<JournalGc::Result> JournalGc::collect(fs::path dir, uint64_t act
         // Nothing reclaimable in this segment (every record still live): leave it
         // untouched. Copying a fully-live segment forward would only churn bytes
         // and reorder records for no retention gain.
-        if (!gc.reclaimable && gc.liveRecordIndices.size() == scan->records.size())
+        if (!gc.reclaimable && gc.liveRecordIndices.size() == scan->records.size()) {
+            result.pinnedSegments.push_back(seg);
             continue;
+        }
+
+        // PIN rather than copy when copy-forward is off, or when the live set is too
+        // big to be worth (or to bound) the rewrite. Pinning is always safe: the
+        // segment keeps the only copy of records somebody still needs, which is
+        // precisely why it must not be deleted. Note that a LATER segment may still
+        // be fully released and deleted -- that removes only records at or below some
+        // VShard's released watermark, so what survives is still a prefix-free,
+        // gap-free sequence per VShard (JournalReplay::finalize validates exactly
+        // that).
+        if (!gc.reclaimable && (!opts.copyForward || gc.liveRecordIndices.size() > opts.maxCopyForwardRecords)) {
+            result.pinnedSegments.push_back(seg);
+            continue;
+        }
 
         if (!gc.reclaimable) {
             // Copy every live record forward into the active segment, make it

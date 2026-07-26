@@ -107,7 +107,7 @@ seastar::future<> ReplicatedVShardHost::addVShard(uint16_t vshard, std::vector<N
             // every group on the reactor (~1365 at 4096/3 shards), so the per-VShard
             // size would rotate -- and seal, and fsync, and sync_directory --
             // constantly.
-            sharedWriter_ = std::make_unique<JournalWriter>(dir, hdr, 1u << 26);
+            sharedWriter_ = std::make_unique<JournalWriter>(dir, hdr, sharedJournalSegmentBytes_);
             sharedRecovered_ = co_await sharedWriter_->open();
             sharedSink_ = std::make_unique<SharedShardJournal>(*sharedWriter_);
             timestar::http_log.info(
@@ -120,7 +120,7 @@ seastar::future<> ReplicatedVShardHost::addVShard(uint16_t vshard, std::vector<N
     if (!sharedSink_) {
         fs::path dir = journalRoot_ / ("vshard_" + std::to_string(vshard));
         fs::create_directories(dir);
-        vs.writer = std::make_unique<JournalWriter>(dir, hdr, 1u << 20);
+        vs.writer = std::make_unique<JournalWriter>(dir, hdr, journalSegmentBytes_);
         ownRecovered = co_await vs.writer->open();
     }
     // Shared mode reads the ONE recovered set (never copied -- it is ~1365 groups'
@@ -143,6 +143,17 @@ seastar::future<> ReplicatedVShardHost::addVShard(uint16_t vshard, std::vector<N
                          ? std::make_unique<raft::JournalRaftPersistence>(static_cast<JournalSink&>(*sharedSink_),
                                                                           VShardId{vshard}, st.nextSeq)
                          : std::make_unique<raft::JournalRaftPersistence>(*vs.writer, VShardId{vshard}, st.nextSeq);
+    // SEED THE RECLAIM FLOOR FROM WHAT WAS ACTUALLY RECOVERED (debt D-34). Mandatory,
+    // not an optimisation: a fresh persistence object knows none of the on-disk records'
+    // seqs, so its "oldest live entry" would be the first entry appended AFTER this
+    // restart -- a much higher seq -- and the floor would jump straight over the
+    // recovered log suffix and release the records it is made of.
+    vs.persistence->seedRetention(std::move(st.retention));
+    // The recovered floor is the starting point for reclamation too, so a node that
+    // restarts over an already-compacted journal can collect on its FIRST pass instead
+    // of waiting for the next compaction.
+    if (const uint64_t floor = vs.persistence->releasedSeq(); floor > 0)
+        retention_.setReleased(VShardId{vshard}, floor);
     vs.sm = std::make_unique<EngineDataStateMachine>(store_, VShardId{vshard});
     raft::RaftNode node(self_, baseVoters, std::move(st.log), st.hardState, opts, baseLearners);
     if (st.snapshot && st.snapshotFromPeer) {
@@ -324,6 +335,100 @@ seastar::future<uint64_t> ReplicatedVShardHost::snapshotVShard(uint16_t vshard) 
 }
 
 // ---------------------------------------------------------------------------
+// Journal segment reclamation (debt D-34)
+// ---------------------------------------------------------------------------
+
+seastar::future<> ReplicatedVShardHost::collectSharedSegments(std::filesystem::path dir, uint64_t activeSegment,
+                                                              JournalGc::Result* out) {
+    *out = co_await JournalGc::collect(std::move(dir), activeSegment, *sharedWriter_, retention_, JournalGc::Options{});
+}
+
+size_t ReplicatedVShardHost::publishReclaimFloors() {
+    size_t advanced = 0;
+    for (const auto& [vs, state] : vshards_) {
+        if (!state.persistence)
+            continue;
+        const uint64_t floor = state.persistence->releasedSeq();
+        // JournalRetention::setReleased is monotonic on its own, but comparing here is
+        // what tells the caller whether anything CHANGED -- which is what decides
+        // whether a collect pass has any work to do at all.
+        if (floor > retention_.released(VShardId{vs})) {
+            retention_.setReleased(VShardId{vs}, floor);
+            ++advanced;
+        }
+    }
+    return advanced;
+}
+
+seastar::future<size_t> ReplicatedVShardHost::reclaimJournalSegments() {
+    // One pass at a time: a pass suspends over file I/O, and two concurrent passes over
+    // the same directory would both plan against the same segment and race the unlink.
+    if (stopped_ || journalGcRunning_)
+        co_return 0;
+    journalGcRunning_ = true;
+    size_t deleted = 0;
+    std::exception_ptr err;
+    try {
+        publishReclaimFloors();
+        ++journalGcPasses_;
+        if (sharedSink_ && sharedWriter_) {
+            // SHARED LAYOUT (debt D-10). ONE directory holding every group on this
+            // reactor, so a segment is reclaimable only once EVERY group's floor has
+            // passed every record in it -- planSegment's rule verbatim -- and a single
+            // laggard would otherwise pin the whole 64 MiB segment for ~1365 groups.
+            // Copy-forward is therefore ON, and it runs inside runExclusive() because
+            // it APPENDS to the same writer every group is group-committing through.
+            const fs::path dir = journalRoot_ / ("shard_" + std::to_string(seastar::this_shard_id()));
+            const uint64_t active = sharedWriter_->currentSegmentNumber();
+            JournalGc::Result result;
+            // A PLAIN lambda returning the future of a NAMED member coroutine -- the
+            // standing rule in this tree. A coroutine lambda here would put its frame's
+            // captures in a closure the helper owns, and `&result` points into THIS
+            // frame, which is what the coroutine writes through.
+            co_await sharedSink_->runExclusive(
+                [this, dir, active, out = &result] { return collectSharedSegments(dir, active, out); });
+            deleted += result.deletedSegments.size();
+            journalSegmentsPinned_ += result.pinnedSegments.size();
+            journalRecordsCopiedForward_ += result.copiedRecords;
+        } else {
+            // PER-VSHARD LAYOUT (the default). Each directory holds exactly one group's
+            // records, so its own floor decides everything and DELETE-ONLY is both
+            // sufficient and the reason no exclusion is needed: nothing here touches the
+            // writer, and a sealed segment strictly below the active one is not
+            // something the writer will ever touch either.
+            //
+            // Visit only the groups whose floor MOVED. Re-scanning ~1365 directories a
+            // minute to re-derive an unchanged answer is the difference between a
+            // background task and a background problem.
+            for (auto& [vs, state] : vshards_) {
+                if (stopped_)
+                    break;
+                if (!state.writer || !state.persistence)
+                    continue;
+                const uint64_t floor = retention_.released(VShardId{vs});
+                if (floor == 0 || floor <= state.lastGcFloor)
+                    continue;
+                const fs::path dir = journalRoot_ / ("vshard_" + std::to_string(vs));
+                auto result = co_await JournalGc::collect(dir, state.writer->currentSegmentNumber(), *state.writer,
+                                                          retention_, JournalGc::Options{.copyForward = false});
+                // Recorded AFTER the pass: a throw leaves it unchanged so the next pass
+                // retries rather than skipping a directory it never finished.
+                state.lastGcFloor = floor;
+                deleted += result.deletedSegments.size();
+                journalSegmentsPinned_ += result.pinnedSegments.size();
+            }
+        }
+    } catch (...) {
+        err = std::current_exception();
+    }
+    journalGcRunning_ = false;
+    journalSegmentsDeleted_ += deleted;
+    if (err)
+        std::rethrow_exception(err);
+    co_return deleted;
+}
+
+// ---------------------------------------------------------------------------
 // The snapshot producer trigger (debt D-6)
 // ---------------------------------------------------------------------------
 
@@ -364,6 +469,22 @@ void ReplicatedVShardHost::startSnapshotTrigger() {
 seastar::future<> ReplicatedVShardHost::snapshotSweep() {
     try {
         co_await maybeSnapshotOnce();
+        // RECLAIM ON THE SNAPSHOT SWEEP'S TIMER, at a slower cadence (debt D-34).
+        // Compaction is what MOVES a floor, so there is nothing to collect that a
+        // snapshot did not cause -- but the collect reads whole sealed segments, so it
+        // gets its own (longer) interval rather than running every 5 s. Failures inside
+        // it are caught here with the snapshot failure: nothing was deleted (the unlink
+        // is the last step of each segment) and the next pass retries.
+        const auto now = seastar::lowres_clock::now();
+        if (lastJournalGc_.time_since_epoch().count() == 0 || now - lastJournalGc_ >= kJournalGcInterval) {
+            lastJournalGc_ = now;
+            const size_t deleted = co_await reclaimJournalSegments();
+            if (deleted > 0)
+                timestar::http_log.info(
+                    "cluster: shard {} reclaimed {} sealed Raft journal segment(s) below the snapshot boundary "
+                    "({} total, {} record(s) copied forward)",
+                    seastar::this_shard_id(), deleted, journalSegmentsDeleted_, journalRecordsCopiedForward_);
+        }
     } catch (const std::exception& e) {
         // (e) A FAILED SNAPSHOT MUST NEVER TAKE THE WRITE PATH WITH IT. Nothing was
         // compacted (compact() is the last step and it either ran or did not), so the group

@@ -366,6 +366,15 @@ seastar::future<> RaftGroup::compact(LogIndex upto, std::string snapshotData) {
     // the full log (no compaction, no loss).
     if (node_.log().snapshotIndex() > before && node_.servableSnapshot().index != kNoIndex) {
         co_await persistence_.persistSnapshot(node_.servableSnapshot(), /*receivedFromPeer=*/false);
+        // RE-PERSIST THE CURRENT HARD STATE (debt D-34). Not redundant, and not for this
+        // group's benefit: it is what lets the journal's segment GC actually reclaim
+        // anything. A HardState record is written only when the term or vote CHANGES, so
+        // a group with stable leadership has exactly ONE, from startup -- and that record
+        // is needed forever, which pins every segment at or after it and makes the
+        // snapshot boundary reclaim nothing at all. One ~40-byte record moves the pin up
+        // to the new boundary. Replaying it is idempotent: same term, same vote, and
+        // recoverRaftState simply overwrites what an earlier identical record set.
+        co_await persistence_.persistHardState(node_.hardState());
         co_await persistence_.sync();
     }
     co_await drainReady();

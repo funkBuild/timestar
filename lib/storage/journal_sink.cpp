@@ -72,6 +72,14 @@ seastar::future<> SharedShardJournal::runRounds() {
     roundLoopRunning_ = false;
 }
 
+seastar::future<> SharedShardJournal::runExclusive(seastar::noncopyable_function<seastar::future<>()> fn) {
+    // Held for the WHOLE of `fn`, not per operation -- see the header. Under the gate
+    // so stop() drains a copy-forward in progress before the writer is closed.
+    auto held = gate_.hold();
+    auto units = co_await seastar::get_units(ioLock_, 1);
+    co_await fn();
+}
+
 seastar::future<> SharedShardJournal::stop() {
     if (!gate_.is_closed())
         co_await gate_.close();

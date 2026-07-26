@@ -12,10 +12,12 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
+#include <seastar/core/sleep.hh>
 #include <seastar/core/when_all.hh>
 #include <seastar/util/file.hh>
 #include <span>
@@ -241,4 +243,60 @@ seastar::future<> testSyncAfterStopFailsClosed() {
 }
 TEST(JournalSinkTest, SyncAfterStopFailsRatherThanHangs) {
     testSyncAfterStopFailsClosed().get();
+}
+
+// ---------------------------------------------------------------------------
+// runExclusive(): the seam segment GC copy-forward runs inside (debt D-34).
+// ---------------------------------------------------------------------------
+//
+// Copy-forward APPENDS relocated records to the very writer every group on the shard is
+// group-committing through, and then barriers. Interleaving that with a round is not a
+// tidiness question: an append landing inside a barrier is written at an offset computed
+// before it existed and then erased from `tail_` as though it had been flushed. So the
+// exclusion must hold for the WHOLE of the copy, not per call -- a round that barriered
+// between two relocated records would report them durable while the source segment is
+// about to be unlinked.
+seastar::future<> testRunExclusiveHoldsOffGroupCommitRounds() {
+    const auto dir = tmpDir("exclusive");
+    JournalWriter w(dir, header(), 1u << 20);
+    co_await w.open();
+    SharedShardJournal sink(w);
+
+    bool insideExclusive = false;
+    bool exclusiveDone = false;
+    bool syncResolved = false;
+    bool syncSawExclusiveRunning = false;
+
+    auto ex = sink.runExclusive([&]() -> seastar::future<> {
+        insideExclusive = true;
+        // Two suspensions, i.e. exactly the shape of a multi-record copy-forward: a
+        // per-call lock would let a round in here.
+        co_await w.append(rec(1, 1, "relocated-a"));
+        co_await seastar::sleep(std::chrono::milliseconds(1));
+        co_await w.append(rec(1, 2, "relocated-b"));
+        co_await w.barrier();
+        exclusiveDone = true;
+        insideExclusive = false;
+    });
+
+    // A group tries to group-commit while the copy is in flight.
+    co_await sink.append(rec(2, 1, "group"));
+    auto s = sink.sync().then([&] {
+        syncResolved = true;
+        syncSawExclusiveRunning = insideExclusive;
+    });
+
+    co_await std::move(ex);
+    EXPECT_TRUE(exclusiveDone);
+    EXPECT_FALSE(syncResolved) << "a group-commit round must not complete while the copy-forward holds the writer";
+    co_await std::move(s);
+    EXPECT_TRUE(syncResolved);
+    EXPECT_FALSE(syncSawExclusiveRunning) << "the round's barrier ran strictly after the exclusive section";
+
+    co_await sink.stop();
+    co_await w.close();
+    fs::remove_all(dir);
+}
+TEST(JournalSinkTest, RunExclusiveHoldsOffGroupCommitRounds) {
+    testRunExclusiveHoldsOffGroupCommitRounds().get();
 }

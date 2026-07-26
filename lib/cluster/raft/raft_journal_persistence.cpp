@@ -83,10 +83,30 @@ JournalRaftPersistence::JournalRaftPersistence(JournalWriter& writer, VShardId v
 JournalRaftPersistence::JournalRaftPersistence(JournalSink& sink, VShardId vshard, uint64_t startSeq)
     : sink_(sink), vshard_(vshard), nextSeq_(startSeq == 0 ? 1 : startSeq) {}
 
+uint64_t JournalRaftPersistence::releasedSeq() const {
+    // Nothing is releasable until a snapshot exists: without one the whole log is
+    // live, and its very first record is the log's own beginning.
+    if (lastSnapshotSeq_ == 0)
+        return 0;
+    uint64_t floor = lastSnapshotSeq_;
+    if (lastHardStateSeq_ != 0)
+        floor = std::min(floor, lastHardStateSeq_);
+    if (!entrySeqs_.empty())
+        floor = std::min(floor, entrySeqs_.front().second);
+    return floor - 1;  // floor >= 1 here (seqs start at 1), so this cannot underflow
+}
+
+void JournalRaftPersistence::seedRetention(JournalRetentionSeed seed) {
+    lastHardStateSeq_ = seed.latestHardStateSeq;
+    lastSnapshotSeq_ = seed.latestSnapshotSeq;
+    entrySeqs_.assign(seed.entrySeqs.begin(), seed.entrySeqs.end());
+}
+
 seastar::future<> JournalRaftPersistence::persistHardState(HardState hs) {
     JournalRecord r;
     r.vshard = vshard_;
     r.vshardSeq = nextSeq_++;
+    lastHardStateSeq_ = r.vshardSeq;  // the newest HardState record pins the floor (D-34)
     r.kind = JournalRecordKind::HardState;
     r.raftTerm = hs.currentTerm;
     r.payload.reserve(8);
@@ -103,6 +123,12 @@ seastar::future<> JournalRaftPersistence::persistEntries(std::vector<LogEntry> e
         r.raftTerm = e.term;
         r.raftIndex = e.index;
         r.payload = e.data;
+        // Mirror what recoverRaftState will rebuild (D-34): a re-append at index I
+        // supersedes every record at or above I, so those records stop pinning the
+        // floor. Keeps entrySeqs_ ascending in BOTH index and seq.
+        while (!entrySeqs_.empty() && entrySeqs_.back().first >= e.index)
+            entrySeqs_.pop_back();
+        entrySeqs_.emplace_back(e.index, r.vshardSeq);
         co_await sink_.append(r);
     }
 }
@@ -111,9 +137,14 @@ seastar::future<> JournalRaftPersistence::persistSnapshot(Snapshot snap, bool re
     JournalRecord r;
     r.vshard = vshard_;
     r.vshardSeq = nextSeq_++;
+    lastSnapshotSeq_ = r.vshardSeq;
     r.kind = JournalRecordKind::Snapshot;
     r.raftTerm = snap.term;
     r.raftIndex = snap.index;
+    // Entries at or below the boundary are compacted away, so their records stop
+    // pinning the reclaim floor (D-34). This is the ONLY thing that ever advances it.
+    while (!entrySeqs_.empty() && entrySeqs_.front().first <= snap.index)
+        entrySeqs_.pop_front();
     r.payload = encodeSnapshotPayload(snap, receivedFromPeer);
     return sink_.append(r);
 }
@@ -134,6 +165,11 @@ RecoveredRaftState recoverRaftState(const std::vector<JournalRecord>& records, V
 
     RecoveredRaftState out;
     std::map<LogIndex, LogEntry> entries;  // ordered by index; a re-append overwrites
+    // Parallel to `entries` in EVERY mutation below: the vshard_seq of the record that
+    // put each surviving entry there. It is what seeds the reclaim floor (D-34), and it
+    // must be derived here rather than guessed later -- a fresh JournalRaftPersistence
+    // has no idea which seqs the records already on disk carry.
+    std::map<LogIndex, uint64_t> entrySeq;
     LogIndex snapIndex = kNoIndex;
     Term snapTerm = kNoTerm;
 
@@ -143,6 +179,7 @@ RecoveredRaftState recoverRaftState(const std::vector<JournalRecord>& records, V
             case JournalRecordKind::HardState:
                 out.hardState.currentTerm = r->raftTerm;
                 out.hardState.votedFor = (r->payload.size() >= 8) ? getU64(r->payload.data()) : kNoNode;
+                out.retention.latestHardStateSeq = r->vshardSeq;
                 break;
             case JournalRecordKind::Data:
             case JournalRecordKind::Config: {
@@ -154,7 +191,9 @@ RecoveredRaftState recoverRaftState(const std::vector<JournalRecord>& records, V
                 // Drop any entries above this index that a prior append left; a
                 // lower-index re-append means the higher suffix was superseded.
                 entries.erase(entries.upper_bound(r->raftIndex), entries.end());
+                entrySeq.erase(entrySeq.upper_bound(r->raftIndex), entrySeq.end());
                 entries[r->raftIndex] = std::move(e);
+                entrySeq[r->raftIndex] = r->vshardSeq;
                 break;
             }
             case JournalRecordKind::Truncation: {
@@ -162,12 +201,14 @@ RecoveredRaftState recoverRaftState(const std::vector<JournalRecord>& records, V
                 if (r->payload.size() >= 8) {
                     const LogIndex from = getU64(r->payload.data());
                     entries.erase(entries.lower_bound(from), entries.end());
+                    entrySeq.erase(entrySeq.lower_bound(from), entrySeq.end());
                 }
                 break;
             }
             case JournalRecordKind::Snapshot: {
                 snapIndex = r->raftIndex;
                 snapTerm = r->raftTerm;
+                out.retention.latestSnapshotSeq = r->vshardSeq;
                 // Decode the full snapshot (config + state-machine data), not just
                 // the header -- the boundary membership and applied state live
                 // only here once their entries are compacted away.
@@ -183,6 +224,7 @@ RecoveredRaftState recoverRaftState(const std::vector<JournalRecord>& records, V
                 }
                 // Entries at or below the snapshot boundary are compacted away.
                 entries.erase(entries.begin(), entries.upper_bound(snapIndex));
+                entrySeq.erase(entrySeq.begin(), entrySeq.upper_bound(snapIndex));
                 break;
             }
             default:
@@ -200,6 +242,9 @@ RecoveredRaftState recoverRaftState(const std::vector<JournalRecord>& records, V
         ordered.push_back(std::move(e));
     if (!ordered.empty())
         out.log.append(std::move(ordered));
+    out.retention.entrySeqs.reserve(entrySeq.size());
+    for (const auto& [idx, seq] : entrySeq)
+        out.retention.entrySeqs.emplace_back(idx, seq);
     return out;
 }
 

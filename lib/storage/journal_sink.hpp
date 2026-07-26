@@ -7,6 +7,7 @@
 #include <seastar/core/future.hh>
 #include <seastar/core/gate.hh>
 #include <seastar/core/semaphore.hh>
+#include <seastar/util/noncopyable_function.hh>
 #include <vector>
 
 namespace timestar {
@@ -124,13 +125,12 @@ private:
 //     shard, not one), and that is the correct direction: a shard that cannot
 //     fdatasync must not ack anything.
 //
-// WHAT THIS CLASS DOES NOT SOLVE. Segment RETENTION. With one journal per shard a
-// sealed segment holds records from many groups and can only be reclaimed once
-// EVERY group's boundary has passed it (or its stragglers are copied forward).
-// `JournalRetention`/`JournalGc` implement exactly that rule and have no caller
-// (debt D-34) -- in either layout, so nothing regresses here, but the shared
-// layout is the one those bricks were written for. See D-10's row in
-// docs/write-scaleout-plan.md.
+// SEGMENT RETENTION IS NOW WIRED, THROUGH runExclusive(). With one journal per shard
+// a sealed segment holds records from many groups and can only be reclaimed once
+// EVERY group's boundary has passed it -- or its stragglers are copied forward, which
+// is a WRITE into the very buffer this contract governs, hence runExclusive() rather
+// than a raw writer reference. `JournalRetention`/`JournalGc` implement the rule and
+// `ReplicatedVShardHost::reclaimJournalSegments` is their caller (debt D-34).
 // ============================================================================
 class SharedShardJournal final : public JournalSink {
 public:
@@ -142,6 +142,27 @@ public:
     // Drain any in-flight round. MUST be awaited before the writer is closed: a
     // round holds a reference to it.
     seastar::future<> stop();
+
+    // Run `fn` with EXCLUSIVE access to the shared writer: no group's append and no
+    // group-commit barrier may interleave with it. This is the only sanctioned way to
+    // touch the writer from outside this class, and it exists for exactly one caller --
+    // segment GC's copy-forward (debt D-34), which appends relocated records and issues
+    // its own barrier directly against the writer.
+    //
+    // WHY IT MUST BE EXCLUSIVE, in the same terms as the contract above: an append that
+    // lands inside a running barrier is written at an offset computed before it existed
+    // and then erased from `tail_` as though it had been flushed, and an append may
+    // ROTATE the segment out from under a barrier. Both are silent record loss on the
+    // durability path. It also has to hold across the WHOLE copy-forward, not per call:
+    // a round that barriered between two relocated records would report those records
+    // durable while the old segment is about to be unlinked.
+    //
+    // `fn` runs UNDER `ioLock_`, so it must not call append()/sync() on this sink (that
+    // would self-deadlock) -- it talks to the writer directly. Waiting groups' sync()
+    // requests queue and are served by the next round, which is the normal back-pressure
+    // shape; keeping `fn` bounded is the caller's job (JournalGc::Options::
+    // maxCopyForwardRecords).
+    seastar::future<> runExclusive(seastar::noncopyable_function<seastar::future<>()> fn);
 
     [[nodiscard]] uint64_t fsyncs() const override { return writer_.fsyncs(); }
     [[nodiscard]] uint64_t syncRequests() const override { return syncRequests_; }

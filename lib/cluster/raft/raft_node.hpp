@@ -182,6 +182,12 @@ public:
     Role role() const { return role_; }
     bool isLeader() const { return role_ == Role::Leader; }
     Term currentTerm() const { return currentTerm_; }
+    // The durable half of this node's state, as it stands right now. A Ready only
+    // carries a hardState when it CHANGED, so this is how a caller re-persists the
+    // current one out of band -- which compaction does, so that a group with stable
+    // leadership is not pinned to the single HardState record it wrote at startup
+    // (debt D-34, JournalRaftPersistence::releasedSeq).
+    HardState hardState() const { return HardState{currentTerm_, votedFor_}; }
     NodeId leader() const { return leaderId_; }
     // A leadership handoff is in flight, which is the OTHER reason propose() refuses
     // (see propose()). A caller that gets a bare `false` needs this to tell "I am not the
