@@ -3,22 +3,27 @@
 # DURABILITY. Same-session A/B: the identical run once with the snapshot trigger OFF and
 # once with it ON, comparing what each reads back.
 #
-# WHY AN A/B AND NOT AN ABSOLUTE BAR. An absolute "every acked point readable" is the right
-# invariant and this gate reports it -- but it is VIOLATED ON THIS BINARY BY A PRE-EXISTING,
-# LOAD-DEPENDENT DEFECT that has nothing to do with snapshots, and measuring it as an
-# absolute would attribute someone else's bug to D-6 (or, worse, hide a real D-6 regression
-# inside the noise). Measured on this box, three configurations:
+# TWO PHASES, AND THE FIRST ONE IS THE FENCE.
 #
-#     load phase + snapshots ON      194 / 194 / 194  of 200 acked
-#     load phase + snapshots OFF     183 / 193 / 199  of 200 acked   <-- WORSE, and no
-#                                                                        snapshot was taken
-#     NO load phase, snapshots OFF   200 / 200 / 200  of 200 acked
+# PHASE 1 (FENCE, hard-asserted): a LIGHT load -- just enough to roll TSM and trigger
+# snapshots -- then 200 acked probes, kill -9, restart, and EVERY ACKED POINT MUST BE
+# READABLE. That is the real invariant, and in this regime it holds, so asserting it is a
+# fence rather than a coin toss.
 #
-# So kill -9 + full log replay is sound on its own; the loss appears only when a heavy write
-# campaign precedes the probes, and the SNAPSHOT run is the better of the two. Filed as
-# debt D-36 -- the prime suspect is restart replay of ~1.5M points tripping
-# `rejectIfIngestBacklogged` inside apply (EngineDataStateMachine's header already warns
-# "do not read this as never fires"), which leaves an entry in the log and un-applied.
+# PHASE 2 (A/B, advisory): the same run under a HEAVY load, once with the trigger off and
+# once on, reported for context. The absolute bar does NOT hold there on this binary,
+# because of a PRE-EXISTING load-dependent defect (debt D-36) that has nothing to do with
+# snapshots -- and its magnitude swings run to run, so asserting the A/B alone would both
+# fail without a regression and pass with one (review F5). Measured across runs:
+#
+#     heavy load + snapshots ON      194-195 of 200 acked
+#     heavy load + snapshots OFF     175-199 of 200 acked   (183/193/199 and 175/175/175
+#                                                            observed on the same binary)
+#     LIGHT load, either way         200 of 200 acked
+#
+# The spread on the control arm is the point: it is wider than any regression this gate
+# would be looking for. Phase 2 is kept because it is the evidence that the loss is not
+# snapshot-related -- the snapshot arm is never the worse one -- not because it is a bar.
 #
 # WHAT D-6 COULD HAVE BROKEN, and what this therefore isolates. A snapshot splits recovery
 # into two halves that must AGREE: everything at or below the compacted boundary comes from
@@ -62,14 +67,21 @@ fi
 # (one of 4096 groups sees very few), and the memory store has to actually ROLL or there is
 # no flushed data to snapshot at all.
 SNAP_ON="${GATE_SNAPSHOT_ENTRIES:-4}"
-SNAP_OFF=100000000  # unreachable at this scale -> the control arm compacts nothing
+# The control arm must disable BOTH halves of the policy (review F6): leaving the 64 MiB
+# byte threshold live would let a busy group snapshot anyway and the "control" would not be
+# one.
+SNAP_OFF=100000000
+SNAP_OFF_BYTES=1099511627776  # 1 TiB, i.e. unreachable
+LIGHT_BATCHES="${GATE_LIGHT_BATCHES:-20}"
+LIGHT_WAL="${GATE_LIGHT_WAL:-262144}"
 WAL_THRESHOLD="${GATE_WAL_THRESHOLD:-2097152}"
 
 trap 'kill_cluster 197' EXIT
 
-# run_arm NAME SNAPSHOT_ENTRIES -> sets ARM_MIN, ARM_READS, ARM_TAKEN, ARM_RECOVERED
+# run_arm NAME SNAPSHOT_ENTRIES BATCHES WAL_THRESHOLD SNAPSHOT_BYTES
+#   -> sets ARM_MIN, ARM_READS, ARM_TAKEN, ARM_RECOVERED, ARM_ACKED, ARM_BACKLOG, ...
 run_arm() {
-    local name="$1" snap="$2"
+    local name="$1" snap="$2" batches="${3:-$BATCHES}" wal="${4:-$WAL_THRESHOLD}" snapbytes="${5:-}"
     kill_cluster 197
     require_ports_free $PORTS
     for i in 1 2 3; do rm -rf "/tmp/tsgate_sd$i"; mkdir -p "/tmp/tsgate_sd$i"; done
@@ -78,7 +90,8 @@ run_arm() {
         env TIMESTAR_DATA_DIR="/tmp/tsgate_sd$1" TIMESTAR_CLUSTER_ENABLED=true TIMESTAR_CLUSTER_PARTITIONED=true \
             TIMESTAR_CLUSTER_REPLICATION_FACTOR=3 TIMESTAR_CLUSTER_NODE_ID=$1 TIMESTAR_CLUSTER_PEERS="$PEERS" \
             TIMESTAR_CLUSTER_SNAPSHOT_ENTRIES="$snap" TIMESTAR_CLUSTER_SNAPSHOT_MIN_INTERVAL_S=2 \
-            TIMESTAR_WAL_SIZE_THRESHOLD="$WAL_THRESHOLD" \
+            ${snapbytes:+TIMESTAR_CLUSTER_SNAPSHOT_BYTES="$snapbytes"} \
+            TIMESTAR_WAL_SIZE_THRESHOLD="$wal" \
             "$BIN" --port $((19709 + $1)) --smp 4 >>"/tmp/tsgate_sd$1/s.log" 2>&1 &
     }
     echo "=== ARM: $name (snapshot entry threshold $snap) ==="
@@ -88,7 +101,7 @@ run_arm() {
 
     # Load, so the snapshot producer has flushed data to compact -- and so the arms share
     # the same (load-dependent) exposure to the pre-existing defect above.
-    "$BENCH" --server-port 19710 -c 4 --batches "$BATCHES" --batch-size 10000 --verify 0 \
+    "$BENCH" --server-port 19710 -c 4 --batches "$batches" --batch-size 10000 --verify 0 \
         --warmup 3 --connections 8 --hosts 500 --racks 2 >/tmp/tsgate_sd_bench.txt 2>&1
     grep -E "Requests:|Throughput" /tmp/tsgate_sd_bench.txt | sed 's/^/    /'
 
@@ -162,41 +175,69 @@ run_arm() {
     return 0
 }
 
-# ---- CONTROL ARM: no compaction at all ----
-run_arm "control, snapshots OFF" "$SNAP_OFF" || gate_exit
+# ---- PHASE 1: THE FENCE ----
+# Light load: enough rollovers to give the producer flushed data to compact, small enough
+# that restart replay does not trip the D-36 confounder. Here the absolute bar HOLDS, so it
+# is asserted.
+run_arm "FENCE, light load, snapshots ON" "$SNAP_ON" "$LIGHT_BATCHES" "$LIGHT_WAL" || gate_exit
+FENCE_MIN=$ARM_MIN; FENCE_READS="$ARM_READS"; FENCE_TAKEN=$ARM_TAKEN; FENCE_ACKED=$ARM_ACKED
+FENCE_RECOVERED=$ARM_RECOVERED
+echo "=== FENCE ==="
+echo "  light load + compaction: readback$FENCE_READS of $FENCE_ACKED acked, $FENCE_TAKEN snapshots taken"
+# ANTI-VACUITY first: without a snapshot taken AND a compacted journal recovered, the fence
+# is just a kill -9 test and says nothing about D-6.
+assert_ge "FENCE: snapshots taken" "$FENCE_TAKEN" 1
+assert_ge "FENCE: VShards recovered from a compacted journal" "$FENCE_RECOVERED" 1
+assert_eq "FENCE: snapshot-recovery refusals" "$ARM_REFUSED" 0
+assert_eq "FENCE: snapshots refused as too large" "$ARM_TOOBIG" 0
+# THE INVARIANT, hard-asserted: ack => durable quorum commit, so every acked point must be
+# readable after the whole cluster is kill -9'd and restarted over compacted journals.
+assert_ge "FENCE: every acked point readable after kill -9 over compacted journals" "$FENCE_MIN" "$FENCE_ACKED"
+assert_le "FENCE: nothing fabricated or double-counted" "$FENCE_MIN" "$PROBES"
+rm -rf /tmp/tsgate_sd1 /tmp/tsgate_sd2 /tmp/tsgate_sd3
+
+# ---- PHASE 2, CONTROL ARM: no compaction at all ----
+run_arm "control, heavy load, snapshots OFF" "$SNAP_OFF" "$BATCHES" "$WAL_THRESHOLD" "$SNAP_OFF_BYTES" || gate_exit
 CTRL_MIN=$ARM_MIN; CTRL_READS="$ARM_READS"; CTRL_TAKEN=$ARM_TAKEN; CTRL_ACKED=$ARM_ACKED
 CTRL_BACKLOG=$ARM_BACKLOG
 assert_eq "control arm took no snapshots (it is the control)" "$CTRL_TAKEN" 0
 
-# ---- SUBJECT ARM: the snapshot producer running ----
-run_arm "subject, snapshots ON" "$SNAP_ON" || gate_exit
+rm -rf /tmp/tsgate_sd1 /tmp/tsgate_sd2 /tmp/tsgate_sd3
+
+# ---- PHASE 2, SUBJECT ARM: the snapshot producer running ----
+run_arm "subject, heavy load, snapshots ON" "$SNAP_ON" || gate_exit
 SUBJ_MIN=$ARM_MIN; SUBJ_READS="$ARM_READS"; SUBJ_TAKEN=$ARM_TAKEN; SUBJ_ACKED=$ARM_ACKED
 
-echo "=== A/B ==="
+echo "=== A/B (advisory -- see the header and debt D-36) ==="
 echo "  control (no compaction):  readback$CTRL_READS of $CTRL_ACKED acked, worst $CTRL_MIN"
 echo "  subject (compacting):     readback$SUBJ_READS of $SUBJ_ACKED acked, worst $SUBJ_MIN," \
      "$SUBJ_TAKEN snapshots taken"
 
-# ANTI-VACUITY: without snapshots and without a compacted journal being RECOVERED, the
-# subject arm is just the control arm and proves nothing about D-6.
+# ANTI-VACUITY for phase 2 as well.
 assert_ge "snapshots taken in the subject arm" "$SUBJ_TAKEN" 1
-assert_ge "VShards recovered from a compacted journal" "$ARM_RECOVERED" 1
+assert_ge "VShards recovered from a compacted journal (subject arm)" "$ARM_RECOVERED" 1
 assert_eq "snapshot-recovery refusals" "$ARM_REFUSED" 0
 assert_eq "snapshots refused as too large" "$ARM_TOOBIG" 0
 
-# THE D-6 ASSERTION: compacting must not cost durability. Every way D-6 could lose data --
-# a boundary above unflushed or unconverted data, a re-installed payload -- makes the
-# subject arm strictly worse than the control.
-assert_ge "acked points readable WITH compaction (>= without, i.e. compaction costs nothing)" \
-    "$SUBJ_MIN" "$CTRL_MIN"
-# Nothing fabricated or double-counted either (a re-installed snapshot would read back ~2x).
+# ADVISORY, NOT ASSERTED (review F5): the control arm's own spread (175-199 across runs on
+# one binary) is wider than any regression this comparison could detect, so asserting it
+# would fail without a regression and pass with one. The FENCE above is what actually holds
+# D-6 to account; this is the evidence that the residual loss is not snapshot-related.
+if [ "$SUBJ_MIN" -ge "$CTRL_MIN" ]; then
+    echo "  ADVISORY: compaction is not the worse arm ($SUBJ_MIN >= $CTRL_MIN), consistent with D-36 being unrelated"
+else
+    echo "  ADVISORY: compaction read back FEWER points this run ($SUBJ_MIN < $CTRL_MIN). One draw is not a verdict --" \
+         "the control arm alone spans 175-199 across runs. Re-run before concluding anything, and check the FENCE."
+fi
+# Still hard-asserted, because it is not noise-shaped: a re-installed snapshot would
+# double-register its TSM files and read back ~2x.
 assert_le "acked points readable WITH compaction (<= sent, nothing fabricated/doubled)" "$SUBJ_MIN" "$PROBES"
 
 # THE ABSOLUTE INVARIANT, reported and NOT asserted -- see the header. It is violated on
 # this binary by a pre-existing, load-dependent defect (D-36) in BOTH arms, and asserting it
 # here would attribute that to D-6.
 if [ "$SUBJ_MIN" -lt "$SUBJ_ACKED" ]; then
-    echo "  ADVISORY (debt D-36, PRE-EXISTING, not a D-6 regression): the absolute bar is not met --" \
+    echo "  ADVISORY (debt D-36, PRE-EXISTING, not a D-6 regression): under HEAVY load the absolute bar is not met --" \
          "$SUBJ_MIN of $SUBJ_ACKED acked points readable with compaction," \
          "$CTRL_MIN of $CTRL_ACKED without it. ack => durable quorum commit means this must be" \
          "$SUBJ_ACKED; the control arm shows it is not snapshot-related. Ingest-backlog log lines:" \

@@ -359,6 +359,12 @@ public:
     size_t getTSMFileCount() const { return tsmFileManager.getSequencedTsmFiles().size(); }
     uint64_t getCompletedCompactions() const { return tsmFileManager.getCompletedCompactions(); }
     size_t getRetainedMemoryStoreCount() const { return walFileManager.retainedMemoryStoreCount(); }
+    // Are there ROLLED-OVER memory stores still awaiting conversion to TSM? THE one
+    // spelling of that predicate (review F7): the cluster snapshot producer needs it to
+    // know whether "the highest revision in TSM" has everything below it (conversions
+    // complete out of order), and re-spelling it as `count > 1` elsewhere invites the two
+    // to drift the moment `memoryStores`' shape changes.
+    bool hasPendingWalConversions() const { return walFileManager.hasPendingConversions(); }
 
     // Read-only view of compaction placement. Exposed so tests can assert that
     // background work actually landed in its scheduling group -- the original

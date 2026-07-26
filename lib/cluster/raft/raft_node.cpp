@@ -420,6 +420,18 @@ void RaftNode::compact(LogIndex upto, std::string snapshotData) {
     snapshot_.term = log_.snapshotTerm();
     snapshot_.config = baseConfig_;
     snapshot_.data = std::move(snapshotData);
+
+    // EVERY IN-FLIGHT TRANSFER IS NOW FEEDING BYTES THAT NO LONGER EXIST (review F3).
+    // `snapshot_.data` was just REPLACED IN PLACE, so a transfer mid-way through the old
+    // payload would continue at its old offset into the NEW one. When the (index, term)
+    // pair also happened to match -- a re-snapshot at the SAME boundary, which a group with
+    // a stalled flush watermark produces on every sweep -- handleInstallSnapshotReply's
+    // "our snapshot moved on" guard does not fire either, so the follower would be handed a
+    // SPLICE of two different snapshots and, if the lengths lined up, would install it as
+    // valid. Dropping the transfers makes the next sendAppend restart cleanly from offset
+    // 0, and the follower's staging is keyed by (index, term) so it discards its partial
+    // the moment a chunk 0 arrives.
+    snapTransfers_.clear();
 }
 
 void RaftNode::seedRecoveredSnapshot(Snapshot snap) {
@@ -596,9 +608,42 @@ void RaftNode::handleInstallSnapshotReply(NodeId from, const InstallSnapshotRepl
             return;  // progress on a transfer we are no longer running: ignore
         SnapshotTransfer& t = it->second;
         t.idleTicks = 0;
-        if (rr.stagedBytes > t.acked) {
-            t.acked = rr.stagedBytes;
+
+        // THE FOLLOWER'S REPORT IS THE TRUTH, INCLUDING WHEN IT GOES BACKWARDS.
+        //
+        // This assignment used to be `if (rr.stagedBytes > t.acked)`, i.e. monotonic, and
+        // that was an IMMORTAL LIVELOCK in exactly the case volatile staging exists for.
+        // A follower that restarts mid-transfer loses its staging while the leader's
+        // SnapshotTransfer survives; the leader sends offset `t.acked` (say 24 MiB), the
+        // follower takes the "chunk from the middle with nothing staged" branch and
+        // answers `stagedBytes = 0` -- which the monotonic guard DISCARDED. The leader kept
+        // its stale `acked`, resent the same offset, and got the same answer forever: one
+        // 4 MiB chunk per round trip, no restart counted, no abandonment, and no other way
+        // for that follower to catch up (its log prefix is gone). Demonstrated at 50 rounds
+        // with the offset pinned and both counters at zero.
+        //
+        // A backwards report is not noise -- it is the follower telling us where it really
+        // is, which is the entire contract of this reply.
+        const bool advanced = rr.stagedBytes > t.acked;
+        t.acked = rr.stagedBytes;
+
+        if (advanced) {
             t.resends = 0;  // real progress clears the stall budget
+        } else {
+            // ANSWERING BUT NOT PROGRESSING. Distinct from silence (which `idleTicks` and
+            // the tick sweep handle) and it needs its own bound, because every reply resets
+            // `idleTicks` and a peer that answers promptly with no progress would otherwise
+            // never be stall-detected at all. Spends the SAME budget as a silent stall, so
+            // one bound governs abandonment however the transfer is failing.
+            ++snapshotTransfersRestarted_;
+            if (++t.resends > opts_.maxSnapshotResends) {
+                // Give up. Nothing to unwind: no nextIndex_ was moved on this transfer's
+                // behalf, so the peer is left exactly as far behind as it truly is and the
+                // next heartbeat starts a fresh transfer from offset 0.
+                ++snapshotTransfersAbandoned_;
+                snapTransfers_.erase(it);
+                return;
+            }
         }
         if (t.index != snapshot_.index || t.term != snapshot_.term) {
             // Our snapshot moved on (a newer compaction) -- stop feeding the old one; the

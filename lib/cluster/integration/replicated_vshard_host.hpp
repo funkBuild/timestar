@@ -183,6 +183,10 @@ public:
     // non-zero means this shard is converting continuously and its logs will stay long --
     // the conservative half of the trade in EngineLocalStore::hasUnconvertedStores.
     uint64_t snapshotsSkippedPendingConversion() const { return snapshotsSkippedPendingConversion_; }
+    // Sweeps that declined because the boundary would not have ADVANCED (the flush
+    // watermark has not moved since the last snapshot). Expected to dominate on a
+    // low-traffic group; it is the cheap no-op arm, not a problem.
+    uint64_t snapshotsSkippedNoAdvance() const { return snapshotsSkippedNoAdvance_; }
     // Sweep passes run, and the highest entries-since-snapshot any group showed on the last
     // pass. Together they answer the FIRST question when logs are not being compacted --
     // "is the sweep running at all, and is anything close to the threshold?" -- which
@@ -237,6 +241,7 @@ private:
     uint64_t snapshotsRefusedTooLarge_ = 0;
     uint64_t snapshotsSkippedUnflushed_ = 0;
     uint64_t snapshotsSkippedPendingConversion_ = 0;
+    uint64_t snapshotsSkippedNoAdvance_ = 0;
     uint64_t snapshotSweeps_ = 0;
     uint64_t snapshotMaxEntriesSinceSeen_ = 0;
 };

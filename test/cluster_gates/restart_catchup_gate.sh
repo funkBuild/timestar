@@ -104,9 +104,10 @@ require_ports_free $PORTS
 for i in 1 2 3; do rm -rf "/tmp/tsgate_cu$i"; mkdir -p "/tmp/tsgate_cu$i"; done
 PEERS="127.0.0.1:49410,127.0.0.1:49411,127.0.0.1:49412"
 # SNAPSHOT_ENTRIES is what forces the producer to run inside a gate-sized campaign (see
-# the header). 32 entries per VShard is reached within the first few dozen batches, and the
-# 5 s min-interval keeps the sweep from re-snapshotting the same group on every pass while
-# still letting all ~1365 groups per shard get a turn.
+# the header for why it has to be this low -- a VShard sees only the batches that touch it,
+# and the busiest of 4096 groups reached 4-5 entries here). The 2 s min-interval keeps the
+# sweep from re-snapshotting one group on every pass while still letting the ~1365 groups
+# per shard get a turn.
 SNAP_ENTRIES="${GATE_SNAPSHOT_ENTRIES:-4}"
 # ... and the memory store must actually ROLL, or there is no flushed data to snapshot at
 # all (see the header: this is what made the first run of this gate report taken=0).

@@ -6,6 +6,9 @@
 // in engine_rf3_test).
 #include "../../../lib/cluster/integration/replica_engine_reader.hpp"
 #include "../../../lib/cluster/integration/replicated_vshard_host.hpp"
+
+#include "../../../lib/cluster/data/snapshot_payload.hpp"
+#include "../../../lib/cluster/raft/raft_journal_persistence.hpp"
 #include "../../../lib/core/placement_table.hpp"  // virtualShard
 #include "../../../lib/core/vshard.hpp"
 #include "../../../lib/http/http_query_handler.hpp"
@@ -760,6 +763,111 @@ TEST_F(ReplicatedVShardHostTest, StopSilencesTheTrigger) {
         // A sweep after stop() must do nothing: it reads Engine files and calls
         // RaftGroup::compact, and both need the registry and store still standing.
         EXPECT_EQ(host.maybeSnapshotOnce().get(), 0u);
+        fs::remove_all(jroot);
+    }).get();
+}
+
+// REVIEW F2, and it is the case that turned a fail-closed refusal into silent loss.
+//
+// `RaftGroup::drainReady` persists AND FSYNCS an incoming Snapshot record BEFORE
+// `sm_.applySnapshot` writes the TSM files -- correct for Raft (durability precedes
+// anything observable) and it means the payload is durable in the JOURNAL and nowhere else
+// until the install finishes. A kill -9 in that window leaves a replica whose log has been
+// truncated to the boundary and whose Engine holds only whichever files landed. If recovery
+// skips the re-install (which is right for a snapshot this node PRODUCED, since it was
+// built from this node's own on-disk files) the replica comes back reporting itself caught
+// up over a hole: it serves replica reads from it, and if elected it builds and serves a
+// SNAPSHOT from it.
+//
+// This drives the exact window: persist a RECEIVED snapshot record, never install it, then
+// recover. The payload must be installed on recovery.
+TEST_F(ReplicatedVShardHostTest, ARecoveredRECEIVEDSnapshotIsReinstalledBecauseItsInstallMayNeverHaveRun) {
+    seastar::async([] {
+        if (!timestar::vshardsCohesiveOnCores(seastar::smp::count))
+            GTEST_SKIP() << "core count is not VShard-cohesive";
+        ScopedShardedEngine eng;
+        eng.start();
+        cluster::EngineLocalStore store(*eng);
+        NoopTransport transport;
+        fs::path jroot = tmpDir();
+        RaftOptions opts;
+        opts.electionTimeoutMin = opts.electionTimeoutMax = 1;
+        opts.heartbeatTimeout = 1;
+
+        const auto series = core0Series("snapf2");
+        const auto sid = SeriesId128::fromSeriesKey(series.key);
+
+        // Build a REAL snapshot payload on a donor host, exactly as a leader would ship it.
+        data::SnapshotPayload payload;
+        {
+            cluster::ReplicatedVShardHost donor(store, transport, /*self=*/1, jroot / "donor");
+            donor.addVShard(series.vshard, {1}, opts).get();
+            RaftGroup* g = donor.group(series.vshard);
+            for (int i = 0; i < 10 && !g->isLeader(); ++i)
+                g->tick().get();
+            ASSERT_TRUE(g->isLeader());
+            commitWrites(donor, g, series.key, series.vshard, 4);
+            flushToTsm(eng);
+            payload = store.buildVShardSnapshot(VShardId{series.vshard}).get();
+            ASSERT_FALSE(payload.files.empty()) << "the donor snapshot must actually carry files";
+            donor.stop().get();
+        }
+
+        // A RECEIVING replica: persist the incoming Snapshot record and CRASH before the
+        // install (i.e. never call applySnapshot). This is precisely what drainReady's
+        // ordering makes reachable.
+        const fs::path recvRoot = jroot / "receiver";
+        raft::Snapshot incoming;
+        incoming.index = 4;
+        incoming.term = 1;
+        incoming.config.voters = {1};
+        incoming.data = data::encodeSnapshotPayload(payload);
+        {
+            fs::path dir = recvRoot / ("vshard_" + std::to_string(series.vshard));
+            fs::create_directories(dir);
+            JournalSegmentHeader hdr;
+            hdr.clusterUuid.fill(0x11);
+            hdr.coreNumber = static_cast<uint16_t>(seastar::this_shard_id());
+            hdr.bootId.fill(0x44);
+            JournalWriter w(dir, hdr, 1u << 20);
+            w.open().get();
+            raft::JournalRaftPersistence p(w, VShardId{series.vshard});
+            p.persistSnapshot(incoming, /*receivedFromPeer=*/true).get();
+            p.sync().get();
+            w.close().get();
+        }
+
+        // Wipe the receiving Engine's view of that data, so "installed" is distinguishable
+        // from "was already there": a fresh Engine has none of the donor's files.
+        cleanTestShardDirectories();
+        ScopedShardedEngine recvEng;
+        recvEng.start();
+        cluster::EngineLocalStore recvStore(*recvEng);
+        {
+            auto pre = (*recvEng)
+                           .invoke_on(0u, [key = series.key, sid](Engine& e) { return e.query(key, sid, 0, UINT64_MAX); })
+                           .get();
+            const size_t n = pre.has_value() ? std::get<QueryResult<double>>(pre.value()).values.size() : 0;
+            ASSERT_EQ(n, 0u) << "the receiving Engine must start with none of the donor's data";
+        }
+
+        cluster::ReplicatedVShardHost receiver(recvStore, transport, /*self=*/1, recvRoot);
+        ASSERT_NO_THROW(receiver.addVShard(series.vshard, {1}, opts).get());
+        RaftGroup* rg = receiver.group(series.vshard);
+        ASSERT_NE(rg, nullptr);
+        EXPECT_EQ(rg->node().log().snapshotIndex(), 4u) << "the boundary must be adopted";
+
+        // THE ASSERTION: the payload was re-installed, so the replica really holds the data
+        // it is about to report itself caught up on. Without the provenance bit this reads
+        // back ZERO while the group claims the boundary -- a hole it would serve from.
+        auto rq = (*recvEng)
+                      .invoke_on(0u, [key = series.key, sid](Engine& e) { return e.query(key, sid, 0, UINT64_MAX); })
+                      .get();
+        ASSERT_TRUE(rq.has_value()) << "a recovered RECEIVED snapshot must have been installed";
+        EXPECT_EQ(std::get<QueryResult<double>>(rq.value()).values.size(), 4u)
+            << "the replica must hold the snapshot's data, not merely its boundary";
+
+        receiver.stop().get();
         fs::remove_all(jroot);
     }).get();
 }

@@ -32,7 +32,7 @@ public:
 
     seastar::future<> persistHardState(HardState hs) override;
     seastar::future<> persistEntries(std::vector<LogEntry> entries) override;
-    seastar::future<> persistSnapshot(Snapshot snap) override;
+    seastar::future<> persistSnapshot(Snapshot snap, bool receivedFromPeer) override;
     seastar::future<> sync() override;
 
     uint64_t nextSeq() const { return nextSeq_; }
@@ -52,6 +52,13 @@ struct RecoveredRaftState {
     // RaftNode's base config (the membership as of the boundary lives ONLY here
     // once its ConfigChange entries are compacted away).
     std::optional<Snapshot> snapshot;
+    // Was that snapshot RECEIVED from a peer rather than produced here? If so the caller
+    // MUST re-install its payload into the state machine before serving anything: the
+    // record is fsync'd before the install, so a crash in between leaves the log truncated
+    // to the boundary and the Engine holding only whichever files landed. See
+    // RaftPersistence::persistSnapshot. Absent/legacy records read as produced-here, which
+    // is the pre-D-6 shape (nothing ever compacted, so none exist in the wild).
+    bool snapshotFromPeer = false;
     uint64_t nextSeq = 1;  // resume point for a new JournalRaftPersistence
 };
 

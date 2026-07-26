@@ -19,7 +19,17 @@ public:
     virtual ~RaftPersistence() = default;
     virtual seastar::future<> persistHardState(HardState hs) = 0;
     virtual seastar::future<> persistEntries(std::vector<LogEntry> entries) = 0;
-    virtual seastar::future<> persistSnapshot(Snapshot snap) = 0;
+    // `receivedFromPeer` records PROVENANCE, and it is a durability contract rather than
+    // bookkeeping (review F2). A snapshot this node PRODUCED was built from its own on-disk
+    // state, so that state survives a crash and recovery need only adopt the boundary. A
+    // snapshot RECEIVED from a peer is durable in this record and NOWHERE ELSE until the
+    // state machine has finished installing it -- and the record is fsync'd BEFORE the
+    // install by design (the Ready contract). A crash in that window leaves a replica whose
+    // log has been truncated to the boundary and whose Engine holds only whichever files
+    // landed, so recovery MUST re-install a received snapshot and MUST NOT re-install a
+    // produced one. The two are byte-identical in shape, so the flag is the only thing that
+    // can tell them apart.
+    virtual seastar::future<> persistSnapshot(Snapshot snap, bool receivedFromPeer) = 0;
     // Make everything appended since the last sync() durable (fsync).
     virtual seastar::future<> sync() = 0;
 };

@@ -3,6 +3,7 @@
 #include "raft_config.hpp"
 
 #include <algorithm>
+#include <cstring>
 #include <map>
 #include <seastar/core/coroutine.hh>
 
@@ -22,9 +23,19 @@ uint64_t getU64(const char* p) {
     return v;
 }
 
-// Snapshot payload: [index u64][term u64][configLen u64][config bytes][data...].
-std::string encodeSnapshotPayload(const Snapshot& s) {
+// Snapshot payload, v2: [magic 8][flags u8][index u64][term u64][configLen u64][config][data]
+// Legacy (pre-provenance): [index u64][term u64][configLen u64][config][data]
+//
+// The magic prefix is what lets the two be told apart, and a prefix rather than a trailer
+// because `data` is the unbounded tail. Legacy records read as produced-here -- the
+// pre-D-6 shape, and there are none in the wild since nothing ever compacted before it.
+constexpr char kSnapshotRecordMagic[8] = {'T', 'S', 'R', 'S', 'N', 'A', 'P', '1'};
+constexpr uint8_t kSnapshotFlagReceivedFromPeer = 0x01;
+
+std::string encodeSnapshotPayload(const Snapshot& s, bool receivedFromPeer) {
     std::string out;
+    out.append(kSnapshotRecordMagic, sizeof(kSnapshotRecordMagic));
+    out.push_back(static_cast<char>(receivedFromPeer ? kSnapshotFlagReceivedFromPeer : 0));
     putU64(out, s.index);
     putU64(out, s.term);
     const std::string cfg = encodeConfig(s.config);
@@ -37,17 +48,30 @@ std::string encodeSnapshotPayload(const Snapshot& s) {
 // Inverse of encodeSnapshotPayload. Returns nullopt on any malformed/truncated
 // payload (fail closed). `index`/`term` are taken from the record header by the
 // caller and cross-checked against the payload.
-std::optional<Snapshot> decodeSnapshotPayload(const std::string& p) {
-    if (p.size() < 24)
+std::optional<Snapshot> decodeSnapshotPayload(const std::string& p, bool* receivedFromPeer) {
+    size_t off = 0;
+    if (receivedFromPeer)
+        *receivedFromPeer = false;
+    if (p.size() >= sizeof(kSnapshotRecordMagic) &&
+        std::memcmp(p.data(), kSnapshotRecordMagic, sizeof(kSnapshotRecordMagic)) == 0) {
+        off = sizeof(kSnapshotRecordMagic);
+        if (p.size() < off + 1)
+            return std::nullopt;
+        const uint8_t flags = static_cast<uint8_t>(p[off]);
+        ++off;
+        if (receivedFromPeer)
+            *receivedFromPeer = (flags & kSnapshotFlagReceivedFromPeer) != 0;
+    }
+    if (p.size() < off + 24)
         return std::nullopt;  // index + term + configLen
     Snapshot s;
-    s.index = getU64(p.data());
-    s.term = getU64(p.data() + 8);
-    const uint64_t cfgLen = getU64(p.data() + 16);
-    if (24 + cfgLen > p.size())
+    s.index = getU64(p.data() + off);
+    s.term = getU64(p.data() + off + 8);
+    const uint64_t cfgLen = getU64(p.data() + off + 16);
+    if (off + 24 + cfgLen > p.size())
         return std::nullopt;
-    s.config = decodeConfig(p.substr(24, cfgLen));
-    s.data = p.substr(24 + cfgLen);
+    s.config = decodeConfig(p.substr(off + 24, cfgLen));
+    s.data = p.substr(off + 24 + cfgLen);
     return s;
 }
 
@@ -80,14 +104,14 @@ seastar::future<> JournalRaftPersistence::persistEntries(std::vector<LogEntry> e
     }
 }
 
-seastar::future<> JournalRaftPersistence::persistSnapshot(Snapshot snap) {
+seastar::future<> JournalRaftPersistence::persistSnapshot(Snapshot snap, bool receivedFromPeer) {
     JournalRecord r;
     r.vshard = vshard_;
     r.vshardSeq = nextSeq_++;
     r.kind = JournalRecordKind::Snapshot;
     r.raftTerm = snap.term;
     r.raftIndex = snap.index;
-    r.payload = encodeSnapshotPayload(snap);
+    r.payload = encodeSnapshotPayload(snap, receivedFromPeer);
     return writer_.append(r);
 }
 
@@ -144,9 +168,11 @@ RecoveredRaftState recoverRaftState(const std::vector<JournalRecord>& records, V
                 // Decode the full snapshot (config + state-machine data), not just
                 // the header -- the boundary membership and applied state live
                 // only here once their entries are compacted away.
-                if (auto snap = decodeSnapshotPayload(r->payload))
+                bool fromPeer = false;
+                if (auto snap = decodeSnapshotPayload(r->payload, &fromPeer)) {
                     out.snapshot = std::move(*snap);
-                else {
+                    out.snapshotFromPeer = fromPeer;
+                } else {
                     Snapshot s;  // fall back to header-only if the payload is bad
                     s.index = snapIndex;
                     s.term = snapTerm;

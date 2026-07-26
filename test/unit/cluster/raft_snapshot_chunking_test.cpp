@@ -143,6 +143,11 @@ std::string payloadOf(size_t bytes) {
     return s;
 }
 
+template <class T>
+const T* payloadIf(const Message& m) {
+    return std::get_if<T>(&m.payload);
+}
+
 // Drain a node's Ready AND advance it -- `ready()` alone leaves the pending messages in
 // place, so a test that only peeks sees the previous round's messages again.
 RaftNode::Ready drain(RaftNode& n) {
@@ -778,6 +783,144 @@ TEST(RaftSnapshotChunkingTest, NothingAdvancesNextIndexOnASendAndAbandonmentIsAN
     ASSERT_EQ(net.installed(3).size(), 1u) << "once the peer is reachable the transfer completes";
     EXPECT_EQ(net.installed(3)[0], payload);
     EXPECT_EQ(net.node(3).commitIndex(), net.node(1).commitIndex());
+}
+
+TEST(RaftSnapshotChunkingTest, AFollowerThatLOSTItsStagingRestartsTheTransferInsteadOfLivelocking) {
+    // REVIEW F1, and it is the case volatile staging exists FOR. A follower that restarts
+    // mid-transfer comes back with nothing staged while the LEADER's SnapshotTransfer
+    // survives. The leader sends its remembered offset, the follower takes the "chunk from
+    // the middle with nothing staged" branch and answers `stagedBytes = 0` -- and the
+    // leader must believe it.
+    //
+    // It used to not: `if (rr.stagedBytes > t.acked)` discarded the backwards report as
+    // non-monotonic, kept the stale offset, and resent it -- while every reply reset
+    // `idleTicks`, so the tick sweep never fired either. One 4 MiB chunk per round trip,
+    // forever, no restart counted, no abandonment, and no other way for that follower to
+    // catch up because its log prefix is gone. An IMMORTAL LIVELOCK on the recovery path.
+    //
+    // This drives the leader by hand rather than through the network harness, because the
+    // point is precisely a follower whose state does NOT match what the leader remembers.
+    RaftOptions o = chunkedOpts(8);
+    o.maxSnapshotResends = 3;
+    RaftNode leader(1, {1, 2, 3}, RaftLog{}, HardState{}, o);
+    leader.campaign();
+    drain(leader);
+    // Give the other two voters' grants so it really becomes leader.
+    for (NodeId v : {2u, 3u}) {
+        RequestVoteReply g;
+        g.term = leader.currentTerm();
+        g.voteGranted = true;
+        leader.step(Message{.to = 1, .from = v, .payload = g});
+    }
+    drain(leader);
+    ASSERT_TRUE(leader.isLeader());
+    // Ack the term-start no-op from BOTH followers, so node 3's nextIndex sits just above
+    // it; then commit three more entries on node 2's ack ALONE, so node 3 falls behind.
+    auto ackAppend = [&](NodeId v, LogIndex match) {
+        AppendEntriesReply a;
+        a.term = leader.currentTerm();
+        a.success = true;
+        a.matchIndex = match;
+        leader.step(Message{.to = 1, .from = v, .payload = a});
+    };
+    ackAppend(2, leader.log().lastIndex());
+    ackAppend(3, leader.log().lastIndex());
+    drain(leader);
+    for (const char* c : {"a", "b", "c"})
+        leader.propose(c);
+    drain(leader);
+    ackAppend(2, leader.log().lastIndex());  // quorum without node 3
+    drain(leader);
+    ASSERT_GE(leader.commitIndex(), 4u);
+
+    // Compact PAST node 3's position, so only a snapshot can catch it up.
+    const std::string payload = payloadOf(40);  // 5 chunks at 8 bytes
+    leader.compact(leader.commitIndex(), payload);
+    ASSERT_GT(leader.log().snapshotIndex(), 1u);
+    const LogIndex boundary = leader.log().snapshotIndex();
+    const Term boundaryTerm = leader.log().snapshotTerm();
+
+    // Start the transfer and walk it forward to a NONZERO offset by acking normally.
+    leader.tick();
+    drain(leader);
+    auto ackProgress = [&](uint64_t staged) {
+        InstallSnapshotReply r;
+        r.term = leader.currentTerm();
+        r.matchIndex = 0;
+        r.pendingSnapshotIndex = boundary;
+        r.stagedBytes = staged;
+        leader.step(Message{.to = 1, .from = 3, .payload = r});
+        return drain(leader);
+    };
+    ackProgress(8);
+    ackProgress(16);
+    RaftNode::Ready rd = ackProgress(24);
+    const InstallSnapshot* sent = nullptr;
+    for (const auto& m : rd.messages)
+        if (m.to == 3 && (sent = payloadIf<InstallSnapshot>(m)))
+            break;
+    ASSERT_NE(sent, nullptr);
+    ASSERT_EQ(sent->offset, 24u) << "the transfer must really be at a nonzero offset";
+    ASSERT_TRUE(leader.snapshotTransferInFlight(3));
+    (void)boundaryTerm;
+
+    // NOW THE FOLLOWER RESTARTS: nothing staged, so it reports zero.
+    rd = ackProgress(0);
+    sent = nullptr;
+    for (const auto& m : rd.messages)
+        if (m.to == 3 && (sent = payloadIf<InstallSnapshot>(m)))
+            break;
+    ASSERT_NE(sent, nullptr);
+    EXPECT_EQ(sent->offset, 0u) << "the leader must RESTART from where the follower says it is, not from its own "
+                                   "stale idea of it -- pinning the offset here is the livelock";
+    EXPECT_EQ(leader.snapshotTransfersRestarted(), 1u) << "a no-progress reply must be COUNTED, not silently absorbed";
+
+    // And a peer that keeps reporting no progress must eventually be ABANDONED rather than
+    // fed one chunk per round trip forever. Every reply resets idleTicks, so the tick sweep
+    // cannot be what catches this -- the no-progress budget has to.
+    for (int i = 0; i < 10 && leader.snapshotTransferInFlight(3); ++i)
+        ackProgress(0);
+    EXPECT_FALSE(leader.snapshotTransferInFlight(3)) << "an answering-but-never-progressing peer must be given up on";
+    EXPECT_GE(leader.snapshotTransfersAbandoned(), 1u);
+    // Abandonment is a no-op on progress, as ever: the peer is left exactly as far behind
+    // as it truly is (it acked the term-start no-op at index 1 and nothing since).
+    EXPECT_LT(leader.matchIndexOf(3), boundary) << "no send may be recorded as replication";
+}
+
+TEST(RaftSnapshotChunkingTest, RecompactingInvalidatesEveryInFlightTransfer) {
+    // REVIEW F3. `compact` REPLACES `snapshot_.data` in place, so a transfer mid-way
+    // through the old payload would continue at its old offset into the new one. At an
+    // UNCHANGED (index, term) -- which a group with a stalled flush watermark produces on
+    // every sweep -- the reply path's "our snapshot moved on" guard does not fire either,
+    // so the follower would be handed a SPLICE of two snapshots and, if the lengths lined
+    // up, would install it as valid.
+    ChunkNet net({1, 2, 3}, chunkedOpts(8));
+    net.node(1).campaign();
+    net.run();
+    ASSERT_TRUE(net.node(1).isLeader());
+    net.isolate(3);
+    net.node(1).propose("x");
+    net.run();
+    net.node(1).compact(net.node(1).commitIndex(), payloadOf(80));
+    net.heal(3);
+    net.tickAll();
+    net.step();
+    ASSERT_TRUE(net.node(1).snapshotTransferInFlight(3));
+
+    // Re-compact at the SAME boundary with DIFFERENT bytes: the transfer must be dropped,
+    // not continued into the new payload.
+    net.node(1).compact(net.node(1).commitIndex(), payloadOf(80));
+    EXPECT_FALSE(net.node(1).snapshotTransferInFlight(3));
+
+    // ... and the follower still ends up with a WHOLE, consistent payload.
+    const std::string finalPayload = payloadOf(96);
+    net.node(1).compact(net.node(1).commitIndex(), finalPayload);
+    for (int round = 0; round < 200 && net.installed(3).empty(); ++round) {
+        net.tickAll();
+        net.run();
+    }
+    ASSERT_EQ(net.installed(3).size(), 1u);
+    EXPECT_EQ(net.installed(3)[0], finalPayload) << "never a splice of two snapshots";
 }
 
 TEST(RaftSnapshotChunkingTest, ASnapshotOverTheTotalBoundIsRefusedWithoutTouchingProgress) {

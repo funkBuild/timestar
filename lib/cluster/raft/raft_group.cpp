@@ -62,7 +62,7 @@ seastar::future<> RaftGroup::drainReady() {
         //    then one sync() -- a single fsync makes the whole Ready durable.
         bool persisted = false;
         if (rd.snapshot) {
-            co_await persistence_.persistSnapshot(*rd.snapshot);
+            co_await persistence_.persistSnapshot(*rd.snapshot, /*receivedFromPeer=*/true);
             persisted = true;
         }
         if (rd.hardState) {
@@ -370,7 +370,7 @@ seastar::future<> RaftGroup::compactLocked(LogIndex upto, std::string snapshotDa
     // AT the boundary (the payload is durable), and a crash before the record recovers with
     // the full log (no compaction, no loss).
     if (node_.log().snapshotIndex() > before && node_.servableSnapshot().index != kNoIndex) {
-        co_await persistence_.persistSnapshot(node_.servableSnapshot());
+        co_await persistence_.persistSnapshot(node_.servableSnapshot(), /*receivedFromPeer=*/false);
         co_await persistence_.sync();
     }
     co_await drainReady();

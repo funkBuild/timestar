@@ -32,9 +32,11 @@ seastar::future<data::SnapshotPayload> EngineLocalStore::buildVShardSnapshot(VSh
 
 seastar::future<bool> EngineLocalStore::hasUnconvertedStores(VShardId vshard) {
     const unsigned core = timestar::assignCore(vshard, seastar::smp::count);
-    // memoryStores[0] is the ACTIVE store; anything beyond it is rolled over and still
-    // awaiting background conversion to TSM. See the header for why compaction must wait.
-    co_return co_await engines_.invoke_on(core, [](Engine& e) { return e.getRetainedMemoryStoreCount() > 1; });
+    // ONE predicate, one spelling (review F7): `WALFileManager::hasPendingConversions` is
+    // the authority on "a rolled store has not reached TSM yet", and re-deriving it from
+    // the retained count here would drift the moment that vector's shape changes. See the
+    // header for why compaction must wait on it.
+    co_return co_await engines_.invoke_on(core, [](Engine& e) { return e.hasPendingWalConversions(); });
 }
 
 seastar::future<bool> EngineLocalStore::installVShardSnapshot(VShardId vshard, data::SnapshotPayload payload) {

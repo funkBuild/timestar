@@ -59,10 +59,36 @@ seastar::future<> ReplicatedVShardHost::addVShard(uint16_t vshard, std::vector<N
     vs.persistence = std::make_unique<raft::JournalRaftPersistence>(*vs.writer, VShardId{vshard}, st.nextSeq);
     vs.sm = std::make_unique<EngineDataStateMachine>(store_, VShardId{vshard});
     raft::RaftNode node(self_, baseVoters, std::move(st.log), st.hardState, opts, baseLearners);
-    if (st.snapshot) {
-        // RECOVERING A COMPACTED JOURNAL (debt D-6). This used to throw outright -- which
-        // was correct while nothing ever compacted, and would have turned the FIRST restart
-        // after D-6 into a fail-closed refusal to start.
+    if (st.snapshot && st.snapshotFromPeer) {
+        // A RECEIVED SNAPSHOT MUST BE RE-INSTALLED (review F2), and this is the case that
+        // turned a fail-closed refusal into silent loss before it was caught.
+        //
+        // `RaftGroup::drainReady` persists AND FSYNCS the incoming Snapshot record BEFORE
+        // `sm_.applySnapshot` writes the TSM files -- correct for Raft (the Ready contract
+        // requires durability before anything observable) and it means the payload is
+        // durable in the JOURNAL and nowhere else until the install finishes. A kill -9 in
+        // that window leaves a replica whose log has been truncated to the boundary and
+        // whose Engine holds only whichever files landed. Skipping the re-install there --
+        // as the produced-snapshot reasoning below would have us do -- makes that replica
+        // report itself caught up, serve replica reads out of a hole, and, if elected,
+        // build and serve a SNAPSHOT out of that hole.
+        //
+        // Re-installing is idempotent: `TSMFileManager::addTSMFile` is keyed by the file's
+        // rank (tier+seq, parsed from the name), so a file `Engine::init` already
+        // registered is not registered twice, and `restoreVShardSnapshot` verifies before
+        // it installs. So this is safe whether the crash landed before, during or after
+        // the original install.
+        timestar::http_log.info(
+            "cluster: VShard {} recovered a RECEIVED snapshot at boundary index {} (term {}); re-installing its "
+            "payload, because a crash between persisting the record and installing the files would otherwise leave "
+            "this replica reporting itself caught up over a hole",
+            vshard, st.snapshot->index, st.snapshot->term);
+        co_await vs.sm->applySnapshot(*st.snapshot);
+        node.seedRecoveredSnapshot(*st.snapshot);
+    } else if (st.snapshot) {
+        // RECOVERING A LOCALLY-PRODUCED SNAPSHOT (debt D-6). This used to throw outright --
+        // which was correct while nothing ever compacted, and would have turned the FIRST
+        // restart after D-6 into a fail-closed refusal to start.
         //
         // THE PAYLOAD IS NOT RE-INSTALLED, and that is deliberate rather than lazy. A
         // VShard snapshot is a manifest plus the bytes of the TSM files it references, and
@@ -159,6 +185,18 @@ seastar::future<uint64_t> ReplicatedVShardHost::snapshotVShard(uint16_t vshard) 
     upto = std::min<uint64_t>(upto, g->appliedIndex());
     if (upto == 0) {
         ++snapshotsSkippedUnflushed_;
+        co_return 0;
+    }
+    // NOTHING TO GAIN, AND SOMETHING TO LOSE, FROM RE-SNAPSHOTTING THE SAME BOUNDARY
+    // (review F3). A group whose flush watermark has not moved since its last snapshot
+    // computes the SAME `upto` on every sweep. Compacting again truncates nothing, but it
+    // does REPLACE `snapshot_.data` in place -- which invalidates any in-flight
+    // InstallSnapshot transfer, and at an unchanged (index, term) it does so without
+    // tripping the reply path's "our snapshot moved on" guard. `RaftNode::compact` now
+    // drops live transfers defensively, but the transfer should not be disturbed at all
+    // for a boundary that is not advancing.
+    if (upto <= static_cast<uint64_t>(g->node().log().snapshotIndex())) {
+        ++snapshotsSkippedNoAdvance_;
         co_return 0;
     }
     std::string encoded = data::encodeSnapshotPayload(std::move(payload));

@@ -23,6 +23,14 @@ using timestar::VShardId;
 
 namespace fs = std::filesystem;
 
+// EXPECT inside a coroutine cannot early-return with ASSERT_*, so guard explicitly.
+#define ASSERT_TRUE_OR_RETURN(cond)   \
+    do {                              \
+        EXPECT_TRUE(cond);            \
+        if (!(cond))                  \
+            co_return;                \
+    } while (0)
+
 namespace {
 
 fs::path tmpDir(const std::string& tag) {
@@ -125,6 +133,43 @@ seastar::future<> testTruncationAndReAppendRecover() {
     fs::remove_all(dir);
 }
 
+// REVIEW F2: PROVENANCE SURVIVES RECOVERY, and it is a durability contract rather than
+// bookkeeping. `drainReady` fsyncs an incoming Snapshot record BEFORE `applySnapshot`
+// writes the TSM files, so a crash in that window leaves the log truncated to the boundary
+// and the Engine holding only whichever files landed. Recovery MUST re-install a RECEIVED
+// snapshot and MUST NOT re-install a produced one -- and the two are byte-identical in
+// shape, so this flag is the only thing that can tell them apart.
+seastar::future<> testSnapshotProvenance() {
+    const auto dir = tmpDir("snapprov");
+    const VShardId vs{12};
+    {
+        JournalWriter w(dir, header(), 1u << 20);
+        co_await w.open();
+        JournalRaftPersistence p(w, vs);
+        Snapshot snap;
+        snap.index = 7;
+        snap.term = 3;
+        snap.config.voters = {1, 2, 3};
+        snap.data = "received-state@7";
+        co_await p.persistSnapshot(snap, /*receivedFromPeer=*/true);
+        co_await p.sync();
+        co_await w.close();
+    }
+    {
+        JournalWriter w(dir, header(), 1u << 20);
+        auto recovered = co_await w.open();
+        RecoveredRaftState st = recoverRaftState(recovered, vs);
+        ASSERT_TRUE_OR_RETURN(st.snapshot.has_value());
+        EXPECT_TRUE(st.snapshotFromPeer) << "a RECEIVED snapshot must recover as received, or the replica comes back "
+                                            "believing it is caught up over whatever files happened to land";
+        EXPECT_EQ(st.snapshot->index, 7u);
+        EXPECT_EQ(st.snapshot->data, "received-state@7");
+        EXPECT_EQ(st.snapshot->config.voters, (std::vector<NodeId>{1, 2, 3}));
+        co_await w.close();
+    }
+    fs::remove_all(dir);
+}
+
 seastar::future<> testSnapshotRecover() {
     const auto dir = tmpDir("snap");
     const VShardId vs{11};
@@ -138,7 +183,7 @@ seastar::future<> testSnapshotRecover() {
         snap.term = 2;
         snap.config.voters = {1, 2, 3};
         snap.data = "state@5";
-        co_await p.persistSnapshot(snap);
+        co_await p.persistSnapshot(snap, /*receivedFromPeer=*/false);
         co_await p.persistEntries({entry(2, 6, "f")});  // entry above the snapshot
         co_await p.sync();
         co_await w.close();
@@ -158,6 +203,7 @@ seastar::future<> testSnapshotRecover() {
             EXPECT_EQ(st.snapshot->config.voters, (std::vector<NodeId>{1, 2, 3}));
             EXPECT_EQ(st.snapshot->data, "state@5");
         }
+        EXPECT_FALSE(st.snapshotFromPeer) << "a locally PRODUCED snapshot must recover as produced";
         auto tail = st.log.entriesFrom(6);
         EXPECT_EQ(tail.size(), 1u);
         if (tail.size() == 1u)
@@ -177,4 +223,7 @@ TEST(RaftJournalPersistenceTest, TruncationAndReAppendRecover) {
 }
 TEST(RaftJournalPersistenceTest, SnapshotRecover) {
     testSnapshotRecover().get();
+}
+TEST(RaftJournalPersistenceTest, SnapshotProvenanceSurvivesRecovery) {
+    testSnapshotProvenance().get();
 }

@@ -83,6 +83,13 @@ TEST(ReplicatedCommandCodec, TruncationAndCorruptionRejected) {
 //   * gate OFF (the fail-closed default, and what every node emits until the cluster has
 //     COMMITTED an activation) => v1 bytes, byte-for-byte what the explicitly-v1 encoder
 //     produces;
+//
+// SCOPE, stated because it is easy to over-read (review F8): these compare against THIS
+// BUILD's `encodeWriteBatch(b, V<n>)`, not against a golden vector. They therefore pin the
+// version CHOICE -- that the gate, and nothing else, decides which encoder the journal
+// path calls -- and NOT the on-wire layout of either version. A change that altered v1's
+// bytes in both the encoder and the journal path would pass these; the layouts are pinned
+// where they belong, in write_record's own round-trip and truncation tests.
 //   * gate ON (simulating an activation) => v2 bytes, byte-for-byte what the
 //     explicitly-v2 encoder produces;
 //   * the command decodes correctly EITHER WAY -- the decoder is unconditionally
