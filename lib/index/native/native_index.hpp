@@ -206,6 +206,17 @@ public:
     size_t getSeriesCountSync() const;
     seastar::future<> compact() override;
 
+    // Number of application-cache keys (postings bitmaps, day bitmaps, HLL
+    // sketches, measurement blooms) dirtied since the last flush, and the bound
+    // the dirty-cache trigger holds it under. Synchronous and O(1) — four set
+    // sizes — so a gauge or a test can read it on the reactor. See the
+    // dirty-cache flush trigger below (write-scaleout debt D-17).
+    size_t dirtyIndexCacheKeys() const;
+    static size_t maxDirtyIndexCacheKeys();
+    // Period of the background dirty-cache flush, i.e. the bound on how long
+    // index-cache state can live only in RAM once no further writes arrive.
+    static std::chrono::milliseconds dirtyIndexCacheFlushInterval();
+
     // Non-virtual: insert indexing (template)
     template <class T>
     seastar::future<SeriesId128> indexInsert(const TimeStarInsert<T>& insert);
@@ -317,6 +328,97 @@ private:
     seastar::future<> flushMemTable();
     seastar::future<> doFlushImmutableMemTable();  // Background flush work
     seastar::future<> waitForFlush();              // Wait for any in-flight flush to complete
+
+    // --- Dirty application-cache flush (write-scaleout debt D-17) ---
+    //
+    // The postings-bitmap / day-bitmap / HLL / measurement-bloom caches are
+    // mutated WITHOUT writing a KV entry (a day-bitmap add for an already-known
+    // series writes nothing to the memtable), yet the only thing that used to
+    // drain them was a memtable threshold crossing plus close()/compact(). So a
+    // workload that dirties caches without memtable pressure — steady state on a
+    // fixed fleet, or a day rollover, which adds real bits to a brand-new day
+    // bitmap while creating no series at all — accumulated dirty state with NO
+    // bound at all. That is two problems at once:
+    //
+    //   * MEMORY. The trims deliberately skip dirty entries (evicting one would
+    //     discard an unpersisted add), so dirty entries are trim-exempt and the
+    //     byte budgets below do not bound them.
+    //   * DURABILITY. Everything outstanding is lost on any non-clean exit, and
+    //     day-bitmap membership has no repair path on open the way postings do
+    //     (the watermark repair rebuilds postings from metadata; the insert
+    //     timestamps a day bitmap needs are gone). That is D-3's residual.
+    //
+    // Two bounds, both routed into the SAME flush body the memtable threshold
+    // uses, so there is exactly one way dirty caches reach disk:
+    //
+    //   * SIZE — checked O(1) on the insert path (`maybeFlushDirtyCaches`),
+    //     which is why the accounting is incremental rather than a scan.
+    //   * AGE — a periodic timer, because the size bound provably cannot fire
+    //     in the steady state that motivated this: a fixed fleet re-touching the
+    //     same day bitmap dirties ONE key forever.
+    //
+    // `flushDirtyCaches()` REQUIRES flushMutex_ to be held: it clears every
+    // `dirty` flag, so it must not interleave with another flush (or with the
+    // memtable swap/WAL rotate), and the batch it builds is the only remaining
+    // copy of those adds until it is applied. `flushDirtyCachesUnderMutex()` is
+    // the entry point for callers that do not already hold it.
+    seastar::future<> flushDirtyCaches();
+    seastar::future<> flushDirtyCachesUnderMutex();
+    // Insert-path check. Deliberately NOT a coroutine: the overwhelmingly common
+    // answer is "nothing to do", and a coroutine would allocate a frame per call
+    // to reach a bare `co_return`.
+    seastar::future<> maybeFlushDirtyCaches();
+    // True when a flush would actually persist something. The timer consults
+    // this rather than flushDirtyCaches()'s own (deliberately looser) guard, so
+    // an idle shard with populated-but-clean caches does not rewrite the local-ID
+    // counter and watermark, and dirty the memtable, once a second forever.
+    bool hasDirtyCacheState() const;
+    // Record a bitmap/day-bitmap cache key ENTERING its dirty set, charging the
+    // bytes its flush will write. Only the clean→dirty transition is charged:
+    // re-dirtying an already-dirty key adds no new work for the next flush.
+    void noteDirtyBitmapKey(std::unordered_set<std::string>& dirtyKeys, const std::string& cacheKey, size_t entryBytes);
+
+    // Estimated bytes the next dirty-cache flush will write. Maintained O(1) at
+    // the dirty-transition sites (see noteDirtyBitmapKey); zeroed by
+    // flushDirtyCaches() once the synchronous serializers have emptied the dirty
+    // sets, so anything a concurrent insert dirties during the bloom rebuild's
+    // suspension re-accumulates through the normal path.
+    //
+    // It does NOT track a bitmap growing in place while already dirty — that
+    // costs a per-add branch on the hottest path in the index and would still be
+    // an estimate. The AGE bound covers it: an in-place-growing bitmap is by
+    // definition being changed, so it is flushed within one interval.
+    size_t dirtyCacheBytes_ = 0;
+    // Resolved once in open(): indexCacheBudgetBytes() reads
+    // seastar::memory::stats(), and this is consulted per insert batch. 0 before
+    // open(), which also disables the byte trigger on an index that has no
+    // caches to dirty yet.
+    size_t maxDirtyCacheBytes_ = 0;
+
+    // ONE TENTH of MAX_BITMAP_CACHE_ENTRIES (and one fifth of
+    // MAX_DAY_BITMAP_CACHE_ENTRIES), so at most ~10-20% of either cache can be
+    // trim-exempt at once and the entry-count trims below keep their meaning.
+    // It is also a sane single write batch: 10K serialized bitmaps is the same
+    // order as one memtable flush, not a stall.
+    static constexpr size_t kMaxDirtyCacheKeys = 10000;
+    // Share of the whole index cache budget that may be dirty, hence
+    // unreclaimable by the trims. 10% is the slice maxHllCacheBytes() already
+    // gets: ~51 MB at the 512 MB budget ceiling, ~1.6 MB at the 16 MB floor.
+    static constexpr size_t kDirtyCacheBudgetPercent = 10;
+    // Charged for a newly dirtied measurement bloom. BloomFilter::build() sizes
+    // from the measurement's distinct tag values, so the real figure ranges from
+    // 8 KB to megabytes; 8 KB is its floor, which keeps the estimate a LOWER
+    // bound on what the flush writes rather than an optimistic guess.
+    static constexpr size_t kDirtyBloomBytesEstimate = 8192;
+    // 10x kWalSyncInterval. The WAL sync flushes a user-space buffer and
+    // fdatasyncs; this serializes every CHANGED bitmap into a batch, so it is
+    // deliberately an order of magnitude coarser. It costs nothing when nothing
+    // changed (hasDirtyCacheState() is four empty-checks), and it is what puts
+    // the day-bitmap loss window — the one with no repair path on open — in the
+    // same league as the WAL's instead of unbounded.
+    static constexpr std::chrono::seconds kDirtyCacheFlushInterval{1};
+    seastar::timer<> dirtyCacheTimer_;
+    seastar::gate dirtyCacheGate_;
 
     // Step 4: Incremental SSTable refresh — only opens new files and closes removed ones.
     seastar::future<> refreshSSTables();
