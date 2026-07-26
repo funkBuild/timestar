@@ -286,20 +286,33 @@ node-kill mid-bench (bounded errors, full catch-up) and kill -9 of the whole clu
     is the row above. Acking earlier would buy ~0.2 ms and cost the
     read-your-writes story (session tokens ride `appliedIndex`), so it is
     closed rather than deferred.
-3d-scope. **What the in-flight bound actually covers, honestly.** `WriteAdmission` is
-    charged in `writeSlicesToOwningShards`, i.e. on the REQUEST shard of the RF>1
-    replicated path only. It does NOT cover:
-    - **peer ingress** (`ShardRaftPlane::proposeBatch{,Hinted}`): a batch forwarded by
-      another node is bounded only by `rpc::resource_limits`, which caps a single frame
-      (~10.67 MiB) and total estimated in-flight RPC memory, not this node's write
-      pipeline. On a 3-node RF=3 cluster ~2/3 of all replication arrives this way, so the
-      majority of write memory is outside the budget;
-    - **RF=1** (`NodeWriteRouter`), which has no bound at all.
-    Extending it to both is deliberately deferred: the ingress side needs the charge to
-    be released on the SERVING shard rather than the owning ones, which is a different
-    accounting shape, and doing it half-way would give a number that looks like a
-    node-wide bound while being a third of one. Until then, read the bound as "what this
-    node ORIGINATES", not "what this node holds".
+3d-scope. **What the in-flight bound actually covers, honestly.** UPDATED by debt D-8:
+    it now covers BOTH doors of the RF>1 replicated write path, as two SEPARATE
+    per-shard budgets (`cluster::AdmissionClass`):
+    - **originated** (`writeSlicesToOwningShards`) — charged on the REQUEST shard, as
+      before;
+    - **peer ingress** (`proposeSlicesToOwningShards{,Hinted}`, reached from
+      `ShardRaftPlane::proposeBatch{,Hinted}`) — charged on the SERVING shard, the one
+      the peer's connection landed on, which is where the decoded batch and the whole
+      fan-out frame live. This is ~2/3 of all replication traffic on a balanced 3-node
+      RF=3 cluster and was previously bounded only by `rpc::resource_limits`, which caps
+      one frame (~10.67 MiB) and total estimated in-flight RPC memory rather than this
+      node's write pipeline.
+    Separate rather than shared on purpose: one counter would let a burst of replication
+    503 a client's own writes on a node coordinating almost nothing, and the reverse, with
+    which side loses decided by arrival order. Separate budgets make each role's headroom
+    a property of that role — at the cost that the node-wide ceiling is now the SUM
+    (2 x 32 MiB x shards by default), which is why the default is documented per class
+    rather than as a node bound.
+    Still NOT covered, and this is the honest remainder:
+    - **RF=1** (`NodeWriteRouter`) has no bound at all;
+    - **Raft's own memory** — the journal append path, the unstable log, and the apply
+      queue behind a committed entry — is downstream of admission and bounded by nothing
+      here. A batch is released from the ingress budget when its propose returns; the
+      entry it created lives on in the log and in every follower's;
+    - **InstallSnapshot** (D-5) and query-side memory, neither of which is a write.
+    So read the bound as "what this node's write PIPELINE holds, per role", not "what this
+    node holds".
 
 3d. **Backpressure**: bounded in-flight bytes per shard on the data plane
     (the Raft send gate `8192` exists; the data plane has none) surfacing as

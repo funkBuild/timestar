@@ -938,6 +938,71 @@ seastar::future<> testLocalFailureDoesNotWake() {
     EXPECT_TRUE(local.wakes.empty());
 }
 
+// ---------------------------------------------------------------------------
+// A PEER THAT IS FULL, not gone (debt D-8). Peer-ingress admission answers the hinted
+// verb with rejects of kind Overloaded rather than throwing, so the coordinator sees the
+// truth: uncommitted, retryable, nobody else to ask.
+class OverloadedTransport : public ScriptedTransport {
+public:
+    unsigned rejectAttempts = 1000;  // "full" for this many calls, then normal
+    unsigned seen = 0;
+    seastar::future<ProposeOutcome> proposeWriteHinted(NodeId to, VShardBatchView view, OptDeadline d) override {
+        if (++seen > rejectAttempts)
+            return ScriptedTransport::proposeWriteHinted(to, view, d);
+        ProposeOutcome out;
+        out.committed = false;
+        for (const auto* g : view)
+            out.rejects.push_back(SliceReject{g->first, timestar::raft::kNoNode, WriteFailure::Overloaded});
+        return seastar::make_ready_future<ProposeOutcome>(std::move(out));
+    }
+};
+
+// A permanently full peer fails the batch CLOSED and retryably -- a 503 the client can
+// pace against -- and it does so on the BASE deadline. Overload is not an election, so it
+// must never buy the 6 s window (debt D-14): holding a batch, and its own in-flight
+// charge, for 6 s against a peer that needs something to DRAIN makes the overload worse.
+seastar::future<> testOverloadedPeerFailsRetryablyOnTheBaseDeadline() {
+    VShardDirectory dir(1, rf3Map(3));
+    WriteBatch batch = manySeries(30);
+    WakeCountingSink local;
+    OverloadedTransport client;
+    NoLeaderResolver leaders;
+    for (uint16_t v : vshardsOf(batch))
+        local.rejectUntilAttempt[v] = 0;  // our own slices commit; only the remote ones are full
+
+    ReplicatedBatchWriteRouter router(dir, local, client, leaders);
+    const auto t0 = std::chrono::steady_clock::now();
+    bool threw = false;
+    try {
+        co_await router.write(std::move(batch));
+    } catch (const RetryableWriteError& e) {
+        threw = true;
+        EXPECT_NE(std::string(e.what()).find("overloaded"), std::string::npos)
+            << "the client must be told what actually happened: " << e.what();
+    }
+    const auto ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    EXPECT_TRUE(threw) << "a permanently full peer must fail the batch closed, never ack or hang";
+    EXPECT_LT(ms, 2500) << "overload was granted the election window (" << ms << " ms)";
+
+    // And it is NOT treated as an unreachable peer: a full node is alive and still leads
+    // its groups, so waking the groups behind it would be pure disturbance.
+    EXPECT_TRUE(local.wakes.empty()) << "an OVERLOADED peer must not have its groups woken";
+}
+
+// The other half: a peer that drains inside the retry budget costs a pause, not an error.
+seastar::future<> testOverloadedPeerThatDrainsIsAbsorbed() {
+    VShardDirectory dir(1, rf3Map(3));
+    WriteBatch batch = manySeries(30);
+    WakeCountingSink local;
+    OverloadedTransport client;
+    client.rejectAttempts = 2;  // full for two calls, then it drains
+    NoLeaderResolver leaders;
+    ReplicatedBatchWriteRouter router(dir, local, client, leaders);
+    co_await router.write(std::move(batch));  // must NOT throw
+    EXPECT_TRUE(local.wakes.empty());
+}
+
 // The pacing table itself: fast while a transfer is plausible, then spanning an election.
 TEST(WriteRetryPacing, ElectionShapedClassesEscalateAfterTheFastRetries) {
     for (auto f : {WriteFailure::NotLeader, WriteFailure::LeaderRefused, WriteFailure::LeadershipLost}) {
@@ -973,6 +1038,13 @@ TEST(ReplicatedBatchWriteRouterTest, LocalFailureDoesNotWake) {
 }
 TEST(ReplicatedBatchWriteRouterTest, RecoveredBlipNeverWakes) {
     testRecoveredBlipNeverWakes().get();
+}
+
+TEST(ReplicatedBatchWriteRouterTest, OverloadedPeerFailsRetryablyOnTheBaseDeadline) {
+    testOverloadedPeerFailsRetryablyOnTheBaseDeadline().get();
+}
+TEST(ReplicatedBatchWriteRouterTest, OverloadedPeerThatDrainsIsAbsorbed) {
+    testOverloadedPeerThatDrainsIsAbsorbed().get();
 }
 
 TEST(ReplicatedBatchWriteRouterTest, TransportErrorRetriesAgainstTheAdvancedMap) {

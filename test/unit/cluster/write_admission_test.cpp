@@ -123,6 +123,50 @@ TEST(WriteAdmissionTest, BoundRejectsRatherThanQueues) {
     EXPECT_EQ(adm.inFlight(), 0u);
 }
 
+// TWO BUDGETS, ONE PER DOOR (debt D-8). What a node ORIGINATES and what a peer pushes at
+// it are bounded separately, so neither role can starve the other: a burst of replication
+// must not 503 a client's own writes on a node that is coordinating almost nothing, and a
+// busy coordinator must not turn away replication it is the LEADER for.
+TEST(WriteAdmissionTest, TheOriginatedAndIngressBudgetsAreIndependent) {
+    auto& orig = cluster::WriteAdmission::local(cluster::AdmissionClass::Originated);
+    auto& ingress = cluster::WriteAdmission::local(cluster::AdmissionClass::PeerIngress);
+    ASSERT_EQ(orig.inFlight(), 0u) << "a previous test leaked a charge";
+    ASSERT_EQ(ingress.inFlight(), 0u);
+    EXPECT_NE(&orig, &ingress) << "one counter for both doors is the starvation shape D-8 rejects";
+
+    const size_t lim = cluster::WriteAdmission::limitBytes(cluster::AdmissionClass::PeerIngress);
+    {
+        // Fill the INGRESS budget completely.
+        cluster::WriteAdmissionGuard full(lim, cluster::AdmissionClass::PeerIngress);
+        EXPECT_EQ(ingress.inFlight(), lim);
+        EXPECT_EQ(orig.inFlight(), 0u) << "an ingress charge must not touch the originated counter";
+
+        bool ingressRejected = false;
+        try {
+            cluster::WriteAdmissionGuard more(lim, cluster::AdmissionClass::PeerIngress);
+        } catch (const data::WriteOverloadedError& e) {
+            ingressRejected = true;
+            EXPECT_NE(std::string(e.what()).find("peer-ingress"), std::string::npos)
+                << "the message must name the door that is full: " << e.what();
+        }
+        EXPECT_TRUE(ingressRejected);
+
+        // ... and a client's own write still goes through on the same shard.
+        EXPECT_NO_THROW({ cluster::WriteAdmissionGuard mine(lim); });
+    }
+    EXPECT_EQ(ingress.inFlight(), 0u) << "the guard must release to the class it charged";
+    EXPECT_EQ(orig.inFlight(), 0u);
+
+    // The mirror image: a full ORIGINATED budget does not stop replication we lead.
+    {
+        cluster::WriteAdmissionGuard full(cluster::WriteAdmission::limitBytes(), cluster::AdmissionClass::Originated);
+        EXPECT_THROW(cluster::WriteAdmissionGuard(cluster::WriteAdmission::limitBytes()), data::WriteOverloadedError);
+        EXPECT_NO_THROW({ cluster::WriteAdmissionGuard peer(1024, cluster::AdmissionClass::PeerIngress); });
+    }
+    EXPECT_EQ(orig.inFlight(), 0u);
+    EXPECT_EQ(ingress.inFlight(), 0u);
+}
+
 // The size estimate the bound is charged in tracks the payload, not the object count.
 TEST(WriteAdmissionTest, ResidentEstimateTracksThePayload) {
     const size_t small = data::approxResidentBytes(floatBatch(1, 10));

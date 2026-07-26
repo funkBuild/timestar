@@ -408,3 +408,89 @@ TEST_F(ShardRaftPlaneTest, UnassignedVShardFailsTheWholeBatchBeforeAnyDispatch) 
         shards.stop().get();
     }).get();
 }
+
+// PEER-INGRESS ADMISSION (debt D-8): the budget that used to cover only what this node
+// ORIGINATES now covers what its peers push at it too -- ~2/3 of replication traffic on a
+// balanced 3-node RF=3 cluster, previously bounded only by rpc::resource_limits.
+//
+// The charge is taken on the SERVING shard (the one the peer's connection landed on),
+// which is where the decoded batch and the whole fan-out frame live. The interesting
+// property is not that it rejects -- it is HOW: on the hinted verb the rejection is
+// REPORTED as per-slice `Overloaded` rejects with no leader hint, not thrown, so the
+// coordinator retries against the pacing table for "something must drain" instead of
+// reading a full node as an unreachable one and waking the Raft groups behind it.
+TEST_F(ShardRaftPlaneTest, PeerIngressIsChargedAndRejectsWithoutWedgingOrDoubleReleasing) {
+    seastar::async([] {
+        seastar::sharded<cluster::ShardRaftPlane> shards;
+        shards.start().get();
+
+        data::WriteBatch batch;
+        for (int i = 0; i < 32; ++i)
+            batch.series.push_back(floatSeries(buildSeriesKey("m", {{"host", "h" + std::to_string(i)}}, "v"), 1.0));
+        const std::set<uint16_t> asked = [&] {
+            std::set<uint16_t> vs;
+            for (const auto& s : batch.series) {
+                data::WriteSeries copy = s;
+                vs.insert(data::vshardOf(copy));
+            }
+            return vs;
+        }();
+
+        auto& ingress = cluster::WriteAdmission::local(cluster::AdmissionClass::PeerIngress);
+        auto& originated = cluster::WriteAdmission::local(cluster::AdmissionClass::Originated);
+        ASSERT_EQ(ingress.inFlight(), 0u) << "a previous test leaked an ingress charge";
+        const size_t lim = cluster::WriteAdmission::limitBytes(cluster::AdmissionClass::PeerIngress);
+        {
+            // Fill the ingress budget on THIS shard, which is the one that will serve.
+            cluster::WriteAdmissionGuard full(lim, cluster::AdmissionClass::PeerIngress);
+
+            data::WriteBatch copy;
+            copy.series = batch.series;
+            data::ProposeOutcome out = cluster::proposeSlicesToOwningShardsHinted(shards, std::move(copy)).get();
+
+            EXPECT_FALSE(out.committed) << "an admission rejection must never ack";
+            EXPECT_TRUE(out.committedVShards.empty()) << "nothing was proposed, so nothing may be crossed off";
+            ASSERT_EQ(out.rejects.size(), asked.size()) << "every asked-about slice must be named uncommitted";
+            for (const auto& r : out.rejects) {
+                EXPECT_EQ(r.kind, data::WriteFailure::Overloaded);
+                EXPECT_TRUE(data::isRetryableWriteFailure(r.kind));
+                EXPECT_FALSE(data::isElectionWaitFailure(r.kind))
+                    << "overload must never buy the 6 s election window (debt D-14)";
+                EXPECT_EQ(r.leaderHint, timestar::raft::kNoNode) << "we may still lead it; there is nowhere better";
+                EXPECT_TRUE(asked.count(r.vshard)) << "a reject for a VShard nobody asked about";
+            }
+            // The rejected batch was NOT charged (all-or-nothing), so the budget still
+            // holds exactly the test's own charge -- no double-charge, no leak.
+            EXPECT_EQ(ingress.inFlight(), lim);
+            EXPECT_EQ(originated.inFlight(), 0u) << "peer ingress must not spend the originated budget";
+        }
+        EXPECT_EQ(ingress.inFlight(), 0u) << "double release would show up here as a saturated-to-zero counter";
+
+        // With the budget free the SAME call gets past admission and fails downstream
+        // instead -- the planes are not started -- which proves the rejection above came
+        // from admission and not from the harness.
+        {
+            data::WriteBatch copy;
+            copy.series = batch.series;
+            data::ProposeOutcome out = cluster::proposeSlicesToOwningShardsHinted(shards, std::move(copy)).get();
+            EXPECT_FALSE(out.committed);
+            ASSERT_FALSE(out.rejects.empty());
+            EXPECT_EQ(out.rejects[0].kind, data::WriteFailure::ShardStopping);
+            EXPECT_EQ(ingress.inFlight(), 0u) << "the charge must be released on the failure path too";
+        }
+
+        // The bool (legacy) verb has no way to say "overloaded", so it THROWS -- which the
+        // coordinator classifies as the retryable Transport class. Still retryable, still
+        // not election-shaped; the hinted path above is the one production uses.
+        {
+            cluster::WriteAdmissionGuard full(lim, cluster::AdmissionClass::PeerIngress);
+            data::WriteBatch copy;
+            copy.series = batch.series;
+            EXPECT_THROW(cluster::proposeSlicesToOwningShards(shards, std::move(copy)).get(),
+                         data::WriteOverloadedError);
+        }
+        EXPECT_EQ(ingress.inFlight(), 0u);
+
+        shards.stop().get();
+    }).get();
+}

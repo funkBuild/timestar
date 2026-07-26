@@ -610,6 +610,22 @@ inline seastar::future<> writeSlicesToOwningShards(seastar::sharded<ShardRaftPla
 // so the caller redirects/retries -- never a silent partial commit.
 inline seastar::future<bool> proposeSlicesToOwningShards(seastar::sharded<ShardRaftPlane>& shards,
                                                          data::WriteBatch batch) {
+    // PEER-INGRESS ADMISSION (debt D-8). Charged on THIS shard -- the one the peer's
+    // connection landed on -- because this frame holds the decoded batch, the slices and
+    // every awaited quorum round, exactly as the originated charge does one door over.
+    // It is its OWN budget, not the originated one: see AdmissionClass.
+    //
+    // NO DOUBLE CHARGE with the originated path. A coordinator's own slices never come
+    // through here -- ReplicatedBatchWriteRouter proposes locally-led groups straight into
+    // the NodeStore (`local_.proposeVShardBatchesHinted`) and only ever RPCs a REMOTE
+    // leader -- so the two doors are disjoint by construction, and a self-slice is charged
+    // once, as originated.
+    //
+    // Rejection throws WriteOverloadedError, which crosses the wire as an exception and
+    // reaches the coordinator as the retryable `Transport` class (see the hinted overload
+    // below, which does better). Retryable either way, and NOT election-shaped either way,
+    // so an overloaded peer can never buy the 6 s election window (debt D-14).
+    WriteAdmissionGuard admission(data::approxResidentBytes(batch), AdmissionClass::PeerIngress);
     // One split, buckets of groups -- same shape as writeSlicesToOwningShards.
     std::map<unsigned, data::VShardBatches> byShard;
     for (auto& g : data::splitByVShard(std::move(batch)))
@@ -649,9 +665,35 @@ inline seastar::future<bool> proposeSlicesToOwningShards(seastar::sharded<ShardR
 // not a fault. Anything else still propagates -- a bug must not be laundered into a retry.
 inline seastar::future<data::ProposeOutcome> proposeSlicesToOwningShardsHinted(seastar::sharded<ShardRaftPlane>& shards,
                                                                                data::WriteBatch batch) {
+    const size_t charge = data::approxResidentBytes(batch);
     std::map<unsigned, data::VShardBatches> byShard;
     for (auto& g : data::splitByVShard(std::move(batch)))
         byShard[shardForVShard(g.first)].push_back(std::move(g));
+
+    // PEER-INGRESS ADMISSION (debt D-8), and on THIS path the rejection is REPORTED
+    // rather than thrown. A thrown exception reaches the coordinator as `Transport` --
+    // retryable and correctly not election-shaped, but ambiguous, and it also marks this
+    // node "unreachable" so the coordinator wakes the Raft groups behind it at give-up
+    // (replicated_write_router.cpp) for a node that is merely busy. A reject list says
+    // exactly what happened: every slice UNCOMMITTED, kind Overloaded, NO leader hint (we
+    // may well still be the leader -- there is nowhere better to send it, only a later
+    // time). The coordinator then paces geometrically and retries here, which is what
+    // "something must drain" wants.
+    //
+    // committed=false with an EMPTY committed set is the honest answer under the
+    // committed-set contract: nothing was proposed, so nothing may be crossed off.
+    std::optional<WriteAdmissionGuard> admission;
+    try {
+        admission.emplace(charge, AdmissionClass::PeerIngress);
+    } catch (const data::WriteOverloadedError&) {
+        data::ProposeOutcome over;
+        over.committed = false;
+        for (const auto& [shard, slice] : byShard)
+            for (const auto& g : slice)
+                over.rejects.push_back(
+                    data::SliceReject{g.first, timestar::raft::kNoNode, data::WriteFailure::Overloaded});
+        co_return over;
+    }
 
     std::vector<seastar::future<data::ProposeOutcome>> pending;
     std::vector<std::vector<uint16_t>> pendingVShards;  // parallel to `pending`
