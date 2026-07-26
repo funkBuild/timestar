@@ -171,7 +171,7 @@ TEST_F(ShardRaftPlaneTest, ProposeOverSocketSplitsAcrossOwningShardsAndFailsClea
             if (k1.empty()) {
                 k1 = key;
                 vs1 = vs;
-            } else if (vs != vs1 && cluster::shardForVShard(vs) != cluster::shardForVShard(vs1)) {
+            } else if (vs != vs1 && cluster::shardForGroup(vs) != cluster::shardForGroup(vs1)) {
                 k2 = key;
                 vs2 = vs;
             }
@@ -211,7 +211,7 @@ TEST_F(ShardRaftPlaneTest, ProposeOverSocketSplitsAcrossOwningShardsAndFailsClea
             opts.heartbeatTimeout = 1;
             for (uint16_t vs : {vs1, vs2})
                 shards
-                    .invoke_on(cluster::shardForVShard(vs),
+                    .invoke_on(cluster::shardForGroup(vs),
                                [vs, opts, self](cluster::ShardRaftPlane& p) { return p.addVShard(vs, {self}, opts); })
                     .get();
             shards
@@ -224,7 +224,7 @@ TEST_F(ShardRaftPlaneTest, ProposeOverSocketSplitsAcrossOwningShardsAndFailsClea
             // Wait for both single-voter groups to elect themselves (timer-driven ticking).
             auto isLeader = [&](uint16_t vs) {
                 return shards
-                    .invoke_on(cluster::shardForVShard(vs),
+                    .invoke_on(cluster::shardForGroup(vs),
                                [vs](cluster::ShardRaftPlane& p) {
                                    auto* g = p.plane().host().group(vs);
                                    return g && g->isLeader();
@@ -303,7 +303,7 @@ TEST_F(ShardRaftPlaneTest, ProposeOverSocketSplitsAcrossOwningShardsAndFailsClea
             // sharded<>::stop() produces transiently, since it stops every shard
             // concurrently -- and route a write there. It must raise a retryable error, not
             // dereference the null plane and crash the node.
-            shards.invoke_on(cluster::shardForVShard(vs2), [](cluster::ShardRaftPlane& p) { return p.stop(); }).get();
+            shards.invoke_on(cluster::shardForGroup(vs2), [](cluster::ShardRaftPlane& p) { return p.stop(); }).get();
 
             // The error must be the RETRYABLE shard-stopping one specifically -- any
             // other runtime_error here (a null deref turned into a generic failure, a

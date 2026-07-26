@@ -16,6 +16,18 @@ using timestar::raft::NodeId;
 struct ControlMap {
     uint64_t epoch = 0;
     std::map<uint16_t, std::vector<NodeId>> placement;
+    // Which Raft GROUP replicates each VShard (ADR 0004's prep step, debt D-11).
+    // SPARSE and normally EMPTY: an absent entry means the identity mapping,
+    // groupId == vshard, which is what every cluster runs today. It exists so a
+    // later N:1 VShard:group consolidation is a rolling migration (the directory
+    // simply starts carrying non-identity entries for the VShards that have moved
+    // into a consolidated group) rather than a backup-and-rebuild -- see
+    // docs/adr/0004-vshard-group-consolidation.md, "Migration path".
+    //
+    // Read it through VShardDirectory::groupOf(), never directly: the empty-means-
+    // identity default is the whole reason this is safe to add now, and a direct
+    // find() at a call site is how that default gets forgotten.
+    std::map<uint16_t, uint16_t> groups;
 
     friend bool operator==(const ControlMap&, const ControlMap&) = default;
 };
@@ -42,6 +54,24 @@ public:
     const ControlMap& current() const { return map_; }
     uint64_t epoch() const { return map_.epoch; }
 
+    // Trailer magic for the optional VShard->group section (debt D-11). The
+    // section is emitted ONLY when a non-identity mapping exists, so an identity
+    // map -- i.e. every map any cluster produces today -- serializes to exactly
+    // the bytes it did before the field existed. That is what makes this change
+    // byte-identical on disk rather than merely compatible.
+    //
+    // FAIL-CLOSED ON UNKNOWN SHAPES: load() rejects ANY trailing bytes it does not
+    // recognise instead of ignoring them, because silently ignoring a group
+    // section is precisely the failure that matters -- a node would route by the
+    // identity while its peers route by the consolidated mapping.
+    //
+    // WHAT THIS DOES *NOT* BUY, stated plainly: a PRE-D-11 binary's load() stops
+    // after the placement entries and ignores trailing bytes, so it cannot be made
+    // to fail closed retroactively. That exposure is zero today (nothing produces
+    // a non-identity map) and it is why ADR 0004 lists a mixed-K handshake refusal
+    // as a prerequisite of consolidation, not of this prep step.
+    static constexpr uint64_t kGroupSectionMagic = 0x4d475343'52475031ull;  // "MGSC" "RGP1"
+
     // Durable serialization so the cache survives restart (route during a cold
     // start before group 0 is reachable).
     std::string serialize() const {
@@ -61,6 +91,14 @@ public:
             put64(reps.size());
             for (NodeId n : reps)
                 put64(n);
+        }
+        if (!map_.groups.empty()) {
+            put64(kGroupSectionMagic);
+            put64(map_.groups.size());
+            for (const auto& [vs, g] : map_.groups) {  // std::map: canonical order
+                put16(vs);
+                put16(g);
+            }
         }
         return out;
     }
@@ -98,6 +136,23 @@ public:
             for (uint64_t j = 0; j < nr; ++j)
                 reps.push_back(get64());
             m.placement[vs] = std::move(reps);
+        }
+        // Optional VShard->group section (debt D-11). Absent == identity mapping.
+        if (p != end) {
+            if (!avail(16))
+                return false;  // a trailer too short to even be one: fail closed
+            if (get64() != kGroupSectionMagic)
+                return false;  // unknown trailing shape: fail closed, never assume identity
+            uint64_t ng = get64();
+            if (ng > static_cast<uint64_t>(end - p) / 4)
+                return false;  // non-wrapping bound
+            for (uint64_t i = 0; i < ng; ++i) {
+                uint16_t vs = get16();
+                uint16_t g = get16();
+                m.groups[vs] = g;
+            }
+            if (p != end)
+                return false;  // bytes past a section we DID understand: still fail closed
         }
         map_ = std::move(m);
         return true;

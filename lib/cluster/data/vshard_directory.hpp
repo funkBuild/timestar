@@ -41,6 +41,34 @@ public:
     }
     NodeId ownerOfSeries(const SeriesId128& id) const { return ownerOf(timestar::virtualShard(id)); }
 
+    // The Raft GROUP that replicates a VShard (ADR 0004's prep step, debt D-11).
+    //
+    // Today this is ALWAYS the identity -- `ControlMap::groups` is empty on every
+    // cluster in existence, so groupOf(v) == v and the whole system is byte- and
+    // behaviour-identical to the version before this accessor existed. It is here
+    // so that a later 1:N VShard:group consolidation needs no data migration: the
+    // control map starts carrying explicit entries for the VShards that have moved
+    // into a consolidated group, and every routing site already asks rather than
+    // assumes. See docs/adr/0004-vshard-group-consolidation.md.
+    //
+    // NOTE the two things this does NOT decide, because conflating them is the
+    // mistake this accessor exists to prevent:
+    //   * WHICH NODES hold the data -- that is `ownerOf`, which stays per VShard
+    //     (placement granularity is the VShard, consolidation or not; under
+    //     consolidation the group's replica set is what constrains it).
+    //   * WHICH ENGINE CORE holds the data -- that is `assignCore(vshard)`, which
+    //     stays per VShard. Only the RAFT GROUP moves to `assignCore(groupOf(v))`.
+    //     The apply path already hops (`EngineLocalStore` invoke_on's the VShard's
+    //     own core), so the two are already decoupled.
+    uint16_t groupOf(uint16_t vshard) const {
+        auto it = map_.groups.find(vshard);
+        return it == map_.groups.end() ? vshard : it->second;
+    }
+
+    // True iff every VShard maps to its own group (the only shape in production
+    // today). Sites that must stay an integer op can assert on this.
+    bool identityGroupMapping() const { return map_.groups.empty(); }
+
     bool isLocal(uint16_t vshard) const { return ownerOf(vshard) == self_; }
     bool isLocalSeries(const SeriesId128& id) const { return ownerOfSeries(id) == self_; }
 

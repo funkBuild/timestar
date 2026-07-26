@@ -356,7 +356,7 @@ seastar::future<> ClusterDataPlane::start(const ClusterConfig& cfg, seastar::sha
         {
             std::map<unsigned, std::vector<std::pair<uint16_t, std::vector<data::NodeId>>>> byShard;
             for (const auto& [vshard, voters] : rt_->localReplicaGroups())
-                byShard[shardForVShard(vshard)].push_back({vshard, voters});
+                byShard[shardOwningVShard(vshard, dir_.get())].push_back({vshard, voters});
             for (auto& [shard, groups] : byShard) {
                 co_await shards_.invoke_on(shard,
                                            [g = std::move(groups), ropts](ShardRaftPlane& p) -> seastar::future<> {
@@ -860,20 +860,20 @@ seastar::future<> ClusterDataPlane::writeFromShard(data::WriteBatch batch) {
 seastar::future<bool> ClusterDataPlane::proposeBatch(data::WriteBatch batch) {
     // A peer forwarded this batch because we lead those VShards. Replicate each
     // slice through the Raft group on its owning shard.
-    return proposeSlicesToOwningShards(shards_, std::move(batch));
+    return proposeSlicesToOwningShards(shards_, std::move(batch), dir_.get());
 }
 
 seastar::future<std::map<uint16_t, data::NodeId>> ClusterDataPlane::gatherLeaders() const {
     std::map<uint16_t, NodeId> leaders;
     auto& shards = const_cast<seastar::sharded<ShardRaftPlane>&>(shards_);
     for (unsigned sh = 0; sh < seastar::smp::count; ++sh) {
-        auto part = co_await shards.invoke_on(sh, [](ShardRaftPlane& p) {
+        auto part = co_await shards.invoke_on(sh, [dirp = dir_.get()](ShardRaftPlane& p) {
             std::map<uint16_t, data::NodeId> out;
             if (!p.ready())
                 return out;
             auto& host = p.plane().host();
             for (uint16_t vs = 0; vs < timestar::VIRTUAL_SHARD_COUNT; ++vs) {
-                if (shardForVShard(vs) != seastar::this_shard_id())
+                if (shardOwningVShard(vs, dirp) != seastar::this_shard_id())
                     continue;
                 // ONLY VShards this node HOSTS (debt D-13). `leaderOf` returns kNoNode
                 // for a group we do not replicate, which reads identically to "hosted,

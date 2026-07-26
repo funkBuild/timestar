@@ -30,6 +30,19 @@ ReplicatedVShardHost::~ReplicatedVShardHost() {
 }
 
 seastar::future<> ReplicatedVShardHost::addVShard(uint16_t vshard, std::vector<NodeId> voters, raft::RaftOptions opts) {
+    // AN IDENTITY-ASSUMING SITE, deliberately left so (debt D-11, ADR 0004). Three
+    // things below are keyed by the VShard id AS a group id:
+    //   * `registry_.addGroup(vshard, ...)` -- the group id the transport peeks and
+    //     the registry maps;
+    //   * the journal directory `vshard_<id>/`;
+    //   * `EngineDataStateMachine(store_, VShardId{vshard})` -- one state machine per
+    //     VShard, where a consolidated group needs one fanning out over its K VShards.
+    // Converting these is not indirection, it is the consolidation itself (a group
+    // gains a member list, its snapshot becomes a manifest of K VShard snapshots, and
+    // its compaction boundary becomes the MIN over them). D-11 converts the ROUTING so
+    // that work is local to this file and the snapshot path; see the ADR's "What
+    // remains before consolidation is possible".
+    //
     // A VShard is hosted at most once: re-adding would open a second JournalWriter on
     // the same dir (two recoverers over one journal) and leak the old writer's fd.
     if (registry_.group(vshard))

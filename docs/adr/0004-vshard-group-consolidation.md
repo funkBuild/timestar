@@ -1,6 +1,10 @@
 # ADR 0004 — VShard : Raft-group consolidation
 
-**Status:** Proposed — design only, NOT implemented (write-scaleout Phase 5c)
+**Status:** Proposed — design only, NOT implemented (write-scaleout Phase 5c).
+**The prep step recommended at the bottom of this ADR — an explicit group id in the
+VShard directory — IS implemented** (debt D-11, batch F). See "Prep step: DONE" below
+for what it converted and what is still identity-assuming. Nothing about the
+recommendation has changed: **do not consolidate now.**
 
 **Parent design:** [Cluster Architecture and Implementation Plan](../clustering.md),
 [Cluster Write Scale-Out Plan](../write-scaleout-plan.md) §4 Phase 5
@@ -202,3 +206,80 @@ placement/movement subsystem was built to provide.
 If the decision goes the other way later, put the explicit group id in the VShard
 directory first. That single field is what makes the difference between a rolling
 migration and a rebuild.
+
+## Prep step: DONE (debt D-11, batch F)
+
+`ControlMap` now carries `std::map<uint16_t,uint16_t> groups` — **sparse, and empty on
+every cluster in existence**. `VShardDirectory::groupOf(v)` reads it and falls back to
+the identity, so today `groupOf(v) == v` and the system is behaviourally and
+byte-for-byte what it was: an identity map emits **no** trailer at all in
+`ControlMapCache::serialize()`, so the persisted control map is unchanged on disk.
+
+### What was converted (asks the directory instead of assuming)
+
+`shardForVShard(v)` — the "which reactor owns this VShard's Raft group" helper — is
+**gone**, split into two functions that cannot be confused:
+
+- `shardForGroup(groupId)` — the genuine integer op. Its one caller that starts from a
+  group id is the transport's raw-deliver hook, where the 2-byte peek off the wire *is*
+  the group id, so it is correct by construction.
+- `shardOwningVShard(vshard, dir)` — `shardForGroup(dir->groupOf(vshard))`. Every site
+  that starts from a VShard goes through it: the write fan-out
+  (`writeSlicesToOwningShards`), both propose fan-outs (`proposeSlicesToOwningShards` and
+  its hinted twin), `leaderReadIndex`, `leaderCommitIndex`, `resolveLeaders`,
+  `ShardRaftPlane::counts`, `ShardRaftPlane::rebalance`, `ClusterDataPlane`'s startup
+  `addVShard` fan-out and its `gatherLeaders` sweep.
+
+The three fan-outs additionally funnel through one `bucketByOwningShard(groups, dir)`
+rather than open-coding the bucket insert, so a mapping is honoured by all of them or
+by none. `ShardRaftPlane` retains the directory pointer (`dir_`) for this; it is the
+same immutable-after-`start()` object the routers already read.
+
+`dir` is nullable and null means the identity — only for the unit tests that exercise
+the shard fan-out with no control map.
+
+### On-disk / on-wire compatibility
+
+The group section is a **trailer** after the placement entries: magic + count + `(u16
+vshard, u16 group)` pairs, emitted only when the mapping is non-identity. `load()`
+**fails closed** on any trailing bytes it does not recognise (short trailer, unknown
+magic, bytes past a section it did understand) and leaves the previously cached map
+untouched, rather than parsing the prefix and silently routing by the identity.
+
+What that does **not** buy, stated plainly: a *pre-D-11* binary's `load()` stops after
+the placement entries and ignores trailing bytes, and cannot be made to fail closed
+retroactively. The exposure is exactly zero today because nothing produces a
+non-identity map — and closing it is the **mixed-K handshake refusal** already listed
+under "Testing" below, which is a prerequisite of consolidation, not of this prep step.
+
+### What remains before consolidation is possible
+
+The prep step converted **routing**. It did not, and could not, convert the places where
+a group id is *structural*. In rough order of cost:
+
+1. **`ReplicatedVShardHost::addVShard` is still 1 VShard = 1 group** — and deliberately
+   so; the file says as much at the call site. Three things there are keyed by the
+   VShard id *as* a group id: `registry_.addGroup(vshard, …)`, the journal directory
+   `vshard_<id>/`, and `EngineDataStateMachine(store_, VShardId{vshard})`. Converting
+   these is not indirection, it *is* consolidation: a group gains a member VShard list
+   and its state machine has to fan out over them.
+2. **Journal key layout.** Every `JournalRecord` is tagged with a VShard and a per-VShard
+   `vshard_seq`, and `recoverRaftState(records, vshard)` filters a record set by VShard.
+   That is exactly right for a *shared* journal (see D-10) but under consolidation the
+   Raft log is per GROUP, so the log records of a group's K VShards interleave in one
+   index space: recovery would filter by `groupOf(record.vshard)` and the per-VShard
+   sequence stops being the log's ordering key. Decide this at the same time as D-10 —
+   the two touch the same records.
+3. **Snapshot boundaries.** `snapshotVShard` builds one VShard's manifest; a group's
+   snapshot is a manifest of K of them, and the group's compaction boundary becomes the
+   **MIN** over its VShards. Today a lagging VShard pins only itself.
+4. **Transport peek.** `raft_rpc_transport` peeks 2 bytes of group id to route an
+   envelope to a reactor. This needs no change *if* the group id stays a `uint16_t` and
+   groups stay ≤ 4096 — but it does mean group ids and VShard ids share a number space,
+   so a mis-set K produces a *valid-looking* id rather than a decode error. That is the
+   concrete shape of the split-brain the mixed-K handshake refusal has to prevent.
+5. **Movement.** `MoveJob` moves a VShard; under consolidation the cheap move is a whole
+   group. See "Movement" above — the recommendation stands: do not build group splitting.
+6. **The balancer** (`ShardRaftPlane::rebalance`) enumerates VShards and asks the host
+   whether it hosts each one. Under consolidation it should enumerate GROUPS; as written
+   it would consider a group K times and count its leadership K times over.
