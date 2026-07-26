@@ -1,10 +1,12 @@
 #include "raft_rpc_transport.hpp"
 
+#include "../../utils/logger.hpp"
 #include "../reconnect_policy.hpp"
 #include "raft_codec.hpp"
 
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <map>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/gate.hh>
@@ -37,6 +39,56 @@ seastar::sstring read(RaftSerializer, Input& in, seastar::rpc::type<seastar::sst
 }
 
 constexpr uint64_t kDeliverVerb = 1;
+
+// Raft message-rate instrumentation (write-scaleout 5-pre / 5a), enabled with
+// TIMESTAR_RAFT_PROFILE=1 alongside the RaftGroup stage profiler. It is the only way to
+// answer "how much of this node's work is heartbeat traffic" -- the stage profiler
+// samples PROPOSALS, and a group that is merely ticking never proposes anything.
+//
+// Counters are shard-local (thread_local) and reported from send()/deliver() on a time
+// bucket, so no timer is needed and a shard that sends nothing prints nothing. The
+// report is per shard: every shard runs its own transport instance.
+struct TransportCounters {
+    uint64_t envelopesSent = 0;  // Raft messages handed to send()
+    uint64_t framesSent = 0;     // RPC calls actually issued (== envelopesSent until 5a)
+    uint64_t bytesSent = 0;      // encoded envelope bytes
+    uint64_t envelopesRecv = 0;  // Raft messages delivered inbound
+    uint64_t framesRecv = 0;     // inbound RPC calls
+    uint64_t dropped = 0;        // no peer / backing off
+    seastar::lowres_clock::time_point windowStart{};
+};
+thread_local TransportCounters g_tx;
+
+bool transportProfileEnabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("TIMESTAR_RAFT_PROFILE");
+        return e && e[0] == '1';
+    }();
+    return on;
+}
+
+// Report at most once per window, and only when something moved.
+void maybeReportTransport() {
+    if (!transportProfileEnabled())
+        return;
+    constexpr auto kWindow = std::chrono::seconds(5);
+    const auto now = seastar::lowres_clock::now();
+    if (g_tx.windowStart == seastar::lowres_clock::time_point{}) {
+        g_tx.windowStart = now;
+        return;
+    }
+    if (now - g_tx.windowStart < kWindow)
+        return;
+    const double secs = std::chrono::duration<double>(now - g_tx.windowStart).count();
+    timestar::timestar_log.info(
+        "[RAFT_MSGRATE] shard={} window={:.1f}s out_env/s={:.0f} out_frames/s={:.0f} "
+        "env_per_frame={:.2f} out_MB/s={:.2f} in_env/s={:.0f} in_frames/s={:.0f} dropped/s={:.0f}",
+        seastar::this_shard_id(), secs, g_tx.envelopesSent / secs, g_tx.framesSent / secs,
+        g_tx.framesSent ? static_cast<double>(g_tx.envelopesSent) / static_cast<double>(g_tx.framesSent) : 0.0,
+        g_tx.bytesSent / secs / 1e6, g_tx.envelopesRecv / secs, g_tx.framesRecv / secs, g_tx.dropped / secs);
+    g_tx = TransportCounters{};
+    g_tx.windowStart = now;
+}
 
 // How long to wait before re-attempting a peer connection that failed. seastar's
 // rpc::client never reconnects itself, so we recreate it -- but a node runs
@@ -148,6 +200,11 @@ seastar::future<> RaftRpcTransport::start(seastar::socket_address local, Deliver
             // 100s of KB) AppendEntries payload is decoded on the shard that owns
             // the group rather than on this single listening shard. groupId is the
             // first field encodeEnvelope writes: u16, little-endian, at offset 0.
+            if (transportProfileEnabled()) {
+                ++g_tx.framesRecv;
+                ++g_tx.envelopesRecv;
+                maybeReportTransport();
+            }
             if (impl_->onDeliverRaw) {
                 if (data.size() < 2)
                     co_return seastar::rpc::no_wait;
@@ -222,11 +279,20 @@ seastar::future<> RaftRpcTransport::send(Envelope env) {
     if (impl_->stopping || impl_->gate.is_closed())
         return seastar::make_ready_future<>();
     auto* conn = impl_->clientFor(env.message.to);
-    if (!conn)
+    if (!conn) {
+        if (transportProfileEnabled())
+            ++g_tx.dropped;
         return seastar::make_ready_future<>();  // unknown peer: drop (Raft retries)
+    }
 
     std::string bytes = encodeEnvelope(env);
     seastar::sstring data(bytes.data(), bytes.size());
+    if (transportProfileEnabled()) {
+        ++g_tx.envelopesSent;
+        ++g_tx.framesSent;
+        g_tx.bytesSent += data.size();
+        maybeReportTransport();
+    }
 
     // Fire-and-forget: run the RPC in the background under the gate so the Ready
     // loop is never blocked on the network. Transport errors are swallowed -- a
