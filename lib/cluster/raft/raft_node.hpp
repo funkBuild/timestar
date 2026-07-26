@@ -6,6 +6,7 @@
 #include "raft_types.hpp"
 
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <optional>
 #include <random>
@@ -156,6 +157,29 @@ public:
         return it == matchIndex_.end() ? kNoIndex : it->second;
     }
 
+    // Ticks since `peer` last REPLIED to us in this leadership term (any
+    // AppendEntries or InstallSnapshot reply, success or reject -- a reply is a
+    // liveness proof regardless of what it says). `kNeverAcked` if it has not
+    // replied since we won the term, or if it is not a member. Meaningful only on
+    // the leader; reset on every role change.
+    //
+    // Exists because matchIndex ALONE cannot tell a dead peer from a caught-up one
+    // on a write-idle group: a peer that dies while caught up keeps matchIndex ==
+    // lastIndex forever, since lastIndex stops moving too. The leadership balancer
+    // needs a signal that decays on its own, and the heartbeat already provides one
+    // -- a live peer answers `bcastAppend` every `heartbeatTimeout` ticks whether or
+    // not there is anything to replicate. See ShardRaftPlane::rebalance.
+    static constexpr uint64_t kNeverAcked = std::numeric_limits<uint64_t>::max();
+    uint64_t ticksSinceAck(NodeId peer) const {
+        auto it = lastAckTick_.find(peer);
+        return it == lastAckTick_.end() ? kNeverAcked : tick_ - it->second;
+    }
+
+    // The configured leader heartbeat interval, in ticks. Exposed so a caller can
+    // scale a staleness bound to the group's real cadence rather than hard-coding a
+    // tick count that silently changes meaning when the tick period does.
+    unsigned heartbeatTimeout() const { return opts_.heartbeatTimeout; }
+
     // Propose a §6 membership change to the given target voters/learners. The
     // leader enters a joint configuration (Cold,new) immediately, and once that
     // commits it auto-appends the final Cnew. false if not the leader or a change
@@ -229,6 +253,12 @@ private:
     std::map<NodeId, LogIndex> matchIndex_;  // highest index known replicated on the peer
     // CheckQuorum: voters we have heard from since the last quorum check.
     std::set<NodeId> recentActive_;
+    // Monotonic tick counter, and the tick at which each peer last replied to us as
+    // leader. O(1) per tick (one increment) rather than a per-peer sweep -- at 4096
+    // groups per shard ticking every 20 ms, a per-peer bump per tick is not free.
+    // See ticksSinceAck().
+    uint64_t tick_ = 0;
+    std::map<NodeId, uint64_t> lastAckTick_;
     NodeId leadTransferee_ = kNoNode;  // in-flight leader-transfer target (0 = none)
     // Ticks since the in-flight transfer began. A transfer to a target that never
     // finishes catching up must be ABANDONED (§3.10): while `leadTransferee_` is set the

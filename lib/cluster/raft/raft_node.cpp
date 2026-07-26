@@ -162,6 +162,7 @@ void RaftNode::becomeFollower(Term term, NodeId leader) {
     nextIndex_.clear();
     matchIndex_.clear();
     recentActive_.clear();
+    lastAckTick_.clear();  // liveness is per-term; see ticksSinceAck()
     leadTransferee_ = kNoNode;
     pendingReads_.clear();  // drop unconfirmed reads; the caller retries at the new leader
     ackedReadSeq_.clear();
@@ -218,6 +219,11 @@ void RaftNode::becomeLeader() {
     // learners): optimistically probe from our log end.
     nextIndex_.clear();
     matchIndex_.clear();
+    // Deliberately NOT seeded: a brand-new leader has heard from nobody, so every
+    // peer reads as kNeverAcked until it answers our first heartbeat (one
+    // heartbeatTimeout away). That errs toward "not live", which is the safe
+    // direction for every consumer -- the balancer simply skips a pass.
+    lastAckTick_.clear();
     for (NodeId peer : replicationPeers(config_, id_)) {
         nextIndex_[peer] = log_.lastIndex() + 1;
         matchIndex_[peer] = kNoIndex;
@@ -372,6 +378,7 @@ void RaftNode::handleInstallSnapshot(NodeId from, const InstallSnapshot& is) {
 void RaftNode::handleInstallSnapshotReply(NodeId from, const InstallSnapshotReply& rr) {
     if (role_ != Role::Leader || !(isVoter(from) || isLearner(from)))
         return;
+    lastAckTick_[from] = tick_;  // any reply is a liveness proof; see ticksSinceAck()
     if (rr.matchIndex > matchIndex_[from])
         matchIndex_[from] = rr.matchIndex;
     nextIndex_[from] = std::max(nextIndex_[from], matchIndex_[from] + 1);
@@ -396,6 +403,10 @@ void RaftNode::handleAppendEntriesReply(NodeId from, const AppendEntriesReply& r
     // count toward commit, which maybeAdvanceCommitAsLeader enforces separately.
     if (role_ != Role::Leader || !(isVoter(from) || isLearner(from)))
         return;
+
+    // Liveness, independent of what the reply SAYS: a rejected append still proves
+    // the peer is up and reachable. See ticksSinceAck().
+    lastAckTick_[from] = tick_;
 
     // ReadIndex: record the highest readSeq this voter has echoed, then re-check
     // whether any pending read is now quorum-confirmed.
@@ -568,6 +579,7 @@ void RaftNode::checkQuorumOrStepDown() {
 }
 
 void RaftNode::tick() {
+    ++tick_;  // monotonic clock behind ticksSinceAck(); see raft_node.hpp
     if (role_ == Role::Leader) {
         // ABANDON A STUCK LEADER TRANSFER (§3.10). While `leadTransferee_` is set the
         // leader refuses EVERY proposal (see propose()), which is correct for a handoff

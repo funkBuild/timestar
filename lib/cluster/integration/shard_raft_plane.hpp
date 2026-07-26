@@ -316,7 +316,52 @@ public:
             // balancer pass is still an outage, and a caught-up target is also the only
             // one that transfers IMMEDIATELY (transferLeadership sends TimeoutNow at
             // once rather than waiting on a catch-up round trip).
-            if (g->matchIndexOf(target) < g->node().log().lastIndex()) {
+            //
+            // THE GUARD USED TO BE EXACT EQUALITY (matchIndex == lastIndex) and that made
+            // the balancer LOAD-DEPENDENT (debt D-1). On a group taking writes, matchIndex
+            // trails lastIndex by whatever is in flight essentially all of the time -- the
+            // leader appends locally, then replicates -- so a perfectly healthy peer failed
+            // the test on nearly every pass. The balancer converged when the cluster was
+            // quiet and could only move COLD groups when it was busy, which is exactly
+            // backwards: hot groups are the ones whose leadership placement matters.
+            //
+            // Two independent gates replace it, and BOTH must hold:
+            //
+            //   1. LAG BOUND -- within kMaxTransferLagEntries of our log end. This is the
+            //      "the handoff will complete promptly" half. 64 entries is about one
+            //      AppendEntries round trip of in-flight work at this batch size, so a
+            //      peer keeping up passes continuously while one genuinely behind (a
+            //      restarted node still streaming its backlog) does not. TimeoutNow then
+            //      fires on the very next ack rather than after a catch-up campaign.
+            //
+            //   2. LIVENESS -- replied within kMaxTransferAckStaleTicks. This is the
+            //      "the target is actually there" half, and it is the one a pure lag bound
+            //      CANNOT provide. On an IDLE group a dead peer sits at lag ZERO forever:
+            //      it was caught up when it died and lastIndex never moves again, so it
+            //      passes any delta check, including the old exact-equality one. (That
+            //      hole is therefore not new here -- it is pre-existing, and this closes
+            //      it.) The heartbeat gives an independent decaying signal: the leader
+            //      bcastAppends every heartbeatTimeout ticks whether or not there is
+            //      anything to send, and a live peer answers. Three missed heartbeat
+            //      rounds is the bound -- comfortably above one round plus jitter and RTT,
+            //      and comfortably BELOW electionTimeoutMin (125 ticks at the production
+            //      25-tick heartbeat), so a peer this test calls dead has already missed
+            //      enough rounds that the group would be re-electing if it were the leader.
+            //
+            // Residual exposure, bounded and deliberate: a peer that dies between its last
+            // ack and this pass can still be targeted for up to kMaxTransferAckStaleTicks.
+            // That costs the group its proposals for ONE election timeout, after which
+            // RaftNode::tick abandons the transfer (§3.10) and writes resume; the peer then
+            // reads stale on every later pass and is skipped. One bounded window on the
+            // pass that races the death, not a window per pass forever -- which is what
+            // the abandon fix alone left on the table.
+            constexpr raft::LogIndex kMaxTransferLagEntries = 64;
+            const auto lastIdx = g->node().log().lastIndex();
+            const auto match = g->matchIndexOf(target);
+            const bool caughtUp = match >= lastIdx || (lastIdx - match) <= kMaxTransferLagEntries;
+            const uint64_t kMaxTransferAckStaleTicks = 3ULL * g->heartbeatTimeout();
+            const bool live = g->ticksSinceAck(target) <= kMaxTransferAckStaleTicks;
+            if (!caughtUp || !live) {
                 ++ti;
                 continue;
             }

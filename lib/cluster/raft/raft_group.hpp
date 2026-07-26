@@ -110,6 +110,10 @@ public:
     LogIndex commitIndex() const { return node_.commitIndex(); }
     // Highest index this leader knows replicated on `peer` (M5 move catchUp signal).
     LogIndex matchIndexOf(NodeId peer) const { return node_.matchIndexOf(peer); }
+    // Ticks since `peer` last replied to us in this term (RaftNode::kNeverAcked if
+    // never). The balancer's liveness gate; see ShardRaftPlane::rebalance.
+    uint64_t ticksSinceAck(NodeId peer) const { return node_.ticksSinceAck(peer); }
+    unsigned heartbeatTimeout() const { return node_.heartbeatTimeout(); }
     const RaftNode& node() const { return node_; }
 
 private:
