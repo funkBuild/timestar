@@ -9,6 +9,7 @@ not probes, so they can be run from CI or a release checklist.
 | `deposed_primary_gate.sh` | a write to a VShard whose PLACEMENT PRIMARY is alive but no longer leader is answered with a retryable 503 at worst and NEVER an opaque 500 (write-scaleout 3a/3b) |
 | `rolling_rebalance_gate.sh` | a leadership rebalance under sustained writes costs latency, not client errors |
 | `backpressure_gate.sh` | the per-shard in-flight write bound degrades to 503 + `Retry-After`, never to 500s or timeouts, and the DEFAULT budget never gets in the way |
+| `fault_injection_gate.sh` | a BURST of TCP connection resets between two live nodes costs latency, not client errors, and loses/duplicates nothing (write-scaleout 4c) |
 
 All three take an optional server binary as `$1` (default
 `build/bin/timestar_http_server`), so a "before" binary can be measured the same way.
@@ -42,3 +43,54 @@ opaque HTTP 500s; it now produces zero 500s and a small number of honest 503s.
 only sheds leadership a node holds ABOVE its fair share, so storming an already-balanced
 cluster initiates **zero** transfers and proves nothing. The script asserts on
 `transfers_initiated` for exactly that reason.
+
+## `fault_injection_gate.sh` — injecting [D6] rather than waiting for it
+
+Phases 1-3 could only observe the write-collapse window statistically ("2 of 6 runs took
+a 2-3 error burst"). This gate produces the fault on demand.
+
+**The fault is a RESET, not a kill, and the distinction is the whole point.** A killed
+node refuses connections, so reconnects fail and the write *should* eventually fail
+closed — that is the node-kill round, and it is a different property. [D6] is the other
+one: the peer is **healthy and its listener is open**, but an established connection
+dies. seastar's `rpc::client` never re-dials, so `DataPlaneRpc` must notice and replace
+it, and the write retry must OUTLIVE the 200 ms reconnect backoff it does that behind.
+Pre-4a it did not — six attempts 20 ms apart all fit inside one backoff window, so every
+attempt fast-failed on the same dead socket and the client got a 5xx.
+
+`tcp_reset_proxy.py` carries one peer's traffic and, on `SIGUSR1`, destroys every
+connection it holds with a real **RST** (`SO_LINGER {1,0}`), not a FIN — a clean shutdown
+is the easy case. Its listening socket stays open throughout, so a reconnect succeeds
+immediately; only established connections die.
+
+**Topology.** Nodes 1 and 2 are told node 3 lives at `127.0.0.2` (the proxy); node 3 is
+told it lives at `127.0.0.1`, where it binds. Same node ids, same placement, same
+replication — only the address nodes 1 and 2 *dial* differs. That asymmetry is the only
+way to put a proxy in front of a peer whose HTTP/data/Raft ports are a fixed offset apart
+and whose own bind address comes from the same list. Only the data-plane and Raft ports
+are proxied: node 3's HTTP listener binds `0.0.0.0`, so a proxy on `127.0.0.2:<http>`
+collides with it and node 3 exits on the failed bind (the first version of this gate did
+exactly that). The cluster planes only ever dial `port+1000` / `port+2000`.
+
+**Three anti-vacuity assertions**, each of which a real earlier run of this gate failed:
+
+1. `reset rounds` and `connections destroyed` must both be non-trivial. The first version
+   gated the resetter on the bench still running, and the bench finished in under a
+   second, so the storm never fired and every "0 errors" assertion passed vacuously. The
+   bench, the resetter and the probe now run decoupled.
+2. Node 3 must LEAD at least 800 VShards. The first node to start wins every election, and
+   a converged-but-skewed cluster left node 3 leading 128 of 4096 — 3% of traffic crossing
+   the fault. The gate rebalances and waits for fair share first.
+3. The baseline run through the proxy must itself be error-free, so a proxy bug cannot be
+   read as a server property.
+
+**The proxy is a handicap and the gate says so.** Absolute throughput through a Python
+forwarder is not a server number, so the dip is asserted against a QUIET baseline measured
+through the same proxy — not against an unproxied figure. (In practice the handicap is
+small: 4.96 M pts/s baseline vs 5.0-5.1 M unproxied.)
+
+**Result on the Phase-4 binary:** 147 reset rounds destroying 392 peer connections
+mid-bench → **2000/2000 bench requests OK, 200/200 probe writes OK, 0 HTTP errors, 0
+server-side 500s, 0 crashes**; throughput 4.68 M vs a 4.96 M baseline (**94% retained**);
+all 200 acked probe points readable **on every node**. The cost lands exactly where 4a
+intends it to — p99 batch latency 121 ms → 175 ms, max 170 ms → 346 ms.
