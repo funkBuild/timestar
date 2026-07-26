@@ -2075,6 +2075,14 @@ seastar::future<bool> HttpWriteHandler::processBatchWrites(const json_value_t::a
         } catch (const timestar::data::WriteFrameTooLargeError&) {
             if (!clusterError)
                 clusterError = std::current_exception();
+        } catch (const timestar::raft::ProposalTooLargeError&) {
+            // Same shape as the frame case one line up, from the other producer: the
+            // Raft entry this batch would become is larger than any follower could be
+            // sent. Terminal and the CLIENT's to fix, so it must reach the top-level
+            // handler (413) rather than be counted as failed points -- which is a 200
+            // "partial" whose missing points nobody retries.
+            if (!clusterError)
+                clusterError = std::current_exception();
         } catch (const timestar::InsertTooLargeException& e) {
             const unsigned shard = activeShards[i];
             timestar::http_log.warn("Batch too large for WAL segment on shard {}: {}", shard, e.what());
@@ -2346,6 +2354,23 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleW
         // to become.
         ++engineSharded->local().metrics().insert_errors_total;
         timestar::http_log.warn("Write rejected, inter-node frame too large: {}", e.what());
+        rep->set_status(seastar::http::reply::status_type::payload_too_large);
+        if (timestar::http::isProtobuf(resFmt)) {
+            rep->_content = timestar::proto::formatWriteResponse("error", 0, 0, {std::string(e.what())});
+        } else {
+            rep->_content = createErrorResponse(e.what());
+        }
+        timestar::http::setContentType(*rep, resFmt);
+    } catch (const timestar::raft::ProposalTooLargeError& e) {
+        // The OTHER too-large producer: the encoded Raft entry, refused at propose so it
+        // never becomes durable (write-scaleout 5 review, F3b). `classifyLocalWriteFailure`
+        // already calls it Fatal, and a Fatal failure propagates the original exception,
+        // so it arrives here -- where it used to fall through to the opaque 500 despite
+        // being the same client-fixable condition as the frame case above. Unreachable
+        // today (`kMaxProposalBytes` is 92 MiB and the handler caps a batch long before
+        // that), which is why it is a cosmetic fix and not a bug fix.
+        ++engineSharded->local().metrics().insert_errors_total;
+        timestar::http_log.warn("Write rejected, Raft proposal too large: {}", e.what());
         rep->set_status(seastar::http::reply::status_type::payload_too_large);
         if (timestar::http::isProtobuf(resFmt)) {
             rep->_content = timestar::proto::formatWriteResponse("error", 0, 0, {std::string(e.what())});
