@@ -667,6 +667,12 @@ void RaftNode::step(Message m) {
             const bool inLease =
                 opts_.checkQuorum && leaderId_ != kNoNode && electionElapsed_ < electionTimeout_ && !transferVote;
             if (inLease) {
+                // COUNTED, because the drop is invisible otherwise (no reply, no term
+                // bump) and the DRIVER needs to know it happened: a hibernating group
+                // ticks 1-in-10, which stretches this lease 10x, and the driver's cure is
+                // to un-hibernate the group so the lease expires in real time. See
+                // RaftGroupRegistry::deliver.
+                ++leaseDroppedVotes_;
                 return;  // ignore; do not bump term
             }
         }

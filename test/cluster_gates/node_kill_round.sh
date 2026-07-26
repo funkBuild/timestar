@@ -138,7 +138,25 @@ for s in r.get("series",[]):
     for f in s.get("fields",{}).values():
         t+=sum(v for v in f.get("values",[]) if v is not None)
 print(int(t))')
-    assert_eq "acked probe points readable on node at $p" "$N" "$PROBE_OK"
+    # NO ACKED LOSS is a LOWER bound, not an equality, and the difference is a real
+    # contract rather than slack. A probe that got a 503 may still have COMMITTED: the
+    # retryable classes Transport and LeadershipLost are documented AMBIGUOUS
+    # (write_errors.hpp), so "the client was told to retry" does not mean "nothing landed".
+    # An over-count is therefore legal and was measured -- 42 readable against 41 acked on
+    # a 3-node kill round -- while an equality assertion turns that into a red gate and
+    # teaches people to ignore it.
+    #
+    # What must NOT happen is either direction of real breakage, so both are asserted:
+    #   readable >= acked   -- no acknowledged write was lost (the property);
+    #   readable <= PROBES  -- no point was fabricated or double-counted (LWW means a
+    #                          re-applied duplicate still counts ONCE, so a count above the
+    #                          number of probes sent would be a genuine defect).
+    assert_ge "probe points readable on node at $p (>= acked, no acknowledged loss)" "$N" "$PROBE_OK"
+    if [ "${N:-0}" -gt "$PROBES" ]; then
+        gate_fail "node at $p read $N points from $PROBES probes -- fabricated or double-counted"
+    fi
+    [ "${N:-0}" -gt "$PROBE_OK" ] &&
+        echo "  (note) node at $p reads $N of $PROBES probes against $PROBE_OK acked: $((N - PROBE_OK)) ambiguous 503(s) committed after all"
 done
 
 gate_exit

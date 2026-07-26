@@ -40,6 +40,12 @@ public:
 
     // Hibernation: a quiescent FOLLOWER group (has a leader, no pending Ready) is
     // skipped for up to `followerSkip` consecutive passes before a check-tick,
+    //
+    // NOTE, because it is not obvious and it cost a measured availability regression: the
+    // skip stretches every TICK-DRIVEN clock in that group by ~followerSkip, and with
+    // CheckQuorum on that includes the disruption-guard LEASE. `deliver()` therefore wakes
+    // a group that DROPPED a vote under that lease -- see the comment there for the
+    // mechanism, the numbers, and why the trigger is the drop and not the vote.
     // since a live leader's heartbeats keep it a follower regardless of its own
     // ticking and a dead leader is still detected by the periodic check-tick
     // (failover for idle groups is slower by ~followerSkip, which is fine -- they

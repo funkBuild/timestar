@@ -3,6 +3,7 @@
 // of lightweight groups without per-group services" property. Here 25 groups
 // across 3 nodes elect leaders (timer-driven) and replicate over shared sockets.
 #include "../../../lib/cluster/raft/raft_group_registry.hpp"
+
 #include "../../../lib/cluster/raft/raft_rpc_transport.hpp"
 
 #include <gtest/gtest.h>
@@ -261,8 +262,7 @@ seastar::future<> testManyGroupsFailOverWhenLeaderNodeCrashes() {
     // hibernated follower groups, via their periodic check-tick.
     bool refailed = co_await waitFor([&] {
         for (uint16_t g = 1; g <= kGroups; ++g) {
-            const bool has = nodes[2].registry->group(g)->isLeader() ||
-                             nodes[3].registry->group(g)->isLeader();
+            const bool has = nodes[2].registry->group(g)->isLeader() || nodes[3].registry->group(g)->isLeader();
             if (!has)
                 return false;
         }
@@ -282,7 +282,86 @@ seastar::future<> testManyGroupsFailOverWhenLeaderNodeCrashes() {
         co_await std::move(f);
 }
 
+// HIBERNATION MUST NOT STRETCH THE CHECKQUORUM LEASE (debt D-9).
+//
+// A quiescent follower ticks 1-in-10, which stretches every tick-driven clock in the group
+// by 10x -- including, once CheckQuorum is on, the disruption-guard lease. A vote request
+// arriving inside that stretched lease is dropped SILENTLY (no term bump), so a group whose
+// leader has DIED cannot be voted into a new one for 25-50 s instead of 2.5-5 s. Measured
+// live before the fix: enabling CheckQuorum took node_kill_round from 49/400 failed batches
+// and an 8 s recovery to 153/400 and 43 s.
+//
+// deliver() therefore wakes a group whose step DROPPED a vote under that lease -- the drop
+// and not the vote, so an ordinary election and every leadership transfer (whose vote
+// bypasses the lease) leave hibernation alone. This test asserts the four steps in order:
+// the group hibernates; the vote is REFUSED and COUNTED (which is why the wake is needed at
+// all, and it is asserted, not assumed); from then on the group ticks at full rate; and its
+// lease therefore expires at the normal election timeout rather than 10x it.
+class DropTransport : public RaftTransport {
+public:
+    size_t sent = 0;
+    seastar::future<> send(Envelope) override {
+        ++sent;
+        return seastar::make_ready_future<>();
+    }
+};
+
+seastar::future<> testASolicitedVoteUnHibernatesTheVoter() {
+    RaftOptions o;
+    o.checkQuorum = true;
+    o.electionTimeoutMin = o.electionTimeoutMax = 60;  // 60 passes at the 1 ms tick below
+    o.heartbeatTimeout = 5;
+
+    DropTransport transport;
+    NoopPersistence persistence;
+    RecordingSM sm;
+    RaftGroupRegistry reg(transport, 1ms);
+    reg.addGroup(1, RaftNode(2, {1, 2, 3}, RaftLog{}, HardState{}, o), persistence, sm);
+    reg.startTicking();
+    RaftGroup* g = reg.group(1);
+
+    // Hear from leader 1 -> quiescent follower -> hibernating.
+    AppendEntries ae;
+    ae.term = 1;
+    ae.leaderId = 1;
+    co_await reg.deliver(Envelope{1, Message{.to = 2, .from = 1, .payload = ae}});
+    co_await seastar::sleep(40ms);
+    EXPECT_EQ(g->leader(), 1u);
+    const uint64_t skippedBefore = reg.skippedTicks();
+    EXPECT_GT(skippedBefore, 0u) << "the follower never hibernated -- the test proves nothing";
+    co_await seastar::sleep(30ms);
+    EXPECT_GT(reg.skippedTicks(), skippedBefore) << "still hibernating (the control for below)";
+
+    // A campaign from node 3. It is REFUSED -- the lease is still valid and it does not even
+    // bump our term -- which is exactly the situation the wake has to get us out of.
+    RequestVote rv;
+    rv.term = 2;
+    rv.candidateId = 3;
+    co_await reg.deliver(Envelope{1, Message{.to = 2, .from = 3, .payload = rv}});
+    EXPECT_EQ(g->currentTerm(), 1u) << "the lease must still refuse the vote (silently)";
+    EXPECT_EQ(g->role(), Role::Follower);
+    EXPECT_EQ(g->node().leaseDroppedVotes(), 1u) << "the drop is the wake trigger; it must be counted";
+
+    // ... but the group is now awake: no more skipped ticks while it is still a follower,
+    // so its lease runs down in REAL time.
+    const uint64_t skippedAtVote = reg.skippedTicks();
+    co_await seastar::sleep(30ms);  // < the 60-pass election timeout, so still a follower
+    EXPECT_EQ(reg.skippedTicks(), skippedAtVote) << "the voter is still hibernating: its lease is 10x too long";
+
+    // And the lease does expire, at the normal election timeout rather than 10x it: the
+    // group times out and campaigns (it cannot WIN here -- sends are dropped -- so the
+    // observable is the term bump).
+    bool campaigned = co_await waitFor([&] { return g->currentTerm() > 1; });
+    EXPECT_TRUE(campaigned) << "the woken voter never reached its election timeout";
+
+    co_await reg.stop();
+}
+
 }  // namespace
+
+TEST(RaftGroupRegistryTest, ASolicitedVoteUnHibernatesTheVoter) {
+    testASolicitedVoteUnHibernatesTheVoter().get();
+}
 
 TEST(RaftGroupRegistryTest, ManyGroupsMultiplexOverSharedTransportAndTimer) {
     testManyGroupsOverSharedTransport().get();
