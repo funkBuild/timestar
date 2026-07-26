@@ -215,9 +215,16 @@ public:
     // The peer-ingress entry for the hinted verb: a forwarded batch arrives flat, so it
     // is split here and answered per VShard. The default splits and delegates; the
     // per-shard plane overrides it to fan the slices out to their owning shards.
-    // Peer INGRESS: the forwarding node bounds this call with its own RPC deadline, and
-    // the propose inherits no deadline here. Giving ingress its own bound belongs with
-    // the ingress admission work the plan defers (3d-scope).
+    //
+    // BYTE ADMISSION: peer ingress IS bounded now (debt D-8) -- charged against its own
+    // per-shard budget in `proposeSlicesToOwningShards{,Hinted}`, on the shard serving the
+    // connection. That covers the per-shard plane's override; this DEFAULT reaches the
+    // charge too, since it delegates to `proposeVShardBatches` -> `proposeBatch`, which the
+    // plane implements over the same guarded helper. An override that bypasses both would
+    // be unbounded, so keep the charge in the helpers rather than at a call site.
+    //
+    // TIME: unchanged -- the forwarding node bounds this call with its own RPC deadline and
+    // the propose inherits no deadline here.
     virtual seastar::future<ProposeOutcome> proposeBatchHinted(WriteBatch batch) {
         return seastar::do_with(splitByVShard(std::move(batch)), [this](VShardBatches& groups) {
             return proposeVShardBatchesHinted(viewOf(groups), std::nullopt);

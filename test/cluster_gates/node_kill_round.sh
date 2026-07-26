@@ -102,6 +102,10 @@ HTTP_ERRS=$(grep -o '[0-9]* HTTP errors' /tmp/tsgate_nk_bench.txt | head -1 | cu
 
 echo "  === D-14 BAND: ${HTTP_ERRS:-?} of $BATCHES bench batches failed (${OK_REQS:-?} OK) during a $((BENCH_END - KILL_T))s post-kill window ==="
 echo "  probe writes during the outage: $PROBE_OK/$PROBES acked, $PROBE_5XX 5xx"
+# The failure KINDS matter to the no-loss assertion below (only the ambiguous ones can
+# legitimately leave a surplus of readable points over acked ones), so they are captured,
+# not just eyeballed. The bench prints only its FIRST error, so this is the kinds it saw at
+# all rather than a full histogram.
 echo "  failure kinds seen by the bench:"
 grep -oE '\(last: [a-z-]+\)' /tmp/tsgate_nk_bench.txt | sort | uniq -c | sed 's/^/    /'
 
@@ -139,12 +143,15 @@ for s in r.get("series",[]):
         t+=sum(v for v in f.get("values",[]) if v is not None)
 print(int(t))')
     # NO ACKED LOSS is a LOWER bound, not an equality, and the difference is a real
-    # contract rather than slack. A probe that got a 503 may still have COMMITTED: the
-    # retryable classes Transport and LeadershipLost are documented AMBIGUOUS
-    # (write_errors.hpp), so "the client was told to retry" does not mean "nothing landed".
-    # An over-count is therefore legal and was measured -- 42 readable against 41 acked on
-    # a 3-node kill round -- while an equality assertion turns that into a red gate and
-    # teaches people to ignore it.
+    # contract rather than slack. A probe that got a 503 may still have COMMITTED, but only
+    # for the AMBIGUOUS classes: `Transport` (the frame may have been on the wire) and
+    # `LeadershipLost` (the entry was appended here and a successor may commit it) --
+    # write_errors.hpp records ambiguity per class, and NotLeader / LeaderRefused /
+    # ShardStopping / Overloaded are all unambiguous refusals that appended nothing. So a
+    # surplus is legal when the failures were ambiguous (the kinds are printed above, and
+    # this round reports "(last: transport)"), and would be worth investigating if every
+    # failure had been an unambiguous refusal. Measured: 42 readable against 41 acked.
+    # An equality assertion turns that into a red gate and teaches people to ignore it.
     #
     # What must NOT happen is either direction of real breakage, so both are asserted:
     #   readable >= acked   -- no acknowledged write was lost (the property);
@@ -152,9 +159,7 @@ print(int(t))')
     #                          re-applied duplicate still counts ONCE, so a count above the
     #                          number of probes sent would be a genuine defect).
     assert_ge "probe points readable on node at $p (>= acked, no acknowledged loss)" "$N" "$PROBE_OK"
-    if [ "${N:-0}" -gt "$PROBES" ]; then
-        gate_fail "node at $p read $N points from $PROBES probes -- fabricated or double-counted"
-    fi
+    assert_le "probe points readable on node at $p (<= probes sent, nothing fabricated)" "$N" "$PROBES"
     [ "${N:-0}" -gt "$PROBE_OK" ] &&
         echo "  (note) node at $p reads $N of $PROBES probes against $PROBE_OK acked: $((N - PROBE_OK)) ambiguous 503(s) committed after all"
 done

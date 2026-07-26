@@ -2,6 +2,7 @@
 
 #include "../../core/placement_table.hpp"  // virtualShard
 #include "../../core/vshard.hpp"           // assignCore
+#include "../../utils/logger.hpp"          // timestar::http_log
 #include "../data/dataplane_rpc.hpp"
 #include "../data/leader_filtered_node_store.hpp"
 #include "../data/node_store.hpp"
@@ -24,6 +25,7 @@
 #include <seastar/core/do_with.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/gate.hh>
+#include <seastar/core/lowres_clock.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/core/smp.hh>
 #include <string>
@@ -692,6 +694,36 @@ inline seastar::future<data::ProposeOutcome> proposeSlicesToOwningShardsHinted(s
             for (const auto& g : slice)
                 over.rejects.push_back(
                     data::SliceReject{g.first, timestar::raft::kNoNode, data::WriteFailure::Overloaded});
+        // SAY SO, RATE-LIMITED. This branch is otherwise INVISIBLE on this node: the reject
+        // travels back to the coordinator, so the operator of the node that is actually
+        // full sees nothing at all, and `WriteAdmission::rejected()` currently has no
+        // consumer (no metric, no endpoint -- worth wiring, and nothing does it today).
+        //
+        // The string deliberately does NOT contain "shard write buffer full":
+        // backpressure_gate.sh asserts that phase 2, at the DEFAULT budget, logs ZERO
+        // occurrences of that phrase, and replication traffic legitimately reaching an
+        // ingress bound would then read as a gate failure. Distinct phrasing keeps the two
+        // conditions distinguishable in a log and in a grep.
+        //
+        // One line per second per shard: an overloaded ingress path is hit at the request
+        // RATE, and a log line per rejected batch is how a node under pressure spends its
+        // remaining capacity on logging.
+        static thread_local seastar::lowres_clock::time_point lastLog{};
+        static thread_local uint64_t suppressed = 0;
+        const auto now = seastar::lowres_clock::now();
+        if (now - lastLog >= std::chrono::seconds(1)) {
+            timestar::http_log.warn(
+                "cluster: peer-ingress admission FULL on shard {} ({} of {} bytes in flight); rejected {} replicated "
+                "VShard slice(s) as retryable-overloaded ({} similar rejection(s) suppressed in the last second). The "
+                "coordinator will pace and retry; this node is the leader for those slices, so there is nowhere else "
+                "for them to go.",
+                seastar::this_shard_id(), WriteAdmission::local(AdmissionClass::PeerIngress).inFlight(),
+                WriteAdmission::limitBytes(AdmissionClass::PeerIngress), over.rejects.size(), suppressed);
+            lastLog = now;
+            suppressed = 0;
+        } else {
+            ++suppressed;
+        }
         co_return over;
     }
 
