@@ -22,6 +22,24 @@ struct RequestVote {
     NodeId candidateId = kNoNode;
     LogIndex lastLogIndex = kNoIndex;
     Term lastLogTerm = kNoTerm;
+    // §3.10 + CheckQuorum: "the leader I currently follow sent me a TimeoutNow", set ONLY
+    // by a campaign started from a TimeoutNow (see RaftNode::step). It makes the voter's
+    // CheckQuorum disruption guard stand aside (raft_node.cpp, `inLease`), which is the
+    // whole reason CheckQuorum can be on at all: TimeoutNow skips the TRANSFEREE's lease,
+    // but every OTHER voter is still hearing the outgoing leader's heartbeats and would
+    // otherwise drop the vote silently -- see ADR 0005 and the revert in 1f2e752.
+    //
+    // IT IS A LEASE BYPASS AND NOTHING ELSE. Every other vote condition still applies
+    // (§5.4.1 log up-to-date, one vote per term, term ordering), so a lying peer gains
+    // exactly what it already has when CheckQuorum is off -- which was the shipped
+    // configuration until this landed.
+    //
+    // DELIBERATELY THE LAST FIELD: RequestVote is aggregate-initialized positionally in
+    // several tests, and a new member in the middle would change what those braces mean.
+    // The wire layout does not depend on it either way -- the codec writes named fields,
+    // and a transfer-flagged vote travels under its OWN message-type byte (raft_codec.cpp)
+    // rather than as an extra byte inside the ordinary one.
+    bool campaignTransfer = false;
 };
 
 struct RequestVoteReply {

@@ -96,6 +96,25 @@ enum : uint8_t {
     kInstallSnapshot = 5,
     kInstallSnapshotReply = 6,
     kTimeoutNow = 7,
+    // A RequestVote carrying campaignTransfer (ADR 0005). SAME BODY LAYOUT as
+    // kRequestVote -- only the type byte differs -- and that is the entire mixed-version
+    // mechanism: this envelope has NO version field (it never had one, the transport had
+    // one verb and one format), so adding a byte INSIDE kRequestVote would make an old
+    // decoder mis-frame every field after it and produce a valid-LOOKING vote request
+    // with a garbage term and log index. An unknown TYPE, by contrast, falls into
+    // decodeEnvelope's `default:` and the envelope is dropped whole.
+    //
+    // So an old voter FAILS CLOSED: it never sees the transfer vote, never votes, and
+    // the transfer degrades to exactly the pre-bypass behaviour (the outgoing leader
+    // abandons the transfer after one election timeout -- RaftNode::tick -- and the
+    // group elects normally). Slow, not wedged, and never a misparse.
+    //
+    // What is NOT covered here is mechanism (c) of the ADR: gating activation on the
+    // cluster-wide committed format version, so CheckQuorum itself stays off until every
+    // voter can read this tag. Until that lands, a MIXED-VERSION cluster running with
+    // CheckQuorum on gets slow transfers during the rolling window (see the register row
+    // for D-9).
+    kRequestVoteTransfer = 8,
 };
 
 void writeConfig(Writer& w, const Config& c) {
@@ -140,7 +159,11 @@ std::string encodeEnvelope(const Envelope& env) {
         [&](const auto& p) {
             using T = std::decay_t<decltype(p)>;
             if constexpr (std::is_same_v<T, RequestVote>) {
-                w.u8(kRequestVote);
+                // The transfer flag is carried by the TYPE, not by an extra field: same
+                // body, different tag (see kRequestVoteTransfer). A node only ever emits
+                // the new tag when it is campaigning FROM a TimeoutNow, so an old peer
+                // sees the new byte only in exactly the case the bypass exists for.
+                w.u8(p.campaignTransfer ? kRequestVoteTransfer : kRequestVote);
                 w.u8(p.preVote ? 1 : 0);
                 w.u64(p.term);
                 w.u64(p.candidateId);
@@ -201,9 +224,18 @@ std::optional<Envelope> decodeEnvelope(const std::string& bytes) {
     const uint8_t tag = r.u8();
 
     switch (tag) {
-        case kRequestVote: {
+        case kRequestVote:
+        case kRequestVoteTransfer: {
             RequestVote p;
-            p.preVote = r.u8() != 0;
+            const bool preVoteByte = r.u8() != 0;
+            // A TRANSFER VOTE IS NEVER A PREVOTE, whatever the byte says. The transfer
+            // campaign enters becomeCandidate() directly (it must: a straw poll would
+            // reset the disruption guard problem one level down), so the only shape that
+            // can legitimately carry this tag is a real vote. Forcing it here keeps the
+            // lease bypass confined to the real-vote path even if a peer -- buggy or
+            // hostile -- sets both bits.
+            p.preVote = (tag == kRequestVoteTransfer) ? false : preVoteByte;
+            p.campaignTransfer = (tag == kRequestVoteTransfer);
             p.term = r.u64();
             p.candidateId = r.u64();
             p.lastLogIndex = r.u64();

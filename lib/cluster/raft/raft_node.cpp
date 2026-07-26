@@ -185,7 +185,7 @@ void RaftNode::becomePreCandidate() {
     bcastRequestVote(/*preVote=*/true);
 }
 
-void RaftNode::becomeCandidate() {
+void RaftNode::becomeCandidate(bool transfer) {
     role_ = Role::Candidate;
     ++currentTerm_;
     votedFor_ = id_;  // vote for self
@@ -199,7 +199,7 @@ void RaftNode::becomeCandidate() {
         becomeLeader();
         return;
     }
-    bcastRequestVote(/*preVote=*/false);
+    bcastRequestVote(/*preVote=*/false, transfer);
 }
 
 void RaftNode::becomeLeader() {
@@ -511,7 +511,7 @@ bool RaftNode::maybeAppendLeaveJoint() {
     return true;
 }
 
-void RaftNode::bcastRequestVote(bool preVote) {
+void RaftNode::bcastRequestVote(bool preVote, bool transfer) {
     std::set<NodeId> asked(config_.voters.begin(), config_.voters.end());
     asked.insert(config_.votersOutgoing.begin(), config_.votersOutgoing.end());
     for (NodeId peer : asked) {
@@ -519,6 +519,10 @@ void RaftNode::bcastRequestVote(bool preVote) {
             continue;
         RequestVote rv;
         rv.preVote = preVote;
+        // A transfer campaign never pre-votes (it enters becomeCandidate directly), so
+        // these two are mutually exclusive by construction; the decoder enforces the same
+        // thing on the wire.
+        rv.campaignTransfer = transfer && !preVote;
         // A PreVote probes the NEXT term without adopting it; a real vote uses ours.
         rv.term = preVote ? currentTerm_ + 1 : currentTerm_;
         rv.candidateId = id_;
@@ -642,7 +646,26 @@ void RaftNode::step(Message m) {
         if (isVoteRequest(m.payload)) {
             // Disruption guard (CheckQuorum lease): a node that still hears from a
             // valid leader refuses to grant votes / bump term.
-            const bool inLease = opts_.checkQuorum && leaderId_ != kNoNode && electionElapsed_ < electionTimeout_;
+            //
+            // EXCEPT for a LEADER TRANSFER (ADR 0005, debt D-9). TimeoutNow lets the
+            // transferee skip its OWN lease, but this guard is the other voters', and
+            // they are all still hearing the outgoing leader's heartbeats -- so without
+            // the exception every one of them dropped the transferee's vote here, without
+            // even bumping its term, and a transfer that takes 0 tick rounds with
+            // CheckQuorum off took a full election timeout (2.5-5 s of leaderlessness at
+            // the production tick) with it on. That is what forced the revert in
+            // 1f2e752; this is the etcd fix that lets CheckQuorum come back.
+            //
+            // The flag is a HINT, not an assertion we can verify -- and it does not need
+            // to be. It stands the lease down and does nothing else: the vote still has
+            // to pass §5.4.1's log check and the one-vote-per-term rule below, so the
+            // most a lying peer buys is the situation that shipped for months with
+            // CheckQuorum off. It is also self-limiting, because only the current leader
+            // sends TimeoutNow, and a TimeoutNow is only honoured from the believed
+            // leader at the current term.
+            const bool transferVote = std::get<RequestVote>(m.payload).campaignTransfer;
+            const bool inLease =
+                opts_.checkQuorum && leaderId_ != kNoNode && electionElapsed_ < electionTimeout_ && !transferVote;
             if (inLease) {
                 return;  // ignore; do not bump term
             }
@@ -688,10 +711,18 @@ void RaftNode::step(Message m) {
                 handleInstallSnapshotReply(m.from, p);
             } else if constexpr (std::is_same_v<T, TimeoutNow>) {
                 // Leader transfer: elect NOW, forcing a real election (skip the
-                // PreVote straw poll and any CheckQuorum lease) so leadership
+                // PreVote straw poll and our own CheckQuorum lease) so leadership
                 // moves deterministically. Learners ignore it.
+                //
+                // `transfer=true` marks the vote requests this campaign sends, so the
+                // OTHER voters' leases stand aside too (ADR 0005). Skipping only our own
+                // is what made CheckQuorum break transfers: we campaigned instantly and
+                // then nobody answered. This is the ONLY site that sets the flag -- a
+                // node cannot elect itself with it, only be elected with it by the
+                // incumbent, because this arm is reached only for a TimeoutNow accepted
+                // from the leader we follow at the current term.
                 if (isVoter(id_))
-                    becomeCandidate();
+                    becomeCandidate(/*transfer=*/true);
             }
         },
         m.payload);

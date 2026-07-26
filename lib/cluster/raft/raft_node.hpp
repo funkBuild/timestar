@@ -198,11 +198,16 @@ private:
 
     void becomeFollower(Term term, NodeId leader);
     void becomePreCandidate();
-    void becomeCandidate();
+    // `transfer` marks this campaign as started by a TimeoutNow from the leader we
+    // follow, which flags the vote requests so other voters' CheckQuorum lease stands
+    // aside (ADR 0005). It is a PARAMETER and not a member on purpose: it must describe
+    // THIS campaign only, and a member would leak the flag into the next self-timeout
+    // campaign of a node that once received a TimeoutNow.
+    void becomeCandidate(bool transfer = false);
     void becomeLeader();
     void resetElectionTimer();
     void send(Message m);
-    void bcastRequestVote(bool preVote);
+    void bcastRequestVote(bool preVote, bool transfer = false);
     void checkQuorumOrStepDown();
 
     void handleRequestVote(NodeId from, const RequestVote& rv);

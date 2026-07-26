@@ -154,6 +154,116 @@ TEST(RaftNodeTest, LowerTermVoteRequestRejectedWithOurTerm) {
     EXPECT_EQ(n.currentTerm(), 5u);  // we did NOT adopt term 3
 }
 
+// ---------------------------------------------------------------------------
+// The leader-transfer lease bypass (ADR 0005 / debt D-9), from the VOTER's side.
+//
+// The claim being pinned is narrow and it is the reason the flag is safe: a
+// campaignTransfer vote stands the CheckQuorum lease down and buys NOTHING ELSE. The
+// distinction the assertions turn on is that the lease refuses SILENTLY (no reply, no
+// term bump), while every other rule refuses with a reply -- so "we got a rejection" is
+// itself proof the bypass happened and the rejection came from a real vote rule.
+
+namespace {
+
+RaftOptions checkQuorumTimeout(unsigned t) {
+    RaftOptions o = fixedTimeout(t);
+    o.checkQuorum = true;
+    return o;
+}
+
+// Put `n` inside its CheckQuorum lease: it has just heard a valid AppendEntries from
+// `leader` at its own term, so leaderId_ is set and electionElapsed_ is 0.
+void hearFromLeader(RaftNode& n, NodeId leader, Term term, LogIndex prevIdx, Term prevTerm) {
+    AppendEntries ae;
+    ae.term = term;
+    ae.leaderId = leader;
+    ae.prevLogIndex = prevIdx;
+    ae.prevLogTerm = prevTerm;
+    n.step(Message{.to = n.id(), .from = leader, .payload = ae});
+    drain(n);  // discard the ack
+    ASSERT_EQ(n.leader(), leader);
+}
+
+RequestVote transferVote(Term term, NodeId candidate, LogIndex lastIdx, Term lastTerm) {
+    RequestVote rv;
+    rv.term = term;
+    rv.candidateId = candidate;
+    rv.lastLogIndex = lastIdx;
+    rv.lastLogTerm = lastTerm;
+    rv.campaignTransfer = true;
+    return rv;
+}
+
+}  // namespace
+
+TEST(RaftNodeTest, TheLeaseStillDropsAnOrdinaryVoteFromALiveFollower) {
+    // The control for the three below: WITHOUT the flag, nothing changes. The vote is
+    // dropped silently -- no reply, no term bump -- which is exactly the behaviour that
+    // broke leadership transfer and forced 1f2e752.
+    RaftNode n(1, {1, 2, 3}, logOfTerms({5, 5}), HardState{5, kNoNode}, checkQuorumTimeout(10));
+    hearFromLeader(n, 2, 5, 2, 5);
+    n.step(Message{.to = 1, .from = 3, .payload = RequestVote{false, 6, 3, 2, 5}});
+    RaftNode::Ready rd = drain(n);
+    EXPECT_TRUE(rd.messages.empty()) << "the lease refuses silently";
+    EXPECT_EQ(n.currentTerm(), 5u) << "and without even bumping our term";
+    EXPECT_EQ(n.leader(), 2u);
+}
+
+TEST(RaftNodeTest, TransferVoteBypassesTheLeaseAndIsGranted) {
+    RaftNode n(1, {1, 2, 3}, logOfTerms({5, 5}), HardState{5, kNoNode}, checkQuorumTimeout(10));
+    hearFromLeader(n, 2, 5, 2, 5);
+    n.step(Message{.to = 1, .from = 3, .payload = transferVote(6, 3, 2, 5)});
+    RaftNode::Ready rd = drain(n);
+    ASSERT_EQ(rd.messages.size(), 1u);
+    const auto* reply = payloadIf<RequestVoteReply>(rd.messages[0]);
+    ASSERT_NE(reply, nullptr);
+    EXPECT_TRUE(reply->voteGranted);
+    EXPECT_EQ(n.currentTerm(), 6u);
+    ASSERT_TRUE(rd.hardState.has_value());
+    EXPECT_EQ(rd.hardState->votedFor, 3u);
+}
+
+TEST(RaftNodeTest, TransferVoteStillObeysTheLogUpToDateCheck) {
+    // §5.4.1 is not a lease and the flag does not touch it. Note the term DOES bump:
+    // that is the proof the lease stood aside and the refusal came from the log check.
+    RaftNode n(1, {1, 2, 3}, logOfTerms({5, 5}), HardState{5, kNoNode}, checkQuorumTimeout(10));
+    hearFromLeader(n, 2, 5, 2, 5);
+    n.step(Message{.to = 1, .from = 3, .payload = transferVote(6, 3, /*lastIdx=*/1, /*lastTerm=*/4)});
+    RaftNode::Ready rd = drain(n);
+    ASSERT_EQ(rd.messages.size(), 1u);
+    const auto* reply = payloadIf<RequestVoteReply>(rd.messages[0]);
+    ASSERT_NE(reply, nullptr);
+    EXPECT_FALSE(reply->voteGranted) << "a stale log loses the election, flag or no flag";
+    EXPECT_EQ(n.currentTerm(), 6u);
+}
+
+TEST(RaftNodeTest, TransferVoteStillObeysOneVotePerTerm) {
+    RaftNode n(1, {1, 2, 3}, logOfTerms({5, 5}), HardState{5, kNoNode}, checkQuorumTimeout(10));
+    hearFromLeader(n, 2, 5, 2, 5);
+    n.step(Message{.to = 1, .from = 3, .payload = transferVote(6, 3, 2, 5)});
+    ASSERT_TRUE(payloadIf<RequestVoteReply>(drain(n).messages.at(0))->voteGranted);
+    // A SECOND transferee at the same term cannot also be voted for -- which is the
+    // property that makes two leaders in one term impossible.
+    n.step(Message{.to = 1, .from = 2, .payload = transferVote(6, 2, 2, 5)});
+    RaftNode::Ready rd = drain(n);
+    ASSERT_EQ(rd.messages.size(), 1u);
+    EXPECT_FALSE(payloadIf<RequestVoteReply>(rd.messages[0])->voteGranted);
+    EXPECT_EQ(n.currentTerm(), 6u);
+}
+
+TEST(RaftNodeTest, TransferVoteAtAStaleTermIsRejectedWithOurTerm) {
+    RaftNode n(1, {1, 2, 3}, logOfTerms({5, 5}), HardState{5, kNoNode}, checkQuorumTimeout(10));
+    hearFromLeader(n, 2, 5, 2, 5);
+    n.step(Message{.to = 1, .from = 3, .payload = transferVote(3, 3, 2, 5)});
+    RaftNode::Ready rd = drain(n);
+    ASSERT_EQ(rd.messages.size(), 1u);
+    const auto* reply = payloadIf<RequestVoteReply>(rd.messages[0]);
+    ASSERT_NE(reply, nullptr);
+    EXPECT_FALSE(reply->voteGranted);
+    EXPECT_EQ(reply->term, 5u);
+    EXPECT_EQ(n.currentTerm(), 5u) << "a stale transfer vote never moves our term";
+}
+
 TEST(RaftNodeTest, CandidateWinsOnMajority) {
     RaftNode n(1, {1, 2, 3}, RaftLog{}, HardState{}, fixedTimeout(1));
     n.tick();  // -> candidate term 1

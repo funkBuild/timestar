@@ -453,6 +453,84 @@ TEST(RaftClusterTest, LeaderTransferMovesLeadership) {
     EXPECT_EQ(net.applied(2).back(), "y");
 }
 
+// THE DIRECT REGRESSION TEST FOR 1f2e752 (ADR 0005 / debt D-9). This is the test whose
+// absence let CheckQuorum ship broken: LeaderTransferMovesLeadership above runs with
+// CheckQuorum OFF, so it could not see the failure at all.
+//
+// The measurement is TICK ROUNDS, and the assertion is that there are NONE. `net.run()`
+// only delivers messages; it never advances anyone's clock. So if the transfer needs an
+// election timeout -- the pre-bypass behaviour, where every other voter is still inside
+// the outgoing leader's lease and drops the transferee's vote silently -- node 2 simply
+// never becomes leader here, however long run() churns.
+TEST(RaftClusterTest, LeaderTransferUnderCheckQuorumCompletesInZeroTickRounds) {
+    Network net({1, 2, 3}, optsPreVoteCheckQuorum());
+    net.node(1).campaign();
+    net.run();
+    ASSERT_EQ(net.leader(), 1u);
+    net.node(1).propose("x");
+    net.run();
+    ASSERT_EQ(net.node(3).leader(), 1u);  // node 3 is inside node 1's lease
+
+    // Not a single tickAll() from here to the assertions.
+    net.node(1).transferLeadership(2);
+    net.run();
+
+    EXPECT_EQ(net.node(2).role(), Role::Leader);
+    EXPECT_EQ(net.node(1).role(), Role::Follower);
+    EXPECT_EQ(net.leaderCount(), 1);
+    EXPECT_EQ(net.node(3).leader(), 2u);
+    EXPECT_GT(net.node(2).currentTerm(), 1u);
+
+    // And the new leader serves writes immediately -- there is no leaderless window to
+    // wait out, which is the whole availability point (the balancer fires every 5 s over
+    // 4096 groups and reads fail closed after ~125 ms of leaderlessness).
+    EXPECT_TRUE(net.node(2).propose("y"));
+    net.run();
+    EXPECT_EQ(net.applied(1).back(), "y");
+    EXPECT_EQ(net.applied(3).back(), "y");
+}
+
+// The other half of the claim: the lease is still a lease. A node that campaigns on its
+// OWN initiative against a live leader is still refused, so the bypass bought exactly
+// the transfer case and not a general disruption licence.
+TEST(RaftClusterTest, CheckQuorumStillRefusesAnUnsolicitedCampaign) {
+    Network net({1, 2, 3}, optsPreVoteCheckQuorum());
+    net.node(1).campaign();
+    net.run();
+    ASSERT_EQ(net.leader(), 1u);
+    const Term termBefore = net.node(3).currentTerm();
+
+    net.node(2).campaign();  // no TimeoutNow behind it: an ordinary (pre)vote
+    net.run();
+
+    EXPECT_EQ(net.leader(), 1u);
+    EXPECT_NE(net.node(2).role(), Role::Leader);
+    EXPECT_EQ(net.node(3).currentTerm(), termBefore) << "a leased voter does not even bump its term";
+    EXPECT_EQ(net.node(3).leader(), 1u);
+}
+
+// A transfer to a target that is BEHIND still completes under CheckQuorum: the leader
+// catches it up first and only then sends TimeoutNow, so the bypass has to survive the
+// catch-up round trip rather than only the already-caught-up fast path.
+TEST(RaftClusterTest, LeaderTransferUnderCheckQuorumCatchesTheTargetUpFirst) {
+    Network net({1, 2, 3}, optsPreVoteCheckQuorum());
+    net.node(1).campaign();
+    net.run();
+    ASSERT_EQ(net.leader(), 1u);
+
+    net.isolate(3);  // node 3 misses these
+    net.node(1).propose("a");
+    net.node(1).propose("b");
+    net.run();
+    net.heal(3);
+
+    net.node(1).transferLeadership(3);
+    net.run();
+    EXPECT_EQ(net.node(3).role(), Role::Leader);
+    EXPECT_EQ(net.leaderCount(), 1);
+    EXPECT_EQ(net.applied(3).size(), 2u);
+}
+
 TEST(RaftClusterTest, ReadIndexConfirmsAfterQuorumHeartbeat) {
     Network net({1, 2, 3}, opts());
     net.node(1).campaign();
