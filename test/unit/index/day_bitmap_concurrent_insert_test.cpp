@@ -204,11 +204,17 @@ SEASTAR_TEST_F(DayBitmapConcurrentInsertTest, ConcurrentBatchDayRecordingKeepsEv
 // What CAN be pinned deterministically is the shape that makes it possible -- a raw
 // pointer into one of the bitmap caches escaping a coroutine that suspends.
 //
-// This is not a style rule. `bitmapCache_` and `dayBitmapCache_` are tsl::robin_map
-// (open addressing) holding `roaring::Roaring` BY VALUE, and both are rehashed by any
-// insert and erased by the trims that memory pressure makes routine. A pointer to an
-// entry is therefore valid only inside a single, uninterrupted reactor task -- which a
-// `co_return &entry.bitmap` guarantees it is NOT.
+// WHAT CHANGED IN 5.1. The caches now hold `seastar::lw_shared_ptr<BitmapEntry>` rather
+// than `BitmapEntry` by value, so a rehash moves 8-byte handles and never an entry, and a
+// handle keeps its entry alive even if a trim drops it from the map. That kills BOTH
+// halves of the hazard structurally, and it is why the read accessors no longer carry a
+// "consume the returned pointer immediately" contract -- a contract that was never
+// satisfiable, because the invalidation happened before the caller resumed.
+//
+// So the shape this test pins is now the CACHE'S OWN TYPE plus the absence of raw
+// pointers out of the accessors. Both are checked: if someone reverts the value type, a
+// `co_return &entry.bitmap` becomes lethal again even though no accessor signature
+// changed.
 TEST(DayBitmapSourceInspection, NoBitmapPointerEscapesASuspendingCoroutine) {
     std::ifstream in(NATIVE_INDEX_SOURCE_PATH);
     ASSERT_TRUE(in.good()) << "cannot open " << NATIVE_INDEX_SOURCE_PATH;
@@ -216,21 +222,36 @@ TEST(DayBitmapSourceInspection, NoBitmapPointerEscapesASuspendingCoroutine) {
     ss << in.rdbuf();
     const std::string src = ss.str();
 
-    // (1) A MUTABLE bitmap pointer must never leave one of these coroutines. The read-side
-    // accessors return `const roaring::Roaring*` and are held to a consume-immediately
-    // contract documented on their declarations (retiring that contract by making the
-    // cache values heap-stable is Phase-5 debt); the WRITE side has no excuse, because the
-    // mutation can simply happen inside. Both spellings are checked -- clang-format
-    // produces the unspaced one, but a hand-written `Roaring *` would slip past a single
-    // literal.
-    for (const char* spelling : {"seastar::future<roaring::Roaring*>", "seastar::future<roaring::Roaring *>"}) {
+    std::ifstream hin(NATIVE_INDEX_HPP_SOURCE_PATH);
+    ASSERT_TRUE(hin.good()) << "cannot open " << NATIVE_INDEX_HPP_SOURCE_PATH;
+    std::stringstream hss;
+    hss << hin.rdbuf();
+    const std::string hdr = hss.str();
+
+    // (0) THE LOAD-BEARING INVARIANT: the cache values are heap-stable handles. Everything
+    // else in this test is downstream of it.
+    EXPECT_NE(hdr.find("using BitmapHandle = seastar::lw_shared_ptr<BitmapEntry>"), std::string::npos)
+        << "the bitmap caches must hold heap-stable, refcounted handles. Held BY VALUE in a "
+        << "tsl::robin_map (open addressing) every insert RELOCATES every entry and every "
+        << "trim FREES one, so no reference into the cache survives a suspension -- the "
+        << "use-after-free that faults inside roaring_bitmap_add (write-scaleout 4d/5.1).";
+    EXPECT_NE(hdr.find("using BitmapCache = tsl::robin_map<std::string, BitmapHandle>"), std::string::npos);
+    EXPECT_EQ(hdr.find("tsl::robin_map<std::string, BitmapEntry>"), std::string::npos)
+        << "a bitmap cache still holds BitmapEntry BY VALUE -- see above.";
+
+    // (1) No raw bitmap pointer, mutable or const, may leave one of these coroutines. The
+    // mutable spelling was always forbidden (the write path mutates inside); the CONST one
+    // is forbidden now too, because the pin is what makes a read safe and a raw pointer
+    // carries no pin. Both spacings are checked -- clang-format produces the unspaced
+    // form, but a hand-written `Roaring *` would slip past a single literal.
+    for (const char* spelling :
+         {"seastar::future<roaring::Roaring*>", "seastar::future<roaring::Roaring *>",
+          "seastar::future<const roaring::Roaring*>", "seastar::future<const roaring::Roaring *>"}) {
         EXPECT_EQ(src.find(spelling), std::string::npos)
-            << "native_index.cpp hands a MUTABLE `roaring::Roaring*` out of a coroutine (" << spelling
-            << "). The caller dereferences it in a LATER reactor task, by which "
-            << "point a robin_map rehash or a flush+trim can have moved or freed the entry "
-            << "-- the use-after-free that faults inside roaring_bitmap_add "
-            << "(write-scaleout 4d). Do the mutation inside the accessor (see "
-            << "addToDayBitmapForInsert) instead.";
+            << "native_index.cpp hands a raw `roaring::Roaring` pointer out of a coroutine (" << spelling
+            << "). The caller dereferences it in a LATER reactor task, and a raw pointer "
+            << "pins nothing. Return a BitmapHandle (read side) or do the mutation inside "
+            << "the accessor (write side, see addToDayBitmapForInsert).";
     }
 
     // ... and the replacements are actually there, so the check above cannot pass simply
@@ -238,34 +259,26 @@ TEST(DayBitmapSourceInspection, NoBitmapPointerEscapesASuspendingCoroutine) {
     EXPECT_NE(src.find("NativeIndex::addToDayBitmapForInsert"), std::string::npos);
     EXPECT_NE(src.find("NativeIndex::addToPostingsBitmapForInsert"), std::string::npos);
 
-    // (2) `updateTagHLL` is the one INSERT-PATH function that consumes a read-side
-    // accessor, and it had the identical defect: it BOUND the result of
-    // `co_await getPostingsBitmapByKey(...)` to a pointer and then iterated it, on the
-    // argument that "the seed loop below does not suspend" -- the exact model (1) exists
-    // to refute. It is the worse instance, because that accessor's cold-load branch
-    // inserts the entry with `dirty = false`, i.e. immediately trim-eligible, and the
-    // function is reachable from `getOrCreateSeriesId` on the hot write path.
-    //
-    // Structural rather than behavioural on purpose: the fault is a RACE between reactor
-    // tasks, so no unit test can schedule it on demand (the same reason 4d itself is
-    // pinned this way). What IS deterministic is the shape, and this pins the shape: the
-    // result must be DISCARDED and the bitmap re-found by key, never bound and walked.
-    const size_t fnStart = src.find("NativeIndex::updateTagHLL");
-    ASSERT_NE(fnStart, std::string::npos) << "updateTagHLL not found -- this check has rotted";
-    const size_t fnEnd = src.find("\n}\n", fnStart);
-    ASSERT_NE(fnEnd, std::string::npos);
-    const std::string body = src.substr(fnStart, fnEnd - fnStart);
+    // (2) The trims must honour the pin. Freeing is already impossible (the holder's
+    // handle keeps the entry alive), so this is about COHERENCE: evicting an entry a
+    // reader still holds would leave the reader and a concurrent writer mutating two
+    // different objects for the same key, and the reader's adds would be the ones lost.
+    for (const char* fn : {"NativeIndex::trimBitmapCache", "NativeIndex::trimDayBitmapCache"}) {
+        const size_t start = src.find(fn);
+        ASSERT_NE(start, std::string::npos) << fn << " not found -- this check has rotted";
+        const size_t end = src.find("\n}\n", start);
+        ASSERT_NE(end, std::string::npos);
+        EXPECT_NE(src.substr(start, end - start).find(".owned()"), std::string::npos)
+            << fn << " evicts without checking whether the entry is PINNED. An entry a "
+            << "suspended reader holds must stay in the map, or that reader and a "
+            << "concurrent writer end up on divergent copies of the same key.";
+    }
 
-    EXPECT_EQ(body.find("= co_await getPostingsBitmapByKey"), std::string::npos)
-        << "updateTagHLL binds the result of getPostingsBitmapByKey to a variable. That "
-        << "pointer is computed inside a coroutine that suspended, so anything done with "
-        << "it runs in a different reactor task -- a rehash or a flush+trim in between "
-        << "makes it a use-after-free on the hot write path (write-scaleout 4d, blocker 2). "
-        << "Discard the result and re-find the entry by key, then COPY the bitmap.";
-    if (body.find("getPostingsBitmapByKey") != std::string::npos) {
-        EXPECT_NE(body.find("(void)co_await getPostingsBitmapByKey"), std::string::npos)
-            << "updateTagHLL must call getPostingsBitmapByKey only for its side effect of "
-            << "repopulating bitmapCache_, and re-find the entry by key afterwards.";
+    // (3) Nothing may create a cache slot through `operator[]`: that inserts a NULL
+    // handle, which every reader would then have to guard. `ensureEntry` materializes it.
+    for (const char* spelling : {"bitmapCache_[", "dayBitmapCache_["}) {
+        EXPECT_EQ(src.find(spelling), std::string::npos)
+            << spelling << "...] inserts a null handle. Use ensureEntry(cache, key).";
     }
 }
 

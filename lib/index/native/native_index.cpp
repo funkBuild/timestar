@@ -1408,22 +1408,23 @@ seastar::future<std::expected<std::vector<SeriesId128>, SeriesLimitExceeded>> Na
         co_return res;
     }
 
-    // Multi-tag: incrementally intersect bitmaps.
-    // IMPORTANT: We copy each bitmap immediately because getPostingsBitmapByKey() may
-    // insert into bitmapCache_ (a robin_map), which can rehash and invalidate prior pointers.
+    // Multi-tag: incrementally intersect bitmaps. The handles are heap-stable pins
+    // (write-scaleout 5.1), so folding into an owned accumulator is now a choice about
+    // MUTATION (a concurrent insert can still add to a cached bitmap) rather than about
+    // lifetime.
     std::string cacheKey;
     roaring::Roaring result;
     bool first = true;
     for (const auto& [tagKey, tagValue] : tagFilters) {
         buildBitmapCacheKey(cacheKey, measurement, tagKey, tagValue);
-        auto* bitmap = co_await getPostingsBitmapByKey(cacheKey);
+        auto bitmap = co_await getPostingsBitmapByKey(cacheKey);
         if (!bitmap)
             co_return std::vector<SeriesId128>{};
         if (first) {
-            result = *bitmap;  // copy into owned accumulator
+            result = bitmap->bitmap;  // copy into owned accumulator
             first = false;
         } else {
-            result &= *bitmap;
+            result &= bitmap->bitmap;
             if (result.isEmpty())
                 co_return std::vector<SeriesId128>{};
         }
@@ -1505,28 +1506,27 @@ NativeIndex::findSeriesWithMetadata(const std::string& measurement,
     std::optional<roaring::Roaring> intersected;
 
     if (tagFilters.size() == 1) {
-        // Single tag — copy bitmap into owned storage (pointer may be invalidated by future cache ops)
+        // Single tag — copy into owned storage: the loop below yields, and a concurrent
+        // insert can still ADD to the cached bitmap under an iterator.
         auto& [tagKey, tagValue] = *tagFilters.begin();
         buildBitmapCacheKey(cacheKey, measurement, tagKey, tagValue);
-        auto* bmp = co_await getPostingsBitmapByKey(cacheKey);
+        auto bmp = co_await getPostingsBitmapByKey(cacheKey);
         if (!bmp)
             co_return std::vector<SeriesWithMetadata>{};
-        intersected = *bmp;
+        intersected = bmp->bitmap;
     } else {
-        // Multi-tag — incrementally intersect bitmaps.
-        // IMPORTANT: Copy each bitmap immediately because getPostingsBitmapByKey() may
-        // insert into bitmapCache_ (a robin_map), which can rehash and invalidate prior pointers.
+        // Multi-tag — incrementally intersect bitmaps into an owned accumulator.
         bool first = true;
         for (const auto& [tagKey, tagValue] : tagFilters) {
             buildBitmapCacheKey(cacheKey, measurement, tagKey, tagValue);
-            auto* bmp = co_await getPostingsBitmapByKey(cacheKey);
+            auto bmp = co_await getPostingsBitmapByKey(cacheKey);
             if (!bmp)
                 co_return std::vector<SeriesWithMetadata>{};
             if (first) {
-                intersected = *bmp;
+                intersected = bmp->bitmap;
                 first = false;
             } else {
-                *intersected &= *bmp;
+                *intersected &= bmp->bitmap;
                 if (intersected->isEmpty())
                     co_return std::vector<SeriesWithMetadata>{};
             }
@@ -1695,13 +1695,14 @@ seastar::future<std::vector<SeriesId128>> NativeIndex::findSeriesByTag(const std
     // Phase 2: Load roaring bitmap and reverse-lookup to global IDs
     std::string cacheKey;
     buildBitmapCacheKey(cacheKey, measurement, tagKey, tagValue);
-    auto* bitmapPtr = co_await getPostingsBitmapByKey(cacheKey);
-    if (!bitmapPtr)
+    auto handle = co_await getPostingsBitmapByKey(cacheKey);
+    if (!handle)
         co_return std::vector<SeriesId128>{};
-    // Owned copy: the loop below yields periodically, and a concurrent insert
-    // can rehash bitmapCache_ (dangling bitmapPtr) or add to this bitmap
-    // (invalidating its iterator) during the suspension.
-    roaring::Roaring bitmap = *bitmapPtr;
+    // Owned copy: the loop below yields periodically, and a concurrent insert can ADD to
+    // this bitmap during the suspension, invalidating its iterator. (The entry itself no
+    // longer moves or dies -- the handle is a heap-stable pin -- but a bitmap being
+    // mutated still must not be walked.)
+    roaring::Roaring bitmap = handle->bitmap;
 
     std::vector<SeriesId128> result;
     result.reserve(bitmap.cardinality());
@@ -1758,34 +1759,33 @@ seastar::future<std::map<std::string, std::vector<SeriesId128>>> NativeIndex::ge
     for (auto& [tagValue, value] : toLoad) {
         fullCacheKey.assign(cachePrefix);
         fullCacheKey.append(tagValue);
-        auto& entry = bitmapCache_[fullCacheKey];
-        entry.bitmap = roaring::Roaring::readSafe(value.data(), value.size());
-        entry.dirty = false;
+        auto entry = ensureEntry(bitmapCache_, fullCacheKey);
+        entry->bitmap = roaring::Roaring::readSafe(value.data(), value.size());
+        entry->dirty = false;
         cacheHitValues.push_back(std::move(tagValue));
     }
 
-    // Owned copies, not pointers: the reverse-lookup loop below yields
-    // periodically, and a concurrent insert can rehash bitmapCache_ (dangling
-    // any pointers) or grow a bitmap under its iterator.
+    // Owned copies: the reverse-lookup loop below yields periodically, and a concurrent
+    // insert can grow a cached bitmap under its iterator.
     std::map<std::string, roaring::Roaring> bitmapsByValue;
     for (auto& tagValue : cacheHitValues) {
         fullCacheKey.assign(cachePrefix);
         fullCacheKey.append(tagValue);
         auto cacheIt = bitmapCache_.find(fullCacheKey);
         if (cacheIt != bitmapCache_.end()) {
-            bitmapsByValue.emplace(std::move(tagValue), cacheIt->second.bitmap);
+            bitmapsByValue.emplace(std::move(tagValue), cacheIt->second->bitmap);
         }
     }
 
     // Add any dirty cache entries that don't have a KV counterpart
     // (new tag values inserted since last flush).
     for (auto cacheIt = bitmapCache_.begin(); cacheIt != bitmapCache_.end(); ++cacheIt) {
-        if (!cacheIt->second.dirty)
+        if (!cacheIt->second->dirty)
             continue;
         auto& postingsKey = cacheIt->first;
         if (postingsKey.size() > cachePrefix.size() && postingsKey.compare(0, cachePrefix.size(), cachePrefix) == 0) {
             // try_emplace: single lookup; copies the bitmap only when inserted
-            bitmapsByValue.try_emplace(postingsKey.substr(cachePrefix.size()), cacheIt->second.bitmap);
+            bitmapsByValue.try_emplace(postingsKey.substr(cachePrefix.size()), cacheIt->second->bitmap);
         }
     }
 
@@ -2062,7 +2062,7 @@ void NativeIndex::flushDirtyBitmaps(IndexWriteBatch& batch) {
         auto it = bitmapCache_.find(cacheKey);
         if (it == bitmapCache_.end())
             continue;
-        auto& entry = it.value();
+        auto& entry = *it.value();
         if (!entry.dirty)
             continue;
 
@@ -2090,10 +2090,20 @@ void NativeIndex::flushDirtyBitmaps(IndexWriteBatch& batch) {
     bitmapCacheDirtyKeys_.clear();
 }
 
-seastar::future<const roaring::Roaring*> NativeIndex::getPostingsBitmapByKey(const std::string& cacheKey) {
+// Materialize a cache entry. `operator[]` on a BitmapCache inserts a NULL handle, which
+// every reader would then have to guard; funnel creation through here instead so a value
+// in one of these maps is never null.
+NativeIndex::BitmapHandle NativeIndex::ensureEntry(BitmapCache& cache, const std::string& key) {
+    auto& handle = cache[key];
+    if (!handle)
+        handle = seastar::make_lw_shared<BitmapEntry>();
+    return handle;  // by value: the caller's copy pins the entry
+}
+
+seastar::future<NativeIndex::BitmapHandle> NativeIndex::getPostingsBitmapByKey(const std::string& cacheKey) {
     auto it = bitmapCache_.find(cacheKey);
     if (it != bitmapCache_.end()) {
-        co_return &it->second.bitmap;
+        co_return it->second;  // handle copy = pin; safe to hold across suspensions
     }
 
     // Build KV key by prepending prefix byte to cache key (used for both bloom check and KV lookup)
@@ -2125,7 +2135,7 @@ seastar::future<const roaring::Roaring*> NativeIndex::getPostingsBitmapByKey(con
         }
         if (!bloomIt->second.isNull()) {
             if (!bloomIt->second.mayContain(bitmapKvKey)) {
-                co_return nullptr;
+                co_return BitmapHandle{};
             }
         }
     }
@@ -2139,30 +2149,30 @@ seastar::future<const roaring::Roaring*> NativeIndex::getPostingsBitmapByKey(con
     auto post = bitmapCache_.find(cacheKey);
     if (post != bitmapCache_.end()) {
         if (val.has_value()) {
-            post.value().bitmap |= roaring::Roaring::readSafe(val->data(), val->size());
-            post.value().approxBytes = val->size();
+            post.value()->bitmap |= roaring::Roaring::readSafe(val->data(), val->size());
+            post.value()->approxBytes = val->size();
         }
-        co_return &post.value().bitmap;
+        co_return post->second;
     }
     if (val.has_value()) {
-        auto& entry = bitmapCache_[cacheKey];
-        entry.bitmap = roaring::Roaring::readSafe(val->data(), val->size());
-        entry.dirty = false;
-        entry.approxBytes = val->size();
-        co_return &entry.bitmap;
+        auto entry = ensureEntry(bitmapCache_, cacheKey);
+        entry->bitmap = roaring::Roaring::readSafe(val->data(), val->size());
+        entry->dirty = false;
+        entry->approxBytes = val->size();
+        co_return entry;
     }
 
-    co_return nullptr;
+    co_return BitmapHandle{};
 }
 
 seastar::future<uint64_t> NativeIndex::addToPostingsBitmapForInsert(std::string& cacheKey, uint32_t localId) {
     auto it = bitmapCache_.find(cacheKey);
     if (it != bitmapCache_.end()) {
-        it.value().dirty = true;
+        it.value()->dirty = true;
         bitmapCacheDirtyKeys_.insert(cacheKey);
         // Cache hit: no suspension at all, so the reference cannot go stale.
-        it.value().bitmap.add(localId);
-        co_return it.value().bitmap.cardinality();
+        it.value()->bitmap.add(localId);
+        co_return it.value()->bitmap.cardinality();
     }
 
     // Cache miss — cold load from KV store
@@ -2172,29 +2182,37 @@ seastar::future<uint64_t> NativeIndex::addToPostingsBitmapForInsert(std::string&
     bitmapKvKey.append(cacheKey);
 
     // Pre-insert an empty bitmap before co_await so concurrent coroutines
-    // can start adding local IDs immediately (cache hit path at line 1742).
-    // Do NOT hold a reference across the suspension — robin_map rehash
-    // would invalidate it.
-    bitmapCache_[cacheKey].dirty = true;
+    // can start adding local IDs immediately (cache hit path above). The handle we
+    // keep is a PIN as well as a heap-stable reference, so the entry cannot be
+    // evicted during the suspension -- but we still re-find by key afterwards,
+    // because a concurrent trim may have dropped the entry from the MAP and a later
+    // reader would then be looking at a different one.
+    auto pin = ensureEntry(bitmapCache_, cacheKey);
+    pin->dirty = true;
     bitmapCacheDirtyKeys_.insert(cacheKey);
     auto existing = co_await kvGet(bitmapKvKey);
-    // Re-find after co_await (rehash may have moved entries)
-    auto& entry = bitmapCache_[cacheKey];
+    // Re-find after co_await: whatever is in the map NOW is what future readers see.
+    auto entry = ensureEntry(bitmapCache_, cacheKey);
     if (existing.has_value()) {
         // IMPORTANT: Merge (OR) the KV-loaded bitmap into the existing entry
         // rather than replacing it. During the co_await above, concurrent
         // coroutines may have added local IDs to the pre-inserted empty bitmap.
         // A plain assignment would silently discard those concurrent adds.
-        entry.bitmap |= roaring::Roaring::readSafe(existing->data(), existing->size());
-        entry.approxBytes = existing->size();
+        entry->bitmap |= roaring::Roaring::readSafe(existing->data(), existing->size());
+        entry->approxBytes = existing->size();
+    }
+    if (entry != pin) {
+        // The map's entry was replaced while we were suspended (evict + reload).
+        // Fold our pinned copy in so nothing added to it during the window is lost.
+        entry->bitmap |= pin->bitmap;
     }
     // RE-MARK DIRTY: a flush during the suspension clears the flag, and the add below
     // would then never be persisted (see addToDayBitmapForInsert).
-    entry.dirty = true;
+    entry->dirty = true;
     bitmapCacheDirtyKeys_.insert(cacheKey);
     // The add happens HERE, with no suspension between it and the re-find above.
-    entry.bitmap.add(localId);
-    co_return entry.bitmap.cardinality();
+    entry->bitmap.add(localId);
+    co_return entry->bitmap.cardinality();
 }
 
 seastar::future<> NativeIndex::migrateToLocalIds(IndexWriteBatch& batch) {
@@ -2236,9 +2254,9 @@ seastar::future<> NativeIndex::migrateToLocalIds(IndexWriteBatch& batch) {
             mtvPart = mtvPart.substr(0, mtvPart.size() - 1);
         }
         std::string postingsKey(mtvPart);
-        auto& entry = bitmapCache_[postingsKey];
-        entry.bitmap.add(*localOpt);
-        entry.dirty = true;
+        auto entry = ensureEntry(bitmapCache_, postingsKey);
+        entry->bitmap.add(*localOpt);
+        entry->dirty = true;
         return true;
     });
 
@@ -2246,7 +2264,7 @@ seastar::future<> NativeIndex::migrateToLocalIds(IndexWriteBatch& batch) {
     std::string bitmapKey;
     size_t bitmapCount = 0;
     for (auto it = bitmapCache_.begin(); it != bitmapCache_.end(); ++it) {
-        auto& entry = it.value();
+        auto& entry = *it.value();
         if (!entry.dirty)
             continue;
         entry.bitmap.runOptimize();
@@ -2285,10 +2303,10 @@ void NativeIndex::buildDayBitmapCacheKey(std::string& out, const std::string& me
 seastar::future<bool> NativeIndex::addToDayBitmapForInsert(std::string& cacheKey, uint32_t localId) {
     auto it = dayBitmapCache_.find(cacheKey);
     if (it != dayBitmapCache_.end()) {
-        it.value().dirty = true;
+        it.value()->dirty = true;
         dayBitmapCacheDirtyKeys_.insert(cacheKey);
         // Cache hit: no suspension at all, so the reference cannot go stale.
-        co_return it.value().bitmap.addChecked(localId);
+        co_return it.value()->bitmap.addChecked(localId);
     }
 
     // Cache miss — cold load from KV store
@@ -2298,31 +2316,35 @@ seastar::future<bool> NativeIndex::addToDayBitmapForInsert(std::string& cacheKey
     kvKey.append(cacheKey);
 
     // Pre-insert an empty bitmap before co_await so concurrent coroutines
-    // can start adding local IDs immediately.
-    dayBitmapCache_[cacheKey].dirty = true;
+    // can start adding local IDs immediately. The handle also PINS the entry against
+    // eviction for the duration of the load (write-scaleout 5.1).
+    auto pin = ensureEntry(dayBitmapCache_, cacheKey);
+    pin->dirty = true;
     dayBitmapCacheDirtyKeys_.insert(cacheKey);
     auto existing = co_await kvGet(kvKey);
-    // Re-find after co_await (rehash may have moved entries)
-    auto& entry = dayBitmapCache_[cacheKey];
+    // Re-find after co_await: whatever is in the map NOW is what future readers see.
+    auto entry = ensureEntry(dayBitmapCache_, cacheKey);
     if (existing.has_value()) {
         // Merge (OR) to preserve concurrent adds during the co_await suspension.
-        entry.bitmap |= roaring::Roaring::readSafe(existing->data(), existing->size());
-        entry.approxBytes = existing->size();
+        entry->bitmap |= roaring::Roaring::readSafe(existing->data(), existing->size());
+        entry->approxBytes = existing->size();
     }
+    if (entry != pin)
+        entry->bitmap |= pin->bitmap;  // entry was replaced mid-load; keep its adds
     // RE-MARK DIRTY. A flush during the suspension above clears every dirty flag and
     // empties the dirty-key set; the add below would then never be persisted and the
     // series would silently vanish from that day's discovery bitmap.
-    entry.dirty = true;
+    entry->dirty = true;
     dayBitmapCacheDirtyKeys_.insert(cacheKey);
     // The add happens HERE, with NOTHING between it and the re-find above. See the
     // header note on why this function mutates instead of returning a pointer.
-    co_return entry.bitmap.addChecked(localId);
+    co_return entry->bitmap.addChecked(localId);
 }
 
-seastar::future<const roaring::Roaring*> NativeIndex::getDayBitmapByKey(const std::string& cacheKey) {
+seastar::future<NativeIndex::BitmapHandle> NativeIndex::getDayBitmapByKey(const std::string& cacheKey) {
     auto it = dayBitmapCache_.find(cacheKey);
     if (it != dayBitmapCache_.end()) {
-        co_return &it->second.bitmap;
+        co_return it->second;  // handle copy = pin
     }
 
     // Cache miss — load from KV
@@ -2338,20 +2360,20 @@ seastar::future<const roaring::Roaring*> NativeIndex::getDayBitmapByKey(const st
     auto post = dayBitmapCache_.find(cacheKey);
     if (post != dayBitmapCache_.end()) {
         if (val.has_value()) {
-            post.value().bitmap |= roaring::Roaring::readSafe(val->data(), val->size());
-            post.value().approxBytes = val->size();
+            post.value()->bitmap |= roaring::Roaring::readSafe(val->data(), val->size());
+            post.value()->approxBytes = val->size();
         }
-        co_return &post.value().bitmap;
+        co_return post->second;
     }
     if (val.has_value()) {
-        auto& entry = dayBitmapCache_[cacheKey];
-        entry.bitmap = roaring::Roaring::readSafe(val->data(), val->size());
-        entry.dirty = false;
-        entry.approxBytes = val->size();
-        co_return &entry.bitmap;
+        auto entry = ensureEntry(dayBitmapCache_, cacheKey);
+        entry->bitmap = roaring::Roaring::readSafe(val->data(), val->size());
+        entry->dirty = false;
+        entry->approxBytes = val->size();
+        co_return entry;
     }
 
-    co_return nullptr;
+    co_return BitmapHandle{};
 }
 
 void NativeIndex::flushDirtyDayBitmaps(IndexWriteBatch& batch) {
@@ -2361,7 +2383,7 @@ void NativeIndex::flushDirtyDayBitmaps(IndexWriteBatch& batch) {
         auto it = dayBitmapCache_.find(cacheKey);
         if (it == dayBitmapCache_.end())
             continue;
-        auto& entry = it.value();
+        auto& entry = *it.value();
         if (!entry.dirty)
             continue;
 
@@ -2424,7 +2446,7 @@ void NativeIndex::trimBitmapCache() {
     if (!overEntries) {
         // Only compute total bytes if entry count is OK (avoid O(n) scan when unnecessary)
         for (const auto& [key, entry] : bitmapCache_) {
-            totalBytes += entry.approxBytes + key.size();
+            totalBytes += entry->approxBytes + key.size();
         }
         overBytes = totalBytes > maxBitmapCacheBytes();
     }
@@ -2446,9 +2468,14 @@ void NativeIndex::trimBitmapCache() {
         bool doneBytes = !overBytes || totalBytes <= byteTarget;
         if (doneEntries && doneBytes)
             break;
-        if (!it->second.dirty) {
+        // PINNED entries are skipped (write-scaleout 5.1). A handle held by a suspended
+        // reader keeps the entry ALIVE regardless, so this is not a lifetime requirement
+        // -- it keeps the reader and any concurrent writer looking at the SAME entry
+        // instead of at two divergent copies. `owned()` is true exactly when the map
+        // holds the only handle.
+        if (!it->second->dirty && it->second.owned()) {
             if (overBytes) {
-                totalBytes -= it->second.approxBytes + it->first.size();
+                totalBytes -= it->second->approxBytes + it->first.size();
             }
             auto nullPos = it->first.find('\0');
             if (nullPos != std::string::npos) {
@@ -2467,7 +2494,7 @@ void NativeIndex::trimDayBitmapCache() {
     bool overBytes = false;
     if (!overEntries) {
         for (const auto& [key, entry] : dayBitmapCache_) {
-            totalBytes += entry.approxBytes + key.size();
+            totalBytes += entry->approxBytes + key.size();
         }
         overBytes = totalBytes > maxDayBitmapCacheBytes();
     }
@@ -2482,9 +2509,10 @@ void NativeIndex::trimDayBitmapCache() {
         bool doneBytes = !overBytes || totalBytes <= byteTarget;
         if (doneEntries && doneBytes)
             break;
-        if (!it->second.dirty) {
+        // Pinned entries are skipped -- see trimBitmapCache.
+        if (!it->second->dirty && it->second.owned()) {
             if (overBytes) {
-                totalBytes -= it->second.approxBytes + it->first.size();
+                totalBytes -= it->second->approxBytes + it->first.size();
             }
             it = dayBitmapCache_.erase(it);
         } else {
@@ -2605,9 +2633,9 @@ seastar::future<roaring::Roaring> NativeIndex::buildActiveSeriesBitmap(const std
     std::string cacheKey;
     for (uint32_t day = startDay; day <= endDay; ++day) {
         buildDayBitmapCacheKey(cacheKey, measurement, day);
-        auto* bitmap = co_await getDayBitmapByKey(cacheKey);
+        auto bitmap = co_await getDayBitmapByKey(cacheKey);
         if (bitmap) {
-            result |= *bitmap;
+            result |= bitmap->bitmap;
         }
     }
     co_return result;
@@ -2641,6 +2669,11 @@ seastar::future<> NativeIndex::removeExpiredDayBitmaps(const std::string& measur
             }
         }
     }
+    // Erasing is unconditional even for a PINNED entry (unlike the trims, which skip
+    // them): a reader holding a handle keeps its entry alive on the heap, so this only
+    // detaches it from the map -- and detaching is the point, since the day is being
+    // retired. The reader finishes on a snapshot of an expiring day, which is the same
+    // answer it would have got had it started a moment earlier.
     for (const auto& k : toEvict) {
         dayBitmapCache_.erase(k);
     }
@@ -2683,7 +2716,7 @@ NativeIndex::findSeriesWithMetadataTimeScoped(const std::string& measurement,
             measPrefix.push_back('\0');
             for (auto it = dayBitmapCache_.begin(); it != dayBitmapCache_.end(); ++it) {
                 if (it->first.size() >= measPrefix.size() && it->first.compare(0, measPrefix.size(), measPrefix) == 0 &&
-                    !it->second.bitmap.isEmpty()) {
+                    !it->second->bitmap.isEmpty()) {
                     hasDayBitmaps = true;
                     break;
                 }
@@ -2703,26 +2736,24 @@ NativeIndex::findSeriesWithMetadataTimeScoped(const std::string& measurement,
         if (tagFilters.size() == 1) {
             auto& [tagKey, tagValue] = *tagFilters.begin();
             buildBitmapCacheKey(cacheKey, measurement, tagKey, tagValue);
-            auto* tagBitmap = co_await getPostingsBitmapByKey(cacheKey);
+            auto tagBitmap = co_await getPostingsBitmapByKey(cacheKey);
             if (!tagBitmap)
                 co_return std::vector<SeriesWithMetadata>{};
-            activeSeries &= *tagBitmap;
+            activeSeries &= tagBitmap->bitmap;
         } else {
-            // Multi-tag — incrementally intersect into activeSeries.
-            // IMPORTANT: Copy/AND each bitmap immediately because getPostingsBitmapByKey() may
-            // insert into bitmapCache_ (a robin_map), which can rehash and invalidate prior pointers.
+            // Multi-tag — incrementally intersect into an owned accumulator.
             roaring::Roaring tagIntersection;
             bool first = true;
             for (const auto& [tagKey, tagValue] : tagFilters) {
                 buildBitmapCacheKey(cacheKey, measurement, tagKey, tagValue);
-                auto* bmp = co_await getPostingsBitmapByKey(cacheKey);
+                auto bmp = co_await getPostingsBitmapByKey(cacheKey);
                 if (!bmp)
                     co_return std::vector<SeriesWithMetadata>{};
                 if (first) {
-                    tagIntersection = *bmp;
+                    tagIntersection = bmp->bitmap;
                     first = false;
                 } else {
-                    tagIntersection &= *bmp;
+                    tagIntersection &= bmp->bitmap;
                     if (tagIntersection.isEmpty())
                         break;
                 }
@@ -2890,54 +2921,39 @@ seastar::future<> NativeIndex::updateTagHLL(const std::string& measurement, cons
             //  - deserialized sketch: a sketch persisted below the threshold
             //    by an older version stopped receiving ids when the threshold
             //    was introduced; merging the bitmap back-fills the frozen gap.
-            // The seed is taken BY VALUE, and that is the whole point.
-            //
-            // This used to hold a `const roaring::Roaring*` into bitmapCache_ across a
+            // WHY THE SEED COMES THROUGH A HANDLE. This used to hold a
+            // `const roaring::Roaring*` into bitmapCache_ across a
             // `co_await getPostingsBitmapByKey(...)` and then iterate it, on the argument
-            // that "the seed loop below does not suspend". That argument is exactly the
-            // one write-scaleout 4d disproved: the pointer is computed INSIDE a coroutine
-            // that suspended, so the loop runs in a DIFFERENT reactor task than the
-            // `co_return` that produced it, and any other insert on this shard can rehash
-            // bitmapCache_ (open addressing, Roaring by value -- every bitmap moves) or
-            // flush+trim the entry in between.
+            // that "the seed loop below does not suspend" -- the argument write-scaleout
+            // 4d disproved, since the pointer is computed INSIDE a coroutine that
+            // suspended and the loop therefore runs in a DIFFERENT reactor task. 4d fixed
+            // it by discarding the pointer and re-finding the key; 5.1 makes the accessor
+            // hand back a heap-stable PINNED handle instead, so holding it is simply
+            // correct and the re-find dance is gone.
             //
-            // It is the worse instance of the two, because getPostingsBitmapByKey's
-            // cold-load branch inserts the entry with `dirty = false`, i.e. IMMEDIATELY
-            // trim-eligible; and it sits on the hot write path (getOrCreateSeriesId ->
-            // updateTagHLL) under exactly the memory pressure the production crash needed.
-            //
-            // The copy is a one-time cost: this branch runs only when a tag value first
-            // crosses kTagHllMinCardinality, or when an old sub-threshold sketch is
-            // back-filled. Correctness beats a few KB there.
-            roaring::Roaring seed;
-            bool haveSeed = false;
+            // The seed loop still must not run while the entry is being mutated, but the
+            // only mutations happen in non-suspending regions of this same shard, so the
+            // loop below (which does not suspend) is safe against them.
+            BitmapHandle seed;
             auto bmIt = bitmapCache_.find(seedBitmapKey);
             if (bmIt != bitmapCache_.end()) {
-                seed = bmIt.value().bitmap;  // no suspension since the find
-                haveSeed = true;
+                seed = bmIt->second;
             } else {
-                // Evicted during the suspension (a flush cleared its dirty flag and a trim
-                // ran). Reload it -- for its SIDE EFFECT of repopulating bitmapCache_ --
-                // and then RE-FIND by key. The returned pointer is deliberately discarded
-                // and never dereferenced: it belongs to the task that produced it.
-                (void)co_await getPostingsBitmapByKey(seedBitmapKey);
+                // Evicted during the suspension (a flush cleared its dirty flag and a
+                // trim ran). Reload it; the handle keeps it alive for us.
+                seed = co_await getPostingsBitmapByKey(seedBitmapKey);
                 // Re-find the sketch after suspending again.
                 it = hllCache_.find(key);
                 if (it == hllCache_.end()) {
                     it = hllCache_.try_emplace(key).first;
                 }
-                auto reIt = bitmapCache_.find(seedBitmapKey);
-                if (reIt != bitmapCache_.end()) {
-                    seed = reIt.value().bitmap;
-                    haveSeed = true;
-                }
-                // Still absent means it was evicted AGAIN in that window, or the key has
-                // no postings on disk. Skip seeding, exactly as the old null-pointer path
-                // did: an unseeded sketch under-reports until the next add, which is a
-                // recoverable estimate error, not memory corruption.
+                // A still-empty handle means the key has no postings on disk. Skip
+                // seeding, exactly as the old null-pointer path did: an unseeded sketch
+                // under-reports until the next add, which is a recoverable estimate
+                // error, not memory corruption.
             }
-            if (haveSeed) {
-                for (uint32_t existingId : seed) {
+            if (seed) {
+                for (uint32_t existingId : seed->bitmap) {
                     it.value().add(existingId);
                 }
             }
@@ -2992,7 +3008,7 @@ seastar::future<> NativeIndex::flushDirtyMeasurementBlooms(IndexWriteBatch& batc
         auto& key = it->first;
         // Cache key format: "measurement\0tagKey\0tagValue"
         size_t sep = key.find('\0');
-        if (sep == std::string::npos || it->second.bitmap.isEmpty())
+        if (sep == std::string::npos || it->second->bitmap.isEmpty())
             continue;
         auto bucket = keysByMeasurement.find(std::string_view(key.data(), sep));
         if (bucket != keysByMeasurement.end()) {
@@ -3126,9 +3142,9 @@ seastar::future<double> NativeIndex::estimateTagCardinality(const std::string& m
     // Fallback: check roaring bitmap cardinality (exact)
     std::string cacheKey;
     buildBitmapCacheKey(cacheKey, measurement, tagKey, tagValue);
-    auto* bitmap = co_await getPostingsBitmapByKey(cacheKey);
+    auto bitmap = co_await getPostingsBitmapByKey(cacheKey);
     if (bitmap) {
-        co_return static_cast<double>(bitmap->cardinality());
+        co_return static_cast<double>(bitmap->bitmap.cardinality());
     }
 
     co_return 0.0;

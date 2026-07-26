@@ -27,6 +27,7 @@
 #include <seastar/core/gate.hh>
 #include <seastar/core/semaphore.hh>
 #include <seastar/core/shared_future.hh>
+#include <seastar/core/shared_ptr.hh>
 #include <seastar/core/smp.hh>
 #include <seastar/core/timer.hh>
 #include <unordered_map>
@@ -382,24 +383,56 @@ private:
         // container list (getSizeInBytes) on every flush.
         size_t approxBytes = 0;
     };
+    // HEAP-STABLE CACHE VALUES + AN EVICTION PIN (write-scaleout 5.1). This used to be
+    // `robin_map<std::string, BitmapEntry>` -- open addressing, entries BY VALUE -- and
+    // that is what made every pointer into it unholdable across a suspension:
+    //
+    //   * REHASH. Any insert could rehash the map and RELOCATE every entry, so a
+    //     `&entry.bitmap` computed before a `co_await` pointed at moved memory after it.
+    //   * EVICTION. `trimBitmapCache()` erases clean entries outright, destroying the
+    //     `Roaring`, and the flush immediately before it clears the `dirty` flag that was
+    //     the entry's only protection from being evicted.
+    //
+    // Phase 4d fixed the WRITE side by mutating inside the accessor, and left the READ
+    // side under a "consume the pointer immediately" contract that is not actually
+    // satisfiable -- the invalidation happens BEFORE the caller resumes, so there is no
+    // instant at which the caller could have consumed it safely. The contract is retired
+    // rather than documented:
+    //
+    //   * `lw_shared_ptr` values are heap-stable: a rehash moves the 8-byte handle, never
+    //     the entry, so no outstanding reference is invalidated by an insert. (lw_, not
+    //     std::shared_ptr: the refcount is non-atomic, and an index is shard-local.)
+    //   * The handle IS the pin. A reader holding one keeps the entry alive even if the
+    //     map drops it, so eviction can never free memory a suspended reader is about to
+    //     read. The trims additionally SKIP entries whose handle is not `owned()` (i.e.
+    //     someone else holds one), so a pinned entry stays in the map and a reader and a
+    //     concurrent writer keep seeing the SAME entry rather than diverging snapshots.
+    //
+    // Values are never null: create through `ensureEntry()`, which materializes the
+    // handle, rather than through `operator[]` (which would insert an empty handle).
+    using BitmapHandle = seastar::lw_shared_ptr<BitmapEntry>;
+    using BitmapCache = tsl::robin_map<std::string, BitmapHandle>;
+    static BitmapHandle ensureEntry(BitmapCache& cache, const std::string& key);
+
     // In-memory bitmap cache. Key: "measurement\0tagKey\0tagValue"
     // Populated lazily on first access (insert or query), flushed before memtable swap.
-    tsl::robin_map<std::string, BitmapEntry> bitmapCache_;
+    BitmapCache bitmapCache_;
     // Keys of dirty entries (mirrors hllCacheDirty_): flushes iterate this
     // set instead of walking the entire cache (up to 100K entries) per flush.
     std::unordered_set<std::string> bitmapCacheDirtyKeys_;
 
-    // Get or load a bitmap (read-only). Returns nullptr if not found anywhere.
+    // Get or load a bitmap (read-only). Returns an EMPTY handle if not found anywhere.
     // Uses pre-built cache key to avoid double string construction.
     //
-    // CALLER CONTRACT: the returned pointer is valid ONLY until the next suspension
-    // point, and strictly speaking not even that -- it is computed inside a coroutine
-    // that may have suspended, so a rehash or a trim can land between the `co_return`
-    // and the caller's resumption (see addToPostingsBitmapForInsert for the mechanism).
-    // Every caller must consume it -- copy it, OR it into an accumulator -- as the first
-    // thing it does, and must never store it. The WRITE paths no longer take this risk;
-    // hardening the read paths the same way is filed in docs/write-scaleout-plan.md.
-    seastar::future<const roaring::Roaring*> getPostingsBitmapByKey(const std::string& cacheKey);
+    // The handle is a PIN: holding it keeps the entry alive across any number of
+    // suspensions, and the trims will not evict an entry while it is held. That retires
+    // the old "consume the returned pointer immediately" contract, which was
+    // unsatisfiable (the rehash/trim that invalidated the pointer happened BEFORE the
+    // caller resumed, so there was no safe instant in which to consume it). Callers may
+    // now hold the handle across `co_await`s; the only remaining rule is the ordinary one
+    // that a bitmap being MUTATED concurrently must not be iterated, so a caller that
+    // yields mid-iteration still copies (see findSeriesByTag).
+    seastar::future<BitmapHandle> getPostingsBitmapByKey(const std::string& cacheKey);
     // Load (if cold) the postings bitmap named by `cacheKey` and ADD `localId` to it,
     // returning the resulting cardinality. Marks the entry dirty.
     //
@@ -476,7 +509,9 @@ private:
     static constexpr uint64_t kTagHllMinCardinality = 10000;
 
     // --- Phase 3: Time-scoped per-day bitmaps ---
-    tsl::robin_map<std::string, BitmapEntry> dayBitmapCache_;
+    // Same heap-stable + pinned shape as bitmapCache_ above, for the same reasons; this
+    // is the hotter of the two on the insert path (once per series per day per BATCH).
+    BitmapCache dayBitmapCache_;
     std::unordered_set<std::string> dayBitmapCacheDirtyKeys_;  // see bitmapCacheDirtyKeys_
 
     static void buildDayBitmapCacheKey(std::string& out, const std::string& measurement, uint32_t day);
@@ -486,7 +521,8 @@ private:
     // addToPostingsBitmapForInsert -- this is the path the reported crash was on, being
     // the only one entered once per series per day per BATCH.
     seastar::future<bool> addToDayBitmapForInsert(std::string& cacheKey, uint32_t localId);
-    seastar::future<const roaring::Roaring*> getDayBitmapByKey(const std::string& cacheKey);
+    // Read-only accessor; see getPostingsBitmapByKey for what the handle guarantees.
+    seastar::future<BitmapHandle> getDayBitmapByKey(const std::string& cacheKey);
     void flushDirtyDayBitmaps(IndexWriteBatch& batch);
     seastar::future<roaring::Roaring> buildActiveSeriesBitmap(const std::string& measurement, uint32_t startDay,
                                                               uint32_t endDay);
