@@ -96,7 +96,11 @@ public:
         const size_t lim = limitBytes(cls_);
         if (inFlight_ != 0 && inFlight_ + bytes > lim) {
             ++rejected_;
-            throw data::WriteOverloadedError(std::string("cluster: shard ") + name(cls_) + " write buffer full (" +
+            // The ORIGINATED wording is byte-identical to what shipped before the second
+            // budget existed ("cluster: shard write buffer full (N of M bytes in flight)")
+            // -- backpressure_gate.sh greps the server log for exactly that, and so may an
+            // operator's alert. Only the new class adds a word.
+            throw data::WriteOverloadedError(std::string("cluster: shard ") + name(cls_) + " buffer full (" +
                                              std::to_string(inFlight_) + " of " + std::to_string(lim) +
                                              " bytes in flight); retry this write");
         }
@@ -117,7 +121,9 @@ public:
 private:
     explicit WriteAdmission(AdmissionClass cls = AdmissionClass::Originated) : cls_(cls) {}
 
-    static const char* name(AdmissionClass c) { return c == AdmissionClass::PeerIngress ? "peer-ingress" : "write"; }
+    static const char* name(AdmissionClass c) {
+        return c == AdmissionClass::PeerIngress ? "peer-ingress write" : "write";
+    }
 
     // Parse a byte count from `env`, or the default. STRICT (see below).
     static size_t parseLimit(const char* env, const char* what) {
