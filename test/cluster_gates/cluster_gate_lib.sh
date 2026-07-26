@@ -48,8 +48,7 @@ kill_cluster() { # $1 = port prefix used by this gate, e.g. 492
     # did match it. The fix is for hand-saved binaries, which is how people actually
     # measure a "before".)
     #
-    # THE PREFIX IS NOT UNIQUE PER GATE -- 493 covers both fault_injection (49310-49312)
-    # and deposed_primary (49310-49314), 492 covers both backpressure and
+    # THE PREFIX IS NOT UNIQUE PER GATE -- 492 covers both backpressure and
     # rolling_rebalance -- so this DOES reach a same-band gate's cluster. That is fine,
     # and it is why the README's "run them ONE AT A TIME" rule is a rule: with only one
     # gate live, anything else in the band is a stray from a crashed run and killing it is
@@ -177,6 +176,15 @@ wait_leadership_settled() {
 # The Raft and data-plane listeners sit at +2000/+1000 offsets from the HTTP port, so all
 # three have to be checked -- an earlier version of these gates only killed by HTTP port
 # and was bitten by exactly that.
+# CHOOSE PORTS BELOW THE EPHEMERAL RANGE (`cat /proc/sys/net/ipv4/ip_local_port_range`,
+# 32768-60999 here). A gate starts its nodes in a burst and each dials the others' Raft and
+# data ports, so a gate whose own ports sit inside that range races the kernel for them: an
+# outbound connection from an earlier node gets handed the port a later node still has to
+# bind, seastar exits on the failed listen, and the gate reports "cluster did not converge"
+# with one node silently absent. It scales with node count and with how busy the box is --
+# `deposed_primary_gate.sh` (five nodes) hit it four times in one session and was moved to
+# 19310+ for that reason; the 3-node gates are exposed to the same race, less often. See the
+# debt register.
 require_ports_free() { # $@ = HTTP ports
     local busy="" p
     for p in "$@"; do

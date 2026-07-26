@@ -19,23 +19,31 @@ cd "$(dirname "$0")" || exit 2
 
 BIN="${1:-$BUILD_DIR/bin/timestar_http_server}"
 [ -x "$BIN" ] || { echo "no server binary at $BIN"; exit 2; }
-PORTS="49310 49311 49312 49313 49314"
+# PORTS BELOW THE EPHEMERAL RANGE (32768-60999 here), deliberately. This gate starts FIVE
+# nodes in a burst and each one dials the others' Raft/data ports, so with the gate's ports
+# inside the ephemeral range the kernel hands a peer's OUTBOUND connection the very port a
+# later-starting node still has to bind: seastar then exits on the failed listen, one node
+# silently never comes up, and the gate fails as "cluster did not converge". Observed four
+# times in one session on node 3 (49312, then 51312 three runs running) before moving the
+# whole gate below 32768. The 3-node gates are exposed to the same race, just less often --
+# see the debt register.
+PORTS="19310 19311 19312 19313 19314"
 WRITES="${GATE_WRITES:-300}"
 
-kill_cluster 493
-require_ports_free 49310 49311 49312 49313 49314
+kill_cluster 193
+require_ports_free 19310 19311 19312 19313 19314
 for i in 1 2 3 4 5; do rm -rf "/tmp/tsgate_dp$i"; mkdir -p "/tmp/tsgate_dp$i"; done
-PEERS="127.0.0.1:49310,127.0.0.1:49311,127.0.0.1:49312,127.0.0.1:49313,127.0.0.1:49314"
+PEERS="127.0.0.1:19310,127.0.0.1:19311,127.0.0.1:19312,127.0.0.1:19313,127.0.0.1:19314"
 for i in 1 2 3 4 5; do
     env TIMESTAR_DATA_DIR="/tmp/tsgate_dp$i" TIMESTAR_CLUSTER_ENABLED=true TIMESTAR_CLUSTER_PARTITIONED=true \
         TIMESTAR_CLUSTER_REPLICATION_FACTOR=3 TIMESTAR_CLUSTER_NODE_ID=$i TIMESTAR_CLUSTER_PEERS="$PEERS" \
-        "$BIN" --port $((49309 + i)) --smp 2 >"/tmp/tsgate_dp$i/s.log" 2>&1 &
+        "$BIN" --port $((19309 + i)) --smp 2 >"/tmp/tsgate_dp$i/s.log" 2>&1 &
 done
-trap 'kill_cluster 493' EXIT
+trap 'kill_cluster 193' EXIT
 
 wait_all_led "$PORTS" 4096 150 || gate_exit
 
-HOSTED=$(status_field "$(cluster_status 49310)" vshards_hosted)
+HOSTED=$(status_field "$(cluster_status 19310)" vshards_hosted)
 echo "  node 1 hosts $HOSTED of 4096 VShards (it must FORWARD the rest by placement primary)"
 # If the coordinator hosts everything the gate is vacuous -- it cannot reach the
 # stale-primary path at all. This is the check that makes a 3-node run FAIL rather than
@@ -84,7 +92,7 @@ echo "=== $WRITES writes to node 1, against deposed primaries ==="
 BASE_TS=1700000000000000000
 OK=0; E5XX=0; OTHER=0
 for i in $(seq 0 $((WRITES - 1))); do
-    CODE=$(curl -s -m10 -o /tmp/tsgate_dp_resp.txt -w '%{http_code}' -X POST http://127.0.0.1:49310/write \
+    CODE=$(curl -s -m10 -o /tmp/tsgate_dp_resp.txt -w '%{http_code}' -X POST http://127.0.0.1:19310/write \
         -H 'Content-Type: application/json' \
         -d "{\"measurement\":\"deposed\",\"tags\":{\"host\":\"h$i\"},\"fields\":{\"v\":1.0},\"timestamp\":$((BASE_TS + i * 1000000000))}")
     case "$CODE" in

@@ -40,6 +40,11 @@ consensus) is filed in the plan doc's Phase 5 outcome.
 
 ## Why the topologies differ
 
+`deposed_primary_gate.sh` runs on **19310-19314**, not in the 493xx band the other gates
+use, because its ports have to sit BELOW the ephemeral range — see `require_ports_free`'s
+note in `cluster_gate_lib.sh`. That also means its `kill_cluster` prefix (193) no longer
+collides with `fault_injection_gate.sh`'s.
+
 `deposed_primary_gate.sh` uses **five** nodes at RF=3 on purpose. At RF=3 on THREE nodes
 every node hosts every Raft group, so the router's `LeaderResolver` always knows the real
 leader locally and the stale-primary path is unreachable — a 3-node run passes even on a
