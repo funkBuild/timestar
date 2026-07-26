@@ -89,6 +89,15 @@ forwarder is not a server number, so the dip is asserted against a QUIET baselin
 through the same proxy — not against an unproxied figure. (In practice the handicap is
 small: 4.96 M pts/s baseline vs 5.0-5.1 M unproxied.)
 
+**It is a discriminating gate, proven by A/B.** The same tree with only the three 4a
+files reverted to `ad77cf3` (`write_errors.hpp`, `replicated_write_router.{cpp,hpp}` —
+so 4b's jitter and keepalive are still present) FAILS it, under an identical fault:
+147 reset rounds destroying 400 peer connections → **9 bench HTTP errors + 1 probe 5xx**,
+every one of them `RetryableWriteError: N VShard slice(s) uncommitted after 6 attempt(s)
+(last: transport)` — the [D6] signature verbatim. The Phase-4 binary takes the identical
+storm (147 rounds, 392 connections) with zero. Throughput was 92% of baseline before and
+94% after, i.e. the fix converts errors into a little latency and costs nothing else.
+
 **Result on the Phase-4 binary:** 147 reset rounds destroying 392 peer connections
 mid-bench → **2000/2000 bench requests OK, 200/200 probe writes OK, 0 HTTP errors, 0
 server-side 500s, 0 crashes**; throughput 4.68 M vs a 4.96 M baseline (**94% retained**);

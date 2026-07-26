@@ -1,7 +1,17 @@
 # Cluster Write Scale-Out Plan
 
-Status: Phases 1, 2 and 3 IMPLEMENTED (2026-07-25); Phases 4-6 planned.
+Status: Phases 1, 2, 3 and 4 IMPLEMENTED (Phase 4: 2026-07-26); Phases 5-6 planned.
 Branch `cluster-design`.
+
+Phase 4 result: **[D6] is closed on the measurement it was defined by.** The canonical
+bench's rejected-run rate went 2-in-6 (Phase 2) -> 1-in-9 (Phase 3) -> **0 in 8**, with
+median throughput 5.34 M pts/s and p50 82.7 ms (Phase 3: 4.98 M / 93.5 ms), and no run's
+MAX latency exceeded 173 ms -- i.e. no request came close to burning the 1.5 s retry
+deadline, which is what the one rejected Phase-3 run did at 1471 ms. More importantly the
+window is no longer measured statistically at all: `test/cluster_gates/fault_injection_
+gate.sh` injects the actual fault (147 rounds of TCP RSTs destroying ~400 peer connections
+mid-bench) and the same tree with ONLY the three 4a files reverted fails it 9+1 errors to
+0. See "Phase 4 gate outcomes" below.
 
 Phase 3 result: the availability phase, not a throughput phase — and it did not
 move throughput (median 4.98M vs Phase 2's 5.06M, flat within noise), which is
@@ -413,6 +423,169 @@ is real and client-visible.
 Gates: fault-injection round (connection reset mid-bench) → 0 HTTP errors;
 node kill → errors only for writes whose deadline truly expired; restart
 catch-up verified (existing gate).
+
+### Phase 4 outcome (2026-07-26) — IMPLEMENTED
+
+4a. **Retry pacing vs the reconnect window. The retry could not reach the thing it was
+    retrying.** `DataPlaneRpc::clientFor` hands back the DEAD client for the 200 ms
+    `kReconnectBackoff` after a connection dies -- deliberate, so a burst of writes to a
+    down peer costs one dial and not one per write. The 3b retry paused a FLAT 20 ms
+    between attempts, so its whole budget (5 pauses = 100 ms) fit INSIDE one such window:
+    all six attempts fast-failed against the same dead socket, the transport was never
+    asked to re-dial, and a 200 ms blip against a HEALTHY peer became a client 5xx.
+
+    The fix is the extension `WriteFailure` was designed for -- a PACING table beside the
+    policy table. `Transport` and `Overloaded` (the two classes whose cure is waiting for
+    something to come back) back off geometrically from the same 20 ms base
+    (20/40/80/160/320, capped), spanning ~620 ms across the budget: three reconnect
+    windows inside the 1.5 s deadline. The leader-shaped classes keep the flat 20 ms,
+    because a `NotLeader` retry goes to a DIFFERENT node on the 3a hint and backing off
+    would add hundreds of ms of p99 to every routine rebalance for no availability gain.
+    A mixed batch takes the MAXIMUM over the classes it saw. Delays are jittered +/-25%.
+
+    The coupling to the transport constant is a `static_assert` against one shared
+    definition (`lib/cluster/reconnect_policy.hpp`), not a comment.
+
+    NOTE for whoever tunes these numbers: for a SLOW peer the pacing barely matters --
+    `kAttemptTimeout` (600 ms) dominates and both schedules fit ~3 attempts in the
+    deadline. The geometric schedule only changes the case the attempts fail FAST, which
+    is exactly the dead-connection case. That is why it costs nothing on the rebalance
+    gate and everything on the reset gate.
+
+4b. **Connection health.** (i) Reconnect jitter (+/-50%) shared by both transports:
+    un-jittered, a peer restart drops N_shards x N_peers connections at one instant and
+    every one re-dials at the same instant, fails together, and stays in lockstep for the
+    whole outage. (ii) TCP keepalive (5s idle / 2s interval / 3 probes) on every peer
+    connection via seastar's own `rpc::client_options.keepalive`, so a flow that dies
+    while idle is retired by the kernel rather than discovered by the first write that
+    hangs to its attempt deadline. Deliberately NOT an application-level ping verb: that
+    needs a timer per peer per shard, a verb in every wire version, and its own timeout
+    policy, and cannot beat the kernel to a flow the kernel has already given up on.
+    (iii) Peer registration was two independent try-guarded loops with two separate DNS
+    lookups, so a hiccup hitting one and not the other left a permanently ASYMMETRIC view
+    of a peer (Raft replicating to it while forwarded writes said "unknown peer", or the
+    reverse) that nothing ever re-resolved. Now one resolution feeds every plane,
+    all-or-nothing, and unresolved peers go on a retry list a periodic resolver drains.
+
+    Deviation from the plan text: the lazy re-resolution lives in `ClusterDataPlane`, not
+    in `clientFor`. `clientFor` is synchronous (it returns a raw client pointer) so it
+    cannot await DNS, and it can only see the data plane -- fixing it there would have
+    left the Raft half of the asymmetry unaddressed.
+
+4c. **Fault-injection gate** (`test/cluster_gates/fault_injection_gate.sh` +
+    `tcp_reset_proxy.py`). See the gate README for the topology and the three
+    anti-vacuity assertions, each of which a real earlier run of the gate failed.
+
+Gate outcomes (2026-07-26):
+
+- **Fault injection (the new discriminating gate).** 147 reset rounds destroying 392 peer
+  connections mid-bench -> **2000/2000 bench requests OK, 200/200 probe writes OK, 0 HTTP
+  errors, 0 server-side 500s, 0 crashes**; 94% of the proxied baseline throughput
+  retained; all 200 acked probe points readable **on every node**. The same tree with only
+  the three 4a files reverted to `ad77cf3` (4b still present) takes the identical storm
+  (147 rounds, 400 connections) and produces **9 bench HTTP errors + 1 probe 5xx**, every
+  one `"N VShard slice(s) uncommitted after 6 attempt(s) (last: transport)"`. The cost of
+  the fix lands where it is meant to: p99 batch latency 121 -> 175 ms, max 170 -> 346 ms.
+- **[D6] rejected-run rate: 0 of 8** canonical runs (100x10k, hosts=1000, conns=8,
+  `--smp 4`, RF=3 on 3 nodes, leadership balanced first). Throughputs 4.99/5.25/5.42/5.36/
+  5.29/5.60/5.33/5.44 M pts/s (**median 5.34 M**), p50 76-93 ms (**median 82.7 ms**), max
+  120-173 ms. Zero server-side 500s and zero fence events across the campaign.
+- **Rolling rebalance:** 2216 transfers mid-bench, **600/600 OK, 0 HTTP errors**, 4.86 M
+  pts/s, leadership converged to [1364 1368 1364] -- identical to Phase 3.
+- **Deposed primary (5 nodes, RF=3):** 16613 transfers, **300/300 accepted, 0 5xx, 0
+  500s**.
+- **Backpressure:** 16 x 503 all carrying `Retry-After`, 0 x 500; 200/200 rejected under
+  the artificial 1 MB budget with the budget named; restarted at the default budget the
+  same cluster runs **200/200 OK at 5.07 M pts/s**.
+- **Node kill mid-bench:** 285 OK / 15 bounded 503s (`last: transport`, after the retry
+  budget against a genuinely dead node), 0 server-side 500s; restart -> full catch-up
+  (`peer_caught_up` == `vshards_led` on all three: 1364/1368/1364). **kill -9 of the whole
+  cluster:** 200/200 acked points readable on every node after restart.
+- Suites: **4097 unit tests / 417 suites green** (run from the build root -- two
+  source-inspection tests read `lib/...` relative to CWD and fail from anywhere else),
+  **30 socket tests green**.
+
+**MEASUREMENT HAZARD, recorded because it cost a run.** These gates are disk-hungry: the
+600-batch rolling-rebalance gate writes ~10 GB per node of Raft journal + TSM, and the
+fault gate's two 2000-batch runs wrote 27 GB across three nodes. On this box /tmp is a
+per-user-quota tmpfs, so exhausting it does NOT look like a disk-full error -- every
+`JournalWriter` fences with `Disk quota exceeded` and the cluster degrades into exactly
+the shape a write-path regression would produce. A first rolling-rebalance run showed
+**579 HTTP errors and 31 k pts/s** and was pure quota artifact; re-run with space free it
+was 600/600 and 4.86 M. Check free space before believing a bad cluster number, and grep
+the node logs for `Disk quota exceeded` before blaming the code (the D6 script above
+asserts on that count for this reason).
+
+4d. **The `roaring_bitmap_add` crash: ROOT-CAUSED as a use-after-free, not an allocation
+    failure. FIXED.**
+
+    `getOrLoadDayBitmapForInsert` (and its postings twin) returned a `roaring::Roaring*`
+    pointing INTO the cache and let the caller write through it:
+
+        if ((co_await getOrLoadDayBitmapForInsert(key))->addChecked(localId)) ...
+
+    There is no `co_await` between the two, which is why it read as safe. But the pointer
+    is computed INSIDE a coroutine that suspends (`co_await kvGet` on a cold key), so
+    `co_return &entry.bitmap` and the caller's `->addChecked` run in DIFFERENT reactor
+    tasks. In between, any other insert coroutine on the shard can (a) insert a new key
+    and REHASH the cache -- a `tsl::robin_map`, OPEN ADDRESSING, holding
+    `roaring::Roaring` BY VALUE, so every bitmap moves -- or (b) cross the memtable
+    threshold, running `flushDirtyDayBitmaps()` (which clears the `dirty` flag that
+    protects an entry from eviction, and calls runOptimize/shrinkToFit) and then
+    `trimDayBitmapCache()`, which ERASES the now-clean entry.
+
+    That explains both halves of the reported signature exactly: memory pressure makes
+    the trim routine (hence "always right after the pressure dump"), and distinct SERIES
+    count -- not byte count -- makes the rehash routine (hence "vanishes when the same
+    bytes arrive as few series with many timestamps"). The day-bitmap path lands first
+    because it is entered once per series per day per BATCH, where postings is entered
+    once per NEW series.
+
+    Silent second half: an add landing on an entry whose dirty flag had been cleared
+    during the suspension was never persisted, so the series disappeared from that day's
+    discovery bitmap. A wrong answer, not a crash.
+
+    FIX: `addToDayBitmapForInsert` / `addToPostingsBitmapForInsert` mutate INSIDE, after
+    re-finding the entry, with no suspension in between, and re-mark the entry dirty.
+    Cardinality comes back BY VALUE. Pinned by
+    `DayBitmapSourceInspection.NoBitmapPointerEscapesASuspendingCoroutine`, which fails on
+    the pre-fix file (verified by reverting it and re-running).
+
+    **The CRoaring allocator hook was considered and RULED OUT, with evidence.** It would
+    not have prevented this crash -- the fault is a UAF, not an OOM -- and it cannot
+    deliver the "clean `std::bad_alloc`" it promises:
+
+      * `roaring::Roaring::add` is declared `noexcept` (roaring.hh), so a throwing
+        allocator hook terminates the process rather than surfacing an error. An abort
+        with a message beats a garbage-address SIGSEGV for forensics, but it is still a
+        node crash, not the "clean error" the HA bar asks for.
+      * Unwinding out of the hook is not even safe: `array_container_grow` assigns
+        `container->capacity = new_capacity` BEFORE its `roaring_realloc`, so a throw
+        leaves the container claiming a capacity its array does not have -- subsequent
+        adds write out of bounds. A hook would trade a diagnosable crash for silent
+        corruption.
+
+    If the allocator hook is wanted anyway (for attribution of roaring's allocations to
+    seastar's accounting, which is a real and separate benefit), it must be a
+    log-and-abort hook, not a throwing one, and that decision should be recorded as such.
+
+**Filed for the index owner (found during 4d, NOT fixed here):**
+
+- **Day-bitmap membership is lost between memory and disk under concurrency + frequent
+  flushes.** With a 4 KB write buffer and concurrent inserts, the warm pre-close
+  time-scoped count is EXACTLY right (600/600) and the count after close+reopen is short
+  by roughly one chunk (559/600, evenly across days). It needs BOTH concurrency and
+  frequent flushes -- the same workload run sequentially persists everything, and at a
+  64 KB buffer the loss disappears -- so it is in the flush/compaction path, not the add
+  path 4d fixed. It reproduces IDENTICALLY on the pre-4d index code. One-command repro:
+  `./test/timestar_unit_test --gtest_also_run_disabled_tests --gtest_filter=
+  '*DISABLED_ConcurrentInsertsWithTinyWriteBufferLoseDayMembership'`.
+- **The READ-side bitmap accessors still escape.** `getPostingsBitmapByKey` /
+  `getDayBitmapByKey` still return `const roaring::Roaring*` out of a suspending
+  coroutine, with the same rehash/trim hazard. Their declarations now state the
+  consume-immediately contract, and the structural test only forbids the MUTABLE escape.
+  The clean fix is to make the cache values heap-stable (`unique_ptr<BitmapEntry>`), which
+  removes the rehash half for every holder at once; the eviction half needs a pin.
 
 ### Phase 5 — Consensus-layer efficiency (after the funnel is gone)
 
