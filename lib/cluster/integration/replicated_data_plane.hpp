@@ -44,6 +44,11 @@ public:
     ReplicatedVShardHost& host() { return host_; }
 
     void startTicking() { host_.startTicking(); }
+    // Start the background Raft-log snapshot/compaction trigger (debt D-6). Separate from
+    // startTicking() because it is a POLICY loop rather than consensus: a test drives
+    // `host().maybeSnapshotOnce()` directly instead, and the composition tests that only
+    // exercise replication leave it off.
+    void startSnapshotTrigger() { host_.startSnapshotTrigger(); }
     seastar::future<> stop() { return host_.stop(); }
 
 private:

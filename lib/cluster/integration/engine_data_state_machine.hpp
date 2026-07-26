@@ -49,10 +49,28 @@ public:
 
     uint64_t appliedIndex() const { return appliedIndex_; }
 
+    // Entry-payload BYTES applied since the last snapshot install/produce (debt D-6).
+    //
+    // Half of the snapshot trigger. Entry COUNT bounds restart REPLAY TIME (each entry is
+    // a WriteBatch that has to be decoded and re-applied); bytes bound the JOURNAL'S DISK
+    // FOOTPRINT, and the two diverge by orders of magnitude across real workloads -- a
+    // fleet writing 10k-point batches reaches a byte threshold in a few hundred entries,
+    // while a trickle of single-point writes reaches an entry threshold having written
+    // almost nothing. A trigger on either one alone therefore misses one of the two
+    // problems snapshotting exists to solve, so the policy uses both.
+    //
+    // Counted here rather than in the host because this is the one place every applied
+    // entry passes through, and it costs one add on a path that already decodes the entry.
+    uint64_t appliedBytesSinceSnapshot() const { return appliedBytesSinceSnapshot_; }
+    // Called by the snapshot producer once compaction has succeeded: the log below the new
+    // boundary is gone, so the bytes it held no longer count against the next trigger.
+    void noteSnapshotTaken() { appliedBytesSinceSnapshot_ = 0; }
+
 private:
     EngineLocalStore& store_;
     VShardId vshard_;
     uint64_t appliedIndex_ = 0;
+    uint64_t appliedBytesSinceSnapshot_ = 0;
 };
 
 }  // namespace timestar::cluster

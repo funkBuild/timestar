@@ -155,6 +155,23 @@ public:
     // by the driver after it has durably written the snapshot payload.
     void compact(LogIndex upto, std::string snapshotData);
 
+    // Seed the SERVABLE snapshot from one recovered off this node's journal, at
+    // construction time only (debt D-6).
+    //
+    // The constructor takes a RaftLog that may already be RESTORED to a snapshot boundary
+    // (recoverRaftState does that), which is enough for this node's own log arithmetic --
+    // but it leaves `snapshot_` empty, so a restarted node that later becomes LEADER has
+    // nothing to serve a follower below its boundary: `sendAppend` finds no prev term,
+    // hands off to `sendInstallSnapshot`, and that returns immediately ("nothing to
+    // serve"). The follower could then never be caught up until this node happened to take
+    // a fresh snapshot. Before D-6 wired the producer this was unreachable, because nothing
+    // ever compacted; it is reachable now.
+    //
+    // Refuses (throws) a snapshot that does not sit exactly at the log's boundary -- that
+    // pairing is the one thing making the seeded payload the right bytes for the index it
+    // claims, and serving a mismatched one would install the wrong state on a follower.
+    void seedRecoveredSnapshot(Snapshot snap);
+
     // Output draining (single-threaded: ready() -> persist+send+apply -> advance()).
     bool hasReady() const;
     Ready ready();
@@ -200,6 +217,10 @@ public:
     uint64_t stagedSnapshotBytes() const { return snapStaging_ ? snapStaging_->data.size() : 0; }
     LogIndex commitIndex() const { return commitIndex_; }
     const RaftLog& log() const { return log_; }
+    // The snapshot this node can currently SERVE to a lagging peer (index == kNoIndex when
+    // there is none). The driver needs it after `compact()` in order to PERSIST it -- see
+    // RaftGroup::compact for why an unpersisted snapshot makes compaction pointless.
+    const Snapshot& servableSnapshot() const { return snapshot_; }
     unsigned electionTimeout() const { return electionTimeout_; }
 
     bool isVoter(NodeId n) const;

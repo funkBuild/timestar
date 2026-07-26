@@ -141,6 +141,18 @@ void set_routes(routes& r) {
                           caught += "\"" + std::to_string(peer) + "\":" + std::to_string(n);
                       }
                       body += ",\"peer_caught_up\":{" + caught + "}";
+                      // Raft-log snapshot/compaction (debt D-5/D-6). `snapshots_taken`
+                      // rising is how an operator sees compaction running at all; the chunk
+                      // and install counters are the ONLY way to tell a snapshot-based
+                      // catch-up from an append-based one.
+                      body += ",\"snapshot_trigger\":" + std::string(st.snapshotTriggerEnabled ? "true" : "false") +
+                              ",\"snapshots_taken\":" + std::to_string(st.snapshotsTaken) +
+                              ",\"snapshots_refused_too_large\":" + std::to_string(st.snapshotsRefusedTooLarge) +
+                              ",\"snapshot_chunks_sent\":" + std::to_string(st.snapshotChunksSent) +
+                              ",\"snapshots_installed\":" + std::to_string(st.snapshotsInstalled) +
+                              ",\"snapshots_undeliverable\":" + std::to_string(st.snapshotsUndeliverable) +
+                              ",\"snapshot_transfers_restarted\":" + std::to_string(st.snapshotTransfersRestarted) +
+                              ",\"snapshot_transfers_abandoned\":" + std::to_string(st.snapshotTransfersAbandoned);
                   }
                   body += "}";
                   rep->_content = std::move(body);

@@ -47,16 +47,46 @@ seastar::future<> ReplicatedVShardHost::addVShard(uint16_t vshard, std::vector<N
 
     std::vector<NodeId> baseVoters = voters;
     std::vector<NodeId> baseLearners;
-    if (st.snapshot) {
-        // Snapshot recovery installs the manifest into the Engine
-        // (EngineDataStateMachine::applySnapshot) -- not wired in v1, so a compacted
-        // journal cannot be recovered yet. Fail-closed rather than start with a hole.
-        throw std::runtime_error("ReplicatedVShardHost: snapshot recovery not yet wired (M3)");
+    if (st.snapshot && !st.snapshot->config.voters.empty()) {
+        // The membership as of the boundary lives ONLY in the snapshot once its
+        // ConfigChange entries are compacted away, so it -- not the configured voter list
+        // -- is the config floor for a recovered group.
+        baseVoters = st.snapshot->config.voters;
+        baseLearners = st.snapshot->config.learners;
     }
 
     vs.persistence = std::make_unique<raft::JournalRaftPersistence>(*vs.writer, VShardId{vshard}, st.nextSeq);
     vs.sm = std::make_unique<EngineDataStateMachine>(store_, VShardId{vshard});
     raft::RaftNode node(self_, baseVoters, std::move(st.log), st.hardState, opts, baseLearners);
+    if (st.snapshot) {
+        // RECOVERING A COMPACTED JOURNAL (debt D-6). This used to throw outright -- which
+        // was correct while nothing ever compacted, and would have turned the FIRST restart
+        // after D-6 into a fail-closed refusal to start.
+        //
+        // THE PAYLOAD IS NOT RE-INSTALLED, and that is deliberate rather than lazy. A
+        // VShard snapshot is a manifest plus the bytes of the TSM files it references, and
+        // `snapshotVShard` builds it FROM THIS NODE'S OWN on-disk files at a boundary that
+        // by construction covers only FLUSHED data. Those files are still on this disk
+        // after a restart, and `Engine::init` has already registered them -- so the local
+        // state machine is already at or above the boundary and there is nothing to
+        // restore. Re-installing would be actively WRONG, not merely wasteful:
+        // `installVShardSnapshotFiles` calls `TSMFileManager::addTSMFile` for every file it
+        // writes, so a file already registered by init would be registered TWICE and its
+        // points counted twice by every query.
+        //
+        // What the core does still need is the snapshot as something it can SERVE: without
+        // it a restarted leader has no payload for a follower below its boundary. That is
+        // what seedRecoveredSnapshot does, and it deliberately does NOT surface the
+        // snapshot to this node's own state machine.
+        //
+        // (The log suffix ABOVE the boundary replays as usual, which is what covers the
+        // unflushed writes the boundary was chosen to exclude.)
+        node.seedRecoveredSnapshot(*st.snapshot);
+        timestar::http_log.info(
+            "cluster: VShard {} recovered from a compacted journal at boundary index {} (term {}); the local Engine "
+            "already holds the flushed data the snapshot describes, so only the log suffix above it is replayed",
+            vshard, st.snapshot->index, st.snapshot->term);
+    }
     registry_.addGroup(vshard, std::move(node), *vs.persistence, *vs.sm);
     vshards_[vshard] = std::move(vs);
     co_return;
@@ -79,9 +109,38 @@ seastar::future<uint64_t> ReplicatedVShardHost::snapshotVShard(uint16_t vshard) 
     // that lives only in the memory store, so they MUST stay in the log -- compacting to
     // appliedIndex would truncate them and lose unflushed data on restart.
     auto payload = co_await store_.buildVShardSnapshot(VShardId{vshard});
-    const uint64_t upto = payload.manifest.snapshotRevision;
-    if (upto == 0)
+    const uint64_t maxFlushedRevision = payload.manifest.snapshotRevision;
+    if (maxFlushedRevision == 0) {
+        ++snapshotsSkippedUnflushed_;
         co_return 0;  // no flushed data yet -> nothing to compact
+    }
+
+    // TRUNCATE ONE ENTRY BELOW THE HIGHEST FLUSHED REVISION, not at it. Found while wiring
+    // the trigger (D-6), and it is a real hole rather than belt-and-braces.
+    //
+    // `snapshotRevision` is the MAXIMUM revision appearing in the flushed extents, and a
+    // revision is one whole log ENTRY -- but an entry's points do not all flush together.
+    // `EngineLocalStore::applyWrites` buckets a batch's series by core and issues several
+    // `insertBatch` calls, any of which can trigger a memory-store rollover: so entry N can
+    // legitimately have SOME of its points in TSM and the rest still in the memory store,
+    // and the manifest then reports `snapshotRevision == N` for a partially-flushed entry.
+    // Truncating AT N discards the log entry holding the unflushed remainder, and those
+    // points are gone on the next restart -- a silent data loss on the one invariant this
+    // whole path exists to protect.
+    //
+    // Backing off by one entry closes it for the cost of retaining one entry: entry N stays
+    // in the log and replays, and re-applying a fully-flushed entry is idempotent under LWW
+    // (identical revision re-stamp, ADR 0003).
+    uint64_t upto = maxFlushedRevision - 1;
+    // And never above what this replica has APPLIED. RaftNode::compact clamps to
+    // lastApplied_ itself, but clamping here too means the value we log and RETURN is the
+    // one that was really used -- a caller that trusts the return value to mean "the log
+    // below this is gone" would otherwise be wrong on a lagging replica.
+    upto = std::min<uint64_t>(upto, g->appliedIndex());
+    if (upto == 0) {
+        ++snapshotsSkippedUnflushed_;
+        co_return 0;
+    }
     std::string encoded = data::encodeSnapshotPayload(std::move(payload));
     // REFUSE TO COMPACT INTO A SNAPSHOT NOBODY CAN RECEIVE (write-scaleout 5 review, F3c).
     // Compaction is the point of no return: it DISCARDS the log prefix this snapshot
@@ -107,10 +166,129 @@ seastar::future<uint64_t> ReplicatedVShardHost::snapshotVShard(uint16_t vshard) 
             "cannot be held in memory to serve (chunking bounds the MESSAGE, not the payload). The log is kept instead "
             "(it will keep growing). Streaming the payload via disk rather than staging it in RAM is the fix (D-32).",
             vshard, encoded.size(), raft::kMaxVShardSnapshotBytes);
+        ++snapshotsRefusedTooLarge_;
         co_return 0;
     }
     co_await g->compact(upto, std::move(encoded));
+    ++snapshotsTaken_;
+    if (auto it = vshards_.find(vshard); it != vshards_.end()) {
+        it->second.lastSnapshot = seastar::lowres_clock::now();
+        if (it->second.sm)
+            it->second.sm->noteSnapshotTaken();  // the bytes below the new boundary are gone
+    }
     co_return upto;
+}
+
+// ---------------------------------------------------------------------------
+// The snapshot producer trigger (debt D-6)
+// ---------------------------------------------------------------------------
+
+void ReplicatedVShardHost::startSnapshotTrigger() {
+    if (snapshotTriggerEnabled_ || stopped_)
+        return;
+    // (a) THE COHESION GATE, checked ONCE here rather than 1365 times in the sweep.
+    // `buildVShardSnapshot` throws on a non-cohesive core count -- a single-core snapshot
+    // would omit the series that scatter across cores, i.e. ship a PARTIAL snapshot -- and
+    // that is a property of the node, not of a group, so it can never become true later.
+    // Disabling the whole trigger with ONE warning is the difference between a legible
+    // startup line and a permanent error every five seconds.
+    if (!timestar::vshardsCohesiveOnCores(seastar::smp::count)) {
+        timestar::http_log.warn(
+            "cluster: the Raft snapshot trigger is DISABLED on this node: {} cores is not VShard-cohesive, so a "
+            "single-core snapshot would omit series that scatter across cores. Raft logs will grow without bound and "
+            "restart replay will lengthen accordingly (debt D-6).",
+            seastar::smp::count);
+        return;
+    }
+    snapshotTriggerEnabled_ = true;
+    // JITTER the first fire so shards do not sweep in lockstep (they share the disk).
+    snapshotCursor_ = seastar::this_shard_id() * 397;
+    snapshotTimer_.set_callback([this] {
+        if (stopped_ || snapshotSweepRunning_ || snapshotGate_.is_closed())
+            return;
+        snapshotSweepRunning_ = true;
+        // The sweep body is a NAMED MEMBER COROUTINE. A coroutine lambda here would have
+        // its frame owned by the with_gate temporary and outlive what it captured -- the
+        // standing rule in this tree, and the bug that segfaulted shard 0 in raft_group.cpp.
+        (void)seastar::with_gate(snapshotGate_,
+                                 [this] { return snapshotSweep().finally([this] { snapshotSweepRunning_ = false; }); });
+    });
+    const auto jitter = std::chrono::milliseconds((seastar::this_shard_id() * 731) % 5000);  // NOLINT
+    snapshotTimer_.arm(seastar::lowres_clock::now() + kSnapshotSweepInterval + jitter, {kSnapshotSweepInterval});
+}
+
+seastar::future<> ReplicatedVShardHost::snapshotSweep() {
+    try {
+        co_await maybeSnapshotOnce();
+    } catch (const std::exception& e) {
+        // (e) A FAILED SNAPSHOT MUST NEVER TAKE THE WRITE PATH WITH IT. Nothing was
+        // compacted (compact() is the last step and it either ran or did not), so the group
+        // is exactly as it was: a larger log and working replication. Log and move on.
+        timestar::http_log.warn("cluster: Raft snapshot sweep failed: {} (the log is kept; will retry)", e.what());
+    }
+    co_return;
+}
+
+seastar::future<size_t> ReplicatedVShardHost::maybeSnapshotOnce() {
+    size_t taken = 0;
+    if (stopped_ || vshards_.empty())
+        co_return 0;
+    const auto now = seastar::lowres_clock::now();
+
+    // Collect candidates first, THEN snapshot: `snapshotVShard` suspends, and mutating
+    // `vshards_` under a suspended iterator over it is how this would become a UAF.
+    std::vector<uint16_t> candidates;
+    // (c) STAGGER: start the scan at a rotating offset so the same low-numbered VShards do
+    // not always win the shard's one slot. Two passes over a map is cheaper than any
+    // ordering trick and this runs once every 5 s.
+    const size_t n = vshards_.size();
+    const size_t start = n == 0 ? 0 : snapshotCursor_ % n;
+    size_t idx = 0;
+    for (int lap = 0; lap < 2 && candidates.size() < kMaxConcurrentSnapshots; ++lap) {
+        idx = 0;
+        for (const auto& [vs, state] : vshards_) {
+            const bool inRange = (lap == 0) ? (idx >= start) : (idx < start);
+            ++idx;
+            if (!inRange)
+                continue;
+            if (candidates.size() >= kMaxConcurrentSnapshots)
+                break;
+            raft::RaftGroup* g = registry_.group(vs);
+            if (!g || !state.sm)
+                continue;
+            // Not again inside kMinSnapshotInterval, so a hot VShard cannot monopolize the
+            // slot while every other group's log grows.
+            if (state.lastSnapshot.time_since_epoch().count() != 0 && now - state.lastSnapshot < snapshotMinInterval_)
+                continue;
+            const raft::LogIndex boundary = g->node().log().snapshotIndex();
+            const uint64_t applied = g->appliedIndex();
+            const uint64_t entriesSince = applied > boundary ? applied - boundary : 0;
+            // EITHER threshold suffices; a zero threshold disables that half.
+            const bool byEntries = snapshotEntryThreshold_ != 0 && entriesSince >= snapshotEntryThreshold_;
+            const bool byBytes =
+                snapshotByteThreshold_ != 0 && state.sm->appliedBytesSinceSnapshot() >= snapshotByteThreshold_;
+            const bool always = snapshotEntryThreshold_ == 0 && snapshotByteThreshold_ == 0;
+            if (!byEntries && !byBytes && !always)
+                continue;
+            candidates.push_back(vs);
+        }
+    }
+    snapshotCursor_ += kMaxConcurrentSnapshots + 1;
+
+    // kMaxConcurrentSnapshots is 1, so this is a loop for the sake of the constant rather
+    // than for parallelism -- deliberately: raising the constant must not silently mean
+    // "read and encode N VShards' TSM files at once on one reactor".
+    for (uint16_t vs : candidates) {
+        if (stopped_)
+            break;
+        const uint64_t upto = co_await snapshotVShard(vs);
+        if (upto > 0) {
+            ++taken;
+            timestar::http_log.debug("cluster: snapshotted VShard {} and compacted its Raft log up to index {}", vs,
+                                     upto);
+        }
+    }
+    co_return taken;
 }
 
 seastar::future<bool> ReplicatedVShardHost::proposeBatch(data::WriteBatch batch) {
@@ -299,6 +477,13 @@ seastar::future<> ReplicatedVShardHost::stop() {
     if (stopped_)
         co_return;
     stopped_ = true;
+    // Stop the snapshot trigger FIRST and wait for any in-flight sweep: it reads Engine
+    // files and calls RaftGroup::compact, both of which need the registry and the store
+    // still standing. (e) honours stop() -- an unclosed gate here is a compaction landing
+    // on a torn-down group.
+    snapshotTimer_.cancel();
+    if (!snapshotGate_.is_closed())
+        co_await snapshotGate_.close();
     co_await registry_.stop();  // stops the tick loop + drains
     for (auto& [vs, state] : vshards_)
         if (state.writer)

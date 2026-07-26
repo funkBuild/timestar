@@ -13,7 +13,9 @@
 #include <map>
 #include <memory>
 #include <seastar/core/future.hh>
+#include <seastar/core/gate.hh>
 #include <seastar/core/lowres_clock.hh>
+#include <seastar/core/timer.hh>
 
 namespace timestar::cluster {
 
@@ -129,11 +131,64 @@ public:
     void startTicking() { registry_.startTicking(); }
     seastar::future<> stop();
 
+    // ---- the snapshot PRODUCER trigger (debt D-6) ----
+    //
+    // Before this, `snapshotVShard` had NO production caller: nothing ever compacted, so
+    // every group's Raft log grew without bound until a restart replayed the whole thing.
+    // F3c and the Phase-6 headroom fix both protected a path nothing called.
+    //
+    // POLICY. A group is a candidate when EITHER of two things has grown enough past its
+    // last snapshot: entries (bounds restart REPLAY time) or applied entry bytes (bounds
+    // journal DISK). See EngineDataStateMachine::appliedBytesSinceSnapshot for why one
+    // alone is not enough.
+    static constexpr uint64_t kSnapshotEntryThreshold = 8192;
+    static constexpr uint64_t kSnapshotBytesThreshold = uint64_t{64} << 20;
+    // How often the sweep looks. A snapshot is expensive (it reads every TSM file the
+    // VShard touches), so this is deliberately slow relative to the 20 ms Raft tick: the
+    // thresholds decide WHETHER, this only decides how promptly.
+    static constexpr std::chrono::seconds kSnapshotSweepInterval{5};
+    // RATE LIMIT. At most this many snapshots in flight per SHARD, over ~1365 groups on a
+    // 3-core 4096-VShard node. Snapshotting reads whole TSM files and encodes them, so a
+    // stampede would compete with the write path for the same reactor and the same disk --
+    // and the point of a background trigger is that nobody notices it.
+    static constexpr size_t kMaxConcurrentSnapshots = 1;
+    // A group is not snapshotted again inside this window even if it re-crosses a
+    // threshold, so a hot VShard cannot monopolize the shard's one slot.
+    static constexpr std::chrono::seconds kMinSnapshotInterval{60};
+
+    // Override the policy above. Exists for two reasons: a test cannot practically write
+    // 8192 entries or 64 MiB, and an operator with an unusual workload (very large batches,
+    // or a very slow disk) needs the knob without a rebuild. Zero on either threshold
+    // disables that half; both zero makes every group eligible on every sweep.
+    void setSnapshotPolicy(uint64_t entryThreshold, uint64_t byteThreshold, std::chrono::seconds minInterval) {
+        snapshotEntryThreshold_ = entryThreshold;
+        snapshotByteThreshold_ = byteThreshold;
+        snapshotMinInterval_ = minInterval;
+    }
+
+    // Start the periodic sweep. Separate from startTicking() so a test can drive
+    // maybeSnapshotOnce() by hand instead.
+    void startSnapshotTrigger();
+
+    // ONE sweep pass: pick at most `kMaxConcurrentSnapshots` eligible groups and snapshot
+    // them. Returns how many were snapshotted. Exposed for tests (and for an operator
+    // action later); the periodic timer just calls it.
+    seastar::future<size_t> maybeSnapshotOnce();
+
+    // Observability for the gate and for `/cluster/status`.
+    uint64_t snapshotsTaken() const { return snapshotsTaken_; }
+    uint64_t snapshotsRefusedTooLarge() const { return snapshotsRefusedTooLarge_; }
+    uint64_t snapshotsSkippedUnflushed() const { return snapshotsSkippedUnflushed_; }
+    bool snapshotTriggerEnabled() const { return snapshotTriggerEnabled_; }
+
 private:
     struct VShardState {
         std::unique_ptr<JournalWriter> writer;
         std::unique_ptr<raft::JournalRaftPersistence> persistence;
         std::unique_ptr<EngineDataStateMachine> sm;
+        // When this group was last snapshotted (default-constructed == never), for
+        // kMinSnapshotInterval.
+        seastar::lowres_clock::time_point lastSnapshot{};
     };
 
     EngineLocalStore& store_;
@@ -150,6 +205,27 @@ private:
     data::SliceReject classifyRefusal(uint16_t vshard);
     uint64_t proposeRefusedWhileLeader_ = 0;
     seastar::lowres_clock::time_point lastRefusalLog_{};
+
+    // ---- snapshot trigger state (debt D-6) ----
+    //
+    // The sweep body is a NAMED MEMBER COROUTINE, not a lambda inside with_gate: a
+    // coroutine frame captured by a with_gate temporary outlives the frame it referenced
+    // (the standing rule in this tree, learned the hard way in raft_group.cpp).
+    seastar::future<> snapshotSweep();
+    seastar::timer<seastar::lowres_clock> snapshotTimer_;
+    seastar::gate snapshotGate_;
+    bool snapshotSweepRunning_ = false;  // one sweep at a time; the timer skips if busy
+    bool snapshotTriggerEnabled_ = false;
+    // STAGGER. The sweep starts scanning at a rotating offset, so the same low-numbered
+    // VShards are not always the ones that reach the shard's one snapshot slot. Seeded
+    // from the shard id so two shards do not walk in lockstep either.
+    size_t snapshotCursor_ = 0;
+    uint64_t snapshotEntryThreshold_ = kSnapshotEntryThreshold;
+    uint64_t snapshotByteThreshold_ = kSnapshotBytesThreshold;
+    std::chrono::seconds snapshotMinInterval_ = kMinSnapshotInterval;
+    uint64_t snapshotsTaken_ = 0;
+    uint64_t snapshotsRefusedTooLarge_ = 0;
+    uint64_t snapshotsSkippedUnflushed_ = 0;
 };
 
 }  // namespace timestar::cluster

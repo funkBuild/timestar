@@ -229,6 +229,52 @@ public:
             plane_->startTicking();
     }
 
+    // Start this shard's background Raft-log snapshot/compaction trigger (debt D-6).
+    // Called after every group on the shard exists, so the first sweep sees the real
+    // group set rather than a partial one.
+    void startSnapshotTrigger() {
+        if (plane_)
+            plane_->startSnapshotTrigger();
+    }
+
+    // This shard's snapshot-producer counters (debt D-6), for `/cluster/status` and for
+    // the restart-catch-up gate -- which needs to prove a catch-up used the SNAPSHOT path
+    // rather than ordinary appends, and cannot tell the two apart without a counter.
+    struct SnapshotCounts {
+        uint64_t taken = 0;            // snapshots produced + logs compacted here
+        uint64_t refusedTooLarge = 0;  // over kMaxVShardSnapshotBytes: log kept
+        uint64_t chunksSent = 0;       // InstallSnapshot chunks put on the wire (leader)
+        uint64_t installed = 0;        // snapshots installed as a follower
+        uint64_t undeliverable = 0;    // snapshots this node declined to send
+        uint64_t transfersRestarted = 0;
+        uint64_t transfersAbandoned = 0;
+        bool triggerEnabled = false;
+    };
+
+    SnapshotCounts snapshotCounts() const {
+        SnapshotCounts c;
+        if (!plane_)
+            return c;
+        auto& host = const_cast<ReplicatedDataPlane*>(plane_.get())->host();
+        c.taken = host.snapshotsTaken();
+        c.refusedTooLarge = host.snapshotsRefusedTooLarge();
+        c.triggerEnabled = host.snapshotTriggerEnabled();
+        for (uint16_t vs = 0; vs <= timestar::VIRTUAL_SHARD_MASK; ++vs) {
+            if (!host.hosts(vs))
+                continue;
+            raft::RaftGroup* g = host.group(vs);
+            if (!g)
+                continue;
+            const auto& n = g->node();
+            c.chunksSent += n.snapshotChunksSent();
+            c.installed += n.snapshotsInstalled();
+            c.undeliverable += n.undeliverableSnapshots();
+            c.transfersRestarted += n.snapshotTransfersRestarted();
+            c.transfersAbandoned += n.snapshotTransfersAbandoned();
+        }
+        return c;
+    }
+
     ReplicatedDataPlane& plane() { return *plane_; }
 
     // Whether this shard's plane may still take work. `plane_ != nullptr` alone is too

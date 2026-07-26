@@ -11,6 +11,8 @@ seastar::future<> EngineDataStateMachine::apply(raft::LogEntry entry) {
     // header). The type guard below is defensive -- an empty-data entry would decode
     // to nullopt and fail-stop, which we must not do for a control entry.
     appliedIndex_ = entry.index;
+    // Half the snapshot trigger's input (D-6); see appliedBytesSinceSnapshot().
+    appliedBytesSinceSnapshot_ += entry.data.size();
     if (entry.type != raft::EntryType::Normal)
         co_return;
 
@@ -53,6 +55,8 @@ seastar::future<> EngineDataStateMachine::applySnapshot(raft::Snapshot snap) {
     // The snapshot subsumes the log up to snap.index; advance the applied watermark so a
     // subsequent apply() of the post-snapshot suffix is correctly ordered.
     appliedIndex_ = snap.index;
+    // Everything this counter was measuring is now inside the snapshot (D-6).
+    appliedBytesSinceSnapshot_ = 0;
     co_return;
 }
 

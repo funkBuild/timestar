@@ -332,11 +332,48 @@ seastar::future<> RaftGroup::transferLeadership(NodeId target) {
 }
 
 seastar::future<> RaftGroup::compact(LogIndex upto, std::string snapshotData) {
-    return seastar::with_semaphore(lock_, 1,
-                                   [this, upto, snapshotData = std::move(snapshotData)]() mutable -> seastar::future<> {
-                                       node_.compact(upto, std::move(snapshotData));
-                                       co_await drainReady();
-                                   });
+    // THE LAMBDA HERE IS DELIBERATELY NOT A COROUTINE, and this is not a style choice.
+    //
+    // `seastar::with_semaphore` moves `func` into a `.then` continuation and invokes it
+    // there; that continuation -- and with it the CLOSURE -- is destroyed as soon as the
+    // invocation returns a future, i.e. AT THE FIRST SUSPENSION. A coroutine lambda's frame
+    // does not copy its captures; it holds a pointer to the closure. So any capture
+    // (`this` included) read AFTER a `co_await` is read out of freed memory.
+    //
+    // Every other with_semaphore body in this file happens to be safe only because it
+    // touches its captures EXCLUSIVELY BEFORE its single `co_await drainReady()` -- a
+    // fragile property nothing enforces (filed as debt D-33). This body cannot be: it
+    // suspends on persistSnapshot and then needs `persistence_` and `this` again. Written
+    // as a coroutine lambda it read a destroyed closure and `RaftNode::ready()` copied a
+    // garbage `Snapshot` out of it -- a std::bad_alloc on a vector with a nonsense length,
+    // caught by the recovery test rather than by reasoning.
+    return seastar::with_semaphore(lock_, 1, [this, upto, data = std::move(snapshotData)]() mutable {
+        return compactLocked(upto, std::move(data));
+    });
+}
+
+// Precondition: the caller holds lock_. A NAMED MEMBER COROUTINE, so `upto`,
+// `snapshotData` and `this` live in this coroutine's own frame (see compact()).
+seastar::future<> RaftGroup::compactLocked(LogIndex upto, std::string snapshotData) {
+    const LogIndex before = node_.log().snapshotIndex();
+    node_.compact(upto, std::move(snapshotData));
+    // PERSIST THE PRODUCED SNAPSHOT (debt D-6). Found by the recovery test the moment the
+    // producer had a caller at all.
+    //
+    // `RaftNode::compact` trims only the IN-MEMORY log. The journal is append-only, so with
+    // no Snapshot record the boundary does not survive a restart: `recoverRaftState` sees
+    // every Data record ever written and replays the ENTIRE history. Compaction would then
+    // bound nothing and reclaim nothing -- exactly the unbounded replay D-6 exists to fix.
+    //
+    // PERSISTED BEFORE anything depends on the prefix being gone, and both crash windows
+    // are safe either way: a crash after the record and before the in-memory trim recovers
+    // AT the boundary (the payload is durable), and a crash before the record recovers with
+    // the full log (no compaction, no loss).
+    if (node_.log().snapshotIndex() > before && node_.servableSnapshot().index != kNoIndex) {
+        co_await persistence_.persistSnapshot(node_.servableSnapshot());
+        co_await persistence_.sync();
+    }
+    co_await drainReady();
 }
 
 }  // namespace timestar::raft

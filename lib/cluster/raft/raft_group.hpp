@@ -125,6 +125,10 @@ private:
     // The ready/persist/send/apply/advance loop. MUST run under the group lock so
     // no step()/tick()/propose() interleaves a ready()..advance() pair.
     seastar::future<> drainReady();
+    // compact()'s body, under the group lock. A named member coroutine rather than a
+    // coroutine lambda because it suspends more than once -- see compact() for why that
+    // distinction is a correctness one here and not a style one.
+    seastar::future<> compactLocked(LogIndex upto, std::string snapshotData);
 
     // Resolve any read barriers whose ReadIndex this node has now applied through.
     void releaseReadBarriers();

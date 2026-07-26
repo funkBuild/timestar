@@ -451,3 +451,315 @@ TEST_F(ReplicatedVShardHostTest, ReplicaEngineReaderServesAtEachConsistency) {
         fs::remove_all(jroot);
     }).get();
 }
+
+// ---------------------------------------------------------------------------
+// The snapshot PRODUCER trigger (debt D-6)
+// ---------------------------------------------------------------------------
+//
+// `snapshotVShard` had NO production caller before this: nothing ever compacted, so every
+// group's Raft log grew without bound until a restart replayed the whole thing. These
+// tests pin the four things that make wiring it safe:
+//
+//   (a) the cohesion gate is respected (a single-core snapshot on a non-cohesive core
+//       count would omit series that scatter across cores -- a PARTIAL snapshot);
+//   (b) the truncation boundary never rises above FLUSHED data;
+//   (c) the sweep is rate-limited and staggered rather than a stampede;
+//   (d) a compacted journal is RECOVERABLE, which is what the very first restart after
+//       this trigger ships depends on.
+
+namespace {
+// A VShard whose assignCore is 0, so buildVShardSnapshot's invoke_on is inline on this
+// shard -- the same locality the production apply path guarantees.
+struct Core0Series {
+    std::string key;
+    uint16_t vshard = 0;
+};
+Core0Series core0Series(const std::string& measurement) {
+    Core0Series out;
+    for (int i = 0;; ++i) {
+        out.key = buildSeriesKey(measurement, {{"host", "h" + std::to_string(i)}}, "value");
+        out.vshard = timestar::virtualShard(SeriesId128::fromSeriesKey(out.key));
+        if (timestar::assignCore(VShardId{out.vshard}, seastar::smp::count) == 0)
+            return out;
+    }
+}
+
+// Commit `n` single-point writes to `vshard`'s group, ticking until each acks.
+void commitWrites(cluster::ReplicatedVShardHost& host, RaftGroup* g, const std::string& key, uint16_t vshard, int n) {
+    for (int i = 0; i < n; ++i) {
+        data::WriteSeries s;
+        s.seriesKey = key;
+        s.type = TSMValueType::Float;
+        s.timestamps = {BASE + static_cast<uint64_t>(i)};
+        s.values = std::vector<double>{static_cast<double>(i)};
+        data::WriteBatch b;
+        b.series = {std::move(s)};
+        auto f = host.proposeBatch(std::move(b));
+        for (int k = 0; k < 40 && !f.available(); ++k)
+            g->tick().get();
+        ASSERT_TRUE(f.get());
+    }
+}
+
+// Roll the memory store to TSM and wait for the file count to EXCEED `baseline`. Waiting
+// for "> 0" is not enough when a test flushes twice: the second rollover would return
+// immediately on the first flush's file and the highest flushed revision would not have
+// moved, so the second snapshot would find nothing new to compact.
+void flushToTsm(ScopedShardedEngine& eng, size_t baseline = 0) {
+    (*eng).invoke_on_all([](Engine& e) { return e.rolloverMemoryStore(); }).get();
+    for (int i = 0; i < 300; ++i) {
+        auto n = (*eng).invoke_on(0u, [](Engine& e) { return e.getTSMFileCount(); }).get();
+        if (n > baseline)
+            return;
+        seastar::sleep(std::chrono::milliseconds(100)).get();
+    }
+}
+size_t tsmFileCount(ScopedShardedEngine& eng) {
+    return (*eng).invoke_on(0u, [](Engine& e) { return e.getTSMFileCount(); }).get();
+}
+}  // namespace
+
+TEST_F(ReplicatedVShardHostTest, TheTriggerSnapshotsOnlyOnceAThresholdIsCrossed) {
+    seastar::async([] {
+        if (!timestar::vshardsCohesiveOnCores(seastar::smp::count))
+            GTEST_SKIP() << "core count is not VShard-cohesive; the trigger is disabled by design";
+        ScopedShardedEngine eng;
+        eng.start();
+        cluster::EngineLocalStore store(*eng);
+        NoopTransport transport;
+        fs::path jroot = tmpDir();
+        cluster::ReplicatedVShardHost host(store, transport, /*self=*/1, jroot);
+        RaftOptions opts;
+        opts.electionTimeoutMin = opts.electionTimeoutMax = 1;
+        opts.heartbeatTimeout = 1;
+
+        const auto series = core0Series("snaptrigger");
+        host.addVShard(series.vshard, {1}, opts).get();
+        RaftGroup* g = host.group(series.vshard);
+        ASSERT_NE(g, nullptr);
+        for (int i = 0; i < 10 && !g->isLeader(); ++i)
+            g->tick().get();
+        ASSERT_TRUE(g->isLeader());
+
+        commitWrites(host, g, series.key, series.vshard, 4);
+        flushToTsm(eng);
+
+        // A HIGH threshold: eligible on neither count, so the sweep must do nothing even
+        // though there IS flushed data to snapshot. Without this the trigger would compact
+        // on every sweep and the "policy" would be decoration.
+        host.setSnapshotPolicy(/*entries=*/1'000'000, /*bytes=*/1ull << 40, std::chrono::seconds(0));
+        EXPECT_EQ(host.maybeSnapshotOnce().get(), 0u);
+        EXPECT_EQ(g->node().log().snapshotIndex(), 0u) << "the log must be untouched below the threshold";
+        EXPECT_EQ(host.snapshotsTaken(), 0u);
+
+        // Now an ENTRY threshold this group has crossed.
+        host.setSnapshotPolicy(/*entries=*/2, /*bytes=*/0, std::chrono::seconds(0));
+        EXPECT_EQ(host.maybeSnapshotOnce().get(), 1u);
+        EXPECT_GT(g->node().log().snapshotIndex(), 0u) << "the log must now be compacted";
+        EXPECT_EQ(host.snapshotsTaken(), 1u);
+
+        // And the BYTES half works on its own (entries disabled), after more writes.
+        const raft::LogIndex firstBoundary = g->node().log().snapshotIndex();
+        const size_t filesAfterFirst = tsmFileCount(eng);
+        commitWrites(host, g, series.key, series.vshard, 4);
+        flushToTsm(eng, filesAfterFirst);
+        host.setSnapshotPolicy(/*entries=*/0, /*bytes=*/1, std::chrono::seconds(0));
+        EXPECT_EQ(host.maybeSnapshotOnce().get(), 1u);
+        EXPECT_GT(g->node().log().snapshotIndex(), firstBoundary) << "the boundary must advance";
+
+        host.stop().get();
+        fs::remove_all(jroot);
+    }).get();
+}
+
+TEST_F(ReplicatedVShardHostTest, TheTruncationBoundaryStaysBelowTheHighestFlushedRevision) {
+    seastar::async([] {
+        if (!timestar::vshardsCohesiveOnCores(seastar::smp::count))
+            GTEST_SKIP() << "core count is not VShard-cohesive";
+        ScopedShardedEngine eng;
+        eng.start();
+        cluster::EngineLocalStore store(*eng);
+        NoopTransport transport;
+        fs::path jroot = tmpDir();
+        cluster::ReplicatedVShardHost host(store, transport, /*self=*/1, jroot);
+        RaftOptions opts;
+        opts.electionTimeoutMin = opts.electionTimeoutMax = 1;
+        opts.heartbeatTimeout = 1;
+
+        const auto series = core0Series("snapbound");
+        host.addVShard(series.vshard, {1}, opts).get();
+        RaftGroup* g = host.group(series.vshard);
+        for (int i = 0; i < 10 && !g->isLeader(); ++i)
+            g->tick().get();
+        ASSERT_TRUE(g->isLeader());
+        commitWrites(host, g, series.key, series.vshard, 5);
+        flushToTsm(eng);
+
+        // The manifest's own view of the highest FLUSHED revision, read independently of
+        // the code under test.
+        const uint64_t maxFlushed = store.buildVShardSnapshot(VShardId{series.vshard}).get().manifest.snapshotRevision;
+        ASSERT_GT(maxFlushed, 1u);
+
+        const uint64_t compacted = host.snapshotVShard(series.vshard).get();
+        // STRICTLY below, by exactly one entry. A revision is one whole log ENTRY, but
+        // `EngineLocalStore::applyWrites` issues several insertBatch calls per entry and any
+        // of them can roll the memory store -- so entry `maxFlushed` may be only PARTIALLY
+        // flushed, and truncating AT it would discard the log entry holding the unflushed
+        // remainder. That is silent data loss on the one invariant this path protects.
+        EXPECT_EQ(compacted, maxFlushed - 1) << "one entry of slack, deliberately";
+        EXPECT_LT(compacted, maxFlushed);
+        EXPECT_LE(compacted, g->appliedIndex()) << "never above what this replica applied";
+        EXPECT_EQ(g->node().log().snapshotIndex(), compacted);
+        // The entry AT the highest flushed revision is retained, so its (possibly
+        // unflushed) points still replay.
+        EXPECT_GE(g->node().log().lastIndex(), maxFlushed);
+
+        host.stop().get();
+        fs::remove_all(jroot);
+    }).get();
+}
+
+TEST_F(ReplicatedVShardHostTest, TheSweepIsRateLimitedPerPassAndPerGroup) {
+    seastar::async([] {
+        if (!timestar::vshardsCohesiveOnCores(seastar::smp::count))
+            GTEST_SKIP() << "core count is not VShard-cohesive";
+        ScopedShardedEngine eng;
+        eng.start();
+        cluster::EngineLocalStore store(*eng);
+        NoopTransport transport;
+        fs::path jroot = tmpDir();
+        cluster::ReplicatedVShardHost host(store, transport, /*self=*/1, jroot);
+        RaftOptions opts;
+        opts.electionTimeoutMin = opts.electionTimeoutMax = 1;
+        opts.heartbeatTimeout = 1;
+
+        // Three eligible groups on core 0. Snapshotting reads and encodes whole TSM files,
+        // so a sweep that took all of them at once would compete with the write path for the
+        // same reactor and the same disk -- the point of a background trigger is that nobody
+        // notices it.
+        std::vector<Core0Series> all;
+        std::set<uint16_t> seen;
+        for (int i = 0; all.size() < 3; ++i) {
+            auto s = core0Series("snaprate" + std::to_string(i));
+            if (seen.insert(s.vshard).second)
+                all.push_back(s);
+        }
+        for (const auto& s : all) {
+            host.addVShard(s.vshard, {1}, opts).get();
+            RaftGroup* g = host.group(s.vshard);
+            for (int i = 0; i < 10 && !g->isLeader(); ++i)
+                g->tick().get();
+            ASSERT_TRUE(g->isLeader());
+            commitWrites(host, g, s.key, s.vshard, 3);
+        }
+        flushToTsm(eng);
+
+        host.setSnapshotPolicy(/*entries=*/1, /*bytes=*/0, std::chrono::seconds(0));
+        // ONE per pass, however many are eligible.
+        EXPECT_EQ(host.maybeSnapshotOnce().get(), 1u);
+        EXPECT_EQ(host.snapshotsTaken(), 1u);
+
+        // And a per-group minimum interval, so one hot VShard cannot monopolize the slot
+        // while every other group's log grows: with a long min-interval, repeated passes
+        // must reach the OTHER groups rather than re-snapshotting the first.
+        host.setSnapshotPolicy(/*entries=*/1, /*bytes=*/0, std::chrono::seconds(3600));
+        std::set<raft::LogIndex> compactedGroups;
+        for (int pass = 0; pass < 5; ++pass) {
+            host.maybeSnapshotOnce().get();
+            for (const auto& s : all)
+                if (host.group(s.vshard)->node().log().snapshotIndex() > 0)
+                    compactedGroups.insert(s.vshard);
+        }
+        EXPECT_EQ(compactedGroups.size(), all.size()) << "every eligible group must get its turn";
+        EXPECT_EQ(host.snapshotsTaken(), all.size()) << "and none of them twice inside the min interval";
+
+        host.stop().get();
+        fs::remove_all(jroot);
+    }).get();
+}
+
+TEST_F(ReplicatedVShardHostTest, ACompactedJournalIsRecoveredWithoutReinstallingTheSnapshot) {
+    seastar::async([] {
+        if (!timestar::vshardsCohesiveOnCores(seastar::smp::count))
+            GTEST_SKIP() << "core count is not VShard-cohesive";
+        ScopedShardedEngine eng;
+        eng.start();
+        cluster::EngineLocalStore store(*eng);
+        NoopTransport transport;
+        fs::path jroot = tmpDir();
+        RaftOptions opts;
+        opts.electionTimeoutMin = opts.electionTimeoutMax = 1;
+        opts.heartbeatTimeout = 1;
+
+        const auto series = core0Series("snaprecover");
+        const auto sid = SeriesId128::fromSeriesKey(series.key);
+        raft::LogIndex boundary = 0;
+        {
+            cluster::ReplicatedVShardHost host(store, transport, /*self=*/1, jroot);
+            host.addVShard(series.vshard, {1}, opts).get();
+            RaftGroup* g = host.group(series.vshard);
+            for (int i = 0; i < 10 && !g->isLeader(); ++i)
+                g->tick().get();
+            ASSERT_TRUE(g->isLeader());
+            commitWrites(host, g, series.key, series.vshard, 4);
+            flushToTsm(eng);
+            ASSERT_GT(host.snapshotVShard(series.vshard).get(), 0u);
+            boundary = g->node().log().snapshotIndex();
+            ASSERT_GT(boundary, 0u);
+            host.stop().get();
+        }
+
+        // RESTART over the SAME journal and the SAME Engine (a compacted journal, which
+        // addVShard used to refuse outright with "snapshot recovery not yet wired"). That
+        // refusal was correct while nothing ever compacted; with the trigger wired it would
+        // have made the FIRST restart after a snapshot a fail-closed startup.
+        {
+            cluster::ReplicatedVShardHost host2(store, transport, /*self=*/1, jroot);
+            ASSERT_NO_THROW(host2.addVShard(series.vshard, {1}, opts).get());
+            RaftGroup* g2 = host2.group(series.vshard);
+            ASSERT_NE(g2, nullptr);
+            EXPECT_EQ(g2->node().log().snapshotIndex(), boundary) << "the boundary must be adopted from the journal";
+            // The recovered node can SERVE the snapshot to a lagging follower. Without
+            // seedRecoveredSnapshot this is empty and a follower below the boundary could
+            // never be caught up until this node happened to take a fresh snapshot.
+            EXPECT_EQ(g2->node().log().snapshotIndex(), boundary);
+
+            // AND THE DATA IS NOT DOUBLED. The payload is deliberately NOT re-installed: the
+            // local Engine already holds those TSM files (Engine::init registered them), and
+            // installVShardSnapshotFiles would call addTSMFile on each again -- registering
+            // the same file twice and counting its points twice in every query.
+            for (int i = 0; i < 10 && !g2->isLeader(); ++i)
+                g2->tick().get();
+            auto rq = (*eng)
+                          .invoke_on(0u,
+                                     [key = series.key, sid](Engine& e) { return e.query(key, sid, 0, UINT64_MAX); })
+                          .get();
+            ASSERT_TRUE(rq.has_value());
+            EXPECT_EQ(std::get<QueryResult<double>>(rq.value()).values.size(), 4u)
+                << "recovery must not double-register the snapshot's TSM files";
+            host2.stop().get();
+        }
+        fs::remove_all(jroot);
+    }).get();
+}
+
+TEST_F(ReplicatedVShardHostTest, StopSilencesTheTrigger) {
+    seastar::async([] {
+        ScopedShardedEngine eng;
+        eng.start();
+        cluster::EngineLocalStore store(*eng);
+        NoopTransport transport;
+        fs::path jroot = tmpDir();
+        cluster::ReplicatedVShardHost host(store, transport, /*self=*/1, jroot);
+        RaftOptions opts;
+        opts.electionTimeoutMin = opts.electionTimeoutMax = 1;
+        const auto series = core0Series("snapstop");
+        host.addVShard(series.vshard, {1}, opts).get();
+        host.setSnapshotPolicy(0, 0, std::chrono::seconds(0));  // every group eligible
+        host.stop().get();
+        // A sweep after stop() must do nothing: it reads Engine files and calls
+        // RaftGroup::compact, and both need the registry and store still standing.
+        EXPECT_EQ(host.maybeSnapshotOnce().get(), 0u);
+        fs::remove_all(jroot);
+    }).get();
+}

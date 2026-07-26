@@ -340,6 +340,11 @@ seastar::future<> ClusterDataPlane::start(const ClusterConfig& cfg, seastar::sha
         }
         co_await shards_.invoke_on_all([](ShardRaftPlane& p) {
             p.startTicking();
+            // THE SNAPSHOT PRODUCER TRIGGER (debt D-6). Started AFTER every group on the
+            // shard exists, so the first sweep sees the real group set. Before this,
+            // `snapshotVShard` had no production caller at all: nothing ever compacted, so
+            // every Raft log grew until a restart replayed the whole thing.
+            p.startSnapshotTrigger();
             return seastar::make_ready_future<>();
         });
         replicated_ = true;
@@ -732,6 +737,15 @@ seastar::future<ClusterDataPlane::Status> ClusterDataPlane::status() const {
         st.vshardsLeaderless += c.leaderless;
         for (const auto& [peer, n] : c.peerCaughtUp)
             st.peerCaughtUp[peer] += n;
+        auto sc = co_await shards.invoke_on(sh, [](ShardRaftPlane& p) { return p.snapshotCounts(); });
+        st.snapshotsTaken += sc.taken;
+        st.snapshotsRefusedTooLarge += sc.refusedTooLarge;
+        st.snapshotChunksSent += sc.chunksSent;
+        st.snapshotsInstalled += sc.installed;
+        st.snapshotsUndeliverable += sc.undeliverable;
+        st.snapshotTransfersRestarted += sc.transfersRestarted;
+        st.snapshotTransfersAbandoned += sc.transfersAbandoned;
+        st.snapshotTriggerEnabled = st.snapshotTriggerEnabled || sc.triggerEnabled;
     }
     co_return st;
 }

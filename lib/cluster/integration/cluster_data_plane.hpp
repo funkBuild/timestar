@@ -108,6 +108,20 @@ public:
         // appends -- which also silently blocks leadership transfer to it, since
         // RaftNode::transferLeadership only sends TimeoutNow to a caught-up target.
         std::map<NodeId, size_t> peerCaughtUp;
+        // Raft-log snapshot/compaction (debt D-5/D-6). `snapshotsTaken` rising is how an
+        // operator sees that log compaction is actually running; `snapshotChunksSent` /
+        // `snapshotsInstalled` are what distinguish a catch-up that went through the
+        // SNAPSHOT path from one that went through ordinary appends, which nothing else can
+        // tell apart. `snapshotsRefusedTooLarge` + `snapshotsUndeliverable` are the two
+        // ways a VShard ends up with a permanently growing log.
+        uint64_t snapshotsTaken = 0;
+        uint64_t snapshotsRefusedTooLarge = 0;
+        uint64_t snapshotChunksSent = 0;
+        uint64_t snapshotsInstalled = 0;
+        uint64_t snapshotsUndeliverable = 0;
+        uint64_t snapshotTransfersRestarted = 0;
+        uint64_t snapshotTransfersAbandoned = 0;
+        bool snapshotTriggerEnabled = false;
     };
     seastar::future<Status> status() const;
 

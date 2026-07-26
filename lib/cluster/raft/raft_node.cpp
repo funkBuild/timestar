@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <functional>
 #include <limits>
+#include <stdexcept>
 
 namespace timestar::raft {
 
@@ -419,6 +420,26 @@ void RaftNode::compact(LogIndex upto, std::string snapshotData) {
     snapshot_.term = log_.snapshotTerm();
     snapshot_.config = baseConfig_;
     snapshot_.data = std::move(snapshotData);
+}
+
+void RaftNode::seedRecoveredSnapshot(Snapshot snap) {
+    if (snap.index == kNoIndex)
+        return;
+    if (snap.index != log_.snapshotIndex() || snap.term != log_.snapshotTerm())
+        throw std::runtime_error(
+            "RaftNode::seedRecoveredSnapshot: the snapshot does not sit at the log's compacted boundary; serving it "
+            "would hand a follower a payload that does not match the index it claims");
+    // The boundary config lives ONLY in the snapshot once its ConfigChange entries are
+    // compacted away, so it is the config floor. Defensive, as in the receive path: an
+    // empty voter set (corruption) would brick the group.
+    if (!snap.config.voters.empty()) {
+        baseConfig_ = snap.config;
+        recomputeConfigFromLog();
+    }
+    snapshot_ = std::move(snap);
+    // NOT surfaced via pendingSnapshotApply_: the driver recovered this from its OWN
+    // journal, so its state machine is already at (or above) the boundary -- see
+    // ReplicatedVShardHost::addVShard for why re-installing it locally would be wrong.
 }
 
 void RaftNode::handleInstallSnapshot(NodeId from, const InstallSnapshot& is) {
