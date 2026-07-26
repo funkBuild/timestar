@@ -1,8 +1,19 @@
 # ADR 0005 — A leader-transfer bypass for the CheckQuorum disruption guard
 
-**Status:** ACCEPTED and IMPLEMENTED. CheckQuorum is ON. Mechanism (b) — the new
-message-type byte — shipped; mechanism (c) — cluster-wide gated activation — did NOT, and
-is carried as debt D-30.
+**Status:** ACCEPTED, IMPLEMENTED, **NOT YET ENABLED.** Mechanism (b) — the new
+message-type byte — shipped and is proven at scale (2216 transfers under sustained writes
+with CheckQuorum on, zero client errors). Mechanism (c) — cluster-wide gated activation —
+did not ship, and the release ordering makes it optional rather than blocking (debt D-30).
+`kCheckQuorumDefault` is **false** for this release.
+
+**Why enabling is deferred, on a measurement rather than a doubt.** Same binary, same
+session, `node_kill_round.sh`, the flag the only difference: **OFF 32/400 failed batches /
+7 s recovery / 3.88 M pts/s (twice, identical); ON 50/400 / 11 s / 2.60 M and 59/400 /
+13 s / 2.12 M.** This ADR's own accounting says the guard buys promptness under partition
+and no safety at all, so ~1.6-1.8x on the one-node-down write band and 4-6 s of extra
+failover is the wrong trade — single-node failure is the commoner event. The decoder
+shipping now with the guard off is what makes enabling it later a one-line flip with no
+mixed-version window. Residual: debt D-29.
 
 **Also fix the "self-limiting" claim under *Decision*: it was false as written.** See (1)
 below.
@@ -27,7 +38,10 @@ whose leader had DIED could not be voted into a new one for that whole window. S
 A/B on `node_kill_round.sh`: 49/400 failed batches and an 8 s recovery with CheckQuorum
 off, **153/400 and 43 s** with it on. Fixed at the source — the driver now credits the
 passes it skipped (`RaftNode::tick(passes)`), so every tick-driven clock, the lease
-included, expires in REAL time.
+included, expires in REAL time. That fix also improved failover with the guard OFF
+(49/400 → 32/400), which is the clearest sign it was a real defect and not merely a
+CheckQuorum prerequisite. It did not close the gap completely, which is why the flag is
+still off.
 
 The lesson for the next reader: the lease is not only about what the wire carries. Any
 mechanism that slows a group's TICK also slows its lease, and this codebase has one.

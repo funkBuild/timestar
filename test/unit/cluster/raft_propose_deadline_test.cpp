@@ -244,7 +244,11 @@ seastar::future<> testDeadlineIsTheOnlyEscape() {
     co_await teardown(nodes);
 }
 
-// checkQuorum ON -- the data-plane setting, and the belt to the deadline's braces. A
+// checkQuorum ON. This is the belt to the deadline's braces, and the property CheckQuorum
+// is WANTED for -- it builds its own RaftOptions, and the production data plane currently
+// leaves the flag off (debt D-9/D-29: the bypass is built and proven, the measured
+// one-node-down cost is not yet worth paying), so this test is what keeps the behaviour
+// pinned for the release that turns it on. A
 // leader that stops hearing from a majority STEPS DOWN within an election timeout, so a
 // quorum-less write fails on its own: either the waiter is failed by the step-down
 // (LeadershipLost) or the propose is refused outright once it is no longer leader. What
