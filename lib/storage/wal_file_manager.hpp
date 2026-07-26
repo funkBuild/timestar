@@ -78,16 +78,24 @@ public:
 
     // True while any rolled-over store is still awaiting TSM conversion.
     // Drives compaction's WAL-first priority.
-    bool hasPendingConversions() const { return memoryStores.size() > 1; }
+    bool hasPendingConversions() const { return pendingConversion(memoryStores); }
+
+    // As a pure function of the store list, so a test asserts against THIS predicate
+    // rather than a hand-respelled copy of it (`stores.size() > 1` written out again in a
+    // test is a second definition that silently stops tracking this one).
+    static bool pendingConversion(const std::vector<seastar::shared_ptr<MemoryStore>>& stores) {
+        return stores.size() > 1;
+    }
 
     // The same question, asked about ONE VShard (debt D-35): is there a rolled-over
     // store still awaiting TSM conversion that holds data for `vshard`?
     //
     // `memoryStores[0]` is the ACTIVE store (rolloverMemoryStore inserts the fresh
     // store at the front); every later element is a rolled store whose TSM file has
-    // not been registered yet -- conversion erases the store from this vector only
-    // AFTER `addTSMFile` (see convertWalToTsm), which is the same visibility ordering
-    // queries rely on. So the rolled set is exactly `[1, size)`, and the answer is a
+    // not been registered yet -- conversion erases the store from this vector only after
+    // `writeMemstore` has returned, i.e. after `TSMFileManager::openTsmFile` registered the
+    // new file (see convertWalToTsm), which is the same visibility ordering queries rely
+    // on. So the rolled set is exactly `[1, size)`, and the answer is a
     // bit probe per element of a vector that is at most kIngestRejectMemoryStores (16)
     // long.
     //

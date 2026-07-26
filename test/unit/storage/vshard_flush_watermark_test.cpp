@@ -14,11 +14,15 @@
 #include "../../../lib/core/placement_table.hpp"  // timestar::virtualShard
 #include "../../../lib/core/vshard.hpp"
 #include "../../../lib/storage/memory_store.hpp"
+#include "../../../lib/storage/storage_layout.hpp"
+#include "../../../lib/storage/wal.hpp"
 #include "../../../lib/storage/wal_file_manager.hpp"
 #include "../../../lib/utils/series_key.hpp"
 
 #include <gtest/gtest.h>
 
+#include <seastar/core/coroutine.hh>
+#include <seastar/core/future.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <string>
 #include <vector>
@@ -97,17 +101,16 @@ TEST(VShardFlushWatermarkTest, OnlyRolledStoresHoldingTheVShardCountAsPending) {
 
     std::vector<seastar::shared_ptr<MemoryStore>> stores{active, rolled};
 
+    // THE D-35 DELTA, stated against BOTH real predicates rather than a respelling of
+    // either: the per-SHARD one says "a conversion is pending, no group may compact",
+    // while the per-VSHARD one frees VShard a, whose data that conversion has nothing to
+    // do with.
+    EXPECT_TRUE(WALFileManager::pendingConversion(stores)) << "the per-shard predicate is TRUE here";
     // The active store never counts: its data is the contiguous SUFFIX the boundary
     // deliberately excludes, not an out-of-order hole below it.
     EXPECT_FALSE(WALFileManager::pendingConversionForVShard(stores, a.vshard));
     // The rolled store does: VShard b's revisions may sit BELOW revisions already in TSM.
     EXPECT_TRUE(WALFileManager::pendingConversionForVShard(stores, b.vshard));
-
-    // THE D-35 DELTA, stated as an assertion: the shard HAS a pending conversion (the
-    // per-shard predicate would say "no group may compact"), and VShard a is still free
-    // to compact because that conversion is nothing to do with it.
-    EXPECT_GT(stores.size(), 1u) << "the per-shard predicate is TRUE here";
-    EXPECT_FALSE(WALFileManager::pendingConversionForVShard(stores, a.vshard));
 
     // A VShard nobody has written at all is never pending.
     const KeyAt c = keyNotIn("d35pending_third", {a.vshard, b.vshard});
@@ -121,5 +124,42 @@ TEST(VShardFlushWatermarkTest, AnActiveStoreAloneNeverBlocksCompaction) {
     auto active = seastar::make_shared<MemoryStore>(1);
     insertOne(*active, a.key, 3'000, 1.0);
     std::vector<seastar::shared_ptr<MemoryStore>> stores{active};
+    EXPECT_FALSE(WALFileManager::pendingConversion(stores));
     EXPECT_FALSE(WALFileManager::pendingConversionForVShard(stores, a.vshard));
+}
+
+// WAL-REPLAY PARITY. The bitmap hangs off `insertMemory` precisely so that recovery
+// populates it too (`initFromWAL` -> `WALReader::readAll` -> `insertMemory`). A recovered
+// store that under-reported its VShards would let the producer compact over revisions that
+// are in RAM and not in TSM -- the exact loss D-6 measured -- and it would do so ONLY
+// after a restart, which is the worst possible time to find out.
+seastar::future<> testWalReplayRebuildsTheSameBitmap() {
+    const KeyAt a = keyNotIn("d35replay", {});
+    const KeyAt b = keyNotIn("d35replay_other", {a.vshard});
+    EXPECT_NE(a.vshard, b.vshard);
+
+    auto live = seastar::make_shared<MemoryStore>(777);
+    co_await live->initWAL(timestar::StorageLayout("."), seastar::this_shard_id());
+    const std::string walPath = live->getWAL()->filename();
+    for (const auto& k : {a, b}) {
+        TimeStarInsert<double> ins = TimeStarInsert<double>::fromSeriesKey(k.key);
+        ins.timestamps = {4'000};
+        ins.values = {7.5};
+        ins.setCachedSeriesKey(k.key);
+        EXPECT_FALSE(co_await live->insert(ins));
+    }
+    EXPECT_TRUE(live->touchesVShard(a.vshard));
+    EXPECT_TRUE(live->touchesVShard(b.vshard));
+    const size_t liveCount = live->vshardsTouched();
+    co_await live->close();
+
+    auto recovered = seastar::make_shared<MemoryStore>(778);
+    co_await recovered->initFromWAL(walPath);
+    EXPECT_TRUE(recovered->touchesVShard(a.vshard)) << "recovery must rebuild the VShard bitmap";
+    EXPECT_TRUE(recovered->touchesVShard(b.vshard));
+    EXPECT_EQ(recovered->vshardsTouched(), liveCount);
+    co_await live->removeWAL();
+}
+TEST(VShardFlushWatermarkTest, WalReplayRebuildsTheSameBitmap) {
+    testWalReplayRebuildsTheSameBitmap().get();
 }

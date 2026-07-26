@@ -1,5 +1,6 @@
 #pragma once
 
+#include "../core/vshard.hpp"  // VIRTUAL_SHARD_COUNT (the bitmap below is sized from it)
 #include "logger.hpp"
 #include "series_id.hpp"
 #include "timestar_config.hpp"
@@ -147,9 +148,18 @@ private:
     // at ~0.5 load factor) plus the two heap vector allocations.
     static constexpr size_t PER_SERIES_OVERHEAD_BYTES = 448;
 
-    // Presence bitmap over the 4096 virtual shards (debt D-35); see noteVShard().
+    // Presence bitmap over the virtual shards (debt D-35); see noteVShard().
     // 64 words == 512 bytes, zero-initialised, never grows, never allocates.
-    std::array<uint64_t, 64> vshardBits_{};
+    //
+    // The word count is NOT independent of the VShard space: noteVShard indexes
+    // `vshard >> 6`, so raising VIRTUAL_SHARD_COUNT without widening this array is an
+    // out-of-bounds WRITE on every insert of a high-numbered VShard -- silent heap
+    // corruption on the hottest path in the system. Fail the build instead.
+    static constexpr size_t kVShardBitmapWords = timestar::VIRTUAL_SHARD_COUNT / 64;
+    static_assert(timestar::VIRTUAL_SHARD_COUNT == 64 * 64,
+                  "MemoryStore's VShard presence bitmap (debt D-35) is sized for 4096 VShards; widen "
+                  "vshardBits_ and re-check noteVShard/touchesVShard's shift and mask if that changes");
+    std::array<uint64_t, kVShardBitmapWords> vshardBits_{};
 
 public:
     size_t getResidentBytesEstimate() const { return residentBytesEstimate; }
