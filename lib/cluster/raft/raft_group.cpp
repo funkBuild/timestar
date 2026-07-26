@@ -18,12 +18,16 @@ namespace timestar::raft {
 // there; that continuation -- and with it the CLOSURE -- is destroyed as soon as the
 // invocation returns a future, i.e. AT THE FIRST SUSPENSION. A coroutine lambda's frame
 // does not copy its captures, it holds a POINTER to the closure, so every capture
-// (`this` included) read after a `co_await` is read out of freed memory. Every body in
-// this file suspends: `co_await drainReady()` is the whole point of them.
+// (`this` included) read after a `co_await` is read out of freed memory.
 //
-// It used to be written that way throughout and survived only because each body touched
-// its captures EXCLUSIVELY BEFORE its single suspension -- a property nothing stated,
-// nothing tested, and any edit could break. `compact()` DID break it: a second
+// Of the ten bodies this file used to hold, EIGHT suspended under the lock --
+// `co_await drainReady()` is the whole point of them -- and each survived only because
+// it touched its captures EXCLUSIVELY BEFORE that single suspension: a property nothing
+// stated, nothing tested, and any edit could break. (The remaining two were exempt for
+// reasons of their own, both accidental: `compact()` had already been rewritten as a
+// plain lambda delegating to a named coroutine, and `waitApplied`'s body never awaited
+// at all -- it was a coroutine lambda only by virtue of `co_return`, so its closure
+// could not die under it.) `compact()` is what proved the hazard real: a second
 // suspension made `RaftNode::ready()` copy a garbage `Snapshot` out of the dead closure
 // (std::bad_alloc on a vector with a nonsense length, D-6).
 //
