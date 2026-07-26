@@ -73,6 +73,11 @@ public:
     // must send an InstallSnapshot instead; only the still-materialized suffix is
     // returned.
     std::vector<LogEntry> entriesFrom(LogIndex from) const;
+    // Bounded overload for catch-up replication (write-scaleout 5.4): at most `maxCount`
+    // entries and, past the first, at most `maxBytes` of entry payload. Either bound may
+    // be 0 to disable it. The first entry is always included so that a single entry
+    // larger than `maxBytes` cannot wedge a follower.
+    std::vector<LogEntry> entriesFrom(LogIndex from, size_t maxCount, size_t maxBytes) const;
 
     // Compact the prefix up to and including `upto` into a snapshot boundary.
     // Requires snapshotIndex() <= upto <= lastIndex(); the boundary term is taken

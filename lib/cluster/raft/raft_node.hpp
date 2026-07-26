@@ -23,6 +23,28 @@ struct RaftOptions {
     bool preVote = false;           // §PreVote (added in the pre-vote brick)
     bool checkQuorum = false;       // §CheckQuorum leader lease (added later)
     uint64_t rngSeed = 0;           // 0 => derive deterministically from node id
+
+    // CATCH-UP CHUNKING (write-scaleout 5.4). A follower that has been down carries a
+    // nextIndex far behind the leader's lastIndex, and `sendAppend` used to put the WHOLE
+    // remaining tail -- `log_.entriesFrom(nextIndex)` -- into ONE AppendEntries. After a
+    // large write campaign that is an arbitrarily large message, which is why the Raft
+    // transport's inbound admission bound had to stay loose (1 GiB): the deliver verb is
+    // `no_wait`, so an over-limit message is DROPPED WITH NO REPLY, and a follower whose
+    // catch-up append is always too big retries the same oversized message forever and
+    // never catches up -- silently.
+    //
+    // Capping it is safe without any protocol change: a follower acks the PREFIX it
+    // received (`matchIndex`), and `handleAppendEntriesReply` immediately sends the next
+    // chunk while `nextIndex <= lastIndex`, so catch-up is a pipeline of bounded messages
+    // rather than one unbounded one. Leadership transfer still waits for
+    // `matchIndex == lastIndex`, which the pipeline reaches in more round trips rather
+    // than not at all.
+    //
+    // Both bounds apply; whichever binds first wins. At least one entry is ALWAYS sent,
+    // so an entry larger than maxAppendBytes still replicates (it is the message-size
+    // bound that then has to accommodate it, not this).
+    size_t maxAppendEntries = 256;
+    size_t maxAppendBytes = 1u << 20;  // 1 MiB of entry payload per AppendEntries
 };
 
 // One replica of one Raft group (one VShard). Deterministic and reactor-free:
@@ -48,8 +70,8 @@ public:
         std::vector<Message> messages;       // send only after hardState+snapshot+entries are durable
         std::vector<ReadState> readStates;   // ReadIndex barriers confirmed this cycle
         bool empty() const {
-            return !hardState && !snapshot && entries.empty() && committed.empty() &&
-                   messages.empty() && readStates.empty();
+            return !hardState && !snapshot && entries.empty() && committed.empty() && messages.empty() &&
+                   readStates.empty();
         }
     };
 
@@ -60,10 +82,10 @@ public:
              std::vector<NodeId> learners = {});
 
     // Inputs.
-    void tick();          // one logical clock tick (driven by a seastar::timer)
-    void step(Message m);  // an incoming RPC for this group
+    void tick();                     // one logical clock tick (driven by a seastar::timer)
+    void step(Message m);            // an incoming RPC for this group
     bool propose(std::string data);  // leader-only append; false if not leader (replication brick)
-    void campaign();       // start an election now (bootstrap / TimeoutNow)
+    void campaign();                 // start an election now (bootstrap / TimeoutNow)
 
     // Leader transfer (§3.10): hand leadership to `target` (a voter). The current
     // leader first ensures `target` is caught up, then sends it a TimeoutNow so it
@@ -157,8 +179,8 @@ private:
     bool electionLost() const;
 
     NodeId id_;
-    Config config_;                       // active membership (latest ConfigChange in log)
-    Config baseConfig_;                   // membership at the snapshot boundary (config floor)
+    Config config_;                          // active membership (latest ConfigChange in log)
+    Config baseConfig_;                      // membership at the snapshot boundary (config floor)
     LogIndex latestConfigIndex_ = kNoIndex;  // index of the highest ConfigChange in the log
     RaftOptions opts_;
 
@@ -172,9 +194,9 @@ private:
     LogIndex lastApplied_ = kNoIndex;
 
     unsigned electionElapsed_ = 0;
-    unsigned electionTimeout_ = 0;  // current randomized target
+    unsigned electionTimeout_ = 0;   // current randomized target
     unsigned heartbeatElapsed_ = 0;  // leader heartbeat clock
-    std::map<NodeId, bool> votes_;  // this election's replies (self included)
+    std::map<NodeId, bool> votes_;   // this election's replies (self included)
     std::mt19937_64 rng_;
 
     // Leader-only replication progress, one per voter (self included).
@@ -198,7 +220,7 @@ private:
     bool hsDirty_ = false;
     LogIndex unstableStart_ = kNoIndex;  // first log index not yet reported for persistence
     std::vector<Message> pendingMessages_;
-    Snapshot snapshot_;                        // the current snapshot we can serve (index 0 = none)
+    Snapshot snapshot_;                             // the current snapshot we can serve (index 0 = none)
     std::optional<Snapshot> pendingSnapshotApply_;  // a received snapshot to surface to the driver
 };
 

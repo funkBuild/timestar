@@ -85,6 +85,29 @@ std::vector<LogEntry> RaftLog::entriesFrom(LogIndex from) const {
     return std::vector<LogEntry>(entries_.begin() + (start - firstIndex()), entries_.end());
 }
 
+std::vector<LogEntry> RaftLog::entriesFrom(LogIndex from, size_t maxCount, size_t maxBytes) const {
+    const LogIndex start = std::max(from, firstIndex());
+    if (start > lastIndex())
+        return {};
+    const size_t offset = static_cast<size_t>(start - firstIndex());
+    const size_t available = entries_.size() - offset;
+    if (maxCount == 0)
+        maxCount = available;
+    size_t take = 0;
+    size_t bytes = 0;
+    while (take < available && take < maxCount) {
+        const size_t sz = entries_[offset + take].data.size();
+        // The byte bound applies only AFTER the first entry, so a single entry larger
+        // than maxBytes still replicates -- a log the leader accepted must be
+        // deliverable, or the follower wedges on it forever.
+        if (take > 0 && maxBytes != 0 && bytes + sz > maxBytes)
+            break;
+        bytes += sz;
+        ++take;
+    }
+    return std::vector<LogEntry>(entries_.begin() + offset, entries_.begin() + offset + take);
+}
+
 void RaftLog::compactTo(LogIndex upto) {
     if (upto <= snapshotIndex_)
         return;  // already compacted at least this far (backward upto is a no-op)

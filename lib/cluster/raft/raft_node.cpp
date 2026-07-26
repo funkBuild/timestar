@@ -128,8 +128,7 @@ bool RaftNode::electionWon() const {
     for (const auto& [node, g] : votes_)
         if (g)
             granted.insert(node);
-    return majorityOf(config_.voters, granted) &&
-           (!config_.joint() || majorityOf(config_.votersOutgoing, granted));
+    return majorityOf(config_.voters, granted) && (!config_.joint() || majorityOf(config_.votersOutgoing, granted));
 }
 
 bool RaftNode::electionLost() const {
@@ -258,7 +257,11 @@ void RaftNode::sendAppend(NodeId peer) {
     ae.leaderId = id_;
     ae.prevLogIndex = prevIndex;
     ae.prevLogTerm = *prevTerm;
-    ae.entries = log_.entriesFrom(ni);
+    // Chunked catch-up (write-scaleout 5.4): send a BOUNDED prefix of the tail. The
+    // follower acks what it got and handleAppendEntriesReply immediately sends the next
+    // chunk, so a far-behind follower is caught up by a pipeline of bounded messages
+    // instead of one message whose size is the size of the backlog. See RaftOptions.
+    ae.entries = log_.entriesFrom(ni, opts_.maxAppendEntries, opts_.maxAppendBytes);
     ae.leaderCommit = commitIndex_;
     ae.readSeq = readSeq_;  // followers echo this for ReadIndex confirmation
     send(Message{.to = peer, .from = id_, .payload = std::move(ae)});
@@ -570,8 +573,7 @@ void RaftNode::step(Message m) {
     // future term) and a GRANTED PreVote reply (carries that future term). A
     // REJECTED PreVote reply carries the responder's real term and does step us
     // down.
-    const bool preVoteReq =
-        std::holds_alternative<RequestVote>(m.payload) && std::get<RequestVote>(m.payload).preVote;
+    const bool preVoteReq = std::holds_alternative<RequestVote>(m.payload) && std::get<RequestVote>(m.payload).preVote;
     const bool preVoteGrant = std::holds_alternative<RequestVoteReply>(m.payload) &&
                               std::get<RequestVoteReply>(m.payload).preVote &&
                               std::get<RequestVoteReply>(m.payload).voteGranted;
@@ -584,8 +586,7 @@ void RaftNode::step(Message m) {
         if (isVoteRequest(m.payload)) {
             // Disruption guard (CheckQuorum lease): a node that still hears from a
             // valid leader refuses to grant votes / bump term.
-            const bool inLease =
-                opts_.checkQuorum && leaderId_ != kNoNode && electionElapsed_ < electionTimeout_;
+            const bool inLease = opts_.checkQuorum && leaderId_ != kNoNode && electionElapsed_ < electionTimeout_;
             if (inLease) {
                 return;  // ignore; do not bump term
             }
@@ -597,8 +598,7 @@ void RaftNode::step(Message m) {
         }
     } else if (mTerm < currentTerm_) {
         // Force the stale sender to learn the newer term.
-        if (std::holds_alternative<AppendEntries>(m.payload) ||
-            std::holds_alternative<InstallSnapshot>(m.payload)) {
+        if (std::holds_alternative<AppendEntries>(m.payload) || std::holds_alternative<InstallSnapshot>(m.payload)) {
             AppendEntriesReply r;
             r.term = currentTerm_;
             r.success = false;
@@ -646,8 +646,8 @@ void RaftNode::handleRequestVote(NodeId from, const RequestVote& rv) {
     // currently follow a leader (a follower never votes against its own leader).
     // Re-granting to the same candidate is idempotent. A PreVote probe at a
     // strictly higher term is always eligible (it changes no durable state).
-    const bool canVote = (votedFor_ == from) || (votedFor_ == kNoNode && leaderId_ == kNoNode) ||
-                         (rv.preVote && rv.term > currentTerm_);
+    const bool canVote =
+        (votedFor_ == from) || (votedFor_ == kNoNode && leaderId_ == kNoNode) || (rv.preVote && rv.term > currentTerm_);
     // A learner never grants a vote (it is not part of the voting configuration).
     const bool grant = isVoter(id_) && canVote && log_.isUpToDate(rv.lastLogIndex, rv.lastLogTerm);
 
@@ -847,8 +847,8 @@ bool RaftNode::proposeConfChange(std::vector<NodeId> voters, std::vector<NodeId>
     // Enter the joint configuration Cold,new: decisions now need a majority in
     // both the new voters and the current (outgoing) voters.
     Config joint;
-    joint.voters = std::move(voters);          // Cnew
-    joint.votersOutgoing = config_.voters;     // Cold
+    joint.voters = std::move(voters);       // Cnew
+    joint.votersOutgoing = config_.voters;  // Cold
     joint.learners = std::move(learners);
     LogEntry e;
     e.term = currentTerm_;
