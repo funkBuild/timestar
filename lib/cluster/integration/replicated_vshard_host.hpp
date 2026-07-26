@@ -179,6 +179,10 @@ public:
     uint64_t snapshotsTaken() const { return snapshotsTaken_; }
     uint64_t snapshotsRefusedTooLarge() const { return snapshotsRefusedTooLarge_; }
     uint64_t snapshotsSkippedUnflushed() const { return snapshotsSkippedUnflushed_; }
+    // Sweeps that declined because a rolled-over store had not yet reached TSM. Steady
+    // non-zero means this shard is converting continuously and its logs will stay long --
+    // the conservative half of the trade in EngineLocalStore::hasUnconvertedStores.
+    uint64_t snapshotsSkippedPendingConversion() const { return snapshotsSkippedPendingConversion_; }
     // Sweep passes run, and the highest entries-since-snapshot any group showed on the last
     // pass. Together they answer the FIRST question when logs are not being compacted --
     // "is the sweep running at all, and is anything close to the threshold?" -- which
@@ -232,6 +236,7 @@ private:
     uint64_t snapshotsTaken_ = 0;
     uint64_t snapshotsRefusedTooLarge_ = 0;
     uint64_t snapshotsSkippedUnflushed_ = 0;
+    uint64_t snapshotsSkippedPendingConversion_ = 0;
     uint64_t snapshotSweeps_ = 0;
     uint64_t snapshotMaxEntriesSinceSeen_ = 0;
 };

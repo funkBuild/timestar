@@ -30,6 +30,13 @@ seastar::future<data::SnapshotPayload> EngineLocalStore::buildVShardSnapshot(VSh
     co_return payload;
 }
 
+seastar::future<bool> EngineLocalStore::hasUnconvertedStores(VShardId vshard) {
+    const unsigned core = timestar::assignCore(vshard, seastar::smp::count);
+    // memoryStores[0] is the ACTIVE store; anything beyond it is rolled over and still
+    // awaiting background conversion to TSM. See the header for why compaction must wait.
+    co_return co_await engines_.invoke_on(core, [](Engine& e) { return e.getRetainedMemoryStoreCount() > 1; });
+}
+
 seastar::future<bool> EngineLocalStore::installVShardSnapshot(VShardId vshard, data::SnapshotPayload payload) {
     if (!timestar::vshardsCohesiveOnCores(seastar::smp::count))
         throw std::runtime_error("installVShardSnapshot: core count is not VShard-cohesive");

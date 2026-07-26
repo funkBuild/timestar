@@ -788,6 +788,7 @@ seastar::future<ClusterDataPlane::Status> ClusterDataPlane::status() const {
         st.snapshotsTaken += sc.taken;
         st.snapshotsRefusedTooLarge += sc.refusedTooLarge;
         st.snapshotsSkippedUnflushed += sc.skippedUnflushed;
+        st.snapshotsSkippedPendingConversion += sc.skippedPendingConversion;
         st.snapshotSweeps += sc.sweeps;
         st.snapshotMaxEntriesSince = std::max(st.snapshotMaxEntriesSince, sc.maxEntriesSinceSeen);
         st.snapshotChunksSent += sc.chunksSent;

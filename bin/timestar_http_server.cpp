@@ -149,6 +149,8 @@ void set_routes(routes& r) {
                               ",\"snapshots_taken\":" + std::to_string(st.snapshotsTaken) +
                               ",\"snapshots_refused_too_large\":" + std::to_string(st.snapshotsRefusedTooLarge) +
                               ",\"snapshots_skipped_unflushed\":" + std::to_string(st.snapshotsSkippedUnflushed) +
+                              ",\"snapshots_skipped_pending_conversion\":" +
+                              std::to_string(st.snapshotsSkippedPendingConversion) +
                               ",\"snapshot_sweeps\":" + std::to_string(st.snapshotSweeps) +
                               ",\"snapshot_max_entries_since\":" + std::to_string(st.snapshotMaxEntriesSince) +
                               ",\"snapshot_chunks_sent\":" + std::to_string(st.snapshotChunksSent) +

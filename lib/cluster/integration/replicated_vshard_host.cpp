@@ -104,6 +104,23 @@ seastar::future<uint64_t> ReplicatedVShardHost::snapshotVShard(uint16_t vshard) 
     raft::RaftGroup* g = registry_.group(vshard);
     if (!g)
         co_return 0;  // not hosted here
+    // REFUSE WHILE ANY ROLLED-OVER STORE IS STILL AWAITING CONVERSION TO TSM.
+    //
+    // This is the FIRST of two conditions that make the boundary below safe, and it is the
+    // one the snapshot-durability gate caught: WAL->TSM conversions run 6 at a time and so
+    // complete OUT OF ORDER, which means "the highest revision in TSM" can sit ABOVE an
+    // unconverted store's revisions. Truncating there discards log entries whose data lives
+    // only in RAM -- measured as 7 of 200 acknowledged points lost across a kill -9, with
+    // the three nodes disagreeing about how many (they had converted different stores).
+    // Full reasoning on EngineLocalStore::hasUnconvertedStores.
+    //
+    // Skipping is free: the sweep comes back every few seconds and conversions finish in
+    // seconds. A larger log is a cost; a truncated log is data loss.
+    if (co_await store_.hasUnconvertedStores(VShardId{vshard})) {
+        ++snapshotsSkippedPendingConversion_;
+        co_return 0;
+    }
+
     // Capture only FLUSHED (TSM) data. manifest.snapshotRevision is the highest
     // revision the snapshot reproduces; since revisions are stamped from the log index
     // (ADR 0003), it is a safe log-truncation boundary. Entries after it may hold data
@@ -116,8 +133,10 @@ seastar::future<uint64_t> ReplicatedVShardHost::snapshotVShard(uint16_t vshard) 
         co_return 0;  // no flushed data yet -> nothing to compact
     }
 
-    // TRUNCATE ONE ENTRY BELOW THE HIGHEST FLUSHED REVISION, not at it. Found while wiring
-    // the trigger (D-6), and it is a real hole rather than belt-and-braces.
+    // TRUNCATE ONE ENTRY BELOW THE HIGHEST FLUSHED REVISION, not at it. The SECOND of the
+    // two conditions that make this boundary safe (the first is the pending-conversion
+    // refusal above). Found while wiring the trigger (D-6), and a real hole rather than
+    // belt-and-braces.
     //
     // `snapshotRevision` is the MAXIMUM revision appearing in the flushed extents, and a
     // revision is one whole log ENTRY -- but an entry's points do not all flush together.

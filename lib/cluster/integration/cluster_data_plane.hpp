@@ -120,6 +120,7 @@ public:
         // non-zero with snapshotsTaken == 0 means the trigger is correctly declining rather
         // than broken -- the FIRST thing to check when logs are not being compacted.
         uint64_t snapshotsSkippedUnflushed = 0;
+        uint64_t snapshotsSkippedPendingConversion = 0;
         uint64_t snapshotSweeps = 0;
         uint64_t snapshotMaxEntriesSince = 0;
         uint64_t snapshotChunksSent = 0;

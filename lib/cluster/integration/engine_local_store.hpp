@@ -44,6 +44,34 @@ public:
     // via schema broadcast, not the snapshot).
     seastar::future<data::SnapshotPayload> buildVShardSnapshot(VShardId vshard);
 
+    // Are there rolled-over memory stores on this VShard's core that have NOT yet been
+    // converted to TSM? (debt D-6.)
+    //
+    // THE SNAPSHOT PRODUCER MUST NOT COMPACT WHILE THIS IS TRUE, and the reason is
+    // measured rather than theoretical -- it cost the snapshot-durability gate 7 of 200
+    // acknowledged points on the first run.
+    //
+    // A snapshot's truncation boundary is derived from the highest revision present in
+    // TSM. That is only a safe boundary if every revision BELOW it is also in TSM, and
+    // WAL->TSM conversions run `conversion_concurrency` at a time (6) and therefore
+    // COMPLETE OUT OF ORDER. Store A (revisions 1..10) and store B (11..20) can both have
+    // rolled with only B converted: TSM then holds 11..20, the max flushed revision is 20,
+    // and truncating anywhere near it discards the log entries for 1..10 -- whose data
+    // exists ONLY in retained store A, in RAM, and is gone on a kill -9. The nodes then
+    // disagree about how much they lost, because which conversions had finished differs
+    // per node.
+    //
+    // With no unconverted store, TSM is exactly the set of ROLLED stores and the only
+    // unflushed data is the ACTIVE store, which holds a contiguous SUFFIX of each VShard's
+    // revisions -- so the max flushed revision has every revision below it in TSM, which is
+    // what makes it a boundary at all.
+    //
+    // Conservative in the safe direction: under sustained write load a shard may rarely
+    // have zero pending conversions, and a group then keeps its log until it does. A larger
+    // log is a cost; a truncated log is data loss. Residual D-35 wants the precise
+    // per-VShard flushed watermark so compaction need not wait for a quiet moment.
+    seastar::future<bool> hasUnconvertedStores(VShardId vshard);
+
     // Install a received VShard snapshot (consumer side of the above). Same cohesion
     // precondition; dispatches to assignCore(vshard). Returns true iff installed.
     seastar::future<bool> installVShardSnapshot(VShardId vshard, data::SnapshotPayload payload);
