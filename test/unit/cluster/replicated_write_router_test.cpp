@@ -70,6 +70,22 @@ public:
     }
 };
 
+// A resolver that changes its mind: node 1 leads until it has been consulted
+// `switchAfter` times, then node 2 does. It models the ordinary case a self-naming hint
+// HIDES -- the leadership the coordinator was refusing for has MOVED, and only
+// re-resolving can find it (write-scaleout 5 review, F1).
+class SwitchingLeaderResolver : public LeaderResolver {
+public:
+    // Node 1 leads until the local sink has refused once (i.e. for the whole of attempt
+    // 1); node 2 leads from then on. Keyed off the sink's own attempt counter so the
+    // switch lands exactly on the attempt boundary, whatever order the router resolves
+    // VShards in.
+    const unsigned* localAttempts = nullptr;
+    NodeId leaderOf(uint16_t) const override {
+        return (localAttempts && *localAttempts > 0) ? static_cast<NodeId>(2) : static_cast<NodeId>(1);
+    }
+};
+
 // ---------------------------------------------------------------------------
 // 3a/3b doubles: sinks/transports that answer the HINTED entry points, so a test can
 // script per-attempt, per-VShard outcomes.
@@ -299,6 +315,85 @@ seastar::future<> testLeaderHintRedirectsTheRetry() {
     EXPECT_EQ(got, vs) << "the retry must follow the hint to node 2";
 }
 
+// ---------------------------------------------------------------------------
+// F1 (write-scaleout 5 review): A SELF-NAMING HINT MUST NOT STEER THE RETRY.
+//
+// THE MECHANISM THIS PINS. `RaftGroup::propose*` returns a bare `false` for BOTH
+// "role != Leader" and "I AM the leader but a transfer is in flight". The local sink used
+// to label both `NotLeader` and attach `g->leader()` as the hint -- which, when the
+// refuser IS the leader, is ITSELF. The router accepted that hint, re-bucketed the slice
+// into its LOCAL view, and asked the same refusing group again. All six attempts went to
+// the same place, NO RPC EVER LEFT THE NODE, and the client got a 503 saying "not-leader"
+// -- which is why the one-node-down symptom read as a routing bug rather than a refusal.
+//
+// The router must DROP a hint that names the target that just rejected, so the next
+// attempt re-resolves from the live leader view instead of looping.
+seastar::future<> testSelfNamingHintIsIgnored() {
+    VShardDirectory dir(1, allLocalMap());
+    WriteBatch batch = manySeries(4);
+    const auto vs = vshardsOf(batch);
+    ScriptedLocalSink local;
+    ScriptedTransport client;
+    // Attempt 1 resolves LOCAL (node 1 leads); the local sink refuses and names ITSELF.
+    // By attempt 2 the transfer has completed and the live view says node 2 -- which the
+    // retry can only discover if the self-naming hint was DROPPED. If the hint is kept it
+    // pins the slice to node 1 for the whole budget, the resolver is never consulted
+    // again, and no RPC is ever made: the exact loop F1 removes.
+    SwitchingLeaderResolver leaders;
+    leaders.localAttempts = &local.attempts;
+    for (uint16_t v : vs) {
+        local.rejectUntilAttempt[v] = 1000;  // node 1 never commits it
+        local.hintFor[v] = 1;                // ...and names ITSELF as the leader
+        local.kindFor[v] = WriteFailure::LeaderRefused;
+    }
+    ReplicatedBatchWriteRouter router(dir, local, client, leaders);
+
+    co_await router.write(std::move(batch));
+
+    EXPECT_EQ(local.attempts, 1u)
+        << "the refusing node was asked again: a hint naming the rejecter steered the retry back to it, "
+        << "which is the six-attempts-no-RPC loop F1 removes";
+    EXPECT_EQ(client.calls, 1u) << "the retry must leave the node";
+    auto got = client.received[2];
+    std::sort(got.begin(), got.end());
+    EXPECT_EQ(got, vs) << "with the self-hint dropped, the retry re-resolves to the real leader";
+}
+
+// The 503's REASON must be what the target reported. Before F1 there was no way for a
+// leader refusing its OWN proposal to say so -- the sink labelled it `NotLeader` -- so the
+// 503 said "not-leader" and pointed the next investigator at routing, which was working
+// correctly. This pins the new label all the way through to the client-visible message.
+// (The router's unconditional `noteKind(NotLeader)` was scoped to the names-nothing case
+// in the same change; that half is a clarity fix, not a behaviour change, because pacing
+// takes the max over classes.)
+seastar::future<> testRefusalReasonIsReportedNotManufactured() {
+    VShardDirectory dir(1, allLocalMap());
+    WriteBatch batch = manySeries(4);
+    const auto vs = vshardsOf(batch);
+    ScriptedLocalSink local;
+    ScriptedTransport client;
+    MapLeaderResolver leaders;
+    for (uint16_t v : vs) {
+        local.rejectUntilAttempt[v] = 1000;  // never commits, so the budget is exhausted
+        local.kindFor[v] = WriteFailure::LeaderRefused;
+        leaders.leaders[v] = 1;  // node 1 really is the leader; there is nowhere else to go
+    }
+    ReplicatedBatchWriteRouter router(dir, local, client, leaders);
+
+    bool threw = false;
+    try {
+        co_await router.write(std::move(batch));
+    } catch (const RetryableWriteError& e) {
+        threw = true;
+        const std::string what = e.what();
+        EXPECT_NE(what.find("leader-refused-mid-transfer"), std::string::npos)
+            << "the 503 manufactured its reason instead of reporting the one the target gave: " << what;
+        EXPECT_EQ(what.find("not-leader"), std::string::npos)
+            << "a leader that refused its own proposal must not be reported as not-leader: " << what;
+    }
+    EXPECT_TRUE(threw) << "a slice that never commits must fail the write";
+}
+
 // 3b: only the FAILED slice is re-dispatched. A batch spanning several VShards where one
 // loses its leader must not re-propose the ones that already committed.
 seastar::future<> testRetriesOnlyTheFailedSlice() {
@@ -525,7 +620,6 @@ seastar::future<> testRemoteAttemptsCarryADeadline() {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // write-scaleout 4a: the retry schedule must OUTLAST the transport's reconnect backoff.
 //
@@ -574,8 +668,8 @@ seastar::future<> testBlipLongerThanTheBackoffIsAbsorbed() {
     // Must NOT throw: a transient reset resolves inside the write deadline.
     co_await router.write(manySeries(60));
     EXPECT_GT(client.attempts, 1u) << "the blip must actually have been retried";
-    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(seastar::lowres_clock::now() -
-                                                                              client.start);
+    const auto elapsed =
+        std::chrono::duration_cast<std::chrono::milliseconds>(seastar::lowres_clock::now() - client.start);
     EXPECT_LE(elapsed.count(),
               std::chrono::duration_cast<std::chrono::milliseconds>(ReplicatedBatchWriteRouter::kDeadline).count())
         << "absorbing the blip must still respect the write deadline";
@@ -642,13 +736,23 @@ TEST(ReplicatedBatchWriteRouterTest, StrictSubsetRejectNeverAcks) {
 TEST(ReplicatedBatchWriteRouterTest, RejectsOutsideTheViewCannotAck) {
     testRejectsOutsideTheViewCannotAck().get();
 }
-TEST(ReplicatedBatchWriteRouterTest, RoutesEachSeriesToItsVShardLeader) { testRoutesToLeaders().get(); }
+TEST(ReplicatedBatchWriteRouterTest, RoutesEachSeriesToItsVShardLeader) {
+    testRoutesToLeaders().get();
+}
 TEST(ReplicatedBatchWriteRouterTest, StaleLeaderFailsWholeWriteRetryably) {
     testStaleLeaderFailsWrite().get();
 }
-TEST(ReplicatedBatchWriteRouterTest, UnassignedVShardRejects) { testUnassignedRejects().get(); }
+TEST(ReplicatedBatchWriteRouterTest, UnassignedVShardRejects) {
+    testUnassignedRejects().get();
+}
 TEST(ReplicatedBatchWriteRouterTest, LeaderHintRedirectsTheRetry) {
     testLeaderHintRedirectsTheRetry().get();
+}
+TEST(ReplicatedBatchWriteRouterTest, SelfNamingHintIsIgnored) {
+    testSelfNamingHintIsIgnored().get();
+}
+TEST(ReplicatedBatchWriteRouterTest, RefusalReasonIsReportedNotManufactured) {
+    testRefusalReasonIsReportedNotManufactured().get();
 }
 TEST(ReplicatedBatchWriteRouterTest, RetriesOnlyTheFailedSlice) {
     testRetriesOnlyTheFailedSlice().get();

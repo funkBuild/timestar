@@ -2,6 +2,7 @@
 
 #include "raft_driver.hpp"  // RaftTransport, Envelope
 
+#include <cstddef>
 #include <functional>
 #include <memory>
 #include <seastar/core/future.hh>

@@ -73,6 +73,21 @@ using timestar::raft::NodeId;
 enum class WriteFailure : uint8_t {
     None = 0,
     NotLeader,
+    // THE LEADER ITSELF REFUSED (write-scaleout 5 review, F1). Distinct from NotLeader,
+    // and the distinction is diagnostic rather than cosmetic: `RaftGroup::propose*`
+    // returns a bare `false` for BOTH "I am not the leader" and "I AM the leader but I am
+    // handing leadership away" (`leadTransferee_ != kNoNode`), and the sink used to label
+    // both NotLeader. When the refuser is the leader, `g->leader()` is ITSELF, so the
+    // reject carried a leader hint pointing back at the node that just refused, the router
+    // re-bucketed the slice into its LOCAL view, and all six attempts asked the same
+    // refusing group again -- no RPC ever left the node. The symptom read as "the
+    // coordinator is proposing to the wrong place"; it was proposing to exactly the right
+    // place, which was refusing.
+    //
+    // Retryable (the refusal is bounded by the transfer-abandon window), but it must never
+    // be confused with NotLeader: a NotLeader retry goes somewhere ELSE, and this one has
+    // nowhere else to go.
+    LeaderRefused,
     LeadershipLost,
     Transport,
     ShardStopping,
@@ -86,6 +101,7 @@ enum class WriteFailure : uint8_t {
 constexpr bool isRetryableWriteFailure(WriteFailure f) {
     switch (f) {
         case WriteFailure::NotLeader:
+        case WriteFailure::LeaderRefused:
         case WriteFailure::LeadershipLost:
         case WriteFailure::Transport:
         case WriteFailure::ShardStopping:
@@ -142,6 +158,7 @@ constexpr std::chrono::milliseconds writeFailureRetryDelay(WriteFailure f, unsig
         }
         case WriteFailure::None:
         case WriteFailure::NotLeader:
+        case WriteFailure::LeaderRefused:
         case WriteFailure::LeadershipLost:
         case WriteFailure::ShardStopping:
         case WriteFailure::Unassigned:
@@ -190,6 +207,8 @@ constexpr const char* writeFailureName(WriteFailure f) {
             return "none";
         case WriteFailure::NotLeader:
             return "not-leader";
+        case WriteFailure::LeaderRefused:
+            return "leader-refused-mid-transfer";
         case WriteFailure::LeadershipLost:
             return "leadership-lost";
         case WriteFailure::Transport:

@@ -45,6 +45,18 @@ struct RaftOptions {
     // bound that then has to accommodate it, not this).
     size_t maxAppendEntries = 256;
     size_t maxAppendBytes = 1u << 20;  // 1 MiB of entry payload per AppendEntries
+
+    // The largest single message this group may PRODUCE, mirroring the transport's peer
+    // admission bound. 0 disables the check (tests, and any driver with no such bound).
+    //
+    // It exists for InstallSnapshot, the one producer 5.4 did not cap: it carries an
+    // entire VShard snapshot in one message. Over the bound, the transport refuses to send
+    // it -- and `sendInstallSnapshot` used to advance `nextIndex_[peer]` BEFORE the send,
+    // so a refusal became a hot loop: optimistic advance -> follower rejects the next
+    // append -> rewind -> re-encode the whole snapshot -> refuse -> repeat, once per round
+    // trip, with an error log each time. Checking here means the doomed message is never
+    // built and `nextIndex_` is never moved on its behalf.
+    size_t maxMessageBytes = 0;
 };
 
 // One replica of one Raft group (one VShard). Deterministic and reactor-free:
@@ -114,6 +126,15 @@ public:
     bool isLeader() const { return role_ == Role::Leader; }
     Term currentTerm() const { return currentTerm_; }
     NodeId leader() const { return leaderId_; }
+    // A leadership handoff is in flight, which is the OTHER reason propose() refuses
+    // (see propose()). A caller that gets a bare `false` needs this to tell "I am not the
+    // leader" from "I am the leader and I am standing down" -- the two want opposite
+    // retries (write-scaleout 5 review, F1).
+    bool transferInFlight() const { return leadTransferee_ != kNoNode; }
+    // Snapshots this node declined to send because they exceed opts_.maxMessageBytes.
+    // Non-zero means a follower CANNOT be caught up by snapshot and needs chunked
+    // InstallSnapshot (or a smaller snapshot) before it can rejoin.
+    uint64_t undeliverableSnapshots() const { return undeliverableSnapshots_; }
     LogIndex commitIndex() const { return commitIndex_; }
     const RaftLog& log() const { return log_; }
     unsigned electionTimeout() const { return electionTimeout_; }
@@ -210,6 +231,7 @@ private:
     // leader refuses every proposal, so a transfer to a DEAD peer wedges the group's
     // writes permanently. See tick().
     unsigned transferElapsed_ = 0;
+    uint64_t undeliverableSnapshots_ = 0;  // see undeliverableSnapshots()
 
     // ReadIndex tracking (leader).
     uint64_t readSeq_ = 0;  // monotonic heartbeat sequence for read confirmation

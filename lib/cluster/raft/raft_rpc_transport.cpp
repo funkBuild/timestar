@@ -94,7 +94,7 @@ constexpr size_t kMaxBatchEnvelopes = 512;
 // The number is sized for the one producer still unbounded -- InstallSnapshot, which
 // carries a whole VShard snapshot -- not for appends, which 5.4 caps at 1 MiB of entries.
 constexpr size_t kMaxInboundRaftMemory = size_t{128} << 20;  // 128 MiB in flight
-constexpr size_t kMaxRaftMessageBytes = size_t{96} << 20;    // refuse to SEND above this
+constexpr size_t kMaxRaftMessageBytes = kMaxRaftSendBytes;   // refuse to SEND above this
 
 // Raft message-rate instrumentation (write-scaleout 5-pre / 5a). The counters are
 // unconditional -- they are a handful of increments on a path that already does an
@@ -179,6 +179,8 @@ struct RaftRpcTransport::Impl {
     };
     std::map<NodeId, PeerCaps> caps;
     std::map<NodeId, PendingFrames> pending;
+    // (group, peer) pairs whose oversized-message refusal has already been logged.
+    std::set<std::pair<uint16_t, NodeId>> oversizeLogged;
     uint64_t nextGeneration = 1;
     bool flushScheduled = false;
     // OFF BY DEFAULT, and the measurement that made it so is recorded in
@@ -564,10 +566,19 @@ seastar::future<> RaftRpcTransport::send(Envelope env) {
     // to replicate, not to watch a follower hang.
     if (bytes.size() > kMaxRaftMessageBytes) {
         ++impl_->stats.dropped;
-        timestar::timestar_log.error(
-            "[RAFT] refusing to send a {} byte message for group {} to node {}: over the {} byte peer admission "
-            "bound (an InstallSnapshot this large cannot be delivered; chunked snapshot streaming is the fix)",
-            bytes.size(), env.groupId, env.message.to, kMaxRaftMessageBytes);
+        // LATCHED PER (group, peer). Raft retries on every heartbeat, so an undeliverable
+        // message is not a one-off event -- unlatched, this logs once per round trip for
+        // as long as the condition lasts, which buries the node's log in the one message
+        // an operator most needs to find. The condition is a property of the pair, not of
+        // the moment, so saying it once per pair is saying it exactly as often as it is
+        // true (write-scaleout 5 review, F3a).
+        if (impl_->oversizeLogged.emplace(env.groupId, env.message.to).second) {
+            timestar::timestar_log.error(
+                "[RAFT] refusing to send a {} byte message for group {} to node {}: over the {} byte peer admission "
+                "bound (an InstallSnapshot this large cannot be delivered; chunked snapshot streaming is the fix). "
+                "Further refusals for this group/peer are not logged.",
+                bytes.size(), env.groupId, env.message.to, kMaxRaftMessageBytes);
+        }
         return seastar::make_ready_future<>();
     }
     impl_->enqueue(env.message.to, seastar::sstring(bytes.data(), bytes.size()));

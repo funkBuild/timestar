@@ -275,6 +275,15 @@ void RaftNode::bcastAppend() {
 void RaftNode::sendInstallSnapshot(NodeId peer) {
     if (snapshot_.index == kNoIndex)
         return;  // nothing to serve (should not happen once compaction ran)
+    // REFUSE, WITHOUT ADVANCING nextIndex_, a snapshot the transport cannot carry
+    // (write-scaleout 5 review, F3a). The optimistic advance below is what turns a
+    // refused send into a hot loop -- advance, follower rejects the next append, rewind,
+    // re-encode the whole snapshot, refuse again -- so the check has to come BEFORE it.
+    // The peer stays uncaught-up, which is the truth, and the counter says why.
+    if (opts_.maxMessageBytes != 0 && snapshot_.data.size() > opts_.maxMessageBytes) {
+        ++undeliverableSnapshots_;
+        return;
+    }
     InstallSnapshot is;
     is.term = currentTerm_;
     is.leaderId = id_;
@@ -524,6 +533,19 @@ void RaftNode::sendTimeoutNow(NodeId target) {
 
 void RaftNode::transferLeadership(NodeId target) {
     if (role_ != Role::Leader || target == id_ || !isVoter(target))
+        return;
+    // A REPEAT REQUEST FOR THE TRANSFER ALREADY IN FLIGHT IS IGNORED (etcd's behaviour;
+    // write-scaleout 5 review, F2). Without this, resetting the window unconditionally
+    // DEFEATS the abandon-after-one-election-timeout bound: any caller re-requesting the
+    // same target faster than an election timeout -- a balancer pass every 5 s against a
+    // 2.5-5 s timeout is exactly that shape -- re-arms the clock forever, and the group
+    // refuses every proposal for as long as the caller keeps asking. That is the same
+    // permanent-refusal failure tick() was changed to bound, reachable through a
+    // different door.
+    //
+    // Only a change of TARGET restarts the window: that is a genuinely new transfer, and
+    // it deserves its own full window.
+    if (leadTransferee_ == target)
         return;
     leadTransferee_ = target;
     transferElapsed_ = 0;

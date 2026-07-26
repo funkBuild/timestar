@@ -82,7 +82,23 @@ seastar::future<uint64_t> ReplicatedVShardHost::snapshotVShard(uint16_t vshard) 
     const uint64_t upto = payload.manifest.snapshotRevision;
     if (upto == 0)
         co_return 0;  // no flushed data yet -> nothing to compact
-    co_await g->compact(upto, data::encodeSnapshotPayload(std::move(payload)));
+    std::string encoded = data::encodeSnapshotPayload(std::move(payload));
+    // REFUSE TO COMPACT INTO A SNAPSHOT NOBODY CAN RECEIVE (write-scaleout 5 review, F3c).
+    // Compaction is the point of no return: it DISCARDS the log prefix this snapshot
+    // replaces, so a follower that later needs catching up has only the snapshot to be
+    // caught up WITH. If that snapshot is over the transport's send bound, the follower
+    // can never be caught up at all -- and the log entries that would have done it are
+    // gone. Declining to compact leaves the group exactly as it was: larger log, working
+    // replication.
+    if (encoded.size() > raft::kMaxRaftSendBytes) {
+        timestar::http_log.error(
+            "cluster: NOT compacting VShard {}: its snapshot is {} bytes, over the {} byte Raft send bound, so no "
+            "follower could be caught up from it. The log is kept instead (it will keep growing). Chunked "
+            "InstallSnapshot streaming is the fix.",
+            vshard, encoded.size(), raft::kMaxRaftSendBytes);
+        co_return 0;
+    }
+    co_await g->compact(upto, std::move(encoded));
     co_return upto;
 }
 
@@ -91,6 +107,41 @@ seastar::future<bool> ReplicatedVShardHost::proposeBatch(data::WriteBatch batch)
     // authority every replica uses -- see WriteSeries::vshard). schemaVersion is
     // carried per group.
     return proposeVShardBatches(data::splitByVShard(std::move(batch)));
+}
+
+// WHY A BARE `false` NEEDS DECODING (write-scaleout 5 review, F1).
+//
+// `RaftGroup::proposeAndAwaitApplied` returns false for TWO different situations:
+// `role_ != Leader` (ask someone else) and `leadTransferee_ != kNoNode` (I am the leader,
+// I am handing leadership away, ask me again shortly). This site used to label both
+// `NotLeader` and attach `g->leader()` as the hint -- which, when WE are the refusing
+// leader, is OURSELVES. The router accepts the hint, re-buckets the slice into its LOCAL
+// view, and asks the same refusing group again; six attempts later the client gets a 503
+// saying "not-leader" and NO RPC EVER LEFT THE NODE. That is what made the one-node-down
+// symptom look like a routing bug rather than a refusal.
+//
+// So: report the two apart, and NEVER hand back a hint naming this node. With no hint the
+// router re-resolves from its live leader view on the next attempt instead of looping.
+data::SliceReject ReplicatedVShardHost::classifyRefusal(uint16_t vshard) {
+    raft::RaftGroup* g = registry_.group(vshard);
+    NodeId hint = g ? g->leader() : raft::kNoNode;
+    data::WriteFailure kind = data::WriteFailure::NotLeader;
+    if (g && hint == self_) {
+        // We ARE the leader and we refused: a transfer is in flight (or leadership flapped
+        // between the propose and here). There is nowhere else to send this slice.
+        kind = data::WriteFailure::LeaderRefused;
+        hint = raft::kNoNode;
+        ++proposeRefusedWhileLeader_;
+        const auto now = seastar::lowres_clock::now();
+        if (now - lastRefusalLog_ >= std::chrono::seconds(5)) {
+            lastRefusalLog_ = now;
+            timestar::http_log.warn(
+                "cluster: this node LEADS VShard {} and refused a proposal ({} such refusals so far); a leadership "
+                "transfer is {}in flight. Writes to it fail retryably until the transfer completes or is abandoned.",
+                vshard, proposeRefusedWhileLeader_, g->transferInFlight() ? "" : "no longer ");
+        }
+    }
+    return data::SliceReject{vshard, hint, kind};
 }
 
 seastar::future<bool> ReplicatedVShardHost::proposeVShardBatches(data::VShardBatches byVShard) {
@@ -180,9 +231,7 @@ seastar::future<data::ProposeOutcome> ReplicatedVShardHost::proposeVShardBatches
             if (co_await std::move(pending[i])) {
                 out.committedVShards.push_back(vs);  // durable quorum commit -- the ONLY way in
             } else {
-                raft::RaftGroup* g = registry_.group(vs);
-                out.rejects.push_back(
-                    data::SliceReject{vs, g ? g->leader() : raft::kNoNode, data::WriteFailure::NotLeader});
+                out.rejects.push_back(classifyRefusal(vs));
             }
         } catch (...) {
             const auto kind = data::classifyLocalWriteFailure(std::current_exception());
@@ -192,7 +241,10 @@ seastar::future<data::ProposeOutcome> ReplicatedVShardHost::proposeVShardBatches
                 continue;
             }
             raft::RaftGroup* g = registry_.group(vs);
-            out.rejects.push_back(data::SliceReject{vs, g ? g->leader() : raft::kNoNode, kind});
+            NodeId hint = g ? g->leader() : raft::kNoNode;
+            if (hint == self_)
+                hint = raft::kNoNode;  // never point a retry back at the node that just failed it
+            out.rejects.push_back(data::SliceReject{vs, hint, kind});
         }
     }
     if (fatalErr)

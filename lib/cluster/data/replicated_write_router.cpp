@@ -139,14 +139,27 @@ seastar::future<> ReplicatedBatchWriteRouter::write(VShardBatches groups) {
                 for (const auto& r : out.rejects) {
                     lastKind = r.kind;
                     noteKind(r.kind);
-                    if (r.leaderHint != kNoNode && askedHere.count(r.vshard))
+                    // A HINT NAMING THE REJECTER IS NOT A HINT (write-scaleout 5 review,
+                    // F1). A target that just refused a slice and then says "the leader is
+                    // me" sends the retry straight back to itself: the slice re-buckets to
+                    // the same place and every remaining attempt asks the same refusing
+                    // group again, with no RPC and no possibility of a different answer.
+                    // Dropping it makes the next attempt RE-RESOLVE from the live leader
+                    // view instead, which is the only thing that can change. (The local
+                    // sink already refrains from naming itself; this is the general rule,
+                    // and it covers a remote peer that names itself too.)
+                    if (r.leaderHint != kNoNode && r.leaderHint != pendingTargets[i] && askedHere.count(r.vshard))
                         nextHints[r.vshard] = r.leaderHint;
                 }
-                if (lastKind == WriteFailure::None)
-                    lastKind = WriteFailure::NotLeader;
-                // A target that named no reason at all is treated as a plain not-leader:
+                // A target that named NO reason at all is treated as a plain not-leader:
                 // the slices are uncommitted and the retry goes elsewhere immediately.
-                noteKind(WriteFailure::NotLeader);
+                // This must stay INSIDE the "named nothing" case -- applying it
+                // unconditionally MANUFACTURED the label, so a 503 said "not-leader"
+                // whatever the target actually reported.
+                if (out.rejects.empty()) {
+                    lastKind = WriteFailure::NotLeader;
+                    noteKind(WriteFailure::NotLeader);
+                }
             } catch (...) {
                 const auto kind = isLocal ? classifyLocalWriteFailure(std::current_exception())
                                           : classifyRemoteWriteFailure(std::current_exception());

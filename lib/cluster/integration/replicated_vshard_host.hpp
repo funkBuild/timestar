@@ -13,6 +13,7 @@
 #include <map>
 #include <memory>
 #include <seastar/core/future.hh>
+#include <seastar/core/lowres_clock.hh>
 
 namespace timestar::cluster {
 
@@ -28,9 +29,7 @@ using timestar::raft::NodeId;
 // EngineDataStateMachine over the shared EngineLocalStore, and adds the RaftGroup to
 // the registry. propose() replicates a ReplicatedCommand to a VShard's group and
 // resolves only on durable-quorum commit + apply.
-class ReplicatedVShardHost : public data::ProposeSink,
-                             public data::LeaderResolver,
-                             public data::ReadIndexSink {
+class ReplicatedVShardHost : public data::ProposeSink, public data::LeaderResolver, public data::ReadIndexSink {
 public:
     ReplicatedVShardHost(EngineLocalStore& store, raft::RaftTransport& transport, NodeId self,
                          std::filesystem::path journalRoot,
@@ -110,6 +109,10 @@ public:
     seastar::future<raft::LogIndex> leaderReadIndex(uint16_t vshard) override;
     seastar::future<raft::LogIndex> leaderCommitIndex(uint16_t vshard) override;
     raft::RaftGroupRegistry& registry() { return registry_; }
+    // How many proposals this node refused WHILE BEING THE LEADER of the VShard (a
+    // leadership transfer in flight). Non-zero means writes are failing for a reason no
+    // amount of re-routing can fix -- see classifyRefusal (write-scaleout 5 review, F1).
+    uint64_t proposeRefusedWhileLeader() const { return proposeRefusedWhileLeader_; }
     size_t vshardCount() const { return vshards_.size(); }
 
     void startTicking() { registry_.startTicking(); }
@@ -132,6 +135,10 @@ private:
     std::map<uint16_t, VShardState> vshards_;
     raft::RaftGroupRegistry registry_;
     bool stopped_ = false;
+    // See classifyRefusal / proposeRefusedWhileLeader.
+    data::SliceReject classifyRefusal(uint16_t vshard);
+    uint64_t proposeRefusedWhileLeader_ = 0;
+    seastar::lowres_clock::time_point lastRefusalLog_{};
 };
 
 }  // namespace timestar::cluster

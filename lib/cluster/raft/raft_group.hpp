@@ -27,6 +27,15 @@ public:
     // Inputs. Each mutates the node then drains its Ready under the group lock.
     seastar::future<> step(Message m);
     seastar::future<> tick();
+    // An entry larger than this can be appended and COMMITTED and then never delivered
+    // to a follower -- the transport refuses it, the follower can never catch up, and the
+    // group is permanently one replica short with the offending entry already durable.
+    // Failing the write CLOSED at propose is strictly cheaper than discovering that
+    // afterwards, and it is where the caller can still be told (write-scaleout 5 review,
+    // F3b). Sized under the transport's send mirror to leave room for the envelope header
+    // and the AppendEntries framing around the entry.
+    static constexpr size_t kMaxProposalBytes = kMaxRaftSendBytes - (size_t{4} << 20);
+
     seastar::future<bool> propose(std::string data);
     // Propose `data` and resolve only once THIS entry is committed AND applied on
     // this node -- the commit/apply acknowledgement `propose()` does not give.
@@ -96,6 +105,7 @@ public:
     bool isLeader() const { return node_.isLeader(); }
     Term currentTerm() const { return node_.currentTerm(); }
     NodeId leader() const { return node_.leader(); }
+    bool transferInFlight() const { return node_.transferInFlight(); }
     LogIndex commitIndex() const { return node_.commitIndex(); }
     // Highest index this leader knows replicated on `peer` (M5 move catchUp signal).
     LogIndex matchIndexOf(NodeId peer) const { return node_.matchIndexOf(peer); }

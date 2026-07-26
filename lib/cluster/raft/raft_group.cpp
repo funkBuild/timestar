@@ -197,6 +197,16 @@ seastar::future<bool> RaftGroup::proposeAndAwaitApplied(std::string data) {
 
 seastar::future<bool> RaftGroup::proposeAndAwaitApplied(std::string data,
                                                         std::optional<seastar::lowres_clock::time_point> deadline) {
+    // FAIL CLOSED before the entry is durable (write-scaleout 5 review, F3b). An entry
+    // over the transport's send bound can commit here and then never reach a follower,
+    // leaving the group permanently one replica short with the offending entry already in
+    // every surviving log -- unfixable without surgery. A throw is a bad answer; a
+    // committed undeliverable entry is a worse one, and only the throw reaches a caller
+    // who can still do something about it.
+    if (data.size() > kMaxProposalBytes)
+        throw ProposalTooLargeError("raft: proposal of " + std::to_string(data.size()) +
+                                    " bytes exceeds the deliverable maximum of " + std::to_string(kMaxProposalBytes) +
+                                    " bytes for group " + std::to_string(groupId_));
     const uint64_t tEnter = profileEnabled() ? nowNs() : 0;
     // Register the waiter INSIDE the lock (mirroring readBarrier): capture the
     // proposed entry's index and register its promise before any drainReady can
@@ -286,6 +296,10 @@ seastar::future<> RaftGroup::tick() {
 }
 
 seastar::future<bool> RaftGroup::propose(std::string data) {
+    if (data.size() > kMaxProposalBytes)
+        return seastar::make_exception_future<bool>(ProposalTooLargeError(
+            "raft: proposal of " + std::to_string(data.size()) + " bytes exceeds the deliverable maximum of " +
+            std::to_string(kMaxProposalBytes) + " bytes for group " + std::to_string(groupId_)));
     return seastar::with_semaphore(lock_, 1, [this, data = std::move(data)]() mutable -> seastar::future<bool> {
         const bool ok = node_.propose(std::move(data));
         co_await drainReady();

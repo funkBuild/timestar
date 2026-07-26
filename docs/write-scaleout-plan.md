@@ -911,36 +911,102 @@ Both are pinned by deterministic unit tests (`raft_transfer_abort_test.cpp`), wh
 where the evidence for the fix lives. Neither is a Phase-5 regression: nothing in this
 phase touches the balancer, transfer, or propose paths.
 
-**A SECOND, SEPARATE PROBLEM THE SAME GATE EXPOSED — NOT diagnosed, NOT fixed, and the
-one thing in this phase a reviewer should pick up first.** Writing to a 3-node RF=3
-cluster with ONE NODE DOWN produces a run-to-run-variable share of bounded 503s —
-`N VShard slice(s) uncommitted after 6 attempt(s) (last: not-leader)` — measured at
-106/400, 107/400, 50/400 and 91/400 across four runs of this gate. Facts established:
+**THE ONE-NODE-DOWN 503s: DIAGNOSED (review round, F1), and the first diagnosis in this
+document was WRONG in its central inference.** Writing to a 3-node RF=3 cluster with ONE
+NODE DOWN produces a run-to-run-variable share of bounded 503s — 50, 91, 106, 107 and
+201 of 400 across five runs, and **111/400 on the pre-Phase-5 binary**, so it is
+pre-existing and Phase 5 neither caused it nor is credited with fixing it.
 
-- every rejection is logged on the COORDINATOR (the node the bench writes to) and **zero**
-  on the node that actually holds the leadership. So the write path is repeatedly
-  proposing to the wrong place and exhausting its retry budget, six attempts deep; this is
-  a leader-RESOLUTION problem, not a consensus one;
-- **it is PRE-EXISTING, and that is measured rather than assumed.** The same gate run
-  against the pre-Phase-5 binary (`c052253`, `lib/` checked out and rebuilt) gives
-  **111/400** — squarely inside the Phase-5 binary's 50-201 range. So Phase 5 neither
-  caused it nor demonstrably fixed it;
-- the two transfer fixes above are correct by construction and proven by unit test, but
-  their effect ON THIS NUMBER is **not** established: run-to-run variance exceeds any
-  difference between binaries. Do not read 26 % -> 12 % as a result. It is not one. (An
-  early hypothesis that it tracks leadership skew is also dead: the worst run, 201/400,
-  settled EVENLY at [2169 1927], and the baseline run settled at the same [256 3840] as a
-  Phase-5 run that scored half its errors.)
+**The mechanism, read end to end rather than inferred from where the log lines landed:**
 
-**This is the first thing a reviewer should pick up.** A quarter to a half of writes
-failing while one of three nodes is down, with a healthy quorum and the leadership known
-locally, is a live availability defect — it is simply not one this phase created or was
-scoped to fix.
+1. `RaftGroup::proposeAndAwaitApplied` returns a bare `false` for BOTH `role_ != Leader`
+   AND `leadTransferee_ != kNoNode` — "ask someone else" and "I am the leader and I am
+   standing down" are indistinguishable at the call site.
+2. The local sink turned that `false` into
+   `SliceReject{vs, g->leader(), NotLeader}`. **When this node IS the leader refusing,
+   `g->leader()` is ITSELF.**
+3. The router accepted the hint, so `nextHints[vs] = self`, so the slice re-bucketed into
+   `localView`, so the next attempt asked **the same refusing group again**. Six attempts,
+   **no RPC ever made**, and a 503 labelled `not-leader`.
+
+**The earlier inference here — "every rejection on the coordinator and none on the leader,
+therefore the write path is proposing to the WRONG PLACE" — does not follow, and it
+pointed the next investigator at the wrong layer.** The coordinator *is* the leader in
+this scenario; the evidence cannot distinguish "wrong place" from "right place, refusing".
+A stale-leader-map hypothesis was also refuted directly: `leaderOf` is consulted fresh on
+every attempt, so a stale map cannot survive a retry — only a hint can, which is exactly
+what did.
+
+Fixed here (the fix is diagnostic and routing, not consensus):
+
+- a distinct `WriteFailure::LeaderRefused`, so "the leader refused, mid-transfer" can no
+  longer be reported as "not-leader";
+- the sink never emits a `leaderHint` naming itself, and the router **drops any hint that
+  names the target that just rejected** — the general rule, which also covers a remote
+  peer naming itself. With no hint the next attempt RE-RESOLVES, which is the only thing
+  that can change the answer;
+- `ReplicatedVShardHost::proposeRefusedWhileLeader()` counts refusals-while-leader, with
+  a rate-limited warn naming the VShard, so the condition is visible without a code read;
+- the router's unconditional `noteKind(NotLeader)` is scoped to the case where a target
+  named no reason at all — the manufactured half of the label.
+
+Pinned by `ReplicatedBatchWriteRouterTest.SelfNamingHintIsIgnored` (verified
+discriminating: reverting the router condition fails it) and
+`.RefusalReasonIsReportedNotManufactured`.
 
 The gate therefore hard-asserts what it is FOR — catch-up, zero server-side 500s, zero
 crashes, and an anti-vacuity floor on batches accepted — and reports the 503 count as
 ADVISORY, the same way `deposed_primary_gate.sh` treats its accepted-write count and for
 the same reason.
+
+#### Review round (2026-07-26, post-implementation): 3 fixes, 2 filed
+
+- **F1 — the one-node-down 503 diagnosis was wrong.** See 5.4 above, rewritten. Distinct
+  `LeaderRefused` failure class, self-naming hints dropped at the router, a
+  refused-while-leader counter, and the manufactured `NotLeader` label scoped to the case
+  it was written for.
+- **F2 — the transfer-abandon window was re-armable, which defeated it.**
+  `transferLeadership(target)` reset `transferElapsed_ = 0` unconditionally, so ANY caller
+  re-requesting the same target faster than one election timeout kept the clock at zero
+  forever — and the leadership balancer runs every ~5 s against a 2.5-5 s timeout, which is
+  exactly that shape. The abort added earlier in this phase was therefore only being saved
+  by the balancer's caught-up target filter. Now a repeat request for the transfer already
+  in flight is IGNORED (etcd's behaviour) and only a change of target restarts the window.
+  The old test named `EachTransferGetsAFreshWindow` ran no ticks after its second request
+  and so asserted nothing about the window; replaced by
+  `RepeatingTheSameTransferDoesNotReArmTheAbortWindow` and `ChangingTheTargetRestartsTheWindow`.
+- **F3 — undeliverable messages are now refused where they are BUILT.**
+  `kMaxRaftSendBytes` moves into `raft_types.hpp` as the one definition, and three
+  producers take it: (a) `sendInstallSnapshot` refuses an oversized snapshot WITHOUT
+  advancing `nextIndex_` — the optimistic advance turned a transport refusal into a hot
+  loop (advance, follower rejects, rewind, re-encode the whole snapshot, refuse, repeat,
+  one error log per round trip), and the transport's refusal log is now latched per
+  (group, peer) as well; (b) `RaftGroup::propose*` fails CLOSED above
+  `kMaxProposalBytes`, because an entry that commits and can never be delivered leaves the
+  group permanently one replica short with the offending entry already durable; (c)
+  `snapshotVShard` refuses to COMPACT into a snapshot over the bound — compaction discards
+  the log prefix the snapshot replaces, so an undeliverable snapshot would destroy the only
+  other way to catch a follower up. Reachable only once the snapshot trigger is wired
+  (`snapshotVShard` has no production caller today), which is why it is fixed before
+  someone wires it.
+
+**Filed, NOT fixed (recorded debt):**
+
+- **F4 — the balancer's caught-up guard is too strict.** It gates a transfer on
+  `matchIndexOf(target) == lastIndex()`, i.e. exact equality, so under sustained writes a
+  perfectly healthy peer is almost never exactly caught up and leadership balancing
+  becomes load-dependent — it converges when the cluster is quiet and stalls when it is
+  busy. The property actually wanted is "this peer is ALIVE and replicating", so the gate
+  should be a RECENT ACK (a bounded matchIndex lag, or a last-ack timestamp), not
+  equality. Low risk, but it changes balancer behaviour under load and wants its own
+  rolling-rebalance measurement.
+- **F5 — a pre-existing read-path clobber in the index** (`native_index.cpp` ~:1759-1765,
+  `getSeriesGroupedByTag`). The batch-insert of KV scan misses does
+  `entry->bitmap = readSafe(...); entry->dirty = false;` on an entry a concurrent insert
+  may have created and DIRTIED during the scan's suspension — overwriting its adds and
+  clearing the flag that would have persisted them. Same shape as the merge-don't-assign
+  rule the accessors already follow; the fix is `|=` and leaving `dirty` alone. For the
+  index owner, alongside the index-flush durability defect already filed above.
 
 #### 5.5. ADRs (design only)
 

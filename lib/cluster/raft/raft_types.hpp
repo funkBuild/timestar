@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -54,6 +55,24 @@ struct LogEntry {
     friend bool operator==(const LogEntry&, const LogEntry&) = default;
 };
 
+// A proposal too large to ever be delivered to a follower. Terminal, never retryable:
+// re-proposing the same bytes produces the same answer, and the point of throwing is that
+// the entry does NOT become durable first (write-scaleout 5 review, F3b).
+class ProposalTooLargeError : public std::runtime_error {
+public:
+    explicit ProposalTooLargeError(const std::string& what) : std::runtime_error(what) {}
+};
+
+// THE ONE DEFINITION of the largest single Raft message that may be produced or sent
+// (write-scaleout 5 review, F3). The transport enforces it on the way out and mirrors the
+// peer's inbound admission bound with it; the producers (RaftGroup::kMaxProposalBytes,
+// RaftOptions::maxMessageBytes, the snapshot builder) size themselves against it, so an
+// undeliverable message is refused where it is BUILT rather than discovered on the wire.
+//
+// It lives here, in the shared types header, precisely so the deterministic core does not
+// have to include a transport header to know it.
+inline constexpr size_t kMaxRaftSendBytes = size_t{96} << 20;
+
 // The Raft-persistent voting state (durably fsync'd before any RPC that depends
 // on it, per the journal safety contract). commitIndex is volatile and NOT part
 // of hard state.
@@ -75,9 +94,7 @@ struct Config {
 
     bool joint() const { return !votersOutgoing.empty(); }
 
-    static bool contains(const std::vector<NodeId>& v, NodeId n) {
-        return std::find(v.begin(), v.end(), n) != v.end();
-    }
+    static bool contains(const std::vector<NodeId>& v, NodeId n) { return std::find(v.begin(), v.end(), n) != v.end(); }
     // A voter is anyone in either voting set (both participate during a joint
     // transition).
     bool isVoter(NodeId n) const { return contains(voters, n) || contains(votersOutgoing, n); }

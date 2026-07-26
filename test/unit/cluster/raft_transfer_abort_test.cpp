@@ -101,19 +101,47 @@ TEST(RaftTransferAbortTest, ATransferToACaughtUpPeerStillCompletes) {
     EXPECT_TRUE(sawTimeoutNow) << "a caught-up target must be told to elect at once";
 }
 
-// The timer restarts per transfer: a second attempt gets its own full window rather than
-// inheriting the elapsed ticks of the first.
-TEST(RaftTransferAbortTest, EachTransferGetsAFreshWindow) {
+// THE ABORT WINDOW MUST NOT BE RE-ARMABLE BY REPEATING THE SAME TRANSFER.
+//
+// This is the door the abort can be walked around through, and it is not hypothetical: the
+// leadership balancer runs every ~5 s against a 2.5-5 s election timeout, so a balancer
+// that keeps choosing the same (down) target re-requests the transfer faster than the
+// window expires. If each request reset the clock, `leadTransferee_` would never clear and
+// the group would refuse writes forever -- exactly the failure tick()'s abort exists to
+// bound, reached through a different door. etcd ignores a repeat request for the transfer
+// already in flight; so do we.
+//
+// The previous version of this test never ran a tick after the second request, so it
+// asserted nothing about the window at all.
+TEST(RaftTransferAbortTest, RepeatingTheSameTransferDoesNotReArmTheAbortWindow) {
     RaftNode leader = makeIsolatedLeader({1, 2, 3});
     ackFully(leader, 2);
+
+    leader.transferLeadership(3);  // node 3 never acks
+    for (unsigned i = 0; i < leader.electionTimeout() - 1; ++i) {
+        leader.transferLeadership(3);  // the balancer, asking again on every pass
+        leader.tick();
+    }
+    EXPECT_FALSE(leader.propose("still inside the one and only window"));
+
+    leader.transferLeadership(3);  // ...and once more, right before the deadline
+    leader.tick();
+    EXPECT_TRUE(leader.propose("the window expired despite the repeat requests"))
+        << "a repeated transfer request to the SAME target re-armed the abort window, so the group "
+        << "refuses proposals for as long as something keeps asking (write-scaleout 5 review, F2)";
+}
+
+// ...but a transfer to a DIFFERENT target is a new transfer and gets its own full window.
+TEST(RaftTransferAbortTest, ChangingTheTargetRestartsTheWindow) {
+    RaftNode leader = makeIsolatedLeader({1, 2, 3});
+    ackFully(leader, 2);  // node 2 is caught up but we aim at 3, which never acks
 
     leader.transferLeadership(3);
     for (unsigned i = 0; i < leader.electionTimeout() - 1; ++i)
         leader.tick();
-    EXPECT_FALSE(leader.propose("still in the first window"));
 
-    leader.transferLeadership(3);  // restart
+    leader.transferLeadership(2);  // a genuinely new target
     leader.tick();
-    EXPECT_FALSE(leader.propose("one tick into the second window"))
-        << "the second transfer inherited the first one's elapsed ticks and aborted early";
+    EXPECT_FALSE(leader.propose("one tick into the new target's window"))
+        << "the new transfer inherited the previous target's elapsed ticks and aborted early";
 }
