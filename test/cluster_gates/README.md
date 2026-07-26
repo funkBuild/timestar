@@ -10,9 +10,19 @@ not probes, so they can be run from CI or a release checklist.
 | `rolling_rebalance_gate.sh` | a leadership rebalance under sustained writes costs latency, not client errors |
 | `backpressure_gate.sh` | the per-shard in-flight write bound degrades to 503 + `Retry-After`, never to 500s or timeouts, and the DEFAULT budget never gets in the way |
 | `fault_injection_gate.sh` | a BURST of TCP connection resets between two live nodes costs latency, not client errors, and loses/duplicates nothing (write-scaleout 4c) |
+| `restart_catchup_gate.sh` | a follower that was DOWN through a large write campaign catches up when it returns, under the tightened Raft admission bound (write-scaleout 5.4) |
 
-All three take an optional server binary as `$1` (default
+All of them take an optional server binary as `$1` (default
 `build/bin/timestar_http_server`), so a "before" binary can be measured the same way.
+
+`restart_catchup_gate.sh` is a REGRESSION FENCE, and it says so in its own header: the
+pre-5.4 binary passes it, because at 400 batches the log tail still fits under the old
+1 GiB admission bound. What it fences is the 8x-tightened 128 MiB bound. Its client-error
+count is ADVISORY for a measured reason -- writing to a 3-node RF=3 cluster with one node
+down produces 50-201 of 400 bounded 503s, and the pre-Phase-5 binary produces 111/400, so
+the number cannot credit or blame a change. That defect (every rejection on the
+COORDINATOR, none on the node actually holding leadership -- i.e. leader RESOLUTION, not
+consensus) is filed in the plan doc's Phase 5 outcome.
 
 ## Why the topologies differ
 
