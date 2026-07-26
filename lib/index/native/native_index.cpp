@@ -339,12 +339,34 @@ seastar::future<> NativeIndex::close() {
         co_await walSyncGate_.close();
     }
 
-    // Wait for any in-flight background flush, then flush remaining data
+    // Wait for any in-flight background flush, then flush remaining data.
+    //
+    // UNCONDITIONALLY (write-scaleout debt D-3). This used to be guarded on
+    // `!memtable_->empty()`, but the memtable is not the only thing
+    // flushMemTable() makes durable: it is also the ONLY caller of
+    // flushDirtyBitmaps / flushDirtyDayBitmaps / flushDirtyHLLs /
+    // flushDirtyMeasurementBlooms, and those caches are mutated WITHOUT touching
+    // the memtable at all (a day-bitmap add for an already-known series writes no
+    // KV entry). So an empty memtable does not mean there is nothing to persist —
+    // and it is exactly what the last maybeFlushMemTable() leaves behind, since
+    // it swaps the active memtable out and installs a fresh empty one.
+    //
+    // That is the whole of the reported defect: under concurrency plus a small
+    // write buffer, the final threshold flush fired while the last chunk of
+    // inserts were still in flight; their day-bitmap adds then landed on a
+    // now-empty memtable's watch, close() skipped the flush, and those series
+    // were absent from day-scoped discovery after reopen (559/600, the missing
+    // ids being exactly the contiguous tail assigned after the last flush).
+    // The postings half of the same loss was invisible only because the
+    // crash-window watermark repair reconstructs postings from metadata on open;
+    // day bitmaps cannot be reconstructed (the timestamps are gone), so they are
+    // where it surfaced.
+    //
+    // flushMemTable() already short-circuits on an empty memtable — but only
+    // AFTER draining the caches, which is the point.
     try {
         co_await waitForFlush();
-        if (memtable_ && !memtable_->empty()) {
-            co_await flushMemTable();
-        }
+        co_await flushMemTable();
     } catch (const std::exception& e) {
         ::native_index_log.warn("Failed to flush MemTable on close: {} — data preserved in WAL", e.what());
     }
@@ -708,8 +730,15 @@ seastar::future<> NativeIndex::maybeFlushMemTable() {
         flushDirtyHLLs(postingsBatch);
         co_await flushDirtyMeasurementBlooms(postingsBatch);
         if (!postingsBatch.empty()) {
-            co_await wal_->append(postingsBatch);
+            // Apply BEFORE the append, matching kvWriteBatch's documented rule.
+            // flushDirtyBitmaps/flushDirtyDayBitmaps have already cleared every
+            // `dirty` flag by this point, so the batch is the only remaining copy
+            // of those adds: a throwing append would otherwise leave them in
+            // neither the memtable nor the log. The memtable copy is durable via
+            // the SSTable flush regardless, and the WAL copy is idempotent on
+            // replay.
             postingsBatch.applyTo(*memtable_);
+            co_await wal_->append(postingsBatch);
         }
         // Evict non-dirty cache entries to bound memory growth
         trimBitmapCache();
@@ -756,8 +785,15 @@ seastar::future<> NativeIndex::flushMemTable() {
         flushDirtyHLLs(postingsBatch);
         co_await flushDirtyMeasurementBlooms(postingsBatch);
         if (!postingsBatch.empty()) {
-            co_await wal_->append(postingsBatch);
+            // Apply BEFORE the append, matching kvWriteBatch's documented rule.
+            // flushDirtyBitmaps/flushDirtyDayBitmaps have already cleared every
+            // `dirty` flag by this point, so the batch is the only remaining copy
+            // of those adds: a throwing append would otherwise leave them in
+            // neither the memtable nor the log. The memtable copy is durable via
+            // the SSTable flush regardless, and the WAL copy is idempotent on
+            // replay.
             postingsBatch.applyTo(*memtable_);
+            co_await wal_->append(postingsBatch);
         }
         trimBitmapCache();
         trimDayBitmapCache();
@@ -2014,11 +2050,12 @@ size_t NativeIndex::getSeriesCountSync() const {
 }
 
 seastar::future<> NativeIndex::compact() {
-    // Wait for any in-flight background flush, then flush active memtable
+    // Wait for any in-flight background flush, then flush active memtable.
+    // Unconditional for the reason spelled out in close(): flushMemTable() is
+    // also the only thing that drains the dirty bitmap/day-bitmap/HLL/bloom
+    // caches, and those can hold unpersisted state while the memtable is empty.
     co_await waitForFlush();
-    if (memtable_ && !memtable_->empty()) {
-        co_await flushMemTable();
-    }
+    co_await flushMemTable();
 
     // Retire all readers before compaction (compaction deletes files). Deferred
     // close: an in-flight scan may still hold a snapshot of these readers.

@@ -283,22 +283,35 @@ TEST(DayBitmapSourceInspection, NoBitmapPointerEscapesASuspendingCoroutine) {
 }
 
 // ---------------------------------------------------------------------------
-// A SECOND, DISTINCT defect found while building the repro above. NOT fixed here, and
-// NOT introduced by 4d -- it reproduces identically on the pre-4d index code.
+// A SECOND, DISTINCT defect found while building the repro above (debt D-3), FIXED and
+// now a gate. It was never introduced by 4d -- it reproduced identically on the pre-4d
+// index code.
 //
-// With a 4 KB write buffer (so a memtable flush + L0 compaction fires every few series)
-// and CONCURRENT inserts, day-bitmap membership that is CORRECT IN MEMORY is lost on the
-// way to disk: the warm, pre-close, time-scoped count is exactly right, and the count
-// after close + reopen is short by roughly one chunk's worth. It needs BOTH concurrency
-// and frequent flushes -- the same workload run sequentially persists everything, and at
-// a 64 KB buffer the loss disappears -- which points at the flush/compaction path, not at
-// the add path this phase fixed.
+// THE SYMPTOM. With a 4 KB write buffer (so a memtable flush fires every few series) and
+// CONCURRENT inserts, day-bitmap membership that is CORRECT IN MEMORY was lost on the way
+// to disk: the warm, pre-close, time-scoped count was exactly right and the count after
+// close + reopen was short by roughly one chunk (559/600). It needed BOTH concurrency and
+// frequent flushes -- the same workload run sequentially persisted everything, and at a
+// 64 KB buffer the loss disappeared.
 //
-// Enable it to work on the bug; it is a one-command repro:
-//     ./test/timestar_unit_test --gtest_also_run_disabled_tests \
-//         --gtest_filter='*DISABLED_ConcurrentInsertsWithTinyWriteBufferLoseDayMembership'
-// Filed in docs/write-scaleout-plan.md for the index owner.
-SEASTAR_TEST_F(DayBitmapConcurrentInsertTest, DISABLED_ConcurrentInsertsWithTinyWriteBufferLoseDayMembership) {
+// THE CAUSE, and it is not the day bitmaps. `close()` guarded its final flush on
+// `!memtable_->empty()`, but `flushMemTable()` is the ONLY caller of
+// flushDirtyBitmaps / flushDirtyDayBitmaps / flushDirtyHLLs / flushDirtyMeasurementBlooms,
+// and those caches are mutated WITHOUT touching the memtable -- a day-bitmap add for an
+// already-known series writes no KV entry. An empty memtable is in fact exactly what the
+// last threshold flush leaves behind (it swaps the active memtable out and installs a
+// fresh one), so the tail of a concurrent chunk landed its day-bitmap adds after that
+// flush, close() then skipped the flush entirely, and those series were simply not on
+// disk. The missing ids were the contiguous tail assigned after the last flush -- which
+// is why the loss tracked flush cadence and concurrency rather than volume.
+//
+// The postings half of the same loss is invisible from the outside: the crash-window
+// watermark repair rebuilds postings from series metadata on open. Day bitmaps cannot be
+// rebuilt (the insert timestamps are gone), so they are where it surfaced.
+//
+// A note for whoever changes the flush path: this test is a DURABILITY gate, not a day
+// bitmap gate. Any state that lives only in an index cache until a flush is covered by it.
+SEASTAR_TEST_F(DayBitmapConcurrentInsertTest, ConcurrentInsertsWithTinyWriteBufferKeepDayMembership) {
     constexpr int kSeries = 600;
     constexpr int kDays = 4;
     const uint64_t baseDay = 20500ULL * ke::NS_PER_DAY;
