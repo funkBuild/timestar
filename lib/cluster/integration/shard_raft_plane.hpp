@@ -334,32 +334,49 @@ public:
             //      restarted node still streaming its backlog) does not. TimeoutNow then
             //      fires on the very next ack rather than after a catch-up campaign.
             //
-            //   2. LIVENESS -- replied within kMaxTransferAckStaleTicks. This is the
-            //      "the target is actually there" half, and it is the one a pure lag bound
+            //   2. LIVENESS -- replied within the LAST HEARTBEAT ROUND. This is the "the
+            //      target is actually there" half, and it is the one a pure lag bound
             //      CANNOT provide. On an IDLE group a dead peer sits at lag ZERO forever:
             //      it was caught up when it died and lastIndex never moves again, so it
             //      passes any delta check, including the old exact-equality one. (That
             //      hole is therefore not new here -- it is pre-existing, and this closes
             //      it.) The heartbeat gives an independent decaying signal: the leader
             //      bcastAppends every heartbeatTimeout ticks whether or not there is
-            //      anything to send, and a live peer answers. Three missed heartbeat
-            //      rounds is the bound -- comfortably above one round plus jitter and RTT,
-            //      and comfortably BELOW electionTimeoutMin (125 ticks at the production
-            //      25-tick heartbeat), so a peer this test calls dead has already missed
-            //      enough rounds that the group would be re-electing if it were the leader.
+            //      anything to send, and a live peer answers within an RTT.
             //
-            // Residual exposure, bounded and deliberate: a peer that dies between its last
-            // ack and this pass can still be targeted for up to kMaxTransferAckStaleTicks.
-            // That costs the group its proposals for ONE election timeout, after which
-            // RaftNode::tick abandons the transfer (§3.10) and writes resume; the peer then
-            // reads stale on every later pass and is skipped. One bounded window on the
-            // pass that races the death, not a window per pass forever -- which is what
-            // the abandon fix alone left on the table.
+            // THE LIVENESS WINDOW IS ONE HEARTBEAT ROUND, AND IT IS THIS TIGHT FOR A
+            // MEASURED REASON. It was three rounds (1.5 s at the production 25-tick
+            // heartbeat) and `fault_injection_gate.sh` regressed: 1 of 2000 bench writes
+            // failed `RetryableWriteError ... (last: transport)` where the same tree
+            // without this change took a marginally HEAVIER storm (167 rounds / 457
+            // connections vs 165 / 442) with zero. The mechanism is specific and it is
+            // this loop's: the periodic balancer could target a peer whose connection had
+            // just been RST, because the ack clock had not yet decayed past three rounds
+            // and the lag bound still held. `transferLeadership` then pins
+            // `leadTransferee_` and the group refuses EVERY proposal until the transferee
+            // acks -- and the abandon bound is one ELECTION timeout (2.5-5 s), far longer
+            // than the 1.5 s write deadline. So one mis-aimed transfer is one failed
+            // batch. The old exact-equality guard was accidentally immune: a peer whose
+            // acks stopped fell behind a growing lastIndex immediately.
+            //
+            // One round is the tightest bound a HEALTHY peer still satisfies -- it answers
+            // every heartbeat within an RTT, so its clock resets long before the next
+            // round -- and it cuts the post-reset eligibility window from 1.5 s to 0.5 s.
+            //
+            // Residual exposure, bounded and now deliberate: a peer that dies inside the
+            // current heartbeat round can still be targeted on a pass that races it. That
+            // costs the group its proposals for one election timeout, after which
+            // RaftNode::tick abandons the transfer (§3.10) and writes resume; the peer
+            // then reads stale on every later pass and is skipped. One bounded window on
+            // the pass that races the death, not a window per pass forever -- which is
+            // what the abandon fix alone left on the table. Shrinking it further means
+            // shortening the ABANDON window (a consensus-timing change, not a target
+            // filter) -- see the debt register.
             constexpr raft::LogIndex kMaxTransferLagEntries = 64;
             const auto lastIdx = g->node().log().lastIndex();
             const auto match = g->matchIndexOf(target);
             const bool caughtUp = match >= lastIdx || (lastIdx - match) <= kMaxTransferLagEntries;
-            const uint64_t kMaxTransferAckStaleTicks = 3ULL * g->heartbeatTimeout();
+            const uint64_t kMaxTransferAckStaleTicks = g->heartbeatTimeout();
             const bool live = g->ticksSinceAck(target) <= kMaxTransferAckStaleTicks;
             if (!caughtUp || !live) {
                 ++ti;
