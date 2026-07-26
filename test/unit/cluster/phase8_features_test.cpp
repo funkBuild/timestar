@@ -7,8 +7,11 @@
 #include "../../../lib/cluster/features/operator_surface.hpp"
 #include "../../../lib/cluster/features/routing_summary.hpp"
 #include "../../../lib/cluster/features/stream_subscription.hpp"
+#include "../../../lib/cluster/integration/journal_format_bridge.hpp"
 
 #include <gtest/gtest.h>
+
+#include <seastar/core/smp.hh>
 
 #include <string>
 #include <vector>
@@ -249,4 +252,39 @@ TEST(OperatorSurface, ReplicaDecisionTrace) {
     EXPECT_EQ(d.eligible.size(), 3u);
     auto none = traceReplicaDecision(7, "bounded_staleness", {});
     EXPECT_EQ(none.chosen, 0);  // no eligible replica -> fails closed
+}
+
+// The group-0 -> journal-codec seam (debt D-7). `publishJournalFormat` is the ONE way the
+// journal's emission version may move, and it must be fail-closed and monotonic in exactly
+// the way `Group0State::activeFormatVersion` is: the activation is a committed group-0
+// decision, and a node that has not observed one emits v1.
+TEST(JournalFormatBridge, OnlyACommittedGroup0ActivationRaisesTheJournalFormat) {
+    timestar::data::JournalFormatGate::resetForTesting();
+    timestar::control::Group0State st;
+    ASSERT_EQ(st.activeFormatVersion, 1u) << "group-0 starts at format 1";
+
+    // A fresh cluster: nothing activated, so the journal stays on v1. This is the state
+    // production is in today -- no live group 0 is composed into the running data plane, so
+    // no node observes an activation and no v2 byte can reach a journal.
+    timestar::cluster::publishJournalFormat(st).get();
+    EXPECT_EQ(timestar::data::JournalFormatGate::writeBatchFormat(), timestar::data::kWriteBatchFormatV1);
+
+    // A committed activation reaches EVERY shard (the gate is per-shard because it is read
+    // on the write hot path; a shard that was not reached would silently keep emitting v1).
+    st.activeFormatVersion = timestar::data::kJournalV2ActivationVersion;
+    timestar::cluster::publishJournalFormat(st).get();
+    for (unsigned sh = 0; sh < seastar::smp::count; ++sh) {
+        const auto fmt =
+            seastar::smp::submit_to(sh, [] { return timestar::data::JournalFormatGate::writeBatchFormat(); }).get();
+        EXPECT_EQ(fmt, timestar::data::kWriteBatchFormatV2) << "shard " << sh << " was not told";
+    }
+
+    // A LOWER observation cannot un-activate it: group-0 state is rebuilt by replaying its
+    // log, so a mid-replay observer can transiently report an older version than the one
+    // already committed.
+    st.activeFormatVersion = 1;
+    timestar::cluster::publishJournalFormat(st).get();
+    EXPECT_EQ(timestar::data::JournalFormatGate::writeBatchFormat(), timestar::data::kWriteBatchFormatV2);
+
+    seastar::smp::invoke_on_all([] { timestar::data::JournalFormatGate::resetForTesting(); }).get();
 }

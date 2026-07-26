@@ -127,11 +127,15 @@ WriteBatch mergeVShardBatches(VShardBatches groups);
 //     negotiated with that specific peer via kNegotiateVersion, so a mixed-version
 //     cluster degrades to v1 and an INCOMPATIBLE peer fails closed rather than
 //     misparsing;
-//   - the Raft command path (and hence the journal) still emits v1
-//     unconditionally. Raising it needs a CLUSTER-wide gate -- every voter able to
-//     read v2 -- which is what group-0's committed format activation
-//     (activeFormatVersion / features::FeatureGate) exists for; wiring that to this
-//     codec is the remaining step, and until then no v2 byte can reach a journal.
+//   - the Raft command path (and hence the journal) emits the version the
+//     CLUSTER-WIDE journal gate allows (debt D-7, `data/journal_format.hpp`). It
+//     cannot use per-peer negotiation: a log entry goes to voters that never did the
+//     pairwise handshake, and the journal outlives the process that wrote it. The gate
+//     is group-0's COMMITTED format activation (`activeFormatVersion`, proposed only
+//     after `features::FeatureGate::canActivate` confirms every voter supports the
+//     version), it defaults to v1 and only ever RISES -- so a node that has heard no
+//     activation emits v1, which every binary can read. journal_format.hpp carries the
+//     ordering argument for why "an old binary reads a v2 journal" is unreachable.
 constexpr uint32_t kWriteBatchFormatV1 = 1;
 constexpr uint32_t kWriteBatchFormatV2 = 2;
 

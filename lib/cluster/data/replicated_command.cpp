@@ -1,5 +1,7 @@
 #include "replicated_command.hpp"
 
+#include "journal_format.hpp"  // JournalFormatGate (debt D-7)
+
 #include <cstring>
 
 namespace timestar::data {
@@ -73,7 +75,7 @@ constexpr uint8_t kRetention = 2;
 std::string encodeWriteCommand(const WriteBatch& batch) {
     std::string out;
     out.push_back(static_cast<char>(kWrite));
-    putStr(out, encodeWriteBatch(batch, kWriteBatchFormatV1));  // pinned -- see encodeReplicatedCommand
+    putStr(out, encodeWriteBatch(batch, JournalFormatGate::writeBatchFormat()));  // see encodeReplicatedCommand
     putU64(out, fnv1a(out.data(), out.size()));
     return out;
 }
@@ -85,17 +87,22 @@ std::string encodeReplicatedCommand(const ReplicatedCommand& cmd) {
         // WriteBatch arm reuses the tested encoder as a length-prefixed sub-blob
         // (it carries its own FNV; the outer trailer covers the tag + blob).
         //
-        // The version is PINNED EXPLICITLY, not left to the encoder's default. These
-        // bytes become a Raft log entry: they are replicated to every voter and written
-        // to each one's journal, so the format must be one that EVERY voter -- and every
-        // future binary replaying that journal -- can read. Voters take no part in the
-        // pairwise data-plane version handshake, so per-peer negotiation cannot gate
-        // this; raising it needs the cluster-wide gate group-0's committed format
-        // activation provides (activeFormatVersion / features::FeatureGate, see
-        // write_record.hpp). Spelling v1 out here means a change to the encoder's
-        // DEFAULT can never silently promote the journal format
+        // The version comes from the CLUSTER-WIDE JOURNAL GATE, never from the encoder's
+        // default (debt D-7). These bytes become a Raft log entry: replicated to every
+        // voter and written to each one's journal, so the format must be one every voter
+        // -- and every binary that may later replay that journal -- can read. A voter takes
+        // no part in the pairwise data-plane handshake, so per-peer negotiation cannot gate
+        // it; the gate is group-0's COMMITTED format activation, which the controller
+        // proposes only once FeatureGate::canActivate confirms every voter supports the
+        // version. It defaults to v1 and only ever rises, so a node that has heard no
+        // activation emits v1 -- fail closed. See data/journal_format.hpp for the full
+        // ordering argument (including why "an old binary reads a v2 journal" is
+        // unreachable rather than untested).
+        //
+        // Naming the gate here rather than a literal is also what keeps a change to
+        // encodeWriteBatch's DEFAULT from silently promoting the journal format
         // (docs/write-scaleout-plan.md §6).
-        putStr(out, encodeWriteBatch(*w, kWriteBatchFormatV1));
+        putStr(out, encodeWriteBatch(*w, JournalFormatGate::writeBatchFormat()));
     } else if (const auto* d = std::get_if<DeleteRangeKey>(&cmd)) {
         out.push_back(static_cast<char>(kDelete));
         putStr(out, d->seriesKey);
