@@ -179,6 +179,12 @@ public:
     uint64_t snapshotsTaken() const { return snapshotsTaken_; }
     uint64_t snapshotsRefusedTooLarge() const { return snapshotsRefusedTooLarge_; }
     uint64_t snapshotsSkippedUnflushed() const { return snapshotsSkippedUnflushed_; }
+    // Sweep passes run, and the highest entries-since-snapshot any group showed on the last
+    // pass. Together they answer the FIRST question when logs are not being compacted --
+    // "is the sweep running at all, and is anything close to the threshold?" -- which
+    // `snapshotsTaken() == 0` on its own cannot.
+    uint64_t snapshotSweeps() const { return snapshotSweeps_; }
+    uint64_t snapshotMaxEntriesSinceSeen() const { return snapshotMaxEntriesSinceSeen_; }
     bool snapshotTriggerEnabled() const { return snapshotTriggerEnabled_; }
 
 private:
@@ -226,6 +232,8 @@ private:
     uint64_t snapshotsTaken_ = 0;
     uint64_t snapshotsRefusedTooLarge_ = 0;
     uint64_t snapshotsSkippedUnflushed_ = 0;
+    uint64_t snapshotSweeps_ = 0;
+    uint64_t snapshotMaxEntriesSinceSeen_ = 0;
 };
 
 }  // namespace timestar::cluster

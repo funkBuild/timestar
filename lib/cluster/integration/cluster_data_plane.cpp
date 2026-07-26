@@ -104,6 +104,34 @@ bool checkQuorumEnabled() {
     return true;
 }
 
+// Snapshot-trigger policy overrides (debt D-6). The defaults
+// (`ReplicatedVShardHost::kSnapshotEntryThreshold` / `kSnapshotBytesThreshold`) are sized
+// for production: 8192 entries or 64 MiB per VShard, which on a 4096-VShard cluster means
+// a group snapshots after a substantial amount of real traffic and essentially never
+// during a short benchmark.
+//
+// These exist for two reasons and both are load-bearing. (1) A gate has to be able to FORCE
+// snapshotting: `restart_catchup_gate.sh` must drive a follower far enough behind that its
+// log was compacted away, and reaching an 8192-entry-per-VShard backlog by writing real
+// points would take hours of disk. (2) An operator whose batches are far larger or smaller
+// than the assumed shape needs to move the thresholds without a rebuild -- the numbers are
+// a guess about workload, not a property of the format.
+//
+// Unset == the built-in default. A malformed value is reported and ignored rather than
+// silently taken as zero, because zero DISABLES a threshold (and both zero makes every
+// group eligible on every sweep) -- a typo must not turn a policy into a stampede.
+std::optional<uint64_t> envU64(const char* name) {
+    const char* e = std::getenv(name);
+    if (!e || !*e)
+        return std::nullopt;
+    try {
+        return static_cast<uint64_t>(std::stoull(e));
+    } catch (...) {
+        timestar::http_log.error("cluster: {}='{}' is not a number; using the built-in default", name, e);
+        return std::nullopt;
+    }
+}
+
 // Resolve "host" to an address (numeric dotted-quad parses directly; a hostname --
 // e.g. a docker service name -- goes through DNS).
 seastar::future<seastar::net::inet_address> resolveHost(const std::string& host) {
@@ -338,7 +366,26 @@ seastar::future<> ClusterDataPlane::start(const ClusterConfig& cfg, seastar::sha
                                            });
             }
         }
-        co_await shards_.invoke_on_all([](ShardRaftPlane& p) {
+        // Snapshot-trigger policy, resolved and LOGGED here so a mis-set override is
+        // visible in the boot log rather than inferred from a log that never compacts.
+        const auto snapEntries = envU64("TIMESTAR_CLUSTER_SNAPSHOT_ENTRIES");
+        const auto snapBytes = envU64("TIMESTAR_CLUSTER_SNAPSHOT_BYTES");
+        const auto snapMinIntervalS = envU64("TIMESTAR_CLUSTER_SNAPSHOT_MIN_INTERVAL_S");
+        if (snapEntries || snapBytes || snapMinIntervalS)
+            timestar::http_log.info(
+                "cluster: Raft snapshot policy OVERRIDDEN: entries={} bytes={} min_interval={}s (defaults {} / {} / "
+                "{}s)",
+                snapEntries ? std::to_string(*snapEntries) : "default",
+                snapBytes ? std::to_string(*snapBytes) : "default",
+                snapMinIntervalS ? std::to_string(*snapMinIntervalS) : "default",
+                ReplicatedVShardHost::kSnapshotEntryThreshold, ReplicatedVShardHost::kSnapshotBytesThreshold,
+                ReplicatedVShardHost::kMinSnapshotInterval.count());
+        co_await shards_.invoke_on_all([snapEntries, snapBytes, snapMinIntervalS](ShardRaftPlane& p) {
+            if (snapEntries || snapBytes || snapMinIntervalS)
+                p.setSnapshotPolicy(snapEntries.value_or(ReplicatedVShardHost::kSnapshotEntryThreshold),
+                                    snapBytes.value_or(ReplicatedVShardHost::kSnapshotBytesThreshold),
+                                    std::chrono::seconds(snapMinIntervalS.value_or(
+                                        static_cast<uint64_t>(ReplicatedVShardHost::kMinSnapshotInterval.count()))));
             p.startTicking();
             // THE SNAPSHOT PRODUCER TRIGGER (debt D-6). Started AFTER every group on the
             // shard exists, so the first sweep sees the real group set. Before this,
@@ -740,6 +787,9 @@ seastar::future<ClusterDataPlane::Status> ClusterDataPlane::status() const {
         auto sc = co_await shards.invoke_on(sh, [](ShardRaftPlane& p) { return p.snapshotCounts(); });
         st.snapshotsTaken += sc.taken;
         st.snapshotsRefusedTooLarge += sc.refusedTooLarge;
+        st.snapshotsSkippedUnflushed += sc.skippedUnflushed;
+        st.snapshotSweeps += sc.sweeps;
+        st.snapshotMaxEntriesSince = std::max(st.snapshotMaxEntriesSince, sc.maxEntriesSinceSeen);
         st.snapshotChunksSent += sc.chunksSent;
         st.snapshotsInstalled += sc.installed;
         st.snapshotsUndeliverable += sc.undeliverable;

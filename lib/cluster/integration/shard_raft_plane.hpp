@@ -229,6 +229,13 @@ public:
             plane_->startTicking();
     }
 
+    // Override this shard's snapshot-trigger policy (debt D-6). Must be called BEFORE
+    // startSnapshotTrigger.
+    void setSnapshotPolicy(uint64_t entries, uint64_t bytes, std::chrono::seconds minInterval) {
+        if (plane_)
+            plane_->host().setSnapshotPolicy(entries, bytes, minInterval);
+    }
+
     // Start this shard's background Raft-log snapshot/compaction trigger (debt D-6).
     // Called after every group on the shard exists, so the first sweep sees the real
     // group set rather than a partial one.
@@ -241,11 +248,14 @@ public:
     // the restart-catch-up gate -- which needs to prove a catch-up used the SNAPSHOT path
     // rather than ordinary appends, and cannot tell the two apart without a counter.
     struct SnapshotCounts {
-        uint64_t taken = 0;            // snapshots produced + logs compacted here
-        uint64_t refusedTooLarge = 0;  // over kMaxVShardSnapshotBytes: log kept
-        uint64_t chunksSent = 0;       // InstallSnapshot chunks put on the wire (leader)
-        uint64_t installed = 0;        // snapshots installed as a follower
-        uint64_t undeliverable = 0;    // snapshots this node declined to send
+        uint64_t taken = 0;             // snapshots produced + logs compacted here
+        uint64_t refusedTooLarge = 0;   // over kMaxVShardSnapshotBytes: log kept
+        uint64_t skippedUnflushed = 0;  // eligible, but the VShard has no FLUSHED data yet
+        uint64_t sweeps = 0;            // sweep passes run (0 == the trigger is not running)
+        uint64_t maxEntriesSinceSeen = 0;
+        uint64_t chunksSent = 0;     // InstallSnapshot chunks put on the wire (leader)
+        uint64_t installed = 0;      // snapshots installed as a follower
+        uint64_t undeliverable = 0;  // snapshots this node declined to send
         uint64_t transfersRestarted = 0;
         uint64_t transfersAbandoned = 0;
         bool triggerEnabled = false;
@@ -258,6 +268,9 @@ public:
         auto& host = const_cast<ReplicatedDataPlane*>(plane_.get())->host();
         c.taken = host.snapshotsTaken();
         c.refusedTooLarge = host.snapshotsRefusedTooLarge();
+        c.skippedUnflushed = host.snapshotsSkippedUnflushed();
+        c.sweeps = host.snapshotSweeps();
+        c.maxEntriesSinceSeen = host.snapshotMaxEntriesSinceSeen();
         c.triggerEnabled = host.snapshotTriggerEnabled();
         for (uint16_t vs = 0; vs <= timestar::VIRTUAL_SHARD_MASK; ++vs) {
             if (!host.hosts(vs))

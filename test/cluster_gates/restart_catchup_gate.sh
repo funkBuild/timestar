@@ -10,12 +10,61 @@
 # (RaftOptions::maxAppendEntries / maxAppendBytes) and tightens admission to 128 MiB, and
 # this gate is what says the tightened bound did not break catch-up.
 #
-# HONEST SCOPE. The pre-5.4 binary (c052253) PASSES this gate too: at 400 batches the
-# whole log tail still fits under the old 1 GiB bound, so nothing was broken to begin with
-# at this scale. The gate is therefore a REGRESSION FENCE on the tightened 128 MiB bound
-# -- it says catch-up still works after the bound came down by 8x -- not a demonstration
-# that chunking was required here. Raise GATE_BATCHES if you want to push the backlog
-# toward the old bound; the disk cost rises with it.
+# HONEST SCOPE OF THE APPEND HALF. The pre-5.4 binary (c052253) PASSES that half too: at
+# 400 batches the whole log tail still fits under the old 1 GiB bound, so nothing was
+# broken to begin with at this scale. That half is a REGRESSION FENCE on the tightened
+# admission bound -- it says catch-up still works after the bound came down -- not a
+# demonstration that chunking was required there. Raise GATE_BATCHES if you want to push
+# the backlog toward the old bound; the disk cost rises with it.
+#
+# ============================================================================
+# THE SNAPSHOT HALF (debt D-5/D-6) -- this is the DISCRIMINATING part.
+# ============================================================================
+#
+# The append half cannot fail for a chunked-snapshot regression, because it never reaches
+# the snapshot path: the leader still has every entry the returning follower needs. To
+# exercise chunked InstallSnapshot the follower has to be behind the leader's COMPACTED
+# PREFIX, so the entries that would have caught it up no longer exist.
+#
+# Both halves of that are new. D-6 wired the snapshot PRODUCER (nothing ever compacted
+# before -- `snapshotVShard` had no caller at all), and D-5 chunked the TRANSFER (one
+# message used to carry an entire VShard snapshot, which is why the Raft admission bound
+# had to stay loose and why the producer refused to compact past a size limit).
+#
+# HOW IT IS FORCED, in two independent places, and BOTH are needed:
+#
+#   1. `TIMESTAR_CLUSTER_SNAPSHOT_ENTRIES` lowers the trigger threshold. Production is 8192
+#      entries or 64 MiB PER VSHARD, which a short campaign spread over 4096 VShards never
+#      approaches -- reaching it honestly would take hours of disk. (The knob exists for
+#      operators too; see cluster_data_plane.cpp.)
+#
+#      HOW LOW IT HAS TO BE IS NOT OBVIOUS, and the reason is worth recording: a Raft entry
+#      is one batch's slice FOR ONE VSHARD, so a VShard only gets an entry from the batches
+#      that happen to touch it. Measured on this box, a 120x10k campaign over 200 hosts put
+#      just SEVEN entries in the busiest VShard -- the points are spread across 4096 groups.
+#      A threshold of 8 therefore compacted NOTHING while looking like a broken trigger; the
+#      gate reports `snapshot_max_entries_since` precisely so that mistake is visible next
+#      time rather than mysterious.
+#
+#   2. `TIMESTAR_WAL_SIZE_THRESHOLD` lowers the memory-store ROLLOVER threshold, and this
+#      one is not optional either. A snapshot captures only FLUSHED (TSM) data, so with no
+#      TSM file there is no snapshot to take: the boundary would be revision 0 and
+#      `snapshotVShard` returns 0 forever. At the 64 MB default a 400x10k campaign spread
+#      over 4 shards writes ~24 MB per shard and NEVER ROLLS -- the first run of this gate
+#      produced `snapshots_taken=0` with zero TSM files on disk, and the trigger looked
+#      broken when it was correctly declining to compact unflushed data. 4 MB rolls several
+#      times during the campaign.
+#
+# That first failure is worth keeping in the record: "the producer is wired" and "the
+# producer can run in this gate's shape" are different claims, and only the second one is
+# testable here.
+#
+# WHY IT CANNOT PASS BY ORDINARY APPEND CATCH-UP, which is the assertion that makes this a
+# real gate rather than a re-run of the first half: `/cluster/status` reports
+# `snapshots_taken` (the producer ran), `snapshot_chunks_sent` (chunks left a leader) and
+# `snapshots_installed` (a follower installed one). A catch-up that went through appends
+# leaves all three at zero, and the gate FAILS on that. Nothing else distinguishes the two
+# paths from the outside -- both end with the follower caught up and able to answer.
 #
 # IT ALSO FOUND A REAL DEFECT, in the consensus layer rather than the transport: a leader
 # transfer aimed at a DOWN peer was never abandoned, so the group refused every write
@@ -54,9 +103,19 @@ kill_cluster 494
 require_ports_free $PORTS
 for i in 1 2 3; do rm -rf "/tmp/tsgate_cu$i"; mkdir -p "/tmp/tsgate_cu$i"; done
 PEERS="127.0.0.1:49410,127.0.0.1:49411,127.0.0.1:49412"
+# SNAPSHOT_ENTRIES is what forces the producer to run inside a gate-sized campaign (see
+# the header). 32 entries per VShard is reached within the first few dozen batches, and the
+# 5 s min-interval keeps the sweep from re-snapshotting the same group on every pass while
+# still letting all ~1365 groups per shard get a turn.
+SNAP_ENTRIES="${GATE_SNAPSHOT_ENTRIES:-4}"
+# ... and the memory store must actually ROLL, or there is no flushed data to snapshot at
+# all (see the header: this is what made the first run of this gate report taken=0).
+WAL_THRESHOLD="${GATE_WAL_THRESHOLD:-2097152}"
 start_node() {
     env TIMESTAR_DATA_DIR="/tmp/tsgate_cu$1" TIMESTAR_CLUSTER_ENABLED=true TIMESTAR_CLUSTER_PARTITIONED=true \
         TIMESTAR_CLUSTER_REPLICATION_FACTOR=3 TIMESTAR_CLUSTER_NODE_ID=$1 TIMESTAR_CLUSTER_PEERS="$PEERS" \
+        TIMESTAR_CLUSTER_SNAPSHOT_ENTRIES="$SNAP_ENTRIES" TIMESTAR_CLUSTER_SNAPSHOT_MIN_INTERVAL_S=2 \
+        TIMESTAR_WAL_SIZE_THRESHOLD="$WAL_THRESHOLD" \
         "$BIN" --port $((49409 + $1)) --smp 4 >>"/tmp/tsgate_cu$1/s.log" 2>&1 &
 }
 trap 'kill_cluster 494' EXIT
@@ -116,6 +175,39 @@ curl -s -m10 -X POST "http://127.0.0.1:49410/write" -H 'Content-Type: applicatio
     >/dev/null
 sleep 2
 
+# THE PRODUCER MUST HAVE RUN while node 3 was down -- otherwise the survivors still hold
+# every entry node 3 needs and the catch-up below would go through ordinary appends,
+# leaving the snapshot path untested. Give the 5 s sweep a few passes to land.
+echo "=== check the snapshot producer compacted the survivors' logs ==="
+SNAP_TAKEN=0
+for _ in $(seq 1 30); do
+    SNAP_TAKEN=$(( $(status_field "$(cluster_status 49410)" snapshots_taken) \
+                 + $(status_field "$(cluster_status 49411)" snapshots_taken) ))
+    [ "${SNAP_TAKEN:-0}" -gt 0 ] && break
+    sleep 2
+done
+for p in 49410 49411; do
+    S=$(cluster_status "$p")
+    echo "  node $p: snapshot_trigger=$(printf '%s' "$S" | grep -o '"snapshot_trigger":[a-z]*' | cut -d: -f2)" \
+         "sweeps=$(status_field "$S" snapshot_sweeps)" \
+         "max_entries_since=$(status_field "$S" snapshot_max_entries_since)" \
+         "taken=$(status_field "$S" snapshots_taken)" \
+         "skipped_unflushed=$(status_field "$S" snapshots_skipped_unflushed)" \
+         "refused_too_large=$(status_field "$S" snapshots_refused_too_large)"
+done
+# TSM file count, reported because it is the FIRST thing to look at when taken=0: a snapshot
+# captures only flushed data, so zero TSM files means the trigger is correctly declining
+# rather than broken (see the header).
+echo "  TSM files: node1=$(ls /tmp/tsgate_cu1/shard_*/tsm/ 2>/dev/null | grep -c tsm)" \
+     "node2=$(ls /tmp/tsgate_cu2/shard_*/tsm/ 2>/dev/null | grep -c tsm)"
+# ANTI-VACUITY for the whole snapshot half: with no snapshot taken, nothing below can
+# discriminate chunked InstallSnapshot from append catch-up.
+assert_ge "snapshots taken while node 3 was down" "${SNAP_TAKEN:-0}" 1
+# A snapshot too large to ship means the log was KEPT, so the follower would again catch up
+# by appends -- and it is the condition D-5's chunking + the raised D-6 threshold exist to
+# remove.
+assert_eq "snapshots refused as too large" "$(cat /tmp/tsgate_cu*/s.log | grep -c 'NOT compacting VShard')" 0
+
 echo "=== restart node 3 and wait for it to catch up ==="
 LED_BEFORE=$(( $(status_field "$(cluster_status 49410)" vshards_led) + $(status_field "$(cluster_status 49411)" vshards_led) ))
 echo "  nodes 1-2 lead $LED_BEFORE VShards between them"
@@ -150,8 +242,39 @@ else
     gate_fail "the restarted node cannot answer for the probe point: $READ"
 fi
 
+# ============================================================================
+# PROOF THAT THE SNAPSHOT PATH WAS ACTUALLY USED (D-5's discriminating assertion)
+# ============================================================================
+#
+# Without these three, a green gate says only "node 3 caught up", which ordinary bounded
+# AppendEntries catch-up satisfies just as well -- and would keep satisfying after a
+# chunked-InstallSnapshot regression. There is no other externally visible difference
+# between the two paths.
+CHUNKS_SENT=$(( $(status_field "$(cluster_status 49410)" snapshot_chunks_sent) \
+              + $(status_field "$(cluster_status 49411)" snapshot_chunks_sent) ))
+INSTALLED=$(status_field "$(cluster_status 49412)" snapshots_installed)
+UNDELIVERABLE=$(( $(status_field "$(cluster_status 49410)" snapshots_undeliverable) \
+                + $(status_field "$(cluster_status 49411)" snapshots_undeliverable) ))
+RESTARTED=$(( $(status_field "$(cluster_status 49410)" snapshot_transfers_restarted) \
+            + $(status_field "$(cluster_status 49411)" snapshot_transfers_restarted) ))
+ABANDONED=$(( $(status_field "$(cluster_status 49410)" snapshot_transfers_abandoned) \
+            + $(status_field "$(cluster_status 49411)" snapshot_transfers_abandoned) ))
+echo "  snapshot transfer: chunks_sent=$CHUNKS_SENT installed_on_node3=${INSTALLED:-0}" \
+     "undeliverable=$UNDELIVERABLE restarted=$RESTARTED abandoned=$ABANDONED"
+assert_ge "InstallSnapshot chunks sent by the survivors" "${CHUNKS_SENT:-0}" 1
+assert_ge "snapshots INSTALLED on the restarted node" "${INSTALLED:-0}" 1
+# A snapshot this node declined to send leaves the peer permanently uncaught-up: it is the
+# F3a refusal, and after D-5 it should be unreachable at this scale.
+assert_eq "snapshots this node could not deliver" "${UNDELIVERABLE:-0}" 0
+# Chunks are paced one-in-flight per peer and recovered by a stall timer. A few restarts on
+# a loaded box are honest; ABANDONING a transfer means a peer could not be caught up by
+# snapshot at all, which is a fail.
+assert_eq "snapshot transfers abandoned" "${ABANDONED:-0}" 0
+
 # The send-side mirror of the admission bound must never have fired: an append above it
-# would be a message the peer's bound would have dropped silently.
+# would be a message the peer's bound would have dropped silently. This is also the check
+# that the TIGHTENED bound (D-5: 96 -> 32 MiB send, 128 -> 64 MiB admission) is not being
+# crossed by a real producer.
 assert_eq "oversized Raft messages refused" "$(cat /tmp/tsgate_cu*/s.log | grep -c 'refusing to send')" 0
 assert_eq "journal quota fences" "$(cat /tmp/tsgate_cu*/s.log | grep -c 'Disk quota exceeded')" 0
 assert_eq "server-side 500s" "$(cat /tmp/tsgate_cu*/s.log | grep -c 'Error handling write request')" 0

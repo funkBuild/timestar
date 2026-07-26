@@ -116,6 +116,12 @@ public:
         // ways a VShard ends up with a permanently growing log.
         uint64_t snapshotsTaken = 0;
         uint64_t snapshotsRefusedTooLarge = 0;
+        // Sweeps that picked a group and found it had no FLUSHED data to snapshot. Steady
+        // non-zero with snapshotsTaken == 0 means the trigger is correctly declining rather
+        // than broken -- the FIRST thing to check when logs are not being compacted.
+        uint64_t snapshotsSkippedUnflushed = 0;
+        uint64_t snapshotSweeps = 0;
+        uint64_t snapshotMaxEntriesSince = 0;
         uint64_t snapshotChunksSent = 0;
         uint64_t snapshotsInstalled = 0;
         uint64_t snapshotsUndeliverable = 0;

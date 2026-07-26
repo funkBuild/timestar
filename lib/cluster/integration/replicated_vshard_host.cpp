@@ -5,6 +5,7 @@
 #include "../../utils/logger.hpp"  // timestar::http_log
 #include "../raft/raft_node.hpp"
 
+#include <algorithm>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/reactor.hh>
 #include <stdexcept>
@@ -233,6 +234,7 @@ seastar::future<size_t> ReplicatedVShardHost::maybeSnapshotOnce() {
     size_t taken = 0;
     if (stopped_ || vshards_.empty())
         co_return 0;
+    ++snapshotSweeps_;
     const auto now = seastar::lowres_clock::now();
 
     // Collect candidates first, THEN snapshot: `snapshotVShard` suspends, and mutating
@@ -263,6 +265,7 @@ seastar::future<size_t> ReplicatedVShardHost::maybeSnapshotOnce() {
             const raft::LogIndex boundary = g->node().log().snapshotIndex();
             const uint64_t applied = g->appliedIndex();
             const uint64_t entriesSince = applied > boundary ? applied - boundary : 0;
+            snapshotMaxEntriesSinceSeen_ = std::max(snapshotMaxEntriesSinceSeen_, entriesSince);
             // EITHER threshold suffices; a zero threshold disables that half.
             const bool byEntries = snapshotEntryThreshold_ != 0 && entriesSince >= snapshotEntryThreshold_;
             const bool byBytes =

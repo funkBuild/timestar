@@ -148,6 +148,9 @@ void set_routes(routes& r) {
                       body += ",\"snapshot_trigger\":" + std::string(st.snapshotTriggerEnabled ? "true" : "false") +
                               ",\"snapshots_taken\":" + std::to_string(st.snapshotsTaken) +
                               ",\"snapshots_refused_too_large\":" + std::to_string(st.snapshotsRefusedTooLarge) +
+                              ",\"snapshots_skipped_unflushed\":" + std::to_string(st.snapshotsSkippedUnflushed) +
+                              ",\"snapshot_sweeps\":" + std::to_string(st.snapshotSweeps) +
+                              ",\"snapshot_max_entries_since\":" + std::to_string(st.snapshotMaxEntriesSince) +
                               ",\"snapshot_chunks_sent\":" + std::to_string(st.snapshotChunksSent) +
                               ",\"snapshots_installed\":" + std::to_string(st.snapshotsInstalled) +
                               ",\"snapshots_undeliverable\":" + std::to_string(st.snapshotsUndeliverable) +
