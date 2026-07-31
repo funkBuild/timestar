@@ -221,6 +221,21 @@ public:
         // appends -- which also silently blocks leadership transfer to it, since
         // RaftNode::transferLeadership only sends TimeoutNow to a caught-up target.
         std::map<NodeId, size_t> peerCaughtUp;
+        // Committed-but-unapplied entries across every group this node hosts (debt
+        // D-36), and how many groups they are spread over. An acknowledged write is
+        // durable the moment it commits, but it is only READABLE once it is applied, so
+        // a non-zero applyLagEntries is exactly the set of promises this node is
+        // currently unable to keep. It is the number that tells a restart still catching
+        // up apart from data that is gone.
+        uint64_t applyLagEntries = 0;
+        size_t applyGroupsBehind = 0;
+        // Applies that threw, ticks that threw, and the groups those throwing ticks
+        // never reached. A stalled apply retries, so these are stall/serialization
+        // signals rather than loss ones -- but a group starved of ticks makes no
+        // progress at all, which is what turns a transient apply failure into a read
+        // that stays short.
+        uint64_t applyFailures = 0;
+        uint64_t tickErrors = 0;
         // Raft-log snapshot/compaction (debt D-5/D-6). `snapshotsTaken` rising is how an
         // operator sees that log compaction is actually running; `snapshotChunksSent` /
         // `snapshotsInstalled` are what distinguish a catch-up that went through the

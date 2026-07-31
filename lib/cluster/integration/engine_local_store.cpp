@@ -216,6 +216,21 @@ seastar::future<data::NodeQueryPartial> EngineLocalStore::queryLocal(data::NodeQ
     // with peers' partials and finalizes ONCE, so cross-node group-by / spread are
     // correct. A local early-exit (incomplete/timeout/limit) becomes an
     // incompleteReason, fail-closed -- never a silent empty success.
+    // FENCE ON THIS NODE'S OWN APPLY LAG FIRST (debt D-36). The Engine answers from
+    // APPLIED state; a replicated node's committed log can be ahead of it, and every
+    // entry in that gap is an acknowledged write this query would silently omit. Failing
+    // closed here is the same rule the single-node path already applies to an unreadable
+    // series -- an empty result must mean "this range genuinely holds no data".
+    if (applyFence_) {
+        const bool caughtUp = co_await applyFence_();
+        if (!caughtUp) {
+            data::NodeQueryPartial behind;
+            behind.incompleteReasons.push_back(
+                "node has committed but unapplied writes (still catching up); its answer would omit acknowledged "
+                "points");
+            co_return behind;
+        }
+    }
     http::HttpQueryHandler handler(&engines_);
     // RF=3: req.vshards names the VShards this node must answer for (the ones it
     // leads); restrict discovery to them so a replicated series is not double-counted

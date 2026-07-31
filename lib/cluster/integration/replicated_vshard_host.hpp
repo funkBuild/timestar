@@ -150,6 +150,27 @@ public:
     seastar::future<raft::LogIndex> leaderReadIndex(uint16_t vshard) override;
     seastar::future<raft::LogIndex> leaderCommitIndex(uint16_t vshard) override;
     raft::RaftGroupRegistry& registry() { return registry_; }
+
+    // WAIT UNTIL THIS SHARD'S GROUPS HAVE APPLIED WHAT THEY HAD ALREADY COMMITTED
+    // (debt D-36). Returns true if they caught up within `budget`, false on timeout.
+    //
+    // THE READ FENCE. An acknowledged write is durable at COMMIT and readable only at
+    // APPLY, and the node-local query reads the Engine -- i.e. applied state -- with no
+    // regard for the log above it. After a whole-cluster restart every replica sits with
+    // a recovered, committed, unapplied suffix, and a query issued in that window
+    // answered HTTP 200 while silently omitting acknowledged points. That is exactly the
+    // "incomplete results are failures, never short answers" rule, applied to a
+    // completeness condition the single-node code cannot have.
+    //
+    // THE BAR IS SAMPLED AT ENTRY, deliberately: a query must see every write
+    // acknowledged BEFORE it started, and owes nothing to writes still in flight
+    // alongside it. Sampling the commit index once and waiting for THAT is a bounded
+    // wait; waiting for "no lag at all" on a node under continuous ingest is not a
+    // bound, it is a livelock.
+    //
+    // FREE WHEN CAUGHT UP, which is the common case: the sample is an integer compare
+    // per hosted group and the fast path allocates nothing and never suspends.
+    seastar::future<bool> awaitApplyCatchUp(std::chrono::milliseconds budget);
     // How many proposals this node refused WHILE BEING THE LEADER of the VShard (a
     // leadership transfer in flight). Non-zero means writes are failing for a reason no
     // amount of re-routing can fix -- see classifyRefusal (write-scaleout 5 review, F1).

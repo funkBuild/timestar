@@ -9,7 +9,9 @@
 #include <cstdlib>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/reactor.hh>
+#include <seastar/core/sleep.hh>
 #include <stdexcept>
+#include <utility>
 
 namespace timestar::cluster {
 
@@ -742,6 +744,46 @@ seastar::future<data::ProposeOutcome> ReplicatedVShardHost::proposeVShardBatches
 
 raft::RaftGroup* ReplicatedVShardHost::group(uint16_t vshard) {
     return registry_.group(vshard);
+}
+
+seastar::future<bool> ReplicatedVShardHost::awaitApplyCatchUp(std::chrono::milliseconds budget) {
+    // Sample the bar ONCE, before any suspension: (group, the index it had already
+    // committed). See the header for why the bar is the entry-time commit index and not
+    // "zero lag" -- the latter is unreachable on a node taking writes.
+    std::vector<std::pair<uint16_t, raft::LogIndex>> pending;
+    for (auto& [vs, state] : vshards_) {
+        raft::RaftGroup* g = registry_.group(vs);
+        if (g && g->applyLag() > 0)
+            pending.emplace_back(vs, g->commitIndex());
+    }
+    if (pending.empty())
+        co_return true;  // caught up: the fast path, and it never suspends
+
+    // POLL rather than register a waiter per group. `waitApplied` would be the obvious
+    // tool, but it takes the group's lock to register -- and a shard hosting ~1365
+    // groups would take ~1365 locks on a path that is almost always a no-op, on a
+    // reactor whose Ready drains want those same locks. Polling costs one integer
+    // compare per still-pending group per pass and, unlike a registered waiter, needs
+    // nothing unwound when the budget runs out.
+    const auto deadline = seastar::lowres_clock::now() + budget;
+    while (seastar::lowres_clock::now() < deadline) {
+        co_await seastar::sleep(std::chrono::milliseconds(2));
+        std::erase_if(pending, [this](const auto& p) {
+            raft::RaftGroup* g = registry_.group(p.first);
+            // A group that stopped being hosted (movement) cannot hold this read back:
+            // it is no longer part of this node's answer.
+            return !g || g->appliedIndex() >= p.second;
+        });
+        if (pending.empty())
+            co_return true;
+    }
+    // FAIL CLOSED. The caller turns this into a QUERY_INCOMPLETE, which is the honest
+    // answer: this node holds acknowledged data it cannot yet read out.
+    timestar::http_log.warn(
+        "cluster: shard {} still has {} group(s) with committed-but-unapplied entries after {} ms; failing the read "
+        "closed rather than answering out of state that is behind its own log (debt D-36)",
+        seastar::this_shard_id(), pending.size(), budget.count());
+    co_return false;
 }
 
 NodeId ReplicatedVShardHost::leaderOf(uint16_t vshard) const {

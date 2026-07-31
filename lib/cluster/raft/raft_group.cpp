@@ -132,8 +132,31 @@ seastar::future<> RaftGroup::drainReady() {
         }
         const uint64_t tA0 = profileEnabled() ? nowNs() : 0;
         for (auto& e : rd.committed) {
-            if (e.type == EntryType::Normal && !e.data.empty())
-                co_await sm_.apply(e);
+            if (e.type == EntryType::Normal && !e.data.empty()) {
+                // COUNT THE THROW, then let it out unchanged (debt D-36). Apply is
+                // fail-stop by contract -- the entry must not be marked applied and
+                // `node_.advance(rd)` below must not run -- but a stall that nothing
+                // counts is indistinguishable from data loss from outside the process,
+                // which is exactly the ambiguity D-36 was filed on.
+                try {
+                    co_await sm_.apply(e);
+                } catch (const std::exception& ex) {
+                    // RATE-LIMITED, and it has to be: the failure that motivated this
+                    // counter fired 20,851 times in one restart. First occurrence, then
+                    // every 1024th, so the REASON is always in the log and the log is
+                    // never the reason the node is slow.
+                    if (applyFailures_ % 1024 == 0)
+                        timestar::http_log.warn(
+                            "raft: group {} could not apply committed entry {} ({}); the entry is DURABLE and will be "
+                            "retried, but every point in it is unreadable until it applies (debt D-36, occurrence {})",
+                            groupId_, e.index, ex.what(), applyFailures_ + 1);
+                    ++applyFailures_;
+                    throw;
+                } catch (...) {
+                    ++applyFailures_;
+                    throw;
+                }
+            }
             appliedIndex_ = std::max<uint64_t>(appliedIndex_, e.index);
         }
         if (profileEnabled())

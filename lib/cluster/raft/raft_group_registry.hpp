@@ -54,6 +54,10 @@ public:
     void setHibernation(unsigned followerSkip) { followerSkip_ = followerSkip; }
     uint64_t skippedTicks() const { return skippedTicks_; }
 
+    // Ticks that threw (debt D-36). A group's tick drives its whole Ready drain --
+    // persist, send, APPLY -- so an apply that throws surfaces here.
+    uint64_t tickErrors() const { return tickErrors_; }
+
     // Un-hibernate every group that still believes `leader` leads it, so it ticks at
     // full rate. Returns how many woke.
     //
@@ -74,6 +78,12 @@ public:
     // group.
     size_t wakeFollowersOf(NodeId leader);
 
+    // TEST SEAM: run ONE tick pass synchronously. Not a knob -- `startTicking()` is the
+    // production driver, and this exists so a test of the pass's own behaviour (its
+    // failure isolation, debt D-36) never has to depend on a timer firing or on wall
+    // time. The pass it runs is the production pass, byte for byte.
+    seastar::future<> tickAllForTest() { return tickAll(); }
+
 private:
     seastar::future<> tickAll();
 
@@ -88,6 +98,7 @@ private:
     seastar::gate gate_;
     unsigned followerSkip_ = 9;  // idle followers tick every 10th pass by default
     uint64_t skippedTicks_ = 0;  // metric: total idle-follower ticks skipped
+    uint64_t tickErrors_ = 0;    // metric: ticks that threw (debt D-36)
     bool ticking_ = false;       // guards against overlapping tick passes
     bool stopping_ = false;
 };

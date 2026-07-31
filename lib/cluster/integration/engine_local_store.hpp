@@ -7,8 +7,10 @@
 #include "../data/write_record.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <seastar/core/future.hh>
 #include <seastar/core/sharded.hh>
+#include <utility>
 
 namespace timestar::cluster {
 
@@ -101,11 +103,26 @@ public:
     // coordinator unions items and sums cardinality across owners.
     seastar::future<data::MetadataResult> queryMetadata(data::MetadataRequest req) override;
 
+    // THE READ FENCE (debt D-36). Returns false if this node still holds
+    // committed-but-unapplied entries after its budget, in which case `queryLocal`
+    // fails closed with an incompleteReason instead of answering out of state that is
+    // behind its own log.
+    //
+    // Injected rather than reached for: EngineLocalStore is deliberately Raft-unaware
+    // (it is the adapter that keeps the Engine cluster-unaware), and the groups live in
+    // a per-shard ReplicatedVShardHost the node-level store has no handle on. Unset in
+    // single-node and RF=1 modes, where there is no log above the Engine and therefore
+    // nothing to fence -- and the fast path of the replicated implementation is an
+    // integer compare per hosted group, so wiring it costs a caught-up node nothing.
+    using ApplyFenceFn = std::function<seastar::future<bool>()>;
+    void setApplyFence(ApplyFenceFn fn) { applyFence_ = std::move(fn); }
+
     // Routing helper (public for tests): the core that owns `id`.
     unsigned coreFor(const SeriesId128& id) const;
 
 private:
     seastar::sharded<Engine>& engines_;
+    ApplyFenceFn applyFence_;
 };
 
 }  // namespace timestar::cluster

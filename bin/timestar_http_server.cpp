@@ -141,6 +141,15 @@ void set_routes(routes& r) {
                           caught += "\"" + std::to_string(peer) + "\":" + std::to_string(n);
                       }
                       body += ",\"peer_caught_up\":{" + caught + "}";
+                      // THE ACK-CONTRACT GAP (debt D-36). An acknowledged write is
+                      // durable at commit and readable only at apply, so
+                      // apply_lag_entries > 0 names promises this node cannot currently
+                      // keep -- and distinguishes a restart still replaying from data
+                      // that is actually gone, which nothing else here could.
+                      body += ",\"apply_lag_entries\":" + std::to_string(st.applyLagEntries) +
+                              ",\"apply_groups_behind\":" + std::to_string(st.applyGroupsBehind) +
+                              ",\"apply_failures\":" + std::to_string(st.applyFailures) +
+                              ",\"tick_errors\":" + std::to_string(st.tickErrors);
                       // Raft-log snapshot/compaction (debt D-5/D-6). `snapshots_taken`
                       // rising is how an operator sees compaction running at all; the chunk
                       // and install counters are the ONLY way to tell a snapshot-based

@@ -118,7 +118,28 @@ seastar::future<> RaftGroupRegistry::tickAll() {
         unsigned& skipped = skips_[gid];
         const unsigned passes = 1 + skipped;
         skipped = 0;
-        co_await g->tick(passes);
+        // ONE GROUP'S FAILURE MUST NOT COST EVERY OTHER GROUP ITS TICK (debt D-36).
+        //
+        // A tick drives the group's whole Ready drain -- persist, send, APPLY -- and
+        // apply is allowed to throw (`EngineDataStateMachine::apply` routes through
+        // `Engine::insertBatch`, which refuses while the shard's ingest is backlogged).
+        // That throw used to propagate straight out of this loop, and `groups_` is an
+        // ORDERED map, so the same low id aborted the pass at the same place every time
+        // and every higher id was never ticked at all -- no election timer, no
+        // heartbeat, no drain. Measured across one RF=3 restart: 23 aborted passes cost
+        // 16,511 group-ticks, while acknowledged points sat committed and unapplied.
+        //
+        // The failure itself is NOT swallowed in the sense that matters: the group's
+        // own Ready is not advanced (RaftGroup::drainReady propagates before
+        // `node_.advance`), so the entry is retried on this group's next tick and
+        // re-apply is idempotent. What is dropped is only the propagation OUT of the
+        // pass, which nothing above could act on anyway -- the timer callback discards
+        // the future. Counted, and the reason is logged at the apply site.
+        try {
+            co_await g->tick(passes);
+        } catch (...) {
+            ++tickErrors_;
+        }
     }
 }
 

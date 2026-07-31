@@ -146,7 +146,56 @@ public:
         // to exactly one shard, so shards never contend for the same journal.
         plane_ = std::make_unique<ReplicatedDataPlane>(*store_, *transport_, *rpc_, *dir, self,
                                                        std::filesystem::path(journalRoot), tick);
+        // FENCE THE PEER-FACING READ TOO (debt D-36). This store is what a peer's query
+        // is answered from, and a coordinator merges that answer as authoritative -- so
+        // an unfenced peer leg reintroduces exactly the silent short answer the local leg
+        // is fenced against, just one hop away. The bar is the whole NODE's apply lag,
+        // not this shard's: the answer spans every shard's engines.
+        store_->setApplyFence([this]() { return awaitNodeApplyCatchUp(applyFenceBudget()); });
         return seastar::make_ready_future<>();
+    }
+
+    // THE READ FENCE'S BUDGET (debt D-36): how long a read waits for this node to apply
+    // what it had already committed before failing closed. 0 disables the fence.
+    //
+    // Generous by design. It is only ever spent when the node is genuinely behind its own
+    // committed log -- a restart replaying a large campaign is the case it exists for --
+    // and the alternative to waiting is not a faster answer, it is a WRONG one. A
+    // caught-up node never reaches the wait at all.
+    static std::chrono::milliseconds applyFenceBudget() {
+        static const std::chrono::milliseconds budget = [] {
+            const char* e = std::getenv("TIMESTAR_CLUSTER_READ_APPLY_FENCE_MS");
+            if (!e || !*e)
+                return std::chrono::milliseconds(5000);
+            char* end = nullptr;
+            const long v = std::strtol(e, &end, 10);
+            if (end == e || *end != '\0' || v < 0) {
+                timestar::http_log.error(
+                    "TIMESTAR_CLUSTER_READ_APPLY_FENCE_MS='{}' is not a non-negative millisecond count; using the "
+                    "5000 ms default",
+                    e);
+                return std::chrono::milliseconds(5000);
+            }
+            return std::chrono::milliseconds(v);
+        }();
+        return budget;
+    }
+
+    // This shard's groups only (the unit ClusterDataPlane's node-wide fence reduces over).
+    seastar::future<bool> awaitApplyCatchUp(std::chrono::milliseconds budget) {
+        if (!plane_ || budget.count() == 0)
+            return seastar::make_ready_future<bool>(true);
+        return plane_->host().awaitApplyCatchUp(budget);
+    }
+
+    // Every shard on this node. `peers_` is the sharded<> container this instance lives
+    // in, so this is the same reduction ClusterDataPlane performs, reachable from a shard
+    // that has no handle on the data plane.
+    seastar::future<bool> awaitNodeApplyCatchUp(std::chrono::milliseconds budget) {
+        if (!peers_ || budget.count() == 0)
+            return seastar::make_ready_future<bool>(true);
+        return peers_->map_reduce0([budget](ShardRaftPlane& p) { return p.awaitApplyCatchUp(budget); }, true,
+                                   std::logical_and<bool>{});
     }
 
     // Listen for peer data-plane traffic on the node's data-plane port from THIS shard.
@@ -389,6 +438,15 @@ public:
         size_t led = 0;
         size_t leaderless = 0;
         std::map<data::NodeId, size_t> peerCaughtUp;
+        // THE ACK-CONTRACT GAP (debt D-36): committed entries this node has not yet
+        // applied, and therefore cannot answer a query out of. A restart that replays a
+        // large log is behind here for as long as the replay takes, and until this
+        // existed the only way to observe that was to notice acknowledged points
+        // missing from a query -- which is indistinguishable from having lost them.
+        uint64_t applyLagEntries = 0;
+        size_t groupsBehind = 0;     // hosted groups with commitIndex > appliedIndex
+        uint64_t applyFailures = 0;  // committed applies that threw
+        uint64_t tickErrors = 0;     // ticks that threw (a superset of the above)
     };
 
     Counts counts(data::NodeId self, const std::vector<data::NodeId>& peers) const {
@@ -397,6 +455,7 @@ public:
             return c;
         auto& host = const_cast<ReplicatedDataPlane*>(plane_.get())->host();
         c.hosted = host.vshardCount();
+        c.tickErrors = host.registry().tickErrors();
         for (uint16_t vs = 0; vs < timestar::VIRTUAL_SHARD_COUNT; ++vs) {
             if (shardOwningVShard(vs, dir_) != seastar::this_shard_id())
                 continue;  // not ours
@@ -406,6 +465,19 @@ public:
             // the gates had to refuse to look at it.
             if (!host.hosts(vs))
                 continue;
+            // THE APPLY LAG IS ROLE-INDEPENDENT (debt D-36) and is therefore counted
+            // before the leader filters below: a FOLLOWER that has committed an entry
+            // and not applied it is just as unreadable as a leader that has, and after a
+            // whole-cluster restart every replica is in that state at once -- which is
+            // precisely the window the missing acked points fall into.
+            if (raft::RaftGroup* hg = host.group(vs)) {
+                const auto lag = hg->applyLag();
+                if (lag > 0) {
+                    c.applyLagEntries += lag;
+                    ++c.groupsBehind;
+                }
+                c.applyFailures += hg->applyFailures();
+            }
             const data::NodeId leader = host.leaderOf(vs);
             if (leader == timestar::raft::kNoNode) {
                 ++c.leaderless;

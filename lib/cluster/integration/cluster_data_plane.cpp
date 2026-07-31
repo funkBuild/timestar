@@ -211,6 +211,17 @@ seastar::future<> ClusterDataPlane::start(const ClusterConfig& cfg, seastar::sha
             });
         }
 
+        // FENCE NODE-LOCAL READS ON NODE-LOCAL APPLY LAG (debt D-36). Wired only in the
+        // replicated branch, because only here is there a committed log sitting above the
+        // Engine: at RF=1 the Engine IS the state and there is nothing a query could be
+        // behind. One hop per shard, and every shard's fast path is an integer compare
+        // per hosted group, so a caught-up node pays essentially nothing.
+        local_->setApplyFence([this]() {
+            const auto budget = ShardRaftPlane::applyFenceBudget();
+            return shards_.map_reduce0([budget](ShardRaftPlane& p) { return p.awaitApplyCatchUp(budget); }, true,
+                                       std::logical_and<bool>{});
+        });
+
         // Serve the DATA plane on this node's data-plane address FROM EVERY SHARD
         // (connection_distribution, not SO_REUSEPORT -- this seastar disables reuseport,
         // so shard 0 owns the one socket and hands each accepted fd to the shard the
@@ -871,6 +882,10 @@ seastar::future<ClusterDataPlane::Status> ClusterDataPlane::status() const {
         st.vshardsLeaderless += c.leaderless;
         for (const auto& [peer, n] : c.peerCaughtUp)
             st.peerCaughtUp[peer] += n;
+        st.applyLagEntries += c.applyLagEntries;
+        st.applyGroupsBehind += c.groupsBehind;
+        st.applyFailures += c.applyFailures;
+        st.tickErrors += c.tickErrors;
         auto sc = co_await shards.invoke_on(sh, [](ShardRaftPlane& p) { return p.snapshotCounts(); });
         st.snapshotsTaken += sc.taken;
         st.snapshotsRefusedTooLarge += sc.refusedTooLarge;

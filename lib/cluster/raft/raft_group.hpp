@@ -124,6 +124,25 @@ public:
     NodeId leader() const { return node_.leader(); }
     bool transferInFlight() const { return node_.transferInFlight(); }
     LogIndex commitIndex() const { return node_.commitIndex(); }
+    // How many committed entries this group has NOT yet handed to its state machine
+    // (debt D-36). Zero on a caught-up group. This is the ONE number that separates
+    // "the write was lost" from "the write is on disk and not applied yet" after a
+    // restart, and before it existed both looked identical from a query: an entry in
+    // the recovered log that apply() has not reached is durable, invisible, and
+    // reported by nothing.
+    //
+    // Not a gauge of the log's size -- commitIndex only rises once a leader has
+    // replicated to a quorum, so this counts entries that are COMMITTED (promised) and
+    // unapplied (unreadable), which is exactly the ack-contract gap.
+    LogIndex applyLag() const {
+        const LogIndex c = node_.commitIndex();
+        return c > appliedIndex_ ? c - appliedIndex_ : 0;
+    }
+    // Times a committed entry's apply() threw and aborted the Ready drain (debt D-36).
+    // The drain is retried on the next tick and re-apply is idempotent, so this is a
+    // STALL counter, not a loss counter -- but a group whose apply keeps throwing never
+    // becomes readable, and nothing else in the process says so.
+    uint64_t applyFailures() const { return applyFailures_; }
     // Highest index this leader knows replicated on `peer` (M5 move catchUp signal).
     LogIndex matchIndexOf(NodeId peer) const { return node_.matchIndexOf(peer); }
     // Ticks since `peer` last replied to us in this term (RaftNode::kNeverAcked if
@@ -159,7 +178,8 @@ private:
     seastar::semaphore lock_{1};
 
     // Read-barrier tracking.
-    uint64_t appliedIndex_ = 0;  // highest entry index applied to the SM
+    uint64_t appliedIndex_ = 0;   // highest entry index applied to the SM
+    uint64_t applyFailures_ = 0;  // committed entries whose apply() threw (debt D-36)
     uint64_t nextReadCtx_ = 1;
     std::map<uint64_t, LogIndex> confirmedReads_;                 // ctx -> ReadIndex (awaiting apply)
     std::map<uint64_t, seastar::promise<LogIndex>> readWaiters_;  // ctx -> caller promise
