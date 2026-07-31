@@ -23,11 +23,24 @@
 // THE WINDOW IS ONE HEARTBEAT ROUND, not three, and that is a measured number: at three
 // rounds `fault_injection_gate.sh` lost 1 of 2000 writes where the pre-change tree took a
 // heavier storm with zero, because the balancer could still target a peer whose
-// connection had just been RST. See ShardRaftPlane::rebalance for the mechanism.
+// connection had just been RST. See data::transferrableTo for the mechanism.
+//
+// THIS FILE CALLS THE REAL PREDICATE (debt D-23). It used to re-implement it -- the
+// 64-entry bound and the heartbeat comparison, spelled out again in a local helper -- so
+// the balancer could be changed, or the bound retuned, with every test here still green:
+// the copy would have kept pinning the OLD rule and nothing pinned the new one. The
+// predicate is now a pure scalar function in lib/cluster/data/leadership_balance.hpp
+// taking exactly what it reads (lastIndex, matchIndex, ticksSinceAck, heartbeatTimeout);
+// `ShardRaftPlane::transferrableTo` is a RaftGroup adapter over it and nothing else, which
+// the last test in this file asserts -- one implementation is what makes calling it here
+// equivalent to calling it in the balancer.
+#include "../../../lib/cluster/data/leadership_balance.hpp"
 #include "../../../lib/cluster/raft/raft_node.hpp"
 
 #include <gtest/gtest.h>
 
+#include <fstream>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -65,15 +78,13 @@ void ackFully(RaftNode& leader, NodeId peer) {
     leader.step(Message{.to = 1, .from = peer, .payload = r});
 }
 
-// The balancer's gate, spelled out here exactly as ShardRaftPlane::rebalance spells it,
-// so this file fails if either half is dropped.
+// THE BALANCER'S OWN GATE -- read off this leader and handed to the real predicate. This
+// is an argument adapter, not a re-implementation: every rule (the bound's value, which
+// direction each comparison runs, whether the halves are AND or OR) lives on the other
+// side of this call.
 bool isTransferTarget(const RaftNode& leader, NodeId peer) {
-    constexpr LogIndex kMaxTransferLagEntries = 64;
-    const LogIndex last = leader.log().lastIndex();
-    const LogIndex match = leader.matchIndexOf(peer);
-    const bool caughtUp = match >= last || (last - match) <= kMaxTransferLagEntries;
-    const bool live = leader.ticksSinceAck(peer) <= leader.heartbeatTimeout();
-    return caughtUp && live;
+    return timestar::data::transferrableTo(leader.log().lastIndex(), leader.matchIndexOf(peer),
+                                           leader.ticksSinceAck(peer), leader.heartbeatTimeout());
 }
 
 }  // namespace
@@ -164,6 +175,67 @@ TEST(RaftPeerLivenessTest, APeerFarBehindIsExcludedByTheLagBound) {
 
     EXPECT_EQ(leader.ticksSinceAck(2), 0u) << "still live";
     EXPECT_FALSE(isTransferTarget(leader, 2)) << "200 entries behind is past the 64-entry bound";
+}
+
+TEST(RaftPeerLivenessTest, TheLagBoundIsExactlyKMaxTransferLagEntries) {
+    // The bound's VALUE, exercised through the real predicate rather than through a copy
+    // of it (debt D-23). A test that spells the number itself cannot fail when the number
+    // changes, which is the whole reason the copy was a problem: retuning the bound is a
+    // deliberate act and it must show up here.
+    RaftNode leader = makeLeader({1, 2, 3});
+    ackFully(leader, 2);
+    for (LogIndex i = 0; i < timestar::data::kMaxTransferLagEntries; ++i)
+        ASSERT_TRUE(leader.propose("e" + std::to_string(i)));
+    ASSERT_EQ(leader.log().lastIndex() - leader.matchIndexOf(2), timestar::data::kMaxTransferLagEntries);
+    EXPECT_TRUE(isTransferTarget(leader, 2)) << "exactly at the bound is still a prompt handoff";
+
+    ASSERT_TRUE(leader.propose("one-too-many"));
+    EXPECT_FALSE(isTransferTarget(leader, 2)) << "one entry past the bound is not";
+}
+
+TEST(RaftPeerLivenessTest, TheLivenessWindowIsExactlyOneHeartbeatRound) {
+    // Likewise for the other half: the window is `heartbeatTimeout` ticks INCLUSIVE, and
+    // one tick more is dead. Widening it to three rounds is what the fault gate rejected.
+    RaftNode leader = makeLeader({1, 2, 3});
+    ackFully(leader, 2);
+    for (unsigned t = 0; t < leader.heartbeatTimeout(); ++t)
+        leader.tick();
+    ASSERT_EQ(leader.ticksSinceAck(2), leader.heartbeatTimeout());
+    EXPECT_TRUE(isTransferTarget(leader, 2)) << "a peer that answered the last round is live";
+
+    leader.tick();
+    EXPECT_FALSE(isTransferTarget(leader, 2)) << "one tick past the round is not";
+}
+
+TEST(RaftPeerLivenessTest, TheBalancerAdapterIsAPureForward) {
+    // WHAT MAKES THE TESTS ABOVE TESTS OF THE BALANCER. They call the scalar predicate;
+    // the balancer calls a RaftGroup adapter. That is only the same rule while the adapter
+    // FORWARDS -- so assert it does, and that the plane holds no second copy of the bound.
+    // (The alternative, driving a real RaftGroup here, needs a journal and a reactor: the
+    // balancer's untestability is precisely what D-22 and D-23 are about.)
+#ifdef SHARD_RAFT_PLANE_SOURCE_PATH
+    std::ifstream in(SHARD_RAFT_PLANE_SOURCE_PATH);
+    ASSERT_TRUE(in.is_open()) << "could not open " << SHARD_RAFT_PLANE_SOURCE_PATH;
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    const std::string raw = ss.str();
+    std::string code;  // comments stripped: this is a claim about the code
+    std::istringstream lines(raw);
+    for (std::string line; std::getline(lines, line);) {
+        const size_t c = line.find("//");
+        code += (c == std::string::npos ? line : line.substr(0, c));
+        code += '\n';
+    }
+    EXPECT_NE(code.find("return data::transferrableTo(g.node().log().lastIndex(), g.matchIndexOf(target), "
+                        "g.ticksSinceAck(target),"),
+              std::string::npos)
+        << "ShardRaftPlane::transferrableTo is no longer a pure forward to the real predicate";
+    EXPECT_EQ(code.find("kMaxTransferLagEntries"), std::string::npos)
+        << "a SECOND copy of the transfer lag bound appeared in the plane -- one of the two "
+           "will be retuned and the other will not";
+#else
+    GTEST_SKIP() << "SHARD_RAFT_PLANE_SOURCE_PATH not defined";
+#endif
 }
 
 TEST(RaftPeerLivenessTest, LosingLeadershipClearsTheAckClock) {

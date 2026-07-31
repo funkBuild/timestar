@@ -122,6 +122,7 @@ set(SOURCE_INSPECTION_DEFS
     WAL_FILE_MANAGER_HPP_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/storage/wal_file_manager.hpp"
     NATIVE_INDEX_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/index/native/native_index.cpp"
     NATIVE_INDEX_HPP_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/index/native/native_index.hpp"
+    SHARD_RAFT_PLANE_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/cluster/integration/shard_raft_plane.hpp"
 )
 
 # Main test executable with all tests
