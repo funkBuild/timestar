@@ -37,14 +37,19 @@
 #
 # EXPENSIVE. This builds a second server binary from an isolated worktree (a fresh build
 # dir means building seastar too -- tens of minutes the first time; later runs are
-# incremental if you keep GATE_AB_BUILD_DIR) and then runs the full storm gate TWICE, each
-# of which is now K storms rather than one. It is a release/on-demand check, NOT a
-# per-commit CI gate. The gate it validates, fault_injection_gate.sh, is the one CI runs.
+# incremental because the build dir is KEPT by default) and then runs the full storm gate
+# TWICE, each of which is now K storms rather than one. It is a release/on-demand check,
+# NOT a per-commit CI gate. The gate it validates, fault_injection_gate.sh, is the one CI
+# runs.
 #
 # It never touches your working tree: the revert happens in a `git worktree`, not here.
 #
 # Usage: fault_injection_ab.sh
-#   GATE_AB_BUILD_DIR=<dir>   reuse (and keep) the comparison build dir
+#   GATE_AB_BUILD_DIR=<dir>   comparison build dir; default ../tsdb-ab-build BESIDE THE
+#                             REPO, deliberately NOT on /tmp -- see the note at its
+#                             assignment. Kept between runs so the second A/B is
+#                             incremental; delete it by hand to reclaim ~10 G.
+#   GATE_AB_WORKTREE=<dir>    comparison worktree; default ../tsdb-ab-worktree
 #   GATE_AB_KEEP=1            leave the worktree in place afterwards
 set -u
 cd "$(dirname "$0")" || exit 2
@@ -52,8 +57,15 @@ cd "$(dirname "$0")" || exit 2
 
 REPO="$(git rev-parse --show-toplevel)"
 GATE="$(pwd)/fault_injection_gate.sh"
-AB_WORKTREE="${GATE_AB_WORKTREE:-/tmp/tsgate_ab_worktree}"
-AB_BUILD="${GATE_AB_BUILD_DIR:-/tmp/tsgate_ab_build}"
+# NEITHER OF THESE MAY LIVE ON /tmp, and that is a hard requirement rather than a
+# preference. /tmp here is a tmpfs with a per-user quota, and the storm gate needs every
+# gigabyte of it for its data dirs; a comparison worktree (~1 G with seastar) plus a full
+# build tree (~10 G) inside the same quota is precisely the self-amplifying disk failure
+# the README describes -- and it would be spent on build output, which is not what the
+# quota is for. They default beside the repo instead, on real disk, so the build tree also
+# SURVIVES between runs and the second A/B is incremental.
+AB_WORKTREE="${GATE_AB_WORKTREE:-$(dirname "$REPO")/tsdb-ab-worktree}"
+AB_BUILD="${GATE_AB_BUILD_DIR:-$(dirname "$REPO")/tsdb-ab-build}"
 
 # The revert set, and the commit to take it from. Named once.
 REVERT_AT="fcb2a94^"
@@ -77,7 +89,13 @@ fi
 # currently is, i.e. the WORKING TREE. Uncommitted changes therefore land in one arm and
 # not the other, and the A/B silently measures them too. Refuse rather than report a
 # difference that is not the one named.
-DIRTY=$(git -C "$REPO" status --porcelain --untracked-files=no)
+# `--ignore-submodules=all` IS LOAD-BEARING, not tidiness. `external/seastar` is a gitlink
+# whose `.git` file points at a modules directory that does not exist in this checkout, so
+# a plain `git status` ABORTS on it -- "fatal: not a git repository" to stderr, NOTHING to
+# stdout, and a zero-length $DIRTY. Measured: with a genuinely modified tracked file in the
+# tree, the unguarded form still reported clean. The guard was therefore vacuous and could
+# never have fired, which is the worst state for a check whose whole job is to refuse.
+DIRTY=$(git -C "$REPO" status --porcelain --untracked-files=no --ignore-submodules=all)
 if [ -n "$DIRTY" ]; then
     echo "ABORT: working tree is dirty; the two arms would differ by more than the revert."
     printf '%s\n' "$DIRTY" | sed 's/^/  /'
@@ -88,6 +106,12 @@ fi
 cleanup_ab() {
     if [ "${GATE_AB_KEEP:-0}" != "1" ]; then
         git -C "$REPO" worktree remove --force "$AB_WORKTREE" 2>/dev/null
+        # The seastar symlink below makes the submodule path look modified, which `git
+        # worktree remove` can refuse even with --force. Take the directory out by hand
+        # and prune the registration, or the NEXT run's `worktree add` fails on a path
+        # that is still claimed.
+        rm -rf "$AB_WORKTREE"
+        git -C "$REPO" worktree prune 2>/dev/null
     fi
 }
 trap cleanup_ab EXIT
@@ -124,6 +148,26 @@ if [ "$CHANGED_LIST" != "$EXPECTED_LIST" ]; then
     exit 2
 fi
 
+# SEASTAR HAS TO BE PUT BACK BY HAND. `external/seastar` is a SUBMODULE, and `git worktree
+# add` leaves a submodule as an empty directory -- so `add_subdirectory(external/seastar)`
+# fails and cmake aborts before compiling a line. `git submodule update --init` cannot fix
+# it either: this checkout has no `.git/modules/external/seastar`, so it would have to
+# clone ~1 G from GitHub over the network for a dependency that is byte-identical to the
+# one already on disk.
+#
+# A SYMLINK IS CORRECT HERE, not a shortcut. The revert set is three files under
+# lib/cluster/data; seastar is not in it and cannot be, so both arms are meant to compile
+# the SAME seastar source. The build is out-of-source (everything lands in $AB_BUILD), so
+# sharing the source directory cannot let one arm's objects reach the other's.
+if [ ! -e "$AB_WORKTREE/external/seastar/CMakeLists.txt" ]; then
+    [ -e "$REPO/external/seastar/CMakeLists.txt" ] || {
+        echo "ABORT: $REPO/external/seastar is not populated either -- nothing to share"; exit 2; }
+    rmdir "$AB_WORKTREE/external/seastar" 2>/dev/null
+    ln -sfn "$REPO/external/seastar" "$AB_WORKTREE/external/seastar" || {
+        echo "ABORT: could not link seastar into the comparison worktree"; exit 2; }
+    echo "  seastar shared by symlink from $REPO (submodules are not populated in a worktree)"
+fi
+
 mkdir -p "$AB_BUILD"
 ( cd "$AB_BUILD" && cmake "$AB_WORKTREE" >/tmp/tsgate_ab_cmake.log 2>&1 ) || {
     echo "ABORT: cmake failed; see /tmp/tsgate_ab_cmake.log"; tail -20 /tmp/tsgate_ab_cmake.log; exit 2; }
@@ -135,12 +179,18 @@ AB_BIN="$AB_BUILD/bin/timestar_http_server"
 echo "  comparison binary: $AB_BIN"
 
 # ---------------------------------------------------------------------------
-# Pull the gate's own numbers back out of its output. Every assertion it prints has the
-# shape "  ok: NAME = N (...)" or "  GATE FAILURE: NAME = N, expected ...", so one parse
-# serves both outcomes -- which matters, because the reverted run is EXPECTED to fail and
-# its numbers are the whole point.
-gate_number() { # $1 = log file, $2 = assertion name prefix
-    grep -F "$2 = " "$1" | head -1 | sed "s/.*$2 = //" | grep -oE '^[0-9]+'
+# Pull the gate's own numbers back out of its output, from the `GATE_METRIC name value`
+# lines it prints BEFORE its assertions -- so they are there whether the run passed or
+# failed, and the reverted arm (which is EXPECTED to fail) reports its numbers too.
+#
+# This used to scrape the assertion text and DID NOT WORK: it looked for
+# "client errors across the reset storms = " while the gate prints
+# "client errors across the reset storms (bench + probe, 3 storms) = 6", so `grep -F`
+# matched nothing, both arms parsed empty, and the separation assertions below ran on
+# `${R_TOTAL:-0}` vs `${H_TOTAL:-999}` -- i.e. they compared two defaults and would have
+# reported a discrimination nobody measured.
+gate_number() { # $1 = log file, $2 = metric name
+    grep -E "^GATE_METRIC $2 " "$1" | head -1 | awk '{print $3}' | grep -oE '^[0-9]+'
 }
 
 run_gate() { # $1 = binary, $2 = log file  -- returns the gate's exit code
@@ -163,13 +213,19 @@ HEAD_RC=$?
 # The error counter is now an AGGREGATE over the gate's K storms (debt D-21); the gate
 # prints the per-storm vector next to it, which is what to read when the two arms are
 # closer than expected.
-ERR_ASSERTION="client errors across the reset storms"
-R_ROUNDS=$(gate_number /tmp/tsgate_ab_reverted.log "reset rounds injected")
-R_CONNS=$(gate_number /tmp/tsgate_ab_reverted.log "peer connections actually destroyed")
-R_TOTAL=$(gate_number /tmp/tsgate_ab_reverted.log "$ERR_ASSERTION")
-H_ROUNDS=$(gate_number /tmp/tsgate_ab_head.log "reset rounds injected")
-H_CONNS=$(gate_number /tmp/tsgate_ab_head.log "peer connections actually destroyed")
-H_TOTAL=$(gate_number /tmp/tsgate_ab_head.log "$ERR_ASSERTION")
+R_ROUNDS=$(gate_number /tmp/tsgate_ab_reverted.log reset_rounds_total)
+R_CONNS=$(gate_number /tmp/tsgate_ab_reverted.log reset_conns_total)
+R_TOTAL=$(gate_number /tmp/tsgate_ab_reverted.log storm_errors_total)
+H_ROUNDS=$(gate_number /tmp/tsgate_ab_head.log reset_rounds_total)
+H_CONNS=$(gate_number /tmp/tsgate_ab_head.log reset_conns_total)
+H_TOTAL=$(gate_number /tmp/tsgate_ab_head.log storm_errors_total)
+# A metric that did not parse is a HARNESS failure, and it must not be allowed to reach
+# the separation assertions as a default -- that is exactly how the old scrape produced an
+# unmeasured "pass". Fail here, where the message names the cause.
+for _m in R_ROUNDS R_CONNS R_TOTAL H_ROUNDS H_CONNS H_TOTAL; do
+    eval "_v=\${$_m:-}"
+    [ -n "$_v" ] || gate_fail "could not parse $_m from the gate log -- did the run reach its GATE_METRIC lines? (a VOID or a timeout does not)"
+done
 
 echo "=== A/B result ==="
 echo "  reverted: ${R_ROUNDS:-?} rounds / ${R_CONNS:-?} conns -> ${R_TOTAL:-?} client errors (gate rc=$REVERTED_RC)"
