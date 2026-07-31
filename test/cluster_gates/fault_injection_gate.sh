@@ -45,17 +45,28 @@
 # THE K-STORM FORM IS NOW MEASURED TOO -- three consecutive runs of THIS text, K=3, against
 # one unchanged HEAD binary (2fdde50 + the sizing below), each run a fresh cluster:
 #
-#     run          A              B              C
-#     errors       [0 0 0] = 0    [1 0 0] = 1    [1 0 1] = 2
-#     rounds       79 79 76       77 77 76       79 80 84
-#     conns        228 231 224    221 223 219    226 243 230
-#     baseline     5.15 M         5.16 M         5.06 M pts/s, 0 errors on all three
-#     dip          86 86 87 %     88 87 87 %     87 84 88 %
+#     run          A              B              C              D              E
+#     errors       [0 0 0] = 0    [1 0 0] = 1    [1 0 1] = 2    [0 0 0] = 0    [0 4 0] = 4
+#     rounds       79 79 76       77 77 76       79 80 84       72 75 74       75 75 76
+#     conns        228 231 224    221 223 219    226 243 230    204 213 213    223 222 218
+#     baseline     5.15 M         5.16 M         5.06 M         5.29 M         5.2 M pts/s
+#     dip          86 86 87 %     88 87 87 %     87 84 88 %     89 89 88 %     87 85 87 %
 #
-# NINE storm draws: six zeros and three ones, and NO STORM DREW MORE THAN ONE. That is the
-# distribution the budget is set against -- not a guess, and the reason the budget is on the
-# TOTAL: a per-storm zero would have failed run B and run C on the same binary that passed
-# run A, which is precisely the non-reproducibility D-21 filed.
+# (D and E are the HEAD arms of two `fault_injection_ab.sh` runs -- the same gate, the same
+# binary, the same sizing.)
+#
+# FIFTEEN storm draws: eleven zeros, three ones and ONE FOUR, i.e. run totals 0, 1, 2, 0, 4.
+# The budget is 6, above that maximum with margin. It was 3 after the first nine draws, and
+# run E -- a correct binary -- would have failed it. That is D-21's own complaint recurring
+# at a different threshold, and it is why the budget is on the TOTAL and why it is stated
+# with the draws beside it: any threshold set from a handful of runs of a heavy-tailed
+# distribution will eventually be crossed by the good binary.
+#
+# WHAT THIS GATE ALONE CANNOT DO, said plainly. The reverted arm of the A/B drew 7 and 22
+# under identical storms, so a budget of 6 separates the arms only just, on the worse draw.
+# A single run of this gate is therefore a SMOKE TEST for the pacing, not proof of it; the
+# discriminating claim is `fault_injection_ab.sh`'s WITHIN-RUN ratio, which compares the two
+# binaries under the same environment and cancels exactly the variance this table shows.
 #
 # The two failure modes are separated rather than averaged:
 #
@@ -66,17 +77,16 @@
 #   * THE PROPERTY IS ASSERTED OVER K STORMS AGAINST A BUDGET. The storm runs
 #     GATE_STORM_ROUNDS times (default 3) against the same cluster and the gate asserts on
 #     the TOTAL client errors, with the per-storm vector printed so the distribution is
-#     visible rather than inferred. The default budget sits above the observed run totals
-#     (0, 1, 2 above) and far below what a binary without the 4a fix produces -- see
-#     `fault_injection_ab.sh`, which measures both arms under an identical storm and is
-#     where the separation is actually asserted.
+#     visible rather than inferred. The default budget sits above every observed run total
+#     (0, 1, 2, 0, 4 above); `fault_injection_ab.sh` is where the two binaries are actually
+#     separated.
 #
 # The residual variance is environmental and whole-run (that void baseline), which K storms
 # inside one run cannot average away -- which is exactly why the void rule is separate.
 #
 # Usage: fault_injection_gate.sh [SERVER_BINARY]
 #   GATE_STORM_ROUNDS=K        storms per run (default 3)
-#   GATE_MAX_STORM_ERRORS=N    total client-error budget across all K (default 3)
+#   GATE_MAX_STORM_ERRORS=N    total client-error budget across all K (default 6)
 #   exit 0 = pass, 1 = property failed, 2 = setup refused, 3 = VOID (re-draw)
 set -u
 cd "$(dirname "$0")" || exit 2
@@ -138,7 +148,7 @@ MIN_DIP_PCT="${GATE_MIN_DIP_PCT:-40}"
 # storm K times is what satisfies them -- three anaemic storms cannot add up to one real
 # one.
 STORM_ROUNDS="${GATE_STORM_ROUNDS:-3}"
-MAX_STORM_ERRORS="${GATE_MAX_STORM_ERRORS:-3}"
+MAX_STORM_ERRORS="${GATE_MAX_STORM_ERRORS:-6}"
 # THE COMBINED MODE (debt D-19's second half), off by default. Set by
 # `combined_fault_rebalance_gate.sh`, which is where its floors and budget live: a
 # leadership rebalance storm runs THROUGH each reset storm, at a raised connection count.
