@@ -212,8 +212,13 @@ TEST(WriteAdmissionTest, EveryAdvertiserOffersTheNewestSupportedWireVersion) {
     rpc.setLocalVersion(features::VersionRange{1, 1});
     EXPECT_EQ(rpc.localVersion().max, 1u);
 
-    // The protocol step the hinted-propose verb is gated on must be the newest one.
-    EXPECT_EQ(data::kWriteBatchFormatMax, data::kWriteBatchFormatV3);
+    // ... and Max must name the NEWEST protocol step in the tree, not merely some step.
+    // Both gated steps are listed, so adding a v5 without moving Max fails here rather
+    // than silently disabling itself cluster-wide -- which is the original bug's shape.
+    EXPECT_GE(data::kWriteBatchFormatMax, data::kWriteBatchFormatV3) << "the hinted-propose gate";
+    EXPECT_EQ(data::kWriteBatchFormatMax, data::kNodeQueryResolveMinVersion)
+        << "the leader-resolve read gate (debt D-25) is the newest protocol step; if a newer one has "
+           "landed, add it here and move kWriteBatchFormatMax to it";
 }
 
 // ... and the list of advertisers must be EXHAUSTIVE.

@@ -719,6 +719,20 @@ seastar::future<> DataPlaneRpc::forwardWriteBatch(NodeId to, WriteBatch batch) {
 seastar::future<NodeQueryPartial> DataPlaneRpc::queryNode(NodeId to, NodeQueryRequest req) {
     if (impl_->stopping)
         throw std::runtime_error("dataplane: shutting down");
+    // WIRE-VERSION GATE FOR THE RESOLVE/REDIRECT PAIR (debt D-25). Handshaked ONLY when the
+    // request actually carries a resolve tail, which is the whole of the cost argument: a
+    // read that names nothing to resolve -- every RF == N read, every RF == 1 read, every
+    // metadata fan-out -- takes exactly the round trips it took before, and an RF < N read
+    // pays the handshake once per (shard, peer) connection because `versionFor` caches it
+    // and drops it only when the connection is retired. See node_query.hpp for why absence
+    // of a reply tail cannot be read as "no redirects".
+    if (!req.resolveVShards.empty()) {
+        const uint32_t version = co_await versionFor(to);
+        if (version < kNodeQueryResolveMinVersion)
+            throw ReadResolveUnsupportedError(
+                "dataplane: peer " + std::to_string(to) + " negotiated wire v" + std::to_string(version) + ", below v" +
+                std::to_string(kNodeQueryResolveMinVersion) + " -- it cannot resolve VShard leadership on request");
+    }
     auto* conn = impl_->clientFor(to);
     if (!conn)
         throw std::runtime_error("dataplane: unknown peer");
@@ -744,6 +758,14 @@ seastar::future<NodeQueryPartial> DataPlaneRpc::queryNode(NodeId to, NodeQueryRe
     }
     if (!part)
         throw std::runtime_error("dataplane: malformed node query partial");
+    // The other half of the gate: a peer we did NOT ask to resolve anything must not answer
+    // with redirects. It cannot happen from a correct holder (the tail is emitted only in
+    // answer to a resolve list), so this catches a peer whose reply shape has drifted, and
+    // it refuses rather than letting `applyReadRedirects` hold VShards outstanding on the
+    // word of a node that was never asked.
+    if (req.resolveVShards.empty() && !part->redirects.empty())
+        throw std::runtime_error("dataplane: peer " + std::to_string(to) +
+                                 " answered with leader redirects for a read that asked it to resolve nothing");
     co_return std::move(*part);
 }
 

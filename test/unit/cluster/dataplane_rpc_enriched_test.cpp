@@ -15,12 +15,11 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdlib>
+#include <fstream>
 #include <seastar/core/thread.hh>
 #include <seastar/net/socket_defs.hh>
 #include <seastar/rpc/rpc.hh>
-
-#include <cstdlib>
-#include <fstream>
 
 using namespace timestar;
 
@@ -37,11 +36,10 @@ seastar::socket_address loopback(uint16_t port) {
     return seastar::socket_address(seastar::ipv4_addr("127.0.0.1", port));
 }
 
-data::WriteSeries series(const std::string& m, std::map<std::string, std::string> tags, const std::string& field,
-                         TSMValueType type, std::vector<uint64_t> ts,
-                         std::variant<std::vector<double>, std::vector<int64_t>, std::vector<bool>,
-                                      std::vector<std::string>>
-                             vals) {
+data::WriteSeries series(
+    const std::string& m, std::map<std::string, std::string> tags, const std::string& field, TSMValueType type,
+    std::vector<uint64_t> ts,
+    std::variant<std::vector<double>, std::vector<int64_t>, std::vector<bool>, std::vector<std::string>> vals) {
     data::WriteSeries s;
     s.seriesKey = buildSeriesKey(m, tags, field);
     s.type = type;
@@ -107,8 +105,7 @@ public:
 
 data::WriteBatch oneFloatBatch() {
     data::WriteBatch b;
-    b.series.push_back(
-        series("m", {{"host", "h1"}}, "v", TSMValueType::Float, {BASE}, std::vector<double>{1.0}));
+    b.series.push_back(series("m", {{"host", "h1"}}, "v", TSMValueType::Float, {BASE}, std::vector<double>{1.0}));
     return b;
 }
 
@@ -184,8 +181,8 @@ std::string emptySeriesFrame(size_t n) {
     };
     std::string s;
     s.reserve(n * 13 + 24);
-    u64(s, 0);                            // schemaVersion
-    u32(s, static_cast<uint32_t>(n));     // series count
+    u64(s, 0);                         // schemaVersion
+    u32(s, static_cast<uint32_t>(n));  // series count
     for (size_t i = 0; i < n; ++i) {
         s.push_back(static_cast<char>(TSMValueType::Float));
         u32(s, 0);  // empty seriesKey
@@ -208,10 +205,16 @@ std::string encodeWriteBatchForTest() {
 
 class WireTapPeer {
 public:
-    std::vector<std::string> captured;  // raw proposeWrite frames, in arrival order
+    std::vector<std::string> captured;         // raw proposeWrite frames, in arrival order
+    std::vector<std::string> capturedQueries;  // raw queryNode frames (verb 4), in arrival order
+    int negotiateCalls = 0;                    // how many handshakes this peer was asked for
+    // Redirects this tap answers a queryNode with, whether or not it was asked to resolve
+    // anything -- so a test can play a peer whose reply shape has drifted (debt D-25).
+    std::vector<data::VShardRedirect> replyRedirects;
 
     WireTapPeer(seastar::socket_address addr, uint32_t agreedVersion) {
-        proto_.register_handler(9, [agreedVersion](seastar::sstring) {
+        proto_.register_handler(9, [this, agreedVersion](seastar::sstring) {
+            ++negotiateCalls;
             char b[4];
             for (int i = 0; i < 4; ++i)
                 b[i] = static_cast<char>((agreedVersion >> (8 * i)) & 0xff);
@@ -220,6 +223,13 @@ public:
         proto_.register_handler(6, [this](seastar::sstring data) {
             captured.emplace_back(data.data(), data.size());
             return seastar::make_ready_future<seastar::sstring>(seastar::sstring("1"));  // committed
+        });
+        proto_.register_handler(4, [this](seastar::sstring data) {
+            capturedQueries.emplace_back(data.data(), data.size());
+            data::NodeQueryPartial p;
+            p.redirects = replyRedirects;
+            const std::string bytes = data::encodeNodeQueryPartial(p);
+            return seastar::make_ready_future<seastar::sstring>(seastar::sstring(bytes.data(), bytes.size()));
         });
         seastar::listen_options lo;
         lo.reuse_address = true;
@@ -281,12 +291,12 @@ TEST_F(DataPlaneRpcEnrichedTest, WriteBatchAndQueryNodeOverRealSocket) {
         // FLOAT series sharing region=west at the SAME timestamp, so a cross-series
         // `spread by {region}` has a non-trivial answer (max-min = 20).
         data::WriteBatch batch;
-        batch.series.push_back(
-            series("log", {{"host", "h1"}}, "msg", TSMValueType::String, {BASE}, std::vector<std::string>{"over the wire"}));
-        batch.series.push_back(
-            series("m", {{"host", "h1"}, {"region", "west"}}, "v", TSMValueType::Float, {BASE}, std::vector<double>{10.0}));
-        batch.series.push_back(
-            series("m", {{"host", "h2"}, {"region", "west"}}, "v", TSMValueType::Float, {BASE}, std::vector<double>{30.0}));
+        batch.series.push_back(series("log", {{"host", "h1"}}, "msg", TSMValueType::String, {BASE},
+                                      std::vector<std::string>{"over the wire"}));
+        batch.series.push_back(series("m", {{"host", "h1"}, {"region", "west"}}, "v", TSMValueType::Float, {BASE},
+                                      std::vector<double>{10.0}));
+        batch.series.push_back(series("m", {{"host", "h2"}, {"region", "west"}}, "v", TSMValueType::Float, {BASE},
+                                      std::vector<double>{30.0}));
 
         // Forward over the socket; resolves only after the owner durably applied.
         rpc.forwardWriteBatch(self, batch).get();
@@ -376,8 +386,8 @@ TEST_F(DataPlaneRpcEnrichedTest, EnrichedVerbToLegacyPeerFailsCleanly) {
         LegacyMemStore legacy;
         ThrowingNodeStore unused;  // the client's own sink (never invoked here)
         data::DataPlaneRpc srv, cli;
-        srv.start(loopback(serverPort), legacy).get();   // legacy path only (verbs 1/2)
-        cli.start(loopback(clientPort), unused).get();   // enriched path
+        srv.start(loopback(serverPort), legacy).get();  // legacy path only (verbs 1/2)
+        cli.start(loopback(clientPort), unused).get();  // enriched path
         cli.addPeer(server, loopback(serverPort));
 
         bool threw = false;
@@ -687,10 +697,13 @@ TEST_F(DataPlaneRpcEnrichedTest, ForwardedWritesSpeakTheNegotiatedWireVersion) {
             rpc.setProposeSink(propose);
             rpc.start(loopback(port), sink).get();
             rpc.addPeer(self, loopback(port));
-            // v3 is a PROTOCOL step (the hinted propose verb), not a payload format:
-            // the negotiated version is 3 while the BYTES are still v2 (asserted by the
-            // wire-tap legs below).
-            EXPECT_EQ(rpc.versionFor(self).get(), data::kWriteBatchFormatV3);
+            // v3 and v4 are PROTOCOL steps (the hinted propose verb; the leader-resolve
+            // read exchange), not payload formats: two peers on this binary negotiate
+            // kWriteBatchFormatMax while the BYTES stay v2 (asserted by the wire-tap legs
+            // below). Written against Max rather than a literal so the next protocol step
+            // does not have to edit this line -- the point is "the newest, whatever it is".
+            EXPECT_EQ(rpc.versionFor(self).get(), data::kWriteBatchFormatMax);
+            EXPECT_GE(rpc.versionFor(self).get(), data::kWriteBatchFormatV3) << "the hinted verb must stay reachable";
             EXPECT_TRUE(rpc.proposeWrite(self, oneFloatBatch()).get());
             EXPECT_EQ(propose.lastSeriesCount, 1u);
             rpc.stop().get();
@@ -802,8 +815,7 @@ TEST_F(DataPlaneRpcEnrichedTest, OversizedInboundFrameIsRefusedWithoutAmplifying
 
         // Refused by ADMISSION, not by the sink: "apply boom" would mean the frame was
         // decoded first (and the 458 MB already spent).
-        EXPECT_NE(err.find("memory limit"), std::string::npos)
-            << "expected an admission rejection, got: " << err;
+        EXPECT_NE(err.find("memory limit"), std::string::npos) << "expected an admission rejection, got: " << err;
         EXPECT_EQ(err.find("apply boom"), std::string::npos) << "the frame reached the handler: " << err;
         EXPECT_LT(after - before, 64u << 10) << "refusing a 16 MiB frame grew peak RSS by " << (after - before)
                                              << " KiB -- inbound admission is not bounding decode amplification";
@@ -1066,5 +1078,136 @@ TEST_F(DataPlaneRpcEnrichedTest, ResolveVShardsAndRedirectsCrossTheSocket) {
         EXPECT_DOUBLE_EQ(sumBoth, 33.0);
 
         rpc.stop().get();
+    }).get();
+}
+
+// ---------------------------------------------------------------------------
+// Debt D-25: the read path's wire-version negotiation.
+//
+// `resolveVShards` / `redirects` are OPTIONAL TAILS (D-13), and an absent reply tail says
+// "I lead everything you named" and "I never read your resolve list" in exactly the same
+// bytes. Without a version gate a new coordinator therefore cannot tell a leader read from
+// a follower read against an old holder. The gate rides the SAME per-peer handshake the
+// write path uses, so it costs one round trip per (shard, peer) connection and none at all
+// on a read that names nothing to resolve.
+
+// NEW -> OLD. A peer below the read protocol is never SENT a resolve list, and the refusal
+// is a distinct type, so the coordinator can degrade knowingly instead of reporting a
+// healthy node as unreachable.
+TEST_F(DataPlaneRpcEnrichedTest, AResolveListIsRefusedForAPeerBelowTheReadProtocol) {
+    seastar::async([] {
+        const uint16_t oldPort = 39370, newPort = 39371, clientPort = 39372;
+        const data::NodeId oldPeer = 2, newPeer = 3;
+        WireTapPeer oldTap(loopback(oldPort), data::kWriteBatchFormatV3);  // pre-read-protocol
+        WireTapPeer newTap(loopback(newPort), data::kNodeQueryResolveMinVersion);
+        ThrowingNodeStore store;
+        data::DataPlaneRpc cli;
+        cli.start(loopback(clientPort), store).get();
+        cli.addPeer(oldPeer, loopback(oldPort));
+        cli.addPeer(newPeer, loopback(newPort));
+
+        data::NodeQueryRequest req;
+        req.request.measurement = "m";
+        req.vshards = {3, 7};
+        req.resolveVShards = {3, 7};
+
+        bool refused = false;
+        try {
+            cli.queryNode(oldPeer, req).get();
+        } catch (const data::ReadResolveUnsupportedError&) {
+            refused = true;
+        } catch (const std::exception& e) {
+            ADD_FAILURE() << "expected ReadResolveUnsupportedError, got: " << e.what();
+        }
+        EXPECT_TRUE(refused);
+        EXPECT_TRUE(oldTap.capturedQueries.empty())
+            << "a peer that cannot honour a resolve list must never be sent one -- a pre-D-13 decoder "
+               "refuses the whole frame, which the coordinator would read as an outage";
+
+        // POSITIVE CONTROL, and it is the one that makes the refusal above mean something:
+        // the SAME request to a peer that DOES negotiate the read protocol goes out with
+        // its tail intact. Without this the test would pass against a client that had
+        // simply stopped sending resolve lists to anyone.
+        data::NodeQueryPartial ok = cli.queryNode(newPeer, req).get();
+        EXPECT_TRUE(ok.redirects.empty());
+        ASSERT_EQ(newTap.capturedQueries.size(), 1u);
+        auto decoded = data::decodeNodeQueryRequest(newTap.capturedQueries[0]);
+        ASSERT_TRUE(decoded.has_value());
+        EXPECT_EQ(decoded->resolveVShards, (std::vector<uint16_t>{3, 7}));
+
+        cli.stop().get();
+        oldTap.stop();
+        newTap.stop();
+    }).get();
+}
+
+// THE COST BOUND. A read that names nothing to resolve -- every RF == N read, every RF == 1
+// read -- must not handshake at all, and an RF < N read must handshake ONCE per connection.
+// A version check that added a round trip per read would be a worse bug than the one it
+// closes.
+TEST_F(DataPlaneRpcEnrichedTest, TheReadVersionHandshakeIsPaidOncePerPeerAndNeverWithoutATail) {
+    seastar::async([] {
+        const uint16_t serverPort = 39373, clientPort = 39374;
+        const data::NodeId server = 2;
+        WireTapPeer tap(loopback(serverPort), data::kWriteBatchFormatV3);
+        ThrowingNodeStore store;
+        data::DataPlaneRpc cli;
+        cli.start(loopback(clientPort), store).get();
+        cli.addPeer(server, loopback(serverPort));
+
+        data::NodeQueryRequest plain;
+        plain.request.measurement = "m";
+        plain.vshards = {3, 7};  // ... and nothing to resolve
+        cli.queryNode(server, plain).get();
+        cli.queryNode(server, plain).get();
+        EXPECT_EQ(tap.negotiateCalls, 0)
+            << "the steady-state read path must not pay a handshake for a tail it does not send";
+        EXPECT_EQ(tap.capturedQueries.size(), 2u) << "... and both reads must still have happened";
+
+        // Now a read that DOES carry a tail: exactly one handshake, cached across calls
+        // even though the answer was a refusal.
+        data::NodeQueryRequest resolving = plain;
+        resolving.resolveVShards = {3};
+        EXPECT_THROW(cli.queryNode(server, resolving).get(), data::ReadResolveUnsupportedError);
+        EXPECT_EQ(tap.negotiateCalls, 1);
+        EXPECT_THROW(cli.queryNode(server, resolving).get(), data::ReadResolveUnsupportedError);
+        EXPECT_EQ(tap.negotiateCalls, 1) << "the negotiated version is cached per connection, not re-asked per read";
+
+        cli.stop().get();
+        tap.stop();
+    }).get();
+}
+
+// The REPLY half of the gate. A reply tail is permitted by the REQUEST, never by the
+// server's own version (which a server cannot know the caller's side of), so a peer that
+// volunteers redirects for a read that asked it to resolve nothing has drifted and its
+// answer is refused rather than acted on.
+TEST_F(DataPlaneRpcEnrichedTest, RedirectsFromAPeerAskedToResolveNothingAreRefused) {
+    seastar::async([] {
+        const uint16_t serverPort = 39375, clientPort = 39376;
+        const data::NodeId server = 2;
+        WireTapPeer tap(loopback(serverPort), data::kNodeQueryResolveMinVersion);
+        tap.replyRedirects.push_back(data::VShardRedirect{7, 4, true});
+        ThrowingNodeStore store;
+        data::DataPlaneRpc cli;
+        cli.start(loopback(clientPort), store).get();
+        cli.addPeer(server, loopback(serverPort));
+
+        data::NodeQueryRequest plain;
+        plain.request.measurement = "m";
+        plain.vshards = {3, 7};
+        EXPECT_THROW(cli.queryNode(server, plain).get(), std::runtime_error);
+
+        // NEGATIVE CONTROL: the same volunteered redirect is LEGITIMATE once the request
+        // asks for it, so the refusal above is about the permission and not about the tail.
+        data::NodeQueryRequest resolving = plain;
+        resolving.resolveVShards = {7};
+        data::NodeQueryPartial part = cli.queryNode(server, resolving).get();
+        ASSERT_EQ(part.redirects.size(), 1u);
+        EXPECT_EQ(part.redirects[0].vshard, 7);
+        EXPECT_EQ(part.redirects[0].leader, 4u);
+
+        cli.stop().get();
+        tap.stop();
     }).get();
 }

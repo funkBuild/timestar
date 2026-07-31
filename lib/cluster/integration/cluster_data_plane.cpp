@@ -615,6 +615,11 @@ seastar::future<QueryResponse> ClusterDataPlane::queryReplicated(QueryRequest re
     std::vector<std::string> incompleteReasons;
     std::exception_ptr firstErr;
     std::set<data::NodeId> unreachableLeaders;
+    // Peers that answered the handshake but predate the leader-resolve read protocol
+    // (debt D-25). Kept apart from `unreachableLeaders` because the two want opposite
+    // treatment: an unreachable leader is woken and the client is told to retry, while a
+    // peer mid-rolling-upgrade will answer exactly the same way until it is upgraded.
+    std::set<data::NodeId> unversionedPeers;
 
     // Every VShard still owing an answer. Each one leaves this set exactly once -- when
     // a target answers for it -- so no VShard is dropped and none is asked twice.
@@ -709,6 +714,13 @@ seastar::future<QueryResponse> ClusterDataPlane::queryReplicated(QueryRequest re
                                    std::make_move_iterator(part.partials.end()));
                 allNonNumeric.insert(allNonNumeric.end(), std::make_move_iterator(part.nonNumeric.begin()),
                                      std::make_move_iterator(part.nonNumeric.end()));
+            } catch (const data::ReadResolveUnsupportedError&) {
+                // The peer is REACHABLE and healthy; it simply predates the resolve/redirect
+                // exchange, so it cannot tell us which of these VShards it leads (debt
+                // D-25). Degrade KNOWINGLY: fail the read closed naming the peer, rather
+                // than counting a follower's possibly-stale answer as a leader read. Not
+                // retried and not woken -- neither can change the peer's binary.
+                unversionedPeers.insert(pendingLeaders[i]);
             } catch (...) {
                 // A REMOTE leader we could not reach is an availability problem, not an
                 // internal error: the node is down (or partitioned) but its VShards have
@@ -728,7 +740,7 @@ seastar::future<QueryResponse> ClusterDataPlane::queryReplicated(QueryRequest re
             }
         }
 
-        if (!unreachableLeaders.empty() || firstErr || !incompleteReasons.empty())
+        if (!unreachableLeaders.empty() || !unversionedPeers.empty() || firstErr || !incompleteReasons.empty())
             break;  // answered below; retrying an incomplete/unreachable read is the caller's job
         if (outstanding.empty())
             break;  // every VShard answered exactly once
@@ -744,6 +756,23 @@ seastar::future<QueryResponse> ClusterDataPlane::queryReplicated(QueryRequest re
         break;  // budget spent with VShards still unanswered: fail closed below
     }
 
+    if (!unversionedPeers.empty()) {
+        // Reported BEFORE the unreachable branch: a peer can only land here by ANSWERING
+        // the version handshake, so "too old" is the more specific and more actionable of
+        // the two, and it must not be reported as an outage the operator will go looking
+        // for. Deliberately no wake and no "retry shortly" -- retrying is futile until the
+        // rolling upgrade finishes (debt D-25).
+        std::string nodes;
+        for (data::NodeId n : unversionedPeers)
+            nodes += (nodes.empty() ? "" : ",") + std::to_string(n);
+        QueryResponse r;
+        r.success = false;
+        r.errorCode = "QUERY_INCOMPLETE";
+        r.errorMessage = "peer node(s) " + nodes + " predate the leader-resolve read protocol (data-plane wire v" +
+                         std::to_string(data::kNodeQueryResolveMinVersion) +
+                         "); this node cannot verify who leads their VShards -- finish the rolling upgrade";
+        co_return r;
+    }
     if (!unreachableLeaders.empty()) {
         // Those VShards are hibernating behind a dead leader, so their election
         // timeout is stretched ~10x (25-50s of cluster-wide read failure, measured).

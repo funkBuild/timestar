@@ -148,12 +148,27 @@ constexpr uint32_t kWriteBatchFormatV2 = 2;
 // that does not know v3 simply keeps getting the v1-shaped verb-6 reply.
 constexpr uint32_t kWriteBatchFormatV3 = 3;
 
+// v4 is a PROTOCOL version like v3, and it belongs to the READ path (debt D-25): a peer
+// that negotiates >= 4 understands `NodeQueryRequest::resolveVShards` and answers with
+// `NodeQueryPartial::redirects` -- D-13's optional tails on the node-query frames. Nothing
+// about the write payload moves with it: `encodeWriteBatch(batch, 4)` still emits v2, and
+// the hinted-propose gate is still `>= 3`.
+//
+// It rides the SAME negotiated range for the reason v3 does: that range is already the
+// cluster's one mechanism for "what may I say to this peer", and the read path had no
+// mechanism at all. The range is a single scalar, so a read-path step consumes a number the
+// write path could have used -- deliberately, because ONE ordered protocol line is what
+// makes a peer's answer to `kNegotiateVersion` a complete statement of what it speaks. The
+// read path names it through `kNodeQueryResolveMinVersion` (node_query.hpp), so no read
+// site reads a `kWriteBatchFormat*` spelling.
+constexpr uint32_t kWriteBatchFormatV4 = 4;
+
 // The newest version this binary supports. Every place that advertises this node's
 // capability must use THIS, never the literal that happens to be current: naming v2 in
 // ClusterDataPlane after v3 landed capped every negotiation at 2, so no peer spoke the
 // hinted-propose verb and the leader-hint path was dead in production while every test
 // passed (tests construct their own DataPlaneRpc, whose default was already correct).
-constexpr uint32_t kWriteBatchFormatMax = kWriteBatchFormatV3;
+constexpr uint32_t kWriteBatchFormatMax = kWriteBatchFormatV4;
 
 // Wire codec (bounds-checked; decode returns nullopt on ANY malformed/truncated/
 // inconsistent input so a hostile frame can never fabricate a batch). Bounds-checking
