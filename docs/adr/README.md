@@ -22,3 +22,10 @@ than discovered during implementation. Neither is implemented:
   (write-scaleout 5c; recommendation: **not now**, share the per-shard journal first)
 - [ADR 0005 — A leader-transfer bypass for the CheckQuorum disruption guard](0005-checkquorum-transfer-bypass.md)
   (write-scaleout 5d; why CheckQuorum is off, and what re-enabling it needs on the wire)
+
+ADR 0006 is neither a prerequisite nor a proposal: it records a decision the code was
+already making silently, and it **is** implemented.
+
+- [ADR 0006 — How long a read waits for a leader, and why it is not how long a write
+  waits](0006-read-write-election-tolerance.md)
+  (debt D-26; the read/write election asymmetry, now named and compiler-asserted)
