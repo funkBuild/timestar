@@ -15,13 +15,14 @@ namespace fs = std::filesystem;
 
 namespace timestar {
 
-seastar::future<> JournalGc::copyForward(JournalWriter& writer, uint64_t oldestKeptSegment,
+seastar::future<> JournalGc::copyForward(JournalWriter& writer, uint64_t reclaimedSegment,
                                          std::vector<JournalRecord> records, Result* out) {
     // RE-VALIDATE INSIDE THE EXCLUSIVE SECTION. The plan above was made without the lock,
     // so the writer may have rotated since. What must still hold is that the segment being
-    // COPIED INTO is strictly newer than the one about to be unlinked -- otherwise the
-    // copy would land in the file it is meant to rescue.
-    if (writer.currentSegmentNumber() <= oldestKeptSegment)
+    // COPIED INTO is strictly newer than `reclaimedSegment` -- the file these records came
+    // from and the one the caller is about to UNLINK. Copying into it would destroy the
+    // rescue along with the source.
+    if (writer.currentSegmentNumber() <= reclaimedSegment)
         throw std::runtime_error("JournalGc: the writer's active segment is not above the segment being reclaimed");
     if (writer.fenced())
         throw std::runtime_error("JournalGc: the journal writer is fenced; refusing to copy records forward");
@@ -100,7 +101,14 @@ seastar::future<JournalGc::Result> JournalGc::collect(fs::path dir, uint64_t act
         const bool wholeSegmentLive = gc.liveRecordIndices.size() == scan->records.size();
         const bool overBudget = gc.liveRecordIndices.size() > opts.maxCopyForwardRecords;
         if (!gc.reclaimable && (wholeSegmentLive || !opts.copyForward || overBudget)) {
-            result.pinnedSegments.push_back(seg);
+            // `pinnedSegments` is a CENSUS of what this pass leaves behind, not a record of
+            // the one segment that halted it: since GC stops here, every remaining sealed
+            // segment is retained too, and reporting only the first would make the counter
+            // read "passes that hit a pin" while claiming to measure retention (the
+            // evidence D-39 asks for). Recorded without re-reading them -- they are
+            // retained by the stop, whatever their own contents would have said.
+            for (auto it = std::find(segments.begin(), segments.end(), seg); it != segments.end(); ++it)
+                result.pinnedSegments.push_back(*it);
             break;
         }
 

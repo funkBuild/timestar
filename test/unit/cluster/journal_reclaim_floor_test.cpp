@@ -29,6 +29,7 @@
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
 #include <seastar/util/file.hh>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -424,6 +425,52 @@ seastar::future<> testCrashBetweenTheCopyBarrierAndTheUnlinkRecovers() {
 }
 TEST(JournalReclaimFloorTest, CrashBetweenTheCopyBarrierAndTheUnlinkRecovers) {
     testCrashBetweenTheCopyBarrierAndTheUnlinkRecovers().get();
+}
+
+// seedRetention promotes its value STRAIGHT into the durable watermark, which is sound
+// only because recovered records came off the disk. Called after an append it would launder
+// merely-BUFFERED state into durability -- the exact bug class the two-watermark rewrite
+// exists to remove -- so the precondition is enforced rather than documented.
+seastar::future<> testSeedRetentionRefusesToLaunderBufferedState() {
+    const auto dir = tmpDir("seedguard");
+    JournalWriter w(dir, header(), kSmallSegBytes);
+    co_await w.open();
+
+    JournalRetentionSeed seed;
+    seed.latestHardStateSeq = 1;
+    seed.latestSnapshotSeq = 2;
+
+    {
+        JournalRaftPersistence p(w, VShardId{47});
+        // An append happened first: the seed can no longer be assumed durable.
+        co_await p.persistHardState(HardState{1, 1});
+        bool threw = false;
+        try {
+            p.seedRetention(seed);
+        } catch (const std::logic_error&) {
+            threw = true;
+        }
+        EXPECT_TRUE(threw) << "seeding after an append would promote buffered state as durable";
+        EXPECT_EQ(p.releasedSeq(), 0u);
+    }
+    {
+        JournalRaftPersistence p(w, VShardId{47});
+        p.seedRetention(seed);  // the legitimate call, before anything is appended
+        const uint64_t seeded = p.releasedSeq();
+        bool threwOnSecond = false;
+        try {
+            p.seedRetention(seed);
+        } catch (const std::logic_error&) {
+            threwOnSecond = true;
+        }
+        EXPECT_TRUE(threwOnSecond) << "a second seed must be refused, not silently re-promoted";
+        EXPECT_EQ(p.releasedSeq(), seeded);
+    }
+    co_await w.close();
+    fs::remove_all(dir);
+}
+TEST(JournalReclaimFloorTest, SeedRetentionRefusesToLaunderBufferedState) {
+    testSeedRetentionRefusesToLaunderBufferedState().get();
 }
 
 // A retired VShard must be FORGOTTEN, not left at its last watermark: a re-add gets a

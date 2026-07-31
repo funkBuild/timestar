@@ -258,7 +258,13 @@ public:
     const JournalRetention& journalRetention() const { return retention_; }
 
     uint64_t journalSegmentsDeleted() const { return journalSegmentsDeleted_; }
-    uint64_t journalSegmentsPinned() const { return journalSegmentsPinned_; }
+    // Sealed segments the LAST pass left behind, across every journal it looked at -- a
+    // GAUGE, not a cumulative count, and deliberately so. GC stops at the first segment it
+    // cannot reclaim, so `pinned` census + `deleted` on the same pass is the pair that
+    // answers "is retention keeping up?" (debt D-39 asks for exactly this comparison). A
+    // running total would be meaningless: the same retained segment would be counted again
+    // on every pass until its group compacts.
+    uint64_t journalSegmentsPinnedLastPass() const { return journalSegmentsPinnedLastPass_; }
     uint64_t journalRecordsCopiedForward() const { return journalRecordsCopiedForward_; }
     uint64_t journalGcPasses() const { return journalGcPasses_; }
 
@@ -362,7 +368,7 @@ private:
     seastar::lowres_clock::time_point lastJournalGc_{};
     bool journalGcRunning_ = false;  // one pass at a time (it suspends over file I/O)
     uint64_t journalSegmentsDeleted_ = 0;
-    uint64_t journalSegmentsPinned_ = 0;
+    uint64_t journalSegmentsPinnedLastPass_ = 0;
     uint64_t journalRecordsCopiedForward_ = 0;
     uint64_t journalGcPasses_ = 0;
 };

@@ -268,8 +268,20 @@ TEST(JournalSinkTest, SyncAfterStopFailsRatherThanHangs) {
 // ASSERTED WITH AN ORDERING TOKEN, not a clock. Both sides stamp a shared monotonic step
 // counter; the exclusive section's stamps must come out CONTIGUOUS, i.e. no round stamp
 // ever falls between them. A sleep-versus-fdatasync race would pass against broken code
-// on slow storage; a contiguity check cannot -- it is a statement about the sequence, and
-// the yield loop below hands the reactor many chances to violate it.
+// on slow storage, which is exactly how the first version of this test failed to detect
+// an unlocked runExclusive.
+//
+// The detector still needs the competing round's barrier to actually COMPLETE while the
+// section is open, so the wait below yields UNTIL THE ROUND STAMPS -- up to a generous
+// turn cap -- rather than a fixed number of turns. That is the difference that makes its
+// power independent of disk speed: a slow fdatasync costs more reactor turns, and the loop
+// simply spends more of them. (Under the FIXED code the round can never stamp, so the loop
+// always runs to the cap; a few thousand reactor turns is microseconds of scheduling.)
+// Reactor turns the exclusive section will wait for the competing round to finish. Only an
+// upper bound: the loop exits as soon as the round stamps, which is the failure it is
+// looking for.
+constexpr int kMaxWaitTurns = 20000;
+
 seastar::future<> testRunExclusiveHoldsOffGroupCommitRounds() {
     const auto dir = tmpDir("exclusive");
     JournalWriter w(dir, header(), 1u << 20);
@@ -287,13 +299,11 @@ seastar::future<> testRunExclusiveHoldsOffGroupCommitRounds() {
         exclusiveSteps.push_back(++step);
         co_await w.append(rec(1, 1, "relocated-a"));
         exclusiveSteps.push_back(++step);
-        // Hand the reactor many chances to run a queued round. `yield()` ALWAYS defers --
-        // `coroutine::maybe_yield` does not (it only yields under preemption pressure, so
-        // in a tight loop it is a no-op and the round never gets a turn, which made an
-        // earlier version of this test pass against the unlocked code). No wall-clock is
-        // involved: this is a count of scheduling turns, so slower storage makes the test
-        // MORE adversarial, never less.
-        for (int i = 0; i < 256; ++i)
+        // `yield()` ALWAYS defers -- `coroutine::maybe_yield` does not (it only yields
+        // under preemption pressure, so in a tight loop it is a no-op and the round never
+        // gets a turn, which made an earlier version of this test pass against the
+        // unlocked code).
+        for (int i = 0; i < kMaxWaitTurns && roundSteps.empty(); ++i)
             co_await seastar::yield();
         exclusiveSteps.push_back(++step);
         co_await w.append(rec(1, 2, "relocated-b"));

@@ -367,6 +367,7 @@ seastar::future<size_t> ReplicatedVShardHost::reclaimJournalSegments() {
     auto held = snapshotGate_.hold();
     journalGcRunning_ = true;
     size_t deleted = 0;
+    size_t pinned = 0;  // census for THIS pass; see journalSegmentsPinnedLastPass()
     std::exception_ptr err;
     try {
         publishReclaimFloors();
@@ -388,7 +389,7 @@ seastar::future<size_t> ReplicatedVShardHost::reclaimJournalSegments() {
             auto result = co_await JournalGc::collect(dir, active, *sharedWriter_, retention_, JournalGc::Options{},
                                                       sharedSink_.get());
             deleted += result.deletedSegments.size();
-            journalSegmentsPinned_ += result.pinnedSegments.size();
+            pinned += result.pinnedSegments.size();
             journalRecordsCopiedForward_ += result.copiedRecords;
         } else {
             // PER-VSHARD LAYOUT (the default). Each directory holds exactly one group's
@@ -415,7 +416,7 @@ seastar::future<size_t> ReplicatedVShardHost::reclaimJournalSegments() {
                 // retries rather than skipping a directory it never finished.
                 state.lastGcFloor = floor;
                 deleted += result.deletedSegments.size();
-                journalSegmentsPinned_ += result.pinnedSegments.size();
+                pinned += result.pinnedSegments.size();
             }
         }
     } catch (...) {
@@ -423,6 +424,7 @@ seastar::future<size_t> ReplicatedVShardHost::reclaimJournalSegments() {
     }
     journalGcRunning_ = false;
     journalSegmentsDeleted_ += deleted;
+    journalSegmentsPinnedLastPass_ = pinned;  // a gauge: replaced, never accumulated
     if (err)
         std::rethrow_exception(err);
     co_return deleted;

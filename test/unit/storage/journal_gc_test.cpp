@@ -207,8 +207,10 @@ seastar::future<> testDeleteOnlyPinsASegmentWithLiveRecords() {
     EXPECT_TRUE(result.deletedSegments.empty()) << "a segment holding un-snapshotted state must survive";
     EXPECT_EQ(result.copiedRecords, 0u) << "delete-only must never write to the journal";
     // GC STOPS at the first segment it cannot reclaim rather than skipping ahead, so what
-    // survives is a physical suffix -- exactly ONE pin is reported, and it is the oldest.
-    EXPECT_EQ(result.pinnedSegments.size(), 1u);
+    // survives is a physical suffix -- and `pinnedSegments` is the CENSUS of that suffix
+    // (every sealed segment left behind), not just the one that halted the pass.
+    EXPECT_EQ(result.pinnedSegments.size(), before - 1);
+    EXPECT_EQ(result.pinnedSegments.front(), 0u) << "the halting segment is the oldest sealed one";
     EXPECT_EQ(segmentFileCount(dir), before);
     co_await w.close();
 
@@ -273,7 +275,8 @@ seastar::future<> testCopyForwardRespectsItsBudget() {
                                               JournalGc::Options{.copyForward = true, .maxCopyForwardRecords = 0});
     EXPECT_EQ(result.copiedRecords, 0u);
     EXPECT_TRUE(result.deletedSegments.empty());
-    EXPECT_EQ(result.pinnedSegments.size(), 1u) << "GC stops at the first over-budget segment";
+    EXPECT_EQ(result.pinnedSegments.size(), before - 1)
+        << "GC stops at the first over-budget segment and reports every sealed segment it leaves behind";
     EXPECT_EQ(segmentFileCount(dir), before);
     co_await w.close();
     fs::remove_all(dir);

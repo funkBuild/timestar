@@ -63,7 +63,10 @@ public:
     struct Result {
         std::vector<uint64_t> deletedSegments;      // segment numbers removed
         std::vector<uint64_t> copyForwardSegments;  // sealed segments whose live records were moved
-        std::vector<uint64_t> pinnedSegments;       // left in place: still hold live records
+        // Every sealed segment this pass LEFT BEHIND, oldest first -- a census, not just
+        // the one that halted the pass. Because GC stops at the first unreclaimable
+        // segment, that is the halting segment and everything after it.
+        std::vector<uint64_t> pinnedSegments;
         uint64_t copiedRecords = 0;
         uint64_t copiedBytes = 0;  // encoded body bytes copied forward
     };
@@ -93,7 +96,7 @@ private:
     // exclusive section when there is one. A NAMED static coroutine, never a coroutine
     // lambda handed to runExclusive -- such a lambda's frame points at a closure the helper
     // owns.
-    static seastar::future<> copyForward(JournalWriter& writer, uint64_t oldestKeptSegment,
+    static seastar::future<> copyForward(JournalWriter& writer, uint64_t reclaimedSegment,
                                          std::vector<JournalRecord> records, Result* out);
 };
 

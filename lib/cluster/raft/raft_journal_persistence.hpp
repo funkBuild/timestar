@@ -141,6 +141,15 @@ public:
     // disk, so its oldest-live-entry term would be the first entry appended AFTER the
     // restart -- a much HIGHER seq -- and the floor would jump over the recovered
     // entries and release records the log still needs.
+    //
+    // CALLABLE EXACTLY ONCE, AND ONLY BEFORE THE FIRST APPEND. It promotes the seeded
+    // value straight into `durableFloor_`, which is sound only because RECOVERED records
+    // came off the disk -- an fsync already covered them. Called after an append, it would
+    // promote a floor derived from records that are merely BUFFERED, which is precisely
+    // the intent-versus-durability bug this class was rewritten to eliminate. Enforced
+    // (throws std::logic_error) rather than left to a comment: the enforcement costs a
+    // branch on a path that runs once per group per process, and the thing it prevents is
+    // a replica restarting with no vote.
     void seedRetention(JournalRetentionSeed seed);
 
 private:
@@ -149,6 +158,8 @@ private:
     JournalSink& sink_;
     VShardId vshard_;
     uint64_t nextSeq_;
+    const uint64_t startSeq_;  // nextSeq_ as constructed; seedRetention proves nothing was appended
+    bool seeded_ = false;
 
     // The floor implied by everything APPENDED so far, durable or not. Never returned to
     // a caller; only sampled at sync() entry and promoted into durableFloor_ once that

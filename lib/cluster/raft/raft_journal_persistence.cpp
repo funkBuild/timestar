@@ -79,10 +79,14 @@ std::optional<Snapshot> decodeSnapshotPayload(const std::string& p, bool* receiv
 }  // namespace
 
 JournalRaftPersistence::JournalRaftPersistence(JournalWriter& writer, VShardId vshard, uint64_t startSeq)
-    : owned_(std::in_place, writer), sink_(*owned_), vshard_(vshard), nextSeq_(startSeq == 0 ? 1 : startSeq) {}
+    : owned_(std::in_place, writer),
+      sink_(*owned_),
+      vshard_(vshard),
+      nextSeq_(startSeq == 0 ? 1 : startSeq),
+      startSeq_(nextSeq_) {}
 
 JournalRaftPersistence::JournalRaftPersistence(JournalSink& sink, VShardId vshard, uint64_t startSeq)
-    : sink_(sink), vshard_(vshard), nextSeq_(startSeq == 0 ? 1 : startSeq) {}
+    : sink_(sink), vshard_(vshard), nextSeq_(startSeq == 0 ? 1 : startSeq), startSeq_(nextSeq_) {}
 
 seastar::future<> JournalRaftPersistence::appendFenced(const JournalRecord& r) {
     // A failed append means the bookkeeping above already counted a record that is not in
@@ -110,6 +114,16 @@ uint64_t JournalRaftPersistence::intendedFloor() const {
 }
 
 void JournalRaftPersistence::seedRetention(JournalRetentionSeed seed) {
+    // See the header: the promotion below is sound ONLY for records that are already on
+    // disk. Fail loudly rather than let a second caller (or a caller placed after the
+    // first append) launder buffered state into the durable watermark.
+    if (seeded_)
+        throw std::logic_error("JournalRaftPersistence::seedRetention called twice");
+    if (nextSeq_ != startSeq_)
+        throw std::logic_error(
+            "JournalRaftPersistence::seedRetention called after a record was appended; the seeded floor may only be "
+            "promoted from RECOVERED (already durable) records");
+    seeded_ = true;
     lastHardStateSeq_ = seed.latestHardStateSeq;
     lastSnapshotSeq_ = seed.latestSnapshotSeq;
     entrySeqs_.assign(seed.entrySeqs.begin(), seed.entrySeqs.end());
