@@ -220,3 +220,53 @@ TEST(JournalRecordTest, EncodedBytesMatchesTheRealEncodingForEveryPayloadShape) 
         EXPECT_EQ(r.encodedBytes(), r.encode().size()) << "payload size " << payload.size();
     }
 }
+
+// NOT TESTED HERE, DELIBERATELY, AND THIS IS THE PLACE A READER WILL LOOK FOR IT (debt
+// D-32, review F4): that `encodeInto` never leaves a PARTIAL frame behind. Writing the
+// frame in place gave up the all-or-nothing a scratch string had for free, and the
+// consequence would be worse than a lost record -- a throw between the length prefix and
+// the payload leaves the writer's buffer holding a partial frame with a valid-looking
+// length, the next barrier persists it, and recovery reads the segment as torn FROM THAT
+// POINT, discarding every later record.
+//
+// Two things make it safe, and neither is externally observable, which is why there is no
+// test rather than a weak one: (1) the whole frame's capacity is taken in ONE reservation
+// before the first byte is written, so no write can reallocate and none can throw; (2) any
+// exception unwinds the buffer to where it started. Observing (1) needs the reallocation
+// COUNT during a single call, which nothing outside std::string can see -- final capacity
+// is identical either way on libstdc++, since a trailing append lands on the same figure
+// the reservation would have. Forcing (2) needs `operator new` to fail on demand, and
+// seastar owns `operator new` process-wide in this binary; an override to test one function
+// would change allocation for every other test in it.
+
+// GEOMETRIC GROWTH (debt D-32, review F5). `JournalWriter::tail_` is appended to record
+// after record, and an exact reserve per record would in principle re-pay a reallocation
+// on every append -- O(K^2) copying over a burst of K records.
+//
+// READ THIS BEFORE TREATING IT AS A REGRESSION TEST: it is a PROPERTY test and its negative
+// control does NOT fail. Reverting encodeInto to an exact reserve leaves it green, because
+// libstdc++'s `_M_create` already clamps a growth request up to at least twice the old
+// capacity (measured: an exact-reserve loop of 1000 appends reallocates 11 times, not
+// 1000). What this pins is the property itself -- appending K records must not cost K
+// reallocations -- which would catch a future edit that reintroduces the cost some other
+// way, or a standard library that does not clamp.
+TEST(JournalRecordTest, AppendingManyRecordsReallocatesLogarithmicallyNotEveryTime) {
+    const JournalRecord r = sample(1, 1, JournalRecordKind::Data, std::string(512, 'z'));
+
+    std::string tail;
+    const char* last = tail.data();
+    size_t reallocs = 0;
+    constexpr int kRecords = 1000;
+    for (int i = 0; i < kRecords; ++i) {
+        r.encodeInto(tail);
+        if (tail.data() != last) {
+            ++reallocs;
+            last = tail.data();
+        }
+    }
+
+    EXPECT_EQ(tail.size(), static_cast<size_t>(kRecords) * r.encodedBytes());
+    // Doubling from empty reaches ~520 KB in ~20 steps.
+    EXPECT_LE(reallocs, 40u) << "reallocated " << reallocs << " times over " << kRecords
+                             << " appends -- something has made the tail buffer grow linearly";
+}

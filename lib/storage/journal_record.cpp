@@ -2,8 +2,10 @@
 
 #include "crc32.hpp"
 
+#include <algorithm>
 #include <cassert>
 #include <cstdint>
+#include <new>
 
 // decode() computes frameLen = kFrameHeaderBytes + bodyLen with bodyLen a u32;
 // this is overflow-safe only because size_t is wider than u32 on the target.
@@ -61,21 +63,60 @@ void JournalRecord::encodeInto(std::string& out) const {
     // is only known after, so the CRC field is reserved and PATCHED IN PLACE; the length is
     // known up front from encodedBytes()'s arithmetic.
     const size_t bodyLen = kBodyHeaderBytes + payload.size();
-    out.reserve(out.size() + kFrameHeaderBytes + bodyLen);
-    putU32(out, static_cast<uint32_t>(bodyLen));
-    const size_t crcOff = out.size();
-    putU32(out, 0);  // patched below
-    const size_t bodyOff = out.size();
-    putU16(out, vshard.value());
-    putU64(out, vshardSeq);
-    putU64(out, raftTerm);
-    putU64(out, raftIndex);
-    out.push_back(static_cast<char>(kind));
-    out.append(payload);
-    assert(out.size() - bodyOff == bodyLen && "encodedBytes() and encodeInto() disagree");
-    const uint32_t crc = CRC32::compute(out.data() + bodyOff, bodyLen);
-    for (int i = 0; i < 4; ++i)
-        out[crcOff + i] = static_cast<char>((crc >> (i * 8)) & 0xff);
+
+    // ALL OR NOTHING (review F4). Writing in place gave up the all-or-nothing that building
+    // a scratch string and appending it had for free, and the consequence is worse than a
+    // lost record: a throw between the length prefix and the payload leaves `out` -- which
+    // for the one production caller IS `JournalWriter::tail_` -- holding a PARTIAL frame
+    // with a valid-looking length. The next barrier writes it to disk, and recovery reads
+    // the segment as torn FROM THAT POINT, discarding every later record too. So the write
+    // is unwound to exactly where it started on any exception.
+    const size_t mark = out.size();
+    // GEOMETRIC, NOT EXACT (review F5) -- AND MEASURED, because the premise turned out not
+    // to hold on this toolchain. The concern is real in principle: an exact reserve on a
+    // buffer that is APPENDED TO repeatedly would defeat the amortization std::string
+    // otherwise gives it, every record in a burst re-paying a reallocation for O(K^2)
+    // copying over a window of K appends. On libstdc++ it does NOT happen, because
+    // `_M_create` clamps any growth request up to at least twice the old capacity: an
+    // exact-reserve loop of 1000 appends reallocates 11 times, not 1000 (measured). So
+    // this is portability insurance and an explicit statement of intent, not a fix for a
+    // live regression -- and the test below therefore pins the PROPERTY and cannot fail on
+    // the exact-reserve shape here. Ask for double the capacity when growth is needed, take
+    // the exact figure only when it is larger (a single huge snapshot record), and if the
+    // doubled figure is the thing that cannot be allocated, fall back to the exact one
+    // rather than failing a write that would have fit.
+    //
+    // RESERVING THE WHOLE FRAME UP FRONT IS ALSO WHAT MAKES THE WRITES BELOW UNABLE TO
+    // THROW (review F4): with the capacity already in hand, every put/append is a memcpy
+    // into it and nothing reallocates, so the half-written-frame window does not exist to
+    // be hit. The unwind is kept as defence for a future edit that adds an allocating step.
+    const size_t needed = mark + kFrameHeaderBytes + bodyLen;
+    if (needed > out.capacity()) {
+        try {
+            out.reserve(std::max(needed, out.capacity() * 2));
+        } catch (const std::bad_alloc&) {
+            out.reserve(needed);
+        }
+    }
+    try {
+        putU32(out, static_cast<uint32_t>(bodyLen));
+        const size_t crcOff = out.size();
+        putU32(out, 0);  // patched below
+        const size_t bodyOff = out.size();
+        putU16(out, vshard.value());
+        putU64(out, vshardSeq);
+        putU64(out, raftTerm);
+        putU64(out, raftIndex);
+        out.push_back(static_cast<char>(kind));
+        out.append(payload);
+        assert(out.size() - bodyOff == bodyLen && "encodedBytes() and encodeInto() disagree");
+        const uint32_t crc = CRC32::compute(out.data() + bodyOff, bodyLen);
+        for (int i = 0; i < 4; ++i)
+            out[crcOff + i] = static_cast<char>((crc >> (i * 8)) & 0xff);
+    } catch (...) {
+        out.resize(mark);  // never leave a half-written frame behind
+        throw;
+    }
 }
 
 std::string JournalRecord::encode() const {
