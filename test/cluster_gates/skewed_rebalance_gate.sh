@@ -340,8 +340,10 @@ STORM_TPUT=$(grep -oE 'Throughput:[[:space:]]*[0-9.]+' /tmp/tsgate_sk_bench.txt 
 # the 503s bounded above, so a p99 bound would mostly re-assert the error ceiling. Bounding
 # the tail honestly needs its own calibration across more runs than four; until then the
 # numbers are printed so a drift is visible.
-CTL_P99=$(grep -oE 'p99=[[:space:]]*[0-9.]+' /tmp/tsgate_sk_control.txt | head -1 | grep -oE '[0-9.]+')
-STORM_P99=$(grep -oE 'p99=[[:space:]]*[0-9.]+' /tmp/tsgate_sk_bench.txt | head -1 | grep -oE '[0-9.]+')
+# `sed` and not a second `grep -oE '[0-9.]+'`: the LABEL contains digits, so that pipeline
+# returns "99" from "p99" before the value and the variable ends up holding two lines.
+CTL_P99=$(grep -oE 'p99=[[:space:]]*[0-9.]+' /tmp/tsgate_sk_control.txt | head -1 | sed 's/.*p99=[[:space:]]*//')
+STORM_P99=$(grep -oE 'p99=[[:space:]]*[0-9.]+' /tmp/tsgate_sk_bench.txt | head -1 | sed 's/.*p99=[[:space:]]*//')
 echo "  batch latency p99: control ${CTL_P99:-?} ms -> storm ${STORM_P99:-?} ms (NOT bounded by this gate)"
 STORM_PCT=$(awk -v a="${STORM_TPUT:-0}" -v b="${CTL_TPUT:-0}" 'BEGIN{ if (b+0==0) print 0; else printf "%d", 100*a/b }')
 echo "  throughput under the storm: ${STORM_TPUT:-?} vs control ${CTL_TPUT:-?} (${STORM_PCT}%)"
