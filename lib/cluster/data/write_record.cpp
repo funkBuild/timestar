@@ -35,6 +35,7 @@ uint64_t fnv1a(const char* p, size_t n) {
 // bits, so NaN payloads, +/-Inf and -0.0 survive exactly, and int64 keeps full
 // 64-bit precision.
 constexpr char kV2Magic[4] = {'T', 'S', 'W', '2'};
+static_assert(sizeof(kV2Magic) == kWriteBatchV2MagicBytes, "the charge arithmetic in the header counts this magic");
 constexpr size_t kTrailerBytes = 8;  // fnv1a checksum
 
 // A varint is at most 10 bytes (64 bits / 7).

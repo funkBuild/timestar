@@ -193,12 +193,99 @@ TEST(WriteSliceSizeChainTest, TheProposalBoundIsDerivedFromTheFrameBound) {
     // reader looking for the numbers will find them. If these move, D-31's derivation has
     // been broken and the register row is no longer true.
     static_assert(timestar::raft::RaftGroup::kMaxProposalBytes == timestar::raft::kMaxRaftPayloadBytes);
-    static_assert(kMaxOutboundFrameBytes + kWriteCommandFramingBytes < timestar::raft::RaftGroup::kMaxProposalBytes,
-                  "any frame the data plane will send must be proposable");
+    static_assert(chargeCeilingForV1Bytes(kMaxOutboundFrameBytes) + kWriteCommandFramingBytes <=
+                      timestar::raft::RaftGroup::kMaxProposalBytes,
+                  "any frame the data plane will send must be proposable AS CHARGED -- comparing raw bytes here "
+                  "is review F1's bug, and passes while a maximal boolean frame is refused");
     static_assert(timestar::raft::RaftGroup::kMaxProposalBytes < 2 * kMaxOutboundFrameBytes,
                   "the entry bound is the wire bound plus margin, not an independent opinion");
 
-    EXPECT_EQ(timestar::raft::kMaxRaftPayloadBytes, size_t{12} << 20);
-    EXPECT_EQ(timestar::raft::kMaxRaftSendBytes, size_t{16} << 20);
+    EXPECT_EQ(timestar::raft::kMaxRaftPayloadBytes, size_t{14} << 20);
+    EXPECT_EQ(timestar::raft::kMaxRaftSendBytes, size_t{18} << 20);
     EXPECT_EQ(kMaxOutboundFrameBytes, (size_t{128} << 20) / 12);
+}
+
+// ---------------------------------------------------------------------------
+// 4. The charge ratio, and the frame it has to cover (review F1)
+// ---------------------------------------------------------------------------
+
+// `chargeCeilingForV1Bytes` is what relates the wire bound to the proposal bound, so 11/9
+// had better be a real ceiling and not a plausible one. v1's cheapest point is a boolean
+// (8-byte timestamp + 1-byte value) and the charge adds 2 per point, so booleans bind at
+// 11/9 and everything else is further under.
+TEST(WriteSliceSizeChainTest, TheChargeNeverExceedsElevenNinthsOfAV1Encoding) {
+    struct Case {
+        const char* what;
+        WriteBatch batch;
+    };
+    std::vector<Case> cases;
+    {
+        WriteBatch b;
+        b.series.push_back(boolSeries("b,host=a v", 20000, 1));
+        cases.push_back({"boolean (the binding case)", std::move(b)});
+    }
+    {
+        WriteBatch b;
+        b.series.push_back(floatSeries("f,host=a v", 20000, 1));
+        cases.push_back({"float", std::move(b)});
+    }
+    {
+        WriteBatch b;
+        b.series.push_back(intSeries("i,host=a v", 20000));
+        cases.push_back({"integer", std::move(b)});
+    }
+    {
+        WriteBatch b;
+        b.series.push_back(stringSeries("s,host=a v", 20000));
+        cases.push_back({"string", std::move(b)});
+    }
+
+    for (const auto& c : cases) {
+        const size_t v1 = encodeWriteBatch(c.batch, kWriteBatchFormatV1).size();
+        const size_t charge = maxEncodedBytes(c.batch);
+        EXPECT_LE(charge, chargeCeilingForV1Bytes(v1)) << c.what << ": the ratio is not a ceiling";
+        EXPECT_GE(charge, encodeWriteBatch(c.batch, kWriteBatchFormatV2).size()) << c.what;
+    }
+
+    // ...and the boolean case really is close to the ratio, so the constant is not slack
+    // that happens to hold. (If this drifts far below, the ratio has stopped describing the
+    // format and the chain is being sized against a fiction.)
+    const size_t v1 = encodeWriteBatch(cases[0].batch, kWriteBatchFormatV1).size();
+    EXPECT_GT(maxEncodedBytes(cases[0].batch) * 100 / v1, 121u) << "boolean charge should sit at ~11/9 of v1";
+}
+
+// THE REGRESSION REVIEW F1 FOUND. A frame filled to `kMaxOutboundFrameBytes` in the
+// PESSIMAL encoding (v1) must still be proposable -- otherwise a forwarded write that the
+// data plane happily admits is refused with a terminal 413 at the entry bound. At a 12 MiB
+// proposal bound this failed for booleans by ~1.09 MB and passed for floats by ONE byte.
+TEST(WriteSliceSizeChainTest, AMaximalV1FrameIsProposableForEveryType) {
+    const size_t frame = kMaxOutboundFrameBytes;
+
+    auto fillToFrame = [&](TSMValueType type) {
+        // Per-point v1 cost: 8-byte timestamp + the value column.
+        const size_t perPoint = type == TSMValueType::Boolean ? 9 : 16;
+        const size_t points = (frame - 64) / perPoint;
+        WriteBatch b;
+        b.series.push_back(type == TSMValueType::Boolean ? boolSeries("m,host=a v", points, 1)
+                                                         : floatSeries("m,host=a v", points, 1));
+        // NO REVISIONS, which is both what a forwarded slice really carries (they are
+        // assigned at APPLY from the log position, ADR 0003) and the pessimal shape for the
+        // charge ratio -- a revision column adds 8 v1 bytes per point and no charge, so
+        // carrying one would make the test easier to pass and prove less.
+        b.series.back().revisions.clear();
+        return b;
+    };
+
+    for (TSMValueType type : {TSMValueType::Boolean, TSMValueType::Float}) {
+        WriteBatch b = fillToFrame(type);
+        const size_t v1 = encodeWriteBatch(b, kWriteBatchFormatV1).size();
+        ASSERT_LE(v1, frame) << "the test must build a frame the data plane would actually SEND";
+        ASSERT_GT(v1, frame - 4096) << "...and one that is essentially FULL, or it proves nothing";
+
+        VShardBatches groups;
+        groups.emplace_back(uint16_t{11}, std::move(b));
+        EXPECT_FALSE(firstUnproposableSlice(viewOf(groups), timestar::raft::RaftGroup::kMaxProposalBytes).has_value())
+            << (type == TSMValueType::Boolean ? "boolean" : "float")
+            << ": a maximal frame the wire admits must be proposable, charge and all";
+    }
 }

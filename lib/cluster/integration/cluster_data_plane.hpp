@@ -80,19 +80,29 @@ static_assert(kRaftHeartbeatTicks < kRaftElectionTicksMin, "a leader must heartb
 // data plane will carry" -- reaches into data/dataplane_limits.hpp, which the deterministic
 // Raft core must not include. This header includes both, which is why the join lives here
 // (the same reason the tick-period assertions above do).
-static_assert(data::kMaxOutboundFrameBytes + data::kWriteCommandFramingBytes < raft::RaftGroup::kMaxProposalBytes,
-              "a write frame the data plane will SEND must be proposable as a Raft entry, or the largest "
-              "legitimate batch fails at the leader with an opaque remote error [debt D-31]");
+// IN THE CHARGE UNIT, NOT IN RAW BYTES (review F1). The refusal this guards
+// (`firstUnproposableSlice`) compares `maxEncodedBytes(slice) + framing` against the
+// proposal bound -- a CHARGE, up to 11/9 of a v1 encoding, because the journal gate's
+// format version is independent of the one the frame arrived in. The first version of this
+// assertion compared raw frame bytes, which left it unable to fire on the very mismatch it
+// exists to catch: at a 12 MiB proposal bound it passed with ~1.3 MiB of apparent headroom
+// while a maximal float frame cleared the real bound by ONE byte and a maximal boolean
+// frame was refused outright.
+static_assert(data::chargeCeilingForV1Bytes(data::kMaxOutboundFrameBytes) + data::kWriteCommandFramingBytes <=
+                  raft::RaftGroup::kMaxProposalBytes,
+              "a write frame the data plane will SEND must be proposable as a Raft entry AS CHARGED, or a "
+              "legitimate forwarded batch draws a terminal 413 [debt D-31]");
 // ...and the proposal bound must not be so far above it that it has stopped being derived
 // from anything. Two frames' worth is the slack budget; more than that is the pre-D-31
 // state, where the number floated free of every producer.
 static_assert(raft::RaftGroup::kMaxProposalBytes < 2 * data::kMaxOutboundFrameBytes,
               "the Raft entry bound is meant to be the wire bound plus margin, not an independent opinion "
               "[debt D-31]");
-// The one number the RPC layer refuses on, restated against the data plane's: both
-// transports run on the same reactor with fixed memory, so a Raft frame may not be able to
-// dwarf a data frame.
-static_assert(raft::kMaxRaftSendBytes <= data::kMaxInboundRpcMemory, "[debt D-31]");
+// (The chain's last link -- send refusal vs the peer's RAFT inbound admission -- is
+// asserted in raft_types.hpp, which owns both constants. It used to be stated HERE against
+// `data::kMaxInboundRpcMemory`, the DATA plane's 128 MiB budget, which never admits a Raft
+// frame at all: a comparison that could not fail and would not have meant anything if it
+// had. Review F3.)
 
 // The node-level composition that wires every M2 brick into one live service
 // (integration plan M2): ClusterRuntime placement -> EngineLocalStore sink ->

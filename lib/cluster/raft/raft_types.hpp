@@ -71,10 +71,10 @@ public:
 //
 // One chain, four numbers, each a consequence of the one above it:
 //
-//     largest producer PAYLOAD          12 MiB   kMaxRaftPayloadBytes
+//     largest producer PAYLOAD          14 MiB   kMaxRaftPayloadBytes
 //   + envelope/framing headroom        + 4 MiB   kRaftEnvelopeHeadroomBytes
 //   ------------------------------------------
-//   <= transport SEND refusal           16 MiB   kMaxRaftSendBytes
+//   <= transport SEND refusal           18 MiB   kMaxRaftSendBytes
 //   <= peer inbound ADMISSION           64 MiB   kMaxInboundRaftMemory
 //
 // WHY IT HAS TO BE A CHAIN AND NOT FOUR OPINIONS. The Raft deliver verb is seastar
@@ -105,7 +105,7 @@ public:
 // So `kMaxProposalBytes` is what the chain is sized for: a log entry is ONE VShard's
 // slice of ONE write batch.
 //
-// WHAT D-31 CHANGED: 28 MiB -> 12 MiB, i.e. the proposal bound is now DERIVED from the
+// WHAT D-31 CHANGED: 28 MiB -> 14 MiB, i.e. the proposal bound is now DERIVED from the
 // largest slice the data plane will actually carry instead of being a round number
 // chosen above it. D-5 left the number at 28 MiB and filed the rest, on the reading that
 // closing it required SPLITTING an oversized slice across several proposals (a write-path
@@ -123,23 +123,39 @@ public:
 //     encoded COMMAND could exceed this bound, so the remote path fails as a local 413
 //     naming the VShard instead of an opaque remote error retried against every leader.
 //
-// 12 MiB is that ~10.67 MiB plus ~1.3 MiB of margin, and the relationship is asserted in
-// `cluster_data_plane.hpp` (the D-20 pattern) because the two constants live in headers
-// that do not include each other. The margin is not a guess: the command adds 13 bytes of
-// framing to the batch, and a slice re-encoded at a DIFFERENT format version than the
-// frame it arrived in can grow (v2's zigzag timestamp deltas are 1-10 bytes where v1's
-// are a flat 8, and the journal gate's version is independent of the peer's) -- see
-// `maxEncodedBytes` in data/write_record.hpp, which is what the refusal measures.
+// 14 MiB IS THAT FRAME BOUND EXPRESSED IN THE UNIT THE REFUSAL ACTUALLY USES, and getting
+// that wrong is what review F1 caught in the first version of this work. The refusal does
+// not compare a slice's BYTES against this number, it compares its CHARGE -- what
+// `maxEncodedBytes` says the slice could encode to under the worst format version, because
+// the journal gate's version is independent of the version the frame arrived in. A charge
+// is up to 11/9 of a v1 encoding (see kChargeOverV1Num in data/write_record.hpp: v1's
+// cheapest point is a 9-byte boolean and the charge adds 2 per point), so the number this
+// chain must clear is not 10.67 MB but:
 //
-// A batch that legitimately reaches even the OLD bound does not exist: a whole 10k-point
-// HTTP batch encodes ~1-2 MB and spreads over many of 4096 VShards, so 12 MiB on ONE
-// VShard is already ~10x the largest legitimate batch entire. What the drop really costs
-// is the adversarial shape -- a 64 MiB body whose points all hash to one VShard -- which
-// used to succeed with a 12-28 MiB Raft entry IF the coordinator happened to be that
-// VShard's leader, and got a 413 otherwise. That placement-dependent success is gone: it
-// is a 413 on both paths now.
+//     chargeCeilingForV1Bytes(kMaxOutboundFrameBytes) + kWriteCommandFramingBytes
+//       = 10.67 MB * 11/9 + 4 + 13  ~=  13.67 MB
 //
-// RESIDUAL (D-31): 12 MiB is still 3x a chunk. Closing the rest needs the split.
+// which 12 MiB did NOT clear. Measured on real batches: a maximal FLOAT frame charges
+// 12,582,911 bytes against a 12,582,912-byte bound -- one byte of margin, not the ~1.3 MiB
+// this comment used to claim -- and a maximal BOOLEAN frame charges ~13.67 MB and was
+// REFUSED, i.e. a forwarded ~1.24M-point boolean write that proposed cleanly at 28 MiB
+// drew a terminal 413. 14 MiB clears the boolean case with ~1 MB to spare, and the
+// relationship is asserted IN THE CHARGE UNIT in `cluster_data_plane.hpp` (the D-20
+// pattern), because an assertion on raw bytes cannot fire on the mismatch it exists to
+// catch.
+//
+// WHAT THIS STILL NARROWS, stated with numbers rather than "the largest legitimate payload
+// is untouched" (which was wrong). The bound the assertion guarantees is over a frame whose
+// OWN encoding is v1 -- the pessimal one. A v2 frame carries up to 8x more timestamps per
+// byte, so a slice that fits the wire bound in v2 can re-encode far above this: a boolean
+// slice whose v1 entry is 12.7-28 MB rides a v2 frame of 2.3-5.1 MB and USED to propose at
+// the 28 MiB bound. It now gets a 413. That shape is a single VShard of 4096 holding >1.4M
+// points from one request -- the adversarial concentration this bound exists to refuse,
+// not a batch shape a client produces by spreading writes -- and it is refused LOCALLY and
+// terminally, naming the VShard, rather than becoming an opaque remote error. It is a real
+// narrowing all the same, and the register row says so.
+//
+// RESIDUAL (D-31): 14 MiB is still 3.5x a chunk. Closing the rest needs the split.
 //
 // These live in the shared types header, not in a transport header, precisely so the
 // deterministic core can know them without depending on I/O.
@@ -147,7 +163,7 @@ public:
 // The PAYLOAD is now the primary of the three (it is the one with an external
 // justification) and the send bound is derived from it; before D-31 it was the other way
 // round, which is what let the payload bound float free of anything that produces one.
-inline constexpr size_t kMaxRaftPayloadBytes = size_t{12} << 20;
+inline constexpr size_t kMaxRaftPayloadBytes = size_t{14} << 20;
 inline constexpr size_t kRaftEnvelopeHeadroomBytes = size_t{4} << 20;
 inline constexpr size_t kMaxRaftSendBytes = kMaxRaftPayloadBytes + kRaftEnvelopeHeadroomBytes;
 
@@ -157,13 +173,26 @@ inline constexpr size_t kMaxRaftSendBytes = kMaxRaftPayloadBytes + kRaftEnvelope
 // refusal must fit under it (or a frame is dropped with no reply, a silent lost replica),
 // and the shard-level snapshot transfer cap is a QUARTER of it (debt D-37).
 //
-// DELIBERATELY NOT RETUNED when D-31 halved the send bound: this is a budget for
+// DELIBERATELY NOT RETUNED when D-31 brought the send bound down: this is a budget for
 // CONCURRENCY, not a per-message bound, so it is the one link slack belongs in. It was 2x
-// the send bound and is now 4x. One shard hosts ~1365 groups whose heartbeats and appends
+// the send bound and is now ~3.5x. One shard hosts ~1365 groups whose heartbeats and appends
 // share it; at 4 MiB per snapshot chunk it is also 16 simultaneous chunk transfers before
 // frames merely QUEUE on the semaphore (they are not dropped -- only an over-max_memory
 // frame is), which is the aggregate D-37 caps explicitly on the send side.
 inline constexpr size_t kMaxInboundRaftMemory = size_t{64} << 20;
+
+// THE LAST LINK, ASSERTED (debt D-31, review F3). This is the link whose failure mode is
+// the worst in the whole chain -- a frame over the receiver's `max_memory` is dropped with
+// NO REPLY on a `no_wait` verb, i.e. a replica lost in silence -- and until the two
+// constants lived in the same header it was the one link nothing could state. It is not
+// enough that a single message fits: the budget is shared, so a send bound EQUAL to it
+// would mean one maximal message monopolises the receiver.
+static_assert(kMaxRaftSendBytes < kMaxInboundRaftMemory,
+              "a Raft frame this node will SEND must fit -- with room for concurrent ones -- inside what a peer "
+              "will ADMIT, or it is dropped with no reply and the replica is lost in silence [debt D-31]");
+static_assert(kMaxRaftSendBytes * 3 <= kMaxInboundRaftMemory,
+              "the peer's inbound budget is a CONCURRENCY budget: at least a few maximal messages must fit at "
+              "once, or heartbeats queue behind one append [debt D-31]");
 
 // The largest slice of a snapshot payload one InstallSnapshot may carry (D-5).
 //
@@ -236,6 +265,13 @@ inline constexpr size_t kMaxVShardSnapshotBytes = size_t{128} << 20;
 //
 // This is that aggregate, made explicit and enforced on the SEND side, where there is
 // still something useful to do about it.
+//
+// IT IS A PER-SENDER CAP AND NOT A RECEIVE-SIDE GUARANTEE (review F2). The budget bounds
+// what THIS shard ships; the peer's inbound admission is spent by every leader shipping to
+// it, so N-1 senders compose -- at RF=3 two catching-up leaders can claim half of a peer's
+// Raft inbound budget, at N=5 four can claim all of it. Capping what we send is the only
+// thing a sender can do; bounding what a node RECEIVES would need receiver-side admission
+// by message class (snapshot chunks metered separately from appends), which is not built.
 //
 // WHY IT LIVES IN THE DETERMINISTIC CORE, AS A PLAIN COUNTER. `RaftNode` is reactor-free
 // by contract, so a semaphore is not available to it -- and is not wanted: a transfer that

@@ -195,4 +195,32 @@ std::optional<WriteBatch> decodeWriteBatch(const std::string& bytes);
 // something the encoder will then exceed.
 size_t maxEncodedBytes(const WriteBatch& batch);
 
+// The v2 format magic, as a size (the bytes themselves are private to the .cpp, which
+// static_asserts they agree). Part of the charge arithmetic below.
+inline constexpr size_t kWriteBatchV2MagicBytes = 4;
+
+// HOW MUCH THE CHARGE CAN EXCEED A v1 ENCODING OF THE SAME BATCH -- 11/9, and this ratio
+// is the whole reason a size measured on the wire cannot be compared to the proposal bound
+// as a raw byte count (debt D-31, review F1).
+//
+// `maxEncodedBytes` charges `v1 + magic + 2 bytes per point`, and v1's CHEAPEST point is a
+// boolean: an 8-byte timestamp plus a 1-byte value, 9 bytes. So the charge is at most
+// (9+2)/9 = 11/9 of v1 for a boolean column, 18/16 for float/int, 14/12 for the shortest
+// strings -- booleans bind. Every other term of v1 (per-series key and count headers, the
+// per-batch header and trailer, revisions when present) only makes the ratio smaller, so
+// 11/9 is a true ceiling rather than a typical case.
+//
+// COMPARING RAW BYTES INSTEAD OF THIS IS THE BUG REVIEW F1 FOUND: `kMaxOutboundFrameBytes`
+// (~10.67 MB) looks like it leaves ~1.3 MiB of headroom under a 12 MiB proposal bound, and
+// leaves NONE -- a maximal float frame charges 12,582,911 bytes against a 12,582,912-byte
+// bound, and a maximal boolean frame charges 13.67 MB and is REFUSED. Anything relating the
+// two bounds must go through `chargeCeilingForV1Bytes`.
+inline constexpr size_t kChargeOverV1Num = 11;
+inline constexpr size_t kChargeOverV1Den = 9;
+
+// The most `maxEncodedBytes` can charge for a batch whose v1 encoding is `v1Bytes`.
+constexpr size_t chargeCeilingForV1Bytes(size_t v1Bytes) {
+    return v1Bytes * kChargeOverV1Num / kChargeOverV1Den + kWriteBatchV2MagicBytes;
+}
+
 }  // namespace timestar::data
