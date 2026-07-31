@@ -64,15 +64,16 @@ public:
 };
 
 // ===========================================================================
-// THE RAFT MESSAGE-SIZE ARITHMETIC CHAIN (write-scaleout 5 review F3; retuned by D-5)
+// THE RAFT MESSAGE-SIZE ARITHMETIC CHAIN (write-scaleout 5 review F3; retuned by D-5,
+// tightened by D-31)
 // ===========================================================================
 //
 // One chain, four numbers, each a consequence of the one above it:
 //
-//     largest producer PAYLOAD          28 MiB   kMaxRaftPayloadBytes
+//     largest producer PAYLOAD          12 MiB   kMaxRaftPayloadBytes
 //   + envelope/framing headroom        + 4 MiB   kRaftEnvelopeHeadroomBytes
 //   ------------------------------------------
-//   <= transport SEND refusal           32 MiB   kMaxRaftSendBytes
+//   <= transport SEND refusal           16 MiB   kMaxRaftSendBytes
 //   <= peer inbound ADMISSION           64 MiB   kMaxInboundRaftMemory (raft_rpc_transport.cpp)
 //
 // WHY IT HAS TO BE A CHAIN AND NOT FOUR OPINIONS. The Raft deliver verb is seastar
@@ -100,25 +101,54 @@ public:
 //     single log ENTRY, i.e. `RaftGroup::kMaxProposalBytes`;
 //   * one InstallSnapshot is bounded by `kMaxSnapshotChunkBytes` (4 MiB).
 //
-// So `kMaxProposalBytes` is what the chain is now sized for, and 28 MiB is generous for
-// it: a log entry is ONE VShard's slice of ONE write batch, and the data-plane forward
-// path already refuses a slice over ~10.67 MiB (`kMaxOutboundFrameBytes`, a 413). Only
-// the LOCAL propose path -- coordinator and leader on the same node -- had no
-// equivalent cap, and reaching 28 MiB there needs a >28 MiB encoded slice concentrated
-// on a single VShard out of 4096, which a legitimate client's batch does not do. The
-// adversarial case now gets a clean 413 instead of a 92 MiB Raft entry that three nodes
-// must fsync, ship, stage and apply atomically -- an improvement, not a regression.
+// So `kMaxProposalBytes` is what the chain is sized for: a log entry is ONE VShard's
+// slice of ONE write batch.
 //
-// RESIDUAL (D-31): 28 MiB is still 7x what a chunk needs, and the gap is entirely the
-// PROPOSAL bound's. Closing it means splitting an oversized single-VShard slice into
-// several proposals, which is a write-path change (the slice stops being one atomic
-// entry), so it is filed rather than done here.
+// WHAT D-31 CHANGED: 28 MiB -> 12 MiB, i.e. the proposal bound is now DERIVED from the
+// largest slice the data plane will actually carry instead of being a round number
+// chosen above it. D-5 left the number at 28 MiB and filed the rest, on the reading that
+// closing it required SPLITTING an oversized slice across several proposals (a write-path
+// change: the slice stops being one atomic entry). That is still the only way to reach
+// "one chunk plus headroom", and it is still not done -- but it was never needed to get
+// most of the way there, because a bound already exists a layer down:
+//
+//   * a slice that arrives from a PEER rode `kMaxOutboundFrameBytes` (~10.67 MiB, the
+//     peer's data-plane inbound admission divided by its bloat factor), and a single
+//     slice is a subset of that frame, so it can never exceed it;
+//   * a slice proposed LOCALLY (coordinator and leader on the same node) has no frame to
+//     ride, which is why the propose-side refusal exists at all;
+//   * and the two are now measured in the SAME unit -- `firstUnproposableSlice`
+//     (data/replicated_command.hpp) refuses, client-side and terminally, any slice whose
+//     encoded COMMAND could exceed this bound, so the remote path fails as a local 413
+//     naming the VShard instead of an opaque remote error retried against every leader.
+//
+// 12 MiB is that ~10.67 MiB plus ~1.3 MiB of margin, and the relationship is asserted in
+// `cluster_data_plane.hpp` (the D-20 pattern) because the two constants live in headers
+// that do not include each other. The margin is not a guess: the command adds 13 bytes of
+// framing to the batch, and a slice re-encoded at a DIFFERENT format version than the
+// frame it arrived in can grow (v2's zigzag timestamp deltas are 1-10 bytes where v1's
+// are a flat 8, and the journal gate's version is independent of the peer's) -- see
+// `maxEncodedBytes` in data/write_record.hpp, which is what the refusal measures.
+//
+// A batch that legitimately reaches even the OLD bound does not exist: a whole 10k-point
+// HTTP batch encodes ~1-2 MB and spreads over many of 4096 VShards, so 12 MiB on ONE
+// VShard is already ~10x the largest legitimate batch entire. What the drop really costs
+// is the adversarial shape -- a 64 MiB body whose points all hash to one VShard -- which
+// used to succeed with a 12-28 MiB Raft entry IF the coordinator happened to be that
+// VShard's leader, and got a 413 otherwise. That placement-dependent success is gone: it
+// is a 413 on both paths now.
+//
+// RESIDUAL (D-31): 12 MiB is still 3x a chunk. Closing the rest needs the split.
 //
 // These live in the shared types header, not in a transport header, precisely so the
 // deterministic core can know them without depending on I/O.
-inline constexpr size_t kMaxRaftSendBytes = size_t{32} << 20;
+//
+// The PAYLOAD is now the primary of the three (it is the one with an external
+// justification) and the send bound is derived from it; before D-31 it was the other way
+// round, which is what let the payload bound float free of anything that produces one.
+inline constexpr size_t kMaxRaftPayloadBytes = size_t{12} << 20;
 inline constexpr size_t kRaftEnvelopeHeadroomBytes = size_t{4} << 20;
-inline constexpr size_t kMaxRaftPayloadBytes = kMaxRaftSendBytes - kRaftEnvelopeHeadroomBytes;
+inline constexpr size_t kMaxRaftSendBytes = kMaxRaftPayloadBytes + kRaftEnvelopeHeadroomBytes;
 
 // The largest slice of a snapshot payload one InstallSnapshot may carry (D-5).
 //

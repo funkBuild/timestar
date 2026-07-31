@@ -1,10 +1,13 @@
 #include "dataplane_rpc.hpp"
 
 #include "../../utils/logger.hpp"
+#include "../raft/raft_group.hpp"  // kMaxProposalBytes -- the bound a slice must fit (D-31)
 #include "../reconnect_policy.hpp"
 #include "dataplane_codec.hpp"
+#include "dataplane_limits.hpp"
 #include "node_metadata.hpp"
 #include "node_query.hpp"
+#include "replicated_command.hpp"  // firstUnproposableSlice
 #include "write_record.hpp"
 
 #include <chrono>
@@ -91,38 +94,9 @@ seastar::rpc::client_options peerClientOptions() {
     return opts;
 }
 
-// Inbound frame admission (rpc::resource_limits). Without these, seastar's default is
-// rpc_semaphore::max_counter() -- effectively unbounded -- so a peer could hold
-// arbitrarily much of this node's memory in flight. That is the only bound available
-// against per-SERIES decode amplification, which no decoder change can fix: an empty
-// WriteSeries costs 13 bytes on the wire (type + a zero keyLen + a zero count + a zero
-// revCount) and 144 resident, so a legal, checksum-valid 16 MiB frame of ~1.29M empty
-// series decodes to ~458 MB and is RETAINED (it is handed to applyWrites). 13 bytes per
-// series is the format's structural floor; the frame size is the thing to bound.
-//
-// kInboundBloatFactor is seastar's per-request "resident bytes per wire byte" estimate
-// (rpc::estimate_request_size), set to that worst-case ratio (144/13 = 11.1, rounded
-// up). It makes the semaphore account for what a frame will really COST rather than
-// what it weighs, so:
-//   - a frame whose estimate exceeds the budget is refused BEFORE the handler runs,
-//     with an exceptional reply on a connection that stays up (rpc_impl.hh) -- for
-//     these waited verbs that is a clean, retryable write failure;
-//   - everything admitted queues behind the budget, so total resident decode stays
-//     within it instead of scaling with the number of peers.
-// The budget over the bloat factor is the effective per-frame ceiling: ~10.9 MiB of
-// wire. The largest legitimate frame is far smaller -- a whole 10k-point HTTP batch
-// encodes ~1-2 MB and what actually crosses the wire is a per-VShard SLICE of one --
-// so this is several times the real maximum while still refusing the amplifying shape.
-constexpr size_t kMaxInboundRpcMemory = 128u << 20;  // 128 MiB of estimated in-flight
-constexpr unsigned kInboundBloatFactor = 12;
-
-// The largest frame this node will SEND on the data plane: the inbound admission ceiling
-// above (max_memory / bloat_factor ~= 10.67 MiB), which every peer in a homogeneous
-// cluster shares. Checking it CLIENT-side turns "the peer refused an oversized frame" --
-// which arrives as an opaque remote error, gets retried pointlessly against every other
-// leader, and is finally reported as an internal 500 -- into a local, terminal failure
-// naming the actual size, which the HTTP layer maps to 413 (write-scaleout 3d).
-constexpr size_t kMaxOutboundFrameBytes = kMaxInboundRpcMemory / kInboundBloatFactor;
+// The frame bounds moved to data/dataplane_limits.hpp in D-31, so the Raft proposal bound
+// can be asserted against `kMaxOutboundFrameBytes` from a header that sees both. The
+// rationale for both numbers is there.
 
 seastar::rpc::resource_limits inboundLimits() {
     seastar::rpc::resource_limits lim;
@@ -804,6 +778,18 @@ seastar::future<ProposeOutcome> DataPlaneRpc::proposeWriteHinted(NodeId to, VSha
     auto* conn = impl_->clientFor(to);
     if (!conn)
         throw std::runtime_error("dataplane: unknown peer");
+    // TWO REFUSALS, AND NEITHER IMPLIES THE OTHER (debt D-31). This one is per-SLICE: the
+    // peer turns each group into ONE Raft entry, so a frame that fits the wire can still
+    // hold a slice that cannot be proposed -- and it is charged at the worst format
+    // version, because the version the receiver's journal gate emits is not the version
+    // negotiated for this wire. Refusing here makes it a local, terminal 413 naming the
+    // VShard instead of the receiving leader's ProposalTooLargeError arriving as an opaque
+    // remote error that the router retries against every other leader.
+    if (auto over = firstUnproposableSlice(view, raft::RaftGroup::kMaxProposalBytes))
+        throw WriteFrameTooLargeError("dataplane: write slice for vshard " + std::to_string(over->vshard) +
+                                      " encodes to as much as " + std::to_string(over->bytes) + " bytes, over the " +
+                                      std::to_string(raft::RaftGroup::kMaxProposalBytes) +
+                                      "-byte Raft entry limit; split the batch");
     // Encode straight from the borrowed groups -- no mergeVShardBatches allocation.
     std::string bytes = encodeWriteBatch(view, version);
     if (bytes.size() > kMaxOutboundFrameBytes)
@@ -848,6 +834,14 @@ seastar::future<bool> DataPlaneRpc::proposeWrite(NodeId to, WriteBatch batch) {
     auto* conn = impl_->clientFor(to);
     if (!conn)
         throw std::runtime_error("dataplane: unknown peer");
+    // The legacy (pre-v3) propose verb sends the WHOLE batch and the receiver splits it,
+    // so the per-slice bound cannot be evaluated here -- but the batch bounds every slice
+    // of it, which is conservative in the safe direction (debt D-31).
+    if (maxEncodedWriteCommandBytes(batch) > raft::RaftGroup::kMaxProposalBytes)
+        throw WriteFrameTooLargeError("dataplane: write batch encodes to as much as " +
+                                      std::to_string(maxEncodedWriteCommandBytes(batch)) + " bytes, over the " +
+                                      std::to_string(raft::RaftGroup::kMaxProposalBytes) +
+                                      "-byte Raft entry limit; split the batch");
     std::string bytes = encodeWriteBatch(batch, version);
     if (bytes.size() > kMaxOutboundFrameBytes)
         throw WriteFrameTooLargeError("dataplane: encoded write slice of " + std::to_string(bytes.size()) +

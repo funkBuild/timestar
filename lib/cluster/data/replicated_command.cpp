@@ -80,6 +80,15 @@ std::string encodeWriteCommand(const WriteBatch& batch) {
     return out;
 }
 
+std::optional<OversizeSlice> firstUnproposableSlice(const VShardBatchView& view, size_t bound) {
+    for (const auto* g : view) {
+        const size_t n = maxEncodedWriteCommandBytes(g->second);
+        if (n > bound)
+            return OversizeSlice{g->first, n};
+    }
+    return std::nullopt;
+}
+
 std::string encodeReplicatedCommand(const ReplicatedCommand& cmd) {
     std::string out;
     if (const auto* w = std::get_if<WriteBatch>(&cmd)) {

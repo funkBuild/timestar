@@ -3,9 +3,12 @@
 #include "../../config/timestar_config.hpp"  // ClusterConfig
 #include "../../core/engine.hpp"
 #include "../../http/http_query_handler.hpp"  // HttpQueryHandler, QueryResponse
+#include "../data/dataplane_limits.hpp"       // kMaxOutboundFrameBytes (the D-31 assertions below)
 #include "../data/dataplane_rpc.hpp"
 #include "../data/node_query_coordinator.hpp"
 #include "../data/node_write_router.hpp"
+#include "../data/replicated_command.hpp"  // kWriteCommandFramingBytes
+#include "../raft/raft_group.hpp"          // kMaxProposalBytes
 #include "../raft/raft_rpc_transport.hpp"
 #include "cluster_runtime.hpp"
 #include "engine_local_store.hpp"
@@ -68,6 +71,28 @@ static_assert(kRaftTransferTicks >= kRaftHeartbeatTicks,
 static_assert(kRaftTransferTicks < kRaftElectionTicksMin,
               "an abandon window as long as an election is the pre-D-20 behaviour under a new name [debt D-20]");
 static_assert(kRaftHeartbeatTicks < kRaftElectionTicksMin, "a leader must heartbeat many times per election");
+
+// ---------------------------------------------------------------------------
+// THE MESSAGE-SIZE CHAIN, asserted where both ends of it are visible (debt D-31).
+//
+// raft_types.hpp states the chain and can assert the links INSIDE it, but its top link --
+// "the largest producer payload is a write slice, and a write slice is bounded by what the
+// data plane will carry" -- reaches into data/dataplane_limits.hpp, which the deterministic
+// Raft core must not include. This header includes both, which is why the join lives here
+// (the same reason the tick-period assertions above do).
+static_assert(data::kMaxOutboundFrameBytes + data::kWriteCommandFramingBytes < raft::RaftGroup::kMaxProposalBytes,
+              "a write frame the data plane will SEND must be proposable as a Raft entry, or the largest "
+              "legitimate batch fails at the leader with an opaque remote error [debt D-31]");
+// ...and the proposal bound must not be so far above it that it has stopped being derived
+// from anything. Two frames' worth is the slack budget; more than that is the pre-D-31
+// state, where the number floated free of every producer.
+static_assert(raft::RaftGroup::kMaxProposalBytes < 2 * data::kMaxOutboundFrameBytes,
+              "the Raft entry bound is meant to be the wire bound plus margin, not an independent opinion "
+              "[debt D-31]");
+// The one number the RPC layer refuses on, restated against the data plane's: both
+// transports run on the same reactor with fixed memory, so a Raft frame may not be able to
+// dwarf a data frame.
+static_assert(raft::kMaxRaftSendBytes <= data::kMaxInboundRpcMemory, "[debt D-31]");
 
 // The node-level composition that wires every M2 brick into one live service
 // (integration plan M2): ClusterRuntime placement -> EngineLocalStore sink ->

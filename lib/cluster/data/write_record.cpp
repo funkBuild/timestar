@@ -552,6 +552,17 @@ size_t approxResidentBytes(const VShardBatchView& view) {
     return n;
 }
 
+size_t maxEncodedBytes(const WriteBatch& batch) {
+    size_t points = 0;
+    for (const auto& s : batch.series)
+        points += s.timestamps.size();
+    // v1 exactly (v1EncodedSize is that, and is what both encoders reserve), plus the
+    // only two ways v2 can come out LARGER: its magic, and a 10-byte varint delta where
+    // v1 pays a flat 8. See the header for why a version-independent bound is required
+    // rather than "whatever version I am holding".
+    return v1EncodedSize(batch) + sizeof(kV2Magic) + 2 * points;
+}
+
 std::string encodeWriteBatch(const WriteBatch& batch) {
     return encodeWriteBatch(batch, kWriteBatchFormatV1);
 }

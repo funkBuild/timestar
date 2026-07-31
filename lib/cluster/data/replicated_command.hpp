@@ -53,4 +53,33 @@ std::string encodeReplicatedCommand(const ReplicatedCommand& cmd);
 std::string encodeWriteCommand(const WriteBatch& batch);
 std::optional<ReplicatedCommand> decodeReplicatedCommand(const std::string& bytes);
 
+// What the command wrapper costs on top of the batch it carries: a 1-byte kind tag, the
+// 4-byte length prefix of the sub-blob, and the 8-byte FNV trailer.
+inline constexpr size_t kWriteCommandFramingBytes = 1 + 4 + 8;
+
+// An upper bound, over every format version this codec can emit, on the bytes
+// `encodeWriteCommand(batch)` produces -- i.e. on the size of the Raft ENTRY that batch
+// becomes (debt D-31). See `maxEncodedBytes` for why the bound has to be
+// version-independent.
+inline size_t maxEncodedWriteCommandBytes(const WriteBatch& batch) {
+    return maxEncodedBytes(batch) + kWriteCommandFramingBytes;
+}
+
+// The first group of `view` whose command encoding could exceed `bound`, and by how much
+// (debt D-31). `bound` is `RaftGroup::kMaxProposalBytes`; this is checked on the SEND side
+// of a forwarded write so the refusal is a local, terminal 413 naming the VShard, rather
+// than the receiving leader's `ProposalTooLargeError` arriving as an opaque remote error
+// that the router retries against every other leader before reporting a 500.
+//
+// A frame carries a whole VIEW but a Raft entry carries ONE group, so the frame bound the
+// send path already checks does not imply this one and cannot replace it: a frame within
+// `kMaxOutboundFrameBytes` can still hold a single slice that re-encodes larger than a
+// proposal may be (see maxEncodedBytes). Cheap: it walks series, not bytes, on a path that
+// is about to encode all of them anyway.
+struct OversizeSlice {
+    uint16_t vshard = 0;
+    size_t bytes = 0;  // the BOUND-side estimate, i.e. what was compared
+};
+std::optional<OversizeSlice> firstUnproposableSlice(const VShardBatchView& view, size_t bound);
+
 }  // namespace timestar::data

@@ -2367,13 +2367,17 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpWriteHandler::handleW
         // being the same client-fixable condition as the frame case above.
         //
         // NO LONGER UNREACHABLE. It was, while `kMaxProposalBytes` was 92 MiB and the
-        // handler capped a body long before that. D-5 retuned the Raft size chain and the
-        // bound is now 28 MiB, which a >28 MiB ENCODED single-VShard slice reaches -- so a
-        // 64 MiB body (the `max_write_body_size` default) whose points all hash to one of
-        // 4096 VShards now gets this 413 instead of producing a 28+ MiB Raft entry that
+        // handler capped a body long before that. D-5 retuned the Raft size chain to
+        // 28 MiB and D-31 took it to 12 MiB, which a >12 MiB ENCODED single-VShard slice
+        // reaches -- so a 64 MiB body (the `max_write_body_size` default) whose points all
+        // hash to one of 4096 VShards gets this 413 instead of producing a Raft entry that
         // three nodes must fsync, ship, stage and apply atomically. A legitimate batch
         // spreads over many VShards and never comes near it. See raft_types.hpp for the
         // chain, and debt D-31 for splitting an oversized slice instead of refusing it.
+        //
+        // It is now also reachable on the FORWARDED path, as the same 413 rather than an
+        // opaque remote error: `firstUnproposableSlice` refuses client-side, and that
+        // refusal is a WriteFrameTooLargeError, handled above.
         ++engineSharded->local().metrics().insert_errors_total;
         timestar::http_log.warn("Write rejected, Raft proposal too large: {}", e.what());
         rep->set_status(seastar::http::reply::status_type::payload_too_large);

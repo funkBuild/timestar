@@ -176,4 +176,23 @@ std::string encodeWriteBatch(const WriteBatch& batch, uint32_t version);
 std::string encodeWriteBatch(const VShardBatchView& view, uint32_t version);
 std::optional<WriteBatch> decodeWriteBatch(const std::string& bytes);
 
+// An upper bound on `encodeWriteBatch(batch, v).size()` for EVERY version v this codec
+// can emit, computed without encoding anything (debt D-31).
+//
+// It exists because the two ends of a forwarded write do not agree on a version and do
+// not have to: the data-plane wire emits what was NEGOTIATED with that peer, while the
+// slice the receiver re-encodes as a Raft command emits what the CLUSTER-WIDE journal
+// gate allows (see the FORMAT SAFETY note above). So a size measured at one end says
+// nothing about the other end unless it is version-independent, and the direction that
+// bites is v2 -> v1: v2's zigzag timestamp deltas are 1-10 bytes where v1's are a flat 8,
+// so the SAME batch is usually smaller in v2 and can be larger. Anything that refuses an
+// oversized slice must therefore charge the worst version, not the one in its hand.
+//
+// The bound is v1's exact size plus the two things only v2 can add: its 4-byte magic and
+// up to 2 bytes per point (a 10-byte varint where v1 pays 8; the first timestamp of a
+// series is a fixed u64 in both, so this is slack, not a shortfall). It is an upper
+// bound, never an estimate -- a refusal computed from it must not be able to admit
+// something the encoder will then exceed.
+size_t maxEncodedBytes(const WriteBatch& batch);
+
 }  // namespace timestar::data

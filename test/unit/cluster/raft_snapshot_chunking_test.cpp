@@ -351,8 +351,12 @@ TEST(RaftSnapshotChunkingTest, TheSizeChainHoldsAndIsSizedForAnAppendNotASnapsho
     static_assert(RaftGroup::kMaxProposalBytes == kMaxRaftPayloadBytes,
                   "the largest log entry is what the chain is now sized for");
     // A chunk must be much smaller than the entry bound, or the chain is still being
-    // dragged up by snapshots.
-    static_assert(kMaxSnapshotChunkBytes * 4 <= kMaxRaftPayloadBytes);
+    // dragged up by snapshots. The multiple was 4 when D-5 wrote this and is 3 after D-31
+    // brought the entry bound down to 12 MiB: the entry bound is no longer chosen as a
+    // multiple of a chunk at all, it is the data plane's frame bound plus margin, and this
+    // asserts only that a chunk stayed comfortably under it. Do not "restore" the 4 by
+    // raising the entry bound -- that is the direction D-31 exists to close.
+    static_assert(kMaxSnapshotChunkBytes * 3 <= kMaxRaftPayloadBytes);
     // The compaction/memory ceiling is a MULTIPLE of a chunk (so a big snapshot ships as
     // a pipeline) and is well ABOVE the old effective ceiling (so compaction that used to
     // be refused now runs).
