@@ -37,6 +37,11 @@
 # the current binary. If phase 2 starts falling short again, that is a D-36 REGRESSION and the
 # readback gate is where to confirm it.
 #
+# MEASURED after the fix: BOTH heavy arms 200/200/200, 37 snapshots taken, 37 compacted-journal
+# recoveries, crashes 0 -- the first run on which the "absolute bar is met" branch below has
+# ever been taken. ONE run is not grounds to promote it to an assertion on a bar this gate has
+# never held before; two consecutive clean runs would be.
+#
 # WHAT D-6 COULD HAVE BROKEN, and what this therefore isolates. A snapshot splits recovery
 # into two halves that must AGREE: everything at or below the compacted boundary comes from
 # the LOCAL Engine's TSM files, everything above it from the retained log suffix. A boundary
