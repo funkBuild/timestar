@@ -113,7 +113,7 @@ one-node outage.
 **(c) Make it configurable.** Rejected for now, on the D-20 precedent: a knob for a
 consensus-timing relationship is a knob for breaking the relationship, and the assertions
 are what keep the three numbers honest. If it becomes configurable it must be validated at
-startup against the same three inequalities, exactly as `ShardRaftPlane::start()` already
+startup against the same three inequalities, exactly as `ClusterDataPlane::start()` already
 restates the D-20 assertions at runtime for a future config key.
 
 **(d) Election-SHAPED extension for reads, mirroring D-14's per-attempt test.** Rejected as
@@ -128,10 +128,21 @@ Revisit if RF < N read availability during a failover is measured to be the bind
 
 ## Consequences
 
-* A read now spends up to **1.2 s** before answering `QUERY_INCOMPLETE` where it spent
-  100 ms. During a genuine outage that is 1.1 s of extra latency on a request that fails
-  anyway. That is the cost, and it is taken deliberately: the same 1.2 s is what turns a
-  routine rebalance from a user-visible error into a latency bump.
+* A read now spends up to **1.2 s plus one in-flight round** before answering
+  `QUERY_INCOMPLETE` where it spent 100 ms. The budget is checked in WALL CLOCK between
+  rounds, not as an iteration count, because the sleeps are not the only cost: each round
+  also runs `gatherLeaders()` (a sequential `invoke_on` across every shard) and a full
+  remote fan-out, so a redirect-churning read counted in iterations could have sailed past
+  the 2.5 s election minimum the static_assert claims to exclude — the assertion would have
+  been arithmetic rather than behaviour. The residual overshoot is the last dispatched
+  round, because the read RPCs themselves are untimed (debt D-41).
+* **A doomed read is not free while it waits.** Up to ~24 leadership gathers and up to ~24
+  remote fan-outs are issued before it gives up, against a cluster that is already
+  struggling. This is the strongest argument for keeping the read budget well under the
+  write's, and the reason alternative (a) is not merely "slower".
+* During a genuine outage this is ~1.1 s of extra latency on a request that fails anyway.
+  That is the cost, taken deliberately: the same 1.2 s is what turns a routine rebalance
+  from a user-visible error into a latency bump.
 * Reads still fail during an election, by design. **An operator seeing read errors and no
   write errors during a node failure is seeing this decision working**, not a bug — and
   that sentence is the reason this ADR exists.
@@ -157,3 +168,11 @@ primary. The material for the fix is already there (`ControlMap::placement` hold
 replica vector, and a non-primary holder that does not lead the group will simply redirect
 us), but it is a routing change with a double-count contract to preserve and it wants the
 fault gate, so it is filed rather than folded in here.
+
+D-41 also carries the read path's missing **per-attempt bound**: `queryNode` is untimed, so
+a peer that accepts the connection and then goes silent hangs a read indefinitely, and the
+wall-clock budget above cannot help because it is only checked between rounds. The write
+path closed this in write-scaleout 3f (`kAttemptTimeout`, pushed into the RPC itself); the
+read path has no equivalent. That is also why the D-25 version handshake deliberately uses
+the UNTIMED `versionFor`: a bounded handshake in front of an unbounded query is false
+reassurance, not defence in depth.
