@@ -40,19 +40,43 @@ the number cannot credit or blame a change. That defect (every rejection on the
 COORDINATOR, none on the node actually holding leadership -- i.e. leader RESOLUTION, not
 consensus) is filed in the plan doc's Phase 5 outcome.
 
+## Ports: every gate sits BELOW the kernel's ephemeral range (debt D-27)
+
+A node binds three listeners — HTTP at `P`, the data plane at `P+1000`, Raft at `P+2000` —
+and a gate starts its nodes in a burst, each dialling the others. With the gate's own ports
+inside `ip_local_port_range` (32768-60999 here) the kernel can hand an earlier node's
+OUTBOUND connection the very port a later node still has to bind: seastar exits on the
+failed listen, one node silently never comes up, and the gate reports "cluster did not
+converge" 300 s later with the cause visible only in a node log. `deposed_primary_gate.sh`
+hit it four times in one session (49312 once, then 51312 on three consecutive runs) at five
+nodes; the 3-node gates were exposed to the same race with fewer dials.
+
+D-27 moved **every** gate below the range, and `require_ports_free` now ABORTS on a port
+inside it (checked against the live kernel range, for all three listeners) so a new gate
+cannot reintroduce the race.
+
+| gate | HTTP ports | data (+1000) | Raft (+2000) | `kill_cluster` prefix | data dirs |
+|---|---|---|---|---|---|
+| `backpressure_gate.sh` | 19210-19212 | 20210-20212 | 21210-21212 | `1921` | `/tmp/tsgate_bp*` |
+| `rolling_rebalance_gate.sh` | 19220-19222 | 20220-20222 | 21220-21222 | `1922` | `/tmp/tsgate_rb*` |
+| `deposed_primary_gate.sh` | 19310-19314 | 20310-20314 | 21310-21314 | `1931` | `/tmp/tsgate_dp*` |
+| `fault_injection_gate.sh` | 19410-19412 | 20410-20412 | 21410-21412 | `1941` | `/tmp/tsgate_fi*` |
+| `restart_catchup_gate.sh` | 19510-19512 | 20510-20512 | 21510-21512 | `1951` | `/tmp/tsgate_cu*` |
+| `node_kill_round.sh` | 19610-19612 | 20610-20612 | 21610-21612 | `1961` | `/tmp/tsgate_nk*` |
+| `snapshot_durability_gate.sh` | 19710-19712 | 20710-20712 | 21710-21712 | `1971` | `/tmp/tsgate_sd*` |
+| `restart_readback_gate.sh` | 19730-19732 | 20730-20732 | 21730-21732 | `1973` | `/tmp/tsgate_rr*` |
+
+The prefixes are now four digits and unique per gate — they used to be three, so `492`
+covered both `backpressure` and `rolling_rebalance` and `197` also matched `--port 19730`,
+i.e. one gate's cleanup reached another's cluster. `rolling_rebalance_gate.sh`'s data dirs
+moved from `tsgate_rr` to `tsgate_rb` in the same change, because they collided with
+`restart_readback_gate.sh`'s — which `rm -rf`s them in its cleanup.
+
+None of that is licence to run two gates at once: they fight over data dirs, disk and CPU
+long before they fight over a pkill, and the self-amplifying disk failure above is what that
+costs.
+
 ## Why the topologies differ
-
-`deposed_primary_gate.sh` runs on **19310-19314**, not in the 493xx band the other gates
-use, because its ports have to sit BELOW the ephemeral range — see `require_ports_free`'s
-note in `cluster_gate_lib.sh`. That also means its `kill_cluster` prefix (193) no longer
-collides with `fault_injection_gate.sh`'s.
-
-`snapshot_durability_gate.sh` (19710-19712) and `restart_readback_gate.sh` (19730-19732) sit in the same
-sub-ephemeral band for the same reason. `kill_cluster` matches the port as a SUBSTRING of the argv, so the durability gate's
-prefix `197` also matches `--port 19730` — its cleanup reaches a readback run's cluster, and
-`1973` is a subset of `197`, not a sibling of it. That is another reason the ONE AT A TIME rule
-above is a rule and not advice; with only one gate live, anything else in the band is a stray
-from a crashed run and killing it is the cleanup you want.
 
 `deposed_primary_gate.sh` uses **five** nodes at RF=3 on purpose. At RF=3 on THREE nodes
 every node hosts every Raft group, so the router's `LeaderResolver` always knows the real

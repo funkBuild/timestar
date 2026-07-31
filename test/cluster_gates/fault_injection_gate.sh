@@ -37,7 +37,7 @@ BENCH="$BUILD_DIR/bin/timestar_insert_bench"
 [ -x "$BENCH" ] || { echo "no insert bench at $BENCH"; exit 2; }
 command -v python3 >/dev/null || { echo "python3 required for the reset proxy"; exit 2; }
 
-PORTS="49310 49311 49312"
+PORTS="19410 19411 19412"
 # Minimum resets the run must actually have injected. Without this the gate is vacuous:
 # a proxy that never fired, or a bench that finished before the storm started, would pass.
 #
@@ -60,33 +60,33 @@ MIN_DIP_PCT="${GATE_MIN_DIP_PCT:-40}"
 
 cleanup() {
     [ -n "${PROXY_PID:-}" ] && kill -9 "$PROXY_PID" 2>/dev/null
-    kill_cluster 493
+    kill_cluster 1941
 }
-kill_cluster 493
-require_ports_free 49310 49311 49312
+kill_cluster 1941
+require_ports_free 19410 19411 19412
 for i in 1 2 3; do rm -rf "/tmp/tsgate_fi$i"; mkdir -p "/tmp/tsgate_fi$i"; done
 trap cleanup EXIT
 
 # Node 3 is reached through 127.0.0.2 by everyone EXCEPT itself.
-PEERS_VIA_PROXY="127.0.0.1:49310,127.0.0.1:49311,127.0.0.2:49312"
-PEERS_DIRECT="127.0.0.1:49310,127.0.0.1:49311,127.0.0.1:49312"
+PEERS_VIA_PROXY="127.0.0.1:19410,127.0.0.1:19411,127.0.0.2:19412"
+PEERS_DIRECT="127.0.0.1:19410,127.0.0.1:19411,127.0.0.1:19412"
 start_node() { # $1 = node id, $2 = peers list
     env TIMESTAR_DATA_DIR="/tmp/tsgate_fi$1" TIMESTAR_CLUSTER_ENABLED=true TIMESTAR_CLUSTER_PARTITIONED=true \
         TIMESTAR_CLUSTER_REPLICATION_FACTOR=3 TIMESTAR_CLUSTER_NODE_ID=$1 TIMESTAR_CLUSTER_PEERS="$2" \
-        "$BIN" --port $((49309 + $1)) --smp 4 >>"/tmp/tsgate_fi$1/s.log" 2>&1 &
+        "$BIN" --port $((19409 + $1)) --smp 4 >>"/tmp/tsgate_fi$1/s.log" 2>&1 &
 }
 
 # Only the DATA-PLANE and RAFT ports are proxied. Node 3's HTTP listener binds
-# 0.0.0.0:49312 (it is not a cluster-plane address), so a proxy on 127.0.0.2:49312 would
+# 0.0.0.0:19412 (it is not a cluster-plane address), so a proxy on 127.0.0.2:19412 would
 # collide with it and node 3 would exit on the failed bind -- which is exactly what the
 # first version of this gate did. The cluster planes only ever dial port+1000 and
 # port+2000, so leaving the HTTP port unproxied costs nothing.
-echo "=== proxy: 127.0.0.2:{50312,51312} -> 127.0.0.1:{50312,51312} ==="
+echo "=== proxy: 127.0.0.2:{20412,21412} -> 127.0.0.1:{20412,21412} ==="
 PROXY_LOG=/tmp/tsgate_fi_proxy.log
 : >"$PROXY_LOG"
 python3 ./tcp_reset_proxy.py \
-    --map 127.0.0.2:50312:127.0.0.1:50312:reset \
-    --map 127.0.0.2:51312:127.0.0.1:51312 \
+    --map 127.0.0.2:20412:127.0.0.1:20412:reset \
+    --map 127.0.0.2:21412:127.0.0.1:21412 \
     >"$PROXY_LOG" 2>&1 &
 PROXY_PID=$!
 for _ in $(seq 1 30); do grep -q READY "$PROXY_LOG" && break; sleep 0.2; done
@@ -108,7 +108,7 @@ for _ in $(seq 1 12); do
     sleep 1
 done
 wait_balanced "$PORTS" 4096 3 60 || gate_exit
-NODE3_LED=$(status_field "$(cluster_status 49312)" vshards_led)
+NODE3_LED=$(status_field "$(cluster_status 19412)" vshards_led)
 echo "  node 3 (behind the proxy) leads $NODE3_LED VShards"
 assert_ge "VShards led behind the proxy (traffic that must cross the fault)" "${NODE3_LED:-0}" 800
 
@@ -116,7 +116,7 @@ assert_ge "VShards led behind the proxy (traffic that must cross the fault)" "${
 # Baseline: the same load through the same proxy, with NO resets. Everything below is
 # measured against this, not against an unproxied number.
 echo "=== baseline (proxy in path, no faults) ==="
-timeout 300 "$BENCH" --server-port 49310 -c 4 --batches 2000 --batch-size 10000 --verify 0 \
+timeout 300 "$BENCH" --server-port 19410 -c 4 --batches 2000 --batch-size 10000 --verify 0 \
     --warmup 5 --connections 4 --hosts 1000 --racks 2 >/tmp/tsgate_fi_base.txt 2>&1
 grep -E "Requests:|Throughput|batch latency" /tmp/tsgate_fi_base.txt
 BASE_TPUT=$(grep -oE 'Throughput:[[:space:]]*[0-9.]+' /tmp/tsgate_fi_base.txt | head -1 | grep -oE '[0-9.]+')
@@ -137,7 +137,7 @@ echo "=== reset storm under sustained writes ==="
 # gated the resetter on the bench still running and the bench finished in under a second,
 # so the storm never fired -- the anti-vacuity assertions below exist because of that.
 rm -f /tmp/tsgate_fi_stop
-( timeout 300 "$BENCH" --server-port 49310 -c 4 --batches 2000 --batch-size 10000 --verify 0 \
+( timeout 300 "$BENCH" --server-port 19410 -c 4 --batches 2000 --batch-size 10000 --verify 0 \
     --warmup 5 --connections 4 --hosts 1000 --racks 2 >/tmp/tsgate_fi_storm.txt 2>&1 ) &
 BENCHPID=$!
 ( ROUNDS=0
@@ -152,7 +152,7 @@ sleep 1
 PROBE_OK=0; PROBE_5XX=0; PROBE_OTHER=0
 i=0
 while [ "$i" -lt "$PROBE" ]; do
-    CODE=$(curl -s -m10 -o /tmp/tsgate_fi_resp.txt -w '%{http_code}' -X POST http://127.0.0.1:49310/write \
+    CODE=$(curl -s -m10 -o /tmp/tsgate_fi_resp.txt -w '%{http_code}' -X POST http://127.0.0.1:19410/write \
         -H 'Content-Type: application/json' \
         -d "{\"measurement\":\"faultprobe\",\"tags\":{\"host\":\"p$i\"},\"fields\":{\"v\":1.0},\"timestamp\":$((BASE_TS + i * 1000000000))}")
     case "$CODE" in

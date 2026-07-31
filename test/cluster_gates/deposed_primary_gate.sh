@@ -25,12 +25,12 @@ BIN="${1:-$BUILD_DIR/bin/timestar_http_server}"
 # later-starting node still has to bind: seastar then exits on the failed listen, one node
 # silently never comes up, and the gate fails as "cluster did not converge". Observed four
 # times in one session on node 3 (49312, then 51312 three runs running) before moving the
-# whole gate below 32768. The 3-node gates are exposed to the same race, just less often --
-# see the debt register.
+# whole gate below 32768. The 3-node gates were exposed to the same race, just less often;
+# D-27 moved all of them, and `require_ports_free` now REFUSES a port inside the range.
 PORTS="19310 19311 19312 19313 19314"
 WRITES="${GATE_WRITES:-300}"
 
-kill_cluster 193
+kill_cluster 1931
 require_ports_free 19310 19311 19312 19313 19314
 for i in 1 2 3 4 5; do rm -rf "/tmp/tsgate_dp$i"; mkdir -p "/tmp/tsgate_dp$i"; done
 PEERS="127.0.0.1:19310,127.0.0.1:19311,127.0.0.1:19312,127.0.0.1:19313,127.0.0.1:19314"
@@ -39,7 +39,7 @@ for i in 1 2 3 4 5; do
         TIMESTAR_CLUSTER_REPLICATION_FACTOR=3 TIMESTAR_CLUSTER_NODE_ID=$i TIMESTAR_CLUSTER_PEERS="$PEERS" \
         "$BIN" --port $((19309 + i)) --smp 2 >"/tmp/tsgate_dp$i/s.log" 2>&1 &
 done
-trap 'kill_cluster 193' EXIT
+trap 'kill_cluster 1931' EXIT
 
 wait_all_led "$PORTS" 4096 150 || gate_exit
 

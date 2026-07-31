@@ -25,19 +25,19 @@ LIMIT="${2:-1000000}"   # ~3 canonical batches per shard: 12 connections trip it
 [ -x "$BIN" ] || { echo "no server binary at $BIN"; exit 2; }
 BENCH="$BUILD_DIR/bin/timestar_insert_bench"
 [ -x "$BENCH" ] || { echo "no insert bench at $BENCH"; exit 2; }
-PORTS="49210 49211 49212"
+PORTS="19210 19211 19212"
 
-kill_cluster 492
-require_ports_free 49210 49211 49212
+kill_cluster 1921
+require_ports_free 19210 19211 19212
 for i in 1 2 3; do rm -rf "/tmp/tsgate_bp$i"; mkdir -p "/tmp/tsgate_bp$i"; done
-PEERS="127.0.0.1:49210,127.0.0.1:49211,127.0.0.1:49212"
+PEERS="127.0.0.1:19210,127.0.0.1:19211,127.0.0.1:19212"
 for i in 1 2 3; do
     env TIMESTAR_CLUSTER_WRITE_INFLIGHT_BYTES="$LIMIT" TIMESTAR_DATA_DIR="/tmp/tsgate_bp$i" \
         TIMESTAR_CLUSTER_ENABLED=true TIMESTAR_CLUSTER_PARTITIONED=true \
         TIMESTAR_CLUSTER_REPLICATION_FACTOR=3 TIMESTAR_CLUSTER_NODE_ID=$i TIMESTAR_CLUSTER_PEERS="$PEERS" \
-        "$BIN" --port $((49209 + i)) --smp 4 >"/tmp/tsgate_bp$i/s.log" 2>&1 &
+        "$BIN" --port $((19209 + i)) --smp 4 >"/tmp/tsgate_bp$i/s.log" 2>&1 &
 done
-trap 'kill_cluster 492' EXIT
+trap 'kill_cluster 1921' EXIT
 
 wait_balanced "$PORTS" 4096 3 90 || gate_exit
 
@@ -47,7 +47,7 @@ assert_ge "startup log names the in-flight budget" \
     "$(cat /tmp/tsgate_bp*/s.log | grep -c "cluster write in-flight budget: $LIMIT")" 1
 
 run_bench() { # $1 = connections, $2 = batches
-    timeout 300 "$BENCH" --server-port 49210 -c 4 --batches "$2" --batch-size 10000 --verify 0 \
+    timeout 300 "$BENCH" --server-port 19210 -c 4 --batches "$2" --batch-size 10000 --verify 0 \
         --warmup 3 --connections "$1" --hosts 1000 --racks 2 2>&1
 }
 errs_of() { grep -o '[0-9]* HTTP errors' <<<"$1" | head -1 | cut -d' ' -f1; }
@@ -84,7 +84,7 @@ print(json.dumps({"writes": w}))
 PY
 rm -f /tmp/tsgate_bp_h_*.txt
 seq 1 16 | xargs -P 16 -I{} curl -s -m60 -o /dev/null -D "/tmp/tsgate_bp_h_{}.txt" \
-    -X POST http://127.0.0.1:49210/write -H 'Content-Type: application/json' \
+    -X POST http://127.0.0.1:19210/write -H 'Content-Type: application/json' \
     --data-binary @/tmp/tsgate_bp_probe.json >/dev/null 2>&1
 rm -f /tmp/tsgate_bp_probe.json
 echo "  probe statuses: $(grep -h '^HTTP/1.1' /tmp/tsgate_bp_h_*.txt 2>/dev/null | tr -d '\r' | sort | uniq -c | tr '\n' ' ')"
@@ -107,7 +107,7 @@ assert_eq "server-side 500s under overload" \
     "$(cat /tmp/tsgate_bp*/s.log | grep -c 'Error handling write request')" 0
 
 echo "=== C: a single write still succeeds at the tiny budget ==="
-CODE=$(curl -s -m10 -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:49210/write \
+CODE=$(curl -s -m10 -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:19210/write \
     -H 'Content-Type: application/json' \
     -d '{"measurement":"bp2","tags":{"host":"x"},"fields":{"v":1.5},"timestamp":1700000900000000000}')
 assert_eq "single write status" "$CODE" 200
@@ -120,14 +120,14 @@ echo "=== B: SAME cluster restarted at the DEFAULT budget (must run clean) ==="
 # budget small enough for 16 curls to trip is far below what one bench connection holds --
 # so "the load dropped" is not expressible there. What an operator actually needs to know
 # is that the DEFAULT budget never gets in the way, which is what this measures.
-kill_cluster 492
-require_ports_free 49210 49211 49212
+kill_cluster 1921
+require_ports_free 19210 19211 19212
 for i in 1 2 3; do rm -rf "/tmp/tsgate_bp$i"; mkdir -p "/tmp/tsgate_bp$i"; done
 for i in 1 2 3; do
     env TIMESTAR_DATA_DIR="/tmp/tsgate_bp$i" \
         TIMESTAR_CLUSTER_ENABLED=true TIMESTAR_CLUSTER_PARTITIONED=true \
         TIMESTAR_CLUSTER_REPLICATION_FACTOR=3 TIMESTAR_CLUSTER_NODE_ID=$i TIMESTAR_CLUSTER_PEERS="$PEERS" \
-        "$BIN" --port $((49209 + i)) --smp 4 >"/tmp/tsgate_bp$i/s.log" 2>&1 &
+        "$BIN" --port $((19209 + i)) --smp 4 >"/tmp/tsgate_bp$i/s.log" 2>&1 &
 done
 wait_balanced "$PORTS" 4096 3 90 || gate_exit
 assert_ge "startup log names the DEFAULT budget" \

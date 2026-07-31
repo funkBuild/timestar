@@ -93,13 +93,13 @@ LIGHT_BATCHES="${GATE_LIGHT_BATCHES:-20}"
 LIGHT_WAL="${GATE_LIGHT_WAL:-262144}"
 WAL_THRESHOLD="${GATE_WAL_THRESHOLD:-2097152}"
 
-trap 'kill_cluster 197' EXIT
+trap 'kill_cluster 1971' EXIT
 
 # run_arm NAME SNAPSHOT_ENTRIES BATCHES WAL_THRESHOLD SNAPSHOT_BYTES
 #   -> sets ARM_MIN, ARM_READS, ARM_TAKEN, ARM_RECOVERED, ARM_ACKED, ARM_BACKLOG, ...
 run_arm() {
     local name="$1" snap="$2" batches="${3:-$BATCHES}" wal="${4:-$WAL_THRESHOLD}" snapbytes="${5:-}"
-    kill_cluster 197
+    kill_cluster 1971
     require_ports_free $PORTS
     for i in 1 2 3; do rm -rf "/tmp/tsgate_sd$i"; mkdir -p "/tmp/tsgate_sd$i"; done
     local PEERS="127.0.0.1:19710,127.0.0.1:19711,127.0.0.1:19712"
@@ -161,7 +161,7 @@ run_arm() {
     echo "    snapshots taken: $ARM_TAKEN before the probes, $AFTER after"
     ARM_TAKEN=$AFTER
 
-    kill_cluster 197
+    kill_cluster 1971
     sleep 2
     for i in 1 2 3; do start_node $i; done
     wait_all_led "$PORTS" 4096 180 || return 1

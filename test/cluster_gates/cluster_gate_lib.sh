@@ -48,12 +48,17 @@ kill_cluster() { # $1 = port prefix used by this gate, e.g. 492
     # did match it. The fix is for hand-saved binaries, which is how people actually
     # measure a "before".)
     #
-    # THE PREFIX IS NOT UNIQUE PER GATE -- 492 covers both backpressure and
-    # rolling_rebalance -- so this DOES reach a same-band gate's cluster. That is fine,
-    # and it is why the README's "run them ONE AT A TIME" rule is a rule: with only one
-    # gate live, anything else in the band is a stray from a crashed run and killing it is
-    # the cleanup you want. Do not read this as licence to run two gates at once; they
-    # would fight over ports and data dirs long before they fought over this pkill.
+    # SINCE D-27 THE PREFIX IS UNIQUE PER GATE (four digits: 1921 backpressure, 1922
+    # rolling rebalance, 1931 deposed primary, 1941 fault injection,
+    # 1951 restart catchup, 1961 node kill, 1971 snapshot durability, 1973 restart
+    # readback -- the README's port table is authoritative). It used to be three, and 492
+    # covered both backpressure and rolling_rebalance, so a cleanup reached a same-band
+    # gate's cluster. That was harmless under the ONE AT A TIME rule and is now moot.
+    #
+    # Keep the rule anyway: two gates at once fight over data dirs, disk and CPU long
+    # before they fight over this pkill, and the README's self-amplifying disk failure is
+    # what that costs. With only one gate live, anything else in ITS band is a stray from a
+    # crashed run and killing it is the cleanup you want.
     #
     # Safe to match loosely here because this lives in a SCRIPT FILE: the same pattern
     # inlined into `bash -c` would match the invoking shell's own argv and kill it
@@ -176,22 +181,46 @@ wait_leadership_settled() {
 # The Raft and data-plane listeners sit at +2000/+1000 offsets from the HTTP port, so all
 # three have to be checked -- an earlier version of these gates only killed by HTTP port
 # and was bitten by exactly that.
-# CHOOSE PORTS BELOW THE EPHEMERAL RANGE (`cat /proc/sys/net/ipv4/ip_local_port_range`,
-# 32768-60999 here). A gate starts its nodes in a burst and each dials the others' Raft and
-# data ports, so a gate whose own ports sit inside that range races the kernel for them: an
+# PORTS MUST SIT BELOW THE EPHEMERAL RANGE (`cat /proc/sys/net/ipv4/ip_local_port_range`,
+# 32768-60999 here), and this function now ENFORCES that rather than merely advising it
+# (debt D-27). A gate starts its nodes in a burst and each dials the others' Raft and data
+# ports, so a gate whose own ports sit inside that range races the kernel for them: an
 # outbound connection from an earlier node gets handed the port a later node still has to
 # bind, seastar exits on the failed listen, and the gate reports "cluster did not converge"
 # with one node silently absent. It scales with node count and with how busy the box is --
-# `deposed_primary_gate.sh` (five nodes) hit it four times in one session and was moved to
-# 19310+ for that reason; the 3-node gates are exposed to the same race, less often. See the
-# debt register.
+# `deposed_primary_gate.sh` (five nodes) hit it four times in one session (49312 once, then
+# 51312 on three consecutive runs) before being moved to 19310+, which fixed it outright.
+#
+# D-27 moved EVERY gate below the range; the check below is what keeps a new one from
+# reintroducing the race. It is an ABORT and not a warning on purpose: the failure it
+# prevents does not look like a port problem when it happens -- it looks like a 300 s
+# convergence timeout with one node missing, and the cause is only visible in a node log.
+#
+# It is checked against the LIVE kernel range, not a hardcoded 32768: a box configured with
+# a wider range (some tune it down to 10000) has a correspondingly wider hazard, and a gate
+# that is safe here would silently be unsafe there.
+#
+# All three of a node's listeners are checked -- HTTP, data plane (+1000) and Raft (+2000)
+# -- both for the in-use test and for the range test, so a base port that is itself safe
+# but whose Raft port is not still fails here rather than at bind time.
 require_ports_free() { # $@ = HTTP ports
-    local busy="" p
+    local busy="" ephemeral="" p q lo hi
+    read -r lo hi < /proc/sys/net/ipv4/ip_local_port_range 2>/dev/null
+    : "${lo:=32768}" "${hi:=60999}"
     for p in "$@"; do
         for q in "$p" $((p + 1000)) $((p + 2000)); do
             if ss -ltn 2>/dev/null | grep -qE "[:.]$q\b"; then busy="$busy $q"; fi
+            if [ "$q" -ge "$lo" ] && [ "$q" -le "$hi" ]; then ephemeral="$ephemeral $q"; fi
         done
     done
+    if [ -n "$ephemeral" ]; then
+        echo "ABORT: gate ports inside the kernel ephemeral range ($lo-$hi):$ephemeral" >&2
+        echo "       A node's own outbound dial can be handed one of these before a later" >&2
+        echo "       node binds it; seastar then exits on the failed listen and the gate" >&2
+        echo "       reports 'cluster did not converge'. Pick a base below $lo - 2000." >&2
+        echo "       See debt D-27 and test/cluster_gates/README.md's port table." >&2
+        exit 2
+    fi
     if [ -n "$busy" ]; then
         echo "ABORT: ports still in use:$busy -- a previous run's server is still alive" >&2
         ss -ltnp 2>/dev/null | grep -E "$(echo "$busy" | tr ' ' '|' | sed 's/^|//')" >&2

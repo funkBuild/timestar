@@ -86,7 +86,7 @@ BIN="${1:-$BUILD_DIR/bin/timestar_http_server}"
 [ -x "$BIN" ] || { echo "no server binary at $BIN"; exit 2; }
 BENCH="$BUILD_DIR/bin/timestar_insert_bench"
 [ -x "$BENCH" ] || { echo "no insert bench at $BENCH"; exit 2; }
-PORTS="49410 49411 49412"
+PORTS="19510 19511 19512"
 BATCHES="${GATE_BATCHES:-400}"   # 400 x 10k = 4M points
 
 # These gates are disk-hungry and /tmp is a per-user-quota tmpfs here: exhausting it
@@ -99,10 +99,10 @@ if [ "${FREE_GB:-0}" -lt 20 ]; then
     exit 2
 fi
 
-kill_cluster 494
+kill_cluster 1951
 require_ports_free $PORTS
 for i in 1 2 3; do rm -rf "/tmp/tsgate_cu$i"; mkdir -p "/tmp/tsgate_cu$i"; done
-PEERS="127.0.0.1:49410,127.0.0.1:49411,127.0.0.1:49412"
+PEERS="127.0.0.1:19510,127.0.0.1:19511,127.0.0.1:19512"
 # SNAPSHOT_ENTRIES is what forces the producer to run inside a gate-sized campaign (see
 # the header for why it has to be this low -- a VShard sees only the batches that touch it,
 # and the busiest of 4096 groups reached 4-5 entries here). The 2 s min-interval keeps the
@@ -117,15 +117,15 @@ start_node() {
         TIMESTAR_CLUSTER_REPLICATION_FACTOR=3 TIMESTAR_CLUSTER_NODE_ID=$1 TIMESTAR_CLUSTER_PEERS="$PEERS" \
         TIMESTAR_CLUSTER_SNAPSHOT_ENTRIES="$SNAP_ENTRIES" TIMESTAR_CLUSTER_SNAPSHOT_MIN_INTERVAL_S=2 \
         TIMESTAR_WAL_SIZE_THRESHOLD="$WAL_THRESHOLD" \
-        "$BIN" --port $((49409 + $1)) --smp 4 >>"/tmp/tsgate_cu$1/s.log" 2>&1 &
+        "$BIN" --port $((19509 + $1)) --smp 4 >>"/tmp/tsgate_cu$1/s.log" 2>&1 &
 }
-trap 'kill_cluster 494' EXIT
+trap 'kill_cluster 1951' EXIT
 
 for i in 1 2 3; do start_node $i; done
 wait_all_led "$PORTS" 4096 120 || gate_exit
 
 echo "=== kill node 3, then write $BATCHES x 10k points with it down ==="
-pkill -u "$(id -u)" -9 -f "timestar_http_server.*--port 49412"
+pkill -u "$(id -u)" -9 -f "timestar_http_server.*--port 19512"
 sleep 3
 # WAIT FOR RE-ELECTION BEFORE MEASURING. Node 3 led ~1/3 of the VShards; killing it
 # leaves those leaderless until the surviving pair re-elects, and a write to one of them
@@ -133,16 +133,16 @@ sleep 3
 # gate's -- measuring through it conflates failover with catch-up. With leadership settled
 # on the surviving pair and a 2-of-3 quorum intact, ZERO errors is the right bar, and it
 # is the bar that exposed the stuck-transfer defect above.
-wait_all_led "49410 49411" 4096 90 || gate_exit
+wait_all_led "19510 19511" 4096 90 || gate_exit
 # ...and settled, not merely elected. `wait_all_led` returns as soon as every VShard has
 # SOME leader, which on a freshly bereaved cluster is the middle of a leadership
 # reshuffle: a write landing on a VShard that is mid-transfer is an honest bounded 503,
 # and measuring through that reshuffle is measuring failover again. (Observed: 50/400
 # errors in a 6 s burst covering the whole bench when it started immediately after
 # wait_all_led, against 106/400 before the stuck-transfer fixes and 0 once settled.)
-wait_leadership_settled "49410 49411" 40 || gate_exit
+wait_leadership_settled "19510 19511" 40 || gate_exit
 
-"$BENCH" --server-port 49410 -c 4 --batches "$BATCHES" --batch-size 10000 --verify 0 \
+"$BENCH" --server-port 19510 -c 4 --batches "$BATCHES" --batch-size 10000 --verify 0 \
     --warmup 5 --connections 8 --hosts 1000 --racks 2 >/tmp/tsgate_cu_bench.txt 2>&1
 grep -E "Requests:|Throughput|batch latency" /tmp/tsgate_cu_bench.txt | sed 's/^/  /'
 OK_REQS=$(grep -oE '[0-9]+ OK' /tmp/tsgate_cu_bench.txt | head -1 | cut -d' ' -f1)
@@ -171,7 +171,7 @@ echo "  campaign with one replica down: ${OK_REQS:-?} OK, ${HTTP_ERRS:-?} bounde
 
 # A probe write whose points must be readable ON NODE 3 once it has caught up.
 TS=$(date +%s)000000000
-curl -s -m10 -X POST "http://127.0.0.1:49410/write" -H 'Content-Type: application/json' \
+curl -s -m10 -X POST "http://127.0.0.1:19510/write" -H 'Content-Type: application/json' \
     -d "{\"measurement\":\"catchup\",\"tags\":{\"probe\":\"p1\"},\"fields\":{\"value\":42.5},\"timestamp\":$TS}" \
     >/dev/null
 sleep 2
@@ -182,12 +182,12 @@ sleep 2
 echo "=== check the snapshot producer compacted the survivors' logs ==="
 SNAP_TAKEN=0
 for _ in $(seq 1 30); do
-    SNAP_TAKEN=$(( $(status_field "$(cluster_status 49410)" snapshots_taken) \
-                 + $(status_field "$(cluster_status 49411)" snapshots_taken) ))
+    SNAP_TAKEN=$(( $(status_field "$(cluster_status 19510)" snapshots_taken) \
+                 + $(status_field "$(cluster_status 19511)" snapshots_taken) ))
     [ "${SNAP_TAKEN:-0}" -gt 0 ] && break
     sleep 2
 done
-for p in 49410 49411; do
+for p in 19510 19511; do
     S=$(cluster_status "$p")
     echo "  node $p: snapshot_trigger=$(printf '%s' "$S" | grep -o '"snapshot_trigger":[a-z]*' | cut -d: -f2)" \
          "sweeps=$(status_field "$S" snapshot_sweeps)" \
@@ -210,14 +210,14 @@ assert_ge "snapshots taken while node 3 was down" "${SNAP_TAKEN:-0}" 1
 assert_eq "snapshots refused as too large" "$(cat /tmp/tsgate_cu*/s.log | grep -c 'NOT compacting VShard')" 0
 
 echo "=== restart node 3 and wait for it to catch up ==="
-LED_BEFORE=$(( $(status_field "$(cluster_status 49410)" vshards_led) + $(status_field "$(cluster_status 49411)" vshards_led) ))
+LED_BEFORE=$(( $(status_field "$(cluster_status 19510)" vshards_led) + $(status_field "$(cluster_status 19511)" vshards_led) ))
 echo "  nodes 1-2 lead $LED_BEFORE VShards between them"
 start_node 3
 CAUGHT=0
 for _ in $(seq 1 150); do   # up to 5 minutes
     sleep 2
     OK=1
-    for p in 49410 49411; do
+    for p in 19510 19511; do
         S=$(cluster_status "$p")
         LED=$(status_field "$S" vshards_led)
         C3=$(printf '%s' "$S" | grep -o '"3":[0-9]*' | head -1 | cut -d: -f2)
@@ -228,14 +228,14 @@ for _ in $(seq 1 150); do   # up to 5 minutes
     done
     if [ "$OK" = "1" ]; then CAUGHT=1; break; fi
 done
-for p in 49410 49411; do
+for p in 19510 19511; do
     S=$(cluster_status "$p")
     echo "  node $p: led=$(status_field "$S" vshards_led) peer3_caught_up=$(printf '%s' "$S" | grep -o '"3":[0-9]*' | head -1 | cut -d: -f2)"
 done
 assert_eq "node 3 caught up on every group its peers lead" "$CAUGHT" 1
 
 # It is not caught up in any useful sense unless it can ANSWER for the data.
-READ=$(curl -s -m15 -X POST "http://127.0.0.1:49412/query" -H 'Content-Type: application/json' \
+READ=$(curl -s -m15 -X POST "http://127.0.0.1:19512/query" -H 'Content-Type: application/json' \
     -d "{\"query\":\"avg:catchup(value){probe:p1}\",\"startTime\":$((TS - 1000000000)),\"endTime\":$((TS + 1000000000))}")
 if printf '%s' "$READ" | grep -q '42.5'; then
     gate_ok "the probe point is readable on the restarted node"
@@ -251,15 +251,15 @@ fi
 # AppendEntries catch-up satisfies just as well -- and would keep satisfying after a
 # chunked-InstallSnapshot regression. There is no other externally visible difference
 # between the two paths.
-CHUNKS_SENT=$(( $(status_field "$(cluster_status 49410)" snapshot_chunks_sent) \
-              + $(status_field "$(cluster_status 49411)" snapshot_chunks_sent) ))
-INSTALLED=$(status_field "$(cluster_status 49412)" snapshots_installed)
-UNDELIVERABLE=$(( $(status_field "$(cluster_status 49410)" snapshots_undeliverable) \
-                + $(status_field "$(cluster_status 49411)" snapshots_undeliverable) ))
-RESTARTED=$(( $(status_field "$(cluster_status 49410)" snapshot_transfers_restarted) \
-            + $(status_field "$(cluster_status 49411)" snapshot_transfers_restarted) ))
-ABANDONED=$(( $(status_field "$(cluster_status 49410)" snapshot_transfers_abandoned) \
-            + $(status_field "$(cluster_status 49411)" snapshot_transfers_abandoned) ))
+CHUNKS_SENT=$(( $(status_field "$(cluster_status 19510)" snapshot_chunks_sent) \
+              + $(status_field "$(cluster_status 19511)" snapshot_chunks_sent) ))
+INSTALLED=$(status_field "$(cluster_status 19512)" snapshots_installed)
+UNDELIVERABLE=$(( $(status_field "$(cluster_status 19510)" snapshots_undeliverable) \
+                + $(status_field "$(cluster_status 19511)" snapshots_undeliverable) ))
+RESTARTED=$(( $(status_field "$(cluster_status 19510)" snapshot_transfers_restarted) \
+            + $(status_field "$(cluster_status 19511)" snapshot_transfers_restarted) ))
+ABANDONED=$(( $(status_field "$(cluster_status 19510)" snapshot_transfers_abandoned) \
+            + $(status_field "$(cluster_status 19511)" snapshot_transfers_abandoned) ))
 echo "  snapshot transfer: chunks_sent=$CHUNKS_SENT installed_on_node3=${INSTALLED:-0}" \
      "undeliverable=$UNDELIVERABLE restarted=$RESTARTED abandoned=$ABANDONED"
 assert_ge "InstallSnapshot chunks sent by the survivors" "${CHUNKS_SENT:-0}" 1

@@ -30,7 +30,7 @@ BIN="${1:-$BUILD_DIR/bin/timestar_http_server}"
 [ -x "$BIN" ] || { echo "no server binary at $BIN"; exit 2; }
 BENCH="$BUILD_DIR/bin/timestar_insert_bench"
 [ -x "$BENCH" ] || { echo "no insert bench at $BENCH"; exit 2; }
-PORTS="49610 49611 49612"
+PORTS="19610 19611 19612"
 BATCHES="${GATE_BATCHES:-400}"
 PROBES="${GATE_PROBES:-50}"
 
@@ -40,16 +40,16 @@ if [ "${FREE_GB:-0}" -lt 20 ]; then
     exit 2
 fi
 
-kill_cluster 496
+kill_cluster 1961
 require_ports_free $PORTS
 for i in 1 2 3; do rm -rf "/tmp/tsgate_nk$i"; mkdir -p "/tmp/tsgate_nk$i"; done
-PEERS="127.0.0.1:49610,127.0.0.1:49611,127.0.0.1:49612"
+PEERS="127.0.0.1:19610,127.0.0.1:19611,127.0.0.1:19612"
 start_node() {
     env TIMESTAR_DATA_DIR="/tmp/tsgate_nk$1" TIMESTAR_CLUSTER_ENABLED=true TIMESTAR_CLUSTER_PARTITIONED=true \
         TIMESTAR_CLUSTER_REPLICATION_FACTOR=3 TIMESTAR_CLUSTER_NODE_ID=$1 TIMESTAR_CLUSTER_PEERS="$PEERS" \
-        "$BIN" --port $((49609 + $1)) --smp 4 >>"/tmp/tsgate_nk$1/s.log" 2>&1 &
+        "$BIN" --port $((19609 + $1)) --smp 4 >>"/tmp/tsgate_nk$1/s.log" 2>&1 &
 }
-trap 'kill_cluster 496' EXIT
+trap 'kill_cluster 1961' EXIT
 
 for i in 1 2 3; do start_node $i; done
 wait_all_led "$PORTS" 4096 120 || gate_exit
@@ -62,12 +62,12 @@ for _ in $(seq 1 12); do
     sleep 2
 done
 wait_leadership_settled "$PORTS" 40 || gate_exit
-LED3=$(status_field "$(cluster_status 49612)" vshards_led)
+LED3=$(status_field "$(cluster_status 19612)" vshards_led)
 echo "  node 3 leads $LED3 of 4096 before the kill"
 assert_ge "leadership on the node about to be killed (anti-vacuity)" "${LED3:-0}" 800
 
 echo "=== bench $BATCHES x 10k against node 1; kill -9 node 3 at t+3s ==="
-"$BENCH" --server-port 49610 -c 4 --batches "$BATCHES" --batch-size 10000 --verify 0 \
+"$BENCH" --server-port 19610 -c 4 --batches "$BATCHES" --batch-size 10000 --verify 0 \
     --warmup 5 --connections 8 --hosts 1000 --racks 2 >/tmp/tsgate_nk_bench.txt 2>&1 &
 BENCH_PID=$!
 sleep 3
@@ -77,7 +77,7 @@ if ! kill -0 "$BENCH_PID" 2>/dev/null; then
     gate_fail "the bench finished before the kill landed -- the round is vacuous (raise GATE_BATCHES)"
     gate_exit
 fi
-pkill -u "$(id -u)" -9 -f -- "--port 49612"
+pkill -u "$(id -u)" -9 -f -- "--port 19612"
 KILL_T=$(date +%s)
 echo "  node 3 killed at t+3s"
 
@@ -86,7 +86,7 @@ echo "  node 3 killed at t+3s"
 BASE_TS=1700000000000000000
 PROBE_OK=0; PROBE_5XX=0
 for i in $(seq 0 $((PROBES - 1))); do
-    CODE=$(curl -s -m10 -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:49610/write \
+    CODE=$(curl -s -m10 -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:19610/write \
         -H 'Content-Type: application/json' \
         -d "{\"measurement\":\"nkprobe\",\"tags\":{\"p\":\"p$i\"},\"fields\":{\"v\":1.0},\"timestamp\":$((BASE_TS + i * 1000000000))}")
     case "$CODE" in
@@ -124,7 +124,7 @@ assert_ge "batches accepted (anti-vacuity)" "${OK_REQS:-0}" "$((BATCHES / 4))"
 # while still failing a run that acked essentially nothing.
 assert_ge "probe writes acked during the outage (anti-vacuity)" "$PROBE_OK" 10
 sleep 3
-for p in 49610 49611; do
+for p in 19610 19611; do
     R=$(curl -s -m20 -X POST "http://127.0.0.1:$p/query" -H 'Content-Type: application/json' \
         -d "{\"query\":\"count:nkprobe(v)\",\"startTime\":$((BASE_TS - 1000000000)),\"endTime\":$((BASE_TS + PROBES * 1000000000)),\"aggregationInterval\":\"1h\"}")
     # A FAILED read must not be scored as "no data": that is the whole QUERY_INCOMPLETE
