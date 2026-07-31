@@ -28,6 +28,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 using timestar::data::BalanceGroup;
@@ -207,6 +208,10 @@ TEST(LeadershipBalanceTest, ANodeThatReplicatesNothingWeHostIsNeverATarget) {
     auto groups = hostedGroups(9, pairs, {1, 1, 1, 1, 1, 1, 1, 2, 3});
     auto p = planLeadershipBalance(groups, kSelf, {1, 2, 3, 4}, 100);
     EXPECT_EQ(p.expected.count(4), 0u);
+    // Anti-vacuity: there ARE targets to look through, so "node 4 is not among them" is a
+    // statement about the choice and not about an empty list.
+    ASSERT_FALSE(p.targets.empty());
+    ASSERT_TRUE(p.viable());
     for (size_t i = 0; i < p.targets.size(); ++i)
         EXPECT_NE(p.targetAt(i), 4u) << "node 4 replicates none of our groups";
 }
@@ -245,14 +250,23 @@ TEST(LeadershipBalanceTest, TheBudgetIsWhatWeHoldAboveFairShareCappedByMaxTransf
 }
 
 TEST(LeadershipBalanceTest, APassWithNothingToDoIsNotViable) {
+    // The five shapes, and they must reach the two DIFFERENT early returns: (a) leaves on
+    // the fair-share test, (b) on the empty-target list, (c)-(e) on the caller's arguments.
     const std::vector<std::vector<NodeId>> pairs = {{2, 3}};
     // (a) we are at our own share.
     auto even = hostedGroups(9, pairs, {1, 1, 1, 2, 2, 2, 3, 3, 3});
     EXPECT_FALSE(planLeadershipBalance(even, kSelf, {1, 2, 3}, 100).viable());
-    // (b) we are above share but no peer is below its own (they lead groups on other
-    //     shards; over THIS survey nobody is short).
-    auto noRoom = hostedGroups(3, pairs, {1, 2, 3});
-    auto p = planLeadershipBalance(noRoom, kSelf, {1, 2, 3}, 100);
+    // (b) we are above share and yet NO peer is below its own -- the `targets.empty()`
+    //     shape, which needs leadership held by a node the pass was not given. Nine groups
+    //     over voters {1,2,3}, shares 3 each, led [4, 3, 2] -- but node 3 is absent from
+    //     the peer list (a node being removed, or a list read before it joined). We are
+    //     above share, peer 2 is exactly at its share, and there is nobody to give to.
+    //     (An earlier draft used a case that returned from the SAME branch as (a) and so
+    //     left this one untested.)
+    auto noRoom = fullMembership(9, {1, 2, 3}, {1, 1, 1, 1, 2, 2, 2, 3, 3});
+    auto p = planLeadershipBalance(noRoom, kSelf, {1, 2}, 100);
+    ASSERT_EQ(p.mine.size(), 4u);
+    ASSERT_GT(static_cast<double>(p.mine.size()), p.expected.at(kSelf)) << "we must really be above share here";
     EXPECT_TRUE(p.targets.empty());
     EXPECT_FALSE(p.viable());
     // (c) degenerate callers.
@@ -450,37 +464,123 @@ TEST(LeadershipBalanceTest, TheCursorAdvancesOnAnUnarmedAttemptToo) {
 
 // --- the extraction is the balancer, not a copy of it ------------------------------------
 
-TEST(LeadershipBalanceTest, TheBalancerLoopHoldsNoArithmeticOfItsOwn) {
-    // WHAT MAKES EVERY TEST ABOVE A TEST OF THE BALANCER. The loop cannot be unit-tested
-    // (it needs a whole ReplicatedDataPlane), so behaviour preservation rests on the loop
-    // CONSUMING the extracted functions rather than re-deriving anything. If the
-    // arithmetic creeps back into `rebalance`, these tests keep passing while the balancer
-    // changes -- which is exactly the drift D-23 files against the liveness predicate.
+namespace {
+
+// Strip C and C++ comments and string/char literals, so the checks below are claims about
+// CODE. (A comment quoting the old formula -- this file's own header does -- must not
+// trip them, and the earlier version of this test, which stripped only `//`, would have
+// been fooled by a `/* */` one.)
+std::string stripCommentsAndLiterals(const std::string& src) {
+    std::string out;
+    enum { kCode, kLine, kBlock, kStr, kChar } st = kCode;
+    for (size_t i = 0; i < src.size(); ++i) {
+        const char c = src[i];
+        const char n = i + 1 < src.size() ? src[i + 1] : '\0';
+        switch (st) {
+            case kCode:
+                if (c == '/' && n == '/') {
+                    st = kLine;
+                    ++i;
+                } else if (c == '/' && n == '*') {
+                    st = kBlock;
+                    ++i;
+                } else if (c == '"') {
+                    st = kStr;
+                } else if (c == '\'') {
+                    st = kChar;
+                } else {
+                    out += c;
+                }
+                break;
+            case kLine:
+                if (c == '\n') {
+                    st = kCode;
+                    out += '\n';
+                }
+                break;
+            case kBlock:
+                if (c == '*' && n == '/') {
+                    st = kCode;
+                    ++i;
+                }
+                break;
+            case kStr:
+                if (c == '\\')
+                    ++i;
+                else if (c == '"')
+                    st = kCode;
+                break;
+            case kChar:
+                if (c == '\\')
+                    ++i;
+                else if (c == '\'')
+                    st = kCode;
+                break;
+        }
+    }
+    return out;
+}
+
+// The brace-matched body of the named member function, from stripped source.
+std::string functionBody(const std::string& stripped, const std::string& signature) {
+    const size_t at = stripped.find(signature);
+    if (at == std::string::npos)
+        return {};
+    const size_t open = stripped.find('{', at);
+    if (open == std::string::npos)
+        return {};
+    int depth = 0;
+    for (size_t i = open; i < stripped.size(); ++i) {
+        if (stripped[i] == '{')
+            ++depth;
+        else if (stripped[i] == '}' && --depth == 0)
+            return stripped.substr(open, i - open + 1);
+    }
+    return {};
+}
+
+}  // namespace
+
+TEST(LeadershipBalanceTest, TheBalancerLoopSpellsNoShareArithmeticOfItsOwn) {
+    // WHAT THIS DOES AND DOES NOT PROVE -- stated precisely, because the first version of
+    // this test claimed more than it could deliver and an adversarial review defeated it
+    // by re-inlining the fair-share computation with respelled identifiers.
+    //
+    // It CANNOT prove the loop is free of arithmetic; that is a semantic property and this
+    // is a text check. What it enforces is a token-CLASS bar over the brace-matched body of
+    // `rebalance`: no division, no floating-point type or literal, no associative
+    // container, no compound accumulation. A fair share is a SUM OF RECIPROCALS
+    // accumulated per node, so any re-derivation of it -- however its variables are named
+    // -- has to divide and has to accumulate somewhere, and trips this. The survey and the
+    // await, which is all the loop is now, need none of them.
+    //
+    // The real evidence that the extraction is behaviour-preserving remains the diff.
 #ifdef SHARD_RAFT_PLANE_SOURCE_PATH
     std::ifstream in(SHARD_RAFT_PLANE_SOURCE_PATH);
     ASSERT_TRUE(in.is_open()) << "could not open " << SHARD_RAFT_PLANE_SOURCE_PATH;
     std::ostringstream ss;
     ss << in.rdbuf();
-    const std::string raw = ss.str();
+    const std::string body = functionBody(stripCommentsAndLiterals(ss.str()), "future<size_t> rebalance(");
+    ASSERT_FALSE(body.empty()) << "could not locate the body of ShardRaftPlane::rebalance";
+    ASSERT_GT(body.size(), 200u) << "the located body is implausibly short -- the matcher is broken, "
+                                    "and a broken matcher passes every check below vacuously";
 
-    // Comments are stripped: this is a claim about the CODE, and a comment quoting the old
-    // formula (this file's own header does) must not trip it.
-    std::string code;
-    std::istringstream lines(raw);
-    for (std::string line; std::getline(lines, line);) {
-        const size_t c = line.find("//");
-        code += (c == std::string::npos ? line : line.substr(0, c));
-        code += '\n';
-    }
-
-    for (const char* needle : {"data::planLeadershipBalance(groups, self, peers, maxTransfers)", "pass.chooseTarget(",
-                               "pass.recordAttempt(chosen, armed)", "co_return pass.done();"})
-        EXPECT_NE(code.find(needle), std::string::npos)
+    for (const char* needle : {"planLeadershipBalance(", "chooseTarget(", "recordAttempt(", "pass.done()"})
+        EXPECT_NE(body.find(needle), std::string::npos)
             << "rebalance no longer consumes the extracted plan: missing " << needle;
 
-    for (const char* forbidden : {"1.0 / static_cast<double>", "--deficit", "fairSelf", "targets.push_back"})
-        EXPECT_EQ(code.find(forbidden), std::string::npos)
-            << "the balancer's arithmetic is back in the loop, where nothing pins it: " << forbidden;
+    // (token, what re-deriving a share would need it for)
+    const std::vector<std::pair<std::string, std::string>> forbidden = {
+        {"/", "a share is a sum of RECIPROCALS -- re-deriving one has to divide"},
+        {"double", "shares are fractional; an inlined one needs a floating-point type"},
+        {".0", "a floating-point literal (1.0 / n, 0.0 seeds) belongs to the arithmetic"},
+        {"std::map", "per-node shares and led counts are accumulated in a keyed container"},
+        {"+=", "accumulating anything per node is the extraction's job"},
+    };
+    for (const auto& [token, why] : forbidden)
+        EXPECT_EQ(body.find(token), std::string::npos)
+            << "the balancer's arithmetic looks to be back in the loop, where nothing pins it -- "
+            << "found `" << token << "`: " << why;
 #else
     GTEST_SKIP() << "SHARD_RAFT_PLANE_SOURCE_PATH not defined";
 #endif
