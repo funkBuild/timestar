@@ -81,7 +81,9 @@ public:
                                                  std::optional<seastar::lowres_clock::time_point> deadline);
     seastar::future<> campaign();
     seastar::future<bool> proposeConfChange(std::vector<NodeId> voters, std::vector<NodeId> learners);
-    seastar::future<> transferLeadership(NodeId target);
+    // true iff a transfer was actually ARMED by this call (debt D-24); see
+    // RaftNode::transferLeadership for the early returns that answer false.
+    seastar::future<bool> transferLeadership(NodeId target);
     // Trigger a state-machine snapshot compaction up to `upto` with the given
     // opaque payload (the caller produced it from its state machine).
     seastar::future<> compact(LogIndex upto, std::string snapshotData);

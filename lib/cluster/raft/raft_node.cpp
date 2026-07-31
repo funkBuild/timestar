@@ -844,9 +844,11 @@ void RaftNode::sendTimeoutNow(NodeId target) {
     send(Message{.to = target, .from = id_, .payload = tn});
 }
 
-void RaftNode::transferLeadership(NodeId target) {
+bool RaftNode::transferLeadership(NodeId target) {
+    // Every `return false` below is a call that DID NOTHING, and the caller has no other
+    // way to know (debt D-24): the balancer counted all of them as transfers initiated.
     if (role_ != Role::Leader || target == id_ || !isVoter(target))
-        return;
+        return false;
     // A REPEAT REQUEST FOR THE TRANSFER ALREADY IN FLIGHT IS IGNORED (etcd's behaviour;
     // write-scaleout 5 review, F2). Without this, resetting the window unconditionally
     // DEFEATS the abandon-after-one-election-timeout bound: any caller re-requesting the
@@ -859,13 +861,14 @@ void RaftNode::transferLeadership(NodeId target) {
     // Only a change of TARGET restarts the window: that is a genuinely new transfer, and
     // it deserves its own full window.
     if (leadTransferee_ == target)
-        return;
+        return false;
     leadTransferee_ = target;
     transferElapsed_ = 0;
     if (matchIndex_[target] == log_.lastIndex())
         sendTimeoutNow(target);  // already caught up: elect now
     else
         sendAppend(target);  // catch it up first; TimeoutNow fires on the ack
+    return true;
 }
 
 void RaftNode::checkQuorumOrStepDown() {

@@ -73,8 +73,7 @@ public:
             auto sm = std::make_unique<RecordingSM>();
             auto transport = std::make_unique<QueueTransport>(*this);
             RaftNode node(id, voters, RaftLog{}, HardState{}, opts);
-            auto group = std::make_unique<RaftGroup>(/*groupId=*/1, std::move(node), *persistence,
-                                                     *transport, *sm);
+            auto group = std::make_unique<RaftGroup>(/*groupId=*/1, std::move(node), *persistence, *transport, *sm);
             persistence_[id] = std::move(persistence);
             sm_[id] = std::move(sm);
             transport_[id] = std::move(transport);
@@ -178,7 +177,31 @@ seastar::future<> testConfChangeThroughDriver() {
     EXPECT_EQ(net.group(1).node().config().voters, (std::vector<NodeId>{1, 2}));
 }
 
+// THE DRIVER MUST PROPAGATE "did a transfer actually start?" (debt D-24). The balancer's
+// `transfers_initiated` counter reaches RaftNode through THIS seam, so a driver that
+// swallowed the answer would leave the counter inflated no matter what the core reports --
+// and the deposed-primary gate asserts an anti-vacuity floor on it.
+seastar::future<> testTransferLeadershipReportsThroughTheDriver() {
+    GroupNetwork net({1, 2, 3}, opts());
+    co_await net.group(1).campaign();
+    co_await net.pump();
+    EXPECT_EQ(net.leader(), 1u);
+
+    EXPECT_FALSE(co_await net.group(2).transferLeadership(3)) << "a FOLLOWER cannot transfer anything";
+    EXPECT_FALSE(co_await net.group(1).transferLeadership(1)) << "transferring to ourselves starts nothing";
+    EXPECT_FALSE(co_await net.group(1).transferLeadership(9)) << "node 9 is not a voter of this group";
+
+    EXPECT_TRUE(co_await net.group(1).transferLeadership(2)) << "a genuine transfer must report itself started";
+    EXPECT_TRUE(net.group(1).transferInFlight());
+    EXPECT_FALSE(co_await net.group(1).transferLeadership(2))
+        << "the F2 re-arm guard ignored the repeat request but reported it as a transfer initiated";
+}
+
 }  // namespace
+
+TEST(RaftGroupTest, TransferLeadershipReportsThroughTheDriver) {
+    testTransferLeadershipReportsThroughTheDriver().get();
+}
 
 TEST(RaftGroupTest, ElectsAndReplicatesThroughTheAsyncDriver) {
     testElectAndReplicate().get();

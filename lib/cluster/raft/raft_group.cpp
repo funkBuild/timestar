@@ -342,10 +342,15 @@ seastar::future<bool> RaftGroup::proposeConfChange(std::vector<NodeId> voters, s
     co_return ok;
 }
 
-seastar::future<> RaftGroup::transferLeadership(NodeId target) {
+seastar::future<bool> RaftGroup::transferLeadership(NodeId target) {
     auto units = co_await seastar::get_units(lock_, 1);
-    node_.transferLeadership(target);
+    // Propagated, not discarded (debt D-24): the balancer's transfers_initiated counter is
+    // only honest if it counts transfers that were actually ARMED, and this is the only
+    // layer that knows. Ready is drained either way -- a call that started nothing may
+    // still have output pending from something else.
+    const bool started = node_.transferLeadership(target);
     co_await drainReady();
+    co_return started;
 }
 
 seastar::future<> RaftGroup::compact(LogIndex upto, std::string snapshotData) {

@@ -180,7 +180,15 @@ public:
     // Leader transfer (§3.10): hand leadership to `target` (a voter). The current
     // leader first ensures `target` is caught up, then sends it a TimeoutNow so it
     // elects immediately. No-op if we are not the leader or target is not a voter.
-    void transferLeadership(NodeId target);
+    //
+    // RETURNS WHETHER A TRANSFER WAS ACTUALLY STARTED (debt D-24) -- i.e. whether
+    // `leadTransferee_` went from unset to set on this call. Every early return above
+    // answers false, including the F2 re-arm guard (`leadTransferee_ == target`), which
+    // is the one the balancer could not see: it counted a repeat request for the transfer
+    // already in flight as a transfer initiated, and the deposed-primary gate asserts an
+    // anti-vacuity FLOOR on that counter, so the inflation made the assertion weaker than
+    // it reads. A caller that keeps a counter must count THIS, not the call.
+    bool transferLeadership(NodeId target);
 
     // Request a linearizable ReadIndex barrier for `context` (leader only). Starts
     // a heartbeat confirmation round; the barrier surfaces in Ready.readStates

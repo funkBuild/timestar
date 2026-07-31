@@ -345,6 +345,56 @@ TEST(RaftTransferAbortTest, RepeatingTheSameTransferDoesNotReArmTheAbortWindow) 
         << "refuses proposals for as long as something keeps asking (write-scaleout 5 review, F2)";
 }
 
+// ...AND THE REPEAT REQUEST MUST REPORT THAT IT STARTED NOTHING (debt D-24). The guard
+// above is silent, so a caller keeping a counter -- `ShardRaftPlane::rebalance`, whose
+// `transfers_initiated` the deposed-primary gate asserts an anti-vacuity FLOOR on --
+// counted every re-request as a transfer. D-12 closed the non-voter door into the same
+// counter; this is the other one.
+TEST(RaftTransferAbortTest, TransferLeadershipReportsWhetherItStartedOne) {
+    RaftNode leader = makeIsolatedLeader({1, 2, 3});
+    ackFully(leader, 2);
+
+    EXPECT_FALSE(leader.transferLeadership(1)) << "transferring to ourselves starts nothing";
+    EXPECT_FALSE(leader.transferLeadership(9)) << "node 9 is not a voter of this group (the D-12 door)";
+    EXPECT_TRUE(leader.transferLeadership(3)) << "a genuine transfer must report itself started";
+    EXPECT_FALSE(leader.transferLeadership(3)) << "the F2 re-arm guard started nothing and must say so";
+    EXPECT_TRUE(leader.transferLeadership(2)) << "a NEW target is a new transfer";
+
+    // A follower cannot transfer anything either.
+    RaftNode follower(2, {1, 2, 3}, RaftLog{}, HardState{}, transferOpts());
+    EXPECT_FALSE(follower.transferLeadership(3));
+}
+
+// THE COUNTER, UNDER THE BALANCER'S OWN CALL PATTERN. `rebalance` runs periodically and
+// re-picks the same peer while its deficit stands, so "ask on every pass" is the production
+// shape, not a corner. Counting the CALLS reported one transfer per pass; counting what the
+// call ARMED reports one per window. The ground truth here is the number of times
+// `leadTransferee_` actually went from unset to set, sampled independently of the return
+// value -- so the test cannot pass by trusting the thing it is checking.
+TEST(RaftTransferAbortTest, RepeatedPassesCountOneTransferPerWindowNotOnePerPass) {
+    RaftNode leader = makeIsolatedLeader({1, 2, 3});
+    ackFully(leader, 2);  // node 3 never acks: the transfer can only ever be abandoned
+
+    unsigned reported = 0, actuallyArmed = 0, passes = 0;
+    for (unsigned tick = 0; tick < 4 * leader.transferTimeout(); ++tick) {
+        if (tick % 2 == 0) {  // a balancer pass, faster than the window expires
+            ++passes;
+            const bool before = leader.transferInFlight();
+            const bool started = leader.transferLeadership(3);
+            if (!before && leader.transferInFlight())
+                ++actuallyArmed;
+            if (started)
+                ++reported;
+        }
+        leader.tick();
+    }
+
+    EXPECT_EQ(reported, actuallyArmed) << "transfers_initiated counted " << reported << " transfers where "
+                                       << actuallyArmed << " were armed (debt D-24)";
+    EXPECT_GT(actuallyArmed, 0u) << "nothing was ever armed, so the equality above is vacuous";
+    EXPECT_LT(reported, passes) << "every pass was counted, so this pattern cannot show the difference";
+}
+
 // ...but a transfer to a DIFFERENT target is a new transfer and gets its own full window.
 TEST(RaftTransferAbortTest, ChangingTheTargetRestartsTheWindow) {
     RaftNode leader = makeIsolatedLeader({1, 2, 3});

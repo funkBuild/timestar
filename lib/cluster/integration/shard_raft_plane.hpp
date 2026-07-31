@@ -608,9 +608,25 @@ public:
                 continue;  // no peer can take this group right now; try the next one
             auto& [target, deficit] = targets[chosen];
             try {
-                co_await g->transferLeadership(target);
-                --deficit;
-                ++done;
+                // COUNT WHAT WAS ARMED, NOT WHAT WAS ASKED (debt D-24). The candidate
+                // filter above refuses non-voters and peers that are not caught up, but
+                // `RaftNode::transferLeadership` has one more silent early return this
+                // loop cannot see: the F2 re-arm guard, which ignores a repeat request for
+                // the transfer ALREADY in flight to that same target. The balancer runs on
+                // a period comparable to the abandon window, so that is not a corner --
+                // and counting it inflated `transfers_initiated`, which the
+                // deposed-primary gate asserts an anti-vacuity FLOOR on. An inflated
+                // counter makes that assertion weaker than it reads, in the direction that
+                // hides a balancer doing nothing.
+                //
+                // `deficit` is charged on the same condition: an unarmed transfer moves no
+                // leadership, so spending the target's deficit on it would make the rest
+                // of the pass skip a peer that still needs groups.
+                const bool started = co_await g->transferLeadership(target);
+                if (started) {
+                    --deficit;
+                    ++done;
+                }
                 ++ti;
             } catch (...) {
                 ++ti;  // next pass retries
