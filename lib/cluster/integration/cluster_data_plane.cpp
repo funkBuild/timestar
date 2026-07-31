@@ -56,6 +56,26 @@ inline constexpr bool kCheckQuorumDefault = false;
 // (D-30). Only the environment read and the logging are here: the property the release
 // ordering depends on -- that no runtime input can turn the guard ON -- is a claim about
 // `resolveCheckQuorum`, and a claim nothing can call is a claim nothing can check.
+//
+// WHICH LEAVES *THIS FUNCTION* AS THE REMAINING WAY TO REVOKE IT, and no test covers this
+// body: it reads the real environment of a real process, so a unit test cannot exercise it
+// without mutating global state the rest of the suite shares. The pinned property protects
+// the DECISION, not this call site. Concretely, the edit shapes that would defeat it, none
+// of which would fail a single test:
+//
+//   * returning something other than `on` from any branch below -- e.g. "return true" in
+//     the EnableRefused arm, which reads like completing an obvious omission;
+//   * `resolveCheckQuorum(kCheckQuorumDefault || ov == ...EnableRefused, ov)`, or any other
+//     expression that lets the override reach the first argument;
+//   * a second getenv here (`..._FORCE`, `..._ENABLE`) consulted after the resolve;
+//   * assigning `ropts.checkQuorum` at the construction site from anything but this
+//     function.
+//
+// The rule is one line: **the override may only ever narrow the build default.** If a
+// future change needs an enable knob, it needs ADR 0005 mechanism (c) first -- that is the
+// whole of debt D-30. The construction site backs this up with a runtime fail-closed check
+// on the value this returns, so the first four shapes above throw at node start rather than
+// shipping; only an edit that also removes THAT check gets through.
 bool checkQuorumEnabled() {
     const char* e = std::getenv("TIMESTAR_CLUSTER_CHECKQUORUM");
     const auto ov = parseCheckQuorumOverride(e);
@@ -400,6 +420,18 @@ seastar::future<> ClusterDataPlane::start(const ClusterConfig& cfg, seastar::sha
         //   RaftProposeDeadlineTest.CheckQuorumFailsAQuorumLessWriteOnItsOwn -- the
         //     property the guard is wanted FOR, on its own RaftOptions
         ropts.checkQuorum = checkQuorumEnabled();
+        // FAIL-CLOSED AT THE ONLY SITE THAT MATTERS (debt D-30). `resolveCheckQuorum` is
+        // pure and pinned; `checkQuorumEnabled()` above is not covered by any test,
+        // because it reads a real process environment. This assertion is what makes the
+        // uncovered part unable to lie: whatever that function grows into, the guard
+        // cannot end up ON while the BUILD default is off -- which is the exact property
+        // the release ordering rests on (no runtime input may enable it; see ADR 0005
+        // mechanism (c)). Cheap: once per node start.
+        if (ropts.checkQuorum && !kCheckQuorumDefault)
+            throw std::runtime_error(
+                "cluster: CheckQuorum resolved ON while the build default is OFF -- the override is disable-only by "
+                "design (ADR 0005 mechanism (c) is not built, so enabling per node is the mixed-version hazard that "
+                "ADR exists to prevent). Flip kCheckQuorumDefault to enable it, in a build, for the whole cluster");
         {
             std::map<unsigned, std::vector<std::pair<uint16_t, std::vector<data::NodeId>>>> byShard;
             for (const auto& [vshard, voters] : rt_->localReplicaGroups())
