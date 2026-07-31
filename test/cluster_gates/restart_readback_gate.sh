@@ -65,8 +65,8 @@ fi
 # next gate then measures a box with no headroom, which is self-amplifying and reads
 # exactly like a regression (see the README's ONE AT A TIME section).
 cleanup() {
-    kill_cluster 1973
-    rm -rf /tmp/tsgate_rr1 /tmp/tsgate_rr2 /tmp/tsgate_rr3 /tmp/tsgate_rr_bench.txt
+    gate_cleanup 1973 /tmp/tsgate_rr1 /tmp/tsgate_rr2 /tmp/tsgate_rr3
+    rm -f /tmp/tsgate_rr_bench.txt
 }
 trap cleanup EXIT
 

@@ -29,7 +29,7 @@ start_node() {
         TIMESTAR_CLUSTER_REPLICATION_FACTOR=3 TIMESTAR_CLUSTER_NODE_ID=$1 TIMESTAR_CLUSTER_PEERS="$PEERS" \
         "$BIN" --port $((19219 + $1)) --smp 4 >>"/tmp/tsgate_rb$1/s.log" 2>&1 &
 }
-trap 'kill_cluster 1922' EXIT
+trap 'gate_cleanup 1922 /tmp/tsgate_rb1 /tmp/tsgate_rb2 /tmp/tsgate_rb3' EXIT
 
 # Two-node phase: a 2-of-3 quorum elects leaders for every VShard between nodes 1 and 2.
 start_node 1; start_node 2

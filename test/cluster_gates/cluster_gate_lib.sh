@@ -68,6 +68,41 @@ kill_cluster() { # $1 = port prefix used by this gate, e.g. 492
     sleep 2
 }
 
+# gate_cleanup PREFIX DATADIR... -- kill this gate's cluster AND RECLAIM ITS DISK.
+#
+# THE rm IS THE POINT, and it is not tidiness. These gates run on a tmpfs /tmp with a
+# per-user QUOTA, and a gate that leaves 3-10 G of data dirs behind does not merely waste
+# space: the next gate's bench slows down, the 0.3 s resetter fires more rounds, it slows
+# further, and the run fails as a plausible-looking "regression" (the README's
+# self-amplifying failure). Left unattended it exhausts the quota outright, at which point
+# "Disk quota exceeded" reaches every process on the box -- including the shell driving
+# the gate, which is how one session lost its whole harness mid-run.
+#
+# Only `restart_readback_gate.sh` did this before; every other gate leaked its dirs.
+#
+# The node LOGS are what a failed run is diagnosed from, so the tail of each is copied out
+# BEFORE the delete -- a few hundred KB that survives, instead of gigabytes that must not.
+# `GATE_KEEP_DATA=1` keeps everything, for when the tail is not enough.
+gate_cleanup() {
+    local prefix="$1"; shift
+    kill_cluster "$prefix"
+    if [ "${GATE_KEEP_DATA:-0}" = "1" ]; then
+        echo "  GATE_KEEP_DATA=1: leaving $* in place ($(du -shc "$@" 2>/dev/null | tail -1 | cut -f1))"
+        return
+    fi
+    local tails="/tmp/tsgate_${prefix}_tails.log" d f
+    : >"$tails"
+    for d in "$@"; do
+        [ -d "$d" ] || continue
+        for f in "$d"/*.log; do
+            [ -f "$f" ] || continue
+            { echo "=== $f (last 300 lines) ==="; tail -n 300 "$f"; } >>"$tails"
+        done
+    done
+    rm -rf "$@"
+    echo "  cleaned: $* (log tails kept in $tails)"
+}
+
 cluster_status() { curl -s -m3 "http://127.0.0.1:$1/cluster/status" 2>/dev/null; }
 status_field() { printf '%s' "$1" | grep -o "\"$2\":[0-9]*" | cut -d: -f2; }
 

@@ -119,7 +119,7 @@ start_node() {
         TIMESTAR_WAL_SIZE_THRESHOLD="$WAL_THRESHOLD" \
         "$BIN" --port $((19509 + $1)) --smp 4 >>"/tmp/tsgate_cu$1/s.log" 2>&1 &
 }
-trap 'kill_cluster 1951' EXIT
+trap 'gate_cleanup 1951 /tmp/tsgate_cu1 /tmp/tsgate_cu2 /tmp/tsgate_cu3' EXIT
 
 for i in 1 2 3; do start_node $i; done
 wait_all_led "$PORTS" 4096 120 || gate_exit

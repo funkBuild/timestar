@@ -8,6 +8,7 @@ not probes, so they can be run from CI or a release checklist.
 |---|---|
 | `deposed_primary_gate.sh` | a write to a VShard whose PLACEMENT PRIMARY is alive but no longer leader is answered with a retryable 503 at worst and NEVER an opaque 500 (write-scaleout 3a/3b), **and** that reads work at all at RF < N: every node answers the same scatter-gather count (debt D-13) |
 | `rolling_rebalance_gate.sh` | a leadership rebalance under sustained writes costs latency, not client errors |
+| `skewed_rebalance_gate.sh` | the same, under a SKEWED load — 40 series, so the whole campaign lands on ~1% of the 4096 groups and those groups are continuously mid-append while the balancer storms (debt D-18). The concentration is MEASURED per VShard, from the per-VShard journal sizes, so the gate cannot silently decay into a copy of the rolling one |
 | `backpressure_gate.sh` | the per-shard in-flight write bound degrades to 503 + `Retry-After`, never to 500s or timeouts, and the DEFAULT budget never gets in the way |
 | `fault_injection_gate.sh` | a BURST of TCP connection resets between two live nodes costs latency, not client errors, and loses/duplicates nothing (write-scaleout 4c) |
 | `restart_catchup_gate.sh` | a follower that was DOWN through a large write campaign catches up when it returns, under the tightened Raft admission bound (write-scaleout 5.4) |
@@ -30,6 +31,26 @@ passes with 146 rounds and zero errors.
 The failure mode is self-amplifying, which makes it very convincing as a "regression":
 less headroom -> slower bench -> the 0.3 s resetter fires more rounds -> slower still. If
 a gate fails, re-run it ALONE before believing it.
+
+**Every gate now deletes its own data dirs in an EXIT trap** (`gate_cleanup` in
+`cluster_gate_lib.sh`), so "with the previous run's data dirs deleted" is the default
+rather than an instruction. It was not: only `restart_readback_gate.sh` cleaned up, and a
+session that ran several gates back to back walked the tmpfs down to nothing. That is worse
+than a slow bench — /tmp here is a tmpfs with a per-user quota, and exhausting it produces
+"Disk quota exceeded" in EVERY process on the box, including the shell driving the gate.
+One session lost its whole harness that way mid-run.
+
+The tail of each node log is copied to `/tmp/tsgate_<prefix>_tails.log` before the delete,
+so a failed run is still diagnosable; `GATE_KEEP_DATA=1` keeps everything when it is not.
+Check `df -h /tmp` and `ls -d /tmp/tsgate_*` before and after a run anyway — a gate killed
+between its `mkdir` and its trap leaves dirs behind.
+
+**Budget the disk before a run, not after.** Each bench writes
+`batches * batch-size * 10` points and the cluster keeps them at RF=3; measured here that
+is ~22 bytes per point per replica, i.e. ~6.7 G per 100 M points. `fault_injection_gate.sh`
+runs K+1 benches against ONE cluster and nothing is deleted between them, which is why its
+bench size came DOWN when it went to K storms (see its `BENCH_BATCHES` note): its measured
+peak is 27 G of the 62 G tmpfs.
 
 `restart_catchup_gate.sh` is a REGRESSION FENCE, and it says so in its own header: the
 pre-5.4 binary passes it, because at 400 batches the log tail still fits under the old
@@ -59,6 +80,7 @@ cannot reintroduce the race.
 |---|---|---|---|---|---|
 | `backpressure_gate.sh` | 19210-19212 | 20210-20212 | 21210-21212 | `1921` | `/tmp/tsgate_bp*` |
 | `rolling_rebalance_gate.sh` | 19220-19222 | 20220-20222 | 21220-21222 | `1922` | `/tmp/tsgate_rb*` |
+| `skewed_rebalance_gate.sh` | 19240-19242 | 20240-20242 | 21240-21242 | `1924` | `/tmp/tsgate_sk*` |
 | `deposed_primary_gate.sh` | 19310-19314 | 20310-20314 | 21310-21314 | `1931` | `/tmp/tsgate_dp*` |
 | `fault_injection_gate.sh` | 19410-19412 | 20410-20412 | 21410-21412 | `1941` | `/tmp/tsgate_fi*` |
 | `restart_catchup_gate.sh` | 19510-19512 | 20510-20512 | 21510-21512 | `1951` | `/tmp/tsgate_cu*` |

@@ -37,7 +37,7 @@ for i in 1 2 3; do
         TIMESTAR_CLUSTER_REPLICATION_FACTOR=3 TIMESTAR_CLUSTER_NODE_ID=$i TIMESTAR_CLUSTER_PEERS="$PEERS" \
         "$BIN" --port $((19209 + i)) --smp 4 >"/tmp/tsgate_bp$i/s.log" 2>&1 &
 done
-trap 'kill_cluster 1921' EXIT
+trap 'gate_cleanup 1921 /tmp/tsgate_bp1 /tmp/tsgate_bp2 /tmp/tsgate_bp3' EXIT
 
 wait_balanced "$PORTS" 4096 3 90 || gate_exit
 

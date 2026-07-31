@@ -41,7 +41,23 @@
 # baseline through the proxy collapsed to 9% of throughput with 214 client errors, and the
 # storm that followed inherited a sick cluster AND a longer bench (the resetter fires on a
 # fixed 0.3 s clock, so a slower bench takes MORE rounds -- 199 against the usual 145-148).
-# The two failure modes are therefore separated rather than averaged:
+#
+# THE K-STORM FORM IS NOW MEASURED TOO -- three consecutive runs of THIS text, K=3, against
+# one unchanged HEAD binary (2fdde50 + the sizing below), each run a fresh cluster:
+#
+#     run          A              B              C
+#     errors       [0 0 0] = 0    [1 0 0] = 1    [1 0 1] = 2
+#     rounds       79 79 76       77 77 76       79 80 84
+#     conns        228 231 224    221 223 219    226 243 230
+#     baseline     5.15 M         5.16 M         5.06 M pts/s, 0 errors on all three
+#     dip          86 86 87 %     88 87 87 %     87 84 88 %
+#
+# NINE storm draws: six zeros and three ones, and NO STORM DREW MORE THAN ONE. That is the
+# distribution the budget is set against -- not a guess, and the reason the budget is on the
+# TOTAL: a per-storm zero would have failed run B and run C on the same binary that passed
+# run A, which is precisely the non-reproducibility D-21 filed.
+#
+# The two failure modes are separated rather than averaged:
 #
 #   * A DIRTY BASELINE VOIDS THE RUN (exit 3), it does not fail it. The control arm failed,
 #     so the run says nothing about the fault -- reporting that as a property failure is
@@ -50,9 +66,10 @@
 #   * THE PROPERTY IS ASSERTED OVER K STORMS AGAINST A BUDGET. The storm runs
 #     GATE_STORM_ROUNDS times (default 3) against the same cluster and the gate asserts on
 #     the TOTAL client errors, with the per-storm vector printed so the distribution is
-#     visible rather than inferred. The default budget of 3 sits above the observed
-#     0-1-per-storm band and an order of magnitude below what a binary without the 4a fix
-#     produces (9-10 in a SINGLE storm, `fault_injection_ab.sh`), so it still discriminates.
+#     visible rather than inferred. The default budget sits above the observed run totals
+#     (0, 1, 2 above) and far below what a binary without the 4a fix produces -- see
+#     `fault_injection_ab.sh`, which measures both arms under an identical storm and is
+#     where the separation is actually asserted.
 #
 # The residual variance is environmental and whole-run (that void baseline), which K storms
 # inside one run cannot average away -- which is exactly why the void rule is separate.
@@ -76,19 +93,44 @@ PORTS="19410 19411 19412"
 # a proxy that never fired, or a bench that finished before the storm started, would pass.
 #
 # THESE FLOORS ARE SET AGAINST THE OBSERVED STORM, not against zero (debt D-4). They used
-# to be 8 and 8 -- about 5% of what a real run injects (147 rounds destroying 392-400
-# connections), which is barely more than the vacuity check they replaced: a storm that
-# fired 9 times would have satisfied them while proving almost nothing about a burst.
-# They are now ~50% of observed, which is the largest fraction that still leaves room for
-# a slower box (the resetter fires on a fixed 0.3 s clock while the bench length is
-# machine-dependent, so a machine that finishes the bench in half the time legitimately
-# injects half the rounds). A run that comes in under these is not a pass and is not a
-# failure of the property either -- it is a run that did not test it, and it must say so.
+# to be 8 and 8 -- about 5% of what a real run injects, which is barely more than the
+# vacuity check they replaced: a storm that fired 9 times would have satisfied them while
+# proving almost nothing about a burst. They are ~50% of observed, which is the largest
+# fraction that still leaves room for a slower box (the resetter fires on a fixed 0.3 s
+# clock while the bench length is machine-dependent, so a machine that finishes the bench
+# in half the time legitimately injects half the rounds). A run that comes in under these
+# is not a pass and is not a failure of the property either -- it is a run that did not
+# test it, and it must say so.
+#
+# They came down from 70/180 with the bench size (see BENCH_BATCHES below): 70/180 was
+# ~50% of a 2000-batch storm, and K storms of that size do not fit this box's tmpfs.
+# Per-storm observations at the current 1000 batches are in the header's table.
 #
 # If a genuinely slower/faster box needs a different number, override rather than edit:
 # GATE_MIN_RESET_ROUNDS / GATE_MIN_RESET_CONNS. Record the observed counts when you do.
-MIN_RESET_ROUNDS="${GATE_MIN_RESET_ROUNDS:-70}"
-MIN_RESET_CONNS="${GATE_MIN_RESET_CONNS:-180}"
+MIN_RESET_ROUNDS="${GATE_MIN_RESET_ROUNDS:-35}"
+MIN_RESET_CONNS="${GATE_MIN_RESET_CONNS:-100}"
+# HOW BIG EACH BENCH IS, and why K STORMS FORCED IT DOWN. Every bench here writes
+# `batches * batch-size * 10 fields` points into a cluster that keeps all of them at RF=3,
+# and NOTHING is deleted between storms -- the K storms share one cluster by design, so
+# each one lands on top of its predecessors. At the 2000 batches this gate used when it ran
+# ONE storm that is 200 M points per bench, and MEASURED here: baseline + 2 storms filled
+# 34 G of the 62 G tmpfs, with the third storm still to come. The run was killed at that
+# point; a fourth bench would have taken it past the quota, and a /tmp quota exhaustion on
+# this box does not fail the gate politely -- "Disk quota exceeded" reaches every process
+# including the shell driving it.
+#
+# So the K-storm restructure and the old bench size are not simultaneously affordable, and
+# the bench size is the right thing to give up: storm INTENSITY is set by the resetter (it
+# destroys EVERY live connection on every round, 0.3 s apart), not by how long the bench
+# runs. A shorter bench buys fewer ROUNDS, not weaker ones.
+#
+# 1000 batches => 100 M points/bench, ~4 benches/run => ~25 G peak, leaving the README's
+# headroom intact. The floors above move with it: 146-155 rounds / 400-431 connections
+# measured per storm at 2000 batches, so ~73/200 at 1000, and the floors are ~50% of that
+# (the resetter fires on a wall clock while bench length is machine-dependent, so a faster
+# box legitimately injects fewer rounds).
+BENCH_BATCHES="${GATE_BENCH_BATCHES:-1000}"
 # The dip bound, as a percentage of the quiet-through-the-proxy baseline.
 MIN_DIP_PCT="${GATE_MIN_DIP_PCT:-40}"
 # D-21: K storms per run, and a budget on their TOTAL rather than a zero on one draw. The
@@ -115,7 +157,9 @@ gate_void() {
 
 cleanup() {
     [ -n "${PROXY_PID:-}" ] && kill -9 "$PROXY_PID" 2>/dev/null
-    kill_cluster 1941
+    gate_cleanup 1941 /tmp/tsgate_fi1 /tmp/tsgate_fi2 /tmp/tsgate_fi3
+    rm -f /tmp/tsgate_fi_base.txt /tmp/tsgate_fi_storm.txt /tmp/tsgate_fi_resp.txt \
+        /tmp/tsgate_fi_rounds /tmp/tsgate_fi_stop
 }
 kill_cluster 1941
 require_ports_free 19410 19411 19412
@@ -171,7 +215,7 @@ assert_ge "VShards led behind the proxy (traffic that must cross the fault)" "${
 # Baseline: the same load through the same proxy, with NO resets. Everything below is
 # measured against this, not against an unproxied number.
 echo "=== baseline (proxy in path, no faults) ==="
-timeout 300 "$BENCH" --server-port 19410 -c 4 --batches 2000 --batch-size 10000 --verify 0 \
+timeout 300 "$BENCH" --server-port 19410 -c 4 --batches "$BENCH_BATCHES" --batch-size 10000 --verify 0 \
     --warmup 5 --connections 4 --hosts 1000 --racks 2 >/tmp/tsgate_fi_base.txt 2>&1
 # "First error" is printed here too (D-21): when the baseline DOES break, its signature is
 # the only evidence of why, and the run that first showed this had none recorded.
@@ -222,7 +266,7 @@ while [ "$storm" -le "$STORM_ROUNDS" ]; do
     # second, so the storm never fired -- the anti-vacuity assertions below exist because
     # of that.
     rm -f /tmp/tsgate_fi_stop
-    ( timeout 300 "$BENCH" --server-port 19410 -c 4 --batches 2000 --batch-size 10000 --verify 0 \
+    ( timeout 300 "$BENCH" --server-port 19410 -c 4 --batches "$BENCH_BATCHES" --batch-size 10000 --verify 0 \
         --warmup 5 --connections 4 --hosts 1000 --racks 2 >/tmp/tsgate_fi_storm.txt 2>&1 ) &
     BENCHPID=$!
     ( ROUNDS=0
@@ -308,6 +352,24 @@ done
 
 # ---------------------------------------------------------------------------
 echo "=== $STORM_ROUNDS storms: errors[$ERR_VECTOR ] rounds/conns[$ROUND_VECTOR ] throughput[$TPUT_VECTOR ] ==="
+
+# MACHINE-READABLE TOTALS, printed BEFORE the assertions so they survive a FAILING run --
+# which is the case that matters, because `fault_injection_ab.sh`'s whole job is to read
+# the numbers off an arm that is EXPECTED to fail.
+#
+# It used to scrape the assertion lines instead, and that silently did not work: the
+# assertion is named "client errors across the reset storms (bench + probe, K storms)"
+# while the A/B looked for "client errors across the reset storms = ", so the `grep -F`
+# never matched and BOTH arms parsed as empty -- the A/B then compared `${R_TOTAL:-0}`
+# against `${H_TOTAL:-999}` and reported a separation it had not measured. Assertion text
+# is prose and will be reworded again; these lines are the contract.
+echo "GATE_METRIC storm_errors_total $((TOT_BENCH_ERRS + TOT_PROBE_5XX))"
+echo "GATE_METRIC storm_bench_errors $TOT_BENCH_ERRS"
+echo "GATE_METRIC storm_probe_5xx $TOT_PROBE_5XX"
+echo "GATE_METRIC reset_rounds_total $TOT_ROUNDS"
+echo "GATE_METRIC reset_conns_total $TOT_CONNS"
+echo "GATE_METRIC storm_count $STORM_ROUNDS"
+echo "GATE_METRIC worst_storm_pct $WORST_PCT"
 
 # THE ANTI-VACUITY ASSERTIONS. Without a real storm this gate proves nothing: a proxy that
 # never fired, or one that fired while no connection was open, would otherwise pass. The
