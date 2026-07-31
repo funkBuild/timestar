@@ -3,6 +3,7 @@
 #include "../raft/raft_types.hpp"  // NodeId, LogIndex, kNoNode
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -126,6 +127,48 @@ inline bool transferrableTo(LogIndex lastIndex, LogIndex matchIndex, uint64_t ti
     const bool caughtUp = matchIndex >= lastIndex || (lastIndex - matchIndex) <= kMaxTransferLagEntries;
     const bool live = ticksSinceAck <= heartbeatTimeout;
     return caughtUp && live;
+}
+
+// A FAIR SHARE IS A SUM OF 1/|voters| IN DOUBLE, AND MUST BE CONSUMED WITH A TOLERANCE.
+//
+// This is a REAL DEFECT that predates the extraction (the pre-extraction loop had it
+// identically) and that the extraction is what made findable, because it only shows up
+// when someone can call the arithmetic directly. Six additions of 1/3 sum to
+// 1.9999999999999998, and truncating that with `static_cast<size_t>` yields ONE where the
+// true share is TWO. At RF=3, 102 of the 200 multiples of 3 up to 600 land strictly below
+// their true integer this way (at RF=5, 79 of 200).
+//
+// What it costs, driven through this function: 6 groups over 3 voters with leadership
+// [3, 2, 1] and self leading 3. The true shares are 2 each, so the answer is to move ONE
+// group to the node holding 1. Truncating instead gives that node a deficit of
+// `1 - 1 == 0` -- chooseTarget then skips it as satisfied -- and a budget of `3 - 1 == 2`
+// that nothing can spend. The pass transfers NOTHING and the [3, 2, 1] imbalance is
+// permanent, on every pass, forever. That is the same *shape* of never-converging
+// behaviour D-12 measured, and it is a plausible-but-UNPROVEN explanation of D-12's
+// residual 2-3 spread; nobody has re-run a cluster to check.
+//
+// The fix is to floor with a tolerance rather than to truncate, and to compare with the
+// same tolerance so a node exactly AT its share is never read as above or below it. The
+// tolerance is derived, not picked: the accumulated error is bounded by n * epsilon, which
+// over the 4096 VShards a shard can host is ~3e-11 (measured: 3.1e-11 at n = 4095), while
+// the smallest gap that can distinguish two real shares is 1/|voters| >= 1/N, of order
+// 0.1 for any replication factor anyone runs. 1e-6 sits five orders above the noise and
+// five below the signal. It is NOT a substitute for exact arithmetic if voter sets ever
+// grow into the thousands.
+inline constexpr double kShareTolerance = 1e-6;
+
+// The number of WHOLE groups a share of `share` is worth. floor, so a share of 6.67 is
+// six -- but a share that is a whole number spelled 1.9999999999999998 is two.
+inline size_t shareFloor(double share) {
+    if (share <= 0.0)
+        return 0;
+    return static_cast<size_t>(std::floor(share + kShareTolerance));
+}
+
+// Is `have` strictly BELOW `share` -- i.e. does this node genuinely want more groups?
+// A node holding exactly its share must answer false, whichever way the last bit fell.
+inline bool belowShare(size_t have, double share) {
+    return static_cast<double>(have) + kShareTolerance < share;
 }
 
 // One surveyed group: what the live Raft view says about a VShard this shard hosts.
@@ -287,7 +330,10 @@ inline LeadershipBalancePass planLeadershipBalance(const std::vector<BalanceGrou
             p.mine.push_back(i);
     }
     const double fairSelf = p.expected.count(self) ? p.expected.at(self) : 0.0;
-    if (static_cast<double>(p.mine.size()) <= fairSelf)
+    // Shed only if we are above our share by more than the tolerance -- a node holding
+    // EXACTLY its share (the converged state, and the one whose last bit falls short)
+    // must read as converged and stop.
+    if (static_cast<double>(p.mine.size()) <= fairSelf + kShareTolerance)
         return p;  // at or below our own share: shed nothing
 
     for (NodeId id : peers) {
@@ -295,12 +341,12 @@ inline LeadershipBalancePass planLeadershipBalance(const std::vector<BalanceGrou
             continue;
         const double fairPeer = p.expected.count(id) ? p.expected.at(id) : 0.0;
         const size_t have = p.led.count(id) ? p.led.at(id) : 0;
-        if (static_cast<double>(have) < fairPeer)
-            p.targets.push_back({id, static_cast<size_t>(fairPeer) - have});
+        if (belowShare(have, fairPeer))
+            p.targets.push_back({id, shareFloor(fairPeer) - have});
     }
     if (p.targets.empty())
         return p;
-    p.budget = std::min(maxTransfers, p.mine.size() - static_cast<size_t>(fairSelf));
+    p.budget = std::min(maxTransfers, p.mine.size() - shareFloor(fairSelf));
     return p;
 }
 

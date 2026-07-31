@@ -152,6 +152,53 @@ TEST(LeadershipBalanceTest, AtRfBelowNAConvergedNodeShedsNothingThoughTheOldForm
     EXPECT_NEAR(oldFairShare(groups, 5) / p.expected.at(kSelf), 0.6, 0.01) << "~40% low, as the D-12 row records";
 }
 
+TEST(LeadershipBalanceTest, AWholeNumberShareMustNotTruncateDownwards) {
+    // A REAL DEFECT, PRE-EXISTING, FOUND BY REVIEW OF THE EXTRACTION -- and only findable
+    // because the extraction let someone call the arithmetic directly. Six additions of
+    // 1/3 sum to 1.9999999999999998, so truncating the share yields ONE where the truth is
+    // TWO. At RF=3 that hits 102 of the 200 multiples of 3 up to 600.
+    //
+    // 6 groups over 3 voters, leadership [3, 2, 1], self leading 3. Every share is exactly
+    // 2, so the answer is to move ONE group to the node holding 1. Under truncation that
+    // node's deficit is 1 - 1 == 0 (chooseTarget skips it as satisfied) and the budget is
+    // 3 - 1 == 2 that nothing can spend: the pass moves NOTHING, and does so on every pass
+    // forever.
+    const std::vector<NodeId> three = {1, 2, 3};
+    auto groups = fullMembership(6, three, {1, 1, 1, 2, 2, 3});
+    auto p = planLeadershipBalance(groups, kSelf, three, 100);
+
+    ASSERT_EQ(p.mine.size(), 3u);
+    ASSERT_EQ(p.led.at(2), 2u);
+    ASSERT_EQ(p.led.at(3), 1u);
+    EXPECT_LT(p.expected.at(kSelf), 2.0) << "the accumulated double really is short of 2 -- "
+                                            "if this ever fails the case has stopped exercising the bug";
+
+    ASSERT_TRUE(p.viable());
+    EXPECT_EQ(p.budget, 1u) << "we hold 3 of a true share of 2";
+    ASSERT_EQ(p.targets.size(), 1u) << "node 2 is exactly at its share; only node 3 is short";
+    EXPECT_EQ(p.targetAt(0), 3u);
+    EXPECT_EQ(p.deficitAt(0), 1u) << "a deficit of 0 here is the whole defect: the pass transfers nothing";
+
+    // ... and the pass really does move one group, which is what "not permanent" means.
+    const size_t idx = p.chooseTarget(three, anyoneEligible());
+    ASSERT_NE(idx, LeadershipBalancePass::kNoTarget);
+    p.recordAttempt(idx, /*armed=*/true);
+    EXPECT_EQ(p.done(), 1u);
+    EXPECT_TRUE(p.exhausted()) << "one group, and then converged";
+}
+
+TEST(LeadershipBalanceTest, ATolerantShareStillFloorsAGenuinelyFractionalOne) {
+    // The other side of the tolerance: it must not round a real fraction UP. 20 groups
+    // over 3 voters is a share of 6.67, and a node holding 7 is above share by one -- if
+    // 6.67 rounded to 7 the balancer would call an over-loaded node converged.
+    const std::vector<std::vector<NodeId>> pairs = {{2, 3}};
+    auto groups = hostedGroups(20, pairs, {1, 1, 1, 1, 1, 1, 1, 2, 2, 3});
+    auto p = planLeadershipBalance(groups, kSelf, {1, 2, 3}, 100);
+    ASSERT_NEAR(p.expected.at(kSelf), 20.0 / 3.0, 1e-9);
+    ASSERT_EQ(p.mine.size(), 14u);
+    EXPECT_EQ(p.budget, 14u - 6u) << "floor(6.67) is 6, not 7";
+}
+
 TEST(LeadershipBalanceTest, ANodeThatReplicatesNothingWeHostIsNeverATarget) {
     // A peer in the cluster's node list that is a voter of none of OUR groups has a fair
     // share of zero over this survey, so it cannot be below its share and cannot receive
@@ -171,7 +218,13 @@ TEST(LeadershipBalanceTest, ALeaderlessGroupIsInNobodysLedCountButInEveryVotersS
     auto p = planLeadershipBalance(groups, kSelf, {1, 2, 3}, 100);
     EXPECT_EQ(p.mine.size(), 5u) << "we cannot give away a group we do not lead";
     EXPECT_EQ(p.led.count(kNoNode), 0u) << "'nobody' must never appear as a leader";
-    EXPECT_NEAR(p.expected.at(kSelf), 2.0, 1e-9) << "6 groups / 3 voters -- the leaderless one included";
+    // Asserted through the INTEGERS the pass actually consumes, not through the double:
+    // 6 groups over 3 voters is a share of exactly 2, and a share of 2 that reaches the
+    // consumers as 1 is what F1 is about. EXPECT_NEAR on expected[self] passes either way.
+    EXPECT_EQ(p.budget, 5u - 2u) << "we hold 5 of a fair 2 -- the leaderless group is in that share";
+    ASSERT_EQ(p.targets.size(), 2u);
+    EXPECT_EQ(p.deficitAt(0), 2u) << "peer 2 leads none of a fair 2";
+    EXPECT_EQ(p.deficitAt(1), 2u) << "peer 3 leads none of a fair 2";
 }
 
 // --- budget ---------------------------------------------------------------------------
