@@ -472,14 +472,18 @@ seastar::future<> ReplicatedVShardHost::snapshotSweep() {
     try {
         co_await maybeSnapshotOnce();
         // RECLAIM ON THE SNAPSHOT SWEEP'S TIMER, at a slower cadence (debt D-34).
-        // Compaction is the DOMINANT thing that moves a floor -- but not the only one: the
-        // floor is `min(newest HardState, newest Snapshot, oldest live entry) - 1`, so a
-        // group whose hard state was the binding term also advances when an election
-        // re-persists it. Neither happens often enough to want a 5 s cadence, and the
-        // collect reads whole sealed segments, so it gets its own longer interval and
-        // piggy-backs on this timer rather than owning one. Failures are caught here with
-        // the snapshot failure: nothing was deleted (the unlink is the last step of each
-        // segment) and the next pass retries.
+        //
+        // THREE things move a floor, and compaction is only the dominant one. The floor is
+        // `min(newest HardState, newest Snapshot, oldest live entry) - 1`, so it also
+        // advances when (b) a group whose HARD STATE was the binding term re-persists it --
+        // an election, or compaction's own re-persist -- and when (c) a CONFLICTING
+        // RE-APPEND in persistEntries pops the superseded suffix off the back of
+        // `entrySeqs_` and raises its front, with no snapshot and no hard state involved at
+        // all. None of the three is frequent enough to want a 5 s cadence, and a collect
+        // reads whole sealed segments, so it gets its own longer interval and piggy-backs
+        // on this timer rather than owning one. Failures are caught here with the snapshot
+        // failure: nothing was deleted (the unlink is the last step of each segment) and
+        // the next pass retries.
         const auto now = seastar::lowres_clock::now();
         if (lastJournalGc_.time_since_epoch().count() == 0 || now - lastJournalGc_ >= kJournalGcInterval) {
             lastJournalGc_ = now;

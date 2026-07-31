@@ -1,6 +1,6 @@
 #include "../../../lib/storage/journal_gc.hpp"
 
-#include "../../../lib/storage/journal_replay.hpp"
+#include "../../../lib/cluster/raft/raft_journal_persistence.hpp"  // recoverRaftState: the PRODUCTION reader
 #include "../../../lib/storage/journal_retention.hpp"
 #include "../../../lib/storage/journal_writer.hpp"
 
@@ -55,10 +55,15 @@ JournalSegmentHeader header() {
     return h;
 }
 
+// A Data record carrying a REAL Raft index, so recovery reconstructs a log from it.
+// `raftIndex == seq` because each of these tests writes one entry per sequence for a
+// VShard; that is what lets the assertions below run through `recoverRaftState`, which is
+// what production runs, instead of through a replay layer nothing calls.
 JournalRecord rec(uint16_t vshard, uint64_t seq, std::string payload) {
     JournalRecord r;
     r.vshard = VShardId{vshard};
     r.vshardSeq = seq;
+    r.raftIndex = seq;
     r.kind = JournalRecordKind::Data;
     r.payload = std::move(payload);
     return r;
@@ -127,27 +132,24 @@ seastar::future<> testLaggardRecordsAreCopiedForwardAndSurvive() {
     EXPECT_FALSE(result.copyForwardSegments.empty());
     co_await w.close();
 
-    // Reopen and recover, then route the recovered stream through the REAL replay
-    // layer (not a manual sort): copy-forward relocates vs2's older records behind
-    // its newer ones, so replay MUST sort by sequence and still validate gap-free.
+    // Reopen and recover through THE PRODUCTION PATH -- `JournalWriter::open()` handing
+    // its record set to `recoverRaftState`. Copy-forward relocates vs2's older records
+    // behind its newer ones physically, so this is the assertion that matters: recovery
+    // orders by vshard_seq, not by position, and reconstructs the laggard's log intact.
+    // (Asserting through `JournalReplay` instead would prove nothing about a real restart:
+    // that class has no production caller.)
     JournalWriter w2(dir, header(), kSmallSegBytes);
     auto recovered = co_await w2.open();
     co_await w2.close();
 
-    timestar::JournalReplay replay(1);
-    for (const auto& r : recovered)
-        EXPECT_TRUE(replay.ingest(r));
-    EXPECT_TRUE(replay.finalize()) << "recovery must not fail closed: " << replay.failureDetail();
-
-    std::vector<uint64_t> vs2Seqs;
-    for (const auto& r : replay.recordsForCore(replay.ownerCore(VShardId{2}))) {
-        if (r.vshard.value() == 2) {
-            EXPECT_EQ(r.payload, "vs2-live");
-            vs2Seqs.push_back(r.vshardSeq);
-        }
+    timestar::raft::RecoveredRaftState st = timestar::raft::recoverRaftState(recovered, VShardId{2});
+    EXPECT_EQ(st.log.lastIndex(), 6u) << "no laggard record may be lost to copy-forward";
+    for (uint64_t i = 1; i <= 6; ++i) {
+        const timestar::raft::LogEntry* e = st.log.entryAt(i);
+        EXPECT_NE(e, nullptr);
+        if (e)
+            EXPECT_EQ(e->data, "vs2-live") << "a relocated record must rebuild the same entry, not a shifted one";
     }
-    // Already in sequence order out of replay; no laggard record may be lost.
-    EXPECT_EQ(vs2Seqs, (std::vector<uint64_t>{1, 2, 3, 4, 5, 6}));
     fs::remove_all(dir);
 }
 TEST(JournalGcTest, LaggardRecordsAreCopiedForwardAndSurvive) {
@@ -313,14 +315,19 @@ seastar::future<> testAPartiallyDeletedSequenceRecovers() {
     JournalWriter w2(dir, header(), kSmallSegBytes);
     auto recovered = co_await w2.open();
     co_await w2.close();
-    timestar::JournalReplay replay(1);
+    // Asserted on the RECORD STREAM `JournalWriter::open()` returns -- the production
+    // reader -- rather than on a reconstructed Raft log, and deliberately: a deleted prefix
+    // means the surviving records are legitimately NOT a log starting at index 1, so the
+    // property under test is the one GC actually guarantees (contiguity of what is left),
+    // not what a log builder would make of it.
+    std::vector<uint64_t> seqs;
     for (const auto& r : recovered)
-        EXPECT_TRUE(replay.ingest(r));
-    EXPECT_TRUE(replay.finalize()) << "a retained log may begin mid-sequence after GC: " << replay.failureDetail();
-    const auto& out = replay.recordsForCore(replay.ownerCore(VShardId{1}));
-    EXPECT_FALSE(out.empty());
-    for (size_t i = 1; i < out.size(); ++i)
-        EXPECT_EQ(out[i].vshardSeq, out[i - 1].vshardSeq + 1) << "the surviving suffix must be gap-free";
+        if (r.vshard.value() == 1)
+            seqs.push_back(r.vshardSeq);
+    std::sort(seqs.begin(), seqs.end());  // physical order is not authoritative after GC
+    EXPECT_FALSE(seqs.empty());
+    for (size_t i = 1; i < seqs.size(); ++i)
+        EXPECT_EQ(seqs[i], seqs[i - 1] + 1) << "the surviving suffix must be gap-free";
     fs::remove_all(dir);
 }
 TEST(JournalGcTest, APartiallyDeletedSequenceRecovers) {

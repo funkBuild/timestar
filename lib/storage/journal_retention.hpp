@@ -31,20 +31,38 @@ public:
 
     // FORGET a VShard entirely, so its next watermark starts from 0 again.
     //
-    // MOVEMENT MUST CALL THIS when a VShard is torn down on this node, and the monotonic
-    // rule above is exactly why (debt D-40). `setReleased` ignores a regression, which is
-    // right while one group's sequence keeps climbing and wrong the moment the sequence
-    // RESTARTS: a VShard removed and later re-added gets a FRESH journal whose vshard_seq
-    // begins at 1, and a stale watermark of, say, 500 would mark every record of the new
-    // journal released -- the first GC pass then deletes the new group's sealed segments,
-    // including its snapshot boundary and its only HardState record. That is true in BOTH
-    // layouts (the per-VShard journal is a fresh directory; the shared journal is fresh
-    // records in a live one), and it is the mirror image of the leak D-40 describes: a
-    // watermark left too LOW pins segments forever, one left too HIGH deletes live ones.
+    // ================== READ THE ORDERING BEFORE CALLING THIS (debt D-40) ==============
+    //
+    // This is HALF of a protocol, and on its own it is the wrong half. VShard teardown has
+    // two hazards that pull in OPPOSITE directions, and each single-line "fix" causes the
+    // other one:
+    //
+    //   * FORGETTING ALONE STALLS RECLAMATION. `released()` drops to 0, so every record
+    //     the departed VShard ever wrote reads as LIVE. Its segments are pinned, and
+    //     because `JournalGc` STOPS at the first segment it cannot reclaim, the whole
+    //     shard's reclamation halts behind a group that no longer exists -- permanently,
+    //     since nothing will ever advance a floor for it again.
+    //   * PUBLISHING "EVERYTHING RELEASED" ALONE LEAKS THE ENTRY. It reclaims correctly
+    //     now, but `setReleased` is MONOTONIC, so the watermark survives; a later re-add
+    //     over a fresh journal -- whose `vshard_seq` restarts at 1 -- inherits it and the
+    //     first GC pass deletes the NEW group's sealed segments, snapshot boundary and
+    //     only HardState record included.
+    //
+    // The safe shape is therefore ORDERED and STATE-AWARE, not a call at a single site:
+    //   (a) at teardown, publish a released watermark covering the departed VShard's
+    //       records (they are dead -- the replica is gone), and leave the entry in place;
+    //   (b) let a GC pass actually collect against it;
+    //   (c) only THEN clearReleased() -- or, equivalently and more simply, clear at
+    //       RE-ADD time, before the new group's first append, so no stale value can ever
+    //       reach the new journal.
+    // Whichever of (c)'s two placements is chosen, it must hang off the MOVEMENT decision
+    // and not off `vshards_.count() == 0`: a group that is merely momentarily absent -- an
+    // `addVShard` that has not run yet, a restart mid-move -- would otherwise be declared
+    // fully released and have its LIVE log deleted.
     //
     // Not called from anywhere yet, because VShard teardown/movement is not wired (D-40).
-    // It exists now so that wiring is a one-line change at the teardown site rather than a
-    // rediscovery of this hazard.
+    // It exists so the protocol above is written down where its implementer will meet it.
+    // ==================================================================================
     void clearReleased(VShardId vshard);
 
     // How many VShards carry a watermark (diagnostics; also the thing that grows without
