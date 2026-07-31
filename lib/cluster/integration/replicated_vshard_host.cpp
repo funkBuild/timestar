@@ -85,6 +85,12 @@ seastar::future<> ReplicatedVShardHost::addVShard(uint16_t vshard, std::vector<N
     // the same dir (two recoverers over one journal) and leak the old writer's fd.
     if (registry_.group(vshard))
         throw std::runtime_error("ReplicatedVShardHost::addVShard: VShard already hosted");
+    // EVERY group on this shard shares ONE snapshot transfer budget (debt D-37), stamped
+    // in here rather than at the ClusterDataPlane call site that builds `opts`: the budget
+    // is a per-SHARD object and that site builds one options struct for the whole node.
+    // The host outlives the registry (declaration order), so the pointer outlives every
+    // RaftNode that holds it.
+    opts.snapshotBudget = &snapshotBudget_;
     VShardState vs;
     JournalSegmentHeader hdr;
     hdr.clusterUuid.fill(0x11);  // TODO(M3 group-0): the real cluster UUID from node.json

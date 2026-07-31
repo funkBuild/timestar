@@ -184,6 +184,27 @@ public:
     // threshold, so a hot VShard cannot monopolize the shard's one slot.
     static constexpr std::chrono::seconds kMinSnapshotInterval{60};
 
+    // THE OTHER RATE LIMIT, and it bounds the other direction (debt D-37).
+    // kMaxConcurrentSnapshots above caps snapshot PRODUCTION on this shard; this caps
+    // concurrent snapshot TRANSFERS out of it. Production was capped from the start
+    // because it costs local CPU and disk; transfers were not, because each one is
+    // individually paced at one unacked chunk -- but a shard hosts ~1365 groups and
+    // nothing summed them, so a node returning from a long outage could be sent up to that
+    // many 4 MiB chunks at once.
+    //
+    // FOUR, because 4 x kMaxSnapshotChunkBytes = 16 MiB is a QUARTER of the peer's
+    // per-shard Raft inbound admission budget (kMaxInboundRaftMemory, 64 MiB). The other
+    // three quarters have to stay available for appends and heartbeats: while a transfer
+    // is in flight its chunks ARE that follower's heartbeat, so snapshot traffic that
+    // crowds out ordinary replication makes followers campaign -- the failure this cap
+    // exists to prevent, not one to trade for. Four also keeps the pipeline full: a
+    // transfer costs one round trip per chunk, so four in flight saturate a link that one
+    // would leave idle between acks.
+    static constexpr size_t kMaxConcurrentSnapshotTransfers = 4;
+    static_assert(kMaxConcurrentSnapshotTransfers * raft::kMaxSnapshotChunkBytes <= raft::kMaxInboundRaftMemory / 4,
+                  "concurrent snapshot chunks must not be able to claim more than a quarter of a peer's Raft "
+                  "inbound budget, or a catching-up node starves ordinary replication [debt D-37]");
+
     // Override the policy above. Exists for two reasons: a test cannot practically write
     // 8192 entries or 64 MiB, and an operator with an unusual workload (very large batches,
     // or a very slow disk) needs the knob without a rebuild. Zero on either threshold
@@ -287,6 +308,13 @@ public:
     uint64_t snapshotSweeps() const { return snapshotSweeps_; }
     uint64_t snapshotMaxEntriesSinceSeen() const { return snapshotMaxEntriesSinceSeen_; }
     bool snapshotTriggerEnabled() const { return snapshotTriggerEnabled_; }
+    // The shard-level transfer budget (debt D-37): how many transfers are shipping chunks
+    // right now, and how many groups are queued behind them. `waiting` steadily non-zero
+    // means this shard is catching a peer up on more groups than the cap allows at once,
+    // which is the burst being shaped rather than a fault.
+    size_t snapshotTransfersActive() const { return snapshotBudget_.active(); }
+    size_t snapshotTransfersWaiting() const { return snapshotBudget_.waiting(); }
+    static constexpr size_t snapshotTransferCap() { return kMaxConcurrentSnapshotTransfers; }
 
 private:
     struct VShardState {
@@ -331,6 +359,9 @@ private:
     // (and its groups) MUST tear down before vshards_. Members destruct in reverse
     // declaration order, so vshards_ is declared FIRST and registry_ LAST.
     std::map<uint16_t, VShardState> vshards_;
+    // DECLARED BEFORE registry_ for the same reason vshards_ is: every RaftNode in the
+    // registry holds a POINTER to this budget, so it must outlive them (debt D-37).
+    raft::SnapshotTransferBudget snapshotBudget_{kMaxConcurrentSnapshotTransfers};
     raft::RaftGroupRegistry registry_;
     bool stopped_ = false;
     // See classifyRefusal / proposeRefusedWhileLeader.

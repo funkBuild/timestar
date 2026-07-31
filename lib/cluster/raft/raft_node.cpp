@@ -178,8 +178,8 @@ void RaftNode::becomeFollower(Term term, NodeId leader) {
     nextIndex_.clear();
     matchIndex_.clear();
     recentActive_.clear();
-    lastAckTick_.clear();    // liveness is per-term; see ticksSinceAck()
-    snapTransfers_.clear();  // chunked-snapshot progress is per-term too (D-5)
+    lastAckTick_.clear();  // liveness is per-term; see ticksSinceAck()
+    clearTransfers();      // chunked-snapshot progress is per-term too (D-5); releases the shard budget
     leadTransferee_ = kNoNode;
     pendingReads_.clear();  // drop unconfirmed reads; the caller retries at the new leader
     ackedReadSeq_.clear();
@@ -243,7 +243,7 @@ void RaftNode::becomeLeader() {
     lastAckTick_.clear();
     // No transfer this term has begun. A stale record would let a fresh leader believe a
     // chunk is in flight and so decline to start the transfer the peer actually needs.
-    snapTransfers_.clear();
+    clearTransfers();
     for (NodeId peer : replicationPeers(config_, id_)) {
         nextIndex_[peer] = log_.lastIndex() + 1;
         matchIndex_[peer] = kNoIndex;
@@ -338,13 +338,72 @@ void RaftNode::sendInstallSnapshot(NodeId peer) {
             return;
         // The snapshot moved on under us (a newer compaction). The peer's staging is keyed
         // by (index, term) and will discard its partial on the first chunk of the new one.
-        snapTransfers_.erase(it);
+        endTransfer(peer);
     }
     SnapshotTransfer t;
     t.index = snapshot_.index;
     t.term = snapshot_.term;
+
+    // THE SHARD BUDGET (debt D-37). Without one this always started immediately, so ~1365
+    // groups could each put a chunk on the wire at once and the only thing bounding the
+    // aggregate was the peer's inbound semaphore -- which queues, turning a burst into
+    // every transfer crawling. A group that cannot start now takes a FIFO ticket and the
+    // tick sweep starts it when its turn comes.
+    if (opts_.snapshotBudget != nullptr) {
+        t.ticket = opts_.snapshotBudget->enqueue();
+        if (!opts_.snapshotBudget->tryAcquire(t.ticket)) {
+            t.active = false;
+            snapTransfers_[peer] = t;
+            ++snapshotTransfersDeferred_;
+            // The peer hears NOTHING while it waits, and chunks are what its election
+            // clock is living on -- so give it a heartbeat it can reject.
+            sendSnapshotWaitProbe(peer);
+            return;
+        }
+    }
+    t.active = true;
     snapTransfers_[peer] = t;
     sendSnapshotChunk(peer, 0, chunk);
+}
+
+void RaftNode::sendSnapshotWaitProbe(NodeId peer) {
+    // Anchored at the snapshot BOUNDARY, which is the lowest index we can still name a
+    // term for. The follower is below it (that is why it needs a snapshot), so it rejects
+    // -- after `handleAppendEntries` has already reset its election clock, which is what
+    // this is for. The rejection's conflict hint walks nextIndex_ back down to the
+    // boundary, `sendAppend` hands off to `sendInstallSnapshot`, and the waiting record
+    // makes THAT a no-op -- so this probe cannot become a reply-driven hot loop; it is
+    // emitted only by the tick sweep, once per heartbeat interval.
+    //
+    // If the follower turns out to HAVE the boundary entry it answers success instead,
+    // nextIndex_ advances past it and the transfer is dropped as unnecessary (see
+    // handleAppendEntriesReply) -- which is a correct answer, not a lie.
+    AppendEntries ae;
+    ae.term = currentTerm_;
+    ae.leaderId = id_;
+    ae.prevLogIndex = snapshot_.index;
+    ae.prevLogTerm = snapshot_.term;
+    ae.leaderCommit = commitIndex_;
+    ae.readSeq = readSeq_;
+    send(Message{.to = peer, .from = id_, .payload = std::move(ae)});
+}
+
+void RaftNode::endTransfer(NodeId peer) {
+    auto it = snapTransfers_.find(peer);
+    if (it == snapTransfers_.end())
+        return;
+    if (opts_.snapshotBudget != nullptr) {
+        if (it->second.active)
+            opts_.snapshotBudget->release();
+        else
+            opts_.snapshotBudget->cancel(it->second.ticket);
+    }
+    snapTransfers_.erase(it);
+}
+
+void RaftNode::clearTransfers() {
+    while (!snapTransfers_.empty())
+        endTransfer(snapTransfers_.begin()->first);
 }
 
 void RaftNode::sendSnapshotChunk(NodeId peer, uint64_t offset, size_t chunkLen) {
@@ -382,9 +441,39 @@ void RaftNode::sweepStalledSnapshotTransfers(unsigned passes) {
     // over-budget peer, a reset connection or a restarted follower produces no reply and
     // no error -- and because at most one chunk per peer is in flight, silence means the
     // transfer is simply stopped. This timer is the only thing that notices.
+    const size_t chunkLen =
+        opts_.maxSnapshotChunkBytes == 0 ? std::numeric_limits<size_t>::max() : opts_.maxSnapshotChunkBytes;
     for (auto it = snapTransfers_.begin(); it != snapTransfers_.end();) {
         SnapshotTransfer& t = it->second;
         t.idleTicks += passes;
+        if (!t.active) {
+            // WAITING ON THE SHARD BUDGET (debt D-37). This is where a deferred transfer
+            // gets its turn: the budget hands the slot to the OLDEST outstanding ticket, so
+            // the order groups asked in is the order they run in -- ticking groups in map
+            // order would otherwise let the lowest-numbered group win every free slot
+            // forever. Stall/abandon logic deliberately does NOT apply: nothing is on the
+            // wire to be stalled, and abandoning a waiter would just re-queue it at the
+            // BACK, which is starvation dressed as recovery.
+            const NodeId waiter = it->first;
+            if (opts_.snapshotBudget != nullptr && opts_.snapshotBudget->tryAcquire(t.ticket)) {
+                t.active = true;
+                t.idleTicks = 0;
+                t.resends = 0;
+                ++it;
+                sendSnapshotChunk(waiter, 0, chunkLen);
+                continue;
+            }
+            // Still queued: keep the peer's election clock alive on the heartbeat cadence
+            // (it is being sent nothing else at all).
+            if (opts_.heartbeatTimeout != 0 && t.idleTicks >= opts_.heartbeatTimeout) {
+                t.idleTicks = 0;
+                ++it;
+                sendSnapshotWaitProbe(waiter);
+                continue;
+            }
+            ++it;
+            continue;
+        }
         if (opts_.snapshotChunkTimeout == 0 || t.idleTicks < opts_.snapshotChunkTimeout) {
             ++it;
             continue;
@@ -396,7 +485,9 @@ void RaftNode::sweepStalledSnapshotTransfers(unsigned passes) {
             // counter is the operator's signal that a peer cannot be snapshot-caught-up
             // (a dropped-chunk storm, or a peer that predates the chunk tag).
             ++snapshotTransfersAbandoned_;
-            it = snapTransfers_.erase(it);
+            const NodeId dead = it->first;
+            ++it;
+            endTransfer(dead);
             continue;
         }
         ++t.resends;
@@ -405,12 +496,10 @@ void RaftNode::sweepStalledSnapshotTransfers(unsigned passes) {
         // we were: if our chunk arrived and only the reply was lost, `acked` is stale and
         // the peer answers the duplicate with its real offset (its staged prefix is the
         // only state it keeps, so a duplicate chunk is idempotent by construction).
-        const size_t chunk =
-            opts_.maxSnapshotChunkBytes == 0 ? std::numeric_limits<size_t>::max() : opts_.maxSnapshotChunkBytes;
         const NodeId peer = it->first;
         const uint64_t resumeAt = t.acked;
         ++it;  // sendSnapshotChunk mutates only this peer's record, but advance first anyway
-        sendSnapshotChunk(peer, resumeAt, chunk);
+        sendSnapshotChunk(peer, resumeAt, chunkLen);
     }
 }
 
@@ -445,7 +534,7 @@ void RaftNode::compact(LogIndex upto, std::string snapshotData) {
     // valid. Dropping the transfers makes the next sendAppend restart cleanly from offset
     // 0, and the follower's staging is keyed by (index, term) so it discards its partial
     // the moment a chunk 0 arrives.
-    snapTransfers_.clear();
+    clearTransfers();
 }
 
 void RaftNode::seedRecoveredSnapshot(Snapshot snap) {
@@ -655,14 +744,14 @@ void RaftNode::handleInstallSnapshotReply(NodeId from, const InstallSnapshotRepl
                 // behalf, so the peer is left exactly as far behind as it truly is and the
                 // next heartbeat starts a fresh transfer from offset 0.
                 ++snapshotTransfersAbandoned_;
-                snapTransfers_.erase(it);
+                endTransfer(from);
                 return;
             }
         }
         if (t.index != snapshot_.index || t.term != snapshot_.term) {
             // Our snapshot moved on (a newer compaction) -- stop feeding the old one; the
             // next sendAppend starts a transfer for the current boundary.
-            snapTransfers_.erase(it);
+            endTransfer(from);
             return;
         }
         // Release the NEXT chunk, from where the peer says it actually is. This reply is
@@ -679,7 +768,7 @@ void RaftNode::handleInstallSnapshotReply(NodeId from, const InstallSnapshotRepl
 
     // An install OUTCOME (or a stale-snapshot answer, or any reply from a peer that
     // predates chunking): the transfer, if any, is over.
-    snapTransfers_.erase(from);
+    endTransfer(from);
     if (rr.matchIndex > matchIndex_[from])
         matchIndex_[from] = rr.matchIndex;
     nextIndex_[from] = std::max(nextIndex_[from], matchIndex_[from] + 1);
@@ -716,6 +805,15 @@ void RaftNode::handleAppendEntriesReply(NodeId from, const AppendEntriesReply& r
     confirmReads();
 
     if (rr.success) {
+        // A successful append means this peer has a matching prefix -- it does not need a
+        // snapshot after all (the keep-alive probe of a DEFERRED transfer can produce
+        // exactly this, when the follower turns out to hold the boundary entry). Drop the
+        // queued transfer so its budget ticket is not held for a transfer that will never
+        // run; head-of-line fairness makes an abandoned ticket everyone else's problem
+        // (debt D-37). Only a WAITING one: an ACTIVE transfer has bytes on the wire and its
+        // own machinery, and a reordered stale success must not throw that progress away.
+        if (auto it = snapTransfers_.find(from); it != snapTransfers_.end() && !it->second.active)
+            endTransfer(from);
         if (rr.matchIndex > matchIndex_[from])
             matchIndex_[from] = rr.matchIndex;
         // Keep any optimistically-streamed higher nextIndex; never rewind on a

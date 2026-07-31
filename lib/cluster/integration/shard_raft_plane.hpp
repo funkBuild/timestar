@@ -298,6 +298,15 @@ public:
         uint64_t undeliverable = 0;  // snapshots this node declined to send
         uint64_t transfersRestarted = 0;
         uint64_t transfersAbandoned = 0;
+        // ---- shard-level transfer budget (debt D-37) ----
+        // `deferred` is CUMULATIVE (transfers that had to queue before their first chunk);
+        // `active`/`waiting` are GAUGES read off the shard's one budget, so they are not
+        // summed over groups the way everything above is. Reading a gauge as a total is the
+        // mistake this comment exists to prevent.
+        uint64_t transfersDeferred = 0;
+        size_t transfersActive = 0;
+        size_t transfersWaiting = 0;
+        size_t transferCap = 0;
         bool triggerEnabled = false;
     };
 
@@ -335,6 +344,9 @@ public:
         c.sweeps = host.snapshotSweeps();
         c.maxEntriesSinceSeen = host.snapshotMaxEntriesSinceSeen();
         c.triggerEnabled = host.snapshotTriggerEnabled();
+        c.transfersActive = host.snapshotTransfersActive();
+        c.transfersWaiting = host.snapshotTransfersWaiting();
+        c.transferCap = ReplicatedVShardHost::snapshotTransferCap();
         for (uint16_t vs = 0; vs <= timestar::VIRTUAL_SHARD_MASK; ++vs) {
             if (!host.hosts(vs))
                 continue;
@@ -347,6 +359,7 @@ public:
             c.undeliverable += n.undeliverableSnapshots();
             c.transfersRestarted += n.snapshotTransfersRestarted();
             c.transfersAbandoned += n.snapshotTransfersAbandoned();
+            c.transfersDeferred += n.snapshotTransfersDeferred();
         }
         return c;
     }

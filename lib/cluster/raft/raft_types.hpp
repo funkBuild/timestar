@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -74,7 +75,7 @@ public:
 //   + envelope/framing headroom        + 4 MiB   kRaftEnvelopeHeadroomBytes
 //   ------------------------------------------
 //   <= transport SEND refusal           16 MiB   kMaxRaftSendBytes
-//   <= peer inbound ADMISSION           64 MiB   kMaxInboundRaftMemory (raft_rpc_transport.cpp)
+//   <= peer inbound ADMISSION           64 MiB   kMaxInboundRaftMemory
 //
 // WHY IT HAS TO BE A CHAIN AND NOT FOUR OPINIONS. The Raft deliver verb is seastar
 // `no_wait`: a frame whose estimated cost exceeds the receiver's `max_memory` is
@@ -150,6 +151,20 @@ inline constexpr size_t kMaxRaftPayloadBytes = size_t{12} << 20;
 inline constexpr size_t kRaftEnvelopeHeadroomBytes = size_t{4} << 20;
 inline constexpr size_t kMaxRaftSendBytes = kMaxRaftPayloadBytes + kRaftEnvelopeHeadroomBytes;
 
+// The last link of the chain: what a peer's Raft RPC server will hold IN FLIGHT, applied
+// as `rpc::resource_limits::max_memory` in raft_rpc_transport.cpp. It lives here rather
+// than there because it is the number two other bounds are derived from -- the send
+// refusal must fit under it (or a frame is dropped with no reply, a silent lost replica),
+// and the shard-level snapshot transfer cap is a QUARTER of it (debt D-37).
+//
+// DELIBERATELY NOT RETUNED when D-31 halved the send bound: this is a budget for
+// CONCURRENCY, not a per-message bound, so it is the one link slack belongs in. It was 2x
+// the send bound and is now 4x. One shard hosts ~1365 groups whose heartbeats and appends
+// share it; at 4 MiB per snapshot chunk it is also 16 simultaneous chunk transfers before
+// frames merely QUEUE on the semaphore (they are not dropped -- only an over-max_memory
+// frame is), which is the aggregate D-37 caps explicitly on the send side.
+inline constexpr size_t kMaxInboundRaftMemory = size_t{64} << 20;
+
 // The largest slice of a snapshot payload one InstallSnapshot may carry (D-5).
 //
 // WHY 4 MiB. It is the same order as the bounds the other Raft producers already live
@@ -205,6 +220,96 @@ inline constexpr size_t kMaxSnapshotChunkBytes = size_t{4} << 20;
 // RESIDUAL (D-32): the honest fix is to stream the payload to and from DISK rather than
 // staging it in RAM, after which this bound is a disk bound and can be far larger.
 inline constexpr size_t kMaxVShardSnapshotBytes = size_t{128} << 20;
+
+// ===========================================================================
+// THE SHARD-LEVEL SNAPSHOT TRANSFER BUDGET (debt D-37)
+// ===========================================================================
+//
+// Snapshot flow control is per peer PER GROUP -- one unacked chunk, held in that group's
+// `RaftNode::snapTransfers_`. Every link of that holds; what nothing bounded is the
+// AGGREGATE. A shard hosts ~1365 groups, so a node returning after an outage long enough
+// for its peers to have compacted could be the target of that many SIMULTANEOUS transfers,
+// each willing to put a 4 MiB chunk on the wire. The peer's inbound admission semaphore
+// QUEUES rather than drops, so the failure is not corruption -- it is every transfer
+// crawling behind every other, which is what the restart-catchup gate already shows in
+// miniature (10-15 stall-driven resends among 18-19 chunks on a THREE-node cluster).
+//
+// This is that aggregate, made explicit and enforced on the SEND side, where there is
+// still something useful to do about it.
+//
+// WHY IT LIVES IN THE DETERMINISTIC CORE, AS A PLAIN COUNTER. `RaftNode` is reactor-free
+// by contract, so a semaphore is not available to it -- and is not wanted: a transfer that
+// must WAIT on a future would suspend inside `tick()`, which is a synchronous state
+// transition. A group that cannot start now simply does not start now, and the tick that
+// comes round 20 ms later asks again. The budget is therefore a POD the host owns per
+// shard and hands to every group by pointer through RaftOptions.
+//
+// WHY PER SHARD RATHER THAN PER NODE. Everything on this path is already per shard: the
+// Raft transport, its inbound admission budget, the group registry and the tick loop. A
+// node-level counter would need cross-shard atomics on a path that runs every 20 ms for
+// every group, to bound something whose consumer -- the peer's per-shard inbound memory --
+// is itself per shard. Per shard is the unit the number is actually derived from.
+//
+// FAIRNESS IS FIFO, AND IT IS NOT OPTIONAL. Groups are ticked in map order, so "whoever
+// asks when a slot frees" means the lowest-numbered group wins every time and a
+// high-numbered group with a real snapshot to ship can wait indefinitely. A waiter takes a
+// TICKET and only the OLDEST outstanding ticket may take a free slot.
+//
+// EVERY WAITER MUST EVENTUALLY CANCEL OR ACQUIRE. The queue is head-of-line by
+// construction, so a ticket whose owner disappears without cancelling stalls the shard's
+// transfers. RaftNode routes every path that drops a transfer record -- role change,
+// re-compaction, abandonment, completion, the peer catching up another way -- through one
+// helper for exactly this reason. A group DESTROYED while holding one would leak it; no
+// such path exists today (nothing removes a VShard -- see debt D-40), and whatever wires
+// VShard teardown must clear the group's transfers before dropping the node.
+class SnapshotTransferBudget {
+public:
+    SnapshotTransferBudget() = default;
+    explicit SnapshotTransferBudget(size_t cap) : cap_(cap) {}
+
+    // 0 == unlimited (the default for a core with no host, i.e. every unit test that does
+    // not opt in -- so the budget can never change behaviour it was not given).
+    size_t cap() const { return cap_; }
+    size_t active() const { return active_; }
+    size_t waiting() const { return waiting_.size(); }
+
+    // Take a place in the queue. Returned tickets increase, so the smallest outstanding
+    // one is the oldest.
+    uint64_t enqueue() {
+        const uint64_t t = ++nextTicket_;
+        waiting_.insert(t);
+        return t;
+    }
+
+    // Admit `ticket` if there is a free slot AND it is at the head of the queue.
+    bool tryAcquire(uint64_t ticket) {
+        auto it = waiting_.find(ticket);
+        if (it == waiting_.end())
+            return false;  // not a live waiter: cancelled, or already admitted
+        if (cap_ != 0 && active_ >= cap_)
+            return false;
+        if (*waiting_.begin() != ticket)
+            return false;  // an older waiter is still queued -- FIFO
+        waiting_.erase(it);
+        ++active_;
+        return true;
+    }
+
+    // Give up a place in the queue without having been admitted.
+    void cancel(uint64_t ticket) { waiting_.erase(ticket); }
+
+    // Give back an admitted slot.
+    void release() {
+        if (active_ > 0)
+            --active_;
+    }
+
+private:
+    size_t cap_ = 0;
+    size_t active_ = 0;
+    uint64_t nextTicket_ = 0;
+    std::set<uint64_t> waiting_;
+};
 
 // The Raft-persistent voting state (durably fsync'd before any RPC that depends
 // on it, per the journal safety contract). commitIndex is volatile and NOT part

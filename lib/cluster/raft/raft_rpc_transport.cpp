@@ -104,29 +104,13 @@ struct BatchRecord {
 // submit_to round trips into a shard that processes them serially anyway.
 constexpr size_t kMaxConcurrentDeliverChains = 16;
 
-// Inbound admission bound for this transport, and its SEND-SIDE MIRROR (write-scaleout
-// 5.4). They are one pair of constants on purpose: seastar answers an over-limit `no_wait`
+// The inbound admission bound moved to raft_types.hpp in D-37, next to the rest of the
+// size chain it is the last link of -- a shard-level cap on concurrent snapshot transfers
+// is derived from it, and that cap lives in a header. Its SEND-SIDE MIRROR stays here,
+// because it is a property of this transport: seastar answers an over-limit `no_wait`
 // request by dropping it with no reply, so a sender that exceeds the receiver's bound
 // produces a silent, permanently-retried black hole. Refusing (and logging) on the send
 // side turns that into a visible error naming the group.
-//
-// TIGHTENED FROM 128 MiB BY D-5, and what made that possible was chunking the producer
-// that needed the slack. Before D-5 the number was sized for InstallSnapshot carrying a
-// WHOLE VShard snapshot in one message -- i.e. for "however big a VShard's flushed data
-// happens to be", which is not a bound. It is now sized for the biggest APPEND (a single
-// log entry, `RaftGroup::kMaxProposalBytes`); a snapshot chunk is 4 MiB. The full
-// arithmetic chain, and why every link of it must hold, is stated once in raft_types.hpp.
-//
-// DELIBERATELY NOT RETUNED BY D-31, which halved the send bound (32 -> 16 MiB): this is a
-// budget for CONCURRENCY, not a per-message bound, so it is the one link of the chain that
-// slack belongs in. It was 2x the send bound and is now 4x, and the multiple is what it is
-// for: `max_memory` bounds TOTAL in-flight request memory, a request whose estimate
-// exceeds it can never be admitted at all, and one shard hosts ~1365 groups whose
-// heartbeats and appends share this budget. At 4 MiB per snapshot chunk that is 16
-// simultaneous chunk transfers before frames merely QUEUE on the semaphore (they are not
-// dropped -- only an over-max_memory frame is), which is exactly the aggregate D-37 makes
-// explicit and caps on the SEND side, at a quarter of it.
-constexpr size_t kMaxInboundRaftMemory = size_t{64} << 20;  // 64 MiB in flight
 constexpr size_t kMaxRaftMessageBytes = kMaxRaftSendBytes;  // refuse to SEND above this
 
 // Raft message-rate instrumentation (write-scaleout 5-pre / 5a). The counters are

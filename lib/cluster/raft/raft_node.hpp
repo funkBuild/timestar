@@ -122,6 +122,13 @@ struct RaftOptions {
     // than on message size (see kMaxVShardSnapshotBytes).
     size_t maxSnapshotBytes = 0;
 
+    // The SHARD-LEVEL cap on concurrently active snapshot transfers (debt D-37), shared by
+    // every group on this reactor. nullptr == unbounded, which is the pre-D-37 behaviour
+    // and what every core test that does not opt in gets. The pointee is owned by
+    // `ReplicatedVShardHost` and outlives every group it hands it to; see
+    // SnapshotTransferBudget for why a plain counter and not a semaphore.
+    SnapshotTransferBudget* snapshotBudget = nullptr;
+
     // Ticks with NO reply from a peer mid-transfer before the in-flight chunk is RESENT.
     // The transport is fire-and-forget, so a dropped chunk is SILENT: this timer is the
     // only thing that notices. Two heartbeat intervals by default -- long enough that a
@@ -266,6 +273,17 @@ public:
     uint64_t snapshotTransfersAbandoned() const { return snapshotTransfersAbandoned_; }
     // Received snapshots refused because their declared total exceeds what we will stage.
     uint64_t snapshotsRefusedTooLarge() const { return snapshotsRefusedTooLarge_; }
+    // Transfers that had to QUEUE for a shard budget slot before sending their first chunk
+    // (debt D-37). Zero on a healthy cluster; a rising count is a node being caught up on
+    // many groups at once, which is the burst the cap exists to shape.
+    uint64_t snapshotTransfersDeferred() const { return snapshotTransfersDeferred_; }
+    // Transfers currently queued on this group (0 or 1 per peer).
+    uint64_t snapshotTransfersWaiting() const {
+        uint64_t n = 0;
+        for (const auto& [peer, t] : snapTransfers_)
+            n += t.active ? 0 : 1;
+        return n;
+    }
     // Is a chunked transfer to `peer` in flight? (Leader-only; test/inspection aid.)
     bool snapshotTransferInFlight(NodeId peer) const { return snapTransfers_.count(peer) != 0; }
     // Bytes of a partial snapshot currently staged as a follower (0 == none).
@@ -363,6 +381,19 @@ private:
     // Put the chunk at `offset` (up to `chunkLen` bytes of the current snapshot) on the
     // wire to `peer` and record it as in flight. Never touches nextIndex_.
     void sendSnapshotChunk(NodeId peer, uint64_t offset, size_t chunkLen);
+    // Keep a DEFERRED peer's election clock alive (debt D-37). While a transfer is waiting
+    // for a budget slot the peer is sent nothing at all -- and chunks are what serve as
+    // that peer's heartbeat, so silence for an election timeout makes it campaign. This is
+    // an ordinary empty AppendEntries anchored at the snapshot boundary: the follower
+    // rejects it (it is below our boundary, which is why it needs a snapshot) but resets
+    // its election clock first, which is the whole point.
+    void sendSnapshotWaitProbe(NodeId peer);
+    // Release a transfer's hold on the shard budget -- its slot if ACTIVE, its queue
+    // ticket if WAITING -- and erase it. EVERY path that drops a transfer record goes
+    // through one of these two, because a ticket abandoned in the queue head-of-line
+    // blocks every other group on the shard (debt D-37).
+    void endTransfer(NodeId peer);
+    void clearTransfers();
     // Resend / abandon transfers whose in-flight chunk has gone unacked (leader, per tick).
     void sweepStalledSnapshotTransfers(unsigned passes);
     void maybeAdvanceCommitAsLeader();
@@ -433,18 +464,27 @@ private:
     // the tick sweep as the only recovery from a dropped chunk.
     //
     // Cleared on every role change, like matchIndex_/lastAckTick_: progress is per-term.
+    //
+    // A record is either WAITING (it holds a queue ticket on the shard budget and has sent
+    // no chunk) or ACTIVE (it holds a budget slot and has one unacked chunk on the wire) --
+    // see debt D-37. Both states occupy the map, so the flow control above is unchanged:
+    // whichever it is, `sendInstallSnapshot` will not start a second one.
     struct SnapshotTransfer {
         LogIndex index = kNoIndex;  // the snapshot boundary being shipped
         Term term = kNoTerm;        // ... and its term; the pair keys the peer's staging
         uint64_t offset = 0;        // offset of the chunk currently in flight
         uint64_t acked = 0;         // bytes the peer has confirmed staged
         unsigned idleTicks = 0;     // tick passes since the in-flight chunk was sent
+                                    // (while WAITING: since the last keep-alive probe)
         unsigned resends = 0;       // consecutive resends with no acked progress
+        bool active = false;        // holds a budget slot (false => holds `ticket`)
+        uint64_t ticket = 0;        // queue position while waiting (D-37)
     };
     std::map<NodeId, SnapshotTransfer> snapTransfers_;
     uint64_t snapshotChunksSent_ = 0;
     uint64_t snapshotTransfersRestarted_ = 0;
     uint64_t snapshotTransfersAbandoned_ = 0;
+    uint64_t snapshotTransfersDeferred_ = 0;
 
     // ---- chunked InstallSnapshot, follower side (debt D-5) ----
     //
