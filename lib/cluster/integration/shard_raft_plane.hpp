@@ -426,11 +426,13 @@ public:
     // "1 VShard slice(s) uncommitted ... (last: not-leader)" for as long as it
     // stayed down, against a perfectly healthy 2-of-3 quorum.
     //
-    // RaftNode::tick now abandons a transfer after one election timeout, so this
-    // is no longer unbounded -- but a bounded write outage repeated every
-    // balancer pass is still an outage, and a caught-up target is also the only
-    // one that transfers IMMEDIATELY (transferLeadership sends TimeoutNow at
-    // once rather than waiting on a catch-up round trip).
+    // RaftNode::tick abandons a transfer after `transferTimeout` -- two
+    // heartbeat intervals, 1 s at the production cadence, since D-20 shortened
+    // it from one election timeout -- so this is no longer unbounded and no
+    // longer outlasts the write deadline. A bounded write outage repeated every
+    // balancer pass is still an outage, though, and a caught-up target is also
+    // the only one that transfers IMMEDIATELY (transferLeadership sends
+    // TimeoutNow at once rather than waiting on a catch-up round trip).
     //
     // THE GUARD USED TO BE EXACT EQUALITY (matchIndex == lastIndex) and that made
     // the balancer LOAD-DEPENDENT (debt D-1). On a group taking writes, matchIndex
@@ -469,10 +471,15 @@ public:
     // just been RST, because the ack clock had not yet decayed past three rounds
     // and the lag bound still held. `transferLeadership` then pins
     // `leadTransferee_` and the group refuses EVERY proposal until the transferee
-    // acks -- and the abandon bound is one ELECTION timeout (2.5-5 s), far longer
-    // than the 1.5 s write deadline. So one mis-aimed transfer is one failed
-    // batch. The old exact-equality guard was accidentally immune: a peer whose
-    // acks stopped fell behind a growing lastIndex immediately.
+    // acks -- and the abandon bound was, WHEN THAT WAS MEASURED, one ELECTION
+    // timeout (2.5-5 s), far longer than the 1.5 s write deadline. So one
+    // mis-aimed transfer was one failed batch. The old exact-equality guard was
+    // accidentally immune: a peer whose acks stopped fell behind a growing
+    // lastIndex immediately. D-20 has since cut the abandon bound to 1 s, which
+    // makes a mis-aimed transfer a retry rather than a failed batch -- but that
+    // is a REASON THIS FILTER STAYS TIGHT, not a licence to relax it: the gate
+    // result above is the only measurement anyone has of this loop, and it was
+    // taken at three rounds.
     //
     // One round is the tightest bound a HEALTHY peer still satisfies -- it answers
     // every heartbeat within an RTT, so its clock resets long before the next
@@ -480,13 +487,13 @@ public:
     //
     // Residual exposure, bounded and now deliberate: a peer that dies inside the
     // current heartbeat round can still be targeted on a pass that races it. That
-    // costs the group its proposals for one election timeout, after which
-    // RaftNode::tick abandons the transfer (§3.10) and writes resume; the peer
-    // then reads stale on every later pass and is skipped. One bounded window on
-    // the pass that races the death, not a window per pass forever -- which is
-    // what the abandon fix alone left on the table. Shrinking it further means
-    // shortening the ABANDON window (a consensus-timing change, not a target
-    // filter) -- see the debt register.
+    // costs the group its proposals for one `transferTimeout` (1 s at production
+    // cadence, was one election timeout before D-20), after which RaftNode::tick
+    // abandons the transfer (§3.10) and writes resume; the peer then reads stale
+    // on every later pass and is skipped. One bounded window on the pass that
+    // races the death, not a window per pass forever -- and since D-20 that
+    // window fits inside the write deadline, so the batch that races it retries
+    // into the resumed leader instead of failing.
     static bool transferrableTo(raft::RaftGroup& g, data::NodeId target) {
         constexpr raft::LogIndex kMaxTransferLagEntries = 64;
         const auto lastIdx = g.node().log().lastIndex();
