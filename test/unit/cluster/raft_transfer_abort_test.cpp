@@ -320,13 +320,18 @@ TEST(RaftTransferAbortTest, ATransferToACaughtUpPeerStillCompletes) {
 
 // THE ABORT WINDOW MUST NOT BE RE-ARMABLE BY REPEATING THE SAME TRANSFER.
 //
-// This is the door the abort can be walked around through, and it is not hypothetical: the
-// leadership balancer runs every ~5 s against a 2.5-5 s election timeout, so a balancer
-// that keeps choosing the same (down) target re-requests the transfer faster than the
-// window expires. If each request reset the clock, `leadTransferee_` would never clear and
-// the group would refuse writes forever -- exactly the failure tick()'s abort exists to
-// bound, reached through a different door. etcd ignores a repeat request for the transfer
-// already in flight; so do we.
+// This is the door the abort can be walked around through, and it is not hypothetical --
+// but WHICH CALLER walks through it changed with D-20. The PERIODIC balancer no longer
+// can: it runs every 5 s, never overlaps itself, and the window is now 1 s, so
+// `leadTransferee_` is always clear again by the next pass. (Before D-20 the window was
+// one election timeout, 2.5-5 s, and the periodic pass re-requested inside it routinely --
+// which is how this was found.) What remains, and is bounded by nothing, is the OPERATOR
+// endpoint `POST /cluster/rebalance-leadership`: the deposed-primary and rolling-rebalance
+// gates both storm it in a loop, and an operator can call it at any rate. If each request
+// reset the clock, `leadTransferee_` would never clear and the group would refuse writes
+// for as long as the storm lasted -- exactly the failure tick()'s abort exists to bound,
+// reached through a different door. etcd ignores a repeat request for the transfer already
+// in flight; so do we.
 //
 // The previous version of this test never ran a tick after the second request, so it
 // asserted nothing about the window at all.
