@@ -5,7 +5,7 @@
 #include "../../utils/logger.hpp"          // timestar::http_log
 #include "../data/dataplane_rpc.hpp"
 #include "../data/leader_filtered_node_store.hpp"
-#include "../data/leadership_balance.hpp"  // transferrableTo, pure (debt D-23)
+#include "../data/leadership_balance.hpp"  // the balancer's arithmetic, pure (debt D-22)
 #include "../data/node_store.hpp"
 #include "../data/vshard_directory.hpp"  // VShardDirectory::groupOf (debt D-11)
 #include "../features/feature_gate.hpp"  // VersionRange
@@ -429,35 +429,19 @@ public:
     // VShards evenly over shards and every shard sees the same node set, balancing
     // each shard's slice independently balances the cluster as a whole.
     //
-    // FAIR SHARE IS PER-NODE AND MEMBERSHIP-WEIGHTED, NOT totalLed/N (debt D-12). A node
-    // can only lead a group it REPLICATES, so at RF < N the nodes are not
-    // interchangeable: of the groups THIS shard hosts, we are a voter in all of them and
-    // a given peer in only some. The old `fair = totalLed / peers.size()` divided our
-    // hosted count by the whole cluster, which at RF=3 on 5 nodes is ~40% of the truth --
-    // so every node believed itself permanently above fair share and shed leadership on
-    // every pass, forever. MEASURED on an idle 5-node RF=3 cluster before this fix: after
-    // 12 minutes with no writes the balancer was still moving 26-114 VShards per 30 s and
-    // the spread had stalled at ~300 of a fair 819 (min 666, max 980) instead of closing.
-    //
-    // The correct expectation for node v over the groups we host is the sum of 1/|voters|
-    // over those groups v is a voter of: with uniform RF it is |hosted|/RF for us and
-    // |hosted ∩ hosted(v)|/RF for a peer. At RF == N every group has every node as a voter,
-    // so expected[v] == hosted/N for every v -- the old formula's shape, and behaviourally
-    // the same target, which is why RF == N (production, the 3-node gates) is unchanged.
-    // It is not literally the same arithmetic: the old divisor counted only groups that had
-    // a LEADER (leaderless ones were skipped before the count) and divided in integers,
-    // where this counts every hosted group and divides in doubles. Both differences are
-    // sub-one-VShard on a converged cluster and neither changes which side of fair share a
-    // node lands on -- the 3-node gates measure identically before and after -- but "reduces
-    // exactly to the old formula" would be too strong a claim.
+    // THE ARITHMETIC IS NOT HERE (debt D-22). Fair share, who is a candidate, how much
+    // budget a pass has and what an armed transfer costs are all in
+    // `data::planLeadershipBalance` / `LeadershipBalancePass`
+    // (lib/cluster/data/leadership_balance.hpp), which is pure and unit-tested;
+    // `leadership_balance_test.cpp` pins the D-12 cases the 3-node gates cannot see and
+    // the D-24 armed-only accounting. What is left here is exactly what needs the live
+    // plane: reading the Raft view into a survey, and awaiting the transfer. Keep it that
+    // way -- arithmetic that creeps back into this loop is arithmetic nothing pins.
     seastar::future<size_t> rebalance(size_t maxTransfers, data::NodeId self, std::vector<data::NodeId> peers) {
         if (!plane_ || maxTransfers == 0 || peers.empty())
-            co_return 0;
+            co_return 0;  // (planLeadershipBalance refuses these too; this skips the survey)
         auto& host = plane_->host();
-        std::map<data::NodeId, size_t> led;       // leadership we can SEE (over our hosted groups)
-        std::map<data::NodeId, double> expected;  // fair share of that same set, by membership
-        std::map<uint16_t, std::vector<data::NodeId>> votersOf;
-        std::vector<uint16_t> mine;
+        std::vector<data::BalanceGroup> groups;
         for (uint16_t vs = 0; vs < timestar::VIRTUAL_SHARD_COUNT; ++vs) {
             if (shardOwningVShard(vs, dir_) != seastar::this_shard_id())
                 continue;
@@ -471,110 +455,39 @@ public:
             const auto& voters = g->node().config().voters;
             if (voters.empty())
                 continue;
-            for (data::NodeId v : voters)
-                expected[v] += 1.0 / static_cast<double>(voters.size());
-            votersOf[vs].assign(voters.begin(), voters.end());
-            const data::NodeId leader = host.leaderOf(vs);
-            if (leader == timestar::raft::kNoNode)
-                continue;
-            ++led[leader];
-            if (leader == self)
-                mine.push_back(vs);
+            groups.push_back(
+                data::BalanceGroup{vs, std::vector<data::NodeId>(voters.begin(), voters.end()), host.leaderOf(vs)});
         }
-        const double fairSelf = expected.count(self) ? expected.at(self) : 0.0;
-        if (static_cast<double>(mine.size()) <= fairSelf)
+
+        data::LeadershipBalancePass pass = data::planLeadershipBalance(groups, self, peers, maxTransfers);
+        if (!pass.viable())
             co_return 0;
 
-        std::vector<std::pair<data::NodeId, size_t>> targets;
-        for (data::NodeId id : peers) {
-            if (id == self)
-                continue;
-            const double fairPeer = expected.count(id) ? expected.at(id) : 0.0;
-            const size_t have = led.count(id) ? led.at(id) : 0;
-            if (static_cast<double>(have) < fairPeer)
-                targets.push_back({id, static_cast<size_t>(fairPeer) - have});
-        }
-        if (targets.empty())
-            co_return 0;
-
-        const size_t budget = std::min(maxTransfers, mine.size() - static_cast<size_t>(fairSelf));
-        size_t done = 0, ti = 0;
-        for (uint16_t vs : mine) {
-            if (done >= budget)
+        for (size_t gi : pass.mine) {
+            if (pass.exhausted())
                 break;
-            raft::RaftGroup* g = host.group(vs);
+            const data::BalanceGroup& bg = groups[gi];
+            raft::RaftGroup* g = host.group(bg.vshard);
             if (!g || !g->isLeader())
                 continue;
-            const auto& voters = votersOf[vs];
-            // Pick the first ELIGIBLE target for THIS group, starting from the
-            // round-robin cursor, rather than taking whatever the cursor points at and
-            // giving up on the group if it does not fit.
-            //
-            // A NON-VOTER OF THIS GROUP IS NOT A CANDIDATE AT ALL (debt D-12).
-            // `RaftNode::transferLeadership` returns silently for a target that is not a
-            // voter, so aiming at one is a NO-OP that this loop nonetheless counted as a
-            // transfer: at RF=3 on 5 nodes, 2 of the 4 peers replicate any given group,
-            // so about half of every pass's budget was spent on transfers that could not
-            // happen -- and `transfers_initiated` reported them. MEASURED before the fix
-            // on an idle 5-node RF=3 cluster: 114 961 transfers "initiated" over five
-            // minutes of operator storms against roughly 1 500 VShards that actually
-            // changed hands.
-            size_t chosen = targets.size();
-            for (size_t k = 0; k < targets.size(); ++k) {
-                const size_t idx = (ti + k) % targets.size();
-                auto& [cand, deficit] = targets[idx];
-                if (deficit == 0)
-                    continue;
-                if (std::find(voters.begin(), voters.end(), cand) == voters.end())
-                    continue;
-                if (!transferrableTo(*g, cand))
-                    continue;
-                chosen = idx;
-                break;
-            }
-            if (chosen == targets.size())
+            const size_t chosen =
+                pass.chooseTarget(bg.voters, [&](data::NodeId cand) { return transferrableTo(*g, cand); });
+            if (chosen == data::LeadershipBalancePass::kNoTarget)
                 continue;  // no peer can take this group right now; try the next one
-            auto& [target, deficit] = targets[chosen];
-            // COUNT WHAT WAS ARMED, NOT WHAT WAS ASKED (debt D-24). The candidate filter
-            // above refuses non-voters and peers that are not caught up, but
-            // `RaftNode::transferLeadership` has one more silent early return this loop
-            // cannot see: the F2 re-arm guard, which ignores a repeat request for the
-            // transfer ALREADY in flight to that same target. Counting it inflated
-            // `transfers_initiated`, which `deposed_primary_gate.sh` asserts an
-            // anti-vacuity FLOOR on -- an inflated counter makes that assertion weaker
-            // than it reads, in the direction that hides a balancer doing nothing.
-            //
-            // WHICH CALLER ACTUALLY REACHES THAT GUARD: not this timer. The periodic pass
-            // runs every 5 s and never overlaps itself, and since D-20 the abandon window
-            // is 1 s, so `leadTransferee_` is clear again by the next pass. It is the
-            // OPERATOR endpoint -- `POST /cluster/rebalance-leadership`, which calls
-            // `rebalanceLeadership` directly, bounded by nothing -- that can ask again
-            // inside a live window. (Before D-20 the window was 2.5-5 s and the periodic
-            // pass reached it too, which is how the inflation was found.)
-            //
-            // `deficit` is charged on the same condition: an unarmed transfer moves no
-            // leadership, so spending the target's deficit on it would make the rest of
-            // the pass skip a peer that still needs groups.
-            //
             // Accounted from the OUT-PARAM rather than from the returned bool, because the
             // Ready drain that FOLLOWS the arming can throw: a future carries a value or
             // an exception and never both, so a catch arm reading only the return value
-            // leaves an armed transfer uncounted and its target uncharged -- the same
-            // defect as the inflation, with the sign flipped.
+            // leaves an armed transfer uncounted and its target uncharged (debt D-24).
             bool armed = false;
             try {
-                co_await g->transferLeadership(target, &armed);
+                co_await g->transferLeadership(pass.targetAt(chosen), &armed);
             } catch (...) {
                 // Persist/send failed; the transfer may nonetheless be armed inside the
                 // core, and `armed` says which. Next pass retries either way.
             }
-            if (armed) {
-                --deficit;
-                ++done;
-            }
-            ++ti;
+            pass.recordAttempt(chosen, armed);
         }
-        co_return done;
+        co_return pass.done();
     }
 
     seastar::future<> stop() {

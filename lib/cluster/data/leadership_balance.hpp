@@ -2,27 +2,41 @@
 
 #include "../raft/raft_types.hpp"  // NodeId, LogIndex, kNoNode
 
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
+#include <map>
+#include <utility>
+#include <vector>
 
-// THE BALANCER'S TRANSFER-ELIGIBILITY PREDICATE, EXTRACTED PURE (debt D-23).
+// THE LEADERSHIP BALANCER'S ARITHMETIC, EXTRACTED PURE (debt D-22).
 //
-// `raft_peer_liveness_test` used to re-implement this predicate by hand -- the 64-entry
-// lag bound and the heartbeat comparison, spelled out a second time in the test -- so the
-// test and the balancer could drift apart while the test stayed green: the copy kept
-// pinning the OLD rule and nothing pinned the new one. Retuning either bound, or dropping
-// a half, was therefore an unpinned change that looked pinned.
+// `ShardRaftPlane::rebalance` is not unit-testable: it needs a whole
+// `ReplicatedDataPlane`, a journal per VShard and a live Raft tick. So the decisions it
+// makes -- fair share, who is a candidate, how much budget a pass has, what a transfer
+// costs -- were verified analytically and on a 5-node cluster (debt D-12) and pinned by
+// NOTHING, which is how a future edit could silently restore the ~40 %-low target with
+// every 3-node gate still green (they cannot see it by construction: at RF == N the two
+// formulas agree).
 //
-// The predicate now takes exactly what it reads, so a test can call the real one; its only
-// other caller, `ShardRaftPlane::transferrableTo`, is a RaftGroup adapter over it and
-// nothing else. One implementation is what makes calling it in a test equivalent to
-// calling it in the balancer.
+// Everything here is a pure function of its arguments, in the shape `planReadRouting`
+// took for D-13. The loop keeps only what genuinely needs the plane: reading the live
+// Raft view into a survey, and awaiting `transferLeadership`. It holds no arithmetic of
+// its own, so these tests are tests of the balancer and not of a copy of it.
+//
+// The transfer-eligibility predicate below arrived first, for the same reason under a
+// different name (debt D-23): `raft_peer_liveness_test` re-implemented it by hand, so the
+// test and the balancer could drift apart while every test stayed green -- the copy kept
+// pinning the OLD rule and nothing pinned the new one.
 namespace timestar::data {
 
+using timestar::raft::kNoNode;
 using timestar::raft::LogIndex;
+using timestar::raft::NodeId;
 
 // May `target` be handed leadership of a group right now? (Extracted so the balancer's
 // candidate loop can try the NEXT peer when this one is ineligible instead of giving up
-// on the group -- see ShardRaftPlane::rebalance. Extracted a second time, as
+// on the group -- see LeadershipBalancePass::chooseTarget. Extracted a second time, as
 // this SCALAR overload, so the tests can exercise the real predicate rather than a
 // hand-written copy of it -- debt D-23.)
 //
@@ -78,7 +92,7 @@ using timestar::raft::LogIndex;
 // failed `RetryableWriteError ... (last: transport)` where the same tree
 // without this change took a marginally HEAVIER storm (167 rounds / 457
 // connections vs 165 / 442) with zero. The mechanism is specific and it is
-// this loop's: the periodic balancer could target a peer whose connection
+// the balancer loop's: the periodic balancer could target a peer whose connection
 // had just been RST, because the ack clock had not yet decayed past three rounds
 // and the lag bound still held. `transferLeadership` then pins
 // `leadTransferee_` and the group refuses EVERY proposal until the transferee
@@ -112,6 +126,182 @@ inline bool transferrableTo(LogIndex lastIndex, LogIndex matchIndex, uint64_t ti
     const bool caughtUp = matchIndex >= lastIndex || (lastIndex - matchIndex) <= kMaxTransferLagEntries;
     const bool live = ticksSinceAck <= heartbeatTimeout;
     return caughtUp && live;
+}
+
+// One surveyed group: what the live Raft view says about a VShard this shard hosts.
+// `leader == kNoNode` means hosted but with no elected leader -- it still counts toward
+// every voter's fair share (we replicate it, so it is leadership that exists to be won)
+// but it is nobody's led count.
+struct BalanceGroup {
+    uint16_t vshard = 0;
+    std::vector<NodeId> voters;
+    NodeId leader = kNoNode;
+};
+
+// One rebalancing pass over a shard's surveyed groups: who may receive leadership, how
+// much this pass may give away, and the round-robin cursor that spreads it.
+class LeadershipBalancePass {
+public:
+    static constexpr size_t kNoTarget = static_cast<size_t>(-1);
+
+    // Fair share of the surveyed set, per node: Σ 1/|voters(g)| over the groups we host
+    // that the node is a voter of. See planLeadershipBalance for why it is not totalLed/N.
+    std::map<NodeId, double> expected;
+    // Leadership we can SEE over that same set (leaderless groups are in nobody's count).
+    std::map<NodeId, size_t> led;
+    // Indices into the surveyed groups WE lead, in survey order.
+    std::vector<size_t> mine;
+    // (peer, how many groups it is short of its fair share). A peer at or above share is
+    // not here at all. A deficit may be ZERO -- a peer whose shortfall rounds away still
+    // occupies a slot, and therefore still shifts the round-robin cursor's modulus.
+    std::vector<std::pair<NodeId, size_t>> targets;
+    // How many groups this pass may give away: what we hold above our own share, capped
+    // by the caller's maxTransfers.
+    size_t budget = 0;
+
+    // Is there anything to do? A pass that is not viable must transfer nothing -- the
+    // three ways to get here are "we are at or below our own share", "no peer is below
+    // its share", and "the caller asked for no transfers".
+    bool viable() const { return budget > 0 && !targets.empty(); }
+    bool exhausted() const { return done_ >= budget; }
+    size_t done() const { return done_; }
+    size_t cursor() const { return cursor_; }
+    NodeId targetAt(size_t idx) const { return targets[idx].first; }
+    size_t deficitAt(size_t idx) const { return targets[idx].second; }
+
+    // Pick the first ELIGIBLE target for a group with these `voters`, starting from the
+    // round-robin cursor, rather than taking whatever the cursor points at and giving up
+    // on the group if it does not fit. Returns kNoTarget when no peer can take it now.
+    //
+    // A NON-VOTER OF THIS GROUP IS NOT A CANDIDATE AT ALL (debt D-12).
+    // `RaftNode::transferLeadership` returns silently for a target that is not a
+    // voter, so aiming at one is a NO-OP that the loop nonetheless counted as a
+    // transfer: at RF=3 on 5 nodes, 2 of the 4 peers replicate any given group,
+    // so about half of every pass's budget was spent on transfers that could not
+    // happen -- and `transfers_initiated` reported them. MEASURED before the fix
+    // on an idle 5-node RF=3 cluster: 114 961 transfers "initiated" over five
+    // minutes of operator storms against roughly 1 500 VShards that actually
+    // changed hands.
+    //
+    // `eligible(cand)` is the caller's live check -- `transferrableTo` against the real
+    // group -- and is asked LAST, because it is the only one that touches Raft.
+    template <class Eligible>
+    size_t chooseTarget(const std::vector<NodeId>& voters, Eligible&& eligible) const {
+        if (targets.empty())
+            return kNoTarget;
+        for (size_t k = 0; k < targets.size(); ++k) {
+            const size_t idx = (cursor_ + k) % targets.size();
+            const auto& [cand, deficit] = targets[idx];
+            if (deficit == 0)
+                continue;
+            if (std::find(voters.begin(), voters.end(), cand) == voters.end())
+                continue;
+            if (!eligible(cand))
+                continue;
+            return idx;
+        }
+        return kNoTarget;
+    }
+
+    // Account for one attempted transfer to `targets[idx]`.
+    //
+    // COUNT WHAT WAS ARMED, NOT WHAT WAS ASKED (debt D-24). The candidate filter in
+    // chooseTarget refuses non-voters and peers that are not caught up, but
+    // `RaftNode::transferLeadership` has one more silent early return the balancer
+    // cannot see: the F2 re-arm guard, which ignores a repeat request for the
+    // transfer ALREADY in flight to that same target. Counting it inflated
+    // `transfers_initiated`, which `deposed_primary_gate.sh` asserts an
+    // anti-vacuity FLOOR on -- an inflated counter makes that assertion weaker
+    // than it reads, in the direction that hides a balancer doing nothing.
+    //
+    // WHICH CALLER ACTUALLY REACHES THAT GUARD: not the periodic timer. That pass
+    // runs every 5 s and never overlaps itself, and since D-20 the abandon window
+    // is 1 s, so `leadTransferee_` is clear again by the next pass. It is the
+    // OPERATOR endpoint -- `POST /cluster/rebalance-leadership`, which calls
+    // `rebalanceLeadership` directly, bounded by nothing -- that can ask again
+    // inside a live window. (Before D-20 the window was 2.5-5 s and the periodic
+    // pass reached it too, which is how the inflation was found.)
+    //
+    // `deficit` is charged on the same condition: an unarmed transfer moves no
+    // leadership, so spending the target's deficit on it would make the rest of
+    // the pass skip a peer that still needs groups.
+    //
+    // THE CURSOR ADVANCES EITHER WAY. It is a fairness device, not an accounting one:
+    // holding it still on an unarmed attempt would re-offer the same peer the same
+    // groups for the rest of the pass.
+    void recordAttempt(size_t idx, bool armed) {
+        if (armed) {
+            --targets[idx].second;
+            ++done_;
+        }
+        ++cursor_;
+    }
+
+private:
+    size_t done_ = 0;
+    size_t cursor_ = 0;
+};
+
+// Plan one rebalancing pass over `groups` -- the groups THIS shard hosts, surveyed in
+// VShard order.
+//
+// FAIR SHARE IS PER-NODE AND MEMBERSHIP-WEIGHTED, NOT totalLed/N (debt D-12). A node
+// can only lead a group it REPLICATES, so at RF < N the nodes are not
+// interchangeable: of the groups this shard hosts, we are a voter in all of them and
+// a given peer in only some. The old `fair = totalLed / peers.size()` divided our
+// hosted count by the whole cluster, which at RF=3 on 5 nodes is ~40% of the truth --
+// so every node believed itself permanently above fair share and shed leadership on
+// every pass, forever. MEASURED on an idle 5-node RF=3 cluster before this fix: after
+// 12 minutes with no writes the balancer was still moving 26-114 VShards per 30 s and
+// the spread had stalled at ~300 of a fair 819 (min 666, max 980) instead of closing.
+//
+// The correct expectation for node v over the groups we host is the sum of 1/|voters|
+// over those groups v is a voter of: with uniform RF it is |hosted|/RF for us and
+// |hosted ∩ hosted(v)|/RF for a peer. At RF == N every group has every node as a voter,
+// so expected[v] == hosted/N for every v -- the old formula's shape, and behaviourally
+// the same target, which is why RF == N (production, the 3-node gates) is unchanged.
+// It is not literally the same arithmetic: the old divisor counted only groups that had
+// a LEADER (leaderless ones were skipped before the count) and divided in integers,
+// where this counts every hosted group and divides in doubles. Both differences are
+// sub-one-VShard on a converged cluster and neither changes which side of fair share a
+// node lands on -- the 3-node gates measure identically before and after -- but "reduces
+// exactly to the old formula" would be too strong a claim.
+inline LeadershipBalancePass planLeadershipBalance(const std::vector<BalanceGroup>& groups, NodeId self,
+                                                   const std::vector<NodeId>& peers, size_t maxTransfers) {
+    LeadershipBalancePass p;
+    if (maxTransfers == 0 || peers.empty())
+        return p;  // budget stays 0: not viable
+    for (size_t i = 0; i < groups.size(); ++i) {
+        const BalanceGroup& g = groups[i];
+        if (g.voters.empty())
+            continue;
+        for (NodeId v : g.voters)
+            p.expected[v] += 1.0 / static_cast<double>(g.voters.size());
+        // A group we do not REPLICATE tells us nothing and can never be ours to give
+        // away, so the survey must not contain one; a group we replicate but that has no
+        // elected leader is nobody's led count, but it IS in everyone's fair share.
+        if (g.leader == kNoNode)
+            continue;
+        ++p.led[g.leader];
+        if (g.leader == self)
+            p.mine.push_back(i);
+    }
+    const double fairSelf = p.expected.count(self) ? p.expected.at(self) : 0.0;
+    if (static_cast<double>(p.mine.size()) <= fairSelf)
+        return p;  // at or below our own share: shed nothing
+
+    for (NodeId id : peers) {
+        if (id == self)
+            continue;
+        const double fairPeer = p.expected.count(id) ? p.expected.at(id) : 0.0;
+        const size_t have = p.led.count(id) ? p.led.at(id) : 0;
+        if (static_cast<double>(have) < fairPeer)
+            p.targets.push_back({id, static_cast<size_t>(fairPeer) - have});
+    }
+    if (p.targets.empty())
+        return p;
+    p.budget = std::min(maxTransfers, p.mine.size() - static_cast<size_t>(fairSelf));
+    return p;
 }
 
 }  // namespace timestar::data
