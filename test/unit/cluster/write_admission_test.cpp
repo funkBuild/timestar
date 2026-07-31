@@ -212,13 +212,32 @@ TEST(WriteAdmissionTest, EveryAdvertiserOffersTheNewestSupportedWireVersion) {
     rpc.setLocalVersion(features::VersionRange{1, 1});
     EXPECT_EQ(rpc.localVersion().max, 1u);
 
-    // ... and Max must name the NEWEST protocol step in the tree, not merely some step.
-    // Both gated steps are listed, so adding a v5 without moving Max fails here rather
-    // than silently disabling itself cluster-wide -- which is the original bug's shape.
+    // ... and Max must be able to REACH every gated protocol step in the tree. Listed
+    // individually, and as `>=`, because a future v5 must be able to land by moving Max
+    // alone: an equality here would instruct the next person to drag a gate forward with
+    // it, which is the opposite of what a gate is for (see the next test).
     EXPECT_GE(data::kWriteBatchFormatMax, data::kWriteBatchFormatV3) << "the hinted-propose gate";
-    EXPECT_EQ(data::kWriteBatchFormatMax, data::kNodeQueryResolveMinVersion)
-        << "the leader-resolve read gate (debt D-25) is the newest protocol step; if a newer one has "
-           "landed, add it here and move kWriteBatchFormatMax to it";
+    EXPECT_GE(data::kWriteBatchFormatMax, data::kNodeQueryResolveMinVersion) << "the leader-resolve read gate (D-25)";
+}
+
+// A CAPABILITY GATE IS A HISTORICAL FACT AND MUST NOT MOVE (debt D-25).
+//
+// `kNodeQueryResolveMinVersion` records the version at which the resolve/redirect exchange
+// became speakable. Raising it with a later protocol step -- the reflex a
+// "Max == the read gate" tripwire would have taught -- REFUSES peers that are perfectly
+// capable of resolving, turning working mixed-version reads into QUERY_INCOMPLETE with a
+// false diagnosis for the whole upgrade window. Lowering it is worse: it sends resolve
+// lists to peers that cannot honour them, which is the bug D-25 closed.
+TEST(WriteAdmissionTest, TheReadResolveGateIsPinnedToTheVersionThatIntroducedIt) {
+    EXPECT_EQ(data::kNodeQueryResolveMinVersion, data::kWriteBatchFormatV4)
+        << "the leader-resolve read exchange became speakable at v4 and that is a fact about history, not a "
+           "number to keep current: RAISING it refuses capable peers for a whole rolling upgrade, LOWERING it "
+           "sends resolve lists to peers that predate the exchange. A new read-path capability needs a NEW "
+           "constant at a NEW version, not an edit to this one [debt D-25]";
+    // v3 is the hinted-propose gate and predates the resolve exchange (6bf2d18 is an
+    // ancestor of D-13's 6314ab8), so the two must not be conflated -- negotiating v3 says
+    // nothing about whether a peer can resolve leadership.
+    EXPECT_GT(data::kNodeQueryResolveMinVersion, data::kWriteBatchFormatV3);
 }
 
 // ... and the list of advertisers must be EXHAUSTIVE.

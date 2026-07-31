@@ -8,6 +8,7 @@
 #include <gtest/gtest.h>
 
 #include <seastar/core/thread.hh>
+#include <stdexcept>
 
 using namespace timestar::data;
 
@@ -41,11 +42,20 @@ LeaderFilteredNodeStore::ResolveFn fixedResolver() {
         std::vector<VShardRedirect> out;
         for (uint16_t vs : vshards) {
             switch (vs) {
-                case 10: out.push_back(VShardRedirect{10, kSelf, true}); break;
-                case 11: out.push_back(VShardRedirect{11, 0, true}); break;
-                case 12: out.push_back(VShardRedirect{12, 3, true}); break;
-                case 13: out.push_back(VShardRedirect{13, 0, false}); break;
-                default: break;  // deliberately unanswered -- see the test for it
+                case 10:
+                    out.push_back(VShardRedirect{10, kSelf, true});
+                    break;
+                case 11:
+                    out.push_back(VShardRedirect{11, 0, true});
+                    break;
+                case 12:
+                    out.push_back(VShardRedirect{12, 3, true});
+                    break;
+                case 13:
+                    out.push_back(VShardRedirect{13, 0, false});
+                    break;
+                default:
+                    break;  // deliberately unanswered -- see the test for it
             }
         }
         return seastar::make_ready_future<std::vector<VShardRedirect>>(std::move(out));
@@ -150,5 +160,31 @@ TEST(LeaderFilteredNodeStore, OnlyTheNamedSubsetIsChecked) {
         EXPECT_EQ(inner.lastFilter, (std::vector<uint16_t>{10, 12}));
         ASSERT_EQ(out.redirects.size(), 1u);
         EXPECT_EQ(out.redirects[0].vshard, 13);
+    }).get();
+}
+
+// A resolve list with NO RESOLVER is a construction error, not a pass-through (found in the
+// D-25 review). Passing it through is the exact hazard the exchange exists to prevent --
+// this node answers from replicas it may not lead while the coordinator counts it as a
+// leader read -- and it is INVISIBLE to the coordinator's wire-version gate, because a
+// mis-wired node advertises the same version as a correctly wired one.
+TEST(LeaderFilteredNodeStore, AResolveListWithNoResolverFailsLoudlyRatherThanServingAFollowerRead) {
+    seastar::async([] {
+        RecordingStore inner;
+        LeaderFilteredNodeStore store(inner, kSelf, LeaderFilteredNodeStore::ResolveFn{});  // no resolver wired
+        NodeQueryRequest req;
+        req.vshards = {10, 11};
+        req.resolveVShards = {11};
+        EXPECT_THROW(store.queryLocal(req).get(), std::logic_error);
+        EXPECT_EQ(inner.calls, 0) << "the un-resolvable read must never reach the store";
+
+        // NEGATIVE CONTROL: with nothing to resolve there is nothing to be wrong about, so a
+        // resolver-less store is still a legitimate pass-through -- which is what an RF == N
+        // node and every pre-D-13 peer look like.
+        NodeQueryRequest plain;
+        plain.vshards = {10, 11};
+        auto out = store.queryLocal(plain).get();
+        EXPECT_EQ(inner.calls, 1);
+        EXPECT_TRUE(out.redirects.empty());
     }).get();
 }

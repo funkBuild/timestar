@@ -88,16 +88,28 @@ inline ReadRouting planReadRouting(const std::set<uint16_t>& outstanding,
 // re-asked at the node it named. Returns true if a usable new hint was learned (which the
 // caller spends a redirect round on rather than a sleep).
 //
-// A redirect naming a VShard this target was NOT asked about is ignored: a buggy or hostile
-// peer must not steer another target's slice, nor hold a VShard outstanding forever.
+// TWO SETS, AND THEY ARE NOT THE SAME SET (found in the D-25 review). `asked` is the
+// target's whole read filter -- what leaves `outstanding` on a plain answer -- while
+// `permittedRedirects` is the SUBSET the target was asked to RESOLVE (its
+// `NodeQueryRequest::resolveVShards`), which is the only thing it has been given standing to
+// redirect. Using `asked` for both let a drifted or hostile peer redirect a VShard the
+// COORDINATOR ITSELF HOSTS: `planReadRouting` re-reads its own live leadership for a hosted
+// VShard and ignores hints for it, so the coordinator routed it straight back to the same
+// target, which redirected it again -- the full retry budget burned in a loop, and then a
+// spurious "leader unreachable" (with its `wakeFollowersOf` amplification) once the resolve
+// list emptied and the VShard could never leave `outstanding`. A redirect outside the
+// permitted set is ignored, which means the VShard is treated as ANSWERED and leaves
+// `outstanding` -- the target was asked for it without being asked to resolve it, so its
+// answer is the answer.
 inline bool applyReadRedirects(NodeId target, const std::vector<uint16_t>& asked,
+                               const std::vector<uint16_t>& permittedRedirects,
                                const std::vector<VShardRedirect>& redirects, std::set<uint16_t>& outstanding,
                                std::map<uint16_t, NodeId>& hints) {
-    const std::set<uint16_t> askedHere(asked.begin(), asked.end());
+    const std::set<uint16_t> permitted(permittedRedirects.begin(), permittedRedirects.end());
     std::set<uint16_t> redirected;
     bool learned = false;
     for (const auto& rd : redirects) {
-        if (!askedHere.count(rd.vshard))
+        if (!permitted.count(rd.vshard))
             continue;
         redirected.insert(rd.vshard);
         if (rd.hosted && rd.leader != raft::kNoNode && rd.leader != target) {

@@ -723,9 +723,20 @@ seastar::future<NodeQueryPartial> DataPlaneRpc::queryNode(NodeId to, NodeQueryRe
     // request actually carries a resolve tail, which is the whole of the cost argument: a
     // read that names nothing to resolve -- every RF == N read, every RF == 1 read, every
     // metadata fan-out -- takes exactly the round trips it took before, and an RF < N read
-    // pays the handshake once per (shard, peer) connection because `versionFor` caches it
-    // and drops it only when the connection is retired. See node_query.hpp for why absence
-    // of a reply tail cannot be read as "no redirects".
+    // pays the handshake once per (shard, peer) connection in the STEADY STATE, because
+    // `versionFor` caches it and drops it only when the connection is retired. (Concurrent
+    // COLD reads to the same peer each handshake: there is no in-flight dedup on
+    // `versionFor`. Pre-existing on the write path, recorded as a residual on debt D-25.)
+    // See node_query.hpp for why absence of a reply tail cannot be read as "no redirects".
+    //
+    // DELIBERATELY THE UNTIMED `versionFor`, against the write path's own rule that a
+    // handshake must not put an unbounded suspension in front of a bounded one. That rule
+    // is about INVERSION, and there is nothing here to invert: the `queryNodeStub` call
+    // below is itself untimed, so the read path is uniformly unbounded and the handshake
+    // adds no new class of stall. A deadline here would be false reassurance while the query
+    // RPC it precedes can still hang forever on a black-holed peer -- the read path needs a
+    // per-attempt bound of its own first, filed with the rest of the read-side fault
+    // handling (debt D-41).
     if (!req.resolveVShards.empty()) {
         const uint32_t version = co_await versionFor(to);
         if (version < kNodeQueryResolveMinVersion)

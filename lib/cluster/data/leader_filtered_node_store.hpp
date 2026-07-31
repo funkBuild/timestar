@@ -8,6 +8,8 @@
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
 #include <set>
+#include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -40,6 +42,13 @@ namespace timestar::data {
 //  - `hosted=false` (this node holds no replica) and `leader=kNoNode` (hosted, no
 //    election) are both reported, and both fail the coordinator's read closed once its
 //    retry budget is spent.
+//  - A resolve list with NO RESOLVER is a construction error and THROWS. It used to pass
+//    straight through, which is the exact hazard the whole exchange exists to prevent --
+//    this node answering from a replica it may not lead while the coordinator counts it as
+//    a leader read -- and it is INVISIBLE to the coordinator's wire-version gate (debt
+//    D-25), because a mis-wired node advertises the same version as a correct one. There is
+//    no safe silent behaviour here: answering is a stale read and staying quiet is a
+//    dropped VShard, so it fails loudly at the one place that can tell the difference.
 class LeaderFilteredNodeStore : public NodeStore {
 public:
     // Resolve leadership for a set of VShards on THIS node. One entry per input VShard,
@@ -58,8 +67,13 @@ public:
     }
 
     seastar::future<NodeQueryPartial> queryLocal(NodeQueryRequest req) override {
-        if (req.resolveVShards.empty() || !resolve_)
+        if (req.resolveVShards.empty())
             co_return co_await inner_.queryLocal(std::move(req));
+        if (!resolve_)
+            throw std::logic_error("LeaderFilteredNodeStore: asked to resolve " +
+                                   std::to_string(req.resolveVShards.size()) +
+                                   " VShard(s) with no resolver wired -- answering them from this node's replicas "
+                                   "would be the follower read the resolve exchange exists to prevent");
 
         std::vector<VShardRedirect> resolved = co_await resolve_(req.resolveVShards);
         std::vector<VShardRedirect> redirects;

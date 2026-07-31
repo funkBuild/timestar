@@ -640,6 +640,18 @@ seastar::future<QueryResponse> ClusterDataPlane::queryReplicated(QueryRequest re
     int redirectRounds = 0;
     size_t leaderless = 0;
     std::vector<uint16_t> unassigned;
+    // THE BUDGET IS WALL CLOCK, NOT ITERATIONS (found in the D-25/D-26 review). Counting
+    // sleeps bounds only the SLEEPING: each round also runs `gatherLeaders()` (a sequential
+    // invoke_on across every shard) and a full remote fan-out, so a slow or redirect-churning
+    // read could spend far more than 1.2 s and sail past the 2.5 s election minimum the
+    // static_assert in the header claims to exclude -- making the assertion a statement about
+    // arithmetic rather than about behaviour. Checked BETWEEN rounds, so the real bound is the
+    // budget plus at most one in-flight round; the RPCs themselves are untimed (see the
+    // residual on debt D-41).
+    const auto readStart = std::chrono::steady_clock::now();
+    const auto budgetSpent = [&readStart] {
+        return std::chrono::steady_clock::now() - readStart >= kReadLeaderlessBudget;
+    };
     while (true) {
         leaderless = 0;
         unassigned.clear();
@@ -658,7 +670,7 @@ seastar::future<QueryResponse> ClusterDataPlane::queryReplicated(QueryRequest re
 
         if (!unassigned.empty())
             break;  // fail closed below; retrying cannot assign a VShard
-        if (leaderless > 0 && leaderlessRetries < kReadLeaderRetries) {
+        if (leaderless > 0 && leaderlessRetries < kReadLeaderRetries && !budgetSpent()) {
             ++leaderlessRetries;
             co_await seastar::sleep(kReadLeaderRetryDelay);
             continue;  // re-gather before dispatching anything
@@ -669,9 +681,14 @@ seastar::future<QueryResponse> ClusterDataPlane::queryReplicated(QueryRequest re
         std::vector<seastar::future<data::NodeQueryPartial>> pending;
         std::vector<data::NodeId> pendingLeaders;           // parallel to `pending`
         std::vector<std::vector<uint16_t>> pendingVShards;  // parallel to `pending`
+        // The SUBSET of pendingVShards[i] that target i was asked to RESOLVE, which is the
+        // only set it has standing to redirect (see applyReadRedirects). Kept apart from
+        // pendingVShards because the two answer different questions.
+        std::vector<std::vector<uint16_t>> pendingResolve;  // parallel to `pending`
         pending.reserve(byLeader.size());
         pendingLeaders.reserve(byLeader.size());
         pendingVShards.reserve(byLeader.size());
+        pendingResolve.reserve(byLeader.size());
         for (auto& [leader, vshards] : byLeader) {
             data::NodeQueryRequest nq;
             nq.request = request;
@@ -685,6 +702,7 @@ seastar::future<QueryResponse> ClusterDataPlane::queryReplicated(QueryRequest re
             if (auto r = resolveAt.find(leader); r != resolveAt.end())
                 nq.resolveVShards = std::move(r->second);
             pendingLeaders.push_back(leader);
+            pendingResolve.push_back(nq.resolveVShards);  // COPY: nq is moved into the call below
             pendingVShards.push_back(std::move(vshards));
             if (leader == self)
                 pending.push_back(local_->queryLocal(std::move(nq)));
@@ -706,9 +724,10 @@ seastar::future<QueryResponse> ClusterDataPlane::queryReplicated(QueryRequest re
                 // excluded it), so it stays outstanding and is re-asked at the node
                 // named. Everything else this target was asked for is answered, once.
                 // Redirect bookkeeping (which VShards this target answered, which hints
-                // to keep) is in data::applyReadRedirects, where it is unit-tested.
-                if (data::applyReadRedirects(pendingLeaders[i], pendingVShards[i], part.redirects, outstanding,
-                                             readLeaderHints_))
+                // to keep, and which redirects it had standing to issue at all) is in
+                // data::applyReadRedirects, where it is unit-tested.
+                if (data::applyReadRedirects(pendingLeaders[i], pendingVShards[i], pendingResolve[i], part.redirects,
+                                             outstanding, readLeaderHints_))
                     learnedHint = true;
                 allPartials.insert(allPartials.end(), std::make_move_iterator(part.partials.begin()),
                                    std::make_move_iterator(part.partials.end()));
@@ -744,11 +763,11 @@ seastar::future<QueryResponse> ClusterDataPlane::queryReplicated(QueryRequest re
             break;  // answered below; retrying an incomplete/unreachable read is the caller's job
         if (outstanding.empty())
             break;  // every VShard answered exactly once
-        if (learnedHint && redirectRounds < kReadRedirectRounds) {
+        if (learnedHint && redirectRounds < kReadRedirectRounds && !budgetSpent()) {
             ++redirectRounds;
             continue;  // we know somewhere new to ask -- no reason to sleep first
         }
-        if (leaderlessRetries < kReadLeaderRetries) {
+        if (leaderlessRetries < kReadLeaderRetries && !budgetSpent()) {
             ++leaderlessRetries;
             co_await seastar::sleep(kReadLeaderRetryDelay);
             continue;
@@ -756,12 +775,22 @@ seastar::future<QueryResponse> ClusterDataPlane::queryReplicated(QueryRequest re
         break;  // budget spent with VShards still unanswered: fail closed below
     }
 
+    // THE ORDER OF THESE BRANCHES IS THE DIAGNOSIS, most specific first, and the FIRST of
+    // them is a local failure of OUR OWN read (found in the D-25 review). The catch above
+    // says a local failure "still propagates", but it was reported after the remote
+    // branches, so one unreachable peer in the same round turned a genuine internal error
+    // -- a bug, an I/O failure, a decode fault on this node -- into `QUERY_INCOMPLETE:
+    // leader node(s) N unreachable`, sending the operator after a healthy peer while the
+    // real failure was here. Nothing about a remote node makes a local exception less true,
+    // so it goes first and restores the contract the catch already claimed.
+    if (firstErr)
+        std::rethrow_exception(firstErr);
     if (!unversionedPeers.empty()) {
-        // Reported BEFORE the unreachable branch: a peer can only land here by ANSWERING
-        // the version handshake, so "too old" is the more specific and more actionable of
-        // the two, and it must not be reported as an outage the operator will go looking
-        // for. Deliberately no wake and no "retry shortly" -- retrying is futile until the
-        // rolling upgrade finishes (debt D-25).
+        // Then the version refusal, BEFORE the unreachable branch: a peer can only land
+        // here by ANSWERING the version handshake, so "too old" is the more specific and
+        // more actionable of the two, and it must not be reported as an outage the operator
+        // will go looking for. Deliberately no wake and no "retry shortly" -- retrying is
+        // futile until the rolling upgrade finishes (debt D-25).
         std::string nodes;
         for (data::NodeId n : unversionedPeers)
             nodes += (nodes.empty() ? "" : ",") + std::to_string(n);
@@ -791,8 +820,6 @@ seastar::future<QueryResponse> ClusterDataPlane::queryReplicated(QueryRequest re
             "leader node(s) " + nodes + " unreachable; their VShards were woken to re-elect -- retry shortly";
         co_return r;
     }
-    if (firstErr)
-        std::rethrow_exception(firstErr);
     if (!incompleteReasons.empty()) {
         QueryResponse r;
         r.success = false;

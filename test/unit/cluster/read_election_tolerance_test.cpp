@@ -90,3 +90,41 @@ TEST(ReadElectionTolerance, TheBudgetHasASingleDefinition) {
     // budget under the previous name.
     EXPECT_EQ(src.find("static constexpr int kLeaderRetries"), std::string::npos);
 }
+
+// ... and it must be enforced in WALL CLOCK, not as an iteration count (found in the
+// D-25/D-26 review). Each of the 24 rounds also runs `gatherLeaders()` -- a sequential
+// `invoke_on` across every shard -- and a full remote fan-out, so counting sleeps bounds
+// only the SLEEPING: a slow or redirect-churning read could exceed 2.5 s and sail past the
+// election minimum the static_assert above claims to exclude, leaving that assertion a
+// statement about arithmetic rather than about behaviour.
+//
+// The loop lives inside a coroutine that needs a live multi-node plane, so this is a source
+// pin rather than a timing test -- the same shape as the single-definition tripwire above,
+// and for the same reason: the thing being protected is invisible to every test we can run
+// here. A timing test would need the RF < N read gate debt D-41 also asks for.
+TEST(ReadElectionTolerance, TheBudgetIsEnforcedInWallClockNotIterations) {
+    auto readSource = [](const std::string& rel) {
+        for (const std::string& prefix : {"", "../", "../../", "../../../"}) {
+            std::ifstream in(prefix + rel);
+            if (in.good()) {
+                std::ostringstream ss;
+                ss << in.rdbuf();
+                return ss.str();
+            }
+        }
+        return std::string();
+    };
+    const std::string src = readSource("lib/cluster/integration/cluster_data_plane.cpp");
+    ASSERT_FALSE(src.empty());
+    EXPECT_NE(src.find("std::chrono::steady_clock::now() - readStart >= kReadLeaderlessBudget"), std::string::npos)
+        << "the read loop no longer measures its budget in wall clock against kReadLeaderlessBudget [debt D-26]";
+    // Every arm that CONTINUES the loop must consult it -- the two sleeping retries and the
+    // redirect round, which is the one that can spin without sleeping at all.
+    size_t guards = 0;
+    for (size_t at = src.find("budgetSpent()"); at != std::string::npos; at = src.find("budgetSpent()", at + 1))
+        ++guards;
+    EXPECT_GE(guards, 3u) << "a continue-arm of the read loop is not gated on the wall-clock budget: the "
+                             "leaderless pre-dispatch retry, the redirect round and the post-dispatch retry "
+                             "must each consult it -- the redirect round especially, since it can spin "
+                             "without sleeping at all [debt D-26]";
+}

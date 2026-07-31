@@ -236,7 +236,8 @@ TEST(ReadRoundBookkeeping, AnAnswerRetiresOnlyTheVShardsItDidNotRedirect) {
         {2, 5, true},  // node 5 leads it: keep it outstanding, remember where to go
         {3, 0, true},  // hosted, leaderless: keep it outstanding, remember nothing
     };
-    const bool learned = applyReadRedirects(/*target=*/4, {1, 2, 3, 4}, redirects, outstanding, hints);
+    const bool learned = applyReadRedirects(/*target=*/4, {1, 2, 3, 4}, /*permittedRedirects=*/{1, 2, 3, 4}, redirects,
+                                            outstanding, hints);
     EXPECT_TRUE(learned);
     EXPECT_EQ(outstanding, (std::set<uint16_t>{2, 3}));
     EXPECT_EQ(hints.at(2), 5u);
@@ -248,7 +249,7 @@ TEST(ReadRoundBookkeeping, ARedirectForAVShardWeDidNotAskAboutIsIgnored) {
     std::map<uint16_t, NodeId> hints{{99, 3}};
     // A hostile/buggy peer names a VShard outside its view, and names ITSELF for one it has.
     std::vector<VShardRedirect> redirects{{99, 7, true}, {1, 4, true}};
-    applyReadRedirects(/*target=*/4, {1, 2}, redirects, outstanding, hints);
+    applyReadRedirects(/*target=*/4, {1, 2}, /*permittedRedirects=*/{1, 2}, redirects, outstanding, hints);
     EXPECT_EQ(hints.at(99), 3u) << "a peer steered a slice it was never asked about";
     EXPECT_EQ(hints.count(1), 0u) << "a target naming ITSELF is not a hint";
     EXPECT_EQ(outstanding, (std::set<uint16_t>{1})) << "VShard 1 was redirected, so it stays outstanding";
@@ -293,4 +294,41 @@ TEST(ReadRoundBookkeeping, UnreachabilityDoesNotForgetOtherNodesHints) {
     applyReadTargetUnreachable(/*target=*/5, {7, 8}, hints);
     EXPECT_EQ(hints.count(7), 0u);
     EXPECT_EQ(hints.at(8), 4u);
+}
+
+// THE D-25 REVIEW FINDING. A target may only redirect the VShards it was asked to RESOLVE,
+// not everything in its read filter. The two sets are the same only at RF == N; below that
+// the coordinator asks a holder for VShards it has ALREADY resolved locally (it hosts them)
+// alongside the ones it wants resolved, and a redirect for the first kind is a bogus claim
+// about a group whose leadership this node reads directly.
+//
+// The consequence of conflating them is not merely a stale hint. `planReadRouting` re-reads
+// its own live leadership for a HOSTED VShard and ignores hints for it, so the coordinator
+// routes it straight back to the same target, which redirects it again: the whole retry
+// budget in a loop, and then a spurious "leader unreachable" once the resolve list empties
+// and the VShard can never leave `outstanding`.
+TEST(ReadRoundBookkeeping, ARedirectForAVShardTheTargetWasNotAskedToResolveIsIgnored) {
+    std::set<uint16_t> outstanding{1, 2, 3};
+    std::map<uint16_t, NodeId> hints;
+    // We asked node 4 for {1,2,3} but only asked it to RESOLVE {3}: 1 and 2 are ours and we
+    // already know who leads them. It redirects all three anyway.
+    std::vector<VShardRedirect> redirects{{1, 9, true}, {2, 9, true}, {3, 5, true}};
+    const bool learned =
+        applyReadRedirects(/*target=*/4, {1, 2, 3}, /*permittedRedirects=*/{3}, redirects, outstanding, hints);
+    EXPECT_TRUE(learned);
+    EXPECT_EQ(hints.count(1), 0u) << "a target redirected a VShard the coordinator resolves itself";
+    EXPECT_EQ(hints.count(2), 0u);
+    EXPECT_EQ(hints.at(3), 5u) << "the permitted redirect must still be honoured";
+    // 1 and 2 were ANSWERED (asked without being asked to resolve), so they retire; only the
+    // permitted redirect stays outstanding. Retiring them is what stops the loop.
+    EXPECT_EQ(outstanding, (std::set<uint16_t>{3}));
+
+    // NEGATIVE CONTROL: the identical redirects with 1 and 2 INSIDE the permitted set are
+    // legitimate and are honoured, so this is about standing, not about the redirects.
+    std::set<uint16_t> outstanding2{1, 2, 3};
+    std::map<uint16_t, NodeId> hints2;
+    applyReadRedirects(/*target=*/4, {1, 2, 3}, /*permittedRedirects=*/{1, 2, 3}, redirects, outstanding2, hints2);
+    EXPECT_EQ(hints2.at(1), 9u);
+    EXPECT_EQ(hints2.at(2), 9u);
+    EXPECT_EQ(outstanding2, (std::set<uint16_t>{1, 2, 3}));
 }
