@@ -40,10 +40,14 @@
 # The old checkout reached PAST 4a -- it dropped d101c07's and c052253's later fixes in
 # those files too, which is why the header used to hedge that "the reverted binary produced
 # errors" was a weaker claim than it looked. Nothing is hedged now: the arms differ by the
-# retry pause and by nothing else. The [D6] signature assertion
-# (`RetryableWriteError ... last: transport` -- the retry giving up against a socket the
-# transport had not re-dialled yet) is kept anyway, because it pins the MECHANISM and not
-# just the count.
+# retry pause and by nothing else.
+#
+# THE [D6] SIGNATURE IS INFORMATIONAL, NOT THE DISCRIMINATOR, and saying otherwise was this
+# script's last wrong evidence claim. It names a failure CLASS that BOTH binaries reach:
+# measured on one run's retained logs, HEAD carried the identical
+# `uncommitted after 6 attempt(s) (last: transport)` give-up TWICE where the reverted arm
+# carried it six times, at the same attempt count. Its PRESENCE therefore proves nothing --
+# what separates the arms is the RATE, which is what the separation assertion is on.
 #
 # WHAT "DISCRIMINATES" MEANS HERE, since D-21. It is no longer "the reverted arm produced
 # an error and HEAD produced none": HEAD is not reliably zero (0, 1, 0 and one void across

@@ -223,9 +223,13 @@ Measured, two runs at the A/B's own sizing (2000 batches, K=2):
 | 1 | `[3 10]` = 13, rc=1 | `[1 0]` = 1, rc=0 | 13x | 103% |
 | 2 | `[16 11]` = 27, rc=1 | `[3 0]` = 3, rc=0 | 9x | 102% |
 
-Every reverted-arm failure carried `uncommitted after 6 attempt(s) (last: transport)` — the
-BASE attempt budget exhausted on the transport class, i.e. the flat schedule never
-outlasting one reconnect window — and the HEAD arm produced none at all.
+**The [D6] signature pins a CLASS both binaries can reach — it is not the discriminator.**
+Every reverted-arm failure carried `uncommitted after 6 attempt(s) (last: transport)`, the
+BASE attempt budget exhausted on the transport class. So did HEAD's: on one run's retained
+logs the reverted arm carried 6 of that exact string and **the HEAD arm carried 2**, at the
+same attempt count. HEAD reaches the transport class too, just far less often. The
+discrimination is the COUNT separation in the table above, which is the assertion that
+fails the script; the signature check is informational on both arms and prints both counts.
 
 **The A/B storms harder than the CI gate, deliberately.** The signal scales with reset
 ROUNDS, and the gate's own sizing is chosen for DISK (K+1 benches against one cluster, ~27 G
