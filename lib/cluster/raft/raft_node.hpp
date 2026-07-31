@@ -25,6 +25,44 @@ struct RaftOptions {
     bool checkQuorum = false;       // §CheckQuorum leader lease (added later)
     uint64_t rngSeed = 0;           // 0 => derive deterministically from node id
 
+    // HOW LONG A STUCK LEADER TRANSFER IS TOLERATED before it is abandoned (§3.10,
+    // debt D-20), in ticks. 0 => derive as 2 * heartbeatTimeout, clamped to at least
+    // one tick and never longer than the election timeout.
+    //
+    // THIS IS A DELIBERATE DEVIATION FROM etcd, WHICH USES ONE ELECTION TIMEOUT. While
+    // `leadTransferee_` is set the leader refuses EVERY proposal, so the abandon window
+    // is the exact duration a mis-aimed transfer costs the group its writes. At the
+    // production timing one election timeout is 2.5-5 s against a 1.5 s write deadline:
+    // a single transfer aimed at a peer that went unreachable after the balancer picked
+    // it is a whole batch of failed writes (measured while closing D-1 -- the reason
+    // that row's target filter had to be conservative rather than merely correct). Two
+    // heartbeat intervals is 1 s at production timing, which a batch can absorb inside
+    // its base deadline.
+    //
+    // SHORTENING IT IS SAFE, and that is a claim about Raft rather than about this
+    // code. Abandoning is a purely LOCAL decision by the OLD leader to resume accepting
+    // proposals in the term it already leads; it retracts nothing and grants nothing.
+    // The transferee may hold a TimeoutNow and campaign anyway -- that campaign runs at
+    // term+1, which no leader has, so it cannot produce two leaders in one term. If it
+    // wins, the old leader steps down on the higher term exactly as it would for any
+    // election it lost, and the proposals it accepted in between either committed on a
+    // quorum (in which case §5.4.1's election restriction guarantees the winner has
+    // them) or did not (in which case they are truncated and their writes were never
+    // acked -- `proposeAndAwaitApplied` resolves on APPLY, and the router reports
+    // uncommitted from the committed set). Both are ordinary stale-leader outcomes that
+    // Raft handles on every failover.
+    //
+    // The cost of abandoning a transfer that WOULD have completed is that it simply did
+    // not happen: no TimeoutNow is sent on a later catch-up ack, and the balancer's next
+    // pass tries again. So the bound wants to be comfortably longer than a healthy
+    // handoff (TimeoutNow -> campaign -> step down, single-digit milliseconds; or one
+    // bounded catch-up round trip, since `propose` refuses while transferring and the
+    // target's backlog is therefore FIXED) and much shorter than the write deadline.
+    //
+    // It must stay below the election timeout, which the derivation enforces: a window
+    // at or past it would be the old behaviour wearing a new name.
+    unsigned transferTimeout = 0;
+
     // CATCH-UP CHUNKING (write-scaleout 5.4). A follower that has been down carries a
     // nextIndex far behind the leader's lastIndex, and `sendAppend` used to put the WHOLE
     // remaining tail -- `log_.entriesFrom(nextIndex)` -- into ONE AppendEntries. After a
@@ -228,6 +266,10 @@ public:
     // RaftGroup::compact for why an unpersisted snapshot makes compaction pointless.
     const Snapshot& servableSnapshot() const { return snapshot_; }
     unsigned electionTimeout() const { return electionTimeout_; }
+    // The window a stuck leader transfer is abandoned after (§3.10, debt D-20). Exposed
+    // so a caller -- and a test -- can scale to the real bound rather than assume it is
+    // the election timeout, which it deliberately is not. See RaftOptions::transferTimeout.
+    unsigned transferTimeout() const { return transferTimeout_; }
 
     bool isVoter(NodeId n) const;
     bool isLearner(NodeId n) const;
@@ -362,6 +404,12 @@ private:
     // leader refuses every proposal, so a transfer to a DEAD peer wedges the group's
     // writes permanently. See tick().
     unsigned transferElapsed_ = 0;
+    // The abandon bound itself, resolved once at construction from
+    // RaftOptions::transferTimeout. NOT the election timeout (debt D-20) and NOT
+    // randomized: an election timeout is randomized to break split votes between peers
+    // racing each other, while this one is a single leader's local patience with a
+    // handoff it started, and nothing races it.
+    unsigned transferTimeout_ = 0;
     uint64_t undeliverableSnapshots_ = 0;  // see undeliverableSnapshots()
 
     // ---- chunked InstallSnapshot, leader side (debt D-5) ----

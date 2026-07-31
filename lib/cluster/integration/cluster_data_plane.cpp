@@ -277,6 +277,30 @@ seastar::future<> ClusterDataPlane::start(const ClusterConfig& cfg, seastar::sha
         // mid-install. Pinned as a property (not as these numbers) by
         // `RaftSnapshotChunkingTest.AFollowerBeingFedChunksDoesNotCampaignAgainstItsLeader`.
         ropts.snapshotChunkTimeout = 2 * ropts.heartbeatTimeout;
+        // THE LEADER-TRANSFER ABANDON WINDOW (debt D-20), stated here rather than left to
+        // the core's derivation because it belongs in the same ordering as the timeouts
+        // above and is read against the WRITE deadline, which only this layer knows:
+        //
+        //     transferTimeout 50 (1 s)  <  kDeadline 1.5 s  <<  electionTimeoutMin 125
+        //
+        // While a transfer is in flight the group refuses EVERY proposal, so this window
+        // is exactly what a mis-aimed transfer costs the group's writes. etcd uses one
+        // election timeout (2.5-5 s here), which is LONGER than the write deadline -- so a
+        // single transfer aimed at a peer that went unreachable after the balancer picked
+        // it fails a whole batch. At 1 s a batch absorbs it inside its base deadline and
+        // retries into the resumed leader. The safety argument for abandoning early is on
+        // RaftOptions::transferTimeout; the short version is that it retracts nothing and
+        // grants nothing, the transferee's campaign is at a term no leader holds, and a
+        // proposal accepted after abandoning is only ever ACKED if it committed.
+        ropts.transferTimeout = 2 * ropts.heartbeatTimeout;
+        if (ropts.transferTimeout >= ropts.electionTimeoutMin)
+            // Same fail-closed reasoning as the chunk timeout below: a transfer window at
+            // or past an election timeout is the pre-D-20 behaviour wearing a new name,
+            // and the whole point is that it is much shorter than the write deadline.
+            throw std::runtime_error(
+                "cluster: Raft transferTimeout must be well below electionTimeoutMin -- the leader refuses every "
+                "proposal while a transfer is in flight, so an abandon window as long as an election outlasts the "
+                "write deadline and makes one mis-aimed transfer a failed batch");
         if (ropts.snapshotChunkTimeout >= ropts.electionTimeoutMin)
             // Fail closed at startup rather than discover it as an election storm during a
             // rebalance: a future edit to any of the three numbers must keep the ordering.

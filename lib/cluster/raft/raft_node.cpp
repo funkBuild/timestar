@@ -46,6 +46,17 @@ RaftNode::RaftNode(NodeId id, std::vector<NodeId> voters, RaftLog log, HardState
     commitIndex_ = log_.snapshotIndex();
     lastApplied_ = log_.snapshotIndex();
     unstableStart_ = log_.lastIndex() + 1;  // the on-disk log is already durable
+    // The leader-transfer abandon bound (§3.10, debt D-20). Resolved ONCE, here, because
+    // it is a property of the configured cadence and not of the current election draw --
+    // see RaftOptions::transferTimeout for why it is two heartbeats and not one election
+    // timeout, and why shortening it is safe.
+    //
+    // Clamped against electionTimeoutMin rather than the randomized electionTimeout_, so
+    // the invariant "the transfer window never outlasts an election" holds for EVERY draw
+    // this node will ever make, not just its first.
+    const unsigned derivedTransfer =
+        opts_.transferTimeout != 0 ? opts_.transferTimeout : std::max(2u * opts_.heartbeatTimeout, 1u);
+    transferTimeout_ = std::max(1u, std::min(derivedTransfer, std::max(1u, opts_.electionTimeoutMin)));
     resetElectionTimer();
 }
 
@@ -905,9 +916,22 @@ void RaftNode::tick(unsigned passes) {
         // "1 VShard slice(s) uncommitted after 6 attempt(s) (last: not-leader)" for as
         // long as one of three nodes was down -- with a healthy 2-of-3 quorum available.
         //
-        // etcd bounds it the same way: one election timeout, then give up and resume
-        // accepting writes. The transfer is merely not completed; nothing is unsafe.
-        if (leadTransferee_ != kNoNode && (transferElapsed_ += passes) >= electionTimeout_) {
+        // etcd bounds it at ONE ELECTION TIMEOUT; this bounds it at `transferTimeout_`,
+        // two heartbeat intervals by default (debt D-20). The deviation is deliberate and
+        // its safety argument is on RaftOptions::transferTimeout: at the production timing
+        // an election timeout is 2.5-5 s against a 1.5 s write deadline, so the etcd bound
+        // makes ONE mis-aimed transfer cost a whole batch, while abandoning is a purely
+        // LOCAL decision to resume proposing in a term we already lead -- it cannot
+        // produce two leaders in one term, and a transferee that campaigns anyway simply
+        // deposes us on the higher term as any election would.
+        //
+        // The transfer is merely not completed; nothing is unsafe. `leadTransferee_` is
+        // cleared, so the next balancer pass may legitimately re-arm a window for the same
+        // target -- which is what makes the SHORTER bound a real reduction in refusal
+        // rather than a rotation of it: a dead target now costs the group ~1 s per pass
+        // instead of a full election timeout, and D-1's liveness filter stops it being
+        // chosen at all once its ack clock has decayed.
+        if (leadTransferee_ != kNoNode && (transferElapsed_ += passes) >= transferTimeout_) {
             leadTransferee_ = kNoNode;
             transferElapsed_ = 0;
         }
