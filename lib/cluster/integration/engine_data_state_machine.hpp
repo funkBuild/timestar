@@ -27,14 +27,25 @@ namespace timestar::cluster {
 //     skipping would diverge this replica from the others. RaftGroup::drainReady
 //     propagates the throw BEFORE advancing the applied index, so the entry is not
 //     marked applied -- the replica halts/retries rather than skipping.
-//   - Backpressure: admission is meant to happen at PROPOSE time (the leader rejects
-//     if ingest-backlogged). apply() itself can still throw IngestBacklogException
-//     today because it routes through Engine::insertBatch, which calls
-//     rejectIfIngestBacklogged unconditionally -- a follower applying a large
-//     catch-up burst that outruns background flush. That throw does NOT diverge
-//     (RaftGroup retries the whole Ready, and re-apply is idempotent), but it can
-//     stall a lagging replica's recovery; a proper apply-path bypass (insert without
-//     admission control) is a follow-on. Do not read this as "never fires".
+//   - Backpressure: apply() CAN AND DOES throw IngestBacklogException, because it routes
+//     through Engine::insertBatch, which calls rejectIfIngestBacklogged unconditionally.
+//     Measured at 20,851 refusals across one RF=3 restart replay (debt D-36) -- so read
+//     this as "fires routinely under replay", not as a theoretical edge.
+//
+//     CORRECTING WHAT THIS NOTE USED TO SAY: it claimed admission "is meant to happen at
+//     PROPOSE time (the leader rejects if ingest-backlogged)" and called an apply-path
+//     bypass a mere follow-on. Propose-time admission DOES NOT EXIST --
+//     rejectIfIngestBacklogged has exactly two callers, both Engine::insert*, so in
+//     cluster mode APPLY IS THE INGEST PATH and a bare bypass would remove the clustered
+//     write path's only conversion/compaction-backlog backpressure. Both halves have to
+//     land together; filed as debt D-42.
+//
+//     The throw does NOT diverge (RaftGroup retries the whole Ready, and re-apply is
+//     idempotent). What it used to do was worse than stall one replica: it propagated out
+//     of RaftGroupRegistry::tickAll and aborted the WHOLE tick pass, starving every
+//     higher-numbered group on the reactor (D-36). Tick failures are now isolated per
+//     group and counted, and a cluster read fences on the node's own apply lag rather
+//     than answering out of state that is behind its committed log.
 //   - appliedIndex(): the SM's watermark tracks the last DATA entry apply() ran on.
 //     The RaftGroup only invokes apply() for Normal non-empty entries, so a trailing
 //     config-change or empty term-start no-op is NOT counted here; the authoritative

@@ -11,10 +11,11 @@
 # fence rather than a coin toss.
 #
 # PHASE 2 (A/B, advisory): the same run under a HEAVY load, once with the trigger off and
-# once on, reported for context. The absolute bar does NOT hold there on this binary,
-# because of a PRE-EXISTING load-dependent defect (debt D-36) that has nothing to do with
-# snapshots -- and its magnitude swings run to run, so asserting the A/B alone would both
-# fail without a regression and pass with one (review F5). Measured across runs:
+# once on, reported for context. The absolute bar did NOT hold there on the binary this gate
+# was written against, because of a PRE-EXISTING load-dependent defect (debt D-36) that has
+# nothing to do with snapshots -- and its magnitude swung run to run, so asserting the A/B
+# alone would both fail without a regression and pass with one (review F5). Measured across
+# runs on THAT binary:
 #
 #     heavy load + snapshots ON      194-195 of 200 acked
 #     heavy load + snapshots OFF     175-199 of 200 acked   (183/193/199 and 175/175/175
@@ -22,8 +23,19 @@
 #     LIGHT load, either way         200 of 200 acked
 #
 # The spread on the control arm is the point: it is wider than any regression this gate
-# would be looking for. Phase 2 is kept because it is the evidence that the loss is not
+# would be looking for. Phase 2 is kept because it is the evidence that the shortfall is not
 # snapshot-related -- the snapshot arm is never the worse one -- not because it is a bar.
+#
+# D-36 IS NOW CLOSED (`966baf8`), and knowing what it was changes how to read phase 2. It was
+# never loss: the points were durable in the recovered journals and simply not APPLIED yet, and
+# this gate reads back exactly once, so it was measuring apply lag and calling it durability.
+# The fix fences a cluster read on the node's own apply lag, so a read either waits or fails
+# closed rather than answering short. Phase 2's absolute bar should therefore now be MET -- but
+# it is still reported rather than asserted here, because the sample that closed D-36 came from
+# `restart_readback_gate.sh` (which re-reads, and is the gate that actually holds that
+# invariant to account) and because the control arm's historical spread is not evidence about
+# the current binary. If phase 2 starts falling short again, that is a D-36 REGRESSION and the
+# readback gate is where to confirm it.
 #
 # WHAT D-6 COULD HAVE BROKEN, and what this therefore isolates. A snapshot splits recovery
 # into two halves that must AGREE: everything at or below the compacted boundary comes from
@@ -237,7 +249,8 @@ assert_le "acked points readable WITH compaction (<= sent, nothing fabricated/do
 # this binary by a pre-existing, load-dependent defect (D-36) in BOTH arms, and asserting it
 # here would attribute that to D-6.
 if [ "$SUBJ_MIN" -lt "$SUBJ_ACKED" ]; then
-    echo "  ADVISORY (debt D-36, PRE-EXISTING, not a D-6 regression): under HEAVY load the absolute bar is not met --" \
+    echo "  ADVISORY (debt D-36 REGRESSION -- D-36 is CLOSED, so this should no longer happen; NOT a D-6 finding):" \
+         "under HEAVY load the absolute bar is not met --" \
          "$SUBJ_MIN of $SUBJ_ACKED acked points readable with compaction," \
          "$CTRL_MIN of $CTRL_ACKED without it. ack => durable quorum commit means this must be" \
          "$SUBJ_ACKED; the control arm shows it is not snapshot-related. Ingest-backlog log lines:" \

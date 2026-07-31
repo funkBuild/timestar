@@ -13,6 +13,8 @@ not probes, so they can be run from CI or a release checklist.
 | `restart_catchup_gate.sh` | a follower that was DOWN through a large write campaign catches up when it returns, under the tightened Raft admission bound (write-scaleout 5.4) |
 | `fault_injection_ab.sh` | **(expensive, on-demand — not a CI gate)** that `fault_injection_gate.sh` DISCRIMINATES: builds the 4a-reverted binary and asserts it fails the same storm HEAD passes |
 | `node_kill_round.sh` | `kill -9` of one node MID-BENCH: no 500s, no crashes, every ACKED write readable afterwards on both survivors — and it prints the one-node-down 503 band (debt D-14), which stays advisory |
+| `snapshot_durability_gate.sh` | TAKING SNAPSHOTS DOES NOT COST DURABILITY (debt D-6): under a light load, every acked point is readable after the whole cluster is `kill -9`'d and restarted OVER COMPACTED JOURNALS; the heavy-load A/B is advisory |
+| `restart_readback_gate.sh` | AN ACKED WRITE IS READABLE AFTER A RESTART THAT FOLLOWS A HEAVY CAMPAIGN (debt D-36). It re-reads REPEATEDLY, which is the whole point: a single read cannot tell 25 lost points from 25 durable ones that apply() has not reached, and that ambiguity is what left D-36 undetermined for a session. A count that climbs is a stall; one that stays flat is loss. Reports `apply_lag_entries` / `apply_failures` / `tick_errors` while it waits |
 
 All of them take an optional server binary as `$1` (default
 `build/bin/timestar_http_server`), so a "before" binary can be measured the same way.
@@ -44,6 +46,13 @@ consensus) is filed in the plan doc's Phase 5 outcome.
 use, because its ports have to sit BELOW the ephemeral range — see `require_ports_free`'s
 note in `cluster_gate_lib.sh`. That also means its `kill_cluster` prefix (193) no longer
 collides with `fault_injection_gate.sh`'s.
+
+`snapshot_durability_gate.sh` (19710-19712) and `restart_readback_gate.sh` (19730-19732) sit in the same
+sub-ephemeral band for the same reason. `kill_cluster` matches the port as a SUBSTRING of the argv, so the durability gate's
+prefix `197` also matches `--port 19730` — its cleanup reaches a readback run's cluster, and
+`1973` is a subset of `197`, not a sibling of it. That is another reason the ONE AT A TIME rule
+above is a rule and not advice; with only one gate live, anything else in the band is a stray
+from a crashed run and killing it is the cleanup you want.
 
 `deposed_primary_gate.sh` uses **five** nodes at RF=3 on purpose. At RF=3 on THREE nodes
 every node hosts every Raft group, so the router's `LeaderResolver` always knows the real
