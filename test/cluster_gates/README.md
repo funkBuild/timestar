@@ -179,13 +179,16 @@ exactly that). The cluster planes only ever dial `port+1000` / `port+2000`.
    gated the resetter on the bench still running, and the bench finished in under a
    second, so the storm never fired and every "0 errors" assertion passed vacuously. The
    bench, the resetter and the probe now run decoupled.
-   **The floors are 70 rounds / 180 connections**, roughly half of what a real run
-   injects here (147 rounds destroying 392-400 connections). They were 8/8 — about 5% of
-   observed, i.e. barely a vacuity check — until D-4. Half leaves room for a faster or
-   slower box: the resetter fires on a fixed 0.3 s wall clock while the bench length is
-   machine-dependent, so a machine that finishes the bench in half the time legitimately
-   injects half the rounds. Override with `GATE_MIN_RESET_ROUNDS` /
-   `GATE_MIN_RESET_CONNS` rather than editing, and record the observed counts when you do.
+   **The floors are 35 rounds / 100 connections PER STORM**, multiplied by K, and they are
+   roughly half of what a real run injects at the gate's own sizing (76-84 rounds
+   destroying 217-243 connections per storm). They were 8/8 — about 5% of observed, i.e.
+   barely a vacuity check — until D-4, and 70/180 until the bench came down for K storms
+   (D-21; at 2000 batches a storm injects ~147 rounds, which is what the A/B still uses).
+   Half leaves room for a faster or slower box: the resetter fires on a fixed 0.3 s wall
+   clock while the bench length is machine-dependent, so a machine that finishes the bench
+   in half the time legitimately injects half the rounds. Override with
+   `GATE_MIN_RESET_ROUNDS` / `GATE_MIN_RESET_CONNS` rather than editing, and record the
+   observed counts when you do.
 2. Node 3 must LEAD at least 800 VShards. The first node to start wins every election, and
    a converged-but-skewed cluster left node 3 leading 128 of 4096 — 3% of traffic crossing
    the fault. The gate rebalances and waits for fair share first.
@@ -197,29 +200,48 @@ forwarder is not a server number, so the dip is asserted against a QUIET baselin
 through the same proxy — not against an unproxied figure. (In practice the handicap is
 small: 4.96 M pts/s baseline vs 5.0-5.1 M unproxied.)
 
-**It is a discriminating gate, and `fault_injection_ab.sh` re-proves that on demand.**
-The same tree with only the three 4a files reverted to `ad77cf3` (`write_errors.hpp`,
-`replicated_write_router.{cpp,hpp}` — so 4b's jitter and keepalive, which live in
-`reconnect_policy.hpp`, are still present) FAILS it, under an identical fault: 147 reset
-rounds destroying 400 peer connections → **9 bench HTTP errors + 1 probe 5xx**, every one
-of them `RetryableWriteError: N VShard slice(s) uncommitted after 6 attempt(s) (last:
-transport)` — the [D6] signature verbatim. The Phase-4 binary takes the identical storm
-(147 rounds, 392 connections) with zero. Throughput was 92% of baseline before and 94%
-after, i.e. the fix converts errors into a little latency and costs nothing else.
+**It is a discriminating gate, and `fault_injection_ab.sh` proves that on demand — it has
+now actually been run (debt D-19).** It creates a `git worktree` at HEAD, applies a
+two-anchor patch that undoes 4a's PACING and nothing else (`writeFailureRetryDelay` stops
+doubling for the Transport/Overloaded classes, and the coupling `static_assert` that makes
+exactly that a compile error is switched off — that assert *is* the fix's guarantee, so
+disabling it is the honest inverse), builds a comparison `timestar_http_server` in its own
+build dir beside the repo, runs the storm gate against both binaries in turn, and asserts a
+**within-run separation** plus the [D6] signature.
 
-That was a hand-run session claim with no way to re-check it. It is now scripted
-(D-4). `fault_injection_ab.sh` creates a `git worktree`, applies
+It used to `git checkout fcb2a94^` the three 4a files instead. That still produces exactly
+the intended 3-file diff — and then **does not compile**: later work needs
+`WriteFailure::LeaderRefused` and `ReplicatedBatchWriteRouter::kElectionDeadline`, which the
+pre-4a files do not define. The comparison binary that description implies had never
+existed. The patch is also *narrower* than the checkout was, which reached past 4a and
+dropped `d101c07`'s and `c052253`'s later fixes in those files.
 
-```
-git checkout fcb2a94^ -- lib/cluster/data/write_errors.hpp \
-                         lib/cluster/data/replicated_write_router.cpp \
-                         lib/cluster/data/replicated_write_router.hpp
-```
+Measured, two runs at the A/B's own sizing (2000 batches, K=2):
 
-builds `timestar_http_server` in its own build dir, runs the storm gate against both
-binaries in turn, and asserts the reverted one produces client errors **carrying the
-[D6] signature** while HEAD produces zero — plus that both runs took a comparable storm
-(within 2x), since comparing a heavy storm to a light one says nothing.
+| draw | REVERTED | HEAD | separation | intensity ratio |
+|---|---|---|---|---|
+| 1 | `[3 10]` = 13, rc=1 | `[1 0]` = 1, rc=0 | 13x | 103% |
+| 2 | `[16 11]` = 27, rc=1 | `[3 0]` = 3, rc=0 | 9x | 102% |
+
+Every reverted-arm failure carried `uncommitted after 6 attempt(s) (last: transport)` — the
+BASE attempt budget exhausted on the transport class, i.e. the flat schedule never
+outlasting one reconnect window — and the HEAD arm produced none at all.
+
+**The A/B storms harder than the CI gate, deliberately.** The signal scales with reset
+ROUNDS, and the gate's own sizing is chosen for DISK (K+1 benches against one cluster, ~27 G
+of a 62 G tmpfs). At the gate's default 1000 batches / K=3, three A/B draws gave HEAD 0/4/2
+against REVERTED 7/22/4: the first two separate, the **third overlaps** and the reverted
+binary passed the gate outright. At 2000 batches a storm injects ~147 rounds instead of ~79,
+which is the intensity behind the original "9-10 errors in a single storm" observation. Both
+arms always get the identical setting, and the intensity ratio between them is asserted.
+
+**Why the claim is a ratio and not a threshold.** Two absolute floors were tried and both
+were wrong: `3 * GATE_MAX_STORM_ERRORS` = 9 failed a correct REVERTED 7, and the absolute 5
+that replaced it then failed on HEAD's own noisy `[0 4 0]`. The two arms of one run share a
+box, a disk, a proxy and a storm within 3% of each other, so `REVERTED >= 3x HEAD` (floor 3)
+cancels exactly the variance the absolutes kept tripping over. HEAD's own budget and exit
+code are ADVISORY here — they are the gate's business, and an unlucky HEAD draw says nothing
+about whether the A/B discriminated.
 
 Two things to know before running it:
 
@@ -234,16 +256,18 @@ Two things to know before running it:
 
 It never touches your working tree; the revert happens in the worktree.
 
-**Run it more than once before believing either answer (debt D-20).** Measured while
-gating D-14: three consecutive runs of this gate on the SAME HEAD binary gave 3 errors, 3
-errors, then 0 — with a comparable storm every time (147-151 rounds, 396-405 connections)
-— and the pre-batch control binary in the same session produced 6 storm errors, 2 probe
-5xx, and 257 errors in its QUIET baseline run (the one with no fault injected at all).
-A single failing run does not identify a regression here, and a single passing run does not
-clear one.
+**Run it more than once before believing either answer (debt D-20, D-21).** The gate now
+runs K storms per run and budgets their TOTAL, and the budget has a measured distribution
+behind it: fifteen storm draws of one unchanged HEAD binary gave run totals **0, 1, 2, 0 and
+4** (eleven zeros, three ones, one four). The budget is 6. It was 3 after the first nine
+draws and a correct binary then drew 4 — the same non-reproducibility at a different
+threshold, which is why the draws are printed beside the number. A single failing run still
+does not identify a regression, and a single passing one does not clear one; the
+discriminating claim is the A/B's within-run ratio above.
 
-**Result on the Phase-4 binary:** 147 reset rounds destroying 392 peer connections
-mid-bench → **2000/2000 bench requests OK, 200/200 probe writes OK, 0 HTTP errors, 0
-server-side 500s, 0 crashes**; throughput 4.68 M vs a 4.96 M baseline (**94% retained**);
-all 200 acked probe points readable **on every node**. The cost lands exactly where 4a
-intends it to — p99 batch latency 121 ms → 175 ms, max 170 ms → 346 ms.
+**Result on the Phase-4 binary**, five runs at the gate's own sizing (1000 batches, K=3):
+**76-84 reset rounds destroying 217-243 peer connections per storm**, run totals of 0, 1, 2,
+0 and 4 client errors, **0 server-side 500s and 0 crashes throughout**, every acked probe
+point readable **on every node** in every storm, and 84-89% of the proxied baseline
+(5.06-5.29 M pts/s) retained. The cost lands exactly where 4a intends it to: latency, not
+errors.
