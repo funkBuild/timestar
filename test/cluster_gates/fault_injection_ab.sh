@@ -51,7 +51,7 @@
 # HEAD's own noise. The gate now runs K storms and budgets their TOTAL, and this script
 # asserts a SEPARATION -- HEAD within the budget, the reverted arm at 3x it or worse. The
 # real margin is wider than that bound: a reverted binary produces 9-10 errors in a SINGLE
-# storm where HEAD's whole K-storm budget is 3.
+# storm where HEAD's whole K-storm budget is 6.
 #
 # EXPENSIVE. This builds a second server binary from an isolated worktree (a fresh build
 # dir means building seastar too -- tens of minutes the first time; later runs are
@@ -88,8 +88,10 @@ GATE="$(pwd)/fault_injection_gate.sh"
 #
 # So: twice the bench, two storms instead of three. Both arms get the identical setting --
 # that is the whole point, and the storm-intensity ratio is asserted below -- and the run
-# stays at 3 benches, i.e. the ~34 G peak measured for that shape, inside the 30 G-free
-# precondition this script already enforces.
+# stays at 3 benches, i.e. the ~34 G peak measured for that shape -- which is why the
+# free-space precondition below is 40 G and not the 30 G it used to be: 34 G is the exact
+# point at which the K=3 sizing was killed for filling this tmpfs, so a 30 G floor admitted
+# a run that could not fit.
 export GATE_BENCH_BATCHES="${GATE_BENCH_BATCHES:-2000}"
 export GATE_STORM_ROUNDS="${GATE_STORM_ROUNDS:-2}"
 # NEITHER OF THESE MAY LIVE ON /tmp, and that is a hard requirement rather than a
@@ -130,9 +132,14 @@ PY
 # These gates are disk-hungry and the failure mode is SELF-AMPLIFYING (see the README):
 # less headroom -> slower bench -> the 0.3 s resetter fires more rounds -> slower still,
 # and a space problem reads as a regression. Two full storm runs need the room up front.
+# 40 G, not the 30 G this asked for before. The A/B runs the gate at 2000 batches / K=2 =
+# THREE benches against one cluster, whose measured peak is ~34 G -- so a 30 G floor
+# admitted a run that could not fit, and 34 G is the exact point at which the K=3 sizing was
+# killed for filling the tmpfs. The floor must exceed the peak, not approach it.
 FREE_G=$(df -BG --output=avail /tmp | tail -1 | tr -dc '0-9')
-if [ "${FREE_G:-0}" -lt 30 ]; then
-    echo "ABORT: only ${FREE_G}G free on /tmp; these gates need >= 30G (see README)"
+if [ "${FREE_G:-0}" -lt 40 ]; then
+    echo "ABORT: only ${FREE_G}G free on /tmp; this A/B peaks at ~34G per arm and needs >= 40G"
+    echo "       (the gate alone needs 30G; see test/cluster_gates/README.md)"
     exit 2
 fi
 
@@ -314,10 +321,17 @@ fi
 # one says nothing about the binaries, and the resetter's round count is load-dependent
 # (it fires on a wall clock while the bench length is not). The gate's own floors are the
 # lower bound; here we additionally require the two runs to be within 2x of each other.
-assert_ge "reverted run: reset rounds"  "${R_ROUNDS:-0}" "${GATE_MIN_RESET_ROUNDS:-70}"
-assert_ge "reverted run: connections destroyed" "${R_CONNS:-0}" "${GATE_MIN_RESET_CONNS:-180}"
-assert_ge "HEAD run: reset rounds"      "${H_ROUNDS:-0}" "${GATE_MIN_RESET_ROUNDS:-70}"
-assert_ge "HEAD run: connections destroyed" "${H_CONNS:-0}" "${GATE_MIN_RESET_CONNS:-180}"
+# THE FLOORS SCALE WITH K, because these are RUN TOTALS. They were flat 70/180 -- the
+# gate's old PER-STORM numbers -- so at K=2 they demanded less than one storm's worth of
+# resets across two, and a run in which the second storm never fired would have passed.
+# The gate's own per-storm floors are 35/100 (see its BENCH_BATCHES note); at the A/B's
+# 2000 batches a storm injects ~140 rounds / ~390 connections, so these stay conservative.
+AB_MIN_ROUNDS=$(( ${GATE_MIN_RESET_ROUNDS:-35} * GATE_STORM_ROUNDS ))
+AB_MIN_CONNS=$(( ${GATE_MIN_RESET_CONNS:-100} * GATE_STORM_ROUNDS ))
+assert_ge "reverted run: reset rounds (K=$GATE_STORM_ROUNDS)"  "${R_ROUNDS:-0}" "$AB_MIN_ROUNDS"
+assert_ge "reverted run: connections destroyed" "${R_CONNS:-0}" "$AB_MIN_CONNS"
+assert_ge "HEAD run: reset rounds (K=$GATE_STORM_ROUNDS)"      "${H_ROUNDS:-0}" "$AB_MIN_ROUNDS"
+assert_ge "HEAD run: connections destroyed" "${H_CONNS:-0}" "$AB_MIN_CONNS"
 if [ "${R_CONNS:-0}" -gt 0 ] && [ "${H_CONNS:-0}" -gt 0 ]; then
     RATIO=$(awk -v a="${R_CONNS}" -v b="${H_CONNS}" 'BEGIN{ r = (a>b) ? a/b : b/a; printf "%d", 100*r }')
     assert_le "storm intensity ratio between the two runs (%, 100 = identical)" "$RATIO" 200
@@ -330,7 +344,7 @@ fi
 # is satisfied by HEAD's own noise. The arms are separated by a FACTOR instead: the gate's
 # budget is what HEAD must stay inside, and the reverted arm must exceed it several times
 # over. The margin is real -- a reverted binary produces 9-10 errors in a SINGLE storm
-# where HEAD's whole K-storm budget is 3.
+# where HEAD's whole K-storm budget is 6.
 # THE CLAIM IS A WITHIN-RUN RATIO, NOT TWO ABSOLUTE THRESHOLDS, and getting there took two
 # corrections in a row -- which is itself the argument for the shape.
 #
@@ -339,12 +353,12 @@ fi
 #     checkout. The first real run measured REVERTED 7, so 9 would have failed the A/B on a
 #     correct result.
 #   * Replacing it with an absolute 5 fixed that draw and broke the next one: the HEAD arm
-#     drew [0 4 0] = 4 against the gate's then-budget of 3, so the A/B reported a failure
+#     drew [0 4 0] = 4 against the gate's then-budget of 3 (now 6), so the A/B reported a failure
 #     about a binary it was not testing.
 #
 # Both mistakes are the same mistake: an absolute threshold on a heavy-tailed count, set
 # from a handful of runs. The two arms of ONE A/B run share a box, a disk, a proxy and a
-# storm within 1% of each other (the intensity ratio is asserted above), so the RATIO
+# storm within 3% of each other (the intensity ratio is asserted above), so the RATIO
 # between them cancels exactly the variance the absolutes kept tripping over. Measured:
 #
 #     draw   HEAD   REVERTED   ratio
@@ -355,8 +369,20 @@ fi
 # produced real errors, and a noisy HEAD raises the bar instead of failing the run.
 BUDGET="${GATE_MAX_STORM_ERRORS:-6}"
 SEP_FACTOR="${GATE_AB_SEPARATION_FACTOR:-3}"
-SEP_FLOOR=$(( (H_TOTAL > 1 ? H_TOTAL : 1) * SEP_FACTOR ))
-assert_ge "SEPARATION: reverted errors ($R_TOTAL) vs ${SEP_FACTOR}x HEAD's ($H_TOTAL)" "$R_TOTAL" "$SEP_FLOOR"
+# ...AND IT MUST ALSO CLEAR HEAD'S OWN NOISE FLOOR. `3 * max(H,1)` alone is vacuous when
+# both arms draw near zero: HEAD has drawn as many as 4 unaided, so a run of HEAD 0 against
+# REVERTED 3 would "separate" on numbers that are both inside the good binary's ordinary
+# spread. The floor is therefore the LARGER of the ratio and one past the gate's own budget,
+# so the reverted arm must land somewhere HEAD is not merely unlikely to go but is asserted
+# not to go.
+SEP_RATIO=$(( (H_TOTAL > 1 ? H_TOTAL : 1) * SEP_FACTOR ))
+SEP_FLOOR=$(( SEP_RATIO > BUDGET + 1 ? SEP_RATIO : BUDGET + 1 ))
+assert_ge "SEPARATION: reverted errors ($R_TOTAL) vs max(${SEP_FACTOR}x HEAD's $H_TOTAL, budget+1)" "$R_TOTAL" "$SEP_FLOOR"
+# AN OVERLAP DRAW FAILS RED, AND THAT IS THE INTENDED OUTCOME rather than a defect in the
+# script: measured at the gate's own lighter sizing, one draw in three came out HEAD 2
+# against REVERTED 4 and no honest threshold separates those. A red A/B means RE-DRAW (and,
+# if it repeats, the storm is not intense enough to discriminate on this box) -- it does not
+# on its own mean the pacing fix has regressed.
 # ADVISORY, deliberately. HEAD's own absolute budget is `fault_injection_gate.sh`'s business,
 # and an unlucky HEAD draw says nothing about whether this script discriminated -- which is
 # the only question it exists to answer. Reported so a run that is drifting is visible.
@@ -379,17 +405,26 @@ fi
 # only ever have reported "NOT the [D6] signature", on every arm, forever. Executing the
 # script end to end (D-19) is what surfaced it.
 #
-# The corrected pattern matches what [D6] actually looks like from outside: the retry giving
-# up with the TRANSPORT class last. Measured on the reverted arm, all four bench failures
-# and both probe 5xx were "uncommitted after 6 attempt(s) (last: transport)" -- the BASE
-# budget exhausted, i.e. the flat schedule never outlived one reconnect window -- and the
-# HEAD arm produced none at all.
+# THE SIGNATURE PINS A CLASS BOTH BINARIES CAN REACH -- it is NOT the discriminator, and
+# saying otherwise was this script's last wrong evidence claim. Measured on one run's
+# retained logs: the REVERTED arm carried 6 x `uncommitted after 6 attempt(s)
+# (last: transport)` and the HEAD arm carried 2 x THE SAME STRING, at the same attempt
+# count. HEAD reaches the transport class too; it just reaches it far less often. So the
+# check below is INFORMATIONAL on both arms, and the discrimination is the COUNT separation
+# asserted above -- which is why that assertion is the one that fails the script.
+#
+# It is still worth printing: a reverted arm failing with some OTHER class would mean the
+# patch is not exercising the pacing at all, and both counts side by side make the
+# "same class, different rate" shape visible instead of implied.
 D6_SIGNATURE='uncommitted after [0-9]+ attempt\(s\) \(last: transport\)'
-if grep -qE "$D6_SIGNATURE" /tmp/tsgate_ab_reverted.log; then
-    gate_ok "REVERTED binary: failures carry the [D6] signature ($(grep -oE "$D6_SIGNATURE" /tmp/tsgate_ab_reverted.log | sort | uniq -c | tr -s ' ' | tr '\n' ';'))"
+R_SIG=$(grep -cE "$D6_SIGNATURE" /tmp/tsgate_ab_reverted.log)
+H_SIG=$(grep -cE "$D6_SIGNATURE" /tmp/tsgate_ab_head.log)
+echo "  [D6] class ([last: transport] give-ups logged): REVERTED $R_SIG, HEAD $H_SIG"
+if [ "$R_SIG" -gt 0 ]; then
+    gate_ok "REVERTED binary: failures carry the [D6] class (informational; HEAD carries it $H_SIG time(s) too)"
 else
-    gate_fail "REVERTED binary failed, but NOT with the [D6] signature -- the gate may be \
-catching something other than the retry pacing. First error line: \
+    gate_fail "REVERTED binary failed, but NOT with the [D6] class -- the patch may not be \
+exercising the retry pacing at all. First error line: \
 $(grep -m1 'First error' /tmp/tsgate_ab_reverted.log)"
 fi
 # Also advisory, and for the same reason as the budget above: the HEAD arm's exit code is

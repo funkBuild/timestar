@@ -32,7 +32,7 @@
 #     rebalance          129 / 420    13 / 420     0 / 408   (transfers / calls)
 #     probe read-back    200/200 on every node, every storm, all three runs
 #
-# The ceiling is ~2x the worst draw (36). Note the reset gate's own budget is 3 across
+# The ceiling is ~2x the worst draw (36). Note the reset gate's own budget is 6 across
 # THREE storms at 4 connections: the extra errors here are the CONNECTION COUNT, which
 # multiplies the sockets each reset round destroys, far more than they are the rebalance.
 #

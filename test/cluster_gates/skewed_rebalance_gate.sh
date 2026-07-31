@@ -53,23 +53,70 @@
 # close D-18's wording exactly. Until then the hot groups' own leadership is inferred from
 # the fact that the balancer's cursor sweeps all 4096.
 #
-# WHAT IT FOUND, which is the reason it exists. Under the SPREAD load the rolling gate
-# offers, an identical storm produces ZERO client errors. Under this one it produces a
-# handful of retryable 503s (0, 5, 6 and 24 of 500 batches across four runs), and the node
-# log names the mechanism verbatim:
+# WHAT IT FOUND, which is the reason it exists, and it is a COMPOSITION of two failures
+# rather than either one. Under the SPREAD load the rolling gate offers, an identical storm
+# produces ZERO client errors. Under this one it produces a handful of retryable 503s.
+# Reading only the node log, the story looks like the abandon window:
 #
 #   cluster: this node LEADS VShard 1304 and refused a proposal (1 such refusals so far);
 #   a leadership transfer is in flight
 #
-# That is D-20's abandon window meeting a group that is never idle. It is NOT a regression
-# from D-20 -- that row SHORTENED the window (one election timeout -> 1 s), so it strictly
-# reduces this -- and it is not loss: the probe reads back 150/150 on every node on every
-# run, and the router retried 8-14 times before its 1.5 s deadline expired. The gate
-# therefore bounds the refusals rather than forbidding them; the numbers are below.
+# Those refusals are real and this gate counts them. But they are NOT what failed the
+# batches, and the gate's own output says so: every give-up reports `(last: transport)`,
+# which is `writeFailureName(WriteFailure::Transport)` -- a LeaderRefused give-up would
+# print `leader-refused-mid-transfer`. What actually happens is both, in order:
+#
+#   1. A rebalance-armed group refuses the slice. LeaderRefused is election-SHAPED, so
+#      `ReplicatedBatchWriteRouter` widens the budget for the next decision from
+#      kMaxAttempts/kDeadline (6 attempts, 1.5 s) to kMaxElectionAttempts/kElectionDeadline
+#      (16 attempts, 6 s) -- the batch is now waiting out what might be an election.
+#   2. Inside that widened window a slice fails on the TRANSPORT (an attempt timing out
+#      against a hot group that is saturated, here; no fault is injected). `electionWaitOnly`
+#      is recomputed per attempt and is deliberately NOT sticky, so the budget collapses
+#      back to 6 attempts in the same breath -- and the attempt counter is already past 6,
+#      so the give-up is IMMEDIATE, with no further retry, reporting `last: transport`.
+#
+# The attempt counts are the proof and they are asserted below: 8, 9, 13 and 14 attempts
+# were observed, all of them > kMaxAttempts (6), which is reachable ONLY if earlier attempts
+# were election-shaped. So "the 1.5 s deadline expired" is the wrong citation -- the
+# governing bound while the batch waits is kElectionDeadline (6 s) / 16 attempts, and the
+# 1.5 s figure only becomes relevant at the instant it kills the batch.
+#
+# IS IT A REGRESSION FROM D-20? THIS GATE CANNOT TELL, and that is the measured answer
+# rather than the argued one. A binary with the pre-D-20 window restored (kRaftTransferTicks
+# back to kRaftElectionTicksMin - 1 = 2.48 s, both D-20 fence layers disarmed) was built and
+# run against this gate, interleaved with the current binary on the same box in the same
+# session:
+#
+#     arm            503s of 500   transfers   joiner led   retained
+#     1 s (current)  17            2581        1365         22 %
+#     2.48 s (pre)   16            3522        1254         31 %
+#     1 s (current)  11            2307        1365         14 %
+#     2.48 s (pre)   8             1961        1364         24 %
+#
+# The pre-D-20 draws (8 and 16) sit INSIDE the current binary's own spread on the identical
+# configuration (0, 5, 6, 24, 13, 0, 17, 11 across eight runs). So the window is not
+# separable here in either direction: there is no evidence the current binary is worse --
+# which is what a regression would look like -- and equally no evidence for the "the old
+# window produces strictly more" reasoning this comment used to assert as measured. The
+# claim is withdrawn, not restated: D-20 rests on its unit tests and on the timing
+# assertions, NOT on this gate.
+#
+# What a sensitive measurement needs is the counter the server already keeps and does not
+# publish: `ReplicatedVShardHost::proposeRefusedWhileLeader()` counts exactly these
+# refusals, but it is not on `/cluster/status`, so from outside the only view is a WARN line
+# rate-limited to one per node per 5 s. The two arms' refusal counters differed by 165 to 1
+# on one pairing and not at all on the other, which is the instrument failing, not the
+# window behaving inconsistently. Publishing that counter would make this a real
+# measurement; it is the same missing-operator-surface residual as the per-VShard
+# leadership one above.
+#
+# It is NOT loss either way: the probe reads back 150/150 on every node on every run of
+# both arms.
 #
 # Usage: skewed_rebalance_gate.sh [SERVER_BINARY]
 #   GATE_MIN_TRANSFERS=N   anti-vacuity floor on transfers_initiated (default 800)
-#   GATE_MAX_STORM_5XX=N   ceiling on retryable 503s under the storm (default 50 of 500)
+#   GATE_MAX_STORM_5XX=N   ceiling on retryable 503s under the storm (default 100 of 500)
 #   GATE_MIN_DIP_PCT=N     throughput floor vs the control, percent (default 10)
 #   GATE_HOSTS=N           simulated hosts; the skew knob (default 4 => 40 series)
 #   GATE_KEEP_DATA=1       keep the data dirs (they are deleted on exit by default)
@@ -85,8 +132,8 @@ BENCH="$BUILD_DIR/bin/timestar_insert_bench"
 
 PORTS="19240 19241 19242"
 # Anti-vacuity: without real transfers this gate is just a skewed write bench. Measured
-# 2175 / 2298 / 2901 across the three calibration runs (105-228 endpoint calls), so the
-# floor is ~a third of the lowest.
+# 2175 / 2298 / 2901 / 2196 across the four calibration runs (105-228 endpoint calls), so
+# the floor is ~a third of the lowest.
 MIN_TRANSFERS="${GATE_MIN_TRANSFERS:-800}"
 HOSTS="${GATE_HOSTS:-4}"
 # THE LOAD IS SIZED TO THE 39 GROUPS IT LANDS ON, not copied from the rolling gate. See the
@@ -94,43 +141,55 @@ HOSTS="${GATE_HOSTS:-4}"
 # saturates them (210/400 batches refused, median latency at the 1500 ms write deadline,
 # 30 G of tmpfs in 95 s). 4 connections x 20 000 points per batch keeps every hot group
 # continuously mid-append -- which is the state this gate exists to create -- without
-# driving it into its own ceiling, and keeps the whole run inside ~15 G.
+# driving it into its own ceiling. Measured peak with the control arm included: 4.6 G.
 BATCHES="${GATE_BATCHES:-500}"
 BATCH_SIZE="${GATE_BATCH_SIZE:-2000}"
 CONNECTIONS="${GATE_CONNECTIONS:-4}"
 PROBE="${GATE_PROBE:-150}"
 # The joining node must end up with a REAL share, not a token one. Fair share of 4096 over
-# three nodes is 1365, and the storm reaches it: 1364 on all three calibration runs (1352
-# on the oversized first one). The floor is two thirds of fair share -- far below what a
-# working balancer reaches and far above the handful a broken one would.
+# three nodes is 1365, and the storm reaches it: 1364-1365 on all four calibration runs
+# (1352 on the oversized first one). The floor is 900, i.e. 66% of fair share -- far below
+# what a working balancer reaches and far above the handful a broken one would.
 MIN_JOINER_LED="${GATE_MIN_JOINER_LED:-900}"
 # A VShard journal bigger than this took real traffic. An idle group's directory holds a
 # HardState record and nothing else (tens of KB); a hot one holds the whole campaign.
 HOT_KB="${GATE_HOT_KB:-1024}"
 # The hot set must stay SMALL -- this is what makes the workload skewed rather than merely
-# different. 40 series can touch at most 40 groups; the bound is generous so that a hash
-# change that spreads them a little does not fail the gate, while a change that spreads
-# them over the whole ring does.
-MAX_HOT_VSHARDS="${GATE_MAX_HOT_VSHARDS:-160}"
+# different. 40 series can touch at most 40 groups, and every run has measured exactly 39,
+# so the bound is 60: tight enough to FALSIFY (160 could not be reached by 40 series under
+# any hash and so asserted nothing) while leaving room for a hash change that collides
+# differently.
+MAX_HOT_VSHARDS="${GATE_MAX_HOT_VSHARDS:-60}"
 # THE RETRYABLE-503 CEILING AND THE DIP FLOOR, both CALIBRATED, both bands rather than
 # absolutes -- see the long note at the assertions for why a zero would be wrong here.
 # Three runs of this exact configuration (500 batches x 20 000 points, 4 connections):
 #
-#     run                 2         3         4         5
-#     control pts/s       2.17 M    3.26 M    1.67 M    1.32 M   (0 errors on all four)
-#     storm pts/s         643 k     524 k     376 k     587 k
-#     retained            29 %      16 %      22 %      44 %
-#     retryable 503s      6         5         24        0        (of 500 batches)
-#     transfers           2175      2298      2901      2196
-#     hot VShards         39        39        39        39
-#     joiner led          1364      1364      1364      1365     (fair share 1365)
-#     probe read-back     150/150 on every node, all four runs
+#     run                 2      3      4      5      6      7      8      9
+#     retained            29 %   16 %   22 %   44 %   30 %   43 %   22 %   14 %
+#     retryable 503s      6      5      24     0      13     0      17     11
+#     transfers           2175   2298   2901   2196   2532   2201   2581   2307
+#     hot VShards         39     39     39     39     39     39     39     39
+#     joiner led          1364   1364   1364   1365   1364   1364   1365   1365
 #
-# The ceiling is ~2x the worst draw and the floor ~2/3 of it, which is the margin the
-# spread demands: identical input drew 0 to 24 refusals and 16 % to 44 % retained. They
-# still discriminate by an order of magnitude -- the oversized first calibration run, the
-# same storm against groups driven into saturation, produced 210 refusals of 400 batches.
-MAX_STORM_5XX="${GATE_MAX_STORM_5XX:-50}"
+#     control             1.32-3.43 M pts/s, ZERO client errors on all eight
+#     probe read-back     150/150 on every node, all eight runs
+#     failure class       transport at attempt 8 wherever there were errors at all
+#
+# (A reviewer's independent run of the same configuration drew 20, inside this band.)
+#
+# THE CEILING IS A COARSE TRIPWIRE, NOT A TIGHT BOUND, and it is set that way on purpose --
+# D-21's whole lesson is that a threshold fitted to a handful of draws of a heavy-tailed
+# count gets crossed by the good binary. Identical input has drawn 0, 0, 5, 6, 11, 13, 17,
+# 20 and 24 here;
+# a ~2x-the-worst ceiling (50) is exactly the shape that failed for D-21 at 3, so it is 100
+# -- 20 % of the batches, still an order of magnitude below the saturation regime the
+# oversized first calibration run produced (210 of 400, 52 %).
+#
+# The tight, falsifiable assertion is the FAILURE CLASS below, not this number: a give-up
+# must name a retryable class, and the (class, attempt-count) pair distinguishes the
+# election-extension composition from a plain transport failure. That is what would catch a
+# change in KIND; the ceiling only catches a change in ORDER OF MAGNITUDE.
+MAX_STORM_5XX="${GATE_MAX_STORM_5XX:-100}"
 MIN_DIP_PCT="${GATE_MIN_DIP_PCT:-10}"
 
 kill_cluster 1924
@@ -275,6 +334,15 @@ assert_ge "leadership the joining node ended up with (fair share 1365)" "${LED3:
 HTTP_ERRS=$(grep -o '[0-9]* HTTP errors' /tmp/tsgate_sk_bench.txt | head -1 | cut -d' ' -f1)
 CONN_FAILS=$(grep -o '[0-9]* connection failures' /tmp/tsgate_sk_bench.txt | head -1 | cut -d' ' -f1)
 STORM_TPUT=$(grep -oE 'Throughput:[[:space:]]*[0-9.]+' /tmp/tsgate_sk_bench.txt | head -1 | grep -oE '[0-9.]+')
+# LATENCY IS RECORDED AND DELIBERATELY NOT BOUNDED HERE, which is a stated gap rather than
+# an oversight. Measured p99 under the storm reaches 3460 ms against a control p99 of 88 ms
+# -- a 39x tail -- and a batch that exceeds the router's budget already surfaces as one of
+# the 503s bounded above, so a p99 bound would mostly re-assert the error ceiling. Bounding
+# the tail honestly needs its own calibration across more runs than four; until then the
+# numbers are printed so a drift is visible.
+CTL_P99=$(grep -oE 'p99=[[:space:]]*[0-9.]+' /tmp/tsgate_sk_control.txt | head -1 | grep -oE '[0-9.]+')
+STORM_P99=$(grep -oE 'p99=[[:space:]]*[0-9.]+' /tmp/tsgate_sk_bench.txt | head -1 | grep -oE '[0-9.]+')
+echo "  batch latency p99: control ${CTL_P99:-?} ms -> storm ${STORM_P99:-?} ms (NOT bounded by this gate)"
 STORM_PCT=$(awk -v a="${STORM_TPUT:-0}" -v b="${CTL_TPUT:-0}" 'BEGIN{ if (b+0==0) print 0; else printf "%d", 100*a/b }')
 echo "  throughput under the storm: ${STORM_TPUT:-?} vs control ${CTL_TPUT:-?} (${STORM_PCT}%)"
 # THE CLIENT-ERROR BOUND IS A BAND, NOT A ZERO, AND THAT IS THIS GATE'S FINDING (D-18).
@@ -296,7 +364,50 @@ echo "  throughput under the storm: ${STORM_TPUT:-?} vs control ${CTL_TPUT:-?} (
 # So the gate asserts what actually holds: no opaque 500s, no loss, and a BOUNDED number of
 # retryable refusals. A zero here would be a gate that fails on correct behaviour, and an
 # unbounded band would not notice the window growing again.
-assert_le "client HTTP errors (retryable 503s from groups mid-transfer)" "${HTTP_ERRS:-999}" "$MAX_STORM_5XX"
+assert_le "client HTTP errors (retryable 503s under the storm)" "${HTTP_ERRS:-999}" "$MAX_STORM_5XX"
+
+# THE FAILURE CLASS IS THE FALSIFIABLE PART, and it is what the count ceiling above is not.
+# `RetryableWriteError` names the class of the LAST failure and the attempt it gave up on,
+# so the composition in the header can be read straight off a run instead of inferred.
+# `head -1` on BOTH, and it is not defensive padding: the bench prints the error body TWICE
+# on one line (the `message` and `error` fields of the JSON both carry it), so `grep -o`
+# returns two matches from a single `grep -m1` line and the variable ends up holding
+# "transport\ntransport". That got as far as a run, where the `case` below matched neither
+# alternative and failed the gate with a truncated message.
+ERR_CLASS=$(grep -m1 -oE '\(last: [a-z-]+\)' /tmp/tsgate_sk_bench.txt | head -1 | tr -d '()' | cut -d' ' -f2)
+ERR_ATTEMPTS=$(grep -m1 -oE 'after [0-9]+ attempt\(s\)' /tmp/tsgate_sk_bench.txt | head -1 | grep -oE '[0-9]+')
+# The refusal line carries a RUNNING COUNT ("N such refusals so far") and is not emitted on
+# every refusal, so counting LINES undercounts badly -- one line was logged against 13
+# client errors. Take the largest counter any node reported instead.
+REFUSALS=$(cat /tmp/tsgate_sk*/s.log 2>/dev/null | grep -oE '\(([0-9]+) such refusals so far\)' |
+    grep -oE '[0-9]+' | sort -rn | head -1)
+REFUSALS="${REFUSALS:-0}"
+echo "  failure class: ${ERR_CLASS:-<none, no client errors>} after ${ERR_ATTEMPTS:-0} attempts;"
+echo "  abandon-window refusals (largest per-node counter logged): $REFUSALS"
+if [ -n "${ERR_CLASS:-}" ]; then
+    # HARD: a give-up must name a RETRYABLE class. `fatal` or `unassigned` here would mean
+    # the storm is producing something the client cannot retry, which is a different and
+    # much worse property than the bounded 503s this gate tolerates.
+    case "$ERR_CLASS" in
+        transport|leader-refused-mid-transfer|not-leader|leadership-lost|overloaded)
+            gate_ok "first failure carries a retryable class ($ERR_CLASS)" ;;
+        *)  gate_fail "first failure class is '$ERR_CLASS', which is not retryable -- the storm is producing a failure the client cannot retry" ;;
+    esac
+    # THE COMPOSITION, asserted where it is decidable. `transport` past kMaxAttempts (6) is
+    # reachable ONLY through an election-shaped extension, so the pair (class, attempts)
+    # distinguishes "a refusal widened the budget and a transport blip then collapsed it"
+    # from "a plain transport failure inside the base budget". Both are legitimate; the gate
+    # reports WHICH, so the header's story cannot quietly stop being true.
+    if [ "$ERR_CLASS" = "transport" ] && [ "${ERR_ATTEMPTS:-0}" -gt 6 ]; then
+        gate_ok "composition confirmed: transport give-up at attempt $ERR_ATTEMPTS, past kMaxAttempts 6, so an election-shaped failure widened the budget first"
+    elif [ "$ERR_CLASS" = "transport" ]; then
+        echo "  (note) transport give-up at attempt ${ERR_ATTEMPTS:-?}, INSIDE the base budget --"
+        echo "         this run's failures are not the election-extension composition the header describes"
+    fi
+fi
+echo "GATE_METRIC first_error_class ${ERR_CLASS:-none}"
+echo "GATE_METRIC first_error_attempts ${ERR_ATTEMPTS:-0}"
+echo "GATE_METRIC leader_refusals $REFUSALS"
 assert_eq "client connection failures" "${CONN_FAILS:-missing}" 0
 # THE COST MUST BE LATENCY, AND BOUNDED. Against the control rather than an absolute, for
 # the same reason the fault gate measures its dip through its own proxy: the skew already

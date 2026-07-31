@@ -42,8 +42,8 @@
 # storm that followed inherited a sick cluster AND a longer bench (the resetter fires on a
 # fixed 0.3 s clock, so a slower bench takes MORE rounds -- 199 against the usual 145-148).
 #
-# THE K-STORM FORM IS NOW MEASURED TOO -- three consecutive runs of THIS text, K=3, against
-# one unchanged HEAD binary (2fdde50 + the sizing below), each run a fresh cluster:
+# THE K-STORM FORM IS NOW MEASURED TOO -- five runs of THIS text, K=3, against one
+# unchanged HEAD binary (2fdde50 + the sizing below), each run a fresh cluster:
 #
 #     run          A              B              C              D              E
 #     errors       [0 0 0] = 0    [1 0 0] = 1    [1 0 1] = 2    [0 0 0] = 0    [0 4 0] = 4
@@ -62,11 +62,14 @@
 # with the draws beside it: any threshold set from a handful of runs of a heavy-tailed
 # distribution will eventually be crossed by the good binary.
 #
-# WHAT THIS GATE ALONE CANNOT DO, said plainly. The reverted arm of the A/B drew 7 and 22
-# under identical storms, so a budget of 6 separates the arms only just, on the worse draw.
-# A single run of this gate is therefore a SMOKE TEST for the pacing, not proof of it; the
-# discriminating claim is `fault_injection_ab.sh`'s WITHIN-RUN ratio, which compares the two
-# binaries under the same environment and cancels exactly the variance this table shows.
+# WHAT THIS GATE ALONE CANNOT DO, said plainly: IT CAN PASS A BINARY WITHOUT THE 4a FIX.
+# At this sizing the A/B's reverted arm has drawn 7, 22 and **4** across runs, and 4 is
+# INSIDE this budget of 6 -- so one run of this gate would have reported GATE PASSED on a
+# binary with the pacing removed. It is a smoke test for the pacing, not proof of it. The
+# discriminating claim is `fault_injection_ab.sh`'s WITHIN-RUN ratio, which compares the
+# two binaries under the same environment and cancels exactly the variance this table
+# shows -- and which floors the separation at `max(3x HEAD, budget+1)` for precisely the
+# reason above.
 #
 # The two failure modes are separated rather than averaged:
 #
@@ -421,9 +424,11 @@ echo "=== $STORM_ROUNDS storms: errors[$ERR_VECTOR ] rounds/conns[$ROUND_VECTOR 
 # It used to scrape the assertion lines instead, and that silently did not work: the
 # assertion is named "client errors across the reset storms (bench + probe, K storms)"
 # while the A/B looked for "client errors across the reset storms = ", so the `grep -F`
-# never matched and BOTH arms parsed as empty -- the A/B then compared `${R_TOTAL:-0}`
-# against `${H_TOTAL:-999}` and reported a separation it had not measured. Assertion text
-# is prose and will be reworded again; these lines are the contract.
+# never matched and BOTH arms parsed as empty. Note which way that failed: the A/B then
+# compared `${R_TOTAL:-0}` against `${H_TOTAL:-999}`, so BOTH the reverted floor and the
+# HEAD budget were evaluated on DEFAULTS -- it did not fail loudly, it reported a
+# separation nobody had measured. Assertion text is prose and will be reworded again;
+# these lines are the contract, and an unparseable metric is now a harness failure.
 echo "GATE_METRIC storm_errors_total $((TOT_BENCH_ERRS + TOT_PROBE_5XX))"
 echo "GATE_METRIC storm_bench_errors $TOT_BENCH_ERRS"
 echo "GATE_METRIC storm_probe_5xx $TOT_PROBE_5XX"
