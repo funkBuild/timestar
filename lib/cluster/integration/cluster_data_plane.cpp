@@ -2,6 +2,7 @@
 
 #include "../../utils/logger.hpp"  // timestar::http_log
 #include "../data/read_routing.hpp"
+#include "checkquorum_policy.hpp"
 #include "write_admission.hpp"
 
 #include <algorithm>
@@ -51,57 +52,52 @@ HostPort parseHostPort(const std::string& s) {
 // node is exactly the mixed-version hazard that ADR exists to prevent.
 inline constexpr bool kCheckQuorumDefault = false;
 
+// The PARSE and the DECISION live in `checkquorum_policy.hpp` and are pinned there
+// (D-30). Only the environment read and the logging are here: the property the release
+// ordering depends on -- that no runtime input can turn the guard ON -- is a claim about
+// `resolveCheckQuorum`, and a claim nothing can call is a claim nothing can check.
 bool checkQuorumEnabled() {
     const char* e = std::getenv("TIMESTAR_CLUSTER_CHECKQUORUM");
+    const auto ov = parseCheckQuorumOverride(e);
+    const bool on = resolveCheckQuorum(kCheckQuorumDefault, ov);
+
     if (!kCheckQuorumDefault) {
         // Nothing to disable, and nothing may enable. Say so if someone tried, so the
         // knob's absence of effect is visible rather than mysterious.
-        if (e && *e)
+        if (ov != CheckQuorumOverride::None)
             timestar::http_log.info(
                 "cluster: TIMESTAR_CLUSTER_CHECKQUORUM='{}' has no effect -- Raft CheckQuorum is OFF in this build "
                 "(debt D-9/D-29) and this override is disable-only",
                 e);
-        return false;
+        return on;
     }
-    if (!e || !*e)
-        return true;
-    // TRIM AND LOWERCASE BEFORE COMPARING. This is an operator's only lever over the
-    // guard and it is reached at 3am: `FALSE`, `Off` and a value with a stray space or
-    // trailing newline (trivially produced by a shell here-doc, a docker-compose YAML
-    // scalar, or an env file) must all mean what they obviously mean. A case-SENSITIVE
-    // exact match silently fell through to the "not a boolean" arm below and left the
-    // guard ON -- i.e. the one outcome the operator was trying to avoid.
-    std::string v(e);
-    v.erase(0, v.find_first_not_of(" \t\r\n"));
-    if (const auto last = v.find_last_not_of(" \t\r\n"); last != std::string::npos)
-        v.erase(last + 1);
-    else
-        v.clear();
-    std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-    if (v.empty())
-        return true;  // whitespace only == unset
-    if (v == "0" || v == "false" || v == "no" || v == "off") {
-        timestar::http_log.warn(
-            "cluster: Raft CheckQuorum DISABLED on this node by TIMESTAR_CLUSTER_CHECKQUORUM='{}'. A partitioned "
-            "or stale leader will now keep accepting proposals it cannot commit until each one's own deadline, and "
-            "leader-only reads on the losing side of a partition converge per request rather than promptly. Nothing "
-            "is unsafe (commit still needs a quorum ack); this is the configuration that shipped before debt D-9.",
-            e);
-        return false;
+    switch (ov) {
+        case CheckQuorumOverride::Disable:
+            timestar::http_log.warn(
+                "cluster: Raft CheckQuorum DISABLED on this node by TIMESTAR_CLUSTER_CHECKQUORUM='{}'. A partitioned "
+                "or stale leader will now keep accepting proposals it cannot commit until each one's own deadline, "
+                "and leader-only reads on the losing side of a partition converge per request rather than promptly. "
+                "Nothing is unsafe (commit still needs a quorum ack); this is the configuration that shipped before "
+                "debt D-9.",
+                e);
+            break;
+        case CheckQuorumOverride::EnableRefused:
+            timestar::http_log.warn(
+                "cluster: TIMESTAR_CLUSTER_CHECKQUORUM='{}' is ignored -- the override is DISABLE-ONLY and "
+                "CheckQuorum is already on. Enabling it per node is exactly the mixed-version hazard ADR 0005 exists "
+                "to prevent (one node running the disruption guard while an older peer drops its transfer votes).",
+                e);
+            break;
+        case CheckQuorumOverride::Invalid:
+            timestar::http_log.error(
+                "cluster: TIMESTAR_CLUSTER_CHECKQUORUM='{}' is not a boolean (0/false/no/off disable, case- and "
+                "whitespace-insensitive; nothing enables); leaving CheckQuorum ON",
+                e);
+            break;
+        case CheckQuorumOverride::None:
+            break;
     }
-    if (v == "1" || v == "true" || v == "yes" || v == "on") {
-        timestar::http_log.warn(
-            "cluster: TIMESTAR_CLUSTER_CHECKQUORUM='{}' is ignored -- the override is DISABLE-ONLY and CheckQuorum "
-            "is already on. Enabling it per node is exactly the mixed-version hazard ADR 0005 exists to prevent "
-            "(one node running the disruption guard while an older peer drops its transfer votes).",
-            e);
-        return true;
-    }
-    timestar::http_log.error(
-        "cluster: TIMESTAR_CLUSTER_CHECKQUORUM='{}' is not a boolean (0/false/no/off disable, case- and "
-        "whitespace-insensitive; nothing enables); leaving CheckQuorum ON",
-        e);
-    return true;
+    return on;
 }
 
 // Snapshot-trigger policy overrides (debt D-6). The defaults

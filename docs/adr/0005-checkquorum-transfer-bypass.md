@@ -6,6 +6,47 @@ with CheckQuorum on, zero client errors). Mechanism (c) — cluster-wide gated a
 did not ship, and the release ordering makes it optional rather than blocking (debt D-30).
 `kCheckQuorumDefault` is **false** for this release.
 
+**Mechanism (c) is now DEFERRED BY DECISION, not merely unbuilt (2026-08-01, debt D-30
+closed as a recorded decision).** The "Recommendation: (b) AND (c) together" below stands
+as the end state and is not withdrawn. What changed is that it is no longer an open
+question for this release, for two reasons and one condition.
+
+*Reason 1 — with the guard off, (c) has nothing to gate.* (c) exists to stop a node running
+the disruption guard while a peer would drop its transfer votes. No node runs it: the
+default is off in every build of this release, and the only runtime knob is disable-only.
+There is no window for (c) to protect.
+
+*Reason 2 — it is not a small contained piece of work, and the size is not in the gating
+logic.* The machinery itself exists and is D-7's (`features::FeatureGate::canActivate`,
+group 0's committed `activeFormatVersion`, `integration/journal_format_bridge.hpp`), which
+is why the D-30 row has always said the two should land together. But that machinery **has
+no caller in a running server** — no live group 0 is composed into `ClusterDataPlane` — so
+building (c) means wiring the control plane into the data plane (integration milestones
+M4/M5), and it means first closing D-7's own review residual (F9): `canActivate` is
+evaluated over GROUP-0's meta-voters, which are not proven to cover every DATA group's
+voter set, and a gate that misses a voter is worse than no gate because it reads as proof.
+Neither belongs in a debt-burndown package, and doing the gating logic alone would produce
+a mechanism that cannot be exercised — the exact shape this campaign has repeatedly filed
+against itself.
+
+*The condition, and it is load-bearing.* The ordering argument holds **only while enabling
+is a BUILD decision**. That property is now pinned rather than asserted: the parse and the
+decision are pure functions in `lib/cluster/integration/checkquorum_policy.hpp`, and
+`CheckQuorumPolicyTest.OverrideCanNeverEnableTheGuard` runs every plausible override value —
+including `1`, `true`, `on` — through `resolveCheckQuorum(buildDefault=false, …)` and
+requires OFF from all of them. Before this they were a function in an anonymous namespace
+that nothing could call, so an edit "completing" the override into a symmetric boolean would
+have left every test green and silently revoked this deferral.
+
+**What re-opens (c), specifically.** Any ONE of: (1) an operator-visible or runtime enable
+for CheckQuorum — at that point (c) is mandatory and this deferral is void; (2) a release
+that wants the guard ON in the SAME release that first ships the tag-8 decoder, i.e. without
+the one-release gap the ordering depends on; (3) any future behaviour change of this shape
+whose wire form is not fail-closed, since (b) is what makes "the old peer drops it" true and
+not every change has a (b); (4) `publishJournalFormat` acquiring a caller — at which point
+the machinery is live, (c) is cheap, and it must land together with D-7's F9 voter-set
+closure. Absent all four, (c) stays unbuilt and this is the record of why.
+
 **Why enabling is deferred, on a measurement rather than a doubt.** Same binary, same
 session, `node_kill_round.sh`, the flag the only difference: **OFF 32/400 failed batches /
 7 s recovery / 3.88 M pts/s (twice, identical); ON 50/400 / 11 s / 2.60 M and 59/400 /
@@ -220,7 +261,10 @@ this ADR exists to prevent. It should live beside the codec activation that Phas
 *(As shipped: activation is a BUILD decision, not a committed one — debt D-30 — and the
 only runtime knob is `TIMESTAR_CLUSTER_CHECKQUORUM`, which is **disable-only** for exactly
 the reason above. Turning it off per node is always safe; turning it on per node is the
-hazard, so nothing does.)*
+hazard, so nothing does. That is not a convention: `resolveCheckQuorum(buildDefault=false,
+ov)` returns false for every `ov`, `constexpr`, and
+`CheckQuorumPolicyTest.OverrideCanNeverEnableTheGuard` enumerates the values — see the
+status block's deferral condition.)*
 
 ## Consequences
 
