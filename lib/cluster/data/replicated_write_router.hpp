@@ -47,12 +47,16 @@ namespace timestar::data {
 // REPLICATES through Raft on the leader, acking only on durable quorum commit.
 class ReplicatedBatchWriteRouter {
 public:
-    // Retry budget. Sized against the write path's analogue on the read side
-    // (cluster_data_plane.cpp's kLeaderRetries: 4 x 25ms), but a little longer, because a
-    // write must wait for the NEW leader to be elected AND to commit, not just to answer
-    // a ReadIndex. A leadership transfer completes in single-digit milliseconds, so this
-    // converts the transfer window into a latency bump; a genuinely dead peer still fails
-    // the write inside the deadline, and fail-closed is preserved.
+    // Retry budget. Its analogue on the read side is `kReadLeaderlessBudget`
+    // (cluster/integration/cluster_data_plane.hpp), and the two are NOT the same size on
+    // purpose: a write must wait for the NEW leader to be elected AND to commit, not just
+    // to answer a ReadIndex, and a lost write costs the client a whole re-submitted batch
+    // where a lost read costs it one cheap re-issue. The asymmetry -- read rides out a
+    // TRANSFER, write rides out an ELECTION -- is recorded in ADR 0006 and asserted where
+    // both constants are visible (debt D-26); do not "harmonise" the two numbers. A
+    // leadership transfer completes in single-digit milliseconds, so this converts the
+    // transfer window into a latency bump; a genuinely dead peer still fails the write
+    // inside the deadline, and fail-closed is preserved.
     static constexpr unsigned kMaxAttempts = 6;  // 1 initial + 5 retries
     // The pause between attempts is no longer a single number: it is chosen per failure
     // CLASS by `writeFailureRetryDelay` (write_errors.hpp, write-scaleout 4a), because a

@@ -625,23 +625,14 @@ seastar::future<QueryResponse> ClusterDataPlane::queryReplicated(QueryRequest re
     // A VShard is momentarily leaderless during a leadership TRANSFER (the old leader
     // has stepped down, the new one has not yet won). Failing the query outright there
     // turns routine background rebalancing into user-visible read errors -- measured at
-    // ~4.6% of queries while the balancer was actively moving leadership. Re-gather a
-    // few times first: a transfer completes in milliseconds, so this converts a
-    // transient window into a small latency bump. A genuinely leaderless VShard (lost
-    // quorum) still fails closed after the retries.
-    static constexpr int kLeaderRetries = 4;
-    static constexpr auto kLeaderRetryDelay = std::chrono::milliseconds(25);
-    // Rounds spent following REDIRECTS rather than waiting for an election. They are a
-    // separate budget because they are not the same event: a redirect is progress (we
-    // learned where the leader is and re-ask immediately, no sleep), whereas a
-    // leaderless retry is a wait. Charging redirects to kLeaderRetries would let a
-    // cluster that redirects once -- the ordinary RF < N cold-cache case -- spend most
-    // of its election tolerance before the first election even mattered. Two rounds is
-    // enough for hint -> leader; a hint war beyond that fails closed like any other
-    // unresolvable read.
-    static constexpr int kRedirectRounds = 2;
-
-    int leaderlessRetries = 0, redirectRounds = 0;
+    // ~4.6% of queries while the balancer was actively moving leadership. Re-gather for
+    // `kReadLeaderlessBudget` first, which converts a transfer window into a latency bump.
+    // A genuinely leaderless VShard (lost quorum, or an election under way) still fails
+    // closed after the retries -- deliberately, and much sooner than a write gives up; the
+    // budget, the asymmetry and the assertions that pin them live in cluster_data_plane.hpp
+    // next to the Raft clocks they are derived from (debt D-26, ADR 0006).
+    unsigned leaderlessRetries = 0;
+    int redirectRounds = 0;
     size_t leaderless = 0;
     std::vector<uint16_t> unassigned;
     while (true) {
@@ -662,9 +653,9 @@ seastar::future<QueryResponse> ClusterDataPlane::queryReplicated(QueryRequest re
 
         if (!unassigned.empty())
             break;  // fail closed below; retrying cannot assign a VShard
-        if (leaderless > 0 && leaderlessRetries < kLeaderRetries) {
+        if (leaderless > 0 && leaderlessRetries < kReadLeaderRetries) {
             ++leaderlessRetries;
-            co_await seastar::sleep(kLeaderRetryDelay);
+            co_await seastar::sleep(kReadLeaderRetryDelay);
             continue;  // re-gather before dispatching anything
         }
         if (leaderless > 0)
@@ -741,13 +732,13 @@ seastar::future<QueryResponse> ClusterDataPlane::queryReplicated(QueryRequest re
             break;  // answered below; retrying an incomplete/unreachable read is the caller's job
         if (outstanding.empty())
             break;  // every VShard answered exactly once
-        if (learnedHint && redirectRounds < kRedirectRounds) {
+        if (learnedHint && redirectRounds < kReadRedirectRounds) {
             ++redirectRounds;
             continue;  // we know somewhere new to ask -- no reason to sleep first
         }
-        if (leaderlessRetries < kLeaderRetries) {
+        if (leaderlessRetries < kReadLeaderRetries) {
             ++leaderlessRetries;
-            co_await seastar::sleep(kLeaderRetryDelay);
+            co_await seastar::sleep(kReadLeaderRetryDelay);
             continue;
         }
         break;  // budget spent with VShards still unanswered: fail closed below

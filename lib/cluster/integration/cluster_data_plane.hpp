@@ -73,6 +73,44 @@ static_assert(kRaftTransferTicks < kRaftElectionTicksMin,
 static_assert(kRaftHeartbeatTicks < kRaftElectionTicksMin, "a leader must heartbeat many times per election");
 
 // ---------------------------------------------------------------------------
+// HOW LONG A READ WAITS FOR A LEADER, and why it is deliberately far less than a write
+// waits (debt D-26; the decision and its alternatives are ADR 0006).
+//
+// A replicated read cannot be answered for a VShard with no elected leader, so it sleeps
+// and re-gathers. THE POLICY IS: a read rides out a leadership TRANSFER -- the routine,
+// planned, sub-second event the balancer causes continuously -- and deliberately does NOT
+// ride out an ELECTION, which the write path does wait for (`kElectionDeadline`, 6 s, debt
+// D-14). A failed read is idempotent and cheap to re-issue and its caller usually wants an
+// answer or an error promptly; a failed write costs the client a whole re-submitted batch.
+//
+// Before D-26 these lived as function-local `static constexpr`s inside queryReplicated at
+// 4 x 25 ms = 100 ms -- 4% of the SHORTEST election, and under the 1 s abandon window a
+// mis-aimed transfer can cost, so the read did not reliably survive the one event its own
+// comment claimed it was sized for. They are here, named, and asserted against the Raft
+// clocks and the write window for the D-20 reason: the relationships are load-bearing and
+// no single file could see them.
+inline constexpr std::chrono::milliseconds kReadLeaderRetryDelay{50};
+inline constexpr unsigned kReadLeaderRetries = 24;
+inline constexpr std::chrono::milliseconds kReadLeaderlessBudget =
+    kReadLeaderRetryDelay * static_cast<int64_t>(kReadLeaderRetries);  // 1.2 s
+// Rounds spent following a REDIRECT rather than waiting. A separate budget because it is a
+// different event: a redirect is progress (re-ask immediately, no sleep) where a leaderless
+// retry is a wait, and charging redirects to the wait budget let the ordinary RF < N
+// cold-cache case spend its election tolerance before any election mattered.
+inline constexpr int kReadRedirectRounds = 2;
+
+static_assert(kReadLeaderlessBudget >= raftTicksToWallClock(kRaftTransferTicks),
+              "a read must outlast the leader-transfer abandon window, or routine rebalancing is user-visible "
+              "read errors -- which is the failure this budget was introduced for [debt D-26]");
+static_assert(kReadLeaderlessBudget < raftTicksToWallClock(kRaftElectionTicksMin),
+              "a read must NOT sit through an election: that is the write path's trade, taken because a lost "
+              "batch is expensive, and a read that waits as long has stopped being the cheap-to-retry half "
+              "[debt D-26, ADR 0006]");
+static_assert(kReadLeaderlessBudget < data::ReplicatedBatchWriteRouter::kElectionDeadline,
+              "the read/write election asymmetry is a DECISION and must keep its direction; inverting it "
+              "silently would make reads the slow half [debt D-26, ADR 0006]");
+
+// ---------------------------------------------------------------------------
 // THE MESSAGE-SIZE CHAIN, asserted where both ends of it are visible (debt D-31).
 //
 // raft_types.hpp states the chain and can assert the links INSIDE it, but its top link --
