@@ -75,6 +75,23 @@ cd "$(dirname "$0")" || exit 2
 
 REPO="$(git rev-parse --show-toplevel)"
 GATE="$(pwd)/fault_injection_gate.sh"
+
+# THE A/B STORMS HARDER THAN THE CI GATE, and it must, because the two are sized for
+# different things. The discrimination signal is the reverted binary failing writes it
+# cannot re-dial for, so it scales with the number of RESET ROUNDS a bench is exposed to;
+# the CI gate's own sizing is chosen for DISK (K+1 benches against one cluster, ~27 G of a
+# 62 G tmpfs) and not for signal. Measured at the gate's default 1000 batches / K=3, three
+# A/B draws came out HEAD 0/4/2 against REVERTED 7/22/4 -- real, but the third draw's arms
+# OVERLAP and the reverted binary passed the gate outright. At 2000 batches a storm injects
+# ~147 rounds instead of ~79, which is the intensity behind the original "9-10 errors in a
+# SINGLE storm" observation.
+#
+# So: twice the bench, two storms instead of three. Both arms get the identical setting --
+# that is the whole point, and the storm-intensity ratio is asserted below -- and the run
+# stays at 3 benches, i.e. the ~34 G peak measured for that shape, inside the 30 G-free
+# precondition this script already enforces.
+export GATE_BENCH_BATCHES="${GATE_BENCH_BATCHES:-2000}"
+export GATE_STORM_ROUNDS="${GATE_STORM_ROUNDS:-2}"
 # NEITHER OF THESE MAY LIVE ON /tmp, and that is a hard requirement rather than a
 # preference. /tmp here is a tmpfs with a per-user quota, and the storm gate needs every
 # gigabyte of it for its data dirs; a comparison worktree (~1 G with seastar) plus a full
