@@ -139,6 +139,14 @@ MIN_DIP_PCT="${GATE_MIN_DIP_PCT:-40}"
 # one.
 STORM_ROUNDS="${GATE_STORM_ROUNDS:-3}"
 MAX_STORM_ERRORS="${GATE_MAX_STORM_ERRORS:-3}"
+# THE COMBINED MODE (debt D-19's second half), off by default. Set by
+# `combined_fault_rebalance_gate.sh`, which is where its floors and budget live: a
+# leadership rebalance storm runs THROUGH each reset storm, at a raised connection count.
+# It is a knob rather than a second script so the proxy topology, the balance-first step
+# and the known-count probe are not duplicated and cannot drift apart.
+REBALANCE_STORM="${GATE_REBALANCE_STORM:-0}"
+MIN_COMBINED_CALLS="${GATE_MIN_COMBINED_CALLS:-0}"
+CONNECTIONS="${GATE_CONNECTIONS:-4}"
 # A baseline slower than this VOIDS the run rather than failing it (see the header): the
 # fault-free control through the proxy runs 4.98-5.16 M pts/s here, and the one collapse
 # observed came in at 0.45 M. The floor is ~40% of the low end -- far enough below the
@@ -205,8 +213,22 @@ echo "=== balancing leadership so a fair share of traffic crosses the proxy ==="
 for _ in $(seq 1 12); do
     for p in $PORTS; do curl -s -m5 -X POST "http://127.0.0.1:$p/cluster/rebalance-leadership?max=2048" >/dev/null 2>&1; done
     sleep 1
+    # IN COMBINED MODE THIS STOPS EARLY, ON PURPOSE, and it is the difference between a
+    # combined gate and two gates in a trenchcoat. `/cluster/rebalance-leadership` only
+    # sheds leadership held ABOVE fair share, so balancing to fair share here leaves the
+    # rebalance storm below with NOTHING TO DO -- measured exactly that way: 129 transfers
+    # in the first storm and ZERO in the second, i.e. half the run was an ordinary reset
+    # gate. Stopping as soon as enough traffic crosses the proxy preserves the imbalance
+    # the storm then works through, while the >= 800 assertion below still holds from the
+    # first storm onward.
+    if [ "$REBALANCE_STORM" = "1" ]; then
+        N3=$(status_field "$(cluster_status 19412)" vshards_led)
+        [ "${N3:-0}" -ge 900 ] && { echo "  combined mode: stopping the pre-balance at node 3 = $N3 (imbalance kept for the storm)"; break; }
+    fi
 done
-wait_balanced "$PORTS" 4096 3 60 || gate_exit
+if [ "$REBALANCE_STORM" != "1" ]; then
+    wait_balanced "$PORTS" 4096 3 60 || gate_exit
+fi
 NODE3_LED=$(status_field "$(cluster_status 19412)" vshards_led)
 echo "  node 3 (behind the proxy) leads $NODE3_LED VShards"
 assert_ge "VShards led behind the proxy (traffic that must cross the fault)" "${NODE3_LED:-0}" 800
@@ -249,6 +271,7 @@ PROBE=200
 # its own read-back. The totals are what the property is asserted on; the per-storm vector
 # is printed so the distribution is visible in the log rather than inferred from a pass/fail.
 TOT_ROUNDS=0; TOT_CONNS=0; TOT_BENCH_ERRS=0; TOT_PROBE_5XX=0; TOT_PROBE_OTHER=0; TOT_CONN_FAILS=0
+TOT_TRANSFERS=0; TOT_REBAL_CALLS=0
 WORST_PCT=100
 ERR_VECTOR=""; ROUND_VECTOR=""; TPUT_VECTOR=""
 PREV_CONNS=0
@@ -265,9 +288,9 @@ while [ "$storm" -le "$STORM_ROUNDS" ]; do
     # gated the resetter on the bench still running and the bench finished in under a
     # second, so the storm never fired -- the anti-vacuity assertions below exist because
     # of that.
-    rm -f /tmp/tsgate_fi_stop
+    rm -f /tmp/tsgate_fi_stop /tmp/tsgate_fi_rebal
     ( timeout 300 "$BENCH" --server-port 19410 -c 4 --batches "$BENCH_BATCHES" --batch-size 10000 --verify 0 \
-        --warmup 5 --connections 4 --hosts 1000 --racks 2 >/tmp/tsgate_fi_storm.txt 2>&1 ) &
+        --warmup 5 --connections "$CONNECTIONS" --hosts 1000 --racks 2 >/tmp/tsgate_fi_storm.txt 2>&1 ) &
     BENCHPID=$!
     ( ROUNDS=0
       while [ ! -f /tmp/tsgate_fi_stop ]; do
@@ -276,6 +299,26 @@ while [ "$storm" -le "$STORM_ROUNDS" ]; do
       done
       echo "$ROUNDS" >/tmp/tsgate_fi_rounds ) &
     RESETPID=$!
+    # THE FOURTH THING, when this is the COMBINED gate (debt D-19's second half): a
+    # leadership rebalance storm running THROUGH the reset storm. Two faults at once is not
+    # the sum of two gates -- a write whose slice is refused by a group mid-transfer has to
+    # be re-dispatched over a transport that is simultaneously losing its connections, and
+    # the retry budget is shared between both. `combined_fault_rebalance_gate.sh` is the
+    # entry point; here it is a knob so the topology, proxy and probe are not duplicated.
+    REBALPID=""
+    if [ "$REBALANCE_STORM" = "1" ]; then
+        ( T=0; C=0
+          while [ ! -f /tmp/tsgate_fi_stop ]; do
+              for p in $PORTS; do
+                  R=$(curl -s -m5 -X POST "http://127.0.0.1:$p/cluster/rebalance-leadership?max=512" 2>/dev/null)
+                  N=$(printf '%s' "$R" | grep -o '"transfers_initiated":[0-9]*' | cut -d: -f2)
+                  T=$((T + ${N:-0})); C=$((C + 1))
+              done
+              sleep 0.2
+          done
+          echo "$T $C" >/tmp/tsgate_fi_rebal ) &
+        REBALPID=$!
+    fi
     sleep 1
 
     PROBE_OK=0; PROBE_5XX=0; PROBE_OTHER=0
@@ -295,6 +338,14 @@ while [ "$storm" -le "$STORM_ROUNDS" ]; do
     wait $BENCHPID
     touch /tmp/tsgate_fi_stop
     wait $RESETPID
+    if [ -n "$REBALPID" ]; then
+        wait $REBALPID
+        STORM_TRANSFERS=0; STORM_CALLS=0
+        [ -s /tmp/tsgate_fi_rebal ] && read -r STORM_TRANSFERS STORM_CALLS </tmp/tsgate_fi_rebal
+        TOT_TRANSFERS=$((TOT_TRANSFERS + STORM_TRANSFERS))
+        TOT_REBAL_CALLS=$((TOT_REBAL_CALLS + STORM_CALLS))
+        echo "  rebalance: $STORM_TRANSFERS transfers over $STORM_CALLS calls, DURING the reset storm"
+    fi
     ROUNDS=$(cat /tmp/tsgate_fi_rounds 2>/dev/null || echo 0)
     echo "  probe writes: $PROBE_OK ok, $PROBE_5XX 5xx, $PROBE_OTHER other (of $i attempted)"
     grep -E "Requests:|First error|Throughput|batch latency" /tmp/tsgate_fi_storm.txt
@@ -370,6 +421,9 @@ echo "GATE_METRIC reset_rounds_total $TOT_ROUNDS"
 echo "GATE_METRIC reset_conns_total $TOT_CONNS"
 echo "GATE_METRIC storm_count $STORM_ROUNDS"
 echo "GATE_METRIC worst_storm_pct $WORST_PCT"
+echo "GATE_METRIC rebalance_transfers $TOT_TRANSFERS"
+echo "GATE_METRIC rebalance_calls $TOT_REBAL_CALLS"
+echo "GATE_METRIC bench_connections $CONNECTIONS"
 
 # THE ANTI-VACUITY ASSERTIONS. Without a real storm this gate proves nothing: a proxy that
 # never fired, or one that fired while no connection was open, would otherwise pass. The
@@ -377,6 +431,28 @@ echo "GATE_METRIC worst_storm_pct $WORST_PCT"
 # real one.
 assert_ge "reset rounds injected" "$TOT_ROUNDS" "$((MIN_RESET_ROUNDS * STORM_ROUNDS))"
 assert_ge "peer connections actually destroyed" "$TOT_CONNS" "$((MIN_RESET_CONNS * STORM_ROUNDS))"
+# In combined mode the SECOND fault needs its own anti-vacuity floor, and it is on the CALLS
+# rather than on the transfers -- which is a MEASUREMENT, not a weakening.
+#
+# The obvious assertion (transfers >= N) fails on correct behaviour here. Measured over two
+# runs: with the cluster deliberately left imbalanced (1536/1536/1024 against a fair 1365)
+# and 420 rebalance calls issued THROUGH the reset storms, `transfers_initiated` came to
+# 0 and 13. The same endpoint on a healthy transport moves thousands (2175-2901 in
+# `skewed_rebalance_gate.sh`). The difference is the fault: the only node below fair share
+# is the one behind the proxy, its acks are being destroyed every 0.3 s, so D-1's liveness
+# filter reads it as dead and REFUSES to hand it groups. A balancer that shipped leadership
+# to a peer whose connection is being reset is precisely what D-1 exists to prevent.
+#
+# So the anti-vacuity check is that the storm loop actually ran, and the transfer count is
+# reported as the finding. (D-18 records D-1's production effect as reasoned and
+# unit-pinned rather than measured; this is the first live measurement of the filter
+# ACTING, and it is on the register's D-18 row.)
+if [ "$REBALANCE_STORM" = "1" ]; then
+    assert_ge "rebalance calls issued DURING the reset storms" "$TOT_REBAL_CALLS" "$MIN_COMBINED_CALLS"
+    echo "  (finding) $TOT_TRANSFERS leadership transfers initiated across $TOT_REBAL_CALLS calls --"
+    echo "            near-zero is CORRECT: the only under-share node is the one behind the"
+    echo "            reset proxy, and D-1's liveness filter refuses a peer that is not acking."
+fi
 
 # THE PROPERTY, as an aggregate over K draws (debt D-21). A reset burst against a LIVE peer
 # must be absorbed by the transport's reconnect plus the 4a retry pacing, inside the 1.5 s

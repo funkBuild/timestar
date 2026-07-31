@@ -12,6 +12,7 @@ not probes, so they can be run from CI or a release checklist.
 | `backpressure_gate.sh` | the per-shard in-flight write bound degrades to 503 + `Retry-After`, never to 500s or timeouts, and the DEFAULT budget never gets in the way |
 | `fault_injection_gate.sh` | a BURST of TCP connection resets between two live nodes costs latency, not client errors, and loses/duplicates nothing (write-scaleout 4c) |
 | `restart_catchup_gate.sh` | a follower that was DOWN through a large write campaign catches up when it returns, under the tightened Raft admission bound (write-scaleout 5.4) |
+| `combined_fault_rebalance_gate.sh` | **(debt D-19)** TCP resets **and** a leadership rebalance **and** 4x the connections, all at once — the faults a single-fault gate cannot compose. It is `fault_injection_gate.sh` in combined mode, not a copy. Its finding: under the reset storm `transfers_initiated` collapses to ~0 because D-1's liveness filter refuses the peer behind the fault |
 | `fault_injection_ab.sh` | **(expensive, on-demand — not a CI gate)** that `fault_injection_gate.sh` DISCRIMINATES: builds the 4a-reverted binary and asserts it fails the same storm HEAD passes |
 | `node_kill_round.sh` | `kill -9` of one node MID-BENCH: no 500s, no crashes, every ACKED write readable afterwards on both survivors — and it prints the one-node-down 503 band (debt D-14), which stays advisory |
 | `snapshot_durability_gate.sh` | TAKING SNAPSHOTS DOES NOT COST DURABILITY (debt D-6): under a light load, every acked point is readable after the whole cluster is `kill -9`'d and restarted OVER COMPACTED JOURNALS; the heavy-load A/B is advisory |
@@ -83,6 +84,7 @@ cannot reintroduce the race.
 | `skewed_rebalance_gate.sh` | 19240-19242 | 20240-20242 | 21240-21242 | `1924` | `/tmp/tsgate_sk*` |
 | `deposed_primary_gate.sh` | 19310-19314 | 20310-20314 | 21310-21314 | `1931` | `/tmp/tsgate_dp*` |
 | `fault_injection_gate.sh` | 19410-19412 | 20410-20412 | 21410-21412 | `1941` | `/tmp/tsgate_fi*` |
+| `combined_fault_rebalance_gate.sh` | (runs `fault_injection_gate.sh` in combined mode — same ports, dirs and prefix; never run both at once) |||||
 | `restart_catchup_gate.sh` | 19510-19512 | 20510-20512 | 21510-21512 | `1951` | `/tmp/tsgate_cu*` |
 | `node_kill_round.sh` | 19610-19612 | 20610-20612 | 21610-21612 | `1961` | `/tmp/tsgate_nk*` |
 | `snapshot_durability_gate.sh` | 19710-19712 | 20710-20712 | 21710-21712 | `1971` | `/tmp/tsgate_sd*` |

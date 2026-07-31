@@ -6,26 +6,44 @@
 # three 4a files reverted FAILS it, 9 bench HTTP errors + 1 probe 5xx") and there was no
 # way to re-check it. This script is that check, automated.
 #
-# WHAT IT COMPARES. HEAD, against HEAD with exactly the three write-scaleout 4a files
-# reverted to the commit before 4a landed:
+# WHAT IT COMPARES. HEAD, against HEAD with 4a's PACING and nothing else undone: the
+# retry's pause between attempts goes back to a FLAT 20 ms for the Transport/Overloaded
+# classes, which is the whole of what write-scaleout 4a changed about behaviour.
+#
+# THE FILE CHECKOUT THIS USED TO DO NO LONGER COMPILES, and finding that out is what
+# executing this script end to end (debt D-19) was for. It ran
 #
 #     git checkout fcb2a94^ -- lib/cluster/data/write_errors.hpp \
 #                              lib/cluster/data/replicated_write_router.cpp \
 #                              lib/cluster/data/replicated_write_router.hpp
 #
-# `lib/cluster/reconnect_policy.hpp` -- also added by fcb2a94 -- is deliberately NOT
-# reverted: 4b's connection jitter and keepalive depend on it and are not what is under
-# test.
+# which still produces exactly the intended 3-file diff -- and then fails to build, because
+# later work depends on symbols the pre-4a versions of those files do not define:
 #
-# WHY WHOLE-FILE CHECKOUT AND NOT `git revert fcb2a94`. A hunk-level revert of 4a
-# CONFLICTS: two later commits (d101c07's leader-refusal labelling, c052253's lifetime
-# fix) touch the same lines, so there is no clean way to remove only 4a's hunks. The
-# whole-file checkout therefore takes those three files back FURTHER than 4a alone --
-# it drops the later fixes in them too. That makes "the reverted binary produced errors"
-# on its own a weaker claim than it looks, which is why this script also asserts the
-# errors carry the [D6] SIGNATURE (`RetryableWriteError ... last: transport`): the retry
-# giving up against a socket the transport had not re-dialled yet. That signature is
-# specific to the pacing fix; the other reverted changes do not produce it.
+#     replicated_vshard_host.cpp:620: 'LeaderRefused' is not a member of 'WriteFailure'
+#     cluster_data_plane.hpp:109:     'kElectionDeadline' is not a member of
+#                                     'ReplicatedBatchWriteRouter'
+#
+# So the incantation was stale, its "verified to produce the intended diff" check could
+# never have caught it, and the comparison binary it describes has never existed.
+#
+# A SURGICAL PATCH REPLACES IT, and the result is a STRONGER A/B than the checkout was. The
+# two edits are:
+#
+#   1. `write_errors.hpp`: `writeFailureRetryDelay` stops doubling for Transport/Overloaded
+#      and returns the base -- i.e. the flat 20 ms of the pre-4a loop.
+#   2. `replicated_write_router.hpp`: the coupling `static_assert` is neutralised. That
+#      assert exists PRECISELY to make [D6] a compile error ("the write retry schedule must
+#      outlast the transport reconnect window"), so disabling it is the honest inverse of
+#      the fix rather than collateral.
+#
+# The old checkout reached PAST 4a -- it dropped d101c07's and c052253's later fixes in
+# those files too, which is why the header used to hedge that "the reverted binary produced
+# errors" was a weaker claim than it looked. Nothing is hedged now: the arms differ by the
+# retry pause and by nothing else. The [D6] signature assertion
+# (`RetryableWriteError ... last: transport` -- the retry giving up against a socket the
+# transport had not re-dialled yet) is kept anyway, because it pins the MECHANISM and not
+# just the count.
 #
 # WHAT "DISCRIMINATES" MEANS HERE, since D-21. It is no longer "the reverted arm produced
 # an error and HEAD produced none": HEAD is not reliably zero (0, 1, 0 and one void across
@@ -67,11 +85,28 @@ GATE="$(pwd)/fault_injection_gate.sh"
 AB_WORKTREE="${GATE_AB_WORKTREE:-$(dirname "$REPO")/tsdb-ab-worktree}"
 AB_BUILD="${GATE_AB_BUILD_DIR:-$(dirname "$REPO")/tsdb-ab-build}"
 
-# The revert set, and the commit to take it from. Named once.
-REVERT_AT="fcb2a94^"
-REVERT_FILES="lib/cluster/data/write_errors.hpp
-lib/cluster/data/replicated_write_router.cpp
-lib/cluster/data/replicated_write_router.hpp"
+# The two files the pacing patch touches, named once. See the header for why this is a
+# patch and not a `git checkout` of the pre-4a versions.
+REVERT_FILES="lib/cluster/data/replicated_write_router.hpp
+lib/cluster/data/write_errors.hpp"
+
+# patch_anchor FILE OLD NEW -- exact, unique, and it REFUSES rather than half-applying.
+# A sed that silently matches nothing would build a comparison binary identical to HEAD,
+# which is the one failure mode this whole script cannot survive: every assertion below
+# would then compare a thing to itself.
+patch_anchor() {
+    python3 - "$AB_WORKTREE/$1" "$2" "$3" <<'PY'
+import sys
+path, old, new = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(path) as f:
+    s = f.read()
+n = s.count(old)
+if n != 1:
+    sys.exit("anchor matched %d times (need exactly 1) in %s:\n%s" % (n, path, old))
+with open(path, "w") as f:
+    f.write(s.replace(old, new))
+PY
+}
 
 [ -x "$BUILD_DIR/bin/timestar_http_server" ] || { echo "no HEAD server binary at $BUILD_DIR/bin"; exit 2; }
 
@@ -123,30 +158,44 @@ rm -rf "$AB_WORKTREE"
 git -C "$REPO" worktree add --detach "$AB_WORKTREE" HEAD >/dev/null 2>&1 || {
     echo "ABORT: could not create the comparison worktree at $AB_WORKTREE"; exit 2; }
 
-git -C "$AB_WORKTREE" rev-parse --verify "$REVERT_AT" >/dev/null 2>&1 || {
-    echo "ABORT: $REVERT_AT does not resolve -- the 4a commit is not in this history"; exit 2; }
-# shellcheck disable=SC2086
-git -C "$AB_WORKTREE" checkout "$REVERT_AT" -- $REVERT_FILES || {
-    echo "ABORT: the revert checkout failed"; exit 2; }
+# EDIT 1: the geometric back-off becomes flat -- the pre-4a pause, for the two classes
+# whose cure is waiting for something to come back.
+patch_anchor lib/cluster/data/write_errors.hpp \
+'            int64_t ms = kWriteRetryDelayBase.count();
+            for (unsigned i = 1; i < attempt && ms < kWriteRetryDelayMax.count(); ++i)
+                ms *= 2;' \
+'            int64_t ms = kWriteRetryDelayBase.count();  // A/B: flat, i.e. pre-4a
+            (void)attempt;' || { echo "ABORT: the pacing anchor has moved; see the header"; exit 2; }
 
-# ANTI-VACUITY, and the one that actually bites: if the revert is a no-op -- history
-# rewritten, files moved, the fix re-landed elsewhere -- the two binaries are IDENTICAL
-# and every assertion below compares a thing to itself. The reverted run would then
-# produce zero errors and this script would "fail to prove discrimination" for a reason
-# that has nothing to do with the server. Catch it here, where the message is honest.
+# EDIT 2: the compiler fence that makes edit 1 illegal. It is not collateral -- that assert
+# IS the fix's guarantee ("the write retry schedule must outlast the transport reconnect
+# window"), so turning it off is the exact inverse of 4a and nothing more.
+patch_anchor lib/cluster/data/replicated_write_router.hpp \
+'    static_assert(worstCaseWriteRetrySpan(WriteFailure::Transport, kMaxAttempts) > cluster::worstCaseReconnectBackoff(),' \
+'    static_assert(true,  // A/B: the fence that forbids the flat schedule, deliberately off' \
+    || { echo "ABORT: the coupling static_assert has moved; see the header"; exit 2; }
+
+# ANTI-VACUITY, and the one that actually bites: if the patch is a no-op -- files moved, the
+# pacing re-expressed elsewhere -- the two binaries are IDENTICAL and every assertion below
+# compares a thing to itself. The reverted run would then produce zero errors and this
+# script would "fail to prove discrimination" for a reason that has nothing to do with the
+# server. Catch it here, where the message is honest. (patch_anchor already refuses a
+# missing anchor; this catches the opposite -- a patch that touched more than it should.)
 CHANGED_LIST=$(git -C "$AB_WORKTREE" diff --name-only HEAD -- | sort)
 CHANGED=$(printf '%s\n' "$CHANGED_LIST" | grep -c .)
 EXPECTED_LIST=$(printf '%s\n' $REVERT_FILES | sort)
-echo "  reverted $CHANGED file(s) to $REVERT_AT"
+echo "  patched $CHANGED file(s) back to the pre-4a flat retry pacing"
 if [ "$CHANGED_LIST" != "$EXPECTED_LIST" ]; then
-    echo "ABORT: the revert did not touch exactly the three 4a files."
+    echo "ABORT: the pacing patch did not touch exactly the two expected files."
     echo "       expected:"; printf '         %s\n' $EXPECTED_LIST
     echo "       got:"; printf '%s\n' "$CHANGED_LIST" | sed 's/^/         /'
-    echo "       Zero files means the comparison binary would BE HEAD and every assertion"
-    echo "       below would compare a thing to itself. A different set means the 4a fix"
-    echo "       has moved; update REVERT_AT/REVERT_FILES in this script."
     exit 2
 fi
+# And it must be SMALL: two anchors, five lines. A patch that grew is a patch that is no
+# longer "4a's pacing and nothing else".
+PATCH_LINES=$(git -C "$AB_WORKTREE" diff --numstat HEAD -- | awk '{a+=$1; d+=$2} END{print a+d}')
+[ "${PATCH_LINES:-99}" -le 12 ] || {
+    echo "ABORT: the pacing patch changed $PATCH_LINES lines; it should change ~5."; exit 2; }
 
 # SEASTAR HAS TO BE PUT BACK BY HAND. `external/seastar` is a SUBMODULE, and `git worktree
 # add` leaves a submodule as an empty directory -- so `add_subdirectory(external/seastar)`
