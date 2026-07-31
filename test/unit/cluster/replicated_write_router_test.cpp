@@ -1097,6 +1097,61 @@ seastar::future<> testASilentTargetIsStillTreatedAsNotLeader() {
         << "it committed inside the BASE attempt budget, so this proves nothing about the election window";
 }
 
+// A REJECT FOR A VSHARD WE NEVER SENT MUST NOT SET A FAILURE CLASS. The hint and the
+// committed set were already scoped to what this target was asked; the KIND was not, so a
+// buggy or hostile peer could fold a class -- and with it the retry pacing and the 6 s
+// election window -- out of a slice this dispatch has no relationship to.
+//
+// The DAMAGING direction is the one this test takes. A foreign class cannot BUY the
+// election window (`electionWaitOnly` is an AND, so an extra election-shaped class changes
+// nothing), but a foreign `Transport` REVOKES it from a batch that is otherwise purely
+// leaderless -- exactly the D-14 availability the window exists for, thrown away on
+// evidence about somebody else's VShard.
+class ForeignRejectSink : public ProposeSink {
+public:
+    unsigned attempts = 0;
+    unsigned commitFromAttempt = 8;
+    seastar::future<bool> proposeBatch(WriteBatch) override {
+        return seastar::make_exception_future<bool>(std::runtime_error("unused"));
+    }
+    seastar::future<ProposeOutcome> proposeVShardBatchesHinted(VShardBatchView view, OptDeadline) override {
+        ProposeOutcome out;
+        if (++attempts >= commitFromAttempt) {
+            for (const auto* g : view)
+                out.committedVShards.push_back(g->first);
+            out.committed = true;
+            return seastar::make_ready_future<ProposeOutcome>(std::move(out));
+        }
+        // EVERY slice we were asked about, named, and election-shaped -- so there is no
+        // unexplained remainder and nothing but the foreign reject can change the class.
+        for (const auto* g : view)
+            out.rejects.push_back(SliceReject{g->first, timestar::raft::kNoNode, WriteFailure::NotLeader});
+        // ...plus one for VShard 4095, which this batch does not span and this target was
+        // never asked about, carrying the class that would revoke the window.
+        out.rejects.push_back(SliceReject{4095, timestar::raft::kNoNode, WriteFailure::Transport});
+        return seastar::make_ready_future<ProposeOutcome>(std::move(out));
+    }
+};
+
+seastar::future<> testAForeignRejectCannotSetTheFailureClass() {
+    VShardDirectory dir(1, allLocalMap());
+    WriteBatch batch = manySeries(4);
+    ForeignRejectSink local;
+    ScriptedTransport client;
+    MapLeaderResolver leaders;
+    for (uint16_t v : vshardsOf(batch)) {
+        leaders.leaders[v] = 1;
+        EXPECT_NE(v, 4095) << "the foreign VShard must not be one the batch actually spans";
+    }
+
+    ReplicatedBatchWriteRouter router(dir, local, client, leaders);
+    co_await router.write(std::move(batch));  // must NOT throw
+    EXPECT_EQ(local.attempts, 8u) << "a reject naming a VShard this target was never asked about set the batch's "
+                                  << "failure class, revoking the election window from a purely leaderless batch";
+    EXPECT_GT(local.attempts, ReplicatedBatchWriteRouter::kMaxAttempts)
+        << "it committed inside the BASE attempt budget, so this proves nothing about the window";
+}
+
 // The pacing table itself: fast while a transfer is plausible, then spanning an election.
 TEST(WriteRetryPacing, ElectionShapedClassesEscalateAfterTheFastRetries) {
     for (auto f : {WriteFailure::NotLeader, WriteFailure::LeaderRefused, WriteFailure::LeadershipLost}) {
@@ -1139,6 +1194,9 @@ TEST(ReplicatedBatchWriteRouterTest, UnexplainedUncommittedSlicesDoNotBuyTheElec
 }
 TEST(ReplicatedBatchWriteRouterTest, ASilentTargetIsStillTreatedAsNotLeader) {
     testASilentTargetIsStillTreatedAsNotLeader().get();
+}
+TEST(ReplicatedBatchWriteRouterTest, AForeignRejectCannotSetTheFailureClass) {
+    testAForeignRejectCannotSetTheFailureClass().get();
 }
 
 TEST(ReplicatedBatchWriteRouterTest, OverloadedPeerFailsRetryablyOnTheBaseDeadline) {

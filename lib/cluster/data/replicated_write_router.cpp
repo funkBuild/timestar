@@ -187,9 +187,17 @@ seastar::future<> ReplicatedBatchWriteRouter::write(VShardBatches groups) {
                 // said.
                 std::set<uint16_t> explainedHere;
                 for (const auto& r : out.rejects) {
+                    // A REJECT FOR A VSHARD WE NEVER SENT IS NOT EVIDENCE ABOUT ANYTHING.
+                    // The hint and the committed set were already gated on `askedHere`;
+                    // the KIND was not, so a buggy or hostile peer could fold a failure
+                    // class -- and with it the retry pacing and the election window -- out
+                    // of a slice this dispatch has no relationship to. Every use of a
+                    // reply is now scoped to what this target was actually asked.
+                    if (!askedHere.count(r.vshard))
+                        continue;
                     lastKind = r.kind;
                     noteKind(r.kind);
-                    if (askedHere.count(r.vshard) && !committedHere.count(r.vshard))
+                    if (!committedHere.count(r.vshard))
                         explainedHere.insert(r.vshard);
                     // A HINT NAMING THE REJECTER IS NOT A HINT (write-scaleout 5 review,
                     // F1). A target that just refused a slice and then says "the leader is
@@ -200,7 +208,8 @@ seastar::future<> ReplicatedBatchWriteRouter::write(VShardBatches groups) {
                     // view instead, which is the only thing that can change. (The local
                     // sink already refrains from naming itself; this is the general rule,
                     // and it covers a remote peer that names itself too.)
-                    if (r.leaderHint != kNoNode && r.leaderHint != pendingTargets[i] && askedHere.count(r.vshard))
+                    // (The `askedHere` half of that rule is now the loop guard above.)
+                    if (r.leaderHint != kNoNode && r.leaderHint != pendingTargets[i])
                         nextHints[r.vshard] = r.leaderHint;
                 }
                 // EVERY UNCOMMITTED SLICE GETS A CLASS, AND IT IS NEVER ONE IT INHERITED
@@ -229,6 +238,12 @@ seastar::future<> ReplicatedBatchWriteRouter::write(VShardBatches groups) {
                 // Both in-tree sinks name every slice they fail or none of them, so the
                 // second arm is unreachable today; it exists so that a future sink
                 // reporting a strict subset cannot silently buy the election window.
+                //
+                // The test is `rejects.empty()` and not "explained none of ours" on
+                // purpose: a target whose rejects name ONLY VShards we never sent it (the
+                // loop above ignores those entirely) is not the silent pre-v3 shim -- it
+                // is a peer talking about something else -- so it takes the ambiguous
+                // arm rather than the election-shaped one.
                 std::vector<uint16_t> unexplained;
                 for (const auto* g : *pendingViews[i])
                     if (!committedHere.count(g->first) && !explainedHere.count(g->first))

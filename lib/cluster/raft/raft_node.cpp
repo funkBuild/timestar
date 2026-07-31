@@ -52,11 +52,14 @@ RaftNode::RaftNode(NodeId id, std::vector<NodeId> voters, RaftLog log, HardState
     // timeout, and why shortening it is safe.
     //
     // Clamped against electionTimeoutMin rather than the randomized electionTimeout_, so
-    // the invariant "the transfer window never outlasts an election" holds for EVERY draw
-    // this node will ever make, not just its first.
+    // the invariant holds for EVERY draw this node will ever make, not just its first --
+    // and STRICTLY below it, matching the boundary `ClusterDataPlane::start` refuses to
+    // boot on (`>=`). A window EQUAL to the shortest election timeout is the pre-D-20
+    // behaviour, so the two sites must not disagree about which side of the line that is.
     const unsigned derivedTransfer =
         opts_.transferTimeout != 0 ? opts_.transferTimeout : std::max(2u * opts_.heartbeatTimeout, 1u);
-    transferTimeout_ = std::max(1u, std::min(derivedTransfer, std::max(1u, opts_.electionTimeoutMin)));
+    const unsigned transferCeiling = opts_.electionTimeoutMin > 1 ? opts_.electionTimeoutMin - 1 : 1;
+    transferTimeout_ = std::max(1u, std::min(derivedTransfer, transferCeiling));
     resetElectionTimer();
 }
 

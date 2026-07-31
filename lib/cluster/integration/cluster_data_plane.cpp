@@ -207,7 +207,7 @@ seastar::future<> ClusterDataPlane::start(const ClusterConfig& cfg, seastar::sha
             const data::VShardDirectory* dirp = dir_.get();
             auto* peers = &shards_;
             co_await shards_.invoke_on_all([enginesPtr = enginesPtr_, peers, dirp, selfId, jroot](ShardRaftPlane& p) {
-                return p.init(enginesPtr, peers, dirp, selfId, jroot, std::chrono::milliseconds(20));
+                return p.init(enginesPtr, peers, dirp, selfId, jroot, kRaftTickPeriod);
             });
         }
 
@@ -243,10 +243,13 @@ seastar::future<> ClusterDataPlane::start(const ClusterConfig& cfg, seastar::sha
 
         // Instantiate each VShard's group ON ITS OWNING SHARD (see the many-group
         // timing note below).
+        // Every one of these is a TICK COUNT whose meaning depends on kRaftTickPeriod, so
+        // they are declared together with it and with the compile-time relationships
+        // between them -- see cluster_data_plane.hpp (debt D-20).
         raft::RaftOptions ropts;
-        ropts.heartbeatTimeout = 25;     // 500ms at the 20ms tick
-        ropts.electionTimeoutMin = 125;  // 2.5s
-        ropts.electionTimeoutMax = 250;  // 5s (randomized -> spreads campaigns)
+        ropts.heartbeatTimeout = kRaftHeartbeatTicks;
+        ropts.electionTimeoutMin = kRaftElectionTicksMin;
+        ropts.electionTimeoutMax = kRaftElectionTicksMax;
         // Mirror the transport's send bound INTO the core, so a message that could not be
         // delivered is never built and never moves nextIndex (write-scaleout 5 review,
         // F3a). One definition, in raft_types.hpp -- and it is the PAYLOAD bound, not the
@@ -292,7 +295,12 @@ seastar::future<> ClusterDataPlane::start(const ClusterConfig& cfg, seastar::sha
         // RaftOptions::transferTimeout; the short version is that it retracts nothing and
         // grants nothing, the transferee's campaign is at a term no leader holds, and a
         // proposal accepted after abandoning is only ever ACKED if it committed.
-        ropts.transferTimeout = 2 * ropts.heartbeatTimeout;
+        ropts.transferTimeout = kRaftTransferTicks;
+        // The two relationships that matter are asserted at COMPILE time in the header,
+        // against the constants above and against the router's kDeadline. These runtime
+        // checks are the same two conditions re-stated for the values actually installed,
+        // which is what a future runtime-configurable timing knob would need: a
+        // static_assert cannot see a value read from a config file.
         if (ropts.transferTimeout >= ropts.electionTimeoutMin)
             // Same fail-closed reasoning as the chunk timeout below: a transfer window at
             // or past an election timeout is the pre-D-20 behaviour wearing a new name,
@@ -301,6 +309,14 @@ seastar::future<> ClusterDataPlane::start(const ClusterConfig& cfg, seastar::sha
                 "cluster: Raft transferTimeout must be well below electionTimeoutMin -- the leader refuses every "
                 "proposal while a transfer is in flight, so an abandon window as long as an election outlasts the "
                 "write deadline and makes one mis-aimed transfer a failed batch");
+        if (raftTicksToWallClock(ropts.transferTimeout) >= data::ReplicatedBatchWriteRouter::kDeadline)
+            // THE WALL-CLOCK HALF, and the load-bearing one: D-20's whole claim is that a
+            // batch blocked by a transfer outlasts the refusal and retries into the resumed
+            // leader inside its BASE deadline. A tick period or a deadline that breaks that
+            // must not boot.
+            throw std::runtime_error(
+                "cluster: Raft transferTimeout must fit inside the base write deadline -- a longer abandon window "
+                "makes one mis-aimed leadership transfer a failed batch again (debt D-20)");
         if (ropts.snapshotChunkTimeout >= ropts.electionTimeoutMin)
             // Fail closed at startup rather than discover it as an election storm during a
             // rebalance: a future edit to any of the three numbers must keep the ordering.

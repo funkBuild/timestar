@@ -29,6 +29,46 @@ inline constexpr uint16_t kDataPlanePortOffset = 1000;
 // The Raft (replica<->replica) RPC listener port offset. HTTP 8086 -> Raft 10086.
 inline constexpr uint16_t kRaftPortOffset = 2000;
 
+// ---------------------------------------------------------------------------
+// RAFT TIMING POLICY for the replicated data plane, in ONE place, because the
+// relationships between these numbers are load-bearing and two of them are enforceable
+// only where the tick PERIOD is visible (debt D-20).
+//
+// The tick period used to be a bare `std::chrono::milliseconds(20)` argument at the
+// `ShardRaftPlane::init` call site while every timeout beside it was expressed in TICKS,
+// so every wall-clock claim about Raft timing -- including the one that makes the
+// leader-transfer abandon window safe -- was a multiplication done in a comment.
+inline constexpr std::chrono::milliseconds kRaftTickPeriod{20};
+inline constexpr unsigned kRaftHeartbeatTicks = 25;                      // 500 ms
+inline constexpr unsigned kRaftElectionTicksMin = 125;                   // 2.5 s
+inline constexpr unsigned kRaftElectionTicksMax = 250;                   // 5 s (randomized: spreads campaigns)
+inline constexpr unsigned kRaftTransferTicks = 2 * kRaftHeartbeatTicks;  // 1 s (§3.10 abandon window)
+
+constexpr std::chrono::milliseconds raftTicksToWallClock(unsigned ticks) {
+    return kRaftTickPeriod * static_cast<int64_t>(ticks);
+}
+
+// THE INEQUALITY D-20 RESTS ON, asserted by the compiler rather than by prose. While a
+// transfer is in flight the group refuses EVERY proposal, so the abandon window is what a
+// mis-aimed transfer costs the group's writes -- and the whole point of shortening it from
+// one election timeout is that a blocked batch can now outlast it and retry into the
+// resumed leader INSIDE its base deadline. That is a wall-clock relationship between a
+// tick count here and a millisecond constant in replicated_write_router.hpp, so nothing in
+// either file could see it: dropping kDeadline to 800 ms, or handing the plane a 40 ms
+// tick, silently restored the pre-D-20 failure mode with every test still green.
+static_assert(raftTicksToWallClock(kRaftTransferTicks) < data::ReplicatedBatchWriteRouter::kDeadline,
+              "the leader-transfer abandon window must fit inside the BASE write deadline, or one mis-aimed "
+              "transfer is again a failed batch rather than a retry [debt D-20]");
+// ...and it must still be long enough for a healthy peer to answer on the cadence it is
+// served on, or a transfer is abandoned before its target has had one chance to ack.
+static_assert(kRaftTransferTicks >= kRaftHeartbeatTicks,
+              "the abandon window must cover at least one heartbeat round [debt D-20]");
+// The ordering the group's own clocks need: abandoning must be far cheaper than an
+// election, never a substitute for one.
+static_assert(kRaftTransferTicks < kRaftElectionTicksMin,
+              "an abandon window as long as an election is the pre-D-20 behaviour under a new name [debt D-20]");
+static_assert(kRaftHeartbeatTicks < kRaftElectionTicksMin, "a leader must heartbeat many times per election");
+
 // The node-level composition that wires every M2 brick into one live service
 // (integration plan M2): ClusterRuntime placement -> EngineLocalStore sink ->
 // DataPlaneRpc transport (server + peer clients) -> NodeWriteRouter (writes) +

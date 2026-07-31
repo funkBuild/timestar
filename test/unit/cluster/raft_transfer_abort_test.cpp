@@ -141,12 +141,15 @@ TEST(RaftTransferAbortTest, TheAbandonWindowIsTwoHeartbeatsAndNeverAnElectionTim
         RaftNode n(1, {1, 2, 3}, RaftLog{}, HardState{}, o);
         EXPECT_EQ(n.transferTimeout(), 4u);
     }
-    {  // clamped: a window at or past an election timeout is the pre-D-20 behaviour
+    {  // clamped, and STRICTLY below the shortest election timeout -- the same boundary
+       // ClusterDataPlane::start refuses to boot on, so the two cannot disagree about
+       // which side of the line is legal
         RaftOptions o = transferOpts();
         o.transferTimeout = 10'000;
         RaftNode n(1, {1, 2, 3}, RaftLog{}, HardState{}, o);
-        EXPECT_EQ(n.transferTimeout(), o.electionTimeoutMin);
-        EXPECT_LE(n.transferTimeout(), n.electionTimeout());
+        EXPECT_EQ(n.transferTimeout(), o.electionTimeoutMin - 1);
+        EXPECT_LT(n.transferTimeout(), o.electionTimeoutMin);
+        EXPECT_LT(n.transferTimeout(), n.electionTimeout());
     }
     {  // never zero, whatever the cadence: a zero window would abandon before the
        // TimeoutNow it just sent could possibly be answered

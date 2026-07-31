@@ -59,8 +59,11 @@ struct RaftOptions {
     // bounded catch-up round trip, since `propose` refuses while transferring and the
     // target's backlog is therefore FIXED) and much shorter than the write deadline.
     //
-    // It must stay below the election timeout, which the derivation enforces: a window
-    // at or past it would be the old behaviour wearing a new name.
+    // It must stay STRICTLY below the shortest election timeout, which the derivation
+    // enforces by clamping to `electionTimeoutMin - 1`: a window at or past it would be
+    // the old behaviour wearing a new name, and `ClusterDataPlane::start` refuses to boot
+    // on exactly that boundary (`>=`), so the clamp and the startup check agree about
+    // which side of the line is legal.
     unsigned transferTimeout = 0;
 
     // CATCH-UP CHUNKING (write-scaleout 5.4). A follower that has been down carries a
