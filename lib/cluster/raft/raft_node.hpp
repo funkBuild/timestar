@@ -289,6 +289,21 @@ public:
     // Bytes of a partial snapshot currently staged as a follower (0 == none).
     uint64_t stagedSnapshotBytes() const { return snapStaging_ ? snapStaging_->data.size() : 0; }
     LogIndex commitIndex() const { return commitIndex_; }
+
+    // Does `commitIndex_` reflect a commit made in the CURRENT term (§5.4.2)?
+    //
+    // THE ONLY THING THAT MAKES commitIndex_ AN UPPER BOUND ON WHAT WAS ACKNOWLEDGED.
+    // commitIndex_ is not persisted (HardState is {term, votedFor}), so a restarted node
+    // starts at its snapshot boundary, and `maybeAdvanceCommitAsLeader` refuses to raise
+    // it until a current-term entry -- becomeLeader's no-op -- reaches a majority. In that
+    // window a freshly elected leader ALREADY REPORTS ITSELF LEADER while commitIndex_
+    // still names stale state, so anything that reads "commit minus applied" sees a lag of
+    // zero and concludes, wrongly, that it is caught up. This predicate is what closes
+    // that window, and it recurs on EVERY leadership change, not just on restarts.
+    //
+    // Named here rather than spelled out at each site because there are now two (read
+    // barriers and the read fence, debt D-36) and they must never disagree about it.
+    bool hasCurrentTermCommit() const { return log_.term(commitIndex_) == std::optional<Term>(currentTerm_); }
     const RaftLog& log() const { return log_; }
     // The snapshot this node can currently SERVE to a lagging peer (index == kNoIndex when
     // there is none). The driver needs it after `compact()` in order to PERSIST it -- see

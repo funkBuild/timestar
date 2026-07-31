@@ -747,47 +747,59 @@ raft::RaftGroup* ReplicatedVShardHost::group(uint16_t vshard) {
 }
 
 seastar::future<bool> ReplicatedVShardHost::awaitApplyCatchUp(std::chrono::milliseconds budget) {
-    // A fence started during shutdown has nothing to fence and no host to resume against.
+    // FAIL CLOSED DURING SHUTDOWN. A node tearing down cannot prove it has applied what it
+    // committed, and "we are stopping" is not evidence that the answer would be complete --
+    // it is the reason it might not be. The caller turns this into QUERY_INCOMPLETE, which
+    // is what a client should see from a node on its way out.
     if (stopped_ || readFenceGate_.is_closed())
-        co_return true;
+        co_return false;
     const auto holder = readFenceGate_.hold();
-    // Sample the bar ONCE, before any suspension: (group, the index it had already
-    // committed). See the header for why the bar is the entry-time commit index and not
-    // "zero lag" -- the latter is unreachable on a node taking writes.
-    std::vector<std::pair<uint16_t, raft::LogIndex>> pending;
-    for (auto& [vs, state] : vshards_) {
-        raft::RaftGroup* g = registry_.group(vs);
-        if (g && g->applyLag() > 0)
-            pending.emplace_back(vs, g->commitIndex());
-    }
-    if (pending.empty())
+
+    // Enroll every hosted group ONCE, before any suspension. The policy (apply_fence.hpp)
+    // owns the two reasons a group is pending and when each clears; this function owns
+    // only the sampling, the sleep and the budget.
+    ApplyFencePolicy fence;
+    for (auto& [vs, state] : vshards_)
+        fence.enroll(vs, fenceStateOf(vs));
+    if (fence.clear())
         co_return true;  // caught up: the fast path, and it never suspends
 
     // POLL rather than register a waiter per group. `waitApplied` would be the obvious
-    // tool, but it takes the group's lock to register -- and a shard hosting ~1365
-    // groups would take ~1365 locks on a path that is almost always a no-op, on a
-    // reactor whose Ready drains want those same locks. Polling costs one integer
-    // compare per still-pending group per pass and, unlike a registered waiter, needs
-    // nothing unwound when the budget runs out.
+    // tool, but it takes the group's lock to register -- and a shard hosting ~1000 groups
+    // would take ~1000 locks on a path that is almost always a no-op, on a reactor whose
+    // Ready drains want those same locks. Polling costs a handful of integer reads per
+    // still-pending group per pass and, unlike a registered waiter, needs nothing unwound
+    // when the budget runs out. It also re-reads `hasCurrentTermCommit`, which a waiter
+    // registered against a stale commit index could not.
     const auto deadline = seastar::lowres_clock::now() + budget;
     while (seastar::lowres_clock::now() < deadline) {
         co_await seastar::sleep(std::chrono::milliseconds(2));
-        std::erase_if(pending, [this](const auto& p) {
-            raft::RaftGroup* g = registry_.group(p.first);
-            // A group that stopped being hosted (movement) cannot hold this read back:
-            // it is no longer part of this node's answer.
-            return !g || g->appliedIndex() >= p.second;
-        });
-        if (pending.empty())
+        if (stopped_)
+            co_return false;  // same reasoning as the entry check
+        if (fence.refresh([this](uint16_t vs) { return fenceStateOf(vs); }))
             co_return true;
     }
     // FAIL CLOSED. The caller turns this into a QUERY_INCOMPLETE, which is the honest
     // answer: this node holds acknowledged data it cannot yet read out.
+    const auto stuck = fence.pendingGroups();
     timestar::http_log.warn(
-        "cluster: shard {} still has {} group(s) with committed-but-unapplied entries after {} ms; failing the read "
-        "closed rather than answering out of state that is behind its own log (debt D-36)",
-        seastar::this_shard_id(), pending.size(), budget.count());
+        "cluster: shard {} still has {} group(s) that cannot prove they have applied what they committed after {} ms "
+        "(first: VShard {}); failing the read closed rather than answering out of state that is behind its own log "
+        "(debt D-36)",
+        seastar::this_shard_id(), stuck.size(), budget.count(), stuck.empty() ? 0 : stuck.front());
     co_return false;
+}
+
+FenceGroupState ReplicatedVShardHost::fenceStateOf(uint16_t vshard) {
+    FenceGroupState s;
+    raft::RaftGroup* g = registry_.group(vshard);
+    if (!g)
+        return s;  // not hosted: the policy drops it
+    s.hosted = true;
+    s.hasCurrentTermCommit = g->hasCurrentTermCommit();
+    s.commitIndex = g->commitIndex();
+    s.appliedIndex = g->appliedIndex();
+    return s;
 }
 
 NodeId ReplicatedVShardHost::leaderOf(uint16_t vshard) const {

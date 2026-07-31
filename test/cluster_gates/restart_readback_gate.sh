@@ -59,7 +59,16 @@ if [ "${FREE_GB:-0}" -lt 30 ]; then
     exit 2
 fi
 
-trap 'kill_cluster 1973' EXIT
+# CLEAN UP ON EVERY EXIT, not just the happy one. This gate holds three RF=3 data dirs
+# of a 150x10k campaign -- tens of gigabytes of tmpfs -- and every `gate_exit` before the
+# end (a cluster that never converged, a failed wait) used to leave all of it behind. The
+# next gate then measures a box with no headroom, which is self-amplifying and reads
+# exactly like a regression (see the README's ONE AT A TIME section).
+cleanup() {
+    kill_cluster 1973
+    rm -rf /tmp/tsgate_rr1 /tmp/tsgate_rr2 /tmp/tsgate_rr3 /tmp/tsgate_rr_bench.txt
+}
+trap cleanup EXIT
 
 PEERS="127.0.0.1:19730,127.0.0.1:19731,127.0.0.1:19732"
 start_node() {
@@ -182,5 +191,4 @@ assert_le "nothing fabricated or double-counted" "$WORST" "$PROBES"
 assert_eq "node crashes" "$CRASH" 0
 assert_eq "server-side 500s" "$SVR500" 0
 
-for i in 1 2 3; do rm -rf "/tmp/tsgate_rr$i"; done
 gate_exit

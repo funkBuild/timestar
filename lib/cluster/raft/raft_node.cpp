@@ -1382,8 +1382,9 @@ void RaftNode::confirmReads() {
     // A read is only linearizable once the leader has committed an entry in its
     // CURRENT term (so commitIndex reflects real committed state, not a stale
     // prior-term value). becomeLeader's no-op guarantees this shortly after
-    // election; until then, hold the reads.
-    if (log_.term(commitIndex_) != std::optional<Term>(currentTerm_))
+    // election; until then, hold the reads. Shared with the read fence (debt D-36)
+    // so the two cannot drift -- see hasCurrentTermCommit().
+    if (!hasCurrentTermCommit())
         return;
 
     // The highest readSeq a quorum of voters has echoed.

@@ -124,6 +124,10 @@ public:
     NodeId leader() const { return node_.leader(); }
     bool transferInFlight() const { return node_.transferInFlight(); }
     LogIndex commitIndex() const { return node_.commitIndex(); }
+    // Does commitIndex() reflect a commit in the CURRENT term? Until it does, the value
+    // is a stale watermark and "commit minus applied" is a meaningless zero -- see
+    // RaftNode::hasCurrentTermCommit, and the read fence (debt D-36) that depends on it.
+    bool hasCurrentTermCommit() const { return node_.hasCurrentTermCommit(); }
     // How many committed entries this group has NOT yet handed to its state machine
     // (debt D-36). Zero on a caught-up group. This is the ONE number that separates
     // "the write was lost" from "the write is on disk and not applied yet" after a

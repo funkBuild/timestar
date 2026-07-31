@@ -8,6 +8,7 @@
 #include "../data/replicated_command.hpp"
 #include "../raft/raft_group_registry.hpp"
 #include "../raft/raft_journal_persistence.hpp"
+#include "apply_fence.hpp"
 #include "engine_data_state_machine.hpp"
 
 #include <chrono>
@@ -168,8 +169,13 @@ public:
     // wait; waiting for "no lag at all" on a node under continuous ingest is not a
     // bound, it is a livelock.
     //
-    // FREE WHEN CAUGHT UP, which is the common case: the sample is an integer compare
-    // per hosted group and the fast path allocates nothing and never suspends.
+    // FREE WHEN CAUGHT UP, which is the common case: a handful of integer reads per
+    // hosted group, and the fast path never suspends.
+    //
+    // WHAT "CAUGHT UP" MEANS IS NOT "commit == applied" -- see ApplyFencePolicy. A group
+    // with no CURRENT-TERM commit has a commit index that proves nothing, and reporting
+    // it as caught up is how the first version of this fence let a freshly elected
+    // leader answer out of an entire unapplied recovered log.
     seastar::future<bool> awaitApplyCatchUp(std::chrono::milliseconds budget);
     // How many proposals this node refused WHILE BEING THE LEADER of the VShard (a
     // leadership transfer in flight). Non-zero means writes are failing for a reason no
@@ -360,6 +366,10 @@ private:
         // doing 1365 directory walks every minute.
         uint64_t lastGcFloor = 0;
     };
+
+    // One group's state for the read fence (debt D-36). Non-const because
+    // RaftGroupRegistry::group() is; it mutates nothing.
+    FenceGroupState fenceStateOf(uint16_t vshard);
 
     EngineLocalStore& store_;
     NodeId self_;

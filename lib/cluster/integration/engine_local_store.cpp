@@ -253,6 +253,18 @@ seastar::future<data::NodeQueryPartial> EngineLocalStore::queryLocal(data::NodeQ
 }
 
 seastar::future<data::MetadataResult> EngineLocalStore::queryMetadata(data::MetadataRequest req) {
+    // FENCE THIS LEG TOO (debt D-36). Metadata is a READ, and it is answered from the
+    // same applied state a query is: a measurement, field, tag value or cardinality
+    // estimate that exists only in committed-but-unapplied entries is missing from a
+    // successful 200 exactly as a data point would be. `MetadataResult` has no
+    // incompleteReason channel, so this THROWS -- which is the right shape here, because
+    // `ClusterDataPlane::metadata` already fails the whole request on any node's
+    // exception for precisely this reason ("a partial metadata answer would be silently
+    // incomplete, same contract as queries").
+    if (applyFence_ && !co_await applyFence_())
+        throw std::runtime_error(
+            "node has committed but unapplied writes (still catching up); its metadata would omit acknowledged series");
+
     // Schema getters read the node's local schema cache (broadcast across its shards),
     // so one local() call yields this node's full owned-series schema. Cardinality is
     // per-shard HLL, summed across this node's shards.

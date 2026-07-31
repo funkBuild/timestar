@@ -103,10 +103,16 @@ public:
     // coordinator unions items and sums cardinality across owners.
     seastar::future<data::MetadataResult> queryMetadata(data::MetadataRequest req) override;
 
-    // THE READ FENCE (debt D-36). Returns false if this node still holds
-    // committed-but-unapplied entries after its budget, in which case `queryLocal`
-    // fails closed with an incompleteReason instead of answering out of state that is
-    // behind its own log.
+    // THE READ FENCE (debt D-36). Returns false if this node cannot prove it has applied
+    // everything it had already committed, within its budget.
+    //
+    // APPLIED TO EVERY READ KIND THIS STORE SERVES, not just `queryLocal`: `queryMetadata`
+    // answers /measurements, /fields, /tags, /tag-values and /cardinality out of the same
+    // applied state, so a series that exists only in unapplied entries is missing from a
+    // successful 200 there exactly as a data point would be. The two differ only in how
+    // they report it -- queryLocal has an incompleteReason, metadata throws -- because
+    // `MetadataResult` has no failure channel and its coordinator already fails the whole
+    // request on any node's exception.
     //
     // Injected rather than reached for: EngineLocalStore is deliberately Raft-unaware
     // (it is the adapter that keeps the Engine cluster-unaware), and the groups live in
