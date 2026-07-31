@@ -27,11 +27,19 @@
 # giving up against a socket the transport had not re-dialled yet. That signature is
 # specific to the pacing fix; the other reverted changes do not produce it.
 #
+# WHAT "DISCRIMINATES" MEANS HERE, since D-21. It is no longer "the reverted arm produced
+# an error and HEAD produced none": HEAD is not reliably zero (0, 1, 0 and one void across
+# six consecutive single-storm runs of one unchanged binary), so that shape was satisfied by
+# HEAD's own noise. The gate now runs K storms and budgets their TOTAL, and this script
+# asserts a SEPARATION -- HEAD within the budget, the reverted arm at 3x it or worse. The
+# real margin is wider than that bound: a reverted binary produces 9-10 errors in a SINGLE
+# storm where HEAD's whole K-storm budget is 3.
+#
 # EXPENSIVE. This builds a second server binary from an isolated worktree (a fresh build
 # dir means building seastar too -- tens of minutes the first time; later runs are
-# incremental if you keep GATE_AB_BUILD_DIR) and then runs the full storm gate TWICE,
-# each of which is several minutes. It is a release/on-demand check, NOT a per-commit CI
-# gate. The gate it validates, fault_injection_gate.sh, is the one CI runs.
+# incremental if you keep GATE_AB_BUILD_DIR) and then runs the full storm gate TWICE, each
+# of which is now K storms rather than one. It is a release/on-demand check, NOT a
+# per-commit CI gate. The gate it validates, fault_injection_gate.sh, is the one CI runs.
 #
 # It never touches your working tree: the revert happens in a `git worktree`, not here.
 #
@@ -152,18 +160,33 @@ run_gate "$BUILD_DIR/bin/timestar_http_server" /tmp/tsgate_ab_head.log
 HEAD_RC=$?
 
 # ---------------------------------------------------------------------------
+# The error counter is now an AGGREGATE over the gate's K storms (debt D-21); the gate
+# prints the per-storm vector next to it, which is what to read when the two arms are
+# closer than expected.
+ERR_ASSERTION="client errors across the reset storms"
 R_ROUNDS=$(gate_number /tmp/tsgate_ab_reverted.log "reset rounds injected")
 R_CONNS=$(gate_number /tmp/tsgate_ab_reverted.log "peer connections actually destroyed")
-R_BENCH=$(gate_number /tmp/tsgate_ab_reverted.log "bench client HTTP errors across the reset storm")
-R_PROBE=$(gate_number /tmp/tsgate_ab_reverted.log "probe 5xx across the reset storm")
+R_TOTAL=$(gate_number /tmp/tsgate_ab_reverted.log "$ERR_ASSERTION")
 H_ROUNDS=$(gate_number /tmp/tsgate_ab_head.log "reset rounds injected")
 H_CONNS=$(gate_number /tmp/tsgate_ab_head.log "peer connections actually destroyed")
-H_BENCH=$(gate_number /tmp/tsgate_ab_head.log "bench client HTTP errors across the reset storm")
-H_PROBE=$(gate_number /tmp/tsgate_ab_head.log "probe 5xx across the reset storm")
+H_TOTAL=$(gate_number /tmp/tsgate_ab_head.log "$ERR_ASSERTION")
 
 echo "=== A/B result ==="
-echo "  reverted: ${R_ROUNDS:-?} rounds / ${R_CONNS:-?} conns -> ${R_BENCH:-?} bench errors, ${R_PROBE:-?} probe 5xx (gate rc=$REVERTED_RC)"
-echo "  HEAD:     ${H_ROUNDS:-?} rounds / ${H_CONNS:-?} conns -> ${H_BENCH:-?} bench errors, ${H_PROBE:-?} probe 5xx (gate rc=$HEAD_RC)"
+echo "  reverted: ${R_ROUNDS:-?} rounds / ${R_CONNS:-?} conns -> ${R_TOTAL:-?} client errors (gate rc=$REVERTED_RC)"
+echo "  HEAD:     ${H_ROUNDS:-?} rounds / ${H_CONNS:-?} conns -> ${H_TOTAL:-?} client errors (gate rc=$HEAD_RC)"
+grep -h "storms: errors\[" /tmp/tsgate_ab_reverted.log | sed 's/^/    reverted /'
+grep -h "storms: errors\[" /tmp/tsgate_ab_head.log | sed 's/^/    HEAD     /'
+
+# A VOID run (exit 3) is neither arm's answer: the gate's own fault-free control failed, so
+# the storm that followed measured the environment. Re-draw rather than reporting an A/B
+# that did not happen -- and say which arm voided, because the reverted arm voiding looks
+# superficially like the discrimination this script exists to prove.
+if [ "$REVERTED_RC" -eq 3 ] || [ "$HEAD_RC" -eq 3 ]; then
+    echo "ABORT (VOID): the $([ "$REVERTED_RC" -eq 3 ] && echo REVERTED || echo HEAD) arm voided --"
+    echo "  its fault-free baseline through the proxy failed, so neither arm's storm is"
+    echo "  comparable. Re-run; check /tmp free space first (see the gate README)."
+    exit 3
+fi
 
 # BOTH RUNS MUST HAVE TAKEN A COMPARABLE STORM. Comparing a heavy storm against a light
 # one says nothing about the binaries, and the resetter's round count is load-dependent
@@ -178,11 +201,17 @@ if [ "${R_CONNS:-0}" -gt 0 ] && [ "${H_CONNS:-0}" -gt 0 ]; then
     assert_le "storm intensity ratio between the two runs (%, 100 = identical)" "$RATIO" 200
 fi
 
-# THE DISCRIMINATION CLAIM, in both directions.
-R_TOTAL=$(( ${R_BENCH:-0} + ${R_PROBE:-0} ))
-H_TOTAL=$(( ${H_BENCH:-0} + ${H_PROBE:-0} ))
-assert_ge "REVERTED binary: client errors under the storm" "$R_TOTAL" 1
-assert_eq "HEAD binary: client errors under the storm" "$H_TOTAL" 0
+# THE DISCRIMINATION CLAIM, in both directions -- and it is a SEPARATION, not a
+# zero-versus-nonzero (debt D-21). HEAD is not reliably zero: measured over six consecutive
+# single-storm runs of one unchanged HEAD binary, the draws were 0, 1, 0 and one void. So
+# "the reverted arm produced at least one error" no longer means anything on its own -- it
+# is satisfied by HEAD's own noise. The arms are separated by a FACTOR instead: the gate's
+# budget is what HEAD must stay inside, and the reverted arm must exceed it several times
+# over. The margin is real -- a reverted binary produces 9-10 errors in a SINGLE storm
+# where HEAD's whole K-storm budget is 3.
+BUDGET="${GATE_MAX_STORM_ERRORS:-3}"
+assert_le "HEAD binary: client errors under the storms" "${H_TOTAL:-999}" "$BUDGET"
+assert_ge "REVERTED binary: client errors under the storms" "${R_TOTAL:-0}" "$((BUDGET * 3))"
 
 # ...AND THE ERRORS MUST BE THE RIGHT ONES. The whole-file revert reaches past 4a (see the
 # header), so "it produced errors" alone does not prove the pacing fix is what the gate

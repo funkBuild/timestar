@@ -38,7 +38,18 @@ import socket
 import struct
 import sys
 
-BUF = 1 << 16
+# 1 MiB, not the 64 KiB this started at, and it is a MEASUREMENT fix rather than a
+# micro-optimisation (debt D-21). This proxy carries a peer's whole data plane on ONE python
+# event loop, and at the gate's offered rate it was close enough to its ceiling to tip: two
+# of seven runs collapsed into a congestion spiral -- drain() backpressure -> RPC deadline
+# expiry -> retries -> more traffic -> worse -- and produced 83-214 client errors in the
+# gate's FAULT-FREE baseline, i.e. with nothing injected at all. A gate whose control arm
+# measures python's throughput cannot say anything about the server's. Bigger chunks cut the
+# per-byte callback and syscall count where it actually costs.
+BUF = 1 << 20
+# The StreamReader's own buffer limit, which defaults to 64 KiB and would otherwise cap the
+# read size above regardless of BUF.
+STREAM_LIMIT = 1 << 20
 
 live = []  # [(writer_a, writer_b)] for resettable mappings only
 reset_rounds = 0
@@ -57,6 +68,17 @@ def hard_reset(writer):
     try:
         writer.transport.abort()
     except Exception:
+        pass
+
+
+def tune(writer):
+    """TCP_NODELAY on both legs: a forwarder that waits for Nagle adds latency to every
+    replication frame, and the write path's deadline is what that eventually spends."""
+    try:
+        sock = writer.get_extra_info("socket")
+        if sock is not None:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except OSError:
         pass
 
 
@@ -79,10 +101,12 @@ async def pump(reader, writer):
 
 async def handle(client_reader, client_writer, target, resettable):
     try:
-        server_reader, server_writer = await asyncio.open_connection(*target)
+        server_reader, server_writer = await asyncio.open_connection(*target, limit=STREAM_LIMIT)
     except OSError:
         client_writer.close()
         return
+    tune(client_writer)
+    tune(server_writer)
     entry = (client_writer, server_writer)
     if resettable:
         live.append(entry)
@@ -129,6 +153,7 @@ async def main():
             lp,
             reuse_address=True,
             backlog=512,
+            limit=STREAM_LIMIT,
         )
         servers.append(srv)
         print(f"MAP {lh}:{lp} -> {th}:{tp}{' RESETTABLE' if resettable else ''}", flush=True)

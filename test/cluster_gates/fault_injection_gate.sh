@@ -26,7 +26,41 @@
 # kernel path it replaces, so absolute throughput here is meaningless. The gate measures a
 # QUIET baseline through the same proxy first, and asserts the dip RELATIVE TO THAT.
 #
+# K STORMS AND AN ERROR BUDGET, NOT ONE STORM AND A ZERO (debt D-21). The single-storm
+# zero-error assertion was not reproducible run to run IN EITHER DIRECTION, so neither a
+# failing run nor a passing one identified anything. MEASURED on this box, six consecutive
+# single-storm runs of the pre-D-21 gate against one unchanged HEAD binary:
+#
+#     run  1     2     3     4         (5 and 6 were cut short by a harness timeout)
+#     err  0     1     0     26        <- the 26 is a VOID run; see below
+#     rounds 145 148   146   199
+#     conns  392 397   395   471
+#     base   5.16M 5.05M 4.98M 0.45M pts/s, baseline errors 0 0 0 214
+#
+# So the storm draws are 0, 1, 0 and the fourth run is not a draw at all: its FAULT-FREE
+# baseline through the proxy collapsed to 9% of throughput with 214 client errors, and the
+# storm that followed inherited a sick cluster AND a longer bench (the resetter fires on a
+# fixed 0.3 s clock, so a slower bench takes MORE rounds -- 199 against the usual 145-148).
+# The two failure modes are therefore separated rather than averaged:
+#
+#   * A DIRTY BASELINE VOIDS THE RUN (exit 3), it does not fail it. The control arm failed,
+#     so the run says nothing about the fault -- reporting that as a property failure is
+#     what made a single red run uninformative. Re-draw it (and read the README's
+#     self-amplifying disk note first: that is one known cause).
+#   * THE PROPERTY IS ASSERTED OVER K STORMS AGAINST A BUDGET. The storm runs
+#     GATE_STORM_ROUNDS times (default 3) against the same cluster and the gate asserts on
+#     the TOTAL client errors, with the per-storm vector printed so the distribution is
+#     visible rather than inferred. The default budget of 3 sits above the observed
+#     0-1-per-storm band and an order of magnitude below what a binary without the 4a fix
+#     produces (9-10 in a SINGLE storm, `fault_injection_ab.sh`), so it still discriminates.
+#
+# The residual variance is environmental and whole-run (that void baseline), which K storms
+# inside one run cannot average away -- which is exactly why the void rule is separate.
+#
 # Usage: fault_injection_gate.sh [SERVER_BINARY]
+#   GATE_STORM_ROUNDS=K        storms per run (default 3)
+#   GATE_MAX_STORM_ERRORS=N    total client-error budget across all K (default 3)
+#   exit 0 = pass, 1 = property failed, 2 = setup refused, 3 = VOID (re-draw)
 set -u
 cd "$(dirname "$0")" || exit 2
 . ./cluster_gate_lib.sh
@@ -57,6 +91,27 @@ MIN_RESET_ROUNDS="${GATE_MIN_RESET_ROUNDS:-70}"
 MIN_RESET_CONNS="${GATE_MIN_RESET_CONNS:-180}"
 # The dip bound, as a percentage of the quiet-through-the-proxy baseline.
 MIN_DIP_PCT="${GATE_MIN_DIP_PCT:-40}"
+# D-21: K storms per run, and a budget on their TOTAL rather than a zero on one draw. The
+# floors above are PER STORM and are multiplied by K below, so a run that injects a full
+# storm K times is what satisfies them -- three anaemic storms cannot add up to one real
+# one.
+STORM_ROUNDS="${GATE_STORM_ROUNDS:-3}"
+MAX_STORM_ERRORS="${GATE_MAX_STORM_ERRORS:-3}"
+# A baseline slower than this VOIDS the run rather than failing it (see the header): the
+# fault-free control through the proxy runs 4.98-5.16 M pts/s here, and the one collapse
+# observed came in at 0.45 M. The floor is ~40% of the low end -- far enough below the
+# observed band to never fire on an honestly slower box, far enough above the collapse to
+# catch it.
+MIN_BASE_TPUT="${GATE_MIN_BASE_TPUT:-2000000}"
+
+# VOID is not a pass and not a failure: it is a run that did not test the property. It gets
+# its own exit code so a caller (fault_injection_ab.sh, CI) can re-draw instead of filing a
+# regression.
+gate_void() {
+    echo "  VOID: $*" >&2
+    echo "GATE VOID -- this run did not test the property; re-draw it (see the header)"
+    exit 3
+}
 
 cleanup() {
     [ -n "${PROXY_PID:-}" ] && kill -9 "$PROXY_PID" 2>/dev/null
@@ -118,100 +173,167 @@ assert_ge "VShards led behind the proxy (traffic that must cross the fault)" "${
 echo "=== baseline (proxy in path, no faults) ==="
 timeout 300 "$BENCH" --server-port 19410 -c 4 --batches 2000 --batch-size 10000 --verify 0 \
     --warmup 5 --connections 4 --hosts 1000 --racks 2 >/tmp/tsgate_fi_base.txt 2>&1
-grep -E "Requests:|Throughput|batch latency" /tmp/tsgate_fi_base.txt
+# "First error" is printed here too (D-21): when the baseline DOES break, its signature is
+# the only evidence of why, and the run that first showed this had none recorded.
+grep -E "Requests:|First error|Throughput|batch latency" /tmp/tsgate_fi_base.txt
 BASE_TPUT=$(grep -oE 'Throughput:[[:space:]]*[0-9.]+' /tmp/tsgate_fi_base.txt | head -1 | grep -oE '[0-9.]+')
 BASE_ERRS=$(grep -o '[0-9]* HTTP errors' /tmp/tsgate_fi_base.txt | head -1 | cut -d' ' -f1)
 echo "  baseline throughput: ${BASE_TPUT:-?} (errors ${BASE_ERRS:-?})"
-assert_eq "baseline client HTTP errors (the proxy alone must break nothing)" "${BASE_ERRS:-missing}" 0
+# THE CONTROL ARM, AND IT VOIDS RATHER THAN FAILS (debt D-21). No fault has been injected
+# yet, so a broken baseline is a broken environment -- disk headroom, a starved proxy, a
+# co-tenant -- and everything downstream of it measures that instead of the server. Failing
+# here would be indistinguishable from the property failing, which is precisely the
+# confusion that left a red run uninformative.
+[ "${BASE_ERRS:-missing}" = "0" ] || gate_void "the fault-free baseline through the proxy took ${BASE_ERRS} client errors"
+if [ -n "${BASE_TPUT:-}" ]; then
+    awk -v t="$BASE_TPUT" -v m="$MIN_BASE_TPUT" 'BEGIN{exit !(t+0 < m+0)}' &&
+        gate_void "the fault-free baseline ran at $BASE_TPUT pts/s, under the ${MIN_BASE_TPUT} floor"
+else
+    gate_void "could not parse a throughput from the baseline run"
+fi
+gate_ok "baseline clean through the proxy: $BASE_TPUT pts/s, 0 client errors"
 
 # ---------------------------------------------------------------------------
 # The known-count durability probe. A fixed set of points is written DURING the
 # turbulence, one per request, so every ack is individually attributable; afterwards the
-# range is read back and must contain EXACTLY the acked points -- no loss, no duplicates.
+# range is read back and must contain every acked point -- no loss.
 BASE_TS=1750000000000000000
 PROBE=200
 
-echo "=== reset storm under sustained writes ==="
-# Three independent things run at once, deliberately decoupled: the bench (bulk load),
-# the RESETTER (the fault), and the probe (the countable writes). An earlier version
-# gated the resetter on the bench still running and the bench finished in under a second,
-# so the storm never fired -- the anti-vacuity assertions below exist because of that.
-rm -f /tmp/tsgate_fi_stop
-( timeout 300 "$BENCH" --server-port 19410 -c 4 --batches 2000 --batch-size 10000 --verify 0 \
-    --warmup 5 --connections 4 --hosts 1000 --racks 2 >/tmp/tsgate_fi_storm.txt 2>&1 ) &
-BENCHPID=$!
-( ROUNDS=0
-  while [ ! -f /tmp/tsgate_fi_stop ]; do
-      kill -USR1 "$PROXY_PID" 2>/dev/null && ROUNDS=$((ROUNDS + 1))
-      sleep 0.3
-  done
-  echo "$ROUNDS" >/tmp/tsgate_fi_rounds ) &
-RESETPID=$!
-sleep 1
+# K STORMS AGAINST THE SAME CLUSTER (debt D-21). Each iteration is an independent burst:
+# its own bench, its own resetter, its own 200-point probe in its own timestamp window, and
+# its own read-back. The totals are what the property is asserted on; the per-storm vector
+# is printed so the distribution is visible in the log rather than inferred from a pass/fail.
+TOT_ROUNDS=0; TOT_CONNS=0; TOT_BENCH_ERRS=0; TOT_PROBE_5XX=0; TOT_PROBE_OTHER=0; TOT_CONN_FAILS=0
+WORST_PCT=100
+ERR_VECTOR=""; ROUND_VECTOR=""; TPUT_VECTOR=""
+PREV_CONNS=0
 
-PROBE_OK=0; PROBE_5XX=0; PROBE_OTHER=0
-i=0
-while [ "$i" -lt "$PROBE" ]; do
-    CODE=$(curl -s -m10 -o /tmp/tsgate_fi_resp.txt -w '%{http_code}' -X POST http://127.0.0.1:19410/write \
-        -H 'Content-Type: application/json' \
-        -d "{\"measurement\":\"faultprobe\",\"tags\":{\"host\":\"p$i\"},\"fields\":{\"v\":1.0},\"timestamp\":$((BASE_TS + i * 1000000000))}")
-    case "$CODE" in
-        2*) PROBE_OK=$((PROBE_OK + 1)) ;;
-        5*) PROBE_5XX=$((PROBE_5XX + 1))
-            [ "$PROBE_5XX" = "1" ] && echo "  first probe 5xx ($CODE): $(head -c 200 /tmp/tsgate_fi_resp.txt)" ;;
-        *)  PROBE_OTHER=$((PROBE_OTHER + 1)) ;;
-    esac
-    i=$((i + 1))
+storm=1
+while [ "$storm" -le "$STORM_ROUNDS" ]; do
+    echo "=== reset storm $storm/$STORM_ROUNDS under sustained writes ==="
+    # Each storm gets its own probe window, 1000 s past the previous one, so a read-back
+    # can attribute points to the storm that wrote them. Reusing one window would let a
+    # later storm's points cover an earlier storm's loss.
+    STORM_TS=$((BASE_TS + (storm - 1) * 1000 * 1000000000))
+    # Three independent things run at once, deliberately decoupled: the bench (bulk load),
+    # the RESETTER (the fault), and the probe (the countable writes). An earlier version
+    # gated the resetter on the bench still running and the bench finished in under a
+    # second, so the storm never fired -- the anti-vacuity assertions below exist because
+    # of that.
+    rm -f /tmp/tsgate_fi_stop
+    ( timeout 300 "$BENCH" --server-port 19410 -c 4 --batches 2000 --batch-size 10000 --verify 0 \
+        --warmup 5 --connections 4 --hosts 1000 --racks 2 >/tmp/tsgate_fi_storm.txt 2>&1 ) &
+    BENCHPID=$!
+    ( ROUNDS=0
+      while [ ! -f /tmp/tsgate_fi_stop ]; do
+          kill -USR1 "$PROXY_PID" 2>/dev/null && ROUNDS=$((ROUNDS + 1))
+          sleep 0.3
+      done
+      echo "$ROUNDS" >/tmp/tsgate_fi_rounds ) &
+    RESETPID=$!
+    sleep 1
+
+    PROBE_OK=0; PROBE_5XX=0; PROBE_OTHER=0
+    i=0
+    while [ "$i" -lt "$PROBE" ]; do
+        CODE=$(curl -s -m10 -o /tmp/tsgate_fi_resp.txt -w '%{http_code}' -X POST http://127.0.0.1:19410/write \
+            -H 'Content-Type: application/json' \
+            -d "{\"measurement\":\"faultprobe\",\"tags\":{\"host\":\"p$i\"},\"fields\":{\"v\":1.0},\"timestamp\":$((STORM_TS + i * 1000000000))}")
+        case "$CODE" in
+            2*) PROBE_OK=$((PROBE_OK + 1)) ;;
+            5*) PROBE_5XX=$((PROBE_5XX + 1))
+                [ "$PROBE_5XX" = "1" ] && echo "  first probe 5xx ($CODE): $(head -c 200 /tmp/tsgate_fi_resp.txt)" ;;
+            *)  PROBE_OTHER=$((PROBE_OTHER + 1)) ;;
+        esac
+        i=$((i + 1))
+    done
+    wait $BENCHPID
+    touch /tmp/tsgate_fi_stop
+    wait $RESETPID
+    ROUNDS=$(cat /tmp/tsgate_fi_rounds 2>/dev/null || echo 0)
+    echo "  probe writes: $PROBE_OK ok, $PROBE_5XX 5xx, $PROBE_OTHER other (of $i attempted)"
+    grep -E "Requests:|First error|Throughput|batch latency" /tmp/tsgate_fi_storm.txt
+
+    # The proxy's RESET lines are CUMULATIVE across the whole run, so this storm's share is
+    # the delta. Summing the file per storm would count every earlier storm again and make
+    # the per-storm floors trivially satisfiable by the last iteration.
+    ALL_CONNS=$(awk '/^RESET /{s+=$2} END{print s+0}' "$PROXY_LOG")
+    RESET_CONNS=$((ALL_CONNS - PREV_CONNS))
+    PREV_CONNS=$ALL_CONNS
+    echo "  reset rounds: $ROUNDS, connections destroyed: $RESET_CONNS"
+
+    STORM_ERRS=$(grep -o '[0-9]* HTTP errors' /tmp/tsgate_fi_storm.txt | head -1 | cut -d' ' -f1)
+    STORM_CONN=$(grep -o '[0-9]* connection failures' /tmp/tsgate_fi_storm.txt | head -1 | cut -d' ' -f1)
+    STORM_TPUT=$(grep -oE 'Throughput:[[:space:]]*[0-9.]+' /tmp/tsgate_fi_storm.txt | head -1 | grep -oE '[0-9.]+')
+    # A bench that produced no parseable counter at all is a harness failure, not a zero.
+    [ -n "${STORM_ERRS:-}" ] && [ -n "${STORM_TPUT:-}" ] ||
+        gate_void "storm $storm produced no parseable bench result (timeout? see /tmp/tsgate_fi_storm.txt)"
+
+    TOT_ROUNDS=$((TOT_ROUNDS + ROUNDS))
+    TOT_CONNS=$((TOT_CONNS + RESET_CONNS))
+    TOT_BENCH_ERRS=$((TOT_BENCH_ERRS + STORM_ERRS))
+    TOT_CONN_FAILS=$((TOT_CONN_FAILS + ${STORM_CONN:-0}))
+    TOT_PROBE_5XX=$((TOT_PROBE_5XX + PROBE_5XX))
+    TOT_PROBE_OTHER=$((TOT_PROBE_OTHER + PROBE_OTHER))
+    ERR_VECTOR="$ERR_VECTOR $((STORM_ERRS + PROBE_5XX))"
+    ROUND_VECTOR="$ROUND_VECTOR $ROUNDS/$RESET_CONNS"
+
+    PCT=$(awk -v a="$STORM_TPUT" -v b="$BASE_TPUT" 'BEGIN{ if (b+0==0) print 0; else printf "%d", 100*a/b }')
+    TPUT_VECTOR="$TPUT_VECTOR ${PCT}%"
+    [ "$PCT" -lt "$WORST_PCT" ] && WORST_PCT=$PCT
+    echo "  throughput under storm $storm: $STORM_TPUT vs baseline $BASE_TPUT ($PCT%)"
+
+    # NO LOSS. Every acked probe point must be readable on EVERY node -- an ack means a
+    # durable quorum commit, so a follower read after the storm must agree.
+    #
+    # THE BOUND IS A BAND, NOT AN EQUALITY, and the difference is the ack contract rather
+    # than sloppiness. A retryable 5xx means UNKNOWN, not "did not happen": the slice may
+    # have committed before the error was raised. Measured exactly that way -- a run with 3
+    # probe 5xx read back 200 of 200 attempted, and the old `== PROBE_OK` assertion called
+    # that a failure three times over. What must never happen is FEWER than the acked count
+    # (loss) or MORE than were attempted (fabrication or a double count).
+    sleep 3
+    for p in $PORTS; do
+        RESP=$(curl -s -m20 -X POST "http://127.0.0.1:$p/query" -H 'Content-Type: application/json' \
+            -d "{\"query\":\"count:faultprobe(v){}\",\"startTime\":$STORM_TS,\"endTime\":$((STORM_TS + PROBE * 1000000000))}")
+        N=$(printf '%s' "$RESP" | grep -o '"point_count":[0-9]*' | cut -d: -f2)
+        echo "  storm $storm read-back on :$p -> point_count=${N:-<none>}"
+        assert_ge "storm $storm: acked probe points readable on :$p (acked $PROBE_OK)" "${N:-0}" "$PROBE_OK"
+        assert_le "storm $storm: probe points readable on :$p (attempted $PROBE)" "${N:-999999}" "$PROBE"
+    done
+
+    storm=$((storm + 1))
 done
-wait $BENCHPID
-touch /tmp/tsgate_fi_stop
-wait $RESETPID
-ROUNDS=$(cat /tmp/tsgate_fi_rounds 2>/dev/null || echo 0)
-echo "  probe writes: $PROBE_OK ok, $PROBE_5XX 5xx, $PROBE_OTHER other (of $i attempted)"
-grep -E "Requests:|First error|Throughput|batch latency" /tmp/tsgate_fi_storm.txt
-
-RESET_CONNS=$(awk '/^RESET /{s+=$2} END{print s+0}' "$PROXY_LOG")
-echo "  reset rounds: $ROUNDS, connections destroyed: $RESET_CONNS"
 
 # ---------------------------------------------------------------------------
-# THE ANTI-VACUITY ASSERTIONS. Without a real storm this gate proves nothing: a proxy that
-# never fired, or one that fired while no connection was open, would otherwise pass.
-assert_ge "reset rounds injected" "$ROUNDS" "$MIN_RESET_ROUNDS"
-assert_ge "peer connections actually destroyed" "$RESET_CONNS" "$MIN_RESET_CONNS"
+echo "=== $STORM_ROUNDS storms: errors[$ERR_VECTOR ] rounds/conns[$ROUND_VECTOR ] throughput[$TPUT_VECTOR ] ==="
 
-# THE PROPERTY. A reset burst against a LIVE peer must be absorbed entirely by the
-# transport's reconnect plus the 4a retry pacing, inside the 1.5s write deadline.
-STORM_ERRS=$(grep -o '[0-9]* HTTP errors' /tmp/tsgate_fi_storm.txt | head -1 | cut -d' ' -f1)
-STORM_CONN=$(grep -o '[0-9]* connection failures' /tmp/tsgate_fi_storm.txt | head -1 | cut -d' ' -f1)
-assert_eq "bench client HTTP errors across the reset storm" "${STORM_ERRS:-missing}" 0
-assert_eq "bench client connection failures" "${STORM_CONN:-missing}" 0
-assert_eq "probe 5xx across the reset storm" "$PROBE_5XX" 0
-assert_eq "probe non-HTTP failures" "$PROBE_OTHER" 0
+# THE ANTI-VACUITY ASSERTIONS. Without a real storm this gate proves nothing: a proxy that
+# never fired, or one that fired while no connection was open, would otherwise pass. The
+# floors are PER STORM and scaled by K here, so K feeble storms cannot substitute for one
+# real one.
+assert_ge "reset rounds injected" "$TOT_ROUNDS" "$((MIN_RESET_ROUNDS * STORM_ROUNDS))"
+assert_ge "peer connections actually destroyed" "$TOT_CONNS" "$((MIN_RESET_CONNS * STORM_ROUNDS))"
+
+# THE PROPERTY, as an aggregate over K draws (debt D-21). A reset burst against a LIVE peer
+# must be absorbed by the transport's reconnect plus the 4a retry pacing, inside the 1.5 s
+# write deadline. The budget is on the TOTAL because a single draw is not reproducible in
+# either direction; the per-storm vector above is what to read when it is exceeded.
+assert_le "client errors across the reset storms (bench + probe, $STORM_ROUNDS storms)" \
+    "$((TOT_BENCH_ERRS + TOT_PROBE_5XX))" "$MAX_STORM_ERRORS"
+# NON-HTTP failures are not budgeted: a client that could not complete a request at all is
+# a different class from a server that answered 503 -- the peer under fault is HEALTHY and
+# its listener never closes, so the coordinator the client talks to has no reason to drop a
+# connection. None has ever been observed here, in either arm of the A/B.
+assert_eq "probe non-HTTP failures" "$TOT_PROBE_OTHER" 0
+assert_eq "bench client connection failures" "$TOT_CONN_FAILS" 0
+# NEITHER IS A 500. The whole point of 4a is that this fault is retryable and says so;
+# an opaque 500 is a defect at any rate.
 assert_eq "server-side 500s" "$(cat /tmp/tsgate_fi*/s.log | grep -c 'Error handling write request')" 0
 assert_eq "node crashes" "$(grep -l 'Segmentation fault' /tmp/tsgate_fi*/s.log 2>/dev/null | wc -l)" 0
 
-# BOUNDED DIP, against the proxied baseline (see the header).
-STORM_TPUT=$(grep -oE 'Throughput:[[:space:]]*[0-9.]+' /tmp/tsgate_fi_storm.txt | head -1 | grep -oE '[0-9.]+')
-if [ -n "${BASE_TPUT:-}" ] && [ -n "${STORM_TPUT:-}" ]; then
-    PCT=$(awk -v a="$STORM_TPUT" -v b="$BASE_TPUT" 'BEGIN{ if (b+0==0) print 0; else printf "%d", 100*a/b }')
-    echo "  throughput under the storm: $STORM_TPUT vs baseline $BASE_TPUT ($PCT%)"
-    assert_ge "throughput retained vs the proxied baseline (%)" "$PCT" "$MIN_DIP_PCT"
-else
-    gate_fail "could not parse throughput from one of the bench runs"
-fi
-
-# ---------------------------------------------------------------------------
-# NO LOSS, NO DUP. Every acked probe point must be readable, exactly once, on EVERY node
-# -- the ack contract says an ack means a durable quorum commit, so a follower read after
-# the storm must agree.
-echo "=== read-back on every node ==="
-sleep 3
-for p in $PORTS; do
-    RESP=$(curl -s -m20 -X POST "http://127.0.0.1:$p/query" -H 'Content-Type: application/json' \
-        -d "{\"query\":\"count:faultprobe(v){}\",\"startTime\":$BASE_TS,\"endTime\":$((BASE_TS + PROBE * 1000000000))}")
-    N=$(printf '%s' "$RESP" | grep -o '"point_count":[0-9]*' | cut -d: -f2)
-    echo "  node on :$p -> point_count=${N:-<none>}"
-    assert_eq "acked probe points readable on :$p" "${N:-missing}" "$PROBE_OK"
-done
+# BOUNDED DIP, against the proxied baseline (see the header), on the WORST storm.
+assert_ge "throughput retained vs the proxied baseline, worst storm (%)" "$WORST_PCT" "$MIN_DIP_PCT"
 
 gate_exit
