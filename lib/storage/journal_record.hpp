@@ -53,6 +53,12 @@ struct JournalRecord {
     void encodeInto(std::string& out) const;
     [[nodiscard]] std::string encode() const;
 
+    // What encodeInto() will append, exactly, without encoding anything (debt D-32).
+    // A caller that needs the SIZE before the bytes -- JournalWriter::append, which
+    // decides whether to rotate the segment first -- can now stream the record straight
+    // into its buffer instead of encoding to a temporary and copying it in.
+    [[nodiscard]] size_t encodedBytes() const { return kFrameHeaderBytes + kBodyHeaderBytes + payload.size(); }
+
     // Decode one frame from the front of `data`. On success returns the record
     // and sets `consumed` to the total frame length so a caller can iterate a
     // buffer of concatenated records. Returns nullopt on: truncated input, a

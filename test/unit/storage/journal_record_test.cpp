@@ -175,3 +175,48 @@ TEST(JournalRecordTest, OutOfRangeOrReservedVShardIsRejected) {
 }
 
 }  // namespace
+
+// ---------------------------------------------------------------------------
+// Streaming encode (debt D-32)
+// ---------------------------------------------------------------------------
+
+// encodeInto() used to build the body in a scratch string and append it, i.e. one whole
+// extra copy of the payload per record -- nothing for a write batch, a second copy of a
+// whole VShard snapshot for a Snapshot record. It now writes straight into `out` and
+// PATCHES the CRC field in place, which is only correct if the patch lands on the right
+// four bytes of a buffer that may ALREADY have records in it. That is what this pins.
+TEST(JournalRecordTest, EncodeIntoANonEmptyBufferPatchesTheRightCrcAndStaysDecodable) {
+    const JournalRecord a = sample(3, 1, JournalRecordKind::Data, "first record's payload"s);
+    const JournalRecord b = sample(4, 2, JournalRecordKind::Snapshot, std::string(9000, '\x5a'));
+
+    std::string buf = "PRE-EXISTING SEGMENT BYTES";
+    const size_t prefix = buf.size();
+    a.encodeInto(buf);
+    b.encodeInto(buf);
+
+    // Appending into a buffer is exactly concatenating the standalone encodings.
+    EXPECT_EQ(buf, "PRE-EXISTING SEGMENT BYTES"s + a.encode() + b.encode());
+
+    // ...and both decode, which is what proves the CRC was patched at the right offset in
+    // each frame rather than at the head of the buffer.
+    size_t consumed = 0;
+    auto ra = JournalRecord::decode(std::span<const char>(buf.data() + prefix, buf.size() - prefix), consumed);
+    ASSERT_TRUE(ra.has_value());
+    EXPECT_EQ(ra->payload, "first record's payload");
+    const size_t first = consumed;
+    auto rb = JournalRecord::decode(std::span<const char>(buf.data() + prefix + first, buf.size() - prefix - first),
+                                    consumed);
+    ASSERT_TRUE(rb.has_value());
+    EXPECT_EQ(rb->payload, std::string(9000, '\x5a'));
+    EXPECT_EQ(rb->kind, JournalRecordKind::Snapshot);
+}
+
+// The size a caller can act on BEFORE the bytes exist -- JournalWriter::append decides
+// whether to rotate the segment from this, then streams the record into its buffer. If it
+// ever disagreed with the real encoding, a record would straddle a segment boundary.
+TEST(JournalRecordTest, EncodedBytesMatchesTheRealEncodingForEveryPayloadShape) {
+    for (const std::string& payload : {""s, "x"s, std::string(27, 'q'), std::string(65537, '\x01')}) {
+        const JournalRecord r = sample(9, 5, JournalRecordKind::Data, payload);
+        EXPECT_EQ(r.encodedBytes(), r.encode().size()) << "payload size " << payload.size();
+    }
+}

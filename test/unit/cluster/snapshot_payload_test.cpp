@@ -26,8 +26,7 @@ VShardSnapshotManifest validManifest() {
 TEST(SnapshotPayloadCodec, RoundTripsManifestAndFiles) {
     SnapshotPayload p;
     p.manifest = validManifest();
-    p.files = {{"0_0.tsm", std::string("\x00\x01\x02binary tsm bytes", 20)},
-               {"1_0.tsm", "another file's contents"}};
+    p.files = {{"0_0.tsm", std::string("\x00\x01\x02binary tsm bytes", 20)}, {"1_0.tsm", "another file's contents"}};
 
     auto back = decodeSnapshotPayload(encodeSnapshotPayload(p));
     ASSERT_TRUE(back.has_value());
@@ -71,4 +70,44 @@ TEST(SnapshotPayloadCodec, TruncationAndCorruptionRejected) {
     for (int i = 0; i < 8; ++i)
         badManifest[badManifest.size() - 8 + i] = static_cast<char>((h >> (8 * i)) & 0xff);
     EXPECT_FALSE(decodeSnapshotPayload(badManifest).has_value()) << "corrupt inner manifest must be rejected";
+}
+
+// ---------------------------------------------------------------------------
+// The CONSUMING overload (debt D-32)
+// ---------------------------------------------------------------------------
+
+// The producer used to hold the payload TWICE at its peak: `encodeSnapshotPayload` took a
+// const&, so `snapshotVShard`'s `std::move` was dead and every file was copied into the
+// output while the input stayed fully resident. This overload must produce the same bytes
+// and must actually release the input as it goes -- both halves matter, because the
+// output being right is what makes it safe and the input being released is the whole
+// point.
+TEST(SnapshotPayloadCodec, TheConsumingOverloadIsByteIdenticalAndDrainsItsInput) {
+    SnapshotPayload p;
+    p.manifest = validManifest();
+    p.files = {{"0_0.tsm", std::string(4096, '\x7f')},
+               {"1_0.tsm", std::string("\x00\x01\x02binary tsm bytes", 20)},
+               {"2_0.tsm", ""}};
+    SnapshotPayload copy = p;
+
+    const std::string byRef = encodeSnapshotPayload(p);
+    const std::string byMove = encodeSnapshotPayload(std::move(copy));
+    EXPECT_EQ(byRef, byMove) << "the consuming overload must not change the wire format";
+
+    // ...and the input's file bodies are gone, which is the memory claim.
+    ASSERT_EQ(copy.files.size(), 3u);
+    for (const auto& f : copy.files)
+        EXPECT_TRUE(f.bytes.empty()) << "file " << f.name << " was not released";
+    // Names are left alone (they are tiny, and clearing them would make the drained
+    // payload unloggable).
+    EXPECT_EQ(copy.files[0].name, "0_0.tsm");
+
+    // The const& source is untouched, so callers that keep their payload still can.
+    EXPECT_EQ(p.files[0].bytes.size(), 4096u);
+
+    auto back = decodeSnapshotPayload(byMove);
+    ASSERT_TRUE(back.has_value());
+    ASSERT_EQ(back->files.size(), 3u);
+    EXPECT_EQ(back->files[0].bytes, std::string(4096, '\x7f'));
+    EXPECT_EQ(back->files[2].bytes, "");
 }

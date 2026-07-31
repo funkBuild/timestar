@@ -54,18 +54,28 @@ void JournalRecord::encodeInto(std::string& out) const {
     assert(vshard.valid() && "encoding a JournalRecord with an out-of-range VShard id");
     assert(payload.size() <= static_cast<size_t>(UINT32_MAX) - kBodyHeaderBytes && "journal payload too large");
 
-    std::string body;
-    body.reserve(kBodyHeaderBytes + payload.size());
-    putU16(body, vshard.value());
-    putU64(body, vshardSeq);
-    putU64(body, raftTerm);
-    putU64(body, raftIndex);
-    body.push_back(static_cast<char>(kind));
-    body.append(payload);
-
-    putU32(out, static_cast<uint32_t>(body.size()));
-    putU32(out, CRC32::compute(body.data(), body.size()));
-    out.append(body);
+    // STRAIGHT INTO `out`, not via a `body` scratch string (debt D-32). The scratch cost a
+    // full copy of the payload on every append -- invisible for a 1 KiB write batch, a
+    // whole extra copy of a snapshot payload (up to kMaxVShardSnapshotBytes) for a Snapshot
+    // record. The frame header has to be written before the body it describes and the CRC
+    // is only known after, so the CRC field is reserved and PATCHED IN PLACE; the length is
+    // known up front from encodedBytes()'s arithmetic.
+    const size_t bodyLen = kBodyHeaderBytes + payload.size();
+    out.reserve(out.size() + kFrameHeaderBytes + bodyLen);
+    putU32(out, static_cast<uint32_t>(bodyLen));
+    const size_t crcOff = out.size();
+    putU32(out, 0);  // patched below
+    const size_t bodyOff = out.size();
+    putU16(out, vshard.value());
+    putU64(out, vshardSeq);
+    putU64(out, raftTerm);
+    putU64(out, raftIndex);
+    out.push_back(static_cast<char>(kind));
+    out.append(payload);
+    assert(out.size() - bodyOff == bodyLen && "encodedBytes() and encodeInto() disagree");
+    const uint32_t crc = CRC32::compute(out.data() + bodyOff, bodyLen);
+    for (int i = 0; i < 4; ++i)
+        out[crcOff + i] = static_cast<char>((crc >> (i * 8)) & 0xff);
 }
 
 std::string JournalRecord::encode() const {

@@ -170,8 +170,30 @@ inline constexpr size_t kMaxSnapshotChunkBytes = size_t{4} << 20;
 // `EngineLocalStore::buildVShardSnapshot` materializes the whole payload (manifest plus
 // every referenced TSM file's bytes) in RAM on the producer, `RaftNode` holds it in
 // `snapshot_` for as long as it is servable, and the receiver stages the whole thing in
-// RAM before installing it. Three copies of an unbounded payload on a reactor with a
-// fixed memory pool is an OOM, not a slow transfer.
+// RAM before installing it. Copies of an unbounded payload on a reactor with a fixed
+// memory pool are an OOM, not a slow transfer.
+//
+// THE MULTIPLE IS NOT THREE (debt D-32, correcting what this comment said). D-5 wrote
+// "three copies" from the three PLACES a payload lives; counting what is CONCURRENT on
+// each path found seven on the producer and eight on the receiver, because the journal
+// record encode chain re-materialized it several times over. D-32 removed four of them
+// (the producer's dead `std::move` into the payload encoder, the journal record's `body`
+// scratch, the journal writer's `encode()` temporary, and the receiver's copy into
+// `applySnapshot`); the remainder, all still concurrent during the journal append:
+//
+//   producer  ~4x: snapshot_.data | persistSnapshot's by-value Snapshot |
+//                  JournalRecord::payload | JournalWriter::tail_
+//   receiver  ~6x: the four above, plus pendingSnapshotApply_ and Ready::snapshot,
+//                  which are two live things by contract (servable state vs undrained
+//                  Ready output) and can only be collapsed by sharing the buffer
+//
+// So the bound STAYS AT 128 MiB rather than rising: the multiple it was set against was
+// understated, and 4-6x of 128 MiB is already 0.5-0.75 GiB on one reactor. Raising it
+// waits on the structural fix D-32 names -- streaming to and from DISK, after which this
+// is a disk bound -- or on making `Snapshot::data` a shared buffer, which would collapse
+// the receiver's two contract-mandated copies into refcounts. NOTE that the multiples
+// above are a CENSUS OF THE CODE, not a measurement: no RSS number has ever been taken on
+// this path.
 //
 // So the compaction refusal SURVIVES D-5 but changes meaning and RISES: it was
 // "> kMaxRaftPayloadBytes, because no single message could carry it" (which after the

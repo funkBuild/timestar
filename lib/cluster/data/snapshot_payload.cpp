@@ -81,6 +81,30 @@ std::string encodeSnapshotPayload(const SnapshotPayload& payload) {
     return out;
 }
 
+std::string encodeSnapshotPayload(SnapshotPayload&& payload) {
+    const std::string manifest = payload.manifest.encode();
+    // Exactly what the const& overload will have written, computed before writing a byte:
+    // manifest blob + file count + per file (name blob + bytes blob) + the FNV trailer.
+    size_t total = 8 + manifest.size() + 4 + 8;
+    for (const auto& f : payload.files)
+        total += 8 + f.name.size() + 8 + f.bytes.size();
+
+    std::string out;
+    out.reserve(total);
+    putBlob(out, manifest);
+    putU32(out, static_cast<uint32_t>(payload.files.size()));
+    for (auto& f : payload.files) {
+        putBlob(out, f.name);
+        putBlob(out, f.bytes);
+        // Release as we go: this is the whole point of the overload. Without the swap the
+        // input is still fully resident when the last file is appended, which is the 2x
+        // peak the const& overload has.
+        std::string().swap(f.bytes);
+    }
+    putU64(out, fnv1a(out.data(), out.size()));
+    return out;
+}
+
 std::optional<SnapshotPayload> decodeSnapshotPayload(const std::string& bytes) {
     if (bytes.size() < 8)
         return std::nullopt;

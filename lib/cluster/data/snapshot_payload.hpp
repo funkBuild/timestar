@@ -35,4 +35,21 @@ struct SnapshotPayload {
 std::string encodeSnapshotPayload(const SnapshotPayload& payload);
 std::optional<SnapshotPayload> decodeSnapshotPayload(const std::string& bytes);
 
+// CONSUMING overload (debt D-32). Byte-for-byte identical output; the difference is
+// what is resident while it runs.
+//
+// The const& overload copies every file into the output, so the producer holds the whole
+// payload TWICE at its peak -- and it grows the output geometrically from empty, so the
+// realloc that crosses the last power of two briefly holds a third partial copy. It is
+// the biggest single term in the memory multiple that `kMaxVShardSnapshotBytes` exists to
+// bound, and it is pure waste on the one caller that matters: `snapshotVShard` builds a
+// payload, encodes it, and never looks at it again.
+//
+// This overload reserves the exact size up front (no growth spikes) and RELEASES each
+// file's bytes as it appends them, so peak residency is the output plus one file rather
+// than the output plus the whole input. `payload` is left valid but unspecified -- its
+// file bodies are gone. The const& overload stays for the callers that keep their payload
+// (tests, and anything that encodes to compare).
+std::string encodeSnapshotPayload(SnapshotPayload&& payload);
+
 }  // namespace timestar::data

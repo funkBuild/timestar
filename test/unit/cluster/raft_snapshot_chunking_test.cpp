@@ -990,3 +990,55 @@ TEST(RaftSnapshotChunkingTest, ChunkingDisabledKeepsThePreD5SingleMessageBehavio
     EXPECT_GT(tight.node(1).undeliverableSnapshots(), 0u);
     EXPECT_EQ(tight.node(1).snapshotChunksSent(), 0u);
 }
+
+// ---------------------------------------------------------------------------
+// The driver may CONSUME the Ready's snapshot (debt D-32)
+// ---------------------------------------------------------------------------
+
+// `RaftGroup::drainReady` now MOVES `*rd.snapshot` into `applySnapshot` instead of copying
+// it -- a whole payload saved on the receiver, which is where the copies are most
+// concentrated. That is only sound if two things hold, and neither is stated anywhere the
+// mover can see, so they are pinned here:
+//
+//   1. the node's own SERVABLE snapshot is a different object, so a driver that consumed
+//      its Ready has not emptied what this node would serve a follower from;
+//   2. `advance()` only needs to know WHETHER the Ready carried a snapshot, not what was
+//      in it -- a moved-from optional is still engaged, and the pending-apply state must
+//      still clear.
+TEST(RaftSnapshotChunkingTest, ConsumingTheReadySnapshotLeavesTheServableOneIntact) {
+    RaftNode n(1, {1, 2, 3}, RaftLog{}, HardState{}, chunkedOpts(0));  // one-message snapshot
+    const std::string full = payloadOf(64);
+
+    InstallSnapshot is;
+    is.term = 2;
+    is.leaderId = 2;
+    is.lastIncludedIndex = 11;
+    is.lastIncludedTerm = 2;
+    is.config.voters = {1, 2, 3};
+    is.data = full;
+    is.offset = 0;
+    is.totalBytes = full.size();
+    is.done = true;
+    n.step(Message{.to = 1, .from = 2, .payload = is});
+    ASSERT_EQ(n.snapshotsInstalled(), 1u);
+
+    RaftNode::Ready rd = n.ready();
+    ASSERT_TRUE(rd.snapshot.has_value());
+    EXPECT_EQ(rd.snapshot->data, full);
+
+    // What the driver does with it: take the bytes.
+    const Snapshot consumed = std::move(*rd.snapshot);
+    EXPECT_EQ(consumed.data, full);
+    EXPECT_EQ(consumed.index, 11u);
+    ASSERT_TRUE(rd.snapshot.has_value()) << "a moved-from optional is still engaged -- advance() reads only that";
+
+    n.advance(rd);
+
+    // 1. The servable snapshot is untouched: a follower asking this node for a snapshot
+    //    still gets the payload, not an empty string.
+    EXPECT_EQ(n.servableSnapshot().data, full);
+    EXPECT_EQ(n.servableSnapshot().index, 11u);
+    // 2. The pending-apply state cleared, so the same snapshot is not reported twice.
+    RaftNode::Ready again = n.ready();
+    EXPECT_FALSE(again.snapshot.has_value());
+}

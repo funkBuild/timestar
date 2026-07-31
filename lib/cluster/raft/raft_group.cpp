@@ -119,8 +119,16 @@ seastar::future<> RaftGroup::drainReady() {
 
         // 3. Apply committed output to the state machine (snapshot install first).
         if (rd.snapshot) {
-            co_await sm_.applySnapshot(*rd.snapshot);
-            appliedIndex_ = std::max<uint64_t>(appliedIndex_, rd.snapshot->index);
+            // MOVE, not copy (debt D-32). `applySnapshot` takes its Snapshot by value, so
+            // an lvalue here duplicated the whole payload -- on the receiver, where two
+            // copies (`snapshot_` and `pendingSnapshotApply_`) are already resident. This
+            // is the payload's LAST use in this iteration: the index is read first, and
+            // `advance` only tests whether rd.snapshot is engaged, which a moved-from
+            // optional still is. It must NOT be moved into `persistSnapshot` above --
+            // that one runs first and this one needs the bytes.
+            const uint64_t snapIndex = rd.snapshot->index;
+            co_await sm_.applySnapshot(std::move(*rd.snapshot));
+            appliedIndex_ = std::max<uint64_t>(appliedIndex_, snapIndex);
         }
         const uint64_t tA0 = profileEnabled() ? nowNs() : 0;
         for (auto& e : rd.committed) {

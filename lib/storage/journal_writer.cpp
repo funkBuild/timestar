@@ -179,12 +179,17 @@ seastar::future<> JournalWriter::append(const JournalRecord& record) {
     if (!opened_)
         throw std::logic_error("JournalWriter::append before open");
 
-    const std::string bytes = record.encode();
+    // The SIZE without the bytes (debt D-32): this used to encode the record into a
+    // temporary and then copy that temporary into `tail_`, i.e. one whole extra copy of
+    // every payload -- negligible for a write batch, a second copy of a whole VShard
+    // snapshot for a Snapshot record. `encodedBytes()` is the arithmetic the rotation
+    // decision actually needs, and the record then streams straight into `tail_`.
+    const size_t bytes = record.encodedBytes();
     // Rotate before writing if this record would push the current segment past
     // its target (a record never straddles a segment). A fresh segment holds
     // only the header, so a single record always fits (payloads are bounded well
     // below segmentBytes by the write-batch limit).
-    if (logicalLen() + bytes.size() > segmentBytes_ && logicalLen() > JournalSegmentHeader::kEncodedBytes) {
+    if (logicalLen() + bytes > segmentBytes_ && logicalLen() > JournalSegmentHeader::kEncodedBytes) {
         try {
             co_await sealCurrent();  // flush + truncate + close the full segment
             co_await startSegment(currentSegment_ + 1);
@@ -195,7 +200,7 @@ seastar::future<> JournalWriter::append(const JournalRecord& record) {
         }
     }
 
-    tail_.append(bytes);  // buffered; made durable (and full blocks finalised) at the next barrier
+    record.encodeInto(tail_);  // buffered; made durable (and full blocks finalised) at the next barrier
 }
 
 seastar::future<> JournalWriter::barrier() {

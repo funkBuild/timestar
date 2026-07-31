@@ -36,9 +36,18 @@ std::vector<std::string> splitLines(const std::string& data) {
 
 class NoopPersistence : public RaftPersistence {
 public:
+    // The snapshot payloads this persistence was handed, in order. Recorded (rather than
+    // discarded like the rest) because `drainReady` persists and then applies the SAME
+    // Snapshot, and debt D-32 made the second of those a MOVE -- so "both saw the whole
+    // payload" is now an invariant with a way to break it. See
+    // testAReceivedSnapshotIsPersistedAndAppliedWithItsWholePayload.
+    std::vector<std::string> snapshots;
     seastar::future<> persistHardState(HardState) override { return seastar::make_ready_future<>(); }
     seastar::future<> persistEntries(std::vector<LogEntry>) override { return seastar::make_ready_future<>(); }
-    seastar::future<> persistSnapshot(Snapshot, bool) override { return seastar::make_ready_future<>(); }
+    seastar::future<> persistSnapshot(Snapshot s, bool) override {
+        snapshots.push_back(std::move(s.data));
+        return seastar::make_ready_future<>();
+    }
     seastar::future<> sync() override { return seastar::make_ready_future<>(); }
 };
 
@@ -89,6 +98,7 @@ public:
 
     RaftGroup& group(NodeId id) { return *groups_.at(id); }
     const std::vector<std::string>& applied(NodeId id) const { return sm_.at(id)->applied; }
+    const std::vector<std::string>& persistedSnapshots(NodeId id) const { return persistence_.at(id)->snapshots; }
 
     void enqueue(Envelope e) { queue_.push_back(std::move(e)); }
 
@@ -173,6 +183,40 @@ seastar::future<> testElectionViaTicks() {
     EXPECT_EQ(net.applied(net.leader()).size(), 1u);
 }
 
+// PERSIST AND APPLY BOTH GET THE WHOLE PAYLOAD (debt D-32). `drainReady` hands the same
+// Snapshot to `persistSnapshot` and then to `applySnapshot`, and both take it BY VALUE.
+// D-32 turned the second into a MOVE, which is the saving -- and which makes "persist must
+// not be the one that moves" a live rule rather than an observation: swapping them leaves
+// the state machine installing an EMPTY snapshot, i.e. a replica that reports itself
+// caught up over a hole, with nothing else in this suite noticing.
+seastar::future<> testASnapshotIsPersistedAndAppliedWithItsWholePayload() {
+    GroupNetwork net({1, 2, 3}, opts());
+    const std::string payload = "alpha\nbeta\ngamma\n";
+
+    InstallSnapshot is;
+    is.term = 1;
+    is.leaderId = 2;
+    is.lastIncludedIndex = 4;
+    is.lastIncludedTerm = 1;
+    is.config.voters = {1, 2, 3};
+    is.data = payload;
+    is.offset = 0;
+    is.totalBytes = payload.size();
+    is.done = true;
+    co_await net.group(1).step(Message{.to = 1, .from = 2, .payload = is});
+    co_await net.pump();
+
+    // ASSERT_* cannot be used in a coroutine (it returns void), so guard explicitly.
+    EXPECT_EQ(net.persistedSnapshots(1).size(), 1u);
+    if (net.persistedSnapshots(1).size() != 1u)
+        co_return;
+    EXPECT_EQ(net.persistedSnapshots(1)[0], payload) << "the journal must get the whole payload";
+    EXPECT_EQ(net.applied(1), (std::vector<std::string>{"alpha", "beta", "gamma"}))
+        << "the state machine must get the whole payload too -- an empty install here is silent loss";
+    // The core still holds it as SERVABLE state, so this node can catch a follower up.
+    EXPECT_EQ(net.group(1).node().servableSnapshot().data, payload);
+}
+
 seastar::future<> testConfChangeThroughDriver() {
     GroupNetwork net({1, 2, 3}, opts());
     co_await net.group(1).campaign();
@@ -249,6 +293,10 @@ TEST(RaftGroupTest, ElectsAndReplicatesThroughTheAsyncDriver) {
 
 TEST(RaftGroupTest, ElectsViaTimerTicks) {
     testElectionViaTicks().get();
+}
+
+TEST(RaftGroupTest, AReceivedSnapshotIsPersistedAndAppliedWithItsWholePayload) {
+    testASnapshotIsPersistedAndAppliedWithItsWholePayload().get();
 }
 
 TEST(RaftGroupTest, ConfigChangeThroughTheAsyncDriver) {

@@ -181,7 +181,10 @@ seastar::future<> ReplicatedVShardHost::addVShard(uint16_t vshard, std::vector<N
             "this replica reporting itself caught up over a hole",
             vshard, st.snapshot->index, st.snapshot->term);
         co_await vs.sm->applySnapshot(*st.snapshot);
-        node.seedRecoveredSnapshot(*st.snapshot);
+        // MOVE on the LAST use (debt D-32): `seedRecoveredSnapshot` takes its Snapshot by
+        // value, so an lvalue duplicated the whole payload once per recovered group -- on
+        // the startup path, where a shard opens ~1365 of them.
+        node.seedRecoveredSnapshot(std::move(*st.snapshot));
     } else if (st.snapshot) {
         // RECOVERING A LOCALLY-PRODUCED SNAPSHOT (debt D-6). This used to throw outright --
         // which was correct while nothing ever compacted, and would have turned the FIRST
@@ -205,11 +208,15 @@ seastar::future<> ReplicatedVShardHost::addVShard(uint16_t vshard, std::vector<N
         //
         // (The log suffix ABOVE the boundary replays as usual, which is what covers the
         // unflushed writes the boundary was chosen to exclude.)
-        node.seedRecoveredSnapshot(*st.snapshot);
+        // Read what the log line needs BEFORE the move (debt D-32) -- see the received
+        // branch above for why the move is worth having.
+        const uint64_t snapIndex = st.snapshot->index;
+        const uint64_t snapTerm = st.snapshot->term;
+        node.seedRecoveredSnapshot(std::move(*st.snapshot));
         timestar::http_log.info(
             "cluster: VShard {} recovered from a compacted journal at boundary index {} (term {}); the local Engine "
             "already holds the flushed data the snapshot describes, so only the log suffix above it is replayed",
-            vshard, st.snapshot->index, st.snapshot->term);
+            vshard, snapIndex, snapTerm);
     }
     registry_.addGroup(vshard, std::move(node), *vs.persistence, *vs.sm);
     vshards_[vshard] = std::move(vs);
@@ -296,6 +303,11 @@ seastar::future<uint64_t> ReplicatedVShardHost::snapshotVShard(uint16_t vshard) 
         ++snapshotsSkippedNoAdvance_;
         co_return 0;
     }
+    // CONSUMING encode (debt D-32). This `std::move` used to be dead -- the only overload
+    // took a const&, so the rvalue bound to it and every file was copied, leaving the
+    // producer holding the payload twice with `payload` still alive for the whole
+    // compaction below it. It now really does consume: `payload`'s file bodies are gone
+    // when this returns.
     std::string encoded = data::encodeSnapshotPayload(std::move(payload));
     // REFUSE TO COMPACT INTO A SNAPSHOT NOBODY CAN RECEIVE (write-scaleout 5 review, F3c).
     // Compaction is the point of no return: it DISCARDS the log prefix this snapshot
@@ -312,9 +324,12 @@ seastar::future<uint64_t> ReplicatedVShardHost::snapshotVShard(uint16_t vshard) 
     // It is now `kMaxVShardSnapshotBytes` (128 MiB), which is a MEMORY bound rather than a
     // message bound: `buildVShardSnapshot` materializes the whole payload in RAM here, the
     // leader holds it for as long as it is servable, and the receiver stages it in RAM
-    // before installing. Three copies of an unbounded payload on a reactor with a fixed
-    // memory pool is an OOM. That is a ~4.5x RISE over the old effective ceiling, so
-    // snapshots that used to block compaction now ship -- as a pipeline of 4 MiB chunks.
+    // before installing. Copies of an unbounded payload on a reactor with a fixed memory
+    // pool are an OOM. That is a ~4.5x RISE over the old effective ceiling, so snapshots
+    // that used to block compaction now ship -- as a pipeline of 4 MiB chunks.
+    //
+    // D-32 removed four of the concurrent copies and left the bound where it is; the
+    // corrected census (and why the number stays) is at kMaxVShardSnapshotBytes.
     if (encoded.size() > raft::kMaxVShardSnapshotBytes) {
         timestar::http_log.error(
             "cluster: NOT compacting VShard {}: its snapshot is {} bytes, over the {} byte total-snapshot bound, so it "
