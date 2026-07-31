@@ -1003,6 +1003,100 @@ seastar::future<> testOverloadedPeerThatDrainsIsAbsorbed() {
     EXPECT_TRUE(local.wakes.empty());
 }
 
+// ---------------------------------------------------------------------------
+// AN UNCOMMITTED SLICE THAT NO REJECT NAMES MUST NOT BE ELECTION-SHAPED BY OMISSION
+// (debt D-28, filed from the Phase-5 review as F10).
+//
+// The router records a failure class per REJECT. A sink that names SOME of its
+// uncommitted slices therefore left the UNNAMED ones carrying whatever the last named
+// reject said -- and if that was election-shaped, the whole batch could ride the 6 s D-14
+// window for a failure nobody claimed was an election. The direction of the error was
+// always wait-longer and never ack (an unclassified slice is still uncommitted and still
+// retried), which is why this was filed rather than fixed as a live bug: both in-tree
+// sinks name every slice they fail or none of them.
+//
+// A sink that reports a strict subset is exactly the future sink the row is about.
+class PartiallyExplainingSink : public ProposeSink {
+public:
+    unsigned attempts = 0;
+    seastar::future<bool> proposeBatch(WriteBatch) override {
+        return seastar::make_exception_future<bool>(std::runtime_error("unused"));
+    }
+    seastar::future<ProposeOutcome> proposeVShardBatchesHinted(VShardBatchView view, OptDeadline) override {
+        ++attempts;
+        ProposeOutcome out;
+        out.committed = false;  // nothing committed, ever
+        // ...but only the FIRST slice is given a reason, and that reason is
+        // election-shaped. Every other slice of the view is uncommitted and unexplained.
+        if (!view.empty())
+            out.rejects.push_back(SliceReject{view.front()->first, timestar::raft::kNoNode, WriteFailure::NotLeader});
+        return seastar::make_ready_future<ProposeOutcome>(std::move(out));
+    }
+};
+
+seastar::future<> testUnexplainedUncommittedSlicesDoNotBuyTheElectionWindow() {
+    VShardDirectory dir(1, allLocalMap());
+    WriteBatch batch = manySeries(30);  // many VShards, so the unnamed remainder is large
+    PartiallyExplainingSink local;
+    ScriptedTransport client;
+    MapLeaderResolver leaders;
+    for (uint16_t v : vshardsOf(batch))
+        leaders.leaders[v] = 1;  // we lead everything: no remote leg to muddy the classes
+    EXPECT_GT(vshardsOf(batch).size(), 1u) << "the batch must span more than the one named slice";
+
+    ReplicatedBatchWriteRouter router(dir, local, client, leaders);
+    const auto t0 = std::chrono::steady_clock::now();
+    EXPECT_THROW(co_await router.write(std::move(batch)), RetryableWriteError);
+    const auto ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+
+    EXPECT_LT(ms, ReplicatedBatchWriteRouter::kElectionDeadline.count())
+        << "slices nobody classified inherited the named reject's election-shaped label (" << ms << " ms)";
+    EXPECT_LT(ms, 2500) << "it must fail on the BASE deadline (~1.5 s): the unnamed remainder is Transport, "
+                        << "the ambiguous default, not an election";
+    EXPECT_LE(local.attempts, ReplicatedBatchWriteRouter::kMaxAttempts)
+        << "the batch spent the EXTENDED attempt budget on an unexplained failure";
+}
+
+// The other arm, unchanged and deliberately different: a target that names NOTHING AT ALL
+// gave one uniform answer about the whole dispatch, and the only sink that can (the bool
+// shim over a pre-v3 peer) means precisely "I did not lead these". That stays NotLeader,
+// election-shaped, so a group mid-election is still waited out.
+class SilentSink : public ProposeSink {
+public:
+    unsigned attempts = 0;
+    unsigned commitFromAttempt = 8;
+    seastar::future<bool> proposeBatch(WriteBatch) override {
+        return seastar::make_exception_future<bool>(std::runtime_error("unused"));
+    }
+    seastar::future<ProposeOutcome> proposeVShardBatchesHinted(VShardBatchView view, OptDeadline) override {
+        ProposeOutcome out;
+        if (++attempts >= commitFromAttempt) {
+            for (const auto* g : view)
+                out.committedVShards.push_back(g->first);
+            out.committed = true;
+        }
+        return seastar::make_ready_future<ProposeOutcome>(std::move(out));  // no rejects, ever
+    }
+};
+
+seastar::future<> testASilentTargetIsStillTreatedAsNotLeader() {
+    VShardDirectory dir(1, allLocalMap());
+    WriteBatch batch = manySeries(4);
+    SilentSink local;
+    ScriptedTransport client;
+    MapLeaderResolver leaders;
+    for (uint16_t v : vshardsOf(batch))
+        leaders.leaders[v] = 1;
+
+    ReplicatedBatchWriteRouter router(dir, local, client, leaders);
+    co_await router.write(std::move(batch));  // must NOT throw
+    EXPECT_EQ(local.attempts, 8u) << "a wholly silent refusal lost its NotLeader label and gave up inside the "
+                                  << "base budget";
+    EXPECT_GT(local.attempts, ReplicatedBatchWriteRouter::kMaxAttempts)
+        << "it committed inside the BASE attempt budget, so this proves nothing about the election window";
+}
+
 // The pacing table itself: fast while a transfer is plausible, then spanning an election.
 TEST(WriteRetryPacing, ElectionShapedClassesEscalateAfterTheFastRetries) {
     for (auto f : {WriteFailure::NotLeader, WriteFailure::LeaderRefused, WriteFailure::LeadershipLost}) {
@@ -1038,6 +1132,13 @@ TEST(ReplicatedBatchWriteRouterTest, LocalFailureDoesNotWake) {
 }
 TEST(ReplicatedBatchWriteRouterTest, RecoveredBlipNeverWakes) {
     testRecoveredBlipNeverWakes().get();
+}
+
+TEST(ReplicatedBatchWriteRouterTest, UnexplainedUncommittedSlicesDoNotBuyTheElectionWindow) {
+    testUnexplainedUncommittedSlicesDoNotBuyTheElectionWindow().get();
+}
+TEST(ReplicatedBatchWriteRouterTest, ASilentTargetIsStillTreatedAsNotLeader) {
+    testASilentTargetIsStillTreatedAsNotLeader().get();
 }
 
 TEST(ReplicatedBatchWriteRouterTest, OverloadedPeerFailsRetryablyOnTheBaseDeadline) {

@@ -181,9 +181,16 @@ seastar::future<> ReplicatedBatchWriteRouter::write(VShardBatches groups) {
                 std::set<uint16_t> askedHere;
                 for (const auto* g : *pendingViews[i])
                     askedHere.insert(g->first);
+                // Which of OUR uncommitted slices did this target actually give a reason
+                // for? Tracked so the remainder can be classified EXPLICITLY below
+                // (debt D-28) instead of silently keeping whatever the last named reject
+                // said.
+                std::set<uint16_t> explainedHere;
                 for (const auto& r : out.rejects) {
                     lastKind = r.kind;
                     noteKind(r.kind);
+                    if (askedHere.count(r.vshard) && !committedHere.count(r.vshard))
+                        explainedHere.insert(r.vshard);
                     // A HINT NAMING THE REJECTER IS NOT A HINT (write-scaleout 5 review,
                     // F1). A target that just refused a slice and then says "the leader is
                     // me" sends the retry straight back to itself: the slice re-buckets to
@@ -196,14 +203,41 @@ seastar::future<> ReplicatedBatchWriteRouter::write(VShardBatches groups) {
                     if (r.leaderHint != kNoNode && r.leaderHint != pendingTargets[i] && askedHere.count(r.vshard))
                         nextHints[r.vshard] = r.leaderHint;
                 }
-                // A target that named NO reason at all is treated as a plain not-leader:
-                // the slices are uncommitted and the retry goes elsewhere immediately.
-                // This must stay INSIDE the "named nothing" case -- applying it
-                // unconditionally MANUFACTURED the label, so a 503 said "not-leader"
-                // whatever the target actually reported.
-                if (out.rejects.empty()) {
-                    lastKind = WriteFailure::NotLeader;
-                    noteKind(WriteFailure::NotLeader);
+                // EVERY UNCOMMITTED SLICE GETS A CLASS, AND IT IS NEVER ONE IT INHERITED
+                // (debt D-28). The kinds above are recorded per REJECT, so a slice this
+                // target left uncommitted AND unnamed used to carry whatever the last
+                // named reject happened to say -- an election-shaped label bought by
+                // omission, which is exactly what the 6 s D-14 window must not be
+                // reachable by. There are two silences and they mean different things:
+                //
+                //   * The target named NOTHING AT ALL. It reported one uniform answer
+                //     about the whole dispatch and gave no reason, and the only sink that
+                //     can (the legacy bool shim over a pre-v3 peer) means precisely "I did
+                //     not lead these". Treated as a plain NotLeader, so the retry
+                //     re-resolves and goes elsewhere at once. Unchanged, and it must stay
+                //     INSIDE the "named nothing" case -- applying it unconditionally
+                //     MANUFACTURED the label, so a 503 said "not-leader" whatever the
+                //     target actually reported.
+                //
+                //   * The target explained SOME slices and not others. It has demonstrated
+                //     it can explain, so its silence about the rest is genuinely unknown
+                //     -- not evidence of an election. Those get `Transport`, the ambiguous
+                //     retryable default: still retried (an unclassified slice is still
+                //     uncommitted, so no ack can be manufactured by it), never
+                //     election-shaped, and paced on the transport schedule.
+                //
+                // Both in-tree sinks name every slice they fail or none of them, so the
+                // second arm is unreachable today; it exists so that a future sink
+                // reporting a strict subset cannot silently buy the election window.
+                std::vector<uint16_t> unexplained;
+                for (const auto* g : *pendingViews[i])
+                    if (!committedHere.count(g->first) && !explainedHere.count(g->first))
+                        unexplained.push_back(g->first);
+                if (!unexplained.empty()) {
+                    const WriteFailure unnamedKind =
+                        out.rejects.empty() ? WriteFailure::NotLeader : WriteFailure::Transport;
+                    lastKind = unnamedKind;
+                    noteKind(unnamedKind);
                 }
             } catch (...) {
                 const auto kind = isLocal ? classifyLocalWriteFailure(std::current_exception())
