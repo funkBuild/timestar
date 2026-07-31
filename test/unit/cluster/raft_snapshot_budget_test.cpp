@@ -334,3 +334,39 @@ TEST(RaftSnapshotBudgetTest, WithNoBudgetEveryGroupStartsImmediately) {
         EXPECT_EQ(g->node().snapshotTransfersDeferred(), 0u);
     }
 }
+
+// ---------------------------------------------------------------------------
+// 6. A peer removed from the configuration (review F6)
+// ---------------------------------------------------------------------------
+
+// A queued transfer is deliberately exempt from the stall/abandon path (nothing is on the
+// wire to be stalled), and a CONFIG change does not clear the transfer map the way a role
+// change does. Between those two facts, a peer removed from the configuration used to keep
+// its ticket forever: holding a FIFO position ahead of live groups, probing a non-member
+// every heartbeat, and on reaching the head of the queue burning a slot for a whole
+// stall-and-abandon cycle. With a per-GROUP budget that was one group's problem; with a
+// shard budget it is every group's.
+TEST(RaftSnapshotBudgetTest, ATransferToARemovedPeerReleasesItsTicket) {
+    SnapshotTransferBudget budget(1);
+    Group holder(1, &budget), leaving(2, &budget);
+    ASSERT_NE(chunkIn(holder.askForSnapshot()), nullptr);
+    ASSERT_EQ(chunkIn(leaving.askForSnapshot()), nullptr);
+    ASSERT_EQ(budget.waiting(), 1u);
+
+    // Remove the learner this group was queued to catch up. A single-voter group commits
+    // (and applies) the configuration immediately.
+    EXPECT_TRUE(leaving.node().proposeConfChange({leaving.node().id()}, {}));
+    drain(leaving.node());
+    EXPECT_FALSE(leaving.node().config().learners.size() > 0);
+
+    leaving.node().tick(1);
+    drain(leaving.node());
+    EXPECT_FALSE(leaving.node().snapshotTransferInFlight(Group::kPeer)) << "the transfer outlived the peer it was for";
+    EXPECT_EQ(budget.waiting(), 0u) << "its ticket is still holding a place in the shard's queue";
+
+    // ...and the queue really is usable again: the slot the holder gives back goes to a
+    // group that is still a member, immediately.
+    holder.reportInstalled();
+    Group fresh(3, &budget);
+    EXPECT_NE(chunkIn(fresh.askForSnapshot()), nullptr);
+}

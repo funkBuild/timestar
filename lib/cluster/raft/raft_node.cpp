@@ -87,6 +87,17 @@ std::vector<NodeId> replicationPeers(const Config& c, NodeId self) {
     return {s.begin(), s.end()};
 }
 
+// Is `peer` still someone this node replicates to? Same membership as replicationPeers,
+// answered without building the set (debt D-37, review F6: a transfer to a peer REMOVED
+// from the configuration must not keep a budget ticket, and there are two places that have
+// to ask).
+bool isReplicationPeer(const Config& c, NodeId self, NodeId peer) {
+    if (peer == self)
+        return false;
+    auto in = [&](const std::vector<NodeId>& v) { return std::find(v.begin(), v.end(), peer) != v.end(); };
+    return in(c.voters) || in(c.votersOutgoing) || in(c.learners);
+}
+
 }  // namespace
 
 bool RaftNode::majorityOf(const std::vector<NodeId>& set, const std::set<NodeId>& acked) const {
@@ -301,6 +312,14 @@ void RaftNode::bcastAppend() {
 void RaftNode::sendInstallSnapshot(NodeId peer) {
     if (snapshot_.index == kNoIndex)
         return;  // nothing to serve (should not happen once compaction ran)
+    // NEVER GRANT A TICKET TO A NON-MEMBER (debt D-37, review F6). Today every caller comes
+    // from `replicationPeers`, so this is defence rather than a live path -- but a shard
+    // budget makes the consequence of a stray grant everyone else's problem, not just this
+    // group's: the ticket holds a FIFO position, probes a node that is no longer in the
+    // configuration every heartbeat, and on reaching the head of the queue burns a slot for
+    // a whole stall-and-abandon cycle before anyone else can have it.
+    if (!isReplicationPeer(config_, id_, peer))
+        return;
     const uint64_t total = snapshot_.data.size();
     // 0 == chunking disabled: one message carries the whole payload (pre-D-5 behaviour,
     // and what the core unit tests exercise).
@@ -445,6 +464,17 @@ void RaftNode::sweepStalledSnapshotTransfers(unsigned passes) {
         opts_.maxSnapshotChunkBytes == 0 ? std::numeric_limits<size_t>::max() : opts_.maxSnapshotChunkBytes;
     for (auto it = snapTransfers_.begin(); it != snapTransfers_.end();) {
         SnapshotTransfer& t = it->second;
+        // A PEER REMOVED FROM THE CONFIGURATION (debt D-37, review F6). Nothing else drops
+        // these: role change clears the map but a CONFIG change does not, and a queued
+        // transfer is exempt from the stall/abandon path by design -- so without this a
+        // departed member's ticket sits in the shard's FIFO indefinitely, probing a node
+        // that is not a member and eventually spending a slot on a transfer nobody wants.
+        if (!isReplicationPeer(config_, id_, it->first)) {
+            const NodeId gone = it->first;
+            ++it;
+            endTransfer(gone);
+            continue;
+        }
         t.idleTicks += passes;
         if (!t.active) {
             // WAITING ON THE SHARD BUDGET (debt D-37). This is where a deferred transfer

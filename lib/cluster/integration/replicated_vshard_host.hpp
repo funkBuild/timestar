@@ -192,18 +192,26 @@ public:
     // nothing summed them, so a node returning from a long outage could be sent up to that
     // many 4 MiB chunks at once.
     //
-    // FOUR, because 4 x kMaxSnapshotChunkBytes = 16 MiB is a QUARTER of the peer's
-    // per-shard Raft inbound admission budget (kMaxInboundRaftMemory, 64 MiB). The other
-    // three quarters have to stay available for appends and heartbeats: while a transfer
-    // is in flight its chunks ARE that follower's heartbeat, so snapshot traffic that
-    // crowds out ordinary replication makes followers campaign -- the failure this cap
+    // FOUR, because 4 x kMaxSnapshotChunkBytes = 16 MiB is a quarter of the peer's
+    // per-shard Raft inbound admission budget (kMaxInboundRaftMemory, 64 MiB) -- PER
+    // SENDER, and that qualifier is load-bearing (review F2). The budget is the RECEIVER's
+    // and every leader shipping to it spends from the same one, so this bounds one
+    // sender's share and N-1 senders compose: at N=3 two catching-up leaders can claim
+    // half of it, at N=5 four can claim all of it. The cap is still the right shape -- a
+    // sender can only cap what it sends -- but it is not a receive-side guarantee, and the
+    // register names that as a residual rather than pretending otherwise.
+    //
+    // The other three quarters have to stay available for appends and heartbeats: while a
+    // transfer is in flight its chunks ARE that follower's heartbeat, so snapshot traffic
+    // that crowds out ordinary replication makes followers campaign -- the failure this cap
     // exists to prevent, not one to trade for. Four also keeps the pipeline full: a
     // transfer costs one round trip per chunk, so four in flight saturate a link that one
     // would leave idle between acks.
     static constexpr size_t kMaxConcurrentSnapshotTransfers = 4;
     static_assert(kMaxConcurrentSnapshotTransfers * raft::kMaxSnapshotChunkBytes <= raft::kMaxInboundRaftMemory / 4,
-                  "concurrent snapshot chunks must not be able to claim more than a quarter of a peer's Raft "
-                  "inbound budget, or a catching-up node starves ordinary replication [debt D-37]");
+                  "ONE SENDER's concurrent snapshot chunks must not be able to claim more than a quarter of a "
+                  "peer's Raft inbound budget, or a catching-up node starves ordinary replication. N-1 senders "
+                  "still compose -- that is a named residual, not something this assert covers [debt D-37]");
 
     // Override the policy above. Exists for two reasons: a test cannot practically write
     // 8192 entries or 64 MiB, and an operator with an unusual workload (very large batches,
