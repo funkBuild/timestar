@@ -104,7 +104,7 @@ run_arm() {
     for i in 1 2 3; do rm -rf "/tmp/tsgate_sd$i"; mkdir -p "/tmp/tsgate_sd$i"; done
     local PEERS="127.0.0.1:19710,127.0.0.1:19711,127.0.0.1:19712"
     start_node() {
-        env TIMESTAR_DATA_DIR="/tmp/tsgate_sd$1" TIMESTAR_CLUSTER_ENABLED=true TIMESTAR_CLUSTER_PARTITIONED=true \
+        env $GATE_SERVER_ENV TIMESTAR_DATA_DIR="/tmp/tsgate_sd$1" TIMESTAR_CLUSTER_ENABLED=true TIMESTAR_CLUSTER_PARTITIONED=true \
             TIMESTAR_CLUSTER_REPLICATION_FACTOR=3 TIMESTAR_CLUSTER_NODE_ID=$1 TIMESTAR_CLUSTER_PEERS="$PEERS" \
             TIMESTAR_CLUSTER_SNAPSHOT_ENTRIES="$snap" TIMESTAR_CLUSTER_SNAPSHOT_MIN_INTERVAL_S=2 \
             ${snapbytes:+TIMESTAR_CLUSTER_SNAPSHOT_BYTES="$snapbytes"} \

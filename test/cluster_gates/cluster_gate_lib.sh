@@ -7,6 +7,23 @@
 BUILD_DIR="${BUILD_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../build" && pwd)}"
 GATE_FAILURES=0
 
+# EXTRA SERVER ENVIRONMENT, applied by every gate to every node it starts.
+#
+#     GATE_SERVER_ENV="TIMESTAR_CLUSTER_SHARED_JOURNAL=1" ./fault_injection_gate.sh
+#
+# Why a passthrough rather than editing a gate when a flag needs exercising: a gate's value
+# is that the arm under test differs from the recorded arm ONLY in the thing being tested.
+# Editing the launch line to add a flag makes the run unquotable against the recorded one
+# (the script itself changed), and the edit tends to survive into the next run by accident.
+# This keeps the flag in the INVOCATION, where the transcript records it.
+#
+# Deliberately word-split (it is a list of KEY=VAL pairs, not one argument), so values
+# containing spaces are not supported -- no server env var takes one, and quoting rules
+# that half-work are worse than a stated limit. It is prepended, so a gate's own settings
+# for the same key still win: `env A=1 A=2` takes the LAST assignment, and a gate that
+# pins a value pins it for a reason (backpressure_gate's in-flight budget, for one).
+GATE_SERVER_ENV="${GATE_SERVER_ENV:-}"
+
 gate_fail() {
     echo "  GATE FAILURE: $*" >&2
     GATE_FAILURES=$((GATE_FAILURES + 1))
@@ -105,6 +122,33 @@ gate_cleanup() {
 
 cluster_status() { curl -s -m3 "http://127.0.0.1:$1/cluster/status" 2>/dev/null; }
 status_field() { printf '%s' "$1" | grep -o "\"$2\":[0-9]*" | cut -d: -f2; }
+status_bool() { printf '%s' "$1" | grep -o "\"$2\":\(true\|false\)" | cut -d: -f2; }
+
+# report_journal_counters "PORT..." -- print the Raft journal's fsync coalescing (D-10) for
+# each node, plus GATE_METRIC totals. INFORMATIONAL: no gate asserts on it, because the
+# ratio depends on how many groups happened to drain together, which is load-shaped.
+#
+# It is here rather than in one gate because the number is only interesting on a run that
+# also injected something: `journal_sync_requests / journal_fsyncs` is 1.0 for the default
+# per-VShard layout (each group syncs its own fd, so there is nothing to coalesce) and > 1
+# only with TIMESTAR_CLUSTER_SHARED_JOURNAL=1. On this box the journal lives on tmpfs, so
+# the ratio -- not a throughput delta -- is the whole of the available evidence.
+report_journal_counters() {
+    local ports="$1" s shared f r tf=0 tr=0
+    for p in $ports; do
+        s=$(cluster_status "$p")
+        shared=$(status_bool "$s" journal_shared)
+        f=$(status_field "$s" journal_fsyncs)
+        r=$(status_field "$s" journal_sync_requests)
+        [ -z "$f" ] && { echo "  journal counters on :$p unavailable"; continue; }
+        tf=$((tf + f)); tr=$((tr + r))
+        echo "  :$p journal_shared=${shared:-?} fsyncs=$f sync_requests=$r" \
+            "coalescing=$(awk -v a="$r" -v b="$f" 'BEGIN{printf (b>0)?"%.2f":"n/a", a/b}')"
+    done
+    echo "GATE_METRIC journal_fsyncs_total $tf"
+    echo "GATE_METRIC journal_sync_requests_total $tr"
+    echo "GATE_METRIC journal_coalescing $(awk -v a="$tr" -v b="$tf" 'BEGIN{printf (b>0)?"%.3f":"0", a/b}')"
+}
 
 # wait_all_led "PORT..." TOTAL_VSHARDS MAX_POLLS -- every VShard has SOME leader
 # somewhere, summed across nodes. Use this when the gate does not need leadership to be

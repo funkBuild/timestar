@@ -191,7 +191,7 @@ trap cleanup EXIT
 PEERS_VIA_PROXY="127.0.0.1:19410,127.0.0.1:19411,127.0.0.2:19412"
 PEERS_DIRECT="127.0.0.1:19410,127.0.0.1:19411,127.0.0.1:19412"
 start_node() { # $1 = node id, $2 = peers list
-    env TIMESTAR_DATA_DIR="/tmp/tsgate_fi$1" TIMESTAR_CLUSTER_ENABLED=true TIMESTAR_CLUSTER_PARTITIONED=true \
+    env $GATE_SERVER_ENV TIMESTAR_DATA_DIR="/tmp/tsgate_fi$1" TIMESTAR_CLUSTER_ENABLED=true TIMESTAR_CLUSTER_PARTITIONED=true \
         TIMESTAR_CLUSTER_REPLICATION_FACTOR=3 TIMESTAR_CLUSTER_NODE_ID=$1 TIMESTAR_CLUSTER_PEERS="$2" \
         "$BIN" --port $((19409 + $1)) --smp 4 >>"/tmp/tsgate_fi$1/s.log" 2>&1 &
 }
@@ -416,6 +416,15 @@ done
 
 # ---------------------------------------------------------------------------
 echo "=== $STORM_ROUNDS storms: errors[$ERR_VECTOR ] rounds/conns[$ROUND_VECTOR ] throughput[$TPUT_VECTOR ] ==="
+
+# THE JOURNAL LAYOUT THIS RUN USED, and what it coalesced (debt D-10). Reported, never
+# asserted. This gate is the one D-10 named for the flag-on run -- the shared writer widens
+# a barrier failure's blast radius from one group to every group on the reactor, and a
+# reset storm is the fault that most plausibly produces one -- so the layout the run
+# actually used has to be in the transcript beside the error count, not inferred from how
+# the run was invoked. With GATE_SERVER_ENV unset this prints the default layout's 1.00.
+echo "=== raft journal fsync coalescing ==="
+report_journal_counters "$PORTS"
 
 # MACHINE-READABLE TOTALS, printed BEFORE the assertions so they survive a FAILING run --
 # which is the case that matters, because `fault_injection_ab.sh`'s whole job is to read

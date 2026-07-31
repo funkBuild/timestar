@@ -32,7 +32,7 @@ require_ports_free 19210 19211 19212
 for i in 1 2 3; do rm -rf "/tmp/tsgate_bp$i"; mkdir -p "/tmp/tsgate_bp$i"; done
 PEERS="127.0.0.1:19210,127.0.0.1:19211,127.0.0.1:19212"
 for i in 1 2 3; do
-    env TIMESTAR_CLUSTER_WRITE_INFLIGHT_BYTES="$LIMIT" TIMESTAR_DATA_DIR="/tmp/tsgate_bp$i" \
+    env $GATE_SERVER_ENV TIMESTAR_CLUSTER_WRITE_INFLIGHT_BYTES="$LIMIT" TIMESTAR_DATA_DIR="/tmp/tsgate_bp$i" \
         TIMESTAR_CLUSTER_ENABLED=true TIMESTAR_CLUSTER_PARTITIONED=true \
         TIMESTAR_CLUSTER_REPLICATION_FACTOR=3 TIMESTAR_CLUSTER_NODE_ID=$i TIMESTAR_CLUSTER_PEERS="$PEERS" \
         "$BIN" --port $((19209 + i)) --smp 4 >"/tmp/tsgate_bp$i/s.log" 2>&1 &
@@ -124,7 +124,7 @@ kill_cluster 1921
 require_ports_free 19210 19211 19212
 for i in 1 2 3; do rm -rf "/tmp/tsgate_bp$i"; mkdir -p "/tmp/tsgate_bp$i"; done
 for i in 1 2 3; do
-    env TIMESTAR_DATA_DIR="/tmp/tsgate_bp$i" \
+    env $GATE_SERVER_ENV TIMESTAR_DATA_DIR="/tmp/tsgate_bp$i" \
         TIMESTAR_CLUSTER_ENABLED=true TIMESTAR_CLUSTER_PARTITIONED=true \
         TIMESTAR_CLUSTER_REPLICATION_FACTOR=3 TIMESTAR_CLUSTER_NODE_ID=$i TIMESTAR_CLUSTER_PEERS="$PEERS" \
         "$BIN" --port $((19209 + i)) --smp 4 >"/tmp/tsgate_bp$i/s.log" 2>&1 &

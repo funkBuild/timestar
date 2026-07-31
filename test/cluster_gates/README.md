@@ -62,6 +62,33 @@ the number cannot credit or blame a change. That defect (every rejection on the
 COORDINATOR, none on the node actually holding leadership -- i.e. leader RESOLUTION, not
 consensus) is filed in the plan doc's Phase 5 outcome.
 
+## Running a gate against a FLAGGED server: `GATE_SERVER_ENV`
+
+Every gate prepends `$GATE_SERVER_ENV` to the `env` line that starts each node, so a
+server-side flag can be exercised from the invocation instead of by editing a script:
+
+```bash
+GATE_SERVER_ENV="TIMESTAR_CLUSTER_SHARED_JOURNAL=1" ./fault_injection_gate.sh
+```
+
+Two properties are the point. The gate text stays byte-identical to the one whose recorded
+numbers you are quoting against (an edited launch line makes the comparison unquotable, and
+tends to survive into the next run unnoticed). And the flag appears in the transcript beside
+the result, which is what a register row needs to cite.
+
+It is word-split — a list of `KEY=VAL` pairs, values without spaces — and it is *prepended*,
+so a gate's own setting for the same key still wins (`env A=1 A=2` takes the last).
+`backpressure_gate.sh` pins `TIMESTAR_CLUSTER_WRITE_INFLIGHT_BYTES` for a reason and this
+cannot override it.
+
+`fault_injection_gate.sh` additionally reports the Raft journal's coalescing
+(`journal_shared` / `journal_fsyncs` / `journal_sync_requests`, plus `GATE_METRIC
+journal_coalescing`) after the storms. It is INFORMATIONAL — nothing asserts on it — and it
+exists because that gate is the one debt D-10 named for a shared-journal run: the shared
+writer widens a barrier failure's blast radius from one group to every group on the reactor,
+and a reset storm is the fault most likely to produce one. The default per-VShard layout
+reports 1.00 by construction (each group syncs its own fd; there is nothing to coalesce).
+
 ## Ports: every gate sits BELOW the kernel's ephemeral range (debt D-27)
 
 A node binds three listeners — HTTP at `P`, the data plane at `P+1000`, Raft at `P+2000` —
