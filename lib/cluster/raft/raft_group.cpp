@@ -342,13 +342,18 @@ seastar::future<bool> RaftGroup::proposeConfChange(std::vector<NodeId> voters, s
     co_return ok;
 }
 
-seastar::future<bool> RaftGroup::transferLeadership(NodeId target) {
+seastar::future<bool> RaftGroup::transferLeadership(NodeId target, bool* armed) {
     auto units = co_await seastar::get_units(lock_, 1);
     // Propagated, not discarded (debt D-24): the balancer's transfers_initiated counter is
     // only honest if it counts transfers that were actually ARMED, and this is the only
     // layer that knows. Ready is drained either way -- a call that started nothing may
     // still have output pending from something else.
     const bool started = node_.transferLeadership(target);
+    // Published BEFORE the drain, which persists and sends and can throw: the arming
+    // already happened inside the core and survives the failure, so the caller's record of
+    // it must survive too. See the header.
+    if (armed)
+        *armed = started;
     co_await drainReady();
     co_return started;
 }

@@ -614,30 +614,44 @@ public:
             if (chosen == targets.size())
                 continue;  // no peer can take this group right now; try the next one
             auto& [target, deficit] = targets[chosen];
+            // COUNT WHAT WAS ARMED, NOT WHAT WAS ASKED (debt D-24). The candidate filter
+            // above refuses non-voters and peers that are not caught up, but
+            // `RaftNode::transferLeadership` has one more silent early return this loop
+            // cannot see: the F2 re-arm guard, which ignores a repeat request for the
+            // transfer ALREADY in flight to that same target. Counting it inflated
+            // `transfers_initiated`, which `deposed_primary_gate.sh` asserts an
+            // anti-vacuity FLOOR on -- an inflated counter makes that assertion weaker
+            // than it reads, in the direction that hides a balancer doing nothing.
+            //
+            // WHICH CALLER ACTUALLY REACHES THAT GUARD: not this timer. The periodic pass
+            // runs every 5 s and never overlaps itself, and since D-20 the abandon window
+            // is 1 s, so `leadTransferee_` is clear again by the next pass. It is the
+            // OPERATOR endpoint -- `POST /cluster/rebalance-leadership`, which calls
+            // `rebalanceLeadership` directly, bounded by nothing -- that can ask again
+            // inside a live window. (Before D-20 the window was 2.5-5 s and the periodic
+            // pass reached it too, which is how the inflation was found.)
+            //
+            // `deficit` is charged on the same condition: an unarmed transfer moves no
+            // leadership, so spending the target's deficit on it would make the rest of
+            // the pass skip a peer that still needs groups.
+            //
+            // Accounted from the OUT-PARAM rather than from the returned bool, because the
+            // Ready drain that FOLLOWS the arming can throw: a future carries a value or
+            // an exception and never both, so a catch arm reading only the return value
+            // leaves an armed transfer uncounted and its target uncharged -- the same
+            // defect as the inflation, with the sign flipped.
+            bool armed = false;
             try {
-                // COUNT WHAT WAS ARMED, NOT WHAT WAS ASKED (debt D-24). The candidate
-                // filter above refuses non-voters and peers that are not caught up, but
-                // `RaftNode::transferLeadership` has one more silent early return this
-                // loop cannot see: the F2 re-arm guard, which ignores a repeat request for
-                // the transfer ALREADY in flight to that same target. The balancer runs on
-                // a period comparable to the abandon window, so that is not a corner --
-                // and counting it inflated `transfers_initiated`, which the
-                // deposed-primary gate asserts an anti-vacuity FLOOR on. An inflated
-                // counter makes that assertion weaker than it reads, in the direction that
-                // hides a balancer doing nothing.
-                //
-                // `deficit` is charged on the same condition: an unarmed transfer moves no
-                // leadership, so spending the target's deficit on it would make the rest
-                // of the pass skip a peer that still needs groups.
-                const bool started = co_await g->transferLeadership(target);
-                if (started) {
-                    --deficit;
-                    ++done;
-                }
-                ++ti;
+                co_await g->transferLeadership(target, &armed);
             } catch (...) {
-                ++ti;  // next pass retries
+                // Persist/send failed; the transfer may nonetheless be armed inside the
+                // core, and `armed` says which. Next pass retries either way.
             }
+            if (armed) {
+                --deficit;
+                ++done;
+            }
+            ++ti;
         }
         co_return done;
     }

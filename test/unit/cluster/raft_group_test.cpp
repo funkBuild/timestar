@@ -11,6 +11,7 @@
 #include <memory>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
+#include <stdexcept>
 #include <vector>
 
 using namespace timestar::raft;
@@ -81,6 +82,11 @@ public:
         }
     }
 
+    // When set, every outbound send FAILS -- which makes `RaftGroup::drainReady` throw
+    // AFTER the core has already acted on the input that produced those messages. That
+    // asymmetry is the point: see testAnArmedTransferSurvivesADrainFailure.
+    bool failSends = false;
+
     RaftGroup& group(NodeId id) { return *groups_.at(id); }
     const std::vector<std::string>& applied(NodeId id) const { return sm_.at(id)->applied; }
 
@@ -120,6 +126,8 @@ private:
 };
 
 seastar::future<> QueueTransport::send(Envelope env) {
+    if (net_.failSends)
+        return seastar::make_exception_future<>(std::runtime_error("transport is down"));
     net_.enqueue(std::move(env));
     return seastar::make_ready_future<>();
 }
@@ -197,7 +205,39 @@ seastar::future<> testTransferLeadershipReportsThroughTheDriver() {
         << "the F2 re-arm guard ignored the repeat request but reported it as a transfer initiated";
 }
 
+// AN ARMED TRANSFER MUST STILL BE ACCOUNTED WHEN THE DRAIN FAILS (debt D-24, review
+// finding 6). `transferLeadership` arms the transfer inside the core and THEN drains
+// Ready, which persists and sends -- and can throw. A future carries a value or an
+// exception and never both, so a caller reading only the returned bool records nothing
+// while the group refuses proposals for the whole abandon window: the inflation this row
+// fixed, with the sign flipped (an undercount, and a target whose deficit is never
+// charged). The out-param is written before the drain, so it survives.
+seastar::future<> testAnArmedTransferSurvivesADrainFailure() {
+    GroupNetwork net({1, 2, 3}, opts());
+    co_await net.group(1).campaign();
+    co_await net.pump();
+    EXPECT_EQ(net.leader(), 1u);
+
+    net.failSends = true;  // the drain that follows the arming will now throw
+    bool armed = false;
+    bool threw = false;
+    try {
+        co_await net.group(1).transferLeadership(2, &armed);
+    } catch (...) {
+        threw = true;
+    }
+    EXPECT_TRUE(threw) << "a persist/send failure must propagate, not be swallowed";
+    EXPECT_TRUE(armed) << "the transfer IS armed (the group refuses proposals until the window expires) but the "
+                       << "caller was told nothing -- transfers_initiated undercounts and the target's deficit "
+                       << "is never charged";
+    EXPECT_TRUE(net.group(1).transferInFlight()) << "the premise: the core really did arm it";
+}
+
 }  // namespace
+
+TEST(RaftGroupTest, AnArmedTransferSurvivesADrainFailure) {
+    testAnArmedTransferSurvivesADrainFailure().get();
+}
 
 TEST(RaftGroupTest, TransferLeadershipReportsThroughTheDriver) {
     testTransferLeadershipReportsThroughTheDriver().get();

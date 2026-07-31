@@ -83,7 +83,16 @@ public:
     seastar::future<bool> proposeConfChange(std::vector<NodeId> voters, std::vector<NodeId> learners);
     // true iff a transfer was actually ARMED by this call (debt D-24); see
     // RaftNode::transferLeadership for the early returns that answer false.
-    seastar::future<bool> transferLeadership(NodeId target);
+    //
+    // `armed`, if given, is written SYNCHRONOUSLY at the moment the core answers --
+    // before the Ready drain that follows it, which persists and sends and can therefore
+    // THROW. A returned future carries either a value or an exception and never both, so
+    // a drain failure would otherwise lose the fact that the transfer IS armed: the group
+    // refuses proposals for the whole abandon window while the caller records nothing,
+    // which is D-24's inflation with the sign flipped (an undercount, and a target whose
+    // deficit was never charged). A caller that keeps a counter and catches exceptions
+    // must account from THIS, not from the return value.
+    seastar::future<bool> transferLeadership(NodeId target, bool* armed = nullptr);
     // Trigger a state-machine snapshot compaction up to `upto` with the given
     // opaque payload (the caller produced it from its state machine).
     seastar::future<> compact(LogIndex upto, std::string snapshotData);
