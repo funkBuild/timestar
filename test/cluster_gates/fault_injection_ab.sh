@@ -315,15 +315,40 @@ fi
 # over. The margin is real -- a reverted binary produces 9-10 errors in a SINGLE storm
 # where HEAD's whole K-storm budget is 3.
 BUDGET="${GATE_MAX_STORM_ERRORS:-3}"
+# THE REVERTED FLOOR IS MEASURED, and it is not a multiple of the budget any more. It was
+# `3 * BUDGET` = 9, taken from a hand-run session's "9-10 in a SINGLE storm" -- a number
+# from a 2000-batch storm AND from the old whole-file checkout, which reached past 4a. On
+# the current sizing and the surgical pacing patch, the first real end-to-end run measured
+# HEAD 0 and REVERTED 7 under storms within 1% of each other (101% intensity ratio). A
+# floor of 9 would have failed the A/B on a correct 7.
+#
+# 5 is strictly above HEAD's measured maximum -- 2, the worst of the nine storm draws behind
+# `fault_injection_gate.sh`'s budget -- and strictly below the reverted arm's draws. That is
+# the separation this script exists to assert; it is a two-sided claim, so the HEAD side is
+# asserted against its own budget just above.
+MIN_REVERTED="${GATE_AB_MIN_REVERTED_ERRORS:-5}"
 assert_le "HEAD binary: client errors under the storms" "${H_TOTAL:-999}" "$BUDGET"
-assert_ge "REVERTED binary: client errors under the storms" "${R_TOTAL:-0}" "$((BUDGET * 3))"
+assert_ge "REVERTED binary: client errors under the storms" "${R_TOTAL:-0}" "$MIN_REVERTED"
 
 # ...AND THE ERRORS MUST BE THE RIGHT ONES. The whole-file revert reaches past 4a (see the
 # header), so "it produced errors" alone does not prove the pacing fix is what the gate
 # measures. [D6] has a verbatim signature -- the retry exhausting its budget against a
 # socket the transport had not re-dialled yet -- and this is what pins the mechanism.
-if grep -qE 'RetryableWriteError.*last: transport' /tmp/tsgate_ab_reverted.log; then
-    gate_ok "REVERTED binary: failures carry the [D6] signature (last: transport)"
+# THE PATTERN WAS WRONG AND HAD NEVER MATCHED ANYTHING. It looked for
+# `RetryableWriteError.*last: transport`, but the exception's TYPE NAME is not in the
+# message the client sees -- the body reads "ReplicatedBatchWriteRouter: N VShard slice(s)
+# uncommitted after 6 attempt(s) (last: transport); retry the write". So this check could
+# only ever have reported "NOT the [D6] signature", on every arm, forever. Executing the
+# script end to end (D-19) is what surfaced it.
+#
+# The corrected pattern matches what [D6] actually looks like from outside: the retry giving
+# up with the TRANSPORT class last. Measured on the reverted arm, all four bench failures
+# and both probe 5xx were "uncommitted after 6 attempt(s) (last: transport)" -- the BASE
+# budget exhausted, i.e. the flat schedule never outlived one reconnect window -- and the
+# HEAD arm produced none at all.
+D6_SIGNATURE='uncommitted after [0-9]+ attempt\(s\) \(last: transport\)'
+if grep -qE "$D6_SIGNATURE" /tmp/tsgate_ab_reverted.log; then
+    gate_ok "REVERTED binary: failures carry the [D6] signature ($(grep -oE "$D6_SIGNATURE" /tmp/tsgate_ab_reverted.log | sort | uniq -c | tr -s ' ' | tr '\n' ';'))"
 else
     gate_fail "REVERTED binary failed, but NOT with the [D6] signature -- the gate may be \
 catching something other than the retry pacing. First error line: \
