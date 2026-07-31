@@ -406,6 +406,13 @@ private:
     seastar::future<> snapshotSweep();
     seastar::timer<seastar::lowres_clock> snapshotTimer_;
     seastar::gate snapshotGate_;
+    // The read fence's own gate (debt D-36). A fence that is WAITING is suspended in a
+    // sleep with nothing but `this` keeping it honest, so it must not outlive the host --
+    // it resumes to read `registry_` and `vshards_`. Closed FIRST in stop(), before the
+    // registry, so an in-flight fence finishes against a live host and a new one is
+    // refused rather than started. Its own gate rather than snapshotGate_'s: a read must
+    // not be held up by a snapshot sweep's lifetime, nor a shutdown by a read's.
+    seastar::gate readFenceGate_;
     bool snapshotSweepRunning_ = false;  // one sweep at a time; the timer skips if busy
     bool snapshotTriggerEnabled_ = false;
     // STAGGER. The sweep starts scanning at a rotating offset, so the same low-numbered

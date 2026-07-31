@@ -747,6 +747,10 @@ raft::RaftGroup* ReplicatedVShardHost::group(uint16_t vshard) {
 }
 
 seastar::future<bool> ReplicatedVShardHost::awaitApplyCatchUp(std::chrono::milliseconds budget) {
+    // A fence started during shutdown has nothing to fence and no host to resume against.
+    if (stopped_ || readFenceGate_.is_closed())
+        co_return true;
+    const auto holder = readFenceGate_.hold();
     // Sample the bar ONCE, before any suspension: (group, the index it had already
     // committed). See the header for why the bar is the entry-time commit index and not
     // "zero lag" -- the latter is unreachable on a node taking writes.
@@ -821,6 +825,10 @@ seastar::future<> ReplicatedVShardHost::stop() {
     // still standing. (e) honours stop() -- an unclosed gate here is a compaction landing
     // on a torn-down group.
     snapshotTimer_.cancel();
+    // The read fence FIRST: a waiting fence resumes into `registry_`/`vshards_`, so it has
+    // to be drained while both still stand (debt D-36). It waits at most its own budget.
+    if (!readFenceGate_.is_closed())
+        co_await readFenceGate_.close();
     if (!snapshotGate_.is_closed())
         co_await snapshotGate_.close();
     co_await registry_.stop();  // stops the tick loop + drains

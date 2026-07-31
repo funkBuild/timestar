@@ -175,11 +175,36 @@ seastar::future<timestar::VShardSnapshotManifest> Engine::createVShardSnapshot(t
                                                                                std::string catalogHash) {
     // Snapshot this shard's flushed TSM files (the caller flushes memory first).
     // Collect them with their rank as the extent file id.
+    //
+    // TAKE THE FILE LIST BY VALUE FIRST -- iterating the LIVE map across the co_await
+    // below is a use-after-free, and it crashed a node. `getSequencedTsmFiles()` returns
+    // a reference to the manager's own map, and background tier compaction ERASES entries
+    // from it (`removeTSMFiles`) when a merge completes. A merge landing during
+    // `addTsmFileExtents`' suspension destroys the node the loop is standing on, so the
+    // structured binding refers to freed storage and `++it` walks a dangling next-pointer:
+    // the loop then copies garbage `shared_ptr`s into `files` and touches a control block
+    // at a nonsense address. Observed exactly that way on a restart replay --
+    // "Compacted 4 files from tier 0 to tier 1" in the millisecond before
+    // `si_addr: 0x0a` on shard 0, inside the vector growth this loop performs.
+    //
+    // A COPY IS THE FIX, not a lock: the copied `shared_ptr`s keep every TSM alive for the
+    // whole snapshot even if compaction unregisters and unlinks it, so the manifest
+    // describes a consistent point-in-time set. A file that vanishes before its BYTES are
+    // read is already handled downstream -- `buildVShardSnapshotFiles` fails closed on a
+    // manifest fileId it can no longer resolve rather than shipping a partial snapshot.
+    std::vector<std::pair<uint64_t, seastar::shared_ptr<::TSM>>> sequenced;
+    {
+        const auto& live = tsmFileManager.getSequencedTsmFiles();
+        sequenced.reserve(live.size());
+        for (const auto& [rank, file] : live)
+            if (file)
+                sequenced.emplace_back(rank, file);
+    }
+
     std::vector<seastar::shared_ptr<::TSM>> files;
+    files.reserve(sequenced.size());
     timestar::VShardExtentMap extents;
-    for (const auto& [rank, file] : tsmFileManager.getSequencedTsmFiles()) {
-        if (!file)
-            continue;
+    for (const auto& [rank, file] : sequenced) {
         files.push_back(file);
         co_await timestar::addTsmFileExtents(extents, rank, *file);
     }
