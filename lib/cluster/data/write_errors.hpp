@@ -55,17 +55,14 @@ using timestar::raft::NodeId;
 //   operations OVERLAP in real time and either order is correct. An acked-then-reverted
 //   sequence is impossible, because a slice that returned success is never retried.
 //
-//   Deletes and retention cutoffs are NOT re-proposed by this machinery (the retry lives
-//   in the WriteBatch router only), so the non-idempotent commands never see it.
-//
-//   FOR WHOEVER REPLICATES DELETES (M6): that immunity is incidental, not designed. A
-//   delete is not idempotent against a concurrent write to the same point -- re-applying
+//   The WriteBatch router is the only place where ambiguous re-proposal is generally
+//   allowed. ReplicatedCommandRouter reuses this taxonomy for deletes, but explicitly
+//   refuses the two ambiguous classes below. A delete is not idempotent against a
+//   concurrent write to the same point -- re-applying
 //   one at a HIGHER revision would erase a write that legitimately landed after the
-//   original delete committed, resurrecting nothing and losing real data. Today
-//   DeleteRangeKey never reaches this retry loop because deletes are not routed through
-//   Raft on the write path at all. The moment they are, this audit must be redone: either
-//   deletes get revision-bounded tombstones (so a re-apply cannot outrank a later write),
-//   or they must be excluded from the ambiguous-retry classes explicitly.
+//   original delete committed, resurrecting nothing and losing real data. Until deletes
+//   get revision-bounded tombstones or durable operation-id deduplication, an ambiguous
+//   delete outcome is reported to the caller and is never automatically re-proposed.
 //
 // `Unassigned` and `Fatal` are terminal: no amount of retrying fixes an unowned VShard
 // or a journal I/O error, and hiding either behind a retry budget only delays the
@@ -283,6 +280,14 @@ public:
 class RetryableWriteError : public std::runtime_error {
 public:
     explicit RetryableWriteError(const std::string& what) : std::runtime_error(what) {}
+};
+
+// A non-idempotent mutation may already have committed, so repeating it could change
+// the result relative to concurrent operations. The HTTP layer reports an UNKNOWN
+// outcome without Retry-After; callers must verify state rather than blindly retry.
+class AmbiguousMutationError : public std::runtime_error {
+public:
+    explicit AmbiguousMutationError(const std::string& what) : std::runtime_error(what) {}
 };
 
 // A slice was routed to a shard whose data plane is tearing down (shutdown in progress).

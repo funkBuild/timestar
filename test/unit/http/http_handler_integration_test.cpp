@@ -1336,6 +1336,31 @@ TEST_F(HttpHandlerIntegrationTest, PartitionedRf3MapsRetryableDeleteFailureTo503
         .get();
 }
 
+TEST_F(HttpHandlerIntegrationTest, PartitionedRf3ReportsAmbiguousDeleteWithoutRetryAdvice) {
+    seastar::thread([] {
+        struct ResetHook {
+            ~ResetHook() { HttpDeleteHandler::clusterDeleteHook = {}; }
+        } reset;
+        ScopedShardedEngine eng;
+        eng.start();
+        HttpDeleteHandler::clusterDeleteHook = [](std::string, uint64_t, uint64_t) {
+            return seastar::make_exception_future<>(
+                timestar::data::AmbiguousMutationError("delete may already have committed"));
+        };
+
+        HttpDeleteHandler handler(&eng.eng, true);
+        auto req = makeDeleteRequest(R"({"series":"m value","startTime":0,"endTime":1})");
+        auto rep = handler.handleDelete(std::move(req)).get();
+        EXPECT_EQ(rep->_status, seastar::http::reply::status_type::gateway_timeout);
+        EXPECT_EQ(rep->_headers["X-TimeStar-Mutation-Outcome"], "unknown");
+        EXPECT_EQ(rep->_headers.count("Retry-After"), 0u);
+        EXPECT_NE(rep->_content.find("DELETE_OUTCOME_UNKNOWN"), std::string::npos);
+        EXPECT_NE(rep->_content.find("may already have committed"), std::string::npos);
+    })
+        .join()
+        .get();
+}
+
 TEST_F(HttpHandlerIntegrationTest, PartitionedRf3BoundsDeleteBatchProposalConcurrency) {
     seastar::thread([] {
         struct ResetHook {

@@ -28,6 +28,14 @@ seastar::future<> ReplicatedCommandRouter::propose(uint16_t vshard, ReplicatedCo
     if (!targetsVShard)
         throw std::invalid_argument("ReplicatedCommandRouter: command does not belong to requested VShard");
 
+    // A WriteBatch is value-idempotent under the revision/LWW contract and a
+    // RetentionCutoffCmd is monotonic. DeleteRangeKey is neither: if attempt one
+    // committed but its reply was lost, re-proposing after a concurrent write would
+    // append a later delete and erase that write. Only unambiguous pre-proposal
+    // refusals may be retried until delete commands carry a revision bound or a
+    // snapshot-persistent operation id.
+    const bool ambiguousRetryUnsafe = std::holds_alternative<DeleteRangeKey>(command);
+
     const NodeId owner = dir_.ownerOf(vshard);
     if (owner == kNoNode)
         throw UnassignedVShardError("ReplicatedCommandRouter: VShard " + std::to_string(vshard) +
@@ -65,6 +73,14 @@ seastar::future<> ReplicatedCommandRouter::propose(uint16_t vshard, ReplicatedCo
             const WriteFailure kind = local ? classifyLocalWriteFailure(ep) : classifyRemoteWriteFailure(ep);
             if (!isRetryableWriteFailure(kind))
                 std::rethrow_exception(ep);
+            if (ambiguousRetryUnsafe && isAmbiguousWriteFailure(kind)) {
+                if (!local && kind == WriteFailure::Transport)
+                    local_.wakeGroupsLedBy(leader);
+                throw AmbiguousMutationError(
+                    "ReplicatedCommandRouter: delete outcome is unknown after " + std::string(writeFailureName(kind)) +
+                    " for VShard " + std::to_string(vshard) +
+                    "; the command was not re-proposed because it may already have committed");
+            }
             out.rejects.push_back(SliceReject{vshard, kNoNode, kind});
             if (!local && kind == WriteFailure::Transport)
                 unreachable = leader;
@@ -89,6 +105,14 @@ seastar::future<> ReplicatedCommandRouter::propose(uint16_t vshard, ReplicatedCo
         if (!isRetryableWriteFailure(lastKind))
             throw std::runtime_error("ReplicatedCommandRouter: terminal proposal failure for VShard " +
                                      std::to_string(vshard));
+        if (ambiguousRetryUnsafe && isAmbiguousWriteFailure(lastKind)) {
+            if (unreachable != kNoNode)
+                local_.wakeGroupsLedBy(unreachable);
+            throw AmbiguousMutationError(
+                "ReplicatedCommandRouter: delete outcome is unknown after " +
+                std::string(writeFailureName(lastKind)) + " for VShard " + std::to_string(vshard) +
+                "; the command was not re-proposed because it may already have committed");
+        }
         hint = nextHint;
 
         const auto pause = cluster::jitteredDelay(writeFailureRetryDelay(lastKind, attempt), kWriteRetryJitterPercent);

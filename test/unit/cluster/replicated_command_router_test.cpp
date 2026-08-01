@@ -21,6 +21,7 @@ class CommandSink : public ProposeSink {
 public:
     bool commit = true;
     NodeId rejectHint = timestar::raft::kNoNode;
+    WriteFailure rejectKind = WriteFailure::NotLeader;
     unsigned calls = 0;
     std::vector<std::string> encoded;
 
@@ -38,7 +39,7 @@ public:
             out.committed = true;
             out.committedVShards = {vshard};
         } else {
-            out.rejects.push_back(SliceReject{vshard, rejectHint, WriteFailure::NotLeader});
+            out.rejects.push_back(SliceReject{vshard, rejectHint, rejectKind});
         }
         return seastar::make_ready_future<ProposeOutcome>(std::move(out));
     }
@@ -65,6 +66,17 @@ public:
         out.committed = true;
         out.committedVShards = {vshard};
         return seastar::make_ready_future<ProposeOutcome>(std::move(out));
+    }
+};
+
+class AmbiguousTransport : public CommandTransport {
+public:
+    seastar::future<ProposeOutcome> proposeCommandHinted(NodeId to, uint16_t, ReplicatedCommand,
+                                                         OptDeadline deadline) override {
+        ++calls;
+        targets.push_back(to);
+        deadlines.push_back(deadline);
+        return seastar::make_exception_future<ProposeOutcome>(std::runtime_error("connection lost after send"));
     }
 };
 
@@ -130,6 +142,37 @@ TEST(ReplicatedCommandRouterTest, PreservesTheCommandAcrossALeaderHintRetry) {
     EXPECT_EQ(remote.targets, std::vector<NodeId>{2});
     ASSERT_EQ(remote.deadlines.size(), 1u);
     EXPECT_TRUE(remote.deadlines[0].has_value());
+}
+
+TEST(ReplicatedCommandRouterTest, DoesNotReproposeDeleteAfterAmbiguousRemoteFailure) {
+    const std::string key = buildSeriesKey("delete", {{"host", "ambiguous-remote"}}, "value");
+    const uint16_t vshard = timestar::virtualShard(SeriesId128::fromSeriesKey(key));
+    VShardDirectory dir(1, mapWith(vshard));
+    CommandSink local;
+    AmbiguousTransport remote;
+    MapLeaders leaders;
+    leaders.leaders[vshard] = 2;
+    ReplicatedCommandRouter router(dir, local, remote, leaders);
+
+    EXPECT_THROW(router.propose(vshard, ReplicatedCommand{deleteFor(key)}).get(), AmbiguousMutationError);
+    EXPECT_EQ(local.calls, 0u);
+    EXPECT_EQ(remote.calls, 1u) << "an unknown delete outcome must never be re-proposed";
+}
+
+TEST(ReplicatedCommandRouterTest, DoesNotReproposeDeleteAfterLeadershipLoss) {
+    const std::string key = buildSeriesKey("delete", {{"host", "ambiguous-local"}}, "value");
+    const uint16_t vshard = timestar::virtualShard(SeriesId128::fromSeriesKey(key));
+    VShardDirectory dir(1, mapWith(vshard));
+    CommandSink local;
+    local.commit = false;
+    local.rejectKind = WriteFailure::LeadershipLost;
+    CommandTransport remote;
+    MapLeaders leaders;
+    ReplicatedCommandRouter router(dir, local, remote, leaders);
+
+    EXPECT_THROW(router.propose(vshard, ReplicatedCommand{deleteFor(key)}).get(), AmbiguousMutationError);
+    EXPECT_EQ(local.calls, 1u) << "a leadership-lost delete may already be in the successor's log";
+    EXPECT_EQ(remote.calls, 0u);
 }
 
 TEST(ReplicatedCommandRouterTest, RejectsCrossVShardCommandBeforeProposal) {
