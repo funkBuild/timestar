@@ -1,6 +1,9 @@
 #include "group0_state_machine.hpp"
 
+#include "../../core/vshard.hpp"
+
 #include <seastar/core/coroutine.hh>
+#include <set>
 #include <stdexcept>
 
 namespace timestar::control {
@@ -78,6 +81,27 @@ struct SR {
     }
 };
 
+bool validNodeRecord(const Group0State& state, const NodeRecord& record) {
+    if (record.raftId == raft::kNoNode || record.uuid.empty() || record.address.empty())
+        return false;
+    if (auto it = state.nodes.find(record.raftId); it != state.nodes.end() && it->second.uuid != record.uuid)
+        return false;  // a Raft id is permanently bound to one node identity
+    for (const auto& [id, existing] : state.nodes)
+        if (id != record.raftId && existing.uuid == record.uuid)
+            return false;  // one persistent node identity cannot occupy two ids
+    return true;
+}
+
+bool validNodeSet(const std::vector<NodeId>& nodes) {
+    if (nodes.empty())
+        return false;
+    std::set<NodeId> unique;
+    for (NodeId id : nodes)
+        if (id == raft::kNoNode || !unique.insert(id).second)
+            return false;
+    return true;
+}
+
 }  // namespace
 
 bool Group0StateMachine::applyCommand(const ControlCommand& cmd) {
@@ -86,24 +110,45 @@ bool Group0StateMachine::applyCommand(const ControlCommand& cmd) {
         [&](const auto& c) {
             using T = std::decay_t<decltype(c)>;
             if constexpr (std::is_same_v<T, InitCluster>) {
-                if (state_.clusterUuid.empty())
+                if (c.clusterUuid.empty() || !state_.clusterUuid.empty())
+                    ok = false;
+                else
                     state_.clusterUuid = c.clusterUuid;  // never re-init
             } else if constexpr (std::is_same_v<T, UpsertNode>) {
-                state_.nodes[c.record.raftId] = c.record;
+                if (!validNodeRecord(state_, c.record)) {
+                    ok = false;
+                } else if (auto it = state_.nodes.find(c.record.raftId);
+                           it != state_.nodes.end() && it->second == c.record) {
+                    ok = false;
+                } else {
+                    state_.nodes[c.record.raftId] = c.record;
+                }
             } else if constexpr (std::is_same_v<T, SetNodeState>) {
-                if (auto it = state_.nodes.find(c.raftId); it != state_.nodes.end())
+                if (auto it = state_.nodes.find(c.raftId);
+                    it != state_.nodes.end() && it->second.state != c.state)
                     it->second.state = c.state;
+                else
+                    ok = false;
             } else if constexpr (std::is_same_v<T, SetDesiredPlacement>) {
-                state_.desiredPlacement[c.vshard] = c.replicas;
-                ++state_.mapEpoch;  // topology change bumps the epoch
+                auto it = state_.desiredPlacement.find(c.vshard);
+                if (c.vshard >= timestar::VIRTUAL_SHARD_COUNT || !validNodeSet(c.replicas) ||
+                    (it != state_.desiredPlacement.end() && it->second == c.replicas)) {
+                    ok = false;
+                } else {
+                    state_.desiredPlacement[c.vshard] = c.replicas;
+                    ++state_.mapEpoch;  // only a real topology change bumps the epoch
+                }
             } else if constexpr (std::is_same_v<T, SetMetaVoters>) {
-                state_.metaVoters = c.voters;
+                if (!validNodeSet(c.voters) || state_.metaVoters == c.voters)
+                    ok = false;
+                else
+                    state_.metaVoters = c.voters;
             } else if constexpr (std::is_same_v<T, CasPolicy>) {
                 // Read the current version WITHOUT inserting -- a failed CAS must
                 // leave state exactly unchanged (no phantom version-0 cell).
                 auto it = state_.policies.find(c.key);
                 const uint64_t curVer = (it == state_.policies.end()) ? 0 : it->second.version;
-                if (curVer == c.expectedVersion) {
+                if (!c.key.empty() && curVer == c.expectedVersion) {
                     PolicyCell& cell = state_.policies[c.key];  // insert only on success
                     ++cell.version;
                     cell.value = c.value;
@@ -111,29 +156,35 @@ bool Group0StateMachine::applyCommand(const ControlCommand& cmd) {
                     ok = false;  // lost update: CAS failed (state unchanged)
                 }
             } else if constexpr (std::is_same_v<T, SetControllerTerm>) {
-                if (c.term > state_.controllerTerm) {  // monotonic fencing
+                if (c.term > state_.controllerTerm && c.leader != raft::kNoNode) {  // monotonic fencing
                     state_.controllerTerm = c.term;
                     state_.controllerLeader = c.leader;
-                }
+                } else
+                    ok = false;
             } else if constexpr (std::is_same_v<T, UpsertJob>) {
-                Job& j = state_.jobs[c.jobId];
-                j.id = c.jobId;
-                // Idempotent step: never move a job backwards, and keep the
-                // payload paired with the RETAINED step (an out-of-order replay of
-                // an older step must not overwrite the newer payload).
-                if (c.step >= j.step) {
-                    j.step = c.step;
-                    j.payload = c.payload;
+                if (c.jobId.empty()) {
+                    ok = false;
+                } else {
+                    Job& j = state_.jobs[c.jobId];
+                    j.id = c.jobId;
+                    // Idempotent step: never move a job backwards, and keep the
+                    // payload paired with the RETAINED step (an out-of-order replay of
+                    // an older step must not overwrite the newer payload).
+                    if (c.step >= j.step) {
+                        j.step = c.step;
+                        j.payload = c.payload;
+                    }
+                    if (c.done)
+                        j.done = true;
                 }
-                if (c.done)
-                    j.done = true;
             } else if constexpr (std::is_same_v<T, MintJoinToken>) {
-                state_.joinTokens.insert(c.token);
+                if (c.token.empty() || !state_.joinTokens.insert(c.token).second)
+                    ok = false;
             } else if constexpr (std::is_same_v<T, AdmitWithToken>) {
                 // Admit ONLY on a valid unused token, consumed atomically. An
                 // invalid/replayed token is a no-op (never implicitly initialize).
                 auto it = state_.joinTokens.find(c.token);
-                if (it != state_.joinTokens.end()) {
+                if (it != state_.joinTokens.end() && validNodeRecord(state_, c.record)) {
                     state_.joinTokens.erase(it);
                     NodeRecord rec = c.record;
                     rec.state = NodeState::Active;

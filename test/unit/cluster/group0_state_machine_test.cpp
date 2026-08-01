@@ -3,6 +3,7 @@
 // command wire codec (round-trip + truncation robustness). All pure -- no reactor.
 #include "../../../lib/cluster/control/control_command.hpp"
 #include "../../../lib/cluster/control/group0_state_machine.hpp"
+#include "../../../lib/core/vshard.hpp"
 
 #include <gtest/gtest.h>
 
@@ -91,6 +92,37 @@ TEST(Group0StateMachineTest, DesiredPlacementBumpsEpoch) {
     sm.applyCommand(SetDesiredPlacement{6, {2, 3, 4}});
     EXPECT_EQ(sm.state().mapEpoch, 2u);
     EXPECT_EQ(sm.state().desiredPlacement.at(5), (std::vector<NodeId>{1, 2, 3}));
+}
+
+TEST(Group0StateMachineTest, PlacementRetriesAreIdempotentAndInvalidControlDataIsRejected) {
+    Group0StateMachine sm;
+    EXPECT_FALSE(sm.applyCommand(InitCluster{""}));
+    EXPECT_TRUE(sm.applyCommand(InitCluster{"cluster-safe"}));
+    EXPECT_FALSE(sm.applyCommand(InitCluster{"cluster-other"}));
+    EXPECT_EQ(sm.state().clusterUuid, "cluster-safe");
+
+    EXPECT_TRUE(sm.applyCommand(UpsertNode{node(1, "u1", "rack-a")}));
+    EXPECT_FALSE(sm.applyCommand(UpsertNode{node(2, "u1", "rack-b")}))
+        << "one persistent node UUID cannot occupy two Raft ids";
+    EXPECT_FALSE(sm.applyCommand(UpsertNode{node(0, "u0", "rack-z")}));
+    EXPECT_EQ(sm.state().nodes.size(), 1u);
+
+    EXPECT_TRUE(sm.applyCommand(SetDesiredPlacement{5, {1, 2, 3}}));
+    const uint64_t committedEpoch = sm.state().mapEpoch;
+    EXPECT_FALSE(sm.applyCommand(SetDesiredPlacement{5, {1, 2, 3}}))
+        << "an ambiguous retry must not invent another topology epoch";
+    EXPECT_FALSE(sm.applyCommand(SetDesiredPlacement{5, {1, 1, 3}}));
+    EXPECT_FALSE(sm.applyCommand(SetDesiredPlacement{5, {0, 2, 3}}));
+    EXPECT_FALSE(sm.applyCommand(SetDesiredPlacement{timestar::VIRTUAL_SHARD_COUNT, {1, 2, 3}}));
+    EXPECT_EQ(sm.state().mapEpoch, committedEpoch);
+    EXPECT_EQ(sm.state().desiredPlacement.at(5), (std::vector<NodeId>{1, 2, 3}));
+
+    EXPECT_FALSE(sm.applyCommand(SetMetaVoters{{1, 1}}));
+    EXPECT_TRUE(sm.applyCommand(SetMetaVoters{{1, 2, 3}}));
+    EXPECT_FALSE(sm.applyCommand(SetMetaVoters{{1, 2, 3}}));
+    EXPECT_FALSE(sm.applyCommand(MintJoinToken{""}));
+    EXPECT_FALSE(sm.applyCommand(SetControllerTerm{1, 0}));
+    EXPECT_EQ(sm.state().controllerTerm, 0u);
 }
 
 TEST(Group0StateMachineTest, CasSucceedsOnMatchFailsOnStale) {

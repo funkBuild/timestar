@@ -1244,12 +1244,16 @@ is not completion.
   exact entry is committed and applied; the RF=3 test proves a local-only append
   remains pending. Bootstrap retries reject conflicting cluster/node identity,
   mirror the complete stable initial voter set, and token admission reports the
-  deterministic applied outcome. Meta-voter reconciliation now waits through
+  deterministic applied outcome. Placement retries are semantic no-ops instead
+  of inventing new map epochs, and malformed control records (zero or duplicate
+  node IDs, duplicate persistent identities, empty identities/tokens, invalid
+  VShards, and duplicate replica/voter sets) are rejected without mutating
+  committed state. Meta-voter reconciliation now waits through
   joint consensus until final `Cnew` applies (including a final config that
   removes the old leader), and a subsequent controller repairs a stale
   state-machine voter mirror. The focused Raft/controller membership evidence
   passes 13/13; the combined controller/identity/host/codec/state evidence passes
-  25/25. Production composition, the operator-facing explicit bootstrap trigger,
+  26/26. Production composition, the operator-facing explicit bootstrap trigger,
   and publication of committed state to the data plane remain outstanding.
 - [ ] **CR-FIX-022 — wire resumable join, drain, remove, replace, and VShard
   movement.** Owner: movement/control plane. Include learner catch-up, verified

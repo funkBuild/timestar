@@ -31,8 +31,8 @@ public:
 
     const Group0State& state() const { return state_; }
 
-    // Apply a command directly (used by snapshot restore and tests); returns
-    // false only for a CAS whose expected version did not match (a lost update).
+    // Apply a command directly (used by tests); returns false for a semantic
+    // no-op/rejection (stale CAS, invalid identity/set, or idempotent replay).
     bool applyCommand(const ControlCommand& cmd);
 
 private:
