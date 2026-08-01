@@ -14,17 +14,17 @@
 #include "../../../lib/index/native/memtable.hpp"
 #include "../../../lib/index/native/native_index.hpp"
 #include "../../../lib/index/native/write_batch.hpp"
-
 #include "../../seastar_gtest.hpp"
 
 #include <gtest/gtest.h>
-#include <seastar/core/coroutine.hh>
 
+#include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <format>
 #include <fstream>
 #include <iterator>
+#include <seastar/core/coroutine.hh>
 #include <string>
 #include <vector>
 
@@ -74,7 +74,9 @@ std::vector<size_t> parseWalBoundaries(const std::string& data) {
     return starts;
 }
 
-std::string testKey(int i) { return std::format("fault_key_{:02d}", i); }
+std::string testKey(int i) {
+    return std::format("fault_key_{:02d}", i);
+}
 
 // Distinct sizes so record boundaries never coincide with DMA-block multiples
 // by accident, and content is verifiable per record.
@@ -434,6 +436,26 @@ public:
         }
         return best;
     }
+
+    static std::string currentSSTablePath() {
+        for (const auto& entry : std::filesystem::directory_iterator("shard_0/native_index")) {
+            if (entry.path().extension() == ".sst") {
+                return entry.path().string();
+            }
+        }
+        return {};
+    }
+
+    static std::vector<std::string> sstablePaths() {
+        std::vector<std::string> paths;
+        for (const auto& entry : std::filesystem::directory_iterator("shard_0/native_index")) {
+            if (entry.path().extension() == ".sst") {
+                paths.push_back(entry.path().string());
+            }
+        }
+        std::sort(paths.begin(), paths.end());
+        return paths;
+    }
 };
 
 // A crash may leave the first frame incomplete, so replay legitimately yields
@@ -485,8 +507,8 @@ SEASTAR_TEST_F(NativeIndexFaultInjectionTest, TornWalTailStillRecoversAckedSerie
     auto data = readWholeFile(walPath);
     EXPECT_FALSE(data.empty());
     std::string torn;
-    appendLE32(torn, 1u << 16);   // record_length promising 64KB
-    appendLE32(torn, 0xDEADBEEF); // bogus CRC
+    appendLE32(torn, 1u << 16);    // record_length promising 64KB
+    appendLE32(torn, 0xDEADBEEF);  // bogus CRC
     torn += "enospc-garbage";
     writeWholeFile(walPath, data + torn);
 
@@ -597,6 +619,72 @@ SEASTAR_TEST_F(NativeIndexFaultInjectionTest, OrphanPartialSSTableIgnoredAndAcke
         }
         co_await index.close();
     }
+}
+
+SEASTAR_TEST_F(NativeIndexFaultInjectionTest, MissingManifestSSTableFailsClosed) {
+    {
+        NativeIndex index(timestar::StorageLayout("."), 0);
+        co_await index.open();
+        (void)co_await index.getOrCreateSeriesId("missing_sst", {{"host", "a"}}, "value");
+        co_await index.close();
+    }
+
+    const auto sstPath = NativeIndexFaultInjectionTest::currentSSTablePath();
+    EXPECT_FALSE(sstPath.empty());
+    if (sstPath.empty())
+        co_return;
+    std::filesystem::remove(sstPath);
+
+    NativeIndex index(timestar::StorageLayout("."), 0);
+    EXPECT_THROW(co_await index.open(), std::runtime_error);
+    EXPECT_FALSE(std::filesystem::exists(sstPath));
+}
+
+SEASTAR_TEST_F(NativeIndexFaultInjectionTest, SymlinkedManifestSSTableFailsClosed) {
+    {
+        NativeIndex index(timestar::StorageLayout("."), 0);
+        co_await index.open();
+        (void)co_await index.getOrCreateSeriesId("symlink_sst", {{"host", "a"}}, "value");
+        co_await index.close();
+    }
+
+    const auto sstPath = NativeIndexFaultInjectionTest::currentSSTablePath();
+    EXPECT_FALSE(sstPath.empty());
+    if (sstPath.empty())
+        co_return;
+    const auto savedPath = sstPath + ".saved";
+    std::filesystem::rename(sstPath, savedPath);
+    std::filesystem::create_symlink(std::filesystem::path(savedPath).filename(), sstPath);
+
+    NativeIndex index(timestar::StorageLayout("."), 0);
+    EXPECT_THROW(co_await index.open(), std::runtime_error);
+    EXPECT_TRUE(std::filesystem::is_symlink(std::filesystem::symlink_status(sstPath)));
+}
+
+SEASTAR_TEST_F(NativeIndexFaultInjectionTest, SwappedManifestSSTableFailsMetadataBinding) {
+    {
+        NativeIndex index(timestar::StorageLayout("."), 0);
+        co_await index.open();
+        (void)co_await index.getOrCreateSeriesId("first", {{"host", "a"}}, "value");
+        co_await index.close();
+    }
+    {
+        NativeIndex index(timestar::StorageLayout("."), 0);
+        co_await index.open();
+        (void)co_await index.getOrCreateSeriesId("second_measurement_with_different_size",
+                                                 {{"host", std::string(200, 'b')}}, "different_field");
+        co_await index.close();
+    }
+
+    const auto paths = NativeIndexFaultInjectionTest::sstablePaths();
+    EXPECT_EQ(paths.size(), 2u);
+    if (paths.size() != 2)
+        co_return;
+    writeWholeFile(paths[0], readWholeFile(paths[1]));
+
+    NativeIndex index(timestar::StorageLayout("."), 0);
+    EXPECT_THROW(co_await index.open(), std::runtime_error);
+    EXPECT_TRUE(std::filesystem::exists(paths[0]));
 }
 
 // ============================================================================

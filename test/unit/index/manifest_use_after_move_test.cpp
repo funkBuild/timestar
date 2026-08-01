@@ -6,9 +6,10 @@
 // =============================================================================
 // Bug #15: Manifest use-after-move
 //
-// In manifest.cpp recovery, after `files_.push_back(std::move(f))`, the code
-// read `f.fileNumber` which is undefined behavior (use-after-move).
-// The fix saves `f.fileNumber` into a local variable before the move.
+// In manifest.cpp recovery, after moving a decoded file record into a vector,
+// the code read the moved-from record's fileNumber.  Recovery now stages and
+// validates records before publishing them, but the AddFile path must still
+// save the file number before moving the decoded record.
 // =============================================================================
 
 #ifndef MANIFEST_SOURCE_PATH
@@ -32,9 +33,9 @@ protected:
 };
 
 TEST_F(ManifestUseAfterMoveTest, SourceInspection_NoUseAfterMove) {
-    // Find all occurrences of push_back(std::move(f)) and verify none are
-    // followed by f.fileNumber before the next closing brace '}' (staying in scope).
-    std::string pattern = "push_back(std::move(f))";
+    // Find every move of a decoded `file` record and verify the moved-from
+    // record is not subsequently dereferenced in the same statement block.
+    std::string pattern = "push_back(std::move(file))";
     size_t pos = 0;
     int occurrences = 0;
 
@@ -51,38 +52,29 @@ TEST_F(ManifestUseAfterMoveTest, SourceInspection_NoUseAfterMove) {
 
         auto afterMove = sourceCode.substr(afterPos, checkEnd - afterPos);
 
-        // There should NOT be f.fileNumber after the move in this window
-        EXPECT_EQ(afterMove.find("f.fileNumber"), std::string::npos)
-            << "Found access to f.fileNumber after std::move(f) "
+        // There should NOT be file.fileNumber after the move in this window.
+        EXPECT_EQ(afterMove.find("file.fileNumber"), std::string::npos)
+            << "Found access to file.fileNumber after std::move(file) "
             << "(occurrence #" << occurrences << "). "
             << "This is use-after-move undefined behavior.\n"
-            << "Code after move:\n" << afterMove;
+            << "Code after move:\n"
+            << afterMove;
         pos += pattern.size();
     }
 
-    EXPECT_GE(occurrences, 1) << "Expected at least one push_back(std::move(f)) in manifest.cpp";
+    EXPECT_GE(occurrences, 1) << "Expected at least one push_back(std::move(file)) in manifest.cpp";
 }
 
 TEST_F(ManifestUseAfterMoveTest, SourceInspection_SavesFileNumberBeforeMove) {
-    // The fix pattern: save fileNumber to a local before the move.
-    // Look for "fn = f.fileNumber" appearing before the second push_back(std::move(f)).
-    // The second occurrence is in the recovery function where the bug was.
+    const auto savePos = sourceCode.find("const auto fileNumber = file.fileNumber;");
+    ASSERT_NE(savePos, std::string::npos) << "Recovery must save file.fileNumber before moving the record";
 
-    std::string pattern = "push_back(std::move(f))";
-    size_t firstPos = sourceCode.find(pattern);
-    ASSERT_NE(firstPos, std::string::npos);
-    size_t secondPos = sourceCode.find(pattern, firstPos + pattern.size());
-    ASSERT_NE(secondPos, std::string::npos) << "Expected at least two push_back(std::move(f))";
+    const auto movePos = sourceCode.find("files_.push_back(std::move(file));", savePos);
+    ASSERT_NE(movePos, std::string::npos) << "Expected the decoded AddFile record to be published";
+    EXPECT_LT(savePos, movePos);
 
-    // Check the 200 chars before the second move for the saved variable
-    size_t start = (secondPos > 200) ? secondPos - 200 : 0;
-    auto beforeMove = sourceCode.substr(start, secondPos - start);
-
-    // Should find something like "fn = f.fileNumber"
-    bool savesFileNumber = (beforeMove.find("= f.fileNumber") != std::string::npos);
-    EXPECT_TRUE(savesFileNumber)
-        << "Should save f.fileNumber to a local variable before std::move(f) "
-        << "in the recovery function.\n"
-        << "Code before move:\n" << beforeMove;
+    const auto advancePos = sourceCode.find("nextFileNumber_ = fileNumber + 1;", movePos);
+    ASSERT_NE(advancePos, std::string::npos) << "Recovery must advance from the saved value";
+    EXPECT_LT(movePos, advancePos);
 }
 #endif

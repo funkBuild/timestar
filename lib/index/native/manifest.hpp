@@ -3,9 +3,11 @@
 #include "sstable.hpp"
 
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <seastar/core/file.hh>
 #include <seastar/core/future.hh>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -47,8 +49,9 @@ public:
     seastar::future<> addFile(const SSTableMetadata& info);
     seastar::future<> removeFiles(const std::vector<uint64_t>& fileNumbers);
 
-    // Atomic add+remove: writes both records in a single append+fsync.
-    // Prevents crash-window where both old and new data exist in the manifest.
+    // Crash-safe add+remove: writes the add first and all removals in one
+    // append+fsync. A durable prefix may retain redundant old files, but can
+    // never remove a source before naming the replacement.
     seastar::future<> atomicReplaceFiles(const SSTableMetadata& newFile, const std::vector<uint64_t>& removeFileNums);
 
     // Write a full snapshot (compacts the manifest file)
@@ -60,7 +63,12 @@ public:
     seastar::future<> close();
 
     // File number generator (monotonically increasing)
-    uint64_t nextFileNumber() { return nextFileNumber_++; }
+    uint64_t nextFileNumber() {
+        if (nextFileNumber_ == std::numeric_limits<uint64_t>::max()) {
+            throw std::overflow_error("Manifest SSTable file number exhausted");
+        }
+        return nextFileNumber_++;
+    }
     uint64_t currentFileNumber() const { return nextFileNumber_; }
 
     const std::string& directory() const { return directory_; }
@@ -80,7 +88,7 @@ private:
     static void appendRecordFrame(std::string& out, const std::string& record);
 
     // Apply a single decoded record (type byte + payload) to in-memory state.
-    void applyRecord(const char* rp, const char* rend);
+    void applyRecord(const char* rp, const char* rend, bool legacyFormat);
 
     // Open (or reopen) the manifest file handle for appending.
     seastar::future<> openFileForAppend();
@@ -105,9 +113,9 @@ private:
     // by the time any append happens.
     bool crcFraming_ = false;
 
-    // Set when recover() stopped before consuming the whole file (torn tail
-    // or CRC-corrupt record). open() then rewrites a clean snapshot so new
-    // appends never land after unreachable garbage bytes.
+    // Set when recover() stopped before consuming a physically incomplete tail.
+    // Complete corruption throws and is preserved; open() rewrites only a
+    // provably torn tail so new appends never land after unreachable bytes.
     bool recoveryTruncated_ = false;
 
     enum RecordType : uint8_t { Snapshot = 0, AddFile = 1, RemoveFile = 2 };

@@ -2,17 +2,21 @@
 
 #include "crc32.hpp"
 
+#include <fcntl.h>
 #include <xxhash.h>
 #include <zstd.h>
 
+#include <charconv>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
+#include <format>
 #include <memory>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/fstream.hh>
 #include <seastar/core/seastar.hh>
 #include <seastar/core/temporary_buffer.hh>
+#include <seastar/core/thread.hh>
 #include <stdexcept>
 
 // Thread-local zstd contexts for SSTable block compress/decompress.
@@ -35,6 +39,24 @@ static ZSTD_DCtx* getSstDCtx() {
 }  // namespace
 
 namespace timestar::index {
+
+static constexpr auto OPEN_NOFOLLOW = static_cast<seastar::open_flags>(O_NOFOLLOW);
+
+static uint64_t inferCanonicalFileNumber(const std::string& filename) {
+    const auto basename = std::filesystem::path(filename).filename().string();
+    static constexpr std::string_view prefix = "idx_";
+    static constexpr std::string_view suffix = ".sst";
+    if (!basename.starts_with(prefix) || !basename.ends_with(suffix))
+        return 0;
+    const std::string_view digits(basename.data() + prefix.size(), basename.size() - prefix.size() - suffix.size());
+    uint64_t fileNumber = 0;
+    const auto [end, error] = std::from_chars(digits.data(), digits.data() + digits.size(), fileNumber);
+    if (error != std::errc{} || end != digits.data() + digits.size() || fileNumber == 0 ||
+        std::format("idx_{:06}.sst", fileNumber) != basename) {
+        return 0;
+    }
+    return fileNumber;
+}
 
 // --- SSTableReader static members ---
 thread_local seastar::semaphore* SSTableReader::blockReadSemaphore_ = nullptr;
@@ -82,21 +104,33 @@ static uint64_t decodeFixed64(const char* p) {
 // --- SSTableWriter (Step 3: streaming writes) ---
 
 seastar::future<SSTableWriter> SSTableWriter::create(std::string filename, int blockSize, int bloomBitsPerKey,
-                                                     int compressionLevel) {
+                                                     int compressionLevel, uint64_t fileNumber) {
     SSTableWriter writer;
     writer.filename_ = filename;
     writer.blockSize_ = blockSize;
     writer.compressionLevel_ = compressionLevel;
+    writer.fileNumber_ = fileNumber != 0 ? fileNumber : inferCanonicalFileNumber(filename);
     writer.bloom_ = BloomFilter(bloomBitsPerKey);
     writer.currentBlock_ = BlockBuilder(16);
     writer.writeTimestampNs_ = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch())
             .count());
 
-    // Step 3: Open file at creation time for streaming writes
+    // A regular existing file is an uncommitted orphan from a crash before the
+    // manifest append and is safe to reuse. Never follow a symlink or truncate
+    // another non-regular collision at the allocated identity.
+    auto pathIsSafe = co_await seastar::async([filename] {
+        const auto status = std::filesystem::symlink_status(filename);
+        return !std::filesystem::exists(status) || std::filesystem::is_regular_file(status);
+    });
+    if (!pathIsSafe) {
+        throw std::runtime_error("Refusing non-regular SSTable output path: " + filename);
+    }
+
+    // Step 3: Open file at creation time for streaming writes.
     std::string_view filenameView{filename};
-    writer.file_ = co_await seastar::open_file_dma(
-        filenameView, seastar::open_flags::wo | seastar::open_flags::create | seastar::open_flags::truncate);
+    writer.file_ = co_await seastar::open_file_dma(filenameView, seastar::open_flags::wo | seastar::open_flags::create |
+                                                                     seastar::open_flags::truncate | OPEN_NOFOLLOW);
     writer.dmaAlign_ = writer.file_.disk_write_dma_alignment();
     writer.fileOpen_ = true;
 
@@ -213,9 +247,13 @@ seastar::future<SSTableMetadata> SSTableWriter::finish() {
     flushBlock();
 
     // Build bloom filter and append to buffer
+    const size_t metadataBufferOffset = pendingData_.size();
     bloom_.build();
     std::string bloomData;
     bloom_.serializeTo(bloomData);
+    char fileNumberBytes[8];
+    encodeFixed64(fileNumberBytes, fileNumber_);
+    bloomData.append(fileNumberBytes, sizeof(fileNumberBytes));
     uint64_t bloomOffset = fileOffset_;
     pendingData_.append(bloomData);
     fileOffset_ += bloomData.size();
@@ -254,7 +292,9 @@ seastar::future<SSTableMetadata> SSTableWriter::finish() {
     encodeFixed64(footer + 24, indexSize);
     encodeFixed64(footer + 32, entryCount_);
     encodeFixed64(footer + 40, writeTimestampNs_);
-    // footer + 48: reserved (8 bytes, zeroed)
+    encodeFixed32(footer + 48,
+                  CRC32::compute(pendingData_.data() + metadataBufferOffset, bloomData.size() + indexSize));
+    // footer + 52: reserved (4 bytes, zeroed)
     encodeFixed32(footer + 56, SSTABLE_MAGIC);
     encodeFixed32(footer + 60, SSTABLE_VERSION);
     pendingData_.append(footer, SSTABLE_FOOTER_SIZE);
@@ -322,11 +362,13 @@ seastar::future<SSTableMetadata> SSTableWriter::finish() {
     pendingData_.shrink_to_fit();
 
     SSTableMetadata meta;
+    meta.fileNumber = fileNumber_;
     meta.entryCount = entryCount_;
     meta.fileSize = fileOffset_;
     meta.minKey = firstKey_;
     meta.maxKey = lastKey_;
     meta.writeTimestamp = writeTimestampNs_;
+    meta.formatVersion = SSTABLE_VERSION;
     co_return meta;
 }
 
@@ -355,7 +397,7 @@ seastar::future<std::unique_ptr<SSTableReader>> SSTableReader::open(std::string 
     reader->blockCache_ = cache;
     reader->cacheId_ = cache ? BlockCache::nextCacheId() : 0;
 
-    auto file = co_await seastar::open_file_dma(filename, seastar::open_flags::ro);
+    auto file = co_await seastar::open_file_dma(filename, seastar::open_flags::ro | OPEN_NOFOLLOW);
 
     auto fileSize = co_await file.size();
     if (fileSize < SSTABLE_FOOTER_SIZE) {
@@ -395,7 +437,7 @@ seastar::future<std::unique_ptr<SSTableReader>> SSTableReader::open(std::string 
         co_await file.close();
         throw std::runtime_error("SSTable bad magic: " + filename);
     }
-    if (version != SSTABLE_VERSION) {
+    if (version != SSTABLE_LEGACY_VERSION && version != SSTABLE_VERSION) {
         co_await file.close();
         throw std::runtime_error("SSTable unsupported version " + std::to_string(version) + ": " + filename);
     }
@@ -406,14 +448,29 @@ seastar::future<std::unique_ptr<SSTableReader>> SSTableReader::open(std::string 
     uint64_t indexSize = decodeFixed64(fp + 24);
     uint64_t entryCount = decodeFixed64(fp + 32);
     uint64_t writeTimestampNs = decodeFixed64(fp + 40);
+    const uint32_t storedMetadataCrc = decodeFixed32(fp + 48);
+
+    const size_t reservedStart = version == SSTABLE_LEGACY_VERSION ? 48 : 52;
+    for (size_t i = reservedStart; i < 56; ++i) {
+        if (static_cast<unsigned char>(fp[i]) != 0) {
+            co_await file.close();
+            throw std::runtime_error("SSTable footer reserved bytes are nonzero: " + filename);
+        }
+    }
 
     reader->metadata_.entryCount = entryCount;
     reader->metadata_.fileSize = fileSize;
     reader->metadata_.writeTimestamp = writeTimestampNs;
+    reader->metadata_.formatVersion = version;
 
     // Read bloom + index in a single DMA read (they're contiguous at the end of the file).
-    uint64_t metaStart = std::min(bloomOffset, indexOffset);
     uint64_t metaEnd = fileSize - SSTABLE_FOOTER_SIZE;
+    if (bloomOffset > metaEnd || bloomSize > metaEnd - bloomOffset || indexOffset != bloomOffset + bloomSize ||
+        indexOffset > metaEnd || indexSize != metaEnd - indexOffset) {
+        co_await file.close();
+        throw std::runtime_error("SSTable metadata layout is invalid: " + filename);
+    }
+    const uint64_t metaStart = bloomOffset;
     if (metaStart < metaEnd) {
         size_t alignedMetaOffset = metaStart & ~(dmaAlign - 1);
         size_t alignedMetaSize = ((metaEnd - alignedMetaOffset) + dmaAlign - 1) & ~(dmaAlign - 1);
@@ -438,16 +495,36 @@ seastar::future<std::unique_ptr<SSTableReader>> SSTableReader::open(std::string 
 
         const char* metaBase = metaBuf.get() + (metaStart - alignedMetaOffset);
 
+        if (version == SSTABLE_VERSION &&
+            CRC32::compute(metaBase, static_cast<size_t>(metaEnd - metaStart)) != storedMetadataCrc) {
+            throw std::runtime_error("SSTable metadata CRC32 mismatch: " + filename);
+        }
+
         // Parse bloom filter
-        if (bloomSize > 0 && bloomOffset >= metaStart && bloomOffset + bloomSize <= metaEnd) {
-            reader->bloom_ =
-                BloomFilter::deserializeFrom(std::string_view(metaBase + (bloomOffset - metaStart), bloomSize));
+        if (bloomSize > 0) {
+            if (version == SSTABLE_LEGACY_VERSION) {
+                // V1 did not checksum its bloom/index region. A corrupted bloom
+                // can create false negatives, so legacy files deliberately use
+                // a null filter until compaction rewrites them as v2.
+                reader->bloom_ = BloomFilter::createNull();
+            } else {
+                if (bloomSize < 13) {
+                    throw std::runtime_error("SSTable v2 bloom/identity block is truncated: " + filename);
+                }
+                const auto filterSize = static_cast<size_t>(bloomSize - 8);
+                const auto* bloomData = metaBase + (bloomOffset - metaStart);
+                reader->metadata_.fileNumber = decodeFixed64(bloomData + filterSize);
+                reader->bloom_ = BloomFilter::deserializeFrom(std::string_view(bloomData, filterSize));
+                if (reader->bloom_.isNull() || reader->bloom_.filterSize() + 5 != filterSize) {
+                    throw std::runtime_error("SSTable bloom filter is malformed: " + filename);
+                }
+            }
         } else {
-            reader->bloom_ = BloomFilter::createNull();
+            throw std::runtime_error("SSTable bloom filter is missing: " + filename);
         }
 
         // Parse index block
-        if (indexSize > 0 && indexOffset >= metaStart && indexOffset + indexSize <= metaEnd) {
+        if (indexSize > 0) {
             const char* ip = metaBase + (indexOffset - metaStart);
             const char* iend = ip + indexSize;
 
@@ -464,6 +541,8 @@ seastar::future<std::unique_ptr<SSTableReader>> SSTableReader::open(std::string 
                                          std::to_string(remainingBytes) + " bytes remain");
             }
             reader->index_.reserve(numEntries);
+            uint64_t expectedBlockOffset = 0;
+            std::string previousFirstKey;
             for (uint32_t i = 0; i < numEntries; ++i) {
                 if (ip + 4 > iend)
                     throw std::runtime_error("SSTable index entry truncated");
@@ -482,15 +561,29 @@ seastar::future<std::unique_ptr<SSTableReader>> SSTableReader::open(std::string 
                 uint32_t size = decodeFixed32(ip);
                 ip += 4;
 
+                if (firstKey.empty() || (!previousFirstKey.empty() && firstKey <= previousFirstKey)) {
+                    throw std::runtime_error("SSTable index keys are empty or out of order: " + filename);
+                }
+                if (size < 8 || offset != expectedBlockOffset || offset > bloomOffset || size > bloomOffset - offset) {
+                    throw std::runtime_error("SSTable index block extent is invalid: " + filename);
+                }
+                expectedBlockOffset = offset + size;
+                previousFirstKey = firstKey;
+
                 reader->index_.push_back({std::move(firstKey), offset, size});
+            }
+            if (ip != iend || expectedBlockOffset != bloomOffset || (entryCount == 0) != reader->index_.empty()) {
+                throw std::runtime_error("SSTable index does not cover the data region exactly: " + filename);
             }
 
             if (!reader->index_.empty()) {
                 reader->metadata_.minKey = reader->index_.front().firstKey;
             }
+        } else {
+            throw std::runtime_error("SSTable index block is missing: " + filename);
         }
     } else {
-        reader->bloom_ = BloomFilter::createNull();
+        throw std::runtime_error("SSTable metadata region is empty: " + filename);
     }
 
     // Build two-level summary index for faster block lookups
@@ -500,11 +593,47 @@ seastar::future<std::unique_ptr<SSTableReader>> SSTableReader::open(std::string 
     reader->readFile_ = std::move(file);
     reader->readFileOpen_ = true;
 
+    if (version == SSTABLE_LEGACY_VERSION) {
+        // V1's index was not checksummed either. Bind every index entry to its
+        // CRC-protected data block once at open so a structurally plausible
+        // interior-key corruption cannot make lookups silently skip a block.
+        uint64_t recoveredEntryCount = 0;
+        std::string previousKey;
+        for (size_t blockIndex = 0; blockIndex < reader->index_.size(); ++blockIndex) {
+            auto blockData = co_await reader->decompressBlock(blockIndex);
+            BlockReader block(blockData);
+            if (!block.valid()) {
+                throw std::runtime_error("Legacy SSTable contains a malformed data block: " + filename);
+            }
+            auto blockIt = block.newIterator();
+            blockIt.seekToFirst();
+            bool firstInBlock = true;
+            while (blockIt.valid()) {
+                const std::string key(blockIt.key());
+                if ((firstInBlock && key != reader->index_[blockIndex].firstKey) ||
+                    (!previousKey.empty() && key <= previousKey)) {
+                    throw std::runtime_error("Legacy SSTable index/data keys do not match: " + filename);
+                }
+                firstInBlock = false;
+                previousKey = key;
+                ++recoveredEntryCount;
+                blockIt.next();
+            }
+            if (firstInBlock) {
+                throw std::runtime_error("Legacy SSTable contains an empty indexed block: " + filename);
+            }
+        }
+        if (recoveredEntryCount != entryCount) {
+            throw std::runtime_error("Legacy SSTable entry count does not match its data blocks: " + filename);
+        }
+        reader->metadata_.maxKey = std::move(previousKey);
+    }
+
     // Populate the key range: minKey comes from the index (first key of the
     // first block, set above); maxKey requires reading the last data block —
     // the index only stores each block's FIRST key. One extra block read at
     // open() enables range-based pruning in kvGet/kvExists/kvPrefixScan.
-    if (!reader->index_.empty() && reader->metadata_.maxKey.empty()) {
+    if (version == SSTABLE_VERSION && !reader->index_.empty() && reader->metadata_.maxKey.empty()) {
         auto lastBlockData = co_await reader->decompressBlock(reader->index_.size() - 1);
         BlockReader lastBlock(lastBlockData);
         if (lastBlock.valid()) {

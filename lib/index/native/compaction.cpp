@@ -12,6 +12,7 @@
 #include <seastar/core/seastar.hh>
 #include <seastar/core/sleep.hh>
 #include <seastar/util/log.hh>
+#include <stdexcept>
 
 namespace timestar::index {
 
@@ -129,6 +130,12 @@ seastar::future<> CompactionEngine::doCompaction(CompactionJob job) {
         int priority = static_cast<int>(job.inputFiles.size()) - 1;
         for (const auto& fileMeta : job.inputFiles) {
             auto reader = co_await SSTableReader::open(sstFilename(fileMeta.fileNumber));
+            if (reader->metadata().formatVersion != SSTABLE_LEGACY_VERSION &&
+                reader->metadata().fileNumber != fileMeta.fileNumber) {
+                co_await reader->close();
+                throw std::runtime_error("SSTable identity does not match manifest during compaction for file " +
+                                         std::to_string(fileMeta.fileNumber));
+            }
             auto iter = reader->newIterator();
             sources.push_back(std::make_unique<SSTableIteratorSource>(std::move(iter), priority--));
             inputReaders.push_back(std::move(reader));
@@ -138,7 +145,11 @@ seastar::future<> CompactionEngine::doCompaction(CompactionJob job) {
     }
     if (openError) {
         for (auto& reader : inputReaders) {
-            co_await reader->close();
+            try {
+                co_await reader->close();
+            } catch (const std::exception& e) {
+                compaction_log.warn("Failed to close an SSTable reader after input-open failure: {}", e.what());
+            }
         }
         std::rethrow_exception(openError);
     }
@@ -156,10 +167,23 @@ seastar::future<> CompactionEngine::doCompaction(CompactionJob job) {
         for (const auto& f : job.inputFiles)
             toRemove.push_back(f.fileNumber);
         co_await manifest_.removeFiles(toRemove);
+        bool removedAny = false;
         for (const auto& f : job.inputFiles) {
             auto path = sstFilename(f.fileNumber);
-            if (co_await seastar::file_exists(path)) {
-                co_await seastar::remove_file(path);
+            try {
+                if (co_await seastar::file_exists(path)) {
+                    co_await seastar::remove_file(path);
+                    removedAny = true;
+                }
+            } catch (const std::exception& e) {
+                compaction_log.error("Failed to remove obsolete empty SSTable {}: {}", path, e.what());
+            }
+        }
+        if (removedAny) {
+            try {
+                co_await seastar::sync_directory(dataDir_);
+            } catch (const std::exception& e) {
+                compaction_log.error("Failed to sync SSTable directory after obsolete-file cleanup: {}", e.what());
             }
         }
         co_return;
@@ -170,8 +194,8 @@ seastar::future<> CompactionEngine::doCompaction(CompactionJob job) {
     uint64_t outputFileNum = manifest_.nextFileNumber();
     auto outputPath = sstFilename(outputFileNum);
     int compressionLevel = (outputLevel >= 1) ? 3 : 1;
-    auto writer =
-        co_await SSTableWriter::create(outputPath, config_.blockSize, config_.bloomBitsPerKey, compressionLevel);
+    auto writer = co_await SSTableWriter::create(outputPath, config_.blockSize, config_.bloomBitsPerKey,
+                                                 compressionLevel, outputFileNum);
 
     // Tombstone GC: determine if tombstones from these input files can be dropped.
     // A tombstone is ONLY safe to drop when:
@@ -206,6 +230,7 @@ seastar::future<> CompactionEngine::doCompaction(CompactionJob job) {
     // Wrap the merge/write/manifest section so we can clean up the partial
     // output file if any step fails (no co_await in catch blocks in C++20).
     std::exception_ptr compactionError;
+    bool outputDurable = false;
     try {
         while (merger.valid()) {
             auto mergedVal = merger.value();
@@ -242,6 +267,7 @@ seastar::future<> CompactionEngine::doCompaction(CompactionJob job) {
         co_await writer.flushPending();
 
         auto outputMeta = co_await writer.finish();
+        outputDurable = true;
         outputMeta.fileNumber = outputFileNum;
         outputMeta.level = outputLevel;
 
@@ -251,10 +277,29 @@ seastar::future<> CompactionEngine::doCompaction(CompactionJob job) {
         }
         co_await manifest_.atomicReplaceFiles(outputMeta, toRemove);
 
+        bool removedAny = false;
         for (const auto& f : job.inputFiles) {
             auto path = sstFilename(f.fileNumber);
-            if (co_await seastar::file_exists(path)) {
-                co_await seastar::remove_file(path);
+            try {
+                if (co_await seastar::file_exists(path)) {
+                    co_await seastar::remove_file(path);
+                    removedAny = true;
+                }
+            } catch (const std::exception& e) {
+                // The manifest already names the durable output and no longer
+                // names this source. Retain the live output; an undeleted
+                // source is a safe orphan and can be reclaimed later.
+                compaction_log.error("Failed to remove obsolete SSTable {}: {}", path, e.what());
+            }
+        }
+        if (removedAny) {
+            try {
+                co_await seastar::sync_directory(dataDir_);
+            } catch (const std::exception& e) {
+                // A failed cleanup barrier can resurrect only unreferenced old
+                // names after a crash. It must not invalidate the committed
+                // replacement or cause its output to be deleted.
+                compaction_log.error("Failed to sync SSTable directory after obsolete-file cleanup: {}", e.what());
             }
         }
 
@@ -267,14 +312,31 @@ seastar::future<> CompactionEngine::doCompaction(CompactionJob job) {
 
     // Close input readers on both success and failure paths (fd leak otherwise).
     // The merger's iterators are not touched after this point.
+    std::exception_ptr closeError;
     for (auto& reader : inputReaders) {
-        co_await reader->close();
+        try {
+            co_await reader->close();
+        } catch (...) {
+            if (!closeError)
+                closeError = std::current_exception();
+        }
     }
+    if (!compactionError)
+        compactionError = closeError;
 
-    // Clean up partial output file on failure
+    // Before finish() returns, abort owns and can remove a partial output. Once
+    // the output is durable, preserve it across any manifest error: fsync
+    // failure is an ambiguous publication result, so recovery may find either
+    // the old manifest (where this is a harmless orphan) or a manifest that
+    // references the output.
     if (compactionError) {
-        if (co_await seastar::file_exists(outputPath)) {
-            co_await seastar::remove_file(outputPath);
+        if (!outputDurable) {
+            co_await writer.abort();
+            try {
+                co_await seastar::sync_directory(dataDir_);
+            } catch (const std::exception& e) {
+                compaction_log.error("Failed to sync SSTable directory after partial-output cleanup: {}", e.what());
+            }
         }
         std::rethrow_exception(compactionError);
     }

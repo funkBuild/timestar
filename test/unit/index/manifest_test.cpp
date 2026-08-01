@@ -1,13 +1,15 @@
 #include "../../../lib/index/native/manifest.hpp"
 
+#include "../../../lib/utils/crc32.hpp"
 #include "../../seastar_gtest.hpp"
 
 #include <gtest/gtest.h>
-#include <seastar/core/coroutine.hh>
 
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <limits>
+#include <seastar/core/coroutine.hh>
 #include <string>
 
 using namespace timestar::index;
@@ -184,9 +186,10 @@ void writeWholeFile(const std::string& path, const std::string& data) {
 
 }  // namespace
 
-// A record whose CRC does not match must stop recovery at that record,
-// keeping everything recovered before it (same policy as WAL replay).
-SEASTAR_TEST_F(ManifestTest, CorruptRecordCRCStopsRecovery) {
+// A fully present record whose CRC does not match is corruption, not a torn
+// append. Startup must preserve it and fail closed rather than rewriting away
+// an acknowledged manifest mutation.
+SEASTAR_TEST_F(ManifestTest, CompleteCorruptRecordFailsClosedAndIsPreserved) {
     {
         auto m = co_await Manifest::open(self->dir_);
         SSTableMetadata f1;
@@ -214,32 +217,100 @@ SEASTAR_TEST_F(ManifestTest, CorruptRecordCRCStopsRecovery) {
     data.back() = static_cast<char>(data.back() ^ 0x5A);
     writeWholeFile(path, data);
 
+    EXPECT_THROW(co_await Manifest::open(self->dir_), std::runtime_error);
+    EXPECT_EQ(readWholeFile(path), data) << "failed recovery must not rewrite the corrupt source";
+}
+
+SEASTAR_TEST_F(ManifestTest, CompleteMalformedRecordFailsClosedAndIsPreserved) {
     {
         auto m = co_await Manifest::open(self->dir_);
-        EXPECT_EQ(m.files().size(), 1u) << "recovery must stop at the corrupt record";
-        if (m.files().size() == 1) {
-            EXPECT_EQ(m.files()[0].fileNumber, 1u);
-            EXPECT_EQ(m.files()[0].minKey, "aaa");
-        }
         co_await m.close();
     }
 
-    // open() must have rewritten a clean snapshot: reopening again succeeds
-    // with the same state and new appends are recoverable.
+    auto path = self->dir_ + "/MANIFEST";
+    auto data = readWholeFile(path);
+    std::string record(1, static_cast<char>(99));  // unknown RecordType
+    appendLE32(data, static_cast<uint32_t>(record.size()));
+    appendLE32(data, CRC32::compute(record.data(), record.size()));
+    data.append(record);
+    writeWholeFile(path, data);
+
+    EXPECT_THROW(co_await Manifest::open(self->dir_), std::runtime_error);
+    EXPECT_EQ(readWholeFile(path), data);
+}
+
+SEASTAR_TEST_F(ManifestTest, CorruptMagicCannotDowngradeToEmptyLegacyState) {
     {
         auto m = co_await Manifest::open(self->dir_);
-        EXPECT_EQ(m.files().size(), 1u);
-        SSTableMetadata f3;
-        f3.fileNumber = m.nextFileNumber();
-        f3.level = 0;
-        co_await m.addFile(f3);
         co_await m.close();
     }
-    {
-        auto m = co_await Manifest::open(self->dir_);
-        EXPECT_EQ(m.files().size(), 2u);
-        co_await m.close();
-    }
+    auto path = self->dir_ + "/MANIFEST";
+    auto data = readWholeFile(path);
+    EXPECT_GE(data.size(), Manifest::MANIFEST_HEADER_SIZE);
+    if (data.size() < Manifest::MANIFEST_HEADER_SIZE)
+        co_return;
+    data[0] ^= 0x01;
+    writeWholeFile(path, data);
+
+    EXPECT_THROW(co_await Manifest::open(self->dir_), std::runtime_error);
+    EXPECT_EQ(readWholeFile(path), data);
+}
+
+SEASTAR_TEST_F(ManifestTest, HeaderWithoutSnapshotFailsClosedAndIsPreserved) {
+    std::string data;
+    appendLE32(data, Manifest::MANIFEST_MAGIC);
+    appendLE32(data, Manifest::MANIFEST_VERSION);
+    const auto path = self->dir_ + "/MANIFEST";
+    writeWholeFile(path, data);
+
+    EXPECT_THROW(co_await Manifest::open(self->dir_), std::runtime_error);
+    EXPECT_EQ(readWholeFile(path), data);
+}
+
+SEASTAR_TEST_F(ManifestTest, FileNumberExhaustionCannotWrap) {
+    std::string snapshot;
+    snapshot.push_back(static_cast<char>(0));  // RecordType::Snapshot
+    appendLE64(snapshot, std::numeric_limits<uint64_t>::max());
+    appendLE32(snapshot, 0);  // file count
+
+    std::string data;
+    appendLE32(data, Manifest::MANIFEST_MAGIC);
+    appendLE32(data, Manifest::MANIFEST_VERSION);
+    appendLE32(data, static_cast<uint32_t>(snapshot.size()));
+    appendLE32(data, CRC32::compute(snapshot.data(), snapshot.size()));
+    data.append(snapshot);
+    writeWholeFile(self->dir_ + "/MANIFEST", data);
+
+    auto m = co_await Manifest::open(self->dir_);
+    EXPECT_THROW((void)m.nextFileNumber(), std::overflow_error);
+    EXPECT_EQ(m.currentFileNumber(), std::numeric_limits<uint64_t>::max());
+    co_await m.close();
+}
+
+SEASTAR_TEST_F(ManifestTest, SymlinkedManifestIsRejectedWithoutTouchingTarget) {
+    const auto target = self->dir_ + "/manifest-target";
+    const auto manifest = self->dir_ + "/MANIFEST";
+    const std::string contents = "durable manifest target";
+    writeWholeFile(target, contents);
+    std::filesystem::create_symlink(std::filesystem::path(target).filename(), manifest);
+
+    EXPECT_THROW(co_await Manifest::open(self->dir_), std::runtime_error);
+    EXPECT_EQ(readWholeFile(target), contents);
+    EXPECT_TRUE(std::filesystem::is_symlink(std::filesystem::symlink_status(manifest)));
+}
+
+SEASTAR_TEST_F(ManifestTest, SymlinkedSnapshotTempIsRejectedWithoutTouchingTarget) {
+    auto m = co_await Manifest::open(self->dir_);
+    const auto target = self->dir_ + "/temp-target";
+    const auto temp = self->dir_ + "/MANIFEST.tmp";
+    const std::string contents = "durable temp target";
+    writeWholeFile(target, contents);
+    std::filesystem::create_symlink(std::filesystem::path(target).filename(), temp);
+
+    EXPECT_THROW(co_await m.writeSnapshot(), std::runtime_error);
+    EXPECT_EQ(readWholeFile(target), contents);
+    EXPECT_TRUE(std::filesystem::is_symlink(std::filesystem::symlink_status(temp)));
+    co_await m.close();
 }
 
 // Legacy (v1, pre-CRC) manifests must recover correctly and be upgraded to
@@ -255,10 +326,10 @@ SEASTAR_TEST_F(ManifestTest, LegacyFormatBackwardCompat) {
     appendLE64(record, 12345);               // fileSize
     appendLE64(record, 678);                 // entryCount
     appendLE32(record, 3);
-    record.append("abc");                    // minKey
+    record.append("abc");  // minKey
     appendLE32(record, 3);
-    record.append("xyz");                    // maxKey
-    appendLE64(record, 999999);              // writeTimestamp
+    record.append("xyz");        // maxKey
+    appendLE64(record, 999999);  // writeTimestamp
 
     std::string file;
     appendLE32(file, static_cast<uint32_t>(record.size()));  // legacy frame: no CRC
@@ -320,9 +391,9 @@ SEASTAR_TEST_F(ManifestTest, TornTailDiscardedOnRecovery) {
     auto path = self->dir_ + "/MANIFEST";
     auto data = readWholeFile(path);
     std::string torn;
-    appendLE32(torn, 1000);       // record_len
-    appendLE32(torn, 0xDEADBEEF); // record_crc
-    torn.append("partial");       // far fewer than 1000 bytes
+    appendLE32(torn, 1000);        // record_len
+    appendLE32(torn, 0xDEADBEEF);  // record_crc
+    torn.append("partial");        // far fewer than 1000 bytes
     writeWholeFile(path, data + torn);
 
     {

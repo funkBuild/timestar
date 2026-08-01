@@ -25,6 +25,7 @@
 namespace timestar::index {
 
 static seastar::logger index_wal_log("timestar.index_wal");
+static constexpr auto OPEN_NOFOLLOW = static_cast<seastar::open_flags>(O_NOFOLLOW);
 
 // CRC32C using SSE 4.2 hardware intrinsics (Castagnoli polynomial).
 // Falls back to software table for non-x86 platforms.
@@ -185,7 +186,7 @@ seastar::future<> IndexWAL::openFile() {
     const auto flags = pathExists
                            ? seastar::open_flags::rw
                            : seastar::open_flags::rw | seastar::open_flags::create | seastar::open_flags::exclusive;
-    walFile_.emplace(co_await seastar::open_file_dma(currentPath_, flags));
+    walFile_.emplace(co_await seastar::open_file_dma(currentPath_, flags | OPEN_NOFOLLOW));
     if (pathExists) {
         uint64_t existingSize = 0;
         std::exception_ptr sizeError;
@@ -487,7 +488,7 @@ seastar::future<uint64_t> IndexWAL::replayOneFile(const std::string& path, MemTa
     }
 
     // Read WAL file using Seastar DMA I/O
-    auto f = co_await seastar::open_file_dma(path, seastar::open_flags::ro);
+    auto f = co_await seastar::open_file_dma(path, seastar::open_flags::ro | OPEN_NOFOLLOW);
     auto is = seastar::make_file_input_stream(f);
     auto buf = co_await is.read_exactly(fileSize);
     co_await is.close();

@@ -20,7 +20,7 @@ namespace timestar::index {
 // SSTable file format:
 //   [Data Block 0] [Data Block 1] ... [Data Block N]
 //     Each block: [uncompressed_size(4)] [compressed_data(N)] [crc32(4)]
-//   [Bloom Filter Block]
+//   [Bloom Filter Block] [file_number (uint64_t), v2]
 //   [Index Block]
 //   [Footer (64 bytes)]
 //
@@ -31,12 +31,14 @@ namespace timestar::index {
 //   index_size         (uint64_t)  offset 24
 //   entry_count        (uint64_t)  offset 32
 //   write_timestamp_ns (uint64_t)  offset 40  — wall-clock ns when SSTable was created
-//   reserved           (uint64_t)  offset 48  — for future use
+//   metadata_crc32     (uint32_t)  offset 48  — v2 CRC over bloom + index
+//   reserved           (uint32_t)  offset 52  — zero
 //   magic              (uint32_t)  offset 56  0x54534958 = "TSIX"
-//   version            (uint32_t)  offset 60  1
+//   version            (uint32_t)  offset 60  2
 
 static constexpr uint32_t SSTABLE_MAGIC = 0x54534958;  // "TSIX"
-static constexpr uint32_t SSTABLE_VERSION = 1;
+static constexpr uint32_t SSTABLE_LEGACY_VERSION = 1;
+static constexpr uint32_t SSTABLE_VERSION = 2;
 static constexpr size_t SSTABLE_FOOTER_SIZE = 64;
 
 struct SSTableMetadata {
@@ -47,6 +49,7 @@ struct SSTableMetadata {
     std::string maxKey;
     int level = 0;
     uint64_t writeTimestamp = 0;  // Wall-clock nanoseconds when SSTable was created
+    uint32_t formatVersion = 0;   // Reader-only; not serialized in the manifest
 };
 
 struct IndexEntry {
@@ -63,7 +66,7 @@ public:
     // Create a writer for a new SSTable file. Opens the file handle.
     // compressionLevel: zstd level (1=fast for L0 flushes, 3=better ratio for compacted L1+).
     static seastar::future<SSTableWriter> create(std::string filename, int blockSize = 16384, int bloomBitsPerKey = 15,
-                                                 int compressionLevel = 1);
+                                                 int compressionLevel = 1, uint64_t fileNumber = 0);
 
     // Add a key-value pair. Keys MUST be added in sorted order.
     // Synchronous — buffers data in memory. Call flushPending() periodically
@@ -105,6 +108,7 @@ private:
     std::string lastKey_;
     std::string currentBlockFirstKey_;
     uint64_t writeTimestampNs_ = 0;  // Captured at create() time
+    uint64_t fileNumber_ = 0;        // Bound into v2 metadata for manifest identity validation
 
     // Step 3: Streaming I/O
     seastar::file file_;

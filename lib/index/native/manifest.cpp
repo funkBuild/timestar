@@ -2,11 +2,16 @@
 
 #include "crc32.hpp"
 
+#include <fcntl.h>
+
 #include <algorithm>
 #include <cstring>
+#include <filesystem>
+#include <limits>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/seastar.hh>
 #include <seastar/core/temporary_buffer.hh>
+#include <seastar/core/thread.hh>
 #include <seastar/util/log.hh>
 #include <stdexcept>
 #include <unordered_set>
@@ -14,6 +19,7 @@
 namespace timestar::index {
 
 static seastar::logger manifest_log("timestar.manifest");
+static constexpr auto OPEN_NOFOLLOW = static_cast<seastar::open_flags>(O_NOFOLLOW);
 
 static void encodeFixed32(std::string& out, uint32_t v) {
     char buf[4];
@@ -45,6 +51,54 @@ static uint64_t decodeFixed64(const char* p) {
     return r;
 }
 
+static void requireBytes(const char* p, const char* end, size_t count, std::string_view field) {
+    if (p > end || static_cast<size_t>(end - p) < count) {
+        throw std::runtime_error("Malformed manifest record: truncated " + std::string(field));
+    }
+}
+
+static SSTableMetadata decodeFileMetadata(const char*& p, const char* end, bool withTimestamp) {
+    requireBytes(p, end, 28, "SSTable metadata");
+    SSTableMetadata file;
+    file.fileNumber = decodeFixed64(p);
+    p += 8;
+    const auto level = decodeFixed32(p);
+    p += 4;
+    file.fileSize = decodeFixed64(p);
+    p += 8;
+    file.entryCount = decodeFixed64(p);
+    p += 8;
+
+    requireBytes(p, end, 4, "minimum-key length");
+    const auto minKeyLength = decodeFixed32(p);
+    p += 4;
+    requireBytes(p, end, minKeyLength, "minimum key");
+    file.minKey.assign(p, minKeyLength);
+    p += minKeyLength;
+
+    requireBytes(p, end, 4, "maximum-key length");
+    const auto maxKeyLength = decodeFixed32(p);
+    p += 4;
+    requireBytes(p, end, maxKeyLength, "maximum key");
+    file.maxKey.assign(p, maxKeyLength);
+    p += maxKeyLength;
+
+    if (withTimestamp) {
+        requireBytes(p, end, 8, "write timestamp");
+        file.writeTimestamp = decodeFixed64(p);
+        p += 8;
+    }
+
+    if (file.fileNumber == 0 || file.fileNumber == std::numeric_limits<uint64_t>::max()) {
+        throw std::runtime_error("Malformed manifest record: invalid SSTable file number");
+    }
+    if (level > 3) {
+        throw std::runtime_error("Malformed manifest record: invalid SSTable level " + std::to_string(level));
+    }
+    file.level = static_cast<int>(level);
+    return file;
+}
+
 seastar::future<> Manifest::openFileForAppend() {
     if (fileOpen_) {
         co_await file_.flush();
@@ -52,7 +106,17 @@ seastar::future<> Manifest::openFileForAppend() {
         fileOpen_ = false;
     }
 
-    file_ = co_await seastar::open_file_dma(manifestPath_, seastar::open_flags::rw | seastar::open_flags::create);
+    auto [exists, regular] = co_await seastar::async([path = manifestPath_] {
+        const auto status = std::filesystem::symlink_status(path);
+        return std::make_pair(std::filesystem::exists(status), std::filesystem::is_regular_file(status));
+    });
+    if (exists && !regular) {
+        throw std::runtime_error("Manifest path is not a regular file: " + manifestPath_);
+    }
+
+    const auto flags = exists ? seastar::open_flags::rw
+                              : seastar::open_flags::rw | seastar::open_flags::create | seastar::open_flags::exclusive;
+    file_ = co_await seastar::open_file_dma(manifestPath_, flags | OPEN_NOFOLLOW);
     dmaAlign_ = file_.disk_write_dma_alignment();
     fileOpen_ = true;
 
@@ -61,19 +125,53 @@ seastar::future<> Manifest::openFileForAppend() {
 }
 
 seastar::future<Manifest> Manifest::open(std::string directory) {
-    co_await seastar::recursive_touch_directory(directory);
+    const auto createdDirectories = co_await seastar::async([directory] {
+        std::vector<std::filesystem::path> missing;
+        auto current = std::filesystem::path(directory);
+        while (true) {
+            const auto status = std::filesystem::symlink_status(current);
+            if (std::filesystem::exists(status)) {
+                if (!std::filesystem::is_directory(status)) {
+                    throw std::runtime_error("Manifest directory ancestor is not a directory: " + current.string());
+                }
+                break;
+            }
+            missing.push_back(current);
+            auto parent = current.parent_path();
+            if (parent.empty())
+                parent = ".";
+            if (parent == current)
+                break;
+            current = std::move(parent);
+        }
+        if (!missing.empty()) {
+            std::filesystem::create_directories(directory);
+        }
+        std::reverse(missing.begin(), missing.end());
+        return missing;
+    });
+    for (const auto& createdDirectory : createdDirectories) {
+        const auto parent = createdDirectory.parent_path();
+        co_await seastar::sync_directory(parent.empty() ? "." : parent.string());
+    }
 
     Manifest m;
     m.directory_ = directory;
     m.manifestPath_ = directory + "/MANIFEST";
 
-    bool exists = co_await seastar::file_exists(m.manifestPath_);
+    bool exists = co_await seastar::async([path = m.manifestPath_] {
+        const auto status = std::filesystem::symlink_status(path);
+        if (std::filesystem::exists(status) && !std::filesystem::is_regular_file(status)) {
+            throw std::runtime_error("Manifest path is not a regular file: " + path);
+        }
+        return std::filesystem::exists(status);
+    });
     bool needsRewrite = false;
     if (exists) {
         co_await m.recover();
         // Rewrite a clean v2 snapshot when:
         //  - the manifest is legacy (v1, no CRC framing): upgrade in place, or
-        //  - recovery stopped early (torn tail / corrupt record): discard the
+        //  - recovery stopped early at a physically incomplete tail: discard the
         //    unreachable garbage so future appends stay recoverable.
         // Both use the atomic temp-file + rename path in writeSnapshot().
         needsRewrite = !m.crcFraming_ || m.recoveryTruncated_;
@@ -203,6 +301,12 @@ seastar::future<> Manifest::appendFrame(const std::string& frame) {
 }
 
 seastar::future<> Manifest::addFile(const SSTableMetadata& info) {
+    if (info.fileNumber == 0 || info.fileNumber == std::numeric_limits<uint64_t>::max()) {
+        throw std::overflow_error("Invalid or exhausted manifest SSTable file number");
+    }
+    if (std::ranges::any_of(files_, [&info](const auto& file) { return file.fileNumber == info.fileNumber; })) {
+        throw std::runtime_error("Duplicate live SSTable file number " + std::to_string(info.fileNumber));
+    }
     std::string record = serializeAddFile(info);
     std::string frame;
     appendRecordFrame(frame, record);
@@ -239,9 +343,15 @@ seastar::future<> Manifest::removeFiles(const std::vector<uint64_t>& fileNumbers
 
 seastar::future<> Manifest::atomicReplaceFiles(const SSTableMetadata& newFile,
                                                const std::vector<uint64_t>& removeFileNums) {
-    // Build a single buffer containing the AddFile record followed by all
-    // RemoveFile records. One write+fsync ensures crash atomicity: either
-    // all records are persisted or none are.
+    if (newFile.fileNumber == 0 || newFile.fileNumber == std::numeric_limits<uint64_t>::max()) {
+        throw std::overflow_error("Invalid or exhausted manifest SSTable file number");
+    }
+    if (std::ranges::any_of(files_, [&newFile](const auto& file) { return file.fileNumber == newFile.fileNumber; })) {
+        throw std::runtime_error("Duplicate live SSTable file number " + std::to_string(newFile.fileNumber));
+    }
+    // Build one append with AddFile first, followed by all RemoveFile records.
+    // A torn append can expose only a safe prefix: either no change, the new
+    // file plus all old files, or the new file plus a subset of old files.
     std::string combinedFrame;
 
     // AddFile record
@@ -252,7 +362,7 @@ seastar::future<> Manifest::atomicReplaceFiles(const SSTableMetadata& newFile,
         appendRecordFrame(combinedFrame, serializeRemoveFile(fn));
     }
 
-    // Single write+fsync
+    // Single append+fsync durability boundary.
     co_await appendFrame(combinedFrame);
 
     // Update in-memory state AFTER successful persist
@@ -281,8 +391,19 @@ seastar::future<> Manifest::writeSnapshot() {
 
     // Write atomically: write to temp file via DMA, fsync, then rename.
     auto tmpPath = manifestPath_ + ".tmp";
-    auto tmpFile = co_await seastar::open_file_dma(
-        tmpPath, seastar::open_flags::wo | seastar::open_flags::create | seastar::open_flags::truncate);
+    const auto staleTempExists = co_await seastar::async([tmpPath] {
+        const auto status = std::filesystem::symlink_status(tmpPath);
+        if (std::filesystem::exists(status) && !std::filesystem::is_regular_file(status)) {
+            throw std::runtime_error("Manifest temporary path is not a regular file: " + tmpPath);
+        }
+        return std::filesystem::exists(status);
+    });
+    if (staleTempExists) {
+        co_await seastar::remove_file(tmpPath);
+        co_await seastar::sync_directory(directory_);
+    }
+    auto tmpFile = co_await seastar::open_file_dma(tmpPath, seastar::open_flags::wo | seastar::open_flags::create |
+                                                                seastar::open_flags::exclusive | OPEN_NOFOLLOW);
     auto tmpAlign = tmpFile.disk_write_dma_alignment();
 
     std::exception_ptr err;
@@ -334,7 +455,7 @@ seastar::future<> Manifest::recover() {
     crcFraming_ = false;
     recoveryTruncated_ = false;
 
-    auto readFile = co_await seastar::open_file_dma(manifestPath_, seastar::open_flags::ro);
+    auto readFile = co_await seastar::open_file_dma(manifestPath_, seastar::open_flags::ro | OPEN_NOFOLLOW);
     auto fileSize = co_await readFile.size();
     if (fileSize == 0) {
         co_await readFile.close();
@@ -363,31 +484,38 @@ seastar::future<> Manifest::recover() {
 
     if (crcFraming_) {
         // v2: [record_len(4)][record_crc(4)][record]
-        while (p + 8 <= end) {
+        size_t completeRecords = 0;
+        while (static_cast<size_t>(end - p) >= 8) {
             uint32_t recordLen = decodeFixed32(p);
             uint32_t storedCrc = decodeFixed32(p + 4);
-            if (p + 8 + recordLen > end) {
+            if (recordLen > static_cast<size_t>(end - p) - 8) {
                 recoveryTruncated_ = true;  // torn tail from a crash mid-append
                 break;
+            }
+            if (recordLen == 0) {
+                throw std::runtime_error("Manifest contains an empty record: " + manifestPath_);
             }
             p += 8;
 
             uint32_t computedCrc = CRC32::compute(p, recordLen);
             if (computedCrc != storedCrc) {
-                // Same policy as WAL replay: stop at the first corrupt record
-                // and keep everything recovered before it. open() rewrites a
-                // clean snapshot so the corrupt tail is discarded atomically.
-                manifest_log.error(
-                    "Manifest record CRC mismatch at offset {} in {} (stored {:#x}, computed {:#x}) — "
-                    "stopping recovery, {} trailing bytes discarded",
-                    static_cast<size_t>(p - 8 - fileBuf.get()), manifestPath_, storedCrc, computedCrc,
-                    static_cast<size_t>(end - p + 8));
-                recoveryTruncated_ = true;
-                break;
+                throw std::runtime_error("Manifest record CRC mismatch at offset " +
+                                         std::to_string(static_cast<size_t>(p - 8 - fileBuf.get())) + " in " +
+                                         manifestPath_);
             }
 
-            applyRecord(p, p + recordLen);
+            const auto recordType = static_cast<uint8_t>(*p);
+            if ((completeRecords == 0 && recordType != RecordType::Snapshot) ||
+                (completeRecords != 0 && recordType == RecordType::Snapshot)) {
+                throw std::runtime_error("Manifest record sequence does not begin with exactly one snapshot: " +
+                                         manifestPath_);
+            }
+            applyRecord(p, p + recordLen, false);
             p += recordLen;
+            ++completeRecords;
+        }
+        if (completeRecords == 0) {
+            throw std::runtime_error("Manifest contains no complete snapshot: " + manifestPath_);
         }
         if (p < end && !recoveryTruncated_) {
             recoveryTruncated_ = true;  // trailing partial length header
@@ -397,118 +525,113 @@ seastar::future<> Manifest::recover() {
 
     // Legacy v1: [record_len(4)][record], no CRC. Legacy manifests are always
     // rewritten as v2 snapshots by open(), which also discards any torn tail.
-    while (p + 4 <= end) {
+    size_t completeRecords = 0;
+    while (static_cast<size_t>(end - p) >= 4) {
         uint32_t recordLen = decodeFixed32(p);
         p += 4;
-        if (p + recordLen > end)
+        if (recordLen > static_cast<size_t>(end - p))
             break;
+        if (recordLen == 0) {
+            throw std::runtime_error("Legacy manifest contains an empty record: " + manifestPath_);
+        }
 
-        applyRecord(p, p + recordLen);
+        const auto recordType = static_cast<uint8_t>(*p);
+        if ((completeRecords == 0 && recordType != RecordType::Snapshot && recordType != RecordType::AddFile) ||
+            (completeRecords != 0 && recordType == RecordType::Snapshot)) {
+            throw std::runtime_error("Legacy manifest contains an invalid snapshot/delta sequence: " + manifestPath_);
+        }
+        applyRecord(p, p + recordLen, true);
         p += recordLen;
+        ++completeRecords;
+    }
+    if (completeRecords == 0) {
+        throw std::runtime_error("Legacy manifest contains no complete snapshot: " + manifestPath_);
     }
 }
 
 // Apply one decoded record (type byte + payload) to the in-memory file set.
-void Manifest::applyRecord(const char* rp, const char* rend) {
-    if (rp >= rend)
-        return;
+void Manifest::applyRecord(const char* rp, const char* rend, bool legacyFormat) {
+    requireBytes(rp, rend, 1, "record type");
     auto type = static_cast<RecordType>(*rp);
     ++rp;
 
     if (type == RecordType::Snapshot) {
-        files_.clear();
-        if (rp + 12 > rend)
-            return;
-        nextFileNumber_ = decodeFixed64(rp);
+        requireBytes(rp, rend, 12, "snapshot header");
+        const auto recoveredNextFileNumber = decodeFixed64(rp);
         rp += 8;
-        uint32_t fileCount = decodeFixed32(rp);
+        const auto fileCount = decodeFixed32(rp);
         rp += 4;
 
-        for (uint32_t i = 0; i < fileCount; ++i) {
-            if (rp + 28 > rend)
-                break;
-            SSTableMetadata f;
-            f.fileNumber = decodeFixed64(rp);
-            rp += 8;
-            f.level = static_cast<int>(decodeFixed32(rp));
-            rp += 4;
-            f.fileSize = decodeFixed64(rp);
-            rp += 8;
-            f.entryCount = decodeFixed64(rp);
-            rp += 8;
-
-            if (rp + 4 > rend)
-                break;
-            uint32_t minKeyLen = decodeFixed32(rp);
-            rp += 4;
-            if (rp + minKeyLen > rend)
-                break;
-            f.minKey.assign(rp, minKeyLen);
-            rp += minKeyLen;
-
-            if (rp + 4 > rend)
-                break;
-            uint32_t maxKeyLen = decodeFixed32(rp);
-            rp += 4;
-            if (rp + maxKeyLen > rend)
-                break;
-            f.maxKey.assign(rp, maxKeyLen);
-            rp += maxKeyLen;
-
-            // writeTimestamp (present in all snapshots written by this codebase).
-            if (rp + 8 <= rend) {
-                f.writeTimestamp = decodeFixed64(rp);
-                rp += 8;
+        auto parseFiles = [rp, rend, fileCount](bool withTimestamp) {
+            auto cursor = rp;
+            std::vector<SSTableMetadata> parsedFiles;
+            parsedFiles.reserve(fileCount);
+            std::unordered_set<uint64_t> seen;
+            for (uint32_t i = 0; i < fileCount; ++i) {
+                auto file = decodeFileMetadata(cursor, rend, withTimestamp);
+                if (!seen.insert(file.fileNumber).second) {
+                    throw std::runtime_error("Malformed manifest snapshot: duplicate SSTable file number " +
+                                             std::to_string(file.fileNumber));
+                }
+                parsedFiles.push_back(std::move(file));
             }
+            if (cursor != rend) {
+                throw std::runtime_error("Malformed manifest snapshot: trailing record bytes");
+            }
+            return parsedFiles;
+        };
 
-            files_.push_back(std::move(f));
+        std::vector<SSTableMetadata> recoveredFiles;
+        if (legacyFormat) {
+            try {
+                recoveredFiles = parseFiles(true);
+            } catch (const std::runtime_error&) {
+                // Manifests written before writeTimestamp was added carry the
+                // same metadata sequence without the final eight-byte field.
+                recoveredFiles = parseFiles(false);
+            }
+        } else {
+            recoveredFiles = parseFiles(true);
         }
+
+        if (recoveredNextFileNumber == 0) {
+            throw std::runtime_error("Malformed manifest snapshot: next file number is zero");
+        }
+        for (const auto& file : recoveredFiles) {
+            if (file.fileNumber >= recoveredNextFileNumber) {
+                throw std::runtime_error("Malformed manifest snapshot: next file number does not exceed live file " +
+                                         std::to_string(file.fileNumber));
+            }
+        }
+        files_ = std::move(recoveredFiles);
+        nextFileNumber_ = recoveredNextFileNumber;
     } else if (type == RecordType::AddFile) {
-        if (rp + 28 > rend)
-            return;
-        SSTableMetadata f;
-        f.fileNumber = decodeFixed64(rp);
-        rp += 8;
-        f.level = static_cast<int>(decodeFixed32(rp));
-        rp += 4;
-        f.fileSize = decodeFixed64(rp);
-        rp += 8;
-        f.entryCount = decodeFixed64(rp);
-        rp += 8;
-
-        if (rp + 4 > rend)
-            return;
-        uint32_t minKeyLen = decodeFixed32(rp);
-        rp += 4;
-        if (rp + minKeyLen > rend)
-            return;
-        f.minKey.assign(rp, minKeyLen);
-        rp += minKeyLen;
-
-        if (rp + 4 > rend)
-            return;
-        uint32_t maxKeyLen = decodeFixed32(rp);
-        rp += 4;
-        if (rp + maxKeyLen > rend)
-            return;
-        f.maxKey.assign(rp, maxKeyLen);
-        rp += maxKeyLen;
-
-        // writeTimestamp (v2 extension, optional for backward compat)
-        if (rp + 8 <= rend) {
-            f.writeTimestamp = decodeFixed64(rp);
+        auto file = decodeFileMetadata(rp, rend, !legacyFormat);
+        if (legacyFormat && static_cast<size_t>(rend - rp) == 8) {
+            file.writeTimestamp = decodeFixed64(rp);
             rp += 8;
         }
-
-        uint64_t fn = f.fileNumber;
-        files_.push_back(std::move(f));
-        if (fn >= nextFileNumber_)
-            nextFileNumber_ = fn + 1;
+        if (rp != rend) {
+            throw std::runtime_error("Malformed manifest add-file record: trailing bytes");
+        }
+        if (file.fileNumber < nextFileNumber_) {
+            throw std::runtime_error("Manifest reuses or duplicates SSTable file number " +
+                                     std::to_string(file.fileNumber));
+        }
+        const auto fileNumber = file.fileNumber;
+        files_.push_back(std::move(file));
+        nextFileNumber_ = fileNumber + 1;
     } else if (type == RecordType::RemoveFile) {
-        if (rp + 8 > rend)
-            return;
-        uint64_t fn = decodeFixed64(rp);
+        requireBytes(rp, rend, 8, "remove-file number");
+        const auto fn = decodeFixed64(rp);
+        rp += 8;
+        if (rp != rend || fn == 0) {
+            throw std::runtime_error("Malformed manifest remove-file record");
+        }
         std::erase_if(files_, [fn](const SSTableMetadata& ff) { return ff.fileNumber == fn; });
+    } else {
+        throw std::runtime_error("Manifest contains unknown record type " +
+                                 std::to_string(static_cast<unsigned char>(type)));
     }
 }
 

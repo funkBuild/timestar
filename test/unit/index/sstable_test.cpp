@@ -4,12 +4,13 @@
 
 #include <fcntl.h>
 #include <gtest/gtest.h>
-#include <seastar/core/coroutine.hh>
 #include <unistd.h>
 
 #include <chrono>
 #include <filesystem>
 #include <format>
+#include <optional>
+#include <seastar/core/coroutine.hh>
 #include <string>
 
 using namespace timestar::index;
@@ -18,6 +19,18 @@ static std::string testDir() {
     auto dir = std::filesystem::temp_directory_path() / "timestar_sstable_test";
     std::filesystem::create_directories(dir);
     return dir.string();
+}
+
+static uint64_t decodeLE64(const char* p) {
+    uint64_t value = 0;
+    for (int i = 0; i < 8; ++i)
+        value |= static_cast<uint64_t>(static_cast<unsigned char>(p[i])) << (i * 8);
+    return value;
+}
+
+static void encodeLE32(char* p, uint32_t value) {
+    for (int i = 0; i < 4; ++i)
+        p[i] = static_cast<char>((value >> (i * 8)) & 0xff);
 }
 
 class SSTableTest : public ::testing::Test {
@@ -287,8 +300,8 @@ SEASTAR_TEST_F(SSTableTest, WriteTimestampRecorded) {
 
 SEASTAR_TEST_F(SSTableTest, WriteTimestampReasonable) {
     auto beforeNs = static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count());
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch())
+            .count());
 
     auto path = self->sstPath("ts_reasonable.sst");
     auto writer = co_await SSTableWriter::create(path);
@@ -296,8 +309,8 @@ SEASTAR_TEST_F(SSTableTest, WriteTimestampReasonable) {
     auto meta = co_await writer.finish();
 
     auto afterNs = static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count());
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch())
+            .count());
 
     // writeTimestamp should be between before and after (within 10 seconds for safety)
     EXPECT_GE(meta.writeTimestamp, beforeNs);
@@ -579,7 +592,8 @@ SEASTAR_TEST_F(SSTableTest, CRC32CorruptionDetected) {
     {
         int fd = ::open(path.c_str(), O_RDWR);
         EXPECT_GE(fd, 0) << "Failed to open SSTable for corruption";
-        if (fd < 0) co_return;
+        if (fd < 0)
+            co_return;
         char bad = 0xFF;
         ssize_t wr = ::pwrite(fd, &bad, 1, 10);  // offset 10: inside compressed data
         EXPECT_EQ(wr, 1);
@@ -626,6 +640,95 @@ SEASTAR_TEST_F(SSTableTest, AbortEmptyWriterDeletesFile) {
     EXPECT_FALSE(std::filesystem::exists(path));
 }
 
+SEASTAR_TEST_F(SSTableTest, WriterRefusesSymlinkCollisionWithoutTruncatingTarget) {
+    auto target = self->sstPath("collision-target");
+    auto path = self->sstPath("collision.sst");
+    const std::string contents = "durable-target-data";
+    int fd = ::open(target.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0644);
+    EXPECT_GE(fd, 0);
+    if (fd < 0)
+        co_return;
+    EXPECT_EQ(::write(fd, contents.data(), contents.size()), static_cast<ssize_t>(contents.size()));
+    ::close(fd);
+    std::filesystem::create_symlink(target, path);
+
+    EXPECT_THROW(co_await SSTableWriter::create(path), std::runtime_error);
+    EXPECT_EQ(std::filesystem::file_size(target), contents.size());
+    EXPECT_TRUE(std::filesystem::is_symlink(std::filesystem::symlink_status(path)));
+}
+
+SEASTAR_TEST_F(SSTableTest, MetadataCorruptionFailsClosed) {
+    auto path = self->sstPath("metadata_crc.sst");
+    {
+        auto writer = co_await SSTableWriter::create(path, 128);
+        for (int i = 0; i < 50; ++i)
+            writer.add(std::format("key:{:04d}", i), std::format("value:{:04d}", i));
+        co_await writer.finish();
+    }
+
+    int fd = ::open(path.c_str(), O_RDWR);
+    EXPECT_GE(fd, 0);
+    if (fd < 0)
+        co_return;
+    const auto fileSize = ::lseek(fd, 0, SEEK_END);
+    char footer[SSTABLE_FOOTER_SIZE];
+    EXPECT_EQ(::pread(fd, footer, sizeof(footer), fileSize - SSTABLE_FOOTER_SIZE),
+              static_cast<ssize_t>(sizeof(footer)));
+    const auto bloomOffset = decodeLE64(footer);
+    char byte = 0;
+    EXPECT_EQ(::pread(fd, &byte, 1, static_cast<off_t>(bloomOffset)), 1);
+    byte ^= 0x01;
+    EXPECT_EQ(::pwrite(fd, &byte, 1, static_cast<off_t>(bloomOffset)), 1);
+    ::close(fd);
+
+    EXPECT_THROW(co_await SSTableReader::open(path), std::runtime_error);
+}
+
+SEASTAR_TEST_F(SSTableTest, V2MetadataBindsCanonicalFileIdentity) {
+    auto path = self->sstPath("idx_000123.sst");
+    auto writer = co_await SSTableWriter::create(path);
+    writer.add("key", "value");
+    const auto writtenMetadata = co_await writer.finish();
+    EXPECT_EQ(writtenMetadata.fileNumber, 123u);
+    EXPECT_EQ(writtenMetadata.formatVersion, SSTABLE_VERSION);
+
+    auto reader = co_await SSTableReader::open(path);
+    EXPECT_EQ(reader->metadata().fileNumber, 123u);
+    EXPECT_EQ(reader->metadata().formatVersion, SSTABLE_VERSION);
+    co_await reader->close();
+}
+
+SEASTAR_TEST_F(SSTableTest, LegacyV1FileIsValidatedAndReadableWithoutBloomTrust) {
+    auto path = self->sstPath("legacy_v1.sst");
+    {
+        auto writer = co_await SSTableWriter::create(path, 128);
+        for (int i = 0; i < 50; ++i)
+            writer.add(std::format("key:{:04d}", i), std::format("value:{:04d}", i));
+        co_await writer.finish();
+    }
+
+    int fd = ::open(path.c_str(), O_RDWR);
+    EXPECT_GE(fd, 0);
+    if (fd < 0)
+        co_return;
+    const auto fileSize = ::lseek(fd, 0, SEEK_END);
+    char legacyReserved[8]{};
+    char legacyVersion[4];
+    encodeLE32(legacyVersion, SSTABLE_LEGACY_VERSION);
+    EXPECT_EQ(::pwrite(fd, legacyReserved, sizeof(legacyReserved), fileSize - 16),
+              static_cast<ssize_t>(sizeof(legacyReserved)));
+    EXPECT_EQ(::pwrite(fd, legacyVersion, sizeof(legacyVersion), fileSize - 4),
+              static_cast<ssize_t>(sizeof(legacyVersion)));
+    ::close(fd);
+
+    auto reader = co_await SSTableReader::open(path);
+    auto first = co_await reader->get("key:0000");
+    auto last = co_await reader->get("key:0049");
+    EXPECT_EQ(first, std::optional<std::string>("value:0000"));
+    EXPECT_EQ(last, std::optional<std::string>("value:0049"));
+    co_await reader->close();
+}
+
 SEASTAR_TEST_F(SSTableTest, TruncatedFileThrowsOnOpen) {
     auto path = self->sstPath("truncated.sst");
 
@@ -642,7 +745,8 @@ SEASTAR_TEST_F(SSTableTest, TruncatedFileThrowsOnOpen) {
     {
         int fd = ::open(path.c_str(), O_WRONLY | O_TRUNC);
         EXPECT_GE(fd, 0) << "Failed to open file for truncation";
-        if (fd < 0) co_return;
+        if (fd < 0)
+            co_return;
         // Write 10 garbage bytes — too small for a valid SSTable
         const char garbage[] = "TRUNCATED!";
         [[maybe_unused]] auto n = ::write(fd, garbage, 10);
@@ -679,20 +783,21 @@ SEASTAR_TEST_F(SSTableTest, TruncatedMetadataThrowsOnOpen) {
     // Build the footer referencing this index region
     char footer[64];
     std::memset(footer, 0, 64);
-    encodeFixed64(footer + 0, 0);             // bloomOffset (no bloom)
-    encodeFixed64(footer + 8, 0);             // bloomSize = 0
-    encodeFixed64(footer + 16, 0);            // indexOffset = 0 (start of file)
-    encodeFixed64(footer + 24, 16);           // indexSize = 16
-    encodeFixed64(footer + 32, 5);            // entryCount
-    encodeFixed64(footer + 40, 0);            // writeTimestamp
-    encodeFixed32(footer + 56, 0x54534958);   // SSTABLE_MAGIC
-    encodeFixed32(footer + 60, 1);            // SSTABLE_VERSION
+    encodeFixed64(footer + 0, 0);            // bloomOffset (no bloom)
+    encodeFixed64(footer + 8, 0);            // bloomSize = 0
+    encodeFixed64(footer + 16, 0);           // indexOffset = 0 (start of file)
+    encodeFixed64(footer + 24, 16);          // indexSize = 16
+    encodeFixed64(footer + 32, 5);           // entryCount
+    encodeFixed64(footer + 40, 0);           // writeTimestamp
+    encodeFixed32(footer + 56, 0x54534958);  // SSTABLE_MAGIC
+    encodeFixed32(footer + 60, 1);           // SSTABLE_VERSION
 
     // Write: 16 bytes index data + 64 bytes footer = 80 bytes total
     {
         int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
         EXPECT_GE(fd, 0);
-        if (fd < 0) co_return;
+        if (fd < 0)
+            co_return;
         [[maybe_unused]] auto n1 = ::write(fd, indexData, 16);
         [[maybe_unused]] auto n2 = ::write(fd, footer, 64);
         ::close(fd);

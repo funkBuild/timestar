@@ -236,9 +236,9 @@ seastar::future<> NativeIndex::open() {
     // Note: std::filesystem::absolute() depends on the process CWD at call time.
     // This is fine because open() is called during startup before any CWD change.
     indexPath_ = std::filesystem::absolute(layout_.nativeIndexDir(shardId_)).string();
-    co_await seastar::async([this] { std::filesystem::create_directories(indexPath_); });
 
-    // Open manifest
+    // Manifest::open creates and durably publishes the index directory when it
+    // does not exist. Keeping creation there avoids an unsynced parent entry.
     manifest_ = std::make_unique<Manifest>(co_await Manifest::open(indexPath_));
 
     // Open WAL and replay into MemTable
@@ -535,6 +535,61 @@ seastar::future<> NativeIndex::refreshSSTables() {
         manifestFiles.insert(fileMeta.fileNumber);
     }
 
+    // Validate and stage every new reader before mutating the live map. A
+    // manifest entry is a durable generation reference: missing, non-regular,
+    // or identity-inconsistent contents must fence startup/refresh rather than
+    // silently omitting acknowledged index mutations.
+    std::vector<std::pair<uint64_t, std::shared_ptr<SSTableReader>>> stagedReaders;
+    std::exception_ptr validationError;
+    try {
+        for (const auto& fileMeta : manifestFileList) {
+            auto path = sstFilename(fileMeta.fileNumber);
+            const auto pathState = co_await seastar::async([path] {
+                const auto status = std::filesystem::symlink_status(path);
+                if (!std::filesystem::exists(status))
+                    return 0;
+                return std::filesystem::is_regular_file(status) ? 1 : 2;
+            });
+            if (pathState == 0) {
+                throw std::runtime_error("Manifest lists missing SSTable file " + std::to_string(fileMeta.fileNumber) +
+                                         ": " + path);
+            }
+            if (pathState != 1) {
+                throw std::runtime_error("Manifest lists non-regular SSTable file " +
+                                         std::to_string(fileMeta.fileNumber) + ": " + path);
+            }
+            if (sstableReaders_.contains(fileMeta.fileNumber)) {
+                continue;
+            }
+
+            auto reader = co_await SSTableReader::open(path, &blockCache_);
+            const auto& diskMeta = reader->metadata();
+            const bool metadataMatches =
+                diskMeta.fileSize == fileMeta.fileSize && diskMeta.entryCount == fileMeta.entryCount &&
+                diskMeta.minKey == fileMeta.minKey && diskMeta.maxKey == fileMeta.maxKey &&
+                (diskMeta.formatVersion == SSTABLE_LEGACY_VERSION || diskMeta.fileNumber == fileMeta.fileNumber) &&
+                (fileMeta.writeTimestamp == 0 || diskMeta.writeTimestamp == fileMeta.writeTimestamp);
+            if (!metadataMatches) {
+                co_await reader->close();
+                throw std::runtime_error("SSTable metadata does not match manifest for file " +
+                                         std::to_string(fileMeta.fileNumber) + ": " + path);
+            }
+            stagedReaders.emplace_back(fileMeta.fileNumber, std::shared_ptr<SSTableReader>(std::move(reader)));
+        }
+    } catch (...) {
+        validationError = std::current_exception();
+    }
+    if (validationError) {
+        for (auto& stagedReader : stagedReaders) {
+            try {
+                co_await stagedReader.second->close();
+            } catch (const std::exception& e) {
+                ::native_index_log.warn("Failed to close staged SSTable reader after validation error: {}", e.what());
+            }
+        }
+        std::rethrow_exception(validationError);
+    }
+
     // Remove readers for files no longer in the manifest. Do NOT close them
     // eagerly: in-flight scans snapshot the shared_ptr, which protects the
     // object but not the fd — closing here would break a suspended scan's next
@@ -547,26 +602,8 @@ seastar::future<> NativeIndex::refreshSSTables() {
             ++it;
         }
     }
-
-    // Open readers for new files not yet in the reader map
-    for (const auto& fileMeta : manifestFileList) {
-        if (sstableReaders_.find(fileMeta.fileNumber) != sstableReaders_.end()) {
-            continue;  // Already open
-        }
-        auto path = sstFilename(fileMeta.fileNumber);
-        if (co_await seastar::file_exists(path)) {
-            // SSTableReader::open returns unique_ptr; convert to shared_ptr for lifetime safety
-            auto reader = co_await SSTableReader::open(path, &blockCache_);
-            sstableReaders_[fileMeta.fileNumber] = std::shared_ptr<SSTableReader>(std::move(reader));
-        } else {
-            // Crash edge: the manifest references a file that is missing on
-            // disk. Skip it so startup can proceed, but say so LOUDLY — any
-            // keys whose newest version lived only in this file are lost.
-            ::native_index_log.error(
-                "Manifest lists SSTable file {} ({}) but it does not exist on disk — skipping "
-                "(possible data loss on shard {})",
-                fileMeta.fileNumber, path, shardId_);
-        }
+    for (auto& [fileNumber, reader] : stagedReaders) {
+        sstableReaders_.emplace(fileNumber, std::move(reader));
     }
 
     // Close any deferred readers whose last scan has finished.
@@ -1060,7 +1097,7 @@ seastar::future<> NativeIndex::doFlushImmutableMemTable() {
     uint64_t fileNum = manifest_->nextFileNumber();
     auto path = sstFilename(fileNum);
     auto writer = co_await SSTableWriter::create(path, timestar::config().index.block_size,
-                                                 timestar::config().index.bloom_filter_bits);
+                                                 timestar::config().index.bloom_filter_bits, 1, fileNum);
 
     auto it = immutableMemtable_->newIterator();
     it.seekToFirst();

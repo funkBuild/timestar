@@ -1,17 +1,17 @@
 #include "../../../lib/index/native/compaction.hpp"
+
 #include "../../../lib/index/native/manifest.hpp"
 #include "../../../lib/index/native/sstable.hpp"
-
 #include "../../seastar_gtest.hpp"
 
 #include <gtest/gtest.h>
-#include <seastar/core/coroutine.hh>
 
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
 #include <format>
 #include <map>
+#include <seastar/core/coroutine.hh>
 #include <set>
 
 using namespace timestar::index;
@@ -109,6 +109,35 @@ SEASTAR_TEST_F(CompactionTest, CompactAll) {
     EXPECT_EQ(manifest.files().size(), 1u);
 
     co_await manifest.close();
+}
+
+SEASTAR_TEST_F(CompactionTest, DurableOutputSurvivesManifestPublicationFailure) {
+    auto manifest = co_await Manifest::open(self->dir_);
+    for (int fileIdx = 0; fileIdx < 2; ++fileIdx) {
+        const auto fileNumber = manifest.nextFileNumber();
+        auto writer = co_await SSTableWriter::create(self->sstFilename(fileNumber), 128);
+        writer.add(std::format("key:{}", fileIdx), std::format("value:{}", fileIdx));
+        auto metadata = co_await writer.finish();
+        metadata.fileNumber = fileNumber;
+        metadata.level = 0;
+        co_await manifest.addFile(metadata);
+    }
+    co_await manifest.close();
+
+    // Make the append path fail only after compaction has durably finished its
+    // output. The old implementation then deleted that output even though an
+    // fsync failure is an ambiguous manifest-publication result.
+    const auto manifestPath = self->dir_ + "/MANIFEST";
+    const auto savedManifestPath = self->dir_ + "/MANIFEST.saved";
+    std::filesystem::rename(manifestPath, savedManifestPath);
+    std::filesystem::create_directory(manifestPath);
+
+    CompactionEngine compactor(self->dir_, manifest);
+    EXPECT_THROW(co_await compactor.compactAll(), std::runtime_error);
+    EXPECT_TRUE(std::filesystem::exists(self->sstFilename(1)));
+    EXPECT_TRUE(std::filesystem::exists(self->sstFilename(2)));
+    EXPECT_TRUE(std::filesystem::exists(self->sstFilename(3)))
+        << "durable output must be retained after an ambiguous manifest failure";
 }
 
 // ---------------------------------------------------------------------------
