@@ -5,7 +5,7 @@
 **Reviewed baseline:** `cluster-design` at `f78e05d` (2026-08-01)
 
 **Remediation commits:** `95c10d2`, `a16b03a`, `d578e81`, `ddab705`,
-`8620b9e`, `20639dc`
+`8620b9e`, `20639dc`, `ea2511b`, `3ac9899`
 
 **Scope:** The recent VShard/Raft cluster redesign, its production-server
 integration, the public HTTP surface, recovery paths, and the release evidence
@@ -18,7 +18,7 @@ used as evidence that the current server is production-ready.
 
 ## Implementation progress after the review
 
-Six remediation commits are now recorded. Cluster release status remains
+Eight remediation commits are now recorded. Cluster release status remains
 **BLOCKED** because group 0/movement, generation-atomic live snapshot
 replacement, pattern-delete expansion, replicated retention, the large-snapshot
 path, rolling wire-format compatibility, and final live release gates remain
@@ -80,7 +80,10 @@ Completed and covered in this pass:
   originating, peer-ingress, and state-machine boundaries. RF=1 and pattern
   deletes remain fail-closed; a mixed exact/pattern batch is rejected before any
   proposal. Legal 10,000-target batches are capped at 32 concurrent quorum
-  waits rather than creating an unbounded proposal fan-out.
+  waits rather than creating an unbounded proposal fan-out. An ambiguous
+  transport or leadership-loss result is never re-proposed: HTTP reports 504,
+  `DELETE_OUTCOME_UNKNOWN`, and no `Retry-After`, because a second unbounded
+  delete could erase a write ordered after the first attempt.
 
 Focused evidence on this pass includes the rebuilt server, unit and socket test
 targets, journal negative tests, alternate-replica routing tests, a black-holed
@@ -89,7 +92,7 @@ identity/topology tests, and pre-proposal admission tests. The strict checkboxes
 below stay open where their stated multi-process or fault-injection “done when”
 evidence has not yet been run.
 
-Final local validation for these remediation commits is green: 4,337/4,337 unit
+Final local validation for these remediation commits is green: 4,340/4,340 unit
 tests passed with no skips, 45/45
 socket-backed cluster tests passed, the first-pass 56/56 focused
 cluster/readiness/identity/admission regressions passed, and the second-pass
@@ -127,8 +130,9 @@ Severity means:
 
 ## Findings
 
-The findings below describe the reviewed baseline. Current mitigations and the
-remaining evidence needed to close each item are recorded in the fix-up list.
+The findings below describe the reviewed baseline and follow-on remediation
+reviews. Current mitigations and the remaining evidence needed to close each
+item are recorded in the fix-up list.
 
 | ID | Severity | Finding | Production impact |
 |---|---|---|---|
@@ -151,6 +155,7 @@ remaining evidence needed to close each item are recorded in the fix-up list.
 | CR-17 | P1 | One-node failover still causes client-visible batch failures | Applications without the promised retry-whole-batch behavior can treat an expected node failure as lost writes. |
 | CR-18 | P1 | Snapshot payload v2 has no rolling-version negotiation | A mixed-version cluster can fail snapshot catch-up in either direction during upgrade. |
 | CR-19 | P0 | Exact-point delete overlap was exclusive at the block minimum | A delete with equal start/end could silently skip a one-point block and leave the point queryable. |
+| CR-20 | P0 | Ambiguous replicated deletes were automatically re-proposed | If the first delete committed but its reply was lost, a second log entry could erase a concurrent write ordered after the first attempt. |
 
 ### CR-01 — deletes bypass consensus
 
@@ -181,6 +186,24 @@ view; RF=1 and pattern requests return an unsupported response before local
 mutation, and a mixed batch is preflighted before any exact command is proposed.
 CR-FIX-010 remains open for the named live leader-failure/restart evidence and
 for pattern-delete semantics.
+
+### CR-20 — ambiguous delete retries could erase concurrent writes
+
+The shared failure taxonomy already recorded that `LeadershipLost` and
+`Transport` are ambiguous: the proposal may have committed even though the
+caller received no acknowledgement. That ambiguity is safe for byte-identical
+writes under the current LWW contract, but not for a non-revision-bounded
+physical range delete. The new command router initially reused the write retry
+policy and could
+therefore append the same delete again after another client had written into the
+range.
+
+Commit `3ac9899` stops after the first ambiguous delete result while preserving
+unambiguous not-leader, leader-refused, stopping, and pre-proposal overload
+retries. The HTTP contract reports an explicit unknown outcome without automatic
+retry advice. This closes the in-request duplicate-delete hazard; durable
+operation IDs or revision-bounded tombstones are still required before an
+ambiguous client-initiated retry can be declared safe under CR-FIX-010.
 
 ### CR-02 and CR-03 — snapshot contents and live installation were unsafe
 
@@ -385,8 +408,9 @@ is not completion.
   fail-stops on a cross-VShard command. HTTP tests cover exact and structured
   targets, mixed-batch preflight, retryable `503`, and a 32-proposal concurrency
   cap; a real single-voter Raft test proves write/delete/query ordering. Pattern
-  expansion and the named multi-node leader-failure, ambiguous client retry,
-  and replica-restart gates remain open.
+  expansion and the named multi-node leader-failure, idempotent client retry,
+  and replica-restart gates remain open. Ambiguous in-request retry now fails
+  closed with an explicit unknown outcome instead of appending a second delete.
 - [ ] **CR-FIX-011 — define a self-contained VShard snapshot format.** Owner:
   snapshot/storage. Include catalog/index extract, data objects, tombstone
   objects or a proven materialised-delete boundary, and real content hashes.
@@ -443,6 +467,10 @@ is not completion.
   Exact-point deletion now recognises a one-point block at the range boundary;
   the VShard-partitioned tombstone regression proves the point is absent from
   the materialised output.
+- [x] **CR-FIX-017 — never re-propose an ambiguous non-revision-bounded delete.**
+  Owner: data path/API. Transport timeout and leadership-loss tests prove only
+  one proposal is attempted; safe leader redirects still retry. HTTP exposes a
+  machine-readable unknown outcome and omits `Retry-After`.
 
 ### 2. Complete control-plane and identity wiring
 
@@ -625,14 +653,14 @@ is recorded in the commits named at the top of this document. These results
 validate the exercised unit and socket paths; they do not supersede the missing
 live gates or the remaining production-composition findings above.
 
-Post-remediation validation through `20639dc`:
+Post-remediation validation through `3ac9899`:
 
 ```text
-timestar_unit_test:              4337/4337 passed (443 suites, -c 2; no skips)
+timestar_unit_test:              4340/4340 passed (443 suites, -c 2; no skips)
 timestar_cluster_socket_test:      45/45 passed (8 suites, -c 2)
 first-pass focused regressions:     56/56 passed (15 suites, -c 2)
 snapshot/compaction regressions:    24/24 passed (9 suites, -c 2)
-exact-delete focused regressions:   HTTP/router/wire/Raft paths passed
+exact-delete focused regressions:   11/11 router/HTTP plus wire/Raft paths passed
 timestar_http_server:              built successfully
 test/cluster_gates/*.sh:           bash -n passed
 git diff --check:                  passed
