@@ -6,7 +6,7 @@
 
 **Remediation commits:** `95c10d2`, `a16b03a`, `d578e81`, `ddab705`,
 `8620b9e`, `20639dc`, `ea2511b`, `3ac9899`, `69ac879`, `09a62c5`,
-`2e06cb8`, `7151f5d`, `5b22b81`, `fef4886`, `3d2d607`
+`2e06cb8`, `7151f5d`, `5b22b81`, `fef4886`, `3d2d607`, `f0e28f0`
 
 **Scope:** The recent VShard/Raft cluster redesign, its production-server
 integration, the public HTTP surface, recovery paths, and the release evidence
@@ -19,7 +19,7 @@ used as evidence that the current server is production-ready.
 
 ## Implementation progress after the review
 
-Fifteen remediation commits are now recorded. Cluster release status remains
+Sixteen remediation commits are now recorded. Cluster release status remains
 **BLOCKED** because group 0/movement, generation-atomic live snapshot
 replacement, pattern-delete expansion, replicated retention, the large-snapshot
 path, and rolling wire-format compatibility remain open. The four previously
@@ -117,6 +117,12 @@ Completed and covered in this pass:
   WAL conversion or compaction cannot report success and retire its source.
   Planned compaction targets also preserve sequence zero instead of confusing
   that valid first allocation with the direct-call auto-allocation sentinel.
+- Compaction now unlinks every source TSM and syncs the directory before
+  removing the sources from the live manager or deleting their tombstone
+  sidecars. Source unlink failures propagate, a failed directory barrier leaves
+  the open sources registered and retryable, and pinned readers retain their
+  in-memory tombstone ranges after disk cleanup. This prevents old raw points
+  from returning after a failed unlink or crash between sidecar and TSM removal.
 
 Focused evidence on this pass includes the rebuilt server, unit and socket test
 targets, journal negative tests, alternate-replica routing tests, a black-holed
@@ -125,7 +131,7 @@ identity/topology tests, and pre-proposal admission tests. The strict checkboxes
 below stay open where their stated multi-process or fault-injection “done when”
 evidence has not yet been run.
 
-Final local validation for these remediation commits is green: 4,352/4,352 unit
+Final local validation for these remediation commits is green: 4,353/4,353 unit
 tests passed with no skips, 45/45 socket-backed cluster tests passed, the
 first-pass 56/56 focused
 cluster/readiness/identity/admission regressions passed, and the second-pass
@@ -194,6 +200,7 @@ item are recorded in the fix-up list.
 | CR-22 | P2 | Live-gate data reset and benchmark preflight could fail open | A gate could race deletion against running nodes or continue after the benchmark sent no load, invalidating otherwise green release evidence. |
 | CR-23 | P0 | TSM publication ignored parent-directory sync failure before deleting the prior durable generation | A crash could discard the renamed output directory entry after its WAL or source TSMs had been removed, losing acknowledged data. |
 | CR-24 | P0 | TSM registration swallowed open/index failures and silently selected one duplicate rank | WAL conversion could delete its recoverable source after failing to register the output; restart could serve a partial or filesystem-order-dependent dataset. |
+| CR-25 | P0 | TSM source retirement deleted tombstones before the source and swallowed source-unlink failures | A failed unlink or crash could reload the raw source without its deletion ranges; pinned readers could also stop filtering deleted points during compaction. |
 
 ### CR-01 — deletes bypass consensus
 
@@ -278,6 +285,27 @@ and compaction retain their old durable source. The stricter collision test also
 exposed a separate ambiguity where planned sequence zero was interpreted as a
 direct-call auto-allocation sentinel; planned targets now carry an explicit flag
 and preserve `(tier, sequence)` exactly.
+
+### CR-25 — source retirement could resurrect tombstoned data
+
+[`TSMFileManager::removeTSMFiles`](../lib/storage/tsm_file_manager.cpp) removed
+each source from live tracking and deleted its tombstone sidecar before asking
+[`TSM::scheduleDelete`](../lib/storage/tsm.cpp) to unlink the TSM. The latter
+also deleted the sidecar, caught source-unlink errors, and returned success. A
+failed unlink therefore left a raw source name on disk without its deletion
+ranges; a crash could produce the same result because neither unlink ordering
+nor source absence had a directory-durability boundary. The sidecar removal
+also cleared the shared TSM object's in-memory ranges, so a query that had
+pinned the source before compaction could return deleted points from its still
+open file descriptor.
+
+Commit `f0e28f0` makes retirement a two-phase operation. It first unlinks every
+source TSM, propagates failures, and syncs the containing directory while the
+sources remain registered and their tombstones remain intact. Only after that
+barrier does it remove live tracking and clean up sidecars. Sidecar unlink keeps
+the tombstone ranges in memory for pinned readers, and an already-unlinked TSM
+is a valid retry after a failed directory sync. An injected sync failure proves
+the safe intermediate state and successful idempotent retry.
 
 ### CR-02 and CR-03 — snapshot contents and live installation were unsafe
 
@@ -573,6 +601,12 @@ is not completion.
   live registration propagates the same collisions before source retirement.
   WAL-output corruption, corrupt-startup, duplicate-startup, duplicate-live-add,
   and planned-sequence-zero regressions cover the failure boundaries.
+- [x] **CR-FIX-019A — make source retirement tombstone-safe and durable.**
+  Owner: storage. Source TSM names are unlinked and their directory is synced
+  before live registration or tombstone sidecars are removed. Failures remain
+  retryable with the source registered; pinned readers keep deletion ranges
+  after sidecar cleanup. The injected directory-sync regression covers both the
+  failed intermediate state and idempotent completion.
 
 ### 2. Complete control-plane and identity wiring
 
@@ -875,6 +909,17 @@ TSM registration validation for `3d2d607`:
 focused failure/sequence-zero regressions: 6/6 passed
 related manager/WAL/compaction tests:    72/72 passed
 current full unit suite:             4352/4352 passed (444 suites, -c 2)
+current socket-backed cluster suite:     45/45 passed (8 suites, -c 2)
+timestar_http_server:                    built successfully
+git diff --check:                        passed
+```
+
+TSM source-retirement validation for `f0e28f0`:
+
+```text
+focused retirement/deletion regressions: 13/13 passed
+related manager/compactor/tombstone tests: 100/100 passed
+current full unit suite:              4353/4353 passed (444 suites, -c 2)
 current socket-backed cluster suite:     45/45 passed (8 suites, -c 2)
 timestar_http_server:                    built successfully
 git diff --check:                        passed
