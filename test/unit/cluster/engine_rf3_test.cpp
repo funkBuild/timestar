@@ -122,6 +122,11 @@ std::string writeCmd(const std::string& key, double value) {
     return data::encodeReplicatedCommand(data::ReplicatedCommand{std::move(b)});
 }
 
+std::string deleteCmd(const std::string& key, const SeriesId128& operationId) {
+    data::DeleteRangeKey command{key, BASE, BASE, operationId};
+    return data::encodeReplicatedCommand(data::ReplicatedCommand{std::move(command)});
+}
+
 std::string keyInVShard(const std::string& measurement, const std::string& field, uint16_t vshard = 1) {
     for (unsigned i = 0;; ++i) {
         std::string key = buildSeriesKey(measurement, {{"host", "h" + std::to_string(i)}}, field);
@@ -242,6 +247,152 @@ TEST_F(EngineRf3Test, ThreeRealEnginesConvergeUnderPartition) {
             fs::remove_all(d);
         for (auto& d : engineDirs)
             fs::remove_all(d);
+    }).get();
+}
+
+// Exact-delete retry gate over the real RF=3 state machine. The first retry is
+// proposed by a new leader after failover; the second is proposed by a replica
+// that rebuilt its receipt exclusively from the durable journal. In both cases
+// a write ordered after the original delete must survive.
+TEST_F(EngineRf3Test, ExactDeleteRetrySurvivesLeaderFailoverAndReplicaRestart) {
+    seastar::async([] {
+        const std::vector<NodeId> voters = {1, 2, 3};
+        const NodeId firstLeader = 1;
+        Router router;
+        std::map<NodeId, Replica> reps;
+        std::map<NodeId, fs::path> journalDirs;
+        std::map<NodeId, fs::path> engineDirs;
+
+        auto tick = [&](int rounds) {
+            for (int i = 0; i < rounds; ++i) {
+                for (auto& [id, replica] : reps)
+                    if (replica.group)
+                        replica.group->tick().get();
+                router.pump().get();
+            }
+        };
+        auto drive = [&](auto& future, int rounds) {
+            for (int i = 0; i < rounds && !future.available(); ++i) {
+                router.pump().get();
+                for (auto& [id, replica] : reps)
+                    if (replica.group)
+                        replica.group->tick().get();
+                router.pump().get();
+            }
+        };
+        auto boot = [&](NodeId id, NodeId preferredLeader) {
+            auto& replica = reps[id];
+            replica.engine = std::make_unique<ScopedShardedEngine>();
+            replica.engine->startAt(engineDirs.at(id).string());
+            replica.store = std::make_unique<cluster::EngineLocalStore>(**replica.engine);
+            replica.sm =
+                std::make_unique<cluster::EngineDataStateMachine>(*replica.store, timestar::VShardId{1});
+            replica.writer = std::make_unique<JournalWriter>(journalDirs.at(id), header(), 1u << 20);
+            auto recovered = replica.writer->open().get();
+            RecoveredRaftState state = recoverRaftState(recovered, VShardId{1});
+            replica.persistence =
+                std::make_unique<JournalRaftPersistence>(*replica.writer, VShardId{1}, state.nextSeq);
+            if (!replica.transport)
+                replica.transport = std::make_unique<RouterTransport>(router);
+
+            ASSERT_FALSE(state.snapshot.has_value())
+                << "this gate proves committed-log receipt replay; snapshot receipt recovery has its own host gate";
+            RaftNode node(id, voters, std::move(state.log), state.hardState, optsFor(id, preferredLeader), {});
+            replica.group = std::make_unique<RaftGroup>(1, std::move(node), *replica.persistence,
+                                                        *replica.transport, *replica.sm);
+            router.setGroup(id, replica.group.get());
+        };
+        auto commit = [&](NodeId leader, const std::string& command) {
+            auto future = reps[leader].group->proposeAndAwaitApplied(command);
+            drive(future, 100);
+            if (!future.available()) {
+                ADD_FAILURE() << "proposal did not complete while the RF=3 harness was driven";
+                return false;
+            }
+            return future.get();
+        };
+        auto stopReplica = [&](NodeId id) {
+            auto& replica = reps[id];
+            router.setGroup(id, nullptr);
+            replica.group.reset();
+            replica.persistence.reset();
+            replica.sm.reset();
+            replica.store.reset();
+            replica.writer->close().get();
+            replica.writer.reset();
+            replica.engine.reset();
+        };
+
+        for (NodeId id : voters) {
+            engineDirs[id] = tmpDir("deleng" + std::to_string(id));
+            journalDirs[id] = tmpDir("delj" + std::to_string(id));
+            boot(id, firstLeader);
+        }
+
+        tick(40);
+        ASSERT_TRUE(reps[firstLeader].group->isLeader());
+
+        const std::string key = keyInVShard("delete_retry_rf3", "value");
+        const SeriesId128 operationId = SeriesId128::fromHex("2468ace013579bdf2468ace013579bdf");
+        const std::string deletion = deleteCmd(key, operationId);
+        ASSERT_TRUE(commit(firstLeader, writeCmd(key, 10.0)));
+        ASSERT_TRUE(commit(firstLeader, deletion));
+        ASSERT_TRUE(commit(firstLeader, writeCmd(key, 20.0)));
+        tick(20);
+        for (NodeId id : voters)
+            EXPECT_DOUBLE_EQ(latestOn(*reps[id].engine, "delete_retry_rf3", "value"), 20.0) << "node " << id;
+
+        // The original leader disappears after all three replicas have the
+        // receipt. A survivor retries the identical command in a later term.
+        router.partition(firstLeader);
+        tick(80);
+        NodeId failoverLeader = 0;
+        for (NodeId id : {NodeId{2}, NodeId{3}})
+            if (reps[id].group->isLeader())
+                failoverLeader = id;
+        ASSERT_NE(failoverLeader, 0u);
+        ASSERT_TRUE(commit(failoverLeader, deletion));
+        tick(20);
+        for (NodeId id : {NodeId{2}, NodeId{3}})
+            EXPECT_DOUBLE_EQ(latestOn(*reps[id].engine, "delete_retry_rf3", "value"), 20.0) << "node " << id;
+
+        // Restart the other survivor from its real Engine directory and Raft
+        // journal, then let it catch up before making it leader. Its in-memory
+        // receipt map starts empty and is reconstructed by committed-log replay.
+        const NodeId restarted = failoverLeader == 2 ? 3 : 2;
+        router.heal(firstLeader);
+        tick(40);
+        stopReplica(restarted);
+        boot(restarted, restarted);
+        tick(100);
+        ASSERT_DOUBLE_EQ(latestOn(*reps[restarted].engine, "delete_retry_rf3", "value"), 20.0);
+
+        router.partition(failoverLeader);
+        reps[restarted].group->campaign().get();
+        router.pump().get();
+        tick(20);
+        ASSERT_TRUE(reps[restarted].group->isLeader());
+        ASSERT_TRUE(commit(restarted, deletion));
+        tick(20);
+        EXPECT_DOUBLE_EQ(latestOn(*reps[restarted].engine, "delete_retry_rf3", "value"), 20.0);
+        EXPECT_DOUBLE_EQ(latestOn(*reps[firstLeader].engine, "delete_retry_rf3", "value"), 20.0);
+
+        router.heal(failoverLeader);
+        tick(40);
+        for (NodeId id : voters)
+            EXPECT_DOUBLE_EQ(latestOn(*reps[id].engine, "delete_retry_rf3", "value"), 20.0) << "node " << id;
+
+        for (auto& [id, replica] : reps) {
+            router.setGroup(id, nullptr);
+            replica.group.reset();
+            replica.persistence.reset();
+            replica.writer->close().get();
+        }
+        reps.clear();
+        for (const auto& [id, dir] : journalDirs)
+            fs::remove_all(dir);
+        for (const auto& [id, dir] : engineDirs)
+            fs::remove_all(dir);
     }).get();
 }
 
