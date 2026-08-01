@@ -39,7 +39,7 @@ namespace fs = std::filesystem;
 
 // ------------------------ WAL ------------------------
 
-WAL::WAL(unsigned int _sequenceNumber, timestar::StorageLayout layout, unsigned shardId)
+WAL::WAL(uint64_t _sequenceNumber, timestar::StorageLayout layout, unsigned shardId)
     : sequenceNumber(_sequenceNumber),
       layout_(std::move(layout)),
       shardId_(shardId),
@@ -82,14 +82,15 @@ seastar::future<> WAL::init(MemoryStore* /*store*/, bool isRecovery) {
         openFlags = seastar::open_flags::rw;
         timestar::wal_log.debug("Opening WAL {} for recovery", filename);
     } else {
-        // Fresh creation mode: always truncate to start with empty file
+        // A non-empty path may be the only durable copy of acknowledged data.
+        // Never truncate it merely because sequence allocation collided. The
+        // one safe retry case is an empty artifact left by a prior creation
+        // whose directory barrier failed before the WAL became writable.
         if (fileExisted) {
-            timestar::wal_log.warn(
-                "WAL file {} already exists when creating new WAL. "
-                "Truncating to start fresh.",
-                filename);
+            openFlags = seastar::open_flags::rw;
+        } else {
+            openFlags = seastar::open_flags::rw | seastar::open_flags::create | seastar::open_flags::exclusive;
         }
-        openFlags = seastar::open_flags::rw | seastar::open_flags::create | seastar::open_flags::truncate;
         timestar::wal_log.debug("Creating fresh WAL {}", filename);
     }
 
@@ -97,6 +98,31 @@ seastar::future<> WAL::init(MemoryStore* /*store*/, bool isRecovery) {
 
     if (!walFile) {
         throw std::runtime_error("Failed to open WAL file: " + filename);
+    }
+
+    if (!isRecovery && fileExisted) {
+        uint64_t existingSize = 0;
+        std::exception_ptr sizeError;
+        try {
+            existingSize = co_await walFile.size();
+        } catch (...) {
+            sizeError = std::current_exception();
+        }
+        if (sizeError) {
+            try {
+                co_await walFile.close();
+            } catch (...) {}
+            _closed = true;
+            std::rethrow_exception(sizeError);
+        }
+        if (existingSize != 0) {
+            try {
+                co_await walFile.close();
+            } catch (...) {}
+            _closed = true;
+            throw std::runtime_error("Refusing to overwrite existing non-empty WAL file: " + filename);
+        }
+        timestar::wal_log.info("Retrying fresh creation over empty WAL artifact {}", filename);
     }
 
     // Make the segment name durable before any write can be acknowledged. This
@@ -195,7 +221,7 @@ seastar::future<> WAL::init(MemoryStore* /*store*/, bool isRecovery) {
                             mode);
 }
 
-std::string WAL::sequenceNumberToFilename(unsigned int sequenceNumber) {
+std::string WAL::sequenceNumberToFilename(uint64_t sequenceNumber) {
     // Test-only helper: production WAL paths come from the injected layout via
     // the instance filename(). This static resolves against the default root so
     // it reads no global configuration; it matches the instance path only for

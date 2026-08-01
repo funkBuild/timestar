@@ -195,7 +195,7 @@ public:
         const auto& c = timestar::config();
         return c.cluster.enabled && c.cluster.partitioned && c.cluster.replication_factor > 1;
     }
-    const unsigned int sequenceNumber;
+    const uint64_t sequenceNumber;
 
     // TSM sequence number reserved for this store's flush file, taken inside
     // the rollover critical section so that TSM seq order == store write order
@@ -248,7 +248,7 @@ public:
         return n;
     }
 
-    MemoryStore(unsigned int _sequenceNumber) : sequenceNumber(_sequenceNumber) {
+    MemoryStore(uint64_t _sequenceNumber) : sequenceNumber(_sequenceNumber) {
         timestar::memory_log.debug("Memory store {} created", sequenceNumber);
     }
     ~MemoryStore() { timestar::memory_log.debug("Memory store {} removed", sequenceNumber); }

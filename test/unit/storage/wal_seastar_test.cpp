@@ -106,6 +106,44 @@ TEST_F(WALSeastarTest, CreationAndRemovalAreDirectoryDurableAndRetryable) {
     testWALDirectoryDurabilityBoundaries().get();
 }
 
+seastar::future<> testFreshWALRefusesToTruncateExistingData() {
+    const unsigned shard = seastar::this_shard_id();
+    const uint64_t sequence = 9002;
+    const timestar::StorageLayout layout(".");
+    const std::string path = layout.walFile(shard, sequence).string();
+    TimeStarInsert<double> insert("wal_identity", "collision");
+    insert.addValue(1000, 90.02);
+
+    {
+        WAL original(sequence, layout, shard);
+        co_await original.init(nullptr);
+        co_await original.insert(insert);
+        co_await original.close();
+    }
+    const auto sizeBefore = fs::file_size(path);
+
+    bool collisionRejected = false;
+    {
+        WAL colliding(sequence, layout, shard);
+        try {
+            co_await colliding.init(nullptr);
+        } catch (const std::runtime_error&) {
+            collisionRejected = true;
+        }
+    }
+    EXPECT_TRUE(collisionRejected);
+    EXPECT_EQ(fs::file_size(path), sizeBefore);
+
+    auto recovered = std::make_shared<MemoryStore>(sequence);
+    WALReader reader(path);
+    co_await reader.readAll(recovered.get());
+    EXPECT_NE(recovered->series.find(insert.seriesId128()), recovered->series.end());
+}
+
+TEST_F(WALSeastarTest, FreshWALRefusesToTruncateExistingData) {
+    testFreshWALRefusesToTruncateExistingData().get();
+}
+
 seastar::future<> testWALWriteAndRecoverFloat() {
     unsigned int sequenceNumber = 1;
     auto store = std::make_shared<MemoryStore>(sequenceNumber);

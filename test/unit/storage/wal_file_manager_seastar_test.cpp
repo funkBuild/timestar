@@ -247,6 +247,123 @@ TEST_F(WALFileManagerSeastarTest, CorruptRecoveredWalFailsStartupAndPreservesSou
         .get();
 }
 
+// A .wal artifact with damaged identity may contain the only durable copy of
+// acknowledged data. It must fence startup rather than being logged and skipped.
+TEST_F(WALFileManagerSeastarTest, MalformedWalFilenameFailsStartupAndPreservesSource) {
+    seastar::thread([] {
+        const unsigned shard = seastar::this_shard_id();
+        const unsigned sequence = 9013;
+        const timestar::StorageLayout layout(".");
+        fs::create_directories(layout.tsmDir(shard));
+        const fs::path canonicalPath = layout.walFile(shard, sequence);
+        const fs::path malformedPath = canonicalPath.parent_path() / "acknowledged-data.wal";
+
+        {
+            auto sourceStore = std::make_shared<MemoryStore>(sequence);
+            WAL source(sequence, layout, shard);
+            source.init(sourceStore.get()).get();
+            TimeStarInsert<double> insert("wal_recovery", "damaged_name");
+            insert.addValue(1000, 13.0);
+            source.insert(insert).get();
+            source.close().get();
+        }
+        fs::rename(canonicalPath, malformedPath);
+
+        Engine engine(layout);
+        TSMFileManager tsmManager(layout, shard);
+        tsmManager.init().get();
+        WALFileManager walManager(layout, shard);
+
+        EXPECT_THROW(walManager.init(engine, tsmManager).get(), std::runtime_error);
+        EXPECT_TRUE(fs::exists(malformedPath));
+        EXPECT_TRUE(walManager.getMemoryStores().empty());
+        EXPECT_TRUE(tsmManager.getSequencedTsmFiles().empty());
+
+        walManager.close().get();
+        tsmManager.stop().get();
+    })
+        .join()
+        .get();
+}
+
+// std::stoi accepts a numeric prefix and previously aliased this filename to a
+// legitimate sequence. Recovery identity parsing must consume the whole stem.
+TEST_F(WALFileManagerSeastarTest, NumericPrefixWalFilenameIsRejectedExactly) {
+    seastar::thread([] {
+        const unsigned shard = seastar::this_shard_id();
+        const unsigned sequence = 9014;
+        const timestar::StorageLayout layout(".");
+        fs::create_directories(layout.tsmDir(shard));
+        const fs::path canonicalPath = layout.walFile(shard, sequence);
+        const fs::path malformedPath = canonicalPath.parent_path() / "0000009014junk.wal";
+
+        {
+            auto sourceStore = std::make_shared<MemoryStore>(sequence);
+            WAL source(sequence, layout, shard);
+            source.init(sourceStore.get()).get();
+            TimeStarInsert<double> insert("wal_recovery", "numeric_prefix_name");
+            insert.addValue(1000, 14.0);
+            source.insert(insert).get();
+            source.close().get();
+        }
+        fs::rename(canonicalPath, malformedPath);
+
+        Engine engine(layout);
+        TSMFileManager tsmManager(layout, shard);
+        tsmManager.init().get();
+        WALFileManager walManager(layout, shard);
+
+        EXPECT_THROW(walManager.init(engine, tsmManager).get(), std::runtime_error);
+        EXPECT_TRUE(fs::exists(malformedPath));
+        EXPECT_TRUE(walManager.getMemoryStores().empty());
+        EXPECT_TRUE(tsmManager.getSequencedTsmFiles().empty());
+
+        walManager.close().get();
+        tsmManager.stop().get();
+    })
+        .join()
+        .get();
+}
+
+// StorageLayout already emits uint64_t WAL names. Recovery and the next active
+// allocation must retain that width instead of rejecting or wrapping at 32 bits.
+TEST_F(WALFileManagerSeastarTest, RecoveryContinuesAboveUint32SequenceRange) {
+    seastar::thread([] {
+        const unsigned shard = seastar::this_shard_id();
+        const uint64_t sequence = static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()) + 1;
+        const timestar::StorageLayout layout(".");
+        fs::create_directories(layout.tsmDir(shard));
+        const fs::path recoveredPath = layout.walFile(shard, sequence);
+
+        {
+            auto sourceStore = std::make_shared<MemoryStore>(sequence);
+            WAL source(sequence, layout, shard);
+            source.init(sourceStore.get()).get();
+            TimeStarInsert<double> insert("wal_recovery", "wide_sequence");
+            insert.addValue(1000, 42.95);
+            source.insert(insert).get();
+            source.close().get();
+        }
+
+        Engine engine(layout);
+        TSMFileManager tsmManager(layout, shard);
+        tsmManager.init().get();
+        WALFileManager walManager(layout, shard);
+
+        EXPECT_NO_THROW(walManager.init(engine, tsmManager).get());
+        EXPECT_FALSE(fs::exists(recoveredPath));
+        ASSERT_EQ(walManager.getMemoryStores().size(), 1u);
+        EXPECT_EQ(walManager.getMemoryStores().front()->sequenceNumber, sequence + 1);
+        EXPECT_TRUE(fs::exists(layout.walFile(shard, sequence + 1)));
+        EXPECT_EQ(tsmManager.getSequencedTsmFiles().size(), 1u);
+
+        walManager.close().get();
+        tsmManager.stop().get();
+    })
+        .join()
+        .get();
+}
+
 // Repeated conversion failures must never evict the only live in-memory copy.
 // The retry loop keeps the store visible to queries and pending-conversion
 // accounting until a later attempt publishes it successfully.

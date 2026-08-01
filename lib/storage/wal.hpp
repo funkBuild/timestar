@@ -107,7 +107,7 @@ private:
     // WAL segment size limit — initialized from config in init()
     size_t maxWalSize_ = 16 * 1024 * 1024;  // default 16 MiB, overridden by config
     // Identity & file
-    unsigned int sequenceNumber;
+    uint64_t sequenceNumber;
     // Injected path authority + owning shard, so this segment's filename is
     // derived from the configured data root rather than the global config.
     const timestar::StorageLayout layout_;
@@ -188,7 +188,7 @@ private:
     CompressionStats _compressionStats;
 
 public:
-    WAL(unsigned int _sequenceNumber, timestar::StorageLayout layout, unsigned shardId);
+    WAL(uint64_t _sequenceNumber, timestar::StorageLayout layout, unsigned shardId);
     ~WAL();  // Ensure caller invoked close()/finalFlush() before destruction
 
     // This segment's on-disk path, derived from the injected layout.
@@ -236,7 +236,7 @@ public:
     }
 
     // Utilities
-    static std::string sequenceNumberToFilename(unsigned int sequenceNumber);
+    static std::string sequenceNumberToFilename(uint64_t sequenceNumber);
 };
 
 class WALReader {

@@ -57,7 +57,7 @@ class WALFileManager {
 private:
     const timestar::StorageLayout layout_;
     int shardId;
-    uint32_t currentWalSequenceNumber = 0;
+    uint64_t currentWalSequenceNumber = 0;
     bool walSequenceInitialized_ = false;
     std::vector<seastar::shared_ptr<MemoryStore>> memoryStores;
     // Stores whose TSM is already query-visible but whose source WAL has not
