@@ -6,7 +6,7 @@
 
 **Remediation commits:** `95c10d2`, `a16b03a`, `d578e81`, `ddab705`,
 `8620b9e`, `20639dc`, `ea2511b`, `3ac9899`, `69ac879`, `09a62c5`,
-`2e06cb8`
+`2e06cb8`, `7151f5d`
 
 **Scope:** The recent VShard/Raft cluster redesign, its production-server
 integration, the public HTTP surface, recovery paths, and the release evidence
@@ -19,7 +19,7 @@ used as evidence that the current server is production-ready.
 
 ## Implementation progress after the review
 
-Eleven remediation commits are now recorded. Cluster release status remains
+Twelve remediation commits are now recorded. Cluster release status remains
 **BLOCKED** because group 0/movement, generation-atomic live snapshot
 replacement, pattern-delete expansion, replicated retention, the large-snapshot
 path, and rolling wire-format compatibility remain open. The four previously
@@ -610,10 +610,15 @@ is not completion.
   `/health` returns non-ready for each injected condition and only becomes ready
   after the node can satisfy its configured API contract.
 - [ ] **CR-FIX-063 — close or explicitly disable conditional durability debt.**
-  Owner: index/journal. Fix D-38 (`NativeIndex` destruction with in-flight gates)
-  and resolve D-39/D-10 before enabling shared journals by default. **Done when:**
-  destructor fault tests cannot SIGILL and real-disk shared-journal GC evidence
-  demonstrates bounded reclamation.
+  Owner: index/journal. Resolve D-39/D-10 before enabling shared journals by
+  default. **Done when:** real-disk shared-journal GC evidence demonstrates
+  bounded reclamation. **Progress:** D-38 is closed in `7151f5d`: the six
+  in-tree crash simulations now use an explicit test-only abandonment boundary
+  that cancels timers and drains both background gates and any threshold flush
+  without performing a clean WAL close. A deterministic lifecycle regression
+  holds each gate open and proves abandonment waits; unsupported destruction
+  now fails with an actionable lifecycle diagnostic instead of Seastar's opaque
+  `~gate()` SIGILL. Production callers must still `co_await close()`.
 - [x] **CR-FIX-064 — make replicated startup open-file-safe and
   exception-safe.** Owner: server/cluster composition. Resolve the descriptor
   requirement before opening Engine/Raft state, raise an ordinary soft limit
@@ -760,4 +765,12 @@ backpressure_gate.sh:                 passed on 2e06cb8
 node_kill_round.sh:                   passed on 2e06cb8
 restart_catchup_gate.sh:              passed on 2e06cb8
 snapshot_durability_gate.sh:          passed on 2e06cb8
+```
+
+NativeIndex lifecycle validation for `7151f5d`:
+
+```text
+targeted lifecycle/recovery tests:       7/7 passed
+current full unit suite:             4342/4342 passed (444 suites, -c 2)
+current socket-backed cluster suite:     45/45 passed (8 suites, -c 2)
 ```
