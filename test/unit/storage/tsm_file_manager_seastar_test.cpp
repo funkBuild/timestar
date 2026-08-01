@@ -328,6 +328,43 @@ TEST_F(TSMFileManagerSeastarTest, WriteMemstore) {
     testFMWriteMemstore().get();
 }
 
+// A final-directory fsync is the WAL->TSM ownership handoff. If it fails,
+// writeMemstore must fail before registering success; its caller will therefore
+// keep the WAL instead of deleting the only durable generation.
+seastar::future<> testFMWriteMemstoreDirectorySyncFailureFailsClosed() {
+    TSMFileManager mgr(timestar::StorageLayout("."), seastar::this_shard_id());
+    co_await mgr.init();
+    mgr.setDirectorySyncForTesting([](const std::string&) {
+        return seastar::make_exception_future<>(std::runtime_error("injected final-directory sync failure"));
+    });
+
+    auto store = seastar::make_shared<MemoryStore>(0);
+    TimeStarInsert<double> insert("durability", "value");
+    insert.addValue(1000, 1.0);
+    store->insertMemory(std::move(insert));
+
+    bool failed = false;
+    try {
+        co_await mgr.writeMemstore(store, 0);
+    } catch (const std::runtime_error& e) {
+        failed = true;
+        EXPECT_NE(std::string(e.what()).find("injected final-directory"), std::string::npos);
+    }
+    EXPECT_TRUE(failed);
+    EXPECT_TRUE(mgr.getSequencedTsmFiles().empty())
+        << "an un-durable final name must not be reported as a completed WAL conversion";
+
+    size_t finalFiles = 0;
+    for (const auto& entry : fs::directory_iterator("shard_0/tsm"))
+        if (entry.path().extension() == ".tsm")
+            ++finalFiles;
+    EXPECT_EQ(finalFiles, 1u) << "the safe failure shape keeps the new file AND lets the caller keep its WAL";
+}
+
+TEST_F(TSMFileManagerSeastarTest, WriteMemstoreDirectorySyncFailureFailsClosed) {
+    testFMWriteMemstoreDirectorySyncFailureFailsClosed().get();
+}
+
 // ---------------------------------------------------------------------------
 // Test: rollover-time seq reservations keep LWW rank in WRITE order even when
 // conversions complete out of order.

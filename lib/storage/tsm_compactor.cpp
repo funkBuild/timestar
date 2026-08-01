@@ -1251,19 +1251,13 @@ seastar::future<CompactionResult> TSMCompactor::compact(
         // Atomic rename from temp to final (async to avoid blocking the reactor)
         co_await seastar::rename_file(tempPath, outputPath);
 
-        // Fsync the parent directory to ensure the rename (directory entry update)
-        // is durable.  Without this, a crash could lose the rename even though
-        // the file data is already on disk.
+        // Fsync the parent directory to ensure the rename is durable BEFORE
+        // executeCompaction is allowed to remove the source generation. A sync
+        // failure is a compaction failure, not a warning: keeping both the
+        // source and an orphan output is safe; deleting the source is not.
         auto slash = outputPath.rfind('/');
         std::string dir = (slash != std::string::npos) ? outputPath.substr(0, slash) : ".";
-        try {
-            auto dirFile = co_await seastar::open_directory(dir);
-            co_await dirFile.flush();
-            co_await dirFile.close();
-        } catch (...) {
-            // Best-effort: log but don't fail the compaction
-            timestar::compactor_log.warn("Failed to fsync parent directory after compaction rename: {}", dir);
-        }
+        co_await fileManager->syncPublishedDirectory(dir);
 
         compactionResult = CompactionResult{outputPath, stats};
     } catch (...) {
@@ -1417,15 +1411,11 @@ seastar::future<CompactionStats> TSMCompactor::executeCompaction(CompactionPlan 
                 dirPath = (slash != std::string::npos) ? finalPath.substr(0, slash) : ".";
             }
         }
-        if (!dirPath.empty()) {
-            try {
-                auto d = co_await seastar::open_directory(dirPath);
-                co_await d.flush();
-                co_await d.close();
-            } catch (...) {
-                // best-effort directory sync
-            }
-        }
+        if (!dirPath.empty())
+            // Same publish boundary as ordinary compaction. If this fails, the
+            // newly registered outputs may coexist with the sources in memory
+            // and on disk, which is retry-safe; the sources MUST remain.
+            co_await fileManager->syncPublishedDirectory(dirPath);
         co_await fileManager->removeTSMFiles(plan.sourceFiles);
 
         CompactionStats finalStats;

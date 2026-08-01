@@ -8,6 +8,7 @@
 
 #include <filesystem>
 #include <seastar/core/reactor.hh>
+#include <seastar/core/seastar.hh>
 #include <seastar/core/sleep.hh>
 #include <seastar/core/thread.hh>
 #include <seastar/core/with_scheduling_group.hh>
@@ -15,7 +16,9 @@
 namespace fs = std::filesystem;
 
 TSMFileManager::TSMFileManager(timestar::StorageLayout layout, unsigned shard)
-    : layout_(std::move(layout)), shardId(static_cast<int>(shard)) {}
+    : layout_(std::move(layout)),
+      shardId(static_cast<int>(shard)),
+      directorySync_([](const std::string& path) { return seastar::sync_directory(path); }) {}
 
 // Destructor defined here where TSMCompactor is a complete type,
 // so std::unique_ptr<TSMCompactor> can call delete.
@@ -152,16 +155,11 @@ seastar::future<uint64_t> TSMFileManager::writeMemstore(seastar::shared_ptr<Memo
     co_await seastar::rename_file(tmpFilename, filename);
 
     // Fsync the parent directory to ensure the rename (directory entry update)
-    // is durable.  Without this, a crash could lose the rename even though
-    // the file data is already on disk.
+    // is durable. Without this, a crash could lose the TSM after its WAL is
+    // unlinked. THIS IS NOT BEST-EFFORT: writeMemstore returning is what permits
+    // WALFileManager::convertWalToTsm to remove the old durable generation.
     const std::string parentDir = layout_.tsmDir(shardId).string();
-    try {
-        auto dirFile = co_await seastar::open_directory(parentDir);
-        co_await dirFile.flush();
-        co_await dirFile.close();
-    } catch (...) {
-        timestar::tsm_log.warn("Failed to fsync parent directory after memstore write rename: {}", parentDir);
-    }
+    co_await syncPublishedDirectory(parentDir);
 
     uint64_t bytesWritten = 0;
     try {

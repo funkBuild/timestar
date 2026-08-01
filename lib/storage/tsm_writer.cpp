@@ -795,9 +795,18 @@ static void fsyncParentDir(const std::string& filepath) {
     std::string dir = (slash != std::string::npos) ? filepath.substr(0, slash) : ".";
     int dirfd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY);
     if (dirfd < 0)
-        return;  // best-effort
-    ::fsync(dirfd);
-    ::close(dirfd);
+        throw std::system_error(errno, std::system_category(), "TSMWriter: failed to open parent directory " + dir);
+    int syncRet;
+    do {
+        syncRet = ::fsync(dirfd);
+    } while (syncRet < 0 && errno == EINTR);
+    if (syncRet < 0) {
+        const int err = errno;
+        ::close(dirfd);
+        throw std::system_error(err, std::system_category(), "TSMWriter: failed to fsync parent directory " + dir);
+    }
+    if (::close(dirfd) < 0)
+        throw std::system_error(errno, std::system_category(), "TSMWriter: failed to close parent directory " + dir);
 }
 
 void TSMWriter::close() {
@@ -926,19 +935,12 @@ seastar::future<> TSMWriter::closeDMA() {
         std::rethrow_exception(writeError);
     }
 
-    // Ensure the directory entry for this new file is durable.
-    // Use Seastar's async file API instead of blocking ::open()+::fsync() on the reactor.
-    {
-        auto slash = filename.rfind('/');
-        std::string dir = (slash != std::string::npos) ? filename.substr(0, slash) : ".";
-        try {
-            auto dirFile = co_await seastar::open_directory(dir);
-            co_await dirFile.flush();
-            co_await dirFile.close();
-        } catch (...) {
-            // best-effort directory sync — non-fatal
-        }
-    }
+    // Ensure the directory entry for this new file is durable. This writer is
+    // also used directly by migration/rebalancing paths, so a directory failure
+    // must propagate even when no manager-level rename follows it.
+    auto slash = filename.rfind('/');
+    std::string dir = (slash != std::string::npos) ? filename.substr(0, slash) : ".";
+    co_await seastar::sync_directory(dir);
 
     LOG_INSERT_PATH(timestar::tsm_log, debug, "DMA file written successfully: {}", filename);
 }

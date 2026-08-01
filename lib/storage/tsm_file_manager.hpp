@@ -8,6 +8,7 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -16,6 +17,8 @@
 #include <seastar/core/scheduling.hh>
 #include <seastar/core/semaphore.hh>
 #include <seastar/core/shared_ptr.hh>
+#include <string>
+#include <utility>
 #include <vector>
 
 // Forward declaration
@@ -35,6 +38,11 @@ private:
     // No atomic needed: TSMFileManager is a per-shard object in Seastar's shard-per-core model,
     // only accessed from a single thread.
     uint64_t nextSequenceId = 0;
+    // Publication durability boundary for WAL conversion and compaction. A
+    // caller may delete the old durable generation only after this succeeds.
+    // Kept per manager so a regression can inject the exact final-directory
+    // failure without changing process-global filesystem behaviour.
+    std::function<seastar::future<>(const std::string&)> directorySync_;
     // Track files by tier for compaction
     std::vector<seastar::shared_ptr<TSM>> tiers[MAX_TIERS];
 
@@ -153,6 +161,10 @@ public:
     // instead of reconstructing shard_N paths from the global configuration.
     [[nodiscard]] const timestar::StorageLayout& layout() const { return layout_; }
     [[nodiscard]] unsigned shard() const { return static_cast<unsigned>(shardId); }
+    seastar::future<> syncPublishedDirectory(const std::string& path) { return directorySync_(path); }
+    void setDirectorySyncForTesting(std::function<seastar::future<>(const std::string&)> sync) {
+        directorySync_ = std::move(sync);
+    }
 
     seastar::future<> init();
     seastar::future<> stop();

@@ -706,6 +706,42 @@ SEASTAR_TEST_F(TSMCompactorTest, CompactionStatistics) {
     co_return;
 }
 
+// The output rename is not a durable publication until its directory fsync
+// succeeds. Ordinary compaction must propagate that failure before removing or
+// unregistering any source file.
+SEASTAR_TEST_F(TSMCompactorTest, DirectorySyncFailureKeepsOrdinaryCompactionSources) {
+    std::vector<seastar::shared_ptr<TSM>> sources;
+    for (int i = 0; i < 2; ++i) {
+        auto tsm = self->createTestTSMFile(0, i, "syncfail.", 2, 5, 1000 + i * 100);
+        co_await tsm->open();
+        co_await tsm->readSparseIndex();
+        co_await self->fileManager->addTSMFile(tsm);
+        sources.push_back(tsm);
+    }
+    self->fileManager->setDirectorySyncForTesting([](const std::string&) {
+        return seastar::make_exception_future<>(std::runtime_error("injected compaction directory sync failure"));
+    });
+
+    CompactionPlan plan;
+    plan.sourceFiles = sources;
+    plan.targetTier = 1;
+    plan.targetSeqNum = 100;
+    plan.targetPath = "shard_0/tsm/01_0000000100.tsm";
+
+    bool failed = false;
+    try {
+        co_await self->compactor->executeCompaction(plan);
+    } catch (const std::runtime_error& e) {
+        failed = true;
+        EXPECT_NE(std::string(e.what()).find("injected compaction"), std::string::npos);
+    }
+    EXPECT_TRUE(failed);
+    EXPECT_EQ(self->fileManager->getFileCountInTier(0), sources.size());
+    for (const auto& source : sources)
+        EXPECT_TRUE(fs::exists(source->getFilePath())) << "source was deleted before output publication was durable";
+    co_return;
+}
+
 // Test full compaction across all tiers
 SEASTAR_TEST_F(TSMCompactorTest, FullCompaction) {
     // Create files in multiple tiers
@@ -994,5 +1030,39 @@ SEASTAR_TEST_F(TSMCompactorTest, VShardPartitionedBackgroundCompaction) {
     }
     EXPECT_GT(files, 0u);
     EXPECT_TRUE(checkedDeletedSeries) << "partitioned compaction dropped the surviving series generation";
+    co_return;
+}
+
+SEASTAR_TEST_F(TSMCompactorTest, DirectorySyncFailureKeepsVShardPartitionedSources) {
+    self->compactor->setVShardPartitioning(true);
+    std::vector<seastar::shared_ptr<TSM>> sources;
+    for (int i = 0; i < 2; ++i) {
+        auto tsm = self->createTestTSMFile(0, i, "part-syncfail.", 3, 4, 1000 + i * 100);
+        co_await tsm->open();
+        co_await tsm->readSparseIndex();
+        co_await self->fileManager->addTSMFile(tsm);
+        sources.push_back(tsm);
+    }
+    self->fileManager->setDirectorySyncForTesting([](const std::string&) {
+        return seastar::make_exception_future<>(std::runtime_error("injected partition directory sync failure"));
+    });
+
+    CompactionPlan plan;
+    plan.sourceFiles = sources;
+    plan.targetTier = 1;
+    plan.targetSeqNum = 100;
+    plan.targetPath = "shard_0/tsm/01_0000000100.tsm";
+
+    bool failed = false;
+    try {
+        co_await self->compactor->executeCompaction(plan);
+    } catch (const std::runtime_error& e) {
+        failed = true;
+        EXPECT_NE(std::string(e.what()).find("injected partition"), std::string::npos);
+    }
+    EXPECT_TRUE(failed);
+    EXPECT_EQ(self->fileManager->getFileCountInTier(0), sources.size());
+    for (const auto& source : sources)
+        EXPECT_TRUE(fs::exists(source->getFilePath())) << "partitioned source was deleted before durable publish";
     co_return;
 }
