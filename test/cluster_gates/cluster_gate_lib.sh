@@ -24,6 +24,13 @@ GATE_FAILURES=0
 # pins a value pins it for a reason (backpressure_gate's in-flight budget, for one).
 GATE_SERVER_ENV="${GATE_SERVER_ENV:-}"
 
+# Every gate runs multiple Seastar processes on one host. Without an explicit
+# budget each process sizes itself from the host's full available RAM, so three
+# otherwise healthy nodes can collectively overcommit the machine and kill the
+# harness during catch-up/compaction. Keep the default aggregate bounded and
+# reproducible; a capacity run may override this in its invocation.
+GATE_SERVER_MEMORY="${GATE_SERVER_MEMORY:-8G}"
+
 gate_fail() {
     echo "  GATE FAILURE: $*" >&2
     GATE_FAILURES=$((GATE_FAILURES + 1))

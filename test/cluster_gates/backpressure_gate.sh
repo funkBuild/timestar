@@ -35,7 +35,7 @@ for i in 1 2 3; do
     env $GATE_SERVER_ENV TIMESTAR_CLUSTER_WRITE_INFLIGHT_BYTES="$LIMIT" TIMESTAR_DATA_DIR="/tmp/tsgate_bp$i" \
         TIMESTAR_CLUSTER_ENABLED=true TIMESTAR_CLUSTER_PARTITIONED=true \
         TIMESTAR_CLUSTER_REPLICATION_FACTOR=3 TIMESTAR_CLUSTER_UUID=00112233445566778899aabbccddeeff TIMESTAR_CLUSTER_DEVELOPMENT_ALLOW_INSECURE_TRANSPORT=true TIMESTAR_CLUSTER_NODE_ID=$i TIMESTAR_CLUSTER_PEERS="$PEERS" \
-        "$BIN" --port $((19209 + i)) --smp 4 >"/tmp/tsgate_bp$i/s.log" 2>&1 &
+        "$BIN" --port $((19209 + i)) --smp 4 --memory "$GATE_SERVER_MEMORY" >"/tmp/tsgate_bp$i/s.log" 2>&1 &
 done
 trap 'gate_cleanup 1921 /tmp/tsgate_bp1 /tmp/tsgate_bp2 /tmp/tsgate_bp3' EXIT
 
@@ -138,7 +138,7 @@ for i in 1 2 3; do
     env $GATE_SERVER_ENV TIMESTAR_DATA_DIR="/tmp/tsgate_bp$i" \
         TIMESTAR_CLUSTER_ENABLED=true TIMESTAR_CLUSTER_PARTITIONED=true \
         TIMESTAR_CLUSTER_REPLICATION_FACTOR=3 TIMESTAR_CLUSTER_UUID=00112233445566778899aabbccddeeff TIMESTAR_CLUSTER_DEVELOPMENT_ALLOW_INSECURE_TRANSPORT=true TIMESTAR_CLUSTER_NODE_ID=$i TIMESTAR_CLUSTER_PEERS="$PEERS" \
-        "$BIN" --port $((19209 + i)) --smp 4 >"/tmp/tsgate_bp$i/s.log" 2>&1 &
+        "$BIN" --port $((19209 + i)) --smp 4 --memory "$GATE_SERVER_MEMORY" >"/tmp/tsgate_bp$i/s.log" 2>&1 &
 done
 wait_balanced "$PORTS" 4096 3 90 || gate_exit
 wait_healthy "$PORTS" 60 || gate_exit

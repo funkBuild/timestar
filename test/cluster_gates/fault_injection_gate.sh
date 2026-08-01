@@ -193,7 +193,7 @@ PEERS_DIRECT="127.0.0.1:19410,127.0.0.1:19411,127.0.0.1:19412"
 start_node() { # $1 = node id, $2 = peers list
     env $GATE_SERVER_ENV TIMESTAR_DATA_DIR="/tmp/tsgate_fi$1" TIMESTAR_CLUSTER_ENABLED=true TIMESTAR_CLUSTER_PARTITIONED=true \
         TIMESTAR_CLUSTER_REPLICATION_FACTOR=3 TIMESTAR_CLUSTER_UUID=00112233445566778899aabbccddeeff TIMESTAR_CLUSTER_DEVELOPMENT_ALLOW_INSECURE_TRANSPORT=true TIMESTAR_CLUSTER_NODE_ID=$1 TIMESTAR_CLUSTER_PEERS="$2" \
-        "$BIN" --port $((19409 + $1)) --smp 4 >>"/tmp/tsgate_fi$1/s.log" 2>&1 &
+        "$BIN" --port $((19409 + $1)) --smp 4 --memory "$GATE_SERVER_MEMORY" >>"/tmp/tsgate_fi$1/s.log" 2>&1 &
 }
 
 # Only the DATA-PLANE and RAFT ports are proxied. Node 3's HTTP listener binds

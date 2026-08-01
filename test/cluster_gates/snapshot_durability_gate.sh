@@ -109,7 +109,7 @@ run_arm() {
             TIMESTAR_CLUSTER_SNAPSHOT_ENTRIES="$snap" TIMESTAR_CLUSTER_SNAPSHOT_MIN_INTERVAL_S=2 \
             ${snapbytes:+TIMESTAR_CLUSTER_SNAPSHOT_BYTES="$snapbytes"} \
             TIMESTAR_WAL_SIZE_THRESHOLD="$wal" \
-            "$BIN" --port $((19709 + $1)) --smp 4 >>"/tmp/tsgate_sd$1/s.log" 2>&1 &
+            "$BIN" --port $((19709 + $1)) --smp 4 --memory "$GATE_SERVER_MEMORY" >>"/tmp/tsgate_sd$1/s.log" 2>&1 &
     }
     echo "=== ARM: $name (snapshot entry threshold $snap) ==="
     for i in 1 2 3; do start_node $i; done

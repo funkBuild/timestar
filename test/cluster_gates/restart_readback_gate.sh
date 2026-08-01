@@ -75,7 +75,7 @@ start_node() {
     env $GATE_SERVER_ENV TIMESTAR_DATA_DIR="/tmp/tsgate_rr$1" TIMESTAR_CLUSTER_ENABLED=true TIMESTAR_CLUSTER_PARTITIONED=true \
         TIMESTAR_CLUSTER_REPLICATION_FACTOR=3 TIMESTAR_CLUSTER_UUID=00112233445566778899aabbccddeeff TIMESTAR_CLUSTER_DEVELOPMENT_ALLOW_INSECURE_TRANSPORT=true TIMESTAR_CLUSTER_NODE_ID=$1 TIMESTAR_CLUSTER_PEERS="$PEERS" \
         TIMESTAR_WAL_SIZE_THRESHOLD="${GATE_WAL_THRESHOLD:-2097152}" \
-        "$BIN" --port $((19729 + $1)) --smp 4 >>"/tmp/tsgate_rr$1/s.log" 2>&1 &
+        "$BIN" --port $((19729 + $1)) --smp 4 --memory "$GATE_SERVER_MEMORY" >>"/tmp/tsgate_rr$1/s.log" 2>&1 &
 }
 
 # status_sum FIELD -- summed across the three nodes.

@@ -1,6 +1,8 @@
 #!/bin/bash
-# GATE (write-scaleout 5.4): a follower that was DOWN through a large write campaign must
-# catch up when it returns -- through BOUNDED AppendEntries messages.
+# GATE (write-scaleout 5.4 / CR-FIX-011): a follower that was DOWN through a
+# large write campaign has its whole data directory removed, then must catch up
+# from an actually empty node -- through bounded snapshot chunks plus the
+# retained post-snapshot suffix.
 #
 # WHAT IT DISCRIMINATES. `sendAppend` used to put `log_.entriesFrom(nextIndex)` -- the
 # entire remaining log tail -- into ONE AppendEntries. The Raft deliver verb is seastar
@@ -77,6 +79,14 @@
 # catch-up genuinely runs as a pipeline. It is sized in batches rather than points so the
 # disk cost is explicit: each batch is 10k points at RF=3.
 #
+# EMPTY-NODE SCOPE. `snapshots_installed` proves the freshly recreated process
+# installed a transferred payload; the subsequent public queries prove the node
+# can coordinate normal discovery after that catch-up and preserve both a live
+# and an exactly deleted probe. The focused EngineSnapshotApply regression is
+# the complementary proof that those discovered records come from the installed
+# catalog itself rather than another replica. Existing-data crash/restart replay
+# remains covered by restart_readback_gate.sh.
+#
 # Usage: restart_catchup_gate.sh [SERVER_BINARY]
 set -u
 cd "$(dirname "$0")" || exit 2
@@ -117,7 +127,7 @@ start_node() {
         TIMESTAR_CLUSTER_REPLICATION_FACTOR=3 TIMESTAR_CLUSTER_UUID=00112233445566778899aabbccddeeff TIMESTAR_CLUSTER_DEVELOPMENT_ALLOW_INSECURE_TRANSPORT=true TIMESTAR_CLUSTER_NODE_ID=$1 TIMESTAR_CLUSTER_PEERS="$PEERS" \
         TIMESTAR_CLUSTER_SNAPSHOT_ENTRIES="$SNAP_ENTRIES" TIMESTAR_CLUSTER_SNAPSHOT_MIN_INTERVAL_S=2 \
         TIMESTAR_WAL_SIZE_THRESHOLD="$WAL_THRESHOLD" \
-        "$BIN" --port $((19509 + $1)) --smp 4 >>"/tmp/tsgate_cu$1/s.log" 2>&1 &
+        "$BIN" --port $((19509 + $1)) --smp 4 --memory "$GATE_SERVER_MEMORY" >>"/tmp/tsgate_cu$1/s.log" 2>&1 &
 }
 trap 'gate_cleanup 1951 /tmp/tsgate_cu1 /tmp/tsgate_cu2 /tmp/tsgate_cu3' EXIT
 
@@ -125,8 +135,18 @@ for i in 1 2 3; do start_node $i; done
 wait_all_led "$PORTS" 4096 120 || gate_exit
 
 echo "=== kill node 3, then write $BATCHES x 10k points with it down ==="
-pkill -u "$(id -u)" -9 -f "timestar_http_server.*--port 19512"
+pkill -u "$(id -u)" -9 -f -- '--port 19512'
 sleep 3
+# This is not an ordinary restart: remove every journal, TSM, WAL, index and
+# node-local identity artifact while the process is confirmed dead. The helper
+# restricts recursive removal to a direct /tmp/tsgate_* root, retries it, proves
+# absence, and only then recreates an empty directory for the later log file.
+fresh_gate_data_dirs /tmp/tsgate_cu3 || exit 2
+if find /tmp/tsgate_cu3 -mindepth 1 -print -quit | grep -q .; then
+    echo "ABORT: node 3 data directory is not empty after verified reset" >&2
+    exit 2
+fi
+echo "  node 3 durable state removed; restart target is empty"
 # WAIT FOR RE-ELECTION BEFORE MEASURING. Node 3 led ~1/3 of the VShards; killing it
 # leaves those leaderless until the surviving pair re-elects, and a write to one of them
 # in that window is a bounded, honest 503. That is the NODE-KILL round's subject, not this
@@ -141,6 +161,24 @@ wait_all_led "19510 19511" 4096 90 || gate_exit
 # errors in a 6 s burst covering the whole bench when it started immediately after
 # wait_all_led, against 106/400 before the stuck-transfer fixes and 0 once settled.)
 wait_leadership_settled "19510 19511" 40 || gate_exit
+
+# Two public-path probes precede the bulk campaign so the low WAL threshold
+# rolls them into TSM before snapshot production. One survives; the other is
+# deleted through the replicated exact-key command before the donor materialises
+# its resolved VShard view.
+TS=$(date +%s)000000000
+KEEP_CODE=$(curl -sS -m10 -o /tmp/tsgate_cu_keep_write.txt -w '%{http_code}' \
+    -X POST "http://127.0.0.1:19510/write" -H 'Content-Type: application/json' \
+    -d "{\"measurement\":\"catchup\",\"tags\":{\"probe\":\"p1\"},\"fields\":{\"value\":42.5},\"timestamp\":$TS}")
+GONE_CODE=$(curl -sS -m10 -o /tmp/tsgate_cu_gone_write.txt -w '%{http_code}' \
+    -X POST "http://127.0.0.1:19510/write" -H 'Content-Type: application/json' \
+    -d "{\"measurement\":\"catchup\",\"tags\":{\"probe\":\"gone\"},\"fields\":{\"value\":99.5},\"timestamp\":$TS}")
+DELETE_CODE=$(curl -sS -m10 -o /tmp/tsgate_cu_delete.txt -w '%{http_code}' \
+    -X POST "http://127.0.0.1:19510/delete" -H 'Content-Type: application/json' \
+    -d "{\"measurement\":\"catchup\",\"tags\":{\"probe\":\"gone\"},\"field\":\"value\",\"startTime\":$TS,\"endTime\":$TS}")
+assert_eq "surviving probe write HTTP status" "$KEEP_CODE" 200
+assert_eq "deleted probe write HTTP status" "$GONE_CODE" 200
+assert_eq "replicated exact delete HTTP status" "$DELETE_CODE" 200
 
 "$BENCH" --server-port 19510 -c 4 --batches "$BATCHES" --batch-size 10000 --verify 0 \
     --warmup 5 --connections 8 --hosts 1000 --racks 2 >/tmp/tsgate_cu_bench.txt 2>&1
@@ -169,11 +207,6 @@ assert_ge "batches accepted during the campaign" "${OK_REQS:-0}" "$((BATCHES / 4
 # What IS hard-asserted: zero server-side 500s, zero crashes, and the catch-up itself.
 echo "  campaign with one replica down: ${OK_REQS:-?} OK, ${HTTP_ERRS:-?} bounded 503s (ADVISORY -- see the script)"
 
-# A probe write whose points must be readable ON NODE 3 once it has caught up.
-TS=$(date +%s)000000000
-curl -s -m10 -X POST "http://127.0.0.1:19510/write" -H 'Content-Type: application/json' \
-    -d "{\"measurement\":\"catchup\",\"tags\":{\"probe\":\"p1\"},\"fields\":{\"value\":42.5},\"timestamp\":$TS}" \
-    >/dev/null
 sleep 2
 
 # THE PRODUCER MUST HAVE RUN while node 3 was down -- otherwise the survivors still hold
@@ -238,9 +271,19 @@ assert_eq "node 3 caught up on every group its peers lead" "$CAUGHT" 1
 READ=$(curl -s -m15 -X POST "http://127.0.0.1:19512/query" -H 'Content-Type: application/json' \
     -d "{\"query\":\"avg:catchup(value){probe:p1}\",\"startTime\":$((TS - 1000000000)),\"endTime\":$((TS + 1000000000))}")
 if printf '%s' "$READ" | grep -q '42.5'; then
-    gate_ok "the probe point is readable on the restarted node"
+    gate_ok "the surviving probe is discoverable through the empty-node restart"
 else
-    gate_fail "the restarted node cannot answer for the probe point: $READ"
+    gate_fail "the empty-node restart cannot discover the surviving probe: $READ"
+fi
+
+GONE_READ=$(curl -s -m15 -X POST "http://127.0.0.1:19512/query" -H 'Content-Type: application/json' \
+    -d "{\"query\":\"avg:catchup(value){probe:gone}\",\"startTime\":$((TS - 1000000000)),\"endTime\":$((TS + 1000000000))}")
+if printf '%s' "$GONE_READ" | grep -q '99.5'; then
+    gate_fail "the exactly deleted probe resurrected after empty-node catch-up: $GONE_READ"
+elif printf '%s' "$GONE_READ" | grep -q '"status":"success"'; then
+    gate_ok "the exactly deleted probe remains absent after empty-node catch-up"
+else
+    gate_fail "the deleted-probe query did not complete successfully: $GONE_READ"
 fi
 
 # ============================================================================

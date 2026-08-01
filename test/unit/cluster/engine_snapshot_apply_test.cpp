@@ -49,6 +49,22 @@ data::WriteSeries seriesOnCore0(std::string* outKey, SeriesId128* outSid, VShard
         }
     }
 }
+
+data::WriteSeries deletedSeriesOnVShard(VShardId vshard, std::string* outKey) {
+    for (int i = 0;; ++i) {
+        std::string key = buildSeriesKey("snapsm_deleted", {{"host", "gone" + std::to_string(i)}}, "value");
+        if (virtualShard(SeriesId128::fromSeriesKey(key)) != vshard.value())
+            continue;
+        *outKey = key;
+        data::WriteSeries series;
+        series.seriesKey = std::move(key);
+        series.type = TSMValueType::Float;
+        series.timestamps = {BASE, BASE + 1000};
+        series.values = std::vector<double>{70.0, 80.0};
+        series.revisions = {43, 43};
+        return series;
+    }
+}
 }  // namespace
 
 TEST(EngineSnapshotApply, ApplySnapshotInstallsDataOnFreshReplica) {
@@ -57,6 +73,7 @@ TEST(EngineSnapshotApply, ApplySnapshotInstallsDataOnFreshReplica) {
         std::filesystem::remove_all("snapsm_dst");
 
         std::string key;
+        std::string deletedKey;
         SeriesId128 sid;
         VShardId vs{0};
         data::SnapshotPayload payload;
@@ -74,7 +91,8 @@ TEST(EngineSnapshotApply, ApplySnapshotInstallsDataOnFreshReplica) {
             cluster::EngineLocalStore srcStore(*srcEng);
 
             data::WriteBatch b;
-            b.series = {seriesOnCore0(&key, &sid, &vs)};
+            b.series.push_back(seriesOnCore0(&key, &sid, &vs));
+            b.series.push_back(deletedSeriesOnVShard(vs, &deletedKey));
             srcStore.applyWrites(std::move(b)).get();
 
             (*srcEng).invoke_on_all([](Engine& e) { return e.rolloverMemoryStore(); }).get();
@@ -84,6 +102,8 @@ TEST(EngineSnapshotApply, ApplySnapshotInstallsDataOnFreshReplica) {
                     break;
                 seastar::sleep(std::chrono::milliseconds(100)).get();
             }
+            ASSERT_TRUE(srcStore.applyDelete(deletedKey, 0, UINT64_MAX).get())
+                << "the source tombstone must be durable before snapshot materialisation";
             payload = srcStore.buildVShardSnapshot(vs).get();
         }
         ASSERT_FALSE(payload.files.empty()) << "flushed data must be shipped";
@@ -114,15 +134,34 @@ TEST(EngineSnapshotApply, ApplySnapshotInstallsDataOnFreshReplica) {
             // The catalog/index is part of the snapshot: normal discovery by
             // measurement+tags+field must work on an empty data directory,
             // without carrying a precomputed SeriesId from the donor.
-            auto discovered = (*dstEng)
-                                  .invoke_on(0u, [key](Engine& e) {
-                                      auto parsed = TimeStarInsert<double>::fromSeriesKey(key);
-                                      return e.queryBySeries(std::move(parsed.measurement), std::move(parsed.tags),
-                                                             std::move(parsed.field), 0, UINT64_MAX);
-                                  })
-                                  .get();
+            auto discovered =
+                (*dstEng)
+                    .invoke_on(0u,
+                               [key](Engine& e) {
+                                   auto parsed = TimeStarInsert<double>::fromSeriesKey(key);
+                                   return e.queryBySeries(std::move(parsed.measurement), std::move(parsed.tags),
+                                                          std::move(parsed.field), 0, UINT64_MAX);
+                               })
+                    .get();
             auto& discoveredFloat = std::get<QueryResult<double>>(discovered);
             EXPECT_EQ(discoveredFloat.timestamps, (std::vector<uint64_t>{BASE, BASE + 1000}));
+
+            // The payload carries the resolved logical view, not the donor's
+            // raw TSM plus an out-of-band tombstone sidecar. A completely
+            // deleted series must therefore be absent from both installed data
+            // and the rebuilt discovery catalog on a truly empty receiver.
+            auto deleted =
+                (*dstEng)
+                    .invoke_on(0u,
+                               [deletedKey](Engine& e) {
+                                   auto parsed = TimeStarInsert<double>::fromSeriesKey(deletedKey);
+                                   return e.queryBySeries(std::move(parsed.measurement), std::move(parsed.tags),
+                                                          std::move(parsed.field), 0, UINT64_MAX);
+                               })
+                    .get();
+            const auto& deletedFloat = std::get<QueryResult<double>>(deleted);
+            EXPECT_TRUE(deletedFloat.timestamps.empty());
+            EXPECT_TRUE(deletedFloat.values.empty());
 
             // The separately transported Raft snapshot metadata must describe
             // this exact payload boundary, even when both envelopes are valid.

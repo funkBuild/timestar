@@ -11,7 +11,7 @@ not probes, so they can be run from CI or a release checklist.
 | `skewed_rebalance_gate.sh` | the same, under a SKEWED load — 40 series, so the whole campaign lands on ~1% of the 4096 groups and those groups are continuously mid-append while the balancer storms (debt D-18). The concentration is MEASURED per VShard, from the per-VShard journal sizes, so the gate cannot silently decay into a copy of the rolling one |
 | `backpressure_gate.sh` | the per-shard in-flight write bound degrades to 503 + `Retry-After`, never to 500s or timeouts, and the DEFAULT budget never gets in the way |
 | `fault_injection_gate.sh` | a BURST of TCP connection resets between two live nodes costs latency, not client errors, and loses/duplicates nothing (write-scaleout 4c) |
-| `restart_catchup_gate.sh` | a follower that was DOWN through a large write campaign catches up when it returns, under the tightened Raft admission bound (write-scaleout 5.4) |
+| `restart_catchup_gate.sh` | a follower whose entire data directory is removed while DOWN catches up through chunked snapshots plus the retained suffix, then preserves live and exactly deleted probes (write-scaleout 5.4 / CR-FIX-011) |
 | `combined_fault_rebalance_gate.sh` | **(debt D-19)** TCP resets **and** a leadership rebalance **and** 4x the connections, all at once — the faults a single-fault gate cannot compose. It is `fault_injection_gate.sh` in combined mode, not a copy. Its finding: under the reset storm `transfers_initiated` collapses to ~0 because D-1's liveness filter refuses the peer behind the fault |
 | `fault_injection_ab.sh` | **(expensive, on-demand — not a CI gate)** that `fault_injection_gate.sh` DISCRIMINATES: builds the 4a-reverted binary and asserts it fails the same storm HEAD passes |
 | `node_kill_round.sh` | `kill -9` of one node MID-BENCH: no 500s, no crashes, every ACKED write readable afterwards on both survivors — and it prints the one-node-down 503 band (debt D-14), which stays advisory |
@@ -20,6 +20,11 @@ not probes, so they can be run from CI or a release checklist.
 
 All of them take an optional server binary as `$1` (default
 `build/bin/timestar_http_server`), so a "before" binary can be measured the same way.
+Every node also receives an explicit `--memory` budget: 8 GiB by default,
+overrideable with `GATE_SERVER_MEMORY`. This is a per-process limit, so size the
+aggregate as `node count * GATE_SERVER_MEMORY`; leaving it implicit lets every
+Seastar process size itself from the whole host and can overcommit a multi-node
+gate before the property under test is reached.
 
 ## Run them ONE AT A TIME, with the previous run's data dirs deleted
 
