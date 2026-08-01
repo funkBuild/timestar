@@ -7,7 +7,8 @@
 **Remediation commits:** `95c10d2`, `a16b03a`, `d578e81`, `ddab705`,
 `8620b9e`, `20639dc`, `ea2511b`, `3ac9899`, `69ac879`, `09a62c5`,
 `2e06cb8`, `7151f5d`, `5b22b81`, `fef4886`, `3d2d607`, `f0e28f0`,
-`da55952`, `a1beb94`, `bb5b871`, `e201343`, `6ad2c93`, `9a42d84`
+`da55952`, `a1beb94`, `bb5b871`, `e201343`, `6ad2c93`, `9a42d84`,
+`41fdc34`
 
 **Scope:** The recent VShard/Raft cluster redesign, its production-server
 integration, the public HTTP surface, recovery paths, and the release evidence
@@ -20,7 +21,7 @@ used as evidence that the current server is production-ready.
 
 ## Implementation progress after the review
 
-Twenty-two remediation commits are now recorded. Cluster release status remains
+Twenty-three remediation commits are now recorded. Cluster release status remains
 **BLOCKED** because group 0/movement, generation-atomic live snapshot
 replacement, pattern-delete expansion, replicated retention, the large-snapshot
 path, and rolling wire-format compatibility remain open. The four previously
@@ -156,6 +157,12 @@ Completed and covered in this pass:
   failure aborts recovery and therefore startup. The source remains intact;
   legacy no-CRC frames are accepted only when they cannot be mistaken for a
   corrupt current-format frame.
+- WAL discovery now requires the exact canonical sequence basename and refuses
+  startup on every unrecognized `.wal` artifact instead of skipping it or
+  accepting a numeric prefix. WAL/store/manager sequences are 64-bit end to end,
+  with final exhaustion guarded. Fresh creation uses exclusive create and will
+  never truncate a pre-existing nonempty segment; only a zero-length artifact
+  from a failed creation barrier can be retried in place.
 
 Focused evidence on this pass includes the rebuilt server, unit and socket test
 targets, journal negative tests, alternate-replica routing tests, a black-holed
@@ -164,7 +171,7 @@ identity/topology tests, and pre-proposal admission tests. The strict checkboxes
 below stay open where their stated multi-process or fault-injection “done when”
 evidence has not yet been run.
 
-Final local validation for these remediation commits is green: 4,366/4,366 unit
+Final local validation for these remediation commits is green: 4,370/4,370 unit
 tests passed with no skips, 45/45 socket-backed cluster tests passed, the
 first-pass 56/56 focused
 cluster/readiness/identity/admission regressions passed, and the second-pass
@@ -240,6 +247,7 @@ item are recorded in the fix-up list.
 | CR-29 | P0 | A background WAL conversion was abandoned and evicted after two failures | Acknowledged data disappeared from live queries until restart, conversion-pending snapshot fences became falsely clear, and admission resumed while that durable data existed only in an offline WAL. |
 | CR-30 | P0 | Startup continued after a recovered WAL failed TSM conversion | The node destroyed the recovered in-memory data, created a fresh active WAL, and reported startup success while acknowledged points remained query-invisible in an offline source file. |
 | CR-31 | P0 | WAL recovery discarded fully framed corruption and continued startup | A CRC-invalid or malformed acknowledged command could be omitted from the recovered store while the node served the remaining dataset as complete. |
+| CR-32 | P0 | WAL filename identity was permissive and fresh creation truncated collisions | Malformed names could be skipped or aliased to another sequence, 32-bit allocation could wrap recovery order, and a colliding fresh create could erase the only durable acknowledged segment. |
 
 ### CR-01 — deletes bypass consensus
 
@@ -471,6 +479,30 @@ fails closed instead of allowing a damaged current CRC prefix to masquerade as
 a legacy command. Regressions cover single- and second-frame CRC failures,
 manager startup/source preservation, unambiguous legacy replay, and a truncated
 final frame.
+
+### CR-32 — WAL discovery and creation did not preserve segment identity
+
+[`WALFileManager::init`](../lib/storage/wal_file_manager.cpp) removed from its
+recovery list any `.wal` whose basename `std::stoi` could not parse, allowing
+startup to serve without a possibly acknowledged segment. `std::stoi` also accepted a numeric prefix, so a
+name such as `0000009014junk.wal` silently assumed sequence 9014. The manager,
+store, and WAL then narrowed the path layer's 64-bit sequence to 32 bits, making
+eventual wrap reorder simultaneously retained segments. Finally, fresh
+[`WAL::init`](../lib/storage/wal.cpp) opened with `truncate` even when the target
+already existed and was nonempty, turning any allocator collision into durable
+data loss.
+
+Commit `41fdc34` parses and stores WAL sequences as `uint64_t`, consumes the
+entire canonical basename, sorts the parsed identity once, and fences startup
+without modifying any unrecognized `.wal` artifact. Values above `UINT32_MAX`
+recover and allocate their successor normally; `UINT64_MAX` is an explicit
+exhaustion error rather than wrap. Fresh creation uses exclusive create when the
+path is absent and refuses a pre-existing nonempty file after closing its
+descriptor. A zero-length file left by a prior failed creation-directory sync
+remains the sole retryable collision because it could not have accepted an
+acknowledged command. Regressions preserve real WAL contents across malformed
+renames and fresh-create collision, reject numeric-prefix aliases, and recover
+through sequence 4,294,967,296.
 
 ### CR-02 and CR-03 — snapshot contents and live installation were unsafe
 
@@ -803,6 +835,11 @@ is not completion.
   frame remains a recoverable torn tail; ambiguous legacy/current framing fails
   closed. Manager-level coverage proves the corrupt source is preserved and no
   partial store becomes live.
+- [x] **CR-FIX-019H — enforce WAL segment identity without destructive
+  collision handling.** Owner: storage. Recovery accepts only canonical,
+  fully consumed 64-bit sequence names and fails on every other `.wal` artifact.
+  Allocation cannot wrap, fresh create cannot truncate a nonempty path, and an
+  empty failed-create artifact remains safely retryable.
 
 ### 2. Complete control-plane and identity wiring
 
@@ -1182,6 +1219,17 @@ Fail-closed WAL corruption validation for `9a42d84`:
 focused corruption/legacy/torn-tail tests:   5/5 passed
 related WAL/recovery/storage tests:        100/100 passed
 current full unit suite:                  4366/4366 passed (444 suites, -c 2)
+current socket-backed cluster suite:        45/45 passed (8 suites, -c 2)
+timestar_http_server:                       built successfully
+git diff --check:                           passed
+```
+
+WAL identity/allocation validation for `41fdc34`:
+
+```text
+focused name/collision/wide-sequence tests:  5/5 passed
+related WAL/recovery/storage tests:        104/104 passed
+current full unit suite:                  4370/4370 passed (444 suites, -c 2)
 current socket-backed cluster suite:        45/45 passed (8 suites, -c 2)
 timestar_http_server:                       built successfully
 git diff --check:                           passed
