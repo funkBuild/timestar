@@ -10,7 +10,7 @@
 `da55952`, `a1beb94`, `bb5b871`, `e201343`, `6ad2c93`, `9a42d84`,
 `41fdc34`, `a58d2a9`, `6a73809`, `81692a4`, `d363348`, `2749027`,
 `1f61f49`, `b2c7d0b`, `872f7e1`, `023d9c3`, `d5f4755`, `7f6d7e8`,
-`7760ebd`, `6557666`, `c8f28c8`
+`7760ebd`, `6557666`, `c8f28c8`, `445f1f0`, `8b8536d`
 
 **Scope:** The recent VShard/Raft cluster redesign, its production-server
 integration, the public HTTP surface, recovery paths, and the release evidence
@@ -23,7 +23,7 @@ used as evidence that the current server is production-ready.
 
 ## Implementation progress after the review
 
-Thirty-seven remediation commits are now recorded. Cluster release status
+Thirty-nine remediation commits are now recorded. Cluster release status
 remains **BLOCKED** because group 0/movement, atomic and retry-safe
 pattern-delete semantics, replicated retention, the large-snapshot path, and
 rolling wire-format compatibility remain open. The four previously stale live
@@ -82,21 +82,21 @@ Completed and covered in this pass:
 - Source-inspection tests use build-provided absolute paths, so their result no
   longer depends on whether the binary is launched by CTest, from `build/test`,
   or from the repository root.
-- RF&gt;1 exact-series deletes now route from the public HTTP handler to the
-  VShard's current Raft leader and acknowledge only after quorum commit and
-  apply. Pattern selectors are expanded before the first mutation against every
-  VShard's quorum-fenced, applied NativeIndex catalog. The coordinator pins one
-  placement epoch, revalidates every canonical returned key against the selector
-  and requested VShard, refuses pre-v4 peers, and bounds discovery at 10,000
-  series plus 8 MiB of encoded keys. The entire mixed batch is preflighted,
-  sorted, and deduplicated before a maximum of 32 concurrent exact proposals.
-  RF=1, missing production wiring, placement churn, incomplete leadership, and
-  over-broad selectors fail closed before mutation. Any multi-target proposal
-  failure is reported as 504 `DELETE_OUTCOME_UNKNOWN` with no `Retry-After`,
-  because some commands may already have committed. This is deliberately
-  recorded as bounded two-phase semantics, not atomic pattern deletion: writes
-  concurrent with catalog expansion, durable client retries, and restart/failover
-  behavior still need the CR-FIX-010 design and live evidence.
+- RF&gt;1 exact-series deletes now require a stable 128-bit `Idempotency-Key`,
+  derive a distinct operation identity for each canonical key/range, route to
+  the VShard's current Raft leader, and acknowledge only after quorum commit and
+  apply. The state machine retains operation ID, target hash, and original apply
+  index; a byte-identical retry is a no-op, while ID reuse for another target
+  fail-stops. Payload v3 carries only receipts covered by its exact Raft snapshot
+  boundary, and local recovery reads that small section without copying snapshot
+  objects. Ambiguous leader/transport retries and partial exact batches can
+  therefore return retryable failure instead of risking a second physical
+  delete. Pattern discovery infrastructure remains internally tested, but the
+  public clustered handler now rejects every pattern or mixed-pattern batch
+  before expansion and proposal: re-expanding after a partial attempt could add
+  a concurrently created series that had no original operation receipt. RF=1
+  remains unsupported. Receipt retention is not yet bounded and the named
+  multi-node failure/restart evidence remains open under CR-FIX-010.
 - Replicated startup now raises a low soft `RLIMIT_NOFILE` to 8,192 when the
   process hard limit permits it and otherwise fails before opening Engine or
   Raft state with a `LimitNOFILE`/`ulimit` diagnostic. `ClusterDataPlane::start`
@@ -359,15 +359,16 @@ selector in the request before the first proposal, deduplicates exact
 key/range triples, caps the batch at 10,000 series and 8 MiB of encoded catalog
 keys, and limits proposal fan-out to 32.
 
-This removes the previous misleading local/best-effort behavior and the blanket
-RF&gt;1 rejection, but it does not make a broad selector one atomic replicated
-operation. A write concurrent with the catalog scan can race the subsequent
-exact commands, and a partial multi-target failure necessarily has an unknown
-batch outcome. The API now exposes that ambiguity as a non-retryable 504 instead
-of inviting an unsafe replay. RF=1 still fails closed. CR-FIX-010 remains open
-for a revision/durable-operation design that defines concurrent writes and
-client retries, plus the named multi-node leader-failure and replica-restart
-evidence.
+The next review pass found that this still did not make a broad selector a
+retry-safe replicated operation. After a partial attempt, a retry repeated the
+catalog scan; a series created in between then appeared as a new exact target
+with no receipt from the original attempt and could be deleted. Commit `8b8536d`
+therefore removes the production pattern hook and rejects every clustered
+pattern or mixed-pattern batch before both expansion and proposal. The bounded,
+leader-fenced discovery implementation remains covered as a building block, but
+is not a supported mutation path. A durable replicated expansion plan or an
+equivalently bounded per-VShard selector command is required to re-enable it.
+RF=1 continues to fail closed.
 
 ### CR-20 — ambiguous delete retries could erase concurrent writes
 
@@ -380,12 +381,20 @@ policy and could
 therefore append the same delete again after another client had written into the
 range.
 
-Commit `3ac9899` stops after the first ambiguous delete result while preserving
-unambiguous not-leader, leader-refused, stopping, and pre-proposal overload
-retries. The HTTP contract reports an explicit unknown outcome without automatic
-retry advice. This closes the in-request duplicate-delete hazard; durable
-operation IDs or revision-bounded tombstones are still required before an
-ambiguous client-initiated retry can be declared safe under CR-FIX-010.
+Commit `3ac9899` stopped after the first ambiguous legacy-delete result while
+preserving unambiguous not-leader, leader-refused, stopping, and pre-proposal
+overload retries. Commit `445f1f0` adds the durable identity it was waiting for:
+partitioned HTTP deletes require a non-zero 128-bit `Idempotency-Key`, each exact
+target derives a stable operation ID, and the replicated state machine records
+the command hash and first applied index only after storage deletion completes.
+The receipt is reconstructed by log replay or carried in snapshot payload v3;
+receipt recovery from a locally produced snapshot skips the large object bodies.
+A duplicate after an intervening write is now a state-machine no-op, including
+after journal compaction and host restart, so the router may safely retry an
+ambiguous exact command. Reusing an operation ID for different target bytes is a
+fail-stop invariant breach rather than a false success. CR-FIX-010 remains open
+for bounded receipt retention and the named multi-node failure/restart evidence;
+patterns remain fail-closed as described above.
 
 ### CR-23 — TSM publication did not fence deletion of its durable source
 
@@ -794,9 +803,11 @@ CR-FIX-060 rather than required by the current producer's install contract.
 ### CR-18 — snapshot upgrade compatibility is unspecified
 
 Payload v2 is intentionally fail-closed: upgraded production code rejects
-legacy catalog-less v1 snapshots, while an older binary cannot decode v2. No
-group-0 capability bit, negotiated minimum version, upgrade order, or offline
-upgrade requirement currently prevents mixed versions from attempting an
+legacy catalog-less v1 snapshots, while an older binary cannot decode v2.
+Snapshot-persistent exact-delete receipts add payload v3 once a VShard has such
+a receipt; v2 remains byte-identical for snapshots with none. No group-0
+capability bit, negotiated minimum version, upgrade order, or offline upgrade
+requirement currently prevents mixed versions from attempting either
 incompatible InstallSnapshot. This is an availability failure rather than
 silent state corruption, but it blocks a supported rolling production upgrade.
 
@@ -952,9 +963,10 @@ is not completion.
   implementation.** Owner: HTTP/data path. **Done when:** the API returns an
   explicit unsupported/conflict response before changing local state, and a
   test proves no authenticated or forwarded-header variant bypasses the guard.
-  The guard remains active for RF=1, absent pattern-discovery wiring, old peers,
-  and any incomplete or over-limit RF&gt;1 expansion. Exact targets and bounded
-  RF&gt;1 pattern expansion use the partial CR-FIX-010 implementation.
+  The guard remains active for RF=1, old peers, and every RF&gt;1 pattern or
+  mixed-pattern request. Exact targets alone use the partial CR-FIX-010
+  implementation; the discovery building block is not production-wired because
+  retrying its expansion can change the target set.
 - [x] **CR-FIX-002 — reject retention create/update/delete in partitioned mode
   until CR-FIX-040 is complete.** Owner: HTTP/control plane. **Done when:** no
   node-local policy mutation is possible through the public API in cluster mode.
@@ -979,16 +991,21 @@ is not completion.
   v3 socket path rejects old peers and VShard-prefix spoofing; state apply
   fail-stops on a cross-VShard command. HTTP tests cover exact and structured
   targets, mixed-batch preflight, retryable `503`, and a 32-proposal concurrency
-  cap; a real single-voter Raft test proves write/delete/query ordering. Bounded
-  RF&gt;1 pattern expansion now uses a checksummed v4 request, placement-epoch and
-  current-leader routing, quorum ReadIndex plus applied-state fences, exact
-  VShard catalog scans, canonical-key validation, and whole-batch preflight.
-  Count and byte limits fail before any proposal; an old peer cannot be mistaken
-  for an empty catalog; redirected replica catalogs are excluded. Once a
-  multi-target fan-out begins, any failure becomes an explicit unknown outcome
-  and is not advertised as retryable. Atomic ordering with concurrent series
-  creation, durable/idempotent client retry, and the named multi-node
-  leader-failure and replica-restart gates remain open.
+  cap; a real single-voter Raft test proves write/delete/query ordering. Exact
+  commands now require a stable HTTP `Idempotency-Key`; derived per-target IDs,
+  target hashes, and original apply indexes are replicated receipts. A retry
+  after an intervening write is a no-op, ambiguous router outcomes can safely be
+  retried, and partial exact batches return retryable failure. Receipt prefixes
+  are encoded in snapshot payload v3 only when covered by the compacted Raft
+  boundary. Tests prove command/receipt codec rejection, conflicting-ID
+  fail-stop, snapshot-boundary filtering, lightweight local snapshot recovery,
+  and a real compacted-journal restart followed by a harmless old-delete retry.
+  The previously implemented v4 pattern discovery remains internally covered,
+  but production now fails every pattern or mixed-pattern request before
+  expansion/proposal because a retry could discover a concurrently created new
+  target. CR-FIX-010 remains open for a replicated/frozen pattern plan, bounded
+  exact-receipt retention, and the named multi-node leader-failure and replica
+  restart gates. `445f1f0`, `8b8536d`.
 - [ ] **CR-FIX-011 — define a self-contained VShard snapshot format.** Owner:
   snapshot/storage. Include catalog/index extract, data objects, tombstone
   objects or a proven materialised-delete boundary, and real content hashes.
@@ -1661,3 +1678,20 @@ These tests are deterministic process-reopen fault simulations, not a
 multi-process release gate. They close the storage replacement contract in
 CR-FIX-012; the bounded empty-node public-path gate remains part of CR-FIX-011
 and CR-FIX-078.
+
+Snapshot-durable exact-delete retry validation for `445f1f0` and `8b8536d`:
+
+```text
+command/snapshot/state-machine/router/HTTP focused pass: 32/32 passed
+real compacted-journal receipt recovery and retry:          1/1 passed
+partitioned exact/pattern fail-closed HTTP pass:           10/10 passed
+timestar_unit_test:                         built successfully (-j2)
+timestar_http_server:                       built successfully (-j2)
+all test processes:                                --smp 1 --memory 1G
+git diff --check:                                           passed
+```
+
+This closes the known exact-delete retry corruption path but not CR-FIX-010 as
+a whole. Receipt retention still needs a deterministic bound, pattern deletes
+need a replicated immutable expansion plan before re-enablement, and the named
+multi-node leader-failure/replica-restart gate has not yet run.
