@@ -199,7 +199,8 @@ public:
     // PRECONDITION: replicated mode (replication_factor > 1). RF=1 still routes through
     // write() on shard 0.
     seastar::future<> writeFromShard(data::WriteBatch batch);
-    seastar::future<> deleteRangesFromShard(std::vector<data::DeleteRangeTarget> targets, SeriesId128 operationId);
+    seastar::future<> deleteRangesFromShard(std::vector<data::DeleteRangeTarget> targets, SeriesId128 operationId,
+                                            uint64_t issuedAtMs);
     // Expand a pattern against a placement-epoch-pinned, quorum-fenced catalog
     // view. No mutation is proposed by this method.
     seastar::future<std::vector<std::string>> findPatternSeries(data::PatternSeriesSelector selector,
@@ -252,7 +253,8 @@ public:
         // `snapshotsInstalled` are what distinguish a catch-up that went through the
         // SNAPSHOT path from one that went through ordinary appends, which nothing else can
         // tell apart. `snapshotsRefusedTooLarge` + `snapshotsUndeliverable` are the two
-        // ways a VShard ends up with a permanently growing log.
+        // ways a VShard ends up with a permanently growing log; the skip counters explain
+        // conservative waits for storage/delete state to catch up.
         uint64_t snapshotsTaken = 0;
         uint64_t snapshotsRefusedTooLarge = 0;
         // Sweeps that picked a group and found it had no FLUSHED data to snapshot. Steady
@@ -260,6 +262,9 @@ public:
         // than broken -- the FIRST thing to check when logs are not being compacted.
         uint64_t snapshotsSkippedUnflushed = 0;
         uint64_t snapshotsSkippedPendingConversion = 0;
+        // The candidate data boundary predates receipt retirement, so compacting it
+        // would make a retained-suffix retry execute twice after recovery.
+        uint64_t snapshotsSkippedDeleteState = 0;
         uint64_t snapshotSweeps = 0;
         uint64_t snapshotMaxEntriesSince = 0;
         uint64_t snapshotChunksSent = 0;

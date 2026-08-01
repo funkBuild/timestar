@@ -393,6 +393,7 @@ public:
         uint64_t refusedTooLarge = 0;   // over kMaxVShardSnapshotBytes: log kept
         uint64_t skippedUnflushed = 0;  // eligible, but the VShard has no FLUSHED data yet
         uint64_t skippedPendingConversion = 0;
+        uint64_t skippedDeleteState = 0;
         uint64_t sweeps = 0;  // sweep passes run (0 == the trigger is not running)
         uint64_t maxEntriesSinceSeen = 0;
         uint64_t chunksSent = 0;     // InstallSnapshot chunks put on the wire (leader)
@@ -452,6 +453,7 @@ public:
         c.refusedTooLarge = host.snapshotsRefusedTooLarge();
         c.skippedUnflushed = host.snapshotsSkippedUnflushed();
         c.skippedPendingConversion = host.snapshotsSkippedPendingConversion();
+        c.skippedDeleteState = host.snapshotsSkippedDeleteState();
         c.sweeps = host.snapshotSweeps();
         c.maxEntriesSinceSeen = host.snapshotMaxEntriesSinceSeen();
         c.triggerEnabled = host.snapshotTriggerEnabled();

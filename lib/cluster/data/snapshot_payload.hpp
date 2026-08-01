@@ -26,8 +26,19 @@ struct DeleteOperationReceipt {
     SeriesId128 operationId{};
     uint64_t appliedIndex = 0;
     uint64_t commandHash = 0;
+    // Zero is the legacy, non-expiring receipt form. Modern receipts use the
+    // client-stable issuance time carried by their replicated command.
+    uint64_t issuedAtMs = 0;
 
     auto operator<=>(const DeleteOperationReceipt&) const = default;
+};
+
+struct DeleteReceiptSnapshotState {
+    // Modern retries at or before this floor are known-retired no-ops. The
+    // index identifies the log entry whose deterministic apply advanced it.
+    uint64_t retiredBeforeMs = 0;
+    uint64_t retiredAtIndex = 0;
+    std::vector<DeleteOperationReceipt> receipts;
 };
 
 // The monolithic Raft InstallSnapshot payload for a VShard (integration plan M3): the
@@ -45,8 +56,11 @@ struct SnapshotPayload {
     // Empty means a decoded legacy v1 payload; production install rejects it
     // because it cannot restore discovery metadata.
     std::string catalog;
-    // Present only in payload v3. Canonically sorted by operationId and limited
-    // to receipts at or below the Raft snapshot boundary.
+    // Present in payload v3 (legacy receipts) or v4 (bounded modern receipts).
+    // Canonically sorted by operationId and limited to state at or below the
+    // Raft snapshot boundary.
+    uint64_t deleteReceiptsRetiredBeforeMs = 0;
+    uint64_t deleteReceiptsRetiredAtIndex = 0;
     std::vector<DeleteOperationReceipt> deleteReceipts;
     std::vector<SnapshotFile> files;  // one per manifest.dataExtents entry, same order
 };
@@ -57,11 +71,13 @@ struct SnapshotPayload {
 std::string encodeSnapshotPayload(const SnapshotPayload& payload);
 std::optional<SnapshotPayload> decodeSnapshotPayload(const std::string& bytes);
 
-// Recovery of a locally-produced snapshot must restore state-machine receipts
-// without decoding/copying its potentially 128 MiB data objects. This verifies
-// the outer checksum and complete framing, but returns only the small receipt
-// section (empty for legacy/v2 payloads).
+// Recovery of a locally-produced snapshot must restore state-machine receipt
+// state without decoding/copying its potentially 128 MiB data objects. Both
+// helpers verify the outer checksum and complete framing. The vector-only form
+// is retained for legacy callers; bounded recovery must use the state form so it
+// does not discard the retired-before floor.
 std::optional<std::vector<DeleteOperationReceipt>> decodeSnapshotDeleteReceipts(const std::string& bytes);
+std::optional<DeleteReceiptSnapshotState> decodeSnapshotDeleteReceiptState(const std::string& bytes);
 
 // CONSUMING overload (debt D-32). Byte-for-byte identical output; the difference is
 // what is resident while it runs.

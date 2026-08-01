@@ -73,6 +73,7 @@ constexpr uint8_t kDelete = 1;
 constexpr uint8_t kRetention = 2;
 constexpr uint8_t kIdempotentDelete = 3;
 constexpr uint8_t kIdempotentDeleteBatch = 4;
+constexpr uint8_t kBoundedIdempotentDeleteBatch = 5;
 constexpr size_t kMinimumDeleteRangeTargetBytes = 4 + 8 + 8;
 
 bool validDeleteRangeTargets(const std::vector<DeleteRangeTarget>& targets) {
@@ -139,8 +140,11 @@ std::string encodeReplicatedCommand(const ReplicatedCommand& cmd) {
     } else if (const auto* batch = std::get_if<DeleteRangeBatch>(&cmd)) {
         if (batch->operationId == SeriesId128{} || !validDeleteRangeTargets(batch->targets))
             throw std::invalid_argument("encodeReplicatedCommand: invalid idempotent delete batch");
-        out.push_back(static_cast<char>(kIdempotentDeleteBatch));
+        out.push_back(
+            static_cast<char>(batch->issuedAtMs == 0 ? kIdempotentDeleteBatch : kBoundedIdempotentDeleteBatch));
         batch->operationId.appendTo(out);
+        if (batch->issuedAtMs != 0)
+            putU64(out, batch->issuedAtMs);
         putU32(out, static_cast<uint32_t>(batch->targets.size()));
         for (const auto& target : batch->targets) {
             putStr(out, target.seriesKey);
@@ -195,12 +199,17 @@ std::optional<ReplicatedCommand> decodeReplicatedCommand(const std::string& byte
         if (!r.ok)
             return std::nullopt;
         cmd = std::move(d);
-    } else if (tag == kIdempotentDeleteBatch) {
+    } else if (tag == kIdempotentDeleteBatch || tag == kBoundedIdempotentDeleteBatch) {
         DeleteRangeBatch d;
         if (!r.avail(16))
             return std::nullopt;
         d.operationId = SeriesId128::fromBytes(r.p, 16);
         r.p += 16;
+        if (tag == kBoundedIdempotentDeleteBatch) {
+            d.issuedAtMs = r.u64();
+            if (!r.ok || d.issuedAtMs == 0)
+                return std::nullopt;
+        }
         const uint32_t count = r.u32();
         if (!r.ok || d.operationId == SeriesId128{} || count == 0 || count > kMaxDeleteRangeBatchTargets ||
             count > static_cast<size_t>(r.end - r.p) / kMinimumDeleteRangeTargetBytes)
@@ -243,10 +252,12 @@ uint64_t deleteRangeCommandHash(const DeleteRangeKey& command) {
 
 uint64_t deleteRangeCommandHash(const DeleteRangeBatch& command) {
     std::string canonical;
-    size_t bytes = 4;
+    size_t bytes = 4 + (command.issuedAtMs == 0 ? 0 : 8);
     for (const auto& target : command.targets)
         bytes += 4 + target.seriesKey.size() + 16;
     canonical.reserve(bytes);
+    if (command.issuedAtMs != 0)
+        putU64(canonical, command.issuedAtMs);
     putU32(canonical, static_cast<uint32_t>(command.targets.size()));
     for (const auto& target : command.targets) {
         putStr(canonical, target.seriesKey);

@@ -222,6 +222,24 @@ TEST(ReplicatedCommandRouterTest, VShardDeleteBatchRetriesTheExactBytesAfterAmbi
     EXPECT_EQ(remote.encoded[1], expected);
 }
 
+TEST(ReplicatedCommandRouterTest, RetiredDeleteIdentityIsTerminalWithoutReproposal) {
+    const std::string key = buildSeriesKey("delete", {{"host", "expired"}}, "value");
+    const uint16_t vshard = timestar::virtualShard(SeriesId128::fromSeriesKey(key));
+    VShardDirectory dir(1, mapWith(vshard));
+    CommandSink local;
+    local.commit = false;
+    local.rejectKind = WriteFailure::Expired;
+    CommandTransport remote;
+    MapLeaders leaders;
+    ReplicatedCommandRouter router(dir, local, remote, leaders);
+    auto batch = deleteBatchFor(key);
+    batch.issuedAtMs = 1'800'000'000'000;
+
+    EXPECT_THROW(router.propose(vshard, ReplicatedCommand{batch}).get(), DeleteReceiptExpiredError);
+    EXPECT_EQ(local.calls, 1u);
+    EXPECT_EQ(remote.calls, 0u);
+}
+
 TEST(ReplicatedCommandRouterTest, DoesNotReproposeDeleteAfterLeadershipLoss) {
     const std::string key = buildSeriesKey("delete", {{"host", "ambiguous-local"}}, "value");
     const uint16_t vshard = timestar::virtualShard(SeriesId128::fromSeriesKey(key));

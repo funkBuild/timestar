@@ -1215,6 +1215,7 @@ seastar::future<ClusterDataPlane::Status> ClusterDataPlane::status() const {
         st.snapshotsRefusedTooLarge += sc.refusedTooLarge;
         st.snapshotsSkippedUnflushed += sc.skippedUnflushed;
         st.snapshotsSkippedPendingConversion += sc.skippedPendingConversion;
+        st.snapshotsSkippedDeleteState += sc.skippedDeleteState;
         st.snapshotSweeps += sc.sweeps;
         st.snapshotMaxEntriesSince = std::max(st.snapshotMaxEntriesSince, sc.maxEntriesSinceSeen);
         st.snapshotChunksSent += sc.chunksSent;
@@ -1293,11 +1294,13 @@ seastar::future<> ClusterDataPlane::writeFromShard(data::WriteBatch batch) {
 }
 
 seastar::future<> ClusterDataPlane::deleteRangesFromShard(std::vector<data::DeleteRangeTarget> targets,
-                                                          SeriesId128 operationId) {
+                                                          SeriesId128 operationId, uint64_t issuedAtMs) {
     if (!replicated_ || !shardsStarted_)
         throw std::runtime_error("ClusterDataPlane::deleteRangesFromShard requires replicated mode after start()");
     if (operationId == SeriesId128{})
         throw std::invalid_argument("ClusterDataPlane::deleteRangesFromShard requires a non-zero operation ID");
+    if (issuedAtMs == 0)
+        throw std::invalid_argument("ClusterDataPlane::deleteRangesFromShard requires an issuance timestamp");
     if (targets.empty() || targets.size() > data::kMaxDeleteRangeBatchTargets)
         throw std::invalid_argument("ClusterDataPlane::deleteRangesFromShard requires a bounded non-empty batch");
     const uint16_t vshard = timestar::virtualShard(SeriesId128::fromSeriesKey(targets.front().seriesKey));
@@ -1309,7 +1312,7 @@ seastar::future<> ClusterDataPlane::deleteRangesFromShard(std::vector<data::Dele
                 "ClusterDataPlane::deleteRangesFromShard requires canonical targets from one VShard");
     }
     const unsigned owner = shardOwningVShard(vshard, dir_.get());
-    data::DeleteRangeBatch batch{std::move(targets), operationId};
+    data::DeleteRangeBatch batch{std::move(targets), operationId, issuedAtMs};
     return shards_.invoke_on(owner, [vshard, batch = std::move(batch)](ShardRaftPlane& plane) mutable {
         return plane.command(vshard, data::ReplicatedCommand{std::move(batch)});
     });

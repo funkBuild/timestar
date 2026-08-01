@@ -119,6 +119,10 @@ protected:
         req->content = body;
         req->_headers["Content-Type"] = "application/json";
         req->_headers["Idempotency-Key"] = "11111111111111111111111111111111";
+        static const uint64_t issuedAtMs = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch())
+                .count());
+        req->_headers["Idempotency-Key-Timestamp"] = std::to_string(issuedAtMs);
         return req;
     }
 
@@ -1271,7 +1275,7 @@ TEST_F(HttpHandlerIntegrationTest, PartitionedRf3RoutesExactDeleteThroughCluster
         eng.start();
         std::vector<std::string> keys;
         HttpDeleteHandler::clusterDeleteHook = [&keys](std::vector<timestar::data::DeleteRangeTarget> targets,
-                                                       SeriesId128 operationId) {
+                                                       SeriesId128 operationId, uint64_t issuedAtMs) {
             if (targets.size() != 1u) {
                 ADD_FAILURE() << "one exact target must produce one one-target VShard batch";
                 return seastar::make_ready_future<>();
@@ -1280,6 +1284,7 @@ TEST_F(HttpHandlerIntegrationTest, PartitionedRf3RoutesExactDeleteThroughCluster
             EXPECT_EQ(targets[0].startTime, 10u);
             EXPECT_EQ(targets[0].endTime, 20u);
             EXPECT_NE(operationId, SeriesId128{});
+            EXPECT_NE(issuedAtMs, 0u);
             return seastar::make_ready_future<>();
         };
 
@@ -1304,9 +1309,12 @@ TEST_F(HttpHandlerIntegrationTest, PartitionedRf3RequiresStableDeleteIdempotency
         ScopedShardedEngine eng;
         eng.start();
         std::vector<SeriesId128> operations;
-        HttpDeleteHandler::clusterDeleteHook = [&operations](std::vector<timestar::data::DeleteRangeTarget>,
-                                                             SeriesId128 operationId) {
+        std::vector<uint64_t> timestamps;
+        HttpDeleteHandler::clusterDeleteHook = [&operations, &timestamps](
+                                                   std::vector<timestar::data::DeleteRangeTarget>,
+                                                   SeriesId128 operationId, uint64_t issuedAtMs) {
             operations.push_back(operationId);
+            timestamps.push_back(issuedAtMs);
             return seastar::make_ready_future<>();
         };
 
@@ -1318,6 +1326,13 @@ TEST_F(HttpHandlerIntegrationTest, PartitionedRf3RequiresStableDeleteIdempotency
         EXPECT_NE(missingReply->_content.find("Idempotency-Key"), std::string::npos);
         EXPECT_TRUE(operations.empty());
 
+        auto missingTimestamp = makeDeleteRequest(R"({"series":"m value","startTime":0,"endTime":1})");
+        missingTimestamp->_headers.erase("Idempotency-Key-Timestamp");
+        auto missingTimestampReply = handler.handleDelete(std::move(missingTimestamp)).get();
+        EXPECT_EQ(missingTimestampReply->_status, seastar::http::reply::status_type::bad_request);
+        EXPECT_NE(missingTimestampReply->_content.find("Idempotency-Key-Timestamp"), std::string::npos);
+        EXPECT_TRUE(operations.empty());
+
         for (unsigned attempt = 0; attempt < 2; ++attempt) {
             auto reply =
                 handler.handleDelete(makeDeleteRequest(R"({"series":"m value","startTime":0,"endTime":1})")).get();
@@ -1327,8 +1342,45 @@ TEST_F(HttpHandlerIntegrationTest, PartitionedRf3RequiresStableDeleteIdempotency
             handler.handleDelete(makeDeleteRequest(R"({"series":"m value","startTime":0,"endTime":2})")).get();
         ASSERT_TRUE(isOk(*changed)) << changed->_content;
         ASSERT_EQ(operations.size(), 3u);
+        ASSERT_EQ(timestamps.size(), 3u);
         EXPECT_EQ(operations[0], operations[1]) << "a byte-identical retry changed operation identity";
+        EXPECT_EQ(timestamps[0], timestamps[1]) << "the helper did not preserve the client issuance time";
         EXPECT_NE(operations[0], operations[2]) << "a different target reused an operation identity";
+    })
+        .join()
+        .get();
+}
+
+TEST_F(HttpHandlerIntegrationTest, PartitionedRf3RejectsStaleOrFutureDeleteIdentityBeforeProposal) {
+    seastar::thread([] {
+        struct ResetHook {
+            ~ResetHook() { HttpDeleteHandler::clusterDeleteHook = {}; }
+        } reset;
+        ScopedShardedEngine eng;
+        eng.start();
+        unsigned proposals = 0;
+        HttpDeleteHandler::clusterDeleteHook = [&proposals](std::vector<timestar::data::DeleteRangeTarget>, SeriesId128,
+                                                            uint64_t) {
+            ++proposals;
+            return seastar::make_ready_future<>();
+        };
+        HttpDeleteHandler handler(&eng.eng, true);
+        const uint64_t nowMs = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch())
+                .count());
+
+        auto stale = makeDeleteRequest(R"({"series":"m value","startTime":0,"endTime":1})");
+        stale->_headers["Idempotency-Key-Timestamp"] =
+            std::to_string(nowMs - timestar::data::kDeleteReceiptRetentionMs);
+        auto staleReply = handler.handleDelete(std::move(stale)).get();
+        EXPECT_EQ(staleReply->_status, seastar::http::reply::status_type::bad_request);
+
+        auto future = makeDeleteRequest(R"({"series":"m value","startTime":0,"endTime":1})");
+        future->_headers["Idempotency-Key-Timestamp"] =
+            std::to_string(nowMs + timestar::data::kDeleteReceiptFutureSkewMs + 1);
+        auto futureReply = handler.handleDelete(std::move(future)).get();
+        EXPECT_EQ(futureReply->_status, seastar::http::reply::status_type::bad_request);
+        EXPECT_EQ(proposals, 0u);
     })
         .join()
         .get();
@@ -1352,18 +1404,18 @@ TEST_F(HttpHandlerIntegrationTest, PartitionedRf3UsesOneCanonicalReceiptPerVShar
         }
 
         std::vector<SeriesId128> operations;
-        HttpDeleteHandler::clusterDeleteHook =
-            [&operations, &first, &second](std::vector<timestar::data::DeleteRangeTarget> targets,
-                                          SeriesId128 operationId) {
-                if (targets.size() != 2u) {
-                    ADD_FAILURE() << "same-VShard exact targets were not grouped into one batch";
-                    return seastar::make_ready_future<>();
-                }
-                EXPECT_EQ(targets[0].seriesKey, first);
-                EXPECT_EQ(targets[1].seriesKey, second);
-                operations.push_back(operationId);
+        HttpDeleteHandler::clusterDeleteHook = [&operations, &first, &second](
+                                                   std::vector<timestar::data::DeleteRangeTarget> targets,
+                                                   SeriesId128 operationId, uint64_t) {
+            if (targets.size() != 2u) {
+                ADD_FAILURE() << "same-VShard exact targets were not grouped into one batch";
                 return seastar::make_ready_future<>();
-            };
+            }
+            EXPECT_EQ(targets[0].seriesKey, first);
+            EXPECT_EQ(targets[1].seriesKey, second);
+            operations.push_back(operationId);
+            return seastar::make_ready_future<>();
+        };
 
         HttpDeleteHandler handler(&eng.eng, true);
         const std::string firstBody = R"({"deletes":[{"series":")" + second +
@@ -1394,7 +1446,8 @@ TEST_F(HttpHandlerIntegrationTest, PartitionedRf3RejectsUnwiredPatternDiscoveryB
         ScopedShardedEngine eng;
         eng.start();
         unsigned calls = 0;
-        HttpDeleteHandler::clusterDeleteHook = [&calls](std::vector<timestar::data::DeleteRangeTarget>, SeriesId128) {
+        HttpDeleteHandler::clusterDeleteHook = [&calls](std::vector<timestar::data::DeleteRangeTarget>, SeriesId128,
+                                                        uint64_t) {
             ++calls;
             return seastar::make_ready_future<>();
         };
@@ -1436,8 +1489,8 @@ TEST_F(HttpHandlerIntegrationTest, PartitionedRf3RejectsPatternBeforeExpansionOr
             EXPECT_EQ(maxSeries, 10'000u);
             return seastar::make_ready_future<std::vector<std::string>>(std::vector<std::string>{patternA, patternB});
         };
-        HttpDeleteHandler::clusterDeleteHook = [&](std::vector<timestar::data::DeleteRangeTarget> targets,
-                                                   SeriesId128) {
+        HttpDeleteHandler::clusterDeleteHook = [&](std::vector<timestar::data::DeleteRangeTarget> targets, SeriesId128,
+                                                   uint64_t) {
             ++proposals;
             for (auto& target : targets) {
                 EXPECT_EQ(target.startTime, 10u);
@@ -1472,7 +1525,8 @@ TEST_F(HttpHandlerIntegrationTest, PartitionedRf3ExpansionFailureLeavesExactPref
         ScopedShardedEngine eng;
         eng.start();
         unsigned proposals = 0;
-        HttpDeleteHandler::clusterDeleteHook = [&](std::vector<timestar::data::DeleteRangeTarget>, SeriesId128) {
+        HttpDeleteHandler::clusterDeleteHook = [&](std::vector<timestar::data::DeleteRangeTarget>, SeriesId128,
+                                                   uint64_t) {
             ++proposals;
             return seastar::make_ready_future<>();
         };
@@ -1505,7 +1559,8 @@ TEST_F(HttpHandlerIntegrationTest, PartitionedRf3BroadPatternFailsBeforeMutation
         ScopedShardedEngine eng;
         eng.start();
         unsigned proposals = 0;
-        HttpDeleteHandler::clusterDeleteHook = [&](std::vector<timestar::data::DeleteRangeTarget>, SeriesId128) {
+        HttpDeleteHandler::clusterDeleteHook = [&](std::vector<timestar::data::DeleteRangeTarget>, SeriesId128,
+                                                   uint64_t) {
             ++proposals;
             return seastar::make_ready_future<>();
         };
@@ -1535,8 +1590,8 @@ TEST_F(HttpHandlerIntegrationTest, PartitionedRf3PartialMultiTargetFailureIsSafe
         ScopedShardedEngine eng;
         eng.start();
         unsigned committed = 0;
-        HttpDeleteHandler::clusterDeleteHook =
-            [&](std::vector<timestar::data::DeleteRangeTarget> targets, SeriesId128) {
+        HttpDeleteHandler::clusterDeleteHook = [&](std::vector<timestar::data::DeleteRangeTarget> targets, SeriesId128,
+                                                   uint64_t) {
             if (std::ranges::any_of(targets,
                                     [](const auto& target) { return target.seriesKey.starts_with("bad "); })) {
                 return seastar::sleep(std::chrono::milliseconds(2)).then([] {
@@ -1568,7 +1623,8 @@ TEST_F(HttpHandlerIntegrationTest, PartitionedRf3MapsRetryableDeleteFailureTo503
         } reset;
         ScopedShardedEngine eng;
         eng.start();
-        HttpDeleteHandler::clusterDeleteHook = [](std::vector<timestar::data::DeleteRangeTarget>, SeriesId128) {
+        HttpDeleteHandler::clusterDeleteHook = [](std::vector<timestar::data::DeleteRangeTarget>, SeriesId128,
+                                                  uint64_t) {
             return seastar::make_exception_future<>(timestar::data::RetryableWriteError("delete quorum unavailable"));
         };
 
@@ -1583,6 +1639,29 @@ TEST_F(HttpHandlerIntegrationTest, PartitionedRf3MapsRetryableDeleteFailureTo503
         .get();
 }
 
+TEST_F(HttpHandlerIntegrationTest, PartitionedRf3ReportsRetiredDeleteIdentityAsConflict) {
+    seastar::thread([] {
+        struct ResetHook {
+            ~ResetHook() { HttpDeleteHandler::clusterDeleteHook = {}; }
+        } reset;
+        ScopedShardedEngine eng;
+        eng.start();
+        HttpDeleteHandler::clusterDeleteHook = [](std::vector<timestar::data::DeleteRangeTarget>, SeriesId128,
+                                                  uint64_t) {
+            return seastar::make_exception_future<>(timestar::data::DeleteReceiptExpiredError(
+                "delete idempotency receipt is outside the retained VShard window"));
+        };
+
+        HttpDeleteHandler handler(&eng.eng, true);
+        auto reply = handler.handleDelete(makeDeleteRequest(R"({"series":"m value","startTime":0,"endTime":1})")).get();
+        EXPECT_EQ(reply->_status, seastar::http::reply::status_type::conflict);
+        EXPECT_EQ(reply->_headers["X-TimeStar-Idempotency-Window"], "expired");
+        EXPECT_NE(reply->_content.find("DELETE_IDEMPOTENCY_EXPIRED"), std::string::npos);
+    })
+        .join()
+        .get();
+}
+
 TEST_F(HttpHandlerIntegrationTest, PartitionedRf3ReportsAmbiguousDeleteWithoutRetryAdvice) {
     seastar::thread([] {
         struct ResetHook {
@@ -1590,7 +1669,8 @@ TEST_F(HttpHandlerIntegrationTest, PartitionedRf3ReportsAmbiguousDeleteWithoutRe
         } reset;
         ScopedShardedEngine eng;
         eng.start();
-        HttpDeleteHandler::clusterDeleteHook = [](std::vector<timestar::data::DeleteRangeTarget>, SeriesId128) {
+        HttpDeleteHandler::clusterDeleteHook = [](std::vector<timestar::data::DeleteRangeTarget>, SeriesId128,
+                                                  uint64_t) {
             return seastar::make_exception_future<>(
                 timestar::data::AmbiguousMutationError("delete may already have committed"));
         };
@@ -1617,8 +1697,8 @@ TEST_F(HttpHandlerIntegrationTest, PartitionedRf3BoundsDeleteBatchProposalConcur
         eng.start();
         unsigned active = 0;
         unsigned maximum = 0;
-        HttpDeleteHandler::clusterDeleteHook =
-            [&active, &maximum](std::vector<timestar::data::DeleteRangeTarget>, SeriesId128) {
+        HttpDeleteHandler::clusterDeleteHook = [&active, &maximum](std::vector<timestar::data::DeleteRangeTarget>,
+                                                                   SeriesId128, uint64_t) {
             ++active;
             maximum = std::max(maximum, active);
             return seastar::sleep(std::chrono::milliseconds(2)).finally([&active] { --active; });

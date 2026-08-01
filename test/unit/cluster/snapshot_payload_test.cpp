@@ -110,6 +110,43 @@ TEST(SnapshotPayloadCodec, Version3AuthenticatesDeleteReceiptsAndSupportsLightwe
     EXPECT_FALSE(decodeSnapshotDeleteReceipts(corrupt).has_value());
 }
 
+TEST(SnapshotPayloadCodec, Version4RoundTripsBoundedReceiptFloorWithoutReadingObjects) {
+    SnapshotPayload p;
+    p.manifest = validManifest();
+    addValidCatalog(p);
+    p.deleteReceiptsRetiredBeforeMs = 1'000;
+    p.deleteReceiptsRetiredAtIndex = 50;
+    p.deleteReceipts = {
+        {SeriesId128::fromHex("11111111111111111111111111111111"), 12, 0x1234, 0},
+        {SeriesId128::fromHex("22222222222222222222222222222222"), 60, 0x5678, 1'001},
+        {SeriesId128::fromHex("33333333333333333333333333333333"), 99, 0x9abc, 2'000},
+    };
+    p.files = {{"9_1_d1.tsm", std::string(4096, 'x')}};
+
+    const std::string encoded = encodeSnapshotPayload(p);
+    auto decoded = decodeSnapshotPayload(encoded);
+    ASSERT_TRUE(decoded.has_value());
+    EXPECT_EQ(decoded->deleteReceiptsRetiredBeforeMs, p.deleteReceiptsRetiredBeforeMs);
+    EXPECT_EQ(decoded->deleteReceiptsRetiredAtIndex, p.deleteReceiptsRetiredAtIndex);
+    EXPECT_EQ(decoded->deleteReceipts, p.deleteReceipts);
+
+    auto lightweight = decodeSnapshotDeleteReceiptState(encoded);
+    ASSERT_TRUE(lightweight.has_value());
+    EXPECT_EQ(lightweight->retiredBeforeMs, p.deleteReceiptsRetiredBeforeMs);
+    EXPECT_EQ(lightweight->retiredAtIndex, p.deleteReceiptsRetiredAtIndex);
+    EXPECT_EQ(lightweight->receipts, p.deleteReceipts);
+
+    auto invalid = p;
+    invalid.deleteReceipts[1].issuedAtMs = invalid.deleteReceiptsRetiredBeforeMs;
+    EXPECT_THROW(encodeSnapshotPayload(invalid), std::invalid_argument);
+    invalid = p;
+    invalid.deleteReceiptsRetiredAtIndex = invalid.manifest.snapshotRevision;
+    EXPECT_THROW(encodeSnapshotPayload(invalid), std::invalid_argument);
+    invalid = p;
+    invalid.deleteReceiptsRetiredBeforeMs = 0;
+    EXPECT_THROW(encodeSnapshotPayload(invalid), std::invalid_argument);
+}
+
 TEST(SnapshotPayloadCodec, EmptyFileListRoundTrips) {
     SnapshotPayload p;
     p.manifest = validManifest();

@@ -12,8 +12,8 @@
 #include "engine_data_state_machine.hpp"
 
 #include <algorithm>
-#include <chrono>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <map>
@@ -21,6 +21,7 @@
 #include <seastar/core/future.hh>
 #include <seastar/core/gate.hh>
 #include <seastar/core/lowres_clock.hh>
+#include <seastar/core/semaphore.hh>
 #include <seastar/core/timer.hh>
 #include <string_view>
 
@@ -371,6 +372,9 @@ public:
     // non-zero means this shard is converting continuously and its logs will stay long --
     // the conservative half of the trade in EngineLocalStore::hasUnconvertedStores.
     uint64_t snapshotsSkippedPendingConversion() const { return snapshotsSkippedPendingConversion_; }
+    // The flushed data boundary still precedes a receipt-retirement entry, so
+    // compacting there could make a suffix retry execute twice after recovery.
+    uint64_t snapshotsSkippedDeleteState() const { return snapshotsSkippedDeleteState_; }
     // Sweeps that declined because the boundary would not have ADVANCED (the flush
     // watermark has not moved since the last snapshot). Expected to dominate on a
     // low-traffic group; it is the cheap no-op arm, not a problem.
@@ -395,6 +399,10 @@ private:
         std::unique_ptr<JournalWriter> writer;
         std::unique_ptr<raft::JournalRaftPersistence> persistence;
         std::unique_ptr<EngineDataStateMachine> sm;
+        // Admission + proposal + post-apply inspection must be one ordered
+        // operation per group; otherwise a concurrent newer delete could retire
+        // this request between its floor check and log append.
+        std::unique_ptr<seastar::semaphore> deleteProposalLock = std::make_unique<seastar::semaphore>(1);
         // When this group was last snapshotted (default-constructed == never), for
         // kMinSnapshotInterval.
         seastar::lowres_clock::time_point lastSnapshot{};
@@ -476,6 +484,7 @@ private:
     uint64_t snapshotsRefusedTooLarge_ = 0;
     uint64_t snapshotsSkippedUnflushed_ = 0;
     uint64_t snapshotsSkippedPendingConversion_ = 0;
+    uint64_t snapshotsSkippedDeleteState_ = 0;
     uint64_t snapshotsSkippedNoAdvance_ = 0;
     uint64_t snapshotSweeps_ = 0;
     uint64_t snapshotMaxEntriesSinceSeen_ = 0;

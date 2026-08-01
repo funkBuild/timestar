@@ -107,6 +107,9 @@ seastar::future<> ReplicatedCommandRouter::propose(uint16_t vshard, ReplicatedCo
             if (reject.leaderHint != kNoNode && reject.leaderHint != leader)
                 nextHint = reject.leaderHint;
         }
+        if (lastKind == WriteFailure::Expired)
+            throw DeleteReceiptExpiredError("ReplicatedCommandRouter: delete idempotency window expired for VShard " +
+                                            std::to_string(vshard));
         if (!isRetryableWriteFailure(lastKind))
             throw std::runtime_error("ReplicatedCommandRouter: terminal proposal failure for VShard " +
                                      std::to_string(vshard));

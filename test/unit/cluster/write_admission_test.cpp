@@ -49,6 +49,7 @@ TEST(WriteFailureTaxonomyTest, RetryAndAmbiguityPolicyIsExplicit) {
     EXPECT_TRUE(data::isRetryableWriteFailure(WriteFailure::Overloaded));
     EXPECT_FALSE(data::isRetryableWriteFailure(WriteFailure::Unassigned));
     EXPECT_FALSE(data::isRetryableWriteFailure(WriteFailure::Fatal));
+    EXPECT_FALSE(data::isRetryableWriteFailure(WriteFailure::Expired));
     EXPECT_FALSE(data::isRetryableWriteFailure(WriteFailure::None));
 
     EXPECT_TRUE(data::isAmbiguousWriteFailure(WriteFailure::LeadershipLost));
@@ -67,6 +68,7 @@ TEST(WriteFailureTaxonomyTest, LocalClassificationIsConservative) {
     EXPECT_EQ(cls(std::make_exception_ptr(data::WriteOverloadedError("full"))), WriteFailure::Overloaded);
     EXPECT_EQ(cls(std::make_exception_ptr(data::UnassignedVShardError("none"))), WriteFailure::Unassigned);
     EXPECT_EQ(cls(std::make_exception_ptr(data::WriteFrameTooLargeError("big"))), WriteFailure::Fatal);
+    EXPECT_EQ(cls(std::make_exception_ptr(data::DeleteReceiptExpiredError("old"))), WriteFailure::Expired);
     EXPECT_EQ(cls(std::make_exception_ptr(data::ShardStoppingError("shard data plane is stopping"))),
               WriteFailure::ShardStopping);
     // Matched by TYPE now, not by message. A plain runtime_error wearing the same words is

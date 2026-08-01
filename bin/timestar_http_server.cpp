@@ -223,6 +223,7 @@ void set_routes(routes& r) {
                               ",\"snapshots_skipped_unflushed\":" + std::to_string(st.snapshotsSkippedUnflushed) +
                               ",\"snapshots_skipped_pending_conversion\":" +
                               std::to_string(st.snapshotsSkippedPendingConversion) +
+                              ",\"snapshots_skipped_delete_state\":" + std::to_string(st.snapshotsSkippedDeleteState) +
                               ",\"snapshot_sweeps\":" + std::to_string(st.snapshotSweeps) +
                               ",\"snapshot_max_entries_since\":" + std::to_string(st.snapshotMaxEntriesSince) +
                               ",\"snapshot_chunks_sent\":" + std::to_string(st.snapshotChunksSent) +
@@ -748,8 +749,10 @@ int main(int argc, char** argv) {
                         };
                     if (replicatedWrites) {
                         timestar::http::HttpDeleteHandler::clusterDeleteHook =
-                            [](std::vector<timestar::data::DeleteRangeTarget> targets, SeriesId128 operationId) {
-                                return g_clusterDataPlane.deleteRangesFromShard(std::move(targets), operationId);
+                            [](std::vector<timestar::data::DeleteRangeTarget> targets, SeriesId128 operationId,
+                               uint64_t issuedAtMs) {
+                                return g_clusterDataPlane.deleteRangesFromShard(std::move(targets), operationId,
+                                                                                issuedAtMs);
                             };
                     }
                     // Route metadata endpoints through the scatter+merge.

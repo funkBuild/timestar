@@ -637,6 +637,69 @@ TEST_F(ReplicatedVShardHostTest, TheTruncationBoundaryStaysBelowTheHighestFlushe
     }).get();
 }
 
+TEST_F(ReplicatedVShardHostTest, SnapshotWaitsUntilFlushedBoundaryCoversDeleteReceiptRetirement) {
+    seastar::async([] {
+        if (!timestar::vshardsCohesiveOnCores(seastar::smp::count))
+            GTEST_SKIP() << "core count is not VShard-cohesive";
+        ScopedShardedEngine eng;
+        eng.start();
+        cluster::EngineLocalStore store(*eng);
+        NoopTransport transport;
+        fs::path jroot = tmpDir();
+        cluster::ReplicatedVShardHost host(store, transport, /*self=*/1, jroot);
+        RaftOptions opts;
+        opts.electionTimeoutMin = opts.electionTimeoutMax = 1;
+        opts.heartbeatTimeout = 1;
+
+        const auto series = core0Series("snap_delete_floor");
+        host.addVShard(series.vshard, {1}, opts).get();
+        RaftGroup* group = host.group(series.vshard);
+        for (int i = 0; i < 10 && !group->isLeader(); ++i)
+            group->tick().get();
+        ASSERT_TRUE(group->isLeader());
+
+        commitWrites(host, group, series.key, series.vshard, 4);
+        flushToTsm(eng);
+        const size_t filesBeforeCatchUp = tsmFileCount(eng);
+
+        const auto proposeAndTick = [&](data::DeleteRangeBatch batch) {
+            auto proposed = host.propose(series.vshard, data::ReplicatedCommand{std::move(batch)});
+            for (int i = 0; i < 40 && !proposed.available(); ++i)
+                group->tick().get();
+            ASSERT_TRUE(proposed.get());
+        };
+        const uint64_t issuedAt = 2 * data::kDeleteReceiptRetentionMs;
+        const data::DeleteRangeBatch oldDelete{
+            {{series.key, BASE, BASE}}, SeriesId128::fromHex("30000000000000000000000000000001"), issuedAt};
+        const data::DeleteRangeBatch laterDelete{{{series.key, BASE, BASE}},
+                                                 SeriesId128::fromHex("30000000000000000000000000000002"),
+                                                 issuedAt + data::kDeleteReceiptRetentionMs + 1};
+        proposeAndTick(oldDelete);
+        proposeAndTick(laterDelete);
+
+        const auto expired =
+            host.proposeCommandHinted(series.vshard, data::ReplicatedCommand{oldDelete}, std::nullopt).get();
+        ASSERT_EQ(expired.rejects.size(), 1u);
+        EXPECT_EQ(expired.rejects[0].kind, data::WriteFailure::Expired)
+            << "a remote coordinator needs a typed terminal outcome, not an opaque RPC failure";
+
+        EXPECT_EQ(host.snapshotVShard(series.vshard).get(), 0u)
+            << "an older data boundary cannot represent receipts retired by its retained suffix";
+        EXPECT_EQ(host.snapshotsSkippedDeleteState(), 1u);
+        EXPECT_EQ(group->node().log().snapshotIndex(), 0u);
+
+        // Once later writes move the flushed revision beyond the retirement entry,
+        // the same group is compactable again; the safeguard is a bounded wait for
+        // storage catch-up, not a permanent disable.
+        commitWrites(host, group, series.key, series.vshard, 4);
+        flushToTsm(eng, filesBeforeCatchUp);
+        EXPECT_GT(host.snapshotVShard(series.vshard).get(), 0u);
+
+        host.stop().get();
+        fs::remove_all(jroot);
+    }).get();
+}
+
 TEST_F(ReplicatedVShardHostTest, SharedJournalSnapshotBatchTargetsAFifteenMinuteFairScan) {
     using Host = cluster::ReplicatedVShardHost;
     // 180 sweeps fit in fifteen minutes at the five-second cadence. The batch scales
@@ -913,7 +976,8 @@ TEST_F(ReplicatedVShardHostTest, CompactedJournalRestoresDeleteRetryReceipts) {
         opts.heartbeatTimeout = 1;
         const auto series = core0Series("delete_receipt_recovery");
         const SeriesId128 operationId = SeriesId128::fromHex("13579bdf2468ace013579bdf2468ace0");
-        const data::DeleteRangeKey deletion{series.key, BASE, BASE, operationId};
+        const data::DeleteRangeBatch deletion{
+            {data::DeleteRangeTarget{series.key, BASE, BASE}}, operationId, 1'800'000'000'000};
 
         auto proposeAndTick = [](cluster::ReplicatedVShardHost& host, RaftGroup* group, uint16_t vshard,
                                  data::ReplicatedCommand command) {

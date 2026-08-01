@@ -4,9 +4,11 @@
 #include "../raft/raft_driver.hpp"  // raft::RaftStateMachine
 #include "engine_local_store.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <map>
 #include <seastar/core/future.hh>
+#include <stdexcept>
 
 namespace timestar::cluster {
 
@@ -39,7 +41,14 @@ namespace timestar::cluster {
 //     coarser hint, e.g. for read-catch-up).
 class EngineDataStateMachine : public raft::RaftStateMachine {
 public:
-    EngineDataStateMachine(EngineLocalStore& store, VShardId vshard) : store_(store), vshard_(vshard) {}
+    enum class DeleteReceiptStatus { Retained, Expired, Missing };
+
+    EngineDataStateMachine(EngineLocalStore& store, VShardId vshard,
+                           size_t maxDeleteReceipts = data::kMaxDeleteReceiptsPerVShard)
+        : store_(store), vshard_(vshard), maxDeleteReceipts_(maxDeleteReceipts) {
+        if (maxDeleteReceipts_ == 0)
+            throw std::invalid_argument("EngineDataStateMachine: delete receipt capacity must be non-zero");
+    }
 
     seastar::future<> apply(raft::LogEntry entry) override;
     seastar::future<> applySnapshot(raft::Snapshot snap) override;
@@ -50,11 +59,22 @@ public:
     // host adds only this prefix to the payload: including a receipt from the
     // retained suffix would cause replay to skip a delete whose storage effects
     // are not present in the snapshot.
-    std::vector<data::DeleteOperationReceipt> deleteReceiptsThrough(uint64_t snapshotIndex) const;
+    // A retirement discards receipts that an older boundary would need while
+    // replaying the suffix preceding the retirement entry. Such a historical
+    // state can no longer be reconstructed and the producer must wait until its
+    // data boundary covers the retirement entry.
+    bool canSnapshotDeleteReceiptStateThrough(uint64_t snapshotIndex) const;
+    data::DeleteReceiptSnapshotState deleteReceiptStateThrough(uint64_t snapshotIndex) const;
+
+    // Leader-side pre-proposal admission and post-apply result checks. They keep
+    // an expired command out of the log when possible and ensure a committed
+    // retired no-op is never reported as a newly executed delete.
+    void checkDeleteAdmission(const data::DeleteRangeBatch& command) const;
+    DeleteReceiptStatus deleteReceiptStatus(const data::DeleteRangeBatch& command) const;
 
     // Restore the small state-machine-only part of a locally produced snapshot
     // without reinstalling (or even decoding/copying) its TSM objects.
-    void restoreDeleteReceipts(std::vector<data::DeleteOperationReceipt> receipts, uint64_t snapshotIndex);
+    void restoreDeleteReceiptState(data::DeleteReceiptSnapshotState state, uint64_t snapshotIndex);
 
     // Entry-payload BYTES applied since the last snapshot install/produce (debt D-6).
     //
@@ -79,6 +99,12 @@ private:
     uint64_t appliedIndex_ = 0;
     uint64_t appliedBytesSinceSnapshot_ = 0;
     std::map<SeriesId128, data::DeleteOperationReceipt> deleteReceipts_;
+    uint64_t deleteReceiptsRetiredBeforeMs_ = 0;
+    uint64_t deleteReceiptsRetiredAtIndex_ = 0;
+    size_t maxDeleteReceipts_;
+
+    void advanceDeleteReceiptFloor(uint64_t floorMs, uint64_t appliedIndex);
+    void makeRoomForDeleteReceipt(uint64_t appliedIndex);
 };
 
 }  // namespace timestar::cluster

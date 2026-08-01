@@ -1,7 +1,9 @@
 #include "snapshot_payload.hpp"
 
 #include "../../storage/series_catalog.hpp"
+#include "replicated_command.hpp"
 
+#include <algorithm>
 #include <cstring>
 #include <stdexcept>
 
@@ -12,7 +14,9 @@ namespace {
 constexpr uint32_t kPayloadMagic = 0x32505354;  // "TSP2" little-endian
 constexpr uint32_t kPayloadVersionV2 = 2;
 constexpr uint32_t kPayloadVersionV3 = 3;
-constexpr size_t kDeleteReceiptBytes = 16 + 8 + 8;
+constexpr uint32_t kPayloadVersionV4 = 4;
+constexpr size_t kLegacyDeleteReceiptBytes = 16 + 8 + 8;
+constexpr size_t kBoundedDeleteReceiptBytes = kLegacyDeleteReceiptBytes + 8;
 
 uint64_t fnv1a(const char* p, size_t n) {
     uint64_t h = 1469598103934665603ull;
@@ -94,13 +98,21 @@ struct Reader {
 };
 
 bool validDeleteReceipts(const SnapshotPayload& payload) {
-    if (!payload.deleteReceipts.empty() && payload.catalog.empty())
+    const bool hasRetiredFloor =
+        payload.deleteReceiptsRetiredBeforeMs != 0 || payload.deleteReceiptsRetiredAtIndex != 0;
+    if ((!payload.deleteReceipts.empty() || hasRetiredFloor) && payload.catalog.empty())
+        return false;
+    if ((payload.deleteReceiptsRetiredBeforeMs == 0) != (payload.deleteReceiptsRetiredAtIndex == 0) ||
+        payload.deleteReceiptsRetiredAtIndex >= payload.manifest.snapshotRevision ||
+        payload.deleteReceipts.size() > kMaxDeleteReceiptsPerVShard)
         return false;
     SeriesId128 previous{};
     bool first = true;
     for (const auto& receipt : payload.deleteReceipts) {
         if (receipt.operationId == SeriesId128{} || receipt.appliedIndex == 0 ||
-            receipt.appliedIndex >= payload.manifest.snapshotRevision || (!first && !(previous < receipt.operationId)))
+            receipt.appliedIndex >= payload.manifest.snapshotRevision ||
+            (receipt.issuedAtMs != 0 && receipt.issuedAtMs <= payload.deleteReceiptsRetiredBeforeMs) ||
+            (!first && !(previous < receipt.operationId)))
             return false;
         first = false;
         previous = receipt.operationId;
@@ -108,7 +120,7 @@ bool validDeleteReceipts(const SnapshotPayload& payload) {
     return true;
 }
 
-void putDeleteReceipts(std::string& out, const std::vector<DeleteOperationReceipt>& receipts) {
+void putDeleteReceipts(std::string& out, const std::vector<DeleteOperationReceipt>& receipts, bool bounded) {
     if (receipts.size() > UINT32_MAX)
         throw std::invalid_argument("encodeSnapshotPayload: too many delete receipts");
     putU32(out, static_cast<uint32_t>(receipts.size()));
@@ -116,13 +128,16 @@ void putDeleteReceipts(std::string& out, const std::vector<DeleteOperationReceip
         receipt.operationId.appendTo(out);
         putU64(out, receipt.appliedIndex);
         putU64(out, receipt.commandHash);
+        if (bounded)
+            putU64(out, receipt.issuedAtMs);
     }
 }
 
 bool readDeleteReceipts(Reader& r, const VShardSnapshotManifest& manifest,
-                        std::vector<DeleteOperationReceipt>& receipts) {
+                        std::vector<DeleteOperationReceipt>& receipts, bool bounded, uint64_t retiredBeforeMs) {
     const uint32_t count = r.u32();
-    if (!r.ok || count > static_cast<uint64_t>(r.end - r.p) / kDeleteReceiptBytes)
+    const size_t receiptBytes = bounded ? kBoundedDeleteReceiptBytes : kLegacyDeleteReceiptBytes;
+    if (!r.ok || count > kMaxDeleteReceiptsPerVShard || count > static_cast<uint64_t>(r.end - r.p) / receiptBytes)
         return false;
     receipts.reserve(count);
     SeriesId128 previous{};
@@ -131,8 +146,12 @@ bool readDeleteReceipts(Reader& r, const VShardSnapshotManifest& manifest,
         receipt.operationId = r.seriesId();
         receipt.appliedIndex = r.u64();
         receipt.commandHash = r.u64();
+        if (bounded)
+            receipt.issuedAtMs = r.u64();
         if (!r.ok || receipt.operationId == SeriesId128{} || receipt.appliedIndex == 0 ||
-            receipt.appliedIndex >= manifest.snapshotRevision || (i != 0 && !(previous < receipt.operationId)))
+            receipt.appliedIndex >= manifest.snapshotRevision ||
+            (receipt.issuedAtMs != 0 && receipt.issuedAtMs <= retiredBeforeMs) ||
+            (i != 0 && !(previous < receipt.operationId)))
             return false;
         previous = receipt.operationId;
         receipts.push_back(receipt);
@@ -144,6 +163,11 @@ bool readDeleteReceipts(Reader& r, const VShardSnapshotManifest& manifest,
 
 std::string encodeSnapshotPayload(const SnapshotPayload& payload) {
     std::string out;
+    const bool hasDeleteState = !payload.deleteReceipts.empty() || payload.deleteReceiptsRetiredBeforeMs != 0 ||
+                                payload.deleteReceiptsRetiredAtIndex != 0;
+    const bool boundedDeleteState =
+        payload.deleteReceiptsRetiredBeforeMs != 0 ||
+        std::ranges::any_of(payload.deleteReceipts, [](const auto& receipt) { return receipt.issuedAtMs != 0; });
     if (!payload.catalog.empty()) {
         if (!payload.manifest.valid() ||
             timestar::SeriesCatalog::snapshotHash(payload.catalog) != payload.manifest.catalogHash ||
@@ -152,15 +176,20 @@ std::string encodeSnapshotPayload(const SnapshotPayload& payload) {
             !validDeleteReceipts(payload))
             throw std::invalid_argument("encodeSnapshotPayload: catalog/hash mismatch");
         putU32(out, kPayloadMagic);
-        putU32(out, payload.deleteReceipts.empty() ? kPayloadVersionV2 : kPayloadVersionV3);
-    } else if (!payload.deleteReceipts.empty()) {
+        putU32(out, !hasDeleteState ? kPayloadVersionV2 : (boundedDeleteState ? kPayloadVersionV4 : kPayloadVersionV3));
+    } else if (hasDeleteState) {
         throw std::invalid_argument("encodeSnapshotPayload: delete receipts require a v2+ catalog");
     }
     putBlob(out, payload.manifest.encode());
     if (!payload.catalog.empty()) {
         putBlob(out, payload.catalog);
-        if (!payload.deleteReceipts.empty())
-            putDeleteReceipts(out, payload.deleteReceipts);
+        if (boundedDeleteState) {
+            putU64(out, payload.deleteReceiptsRetiredBeforeMs);
+            putU64(out, payload.deleteReceiptsRetiredAtIndex);
+            putDeleteReceipts(out, payload.deleteReceipts, true);
+        } else if (!payload.deleteReceipts.empty()) {
+            putDeleteReceipts(out, payload.deleteReceipts, false);
+        }
     }
     putU32(out, static_cast<uint32_t>(payload.files.size()));
     for (const auto& f : payload.files) {
@@ -176,18 +205,25 @@ std::string encodeSnapshotPayload(SnapshotPayload&& payload) {
     // Exactly what the const& overload will have written, computed before writing a byte:
     // manifest blob + file count + per file (name blob + bytes blob) + the FNV trailer.
     const bool versioned = !payload.catalog.empty();
-    const bool v3 = !payload.deleteReceipts.empty();
+    const bool hasDeleteState = !payload.deleteReceipts.empty() || payload.deleteReceiptsRetiredBeforeMs != 0 ||
+                                payload.deleteReceiptsRetiredAtIndex != 0;
+    const bool v4 =
+        payload.deleteReceiptsRetiredBeforeMs != 0 ||
+        std::ranges::any_of(payload.deleteReceipts, [](const auto& receipt) { return receipt.issuedAtMs != 0; });
+    const bool v3 = hasDeleteState && !v4;
     if (versioned && (!payload.manifest.valid() ||
                       timestar::SeriesCatalog::snapshotHash(payload.catalog) != payload.manifest.catalogHash ||
                       !timestar::SeriesCatalog::loadSnapshot(
                           std::span<const char>(payload.catalog.data(), payload.catalog.size())) ||
                       !validDeleteReceipts(payload)))
         throw std::invalid_argument("encodeSnapshotPayload: catalog/hash mismatch");
-    if (!versioned && v3)
+    if (!versioned && hasDeleteState)
         throw std::invalid_argument("encodeSnapshotPayload: delete receipts require a v2+ catalog");
     size_t total = (versioned ? 8 + 8 + payload.catalog.size() : 0) + 8 + manifest.size() + 4 + 8;
     if (v3)
-        total += 4 + payload.deleteReceipts.size() * kDeleteReceiptBytes;
+        total += 4 + payload.deleteReceipts.size() * kLegacyDeleteReceiptBytes;
+    if (v4)
+        total += 16 + 4 + payload.deleteReceipts.size() * kBoundedDeleteReceiptBytes;
     for (const auto& f : payload.files)
         total += 8 + f.name.size() + 8 + f.bytes.size();
 
@@ -195,14 +231,19 @@ std::string encodeSnapshotPayload(SnapshotPayload&& payload) {
     out.reserve(total);
     if (versioned) {
         putU32(out, kPayloadMagic);
-        putU32(out, v3 ? kPayloadVersionV3 : kPayloadVersionV2);
+        putU32(out, v4 ? kPayloadVersionV4 : (v3 ? kPayloadVersionV3 : kPayloadVersionV2));
     }
     putBlob(out, manifest);
     if (versioned) {
         putBlob(out, payload.catalog);
         std::string().swap(payload.catalog);
-        if (v3)
-            putDeleteReceipts(out, payload.deleteReceipts);
+        if (v4) {
+            putU64(out, payload.deleteReceiptsRetiredBeforeMs);
+            putU64(out, payload.deleteReceiptsRetiredAtIndex);
+            putDeleteReceipts(out, payload.deleteReceipts, true);
+        } else if (v3) {
+            putDeleteReceipts(out, payload.deleteReceipts, false);
+        }
     }
     putU32(out, static_cast<uint32_t>(payload.files.size()));
     for (auto& f : payload.files) {
@@ -234,7 +275,8 @@ std::optional<SnapshotPayload> decodeSnapshotPayload(const std::string& bytes) {
         Reader probe = r;
         if (probe.u32() == kPayloadMagic) {
             version = probe.u32();
-            if ((version != kPayloadVersionV2 && version != kPayloadVersionV3) || !probe.ok)
+            if ((version != kPayloadVersionV2 && version != kPayloadVersionV3 && version != kPayloadVersionV4) ||
+                !probe.ok)
                 return std::nullopt;
             r = probe;
         }
@@ -255,8 +297,16 @@ std::optional<SnapshotPayload> decodeSnapshotPayload(const std::string& bytes) {
             return std::nullopt;
     }
 
-    if (version == kPayloadVersionV3 && !readDeleteReceipts(r, out.manifest, out.deleteReceipts))
+    if (version == kPayloadVersionV4) {
+        out.deleteReceiptsRetiredBeforeMs = r.u64();
+        out.deleteReceiptsRetiredAtIndex = r.u64();
+        if (!r.ok || (out.deleteReceiptsRetiredBeforeMs == 0) != (out.deleteReceiptsRetiredAtIndex == 0) ||
+            out.deleteReceiptsRetiredAtIndex >= out.manifest.snapshotRevision ||
+            !readDeleteReceipts(r, out.manifest, out.deleteReceipts, true, out.deleteReceiptsRetiredBeforeMs))
+            return std::nullopt;
+    } else if (version == kPayloadVersionV3 && !readDeleteReceipts(r, out.manifest, out.deleteReceipts, false, 0)) {
         return std::nullopt;
+    }
 
     uint32_t nfiles = r.u32();
     // Each file is >= two 8-byte length prefixes; reject an inflated count.
@@ -276,7 +326,7 @@ std::optional<SnapshotPayload> decodeSnapshotPayload(const std::string& bytes) {
     return out;
 }
 
-std::optional<std::vector<DeleteOperationReceipt>> decodeSnapshotDeleteReceipts(const std::string& bytes) {
+std::optional<DeleteReceiptSnapshotState> decodeSnapshotDeleteReceiptState(const std::string& bytes) {
     if (bytes.size() < 8)
         return std::nullopt;
     const size_t bodyLen = bytes.size() - 8;
@@ -292,7 +342,8 @@ std::optional<std::vector<DeleteOperationReceipt>> decodeSnapshotDeleteReceipts(
         Reader probe = r;
         if (probe.u32() == kPayloadMagic) {
             version = probe.u32();
-            if ((version != kPayloadVersionV2 && version != kPayloadVersionV3) || !probe.ok)
+            if ((version != kPayloadVersionV2 && version != kPayloadVersionV3 && version != kPayloadVersionV4) ||
+                !probe.ok)
                 return std::nullopt;
             r = probe;
         }
@@ -305,9 +356,17 @@ std::optional<std::vector<DeleteOperationReceipt>> decodeSnapshotDeleteReceipts(
     if (version != 0 && !r.skipBlob())
         return std::nullopt;
 
-    std::vector<DeleteOperationReceipt> receipts;
-    if (version == kPayloadVersionV3 && !readDeleteReceipts(r, *manifest, receipts))
+    DeleteReceiptSnapshotState state;
+    if (version == kPayloadVersionV4) {
+        state.retiredBeforeMs = r.u64();
+        state.retiredAtIndex = r.u64();
+        if (!r.ok || (state.retiredBeforeMs == 0) != (state.retiredAtIndex == 0) ||
+            state.retiredAtIndex >= manifest->snapshotRevision ||
+            !readDeleteReceipts(r, *manifest, state.receipts, true, state.retiredBeforeMs))
+            return std::nullopt;
+    } else if (version == kPayloadVersionV3 && !readDeleteReceipts(r, *manifest, state.receipts, false, 0)) {
         return std::nullopt;
+    }
 
     const uint32_t files = r.u32();
     if (!r.ok || files > static_cast<uint64_t>(r.end - r.p) / 16)
@@ -317,7 +376,14 @@ std::optional<std::vector<DeleteOperationReceipt>> decodeSnapshotDeleteReceipts(
             return std::nullopt;
     if (!r.ok || r.p != r.end)
         return std::nullopt;
-    return receipts;
+    return state;
+}
+
+std::optional<std::vector<DeleteOperationReceipt>> decodeSnapshotDeleteReceipts(const std::string& bytes) {
+    auto state = decodeSnapshotDeleteReceiptState(bytes);
+    if (!state)
+        return std::nullopt;
+    return std::move(state->receipts);
 }
 
 }  // namespace timestar::data

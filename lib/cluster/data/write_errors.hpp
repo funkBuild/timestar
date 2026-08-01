@@ -55,14 +55,11 @@ using timestar::raft::NodeId;
 //   operations OVERLAP in real time and either order is correct. An acked-then-reverted
 //   sequence is impossible, because a slice that returned success is never retried.
 //
-//   The WriteBatch router is the only place where ambiguous re-proposal is generally
-//   allowed. ReplicatedCommandRouter reuses this taxonomy for deletes, but explicitly
-//   refuses the two ambiguous classes below. A delete is not idempotent against a
-//   concurrent write to the same point -- re-applying
-//   one at a HIGHER revision would erase a write that legitimately landed after the
-//   original delete committed, resurrecting nothing and losing real data. Until deletes
-//   get revision-bounded tombstones or durable operation-id deduplication, an ambiguous
-//   delete outcome is reported to the caller and is never automatically re-proposed.
+//   ReplicatedCommandRouter also uses this taxonomy for deletes. Legacy commands without
+//   an operation ID still refuse the two ambiguous classes below: re-applying a physical
+//   delete after a concurrent write would erase data ordered after the first attempt.
+//   Modern per-VShard batches carry snapshot-durable operation receipts, so their exact
+//   retries are replicated no-ops and may use the ordinary retry policy safely.
 //
 // `Unassigned` and `Fatal` are terminal: no amount of retrying fixes an unowned VShard
 // or a journal I/O error, and hiding either behind a retry budget only delays the
@@ -91,6 +88,7 @@ enum class WriteFailure : uint8_t {
     Overloaded,
     Unassigned,
     Fatal,
+    Expired,
 };
 
 // The retry POLICY table. Phase 4a extends this (and only this) to give a
@@ -107,6 +105,7 @@ constexpr bool isRetryableWriteFailure(WriteFailure f) {
         case WriteFailure::None:
         case WriteFailure::Unassigned:
         case WriteFailure::Fatal:
+        case WriteFailure::Expired:
             return false;
     }
     return false;
@@ -198,6 +197,7 @@ constexpr std::chrono::milliseconds writeFailureRetryDelay(WriteFailure f, unsig
         case WriteFailure::ShardStopping:
         case WriteFailure::Unassigned:
         case WriteFailure::Fatal:
+        case WriteFailure::Expired:
             break;
     }
     return kWriteRetryDelayBase;
@@ -256,6 +256,8 @@ constexpr const char* writeFailureName(WriteFailure f) {
             return "unassigned";
         case WriteFailure::Fatal:
             return "fatal";
+        case WriteFailure::Expired:
+            return "expired";
     }
     return "?";
 }
@@ -318,6 +320,14 @@ public:
     explicit WriteFrameTooLargeError(const std::string& what) : std::runtime_error(what) {}
 };
 
+// The request's durable delete identity has fallen behind the replicated
+// retention/capacity floor. Re-proposing it would be unsafe; the state machine
+// treats a committed late copy as a no-op and the HTTP layer reports conflict.
+class DeleteReceiptExpiredError : public std::runtime_error {
+public:
+    explicit DeleteReceiptExpiredError(const std::string& what) : std::runtime_error(what) {}
+};
+
 // ---------------------------------------------------------------------------
 // Classify an exception raised by a LOCAL propose (same process, so the cause is
 // knowable). Anything not explicitly recognised is Fatal: a retry budget must never be
@@ -340,6 +350,8 @@ inline WriteFailure classifyLocalWriteFailure(const std::exception_ptr& e) {
         return WriteFailure::Overloaded;
     } catch (const WriteFrameTooLargeError&) {
         return WriteFailure::Fatal;
+    } catch (const DeleteReceiptExpiredError&) {
+        return WriteFailure::Expired;
     } catch (const UnassignedVShardError&) {
         return WriteFailure::Unassigned;
     } catch (...) {

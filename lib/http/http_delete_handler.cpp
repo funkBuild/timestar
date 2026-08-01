@@ -13,6 +13,8 @@
 #include "scatter_gather.hpp"
 #include "series_key.hpp"
 
+#include <charconv>
+#include <chrono>
 #include <seastar/core/loop.hh>
 #include <seastar/core/smp.hh>
 #include <seastar/core/when_all.hh>
@@ -57,13 +59,13 @@ namespace timestar::http {
 // Forward declaration for shared validation used by both JSON and protobuf paths.
 static void validateDeleteRequest(const HttpDeleteHandler::DeleteRequest& req);
 
-static SeriesId128 deleteBatchOperationId(const SeriesId128& requestId, uint16_t vshard,
+static SeriesId128 deleteBatchOperationId(const SeriesId128& requestId, uint64_t issuedAtMs, uint16_t vshard,
                                           const std::vector<timestar::data::DeleteRangeTarget>& targets) {
     std::string identity = requestId.toBytes();
     size_t targetBytes = 0;
     for (const auto& target : targets)
         targetBytes += sizeof(uint32_t) + target.seriesKey.size() + sizeof(uint64_t) * 2;
-    identity.reserve(identity.size() + sizeof(vshard) + sizeof(uint32_t) + targetBytes);
+    identity.reserve(identity.size() + sizeof(issuedAtMs) + sizeof(vshard) + sizeof(uint32_t) + targetBytes);
     identity.push_back(static_cast<char>(vshard & 0xff));
     identity.push_back(static_cast<char>((vshard >> 8) & 0xff));
     const auto appendU32 = [&identity](uint32_t value) {
@@ -74,6 +76,7 @@ static SeriesId128 deleteBatchOperationId(const SeriesId128& requestId, uint16_t
         for (unsigned byte = 0; byte < sizeof(value); ++byte)
             identity.push_back(static_cast<char>((value >> (byte * 8)) & 0xff));
     };
+    appendU64(issuedAtMs);
     appendU32(static_cast<uint32_t>(targets.size()));
     for (const auto& target : targets) {
         appendU32(static_cast<uint32_t>(target.seriesKey.size()));
@@ -220,6 +223,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDeleteHandler::handle
     // Reusing this header with a different body deliberately derives different
     // operations: the contract is "same key AND same request".
     SeriesId128 clusterRequestId;
+    uint64_t clusterRequestIssuedAtMs = 0;
     if (partitionedCluster_) {
         const std::string idempotencyKey = req->get_header("Idempotency-Key");
         try {
@@ -230,6 +234,29 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDeleteHandler::handle
             reply->set_status(seastar::http::reply::status_type::bad_request);
             constexpr std::string_view message =
                 "Partitioned delete requires Idempotency-Key as 32 non-zero hexadecimal characters";
+            if (timestar::http::isProtobuf(resFmt))
+                reply->_content = timestar::proto::formatDeleteResponse("error", 0, 0, std::string(message));
+            else
+                reply->_content = createErrorResponse(std::string(message));
+            timestar::http::setContentType(*reply, resFmt);
+            co_return reply;
+        }
+        const std::string issuedAt = req->get_header("Idempotency-Key-Timestamp");
+        const auto parsed =
+            std::from_chars(issuedAt.data(), issuedAt.data() + issuedAt.size(), clusterRequestIssuedAtMs);
+        const uint64_t nowMs = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch())
+                .count());
+        if (issuedAt.empty() || parsed.ec != std::errc{} || parsed.ptr != issuedAt.data() + issuedAt.size() ||
+            clusterRequestIssuedAtMs == 0 ||
+            (nowMs >= clusterRequestIssuedAtMs &&
+             nowMs - clusterRequestIssuedAtMs >= timestar::data::kDeleteReceiptRetentionMs) ||
+            (clusterRequestIssuedAtMs > nowMs &&
+             clusterRequestIssuedAtMs - nowMs > timestar::data::kDeleteReceiptFutureSkewMs)) {
+            reply->set_status(seastar::http::reply::status_type::bad_request);
+            constexpr std::string_view message =
+                "Idempotency-Key-Timestamp must be Unix epoch milliseconds within the retained one-hour window "
+                "and must be reused unchanged with Idempotency-Key";
             if (timestar::http::isProtobuf(resFmt))
                 reply->_content = timestar::proto::formatDeleteResponse("error", 0, 0, std::string(message));
             else
@@ -514,16 +541,18 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDeleteHandler::handle
             struct VShardDeleteBatch {
                 std::vector<timestar::data::DeleteRangeTarget> targets;
                 SeriesId128 operationId;
+                uint64_t issuedAtMs;
             };
             std::vector<VShardDeleteBatch> batches;
             batches.reserve(grouped.size());
             for (auto& [vshard, targets] : grouped) {
-                const SeriesId128 operationId = deleteBatchOperationId(clusterRequestId, vshard, targets);
-                if (timestar::data::encodedDeleteRangeBatchBytes(targets) >
+                const SeriesId128 operationId =
+                    deleteBatchOperationId(clusterRequestId, clusterRequestIssuedAtMs, vshard, targets);
+                if (timestar::data::encodedDeleteRangeBatchBytes(targets, clusterRequestIssuedAtMs) >
                     timestar::raft::RaftGroup::kMaxProposalBytes)
                     throw timestar::data::WriteFrameTooLargeError(
                         "delete request contains a VShard batch larger than the Raft entry limit");
-                batches.push_back({std::move(targets), operationId});
+                batches.push_back({std::move(targets), operationId, clusterRequestIssuedAtMs});
             }
 
             // A legal request may span every VShard. Starting all those quorum
@@ -536,7 +565,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDeleteHandler::handle
             // replicated no-ops, while only missing VShards perform storage work.
             co_await seastar::max_concurrent_for_each(
                 batches, kMaxConcurrentClusterDeletes, [](VShardDeleteBatch& batch) {
-                    return clusterDeleteHook(std::move(batch.targets), batch.operationId);
+                    return clusterDeleteHook(std::move(batch.targets), batch.operationId, batch.issuedAtMs);
                 });
 
             // Raft's acknowledgement proves that every expanded exact target
@@ -741,6 +770,13 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDeleteHandler::handle
             reply->_content = timestar::proto::formatDeleteResponse("error", 0, 0, e.what());
         else
             reply->_content = createErrorResponse(e.what());
+    } catch (const timestar::data::DeleteReceiptExpiredError& e) {
+        reply->set_status(seastar::http::reply::status_type::conflict);
+        reply->_headers["X-TimeStar-Idempotency-Window"] = "expired";
+        if (timestar::http::isProtobuf(resFmt))
+            reply->_content = timestar::proto::formatDeleteResponse("error", 0, 0, e.what());
+        else
+            reply->_content = timestar::http::jsonError(e.what(), "DELETE_IDEMPOTENCY_EXPIRED");
     } catch (const timestar::data::AmbiguousMutationError& e) {
         // Do not attach Retry-After: unlike an unambiguous pre-proposal refusal,
         // this command may already be committed. Repeating a range delete after a

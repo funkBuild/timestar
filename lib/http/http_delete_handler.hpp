@@ -111,8 +111,8 @@ private:
     bool partitionedCluster_ = false;
 
 public:
-    using ClusterDeleteHook = std::function<seastar::future<>(
-        std::vector<timestar::data::DeleteRangeTarget> targets, SeriesId128 operationId)>;
+    using ClusterDeleteHook = std::function<seastar::future<>(std::vector<timestar::data::DeleteRangeTarget> targets,
+                                                              SeriesId128 operationId, uint64_t issuedAtMs)>;
     using ClusterPatternExpandHook = std::function<seastar::future<std::vector<std::string>>(
         timestar::data::PatternSeriesSelector selector, uint32_t maxSeries)>;
     static inline ClusterDeleteHook clusterDeleteHook{};

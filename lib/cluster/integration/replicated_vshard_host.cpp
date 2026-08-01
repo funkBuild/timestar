@@ -261,11 +261,11 @@ seastar::future<> ReplicatedVShardHost::addVShard(uint16_t vshard, std::vector<N
         // branch above for why the move is worth having.
         const uint64_t snapIndex = st.snapshot->index;
         const uint64_t snapTerm = st.snapshot->term;
-        auto receipts = data::decodeSnapshotDeleteReceipts(st.snapshot->data);
-        if (!receipts)
+        auto deleteState = data::decodeSnapshotDeleteReceiptState(st.snapshot->data);
+        if (!deleteState)
             throw std::runtime_error(
                 "ReplicatedVShardHost: locally produced snapshot has invalid delete-receipt framing");
-        vs.sm->restoreDeleteReceipts(std::move(*receipts), snapIndex);
+        vs.sm->restoreDeleteReceiptState(std::move(*deleteState), snapIndex);
         node.seedRecoveredSnapshot(std::move(*st.snapshot));
         timestar::http_log.info(
             "cluster: VShard {} recovered from a compacted journal at boundary index {} (term {}); the local Engine "
@@ -288,6 +288,27 @@ seastar::future<bool> ReplicatedVShardHost::propose(uint16_t vshard, data::Repli
         throw std::runtime_error("ReplicatedVShardHost::propose: VShard not hosted here");
     if (const auto* writes = std::get_if<data::WriteBatch>(&cmd))
         co_await store_.checkWriteAdmission(*writes);
+    if (const auto* batch = std::get_if<data::DeleteRangeBatch>(&cmd)) {
+        auto state = vshards_.find(vshard);
+        if (state == vshards_.end() || !state->second.sm || !state->second.deleteProposalLock)
+            throw std::runtime_error("ReplicatedVShardHost::propose: VShard state is unavailable");
+        auto units = co_await seastar::get_units(*state->second.deleteProposalLock, 1);
+        state->second.sm->checkDeleteAdmission(*batch);
+        const bool committed = co_await g->proposeAndAwaitApplied(data::encodeReplicatedCommand(cmd), deadline);
+        if (!committed)
+            co_return false;
+        switch (state->second.sm->deleteReceiptStatus(*batch)) {
+            case EngineDataStateMachine::DeleteReceiptStatus::Retained:
+                co_return true;
+            case EngineDataStateMachine::DeleteReceiptStatus::Expired:
+                throw data::DeleteReceiptExpiredError(
+                    "delete idempotency receipt expired before the committed command applied");
+            case EngineDataStateMachine::DeleteReceiptStatus::Missing:
+                throw std::runtime_error(
+                    "ReplicatedVShardHost::propose: committed delete has no receipt or retired-floor outcome");
+        }
+        throw std::runtime_error("ReplicatedVShardHost::propose: invalid delete receipt status");
+    }
     co_return co_await g->proposeAndAwaitApplied(data::encodeReplicatedCommand(cmd), deadline);
 }
 
@@ -309,7 +330,10 @@ seastar::future<data::ProposeOutcome> ReplicatedVShardHost::proposeCommandHinted
         }
     } catch (...) {
         const auto kind = data::classifyLocalWriteFailure(std::current_exception());
-        if (!data::isRetryableWriteFailure(kind))
+        // Expiry is terminal to the caller but is still an expected protocol
+        // outcome. Encode it so a remote coordinator can return the same 409 as
+        // a local one; rethrow genuinely fatal terminal failures.
+        if (!data::isRetryableWriteFailure(kind) && kind != data::WriteFailure::Expired)
             throw;
         NodeId hint = g->leader();
         if (hint == self_)
@@ -392,11 +416,25 @@ seastar::future<uint64_t> ReplicatedVShardHost::snapshotVShard(uint16_t vshard) 
         ++snapshotsSkippedNoAdvance_;
         co_return 0;
     }
+    // Receipt retirement destroys historical dedupe state. If retirement entry N
+    // sits in the retained suffix, an older snapshot cannot omit both its floor and
+    // the receipts it removed: a retry before N would execute again during replay
+    // and could erase a write which originally survived. Wait for the flushed data
+    // boundary to cover N; keeping the log is the safe side of this trade.
+    if (auto state = vshards_.find(vshard);
+        state != vshards_.end() && state->second.sm && !state->second.sm->canSnapshotDeleteReceiptStateThrough(upto)) {
+        ++snapshotsSkippedDeleteState_;
+        co_return 0;
+    }
     // Delete idempotency is replicated state just like the data. Include only
     // receipts covered by this exact boundary; suffix receipts must be rebuilt
     // by suffix replay or their deletes could be skipped after restore.
-    if (auto state = vshards_.find(vshard); state != vshards_.end() && state->second.sm)
-        payload.deleteReceipts = state->second.sm->deleteReceiptsThrough(upto);
+    if (auto state = vshards_.find(vshard); state != vshards_.end() && state->second.sm) {
+        auto deleteState = state->second.sm->deleteReceiptStateThrough(upto);
+        payload.deleteReceiptsRetiredBeforeMs = deleteState.retiredBeforeMs;
+        payload.deleteReceiptsRetiredAtIndex = deleteState.retiredAtIndex;
+        payload.deleteReceipts = std::move(deleteState.receipts);
+    }
     // CONSUMING encode (debt D-32). This `std::move` used to be dead -- the only overload
     // took a const&, so the rvalue bound to it and every file was copied, leaving the
     // producer holding the payload twice with `payload` still alive for the whole

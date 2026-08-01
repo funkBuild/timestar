@@ -64,6 +64,11 @@ std::string keyOnVShard(const std::string& measurement, uint16_t vshard) {
     }
 }
 
+data::DeleteRangeBatch boundedDelete(const std::string& key, const std::string& operationId, uint64_t issuedAtMs) {
+    return data::DeleteRangeBatch{
+        {data::DeleteRangeTarget{key, BASE, BASE}}, SeriesId128::fromHex(operationId), issuedAtMs};
+}
+
 double latest(seastar::sharded<Engine>& eng, const std::string& m, const std::string& f) {
     http::HttpQueryHandler h(&eng);
     QueryRequest q;
@@ -133,11 +138,11 @@ TEST_F(EngineDataStateMachineTest, IdempotentDeleteRetryCannotEraseAnIntervening
         EXPECT_DOUBLE_EQ(latest(*eng, "delete_retry", "value"), 20.0)
             << "a client retry physically deleted a write ordered after the first attempt";
 
-        const auto receipts = sm.deleteReceiptsThrough(9);
-        ASSERT_EQ(receipts.size(), 1u);
-        EXPECT_EQ(receipts[0].operationId, operationId);
-        EXPECT_EQ(receipts[0].appliedIndex, 9u);
-        EXPECT_TRUE(sm.deleteReceiptsThrough(8).empty());
+        const auto receiptState = sm.deleteReceiptStateThrough(9);
+        ASSERT_EQ(receiptState.receipts.size(), 1u);
+        EXPECT_EQ(receiptState.receipts[0].operationId, operationId);
+        EXPECT_EQ(receiptState.receipts[0].appliedIndex, 9u);
+        EXPECT_TRUE(sm.deleteReceiptStateThrough(8).receipts.empty());
 
         auto conflicting = command;
         conflicting.endTime = BASE + 2;
@@ -156,7 +161,7 @@ TEST_F(EngineDataStateMachineTest, RestoredDeleteReceiptProtectsPostSnapshotWrit
         cluster::EngineDataStateMachine sm(store, timestar::VShardId{vshard});
         const SeriesId128 operationId = SeriesId128::fromHex("abcdef0123456789abcdef0123456789");
         data::DeleteRangeKey command{key, BASE - 1, BASE + 1, operationId};
-        sm.restoreDeleteReceipts({{operationId, 7, data::deleteRangeCommandHash(command)}}, 7);
+        sm.restoreDeleteReceiptState({0, 0, {{operationId, 7, data::deleteRangeCommandHash(command), 0}}}, 7);
 
         sm.apply(writeEntry(8, key, 30.0)).get();
         sm.apply(deleteEntry(9, command)).get();
@@ -191,10 +196,80 @@ TEST_F(EngineDataStateMachineTest, OneBatchReceiptProtectsEveryTargetFromRetry) 
         EXPECT_DOUBLE_EQ(latest(*eng, "delete_batch_a", "value"), 20.0);
         EXPECT_DOUBLE_EQ(latest(*eng, "delete_batch_b", "value"), 21.0);
 
-        const auto receipts = sm.deleteReceiptsThrough(5);
-        ASSERT_EQ(receipts.size(), 1u) << "one VShard batch must consume one durable receipt";
-        EXPECT_EQ(receipts[0].operationId, command.operationId);
-        EXPECT_EQ(receipts[0].commandHash, data::deleteRangeCommandHash(command));
+        const auto receiptState = sm.deleteReceiptStateThrough(5);
+        ASSERT_EQ(receiptState.receipts.size(), 1u) << "one VShard batch must consume one durable receipt";
+        EXPECT_EQ(receiptState.receipts[0].operationId, command.operationId);
+        EXPECT_EQ(receiptState.receipts[0].commandHash, data::deleteRangeCommandHash(command));
+    }).get();
+}
+
+TEST_F(EngineDataStateMachineTest, ReceiptCapacityRetiresOldRetryWithoutDeletingALaterWrite) {
+    seastar::async([] {
+        ScopedShardedEngine eng;
+        eng.start();
+        cluster::EngineLocalStore store(*eng);
+        const std::string first = buildSeriesKey("delete_cap_a", {{"host", "h1"}}, "value");
+        const uint16_t vshard = timestar::virtualShard(SeriesId128::fromSeriesKey(first));
+        const std::string second = keyOnVShard("delete_cap_b", vshard);
+        const std::string third = keyOnVShard("delete_cap_c", vshard);
+        cluster::EngineDataStateMachine sm(store, timestar::VShardId{vshard}, 2);
+        const uint64_t issuedAt = 2 * data::kDeleteReceiptRetentionMs;
+        const auto a = boundedDelete(first, "10000000000000000000000000000001", issuedAt);
+        const auto b = boundedDelete(second, "10000000000000000000000000000002", issuedAt + 1);
+        const auto c = boundedDelete(third, "10000000000000000000000000000003", issuedAt + 2);
+
+        sm.apply(writeEntry(1, first, 10.0)).get();
+        sm.apply(deleteBatchEntry(2, a)).get();
+        sm.apply(writeEntry(3, first, 20.0)).get();
+        sm.apply(deleteBatchEntry(4, b)).get();
+        sm.apply(deleteBatchEntry(5, c)).get();
+
+        const auto state = sm.deleteReceiptStateThrough(5);
+        ASSERT_EQ(state.receipts.size(), 2u);
+        EXPECT_EQ(state.retiredBeforeMs, issuedAt);
+        EXPECT_EQ(state.retiredAtIndex, 5u);
+        EXPECT_EQ(sm.deleteReceiptStatus(a), cluster::EngineDataStateMachine::DeleteReceiptStatus::Expired);
+        EXPECT_THROW(sm.checkDeleteAdmission(a), data::DeleteReceiptExpiredError);
+
+        EXPECT_FALSE(sm.canSnapshotDeleteReceiptStateThrough(4));
+        EXPECT_THROW(sm.deleteReceiptStateThrough(4), std::logic_error)
+            << "after receipt retirement, an older snapshot cannot reconstruct the historical receipt set";
+
+        cluster::EngineDataStateMachine restored(store, timestar::VShardId{vshard}, 2);
+        restored.restoreDeleteReceiptState(state, 5);
+        restored.apply(writeEntry(6, first, 30.0)).get();
+        restored.apply(deleteBatchEntry(7, a)).get();
+        EXPECT_DOUBLE_EQ(latest(*eng, "delete_cap_a", "value"), 30.0)
+            << "an evicted operation ID was physically replayed after its durable floor";
+    }).get();
+}
+
+TEST_F(EngineDataStateMachineTest, ReceiptTimeWindowRetiresOldRetryWithoutDeletingALaterWrite) {
+    seastar::async([] {
+        ScopedShardedEngine eng;
+        eng.start();
+        cluster::EngineLocalStore store(*eng);
+        const std::string first = buildSeriesKey("delete_time_a", {{"host", "h1"}}, "value");
+        const uint16_t vshard = timestar::virtualShard(SeriesId128::fromSeriesKey(first));
+        const std::string second = keyOnVShard("delete_time_b", vshard);
+        cluster::EngineDataStateMachine sm(store, timestar::VShardId{vshard}, 4);
+        const uint64_t issuedAt = 2 * data::kDeleteReceiptRetentionMs;
+        const auto oldDelete = boundedDelete(first, "20000000000000000000000000000001", issuedAt);
+        const auto laterDelete =
+            boundedDelete(second, "20000000000000000000000000000002", issuedAt + data::kDeleteReceiptRetentionMs + 1);
+
+        sm.apply(writeEntry(1, first, 10.0)).get();
+        sm.apply(deleteBatchEntry(2, oldDelete)).get();
+        sm.apply(writeEntry(3, first, 20.0)).get();
+        sm.apply(deleteBatchEntry(4, laterDelete)).get();
+        sm.apply(deleteBatchEntry(5, oldDelete)).get();
+
+        EXPECT_DOUBLE_EQ(latest(*eng, "delete_time_a", "value"), 20.0);
+        const auto state = sm.deleteReceiptStateThrough(4);
+        EXPECT_EQ(state.retiredBeforeMs, issuedAt + 1);
+        EXPECT_EQ(state.retiredAtIndex, 4u);
+        ASSERT_EQ(state.receipts.size(), 1u);
+        EXPECT_EQ(state.receipts[0].operationId, laterDelete.operationId);
     }).get();
 }
 

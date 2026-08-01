@@ -70,21 +70,37 @@ TEST(ReplicatedCommandCodec, DeleteAndRetentionArmsRoundTrip) {
 TEST(ReplicatedCommandCodec, CanonicalDeleteBatchRoundTripsAsOneIdempotentOperation) {
     DeleteRangeBatch batch;
     batch.operationId = SeriesId128::fromHex("fedcba9876543210fedcba9876543210");
+    batch.issuedAtMs = 1'800'000'000'000;
     batch.targets = {{"a value", 10, 20}, {"b value", 30, 40}};
 
     const std::string encoded = encodeReplicatedCommand(ReplicatedCommand{batch});
+    ASSERT_FALSE(encoded.empty());
+    EXPECT_EQ(static_cast<uint8_t>(encoded[0]), 5u);
     EXPECT_EQ(encodedDeleteRangeBatchBytes(batch), encoded.size());
     auto decoded = decodeReplicatedCommand(encoded);
     ASSERT_TRUE(decoded.has_value());
     ASSERT_TRUE(std::holds_alternative<DeleteRangeBatch>(*decoded));
     const auto& back = std::get<DeleteRangeBatch>(*decoded);
     EXPECT_EQ(back.operationId, batch.operationId);
+    EXPECT_EQ(back.issuedAtMs, batch.issuedAtMs);
     EXPECT_EQ(back.targets, batch.targets);
     EXPECT_EQ(deleteRangeCommandHash(back), deleteRangeCommandHash(batch));
 
     auto changed = batch;
     ++changed.targets[1].endTime;
     EXPECT_NE(deleteRangeCommandHash(changed), deleteRangeCommandHash(batch));
+    changed = batch;
+    ++changed.issuedAtMs;
+    EXPECT_NE(deleteRangeCommandHash(changed), deleteRangeCommandHash(batch));
+
+    auto legacy = batch;
+    legacy.issuedAtMs = 0;
+    const auto legacyEncoded = encodeReplicatedCommand(ReplicatedCommand{legacy});
+    ASSERT_FALSE(legacyEncoded.empty());
+    EXPECT_EQ(static_cast<uint8_t>(legacyEncoded[0]), 4u);
+    auto legacyDecoded = decodeReplicatedCommand(legacyEncoded);
+    ASSERT_TRUE(legacyDecoded.has_value());
+    EXPECT_EQ(std::get<DeleteRangeBatch>(*legacyDecoded).issuedAtMs, 0u);
 
     auto unsorted = batch;
     std::swap(unsorted.targets[0], unsorted.targets[1]);

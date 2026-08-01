@@ -56,13 +56,19 @@ struct DeleteRangeTarget {
 struct DeleteRangeBatch {
     std::vector<DeleteRangeTarget> targets;
     SeriesId128 operationId{};
+    // Client-stable Unix epoch milliseconds. Zero identifies the legacy batch
+    // wire form, whose receipt may never be retired safely.
+    uint64_t issuedAtMs = 0;
 };
 
 inline constexpr size_t kMaxDeleteRangeBatchTargets = 10'000;
+inline constexpr size_t kMaxDeleteReceiptsPerVShard = 1'024;
+inline constexpr uint64_t kDeleteReceiptRetentionMs = 60 * 60 * 1'000;
+inline constexpr uint64_t kDeleteReceiptFutureSkewMs = 5 * 60 * 1'000;
 
-inline size_t encodedDeleteRangeBatchBytes(const std::vector<DeleteRangeTarget>& targets) {
-    // tag + operation ID + target count + checksum trailer.
-    size_t bytes = 1 + 16 + 4 + 8;
+inline size_t encodedDeleteRangeBatchBytes(const std::vector<DeleteRangeTarget>& targets, uint64_t issuedAtMs = 0) {
+    // tag + operation ID + optional issuance time + target count + checksum.
+    size_t bytes = 1 + 16 + (issuedAtMs == 0 ? 0 : 8) + 4 + 8;
     for (const auto& target : targets) {
         constexpr size_t framing = 4 + 8 + 8;  // key length + inclusive range
         if (target.seriesKey.size() > SIZE_MAX - framing || bytes > SIZE_MAX - framing - target.seriesKey.size())
@@ -73,7 +79,7 @@ inline size_t encodedDeleteRangeBatchBytes(const std::vector<DeleteRangeTarget>&
 }
 
 inline size_t encodedDeleteRangeBatchBytes(const DeleteRangeBatch& command) {
-    return encodedDeleteRangeBatchBytes(command.targets);
+    return encodedDeleteRangeBatchBytes(command.targets, command.issuedAtMs);
 }
 
 // Stable digest of the exact delete target. Snapshot-persistent operation

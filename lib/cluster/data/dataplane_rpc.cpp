@@ -218,7 +218,7 @@ std::optional<ProposeOutcome> decodeProposeOutcome(const seastar::sstring& s) {
             leader |= static_cast<uint64_t>(static_cast<uint8_t>(s[off + 2 + b])) << (8 * b);
         r.leaderHint = leader;
         const uint8_t kind = static_cast<uint8_t>(s[off + 10]);
-        if (kind > static_cast<uint8_t>(WriteFailure::Fatal))
+        if (kind > static_cast<uint8_t>(WriteFailure::Expired))
             return std::nullopt;
         r.kind = static_cast<WriteFailure>(kind);
         out.rejects.push_back(r);

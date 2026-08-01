@@ -108,6 +108,7 @@ public:
 class RecordingProposeSink : public data::ProposeSink {
 public:
     bool committed = true;
+    data::WriteFailure commandFailure = data::WriteFailure::NotLeader;
     int calls = 0;
     int commandCalls = 0;
     size_t lastSeriesCount = 0;
@@ -128,7 +129,7 @@ public:
         if (committed)
             out.committedVShards = {vshard};
         else
-            out.rejects.push_back(data::SliceReject{vshard, timestar::raft::kNoNode, data::WriteFailure::NotLeader});
+            out.rejects.push_back(data::SliceReject{vshard, timestar::raft::kNoNode, commandFailure});
         return seastar::make_ready_future<data::ProposeOutcome>(std::move(out));
     }
 };
@@ -982,13 +983,25 @@ TEST_F(DataPlaneRpcEnrichedTest, ReplicatedCommandCrossesV3SocketAndRejectsVShar
 
         const std::string key = buildSeriesKey("delete", {{"host", "wire"}}, "value");
         const uint16_t vshard = timestar::virtualShard(SeriesId128::fromSeriesKey(key));
-        const data::ReplicatedCommand command{data::DeleteRangeKey{key, BASE, BASE + 10}};
+        const data::ReplicatedCommand command{
+            data::DeleteRangeBatch{{data::DeleteRangeTarget{key, BASE, BASE + 10}},
+                                   SeriesId128::fromHex("abcdef0123456789abcdef0123456789"),
+                                   1'800'000'000'000}};
         const data::ProposeOutcome out = rpc.proposeCommandHinted(self, vshard, command, std::nullopt).get();
         EXPECT_TRUE(out.committed);
         EXPECT_EQ(out.committedVShards, std::vector<uint16_t>{vshard});
         EXPECT_EQ(sink.commandCalls, 1);
         EXPECT_EQ(sink.lastCommandVShard, vshard);
         EXPECT_EQ(sink.lastCommandBytes, data::encodeReplicatedCommand(command));
+
+        sink.committed = false;
+        sink.commandFailure = data::WriteFailure::Expired;
+        const data::ProposeOutcome expired = rpc.proposeCommandHinted(self, vshard, command, std::nullopt).get();
+        EXPECT_FALSE(expired.committed);
+        ASSERT_EQ(expired.rejects.size(), 1u);
+        EXPECT_EQ(expired.rejects[0].vshard, vshard);
+        EXPECT_EQ(expired.rejects[0].kind, data::WriteFailure::Expired)
+            << "receipt expiry must remain typed across the socket so the coordinator can return HTTP 409";
 
         const uint16_t wrong = static_cast<uint16_t>((vshard + 1) % timestar::VIRTUAL_SHARD_COUNT);
         std::string error;
@@ -998,7 +1011,7 @@ TEST_F(DataPlaneRpcEnrichedTest, ReplicatedCommandCrossesV3SocketAndRejectsVShar
             error = e.what();
         }
         EXPECT_NE(error.find("does not belong to its VShard"), std::string::npos) << error;
-        EXPECT_EQ(sink.commandCalls, 1) << "a spoofed VShard prefix must be rejected before the sink";
+        EXPECT_EQ(sink.commandCalls, 2) << "a spoofed VShard prefix must be rejected before the sink";
 
         rpc.stop().get();
     }).get();
