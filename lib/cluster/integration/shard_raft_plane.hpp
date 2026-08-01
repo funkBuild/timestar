@@ -4,6 +4,7 @@
 #include "../../core/vshard.hpp"           // assignCore
 #include "../../utils/logger.hpp"          // timestar::http_log
 #include "../data/dataplane_rpc.hpp"
+#include "../data/journal_format.hpp"
 #include "../data/leader_filtered_node_store.hpp"
 #include "../data/leadership_balance.hpp"  // the balancer's arithmetic, pure (debt D-22)
 #include "../data/node_store.hpp"
@@ -412,6 +413,8 @@ public:
         size_t transferCap = 0;
         size_t productionLimit = 0;  // sequential snapshots attempted per sweep on this shard
         bool triggerEnabled = false;
+        uint32_t activeClusterFormat = 1;
+        bool snapshotFormatReady = false;
     };
 
     // Journal fsync accounting (debt D-10). `syncRequests / fsyncs` is the
@@ -457,6 +460,8 @@ public:
         c.sweeps = host.snapshotSweeps();
         c.maxEntriesSinceSeen = host.snapshotMaxEntriesSinceSeen();
         c.triggerEnabled = host.snapshotTriggerEnabled();
+        c.activeClusterFormat = data::JournalFormatGate::activeVersion();
+        c.snapshotFormatReady = data::JournalFormatGate::supports(data::kSnapshotV2ActivationVersion);
         c.transfersActive = host.snapshotTransfersActive();
         c.transfersWaiting = host.snapshotTransfersWaiting();
         c.transferCap = ReplicatedVShardHost::snapshotTransferCap();

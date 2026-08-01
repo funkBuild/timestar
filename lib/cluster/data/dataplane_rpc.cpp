@@ -5,12 +5,14 @@
 #include "../reconnect_policy.hpp"
 #include "dataplane_codec.hpp"
 #include "dataplane_limits.hpp"
+#include "journal_format.hpp"
 #include "node_metadata.hpp"
 #include "node_query.hpp"
 #include "pattern_series.hpp"
 #include "replicated_command.hpp"  // firstUnproposableSlice
 #include "write_record.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <functional>
@@ -576,8 +578,7 @@ seastar::future<> DataPlaneRpc::start(seastar::socket_address local, NodeStore& 
         } else if (const auto* batch = std::get_if<DeleteRangeBatch>(&*command)) {
             matches = !batch->targets.empty();
             for (const auto& target : batch->targets)
-                matches = matches &&
-                          timestar::virtualShard(SeriesId128::fromSeriesKey(target.seriesKey)) == vshard;
+                matches = matches && timestar::virtualShard(SeriesId128::fromSeriesKey(target.seriesKey)) == vshard;
         } else if (auto* w = std::get_if<WriteBatch>(&*command)) {
             matches = !w->series.empty();
             for (auto& s : w->series)
@@ -965,7 +966,11 @@ seastar::future<ProposeOutcome> DataPlaneRpc::proposeCommandHinted(NodeId to, ui
     // to a negotiated v1/v2 peer: an unknown RPC verb is not an upgrade policy.
     const uint32_t version = co_await versionFor(to, deadline);
     if (version < kWriteBatchFormatV3)
-        throw std::runtime_error("dataplane: peer wire version does not support replicated commands");
+        throw ClusterFormatUnsupportedError("dataplane: peer wire version does not support replicated commands");
+    const uint32_t requiredFormat = requiredClusterFormatVersion(command);
+    if (requiredFormat >= kBoundedDeleteReceiptActivationVersion && version < kWriteBatchFormatV5)
+        throw ClusterFormatUnsupportedError(
+            "dataplane: peer wire version does not support bounded delete receipts or Expired outcomes");
     auto* conn = impl_->clientFor(to);
     if (!conn)
         throw std::runtime_error("dataplane: unknown peer");
@@ -986,6 +991,11 @@ seastar::future<ProposeOutcome> DataPlaneRpc::proposeCommandHinted(NodeId to, ui
     auto out = decodeProposeOutcome(reply);
     if (!out)
         throw std::runtime_error("dataplane: malformed replicated-command reply");
+    if (version < kWriteBatchFormatV5 &&
+        std::ranges::any_of(
+            out->rejects, [](const SliceReject& reject) { return reject.kind == WriteFailure::Expired; }))
+        throw ClusterFormatUnsupportedError(
+            "dataplane: peer returned an Expired outcome below the protocol version that defines it");
     if (out->committed)
         out->committedVShards = {vshard};
     co_return std::move(*out);

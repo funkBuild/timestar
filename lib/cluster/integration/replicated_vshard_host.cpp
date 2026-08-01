@@ -3,6 +3,8 @@
 #include "../../core/placement_table.hpp"  // virtualShard
 #include "../../core/vshard.hpp"
 #include "../../utils/logger.hpp"  // timestar::http_log
+#include "../data/journal_format.hpp"
+#include "../data/write_errors.hpp"
 #include "../raft/raft_node.hpp"
 
 #include <algorithm>
@@ -286,6 +288,11 @@ seastar::future<bool> ReplicatedVShardHost::propose(uint16_t vshard, data::Repli
     raft::RaftGroup* g = registry_.group(vshard);
     if (!g)
         throw std::runtime_error("ReplicatedVShardHost::propose: VShard not hosted here");
+    const uint32_t requiredFormat = data::requiredClusterFormatVersion(cmd);
+    if (!data::JournalFormatGate::supports(requiredFormat))
+        throw data::ClusterFormatUnsupportedError(
+            "cluster: replicated command requires committed format v" + std::to_string(requiredFormat) +
+            ", but this shard has activated only v" + std::to_string(data::JournalFormatGate::activeVersion()));
     if (const auto* writes = std::get_if<data::WriteBatch>(&cmd))
         co_await store_.checkWriteAdmission(*writes);
     if (const auto* batch = std::get_if<data::DeleteRangeBatch>(&cmd)) {
@@ -347,6 +354,14 @@ seastar::future<uint64_t> ReplicatedVShardHost::snapshotVShard(uint16_t vshard) 
     raft::RaftGroup* g = registry_.group(vshard);
     if (!g)
         co_return 0;  // not hosted here
+    // Every production snapshot carries the deterministic catalog introduced in
+    // payload v2. Refuse before materialising TSM bytes until group 0 has
+    // committed that every voter can read it.
+    if (!data::JournalFormatGate::supports(data::kSnapshotV2ActivationVersion))
+        throw data::ClusterFormatUnsupportedError("cluster: snapshot payload v2 requires committed format v" +
+                                                  std::to_string(data::kSnapshotV2ActivationVersion) +
+                                                  ", but this shard has activated only v" +
+                                                  std::to_string(data::JournalFormatGate::activeVersion()));
     // REFUSE WHILE ANY TARGET-BEARING ROLLED STORE IS STILL AWAITING
     // CONVERSION TO TSM, and capture the active store's first surviving
     // revision in the same reactor turn.
@@ -450,6 +465,11 @@ seastar::future<uint64_t> ReplicatedVShardHost::snapshotVShard(uint16_t vshard) 
         payload.deleteReceiptsRetiredAtIndex = deleteState.retiredAtIndex;
         payload.deleteReceipts = std::move(deleteState.receipts);
     }
+    const uint32_t requiredFormat = data::requiredClusterFormatVersion(payload);
+    if (!data::JournalFormatGate::supports(requiredFormat))
+        throw data::ClusterFormatUnsupportedError(
+            "cluster: snapshot state requires committed format v" + std::to_string(requiredFormat) +
+            ", but this shard has activated only v" + std::to_string(data::JournalFormatGate::activeVersion()));
     // Bind the payload to the exact Raft boundary. The storage builder emits the
     // minimal data fence (highest extent revision); the host may safely promote
     // it across entries whose effects are already represented by the resolved

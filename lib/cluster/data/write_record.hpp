@@ -163,12 +163,19 @@ constexpr uint32_t kWriteBatchFormatV3 = 3;
 // site reads a `kWriteBatchFormat*` spelling.
 constexpr uint32_t kWriteBatchFormatV4 = 4;
 
+// v5 gates the bounded-delete command/reply contract. The WriteBatch bytes are
+// still v2; this number says a peer understands command tag 5 and the typed
+// `Expired` proposal outcome. Snapshot payload v4 uses the same cluster-wide
+// activation through JournalFormatGate because snapshots and Raft entries reach
+// voters outside the pairwise data-plane handshake.
+constexpr uint32_t kWriteBatchFormatV5 = 5;
+
 // The newest version this binary supports. Every place that advertises this node's
 // capability must use THIS, never the literal that happens to be current: naming v2 in
 // ClusterDataPlane after v3 landed capped every negotiation at 2, so no peer spoke the
 // hinted-propose verb and the leader-hint path was dead in production while every test
 // passed (tests construct their own DataPlaneRpc, whose default was already correct).
-constexpr uint32_t kWriteBatchFormatMax = kWriteBatchFormatV4;
+constexpr uint32_t kWriteBatchFormatMax = kWriteBatchFormatV5;
 
 // Wire codec (bounds-checked; decode returns nullopt on ANY malformed/truncated/
 // inconsistent input so a hostile frame can never fabricate a batch). Bounds-checking

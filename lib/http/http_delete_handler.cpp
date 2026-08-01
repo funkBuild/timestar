@@ -533,10 +533,8 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDeleteHandler::handle
             // that raise the body limit.
             std::map<uint16_t, std::vector<timestar::data::DeleteRangeTarget>> grouped;
             for (const auto& command : expanded) {
-                const uint16_t vshard =
-                    timestar::virtualShard(SeriesId128::fromSeriesKey(command.seriesKey));
-                grouped[vshard].push_back(
-                    {command.seriesKey, command.startTime, command.endTime});
+                const uint16_t vshard = timestar::virtualShard(SeriesId128::fromSeriesKey(command.seriesKey));
+                grouped[vshard].push_back({command.seriesKey, command.startTime, command.endTime});
             }
             struct VShardDeleteBatch {
                 std::vector<timestar::data::DeleteRangeTarget> targets;
@@ -597,7 +595,8 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDeleteHandler::handle
                     response.deletedSeriesCount = expanded.size();
                 }
                 response.note =
-                    "seriesDeleted is the number of unique exact targets covered by committed and applied VShard batches";
+                    "seriesDeleted is the number of unique exact targets covered by committed and applied VShard "
+                    "batches";
                 reply->_content = glz::write_json(response).value_or("{}");
             }
             timestar::http::setContentType(*reply, resFmt);
@@ -777,6 +776,12 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDeleteHandler::handle
             reply->_content = timestar::proto::formatDeleteResponse("error", 0, 0, e.what());
         else
             reply->_content = timestar::http::jsonError(e.what(), "DELETE_IDEMPOTENCY_EXPIRED");
+    } catch (const timestar::data::ClusterFormatUnsupportedError& e) {
+        reply->set_status(seastar::http::reply::status_type::conflict);
+        if (timestar::http::isProtobuf(resFmt))
+            reply->_content = timestar::proto::formatDeleteResponse("error", 0, 0, e.what());
+        else
+            reply->_content = timestar::http::jsonError(e.what(), "CLUSTER_FORMAT_NOT_ACTIVE");
     } catch (const timestar::data::AmbiguousMutationError& e) {
         // Do not attach Retry-After: unlike an unambiguous pre-proposal refusal,
         // this command may already be committed. Repeating a range delete after a

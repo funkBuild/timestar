@@ -3,6 +3,7 @@
 #include "../../../lib/cluster/integration/write_admission.hpp"
 
 #include "../../../lib/cluster/data/dataplane_rpc.hpp"
+#include "../../../lib/cluster/data/journal_format.hpp"
 #include "../../../lib/cluster/data/write_errors.hpp"
 #include "../../../lib/cluster/data/write_record.hpp"
 #include "../../../lib/cluster/integration/cluster_data_plane.hpp"
@@ -69,6 +70,8 @@ TEST(WriteFailureTaxonomyTest, LocalClassificationIsConservative) {
     EXPECT_EQ(cls(std::make_exception_ptr(data::UnassignedVShardError("none"))), WriteFailure::Unassigned);
     EXPECT_EQ(cls(std::make_exception_ptr(data::WriteFrameTooLargeError("big"))), WriteFailure::Fatal);
     EXPECT_EQ(cls(std::make_exception_ptr(data::DeleteReceiptExpiredError("old"))), WriteFailure::Expired);
+    EXPECT_EQ(cls(std::make_exception_ptr(data::ClusterFormatUnsupportedError("upgrade required"))),
+              WriteFailure::Fatal);
     EXPECT_EQ(cls(std::make_exception_ptr(data::ShardStoppingError("shard data plane is stopping"))),
               WriteFailure::ShardStopping);
     // Matched by TYPE now, not by message. A plain runtime_error wearing the same words is
@@ -91,6 +94,7 @@ TEST(WriteFailureTaxonomyTest, RemoteClassificationTreatsPeerErrorsAsAvailabilit
     EXPECT_EQ(cls(std::make_exception_ptr(std::runtime_error("dataplane: unknown peer"))), WriteFailure::Transport);
     EXPECT_EQ(cls(std::make_exception_ptr(data::WriteFrameTooLargeError("big"))), WriteFailure::Fatal);
     EXPECT_EQ(cls(std::make_exception_ptr(data::UnassignedVShardError("none"))), WriteFailure::Unassigned);
+    EXPECT_EQ(cls(std::make_exception_ptr(data::ClusterFormatUnsupportedError("old peer"))), WriteFailure::Fatal);
 }
 
 // The in-flight bound admits, charges, releases, and REJECTS rather than queueing.
@@ -249,6 +253,8 @@ TEST(WriteAdmissionTest, EveryAdvertiserOffersTheNewestSupportedWireVersion) {
     // it, which is the opposite of what a gate is for (see the next test).
     EXPECT_GE(data::kWriteBatchFormatMax, data::kWriteBatchFormatV3) << "the hinted-propose gate";
     EXPECT_GE(data::kWriteBatchFormatMax, data::kNodeQueryResolveMinVersion) << "the leader-resolve read gate (D-25)";
+    EXPECT_GE(data::kWriteBatchFormatMax, data::kBoundedDeleteReceiptActivationVersion)
+        << "the bounded-delete command and Expired-outcome gate";
 }
 
 // A CAPABILITY GATE IS A HISTORICAL FACT AND MUST NOT MOVE (debt D-25).

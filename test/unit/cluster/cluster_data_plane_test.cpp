@@ -37,6 +37,8 @@ TEST_F(ClusterDataPlaneTest, ClusterReadinessFailsClosedOnCurrentServingBlockers
     st.replicated = true;
     st.vshardsHostedHere = 10;
     st.snapshotTriggerEnabled = true;
+    st.activeClusterFormat = data::kSnapshotV2ActivationVersion;
+    st.snapshotFormatReady = true;
     EXPECT_TRUE(st.readyForTraffic());
 
     st.unresolvedPeerCount = 1;
@@ -68,6 +70,13 @@ TEST_F(ClusterDataPlaneTest, ClusterReadinessFailsClosedOnCurrentServingBlockers
     EXPECT_FALSE(st.readyForTraffic());
     EXPECT_NE(st.readinessReason().find("snapshot"), std::string::npos);
     st.snapshotTriggerEnabled = true;
+
+    st.activeClusterFormat = 1;
+    st.snapshotFormatReady = false;
+    EXPECT_FALSE(st.readyForTraffic());
+    EXPECT_NE(st.readinessReason().find("below snapshot requirement v2"), std::string::npos);
+    st.activeClusterFormat = data::kSnapshotV2ActivationVersion;
+    st.snapshotFormatReady = true;
 
     st.snapshotsRefusedTooLarge = 1;
     EXPECT_FALSE(st.readyForTraffic());

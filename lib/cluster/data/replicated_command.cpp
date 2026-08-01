@@ -89,6 +89,14 @@ bool validDeleteRangeTargets(const std::vector<DeleteRangeTarget>& targets) {
 
 }  // namespace
 
+uint32_t requiredClusterFormatVersion(const ReplicatedCommand& cmd) {
+    if (const auto* d = std::get_if<DeleteRangeKey>(&cmd))
+        return d->operationId == SeriesId128{} ? 1 : kDeleteReceiptActivationVersion;
+    if (const auto* batch = std::get_if<DeleteRangeBatch>(&cmd))
+        return batch->issuedAtMs == 0 ? kDeleteReceiptActivationVersion : kBoundedDeleteReceiptActivationVersion;
+    return 1;
+}
+
 std::string encodeWriteCommand(const WriteBatch& batch) {
     std::string out;
     out.push_back(static_cast<char>(kWrite));

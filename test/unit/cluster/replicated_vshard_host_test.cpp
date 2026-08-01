@@ -6,6 +6,7 @@
 // in engine_rf3_test).
 #include "../../../lib/cluster/integration/replicated_vshard_host.hpp"
 
+#include "../../../lib/cluster/data/journal_format.hpp"
 #include "../../../lib/cluster/data/snapshot_payload.hpp"
 #include "../../../lib/cluster/integration/replica_engine_reader.hpp"
 #include "../../../lib/cluster/raft/raft_journal_persistence.hpp"
@@ -47,8 +48,15 @@ constexpr uint64_t BASE = 1'700'000'000'000'000'000ULL;
 
 class ReplicatedVShardHostTest : public ::testing::Test {
 protected:
-    void SetUp() override { cleanTestShardDirectories(); }
-    void TearDown() override { cleanTestShardDirectories(); }
+    void SetUp() override {
+        cleanTestShardDirectories();
+        data::JournalFormatGate::resetForTesting();
+        data::JournalFormatGate::activate(data::kBoundedDeleteReceiptActivationVersion);
+    }
+    void TearDown() override {
+        data::JournalFormatGate::resetForTesting();
+        cleanTestShardDirectories();
+    }
 };
 
 fs::path tmpDir() {
@@ -542,6 +550,56 @@ size_t tsmFileCount(ScopedShardedEngine& eng) {
     return (*eng).invoke_on(0u, [](Engine& e) { return e.getTSMFileCount(); }).get();
 }
 }  // namespace
+
+TEST_F(ReplicatedVShardHostTest, NewJournalAndSnapshotFormatsWaitForCommittedActivation) {
+    seastar::async([] {
+        if (!timestar::vshardsCohesiveOnCores(seastar::smp::count))
+            GTEST_SKIP() << "core count is not VShard-cohesive";
+        data::JournalFormatGate::resetForTesting();
+
+        ScopedShardedEngine eng;
+        eng.start();
+        cluster::EngineLocalStore store(*eng);
+        NoopTransport transport;
+        fs::path jroot = tmpDir();
+        cluster::ReplicatedVShardHost host(store, transport, 1, jroot);
+        RaftOptions opts;
+        opts.electionTimeoutMin = opts.electionTimeoutMax = 1;
+        opts.heartbeatTimeout = 1;
+
+        const auto series = core0Series("format_gate");
+        host.addVShard(series.vshard, {1}, opts).get();
+        RaftGroup* group = host.group(series.vshard);
+        for (int i = 0; i < 10 && !group->isLeader(); ++i)
+            group->tick().get();
+        ASSERT_TRUE(group->isLeader());
+
+        EXPECT_THROW(host.snapshotVShard(series.vshard).get(), data::ClusterFormatUnsupportedError)
+            << "payload v2 must not be emitted while the committed gate is still v1";
+
+        data::JournalFormatGate::activate(data::kSnapshotV2ActivationVersion);
+        EXPECT_GT(host.snapshotVShard(series.vshard).get(), 0u)
+            << "the same data-free applied prefix becomes snapshot-safe after v2 activation";
+
+        const data::DeleteRangeBatch bounded{{{series.key, BASE, BASE}},
+                                             SeriesId128::fromHex("70000000000000000000000000000001"),
+                                             2 * data::kDeleteReceiptRetentionMs};
+        EXPECT_THROW(host.propose(series.vshard, data::ReplicatedCommand{bounded}).get(),
+                     data::ClusterFormatUnsupportedError)
+            << "command tag 5 must not enter Raft under only the v2 activation";
+
+        data::JournalFormatGate::activate(data::kBoundedDeleteReceiptActivationVersion);
+        auto proposed = host.propose(series.vshard, data::ReplicatedCommand{bounded});
+        for (int i = 0; i < 40 && !proposed.available(); ++i)
+            group->tick().get();
+        EXPECT_TRUE(proposed.get());
+        EXPECT_GT(host.snapshotVShard(series.vshard).get(), 0u)
+            << "payload v4 becomes safe only with the same activation as bounded receipt commands";
+
+        host.stop().get();
+        fs::remove_all(jroot);
+    }).get();
+}
 
 TEST_F(ReplicatedVShardHostTest, TheTriggerSnapshotsOnlyOnceAThresholdIsCrossed) {
     seastar::async([] {

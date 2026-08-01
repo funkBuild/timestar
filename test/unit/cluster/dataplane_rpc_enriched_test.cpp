@@ -1046,6 +1046,31 @@ TEST_F(DataPlaneRpcEnrichedTest, ReplicatedCommandIsNotSentToAPeerBelowV3) {
     }).get();
 }
 
+TEST_F(DataPlaneRpcEnrichedTest, BoundedDeleteIsNotSentToAPeerBelowV5) {
+    seastar::async([] {
+        const uint16_t serverPort = 39382, clientPort = 39383;
+        const data::NodeId server = 2;
+        WireTapPeer tap(loopback(serverPort), /*agreedVersion=*/4);
+        ThrowingNodeStore store;
+        data::DataPlaneRpc client;
+        client.start(loopback(clientPort), store).get();
+        client.addPeer(server, loopback(serverPort));
+
+        const std::string key = buildSeriesKey("delete", {{"host", "v4-peer"}}, "value");
+        const uint16_t vshard = timestar::virtualShard(SeriesId128::fromSeriesKey(key));
+        const data::ReplicatedCommand command{
+            data::DeleteRangeBatch{{data::DeleteRangeTarget{key, BASE, BASE + 10}},
+                                   SeriesId128::fromHex("abcdef0123456789abcdef0123456789"),
+                                   1'800'000'000'000}};
+        EXPECT_THROW(client.proposeCommandHinted(server, vshard, command, std::nullopt).get(),
+                     data::ClusterFormatUnsupportedError);
+        EXPECT_EQ(tap.negotiateCalls, 1);
+
+        client.stop().get();
+        tap.stop();
+    }).get();
+}
+
 // A peer that predates v3 keeps getting the v1-shaped verb, with hintless rejects --
 // a rolling upgrade must not turn a clean not-leader into a malformed-reply 5xx.
 TEST_F(DataPlaneRpcEnrichedTest, HintedProposeFallsBackForAPeerBelowV3) {

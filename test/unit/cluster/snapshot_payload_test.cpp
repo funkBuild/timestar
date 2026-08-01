@@ -4,6 +4,7 @@
 // checksum / a corrupt inner manifest.
 #include "../../../lib/cluster/data/snapshot_payload.hpp"
 
+#include "../../../lib/cluster/data/journal_format.hpp"
 #include "../../../lib/storage/series_catalog.hpp"
 
 #include <gtest/gtest.h>
@@ -36,6 +37,24 @@ void addValidCatalog(SnapshotPayload& payload) {
     payload.manifest.catalogHash = timestar::SeriesCatalog::snapshotHash(payload.catalog);
 }
 }  // namespace
+
+TEST(SnapshotPayloadCodec, PayloadVersionsNameTheirCommittedFormatRequirements) {
+    SnapshotPayload payload;
+    payload.manifest = validManifest();
+    EXPECT_EQ(requiredClusterFormatVersion(payload), 1u);
+
+    addValidCatalog(payload);
+    EXPECT_EQ(requiredClusterFormatVersion(payload), kSnapshotV2ActivationVersion);
+
+    payload.deleteReceipts = {
+        {SeriesId128::fromHex("11111111111111111111111111111111"), 12, 0x1234},
+    };
+    EXPECT_EQ(requiredClusterFormatVersion(payload), kDeleteReceiptActivationVersion);
+
+    payload.deleteReceiptsRetiredBeforeMs = 1'000;
+    payload.deleteReceiptsRetiredAtIndex = 50;
+    EXPECT_EQ(requiredClusterFormatVersion(payload), kBoundedDeleteReceiptActivationVersion);
+}
 
 TEST(SnapshotPayloadCodec, RoundTripsManifestAndFiles) {
     SnapshotPayload p;

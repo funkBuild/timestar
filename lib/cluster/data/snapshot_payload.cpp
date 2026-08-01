@@ -1,6 +1,7 @@
 #include "snapshot_payload.hpp"
 
 #include "../../storage/series_catalog.hpp"
+#include "journal_format.hpp"
 #include "replicated_command.hpp"
 
 #include <algorithm>
@@ -8,6 +9,16 @@
 #include <stdexcept>
 
 namespace timestar::data {
+
+uint32_t requiredClusterFormatVersion(const SnapshotPayload& payload) {
+    if (payload.deleteReceiptsRetiredBeforeMs != 0 || payload.deleteReceiptsRetiredAtIndex != 0)
+        return kBoundedDeleteReceiptActivationVersion;
+    if (!payload.deleteReceipts.empty())
+        return kDeleteReceiptActivationVersion;
+    if (!payload.catalog.empty())
+        return kSnapshotV2ActivationVersion;
+    return 1;
+}
 
 namespace {
 

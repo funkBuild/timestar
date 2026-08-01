@@ -328,6 +328,15 @@ public:
     explicit DeleteReceiptExpiredError(const std::string& what) : std::runtime_error(what) {}
 };
 
+// A command/snapshot feature is newer than either the cluster-wide committed
+// format or the destination peer's negotiated protocol. This is a terminal,
+// pre-emission refusal: retrying another leader cannot make mixed-version bytes
+// safe. The HTTP layer reports an explicit upgrade/activation conflict.
+class ClusterFormatUnsupportedError : public std::runtime_error {
+public:
+    explicit ClusterFormatUnsupportedError(const std::string& what) : std::runtime_error(what) {}
+};
+
 // ---------------------------------------------------------------------------
 // Classify an exception raised by a LOCAL propose (same process, so the cause is
 // knowable). Anything not explicitly recognised is Fatal: a retry budget must never be
@@ -352,6 +361,8 @@ inline WriteFailure classifyLocalWriteFailure(const std::exception_ptr& e) {
         return WriteFailure::Fatal;
     } catch (const DeleteReceiptExpiredError&) {
         return WriteFailure::Expired;
+    } catch (const ClusterFormatUnsupportedError&) {
+        return WriteFailure::Fatal;
     } catch (const UnassignedVShardError&) {
         return WriteFailure::Unassigned;
     } catch (...) {
@@ -373,6 +384,8 @@ inline WriteFailure classifyRemoteWriteFailure(const std::exception_ptr& e) {
         return WriteFailure::Fatal;  // our own frame is too big; a different peer will refuse it too
     } catch (const UnassignedVShardError&) {
         return WriteFailure::Unassigned;
+    } catch (const ClusterFormatUnsupportedError&) {
+        return WriteFailure::Fatal;  // client-side negotiation refusal; no frame was sent
     } catch (...) {
         return WriteFailure::Transport;
     }

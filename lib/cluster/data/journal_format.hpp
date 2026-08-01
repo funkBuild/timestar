@@ -61,6 +61,19 @@ namespace timestar::data {
 // journal codec is one participant), while write_record's counts payload layouts.
 constexpr uint32_t kJournalV2ActivationVersion = 2;
 
+// Later committed-format activations cover the whole durable/protocol feature,
+// not just WriteBatch compression:
+//
+//   v2: self-contained snapshot payload v2 (catalog + resolved data object)
+//   v3: durable legacy delete receipts (command tags 3/4 + snapshot payload v3)
+//   v5: bounded delete receipts (command tag 5 + snapshot payload v4) and the
+//       pairwise `Expired` proposal outcome. Version 4 was already consumed by
+//       the node-query redirect protocol, so one ordered capability line moves
+//       the bounded-delete feature to 5 rather than reusing 4 ambiguously.
+constexpr uint32_t kSnapshotV2ActivationVersion = 2;
+constexpr uint32_t kDeleteReceiptActivationVersion = 3;
+constexpr uint32_t kBoundedDeleteReceiptActivationVersion = 5;
+
 // Per-shard, because a Seastar shard is a thread and this is read on the write hot path:
 // one thread_local load beats any synchronization. An activation is pushed to every shard
 // with `invoke_on_all`, so the shards agree within one hop -- and a shard that has not yet
@@ -87,6 +100,10 @@ public:
 
     // The group-0 format version this shard believes is active (1 == nothing activated).
     static uint32_t activeVersion() { return mutableActiveVersion(); }
+
+    // May this shard emit durable/wire state introduced at `requiredVersion`?
+    // Decoders remain unconditional; this governs emission only.
+    static bool supports(uint32_t requiredVersion) { return activeVersion() >= requiredVersion; }
 
     // Tests only: drop back to the fail-closed default. Deliberately NOT named `activate`
     // or reachable from configuration -- nothing in production may lower the gate.

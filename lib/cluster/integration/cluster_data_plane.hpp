@@ -5,6 +5,7 @@
 #include "../../http/http_query_handler.hpp"  // HttpQueryHandler, QueryResponse
 #include "../data/dataplane_limits.hpp"       // kMaxOutboundFrameBytes (the D-31 assertions below)
 #include "../data/dataplane_rpc.hpp"
+#include "../data/journal_format.hpp"
 #include "../data/node_query_coordinator.hpp"
 #include "../data/node_write_router.hpp"
 #include "../data/replicated_command.hpp"  // kWriteCommandFramingBytes
@@ -274,6 +275,11 @@ public:
         uint64_t snapshotTransfersAbandoned = 0;
         size_t snapshotProductionLimitPerShard = 0;
         bool snapshotTriggerEnabled = false;
+        // The minimum committed format observed across local reactor shards. Snapshot
+        // payload v2 is the first self-contained production format; a running timer
+        // cannot make progress while its emission gate remains below this version.
+        uint32_t activeClusterFormat = 1;
+        bool snapshotFormatReady = false;
         // Raft journal fsync accounting (debt D-10). journalSyncRequests /
         // journalFsyncs is the coalescing factor -- 1.0 for the default per-VShard
         // journal, > 1 when the shared per-shard journal is enabled.
@@ -291,7 +297,7 @@ public:
             if (!replicated)
                 return true;
             return vshardsHostedHere != 0 && vshardsLeaderless == 0 && applyLagEntries == 0 && applyFailures == 0 &&
-                   tickErrors == 0 && snapshotTriggerEnabled && snapshotsRefusedTooLarge == 0 &&
+                   tickErrors == 0 && snapshotTriggerEnabled && snapshotFormatReady && snapshotsRefusedTooLarge == 0 &&
                    snapshotsUndeliverable == 0;
         }
 
@@ -312,6 +318,9 @@ public:
                 return std::to_string(applyLagEntries) + " committed Raft entrie(s) are not applied";
             if (!snapshotTriggerEnabled)
                 return "Raft snapshot production is disabled";
+            if (!snapshotFormatReady)
+                return "committed cluster format v" + std::to_string(activeClusterFormat) +
+                       " is below snapshot requirement v" + std::to_string(data::kSnapshotV2ActivationVersion);
             if (snapshotsRefusedTooLarge != 0)
                 return std::to_string(snapshotsRefusedTooLarge) +
                        " VShard snapshot(s) exceeded the safe in-memory size bound";

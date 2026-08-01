@@ -65,6 +65,11 @@ struct SnapshotPayload {
     std::vector<SnapshotFile> files;  // one per manifest.dataExtents entry, same order
 };
 
+// Cluster-wide committed format required before this payload may be installed
+// as a Raft snapshot. The decoder remains able to read every historical version;
+// this helper gates emission only.
+uint32_t requiredClusterFormatVersion(const SnapshotPayload& payload);
+
 // FNV-trailer-checksummed, bounds-checked codec (the manifest carries its own CRC in
 // its encode()); decode returns nullopt on ANY malformed/truncated/checksum-mismatch,
 // so a corrupt snapshot can never be installed as valid state.

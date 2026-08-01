@@ -4,13 +4,16 @@
 #include "../../utils/line_parser.hpp"
 #include "../../utils/logger.hpp"  // timestar::http_log
 #include "../../utils/series_key.hpp"
+#include "../data/journal_format.hpp"
 #include "../data/read_routing.hpp"
+#include "../data/write_errors.hpp"
 #include "checkquorum_policy.hpp"
 #include "write_admission.hpp"
 
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include <limits>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/sleep.hh>
 #include <seastar/net/dns.hh>
@@ -1199,6 +1202,8 @@ seastar::future<ClusterDataPlane::Status> ClusterDataPlane::status() const {
     // Readiness requires the trigger on EVERY shard. Starting false and OR-ing
     // masked a dead snapshot loop on N-1 shards as long as one shard remained live.
     st.snapshotTriggerEnabled = true;
+    st.snapshotFormatReady = true;
+    st.activeClusterFormat = std::numeric_limits<uint32_t>::max();
     for (unsigned sh = 0; sh < seastar::smp::count; ++sh) {
         auto c = co_await shards.invoke_on(sh, [self, peers](ShardRaftPlane& p) { return p.counts(self, peers); });
         st.vshardsHostedHere += c.hosted;
@@ -1225,6 +1230,8 @@ seastar::future<ClusterDataPlane::Status> ClusterDataPlane::status() const {
         st.snapshotTransfersAbandoned += sc.transfersAbandoned;
         st.snapshotProductionLimitPerShard = std::max(st.snapshotProductionLimitPerShard, sc.productionLimit);
         st.snapshotTriggerEnabled = st.snapshotTriggerEnabled && sc.triggerEnabled;
+        st.snapshotFormatReady = st.snapshotFormatReady && sc.snapshotFormatReady;
+        st.activeClusterFormat = std::min(st.activeClusterFormat, sc.activeClusterFormat);
         auto jc = co_await shards.invoke_on(sh, [](ShardRaftPlane& p) { return p.journalCounts(); });
         st.journalFsyncs += jc.fsyncs;
         st.journalSyncRequests += jc.syncRequests;
@@ -1234,6 +1241,8 @@ seastar::future<ClusterDataPlane::Status> ClusterDataPlane::status() const {
         st.journalGcPasses += jc.gcPasses;
         st.journalShared = st.journalShared || jc.shared;
     }
+    if (st.activeClusterFormat == std::numeric_limits<uint32_t>::max())
+        st.activeClusterFormat = 1;
     co_return st;
 }
 
@@ -1301,6 +1310,11 @@ seastar::future<> ClusterDataPlane::deleteRangesFromShard(std::vector<data::Dele
         throw std::invalid_argument("ClusterDataPlane::deleteRangesFromShard requires a non-zero operation ID");
     if (issuedAtMs == 0)
         throw std::invalid_argument("ClusterDataPlane::deleteRangesFromShard requires an issuance timestamp");
+    if (!data::JournalFormatGate::supports(data::kBoundedDeleteReceiptActivationVersion))
+        throw data::ClusterFormatUnsupportedError("bounded replicated deletes require committed cluster format v" +
+                                                  std::to_string(data::kBoundedDeleteReceiptActivationVersion) +
+                                                  ", but this shard has activated only v" +
+                                                  std::to_string(data::JournalFormatGate::activeVersion()));
     if (targets.empty() || targets.size() > data::kMaxDeleteRangeBatchTargets)
         throw std::invalid_argument("ClusterDataPlane::deleteRangesFromShard requires a bounded non-empty batch");
     const uint16_t vshard = timestar::virtualShard(SeriesId128::fromSeriesKey(targets.front().seriesKey));

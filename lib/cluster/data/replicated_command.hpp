@@ -98,6 +98,11 @@ struct RetentionCutoffCmd {
 
 using ReplicatedCommand = std::variant<WriteBatch, DeleteRangeKey, DeleteRangeBatch, RetentionCutoffCmd>;
 
+// Cluster-wide committed format needed before this command may become a Raft
+// entry. Decoding is intentionally unconditional for replay/upgrade. Emission is
+// checked by ReplicatedVShardHost, the one production owner of data-group logs.
+uint32_t requiredClusterFormatVersion(const ReplicatedCommand& cmd);
+
 // Self-delimiting, trailer-checksummed wire form (a 1-byte kind tag + the payload,
 // the WriteBatch arm reusing the tested encodeWriteBatch). decode returns nullopt on
 // ANY malformed/truncated/checksum-mismatched input so a corrupt frame can never

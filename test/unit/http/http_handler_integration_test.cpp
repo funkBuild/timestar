@@ -1592,8 +1592,7 @@ TEST_F(HttpHandlerIntegrationTest, PartitionedRf3PartialMultiTargetFailureIsSafe
         unsigned committed = 0;
         HttpDeleteHandler::clusterDeleteHook = [&](std::vector<timestar::data::DeleteRangeTarget> targets, SeriesId128,
                                                    uint64_t) {
-            if (std::ranges::any_of(targets,
-                                    [](const auto& target) { return target.seriesKey.starts_with("bad "); })) {
+            if (std::ranges::any_of(targets, [](const auto& target) { return target.seriesKey.starts_with("bad "); })) {
                 return seastar::sleep(std::chrono::milliseconds(2)).then([] {
                     return seastar::make_exception_future<>(
                         timestar::data::RetryableWriteError("one target refused before proposal"));
@@ -1657,6 +1656,30 @@ TEST_F(HttpHandlerIntegrationTest, PartitionedRf3ReportsRetiredDeleteIdentityAsC
         EXPECT_EQ(reply->_status, seastar::http::reply::status_type::conflict);
         EXPECT_EQ(reply->_headers["X-TimeStar-Idempotency-Window"], "expired");
         EXPECT_NE(reply->_content.find("DELETE_IDEMPOTENCY_EXPIRED"), std::string::npos);
+    })
+        .join()
+        .get();
+}
+
+TEST_F(HttpHandlerIntegrationTest, PartitionedRf3ReportsInactiveClusterFormatAsConflict) {
+    seastar::thread([] {
+        struct ResetHook {
+            ~ResetHook() { HttpDeleteHandler::clusterDeleteHook = {}; }
+        } reset;
+        ScopedShardedEngine eng;
+        eng.start();
+        HttpDeleteHandler::clusterDeleteHook = [](std::vector<timestar::data::DeleteRangeTarget>, SeriesId128,
+                                                  uint64_t) {
+            return seastar::make_exception_future<>(timestar::data::ClusterFormatUnsupportedError(
+                "bounded replicated deletes require committed cluster format v5"));
+        };
+
+        HttpDeleteHandler handler(&eng.eng, true);
+        auto reply = handler.handleDelete(makeDeleteRequest(R"({"series":"m value","startTime":0,"endTime":1})")).get();
+        EXPECT_EQ(reply->_status, seastar::http::reply::status_type::conflict);
+        EXPECT_NE(reply->_content.find("CLUSTER_FORMAT_NOT_ACTIVE"), std::string::npos);
+        EXPECT_NE(reply->_content.find("format v5"), std::string::npos);
+        EXPECT_EQ(reply->_headers.count("Retry-After"), 0u);
     })
         .join()
         .get();

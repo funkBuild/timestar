@@ -217,7 +217,10 @@ void set_routes(routes& r) {
                       // rising is how an operator sees compaction running at all; the chunk
                       // and install counters are the ONLY way to tell a snapshot-based
                       // catch-up from an append-based one.
-                      body += ",\"snapshot_trigger\":" + std::string(st.snapshotTriggerEnabled ? "true" : "false") +
+                      body += ",\"active_cluster_format\":" + std::to_string(st.activeClusterFormat) +
+                              ",\"snapshot_format_ready\":" +
+                              std::string(st.snapshotFormatReady ? "true" : "false") +
+                              ",\"snapshot_trigger\":" + std::string(st.snapshotTriggerEnabled ? "true" : "false") +
                               ",\"snapshots_taken\":" + std::to_string(st.snapshotsTaken) +
                               ",\"snapshots_refused_too_large\":" + std::to_string(st.snapshotsRefusedTooLarge) +
                               ",\"snapshots_skipped_unflushed\":" + std::to_string(st.snapshotsSkippedUnflushed) +

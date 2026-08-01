@@ -293,6 +293,12 @@ seastar::future<> testFormatActivationGatedByVoterSupport() {
         4, {timestar::features::VersionRange{1, 4}, timestar::features::VersionRange{1, 2}}));
     co_await router.pump();
     EXPECT_EQ(nodes[1].sm->state().activeFormatVersion, 3u) << "one lagging voter blocks activation";
+
+    // Once every voter advertises v5, the same committed mechanism activates
+    // bounded delete commands, payload v4, and the Expired reply contract.
+    EXPECT_TRUE(co_await controller.activateFormat(5, {timestar::features::VersionRange{1, 5}}));
+    co_await router.pump();
+    EXPECT_EQ(nodes[1].sm->state().activeFormatVersion, 5u);
 }
 
 }  // namespace

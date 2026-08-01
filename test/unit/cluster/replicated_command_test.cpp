@@ -116,6 +116,19 @@ TEST(ReplicatedCommandCodec, CanonicalDeleteBatchRoundTripsAsOneIdempotentOperat
         EXPECT_FALSE(decodeReplicatedCommand(encoded.substr(0, n)).has_value()) << "prefix " << n;
 }
 
+TEST(ReplicatedCommandCodec, NewDurableDeleteFormsNameTheirCommittedFormatRequirements) {
+    const auto id = SeriesId128::fromHex("fedcba9876543210fedcba9876543210");
+    EXPECT_EQ(requiredClusterFormatVersion(ReplicatedCommand{DeleteRangeKey{"key", 1, 2}}), 1u);
+    EXPECT_EQ(requiredClusterFormatVersion(ReplicatedCommand{DeleteRangeKey{"key", 1, 2, id}}),
+              kDeleteReceiptActivationVersion);
+
+    DeleteRangeBatch legacy{{{"key", 1, 2}}, id, 0};
+    EXPECT_EQ(requiredClusterFormatVersion(ReplicatedCommand{legacy}), kDeleteReceiptActivationVersion);
+    legacy.issuedAtMs = 1'800'000'000'000;
+    EXPECT_EQ(requiredClusterFormatVersion(ReplicatedCommand{legacy}), kBoundedDeleteReceiptActivationVersion);
+    EXPECT_EQ(requiredClusterFormatVersion(ReplicatedCommand{RetentionCutoffCmd{3}}), 1u);
+}
+
 TEST(ReplicatedCommandCodec, TruncationAndCorruptionRejected) {
     WriteBatch b;
     b.series = {floatSeries()};
