@@ -1,6 +1,8 @@
 #include "../../../lib/core/placement_table.hpp"
 #include "../../../lib/core/series_id.hpp"
 #include "../../../lib/index/native/native_index.hpp"
+#include "../../../lib/storage/tsm.hpp"
+#include "../../../lib/utils/series_key.hpp"
 
 #include <gtest/gtest.h>
 
@@ -112,4 +114,100 @@ seastar::future<> testBoundedVShardPatternExpansion() {
 
 TEST_F(NativeIndexVShardExtractTest, PatternExpansionIsVShardScopedFilteredAndBounded) {
     testBoundedVShardPatternExpansion().get();
+}
+
+seastar::future<> testReplaceVShardCatalogRemovesObsoleteDiscoveryState() {
+    const std::map<std::string, std::string> keepTags{{"env", "prod"}, {"host", "keep"}};
+    const std::string keepKey = timestar::buildSeriesKey("cpu", keepTags, "usage");
+    const SeriesId128 keepId = SeriesId128::fromSeriesKey(keepKey);
+    const uint16_t target = timestar::virtualShard(keepId);
+
+    std::map<std::string, std::string> dropTags;
+    SeriesId128 dropId;
+    for (unsigned i = 0; i < 100'000; ++i) {
+        dropTags = {{"env", "prod"}, {"host", "drop" + std::to_string(i)}, {"retired", "yes"}};
+        dropId = SeriesId128::fromSeriesKey(timestar::buildSeriesKey("cpu", dropTags, "usage"));
+        if (timestar::virtualShard(dropId) == target)
+            break;
+    }
+    EXPECT_EQ(timestar::virtualShard(dropId), target);
+    if (timestar::virtualShard(dropId) != target)
+        co_return;
+
+    std::map<std::string, std::string> foreignTags;
+    SeriesId128 foreignId;
+    for (unsigned i = 0; i < 100'000; ++i) {
+        foreignTags = {{"env", "prod"}, {"host", "foreign" + std::to_string(i)}};
+        foreignId = SeriesId128::fromSeriesKey(timestar::buildSeriesKey("cpu", foreignTags, "usage"));
+        if (timestar::virtualShard(foreignId) != target)
+            break;
+    }
+    EXPECT_NE(timestar::virtualShard(foreignId), target);
+    if (timestar::virtualShard(foreignId) == target)
+        co_return;
+
+    auto assertReplacement = [&](timestar::index::NativeIndex& index) -> seastar::future<> {
+        auto targetRows = co_await index.extractVShardSeriesMetadata(target);
+        EXPECT_EQ(targetRows.size(), 1u);
+        if (targetRows.size() == 1)
+            EXPECT_EQ(targetRows.front().first, keepId);
+        EXPECT_TRUE((co_await index.getSeriesId("cpu", keepTags, "usage")).has_value());
+        EXPECT_FALSE((co_await index.getSeriesId("cpu", dropTags, "usage")).has_value());
+        EXPECT_FALSE((co_await index.getSeriesValueType(dropId)).has_value());
+
+        auto all = co_await index.findSeries("cpu");
+        EXPECT_TRUE(all.has_value());
+        if (all.has_value())
+            EXPECT_EQ(std::set<SeriesId128>(all->begin(), all->end()),
+                      (std::set<SeriesId128>{keepId, foreignId}));
+
+        auto sharedTag = co_await index.findSeries("cpu", {{"env", "prod"}});
+        EXPECT_TRUE(sharedTag.has_value());
+        if (sharedTag.has_value())
+            EXPECT_EQ(std::set<SeriesId128>(sharedTag->begin(), sharedTag->end()),
+                      (std::set<SeriesId128>{keepId, foreignId}));
+
+        auto emptiedTag = co_await index.findSeries("cpu", {{"retired", "yes"}});
+        EXPECT_TRUE(emptiedTag.has_value());
+        if (emptiedTag.has_value())
+            EXPECT_TRUE(emptiedTag->empty()) << "an emptied postings row must be deleted durably, not left stale";
+        co_return;
+    };
+
+    {
+        timestar::index::NativeIndex index(timestar::StorageLayout("."), 0);
+        co_await index.open();
+        EXPECT_EQ(co_await index.getOrCreateSeriesId(keepId, "cpu", keepTags, "usage"), keepId);
+        EXPECT_EQ(co_await index.getOrCreateSeriesId(dropId, "cpu", dropTags, "usage"), dropId);
+        EXPECT_EQ(co_await index.getOrCreateSeriesId(foreignId, "cpu", foreignTags, "usage"), foreignId);
+        co_await index.putSeriesValueType(keepId, TSMValueType::Float);
+        co_await index.putSeriesValueType(dropId, TSMValueType::Float);
+        co_await index.putSeriesValueType(foreignId, TSMValueType::Float);
+
+        auto before = co_await index.findSeries("cpu", {{"retired", "yes"}});
+        EXPECT_TRUE(before.has_value());
+        if (before.has_value())
+            EXPECT_EQ(*before, (std::vector<SeriesId128>{dropId}));
+
+        auto removed = co_await index.removeVShardSeriesMetadataExcept(target, {keepId});
+        EXPECT_EQ(removed, (std::vector<SeriesId128>{dropId}));
+        EXPECT_TRUE((co_await index.removeVShardSeriesMetadataExcept(target, {keepId})).empty())
+            << "catalog replacement must be idempotent after an interrupted snapshot apply is replayed";
+        co_await assertReplacement(index);
+        co_await index.close();
+    }
+
+    // Reopen from the durable IndexWAL/SSTable view. This distinguishes real
+    // replacement from merely evicting the old series from process-local caches.
+    {
+        timestar::index::NativeIndex reopened(timestar::StorageLayout("."), 0);
+        co_await reopened.open();
+        co_await assertReplacement(reopened);
+        co_await reopened.close();
+    }
+    co_return;
+}
+
+TEST_F(NativeIndexVShardExtractTest, CatalogReplacementRemovesObsoleteDiscoveryStateDurably) {
+    testReplaceVShardCatalogRemovesObsoleteDiscoveryState().get();
 }

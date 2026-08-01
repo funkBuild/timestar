@@ -127,6 +127,18 @@ public:
     // order (SeriesId128 bytes).
     seastar::future<std::vector<std::pair<SeriesId128, SeriesMetadata>>> extractVShardSeriesMetadata(uint16_t vshard);
 
+    // Remove every catalog row for `vshard` except the retained identities. The
+    // primary metadata key, measurement-series key, durable value-type binding,
+    // and tag-postings memberships are published in one IndexWriteBatch. This is
+    // the destructive half of live snapshot catalog replacement: callers first
+    // validate the complete incoming catalog, invoke this method, then index that
+    // catalog while their external apply/read fence remains closed.
+    //
+    // Returns the identities that were removed so Engine can evict its own
+    // value-type cache. Repeating the operation is a no-op.
+    seastar::future<std::vector<SeriesId128>> removeVShardSeriesMetadataExcept(
+        uint16_t vshard, const std::set<SeriesId128>& retained);
+
     // Bounded pattern expansion over one VShard's catalog range. This is the
     // storage primitive behind replicated pattern delete discovery: it never
     // scans or returns a foreign VShard and stops as soon as the caller's bound

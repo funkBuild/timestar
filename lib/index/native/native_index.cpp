@@ -1533,6 +1533,121 @@ seastar::future<std::vector<std::pair<SeriesId128, SeriesMetadata>>> NativeIndex
     co_return out;
 }
 
+seastar::future<std::vector<SeriesId128>> NativeIndex::removeVShardSeriesMetadataExcept(
+    uint16_t vshard, const std::set<SeriesId128>& retained) {
+    if (vshard >= timestar::VIRTUAL_SHARD_COUNT)
+        throw std::invalid_argument("removeVShardSeriesMetadataExcept: invalid VShard");
+    for (const auto& id : retained) {
+        if (timestar::virtualShard(id) != vshard)
+            throw std::invalid_argument("removeVShardSeriesMetadataExcept: retained identity belongs to another VShard");
+    }
+
+    auto existing = co_await extractVShardSeriesMetadata(vshard);
+    std::vector<std::pair<SeriesId128, SeriesMetadata>> obsolete;
+    obsolete.reserve(existing.size());
+    for (auto& record : existing) {
+        if (!retained.contains(record.first))
+            obsolete.push_back(std::move(record));
+    }
+    if (obsolete.empty())
+        co_return std::vector<SeriesId128>{};
+
+    // Serialize with application-cache flushing. A postings entry can be dirty
+    // without any corresponding memtable operation; flushing first means the
+    // replacement batch below starts from one durable, complete bitmap. We then
+    // update the cached bitmap and its KV row in the SAME batch as the catalog
+    // deletions, so a restart cannot recover stale tag discovery after recovering
+    // the removed metadata rows.
+    auto flushUnits = co_await seastar::get_units(flushMutex_, 1);
+    co_await flushDirtyCaches();
+
+    std::map<std::string, std::set<uint32_t>> postingsRemovals;
+    std::set<std::string> affectedMeasurements;
+    for (const auto& [id, metadata] : obsolete) {
+        affectedMeasurements.insert(metadata.measurement);
+        const auto localId = localIdMap_.getLocalId(id);
+        if (!localId)
+            continue;
+        for (const auto& [tagKey, tagValue] : metadata.tags) {
+            std::string cacheKey;
+            buildBitmapCacheKey(cacheKey, metadata.measurement, tagKey, tagValue);
+            postingsRemovals[std::move(cacheKey)].insert(*localId);
+        }
+    }
+
+    std::map<std::string, BitmapHandle> postings;
+    for (const auto& [cacheKey, ids] : postingsRemovals)
+        postings.emplace(cacheKey, co_await getPostingsBitmapByKey(cacheKey));
+
+    IndexWriteBatch batch;
+    batch.reserve(obsolete.size() * 3 + postings.size());
+    std::vector<SeriesId128> removed;
+    removed.reserve(obsolete.size());
+    for (const auto& [id, metadata] : obsolete) {
+        batch.remove(ke::encodeSeriesMetadataKey(id));
+        batch.remove(ke::encodeMeasurementSeriesKey(metadata.measurement, id));
+        batch.remove(ke::encodeSeriesValueTypeKey(id));
+        removed.push_back(id);
+    }
+
+    // No suspension from the first mutation through applyTo(): another insert
+    // may have populated the pinned entry while it was loading above, but every
+    // such unrelated add is retained in the serialized result. An insert that
+    // races the WAL append below re-dirties the same heap-stable entry and is
+    // picked up by the next ordinary cache flush.
+    for (auto& [cacheKey, handle] : postings) {
+        if (!handle)
+            continue;
+        bool changed = false;
+        for (uint32_t localId : postingsRemovals.at(cacheKey)) {
+            if (handle->bitmap.contains(localId)) {
+                handle->bitmap.remove(localId);
+                changed = true;
+            }
+        }
+        if (!changed)
+            continue;
+
+        std::string kvKey;
+        kvKey.reserve(1 + cacheKey.size());
+        kvKey.push_back(static_cast<char>(POSTINGS_BITMAP));
+        kvKey.append(cacheKey);
+        if (handle->bitmap.isEmpty()) {
+            handle->approxBytes = 0;
+            batch.remove(std::move(kvKey));
+        } else {
+            handle->bitmap.runOptimize();
+            handle->bitmap.shrinkToFit();
+            const size_t bytes = handle->bitmap.getSizeInBytes();
+            handle->approxBytes = bytes;
+            std::string encoded(bytes, '\0');
+            handle->bitmap.write(encoded.data());
+            batch.put(std::move(kvKey), std::move(encoded));
+        }
+        handle->dirty = false;
+        bitmapCacheDirtyKeys_.erase(cacheKey);
+    }
+
+    for (const auto& id : removed) {
+        indexedSeriesCache_.erase(id);
+        indexedSeriesCacheRetired_.erase(id);
+        seriesMetadataCache_.erase(id);
+    }
+    for (const auto& measurement : affectedMeasurements)
+        invalidateDiscoveryCache(measurement);
+    dischargeDirtyCacheBytesIfClean();
+
+    // Match kvWriteBatch's apply-before-append ordering while retaining the
+    // flush mutex across the cache state transition. maybeFlushMemTable() is
+    // called only after releasing it, because that routine acquires the same
+    // mutex for its swap/rotate decision.
+    batch.applyTo(*memtable_);
+    co_await wal_->append(batch);
+    flushUnits.return_all();
+    co_await maybeFlushMemTable();
+    co_return removed;
+}
+
 seastar::future<std::expected<std::vector<std::string>, SeriesLimitExceeded>> NativeIndex::findVShardSeriesKeys(
     uint16_t vshard, const std::string& measurement, const std::map<std::string, std::string>& tagFilters,
     const std::unordered_set<std::string>& fieldFilter, size_t maxSeries, size_t maxEncodedKeyBytes) {
