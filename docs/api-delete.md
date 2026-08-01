@@ -13,6 +13,13 @@ unavailable. Requests using `fields`, omitting a field, or mixing an exact targe
 with a pattern return `501` before discovery or mutation. Pattern deletes remain
 available in non-partitioned mode.
 
+Exact RF&gt;1 deletion uses bounded receipt command tag 5 and is accepted only
+after group 0 has committed cluster format v5. Until then the request fails
+before any Raft proposal with HTTP `409` and JSON code
+`CLUSTER_FORMAT_NOT_ACTIVE`. The current static-bootstrap server does not yet
+compose the group-0 activation bridge, so this is intentionally unavailable and
+cluster readiness remains false; do not deploy it as a production delete path.
+
 Every RF&gt;1 request must include both of these headers:
 
 - `Idempotency-Key`: exactly 32 hexadecimal characters and not all zeroes.
@@ -198,7 +205,7 @@ Relevant status codes are:
 | Status | Meaning |
 |--------|---------|
 | `400` | Invalid body, idempotency header, timestamp, range, or safety limit |
-| `409` | The replicated idempotency receipt has been retired; outcome reconciliation is required |
+| `409` | `DELETE_IDEMPOTENCY_EXPIRED`: the replicated receipt was retired and reconciliation is required; or `CLUSTER_FORMAT_NOT_ACTIVE`: committed format v5 is not active and no delete was proposed |
 | `413` | HTTP body or encoded per-VShard Raft entry is too large |
 | `501` | Delete form is unsupported in the configured cluster mode |
 | `503` | Retryable pre-proposal cluster condition; honor `Retry-After` |

@@ -666,6 +666,17 @@ Tasks:
    pinned by the brick's gate).
 5. Remaining operator/metrics surface per plan §"Observability".
 
+Current feature-gating slice (`9ecd0e6`): pairwise protocol negotiation now
+advertises through v5 and refuses bounded delete tag 5/`Expired` exchanges with
+older peers. The cluster-wide emission gate independently refuses snapshot
+payload v2-v4 and durable receipt command tags until their committed activation
+(v2, v3, and v5 respectively). Readiness exposes and enforces the snapshot
+minimum. This is deliberately partial: the production server still has no live
+group-0 composition/bridge, activation currently reasons about meta-voters
+rather than the union of data voters, and the docker mixed-binary gate has not
+run. Those are task 3's remaining production blockers; no static configuration
+bypass may raise the gate.
+
 **Re-opens:** the SSE handler's node-local guard (deliberately — that guard
 exists to be replaced by exactly this). **Defers:** hot-series lanes (out of
 first release, decision 6), replica-read demand-driven extensions.

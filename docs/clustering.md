@@ -942,6 +942,24 @@ Rolling upgrades allow adjacent compatible versions. A group does not activate
 a storage or log format until every current voter can read it and the feature
 gate is committed.
 
+The implemented ordered capability line currently reserves v2 for self-contained
+snapshot payloads, v3 for legacy durable delete receipts, v4 for node-query
+redirects, and v5 for bounded delete command tag 5, snapshot payload v4, and the
+typed `Expired` proposal result. Emission fails closed: snapshots require at least
+v2, and bounded deletes require both committed format v5 and peer protocol v5.
+Decoders continue to read historical formats regardless of the active emission
+gate. `/cluster/status` reports `active_cluster_format` and
+`snapshot_format_ready`; `/health` is not ready below snapshot format v2.
+
+This is not yet an operable rolling-upgrade path. The current static-bootstrap
+server does not compose persistent group 0 or call the activation bridge, so it
+remains at format v1: snapshot production and bounded deletes are refused and
+readiness stays false. Production enablement requires group-0 wiring, activation
+over every data-group voter (including join admission), and mixed-binary tests.
+Downgrading a binary below an already committed format is unsupported unless a
+future documented offline procedure first makes the durable state readable by
+that binary.
+
 ## Observability and administration
 
 Required cluster APIs or CLI operations include:

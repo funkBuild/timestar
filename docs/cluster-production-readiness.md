@@ -11,7 +11,7 @@
 `41fdc34`, `a58d2a9`, `6a73809`, `81692a4`, `d363348`, `2749027`,
 `1f61f49`, `b2c7d0b`, `872f7e1`, `023d9c3`, `d5f4755`, `7f6d7e8`,
 `7760ebd`, `6557666`, `c8f28c8`, `445f1f0`, `8b8536d`, `6912dfb`,
-`ecb63a5`, `a03fe1d`, `8ae846c`
+`ecb63a5`, `a03fe1d`, `8ae846c`, `9ecd0e6`
 
 **Scope:** The recent VShard/Raft cluster redesign, its production-server
 integration, the public HTTP surface, recovery paths, and the release evidence
@@ -24,7 +24,7 @@ used as evidence that the current server is production-ready.
 
 ## Implementation progress after the review
 
-Forty-three remediation commits are now recorded. Cluster release status
+Forty-four remediation commits are now recorded. Cluster release status
 remains **BLOCKED** because group 0/movement, atomic and retry-safe
 pattern-delete semantics, replicated retention, the large-snapshot path,
 sustained live receipt-retirement compaction evidence, and rolling wire-format
@@ -49,8 +49,11 @@ Completed and covered in this pass:
   to both data-plane and Raft transports. Plaintext requires an explicitly named
   development-only override.
 - `/health` now fails on unresolved peers, zero/leaderless hosting, apply lag or
-  failures, Raft tick failures, disabled snapshot production, oversize snapshot
-  refusal, and undeliverable snapshots. Unsupported SMP layouts fail startup.
+  failures, Raft tick failures, disabled snapshot production, a committed
+  format too old to emit self-contained snapshots, oversize snapshot refusal,
+  and undeliverable snapshots. `/cluster/status` publishes the minimum local
+  `active_cluster_format` and `snapshot_format_ready`. Unsupported SMP layouts
+  fail startup.
 - The leadership-rebalance mutation requires the configured bearer token;
   `/cluster/status` remains intentionally readable for liveness diagnostics and
   must be protected at the network/proxy boundary if topology is sensitive.
@@ -1421,7 +1424,24 @@ is not completion.
   counts against the 1,024-per-VShard cap. **Done when:** old-to-new and
   new-to-old snapshot and command attempts follow the documented safe path,
   mixed-version behavior is covered by a multi-process test, and rollback
-  constraints are explicit.
+  constraints are explicit. **Implementation progress (`9ecd0e6`):** the one
+  ordered capability line now assigns snapshot payload v2 to activation v2,
+  legacy durable receipts/payload v3 to v3, and bounded command tag 5, payload
+  v4, and the typed `Expired` result to v5 (v4 remains the node-query redirect
+  protocol). `ReplicatedVShardHost` refuses a command before proposal and a
+  snapshot before encoding unless the committed per-shard gate is sufficient;
+  the data-plane client also refuses a bounded command before framing it for a
+  peer below protocol v5. Exact partitioned deletes return HTTP 409
+  `CLUSTER_FORMAT_NOT_ACTIVE` until v5 is active. Readiness now fails while the
+  local minimum format is below snapshot v2, rather than treating a running but
+  permanently refusing snapshot timer as healthy. Codec decoders remain
+  unconditional for replay and upgrade. **Still open:** compose and persist
+  group 0 in the production server, close the data-voter-set/admission hole,
+  publish the committed activation to every shard, preflight legacy receipt
+  counts, state the downgrade rule, and run old/new multi-process snapshot and
+  command tests. Because the production server has no group-0 bridge caller,
+  this fail-closed slice deliberately leaves clustered readiness false and
+  bounded deletes unavailable; it does not close this task.
 - [x] **CR-FIX-077 — make live-gate orchestration fail closed.** Owner:
   release/tests. Restrict reset targets to direct `/tmp/tsgate_*` roots, retry
   removal and prove absence before recreation, never delete a running arm's
@@ -1787,6 +1807,27 @@ multi-process delete-heavy measurement required by CR-FIX-065. No live servers
 were started for this validation; the single-job build and repository-local
 temporary directory keep host memory and `/tmp` use bounded.
 
+Format-emission/readiness validation for `9ecd0e6`:
+
+```text
+codec/host/group-0/admission/HTTP focused tests: 27/27 passed
+write-failure taxonomy:                            3/3 passed
+complete DataPlaneRpc + ClusterDataPlane suites: 31/31 passed
+additional targeted socket/readiness checks:       4/4 passed
+timestar_unit_test:                    built successfully (-j1)
+timestar_cluster_socket_test:          built successfully (-j1)
+timestar_http_server:                  built successfully (-j1)
+all test processes:                           --smp 1 --memory 1G
+compiler temporary directory:                         build/tmp
+git diff --check:                                      passed
+```
+
+No live or multi-process server was started for this validation. The first
+combined build requested a nonexistent target name only after the unit and
+socket targets had built; the correctly named `timestar_http_server` target was
+then built successfully. This is deterministic fail-closed coverage, not the
+mixed-binary evidence required to close CR-FIX-076.
+
 This closes the known exact-delete retry corruption path and bounds modern
 receipt memory, but not CR-FIX-010 as a whole. Pattern deletes need a replicated
 immutable expansion plan before re-enablement, and the external multi-process
@@ -1794,5 +1835,7 @@ release gate remains required even though the deterministic RF=3
 leader-failure/replica-restart gate now passes. `8ae846c` removes CR-FIX-065's
 known implementation starvation path; the sustained live workload must still
 show that snapshots keep advancing and journal bytes plateau or reclaim.
-CR-FIX-076 remains an activation blocker: payload v4, command tag 5, and the new
-RPC failure outcome do not establish rolling compatibility.
+CR-FIX-076 remains an activation blocker: `9ecd0e6` prevents unsafe emission and
+false readiness, but production group-0 activation, voter/admission coverage,
+legacy-receipt preflight, downgrade policy, and mixed-binary evidence are still
+missing.
