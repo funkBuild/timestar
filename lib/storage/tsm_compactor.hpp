@@ -291,6 +291,8 @@ public:
 
     // Stop all compactions
     void stopCompaction() { compactionEnabled = false; }
+    void resumeCompaction() { compactionEnabled = true; }
+    [[nodiscard]] bool isCompactionEnabled() const { return compactionEnabled; }
 
     // Get current compaction statistics
     std::vector<CompactionStats> getActiveCompactionStats() const;

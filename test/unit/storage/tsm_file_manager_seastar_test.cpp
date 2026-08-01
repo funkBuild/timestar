@@ -4,6 +4,7 @@
 #include "../../../lib/core/timestar_value.hpp"
 #include "../../../lib/storage/memory_store.hpp"
 #include "../../../lib/storage/tsm.hpp"
+#include "../../../lib/storage/tsm_compactor.hpp"
 #include "../../../lib/storage/tsm_file_manager.hpp"
 #include "../../../lib/storage/tsm_writer.hpp"
 
@@ -71,6 +72,35 @@ seastar::future<> testFMInitEmpty() {
 
 TEST_F(TSMFileManagerSeastarTest, InitEmpty) {
     testFMInitEmpty().get();
+}
+
+seastar::future<> testFMCompactionLoopRestartsAfterDrain() {
+    TSMFileManager mgr(timestar::StorageLayout("."), seastar::this_shard_id());
+    co_await mgr.init();
+
+    co_await mgr.startCompactionLoop();
+    EXPECT_TRUE(mgr.compactionLoopEnabled());
+    if (!mgr.getCompactor()) {
+        ADD_FAILURE() << "TSMFileManager::init did not construct its compactor";
+        co_await mgr.stop();
+        co_return;
+    }
+    EXPECT_TRUE(mgr.getCompactor()->isCompactionEnabled());
+
+    co_await mgr.stopCompactionLoop();
+    EXPECT_FALSE(mgr.compactionLoopEnabled());
+    EXPECT_FALSE(mgr.getCompactor()->isCompactionEnabled());
+
+    co_await mgr.startCompactionLoop();
+    EXPECT_TRUE(mgr.compactionLoopEnabled());
+    EXPECT_TRUE(mgr.getCompactor()->isCompactionEnabled())
+        << "snapshot installation must restore actual compaction work, not only the manager-loop flag";
+
+    co_await mgr.stop();
+}
+
+TEST_F(TSMFileManagerSeastarTest, CompactionLoopRestartsAfterDrain) {
+    testFMCompactionLoopRestartsAfterDrain().get();
 }
 
 // ---------------------------------------------------------------------------
@@ -483,8 +513,7 @@ seastar::future<> testFMRemoveDirectorySyncFailureKeepsTombstoneAndRetries(TSMFi
     // Retrying is idempotent even though the first attempt already unlinked
     // the source name. Once the durability barrier succeeds, registration and
     // the disk sidecar can be retired while the pinned reader stays filtered.
-    mgr.setDirectorySyncForTesting(
-        [](const std::string& directory) { return seastar::sync_directory(directory); });
+    mgr.setDirectorySyncForTesting([](const std::string& directory) { return seastar::sync_directory(directory); });
     co_await mgr.removeTSMFiles({pinned});
     EXPECT_TRUE(mgr.getSequencedTsmFiles().empty());
     EXPECT_FALSE(fs::exists("shard_0/tsm/0_1.tombstone"));

@@ -465,6 +465,7 @@ seastar::future<> TSMFileManager::startCompactionLoop() {
     if (!compactor || !tierTasks_.empty()) {
         co_return;
     }
+    compactor->resumeCompaction();
     compactionLoopEnabled_ = true;
     compactionAbort_.emplace();
     tierTasks_.reserve(MAX_TIERS - 1);

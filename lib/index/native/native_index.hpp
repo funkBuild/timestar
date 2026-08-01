@@ -30,6 +30,7 @@
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/smp.hh>
 #include <seastar/core/timer.hh>
+#include <set>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -127,6 +128,24 @@ public:
     // order (SeriesId128 bytes).
     seastar::future<std::vector<std::pair<SeriesId128, SeriesMetadata>>> extractVShardSeriesMetadata(uint16_t vshard);
 
+    struct ExactMetadataSummary {
+        std::set<std::string> measurements;
+        std::set<std::string> fields;
+        std::map<std::string, std::string> fieldTypes;
+        std::set<std::string> tagKeys;
+        std::set<std::string> tagValues;
+        uint64_t measurementSeries = 0;
+        uint64_t matchingTagSeries = 0;
+    };
+
+    // Derive cluster-facing schema/cardinality from authoritative primary
+    // series rows. Aggregate schema blobs and HLLs are append-oriented and
+    // cannot subtract a superseded snapshot generation; this bounded-memory
+    // scan prevents those stale aggregates from leaking old identities.
+    seastar::future<ExactMetadataSummary> summarizeExactMetadata(const std::string& measurement = {},
+                                                                 const std::string& tagKey = {},
+                                                                 const std::string& tagValue = {});
+
     // Remove every catalog row for `vshard` except the retained identities. The
     // primary metadata key, measurement-series key, durable value-type binding,
     // and tag-postings memberships are published in one IndexWriteBatch. This is
@@ -136,8 +155,8 @@ public:
     //
     // Returns the identities that were removed so Engine can evict its own
     // value-type cache. Repeating the operation is a no-op.
-    seastar::future<std::vector<SeriesId128>> removeVShardSeriesMetadataExcept(
-        uint16_t vshard, const std::set<SeriesId128>& retained);
+    seastar::future<std::vector<SeriesId128>> removeVShardSeriesMetadataExcept(uint16_t vshard,
+                                                                               const std::set<SeriesId128>& retained);
 
     // Bounded pattern expansion over one VShard's catalog range. This is the
     // storage primitive behind replicated pattern delete discovery: it never

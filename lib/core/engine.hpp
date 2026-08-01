@@ -20,6 +20,7 @@
 #include "wal.hpp"
 #include "wal_file_manager.hpp"
 
+#include <functional>
 #include <map>
 #include <memory>
 #include <seastar/core/coroutine.hh>
@@ -27,6 +28,7 @@
 #include <seastar/core/gate.hh>
 #include <seastar/core/memory.hh>
 #include <seastar/core/scheduling.hh>
+#include <seastar/core/semaphore.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/core/timer.hh>
 #include <vector>
@@ -35,6 +37,18 @@ struct EngineVShardSnapshot {
     timestar::VShardSnapshotManifest manifest;
     std::vector<std::pair<std::string, std::string>> files;
     std::string catalog;
+};
+
+// Durable boundaries in the live VShard snapshot replacement transaction.
+// Exposed only for deterministic fault injection; production leaves the hook
+// unset and pays one predictable branch per boundary.
+enum class SnapshotInstallCheckpoint {
+    WalGenerationDeleted,
+    TsmGenerationDeleted,
+    DataPublished,
+    CatalogPruned,
+    CatalogInstalled,
+    SupersededObjectsRetired,
 };
 
 class Engine {
@@ -66,6 +80,12 @@ private:
     // Gate to block new inserts during shutdown. Closed early in stop() so
     // in-flight inserts finish but no new ones start.
     seastar::gate _insertGate;
+
+    // Snapshot installs for different VShards can arrive from independent Raft
+    // groups on the same reactor. They mutate the shared WAL/TSM managers, so
+    // the complete preflight+swap is serialized per Engine.
+    seastar::semaphore _snapshotInstallSemaphore{1};
+    std::function<void(SnapshotInstallCheckpoint)> _snapshotInstallCheckpointHook;
 
     // Back-reference to the sharded<Engine> container for cross-shard communication.
     // Used for schema broadcasts and cross-shard operations; metadata is indexed locally per-shard.
@@ -183,6 +203,9 @@ private:
     seastar::future<bool> installVShardSnapshotFilesOwned(
         std::shared_ptr<const timestar::VShardSnapshotManifest> manifest,
         std::vector<std::pair<std::string, std::string>> files);
+    seastar::future<bool> installVShardSnapshotBundleOwned(
+        std::shared_ptr<const timestar::VShardSnapshotManifest> manifest,
+        std::vector<std::pair<std::string, std::string>> files, std::string catalog);
     enum class SnapshotInstallDisposition { Fresh, Idempotent, Reject };
     seastar::future<SnapshotInstallDisposition> classifySnapshotInstall(
         const timestar::VShardSnapshotManifest& manifest,
@@ -224,6 +247,20 @@ public:
     // Returns true iff installed (verification passed).
     seastar::future<bool> installVShardSnapshotFiles(timestar::VShardSnapshotManifest manifest,
                                                      std::vector<std::pair<std::string, std::string>> files);
+
+    // Production snapshot consumer: validate the complete data+catalog bundle,
+    // then replace one VShard's live generation. The caller must hold the Raft
+    // apply isolation for this VShard; unrelated VShards may continue writing.
+    seastar::future<bool> installVShardSnapshotBundle(timestar::VShardSnapshotManifest manifest,
+                                                      std::vector<std::pair<std::string, std::string>> files,
+                                                      std::string catalog);
+
+    void setSnapshotInstallCheckpointForTesting(std::function<void(SnapshotInstallCheckpoint)> hook) {
+        _snapshotInstallCheckpointHook = std::move(hook);
+    }
+    void setSnapshotDirectorySyncForTesting(std::function<seastar::future<>(const std::string&)> sync) {
+        tsmFileManager.setDirectorySyncForTesting(std::move(sync));
+    }
 
     // Reconstruct the durable NativeIndex records and exact day memberships
     // from a verified catalog after the snapshot TSM has been installed.
@@ -270,7 +307,7 @@ public:
     seastar::future<> insert(TimeStarInsert<T> insertRequest, bool skipMetadataIndexing = false);
     template <class T>
     seastar::future<WALTimingInfo> insertBatch(std::vector<TimeStarInsert<T>> insertRequests,
-                                              bool enforceAdmission = true);
+                                               bool enforceAdmission = true);
 
     // Enforce each request's series type binding, converting losslessly where
     // possible. Returns the subset whose type matches T; anything bound to a
@@ -282,7 +319,7 @@ public:
     // insertBatch, which invokes it.
     template <class T>
     seastar::future<std::vector<TimeStarInsert<T>>> enforceSeriesTypes(std::vector<TimeStarInsert<T>> requests,
-                                                                      bool enforceAdmission = true);
+                                                                       bool enforceAdmission = true);
     template <class T>
     seastar::future<SeriesId128> indexMetadata(TimeStarInsert<T> insertRequest);
     seastar::future<> indexMetadataBatch(const std::vector<MetadataOp>& ops);

@@ -251,6 +251,7 @@ public:
     // Start background compaction
     seastar::future<> startCompactionLoop();
     seastar::future<> stopCompactionLoop();
+    [[nodiscard]] bool compactionLoopEnabled() const { return compactionLoopEnabled_; }
 
     // Per-shard query I/O semaphore.  Gates concurrent DMA reads during
     // query execution to prevent reactor stalls from unbounded parallel I/O.

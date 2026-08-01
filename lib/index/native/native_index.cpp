@@ -1533,13 +1533,49 @@ seastar::future<std::vector<std::pair<SeriesId128, SeriesMetadata>>> NativeIndex
     co_return out;
 }
 
+seastar::future<NativeIndex::ExactMetadataSummary> NativeIndex::summarizeExactMetadata(const std::string& measurement,
+                                                                                       const std::string& tagKey,
+                                                                                       const std::string& tagValue) {
+    ExactMetadataSummary out;
+    std::map<std::string, SeriesId128> fieldRepresentatives;
+    const std::string prefix(1, static_cast<char>(SERIES_METADATA));
+    co_await kvPrefixScan(prefix, [&](std::string_view key, std::string_view value) -> bool {
+        const auto metadata = ke::decodeSeriesMetadata(value);
+        out.measurements.insert(metadata.measurement);
+        if (metadata.measurement != measurement)
+            return true;
+
+        ++out.measurementSeries;
+        out.fields.insert(metadata.field);
+        if (key.size() >= ke::kSeriesMetadataKeyIdOffset + 16) {
+            fieldRepresentatives.try_emplace(metadata.field,
+                                             SeriesId128::fromBytes(key.data() + ke::kSeriesMetadataKeyIdOffset, 16));
+        }
+        for (const auto& [key, value] : metadata.tags) {
+            out.tagKeys.insert(key);
+            if (key == tagKey) {
+                out.tagValues.insert(value);
+                if (tagValue.empty() || value == tagValue)
+                    ++out.matchingTagSeries;
+            }
+        }
+        return true;
+    });
+    for (const auto& [field, id] : fieldRepresentatives) {
+        if (const auto type = co_await getSeriesValueType(id))
+            out.fieldTypes.emplace(field, std::string(timestar::valueTypeName(*type)));
+    }
+    co_return out;
+}
+
 seastar::future<std::vector<SeriesId128>> NativeIndex::removeVShardSeriesMetadataExcept(
     uint16_t vshard, const std::set<SeriesId128>& retained) {
     if (vshard >= timestar::VIRTUAL_SHARD_COUNT)
         throw std::invalid_argument("removeVShardSeriesMetadataExcept: invalid VShard");
     for (const auto& id : retained) {
         if (timestar::virtualShard(id) != vshard)
-            throw std::invalid_argument("removeVShardSeriesMetadataExcept: retained identity belongs to another VShard");
+            throw std::invalid_argument(
+                "removeVShardSeriesMetadataExcept: retained identity belongs to another VShard");
     }
 
     auto existing = co_await extractVShardSeriesMetadata(vshard);

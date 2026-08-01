@@ -5,12 +5,14 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <cerrno>
 #include <filesystem>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/thread.hh>
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -20,12 +22,20 @@ namespace timestar {
 namespace {
 
 // fsync a file (or directory) by path (blocking; call from seastar::async).
+// This is the ownership-transfer barrier: ignoring open/fsync errors would let
+// restore report success and Raft discard its prefix while the installed data
+// existed only in the page cache or an uncommitted directory entry.
 void fsyncPath(const std::string& path, int flags) {
     int fd = ::open(path.c_str(), flags);
     if (fd < 0)
-        return;  // best-effort
-    ::fsync(fd);
-    ::close(fd);
+        throw std::system_error(errno, std::generic_category(), "open for fsync: " + path);
+    if (::fsync(fd) != 0) {
+        const int error = errno;
+        ::close(fd);
+        throw std::system_error(error, std::generic_category(), "fsync: " + path);
+    }
+    if (::close(fd) != 0)
+        throw std::system_error(errno, std::generic_category(), "close after fsync: " + path);
 }
 
 }  // namespace

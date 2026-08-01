@@ -64,15 +64,7 @@ seastar::future<bool> EngineLocalStore::installVShardSnapshot(VShardId vshard, d
         files.reserve(payload.files.size());
         for (auto& f : payload.files)
             files.emplace_back(std::move(f.name), std::move(f.bytes));
-        auto snapshotVShard = payload.manifest.vshard;
-        auto hash = payload.manifest.catalogHash;
-        return e.installVShardSnapshotFiles(std::move(payload.manifest), std::move(files))
-            .then([&e, snapshotVShard, catalog = std::move(payload.catalog),
-                   hash = std::move(hash)](bool installed) mutable {
-                if (!installed)
-                    return seastar::make_ready_future<bool>(false);
-                return e.installVShardSnapshotCatalog(snapshotVShard, std::move(catalog), std::move(hash));
-            });
+        return e.installVShardSnapshotBundle(std::move(payload.manifest), std::move(files), std::move(payload.catalog));
     });
 }
 
@@ -406,48 +398,69 @@ seastar::future<data::MetadataResult> EngineLocalStore::queryMetadata(data::Meta
         throw std::runtime_error(
             "node has committed but unapplied writes (still catching up); its metadata would omit acknowledged series");
 
-    // Schema getters read the node's local schema cache (broadcast across its shards),
-    // so one local() call yields this node's full owned-series schema. Cardinality is
-    // per-shard HLL, summed across this node's shards.
+    // Snapshot replacement is subtractive, whereas the legacy schema blobs and
+    // HLLs are append-oriented broadcasts. Derive cluster-facing metadata from
+    // authoritative primary series rows on every core so a superseded
+    // generation cannot leave a phantom measurement/field/tag or over-count.
     data::MetadataResult out;
-    Engine& e = engines_.local();
+    std::set<std::string> measurements;
+    std::set<std::string> fields;
+    std::map<std::string, std::string> fieldTypes;
+    std::set<std::string> tagKeys;
+    std::set<std::string> tagValues;
+    uint64_t measurementSeries = 0;
+    uint64_t matchingTagSeries = 0;
+    for (unsigned core = 0; core < seastar::smp::count; ++core) {
+        auto summary = co_await engines_.invoke_on(
+            core, [measurement = req.measurement, tagKey = req.tagKey, tagValue = req.tagValue](Engine& engine) {
+                return engine.getIndex().summarizeExactMetadata(measurement, tagKey, tagValue);
+            });
+        measurements.insert(summary.measurements.begin(), summary.measurements.end());
+        fields.insert(summary.fields.begin(), summary.fields.end());
+        for (auto& [field, type] : summary.fieldTypes) {
+            auto [it, inserted] = fieldTypes.emplace(field, type);
+            if (!inserted && it->second != type)
+                throw std::runtime_error("conflicting field types across local shards for " + req.measurement + " " +
+                                         field);
+        }
+        tagKeys.insert(summary.tagKeys.begin(), summary.tagKeys.end());
+        tagValues.insert(summary.tagValues.begin(), summary.tagValues.end());
+        measurementSeries += summary.measurementSeries;
+        matchingTagSeries += summary.matchingTagSeries;
+    }
+
     switch (req.kind) {
         case data::MetadataKind::Measurements: {
-            out.items = co_await e.getAllMeasurements();
+            out.items.assign(measurements.begin(), measurements.end());
             break;
         }
         case data::MetadataKind::Fields: {
             // Carry the field TYPE alongside the name as "name\x1ftype" so the
             // coordinator's set-union preserves it (a field has one global type, so
             // identical pairs dedup). The handler splits on \x1f.
-            auto s = co_await e.getMeasurementFields(req.measurement);
-            for (const auto& f : s) {
-                std::string type = co_await e.getIndex().getFieldType(req.measurement, f);
-                out.items.push_back(f + std::string(1, '\x1f') + type);
+            for (const auto& field : fields) {
+                const auto type = fieldTypes.find(field);
+                if (type == fieldTypes.end())
+                    throw std::runtime_error("series metadata has no durable value type for " + req.measurement + " " +
+                                             field);
+                out.items.push_back(field + std::string(1, '\x1f') + type->second);
             }
             break;
         }
         case data::MetadataKind::TagKeys: {
-            auto s = co_await e.getMeasurementTags(req.measurement);
-            out.items.assign(s.begin(), s.end());
+            out.items.assign(tagKeys.begin(), tagKeys.end());
             break;
         }
         case data::MetadataKind::TagValues: {
-            auto s = co_await e.getTagValues(req.measurement, req.tagKey);
-            out.items.assign(s.begin(), s.end());
+            out.items.assign(tagValues.begin(), tagValues.end());
             break;
         }
         case data::MetadataKind::MeasurementCardinality: {
-            out.cardinality = co_await timestar::cluster::scatterAndSum(engines_, [m = req.measurement](Engine& eng) {
-                return eng.getIndex().estimateMeasurementCardinality(m);
-            });
+            out.cardinality = static_cast<double>(measurementSeries);
             break;
         }
         case data::MetadataKind::TagCardinality: {
-            out.cardinality = co_await timestar::cluster::scatterAndSum(
-                engines_, [m = req.measurement, k = req.tagKey, v = req.tagValue](Engine& eng) {
-                    return eng.getIndex().estimateTagCardinality(m, k, v);
-                });
+            out.cardinality = static_cast<double>(matchingTagSeries);
             break;
         }
     }

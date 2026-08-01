@@ -1,7 +1,8 @@
 // Integration M3 (snapshots): the full consumer chain. EngineLocalStore::
 // buildVShardSnapshot produces a self-contained payload; EngineDataStateMachine::
-// applySnapshot decodes it and installs it into a FRESH replica's Engine, and a
-// query reproduces the data. A malformed payload is fail-stop. The series is
+// applySnapshot decodes it and installs it into an Engine, and a query
+// reproduces the data. Coverage below includes both fresh catch-up and live
+// generation replacement. A malformed payload is fail-stop. The series is
 // chosen so its VShard maps to core 0, keeping the internal invoke_on(assignCore)
 // inline (no cross-shard payload transfer) exactly as the real apply path -- which
 // runs ON the VShard's core -- guarantees. Source and dest engines are scoped so
@@ -11,14 +12,19 @@
 #include "../../../lib/cluster/integration/engine_local_store.hpp"
 #include "../../../lib/core/placement_table.hpp"  // virtualShard
 #include "../../../lib/core/vshard.hpp"           // assignCore
+#include "../../../lib/storage/series_catalog.hpp"
+#include "../../../lib/storage/vshard_snapshot_builder.hpp"
 #include "../../../lib/utils/series_key.hpp"
 #include "../../test_helpers.hpp"
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <chrono>
+#include <filesystem>
 #include <seastar/core/sleep.hh>
 #include <seastar/core/thread.hh>
+#include <stdexcept>
 
 using namespace timestar;
 
@@ -64,6 +70,112 @@ data::WriteSeries deletedSeriesOnVShard(VShardId vshard, std::string* outKey) {
         series.revisions = {43, 43};
         return series;
     }
+}
+
+struct TestSeries {
+    data::WriteSeries write;
+    std::string key;
+    SeriesId128 id;
+};
+
+TestSeries floatSeriesOnVShard(std::string measurement, VShardId vshard, std::string tagStem, uint64_t timestampOffset,
+                               double value, uint64_t revision) {
+    for (uint64_t i = 0;; ++i) {
+        std::string key = buildSeriesKey(measurement, {{"host", tagStem + std::to_string(i)}}, "value");
+        const auto id = SeriesId128::fromSeriesKey(key);
+        if (virtualShard(id) != vshard.value())
+            continue;
+        data::WriteSeries series;
+        series.seriesKey = key;
+        series.type = TSMValueType::Float;
+        series.timestamps = {BASE + timestampOffset, BASE + timestampOffset + 1000};
+        series.values = std::vector<double>{value, value + 1.0};
+        series.revisions = {revision, revision};
+        return TestSeries{std::move(series), std::move(key), id};
+    }
+}
+
+VShardId anotherVShardOnCore(VShardId target) {
+    const unsigned core = assignCore(target, seastar::smp::count);
+    for (uint16_t value = 0; value < VIRTUAL_SHARD_COUNT; ++value) {
+        VShardId candidate{value};
+        if (candidate != target && assignCore(candidate, seastar::smp::count) == core)
+            return candidate;
+    }
+    throw std::runtime_error("test requires two VShards on the target core");
+}
+
+void flushAndWaitForTsm(seastar::sharded<Engine>& engines, unsigned core) {
+    engines.invoke_on_all([](Engine& engine) { return engine.rolloverMemoryStore(); }).get();
+    for (int i = 0; i < 300; ++i) {
+        if (engines.invoke_on(core, [](Engine& engine) { return engine.getTSMFileCount(); }).get() > 0)
+            return;
+        seastar::sleep(std::chrono::milliseconds(20)).get();
+    }
+    throw std::runtime_error("WAL conversion did not publish a TSM file");
+}
+
+struct FloatRead {
+    bool found = false;
+    std::vector<uint64_t> timestamps;
+    std::vector<double> values;
+};
+
+FloatRead readFloat(seastar::sharded<Engine>& engines, const TestSeries& series) {
+    const unsigned core = assignCore(VShardId{virtualShard(series.id)}, seastar::smp::count);
+    auto result =
+        engines
+            .invoke_on(core, [&series](Engine& engine) { return engine.query(series.key, series.id, 0, UINT64_MAX); })
+            .get();
+    if (!result)
+        return {};
+    const auto* values = std::get_if<QueryResult<double>>(&*result);
+    if (!values)
+        throw std::runtime_error("test float series resolved to a different value type");
+    return FloatRead{true, values->timestamps, values->values};
+}
+
+struct BuiltSnapshot {
+    data::SnapshotPayload payload;
+    TestSeries series;
+    VShardId vshard{0};
+};
+
+BuiltSnapshot buildNonEmptySnapshot(const std::string& root, std::string measurement = "snapshot_new",
+                                    double value = 7.0, uint64_t revision = 43, uint64_t timestampOffset = 0) {
+    std::filesystem::remove_all(root);
+    BuiltSnapshot built;
+    {
+        ScopedShardedEngine source;
+        source.startAt(root);
+        cluster::EngineLocalStore store(*source);
+
+        std::string unusedKey;
+        SeriesId128 unusedId;
+        built.vshard = VShardId{0};
+        (void)seriesOnCore0(&unusedKey, &unusedId, &built.vshard);
+        built.series =
+            floatSeriesOnVShard(std::move(measurement), built.vshard, "new", timestampOffset, value, revision);
+
+        data::WriteBatch batch;
+        batch.series.push_back(built.series.write);
+        store.applyWrites(std::move(batch)).get();
+        flushAndWaitForTsm(*source, assignCore(built.vshard, seastar::smp::count));
+        built.payload = store.buildVShardSnapshot(built.vshard).get();
+    }
+    std::filesystem::remove_all(root);
+    if (built.payload.files.size() != 1)
+        throw std::runtime_error("non-empty snapshot test fixture did not produce exactly one object");
+    return built;
+}
+
+data::SnapshotPayload emptySnapshot(VShardId vshard) {
+    SeriesCatalog catalog;
+    data::SnapshotPayload payload;
+    payload.catalog = catalog.snapshot();
+    VShardSnapshotBuilder builder(vshard);
+    payload.manifest = builder.build({}, SeriesCatalog::snapshotHash(payload.catalog));
+    return payload;
 }
 }  // namespace
 
@@ -179,6 +291,277 @@ TEST(EngineSnapshotApply, ApplySnapshotInstallsDataOnFreshReplica) {
 
         std::filesystem::remove_all("snapsm_src");
         std::filesystem::remove_all("snapsm_dst");
+    })
+        .join()
+        .get();
+}
+
+TEST(EngineSnapshotApply, ReplacesLiveWalAndMixedTsmGenerationExactly) {
+    seastar::thread([] {
+        const std::string sourceRoot = "snapsm_replace_src";
+        const std::string destRoot = "snapsm_replace_dst";
+        auto incoming = buildNonEmptySnapshot(sourceRoot);
+        std::filesystem::remove_all(destRoot);
+
+        {
+            ScopedShardedEngine dest;
+            dest.startAt(destRoot);
+            cluster::EngineLocalStore store(*dest);
+            const unsigned core = assignCore(incoming.vshard, seastar::smp::count);
+            const VShardId foreignVShard = anotherVShardOnCore(incoming.vshard);
+            const auto oldDisk =
+                floatSeriesOnVShard("snapshot_old_disk", incoming.vshard, "old-disk", 10'000, 10.0, 10);
+            const auto foreignDisk =
+                floatSeriesOnVShard("snapshot_foreign_disk", foreignVShard, "foreign-disk", 20'000, 20.0, 20);
+            const auto oldWal = floatSeriesOnVShard("snapshot_old_wal", incoming.vshard, "old-wal", 30'000, 30.0, 30);
+            const auto foreignWal =
+                floatSeriesOnVShard("snapshot_foreign_wal", foreignVShard, "foreign-wal", 40'000, 40.0, 40);
+
+            data::WriteBatch diskBatch;
+            diskBatch.series = {oldDisk.write, foreignDisk.write};
+            store.applyWrites(std::move(diskBatch)).get();
+            flushAndWaitForTsm(*dest, core);
+
+            data::WriteBatch walBatch;
+            walBatch.series = {oldWal.write, foreignWal.write};
+            store.applyWrites(std::move(walBatch)).get();
+
+            ASSERT_TRUE(store.installVShardSnapshot(incoming.vshard, incoming.payload).get());
+
+            const auto installed = readFloat(*dest, incoming.series);
+            EXPECT_EQ(installed.timestamps, (std::vector<uint64_t>{BASE, BASE + 1000}));
+            EXPECT_EQ(installed.values, (std::vector<double>{7.0, 8.0}));
+            EXPECT_TRUE(readFloat(*dest, oldDisk).timestamps.empty());
+            EXPECT_TRUE(readFloat(*dest, oldWal).timestamps.empty());
+            EXPECT_EQ(readFloat(*dest, foreignDisk).values, (std::vector<double>{20.0, 21.0}));
+            EXPECT_EQ(readFloat(*dest, foreignWal).values, (std::vector<double>{40.0, 41.0}));
+
+            auto measurements = store.queryMetadata({data::MetadataKind::Measurements, "", "", ""}).get().items;
+            EXPECT_NE(std::find(measurements.begin(), measurements.end(), "snapshot_new"), measurements.end());
+            EXPECT_NE(std::find(measurements.begin(), measurements.end(), "snapshot_foreign_disk"), measurements.end());
+            EXPECT_NE(std::find(measurements.begin(), measurements.end(), "snapshot_foreign_wal"), measurements.end());
+            EXPECT_EQ(std::find(measurements.begin(), measurements.end(), "snapshot_old_disk"), measurements.end());
+            EXPECT_EQ(std::find(measurements.begin(), measurements.end(), "snapshot_old_wal"), measurements.end());
+            auto cardinality =
+                store.queryMetadata({data::MetadataKind::MeasurementCardinality, "snapshot_new", "", ""}).get();
+            EXPECT_DOUBLE_EQ(cardinality.cardinality, 1.0);
+
+            // An exact retry must reuse the already-published object. Compare
+            // after two retries so the first can finish the unrelated VShard's
+            // asynchronous rollover conversion without making this assertion racy.
+            ASSERT_TRUE(store.installVShardSnapshot(incoming.vshard, incoming.payload).get());
+            const size_t filesAfterRetry =
+                (*dest).invoke_on(core, [](Engine& engine) { return engine.getTSMFileCount(); }).get();
+            ASSERT_TRUE(store.installVShardSnapshot(incoming.vshard, incoming.payload).get());
+            EXPECT_EQ((*dest).invoke_on(core, [](Engine& engine) { return engine.getTSMFileCount(); }).get(),
+                      filesAfterRetry);
+            EXPECT_EQ(readFloat(*dest, incoming.series).values, (std::vector<double>{7.0, 8.0}));
+        }
+
+        std::filesystem::remove_all(destRoot);
+    })
+        .join()
+        .get();
+}
+
+TEST(EngineSnapshotApply, InvalidPreflightDoesNotMutateAndEmptySnapshotClearsOnlyTarget) {
+    seastar::thread([] {
+        const std::string sourceRoot = "snapsm_preflight_src";
+        const std::string destRoot = "snapsm_preflight_dst";
+        auto incoming = buildNonEmptySnapshot(sourceRoot);
+        std::filesystem::remove_all(destRoot);
+
+        {
+            ScopedShardedEngine dest;
+            dest.startAt(destRoot);
+            cluster::EngineLocalStore store(*dest);
+            const VShardId foreignVShard = anotherVShardOnCore(incoming.vshard);
+            const auto oldTarget =
+                floatSeriesOnVShard("snapshot_preflight_old", incoming.vshard, "old", 50'000, 50.0, 50);
+            const auto foreign =
+                floatSeriesOnVShard("snapshot_preflight_foreign", foreignVShard, "foreign", 60'000, 60.0, 60);
+            data::WriteBatch batch;
+            batch.series = {oldTarget.write, foreign.write};
+            store.applyWrites(std::move(batch)).get();
+
+            auto corrupt = incoming.payload;
+            ASSERT_FALSE(corrupt.catalog.empty());
+            corrupt.catalog.back() ^= 0x01;
+            EXPECT_FALSE(store.installVShardSnapshot(incoming.vshard, std::move(corrupt)).get());
+            EXPECT_EQ(readFloat(*dest, oldTarget).values, (std::vector<double>{50.0, 51.0}));
+            EXPECT_EQ(readFloat(*dest, foreign).values, (std::vector<double>{60.0, 61.0}));
+            auto before = store.queryMetadata({data::MetadataKind::Measurements, "", "", ""}).get().items;
+            EXPECT_NE(std::find(before.begin(), before.end(), "snapshot_preflight_old"), before.end());
+
+            ASSERT_TRUE(store.installVShardSnapshot(incoming.vshard, emptySnapshot(incoming.vshard)).get());
+            EXPECT_TRUE(readFloat(*dest, oldTarget).timestamps.empty());
+            EXPECT_EQ(readFloat(*dest, foreign).values, (std::vector<double>{60.0, 61.0}));
+            auto after = store.queryMetadata({data::MetadataKind::Measurements, "", "", ""}).get().items;
+            EXPECT_EQ(std::find(after.begin(), after.end(), "snapshot_preflight_old"), after.end());
+            EXPECT_NE(std::find(after.begin(), after.end(), "snapshot_preflight_foreign"), after.end());
+            EXPECT_TRUE(store.installVShardSnapshot(incoming.vshard, emptySnapshot(incoming.vshard)).get());
+        }
+
+        std::filesystem::remove_all(destRoot);
+    })
+        .join()
+        .get();
+}
+
+TEST(EngineSnapshotApply, EveryDurableCheckpointCanRetryToTheExactGeneration) {
+    seastar::thread([] {
+        const std::string sourceRoot = "snapsm_checkpoint_src";
+        auto incoming = buildNonEmptySnapshot(sourceRoot);
+        const std::array checkpoints{
+            SnapshotInstallCheckpoint::WalGenerationDeleted, SnapshotInstallCheckpoint::TsmGenerationDeleted,
+            SnapshotInstallCheckpoint::DataPublished,        SnapshotInstallCheckpoint::CatalogPruned,
+            SnapshotInstallCheckpoint::CatalogInstalled,     SnapshotInstallCheckpoint::SupersededObjectsRetired,
+        };
+
+        for (size_t index = 0; index < checkpoints.size(); ++index) {
+            const std::string destRoot = "snapsm_checkpoint_dst_" + std::to_string(index);
+            std::filesystem::remove_all(destRoot);
+            bool injected = false;
+            {
+                ScopedShardedEngine dest;
+                dest.startAt(destRoot);
+                cluster::EngineLocalStore store(*dest);
+                const auto oldTarget = floatSeriesOnVShard("snapshot_checkpoint_old", incoming.vshard,
+                                                           "old" + std::to_string(index), 70'000, 70.0, 20);
+                data::WriteBatch batch;
+                batch.series.push_back(oldTarget.write);
+                store.applyWrites(std::move(batch)).get();
+                flushAndWaitForTsm(*dest, assignCore(incoming.vshard, seastar::smp::count));
+
+                (*dest)
+                    .invoke_on(assignCore(incoming.vshard, seastar::smp::count),
+                               [checkpoint = checkpoints[index], &injected](Engine& engine) {
+                                   engine.setSnapshotInstallCheckpointForTesting(
+                                       [checkpoint, &injected](SnapshotInstallCheckpoint reached) {
+                                           if (!injected && reached == checkpoint) {
+                                               injected = true;
+                                               throw std::runtime_error("injected snapshot-install interruption");
+                                           }
+                                       });
+                               })
+                    .get();
+                EXPECT_THROW(store.installVShardSnapshot(incoming.vshard, incoming.payload).get(), std::runtime_error);
+                EXPECT_TRUE(injected);
+                (*dest)
+                    .invoke_on(assignCore(incoming.vshard, seastar::smp::count),
+                               [](Engine& engine) { engine.setSnapshotInstallCheckpointForTesting({}); })
+                    .get();
+
+                // DataPublished is the most important restart boundary: the
+                // immutable object exists but the exact catalog may not. Close
+                // and reopen here to prove retry does not depend on RAM state.
+                if (checkpoints[index] != SnapshotInstallCheckpoint::DataPublished) {
+                    ASSERT_TRUE(store.installVShardSnapshot(incoming.vshard, incoming.payload).get());
+                    EXPECT_EQ(readFloat(*dest, incoming.series).values, (std::vector<double>{7.0, 8.0}));
+                }
+            }
+            if (checkpoints[index] == SnapshotInstallCheckpoint::DataPublished) {
+                ScopedShardedEngine reopened;
+                reopened.startAt(destRoot);
+                cluster::EngineLocalStore store(*reopened);
+                ASSERT_TRUE(store.installVShardSnapshot(incoming.vshard, incoming.payload).get());
+                EXPECT_EQ(readFloat(*reopened, incoming.series).values, (std::vector<double>{7.0, 8.0}));
+                auto measurements = store.queryMetadata({data::MetadataKind::Measurements, "", "", ""}).get().items;
+                EXPECT_EQ(std::find(measurements.begin(), measurements.end(), "snapshot_checkpoint_old"),
+                          measurements.end());
+            }
+            std::filesystem::remove_all(destRoot);
+        }
+    })
+        .join()
+        .get();
+}
+
+TEST(EngineSnapshotApply, NewGenerationDurablyRetiresSupersededPureSnapshotObject) {
+    seastar::thread([] {
+        const std::string firstSourceRoot = "snapsm_retire_src_1";
+        const std::string secondSourceRoot = "snapsm_retire_src_2";
+        const std::string destRoot = "snapsm_retire_dst";
+        auto first = buildNonEmptySnapshot(firstSourceRoot);
+        auto second = buildNonEmptySnapshot(secondSourceRoot, "snapshot_newer", 9.0, 44, 100'000);
+        ASSERT_EQ(first.vshard, second.vshard);
+        std::filesystem::remove_all(destRoot);
+
+        {
+            ScopedShardedEngine dest;
+            dest.startAt(destRoot);
+            cluster::EngineLocalStore store(*dest);
+            const unsigned core = assignCore(first.vshard, seastar::smp::count);
+            ASSERT_TRUE(store.installVShardSnapshot(first.vshard, first.payload).get());
+            ASSERT_EQ((*dest).invoke_on(core, [](Engine& engine) { return engine.getTSMFileCount(); }).get(), 1u);
+
+            ASSERT_TRUE(store.installVShardSnapshot(second.vshard, second.payload).get());
+            EXPECT_EQ((*dest).invoke_on(core, [](Engine& engine) { return engine.getTSMFileCount(); }).get(), 1u);
+            EXPECT_TRUE(readFloat(*dest, first.series).timestamps.empty());
+            EXPECT_EQ(readFloat(*dest, second.series).values, (std::vector<double>{9.0, 10.0}));
+        }
+
+        // Reopen proves source-name retirement, its directory barrier, and
+        // sidecar cleanup did not merely hide the old object in the live map.
+        {
+            ScopedShardedEngine reopened;
+            reopened.startAt(destRoot);
+            const unsigned core = assignCore(first.vshard, seastar::smp::count);
+            EXPECT_EQ((*reopened).invoke_on(core, [](Engine& engine) { return engine.getTSMFileCount(); }).get(), 1u);
+            EXPECT_TRUE(readFloat(*reopened, first.series).timestamps.empty());
+            EXPECT_EQ(readFloat(*reopened, second.series).values, (std::vector<double>{9.0, 10.0}));
+        }
+
+        std::filesystem::remove_all(destRoot);
+    })
+        .join()
+        .get();
+}
+
+TEST(EngineSnapshotApply, RetryReconcilesPublishedObjectAfterDirectoryBarrierFailure) {
+    seastar::thread([] {
+        const std::string sourceRoot = "snapsm_orphan_src";
+        const std::string destRoot = "snapsm_orphan_dst";
+        auto incoming = buildNonEmptySnapshot(sourceRoot);
+        std::filesystem::remove_all(destRoot);
+
+        {
+            ScopedShardedEngine dest;
+            dest.startAt(destRoot);
+            cluster::EngineLocalStore store(*dest);
+            const unsigned core = assignCore(incoming.vshard, seastar::smp::count);
+            bool failed = false;
+            (*dest)
+                .invoke_on(core,
+                           [&failed](Engine& engine) {
+                               engine.setSnapshotDirectorySyncForTesting([&failed](const std::string&) {
+                                   failed = true;
+                                   return seastar::make_exception_future<>(
+                                       std::runtime_error("injected directory barrier failure after publish"));
+                               });
+                           })
+                .get();
+
+            EXPECT_THROW(store.installVShardSnapshot(incoming.vshard, incoming.payload).get(), std::runtime_error);
+            EXPECT_TRUE(failed);
+
+            (*dest)
+                .invoke_on(core,
+                           [](Engine& engine) {
+                               engine.setSnapshotDirectorySyncForTesting(
+                                   [](const std::string&) { return seastar::make_ready_future<>(); });
+                           })
+                .get();
+            ASSERT_TRUE(store.installVShardSnapshot(incoming.vshard, incoming.payload).get());
+            EXPECT_EQ(readFloat(*dest, incoming.series).values, (std::vector<double>{7.0, 8.0}));
+            const size_t fileCount =
+                (*dest).invoke_on(core, [](Engine& engine) { return engine.getTSMFileCount(); }).get();
+            ASSERT_TRUE(store.installVShardSnapshot(incoming.vshard, incoming.payload).get());
+            EXPECT_EQ((*dest).invoke_on(core, [](Engine& engine) { return engine.getTSMFileCount(); }).get(),
+                      fileCount);
+        }
+
+        std::filesystem::remove_all(destRoot);
     })
         .join()
         .get();
