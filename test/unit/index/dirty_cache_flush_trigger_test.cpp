@@ -192,11 +192,10 @@ SEASTAR_TEST_F(DirtyCacheFlushTriggerTest, AgeTriggerFlushesDirtyCachesWithNoFur
         // the SSTable would carry no day-bitmap keys, and the reopen would come
         // back empty.
         //
-        // A crash simulation (destroy without close, as
-        // index_fault_injection_test.cpp does) would be the sharper instrument,
-        // but it is not a supported path for an index with armed timers: the
-        // destructor cancels both timers and cannot drain their gates, so a body
-        // still in flight traps in ~gate(). Filed as D-38.
+        // The sharper crash simulations use NativeIndex::abandonForTesting(): it drains
+        // timer work without running the clean close-time data flush. Destroying
+        // an asynchronously active object directly cannot be made safe by a C++
+        // destructor because the destructor cannot suspend.
         co_await index.close();
     }
 
@@ -374,20 +373,32 @@ TEST(DirtyCacheFlushSourceInspection, FlushOrderingAndTimerLifecycleAreIntact) {
     // that survives into ~NativeIndex writes through a dead one.
     EXPECT_NE(src.find("dirtyCacheTimer_.arm_periodic(kDirtyCacheFlushInterval)"), std::string::npos)
         << "the periodic dirty-cache flush is never armed -- the AGE bound does not exist";
+    const size_t stopAt = src.find("seastar::future<> NativeIndex::stopBackgroundTasks()");
+    ASSERT_NE(stopAt, std::string::npos);
+    const size_t stopEnd = src.find("\n}\n", stopAt);
+    ASSERT_NE(stopEnd, std::string::npos);
+    const std::string stopBody = src.substr(stopAt, stopEnd - stopAt);
+    EXPECT_NE(stopBody.find("dirtyCacheTimer_.cancel()"), std::string::npos)
+        << "background shutdown must cancel the periodic dirty-cache flush";
+    EXPECT_NE(stopBody.find("dirtyCacheGate_.close()"), std::string::npos)
+        << "close() must DRAIN an in-flight dirty-cache flush, not merely stop new ones: it holds flushMutex_ and "
+        << "appends to the WAL that close() is about to shut down";
     const size_t closeAt = src.find("seastar::future<> NativeIndex::close()");
     ASSERT_NE(closeAt, std::string::npos);
     const size_t closeEnd = src.find("\n}\n", closeAt);
     ASSERT_NE(closeEnd, std::string::npos);
-    const std::string closeBody = src.substr(closeAt, closeEnd - closeAt);
-    EXPECT_NE(closeBody.find("dirtyCacheTimer_.cancel()"), std::string::npos)
-        << "close() must cancel the periodic dirty-cache flush";
-    EXPECT_NE(closeBody.find("dirtyCacheGate_.close()"), std::string::npos)
-        << "close() must DRAIN an in-flight dirty-cache flush, not merely stop new ones: it holds flushMutex_ and "
-        << "appends to the WAL that close() is about to shut down";
+    EXPECT_NE(src.substr(closeAt, closeEnd - closeAt).find("stopBackgroundTasks()"), std::string::npos)
+        << "close() must use the common background drain";
+    const size_t abandonAt = src.find("seastar::future<> NativeIndex::abandonForTesting()");
+    ASSERT_NE(abandonAt, std::string::npos);
+    const size_t abandonEnd = src.find("\n}\n", abandonAt);
+    ASSERT_NE(abandonEnd, std::string::npos);
+    EXPECT_NE(src.substr(abandonAt, abandonEnd - abandonAt).find("stopBackgroundTasks()"), std::string::npos)
+        << "the non-clean test boundary must drain background work before destruction";
     const size_t dtorAt = src.find("NativeIndex::~NativeIndex()");
     ASSERT_NE(dtorAt, std::string::npos);
     const size_t dtorEnd = src.find("\n}\n", dtorAt);
     ASSERT_NE(dtorEnd, std::string::npos);
     EXPECT_NE(src.substr(dtorAt, dtorEnd - dtorAt).find("dirtyCacheTimer_.cancel()"), std::string::npos)
-        << "the destructor must cancel the timer too -- an index can be destroyed without close()";
+        << "the destructor must still cancel the timer as an emergency backstop";
 }

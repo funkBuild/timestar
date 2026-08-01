@@ -326,7 +326,9 @@ SEASTAR_TEST_F(NativeIndexFaultInjectionTest, TornWalTailStillRecoversAckedSerie
         co_await index.open();
         idA = co_await index.getOrCreateSeriesId("fault_m", {{"host", "a"}}, "f");
         idB = co_await index.getOrCreateSeriesId("fault_m", {{"host", "b"}}, "f");
-        // no close() — simulated crash; destructor safety-net persists the WAL
+        // Stop owned background coroutines without a clean state flush, then
+        // let the IndexWAL destructor safety-net persist the buffered WAL.
+        co_await index.abandonForTesting();
     }
 
     // Inject the torn tail after the acked records.
@@ -399,7 +401,8 @@ SEASTAR_TEST_F(NativeIndexFaultInjectionTest, OrphanPartialSSTableIgnoredAndAcke
         co_await index.open();
         idA = co_await index.getOrCreateSeriesId("orphan_m", {{"host", "a"}}, "f");
         idB = co_await index.getOrCreateSeriesId("orphan_m", {{"host", "b"}}, "f");
-        // no close() — crash before any memtable flush: manifest lists 0 files
+        // Simulated crash before any memtable flush: manifest lists 0 files.
+        co_await index.abandonForTesting();
     }
 
     // Simulate the interrupted flush: partial garbage at the exact path the

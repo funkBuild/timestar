@@ -36,7 +36,8 @@ SEASTAR_TEST_F(NativeIndexTest, CrashWindowPostingsRepair) {
         co_await index.close();
     }
 
-    // Session 2: create a second series, then crash (no close). Its metadata
+    // Session 2: create a second series, then cross the explicit crash boundary
+    // (no clean close). Its metadata
     // and local-ID assignment are persisted with the creation batch, but its
     // postings-bitmap membership lives only in RAM.
     SeriesId128 idB;
@@ -44,7 +45,7 @@ SEASTAR_TEST_F(NativeIndexTest, CrashWindowPostingsRepair) {
         NativeIndex index(timestar::StorageLayout("."), 0);
         co_await index.open();
         idB = co_await index.getOrCreateSeriesId("repair_m", {{"host", "b"}}, "f");
-        // no close() — simulated crash
+        co_await index.abandonForTesting();
     }
 
     // Session 3: open() must repair postings for the crash window — the
@@ -65,7 +66,7 @@ SEASTAR_TEST_F(NativeIndexTest, CrashWindowPostingsRepair) {
 }
 
 SEASTAR_TEST_F(NativeIndexTest, WalRecoverySurvivesReopenAndSecondCrash) {
-    // Crash 1: write without close(). The IndexWAL destructor safety-net
+    // Crash 1: abandon without a clean close. The IndexWAL destructor safety-net
     // persists the buffered records, but nothing flushes the memtable —
     // exactly the state a crashed process leaves behind.
     SeriesId128 id1;
@@ -73,7 +74,7 @@ SEASTAR_TEST_F(NativeIndexTest, WalRecoverySurvivesReopenAndSecondCrash) {
         NativeIndex index(timestar::StorageLayout("."), 0);
         co_await index.open();
         id1 = co_await index.getOrCreateSeriesId("crash_m", {{"host", "a"}}, "f");
-        // no close() — simulated crash
+        co_await index.abandonForTesting();
     }
 
     // Recovery: open() must replay the WAL AND make the replayed data durable
@@ -89,7 +90,7 @@ SEASTAR_TEST_F(NativeIndexTest, WalRecoverySurvivesReopenAndSecondCrash) {
         // Under the old code this write's WAL append truncated the only copy
         // of the replayed records (they lived solely in the volatile memtable).
         id2 = co_await index.getOrCreateSeriesId("crash_m2", {{"host", "b"}}, "f");
-        // no close() — simulated crash 2
+        co_await index.abandonForTesting();
     }
 
     // Both the recovered series and the post-recovery series must survive.

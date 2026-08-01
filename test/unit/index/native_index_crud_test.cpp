@@ -511,17 +511,18 @@ seastar::future<> testOpenCloseLifecycle() {
         co_await index.close();
     }
 
-    // Cycle 3: open and let destructor handle cleanup (no explicit close)
+    // Cycle 3: use the supported non-clean test boundary, then let ordinary
+    // member destruction release the remaining resources.
     {
         timestar::index::NativeIndex index(timestar::StorageLayout("."), 0);
         co_await index.open();
 
         co_await index.getOrCreateSeriesId("lifecycle_test", {{"tag", "value2"}}, "field2");
 
-        // Destructor should clean up db, filter policy, etc. without leaking
+        co_await index.abandonForTesting();
     }
 
-    // Cycle 4: reopen after destructor-based cleanup to verify integrity
+    // Cycle 4: reopen after non-clean teardown to verify integrity
     {
         timestar::index::NativeIndex index(timestar::StorageLayout("."), 0);
         co_await index.open();

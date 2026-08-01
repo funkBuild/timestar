@@ -78,6 +78,8 @@ struct CacheSizeEstimator<std::shared_ptr<const std::vector<SeriesWithMetadata>>
 
 namespace timestar::index {
 
+class NativeIndexLifecycleTestPeer;
+
 // Seastar-native LSM-tree based index backend.
 // Uses DMA I/O with no thread-pool crossings.
 class NativeIndex : public IndexBackend {
@@ -88,6 +90,11 @@ public:
     // Lifecycle
     seastar::future<> open() override;
     seastar::future<> close() override;
+    // Test-only crash boundary: stop and drain NativeIndex-owned background
+    // work without performing close()'s final cache/memtable/WAL flush. This
+    // must be awaited immediately before destruction. Production owners must
+    // use close(); a C++ destructor cannot safely wait for Seastar coroutines.
+    seastar::future<> abandonForTesting();
 
     // --- Series indexing ---
     seastar::future<SeriesId128> getOrCreateSeriesId(std::string measurement, std::map<std::string, std::string> tags,
@@ -265,6 +272,8 @@ public:
     seastar::future<> applySchemaUpdate(SchemaUpdate update);
 
 private:
+    friend class NativeIndexLifecycleTestPeer;
+
     const timestar::StorageLayout layout_;
     int shardId_;
     std::string indexPath_;
@@ -336,6 +345,7 @@ private:
     seastar::future<> flushMemTable();
     seastar::future<> doFlushImmutableMemTable();  // Background flush work
     seastar::future<> waitForFlush();              // Wait for any in-flight flush to complete
+    seastar::future<> stopBackgroundTasks();       // Cancel timers and drain both timer gates
 
     // --- Dirty application-cache flush (write-scaleout debt D-17) ---
     //

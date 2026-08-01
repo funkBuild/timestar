@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cassert>
 #include <charconv>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <format>
@@ -174,6 +175,18 @@ NativeIndex::~NativeIndex() {
     // close paths).
     walSyncTimer_.cancel();
     dirtyCacheTimer_.cancel();
+
+    // Destruction is synchronous, so it cannot make an outstanding Seastar
+    // coroutine safe. Normal owners must await close(); crash-simulation tests
+    // must await abandonForTesting(). Diagnose a contract violation here instead of
+    // falling through to seastar::gate::~gate()'s opaque SIGILL assertion.
+    if (walSyncGate_.get_count() != 0 || dirtyCacheGate_.get_count() != 0) {
+        ::native_index_log.error(
+            "NativeIndex destroyed with background work in flight on shard {} (WAL sync={}, dirty-cache flush={}) "
+            "-- await close() or abandonForTesting() before destruction",
+            shardId_, walSyncGate_.get_count(), dirtyCacheGate_.get_count());
+        std::abort();
+    }
 
     // Guard against destroying the index while a background flush is still in flight.
     // The caller must co_await close() (which calls waitForFlush()) before destruction.
@@ -387,9 +400,10 @@ seastar::future<> NativeIndex::open() {
                             manifest_->files().size(), memtable_->size(), localIdMap_.size());
 }
 
-seastar::future<> NativeIndex::close() {
+seastar::future<> NativeIndex::stopBackgroundTasks() {
     // Stop the periodic WAL sync and drain any in-flight sync before touching
-    // the WAL below (wal_->close() flushes everything anyway).
+    // the WAL. This is shared by clean close and the explicit crash-simulation
+    // boundary; unlike a destructor, both can safely suspend.
     walSyncTimer_.cancel();
     if (!walSyncGate_.is_closed()) {
         co_await walSyncGate_.close();
@@ -402,6 +416,29 @@ seastar::future<> NativeIndex::close() {
     if (!dirtyCacheGate_.is_closed()) {
         co_await dirtyCacheGate_.close();
     }
+}
+
+seastar::future<> NativeIndex::abandonForTesting() {
+    co_await stopBackgroundTasks();
+
+    // A threshold flush is not owned by either timer gate. It also captures a
+    // raw `this`, so destruction must wait for it even at a simulated crash
+    // boundary. Do not start a new flush and do not close/sync the active WAL:
+    // IndexWAL's synchronous destructor safety net leaves the same recoverable
+    // buffered-WAL shape that these fault tests are intended to exercise.
+    try {
+        co_await waitForFlush();
+    } catch (const std::exception& e) {
+        ::native_index_log.warn("Background MemTable flush failed while abandoning NativeIndex: {}", e.what());
+    }
+
+    // This process-global shard-local pointer otherwise outlives the semaphore
+    // member it names. No foreground index call may race abandonForTesting().
+    SSTableReader::setBlockReadSemaphore(nullptr);
+}
+
+seastar::future<> NativeIndex::close() {
+    co_await stopBackgroundTasks();
 
     // Wait for any in-flight background flush, then flush remaining data.
     //
