@@ -15,6 +15,10 @@ using timestar::raft::NodeId;
 // A node's lifecycle state in the cluster (the plan's node lifecycle).
 enum class NodeState : uint8_t { Joining = 0, Active = 1, Draining = 2, Down = 3 };
 
+constexpr bool isValidNodeState(NodeState state) {
+    return state >= NodeState::Joining && state <= NodeState::Down;
+}
+
 // One member node's control-plane record (key family nodes/<uuid>). raftId is
 // the stable id the Raft groups use; uuid identifies the node across restarts;
 // failureDomain (rack/az) drives cross-domain meta-voter selection.

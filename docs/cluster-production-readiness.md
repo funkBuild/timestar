@@ -1248,12 +1248,19 @@ is not completion.
   of inventing new map epochs, and malformed control records (zero or duplicate
   node IDs, duplicate persistent identities, empty identities/tokens, invalid
   VShards, and duplicate replica/voter sets) are rejected without mutating
-  committed state. Meta-voter reconciliation now waits through
+  committed state. The command decoder also rejects out-of-range 64-to-32-bit
+  fields, unknown node-state values, and non-boolean job flags instead of
+  truncating/coercing them. Snapshot recovery rejects duplicate map/set entries,
+  impossible controller fences, invalid enums, zero policy versions and other
+  unreachable semantic state without replacing the last good state. Persisted
+  jobs reject same-step payload conflicts and cannot be resurrected after
+  completion. The focused codec/state evidence passes 17/17. Meta-voter
+  reconciliation now waits through
   joint consensus until final `Cnew` applies (including a final config that
   removes the old leader), and a subsequent controller repairs a stale
   state-machine voter mirror. The focused Raft/controller membership evidence
   passes 13/13; the combined controller/identity/host/codec/state evidence passes
-  26/26. Production composition, the operator-facing explicit bootstrap trigger,
+  28/28. Production composition, the operator-facing explicit bootstrap trigger,
   and publication of committed state to the data plane remain outstanding.
 - [ ] **CR-FIX-022 — wire resumable join, drain, remove, replace, and VShard
   movement.** Owner: movement/control plane. Include learner catch-up, verified

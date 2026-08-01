@@ -1,5 +1,7 @@
 #include "control_command.hpp"
 
+#include <limits>
+
 namespace timestar::control {
 
 namespace {
@@ -47,6 +49,28 @@ struct Reader {
         for (int i = 0; i < 8; ++i)
             v |= static_cast<uint64_t>(u8()) << (8 * i);
         return v;
+    }
+    uint32_t u32() {
+        const uint64_t v = u64();
+        if (v > std::numeric_limits<uint32_t>::max()) {
+            ok = false;
+            return 0;
+        }
+        return static_cast<uint32_t>(v);
+    }
+    bool boolean() {
+        const uint8_t v = u8();
+        if (v > 1) {
+            ok = false;
+            return false;
+        }
+        return v != 0;
+    }
+    NodeState nodeState() {
+        const auto state = static_cast<NodeState>(u8());
+        if (!isValidNodeState(state))
+            ok = false;
+        return state;
     }
     std::string str() {
         uint64_t n = u64();
@@ -102,7 +126,7 @@ NodeRecord readNode(Reader& r) {
     n.uuid = r.str();
     n.address = r.str();
     n.failureDomain = r.str();
-    n.state = static_cast<NodeState>(r.u8());
+    n.state = r.nodeState();
     return n;
 }
 
@@ -181,7 +205,7 @@ std::optional<ControlCommand> decodeCommand(const std::string& bytes) {
         case kSetNodeState: {
             SetNodeState c;
             c.raftId = r.u64();
-            c.state = static_cast<NodeState>(r.u8());
+            c.state = r.nodeState();
             cmd = c;
             break;
         }
@@ -216,8 +240,8 @@ std::optional<ControlCommand> decodeCommand(const std::string& bytes) {
         case kUpsertJob: {
             UpsertJob c;
             c.jobId = r.str();
-            c.step = static_cast<uint32_t>(r.u64());
-            c.done = r.u8() != 0;
+            c.step = r.u32();
+            c.done = r.boolean();
             c.payload = r.str();
             cmd = std::move(c);
             break;
@@ -237,7 +261,7 @@ std::optional<ControlCommand> decodeCommand(const std::string& bytes) {
         }
         case kSetActiveVersion: {
             SetActiveVersion c;
-            c.version = static_cast<uint32_t>(r.u64());
+            c.version = r.u32();
             cmd = std::move(c);
             break;
         }

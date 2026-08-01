@@ -3,6 +3,7 @@
 #include "../../core/vshard.hpp"
 
 #include <seastar/core/coroutine.hh>
+#include <limits>
 #include <set>
 #include <stdexcept>
 
@@ -56,6 +57,28 @@ struct SR {
             v |= static_cast<uint64_t>(u8()) << (8 * i);
         return v;
     }
+    uint32_t u32() {
+        const uint64_t v = u64();
+        if (v > std::numeric_limits<uint32_t>::max()) {
+            ok = false;
+            return 0;
+        }
+        return static_cast<uint32_t>(v);
+    }
+    bool boolean() {
+        const uint8_t v = u8();
+        if (v > 1) {
+            ok = false;
+            return false;
+        }
+        return v != 0;
+    }
+    NodeState nodeState() {
+        const auto state = static_cast<NodeState>(u8());
+        if (!isValidNodeState(state))
+            ok = false;
+        return state;
+    }
     std::string str() {
         uint64_t n = u64();
         if (!ok || !avail(n)) {
@@ -82,7 +105,8 @@ struct SR {
 };
 
 bool validNodeRecord(const Group0State& state, const NodeRecord& record) {
-    if (record.raftId == raft::kNoNode || record.uuid.empty() || record.address.empty())
+    if (record.raftId == raft::kNoNode || record.uuid.empty() || record.address.empty() ||
+        !isValidNodeState(record.state))
         return false;
     if (auto it = state.nodes.find(record.raftId); it != state.nodes.end() && it->second.uuid != record.uuid)
         return false;  // a Raft id is permanently bound to one node identity
@@ -90,6 +114,34 @@ bool validNodeRecord(const Group0State& state, const NodeRecord& record) {
         if (id != record.raftId && existing.uuid == record.uuid)
             return false;  // one persistent node identity cannot occupy two ids
     return true;
+}
+
+bool validNodeSet(const std::vector<NodeId>& nodes);
+
+bool validSnapshotState(const Group0State& state) {
+    std::set<std::string> nodeUuids;
+    for (const auto& [id, record] : state.nodes) {
+        if (id != record.raftId || record.raftId == raft::kNoNode || record.uuid.empty() || record.address.empty() ||
+            !isValidNodeState(record.state) || !nodeUuids.insert(record.uuid).second)
+            return false;
+    }
+    for (const auto& [vshard, replicas] : state.desiredPlacement)
+        if (vshard >= timestar::VIRTUAL_SHARD_COUNT || !validNodeSet(replicas))
+            return false;
+    if (!state.metaVoters.empty() && !validNodeSet(state.metaVoters))
+        return false;
+    for (const auto& [key, cell] : state.policies)
+        if (key.empty() || cell.version == 0)
+            return false;
+    for (const auto& [id, job] : state.jobs)
+        if (id.empty() || id != job.id)
+            return false;
+    for (const auto& token : state.joinTokens)
+        if (token.empty())
+            return false;
+    if ((state.controllerTerm == 0) != (state.controllerLeader == raft::kNoNode))
+        return false;
+    return state.activeFormatVersion != 0;
 }
 
 bool validNodeSet(const std::vector<NodeId>& nodes) {
@@ -125,7 +177,7 @@ bool Group0StateMachine::applyCommand(const ControlCommand& cmd) {
                 }
             } else if constexpr (std::is_same_v<T, SetNodeState>) {
                 if (auto it = state_.nodes.find(c.raftId);
-                    it != state_.nodes.end() && it->second.state != c.state)
+                    it != state_.nodes.end() && isValidNodeState(c.state) && it->second.state != c.state)
                     it->second.state = c.state;
                 else
                     ok = false;
@@ -164,18 +216,25 @@ bool Group0StateMachine::applyCommand(const ControlCommand& cmd) {
             } else if constexpr (std::is_same_v<T, UpsertJob>) {
                 if (c.jobId.empty()) {
                     ok = false;
+                } else if (auto it = state_.jobs.find(c.jobId); it == state_.jobs.end()) {
+                    state_.jobs.emplace(c.jobId, Job{c.jobId, c.step, c.done, c.payload});
                 } else {
-                    Job& j = state_.jobs[c.jobId];
-                    j.id = c.jobId;
-                    // Idempotent step: never move a job backwards, and keep the
-                    // payload paired with the RETAINED step (an out-of-order replay of
-                    // an older step must not overwrite the newer payload).
-                    if (c.step >= j.step) {
+                    Job& j = it->second;
+                    // A step number identifies one immutable operation. Conflicting
+                    // payloads at the same step are rejected, as are regressions and
+                    // attempts to resurrect a completed job. The one allowed same-step
+                    // mutation is making completion sticky.
+                    if (j.done || c.step < j.step || (c.step == j.step && c.payload != j.payload)) {
+                        ok = false;
+                    } else if (c.step > j.step) {
                         j.step = c.step;
                         j.payload = c.payload;
-                    }
-                    if (c.done)
+                        j.done = c.done;
+                    } else if (!j.done && c.done) {
                         j.done = true;
+                    } else {
+                        ok = false;  // exact idempotent replay
+                    }
                 }
             } else if constexpr (std::is_same_v<T, MintJoinToken>) {
                 if (c.token.empty() || !state_.joinTokens.insert(c.token).second)
@@ -272,41 +331,59 @@ bool Group0StateMachine::loadSnapshot(const std::string& data) {
     s.controllerTerm = r.u64();
     s.controllerLeader = r.u64();
     uint64_t nNodes = r.u64();
+    if (!r.ok || nNodes > static_cast<uint64_t>(r.end - r.p) / 33)
+        r.ok = false;  // minimum node: id + three string lengths + state
     for (uint64_t i = 0; i < nNodes && r.ok; ++i) {
         NodeRecord n;
         n.raftId = r.u64();
         n.uuid = r.str();
         n.address = r.str();
         n.failureDomain = r.str();
-        n.state = static_cast<NodeState>(r.u8());
-        s.nodes[n.raftId] = std::move(n);
+        n.state = r.nodeState();
+        if (r.ok && !s.nodes.emplace(n.raftId, std::move(n)).second)
+            r.ok = false;
     }
     uint64_t nPlace = r.u64();
+    if (!r.ok || nPlace > static_cast<uint64_t>(r.end - r.p) / 10)
+        r.ok = false;  // minimum placement: vshard + replica count
     for (uint64_t i = 0; i < nPlace && r.ok; ++i) {
         uint16_t vs = r.u16();
-        s.desiredPlacement[vs] = r.ids();
+        auto replicas = r.ids();
+        if (r.ok && !s.desiredPlacement.emplace(vs, std::move(replicas)).second)
+            r.ok = false;
     }
     s.metaVoters = r.ids();
     uint64_t nPol = r.u64();
+    if (!r.ok || nPol > static_cast<uint64_t>(r.end - r.p) / 24)
+        r.ok = false;  // minimum policy: key length + version + value length
     for (uint64_t i = 0; i < nPol && r.ok; ++i) {
         std::string k = r.str();
         PolicyCell cell;
         cell.version = r.u64();
         cell.value = r.str();
-        s.policies[k] = std::move(cell);
+        if (r.ok && !s.policies.emplace(std::move(k), std::move(cell)).second)
+            r.ok = false;
     }
     uint64_t nJobs = r.u64();
+    if (!r.ok || nJobs > static_cast<uint64_t>(r.end - r.p) / 25)
+        r.ok = false;  // minimum job: id length + step + done + payload length
     for (uint64_t i = 0; i < nJobs && r.ok; ++i) {
         Job j;
         j.id = r.str();
-        j.step = static_cast<uint32_t>(r.u64());
-        j.done = r.u8() != 0;
+        j.step = r.u32();
+        j.done = r.boolean();
         j.payload = r.str();
-        s.jobs[j.id] = std::move(j);
+        if (r.ok && !s.jobs.emplace(j.id, std::move(j)).second)
+            r.ok = false;
     }
     uint64_t nTok = r.u64();
-    for (uint64_t i = 0; i < nTok && r.ok; ++i)
-        s.joinTokens.insert(r.str());
+    if (!r.ok || nTok > static_cast<uint64_t>(r.end - r.p) / 8)
+        r.ok = false;  // each token has at least its string length
+    for (uint64_t i = 0; i < nTok && r.ok; ++i) {
+        auto token = r.str();
+        if (r.ok && !s.joinTokens.insert(std::move(token)).second)
+            r.ok = false;
+    }
     // Trailing, optional for backward compatibility: a pre-format-version snapshot has
     // no field here, so default to 1 (s.activeFormatVersion's default) rather than fail.
     // Exactly eight trailing bytes is the only other valid shape. Previously a partial
@@ -315,14 +392,14 @@ bool Group0StateMachine::loadSnapshot(const std::string& data) {
     const size_t remaining = static_cast<size_t>(r.end - r.p);
     if (r.ok && remaining == 8) {
         const uint64_t activeFormatVersion = r.u64();
-        if (activeFormatVersion == 0 || activeFormatVersion > UINT32_MAX)
+        if (activeFormatVersion == 0 || activeFormatVersion > std::numeric_limits<uint32_t>::max())
             r.ok = false;
         else
             s.activeFormatVersion = static_cast<uint32_t>(activeFormatVersion);
     } else if (remaining != 0) {
         r.ok = false;
     }
-    if (!r.ok || r.p != r.end)
+    if (!r.ok || r.p != r.end || !validSnapshotState(s))
         return false;  // reject a corrupt snapshot without half-applying it
     state_ = std::move(s);
     return true;

@@ -21,6 +21,24 @@ NodeRecord node(NodeId id, std::string uuid, std::string fd, NodeState st = Node
     return r;
 }
 
+uint64_t readU64(const std::string& bytes, size_t& offset) {
+    uint64_t value = 0;
+    for (unsigned i = 0; i < 8; ++i)
+        value |= static_cast<uint64_t>(static_cast<uint8_t>(bytes.at(offset++))) << (8 * i);
+    return value;
+}
+
+void writeU64(std::string& bytes, size_t offset, uint64_t value) {
+    for (unsigned i = 0; i < 8; ++i)
+        bytes.at(offset + i) = static_cast<char>((value >> (8 * i)) & 0xff);
+}
+
+void skipString(const std::string& bytes, size_t& offset) {
+    const uint64_t size = readU64(bytes, offset);
+    offset += size;
+    ASSERT_LE(offset, bytes.size());
+}
+
 }  // namespace
 
 TEST(ControlCommandCodecTest, RoundTripAllCommands) {
@@ -64,6 +82,28 @@ TEST(ControlCommandCodecTest, TrailingBytesRejected) {
     std::string full = encodeCommand(SetMetaVoters{{1, 2, 3}});
     full.push_back('\0');
     EXPECT_FALSE(decodeCommand(full).has_value());
+}
+
+TEST(ControlCommandCodecTest, NarrowFieldsAndEnumsFailClosed) {
+    std::string state = encodeCommand(SetNodeState{7, NodeState::Joining});
+    state.back() = static_cast<char>(0xff);
+    EXPECT_FALSE(decodeCommand(state).has_value());
+
+    std::string record = encodeCommand(UpsertNode{node(7, "uuid-7", "rack-a")});
+    record.back() = static_cast<char>(0xff);
+    EXPECT_FALSE(decodeCommand(record).has_value());
+
+    std::string job = encodeCommand(UpsertJob{"j", 1, false, "payload"});
+    const size_t stepOffset = 1 + 8 + 1;  // tag + job-id length + "j"
+    job.at(stepOffset + 4) = 1;           // 2^32 + 1 cannot fit uint32_t
+    EXPECT_FALSE(decodeCommand(job).has_value());
+    job = encodeCommand(UpsertJob{"j", 1, false, "payload"});
+    job.at(stepOffset + 8) = 2;  // booleans are exactly 0 or 1
+    EXPECT_FALSE(decodeCommand(job).has_value());
+
+    std::string version = encodeCommand(SetActiveVersion{1});
+    version.at(1 + 4) = 1;  // 2^32 + 1 cannot fit uint32_t
+    EXPECT_FALSE(decodeCommand(version).has_value());
 }
 
 TEST(Group0StateMachineTest, AppliesCoreCommands) {
@@ -156,17 +196,21 @@ TEST(Group0StateMachineTest, ControllerTermIsMonotonic) {
 
 TEST(Group0StateMachineTest, JobsAreIdempotentAndMonotonic) {
     Group0StateMachine sm;
-    sm.applyCommand(UpsertJob{"j1", 1, false, "p"});
-    sm.applyCommand(UpsertJob{"j1", 2, false, "p"});
+    EXPECT_TRUE(sm.applyCommand(UpsertJob{"j1", 1, false, "p"}));
+    EXPECT_TRUE(sm.applyCommand(UpsertJob{"j1", 2, false, "p"}));
     EXPECT_EQ(sm.state().jobs.at("j1").step, 2u);
     // Re-applying an older step (crash-resume replay) never regresses.
-    sm.applyCommand(UpsertJob{"j1", 1, false, "p"});
+    EXPECT_FALSE(sm.applyCommand(UpsertJob{"j1", 1, false, "p"}));
     EXPECT_EQ(sm.state().jobs.at("j1").step, 2u);
-    sm.applyCommand(UpsertJob{"j1", 3, true, "p"});
+    EXPECT_FALSE(sm.applyCommand(UpsertJob{"j1", 2, false, "conflict"}));
+    EXPECT_EQ(sm.state().jobs.at("j1").payload, "p");
+    EXPECT_TRUE(sm.applyCommand(UpsertJob{"j1", 3, true, "p"}));
     EXPECT_TRUE(sm.state().jobs.at("j1").done);
     // Completion is sticky.
-    sm.applyCommand(UpsertJob{"j1", 3, false, "p"});
+    EXPECT_FALSE(sm.applyCommand(UpsertJob{"j1", 3, false, "p"}));
+    EXPECT_FALSE(sm.applyCommand(UpsertJob{"j1", 4, false, "resurrect"}));
     EXPECT_TRUE(sm.state().jobs.at("j1").done);
+    EXPECT_EQ(sm.state().jobs.at("j1").step, 3u);
 }
 
 TEST(Group0StateMachineTest, JoinTokenGatesAdmission) {
@@ -252,6 +296,45 @@ TEST(Group0StateMachineTest, SnapshotRoundTrip) {
     legacy.push_back('\0');  // partial optional format field
     EXPECT_FALSE(other.loadSnapshot(legacy));
     EXPECT_EQ(other.state().clusterUuid, "keep-me");
+}
+
+TEST(Group0StateMachineTest, SemanticallyInvalidSnapshotLeavesOldStateUntouched) {
+    Group0StateMachine source;
+    ASSERT_TRUE(source.applyCommand(InitCluster{"cluster-snapshot"}));
+    ASSERT_TRUE(source.applyCommand(UpsertNode{node(1, "uuid-1", "rack-a")}));
+    const std::string valid = source.snapshot();
+
+    Group0StateMachine target;
+    ASSERT_TRUE(target.applyCommand(InitCluster{"keep-me"}));
+
+    // Locate the first node state in the documented snapshot encoding and make
+    // it an unknown enum value. Recovery must reject the whole snapshot.
+    std::string invalidState = valid;
+    size_t offset = 0;
+    skipString(invalidState, offset);  // cluster UUID
+    offset += 8 * 4;                  // epoch, applied index, controller term/leader
+    ASSERT_EQ(readU64(invalidState, offset), 1u);
+    offset += 8;  // node id
+    skipString(invalidState, offset);
+    skipString(invalidState, offset);
+    skipString(invalidState, offset);
+    invalidState.at(offset) = static_cast<char>(0xff);
+    EXPECT_FALSE(target.loadSnapshot(invalidState));
+    EXPECT_EQ(target.state().clusterUuid, "keep-me");
+
+    // A controller term and leader are one fence: neither half may exist alone.
+    std::string invalidFence = valid;
+    offset = 0;
+    skipString(invalidFence, offset);
+    offset += 8 * 2;  // epoch + applied index
+    writeU64(invalidFence, offset, 1);  // leader remains kNoNode
+    EXPECT_FALSE(target.loadSnapshot(invalidFence));
+    EXPECT_EQ(target.state().clusterUuid, "keep-me");
+
+    std::string invalidVersion = valid;
+    writeU64(invalidVersion, invalidVersion.size() - 8, 0);
+    EXPECT_FALSE(target.loadSnapshot(invalidVersion));
+    EXPECT_EQ(target.state().clusterUuid, "keep-me");
 }
 
 TEST(Group0StateMachineTest, CorruptSnapshotApplyIsFatalAndKeepsOldState) {
