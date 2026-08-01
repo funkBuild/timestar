@@ -3,6 +3,7 @@
 #include "../../utils/logger.hpp"
 
 #include <algorithm>
+#include <exception>
 #include <optional>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/semaphore.hh>
@@ -293,12 +294,14 @@ seastar::future<bool> RaftGroup::proposeAndAwaitApplied(std::string data,
     // proposed entry's index and register its promise before any drainReady can
     // observe it, so a leader flap cannot resolve or fail a half-created waiter.
     std::optional<seastar::future<bool>> fut;
+    LogIndex waiterIndex = kNoIndex;
     {
         auto units = co_await seastar::get_units(lock_, 1);
         const uint64_t tL0 = profileEnabled() ? nowNs() : 0;
         if (!node_.propose(std::move(data)))
             co_return false;                           // not the leader (units released by the frame's unwind)
         const LogIndex idx = node_.log().lastIndex();  // the entry we just appended
+        waiterIndex = idx;
         seastar::promise<bool> promise;
         fut = promise.get_future();
         applyWaiters_.emplace_back(idx, std::move(promise));
@@ -321,11 +324,31 @@ seastar::future<bool> RaftGroup::proposeAndAwaitApplied(std::string data,
         if (profileEnabled())
             g_prof.inLockNs += nowNs() - tL0;
     }  // lock released here -- the apply wait below must NOT hold it
-    // with_timeout does NOT cancel or abandon the inner future: it keeps it alive under a
-    // then_wrapped and discards the late result. That is exactly what is needed here --
-    // the waiter's promise stays registered in applyWaiters_ and a later apply resolves a
-    // promise that is still valid, instead of one destroyed out from under drainReady.
-    const bool ok = deadline ? co_await seastar::with_timeout(*deadline, std::move(*fut)) : co_await std::move(*fut);
+    bool ok;
+    if (!deadline) {
+        ok = co_await std::move(*fut);
+    } else {
+        std::exception_ptr failure;
+        try {
+            ok = co_await seastar::with_timeout(*deadline, std::move(*fut));
+        } catch (...) {
+            failure = std::current_exception();
+        }
+        if (failure) {
+            // The waiter list and drainReady are both serialized by lock_. A
+            // timeout therefore removes exactly this entry without racing a
+            // concurrent apply. with_timeout still owns/observes the inner
+            // future, so destroying the promise here produces a consumed broken
+            // promise rather than an abandoned exceptional future.
+            auto units = co_await seastar::get_units(lock_, 1);
+            auto waiter = std::find_if(applyWaiters_.begin(), applyWaiters_.end(),
+                                       [waiterIndex](const auto& item) { return item.first == waiterIndex; });
+            if (waiter != applyWaiters_.end())
+                applyWaiters_.erase(waiter);
+            units.return_all();
+            std::rethrow_exception(failure);
+        }
+    }
     if (profileEnabled()) {
         g_prof.appliedNs += nowNs() - tEnter;
         ++g_prof.proposals;

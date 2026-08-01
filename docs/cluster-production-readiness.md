@@ -343,6 +343,7 @@ item are recorded in the fix-up list.
 | CR-36 | P0 | NativeIndex manifest/SSTable recovery omitted or destroyed durable generations | Complete manifest corruption could be rewritten as a clean prefix, missing/swapped or metadata-corrupt SSTables could be served as an incomplete index, and compaction could delete a durable output after an ambiguous manifest publication. |
 | CR-37 | P0 | NativeIndex startup ignored unreferenced and ambiguous SSTable-namespace artifacts | Crash outputs and obsolete compaction sources could accumulate to disk exhaustion, while a malformed or non-regular possible durable generation was silently omitted instead of fencing incomplete recovery. |
 | CR-38 | P2 | Multi-process release gates gave every Seastar node an implicit host-sized memory budget | Three to five colocated nodes could overcommit RAM and terminate the runner before a gate reached its assertions, making the release evidence non-reproducible. |
+| CR-39 | P1 | A quorum-less leader retained deadline-expired proposal waiters and accepted an unbounded uncommitted log tail | Repeated timed-out writes could grow raw memory indefinitely even though every client request completed within its deadline. |
 
 ### CR-01 — deletes bypass consensus
 
@@ -1555,6 +1556,26 @@ is not completion.
   peak RSS and `/tmp` use, installs at least one snapshot on the recreated node,
   and proves both the surviving and exactly deleted public-path probes. The
   pre-limit attempt was interrupted during catch-up and cannot close this task.
+- [x] **CR-FIX-079 — reclaim deadline-expired Raft apply waiters.** Owner:
+  consensus. A proposal timeout now reacquires the group lock and removes its
+  exact apply waiter, serialized against the same apply path that resolves it.
+  Seastar's timeout continuation continues to own and consume the inner future,
+  so erasing the promise cannot race apply or create an abandoned exception.
+  The ambiguous durable log entry is deliberately not cancelled and may still
+  commit after quorum returns. The real quorum-loss test proves one deliberately
+  unbounded waiter remains, a bounded waiter disappears at its deadline, and
+  healing drains the last waiter; the focused Raft/controller evidence passes
+  19/19.
+- [ ] **CR-FIX-080 — bound the aggregate uncommitted Raft log tail.** Owner:
+  consensus/resource control. Deadline cleanup bounds waiter metadata but not
+  the locally durable entry: with CheckQuorum disabled, an isolated leader can
+  continue accepting new proposals that cannot commit. Add a per-shard byte
+  budget (with per-group fairness), release it on commit/truncation/snapshot,
+  reconstruct it on recovery/leadership, and expose refusal/current/peak
+  metrics. **Done when:** repeated deadline-expired writes under a held
+  partition plateau in both RSS and journal growth, reject before append once
+  the budget is full, and recover admission after healing without losing any
+  acknowledged write.
 
 ## Release exit criteria
 

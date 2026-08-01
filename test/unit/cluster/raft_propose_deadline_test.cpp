@@ -211,6 +211,7 @@ seastar::future<> testDeadlineIsTheOnlyEscape() {
     auto hung = nodes[1]->group->proposeAndAwaitApplied(cmd("hangs", 2.0));
     co_await tickAndPump(nodes, router, 60);
     EXPECT_FALSE(hung.available()) << "an unbounded propose resolved without a quorum -- this test's premise is broken";
+    EXPECT_EQ(nodes[1]->group->pendingApplyWaiters(), 1u);
 
     // (2) THE FIX. Same condition, bounded: it fails inside its deadline.
     const auto t0 = std::chrono::steady_clock::now();
@@ -233,6 +234,8 @@ seastar::future<> testDeadlineIsTheOnlyEscape() {
     EXPECT_EQ(kind, data::WriteFailure::Transport) << "kind=" << data::writeFailureName(kind);
     EXPECT_TRUE(data::isRetryableWriteFailure(kind));
     EXPECT_TRUE(data::isAmbiguousWriteFailure(kind));
+    EXPECT_EQ(nodes[1]->group->pendingApplyWaiters(), 1u)
+        << "the timed-out waiter must be reclaimed; only the deliberately unbounded waiter remains";
 
     // Heal so the hung waiter resolves; never leave a promise with a pending future.
     router.heal(2);
@@ -241,6 +244,7 @@ seastar::future<> testDeadlineIsTheOnlyEscape() {
         co_await tickAndPump(nodes, router, 1);
     EXPECT_TRUE(hung.available()) << "healing must resolve the previously-hung waiter";
     co_await std::move(hung).then_wrapped([](seastar::future<bool> f) { f.ignore_ready_future(); });
+    EXPECT_EQ(nodes[1]->group->pendingApplyWaiters(), 0u);
     co_await teardown(nodes);
 }
 

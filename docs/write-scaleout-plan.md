@@ -765,6 +765,13 @@ Only now is the Raft layer plausibly the limiter; re-profile first.
     depends on CheckQuorum for safety today -- the propose deadline already
     bounds every write and bounds waiter accumulation.
 
+    **2026-08-02 follow-on:** the last clause is now enforced rather than merely
+    inferred: a deadline-expired apply waiter is removed under the Raft group
+    lock, and the quorum-loss regression observes the waiter count return to its
+    deliberately unbounded control. This bounds waiter metadata only; the
+    ambiguous durable entry remains eligible to commit, and aggregate
+    uncommitted-log admission is tracked separately as CR-FIX-080.
+
 5c. **(Deferred, design-only) VShard:group consolidation**: hosting 4096 Raft
     groups per node is the root of per-proposal and heartbeat overhead; a
     16:1 VShard-to-group mapping would cut it 16x but coarsens movement

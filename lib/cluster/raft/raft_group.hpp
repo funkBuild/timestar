@@ -69,14 +69,12 @@ public:
     // must classify it as retryable-ambiguous, exactly like a transport failure; LWW
     // re-application makes the retry harmless (see cluster/data/write_errors.hpp).
     //
-    // The entry's waiter is deliberately LEFT in applyWaiters_ rather than erased:
-    // removing it would race drainReady, which walks and resolves that list under the
-    // group lock while this coroutine is suspended outside it. Instead the underlying
-    // future is kept alive by with_timeout and its result discarded, so a later apply
-    // resolves a promise that is still valid. Waiters that will never resolve are
-    // reclaimed when leadership is lost (releaseApplyWaiters fails them all), which is
-    // why the data plane also enables checkQuorum -- a partitioned leader steps down
-    // within an election timeout and drains them.
+    // On timeout the waiter is removed while holding the same group lock used by
+    // drainReady. with_timeout keeps the underlying future alive and consumes the
+    // broken-promise result produced by erasure, so there is neither a promise race nor
+    // an unbounded waiter leak when CheckQuorum is disabled and an isolated leader never
+    // steps down. The log entry itself remains an ambiguous durable proposal and may
+    // still commit after quorum returns.
     seastar::future<bool> proposeAndAwaitApplied(std::string data,
                                                  std::optional<seastar::lowres_clock::time_point> deadline);
     seastar::future<> campaign();
@@ -152,6 +150,9 @@ public:
     // STALL counter, not a loss counter -- but a group whose apply keeps throwing never
     // becomes readable, and nothing else in the process says so.
     uint64_t applyFailures() const { return applyFailures_; }
+    // Primarily operational/test visibility for bounded deadline cleanup. Read only on
+    // the owning shard between async operations, like the other observers above.
+    size_t pendingApplyWaiters() const { return applyWaiters_.size(); }
     // Highest index this leader knows replicated on `peer` (M5 move catchUp signal).
     LogIndex matchIndexOf(NodeId peer) const { return node_.matchIndexOf(peer); }
     // Ticks since `peer` last replied to us in this term (RaftNode::kNeverAcked if
