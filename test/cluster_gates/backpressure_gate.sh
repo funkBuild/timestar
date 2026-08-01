@@ -40,15 +40,17 @@ done
 trap 'gate_cleanup 1921 /tmp/tsgate_bp1 /tmp/tsgate_bp2 /tmp/tsgate_bp3' EXIT
 
 wait_balanced "$PORTS" 4096 3 90 || gate_exit
+wait_healthy "$PORTS" 60 || gate_exit
 
 # The effective budget must be LOGGED at startup -- a mis-set value has to be visible in
 # the boot log rather than inferred from a wall of 503s.
 assert_ge "startup log names the in-flight budget" \
     "$(cat /tmp/tsgate_bp*/s.log | grep -c "cluster write in-flight budget: $LIMIT")" 1
 
-run_bench() { # $1 = connections, $2 = batches
+run_bench() { # $1 = connections, $2 = batches, $3 = persistent transcript
     timeout 300 "$BENCH" --server-port 19210 -c 4 --batches "$2" --batch-size 10000 --verify 0 \
-        --warmup 3 --connections "$1" --hosts 1000 --racks 2 2>&1
+        --warmup 3 --connections "$1" --hosts 1000 --racks 2 >"$3" 2>&1
+    BENCH_RC=$?
 }
 errs_of() { grep -o '[0-9]* HTTP errors' <<<"$1" | head -1 | cut -d' ' -f1; }
 oks_of()  { grep -o 'Requests: *[0-9]*' <<<"$1" | head -1 | grep -o '[0-9]*'; }
@@ -97,9 +99,18 @@ assert_eq "503s WITHOUT Retry-After" "$((N503 - NRETRY))" 0
 assert_eq "500 responses in the probe" "$N500" 0
 rm -f /tmp/tsgate_bp_h_*.txt
 
+# The large concurrent probes can leave a short node-local apply tail even when
+# every HTTP request was refused/ambiguous. The benchmark has its own /health
+# preflight; wait for the cluster-aware contract instead of mistaking transient
+# non-readiness for an empty overload campaign.
+wait_healthy "$PORTS" 60 || gate_exit
+
 echo "=== A: 12 connections against a $LIMIT-byte/shard budget (must PUSH BACK) ==="
-A=$(run_bench 12 200)
+run_bench 12 200 /tmp/tsgate_bp_overload_bench.txt
+A_RC=$BENCH_RC
+A=$(</tmp/tsgate_bp_overload_bench.txt)
 grep -E "Requests:|First error|Throughput" <<<"$A"
+assert_eq "overload benchmark completed" "$A_RC" 0
 assert_ge "batches rejected under overload" "$(errs_of "$A")" 1
 assert_ge "server-side 'shard write buffer full' rejections" \
     "$(cat /tmp/tsgate_bp*/s.log | grep -c 'shard write buffer full')" 1
@@ -130,10 +141,14 @@ for i in 1 2 3; do
         "$BIN" --port $((19209 + i)) --smp 4 >"/tmp/tsgate_bp$i/s.log" 2>&1 &
 done
 wait_balanced "$PORTS" 4096 3 90 || gate_exit
+wait_healthy "$PORTS" 60 || gate_exit
 assert_ge "startup log names the DEFAULT budget" \
     "$(cat /tmp/tsgate_bp*/s.log | grep -c 'in-flight budget: 33554432 bytes/shard (default)')" 1
-B=$(run_bench 8 200)
+run_bench 8 200 /tmp/tsgate_bp_default_bench.txt
+B_RC=$BENCH_RC
+B=$(</tmp/tsgate_bp_default_bench.txt)
 grep -E "Requests:|First error|Throughput" <<<"$B"
+assert_eq "default-budget benchmark completed" "$B_RC" 0
 assert_eq "client HTTP errors at the default budget" "$(errs_of "$B")" 0
 assert_ge "batches accepted at the default budget" "$(oks_of "$B")" 200
 assert_eq "server-side rejections at the default budget" \

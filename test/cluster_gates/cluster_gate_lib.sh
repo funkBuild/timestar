@@ -168,6 +168,32 @@ cluster_status() { curl -s -m3 "http://127.0.0.1:$1/cluster/status" 2>/dev/null;
 status_field() { printf '%s' "$1" | grep -o "\"$2\":[0-9]*" | cut -d: -f2; }
 status_bool() { printf '%s' "$1" | grep -o "\"$2\":\(true\|false\)" | cut -d: -f2; }
 
+# wait_healthy "PORT..." MAX_POLLS -- every node satisfies the public readiness
+# contract. Leadership balance alone is not enough: /health also fences apply
+# lag/failures, unresolved peers and snapshot capability. Benches perform their
+# own /health preflight, so starting one before this converges produces an empty
+# campaign that looks like a client or admission failure.
+wait_healthy() {
+    local ports="$1" polls="${2:-60}" p ok last=""
+    for _ in $(seq 1 "$polls"); do
+        ok=1
+        for p in $ports; do
+            if ! curl -fsS -m3 "http://127.0.0.1:$p/health" >/dev/null 2>&1; then
+                ok=0
+                last=$(curl -s -m3 "http://127.0.0.1:$p/health" 2>/dev/null | head -c 300)
+                break
+            fi
+        done
+        if [ "$ok" = "1" ]; then
+            echo "  all nodes satisfy /health readiness"
+            return 0
+        fi
+        sleep 1
+    done
+    gate_fail "cluster did not become healthy within ${polls}s (last response: ${last:-unreachable})"
+    return 1
+}
+
 # report_journal_counters "PORT..." -- print the Raft journal's fsync coalescing (D-10) for
 # each node, plus GATE_METRIC totals. INFORMATIONAL: no gate asserts on it, because the
 # ratio depends on how many groups happened to drain together, which is load-shaped.

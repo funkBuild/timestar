@@ -473,9 +473,8 @@ int main(int argc, char** argv) {
         } else if (formatStr == "protobuf-batch" || formatStr == "proto-batch") {
             format = WireFormat::ProtobufBatch;
         } else if (formatStr != "json") {
-            fmt::print("ERROR: unknown format '{}'. Use 'json', 'json-batch', 'protobuf' or 'protobuf-batch'.\n",
-                       formatStr);
-            co_return;
+            throw std::invalid_argument(fmt::format(
+                "unknown format '{}'. Use 'json', 'json-batch', 'protobuf' or 'protobuf-batch'.", formatStr));
         }
 
         const size_t fieldsPerRow = FIELD_NAMES.size();
@@ -527,8 +526,7 @@ int main(int argc, char** argv) {
             co_await client->close();
 
             if (!healthy) {
-                fmt::print("ERROR: server health check failed at {}:{}\n", host, port);
-                co_return;
+                throw std::runtime_error(fmt::format("server health check failed at {}:{}", host, port));
             }
             fmt::print("Server health check: OK\n\n");
         }

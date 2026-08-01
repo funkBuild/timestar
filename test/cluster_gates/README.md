@@ -164,6 +164,21 @@ lowering the load on the artificial one: the insert bench pipelines several batc
 even at `--connections 1`, so "the load dropped" is not expressible at a budget small
 enough for curl to trip.
 
+Both benchmark arms persist their complete stdout/stderr under `/tmp` and assert the
+benchmark process exit code before parsing request counts. Command substitution used to
+discard the only diagnostic when the benchmark died before printing its summary: the
+gate then showed an empty anti-vacuity count even though server logs proved that a few
+requests had arrived. An abnormal or timed-out client is now a named gate failure with a
+retained transcript, never an unexplained empty field.
+
+The gate waits for the public, cluster-aware `/health` contract both before and after its
+large deterministic curl probes, and again after the default-budget restart. A balanced
+leadership count permits a small transition tolerance and says nothing about apply lag;
+the insert benchmark performs its own strict health preflight. Running it in that gap
+used to print `ERROR: server health check failed`, return success, and yield no request
+summary. The benchmark now exits non-zero for a failed health preflight (and for an
+unknown wire format), so no caller can confuse “campaign never ran” with a clean result.
+
 `deposed_primary_gate.sh` hard-asserts what Phase 3 owns -- zero server-side 500s, zero
 crashes, and enough real leadership transfers for the run to be non-vacuous -- plus, since
 D-13, that reads work. The accepted-write count is ADVISORY, because a rebalance storm
