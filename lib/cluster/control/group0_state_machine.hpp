@@ -18,7 +18,9 @@ class Group0StateMachine : public raft::RaftStateMachine {
 public:
     // Apply one committed command entry. Deterministic; no I/O.
     seastar::future<> apply(raft::LogEntry entry) override;
-    // Restore the full state from a snapshot payload (produced by snapshot()).
+    // Restore the full state from a snapshot payload (produced by snapshot()). A
+    // malformed payload fails the returned future instead of advancing Raft over
+    // state that was not installed.
     seastar::future<> applySnapshot(raft::Snapshot snap) override;
 
     // Serialize the entire state for a Raft snapshot (the compaction payload).

@@ -244,7 +244,11 @@ std::optional<ControlCommand> decodeCommand(const std::string& bytes) {
         default:
             return std::nullopt;
     }
-    if (!r.ok)
+    // A command occupies the WHOLE Raft entry. Accepting an otherwise-valid
+    // prefix and ignoring a suffix makes format skew especially dangerous: an
+    // older binary could appear to understand a newer command while applying
+    // only its old prefix, permanently diverging group-0 state.
+    if (!r.ok || r.p != r.end)
         return std::nullopt;
     return cmd;
 }

@@ -89,7 +89,8 @@ using ControlCommand =
                  SetControllerTerm, UpsertJob, MintJoinToken, AdmitWithToken, SetActiveVersion>;
 
 // Wire serialization for a command (the Raft entry payload). Length-prefixed,
-// self-delimiting; decode returns nullopt on any malformed/truncated input.
+// self-delimiting; decode returns nullopt on any malformed, truncated, or
+// trailing input. One Raft entry must contain exactly one command.
 std::string encodeCommand(const ControlCommand& cmd);
 std::optional<ControlCommand> decodeCommand(const std::string& bytes);
 

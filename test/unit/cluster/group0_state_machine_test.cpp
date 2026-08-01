@@ -34,6 +34,7 @@ TEST(ControlCommandCodecTest, RoundTripAllCommands) {
         UpsertJob{"job-1", 5, true, "move v42"},
         MintJoinToken{"tok-abc"},
         AdmitWithToken{node(8, "u8", "rack-h"), "tok-abc"},
+        SetActiveVersion{5},
     };
     for (const auto& c : cmds) {
         auto back = decodeCommand(encodeCommand(c));
@@ -56,6 +57,12 @@ TEST(ControlCommandCodecTest, TruncatedAndUnknownRejected) {
     EXPECT_TRUE(decodeCommand(full).has_value());
     EXPECT_FALSE(decodeCommand(std::string(1, static_cast<char>(0xEE))).has_value());  // unknown tag
     EXPECT_FALSE(decodeCommand("").has_value());
+}
+
+TEST(ControlCommandCodecTest, TrailingBytesRejected) {
+    std::string full = encodeCommand(SetMetaVoters{{1, 2, 3}});
+    full.push_back('\0');
+    EXPECT_FALSE(decodeCommand(full).has_value());
 }
 
 TEST(Group0StateMachineTest, AppliesCoreCommands) {
@@ -197,4 +204,32 @@ TEST(Group0StateMachineTest, SnapshotRoundTrip) {
     other.applyCommand(InitCluster{"keep-me"});
     EXPECT_FALSE(other.loadSnapshot(blob.substr(0, blob.size() / 2)));
     EXPECT_EQ(other.state().clusterUuid, "keep-me");
+
+    // Neither an incomplete optional format field nor an unknown extension may
+    // be ignored: that would let replicas at different format knowledge install
+    // different logical state at the same Raft snapshot boundary.
+    std::string trailing = blob;
+    trailing.push_back('\0');
+    EXPECT_FALSE(other.loadSnapshot(trailing));
+    EXPECT_EQ(other.state().clusterUuid, "keep-me");
+
+    std::string legacy = blob.substr(0, blob.size() - sizeof(uint64_t));
+    Group0StateMachine legacyRestored;
+    ASSERT_TRUE(legacyRestored.loadSnapshot(legacy));
+    EXPECT_EQ(legacyRestored.state().activeFormatVersion, 1u);
+    legacy.push_back('\0');  // partial optional format field
+    EXPECT_FALSE(other.loadSnapshot(legacy));
+    EXPECT_EQ(other.state().clusterUuid, "keep-me");
+}
+
+TEST(Group0StateMachineTest, CorruptSnapshotApplyIsFatalAndKeepsOldState) {
+    Group0StateMachine sm;
+    sm.applyCommand(InitCluster{"keep-me"});
+
+    timestar::raft::Snapshot bad;
+    bad.index = 9;
+    bad.data = "not a group0 snapshot";
+    EXPECT_THROW((void)sm.applySnapshot(std::move(bad)), std::runtime_error);
+    EXPECT_EQ(sm.state().clusterUuid, "keep-me");
+    EXPECT_EQ(sm.state().appliedIndex, 0u);
 }

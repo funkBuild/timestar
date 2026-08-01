@@ -258,16 +258,32 @@ bool Group0StateMachine::loadSnapshot(const std::string& data) {
         s.joinTokens.insert(r.str());
     // Trailing, optional for backward compatibility: a pre-format-version snapshot has
     // no field here, so default to 1 (s.activeFormatVersion's default) rather than fail.
-    if (r.ok && r.avail(8))
-        s.activeFormatVersion = static_cast<uint32_t>(r.u64());
-    if (!r.ok)
-        return false;  // ignore a corrupt snapshot rather than half-apply
+    // Exactly eight trailing bytes is the only other valid shape. Previously a partial
+    // field or arbitrary suffix was silently accepted, which could make an older binary
+    // claim it had installed state it did not actually understand.
+    const size_t remaining = static_cast<size_t>(r.end - r.p);
+    if (r.ok && remaining == 8) {
+        const uint64_t activeFormatVersion = r.u64();
+        if (activeFormatVersion == 0 || activeFormatVersion > UINT32_MAX)
+            r.ok = false;
+        else
+            s.activeFormatVersion = static_cast<uint32_t>(activeFormatVersion);
+    } else if (remaining != 0) {
+        r.ok = false;
+    }
+    if (!r.ok || r.p != r.end)
+        return false;  // reject a corrupt snapshot without half-applying it
     state_ = std::move(s);
     return true;
 }
 
 seastar::future<> Group0StateMachine::applySnapshot(raft::Snapshot snap) {
-    loadSnapshot(snap.data);
+    // Raft has already accepted the snapshot boundary by the time the driver calls
+    // this method. Treating a decode failure as success advances Raft's applied index
+    // while leaving the old control state in service. That is silent control-plane
+    // divergence, so fail-stop and let the group be quarantined.
+    if (!loadSnapshot(snap.data))
+        throw std::runtime_error("group0: invalid control-state snapshot");
     // The snapshot boundary is at least this index.
     if (snap.index > state_.appliedIndex)
         state_.appliedIndex = snap.index;

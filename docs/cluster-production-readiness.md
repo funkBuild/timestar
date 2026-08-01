@@ -1232,7 +1232,12 @@ is not completion.
   Owner: control plane. Make its committed map the source of placement epoch,
   membership, policies, and jobs. **Done when:** static peer-list derivation is
   not authoritative after bootstrap and control-plane loss preserves the last
-  committed data-plane map.
+  committed data-plane map. **Progress:** the existing group-0 command and
+  snapshot decoders now fail closed on unknown trailing data, and a corrupt
+  snapshot installation throws without changing the old state or advancing its
+  applied boundary. Focused codec/state-machine evidence passes 14/14. The
+  production host, dedicated journal, explicit bootstrap ceremony, recovery,
+  and committed-state publication remain outstanding.
 - [ ] **CR-FIX-022 — wire resumable join, drain, remove, replace, and VShard
   movement.** Owner: movement/control plane. Include learner catch-up, verified
   snapshot, log catch-up, joint consensus, leadership transfer, cutover, and
