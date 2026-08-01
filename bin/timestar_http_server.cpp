@@ -184,7 +184,8 @@ void set_routes(routes& r) {
                   for (const auto& [id, addr] : st.peers) {
                       if (!peers.empty())
                           peers += ",";
-                      peers += "{\"node\":" + std::to_string(id) + ",\"address\":\"" + addr + "\"}";
+                      peers += "{\"node\":" + std::to_string(id) + ",\"address\":\"" +
+                               timestar::jsonEscape(addr) + "\"}";
                   }
                   std::string body = "{\"clustered\":true,\"node_id\":" + std::to_string(st.self) +
                                      ",\"replication_factor\":" + std::to_string(st.replicationFactor) +
@@ -249,6 +250,37 @@ void set_routes(routes& r) {
                           ",\"journal_segments_deleted\":" + std::to_string(st.journalSegmentsDeleted) +
                           ",\"journal_segments_pinned_last_pass\":" + std::to_string(st.journalSegmentsPinnedLastPass) +
                           ",\"journal_records_copied_forward\":" + std::to_string(st.journalRecordsCopiedForward);
+                      body +=
+                          ",\"control_enabled\":" + std::string(st.controlEnabled ? "true" : "false") +
+                          ",\"control_hosted\":" + std::string(st.controlHosted ? "true" : "false") +
+                          ",\"control_initialized\":" + std::string(st.controlInitialized ? "true" : "false") +
+                          ",\"control_locally_ready\":" +
+                          std::string(st.controlLocallyReady() ? "true" : "false") +
+                          ",\"control_leader_here\":" + std::string(st.controlLeaderHere ? "true" : "false") +
+                          ",\"control_voter\":" + std::string(st.controlVoter ? "true" : "false") +
+                          ",\"control_joint_config\":" + std::string(st.controlJointConfig ? "true" : "false") +
+                          ",\"control_current_term_commit\":" +
+                          std::string(st.controlCurrentTermCommit ? "true" : "false") +
+                          ",\"control_leader\":" + std::to_string(st.controlLeader) +
+                          ",\"control_term\":" + std::to_string(st.controlTerm) +
+                          ",\"control_commit_index\":" + std::to_string(st.controlCommitIndex) +
+                          ",\"control_applied_index\":" + std::to_string(st.controlAppliedIndex) +
+                          ",\"control_snapshot_index\":" + std::to_string(st.controlSnapshotIndex) +
+                          ",\"control_map_epoch\":" + std::to_string(st.controlMapEpoch) +
+                          ",\"control_active_format\":" + std::to_string(st.controlActiveFormat) +
+                          ",\"control_nodes\":" + std::to_string(st.controlNodes) +
+                          ",\"control_voters\":" + std::to_string(st.controlVoters) +
+                          ",\"control_learners\":" + std::to_string(st.controlLearners) +
+                          ",\"control_apply_lag_entries\":" + std::to_string(st.controlApplyLagEntries) +
+                          ",\"control_apply_failures\":" + std::to_string(st.controlApplyFailures) +
+                          ",\"control_tick_errors\":" + std::to_string(st.controlTickErrors) +
+                          ",\"control_maintenance_passes\":" + std::to_string(st.controlMaintenancePasses) +
+                          ",\"control_maintenance_failures\":" + std::to_string(st.controlMaintenanceFailures) +
+                          ",\"control_compactions_taken\":" + std::to_string(st.controlCompactionsTaken) +
+                          ",\"control_compactions_refused_too_large\":" +
+                          std::to_string(st.controlCompactionsRefusedTooLarge) +
+                          ",\"control_journal_segments_deleted\":" +
+                          std::to_string(st.controlJournalSegmentsDeleted);
                   }
                   body += "}";
                   rep->_content = std::move(body);

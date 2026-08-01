@@ -215,6 +215,7 @@ seastar::future<> ClusterDataPlane::startImpl(const ClusterConfig& cfg, seastar:
     rt_ = ClusterRuntime::fromConfig(cfg);  // throws (fail-closed) on misconfig
     enginesPtr_ = &engines;
     rf_ = cfg.replication_factor < 1 ? 1 : cfg.replication_factor;
+    controlEnabled_ = cfg.control_enabled;
     dir_ = std::make_unique<data::VShardDirectory>(rt_->directory());
     local_ = std::make_unique<EngineLocalStore>(engines);
     rpc_ = std::make_unique<data::DataPlaneRpc>();
@@ -1247,6 +1248,7 @@ seastar::future<ClusterDataPlane::Status> ClusterDataPlane::status() const {
     st.unresolvedPeerCount = unresolvedPeers_.size();
     st.replicated = replicated_;
     st.replicationFactor = rf_;
+    st.controlEnabled = controlEnabled_;
     if (!replicated_ || !shardsStarted_)
         co_return st;
     std::vector<data::NodeId> peers;
@@ -1298,6 +1300,31 @@ seastar::future<ClusterDataPlane::Status> ClusterDataPlane::status() const {
     }
     if (st.activeClusterFormat == std::numeric_limits<uint32_t>::max())
         st.activeClusterFormat = 1;
+    auto control = co_await shards.invoke_on(0, [](ShardRaftPlane& p) { return p.group0Counts(); });
+    st.controlHosted = control.hosted;
+    st.controlInitialized = control.initialized;
+    st.controlLeaderHere = control.leaderHere;
+    st.controlVoter = control.voter;
+    st.controlJointConfig = control.jointConfig;
+    st.controlCurrentTermCommit = control.currentTermCommit;
+    st.controlLeader = control.leader;
+    st.controlTerm = control.term;
+    st.controlCommitIndex = control.commitIndex;
+    st.controlAppliedIndex = control.appliedIndex;
+    st.controlSnapshotIndex = control.snapshotIndex;
+    st.controlMapEpoch = control.mapEpoch;
+    st.controlActiveFormat = control.activeFormat;
+    st.controlNodes = control.nodes;
+    st.controlVoters = control.voters;
+    st.controlLearners = control.learners;
+    st.controlApplyLagEntries = control.applyLagEntries;
+    st.controlApplyFailures = control.applyFailures;
+    st.controlTickErrors = control.tickErrors;
+    st.controlMaintenancePasses = control.maintenancePasses;
+    st.controlMaintenanceFailures = control.maintenanceFailures;
+    st.controlCompactionsTaken = control.compactionsTaken;
+    st.controlCompactionsRefusedTooLarge = control.compactionsRefusedTooLarge;
+    st.controlJournalSegmentsDeleted = control.journalSegmentsDeleted;
     co_return st;
 }
 

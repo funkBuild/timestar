@@ -81,6 +81,7 @@ public:
     uint64_t compactionsRefusedTooLarge() const { return compactionsRefusedTooLarge_; }
     uint64_t maintenanceFailures() const { return maintenanceFailures_; }
     uint64_t journalSegmentsDeleted() const { return journalSegmentsDeleted_; }
+    uint64_t tickErrors() const { return registry_.tickErrors(); }
 
 private:
     seastar::future<bool> compactAppliedState();

@@ -52,8 +52,12 @@ Completed and covered in this pass:
   failures, Raft tick failures, disabled snapshot production, a committed
   format too old to emit self-contained snapshots, oversize snapshot refusal,
   and undeliverable snapshots. `/cluster/status` publishes the minimum local
-  `active_cluster_format` and `snapshot_format_ready`. Unsupported SMP layouts
-  fail startup.
+  `active_cluster_format` and `snapshot_format_ready`, plus separate group-0
+  hosting/initialization/leader/config, apply, and maintenance fields when the
+  control host is enabled. `control_locally_ready` is intentionally separate
+  from data readiness and is not mislabelled as proof of current quorum
+  reachability: a control-quorum outage freezes topology and policy mutation but
+  does not stop already-configured data groups. Unsupported SMP layouts fail startup.
 - The leadership-rebalance mutation requires the configured bearer token;
   `/cluster/status` remains intentionally readable for liveness diagnostics and
   must be protected at the network/proxy boundary if topology is sensitive.

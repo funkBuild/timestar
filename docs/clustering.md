@@ -993,6 +993,15 @@ Metrics include:
 Readiness distinguishes client coordination, read eligibility, write
 eligibility, joining, draining, and control-plane availability.
 
+The current `/cluster/status` endpoint now exposes group-0 enablement, hosting,
+initialization, leader/voter/config state, term/commit/applied/snapshot indices,
+map epoch, active format, apply/tick errors, and snapshot/GC maintenance. Its
+`control_locally_ready` field requires a current-term commit but deliberately
+does not claim current quorum reachability; that requires an active ReadIndex
+round. It is separate from the existing data-plane `healthy` field: loss of the
+control quorum blocks topology and policy changes but does not make
+already-configured data groups unavailable.
+
 ## Configuration outline
 
 ### Current static RF=3 bootstrap

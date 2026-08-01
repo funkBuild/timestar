@@ -388,6 +388,70 @@ public:
 
     Group0Host* group0() { return group0_.get(); }
 
+    struct Group0Counts {
+        bool hosted = false;
+        bool initialized = false;
+        bool leaderHere = false;
+        bool voter = false;
+        bool jointConfig = false;
+        bool currentTermCommit = false;
+        data::NodeId leader = raft::kNoNode;
+        raft::Term term = raft::kNoTerm;
+        raft::LogIndex commitIndex = raft::kNoIndex;
+        raft::LogIndex appliedIndex = raft::kNoIndex;
+        raft::LogIndex snapshotIndex = raft::kNoIndex;
+        uint64_t mapEpoch = 0;
+        uint32_t activeFormat = 1;
+        size_t nodes = 0;
+        size_t voters = 0;
+        size_t learners = 0;
+        uint64_t applyLagEntries = 0;
+        uint64_t applyFailures = 0;
+        uint64_t tickErrors = 0;
+        uint64_t maintenancePasses = 0;
+        uint64_t maintenanceFailures = 0;
+        uint64_t compactionsTaken = 0;
+        uint64_t compactionsRefusedTooLarge = 0;
+        uint64_t journalSegmentsDeleted = 0;
+    };
+
+    Group0Counts group0Counts() const {
+        Group0Counts c;
+        auto* host = const_cast<ShardRaftPlane*>(this)->group0();
+        if (!host || !host->started())
+            return c;
+        auto* group = host->group();
+        if (!group)
+            return c;
+        c.hosted = true;
+        const auto& state = host->state();
+        const auto& config = group->node().config();
+        c.initialized = !state.clusterUuid.empty() && !state.nodes.empty() && !state.metaVoters.empty();
+        c.leaderHere = group->isLeader();
+        c.voter = group->node().isVoter(group->node().id());
+        c.jointConfig = config.joint();
+        c.currentTermCommit = group->node().hasCurrentTermCommit();
+        c.leader = group->leader();
+        c.term = group->currentTerm();
+        c.commitIndex = group->commitIndex();
+        c.appliedIndex = group->appliedIndex();
+        c.snapshotIndex = group->node().log().snapshotIndex();
+        c.mapEpoch = state.mapEpoch;
+        c.activeFormat = state.activeFormatVersion;
+        c.nodes = state.nodes.size();
+        c.voters = config.voters.size();
+        c.learners = config.learners.size();
+        c.applyLagEntries = group->applyLag();
+        c.applyFailures = group->applyFailures();
+        c.tickErrors = host->tickErrors();
+        c.maintenancePasses = host->maintenancePasses();
+        c.maintenanceFailures = host->maintenanceFailures();
+        c.compactionsTaken = host->compactionsTaken();
+        c.compactionsRefusedTooLarge = host->compactionsRefusedTooLarge();
+        c.journalSegmentsDeleted = host->journalSegmentsDeleted();
+        return c;
+    }
+
     void startTicking() {
         if (plane_)
             plane_->startTicking();

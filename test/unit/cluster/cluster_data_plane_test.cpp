@@ -88,6 +88,33 @@ TEST_F(ClusterDataPlaneTest, ClusterReadinessFailsClosedOnCurrentServingBlockers
     EXPECT_NE(st.readinessReason().find("undeliverable"), std::string::npos);
 }
 
+TEST_F(ClusterDataPlaneTest, ControlHealthIsVisibleWithoutBlockingExistingDataGroups) {
+    cluster::ClusterDataPlane::Status st;
+    st.replicated = true;
+    st.vshardsHostedHere = 10;
+    st.snapshotTriggerEnabled = true;
+    st.snapshotFormatReady = true;
+    EXPECT_TRUE(st.controlLocallyReady());
+    EXPECT_TRUE(st.readyForTraffic());
+
+    st.controlEnabled = true;
+    EXPECT_FALSE(st.controlLocallyReady());
+    EXPECT_TRUE(st.readyForTraffic()) << "control quorum loss must not stop existing data groups";
+
+    st.controlHosted = true;
+    st.controlInitialized = true;
+    st.controlLeader = 1;
+    st.controlCurrentTermCommit = true;
+    EXPECT_TRUE(st.controlLocallyReady());
+
+    st.controlApplyLagEntries = 1;
+    EXPECT_FALSE(st.controlLocallyReady());
+    EXPECT_TRUE(st.readyForTraffic());
+    st.controlApplyLagEntries = 0;
+    st.controlCompactionsRefusedTooLarge = 1;
+    EXPECT_FALSE(st.controlLocallyReady());
+}
+
 data::WriteSeries series(const std::string& m, std::map<std::string, std::string> tags, const std::string& f,
                          TSMValueType type, std::vector<uint64_t> ts,
                          std::variant<std::vector<double>, std::vector<int64_t>, std::vector<bool>,

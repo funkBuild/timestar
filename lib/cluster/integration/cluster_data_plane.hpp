@@ -293,6 +293,47 @@ public:
         uint64_t journalGcPasses = 0;
         bool journalShared = false;
 
+        // Group-0 health is deliberately separate from readyForTraffic(): an
+        // unavailable control quorum freezes topology/policy mutation, while
+        // already-configured data groups continue to serve. Operators still need
+        // a direct signal instead of inferring control failure from stale maps.
+        bool controlEnabled = false;
+        bool controlHosted = false;
+        bool controlInitialized = false;
+        bool controlLeaderHere = false;
+        bool controlVoter = false;
+        bool controlJointConfig = false;
+        bool controlCurrentTermCommit = false;
+        NodeId controlLeader = raft::kNoNode;
+        raft::Term controlTerm = raft::kNoTerm;
+        raft::LogIndex controlCommitIndex = raft::kNoIndex;
+        raft::LogIndex controlAppliedIndex = raft::kNoIndex;
+        raft::LogIndex controlSnapshotIndex = raft::kNoIndex;
+        uint64_t controlMapEpoch = 0;
+        uint32_t controlActiveFormat = 1;
+        size_t controlNodes = 0;
+        size_t controlVoters = 0;
+        size_t controlLearners = 0;
+        uint64_t controlApplyLagEntries = 0;
+        uint64_t controlApplyFailures = 0;
+        uint64_t controlTickErrors = 0;
+        uint64_t controlMaintenancePasses = 0;
+        uint64_t controlMaintenanceFailures = 0;
+        uint64_t controlCompactionsTaken = 0;
+        uint64_t controlCompactionsRefusedTooLarge = 0;
+        uint64_t controlJournalSegmentsDeleted = 0;
+
+        // This is intentionally LOCAL readiness, not a quorum-health claim.
+        // With CheckQuorum disabled an isolated former leader can retain its role;
+        // proving current reachability requires a ReadIndex round, not counters.
+        [[nodiscard]] bool controlLocallyReady() const {
+            if (!controlEnabled)
+                return true;
+            return controlHosted && controlInitialized && controlLeader != raft::kNoNode && controlCurrentTermCommit &&
+                   controlApplyLagEntries == 0 && controlApplyFailures == 0 && controlTickErrors == 0 &&
+                   controlMaintenanceFailures == 0 && controlCompactionsRefusedTooLarge == 0;
+        }
+
         [[nodiscard]] bool readyForTraffic() const {
             if (unresolvedPeerCount != 0)
                 return false;
@@ -444,6 +485,7 @@ private:
     bool shardsStarted_ = false;
     bool replicated_ = false;
     uint16_t rf_ = 1;  // configured replication factor (reported by status())
+    bool controlEnabled_ = false;
 
     // Standing leadership-balancing loop (M5). Without it a fresh cluster leaves ALL
     // leadership on the first node to start, since it wins every election. Runs a
