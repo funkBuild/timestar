@@ -5,7 +5,8 @@
 **Reviewed baseline:** `cluster-design` at `f78e05d` (2026-08-01)
 
 **Remediation commits:** `95c10d2`, `a16b03a`, `d578e81`, `ddab705`,
-`8620b9e`, `20639dc`, `ea2511b`, `3ac9899`, `69ac879`
+`8620b9e`, `20639dc`, `ea2511b`, `3ac9899`, `69ac879`, `09a62c5`,
+`2e06cb8`
 
 **Scope:** The recent VShard/Raft cluster redesign, its production-server
 integration, the public HTTP surface, recovery paths, and the release evidence
@@ -18,11 +19,12 @@ used as evidence that the current server is production-ready.
 
 ## Implementation progress after the review
 
-Nine remediation commits are now recorded. Cluster release status remains
+Eleven remediation commits are now recorded. Cluster release status remains
 **BLOCKED** because group 0/movement, generation-atomic live snapshot
 replacement, pattern-delete expansion, replicated retention, the large-snapshot
-path, rolling wire-format compatibility, and three final live release gates remain
-open.
+path, and rolling wire-format compatibility remain open. The four previously
+stale live release gates now pass on the same executable candidate and no longer
+block release by themselves.
 
 Completed and covered in this pass:
 
@@ -91,6 +93,12 @@ Completed and covered in this pass:
   the server's lifecycle guard remains armed through data-plane/HTTP startup and
   normal shutdown. This prevents an `EMFILE` during VShard journal creation from
   being replaced by Seastar's misleading destructor `SIGILL` trap.
+- Live gates now prove their data roots are absent before recreating them, never
+  reset data while an arm's servers are still running, and fail if the reset is
+  incomplete. Cluster health is required before benchmark load begins, and the
+  insert benchmark exits nonzero when its health preflight or argument parsing
+  fails. This prevents an empty benchmark transcript from satisfying a gate's
+  anti-vacuity checks.
 
 Focused evidence on this pass includes the rebuilt server, unit and socket test
 targets, journal negative tests, alternate-replica routing tests, a black-holed
@@ -99,16 +107,17 @@ identity/topology tests, and pre-proposal admission tests. The strict checkboxes
 below stay open where their stated multi-process or fault-injection “done when”
 evidence has not yet been run.
 
-Final local validation for these remediation commits is green: 4,340/4,340 unit
-tests passed with no skips, 45/45
-socket-backed cluster tests passed, the first-pass 56/56 focused
+Final local validation for these remediation commits is green: 4,341/4,341 unit
+tests passed with no skips, 45/45 socket-backed cluster tests passed, the
+first-pass 56/56 focused
 cluster/readiness/identity/admission regressions passed, and the second-pass
 24/24 snapshot/compaction regressions passed. The exact-delete pass additionally
 covers public HTTP behavior, bounded batch fan-out, leader-hint retry, v3 socket
 transport, old-peer refusal, VShard-spoof rejection, and real Raft
 write/delete/query apply. The production server links, every cluster-gate shell
-script passes `bash -n`, and `git diff --check` passes. These checks do not
-replace the open live multi-process gates.
+script passes `bash -n`, and `git diff --check` passes. The four named live
+multi-process gates also pass on `2e06cb8`; the additional topology, security,
+large-snapshot, and non-empty live-install gates remain open.
 
 ## Decision
 
@@ -158,12 +167,13 @@ item are recorded in the fix-up list.
 | CR-13 | P1 | `/health` is not cluster-aware | An orchestrator can send traffic to a leaderless, unresolved, or apply-stalled node reported as healthy. |
 | CR-14 | P1 | Requested read-consistency modes are accepted but ignored | `session` and `bounded_staleness` do not implement their advertised contracts or return session envelopes. |
 | CR-15 | P2 | The supplied Compose deployment is still the unsafe M1 mode | Operators can mistake a best-effort demo for the redesigned RF=3 deployment. |
-| CR-16 | P2 | Required live release gates are stale on the final tree | Backpressure, node-kill, restart-catch-up, and snapshot-durability behavior is unverified after later changes. |
+| CR-16 | P2 | Required live release gates were stale after later cluster changes | Backpressure, node-kill, restart-catch-up, and snapshot-durability behavior had no same-candidate evidence. |
 | CR-17 | P1 | One-node failover still causes client-visible batch failures | Applications without the promised retry-whole-batch behavior can treat an expected node failure as lost writes. |
 | CR-18 | P1 | Snapshot payload v2 has no rolling-version negotiation | A mixed-version cluster can fail snapshot catch-up in either direction during upgrade. |
 | CR-19 | P0 | Exact-point delete overlap was exclusive at the block minimum | A delete with equal start/end could silently skip a one-point block and leave the point queryable. |
 | CR-20 | P0 | Ambiguous replicated deletes were automatically re-proposed | If the first delete committed but its reply was lost, a second log entry could erase a concurrent write ordered after the first attempt. |
 | CR-21 | P1 | Replicated startup exhausted ordinary open-file limits and did not unwind partial sharded startup | A default 1,024 soft limit failed around the thousandth VShard journal, then cleanup trapped with `SIGILL`, hiding the actionable `EMFILE` and preventing the node from booting. |
+| CR-22 | P2 | Live-gate data reset and benchmark preflight could fail open | A gate could race deletion against running nodes or continue after the benchmark sent no load, invalidating otherwise green release evidence. |
 
 ### CR-01 — deletes bypass consensus
 
@@ -370,22 +380,29 @@ reported `Illegal instruction` instead of the preceding open-file error.
 CR-FIX-064 closes both halves; snapshot materialisation and other CR-12 scale
 limits remain open.
 
-### CR-15 and CR-16 — deployment and evidence gaps
+### CR-15, CR-16, and CR-22 — deployment and evidence gaps
 
 [`docker-compose.cluster.yml`](../docker-compose.cluster.yml) explicitly starts
 Milestone-1 full replication and does not enable partitioning or RF=3. It must
 not be presented as a production cluster example.
 
-The final register in [`write-scaleout-plan.md`](write-scaleout-plan.md) records
-4,308/4,308 unit tests and 40/40 socket tests, but also states that the following
-live gates were not rerun after later cluster changes. The backpressure gate has
-now been refreshed at `69ac879`; the other three remain stale:
+The final register in [`write-scaleout-plan.md`](write-scaleout-plan.md) recorded
+4,308/4,308 unit tests and 40/40 socket tests, but the four live gates had not
+been rerun after later cluster changes. During the rerun,
+`snapshot_durability_gate.sh` also attempted a redundant top-level data reset
+while the preceding arm's restarted nodes were still running. The next arm did
+perform another reset, but racing removal against live TSM creation made the
+evidence unnecessarily mutable. A later backpressure run exposed a second
+fail-open path: `timestar_insert_bench` printed a failed health preflight but
+returned success, leaving an empty load summary for the shell to parse.
 
-- `node_kill_round.sh`
-- `restart_catchup_gate.sh`
-- `snapshot_durability_gate.sh`
-
-Passing unit/socket suites does not discharge these multi-process failure paths.
+Commits `09a62c5` and `2e06cb8` make data reset and benchmark preflight
+fail-closed, preserve benchmark transcripts, and require all nodes to report
+healthy before load begins. Backpressure, node-kill, restart-catch-up, and
+snapshot-durability then passed one at a time on the exact `2e06cb8` executable
+tree. CR-FIX-071 and CR-FIX-077 record the complete results. This closes the
+stale-evidence finding, but does not discharge the separate topology, security,
+large-snapshot, live-install, retention, or delete-idempotency gates.
 
 ## Fix-up task list
 
@@ -612,19 +629,29 @@ is not completion.
 - [ ] **CR-FIX-070 — add regression tests for every P0/P1 task above.** Owner:
   each component owner. Tests must exercise the public server path, not only an
   isolated library brick, wherever the defect was caused by missing composition.
-- [ ] **CR-FIX-071 — rerun the four stale live gates one at a time on the final
+- [x] **CR-FIX-071 — rerun the four stale live gates one at a time on the final
   candidate.** Owner: release. Record commit, hardware, configuration, free
   space, and complete results for backpressure, node kill, restart catch-up, and
-  snapshot durability. **Progress:** `backpressure_gate.sh` passed at `69ac879`
-  on an AMD Ryzen 9 7950X (16 cores/32 threads), 123 GiB RAM, Linux
-  7.0.0-28-generic, with 62 GiB free on `/tmp`. Configuration was three
-  loopback nodes, partitioned RF=3, `--smp 4`, development-only insecure
-  transport, the gate's 1,000,000-byte/shard subject limit, and the default
-  32 MiB/shard recovery limit. Subject results: 16/16 deterministic overload
-  requests returned 503 and `Retry-After`, 0 returned 500; 200/200 load batches
-  were rejected explicitly; a single write returned 200; no node crashed.
-  Recovery results: 200/200 batches accepted at 5,900,261 points/s, zero HTTP
-  or connection errors, zero server-side admission rejections, zero crashes.
+  snapshot durability. **Completed on executable commit `2e06cb8`:** AMD Ryzen
+  9 7950X (16 cores/32 threads), 123 GiB RAM, Linux 7.0.0-28-generic, and 62 GiB
+  free on `/tmp`. All gates used three loopback nodes, partitioned RF=3,
+  `--smp 4`, and the explicitly development-only insecure transport override.
+  Backpressure returned 503 plus `Retry-After` for 16/16 deterministic probes,
+  explicitly rejected 200/200 overload batches, served a subsequent write, and
+  recovered to 200/200 accepted batches at 5,937,134 points/s with no 500s,
+  connection failures, admission rejections, or crashes. Node-kill placed 1,364
+  leaders on the killed node; 367/400 concurrent batches succeeded, 33 returned
+  explicit HTTP errors, 45/50 outage probes were acknowledged, and every
+  acknowledged probe was readable on both survivors with no connection
+  failures, 500s, or crashes. Restart catch-up accepted 400/400 batches while
+  node 3 was down, took eight snapshots, caught node 3 up on all 3,968 groups
+  led by the survivors, installed four snapshots from 13 chunks, and reported
+  no undeliverable/abandoned transfers, quota fences, 500s, or crashes. Snapshot
+  durability preserved all 200/200 acknowledged probes on every node after
+  `kill -9`; the fence and subject arms recovered 17 and 35 compacted journals,
+  respectively, while the no-snapshot control took zero snapshots. All arms
+  reported zero recovery refusals, oversize refusals, quota fences, 500s, and
+  crashes.
 - [ ] **CR-FIX-072 — run topology and security gates missing from the current
   register.** Owner: release. Required scenarios: partitioned former-leader read,
   RF&lt;N primary death and black hole, empty-node snapshot catch-up with deletes,
@@ -651,6 +678,15 @@ is not completion.
   offline upgrade. **Done when:** old-to-new and new-to-old snapshot and command
   attempts follow the documented safe path, mixed-version behavior is covered
   by a multi-process test, and rollback constraints are explicit.
+- [x] **CR-FIX-077 — make live-gate orchestration fail closed.** Owner:
+  release/tests. Restrict reset targets to direct `/tmp/tsgate_*` roots, retry
+  removal and prove absence before recreation, never delete a running arm's
+  data, require cluster-aware health before benchmark load, preserve benchmark
+  stdout/stderr, and make benchmark preflight failures nonzero. **Done when:**
+  helper negative tests reject unsafe paths, every gate passes `bash -n`, an
+  unreachable benchmark endpoint exits nonzero, and the four gates in
+  CR-FIX-071 pass without reset warnings or empty load transcripts. Completed in
+  `09a62c5` and `2e06cb8`.
 
 ## Release exit criteria
 
@@ -709,4 +745,19 @@ HTTP startup/lifecycle regressions: 10/10 passed
 soft nofile 1024, hard 524288:       raised to 8192; 4096 groups opened; HTTP served; clean exit 0
 soft/hard nofile 1024:               actionable pre-Engine refusal; clean exit 1; no SIGILL
 backpressure_gate.sh:                passed (subject overload + default-budget restart recovery)
+```
+
+Live-gate harness validation for `09a62c5` and `2e06cb8`:
+
+```text
+current full unit suite:               4341/4341 passed (443 suites, -c 2)
+current socket-backed cluster suite:     45/45 passed (8 suites, -c 2)
+verified gate reset helper:           passed, including unsafe-target rejection
+test/cluster_gates/*.sh:              bash -n passed
+insert bench invalid format:          nonzero exit with invalid-argument diagnostic
+insert bench unreachable health:      nonzero exit with health-preflight diagnostic
+backpressure_gate.sh:                 passed on 2e06cb8
+node_kill_round.sh:                   passed on 2e06cb8
+restart_catchup_gate.sh:              passed on 2e06cb8
+snapshot_durability_gate.sh:          passed on 2e06cb8
 ```
