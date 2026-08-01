@@ -1,18 +1,33 @@
 #include "group0_controller.hpp"
 
+#include <algorithm>
 #include <seastar/core/coroutine.hh>
+#include <stdexcept>
 
 namespace timestar::control {
 
-seastar::future<bool> Group0Controller::proposeCommand(const ControlCommand& cmd) {
+seastar::future<bool> Group0Controller::proposeCommand(ControlCommand cmd) {
     if (!g0_.isLeader())
         co_return false;
-    co_return co_await g0_.propose(encodeCommand(cmd));
+    // A control-plane success is a published cluster decision, not merely a
+    // local log append. In particular, callers use this return as the format
+    // activation and placement-policy fence. Resolve only after this exact
+    // entry is quorum committed and applied on the controller.
+    co_return co_await g0_.proposeAndAwaitApplied(encodeCommand(cmd));
 }
 
 seastar::future<bool> Group0Controller::activateFormat(uint32_t version,
                                                        const std::vector<features::VersionRange>& voterVersions) {
     if (!g0_.isLeader())
+        co_return false;
+    if (version <= sm_.state().activeFormatVersion)
+        co_return false;
+    // The supplied ranges are positional metadata for the CURRENT stable voter
+    // set. Missing a voter would make an unsafe activation look unanimous; an
+    // extra range is equally ambiguous. Refuse changes during joint consensus,
+    // where there is no single positional voter set to validate against.
+    const auto& config = g0_.node().config();
+    if (config.joint() || voterVersions.size() != config.voters.size())
         co_return false;
     // SAFETY GATE (decision 8): activate ONLY if every current voter can read the
     // format, so no node is ever sent data in a format it cannot decode. Refuse
@@ -23,12 +38,40 @@ seastar::future<bool> Group0Controller::activateFormat(uint32_t version,
 }
 
 seastar::future<> Group0Controller::initCluster(std::string clusterUuid, NodeRecord selfRecord) {
-    // A fresh group 0 is already a group of one (self is the sole voter). Record
-    // the cluster identity, this node (Active), and mirror the sole-voter set.
+    if (!g0_.isLeader())
+        co_return;
+    if (clusterUuid.empty())
+        throw std::invalid_argument("group0 init: cluster UUID must not be empty");
+    if (selfRecord.raftId == raft::kNoNode || selfRecord.uuid.empty() || selfRecord.address.empty())
+        throw std::invalid_argument("group0 init: self node id, UUID, and address must be set");
+
+    const auto& config = g0_.node().config();
+    if (config.joint() || std::find(config.voters.begin(), config.voters.end(), selfRecord.raftId) ==
+                              config.voters.end())
+        throw std::logic_error("group0 init: self must belong to a stable initial voter set");
+    const std::vector<NodeId> initialVoters = config.voters;
+
+    // Retrying an interrupted ceremony with the same identity is safe; using
+    // `cluster init` to rewrite an existing cluster or node identity is not.
+    const auto& state = sm_.state();
+    if (!state.clusterUuid.empty() && state.clusterUuid != clusterUuid)
+        throw std::runtime_error("group0 init: cluster is already initialized with a different UUID");
+    if (auto it = state.nodes.find(selfRecord.raftId); it != state.nodes.end() && it->second.uuid != selfRecord.uuid)
+        throw std::runtime_error("group0 init: Raft node id is already bound to a different node UUID");
+    for (const auto& [id, record] : state.nodes)
+        if (id != selfRecord.raftId && record.uuid == selfRecord.uuid)
+            throw std::runtime_error("group0 init: node UUID is already bound to a different Raft id");
+
+    // Record the cluster identity and this node, then mirror the actual initial
+    // voter set. The initial group may deliberately contain several statically
+    // configured voters so bootstrap itself requires quorum.
     selfRecord.state = NodeState::Active;
-    co_await proposeCommand(InitCluster{std::move(clusterUuid)});
-    co_await proposeCommand(UpsertNode{selfRecord});
-    co_await proposeCommand(SetMetaVoters{{selfRecord.raftId}});
+    if (sm_.state().clusterUuid.empty() && !co_await proposeCommand(InitCluster{clusterUuid}))
+        co_return;
+    if (!co_await proposeCommand(UpsertNode{selfRecord}))
+        co_return;
+    if (!co_await proposeCommand(SetMetaVoters{initialVoters}))
+        co_return;
     co_await stampControllerTermIfLeader();
 }
 
@@ -42,6 +85,8 @@ seastar::future<> Group0Controller::admitNode(NodeRecord record) {
 }
 
 seastar::future<bool> Group0Controller::mintJoinToken(std::string token) {
+    if (token.empty() || sm_.state().joinTokens.contains(token))
+        co_return false;
     co_return co_await proposeCommand(MintJoinToken{std::move(token)});
 }
 
@@ -49,7 +94,20 @@ seastar::future<bool> Group0Controller::admitNodeWithToken(NodeRecord record, st
     // The token is validated + consumed atomically at apply time; the command
     // is a no-op if the token is invalid. Reconcile runs as a separate step.
     record.state = NodeState::Active;
-    co_return co_await proposeCommand(AdmitWithToken{std::move(record), std::move(token)});
+    if (!g0_.isLeader())
+        co_return false;
+    if (!sm_.state().joinTokens.contains(token)) {
+        // An ambiguous retry after the first command committed is idempotently
+        // successful only for the exact node record that consumed it. A replay
+        // attempting to admit another identity remains rejected.
+        if (auto it = sm_.state().nodes.find(record.raftId); it != sm_.state().nodes.end())
+            co_return it->second == record;
+        co_return false;
+    }
+    if (!co_await proposeCommand(AdmitWithToken{record, std::move(token)}))
+        co_return false;
+    auto it = sm_.state().nodes.find(record.raftId);
+    co_return it != sm_.state().nodes.end() && it->second == record;
 }
 
 seastar::future<bool> Group0Controller::reconcileMetaVoters() {

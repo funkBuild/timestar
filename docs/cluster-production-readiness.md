@@ -1239,8 +1239,14 @@ is not completion.
   ID 4096 (without colliding with data VShard 0), persists control state in a
   dedicated `group0` journal, restores snapshots/log state after restart, and
   rejects a corrupt recovered snapshot before serving. Focused
-  codec/state-machine/host evidence passes 16/16. Production composition, the
-  explicit bootstrap ceremony, and publication of committed state to the data
+  codec/state-machine/host evidence passes 16/16. Controller mutations now own
+  their command across asynchronous quorum waits and acknowledge only after the
+  exact entry is committed and applied; the RF=3 test proves a local-only append
+  remains pending. Bootstrap retries reject conflicting cluster/node identity,
+  mirror the complete stable initial voter set, and token admission reports the
+  deterministic applied outcome. The combined focused controller/identity/host/
+  codec/state evidence passes 25/25. Production composition, the operator-facing
+  explicit bootstrap trigger, and publication of committed state to the data
   plane remain outstanding.
 - [ ] **CR-FIX-022 — wire resumable join, drain, remove, replace, and VShard
   movement.** Owner: movement/control plane. Include learner catch-up, verified
@@ -1444,13 +1450,16 @@ is not completion.
   `CLUSTER_FORMAT_NOT_ACTIVE` until v5 is active. Readiness now fails while the
   local minimum format is below snapshot v2, rather than treating a running but
   permanently refusing snapshot timer as healthy. Codec decoders remain
-  unconditional for replay and upgrade. **Still open:** compose and persist
-  group 0 in the production server, close the data-voter-set/admission hole,
-  publish the committed activation to every shard, preflight legacy receipt
-  counts, state the downgrade rule, and run old/new multi-process snapshot and
-  command tests. Because the production server has no group-0 bridge caller,
-  this fail-closed slice deliberately leaves clustered readiness false and
-  bounded deletes unavailable; it does not close this task.
+  unconditional for replay and upgrade. Group-0 activation now also refuses a
+  non-advancing version, a joint voter configuration, or any capability list
+  whose cardinality differs from the complete stable voter set; success is not
+  returned until the activation entry applies. **Still open:** compose and
+  persist group 0 in the production server, close the data-voter-set/admission
+  hole, publish the committed activation to every shard, preflight legacy
+  receipt counts, state the downgrade rule, and run old/new multi-process
+  snapshot and command tests. Because the production server has no group-0
+  bridge caller, this fail-closed slice deliberately leaves clustered readiness
+  false and bounded deletes unavailable; it does not close this task.
 - [x] **CR-FIX-077 — make live-gate orchestration fail closed.** Owner:
   release/tests. Restrict reset targets to direct `/tmp/tsgate_*` roots, retry
   removal and prove absence before recreation, never delete a running arm's

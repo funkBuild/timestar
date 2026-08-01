@@ -29,7 +29,9 @@ public:
     raft::NodeId self() const { return g0_.node().id(); }
 
     // `cluster init`: mint the cluster UUID, record this node (Active), and mirror
-    // the sole-voter set. The fresh group 0 is already a group of one.
+    // the stable initial Raft voter set. A multi-voter initial group therefore
+    // requires quorum for the bootstrap ceremony. Same-identity retries are
+    // allowed; conflicting cluster/node identity fails closed.
     seastar::future<> initCluster(std::string clusterUuid, NodeRecord selfRecord);
 
     // Admit a node into the cluster (record it Active) and re-evaluate the meta
@@ -51,8 +53,11 @@ public:
     // first time we lead under it. Idempotent (SetControllerTerm is monotonic).
     seastar::future<> stampControllerTermIfLeader();
 
-    // Propose a single control command (leader only). Returns false if not leader.
-    seastar::future<bool> proposeCommand(const ControlCommand& cmd);
+    // Propose a single control command (leader only). Returns true only after
+    // this exact entry is quorum committed and applied on this controller;
+    // false means it was rejected before append because this node was not leader.
+    // Leadership loss after append is an ambiguous outcome and throws.
+    seastar::future<bool> proposeCommand(ControlCommand cmd);
 
     // Activate wire/storage format `version` cluster-wide (rolling upgrade, decision
     // 8) ONLY if every current group-0 voter's supported range covers it (FeatureGate::

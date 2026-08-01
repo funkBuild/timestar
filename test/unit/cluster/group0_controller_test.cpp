@@ -13,6 +13,7 @@
 #include <memory>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
+#include <seastar/util/later.hh>
 #include <vector>
 
 using namespace timestar::control;
@@ -81,6 +82,49 @@ struct NodeBox {
     std::unique_ptr<RaftGroup> group;
 };
 
+using Nodes = std::map<NodeId, NodeBox>;
+
+seastar::future<> tickAndPump(Nodes& nodes, Router& router) {
+    co_await router.pump();
+    for (auto& [id, node] : nodes)
+        co_await node.group->tick();
+    co_await router.pump();
+    // The in-memory persistence and transport commonly return ready futures.
+    // Yield explicitly so the controller continuation awakened by an applied
+    // proposal can issue its next bootstrap command before this driver burns
+    // through every round in one reactor task.
+    co_await seastar::yield();
+}
+
+template <typename T>
+seastar::future<T> drive(seastar::future<T> future, Nodes& nodes, Router& router, int rounds = 200) {
+    for (int i = 0; i < rounds && !future.available(); ++i)
+        co_await tickAndPump(nodes, router);
+    if (!future.available()) {
+        const auto& first = nodes.begin()->second;
+        throw std::runtime_error("group0 test future did not settle: commit=" +
+                                 std::to_string(first.group->commitIndex()) + " applied=" +
+                                 std::to_string(first.group->appliedIndex()) + " state-applied=" +
+                                 std::to_string(first.sm->state().appliedIndex) + " cluster=" +
+                                 first.sm->state().clusterUuid);
+    }
+    co_return co_await std::move(future);
+}
+
+seastar::future<> drive(seastar::future<> future, Nodes& nodes, Router& router, int rounds = 200) {
+    for (int i = 0; i < rounds && !future.available(); ++i)
+        co_await tickAndPump(nodes, router);
+    if (!future.available()) {
+        const auto& first = nodes.begin()->second;
+        throw std::runtime_error("group0 test future did not settle: commit=" +
+                                 std::to_string(first.group->commitIndex()) + " applied=" +
+                                 std::to_string(first.group->appliedIndex()) + " state-applied=" +
+                                 std::to_string(first.sm->state().appliedIndex) + " cluster=" +
+                                 first.sm->state().clusterUuid);
+    }
+    co_await std::move(future);
+}
+
 RaftOptions optsFor(NodeId id) {
     RaftOptions o;
     o.electionTimeoutMin = o.electionTimeoutMax = (id == 1 ? 2 : 50);  // node 1 leads
@@ -101,7 +145,7 @@ NodeRecord rec(NodeId id, std::string dom) {
 seastar::future<> testClusterInitGrowsMetaVotersAcrossDomains() {
     Router router;
     std::vector<std::unique_ptr<RouterTransport>> transports;
-    std::map<NodeId, NodeBox> nodes;
+    Nodes nodes;
 
     // group-0 voters start as {1}; nodes 2 and 3 are observers that know that.
     auto makeNode = [&](NodeId id, std::vector<NodeId> knownVoters) {
@@ -125,23 +169,18 @@ seastar::future<> testClusterInitGrowsMetaVotersAcrossDomains() {
     co_await nodes[1].group->campaign();
     co_await router.pump();
     EXPECT_TRUE(nodes[1].group->isLeader());
-    co_await controller.initCluster("cluster-xyz", rec(1, "rack-a"));
-    co_await router.pump();
+    co_await drive(controller.initCluster("cluster-xyz", rec(1, "rack-a")), nodes, router);
     EXPECT_EQ(nodes[1].sm->state().clusterUuid, "cluster-xyz");
     EXPECT_EQ(nodes[1].group->node().config().voters, (std::vector<NodeId>{1}));
 
     // Admit node 2 (rack-b), let it commit, then reconcile: meta voters -> {1,2}.
-    co_await controller.admitNode(rec(2, "rack-b"));
-    co_await router.pump();
-    co_await controller.reconcileMetaVoters();
-    co_await router.pump();
+    co_await drive(controller.admitNode(rec(2, "rack-b")), nodes, router);
+    EXPECT_TRUE(co_await drive(controller.reconcileMetaVoters(), nodes, router));
     EXPECT_EQ(nodes[1].group->node().config().voters, (std::vector<NodeId>{1, 2}));
 
     // Admit node 3 (rack-c), commit, reconcile: meta voters -> {1,2,3} (one per domain).
-    co_await controller.admitNode(rec(3, "rack-c"));
-    co_await router.pump();
-    co_await controller.reconcileMetaVoters();
-    co_await router.pump();
+    co_await drive(controller.admitNode(rec(3, "rack-c")), nodes, router);
+    EXPECT_TRUE(co_await drive(controller.reconcileMetaVoters(), nodes, router));
     EXPECT_EQ(nodes[1].group->node().config().voters, (std::vector<NodeId>{1, 2, 3}));
     EXPECT_FALSE(nodes[1].group->node().config().joint());
 
@@ -166,7 +205,7 @@ seastar::future<> testClusterInitGrowsMetaVotersAcrossDomains() {
 seastar::future<> testReadBarrierReconcilesControlMap() {
     Router router;
     std::vector<std::unique_ptr<RouterTransport>> transports;
-    std::map<NodeId, NodeBox> nodes;
+    Nodes nodes;
     auto makeNode = [&](NodeId id, std::vector<NodeId> knownVoters) {
         transports.push_back(std::make_unique<RouterTransport>(router));
         NodeBox box;
@@ -186,12 +225,15 @@ seastar::future<> testReadBarrierReconcilesControlMap() {
     co_await nodes[1].group->campaign();
     co_await router.pump();
     EXPECT_TRUE(nodes[1].group->isLeader());
-    co_await controller.initCluster("c1", rec(1, "rack-a"));
-    co_await router.pump();
+    auto init = controller.initCluster("c1", rec(1, "rack-a"));
+    EXPECT_FALSE(init.available()) << "RF=3 bootstrap must not ack a local-only append";
+    co_await drive(std::move(init), nodes, router);
+    EXPECT_EQ(nodes[1].sm->state().metaVoters, (std::vector<NodeId>{1, 2, 3}));
 
     // A committed topology change bumps the map epoch.
-    co_await controller.proposeCommand(SetDesiredPlacement{5, {1, 2, 3}});
-    co_await router.pump();
+    auto placement = controller.proposeCommand(SetDesiredPlacement{5, {1, 2, 3}});
+    EXPECT_FALSE(placement.available()) << "control mutation must wait for quorum commit and apply";
+    EXPECT_TRUE(co_await drive(std::move(placement), nodes, router));
     const uint64_t epoch = nodes[1].sm->state().mapEpoch;
     EXPECT_GE(epoch, 1u);
 
@@ -199,8 +241,7 @@ seastar::future<> testReadBarrierReconcilesControlMap() {
     // then await it. The barrier index is at least the committed placement, and
     // the state read behind it reflects the new epoch (linearizable).
     auto rb = nodes[1].group->readBarrier();  // enqueues the heartbeat round
-    co_await router.pump();                    // deliver heartbeats + replies -> confirm
-    timestar::raft::LogIndex readIndex = co_await std::move(rb);
+    timestar::raft::LogIndex readIndex = co_await drive(std::move(rb), nodes, router);
     EXPECT_GT(readIndex, 0u);
     EXPECT_EQ(nodes[1].sm->state().mapEpoch, epoch);
     EXPECT_EQ(nodes[1].sm->state().desiredPlacement.at(5), (std::vector<NodeId>{1, 2, 3}));
@@ -218,7 +259,7 @@ seastar::future<> testReadBarrierReconcilesControlMap() {
 seastar::future<> testJoinTokenGatesAdmission() {
     Router router;
     std::vector<std::unique_ptr<RouterTransport>> transports;
-    std::map<NodeId, NodeBox> nodes;
+    Nodes nodes;
     auto makeNode = [&](NodeId id) {
         transports.push_back(std::make_unique<RouterTransport>(router));
         NodeBox box;
@@ -239,18 +280,31 @@ seastar::future<> testJoinTokenGatesAdmission() {
     co_await router.pump();
 
     // A node presenting an UNMINTED token is rejected.
-    co_await controller.admitNodeWithToken(rec(9, "rack-x"), "bad-token");
+    EXPECT_FALSE(co_await controller.admitNodeWithToken(rec(9, "rack-x"), "bad-token"));
     co_await router.pump();
     EXPECT_EQ(nodes[1].sm->state().nodes.count(9), 0u);
 
     // Mint a token, then the node joins with it -> admitted, token consumed.
     co_await controller.mintJoinToken("join-42");
     co_await router.pump();
-    co_await controller.admitNodeWithToken(rec(2, "rack-b"), "join-42");
+    EXPECT_TRUE(co_await controller.admitNodeWithToken(rec(2, "rack-b"), "join-42"));
     co_await router.pump();
     EXPECT_EQ(nodes[1].sm->state().nodes.count(2), 1u);
     EXPECT_EQ(nodes[1].sm->state().nodes.at(2).state, NodeState::Active);
     EXPECT_EQ(nodes[1].sm->state().joinTokens.count("join-42"), 0u);
+    EXPECT_TRUE(co_await controller.admitNodeWithToken(rec(2, "rack-b"), "join-42"))
+        << "an ambiguous retry for the admitted identity is idempotent";
+    EXPECT_FALSE(co_await controller.admitNodeWithToken(rec(3, "rack-c"), "join-42"))
+        << "a consumed token cannot admit another identity";
+
+    bool conflictingInitRejected = false;
+    try {
+        co_await controller.initCluster("different-cluster", rec(1, "rack-a"));
+    } catch (const std::runtime_error&) {
+        conflictingInitRejected = true;
+    }
+    EXPECT_TRUE(conflictingInitRejected);
+    EXPECT_EQ(nodes[1].sm->state().clusterUuid, "c1");
 }
 
 // M6 rolling-upgrade format activation: activateFormat commits a new active version
@@ -258,7 +312,7 @@ seastar::future<> testJoinTokenGatesAdmission() {
 seastar::future<> testFormatActivationGatedByVoterSupport() {
     Router router;
     std::vector<std::unique_ptr<RouterTransport>> transports;
-    std::map<NodeId, NodeBox> nodes;
+    Nodes nodes;
     auto makeNode = [&](NodeId id) {
         transports.push_back(std::make_unique<RouterTransport>(router));
         NodeBox box;
@@ -280,17 +334,22 @@ seastar::future<> testFormatActivationGatedByVoterSupport() {
 
     // Every voter supports 1..3 -> activate 3 succeeds.
     EXPECT_TRUE(co_await controller.activateFormat(3, {timestar::features::VersionRange{1, 3}}));
-    co_await router.pump();
     EXPECT_EQ(nodes[1].sm->state().activeFormatVersion, 3u);
+
+    // Re-activating the already committed version is a no-op, not a successful
+    // cluster decision.
+    EXPECT_FALSE(co_await controller.activateFormat(3, {timestar::features::VersionRange{1, 3}}));
 
     // Version 5 exceeds the voter's max (3) -> REFUSED, no proposal, version unchanged.
     EXPECT_FALSE(co_await controller.activateFormat(5, {timestar::features::VersionRange{1, 3}}));
     co_await router.pump();
     EXPECT_EQ(nodes[1].sm->state().activeFormatVersion, 3u) << "unsupported version must not activate";
 
-    // A second voter that only speaks 1..2 blocks activating 3 (not all can read it).
+    // A range list that does not correspond exactly to the current voter set is
+    // rejected; otherwise a caller could omit an incompatible voter and fake
+    // unanimity.
     EXPECT_FALSE(co_await controller.activateFormat(
-        4, {timestar::features::VersionRange{1, 4}, timestar::features::VersionRange{1, 2}}));
+        4, {timestar::features::VersionRange{1, 4}, timestar::features::VersionRange{1, 4}}));
     co_await router.pump();
     EXPECT_EQ(nodes[1].sm->state().activeFormatVersion, 3u) << "one lagging voter blocks activation";
 
