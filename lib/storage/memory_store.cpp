@@ -788,3 +788,24 @@ void MemoryStore::deleteRange(const SeriesId128& seriesId, uint64_t startTime, u
         series.erase(seriesId);
     }
 }
+
+size_t MemoryStore::deleteVShard(uint16_t vshard) {
+    if (vshard >= timestar::VIRTUAL_SHARD_COUNT)
+        throw std::invalid_argument("MemoryStore::deleteVShard: invalid VShard");
+
+    size_t removed = 0;
+    for (auto it = series.begin(); it != series.end();) {
+        if (timestar::virtualShard(it.key()) == vshard) {
+            it = series.erase(it);
+            ++removed;
+        } else {
+            ++it;
+        }
+    }
+
+    // This bit is an exact presence predicate. Clear it once the last target
+    // series is gone so conversion/snapshot admission does not remain
+    // conservatively blocked by a generation that was already replaced.
+    vshardBits_[vshard >> 6] &= ~(uint64_t{1} << (vshard & 63));
+    return removed;
+}

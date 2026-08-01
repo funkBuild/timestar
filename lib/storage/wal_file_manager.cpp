@@ -835,6 +835,26 @@ seastar::future<> WALFileManager::deleteFromMemoryStores(const std::string& seri
     co_return;
 }
 
+seastar::future<size_t> WALFileManager::deleteVShardFromMemoryStores(uint16_t vshard) {
+    if (vshard >= timestar::VIRTUAL_SHARD_COUNT)
+        throw std::invalid_argument("WALFileManager::deleteVShardFromMemoryStores: invalid VShard");
+    if (memoryStores.empty() || !memoryStores.front() || !memoryStores.front()->getWAL())
+        throw std::runtime_error("No active WAL available for VShard generation replacement");
+
+    // Durability precedes visibility: if this append fails, no in-memory state
+    // has changed. The retained Raft suffix is applied only after snapshot
+    // install returns, so this marker orders strictly between the discarded
+    // generation and that suffix on WAL replay.
+    co_await memoryStores.front()->getWAL()->deleteVShard(vshard);
+
+    size_t removed = 0;
+    for (auto& store : memoryStores) {
+        if (store)
+            removed += store->deleteVShard(vshard);
+    }
+    co_return removed;
+}
+
 template seastar::future<> WALFileManager::insert<bool>(TimeStarInsert<bool>& insertRequest);
 template seastar::future<> WALFileManager::insert<double>(TimeStarInsert<double>& insertRequest);
 template seastar::future<> WALFileManager::insert<std::string>(TimeStarInsert<std::string>& insertRequest);

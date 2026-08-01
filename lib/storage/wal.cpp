@@ -882,6 +882,62 @@ seastar::future<> WAL::deleteRange(const SeriesId128& seriesId, uint64_t startTi
                     seriesId.toHex(), startTime, endTime, n);
 }
 
+seastar::future<> WAL::deleteVShard(uint16_t vshard) {
+    if (vshard >= timestar::VIRTUAL_SHARD_COUNT)
+        throw std::invalid_argument("WAL::deleteVShard: invalid VShard");
+
+    // One fixed-size record replaces O(series) DeleteRange records and fsyncs.
+    // Snapshot install is a whole-VShard generation operation, so this is also
+    // the exact recovery semantic: replay the old writes, then discard the
+    // target VShard before any retained Raft suffix is applied.
+    AlignedBuffer buffer;
+    constexpr size_t LENGTH_OFFSET = 0;
+    constexpr size_t CRC_OFFSET = sizeof(uint32_t);
+    constexpr size_t PAYLOAD_OFFSET = 2 * sizeof(uint32_t);
+    buffer.write(static_cast<uint32_t>(0));
+    buffer.write(static_cast<uint32_t>(0));
+    buffer.write(static_cast<uint8_t>(WALType::DeleteVShard));
+    // Store this as u32 rather than u16 so the framed entry is long enough for
+    // the reader's unambiguous CRC-bearing-format discriminator (CRC + payload
+    // must be at least eight bytes). The VShard range check below/replay still
+    // constrains the value to 12 bits.
+    buffer.write(static_cast<uint32_t>(vshard));
+
+    const size_t payloadSize = buffer.size() - PAYLOAD_OFFSET;
+    const uint32_t entryLength = static_cast<uint32_t>(sizeof(uint32_t) + payloadSize);
+    std::memcpy(buffer.data.data() + LENGTH_OFFSET, &entryLength, sizeof(uint32_t));
+    const uint32_t crc = CRC32::compute(buffer.data.data() + PAYLOAD_OFFSET, payloadSize);
+    std::memcpy(buffer.data.data() + CRC_OFFSET, &crc, sizeof(uint32_t));
+
+    const size_t n = buffer.size();
+    auto gateHolder = _io_gate.hold();
+    auto units = co_await seastar::get_units(_io_sem, 1);
+    uint64_t myTicket = 0;
+    try {
+        if (!out)
+            throw std::runtime_error("WAL output stream is null in deleteVShard");
+        co_await out->write(reinterpret_cast<const char*>(buffer.data.data()), n);
+        currentSize += n;
+        _unflushed_bytes += n;
+        myTicket = ++_appendSeq;
+        if (requiresImmediateFlush) {
+            co_await padToAlignment();
+            co_await out->flush();
+            _unflushed_bytes = 0;
+            _syncedSeq = _appendSeq;
+        }
+    } catch (const std::exception& e) {
+        timestar::wal_log.error("WAL::deleteVShard write failed: {}", e.what());
+        throw;
+    }
+
+    if (_syncMode == SyncMode::Always && _syncedSeq < myTicket) {
+        units.return_all();
+        co_await ensureDurable(myTicket);
+    }
+    timestar::wal_log.debug("WAL DeleteVShard written: vshard={}, size={} bytes", vshard, n);
+}
+
 // ------------------------ WALReader ------------------------
 
 WALReader::WALReader(std::string _filename) : filename(std::move(_filename)) {}
@@ -1031,8 +1087,8 @@ seastar::future<> WALReader::readAll(MemoryStore* store) {
                     timestar::wal_log.trace("WAL recovery: CRC32 verified for entry");
                 } else {
                     uint8_t firstByte = rawEntry[0];
-                    bool byte0IsType = firstByte <= static_cast<uint8_t>(WALType::Close);
-                    const bool byte4IsType = crcPayload[0] <= static_cast<uint8_t>(WALType::Close);
+                    bool byte0IsType = firstByte <= static_cast<uint8_t>(WALType::DeleteVShard);
+                    const bool byte4IsType = crcPayload[0] <= static_cast<uint8_t>(WALType::DeleteVShard);
                     if (byte0IsType && !byte4IsType) {
                         // Old format entry (no CRC prefix) - skip CRC verification
                         timestar::wal_log.debug("WAL recovery: old format entry detected (no CRC), type={}", firstByte);
@@ -1122,6 +1178,26 @@ seastar::future<> WALReader::readAll(MemoryStore* store) {
                         entriesRead++;
                     } catch (const std::exception& e) {
                         timestar::wal_log.error("WAL recovery: Failed to read DeleteRange entry: {}", e.what());
+                        partialEntries++;
+                        throw;
+                    } catch (...) {
+                        partialEntries++;
+                        throw;
+                    }
+                } break;
+
+                case WALType::DeleteVShard: {
+                    try {
+                        const uint32_t encodedVShard = entrySlice.read<uint32_t>();
+                        if (encodedVShard >= timestar::VIRTUAL_SHARD_COUNT)
+                            throw std::runtime_error("invalid VShard " + std::to_string(encodedVShard));
+                        const auto vshard = static_cast<uint16_t>(encodedVShard);
+                        const size_t removed = store->deleteVShard(vshard);
+                        timestar::wal_log.debug("WAL recovery: DeleteVShard {} removed {} series", encodedVShard,
+                                                removed);
+                        entriesRead++;
+                    } catch (const std::exception& e) {
+                        timestar::wal_log.error("WAL recovery: Failed to read DeleteVShard entry: {}", e.what());
                         partialEntries++;
                         throw;
                     } catch (...) {

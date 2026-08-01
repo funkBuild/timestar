@@ -26,11 +26,14 @@
 class AlignedBuffer;
 class MemoryStore;
 
-enum class WALType {
+enum class WALType : uint8_t {
     Write = 0,
-    Delete,  // Reserved for future use (point-level delete); not currently written
-    DeleteRange,
-    Close
+    Delete = 1,  // Reserved for future use (point-level delete); not currently written
+    DeleteRange = 2,
+    Close = 3,
+    // Durable storage-generation fence used by live VShard snapshot install.
+    // Explicit value preserves the existing on-disk enum assignments.
+    DeleteVShard = 4,
 };
 enum class WALValueType { Float = 0, Boolean, String, Integer };
 
@@ -221,6 +224,7 @@ private:
 public:
     // Delete range operation
     seastar::future<> deleteRange(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime);
+    seastar::future<> deleteVShard(uint16_t vshard);
 
     // Lifecycle
     seastar::future<> close();

@@ -365,4 +365,9 @@ public:
 
     // Delete data in a time range for a series
     void deleteRange(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime);
+
+    // Remove every in-memory series owned by one VShard. Used when a Raft
+    // snapshot replaces that VShard's complete logical generation. Returns the
+    // number of erased series and leaves every foreign VShard untouched.
+    size_t deleteVShard(uint16_t vshard);
 };

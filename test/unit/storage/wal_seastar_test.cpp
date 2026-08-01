@@ -482,12 +482,12 @@ seastar::future<> testLegacyNoCRCFrameStillRecoversWhenUnambiguous() {
     for (size_t i = 0; i < 1024; ++i) {
         field = "legacy_" + std::to_string(i);
         TimeStarInsert<double> candidate("crc_test", field);
-        if (candidate.seriesId128().getRawData()[3] > static_cast<uint8_t>(WALType::Close)) {
+        if (candidate.seriesId128().getRawData()[3] > static_cast<uint8_t>(WALType::DeleteVShard)) {
             break;
         }
     }
     TimeStarInsert<double> insert("crc_test", field);
-    if (insert.seriesId128().getRawData()[3] <= static_cast<uint8_t>(WALType::Close)) {
+    if (insert.seriesId128().getRawData()[3] <= static_cast<uint8_t>(WALType::DeleteVShard)) {
         throw std::runtime_error("could not construct an unambiguous legacy WAL series id");
     }
     insert.addValue(1000, 55.5);

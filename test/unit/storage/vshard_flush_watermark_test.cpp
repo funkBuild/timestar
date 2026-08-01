@@ -21,6 +21,7 @@
 
 #include <gtest/gtest.h>
 
+#include <filesystem>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/shared_ptr.hh>
@@ -47,6 +48,16 @@ KeyAt keyNotIn(const std::string& measurement, const std::vector<uint16_t>& avoi
         for (uint16_t v : avoid)
             clash = clash || v == k.vshard;
         if (!clash)
+            return k;
+    }
+}
+
+KeyAt keyIn(const std::string& measurement, uint16_t wanted) {
+    for (int i = 0;; ++i) {
+        KeyAt k;
+        k.key = timestar::buildSeriesKey(measurement, {{"host", "h" + std::to_string(i)}}, "value");
+        k.vshard = timestar::virtualShard(SeriesId128::fromSeriesKey(k.key));
+        if (k.vshard == wanted)
             return k;
     }
 }
@@ -162,4 +173,52 @@ seastar::future<> testWalReplayRebuildsTheSameBitmap() {
 }
 TEST(VShardFlushWatermarkTest, WalReplayRebuildsTheSameBitmap) {
     testWalReplayRebuildsTheSameBitmap().get();
+}
+
+// Snapshot replacement writes one VShard-wide marker rather than one fsync per
+// series. Replay must erase every target series, preserve foreign VShards, and
+// rebuild the presence bitmap from the resulting logical WAL state.
+seastar::future<> testWalReplayAppliesVShardGenerationDelete() {
+    const KeyAt targetA = keyNotIn("snapshot_wal_a", {});
+    const KeyAt targetB = keyIn("snapshot_wal_b", targetA.vshard);
+    const KeyAt foreign = keyNotIn("snapshot_wal_foreign", {targetA.vshard});
+    EXPECT_EQ(targetB.vshard, targetA.vshard);
+    EXPECT_NE(foreign.vshard, targetA.vshard);
+
+    const timestar::StorageLayout layout(".");
+    const std::string walPath = layout.walFile(seastar::this_shard_id(), 778).string();
+    std::filesystem::remove(walPath);  // clean a prior interrupted test run
+    auto live = seastar::make_shared<MemoryStore>(778);
+    co_await live->initWAL(layout, seastar::this_shard_id());
+    for (const auto& k : {targetA, targetB, foreign}) {
+        TimeStarInsert<double> ins = TimeStarInsert<double>::fromSeriesKey(k.key);
+        ins.timestamps = {5'000};
+        ins.values = {8.5};
+        ins.setCachedSeriesKey(k.key);
+        EXPECT_FALSE(co_await live->insert(ins));
+    }
+
+    co_await live->getWAL()->deleteVShard(targetA.vshard);
+    EXPECT_EQ(live->deleteVShard(targetA.vshard), 2u);
+    EXPECT_EQ(live->deleteVShard(targetA.vshard), 0u) << "live generation deletion must be idempotent";
+    EXPECT_FALSE(live->touchesVShard(targetA.vshard));
+    EXPECT_TRUE(live->touchesVShard(foreign.vshard));
+    EXPECT_EQ(live->series.count(SeriesId128::fromSeriesKey(targetA.key)), 0u);
+    EXPECT_EQ(live->series.count(SeriesId128::fromSeriesKey(targetB.key)), 0u);
+    EXPECT_EQ(live->series.count(SeriesId128::fromSeriesKey(foreign.key)), 1u);
+    co_await live->close();
+
+    auto recovered = seastar::make_shared<MemoryStore>(779);
+    co_await recovered->initFromWAL(walPath);
+    EXPECT_FALSE(recovered->touchesVShard(targetA.vshard));
+    EXPECT_TRUE(recovered->touchesVShard(foreign.vshard));
+    EXPECT_EQ(recovered->series.count(SeriesId128::fromSeriesKey(targetA.key)), 0u);
+    EXPECT_EQ(recovered->series.count(SeriesId128::fromSeriesKey(targetB.key)), 0u);
+    EXPECT_EQ(recovered->series.count(SeriesId128::fromSeriesKey(foreign.key)), 1u)
+        << "a whole-VShard delete must never erase a colocated foreign VShard";
+    co_await live->removeWAL();
+}
+
+TEST(VShardFlushWatermarkTest, WalReplayAppliesVShardGenerationDelete) {
+    testWalReplayAppliesVShardGenerationDelete().get();
 }

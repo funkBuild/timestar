@@ -272,4 +272,9 @@ public:
 
     // Delete data from memory stores and write to WAL
     seastar::future<> deleteFromMemoryStores(const std::string& seriesKey, uint64_t startTime, uint64_t endTime);
+
+    // Persist and apply a whole-VShard generation tombstone. Snapshot install
+    // must quiesce conversions before calling this so no retiring store can
+    // publish an un-tombstoned TSM concurrently.
+    seastar::future<size_t> deleteVShardFromMemoryStores(uint16_t vshard);
 };
