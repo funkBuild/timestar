@@ -7,7 +7,7 @@
 **Remediation commits:** `95c10d2`, `a16b03a`, `d578e81`, `ddab705`,
 `8620b9e`, `20639dc`, `ea2511b`, `3ac9899`, `69ac879`, `09a62c5`,
 `2e06cb8`, `7151f5d`, `5b22b81`, `fef4886`, `3d2d607`, `f0e28f0`,
-`da55952`, `a1beb94`, `bb5b871`, `e201343`
+`da55952`, `a1beb94`, `bb5b871`, `e201343`, `6ad2c93`
 
 **Scope:** The recent VShard/Raft cluster redesign, its production-server
 integration, the public HTTP surface, recovery paths, and the release evidence
@@ -20,7 +20,7 @@ used as evidence that the current server is production-ready.
 
 ## Implementation progress after the review
 
-Twenty remediation commits are now recorded. Cluster release status remains
+Twenty-one remediation commits are now recorded. Cluster release status remains
 **BLOCKED** because group 0/movement, generation-atomic live snapshot
 replacement, pattern-delete expansion, replicated retention, the large-snapshot
 path, and rolling wire-format compatibility remain open. The four previously
@@ -145,6 +145,11 @@ Completed and covered in this pass:
   the source WAL directory barrier succeeds. Retry sleeps are shutdown-abortable,
   and shutdown makes one final inline attempt without waiting out the 30-second
   production delay.
+- Startup WAL recovery now fails closed if recovered contents cannot be
+  published as a live TSM. The source WAL is preserved, no fresh active store is
+  created over the visibility hole, and a later clean startup can load any
+  valid renamed output, replay the preserved source into a newer rank, retire
+  the WAL durably, and finish initialization.
 
 Focused evidence on this pass includes the rebuilt server, unit and socket test
 targets, journal negative tests, alternate-replica routing tests, a black-holed
@@ -153,7 +158,7 @@ identity/topology tests, and pre-proposal admission tests. The strict checkboxes
 below stay open where their stated multi-process or fault-injection “done when”
 evidence has not yet been run.
 
-Final local validation for these remediation commits is green: 4,362/4,362 unit
+Final local validation for these remediation commits is green: 4,363/4,363 unit
 tests passed with no skips, 45/45 socket-backed cluster tests passed, the
 first-pass 56/56 focused
 cluster/readiness/identity/admission regressions passed, and the second-pass
@@ -227,6 +232,7 @@ item are recorded in the fix-up list.
 | CR-27 | P0 | Tombstone rewrites truncated the live sidecar and were not serialized or directory-durable | A crash or concurrent delete could corrupt the only durable delete set, lose an acknowledged sidecar name, or publish incomplete ranges. |
 | CR-28 | P0 | WAL creation and retirement omitted directory durability and post-publication retries rewrote the TSM | A crash could lose an acknowledged segment or resurrect a converted source; a cleanup retry could then collide with its already-live immutable rank. |
 | CR-29 | P0 | A background WAL conversion was abandoned and evicted after two failures | Acknowledged data disappeared from live queries until restart, conversion-pending snapshot fences became falsely clear, and admission resumed while that durable data existed only in an offline WAL. |
+| CR-30 | P0 | Startup continued after a recovered WAL failed TSM conversion | The node destroyed the recovered in-memory data, created a fresh active WAL, and reported startup success while acknowledged points remained query-invisible in an offline source file. |
 
 ### CR-01 — deletes bypass consensus
 
@@ -417,6 +423,26 @@ publication and retirement work inline. Fault injection proves both publication
 and WAL-retirement failures continue past the former two-attempt limit, retain
 the correct visibility/accounting state, converge without a duplicate TSM rank,
 and drain cleanly.
+
+### CR-30 — failed WAL recovery conversion did not fence startup
+
+During [`WALFileManager::init`](../lib/storage/wal_file_manager.cpp), a recovered
+WAL was replayed into a temporary `MemoryStore` and converted to TSM. The
+`bad_alloc` branch propagated, but every other conversion exception was logged
+and swallowed. The loop then released the temporary store, created a fresh
+active WAL, and reported recovery and initialization complete. Preserving the
+source file protected a future restart but did not make its acknowledged data
+visible to the running node; successful reads could therefore return an
+incomplete dataset indefinitely.
+
+Commit `6ad2c93` preserves the source and rethrows the original conversion
+exception, preventing Engine startup from reaching a serving state without the
+recovered generation. Fault injection at the TSM parent-directory barrier proves
+the failed output is not registered, the WAL remains, and no fresh active store
+is created. The same test then constructs a clean process boundary: a valid
+renamed TSM left by the uncertain barrier is loaded, the preserved WAL is replayed
+into a newer immutable rank, the source is durably retired, and startup completes
+with one active store.
 
 ### CR-02 and CR-03 — snapshot contents and live installation were unsafe
 
@@ -738,6 +764,11 @@ is not completion.
   published stores awaiting WAL retirement remain outside memory queries but
   inside retained-memory admission. Repeated-failure regressions cover both
   states and recovery without duplicate immutable publication.
+- [x] **CR-FIX-019F — fail startup when recovered WAL data is not live.**
+  Owner: storage. Any recovered-WAL conversion error propagates after preserving
+  the source; startup cannot create a fresh active store over missing recovered
+  contents. An injected publication-barrier failure also proves the next clean
+  startup can load the uncertain output, replay and retire the WAL, and finish.
 
 ### 2. Complete control-plane and identity wiring
 
@@ -1095,6 +1126,17 @@ WAL conversion-retention validation for `e201343`:
 focused publication/retirement retry tests:  3/3 passed
 related WAL/conversion/storage tests:        96/96 passed
 current full unit suite:                  4362/4362 passed (444 suites, -c 2)
+current socket-backed cluster suite:        45/45 passed (8 suites, -c 2)
+timestar_http_server:                       built successfully
+git diff --check:                           passed
+```
+
+Fail-closed WAL startup validation for `6ad2c93`:
+
+```text
+focused recovery publication/restart test:   1/1 passed
+related WAL/recovery/storage tests:          97/97 passed
+current full unit suite:                  4363/4363 passed (444 suites, -c 2)
 current socket-backed cluster suite:        45/45 passed (8 suites, -c 2)
 timestar_http_server:                       built successfully
 git diff --check:                           passed
