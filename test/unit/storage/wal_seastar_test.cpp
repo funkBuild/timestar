@@ -42,6 +42,70 @@ protected:
     }
 };
 
+seastar::future<> testWALDirectoryDurabilityBoundaries() {
+    const unsigned shard = seastar::this_shard_id();
+    const unsigned sequence = 9001;
+    const timestar::StorageLayout layout(".");
+    const std::string path = layout.walFile(shard, sequence).string();
+
+    // Creation is not a usable WAL boundary until the segment name itself is
+    // durable. A failed barrier must propagate and close the opened descriptor.
+    {
+        WAL wal(sequence, layout, shard);
+        size_t syncCalls = 0;
+        wal.setDirectorySyncForTesting([&](const std::string&) {
+            ++syncCalls;
+            return seastar::make_exception_future<>(std::runtime_error("injected WAL create directory sync failure"));
+        });
+
+        bool failed = false;
+        try {
+            co_await wal.init(nullptr);
+        } catch (const std::runtime_error&) {
+            failed = true;
+        }
+        EXPECT_TRUE(failed);
+        EXPECT_EQ(syncCalls, 1u);
+    }
+
+    // A fresh owner can safely retry the uncertain creation, then a removal
+    // whose unlink succeeds but directory barrier fails must itself be
+    // retryable even though the path is already absent.
+    {
+        WAL wal(sequence, layout, shard);
+        co_await wal.init(nullptr);
+        co_await wal.close();
+        EXPECT_TRUE(co_await seastar::file_exists(path));
+
+        size_t removalSyncCalls = 0;
+        wal.setDirectorySyncForTesting([&](const std::string&) {
+            ++removalSyncCalls;
+            return seastar::make_exception_future<>(std::runtime_error("injected WAL unlink directory sync failure"));
+        });
+
+        bool failed = false;
+        try {
+            co_await wal.remove();
+        } catch (const std::runtime_error&) {
+            failed = true;
+        }
+        EXPECT_TRUE(failed);
+        EXPECT_FALSE(co_await seastar::file_exists(path));
+
+        wal.setDirectorySyncForTesting([&](const std::string& directory) {
+            ++removalSyncCalls;
+            return seastar::sync_directory(directory);
+        });
+        co_await wal.remove();
+        EXPECT_FALSE(co_await seastar::file_exists(path));
+        EXPECT_EQ(removalSyncCalls, 2u);
+    }
+}
+
+TEST_F(WALSeastarTest, CreationAndRemovalAreDirectoryDurableAndRetryable) {
+    testWALDirectoryDurabilityBoundaries().get();
+}
+
 seastar::future<> testWALWriteAndRecoverFloat() {
     unsigned int sequenceNumber = 1;
     auto store = std::make_shared<MemoryStore>(sequenceNumber);

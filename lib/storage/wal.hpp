@@ -8,6 +8,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/file.hh>
@@ -19,6 +20,7 @@
 #include <seastar/core/shared_future.hh>
 #include <seastar/core/timer.hh>
 #include <string>
+#include <utility>
 #include <vector>
 
 class AlignedBuffer;
@@ -111,6 +113,10 @@ private:
     const timestar::StorageLayout layout_;
     unsigned shardId_;
     seastar::file walFile;
+    // A file fdatasync does not make creation or unlink of its directory entry
+    // durable. Keep this injectable so both crash boundaries can be tested
+    // without process-global filesystem hooks.
+    std::function<seastar::future<>(const std::string&)> directorySync_;
 
     // Streamed, unaligned I/O (buffered internally by Seastar)
     std::optional<seastar::output_stream<char>> out;
@@ -225,6 +231,9 @@ public:
 
     // Configuration
     void setImmediateFlush(bool immediate) { requiresImmediateFlush = immediate; }
+    void setDirectorySyncForTesting(std::function<seastar::future<>(const std::string&)> sync) {
+        directorySync_ = std::move(sync);
+    }
 
     // Utilities
     static std::string sequenceNumberToFilename(unsigned int sequenceNumber);

@@ -128,16 +128,33 @@ TEST_F(BugfixSourceInspectionTest, Bug7_NoDoubleWALRemoval) {
     std::string src = readFile(WAL_FILE_MANAGER_CPP_SOURCE_PATH);
     ASSERT_FALSE(src.empty()) << "Could not read wal_file_manager.cpp";
 
-    // The fix should guard the removal with file_exists
+    // Recovery removal is delegated to one idempotent helper so both the old
+    // double-remove edge and the newer directory-durability boundary have one
+    // implementation.
     auto initFn = src.find("WALFileManager::init(");
     ASSERT_NE(initFn, std::string::npos) << "WALFileManager::init not found in source";
 
     auto initEnd = src.find("\nWALFileManager::", initFn + 25);
     std::string initBody = src.substr(initFn, initEnd != std::string::npos ? initEnd - initFn : std::string::npos);
+    EXPECT_NE(initBody.find("removeRecoveredWal(walFilename)"), std::string::npos)
+        << "WAL init() must delegate recovered source retirement to the durable helper";
+    EXPECT_EQ(initBody.find("remove_file(walFilename)"), std::string::npos)
+        << "WAL init() must not bypass the idempotent retirement helper";
 
-    // Should have file_exists guard before remove_file
-    EXPECT_NE(initBody.find("file_exists"), std::string::npos)
-        << "WAL init() must guard remove_file with file_exists to prevent double removal";
+    auto helperFn = src.find("WALFileManager::removeRecoveredWal(");
+    ASSERT_NE(helperFn, std::string::npos) << "durable recovered-WAL removal helper not found";
+    auto helperEnd = src.find("\nseastar::future", helperFn + 35);
+    std::string helperBody = src.substr(helperFn, helperEnd != std::string::npos ? helperEnd - helperFn
+                                                                                : std::string::npos);
+    const auto existsPos = helperBody.find("file_exists");
+    const auto removePos = helperBody.find("remove_file");
+    const auto syncPos = helperBody.find("directorySync_");
+
+    ASSERT_NE(existsPos, std::string::npos);
+    ASSERT_NE(removePos, std::string::npos);
+    ASSERT_NE(syncPos, std::string::npos);
+    EXPECT_LT(existsPos, removePos) << "file existence must guard the unlink for idempotent retry";
+    EXPECT_LT(removePos, syncPos) << "directory sync must follow the recovered WAL unlink";
 }
 
 // ---------------------------------------------------------------------------

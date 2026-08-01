@@ -205,6 +205,12 @@ public:
     // falls back to assigning at write time, which is safe there because those
     // paths convert sequentially.
     std::optional<uint64_t> reservedTsmSeq;
+    // Once writeMemstore has durably published and registered this store's TSM,
+    // a failure retiring the WAL must retry only that retirement. Re-encoding
+    // the same store would collide with the live rank and could prevent the
+    // directory barrier from ever being retried.
+    bool walConversionPublished = false;
+    uint64_t walConversionTsmBytes = 0;
     // Use robin_map for O(1) lookups with better cache locality than std::unordered_map
     tsl::robin_map<SeriesId128, VariantInMemorySeries, SeriesId128::Hash> series;
 

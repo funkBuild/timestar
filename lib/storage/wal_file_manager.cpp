@@ -36,7 +36,19 @@ static std::optional<unsigned int> parseWalSeqNum(const std::string& path) {
 }
 
 WALFileManager::WALFileManager(timestar::StorageLayout layout, unsigned shard)
-    : layout_(std::move(layout)), shardId(static_cast<int>(shard)) {}
+    : layout_(std::move(layout)),
+      shardId(static_cast<int>(shard)),
+      directorySync_([](const std::string& directory) { return seastar::sync_directory(directory); }) {}
+
+seastar::future<> WALFileManager::removeRecoveredWal(const std::string& path) {
+    // A retry after unlink succeeded but directory sync failed sees no name;
+    // it still has to repeat the durability barrier before reporting success.
+    if (co_await seastar::file_exists(path)) {
+        co_await seastar::remove_file(path);
+    }
+    fs::path parent = fs::path(path).parent_path();
+    co_await directorySync_(parent.empty() ? "." : parent.string());
+}
 
 seastar::future<> WALFileManager::init(Engine& engine, TSMFileManager& _tsmFileManager) {
     timestar::wal_log.info("WALFileManager::init starting for shard {}", shardId);
@@ -132,7 +144,6 @@ seastar::future<> WALFileManager::init(Engine& engine, TSMFileManager& _tsmFileM
             timestar::wal_log.info("Writing memory store {} to TSM on shard {}", seqNum, shardId);
             try {
                 co_await convertWalToTsm(store);
-                timestar::wal_log.info("Successfully converted WAL {} to TSM on shard {}", seqNum, shardId);
                 conversionSucceeded = true;
             } catch (const std::bad_alloc& e) {
                 timestar::wal_log.error("Failed to convert WAL {} to TSM on shard {} - bad_alloc", seqNum, shardId);
@@ -149,11 +160,13 @@ seastar::future<> WALFileManager::init(Engine& engine, TSMFileManager& _tsmFileM
             conversionSucceeded = true;  // Empty WAL, safe to remove
         }
 
-        // Only remove WAL file if conversion succeeded or store was empty.
-        // Guard with file_exists to avoid double-removal if convertWalToTsm
-        // already removed it internally via store->removeWAL().
-        if (conversionSucceeded && co_await seastar::file_exists(walFilename)) {
-            co_await seastar::remove_file(walFilename);
+        // Recovery stores do not own a WAL object, so convertWalToTsm cannot
+        // retire this source internally. Do not complete startup until unlink
+        // and the containing-directory barrier both succeed.
+        if (conversionSucceeded) {
+            co_await removeRecoveredWal(walFilename);
+            timestar::wal_log.info("Successfully converted and durably retired recovered WAL {} on shard {}", seqNum,
+                                   shardId);
         }
 
         // Explicitly release the temporary memory store to free resources
@@ -579,39 +592,50 @@ seastar::future<> WALFileManager::convertWalToTsm(seastar::shared_ptr<MemoryStor
                            largestSeriesPoints);
 #endif  // TIMESTAR_LOG_INSERT_PATH
 
-    uint64_t tsmBytesWritten = 0;
-    try {
-        timestar::wal_log.debug(
-            "[TSM_WRITE_START] Calling tsmFileManager->writeMemstore for store {} "
-            "on shard {}",
-            store->sequenceNumber, shardId);
-        tsmBytesWritten = co_await tsmFileManager->writeMemstore(store);
-        timestar::wal_log.debug("[TSM_WRITE_SUCCESS] Successfully wrote TSM for store {} on shard {}",
-                                store->sequenceNumber, shardId);
-    } catch (const std::bad_alloc& e) {
-        timestar::wal_log.error(
-            "[BAD_ALLOC] Memory allocation failed when writing TSM "
-            "for store {} on shard {}",
-            store->sequenceNumber, shardId);
+    uint64_t tsmBytesWritten = store->walConversionTsmBytes;
+    if (!store->walConversionPublished) {
+        try {
+            timestar::wal_log.debug(
+                "[TSM_WRITE_START] Calling tsmFileManager->writeMemstore for store {} "
+                "on shard {}",
+                store->sequenceNumber, shardId);
+            tsmBytesWritten = co_await tsmFileManager->writeMemstore(store);
+            // This marker is in-memory retry state, not the durability record:
+            // writeMemstore returns only after the TSM is synced and registered.
+            store->walConversionTsmBytes = tsmBytesWritten;
+            store->walConversionPublished = true;
+            timestar::wal_log.debug("[TSM_WRITE_SUCCESS] Successfully wrote TSM for store {} on shard {}",
+                                    store->sequenceNumber, shardId);
+        } catch (const std::bad_alloc& e) {
+            timestar::wal_log.error(
+                "[BAD_ALLOC] Memory allocation failed when writing TSM "
+                "for store {} on shard {}",
+                store->sequenceNumber, shardId);
 #if TIMESTAR_LOG_INSERT_PATH
-        timestar::wal_log.error(
-            "[BAD_ALLOC] Stats: {} series, {} points, ~{} MB "
-            "estimated, largest series: '{}' ({} points)",
-            totalSeries, totalPoints, totalMemoryEstimate / (1024 * 1024), largestSeriesKey, largestSeriesPoints);
+            timestar::wal_log.error(
+                "[BAD_ALLOC] Stats: {} series, {} points, ~{} MB "
+                "estimated, largest series: '{}' ({} points)",
+                totalSeries, totalPoints, totalMemoryEstimate / (1024 * 1024), largestSeriesKey,
+                largestSeriesPoints);
 #else
-        timestar::wal_log.error("[BAD_ALLOC] Stats: {} series (detailed stats require TIMESTAR_LOG_INSERT_PATH=1)",
-                                totalSeries);
+            timestar::wal_log.error(
+                "[BAD_ALLOC] Stats: {} series (detailed stats require TIMESTAR_LOG_INSERT_PATH=1)", totalSeries);
 #endif
 
-        timestar::wal_log.error(
-            "[SYSTEM_MEMORY] System may be low on memory - bad_alloc during TSM write "
-            "for store {} on shard {}",
+            timestar::wal_log.error(
+                "[SYSTEM_MEMORY] System may be low on memory - bad_alloc during TSM write "
+                "for store {} on shard {}",
+                store->sequenceNumber, shardId);
+            throw;
+        } catch (const std::exception& e) {
+            timestar::wal_log.error("[TSM_WRITE_ERROR] Failed to write TSM for store {} on shard {}: {}",
+                                    store->sequenceNumber, shardId, e.what());
+            throw;
+        }
+    } else {
+        timestar::wal_log.info(
+            "[CONVERT_WAL_TO_TSM] TSM for store {} on shard {} is already published; retrying WAL retirement only",
             store->sequenceNumber, shardId);
-        throw;
-    } catch (const std::exception& e) {
-        timestar::wal_log.error("[TSM_WRITE_ERROR] Failed to write TSM for store {} on shard {}: {}",
-                                store->sequenceNumber, shardId, e.what());
-        throw;
     }
 
     // Remove from memoryStores immediately after successful TSM write,
@@ -628,12 +652,20 @@ seastar::future<> WALFileManager::convertWalToTsm(seastar::shared_ptr<MemoryStor
     // re-packs data that is already in TSM form. That asymmetry is what
     // justifies prioritising conversion over merges, and this is the number
     // that demonstrates it.
+    const bool ownsLiveWal = store->getWAL() != nullptr;
     const uint64_t walBytes = store->walSizeOnDisk();
     co_await store->removeWAL();
     const double reclaimedPct =
         walBytes > 0 ? 100.0 * (1.0 - static_cast<double>(tsmBytesWritten) / static_cast<double>(walBytes)) : 0.0;
-    timestar::wal_log.info("Successfully converted WAL {} to TSM on shard {} | {} -> {} bytes ({:.1f}% reclaimed)",
-                           store->sequenceNumber, shardId, walBytes, tsmBytesWritten, reclaimedPct);
+    if (ownsLiveWal) {
+        timestar::wal_log.info("Successfully converted WAL {} to TSM on shard {} | {} -> {} bytes ({:.1f}% reclaimed)",
+                               store->sequenceNumber, shardId, walBytes, tsmBytesWritten, reclaimedPct);
+    } else {
+        // Recovery stores deliberately do not attach their source WAL. The
+        // caller still owes removeRecoveredWal() and its directory barrier.
+        timestar::wal_log.debug("Published recovered WAL {} as TSM on shard {}; source retirement still pending",
+                                store->sequenceNumber, shardId);
+    }
 }
 
 seastar::future<> WALFileManager::close() {

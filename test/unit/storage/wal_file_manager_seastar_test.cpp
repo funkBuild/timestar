@@ -36,6 +36,103 @@ protected:
     void TearDown() override { cleanTestShardDirectories(); }
 };
 
+// A post-publication WAL-retirement failure must not make the retry publish the
+// same immutable generation again. It retries only the idempotent unlink +
+// directory barrier, preserving one registered TSM rank.
+TEST_F(WALFileManagerSeastarTest, RetirementRetrySkipsAlreadyPublishedTSM) {
+    seastar::thread([] {
+        const unsigned shard = seastar::this_shard_id();
+        const timestar::StorageLayout layout(".");
+        fs::create_directories(layout.tsmDir(shard));
+
+        Engine engine(layout);
+        TSMFileManager tsmManager(layout, shard);
+        tsmManager.init().get();
+        WALFileManager walManager(layout, shard);
+        walManager.init(engine, tsmManager).get();
+
+        TimeStarInsert<double> insert("wal_retirement", "retry");
+        insert.addValue(1000, 1.0);
+        walManager.insert(insert).get();
+
+        auto store = walManager.getMemoryStores().front();
+        store->close().get();
+        auto* wal = store->getWAL();
+        ASSERT_NE(wal, nullptr);
+        const std::string walPath = wal->filename();
+
+        size_t removalSyncCalls = 0;
+        wal->setDirectorySyncForTesting([&](const std::string&) {
+            ++removalSyncCalls;
+            return seastar::make_exception_future<>(std::runtime_error("injected WAL retirement sync failure"));
+        });
+
+        EXPECT_THROW(walManager.convertWalToTsm(store).get(), std::runtime_error);
+        EXPECT_TRUE(store->walConversionPublished);
+        EXPECT_FALSE(fs::exists(walPath));
+        EXPECT_EQ(tsmManager.getSequencedTsmFiles().size(), 1u);
+
+        wal->setDirectorySyncForTesting([&](const std::string& directory) {
+            ++removalSyncCalls;
+            return seastar::sync_directory(directory);
+        });
+        EXPECT_NO_THROW(walManager.convertWalToTsm(store).get());
+        EXPECT_EQ(removalSyncCalls, 2u);
+        EXPECT_EQ(tsmManager.getSequencedTsmFiles().size(), 1u)
+            << "retirement retry must not republish or collide with the live TSM rank";
+        EXPECT_EQ(store->getWAL(), nullptr);
+
+        walManager.close().get();
+        tsmManager.stop().get();
+    })
+        .join()
+        .get();
+}
+
+// Startup-recovery stores do not own a WAL object. Their raw source removal is
+// performed by WALFileManager and must fail startup if the directory barrier
+// cannot make the unlink durable.
+TEST_F(WALFileManagerSeastarTest, RecoveryRemovalDirectorySyncFailureFailsStartup) {
+    seastar::thread([] {
+        const unsigned shard = seastar::this_shard_id();
+        const unsigned sequence = 9010;
+        const timestar::StorageLayout layout(".");
+        fs::create_directories(layout.tsmDir(shard));
+        const std::string walPath = layout.walFile(shard, sequence).string();
+
+        {
+            auto sourceStore = std::make_shared<MemoryStore>(sequence);
+            WAL source(sequence, layout, shard);
+            source.init(sourceStore.get()).get();
+            TimeStarInsert<double> insert("wal_recovery", "directory_sync");
+            insert.addValue(1000, 1.0);
+            source.insert(insert).get();
+            source.close().get();
+        }
+        ASSERT_TRUE(fs::exists(walPath));
+
+        Engine engine(layout);
+        TSMFileManager tsmManager(layout, shard);
+        tsmManager.init().get();
+        WALFileManager walManager(layout, shard);
+        size_t syncCalls = 0;
+        walManager.setDirectorySyncForTesting([&](const std::string&) {
+            ++syncCalls;
+            return seastar::make_exception_future<>(std::runtime_error("injected recovered-WAL sync failure"));
+        });
+
+        EXPECT_THROW(walManager.init(engine, tsmManager).get(), std::runtime_error);
+        EXPECT_EQ(syncCalls, 1u);
+        EXPECT_FALSE(fs::exists(walPath));
+        EXPECT_EQ(tsmManager.getSequencedTsmFiles().size(), 1u);
+
+        walManager.close().get();
+        tsmManager.stop().get();
+    })
+        .join()
+        .get();
+}
+
 // ===========================================================================
 // 1. Init / Recovery - basic init creates a fresh memory store
 // ===========================================================================

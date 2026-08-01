@@ -40,7 +40,10 @@ namespace fs = std::filesystem;
 // ------------------------ WAL ------------------------
 
 WAL::WAL(unsigned int _sequenceNumber, timestar::StorageLayout layout, unsigned shardId)
-    : sequenceNumber(_sequenceNumber), layout_(std::move(layout)), shardId_(shardId) {}
+    : sequenceNumber(_sequenceNumber),
+      layout_(std::move(layout)),
+      shardId_(shardId),
+      directorySync_([](const std::string& directory) { return seastar::sync_directory(directory); }) {}
 
 std::string WAL::filename() const {
     return layout_.walFile(shardId_, sequenceNumber).string();
@@ -94,6 +97,26 @@ seastar::future<> WAL::init(MemoryStore* /*store*/, bool isRecovery) {
 
     if (!walFile) {
         throw std::runtime_error("Failed to open WAL file: " + filename);
+    }
+
+    // Make the segment name durable before any write can be acknowledged. This
+    // is required even when a prior failed init left the path visible: only a
+    // successful directory sync closes that earlier uncertain create window.
+    // On failure, close the just-opened descriptor before propagating so startup
+    // and rollover fail cleanly without leaking a file handle.
+    std::exception_ptr directorySyncError;
+    try {
+        fs::path parent = fs::path(filename).parent_path();
+        co_await directorySync_(parent.empty() ? "." : parent.string());
+    } catch (...) {
+        directorySyncError = std::current_exception();
+    }
+    if (directorySyncError) {
+        try {
+            co_await walFile.close();
+        } catch (...) {}
+        _closed = true;
+        std::rethrow_exception(directorySyncError);
     }
 
     timestar::wal_log.debug("WAL file opened: {}", filename);
@@ -268,7 +291,13 @@ seastar::future<> WAL::remove() {
         co_await close();
     }
     std::string filename = this->filename();
-    co_await seastar::remove_file(filename);
+    // Retrying after an unlink succeeded but its directory sync failed must be
+    // valid. Always execute the barrier, even when the name is already absent.
+    if (co_await seastar::file_exists(filename)) {
+        co_await seastar::remove_file(filename);
+    }
+    fs::path parent = fs::path(filename).parent_path();
+    co_await directorySync_(parent.empty() ? "." : parent.string());
 }
 
 // Write structured padding so that the total bytes written to the output stream

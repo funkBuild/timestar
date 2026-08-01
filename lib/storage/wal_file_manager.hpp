@@ -5,11 +5,13 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/gate.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 class Engine;
@@ -56,6 +58,7 @@ private:
     bool walSequenceInitialized_ = false;
     std::vector<seastar::shared_ptr<MemoryStore>> memoryStores;
     TSMFileManager* tsmFileManager;
+    std::function<seastar::future<>(const std::string&)> directorySync_;
     seastar::gate _backgroundGate;               // Tracks in-flight background TSM conversions
     seastar::semaphore compactionSemaphore{1};   // Only allow 1 rollover at a time
     seastar::semaphore _conversionSemaphore{1};  // Serialize background TSM conversions
@@ -73,8 +76,17 @@ private:
     // an OOM kill of the whole shard is not.
     static constexpr size_t kIngestRejectMemoryStores = 16;
 
+    // Recovery stores intentionally do not own a live WAL object, so their
+    // source segment is retired here rather than through WAL::remove(). The
+    // operation is idempotent across an unlink-success/directory-sync-failure
+    // retry and does not return until the removal is directory-durable.
+    seastar::future<> removeRecoveredWal(const std::string& path);
+
 public:
     WALFileManager(timestar::StorageLayout layout, unsigned shard);
+    void setDirectorySyncForTesting(std::function<seastar::future<>(const std::string&)> sync) {
+        directorySync_ = std::move(sync);
+    }
 
     // True while any rolled-over store is still awaiting TSM conversion.
     // Drives compaction's WAL-first priority.
