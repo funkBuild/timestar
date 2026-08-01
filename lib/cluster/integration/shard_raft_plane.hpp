@@ -391,8 +391,12 @@ public:
     void startTicking() {
         if (plane_)
             plane_->startTicking();
-        if (group0_ && group0_->started())
-            group0_->startTicking();
+    }
+
+    void startGroup0Ticking() {
+        if (!group0_ || !group0_->started())
+            throw std::logic_error("group 0 must be started before its tick loop");
+        group0_->startTicking();
     }
 
     // Override this shard's snapshot-trigger policy (debt D-6). Must be called BEFORE

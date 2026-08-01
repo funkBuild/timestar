@@ -231,6 +231,15 @@ struct ClusterConfig {
     // Development escape hatch for local fault tests only. Production deployments
     // must leave this false; without it an RF>1 server refuses plaintext startup.
     bool development_allow_insecure_transport = false;
+    // Opt-in production composition for the built-in group-0 control plane. It
+    // stays false for existing static-placement clusters. `control_seed_node_id`
+    // identifies the one initial voter; that node still does NOTHING on a fresh
+    // data directory unless the operator supplies the explicit --cluster-init
+    // ceremony. Other fresh nodes start only as non-voting observers.
+    bool control_enabled = false;
+    uint16_t control_seed_node_id = 0;
+    // Stable rack/AZ/host label recorded in group 0 and used to spread its voters.
+    std::string failure_domain;
 };
 
 // Seastar settings parsed from [seastar] TOML section.
@@ -374,7 +383,9 @@ struct glz::meta<timestar::ClusterConfig> {
         object("enabled", &T::enabled, "node_id", &T::node_id, "peers", &T::peers, "partitioned", &T::partitioned,
                "replication_factor", &T::replication_factor, "cluster_uuid", &T::cluster_uuid, "tls_cert_file",
                &T::tls_cert_file, "tls_key_file", &T::tls_key_file, "tls_ca_file", &T::tls_ca_file, "tls_peer_name",
-               &T::tls_peer_name, "development_allow_insecure_transport", &T::development_allow_insecure_transport);
+               &T::tls_peer_name, "development_allow_insecure_transport", &T::development_allow_insecure_transport,
+               "control_enabled", &T::control_enabled, "control_seed_node_id", &T::control_seed_node_id,
+               "failure_domain", &T::failure_domain);
 };
 
 template <>

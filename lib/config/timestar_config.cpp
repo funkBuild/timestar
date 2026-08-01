@@ -84,6 +84,14 @@ std::vector<std::string> TimestarConfig::validate() const {
                 "replicated cluster transport requires mTLS; set every cluster TLS field (the insecure override is "
                 "development-only)");
     }
+    if (cluster.control_enabled) {
+        if (!cluster.enabled || !cluster.partitioned || cluster.replication_factor <= 1)
+            errors.emplace_back("cluster.control_enabled requires an enabled, partitioned RF > 1 cluster");
+        if (cluster.control_seed_node_id == 0 || cluster.control_seed_node_id > cluster.peers.size())
+            errors.emplace_back("cluster.control_seed_node_id must be in [1, len(cluster.peers)]");
+        if (cluster.failure_domain.empty())
+            errors.emplace_back("cluster.failure_domain must be non-empty when cluster.control_enabled");
+    }
 
     if (storage.wal_size_threshold == 0) {
         errors.emplace_back("storage.wal_size_threshold must be > 0");
@@ -524,6 +532,9 @@ void applyEnvironmentOverrides(TimestarConfig& cfg) {
     envString("TIMESTAR_CLUSTER_TLS_PEER_NAME", cfg.cluster.tls_peer_name);
     envBool("TIMESTAR_CLUSTER_DEVELOPMENT_ALLOW_INSECURE_TRANSPORT",
             cfg.cluster.development_allow_insecure_transport);
+    envBool("TIMESTAR_CLUSTER_CONTROL_ENABLED", cfg.cluster.control_enabled);
+    envU16("TIMESTAR_CLUSTER_CONTROL_SEED_NODE_ID", cfg.cluster.control_seed_node_id);
+    envString("TIMESTAR_CLUSTER_FAILURE_DOMAIN", cfg.cluster.failure_domain);
     // TIMESTAR_CLUSTER_PEERS is a comma-separated list of "host:port" in node-id
     // order (index 0 == node 1), including this node's own address.
     if (auto v = envStr("TIMESTAR_CLUSTER_PEERS")) {

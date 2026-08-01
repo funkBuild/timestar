@@ -25,8 +25,9 @@ stated explicitly.
 
 The statements in this section describe the starting point when this roadmap
 was written. Several foundation, M2, and RF>1 data-path pieces have since landed,
-while group-0 composition, complete snapshot state, topology movement, true
-ReadIndex leader reads, and several cluster-aware HTTP features remain open.
+while group-0 authority/publication and join RPCs, complete snapshot state,
+topology movement, true ReadIndex leader reads, and several cluster-aware HTTP
+features remain open.
 Use the production-readiness review for current status.
 
 - All clustering phases 0-8 exist as reviewed library bricks with injected

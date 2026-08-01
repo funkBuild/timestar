@@ -951,11 +951,14 @@ Decoders continue to read historical formats regardless of the active emission
 gate. `/cluster/status` reports `active_cluster_format` and
 `snapshot_format_ready`; `/health` is not ready below snapshot format v2.
 
-This is not yet an operable rolling-upgrade path. The current static-bootstrap
-server does not compose persistent group 0 or call the activation bridge, so it
-remains at format v1: snapshot production and bounded deletes are refused and
-readiness stays false. Production enablement requires group-0 wiring, activation
-over every data-group voter (including join admission), and mixed-binary tests.
+This is not yet an operable rolling-upgrade path. The current server can opt into
+a persistent group-0 host and explicitly initialize its one-voter seed with
+`--cluster-init`, but it does not call the activation bridge or admit fresh
+observers through a seed/join RPC. Static placement remains authoritative and the
+data plane remains at format v1: snapshot production and bounded deletes are
+refused and readiness stays false. Production enablement still requires committed
+effective-map publication, activation over every data-group voter (including join
+admission), and mixed-binary tests.
 Downgrading a binary below an already committed format is unsupported unless a
 future documented offline procedure first makes the durable state readable by
 that binary.
@@ -1008,6 +1011,9 @@ replication_factor = 3
 node_id = 1
 peers = ["ts-a:8086", "ts-b:8086", "ts-c:8086"]
 cluster_uuid = "00112233445566778899aabbccddeeff"
+control_enabled = true             # opt in; false preserves static-only behaviour
+control_seed_node_id = 1           # the sole initial group-0 voter
+failure_domain = "rack-a"          # stable rack/AZ/host label for this node
 tls_cert_file = "/run/secrets/timestar-node.crt"
 tls_key_file = "/run/secrets/timestar-node.key"
 tls_ca_file = "/run/secrets/timestar-cluster-ca.crt"
@@ -1018,6 +1024,12 @@ The same mTLS identity protects both the data-plane port (HTTP port + 1000) and
 Raft port (HTTP port + 2000), with client certificates required. The
 `development_allow_insecure_transport` setting and corresponding environment
 variable exist only for local test gates; they are not production settings.
+
+On a fresh seed data directory, start once with `--cluster-init`; ordinary
+startup never initializes group 0 implicitly. Existing group-0 journals recover,
+and fresh non-seed nodes host inert observers. The seed/token admission RPC that
+promotes those observers is still outstanding, so this opt-in is not yet a
+multi-node production bootstrap procedure.
 
 ### Target group-0-managed configuration
 

@@ -472,7 +472,8 @@ int main(int argc, char** argv) {
     app.add_options()("port", bpo::value<uint16_t>()->default_value(timestarConfig.server.port), "HTTP server port")(
         "log-level", bpo::value<seastar::log_level>()->default_value(seastar::log_level::info),
         "Log level (error, warn, info, debug, trace)")("config", bpo::value<std::string>(), "Path to TOML config file")(
-        "dump-config", "Print default config to stdout and exit");
+        "dump-config", "Print default config to stdout and exit")(
+        "cluster-init", "Explicitly bootstrap group 0 on the configured control seed (never implied by startup)");
 
     // Inject Seastar settings from TOML [seastar] section.
     // CLI args are already stored first, so bpo::store won't overwrite them.
@@ -519,11 +520,27 @@ int main(int argc, char** argv) {
             auto& config = app.configuration();
             uint16_t port = config["port"].as<uint16_t>();
             auto log_level = config["log-level"].as<seastar::log_level>();
+            const bool clusterInitRequested = config.count("cluster-init") != 0;
 
             // Initialize logging
             timestar::init_logging(log_level);
             timestar::http_log.info("Starting TimeStar {} ({}) built {} with {}", timestar::VERSION,
                                     timestar::GIT_COMMIT, timestar::BUILD_TIME, timestar::COMPILER);
+
+            {
+                const auto& cc = timestar::config().cluster;
+                if (clusterInitRequested && !cc.control_enabled) {
+                    timestar::http_log.error("--cluster-init requires cluster.control_enabled=true");
+                    return 1;
+                }
+                if (clusterInitRequested && cc.node_id != cc.control_seed_node_id) {
+                    timestar::http_log.error(
+                        "--cluster-init may run only on cluster.control_seed_node_id (configured seed {}, this node "
+                        "{})",
+                        cc.control_seed_node_id, cc.node_id);
+                    return 1;
+                }
+            }
 
             // Resolve the data root from [server] data_dir (default "." = CWD).
             // All shard directories (shard_N), placement.json and
@@ -570,6 +587,7 @@ int main(int argc, char** argv) {
             // into startup failures instead of silent VShard remaps/replay.
             std::optional<timestar::cluster::JournalIdentity> clusterJournalIdentity;
             std::optional<timestar::cluster::DataPlaneTls> clusterTls;
+            std::optional<timestar::control::NodeRecord> group0Identity;
             {
                 const auto& cc = timestar::config().cluster;
                 if (cc.enabled && cc.partitioned && cc.replication_factor > 1) {
@@ -578,6 +596,9 @@ int main(int argc, char** argv) {
                     timestar::cluster::bindStaticTopology(identity, dataRoot, staticTopologyDescription(cc));
                     clusterJournalIdentity = timestar::cluster::JournalIdentity::fromHex(
                         identity.cluster_uuid, timestar::cluster::NodeIdentity::generateUuid());
+                    if (cc.control_enabled)
+                        group0Identity = timestar::cluster::nodeRecordFrom(
+                            identity, cc.node_id, cc.peers.at(cc.node_id - 1), cc.failure_domain);
 
                     if (!cc.tls_cert_file.empty()) {
                         clusterTls = timestar::cluster::DataPlaneTls{
@@ -722,6 +743,9 @@ int main(int argc, char** argv) {
                 if (cc.enabled && cc.partitioned) {
                     if (clusterJournalIdentity)
                         g_clusterDataPlane.setJournalIdentity(*clusterJournalIdentity);
+                    if (group0Identity)
+                        g_clusterDataPlane.setGroup0Identity(*group0Identity);
+                    g_clusterDataPlane.requestGroup0Bootstrap(clusterInitRequested);
                     if (clusterTls)
                         g_clusterDataPlane.setTlsCredentials(*clusterTls);
                     g_clusterDataPlane.start(cc, g_engine).get();

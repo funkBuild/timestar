@@ -289,6 +289,31 @@ TEST(TimestarConfigValidateTest, ReplicatedClusterRequiresCompleteTlsUnlessDevel
     EXPECT_TRUE(errorsMatching(cfg.validate(), "requires mTLS").empty());
 }
 
+TEST(TimestarConfigValidateTest, Group0CompositionIsExplicitAndHasOneValidSeedDomain) {
+    timestar::TimestarConfig cfg;
+    EXPECT_FALSE(cfg.cluster.control_enabled);
+
+    cfg.cluster.control_enabled = true;
+    EXPECT_FALSE(errorsMatching(cfg.validate(), "cluster.control_enabled").empty());
+
+    cfg.cluster.enabled = true;
+    cfg.cluster.partitioned = true;
+    cfg.cluster.node_id = 1;
+    cfg.cluster.peers = {"a:1", "b:2", "c:3"};
+    cfg.cluster.replication_factor = 3;
+    cfg.cluster.cluster_uuid = "00112233445566778899aabbccddeeff";
+    cfg.cluster.development_allow_insecure_transport = true;
+    EXPECT_FALSE(errorsMatching(cfg.validate(), "control_seed_node_id").empty());
+    EXPECT_FALSE(errorsMatching(cfg.validate(), "failure_domain").empty());
+
+    cfg.cluster.control_seed_node_id = 4;
+    cfg.cluster.failure_domain = "rack-a";
+    EXPECT_FALSE(errorsMatching(cfg.validate(), "control_seed_node_id").empty());
+    cfg.cluster.control_seed_node_id = 1;
+    EXPECT_TRUE(errorsMatching(cfg.validate(), "cluster.control").empty());
+    EXPECT_TRUE(errorsMatching(cfg.validate(), "failure_domain").empty());
+}
+
 // ===========================================================================
 // server.port
 // ===========================================================================

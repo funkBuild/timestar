@@ -174,6 +174,8 @@ public:
     // path stayed plaintext -- queries fail loudly, writes go silently unencrypted.
     void setTlsCredentials(DataPlaneTls creds) { tls_ = std::move(creds); }
     void setJournalIdentity(JournalIdentity identity) { journalIdentity_ = identity; }
+    void setGroup0Identity(control::NodeRecord record) { group0Identity_ = std::move(record); }
+    void requestGroup0Bootstrap(bool requested = true) { group0BootstrapRequested_ = requested; }
     void setLocalVersion(features::VersionRange range) { localVersion_ = range; }
     // What this NODE advertises to peers (pushed to every per-shard transport in
     // start()). Exposed so a test can read the real value back instead of grepping for a
@@ -406,6 +408,8 @@ private:
     // Applied to this object's transport AND to every per-shard transport in start().
     std::optional<DataPlaneTls> tls_;
     std::optional<JournalIdentity> journalIdentity_;
+    std::optional<control::NodeRecord> group0Identity_;
+    bool group0BootstrapRequested_ = false;
     // Everything this binary can read and write. Pushed to every per-shard transport
     // in start(), so peers negotiate against the node's REAL capability; leaving it at
     // the VersionRange default {1,1} would pin the whole cluster to the v1 wire format

@@ -4,10 +4,12 @@
 #include "../../utils/line_parser.hpp"
 #include "../../utils/logger.hpp"  // timestar::http_log
 #include "../../utils/series_key.hpp"
+#include "../control/group0_controller.hpp"
 #include "../data/journal_format.hpp"
 #include "../data/read_routing.hpp"
 #include "../data/write_errors.hpp"
 #include "checkquorum_policy.hpp"
+#include "group0_startup.hpp"
 #include "write_admission.hpp"
 
 #include <algorithm>
@@ -485,6 +487,59 @@ seastar::future<> ClusterDataPlane::startImpl(const ClusterConfig& cfg, seastar:
                 "cluster: CheckQuorum resolved ON while the build default is OFF -- the override is disable-only by "
                 "design (ADR 0005 mechanism (c) is not built, so enabling per node is the mixed-version hazard that "
                 "ADR exists to prevent). Flip kCheckQuorumDefault to enable it, in a build, for the whole cluster");
+
+        // Compose the control group only when explicitly enabled. The startup
+        // policy keeps a fresh seed completely inert without --cluster-init,
+        // starts fresh non-seeds as non-voting observers, and recovers any
+        // existing dedicated journal. Group 0 shares the already-listening Raft
+        // transport but has its own registry, wire id, journal, and tick loop.
+        if (cfg.control_enabled) {
+            if (!group0Identity_)
+                throw std::invalid_argument("cluster: group 0 requires the persistent node identity");
+            std::error_code journalError;
+            const bool journalExists = std::filesystem::exists(journalRoot / "group0", journalError);
+            if (journalError)
+                throw std::filesystem::filesystem_error("inspect group-0 journal", journalRoot / "group0",
+                                                        journalError);
+            const Group0StartupDecision decision =
+                decideGroup0Startup(true, rt_->selfId, cfg.control_seed_node_id, group0BootstrapRequested_,
+                                    journalExists);
+            if (decision.host()) {
+                auto record = *group0Identity_;
+                const std::string clusterUuid = cfg.cluster_uuid;
+                co_await shards_.invoke_on(
+                    0, [voters = decision.initialVoters, ropts, bootstrap = decision.bootstrap(),
+                        record = std::move(record), clusterUuid](ShardRaftPlane& plane) mutable -> seastar::future<> {
+                        co_await plane.addGroup0(std::move(voters), ropts);
+                        auto* host = plane.group0();
+                        if (!host || !host->group() || !host->stateMachine())
+                            throw std::runtime_error("cluster: group-0 host failed to register its Raft group");
+                        if (bootstrap) {
+                            // A one-voter explicit bootstrap wins synchronously.
+                            // If this is an unsafe retry against a later multi-voter
+                            // config, it cannot self-elect and startup fails closed.
+                            co_await host->group()->campaign();
+                            if (!host->group()->isLeader())
+                                throw std::runtime_error(
+                                    "cluster: explicit group-0 bootstrap did not win the configured seed election");
+                            control::Group0Controller controller(*host->group(), *host->stateMachine());
+                            co_await controller.initCluster(clusterUuid, std::move(record));
+                            if (host->state().clusterUuid != clusterUuid)
+                                throw std::runtime_error(
+                                    "cluster: explicit group-0 bootstrap did not commit the configured cluster UUID");
+                        }
+                        plane.startGroup0Ticking();
+                    });
+            } else {
+                timestar::http_log.info(
+                    "cluster: group 0 is awaiting explicit --cluster-init on configured seed node {}",
+                    cfg.control_seed_node_id);
+            }
+        } else if (group0BootstrapRequested_) {
+            // Normally caught by the server before storage opens. Keep the
+            // composition fail closed for non-server embedders too.
+            throw std::invalid_argument("--cluster-init requires cluster.control_enabled=true");
+        }
         {
             std::map<unsigned, std::vector<std::pair<uint16_t, std::vector<data::NodeId>>>> byShard;
             for (const auto& [vshard, voters] : rt_->localReplicaGroups())

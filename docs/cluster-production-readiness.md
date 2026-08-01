@@ -1268,10 +1268,20 @@ is not completion.
   + parent-directory fsync, survives restart, rejects corrupt/partial files, and
   refuses epoch regression or conflicting same-epoch content; its focused
   cache/directory evidence passes 13/13. It deliberately does not equate
-  incremental desired placement with effective serving membership. Production
-  composition, the operator-facing explicit bootstrap trigger, and the caller
-  that publishes committed/effective state to this cache and the live data plane
-  remain outstanding.
+  incremental desired placement with effective serving membership. Opt-in
+  production composition now starts the dedicated host on shard 0 over the live
+  Raft transport. `--cluster-init` is an explicit, seed-only ceremony; a fresh
+  seed without it stays inert, existing journals recover, and fresh non-seeds
+  are non-campaigning observers. The opt-in config requires a valid seed and
+  non-empty failure domain, while remaining disabled for existing static
+  clusters. Startup/config/host/controller evidence passes 11/11, the complete
+  config validation suite passes 62/62, and the affected socket composition
+  passes 7 tests with 2 SMP>1-only skips; the production server target builds.
+  **Still open:** there is no seed join/token RPC to add observers to the real
+  group, no group-0-backed effective-membership/cutover map, no cache/live-map
+  publication caller, and no periodic group-0 compaction. Static placement and
+  the configured cluster UUID therefore remain authoritative even when the
+  control host is opted in; this task is not closed.
 - [ ] **CR-FIX-022 — wire resumable join, drain, remove, replace, and VShard
   movement.** Owner: movement/control plane. Include learner catch-up, verified
   snapshot, log catch-up, joint consensus, leadership transfer, cutover, and
@@ -1477,13 +1487,14 @@ is not completion.
   unconditional for replay and upgrade. Group-0 activation now also refuses a
   non-advancing version, a joint voter configuration, or any capability list
   whose cardinality differs from the complete stable voter set; success is not
-  returned until the activation entry applies. **Still open:** compose and
-  persist group 0 in the production server, close the data-voter-set/admission
-  hole, publish the committed activation to every shard, preflight legacy
+  returned until the activation entry applies. **Still open:** close the
+  data-voter-set/admission hole, publish the committed activation from the now
+  opt-in live group 0 to every shard, preflight legacy
   receipt counts, state the downgrade rule, and run old/new multi-process
-  snapshot and command tests. Because the production server has no group-0
-  bridge caller, this fail-closed slice deliberately leaves clustered readiness
-  false and bounded deletes unavailable; it does not close this task.
+  snapshot and command tests. Because the production server still has no
+  activation-bridge caller, this fail-closed slice deliberately leaves
+  clustered readiness false and bounded deletes unavailable; it does not close
+  this task.
 - [x] **CR-FIX-077 — make live-gate orchestration fail closed.** Owner:
   release/tests. Restrict reset targets to direct `/tmp/tsgate_*` roots, retry
   removal and prove absence before recreation, never delete a running arm's
