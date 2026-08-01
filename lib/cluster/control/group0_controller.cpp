@@ -174,6 +174,16 @@ seastar::future<bool> Group0Controller::activateCaughtUpLearner(raft::NodeId nod
     co_return co_await proposeCommand(SetNodeState{node, NodeState::Active});
 }
 
+seastar::future<bool> Group0Controller::publishInitialServingMap(ControlMap map) {
+    if (!g0_.isLeader() || map.epoch != 1 || !isCompleteControlMap(map))
+        co_return false;
+    if (sm_.state().servingMap.epoch != 0)
+        co_return sm_.state().servingMap == map;
+    if (!co_await proposeCommand(SetInitialServingMap{map}))
+        co_return false;
+    co_return sm_.state().servingMap == map;
+}
+
 seastar::future<bool> Group0Controller::reconcileMetaVoters() {
     if (!g0_.isLeader())
         co_return false;

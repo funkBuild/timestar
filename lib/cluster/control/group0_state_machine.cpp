@@ -11,6 +11,8 @@ namespace timestar::control {
 
 namespace {
 
+constexpr uint64_t kServingMapSnapshotMagic = 0x54534730'4d415031ull;  // "TSG0MAP1"
+
 // State (snapshot) serialization -- distinct from command serialization: it
 // encodes the whole Group0State so a snapshot fully reconstructs a node.
 struct SW {
@@ -104,6 +106,48 @@ struct SR {
     }
 };
 
+void writeControlMap(SW& w, const ControlMap& map) {
+    w.u64(map.epoch);
+    w.u64(map.placement.size());
+    for (const auto& [vshard, replicas] : map.placement) {
+        w.u16(vshard);
+        w.ids(replicas);
+    }
+    w.u64(map.groups.size());
+    for (const auto& [vshard, group] : map.groups) {
+        w.u16(vshard);
+        w.u16(group);
+    }
+}
+
+ControlMap readControlMap(SR& r) {
+    ControlMap map;
+    map.epoch = r.u64();
+    const uint64_t placements = r.u64();
+    if (!r.ok || placements > static_cast<uint64_t>(r.end - r.p) / 10) {
+        r.ok = false;
+        return map;
+    }
+    for (uint64_t i = 0; i < placements && r.ok; ++i) {
+        const uint16_t vshard = r.u16();
+        auto replicas = r.ids();
+        if (r.ok && !map.placement.emplace(vshard, std::move(replicas)).second)
+            r.ok = false;
+    }
+    const uint64_t groups = r.u64();
+    if (!r.ok || groups > static_cast<uint64_t>(r.end - r.p) / 4) {
+        r.ok = false;
+        return map;
+    }
+    for (uint64_t i = 0; i < groups && r.ok; ++i) {
+        const uint16_t vshard = r.u16();
+        const uint16_t group = r.u16();
+        if (!map.groups.emplace(vshard, group).second)
+            r.ok = false;
+    }
+    return map;
+}
+
 bool validNodeRecord(const Group0State& state, const NodeRecord& record) {
     if (record.raftId == raft::kNoNode || record.uuid.empty() || record.address.empty() ||
         !isValidNodeState(record.state))
@@ -128,6 +172,11 @@ bool validSnapshotState(const Group0State& state) {
     for (const auto& [vshard, replicas] : state.desiredPlacement)
         if (vshard >= timestar::VIRTUAL_SHARD_COUNT || !validNodeSet(replicas))
             return false;
+    if ((state.servingMap.epoch == 0 &&
+         (!state.servingMap.placement.empty() || !state.servingMap.groups.empty())) ||
+        (state.servingMap.epoch != 0 &&
+         (state.servingMap.epoch != 1 || !isCompleteControlMap(state.servingMap))))
+        return false;
     if (!state.metaVoters.empty() && !validNodeSet(state.metaVoters))
         return false;
     for (const auto& [key, cell] : state.policies)
@@ -164,28 +213,54 @@ void Group0StateMachine::expectLocalIdentity(std::string clusterUuid, NodeRecord
         throw std::logic_error("group0: local identity expectation was configured more than once");
     expectedClusterUuid_ = std::move(clusterUuid);
     expectedLocalRecord_ = std::move(localRecord);
-    if (!stateMatchesLocalIdentity(state_))
+    if (!stateMatchesLocalExpectations(state_))
         throw std::runtime_error("group0: existing control state conflicts with the local persistent identity");
 }
 
-bool Group0StateMachine::stateMatchesLocalIdentity(const Group0State& state) const {
-    if (!expectedLocalRecord_)
-        return true;
-    if (!state.clusterUuid.empty() && state.clusterUuid != expectedClusterUuid_)
-        return false;
-    const NodeRecord& local = *expectedLocalRecord_;
-    for (const auto& [id, record] : state.nodes) {
-        if (id == local.raftId &&
-            (record.uuid != local.uuid || record.address != local.address ||
-             record.failureDomain != local.failureDomain))
+void Group0StateMachine::expectInitialServingMap(ControlMap map) {
+    if (map.epoch != 1 || !isCompleteControlMap(map))
+        throw std::invalid_argument("group0: expected initial serving map is incomplete or not epoch 1");
+    if (expectedInitialServingMap_)
+        throw std::logic_error("group0: initial serving-map expectation was configured more than once");
+    expectedInitialServingMap_ = std::move(map);
+    if (!stateMatchesLocalExpectations(state_))
+        throw std::runtime_error("group0: existing control state conflicts with the expected initial serving map");
+}
+
+void Group0StateMachine::setServingMapObserver(ServingMapObserver observer) {
+    if (!observer)
+        throw std::invalid_argument("group0: serving-map observer is empty");
+    if (servingMapObserver_)
+        throw std::logic_error("group0: serving-map observer was configured more than once");
+    servingMapObserver_ = std::move(observer);
+}
+
+bool Group0StateMachine::stateMatchesLocalExpectations(const Group0State& state) const {
+    if (expectedLocalRecord_) {
+        if (!state.clusterUuid.empty() && state.clusterUuid != expectedClusterUuid_)
             return false;
-        if (id != local.raftId && record.uuid == local.uuid)
-            return false;
+        const NodeRecord& local = *expectedLocalRecord_;
+        for (const auto& [id, record] : state.nodes) {
+            if (id == local.raftId &&
+                (record.uuid != local.uuid || record.address != local.address ||
+                 record.failureDomain != local.failureDomain))
+                return false;
+            if (id != local.raftId && record.uuid == local.uuid)
+                return false;
+        }
     }
+    if (expectedInitialServingMap_ && state.servingMap.epoch != 0 &&
+        state.servingMap != *expectedInitialServingMap_)
+        return false;
     return true;
 }
 
 void Group0StateMachine::rejectConflictingLocalCommand(const ControlCommand& command) const {
+    if (const auto* serving = std::get_if<SetInitialServingMap>(&command)) {
+        if (expectedInitialServingMap_ && serving->map != *expectedInitialServingMap_)
+            throw std::runtime_error("group0: committed initial serving map conflicts with local placement");
+        return;
+    }
     if (!expectedLocalRecord_)
         return;
     if (const auto* init = std::get_if<InitCluster>(&command)) {
@@ -315,6 +390,15 @@ bool Group0StateMachine::applyCommand(const ControlCommand& cmd) {
                     state_.activeFormatVersion = c.version;
                 else
                     ok = false;  // no-op: not an advance
+            } else if constexpr (std::is_same_v<T, SetInitialServingMap>) {
+                // Single-assignment by construction. A later serving-map epoch
+                // is a topology cutover and must go through the resumable data
+                // movement protocol, which is intentionally not implemented by
+                // this command.
+                if (c.map.epoch != 1 || !isCompleteControlMap(c.map) || state_.servingMap.epoch != 0)
+                    ok = false;
+                else
+                    state_.servingMap = c.map;
             }
         },
         cmd);
@@ -333,8 +417,11 @@ seastar::future<> Group0StateMachine::apply(raft::LogEntry entry) {
     }
     rejectConflictingLocalCommand(*cmd);
     applyCommand(*cmd);
+    if (servingMapObserver_ && std::holds_alternative<SetInitialServingMap>(*cmd) &&
+        state_.servingMap.epoch != 0)
+        co_await servingMapObserver_(state_.servingMap);
     state_.appliedIndex = entry.index;
-    return seastar::make_ready_future<>();
+    co_return;
 }
 
 std::string Group0StateMachine::snapshot() const {
@@ -375,6 +462,10 @@ std::string Group0StateMachine::snapshot() const {
     for (const auto& t : state_.joinTokens)  // std::set: canonical order
         w.str(t);
     w.u64(state_.activeFormatVersion);  // trailing (back-compat: read only if present)
+    if (state_.servingMap.epoch != 0) {
+        w.u64(kServingMapSnapshotMagic);
+        writeControlMap(w, state_.servingMap);
+    }
     return std::move(w.out);
 }
 
@@ -441,12 +532,10 @@ bool Group0StateMachine::loadSnapshot(const std::string& data) {
             r.ok = false;
     }
     // Trailing, optional for backward compatibility: a pre-format-version snapshot has
-    // no field here, so default to 1 (s.activeFormatVersion's default) rather than fail.
-    // Exactly eight trailing bytes is the only other valid shape. Previously a partial
-    // field or arbitrary suffix was silently accepted, which could make an older binary
-    // claim it had installed state it did not actually understand.
-    const size_t remaining = static_cast<size_t>(r.end - r.p);
-    if (r.ok && remaining == 8) {
+    // no field here, so default to 1. A current snapshot carries active version, then an
+    // optional magic-tagged initial serving map. Unknown/partial trailers fail closed.
+    size_t remaining = static_cast<size_t>(r.end - r.p);
+    if (r.ok && remaining >= 8) {
         const uint64_t activeFormatVersion = r.u64();
         if (activeFormatVersion == 0 || activeFormatVersion > std::numeric_limits<uint32_t>::max())
             r.ok = false;
@@ -455,7 +544,14 @@ bool Group0StateMachine::loadSnapshot(const std::string& data) {
     } else if (remaining != 0) {
         r.ok = false;
     }
-    if (!r.ok || r.p != r.end || !validSnapshotState(s) || !stateMatchesLocalIdentity(s))
+    remaining = static_cast<size_t>(r.end - r.p);
+    if (r.ok && remaining != 0) {
+        if (remaining < 8 || r.u64() != kServingMapSnapshotMagic)
+            r.ok = false;
+        else
+            s.servingMap = readControlMap(r);
+    }
+    if (!r.ok || r.p != r.end || !validSnapshotState(s) || !stateMatchesLocalExpectations(s))
         return false;  // reject a corrupt snapshot without half-applying it
     state_ = std::move(s);
     return true;
@@ -468,10 +564,12 @@ seastar::future<> Group0StateMachine::applySnapshot(raft::Snapshot snap) {
     // divergence, so fail-stop and let the group be quarantined.
     if (!loadSnapshot(snap.data))
         throw std::runtime_error("group0: invalid control-state snapshot");
+    if (servingMapObserver_ && state_.servingMap.epoch != 0)
+        co_await servingMapObserver_(state_.servingMap);
     // The snapshot boundary is at least this index.
     if (snap.index > state_.appliedIndex)
         state_.appliedIndex = snap.index;
-    return seastar::make_ready_future<>();
+    co_return;
 }
 
 }  // namespace timestar::control

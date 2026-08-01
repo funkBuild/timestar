@@ -110,6 +110,7 @@ enum : uint8_t {
     kMintJoinToken = 9,
     kAdmitWithToken = 10,
     kSetActiveVersion = 11,
+    kSetInitialServingMap = 12,
 };
 
 void writeNode(Writer& w, const NodeRecord& r) {
@@ -128,6 +129,48 @@ NodeRecord readNode(Reader& r) {
     n.failureDomain = r.str();
     n.state = r.nodeState();
     return n;
+}
+
+void writeControlMap(Writer& w, const ControlMap& map) {
+    w.u64(map.epoch);
+    w.u64(map.placement.size());
+    for (const auto& [vshard, replicas] : map.placement) {
+        w.u16(vshard);
+        w.ids(replicas);
+    }
+    w.u64(map.groups.size());
+    for (const auto& [vshard, group] : map.groups) {
+        w.u16(vshard);
+        w.u16(group);
+    }
+}
+
+ControlMap readControlMap(Reader& r) {
+    ControlMap map;
+    map.epoch = r.u64();
+    const uint64_t placements = r.u64();
+    if (!r.ok || placements > static_cast<uint64_t>(r.end - r.p) / 10) {
+        r.ok = false;
+        return map;
+    }
+    for (uint64_t i = 0; i < placements && r.ok; ++i) {
+        const uint16_t vshard = r.u16();
+        auto replicas = r.ids();
+        if (r.ok && !map.placement.emplace(vshard, std::move(replicas)).second)
+            r.ok = false;
+    }
+    const uint64_t groups = r.u64();
+    if (!r.ok || groups > static_cast<uint64_t>(r.end - r.p) / 4) {
+        r.ok = false;
+        return map;
+    }
+    for (uint64_t i = 0; i < groups && r.ok; ++i) {
+        const uint16_t vshard = r.u16();
+        const uint16_t group = r.u16();
+        if (!map.groups.emplace(vshard, group).second)
+            r.ok = false;
+    }
+    return map;
 }
 
 }  // namespace
@@ -179,6 +222,9 @@ std::string encodeCommand(const ControlCommand& cmd) {
             } else if constexpr (std::is_same_v<T, SetActiveVersion>) {
                 w.u8(kSetActiveVersion);
                 w.u64(c.version);
+            } else if constexpr (std::is_same_v<T, SetInitialServingMap>) {
+                w.u8(kSetInitialServingMap);
+                writeControlMap(w, c.map);
             }
         },
         cmd);
@@ -262,6 +308,12 @@ std::optional<ControlCommand> decodeCommand(const std::string& bytes) {
         case kSetActiveVersion: {
             SetActiveVersion c;
             c.version = r.u32();
+            cmd = std::move(c);
+            break;
+        }
+        case kSetInitialServingMap: {
+            SetInitialServingMap c;
+            c.map = readControlMap(r);
             cmd = std::move(c);
             break;
         }

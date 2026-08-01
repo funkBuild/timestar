@@ -1,7 +1,9 @@
 #pragma once
 
+#include "../control/control_map_cache.hpp"
 #include "../raft/raft_types.hpp"
 
+#include <optional>
 #include <stdexcept>
 #include <vector>
 
@@ -47,6 +49,24 @@ inline Group0StartupDecision decideGroup0Startup(bool enabled, raft::NodeId self
     if (self == seed)
         return {Group0StartMode::AwaitExplicitBootstrap, {}};
     return {Group0StartMode::Observe, {seed}};
+}
+
+// Until resumable VShard movement exists, the only serving map production may
+// activate is the immutable epoch-1 map derived from the bound static topology.
+// A durable cache is still the restart source of truth, but it must be exactly
+// that committed initial map; silently adopting a different map would start the
+// wrong Raft groups without performing membership changes or data catch-up.
+inline control::ControlMap selectServingMapForStartup(control::ControlMap configured,
+                                                       std::optional<control::ControlMap> cached) {
+    if (!control::isCompleteControlMap(configured))
+        throw std::invalid_argument("group0 startup requires a complete configured serving map");
+    if (!cached)
+        return configured;
+    if (!control::isCompleteControlMap(*cached) || *cached != configured)
+        throw std::runtime_error(
+            "durable serving map differs from static bootstrap placement; dynamic control-map cutover is not "
+            "implemented");
+    return std::move(*cached);
 }
 
 }  // namespace timestar::cluster

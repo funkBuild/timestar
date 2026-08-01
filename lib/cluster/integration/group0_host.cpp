@@ -38,7 +38,9 @@ Group0Host::~Group0Host() {
 
 seastar::future<> Group0Host::start(std::vector<raft::NodeId> voters, raft::RaftOptions opts,
                                     std::string expectedClusterUuid,
-                                    std::optional<control::NodeRecord> localRecord) {
+                                    std::optional<control::NodeRecord> localRecord,
+                                    std::optional<control::ControlMap> expectedInitialServingMap,
+                                    control::Group0StateMachine::ServingMapObserver servingMapObserver) {
     if (started_ || writer_)
         throw std::logic_error("Group0Host::start called more than once");
     if (voters.empty())
@@ -77,6 +79,10 @@ seastar::future<> Group0Host::start(std::vector<raft::NodeId> voters, raft::Raft
         sm_ = std::make_unique<control::Group0StateMachine>();
         if (localRecord)
             sm_->expectLocalIdentity(std::move(expectedClusterUuid), std::move(*localRecord));
+        if (expectedInitialServingMap)
+            sm_->expectInitialServingMap(std::move(*expectedInitialServingMap));
+        if (servingMapObserver)
+            sm_->setServingMapObserver(std::move(servingMapObserver));
 
         raft::RaftNode node(self_, std::move(baseVoters), std::move(st.log), st.hardState, opts,
                             std::move(baseLearners));

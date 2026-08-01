@@ -4,6 +4,7 @@
 #include "../../utils/line_parser.hpp"
 #include "../../utils/logger.hpp"  // timestar::http_log
 #include "../../utils/series_key.hpp"
+#include "../control/durable_control_map.hpp"
 #include "../control/group0_controller.hpp"
 #include "../data/journal_format.hpp"
 #include "../data/read_routing.hpp"
@@ -18,6 +19,7 @@
 #include <limits>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/sleep.hh>
+#include <seastar/core/thread.hh>
 #include <seastar/net/dns.hh>
 #include <seastar/net/inet_address.hh>
 #include <set>
@@ -213,6 +215,11 @@ seastar::future<> ClusterDataPlane::startImpl(const ClusterConfig& cfg, seastar:
     (void)WriteAdmission::limitBytes();
     validateCoreTopology(seastar::smp::count, cfg.replication_factor);
     rt_ = ClusterRuntime::fromConfig(cfg);  // throws (fail-closed) on misconfig
+    const std::filesystem::path dataRoot = timestar::dataRootPath();
+    if (cfg.control_enabled) {
+        auto cached = co_await seastar::async([dataRoot] { return control::DurableControlMapStore(dataRoot).load(); });
+        rt_->map = selectServingMapForStartup(std::move(rt_->map), std::move(cached));
+    }
     enginesPtr_ = &engines;
     rf_ = cfg.replication_factor < 1 ? 1 : cfg.replication_factor;
     controlEnabled_ = cfg.control_enabled;
@@ -259,7 +266,7 @@ seastar::future<> ClusterDataPlane::startImpl(const ClusterConfig& cfg, seastar:
         if (!journalIdentity_)
             throw std::invalid_argument(
                 "ClusterDataPlane: replicated production startup requires a persistent journal identity");
-        std::filesystem::path journalRoot = timestar::dataRootPath();
+        std::filesystem::path journalRoot = dataRoot;
         journalRoot /= "cluster_raft";
         // Start a Raft plane on EVERY shard; each will own only the VShards that
         // assignCore maps to it, so the group work spreads across all cores.
@@ -508,10 +515,18 @@ seastar::future<> ClusterDataPlane::startImpl(const ClusterConfig& cfg, seastar:
             if (decision.host()) {
                 auto record = *group0Identity_;
                 const std::string clusterUuid = cfg.cluster_uuid;
+                const control::ControlMap initialServingMap = rt_->map;
                 co_await shards_.invoke_on(
                     0, [voters = decision.initialVoters, ropts, bootstrap = decision.bootstrap(),
-                        record = std::move(record), clusterUuid](ShardRaftPlane& plane) mutable -> seastar::future<> {
-                        co_await plane.addGroup0(std::move(voters), ropts, clusterUuid, record);
+                        record = std::move(record), clusterUuid, initialServingMap,
+                        dataRoot](ShardRaftPlane& plane) mutable -> seastar::future<> {
+                        auto publishCache = [dataRoot](control::ControlMap map) {
+                            return seastar::async([dataRoot, map = std::move(map)] {
+                                control::DurableControlMapStore(dataRoot).persist(map);
+                            });
+                        };
+                        co_await plane.addGroup0(std::move(voters), ropts, clusterUuid, record,
+                                                 initialServingMap, std::move(publishCache));
                         auto* host = plane.group0();
                         if (!host || !host->group() || !host->stateMachine())
                             throw std::runtime_error("cluster: group-0 host failed to register its Raft group");
@@ -528,6 +543,9 @@ seastar::future<> ClusterDataPlane::startImpl(const ClusterConfig& cfg, seastar:
                             if (host->state().clusterUuid != clusterUuid)
                                 throw std::runtime_error(
                                     "cluster: explicit group-0 bootstrap did not commit the configured cluster UUID");
+                            if (!co_await controller.publishInitialServingMap(initialServingMap))
+                                throw std::runtime_error(
+                                    "cluster: explicit group-0 bootstrap did not commit the initial serving map");
                         }
                         plane.startGroup0Ticking();
                     });
@@ -1313,6 +1331,7 @@ seastar::future<ClusterDataPlane::Status> ClusterDataPlane::status() const {
     st.controlAppliedIndex = control.appliedIndex;
     st.controlSnapshotIndex = control.snapshotIndex;
     st.controlMapEpoch = control.mapEpoch;
+    st.controlServingMapEpoch = control.servingMapEpoch;
     st.controlActiveFormat = control.activeFormat;
     st.controlNodes = control.nodes;
     st.controlVoters = control.voters;

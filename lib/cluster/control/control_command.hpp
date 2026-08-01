@@ -85,9 +85,17 @@ struct SetActiveVersion {
     uint32_t version = 1;
 };
 
+// Publish the complete initial data-serving map atomically. This is deliberately
+// single-assignment: later topology cutovers require the resumable movement
+// protocol and must not be smuggled in as desired placement.
+struct SetInitialServingMap {
+    ControlMap map;
+};
+
 using ControlCommand =
     std::variant<InitCluster, UpsertNode, SetNodeState, SetDesiredPlacement, SetMetaVoters, CasPolicy,
-                 SetControllerTerm, UpsertJob, MintJoinToken, AdmitWithToken, SetActiveVersion>;
+                 SetControllerTerm, UpsertJob, MintJoinToken, AdmitWithToken, SetActiveVersion,
+                 SetInitialServingMap>;
 
 // Wire serialization for a command (the Raft entry payload). Length-prefixed,
 // self-delimiting; decode returns nullopt on any malformed, truncated, or

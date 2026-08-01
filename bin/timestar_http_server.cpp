@@ -267,6 +267,7 @@ void set_routes(routes& r) {
                           ",\"control_applied_index\":" + std::to_string(st.controlAppliedIndex) +
                           ",\"control_snapshot_index\":" + std::to_string(st.controlSnapshotIndex) +
                           ",\"control_map_epoch\":" + std::to_string(st.controlMapEpoch) +
+                          ",\"control_serving_map_epoch\":" + std::to_string(st.controlServingMapEpoch) +
                           ",\"control_active_format\":" + std::to_string(st.controlActiveFormat) +
                           ",\"control_nodes\":" + std::to_string(st.controlNodes) +
                           ",\"control_voters\":" + std::to_string(st.controlVoters) +

@@ -103,6 +103,7 @@ TEST_F(ClusterDataPlaneTest, ControlHealthIsVisibleWithoutBlockingExistingDataGr
 
     st.controlHosted = true;
     st.controlInitialized = true;
+    st.controlServingMapEpoch = 1;
     st.controlLeader = 1;
     st.controlCurrentTermCommit = true;
     EXPECT_TRUE(st.controlLocallyReady());

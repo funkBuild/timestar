@@ -55,6 +55,11 @@ public:
     // before reconcileMetaVoters may promote the learner.
     seastar::future<bool> activateCaughtUpLearner(raft::NodeId node);
 
+    // Commit the complete epoch-1 serving map exactly once. Exact retries are
+    // idempotent; any different/later map is refused until movement/cutover has
+    // its own resumable protocol.
+    seastar::future<bool> publishInitialServingMap(ControlMap map);
+
     // Recompute the desired meta voters and, if they differ from the current
     // group-0 configuration, drive a joint-consensus membership change and mirror
     // the new set into the state machine. The acknowledgement waits for final

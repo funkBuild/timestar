@@ -428,6 +428,10 @@ Extend `cluster_runtime.{hpp,cpp}` + `bin/timestar_http_server.cpp`:
    reconcile their `control_map_cache` by readBarrier reads of group 0 (the
    authoritative path; the watch-stream RPC hint stays deferred) and
    instantiate/teardown local groups accordingly.
+   The production bootstrap now implements the safe prefix of this contract: it
+   commits one complete immutable epoch-1 serving map, durably publishes it on
+   apply, and reloads it on restart only when it matches the bound static map.
+   Dynamic read-barrier reconciliation and group movement/teardown remain open.
 5. **Data groups:** per core, one `RaftGroupRegistry` (shared tick timer,
    shared transport, quiescent-follower hibernation) hosting an
    `EngineDataStateMachine` per locally-replicated vshard, on the core

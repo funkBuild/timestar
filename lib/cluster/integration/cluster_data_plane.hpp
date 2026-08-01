@@ -310,6 +310,7 @@ public:
         raft::LogIndex controlAppliedIndex = raft::kNoIndex;
         raft::LogIndex controlSnapshotIndex = raft::kNoIndex;
         uint64_t controlMapEpoch = 0;
+        uint64_t controlServingMapEpoch = 0;
         uint32_t controlActiveFormat = 1;
         size_t controlNodes = 0;
         size_t controlVoters = 0;
@@ -329,9 +330,10 @@ public:
         [[nodiscard]] bool controlLocallyReady() const {
             if (!controlEnabled)
                 return true;
-            return controlHosted && controlInitialized && controlLeader != raft::kNoNode && controlCurrentTermCommit &&
-                   controlApplyLagEntries == 0 && controlApplyFailures == 0 && controlTickErrors == 0 &&
-                   controlMaintenanceFailures == 0 && controlCompactionsRefusedTooLarge == 0;
+            return controlHosted && controlInitialized && controlServingMapEpoch != 0 &&
+                   controlLeader != raft::kNoNode && controlCurrentTermCommit && controlApplyLagEntries == 0 &&
+                   controlApplyFailures == 0 && controlTickErrors == 0 && controlMaintenanceFailures == 0 &&
+                   controlCompactionsRefusedTooLarge == 0;
         }
 
         [[nodiscard]] bool readyForTraffic() const {

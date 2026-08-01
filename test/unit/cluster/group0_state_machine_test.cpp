@@ -21,6 +21,14 @@ NodeRecord node(NodeId id, std::string uuid, std::string fd, NodeState st = Node
     return r;
 }
 
+ControlMap completeServingMap(uint64_t epoch = 1) {
+    ControlMap map;
+    map.epoch = epoch;
+    for (uint16_t vshard = 0; vshard < timestar::VIRTUAL_SHARD_COUNT; ++vshard)
+        map.placement.emplace(vshard, std::vector<NodeId>{1, 2, 3});
+    return map;
+}
+
 uint64_t readU64(const std::string& bytes, size_t& offset) {
     uint64_t value = 0;
     for (unsigned i = 0; i < 8; ++i)
@@ -54,6 +62,7 @@ TEST(ControlCommandCodecTest, RoundTripAllCommands) {
         MintJoinToken{"tok-abc"},
         AdmitWithToken{node(8, "u8", "rack-h"), "tok-abc"},
         SetActiveVersion{5},
+        SetInitialServingMap{ControlMap{1, {{0, {1, 2, 3}}}, {{0, 7}}}},
     };
     for (const auto& c : cmds) {
         auto back = decodeCommand(encodeCommand(c));
@@ -67,6 +76,10 @@ TEST(ControlCommandCodecTest, RoundTripAllCommands) {
     auto cas = decodeCommand(encodeCommand(CasPolicy{"k", 3, "v"}));
     ASSERT_TRUE(cas && std::holds_alternative<CasPolicy>(*cas));
     EXPECT_EQ(std::get<CasPolicy>(*cas).expectedVersion, 3u);
+    auto serving = decodeCommand(encodeCommand(SetInitialServingMap{ControlMap{1, {{7, {2, 3}}}, {{7, 4}}}}));
+    ASSERT_TRUE(serving && std::holds_alternative<SetInitialServingMap>(*serving));
+    EXPECT_EQ(std::get<SetInitialServingMap>(*serving).map.placement.at(7), (std::vector<NodeId>{2, 3}));
+    EXPECT_EQ(std::get<SetInitialServingMap>(*serving).map.groups.at(7), 4);
 }
 
 TEST(ControlCommandCodecTest, TruncatedAndUnknownRejected) {
@@ -255,7 +268,7 @@ TEST(Group0StateMachineTest, UndecodableCommittedCommandIsFatal) {
     e.index = 1;
     e.type = timestar::raft::EntryType::Normal;
     e.data = std::string(1, static_cast<char>(0xEE));  // unknown command tag
-    EXPECT_THROW((void)sm.apply(e), std::runtime_error);
+    EXPECT_THROW(sm.apply(e).get(), std::runtime_error);
 }
 
 TEST(Group0StateMachineTest, SnapshotRoundTrip) {
@@ -344,7 +357,7 @@ TEST(Group0StateMachineTest, CorruptSnapshotApplyIsFatalAndKeepsOldState) {
     timestar::raft::Snapshot bad;
     bad.index = 9;
     bad.data = "not a group0 snapshot";
-    EXPECT_THROW((void)sm.applySnapshot(std::move(bad)), std::runtime_error);
+    EXPECT_THROW(sm.applySnapshot(std::move(bad)).get(), std::runtime_error);
     EXPECT_EQ(sm.state().clusterUuid, "keep-me");
     EXPECT_EQ(sm.state().appliedIndex, 0u);
 }
@@ -377,4 +390,67 @@ TEST(Group0StateMachineTest, LocalPersistentIdentityFencesCommandsAndSnapshots) 
         << "the local persistent UUID cannot reappear under another Raft id";
     EXPECT_EQ(sm.state().clusterUuid, "cluster-a");
     EXPECT_EQ(sm.state().nodes.count(2), 0u);
+}
+
+TEST(Group0StateMachineTest, InitialServingMapIsCompleteImmutableAndSnapshotted) {
+    Group0StateMachine sm;
+    ControlMap incomplete{1, {{0, {1, 2, 3}}}};
+    EXPECT_FALSE(sm.applyCommand(SetInitialServingMap{incomplete}));
+    EXPECT_EQ(sm.state().servingMap.epoch, 0u);
+
+    const ControlMap initial = completeServingMap();
+    EXPECT_TRUE(sm.applyCommand(SetInitialServingMap{initial}));
+    EXPECT_EQ(sm.state().servingMap, initial);
+    EXPECT_FALSE(sm.applyCommand(SetInitialServingMap{initial}));
+
+    ControlMap conflict = initial;
+    conflict.placement.at(0) = {3, 2, 1};
+    EXPECT_FALSE(sm.applyCommand(SetInitialServingMap{conflict}));
+    EXPECT_FALSE(sm.applyCommand(SetInitialServingMap{completeServingMap(2)}));
+    EXPECT_EQ(sm.state().servingMap, initial);
+
+    Group0StateMachine restored;
+    ASSERT_TRUE(restored.loadSnapshot(sm.snapshot()));
+    EXPECT_EQ(restored.state().servingMap, initial);
+}
+
+TEST(Group0StateMachineTest, ServingMapPublicationRetriesBeforeAppliedAdvance) {
+    Group0StateMachine sm;
+    unsigned attempts = 0;
+    sm.setServingMapObserver([&attempts](ControlMap) {
+        if (attempts++ == 0)
+            return seastar::make_exception_future<>(std::runtime_error("injected cache failure"));
+        return seastar::make_ready_future<>();
+    });
+    const std::string command = encodeCommand(SetInitialServingMap{completeServingMap()});
+    timestar::raft::LogEntry entry{1, 9, timestar::raft::EntryType::Normal, command};
+    EXPECT_THROW(sm.apply(entry).get(), std::runtime_error);
+    EXPECT_EQ(sm.state().appliedIndex, 0u);
+    EXPECT_EQ(sm.state().servingMap.epoch, 1u);
+    EXPECT_NO_THROW(sm.apply(std::move(entry)).get());
+    EXPECT_EQ(attempts, 2u);
+    EXPECT_EQ(sm.state().appliedIndex, 9u);
+}
+
+TEST(Group0StateMachineTest, LocalServingMapExpectationRejectsConflictingCommit) {
+    const ControlMap expected = completeServingMap();
+    ControlMap conflicting = expected;
+    conflicting.placement.at(17) = {3, 2, 1};
+
+    Group0StateMachine sm;
+    sm.expectInitialServingMap(expected);
+    EXPECT_THROW(sm.apply(timestar::raft::LogEntry{
+                              1, 1, timestar::raft::EntryType::Normal,
+                              encodeCommand(SetInitialServingMap{std::move(conflicting)})})
+                     .get(),
+                 std::runtime_error);
+    EXPECT_EQ(sm.state().servingMap.epoch, 0u);
+
+    Group0StateMachine foreign;
+    foreign.applyCommand(SetInitialServingMap{completeServingMap()});
+    auto wrong = completeServingMap();
+    wrong.placement.at(17) = {3, 2, 1};
+    Group0StateMachine snapshotTarget;
+    snapshotTarget.expectInitialServingMap(std::move(wrong));
+    EXPECT_FALSE(snapshotTarget.loadSnapshot(foreign.snapshot()));
 }

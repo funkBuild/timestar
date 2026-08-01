@@ -4,6 +4,7 @@
 #include "control_command.hpp"
 #include "group0_state.hpp"
 
+#include <functional>
 #include <optional>
 #include <seastar/core/future.hh>
 #include <string>
@@ -17,11 +18,18 @@ namespace timestar::control {
 // journal safety contract) with no separate coordination service.
 class Group0StateMachine : public raft::RaftStateMachine {
 public:
+    using ServingMapObserver = std::function<seastar::future<>(ControlMap)>;
+
     // Install the node-local recovery fence before any snapshot/log entry is
     // applied. The replicated state remains node-independent; this expectation
     // only makes this process fail-stop if committed control state names a
     // different cluster or rebinds its persistent identity.
     void expectLocalIdentity(std::string clusterUuid, NodeRecord localRecord);
+    void expectInitialServingMap(ControlMap map);
+    // Called after an initial serving map is logically applied but before Raft
+    // advances its applied boundary. Production uses this to durably publish
+    // control_map.cache; failure retries the same idempotent entry.
+    void setServingMapObserver(ServingMapObserver observer);
 
     // Apply one committed command entry. Deterministic; no I/O.
     seastar::future<> apply(raft::LogEntry entry) override;
@@ -43,12 +51,14 @@ public:
     bool applyCommand(const ControlCommand& cmd);
 
 private:
-    bool stateMatchesLocalIdentity(const Group0State& state) const;
+    bool stateMatchesLocalExpectations(const Group0State& state) const;
     void rejectConflictingLocalCommand(const ControlCommand& command) const;
 
     Group0State state_;
     std::string expectedClusterUuid_;
     std::optional<NodeRecord> expectedLocalRecord_;
+    std::optional<ControlMap> expectedInitialServingMap_;
+    ServingMapObserver servingMapObserver_;
 };
 
 }  // namespace timestar::control

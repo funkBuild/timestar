@@ -1272,7 +1272,15 @@ is not completion.
   + parent-directory fsync, survives restart, rejects corrupt/partial files, and
   refuses epoch regression or conflicting same-epoch content; its focused
   cache/directory evidence passes 13/13. It deliberately does not equate
-  incremental desired placement with effective serving membership. Opt-in
+  incremental desired placement with effective serving membership. Explicit
+  bootstrap now commits the complete epoch-1 serving map as one immutable
+  group-0 command. Every applying replica persists that exact map through the
+  durable cache before advancing its Raft applied boundary; publication failure
+  retries the same entry. Restart loads the cache off-reactor and refuses a map
+  that differs from the bound static topology, while
+  `control_serving_map_epoch` reports whether group 0 has applied it. Focused
+  control/cache/startup evidence passes 38/38 and the affected readiness tests
+  pass 2/2. Opt-in
   production composition now starts the dedicated host on shard 0 over the live
   Raft transport. `--cluster-init` is an explicit, seed-only ceremony; a fresh
   seed without it stays inert, existing journals recover, and fresh non-seeds
@@ -1282,9 +1290,10 @@ is not completion.
   config validation suite passes 62/62, and the affected socket composition
   passes 7 tests with 2 SMP>1-only skips; the production server target builds.
   **Still open:** there is no seed join/token RPC to add observers to the real
-  group, no group-0-backed effective-membership/cutover map, no cache/live-map
-  publication caller. Static placement and the configured cluster UUID therefore
-  remain authoritative even when the control host is opted in. The host now
+  group and no dynamic effective-membership/cutover command or ordered live-map
+  reconciler. The initial committed map is intentionally single-assignment;
+  static placement remains the only permitted content until VShard movement can
+  prove the destination ready before cutover. The host now
   snapshots after 1,024 newly applied control entries on a 60-second maintenance
   cadence, refuses an over-128-MiB
   snapshot before discarding its log prefix, retries maintenance failures, and
@@ -1514,7 +1523,11 @@ is not completion.
   snapshot and command tests. Because the production server still has no
   activation-bridge caller, this fail-closed slice deliberately leaves
   clustered readiness false and bounded deletes unavailable; it does not close
-  this task.
+  this task. Group 0 now also has command tag 12 and a magic-tagged snapshot
+  trailer for its initial serving map. Group 0 had no prior production server
+  composition, so this opt-in first deployment is homogeneous; mixed-version
+  group-0 operation or rollback after that command commits remains unsupported
+  until this task defines the control-plane upgrade gate.
 - [x] **CR-FIX-077 — make live-gate orchestration fail closed.** Owner:
   release/tests. Restrict reset targets to direct `/tmp/tsgate_*` roots, retry
   removal and prove absence before recreation, never delete a running arm's

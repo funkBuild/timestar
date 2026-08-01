@@ -4,6 +4,18 @@
 
 using namespace timestar::cluster;
 
+namespace {
+
+timestar::control::ControlMap completeMap() {
+    timestar::control::ControlMap map;
+    map.epoch = 1;
+    for (uint16_t vshard = 0; vshard < timestar::VIRTUAL_SHARD_COUNT; ++vshard)
+        map.placement.emplace(vshard, std::vector<timestar::raft::NodeId>{1, 2, 3});
+    return map;
+}
+
+}  // namespace
+
 TEST(Group0StartupPolicyTest, FreshSeedNeverInitializesImplicitly) {
     auto decision = decideGroup0Startup(true, /*self=*/1, /*seed=*/1, false, false);
     EXPECT_EQ(decision.mode, Group0StartMode::AwaitExplicitBootstrap);
@@ -28,4 +40,15 @@ TEST(Group0StartupPolicyTest, ExistingJournalRecoversAndFreshNonSeedObserves) {
     EXPECT_EQ(observer.mode, Group0StartMode::Observe);
     EXPECT_TRUE(observer.host());
     EXPECT_EQ(observer.initialVoters, (std::vector<timestar::raft::NodeId>{1}));
+}
+
+TEST(Group0StartupPolicyTest, DurableInitialServingMapMustMatchBoundStaticTopology) {
+    const auto configured = completeMap();
+    EXPECT_EQ(selectServingMapForStartup(configured, std::nullopt), configured);
+    EXPECT_EQ(selectServingMapForStartup(configured, configured), configured);
+
+    auto conflicting = configured;
+    conflicting.placement.at(0) = {3, 2, 1};
+    EXPECT_THROW(selectServingMapForStartup(configured, std::move(conflicting)), std::runtime_error);
+    EXPECT_THROW(selectServingMapForStartup(timestar::control::ControlMap{}, std::nullopt), std::invalid_argument);
 }

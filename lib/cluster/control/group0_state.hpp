@@ -1,5 +1,6 @@
 #pragma once
 
+#include "control_map_cache.hpp"
 #include "../raft/raft_types.hpp"  // NodeId
 
 #include <cstdint>
@@ -62,6 +63,7 @@ struct Group0State {
     NodeId controllerLeader = 0;                               // node that owns controllerTerm
     std::map<NodeId, NodeRecord> nodes;                        // nodes/<uuid>
     std::map<uint16_t, std::vector<NodeId>> desiredPlacement;  // desired-placement/<vshard>
+    ControlMap servingMap;                                     // immutable initial effective serving map
     std::vector<NodeId> metaVoters;                            // group-0 voter set (self-managed)
     std::map<std::string, PolicyCell> policies;                // schema/retention CAS cells
     std::map<std::string, Job> jobs;                           // jobs/<uuid>

@@ -142,6 +142,14 @@ NodeRecord rec(NodeId id, std::string dom) {
     return r;
 }
 
+ControlMap initialServingMap() {
+    ControlMap map;
+    map.epoch = 1;
+    for (uint16_t vshard = 0; vshard < timestar::VIRTUAL_SHARD_COUNT; ++vshard)
+        map.placement.emplace(vshard, std::vector<NodeId>{1, 2, 3});
+    return map;
+}
+
 seastar::future<> testClusterInitGrowsMetaVotersAcrossDomains() {
     Router router;
     std::vector<std::unique_ptr<RouterTransport>> transports;
@@ -256,6 +264,16 @@ seastar::future<> testReadBarrierReconcilesControlMap() {
     EXPECT_FALSE(init.available()) << "RF=3 bootstrap must not ack a local-only append";
     co_await drive(std::move(init), nodes, router);
     EXPECT_EQ(nodes[1].sm->state().metaVoters, (std::vector<NodeId>{1, 2, 3}));
+
+    const ControlMap serving = initialServingMap();
+    auto publish = controller.publishInitialServingMap(serving);
+    EXPECT_FALSE(publish.available()) << "serving-map publication must wait for quorum apply";
+    EXPECT_TRUE(co_await drive(std::move(publish), nodes, router));
+    EXPECT_EQ(nodes[1].sm->state().servingMap, serving);
+    EXPECT_TRUE(co_await controller.publishInitialServingMap(serving));
+    ControlMap conflicting = serving;
+    conflicting.placement.at(0) = {3, 2, 1};
+    EXPECT_FALSE(co_await controller.publishInitialServingMap(std::move(conflicting)));
 
     // A committed topology change bumps the map epoch.
     auto placement = controller.proposeCommand(SetDesiredPlacement{5, {1, 2, 3}});

@@ -1051,6 +1051,14 @@ identity and configured cluster UUID. A recovered snapshot or committed node
 record that rebinds this node's UUID, Raft ID, address, failure domain, or cluster
 UUID is rejected before application instead of being hosted as control state.
 
+The explicit bootstrap commits the complete epoch-1 serving map atomically and
+then publishes `control_map.cache` on every applying node before Raft advances
+its applied index. Restart reads that durable map off the reactor and refuses it
+if it differs from the data directory's bound static topology. This is an
+initial-map durability bridge, not topology movement: the command is immutable,
+and a different/later serving map is rejected until ordered VShard catch-up,
+membership change, cutover, and teardown are implemented.
+
 Once hosted, group 0 runs a bounded maintenance path: after 1,024 newly applied
 control entries, a 60-second sweep persists a complete control-state snapshot
 and reclaims sealed journal segments below its durable boundary. A snapshot over

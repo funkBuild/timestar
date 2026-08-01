@@ -58,9 +58,14 @@ public:
     // observer that knows the seed voter set, then receives the membership entry
     // that admits/promotes it. This never initializes cluster state and never
     // campaigns; bootstrap is an explicit operation at the composition layer.
+    // Production also supplies node-local identity/map recovery fences and an
+    // observer that durably publishes an applied serving map before Raft's
+    // applied boundary advances.
     seastar::future<> start(std::vector<raft::NodeId> voters, raft::RaftOptions opts = {},
                             std::string expectedClusterUuid = {},
-                            std::optional<control::NodeRecord> localRecord = std::nullopt);
+                            std::optional<control::NodeRecord> localRecord = std::nullopt,
+                            std::optional<control::ControlMap> expectedInitialServingMap = std::nullopt,
+                            control::Group0StateMachine::ServingMapObserver servingMapObserver = {});
     void startTicking();
     seastar::future<> stop();
 

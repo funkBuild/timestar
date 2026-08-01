@@ -380,12 +380,15 @@ public:
     // transport but never VShard 0's wire id or journal directory.
     seastar::future<> addGroup0(std::vector<data::NodeId> voters, raft::RaftOptions opts,
                                 std::string expectedClusterUuid = {},
-                                std::optional<control::NodeRecord> localRecord = std::nullopt) {
+                                std::optional<control::NodeRecord> localRecord = std::nullopt,
+                                std::optional<control::ControlMap> expectedInitialServingMap = std::nullopt,
+                                control::Group0StateMachine::ServingMapObserver servingMapObserver = {}) {
         if (seastar::this_shard_id() != 0)
             throw std::logic_error("group 0 may only be hosted on reactor shard 0");
         if (!group0_)
             throw std::logic_error("group 0 host was not constructed");
-        return group0_->start(std::move(voters), opts, std::move(expectedClusterUuid), std::move(localRecord));
+        return group0_->start(std::move(voters), opts, std::move(expectedClusterUuid), std::move(localRecord),
+                              std::move(expectedInitialServingMap), std::move(servingMapObserver));
     }
 
     Group0Host* group0() { return group0_.get(); }
@@ -403,6 +406,7 @@ public:
         raft::LogIndex appliedIndex = raft::kNoIndex;
         raft::LogIndex snapshotIndex = raft::kNoIndex;
         uint64_t mapEpoch = 0;
+        uint64_t servingMapEpoch = 0;
         uint32_t activeFormat = 1;
         size_t nodes = 0;
         size_t voters = 0;
@@ -439,6 +443,7 @@ public:
         c.appliedIndex = group->appliedIndex();
         c.snapshotIndex = group->node().log().snapshotIndex();
         c.mapEpoch = state.mapEpoch;
+        c.servingMapEpoch = state.servingMap.epoch;
         c.activeFormat = state.activeFormatVersion;
         c.nodes = state.nodes.size();
         c.voters = config.voters.size();
