@@ -9,7 +9,7 @@
 `2e06cb8`, `7151f5d`, `5b22b81`, `fef4886`, `3d2d607`, `f0e28f0`,
 `da55952`, `a1beb94`, `bb5b871`, `e201343`, `6ad2c93`, `9a42d84`,
 `41fdc34`, `a58d2a9`, `6a73809`, `81692a4`, `d363348`, `2749027`,
-`1f61f49`, `b2c7d0b`
+`1f61f49`, `b2c7d0b`, `872f7e1`
 
 **Scope:** The recent VShard/Raft cluster redesign, its production-server
 integration, the public HTTP surface, recovery paths, and the release evidence
@@ -22,7 +22,7 @@ used as evidence that the current server is production-ready.
 
 ## Implementation progress after the review
 
-Thirty remediation commits are now recorded. Cluster release status remains
+Thirty-one remediation commits are now recorded. Cluster release status remains
 **BLOCKED** because group 0/movement, generation-atomic live snapshot
 replacement, atomic and retry-safe pattern-delete semantics, replicated
 retention, the large-snapshot path, and rolling wire-format compatibility remain
@@ -115,6 +115,14 @@ Completed and covered in this pass:
   deleted public-path probes. Its first run on the current candidate was
   interrupted during catch-up and is not release evidence; a bounded rerun
   remains required.
+- Snapshot installation now has a deterministic read-visibility proof across
+  its data-plus-catalog publication interval. The Raft driver keeps
+  `appliedIndex` behind the committed snapshot boundary until the complete
+  state-machine install future resolves. The production apply fence therefore
+  refuses data queries, metadata, and pattern discovery while an install is
+  partial, then exposes the rebuilt view only after completion. This closes the
+  external-read visibility subtask of CR-FIX-011; it does not make the storage
+  publication itself generation-atomic, which remains CR-FIX-012.
 - Shared-journal GC now scans past an individually pinned segment and reclaims
   later fully released segments instead of allowing one idle VShard to retain
   the reactor's entire physical suffix. Recovery accepts only sequence gaps
@@ -750,8 +758,12 @@ payload v2 includes the exact catalog, creation ships a resolved VShard-pure
 object, and the receiver uses local names and rejects mixed/non-empty state. It
 also makes an exact data publication retry idempotent, which covers the normal
 crash/replay boundary between file publication and catalog reconstruction.
-CR-FIX-011/012 remain open because data visibility plus index publication is not
-a single fenced generation swap, live replacement is deliberately unsupported,
+Raft does not advance `appliedIndex` until that whole two-step install completes,
+and production data, metadata, and catalog reads use the resulting apply-lag
+fence, so clients cannot observe the intermediate state. CR-FIX-011 remains open
+for the bounded empty-node live gate, replicated-retention coverage, and format
+negotiation. CR-FIX-012 remains open because the storage publication itself is
+not a single generation swap, live replacement is deliberately unsupported,
 and crash injection has not covered every publication boundary. The present
 producer emits at most one file and the receiver rejects multi-file payloads;
 removing that restriction requires atomic generation-directory publication.
@@ -967,12 +979,17 @@ is not completion.
   value-type bindings, and exact day postings. Unit coverage now catches up an
   empty Engine through the real state-machine apply path: normal discovery
   returns the surviving series while a fully deleted series in the same VShard
-  is absent from both installed data and the rebuilt catalog. The public
-  multi-process gate now wipes and proves absence of the returning node's entire
-  durable root and drives live/deleted probes, but its first run was interrupted
-  and supplies no completion evidence. A bounded rerun, replicated-retention
-  coverage (blocked on CR-FIX-040), format negotiation, and a single visibility
-  fence across data plus derived index still remain.
+  is absent from both installed data and the rebuilt catalog. A deterministic
+  Raft-driver regression pauses inside the state-machine install and proves the
+  committed/applied gap remains visible until both data and catalog work finish;
+  a real EngineLocalStore regression proves data queries, metadata, and pattern
+  discovery all fail closed during that interval and become visible afterward.
+  The public multi-process gate now wipes and proves absence of the returning
+  node's entire durable root and drives live/deleted probes, but its first run
+  was interrupted and supplies no completion evidence. A bounded rerun,
+  replicated-retention coverage (blocked on CR-FIX-040), and format negotiation
+  remain. Generation-atomic storage replacement is tracked separately by
+  CR-FIX-012.
 - [ ] **CR-FIX-012 — make live snapshot installation generation-safe and
   atomic.** Owner: storage. Install into unique immutable object names or replace
   the manager's generation under a fence; remove superseded VShard state without
@@ -1586,3 +1603,12 @@ it accepted 400/400 campaign batches, produced nine donor snapshots, refused
 zero oversize snapshots, and committed the exact probe delete; it did not reach
 the caught-up/readback assertions. Its three test roots were about 3 GiB in
 aggregate and were reclaimed after preserving diagnostic tails.
+
+Snapshot read-visibility validation for `872f7e1`:
+
+```text
+focused snapshot/apply-fence regressions:       11/11 passed (-c 2, --memory 2G)
+all RaftGroup + EngineLocalStore regressions:   13/13 passed (-c 2, --memory 2G)
+timestar_unit_test:                             built successfully (-j2)
+git diff --check:                               passed
+```
