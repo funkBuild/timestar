@@ -689,6 +689,13 @@ int main(int argc, char** argv) {
                             return seastar::smp::submit_to(
                                 0u, [b = std::move(b)]() mutable { return g_clusterDataPlane.write(std::move(b)); });
                         };
+                    if (replicatedWrites) {
+                        timestar::http::HttpDeleteHandler::clusterDeleteHook = [](std::string seriesKey,
+                                                                                  uint64_t startTime,
+                                                                                  uint64_t endTime) {
+                            return g_clusterDataPlane.deleteRangeFromShard(std::move(seriesKey), startTime, endTime);
+                        };
+                    }
                     // Route metadata endpoints through the scatter+merge.
                     timestar::http::HttpMetadataHandler::clusterMetadataHook = [](timestar::data::MetadataRequest r) {
                         return seastar::smp::submit_to(

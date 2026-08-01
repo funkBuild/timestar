@@ -32,13 +32,13 @@
 #include "../../test_helpers.hpp"
 
 // HTTP handlers
+#include "../../../lib/cluster/data/write_errors.hpp"
+#include "../../../lib/http/http_delete_handler.hpp"
 #include "../../../lib/http/http_metadata_handler.hpp"
 #include "../../../lib/http/http_query_handler.hpp"
 #include "../../../lib/http/http_retention_handler.hpp"
 #include "../../../lib/http/http_stream_handler.hpp"
 #include "../../../lib/http/http_write_handler.hpp"
-
-#include "../../../lib/http/http_delete_handler.hpp"
 
 using namespace timestar;
 namespace fs = std::filesystem;
@@ -1255,7 +1255,115 @@ TEST_F(HttpHandlerIntegrationTest, PartitionedClusterRejectsDeleteBeforeLocalMut
         req->_headers["x-timestar-cluster-forwarded"] = "1";
         auto rep = deleteHandler.handleDelete(std::move(req)).get();
         EXPECT_EQ(rep->_status, seastar::http::reply::status_type::not_implemented);
-        EXPECT_NE(rep->_content.find("Raft-ordered deletes"), std::string::npos);
+        EXPECT_NE(rep->_content.find("replicated deletes require RF>1"), std::string::npos);
+    })
+        .join()
+        .get();
+}
+
+TEST_F(HttpHandlerIntegrationTest, PartitionedRf3RoutesExactDeleteThroughClusterHook) {
+    seastar::thread([] {
+        struct ResetHook {
+            ~ResetHook() { HttpDeleteHandler::clusterDeleteHook = {}; }
+        } reset;
+        ScopedShardedEngine eng;
+        eng.start();
+        std::vector<std::string> keys;
+        HttpDeleteHandler::clusterDeleteHook = [&keys](std::string key, uint64_t start, uint64_t end) {
+            keys.push_back(std::move(key));
+            EXPECT_EQ(start, 10u);
+            EXPECT_EQ(end, 20u);
+            return seastar::make_ready_future<>();
+        };
+
+        HttpDeleteHandler handler(&eng.eng, true);
+        auto req = makeDeleteRequest(
+            R"({"measurement":"cluster_del","tags":{"host":"h1"},"field":"value","startTime":10,"endTime":20})");
+        auto rep = handler.handleDelete(std::move(req)).get();
+        ASSERT_TRUE(isOk(*rep)) << rep->_content;
+        ASSERT_EQ(keys.size(), 1u);
+        EXPECT_EQ(keys[0], buildSeriesKey("cluster_del", {{"host", "h1"}}, "value"));
+        EXPECT_NE(rep->_content.find("committed and applied"), std::string::npos);
+    })
+        .join()
+        .get();
+}
+
+TEST_F(HttpHandlerIntegrationTest, PartitionedRf3RejectsMixedPatternBatchBeforeAnyProposal) {
+    seastar::thread([] {
+        struct ResetHook {
+            ~ResetHook() { HttpDeleteHandler::clusterDeleteHook = {}; }
+        } reset;
+        ScopedShardedEngine eng;
+        eng.start();
+        unsigned calls = 0;
+        HttpDeleteHandler::clusterDeleteHook = [&calls](std::string, uint64_t, uint64_t) {
+            ++calls;
+            return seastar::make_ready_future<>();
+        };
+
+        HttpDeleteHandler handler(&eng.eng, true);
+        auto req = makeDeleteRequest(
+            R"({"deletes":[{"series":"m value","startTime":0,"endTime":1},{"measurement":"m","tags":{"host":"h1"},"startTime":0,"endTime":1}]})");
+        auto rep = handler.handleDelete(std::move(req)).get();
+        EXPECT_EQ(rep->_status, seastar::http::reply::status_type::not_implemented);
+        EXPECT_EQ(calls, 0u) << "the exact prefix of a mixed batch must not partially commit";
+        EXPECT_NE(rep->_content.find("Pattern delete is unavailable"), std::string::npos);
+    })
+        .join()
+        .get();
+}
+
+TEST_F(HttpHandlerIntegrationTest, PartitionedRf3MapsRetryableDeleteFailureTo503) {
+    seastar::thread([] {
+        struct ResetHook {
+            ~ResetHook() { HttpDeleteHandler::clusterDeleteHook = {}; }
+        } reset;
+        ScopedShardedEngine eng;
+        eng.start();
+        HttpDeleteHandler::clusterDeleteHook = [](std::string, uint64_t, uint64_t) {
+            return seastar::make_exception_future<>(timestar::data::RetryableWriteError("delete quorum unavailable"));
+        };
+
+        HttpDeleteHandler handler(&eng.eng, true);
+        auto req = makeDeleteRequest(R"({"series":"m value","startTime":0,"endTime":1})");
+        auto rep = handler.handleDelete(std::move(req)).get();
+        EXPECT_EQ(rep->_status, seastar::http::reply::status_type::service_unavailable);
+        EXPECT_EQ(rep->_headers["Retry-After"], "1");
+        EXPECT_NE(rep->_content.find("delete quorum unavailable"), std::string::npos);
+    })
+        .join()
+        .get();
+}
+
+TEST_F(HttpHandlerIntegrationTest, PartitionedRf3BoundsDeleteBatchProposalConcurrency) {
+    seastar::thread([] {
+        struct ResetHook {
+            ~ResetHook() { HttpDeleteHandler::clusterDeleteHook = {}; }
+        } reset;
+        ScopedShardedEngine eng;
+        eng.start();
+        unsigned active = 0;
+        unsigned maximum = 0;
+        HttpDeleteHandler::clusterDeleteHook = [&active, &maximum](std::string, uint64_t, uint64_t) {
+            ++active;
+            maximum = std::max(maximum, active);
+            return seastar::sleep(std::chrono::milliseconds(2)).finally([&active] { --active; });
+        };
+
+        std::string body = R"({"deletes":[)";
+        for (unsigned i = 0; i < 96; ++i) {
+            if (i)
+                body += ',';
+            body += R"({"series":"batch,host=h)" + std::to_string(i) + R"( value","startTime":0,"endTime":1})";
+        }
+        body += "]}";
+
+        HttpDeleteHandler handler(&eng.eng, true);
+        auto rep = handler.handleDelete(makeDeleteRequest(body)).get();
+        ASSERT_TRUE(isOk(*rep)) << rep->_content;
+        EXPECT_EQ(active, 0u);
+        EXPECT_EQ(maximum, 32u) << "one request exceeded the bounded Raft-proposal fan-out";
     })
         .join()
         .get();
@@ -1296,8 +1404,7 @@ TEST_F(HttpHandlerIntegrationTest, PartitionedClusterRejectsUnwiredReadConsisten
         HttpQueryHandler queryHandler(nullptr);
         auto req = std::make_unique<seastar::http::request>();
         req->_headers["Content-Type"] = "application/json";
-        req->content =
-            R"json({"query":"latest:m(value)","startTime":0,"endTime":1,"consistency":"session"})json";
+        req->content = R"json({"query":"latest:m(value)","startTime":0,"endTime":1,"consistency":"session"})json";
         auto rep = queryHandler.handleQuery(std::move(req)).get();
         EXPECT_EQ(rep->_status, seastar::http::reply::status_type::not_implemented);
         EXPECT_NE(rep->_content.find("CLUSTER_READ_MODE_UNSUPPORTED"), std::string::npos);

@@ -77,6 +77,10 @@ constexpr uint64_t kNegotiateVersion = 9;   // sstring(u32 min,u32 max) -> sstri
 // CLIENT picks it, and only once the negotiated version says the peer answers it, so
 // both directions of a mixed-version cluster keep working unchanged.
 constexpr uint64_t kProposeWriteHinted = 10;
+// One already-VShard-scoped ReplicatedCommand (currently the production delete
+// path). The request is u16 VShard + the checksummed ReplicatedCommand frame; the
+// response reuses the committed-set/hint shape above.
+constexpr uint64_t kProposeCommandHinted = 11;
 
 // How long before re-attempting a peer connection that died. seastar's rpc::client
 // never reconnects itself, so we replace it -- but bounded, so a burst of concurrent
@@ -258,6 +262,7 @@ struct DataPlaneRpc::Impl {
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> queryMetadataStub;
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> proposeWriteStub;
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> proposeWriteHintedStub;
+    std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> proposeCommandHintedStub;
     // DEADLINE-CARRYING variants of the three verbs the write path awaits
     // (write-scaleout 3f). seastar's rpc client stub has a time_point overload; without
     // it an awaited call has NO timeout at all, so a peer that accepts the connection and
@@ -271,6 +276,9 @@ struct DataPlaneRpc::Impl {
     std::function<seastar::future<seastar::sstring>(Client&, seastar::rpc::rpc_clock_type::time_point,
                                                     seastar::sstring)>
         proposeWriteHintedTimedStub;
+    std::function<seastar::future<seastar::sstring>(Client&, seastar::rpc::rpc_clock_type::time_point,
+                                                    seastar::sstring)>
+        proposeCommandHintedTimedStub;
     std::function<seastar::future<seastar::sstring>(Client&, seastar::rpc::rpc_clock_type::time_point,
                                                     seastar::sstring)>
         negotiateVersionTimedStub;
@@ -354,8 +362,10 @@ struct DataPlaneRpc::Impl {
         queryMetadataStub = proto.make_client<seastar::sstring(seastar::sstring)>(kQueryMetadata);
         proposeWriteStub = proto.make_client<seastar::sstring(seastar::sstring)>(kProposeWrite);
         proposeWriteHintedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kProposeWriteHinted);
+        proposeCommandHintedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kProposeCommandHinted);
         proposeWriteTimedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kProposeWrite);
         proposeWriteHintedTimedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kProposeWriteHinted);
+        proposeCommandHintedTimedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kProposeCommandHinted);
         negotiateVersionTimedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kNegotiateVersion);
         queryNodeTimedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kQueryNode);
         leaderReadIndexStub = proto.make_client<seastar::sstring(seastar::sstring)>(kLeaderReadIndex);
@@ -522,6 +532,38 @@ seastar::future<> DataPlaneRpc::start(seastar::socket_address local, NodeStore& 
         return impl_->proposeSink->proposeBatchHinted(std::move(*batch)).then([](ProposeOutcome out) {
             return encodeProposeOutcome(out);
         });
+    });
+    impl_->proto.register_handler(kProposeCommandHinted, [this](seastar::sstring data) {
+        if (!impl_->proposeSink)
+            return seastar::make_exception_future<seastar::sstring>(
+                std::runtime_error("dataplane: no propose sink (node not RF>1)"));
+        if (data.size() < 3)
+            return seastar::make_exception_future<seastar::sstring>(
+                std::runtime_error("dataplane: malformed proposed command"));
+        const uint16_t vshard = static_cast<uint16_t>(static_cast<uint8_t>(data[0]) |
+                                                      (static_cast<uint16_t>(static_cast<uint8_t>(data[1])) << 8));
+        auto command = decodeReplicatedCommand(std::string(data.data() + 2, data.size() - 2));
+        if (!command)
+            return seastar::make_exception_future<seastar::sstring>(
+                std::runtime_error("dataplane: malformed proposed command"));
+
+        // A peer must not use the explicit VShard prefix to steer a series
+        // command into a different Raft group. RetentionCutoffCmd is VShard-wide
+        // by construction; writes and deletes carry enough identity to verify.
+        bool matches = true;
+        if (const auto* d = std::get_if<DeleteRangeKey>(&*command)) {
+            matches = timestar::virtualShard(SeriesId128::fromSeriesKey(d->seriesKey)) == vshard;
+        } else if (auto* w = std::get_if<WriteBatch>(&*command)) {
+            matches = !w->series.empty();
+            for (auto& s : w->series)
+                matches = matches && vshardOf(s) == vshard;
+        }
+        if (!matches)
+            return seastar::make_exception_future<seastar::sstring>(
+                std::runtime_error("dataplane: proposed command does not belong to its VShard"));
+
+        return impl_->proposeSink->proposeCommandHinted(vshard, std::move(*command), std::nullopt)
+            .then([](ProposeOutcome out) { return encodeProposeOutcome(out); });
     });
     impl_->proto.register_handler(kLeaderReadIndex, [this](seastar::sstring data) {
         if (!impl_->readIndexSink)
@@ -859,6 +901,40 @@ seastar::future<ProposeOutcome> DataPlaneRpc::proposeWriteHinted(NodeId to, VSha
     // committed-set arithmetic works uniformly.
     if (out->committed)
         out->committedVShards = std::move(vshards);
+    co_return std::move(*out);
+}
+
+seastar::future<ProposeOutcome> DataPlaneRpc::proposeCommandHinted(NodeId to, uint16_t vshard,
+                                                                   ReplicatedCommand command, OptDeadline deadline) {
+    if (impl_->stopping)
+        throw std::runtime_error("dataplane: shutting down");
+    // This verb was introduced with the unreleased v3 data plane. Never send it
+    // to a negotiated v1/v2 peer: an unknown RPC verb is not an upgrade policy.
+    const uint32_t version = co_await versionFor(to, deadline);
+    if (version < kWriteBatchFormatV3)
+        throw std::runtime_error("dataplane: peer wire version does not support replicated commands");
+    auto* conn = impl_->clientFor(to);
+    if (!conn)
+        throw std::runtime_error("dataplane: unknown peer");
+    std::string encoded = encodeReplicatedCommand(command);
+    if (encoded.size() > raft::RaftGroup::kMaxProposalBytes)
+        throw WriteFrameTooLargeError("dataplane: replicated command exceeds the Raft entry limit");
+    std::string frame;
+    frame.reserve(2 + encoded.size());
+    frame.push_back(static_cast<char>(vshard & 0xff));
+    frame.push_back(static_cast<char>((vshard >> 8) & 0xff));
+    frame += encoded;
+    if (frame.size() > kMaxOutboundFrameBytes)
+        throw WriteFrameTooLargeError("dataplane: replicated command exceeds the inter-node frame limit");
+    auto reply = deadline
+                     ? co_await impl_->proposeCommandHintedTimedStub(*conn, *deadline,
+                                                                     seastar::sstring(frame.data(), frame.size()))
+                     : co_await impl_->proposeCommandHintedStub(*conn, seastar::sstring(frame.data(), frame.size()));
+    auto out = decodeProposeOutcome(reply);
+    if (!out)
+        throw std::runtime_error("dataplane: malformed replicated-command reply");
+    if (out->committed)
+        out->committedVShards = {vshard};
     co_return std::move(*out);
 }
 

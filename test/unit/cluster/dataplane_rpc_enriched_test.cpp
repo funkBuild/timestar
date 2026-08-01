@@ -96,11 +96,27 @@ class RecordingProposeSink : public data::ProposeSink {
 public:
     bool committed = true;
     int calls = 0;
+    int commandCalls = 0;
     size_t lastSeriesCount = 0;
+    uint16_t lastCommandVShard = 0;
+    std::string lastCommandBytes;
     seastar::future<bool> proposeBatch(data::WriteBatch batch) override {
         ++calls;
         lastSeriesCount = batch.series.size();
         return seastar::make_ready_future<bool>(committed);
+    }
+    seastar::future<data::ProposeOutcome> proposeCommandHinted(uint16_t vshard, data::ReplicatedCommand command,
+                                                               data::OptDeadline) override {
+        ++commandCalls;
+        lastCommandVShard = vshard;
+        lastCommandBytes = data::encodeReplicatedCommand(command);
+        data::ProposeOutcome out;
+        out.committed = committed;
+        if (committed)
+            out.committedVShards = {vshard};
+        else
+            out.rejects.push_back(data::SliceReject{vshard, timestar::raft::kNoNode, data::WriteFailure::NotLeader});
+        return seastar::make_ready_future<data::ProposeOutcome>(std::move(out));
     }
 };
 
@@ -937,6 +953,70 @@ TEST_F(DataPlaneRpcEnrichedTest, HintedProposeCarriesTheRealLeaderBack) {
         // for, so the caller's committed-set arithmetic works uniformly.
         EXPECT_EQ(ok.committedVShards, std::vector<uint16_t>{vs});
         rpc.stop().get();
+    }).get();
+}
+
+TEST_F(DataPlaneRpcEnrichedTest, ReplicatedCommandCrossesV3SocketAndRejectsVShardSpoofing) {
+    seastar::async([] {
+        const uint16_t port = 39361;
+        const data::NodeId self = 1;
+        RecordingProposeSink sink;
+        ThrowingNodeStore store;
+        data::DataPlaneRpc rpc;
+        rpc.setProposeSink(sink);
+        rpc.start(loopback(port), store).get();
+        rpc.addPeer(self, loopback(port));
+
+        const std::string key = buildSeriesKey("delete", {{"host", "wire"}}, "value");
+        const uint16_t vshard = timestar::virtualShard(SeriesId128::fromSeriesKey(key));
+        const data::ReplicatedCommand command{data::DeleteRangeKey{key, BASE, BASE + 10}};
+        const data::ProposeOutcome out = rpc.proposeCommandHinted(self, vshard, command, std::nullopt).get();
+        EXPECT_TRUE(out.committed);
+        EXPECT_EQ(out.committedVShards, std::vector<uint16_t>{vshard});
+        EXPECT_EQ(sink.commandCalls, 1);
+        EXPECT_EQ(sink.lastCommandVShard, vshard);
+        EXPECT_EQ(sink.lastCommandBytes, data::encodeReplicatedCommand(command));
+
+        const uint16_t wrong = static_cast<uint16_t>((vshard + 1) % timestar::VIRTUAL_SHARD_COUNT);
+        std::string error;
+        try {
+            rpc.proposeCommandHinted(self, wrong, command, std::nullopt).get();
+        } catch (const std::exception& e) {
+            error = e.what();
+        }
+        EXPECT_NE(error.find("does not belong to its VShard"), std::string::npos) << error;
+        EXPECT_EQ(sink.commandCalls, 1) << "a spoofed VShard prefix must be rejected before the sink";
+
+        rpc.stop().get();
+    }).get();
+}
+
+TEST_F(DataPlaneRpcEnrichedTest, ReplicatedCommandIsNotSentToAPeerBelowV3) {
+    seastar::async([] {
+        const uint16_t serverPort = 39380, clientPort = 39381;
+        const data::NodeId server = 2;
+        WireTapPeer tap(loopback(serverPort), /*agreedVersion=*/2);
+        ThrowingNodeStore store;
+        data::DataPlaneRpc client;
+        client.start(loopback(clientPort), store).get();
+        client.addPeer(server, loopback(serverPort));
+
+        const std::string key = buildSeriesKey("delete", {{"host", "old-peer"}}, "value");
+        const uint16_t vshard = timestar::virtualShard(SeriesId128::fromSeriesKey(key));
+        std::string error;
+        try {
+            client
+                .proposeCommandHinted(server, vshard,
+                                      data::ReplicatedCommand{data::DeleteRangeKey{key, BASE, BASE + 10}}, std::nullopt)
+                .get();
+        } catch (const std::exception& e) {
+            error = e.what();
+        }
+        EXPECT_NE(error.find("does not support replicated commands"), std::string::npos) << error;
+        EXPECT_TRUE(tap.captured.empty()) << "the command fell back to the write verb on an old peer";
+
+        client.stop().get();
+        tap.stop();
     }).get();
 }
 

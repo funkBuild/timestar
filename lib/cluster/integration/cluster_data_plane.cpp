@@ -1047,6 +1047,17 @@ seastar::future<> ClusterDataPlane::writeFromShard(data::WriteBatch batch) {
     return writeSlicesToOwningShards(shards_, std::move(batch), dir_.get());
 }
 
+seastar::future<> ClusterDataPlane::deleteRangeFromShard(std::string seriesKey, uint64_t startTime, uint64_t endTime) {
+    if (!replicated_ || !shardsStarted_)
+        throw std::runtime_error("ClusterDataPlane::deleteRangeFromShard requires replicated mode after start()");
+    const uint16_t vshard = timestar::virtualShard(SeriesId128::fromSeriesKey(seriesKey));
+    const unsigned owner = shardOwningVShard(vshard, dir_.get());
+    data::DeleteRangeKey del{std::move(seriesKey), startTime, endTime};
+    return shards_.invoke_on(owner, [vshard, del = std::move(del)](ShardRaftPlane& plane) mutable {
+        return plane.command(vshard, data::ReplicatedCommand{std::move(del)});
+    });
+}
+
 seastar::future<bool> ClusterDataPlane::proposeBatch(data::WriteBatch batch) {
     // A peer forwarded this batch because we lead those VShards. Replicate each
     // slice through the Raft group on its owning shard.

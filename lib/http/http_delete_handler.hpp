@@ -5,6 +5,7 @@
 
 #include <glaze/json.hpp>
 
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -108,6 +109,10 @@ private:
     bool partitionedCluster_ = false;
 
 public:
+    using ClusterDeleteHook =
+        std::function<seastar::future<>(std::string seriesKey, uint64_t startTime, uint64_t endTime)>;
+    static inline ClusterDeleteHook clusterDeleteHook{};
+
     struct DeleteRequest {
         std::string seriesKey;
         std::string measurement;

@@ -59,9 +59,9 @@ TEST_F(EngineDataStateMachineTest, AppliesWriteDeleteAndLwwFromLog) {
         ScopedShardedEngine eng;
         eng.start();
         cluster::EngineLocalStore store(*eng);
-        cluster::EngineDataStateMachine sm(store, timestar::VShardId{0});
-
         const std::string key = buildSeriesKey("temp", {{"host", "h1"}}, "value");
+        const uint16_t vshard = timestar::virtualShard(SeriesId128::fromSeriesKey(key));
+        cluster::EngineDataStateMachine sm(store, timestar::VShardId{vshard});
 
         // Entry 5: write 10.0.
         sm.apply(writeEntry(5, key, 10.0)).get();
@@ -83,6 +83,29 @@ TEST_F(EngineDataStateMachineTest, AppliesWriteDeleteAndLwwFromLog) {
         sm.apply(std::move(del)).get();
         EXPECT_EQ(sm.appliedIndex(), 12u);
         EXPECT_DOUBLE_EQ(latest(*eng, "temp", "value"), -1);  // absent
+    }).get();
+}
+
+TEST_F(EngineDataStateMachineTest, RejectsACommittedCommandForAnotherVShard) {
+    seastar::async([] {
+        ScopedShardedEngine eng;
+        eng.start();
+        cluster::EngineLocalStore store(*eng);
+
+        const std::string owned = buildSeriesKey("temp", {{"host", "owned"}}, "value");
+        const uint16_t ownedVShard = timestar::virtualShard(SeriesId128::fromSeriesKey(owned));
+        std::string foreign;
+        for (unsigned i = 0; i < 4096; ++i) {
+            foreign = buildSeriesKey("temp", {{"host", "foreign" + std::to_string(i)}}, "value");
+            if (timestar::virtualShard(SeriesId128::fromSeriesKey(foreign)) != ownedVShard)
+                break;
+        }
+        ASSERT_NE(timestar::virtualShard(SeriesId128::fromSeriesKey(foreign)), ownedVShard);
+
+        cluster::EngineDataStateMachine sm(store, timestar::VShardId{ownedVShard});
+        EXPECT_THROW(sm.apply(writeEntry(1, foreign, 5.0)).get(), std::runtime_error)
+            << "cross-VShard commands must fail-stop instead of contaminating this group's state";
+        EXPECT_DOUBLE_EQ(latest(*eng, "temp", "value"), -1);
     }).get();
 }
 
@@ -124,9 +147,9 @@ TEST_F(EngineDataStateMachineTest, AppliedRevisionsAreNotReStampedByEngineCounte
             .get();
 
         cluster::EngineLocalStore store(*eng);
-        cluster::EngineDataStateMachine sm(store, timestar::VShardId{0});
-
         const std::string key = buildSeriesKey("temp", {{"host", "h1"}}, "value");
+        const uint16_t vshard = timestar::virtualShard(SeriesId128::fromSeriesKey(key));
+        cluster::EngineDataStateMachine sm(store, timestar::VShardId{vshard});
         const unsigned core = timestar::routeToCore(SeriesId128::fromSeriesKey(key));
         const uint64_t before =
             eng->invoke_on(core, [](Engine& e) { return e.nextRevision(); }).get();

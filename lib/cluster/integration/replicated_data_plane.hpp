@@ -1,5 +1,6 @@
 #pragma once
 
+#include "../data/replicated_command_router.hpp"
 #include "../data/replicated_write_router.hpp"
 #include "../data/vshard_directory.hpp"
 #include "../raft/raft_driver.hpp"  // RaftTransport
@@ -23,11 +24,15 @@ public:
     ReplicatedDataPlane(EngineLocalStore& store, raft::RaftTransport& raftTransport, data::NodeTransport& client,
                         const data::VShardDirectory& dir, data::NodeId self, std::filesystem::path journalRoot,
                         std::chrono::milliseconds tick = std::chrono::milliseconds(20))
-        : host_(store, raftTransport, self, std::move(journalRoot), tick), router_(dir, host_, client, host_) {}
+        : host_(store, raftTransport, self, std::move(journalRoot), tick),
+          router_(dir, host_, client, host_),
+          commandRouter_(dir, host_, client, host_) {}
     ReplicatedDataPlane(EngineLocalStore& store, raft::RaftTransport& raftTransport, data::NodeTransport& client,
                         const data::VShardDirectory& dir, data::NodeId self, std::filesystem::path journalRoot,
                         JournalIdentity identity, std::chrono::milliseconds tick = std::chrono::milliseconds(20))
-        : host_(store, raftTransport, self, std::move(journalRoot), identity, tick), router_(dir, host_, client, host_) {}
+        : host_(store, raftTransport, self, std::move(journalRoot), identity, tick),
+          router_(dir, host_, client, host_),
+          commandRouter_(dir, host_, client, host_) {}
 
     // Instantiate the local Raft groups this node replicates (one per entry of
     // ClusterRuntime::localReplicaGroups()).
@@ -41,6 +46,9 @@ public:
     // and buckets the groups by owning shard.
     seastar::future<> write(data::WriteBatch batch) { return router_.write(std::move(batch)); }
     seastar::future<> write(data::VShardBatches groups) { return router_.write(std::move(groups)); }
+    seastar::future<> command(uint16_t vshard, data::ReplicatedCommand cmd) {
+        return commandRouter_.propose(vshard, std::move(cmd));
+    }
 
     // The Raft propose target incoming proposeWrite RPCs dispatch into (host_ is the
     // ProposeSink). The server wires DataPlaneRpc::setProposeSink to this.
@@ -59,6 +67,7 @@ private:
     // host_ before router_: router_ borrows host_ as its local ProposeSink.
     ReplicatedVShardHost host_;
     data::ReplicatedBatchWriteRouter router_;
+    data::ReplicatedCommandRouter commandRouter_;
 };
 
 }  // namespace timestar::cluster

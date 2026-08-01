@@ -99,8 +99,15 @@ TEST_F(ReplicatedVShardHostTest, HostsVShardAndReplicatesThroughRaft) {
             g->tick().get();
         ASSERT_TRUE(g->isLeader());
 
-        // Replicate a write; drive ticks until the commit+apply ack resolves.
-        auto f = host.propose(5, writeCmd(buildSeriesKey("temp", {{"host", "h1"}}, "value"), 42.5));
+        // Replicate a write whose key belongs to the hosted VShard; drive ticks
+        // until the commit+apply ack resolves.
+        std::string key;
+        for (unsigned i = 0;; ++i) {
+            key = buildSeriesKey("temp", {{"host", "h" + std::to_string(i)}}, "value");
+            if (timestar::virtualShard(SeriesId128::fromSeriesKey(key)) == 5)
+                break;
+        }
+        auto f = host.propose(5, writeCmd(key, 42.5));
         for (int i = 0; i < 20 && !f.available(); ++i)
             g->tick().get();
         EXPECT_TRUE(f.get());

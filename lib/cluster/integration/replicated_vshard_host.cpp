@@ -270,12 +270,45 @@ seastar::future<> ReplicatedVShardHost::addVShard(uint16_t vshard, std::vector<N
 }
 
 seastar::future<bool> ReplicatedVShardHost::propose(uint16_t vshard, data::ReplicatedCommand cmd) {
+    return propose(vshard, std::move(cmd), std::nullopt);
+}
+
+seastar::future<bool> ReplicatedVShardHost::propose(uint16_t vshard, data::ReplicatedCommand cmd,
+                                                    data::OptDeadline deadline) {
     raft::RaftGroup* g = registry_.group(vshard);
     if (!g)
         throw std::runtime_error("ReplicatedVShardHost::propose: VShard not hosted here");
     if (const auto* writes = std::get_if<data::WriteBatch>(&cmd))
         co_await store_.checkWriteAdmission(*writes);
-    co_return co_await g->proposeAndAwaitApplied(data::encodeReplicatedCommand(cmd));
+    co_return co_await g->proposeAndAwaitApplied(data::encodeReplicatedCommand(cmd), deadline);
+}
+
+seastar::future<data::ProposeOutcome> ReplicatedVShardHost::proposeCommandHinted(uint16_t vshard,
+                                                                                 data::ReplicatedCommand cmd,
+                                                                                 data::OptDeadline deadline) {
+    data::ProposeOutcome out;
+    raft::RaftGroup* g = registry_.group(vshard);
+    if (!g) {
+        out.rejects.push_back(data::SliceReject{vshard, raft::kNoNode, data::WriteFailure::NotLeader});
+        co_return out;
+    }
+    try {
+        if (co_await propose(vshard, std::move(cmd), deadline)) {
+            out.committed = true;
+            out.committedVShards.push_back(vshard);
+        } else {
+            out.rejects.push_back(classifyRefusal(vshard));
+        }
+    } catch (...) {
+        const auto kind = data::classifyLocalWriteFailure(std::current_exception());
+        if (!data::isRetryableWriteFailure(kind))
+            throw;
+        NodeId hint = g->leader();
+        if (hint == self_)
+            hint = raft::kNoNode;
+        out.rejects.push_back(data::SliceReject{vshard, hint, kind});
+    }
+    co_return out;
 }
 
 seastar::future<uint64_t> ReplicatedVShardHost::snapshotVShard(uint16_t vshard) {

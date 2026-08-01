@@ -1,5 +1,6 @@
 #include "http_delete_handler.hpp"
 
+#include "../cluster/data/write_errors.hpp"
 #include "../cluster/integration/cluster_gateway.hpp"
 #include "content_negotiation.hpp"
 #include "http_auth.hpp"
@@ -11,6 +12,7 @@
 #include "scatter_gather.hpp"
 #include "series_key.hpp"
 
+#include <seastar/core/loop.hh>
 #include <seastar/core/smp.hh>
 #include <seastar/core/when_all.hh>
 
@@ -168,16 +170,13 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDeleteHandler::handle
     auto reqFmt = timestar::http::requestFormat(*req);
     auto resFmt = timestar::http::responseFormat(*req);
 
-    // CR-FIX-001: the public delete path is not yet ordered through each
-    // VShard's Raft group. Applying locally and falling back to the M1
-    // best-effort broadcaster can acknowledge a tombstone that a replica never
-    // receives, allowing deleted data to reappear after failover. Refuse before
-    // parsing or touching the Engine; the forwarded loop-guard header must not
-    // bypass this fence either.
-    if (partitionedCluster_) {
+    // RF=1 partitioned mode has no Raft command path. Never fall through to a
+    // local Engine mutation or the M1 best-effort broadcaster. RF>1 production
+    // installs clusterDeleteHook before HTTP begins accepting requests.
+    if (partitionedCluster_ && !clusterDeleteHook) {
         reply->set_status(seastar::http::reply::status_type::not_implemented);
         constexpr std::string_view message =
-            "Delete is unavailable in partitioned cluster mode until Raft-ordered deletes are enabled";
+            "Delete is unavailable in partitioned RF=1 mode; replicated deletes require RF>1";
         if (timestar::http::isProtobuf(resFmt))
             reply->_content = timestar::proto::formatDeleteResponse("error", 0, 0, std::string(message));
         else
@@ -362,6 +361,57 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDeleteHandler::handle
             }
         }
 
+        if (partitionedCluster_) {
+            // Expand nothing after the first proposal: a mixed batch containing a
+            // pattern delete must fail atomically before any targeted command can
+            // commit. Cluster-wide pattern expansion needs a placement-pinned
+            // catalog snapshot and remains deliberately unsupported.
+            for (const auto& delReq : deleteRequests) {
+                if (delReq.isPattern) {
+                    reply->set_status(seastar::http::reply::status_type::not_implemented);
+                    constexpr std::string_view message =
+                        "Pattern delete is unavailable in partitioned cluster mode; use exact series targets";
+                    if (timestar::http::isProtobuf(resFmt))
+                        reply->_content = timestar::proto::formatDeleteResponse("error", 0, 0, std::string(message));
+                    else
+                        reply->_content = createErrorResponse(std::string(message));
+                    timestar::http::setContentType(*reply, resFmt);
+                    co_return reply;
+                }
+            }
+
+            // A legal request may contain 10,000 targets. Starting all 10,000
+            // quorum waits at once exhausts Raft waiter and connection capacity
+            // before the ordinary write-admission controls can react. Keep enough
+            // parallelism to spread work across leaders without allowing one HTTP
+            // request to create an unbounded proposal fan-out.
+            static constexpr size_t kMaxConcurrentClusterDeletes = 32;
+            co_await seastar::max_concurrent_for_each(
+                deleteRequests, kMaxConcurrentClusterDeletes, [](const DeleteRequest& delReq) {
+                    std::string key = delReq.isStructured
+                                          ? buildSeriesKey(delReq.measurement, delReq.tags, delReq.field)
+                                          : delReq.seriesKey;
+                    return clusterDeleteHook(std::move(key), delReq.startTime, delReq.endTime);
+                });
+
+            // Raft's acknowledgement proves that every exact target committed
+            // and applied, not whether a point happened to exist before apply.
+            // Report committed targets rather than performing a racy pre-read.
+            reply->set_status(seastar::http::reply::status_type::ok);
+            if (timestar::http::isProtobuf(resFmt)) {
+                reply->_content =
+                    timestar::proto::formatDeleteResponse("success", deleteRequests.size(), deleteRequests.size());
+            } else {
+                DeleteDetailedResponse response;
+                response.seriesDeleted = deleteRequests.size();
+                response.totalRequests = deleteRequests.size();
+                response.note = "seriesDeleted is the number of exact delete commands committed and applied";
+                reply->_content = glz::write_json(response).value_or("{}");
+            }
+            timestar::http::setContentType(*reply, resFmt);
+            co_return reply;
+        }
+
         // Execute deletes — parallelized by shard.
         // Targeted deletes (series-key or structured single-field) are grouped by
         // their owning shard so all shards execute in parallel.  Pattern deletes
@@ -510,6 +560,29 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDeleteHandler::handle
             reply->_content = glz::write_json(response).value_or("{}");
         }
 
+    } catch (const timestar::data::RetryableWriteError& e) {
+        timestar::http_log.warn("Delete rejected by retryable cluster condition: {}", e.what());
+        reply->set_status(seastar::http::reply::status_type::service_unavailable);
+        reply->_headers["Retry-After"] = "1";
+        if (timestar::http::isProtobuf(resFmt))
+            reply->_content = timestar::proto::formatDeleteResponse("error", 0, 0, e.what());
+        else
+            reply->_content = createErrorResponse(e.what());
+    } catch (const timestar::data::ShardStoppingError& e) {
+        timestar::http_log.warn("Delete rejected while cluster shard is stopping: {}", e.what());
+        reply->set_status(seastar::http::reply::status_type::service_unavailable);
+        reply->_headers["Retry-After"] = "1";
+        if (timestar::http::isProtobuf(resFmt))
+            reply->_content = timestar::proto::formatDeleteResponse("error", 0, 0, e.what());
+        else
+            reply->_content = createErrorResponse(e.what());
+    } catch (const timestar::data::UnassignedVShardError& e) {
+        timestar::http_log.error("Delete rejected for unassigned VShard: {}", e.what());
+        reply->set_status(seastar::http::reply::status_type::internal_server_error);
+        if (timestar::http::isProtobuf(resFmt))
+            reply->_content = timestar::proto::formatDeleteResponse("error", 0, 0, e.what());
+        else
+            reply->_content = createErrorResponse(e.what());
     } catch (const std::exception& e) {
         timestar::http_log.error("Delete handler error: {}", e.what());
         reply->set_status(seastar::http::reply::status_type::internal_server_error);

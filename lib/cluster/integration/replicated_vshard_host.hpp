@@ -95,6 +95,9 @@ public:
     // Own the command because admission introduces a suspension before encoding.
     // A const-reference parameter would dangle when callers pass a temporary.
     seastar::future<bool> propose(uint16_t vshard, data::ReplicatedCommand cmd);
+    seastar::future<bool> propose(uint16_t vshard, data::ReplicatedCommand cmd, data::OptDeadline deadline);
+    seastar::future<data::ProposeOutcome> proposeCommandHinted(uint16_t vshard, data::ReplicatedCommand cmd,
+                                                               data::OptDeadline deadline) override;
 
     // The write-path entry point: split a WriteBatch by VShard and replicate each
     // group through its Raft group. This node must LEAD every VShard in the batch

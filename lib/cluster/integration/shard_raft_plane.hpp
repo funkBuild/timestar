@@ -269,6 +269,17 @@ public:
     // per-VShard rejects with ITS group's current leader, so the forwarding coordinator
     // learns where the leadership actually went instead of only that it guessed wrong.
     seastar::future<data::ProposeOutcome> proposeBatchHinted(data::WriteBatch batch) override;
+    seastar::future<data::ProposeOutcome> proposeCommandHinted(uint16_t vshard, data::ReplicatedCommand command,
+                                                               data::OptDeadline deadline) override;
+
+    // Originating-node entry for one already-routed mutation. ClusterDataPlane
+    // invokes this on the shard owning the VShard's Raft group; the command
+    // router resolves/forwards the current leader from there.
+    seastar::future<> command(uint16_t vshard, data::ReplicatedCommand command) {
+        if (!ready())
+            return seastar::make_exception_future<>(data::ShardStoppingError(kShardStoppingError));
+        return plane_->command(vshard, std::move(command));
+    }
 
     // ReadIndexSink: a replica is confirming freshness at the leader (M4 replica reads).
     // Same story as proposeBatch -- the connection landed on an arbitrary shard, so hop
@@ -910,6 +921,18 @@ inline seastar::future<bool> ShardRaftPlane::proposeBatch(data::WriteBatch batch
 inline seastar::future<data::ProposeOutcome> ShardRaftPlane::proposeBatchHinted(data::WriteBatch batch) {
     ++inboundProposals_;
     return proposeSlicesToOwningShardsHinted(*peers_, std::move(batch), dir_);
+}
+
+inline seastar::future<data::ProposeOutcome> ShardRaftPlane::proposeCommandHinted(uint16_t vshard,
+                                                                                  data::ReplicatedCommand command,
+                                                                                  data::OptDeadline deadline) {
+    ++inboundProposals_;
+    return peers_->invoke_on(shardOwningVShard(vshard, dir_), [vshard, command = std::move(command),
+                                                               deadline](ShardRaftPlane& p) mutable {
+        if (!p.ready())
+            return seastar::make_exception_future<data::ProposeOutcome>(data::ShardStoppingError(kShardStoppingError));
+        return p.plane().host().proposeCommandHinted(vshard, std::move(command), deadline);
+    });
 }
 
 inline seastar::future<raft::LogIndex> ShardRaftPlane::leaderReadIndex(uint16_t vshard) {

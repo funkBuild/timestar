@@ -3,6 +3,7 @@
 #include "../raft/raft_types.hpp"  // NodeId
 #include "node_metadata.hpp"
 #include "node_query.hpp"
+#include "replicated_command.hpp"
 #include "write_errors.hpp"
 #include "write_record.hpp"
 
@@ -145,6 +146,18 @@ public:
             return out;
         });
     }
+
+    // Forward one non-batch replicated command to the node believed to lead its
+    // VShard. The one-slice ProposeOutcome has the same committed-set contract as
+    // the write path, including an advisory corrected-leader hint on rejection.
+    // The default is a clean not-leader response so existing test transports stay
+    // source-compatible while callers still fail closed and retry elsewhere.
+    virtual seastar::future<ProposeOutcome> proposeCommandHinted(NodeId, uint16_t vshard, ReplicatedCommand,
+                                                                 OptDeadline = std::nullopt) {
+        ProposeOutcome out;
+        out.rejects.push_back(SliceReject{vshard, kNoNode, WriteFailure::NotLeader});
+        return seastar::make_ready_future<ProposeOutcome>(std::move(out));
+    }
 };
 
 // The node-local Raft PROPOSE target for the RF=3 write path (M3): ReplicatedVShardHost
@@ -229,6 +242,17 @@ public:
         return seastar::do_with(splitByVShard(std::move(batch)), [this](VShardBatches& groups) {
             return proposeVShardBatchesHinted(viewOf(groups), std::nullopt);
         });
+    }
+
+    // The single-VShard command analogue of proposeVShardBatchesHinted. Deletes
+    // and future replicated maintenance mutations use this path so their exact
+    // command bytes, leader correction, and deadline semantics do not get
+    // smuggled through a synthetic WriteBatch.
+    virtual seastar::future<ProposeOutcome> proposeCommandHinted(uint16_t vshard, ReplicatedCommand,
+                                                                 OptDeadline = std::nullopt) {
+        ProposeOutcome out;
+        out.rejects.push_back(SliceReject{vshard, kNoNode, WriteFailure::NotLeader});
+        return seastar::make_ready_future<ProposeOutcome>(std::move(out));
     }
 };
 

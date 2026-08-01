@@ -66,6 +66,10 @@ std::string writeCommand(const std::string& key, double value) {
     b.series = {std::move(s)};
     return data::encodeReplicatedCommand(data::ReplicatedCommand{std::move(b)});
 }
+
+std::string deleteCommand(const std::string& key) {
+    return data::encodeReplicatedCommand(data::ReplicatedCommand{data::DeleteRangeKey{key, BASE - 1, BASE + 1}});
+}
 }  // namespace
 
 TEST_F(EngineDataRaftTest, ProposeThroughRaftAppliesToEngine) {
@@ -73,21 +77,23 @@ TEST_F(EngineDataRaftTest, ProposeThroughRaftAppliesToEngine) {
         ScopedShardedEngine eng;
         eng.start();
         cluster::EngineLocalStore store(*eng);
-        cluster::EngineDataStateMachine sm(store, timestar::VShardId{0});
+        const std::string key = buildSeriesKey("temp", {{"host", "h1"}}, "value");
+        const uint16_t vshard = timestar::virtualShard(SeriesId128::fromSeriesKey(key));
+        cluster::EngineDataStateMachine sm(store, timestar::VShardId{vshard});
 
         // Single-voter Raft group over the real Engine's state machine.
         fs::path dir = tmpDir();
         JournalWriter writer(dir, header(), 1u << 20);
         auto recovered = writer.open().get();
-        RecoveredRaftState st = recoverRaftState(recovered, VShardId{1});
-        JournalRaftPersistence persistence(writer, VShardId{1}, st.nextSeq);
+        RecoveredRaftState st = recoverRaftState(recovered, VShardId{vshard});
+        JournalRaftPersistence persistence(writer, VShardId{vshard}, st.nextSeq);
         NoopTransport transport;
 
         RaftOptions opts;
         opts.electionTimeoutMin = opts.electionTimeoutMax = 1;
         opts.heartbeatTimeout = 1;
         RaftNode node(1, {1}, std::move(st.log), st.hardState, opts, {});
-        RaftGroup group(1, std::move(node), persistence, transport, sm);
+        RaftGroup group(vshard, std::move(node), persistence, transport, sm);
 
         // Tick to leadership (a lone voter self-elects within a couple ticks).
         for (int i = 0; i < 10 && !group.isLeader(); ++i)
@@ -95,7 +101,7 @@ TEST_F(EngineDataRaftTest, ProposeThroughRaftAppliesToEngine) {
         ASSERT_TRUE(group.isLeader());
 
         // Propose a write; drive ticks until the commit+apply ack resolves.
-        auto f = group.proposeAndAwaitApplied(writeCommand(buildSeriesKey("temp", {{"host", "h1"}}, "value"), 42.5));
+        auto f = group.proposeAndAwaitApplied(writeCommand(key, 42.5));
         for (int i = 0; i < 20 && !f.available(); ++i)
             group.tick().get();
         bool applied = f.get();
@@ -114,6 +120,16 @@ TEST_F(EngineDataRaftTest, ProposeThroughRaftAppliesToEngine) {
         ASSERT_TRUE(r.success) << r.errorMessage;
         ASSERT_EQ(r.series.size(), 1u);
         EXPECT_DOUBLE_EQ(std::get<std::vector<double>>(r.series[0].fields.at("value").second)[0], 42.5);
+
+        // The exact-key delete travels through the same real Raft commit/apply
+        // boundary and removes the point only after quorum acknowledgement.
+        auto deleted = group.proposeAndAwaitApplied(deleteCommand(key));
+        for (int i = 0; i < 20 && !deleted.available(); ++i)
+            group.tick().get();
+        EXPECT_TRUE(deleted.get());
+        auto afterDelete = h.executeQuery(q).get();
+        EXPECT_TRUE(afterDelete.success) << afterDelete.errorMessage;
+        EXPECT_TRUE(afterDelete.series.empty());
 
         writer.close().get();
         fs::remove_all(dir);

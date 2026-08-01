@@ -122,6 +122,14 @@ std::string writeCmd(const std::string& key, double value) {
     return data::encodeReplicatedCommand(data::ReplicatedCommand{std::move(b)});
 }
 
+std::string keyInVShard(const std::string& measurement, const std::string& field, uint16_t vshard = 1) {
+    for (unsigned i = 0;; ++i) {
+        std::string key = buildSeriesKey(measurement, {{"host", "h" + std::to_string(i)}}, field);
+        if (timestar::virtualShard(SeriesId128::fromSeriesKey(key)) == vshard)
+            return key;
+    }
+}
+
 double latestOn(ScopedShardedEngine& e, const std::string& m, const std::string& f) {
     http::HttpQueryHandler h(&*e);
     QueryRequest q;
@@ -173,7 +181,7 @@ TEST_F(EngineRf3Test, ThreeRealEnginesConvergeUnderPartition) {
             r.engine = std::make_unique<ScopedShardedEngine>();
             r.engine->startAt(edir.string());
             r.store = std::make_unique<cluster::EngineLocalStore>(**r.engine);
-            r.sm = std::make_unique<cluster::EngineDataStateMachine>(*r.store, timestar::VShardId{0});
+            r.sm = std::make_unique<cluster::EngineDataStateMachine>(*r.store, timestar::VShardId{1});
             fs::path jdir = tmpDir("j" + std::to_string(id));
             journalDirs.push_back(jdir);
             r.writer = std::make_unique<JournalWriter>(jdir, header(), 1u << 20);
@@ -194,7 +202,7 @@ TEST_F(EngineRf3Test, ThreeRealEnginesConvergeUnderPartition) {
         // Write 1 (all healthy): commits on quorum, converges on all THREE engines.
         // Distinct measurement per write so a LATEST read is unambiguous.
         {
-            const std::string key = buildSeriesKey("m1", {{"host", "h1"}}, "value");
+            const std::string key = keyInVShard("m1", "value");
             auto f = reps[leader].group->proposeAndAwaitApplied(writeCmd(key, 42.5));
             drive(f, 40);
             ASSERT_TRUE(f.get());
@@ -206,7 +214,7 @@ TEST_F(EngineRf3Test, ThreeRealEnginesConvergeUnderPartition) {
         // Write 2 with node 3 partitioned: still commits (2/3 quorum).
         router.partition(3);
         {
-            const std::string key = buildSeriesKey("m2", {{"host", "h2"}}, "value");
+            const std::string key = keyInVShard("m2", "value");
             auto f = reps[leader].group->proposeAndAwaitApplied(writeCmd(key, 99.0));
             drive(f, 60);
             ASSERT_TRUE(f.get()) << "write must commit with 2/3 quorum";
@@ -412,7 +420,7 @@ TEST_F(EngineRf3Test, LeaderTracksPeerMatchIndex) {
         ASSERT_TRUE(reps[leader].group->isLeader());
 
         {
-            const std::string key = buildSeriesKey("mi", {{"host", "h1"}}, "value");
+            const std::string key = keyInVShard("mi", "value");
             auto f = reps[leader].group->proposeAndAwaitApplied(writeCmd(key, 1.0));
             drive(f, 60);
             ASSERT_TRUE(f.get());
@@ -501,7 +509,7 @@ TEST_F(EngineRf3Test, MoverReplacesFollowerAcrossFourNodes) {
 
         // Commit data BEFORE the move, so node 4 must catch it up.
         {
-            const std::string key = buildSeriesKey("mv", {{"host", "h1"}}, "value");
+            const std::string key = keyInVShard("mv", "value");
             auto f = reps[leader].group->proposeAndAwaitApplied(writeCmd(key, 3.14));
             drive(f, 60);
             ASSERT_TRUE(f.get());
@@ -993,7 +1001,7 @@ TEST_F(EngineRf3Test, StreamingSurvivesFailoverNoLossNoDup) {
         using features::StreamEvent;
         // Commit a write and capture the REAL (term, commitIndex) it landed at.
         auto commitWrite = [&](const std::string& m, double v) -> StreamEvent {
-            auto f = reps[leader].group->proposeAndAwaitApplied(writeCmd(buildSeriesKey(m, {{"h", "1"}}, "v"), v));
+            auto f = reps[leader].group->proposeAndAwaitApplied(writeCmd(keyInVShard(m, "v"), v));
             drive(f, 80);
             EXPECT_TRUE(f.get());
             tick(10);

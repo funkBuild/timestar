@@ -87,6 +87,8 @@ public:
     // the hinted verb only when the negotiated version says the peer answers it,
     // otherwise falls back to the v1-shaped reply with hintless rejects.
     seastar::future<ProposeOutcome> proposeWriteHinted(NodeId to, VShardBatchView view, OptDeadline deadline) override;
+    seastar::future<ProposeOutcome> proposeCommandHinted(NodeId to, uint16_t vshard, ReplicatedCommand command,
+                                                         OptDeadline deadline = std::nullopt) override;
 
     // The Raft propose target incoming proposeWrite RPCs dispatch into (the node's
     // ReplicatedVShardHost). Must be set before a peer sends proposeWrite; outlives

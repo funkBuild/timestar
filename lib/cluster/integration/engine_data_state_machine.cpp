@@ -22,6 +22,20 @@ seastar::future<> EngineDataStateMachine::apply(raft::LogEntry entry) {
         // Skipping it would silently diverge this replica; halting is the safe choice.
         throw std::runtime_error("EngineDataStateMachine: undecodable committed entry (fail-stop)");
 
+    // The Raft group is the isolation boundary. A malformed/hostile forwarder
+    // must not be able to commit a series command into a different VShard and
+    // make replicas apply data outside the group their snapshot/log owns.
+    bool targetsThisVShard = true;
+    if (auto* w = std::get_if<data::WriteBatch>(&*cmd)) {
+        targetsThisVShard = !w->series.empty();
+        for (auto& series : w->series)
+            targetsThisVShard = targetsThisVShard && data::vshardOf(series) == vshard_.value();
+    } else if (const auto* d = std::get_if<data::DeleteRangeKey>(&*cmd)) {
+        targetsThisVShard = timestar::virtualShard(SeriesId128::fromSeriesKey(d->seriesKey)) == vshard_.value();
+    }
+    if (!targetsThisVShard)
+        throw std::runtime_error("EngineDataStateMachine: committed command targets a different VShard (fail-stop)");
+
     if (auto* w = std::get_if<data::WriteBatch>(&*cmd)) {
         // Stamp revisions from the log index (ADR 0003): every point in this entry
         // gets `entry.index`. EngineLocalStore passes revisions through unchanged (the
