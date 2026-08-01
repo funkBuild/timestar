@@ -1,9 +1,11 @@
 #pragma once
 
+#include "../../core/vshard.hpp"
 #include "../raft/raft_types.hpp"  // NodeId
 
 #include <cstdint>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -32,6 +34,34 @@ struct ControlMap {
     friend bool operator==(const ControlMap&, const ControlMap&) = default;
 };
 
+// Structural validation shared by notifications, serialized caches, and the
+// durable serving-map store. A partial map is allowed here because bootstrap
+// constructs the map incrementally; callers that intend to ROUTE from it must
+// additionally require isCompleteControlMap().
+inline bool isValidControlMap(const ControlMap& map) {
+    for (const auto& [vshard, replicas] : map.placement) {
+        if (vshard >= timestar::VIRTUAL_SHARD_COUNT || replicas.empty())
+            return false;
+        std::set<NodeId> unique;
+        for (NodeId replica : replicas)
+            if (replica == raft::kNoNode || !unique.insert(replica).second)
+                return false;
+    }
+    for (const auto& [vshard, group] : map.groups)
+        if (vshard >= timestar::VIRTUAL_SHARD_COUNT || group >= timestar::VIRTUAL_SHARD_COUNT)
+            return false;
+    return true;
+}
+
+inline bool isCompleteControlMap(const ControlMap& map) {
+    if (map.epoch == 0 || map.placement.size() != timestar::VIRTUAL_SHARD_COUNT || !isValidControlMap(map))
+        return false;
+    for (uint16_t vshard = 0; vshard < timestar::VIRTUAL_SHARD_COUNT; ++vshard)
+        if (!map.placement.contains(vshard))
+            return false;
+    return true;
+}
+
 // Every node caches the last valid control map (the plan) so it can keep routing
 // from a committed view during a group-0 quorum outage. Updates NEVER regress the
 // epoch -- a stale/restored notification with a lower epoch is rejected, which is
@@ -45,7 +75,7 @@ public:
     // restore) is rejected rather than adopted -- otherwise two nodes could end on
     // different placements at the same epoch and both believe themselves current.
     bool update(ControlMap fresh) {
-        if (fresh.epoch <= map_.epoch)
+        if (!isValidControlMap(fresh) || fresh.epoch <= map_.epoch)
             return false;  // never regress; same epoch is immutable
         map_ = std::move(fresh);
         return true;
@@ -135,7 +165,8 @@ public:
             reps.reserve(nr);
             for (uint64_t j = 0; j < nr; ++j)
                 reps.push_back(get64());
-            m.placement[vs] = std::move(reps);
+            if (!m.placement.emplace(vs, std::move(reps)).second)
+                return false;
         }
         // Optional VShard->group section (debt D-11). Absent == identity mapping.
         if (p != end) {
@@ -149,11 +180,14 @@ public:
             for (uint64_t i = 0; i < ng; ++i) {
                 uint16_t vs = get16();
                 uint16_t g = get16();
-                m.groups[vs] = g;
+                if (!m.groups.emplace(vs, g).second)
+                    return false;
             }
             if (p != end)
                 return false;  // bytes past a section we DID understand: still fail closed
         }
+        if (!isValidControlMap(m))
+            return false;
         map_ = std::move(m);
         return true;
     }

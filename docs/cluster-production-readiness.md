@@ -1260,8 +1260,15 @@ is not completion.
   removes the old leader), and a subsequent controller repairs a stale
   state-machine voter mirror. The focused Raft/controller membership evidence
   passes 13/13; the combined controller/identity/host/codec/state evidence passes
-  28/28. Production composition, the operator-facing explicit bootstrap trigger,
-  and publication of committed state to the data plane remain outstanding.
+  28/28. A bounded, checksummed `control_map.cache` store now accepts only a
+  complete 4,096-VShard serving map, publishes it with file fsync + atomic rename
+  + parent-directory fsync, survives restart, rejects corrupt/partial files, and
+  refuses epoch regression or conflicting same-epoch content; its focused
+  cache/directory evidence passes 13/13. It deliberately does not equate
+  incremental desired placement with effective serving membership. Production
+  composition, the operator-facing explicit bootstrap trigger, and the caller
+  that publishes committed/effective state to this cache and the live data plane
+  remain outstanding.
 - [ ] **CR-FIX-022 — wire resumable join, drain, remove, replace, and VShard
   movement.** Owner: movement/control plane. Include learner catch-up, verified
   snapshot, log catch-up, joint consensus, leadership transfer, cutover, and
