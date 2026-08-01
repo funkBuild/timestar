@@ -6,7 +6,8 @@
 
 **Remediation commits:** `95c10d2`, `a16b03a`, `d578e81`, `ddab705`,
 `8620b9e`, `20639dc`, `ea2511b`, `3ac9899`, `69ac879`, `09a62c5`,
-`2e06cb8`, `7151f5d`, `5b22b81`, `fef4886`, `3d2d607`, `f0e28f0`
+`2e06cb8`, `7151f5d`, `5b22b81`, `fef4886`, `3d2d607`, `f0e28f0`,
+`da55952`
 
 **Scope:** The recent VShard/Raft cluster redesign, its production-server
 integration, the public HTTP surface, recovery paths, and the release evidence
@@ -19,7 +20,7 @@ used as evidence that the current server is production-ready.
 
 ## Implementation progress after the review
 
-Sixteen remediation commits are now recorded. Cluster release status remains
+Seventeen remediation commits are now recorded. Cluster release status remains
 **BLOCKED** because group 0/movement, generation-atomic live snapshot
 replacement, pattern-delete expansion, replicated retention, the large-snapshot
 path, and rolling wire-format compatibility remain open. The four previously
@@ -123,6 +124,10 @@ Completed and covered in this pass:
   the open sources registered and retryable, and pinned readers retain their
   in-memory tombstone ranges after disk cleanup. This prevents old raw points
   from returning after a failed unlink or crash between sidecar and TSM removal.
+- TSM startup now treats an existing tombstone sidecar as part of the immutable
+  generation's logical contents. Corrupt, unsupported, or unreadable sidecars
+  abort open and registration instead of logging a warning and serving the raw
+  TSM without its durable deletions.
 
 Focused evidence on this pass includes the rebuilt server, unit and socket test
 targets, journal negative tests, alternate-replica routing tests, a black-holed
@@ -131,7 +136,7 @@ identity/topology tests, and pre-proposal admission tests. The strict checkboxes
 below stay open where their stated multi-process or fault-injection “done when”
 evidence has not yet been run.
 
-Final local validation for these remediation commits is green: 4,353/4,353 unit
+Final local validation for these remediation commits is green: 4,354/4,354 unit
 tests passed with no skips, 45/45 socket-backed cluster tests passed, the
 first-pass 56/56 focused
 cluster/readiness/identity/admission regressions passed, and the second-pass
@@ -201,6 +206,7 @@ item are recorded in the fix-up list.
 | CR-23 | P0 | TSM publication ignored parent-directory sync failure before deleting the prior durable generation | A crash could discard the renamed output directory entry after its WAL or source TSMs had been removed, losing acknowledged data. |
 | CR-24 | P0 | TSM registration swallowed open/index failures and silently selected one duplicate rank | WAL conversion could delete its recoverable source after failing to register the output; restart could serve a partial or filesystem-order-dependent dataset. |
 | CR-25 | P0 | TSM source retirement deleted tombstones before the source and swallowed source-unlink failures | A failed unlink or crash could reload the raw source without its deletion ranges; pinned readers could also stop filtering deleted points during compaction. |
+| CR-26 | P0 | TSM open discarded invalid or unreadable tombstone sidecars | Startup could serve durably deleted points from the raw immutable file instead of fencing an incomplete logical generation. |
 
 ### CR-01 — deletes bypass consensus
 
@@ -306,6 +312,22 @@ barrier does it remove live tracking and clean up sidecars. Sidecar unlink keeps
 the tombstone ranges in memory for pinned readers, and an already-unlinked TSM
 is a valid retry after a failed directory sync. An injected sync failure proves
 the safe intermediate state and successful idempotent retry.
+
+### CR-26 — invalid tombstones were ignored at startup
+
+[`TSM::loadTombstones`](../lib/storage/tsm_tombstone_integration.cpp) caught any
+sidecar load failure, logged a warning, cleared the tombstone manager, and let
+`TSM::open` return success. That made a checksum failure, unsupported version,
+truncation, or I/O error indistinguishable from “no deletes”: startup registered
+the raw TSM and could return points whose deletion was durable only in the
+sidecar.
+
+Commit `da55952` propagates a present sidecar's validation or I/O failure with
+both TSM and sidecar paths in the diagnostic. The existing TSM open-error path
+closes the data file before rethrowing, and the sidecar reader already closes
+its descriptor on every exit. A real manager-startup regression pairs a valid
+TSM with a corrupt sidecar and proves the generation never becomes live; valid
+sidecar persistence and reload remain covered.
 
 ### CR-02 and CR-03 — snapshot contents and live installation were unsafe
 
@@ -607,6 +629,10 @@ is not completion.
   retryable with the source registered; pinned readers keep deletion ranges
   after sidecar cleanup. The injected directory-sync regression covers both the
   failed intermediate state and idempotent completion.
+- [x] **CR-FIX-019B — reject incomplete TSM logical generations.** Owner:
+  storage. A present tombstone sidecar must load and validate before its TSM can
+  be registered. Corrupt-sidecar startup proves the failure propagates without
+  exposing raw points; valid sidecars still reload and filter normally.
 
 ### 2. Complete control-plane and identity wiring
 
@@ -923,4 +949,15 @@ current full unit suite:              4353/4353 passed (444 suites, -c 2)
 current socket-backed cluster suite:     45/45 passed (8 suites, -c 2)
 timestar_http_server:                    built successfully
 git diff --check:                        passed
+```
+
+Fail-closed tombstone validation for `da55952`:
+
+```text
+focused corrupt/valid/open-cleanup tests: 13/13 passed
+related manager/tombstone/compactor tests: 109/109 passed
+current full unit suite:               4354/4354 passed (444 suites, -c 2)
+current socket-backed cluster suite:      45/45 passed (8 suites, -c 2)
+timestar_http_server:                     built successfully
+git diff --check:                         passed
 ```
