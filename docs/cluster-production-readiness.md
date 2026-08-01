@@ -6,7 +6,7 @@
 
 **Remediation commits:** `95c10d2`, `a16b03a`, `d578e81`, `ddab705`,
 `8620b9e`, `20639dc`, `ea2511b`, `3ac9899`, `69ac879`, `09a62c5`,
-`2e06cb8`, `7151f5d`, `5b22b81`
+`2e06cb8`, `7151f5d`, `5b22b81`, `fef4886`
 
 **Scope:** The recent VShard/Raft cluster redesign, its production-server
 integration, the public HTTP surface, recovery paths, and the release evidence
@@ -19,7 +19,7 @@ used as evidence that the current server is production-ready.
 
 ## Implementation progress after the review
 
-Thirteen remediation commits are now recorded. Cluster release status remains
+Fourteen remediation commits are now recorded. Cluster release status remains
 **BLOCKED** because group 0/movement, generation-atomic live snapshot
 replacement, pattern-delete expansion, replicated retention, the large-snapshot
 path, and rolling wire-format compatibility remain open. The four previously
@@ -108,6 +108,10 @@ Completed and covered in this pass:
   one-, two-, and four-core topologies; private journals retain the existing
   one-snapshot cadence. `/cluster/status` now publishes snapshot-production and
   journal-GC pass, deletion, pin, and copy-forward counters.
+- TSM publication now treats the destination directory sync as a mandatory
+  durability boundary. WAL conversion and both ordinary and VShard-partitioned
+  compaction retain their prior durable generation when that sync fails; direct
+  TSM writers propagate the same failure instead of treating it as best effort.
 
 Focused evidence on this pass includes the rebuilt server, unit and socket test
 targets, journal negative tests, alternate-replica routing tests, a black-holed
@@ -116,7 +120,7 @@ identity/topology tests, and pre-proposal admission tests. The strict checkboxes
 below stay open where their stated multi-process or fault-injection “done when”
 evidence has not yet been run.
 
-Final local validation for these remediation commits is green: 4,346/4,346 unit
+Final local validation for these remediation commits is green: 4,349/4,349 unit
 tests passed with no skips, 45/45 socket-backed cluster tests passed, the
 first-pass 56/56 focused
 cluster/readiness/identity/admission regressions passed, and the second-pass
@@ -183,6 +187,7 @@ item are recorded in the fix-up list.
 | CR-20 | P0 | Ambiguous replicated deletes were automatically re-proposed | If the first delete committed but its reply was lost, a second log entry could erase a concurrent write ordered after the first attempt. |
 | CR-21 | P1 | Replicated startup exhausted ordinary open-file limits and did not unwind partial sharded startup | A default 1,024 soft limit failed around the thousandth VShard journal, then cleanup trapped with `SIGILL`, hiding the actionable `EMFILE` and preventing the node from booting. |
 | CR-22 | P2 | Live-gate data reset and benchmark preflight could fail open | A gate could race deletion against running nodes or continue after the benchmark sent no load, invalidating otherwise green release evidence. |
+| CR-23 | P0 | TSM publication ignored parent-directory sync failure before deleting the prior durable generation | A crash could discard the renamed output directory entry after its WAL or source TSMs had been removed, losing acknowledged data. |
 
 ### CR-01 — deletes bypass consensus
 
@@ -231,6 +236,23 @@ retries. The HTTP contract reports an explicit unknown outcome without automatic
 retry advice. This closes the in-request duplicate-delete hazard; durable
 operation IDs or revision-bounded tombstones are still required before an
 ambiguous client-initiated retry can be declared safe under CR-FIX-010.
+
+### CR-23 — TSM publication did not fence deletion of its durable source
+
+The WAL-to-TSM and compaction paths renamed their output into place but treated
+failure to sync the destination directory as best effort. Their callers could
+then unlink the WAL or source TSM generation. A crash in that window could lose
+the new directory entry after the only previously durable copy had been
+removed.
+
+Commit `fef4886` makes successful destination-directory sync the publication
+boundary for [`TSMFileManager`](../lib/storage/tsm_file_manager.cpp), ordinary
+compaction, VShard-partitioned compaction, and direct
+[`TSMWriter`](../lib/storage/tsm_writer.cpp) users. A sync failure is propagated
+before a WAL or source TSM may be retired. The uncertain output can coexist
+with the retained source and be retried or recovered, which may require later
+orphan cleanup but does not lose the prior durable generation. Injected failures
+cover WAL conversion and both compaction layouts.
 
 ### CR-02 and CR-03 — snapshot contents and live installation were unsafe
 
@@ -489,8 +511,9 @@ is not completion.
   compaction loop. The partition path now materialises existing tombstone
   sidecars and rejects a concurrent tombstone-generation race; storage/snapshot
   regressions prove mixed tier-0 input is emitted as delete-resolved VShard-pure
-  output. The on-disk migration/rollback procedure for existing mixed
-  higher-tier files remains open.
+  output. Output publication also fails closed before retiring source TSMs if
+  the destination directory cannot be synced. The on-disk migration/rollback
+  procedure for existing mixed higher-tier files remains open.
 - [ ] **CR-FIX-014 — move storage-backlog admission before Raft proposal and
   make apply unconditional.** Owner: storage/write path. **Done when:** an
   overloaded leader returns retryable overload without committing, while
@@ -515,6 +538,11 @@ is not completion.
   Owner: data path/API. Transport timeout and leadership-loss tests prove only
   one proposal is attempted; safe leader redirects still retry. HTTP exposes a
   machine-readable unknown outcome and omits `Retry-After`.
+- [x] **CR-FIX-018 — make TSM generation publication fail closed.** Owner:
+  storage. A WAL or source TSM remains authoritative until the renamed output's
+  parent directory has synced successfully. Injected directory-sync failures
+  prove WAL conversion and both compaction layouts propagate the failure and
+  preserve their prior durable generation.
 
 ### 2. Complete control-plane and identity wiring
 
@@ -795,6 +823,17 @@ Shared-journal reclamation validation for `5b22b81`:
 ```text
 targeted GC/replay/scheduler tests:        6/6 passed
 current full unit suite:             4346/4346 passed (444 suites, -c 2)
+current socket-backed cluster suite:     45/45 passed (8 suites, -c 2)
+timestar_http_server:                    built successfully
+git diff --check:                        passed
+```
+
+TSM publication durability validation for `fef4886`:
+
+```text
+injected directory-sync regressions:       3/3 passed
+related writer/manager/compactor/WAL:     68/68 passed
+current full unit suite:             4349/4349 passed (444 suites, -c 2)
 current socket-backed cluster suite:     45/45 passed (8 suites, -c 2)
 timestar_http_server:                    built successfully
 git diff --check:                        passed
