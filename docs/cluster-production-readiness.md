@@ -5,7 +5,7 @@
 **Reviewed baseline:** `cluster-design` at `f78e05d` (2026-08-01)
 
 **Remediation commits:** `95c10d2`, `a16b03a`, `d578e81`, `ddab705`,
-`8620b9e`, `20639dc`, `ea2511b`, `3ac9899`
+`8620b9e`, `20639dc`, `ea2511b`, `3ac9899`, `69ac879`
 
 **Scope:** The recent VShard/Raft cluster redesign, its production-server
 integration, the public HTTP surface, recovery paths, and the release evidence
@@ -18,10 +18,10 @@ used as evidence that the current server is production-ready.
 
 ## Implementation progress after the review
 
-Eight remediation commits are now recorded. Cluster release status remains
+Nine remediation commits are now recorded. Cluster release status remains
 **BLOCKED** because group 0/movement, generation-atomic live snapshot
 replacement, pattern-delete expansion, replicated retention, the large-snapshot
-path, rolling wire-format compatibility, and final live release gates remain
+path, rolling wire-format compatibility, and three final live release gates remain
 open.
 
 Completed and covered in this pass:
@@ -84,6 +84,13 @@ Completed and covered in this pass:
   transport or leadership-loss result is never re-proposed: HTTP reports 504,
   `DELETE_OUTCOME_UNKNOWN`, and no `Retry-After`, because a second unbounded
   delete could erase a write ordered after the first attempt.
+- Replicated startup now raises a low soft `RLIMIT_NOFILE` to 8,192 when the
+  process hard limit permits it and otherwise fails before opening Engine or
+  Raft state with a `LimitNOFILE`/`ulimit` diagnostic. `ClusterDataPlane::start`
+  unwinds partial sharded startup before preserving its original exception, and
+  the server's lifecycle guard remains armed through data-plane/HTTP startup and
+  normal shutdown. This prevents an `EMFILE` during VShard journal creation from
+  being replaced by Seastar's misleading destructor `SIGILL` trap.
 
 Focused evidence on this pass includes the rebuilt server, unit and socket test
 targets, journal negative tests, alternate-replica routing tests, a black-holed
@@ -156,6 +163,7 @@ item are recorded in the fix-up list.
 | CR-18 | P1 | Snapshot payload v2 has no rolling-version negotiation | A mixed-version cluster can fail snapshot catch-up in either direction during upgrade. |
 | CR-19 | P0 | Exact-point delete overlap was exclusive at the block minimum | A delete with equal start/end could silently skip a one-point block and leave the point queryable. |
 | CR-20 | P0 | Ambiguous replicated deletes were automatically re-proposed | If the first delete committed but its reply was lost, a second log entry could erase a concurrent write ordered after the first attempt. |
+| CR-21 | P1 | Replicated startup exhausted ordinary open-file limits and did not unwind partial sharded startup | A default 1,024 soft limit failed around the thousandth VShard journal, then cleanup trapped with `SIGILL`, hiding the actionable `EMFILE` and preventing the node from booting. |
 
 ### CR-01 — deletes bypass consensus
 
@@ -352,6 +360,16 @@ groups, unresolved peers, apply failures, apply lag, snapshot disablement, or
 journal growth. `/cluster/status` exposes some of this state but is not used for
 readiness.
 
+The live-gate rerun found a second startup resource boundary: the default
+per-VShard journal layout holds one descriptor for each local group, but the
+server neither raised nor preflighted `RLIMIT_NOFILE`. With a normal 1,024 soft
+limit it reached `EMFILE` at VShard 3,972 while still creating the first core's
+groups. The failed `ClusterDataPlane::start` left `sharded<ShardRaftPlane>`
+started, so its global destructor used Seastar's assertion trap and every gate
+reported `Illegal instruction` instead of the preceding open-file error.
+CR-FIX-064 closes both halves; snapshot materialisation and other CR-12 scale
+limits remain open.
+
 ### CR-15 and CR-16 — deployment and evidence gaps
 
 [`docker-compose.cluster.yml`](../docker-compose.cluster.yml) explicitly starts
@@ -360,9 +378,9 @@ not be presented as a production cluster example.
 
 The final register in [`write-scaleout-plan.md`](write-scaleout-plan.md) records
 4,308/4,308 unit tests and 40/40 socket tests, but also states that the following
-live gates were not rerun after later cluster changes:
+live gates were not rerun after later cluster changes. The backpressure gate has
+now been refreshed at `69ac879`; the other three remain stale:
 
-- `backpressure_gate.sh`
 - `node_kill_round.sh`
 - `restart_catchup_gate.sh`
 - `snapshot_durability_gate.sh`
@@ -579,6 +597,15 @@ is not completion.
   and resolve D-39/D-10 before enabling shared journals by default. **Done when:**
   destructor fault tests cannot SIGILL and real-disk shared-journal GC evidence
   demonstrates bounded reclamation.
+- [x] **CR-FIX-064 — make replicated startup open-file-safe and
+  exception-safe.** Owner: server/cluster composition. Resolve the descriptor
+  requirement before opening Engine/Raft state, raise an ordinary soft limit
+  when permitted, fail with an actionable diagnostic when the hard limit is too
+  low, and stop partially-started sharded services without replacing the root
+  exception with a destructor trap. **Done when:** a soft=1,024/hard&gt;=8,192
+  subprocess opens all 4,096 groups and serves HTTP with an effective 8,192
+  limit; a hard=1,024 subprocess exits 1 before Engine startup; and lifecycle
+  source regressions plus a live three-node gate pass. Completed in `69ac879`.
 
 ### 7. Release validation
 
@@ -588,7 +615,16 @@ is not completion.
 - [ ] **CR-FIX-071 — rerun the four stale live gates one at a time on the final
   candidate.** Owner: release. Record commit, hardware, configuration, free
   space, and complete results for backpressure, node kill, restart catch-up, and
-  snapshot durability.
+  snapshot durability. **Progress:** `backpressure_gate.sh` passed at `69ac879`
+  on an AMD Ryzen 9 7950X (16 cores/32 threads), 123 GiB RAM, Linux
+  7.0.0-28-generic, with 62 GiB free on `/tmp`. Configuration was three
+  loopback nodes, partitioned RF=3, `--smp 4`, development-only insecure
+  transport, the gate's 1,000,000-byte/shard subject limit, and the default
+  32 MiB/shard recovery limit. Subject results: 16/16 deterministic overload
+  requests returned 503 and `Retry-After`, 0 returned 500; 200/200 load batches
+  were rejected explicitly; a single write returned 200; no node crashed.
+  Recovery results: 200/200 batches accepted at 5,900,261 points/s, zero HTTP
+  or connection errors, zero server-side admission rejections, zero crashes.
 - [ ] **CR-FIX-072 — run topology and security gates missing from the current
   register.** Owner: release. Required scenarios: partitioned former-leader read,
   RF&lt;N primary death and black hole, empty-node snapshot catch-up with deletes,
@@ -664,4 +700,13 @@ exact-delete focused regressions:   11/11 router/HTTP plus wire/Raft paths passe
 timestar_http_server:              built successfully
 test/cluster_gates/*.sh:           bash -n passed
 git diff --check:                  passed
+```
+
+Additional validation for `69ac879`:
+
+```text
+HTTP startup/lifecycle regressions: 10/10 passed
+soft nofile 1024, hard 524288:       raised to 8192; 4096 groups opened; HTTP served; clean exit 0
+soft/hard nofile 1024:               actionable pre-Engine refusal; clean exit 1; no SIGILL
+backpressure_gate.sh:                passed (subject overload + default-budget restart recovery)
 ```
