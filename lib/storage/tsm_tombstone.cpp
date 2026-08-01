@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <filesystem>
 #include <seastar/core/file.hh>
 #include <seastar/core/fstream.hh>
 #include <seastar/core/seastar.hh>
@@ -13,7 +14,12 @@
 
 namespace timestar {
 
-TSMTombstone::TSMTombstone(const std::string& path) : tombstonePath(path) {
+namespace fs = std::filesystem;
+
+TSMTombstone::TSMTombstone(const std::string& path)
+    : tombstonePath(path), directorySync_([](const std::string& directory) {
+          return seastar::sync_directory(directory);
+      }) {
     if (path.empty()) {
         throw std::invalid_argument("TSMTombstone path must not be empty");
     }
@@ -295,10 +301,16 @@ seastar::future<> TSMTombstone::flush() {
     // Sort and merge entries before writing
     sortAndMergeEntries();
 
+    // Never truncate the live sidecar in place. A crash during an in-place
+    // rewrite leaves the only delete set corrupt and makes the TSM either
+    // unsafe to serve or impossible to open. Publish a fully synced temporary
+    // generation with an atomic rename instead.
+    const std::string temporaryPath = tombstonePath + ".tmp";
+
     // Use output stream for small tombstone files (avoids DMA alignment issues)
     auto output_stream =
         co_await seastar::open_file_dma(
-            tombstonePath, seastar::open_flags::wo | seastar::open_flags::create | seastar::open_flags::truncate)
+            temporaryPath, seastar::open_flags::wo | seastar::open_flags::create | seastar::open_flags::truncate)
             .then([](seastar::file f) { return seastar::make_file_output_stream(std::move(f)); });
 
     // Clean up the output stream on any failure after successful open.
@@ -359,6 +371,14 @@ seastar::future<> TSMTombstone::flush() {
     if (flushError) {
         std::rethrow_exception(flushError);
     }
+
+    // output_stream.flush() fdatasyncs the temporary file. Rename makes the
+    // complete sidecar visible atomically; the directory sync is the final
+    // durability boundary for both first creation and replacement. Leave
+    // isDirty set until every step succeeds so a caller can retry safely.
+    co_await seastar::rename_file(temporaryPath, tombstonePath);
+    fs::path parent = fs::path(tombstonePath).parent_path();
+    co_await directorySync_(parent.empty() ? "." : parent.string());
 
     isDirty = false;
 }

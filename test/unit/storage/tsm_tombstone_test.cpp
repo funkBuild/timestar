@@ -6,6 +6,7 @@
 #include <gtest/gtest.h>
 
 #include <filesystem>
+#include <seastar/core/seastar.hh>
 
 using namespace timestar;
 namespace fs = std::filesystem;
@@ -275,6 +276,33 @@ TEST_F(TSMTombstoneTest, PersistenceAndChecksums) {
                         std::string(e.what()).find("corrupt") != std::string::npos);
         }
     }
+}
+
+// A successful file flush and rename is not a durable sidecar publication until
+// the parent directory sync succeeds. The failure must propagate and leave the
+// object dirty so the exact publication can be retried.
+TEST_F(TSMTombstoneTest, DirectorySyncFailurePropagatesAndRetries) {
+    auto tombstone = std::make_unique<TSMTombstone>(tombstonePath);
+    EXPECT_TRUE(tombstone->addTombstone(series1, 1000, 2000).get());
+
+    tombstone->setDirectorySyncForTesting([](const std::string&) {
+        return seastar::make_exception_future<>(std::runtime_error("injected tombstone directory sync failure"));
+    });
+    EXPECT_THROW(tombstone->flush().get(), std::runtime_error);
+
+    // The safe failure shape can expose the complete renamed file in the live
+    // process, but the caller has not received success and will retry.
+    TSMTombstone visible(tombstonePath);
+    visible.load().get();
+    EXPECT_TRUE(visible.isDeleted(series1, 1500));
+
+    tombstone->setDirectorySyncForTesting(
+        [](const std::string& directory) { return seastar::sync_directory(directory); });
+    EXPECT_NO_THROW(tombstone->flush().get());
+
+    TSMTombstone recovered(tombstonePath);
+    recovered.load().get();
+    EXPECT_TRUE(recovered.isDeleted(series1, 1500));
 }
 
 // Test empty tombstone file

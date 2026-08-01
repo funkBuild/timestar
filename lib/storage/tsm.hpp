@@ -294,6 +294,10 @@ private:
 
     // Tombstone support
     std::unique_ptr<timestar::TSMTombstone> tombstones;
+    // Serialises each logical mutation with its durable sidecar publication.
+    // Without this, concurrent deleteRange coroutines can mutate `entries`
+    // while another flush iterates it and can truncate/rename the same file.
+    seastar::semaphore tombstoneMutationSemaphore_{1};
 
     // Helper to get tombstone file path
     std::string getTombstonePath() const;

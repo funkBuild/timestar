@@ -104,6 +104,29 @@ TEST_F(TombstoneFlushCleanupTest, FlushFunctionHasExpectedStructure) {
         << "flush() should flush the output stream before closing";
 }
 
+// The live sidecar must never be truncated in place. A complete, synced
+// temporary file is renamed into place and the parent directory is then synced
+// before the delete can be acknowledged.
+TEST_F(TombstoneFlushCleanupTest, PublicationIsAtomicAndDirectoryDurable) {
+    std::string funcBody = extractFlushFunction();
+    ASSERT_FALSE(funcBody.empty());
+
+    const size_t temporaryPos = funcBody.find("temporaryPath");
+    const size_t fileFlushPos = funcBody.find("output_stream.flush()");
+    const size_t renamePos = funcBody.find("rename_file");
+    const size_t directorySyncPos = funcBody.find("directorySync_");
+
+    ASSERT_NE(temporaryPos, std::string::npos);
+    ASSERT_NE(fileFlushPos, std::string::npos);
+    ASSERT_NE(renamePos, std::string::npos);
+    ASSERT_NE(directorySyncPos, std::string::npos);
+    EXPECT_LT(temporaryPos, fileFlushPos);
+    EXPECT_LT(fileFlushPos, renamePos);
+    EXPECT_LT(renamePos, directorySyncPos);
+    EXPECT_EQ(funcBody.find("open_file_dma(\n            tombstonePath"), std::string::npos)
+        << "flush must not truncate the live tombstone sidecar";
+}
+
 // Core test: flush() must use exception_ptr pattern for cleanup (not throw in catch)
 TEST_F(TombstoneFlushCleanupTest, UsesExceptionPtrPatternNotThrowInCatch) {
     std::string funcBody = extractFlushFunction();

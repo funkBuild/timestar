@@ -299,6 +299,73 @@ TEST_F(TSMSeastarTest, QueryWithTombstones) {
     testTSMQueryWithTombstones(getTestFilePath("0_7.tsm")).get();
 }
 
+// Two deletes against one TSM can suspend in sidecar I/O. The second mutation
+// must wait until the first range and its durable publication complete; both
+// ranges must survive a reopen.
+seastar::future<> testTSMConcurrentDeletesSerialize(std::string filename) {
+    {
+        TSMWriter writer(filename);
+        const auto seriesId = SeriesId128::fromSeriesKey("test.concurrent_delete");
+        std::vector<uint64_t> timestamps = {1000, 2000, 3000, 4000, 5000};
+        std::vector<double> values = {1.0, 2.0, 3.0, 4.0, 5.0};
+        writer.writeSeries(TSMValueType::Float, seriesId, timestamps, values);
+        writer.writeIndex();
+        writer.close();
+    }
+
+    const auto seriesId = SeriesId128::fromSeriesKey("test.concurrent_delete");
+    {
+        TSM tsm(filename);
+        co_await tsm.open();
+        auto* tombstones = tsm.getTombstones();
+        EXPECT_NE(tombstones, nullptr);
+        if (!tombstones) {
+            co_await tsm.close();
+            co_return;
+        }
+
+        seastar::promise<> firstSyncStartedPromise;
+        auto firstSyncStarted = firstSyncStartedPromise.get_future();
+        seastar::promise<> releaseFirstSync;
+        size_t syncCalls = 0;
+        tombstones->setDirectorySyncForTesting([&](const std::string&) {
+            ++syncCalls;
+            if (syncCalls == 1) {
+                firstSyncStartedPromise.set_value();
+                return releaseFirstSync.get_future();
+            }
+            return seastar::make_ready_future<>();
+        });
+
+        auto firstDelete = tsm.deleteRange(seriesId, 2000, 2000);
+        co_await std::move(firstSyncStarted);
+        EXPECT_EQ(syncCalls, 1u);
+        auto secondDelete = tsm.deleteRange(seriesId, 4000, 4000);
+        EXPECT_FALSE(secondDelete.available());
+        EXPECT_EQ(syncCalls, 1u) << "the second delete must not enter sidecar publication concurrently";
+
+        releaseFirstSync.set_value();
+        EXPECT_TRUE(co_await std::move(firstDelete));
+        EXPECT_TRUE(co_await std::move(secondDelete));
+        EXPECT_EQ(syncCalls, 2u);
+        co_await tsm.close();
+    }
+
+    {
+        TSM tsm(filename);
+        co_await tsm.open();
+        auto result = co_await tsm.queryWithTombstones<double>(seriesId, 0, UINT64_MAX);
+        auto [timestamps, values] = result.getAllData();
+        EXPECT_EQ(timestamps, (std::vector<uint64_t>{1000, 3000, 5000}));
+        EXPECT_EQ(values, (std::vector<double>{1.0, 3.0, 5.0}));
+        co_await tsm.close();
+    }
+}
+
+TEST_F(TSMSeastarTest, ConcurrentDeletesSerialize) {
+    testTSMConcurrentDeletesSerialize(getTestFilePath("0_9.tsm")).get();
+}
+
 seastar::future<> testTSMLoadTombstones(std::string filename) {
     {
         TSMWriter writer(filename);

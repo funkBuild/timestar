@@ -3,6 +3,7 @@
 #include "series_id.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <seastar/core/coroutine.hh>
@@ -10,6 +11,7 @@
 #include <seastar/core/temporary_buffer.hh>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace timestar {
@@ -71,6 +73,10 @@ private:
     seastar::file tombstoneFile;
     bool isOpen = false;
     bool isDirty = false;
+    // Final-name publication is not durable until the parent directory is
+    // synced. Kept injectable so failure of that exact ownership boundary can
+    // be covered without process-global filesystem hooks.
+    std::function<seastar::future<>(const std::string&)> directorySync_;
     // Monotonic in-memory mutation generation. Snapshot materialisation records
     // this before reading a TSM and checks it again before publishing the
     // snapshot: a concurrent delete must make the producer retry rather than
@@ -93,6 +99,9 @@ public:
     seastar::future<> flush();
     seastar::future<> close();
     seastar::future<bool> exists() const;
+    void setDirectorySyncForTesting(std::function<seastar::future<>(const std::string&)> sync) {
+        directorySync_ = std::move(sync);
+    }
     // Unlink the sidecar without discarding the in-memory ranges. Compaction
     // can retire the on-disk generation while readers that already pinned the
     // TSM still need those ranges to filter their open file descriptor.

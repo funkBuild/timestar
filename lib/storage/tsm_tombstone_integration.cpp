@@ -21,6 +21,7 @@ std::string TSM::getTombstonePath() const {
 
 // Load tombstones when opening TSM file
 seastar::future<> TSM::loadTombstones() {
+    auto mutationUnits = co_await seastar::get_units(tombstoneMutationSemaphore_, 1);
     std::string tombstonePath = getTombstonePath();
     LOG_INSERT_PATH(timestar::tsm_log, trace, "Loading tombstones from: {} for TSM: {}", tombstonePath, filePath);
 
@@ -80,6 +81,11 @@ seastar::future<bool> TSM::deleteRange(const SeriesId128& seriesId, uint64_t sta
                         startTime, endTime, filePath);
         co_return false;
     }
+
+    // Keep the in-memory range mutation and its atomic sidecar publication in
+    // one serial critical section. A second delete must not rewrite the same
+    // vectors or temporary/final paths while this flush is suspended in I/O.
+    auto mutationUnits = co_await seastar::get_units(tombstoneMutationSemaphore_, 1);
 
     // Series exists and has data in the time range - add tombstone
     LOG_INSERT_PATH(timestar::tsm_log, debug, "Adding tombstone for series '{}' in TSM {}", seriesId.toHex(), filePath);
@@ -290,6 +296,7 @@ seastar::future<double> TSM::estimateTombstoneCoverage() {
 // tombstone manager: queries can retain a shared_ptr<TSM> across compaction and
 // continue reading the unlinked TSM through its open descriptor.
 seastar::future<bool> TSM::deleteTombstoneFile() {
+    auto mutationUnits = co_await seastar::get_units(tombstoneMutationSemaphore_, 1);
     if (tombstones) {
         co_return co_await tombstones->unlinkFile();
     }

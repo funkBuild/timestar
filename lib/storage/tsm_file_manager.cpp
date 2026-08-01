@@ -50,8 +50,9 @@ seastar::future<> TSMFileManager::init() {
                 if (endsWith(entry.path(), ".tsm")) {
                     paths.push_back(fs::canonical(fs::absolute(entry.path())).string());
                 } else if (endsWith(entry.path(), ".tmp")) {
-                    // Orphaned .tmp files from a previous crash (compaction wrote the
-                    // file but died before rename to .tsm). Safe to remove.
+                    // Orphaned publication temporary from a previous crash
+                    // (TSM compaction/flush or tombstone replacement died
+                    // before its final rename). Safe to remove.
                     std::error_code ec;
                     fs::remove(entry.path(), ec);
                     if (ec) {
