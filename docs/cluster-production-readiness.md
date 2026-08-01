@@ -6,7 +6,7 @@
 
 **Remediation commits:** `95c10d2`, `a16b03a`, `d578e81`, `ddab705`,
 `8620b9e`, `20639dc`, `ea2511b`, `3ac9899`, `69ac879`, `09a62c5`,
-`2e06cb8`, `7151f5d`, `5b22b81`, `fef4886`
+`2e06cb8`, `7151f5d`, `5b22b81`, `fef4886`, `3d2d607`
 
 **Scope:** The recent VShard/Raft cluster redesign, its production-server
 integration, the public HTTP surface, recovery paths, and the release evidence
@@ -19,7 +19,7 @@ used as evidence that the current server is production-ready.
 
 ## Implementation progress after the review
 
-Fourteen remediation commits are now recorded. Cluster release status remains
+Fifteen remediation commits are now recorded. Cluster release status remains
 **BLOCKED** because group 0/movement, generation-atomic live snapshot
 replacement, pattern-delete expansion, replicated retention, the large-snapshot
 path, and rolling wire-format compatibility remain open. The four previously
@@ -112,6 +112,11 @@ Completed and covered in this pass:
   durability boundary. WAL conversion and both ordinary and VShard-partitioned
   compaction retain their prior durable generation when that sync fails; direct
   TSM writers propagate the same failure instead of treating it as best effort.
+- TSM open, index-validation, and rank-collision failures now abort generation
+  registration. Startup cannot serve a partial immutable dataset, and a failed
+  WAL conversion or compaction cannot report success and retire its source.
+  Planned compaction targets also preserve sequence zero instead of confusing
+  that valid first allocation with the direct-call auto-allocation sentinel.
 
 Focused evidence on this pass includes the rebuilt server, unit and socket test
 targets, journal negative tests, alternate-replica routing tests, a black-holed
@@ -120,7 +125,7 @@ identity/topology tests, and pre-proposal admission tests. The strict checkboxes
 below stay open where their stated multi-process or fault-injection “done when”
 evidence has not yet been run.
 
-Final local validation for these remediation commits is green: 4,349/4,349 unit
+Final local validation for these remediation commits is green: 4,352/4,352 unit
 tests passed with no skips, 45/45 socket-backed cluster tests passed, the
 first-pass 56/56 focused
 cluster/readiness/identity/admission regressions passed, and the second-pass
@@ -188,6 +193,7 @@ item are recorded in the fix-up list.
 | CR-21 | P1 | Replicated startup exhausted ordinary open-file limits and did not unwind partial sharded startup | A default 1,024 soft limit failed around the thousandth VShard journal, then cleanup trapped with `SIGILL`, hiding the actionable `EMFILE` and preventing the node from booting. |
 | CR-22 | P2 | Live-gate data reset and benchmark preflight could fail open | A gate could race deletion against running nodes or continue after the benchmark sent no load, invalidating otherwise green release evidence. |
 | CR-23 | P0 | TSM publication ignored parent-directory sync failure before deleting the prior durable generation | A crash could discard the renamed output directory entry after its WAL or source TSMs had been removed, losing acknowledged data. |
+| CR-24 | P0 | TSM registration swallowed open/index failures and silently selected one duplicate rank | WAL conversion could delete its recoverable source after failing to register the output; restart could serve a partial or filesystem-order-dependent dataset. |
 
 ### CR-01 — deletes bypass consensus
 
@@ -253,6 +259,25 @@ before a WAL or source TSM may be retired. The uncertain output can coexist
 with the retained source and be retried or recovered, which may require later
 orphan cleanup but does not lose the prior durable generation. Injected failures
 cover WAL conversion and both compaction layouts.
+
+### CR-24 — invalid TSM generations were silently omitted
+
+[`TSMFileManager::openTsmFile`](../lib/storage/tsm_file_manager.cpp) logged and
+swallowed any open or sparse-index validation failure. During restart this left
+the file on disk but served every other generation as if the dataset were
+complete. During WAL conversion the same successful return allowed the caller
+to remove the WAL even though the new immutable generation was unreadable and
+unregistered. Duplicate manager ranks also kept whichever path happened to be
+visited first, making visibility depend on filesystem iteration order; live
+compaction registration could continue to source deletion after the collision.
+
+Commit `3d2d607` propagates open and index failures and rejects duplicate ranks
+in both startup discovery and live registration. Server lifecycle cleanup closes
+any generations opened before a shard fails initialization, while conversion
+and compaction retain their old durable source. The stricter collision test also
+exposed a separate ambiguity where planned sequence zero was interpreted as a
+direct-call auto-allocation sentinel; planned targets now carry an explicit flag
+and preserve `(tier, sequence)` exactly.
 
 ### CR-02 and CR-03 — snapshot contents and live installation were unsafe
 
@@ -543,6 +568,11 @@ is not completion.
   parent directory has synced successfully. Injected directory-sync failures
   prove WAL conversion and both compaction layouts propagate the failure and
   preserve their prior durable generation.
+- [x] **CR-FIX-019 — reject invalid or ambiguous immutable generations.**
+  Owner: storage. Startup propagates TSM open/index errors and duplicate ranks;
+  live registration propagates the same collisions before source retirement.
+  WAL-output corruption, corrupt-startup, duplicate-startup, duplicate-live-add,
+  and planned-sequence-zero regressions cover the failure boundaries.
 
 ### 2. Complete control-plane and identity wiring
 
@@ -834,6 +864,17 @@ TSM publication durability validation for `fef4886`:
 injected directory-sync regressions:       3/3 passed
 related writer/manager/compactor/WAL:     68/68 passed
 current full unit suite:             4349/4349 passed (444 suites, -c 2)
+current socket-backed cluster suite:     45/45 passed (8 suites, -c 2)
+timestar_http_server:                    built successfully
+git diff --check:                        passed
+```
+
+TSM registration validation for `3d2d607`:
+
+```text
+focused failure/sequence-zero regressions: 6/6 passed
+related manager/WAL/compaction tests:    72/72 passed
+current full unit suite:             4352/4352 passed (444 suites, -c 2)
 current socket-backed cluster suite:     45/45 passed (8 suites, -c 2)
 timestar_http_server:                    built successfully
 git diff --check:                        passed
