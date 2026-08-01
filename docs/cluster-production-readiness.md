@@ -8,7 +8,7 @@
 `8620b9e`, `20639dc`, `ea2511b`, `3ac9899`, `69ac879`, `09a62c5`,
 `2e06cb8`, `7151f5d`, `5b22b81`, `fef4886`, `3d2d607`, `f0e28f0`,
 `da55952`, `a1beb94`, `bb5b871`, `e201343`, `6ad2c93`, `9a42d84`,
-`41fdc34`, `a58d2a9`, `6a73809`
+`41fdc34`, `a58d2a9`, `6a73809`, `81692a4`
 
 **Scope:** The recent VShard/Raft cluster redesign, its production-server
 integration, the public HTTP surface, recovery paths, and the release evidence
@@ -21,7 +21,7 @@ used as evidence that the current server is production-ready.
 
 ## Implementation progress after the review
 
-Twenty-five remediation commits are now recorded. Cluster release status remains
+Twenty-six remediation commits are now recorded. Cluster release status remains
 **BLOCKED** because group 0/movement, generation-atomic live snapshot
 replacement, pattern-delete expansion, replicated retention, the large-snapshot
 path, and rolling wire-format compatibility remain open. The four previously
@@ -173,6 +173,12 @@ Completed and covered in this pass:
   symlinks, and validates both physical and data ranks before opening or
   registration. Sequence allocation stops at the shared 60-bit rank boundary,
   and invalid additions cannot leave a half-registered immutable generation.
+- NativeIndex WAL recovery now treats its directory as an exclusive canonical
+  namespace and permits a torn tail only in the newest generation. Complete
+  corruption, a torn sealed generation, sequence discontinuity, symlinks,
+  malformed aliases, and identity exhaustion fence startup. Fresh creation is
+  exclusive, a recovered empty/torn generation is rotated before reuse, and WAL
+  creation/deletion directory barriers are mandatory.
 
 Focused evidence on this pass includes the rebuilt server, unit and socket test
 targets, journal negative tests, alternate-replica routing tests, a black-holed
@@ -181,8 +187,8 @@ identity/topology tests, and pre-proposal admission tests. The strict checkboxes
 below stay open where their stated multi-process or fault-injection “done when”
 evidence has not yet been run.
 
-Final local validation for these remediation commits is green: all 4,380 unit
-tests completed successfully (4,371 passed and 9 pre-existing SMP-dependent
+Final local validation for these remediation commits is green: all 4,387 unit
+tests completed successfully (4,378 passed and 9 pre-existing SMP-dependent
 tests skipped), 45/45 socket-backed cluster tests passed, the
 first-pass 56/56 focused
 cluster/readiness/identity/admission regressions passed, and the second-pass
@@ -261,6 +267,7 @@ item are recorded in the fix-up list.
 | CR-32 | P0 | WAL filename identity was permissive and fresh creation truncated collisions | Malformed names could be skipped or aliased to another sequence, 32-bit allocation could wrap recovery order, and a colliding fresh create could erase the only durable acknowledged segment. |
 | CR-33 | P0 | Raft journal discovery ignored unrecognized entries and segment creation could truncate after identity wrap | A damaged or partially renamed acknowledged segment could be omitted from replay; exhaustion could wrap to segment zero and overwrite an older durable generation. |
 | CR-34 | P0 | TSM discovery accepted numeric-prefix aliases and rank allocation exceeded its 60-bit identity space | Malformed or symlinked immutable files could enter recovery under the wrong identity; an out-of-range data generation could register and fail later queries, while exhaustion could publish an unusable TSM and strand its source WAL. |
+| CR-35 | P0 | NativeIndex WAL recovery aliased or skipped durable generations and discarded complete corruption | Acknowledged catalog/postings mutations could disappear while startup served an incomplete index; a colliding fresh generation could also truncate the last durable copy. |
 
 ### CR-01 — deletes bypass consensus
 
@@ -560,6 +567,29 @@ fresh/reserved sequence allocation stops at the last valid 60-bit identity.
 Regressions cover numeric-prefix aliases, symlinked files, an out-of-range data
 generation, allocation at the final identity, legacy filename compatibility,
 and rejection without partial manager registration.
+
+### CR-35 — NativeIndex WAL recovery could silently omit durable mutations
+
+[`IndexWAL::recover`](../lib/index/native/index_wal.cpp) discovered generations
+with prefix-consuming `std::stoull`, skipped unrecognized directory entries,
+rebuilt a canonical path instead of replaying the entry it inspected, and
+followed symlinks. Replay then classified a fully present CRC-invalid or
+malformed frame as a discardable tail, and allowed incomplete tails in old
+sealed generations. Fresh open used create-plus-truncate, counters could wrap,
+and an empty recovered generation could later be lazily truncated and reused.
+Creation and retirement also omitted the directory durability barriers needed
+to make the generation namespace crash-safe.
+
+Commit `81692a4` makes the index-WAL directory an exclusive namespace of exact
+canonical regular files. Only the newest generation may end in an incomplete
+header/body or zero padding; complete corruption, sequence discontinuity, and
+any torn sealed generation preserve the source and abort startup. Generation
+and record identities reject exhaustion, fresh paths use exclusive creation,
+and a recovered empty/torn file is durably retired before accepting new writes.
+Creation and deletion now sync the directory, while destructor fallback refuses
+to follow or overwrite an unowned collision. Regressions cover corruption,
+numeric-prefix aliases, symlinks, nonempty collision, generation exhaustion,
+torn sealed generations, and a torn first frame followed by a new write.
 
 ### CR-02 and CR-03 — snapshot contents and live installation were unsafe
 
@@ -906,6 +936,12 @@ is not completion.
   storage. Parsing consumes the exact supported schema, startup refuses
   non-regular immutable entries, both packed ranks validate before open or
   registration, and sequence allocation cannot cross its 60-bit identity space.
+- [x] **CR-FIX-019K — fail closed on invalid NativeIndex WAL recovery.** Owner:
+  storage. Discovery accepts only canonical regular generations; only the newest
+  generation may have an incomplete tail; complete corruption and sequence or
+  identity violations fence startup. Creation cannot truncate a collision, an
+  empty recovered generation is rotated before reuse, and namespace mutations
+  include their directory durability barrier.
 
 ### 2. Complete control-plane and identity wiring
 
@@ -1319,6 +1355,17 @@ TSM immutable identity/rank validation for `6a73809`:
 focused TSM rank/manager suites:              49/49 passed
 current full unit suite:                    4380/4380 successful
   passed/skipped:                           4371/9 (444 suites, -c 2)
+current socket-backed cluster suite:          45/45 passed (8 suites, -c 2)
+timestar_http_server:                         built successfully
+git diff --check:                             passed
+```
+
+NativeIndex WAL recovery validation for `81692a4`:
+
+```text
+focused IndexWAL/NativeIndex recovery suites: 21/21 passed
+current full unit suite:                    4387/4387 successful
+  passed/skipped:                           4378/9 (444 suites, -c 2)
 current socket-backed cluster suite:          45/45 passed (8 suites, -c 2)
 timestar_http_server:                         built successfully
 git diff --check:                             passed
