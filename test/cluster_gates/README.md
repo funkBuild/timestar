@@ -46,6 +46,16 @@ so a failed run is still diagnosable; `GATE_KEEP_DATA=1` keeps everything when i
 Check `df -h /tmp` and `ls -d /tmp/tsgate_*` before and after a run anyway — a gate killed
 between its `mkdir` and its trap leaves dirs behind.
 
+Data reset is a VERIFIED operation, not a best-effort `rm -rf; mkdir`. The shared
+`fresh_gate_data_dirs` helper accepts only direct `/tmp/tsgate_*` roots (never a nested or
+arbitrary path), retries a removal race five times, proves every old root is absent, and
+only then recreates it. A gate aborts before starting a node if that proof fails. This is
+load-bearing for multi-arm gates: `snapshot_durability_gate.sh` once had extra `rm -rf`
+calls between arms while the prior arm's post-crash readback servers were still RUNNING.
+They predictably reported `Directory not empty`; worse, the script ignored that and went
+on to print `GATE PASSED`. Those live deletions are gone. Each next arm now kills the prior
+cluster and performs exactly one verified reset inside `run_arm`.
+
 **Budget the disk before a run, not after.** Each bench writes
 `batches * batch-size * 10` points and the cluster keeps them at RF=3; measured here that
 is ~22 bytes per point per replica, i.e. ~6.7 G per 100 M points. `fault_injection_gate.sh`

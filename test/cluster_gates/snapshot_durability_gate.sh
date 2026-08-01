@@ -101,7 +101,7 @@ run_arm() {
     local name="$1" snap="$2" batches="${3:-$BATCHES}" wal="${4:-$WAL_THRESHOLD}" snapbytes="${5:-}"
     kill_cluster 1971
     require_ports_free $PORTS
-    for i in 1 2 3; do rm -rf "/tmp/tsgate_sd$i"; mkdir -p "/tmp/tsgate_sd$i"; done
+    fresh_gate_data_dirs /tmp/tsgate_sd1 /tmp/tsgate_sd2 /tmp/tsgate_sd3 || return 1
     local PEERS="127.0.0.1:19710,127.0.0.1:19711,127.0.0.1:19712"
     start_node() {
         env $GATE_SERVER_ENV TIMESTAR_DATA_DIR="/tmp/tsgate_sd$1" TIMESTAR_CLUSTER_ENABLED=true TIMESTAR_CLUSTER_PARTITIONED=true \
@@ -211,15 +211,12 @@ assert_eq "FENCE: snapshots refused as too large" "$ARM_TOOBIG" 0
 # readable after the whole cluster is kill -9'd and restarted over compacted journals.
 assert_ge "FENCE: every acked point readable after kill -9 over compacted journals" "$FENCE_MIN" "$FENCE_ACKED"
 assert_le "FENCE: nothing fabricated or double-counted" "$FENCE_MIN" "$PROBES"
-rm -rf /tmp/tsgate_sd1 /tmp/tsgate_sd2 /tmp/tsgate_sd3
 
 # ---- PHASE 2, CONTROL ARM: no compaction at all ----
 run_arm "control, heavy load, snapshots OFF" "$SNAP_OFF" "$BATCHES" "$WAL_THRESHOLD" "$SNAP_OFF_BYTES" || gate_exit
 CTRL_MIN=$ARM_MIN; CTRL_READS="$ARM_READS"; CTRL_TAKEN=$ARM_TAKEN; CTRL_ACKED=$ARM_ACKED
 CTRL_BACKLOG=$ARM_BACKLOG
 assert_eq "control arm took no snapshots (it is the control)" "$CTRL_TAKEN" 0
-
-rm -rf /tmp/tsgate_sd1 /tmp/tsgate_sd2 /tmp/tsgate_sd3
 
 # ---- PHASE 2, SUBJECT ARM: the snapshot producer running ----
 run_arm "subject, heavy load, snapshots ON" "$SNAP_ON" || gate_exit

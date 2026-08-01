@@ -90,7 +90,7 @@ status_sum() {
 
 kill_cluster 1973
 require_ports_free $PORTS
-for i in 1 2 3; do rm -rf "/tmp/tsgate_rr$i"; mkdir -p "/tmp/tsgate_rr$i"; done
+fresh_gate_data_dirs /tmp/tsgate_rr1 /tmp/tsgate_rr2 /tmp/tsgate_rr3 || exit 2
 
 echo "=== phase 1: bring up an RF=3 cluster and load it heavily ==="
 for i in 1 2 3; do start_node $i; done

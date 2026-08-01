@@ -101,7 +101,7 @@ fi
 
 kill_cluster 1951
 require_ports_free $PORTS
-for i in 1 2 3; do rm -rf "/tmp/tsgate_cu$i"; mkdir -p "/tmp/tsgate_cu$i"; done
+fresh_gate_data_dirs /tmp/tsgate_cu1 /tmp/tsgate_cu2 /tmp/tsgate_cu3 || exit 2
 PEERS="127.0.0.1:19510,127.0.0.1:19511,127.0.0.1:19512"
 # SNAPSHOT_ENTRIES is what forces the producer to run inside a gate-sized campaign (see
 # the header for why it has to be this low -- a VShard sees only the batches that touch it,

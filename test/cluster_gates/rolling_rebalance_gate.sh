@@ -22,7 +22,7 @@ MIN_TRANSFERS="${GATE_MIN_TRANSFERS:-200}"
 
 kill_cluster 1922
 require_ports_free 19220 19221 19222
-for i in 1 2 3; do rm -rf "/tmp/tsgate_rb$i"; mkdir -p "/tmp/tsgate_rb$i"; done
+fresh_gate_data_dirs /tmp/tsgate_rb1 /tmp/tsgate_rb2 /tmp/tsgate_rb3 || exit 2
 PEERS="127.0.0.1:19220,127.0.0.1:19221,127.0.0.1:19222"
 start_node() {
     env $GATE_SERVER_ENV TIMESTAR_DATA_DIR="/tmp/tsgate_rb$1" TIMESTAR_CLUSTER_ENABLED=true TIMESTAR_CLUSTER_PARTITIONED=true \

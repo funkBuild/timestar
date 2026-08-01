@@ -29,7 +29,7 @@ PORTS="19210 19211 19212"
 
 kill_cluster 1921
 require_ports_free 19210 19211 19212
-for i in 1 2 3; do rm -rf "/tmp/tsgate_bp$i"; mkdir -p "/tmp/tsgate_bp$i"; done
+fresh_gate_data_dirs /tmp/tsgate_bp1 /tmp/tsgate_bp2 /tmp/tsgate_bp3 || exit 2
 PEERS="127.0.0.1:19210,127.0.0.1:19211,127.0.0.1:19212"
 for i in 1 2 3; do
     env $GATE_SERVER_ENV TIMESTAR_CLUSTER_WRITE_INFLIGHT_BYTES="$LIMIT" TIMESTAR_DATA_DIR="/tmp/tsgate_bp$i" \
@@ -122,7 +122,7 @@ echo "=== B: SAME cluster restarted at the DEFAULT budget (must run clean) ==="
 # is that the DEFAULT budget never gets in the way, which is what this measures.
 kill_cluster 1921
 require_ports_free 19210 19211 19212
-for i in 1 2 3; do rm -rf "/tmp/tsgate_bp$i"; mkdir -p "/tmp/tsgate_bp$i"; done
+fresh_gate_data_dirs /tmp/tsgate_bp1 /tmp/tsgate_bp2 /tmp/tsgate_bp3 || exit 2
 for i in 1 2 3; do
     env $GATE_SERVER_ENV TIMESTAR_DATA_DIR="/tmp/tsgate_bp$i" \
         TIMESTAR_CLUSTER_ENABLED=true TIMESTAR_CLUSTER_PARTITIONED=true \

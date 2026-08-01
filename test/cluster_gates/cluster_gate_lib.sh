@@ -52,6 +52,47 @@ gate_exit() {
     exit 0
 }
 
+# remove_gate_data_dirs DIR... -- remove only this harness's narrowly-named
+# /tmp roots, retrying races and proving they are gone before returning.
+#
+# A plain `rm -rf; mkdir -p` is not a reset unless removal actually succeeded.
+# snapshot_durability_gate exposed this with "Directory not empty" and then
+# continued into the next arm.  It also had redundant top-level rm calls while
+# the prior arm's restarted servers were STILL RUNNING, guaranteeing a race.
+# Never let a release gate measure state whose provenance is ambiguous.
+remove_gate_data_dirs() {
+    local d suffix pass remaining
+    for d in "$@"; do
+        suffix="${d#/tmp/tsgate_}"
+        if [ "$suffix" = "$d" ] || [ -z "$suffix" ] || [[ "$suffix" == */* ]]; then
+            echo "ABORT: refusing to recursively remove non-gate path: $d" >&2
+            return 2
+        fi
+    done
+
+    for pass in 1 2 3 4 5; do
+        rm -rf -- "$@" 2>/dev/null
+        remaining=""
+        for d in "$@"; do [ -e "$d" ] && remaining="$remaining $d"; done
+        [ -z "$remaining" ] && return 0
+        echo "  gate data cleanup retry $pass/5; still present:$remaining" >&2
+        sleep 1
+    done
+    echo "ABORT: gate data directories survived verified cleanup:$remaining" >&2
+    return 1
+}
+
+fresh_gate_data_dirs() {
+    local d
+    remove_gate_data_dirs "$@" || return
+    for d in "$@"; do
+        mkdir -p -- "$d" || {
+            echo "ABORT: could not create fresh gate data directory: $d" >&2
+            return 1
+        }
+    done
+}
+
 kill_cluster() { # $1 = port prefix used by this gate, e.g. 492
     # MATCH ON THE PORT, NOT THE BINARY NAME. Every gate takes an optional server binary
     # as $1 so a "before" binary can be measured the same way. The old pattern
@@ -116,8 +157,11 @@ gate_cleanup() {
             { echo "=== $f (last 300 lines) ==="; tail -n 300 "$f"; } >>"$tails"
         done
     done
-    rm -rf "$@"
-    echo "  cleaned: $* (log tails kept in $tails)"
+    if remove_gate_data_dirs "$@"; then
+        echo "  cleaned: $* (log tails kept in $tails)"
+    else
+        echo "  CLEANUP INCOMPLETE: $* (log tails kept in $tails)" >&2
+    fi
 }
 
 cluster_status() { curl -s -m3 "http://127.0.0.1:$1/cluster/status" 2>/dev/null; }

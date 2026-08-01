@@ -184,7 +184,7 @@ cleanup() {
 }
 kill_cluster 1941
 require_ports_free 19410 19411 19412
-for i in 1 2 3; do rm -rf "/tmp/tsgate_fi$i"; mkdir -p "/tmp/tsgate_fi$i"; done
+fresh_gate_data_dirs /tmp/tsgate_fi1 /tmp/tsgate_fi2 /tmp/tsgate_fi3 || exit 2
 trap cleanup EXIT
 
 # Node 3 is reached through 127.0.0.2 by everyone EXCEPT itself.

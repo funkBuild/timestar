@@ -194,7 +194,7 @@ MIN_DIP_PCT="${GATE_MIN_DIP_PCT:-10}"
 
 kill_cluster 1924
 require_ports_free 19240 19241 19242
-for i in 1 2 3; do rm -rf "/tmp/tsgate_sk$i"; mkdir -p "/tmp/tsgate_sk$i"; done
+fresh_gate_data_dirs /tmp/tsgate_sk1 /tmp/tsgate_sk2 /tmp/tsgate_sk3 || exit 2
 PEERS="127.0.0.1:19240,127.0.0.1:19241,127.0.0.1:19242"
 start_node() {
     env $GATE_SERVER_ENV TIMESTAR_DATA_DIR="/tmp/tsgate_sk$1" TIMESTAR_CLUSTER_ENABLED=true TIMESTAR_CLUSTER_PARTITIONED=true \
