@@ -10,7 +10,7 @@
 `da55952`, `a1beb94`, `bb5b871`, `e201343`, `6ad2c93`, `9a42d84`,
 `41fdc34`, `a58d2a9`, `6a73809`, `81692a4`, `d363348`, `2749027`,
 `1f61f49`, `b2c7d0b`, `872f7e1`, `023d9c3`, `d5f4755`, `7f6d7e8`,
-`7760ebd`, `6557666`, `c8f28c8`, `445f1f0`, `8b8536d`
+`7760ebd`, `6557666`, `c8f28c8`, `445f1f0`, `8b8536d`, `6912dfb`
 
 **Scope:** The recent VShard/Raft cluster redesign, its production-server
 integration, the public HTTP surface, recovery paths, and the release evidence
@@ -23,7 +23,7 @@ used as evidence that the current server is production-ready.
 
 ## Implementation progress after the review
 
-Thirty-nine remediation commits are now recorded. Cluster release status
+Forty remediation commits are now recorded. Cluster release status
 remains **BLOCKED** because group 0/movement, atomic and retry-safe
 pattern-delete semantics, replicated retention, the large-snapshot path, and
 rolling wire-format compatibility remain open. The four previously stale live
@@ -95,8 +95,9 @@ Completed and covered in this pass:
   public clustered handler now rejects every pattern or mixed-pattern batch
   before expansion and proposal: re-expanding after a partial attempt could add
   a concurrently created series that had no original operation receipt. RF=1
-  remains unsupported. Receipt retention is not yet bounded and the named
-  multi-node failure/restart evidence remains open under CR-FIX-010.
+  remains unsupported. Receipt retention is not yet bounded. Commit `6912dfb`
+  closes the named in-process RF=3 leader-failure and replica-restart evidence
+  gap under CR-FIX-010; the external multi-process release gate remains distinct.
 - Replicated startup now raises a low soft `RLIMIT_NOFILE` to 8,192 when the
   process hard limit permits it and otherwise fails before opening Engine or
   Raft state with a `LimitNOFILE`/`ulimit` diagnostic. `ClusterDataPlane::start`
@@ -392,9 +393,11 @@ receipt recovery from a locally produced snapshot skips the large object bodies.
 A duplicate after an intervening write is now a state-machine no-op, including
 after journal compaction and host restart, so the router may safely retry an
 ambiguous exact command. Reusing an operation ID for different target bytes is a
-fail-stop invariant breach rather than a false success. CR-FIX-010 remains open
-for bounded receipt retention and the named multi-node failure/restart evidence;
-patterns remain fail-closed as described above.
+fail-stop invariant breach rather than a false success. Commit `6912dfb` proves
+the same operation on three real Engines: a retry by a new leader in a later term
+and another retry after that replica reconstructs the receipt from durable journal
+replay both preserve a write ordered after the original delete. CR-FIX-010 remains
+open for bounded receipt retention; patterns remain fail-closed as described above.
 
 ### CR-23 — TSM publication did not fence deletion of its durable source
 
@@ -1000,12 +1003,15 @@ is not completion.
   boundary. Tests prove command/receipt codec rejection, conflicting-ID
   fail-stop, snapshot-boundary filtering, lightweight local snapshot recovery,
   and a real compacted-journal restart followed by a harmless old-delete retry.
-  The previously implemented v4 pattern discovery remains internally covered,
+  A three-real-Engine RF=3 test commits the delete, fails over leadership, retries,
+  restarts a caught-up replica from its Engine directory and Raft journal, elects
+  that replica, and retries again; both retries preserve a later write. The
+  previously implemented v4 pattern discovery remains internally covered,
   but production now fails every pattern or mixed-pattern request before
   expansion/proposal because a retry could discover a concurrently created new
   target. CR-FIX-010 remains open for a replicated/frozen pattern plan, bounded
-  exact-receipt retention, and the named multi-node leader-failure and replica
-  restart gates. `445f1f0`, `8b8536d`.
+  exact-receipt retention, and the external multi-process release gate.
+  `445f1f0`, `8b8536d`, `6912dfb`.
 - [ ] **CR-FIX-011 — define a self-contained VShard snapshot format.** Owner:
   snapshot/storage. Include catalog/index extract, data objects, tombstone
   objects or a proven materialised-delete boundary, and real content hashes.
@@ -1679,11 +1685,13 @@ multi-process release gate. They close the storage replacement contract in
 CR-FIX-012; the bounded empty-node public-path gate remains part of CR-FIX-011
 and CR-FIX-078.
 
-Snapshot-durable exact-delete retry validation for `445f1f0` and `8b8536d`:
+Snapshot-durable exact-delete retry validation for `445f1f0`, `8b8536d`, and
+`6912dfb`:
 
 ```text
 command/snapshot/state-machine/router/HTTP focused pass: 32/32 passed
 real compacted-journal receipt recovery and retry:          1/1 passed
+three-real-Engine leader-failover/replica-restart retry:     1/1 passed
 partitioned exact/pattern fail-closed HTTP pass:           10/10 passed
 timestar_unit_test:                         built successfully (-j2)
 timestar_http_server:                       built successfully (-j2)
@@ -1693,5 +1701,6 @@ git diff --check:                                           passed
 
 This closes the known exact-delete retry corruption path but not CR-FIX-010 as
 a whole. Receipt retention still needs a deterministic bound, pattern deletes
-need a replicated immutable expansion plan before re-enablement, and the named
-multi-node leader-failure/replica-restart gate has not yet run.
+need a replicated immutable expansion plan before re-enablement, and the external
+multi-process release gate remains required even though the deterministic RF=3
+leader-failure/replica-restart gate now passes.
