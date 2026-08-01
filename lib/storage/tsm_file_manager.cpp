@@ -248,6 +248,22 @@ seastar::future<> TSMFileManager::addTSMFile(seastar::shared_ptr<TSM> file) {
 }
 
 seastar::future<> TSMFileManager::removeTSMFiles(const std::vector<seastar::shared_ptr<TSM>>& files) {
+    if (files.empty()) {
+        co_return;
+    }
+
+    // Retire the immutable source names before changing the live file set.
+    // All source tombstones remain both on disk and in memory during this
+    // phase. If an unlink or the directory fsync fails, the caller can retry
+    // and the manager continues serving the open, correctly-filtered sources.
+    for (const auto& file : files) {
+        co_await file->scheduleDelete();
+    }
+    co_await syncPublishedDirectory(layout_.tsmDir(shardId).string());
+
+    // The source names are now durably absent, so a restart cannot reload an
+    // uncompacted generation. Only at this point may the new file set become
+    // visible to future queries and deletes.
     for (const auto& file : files) {
         // Remove from tier tracking
         uint64_t tier = file->tierNum;
@@ -258,10 +274,28 @@ seastar::future<> TSMFileManager::removeTSMFiles(const std::vector<seastar::shar
         // Remove from sequenced map
         uint64_t tsmSeqNum = file->rankAsInteger();
         sequencedTsmFiles.erase(tsmSeqNum);
+    }
 
-        // Delete the tombstone file first (if any), then the TSM file itself
-        co_await file->deleteTombstoneFile();
-        co_await file->scheduleDelete();
+    // Sidecars are no longer needed for recovery once their TSM names are
+    // durably absent. Keep the ranges in each TSM object for readers that
+    // pinned it before retirement. Cleanup failure is an orphan-file leak, not
+    // an ambiguous ownership result, so report it without failing a compaction
+    // whose durable source handoff has already completed.
+    bool unlinkedSidecar = false;
+    for (const auto& file : files) {
+        try {
+            unlinkedSidecar = co_await file->deleteTombstoneFile() || unlinkedSidecar;
+        } catch (const std::exception& e) {
+            timestar::tsm_log.warn("Failed to remove retired TSM tombstone for {}: {}", file->getFilePath(), e.what());
+        }
+    }
+    if (unlinkedSidecar) {
+        try {
+            co_await syncPublishedDirectory(layout_.tsmDir(shardId).string());
+        } catch (const std::exception& e) {
+            timestar::tsm_log.warn("Failed to sync retired TSM tombstone cleanup in {}: {}",
+                                   layout_.tsmDir(shardId).string(), e.what());
+        }
     }
 
     co_return;

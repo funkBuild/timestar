@@ -319,6 +319,70 @@ TEST_F(TSMFileManagerSeastarTest, RemoveDeletesFiles) {
     testFMRemoveDeletesFiles(this).get();
 }
 
+// A source TSM may only leave the live set after its unlink is directory
+// durable. Until that barrier succeeds its tombstone must remain recoverable
+// on disk and usable by readers that already pinned the open TSM object.
+seastar::future<> testFMRemoveDirectorySyncFailureKeepsTombstoneAndRetries(TSMFileManagerSeastarTest* self) {
+    constexpr const char* seriesKey = "retirement.value";
+    self->createTestTSMFile("0_1.tsm", seriesKey, {1000, 2000, 3000}, {1.0, 2.0, 3.0});
+
+    TSMFileManager mgr(timestar::StorageLayout("."), seastar::this_shard_id());
+    co_await mgr.init();
+
+    auto files = mgr.getFilesInTier(0);
+    EXPECT_EQ(files.size(), 1u);
+    if (files.size() != 1u) {
+        co_await mgr.stop();
+        co_return;
+    }
+    auto pinned = files.front();
+    const auto seriesId = SeriesId128::fromSeriesKey(seriesKey);
+    EXPECT_TRUE(co_await pinned->deleteRange(seriesId, 2000, 2000));
+    EXPECT_TRUE(fs::exists("shard_0/tsm/0_1.tombstone"));
+
+    mgr.setDirectorySyncForTesting([](const std::string&) {
+        return seastar::make_exception_future<>(std::runtime_error("injected retirement directory sync failure"));
+    });
+
+    bool failed = false;
+    try {
+        co_await mgr.removeTSMFiles({pinned});
+    } catch (const std::runtime_error& e) {
+        failed = std::string(e.what()).find("injected retirement") != std::string::npos;
+    }
+    EXPECT_TRUE(failed);
+    EXPECT_EQ(mgr.getSequencedTsmFiles().size(), 1u)
+        << "a failed source-retirement barrier must leave the source registered";
+    EXPECT_FALSE(fs::exists("shard_0/tsm/0_1.tsm"));
+    EXPECT_TRUE(fs::exists("shard_0/tsm/0_1.tombstone"))
+        << "the recoverable tombstone must outlive an unconfirmed source unlink";
+
+    auto duringFailure = co_await pinned->queryWithTombstones<double>(seriesId, 0, UINT64_MAX);
+    auto [failureTimestamps, failureValues] = duringFailure.getAllData();
+    EXPECT_EQ(failureTimestamps, (std::vector<uint64_t>{1000, 3000}));
+    EXPECT_EQ(failureValues, (std::vector<double>{1.0, 3.0}));
+
+    // Retrying is idempotent even though the first attempt already unlinked
+    // the source name. Once the durability barrier succeeds, registration and
+    // the disk sidecar can be retired while the pinned reader stays filtered.
+    mgr.setDirectorySyncForTesting(
+        [](const std::string& directory) { return seastar::sync_directory(directory); });
+    co_await mgr.removeTSMFiles({pinned});
+    EXPECT_TRUE(mgr.getSequencedTsmFiles().empty());
+    EXPECT_FALSE(fs::exists("shard_0/tsm/0_1.tombstone"));
+
+    auto afterRetirement = co_await pinned->queryWithTombstones<double>(seriesId, 0, UINT64_MAX);
+    auto [retiredTimestamps, retiredValues] = afterRetirement.getAllData();
+    EXPECT_EQ(retiredTimestamps, (std::vector<uint64_t>{1000, 3000}));
+    EXPECT_EQ(retiredValues, (std::vector<double>{1.0, 3.0}));
+
+    co_await mgr.stop();
+}
+
+TEST_F(TSMFileManagerSeastarTest, RemoveDirectorySyncFailureKeepsTombstoneAndRetries) {
+    testFMRemoveDirectorySyncFailureKeepsTombstoneAndRetries(this).get();
+}
+
 // ---------------------------------------------------------------------------
 // Test: writeMemstore creates a new TSM file from a MemoryStore
 // ---------------------------------------------------------------------------

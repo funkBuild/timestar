@@ -93,6 +93,10 @@ public:
     seastar::future<> flush();
     seastar::future<> close();
     seastar::future<bool> exists() const;
+    // Unlink the sidecar without discarding the in-memory ranges. Compaction
+    // can retire the on-disk generation while readers that already pinned the
+    // TSM still need those ranges to filter their open file descriptor.
+    seastar::future<bool> unlinkFile();
     seastar::future<> remove();
 
     // Add a new tombstone with verification

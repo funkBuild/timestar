@@ -374,7 +374,7 @@ seastar::future<bool> TSMTombstone::exists() const {
     return seastar::file_exists(tombstonePath);
 }
 
-seastar::future<> TSMTombstone::remove() {
+seastar::future<bool> TSMTombstone::unlinkFile() {
     if (isOpen) {
         co_await close();
     }
@@ -383,6 +383,12 @@ seastar::future<> TSMTombstone::remove() {
     if (fileExists) {
         co_await seastar::remove_file(tombstonePath);
     }
+
+    co_return fileExists;
+}
+
+seastar::future<> TSMTombstone::remove() {
+    co_await unlinkFile();
 
     entries.clear();
     seriesRanges.clear();

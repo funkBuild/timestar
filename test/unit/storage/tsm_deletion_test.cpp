@@ -169,6 +169,10 @@ TEST(TSMDeletionTest, ScheduleDeleteUnlinksFile) {
            "the close is deferred to ~TSM() via deferCloseOnDestroy_";
     EXPECT_NE(funcBody.find("deferCloseOnDestroy_"), std::string::npos)
         << "scheduleDelete must mark the file for deferred close (deferCloseOnDestroy_ = true)";
+    EXPECT_EQ(funcBody.find("deleteTombstoneFile"), std::string::npos)
+        << "the source TSM must be durably retired before its tombstone sidecar is removed";
+    EXPECT_EQ(funcBody.find("catch ("), std::string::npos)
+        << "source unlink failures must reach the file manager instead of reporting false success";
 
     // The destructor must perform the deferred close so the fd is not leaked.
     auto dtorStart = src.find("TSM::~TSM()");

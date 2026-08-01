@@ -1215,17 +1215,14 @@ seastar::future<seastar::temporary_buffer<uint8_t>> TSM::readCompressedBlock(con
 }
 
 seastar::future<> TSM::scheduleDelete() {
-    // Delete associated tombstone file first (no-op if none exists)
-    co_await deleteTombstoneFile();
-
     // Delete the physical file using async Seastar I/O.
     // Unix unlink is safe while the fd is open: in-flight DMA reads
-    // continue via the open fd, inode freed when the last fd closes.
-    try {
+    // continue via the open fd, inode freed when the last fd closes. Treat an
+    // already-absent name as success so a failed directory fsync can be
+    // retried without losing the manager's still-open source generation.
+    if (co_await seastar::file_exists(filePath)) {
         co_await seastar::remove_file(filePath);
         timestar::tsm_log.info("TSM file deleted: {}", filePath);
-    } catch (const std::exception& e) {
-        timestar::tsm_log.error("Failed to delete TSM file {}: {}", filePath, e.what());
     }
 
     // Do NOT close the fd here.  Queries snapshot the TSM file list (as

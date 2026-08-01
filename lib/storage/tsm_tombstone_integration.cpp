@@ -284,13 +284,14 @@ seastar::future<double> TSM::estimateTombstoneCoverage() {
     co_return std::min(estimatedDeadBytes / static_cast<double>(fileSize), 1.0);
 }
 
-// Delete tombstone file after successful compaction
-seastar::future<> TSM::deleteTombstoneFile() {
+// Delete the sidecar after successful compaction. Do not reset the in-memory
+// tombstone manager: queries can retain a shared_ptr<TSM> across compaction and
+// continue reading the unlinked TSM through its open descriptor.
+seastar::future<bool> TSM::deleteTombstoneFile() {
     if (tombstones) {
-        co_await tombstones->remove();
-        tombstones.reset();
+        co_return co_await tombstones->unlinkFile();
     }
-    co_return;
+    co_return false;
 }
 
 // Explicit template instantiations for supported types

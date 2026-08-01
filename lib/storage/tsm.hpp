@@ -566,6 +566,8 @@ public:
     // Returns value in [0.0, 1.0] representing estimated dead bytes / file size
     seastar::future<double> estimateTombstoneCoverage();
 
-    // Delete tombstone file after compaction
-    seastar::future<> deleteTombstoneFile();
+    // Delete the sidecar after compaction, retaining its in-memory ranges for
+    // readers that pinned this TSM before it was retired. Returns true when a
+    // sidecar was unlinked.
+    seastar::future<bool> deleteTombstoneFile();
 };
