@@ -609,6 +609,17 @@ per-VShard state machine
 tombstones also coalesce so physical retry/replay does not grow them without
 bound.
 
+Raft snapshot compaction is fenced by the oldest surviving replicated revision
+in the active memory-store generation, after refusing any VShard generation
+still awaiting TSM conversion. Entries at or above that revision remain in the
+replay suffix. If no active point survives, TSM plus durable destructive state
+represents the observed applied prefix, so a delete-only VShard can compact
+without waiting for an artificial later write. Receipt-floor retirement blocked
+by a surviving active point conditionally rotates that generation; normal
+bounded conversion makes the next snapshot sweep eligible. The snapshot
+manifest carries this data/log fence as `Raft snapshot index + 1`, and receivers
+reject a payload whose independently checksummed fence does not match.
+
 The schema path uses a group-0 compare-and-set only when a measurement/field
 is first observed or changed. Normal writes validate against cached schema.
 Field type conflicts are rejected; lexicographic conflict resolution is not

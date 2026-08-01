@@ -735,11 +735,14 @@ hot-series lanes (decision 6).
    (admission at propose, never failure at apply) is a new contract on a hot
    path; a bug here is a stalled state machine. Pinned by dedicated tests and
    the X3 fault layer.
-3. **Snapshot of a live VShard over `shard_N`-era layout.**
-   `createVShardSnapshot` reads flushed TSM only; concurrent tier-0
-   multiplexed extents rely on the Task 4c repartition path. The M5 gate's
-   snapshot-under-concurrent-everything test is the proof; until then M3
-   restricts snapshot points to post-flush barriers.
+3. **Snapshot of a live VShard over `shard_N`-era layout.** The current producer
+   materialises the tombstone-resolved, VShard-pure TSM view, refuses a target
+   with an out-of-order rolled conversion, and retains the log from the active
+   store's oldest surviving replicated revision. A delete-only applied prefix
+   may advance directly; a receipt-retirement barrier behind an active point
+   conditionally rotates that generation and waits for normal conversion. The
+   M5 gate's snapshot-under-concurrent-everything test remains the live proof for
+   compaction, retention, rollover, and new-series races.
 4. **Double-WAL write amplification** (X-open) — cost known and accepted for
    M3; must be measured before the 70% scaling-efficiency claim is finalized.
 5. **Query-semantics parity across the wire.** Every canonical-semantics rule

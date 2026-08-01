@@ -11,7 +11,7 @@
 `41fdc34`, `a58d2a9`, `6a73809`, `81692a4`, `d363348`, `2749027`,
 `1f61f49`, `b2c7d0b`, `872f7e1`, `023d9c3`, `d5f4755`, `7f6d7e8`,
 `7760ebd`, `6557666`, `c8f28c8`, `445f1f0`, `8b8536d`, `6912dfb`,
-`ecb63a5`, `a03fe1d`
+`ecb63a5`, `a03fe1d`, `8ae846c`
 
 **Scope:** The recent VShard/Raft cluster redesign, its production-server
 integration, the public HTTP surface, recovery paths, and the release evidence
@@ -24,12 +24,12 @@ used as evidence that the current server is production-ready.
 
 ## Implementation progress after the review
 
-Forty-two remediation commits are now recorded. Cluster release status
+Forty-three remediation commits are now recorded. Cluster release status
 remains **BLOCKED** because group 0/movement, atomic and retry-safe
 pattern-delete semantics, replicated retention, the large-snapshot path,
-delete-receipt compaction liveness, and rolling wire-format compatibility remain
-open. The four previously stale live release gates now pass on the same
-executable candidate and no longer block release by themselves.
+sustained live receipt-retirement compaction evidence, and rolling wire-format
+compatibility remain open. The four previously stale live release gates now pass
+on the same executable candidate and no longer block release by themselves.
 
 Completed and covered in this pass:
 
@@ -93,10 +93,16 @@ Completed and covered in this pass:
   its exact Raft snapshot boundary, and local recovery reads that small section
   without copying snapshot objects. Modern receipts are bounded to the most
   recent 1,024 operations per VShard and one hour; a retry below the replicated
-  floor is a terminal `409 DELETE_IDEMPOTENCY_EXPIRED`. A snapshot is deferred,
-  and `snapshots_skipped_delete_state` increments, if its flushed data boundary
-  cannot yet carry a receipt retirement. That closes the recovery corruption
-  path but creates the compaction-liveness obligation tracked by CR-FIX-065.
+  floor is a terminal `409 DELETE_IDEMPOTENCY_EXPIRED`. Snapshot production now
+  treats the active store's oldest surviving replicated revision as the exact
+  first-unflushed fence. Delete-only state can therefore compact through the
+  observed applied prefix without inventing a later point. If a receipt-floor
+  advancement is still fenced behind an active write, one conditional
+  memory-store rollover publishes that write through the normal bounded
+  conversion path and a later sweep advances. The payload's data/log fence is
+  then bound to the exact Raft boundary. Commit `8ae846c` resolves the identified
+  implementation liveness defect; CR-FIX-065 retains only its sustained live
+  delete-heavy/journal-reclamation evidence.
   Pattern discovery infrastructure remains internally tested, but the public
   clustered handler rejects every pattern or mixed-pattern batch before
   expansion and proposal: re-expanding after a partial attempt could add a
@@ -410,8 +416,11 @@ fail-stop invariant breach rather than a false success. Commit `6912dfb` proves
 the same operation on three real Engines: a retry by a new leader in a later
 term and another retry after that replica reconstructs the receipt from durable
 journal replay both preserve a write ordered after the original delete.
-CR-FIX-010 remains open for patterns and the external release gate; CR-FIX-065
-tracks sustained compaction progress after receipt retirement.
+Commit `8ae846c` makes that receipt retirement compactable even on delete-only
+VShards: the active store supplies the exact first-unflushed fence, and a
+conditional rollover drains a surviving active write when it is the only
+barrier. CR-FIX-010 remains open for patterns and the external release gate;
+CR-FIX-065 retains the sustained live compaction/reclamation measurement.
 
 ### CR-23 — TSM publication did not fence deletion of its durable source
 
@@ -1038,10 +1047,13 @@ is not completion.
   cross-VShard input; HTTP preflights the exact encoded Raft-entry size and caps
   concurrent VShard proposals at 32. Snapshot production refuses an unsafe
   boundary older than the last receipt-floor advancement and exposes
-  `snapshots_skipped_delete_state`; CR-FIX-065 tracks proof that this safe wait
-  cannot starve compaction. CR-FIX-010 remains open for a replicated/frozen
-  pattern plan and the external multi-process release gate. `445f1f0`,
-  `8b8536d`, `6912dfb`, `ecb63a5`, `a03fe1d`.
+  `snapshots_skipped_delete_state`. `8ae846c` derives an exact boundary from the
+  first surviving active revision, advances delete-only snapshots directly, and
+  conditionally rolls an active write barrier so the next sweep can compact.
+  CR-FIX-065 retains the sustained live workload and journal-reclamation proof.
+  CR-FIX-010 remains open for a replicated/frozen pattern plan and the external
+  multi-process release gate. `445f1f0`, `8b8536d`, `6912dfb`, `ecb63a5`,
+  `a03fe1d`, `8ae846c`.
 - [ ] **CR-FIX-011 — define a self-contained VShard snapshot format.** Owner:
   snapshot/storage. Include catalog/index extract, data objects, tombstone
   objects or a proven materialised-delete boundary, and real content hashes.
@@ -1340,6 +1352,19 @@ is not completion.
   sustained delete/mixed workload proves `snapshots_skipped_delete_state` does
   not grow forever, `snapshots_taken` advances, journal bytes plateau or reclaim,
   and restart cannot re-execute a retired delete over a later write.
+  **Implementation complete in `8ae846c`; live evidence remains.** The producer
+  now observes pending rolled generations and the active store's oldest
+  surviving replicated revision in one storage-core turn. It compacts a
+  delete-only applied prefix directly. If receipt retirement is instead blocked
+  by an active point, it conditionally rotates that exact active generation and
+  waits for the existing bounded WAL-to-TSM conversion, avoiding repeated empty
+  rollovers. The payload fence is promoted to `snapshot index + 1`, preserving
+  the receiver binding while retaining every unflushed suffix entry. Unit
+  regressions prove the first-unflushed boundary, fail-closed missing revisions,
+  delete-only advancement, conditional rollover progress without another client
+  write, compacted-journal restart, terminal expiry of the retired retry, and
+  survival of the later value. A sustained live delete/mixed workload with
+  journal-byte plateau/reclamation is still required before checking this row.
 
 ### 7. Release validation
 
@@ -1745,11 +1770,29 @@ all test processes:                                --smp 1 --memory 1G
 git diff --check:                                           passed
 ```
 
+Receipt-retirement compaction implementation validation for `8ae846c`:
+
+```text
+VShard fence + full replicated-host suites:       25/25 passed
+payload/state-machine/install/WAL compatibility:  27/27 passed
+timestar_unit_test:                    built successfully (-j1)
+timestar_http_server:                  built successfully (-j1)
+all test processes:                           --smp 1 --memory 1G
+compiler temporary directory:                         build/tmp
+git diff --check:                                      passed
+```
+
+This is deterministic implementation and restart coverage, not the sustained
+multi-process delete-heavy measurement required by CR-FIX-065. No live servers
+were started for this validation; the single-job build and repository-local
+temporary directory keep host memory and `/tmp` use bounded.
+
 This closes the known exact-delete retry corruption path and bounds modern
 receipt memory, but not CR-FIX-010 as a whole. Pattern deletes need a replicated
 immutable expansion plan before re-enablement, and the external multi-process
 release gate remains required even though the deterministic RF=3
-leader-failure/replica-restart gate now passes. CR-FIX-065 must also show that
-safe snapshot deferral cannot turn sustained receipt retirement into unbounded
-journal growth. CR-FIX-076 remains an activation blocker: payload v4, command
-tag 5, and the new RPC failure outcome do not establish rolling compatibility.
+leader-failure/replica-restart gate now passes. `8ae846c` removes CR-FIX-065's
+known implementation starvation path; the sustained live workload must still
+show that snapshots keep advancing and journal bytes plateau or reclaim.
+CR-FIX-076 remains an activation blocker: payload v4, command tag 5, and the new
+RPC failure outcome do not establish rolling compatibility.
