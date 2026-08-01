@@ -173,6 +173,32 @@ void ClusterDataPlane::validateCoreTopology(unsigned coreCount, uint16_t replica
 }
 
 seastar::future<> ClusterDataPlane::start(const ClusterConfig& cfg, seastar::sharded<Engine>& engines) {
+    std::exception_ptr startupFailure;
+    try {
+        co_await startImpl(cfg, engines);
+        co_return;
+    } catch (...) {
+        startupFailure = std::current_exception();
+    }
+
+    // startImpl() can fail after shards_.start() and after hundreds of VShard
+    // journals have opened (for example, EMFILE part-way through group
+    // creation).  Letting the exception escape at that point makes
+    // sharded<ShardRaftPlane>'s process-global destructor execute a trap and
+    // replace the useful startup error with SIGILL.  Stop everything that did
+    // start, but preserve the original exception even if cleanup itself has a
+    // secondary failure.
+    try {
+        co_await stop();
+    } catch (const std::exception& e) {
+        timestar::http_log.error("ClusterDataPlane cleanup after failed startup also failed: {}", e.what());
+    } catch (...) {
+        timestar::http_log.error("ClusterDataPlane cleanup after failed startup also failed with an unknown error");
+    }
+    std::rethrow_exception(startupFailure);
+}
+
+seastar::future<> ClusterDataPlane::startImpl(const ClusterConfig& cfg, seastar::sharded<Engine>& engines) {
     // Force the in-flight write budget to resolve (and LOG itself) during startup rather
     // than on the first write, so a mis-set TIMESTAR_CLUSTER_WRITE_INFLIGHT_BYTES is
     // visible in the boot log instead of being inferred from a wall of 503s.

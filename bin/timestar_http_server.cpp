@@ -4,6 +4,7 @@
 #include "config/timestar_config.hpp"
 #include "core/engine.hpp"
 #include "core/placement_table.hpp"
+#include "core/vshard.hpp"
 #include "http/content_negotiation.hpp"
 #include "http/http_auth.hpp"
 #include "http/http_delete_handler.hpp"
@@ -24,6 +25,7 @@
 #include "utils/stop_signal.hpp"
 
 #include <atomic>
+#include <cerrno>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -42,6 +44,7 @@
 #include <seastar/util/backtrace.hh>
 #include <seastar/util/defer.hh>
 #include <sstream>
+#include <sys/resource.h>
 #include <vector>
 
 using namespace seastar;
@@ -64,6 +67,41 @@ bool g_clusterPartitioned = false;
 // "degraded". One failure can be transient; a run of them means the tier is
 // wedged and its file count is growing without bound.
 static constexpr uint64_t HEALTH_COMPACTION_FAILURE_THRESHOLD = 5;
+
+// The default journal layout holds one active descriptor per local VShard.
+// At RF=N that is all 4,096 groups, in addition to Engine, RPC, HTTP and
+// transient compaction descriptors.  Keep a full second VShard-count as
+// headroom so the process does not boot at the edge and fail on its first
+// rollover or connection burst.
+static constexpr rlim_t REPLICATED_CLUSTER_MIN_OPEN_FILES = 2 * timestar::VIRTUAL_SHARD_COUNT;
+
+static bool ensureReplicatedClusterOpenFileLimit() {
+    struct rlimit limit {};
+    if (::getrlimit(RLIMIT_NOFILE, &limit) != 0) {
+        timestar::http_log.error("Cannot inspect RLIMIT_NOFILE for replicated startup: {}", std::strerror(errno));
+        return false;
+    }
+    if (limit.rlim_cur >= REPLICATED_CLUSTER_MIN_OPEN_FILES)
+        return true;
+    if (limit.rlim_max < REPLICATED_CLUSTER_MIN_OPEN_FILES) {
+        timestar::http_log.error(
+            "Replicated startup needs at least {} open files (4,096 active VShard journals plus runtime headroom), "
+            "but RLIMIT_NOFILE is soft={} hard={}. Raise the service's LimitNOFILE/ulimit before starting TimeStar.",
+            REPLICATED_CLUSTER_MIN_OPEN_FILES, limit.rlim_cur, limit.rlim_max);
+        return false;
+    }
+
+    const rlim_t previous = limit.rlim_cur;
+    limit.rlim_cur = REPLICATED_CLUSTER_MIN_OPEN_FILES;
+    if (::setrlimit(RLIMIT_NOFILE, &limit) != 0) {
+        timestar::http_log.error("Cannot raise RLIMIT_NOFILE from {} to {} for replicated startup: {}", previous,
+                                REPLICATED_CLUSTER_MIN_OPEN_FILES, std::strerror(errno));
+        return false;
+    }
+    timestar::http_log.info("Raised RLIMIT_NOFILE soft limit from {} to {} for replicated VShard journals", previous,
+                            REPLICATED_CLUSTER_MIN_OPEN_FILES);
+    return true;
+}
 
 // Per-shard stream handler pointer, used to call stop() during shutdown.
 static thread_local timestar::http::HttpStreamHandler* g_streamHandler = nullptr;
@@ -493,6 +531,14 @@ int main(int argc, char** argv) {
                                             cc.peers.size());
                 else
                     timestar::http_log.info("Cluster mode disabled (single node)");
+
+                // Do this before the data directory, Engine or Raft plane is
+                // opened.  A low limit previously failed around the thousandth
+                // VShard journal, then partial-startup cleanup trapped and made
+                // the process look like an illegal-instruction/CPU failure.
+                if (cc.enabled && cc.partitioned && cc.replication_factor > 1 &&
+                    !ensureReplicatedClusterOpenFileLimit())
+                    return 1;
             }
 
             // Take an exclusive lock on the data directory before ANYTHING
@@ -560,11 +606,19 @@ int main(int argc, char** argv) {
             timestar::http_log.info("Initializing Engine on all shards...");
             g_engine.start(storageLayout).get();
 
-            // Scope guard: Seastar's sharded<> asserts in its destructor if
-            // stop() was not called after a successful start().  If any step
-            // below throws, we must stop the engine before the exception
-            // propagates.  The guard is disarmed once startup succeeds.
+            // Lifecycle guard: Seastar's sharded<> asserts in its destructor if
+            // stop() was not called after a successful start(). Keep this armed
+            // through data-plane and HTTP startup, the serving loop, and normal
+            // shutdown: Engine init was not the last operation that can throw.
             auto engineGuard = seastar::defer([&] {
+                if (g_clusterPartitioned) {
+                    try {
+                        g_clusterDataPlane.stop().get();
+                    } catch (const std::exception& e) {
+                        timestar::http_log.error("Data-plane cleanup after server failure also failed: {}", e.what());
+                    }
+                    g_clusterPartitioned = false;
+                }
                 g_engine.invoke_on_all([](Engine& engine) { return engine.stop(); }).get();
                 g_engine.stop().get();
             });
@@ -642,10 +696,6 @@ int main(int argc, char** argv) {
                 timestar::http_log.error("Backtrace:\n{}", current_backtrace());
                 throw;
             }
-
-            // Engine init succeeded -- disarm the scope guard so normal shutdown
-            // handles cleanup (the doShutdown lambda below).
-            engineGuard.cancel();
 
             // Start background tasks on all shards for WAL->TSM conversion
             timestar::http_log.info("Starting background tasks on all shards...");
@@ -776,9 +826,14 @@ int main(int argc, char** argv) {
                 server->listen(seastar::socket_address(seastar::net::inet_address("0.0.0.0"), port), httpLo).get();
             } catch (const std::exception& e) {
                 timestar::http_log.error("Failed to start HTTP server: {}", e.what());
-                // Clean up engine before exiting
-                g_engine.invoke_on_all([](Engine& engine) { return engine.stop(); }).get();
-                g_engine.stop().get();
+                // http_server_control also owns a sharded service. Stop any
+                // instances that start() created before the later setup step
+                // failed; the lifecycle guard above handles data plane + Engine.
+                try {
+                    server->stop().get();
+                } catch (const std::exception& cleanupError) {
+                    timestar::http_log.error("HTTP cleanup after failed startup also failed: {}", cleanupError.what());
+                }
                 throw;
             }
 
@@ -813,8 +868,10 @@ int main(int argc, char** argv) {
                 });
                 // Stop the data plane (peer clients + RPC server) BEFORE the engine,
                 // so no forwarded write/query can arrive after the Engine is gone.
-                if (g_clusterPartitioned)
+                if (g_clusterPartitioned) {
                     co_await g_clusterDataPlane.stop();
+                    g_clusterPartitioned = false;
+                }
                 co_await g_engine.invoke_on_all([](Engine& engine) { return engine.stop(); });
                 co_await g_engine.stop();
             };
@@ -827,6 +884,9 @@ int main(int argc, char** argv) {
                     doShutdown().get();
                 }
                 timestar::http_log.info("Shutdown complete");
+                // Normal shutdown stopped every guarded sharded service. Only
+                // now is it safe to disarm failure-path cleanup.
+                engineGuard.cancel();
             } catch (const seastar::timed_out_error&) {
                 // with_timeout does NOT cancel the doShutdown() coroutine — it
                 // continues running in the background holding references to

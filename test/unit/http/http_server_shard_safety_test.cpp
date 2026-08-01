@@ -272,10 +272,10 @@ TEST_F(HttpServerShardSafetyTest, NoDoubleOwnershipOfInlineHandlers) {
 //
 // After g_engine.start() succeeds, Seastar's sharded<> destructor will
 // assert if stop() was never called.  If Engine::init() or any subsequent
-// initialization step throws, we must call g_engine.stop() before the
-// exception propagates.  We verify that a scope guard (seastar::defer) is
-// present between g_engine.start() and the try block, and that it is
-// disarmed (cancel()) after successful init.
+// initialization or serving-lifecycle step throws, we must stop the data plane
+// and Engine before the exception propagates. We verify that a scope guard
+// (seastar::defer) is present after g_engine.start(), covers both services, and
+// remains armed until normal shutdown has completed.
 // ---------------------------------------------------------------------------
 TEST_F(HttpServerShardSafetyTest, EngineStopGuardOnInitFailure) {
     std::string mainBody = extractFunctionBody("int main(");
@@ -295,8 +295,10 @@ TEST_F(HttpServerShardSafetyTest, EngineStopGuardOnInitFailure) {
 
     // The guard must call g_engine.stop() inside its lambda
     if (deferPos != std::string::npos) {
-        // Find the closing of the defer lambda (next semicolon after the lambda)
-        auto guardEnd = mainBody.find(';', deferPos);
+        // Include the first complete call expression in the guard. The cleanup
+        // now stops the data plane before the Engine, so the first bare
+        // semicolon belongs to that inner call and is too early.
+        auto guardEnd = mainBody.find("});", deferPos);
         if (guardEnd != std::string::npos) {
             auto guardBody = mainBody.substr(deferPos, guardEnd - deferPos);
             EXPECT_NE(guardBody.find("g_engine"), std::string::npos)
@@ -304,8 +306,44 @@ TEST_F(HttpServerShardSafetyTest, EngineStopGuardOnInitFailure) {
         }
     }
 
-    // The guard must be disarmed after successful init
-    EXPECT_NE(mainBody.find(".cancel()"), std::string::npos)
-        << "The engine scope guard must be disarmed via .cancel() after "
-        << "successful initialization to avoid double-stop during normal shutdown.";
+    // The guard must cover the data plane as well as the Engine. A data-plane
+    // start or later HTTP bind failure otherwise leaves sharded<ShardRaftPlane>
+    // live and converts the useful startup exception into SIGILL at process exit.
+    if (deferPos != std::string::npos) {
+        auto guardEnd = mainBody.find("});", deferPos);
+        ASSERT_NE(guardEnd, std::string::npos);
+        auto guardBody = mainBody.substr(deferPos, guardEnd - deferPos);
+        EXPECT_NE(guardBody.find("g_clusterDataPlane.stop()"), std::string::npos)
+            << "The startup lifecycle guard must stop a started ClusterDataPlane.";
+    }
+
+    // Do not disarm after Engine init: data-plane startup, HTTP startup, and the
+    // serving loop can still throw. It is safe only after doShutdown completed.
+    auto cancelPos = mainBody.find("engineGuard.cancel()");
+    auto shutdownPos = mainBody.find("doShutdown().get()");
+    ASSERT_NE(cancelPos, std::string::npos);
+    ASSERT_NE(shutdownPos, std::string::npos);
+    EXPECT_GT(cancelPos, shutdownPos)
+        << "The lifecycle guard must remain armed until normal shutdown has stopped every sharded service.";
+}
+
+// A replicated node opens one persistent journal descriptor per VShard. A low
+// service limit must be raised (or rejected) before any storage service starts;
+// discovering it part-way through ClusterDataPlane::start is both slow and
+// exception-safety-hostile.
+TEST_F(HttpServerShardSafetyTest, ReplicatedOpenFileLimitIsResolvedBeforeEngineStartup) {
+    std::string mainBody = extractFunctionBody("int main(");
+    ASSERT_FALSE(mainBody.empty()) << "Could not extract main function body";
+
+    auto limitPos = mainBody.find("ensureReplicatedClusterOpenFileLimit()");
+    auto enginePos = mainBody.find("g_engine.start(");
+    ASSERT_NE(limitPos, std::string::npos);
+    ASSERT_NE(enginePos, std::string::npos);
+    EXPECT_LT(limitPos, enginePos)
+        << "RLIMIT_NOFILE must be resolved before Engine/Raft resources are opened.";
+
+    EXPECT_NE(sourceCode.find("getrlimit(RLIMIT_NOFILE"), std::string::npos);
+    EXPECT_NE(sourceCode.find("setrlimit(RLIMIT_NOFILE"), std::string::npos);
+    EXPECT_NE(sourceCode.find("2 * timestar::VIRTUAL_SHARD_COUNT"), std::string::npos)
+        << "The minimum must scale from the canonical VShard count and retain runtime headroom.";
 }

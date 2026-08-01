@@ -331,6 +331,13 @@ public:
     seastar::future<bool> proposeBatch(data::WriteBatch batch) override;
 
 private:
+    // The implementation is split from start() so the public entry point can
+    // unwind a partially-started sharded plane before rethrowing.  Seastar's
+    // sharded<> destructor deliberately traps when start() succeeded but
+    // stop() was skipped, so exception safety here is part of the startup
+    // contract rather than optional tidiness.
+    seastar::future<> startImpl(const ClusterConfig& cfg, seastar::sharded<Engine>& engines);
+
     // RF=3 leader read: fan out per-VShard-leader (see .cpp).
     seastar::future<QueryResponse> queryReplicated(QueryRequest request);
     // vshard -> current leader, gathered from every shard (groups live across cores).
