@@ -4,9 +4,12 @@
 #include "tsm_file_manager.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <optional>
+#include <seastar/core/abort_source.hh>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/gate.hh>
 #include <seastar/core/shared_ptr.hh>
@@ -57,11 +60,17 @@ private:
     uint32_t currentWalSequenceNumber = 0;
     bool walSequenceInitialized_ = false;
     std::vector<seastar::shared_ptr<MemoryStore>> memoryStores;
+    // Stores whose TSM is already query-visible but whose source WAL has not
+    // crossed its unlink directory barrier. They must not remain hidden from
+    // retained-memory admission while a background retry owns their contents.
+    std::vector<seastar::shared_ptr<MemoryStore>> walRetirementStores_;
     TSMFileManager* tsmFileManager;
     std::function<seastar::future<>(const std::string&)> directorySync_;
     seastar::gate _backgroundGate;               // Tracks in-flight background TSM conversions
     seastar::semaphore compactionSemaphore{1};   // Only allow 1 rollover at a time
     seastar::semaphore _conversionSemaphore{1};  // Serialize background TSM conversions
+    std::optional<seastar::abort_source> conversionRetryAbort_;
+    std::chrono::milliseconds conversionRetryDelay_{std::chrono::seconds(30)};
     // Backlog at which the burst is considered unabsorbed and logged. Rollover
     // does NOT block here -- see rolloverMemoryStore(). Admission control lives
     // at the request edge via isIngestBacklogged().
@@ -81,12 +90,15 @@ private:
     // operation is idempotent across an unlink-success/directory-sync-failure
     // retry and does not return until the removal is directory-durable.
     seastar::future<> removeRecoveredWal(const std::string& path);
+    seastar::future<> runBackgroundConversion(seastar::shared_ptr<MemoryStore> store);
+    seastar::future<> retryConversionUntilSuccess(seastar::shared_ptr<MemoryStore> store);
 
 public:
     WALFileManager(timestar::StorageLayout layout, unsigned shard);
     void setDirectorySyncForTesting(std::function<seastar::future<>(const std::string&)> sync) {
         directorySync_ = std::move(sync);
     }
+    void setConversionRetryDelayForTesting(std::chrono::milliseconds delay) { conversionRetryDelay_ = delay; }
 
     // True while any rolled-over store is still awaiting TSM conversion.
     // Drives compaction's WAL-first priority.
@@ -121,11 +133,10 @@ public:
     // unflushed remainder of V is in the active store, i.e. a contiguous SUFFIX of V's
     // revisions -- while letting the other 1364 groups compact.
     //
-    // INHERITED HOLE, unchanged and called out so it is not mistaken for a new one:
-    // a store whose conversion fails twice is ERASED from this vector with its data
-    // still only in its WAL file on disk. Both predicates then read "nothing pending"
-    // for it. That is pre-existing (hasPendingConversions has always had it) and is
-    // tracked with the conversion-failure path, not here.
+    // A failed conversion remains in this vector and is retried under the
+    // background gate until success or shutdown. This keeps its data queryable
+    // and keeps both pending predicates conservative; request-edge admission at
+    // kIngestRejectMemoryStores bounds the retained-memory cost.
     bool hasPendingConversionsForVShard(uint16_t vshard) const {
         return pendingConversionForVShard(memoryStores, vshard);
     }
@@ -144,10 +155,11 @@ public:
 
     // True once the retained-store backlog reaches the rejection ceiling.
     // Consulted at the request edge to shed load without blocking.
-    bool isIngestBacklogged() const { return memoryStores.size() >= kIngestRejectMemoryStores; }
+    bool isIngestBacklogged() const { return retainedMemoryStoreCount() >= kIngestRejectMemoryStores; }
 
-    // Stores currently retained (including the active one), for metrics.
-    size_t retainedMemoryStoreCount() const { return memoryStores.size(); }
+    // Stores currently retained (including the active store and published
+    // stores awaiting WAL retirement), for metrics and admission control.
+    size_t retainedMemoryStoreCount() const { return memoryStores.size() + walRetirementStores_.size(); }
 
     seastar::future<> init(Engine& engine, TSMFileManager& _tsmFileManager);
     template <class T>

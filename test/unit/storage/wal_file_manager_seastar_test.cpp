@@ -19,6 +19,7 @@
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/shared_ptr.hh>
+#include <seastar/core/sleep.hh>
 #include <seastar/core/thread.hh>
 #include <string>
 #include <vector>
@@ -125,6 +126,134 @@ TEST_F(WALFileManagerSeastarTest, RecoveryRemovalDirectorySyncFailureFailsStartu
         EXPECT_EQ(syncCalls, 1u);
         EXPECT_FALSE(fs::exists(walPath));
         EXPECT_EQ(tsmManager.getSequencedTsmFiles().size(), 1u);
+
+        walManager.close().get();
+        tsmManager.stop().get();
+    })
+        .join()
+        .get();
+}
+
+// Repeated conversion failures must never evict the only live in-memory copy.
+// The retry loop keeps the store visible to queries and pending-conversion
+// accounting until a later attempt publishes it successfully.
+TEST_F(WALFileManagerSeastarTest, RepeatedConversionFailuresRetainAndEventuallyPublishStore) {
+    seastar::thread([] {
+        const unsigned shard = seastar::this_shard_id();
+        const timestar::StorageLayout layout(".");
+        fs::create_directories(layout.tsmDir(shard));
+
+        Engine engine(layout);
+        TSMFileManager tsmManager(layout, shard);
+        tsmManager.init().get();
+        WALFileManager walManager(layout, shard);
+        walManager.setConversionRetryDelayForTesting(std::chrono::milliseconds(1));
+        walManager.init(engine, tsmManager).get();
+
+        bool allowPublication = false;
+        size_t publicationAttempts = 0;
+        tsmManager.setDirectorySyncForTesting([&](const std::string& directory) {
+            ++publicationAttempts;
+            if (!allowPublication) {
+                return seastar::make_exception_future<>(
+                    std::runtime_error("injected repeated TSM publication failure"));
+            }
+            return seastar::sync_directory(directory);
+        });
+
+        TimeStarInsert<double> insert("wal_conversion", "retained_retry");
+        insert.addValue(1000, 42.0);
+        const auto seriesId = insert.seriesId128();
+        walManager.insert(insert).get();
+        walManager.rolloverMemoryStore().get();
+
+        for (size_t i = 0; i < 2000 && publicationAttempts < 3; ++i) {
+            seastar::sleep(std::chrono::milliseconds(1)).get();
+        }
+        EXPECT_GE(publicationAttempts, 3u) << "conversion retries stopped after the old two-attempt limit";
+        EXPECT_EQ(walManager.retainedMemoryStoreCount(), 2u)
+            << "failed retiring store must remain beside the active store";
+        EXPECT_TRUE(walManager.hasPendingConversions());
+        EXPECT_TRUE(walManager.hasPendingConversionsForVShard(timestar::virtualShard(seriesId)));
+
+        auto matches = walManager.queryAllMemoryStores<double>(seriesId);
+        EXPECT_EQ(matches.size(), 1u);
+        if (!matches.empty()) {
+            EXPECT_EQ(matches.front().series->timestamps, (std::vector<uint64_t>{1000}));
+            EXPECT_EQ(matches.front().series->values, (std::vector<double>{42.0}));
+        }
+
+        allowPublication = true;
+        for (size_t i = 0; i < 2000 && walManager.retainedMemoryStoreCount() != 1; ++i) {
+            seastar::sleep(std::chrono::milliseconds(1)).get();
+        }
+        EXPECT_EQ(walManager.retainedMemoryStoreCount(), 1u);
+        EXPECT_FALSE(walManager.hasPendingConversions());
+        EXPECT_EQ(tsmManager.getSequencedTsmFiles().size(), 1u);
+
+        walManager.close().get();
+        tsmManager.stop().get();
+    })
+        .join()
+        .get();
+}
+
+// Publication and source retirement are separate durability boundaries. Once
+// the TSM is visible, the old store leaves memory queries to prevent duplicate
+// results, but its still-resident contents must remain admission-accounted
+// while WAL unlink durability retries.
+TEST_F(WALFileManagerSeastarTest, RepeatedWalRetirementFailuresRemainAdmissionAccounted) {
+    seastar::thread([] {
+        const unsigned shard = seastar::this_shard_id();
+        const timestar::StorageLayout layout(".");
+        fs::create_directories(layout.tsmDir(shard));
+
+        Engine engine(layout);
+        TSMFileManager tsmManager(layout, shard);
+        tsmManager.init().get();
+        WALFileManager walManager(layout, shard);
+        walManager.setConversionRetryDelayForTesting(std::chrono::milliseconds(1));
+        walManager.init(engine, tsmManager).get();
+
+        auto retiringStore = walManager.getMemoryStores().front();
+        auto* retiringWal = retiringStore->getWAL();
+        ASSERT_NE(retiringWal, nullptr);
+
+        bool allowRetirement = false;
+        size_t retirementAttempts = 0;
+        retiringWal->setDirectorySyncForTesting([&](const std::string& directory) {
+            ++retirementAttempts;
+            if (!allowRetirement) {
+                return seastar::make_exception_future<>(
+                    std::runtime_error("injected repeated WAL retirement failure"));
+            }
+            return seastar::sync_directory(directory);
+        });
+
+        TimeStarInsert<double> insert("wal_retirement", "accounted_retry");
+        insert.addValue(1000, 7.0);
+        walManager.insert(insert).get();
+        walManager.rolloverMemoryStore().get();
+
+        for (size_t i = 0; i < 2000 && retirementAttempts < 3; ++i) {
+            seastar::sleep(std::chrono::milliseconds(1)).get();
+        }
+        EXPECT_GE(retirementAttempts, 3u);
+        EXPECT_EQ(tsmManager.getSequencedTsmFiles().size(), 1u);
+        EXPECT_FALSE(walManager.hasPendingConversions())
+            << "published data is no longer pending conversion";
+        EXPECT_EQ(walManager.getMemoryStores().size(), 1u)
+            << "published store must leave memory queries";
+        EXPECT_EQ(walManager.retainedMemoryStoreCount(), 2u)
+            << "published store must remain in retained-memory admission";
+
+        allowRetirement = true;
+        for (size_t i = 0; i < 2000 && walManager.retainedMemoryStoreCount() != 1; ++i) {
+            seastar::sleep(std::chrono::milliseconds(1)).get();
+        }
+        EXPECT_EQ(walManager.retainedMemoryStoreCount(), 1u);
+        EXPECT_EQ(tsmManager.getSequencedTsmFiles().size(), 1u)
+            << "WAL retirement retries must not republish the TSM";
 
         walManager.close().get();
         tsmManager.stop().get();

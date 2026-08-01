@@ -50,9 +50,59 @@ seastar::future<> WALFileManager::removeRecoveredWal(const std::string& path) {
     co_await directorySync_(parent.empty() ? "." : parent.string());
 }
 
+seastar::future<> WALFileManager::runBackgroundConversion(seastar::shared_ptr<MemoryStore> store) {
+    auto conversionUnits = co_await seastar::get_units(_conversionSemaphore, 1);
+    co_await store->close();
+
+    // Run the CPU-heavy encode + multi-MB DMA write in the dedicated FLUSH
+    // scheduling group. Foreground inserts still preempt it, while the WAL
+    // ownership handoff cannot queue behind deep tier compaction.
+    if (tsmFileManager != nullptr && tsmFileManager->hasFlushGroup()) {
+        co_await seastar::with_scheduling_group(tsmFileManager->flushGroup(),
+                                                [this, store] { return convertWalToTsm(store); });
+    } else {
+        co_await convertWalToTsm(store);
+    }
+}
+
+seastar::future<> WALFileManager::retryConversionUntilSuccess(seastar::shared_ptr<MemoryStore> store) {
+    uint64_t attempt = 0;
+    while (conversionRetryAbort_.has_value() && !conversionRetryAbort_->abort_requested()) {
+        ++attempt;
+        if (attempt > 1) {
+            try {
+                co_await seastar::sleep_abortable(conversionRetryDelay_, *conversionRetryAbort_);
+            } catch (const seastar::sleep_aborted&) {
+                co_return;
+            }
+        }
+
+        try {
+            if (attempt > 1) {
+                timestar::wal_log.info("[BG_CONVERT] Retrying TSM conversion for store {} on shard {} (attempt {})",
+                                       store->sequenceNumber, shardId, attempt);
+            }
+            co_await runBackgroundConversion(store);
+            co_return;
+        } catch (const std::exception& e) {
+            // Never discard ownership on failure. Before publication the store
+            // remains in memory queries and pending-conversion accounting;
+            // after publication it remains in the admission-counted retirement
+            // list until the WAL directory barrier succeeds.
+            timestar::wal_log.error(
+                "[BG_CONVERT] TSM conversion attempt {} failed for store {} on shard {}: {}. "
+                "Data remains queryable; retrying in {}ms.",
+                attempt, store->sequenceNumber, shardId, e.what(), conversionRetryDelay_.count());
+        }
+    }
+}
+
 seastar::future<> WALFileManager::init(Engine& engine, TSMFileManager& _tsmFileManager) {
     timestar::wal_log.info("WALFileManager::init starting for shard {}", shardId);
     tsmFileManager = &_tsmFileManager;
+    if (!conversionRetryAbort_.has_value() || conversionRetryAbort_->abort_requested()) {
+        conversionRetryAbort_.emplace();
+    }
 
     // Size the conversion pool from config. It starts at 1 (header default);
     // adjust to match, using the same signal/consume resize as WAL::_encode_sem
@@ -441,74 +491,25 @@ seastar::future<> WALFileManager::rolloverMemoryStore() {
 
     // Launch TSM conversion as a background task so writes are not blocked.
     // The gate tracks the in-flight conversion; close() drains it at shutdown.
-    // The conversion semaphore serializes conversions to prevent compaction races
-    // (writeMemstore triggers inline compaction which is not reentrant).
+    // The configured conversion semaphore bounds concurrent TSM encodes and
+    // publications; tier compaction runs independently on its background loop.
     if (!previousStore->isEmpty()) {
         auto sid = shardId;
         auto seqNum = previousStore->sequenceNumber;
-        // Use try_with_gate to safely track the background conversion.
-        // This avoids manual enter/leave which can leak on synchronous exceptions.
+        // One gate holder spans the first attempt and every retry, eliminating
+        // a shutdown race between a failed attempt and scheduling its successor.
         (void)seastar::try_with_gate(_backgroundGate, [this, store = previousStore] {
-            return seastar::get_units(_conversionSemaphore, 1).then([this, store](auto convUnits) {
-                return store->close().then([this, store, units = std::move(convUnits)]() mutable {
-                    // Run the CPU-heavy encode + multi-MB DMA write in the
-                    // dedicated FLUSH scheduling group -- not the compaction
-                    // group. Both are below `main` so foreground inserts still
-                    // preempt, but flush sits well above compaction: this work
-                    // is what unlinks the WAL file and drains the ingest
-                    // backlog, so it must not queue behind a deep tier merge.
-                    if (tsmFileManager != nullptr && tsmFileManager->hasFlushGroup()) {
-                        return seastar::with_scheduling_group(tsmFileManager->flushGroup(),
-                                                              [this, store] { return convertWalToTsm(store); })
-                            .finally([units = std::move(units)] {});
-                    }
-                    return convertWalToTsm(store).finally([units = std::move(units)] {});
-                });
-            });
-        }).handle_exception([this, store = previousStore, sid, seqNum](auto ep) {
+            return retryConversionUntilSuccess(store);
+        }).handle_exception([sid, seqNum](auto ep) {
             try {
                 std::rethrow_exception(ep);
             } catch (const seastar::gate_closed_exception&) {
                 // Shutdown in progress, ignore
             } catch (const std::exception& e) {
                 timestar::wal_log.error(
-                    "[BG_CONVERT] Background TSM conversion failed for store {} on shard {}: {}. "
-                    "Data remains queryable from memory; will retry in 30s. "
-                    "WAL on disk will be replayed on restart if retry also fails.",
+                    "[BG_CONVERT] Retry loop terminated unexpectedly for store {} on shard {}: {}. "
+                    "Its data remains queryable and its retained store will be retried during shutdown.",
                     seqNum, sid, e.what());
-                // Schedule a single retry after a delay to avoid permanent memory bloat.
-                (void)seastar::try_with_gate(_backgroundGate, [this, store, sid, seqNum] {
-                    return seastar::sleep(std::chrono::seconds(30)).then([this, store, sid, seqNum] {
-                        return seastar::get_units(_conversionSemaphore, 1)
-                            .then([this, store, sid, seqNum](auto retryUnits) {
-                                timestar::wal_log.info("[BG_CONVERT] Retrying TSM conversion for store {} on shard {}",
-                                                       seqNum, sid);
-                                return store->close().then([this, store, units = std::move(retryUnits)]() mutable {
-                                    return convertWalToTsm(store).finally([units = std::move(units)] {});
-                                });
-                            });
-                    });
-                }).handle_exception([this, store, sid, seqNum](auto ep2) {
-                    try {
-                        std::rethrow_exception(ep2);
-                    } catch (const seastar::gate_closed_exception&) {
-                    } catch (const std::exception& e2) {
-                        timestar::wal_log.error(
-                            "[BG_CONVERT] Retry also failed for store {} on shard {}: {}. "
-                            "WAL preserved on disk for recovery on next startup.",
-                            seqNum, sid, e2.what());
-                        // Remove the store from memoryStores to prevent unbounded
-                        // memory growth. The WAL file remains on disk for crash recovery.
-                        auto it = std::find(memoryStores.begin(), memoryStores.end(), store);
-                        if (it != memoryStores.end()) {
-                            memoryStores.erase(it);
-                            timestar::wal_log.warn(
-                                "[BG_CONVERT] Removed store {} from memoryStores on shard {} "
-                                "to prevent memory leak after conversion failure",
-                                seqNum, sid);
-                        }
-                    }
-                });
             }
         });
     } else {
@@ -640,10 +641,17 @@ seastar::future<> WALFileManager::convertWalToTsm(seastar::shared_ptr<MemoryStor
 
     // Remove from memoryStores immediately after successful TSM write,
     // BEFORE the removeWAL yield point, to prevent duplicate query results.
-    // The shared_ptr `store` keeps data alive for the removeWAL call below.
+    // A live store then moves to the non-query retirement list so its retained
+    // memory remains admission-accounted until the WAL directory barrier
+    // succeeds. Recovery stores do not own a live WAL and stay caller-owned.
+    const bool ownsLiveWal = store->getWAL() != nullptr;
     auto it = std::find(memoryStores.begin(), memoryStores.end(), store);
     if (it != memoryStores.end()) {
         memoryStores.erase(it);
+        if (ownsLiveWal &&
+            std::find(walRetirementStores_.begin(), walRetirementStores_.end(), store) == walRetirementStores_.end()) {
+            walRetirementStores_.push_back(store);
+        }
     }
 
     // Capture the WAL's on-disk size BEFORE unlinking it. WAL->TSM is a format
@@ -652,9 +660,12 @@ seastar::future<> WALFileManager::convertWalToTsm(seastar::shared_ptr<MemoryStor
     // re-packs data that is already in TSM form. That asymmetry is what
     // justifies prioritising conversion over merges, and this is the number
     // that demonstrates it.
-    const bool ownsLiveWal = store->getWAL() != nullptr;
     const uint64_t walBytes = store->walSizeOnDisk();
     co_await store->removeWAL();
+    auto retirementIt = std::find(walRetirementStores_.begin(), walRetirementStores_.end(), store);
+    if (retirementIt != walRetirementStores_.end()) {
+        walRetirementStores_.erase(retirementIt);
+    }
     const double reclaimedPct =
         walBytes > 0 ? 100.0 * (1.0 - static_cast<double>(tsmBytesWritten) / static_cast<double>(walBytes)) : 0.0;
     if (ownsLiveWal) {
@@ -671,6 +682,13 @@ seastar::future<> WALFileManager::convertWalToTsm(seastar::shared_ptr<MemoryStor
 seastar::future<> WALFileManager::close() {
     timestar::wal_log.info("[WAL_CLOSE] Starting WAL file manager close on shard {}", shardId);
 
+    // Wake any retained-store retry loops before draining their gate. A retry
+    // currently inside conversion is allowed to finish; one sleeping for the
+    // next attempt exits immediately so shutdown never waits out 30 seconds.
+    if (conversionRetryAbort_.has_value() && !conversionRetryAbort_->abort_requested()) {
+        conversionRetryAbort_->request_abort();
+    }
+
     // Drain all in-flight background TSM conversions before closing.
     // Guard against double-close (e.g., seastar::sharded<Engine> calling stop() twice).
     if (!_backgroundGate.is_closed()) {
@@ -678,6 +696,24 @@ seastar::future<> WALFileManager::close() {
                                _backgroundGate.get_count(), shardId);
         co_await _backgroundGate.close();
         timestar::wal_log.info("[WAL_CLOSE] Background TSM conversions drained on shard {}", shardId);
+    }
+
+    // A store can already be query-visible from TSM while its WAL unlink is
+    // waiting for a successful directory barrier. Retry those lightweight,
+    // idempotent retirements once during shutdown; a failure leaves the WAL on
+    // disk (or conservatively assumes it may reappear after a crash).
+    auto retirementSnapshot = walRetirementStores_;
+    for (auto& store : retirementSnapshot) {
+        try {
+            timestar::wal_log.info("[WAL_CLOSE] Retrying WAL retirement for published store {} on shard {}",
+                                   store->sequenceNumber, shardId);
+            co_await convertWalToTsm(store);
+        } catch (const std::exception& e) {
+            timestar::wal_log.error(
+                "[WAL_CLOSE] Failed to retire WAL for published store {} on shard {}: {} "
+                "(published TSM remains authoritative; WAL preserved for recovery)",
+                store->sequenceNumber, shardId, e.what());
+        }
     }
 
     // Inline conversion of remaining stores.  These run sequentially with
@@ -723,6 +759,7 @@ seastar::future<> WALFileManager::close() {
     }
 
     memoryStores.clear();
+    walRetirementStores_.clear();
     timestar::wal_log.info("[WAL_CLOSE] WAL file manager closed on shard {}", shardId);
 }
 
