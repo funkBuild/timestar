@@ -14,6 +14,7 @@
 #include "../raft/raft_driver.hpp"       // RaftTransport
 #include "../raft/raft_rpc_transport.hpp"
 #include "engine_local_store.hpp"
+#include "group0_host.hpp"
 #include "replicated_data_plane.hpp"
 #include "write_admission.hpp"
 
@@ -72,6 +73,8 @@ namespace timestar::cluster {
 // distinction is what lets a later ADR-0004 consolidation map several VShards onto one
 // group without every routing site being rewritten (and, worse, some of them missed).
 inline unsigned shardForGroup(uint16_t groupId) {
+    if (groupId == kControlRaftGroupId)
+        return 0;
     return timestar::assignCore(timestar::VShardId{groupId}, seastar::smp::count);
 }
 
@@ -140,6 +143,9 @@ public:
         queryStore_ = std::make_unique<data::LeaderFilteredNodeStore>(
             *store_, self, [this](std::vector<uint16_t> vshards) { return resolveLeaders(std::move(vshards)); });
         transport_ = std::make_unique<raft::RaftRpcTransport>();
+        if (seastar::this_shard_id() == 0)
+            group0_ = std::make_unique<Group0Host>(*transport_, self, std::filesystem::path(journalRoot),
+                                                   journalIdentity, tick);
         // This shard's OWN data-plane transport: its listener on the node's data-plane
         // port and its own peer clients. Every remote leader forward this shard makes
         // now leaves from this core; nothing hops to shard 0.
@@ -349,7 +355,11 @@ public:
     // Decode on THIS shard and hand to the local group registry.
     seastar::future<> deliverDecoded(const char* bytes, size_t len) {
         auto env = raft::decodeEnvelope(std::string(bytes, len));
-        if (!env || !plane_)
+        if (!env)
+            return seastar::make_ready_future<>();
+        if (env->groupId == kControlRaftGroupId)
+            return group0_ ? group0_->deliver(std::move(*env)) : seastar::make_ready_future<>();
+        if (!plane_)
             return seastar::make_ready_future<>();
         return plane_->host().registry().deliver(std::move(*env));
     }
@@ -366,9 +376,23 @@ public:
         return plane_->addVShard(vshard, std::move(voters), opts);
     }
 
+    // Group 0 is a separate Raft registry on shard 0, sharing this shard's
+    // transport but never VShard 0's wire id or journal directory.
+    seastar::future<> addGroup0(std::vector<data::NodeId> voters, raft::RaftOptions opts) {
+        if (seastar::this_shard_id() != 0)
+            throw std::logic_error("group 0 may only be hosted on reactor shard 0");
+        if (!group0_)
+            throw std::logic_error("group 0 host was not constructed");
+        return group0_->start(std::move(voters), opts);
+    }
+
+    Group0Host* group0() { return group0_.get(); }
+
     void startTicking() {
         if (plane_)
             plane_->startTicking();
+        if (group0_ && group0_->started())
+            group0_->startTicking();
     }
 
     // Override this shard's snapshot-trigger policy (debt D-6). Must be called BEFORE
@@ -662,7 +686,10 @@ public:
             co_await rpc_->stop();
         if (plane_)
             co_await plane_->stop();
+        if (group0_)
+            co_await group0_->stop();
         plane_.reset();
+        group0_.reset();
         rpc_.reset();
         if (transport_)
             co_await transport_->stop();
@@ -677,6 +704,8 @@ private:
     // Borrows store_ and `this`; destroyed before store_ (declared after it).
     std::unique_ptr<data::LeaderFilteredNodeStore> queryStore_;
     std::unique_ptr<raft::RaftRpcTransport> transport_;  // this shard's own Raft listener + peer clients
+    // Shard 0 only. Borrows transport_; destroyed before it by declaration order.
+    std::unique_ptr<Group0Host> group0_;
     seastar::sharded<ShardRaftPlane>* peers_ = nullptr;
     const data::VShardDirectory* dir_ = nullptr;  // VShard -> group resolution (debt D-11); not owned
     std::unique_ptr<data::DataPlaneRpc> rpc_;     // this shard's own data-plane listener + peer clients

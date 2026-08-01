@@ -26,6 +26,7 @@
 using timestar::assignCore;
 using timestar::VShardId;
 using timestar::cluster::bucketByOwningShard;
+using timestar::cluster::kControlRaftGroupId;
 using timestar::cluster::shardForGroup;
 using timestar::cluster::shardOwningVShard;
 using timestar::control::ControlMap;
@@ -213,4 +214,14 @@ TEST(VShardGroupDirectoryTest, TheProductionBucketerHonoursTheGroupMapping) {
         // A null directory means the identity -- the shape the fan-out unit tests use.
         EXPECT_EQ(groupsOf(nullptr).size(), groupsOf(&identityDir).size());
     }
+}
+
+TEST(VShardGroupDirectoryTest, ControlGroupHasANonCollidingWireIdAndRoutesToShardZero) {
+    // Data VShard 0 has always used Raft envelope group id 0. The control group
+    // must not overload that id: both groups can be live on shard 0 at once and
+    // the delivery path needs an unambiguous discriminator.
+    EXPECT_EQ(VShardDirectory(1, placementOnly()).groupOf(0), 0);
+    EXPECT_NE(kControlRaftGroupId, 0);
+    EXPECT_EQ(kControlRaftGroupId, timestar::VIRTUAL_SHARD_COUNT);
+    EXPECT_EQ(shardForGroup(kControlRaftGroupId), 0u);
 }

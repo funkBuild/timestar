@@ -1235,9 +1235,13 @@ is not completion.
   committed data-plane map. **Progress:** the existing group-0 command and
   snapshot decoders now fail closed on unknown trailing data, and a corrupt
   snapshot installation throws without changing the old state or advancing its
-  applied boundary. Focused codec/state-machine evidence passes 14/14. The
-  production host, dedicated journal, explicit bootstrap ceremony, recovery,
-  and committed-state publication remain outstanding.
+  applied boundary. A shard-0 production host substrate now reserves wire group
+  ID 4096 (without colliding with data VShard 0), persists control state in a
+  dedicated `group0` journal, restores snapshots/log state after restart, and
+  rejects a corrupt recovered snapshot before serving. Focused
+  codec/state-machine/host evidence passes 16/16. Production composition, the
+  explicit bootstrap ceremony, and publication of committed state to the data
+  plane remain outstanding.
 - [ ] **CR-FIX-022 — wire resumable join, drain, remove, replace, and VShard
   movement.** Owner: movement/control plane. Include learner catch-up, verified
   snapshot, log catch-up, joint consensus, leadership transfer, cutover, and
