@@ -10,6 +10,7 @@
 #include <seastar/core/file.hh>
 #include <seastar/core/temporary_buffer.hh>
 #include <set>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -113,6 +114,11 @@ public:
     seastar::future<bool> addTombstone(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime,
                                        TSM* tsmFile = nullptr  // Optional: for verification
     );
+
+    // Replace every listed series' delete set with the canonical all-time
+    // range, rebuilding the sidecar entries once for the whole batch. Returns
+    // true when flush() is required (including a prior failed dirty write).
+    bool addFullRangeTombstones(std::span<const SeriesId128> seriesIds);
 
     // Check if a specific point is tombstoned
     bool isDeleted(const SeriesId128& seriesId, uint64_t timestamp) const;

@@ -1,5 +1,6 @@
 #include "logger.hpp"
 #include "logging_config.hpp"
+#include "placement_table.hpp"
 #include "tsm.hpp"
 
 #include <algorithm>
@@ -106,6 +107,29 @@ seastar::future<bool> TSM::deleteRange(const SeriesId128& seriesId, uint64_t sta
     }
 
     co_return added;
+}
+
+seastar::future<size_t> TSM::deleteVShard(uint16_t vshard) {
+    if (vshard >= timestar::VIRTUAL_SHARD_COUNT)
+        throw std::invalid_argument("TSM::deleteVShard: invalid VShard");
+
+    std::vector<SeriesId128> targetIds;
+    forEachSeriesId([&](const SeriesId128& id) {
+        if (timestar::virtualShard(id) == vshard)
+            targetIds.push_back(id);
+    });
+    if (targetIds.empty())
+        co_return 0;
+
+    // One lock and one atomic sidecar rewrite for the complete generation
+    // fence. Per-series deleteRange would rewrite/fsync an ever-growing file
+    // once per identity and becomes quadratic on a production-sized VShard.
+    auto mutationUnits = co_await seastar::get_units(tombstoneMutationSemaphore_, 1);
+    if (!tombstones)
+        tombstones = std::make_unique<timestar::TSMTombstone>(getTombstonePath());
+    if (tombstones->addFullRangeTombstones(targetIds))
+        co_await tombstones->flush();
+    co_return targetIds.size();
 }
 
 // Query with tombstone filtering

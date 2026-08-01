@@ -472,6 +472,38 @@ seastar::future<bool> TSMTombstone::addTombstone(const SeriesId128& seriesId, ui
     co_return true;
 }
 
+bool TSMTombstone::addFullRangeTombstones(std::span<const SeriesId128> seriesIds) {
+    bool changed = false;
+    for (const auto& seriesId : seriesIds) {
+        auto& ranges = seriesRanges[seriesId];
+        if (ranges.size() == 1 && ranges.front().first == 0 && ranges.front().second == UINT64_MAX)
+            continue;
+        ranges.assign(1, {0, UINT64_MAX});
+        changed = true;
+    }
+    if (!changed)
+        return isDirty;
+
+    // Rebuild once, rather than calling addTombstone once per series. The
+    // single-series path erases/rebuilds entries for each ID and is O(N^2) for
+    // a high-cardinality VShard; snapshot replacement must stay O(N log N).
+    size_t entryCount = 0;
+    for (const auto& [seriesId, ranges] : seriesRanges)
+        entryCount += ranges.size();
+    entries.clear();
+    entries.reserve(entryCount);
+    for (const auto& [seriesId, ranges] : seriesRanges) {
+        for (const auto& [startTime, endTime] : ranges) {
+            TombstoneEntry entry{seriesId, startTime, endTime, 0};
+            entry.checksum = calculateChecksum(entry);
+            entries.push_back(std::move(entry));
+        }
+    }
+    isDirty = true;
+    ++mutationGeneration_;
+    return true;
+}
+
 bool TSMTombstone::isDeleted(const SeriesId128& seriesId, uint64_t timestamp) const {
     auto it = seriesRanges.find(seriesId);
     if (it == seriesRanges.end()) {

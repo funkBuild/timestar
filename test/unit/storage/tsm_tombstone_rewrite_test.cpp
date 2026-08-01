@@ -3,10 +3,12 @@
 // tombstone file removal, and data correctness after rewrite.
 
 #include "../../../lib/core/series_id.hpp"
+#include "../../../lib/core/placement_table.hpp"
 #include "../../../lib/storage/tsm.hpp"
 #include "../../../lib/storage/tsm_compactor.hpp"
 #include "../../../lib/storage/tsm_file_manager.hpp"
 #include "../../../lib/storage/tsm_writer.hpp"
+#include "../../../lib/utils/series_key.hpp"
 
 #include <gtest/gtest.h>
 
@@ -64,6 +66,24 @@ public:
         writer.close();
     }
 };
+
+namespace {
+std::string seriesKeyInVShard(const std::string& measurement, uint16_t vshard) {
+    for (size_t i = 0;; ++i) {
+        auto key = timestar::buildSeriesKey(measurement, {{"host", "h" + std::to_string(i)}}, "value");
+        if (timestar::virtualShard(SeriesId128::fromSeriesKey(key)) == vshard)
+            return key;
+    }
+}
+
+std::string seriesKeyOutsideVShard(const std::string& measurement, uint16_t vshard) {
+    for (size_t i = 0;; ++i) {
+        auto key = timestar::buildSeriesKey(measurement, {{"host", "h" + std::to_string(i)}}, "value");
+        if (timestar::virtualShard(SeriesId128::fromSeriesKey(key)) != vshard)
+            return key;
+    }
+}
+}  // namespace
 
 // Test: estimateTombstoneCoverage returns 0.0 when no tombstones exist
 seastar::future<> testEstimateNoTombstones(std::string filename, TSMTombstoneRewriteTest* self) {
@@ -256,6 +276,60 @@ seastar::future<> testTombstoneFileExists(std::string filename, TSMTombstoneRewr
 
 TEST_F(TSMTombstoneRewriteTest, TombstoneFileCreated) {
     testTombstoneFileExists(getTestFilePath("0_7.tsm"), this).get();
+}
+
+seastar::future<> testVShardDeleteIsBatchedDurableAndScoped(std::string filename,
+                                                            TSMTombstoneRewriteTest* self) {
+    const std::string targetA = timestar::buildSeriesKey("snapshot_tsm_a", {{"host", "h0"}}, "value");
+    const SeriesId128 targetAId = SeriesId128::fromSeriesKey(targetA);
+    const uint16_t targetVShard = timestar::virtualShard(targetAId);
+    const std::string targetB = seriesKeyInVShard("snapshot_tsm_b", targetVShard);
+    const std::string foreign = seriesKeyOutsideVShard("snapshot_tsm_foreign", targetVShard);
+    const SeriesId128 targetBId = SeriesId128::fromSeriesKey(targetB);
+    const SeriesId128 foreignId = SeriesId128::fromSeriesKey(foreign);
+    EXPECT_EQ(timestar::virtualShard(targetBId), targetVShard);
+    EXPECT_NE(timestar::virtualShard(foreignId), targetVShard);
+    self->createMultiSeriesFile(filename, {targetA, targetB, foreign}, 10);
+
+    {
+        TSM tsm(filename);
+        co_await tsm.open();
+        EXPECT_EQ(co_await tsm.deleteVShard(targetVShard), 2u);
+        EXPECT_TRUE(tsm.hasTombstones());
+        EXPECT_EQ(tsm.getTombstones()->getEntryCount(), 2u)
+            << "the whole VShard must publish in one canonical sidecar generation";
+
+        auto targetAResult = co_await tsm.queryWithTombstones<double>(targetAId, 0, UINT64_MAX);
+        auto targetBResult = co_await tsm.queryWithTombstones<double>(targetBId, 0, UINT64_MAX);
+        auto foreignResult = co_await tsm.queryWithTombstones<double>(foreignId, 0, UINT64_MAX);
+        EXPECT_TRUE(targetAResult.empty());
+        EXPECT_TRUE(targetBResult.empty());
+        EXPECT_FALSE(foreignResult.empty()) << "a mixed TSM's foreign VShard must remain queryable";
+
+        const uint64_t generation = tsm.tombstoneGeneration();
+        EXPECT_EQ(co_await tsm.deleteVShard(targetVShard), 2u);
+        EXPECT_EQ(tsm.tombstoneGeneration(), generation)
+            << "replaying a completed snapshot deletion must not rewrite the sidecar";
+        co_await tsm.close();
+    }
+
+    // Reopen the immutable file and recover the sidecar from disk. This is the
+    // crash/restart boundary the snapshot replacement path depends on.
+    {
+        TSM reopened(filename);
+        co_await reopened.open();
+        auto targetAResult = co_await reopened.queryWithTombstones<double>(targetAId, 0, UINT64_MAX);
+        auto targetBResult = co_await reopened.queryWithTombstones<double>(targetBId, 0, UINT64_MAX);
+        auto foreignResult = co_await reopened.queryWithTombstones<double>(foreignId, 0, UINT64_MAX);
+        EXPECT_TRUE(targetAResult.empty());
+        EXPECT_TRUE(targetBResult.empty());
+        EXPECT_FALSE(foreignResult.empty());
+        co_await reopened.close();
+    }
+}
+
+TEST_F(TSMTombstoneRewriteTest, VShardDeleteIsBatchedDurableAndScoped) {
+    testVShardDeleteIsBatchedDurableAndScoped(getTestFilePath("0_8.tsm"), this).get();
 }
 
 // Test: tier is preserved in compaction plan

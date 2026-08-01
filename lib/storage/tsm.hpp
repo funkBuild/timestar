@@ -534,6 +534,11 @@ public:
     // Delete range with verification
     seastar::future<bool> deleteRange(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime);
 
+    // Durably hide every series in one VShard with a single atomic sidecar
+    // publication. Returns the number of series in this file that belong to
+    // the VShard (including already-tombstoned identities on an idempotent retry).
+    seastar::future<size_t> deleteVShard(uint16_t vshard);
+
     // Query with tombstone filtering
     template <class T>
     seastar::future<TSMResult<T>> queryWithTombstones(const SeriesId128& seriesId, uint64_t startTime,
