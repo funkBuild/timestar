@@ -752,17 +752,6 @@ int main(int argc, char** argv) {
                                 return g_clusterDataPlane.deleteRangeFromShard(std::move(seriesKey), startTime, endTime,
                                                                                operationId);
                             };
-                        timestar::http::HttpDeleteHandler::clusterPatternExpandHook =
-                            [](timestar::data::PatternSeriesSelector selector, uint32_t maxSeries) {
-                                // Pattern coordination owns a pinned placement
-                                // snapshot and leader-hint cache, so keep it on
-                                // shard 0. No mutation is proposed until this
-                                // future returns the complete bounded expansion.
-                                return seastar::smp::submit_to(
-                                    0u, [selector = std::move(selector), maxSeries]() mutable {
-                                        return g_clusterDataPlane.findPatternSeries(std::move(selector), maxSeries);
-                                    });
-                            };
                     }
                     // Route metadata endpoints through the scatter+merge.
                     timestar::http::HttpMetadataHandler::clusterMetadataHook = [](timestar::data::MetadataRequest r) {

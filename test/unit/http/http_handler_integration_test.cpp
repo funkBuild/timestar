@@ -1351,13 +1351,13 @@ TEST_F(HttpHandlerIntegrationTest, PartitionedRf3RejectsUnwiredPatternDiscoveryB
         auto rep = handler.handleDelete(std::move(req)).get();
         EXPECT_EQ(rep->_status, seastar::http::reply::status_type::not_implemented);
         EXPECT_EQ(calls, 0u) << "the exact prefix of a mixed batch must not partially commit";
-        EXPECT_NE(rep->_content.find("quorum-fenced catalog discovery"), std::string::npos);
+        EXPECT_NE(rep->_content.find("expansion plan is replicated"), std::string::npos);
     })
         .join()
         .get();
 }
 
-TEST_F(HttpHandlerIntegrationTest, PartitionedRf3ExpandsEveryPatternBeforeProposingMixedBatch) {
+TEST_F(HttpHandlerIntegrationTest, PartitionedRf3RejectsPatternBeforeExpansionOrProposal) {
     seastar::thread([] {
         struct ResetHook {
             ~ResetHook() {
@@ -1394,12 +1394,11 @@ TEST_F(HttpHandlerIntegrationTest, PartitionedRf3ExpandsEveryPatternBeforePropos
         auto request = makeDeleteRequest(
             R"({"deletes":[{"series":"exact value","startTime":10,"endTime":20},{"measurement":"m","tags":{"env":"prod"},"fields":["value"],"startTime":10,"endTime":20}]})");
         auto reply = handler.handleDelete(std::move(request)).get();
-        ASSERT_TRUE(isOk(*reply)) << reply->_content;
-        EXPECT_EQ(expansions, 1u);
-        EXPECT_EQ(proposals, 3u);
-        std::sort(proposedKeys.begin(), proposedKeys.end());
-        EXPECT_EQ(proposedKeys, (std::vector<std::string>{"exact value", patternA, patternB}));
-        EXPECT_NE(reply->_content.find("unique exact delete commands"), std::string::npos);
+        EXPECT_EQ(reply->_status, seastar::http::reply::status_type::not_implemented);
+        EXPECT_EQ(expansions, 0u);
+        EXPECT_EQ(proposals, 0u);
+        EXPECT_TRUE(proposedKeys.empty());
+        EXPECT_NE(reply->_content.find("expansion plan is replicated"), std::string::npos);
     })
         .join()
         .get();
@@ -1429,9 +1428,10 @@ TEST_F(HttpHandlerIntegrationTest, PartitionedRf3ExpansionFailureLeavesExactPref
         auto request = makeDeleteRequest(
             R"({"deletes":[{"series":"exact value","startTime":0,"endTime":1},{"measurement":"m","startTime":0,"endTime":1}]})");
         auto reply = handler.handleDelete(std::move(request)).get();
-        EXPECT_EQ(reply->_status, seastar::http::reply::status_type::service_unavailable);
+        EXPECT_EQ(reply->_status, seastar::http::reply::status_type::not_implemented);
         EXPECT_EQ(proposals, 0u);
-        EXPECT_EQ(reply->_headers["Retry-After"], "1");
+        EXPECT_EQ(reply->_headers.count("Retry-After"), 0u);
+        EXPECT_NE(reply->_content.find("expansion plan is replicated"), std::string::npos);
     })
         .join()
         .get();
@@ -1459,9 +1459,9 @@ TEST_F(HttpHandlerIntegrationTest, PartitionedRf3BroadPatternFailsBeforeMutation
 
         HttpDeleteHandler handler(&eng.eng, true);
         auto reply = handler.handleDelete(makeDeleteRequest(R"({"measurement":"m"})")).get();
-        EXPECT_EQ(reply->_status, seastar::http::reply::status_type::bad_request);
+        EXPECT_EQ(reply->_status, seastar::http::reply::status_type::not_implemented);
         EXPECT_EQ(proposals, 0u);
-        EXPECT_NE(reply->_content.find("safety limit"), std::string::npos);
+        EXPECT_NE(reply->_content.find("expansion plan is replicated"), std::string::npos);
     })
         .join()
         .get();

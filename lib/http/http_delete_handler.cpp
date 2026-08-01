@@ -399,6 +399,26 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDeleteHandler::handle
         }
 
         if (partitionedCluster_) {
+            // A pattern retry cannot safely re-run catalog expansion: a series
+            // created after an earlier partial attempt would acquire a brand-new
+            // exact operation identity and could be deleted by the retry. A
+            // durable replicated expansion plan (or a per-VShard selector
+            // command with bounded result semantics) is required before this can
+            // be retry-safe. Reject the whole mixed batch before either catalog
+            // discovery or the first exact proposal.
+            if (std::ranges::any_of(deleteRequests, [](const DeleteRequest& request) { return request.isPattern; })) {
+                reply->set_status(seastar::http::reply::status_type::not_implemented);
+                constexpr std::string_view message =
+                    "Pattern delete is unavailable in partitioned mode until its expansion plan is replicated";
+                if (timestar::http::isProtobuf(resFmt))
+                    reply->_content =
+                        timestar::proto::formatDeleteResponse("error", 0, deleteRequests.size(), std::string(message));
+                else
+                    reply->_content = createErrorResponse(std::string(message));
+                timestar::http::setContentType(*reply, resFmt);
+                co_return reply;
+            }
+
             // Preflight and expand the WHOLE batch before proposing its first
             // command. Pattern discovery is a quorum-fenced catalog read at each
             // VShard's current leader; the production hook also pins one placement
