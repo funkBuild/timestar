@@ -105,9 +105,15 @@ TEST_F(ClusterDataPlaneTest, ControlHealthIsVisibleWithoutBlockingExistingDataGr
     st.controlInitialized = true;
     st.controlServingMapEpoch = 1;
     st.controlLeader = 1;
+    st.controlTerm = 7;
+    st.controlControllerLeader = 1;
+    st.controlControllerTerm = 7;
     st.controlCurrentTermCommit = true;
     EXPECT_TRUE(st.controlLocallyReady());
 
+    st.controlControllerTerm = 6;
+    EXPECT_FALSE(st.controlLocallyReady()) << "a leader is not actuating until its Raft term is durably stamped";
+    st.controlControllerTerm = 7;
     st.controlApplyLagEntries = 1;
     EXPECT_FALSE(st.controlLocallyReady());
     EXPECT_TRUE(st.readyForTraffic());

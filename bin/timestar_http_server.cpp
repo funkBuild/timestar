@@ -263,6 +263,8 @@ void set_routes(routes& r) {
                           std::string(st.controlCurrentTermCommit ? "true" : "false") +
                           ",\"control_leader\":" + std::to_string(st.controlLeader) +
                           ",\"control_term\":" + std::to_string(st.controlTerm) +
+                          ",\"control_controller_leader\":" + std::to_string(st.controlControllerLeader) +
+                          ",\"control_controller_term\":" + std::to_string(st.controlControllerTerm) +
                           ",\"control_commit_index\":" + std::to_string(st.controlCommitIndex) +
                           ",\"control_applied_index\":" + std::to_string(st.controlAppliedIndex) +
                           ",\"control_snapshot_index\":" + std::to_string(st.controlSnapshotIndex) +
@@ -281,7 +283,11 @@ void set_routes(routes& r) {
                           ",\"control_compactions_refused_too_large\":" +
                           std::to_string(st.controlCompactionsRefusedTooLarge) +
                           ",\"control_journal_segments_deleted\":" +
-                          std::to_string(st.controlJournalSegmentsDeleted);
+                          std::to_string(st.controlJournalSegmentsDeleted) +
+                          ",\"control_controller_stamp_proposals\":" +
+                          std::to_string(st.controlControllerStampProposals) +
+                          ",\"control_controller_actuation_failures\":" +
+                          std::to_string(st.controlControllerActuationFailures);
                   }
                   body += "}";
                   rep->_content = std::move(body);

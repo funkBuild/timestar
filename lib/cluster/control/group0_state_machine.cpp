@@ -415,6 +415,13 @@ seastar::future<> Group0StateMachine::apply(raft::LogEntry entry) {
         // should quarantine the group rather than serve divergent control state).
         throw std::runtime_error("group0: undecodable committed control command");
     }
+    // The replicated controller epoch is the Raft term that actually owns this
+    // log entry, never a caller-provided integer. A controller can sample its
+    // term before waiting for the group lock and append after a rapid election;
+    // canonicalising here both closes that race and prevents an internal caller
+    // from permanently fencing the cluster with a fabricated future term.
+    if (auto* stamp = std::get_if<SetControllerTerm>(&*cmd))
+        stamp->term = entry.term;
     rejectConflictingLocalCommand(*cmd);
     applyCommand(*cmd);
     if (servingMapObserver_ && std::holds_alternative<SetInitialServingMap>(*cmd) &&

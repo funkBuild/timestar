@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <gtest/gtest.h>
 #include <seastar/core/coroutine.hh>
+#include <seastar/core/sleep.hh>
 #include <unistd.h>
 
 using namespace timestar;
@@ -207,6 +208,30 @@ seastar::future<> recoveredIdentityConflictRefusesStartup() {
     fs::remove_all(root);
 }
 
+seastar::future<> controllerTermActuationFollowsLeadership() {
+    const fs::path root = tempRoot("controller_term");
+    NullTransport transport;
+    Group0Host host(transport, 1, root, identity());
+    co_await host.start({1}, singleVoterOptions());
+    co_await host.group()->campaign();
+    if (!host.group()->isLeader())
+        throw std::runtime_error("single-voter group0 campaign did not elect the host");
+    EXPECT_TRUE(co_await host.propose(InitCluster{"cluster-controller"}));
+    EXPECT_EQ(host.state().controllerTerm, kNoTerm);
+
+    host.startTicking();
+    co_await seastar::sleep(Group0Host::kControllerActuationInterval * 2);
+    EXPECT_EQ(host.state().controllerTerm, host.group()->currentTerm());
+    EXPECT_EQ(host.state().controllerLeader, 1u);
+    EXPECT_EQ(host.controllerStampProposals(), 1u);
+    EXPECT_FALSE(co_await host.maybeStampControllerTermOnce())
+        << "a periodic pass must not append duplicate stamps in one leadership term";
+    EXPECT_EQ(host.controllerStampProposals(), 1u);
+
+    co_await host.stop();
+    fs::remove_all(root);
+}
+
 }  // namespace
 
 TEST(Group0HostTest, UsesReservedWireIdAndRecoversDedicatedJournal) {
@@ -227,4 +252,8 @@ TEST(Group0HostTest, PeriodicPolicyBoundsControlReplay) {
 
 TEST(Group0HostTest, RecoveredIdentityConflictFailsStartup) {
     recoveredIdentityConflictRefusesStartup().get();
+}
+
+TEST(Group0HostTest, ControllerTermActuationFollowsLeadership) {
+    controllerTermActuationFollowsLeadership().get();
 }

@@ -402,6 +402,8 @@ public:
         bool currentTermCommit = false;
         data::NodeId leader = raft::kNoNode;
         raft::Term term = raft::kNoTerm;
+        data::NodeId controllerLeader = raft::kNoNode;
+        raft::Term controllerTerm = raft::kNoTerm;
         raft::LogIndex commitIndex = raft::kNoIndex;
         raft::LogIndex appliedIndex = raft::kNoIndex;
         raft::LogIndex snapshotIndex = raft::kNoIndex;
@@ -419,6 +421,8 @@ public:
         uint64_t compactionsTaken = 0;
         uint64_t compactionsRefusedTooLarge = 0;
         uint64_t journalSegmentsDeleted = 0;
+        uint64_t controllerStampProposals = 0;
+        uint64_t controllerActuationFailures = 0;
     };
 
     Group0Counts group0Counts() const {
@@ -439,6 +443,8 @@ public:
         c.currentTermCommit = group->node().hasCurrentTermCommit();
         c.leader = group->leader();
         c.term = group->currentTerm();
+        c.controllerLeader = state.controllerLeader;
+        c.controllerTerm = state.controllerTerm;
         c.commitIndex = group->commitIndex();
         c.appliedIndex = group->appliedIndex();
         c.snapshotIndex = group->node().log().snapshotIndex();
@@ -456,6 +462,8 @@ public:
         c.compactionsTaken = host->compactionsTaken();
         c.compactionsRefusedTooLarge = host->compactionsRefusedTooLarge();
         c.journalSegmentsDeleted = host->journalSegmentsDeleted();
+        c.controllerStampProposals = host->controllerStampProposals();
+        c.controllerActuationFailures = host->controllerActuationFailures();
         return c;
     }
 

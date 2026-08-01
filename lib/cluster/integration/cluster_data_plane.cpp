@@ -1327,6 +1327,8 @@ seastar::future<ClusterDataPlane::Status> ClusterDataPlane::status() const {
     st.controlCurrentTermCommit = control.currentTermCommit;
     st.controlLeader = control.leader;
     st.controlTerm = control.term;
+    st.controlControllerLeader = control.controllerLeader;
+    st.controlControllerTerm = control.controllerTerm;
     st.controlCommitIndex = control.commitIndex;
     st.controlAppliedIndex = control.appliedIndex;
     st.controlSnapshotIndex = control.snapshotIndex;
@@ -1344,6 +1346,8 @@ seastar::future<ClusterDataPlane::Status> ClusterDataPlane::status() const {
     st.controlCompactionsTaken = control.compactionsTaken;
     st.controlCompactionsRefusedTooLarge = control.compactionsRefusedTooLarge;
     st.controlJournalSegmentsDeleted = control.journalSegmentsDeleted;
+    st.controlControllerStampProposals = control.controllerStampProposals;
+    st.controlControllerActuationFailures = control.controllerActuationFailures;
     co_return st;
 }
 

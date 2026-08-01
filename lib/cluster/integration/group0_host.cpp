@@ -5,6 +5,7 @@
 #include "../../utils/logger.hpp"
 #include "../raft/raft_node.hpp"
 
+#include <algorithm>
 #include <seastar/core/coroutine.hh>
 #include <set>
 #include <stdexcept>
@@ -130,16 +131,25 @@ void Group0Host::startTicking() {
     registry_.startTicking();
     ticking_ = true;
     maintenanceTimer_.set_callback([this] {
-        if (stopped_ || maintenanceRunning_ || maintenanceGate_.is_closed())
+        if (stopped_ || maintenanceRunning_ || backgroundGate_.is_closed())
             return;
         maintenanceRunning_ = true;
         // A named member owns the coroutine frame; the callback itself never
         // suspends or outlives its captures.
-        (void)seastar::with_gate(maintenanceGate_, [this] {
+        (void)seastar::with_gate(backgroundGate_, [this] {
             return maintenanceSweep().finally([this] { maintenanceRunning_ = false; });
         });
     });
     maintenanceTimer_.arm(seastar::lowres_clock::now() + kMaintenanceInterval, {kMaintenanceInterval});
+    controllerTimer_.set_callback([this] {
+        if (stopped_ || controllerRunning_ || backgroundGate_.is_closed())
+            return;
+        controllerRunning_ = true;
+        (void)seastar::with_gate(backgroundGate_, [this] {
+            return controllerSweep().finally([this] { controllerRunning_ = false; });
+        });
+    });
+    controllerTimer_.arm_periodic(kControllerActuationInterval);
 }
 
 seastar::future<> Group0Host::deliver(raft::Envelope env) {
@@ -192,17 +202,17 @@ seastar::future<size_t> Group0Host::reclaimJournalSegments() {
 }
 
 seastar::future<> Group0Host::compact() {
-    if (stopped_ || maintenanceGate_.is_closed())
+    if (stopped_ || backgroundGate_.is_closed())
         throw std::logic_error("Group0Host::compact after stop");
-    auto held = maintenanceGate_.hold();
+    auto held = backgroundGate_.hold();
     (void)co_await compactAppliedState();
     (void)co_await reclaimJournalSegments();
 }
 
 seastar::future<bool> Group0Host::maybeCompactOnce() {
-    if (stopped_ || maintenanceGate_.is_closed())
+    if (stopped_ || backgroundGate_.is_closed())
         co_return false;
-    auto held = maintenanceGate_.hold();
+    auto held = backgroundGate_.hold();
     ++maintenancePasses_;
     raft::RaftGroup* g = group();
     if (!g)
@@ -240,13 +250,63 @@ seastar::future<> Group0Host::maintenanceSweep() {
     }
 }
 
+seastar::future<bool> Group0Host::stampControllerTermProposal() {
+    raft::RaftGroup* g = group();
+    if (!g || !sm_)
+        throw std::logic_error("Group0Host::stampControllerTermProposal before start");
+    if (!g->isLeader() || sm_->state().clusterUuid.empty())
+        co_return false;
+    const raft::Term term = g->currentTerm();
+    if (term == raft::kNoTerm || sm_->state().controllerTerm >= term || lastControllerProposalTerm_ >= term)
+        co_return false;
+
+    // Do not use proposeAndAwaitApplied here. With CheckQuorum disabled, an
+    // isolated leader can retain its role indefinitely and a quorum waiter would
+    // leak until a later term, as well as keeping Group0Host::stop() open. A
+    // successful propose() has already durably appended and sent the entry; Raft
+    // will commit it when a quorum is available. The state machine derives the
+    // controller epoch from the entry's real term, closing a lock-wait election
+    // race around the sampled term in this payload.
+    if (!co_await g->propose(control::encodeCommand(control::SetControllerTerm{term, self_})))
+        co_return false;
+    lastControllerProposalTerm_ = std::max(lastControllerProposalTerm_, g->currentTerm());
+    ++controllerStampProposals_;
+    co_return true;
+}
+
+seastar::future<bool> Group0Host::maybeStampControllerTermOnce() {
+    if (stopped_ || backgroundGate_.is_closed())
+        co_return false;
+    auto held = backgroundGate_.hold();
+    co_return co_await stampControllerTermProposal();
+}
+
+seastar::future<> Group0Host::controllerSweep() {
+    try {
+        (void)co_await stampControllerTermProposal();
+    } catch (const std::exception& e) {
+        ++controllerActuationFailures_;
+        if (controllerActuationFailures_ == 1 || controllerActuationFailures_ % 1024 == 0)
+            timestar::http_log.warn(
+                "cluster: group-0 controller-term actuation failed: {} (will retry; occurrence {})", e.what(),
+                controllerActuationFailures_);
+    } catch (...) {
+        ++controllerActuationFailures_;
+        if (controllerActuationFailures_ == 1 || controllerActuationFailures_ % 1024 == 0)
+            timestar::http_log.warn(
+                "cluster: group-0 controller-term actuation failed with an unknown error (will retry; occurrence {})",
+                controllerActuationFailures_);
+    }
+}
+
 seastar::future<> Group0Host::stop() {
     if (stopped_)
         co_return;
     stopped_ = true;
     maintenanceTimer_.cancel();
-    if (!maintenanceGate_.is_closed())
-        co_await maintenanceGate_.close();
+    controllerTimer_.cancel();
+    if (!backgroundGate_.is_closed())
+        co_await backgroundGate_.close();
     if (started_)
         co_await registry_.stop();
     if (writer_)

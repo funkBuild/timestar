@@ -306,6 +306,8 @@ public:
         bool controlCurrentTermCommit = false;
         NodeId controlLeader = raft::kNoNode;
         raft::Term controlTerm = raft::kNoTerm;
+        NodeId controlControllerLeader = raft::kNoNode;
+        raft::Term controlControllerTerm = raft::kNoTerm;
         raft::LogIndex controlCommitIndex = raft::kNoIndex;
         raft::LogIndex controlAppliedIndex = raft::kNoIndex;
         raft::LogIndex controlSnapshotIndex = raft::kNoIndex;
@@ -323,6 +325,8 @@ public:
         uint64_t controlCompactionsTaken = 0;
         uint64_t controlCompactionsRefusedTooLarge = 0;
         uint64_t controlJournalSegmentsDeleted = 0;
+        uint64_t controlControllerStampProposals = 0;
+        uint64_t controlControllerActuationFailures = 0;
 
         // This is intentionally LOCAL readiness, not a quorum-health claim.
         // With CheckQuorum disabled an isolated former leader can retain its role;
@@ -331,9 +335,10 @@ public:
             if (!controlEnabled)
                 return true;
             return controlHosted && controlInitialized && controlServingMapEpoch != 0 &&
-                   controlLeader != raft::kNoNode && controlCurrentTermCommit && controlApplyLagEntries == 0 &&
+                   controlLeader != raft::kNoNode && controlControllerTerm == controlTerm &&
+                   controlControllerLeader == controlLeader && controlCurrentTermCommit && controlApplyLagEntries == 0 &&
                    controlApplyFailures == 0 && controlTickErrors == 0 && controlMaintenanceFailures == 0 &&
-                   controlCompactionsRefusedTooLarge == 0;
+                   controlControllerActuationFailures == 0 && controlCompactionsRefusedTooLarge == 0;
         }
 
         [[nodiscard]] bool readyForTraffic() const {

@@ -207,6 +207,18 @@ TEST(Group0StateMachineTest, ControllerTermIsMonotonic) {
     EXPECT_EQ(sm.state().controllerLeader, 2u);
 }
 
+TEST(Group0StateMachineTest, ControllerEpochComesFromCommittedLogTerm) {
+    Group0StateMachine sm;
+    timestar::raft::LogEntry entry{
+        /*term=*/7,
+        /*index=*/1,
+        timestar::raft::EntryType::Normal,
+        encodeCommand(SetControllerTerm{/*untrusted payload term=*/999, /*leader=*/2})};
+    EXPECT_NO_THROW(sm.apply(std::move(entry)).get());
+    EXPECT_EQ(sm.state().controllerTerm, 7u);
+    EXPECT_EQ(sm.state().controllerLeader, 2u);
+}
+
 TEST(Group0StateMachineTest, JobsAreIdempotentAndMonotonic) {
     Group0StateMachine sm;
     EXPECT_TRUE(sm.applyCommand(UpsertJob{"j1", 1, false, "p"}));

@@ -45,6 +45,7 @@ public:
     // durable snapshot boundary.
     static constexpr uint64_t kCompactionEntryThreshold = 1024;
     static constexpr std::chrono::seconds kMaintenanceInterval{60};
+    static constexpr std::chrono::milliseconds kControllerActuationInterval{250};
 
     Group0Host(raft::RaftTransport& transport, raft::NodeId self, std::filesystem::path journalRoot,
                const JournalIdentity& identity,
@@ -77,6 +78,10 @@ public:
     // this pass produced a new snapshot; segment GC is attempted either way so a
     // prior failed reclamation is retried even with no new commands.
     seastar::future<bool> maybeCompactOnce();
+    // Propose this leader's current controller term once, without waiting for a
+    // quorum. The locally durable entry commits when quorum is available; using
+    // the non-waiting proposal path keeps an isolated leader and shutdown bounded.
+    seastar::future<bool> maybeStampControllerTermOnce();
     void setCompactionEntryThreshold(uint64_t entries) { compactionEntryThreshold_ = entries; }
 
     bool started() const { return started_; }
@@ -89,12 +94,16 @@ public:
     uint64_t compactionsRefusedTooLarge() const { return compactionsRefusedTooLarge_; }
     uint64_t maintenanceFailures() const { return maintenanceFailures_; }
     uint64_t journalSegmentsDeleted() const { return journalSegmentsDeleted_; }
+    uint64_t controllerStampProposals() const { return controllerStampProposals_; }
+    uint64_t controllerActuationFailures() const { return controllerActuationFailures_; }
     uint64_t tickErrors() const { return registry_.tickErrors(); }
 
 private:
     seastar::future<bool> compactAppliedState();
     seastar::future<size_t> reclaimJournalSegments();
     seastar::future<> maintenanceSweep();
+    seastar::future<bool> stampControllerTermProposal();
+    seastar::future<> controllerSweep();
 
     raft::NodeId self_;
     std::filesystem::path journalRoot_;
@@ -110,14 +119,19 @@ private:
     raft::RaftGroupRegistry registry_;
     JournalRetention retention_;
     seastar::timer<seastar::lowres_clock> maintenanceTimer_;
-    seastar::gate maintenanceGate_;
+    seastar::timer<seastar::lowres_clock> controllerTimer_;
+    seastar::gate backgroundGate_;
     uint64_t compactionEntryThreshold_ = kCompactionEntryThreshold;
     uint64_t maintenancePasses_ = 0;
     uint64_t compactionsTaken_ = 0;
     uint64_t compactionsRefusedTooLarge_ = 0;
     uint64_t maintenanceFailures_ = 0;
     uint64_t journalSegmentsDeleted_ = 0;
+    uint64_t controllerStampProposals_ = 0;
+    uint64_t controllerActuationFailures_ = 0;
+    raft::Term lastControllerProposalTerm_ = raft::kNoTerm;
     bool maintenanceRunning_ = false;
+    bool controllerRunning_ = false;
     bool freshJournal_ = false;
     bool started_ = false;
     bool ticking_ = false;

@@ -48,7 +48,10 @@ struct CasPolicy {
 };
 
 // Records the controller epoch (= group-0 term the leader was elected under) and
-// its owning node. Monotonic: a lower term is ignored (fencing).
+// its owning node. The serialized term is a proposal-time hint; committed apply
+// always substitutes the enclosing log entry's term so it cannot be fabricated
+// or become stale while the proposer waits for the group lock. Monotonic: a
+// lower term is ignored (fencing).
 struct SetControllerTerm {
     uint64_t term = 0;
     NodeId leader = 0;

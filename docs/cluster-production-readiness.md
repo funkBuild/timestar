@@ -1303,7 +1303,17 @@ is not completion.
   hosting now also fences every recovered snapshot and committed identity
   command against the configured cluster UUID and this data directory's
   persistent node UUID/address/failure domain; copied or conflicting control
-  state fails before it can be applied. This task is not closed.
+  state fails before it can be applied. Post-bootstrap leadership is now
+  actuated by a 250 ms host sweep that proposes exactly one controller stamp per
+  term. It uses the locally durable, non-quorum-waiting proposal path so an
+  isolated leader cannot accumulate apply waiters or hang shutdown; the stamp
+  commits when quorum returns. Apply derives the controller epoch from the
+  enclosing Raft log term rather than trusting the payload, closing both a
+  lock-wait election race and fabricated-future-term fencing. Status exposes the
+  replicated controller term/owner plus proposal/failure counters, and local
+  control readiness requires that fence to match the observed leader term.
+  Focused state/controller/host/readiness evidence passes 28/28. This task is not
+  closed.
 - [ ] **CR-FIX-022 — wire resumable join, drain, remove, replace, and VShard
   movement.** Owner: movement/control plane. Include learner catch-up, verified
   snapshot, log catch-up, joint consensus, leadership transfer, cutover, and

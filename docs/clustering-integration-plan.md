@@ -419,7 +419,10 @@ Extend `cluster_runtime.{hpp,cpp}` + `bin/timestar_http_server.cpp`:
    drives odd voter counts across `NodeRecord::failureDomain`s only after a
    `Joining` node is added as a learner, acknowledges the full current tail,
    and commits `Active`; direct promotion of an unknown/lagging voter is refused;
-   `stampControllerTermIfLeader` on leadership. `epoch_regression_guard`
+   a bounded production host sweep durably proposes one controller-term stamp
+   per leadership term without leaving a quorum waiter behind. Committed apply
+   derives that epoch from the entry's Raft term, not its payload.
+   `epoch_regression_guard`
    wired: regressed group-0 state freezes control actuation (data plane
    continues), operator supersession required.
 4. **Placement:** the controller computes desired placement (rendezvous over

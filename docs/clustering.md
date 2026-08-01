@@ -995,8 +995,10 @@ eligibility, joining, draining, and control-plane availability.
 
 The current `/cluster/status` endpoint now exposes group-0 enablement, hosting,
 initialization, leader/voter/config state, term/commit/applied/snapshot indices,
-map epoch, active format, apply/tick errors, and snapshot/GC maintenance. Its
-`control_locally_ready` field requires a current-term commit but deliberately
+replicated controller term/owner, map epochs, active format, apply/tick errors,
+controller actuation, and snapshot/GC maintenance. Its
+`control_locally_ready` field requires a current-term controller stamp and
+commit but deliberately
 does not claim current quorum reachability; that requires an active ReadIndex
 round. It is separate from the existing data-plane `healthy` field: loss of the
 control quorum blocks topology and policy changes but does not make
@@ -1058,6 +1060,14 @@ if it differs from the data directory's bound static topology. This is an
 initial-map durability bridge, not topology movement: the command is immutable,
 and a different/later serving map is rejected until ordered VShard catch-up,
 membership change, cutover, and teardown are implemented.
+
+After bootstrap, the group-0 host checks leadership every 250 ms and durably
+proposes at most one controller stamp in each new term. It deliberately does not
+wait for quorum application in that background path: an isolated leader cannot
+leak a waiter or delay shutdown, and the durable entry commits when quorum is
+restored. Committed apply takes the controller epoch from the enclosing Raft log
+term, not the proposal payload. Until the replicated term/owner matches the
+locally observed leader and term, `control_locally_ready` remains false.
 
 Once hosted, group 0 runs a bounded maintenance path: after 1,024 newly applied
 control entries, a 60-second sweep persists a complete control-state snapshot
