@@ -18,6 +18,7 @@
 #include <cstring>
 #include <filesystem>
 #include <format>
+#include <limits>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/memory.hh>
 #include <seastar/core/seastar.hh>
@@ -96,6 +97,23 @@ static bool rangeMayContainPrefix(const SSTableMetadata& meta, std::string_view 
         return true;
     }
     return nextPrefix > meta.minKey;  // skip when nextPrefix <= minKey (file entirely above range)
+}
+
+static std::optional<uint64_t> parseCanonicalSSTableBasename(std::string_view basename) {
+    static constexpr std::string_view prefix = "idx_";
+    static constexpr std::string_view suffix = ".sst";
+    if (!basename.starts_with(prefix) || !basename.ends_with(suffix)) {
+        return std::nullopt;
+    }
+
+    const auto digits = basename.substr(prefix.size(), basename.size() - prefix.size() - suffix.size());
+    uint64_t fileNumber = 0;
+    const auto [end, error] = std::from_chars(digits.data(), digits.data() + digits.size(), fileNumber);
+    if (digits.empty() || error != std::errc{} || end != digits.data() + digits.size() || fileNumber == 0 ||
+        fileNumber == std::numeric_limits<uint64_t>::max() || std::format("idx_{:06}.sst", fileNumber) != basename) {
+        return std::nullopt;
+    }
+    return fileNumber;
 }
 
 // ============================================================================
@@ -251,6 +269,17 @@ seastar::future<> NativeIndex::open() {
 
     // Open SSTable readers
     co_await refreshSSTables();
+
+    // A crash can leave a finished flush/compaction output before its manifest
+    // append, or obsolete compaction sources after their manifest removal. The
+    // recovered manifest is now validated against every live file, so all
+    // remaining canonical outputs are safe orphans. Reclaim them before the
+    // recovered memtable can allocate the same identity and before this process
+    // serves.
+    // This is deliberately startup-only: after an ambiguous manifest fsync the
+    // in-memory manifest may be older than the durable one, so a live-process
+    // sweep could delete an output that restart recovery will require.
+    co_await reconcileSSTableNamespace();
 
     // Configure per-shard concurrency limiter for SSTable block reads
     SSTableReader::setBlockReadSemaphore(&blockReadSemaphore_);
@@ -519,6 +548,66 @@ seastar::future<> NativeIndex::close() {
 
 std::string NativeIndex::sstFilename(uint64_t fileNumber) {
     return std::format("{}/idx_{:06}.sst", indexPath_, fileNumber);
+}
+
+seastar::future<> NativeIndex::reconcileSSTableNamespace() {
+    std::set<uint64_t> liveFileNumbers;
+    for (const auto& file : manifest_->files()) {
+        liveFileNumbers.insert(file.fileNumber);
+    }
+
+    auto obsoletePaths = co_await seastar::async([directory = indexPath_,
+                                                  liveFileNumbers = std::move(liveFileNumbers)] {
+        std::vector<std::string> paths;
+        for (const auto& entry : std::filesystem::directory_iterator(directory)) {
+            const auto basename = entry.path().filename().string();
+            const auto status = std::filesystem::symlink_status(entry.path());
+
+            if (basename == "MANIFEST") {
+                if (!std::filesystem::is_regular_file(status)) {
+                    throw std::runtime_error("NativeIndex MANIFEST is not a regular file: " + entry.path().string());
+                }
+                continue;
+            }
+            if (basename == "wal") {
+                if (!std::filesystem::is_directory(status)) {
+                    throw std::runtime_error("NativeIndex WAL path is not a directory: " + entry.path().string());
+                }
+                continue;
+            }
+            if (basename == "MANIFEST.tmp") {
+                if (!std::filesystem::is_regular_file(status)) {
+                    throw std::runtime_error("NativeIndex manifest temporary path is not a regular file: " +
+                                             entry.path().string());
+                }
+                paths.push_back(entry.path().string());
+                continue;
+            }
+
+            const auto fileNumber = parseCanonicalSSTableBasename(basename);
+            if (!fileNumber.has_value()) {
+                throw std::runtime_error("Unrecognized entry in NativeIndex directory: " + entry.path().string());
+            }
+            if (!std::filesystem::is_regular_file(status)) {
+                throw std::runtime_error("NativeIndex SSTable path is not a regular file: " + entry.path().string());
+            }
+            if (!liveFileNumbers.contains(*fileNumber)) {
+                paths.push_back(entry.path().string());
+            }
+        }
+        std::sort(paths.begin(), paths.end());
+        return paths;
+    });
+
+    for (const auto& path : obsoletePaths) {
+        co_await seastar::remove_file(path);
+        ::native_index_log.info("Removed unreferenced NativeIndex recovery artifact: {}", path);
+    }
+
+    // Always issue the barrier, even when this scan found nothing. A prior
+    // process may have unlinked an orphan and failed this exact barrier; in
+    // that retry state the absent pathname is the only evidence left.
+    co_await seastar::sync_directory(indexPath_);
 }
 
 // Step 4: Incremental SSTable refresh — only opens new files and closes removed ones.

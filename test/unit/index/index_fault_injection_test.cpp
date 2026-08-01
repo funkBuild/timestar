@@ -559,10 +559,10 @@ SEASTAR_TEST_F(NativeIndexFaultInjectionTest, TornWalTailStillRecoversAckedSerie
 }
 
 // SSTable flush interrupted: the .sst file was (partially) written but the
-// crash hit before the manifest referenced it. Reopen must not open or trust
-// the orphan partial file — including when the recovery flush reuses the same
-// file number — and all acked data must come back via WAL replay.
-SEASTAR_TEST_F(NativeIndexFaultInjectionTest, OrphanPartialSSTableIgnoredAndAckedDataRecovered) {
+// crash hit before the manifest referenced it. Reopen must durably reclaim the
+// orphan partial file before a recovery flush reuses the same file number, and
+// all acked data must come back via WAL replay.
+SEASTAR_TEST_F(NativeIndexFaultInjectionTest, OrphanPartialSSTableReclaimedAndAckedDataRecovered) {
     SeriesId128 idA, idB;
     {
         NativeIndex index(timestar::StorageLayout("."), 0);
@@ -581,9 +581,10 @@ SEASTAR_TEST_F(NativeIndexFaultInjectionTest, OrphanPartialSSTableIgnoredAndAcke
 
     {
         NativeIndex index(timestar::StorageLayout("."), 0);
-        // open() must not throw on the orphans (they are not in the manifest)
-        // and must flush the WAL-replayed memtable to a real SSTable.
+        // open() must reclaim the orphans (they are not in the manifest) and
+        // flush the WAL-replayed memtable to a real SSTable.
         co_await index.open();
+        EXPECT_FALSE(std::filesystem::exists("shard_0/native_index/idx_000042.sst"));
 
         auto metaA = co_await index.getSeriesMetadata(idA);
         EXPECT_TRUE(metaA.has_value()) << "acked series A lost after interrupted SSTable flush";
@@ -602,8 +603,10 @@ SEASTAR_TEST_F(NativeIndexFaultInjectionTest, OrphanPartialSSTableIgnoredAndAcke
         co_await index.close();
     }
 
-    // After the clean close the data lives in a real SSTable written over /
-    // alongside the orphans. A further reopen must read it back fine.
+    // After the clean close the unrelated crash output is still absent. A
+    // further strict reopen validates that every remaining SSTable is live and
+    // must read both recovered series back.
+    EXPECT_FALSE(std::filesystem::exists("shard_0/native_index/idx_000042.sst"));
     {
         NativeIndex index(timestar::StorageLayout("."), 0);
         co_await index.open();
@@ -619,6 +622,86 @@ SEASTAR_TEST_F(NativeIndexFaultInjectionTest, OrphanPartialSSTableIgnoredAndAcke
         }
         co_await index.close();
     }
+}
+
+SEASTAR_TEST_F(NativeIndexFaultInjectionTest, UnreferencedCanonicalSSTableIsReclaimedWithoutDeletingLiveFile) {
+    SeriesId128 id;
+    {
+        NativeIndex index(timestar::StorageLayout("."), 0);
+        co_await index.open();
+        id = co_await index.getOrCreateSeriesId("obsolete_sst", {{"host", "live"}}, "value");
+        co_await index.close();
+    }
+
+    const auto livePath = NativeIndexFaultInjectionTest::currentSSTablePath();
+    EXPECT_FALSE(livePath.empty());
+    if (livePath.empty()) {
+        co_return;
+    }
+    const std::string orphanPath = "shard_0/native_index/idx_000042.sst";
+    std::filesystem::copy_file(livePath, orphanPath);
+    EXPECT_TRUE(std::filesystem::exists(orphanPath));
+
+    {
+        NativeIndex index(timestar::StorageLayout("."), 0);
+        co_await index.open();
+        EXPECT_TRUE(std::filesystem::exists(livePath));
+        EXPECT_FALSE(std::filesystem::exists(orphanPath));
+        EXPECT_TRUE((co_await index.getSeriesMetadata(id)).has_value());
+        co_await index.close();
+    }
+}
+
+SEASTAR_TEST_F(NativeIndexFaultInjectionTest, NonCanonicalSSTableArtifactFailsClosedAndIsPreserved) {
+    {
+        NativeIndex index(timestar::StorageLayout("."), 0);
+        co_await index.open();
+        co_await index.close();
+    }
+
+    const std::string artifactPath = "shard_0/native_index/idx_1.sst";
+    const std::string contents = "possible durable generation";
+    writeWholeFile(artifactPath, contents);
+
+    NativeIndex index(timestar::StorageLayout("."), 0);
+    EXPECT_THROW(co_await index.open(), std::runtime_error);
+    EXPECT_EQ(readWholeFile(artifactPath), contents);
+}
+
+SEASTAR_TEST_F(NativeIndexFaultInjectionTest, SymlinkedOrphanSSTableFailsClosedWithoutTouchingTarget) {
+    {
+        NativeIndex index(timestar::StorageLayout("."), 0);
+        co_await index.open();
+        co_await index.close();
+    }
+
+    const auto target = std::filesystem::absolute("native_index_orphan_target");
+    const std::string contents = "must remain untouched";
+    writeWholeFile(target.string(), contents);
+    const std::string linkPath = "shard_0/native_index/idx_000042.sst";
+    std::filesystem::create_symlink(target, linkPath);
+
+    NativeIndex index(timestar::StorageLayout("."), 0);
+    EXPECT_THROW(co_await index.open(), std::runtime_error);
+    EXPECT_TRUE(std::filesystem::is_symlink(std::filesystem::symlink_status(linkPath)));
+    EXPECT_EQ(readWholeFile(target.string()), contents);
+    std::filesystem::remove(target);
+}
+
+SEASTAR_TEST_F(NativeIndexFaultInjectionTest, StaleManifestTemporaryFileIsReclaimed) {
+    {
+        NativeIndex index(timestar::StorageLayout("."), 0);
+        co_await index.open();
+        co_await index.close();
+    }
+
+    const std::string tempPath = "shard_0/native_index/MANIFEST.tmp";
+    writeWholeFile(tempPath, "complete but unpublished snapshot attempt");
+
+    NativeIndex index(timestar::StorageLayout("."), 0);
+    co_await index.open();
+    EXPECT_FALSE(std::filesystem::exists(tempPath));
+    co_await index.close();
 }
 
 SEASTAR_TEST_F(NativeIndexFaultInjectionTest, MissingManifestSSTableFailsClosed) {

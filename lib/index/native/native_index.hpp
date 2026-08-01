@@ -489,6 +489,10 @@ private:
 
     // Step 4: Incremental SSTable refresh — only opens new files and closes removed ones.
     seastar::future<> refreshSSTables();
+    // Startup-only reconciliation. The recovered manifest is the authority:
+    // validate the whole index namespace, remove only unreferenced protocol
+    // outputs, and durably publish their absence before recovery may serve.
+    seastar::future<> reconcileSSTableNamespace();
     std::string sstFilename(uint64_t fileNumber);
 
     // --- Application-level caches ---
