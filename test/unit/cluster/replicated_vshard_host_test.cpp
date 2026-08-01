@@ -639,6 +639,17 @@ TEST_F(ReplicatedVShardHostTest, TheTruncationBoundaryStaysBelowTheHighestFlushe
     }).get();
 }
 
+TEST_F(ReplicatedVShardHostTest, SharedJournalSnapshotBatchTargetsAFifteenMinuteFairScan) {
+    using Host = cluster::ReplicatedVShardHost;
+    // 180 sweeps fit in fifteen minutes at the five-second cadence. The batch scales
+    // with the supported core topologies instead of baking in the now-unsupported
+    // three-core/~1365-group assumption from D-39's original estimate.
+    EXPECT_EQ(Host::sharedJournalSnapshotsPerSweep(4096), 23u);
+    EXPECT_EQ(Host::sharedJournalSnapshotsPerSweep(2048), 12u);
+    EXPECT_EQ(Host::sharedJournalSnapshotsPerSweep(1024), 6u);
+    EXPECT_EQ(Host::sharedJournalSnapshotsPerSweep(1), 1u);
+}
+
 TEST_F(ReplicatedVShardHostTest, TheSweepIsRateLimitedPerPassAndPerGroup) {
     seastar::async([] {
         if (!timestar::vshardsCohesiveOnCores(seastar::smp::count))

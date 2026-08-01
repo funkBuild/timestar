@@ -263,12 +263,17 @@ public:
         uint64_t snapshotsUndeliverable = 0;
         uint64_t snapshotTransfersRestarted = 0;
         uint64_t snapshotTransfersAbandoned = 0;
+        size_t snapshotProductionLimitPerShard = 0;
         bool snapshotTriggerEnabled = false;
         // Raft journal fsync accounting (debt D-10). journalSyncRequests /
         // journalFsyncs is the coalescing factor -- 1.0 for the default per-VShard
         // journal, > 1 when the shared per-shard journal is enabled.
         uint64_t journalFsyncs = 0;
         uint64_t journalSyncRequests = 0;
+        uint64_t journalSegmentsDeleted = 0;
+        uint64_t journalSegmentsPinnedLastPass = 0;
+        uint64_t journalRecordsCopiedForward = 0;
+        uint64_t journalGcPasses = 0;
         bool journalShared = false;
 
         [[nodiscard]] bool readyForTraffic() const {

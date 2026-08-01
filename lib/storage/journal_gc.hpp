@@ -23,8 +23,9 @@ class SharedShardJournal;
 //     the writer), made durable with a barrier, and only THEN is the old segment
 //     deleted. A crash at any point leaves one complete generation: either the
 //     old segment (copy not yet durable) or the new copy (old not yet deleted).
-//   - A segment that can be neither is PINNED, and GC stops there, so what
-//     survives is always a physical SUFFIX of the segment sequence (see collect()).
+//   - A segment that can be neither is PINNED. The private-journal policy stops
+//     there; the shared-journal policy keeps scanning so one slow VShard cannot
+//     head-of-line block deletion of later, fully released segments.
 //
 // GC never touches the active segment (the one the writer is appending to) or
 // any segment >= it, so copy-forward targets never alias reclaim targets.
@@ -56,6 +57,17 @@ struct JournalGcOptions {
     // rewriting most of a segment to reclaim the rest of it costs more disk
     // traffic than the reclaim is worth. It also bounds the exclusive section.
     size_t maxCopyForwardRecords = 512;
+    // Continue scanning later sealed segments after an unreclaimable one. This is
+    // required by the shared layout: otherwise one idle VShard's old live record
+    // pins the entire physical suffix forever, even when later segments are fully
+    // released. It may leave holes in physical segment numbers and in the
+    // pre-snapshot portion of a VShard's retained sequence. JournalWriter already
+    // accepts physical holes, production Raft recovery is snapshot-aware, and
+    // JournalReplay permits only gaps covered by a later retained Snapshot.
+    //
+    // False remains the delete-only/private-journal policy: keeping a physical
+    // suffix there is cheap because only that one VShard can pin its directory.
+    bool continuePastPinned = false;
 };
 
 class JournalGc {
@@ -64,8 +76,8 @@ public:
         std::vector<uint64_t> deletedSegments;      // segment numbers removed
         std::vector<uint64_t> copyForwardSegments;  // sealed segments whose live records were moved
         // Every sealed segment this pass LEFT BEHIND, oldest first -- a census, not just
-        // the one that halted the pass. Because GC stops at the first unreclaimable
-        // segment, that is the halting segment and everything after it.
+        // the first pin. With continuePastPinned=false this includes the unscanned suffix;
+        // with it enabled, these are the individually inspected unreclaimable segments.
         std::vector<uint64_t> pinnedSegments;
         uint64_t copiedRecords = 0;
         uint64_t copiedBytes = 0;  // encoded body bytes copied forward

@@ -104,6 +104,28 @@ TEST(JournalReplayTest, SequenceGapFailsClosed) {
     EXPECT_TRUE(r.recordsForCore(r.ownerCore(VShardId{7})).empty());
 }
 
+TEST(JournalReplayTest, GapCoveredByALaterSnapshotIsAccepted) {
+    JournalReplay r(2);
+    ASSERT_TRUE(r.ingest(rec(7, 10, "obsolete-before-snapshot")));
+    JournalRecord snapshot = rec(7, 13, "snapshot");  // released 11-12 were collected
+    snapshot.kind = JournalRecordKind::Snapshot;
+    ASSERT_TRUE(r.ingest(snapshot));
+    ASSERT_TRUE(r.ingest(rec(7, 14, "live-after-snapshot")));
+    EXPECT_TRUE(r.finalize());
+    EXPECT_FALSE(r.failed());
+}
+
+TEST(JournalReplayTest, GapAfterTheLatestSnapshotStillFailsClosed) {
+    JournalReplay r(2);
+    JournalRecord snapshot = rec(7, 10, "snapshot");
+    snapshot.kind = JournalRecordKind::Snapshot;
+    ASSERT_TRUE(r.ingest(snapshot));
+    ASSERT_TRUE(r.ingest(rec(7, 12, "missing-live-record-11")));
+    EXPECT_FALSE(r.finalize());
+    EXPECT_TRUE(r.failed());
+    EXPECT_NE(r.failureDetail().find("discontinuity"), std::string::npos);
+}
+
 TEST(JournalReplayTest, OutOfRangeVShardFailsClosed) {
     JournalReplay r(2);
     JournalRecord bad;

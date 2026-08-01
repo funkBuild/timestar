@@ -24,9 +24,12 @@ namespace timestar {
 // segment-GC copy-forward relocates a laggard VShard's older records to the
 // physical tail (behind its newer records already in the active segment), and a
 // crash in the GC barrier->delete window leaves an identical duplicate. finalize()
-// therefore sorts each VShard's records by sequence and drops exact duplicates;
-// only a genuine gap or a CONFLICTING duplicate (same seq, different bytes) fails
-// closed.
+// therefore sorts each VShard's records by sequence and drops exact duplicates.
+// Shared-journal GC may also delete a fully released segment after an older segment
+// remains pinned by another VShard; that can expose a gap in records made obsolete by
+// a later retained Snapshot. finalize() accepts only those snapshot-covered gaps. A
+// gap after the latest retained Snapshot, or a CONFLICTING duplicate (same seq,
+// different bytes), still fails closed.
 class JournalReplay {
 public:
     // coreCount must be >= 1.
@@ -39,9 +42,10 @@ public:
     bool ingest(const JournalRecord& record);
 
     // Sort each VShard's buffered records by sequence, drop exact duplicates, and
-    // validate that each VShard's surviving sequence is gap-free (starting at
-    // whatever it starts at -- a retained log may begin mid-sequence after GC).
-    // Populates the per-core routing. Fails closed on a gap or a conflicting
+    // validate that each VShard's surviving sequence is gap-free after its latest
+    // retained Snapshot (starting at whatever it starts at -- GC may remove a prefix).
+    // Earlier gaps are safe because that Snapshot supersedes every missing record.
+    // Populates the per-core routing. Fails closed on an uncovered gap or a conflicting
     // duplicate. Returns true iff replay is valid. Idempotent.
     bool finalize();
 

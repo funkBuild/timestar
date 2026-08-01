@@ -75,38 +75,34 @@ seastar::future<JournalGc::Result> JournalGc::collect(fs::path dir, uint64_t act
         const auto gc = retention.planSegment(scan->records);
 
         // ------------------------------------------------------------------
-        // STOP AT THE FIRST SEGMENT THAT CANNOT BE RECLAIMED.
+        // HANDLE A SEGMENT THAT CANNOT BE RECLAIMED.
         //
         // A segment is unreclaimable when it still holds live records and they cannot (or
         // should not) be copied forward: copy-forward is off (the per-VShard layout, where
         // GC must never touch the writer), or the live set exceeds the budget, or the
         // segment is entirely live and copying it would churn every byte for no gain.
         //
-        // Having decided that, GC STOPS rather than skipping ahead, so what survives on
-        // disk is always a physical SUFFIX of the segment sequence. That is stronger than
-        // it needs to be for safety and it is deliberate. Deleting a LATER fully-released
-        // segment while an earlier one is pinned is safe for the records that matter --
-        // everything above a VShard's floor is live by definition, so a fully-released
-        // segment can only contain records the group is finished with -- but it can strand
-        // a NON-CONTIGUOUS set of already-dead records: a pinned segment holding VShard V
-        // at seq 10 (dead, pinned by some other VShard's live records), a later released
-        // segment holding V at 11, and V at 12 further on, leaves {10, 12} with a hole.
-        // Harmless for recovery as it stands (recoverRaftState replays by vshard_seq and
-        // re-applies idempotently, and dead records below the boundary are erased by the
-        // Snapshot record anyway), but it is a trap for anything that later validates
-        // continuity -- `JournalReplay::finalize` already fails closed on a gap, and it is
-        // the ADR's intended recovery path even though nothing calls it today. Stopping at
-        // the pin costs a delayed reclaim; the alternative costs a future recovery.
+        // The private layout stops here, preserving a physical suffix. That costs only
+        // this VShard's own directory. The shared layout MUST continue: one idle group's
+        // live HardState in an old segment would otherwise retain every later 64 MiB
+        // segment on the reactor forever, even when those later segments are entirely
+        // released. Deleting a later fully-released segment is safe by definition; any
+        // per-VShard sequence hole it exposes is below a retained Snapshot boundary.
+        // Production recoverRaftState is snapshot-aware, and JournalReplay now accepts
+        // only that precise class of covered gap while continuing to reject gaps after
+        // the latest retained Snapshot.
         // ------------------------------------------------------------------
         const bool wholeSegmentLive = gc.liveRecordIndices.size() == scan->records.size();
         const bool overBudget = gc.liveRecordIndices.size() > opts.maxCopyForwardRecords;
         if (!gc.reclaimable && (wholeSegmentLive || !opts.copyForward || overBudget)) {
-            // `pinnedSegments` is a CENSUS of what this pass leaves behind, not a record of
-            // the one segment that halted it: since GC stops here, every remaining sealed
-            // segment is retained too, and reporting only the first would make the counter
-            // read "passes that hit a pin" while claiming to measure retention (the
-            // evidence D-39 asks for). Recorded without re-reading them -- they are
-            // retained by the stop, whatever their own contents would have said.
+            if (opts.continuePastPinned) {
+                // Shared mode: this segment is genuinely pinned, but it has no authority
+                // over the independently releasable segments after it.
+                result.pinnedSegments.push_back(seg);
+                continue;
+            }
+            // Private mode: `pinnedSegments` is the census of the physical suffix this
+            // pass leaves behind, not just the record of the segment that halted it.
             for (auto it = std::find(segments.begin(), segments.end(), seg); it != segments.end(); ++it)
                 result.pinnedSegments.push_back(*it);
             break;

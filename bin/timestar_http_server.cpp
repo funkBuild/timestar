@@ -228,15 +228,22 @@ void set_routes(routes& r) {
                               ",\"snapshots_installed\":" + std::to_string(st.snapshotsInstalled) +
                               ",\"snapshots_undeliverable\":" + std::to_string(st.snapshotsUndeliverable) +
                               ",\"snapshot_transfers_restarted\":" + std::to_string(st.snapshotTransfersRestarted) +
-                              ",\"snapshot_transfers_abandoned\":" + std::to_string(st.snapshotTransfersAbandoned);
+                              ",\"snapshot_transfers_abandoned\":" + std::to_string(st.snapshotTransfersAbandoned) +
+                              ",\"snapshot_production_limit_per_shard\":" +
+                              std::to_string(st.snapshotProductionLimitPerShard);
                       // Raft journal fsyncs (debt D-10). journal_sync_requests /
                       // journal_fsyncs is the coalescing factor: 1.0 per-VShard, > 1
                       // with the shared per-shard journal. The DISK win is invisible on
                       // tmpfs, so this ratio -- not a throughput number -- is the honest
                       // evidence that the coalescer is doing anything.
-                      body += ",\"journal_shared\":" + std::string(st.journalShared ? "true" : "false") +
-                              ",\"journal_fsyncs\":" + std::to_string(st.journalFsyncs) +
-                              ",\"journal_sync_requests\":" + std::to_string(st.journalSyncRequests);
+                      body +=
+                          ",\"journal_shared\":" + std::string(st.journalShared ? "true" : "false") +
+                          ",\"journal_fsyncs\":" + std::to_string(st.journalFsyncs) +
+                          ",\"journal_sync_requests\":" + std::to_string(st.journalSyncRequests) +
+                          ",\"journal_gc_passes\":" + std::to_string(st.journalGcPasses) +
+                          ",\"journal_segments_deleted\":" + std::to_string(st.journalSegmentsDeleted) +
+                          ",\"journal_segments_pinned_last_pass\":" + std::to_string(st.journalSegmentsPinnedLastPass) +
+                          ",\"journal_records_copied_forward\":" + std::to_string(st.journalRecordsCopiedForward);
                   }
                   body += "}";
                   rep->_content = std::move(body);

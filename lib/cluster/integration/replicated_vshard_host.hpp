@@ -11,6 +11,7 @@
 #include "apply_fence.hpp"
 #include "engine_data_state_machine.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <array>
 #include <cstdint>
@@ -223,17 +224,30 @@ public:
     // VShard touches), so this is deliberately slow relative to the 20 ms Raft tick: the
     // thresholds decide WHETHER, this only decides how promptly.
     static constexpr std::chrono::seconds kSnapshotSweepInterval{5};
-    // RATE LIMIT. At most this many snapshots in flight per SHARD, over ~1365 groups on a
-    // 3-core 4096-VShard node. Snapshotting reads whole TSM files and encodes them, so a
-    // stampede would compete with the write path for the same reactor and the same disk --
-    // and the point of a background trigger is that nobody notices it.
-    static constexpr size_t kMaxConcurrentSnapshots = 1;
+    // RATE LIMIT. The default per-VShard journal produces ONE snapshot per pass.
+    // Shared journals need a different cadence: one lagging floor participates in every
+    // segment on the reactor, so one-per-pass takes 85 minutes even on the supported
+    // four-core topology (and 5.7 hours at one core). Derive a SEQUENTIAL per-pass batch
+    // that targets one fair scan every 15 minutes. The snapshots are never concurrent --
+    // maybeSnapshotOnce awaits each before starting the next -- so this does not multiply
+    // the 128 MiB per-snapshot memory ceiling. A slow disk naturally stretches the cycle
+    // because the one sweep remains in flight and later timer callbacks skip it.
+    static constexpr size_t kPrivateJournalSnapshotsPerSweep = 1;
+    static constexpr std::chrono::minutes kSharedJournalSnapshotTargetCycle{15};
+    static constexpr size_t sharedJournalSnapshotsPerSweep(size_t hostedVShards) {
+        constexpr auto sweepsPerTarget =
+            std::chrono::duration_cast<std::chrono::seconds>(kSharedJournalSnapshotTargetCycle).count() /
+            kSnapshotSweepInterval.count();
+        static_assert(sweepsPerTarget > 0);
+        return std::max<size_t>(
+            1, (hostedVShards + static_cast<size_t>(sweepsPerTarget) - 1) / static_cast<size_t>(sweepsPerTarget));
+    }
     // A group is not snapshotted again inside this window even if it re-crosses a
-    // threshold, so a hot VShard cannot monopolize the shard's one slot.
+    // threshold, so a hot VShard cannot monopolize the shard's production budget.
     static constexpr std::chrono::seconds kMinSnapshotInterval{60};
 
     // THE OTHER RATE LIMIT, and it bounds the other direction (debt D-37).
-    // kMaxConcurrentSnapshots above caps snapshot PRODUCTION on this shard; this caps
+    // The per-sweep budget above caps snapshot PRODUCTION on this shard; this caps
     // concurrent snapshot TRANSFERS out of it. Production was capped from the start
     // because it costs local CPU and disk; transfers were not, because each one is
     // individually paced at one unacked chunk -- but a shard hosts ~1365 groups and
@@ -275,10 +289,13 @@ public:
     // maybeSnapshotOnce() by hand instead.
     void startSnapshotTrigger();
 
-    // ONE sweep pass: pick at most `kMaxConcurrentSnapshots` eligible groups and snapshot
-    // them. Returns how many were snapshotted. Exposed for tests (and for an operator
-    // action later); the periodic timer just calls it.
+    // ONE sweep pass: pick at most the active journal layout's sequential batch of
+    // eligible groups and snapshot them. Returns how many were snapshotted. Exposed for
+    // tests (and for an operator action later); the periodic timer just calls it.
     seastar::future<size_t> maybeSnapshotOnce();
+    size_t snapshotProductionLimit() const {
+        return sharedSink_ ? sharedJournalSnapshotsPerSweep(vshards_.size()) : kPrivateJournalSnapshotsPerSweep;
+    }
 
     // ---- journal SEGMENT reclamation (debt D-34) ----
     //
@@ -319,11 +336,12 @@ public:
     // `JournalWriter::open()` hands its record set to `recoverRaftState`, which sorts one
     // VShard's records by vshard_seq and replays them, so a repeat re-applies the same
     // HardState / re-places the same entry at the same index / re-decodes the same
-    // Snapshot and the reconstructed state is identical. (`JournalReplay::finalize` is
-    // stricter -- it dedupes and validates continuity -- but it has NO production caller,
-    // so it is not what makes this safe.) A partially-deleted sequence is fine for the
-    // same reason: each segment is an independent step, and GC stops at the first pinned
-    // segment so what survives is always a physical SUFFIX of the sequence.
+    // Snapshot and the reconstructed state is identical. (`JournalReplay::finalize`
+    // dedupes too and rejects any sequence gap not covered by a later retained Snapshot,
+    // but it has NO production caller, so it is not what makes this safe.) A
+    // partially-deleted sequence is fine for the same reason: each segment is an
+    // independent step. Private journals preserve a physical suffix; shared journals may
+    // leave holes only in records their retention floors prove obsolete.
     static constexpr std::chrono::seconds kJournalGcInterval{60};
     // Run one reclamation pass now (publish floors, then collect). Returns the number of
     // segment files deleted. Exposed for tests and for an operator action; the sweep
@@ -335,12 +353,12 @@ public:
     const JournalRetention& journalRetention() const { return retention_; }
 
     uint64_t journalSegmentsDeleted() const { return journalSegmentsDeleted_; }
-    // Sealed segments the LAST pass left behind, across every journal it looked at -- a
-    // GAUGE, not a cumulative count, and deliberately so. GC stops at the first segment it
-    // cannot reclaim, so `pinned` census + `deleted` on the same pass is the pair that
-    // answers "is retention keeping up?" (debt D-39 asks for exactly this comparison). A
-    // running total would be meaningless: the same retained segment would be counted again
-    // on every pass until its group compacts.
+    // Sealed segments the LAST pass left behind, across every journal it inspected -- a
+    // GAUGE, not a cumulative count, and deliberately so. Shared mode scans past pins, so
+    // these are individually unreclaimable segments rather than an uninspected physical
+    // suffix. `pinned` + the pass's deletion delta answers "is retention keeping up?". A
+    // running pin total would be meaningless: the same retained segment would be counted
+    // again on every pass until its group compacts.
     uint64_t journalSegmentsPinnedLastPass() const { return journalSegmentsPinnedLastPass_; }
     uint64_t journalRecordsCopiedForward() const { return journalRecordsCopiedForward_; }
     uint64_t journalGcPasses() const { return journalGcPasses_; }

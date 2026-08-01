@@ -1,6 +1,7 @@
 #include "../../../lib/storage/journal_gc.hpp"
 
 #include "../../../lib/cluster/raft/raft_journal_persistence.hpp"  // recoverRaftState: the PRODUCTION reader
+#include "../../../lib/storage/journal_replay.hpp"
 #include "../../../lib/storage/journal_retention.hpp"
 #include "../../../lib/storage/journal_writer.hpp"
 
@@ -285,6 +286,62 @@ seastar::future<> testCopyForwardRespectsItsBudget() {
 }
 TEST(JournalGcTest, CopyForwardRespectsItsBudget) {
     testCopyForwardRespectsItsBudget().get();
+}
+
+// SHARED-JOURNAL HEAD-OF-LINE RECLAMATION (debt D-39). Segment 0 is pinned by
+// VShard 2, but segment 1 contains only a released VShard-1 record. Shared mode must
+// delete segment 1 instead of treating segment 0 as authority over the whole suffix.
+// This deliberately leaves VShard 1 with seq {1, 3}; seq 3 is a retained Snapshot, so
+// both the production recovery path and the stricter future replay path must accept the
+// covered gap while preserving the boundary.
+seastar::future<> testSharedGcContinuesPastAPinAndRecoveryAcceptsTheCoveredGap() {
+    const auto dir = tmpDir("pastpin");
+    constexpr size_t segmentBytes = JournalSegmentHeader::kEncodedBytes + 90;
+    JournalWriter w(dir, header(), segmentBytes);
+    co_await w.open();
+
+    // These two small records share segment 0. VShard 1's is released; VShard 2's is
+    // live, making the segment partially released and over the zero-record copy budget.
+    co_await w.append(rec(1, 1, "old"));
+    co_await w.append(rec(2, 1, "live"));
+    // Large enough to rotate into segment 1, which is fully released.
+    co_await w.append(rec(1, 2, std::string(30, 'r')));
+    // Rotate once more so segment 1 is sealed and retain a snapshot in active segment 2.
+    JournalRecord snapshot = rec(1, 3, std::string(60, 's'));
+    snapshot.kind = JournalRecordKind::Snapshot;
+    snapshot.raftIndex = 2;
+    snapshot.raftTerm = 1;
+    co_await w.append(snapshot);
+    co_await w.barrier();
+    ASSERT_TRUE_OR_RETURN(w.currentSegmentNumber() >= 2);
+
+    JournalRetention ret;
+    ret.setReleased(VShardId{1}, 2);
+    ret.setReleased(VShardId{2}, 0);
+    auto result = co_await JournalGc::collect(
+        dir, w.currentSegmentNumber(), w, ret,
+        JournalGc::Options{.copyForward = true, .maxCopyForwardRecords = 0, .continuePastPinned = true});
+    EXPECT_EQ(result.pinnedSegments, (std::vector<uint64_t>{0}));
+    EXPECT_EQ(result.deletedSegments, (std::vector<uint64_t>{1}))
+        << "a pin may retain itself, not an independently released physical suffix";
+    co_await w.close();
+
+    JournalWriter w2(dir, header(), segmentBytes);
+    auto recovered = co_await w2.open();
+    co_await w2.close();
+    auto state = timestar::raft::recoverRaftState(recovered, VShardId{1});
+    ASSERT_TRUE_OR_RETURN(state.snapshot.has_value());
+    EXPECT_EQ(state.snapshot->index, 2u);
+    EXPECT_EQ(state.nextSeq, 4u);
+
+    timestar::JournalReplay replay(1);
+    for (const auto& record : recovered)
+        ASSERT_TRUE_OR_RETURN(replay.ingest(record));
+    EXPECT_TRUE(replay.finalize()) << replay.failureDetail();
+    fs::remove_all(dir);
+}
+TEST(JournalGcTest, SharedGcContinuesPastAPinAndRecoveryAcceptsTheCoveredGap) {
+    testSharedGcContinuesPastAPinAndRecoveryAcceptsTheCoveredGap().get();
 }
 
 // A PARTIALLY-DELETED SEQUENCE RECOVERS. GC deletes oldest-first, one segment at a time,

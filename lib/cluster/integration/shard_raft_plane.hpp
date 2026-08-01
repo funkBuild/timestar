@@ -409,6 +409,7 @@ public:
         size_t transfersActive = 0;
         size_t transfersWaiting = 0;
         size_t transferCap = 0;
+        size_t productionLimit = 0;  // sequential snapshots attempted per sweep on this shard
         bool triggerEnabled = false;
     };
 
@@ -420,6 +421,10 @@ public:
     struct JournalCounts {
         uint64_t fsyncs = 0;
         uint64_t syncRequests = 0;
+        uint64_t segmentsDeleted = 0;
+        uint64_t segmentsPinnedLastPass = 0;
+        uint64_t recordsCopiedForward = 0;
+        uint64_t gcPasses = 0;
         bool shared = false;
     };
 
@@ -430,6 +435,10 @@ public:
         auto& host = const_cast<ReplicatedDataPlane*>(plane_.get())->host();
         c.fsyncs = host.journalFsyncs();
         c.syncRequests = host.journalSyncRequests();
+        c.segmentsDeleted = host.journalSegmentsDeleted();
+        c.segmentsPinnedLastPass = host.journalSegmentsPinnedLastPass();
+        c.recordsCopiedForward = host.journalRecordsCopiedForward();
+        c.gcPasses = host.journalGcPasses();
         c.shared = ReplicatedVShardHost::sharedJournalEnabled();
         return c;
     }
@@ -449,6 +458,7 @@ public:
         c.transfersActive = host.snapshotTransfersActive();
         c.transfersWaiting = host.snapshotTransfersWaiting();
         c.transferCap = ReplicatedVShardHost::snapshotTransferCap();
+        c.productionLimit = host.snapshotProductionLimit();
         for (uint16_t vs = 0; vs <= timestar::VIRTUAL_SHARD_MASK; ++vs) {
             if (!host.hosts(vs))
                 continue;

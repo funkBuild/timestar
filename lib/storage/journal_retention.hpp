@@ -37,11 +37,11 @@ public:
     // two hazards that pull in OPPOSITE directions, and each single-line "fix" causes the
     // other one:
     //
-    //   * FORGETTING ALONE STALLS RECLAMATION. `released()` drops to 0, so every record
-    //     the departed VShard ever wrote reads as LIVE. Its segments are pinned, and
-    //     because `JournalGc` STOPS at the first segment it cannot reclaim, the whole
-    //     shard's reclamation halts behind a group that no longer exists -- permanently,
-    //     since nothing will ever advance a floor for it again.
+    //   * FORGETTING ALONE LEAKS THE DEPARTED GROUP. `released()` drops to 0, so every
+    //     record that VShard ever wrote reads as LIVE forever. In a private journal that
+    //     pins its whole directory; in a shared journal each segment containing one of
+    //     those records stays pinned (D-39 lets unrelated later segments reclaim, but it
+    //     cannot make the departed group's records dead without this protocol).
     //   * PUBLISHING "EVERYTHING RELEASED" ALONE LEAKS THE ENTRY. It reclaims correctly
     //     now, but `setReleased` is MONOTONIC, so the watermark survives; a later re-add
     //     over a fresh journal -- whose `vshard_seq` restarts at 1 -- inherits it and the

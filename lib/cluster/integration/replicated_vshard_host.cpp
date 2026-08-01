@@ -482,8 +482,9 @@ seastar::future<size_t> ReplicatedVShardHost::reclaimJournalSegments() {
             // sealed segment is immutable), so only the bounded copy-forward write runs
             // inside runExclusive. Wrapping the whole call would hold every group on the
             // reactor off its group-commit for the length of a directory walk.
-            auto result = co_await JournalGc::collect(dir, active, *sharedWriter_, retention_, JournalGc::Options{},
-                                                      sharedSink_.get());
+            auto result =
+                co_await JournalGc::collect(dir, active, *sharedWriter_, retention_,
+                                            JournalGc::Options{.continuePastPinned = true}, sharedSink_.get());
             deleted += result.deletedSegments.size();
             pinned += result.pinnedSegments.size();
             journalRecordsCopiedForward_ += result.copiedRecords;
@@ -609,26 +610,28 @@ seastar::future<size_t> ReplicatedVShardHost::maybeSnapshotOnce() {
     // Collect candidates first, THEN snapshot: `snapshotVShard` suspends, and mutating
     // `vshards_` under a suspended iterator over it is how this would become a UAF.
     std::vector<uint16_t> candidates;
+    const size_t productionLimit = snapshotProductionLimit();
     // (c) STAGGER: start the scan at a rotating offset so the same low-numbered VShards do
-    // not always win the shard's one slot. Two passes over a map is cheaper than any
-    // ordering trick and this runs once every 5 s.
+    // not always win the shard's production budget. Two passes over a map is cheaper than
+    // any ordering trick and this runs once every 5 s.
     const size_t n = vshards_.size();
     const size_t start = n == 0 ? 0 : snapshotCursor_ % n;
+    size_t nextCursor = n == 0 ? 0 : (start + 1) % n;
     size_t idx = 0;
-    for (int lap = 0; lap < 2 && candidates.size() < kMaxConcurrentSnapshots; ++lap) {
+    for (int lap = 0; lap < 2 && candidates.size() < productionLimit; ++lap) {
         idx = 0;
         for (const auto& [vs, state] : vshards_) {
-            const bool inRange = (lap == 0) ? (idx >= start) : (idx < start);
-            ++idx;
+            const size_t currentIdx = idx++;
+            const bool inRange = (lap == 0) ? (currentIdx >= start) : (currentIdx < start);
             if (!inRange)
                 continue;
-            if (candidates.size() >= kMaxConcurrentSnapshots)
+            if (candidates.size() >= productionLimit)
                 break;
             raft::RaftGroup* g = registry_.group(vs);
             if (!g || !state.sm)
                 continue;
             // Not again inside kMinSnapshotInterval, so a hot VShard cannot monopolize the
-            // slot while every other group's log grows.
+            // production budget while every other group's log grows.
             if (state.lastSnapshot.time_since_epoch().count() != 0 && now - state.lastSnapshot < snapshotMinInterval_)
                 continue;
             const raft::LogIndex boundary = g->node().log().snapshotIndex();
@@ -643,13 +646,19 @@ seastar::future<size_t> ReplicatedVShardHost::maybeSnapshotOnce() {
             if (!byEntries && !byBytes && !always)
                 continue;
             candidates.push_back(vs);
+            // Resume immediately AFTER the last group selected, not by an arithmetic
+            // cursor jump. A `limit + 1` jump creates permanent-looking stripes when its
+            // stride shares a divisor with the hosted-group count; with a min interval
+            // shorter than a full scan, already-snapshotted groups can become eligible
+            // again before those stripes ever get a turn.
+            nextCursor = (currentIdx + 1) % n;
         }
     }
-    snapshotCursor_ += kMaxConcurrentSnapshots + 1;
+    snapshotCursor_ = nextCursor;
 
-    // kMaxConcurrentSnapshots is 1, so this is a loop for the sake of the constant rather
-    // than for parallelism -- deliberately: raising the constant must not silently mean
-    // "read and encode N VShards' TSM files at once on one reactor".
+    // Sequential, deliberately: shared mode raises the number attempted per pass so a
+    // fair scan completes within its target cycle, but it must not mean "read and encode
+    // N VShards' TSM files at once on one reactor".
     for (uint16_t vs : candidates) {
         if (stopped_)
             break;

@@ -52,6 +52,16 @@ bool JournalReplay::finalize() {
         std::stable_sort(records.begin(), records.end(),
                          [](const JournalRecord& a, const JournalRecord& b) { return a.vshardSeq < b.vshardSeq; });
 
+        // Shared-journal GC may leave an old segment pinned by ANOTHER VShard while
+        // deleting a newer, fully released one. That exposes holes only in records a
+        // retained Snapshot has already superseded. Find the newest such boundary up
+        // front so the continuity check below can distinguish an expected GC hole from
+        // loss in the live post-snapshot suffix.
+        uint64_t latestSnapshotSeq = 0;
+        for (const JournalRecord& record : records)
+            if (record.kind == JournalRecordKind::Snapshot)
+                latestSnapshotSeq = std::max(latestSnapshotSeq, record.vshardSeq);
+
         auto& out = byCore_[ownerCore(VShardId{vs})];
         bool first = true;
         uint64_t prevSeq = 0;
@@ -74,7 +84,7 @@ bool JournalReplay::finalize() {
                     fail("VShard " + std::to_string(vs) + " sequence space exhausted");
                     return false;
                 }
-                if (record.vshardSeq != prevSeq + 1) {
+                if (record.vshardSeq != prevSeq + 1 && record.vshardSeq > latestSnapshotSeq) {
                     fail("VShard " + std::to_string(vs) + " sequence discontinuity: expected " +
                          std::to_string(prevSeq + 1) + " but saw " + std::to_string(record.vshardSeq));
                     return false;

@@ -1008,10 +1008,15 @@ seastar::future<ClusterDataPlane::Status> ClusterDataPlane::status() const {
         st.snapshotsUndeliverable += sc.undeliverable;
         st.snapshotTransfersRestarted += sc.transfersRestarted;
         st.snapshotTransfersAbandoned += sc.transfersAbandoned;
+        st.snapshotProductionLimitPerShard = std::max(st.snapshotProductionLimitPerShard, sc.productionLimit);
         st.snapshotTriggerEnabled = st.snapshotTriggerEnabled && sc.triggerEnabled;
         auto jc = co_await shards.invoke_on(sh, [](ShardRaftPlane& p) { return p.journalCounts(); });
         st.journalFsyncs += jc.fsyncs;
         st.journalSyncRequests += jc.syncRequests;
+        st.journalSegmentsDeleted += jc.segmentsDeleted;
+        st.journalSegmentsPinnedLastPass += jc.segmentsPinnedLastPass;
+        st.journalRecordsCopiedForward += jc.recordsCopiedForward;
+        st.journalGcPasses += jc.gcPasses;
         st.journalShared = st.journalShared || jc.shared;
     }
     co_return st;
