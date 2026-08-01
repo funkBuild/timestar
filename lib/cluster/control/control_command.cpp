@@ -111,6 +111,7 @@ enum : uint8_t {
     kAdmitWithToken = 10,
     kSetActiveVersion = 11,
     kSetInitialServingMap = 12,
+    kSetActiveVersionCovered = 13,
 };
 
 void writeNode(Writer& w, const NodeRecord& r) {
@@ -220,8 +221,9 @@ std::string encodeCommand(const ControlCommand& cmd) {
                 writeNode(w, c.record);
                 w.str(c.token);
             } else if constexpr (std::is_same_v<T, SetActiveVersion>) {
-                w.u8(kSetActiveVersion);
+                w.u8(kSetActiveVersionCovered);
                 w.u64(c.version);
+                w.ids(c.coveredVoters);
             } else if constexpr (std::is_same_v<T, SetInitialServingMap>) {
                 w.u8(kSetInitialServingMap);
                 writeControlMap(w, c.map);
@@ -308,6 +310,16 @@ std::optional<ControlCommand> decodeCommand(const std::string& bytes) {
         case kSetActiveVersion: {
             SetActiveVersion c;
             c.version = r.u32();
+            // Backward-compatible decode of the pre-coverage command. Its empty
+            // proof is rejected by production apply. The covered form has a new
+            // tag so a truncated current command cannot masquerade as this one.
+            cmd = std::move(c);
+            break;
+        }
+        case kSetActiveVersionCovered: {
+            SetActiveVersion c;
+            c.version = r.u32();
+            c.coveredVoters = r.ids();
             cmd = std::move(c);
             break;
         }

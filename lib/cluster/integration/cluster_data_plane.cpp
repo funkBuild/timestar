@@ -11,6 +11,7 @@
 #include "../data/write_errors.hpp"
 #include "checkquorum_policy.hpp"
 #include "group0_startup.hpp"
+#include "journal_format_bridge.hpp"
 #include "write_admission.hpp"
 
 #include <algorithm>
@@ -525,8 +526,10 @@ seastar::future<> ClusterDataPlane::startImpl(const ClusterConfig& cfg, seastar:
                                 control::DurableControlMapStore(dataRoot).persist(map);
                             });
                         };
+                        auto publishFormat = [](uint32_t version) { return publishJournalFormat(version); };
                         co_await plane.addGroup0(std::move(voters), ropts, clusterUuid, record,
-                                                 initialServingMap, std::move(publishCache));
+                                                 initialServingMap, std::move(publishCache),
+                                                 std::move(publishFormat));
                         auto* host = plane.group0();
                         if (!host || !host->group() || !host->stateMachine())
                             throw std::runtime_error("cluster: group-0 host failed to register its Raft group");

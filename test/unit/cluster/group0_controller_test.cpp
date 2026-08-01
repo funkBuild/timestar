@@ -381,32 +381,41 @@ seastar::future<> testFormatActivationGatedByVoterSupport() {
     co_await router.pump();
     co_await controller.initCluster("c1", rec(1, "rack-a"));
     co_await router.pump();
+    EXPECT_TRUE(co_await controller.publishInitialServingMap(initialServingMap()));
     EXPECT_EQ(nodes[1].sm->state().activeFormatVersion, 1u) << "starts at format 1";
 
-    // Every voter supports 1..3 -> activate 3 succeeds.
-    EXPECT_TRUE(co_await controller.activateFormat(3, {timestar::features::VersionRange{1, 3}}));
+    // Group 0 has one voter, but the serving map has three. A meta-only
+    // capability proof is rejected rather than activating a format on data
+    // voters whose decoders were never checked.
+    EXPECT_FALSE(co_await controller.activateFormat(
+        3, {{1, timestar::features::VersionRange{1, 3}}}));
+    EXPECT_EQ(nodes[1].sm->state().activeFormatVersion, 1u);
+
+    const std::map<NodeId, timestar::features::VersionRange> v3 = {
+        {1, {1, 3}}, {2, {1, 3}}, {3, {1, 3}}};
+    EXPECT_TRUE(co_await controller.activateFormat(3, v3));
     EXPECT_EQ(nodes[1].sm->state().activeFormatVersion, 3u);
 
     // Re-activating the already committed version is a no-op, not a successful
     // cluster decision.
-    EXPECT_FALSE(co_await controller.activateFormat(3, {timestar::features::VersionRange{1, 3}}));
+    EXPECT_FALSE(co_await controller.activateFormat(3, v3));
 
     // Version 5 exceeds the voter's max (3) -> REFUSED, no proposal, version unchanged.
-    EXPECT_FALSE(co_await controller.activateFormat(5, {timestar::features::VersionRange{1, 3}}));
+    EXPECT_FALSE(co_await controller.activateFormat(5, v3));
     co_await router.pump();
     EXPECT_EQ(nodes[1].sm->state().activeFormatVersion, 3u) << "unsupported version must not activate";
 
-    // A range list that does not correspond exactly to the current voter set is
-    // rejected; otherwise a caller could omit an incompatible voter and fake
-    // unanimity.
+    // One lagging data voter blocks activation even though the sole meta-voter
+    // supports it.
     EXPECT_FALSE(co_await controller.activateFormat(
-        4, {timestar::features::VersionRange{1, 4}, timestar::features::VersionRange{1, 4}}));
+        4, {{1, {1, 4}}, {2, {1, 4}}, {3, {1, 3}}}));
     co_await router.pump();
     EXPECT_EQ(nodes[1].sm->state().activeFormatVersion, 3u) << "one lagging voter blocks activation";
 
     // Once every voter advertises v5, the same committed mechanism activates
     // bounded delete commands, payload v4, and the Expired reply contract.
-    EXPECT_TRUE(co_await controller.activateFormat(5, {timestar::features::VersionRange{1, 5}}));
+    EXPECT_TRUE(co_await controller.activateFormat(
+        5, {{1, {1, 5}}, {2, {1, 5}}, {3, {1, 5}}}));
     co_await router.pump();
     EXPECT_EQ(nodes[1].sm->state().activeFormatVersion, 5u);
 

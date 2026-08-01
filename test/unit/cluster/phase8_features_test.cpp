@@ -263,9 +263,9 @@ TEST(JournalFormatBridge, OnlyACommittedGroup0ActivationRaisesTheJournalFormat) 
     timestar::control::Group0State st;
     ASSERT_EQ(st.activeFormatVersion, 1u) << "group-0 starts at format 1";
 
-    // A fresh cluster: nothing activated, so the journal stays on v1. This is the state
-    // production is in today -- no live group 0 is composed into the running data plane, so
-    // no node observes an activation and no v2 byte can reach a journal.
+    // A fresh cluster: nothing activated, so the journal stays on v1. Production now
+    // publishes an activation after it is committed, but does not originate one until
+    // every data-group voter capability and the upgrade preflight are proven.
     timestar::cluster::publishJournalFormat(st).get();
     EXPECT_EQ(timestar::data::JournalFormatGate::writeBatchFormat(), timestar::data::kWriteBatchFormatV1);
 

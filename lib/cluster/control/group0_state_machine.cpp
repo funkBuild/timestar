@@ -12,6 +12,7 @@ namespace timestar::control {
 namespace {
 
 constexpr uint64_t kServingMapSnapshotMagic = 0x54534730'4d415031ull;  // "TSG0MAP1"
+constexpr uint64_t kFormatVotersSnapshotMagic = 0x54534730'46564f31ull;  // "TSG0FVO1"
 
 // State (snapshot) serialization -- distinct from command serialization: it
 // encodes the whole Group0State so a snapshot fully reconstructs a node.
@@ -161,6 +162,9 @@ bool validNodeRecord(const Group0State& state, const NodeRecord& record) {
 }
 
 bool validNodeSet(const std::vector<NodeId>& nodes);
+bool activationCoversServingVoters(const Group0State& state, const std::vector<NodeId>& coveredVoters);
+bool activeFormatProofCoversCurrentServingMap(
+    const Group0State& state, const std::vector<NodeId>& coveredVoters);
 
 bool validSnapshotState(const Group0State& state) {
     std::set<std::string> nodeUuids;
@@ -190,7 +194,11 @@ bool validSnapshotState(const Group0State& state) {
             return false;
     if ((state.controllerTerm == 0) != (state.controllerLeader == raft::kNoNode))
         return false;
-    return state.activeFormatVersion != 0;
+    if (state.activeFormatVersion == 0)
+        return false;
+    if (state.activeFormatVersion == 1)
+        return state.activeFormatVoters.empty();
+    return activeFormatProofCoversCurrentServingMap(state, state.activeFormatVoters);
 }
 
 bool validNodeSet(const std::vector<NodeId>& nodes) {
@@ -200,6 +208,35 @@ bool validNodeSet(const std::vector<NodeId>& nodes) {
     for (NodeId id : nodes)
         if (id == raft::kNoNode || !unique.insert(id).second)
             return false;
+    return true;
+}
+
+bool activationCoversServingVoters(const Group0State& state, const std::vector<NodeId>& coveredVoters) {
+    if (!isCompleteControlMap(state.servingMap) || !validNodeSet(coveredVoters) ||
+        !std::is_sorted(coveredVoters.begin(), coveredVoters.end()))
+        return false;
+    std::set<NodeId> required(state.metaVoters.begin(), state.metaVoters.end());
+    for (const auto& placement : state.servingMap.placement)
+        required.insert(placement.second.begin(), placement.second.end());
+    return std::equal(required.begin(), required.end(), coveredVoters.begin(), coveredVoters.end());
+}
+
+bool activeFormatProofCoversCurrentServingMap(
+    const Group0State& state, const std::vector<NodeId>& coveredVoters) {
+    if (!isCompleteControlMap(state.servingMap) || !validNodeSet(coveredVoters) ||
+        !std::is_sorted(coveredVoters.begin(), coveredVoters.end()))
+        return false;
+    // This vector records the exact meta+data voter union at activation time.
+    // Later group-0 membership changes must not invalidate an otherwise safe
+    // snapshot, but every node that can currently serve data must still appear
+    // in the proof. A future serving-map cutover that introduces an uncovered
+    // replica therefore fails closed until a new activation/proof is committed.
+    for (const auto& [vshard, replicas] : state.servingMap.placement) {
+        (void)vshard;
+        for (NodeId replica : replicas)
+            if (!std::binary_search(coveredVoters.begin(), coveredVoters.end(), replica))
+                return false;
+    }
     return true;
 }
 
@@ -233,6 +270,14 @@ void Group0StateMachine::setServingMapObserver(ServingMapObserver observer) {
     if (servingMapObserver_)
         throw std::logic_error("group0: serving-map observer was configured more than once");
     servingMapObserver_ = std::move(observer);
+}
+
+void Group0StateMachine::setActiveFormatObserver(ActiveFormatObserver observer) {
+    if (!observer)
+        throw std::invalid_argument("group0: active-format observer is empty");
+    if (activeFormatObserver_)
+        throw std::logic_error("group0: active-format observer was configured more than once");
+    activeFormatObserver_ = std::move(observer);
 }
 
 bool Group0StateMachine::stateMatchesLocalExpectations(const Group0State& state) const {
@@ -384,12 +429,15 @@ bool Group0StateMachine::applyCommand(const ControlCommand& cmd) {
             } else if constexpr (std::is_same_v<T, SetActiveVersion>) {
                 // Monotonic: a stale/replayed lower version must never regress the
                 // active format (nodes only ever move formats forward). The safety
-                // check (every voter can read it) is enforced by the controller BEFORE
-                // proposing; apply is the durable, monotonic record.
-                if (c.version > state_.activeFormatVersion)
+                // proof is also checked here against replicated membership. A
+                // controller that checked only meta-voters cannot activate data
+                // emission, even if its command reaches consensus.
+                if (c.version > state_.activeFormatVersion &&
+                    activationCoversServingVoters(state_, c.coveredVoters)) {
                     state_.activeFormatVersion = c.version;
-                else
-                    ok = false;  // no-op: not an advance
+                    state_.activeFormatVoters = c.coveredVoters;
+                } else
+                    ok = false;  // no-op: not an advance or incomplete proof
             } else if constexpr (std::is_same_v<T, SetInitialServingMap>) {
                 // Single-assignment by construction. A later serving-map epoch
                 // is a topology cutover and must go through the resumable data
@@ -423,10 +471,27 @@ seastar::future<> Group0StateMachine::apply(raft::LogEntry entry) {
     if (auto* stamp = std::get_if<SetControllerTerm>(&*cmd))
         stamp->term = entry.term;
     rejectConflictingLocalCommand(*cmd);
-    applyCommand(*cmd);
-    if (servingMapObserver_ && std::holds_alternative<SetInitialServingMap>(*cmd) &&
-        state_.servingMap.epoch != 0)
-        co_await servingMapObserver_(state_.servingMap);
+    const bool publishesServingMap =
+        servingMapObserver_ && std::holds_alternative<SetInitialServingMap>(*cmd);
+    const bool publishesActiveFormat =
+        activeFormatObserver_ && std::holds_alternative<SetActiveVersion>(*cmd);
+    std::optional<Group0State> previous;
+    if (publishesServingMap || publishesActiveFormat)
+        previous = state_;
+    const bool applied = applyCommand(*cmd);
+    if (applied && previous) {
+        Group0State staged = std::move(state_);
+        state_ = std::move(*previous);
+        // Keep both the logical state and applied boundary private until every
+        // node-local publication succeeds. A failure leaves the old state
+        // visible, so replay deterministically reapplies and republishes the
+        // exact same committed entry.
+        if (publishesServingMap)
+            co_await servingMapObserver_(staged.servingMap);
+        if (publishesActiveFormat)
+            co_await activeFormatObserver_(staged.activeFormatVersion);
+        state_ = std::move(staged);
+    }
     state_.appliedIndex = entry.index;
     co_return;
 }
@@ -473,10 +538,14 @@ std::string Group0StateMachine::snapshot() const {
         w.u64(kServingMapSnapshotMagic);
         writeControlMap(w, state_.servingMap);
     }
+    if (!state_.activeFormatVoters.empty()) {
+        w.u64(kFormatVotersSnapshotMagic);
+        w.ids(state_.activeFormatVoters);
+    }
     return std::move(w.out);
 }
 
-bool Group0StateMachine::loadSnapshot(const std::string& data) {
+bool Group0StateMachine::decodeSnapshot(const std::string& data, Group0State& decoded) const {
     SR r{data.data(), data.data() + data.size()};
     Group0State s;
     s.clusterUuid = r.str();
@@ -558,9 +627,24 @@ bool Group0StateMachine::loadSnapshot(const std::string& data) {
         else
             s.servingMap = readControlMap(r);
     }
+    remaining = static_cast<size_t>(r.end - r.p);
+    if (r.ok && remaining != 0) {
+        if (remaining < 16 || r.u64() != kFormatVotersSnapshotMagic)
+            r.ok = false;
+        else
+            s.activeFormatVoters = r.ids();
+    }
     if (!r.ok || r.p != r.end || !validSnapshotState(s) || !stateMatchesLocalExpectations(s))
         return false;  // reject a corrupt snapshot without half-applying it
-    state_ = std::move(s);
+    decoded = std::move(s);
+    return true;
+}
+
+bool Group0StateMachine::loadSnapshot(const std::string& data) {
+    Group0State decoded;
+    if (!decodeSnapshot(data, decoded))
+        return false;
+    state_ = std::move(decoded);
     return true;
 }
 
@@ -569,13 +653,20 @@ seastar::future<> Group0StateMachine::applySnapshot(raft::Snapshot snap) {
     // this method. Treating a decode failure as success advances Raft's applied index
     // while leaving the old control state in service. That is silent control-plane
     // divergence, so fail-stop and let the group be quarantined.
-    if (!loadSnapshot(snap.data))
+    Group0State decoded;
+    if (!decodeSnapshot(snap.data, decoded))
         throw std::runtime_error("group0: invalid control-state snapshot");
-    if (servingMapObserver_ && state_.servingMap.epoch != 0)
-        co_await servingMapObserver_(state_.servingMap);
+    if (servingMapObserver_ && decoded.servingMap.epoch != 0)
+        co_await servingMapObserver_(decoded.servingMap);
+    if (activeFormatObserver_)
+        co_await activeFormatObserver_(decoded.activeFormatVersion);
     // The snapshot boundary is at least this index.
-    if (snap.index > state_.appliedIndex)
-        state_.appliedIndex = snap.index;
+    if (snap.index > decoded.appliedIndex)
+        decoded.appliedIndex = snap.index;
+    // Publish recovered replicated state only after every node-local observer
+    // succeeds. On failure the old state and applied boundary remain visible,
+    // and Raft can retry the same idempotent snapshot installation.
+    state_ = std::move(decoded);
     co_return;
 }
 

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <seastar/core/coroutine.hh>
+#include <set>
 #include <stdexcept>
 
 namespace timestar::control {
@@ -25,25 +26,33 @@ seastar::future<bool> Group0Controller::proposeCommand(ControlCommand cmd) {
     co_return co_await g0_.proposeAndAwaitApplied(encodeCommand(cmd));
 }
 
-seastar::future<bool> Group0Controller::activateFormat(uint32_t version,
-                                                       const std::vector<features::VersionRange>& voterVersions) {
+seastar::future<bool> Group0Controller::activateFormat(
+    uint32_t version, const std::map<raft::NodeId, features::VersionRange>& nodeVersions) {
     if (!g0_.isLeader())
         co_return false;
     if (version <= sm_.state().activeFormatVersion)
         co_return false;
-    // The supplied ranges are positional metadata for the CURRENT stable voter
-    // set. Missing a voter would make an unsafe activation look unanimous; an
-    // extra range is equally ambiguous. Refuse changes during joint consensus,
-    // where there is no single positional voter set to validate against.
     const auto& config = g0_.node().config();
-    if (config.joint() || voterVersions.size() != config.voters.size())
+    if (config.joint() || metaVotersDiffer(sm_.state().metaVoters, config.voters) ||
+        !isCompleteControlMap(sm_.state().servingMap))
         co_return false;
-    // SAFETY GATE (decision 8): activate ONLY if every current voter can read the
-    // format, so no node is ever sent data in a format it cannot decode. Refuse
-    // otherwise -- the incompatible voter must be upgraded first.
-    if (!features::FeatureGate::canActivate(version, voterVersions))
+    std::set<raft::NodeId> required(config.voters.begin(), config.voters.end());
+    for (const auto& placement : sm_.state().servingMap.placement)
+        required.insert(placement.second.begin(), placement.second.end());
+    std::vector<features::VersionRange> ranges;
+    ranges.reserve(required.size());
+    for (raft::NodeId voter : required) {
+        auto capability = nodeVersions.find(voter);
+        if (capability == nodeVersions.end())
+            co_return false;
+        ranges.push_back(capability->second);
+    }
+    if (!features::FeatureGate::canActivate(version, ranges))
         co_return false;
-    co_return co_await proposeCommand(SetActiveVersion{version});
+    std::vector<raft::NodeId> covered(required.begin(), required.end());
+    if (!co_await proposeCommand(SetActiveVersion{version, std::move(covered)}))
+        co_return false;
+    co_return sm_.state().activeFormatVersion >= version;
 }
 
 seastar::future<> Group0Controller::initCluster(std::string clusterUuid, NodeRecord selfRecord) {

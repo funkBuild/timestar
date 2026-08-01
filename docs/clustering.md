@@ -953,15 +953,23 @@ gate. `/cluster/status` reports `active_cluster_format` and
 
 This is not yet an operable rolling-upgrade path. The current server can opt into
 a persistent group-0 host and explicitly initialize its one-voter seed with
-`--cluster-init`, but it does not call the activation bridge or admit fresh
-observers through a seed/join RPC. Static placement remains authoritative and the
-data plane remains at format v1: snapshot production and bounded deletes are
-refused and readiness stays false. Production enablement still requires committed
-effective-map publication, activation over every data-group voter (including join
-admission), and mixed-binary tests.
-Downgrading a binary below an already committed format is unsupported unless a
-future documented offline procedure first makes the durable state readable by
-that binary.
+`--cluster-init`. An applied activation command or recovered group-0 snapshot is
+now published to every reactor-local data gate before group 0 advances its applied
+boundary. The controller and command now require identity-keyed capability
+coverage of the stable meta-voters plus every voter in the committed serving
+map, but no production path collects that proof or preflights legacy receipt
+counts, so none originates an activation.
+Fresh observers also lack a seed/join RPC. Static placement remains authoritative
+and a fresh data plane remains at format v1, so snapshot production and bounded
+deletes are refused and readiness stays false. Production enablement still
+requires an identity-bound capability collector (including join admission), the
+receipt preflight, and mixed-binary tests.
+
+Format activation is monotonic. Once version N is committed, a binary whose
+maximum supported version is below N must not start against that node data and a
+rolling downgrade is unsupported. The only safe rollback is restoration of a
+complete pre-activation backup or an offline rebuild into a cluster whose active
+format the older binary supports; there is no command that lowers the activation.
 
 ## Observability and administration
 

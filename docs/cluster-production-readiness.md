@@ -12,7 +12,7 @@
 `1f61f49`, `b2c7d0b`, `872f7e1`, `023d9c3`, `d5f4755`, `7f6d7e8`,
 `7760ebd`, `6557666`, `c8f28c8`, `445f1f0`, `8b8536d`, `6912dfb`,
 `ecb63a5`, `a03fe1d`, `8ae846c`, `9ecd0e6`, `66049e7`, `470d14c`,
-`3af373a`
+`3af373a`, `88c90b0`
 
 **Scope:** The recent VShard/Raft cluster redesign, its production-server
 integration, the public HTTP surface, recovery paths, and the release evidence
@@ -25,7 +25,7 @@ used as evidence that the current server is production-ready.
 
 ## Implementation progress after the review
 
-Forty-seven remediation commits and the current CR-FIX-080 implementation are
+Forty-eight remediation commits and the current CR-FIX-076 publication bridge are
 now recorded. Cluster release status
 remains **BLOCKED** because group 0/movement, atomic and retry-safe
 pattern-delete semantics, replicated retention, the large-snapshot path,
@@ -1315,8 +1315,12 @@ is not completion.
   lock-wait election race and fabricated-future-term fencing. Status exposes the
   replicated controller term/owner plus proposal/failure counters, and local
   control readiness requires that fence to match the observed leader term.
-  Focused state/controller/host/readiness evidence passes 28/28. This task is not
-  closed.
+  Focused state/controller/host/readiness evidence passes 28/28. Committed
+  format changes and recovered control snapshots now publish the replicated
+  active version to every reactor-local data gate before group 0 advances its
+  applied boundary; a failed publication retries the same entry. This closes
+  the publication half of CR-FIX-076, but no production path originates an
+  activation yet. This task is not closed.
 - [ ] **CR-FIX-022 — wire resumable join, drain, remove, replace, and VShard
   movement.** Owner: movement/control plane. Include learner catch-up, verified
   snapshot, log catch-up, joint consensus, leadership transfer, cutover, and
@@ -1527,17 +1531,34 @@ is not completion.
   local minimum format is below snapshot v2, rather than treating a running but
   permanently refusing snapshot timer as healthy. Codec decoders remain
   unconditional for replay and upgrade. Group-0 activation now also refuses a
-  non-advancing version, a joint voter configuration, or any capability list
-  whose cardinality differs from the complete stable voter set; success is not
-  returned until the activation entry applies. **Still open:** close the
-  data-voter-set/admission hole, publish the committed activation from the now
-  opt-in live group 0 to every shard, preflight legacy
-  receipt counts, state the downgrade rule, and run old/new multi-process
-  snapshot and command tests. Because the production server still has no
-  activation-bridge caller, this fail-closed slice deliberately leaves
-  clustered readiness false and bounded deletes unavailable; it does not close
-  this task. Group 0 now also has command tag 12 and a magic-tagged snapshot
-  trailer for its initial serving map. Group 0 had no prior production server
+  non-advancing version, a joint voter configuration, an incomplete serving
+  map, or identity-keyed capabilities that do not cover the union of the stable
+  meta-voters and every committed data-group voter. The command embeds that
+  canonical covered union and deterministic apply rejects a meta-only,
+  duplicate, unsorted, or incomplete proof; success is not returned until the
+  activation entry applies. The production group-0 state
+  machine now observes both applied activation commands and recovered snapshots,
+  invokes the existing all-shard publication bridge, and does not advance its
+  visible replicated state or applied boundary until publication succeeds.
+  Failed publication leaves the prior state intact for an exact retry. Snapshots persist the canonical
+  activation-time voter proof and reject an activated scalar with no data-voter
+  coverage; a later group-0 membership change does not invalidate the historical
+  proof while every current data-serving replica remains covered. An injected
+  failure/retry, fail-closed snapshot recovery, and membership-change regression
+  prove these fences; the affected 29 focused tests pass. **Still open:** add the
+  identity-bound capability collector and join
+  admission rule that can safely originate an activation, preflight legacy
+  receipt counts, and run old/new multi-process snapshot and command tests.
+  Because no production path originates an activation, this
+  fail-closed slice deliberately leaves clustered readiness false and bounded
+  deletes unavailable; it does not close this task. Once version N is committed,
+  the state machine cannot lower it and a binary whose maximum supported version
+  is below N must not start against that data. Rollback requires restoring a
+  complete pre-activation backup or rebuilding the cluster offline; rolling
+  downgrade is unsupported. Group 0 now also has command tag 12 and a magic-tagged snapshot
+  trailer for its initial serving map, plus covered-activation tag 13; the
+  historical tag 11 remains decodable but its empty voter proof cannot activate
+  a production serving map. Group 0 had no prior production server
   composition, so this opt-in first deployment is homogeneous; mixed-version
   group-0 operation or rollback after that command commits remains unsupported
   until this task defines the control-plane upgrade gate.

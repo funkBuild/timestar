@@ -382,13 +382,15 @@ public:
                                 std::string expectedClusterUuid = {},
                                 std::optional<control::NodeRecord> localRecord = std::nullopt,
                                 std::optional<control::ControlMap> expectedInitialServingMap = std::nullopt,
-                                control::Group0StateMachine::ServingMapObserver servingMapObserver = {}) {
+                                control::Group0StateMachine::ServingMapObserver servingMapObserver = {},
+                                control::Group0StateMachine::ActiveFormatObserver activeFormatObserver = {}) {
         if (seastar::this_shard_id() != 0)
             throw std::logic_error("group 0 may only be hosted on reactor shard 0");
         if (!group0_)
             throw std::logic_error("group 0 host was not constructed");
         return group0_->start(std::move(voters), opts, std::move(expectedClusterUuid), std::move(localRecord),
-                              std::move(expectedInitialServingMap), std::move(servingMapObserver));
+                              std::move(expectedInitialServingMap), std::move(servingMapObserver),
+                              std::move(activeFormatObserver));
     }
 
     Group0Host* group0() { return group0_.get(); }

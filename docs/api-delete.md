@@ -17,9 +17,12 @@ Exact RF&gt;1 deletion uses bounded receipt command tag 5 and is accepted only
 after group 0 has committed cluster format v5. Until then the request fails
 before any Raft proposal with HTTP `409` and JSON code
 `CLUSTER_FORMAT_NOT_ACTIVE`. The server can now opt into a persistent group-0
-host, but it does not yet publish committed format activation into the data
-plane. This operation is therefore intentionally unavailable and cluster
-readiness remains false; do not deploy it as a production delete path.
+host, and an already committed activation is published to every reactor-local
+data gate before group 0 advances its applied boundary. No production path can
+yet safely originate that activation because data-voter capability and legacy
+receipt preflight are incomplete. This operation is therefore intentionally
+unavailable and cluster readiness remains false; do not deploy it as a
+production delete path.
 
 Every RF&gt;1 request must include both of these headers:
 

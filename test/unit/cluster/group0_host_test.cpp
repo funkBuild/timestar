@@ -66,7 +66,6 @@ seastar::future<> durableSnapshotRecovery() {
         EXPECT_TRUE(host.group()->isLeader());
         EXPECT_TRUE(co_await host.propose(InitCluster{"cluster-durable"}));
         EXPECT_TRUE(co_await host.propose(SetMetaVoters{{1}}));
-        EXPECT_TRUE(co_await host.propose(SetActiveVersion{5}));
         expected = host.state();
         co_await host.compact();
         EXPECT_GT(host.group()->node().log().snapshotIndex(), 0u);

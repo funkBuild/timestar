@@ -61,7 +61,7 @@ TEST(ControlCommandCodecTest, RoundTripAllCommands) {
         UpsertJob{"job-1", 5, true, "move v42"},
         MintJoinToken{"tok-abc"},
         AdmitWithToken{node(8, "u8", "rack-h"), "tok-abc"},
-        SetActiveVersion{5},
+        SetActiveVersion{5, {1, 2, 3}},
         SetInitialServingMap{ControlMap{1, {{0, {1, 2, 3}}}, {{0, 7}}}},
     };
     for (const auto& c : cmds) {
@@ -80,6 +80,9 @@ TEST(ControlCommandCodecTest, RoundTripAllCommands) {
     ASSERT_TRUE(serving && std::holds_alternative<SetInitialServingMap>(*serving));
     EXPECT_EQ(std::get<SetInitialServingMap>(*serving).map.placement.at(7), (std::vector<NodeId>{2, 3}));
     EXPECT_EQ(std::get<SetInitialServingMap>(*serving).map.groups.at(7), 4);
+    auto activation = decodeCommand(encodeCommand(SetActiveVersion{5, {1, 2, 3}}));
+    ASSERT_TRUE(activation && std::holds_alternative<SetActiveVersion>(*activation));
+    EXPECT_EQ(std::get<SetActiveVersion>(*activation).coveredVoters, (std::vector<NodeId>{1, 2, 3}));
 }
 
 TEST(ControlCommandCodecTest, TruncatedAndUnknownRejected) {
@@ -95,6 +98,18 @@ TEST(ControlCommandCodecTest, TrailingBytesRejected) {
     std::string full = encodeCommand(SetMetaVoters{{1, 2, 3}});
     full.push_back('\0');
     EXPECT_FALSE(decodeCommand(full).has_value());
+}
+
+TEST(ControlCommandCodecTest, CoveredActivationCannotTruncateIntoLegacyActivation) {
+    const std::string covered = encodeCommand(SetActiveVersion{5, {1, 2, 3}});
+    for (size_t n = 0; n < covered.size(); ++n)
+        EXPECT_FALSE(decodeCommand(covered.substr(0, n)).has_value()) << "prefix " << n;
+
+    std::string legacy = covered.substr(0, 1 + sizeof(uint64_t));
+    legacy.front() = 11;  // historical, uncovered SetActiveVersion tag
+    auto decoded = decodeCommand(legacy);
+    ASSERT_TRUE(decoded && std::holds_alternative<SetActiveVersion>(*decoded));
+    EXPECT_TRUE(std::get<SetActiveVersion>(*decoded).coveredVoters.empty());
 }
 
 TEST(ControlCommandCodecTest, NarrowFieldsAndEnumsFailClosed) {
@@ -114,7 +129,7 @@ TEST(ControlCommandCodecTest, NarrowFieldsAndEnumsFailClosed) {
     job.at(stepOffset + 8) = 2;  // booleans are exactly 0 or 1
     EXPECT_FALSE(decodeCommand(job).has_value());
 
-    std::string version = encodeCommand(SetActiveVersion{1});
+    std::string version = encodeCommand(SetActiveVersion{1, {1}});
     version.at(1 + 4) = 1;  // 2^32 + 1 cannot fit uint32_t
     EXPECT_FALSE(decodeCommand(version).has_value());
 }
@@ -429,7 +444,9 @@ TEST(Group0StateMachineTest, InitialServingMapIsCompleteImmutableAndSnapshotted)
 TEST(Group0StateMachineTest, ServingMapPublicationRetriesBeforeAppliedAdvance) {
     Group0StateMachine sm;
     unsigned attempts = 0;
-    sm.setServingMapObserver([&attempts](ControlMap) {
+    sm.setServingMapObserver([&](ControlMap) {
+        EXPECT_EQ(sm.state().servingMap.epoch, 0u);
+        EXPECT_EQ(sm.state().appliedIndex, 0u);
         if (attempts++ == 0)
             return seastar::make_exception_future<>(std::runtime_error("injected cache failure"));
         return seastar::make_ready_future<>();
@@ -438,10 +455,126 @@ TEST(Group0StateMachineTest, ServingMapPublicationRetriesBeforeAppliedAdvance) {
     timestar::raft::LogEntry entry{1, 9, timestar::raft::EntryType::Normal, command};
     EXPECT_THROW(sm.apply(entry).get(), std::runtime_error);
     EXPECT_EQ(sm.state().appliedIndex, 0u);
-    EXPECT_EQ(sm.state().servingMap.epoch, 1u);
+    EXPECT_EQ(sm.state().servingMap.epoch, 0u);
     EXPECT_NO_THROW(sm.apply(std::move(entry)).get());
     EXPECT_EQ(attempts, 2u);
     EXPECT_EQ(sm.state().appliedIndex, 9u);
+}
+
+TEST(Group0StateMachineTest, FormatPublicationRetriesBeforeAppliedAdvance) {
+    Group0StateMachine sm;
+    ASSERT_TRUE(sm.applyCommand(SetMetaVoters{{1}}));
+    ASSERT_TRUE(sm.applyCommand(SetInitialServingMap{completeServingMap()}));
+    unsigned attempts = 0;
+    uint32_t published = 0;
+    sm.setActiveFormatObserver([&](uint32_t version) {
+        ++attempts;
+        published = version;
+        EXPECT_EQ(sm.state().activeFormatVersion, 1u);
+        EXPECT_EQ(sm.state().appliedIndex, 0u);
+        if (attempts == 1)
+            return seastar::make_exception_future<>(std::runtime_error("injected format publication failure"));
+        return seastar::make_ready_future<>();
+    });
+    const timestar::raft::LogEntry entry{
+        1, 11, timestar::raft::EntryType::Normal, encodeCommand(SetActiveVersion{5, {1, 2, 3}})};
+
+    EXPECT_THROW(sm.apply(entry).get(), std::runtime_error);
+    EXPECT_EQ(sm.state().activeFormatVersion, 1u);
+    EXPECT_EQ(sm.state().appliedIndex, 0u);
+    EXPECT_NO_THROW(sm.apply(entry).get());
+    EXPECT_EQ(attempts, 2u);
+    EXPECT_EQ(published, 5u);
+    EXPECT_EQ(sm.state().appliedIndex, 11u);
+}
+
+TEST(Group0StateMachineTest, SnapshotRecoveryPublishesFormatBeforeAppliedAdvance) {
+    Group0StateMachine source;
+    ASSERT_TRUE(source.applyCommand(InitCluster{"cluster-format-snapshot"}));
+    ASSERT_TRUE(source.applyCommand(SetMetaVoters{{1}}));
+    ASSERT_TRUE(source.applyCommand(SetInitialServingMap{completeServingMap()}));
+    ASSERT_NO_THROW(source.apply(timestar::raft::LogEntry{
+                                      3, 19, timestar::raft::EntryType::Normal,
+                                      encodeCommand(SetActiveVersion{5, {1, 2, 3}})})
+                        .get());
+
+    Group0StateMachine restored;
+    uint32_t published = 0;
+    unsigned attempts = 0;
+    restored.setActiveFormatObserver([&](uint32_t version) {
+        ++attempts;
+        published = version;
+        EXPECT_EQ(restored.state().activeFormatVersion, 1u);
+        EXPECT_EQ(restored.state().appliedIndex, 0u);
+        if (attempts == 1)
+            return seastar::make_exception_future<>(std::runtime_error("injected snapshot publication failure"));
+        return seastar::make_ready_future<>();
+    });
+    auto snapshot = [&] {
+        timestar::raft::Snapshot value;
+        value.index = 19;
+        value.term = 3;
+        value.config.voters = {1};
+        value.data = source.snapshot();
+        return value;
+    };
+
+    EXPECT_THROW(restored.applySnapshot(snapshot()).get(), std::runtime_error);
+    EXPECT_EQ(restored.state().activeFormatVersion, 1u);
+    EXPECT_EQ(restored.state().appliedIndex, 0u);
+    EXPECT_NO_THROW(restored.applySnapshot(snapshot()).get());
+    EXPECT_EQ(attempts, 2u);
+    EXPECT_EQ(published, 5u);
+    EXPECT_EQ(restored.state().activeFormatVersion, 5u);
+    EXPECT_EQ(restored.state().activeFormatVoters, (std::vector<NodeId>{1, 2, 3}));
+    EXPECT_EQ(restored.state().appliedIndex, 19u);
+
+    // Compaction cannot erase the voter proof and leave only the activated
+    // scalar. A historical/meta-only snapshot is rejected before its format is
+    // published or its boundary exposed.
+    std::string uncovered = source.snapshot();
+    uncovered.resize(uncovered.size() - (2 + 3) * sizeof(uint64_t));
+    Group0StateMachine unsafe;
+    unsafe.setActiveFormatObserver([](uint32_t) {
+        return seastar::make_exception_future<>(std::logic_error("unsafe format was published"));
+    });
+    timestar::raft::Snapshot unsafeSnapshot;
+    unsafeSnapshot.index = 19;
+    unsafeSnapshot.term = 3;
+    unsafeSnapshot.config.voters = {1};
+    unsafeSnapshot.data = std::move(uncovered);
+    EXPECT_THROW(unsafe.applySnapshot(std::move(unsafeSnapshot)).get(), std::runtime_error);
+    EXPECT_EQ(unsafe.state().activeFormatVersion, 1u);
+}
+
+TEST(Group0StateMachineTest, FormatSnapshotSurvivesLaterMetaVoterChange) {
+    Group0StateMachine source;
+    ASSERT_TRUE(source.applyCommand(SetMetaVoters{{1}}));
+    ASSERT_TRUE(source.applyCommand(SetInitialServingMap{completeServingMap()}));
+    ASSERT_TRUE(source.applyCommand(SetActiveVersion{5, {1, 2, 3}}));
+    ASSERT_TRUE(source.applyCommand(SetMetaVoters{{1, 4}}));
+
+    Group0StateMachine restored;
+    EXPECT_TRUE(restored.loadSnapshot(source.snapshot()));
+    EXPECT_EQ(restored.state().activeFormatVersion, 5u);
+    EXPECT_EQ(restored.state().activeFormatVoters, (std::vector<NodeId>{1, 2, 3}));
+    EXPECT_EQ(restored.state().metaVoters, (std::vector<NodeId>{1, 4}));
+}
+
+TEST(Group0StateMachineTest, FormatActivationRejectsMetaOnlyOrNonCanonicalCoverage) {
+    Group0StateMachine sm;
+    ASSERT_TRUE(sm.applyCommand(SetMetaVoters{{1}}));
+    ASSERT_TRUE(sm.applyCommand(SetInitialServingMap{completeServingMap()}));
+
+    EXPECT_FALSE(sm.applyCommand(SetActiveVersion{5, {1}}));
+    EXPECT_FALSE(sm.applyCommand(SetActiveVersion{5}));
+    EXPECT_FALSE(sm.applyCommand(SetActiveVersion{5, {3, 2, 1}}));
+    EXPECT_FALSE(sm.applyCommand(SetActiveVersion{5, {1, 2, 2, 3}}));
+    EXPECT_FALSE(sm.applyCommand(SetActiveVersion{5, {1, 2, 3, 4}}));
+    EXPECT_EQ(sm.state().activeFormatVersion, 1u);
+    EXPECT_TRUE(sm.applyCommand(SetActiveVersion{5, {1, 2, 3}}));
+    EXPECT_EQ(sm.state().activeFormatVersion, 5u);
+    EXPECT_EQ(sm.state().activeFormatVoters, (std::vector<NodeId>{1, 2, 3}));
 }
 
 TEST(Group0StateMachineTest, LocalServingMapExpectationRejectsConflictingCommit) {

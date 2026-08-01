@@ -80,12 +80,14 @@ struct AdmitWithToken {
     std::string token;
 };
 
-// Activate a storage/log wire-format version cluster-wide (rolling-upgrade, decision
-// 8). The controller proposes this ONLY after FeatureGate::canActivate confirms every
-// current voter can read `version`; apply advances the active version MONOTONICALLY
-// (a stale/replayed lower version is ignored) so a node never regresses formats.
+// Activate a storage/log wire-format version cluster-wide (rolling-upgrade,
+// decision 8). `coveredVoters` is the canonical union of the stable group-0
+// voters and every voter in the committed serving map whose capability the
+// controller checked. Apply validates that proof against replicated state before
+// advancing monotonically; a meta-only proof can never activate data emission.
 struct SetActiveVersion {
     uint32_t version = 1;
+    std::vector<NodeId> coveredVoters;
 };
 
 // Publish the complete initial data-serving map atomically. This is deliberately

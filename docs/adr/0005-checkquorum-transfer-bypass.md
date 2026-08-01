@@ -21,21 +21,21 @@ logic.* The machinery itself exists and is D-7's (`features::FeatureGate::canAct
 group 0's committed `activeFormatVersion`, `integration/journal_format_bridge.hpp`), which
 is why the D-30 row has always said the two should land together. At the time of the
 decision that machinery had **no caller in a running server** and no live group 0 in
-`ClusterDataPlane`, so building (c) also meant wiring the control plane into the data
-plane. The opt-in host now removes that composition part, but (c) still means adding the
-publication caller and first closing D-7's own review residual (F9): `canActivate` is
-evaluated over GROUP-0's meta-voters, which are not proven to cover every DATA group's
-voter set, and a gate that misses a voter is worse than no gate because it reads as proof.
-Neither belongs in a debt-burndown package, and doing the gating logic alone would produce
-a mechanism that cannot be exercised — the exact shape this campaign has repeatedly filed
-against itself.
+`ClusterDataPlane`. The opt-in host and publication bridge now remove that composition
+part, and F9 is closed for the immutable serving map: activation capabilities cover the
+identity-keyed union of stable meta-voters and every data voter, with the covered union
+revalidated from the committed command at apply. What remains is the production
+capability/receipt-preflight actuator and the separate decision to bind CheckQuorum to an
+activated version. Building only that latter boolean gate would still produce a mechanism
+nothing can exercise.
 
 **Implementation update (2026-08-02):** the server can now opt into a live,
 persistent group-0 host and explicitly bootstrap its configured seed. That
 removes the old “no group 0 is composed” premise, but not this decision: the
-activation bridge still has no production caller, fresh observers have no join
-RPC, and F9 still does not cover the union of data-group voters. CheckQuorum
-therefore remains build-default OFF and runtime-disable-only.
+publication bridge now has a production caller and F9 covers the immutable
+serving-map voter union. Fresh observers still have no join RPC, and production
+has no capability/receipt-preflight actuator that can originate an activation.
+CheckQuorum therefore remains build-default OFF and runtime-disable-only.
 
 *The condition, and it is load-bearing.* The ordering argument holds **only while enabling
 is a BUILD decision**. That property is now pinned rather than asserted: the parse and the
@@ -51,8 +51,8 @@ for CheckQuorum — at that point (c) is mandatory and this deferral is void; (2
 that wants the guard ON in the SAME release that first ships the tag-8 decoder, i.e. without
 the one-release gap the ordering depends on; (3) any future behaviour change of this shape
 whose wire form is not fail-closed, since (b) is what makes "the old peer drops it" true and
-not every change has a (b); (4) `publishJournalFormat` acquiring a caller — at which point
-the machinery is live, (c) is cheap, and it must land together with D-7's F9 voter-set
+not every change has a (b); (4) the production activation actuator acquiring a caller — at which point
+the machinery is live, (c) is cheap, and it must remain bound to D-7's voter-set
 closure. Absent all four, (c) stays unbuilt and this is the record of why.
 
 **Why enabling is deferred, on a measurement rather than a doubt.** Same binary, same

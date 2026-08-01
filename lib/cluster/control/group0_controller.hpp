@@ -7,6 +7,7 @@
 #include "meta_voters.hpp"
 
 #include <cstdint>
+#include <map>
 #include <seastar/core/future.hh>
 #include <string>
 #include <vector>
@@ -80,12 +81,14 @@ public:
     // Leadership loss after append is an ambiguous outcome and throws.
     seastar::future<bool> proposeCommand(ControlCommand cmd);
 
-    // Activate wire/storage format `version` cluster-wide (rolling upgrade, decision
-    // 8) ONLY if every current group-0 voter's supported range covers it (FeatureGate::
-    // canActivate over `voterVersions`, one range per current voter in order). Refuses
-    // (returns false, no proposal) if any voter cannot read it -- a node is never sent a
-    // format it cannot decode. Also false if not leader or not an advance.
-    seastar::future<bool> activateFormat(uint32_t version, const std::vector<features::VersionRange>& voterVersions);
+    // Activate wire/storage format `version` only when identity-keyed
+    // capabilities cover both the current stable group-0 voters and the union of
+    // voters in the committed serving map. Activation also waits for the
+    // state-machine meta-voter mirror to match the stable Raft configuration;
+    // the command then embeds that covered union for deterministic apply-time
+    // validation.
+    seastar::future<bool> activateFormat(
+        uint32_t version, const std::map<raft::NodeId, features::VersionRange>& nodeVersions);
 
 private:
     raft::RaftGroup& g0_;
