@@ -5,6 +5,7 @@
 #include "engine_local_store.hpp"
 
 #include <cstdint>
+#include <map>
 #include <seastar/core/future.hh>
 
 namespace timestar::cluster {
@@ -45,6 +46,16 @@ public:
 
     uint64_t appliedIndex() const { return appliedIndex_; }
 
+    // State-machine receipts covered by a candidate snapshot boundary. The
+    // host adds only this prefix to the payload: including a receipt from the
+    // retained suffix would cause replay to skip a delete whose storage effects
+    // are not present in the snapshot.
+    std::vector<data::DeleteOperationReceipt> deleteReceiptsThrough(uint64_t snapshotIndex) const;
+
+    // Restore the small state-machine-only part of a locally produced snapshot
+    // without reinstalling (or even decoding/copying) its TSM objects.
+    void restoreDeleteReceipts(std::vector<data::DeleteOperationReceipt> receipts, uint64_t snapshotIndex);
+
     // Entry-payload BYTES applied since the last snapshot install/produce (debt D-6).
     //
     // Half of the snapshot trigger. Entry COUNT bounds restart REPLAY TIME (each entry is
@@ -67,6 +78,7 @@ private:
     VShardId vshard_;
     uint64_t appliedIndex_ = 0;
     uint64_t appliedBytesSinceSnapshot_ = 0;
+    std::map<SeriesId128, data::DeleteOperationReceipt> deleteReceipts_;
 };
 
 }  // namespace timestar::cluster

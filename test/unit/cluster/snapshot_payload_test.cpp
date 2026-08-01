@@ -3,6 +3,7 @@
 // installs the whole VShard state. Round-trips, and rejects truncation / a flipped
 // checksum / a corrupt inner manifest.
 #include "../../../lib/cluster/data/snapshot_payload.hpp"
+
 #include "../../../lib/storage/series_catalog.hpp"
 
 #include <gtest/gtest.h>
@@ -21,6 +22,18 @@ VShardSnapshotManifest validManifest() {
     // empty extents/tombstones -> trivially valid
     EXPECT_TRUE(m.valid());
     return m;
+}
+
+void addValidCatalog(SnapshotPayload& payload) {
+    timestar::SeriesCatalog catalog;
+    timestar::CatalogEntry entry;
+    entry.measurement = "cpu";
+    entry.tags = {{"host", "a"}};
+    entry.field = "usage";
+    entry.valueType = TSMValueType::Float;
+    catalog.apply(timestar::CatalogRecord{SeriesId128::fromSeriesKey("catalog-test"), std::move(entry)});
+    payload.catalog = catalog.snapshot();
+    payload.manifest.catalogHash = timestar::SeriesCatalog::snapshotHash(payload.catalog);
 }
 }  // namespace
 
@@ -41,15 +54,7 @@ TEST(SnapshotPayloadCodec, RoundTripsManifestAndFiles) {
 TEST(SnapshotPayloadCodec, Version2AuthenticatesAndRoundTripsCatalog) {
     SnapshotPayload p;
     p.manifest = validManifest();
-    timestar::SeriesCatalog catalog;
-    timestar::CatalogEntry entry;
-    entry.measurement = "cpu";
-    entry.tags = {{"host", "a"}};
-    entry.field = "usage";
-    entry.valueType = TSMValueType::Float;
-    catalog.apply(timestar::CatalogRecord{SeriesId128::fromSeriesKey("catalog-test"), std::move(entry)});
-    p.catalog = catalog.snapshot();
-    p.manifest.catalogHash = timestar::SeriesCatalog::snapshotHash(p.catalog);
+    addValidCatalog(p);
     p.files = {{"9_1_d1.tsm", "bytes"}};
 
     auto encoded = encodeSnapshotPayload(p);
@@ -57,8 +62,7 @@ TEST(SnapshotPayloadCodec, Version2AuthenticatesAndRoundTripsCatalog) {
     ASSERT_TRUE(back.has_value());
     EXPECT_EQ(back->catalog, p.catalog);
     EXPECT_EQ(back->manifest.catalogHash, p.manifest.catalogHash);
-    ASSERT_TRUE(timestar::SeriesCatalog::loadSnapshot(
-                    std::span<const char>(back->catalog.data(), back->catalog.size()))
+    ASSERT_TRUE(timestar::SeriesCatalog::loadSnapshot(std::span<const char>(back->catalog.data(), back->catalog.size()))
                     .has_value());
 
     // Recompute the outer checksum after corrupting a catalog byte: the inner
@@ -74,6 +78,36 @@ TEST(SnapshotPayloadCodec, Version2AuthenticatesAndRoundTripsCatalog) {
     for (int i = 0; i < 8; ++i)
         encoded[encoded.size() - 8 + i] = static_cast<char>((h >> (8 * i)) & 0xff);
     EXPECT_FALSE(decodeSnapshotPayload(encoded).has_value());
+}
+
+TEST(SnapshotPayloadCodec, Version3AuthenticatesDeleteReceiptsAndSupportsLightweightRecovery) {
+    SnapshotPayload p;
+    p.manifest = validManifest();
+    addValidCatalog(p);
+    p.deleteReceipts = {
+        {SeriesId128::fromHex("11111111111111111111111111111111"), 12, 0x1234},
+        {SeriesId128::fromHex("22222222222222222222222222222222"), 99, 0x5678},
+    };
+    p.files = {{"9_1_d1.tsm", std::string(4096, 'x')}};
+
+    const std::string encoded = encodeSnapshotPayload(p);
+    auto decoded = decodeSnapshotPayload(encoded);
+    ASSERT_TRUE(decoded.has_value());
+    EXPECT_EQ(decoded->deleteReceipts, p.deleteReceipts);
+    auto lightweight = decodeSnapshotDeleteReceipts(encoded);
+    ASSERT_TRUE(lightweight.has_value());
+    EXPECT_EQ(*lightweight, p.deleteReceipts);
+
+    auto invalid = p;
+    std::swap(invalid.deleteReceipts[0], invalid.deleteReceipts[1]);
+    EXPECT_THROW(encodeSnapshotPayload(invalid), std::invalid_argument);
+    invalid = p;
+    invalid.deleteReceipts[1].appliedIndex = invalid.manifest.snapshotRevision;
+    EXPECT_THROW(encodeSnapshotPayload(invalid), std::invalid_argument);
+
+    std::string corrupt = encoded;
+    corrupt[corrupt.size() - 1] ^= 1;
+    EXPECT_FALSE(decodeSnapshotDeleteReceipts(corrupt).has_value());
 }
 
 TEST(SnapshotPayloadCodec, EmptyFileListRoundTrips) {

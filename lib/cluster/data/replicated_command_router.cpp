@@ -28,13 +28,13 @@ seastar::future<> ReplicatedCommandRouter::propose(uint16_t vshard, ReplicatedCo
     if (!targetsVShard)
         throw std::invalid_argument("ReplicatedCommandRouter: command does not belong to requested VShard");
 
-    // A WriteBatch is value-idempotent under the revision/LWW contract and a
-    // RetentionCutoffCmd is monotonic. DeleteRangeKey is neither: if attempt one
-    // committed but its reply was lost, re-proposing after a concurrent write would
-    // append a later delete and erase that write. Only unambiguous pre-proposal
-    // refusals may be retried until delete commands carry a revision bound or a
-    // snapshot-persistent operation id.
-    const bool ambiguousRetryUnsafe = std::holds_alternative<DeleteRangeKey>(command);
+    // Legacy deletes have no durable identity: if attempt one committed but its
+    // reply was lost, re-proposing after a concurrent write would append a later
+    // physical delete and erase that write. A non-zero operation ID is retained
+    // by the state machine and its snapshots, so the exact command can safely be
+    // retried through an ambiguous leadership/transport result.
+    const auto* deleteCommand = std::get_if<DeleteRangeKey>(&command);
+    const bool ambiguousRetryUnsafe = deleteCommand && deleteCommand->operationId == SeriesId128{};
 
     const NodeId owner = dir_.ownerOf(vshard);
     if (owner == kNoNode)
@@ -76,10 +76,10 @@ seastar::future<> ReplicatedCommandRouter::propose(uint16_t vshard, ReplicatedCo
             if (ambiguousRetryUnsafe && isAmbiguousWriteFailure(kind)) {
                 if (!local && kind == WriteFailure::Transport)
                     local_.wakeGroupsLedBy(leader);
-                throw AmbiguousMutationError(
-                    "ReplicatedCommandRouter: delete outcome is unknown after " + std::string(writeFailureName(kind)) +
-                    " for VShard " + std::to_string(vshard) +
-                    "; the command was not re-proposed because it may already have committed");
+                throw AmbiguousMutationError("ReplicatedCommandRouter: delete outcome is unknown after " +
+                                             std::string(writeFailureName(kind)) + " for VShard " +
+                                             std::to_string(vshard) +
+                                             "; the command was not re-proposed because it may already have committed");
             }
             out.rejects.push_back(SliceReject{vshard, kNoNode, kind});
             if (!local && kind == WriteFailure::Transport)
@@ -108,10 +108,10 @@ seastar::future<> ReplicatedCommandRouter::propose(uint16_t vshard, ReplicatedCo
         if (ambiguousRetryUnsafe && isAmbiguousWriteFailure(lastKind)) {
             if (unreachable != kNoNode)
                 local_.wakeGroupsLedBy(unreachable);
-            throw AmbiguousMutationError(
-                "ReplicatedCommandRouter: delete outcome is unknown after " +
-                std::string(writeFailureName(lastKind)) + " for VShard " + std::to_string(vshard) +
-                "; the command was not re-proposed because it may already have committed");
+            throw AmbiguousMutationError("ReplicatedCommandRouter: delete outcome is unknown after " +
+                                         std::string(writeFailureName(lastKind)) + " for VShard " +
+                                         std::to_string(vshard) +
+                                         "; the command was not re-proposed because it may already have committed");
         }
         hint = nextHint;
 

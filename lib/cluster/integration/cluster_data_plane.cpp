@@ -1292,12 +1292,15 @@ seastar::future<> ClusterDataPlane::writeFromShard(data::WriteBatch batch) {
     return writeSlicesToOwningShards(shards_, std::move(batch), dir_.get());
 }
 
-seastar::future<> ClusterDataPlane::deleteRangeFromShard(std::string seriesKey, uint64_t startTime, uint64_t endTime) {
+seastar::future<> ClusterDataPlane::deleteRangeFromShard(std::string seriesKey, uint64_t startTime, uint64_t endTime,
+                                                         SeriesId128 operationId) {
     if (!replicated_ || !shardsStarted_)
         throw std::runtime_error("ClusterDataPlane::deleteRangeFromShard requires replicated mode after start()");
     const uint16_t vshard = timestar::virtualShard(SeriesId128::fromSeriesKey(seriesKey));
     const unsigned owner = shardOwningVShard(vshard, dir_.get());
-    data::DeleteRangeKey del{std::move(seriesKey), startTime, endTime};
+    if (operationId == SeriesId128{})
+        throw std::invalid_argument("ClusterDataPlane::deleteRangeFromShard requires a non-zero operation ID");
+    data::DeleteRangeKey del{std::move(seriesKey), startTime, endTime, operationId};
     return shards_.invoke_on(owner, [vshard, del = std::move(del)](ShardRaftPlane& plane) mutable {
         return plane.command(vshard, data::ReplicatedCommand{std::move(del)});
     });

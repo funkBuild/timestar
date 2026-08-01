@@ -80,6 +80,26 @@ public:
     }
 };
 
+class OneShotAmbiguousTransport : public CommandTransport {
+public:
+    seastar::future<ProposeOutcome> proposeCommandHinted(NodeId to, uint16_t vshard, ReplicatedCommand command,
+                                                         OptDeadline deadline) override {
+        if (calls++ == 0) {
+            targets.push_back(to);
+            encoded.push_back(encodeReplicatedCommand(command));
+            deadlines.push_back(deadline);
+            return seastar::make_exception_future<ProposeOutcome>(std::runtime_error("connection lost after send"));
+        }
+        targets.push_back(to);
+        encoded.push_back(encodeReplicatedCommand(command));
+        deadlines.push_back(deadline);
+        ProposeOutcome out;
+        out.committed = true;
+        out.committedVShards = {vshard};
+        return seastar::make_ready_future<ProposeOutcome>(std::move(out));
+    }
+};
+
 class MapLeaders : public LeaderResolver {
 public:
     std::map<uint16_t, NodeId> leaders;
@@ -157,6 +177,26 @@ TEST(ReplicatedCommandRouterTest, DoesNotReproposeDeleteAfterAmbiguousRemoteFail
     EXPECT_THROW(router.propose(vshard, ReplicatedCommand{deleteFor(key)}).get(), AmbiguousMutationError);
     EXPECT_EQ(local.calls, 0u);
     EXPECT_EQ(remote.calls, 1u) << "an unknown delete outcome must never be re-proposed";
+}
+
+TEST(ReplicatedCommandRouterTest, SnapshotPersistentDeleteIdentityMakesAmbiguousRetrySafe) {
+    const std::string key = buildSeriesKey("delete", {{"host", "idempotent-remote"}}, "value");
+    const uint16_t vshard = timestar::virtualShard(SeriesId128::fromSeriesKey(key));
+    VShardDirectory dir(1, mapWith(vshard));
+    CommandSink local;
+    OneShotAmbiguousTransport remote;
+    MapLeaders leaders;
+    leaders.leaders[vshard] = 2;
+    ReplicatedCommandRouter router(dir, local, remote, leaders);
+
+    auto command = deleteFor(key);
+    command.operationId = SeriesId128::fromHex("fedcba9876543210fedcba9876543210");
+    const std::string expected = encodeReplicatedCommand(ReplicatedCommand{command});
+    EXPECT_NO_THROW(router.propose(vshard, ReplicatedCommand{command}).get());
+    ASSERT_EQ(remote.calls, 2u);
+    ASSERT_EQ(remote.encoded.size(), 2u);
+    EXPECT_EQ(remote.encoded[0], expected);
+    EXPECT_EQ(remote.encoded[1], expected);
 }
 
 TEST(ReplicatedCommandRouterTest, DoesNotReproposeDeleteAfterLeadershipLoss) {

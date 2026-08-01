@@ -747,11 +747,11 @@ int main(int argc, char** argv) {
                                 0u, [b = std::move(b)]() mutable { return g_clusterDataPlane.write(std::move(b)); });
                         };
                     if (replicatedWrites) {
-                        timestar::http::HttpDeleteHandler::clusterDeleteHook = [](std::string seriesKey,
-                                                                                  uint64_t startTime,
-                                                                                  uint64_t endTime) {
-                            return g_clusterDataPlane.deleteRangeFromShard(std::move(seriesKey), startTime, endTime);
-                        };
+                        timestar::http::HttpDeleteHandler::clusterDeleteHook =
+                            [](std::string seriesKey, uint64_t startTime, uint64_t endTime, SeriesId128 operationId) {
+                                return g_clusterDataPlane.deleteRangeFromShard(std::move(seriesKey), startTime, endTime,
+                                                                               operationId);
+                            };
                         timestar::http::HttpDeleteHandler::clusterPatternExpandHook =
                             [](timestar::data::PatternSeriesSelector selector, uint32_t maxSeries) {
                                 // Pattern coordination owns a pinned placement

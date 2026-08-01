@@ -56,7 +56,10 @@ ReplicatedVShardHost::ReplicatedVShardHost(EngineLocalStore& store, raft::RaftTr
 ReplicatedVShardHost::ReplicatedVShardHost(EngineLocalStore& store, raft::RaftTransport& transport, NodeId self,
                                            std::filesystem::path journalRoot, JournalIdentity identity,
                                            std::chrono::milliseconds tick)
-    : store_(store), self_(self), journalRoot_(std::move(journalRoot)), journalIdentity_(identity),
+    : store_(store),
+      self_(self),
+      journalRoot_(std::move(journalRoot)),
+      journalIdentity_(identity),
       registry_(transport, tick) {}
 
 ReplicatedVShardHost::~ReplicatedVShardHost() {
@@ -258,6 +261,11 @@ seastar::future<> ReplicatedVShardHost::addVShard(uint16_t vshard, std::vector<N
         // branch above for why the move is worth having.
         const uint64_t snapIndex = st.snapshot->index;
         const uint64_t snapTerm = st.snapshot->term;
+        auto receipts = data::decodeSnapshotDeleteReceipts(st.snapshot->data);
+        if (!receipts)
+            throw std::runtime_error(
+                "ReplicatedVShardHost: locally produced snapshot has invalid delete-receipt framing");
+        vs.sm->restoreDeleteReceipts(std::move(*receipts), snapIndex);
         node.seedRecoveredSnapshot(std::move(*st.snapshot));
         timestar::http_log.info(
             "cluster: VShard {} recovered from a compacted journal at boundary index {} (term {}); the local Engine "
@@ -384,6 +392,11 @@ seastar::future<uint64_t> ReplicatedVShardHost::snapshotVShard(uint16_t vshard) 
         ++snapshotsSkippedNoAdvance_;
         co_return 0;
     }
+    // Delete idempotency is replicated state just like the data. Include only
+    // receipts covered by this exact boundary; suffix receipts must be rebuilt
+    // by suffix replay or their deletes could be skipped after restore.
+    if (auto state = vshards_.find(vshard); state != vshards_.end() && state->second.sm)
+        payload.deleteReceipts = state->second.sm->deleteReceiptsThrough(upto);
     // CONSUMING encode (debt D-32). This `std::move` used to be dead -- the only overload
     // took a const&, so the rvalue bound to it and every file was copied, leaving the
     // producer holding the payload twice with `payload` still alive for the whole

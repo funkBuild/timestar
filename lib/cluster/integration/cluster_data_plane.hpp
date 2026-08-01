@@ -199,7 +199,8 @@ public:
     // PRECONDITION: replicated mode (replication_factor > 1). RF=1 still routes through
     // write() on shard 0.
     seastar::future<> writeFromShard(data::WriteBatch batch);
-    seastar::future<> deleteRangeFromShard(std::string seriesKey, uint64_t startTime, uint64_t endTime);
+    seastar::future<> deleteRangeFromShard(std::string seriesKey, uint64_t startTime, uint64_t endTime,
+                                           SeriesId128 operationId);
     // Expand a pattern against a placement-epoch-pinned, quorum-fenced catalog
     // view. No mutation is proposed by this method.
     seastar::future<std::vector<std::string>> findPatternSeries(data::PatternSeriesSelector selector,

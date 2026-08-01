@@ -3,6 +3,7 @@
 // visibly, a DeleteRangeKey removes it, log-ordered LWW holds (a higher-index write
 // wins), and an undecodable committed entry is fail-stop.
 #include "../../../lib/cluster/integration/engine_data_state_machine.hpp"
+
 #include "../../../lib/core/placement_table.hpp"  // routeToCore
 #include "../../../lib/http/http_query_handler.hpp"
 #include "../../../lib/utils/series_key.hpp"
@@ -36,6 +37,14 @@ raft::LogEntry writeEntry(uint64_t index, const std::string& key, double value) 
     e.type = raft::EntryType::Normal;
     e.data = data::encodeReplicatedCommand(data::ReplicatedCommand{std::move(b)});
     return e;
+}
+
+raft::LogEntry deleteEntry(uint64_t index, data::DeleteRangeKey command) {
+    raft::LogEntry entry;
+    entry.index = index;
+    entry.type = raft::EntryType::Normal;
+    entry.data = data::encodeReplicatedCommand(data::ReplicatedCommand{std::move(command)});
+    return entry;
 }
 
 double latest(seastar::sharded<Engine>& eng, const std::string& m, const std::string& f) {
@@ -83,6 +92,59 @@ TEST_F(EngineDataStateMachineTest, AppliesWriteDeleteAndLwwFromLog) {
         sm.apply(std::move(del)).get();
         EXPECT_EQ(sm.appliedIndex(), 12u);
         EXPECT_DOUBLE_EQ(latest(*eng, "temp", "value"), -1);  // absent
+    }).get();
+}
+
+TEST_F(EngineDataStateMachineTest, IdempotentDeleteRetryCannotEraseAnInterveningWrite) {
+    seastar::async([] {
+        ScopedShardedEngine eng;
+        eng.start();
+        cluster::EngineLocalStore store(*eng);
+        const std::string key = buildSeriesKey("delete_retry", {{"host", "h1"}}, "value");
+        const uint16_t vshard = timestar::virtualShard(SeriesId128::fromSeriesKey(key));
+        cluster::EngineDataStateMachine sm(store, timestar::VShardId{vshard});
+        const SeriesId128 operationId = SeriesId128::fromHex("123456789abcdef0123456789abcdef0");
+        data::DeleteRangeKey command{key, BASE - 1, BASE + 1, operationId};
+
+        sm.apply(writeEntry(5, key, 10.0)).get();
+        sm.apply(deleteEntry(9, command)).get();
+        EXPECT_DOUBLE_EQ(latest(*eng, "delete_retry", "value"), -1);
+
+        sm.apply(writeEntry(10, key, 20.0)).get();
+        EXPECT_DOUBLE_EQ(latest(*eng, "delete_retry", "value"), 20.0);
+        sm.apply(deleteEntry(12, command)).get();
+        EXPECT_DOUBLE_EQ(latest(*eng, "delete_retry", "value"), 20.0)
+            << "a client retry physically deleted a write ordered after the first attempt";
+
+        const auto receipts = sm.deleteReceiptsThrough(9);
+        ASSERT_EQ(receipts.size(), 1u);
+        EXPECT_EQ(receipts[0].operationId, operationId);
+        EXPECT_EQ(receipts[0].appliedIndex, 9u);
+        EXPECT_TRUE(sm.deleteReceiptsThrough(8).empty());
+
+        auto conflicting = command;
+        conflicting.endTime = BASE + 2;
+        EXPECT_THROW(sm.apply(deleteEntry(13, std::move(conflicting))).get(), std::runtime_error)
+            << "operation-ID reuse for another target must fail-stop";
+    }).get();
+}
+
+TEST_F(EngineDataStateMachineTest, RestoredDeleteReceiptProtectsPostSnapshotWrites) {
+    seastar::async([] {
+        ScopedShardedEngine eng;
+        eng.start();
+        cluster::EngineLocalStore store(*eng);
+        const std::string key = buildSeriesKey("delete_snapshot_retry", {{"host", "h1"}}, "value");
+        const uint16_t vshard = timestar::virtualShard(SeriesId128::fromSeriesKey(key));
+        cluster::EngineDataStateMachine sm(store, timestar::VShardId{vshard});
+        const SeriesId128 operationId = SeriesId128::fromHex("abcdef0123456789abcdef0123456789");
+        data::DeleteRangeKey command{key, BASE - 1, BASE + 1, operationId};
+        sm.restoreDeleteReceipts({{operationId, 7, data::deleteRangeCommandHash(command)}}, 7);
+
+        sm.apply(writeEntry(8, key, 30.0)).get();
+        sm.apply(deleteEntry(9, command)).get();
+        EXPECT_DOUBLE_EQ(latest(*eng, "delete_snapshot_retry", "value"), 30.0)
+            << "a retry after snapshot compaction forgot its durable receipt";
     }).get();
 }
 
@@ -151,16 +213,14 @@ TEST_F(EngineDataStateMachineTest, AppliedRevisionsAreNotReStampedByEngineCounte
         const uint16_t vshard = timestar::virtualShard(SeriesId128::fromSeriesKey(key));
         cluster::EngineDataStateMachine sm(store, timestar::VShardId{vshard});
         const unsigned core = timestar::routeToCore(SeriesId128::fromSeriesKey(key));
-        const uint64_t before =
-            eng->invoke_on(core, [](Engine& e) { return e.nextRevision(); }).get();
+        const uint64_t before = eng->invoke_on(core, [](Engine& e) { return e.nextRevision(); }).get();
 
         // Apply a committed entry at log index 77 -> the state machine stamps
         // revision = 77 on the point and passes it through.
         sm.apply(writeEntry(77, key, 42.5)).get();
         EXPECT_DOUBLE_EQ(latest(*eng, "temp", "value"), 42.5);
 
-        const uint64_t after =
-            eng->invoke_on(core, [](Engine& e) { return e.nextRevision(); }).get();
+        const uint64_t after = eng->invoke_on(core, [](Engine& e) { return e.nextRevision(); }).get();
         // The local counter must be untouched: the log-index revision was honored, not
         // clobbered. (Pre-fix, insertBatch would have burned a counter value here.)
         EXPECT_EQ(after, before) << "Engine re-stamped a caller-provided (log-index) revision";

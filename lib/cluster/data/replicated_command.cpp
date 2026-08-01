@@ -69,6 +69,7 @@ struct Reader {
 constexpr uint8_t kWrite = 0;
 constexpr uint8_t kDelete = 1;
 constexpr uint8_t kRetention = 2;
+constexpr uint8_t kIdempotentDelete = 3;
 
 }  // namespace
 
@@ -113,7 +114,10 @@ std::string encodeReplicatedCommand(const ReplicatedCommand& cmd) {
         // (docs/write-scaleout-plan.md §6).
         putStr(out, encodeWriteBatch(*w, JournalFormatGate::writeBatchFormat()));
     } else if (const auto* d = std::get_if<DeleteRangeKey>(&cmd)) {
-        out.push_back(static_cast<char>(kDelete));
+        const bool idempotent = d->operationId != SeriesId128{};
+        out.push_back(static_cast<char>(idempotent ? kIdempotentDelete : kDelete));
+        if (idempotent)
+            d->operationId.appendTo(out);
         putStr(out, d->seriesKey);
         putU64(out, d->startTime);
         putU64(out, d->endTime);
@@ -149,8 +153,16 @@ std::optional<ReplicatedCommand> decodeReplicatedCommand(const std::string& byte
         if (!batch)
             return std::nullopt;
         cmd = std::move(*batch);
-    } else if (tag == kDelete) {
+    } else if (tag == kDelete || tag == kIdempotentDelete) {
         DeleteRangeKey d;
+        if (tag == kIdempotentDelete) {
+            if (!r.avail(16))
+                return std::nullopt;
+            d.operationId = SeriesId128::fromBytes(r.p, 16);
+            r.p += 16;
+            if (d.operationId == SeriesId128{})
+                return std::nullopt;
+        }
         d.seriesKey = r.str();
         d.startTime = r.u64();
         d.endTime = r.u64();
@@ -169,6 +181,15 @@ std::optional<ReplicatedCommand> decodeReplicatedCommand(const std::string& byte
     if (!r.ok || r.p != r.end)
         return std::nullopt;
     return cmd;
+}
+
+uint64_t deleteRangeCommandHash(const DeleteRangeKey& command) {
+    std::string canonical;
+    canonical.reserve(4 + command.seriesKey.size() + 16);
+    putStr(canonical, command.seriesKey);
+    putU64(canonical, command.startTime);
+    putU64(canonical, command.endTime);
+    return fnv1a(canonical.data(), canonical.size());
 }
 
 }  // namespace timestar::data

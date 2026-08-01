@@ -28,7 +28,17 @@ struct DeleteRangeKey {
     std::string seriesKey;
     uint64_t startTime = 0;
     uint64_t endTime = 0;  // inclusive
+    // A non-zero, request-stable operation identity makes an ambiguous retry a
+    // replicated no-op after the first successful apply. Zero identifies the
+    // legacy command encoding and deliberately retains its retry-unsafe
+    // semantics for journal compatibility.
+    SeriesId128 operationId{};
 };
+
+// Stable digest of the exact delete target. Snapshot-persistent operation
+// receipts retain this alongside the ID so accidental ID reuse for different
+// command bytes fail-stops instead of silently acknowledging the wrong delete.
+uint64_t deleteRangeCommandHash(const DeleteRangeKey& command);
 
 // Drop every point older than `cutoffTime` across the VShard. Monotonic. NOTE: in v1
 // EngineDataStateMachine's apply of this command is a NO-OP (EngineLocalStore::

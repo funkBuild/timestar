@@ -1,5 +1,6 @@
 #pragma once
 
+#include "../../core/series_id.hpp"
 #include "../../storage/vshard_snapshot_manifest.hpp"
 
 #include <optional>
@@ -17,6 +18,18 @@ struct SnapshotFile {
     std::string bytes;
 };
 
+// A replicated delete operation already applied at `appliedIndex`. These are
+// state-machine data, not storage-engine tombstones: retaining them across Raft
+// log compaction is what makes a client retry harmless after restart or
+// InstallSnapshot. `commandHash` detects operation-ID reuse for another target.
+struct DeleteOperationReceipt {
+    SeriesId128 operationId{};
+    uint64_t appliedIndex = 0;
+    uint64_t commandHash = 0;
+
+    auto operator<=>(const DeleteOperationReceipt&) const = default;
+};
+
 // The monolithic Raft InstallSnapshot payload for a VShard (integration plan M3): the
 // VShardSnapshotManifest, deterministic series catalog, and every data file it
 // references, self-contained so a
@@ -32,6 +45,9 @@ struct SnapshotPayload {
     // Empty means a decoded legacy v1 payload; production install rejects it
     // because it cannot restore discovery metadata.
     std::string catalog;
+    // Present only in payload v3. Canonically sorted by operationId and limited
+    // to receipts at or below the Raft snapshot boundary.
+    std::vector<DeleteOperationReceipt> deleteReceipts;
     std::vector<SnapshotFile> files;  // one per manifest.dataExtents entry, same order
 };
 
@@ -40,6 +56,12 @@ struct SnapshotPayload {
 // so a corrupt snapshot can never be installed as valid state.
 std::string encodeSnapshotPayload(const SnapshotPayload& payload);
 std::optional<SnapshotPayload> decodeSnapshotPayload(const std::string& bytes);
+
+// Recovery of a locally-produced snapshot must restore state-machine receipts
+// without decoding/copying its potentially 128 MiB data objects. This verifies
+// the outer checksum and complete framing, but returns only the small receipt
+// section (empty for legacy/v2 payloads).
+std::optional<std::vector<DeleteOperationReceipt>> decodeSnapshotDeleteReceipts(const std::string& bytes);
 
 // CONSUMING overload (debt D-32). Byte-for-byte identical output; the difference is
 // what is resident while it runs.

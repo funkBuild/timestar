@@ -33,17 +33,15 @@ namespace fs = std::filesystem;
 namespace {
 
 TEST(JournalIdentityTest, ParsesConfiguredClusterAndBootUuids) {
-    auto id = cluster::JournalIdentity::fromHex("00112233445566778899aabbccddeeff",
-                                                "ffeeddccbbaa99887766554433221100");
+    auto id = cluster::JournalIdentity::fromHex("00112233445566778899aabbccddeeff", "ffeeddccbbaa99887766554433221100");
     EXPECT_EQ(id.clusterUuid.front(), 0x00);
     EXPECT_EQ(id.clusterUuid.back(), 0xff);
     EXPECT_EQ(id.bootId.front(), 0xff);
     EXPECT_EQ(id.bootId.back(), 0x00);
-    EXPECT_THROW(cluster::JournalIdentity::fromHex("short", "ffeeddccbbaa99887766554433221100"),
-                 std::invalid_argument);
-    EXPECT_THROW(cluster::JournalIdentity::fromHex("00112233445566778899aabbccddeezz",
-                                                    "ffeeddccbbaa99887766554433221100"),
-                 std::invalid_argument);
+    EXPECT_THROW(cluster::JournalIdentity::fromHex("short", "ffeeddccbbaa99887766554433221100"), std::invalid_argument);
+    EXPECT_THROW(
+        cluster::JournalIdentity::fromHex("00112233445566778899aabbccddeezz", "ffeeddccbbaa99887766554433221100"),
+        std::invalid_argument);
 }
 constexpr uint64_t BASE = 1'700'000'000'000'000'000ULL;
 
@@ -897,6 +895,72 @@ TEST_F(ReplicatedVShardHostTest, ARecoveredRECEIVEDSnapshotIsReinstalledBecauseI
             << "the replica must hold the snapshot's data, not merely its boundary";
 
         receiver.stop().get();
+        fs::remove_all(jroot);
+    }).get();
+}
+
+TEST_F(ReplicatedVShardHostTest, CompactedJournalRestoresDeleteRetryReceipts) {
+    seastar::async([] {
+        if (!timestar::vshardsCohesiveOnCores(seastar::smp::count))
+            GTEST_SKIP() << "core count is not VShard-cohesive";
+        ScopedShardedEngine eng;
+        eng.start();
+        cluster::EngineLocalStore store(*eng);
+        NoopTransport transport;
+        fs::path jroot = tmpDir();
+        RaftOptions opts;
+        opts.electionTimeoutMin = opts.electionTimeoutMax = 1;
+        opts.heartbeatTimeout = 1;
+        const auto series = core0Series("delete_receipt_recovery");
+        const SeriesId128 operationId = SeriesId128::fromHex("13579bdf2468ace013579bdf2468ace0");
+        const data::DeleteRangeKey deletion{series.key, BASE, BASE, operationId};
+
+        auto proposeAndTick = [](cluster::ReplicatedVShardHost& host, RaftGroup* group, uint16_t vshard,
+                                 data::ReplicatedCommand command) {
+            auto future = host.propose(vshard, std::move(command));
+            for (int i = 0; i < 40 && !future.available(); ++i)
+                group->tick().get();
+            ASSERT_TRUE(future.get());
+        };
+
+        {
+            cluster::ReplicatedVShardHost host(store, transport, 1, jroot);
+            host.addVShard(series.vshard, {1}, opts).get();
+            RaftGroup* group = host.group(series.vshard);
+            for (int i = 0; i < 10 && !group->isLeader(); ++i)
+                group->tick().get();
+            ASSERT_TRUE(group->isLeader());
+
+            proposeAndTick(host, group, series.vshard, writeCmd(series.key, 10.0));
+            proposeAndTick(host, group, series.vshard, data::ReplicatedCommand{deletion});
+            proposeAndTick(host, group, series.vshard, writeCmd(series.key, 20.0));
+            flushToTsm(eng);
+            ASSERT_GE(host.snapshotVShard(series.vshard).get(), 3u)
+                << "the compacted boundary must cover the delete receipt";
+            host.stop().get();
+        }
+
+        {
+            cluster::ReplicatedVShardHost recovered(store, transport, 1, jroot);
+            recovered.addVShard(series.vshard, {1}, opts).get();
+            RaftGroup* group = recovered.group(series.vshard);
+            for (int i = 0; i < 10 && !group->isLeader(); ++i)
+                group->tick().get();
+            ASSERT_TRUE(group->isLeader());
+            proposeAndTick(recovered, group, series.vshard, data::ReplicatedCommand{deletion});
+
+            auto result = (*eng)
+                              .invoke_on(0u,
+                                         [key = series.key](Engine& engine) {
+                                             return engine.query(key, SeriesId128::fromSeriesKey(key), BASE, BASE);
+                                         })
+                              .get();
+            ASSERT_TRUE(result.has_value());
+            ASSERT_EQ(std::get<QueryResult<double>>(*result).values.size(), 1u);
+            EXPECT_DOUBLE_EQ(std::get<QueryResult<double>>(*result).values[0], 20.0)
+                << "retry after local snapshot recovery forgot its receipt and erased the later write";
+            recovered.stop().get();
+        }
         fs::remove_all(jroot);
     }).get();
 }

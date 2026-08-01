@@ -45,7 +45,23 @@ seastar::future<> EngineDataStateMachine::apply(raft::LogEntry entry) {
             s.revisions.assign(s.timestamps.size(), entry.index);
         co_await store_.applyCommittedWrites(std::move(*w));
     } else if (auto* d = std::get_if<data::DeleteRangeKey>(&*cmd)) {
+        const bool idempotent = d->operationId != SeriesId128{};
+        const uint64_t commandHash = data::deleteRangeCommandHash(*d);
+        if (idempotent) {
+            if (const auto found = deleteReceipts_.find(d->operationId); found != deleteReceipts_.end()) {
+                if (found->second.commandHash != commandHash)
+                    throw std::runtime_error(
+                        "EngineDataStateMachine: delete operation ID reused for another command (fail-stop)");
+                co_return;
+            }
+        }
         co_await store_.applyDelete(d->seriesKey, d->startTime, d->endTime);
+        // Publish the receipt only after every Engine delete effect is durable.
+        // A failure before here leaves the Raft entry unapplied; replay uses the
+        // same log index and safely completes the same physical mutation.
+        if (idempotent)
+            deleteReceipts_.emplace(d->operationId,
+                                    data::DeleteOperationReceipt{d->operationId, entry.index, commandHash});
     } else {
         const auto& rc = std::get<data::RetentionCutoffCmd>(*cmd);
         // VShard-wide retention cutoff (EngineLocalStore::applyRetention is the M1.x/M6
@@ -72,16 +88,38 @@ seastar::future<> EngineDataStateMachine::applySnapshot(raft::Snapshot snap) {
         throw std::runtime_error(
             "EngineDataStateMachine::applySnapshot: data revision does not match Raft snapshot boundary "
             "(fail-stop)");
+    auto receipts = std::move(payload->deleteReceipts);
     const bool installed = co_await store_.installVShardSnapshot(vshard_, std::move(*payload));
     if (!installed)
         throw std::runtime_error(
             "EngineDataStateMachine::applySnapshot: snapshot failed verification and was not installed (fail-stop)");
+    restoreDeleteReceipts(std::move(receipts), snap.index);
     // The snapshot subsumes the log up to snap.index; advance the applied watermark so a
     // subsequent apply() of the post-snapshot suffix is correctly ordered.
     appliedIndex_ = snap.index;
     // Everything this counter was measuring is now inside the snapshot (D-6).
     appliedBytesSinceSnapshot_ = 0;
     co_return;
+}
+
+std::vector<data::DeleteOperationReceipt> EngineDataStateMachine::deleteReceiptsThrough(uint64_t snapshotIndex) const {
+    std::vector<data::DeleteOperationReceipt> receipts;
+    receipts.reserve(deleteReceipts_.size());
+    for (const auto& [operationId, receipt] : deleteReceipts_)
+        if (receipt.appliedIndex <= snapshotIndex)
+            receipts.push_back(receipt);
+    return receipts;
+}
+
+void EngineDataStateMachine::restoreDeleteReceipts(std::vector<data::DeleteOperationReceipt> receipts,
+                                                   uint64_t snapshotIndex) {
+    std::map<SeriesId128, data::DeleteOperationReceipt> replacement;
+    for (auto& receipt : receipts) {
+        if (receipt.operationId == SeriesId128{} || receipt.appliedIndex == 0 || receipt.appliedIndex > snapshotIndex ||
+            !replacement.emplace(receipt.operationId, receipt).second)
+            throw std::runtime_error("EngineDataStateMachine: invalid snapshot delete receipt (fail-stop)");
+    }
+    deleteReceipts_ = std::move(replacement);
 }
 
 }  // namespace timestar::cluster

@@ -56,6 +56,17 @@ namespace timestar::http {
 // Forward declaration for shared validation used by both JSON and protobuf paths.
 static void validateDeleteRequest(const HttpDeleteHandler::DeleteRequest& req);
 
+static SeriesId128 exactDeleteOperationId(const SeriesId128& requestId, std::string_view seriesKey, uint64_t startTime,
+                                          uint64_t endTime) {
+    std::string identity = requestId.toBytes();
+    identity.reserve(identity.size() + sizeof(uint64_t) * 2 + seriesKey.size());
+    identity.append(seriesKey);
+    for (uint64_t value : {startTime, endTime})
+        for (unsigned byte = 0; byte < sizeof(value); ++byte)
+            identity.push_back(static_cast<char>((value >> (byte * 8)) & 0xff));
+    return SeriesId128::fromSeriesKey(identity);
+}
+
 HttpDeleteHandler::DeleteRequest HttpDeleteHandler::parseDeleteRequest(const GlazeDeleteRequest& glazeReq) {
     DeleteRequest req;
     req.isPattern = false;
@@ -184,6 +195,31 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDeleteHandler::handle
             reply->_content = createErrorResponse(std::string(message));
         timestar::http::setContentType(*reply, resFmt);
         co_return reply;
+    }
+
+    // A partitioned delete can lose its acknowledgement after commit. Require
+    // the caller to supply a stable 128-bit retry identity; each exact target
+    // derives a distinct operation ID from it and the canonical target bytes.
+    // Reusing this header with a different body deliberately derives different
+    // operations: the contract is "same key AND same request".
+    SeriesId128 clusterRequestId;
+    if (partitionedCluster_) {
+        const std::string idempotencyKey = req->get_header("Idempotency-Key");
+        try {
+            clusterRequestId = SeriesId128::fromHex(idempotencyKey);
+            if (clusterRequestId == SeriesId128{})
+                throw std::invalid_argument("zero operation ID");
+        } catch (...) {
+            reply->set_status(seastar::http::reply::status_type::bad_request);
+            constexpr std::string_view message =
+                "Partitioned delete requires Idempotency-Key as 32 non-zero hexadecimal characters";
+            if (timestar::http::isProtobuf(resFmt))
+                reply->_content = timestar::proto::formatDeleteResponse("error", 0, 0, std::string(message));
+            else
+                reply->_content = createErrorResponse(std::string(message));
+            timestar::http::setContentType(*reply, resFmt);
+            co_return reply;
+        }
     }
 
     // Cluster: replicate an accepted delete to peers (M1) so the deletion applies
@@ -431,28 +467,17 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDeleteHandler::handle
             // parallelism to spread work across leaders without allowing one HTTP
             // request to create an unbounded proposal fan-out.
             static constexpr size_t kMaxConcurrentClusterDeletes = 32;
-            try {
-                co_await seastar::max_concurrent_for_each(
-                    expanded, kMaxConcurrentClusterDeletes, [](const ExpandedDelete& command) {
-                        return clusterDeleteHook(command.seriesKey, command.startTime, command.endTime);
-                    });
-            } catch (...) {
-                if (expanded.size() > 1) {
-                    // Other concurrent commands may already have committed even
-                    // when this particular failure was an unambiguous refusal.
-                    // Advertising the whole batch as retryable could then erase a
-                    // write ordered after one of those committed deletes.
-                    try {
-                        throw;
-                    } catch (const timestar::data::AmbiguousMutationError&) {
-                        throw;
-                    } catch (...) {
-                        throw timestar::data::AmbiguousMutationError(
-                            "multi-target delete outcome is unknown: one or more exact commands may have committed");
-                    }
-                }
-                throw;
-            }
+            // Every exact target derives the same operation identity on a
+            // byte-identical client retry. Targets that already committed are
+            // replicated no-ops, while only missing targets perform storage
+            // work. A partial fan-out is therefore safely retryable rather than
+            // an unbounded second physical delete.
+            co_await seastar::max_concurrent_for_each(
+                expanded, kMaxConcurrentClusterDeletes, [clusterRequestId](const ExpandedDelete& command) {
+                    return clusterDeleteHook(command.seriesKey, command.startTime, command.endTime,
+                                             exactDeleteOperationId(clusterRequestId, command.seriesKey,
+                                                                    command.startTime, command.endTime));
+                });
 
             // Raft's acknowledgement proves that every expanded exact target
             // committed and applied, not whether a point happened to exist before

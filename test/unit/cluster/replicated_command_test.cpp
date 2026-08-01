@@ -46,6 +46,19 @@ TEST(ReplicatedCommandCodec, DeleteAndRetentionArmsRoundTrip) {
     ASSERT_TRUE(std::holds_alternative<DeleteRangeKey>(*db));
     EXPECT_EQ(std::get<DeleteRangeKey>(*db).seriesKey, d.seriesKey);
     EXPECT_EQ(std::get<DeleteRangeKey>(*db).endTime, 200u);
+    EXPECT_EQ(std::get<DeleteRangeKey>(*db).operationId, SeriesId128{})
+        << "legacy delete bytes must remain legacy/retry-unsafe";
+
+    d.operationId = SeriesId128::fromHex("0123456789abcdef0123456789abcdef");
+    auto idempotent = decodeReplicatedCommand(encodeReplicatedCommand(ReplicatedCommand{d}));
+    ASSERT_TRUE(idempotent.has_value());
+    ASSERT_TRUE(std::holds_alternative<DeleteRangeKey>(*idempotent));
+    EXPECT_EQ(std::get<DeleteRangeKey>(*idempotent).operationId, d.operationId);
+    EXPECT_EQ(deleteRangeCommandHash(std::get<DeleteRangeKey>(*idempotent)), deleteRangeCommandHash(d));
+
+    auto changed = d;
+    ++changed.endTime;
+    EXPECT_NE(deleteRangeCommandHash(changed), deleteRangeCommandHash(d));
 
     RetentionCutoffCmd rc{123456};
     auto rb = decodeReplicatedCommand(encodeReplicatedCommand(ReplicatedCommand{rc}));
