@@ -20,6 +20,11 @@ seastar::future<> ReplicatedCommandRouter::propose(uint16_t vshard, ReplicatedCo
     bool targetsVShard = true;
     if (const auto* d = std::get_if<DeleteRangeKey>(&command)) {
         targetsVShard = timestar::virtualShard(SeriesId128::fromSeriesKey(d->seriesKey)) == vshard;
+    } else if (const auto* batch = std::get_if<DeleteRangeBatch>(&command)) {
+        targetsVShard = !batch->targets.empty();
+        for (const auto& target : batch->targets)
+            targetsVShard =
+                targetsVShard && timestar::virtualShard(SeriesId128::fromSeriesKey(target.seriesKey)) == vshard;
     } else if (auto* w = std::get_if<WriteBatch>(&command)) {
         targetsVShard = !w->series.empty();
         for (auto& series : w->series)

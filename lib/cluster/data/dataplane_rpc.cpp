@@ -573,6 +573,11 @@ seastar::future<> DataPlaneRpc::start(seastar::socket_address local, NodeStore& 
         bool matches = true;
         if (const auto* d = std::get_if<DeleteRangeKey>(&*command)) {
             matches = timestar::virtualShard(SeriesId128::fromSeriesKey(d->seriesKey)) == vshard;
+        } else if (const auto* batch = std::get_if<DeleteRangeBatch>(&*command)) {
+            matches = !batch->targets.empty();
+            for (const auto& target : batch->targets)
+                matches = matches &&
+                          timestar::virtualShard(SeriesId128::fromSeriesKey(target.seriesKey)) == vshard;
         } else if (auto* w = std::get_if<WriteBatch>(&*command)) {
             matches = !w->series.empty();
             for (auto& s : w->series)

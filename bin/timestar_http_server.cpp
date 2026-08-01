@@ -748,9 +748,8 @@ int main(int argc, char** argv) {
                         };
                     if (replicatedWrites) {
                         timestar::http::HttpDeleteHandler::clusterDeleteHook =
-                            [](std::string seriesKey, uint64_t startTime, uint64_t endTime, SeriesId128 operationId) {
-                                return g_clusterDataPlane.deleteRangeFromShard(std::move(seriesKey), startTime, endTime,
-                                                                               operationId);
+                            [](std::vector<timestar::data::DeleteRangeTarget> targets, SeriesId128 operationId) {
+                                return g_clusterDataPlane.deleteRangesFromShard(std::move(targets), operationId);
                             };
                     }
                     // Route metadata endpoints through the scatter+merge.

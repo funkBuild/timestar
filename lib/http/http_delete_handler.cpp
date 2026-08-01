@@ -2,6 +2,7 @@
 
 #include "../cluster/data/write_errors.hpp"
 #include "../cluster/integration/cluster_gateway.hpp"
+#include "../cluster/raft/raft_group.hpp"
 #include "content_negotiation.hpp"
 #include "http_auth.hpp"
 #include "http_error.hpp"
@@ -56,14 +57,30 @@ namespace timestar::http {
 // Forward declaration for shared validation used by both JSON and protobuf paths.
 static void validateDeleteRequest(const HttpDeleteHandler::DeleteRequest& req);
 
-static SeriesId128 exactDeleteOperationId(const SeriesId128& requestId, std::string_view seriesKey, uint64_t startTime,
-                                          uint64_t endTime) {
+static SeriesId128 deleteBatchOperationId(const SeriesId128& requestId, uint16_t vshard,
+                                          const std::vector<timestar::data::DeleteRangeTarget>& targets) {
     std::string identity = requestId.toBytes();
-    identity.reserve(identity.size() + sizeof(uint64_t) * 2 + seriesKey.size());
-    identity.append(seriesKey);
-    for (uint64_t value : {startTime, endTime})
+    size_t targetBytes = 0;
+    for (const auto& target : targets)
+        targetBytes += sizeof(uint32_t) + target.seriesKey.size() + sizeof(uint64_t) * 2;
+    identity.reserve(identity.size() + sizeof(vshard) + sizeof(uint32_t) + targetBytes);
+    identity.push_back(static_cast<char>(vshard & 0xff));
+    identity.push_back(static_cast<char>((vshard >> 8) & 0xff));
+    const auto appendU32 = [&identity](uint32_t value) {
         for (unsigned byte = 0; byte < sizeof(value); ++byte)
             identity.push_back(static_cast<char>((value >> (byte * 8)) & 0xff));
+    };
+    const auto appendU64 = [&identity](uint64_t value) {
+        for (unsigned byte = 0; byte < sizeof(value); ++byte)
+            identity.push_back(static_cast<char>((value >> (byte * 8)) & 0xff));
+    };
+    appendU32(static_cast<uint32_t>(targets.size()));
+    for (const auto& target : targets) {
+        appendU32(static_cast<uint32_t>(target.seriesKey.size()));
+        identity.append(target.seriesKey);
+        appendU64(target.startTime);
+        appendU64(target.endTime);
+    }
     return SeriesId128::fromSeriesKey(identity);
 }
 
@@ -198,8 +215,8 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDeleteHandler::handle
     }
 
     // A partitioned delete can lose its acknowledgement after commit. Require
-    // the caller to supply a stable 128-bit retry identity; each exact target
-    // derives a distinct operation ID from it and the canonical target bytes.
+    // the caller to supply a stable 128-bit retry identity; each VShard's
+    // canonical exact-target batch derives a distinct operation ID from it.
     // Reusing this header with a different body deliberately derives different
     // operations: the contract is "same key AND same request".
     SeriesId128 clusterRequestId;
@@ -481,22 +498,45 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDeleteHandler::handle
                 throw timestar::data::DeleteExpansionLimitError(
                     "delete request expands beyond the 10000-series safety limit");
 
-            // A legal request may contain 10,000 targets. Starting all 10,000
-            // quorum waits at once exhausts Raft waiter and connection capacity
-            // before the ordinary write-admission controls can react. Keep enough
-            // parallelism to spread work across leaders without allowing one HTTP
-            // request to create an unbounded proposal fan-out.
+            // One canonical command per VShard gives the whole request/VShard one
+            // durable receipt rather than one receipt per exact series. It also
+            // makes restart replay preserve the request's ordering as one Raft
+            // entry. The default 1 MiB HTTP body cap is below Raft's per-entry
+            // bound; the explicit encoded-size check also protects deployments
+            // that raise the body limit.
+            std::map<uint16_t, std::vector<timestar::data::DeleteRangeTarget>> grouped;
+            for (const auto& command : expanded) {
+                const uint16_t vshard =
+                    timestar::virtualShard(SeriesId128::fromSeriesKey(command.seriesKey));
+                grouped[vshard].push_back(
+                    {command.seriesKey, command.startTime, command.endTime});
+            }
+            struct VShardDeleteBatch {
+                std::vector<timestar::data::DeleteRangeTarget> targets;
+                SeriesId128 operationId;
+            };
+            std::vector<VShardDeleteBatch> batches;
+            batches.reserve(grouped.size());
+            for (auto& [vshard, targets] : grouped) {
+                const SeriesId128 operationId = deleteBatchOperationId(clusterRequestId, vshard, targets);
+                if (timestar::data::encodedDeleteRangeBatchBytes(targets) >
+                    timestar::raft::RaftGroup::kMaxProposalBytes)
+                    throw timestar::data::WriteFrameTooLargeError(
+                        "delete request contains a VShard batch larger than the Raft entry limit");
+                batches.push_back({std::move(targets), operationId});
+            }
+
+            // A legal request may span every VShard. Starting all those quorum
+            // waits at once exhausts Raft waiter and connection capacity before
+            // ordinary write admission can react. Keep enough parallelism to
+            // spread work across leaders without unbounded proposal fan-out.
             static constexpr size_t kMaxConcurrentClusterDeletes = 32;
-            // Every exact target derives the same operation identity on a
-            // byte-identical client retry. Targets that already committed are
-            // replicated no-ops, while only missing targets perform storage
-            // work. A partial fan-out is therefore safely retryable rather than
-            // an unbounded second physical delete.
+            // Every VShard batch derives the same operation identity on a
+            // byte-identical client retry. Batches that already committed are
+            // replicated no-ops, while only missing VShards perform storage work.
             co_await seastar::max_concurrent_for_each(
-                expanded, kMaxConcurrentClusterDeletes, [clusterRequestId](const ExpandedDelete& command) {
-                    return clusterDeleteHook(command.seriesKey, command.startTime, command.endTime,
-                                             exactDeleteOperationId(clusterRequestId, command.seriesKey,
-                                                                    command.startTime, command.endTime));
+                batches, kMaxConcurrentClusterDeletes, [](VShardDeleteBatch& batch) {
+                    return clusterDeleteHook(std::move(batch.targets), batch.operationId);
                 });
 
             // Raft's acknowledgement proves that every expanded exact target
@@ -527,7 +567,8 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDeleteHandler::handle
                 } else {
                     response.deletedSeriesCount = expanded.size();
                 }
-                response.note = "seriesDeleted is the number of unique exact delete commands committed and applied";
+                response.note =
+                    "seriesDeleted is the number of unique exact targets covered by committed and applied VShard batches";
                 reply->_content = glz::write_json(response).value_or("{}");
             }
             timestar::http::setContentType(*reply, resFmt);
@@ -690,6 +731,12 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDeleteHandler::handle
             reply->_content = createErrorResponse(e.what());
     } catch (const timestar::data::PatternSeriesUnsupportedError& e) {
         reply->set_status(seastar::http::reply::status_type::not_implemented);
+        if (timestar::http::isProtobuf(resFmt))
+            reply->_content = timestar::proto::formatDeleteResponse("error", 0, 0, e.what());
+        else
+            reply->_content = createErrorResponse(e.what());
+    } catch (const timestar::data::WriteFrameTooLargeError& e) {
+        reply->set_status(seastar::http::reply::status_type::payload_too_large);
         if (timestar::http::isProtobuf(resFmt))
             reply->_content = timestar::proto::formatDeleteResponse("error", 0, 0, e.what());
         else

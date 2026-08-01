@@ -11,6 +11,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <seastar/core/thread.hh>
 
 using namespace timestar;
@@ -45,6 +46,22 @@ raft::LogEntry deleteEntry(uint64_t index, data::DeleteRangeKey command) {
     entry.type = raft::EntryType::Normal;
     entry.data = data::encodeReplicatedCommand(data::ReplicatedCommand{std::move(command)});
     return entry;
+}
+
+raft::LogEntry deleteBatchEntry(uint64_t index, data::DeleteRangeBatch command) {
+    raft::LogEntry entry;
+    entry.index = index;
+    entry.type = raft::EntryType::Normal;
+    entry.data = data::encodeReplicatedCommand(data::ReplicatedCommand{std::move(command)});
+    return entry;
+}
+
+std::string keyOnVShard(const std::string& measurement, uint16_t vshard) {
+    for (unsigned i = 0;; ++i) {
+        auto key = buildSeriesKey(measurement, {{"host", "h" + std::to_string(i)}}, "value");
+        if (timestar::virtualShard(SeriesId128::fromSeriesKey(key)) == vshard)
+            return key;
+    }
 }
 
 double latest(seastar::sharded<Engine>& eng, const std::string& m, const std::string& f) {
@@ -145,6 +162,39 @@ TEST_F(EngineDataStateMachineTest, RestoredDeleteReceiptProtectsPostSnapshotWrit
         sm.apply(deleteEntry(9, command)).get();
         EXPECT_DOUBLE_EQ(latest(*eng, "delete_snapshot_retry", "value"), 30.0)
             << "a retry after snapshot compaction forgot its durable receipt";
+    }).get();
+}
+
+TEST_F(EngineDataStateMachineTest, OneBatchReceiptProtectsEveryTargetFromRetry) {
+    seastar::async([] {
+        ScopedShardedEngine eng;
+        eng.start();
+        cluster::EngineLocalStore store(*eng);
+        const std::string first = buildSeriesKey("delete_batch_a", {{"host", "h1"}}, "value");
+        const uint16_t vshard = timestar::virtualShard(SeriesId128::fromSeriesKey(first));
+        const std::string second = keyOnVShard("delete_batch_b", vshard);
+        cluster::EngineDataStateMachine sm(store, timestar::VShardId{vshard});
+        data::DeleteRangeBatch command;
+        command.operationId = SeriesId128::fromHex("1029384756abcdef1029384756abcdef");
+        command.targets = {{first, BASE, BASE}, {second, BASE, BASE}};
+        std::sort(command.targets.begin(), command.targets.end());
+
+        sm.apply(writeEntry(3, first, 10.0)).get();
+        sm.apply(writeEntry(4, second, 11.0)).get();
+        sm.apply(deleteBatchEntry(5, command)).get();
+        EXPECT_DOUBLE_EQ(latest(*eng, "delete_batch_a", "value"), -1);
+        EXPECT_DOUBLE_EQ(latest(*eng, "delete_batch_b", "value"), -1);
+
+        sm.apply(writeEntry(6, first, 20.0)).get();
+        sm.apply(writeEntry(7, second, 21.0)).get();
+        sm.apply(deleteBatchEntry(8, command)).get();
+        EXPECT_DOUBLE_EQ(latest(*eng, "delete_batch_a", "value"), 20.0);
+        EXPECT_DOUBLE_EQ(latest(*eng, "delete_batch_b", "value"), 21.0);
+
+        const auto receipts = sm.deleteReceiptsThrough(5);
+        ASSERT_EQ(receipts.size(), 1u) << "one VShard batch must consume one durable receipt";
+        EXPECT_EQ(receipts[0].operationId, command.operationId);
+        EXPECT_EQ(receipts[0].commandHash, data::deleteRangeCommandHash(command));
     }).get();
 }
 

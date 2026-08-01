@@ -2,7 +2,9 @@
 
 #include "journal_format.hpp"  // JournalFormatGate (debt D-7)
 
+#include <algorithm>
 #include <cstring>
+#include <stdexcept>
 
 namespace timestar::data {
 
@@ -70,6 +72,19 @@ constexpr uint8_t kWrite = 0;
 constexpr uint8_t kDelete = 1;
 constexpr uint8_t kRetention = 2;
 constexpr uint8_t kIdempotentDelete = 3;
+constexpr uint8_t kIdempotentDeleteBatch = 4;
+constexpr size_t kMinimumDeleteRangeTargetBytes = 4 + 8 + 8;
+
+bool validDeleteRangeTargets(const std::vector<DeleteRangeTarget>& targets) {
+    if (targets.empty() || targets.size() > kMaxDeleteRangeBatchTargets)
+        return false;
+    for (size_t i = 0; i < targets.size(); ++i) {
+        if (targets[i].seriesKey.empty() || targets[i].startTime > targets[i].endTime ||
+            (i != 0 && !(targets[i - 1] < targets[i])))
+            return false;
+    }
+    return true;
+}
 
 }  // namespace
 
@@ -121,6 +136,17 @@ std::string encodeReplicatedCommand(const ReplicatedCommand& cmd) {
         putStr(out, d->seriesKey);
         putU64(out, d->startTime);
         putU64(out, d->endTime);
+    } else if (const auto* batch = std::get_if<DeleteRangeBatch>(&cmd)) {
+        if (batch->operationId == SeriesId128{} || !validDeleteRangeTargets(batch->targets))
+            throw std::invalid_argument("encodeReplicatedCommand: invalid idempotent delete batch");
+        out.push_back(static_cast<char>(kIdempotentDeleteBatch));
+        batch->operationId.appendTo(out);
+        putU32(out, static_cast<uint32_t>(batch->targets.size()));
+        for (const auto& target : batch->targets) {
+            putStr(out, target.seriesKey);
+            putU64(out, target.startTime);
+            putU64(out, target.endTime);
+        }
     } else {
         const auto& r = std::get<RetentionCutoffCmd>(cmd);
         out.push_back(static_cast<char>(kRetention));
@@ -169,6 +195,29 @@ std::optional<ReplicatedCommand> decodeReplicatedCommand(const std::string& byte
         if (!r.ok)
             return std::nullopt;
         cmd = std::move(d);
+    } else if (tag == kIdempotentDeleteBatch) {
+        DeleteRangeBatch d;
+        if (!r.avail(16))
+            return std::nullopt;
+        d.operationId = SeriesId128::fromBytes(r.p, 16);
+        r.p += 16;
+        const uint32_t count = r.u32();
+        if (!r.ok || d.operationId == SeriesId128{} || count == 0 || count > kMaxDeleteRangeBatchTargets ||
+            count > static_cast<size_t>(r.end - r.p) / kMinimumDeleteRangeTargetBytes)
+            return std::nullopt;
+        d.targets.reserve(count);
+        for (uint32_t i = 0; i < count; ++i) {
+            DeleteRangeTarget target;
+            target.seriesKey = r.str();
+            target.startTime = r.u64();
+            target.endTime = r.u64();
+            if (!r.ok)
+                return std::nullopt;
+            d.targets.push_back(std::move(target));
+        }
+        if (!validDeleteRangeTargets(d.targets))
+            return std::nullopt;
+        cmd = std::move(d);
     } else if (tag == kRetention) {
         RetentionCutoffCmd rc;
         rc.cutoffTime = r.u64();
@@ -189,6 +238,21 @@ uint64_t deleteRangeCommandHash(const DeleteRangeKey& command) {
     putStr(canonical, command.seriesKey);
     putU64(canonical, command.startTime);
     putU64(canonical, command.endTime);
+    return fnv1a(canonical.data(), canonical.size());
+}
+
+uint64_t deleteRangeCommandHash(const DeleteRangeBatch& command) {
+    std::string canonical;
+    size_t bytes = 4;
+    for (const auto& target : command.targets)
+        bytes += 4 + target.seriesKey.size() + 16;
+    canonical.reserve(bytes);
+    putU32(canonical, static_cast<uint32_t>(command.targets.size()));
+    for (const auto& target : command.targets) {
+        putStr(canonical, target.seriesKey);
+        putU64(canonical, target.startTime);
+        putU64(canonical, target.endTime);
+    }
     return fnv1a(canonical.data(), canonical.size());
 }
 

@@ -6,6 +6,7 @@
 #include <optional>
 #include <string>
 #include <variant>
+#include <vector>
 
 namespace timestar::data {
 
@@ -35,10 +36,51 @@ struct DeleteRangeKey {
     SeriesId128 operationId{};
 };
 
+// One canonical exact target inside an idempotent per-VShard delete operation.
+// Targets are encoded in strict tuple order and may not repeat, making the batch
+// bytes (and therefore its receipt hash) independent of HTTP request ordering.
+struct DeleteRangeTarget {
+    std::string seriesKey;
+    uint64_t startTime = 0;
+    uint64_t endTime = 0;
+
+    auto operator<=>(const DeleteRangeTarget&) const = default;
+};
+
+// A whole HTTP operation's exact targets for ONE VShard. Keeping one receipt for
+// this batch rather than one per series makes receipt growth proportional to
+// requests x VShards, not to a selector/request's expanded series cardinality.
+// The batch is still applied in deterministic target order. A crash before the
+// final receipt replays the entry before any later log entry, so repeating an
+// already-finished prefix cannot erase a write ordered after this command.
+struct DeleteRangeBatch {
+    std::vector<DeleteRangeTarget> targets;
+    SeriesId128 operationId{};
+};
+
+inline constexpr size_t kMaxDeleteRangeBatchTargets = 10'000;
+
+inline size_t encodedDeleteRangeBatchBytes(const std::vector<DeleteRangeTarget>& targets) {
+    // tag + operation ID + target count + checksum trailer.
+    size_t bytes = 1 + 16 + 4 + 8;
+    for (const auto& target : targets) {
+        constexpr size_t framing = 4 + 8 + 8;  // key length + inclusive range
+        if (target.seriesKey.size() > SIZE_MAX - framing || bytes > SIZE_MAX - framing - target.seriesKey.size())
+            return SIZE_MAX;
+        bytes += framing + target.seriesKey.size();
+    }
+    return bytes;
+}
+
+inline size_t encodedDeleteRangeBatchBytes(const DeleteRangeBatch& command) {
+    return encodedDeleteRangeBatchBytes(command.targets);
+}
+
 // Stable digest of the exact delete target. Snapshot-persistent operation
 // receipts retain this alongside the ID so accidental ID reuse for different
 // command bytes fail-stops instead of silently acknowledging the wrong delete.
 uint64_t deleteRangeCommandHash(const DeleteRangeKey& command);
+uint64_t deleteRangeCommandHash(const DeleteRangeBatch& command);
 
 // Drop every point older than `cutoffTime` across the VShard. Monotonic. NOTE: in v1
 // EngineDataStateMachine's apply of this command is a NO-OP (EngineLocalStore::
@@ -48,7 +90,7 @@ struct RetentionCutoffCmd {
     uint64_t cutoffTime = 0;
 };
 
-using ReplicatedCommand = std::variant<WriteBatch, DeleteRangeKey, RetentionCutoffCmd>;
+using ReplicatedCommand = std::variant<WriteBatch, DeleteRangeKey, DeleteRangeBatch, RetentionCutoffCmd>;
 
 // Self-delimiting, trailer-checksummed wire form (a 1-byte kind tag + the payload,
 // the WriteBatch arm reusing the tested encodeWriteBatch). decode returns nullopt on

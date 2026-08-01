@@ -32,6 +32,12 @@ seastar::future<> EngineDataStateMachine::apply(raft::LogEntry entry) {
             targetsThisVShard = targetsThisVShard && data::vshardOf(series) == vshard_.value();
     } else if (const auto* d = std::get_if<data::DeleteRangeKey>(&*cmd)) {
         targetsThisVShard = timestar::virtualShard(SeriesId128::fromSeriesKey(d->seriesKey)) == vshard_.value();
+    } else if (const auto* batch = std::get_if<data::DeleteRangeBatch>(&*cmd)) {
+        targetsThisVShard = !batch->targets.empty();
+        for (const auto& target : batch->targets)
+            targetsThisVShard =
+                targetsThisVShard &&
+                timestar::virtualShard(SeriesId128::fromSeriesKey(target.seriesKey)) == vshard_.value();
     }
     if (!targetsThisVShard)
         throw std::runtime_error("EngineDataStateMachine: committed command targets a different VShard (fail-stop)");
@@ -62,6 +68,22 @@ seastar::future<> EngineDataStateMachine::apply(raft::LogEntry entry) {
         if (idempotent)
             deleteReceipts_.emplace(d->operationId,
                                     data::DeleteOperationReceipt{d->operationId, entry.index, commandHash});
+    } else if (auto* batch = std::get_if<data::DeleteRangeBatch>(&*cmd)) {
+        const uint64_t commandHash = data::deleteRangeCommandHash(*batch);
+        if (const auto found = deleteReceipts_.find(batch->operationId); found != deleteReceipts_.end()) {
+            if (found->second.commandHash != commandHash)
+                throw std::runtime_error(
+                    "EngineDataStateMachine: delete operation ID reused for another command (fail-stop)");
+            co_return;
+        }
+        // One Raft entry is the ordering boundary for the whole canonical
+        // VShard batch. If applyDelete fails halfway, no receipt is published;
+        // replay repeats the prefix before any later entry can apply, so it
+        // cannot erase a write ordered after this batch.
+        for (const auto& target : batch->targets)
+            co_await store_.applyDelete(target.seriesKey, target.startTime, target.endTime);
+        deleteReceipts_.emplace(batch->operationId,
+                                data::DeleteOperationReceipt{batch->operationId, entry.index, commandHash});
     } else {
         const auto& rc = std::get<data::RetentionCutoffCmd>(*cmd);
         // VShard-wide retention cutoff (EngineLocalStore::applyRetention is the M1.x/M6

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../cluster/data/pattern_series.hpp"
+#include "../cluster/data/replicated_command.hpp"
 #include "engine.hpp"
 #include "series_id.hpp"
 
@@ -110,8 +111,8 @@ private:
     bool partitionedCluster_ = false;
 
 public:
-    using ClusterDeleteHook = std::function<seastar::future<>(std::string seriesKey, uint64_t startTime,
-                                                              uint64_t endTime, SeriesId128 operationId)>;
+    using ClusterDeleteHook = std::function<seastar::future<>(
+        std::vector<timestar::data::DeleteRangeTarget> targets, SeriesId128 operationId)>;
     using ClusterPatternExpandHook = std::function<seastar::future<std::vector<std::string>>(
         timestar::data::PatternSeriesSelector selector, uint32_t maxSeries)>;
     static inline ClusterDeleteHook clusterDeleteHook{};

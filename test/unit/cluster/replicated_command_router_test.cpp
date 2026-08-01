@@ -120,6 +120,11 @@ DeleteRangeKey deleteFor(const std::string& key) {
     return DeleteRangeKey{key, 10, 20};
 }
 
+DeleteRangeBatch deleteBatchFor(const std::string& key) {
+    return DeleteRangeBatch{{DeleteRangeTarget{key, 10, 20}},
+                            SeriesId128::fromHex("0fedcba9876543210fedcba987654321")};
+}
+
 }  // namespace
 
 TEST(ReplicatedCommandRouterTest, CommitsAnExactCommandOnTheLocalLeader) {
@@ -199,6 +204,24 @@ TEST(ReplicatedCommandRouterTest, SnapshotPersistentDeleteIdentityMakesAmbiguous
     EXPECT_EQ(remote.encoded[1], expected);
 }
 
+TEST(ReplicatedCommandRouterTest, VShardDeleteBatchRetriesTheExactBytesAfterAmbiguousSend) {
+    const std::string key = buildSeriesKey("delete", {{"host", "batch-remote"}}, "value");
+    const uint16_t vshard = timestar::virtualShard(SeriesId128::fromSeriesKey(key));
+    VShardDirectory dir(1, mapWith(vshard));
+    CommandSink local;
+    OneShotAmbiguousTransport remote;
+    MapLeaders leaders;
+    leaders.leaders[vshard] = 2;
+    ReplicatedCommandRouter router(dir, local, remote, leaders);
+
+    const ReplicatedCommand command{deleteBatchFor(key)};
+    const std::string expected = encodeReplicatedCommand(command);
+    EXPECT_NO_THROW(router.propose(vshard, command).get());
+    ASSERT_EQ(remote.encoded.size(), 2u);
+    EXPECT_EQ(remote.encoded[0], expected);
+    EXPECT_EQ(remote.encoded[1], expected);
+}
+
 TEST(ReplicatedCommandRouterTest, DoesNotReproposeDeleteAfterLeadershipLoss) {
     const std::string key = buildSeriesKey("delete", {{"host", "ambiguous-local"}}, "value");
     const uint16_t vshard = timestar::virtualShard(SeriesId128::fromSeriesKey(key));
@@ -226,6 +249,29 @@ TEST(ReplicatedCommandRouterTest, RejectsCrossVShardCommandBeforeProposal) {
     ReplicatedCommandRouter router(dir, local, remote, leaders);
 
     EXPECT_THROW(router.propose(requested, ReplicatedCommand{deleteFor(key)}).get(), std::invalid_argument);
+    EXPECT_EQ(local.calls, 0u);
+    EXPECT_EQ(remote.calls, 0u);
+}
+
+TEST(ReplicatedCommandRouterTest, RejectsCrossVShardDeleteBatchBeforeProposal) {
+    const std::string first = buildSeriesKey("delete", {{"host", "batch-local"}}, "value");
+    const uint16_t requested = timestar::virtualShard(SeriesId128::fromSeriesKey(first));
+    std::string foreign;
+    for (unsigned i = 0;; ++i) {
+        foreign = buildSeriesKey("delete", {{"host", "batch-foreign-" + std::to_string(i)}}, "value");
+        if (timestar::virtualShard(SeriesId128::fromSeriesKey(foreign)) != requested)
+            break;
+    }
+    DeleteRangeBatch batch{{DeleteRangeTarget{first, 10, 20}, DeleteRangeTarget{foreign, 10, 20}},
+                           SeriesId128::fromHex("123456789abcdef0123456789abcdef0")};
+    std::sort(batch.targets.begin(), batch.targets.end());
+    VShardDirectory dir(1, mapWith(requested));
+    CommandSink local;
+    CommandTransport remote;
+    MapLeaders leaders;
+    ReplicatedCommandRouter router(dir, local, remote, leaders);
+
+    EXPECT_THROW(router.propose(requested, ReplicatedCommand{batch}).get(), std::invalid_argument);
     EXPECT_EQ(local.calls, 0u);
     EXPECT_EQ(remote.calls, 0u);
 }

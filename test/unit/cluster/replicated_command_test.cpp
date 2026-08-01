@@ -1,5 +1,5 @@
 // Integration M3 (foundation): the ENRICHED replicated command
-// variant<WriteBatch, DeleteRangeKey, RetentionCutoffCmd> that replaces the lossy
+// variant<WriteBatch, DeleteRangeKey, DeleteRangeBatch, RetentionCutoffCmd> that replaces the lossy
 // DataPoint-based DataCommand -- re-opens the Phase 5 codec gate with WriteBatch.
 #include "../../../lib/cluster/data/replicated_command.hpp"
 
@@ -65,6 +65,39 @@ TEST(ReplicatedCommandCodec, DeleteAndRetentionArmsRoundTrip) {
     ASSERT_TRUE(rb.has_value());
     ASSERT_TRUE(std::holds_alternative<RetentionCutoffCmd>(*rb));
     EXPECT_EQ(std::get<RetentionCutoffCmd>(*rb).cutoffTime, 123456u);
+}
+
+TEST(ReplicatedCommandCodec, CanonicalDeleteBatchRoundTripsAsOneIdempotentOperation) {
+    DeleteRangeBatch batch;
+    batch.operationId = SeriesId128::fromHex("fedcba9876543210fedcba9876543210");
+    batch.targets = {{"a value", 10, 20}, {"b value", 30, 40}};
+
+    const std::string encoded = encodeReplicatedCommand(ReplicatedCommand{batch});
+    EXPECT_EQ(encodedDeleteRangeBatchBytes(batch), encoded.size());
+    auto decoded = decodeReplicatedCommand(encoded);
+    ASSERT_TRUE(decoded.has_value());
+    ASSERT_TRUE(std::holds_alternative<DeleteRangeBatch>(*decoded));
+    const auto& back = std::get<DeleteRangeBatch>(*decoded);
+    EXPECT_EQ(back.operationId, batch.operationId);
+    EXPECT_EQ(back.targets, batch.targets);
+    EXPECT_EQ(deleteRangeCommandHash(back), deleteRangeCommandHash(batch));
+
+    auto changed = batch;
+    ++changed.targets[1].endTime;
+    EXPECT_NE(deleteRangeCommandHash(changed), deleteRangeCommandHash(batch));
+
+    auto unsorted = batch;
+    std::swap(unsorted.targets[0], unsorted.targets[1]);
+    EXPECT_THROW(encodeReplicatedCommand(ReplicatedCommand{unsorted}), std::invalid_argument);
+    auto duplicate = batch;
+    duplicate.targets[1] = duplicate.targets[0];
+    EXPECT_THROW(encodeReplicatedCommand(ReplicatedCommand{duplicate}), std::invalid_argument);
+    auto empty = batch;
+    empty.targets.clear();
+    EXPECT_THROW(encodeReplicatedCommand(ReplicatedCommand{empty}), std::invalid_argument);
+
+    for (size_t n = 0; n < encoded.size(); ++n)
+        EXPECT_FALSE(decodeReplicatedCommand(encoded.substr(0, n)).has_value()) << "prefix " << n;
 }
 
 TEST(ReplicatedCommandCodec, TruncationAndCorruptionRejected) {

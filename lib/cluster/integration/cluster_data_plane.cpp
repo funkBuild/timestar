@@ -1292,17 +1292,26 @@ seastar::future<> ClusterDataPlane::writeFromShard(data::WriteBatch batch) {
     return writeSlicesToOwningShards(shards_, std::move(batch), dir_.get());
 }
 
-seastar::future<> ClusterDataPlane::deleteRangeFromShard(std::string seriesKey, uint64_t startTime, uint64_t endTime,
-                                                         SeriesId128 operationId) {
+seastar::future<> ClusterDataPlane::deleteRangesFromShard(std::vector<data::DeleteRangeTarget> targets,
+                                                          SeriesId128 operationId) {
     if (!replicated_ || !shardsStarted_)
-        throw std::runtime_error("ClusterDataPlane::deleteRangeFromShard requires replicated mode after start()");
-    const uint16_t vshard = timestar::virtualShard(SeriesId128::fromSeriesKey(seriesKey));
-    const unsigned owner = shardOwningVShard(vshard, dir_.get());
+        throw std::runtime_error("ClusterDataPlane::deleteRangesFromShard requires replicated mode after start()");
     if (operationId == SeriesId128{})
-        throw std::invalid_argument("ClusterDataPlane::deleteRangeFromShard requires a non-zero operation ID");
-    data::DeleteRangeKey del{std::move(seriesKey), startTime, endTime, operationId};
-    return shards_.invoke_on(owner, [vshard, del = std::move(del)](ShardRaftPlane& plane) mutable {
-        return plane.command(vshard, data::ReplicatedCommand{std::move(del)});
+        throw std::invalid_argument("ClusterDataPlane::deleteRangesFromShard requires a non-zero operation ID");
+    if (targets.empty() || targets.size() > data::kMaxDeleteRangeBatchTargets)
+        throw std::invalid_argument("ClusterDataPlane::deleteRangesFromShard requires a bounded non-empty batch");
+    const uint16_t vshard = timestar::virtualShard(SeriesId128::fromSeriesKey(targets.front().seriesKey));
+    for (size_t i = 0; i < targets.size(); ++i) {
+        if (targets[i].seriesKey.empty() || targets[i].startTime > targets[i].endTime ||
+            timestar::virtualShard(SeriesId128::fromSeriesKey(targets[i].seriesKey)) != vshard ||
+            (i != 0 && !(targets[i - 1] < targets[i])))
+            throw std::invalid_argument(
+                "ClusterDataPlane::deleteRangesFromShard requires canonical targets from one VShard");
+    }
+    const unsigned owner = shardOwningVShard(vshard, dir_.get());
+    data::DeleteRangeBatch batch{std::move(targets), operationId};
+    return shards_.invoke_on(owner, [vshard, batch = std::move(batch)](ShardRaftPlane& plane) mutable {
+        return plane.command(vshard, data::ReplicatedCommand{std::move(batch)});
     });
 }
 
