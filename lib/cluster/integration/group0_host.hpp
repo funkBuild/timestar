@@ -1,5 +1,7 @@
 #pragma once
 
+#include "../../storage/journal_gc.hpp"
+#include "../../storage/journal_retention.hpp"
 #include "../control/control_command.hpp"
 #include "../control/group0_state_machine.hpp"
 #include "../raft/raft_group_registry.hpp"
@@ -13,6 +15,9 @@
 #include <filesystem>
 #include <memory>
 #include <seastar/core/future.hh>
+#include <seastar/core/gate.hh>
+#include <seastar/core/lowres_clock.hh>
+#include <seastar/core/timer.hh>
 #include <vector>
 
 namespace timestar::cluster {
@@ -33,6 +38,13 @@ static_assert(kControlRaftGroupId < UINT16_MAX);
 // collide with it.
 class Group0Host {
 public:
+    // Group 0 is low volume compared with a data VShard, but it is also expected
+    // to live for the lifetime of the cluster. Snapshot often enough to bound
+    // restart replay, then reclaim sealed private-journal segments below the
+    // durable snapshot boundary.
+    static constexpr uint64_t kCompactionEntryThreshold = 1024;
+    static constexpr std::chrono::seconds kMaintenanceInterval{60};
+
     Group0Host(raft::RaftTransport& transport, raft::NodeId self, std::filesystem::path journalRoot,
                const JournalIdentity& identity,
                std::chrono::milliseconds tick = std::chrono::milliseconds(20));
@@ -52,14 +64,29 @@ public:
     seastar::future<> deliver(raft::Envelope env);
     seastar::future<bool> propose(control::ControlCommand command);
     seastar::future<> compact();
+    // One production maintenance pass, exposed so focused tests and a future
+    // operator action do not need to wait for the timer. Returns true only when
+    // this pass produced a new snapshot; segment GC is attempted either way so a
+    // prior failed reclamation is retried even with no new commands.
+    seastar::future<bool> maybeCompactOnce();
+    void setCompactionEntryThreshold(uint64_t entries) { compactionEntryThreshold_ = entries; }
 
     bool started() const { return started_; }
     bool freshJournal() const { return freshJournal_; }
     raft::RaftGroup* group() { return registry_.group(kControlRaftGroupId); }
     control::Group0StateMachine* stateMachine() { return sm_.get(); }
     const control::Group0State& state() const { return sm_->state(); }
+    uint64_t maintenancePasses() const { return maintenancePasses_; }
+    uint64_t compactionsTaken() const { return compactionsTaken_; }
+    uint64_t compactionsRefusedTooLarge() const { return compactionsRefusedTooLarge_; }
+    uint64_t maintenanceFailures() const { return maintenanceFailures_; }
+    uint64_t journalSegmentsDeleted() const { return journalSegmentsDeleted_; }
 
 private:
+    seastar::future<bool> compactAppliedState();
+    seastar::future<size_t> reclaimJournalSegments();
+    seastar::future<> maintenanceSweep();
+
     raft::NodeId self_;
     std::filesystem::path journalRoot_;
     std::array<uint8_t, 16> clusterUuid_{};
@@ -72,6 +99,16 @@ private:
     std::unique_ptr<raft::JournalRaftPersistence> persistence_;
     std::unique_ptr<control::Group0StateMachine> sm_;
     raft::RaftGroupRegistry registry_;
+    JournalRetention retention_;
+    seastar::timer<seastar::lowres_clock> maintenanceTimer_;
+    seastar::gate maintenanceGate_;
+    uint64_t compactionEntryThreshold_ = kCompactionEntryThreshold;
+    uint64_t maintenancePasses_ = 0;
+    uint64_t compactionsTaken_ = 0;
+    uint64_t compactionsRefusedTooLarge_ = 0;
+    uint64_t maintenanceFailures_ = 0;
+    uint64_t journalSegmentsDeleted_ = 0;
+    bool maintenanceRunning_ = false;
     bool freshJournal_ = false;
     bool started_ = false;
     bool ticking_ = false;

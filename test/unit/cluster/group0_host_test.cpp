@@ -150,6 +150,32 @@ seastar::future<> freshObserverNeverCampaigns() {
     fs::remove_all(root);
 }
 
+seastar::future<> periodicPolicyBoundsControlReplay() {
+    const fs::path root = tempRoot("maintenance");
+    NullTransport transport;
+    Group0Host host(transport, 1, root, identity());
+    co_await host.start({1}, singleVoterOptions());
+    co_await host.group()->campaign();
+    EXPECT_TRUE(co_await host.propose(InitCluster{"cluster-maintained"}));
+    EXPECT_TRUE(co_await host.propose(SetMetaVoters{{1}}));
+    host.startTicking();
+
+    host.setCompactionEntryThreshold(1000);
+    EXPECT_FALSE(co_await host.maybeCompactOnce());
+    EXPECT_EQ(host.group()->node().log().snapshotIndex(), kNoIndex);
+
+    host.setCompactionEntryThreshold(1);
+    EXPECT_TRUE(co_await host.maybeCompactOnce());
+    EXPECT_EQ(host.group()->node().log().snapshotIndex(), host.group()->appliedIndex());
+    EXPECT_EQ(host.compactionsTaken(), 1u);
+    EXPECT_FALSE(co_await host.maybeCompactOnce());
+    EXPECT_EQ(host.compactionsTaken(), 1u);
+    EXPECT_EQ(host.maintenancePasses(), 3u);
+
+    co_await host.stop();
+    fs::remove_all(root);
+}
+
 }  // namespace
 
 TEST(Group0HostTest, UsesReservedWireIdAndRecoversDedicatedJournal) {
@@ -162,4 +188,8 @@ TEST(Group0HostTest, CorruptSnapshotFailsStartup) {
 
 TEST(Group0HostTest, FreshNonVoterIsAnInertObserver) {
     freshObserverNeverCampaigns().get();
+}
+
+TEST(Group0HostTest, PeriodicPolicyBoundsControlReplay) {
+    periodicPolicyBoundsControlReplay().get();
 }

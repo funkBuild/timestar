@@ -119,6 +119,17 @@ void Group0Host::startTicking() {
         throw std::logic_error("Group0Host::startTicking called more than once");
     registry_.startTicking();
     ticking_ = true;
+    maintenanceTimer_.set_callback([this] {
+        if (stopped_ || maintenanceRunning_ || maintenanceGate_.is_closed())
+            return;
+        maintenanceRunning_ = true;
+        // A named member owns the coroutine frame; the callback itself never
+        // suspends or outlives its captures.
+        (void)seastar::with_gate(maintenanceGate_, [this] {
+            return maintenanceSweep().finally([this] { maintenanceRunning_ = false; });
+        });
+    });
+    maintenanceTimer_.arm(seastar::lowres_clock::now() + kMaintenanceInterval, {kMaintenanceInterval});
 }
 
 seastar::future<> Group0Host::deliver(raft::Envelope env) {
@@ -134,19 +145,98 @@ seastar::future<bool> Group0Host::propose(control::ControlCommand command) {
     co_return co_await g->proposeAndAwaitApplied(control::encodeCommand(command));
 }
 
-seastar::future<> Group0Host::compact() {
+seastar::future<bool> Group0Host::compactAppliedState() {
     raft::RaftGroup* g = group();
     if (!g || !sm_)
         throw std::logic_error("Group0Host::compact before start");
     if (g->appliedIndex() == raft::kNoIndex || g->appliedIndex() <= g->node().log().snapshotIndex())
-        co_return;
-    co_await g->compact(g->appliedIndex(), sm_->snapshot());
+        co_return false;
+    std::string snapshot = sm_->snapshot();
+    // RaftNode will have discarded the only log prefix a lagging replica could
+    // use once compact() returns. Never cross that point with a payload the
+    // production transport refuses to stage or send.
+    if (snapshot.size() > raft::kMaxVShardSnapshotBytes) {
+        ++compactionsRefusedTooLarge_;
+        timestar::http_log.error(
+            "cluster: NOT compacting group 0: its snapshot is {} bytes, over the {} byte total-snapshot bound; "
+            "the control log is kept so a follower can still catch up",
+            snapshot.size(), raft::kMaxVShardSnapshotBytes);
+        co_return false;
+    }
+    co_await g->compact(g->appliedIndex(), std::move(snapshot));
+    ++compactionsTaken_;
+    co_return true;
+}
+
+seastar::future<size_t> Group0Host::reclaimJournalSegments() {
+    if (!writer_ || !persistence_)
+        throw std::logic_error("Group0Host::reclaimJournalSegments before start");
+    const uint64_t floor = persistence_->releasedSeq();
+    if (floor == 0)
+        co_return 0;
+    retention_.setReleased(kControlJournalStorageId, floor);
+    auto result = co_await JournalGc::collect(journalRoot_ / "group0", writer_->currentSegmentNumber(), *writer_,
+                                              retention_, JournalGc::Options{.copyForward = false});
+    journalSegmentsDeleted_ += result.deletedSegments.size();
+    co_return result.deletedSegments.size();
+}
+
+seastar::future<> Group0Host::compact() {
+    if (stopped_ || maintenanceGate_.is_closed())
+        throw std::logic_error("Group0Host::compact after stop");
+    auto held = maintenanceGate_.hold();
+    (void)co_await compactAppliedState();
+    (void)co_await reclaimJournalSegments();
+}
+
+seastar::future<bool> Group0Host::maybeCompactOnce() {
+    if (stopped_ || maintenanceGate_.is_closed())
+        co_return false;
+    auto held = maintenanceGate_.hold();
+    ++maintenancePasses_;
+    raft::RaftGroup* g = group();
+    if (!g)
+        throw std::logic_error("Group0Host::maybeCompactOnce before start");
+    const raft::LogIndex applied = g->appliedIndex();
+    const raft::LogIndex snapshot = g->node().log().snapshotIndex();
+    const bool due = compactionEntryThreshold_ != 0 && applied > snapshot &&
+                     applied - snapshot >= compactionEntryThreshold_;
+    const bool compacted = due ? co_await compactAppliedState() : false;
+    (void)co_await reclaimJournalSegments();
+    co_return compacted;
+}
+
+seastar::future<> Group0Host::maintenanceSweep() {
+    try {
+        // This body already runs under maintenanceGate_ from the timer callback,
+        // so perform the same pass without taking a nested hold.
+        ++maintenancePasses_;
+        raft::RaftGroup* g = group();
+        if (!g)
+            throw std::logic_error("Group0Host::maintenanceSweep before start");
+        const raft::LogIndex applied = g->appliedIndex();
+        const raft::LogIndex snapshot = g->node().log().snapshotIndex();
+        if (compactionEntryThreshold_ != 0 && applied > snapshot &&
+            applied - snapshot >= compactionEntryThreshold_)
+            (void)co_await compactAppliedState();
+        const size_t deleted = co_await reclaimJournalSegments();
+        if (deleted > 0)
+            timestar::http_log.info("cluster: group 0 reclaimed {} sealed journal segment(s) ({} total)", deleted,
+                                    journalSegmentsDeleted_);
+    } catch (const std::exception& e) {
+        ++maintenanceFailures_;
+        timestar::http_log.warn(
+            "cluster: group-0 snapshot/journal maintenance failed: {} (the log is kept; will retry)", e.what());
+    }
 }
 
 seastar::future<> Group0Host::stop() {
     if (stopped_)
         co_return;
     stopped_ = true;
+    maintenanceTimer_.cancel();
+    if (!maintenanceGate_.is_closed())
+        co_await maintenanceGate_.close();
     if (started_)
         co_await registry_.stop();
     if (writer_)

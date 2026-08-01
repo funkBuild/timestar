@@ -1279,9 +1279,14 @@ is not completion.
   passes 7 tests with 2 SMP>1-only skips; the production server target builds.
   **Still open:** there is no seed join/token RPC to add observers to the real
   group, no group-0-backed effective-membership/cutover map, no cache/live-map
-  publication caller, and no periodic group-0 compaction. Static placement and
-  the configured cluster UUID therefore remain authoritative even when the
-  control host is opted in; this task is not closed.
+  publication caller. Static placement and the configured cluster UUID therefore
+  remain authoritative even when the control host is opted in. The host now
+  snapshots after 1,024 newly applied
+  control entries on a 60-second maintenance cadence, refuses an over-128-MiB
+  snapshot before discarding its log prefix, retries maintenance failures, and
+  reclaims sealed private-journal segments below the durable snapshot boundary;
+  focused durable recovery/observer/maintenance evidence passes 4/4. This task
+  is not closed.
 - [ ] **CR-FIX-022 — wire resumable join, drain, remove, replace, and VShard
   movement.** Owner: movement/control plane. Include learner catch-up, verified
   snapshot, log catch-up, joint consensus, leadership transfer, cutover, and

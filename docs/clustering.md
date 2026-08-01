@@ -1031,6 +1031,12 @@ and fresh non-seed nodes host inert observers. The seed/token admission RPC that
 promotes those observers is still outstanding, so this opt-in is not yet a
 multi-node production bootstrap procedure.
 
+Once hosted, group 0 runs a bounded maintenance path: after 1,024 newly applied
+control entries, a 60-second sweep persists a complete control-state snapshot
+and reclaims sealed journal segments below its durable boundary. A snapshot over
+the transport's 128 MiB total bound is refused before compaction, retaining the
+log a lagging replica still needs.
+
 ### Target group-0-managed configuration
 
 Names are illustrative and should be finalised with the implementation:
