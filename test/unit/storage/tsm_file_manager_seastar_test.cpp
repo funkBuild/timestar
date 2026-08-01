@@ -590,6 +590,44 @@ TEST_F(TSMFileManagerSeastarTest, AddTSMFileUpdatesSequenceNumber) {
     testFMAddTSMFileUpdatesSequenceNumber(this).get();
 }
 
+// A snapshot received from another replica can have a low local filename seq
+// but a much higher inherited dataSeq. The next local flush must outrank the
+// installed generation; otherwise a post-snapshot write loses LWW forever.
+seastar::future<> testFMAddTSMFileUpdatesFromDataSequence(TSMFileManagerSeastarTest* self) {
+    TSMFileManager mgr(timestar::StorageLayout("."), seastar::this_shard_id());
+    co_await mgr.init();
+
+    self->createTestTSMFile("9_2_d50.tsm", "series.snapshot", {1000}, {1.0});
+    std::string absPath = fs::canonical(fs::absolute(self->tsmDir + "/9_2_d50.tsm")).string();
+    auto tsmFile = seastar::make_shared<TSM>(absPath);
+    co_await tsmFile->open();
+    EXPECT_EQ(tsmFile->seqNum, 2u);
+    EXPECT_EQ(tsmFile->dataSeq, 50u);
+
+    co_await mgr.addTSMFile(tsmFile);
+    EXPECT_GE(mgr.allocateSequenceId(), 51u);
+    co_await tsmFile->close();
+}
+
+TEST_F(TSMFileManagerSeastarTest, AddTSMFileUpdatesFromDataSequence) {
+    testFMAddTSMFileUpdatesFromDataSequence(this).get();
+}
+
+seastar::future<> testFMInitUpdatesFromDataSequence(TSMFileManagerSeastarTest* self) {
+    self->createTestTSMFile("9_2_d50.tsm", "series.snapshot", {1000}, {1.0});
+
+    TSMFileManager mgr(timestar::StorageLayout("."), seastar::this_shard_id());
+    co_await mgr.init();
+
+    EXPECT_EQ(mgr.getSequencedTsmFiles().size(), 1u);
+    EXPECT_GE(mgr.allocateSequenceId(), 51u);
+    co_await mgr.stop();
+}
+
+TEST_F(TSMFileManagerSeastarTest, InitUpdatesFromDataSequence) {
+    testFMInitUpdatesFromDataSequence(this).get();
+}
+
 // ---------------------------------------------------------------------------
 // Test: Remove all files leaves manager in empty state
 // ---------------------------------------------------------------------------

@@ -41,6 +41,10 @@ data::WriteSeries seriesOnCore0(std::string* outKey, SeriesId128* outSid, VShard
             s.type = TSMValueType::Float;
             s.timestamps = {BASE, BASE + 1000};
             s.values = std::vector<double>{7.0, 8.0};
+            // Snapshot production compacts at maxFlushedRevision - 1. Keep the
+            // payload and the test's Raft snapshot index (42) on that exact
+            // production boundary.
+            s.revisions = {43, 43};
             return s;
         }
     }
@@ -106,6 +110,26 @@ TEST(EngineSnapshotApply, ApplySnapshotInstallsDataOnFreshReplica) {
             ASSERT_EQ(result.values.size(), 2u);
             EXPECT_DOUBLE_EQ(result.values[0], 7.0);
             EXPECT_DOUBLE_EQ(result.values[1], 8.0);
+
+            // The catalog/index is part of the snapshot: normal discovery by
+            // measurement+tags+field must work on an empty data directory,
+            // without carrying a precomputed SeriesId from the donor.
+            auto discovered = (*dstEng)
+                                  .invoke_on(0u, [key](Engine& e) {
+                                      auto parsed = TimeStarInsert<double>::fromSeriesKey(key);
+                                      return e.queryBySeries(std::move(parsed.measurement), std::move(parsed.tags),
+                                                             std::move(parsed.field), 0, UINT64_MAX);
+                                  })
+                                  .get();
+            auto& discoveredFloat = std::get<QueryResult<double>>(discovered);
+            EXPECT_EQ(discoveredFloat.timestamps, (std::vector<uint64_t>{BASE, BASE + 1000}));
+
+            // The separately transported Raft snapshot metadata must describe
+            // this exact payload boundary, even when both envelopes are valid.
+            raft::Snapshot wrongBoundary;
+            wrongBoundary.index = 41;
+            wrongBoundary.data = data::encodeSnapshotPayload(payload);
+            EXPECT_THROW(sm.applySnapshot(wrongBoundary).get(), std::runtime_error);
 
             // Fail-stop: a malformed payload must throw, not silently drop state.
             raft::Snapshot bad;

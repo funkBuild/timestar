@@ -931,7 +931,9 @@ SEASTAR_TEST_F(TSMCompactorTest, VShardPartitionedBackgroundCompaction) {
     self->compactor->setVShardPartitioning(true);
     EXPECT_TRUE(self->compactor->vshardPartitioningEnabled());
 
-    // Two tier-0 files, several series spanning multiple VShards, no tombstones.
+    // Two tier-0 files and several series spanning multiple VShards. Include a
+    // tombstone in one source: the partition path must materialise the delete,
+    // not fall back to publishing another mixed file or resurrect the point.
     std::vector<seastar::shared_ptr<TSM>> sources;
     for (int i = 0; i < 2; ++i) {
         char fn[256];
@@ -954,6 +956,10 @@ SEASTAR_TEST_F(TSMCompactorTest, VShardPartitionedBackgroundCompaction) {
         sources.push_back(tsm);
     }
 
+    const SeriesId128 deletedSeries = SeriesId128::fromSeriesKey("part,host=a v");
+    EXPECT_TRUE(co_await sources.front()->deleteRange(deletedSeries, 1000, 1000));
+    EXPECT_TRUE(sources.front()->hasTombstones());
+
     CompactionPlan plan;
     plan.sourceFiles = sources;
     plan.targetTier = 1;
@@ -965,6 +971,7 @@ SEASTAR_TEST_F(TSMCompactorTest, VShardPartitionedBackgroundCompaction) {
     // After compaction: the tier-0 sources are gone; every surviving file is
     // VShard-pure (all its series map to a single VShard).
     size_t files = 0;
+    bool checkedDeletedSeries = false;
     for (const auto& [rank, f] : self->fileManager->getSequencedTsmFiles()) {
         if (!f)
             continue;
@@ -972,10 +979,20 @@ SEASTAR_TEST_F(TSMCompactorTest, VShardPartitionedBackgroundCompaction) {
         auto ids = f->getSeriesIds();
         if (ids.empty())
             continue;
+        EXPECT_FALSE(f->hasTombstones()) << "partition output must materialise source tombstones";
         const uint16_t vs = timestar::virtualShard(ids.front());
         for (const auto& sid : ids)
             EXPECT_EQ(timestar::virtualShard(sid), vs) << "background compaction output is not VShard-pure";
+
+        if (f->getSeriesType(deletedSeries) == TSMValueType::Float) {
+            checkedDeletedSeries = true;
+            auto result = co_await f->queryWithTombstones<double>(deletedSeries, 0, UINT64_MAX);
+            auto [timestamps, values] = result.getAllData();
+            EXPECT_EQ(timestamps, (std::vector<uint64_t>{1100}))
+                << "partitioned compaction resurrected a tombstoned point";
+        }
     }
     EXPECT_GT(files, 0u);
+    EXPECT_TRUE(checkedDeletedSeries) << "partitioned compaction dropped the surviving series generation";
     co_return;
 }

@@ -588,6 +588,20 @@ int main(int argc, char** argv) {
                     })
                     .get();
 
+                // Partitioned clusters must converge shared tier-0 inputs to
+                // VShard-pure immutable files. Set the mode before the first
+                // background compaction can be scheduled; changing it after
+                // the loop starts leaves an order-dependent window where the
+                // server can emit another mixed higher-tier generation.
+                const bool partitionCompaction = timestar::config().cluster.enabled &&
+                                                 timestar::config().cluster.partitioned;
+                g_engine
+                    .invoke_on_all([partitionCompaction](Engine& engine) {
+                        engine.setVShardPartitionedCompaction(partitionCompaction);
+                        return seastar::make_ready_future<>();
+                    })
+                    .get();
+
                 // Compaction placement depends on the groups above, so the loop
                 // starts only once they have been distributed to every shard.
                 g_engine.invoke_on_all([](Engine& engine) { return engine.startBackgroundCompaction(); }).get();

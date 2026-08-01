@@ -532,6 +532,9 @@ public:
     // Get tombstone manager (for compaction)
     timestar::TSMTombstone* getTombstones() { return tombstones.get(); }
     bool hasTombstones() const { return tombstones && tombstones->getEntryCount() > 0; }
+    uint64_t tombstoneGeneration() const noexcept {
+        return tombstones ? tombstones->mutationGeneration() : 0;
+    }
 
     // Pushdown aggregation: decode blocks and fold directly into BlockAggregator
     // instead of materialising TSMResult. Returns the number of points aggregated.

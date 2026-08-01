@@ -49,8 +49,8 @@ public:
     // Build a self-contained InstallSnapshot payload for one VShard (M3). Precondition:
     // vshardsCohesiveOnCores(smp::count) -- a VShard's data must live entirely on
     // assignCore(vshard); this throws otherwise rather than ship a partial snapshot.
-    // Dispatches to that core. catalogHash is a data-only sentinel (catalog reconciles
-    // via schema broadcast, not the snapshot).
+    // Dispatches to that core and includes the exact catalog/index reconstruction
+    // records bound by manifest.catalogHash.
     seastar::future<data::SnapshotPayload> buildVShardSnapshot(VShardId vshard);
 
     // Are there rolled-over memory stores holding THIS VSHARD's data that have NOT yet

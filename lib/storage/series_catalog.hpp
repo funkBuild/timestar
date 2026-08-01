@@ -75,9 +75,15 @@ public:
     // Deterministic snapshot: [u32 count][records sorted by SeriesId128 bytes].
     // Sorting makes the snapshot byte-identical for equal catalogs (anti-entropy).
     [[nodiscard]] std::string snapshot() const;
+    // Stable 128-bit content hash for the exact serialized catalog bytes.
+    [[nodiscard]] static std::string snapshotHash(std::span<const char> data);
     // Install a snapshot into a fresh catalog. Returns nullopt on any decode
     // failure, a count mismatch, or a conflicting duplicate id.
     [[nodiscard]] static std::optional<SeriesCatalog> loadSnapshot(std::span<const char> data);
+
+    // Deterministic records ordered by SeriesId bytes. Used by snapshot install
+    // after the whole catalog has been decoded and validated.
+    [[nodiscard]] std::vector<CatalogRecord> records() const;
 
 private:
     std::unordered_map<SeriesId128, CatalogEntry, SeriesId128::Hash> entries_;

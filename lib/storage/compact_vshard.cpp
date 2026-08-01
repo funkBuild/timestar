@@ -37,8 +37,10 @@ seastar::future<bool> compactSeries(TSMValueType type, const SeriesId128& series
                 range.merge(RevisionRange{block.blockMinRev, block.blockMaxRev, /*empty=*/false});
         }
         // Merge the points (last write wins; see snapshot read / migration).
-        TSMResult<T> result(0);
-        co_await file->readSeries<T>(seriesId, 0, UINT64_MAX, result);
+        // Snapshot/partition materialisation must resolve tombstone sidecars
+        // into the output. readSeries() returns raw points and silently
+        // resurrects deletes when the sidecar is not shipped.
+        TSMResult<T> result = co_await file->queryWithTombstones<T>(seriesId, 0, UINT64_MAX);
         auto [timestamps, values] = result.getAllData();
         for (size_t i = 0; i < timestamps.size(); ++i)
             resolved[timestamps[i]] = std::move(values[i]);

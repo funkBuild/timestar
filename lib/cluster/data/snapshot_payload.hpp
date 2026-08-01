@@ -18,14 +18,20 @@ struct SnapshotFile {
 };
 
 // The monolithic Raft InstallSnapshot payload for a VShard (integration plan M3): the
-// VShardSnapshotManifest plus every data file it references, self-contained so a
+// VShardSnapshotManifest, deterministic series catalog, and every data file it
+// references, self-contained so a
 // lagging replica (or a joining node) can install the whole VShard state without the
 // leader's live files. This is the "manifest + object stream" M3 wires as ONE payload;
 // on-the-wire chunking is M5. EngineDataStateMachine::snapshot() builds it (from
-// Engine::createVShardSnapshot + the referenced files) and applySnapshot() installs it
-// (write files to temp -> Engine::restoreVShardSnapshot, verify-then-install).
+// Engine::buildVShardSnapshotFiles) and applySnapshot() installs it (write files
+// to temp -> Engine::restoreVShardSnapshot -> rebuild NativeIndex).
 struct SnapshotPayload {
     VShardSnapshotManifest manifest;
+    // Deterministic SeriesCatalog::snapshot() bytes. Non-empty payloads use
+    // snapshot format v2 and manifest.catalogHash authenticates these bytes.
+    // Empty means a decoded legacy v1 payload; production install rejects it
+    // because it cannot restore discovery metadata.
+    std::string catalog;
     std::vector<SnapshotFile> files;  // one per manifest.dataExtents entry, same order
 };
 
@@ -48,8 +54,8 @@ std::optional<SnapshotPayload> decodeSnapshotPayload(const std::string& bytes);
 // This overload reserves the exact size up front (no growth spikes) and RELEASES each
 // file's bytes as it appends them, so peak residency is the output plus one file rather
 // than the output plus the whole input. `payload` is left valid but unspecified -- its
-// file bodies are gone. The const& overload stays for the callers that keep their payload
-// (tests, and anything that encodes to compare).
+// catalog and file bodies are gone. The const& overload stays for the callers that keep
+// their payload (tests, and anything that encodes to compare).
 std::string encodeSnapshotPayload(SnapshotPayload&& payload);
 
 }  // namespace timestar::data

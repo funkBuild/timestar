@@ -1,10 +1,16 @@
 #include "snapshot_payload.hpp"
 
+#include "../../storage/series_catalog.hpp"
+
 #include <cstring>
+#include <stdexcept>
 
 namespace timestar::data {
 
 namespace {
+
+constexpr uint32_t kPayloadMagic = 0x32505354;  // "TSP2" little-endian
+constexpr uint32_t kPayloadVersion = 2;
 
 uint64_t fnv1a(const char* p, size_t n) {
     uint64_t h = 1469598103934665603ull;
@@ -71,7 +77,18 @@ struct Reader {
 
 std::string encodeSnapshotPayload(const SnapshotPayload& payload) {
     std::string out;
+    if (!payload.catalog.empty()) {
+        if (!payload.manifest.valid() ||
+            timestar::SeriesCatalog::snapshotHash(payload.catalog) != payload.manifest.catalogHash ||
+            !timestar::SeriesCatalog::loadSnapshot(
+                std::span<const char>(payload.catalog.data(), payload.catalog.size())))
+            throw std::invalid_argument("encodeSnapshotPayload: catalog/hash mismatch");
+        putU32(out, kPayloadMagic);
+        putU32(out, kPayloadVersion);
+    }
     putBlob(out, payload.manifest.encode());
+    if (!payload.catalog.empty())
+        putBlob(out, payload.catalog);
     putU32(out, static_cast<uint32_t>(payload.files.size()));
     for (const auto& f : payload.files) {
         putBlob(out, f.name);
@@ -85,13 +102,27 @@ std::string encodeSnapshotPayload(SnapshotPayload&& payload) {
     const std::string manifest = payload.manifest.encode();
     // Exactly what the const& overload will have written, computed before writing a byte:
     // manifest blob + file count + per file (name blob + bytes blob) + the FNV trailer.
-    size_t total = 8 + manifest.size() + 4 + 8;
+    const bool v2 = !payload.catalog.empty();
+    if (v2 && (!payload.manifest.valid() ||
+               timestar::SeriesCatalog::snapshotHash(payload.catalog) != payload.manifest.catalogHash ||
+               !timestar::SeriesCatalog::loadSnapshot(
+                   std::span<const char>(payload.catalog.data(), payload.catalog.size()))))
+        throw std::invalid_argument("encodeSnapshotPayload: catalog/hash mismatch");
+    size_t total = (v2 ? 8 + 8 + payload.catalog.size() : 0) + 8 + manifest.size() + 4 + 8;
     for (const auto& f : payload.files)
         total += 8 + f.name.size() + 8 + f.bytes.size();
 
     std::string out;
     out.reserve(total);
+    if (v2) {
+        putU32(out, kPayloadMagic);
+        putU32(out, kPayloadVersion);
+    }
     putBlob(out, manifest);
+    if (v2) {
+        putBlob(out, payload.catalog);
+        std::string().swap(payload.catalog);
+    }
     putU32(out, static_cast<uint32_t>(payload.files.size()));
     for (auto& f : payload.files) {
         putBlob(out, f.name);
@@ -117,6 +148,16 @@ std::optional<SnapshotPayload> decodeSnapshotPayload(const std::string& bytes) {
 
     Reader r{bytes.data(), bytes.data() + bodyLen};
     SnapshotPayload out;
+    bool v2 = false;
+    if (bodyLen >= 8) {
+        Reader probe = r;
+        if (probe.u32() == kPayloadMagic) {
+            if (probe.u32() != kPayloadVersion || !probe.ok)
+                return std::nullopt;
+            r = probe;
+            v2 = true;
+        }
+    }
     std::string manifestBlob = r.blob();
     if (!r.ok)
         return std::nullopt;
@@ -124,6 +165,15 @@ std::optional<SnapshotPayload> decodeSnapshotPayload(const std::string& bytes) {
     if (!m)
         return std::nullopt;  // corrupt or structurally-invalid manifest
     out.manifest = std::move(*m);
+
+    if (v2) {
+        out.catalog = r.blob();
+        if (!r.ok || out.catalog.empty() ||
+            timestar::SeriesCatalog::snapshotHash(out.catalog) != out.manifest.catalogHash ||
+            !timestar::SeriesCatalog::loadSnapshot(
+                std::span<const char>(out.catalog.data(), out.catalog.size())))
+            return std::nullopt;
+    }
 
     uint32_t nfiles = r.u32();
     // Each file is >= two 8-byte length prefixes; reject an inflated count.

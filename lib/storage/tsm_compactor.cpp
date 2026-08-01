@@ -1366,12 +1366,15 @@ seastar::future<CompactionStats> TSMCompactor::executeCompaction(CompactionPlan 
     // Cluster VShard-partitioned compaction: merge + partition the inputs into one
     // VShard-pure file per VShard (revision ranges preserved), instead of one mixed
     // output. Only taken when there is nothing that needs the full merge path --
-    // no pending retention and no source tombstones (both are applied there, and
-    // partitionByVShard reads the raw resolved view, which would resurrect
-    // tombstoned points). Otherwise fall through to the normal merge.
-    const bool anyTombstones = std::any_of(plan.sourceFiles.begin(), plan.sourceFiles.end(),
-                                           [](const auto& f) { return f && f->hasTombstones(); });
-    if (vshardPartition_ && localRetention.empty() && !anyTombstones && !plan.sourceFiles.empty()) {
+    // no pending retention. partitionByVShard reads through tombstone sidecars,
+    // materialising their effect into clean VShard-pure outputs. Record exact
+    // mutation generations so a delete racing the read makes us discard the
+    // outputs and retry instead of resurrecting its range.
+    if (vshardPartition_ && localRetention.empty() && !plan.sourceFiles.empty()) {
+        std::vector<uint64_t> tombstoneGenerations;
+        tombstoneGenerations.reserve(plan.sourceFiles.size());
+        for (const auto& file : plan.sourceFiles)
+            tombstoneGenerations.push_back(file ? file->tombstoneGeneration() : 0);
         const uint64_t maxDataSeq = maxDataSeqOf(plan.sourceFiles);
         // Write outputs to .tmp names first, so publishing is a crash-safe rename.
         auto pathFor = [this, tier = plan.targetTier, maxDataSeq](timestar::VShardId) {
@@ -1379,13 +1382,18 @@ seastar::future<CompactionStats> TSMCompactor::executeCompaction(CompactionPlan 
         };
         auto parts = co_await timestar::partitionByVShard(plan.sourceFiles, pathFor);
 
-        // A delete acked WHILE partitionByVShard read the raw data would be
-        // resurrected (the partition path ignores tombstones). Re-check: if any
-        // source gained a tombstone during the read, discard the outputs and keep
-        // the sources -- the next cycle sees the tombstone and takes the merge
-        // path. Also keep the sources if nothing was produced (no data loss).
-        const bool raced = std::any_of(plan.sourceFiles.begin(), plan.sourceFiles.end(),
-                                       [](const auto& f) { return f && f->hasTombstones(); });
+        // A delete can append a sidecar while partitionByVShard is suspended in
+        // its data read. Re-check every generation and discard the outputs on
+        // any mutation; the next cycle rematerialises the later logical view.
+        // Also keep the sources if nothing was produced (no data loss).
+        bool raced = false;
+        for (size_t i = 0; i < plan.sourceFiles.size(); ++i) {
+            const auto& file = plan.sourceFiles[i];
+            if (file && file->tombstoneGeneration() != tombstoneGenerations[i]) {
+                raced = true;
+                break;
+            }
+        }
         if (parts.empty() || raced) {
             for (const auto& [vs, tmp] : parts)
                 co_await seastar::remove_file(tmp);

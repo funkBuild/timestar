@@ -72,6 +72,13 @@ TEST(SeriesCatalogTest, DecodeRejectsNonCanonicalDuplicateAndBadType) {
     dup.encodeInto(encDup);
     EXPECT_FALSE(decodeEntry(encDup).has_value());
 
+    // Same key with different values is still a duplicate tag key. Pair-wise
+    // sorting alone used to accept this malformed identity.
+    auto dupKey = entry("m", {{"a", "1"}, {"a", "2"}}, "f", TSMValueType::Float);
+    std::string encDupKey;
+    dupKey.encodeInto(encDupKey);
+    EXPECT_FALSE(decodeEntry(encDupKey).has_value());
+
     // Out-of-range value type: encode a valid entry then corrupt the last byte.
     auto ok = entry("m", {{"a", "1"}}, "f", TSMValueType::Float);
     std::string encBad;
@@ -140,10 +147,13 @@ TEST(SeriesCatalogTest, SnapshotRoundTripsAndIsInsertionOrderIndependent) {
     const std::string snapA = a.snapshot();
     // Deterministic: equal catalogs snapshot byte-identically regardless of order.
     EXPECT_EQ(snapA, b.snapshot());
+    EXPECT_EQ(SeriesCatalog::snapshotHash(snapA), SeriesCatalog::snapshotHash(b.snapshot()));
+    EXPECT_EQ(SeriesCatalog::snapshotHash(snapA).size(), 32u);
 
     const auto loaded = SeriesCatalog::loadSnapshot(std::span<const char>(snapA.data(), snapA.size()));
     ASSERT_TRUE(loaded.has_value());
     EXPECT_EQ(loaded->size(), 3u);
+    EXPECT_EQ(loaded->records().size(), 3u);
     ASSERT_NE(loaded->find(mkId(2)), nullptr);
     EXPECT_EQ(loaded->find(mkId(2))->valueType, TSMValueType::Boolean);
     EXPECT_EQ(loaded->snapshot(), snapA);  // re-snapshot is stable
@@ -163,6 +173,15 @@ TEST(SeriesCatalogTest, LoadSnapshotRejectsCorruption) {
     std::string badCount = snap;
     badCount[0] = static_cast<char>(9);  // claim 9 records
     EXPECT_FALSE(SeriesCatalog::loadSnapshot(std::span<const char>(badCount.data(), badCount.size())).has_value());
+
+    // Snapshots are canonical map encodings: an identical repeated ID is not
+    // accepted merely because replaying that record would be idempotent.
+    CatalogRecord repeated{mkId(1), entry("m", {{"a", "1"}}, "f", TSMValueType::Float)};
+    std::string duplicate;
+    timestar::codec::putU32(duplicate, 2);
+    repeated.encodeInto(duplicate);
+    repeated.encodeInto(duplicate);
+    EXPECT_FALSE(SeriesCatalog::loadSnapshot(std::span<const char>(duplicate.data(), duplicate.size())).has_value());
 }
 
 }  // namespace

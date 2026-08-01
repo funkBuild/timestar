@@ -31,6 +31,12 @@
 #include <seastar/core/timer.hh>
 #include <vector>
 
+struct EngineVShardSnapshot {
+    timestar::VShardSnapshotManifest manifest;
+    std::vector<std::pair<std::string, std::string>> files;
+    std::string catalog;
+};
+
 class Engine {
 private:
     // Injected, immutable path authority for this shard's storage. Declared
@@ -171,6 +177,17 @@ private:
     // Callers must already hold _insertGate.
     seastar::future<bool> deleteRangeImpl(std::string seriesKey, uint64_t startTime, uint64_t endTime);
 
+    // Coroutine implementation owns the manifest through a small shared handle.
+    // Keeping the large manifest itself out of the coroutine parameter list also
+    // avoids a GCC 14 lowering ICE while retaining correct async lifetime.
+    seastar::future<bool> installVShardSnapshotFilesOwned(
+        std::shared_ptr<const timestar::VShardSnapshotManifest> manifest,
+        std::vector<std::pair<std::string, std::string>> files);
+    enum class SnapshotInstallDisposition { Fresh, Idempotent, Reject };
+    seastar::future<SnapshotInstallDisposition> classifySnapshotInstall(
+        const timestar::VShardSnapshotManifest& manifest,
+        const std::vector<std::pair<std::string, std::string>>& files);
+
 public:
     // Set the back-reference to the sharded<Engine> container.
     // Must be called on every shard after engine.start() and before any inserts.
@@ -194,23 +211,24 @@ public:
                                                 std::vector<std::string> sourcePaths,
                                                 std::vector<std::string> targetNames);
 
-    // Build the data files backing a VShard snapshot for shipping over the wire
-    // (integration plan M3 InstallSnapshot): the manifest plus, for every TSM file
-    // its extents reference, a (installName, rawBytes) pair. The cluster layer wraps
-    // these into the self-contained SnapshotPayload. Precondition (as
-    // createVShardSnapshot): the memory store is flushed. Single-core: this reads
-    // only THIS shard's files, so the caller MUST run it on the VShard's assignCore
-    // and only when vshardsCohesiveOnCores() holds (else the VShard's series scatter
-    // across cores and the file set is incomplete).
-    seastar::future<std::pair<timestar::VShardSnapshotManifest, std::vector<std::pair<std::string, std::string>>>>
-    buildVShardSnapshotFiles(timestar::VShardId vshard, std::string catalogHash);
+    // Build a self-contained VShard snapshot for shipping: a resolved,
+    // VShard-pure TSM object plus the exact series catalog used to reconstruct
+    // NativeIndex discovery state. The catalog's content hash is embedded in
+    // the manifest. Precondition: memory for this VShard has been flushed and
+    // the caller runs on assignCore(vshard) under a cohesive core count.
+    seastar::future<EngineVShardSnapshot> buildVShardSnapshotFiles(timestar::VShardId vshard);
 
     // Install a received VShard snapshot (the consumer side of the above): write each
     // (name, bytes) to a temp file in this shard's tsm dir, then verify-then-install
     // all-or-nothing via restoreVShardSnapshot. The temp files are always cleaned up.
     // Returns true iff installed (verification passed).
-    seastar::future<bool> installVShardSnapshotFiles(const timestar::VShardSnapshotManifest& manifest,
+    seastar::future<bool> installVShardSnapshotFiles(timestar::VShardSnapshotManifest manifest,
                                                      std::vector<std::pair<std::string, std::string>> files);
+
+    // Reconstruct the durable NativeIndex records and exact day memberships
+    // from a verified catalog after the snapshot TSM has been installed.
+    seastar::future<bool> installVShardSnapshotCatalog(timestar::VShardId vshard, std::string catalog,
+                                                       std::string expectedHash);
 
     // Migrate a VShard's data from legacy `sourcePaths` into a VShard-pure file
     // `outputName` in this shard's tsm dir at the migrated floor (Task 6). Returns
@@ -241,6 +259,12 @@ public:
     // Start the background tier-compaction loop. Called after
     // setIOSchedulingGroups() so merges land in ts_compact rather than main.
     seastar::future<> startBackgroundCompaction();
+    // Cluster startup enables this before startBackgroundCompaction(). Tier
+    // merges then publish VShard-pure outputs instead of perpetuating mixed
+    // files. The flag is deliberately explicit so single-node storage remains
+    // byte-for-byte on its established compaction path.
+    void setVShardPartitionedCompaction(bool on);
+    [[nodiscard]] bool vshardPartitionedCompactionEnabled() const;
     seastar::future<> startBackgroundTasks();
     template <class T>
     seastar::future<> insert(TimeStarInsert<T> insertRequest, bool skipMetadataIndexing = false);

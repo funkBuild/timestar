@@ -387,6 +387,7 @@ seastar::future<> TSMTombstone::remove() {
     entries.clear();
     seriesRanges.clear();
     isDirty = false;
+    ++mutationGeneration_;
 }
 
 seastar::future<bool> TSMTombstone::addTombstone(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime,
@@ -441,6 +442,7 @@ seastar::future<bool> TSMTombstone::addTombstone(const SeriesId128& seriesId, ui
     }
 
     isDirty = true;
+    ++mutationGeneration_;
     co_return true;
 }
 
@@ -546,6 +548,7 @@ void TSMTombstone::compact(uint64_t minTime, uint64_t maxTime) {
     entries = std::move(retained);
     isDirty = true;
     rebuildIndex();
+    ++mutationGeneration_;
 }
 
 uint64_t TSMTombstone::getFileSize() const {

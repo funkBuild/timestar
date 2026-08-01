@@ -9,6 +9,7 @@
 #include "placement_table.hpp"
 #include "query_runner.hpp"
 #include "restore_vshard.hpp"
+#include "series_catalog.hpp"
 #include "series_key.hpp"
 #include "tsm_compactor.hpp"
 #include "tsm_writer.hpp"
@@ -93,11 +94,33 @@ seastar::future<> Engine::startBackgroundCompaction() {
     co_await tsmFileManager.startCompactionLoop();
 }
 
+void Engine::setVShardPartitionedCompaction(bool on) {
+    auto* compactor = tsmFileManager.getCompactor();
+    if (compactor == nullptr)
+        throw std::logic_error("setVShardPartitionedCompaction requires Engine::init");
+    compactor->setVShardPartitioning(on);
+}
+
+bool Engine::vshardPartitionedCompactionEnabled() const {
+    const auto* compactor = tsmFileManager.getCompactor();
+    return compactor != nullptr && compactor->vshardPartitioningEnabled();
+}
+
 seastar::future<> Engine::createDirectoryStructure() {
     std::string shardPath = layout_.tsmDir(shardId).string();
     // Wrap blocking std::filesystem call in seastar::async to avoid
     // blocking the Seastar reactor thread.
-    co_await seastar::async([&shardPath]() { fs::create_directories(shardPath); });
+    co_await seastar::async([&shardPath]() {
+        fs::create_directories(shardPath);
+        // Snapshot staging directories are never live state. A crash can leave
+        // complete-looking .tsm files inside them, so remove them before the
+        // file manager scans the live directory. Per-operation subdirectories
+        // make concurrent installs independent during normal operation.
+        std::error_code ec;
+        fs::remove_all(fs::path(shardPath) / "snapin_tmp", ec);
+        ec.clear();
+        fs::remove_all(fs::path(shardPath) / "snapout_tmp", ec);
+    });
 }
 
 std::string Engine::basePath() {
@@ -223,6 +246,21 @@ seastar::future<seastar::shared_ptr<::TSM>> openTsmForVShardOp(std::string path)
     co_await tsm->readSparseIndex();
     co_return tsm;
 }
+
+template <typename T>
+seastar::future<std::vector<uint64_t>> snapshotSeriesTimestamps(
+    const SeriesId128& id, const std::vector<seastar::shared_ptr<::TSM>>& files) {
+    std::vector<uint64_t> timestamps;
+    for (const auto& file : files) {
+        if (!file || file->getSeriesType(id) != timestar::valueTypeOf<T>())
+            continue;
+        TSMResult<T> result(file->dataRank());
+        co_await file->readSeries<T>(id, 0, UINT64_MAX, result);
+        auto [part, values] = result.getAllData();
+        timestamps.insert(timestamps.end(), part.begin(), part.end());
+    }
+    co_return timestamps;
+}
 }  // namespace
 
 seastar::future<bool> Engine::restoreVShardSnapshot(const timestar::VShardSnapshotManifest& manifest,
@@ -230,87 +268,335 @@ seastar::future<bool> Engine::restoreVShardSnapshot(const timestar::VShardSnapsh
                                                     std::vector<std::string> targetNames) {
     if (sourcePaths.size() != targetNames.size())
         throw std::invalid_argument("Engine::restoreVShardSnapshot: sourcePaths/targetNames size mismatch");
+    if (!manifest.valid() || sourcePaths.size() != manifest.dataExtents.size())
+        co_return false;
 
     std::vector<seastar::shared_ptr<::TSM>> files;
-    for (auto& p : sourcePaths)
-        files.push_back(co_await openTsmForVShardOp(std::move(p)));
+    bool ok = false;
+    std::exception_ptr error;
+    try {
+        for (auto& p : sourcePaths)
+            files.push_back(co_await openTsmForVShardOp(std::move(p)));
 
-    std::vector<std::string> targets;
-    targets.reserve(targetNames.size());
-    for (const auto& name : targetNames)
-        targets.push_back((layout_.tsmDir(shardId) / name).string());
+        // Bind every shipped object to the manifest, not just to the
+        // resolved-value hash. The old verifier ignored unrelated series, so a
+        // mixed tier-0 file (or a malicious extra file) could install another
+        // VShard's data while still reproducing the target VShard's hash.
+        // Snapshot objects are now required to be VShard-pure and their
+        // revision extent must exactly match the descriptor.
+        timestar::VShardExtentMap actualExtents;
+        bool structurallyMatches = true;
+        for (size_t i = 0; i < files.size(); ++i) {
+            const auto& file = files[i];
+            if (!file || file->hasTombstones()) {
+                structurallyMatches = false;
+                break;
+            }
+            for (const auto& sid : file->getSeriesIds()) {
+                if (timestar::virtualShard(sid) != manifest.vshard.value()) {
+                    structurallyMatches = false;
+                    break;
+                }
+            }
+            if (!structurallyMatches)
+                break;
+            co_await timestar::addTsmFileExtents(actualExtents, manifest.dataExtents[i].fileId, *file);
+        }
+        if (structurallyMatches)
+            structurallyMatches = actualExtents.extents(manifest.vshard) == manifest.dataExtents;
 
-    const bool ok = co_await timestar::restoreVShardSnapshot(manifest, files, std::move(targets));
-    for (const auto& f : files)
-        co_await f->close();
+        if (structurallyMatches) {
+            std::vector<std::string> targets;
+            targets.reserve(targetNames.size());
+            for (const auto& name : targetNames)
+                // StorageLayout validates that this is exactly one .tsm
+                // basename; direct restore callers therefore cannot escape the
+                // shard directory.
+                targets.push_back(layout_.tsmFile(shardId, name).string());
+
+            ok = co_await timestar::restoreVShardSnapshot(manifest, files, std::move(targets));
+        }
+    } catch (...) {
+        error = std::current_exception();
+    }
+    for (const auto& file : files) {
+        if (!file)
+            continue;
+        try {
+            co_await file->close();
+        } catch (...) {
+            if (!error)
+                error = std::current_exception();
+        }
+    }
+    if (error)
+        std::rethrow_exception(error);
     co_return ok;
 }
 
-seastar::future<std::pair<timestar::VShardSnapshotManifest, std::vector<std::pair<std::string, std::string>>>>
-Engine::buildVShardSnapshotFiles(timestar::VShardId vshard, std::string catalogHash) {
-    // The manifest already carries the resolved-view verification hash and the extents
-    // (one fileId per contributing file for this VShard). We then read each referenced
-    // file's raw bytes so the snapshot is self-contained on the wire.
-    auto manifest = co_await createVShardSnapshot(vshard, std::move(catalogHash));
+seastar::future<EngineVShardSnapshot> Engine::buildVShardSnapshotFiles(timestar::VShardId vshard) {
+    if (!vshard.valid())
+        throw std::invalid_argument("buildVShardSnapshotFiles: invalid VShard");
 
-    const auto& sequenced = tsmFileManager.getSequencedTsmFiles();
-    std::vector<std::pair<std::string, std::string>> files;
-    std::set<uint64_t> seen;  // extents are one-per-file for a VShard, but dedupe defensively
-    for (const auto& ext : manifest.dataExtents) {
-        if (!seen.insert(ext.fileId).second)
+    // Pin one immutable source generation. Shipping the raw source files is not
+    // correct: tier-0 files are intentionally multiplexed across VShards and
+    // tombstones live in sidecars that the old payload omitted. Materialise the
+    // resolved view into ONE snapshot-only, VShard-pure TSM instead. This both
+    // applies existing tombstones and prevents unrelated VShards crossing the
+    // wire or being installed by a valid target hash.
+    struct Source {
+        seastar::shared_ptr<::TSM> file;
+        uint64_t tombstoneGeneration;
+    };
+    std::vector<Source> pinned;
+    std::vector<seastar::shared_ptr<::TSM>> inputs;
+    uint64_t maxDataSeq = 0;
+    for (const auto& [rank, file] : tsmFileManager.getSequencedTsmFiles()) {
+        if (!file)
             continue;
-        auto it = sequenced.find(ext.fileId);
-        if (it == sequenced.end() || !it->second)
-            // The manifest was just built from this same file set; a missing fileId
-            // means a file vanished mid-snapshot. Fail rather than ship a partial.
-            throw std::runtime_error("buildVShardSnapshotFiles: manifest references missing fileId " +
-                                     std::to_string(ext.fileId));
-        const std::string path = it->second->getFilePath();
-        std::string name = std::filesystem::path(path).filename().string();
-        seastar::sstring bytes = co_await seastar::util::read_entire_file_contiguous(path);
-        files.emplace_back(std::move(name), std::string(bytes.data(), bytes.size()));
+        pinned.push_back(Source{file, file->tombstoneGeneration()});
+        inputs.push_back(file);
+        maxDataSeq = std::max(maxDataSeq, file->dataSeq);
     }
-    co_return std::make_pair(std::move(manifest), std::move(files));
+
+    if (inputs.empty()) {
+        timestar::SeriesCatalog catalog;
+        std::string catalogBytes = catalog.snapshot();
+        const std::string catalogHash = timestar::SeriesCatalog::snapshotHash(catalogBytes);
+        timestar::VShardSnapshotBuilder empty(vshard);
+        co_return EngineVShardSnapshot{empty.build({}, catalogHash), {}, std::move(catalogBytes)};
+    }
+
+    const uint64_t sequence = tsmFileManager.allocateSequenceId();
+    const auto stageDir = layout_.tsmDir(shardId) / "snapout_tmp";
+    const std::string name = "9_" + std::to_string(sequence) + "_d" + std::to_string(maxDataSeq) + ".tsm";
+    const std::string path = (stageDir / name).string();
+    co_await seastar::async([stageDir] { std::filesystem::create_directories(stageDir); });
+
+    seastar::shared_ptr<::TSM> materialized;
+    std::exception_ptr error;
+    timestar::VShardSnapshotManifest manifest;
+    std::string bytes;
+    std::string catalogBytes;
+    try {
+        const size_t seriesWritten = co_await timestar::compactVShardToFile(vshard, inputs, path);
+        if (seriesWritten == 0) {
+            timestar::SeriesCatalog catalog;
+            catalogBytes = catalog.snapshot();
+            timestar::VShardSnapshotBuilder empty(vshard);
+            manifest = empty.build({}, timestar::SeriesCatalog::snapshotHash(catalogBytes));
+        } else {
+            materialized = co_await openTsmForVShardOp(path);
+
+            // Export exactly the series present in the resolved snapshot object,
+            // not every index entry currently on the core. A concurrent newer
+            // unflushed series belongs to the retained Raft suffix and must not
+            // appear early in this snapshot's discovery state.
+            const auto ids = materialized->getSeriesIds();
+            auto metadata = co_await index.getSeriesMetadataBatch(ids);
+            if (metadata.size() != ids.size())
+                throw std::runtime_error("buildVShardSnapshotFiles: incomplete NativeIndex metadata batch");
+            timestar::SeriesCatalog catalog;
+            for (const auto& [id, maybeMetadata] : metadata) {
+                if (!maybeMetadata)
+                    throw std::runtime_error("buildVShardSnapshotFiles: data series " + id.toHex() +
+                                             " has no NativeIndex metadata");
+                const auto type = materialized->getSeriesType(id);
+                if (!type)
+                    throw std::runtime_error("buildVShardSnapshotFiles: data series " + id.toHex() +
+                                             " has no value type");
+                timestar::CatalogEntry entry;
+                entry.measurement = maybeMetadata->measurement;
+                entry.tags.assign(maybeMetadata->tags.begin(), maybeMetadata->tags.end());
+                entry.field = maybeMetadata->field;
+                entry.valueType = *type;
+                const auto canonicalId = SeriesId128::fromSeriesKey(
+                    timestar::buildSeriesKey(entry.measurement, maybeMetadata->tags, entry.field));
+                if (canonicalId != id || !catalog.apply(timestar::CatalogRecord{id, std::move(entry)}))
+                    throw std::runtime_error("buildVShardSnapshotFiles: conflicting/non-canonical catalog identity " +
+                                             id.toHex());
+            }
+            if (catalog.size() != ids.size())
+                throw std::runtime_error("buildVShardSnapshotFiles: duplicate/incomplete catalog identity set");
+            catalogBytes = catalog.snapshot();
+            timestar::VShardExtentMap extents;
+            co_await timestar::addTsmFileExtents(extents, materialized->rankAsInteger(), *materialized);
+            timestar::VShardSnapshotBuilder builder(vshard);
+            co_await timestar::feedVShardResolvedView(vshard, {materialized}, builder);
+            manifest = builder.build(extents, timestar::SeriesCatalog::snapshotHash(catalogBytes));
+        }
+
+        // A delete can append to a source sidecar while the materialiser is
+        // suspended in DMA. Refuse that raced view. The Raft snapshot sweep will
+        // retry; retaining more log is safe, truncating the delete is not.
+        for (const auto& source : pinned) {
+            if (source.file->tombstoneGeneration() != source.tombstoneGeneration)
+                throw std::runtime_error("buildVShardSnapshotFiles: tombstone changed during materialisation");
+        }
+
+        if (seriesWritten != 0) {
+            seastar::sstring raw = co_await seastar::util::read_entire_file_contiguous(path);
+            bytes.assign(raw.data(), raw.size());
+        }
+    } catch (...) {
+        error = std::current_exception();
+    }
+    if (materialized) {
+        try {
+            co_await materialized->close();
+        } catch (...) {
+            if (!error)
+                error = std::current_exception();
+        }
+    }
+    co_await seastar::async([path] {
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
+    });
+    if (error)
+        std::rethrow_exception(error);
+
+    std::vector<std::pair<std::string, std::string>> files;
+    if (!bytes.empty())
+        files.emplace_back(name, std::move(bytes));
+    co_return EngineVShardSnapshot{std::move(manifest), std::move(files), std::move(catalogBytes)};
 }
 
-seastar::future<bool> Engine::installVShardSnapshotFiles(const timestar::VShardSnapshotManifest& manifest,
-                                                         std::vector<std::pair<std::string, std::string>> files) {
-    const auto tsmDir = layout_.tsmDir(shardId);
-    // Stage each shipped file in a temp SUBDIR under its ORIGINAL name: restore opens
-    // the source path as a ::TSM, whose ctor parses tier/seq from the FILENAME, so a
-    // mangled temp name (e.g. a ".tmp" suffix) would corrupt that parse and fail
-    // verification. A dedicated subdir keeps the staged copy from colliding with the
-    // install target (tsmDir/name). restoreVShardSnapshot COPIES source->target (does
-    // not consume the source), so we always remove the staging dir afterwards.
-    const auto stageDir = tsmDir / "snapin_tmp";
-    co_await seastar::async([&stageDir] {
-        std::error_code ec;
-        std::filesystem::remove_all(stageDir, ec);  // clear any stale staging from a prior crash
-        std::filesystem::create_directories(stageDir);
-    });
-    std::vector<std::string> tempPaths;
-    std::vector<std::string> names;
-    tempPaths.reserve(files.size());
-    names.reserve(files.size());
-    for (auto& [name, bytes] : files) {
-        const std::string tmp = (stageDir / name).string();
-        co_await seastar::async([&tmp, &bytes] {
-            std::ofstream o(tmp, std::ios::binary | std::ios::trunc);
-            if (!o)
-                throw std::runtime_error("installVShardSnapshotFiles: cannot open temp " + tmp);
-            o.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
-            o.flush();
-            if (!o)
-                throw std::runtime_error("installVShardSnapshotFiles: write failed for " + tmp);
-        });
-        tempPaths.push_back(tmp);
-        names.push_back(name);
+seastar::future<Engine::SnapshotInstallDisposition> Engine::classifySnapshotInstall(
+    const timestar::VShardSnapshotManifest& manifest,
+    const std::vector<std::pair<std::string, std::string>>& files) {
+    // Generation replacement is not yet atomic. Installing over WAL/memstore
+    // state could expose a mixture and resurrect points absent from the
+    // snapshot, so only a truly fresh target or an exact retry is accepted.
+    for (const auto& store : walFileManager.pinMemoryStores()) {
+        if (!store)
+            continue;
+        for (auto it = store->series.begin(); it != store->series.end(); ++it) {
+            if (timestar::virtualShard(it.key()) == manifest.vshard.value())
+                co_return SnapshotInstallDisposition::Reject;
+        }
     }
 
+    std::vector<seastar::shared_ptr<::TSM>> residentFiles;
+    for (const auto& [rank, file] : tsmFileManager.getSequencedTsmFiles()) {
+        if (!file)
+            continue;
+        bool containsTarget = false;
+        bool containsOther = false;
+        for (const auto& sid : file->getSeriesIds()) {
+            if (timestar::virtualShard(sid) == manifest.vshard.value())
+                containsTarget = true;
+            else
+                containsOther = true;
+        }
+        if (!containsTarget)
+            continue;
+        if (containsOther || file->hasTombstones())
+            co_return SnapshotInstallDisposition::Reject;
+        residentFiles.push_back(file);
+    }
+
+    if (!residentFiles.empty()) {
+        // Raft may replay after file publication but before catalog/index
+        // reconstruction. Values plus an aggregate revision range are not
+        // enough for identity: different block ranges can change later LWW.
+        if (residentFiles.size() != files.size())
+            co_return SnapshotInstallDisposition::Reject;
+        seastar::sstring residentBytes =
+            co_await seastar::util::read_entire_file_contiguous(residentFiles.front()->getFilePath());
+        if (residentBytes.size() != files.front().second.size() ||
+            !std::equal(residentBytes.begin(), residentBytes.end(), files.front().second.begin()))
+            co_return SnapshotInstallDisposition::Reject;
+
+        timestar::VShardExtentMap residentExtents;
+        co_await timestar::addTsmFileExtents(residentExtents, manifest.dataExtents.front().fileId,
+                                             *residentFiles.front());
+        if (residentExtents.extents(manifest.vshard) != manifest.dataExtents)
+            co_return SnapshotInstallDisposition::Reject;
+        const bool verified = co_await timestar::verifyVShardSnapshot(manifest, residentFiles);
+        co_return verified ? SnapshotInstallDisposition::Idempotent : SnapshotInstallDisposition::Reject;
+    }
+
+    // Data-free is not state-free: an earlier generation may have index entries
+    // for a fully deleted or not-yet-flushed series. Merging that derived state
+    // is not safe without a generation swap either.
+    auto indexed = co_await index.extractVShardSeriesMetadata(manifest.vshard.value());
+    co_return indexed.empty() ? SnapshotInstallDisposition::Fresh : SnapshotInstallDisposition::Reject;
+}
+
+seastar::future<bool> Engine::installVShardSnapshotFiles(timestar::VShardSnapshotManifest manifest,
+                                                         std::vector<std::pair<std::string, std::string>> files) {
+    auto owned = std::make_shared<const timestar::VShardSnapshotManifest>(std::move(manifest));
+    return installVShardSnapshotFilesOwned(std::move(owned), std::move(files));
+}
+
+seastar::future<bool> Engine::installVShardSnapshotFilesOwned(
+    std::shared_ptr<const timestar::VShardSnapshotManifest> manifestOwner,
+    std::vector<std::pair<std::string, std::string>> files) {
+    const auto& manifest = *manifestOwner;
+    if (!manifest.valid() || files.size() != manifest.dataExtents.size())
+        co_return false;
+
+    // The current producer deliberately materialises one immutable object. The
+    // lower-level restore helper publishes multiple targets with successive
+    // renames, which is not crash-atomic. Do not silently broaden the accepted
+    // wire format until CR-FIX-012 provides a generation-directory swap.
+    if (files.size() > 1)
+        co_return false;
+
+    const auto disposition = co_await classifySnapshotInstall(manifest, files);
+    if (disposition == SnapshotInstallDisposition::Reject)
+        co_return false;
+    if (disposition == SnapshotInstallDisposition::Idempotent)
+        co_return true;
+
+    const auto tsmDir = layout_.tsmDir(shardId);
+    // Stage each shipped file under a receiver-allocated valid TSM basename.
+    // A per-operation subdirectory prevents concurrent VShard installs on this
+    // core from clearing one another's files. restoreVShardSnapshot copies the
+    // staged source to its live target, so the exact subdirectory is disposable.
+    const uint64_t installNonce = tsmFileManager.allocateSequenceId();
+    const auto stageDir = tsmDir / "snapin_tmp" /
+                          (std::to_string(manifest.vshard.value()) + "-" +
+                           std::to_string(manifest.snapshotRevision) + "-" + std::to_string(installNonce));
+    co_await seastar::async([stageDir] { std::filesystem::create_directories(stageDir); });
     bool ok = false;
     std::exception_ptr err;
+    std::vector<std::string> tempPaths;
+    std::vector<std::string> names;
     try {
-        ok = co_await restoreVShardSnapshot(manifest, tempPaths, names);
+        tempPaths.reserve(files.size());
+        names.reserve(files.size());
+        std::set<std::string> wireNames;
+        for (auto& [wireName, bytes] : files) {
+            const std::filesystem::path wirePath(wireName);
+            if (wireName.empty() || wirePath.has_parent_path() || wirePath.filename() != wirePath ||
+                wirePath.extension() != ".tsm" || !wireNames.insert(wireName).second) {
+                ok = false;
+                break;
+            }
+            // Never use a peer-supplied name as a live path. Allocate a local
+            // immutable rank, with dataSeq equal to that rank so the next local
+            // flush is unambiguously newer. This also removes cross-node rank
+            // collisions from the install path.
+            const uint64_t localSeq = tsmFileManager.allocateSequenceId();
+            const std::string name =
+                layout_.compactedTsmFile(shardId, 9, localSeq, localSeq).filename().string();
+            const std::string tmp = (stageDir / name).string();
+            co_await seastar::async([&tmp, &bytes] {
+                std::ofstream o(tmp, std::ios::binary | std::ios::trunc);
+                if (!o)
+                    throw std::runtime_error("installVShardSnapshotFiles: cannot open temp " + tmp);
+                o.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+                o.flush();
+                if (!o)
+                    throw std::runtime_error("installVShardSnapshotFiles: write failed for " + tmp);
+            });
+            tempPaths.push_back(tmp);
+            names.push_back(name);
+        }
+        if (names.size() == files.size())
+            ok = co_await restoreVShardSnapshot(manifest, tempPaths, names);
         if (ok)
             // restoreVShardSnapshot only writes the files to disk; a running Engine
             // does not see them until they are registered in the TSMFileManager (this
@@ -325,13 +611,110 @@ seastar::future<bool> Engine::installVShardSnapshotFiles(const timestar::VShardS
         err = std::current_exception();
     }
     // Always clean up the staging dir (restore copied, not moved).
-    co_await seastar::async([&stageDir] {
+    co_await seastar::async([stageDir] {
         std::error_code ec;
         std::filesystem::remove_all(stageDir, ec);
     });
     if (err)
         std::rethrow_exception(err);
     co_return ok;
+}
+
+seastar::future<bool> Engine::installVShardSnapshotCatalog(timestar::VShardId vshard, std::string catalogBytes,
+                                                           std::string expectedHash) {
+    if (!vshard.valid() || timestar::SeriesCatalog::snapshotHash(catalogBytes) != expectedHash)
+        co_return false;
+    auto catalog = timestar::SeriesCatalog::loadSnapshot(
+        std::span<const char>(catalogBytes.data(), catalogBytes.size()));
+    if (!catalog)
+        co_return false;
+    const auto records = catalog->records();
+
+    // Snapshot the newly-installed pure files and require exact agreement
+    // between their series identities and the catalog before mutating the
+    // index. This prevents both undiscoverable data and catalog-only phantom
+    // series from being accepted as a complete snapshot.
+    std::vector<seastar::shared_ptr<::TSM>> files;
+    std::set<SeriesId128> dataIds;
+    for (const auto& [rank, file] : tsmFileManager.getSequencedTsmFiles()) {
+        if (!file)
+            continue;
+        bool belongs = false;
+        bool containsOther = false;
+        for (const auto& id : file->getSeriesIds()) {
+            if (timestar::virtualShard(id) == vshard.value()) {
+                belongs = true;
+                dataIds.insert(id);
+            } else
+                containsOther = true;
+        }
+        if (belongs) {
+            if (containsOther || file->hasTombstones())
+                co_return false;
+            files.push_back(file);
+        }
+    }
+    std::set<SeriesId128> catalogIds;
+    std::vector<MetadataOp> ops;
+    ops.reserve(records.size());
+    for (const auto& record : records) {
+        if (timestar::virtualShard(record.seriesId) != vshard.value())
+            co_return false;
+        std::optional<TSMValueType> storedType;
+        for (const auto& file : files) {
+            const auto type = file->getSeriesType(record.seriesId);
+            if (!type)
+                continue;
+            if (storedType && *storedType != *type)
+                co_return false;
+            storedType = *type;
+        }
+        if (!storedType || *storedType != record.entry.valueType)
+            co_return false;
+        std::map<std::string, std::string> tags(record.entry.tags.begin(), record.entry.tags.end());
+        if (tags.size() != record.entry.tags.size())
+            co_return false;
+        const auto canonicalId = SeriesId128::fromSeriesKey(
+            timestar::buildSeriesKey(record.entry.measurement, tags, record.entry.field));
+        if (canonicalId != record.seriesId || !catalogIds.insert(record.seriesId).second)
+            co_return false;
+        MetadataOp op;
+        op.valueType = record.entry.valueType;
+        op.measurement = record.entry.measurement;
+        op.fieldName = record.entry.field;
+        op.tags = std::move(tags);
+        op.seriesId = record.seriesId;
+        ops.push_back(std::move(op));
+    }
+    if (catalogIds != dataIds)
+        co_return false;
+
+    // Rebuild the derived NativeIndex state only after the full catalog has
+    // passed structural/hash/data agreement checks. Exact day membership is
+    // recovered from the installed TSM timestamps; using only min/max would
+    // create false positives, while omitting days makes older snapshot series
+    // disappear as soon as a later write creates the first day bitmap.
+    co_await index.indexMetadataBatch(ops);
+    for (const auto& record : records) {
+        co_await index.putSeriesValueType(record.seriesId, record.entry.valueType);
+        std::vector<uint64_t> timestamps;
+        switch (record.entry.valueType) {
+            case TSMValueType::Float:
+                timestamps = co_await snapshotSeriesTimestamps<double>(record.seriesId, files);
+                break;
+            case TSMValueType::Boolean:
+                timestamps = co_await snapshotSeriesTimestamps<bool>(record.seriesId, files);
+                break;
+            case TSMValueType::String:
+                timestamps = co_await snapshotSeriesTimestamps<std::string>(record.seriesId, files);
+                break;
+            case TSMValueType::Integer:
+                timestamps = co_await snapshotSeriesTimestamps<int64_t>(record.seriesId, files);
+                break;
+        }
+        co_await index.recordInsertDays(record.entry.measurement, record.seriesId, timestamps);
+    }
+    co_return true;
 }
 
 seastar::future<size_t> Engine::migrateVShard(timestar::VShardId vshard, std::vector<std::string> sourcePaths,

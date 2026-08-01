@@ -3,6 +3,7 @@
 // installs the whole VShard state. Round-trips, and rejects truncation / a flipped
 // checksum / a corrupt inner manifest.
 #include "../../../lib/cluster/data/snapshot_payload.hpp"
+#include "../../../lib/storage/series_catalog.hpp"
 
 #include <gtest/gtest.h>
 
@@ -35,6 +36,44 @@ TEST(SnapshotPayloadCodec, RoundTripsManifestAndFiles) {
     EXPECT_EQ(back->files[0].name, "0_0.tsm");
     EXPECT_EQ(back->files[0].bytes, p.files[0].bytes);  // binary bytes preserved
     EXPECT_EQ(back->files[1].bytes, "another file's contents");
+}
+
+TEST(SnapshotPayloadCodec, Version2AuthenticatesAndRoundTripsCatalog) {
+    SnapshotPayload p;
+    p.manifest = validManifest();
+    timestar::SeriesCatalog catalog;
+    timestar::CatalogEntry entry;
+    entry.measurement = "cpu";
+    entry.tags = {{"host", "a"}};
+    entry.field = "usage";
+    entry.valueType = TSMValueType::Float;
+    catalog.apply(timestar::CatalogRecord{SeriesId128::fromSeriesKey("catalog-test"), std::move(entry)});
+    p.catalog = catalog.snapshot();
+    p.manifest.catalogHash = timestar::SeriesCatalog::snapshotHash(p.catalog);
+    p.files = {{"9_1_d1.tsm", "bytes"}};
+
+    auto encoded = encodeSnapshotPayload(p);
+    auto back = decodeSnapshotPayload(encoded);
+    ASSERT_TRUE(back.has_value());
+    EXPECT_EQ(back->catalog, p.catalog);
+    EXPECT_EQ(back->manifest.catalogHash, p.manifest.catalogHash);
+    ASSERT_TRUE(timestar::SeriesCatalog::loadSnapshot(
+                    std::span<const char>(back->catalog.data(), back->catalog.size()))
+                    .has_value());
+
+    // Recompute the outer checksum after corrupting a catalog byte: the inner
+    // catalog hash, not merely the transport checksum, must reject it.
+    const auto offset = encoded.find("cpu");
+    ASSERT_NE(offset, std::string::npos);
+    encoded[offset] ^= 0x01;
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i + 8 < encoded.size(); ++i) {
+        h ^= static_cast<uint8_t>(encoded[i]);
+        h *= 1099511628211ull;
+    }
+    for (int i = 0; i < 8; ++i)
+        encoded[encoded.size() - 8 + i] = static_cast<char>((h >> (8 * i)) & 0xff);
+    EXPECT_FALSE(decodeSnapshotPayload(encoded).has_value());
 }
 
 TEST(SnapshotPayloadCodec, EmptyFileListRoundTrips) {

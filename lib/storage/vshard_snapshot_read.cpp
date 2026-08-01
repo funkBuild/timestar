@@ -25,8 +25,10 @@ namespace {
 //     wins). keep-FIRST (emplace) would instead have returned the stale value.
 template <class T>
 seastar::future<> mergeSeriesFromFile(::TSM& file, const SeriesId128& seriesId, std::map<uint64_t, T>& resolved) {
-    TSMResult<T> result(0);
-    co_await file.readSeries<T>(seriesId, 0, UINT64_MAX, result);
+    // A snapshot hash is over the logical view, including sidecar tombstones.
+    // Hashing readSeries()'s raw blocks made a deleted point part of the hash
+    // and made a sidecar-free restore either resurrect it or fail verification.
+    TSMResult<T> result = co_await file.queryWithTombstones<T>(seriesId, 0, UINT64_MAX);
     auto [timestamps, values] = result.getAllData();
     for (size_t i = 0; i < timestamps.size(); ++i)
         resolved[timestamps[i]] = std::move(values[i]);  // last write wins

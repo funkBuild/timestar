@@ -54,6 +54,7 @@ seastar::future<> testGroupsWiredWhenCreatedAfterInit() {
     auto writeGrp = co_await seastar::create_scheduling_group("test_write", 50);
 
     engine.setIOSchedulingGroups(queryGrp, writeGrp, compactGrp, flushGrp);
+    engine.setVShardPartitionedCompaction(true);
 
     const auto& fm = engine.getTSMFileManager();
     EXPECT_TRUE(fm.hasCompactionGroup())
@@ -63,6 +64,8 @@ seastar::future<> testGroupsWiredWhenCreatedAfterInit() {
                                        "WAL->TSM conversion will not be prioritised over tier merges.";
     EXPECT_EQ(fm.compactionGroup(), compactGrp);
     EXPECT_EQ(fm.flushGroup(), flushGrp);
+    EXPECT_TRUE(engine.vshardPartitionedCompactionEnabled())
+        << "partitioned startup must enable VShard-pure compaction before the loop starts";
 
     // Placement is only meaningful if the two are actually distinct: conversion
     // must be able to outrank merges rather than queue behind them.

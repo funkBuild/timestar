@@ -174,6 +174,7 @@ public:
 
     // Get the compactor (for tombstone rewrites)
     TSMCompactor* getCompactor() { return compactor.get(); }
+    const TSMCompactor* getCompactor() const { return compactor.get(); }
 
     // Number of compactions completed since startup (for Prometheus metrics)
     uint64_t getCompletedCompactions() const { return completedCompactions_; }

@@ -10,6 +10,7 @@
 
 #include <gtest/gtest.h>
 
+#include <fstream>
 #include <stdexcept>
 
 using namespace timestar;
@@ -168,18 +169,18 @@ TEST(WriteAdmissionTest, TheOriginatedAndIngressBudgetsAreIndependent) {
 }
 
 TEST(WriteAdmissionTest, ReplicatedAdmissionIsBeforeProposalAndApplyBypassesIt) {
-#ifdef PROJECT_SOURCE_DIR
-    const std::string root = PROJECT_SOURCE_DIR;
-#else
-    const std::string root = "..";
-#endif
     auto read = [](const std::string& path) {
         std::ifstream in(path);
         return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
     };
-    const auto host = read(root + "/lib/cluster/integration/replicated_vshard_host.cpp");
-    const auto sm = read(root + "/lib/cluster/integration/engine_data_state_machine.cpp");
-    const auto store = read(root + "/lib/cluster/integration/engine_local_store.cpp");
+#if defined(REPLICATED_VSHARD_HOST_SOURCE_PATH) && defined(ENGINE_DATA_STATE_MACHINE_SOURCE_PATH) && \
+    defined(ENGINE_LOCAL_STORE_SOURCE_PATH)
+    const auto host = read(REPLICATED_VSHARD_HOST_SOURCE_PATH);
+    const auto sm = read(ENGINE_DATA_STATE_MACHINE_SOURCE_PATH);
+    const auto store = read(ENGINE_LOCAL_STORE_SOURCE_PATH);
+#else
+    GTEST_SKIP() << "cluster integration source paths are not defined";
+#endif
     ASSERT_FALSE(host.empty());
     ASSERT_FALSE(sm.empty());
     ASSERT_FALSE(store.empty());

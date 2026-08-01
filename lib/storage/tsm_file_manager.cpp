@@ -96,8 +96,11 @@ seastar::future<> TSMFileManager::openTsmFile(std::string path) {
     // nextSequenceId is updated even if open() fails on a corrupt file.
     // This prevents sequence number reuse on the next writeMemstore().
     seastar::shared_ptr<TSM> tsmFile = seastar::make_shared<TSM>(path);
-    if (tsmFile->seqNum >= nextSequenceId) {
-        nextSequenceId = tsmFile->seqNum + 1;
+    const uint64_t highestSequence = std::max(tsmFile->seqNum, tsmFile->dataSeq);
+    if (highestSequence >= nextSequenceId) {
+        if (highestSequence == UINT64_MAX) [[unlikely]]
+            throw std::overflow_error("TSM sequence number exhausted");
+        nextSequenceId = highestSequence + 1;
     }
 
     try {
@@ -238,11 +241,17 @@ seastar::future<> TSMFileManager::addTSMFile(seastar::shared_ptr<TSM> file) {
         }
     }
 
-    if (file->seqNum >= nextSequenceId) {
-        if (file->seqNum == UINT64_MAX) [[unlikely]] {
+    // A remotely-created snapshot object can carry a dataSeq above this
+    // receiver's local filename sequence. The next local flush must outrank
+    // that installed generation, so seed from BOTH fields. Seeding from only
+    // seqNum let the next write receive a lower dataSeq and lose LWW to the
+    // older snapshot forever.
+    const uint64_t highestSequence = std::max(file->seqNum, file->dataSeq);
+    if (highestSequence >= nextSequenceId) {
+        if (highestSequence == UINT64_MAX) [[unlikely]] {
             throw std::overflow_error("TSM sequence number exhausted");
         }
-        nextSequenceId = file->seqNum + 1;
+        nextSequenceId = highestSequence + 1;
     }
 
     co_return;

@@ -1,6 +1,9 @@
 #include "series_catalog.hpp"
 
+#include <xxhash.h>
+
 #include <algorithm>
+#include <cstdio>
 
 namespace timestar {
 
@@ -51,7 +54,7 @@ std::optional<CatalogEntry> CatalogEntry::decode(codec::Reader& reader) {
     // duplicate keys). A non-canonical encoding is rejected rather than silently
     // accepted, so equal series always have byte-identical encodings.
     for (size_t i = 1; i < entry.tags.size(); ++i) {
-        if (!(entry.tags[i - 1] < entry.tags[i]))
+        if (!(entry.tags[i - 1] < entry.tags[i]) || entry.tags[i - 1].first == entry.tags[i].first)
             return std::nullopt;
     }
     return entry;
@@ -128,6 +131,14 @@ std::string SeriesCatalog::snapshot() const {
     return out;
 }
 
+std::string SeriesCatalog::snapshotHash(std::span<const char> data) {
+    const XXH128_hash_t hash = XXH3_128bits(data.data(), data.size());
+    char buf[33];
+    std::snprintf(buf, sizeof(buf), "%016llx%016llx", static_cast<unsigned long long>(hash.high64),
+                  static_cast<unsigned long long>(hash.low64));
+    return std::string(buf, 32);
+}
+
 std::optional<SeriesCatalog> SeriesCatalog::loadSnapshot(std::span<const char> data) {
     codec::Reader reader(data);
     const uint32_t count = reader.u32();
@@ -139,13 +150,27 @@ std::optional<SeriesCatalog> SeriesCatalog::loadSnapshot(std::span<const char> d
         auto record = CatalogRecord::decode(reader);
         if (!record)
             return std::nullopt;
-        if (!catalog.apply(*record))
-            return std::nullopt;  // conflicting duplicate id in the snapshot
+        // A snapshot is a canonical map encoding, not a replay stream. Even an
+        // identical duplicate ID is non-canonical and would let distinct byte
+        // strings claim to represent the same catalog.
+        if (catalog.find(record->seriesId) != nullptr || !catalog.apply(*record))
+            return std::nullopt;
     }
     // A trailing byte after the declared count is corruption.
     if (!reader.exhausted())
         return std::nullopt;
     return catalog;
+}
+
+std::vector<CatalogRecord> SeriesCatalog::records() const {
+    std::vector<CatalogRecord> out;
+    out.reserve(entries_.size());
+    for (const auto& [id, entry] : entries_)
+        out.push_back(CatalogRecord{id, entry});
+    std::sort(out.begin(), out.end(), [](const CatalogRecord& lhs, const CatalogRecord& rhs) {
+        return lhs.seriesId.getRawData() < rhs.seriesId.getRawData();
+    });
+    return out;
 }
 
 }  // namespace timestar

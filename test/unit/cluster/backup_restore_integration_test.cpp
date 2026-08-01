@@ -9,6 +9,7 @@
 #include "../../../lib/core/engine.hpp"
 #include "../../../lib/core/placement_table.hpp"  // virtualShard
 #include "../../../lib/core/vshard.hpp"           // vshardsCohesiveOnCores
+#include "../../../lib/storage/series_catalog.hpp"
 
 #include <functional>
 #include <gtest/gtest.h>
@@ -54,10 +55,11 @@ TEST(BackupRestoreIntegration, ExportRestoreInstallAndFailClosed) {
             src.rolloverMemoryStore().get();
             for (int i = 0; i < 300 && src.getTSMFileCount() == 0; ++i)
                 seastar::sleep(std::chrono::milliseconds(100)).get();
-            auto built = src.buildVShardSnapshotFiles(vshard, std::string(32, '0')).get();
+            auto built = src.buildVShardSnapshotFiles(vshard).get();
             data::SnapshotPayload p;
-            p.manifest = std::move(built.first);
-            for (auto& [n, b] : built.second)
+            p.manifest = std::move(built.manifest);
+            p.catalog = std::move(built.catalog);
+            for (auto& [n, b] : built.files)
                 p.files.push_back(data::SnapshotFile{std::move(n), std::move(b)});
             snapBytes = data::encodeSnapshotPayload(p);
             src.stop().get();
@@ -85,6 +87,24 @@ TEST(BackupRestoreIntegration, ExportRestoreInstallAndFailClosed) {
             Engine dst(StorageLayout("bkp_dst").anchored());
             dst.init().get();
             EXPECT_TRUE(dst.installVShardSnapshotFiles(payload->manifest, std::move(files)).get());
+            EXPECT_TRUE(dst.installVShardSnapshotCatalog(payload->manifest.vshard, payload->catalog,
+                                                         payload->manifest.catalogHash)
+                            .get());
+
+            // Catalog identity includes the durable value type. A catalog with
+            // a valid self-hash but a type that disagrees with the TSM must not
+            // be accepted as reconstructed discovery state.
+            SeriesCatalog wrongCatalog;
+            CatalogEntry wrongEntry;
+            wrongEntry.measurement = "bkp";
+            wrongEntry.tags = {{"host", "h1"}};
+            wrongEntry.field = "value";
+            wrongEntry.valueType = TSMValueType::Integer;
+            EXPECT_TRUE(wrongCatalog.apply(CatalogRecord{sid, std::move(wrongEntry)}));
+            auto wrongBytes = wrongCatalog.snapshot();
+            EXPECT_FALSE(dst.installVShardSnapshotCatalog(
+                                payload->manifest.vshard, wrongBytes, SeriesCatalog::snapshotHash(wrongBytes))
+                             .get());
             auto r = dst.query(key, sid, 0, UINT64_MAX).get();
             ASSERT_TRUE(r.has_value());
             EXPECT_DOUBLE_EQ(std::get<QueryResult<double>>(r.value()).values[0], 12.0)

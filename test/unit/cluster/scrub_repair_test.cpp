@@ -48,7 +48,8 @@ TEST(ScrubRepair, DetectsCorruptionAndRepairsViaSnapshot) {
             src.rolloverMemoryStore().get();
             for (int i = 0; i < 300 && src.getTSMFileCount() == 0; ++i)
                 seastar::sleep(std::chrono::milliseconds(100)).get();
-            snap = src.buildVShardSnapshotFiles(vshard, std::string(32, '0')).get();
+            auto built = src.buildVShardSnapshotFiles(vshard).get();
+            snap = {std::move(built.manifest), std::move(built.files)};
             src.stop().get();
         }
         ASSERT_FALSE(snap.second.empty());

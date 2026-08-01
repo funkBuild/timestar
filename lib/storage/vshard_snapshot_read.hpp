@@ -17,7 +17,7 @@ namespace timestar {
 // across files by dataRank (the newer generation's value wins at a shared
 // timestamp, matching the query path), then feeds the resolved (timestamp, value)
 // points in ascending-timestamp order. `files` may be given in any order; this
-// sorts a copy by dataRank descending.
+// sorts a copy by dataRank ascending (oldest first, overwrite with newer).
 //
 // Additive and read-only: it changes no format and no hot path. The caller
 // afterwards calls builder.build(extents, ...) to emit the manifest.
@@ -25,8 +25,9 @@ namespace timestar {
 // PRECONDITIONS the caller must satisfy (a snapshot is over the flushed TSM view):
 //   - Flush the memory store first: this reads TSM FILES ONLY, so any un-flushed
 //     data would be missing from the verification hash.
-//   - Deletes/tombstones must already be MATERIALISED in the files (compaction
-//     applies them); this does not re-apply tombstones to the hashed view.
+//   - Keep the input files and their tombstone views pinned and stable for the
+//     read. This applies each file's current tombstone sidecar; snapshot creation
+//     additionally checks mutation generations to reject a concurrent delete.
 //   - Pass builder.build() the SAME files' extents (from addTsmFileExtents), so
 //     the manifest's snapshotRevision matches the hashed data; feeding one file
 //     set here and a different extent map to build() yields a valid-looking
@@ -38,8 +39,9 @@ seastar::future<> feedVShardResolvedView(VShardId vshard, std::vector<seastar::s
 // (just-installed) `files` and compare it to `manifest.verificationHash`. Returns
 // true iff they match -- i.e. the installed data reproduces the snapshot's
 // resolved logical view exactly. A false result means the install is corrupt or
-// incomplete and must be rejected/quarantined, never served. Same precondition
-// as feedVShardResolvedView (flushed, delete-materialised files).
+// incomplete and must be rejected/quarantined, never served. Same stability
+// precondition as feedVShardResolvedView; shipped snapshot objects themselves
+// are required to have no tombstone sidecars.
 seastar::future<bool> verifyVShardSnapshot(const VShardSnapshotManifest& manifest,
                                            std::vector<seastar::shared_ptr<::TSM>> files);
 

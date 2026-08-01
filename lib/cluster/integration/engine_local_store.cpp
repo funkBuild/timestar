@@ -20,12 +20,12 @@ seastar::future<data::SnapshotPayload> EngineLocalStore::buildVShardSnapshot(VSh
             "buildVShardSnapshot: core count is not VShard-cohesive; a single-core snapshot would omit "
             "series that scatter across cores (refusing to ship a partial snapshot)");
     const unsigned core = timestar::assignCore(vshard, seastar::smp::count);
-    auto built = co_await engines_.invoke_on(
-        core, [vshard](Engine& e) { return e.buildVShardSnapshotFiles(vshard, std::string(32, '0')); });
+    auto built = co_await engines_.invoke_on(core, [vshard](Engine& e) { return e.buildVShardSnapshotFiles(vshard); });
     data::SnapshotPayload payload;
-    payload.manifest = std::move(built.first);
-    payload.files.reserve(built.second.size());
-    for (auto& [name, bytes] : built.second)
+    payload.manifest = std::move(built.manifest);
+    payload.catalog = std::move(built.catalog);
+    payload.files.reserve(built.files.size());
+    for (auto& [name, bytes] : built.files)
         payload.files.push_back(data::SnapshotFile{std::move(name), std::move(bytes)});
     co_return payload;
 }
@@ -50,15 +50,27 @@ seastar::future<bool> EngineLocalStore::hasUnconvertedStores(VShardId vshard) {
 seastar::future<bool> EngineLocalStore::installVShardSnapshot(VShardId vshard, data::SnapshotPayload payload) {
     if (!timestar::vshardsCohesiveOnCores(seastar::smp::count))
         throw std::runtime_error("installVShardSnapshot: core count is not VShard-cohesive");
+    if (payload.manifest.vshard != vshard)
+        co_return false;
     const unsigned core = timestar::assignCore(vshard, seastar::smp::count);
     // The replicated apply path already runs on assignCore(vshard), so this invoke_on
     // is inline (no cross-core transfer of the payload's strings).
     co_return co_await engines_.invoke_on(core, [payload = std::move(payload)](Engine& e) mutable {
+        if (payload.catalog.empty())
+            return seastar::make_ready_future<bool>(false);
         std::vector<std::pair<std::string, std::string>> files;
         files.reserve(payload.files.size());
         for (auto& f : payload.files)
             files.emplace_back(std::move(f.name), std::move(f.bytes));
-        return e.installVShardSnapshotFiles(payload.manifest, std::move(files));
+        auto snapshotVShard = payload.manifest.vshard;
+        auto hash = payload.manifest.catalogHash;
+        return e.installVShardSnapshotFiles(std::move(payload.manifest), std::move(files))
+            .then([&e, snapshotVShard, catalog = std::move(payload.catalog),
+                   hash = std::move(hash)](bool installed) mutable {
+                if (!installed)
+                    return seastar::make_ready_future<bool>(false);
+                return e.installVShardSnapshotCatalog(snapshotVShard, std::move(catalog), std::move(hash));
+            });
     });
 }
 

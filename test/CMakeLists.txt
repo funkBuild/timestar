@@ -123,6 +123,9 @@ set(SOURCE_INSPECTION_DEFS
     NATIVE_INDEX_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/index/native/native_index.cpp"
     NATIVE_INDEX_HPP_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/index/native/native_index.hpp"
     SHARD_RAFT_PLANE_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/cluster/integration/shard_raft_plane.hpp"
+    REPLICATED_VSHARD_HOST_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/cluster/integration/replicated_vshard_host.cpp"
+    ENGINE_DATA_STATE_MACHINE_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/cluster/integration/engine_data_state_machine.cpp"
+    ENGINE_LOCAL_STORE_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/cluster/integration/engine_local_store.cpp"
 )
 
 # Main test executable with all tests

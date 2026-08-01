@@ -62,7 +62,10 @@ seastar::future<bool> TSM::deleteRange(const SeriesId128& seriesId, uint64_t sta
     // Check if any index blocks overlap with the deletion time range
     bool hasOverlap = false;
     for (const auto& block : indexEntry->indexBlocks) {
-        if (block.minTime < endTime && block.maxTime >= startTime) {
+        // Delete ranges and tombstone filters are inclusive at both ends. An
+        // exclusive comparison here skipped an exact-point delete whenever the
+        // point was the minimum (and, for a one-point block, the maximum) time.
+        if (block.minTime <= endTime && block.maxTime >= startTime) {
             hasOverlap = true;
             break;
         }

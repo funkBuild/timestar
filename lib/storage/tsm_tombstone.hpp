@@ -71,6 +71,11 @@ private:
     seastar::file tombstoneFile;
     bool isOpen = false;
     bool isDirty = false;
+    // Monotonic in-memory mutation generation. Snapshot materialisation records
+    // this before reading a TSM and checks it again before publishing the
+    // snapshot: a concurrent delete must make the producer retry rather than
+    // compacting a pre-delete view and then truncating the delete's Raft entry.
+    uint64_t mutationGeneration_ = 0;
 
     // Helper methods
     uint32_t calculateChecksum(const TombstoneEntry& entry) const;
@@ -121,6 +126,7 @@ public:
     size_t getEntryCount() const { return entries.size(); }
     size_t getSeriesCount() const { return seriesRanges.size(); }
     uint64_t getFileSize() const;
+    uint64_t mutationGeneration() const noexcept { return mutationGeneration_; }
 };
 
 // Template implementation for filtering

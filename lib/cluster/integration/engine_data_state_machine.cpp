@@ -48,6 +48,16 @@ seastar::future<> EngineDataStateMachine::applySnapshot(raft::Snapshot snap) {
     auto payload = data::decodeSnapshotPayload(snap.data);
     if (!payload)
         throw std::runtime_error("EngineDataStateMachine::applySnapshot: undecodable snapshot payload (fail-stop)");
+    // The producer deliberately compacts one entry below the highest flushed
+    // point revision: entry N can be only partly flushed, so N remains in the
+    // retained suffix and replays idempotently. Bind those two independently
+    // checksummed envelopes here. Without this check, a valid payload paired
+    // with the wrong Raft snapshot metadata could install state ahead of (or
+    // unrelated to) the log prefix being discarded.
+    if (snap.index == UINT64_MAX || payload->manifest.snapshotRevision != snap.index + 1)
+        throw std::runtime_error(
+            "EngineDataStateMachine::applySnapshot: data revision does not match Raft snapshot boundary "
+            "(fail-stop)");
     const bool installed = co_await store_.installVShardSnapshot(vshard_, std::move(*payload));
     if (!installed)
         throw std::runtime_error(
