@@ -11,7 +11,8 @@
 `41fdc34`, `a58d2a9`, `6a73809`, `81692a4`, `d363348`, `2749027`,
 `1f61f49`, `b2c7d0b`, `872f7e1`, `023d9c3`, `d5f4755`, `7f6d7e8`,
 `7760ebd`, `6557666`, `c8f28c8`, `445f1f0`, `8b8536d`, `6912dfb`,
-`ecb63a5`, `a03fe1d`, `8ae846c`, `9ecd0e6`
+`ecb63a5`, `a03fe1d`, `8ae846c`, `9ecd0e6`, `66049e7`, `470d14c`,
+`3af373a`
 
 **Scope:** The recent VShard/Raft cluster redesign, its production-server
 integration, the public HTTP surface, recovery paths, and the release evidence
@@ -24,7 +25,8 @@ used as evidence that the current server is production-ready.
 
 ## Implementation progress after the review
 
-Forty-four remediation commits are now recorded. Cluster release status
+Forty-seven remediation commits and the current CR-FIX-080 implementation are
+now recorded. Cluster release status
 remains **BLOCKED** because group 0/movement, atomic and retry-safe
 pattern-delete semantics, replicated retention, the large-snapshot path,
 sustained live receipt-retirement compaction evidence, and rolling wire-format
@@ -1575,7 +1577,24 @@ is not completion.
   metrics. **Done when:** repeated deadline-expired writes under a held
   partition plateau in both RSS and journal growth, reject before append once
   the budget is full, and recover admission after healing without losing any
-  acknowledged write.
+  acknowledged write. **Implementation complete; live resource evidence
+  remains.** Every data group on a reactor now publishes its exact logical tail
+  above `commitIndex` into one host-owned budget. Admission is capped at 64 MiB
+  per shard and at one maximal legal proposal (14 MiB plus `LogEntry`) per
+  group, preserving room for at least four independently hot groups; election
+  no-ops, membership entries, and recovered tails remain admissible/accounted
+  so resource control cannot prevent consensus healing. Recovery reconstructs
+  the contribution before the group can tick or serve, every append/commit/
+  truncation/snapshot mutation refreshes it, and group destruction releases it.
+  A full budget throws a typed, unambiguous pre-append refusal classified as
+  retryable `Overloaded`, rather than pretending the leader is transferring.
+  `/cluster/status` exposes `uncommitted_raft_bytes`, peak, aggregate and
+  per-group limits, and cumulative refusals. Five focused regressions pass:
+  recovered-tail lifetime accounting, aggregate composition, per-group
+  fairness, no index advance on refusal, and admission recovery after a real
+  quorum-loss/heal sequence. This row remains unchecked until a memory-bounded
+  live partition run records RSS and journal plateau; no server process was
+  started in this pass because the preceding unbounded run exhausted the host.
 
 ## Release exit criteria
 

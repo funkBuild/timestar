@@ -22,7 +22,15 @@ class RaftGroup {
 public:
     RaftGroup(uint16_t groupId, RaftNode node, RaftPersistence& persistence, RaftTransport& transport,
               RaftStateMachine& sm)
-        : groupId_(groupId), node_(std::move(node)), persistence_(persistence), transport_(transport), sm_(sm) {}
+        : groupId_(groupId),
+          node_(std::move(node)),
+          persistence_(persistence),
+          transport_(transport),
+          sm_(sm),
+          uncommittedProposalBudget_(node_.uncommittedProposalBudget()) {
+        syncUncommittedBudget();
+    }
+    ~RaftGroup();
 
     // Inputs. Each mutates the node then drains its Ready under the group lock.
     seastar::future<> step(Message m);
@@ -177,12 +185,19 @@ private:
     // Resolve any waitApplied waiters this node has now applied through (any role;
     // never failed on role change).
     void releaseAppliedWaiters();
+    // Refresh this group's contribution after a core transition that can append,
+    // truncate, commit or compact log entries. Synchronous and allocation-free in
+    // the common case; callers hold lock_ once construction has completed.
+    void syncUncommittedBudget();
+    // Refuse an otherwise-eligible client entry before Raft appends it.
+    void requireUncommittedBudget(size_t payloadBytes);
 
     uint16_t groupId_;
     RaftNode node_;
     RaftPersistence& persistence_;
     RaftTransport& transport_;
     RaftStateMachine& sm_;
+    UncommittedProposalBudget* uncommittedProposalBudget_ = nullptr;
     // Serializes all node mutation on this core. ALWAYS taken with
     // `seastar::get_units` inside the method's OWN coroutine body -- never with
     // `with_semaphore(lambda)`, whose closure dies at the lambda's first suspension

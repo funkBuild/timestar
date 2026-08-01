@@ -32,7 +32,8 @@ using timestar::raft::NodeId;
 //   * `ShardStopping` -- the slice was turned away by a shard tearing itself down before
 //                        it reached Raft (kShardStoppingError). UNAMBIGUOUS.
 //   * `Overloaded`    -- refused by an admission bound (this node's in-flight byte gate,
-//                        or a peer's rpc::resource_limits) BEFORE any handler ran.
+//                        its uncommitted Raft-tail budget, or a peer's
+//                        rpc::resource_limits) BEFORE the mutation was appended.
 //                        UNAMBIGUOUS.
 //   * `LeadershipLost`-- the entry WAS appended here and then this node stopped leading.
 //                        The successor may or may not commit it. AMBIGUOUS.
@@ -355,6 +356,11 @@ inline WriteFailure classifyLocalWriteFailure(const std::exception_ptr& e) {
         // classified exactly like a transport failure and is safe to retry only because
         // re-application is LWW-idempotent (see the audit above).
         return WriteFailure::Transport;
+    } catch (const raft::ProposalBudgetExceededError&) {
+        // Refused before append by the shard/group uncommitted-tail budget. The
+        // outcome is known and admission may recover as soon as quorum replication
+        // commits or truncates the retained tail.
+        return WriteFailure::Overloaded;
     } catch (const WriteOverloadedError&) {
         return WriteFailure::Overloaded;
     } catch (const WriteFrameTooLargeError&) {

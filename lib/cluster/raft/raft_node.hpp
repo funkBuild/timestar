@@ -129,6 +129,10 @@ struct RaftOptions {
     // SnapshotTransferBudget for why a plain counter and not a semaphore.
     SnapshotTransferBudget* snapshotBudget = nullptr;
 
+    // Aggregate uncommitted client-proposal memory owned by the hosting reactor
+    // shard. nullptr leaves core-only tests/unhosted nodes unlimited.
+    UncommittedProposalBudget* uncommittedProposalBudget = nullptr;
+
     // Ticks with NO reply from a peer mid-transfer before the in-flight chunk is RESENT.
     // The transport is fire-and-forget, so a dropped chunk is SILENT: this timer is the
     // only thing that notices. Two heartbeat intervals by default -- long enough that a
@@ -250,6 +254,8 @@ public:
     // leader" from "I am the leader and I am standing down" -- the two want opposite
     // retries (write-scaleout 5 review, F1).
     bool transferInFlight() const { return leadTransferee_ != kNoNode; }
+    size_t uncommittedLogBytes() const;
+    UncommittedProposalBudget* uncommittedProposalBudget() const { return opts_.uncommittedProposalBudget; }
     // Snapshots this node declined to send because they exceed opts_.maxSnapshotBytes (or,
     // with chunking disabled, opts_.maxMessageBytes). Non-zero means a follower CANNOT be
     // caught up by snapshot and needs a SMALLER snapshot before it can rejoin -- since

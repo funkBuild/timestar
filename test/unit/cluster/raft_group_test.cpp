@@ -207,6 +207,33 @@ seastar::future<> testElectionViaTicks() {
     EXPECT_EQ(net.applied(net.leader()).size(), 1u);
 }
 
+void testRecoveredTailIsAccountedForGroupLifetime() {
+    RaftLog recovered;
+    LogEntry first;
+    first.term = 3;
+    first.data = "recovered-one";
+    LogEntry second;
+    second.term = 3;
+    second.data = "recovered-two";
+    recovered.append({first, second});
+    const size_t expected = estimatedLogEntryBytes(first.data.size()) + estimatedLogEntryBytes(second.data.size());
+
+    UncommittedProposalBudget budget(expected * 2, expected * 2);
+    RaftOptions o = opts();
+    o.uncommittedProposalBudget = &budget;
+    NoopPersistence persistence;
+    NullTransport transport;
+    RecordingSM sm;
+    {
+        RaftNode node(1, {1, 2, 3}, std::move(recovered), HardState{3, kNoNode}, o);
+        RaftGroup group(17, std::move(node), persistence, transport, sm);
+        EXPECT_EQ(budget.current(), expected)
+            << "recovered entries are uncommitted until a current-term quorum proves otherwise";
+        EXPECT_EQ(budget.groupCurrent(17), expected);
+    }
+    EXPECT_EQ(budget.current(), 0u) << "destroying a hosted group must release its shard contribution";
+}
+
 // PERSIST AND APPLY BOTH GET THE WHOLE PAYLOAD (debt D-32). `drainReady` hands the same
 // Snapshot to `persistSnapshot` and then to `applySnapshot`, and both take it BY VALUE.
 // D-32 turned the second into a MOVE, which is the saving -- and which makes "persist must
@@ -416,6 +443,10 @@ TEST(RaftGroupTest, ElectsAndReplicatesThroughTheAsyncDriver) {
 
 TEST(RaftGroupTest, ElectsViaTimerTicks) {
     testElectionViaTicks().get();
+}
+
+TEST(RaftGroupTest, RecoveredUncommittedTailIsAccountedForGroupLifetime) {
+    testRecoveredTailIsAccountedForGroupLifetime();
 }
 
 TEST(RaftGroupTest, AReceivedSnapshotIsPersistedAndAppliedWithItsWholePayload) {

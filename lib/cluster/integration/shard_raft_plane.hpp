@@ -536,6 +536,11 @@ public:
         uint64_t segmentsPinnedLastPass = 0;
         uint64_t recordsCopiedForward = 0;
         uint64_t gcPasses = 0;
+        size_t uncommittedBytes = 0;
+        size_t uncommittedPeakBytes = 0;
+        size_t uncommittedLimitBytes = 0;
+        size_t uncommittedPerGroupLimitBytes = 0;
+        uint64_t uncommittedRefusals = 0;
         bool shared = false;
     };
 
@@ -550,6 +555,11 @@ public:
         c.segmentsPinnedLastPass = host.journalSegmentsPinnedLastPass();
         c.recordsCopiedForward = host.journalRecordsCopiedForward();
         c.gcPasses = host.journalGcPasses();
+        c.uncommittedBytes = host.uncommittedProposalBytes();
+        c.uncommittedPeakBytes = host.uncommittedProposalPeakBytes();
+        c.uncommittedLimitBytes = ReplicatedVShardHost::uncommittedProposalLimitBytes();
+        c.uncommittedPerGroupLimitBytes = ReplicatedVShardHost::uncommittedProposalPerGroupLimitBytes();
+        c.uncommittedRefusals = host.uncommittedProposalRefusals();
         c.shared = ReplicatedVShardHost::sharedJournalEnabled();
         return c;
     }

@@ -74,6 +74,21 @@ public:
     uint64_t journalFsyncs() const;
     uint64_t journalSyncRequests() const;
 
+    // Aggregate uncommitted Raft-log admission (CR-FIX-080). One budget is shared
+    // by every data group hosted on this reactor shard. The per-group ceiling
+    // preserves room for at least four independently partitioned hot groups, while
+    // still admitting the largest legal single proposal.
+    static constexpr size_t kMaxUncommittedProposalBytes = raft::kMaxInboundRaftMemory;
+    static constexpr size_t kMaxUncommittedProposalBytesPerGroup =
+        raft::estimatedLogEntryBytes(raft::RaftGroup::kMaxProposalBytes);
+    static_assert(kMaxUncommittedProposalBytesPerGroup * 4 <= kMaxUncommittedProposalBytes,
+                  "the uncommitted Raft budget must preserve admission fairness across at least four groups");
+    size_t uncommittedProposalBytes() const { return uncommittedProposalBudget_.current(); }
+    size_t uncommittedProposalPeakBytes() const { return uncommittedProposalBudget_.peak(); }
+    uint64_t uncommittedProposalRefusals() const { return uncommittedProposalBudget_.refusals(); }
+    static constexpr size_t uncommittedProposalLimitBytes() { return kMaxUncommittedProposalBytes; }
+    static constexpr size_t uncommittedProposalPerGroupLimitBytes() { return kMaxUncommittedProposalBytesPerGroup; }
+
     // Journal segment ROTATION TARGET, per layout. Must be set before addVShard.
     //
     // A TEST SEAM, and nothing more -- there is no config key behind it and no operator
@@ -449,6 +464,10 @@ private:
     // DECLARED BEFORE registry_ for the same reason vshards_ is: every RaftNode in the
     // registry holds a POINTER to this budget, so it must outlive them (debt D-37).
     raft::SnapshotTransferBudget snapshotBudget_{kMaxConcurrentSnapshotTransfers};
+    // Every RaftGroup in registry_ publishes its current tail here, so declaration
+    // order is load-bearing just like snapshotBudget_: this must outlive registry_.
+    raft::UncommittedProposalBudget uncommittedProposalBudget_{kMaxUncommittedProposalBytes,
+                                                               kMaxUncommittedProposalBytesPerGroup};
     raft::RaftGroupRegistry registry_;
     bool stopped_ = false;
     // See classifyRefusal / proposeRefusedWhileLeader.

@@ -138,11 +138,13 @@ struct NodeBox {
 
 using Nodes = std::map<NodeId, std::unique_ptr<NodeBox>>;
 
-RaftOptions optsFor(NodeId id, NodeId preferredLeader, bool checkQuorum) {
+RaftOptions optsFor(NodeId id, NodeId preferredLeader, bool checkQuorum,
+                    UncommittedProposalBudget* uncommittedBudget = nullptr) {
     RaftOptions o;
     o.electionTimeoutMin = o.electionTimeoutMax = (id == preferredLeader ? 2 : 30);
     o.heartbeatTimeout = 1;
     o.checkQuorum = checkQuorum;
+    o.uncommittedProposalBudget = uncommittedBudget;
     return o;
 }
 
@@ -166,7 +168,8 @@ std::string cmd(const std::string& key, double v) {
 
 // Boot a 3-voter group with node 1 preferred leader, elect it, and commit one write.
 seastar::future<> bootLedCluster(Nodes& nodes, std::vector<RouterTransport>& transports, Router& router,
-                                 bool checkQuorum, const std::string& tag) {
+                                 bool checkQuorum, const std::string& tag,
+                                 UncommittedProposalBudget* leaderBudget = nullptr) {
     transports.reserve(4);
     for (NodeId id : {1, 2, 3}) {
         transports.emplace_back(router);
@@ -175,7 +178,7 @@ seastar::future<> bootLedCluster(Nodes& nodes, std::vector<RouterTransport>& tra
         box->id = id;
         box->router = &router;
         box->transport = &transports.back();
-        co_await box->boot({1, 2, 3}, optsFor(id, 1, checkQuorum));
+        co_await box->boot({1, 2, 3}, optsFor(id, 1, checkQuorum, id == 1 ? leaderBudget : nullptr));
         nodes[id] = std::move(box);
     }
     co_await tickAndPump(nodes, router, 12);
@@ -293,6 +296,64 @@ seastar::future<> testCheckQuorumFailsWritesWithoutADeadline() {
     co_await teardown(nodes);
 }
 
+// CR-FIX-080: a timed-out request releases its waiter but deliberately leaves the
+// ambiguous entry in Raft. That durable tail now has an independent byte budget:
+// once full, another request must be refused before append, and healing must release
+// the charge so normal admission resumes.
+seastar::future<> testUncommittedTailIsBoundedAndRecovers() {
+    const std::string retained = cmd("retained", 4.0);
+    const size_t oneEntry = estimatedLogEntryBytes(retained.size());
+    UncommittedProposalBudget budget(/*shard limit=*/oneEntry * 2, /*per-group limit=*/oneEntry);
+    Router router;
+    std::vector<RouterTransport> transports;
+    Nodes nodes;
+    co_await bootLedCluster(nodes, transports, router, /*checkQuorum=*/false, "budget", &budget);
+    EXPECT_EQ(budget.current(), 0u) << "the healthy bootstrap/write must already be committed";
+
+    router.partition(2);
+    router.partition(3);
+    bool timedOut = false;
+    try {
+        co_await nodes[1]->group->proposeAndAwaitApplied(retained,
+                                                         seastar::lowres_clock::now() + std::chrono::milliseconds(100));
+    } catch (const seastar::timed_out_error&) {
+        timedOut = true;
+    }
+    EXPECT_TRUE(timedOut);
+    EXPECT_EQ(budget.current(), oneEntry);
+    EXPECT_EQ(nodes[1]->group->pendingApplyWaiters(), 0u);
+
+    const LogIndex beforeRefusal = nodes[1]->group->node().log().lastIndex();
+    data::WriteFailure kind = data::WriteFailure::None;
+    try {
+        (void)co_await nodes[1]->group->proposeAndAwaitApplied(cmd("refused", 5.0));
+        ADD_FAILURE() << "a full per-group tail budget accepted another proposal";
+    } catch (...) {
+        kind = data::classifyLocalWriteFailure(std::current_exception());
+    }
+    EXPECT_EQ(kind, data::WriteFailure::Overloaded);
+    EXPECT_TRUE(data::isRetryableWriteFailure(kind));
+    EXPECT_FALSE(data::isAmbiguousWriteFailure(kind));
+    EXPECT_EQ(nodes[1]->group->node().log().lastIndex(), beforeRefusal) << "budget refusal must happen before append";
+    EXPECT_EQ(budget.refusals(), 1u);
+
+    router.heal(2);
+    router.heal(3);
+    for (int i = 0; i < 400 && budget.current() != 0; ++i)
+        co_await tickAndPump(nodes, router, 1);
+    EXPECT_EQ(budget.current(), 0u) << "commit after healing must return the tail charge";
+
+    auto recovered = nodes[1]->group->proposeAndAwaitApplied(cmd("admitted-again", 6.0),
+                                                             seastar::lowres_clock::now() + std::chrono::seconds(2));
+    for (int i = 0; i < 400 && !recovered.available(); ++i)
+        co_await tickAndPump(nodes, router, 1);
+    EXPECT_TRUE(recovered.available());
+    if (recovered.available())
+        EXPECT_TRUE(co_await std::move(recovered));
+    EXPECT_EQ(budget.current(), 0u);
+    co_await teardown(nodes);
+}
+
 }  // namespace
 
 TEST(RaftProposeDeadlineTest, QuorumLossHangsUnboundedAndFailsWithinTheDeadline) {
@@ -300,4 +361,22 @@ TEST(RaftProposeDeadlineTest, QuorumLossHangsUnboundedAndFailsWithinTheDeadline)
 }
 TEST(RaftProposeDeadlineTest, CheckQuorumFailsAQuorumLessWriteOnItsOwn) {
     testCheckQuorumFailsWritesWithoutADeadline().get();
+}
+TEST(RaftProposeDeadlineTest, UncommittedTailRefusesBeforeAppendAndRecoversAfterHealing) {
+    testUncommittedTailIsBoundedAndRecovers().get();
+}
+TEST(RaftProposeDeadlineTest, SharedBudgetEnforcesAggregateAndPerGroupFairness) {
+    constexpr size_t charge = 100;
+    UncommittedProposalBudget budget(/*shard limit=*/charge * 2, /*per-group limit=*/charge);
+    EXPECT_TRUE(budget.allows(1, charge));
+    budget.update(1, charge);
+    EXPECT_FALSE(budget.allows(1, 1)) << "one hot group must not consume the shard";
+    EXPECT_TRUE(budget.allows(2, charge)) << "another group retains its fair share";
+    budget.update(2, charge);
+    EXPECT_FALSE(budget.allows(3, 1)) << "the aggregate cap must compose across groups";
+    EXPECT_EQ(budget.current(), charge * 2);
+    EXPECT_EQ(budget.peak(), charge * 2);
+    EXPECT_EQ(budget.refusals(), 2u);
+    budget.update(1, 0);
+    EXPECT_TRUE(budget.allows(3, charge));
 }

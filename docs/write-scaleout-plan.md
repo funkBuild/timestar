@@ -770,7 +770,14 @@ Only now is the Raft layer plausibly the limiter; re-profile first.
     lock, and the quorum-loss regression observes the waiter count return to its
     deliberately unbounded control. This bounds waiter metadata only; the
     ambiguous durable entry remains eligible to commit, and aggregate
-    uncommitted-log admission is tracked separately as CR-FIX-080.
+    uncommitted-log admission is tracked separately as CR-FIX-080. That
+    implementation is now present: each reactor shard shares a 64 MiB budget,
+    each group is capped at one maximal proposal, recovered tails are charged,
+    commit/truncation releases them, and a full budget returns typed pre-append
+    overload with current/peak/refusal status metrics. Deterministic regressions
+    prove refusal does not advance the log and healing restores admission. The
+    CR-FIX-080 row remains open only for its memory-bounded live RSS/journal
+    plateau measurement.
 
 5c. **(Deferred, design-only) VShard:group consolidation**: hosting 4096 Raft
     groups per node is the root of per-proposal and heartbeat overhead; a

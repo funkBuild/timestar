@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
+#include <map>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -56,12 +58,28 @@ struct LogEntry {
     friend bool operator==(const LogEntry&, const LogEntry&) = default;
 };
 
+// A stable accounting unit for the retained log tail. It deliberately counts the
+// entry object as well as its payload; allocator/vector slack is outside this logical
+// byte budget and is covered by the live RSS gate in CR-FIX-080.
+inline constexpr size_t estimatedLogEntryBytes(size_t payloadBytes) {
+    return payloadBytes > std::numeric_limits<size_t>::max() - sizeof(LogEntry) ? std::numeric_limits<size_t>::max()
+                                                                                : sizeof(LogEntry) + payloadBytes;
+}
+
 // A proposal too large to ever be delivered to a follower. Terminal, never retryable:
 // re-proposing the same bytes produces the same answer, and the point of throwing is that
 // the entry does NOT become durable first (write-scaleout 5 review, F3b).
 class ProposalTooLargeError : public std::runtime_error {
 public:
     explicit ProposalTooLargeError(const std::string& what) : std::runtime_error(what) {}
+};
+
+// The hosting reactor's aggregate or per-group uncommitted-log allowance is full.
+// Unlike LeadershipLostError, this is unambiguous: admission happens before the
+// entry is appended, so callers may safely retry after replication catches up.
+class ProposalBudgetExceededError : public std::runtime_error {
+public:
+    explicit ProposalBudgetExceededError(const std::string& what) : std::runtime_error(what) {}
 };
 
 // ===========================================================================
@@ -345,6 +363,80 @@ private:
     size_t active_ = 0;
     uint64_t nextTicket_ = 0;
     std::set<uint64_t> waiting_;
+};
+
+// ===========================================================================
+// THE SHARD-LEVEL UNCOMMITTED LOG BUDGET (CR-FIX-080)
+// ===========================================================================
+//
+// One reactor shard's aggregate locally materialized Raft tail above commit. A
+// quorum-less leader may keep accepting proposals while CheckQuorum is disabled;
+// client deadlines bound the calls, not the durable entries they appended. The
+// hosting shard gives every data group the same budget so 4,096 independent
+// per-group limits cannot multiply into process exhaustion. A second, smaller
+// per-group cap prevents a single hot partition from consuming the whole shard
+// allowance; required election/config entries and recovered tails are accounted
+// even when they take the gauges over either admission cap.
+class UncommittedProposalBudget {
+public:
+    UncommittedProposalBudget() = default;
+    explicit UncommittedProposalBudget(size_t limit, size_t perGroupLimit = 0)
+        : limit_(limit), perGroupLimit_(perGroupLimit) {}
+
+    bool allows(uint16_t groupId, size_t additionalBytes) {
+        const size_t groupCurrentBytes = groupCurrent(groupId);
+        if ((perGroupLimit_ != 0 &&
+             (additionalBytes > perGroupLimit_ || groupCurrentBytes > perGroupLimit_ - additionalBytes)) ||
+            (limit_ != 0 && (additionalBytes > limit_ || current_ > limit_ - additionalBytes))) {
+            ++refusals_;
+            return false;
+        }
+        return true;
+    }
+
+    // Replace one group's prior contribution with its freshly observed tail.
+    // Recovery and a required election no-op may legitimately put current above
+    // the admission limit; that existing state is counted, while new client
+    // proposals remain refused until commit/truncation brings it back down.
+    void update(uint16_t groupId, size_t currentBytes) {
+        auto previous = groups_.find(groupId);
+        const size_t previousBytes = previous == groups_.end() ? 0 : previous->second;
+        // Mutate the keyed contribution first. A first insertion can allocate and
+        // throw; doing it before the scalar adjustment keeps accounting unchanged
+        // if group construction fails.
+        if (currentBytes == 0) {
+            if (previous != groups_.end())
+                groups_.erase(previous);
+        } else if (previous == groups_.end()) {
+            groups_.emplace(groupId, currentBytes);
+        } else {
+            previous->second = currentBytes;
+        }
+        current_ = previousBytes <= current_ ? current_ - previousBytes : 0;
+        if (currentBytes > std::numeric_limits<size_t>::max() - current_)
+            current_ = std::numeric_limits<size_t>::max();
+        else
+            current_ += currentBytes;
+        peak_ = std::max(peak_, current_);
+    }
+
+    size_t groupCurrent(uint16_t groupId) const {
+        auto it = groups_.find(groupId);
+        return it == groups_.end() ? 0 : it->second;
+    }
+    size_t limit() const { return limit_; }
+    size_t perGroupLimit() const { return perGroupLimit_; }
+    size_t current() const { return current_; }
+    size_t peak() const { return peak_; }
+    uint64_t refusals() const { return refusals_; }
+
+private:
+    size_t limit_ = 0;
+    size_t perGroupLimit_ = 0;
+    size_t current_ = 0;
+    size_t peak_ = 0;
+    uint64_t refusals_ = 0;
+    std::map<uint16_t, size_t> groups_;
 };
 
 // The Raft-persistent voting state (durably fsync'd before any RPC that depends

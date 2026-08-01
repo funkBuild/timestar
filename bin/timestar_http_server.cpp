@@ -249,7 +249,13 @@ void set_routes(routes& r) {
                           ",\"journal_gc_passes\":" + std::to_string(st.journalGcPasses) +
                           ",\"journal_segments_deleted\":" + std::to_string(st.journalSegmentsDeleted) +
                           ",\"journal_segments_pinned_last_pass\":" + std::to_string(st.journalSegmentsPinnedLastPass) +
-                          ",\"journal_records_copied_forward\":" + std::to_string(st.journalRecordsCopiedForward);
+                          ",\"journal_records_copied_forward\":" + std::to_string(st.journalRecordsCopiedForward) +
+                          ",\"uncommitted_raft_bytes\":" + std::to_string(st.uncommittedRaftBytes) +
+                          ",\"uncommitted_raft_peak_bytes\":" + std::to_string(st.uncommittedRaftPeakBytes) +
+                          ",\"uncommitted_raft_limit_bytes\":" + std::to_string(st.uncommittedRaftLimitBytes) +
+                          ",\"uncommitted_raft_per_group_limit_bytes\":" +
+                          std::to_string(st.uncommittedRaftPerGroupLimitBytes) +
+                          ",\"uncommitted_raft_refusals\":" + std::to_string(st.uncommittedRaftRefusals);
                       body +=
                           ",\"control_enabled\":" + std::string(st.controlEnabled ? "true" : "false") +
                           ",\"control_hosted\":" + std::string(st.controlHosted ? "true" : "false") +

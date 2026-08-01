@@ -82,6 +82,28 @@ void maybeReport() {
 }
 }  // namespace
 
+RaftGroup::~RaftGroup() {
+    if (uncommittedProposalBudget_)
+        uncommittedProposalBudget_->update(groupId_, 0);
+}
+
+void RaftGroup::syncUncommittedBudget() {
+    if (uncommittedProposalBudget_)
+        uncommittedProposalBudget_->update(groupId_, node_.uncommittedLogBytes());
+}
+
+void RaftGroup::requireUncommittedBudget(size_t payloadBytes) {
+    if (!uncommittedProposalBudget_ ||
+        uncommittedProposalBudget_->allows(groupId_, estimatedLogEntryBytes(payloadBytes)))
+        return;
+    throw ProposalBudgetExceededError("raft: uncommitted proposal budget is full for group " +
+                                      std::to_string(groupId_) + " (group " +
+                                      std::to_string(uncommittedProposalBudget_->groupCurrent(groupId_)) + "/" +
+                                      std::to_string(uncommittedProposalBudget_->perGroupLimit()) + " bytes, shard " +
+                                      std::to_string(uncommittedProposalBudget_->current()) + "/" +
+                                      std::to_string(uncommittedProposalBudget_->limit()) + " bytes)");
+}
+
 seastar::future<> RaftGroup::drainReady() {
     // Precondition: caller holds lock_. Drain every pending Ready in order.
     while (node_.hasReady()) {
@@ -298,8 +320,11 @@ seastar::future<bool> RaftGroup::proposeAndAwaitApplied(std::string data,
     {
         auto units = co_await seastar::get_units(lock_, 1);
         const uint64_t tL0 = profileEnabled() ? nowNs() : 0;
+        if (node_.isLeader() && !node_.transferInFlight())
+            requireUncommittedBudget(data.size());
         if (!node_.propose(std::move(data)))
             co_return false;                           // not the leader (units released by the frame's unwind)
+        syncUncommittedBudget();
         const LogIndex idx = node_.log().lastIndex();  // the entry we just appended
         waiterIndex = idx;
         seastar::promise<bool> promise;
@@ -381,7 +406,13 @@ seastar::future<LogIndex> RaftGroup::readBarrier() {
 
 seastar::future<> RaftGroup::step(Message m) {
     auto units = co_await seastar::get_units(lock_, 1);
-    node_.step(std::move(m));
+    try {
+        node_.step(std::move(m));
+    } catch (...) {
+        syncUncommittedBudget();
+        throw;
+    }
+    syncUncommittedBudget();
     co_await drainReady();
 }
 
@@ -399,7 +430,11 @@ seastar::future<bool> RaftGroup::propose(std::string data) {
                                     " bytes exceeds the deliverable maximum of " + std::to_string(kMaxProposalBytes) +
                                     " bytes for group " + std::to_string(groupId_));
     auto units = co_await seastar::get_units(lock_, 1);
+    if (node_.isLeader() && !node_.transferInFlight())
+        requireUncommittedBudget(data.size());
     const bool ok = node_.propose(std::move(data));
+    if (ok)
+        syncUncommittedBudget();
     co_await drainReady();
     co_return ok;
 }
@@ -407,12 +442,15 @@ seastar::future<bool> RaftGroup::propose(std::string data) {
 seastar::future<> RaftGroup::campaign() {
     auto units = co_await seastar::get_units(lock_, 1);
     node_.campaign();
+    syncUncommittedBudget();
     co_await drainReady();
 }
 
 seastar::future<bool> RaftGroup::proposeConfChange(std::vector<NodeId> voters, std::vector<NodeId> learners) {
     auto units = co_await seastar::get_units(lock_, 1);
     const bool ok = node_.proposeConfChange(std::move(voters), std::move(learners));
+    if (ok)
+        syncUncommittedBudget();
     co_await drainReady();
     co_return ok;
 }
@@ -427,6 +465,7 @@ seastar::future<bool> RaftGroup::proposeConfChangeAndAwaitApplied(std::vector<No
         const LogIndex before = node_.log().lastIndex();
         if (!node_.proposeConfChange(std::move(voters), std::move(learners)))
             co_return false;
+        syncUncommittedBudget();
         // The one-voter fast path may commit the joint entry and synchronously
         // append final Cnew inside proposeConfChange(). Sampling lastIndex AFTER
         // the call therefore sometimes names the final entry, making the waiter
@@ -482,6 +521,7 @@ seastar::future<> RaftGroup::compact(LogIndex upto, std::string snapshotData) {
     auto units = co_await seastar::get_units(lock_, 1);
     const LogIndex before = node_.log().snapshotIndex();
     node_.compact(upto, std::move(snapshotData));
+    syncUncommittedBudget();
     // PERSIST THE PRODUCED SNAPSHOT (debt D-6). Found by the recovery test the moment the
     // producer had a caller at all.
     //

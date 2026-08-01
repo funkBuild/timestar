@@ -67,6 +67,27 @@ bool RaftNode::isVoter(NodeId n) const {
     return config_.isVoter(n);
 }
 
+size_t RaftNode::uncommittedLogBytes() const {
+    const LogIndex last = log_.lastIndex();
+    if (commitIndex_ >= last)
+        return 0;
+
+    size_t bytes = 0;
+    const LogIndex first = std::max(log_.firstIndex(), commitIndex_ + 1);
+    for (LogIndex index = first;; ++index) {
+        const LogEntry* entry = log_.entryAt(index);
+        if (entry) {
+            const size_t charge = estimatedLogEntryBytes(entry->data.size());
+            if (charge > std::numeric_limits<size_t>::max() - bytes)
+                return std::numeric_limits<size_t>::max();
+            bytes += charge;
+        }
+        if (index == last)
+            break;
+    }
+    return bytes;
+}
+
 bool RaftNode::isLearner(NodeId n) const {
     return config_.isLearner(n);
 }

@@ -136,6 +136,10 @@ seastar::future<> ReplicatedVShardHost::addVShard(uint16_t vshard, std::vector<N
     // The host outlives the registry (declaration order), so the pointer outlives every
     // RaftNode that holds it.
     opts.snapshotBudget = &snapshotBudget_;
+    // The same ownership rule applies to the aggregate uncommitted-log budget
+    // (CR-FIX-080). Recovery is accounted when RaftGroup is constructed below,
+    // before the group can accept a proposal or tick.
+    opts.uncommittedProposalBudget = &uncommittedProposalBudget_;
     VShardState vs;
     JournalSegmentHeader hdr;
     hdr.clusterUuid = journalIdentity_.clusterUuid;

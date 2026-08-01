@@ -1314,6 +1314,12 @@ seastar::future<ClusterDataPlane::Status> ClusterDataPlane::status() const {
         st.journalSegmentsPinnedLastPass += jc.segmentsPinnedLastPass;
         st.journalRecordsCopiedForward += jc.recordsCopiedForward;
         st.journalGcPasses += jc.gcPasses;
+        st.uncommittedRaftBytes += jc.uncommittedBytes;
+        st.uncommittedRaftPeakBytes += jc.uncommittedPeakBytes;
+        st.uncommittedRaftLimitBytes += jc.uncommittedLimitBytes;
+        st.uncommittedRaftPerGroupLimitBytes =
+            std::max<uint64_t>(st.uncommittedRaftPerGroupLimitBytes, jc.uncommittedPerGroupLimitBytes);
+        st.uncommittedRaftRefusals += jc.uncommittedRefusals;
         st.journalShared = st.journalShared || jc.shared;
     }
     if (st.activeClusterFormat == std::numeric_limits<uint32_t>::max())

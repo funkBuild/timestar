@@ -291,6 +291,14 @@ public:
         uint64_t journalSegmentsPinnedLastPass = 0;
         uint64_t journalRecordsCopiedForward = 0;
         uint64_t journalGcPasses = 0;
+        // Locally materialized Raft entries above commit, across this node's
+        // reactor shards (CR-FIX-080). Refusals happen before append and are
+        // therefore unambiguous, retryable overload rather than unknown writes.
+        uint64_t uncommittedRaftBytes = 0;
+        uint64_t uncommittedRaftPeakBytes = 0;
+        uint64_t uncommittedRaftLimitBytes = 0;
+        uint64_t uncommittedRaftPerGroupLimitBytes = 0;
+        uint64_t uncommittedRaftRefusals = 0;
         bool journalShared = false;
 
         // Group-0 health is deliberately separate from readyForTraffic(): an
