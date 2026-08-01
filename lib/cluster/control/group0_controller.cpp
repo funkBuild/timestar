@@ -116,15 +116,26 @@ seastar::future<bool> Group0Controller::reconcileMetaVoters() {
     // Copy (not alias) the live config: proposeConfChange mutates it on append.
     const std::vector<NodeId> current = g0_.node().config().voters;
     const std::vector<NodeId> desired = selectMetaVoters(sm_.state().nodes, current, metaTarget_);
-    if (desired.empty() || !metaVotersDiffer(current, desired))
+    if (desired.empty())
         co_return false;
     // Self-managed membership: the actual voter change is a joint-consensus
     // group-0 configuration entry; the SetMetaVoters command only mirrors the
     // result into the state machine for readers (config entries are not applied
     // to the SM).
-    const bool changed = co_await g0_.proposeConfChange(desired, /*learners=*/{});
-    if (changed)
-        co_await proposeCommand(SetMetaVoters{desired});
+    bool changed = false;
+    if (metaVotersDiffer(current, desired)) {
+        changed = co_await g0_.proposeConfChangeAndAwaitApplied(desired, /*learners=*/{});
+        if (!changed)
+            co_return false;
+    }
+    // Repair the state-machine mirror even when another controller committed
+    // the real config and lost leadership before it could publish the mirror.
+    // This proposal is ordered after the applied final configuration.
+    if (metaVotersDiffer(sm_.state().metaVoters, desired)) {
+        if (!co_await proposeCommand(SetMetaVoters{desired}))
+            throw raft::LeadershipLostError("group0 membership committed but voter mirror was not published");
+        changed = true;
+    }
     co_return changed;
 }
 

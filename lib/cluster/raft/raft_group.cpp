@@ -170,6 +170,7 @@ seastar::future<> RaftGroup::drainReady() {
         // Resolve write waiters whose entry we have now applied (or fail them all
         // if we just lost leadership).
         releaseApplyWaiters();
+        releaseConfigWaiters();
         // Resolve role-agnostic apply waiters (replica reads) we have caught up to.
         releaseAppliedWaiters();
 
@@ -216,6 +217,26 @@ void RaftGroup::releaseApplyWaiters() {
         if (appliedIndex_ >= it->first) {
             it->second.set_value(true);
             it = applyWaiters_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void RaftGroup::releaseConfigWaiters() {
+    for (auto it = configWaiters_.begin(); it != configWaiters_.end();) {
+        if (appliedIndex_ >= it->index) {
+            if (node_.config() == it->expected) {
+                it->promise.set_value(true);
+            } else {
+                it->promise.set_exception(std::make_exception_ptr(
+                    LeadershipLostError("membership proposal was superseded before its final config applied")));
+            }
+            it = configWaiters_.erase(it);
+        } else if (!node_.isLeader()) {
+            it->promise.set_exception(
+                std::make_exception_ptr(LeadershipLostError("membership leadership lost before final config")));
+            it = configWaiters_.erase(it);
         } else {
             ++it;
         }
@@ -371,6 +392,44 @@ seastar::future<bool> RaftGroup::proposeConfChange(std::vector<NodeId> voters, s
     const bool ok = node_.proposeConfChange(std::move(voters), std::move(learners));
     co_await drainReady();
     co_return ok;
+}
+
+seastar::future<bool> RaftGroup::proposeConfChangeAndAwaitApplied(std::vector<NodeId> voters,
+                                                                  std::vector<NodeId> learners) {
+    Config expected{voters, /*votersOutgoing=*/{}, learners};
+    std::optional<seastar::future<bool>> jointApplied;
+    LogIndex jointIndex = kNoIndex;
+    {
+        auto units = co_await seastar::get_units(lock_, 1);
+        if (!node_.proposeConfChange(std::move(voters), std::move(learners)))
+            co_return false;
+        jointIndex = node_.log().lastIndex();
+        seastar::promise<bool> promise;
+        jointApplied = promise.get_future();
+        applyWaiters_.emplace_back(jointIndex, std::move(promise));
+        co_await drainReady();
+    }
+
+    // The core appends final Cnew synchronously when the joint entry commits.
+    // Waiting for the joint entry first gives this wrapper the final entry's
+    // stable index without polling or guessing.
+    co_await std::move(*jointApplied);
+
+    std::optional<seastar::future<bool>> finalApplied;
+    {
+        auto units = co_await seastar::get_units(lock_, 1);
+        const LogIndex finalIndex = node_.latestConfigIndex();
+        if (node_.config().joint() || node_.config() != expected || finalIndex <= jointIndex)
+            throw LeadershipLostError("membership proposal lost leadership before final config was appended");
+        if (appliedIndex_ >= finalIndex)
+            co_return true;
+        if (!node_.isLeader())
+            throw LeadershipLostError("membership leadership lost before final config applied");
+        seastar::promise<bool> promise;
+        finalApplied = promise.get_future();
+        configWaiters_.push_back(ConfigApplyWaiter{finalIndex, std::move(expected), std::move(promise)});
+    }
+    co_return co_await std::move(*finalApplied);
 }
 
 seastar::future<bool> RaftGroup::transferLeadership(NodeId target, bool* armed) {

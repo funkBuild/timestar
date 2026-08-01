@@ -358,6 +358,13 @@ seastar::future<> testFormatActivationGatedByVoterSupport() {
     EXPECT_TRUE(co_await controller.activateFormat(5, {timestar::features::VersionRange{1, 5}}));
     co_await router.pump();
     EXPECT_EQ(nodes[1].sm->state().activeFormatVersion, 5u);
+
+    // A controller that committed the real config and then lost leadership can
+    // leave only the state-machine mirror stale. The next reconcile repairs it
+    // even though no further Raft membership transition is needed.
+    EXPECT_TRUE(co_await controller.proposeCommand(SetMetaVoters{{9}}));
+    EXPECT_TRUE(co_await controller.reconcileMetaVoters());
+    EXPECT_EQ(nodes[1].sm->state().metaVoters, (std::vector<NodeId>{1}));
 }
 
 }  // namespace

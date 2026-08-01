@@ -121,15 +121,21 @@ public:
     void enqueue(Envelope e) { queue_.push_back(std::move(e)); }
 
     // Deliver all queued envelopes (and any they cascade) until quiescent.
+    seastar::future<bool> pumpOne() {
+        if (queue_.empty())
+            co_return false;
+        Envelope e = std::move(queue_.front());
+        queue_.pop_front();
+        auto it = groups_.find(e.message.to);
+        if (it != groups_.end())
+            co_await it->second->step(std::move(e.message));
+        co_return true;
+    }
+
     seastar::future<> pump() {
         int guard = 0;
-        while (!queue_.empty() && guard++ < 100000) {
-            Envelope e = std::move(queue_.front());
-            queue_.pop_front();
-            auto it = groups_.find(e.message.to);
-            if (it != groups_.end())
-                co_await it->second->step(std::move(e.message));
-        }
+        while (!queue_.empty() && guard++ < 100000)
+            co_await pumpOne();
     }
 
     seastar::future<> tickAll() {
@@ -285,6 +291,52 @@ seastar::future<> testConfChangeThroughDriver() {
     EXPECT_EQ(net.group(1).node().config().voters, (std::vector<NodeId>{1, 2}));
 }
 
+seastar::future<> testAwaitedConfChangeDoesNotAckAtTheJointBoundary() {
+    GroupNetwork net({1, 2, 3}, opts());
+    co_await net.group(1).campaign();
+    co_await net.pump();
+    EXPECT_EQ(net.leader(), 1u);
+
+    const LogIndex before = net.group(1).node().log().lastIndex();
+    auto changing = net.group(1).proposeConfChangeAndAwaitApplied({1, 2}, {});
+    co_await seastar::yield();
+    const LogIndex jointIndex = before + 1;
+
+    // Deliver only until the joint entry applies. The core has appended final
+    // Cnew by this point, but it has not necessarily committed it. This is the
+    // exact boundary the old controller incorrectly treated as success.
+    for (int i = 0; i < 100 && net.group(1).appliedIndex() < jointIndex; ++i) {
+        EXPECT_TRUE(co_await net.pumpOne());
+        co_await seastar::yield();
+    }
+    EXPECT_EQ(net.group(1).appliedIndex(), jointIndex);
+    EXPECT_GT(net.group(1).node().latestConfigIndex(), jointIndex);
+    EXPECT_FALSE(changing.available()) << "membership must wait for applied final Cnew";
+
+    co_await net.pump();
+    co_await seastar::yield();
+    EXPECT_TRUE(co_await std::move(changing));
+    EXPECT_FALSE(net.group(1).node().config().joint());
+    EXPECT_EQ(net.group(1).node().config().voters, (std::vector<NodeId>{1, 2}));
+}
+
+seastar::future<> testAwaitedConfChangeSucceedsWhenFinalConfigRemovesLeader() {
+    GroupNetwork net({1, 2, 3}, opts());
+    co_await net.group(1).campaign();
+    co_await net.pump();
+    EXPECT_EQ(net.leader(), 1u);
+
+    auto removingSelf = net.group(1).proposeConfChangeAndAwaitApplied({2, 3}, {});
+    co_await seastar::yield();
+    EXPECT_FALSE(removingSelf.available());
+    co_await net.pump();
+    co_await seastar::yield();
+
+    EXPECT_TRUE(co_await std::move(removingSelf));
+    EXPECT_FALSE(net.group(1).isLeader());
+    EXPECT_EQ(net.group(1).node().config().voters, (std::vector<NodeId>{2, 3}));
+}
+
 // THE DRIVER MUST PROPAGATE "did a transfer actually start?" (debt D-24). The balancer's
 // `transfers_initiated` counter reaches RaftNode through THIS seam, so a driver that
 // swallowed the answer would leave the counter inflated no matter what the core reports --
@@ -361,4 +413,12 @@ TEST(RaftGroupTest, SnapshotApplyLagSpansTheWholeStateMachineInstall) {
 
 TEST(RaftGroupTest, ConfigChangeThroughTheAsyncDriver) {
     testConfChangeThroughDriver().get();
+}
+
+TEST(RaftGroupTest, AwaitedConfigChangeDoesNotAckAtTheJointBoundary) {
+    testAwaitedConfChangeDoesNotAckAtTheJointBoundary().get();
+}
+
+TEST(RaftGroupTest, AwaitedConfigChangeSucceedsWhenFinalConfigRemovesLeader) {
+    testAwaitedConfChangeSucceedsWhenFinalConfigRemovesLeader().get();
 }

@@ -46,7 +46,10 @@ public:
 
     // Recompute the desired meta voters and, if they differ from the current
     // group-0 configuration, drive a joint-consensus membership change and mirror
-    // the new set into the state machine. Returns true iff a change was proposed.
+    // the new set into the state machine. The acknowledgement waits for final
+    // Cnew to apply, not merely for the joint entry to append. It also repairs a
+    // stale mirror left by a controller that lost leadership after committing
+    // the real configuration. Returns true iff reconciliation work committed.
     seastar::future<bool> reconcileMetaVoters();
 
     // Stamp the controller epoch (= our current group-0 term) into state the

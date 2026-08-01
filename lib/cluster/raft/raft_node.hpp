@@ -318,6 +318,7 @@ public:
     bool isVoter(NodeId n) const;
     bool isLearner(NodeId n) const;
     const Config& config() const { return config_; }
+    LogIndex latestConfigIndex() const { return latestConfigIndex_; }
 
     // Highest log index this leader knows is replicated on `peer` (0 if unknown --
     // no entry acked yet, or `peer` is not a member). Meaningful only on the leader.

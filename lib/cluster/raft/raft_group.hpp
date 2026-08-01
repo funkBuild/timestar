@@ -81,6 +81,11 @@ public:
                                                  std::optional<seastar::lowres_clock::time_point> deadline);
     seastar::future<> campaign();
     seastar::future<bool> proposeConfChange(std::vector<NodeId> voters, std::vector<NodeId> learners);
+    // Propose a joint-consensus transition and acknowledge only after the
+    // automatically appended final Cnew entry is committed and applied. A
+    // successful removal of this node may make it a follower at that instant.
+    seastar::future<bool> proposeConfChangeAndAwaitApplied(std::vector<NodeId> voters,
+                                                           std::vector<NodeId> learners);
     // true iff a transfer was actually ARMED by this call (debt D-24); see
     // RaftNode::transferLeadership for the early returns that answer false.
     //
@@ -165,6 +170,9 @@ private:
     // Resolve any proposeAndAwaitApplied waiters whose entry this node has now
     // applied; fail all of them on leadership loss (same contract as read barriers).
     void releaseApplyWaiters();
+    // Resolve membership waiters at the applied FINAL config, including when
+    // that config itself removes this node; fail unrelated leadership loss.
+    void releaseConfigWaiters();
     // Resolve any waitApplied waiters this node has now applied through (any role;
     // never failed on role change).
     void releaseAppliedWaiters();
@@ -191,6 +199,13 @@ private:
     // proposeAndAwaitApplied tracking: (entry index -> caller promise). Resolved
     // true once appliedIndex_ >= index while leader; failed on leadership loss.
     std::vector<std::pair<LogIndex, seastar::promise<bool>>> applyWaiters_;
+
+    struct ConfigApplyWaiter {
+        LogIndex index = kNoIndex;
+        Config expected;
+        seastar::promise<bool> promise;
+    };
+    std::vector<ConfigApplyWaiter> configWaiters_;
 
     // waitApplied tracking: (index -> caller promise). Resolved (value) once
     // appliedIndex_ >= index, regardless of role; never failed on role change.
