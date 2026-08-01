@@ -7,7 +7,7 @@
 **Remediation commits:** `95c10d2`, `a16b03a`, `d578e81`, `ddab705`,
 `8620b9e`, `20639dc`, `ea2511b`, `3ac9899`, `69ac879`, `09a62c5`,
 `2e06cb8`, `7151f5d`, `5b22b81`, `fef4886`, `3d2d607`, `f0e28f0`,
-`da55952`, `a1beb94`
+`da55952`, `a1beb94`, `bb5b871`
 
 **Scope:** The recent VShard/Raft cluster redesign, its production-server
 integration, the public HTTP surface, recovery paths, and the release evidence
@@ -20,7 +20,7 @@ used as evidence that the current server is production-ready.
 
 ## Implementation progress after the review
 
-Eighteen remediation commits are now recorded. Cluster release status remains
+Nineteen remediation commits are now recorded. Cluster release status remains
 **BLOCKED** because group 0/movement, generation-atomic live snapshot
 replacement, pattern-delete expansion, replicated retention, the large-snapshot
 path, and rolling wire-format compatibility remain open. The four previously
@@ -133,6 +133,11 @@ Completed and covered in this pass:
   success. Per-TSM mutation serialization keeps concurrent deletes from changing
   the range vectors or publication paths while another flush is suspended. A
   directory-sync failure remains dirty and is safe to retry.
+- WAL segment creation now syncs the containing directory before the segment can
+  accept acknowledged writes. Live and startup-recovery retirement unlink
+  idempotently and sync the directory before reporting success. A retirement
+  retry remembers that its TSM is already durable and registered, so it retries
+  only the WAL barrier instead of colliding with a duplicate immutable rank.
 
 Focused evidence on this pass includes the rebuilt server, unit and socket test
 targets, journal negative tests, alternate-replica routing tests, a black-holed
@@ -141,7 +146,7 @@ identity/topology tests, and pre-proposal admission tests. The strict checkboxes
 below stay open where their stated multi-process or fault-injection “done when”
 evidence has not yet been run.
 
-Final local validation for these remediation commits is green: 4,357/4,357 unit
+Final local validation for these remediation commits is green: 4,360/4,360 unit
 tests passed with no skips, 45/45 socket-backed cluster tests passed, the
 first-pass 56/56 focused
 cluster/readiness/identity/admission regressions passed, and the second-pass
@@ -213,6 +218,7 @@ item are recorded in the fix-up list.
 | CR-25 | P0 | TSM source retirement deleted tombstones before the source and swallowed source-unlink failures | A failed unlink or crash could reload the raw source without its deletion ranges; pinned readers could also stop filtering deleted points during compaction. |
 | CR-26 | P0 | TSM open discarded invalid or unreadable tombstone sidecars | Startup could serve durably deleted points from the raw immutable file instead of fencing an incomplete logical generation. |
 | CR-27 | P0 | Tombstone rewrites truncated the live sidecar and were not serialized or directory-durable | A crash or concurrent delete could corrupt the only durable delete set, lose an acknowledged sidecar name, or publish incomplete ranges. |
+| CR-28 | P0 | WAL creation and retirement omitted directory durability and post-publication retries rewrote the TSM | A crash could lose an acknowledged segment or resurrect a converted source; a cleanup retry could then collide with its already-live immutable rank. |
 
 ### CR-01 — deletes bypass consensus
 
@@ -354,6 +360,29 @@ cannot race an in-flight delete. Injected directory-sync failure proves the
 complete renamed file remains retryable, and a held first sync proves a second
 delete cannot enter publication until the first finishes; both ranges survive
 close and reopen.
+
+### CR-28 — WAL names were not crash-durable across creation or retirement
+
+[`WAL::init`](../lib/storage/wal.cpp) created each new segment but did not sync
+its containing directory before writes could be acknowledged. Fdatasyncing the
+file contents alone therefore did not complete the new-name durability
+boundary. [`WAL::remove`](../lib/storage/wal.cpp) and the separate startup
+recovery cleanup unlinked converted segments without syncing the directory, so
+a crash could make an old WAL name reappear after its TSM handoff. The live
+conversion retry path had a second defect: if TSM publication succeeded but WAL
+retirement failed, retry called `writeMemstore` again and collided with the TSM
+rank it had already registered instead of retrying cleanup.
+
+Commit `bb5b871` syncs the parent directory during WAL initialisation before the
+segment is usable and closes the opened descriptor if that barrier fails. Live
+and recovered-source removal now use an idempotent existence-check, unlink, and
+directory-sync sequence; an unlink-success/sync-failure retry repeats the
+barrier even though the path is already absent, and startup recovery does not
+report success before it completes. `MemoryStore` retains the successful TSM
+handoff state so a live conversion retry skips publication and performs only
+WAL retirement.
+Injected failures cover creation cleanup, live unlink retry, recovery-startup
+refusal, and one-rank preservation across the post-publication retry.
 
 ### CR-02 and CR-03 — snapshot contents and live installation were unsafe
 
@@ -664,6 +693,11 @@ is not completion.
   file, atomic rename, and parent-directory sync; per-TSM serialization spans
   mutation through durable publication and cleanup. Injected sync failure and
   concurrent-delete reopen regressions cover retry and complete range survival.
+- [x] **CR-FIX-019D — make WAL creation and retirement directory-durable and
+  retryable.** Owner: storage. New segment names sync before use; live and
+  recovered source unlinks sync before success and tolerate a retry after the
+  name is absent. A post-publication retry skips the already-registered TSM and
+  completes only the WAL retirement barrier.
 
 ### 2. Complete control-plane and identity wiring
 
@@ -999,6 +1033,17 @@ Atomic tombstone-publication validation for `a1beb94`:
 focused publication/retry/concurrency tests: 15/15 passed
 related manager/tombstone/compactor tests:  135/135 passed
 current full unit suite:                  4357/4357 passed (444 suites, -c 2)
+current socket-backed cluster suite:        45/45 passed (8 suites, -c 2)
+timestar_http_server:                       built successfully
+git diff --check:                           passed
+```
+
+WAL lifecycle durability validation for `bb5b871`:
+
+```text
+focused lifecycle/source-boundary checks:    4/4 passed
+related WAL/conversion/storage tests:      138/138 passed
+current full unit suite:                  4360/4360 passed (444 suites, -c 2)
 current socket-backed cluster suite:        45/45 passed (8 suites, -c 2)
 timestar_http_server:                       built successfully
 git diff --check:                           passed
