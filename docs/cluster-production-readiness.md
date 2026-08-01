@@ -8,7 +8,7 @@
 `8620b9e`, `20639dc`, `ea2511b`, `3ac9899`, `69ac879`, `09a62c5`,
 `2e06cb8`, `7151f5d`, `5b22b81`, `fef4886`, `3d2d607`, `f0e28f0`,
 `da55952`, `a1beb94`, `bb5b871`, `e201343`, `6ad2c93`, `9a42d84`,
-`41fdc34`, `a58d2a9`, `6a73809`, `81692a4`, `d363348`
+`41fdc34`, `a58d2a9`, `6a73809`, `81692a4`, `d363348`, `2749027`
 
 **Scope:** The recent VShard/Raft cluster redesign, its production-server
 integration, the public HTTP surface, recovery paths, and the release evidence
@@ -21,7 +21,7 @@ used as evidence that the current server is production-ready.
 
 ## Implementation progress after the review
 
-Twenty-seven remediation commits are now recorded. Cluster release status remains
+Twenty-eight remediation commits are now recorded. Cluster release status remains
 **BLOCKED** because group 0/movement, generation-atomic live snapshot
 replacement, pattern-delete expansion, replicated retention, the large-snapshot
 path, and rolling wire-format compatibility remain open. The four previously
@@ -186,6 +186,12 @@ Completed and covered in this pass:
   the untrusted bloom and validate every CRC-protected data block against the
   index before serving. Compaction preserves a durable output across an
   ambiguous manifest-publication failure and syncs obsolete-name cleanup.
+- NativeIndex startup now reconciles the complete SSTable namespace against the
+  recovered manifest before serving or flushing replayed WAL state. Canonical
+  unreferenced flush/compaction outputs and stale manifest temporaries are
+  unlinked with a mandatory directory barrier. Non-canonical names, symlinks,
+  directories, and other ambiguous artifacts are preserved and fence startup;
+  manifest-live generations are never selected for cleanup.
 
 Focused evidence on this pass includes the rebuilt server, unit and socket test
 targets, journal negative tests, alternate-replica routing tests, a black-holed
@@ -194,8 +200,8 @@ identity/topology tests, and pre-proposal admission tests. The strict checkboxes
 below stay open where their stated multi-process or fault-injection “done when”
 evidence has not yet been run.
 
-Final local validation for these remediation commits is green: all 4,401 unit
-tests completed successfully (4,392 passed and 9 pre-existing SMP-dependent
+Final local validation for these remediation commits is green: all 4,405 unit
+tests completed successfully (4,396 passed and 9 pre-existing SMP-dependent
 tests skipped), 45/45 socket-backed cluster tests passed, the
 first-pass 56/56 focused
 cluster/readiness/identity/admission regressions passed, and the second-pass
@@ -276,6 +282,7 @@ item are recorded in the fix-up list.
 | CR-34 | P0 | TSM discovery accepted numeric-prefix aliases and rank allocation exceeded its 60-bit identity space | Malformed or symlinked immutable files could enter recovery under the wrong identity; an out-of-range data generation could register and fail later queries, while exhaustion could publish an unusable TSM and strand its source WAL. |
 | CR-35 | P0 | NativeIndex WAL recovery aliased or skipped durable generations and discarded complete corruption | Acknowledged catalog/postings mutations could disappear while startup served an incomplete index; a colliding fresh generation could also truncate the last durable copy. |
 | CR-36 | P0 | NativeIndex manifest/SSTable recovery omitted or destroyed durable generations | Complete manifest corruption could be rewritten as a clean prefix, missing/swapped or metadata-corrupt SSTables could be served as an incomplete index, and compaction could delete a durable output after an ambiguous manifest publication. |
+| CR-37 | P0 | NativeIndex startup ignored unreferenced and ambiguous SSTable-namespace artifacts | Crash outputs and obsolete compaction sources could accumulate to disk exhaustion, while a malformed or non-regular possible durable generation was silently omitted instead of fencing incomplete recovery. |
 
 ### CR-01 — deletes bypass consensus
 
@@ -633,6 +640,31 @@ source cleanup includes a parent-directory barrier. Regressions cover complete
 manifest corruption and preservation, malformed records, bad magic, exhaustion,
 symlink collisions, missing/swapped SSTables, metadata corruption, v1 migration
 safety, and publication failure after durable output creation.
+
+### CR-37 — NativeIndex startup did not reconcile its SSTable namespace
+
+The manifest is authoritative for live NativeIndex generations, but startup
+previously inspected only the files named by it. A crash after an SSTable became
+durable but before manifest publication could therefore leave an unreferenced
+canonical output forever. Successful compaction could likewise strand obsolete
+sources when post-publication unlink failed. Repeated failures could consume the
+volume. More importantly, non-canonical names and non-regular paths were ignored
+even though they might represent damaged or partially renamed durable state, so
+the node could serve without proving that the on-disk index namespace was
+complete.
+
+Commit `2749027` scans the entire NativeIndex directory after strict manifest and
+live-SSTable validation but before WAL recovery can flush or the index can serve.
+It validates the whole namespace before mutating it, preserves every
+manifest-listed generation, removes only exact canonical unreferenced SSTables
+and a regular stale `MANIFEST.tmp`, then always syncs the directory. Unknown
+names, symlinks, and other non-regular entries are preserved and fence startup.
+The reconciliation remains startup-only because an ambiguous live manifest
+fsync can leave the in-memory manifest older than the durable manifest; using
+that stale in-memory view for a runtime sweep could delete a generation required
+on restart. Regressions cover partial and complete orphan outputs, live-file
+preservation and queryability, malformed-name fail-closed behavior, symlink
+target preservation, and stale manifest-temporary cleanup.
 
 ### CR-02 and CR-03 — snapshot contents and live installation were unsafe
 
@@ -992,6 +1024,11 @@ is not completion.
   disables the untrusted bloom and validates index/data agreement before use.
   Compaction retains a durable output across ambiguous manifest publication and
   syncs obsolete-name cleanup.
+- [x] **CR-FIX-019M — reconcile the NativeIndex recovery namespace.** Owner:
+  storage. Startup validates every index-directory entry against the recovered
+  manifest before serving, durably reclaims only canonical unreferenced outputs
+  and stale manifest temporaries, preserves live generations, and fails closed
+  without following or deleting ambiguous paths.
 
 ### 2. Complete control-plane and identity wiring
 
@@ -1431,4 +1468,16 @@ current socket-backed cluster suite:                  45/45 successful
   passed/skipped:                                     43/2 (8 suites, -c 1)
 timestar_http_server:                                 built successfully
 git diff --check:                                     passed
+```
+
+NativeIndex namespace reconciliation validation for `2749027`:
+
+```text
+focused WAL/manifest/SSTable/compaction recovery suites: 68/68 passed
+current full unit suite:                                4405/4405 successful
+  passed/skipped:                                       4396/9 (444 suites, -c 1)
+current socket-backed cluster suite:                      45/45 successful
+  passed/skipped:                                         43/2 (8 suites, -c 1)
+timestar_http_server:                                     built successfully
+git diff --check:                                         passed
 ```
