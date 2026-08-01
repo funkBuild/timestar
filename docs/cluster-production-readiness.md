@@ -7,7 +7,7 @@
 **Remediation commits:** `95c10d2`, `a16b03a`, `d578e81`, `ddab705`,
 `8620b9e`, `20639dc`, `ea2511b`, `3ac9899`, `69ac879`, `09a62c5`,
 `2e06cb8`, `7151f5d`, `5b22b81`, `fef4886`, `3d2d607`, `f0e28f0`,
-`da55952`
+`da55952`, `a1beb94`
 
 **Scope:** The recent VShard/Raft cluster redesign, its production-server
 integration, the public HTTP surface, recovery paths, and the release evidence
@@ -20,7 +20,7 @@ used as evidence that the current server is production-ready.
 
 ## Implementation progress after the review
 
-Seventeen remediation commits are now recorded. Cluster release status remains
+Eighteen remediation commits are now recorded. Cluster release status remains
 **BLOCKED** because group 0/movement, generation-atomic live snapshot
 replacement, pattern-delete expansion, replicated retention, the large-snapshot
 path, and rolling wire-format compatibility remain open. The four previously
@@ -128,6 +128,11 @@ Completed and covered in this pass:
   generation's logical contents. Corrupt, unsupported, or unreadable sidecars
   abort open and registration instead of logging a warning and serving the raw
   TSM without its durable deletions.
+- Tombstone publication now writes and fdatasyncs a temporary sidecar, atomically
+  renames it over the live name, and syncs the parent directory before reporting
+  success. Per-TSM mutation serialization keeps concurrent deletes from changing
+  the range vectors or publication paths while another flush is suspended. A
+  directory-sync failure remains dirty and is safe to retry.
 
 Focused evidence on this pass includes the rebuilt server, unit and socket test
 targets, journal negative tests, alternate-replica routing tests, a black-holed
@@ -136,7 +141,7 @@ identity/topology tests, and pre-proposal admission tests. The strict checkboxes
 below stay open where their stated multi-process or fault-injection “done when”
 evidence has not yet been run.
 
-Final local validation for these remediation commits is green: 4,354/4,354 unit
+Final local validation for these remediation commits is green: 4,357/4,357 unit
 tests passed with no skips, 45/45 socket-backed cluster tests passed, the
 first-pass 56/56 focused
 cluster/readiness/identity/admission regressions passed, and the second-pass
@@ -207,6 +212,7 @@ item are recorded in the fix-up list.
 | CR-24 | P0 | TSM registration swallowed open/index failures and silently selected one duplicate rank | WAL conversion could delete its recoverable source after failing to register the output; restart could serve a partial or filesystem-order-dependent dataset. |
 | CR-25 | P0 | TSM source retirement deleted tombstones before the source and swallowed source-unlink failures | A failed unlink or crash could reload the raw source without its deletion ranges; pinned readers could also stop filtering deleted points during compaction. |
 | CR-26 | P0 | TSM open discarded invalid or unreadable tombstone sidecars | Startup could serve durably deleted points from the raw immutable file instead of fencing an incomplete logical generation. |
+| CR-27 | P0 | Tombstone rewrites truncated the live sidecar and were not serialized or directory-durable | A crash or concurrent delete could corrupt the only durable delete set, lose an acknowledged sidecar name, or publish incomplete ranges. |
 
 ### CR-01 — deletes bypass consensus
 
@@ -328,6 +334,26 @@ closes the data file before rethrowing, and the sidecar reader already closes
 its descriptor on every exit. A real manager-startup regression pairs a valid
 TSM with a corrupt sidecar and proves the generation never becomes live; valid
 sidecar persistence and reload remain covered.
+
+### CR-27 — tombstone publication was neither atomic nor serialized
+
+[`TSMTombstone::flush`](../lib/storage/tsm_tombstone.cpp) opened the live
+`.tombstone` path with `truncate` and rewrote it across multiple suspending I/O
+operations. A crash after truncation could leave the only durable delete set
+partial or checksum-invalid. The publication also omitted a parent-directory
+sync, so even a fully flushed first sidecar or replacement was not a complete
+crash-durability boundary. Finally, separate `TSM::deleteRange` coroutines could
+mutate the same range vectors and enter flush concurrently while either was
+suspended.
+
+Commit `a1beb94` writes a fixed per-TSM temporary sidecar, fdatasyncs and closes
+it, atomically renames it over the live name, and syncs the parent directory
+before clearing the dirty state. The full logical mutation and publication are
+guarded by a per-TSM semaphore, as are sidecar load and retirement, so cleanup
+cannot race an in-flight delete. Injected directory-sync failure proves the
+complete renamed file remains retryable, and a held first sync proves a second
+delete cannot enter publication until the first finishes; both ranges survive
+close and reopen.
 
 ### CR-02 and CR-03 — snapshot contents and live installation were unsafe
 
@@ -633,6 +659,11 @@ is not completion.
   storage. A present tombstone sidecar must load and validate before its TSM can
   be registered. Corrupt-sidecar startup proves the failure propagates without
   exposing raw points; valid sidecars still reload and filter normally.
+- [x] **CR-FIX-019C — make tombstone mutation publication atomic, serialized,
+  and directory-durable.** Owner: storage. Sidecars publish by synced temporary
+  file, atomic rename, and parent-directory sync; per-TSM serialization spans
+  mutation through durable publication and cleanup. Injected sync failure and
+  concurrent-delete reopen regressions cover retry and complete range survival.
 
 ### 2. Complete control-plane and identity wiring
 
@@ -960,4 +991,15 @@ current full unit suite:               4354/4354 passed (444 suites, -c 2)
 current socket-backed cluster suite:      45/45 passed (8 suites, -c 2)
 timestar_http_server:                     built successfully
 git diff --check:                         passed
+```
+
+Atomic tombstone-publication validation for `a1beb94`:
+
+```text
+focused publication/retry/concurrency tests: 15/15 passed
+related manager/tombstone/compactor tests:  135/135 passed
+current full unit suite:                  4357/4357 passed (444 suites, -c 2)
+current socket-backed cluster suite:        45/45 passed (8 suites, -c 2)
+timestar_http_server:                       built successfully
+git diff --check:                           passed
 ```
