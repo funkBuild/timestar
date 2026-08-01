@@ -2,7 +2,9 @@
 
 **Status:** BLOCKED — no clustered deployment mode is approved for production
 
-**Reviewed tree:** `cluster-design` at `f78e05d` (2026-08-01)
+**Reviewed baseline:** `cluster-design` at `f78e05d` (2026-08-01)
+
+**Remediation commits:** `95c10d2`, `a16b03a`
 
 **Scope:** The recent VShard/Raft cluster redesign, its production-server
 integration, the public HTTP surface, recovery paths, and the release evidence
@@ -15,10 +17,10 @@ used as evidence that the current server is production-ready.
 
 ## Implementation progress after the review
 
-The first remediation pass is now present in the working tree. Cluster release
-status remains **BLOCKED** because group 0/movement, self-contained atomic
-snapshots, replicated deletes/retention, the large-snapshot path, and final live
-release gates remain open.
+Two remediation passes are now committed. Cluster release status remains
+**BLOCKED** because group 0/movement, generation-atomic live snapshot
+replacement, replicated deletes/retention, the large-snapshot path, rolling
+snapshot-format compatibility, and final live release gates remain open.
 
 Completed and covered in this pass:
 
@@ -46,6 +48,29 @@ Completed and covered in this pass:
 - The unit harness restores synthetic placement tables after each test. This
   fixes an order-dependent crash where a four-core test mapping leaked into a
   later two-core Engine and routed work to nonexistent core 3.
+- Snapshot payload v2 now carries a deterministic series catalog bound by a real
+  content hash. Snapshot creation materialises one VShard-pure TSM,
+  applies tombstone sidecars, detects a concurrent tombstone mutation, and
+  refuses missing/non-canonical metadata. Fresh-replica install reconstructs
+  NativeIndex metadata, durable value types, and exact day membership, so normal
+  series discovery works after catch-up.
+- Snapshot install validates payload VShard, extent/file agreement, VShard
+  purity, tombstone absence, wire basenames, catalog/data identity, and content
+  hashes. It allocates receiver-local immutable names and isolated staging
+  directories. A truly identical resident object is retryable after interruption;
+  any different TSM, WAL/memory, or index-only state fails closed until a real
+  generation swap exists.
+- Partitioned production startup now enables VShard-partitioned compaction before
+  the background loop. TSM sequence allocation is restored above both filename
+  sequence and data sequence, preventing a post-snapshot local write from being
+  ranked permanently below the installed generation.
+- VShard compaction and snapshot reads now apply tombstones, detect a concurrent
+  tombstone mutation, and produce clean VShard-pure output. Exact-point TSM
+  deletes use the same inclusive range contract as tombstone queries, closing a
+  pre-existing `[t, t]` delete hole found by the new compaction regression.
+- Source-inspection tests use build-provided absolute paths, so their result no
+  longer depends on whether the binary is launched by CTest, from `build/test`,
+  or from the repository root.
 
 Focused evidence on this pass includes the rebuilt server, unit and socket test
 targets, journal negative tests, alternate-replica routing tests, a black-holed
@@ -54,11 +79,13 @@ identity/topology tests, and pre-proposal admission tests. The strict checkboxes
 below stay open where their stated multi-process or fault-injection “done when”
 evidence has not yet been run.
 
-Final local validation for this remediation tree is green: 4,325/4,325 unit
-tests, 43/43 socket-backed cluster tests, and 56/56 focused cluster/readiness/
-identity/admission regressions. The production server links, every cluster-gate
-shell script passes `bash -n`, and `git diff --check` passes. These checks do not
-replace the open live multi-process gates.
+Final local validation for these remediation commits is green: 4,327 unit tests
+passed and one hardware-specific CRC fallback test was skipped out of 4,328,
+43/43 socket-backed cluster tests passed, the first-pass 56/56 focused
+cluster/readiness/identity/admission regressions passed, and the second-pass
+24/24 snapshot/compaction regressions passed. The production server links, every
+cluster-gate shell script passes `bash -n`, and `git diff --check` passes. These
+checks do not replace the open live multi-process gates.
 
 ## Decision
 
@@ -109,6 +136,8 @@ remaining evidence needed to close each item are recorded in the fix-up list.
 | CR-15 | P2 | The supplied Compose deployment is still the unsafe M1 mode | Operators can mistake a best-effort demo for the redesigned RF=3 deployment. |
 | CR-16 | P2 | Required live release gates are stale on the final tree | Backpressure, node-kill, restart-catch-up, and snapshot-durability behavior is unverified after later changes. |
 | CR-17 | P1 | One-node failover still causes client-visible batch failures | Applications without the promised retry-whole-batch behavior can treat an expected node failure as lost writes. |
+| CR-18 | P1 | Snapshot payload v2 has no rolling-version negotiation | A mixed-version cluster can fail snapshot catch-up in either direction during upgrade. |
+| CR-19 | P0 | Exact-point delete overlap was exclusive at the block minimum | A delete with equal start/end could silently skip a one-point block and leave the point queryable. |
 
 ### CR-01 — deletes bypass consensus
 
@@ -123,7 +152,13 @@ replica is missing the tombstone. The dormant `DeleteRangeKey` command in the
 replicated state machine does not help because the public delete path never
 proposes it.
 
-### CR-02 and CR-03 — snapshot contents and live installation are unsafe
+The follow-on storage review also found that TSM overlap detection used
+`block.minTime < endTime` even though tombstone ranges are inclusive. An exact
+delete of a one-point block therefore returned false and persisted no tombstone.
+CR-FIX-016 corrects the boundary and covers it through the tombstone-resolving
+VShard compaction regression; this does not close the separate Raft-routing gap.
+
+### CR-02 and CR-03 — snapshot contents and live installation were unsafe
 
 [`SnapshotPayload`](../lib/cluster/data/snapshot_payload.hpp) carries a manifest
 and raw TSM file bytes. The producer in
@@ -143,6 +178,26 @@ already registered, [`TSMFileManager::addTSMFile`](../lib/storage/tsm_file_manag
 keeps the old open object and closes the new one. In addition, VShard-partitioned
 compaction is described in the integration plan but is not enabled by the
 production server, so a shipped TSM may contain data outside the target VShard.
+
+The current snapshot-safety pass closes the silent versions of these failures:
+payload v2 includes the exact catalog, creation ships a resolved VShard-pure
+object, and the receiver uses local names and rejects mixed/non-empty state. It
+also makes an exact data publication retry idempotent, which covers the normal
+crash/replay boundary between file publication and catalog reconstruction.
+CR-FIX-011/012 remain open because data visibility plus index publication is not
+a single fenced generation swap, live replacement is deliberately unsupported,
+and crash injection has not covered every publication boundary. The present
+producer emits at most one file and the receiver rejects multi-file payloads;
+removing that restriction requires atomic generation-directory publication.
+
+### CR-18 — snapshot upgrade compatibility is unspecified
+
+Payload v2 is intentionally fail-closed: upgraded production code rejects
+legacy catalog-less v1 snapshots, while an older binary cannot decode v2. No
+group-0 capability bit, negotiated minimum version, upgrade order, or offline
+upgrade requirement currently prevents mixed versions from attempting an
+incompatible InstallSnapshot. This is an availability failure rather than
+silent state corruption, but it blocks a supported rolling production upgrade.
 
 ### CR-04 — control-plane and movement wiring are incomplete
 
@@ -298,16 +353,36 @@ is not completion.
   **Done when:** a node with an empty data directory catches up exclusively by
   snapshot and normal `/query` discovery returns all and only the expected
   series after writes and deletes.
+  **Progress:** payload v2 carries a deterministic catalog and real catalog
+  hash; its single VShard-pure data object contains the tombstone-resolved
+  logical view. Install binds the manifest's data revision to the Raft snapshot
+  index, proves catalog/data identity and type, and rebuilds metadata,
+  value-type bindings, and exact day postings. Unit coverage now catches up an
+  empty Engine and queries through normal discovery after a delete. The public
+  multi-process empty-node gate, retention/deletion coverage, format negotiation,
+  and a single visibility fence across data plus derived index still remain.
 - [ ] **CR-FIX-012 — make live snapshot installation generation-safe and
   atomic.** Owner: storage. Install into unique immutable object names or replace
   the manager's generation under a fence; remove superseded VShard state without
   colliding with open ranks. **Done when:** install onto a non-empty running
   Engine is immediately visible without restart, survives an injected crash at
   every publish step, and cannot expose old/new mixtures.
+  **Progress:** peer filenames can no longer select live paths; receiver-local
+  sequence/data ranks, per-operation staging, extent/purity validation, and an
+  exact byte+extent+logical-hash idempotent retry are implemented. Any different
+  resident TSM, WAL/memory, or index-only state fails closed. True non-empty
+  replacement, atomic data/index visibility, orphan handling at every injected
+  failure point, and generation cleanup remain open.
 - [ ] **CR-FIX-013 — enable and verify VShard-partitioned compaction in cluster
   mode.** Owner: storage. **Done when:** production startup enables the setting,
   tests prove generated snapshot files contain only permitted VShard data, and
   mixed legacy files have a documented migration path.
+  **Progress:** partitioned server startup enables the mode before starting the
+  compaction loop. The partition path now materialises existing tombstone
+  sidecars and rejects a concurrent tombstone-generation race; storage/snapshot
+  regressions prove mixed tier-0 input is emitted as delete-resolved VShard-pure
+  output. The on-disk migration/rollback procedure for existing mixed
+  higher-tier files remains open.
 - [ ] **CR-FIX-014 — move storage-backlog admission before Raft proposal and
   make apply unconditional.** Owner: storage/write path. **Done when:** an
   overloaded leader returns retryable overload without committing, while
@@ -324,6 +399,10 @@ is not completion.
   error/latency bound, all acknowledged writes survive, retried batches appear
   exactly once logically, and unsupported clients receive precise retry
   guidance.
+- [x] **CR-FIX-016 — make TSM delete/block overlap inclusive.** Owner: storage.
+  Exact-point deletion now recognises a one-point block at the range boundary;
+  the VShard-partitioned tombstone regression proves the point is absent from
+  the materialised output.
 
 ### 2. Complete control-plane and identity wiring
 
@@ -460,7 +539,13 @@ is not completion.
   Owner: tests/core. **Done when:** a test using a synthetic core count restores
   the runtime mapping and the complete two-core suite reaches the later sharded
   Engine tests without routing to a nonexistent core. Verified by the
-  4,325-test full-suite pass below.
+  4,328-test full-suite run below.
+- [ ] **CR-FIX-076 — define snapshot wire-version negotiation and upgrade
+  policy.** Owner: control plane/release. Gate v2 production until group 0 or an
+  equivalent handshake proves every sender and receiver supports it, or require
+  and document an offline upgrade. **Done when:** old-to-new and new-to-old
+  snapshot attempts follow the documented safe path, mixed-version behavior is
+  covered by a multi-process test, and rollback constraints are explicit.
 
 ## Release exit criteria
 
@@ -495,16 +580,17 @@ timestar_cluster_socket_test:    40/40 passed
 ```
 
 The repository was clean before and after the original review. The remediation
-working tree is intentionally dirty. These results validate the exercised unit
-and socket paths; they do not supersede the missing live gates or the remaining
-production-composition findings above.
+is recorded in the commits named at the top of this document. These results
+validate the exercised unit and socket paths; they do not supersede the missing
+live gates or the remaining production-composition findings above.
 
-Post-remediation validation on the current working tree:
+Post-remediation validation through `a16b03a`:
 
 ```text
-timestar_unit_test:              4325/4325 passed (442 suites, -c 2)
+timestar_unit_test:              4327 passed, 1 skipped / 4328 (442 suites, -c 2)
 timestar_cluster_socket_test:      43/43 passed (8 suites, -c 2)
-focused cluster regressions:       56/56 passed (15 suites, -c 2)
+first-pass focused regressions:     56/56 passed (15 suites, -c 2)
+snapshot/compaction regressions:    24/24 passed (9 suites, -c 2)
 timestar_http_server:              built successfully
 test/cluster_gates/*.sh:           bash -n passed
 git diff --check:                  passed
