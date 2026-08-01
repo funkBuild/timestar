@@ -89,15 +89,16 @@ SEASTAR_TEST_F(IndexWalCrc32cTest, WalRoundtripVerifiesCrc32c) {
 
 // Source inspection: verify the software fallback uses CRC32C polynomial
 TEST_F(IndexWalCrc32cTest, SoftwareFallbackUsesCrc32cPolynomial) {
+#ifndef INDEX_WAL_SOURCE_PATH
+    FAIL() << "INDEX_WAL_SOURCE_PATH must be supplied by the test build";
+#else
     std::string src;
     {
-        std::ifstream ifs("../lib/index/native/index_wal.cpp");
+        std::ifstream ifs(INDEX_WAL_SOURCE_PATH);
+        ASSERT_TRUE(ifs.is_open()) << "Could not open index_wal.cpp at " << INDEX_WAL_SOURCE_PATH;
         src.assign(std::istreambuf_iterator<char>(ifs), std::istreambuf_iterator<char>());
     }
-
-    if (src.empty()) {
-        GTEST_SKIP() << "Could not read index_wal.cpp for source inspection";
-    }
+    ASSERT_FALSE(src.empty()) << "index_wal.cpp was empty at " << INDEX_WAL_SOURCE_PATH;
 
     // The CRC32C Castagnoli reflected polynomial is 0x82F63B78
     EXPECT_NE(src.find("0x82F63B78"), std::string::npos)
@@ -106,4 +107,5 @@ TEST_F(IndexWalCrc32cTest, SoftwareFallbackUsesCrc32cPolynomial) {
     // The old zlib polynomial must NOT be present
     EXPECT_EQ(src.find("0xEDB88320"), std::string::npos)
         << "Software fallback must NOT use CRC32 zlib polynomial 0xEDB88320";
+#endif
 }
