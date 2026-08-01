@@ -7,7 +7,7 @@
 **Remediation commits:** `95c10d2`, `a16b03a`, `d578e81`, `ddab705`,
 `8620b9e`, `20639dc`, `ea2511b`, `3ac9899`, `69ac879`, `09a62c5`,
 `2e06cb8`, `7151f5d`, `5b22b81`, `fef4886`, `3d2d607`, `f0e28f0`,
-`da55952`, `a1beb94`, `bb5b871`
+`da55952`, `a1beb94`, `bb5b871`, `e201343`
 
 **Scope:** The recent VShard/Raft cluster redesign, its production-server
 integration, the public HTTP surface, recovery paths, and the release evidence
@@ -20,7 +20,7 @@ used as evidence that the current server is production-ready.
 
 ## Implementation progress after the review
 
-Nineteen remediation commits are now recorded. Cluster release status remains
+Twenty remediation commits are now recorded. Cluster release status remains
 **BLOCKED** because group 0/movement, generation-atomic live snapshot
 replacement, pattern-delete expansion, replicated retention, the large-snapshot
 path, and rolling wire-format compatibility remain open. The four previously
@@ -138,6 +138,13 @@ Completed and covered in this pass:
   idempotently and sync the directory before reporting success. A retirement
   retry remembers that its TSM is already durable and registered, so it retries
   only the WAL barrier instead of colliding with a duplicate immutable rank.
+- Failed background WAL conversions are retained and retried until publication
+  succeeds or shutdown begins. Before publication the store remains queryable
+  and visible to snapshot-pending accounting; after publication a separate
+  non-query retirement list keeps its resident memory admission-accounted until
+  the source WAL directory barrier succeeds. Retry sleeps are shutdown-abortable,
+  and shutdown makes one final inline attempt without waiting out the 30-second
+  production delay.
 
 Focused evidence on this pass includes the rebuilt server, unit and socket test
 targets, journal negative tests, alternate-replica routing tests, a black-holed
@@ -146,7 +153,7 @@ identity/topology tests, and pre-proposal admission tests. The strict checkboxes
 below stay open where their stated multi-process or fault-injection “done when”
 evidence has not yet been run.
 
-Final local validation for these remediation commits is green: 4,360/4,360 unit
+Final local validation for these remediation commits is green: 4,362/4,362 unit
 tests passed with no skips, 45/45 socket-backed cluster tests passed, the
 first-pass 56/56 focused
 cluster/readiness/identity/admission regressions passed, and the second-pass
@@ -219,6 +226,7 @@ item are recorded in the fix-up list.
 | CR-26 | P0 | TSM open discarded invalid or unreadable tombstone sidecars | Startup could serve durably deleted points from the raw immutable file instead of fencing an incomplete logical generation. |
 | CR-27 | P0 | Tombstone rewrites truncated the live sidecar and were not serialized or directory-durable | A crash or concurrent delete could corrupt the only durable delete set, lose an acknowledged sidecar name, or publish incomplete ranges. |
 | CR-28 | P0 | WAL creation and retirement omitted directory durability and post-publication retries rewrote the TSM | A crash could lose an acknowledged segment or resurrect a converted source; a cleanup retry could then collide with its already-live immutable rank. |
+| CR-29 | P0 | A background WAL conversion was abandoned and evicted after two failures | Acknowledged data disappeared from live queries until restart, conversion-pending snapshot fences became falsely clear, and admission resumed while that durable data existed only in an offline WAL. |
 
 ### CR-01 — deletes bypass consensus
 
@@ -383,6 +391,32 @@ handoff state so a live conversion retry skips publication and performs only
 WAL retirement.
 Injected failures cover creation cleanup, live unlink retry, recovery-startup
 refusal, and one-rank preservation across the post-publication retry.
+
+### CR-29 — repeated WAL conversion failure evicted acknowledged live data
+
+[`WALFileManager::rolloverMemoryStore`](../lib/storage/wal_file_manager.cpp)
+made one background conversion attempt and scheduled only one delayed retry. If
+both failed, its terminal exception handler erased the rolled `MemoryStore` from
+`memoryStores` while preserving only the source WAL on disk. The WAL protected
+crash recovery, but the running process could no longer query the acknowledged
+points. Both shard-wide and per-VShard pending-conversion predicates also became
+false for that store, allowing snapshot/log-compaction decisions to proceed as
+if its revisions had reached TSM. Erasure bounded memory only by dropping
+acknowledged data from the serving and safety-accounting state, and it released
+request-edge backpressure before the WAL had become query-visible TSM.
+
+Commit `e201343` replaces the two-attempt chain with one gate-held, serialized
+retry coroutine. Failed publication leaves the store in `memoryStores`, so data
+stays queryable and both snapshot fences stay conservative; request admission's
+existing 16-store ceiling bounds accumulation. Once TSM publication is durable
+and query-visible, the store moves to a separate non-query retirement list to
+avoid duplicate results while its memory remains included in the same admission
+count until idempotent WAL retirement succeeds. The 30-second retry sleep is
+abortable, the gate spans every attempt, and shutdown retries remaining
+publication and retirement work inline. Fault injection proves both publication
+and WAL-retirement failures continue past the former two-attempt limit, retain
+the correct visibility/accounting state, converge without a duplicate TSM rank,
+and drain cleanly.
 
 ### CR-02 and CR-03 — snapshot contents and live installation were unsafe
 
@@ -698,6 +732,12 @@ is not completion.
   recovered source unlinks sync before success and tolerate a retry after the
   name is absent. A post-publication retry skips the already-registered TSM and
   completes only the WAL retirement barrier.
+- [x] **CR-FIX-019E — retain and continuously retry failed WAL conversions.**
+  Owner: storage. One shutdown-aware gate holder owns all publication and
+  retirement attempts. Unpublished stores remain queryable and snapshot-pending;
+  published stores awaiting WAL retirement remain outside memory queries but
+  inside retained-memory admission. Repeated-failure regressions cover both
+  states and recovery without duplicate immutable publication.
 
 ### 2. Complete control-plane and identity wiring
 
@@ -1044,6 +1084,17 @@ WAL lifecycle durability validation for `bb5b871`:
 focused lifecycle/source-boundary checks:    4/4 passed
 related WAL/conversion/storage tests:      138/138 passed
 current full unit suite:                  4360/4360 passed (444 suites, -c 2)
+current socket-backed cluster suite:        45/45 passed (8 suites, -c 2)
+timestar_http_server:                       built successfully
+git diff --check:                           passed
+```
+
+WAL conversion-retention validation for `e201343`:
+
+```text
+focused publication/retirement retry tests:  3/3 passed
+related WAL/conversion/storage tests:        96/96 passed
+current full unit suite:                  4362/4362 passed (444 suites, -c 2)
 current socket-backed cluster suite:        45/45 passed (8 suites, -c 2)
 timestar_http_server:                       built successfully
 git diff --check:                           passed
