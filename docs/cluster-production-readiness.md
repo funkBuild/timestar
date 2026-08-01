@@ -8,7 +8,7 @@
 `8620b9e`, `20639dc`, `ea2511b`, `3ac9899`, `69ac879`, `09a62c5`,
 `2e06cb8`, `7151f5d`, `5b22b81`, `fef4886`, `3d2d607`, `f0e28f0`,
 `da55952`, `a1beb94`, `bb5b871`, `e201343`, `6ad2c93`, `9a42d84`,
-`41fdc34`, `a58d2a9`, `6a73809`, `81692a4`
+`41fdc34`, `a58d2a9`, `6a73809`, `81692a4`, `d363348`
 
 **Scope:** The recent VShard/Raft cluster redesign, its production-server
 integration, the public HTTP surface, recovery paths, and the release evidence
@@ -21,7 +21,7 @@ used as evidence that the current server is production-ready.
 
 ## Implementation progress after the review
 
-Twenty-six remediation commits are now recorded. Cluster release status remains
+Twenty-seven remediation commits are now recorded. Cluster release status remains
 **BLOCKED** because group 0/movement, generation-atomic live snapshot
 replacement, pattern-delete expansion, replicated retention, the large-snapshot
 path, and rolling wire-format compatibility remain open. The four previously
@@ -179,6 +179,13 @@ Completed and covered in this pass:
   malformed aliases, and identity exhaustion fence startup. Fresh creation is
   exclusive, a recovered empty/torn generation is rotated before reuse, and WAL
   creation/deletion directory barriers are mandatory.
+- NativeIndex manifest and SSTable recovery now fail closed on complete manifest
+  corruption, malformed records, missing or swapped live SSTables, non-regular
+  paths, identity exhaustion, and invalid file metadata. SSTable v2 binds the
+  file identity and checksums its bloom/index metadata; legacy v1 files disable
+  the untrusted bloom and validate every CRC-protected data block against the
+  index before serving. Compaction preserves a durable output across an
+  ambiguous manifest-publication failure and syncs obsolete-name cleanup.
 
 Focused evidence on this pass includes the rebuilt server, unit and socket test
 targets, journal negative tests, alternate-replica routing tests, a black-holed
@@ -187,8 +194,8 @@ identity/topology tests, and pre-proposal admission tests. The strict checkboxes
 below stay open where their stated multi-process or fault-injection “done when”
 evidence has not yet been run.
 
-Final local validation for these remediation commits is green: all 4,387 unit
-tests completed successfully (4,378 passed and 9 pre-existing SMP-dependent
+Final local validation for these remediation commits is green: all 4,401 unit
+tests completed successfully (4,392 passed and 9 pre-existing SMP-dependent
 tests skipped), 45/45 socket-backed cluster tests passed, the
 first-pass 56/56 focused
 cluster/readiness/identity/admission regressions passed, and the second-pass
@@ -268,6 +275,7 @@ item are recorded in the fix-up list.
 | CR-33 | P0 | Raft journal discovery ignored unrecognized entries and segment creation could truncate after identity wrap | A damaged or partially renamed acknowledged segment could be omitted from replay; exhaustion could wrap to segment zero and overwrite an older durable generation. |
 | CR-34 | P0 | TSM discovery accepted numeric-prefix aliases and rank allocation exceeded its 60-bit identity space | Malformed or symlinked immutable files could enter recovery under the wrong identity; an out-of-range data generation could register and fail later queries, while exhaustion could publish an unusable TSM and strand its source WAL. |
 | CR-35 | P0 | NativeIndex WAL recovery aliased or skipped durable generations and discarded complete corruption | Acknowledged catalog/postings mutations could disappear while startup served an incomplete index; a colliding fresh generation could also truncate the last durable copy. |
+| CR-36 | P0 | NativeIndex manifest/SSTable recovery omitted or destroyed durable generations | Complete manifest corruption could be rewritten as a clean prefix, missing/swapped or metadata-corrupt SSTables could be served as an incomplete index, and compaction could delete a durable output after an ambiguous manifest publication. |
 
 ### CR-01 — deletes bypass consensus
 
@@ -590,6 +598,41 @@ Creation and deletion now sync the directory, while destructor fallback refuses
 to follow or overwrite an unowned collision. Regressions cover corruption,
 numeric-prefix aliases, symlinks, nonempty collision, generation exhaustion,
 torn sealed generations, and a torn first frame followed by a new write.
+
+### CR-36 — NativeIndex manifest/SSTable recovery could lose durable generations
+
+[`Manifest::recover`](../lib/index/native/manifest.cpp) treated a fully present
+CRC-invalid frame like an incomplete tail, stopped at the preceding prefix, and
+then rewrote that prefix as a clean snapshot. Complete malformed records could
+also mutate part of the recovered state before parsing stopped. At the next
+layer, [`NativeIndex::refreshSSTables`](../lib/index/native/native_index.cpp)
+logged and skipped a manifest-listed missing file. The SSTable footer protected
+neither bloom nor index metadata and carried no embedded file identity, so a
+single bloom-bit change could create silent false negatives and two physical
+generations could be swapped while retaining plausible manifest metadata.
+
+Compaction had the inverse crash-boundary error: after finishing and syncing its
+new SSTable it deleted that output on any later exception, including an
+ambiguous manifest flush/fsync result. If the manifest append had reached stable
+storage despite the reported error, recovery would then require a file the
+failure path had removed. Manifest/SSTable creation also followed non-regular
+path collisions, and manifest file-number allocation could wrap.
+
+Commit `d363348` makes manifest record parsing strict and atomic, preserves the
+source and fences startup on every complete checksum/structure error, and only
+repairs a physically incomplete final header/body. Manifest-listed generations
+must all be regular and must match file size, entry count, key range, timestamp,
+and—when available—embedded identity. SSTable v2 adds a CRC over bloom/index
+metadata and a full 64-bit file identity. Legacy v1 remains readable, but its
+unchecksummed bloom is never trusted and every CRC-protected block is validated
+against the index once at open. Output collisions refuse symlinks/non-regular
+paths, allocation cannot wrap, and manifest/SSTable opens use no-follow flags.
+Compaction aborts only an unfinished output; once `finish()` establishes the
+durability boundary, any manifest ambiguity preserves the output, and successful
+source cleanup includes a parent-directory barrier. Regressions cover complete
+manifest corruption and preservation, malformed records, bad magic, exhaustion,
+symlink collisions, missing/swapped SSTables, metadata corruption, v1 migration
+safety, and publication failure after durable output creation.
 
 ### CR-02 and CR-03 — snapshot contents and live installation were unsafe
 
@@ -942,6 +985,13 @@ is not completion.
   identity violations fence startup. Creation cannot truncate a collision, an
   empty recovered generation is rotated before reuse, and namespace mutations
   include their directory durability barrier.
+- [x] **CR-FIX-019L — bind NativeIndex manifests to complete, validated SSTable
+  generations.** Owner: storage. Complete manifest corruption is preserved and
+  fences startup; every listed SSTable must exist and match its durable metadata.
+  SSTable v2 checksums the bloom/index region and embeds its identity, while v1
+  disables the untrusted bloom and validates index/data agreement before use.
+  Compaction retains a durable output across ambiguous manifest publication and
+  syncs obsolete-name cleanup.
 
 ### 2. Complete control-plane and identity wiring
 
@@ -1369,4 +1419,16 @@ current full unit suite:                    4387/4387 successful
 current socket-backed cluster suite:          45/45 passed (8 suites, -c 2)
 timestar_http_server:                         built successfully
 git diff --check:                             passed
+```
+
+NativeIndex manifest/SSTable generation validation for `d363348`:
+
+```text
+focused manifest/SSTable/compaction recovery suites: 65/65 passed
+current full unit suite:                            4401/4401 successful
+  passed/skipped:                                   4392/9 (444 suites, -c 1)
+current socket-backed cluster suite:                  45/45 successful
+  passed/skipped:                                     43/2 (8 suites, -c 1)
+timestar_http_server:                                 built successfully
+git diff --check:                                     passed
 ```
