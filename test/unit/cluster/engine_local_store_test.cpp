@@ -306,6 +306,67 @@ TEST_F(EngineLocalStoreTest, ReplicatedQueryRequiresExactVShardLeaderFence) {
     }).get();
 }
 
+TEST_F(EngineLocalStoreTest, SnapshotVisibilityReadsFailClosedWhileApplyFenceIsClosed) {
+    seastar::async([] {
+        ScopedShardedEngine eng;
+        eng.start();
+        cluster::EngineLocalStore store(*eng);
+
+        auto series = floatS();
+        const std::string seriesKey = series.seriesKey;
+        const uint16_t vshard = timestar::virtualShard(SeriesId128::fromSeriesKey(seriesKey));
+        data::WriteBatch batch;
+        batch.series.push_back(std::move(series));
+        store.applyWrites(std::move(batch)).get();
+
+        store.setLeaderReadFence([vshard](const std::vector<uint16_t>& requested) {
+            EXPECT_EQ(requested, (std::vector<uint16_t>{vshard}));
+            return seastar::make_ready_future<bool>(true);
+        });
+        bool snapshotInstalled = false;
+        store.setApplyFence([&snapshotInstalled] {
+            return seastar::make_ready_future<bool>(snapshotInstalled);
+        });
+
+        auto queryRequest = [vshard] {
+            data::NodeQueryRequest req;
+            req.request.aggregation = AggregationMethod::LATEST;
+            req.request.measurement = "temp";
+            req.request.fields = {"value"};
+            req.request.startTime = BASE - 1;
+            req.request.endTime = BASE + 1;
+            req.vshards = {vshard};
+            return req;
+        };
+        auto patternRequest = [vshard] {
+            data::PatternSeriesRequest req;
+            req.selector.measurement = "temp";
+            req.selector.fields = {"value"};
+            req.vshards = {vshard};
+            req.maxSeries = 10;
+            return req;
+        };
+
+        auto refusedQuery = store.queryLocal(queryRequest()).get();
+        ASSERT_EQ(refusedQuery.incompleteReasons.size(), 1u);
+        EXPECT_NE(refusedQuery.incompleteReasons.front().find("unapplied"), std::string::npos);
+        EXPECT_TRUE(refusedQuery.partials.empty());
+        EXPECT_TRUE(refusedQuery.nonNumeric.empty());
+        EXPECT_THROW(store.queryMetadata({data::MetadataKind::Measurements, "", "", ""}).get(),
+                     std::runtime_error);
+        EXPECT_THROW(store.findPatternSeries(patternRequest()).get(), std::runtime_error);
+
+        snapshotInstalled = true;
+        auto visibleQuery = store.queryLocal(queryRequest()).get();
+        EXPECT_TRUE(visibleQuery.incompleteReasons.empty());
+        EXPECT_EQ(visibleQuery.partials.size() + visibleQuery.nonNumeric.size(), 1u);
+        auto visibleMetadata = store.queryMetadata({data::MetadataKind::Measurements, "", "", ""}).get();
+        EXPECT_EQ(visibleMetadata.items, (std::vector<std::string>{"temp"}));
+        auto visiblePattern = store.findPatternSeries(patternRequest()).get();
+        EXPECT_EQ(visiblePattern.seriesKeys, (std::vector<std::string>{seriesKey}));
+    }).get();
+}
+
 TEST_F(EngineLocalStoreTest, QueryMetadataReturnsOwnedSchema) {
     seastar::async([] {
         ScopedShardedEngine eng;

@@ -11,6 +11,7 @@
 #include <memory>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
+#include <seastar/util/later.hh>
 #include <stdexcept>
 #include <vector>
 
@@ -61,6 +62,23 @@ public:
     seastar::future<> applySnapshot(Snapshot s) override {
         applied = splitLines(s.data);
         return seastar::make_ready_future<>();
+    }
+};
+
+class NullTransport : public RaftTransport {
+public:
+    seastar::future<> send(Envelope) override { return seastar::make_ready_future<>(); }
+};
+
+class PausingSnapshotSM : public RaftStateMachine {
+public:
+    bool snapshotStarted = false;
+    seastar::promise<> releaseSnapshot;
+
+    seastar::future<> apply(LogEntry) override { return seastar::make_ready_future<>(); }
+    seastar::future<> applySnapshot(Snapshot) override {
+        snapshotStarted = true;
+        return releaseSnapshot.get_future();
     }
 };
 
@@ -217,6 +235,44 @@ seastar::future<> testASnapshotIsPersistedAndAppliedWithItsWholePayload() {
     EXPECT_EQ(net.group(1).node().servableSnapshot().data, payload);
 }
 
+// A snapshot install is deliberately two-phase inside Engine today: verified TSM data is
+// registered, then the authenticated catalog is rebuilt into NativeIndex. Cluster reads
+// are still atomic at the Raft boundary only if the group does NOT publish appliedIndex
+// until that whole state-machine future resolves. EngineLocalStore's production apply
+// fence reads this exact commit/applied gap; advancing early would let a query observe
+// installed values with an old/empty discovery index.
+seastar::future<> testSnapshotApplyLagSpansTheWholeStateMachineInstall() {
+    NoopPersistence persistence;
+    NullTransport transport;
+    PausingSnapshotSM sm;
+    RaftNode node(/*id=*/1, /*voters=*/{1, 2}, RaftLog{}, HardState{}, opts());
+    RaftGroup group(/*groupId=*/1, std::move(node), persistence, transport, sm);
+
+    InstallSnapshot snapshot;
+    snapshot.term = 1;
+    snapshot.leaderId = 2;
+    snapshot.lastIncludedIndex = 7;
+    snapshot.lastIncludedTerm = 1;
+    snapshot.config.voters = {1, 2};
+    snapshot.data = "complete snapshot payload";
+    snapshot.offset = 0;
+    snapshot.totalBytes = snapshot.data.size();
+    snapshot.done = true;
+
+    auto installing = group.step(Message{.to = 1, .from = 2, .payload = snapshot});
+    co_await seastar::yield();
+    EXPECT_TRUE(sm.snapshotStarted) << "the test must be paused inside state-machine installation";
+    EXPECT_FALSE(installing.available());
+    EXPECT_EQ(group.commitIndex(), 7u) << "the durable snapshot boundary is already committed";
+    EXPECT_EQ(group.appliedIndex(), 0u) << "partial data/catalog publication must not become readable";
+    EXPECT_EQ(group.applyLag(), 7u) << "the production read fence must see and reject this partial interval";
+
+    sm.releaseSnapshot.set_value();
+    co_await std::move(installing);
+    EXPECT_EQ(group.appliedIndex(), 7u);
+    EXPECT_EQ(group.applyLag(), 0u);
+}
+
 seastar::future<> testConfChangeThroughDriver() {
     GroupNetwork net({1, 2, 3}, opts());
     co_await net.group(1).campaign();
@@ -297,6 +353,10 @@ TEST(RaftGroupTest, ElectsViaTimerTicks) {
 
 TEST(RaftGroupTest, AReceivedSnapshotIsPersistedAndAppliedWithItsWholePayload) {
     testASnapshotIsPersistedAndAppliedWithItsWholePayload().get();
+}
+
+TEST(RaftGroupTest, SnapshotApplyLagSpansTheWholeStateMachineInstall) {
+    testSnapshotApplyLagSpansTheWholeStateMachineInstall().get();
 }
 
 TEST(RaftGroupTest, ConfigChangeThroughTheAsyncDriver) {
