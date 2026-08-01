@@ -7,7 +7,7 @@
 **Remediation commits:** `95c10d2`, `a16b03a`, `d578e81`, `ddab705`,
 `8620b9e`, `20639dc`, `ea2511b`, `3ac9899`, `69ac879`, `09a62c5`,
 `2e06cb8`, `7151f5d`, `5b22b81`, `fef4886`, `3d2d607`, `f0e28f0`,
-`da55952`, `a1beb94`, `bb5b871`, `e201343`, `6ad2c93`
+`da55952`, `a1beb94`, `bb5b871`, `e201343`, `6ad2c93`, `9a42d84`
 
 **Scope:** The recent VShard/Raft cluster redesign, its production-server
 integration, the public HTTP surface, recovery paths, and the release evidence
@@ -20,7 +20,7 @@ used as evidence that the current server is production-ready.
 
 ## Implementation progress after the review
 
-Twenty-one remediation commits are now recorded. Cluster release status remains
+Twenty-two remediation commits are now recorded. Cluster release status remains
 **BLOCKED** because group 0/movement, generation-atomic live snapshot
 replacement, pattern-delete expansion, replicated retention, the large-snapshot
 path, and rolling wire-format compatibility remain open. The four previously
@@ -150,6 +150,12 @@ Completed and covered in this pass:
   created over the visibility hole, and a later clean startup can load any
   valid renamed output, replay the preserved source into a newer rank, retire
   the WAL durably, and finish initialization.
+- WAL recovery now distinguishes an incomplete final frame at EOF from a fully
+  present corrupt frame. A torn final frame remains discardable, but CRC
+  mismatch, invalid length/padding, unknown command/value type, or payload parse
+  failure aborts recovery and therefore startup. The source remains intact;
+  legacy no-CRC frames are accepted only when they cannot be mistaken for a
+  corrupt current-format frame.
 
 Focused evidence on this pass includes the rebuilt server, unit and socket test
 targets, journal negative tests, alternate-replica routing tests, a black-holed
@@ -158,7 +164,7 @@ identity/topology tests, and pre-proposal admission tests. The strict checkboxes
 below stay open where their stated multi-process or fault-injection “done when”
 evidence has not yet been run.
 
-Final local validation for these remediation commits is green: 4,363/4,363 unit
+Final local validation for these remediation commits is green: 4,366/4,366 unit
 tests passed with no skips, 45/45 socket-backed cluster tests passed, the
 first-pass 56/56 focused
 cluster/readiness/identity/admission regressions passed, and the second-pass
@@ -233,6 +239,7 @@ item are recorded in the fix-up list.
 | CR-28 | P0 | WAL creation and retirement omitted directory durability and post-publication retries rewrote the TSM | A crash could lose an acknowledged segment or resurrect a converted source; a cleanup retry could then collide with its already-live immutable rank. |
 | CR-29 | P0 | A background WAL conversion was abandoned and evicted after two failures | Acknowledged data disappeared from live queries until restart, conversion-pending snapshot fences became falsely clear, and admission resumed while that durable data existed only in an offline WAL. |
 | CR-30 | P0 | Startup continued after a recovered WAL failed TSM conversion | The node destroyed the recovered in-memory data, created a fresh active WAL, and reported startup success while acknowledged points remained query-invisible in an offline source file. |
+| CR-31 | P0 | WAL recovery discarded fully framed corruption and continued startup | A CRC-invalid or malformed acknowledged command could be omitted from the recovered store while the node served the remaining dataset as complete. |
 
 ### CR-01 — deletes bypass consensus
 
@@ -443,6 +450,27 @@ is created. The same test then constructs a clean process boundary: a valid
 renamed TSM left by the uncertain barrier is loaded, the preserved WAL is replayed
 into a newer immutable rank, the source is durably retired, and startup completes
 with one active store.
+
+### CR-31 — complete WAL corruption was treated as a discardable tail
+
+[`WALReader::readAll`](../lib/storage/wal.cpp) warned and continued after a
+fully present frame failed CRC validation, contained an unknown command or value
+type, or failed payload parsing. It also stopped successfully at implausible
+length and padding markers. These cases are not equivalent to EOF while reading
+the final frame: the affected command may already have been acknowledged, so
+continuing startup exposes an incomplete durable history as healthy.
+
+Commit `9a42d84` propagates every complete-frame structural, checksum, type, and
+payload error after closing the input resources. `WALFileManager` consequently
+preserves the source WAL and aborts startup without registering partial replay
+state or creating a fresh active store. EOF during the final incomplete frame
+continues to model a crash-torn, unacknowledged tail and retains all earlier
+complete commands. The backward-compatible no-CRC reader remains available only
+when byte layout makes legacy interpretation unambiguous; an ambiguous frame
+fails closed instead of allowing a damaged current CRC prefix to masquerade as
+a legacy command. Regressions cover single- and second-frame CRC failures,
+manager startup/source preservation, unambiguous legacy replay, and a truncated
+final frame.
 
 ### CR-02 and CR-03 — snapshot contents and live installation were unsafe
 
@@ -769,6 +797,12 @@ is not completion.
   the source; startup cannot create a fresh active store over missing recovered
   contents. An injected publication-barrier failure also proves the next clean
   startup can load the uncertain output, replay and retire the WAL, and finish.
+- [x] **CR-FIX-019G — fail startup on complete WAL corruption.** Owner:
+  storage. Fully read frames must validate length, padding, CRC, command/value
+  type, and payload before recovery can succeed. EOF in the final incomplete
+  frame remains a recoverable torn tail; ambiguous legacy/current framing fails
+  closed. Manager-level coverage proves the corrupt source is preserved and no
+  partial store becomes live.
 
 ### 2. Complete control-plane and identity wiring
 
@@ -1137,6 +1171,17 @@ Fail-closed WAL startup validation for `6ad2c93`:
 focused recovery publication/restart test:   1/1 passed
 related WAL/recovery/storage tests:          97/97 passed
 current full unit suite:                  4363/4363 passed (444 suites, -c 2)
+current socket-backed cluster suite:        45/45 passed (8 suites, -c 2)
+timestar_http_server:                       built successfully
+git diff --check:                           passed
+```
+
+Fail-closed WAL corruption validation for `9a42d84`:
+
+```text
+focused corruption/legacy/torn-tail tests:   5/5 passed
+related WAL/recovery/storage tests:        100/100 passed
+current full unit suite:                  4366/4366 passed (444 suites, -c 2)
 current socket-backed cluster suite:        45/45 passed (8 suites, -c 2)
 timestar_http_server:                       built successfully
 git diff --check:                           passed
