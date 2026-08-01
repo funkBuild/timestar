@@ -32,7 +32,7 @@ Every journal record is length-prefixed and CRC-covered and carries, at minimum:
 record_len (u32)              # payload length, excludes this header + CRC
 crc32c     (u32)              # over the payload bytes only
 vshard     (u16)             # 0..4095; the record's owning VShard
-vshard_seq (u64)             # per-VShard monotonic sequence (gap-free per VShard)
+vshard_seq (u64)             # per-VShard monotonic append sequence
 raft_term  (u64)             # per-VShard Raft hard state
 raft_index (u64)             # per-VShard Raft log index
 record_kind(u8)              # data / catalog / truncation / hard-state / config / retention
@@ -40,9 +40,11 @@ payload    (record_len bytes)
 ```
 
 `(vshard, vshard_seq)` totally orders one VShard's records independent of their
-physical position in the shared stream. Replay routes each record to
-`assignCore(vshard, live_core_count)` and applies it in `vshard_seq` order, so
-records written under a previous core count remain recoverable under a new one.
+physical position in the shared stream. The append sequence is gap-free; GC may
+later leave holes only in the prefix superseded by a retained snapshot. Replay
+routes each record to `assignCore(vshard, live_core_count)` and applies it in
+`vshard_seq` order, so records written under a previous core count remain
+recoverable under a new one.
 
 ### 2. Segments
 
@@ -98,11 +100,21 @@ VShard would otherwise pin the whole shared segment.
 
 - GC reclaims a segment only when **every** record in it is below its VShard's
   `released_seq`.
-- When the oldest segment contains live records for a **laggard** VShard while
-  the rest of the segment is reclaimable, those live records are **copied
-  forward** into the current segment (as opaque, re-CRC-checked records) before
-  the old segment is deleted. GC then advances. This bounds shared-log growth to
-  the live (un-released) working set, not to the slowest group's absolute age.
+- When a sealed segment contains a bounded set of live records for a **laggard**
+  VShard while the rest is reclaimable, those live records are **copied
+  forward** into the current segment (as opaque, re-CRC-checked records), made
+  durable, and only then is the old segment deleted.
+- A shared-journal pass continues scanning after an unreclaimable segment. A
+  pin retains that segment, but does not retain an independently fully released
+  physical suffix. This is required to prevent one idle group from
+  head-of-line blocking the entire reactor's journal forever. The private
+  per-VShard layout keeps the simpler stop-at-first-pin/physical-suffix policy,
+  because a pin there affects only that VShard's directory.
+- Shared GC may therefore leave holes in physical segment numbers and in the
+  pre-snapshot portion of one VShard's retained sequence. This is safe only
+  because `released_seq` is derived from durable hard-state, snapshot, and live
+  log-entry records: every deleted sequence is strictly below a retained
+  snapshot and below every record still needed for recovery.
 - **Per-VShard retained-log byte cap: 256 MiB** (`journal.per_vshard_cap_bytes`).
   If a laggard's un-released log for one VShard exceeds the cap, log catch-up for
   that learner is abandoned: the learner is dropped and **restarted from a fresh
@@ -113,12 +125,16 @@ VShard would otherwise pin the whole shared segment.
 
 Startup, for each core it will own after boot-derived assignment:
 
-1. Enumerate its segments in order; validate headers; find the durable tail
+1. Enumerate its segments in order; tolerate physical segment-number holes,
+   validate headers, and find the durable tail
    (last record fully covered by a completed barrier — a torn tail past the last
    barrier is discarded, matching the Phase-0 WAL recovery discipline).
-2. Reconstruct per-VShard `(term, vote, log suffix)` honouring per-group logical
+2. Sort and de-duplicate each VShard by `vshard_seq`. A sequence gap is accepted
+   only when its upper record is at or before the newest retained snapshot;
+   any gap after that snapshot fails closed as live-suffix loss.
+3. Reconstruct per-VShard `(term, vote, log suffix)` honouring per-group logical
    truncation records in append order.
-3. Route each surviving record to its current owning core and apply in
+4. Route each surviving record to its current owning core and apply in
    `vshard_seq` order.
 
 A logical truncation (post-leadership-conflict suffix drop) is itself an appended

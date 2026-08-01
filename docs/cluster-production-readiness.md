@@ -6,7 +6,7 @@
 
 **Remediation commits:** `95c10d2`, `a16b03a`, `d578e81`, `ddab705`,
 `8620b9e`, `20639dc`, `ea2511b`, `3ac9899`, `69ac879`, `09a62c5`,
-`2e06cb8`, `7151f5d`
+`2e06cb8`, `7151f5d`, `5b22b81`
 
 **Scope:** The recent VShard/Raft cluster redesign, its production-server
 integration, the public HTTP surface, recovery paths, and the release evidence
@@ -19,7 +19,7 @@ used as evidence that the current server is production-ready.
 
 ## Implementation progress after the review
 
-Twelve remediation commits are now recorded. Cluster release status remains
+Thirteen remediation commits are now recorded. Cluster release status remains
 **BLOCKED** because group 0/movement, generation-atomic live snapshot
 replacement, pattern-delete expansion, replicated retention, the large-snapshot
 path, and rolling wire-format compatibility remain open. The four previously
@@ -99,6 +99,15 @@ Completed and covered in this pass:
   insert benchmark exits nonzero when its health preflight or argument parsing
   fails. This prevents an empty benchmark transcript from satisfying a gate's
   anti-vacuity checks.
+- Shared-journal GC now scans past an individually pinned segment and reclaims
+  later fully released segments instead of allowing one idle VShard to retain
+  the reactor's entire physical suffix. Recovery accepts only sequence gaps
+  superseded by a later retained snapshot and still fails closed on any
+  post-snapshot gap. Shared mode derives a sequential snapshot batch that gives
+  every hosted group a turn within a target 15-minute fair scan on supported
+  one-, two-, and four-core topologies; private journals retain the existing
+  one-snapshot cadence. `/cluster/status` now publishes snapshot-production and
+  journal-GC pass, deletion, pin, and copy-forward counters.
 
 Focused evidence on this pass includes the rebuilt server, unit and socket test
 targets, journal negative tests, alternate-replica routing tests, a black-holed
@@ -107,7 +116,7 @@ identity/topology tests, and pre-proposal admission tests. The strict checkboxes
 below stay open where their stated multi-process or fault-injection “done when”
 evidence has not yet been run.
 
-Final local validation for these remediation commits is green: 4,341/4,341 unit
+Final local validation for these remediation commits is green: 4,346/4,346 unit
 tests passed with no skips, 45/45 socket-backed cluster tests passed, the
 first-pass 56/56 focused
 cluster/readiness/identity/admission regressions passed, and the second-pass
@@ -610,7 +619,7 @@ is not completion.
   `/health` returns non-ready for each injected condition and only becomes ready
   after the node can satisfy its configured API contract.
 - [ ] **CR-FIX-063 — close or explicitly disable conditional durability debt.**
-  Owner: index/journal. Resolve D-39/D-10 before enabling shared journals by
+  Owner: index/journal. Resolve D-10 before enabling shared journals by
   default. **Done when:** real-disk shared-journal GC evidence demonstrates
   bounded reclamation. **Progress:** D-38 is closed in `7151f5d`: the six
   in-tree crash simulations now use an explicit test-only abandonment boundary
@@ -618,7 +627,13 @@ is not completion.
   without performing a clean WAL close. A deterministic lifecycle regression
   holds each gate open and proves abandonment waits; unsupported destruction
   now fails with an actionable lifecycle diagnostic instead of Seastar's opaque
-  `~gate()` SIGILL. Production callers must still `co_await close()`.
+  `~gate()` SIGILL. Production callers must still `co_await close()`. D-39 is
+  closed in `5b22b81`: shared GC no longer stops at an unrelated pin, recovery
+  permits only snapshot-covered holes, and shared snapshot production targets a
+  15-minute fair scan without concurrent snapshot materialisation. The status
+  endpoint exposes the counters needed for sustained reclamation evidence. The
+  remaining D-10 blocker is the real-disk measurement; shared journals remain
+  opt-in until it is recorded.
 - [x] **CR-FIX-064 — make replicated startup open-file-safe and
   exception-safe.** Owner: server/cluster composition. Resolve the descriptor
   requirement before opening Engine/Raft state, raise an ordinary soft limit
@@ -773,4 +788,14 @@ NativeIndex lifecycle validation for `7151f5d`:
 targeted lifecycle/recovery tests:       7/7 passed
 current full unit suite:             4342/4342 passed (444 suites, -c 2)
 current socket-backed cluster suite:     45/45 passed (8 suites, -c 2)
+```
+
+Shared-journal reclamation validation for `5b22b81`:
+
+```text
+targeted GC/replay/scheduler tests:        6/6 passed
+current full unit suite:             4346/4346 passed (444 suites, -c 2)
+current socket-backed cluster suite:     45/45 passed (8 suites, -c 2)
+timestar_http_server:                    built successfully
+git diff --check:                        passed
 ```
