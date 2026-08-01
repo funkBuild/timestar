@@ -360,6 +360,12 @@ private:
                                                         size_t totalBuckets);
 
 public:
+    // File identity packs tier into four bits and sequence into sixty; dataRank
+    // packs the same fields in the opposite order. Allocation and recovery must
+    // enforce these shared limits before publishing or registering a file.
+    static constexpr uint64_t kMaxTierNumber = 15;
+    static constexpr uint64_t kMaxSequenceNumber = (uint64_t{1} << 60) - 1;
+
     uint64_t tierNum;
     uint64_t seqNum;
     // Newest write generation contained in this file (last-write-wins dedup).

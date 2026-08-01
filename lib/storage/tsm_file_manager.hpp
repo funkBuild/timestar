@@ -38,6 +38,11 @@ private:
     // No atomic needed: TSMFileManager is a per-shard object in Seastar's shard-per-core model,
     // only accessed from a single thread.
     uint64_t nextSequenceId = 0;
+    uint64_t takeSequenceId() {
+        if (nextSequenceId > TSM::kMaxSequenceNumber) [[unlikely]]
+            throw std::overflow_error("TSM 60-bit sequence number exhausted");
+        return nextSequenceId++;
+    }
     // Publication durability boundary for WAL conversion and compaction. A
     // caller may delete the old durable generation only after this succeeds.
     // Kept per manager so a regression can inject the exact final-directory
@@ -182,7 +187,7 @@ public:
     seastar::future<> removeTSMFiles(const std::vector<seastar::shared_ptr<TSM>>& files);
 
     // Allocate a globally unique sequence ID for new TSM files
-    uint64_t allocateSequenceId() { return nextSequenceId++; }
+    uint64_t allocateSequenceId() { return takeSequenceId(); }
 
     // Get the compactor (for tombstone rewrites)
     TSMCompactor* getCompactor() { return compactor.get(); }
@@ -241,7 +246,7 @@ public:
     // carried on the store (MemoryStore::reservedTsmSeq). The 30s conversion
     // retry keeps the same reservation for the same reason: a fresh seq at
     // retry time would outrank every store converted in the interim.
-    uint64_t reserveSequenceId() { return nextSequenceId++; }
+    uint64_t reserveSequenceId() { return takeSequenceId(); }
 
     // Start background compaction
     seastar::future<> startCompactionLoop();

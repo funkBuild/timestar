@@ -48,6 +48,8 @@ seastar::future<> TSMFileManager::init() {
         if (fs::exists(base)) {
             for (const auto& entry : fs::directory_iterator(base)) {
                 if (endsWith(entry.path(), ".tsm")) {
+                    if (!fs::is_regular_file(entry.symlink_status()))
+                        throw std::runtime_error("Non-regular TSM directory entry: " + entry.path().string());
                     paths.push_back(fs::canonical(fs::absolute(entry.path())).string());
                 } else if (endsWith(entry.path(), ".tmp")) {
                     // Orphaned publication temporary from a previous crash
@@ -64,6 +66,7 @@ seastar::future<> TSMFileManager::init() {
                 }
             }
         }
+        std::sort(paths.begin(), paths.end());
         return paths;
     });
 
@@ -100,10 +103,10 @@ seastar::future<> TSMFileManager::openTsmFile(std::string path) {
     // nextSequenceId is updated even if open() fails on a corrupt file.
     // This prevents sequence number reuse on the next writeMemstore().
     seastar::shared_ptr<TSM> tsmFile = seastar::make_shared<TSM>(path);
+    const uint64_t tsmSeqNum = tsmFile->rankAsInteger();
+    (void)tsmFile->dataRank();
     const uint64_t highestSequence = std::max(tsmFile->seqNum, tsmFile->dataSeq);
     if (highestSequence >= nextSequenceId) {
-        if (highestSequence == UINT64_MAX) [[unlikely]]
-            throw std::overflow_error("TSM sequence number exhausted");
         nextSequenceId = highestSequence + 1;
     }
 
@@ -112,8 +115,6 @@ seastar::future<> TSMFileManager::openTsmFile(std::string path) {
     // return: startup must not serve an incomplete dataset, and writeMemstore's
     // caller must retain the WAL when the published TSM cannot be registered.
     co_await tsmFile->open();
-
-    uint64_t tsmSeqNum = tsmFile->rankAsInteger();
 
     auto [it, inserted] = sequencedTsmFiles.insert({tsmSeqNum, tsmFile});
     if (!inserted) {
@@ -129,11 +130,15 @@ seastar::future<> TSMFileManager::openTsmFile(std::string path) {
 }
 
 seastar::future<uint64_t> TSMFileManager::writeMemstore(seastar::shared_ptr<MemoryStore> memStore, uint64_t tier) {
+    if (tier > TSM::kMaxTierNumber)
+        throw std::overflow_error("TSM tier number exceeds the 4-bit file identity limit");
     // Honour a rollover-time reservation when present -- see
     // reserveSequenceId() for why assigning here instead would invert LWW
     // ranking under concurrent conversions. Fresh assignment remains for
     // callers that convert sequentially (startup recovery, tests).
-    const uint64_t seqNum = memStore->reservedTsmSeq.has_value() ? *memStore->reservedTsmSeq : nextSequenceId++;
+    const uint64_t seqNum = memStore->reservedTsmSeq.has_value() ? *memStore->reservedTsmSeq : takeSequenceId();
+    if (seqNum > TSM::kMaxSequenceNumber)
+        throw std::overflow_error("Reserved TSM sequence number exceeds the 60-bit file identity limit");
 
     const std::string filename = layout_.tsmFile(shardId, tier, seqNum).string();
 
@@ -218,7 +223,9 @@ bool TSMFileManager::shouldCompactTier(uint64_t tier) const {
 }
 
 seastar::future<> TSMFileManager::addTSMFile(seastar::shared_ptr<TSM> file) {
-    uint64_t tsmSeqNum = file->rankAsInteger();
+    const uint64_t tsmSeqNum = file->rankAsInteger();
+    (void)file->dataRank();
+    const uint64_t highestSequence = std::max(file->seqNum, file->dataSeq);
     auto [it, inserted] = sequencedTsmFiles.insert({tsmSeqNum, file});
     if (!inserted) {
         const std::string newPath = file->getFilePath();
@@ -237,11 +244,7 @@ seastar::future<> TSMFileManager::addTSMFile(seastar::shared_ptr<TSM> file) {
     // that installed generation, so seed from BOTH fields. Seeding from only
     // seqNum let the next write receive a lower dataSeq and lose LWW to the
     // older snapshot forever.
-    const uint64_t highestSequence = std::max(file->seqNum, file->dataSeq);
     if (highestSequence >= nextSequenceId) {
-        if (highestSequence == UINT64_MAX) [[unlikely]] {
-            throw std::overflow_error("TSM sequence number exhausted");
-        }
         nextSequenceId = highestSequence + 1;
     }
 

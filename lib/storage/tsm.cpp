@@ -9,6 +9,7 @@
 #include "zigzag.hpp"
 
 #include <algorithm>
+#include <charconv>
 #include <filesystem>
 #include <numeric>
 #include <seastar/core/file.hh>
@@ -252,48 +253,70 @@ static size_t decodeBlockCountOnly(const uint8_t* data, uint32_t blockSize, uint
 }
 
 TSM::TSM(std::string _absoluteFilePath) {
-    size_t filenameEndIndex = _absoluteFilePath.find_last_of(".");
-    if (filenameEndIndex == std::string::npos)
-        throw std::runtime_error("TSM invalid filename (no extension): " + _absoluteFilePath);
-    size_t filenameStartIndex = _absoluteFilePath.find_last_of("/") + 1;
+    const std::filesystem::path path(_absoluteFilePath);
+    if (path.filename().empty() || path.extension() != ".tsm")
+        throw std::runtime_error("TSM invalid filename: " + _absoluteFilePath);
 
-    if (filenameStartIndex >= filenameEndIndex)
-        throw std::runtime_error("TSM invalid filename (empty basename): " + _absoluteFilePath);
-
-    std::string filename = _absoluteFilePath.substr(filenameStartIndex, filenameEndIndex - filenameStartIndex);
-
-    // Optional data-sequence suffix on compaction outputs: "<tier>_<seq>_d<dataSeq>".
-    // Strip it before the tier/seq parse below; legacy files without the
-    // suffix use seqNum as their dataSeq.
-    std::optional<uint64_t> parsedDataSeq;
-    size_t dSuffixIndex = filename.find_last_of("_");
-    if (dSuffixIndex != std::string::npos && dSuffixIndex + 1 < filename.size() && filename[dSuffixIndex + 1] == 'd') {
-        try {
-            size_t consumed = 0;
-            const std::string digits = filename.substr(dSuffixIndex + 2);
-            uint64_t v = std::stoull(digits, &consumed);
-            if (!digits.empty() && consumed == digits.size()) {
-                parsedDataSeq = v;
-                filename = filename.substr(0, dSuffixIndex);
-            }
-        } catch (const std::exception&) {
-            // Not a data-seq suffix — fall through to the normal parse.
-        }
+    const std::string stem = path.stem().string();
+    std::vector<std::string_view> parts;
+    size_t begin = 0;
+    while (begin <= stem.size()) {
+        const size_t end = stem.find('_', begin);
+        parts.emplace_back(stem.data() + begin, (end == std::string::npos ? stem.size() : end) - begin);
+        if (end == std::string::npos)
+            break;
+        begin = end + 1;
     }
 
-    size_t underscoreIndex = filename.find_last_of("_");
-    if (underscoreIndex == std::string::npos)
-        throw std::runtime_error("TSM invalid filename:" + filename);
+    auto parseExact = [](std::string_view text, uint64_t& out) {
+        if (text.empty())
+            return false;
+        const auto result = std::from_chars(text.data(), text.data() + text.size(), out);
+        return result.ec == std::errc{} && result.ptr == text.data() + text.size();
+    };
 
-    try {
-        tierNum = std::stoull(filename.substr(0, underscoreIndex));
-        seqNum = std::stoull(filename.substr(underscoreIndex + 1));
-        dataSeq = parsedDataSeq.value_or(seqNum);
+    bool valid = false;
+    uint64_t parsedTier = 0;
+    uint64_t parsedSeq = 0;
+    uint64_t parsedDataSeq = 0;
 
-        timestar::tsm_log.debug("tierNum={} seqNum={} dataSeq={}", tierNum, seqNum, dataSeq);
-    } catch (const std::exception&) {
-        throw std::runtime_error("TSM invalid filename:" + filename);
+    // Current layouts:
+    //   <tier>_<seq>.tsm
+    //   <tier>_<seq>_d<data-seq>.tsm
+    // Leading zero padding remains valid for legacy files.
+    if (parts.size() == 2 && parseExact(parts[0], parsedTier) && parseExact(parts[1], parsedSeq)) {
+        parsedDataSeq = parsedSeq;
+        valid = true;
+    } else if (parts.size() == 3 && parts[2].starts_with('d') && parts[2].size() > 1 &&
+               parseExact(parts[0], parsedTier) && parseExact(parts[1], parsedSeq) &&
+               parseExact(parts[2].substr(1), parsedDataSeq)) {
+        valid = true;
     }
+
+    // Legacy offline core-count rebalance outputs remain readable, but their
+    // schemas are explicit. The old prefix-consuming stoull parser accepted
+    // arbitrary spellings such as "0junk_7.tsm" as a real generation.
+    if (!valid && parts.size() == 3 && parts[0] == "0" && (parts[1] == "rebal" || parts[1] == "split") &&
+        parseExact(parts[2], parsedSeq)) {
+        parsedTier = 0;
+        parsedDataSeq = parsedSeq;
+        valid = true;
+    }
+    uint64_t ignoredSourceShard = 0;
+    if (!valid && parts.size() == 4 && parts[0] == "0" && parts[1] == "wal" &&
+        parseExact(parts[2], ignoredSourceShard) && parseExact(parts[3], parsedSeq)) {
+        parsedTier = 0;
+        parsedDataSeq = parsedSeq;
+        valid = true;
+    }
+
+    if (!valid)
+        throw std::runtime_error("TSM invalid filename: " + path.filename().string());
+
+    tierNum = parsedTier;
+    seqNum = parsedSeq;
+    dataSeq = parsedDataSeq;
+    timestar::tsm_log.debug("tierNum={} seqNum={} dataSeq={}", tierNum, seqNum, dataSeq);
 
     filePath = _absoluteFilePath;
 }
@@ -362,23 +385,21 @@ seastar::future<> TSM::close() {
 }
 
 uint64_t TSM::rankAsInteger() {
-    if (tierNum >= 16) {
+    if (tierNum > kMaxTierNumber) {
         throw std::overflow_error("TSM::rankAsInteger: tierNum " + std::to_string(tierNum) +
                                   " >= 16 would overflow in (tierNum << 60)");
     }
-    constexpr uint64_t maxSeqNum = (uint64_t{1} << 60) - 1;
-    if (seqNum > maxSeqNum) [[unlikely]] {
+    if (seqNum > kMaxSequenceNumber) [[unlikely]] {
         throw std::overflow_error("TSM::rankAsInteger: seqNum " + std::to_string(seqNum) + " exceeds 60-bit limit");
     }
     return (tierNum << 60) | seqNum;
 }
 
 uint64_t TSM::dataRank() {
-    if (tierNum >= 16) {
+    if (tierNum > kMaxTierNumber) {
         throw std::overflow_error("TSM::dataRank: tierNum " + std::to_string(tierNum) + " >= 16 exceeds 4-bit limit");
     }
-    constexpr uint64_t maxDataSeq = (uint64_t{1} << 60) - 1;
-    if (dataSeq > maxDataSeq) [[unlikely]] {
+    if (dataSeq > kMaxSequenceNumber) [[unlikely]] {
         throw std::overflow_error("TSM::dataRank: dataSeq " + std::to_string(dataSeq) + " exceeds 60-bit limit");
     }
     // dataSeq-dominant: write recency decides duplicate resolution; tier only

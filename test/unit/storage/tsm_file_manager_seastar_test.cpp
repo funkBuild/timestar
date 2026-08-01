@@ -93,6 +93,95 @@ TEST_F(TSMFileManagerSeastarTest, InitDiscoversExistingFiles) {
     testFMInitDiscoversExistingFiles(this).get();
 }
 
+seastar::future<> testFMInitRejectsNumericPrefixFilename(TSMFileManagerSeastarTest* self) {
+    self->createTestTSMFile("0_1.tsm", "identity.value", {1000}, {1.0});
+    const fs::path malformed = self->tsmDir + "/0_1junk.tsm";
+    fs::rename(self->tsmDir + "/0_1.tsm", malformed);
+
+    TSMFileManager mgr(timestar::StorageLayout("."), seastar::this_shard_id());
+    bool failed = false;
+    try {
+        co_await mgr.init();
+    } catch (const std::runtime_error&) {
+        failed = true;
+    }
+    EXPECT_TRUE(failed);
+    EXPECT_TRUE(fs::exists(malformed));
+    EXPECT_TRUE(mgr.getSequencedTsmFiles().empty());
+    co_await mgr.stop();
+}
+
+TEST_F(TSMFileManagerSeastarTest, InitRejectsNumericPrefixFilename) {
+    testFMInitRejectsNumericPrefixFilename(this).get();
+}
+
+seastar::future<> testFMInitRejectsSymlinkedTsm(TSMFileManagerSeastarTest* self) {
+    const fs::path externalDir = fs::path(self->shardDir) / "external";
+    fs::create_directories(externalDir);
+    {
+        TSMWriter writer((externalDir / "9_9.tsm").string());
+        const SeriesId128 id = SeriesId128::fromSeriesKey("external.value");
+        writer.writeSeries(TSMValueType::Float, id, std::vector<uint64_t>{1000}, std::vector<double>{9.0});
+        writer.writeIndex();
+        writer.close();
+    }
+    const fs::path link = fs::path(self->tsmDir) / "0_1.tsm";
+    fs::create_symlink("../external/9_9.tsm", link);
+
+    TSMFileManager mgr(timestar::StorageLayout("."), seastar::this_shard_id());
+    bool failed = false;
+    try {
+        co_await mgr.init();
+    } catch (const std::runtime_error&) {
+        failed = true;
+    }
+    EXPECT_TRUE(failed);
+    EXPECT_TRUE(fs::is_symlink(link));
+    EXPECT_TRUE(mgr.getSequencedTsmFiles().empty());
+    co_await mgr.stop();
+}
+
+TEST_F(TSMFileManagerSeastarTest, InitRejectsSymlinkedTsm) {
+    testFMInitRejectsSymlinkedTsm(this).get();
+}
+
+seastar::future<> testFMInitRejectsOutOfRangeDataSequence(TSMFileManagerSeastarTest* self) {
+    const std::string name = "0_1_d" + std::to_string(TSM::kMaxSequenceNumber + 1) + ".tsm";
+    self->createTestTSMFile(name, "wide_data_sequence.value", {1000}, {1.0});
+
+    TSMFileManager mgr(timestar::StorageLayout("."), seastar::this_shard_id());
+    bool failed = false;
+    try {
+        co_await mgr.init();
+    } catch (const std::overflow_error&) {
+        failed = true;
+    }
+    EXPECT_TRUE(failed);
+    EXPECT_TRUE(fs::exists(fs::path(self->tsmDir) / name));
+    EXPECT_TRUE(mgr.getSequencedTsmFiles().empty());
+    co_await mgr.stop();
+}
+
+TEST_F(TSMFileManagerSeastarTest, InitRejectsOutOfRangeDataSequence) {
+    testFMInitRejectsOutOfRangeDataSequence(this).get();
+}
+
+seastar::future<> testFMSequenceAllocationStopsAtRankLimit(TSMFileManagerSeastarTest* self) {
+    const std::string name = "0_" + std::to_string(TSM::kMaxSequenceNumber) + ".tsm";
+    self->createTestTSMFile(name, "last_sequence.value", {1000}, {1.0});
+
+    TSMFileManager mgr(timestar::StorageLayout("."), seastar::this_shard_id());
+    co_await mgr.init();
+    EXPECT_EQ(mgr.getSequencedTsmFiles().size(), 1u);
+    EXPECT_THROW((void)mgr.allocateSequenceId(), std::overflow_error);
+    EXPECT_THROW((void)mgr.reserveSequenceId(), std::overflow_error);
+    co_await mgr.stop();
+}
+
+TEST_F(TSMFileManagerSeastarTest, SequenceAllocationStopsAtRankLimit) {
+    testFMSequenceAllocationStopsAtRankLimit(this).get();
+}
+
 // A tombstone sidecar is part of the TSM's logical contents. Startup must not
 // serve the raw points when that delete set is present but cannot be decoded.
 seastar::future<> testFMInitRejectsCorruptTombstone(TSMFileManagerSeastarTest* self) {
@@ -1323,4 +1412,24 @@ seastar::future<> testFMAddTSMFileSeqOverflow(TSMFileManagerSeastarTest* self) {
 
 TEST_F(TSMFileManagerSeastarTest, AddTSMFileSeqOverflow) {
     testFMAddTSMFileSeqOverflow(this).get();
+}
+
+seastar::future<> testFMAddTSMFileDataRankOverflowDoesNotRegister(TSMFileManagerSeastarTest* self) {
+    TSMFileManager mgr(timestar::StorageLayout("."), seastar::this_shard_id());
+    co_await mgr.init();
+
+    self->createTestTSMFile("0_1.tsm", "overflow.data_rank", {1000}, {1.0});
+    const std::string absPath = fs::canonical(fs::absolute(self->tsmDir + "/0_1.tsm")).string();
+    auto tsmFile = seastar::make_shared<TSM>(absPath);
+    co_await tsmFile->open();
+    tsmFile->dataSeq = TSM::kMaxSequenceNumber + 1;
+
+    EXPECT_THROW(co_await mgr.addTSMFile(tsmFile), std::overflow_error);
+    EXPECT_TRUE(mgr.getSequencedTsmFiles().empty());
+    EXPECT_EQ(mgr.getFileCountInTier(0), 0u);
+    co_await tsmFile->close();
+}
+
+TEST_F(TSMFileManagerSeastarTest, AddTSMFileDataRankOverflowDoesNotRegister) {
+    testFMAddTSMFileDataRankOverflowDoesNotRegister(this).get();
 }

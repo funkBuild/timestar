@@ -185,6 +185,28 @@ TEST(LwwTsmRankTest, FilenameParsingAndDataRank) {
     EXPECT_EQ(compacted.rankAsInteger(), (uint64_t{1} << 60) | 42);
 }
 
+TEST(LwwTsmRankTest, FilenameParsingIsExactAndKeepsKnownLegacySchemas) {
+    EXPECT_THROW((void)TSM("/nonexistent/tsm/0junk_7.tsm"), std::runtime_error);
+    EXPECT_THROW((void)TSM("/nonexistent/tsm/0_7junk.tsm"), std::runtime_error);
+    EXPECT_THROW((void)TSM("/nonexistent/tsm/+0_7.tsm"), std::runtime_error);
+    EXPECT_THROW((void)TSM("/nonexistent/tsm/0_7.tsm.backup"), std::runtime_error);
+    EXPECT_THROW((void)TSM("/nonexistent/tsm/0_wal_bad_7.tsm"), std::runtime_error);
+
+    TSM padded("/nonexistent/tsm/00_0000000007.tsm");
+    EXPECT_EQ(padded.tierNum, 0u);
+    EXPECT_EQ(padded.seqNum, 7u);
+
+    TSM walRebalance("/nonexistent/tsm/0_wal_8_0000000042.tsm");
+    EXPECT_EQ(walRebalance.tierNum, 0u);
+    EXPECT_EQ(walRebalance.seqNum, 42u);
+    EXPECT_EQ(walRebalance.dataSeq, 42u);
+
+    TSM collisionRebalance("/nonexistent/tsm/0_rebal_11.tsm");
+    TSM splitRebalance("/nonexistent/tsm/0_split_12.tsm");
+    EXPECT_EQ(collisionRebalance.seqNum, 11u);
+    EXPECT_EQ(splitRebalance.seqNum, 12u);
+}
+
 TEST(LwwTsmRankTest, NewerFlushOutranksOlderCompactedFile) {
     // THE regression this design exists for: an old point compacted into
     // tier 1 (fresh seq 42, data generation 17) must LOSE duplicate
