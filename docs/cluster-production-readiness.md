@@ -8,7 +8,7 @@
 `8620b9e`, `20639dc`, `ea2511b`, `3ac9899`, `69ac879`, `09a62c5`,
 `2e06cb8`, `7151f5d`, `5b22b81`, `fef4886`, `3d2d607`, `f0e28f0`,
 `da55952`, `a1beb94`, `bb5b871`, `e201343`, `6ad2c93`, `9a42d84`,
-`41fdc34`
+`41fdc34`, `a58d2a9`
 
 **Scope:** The recent VShard/Raft cluster redesign, its production-server
 integration, the public HTTP surface, recovery paths, and the release evidence
@@ -21,7 +21,7 @@ used as evidence that the current server is production-ready.
 
 ## Implementation progress after the review
 
-Twenty-three remediation commits are now recorded. Cluster release status remains
+Twenty-four remediation commits are now recorded. Cluster release status remains
 **BLOCKED** because group 0/movement, generation-atomic live snapshot
 replacement, pattern-delete expansion, replicated retention, the large-snapshot
 path, and rolling wire-format compatibility remain open. The four previously
@@ -163,6 +163,11 @@ Completed and covered in this pass:
   with final exhaustion guarded. Fresh creation uses exclusive create and will
   never truncate a pre-existing nonempty segment; only a zero-length artifact
   from a failed creation barrier can be retried in place.
+- Raft journal discovery now treats its per-VShard or per-core directory as an
+  exclusive segment namespace. Any non-canonical or non-regular entry fences
+  startup and is preserved instead of being silently omitted from replay.
+  Segment identities cannot wrap at startup or rotation, and a fresh segment is
+  created exclusively rather than truncating a colliding durable path.
 
 Focused evidence on this pass includes the rebuilt server, unit and socket test
 targets, journal negative tests, alternate-replica routing tests, a black-holed
@@ -171,8 +176,9 @@ identity/topology tests, and pre-proposal admission tests. The strict checkboxes
 below stay open where their stated multi-process or fault-injection “done when”
 evidence has not yet been run.
 
-Final local validation for these remediation commits is green: 4,370/4,370 unit
-tests passed with no skips, 45/45 socket-backed cluster tests passed, the
+Final local validation for these remediation commits is green: all 4,374 unit
+tests completed successfully (4,365 passed and 9 pre-existing SMP-dependent
+tests skipped), 45/45 socket-backed cluster tests passed, the
 first-pass 56/56 focused
 cluster/readiness/identity/admission regressions passed, and the second-pass
 24/24 snapshot/compaction regressions passed. The exact-delete pass additionally
@@ -248,6 +254,7 @@ item are recorded in the fix-up list.
 | CR-30 | P0 | Startup continued after a recovered WAL failed TSM conversion | The node destroyed the recovered in-memory data, created a fresh active WAL, and reported startup success while acknowledged points remained query-invisible in an offline source file. |
 | CR-31 | P0 | WAL recovery discarded fully framed corruption and continued startup | A CRC-invalid or malformed acknowledged command could be omitted from the recovered store while the node served the remaining dataset as complete. |
 | CR-32 | P0 | WAL filename identity was permissive and fresh creation truncated collisions | Malformed names could be skipped or aliased to another sequence, 32-bit allocation could wrap recovery order, and a colliding fresh create could erase the only durable acknowledged segment. |
+| CR-33 | P0 | Raft journal discovery ignored unrecognized entries and segment creation could truncate after identity wrap | A damaged or partially renamed acknowledged segment could be omitted from replay; exhaustion could wrap to segment zero and overwrite an older durable generation. |
 
 ### CR-01 — deletes bypass consensus
 
@@ -503,6 +510,28 @@ remains the sole retryable collision because it could not have accepted an
 acknowledged command. Regressions preserve real WAL contents across malformed
 renames and fresh-create collision, reject numeric-prefix aliases, and recover
 through sequence 4,294,967,296.
+
+### CR-33 — Raft journal discovery skipped possible durable segments
+
+[`JournalWriter::open`](../lib/storage/journal_writer.cpp) added only filenames
+accepted by `parseSegmentFilename` to recovery and silently ignored every other
+directory entry. These journal directories contain no metadata or temporary-file
+namespace, so an ignored entry can be an acknowledged segment whose filename was
+damaged or partially renamed. Startup would then replay an incomplete Raft
+history as though the directory were complete. Independently, the next segment
+was calculated with unchecked `uint64_t` addition and `startSegment` used
+truncate-on-open. At identity exhaustion, startup or rotation could wrap to zero
+and overwrite an older durable segment.
+
+Commit `a58d2a9` requires every journal-directory entry to be a regular file with
+the exact canonical segment name. Any other entry is preserved and fences the
+writer before replay or fresh creation. Startup and rotation explicitly reject
+segment-number exhaustion, fresh segment creation uses exclusive create, and a
+directory-sync failure closes the new descriptor while leaving the existing
+empty-final recovery protocol intact. Regressions cover a valid acknowledged
+segment under a malformed name, a canonical-named non-regular entry, startup at
+`UINT64_MAX`, and rotation from the final available identity without creating or
+truncating segment zero.
 
 ### CR-02 and CR-03 — snapshot contents and live installation were unsafe
 
@@ -840,6 +869,11 @@ is not completion.
   fully consumed 64-bit sequence names and fails on every other `.wal` artifact.
   Allocation cannot wrap, fresh create cannot truncate a nonempty path, and an
   empty failed-create artifact remains safely retryable.
+- [x] **CR-FIX-019I — enforce Raft journal segment identity without destructive
+  collision handling.** Owner: storage. Recovery treats the journal directory
+  as an exclusive namespace and fences on non-canonical or non-regular entries.
+  Startup and rotation cannot wrap the 64-bit identity, and fresh segment
+  creation cannot truncate an existing path.
 
 ### 2. Complete control-plane and identity wiring
 
@@ -1233,4 +1267,16 @@ current full unit suite:                  4370/4370 passed (444 suites, -c 2)
 current socket-backed cluster suite:        45/45 passed (8 suites, -c 2)
 timestar_http_server:                       built successfully
 git diff --check:                           passed
+```
+
+Raft journal identity validation for `a58d2a9`:
+
+```text
+focused journal-writer identity/recovery tests: 17/17 passed
+related writer/sink/GC/Raft persistence tests:  47/47 passed
+current full unit suite:                    4374/4374 successful
+  passed/skipped:                           4365/9 (444 suites, -c 2)
+current socket-backed cluster suite:          45/45 passed (8 suites, -c 2)
+timestar_http_server:                         built successfully
+git diff --check:                             passed
 ```
