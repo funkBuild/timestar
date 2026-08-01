@@ -511,7 +511,7 @@ seastar::future<> ClusterDataPlane::startImpl(const ClusterConfig& cfg, seastar:
                 co_await shards_.invoke_on(
                     0, [voters = decision.initialVoters, ropts, bootstrap = decision.bootstrap(),
                         record = std::move(record), clusterUuid](ShardRaftPlane& plane) mutable -> seastar::future<> {
-                        co_await plane.addGroup0(std::move(voters), ropts);
+                        co_await plane.addGroup0(std::move(voters), ropts, clusterUuid, record);
                         auto* host = plane.group0();
                         if (!host || !host->group() || !host->stateMachine())
                             throw std::runtime_error("cluster: group-0 host failed to register its Raft group");

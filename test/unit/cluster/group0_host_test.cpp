@@ -176,6 +176,37 @@ seastar::future<> periodicPolicyBoundsControlReplay() {
     fs::remove_all(root);
 }
 
+seastar::future<> recoveredIdentityConflictRefusesStartup() {
+    const fs::path root = tempRoot("identity_fence");
+    const JournalIdentity id = identity();
+    NullTransport transport;
+    {
+        Group0Host foreign(transport, 1, root, id);
+        co_await foreign.start({1}, singleVoterOptions());
+        co_await foreign.group()->campaign();
+        EXPECT_TRUE(co_await foreign.propose(InitCluster{"foreign-cluster"}));
+        co_await foreign.compact();
+        co_await foreign.stop();
+    }
+
+    NodeRecord local;
+    local.raftId = 1;
+    local.uuid = "local-node-uuid";
+    local.address = "node-a:8086";
+    local.failureDomain = "rack-a";
+    local.state = NodeState::Active;
+    Group0Host recovered(transport, 1, root, id);
+    bool rejected = false;
+    try {
+        co_await recovered.start({1}, singleVoterOptions(), "expected-cluster", local);
+    } catch (const std::runtime_error&) {
+        rejected = true;
+    }
+    EXPECT_TRUE(rejected);
+    EXPECT_FALSE(recovered.started());
+    fs::remove_all(root);
+}
+
 }  // namespace
 
 TEST(Group0HostTest, UsesReservedWireIdAndRecoversDedicatedJournal) {
@@ -192,4 +223,8 @@ TEST(Group0HostTest, FreshNonVoterIsAnInertObserver) {
 
 TEST(Group0HostTest, PeriodicPolicyBoundsControlReplay) {
     periodicPolicyBoundsControlReplay().get();
+}
+
+TEST(Group0HostTest, RecoveredIdentityConflictFailsStartup) {
+    recoveredIdentityConflictRefusesStartup().get();
 }

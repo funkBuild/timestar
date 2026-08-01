@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <seastar/core/future.hh>
 #include <seastar/core/gate.hh>
 #include <seastar/core/lowres_clock.hh>
@@ -57,7 +58,9 @@ public:
     // observer that knows the seed voter set, then receives the membership entry
     // that admits/promotes it. This never initializes cluster state and never
     // campaigns; bootstrap is an explicit operation at the composition layer.
-    seastar::future<> start(std::vector<raft::NodeId> voters, raft::RaftOptions opts = {});
+    seastar::future<> start(std::vector<raft::NodeId> voters, raft::RaftOptions opts = {},
+                            std::string expectedClusterUuid = {},
+                            std::optional<control::NodeRecord> localRecord = std::nullopt);
     void startTicking();
     seastar::future<> stop();
 

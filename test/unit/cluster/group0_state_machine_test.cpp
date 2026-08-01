@@ -348,3 +348,33 @@ TEST(Group0StateMachineTest, CorruptSnapshotApplyIsFatalAndKeepsOldState) {
     EXPECT_EQ(sm.state().clusterUuid, "keep-me");
     EXPECT_EQ(sm.state().appliedIndex, 0u);
 }
+
+TEST(Group0StateMachineTest, LocalPersistentIdentityFencesCommandsAndSnapshots) {
+    const NodeRecord local = node(1, "local-uuid", "rack-a");
+    Group0StateMachine sm;
+    sm.expectLocalIdentity("cluster-a", local);
+
+    EXPECT_THROW(sm.apply(timestar::raft::LogEntry{1, 1, timestar::raft::EntryType::Normal,
+                                                   encodeCommand(InitCluster{"cluster-b"})})
+                     .get(),
+                 std::runtime_error);
+    EXPECT_TRUE(sm.state().clusterUuid.empty());
+
+    EXPECT_NO_THROW(sm.apply(timestar::raft::LogEntry{1, 2, timestar::raft::EntryType::Normal,
+                                                      encodeCommand(InitCluster{"cluster-a"})})
+                        .get());
+    EXPECT_THROW(sm.apply(timestar::raft::LogEntry{
+                              1, 3, timestar::raft::EntryType::Normal,
+                              encodeCommand(UpsertNode{node(1, "other-uuid", "rack-a")})})
+                     .get(),
+                 std::runtime_error);
+    EXPECT_EQ(sm.state().nodes.count(1), 0u);
+
+    Group0StateMachine foreign;
+    foreign.applyCommand(InitCluster{"cluster-a"});
+    foreign.applyCommand(UpsertNode{node(2, "local-uuid", "rack-b")});
+    EXPECT_FALSE(sm.loadSnapshot(foreign.snapshot()))
+        << "the local persistent UUID cannot reappear under another Raft id";
+    EXPECT_EQ(sm.state().clusterUuid, "cluster-a");
+    EXPECT_EQ(sm.state().nodes.count(2), 0u);
+}

@@ -1046,6 +1046,11 @@ requires a recent acknowledgement of the complete leader log before committing
 `Active`, then requires catch-up through that state transition before voter
 reconciliation. Reconciliation cannot promote an unknown or lagging node.
 
+Each production group-0 state machine is also fenced to its local `node.json`
+identity and configured cluster UUID. A recovered snapshot or committed node
+record that rebinds this node's UUID, Raft ID, address, failure domain, or cluster
+UUID is rejected before application instead of being hosted as control state.
+
 Once hosted, group 0 runs a bounded maintenance path: after 1,024 newly applied
 control entries, a 60-second sweep persists a complete control-state snapshot
 and reclaims sealed journal segments below its durable boundary. A snapshot over

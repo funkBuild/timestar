@@ -1289,8 +1289,12 @@ is not completion.
   cadence, refuses an over-128-MiB
   snapshot before discarding its log prefix, retries maintenance failures, and
   reclaims sealed private-journal segments below the durable snapshot boundary;
-  focused durable recovery/observer/maintenance evidence passes 4/4. This task
-  is not closed.
+  focused durable recovery/observer/maintenance/identity-fence evidence passes
+  5/5. Production
+  hosting now also fences every recovered snapshot and committed identity
+  command against the configured cluster UUID and this data directory's
+  persistent node UUID/address/failure domain; copied or conflicting control
+  state fails before it can be applied. This task is not closed.
 - [ ] **CR-FIX-022 — wire resumable join, drain, remove, replace, and VShard
   movement.** Owner: movement/control plane. Include learner catch-up, verified
   snapshot, log catch-up, joint consensus, leadership transfer, cutover, and

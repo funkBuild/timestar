@@ -378,12 +378,14 @@ public:
 
     // Group 0 is a separate Raft registry on shard 0, sharing this shard's
     // transport but never VShard 0's wire id or journal directory.
-    seastar::future<> addGroup0(std::vector<data::NodeId> voters, raft::RaftOptions opts) {
+    seastar::future<> addGroup0(std::vector<data::NodeId> voters, raft::RaftOptions opts,
+                                std::string expectedClusterUuid = {},
+                                std::optional<control::NodeRecord> localRecord = std::nullopt) {
         if (seastar::this_shard_id() != 0)
             throw std::logic_error("group 0 may only be hosted on reactor shard 0");
         if (!group0_)
             throw std::logic_error("group 0 host was not constructed");
-        return group0_->start(std::move(voters), opts);
+        return group0_->start(std::move(voters), opts, std::move(expectedClusterUuid), std::move(localRecord));
     }
 
     Group0Host* group0() { return group0_.get(); }

@@ -36,7 +36,9 @@ Group0Host::~Group0Host() {
         timestar::http_log.warn("Group0Host destroyed without stop(): control journal was not closed");
 }
 
-seastar::future<> Group0Host::start(std::vector<raft::NodeId> voters, raft::RaftOptions opts) {
+seastar::future<> Group0Host::start(std::vector<raft::NodeId> voters, raft::RaftOptions opts,
+                                    std::string expectedClusterUuid,
+                                    std::optional<control::NodeRecord> localRecord) {
     if (started_ || writer_)
         throw std::logic_error("Group0Host::start called more than once");
     if (voters.empty())
@@ -73,6 +75,8 @@ seastar::future<> Group0Host::start(std::vector<raft::NodeId> voters, raft::Raft
             std::make_unique<raft::JournalRaftPersistence>(*writer_, kControlJournalStorageId, st.nextSeq);
         persistence_->seedRetention(std::move(st.retention));
         sm_ = std::make_unique<control::Group0StateMachine>();
+        if (localRecord)
+            sm_->expectLocalIdentity(std::move(expectedClusterUuid), std::move(*localRecord));
 
         raft::RaftNode node(self_, std::move(baseVoters), std::move(st.log), st.hardState, opts,
                             std::move(baseLearners));

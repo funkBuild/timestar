@@ -156,6 +156,58 @@ bool validNodeSet(const std::vector<NodeId>& nodes) {
 
 }  // namespace
 
+void Group0StateMachine::expectLocalIdentity(std::string clusterUuid, NodeRecord localRecord) {
+    if (clusterUuid.empty() || localRecord.raftId == raft::kNoNode || localRecord.uuid.empty() ||
+        localRecord.address.empty())
+        throw std::invalid_argument("group0: local identity expectation is incomplete");
+    if (expectedLocalRecord_)
+        throw std::logic_error("group0: local identity expectation was configured more than once");
+    expectedClusterUuid_ = std::move(clusterUuid);
+    expectedLocalRecord_ = std::move(localRecord);
+    if (!stateMatchesLocalIdentity(state_))
+        throw std::runtime_error("group0: existing control state conflicts with the local persistent identity");
+}
+
+bool Group0StateMachine::stateMatchesLocalIdentity(const Group0State& state) const {
+    if (!expectedLocalRecord_)
+        return true;
+    if (!state.clusterUuid.empty() && state.clusterUuid != expectedClusterUuid_)
+        return false;
+    const NodeRecord& local = *expectedLocalRecord_;
+    for (const auto& [id, record] : state.nodes) {
+        if (id == local.raftId &&
+            (record.uuid != local.uuid || record.address != local.address ||
+             record.failureDomain != local.failureDomain))
+            return false;
+        if (id != local.raftId && record.uuid == local.uuid)
+            return false;
+    }
+    return true;
+}
+
+void Group0StateMachine::rejectConflictingLocalCommand(const ControlCommand& command) const {
+    if (!expectedLocalRecord_)
+        return;
+    if (const auto* init = std::get_if<InitCluster>(&command)) {
+        if (init->clusterUuid != expectedClusterUuid_)
+            throw std::runtime_error("group0: committed cluster UUID conflicts with local persistent identity");
+        return;
+    }
+    const NodeRecord* record = nullptr;
+    if (const auto* upsert = std::get_if<UpsertNode>(&command))
+        record = &upsert->record;
+    else if (const auto* admission = std::get_if<AdmitWithToken>(&command))
+        record = &admission->record;
+    if (!record)
+        return;
+    const NodeRecord& local = *expectedLocalRecord_;
+    if ((record->raftId == local.raftId &&
+         (record->uuid != local.uuid || record->address != local.address ||
+          record->failureDomain != local.failureDomain)) ||
+        (record->raftId != local.raftId && record->uuid == local.uuid))
+        throw std::runtime_error("group0: committed node record conflicts with local persistent identity");
+}
+
 bool Group0StateMachine::applyCommand(const ControlCommand& cmd) {
     bool ok = true;
     std::visit(
@@ -279,6 +331,7 @@ seastar::future<> Group0StateMachine::apply(raft::LogEntry entry) {
         // should quarantine the group rather than serve divergent control state).
         throw std::runtime_error("group0: undecodable committed control command");
     }
+    rejectConflictingLocalCommand(*cmd);
     applyCommand(*cmd);
     state_.appliedIndex = entry.index;
     return seastar::make_ready_future<>();
@@ -402,7 +455,7 @@ bool Group0StateMachine::loadSnapshot(const std::string& data) {
     } else if (remaining != 0) {
         r.ok = false;
     }
-    if (!r.ok || r.p != r.end || !validSnapshotState(s))
+    if (!r.ok || r.p != r.end || !validSnapshotState(s) || !stateMatchesLocalIdentity(s))
         return false;  // reject a corrupt snapshot without half-applying it
     state_ = std::move(s);
     return true;

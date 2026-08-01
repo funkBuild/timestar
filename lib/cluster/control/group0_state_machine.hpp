@@ -4,6 +4,7 @@
 #include "control_command.hpp"
 #include "group0_state.hpp"
 
+#include <optional>
 #include <seastar/core/future.hh>
 #include <string>
 
@@ -16,6 +17,12 @@ namespace timestar::control {
 // journal safety contract) with no separate coordination service.
 class Group0StateMachine : public raft::RaftStateMachine {
 public:
+    // Install the node-local recovery fence before any snapshot/log entry is
+    // applied. The replicated state remains node-independent; this expectation
+    // only makes this process fail-stop if committed control state names a
+    // different cluster or rebinds its persistent identity.
+    void expectLocalIdentity(std::string clusterUuid, NodeRecord localRecord);
+
     // Apply one committed command entry. Deterministic; no I/O.
     seastar::future<> apply(raft::LogEntry entry) override;
     // Restore the full state from a snapshot payload (produced by snapshot()). A
@@ -36,7 +43,12 @@ public:
     bool applyCommand(const ControlCommand& cmd);
 
 private:
+    bool stateMatchesLocalIdentity(const Group0State& state) const;
+    void rejectConflictingLocalCommand(const ControlCommand& command) const;
+
     Group0State state_;
+    std::string expectedClusterUuid_;
+    std::optional<NodeRecord> expectedLocalRecord_;
 };
 
 }  // namespace timestar::control
