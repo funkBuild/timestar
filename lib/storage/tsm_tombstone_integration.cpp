@@ -21,26 +21,28 @@ std::string TSM::getTombstonePath() const {
 
 // Load tombstones when opening TSM file
 seastar::future<> TSM::loadTombstones() {
-    try {
-        std::string tombstonePath = getTombstonePath();
-        LOG_INSERT_PATH(timestar::tsm_log, trace, "Loading tombstones from: {} for TSM: {}", tombstonePath, filePath);
+    std::string tombstonePath = getTombstonePath();
+    LOG_INSERT_PATH(timestar::tsm_log, trace, "Loading tombstones from: {} for TSM: {}", tombstonePath, filePath);
 
-        tombstones = std::make_unique<timestar::TSMTombstone>(tombstonePath);
+    tombstones = std::make_unique<timestar::TSMTombstone>(tombstonePath);
 
-        // Check if tombstone file exists
-        bool exists = co_await tombstones->exists();
-        LOG_INSERT_PATH(timestar::tsm_log, trace, "Tombstone file exists: {}", exists);
+    // A present sidecar is part of the immutable generation's logical data.
+    // Never open the raw TSM after discarding an unreadable or corrupt delete
+    // set: doing so resurrects points that were durably removed.
+    bool exists = co_await tombstones->exists();
+    LOG_INSERT_PATH(timestar::tsm_log, trace, "Tombstone file exists: {}", exists);
 
-        if (exists) {
+    if (exists) {
+        try {
             co_await tombstones->load();
             LOG_INSERT_PATH(timestar::tsm_log, debug, "Successfully loaded tombstones from: {}", tombstonePath);
-        } else {
-            LOG_INSERT_PATH(timestar::tsm_log, trace, "No tombstone file found for: {}", filePath);
+        } catch (const std::exception& e) {
+            tombstones.reset();
+            throw std::runtime_error("Failed to load tombstone sidecar " + tombstonePath + " for " + filePath +
+                                     ": " + e.what());
         }
-    } catch (const std::exception& e) {
-        // Log warning but don't fail - TSM can work without tombstones
-        timestar::tsm_log.warn("Failed to load tombstones for {}: {}", filePath, e.what());
-        tombstones.reset();  // Clear tombstone manager on error
+    } else {
+        LOG_INSERT_PATH(timestar::tsm_log, trace, "No tombstone file found for: {}", filePath);
     }
     co_return;
 }

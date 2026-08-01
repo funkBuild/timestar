@@ -93,6 +93,35 @@ TEST_F(TSMFileManagerSeastarTest, InitDiscoversExistingFiles) {
     testFMInitDiscoversExistingFiles(this).get();
 }
 
+// A tombstone sidecar is part of the TSM's logical contents. Startup must not
+// serve the raw points when that delete set is present but cannot be decoded.
+seastar::future<> testFMInitRejectsCorruptTombstone(TSMFileManagerSeastarTest* self) {
+    self->createTestTSMFile("0_1.tsm", "corrupt_tombstone.value", {1000, 2000}, {1.0, 2.0});
+    {
+        std::ofstream sidecar(self->tsmDir + "/0_1.tombstone", std::ios::binary | std::ios::trunc);
+        sidecar << "truncated tombstone";
+    }
+
+    TSMFileManager mgr(timestar::StorageLayout("."), seastar::this_shard_id());
+    bool failed = false;
+    try {
+        co_await mgr.init();
+    } catch (const std::runtime_error& e) {
+        const std::string message = e.what();
+        failed = message.find("Failed to load tombstone sidecar") != std::string::npos &&
+                 message.find("0_1.tombstone") != std::string::npos;
+    }
+
+    EXPECT_TRUE(failed);
+    EXPECT_TRUE(mgr.getSequencedTsmFiles().empty())
+        << "a TSM with an unreadable delete set must never enter the live generation";
+    co_await mgr.stop();
+}
+
+TEST_F(TSMFileManagerSeastarTest, InitRejectsCorruptTombstone) {
+    testFMInitRejectsCorruptTombstone(this).get();
+}
+
 // ---------------------------------------------------------------------------
 // Test: Sequence number tracking across init
 // ---------------------------------------------------------------------------
