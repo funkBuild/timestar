@@ -69,6 +69,7 @@ private:
     seastar::gate _backgroundGate;               // Tracks in-flight background TSM conversions
     seastar::semaphore compactionSemaphore{1};   // Only allow 1 rollover at a time
     seastar::semaphore _conversionSemaphore{1};  // Serialize background TSM conversions
+    size_t conversionConcurrency_ = 1;
     std::optional<seastar::abort_source> conversionRetryAbort_;
     std::chrono::milliseconds conversionRetryDelay_{std::chrono::seconds(30)};
     // Backlog at which the burst is considered unabsorbed and logged. Rollover
@@ -90,10 +91,17 @@ private:
     // operation is idempotent across an unlink-success/directory-sync-failure
     // retry and does not return until the removal is directory-durable.
     seastar::future<> removeRecoveredWal(const std::string& path);
+    bool isRetainedStore(const seastar::shared_ptr<MemoryStore>& store) const;
     seastar::future<> runBackgroundConversion(seastar::shared_ptr<MemoryStore> store);
     seastar::future<> retryConversionUntilSuccess(seastar::shared_ptr<MemoryStore> store);
+    seastar::future<> rolloverMemoryStoreImpl(bool force);
 
 public:
+    struct SnapshotQuiesce {
+        seastar::semaphore_units<> rolloverUnits;
+        seastar::semaphore_units<> conversionUnits;
+    };
+
     WALFileManager(timestar::StorageLayout layout, unsigned shard);
     void setDirectorySyncForTesting(std::function<seastar::future<>(const std::string&)> sync) {
         directorySync_ = std::move(sync);
@@ -167,6 +175,15 @@ public:
     template <class T>
     seastar::future<> insertBatch(std::vector<TimeStarInsert<T>>& insertRequests);
     seastar::future<> rolloverMemoryStore();
+    // Rotate even when the current store became logically empty after a
+    // generation tombstone. This retires its old WAL bytes so the next suffix
+    // write cannot get stuck behind the normal empty-store rollover shortcut.
+    seastar::future<> forceRolloverMemoryStore();
+
+    // Stop rollovers/conversions and synchronously publish+retire every rolled
+    // store that still contains `vshard`. Holding the returned units prevents
+    // a retiring store from publishing stale target data during snapshot swap.
+    seastar::future<SnapshotQuiesce> quiesceForVShardSnapshot(uint16_t vshard);
     seastar::future<> convertWalToTsm(seastar::shared_ptr<MemoryStore> store);
     seastar::future<> close();
     std::optional<TSMValueType> getSeriesType(const std::string& seriesKey);

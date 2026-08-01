@@ -224,8 +224,8 @@ TEST_F(WriteMemstoreCouplingTest, RolloverDoesNotBlockOnConversionBacklog) {
     std::string walSource((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
     ASSERT_FALSE(walSource.empty());
 
-    auto pos = walSource.find("WALFileManager::rolloverMemoryStore()");
-    ASSERT_NE(pos, std::string::npos) << "Could not find WALFileManager::rolloverMemoryStore()";
+    auto pos = walSource.find("WALFileManager::rolloverMemoryStoreImpl(bool force)");
+    ASSERT_NE(pos, std::string::npos) << "Could not find WALFileManager::rolloverMemoryStoreImpl(bool force)";
     auto bracePos = walSource.find('{', pos);
     int depth = 1;
     size_t i = bracePos + 1;

@@ -428,6 +428,114 @@ TEST_F(WALFileManagerSeastarTest, RepeatedConversionFailuresRetainAndEventuallyP
         .get();
 }
 
+// Snapshot replacement deletes one VShard from the active store, potentially
+// leaving it logically empty while its WAL still contains the deleted
+// generation. The ordinary rollover shortcut deliberately skips empty stores;
+// the snapshot path needs a forced rotation so that stale WAL bytes cannot be
+// replayed before a later suffix write.
+TEST_F(WALFileManagerSeastarTest, ForceRolloverRetiresLogicallyEmptyActiveWal) {
+    seastar::thread([] {
+        const unsigned shard = seastar::this_shard_id();
+        const timestar::StorageLayout layout(".");
+        fs::create_directories(layout.tsmDir(shard));
+
+        Engine engine(layout);
+        TSMFileManager tsmManager(layout, shard);
+        tsmManager.init().get();
+        WALFileManager walManager(layout, shard);
+        walManager.init(engine, tsmManager).get();
+
+        ASSERT_EQ(walManager.getMemoryStores().size(), 1u);
+        const auto oldSequence = walManager.getMemoryStores().front()->sequenceNumber;
+        const auto oldWal = layout.walFile(shard, oldSequence);
+        ASSERT_TRUE(fs::exists(oldWal));
+
+        // The normal path must keep its concurrent-rollover shortcut.
+        walManager.rolloverMemoryStore().get();
+        ASSERT_EQ(walManager.getMemoryStores().size(), 1u);
+        EXPECT_EQ(walManager.getMemoryStores().front()->sequenceNumber, oldSequence);
+        EXPECT_TRUE(fs::exists(oldWal));
+
+        walManager.forceRolloverMemoryStore().get();
+        ASSERT_EQ(walManager.getMemoryStores().size(), 1u);
+        EXPECT_GT(walManager.getMemoryStores().front()->sequenceNumber, oldSequence);
+        EXPECT_FALSE(fs::exists(oldWal));
+        EXPECT_TRUE(fs::exists(layout.walFile(shard, walManager.getMemoryStores().front()->sequenceNumber)));
+
+        walManager.close().get();
+        tsmManager.stop().get();
+    })
+        .join()
+        .get();
+}
+
+// A conversion that failed publication can be asleep outside the conversion
+// semaphore for tens of seconds. Snapshot replacement must synchronously finish
+// a target-bearing store rather than allowing that retry to publish stale data
+// after the new generation becomes visible.
+TEST_F(WALFileManagerSeastarTest, SnapshotQuiesceDrainsSleepingTargetConversion) {
+    seastar::thread([] {
+        const unsigned shard = seastar::this_shard_id();
+        const timestar::StorageLayout layout(".");
+        fs::create_directories(layout.tsmDir(shard));
+
+        Engine engine(layout);
+        TSMFileManager tsmManager(layout, shard);
+        tsmManager.init().get();
+        WALFileManager walManager(layout, shard);
+        walManager.setConversionRetryDelayForTesting(std::chrono::hours(1));
+        walManager.init(engine, tsmManager).get();
+
+        bool allowPublication = false;
+        size_t publicationAttempts = 0;
+        tsmManager.setDirectorySyncForTesting([&](const std::string& directory) {
+            ++publicationAttempts;
+            if (!allowPublication) {
+                return seastar::make_exception_future<>(
+                    std::runtime_error("injected first snapshot-quiesce publication failure"));
+            }
+            return seastar::sync_directory(directory);
+        });
+
+        TimeStarInsert<double> insert("snapshot_quiesce", "target");
+        insert.addTag("host", "one");
+        insert.addValue(1000, 42.0);
+        const auto seriesId = insert.seriesId128();
+        const auto vshard = timestar::virtualShard(seriesId);
+        walManager.insert(insert).get();
+        const auto sourceSequence = walManager.getMemoryStores().front()->sequenceNumber;
+        const auto sourceWal = layout.walFile(shard, sourceSequence);
+        walManager.rolloverMemoryStore().get();
+
+        for (size_t i = 0; i < 2000 && publicationAttempts == 0; ++i) {
+            seastar::sleep(std::chrono::milliseconds(1)).get();
+        }
+        ASSERT_EQ(publicationAttempts, 1u);
+        ASSERT_TRUE(walManager.hasPendingConversionsForVShard(vshard));
+        ASSERT_TRUE(fs::exists(sourceWal));
+
+        allowPublication = true;
+        {
+            auto quiesce = walManager.quiesceForVShardSnapshot(vshard).get();
+            EXPECT_EQ(publicationAttempts, 2u)
+                << "quiesce must finish the target store immediately, not wait for its retry timer";
+            EXPECT_FALSE(walManager.hasPendingConversionsForVShard(vshard));
+            EXPECT_EQ(walManager.retainedMemoryStoreCount(), 1u);
+            EXPECT_EQ(tsmManager.getSequencedTsmFiles().size(), 1u);
+            EXPECT_FALSE(fs::exists(sourceWal));
+        }
+
+        // The sleeping background retry is still gate-owned. Shutdown aborts
+        // its timer; once it wakes, the retained-store check makes it a no-op.
+        walManager.close().get();
+        EXPECT_EQ(tsmManager.getSequencedTsmFiles().size(), 1u)
+            << "the stale retry must not republish the already-drained store";
+        tsmManager.stop().get();
+    })
+        .join()
+        .get();
+}
+
 // Publication and source retirement are separate durability boundaries. Once
 // the TSM is visible, the old store leaves memory queries to prevent duplicate
 // results, but its still-resident contents must remain admission-accounted

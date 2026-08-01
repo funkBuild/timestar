@@ -64,8 +64,18 @@ seastar::future<> WALFileManager::removeRecoveredWal(const std::string& path) {
     co_await directorySync_(parent.empty() ? "." : parent.string());
 }
 
+bool WALFileManager::isRetainedStore(const seastar::shared_ptr<MemoryStore>& store) const {
+    return std::find(memoryStores.begin(), memoryStores.end(), store) != memoryStores.end() ||
+           std::find(walRetirementStores_.begin(), walRetirementStores_.end(), store) != walRetirementStores_.end();
+}
+
 seastar::future<> WALFileManager::runBackgroundConversion(seastar::shared_ptr<MemoryStore> store) {
     auto conversionUnits = co_await seastar::get_units(_conversionSemaphore, 1);
+    // Snapshot quiescence can synchronously finish a store while this retry is
+    // asleep or queued on the semaphore. Do not republish/retire it a second
+    // time after the quiesce holder releases.
+    if (!isRetainedStore(store))
+        co_return;
     co_await store->close();
 
     // Run the CPU-heavy encode + multi-MB DMA write in the dedicated FLUSH
@@ -129,6 +139,7 @@ seastar::future<> WALFileManager::init(Engine& engine, TSMFileManager& _tsmFileM
     auto maxConversions = static_cast<ssize_t>(timestar::config().storage.conversion_concurrency);
     if (maxConversions < 1)
         maxConversions = 1;
+    conversionConcurrency_ = static_cast<size_t>(maxConversions);
     auto currentConversions = _conversionSemaphore.available_units();
     if (maxConversions > currentConversions) {
         _conversionSemaphore.signal(maxConversions - currentConversions);
@@ -418,6 +429,14 @@ seastar::future<> WALFileManager::insertBatch(std::vector<TimeStarInsert<T>>& in
 }
 
 seastar::future<> WALFileManager::rolloverMemoryStore() {
+    return rolloverMemoryStoreImpl(false);
+}
+
+seastar::future<> WALFileManager::forceRolloverMemoryStore() {
+    return rolloverMemoryStoreImpl(true);
+}
+
+seastar::future<> WALFileManager::rolloverMemoryStoreImpl(bool force) {
     // Acquire the rollover semaphore to serialize concurrent rollover attempts.
     // Multiple insert coroutines may observe needsRollover=true and call this
     // method simultaneously; the semaphore ensures only one rollover executes.
@@ -436,7 +455,7 @@ seastar::future<> WALFileManager::rolloverMemoryStore() {
     // isEmpty() is conservative: it only skips when the store is definitely
     // fresh (no data at all), which means another coroutine must have just
     // rolled over.
-    if (!memoryStores.empty() && memoryStores[0]->isEmpty()) {
+    if (!force && !memoryStores.empty() && memoryStores[0]->isEmpty()) {
         timestar::wal_log.debug("Rollover already completed by another coroutine on shard {}, skipping", shardId);
         co_return;
     }
@@ -553,6 +572,41 @@ seastar::future<> WALFileManager::rolloverMemoryStore() {
 
     timestar::wal_log.info("Rollover complete, new memory store {} created for shard {}", store->sequenceNumber,
                            shardId);
+}
+
+seastar::future<WALFileManager::SnapshotQuiesce> WALFileManager::quiesceForVShardSnapshot(uint16_t vshard) {
+    if (vshard >= timestar::VIRTUAL_SHARD_COUNT)
+        throw std::invalid_argument("WALFileManager::quiesceForVShardSnapshot: invalid VShard");
+
+    // Lock order matches rollover: the rollover semaphore is released before
+    // ordinary conversion work tries to acquire a conversion unit, so waiting
+    // here for every conversion cannot form a cycle.
+    auto rolloverUnits = co_await seastar::get_units(compactionSemaphore, 1);
+    auto conversionUnits = co_await seastar::get_units(_conversionSemaphore, conversionConcurrency_);
+
+    // A failed background conversion may be sleeping outside the semaphore.
+    // Finish target-bearing rolled stores synchronously while its retry is
+    // excluded; the retained-store check in runBackgroundConversion makes that
+    // queued/sleeping retry a no-op after we remove ownership here.
+    auto stores = memoryStores;
+    for (size_t i = 1; i < stores.size(); ++i) {
+        auto& store = stores[i];
+        if (!store || !store->touchesVShard(vshard) || !isRetainedStore(store))
+            continue;
+        co_await store->close();
+        co_await convertWalToTsm(store);
+    }
+
+    // Publication can succeed while WAL retirement's directory barrier fails.
+    // Such a store no longer participates in queries, but its WAL can reappear
+    // on restart; finish that durable handoff before replacing the VShard.
+    auto retirements = walRetirementStores_;
+    for (auto& store : retirements) {
+        if (store && store->touchesVShard(vshard) && isRetainedStore(store))
+            co_await convertWalToTsm(store);
+    }
+
+    co_return SnapshotQuiesce{std::move(rolloverUnits), std::move(conversionUnits)};
 }
 
 seastar::future<> WALFileManager::convertWalToTsm(seastar::shared_ptr<MemoryStore> store) {
