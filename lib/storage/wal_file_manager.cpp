@@ -202,8 +202,14 @@ seastar::future<> WALFileManager::init(Engine& engine, TSMFileManager& _tsmFileM
                 throw;
             } catch (const std::exception& e) {
                 timestar::wal_log.error("Failed to convert WAL {} to TSM on shard {}: {}", seqNum, shardId, e.what());
-                // Preserve WAL file so it can be recovered on next restart
-                timestar::wal_log.warn("Preserving WAL file {} for recovery on next restart", walFilename);
+                // Preserve the source WAL, but never finish startup without its
+                // recovered contents in the live query path. Continuing here
+                // would destroy `store`, create a fresh active WAL, and serve a
+                // silently incomplete dataset until the next restart.
+                timestar::wal_log.error(
+                    "Preserving WAL file {} and refusing startup because its recovered data is not query-visible",
+                    walFilename);
+                throw;
             }
         } else {
             timestar::wal_log.info("WAL {} is empty, removing without creating TSM on shard {}", seqNum, shardId);

@@ -134,6 +134,70 @@ TEST_F(WALFileManagerSeastarTest, RecoveryRemovalDirectorySyncFailureFailsStartu
         .get();
 }
 
+// Preserving a source WAL is not enough to serve safely. If its recovered
+// contents cannot be published, startup must fail instead of discarding the
+// temporary store and serving a fresh, incomplete active store.
+TEST_F(WALFileManagerSeastarTest, RecoveryConversionFailurePreservesWalAndFailsStartup) {
+    seastar::thread([] {
+        const unsigned shard = seastar::this_shard_id();
+        const unsigned sequence = 9011;
+        const timestar::StorageLayout layout(".");
+        fs::create_directories(layout.tsmDir(shard));
+        const std::string walPath = layout.walFile(shard, sequence).string();
+
+        {
+            auto sourceStore = std::make_shared<MemoryStore>(sequence);
+            WAL source(sequence, layout, shard);
+            source.init(sourceStore.get()).get();
+            TimeStarInsert<double> insert("wal_recovery", "conversion_failure");
+            insert.addValue(1000, 9.0);
+            source.insert(insert).get();
+            source.close().get();
+        }
+        ASSERT_TRUE(fs::exists(walPath));
+
+        Engine engine(layout);
+        TSMFileManager tsmManager(layout, shard);
+        tsmManager.init().get();
+        size_t publicationSyncCalls = 0;
+        tsmManager.setDirectorySyncForTesting([&](const std::string&) {
+            ++publicationSyncCalls;
+            return seastar::make_exception_future<>(
+                std::runtime_error("injected recovered TSM publication failure"));
+        });
+        WALFileManager walManager(layout, shard);
+
+        EXPECT_THROW(walManager.init(engine, tsmManager).get(), std::runtime_error);
+        EXPECT_EQ(publicationSyncCalls, 1u);
+        EXPECT_TRUE(fs::exists(walPath)) << "failed startup must retain the recoverable source";
+        EXPECT_TRUE(walManager.getMemoryStores().empty())
+            << "startup must not create a fresh active store after losing recovered visibility";
+        EXPECT_TRUE(tsmManager.getSequencedTsmFiles().empty())
+            << "a TSM whose publication barrier failed must not become query-visible";
+
+        walManager.close().get();
+        tsmManager.stop().get();
+
+        // A failed directory barrier may leave the renamed TSM present. A new
+        // process must still be able to load that valid generation, replay the
+        // preserved WAL into a newer rank, and retire the source durably.
+        Engine retryEngine(layout);
+        TSMFileManager retryTsmManager(layout, shard);
+        retryTsmManager.init().get();
+        EXPECT_EQ(retryTsmManager.getSequencedTsmFiles().size(), 1u);
+        WALFileManager retryWalManager(layout, shard);
+        EXPECT_NO_THROW(retryWalManager.init(retryEngine, retryTsmManager).get());
+        EXPECT_FALSE(fs::exists(walPath));
+        EXPECT_EQ(retryTsmManager.getSequencedTsmFiles().size(), 2u);
+        EXPECT_EQ(retryWalManager.getMemoryStores().size(), 1u);
+
+        retryWalManager.close().get();
+        retryTsmManager.stop().get();
+    })
+        .join()
+        .get();
+}
+
 // Repeated conversion failures must never evict the only live in-memory copy.
 // The retry loop keeps the store visible to queries and pending-conversion
 // accounting until a later attempt publishes it successfully.
