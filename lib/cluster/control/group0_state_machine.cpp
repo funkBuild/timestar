@@ -245,9 +245,12 @@ bool Group0StateMachine::applyCommand(const ControlCommand& cmd) {
                 auto it = state_.joinTokens.find(c.token);
                 if (it != state_.joinTokens.end() && validNodeRecord(state_, c.record)) {
                     state_.joinTokens.erase(it);
-                    NodeRecord rec = c.record;
-                    rec.state = NodeState::Active;
-                    state_.nodes[rec.raftId] = std::move(rec);
+                    NodeRecord record = c.record;
+                    // Admission is a state-machine invariant, not merely a
+                    // controller convention: no caller can encode Active and
+                    // bypass learner catch-up.
+                    record.state = NodeState::Joining;
+                    state_.nodes[record.raftId] = std::move(record);
                 } else {
                     ok = false;  // rejected: no such token
                 }

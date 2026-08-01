@@ -34,20 +34,33 @@ public:
     // allowed; conflicting cluster/node identity fails closed.
     seastar::future<> initCluster(std::string clusterUuid, NodeRecord selfRecord);
 
-    // Admit a node into the cluster (record it Active) and re-evaluate the meta
-    // voter set (which may promote it to a group-0 voter).
+    // Record a node as Joining. It is not eligible for meta-voter selection
+    // until addLearner(), catch-up, and activateCaughtUpLearner() complete.
     seastar::future<> admitNode(NodeRecord record);
 
     // Mint a group-0 join token (leader only) that a joining node must present.
     seastar::future<bool> mintJoinToken(std::string token);
-    // Admit a node ONLY if it presents a valid unused token; the token is
-    // consumed atomically. Reconcile is a separate step (as with admitNode).
+    // Admit a node as Joining ONLY if it presents a valid unused token; the
+    // token is consumed atomically. Reconcile is a later step.
     seastar::future<bool> admitNodeWithToken(NodeRecord record, std::string token);
+
+    // Add an already-admitted Joining or Active node as a NON-VOTING learner. Idempotent
+    // when it is already a member. Promotion is deliberately separate: the
+    // learner must first acknowledge the leader's complete current log.
+    seastar::future<bool> addLearner(raft::NodeId node);
+    bool learnerCaughtUp(raft::NodeId node) const;
+    // Commit Joining -> Active only for a learner that has acknowledged the
+    // leader's complete current tail. Idempotent once Active. The new state
+    // command itself extends the log, so callers must observe catch-up once more
+    // before reconcileMetaVoters may promote the learner.
+    seastar::future<bool> activateCaughtUpLearner(raft::NodeId node);
 
     // Recompute the desired meta voters and, if they differ from the current
     // group-0 configuration, drive a joint-consensus membership change and mirror
     // the new set into the state machine. The acknowledgement waits for final
-    // Cnew to apply, not merely for the joint entry to append. It also repairs a
+    // Cnew to apply, not merely for the joint entry to append. A newly selected
+    // voter must already be a caught-up learner; reconciliation never adds an
+    // unknown/lagging voter directly. It also repairs a
     // stale mirror left by a controller that lost leadership after committing
     // the real configuration. Returns true iff reconciliation work committed.
     seastar::future<bool> reconcileMetaVoters();

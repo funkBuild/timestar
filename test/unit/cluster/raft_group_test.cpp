@@ -337,6 +337,21 @@ seastar::future<> testAwaitedConfChangeSucceedsWhenFinalConfigRemovesLeader() {
     EXPECT_EQ(net.group(1).node().config().voters, (std::vector<NodeId>{2, 3}));
 }
 
+seastar::future<> testSingleVoterLearnerChangeTracksTheJointEntry() {
+    NoopPersistence persistence;
+    NullTransport transport;
+    RecordingSM sm;
+    RaftNode node(/*id=*/1, /*voters=*/{1}, RaftLog{}, HardState{}, opts());
+    RaftGroup group(/*groupId=*/1, std::move(node), persistence, transport, sm);
+    co_await group.campaign();
+    EXPECT_TRUE(group.isLeader());
+
+    EXPECT_TRUE(co_await group.proposeConfChangeAndAwaitApplied({1}, {2}));
+    EXPECT_FALSE(group.node().config().joint());
+    EXPECT_EQ(group.node().config().voters, (std::vector<NodeId>{1}));
+    EXPECT_EQ(group.node().config().learners, (std::vector<NodeId>{2}));
+}
+
 // THE DRIVER MUST PROPAGATE "did a transfer actually start?" (debt D-24). The balancer's
 // `transfers_initiated` counter reaches RaftNode through THIS seam, so a driver that
 // swallowed the answer would leave the counter inflated no matter what the core reports --
@@ -421,4 +436,8 @@ TEST(RaftGroupTest, AwaitedConfigChangeDoesNotAckAtTheJointBoundary) {
 
 TEST(RaftGroupTest, AwaitedConfigChangeSucceedsWhenFinalConfigRemovesLeader) {
     testAwaitedConfChangeSucceedsWhenFinalConfigRemovesLeader().get();
+}
+
+TEST(RaftGroupTest, SingleVoterLearnerChangeTracksTheJointEntry) {
+    testSingleVoterLearnerChangeTracksTheJointEntry().get();
 }

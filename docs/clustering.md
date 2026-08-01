@@ -1040,6 +1040,12 @@ and fresh non-seed nodes host inert observers. The seed/token admission RPC that
 promotes those observers is still outstanding, so this opt-in is not yet a
 multi-node production bootstrap procedure.
 
+The controller-side admission sequence is fail-closed even before that RPC is
+wired: token admission records `Joining`, adds the node only as a learner,
+requires a recent acknowledgement of the complete leader log before committing
+`Active`, then requires catch-up through that state transition before voter
+reconciliation. Reconciliation cannot promote an unknown or lagging node.
+
 Once hosted, group 0 runs a bounded maintenance path: after 1,024 newly applied
 control entries, a 60-second sweep persists a complete control-state snapshot
 and reclaims sealed journal segments below its durable boundary. A snapshot over

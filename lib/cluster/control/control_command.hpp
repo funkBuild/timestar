@@ -68,7 +68,8 @@ struct MintJoinToken {
 };
 
 // Admit a node ONLY if it presents a valid unused join token: atomically
-// consumes the token and records the node Active. If the token is absent
+// consumes the token and records the node as Joining. Active is a later
+// committed transition only after learner catch-up. If the token is absent
 // (invalid/replayed), the command is a no-op -- the node is never implicitly
 // initialized into the cluster.
 struct AdmitWithToken {

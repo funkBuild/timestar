@@ -401,9 +401,16 @@ seastar::future<bool> RaftGroup::proposeConfChangeAndAwaitApplied(std::vector<No
     LogIndex jointIndex = kNoIndex;
     {
         auto units = co_await seastar::get_units(lock_, 1);
+        const LogIndex before = node_.log().lastIndex();
         if (!node_.proposeConfChange(std::move(voters), std::move(learners)))
             co_return false;
-        jointIndex = node_.log().lastIndex();
+        // The one-voter fast path may commit the joint entry and synchronously
+        // append final Cnew inside proposeConfChange(). Sampling lastIndex AFTER
+        // the call therefore sometimes names the final entry, making the waiter
+        // later reject a successful change because finalIndex <= jointIndex.
+        // The proposed joint entry is exactly the next index from the pre-call
+        // tail, regardless of whether the core also appended Cnew.
+        jointIndex = before + 1;
         seastar::promise<bool> promise;
         jointApplied = promise.get_future();
         applyWaiters_.emplace_back(jointIndex, std::move(promise));

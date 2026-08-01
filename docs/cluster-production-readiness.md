@@ -1285,8 +1285,8 @@ is not completion.
   group, no group-0-backed effective-membership/cutover map, no cache/live-map
   publication caller. Static placement and the configured cluster UUID therefore
   remain authoritative even when the control host is opted in. The host now
-  snapshots after 1,024 newly applied
-  control entries on a 60-second maintenance cadence, refuses an over-128-MiB
+  snapshots after 1,024 newly applied control entries on a 60-second maintenance
+  cadence, refuses an over-128-MiB
   snapshot before discarding its log prefix, retries maintenance failures, and
   reclaims sealed private-journal segments below the durable snapshot boundary;
   focused durable recovery/observer/maintenance evidence passes 4/4. This task
@@ -1297,6 +1297,13 @@ is not completion.
   source grace/cleanup. **Done when:** the M5 growth gate runs through the real
   server, resumes after controller/source crashes, and never serves an
   unsynchronised replica.
+  **Progress:** group-0 admission now commits `Joining`, learner addition is a
+  separate final-config-awaited change, `Active` requires a recent full-tail
+  acknowledgement, and voter reconciliation refuses every selected newcomer
+  that is not still a caught-up learner. The membership waiter also handles the
+  one-voter fast path where joint and final entries append synchronously.
+  Controller/waiter evidence passes 7/7. The production join RPC, retrying
+  orchestration, and data-VShard movement remain open.
 - [ ] **CR-FIX-023 — implement ordered VShard teardown and reclaim-floor
   retirement.** Owner: movement/snapshot. **Done when:** both per-VShard and
   shared journals reclaim departed groups, re-adding the same VShard cannot

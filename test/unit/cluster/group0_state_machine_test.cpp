@@ -215,15 +215,15 @@ TEST(Group0StateMachineTest, JobsAreIdempotentAndMonotonic) {
 
 TEST(Group0StateMachineTest, JoinTokenGatesAdmission) {
     Group0StateMachine sm;
-    NodeRecord n = node(5, "u5", "rack-e", NodeState::Joining);
+    NodeRecord n = node(5, "u5", "rack-e", NodeState::Active);
     // Without a minted token, admission is rejected (never implicit init).
     EXPECT_FALSE(sm.applyCommand(AdmitWithToken{n, "tok-1"}));
     EXPECT_EQ(sm.state().nodes.count(5), 0u);
-    // Mint the token, then admit -> node recorded Active, token consumed.
+    // Even an encoded Active state cannot bypass learner-first admission.
     sm.applyCommand(MintJoinToken{"tok-1"});
     EXPECT_EQ(sm.state().joinTokens.count("tok-1"), 1u);
     EXPECT_TRUE(sm.applyCommand(AdmitWithToken{n, "tok-1"}));
-    EXPECT_EQ(sm.state().nodes.at(5).state, NodeState::Active);
+    EXPECT_EQ(sm.state().nodes.at(5).state, NodeState::Joining);
     EXPECT_EQ(sm.state().joinTokens.count("tok-1"), 0u);  // single-use
     // Replaying the same token is rejected (already consumed).
     EXPECT_FALSE(sm.applyCommand(AdmitWithToken{node(6, "u6", "rack-f"), "tok-1"}));

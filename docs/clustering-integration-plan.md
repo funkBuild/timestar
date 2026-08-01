@@ -416,7 +416,9 @@ Extend `cluster_runtime.{hpp,cpp}` + `bin/timestar_http_server.cpp`:
    No implicit initialization, ever.
 3. **Group-0 hosting:** one `RaftGroup(0)` + `Group0StateMachine` on core 0,
    journal-backed via `raft_journal_persistence`; `reconcileMetaVoters`
-   drives odd voter counts across `NodeRecord::failureDomain`s;
+   drives odd voter counts across `NodeRecord::failureDomain`s only after a
+   `Joining` node is added as a learner, acknowledges the full current tail,
+   and commits `Active`; direct promotion of an unknown/lagging voter is refused;
    `stampControllerTermIfLeader` on leadership. `epoch_regression_guard`
    wired: regressed group-0 state freezes control actuation (data plane
    continues), operator supersession required.

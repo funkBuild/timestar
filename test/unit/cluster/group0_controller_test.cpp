@@ -173,13 +173,40 @@ seastar::future<> testClusterInitGrowsMetaVotersAcrossDomains() {
     EXPECT_EQ(nodes[1].sm->state().clusterUuid, "cluster-xyz");
     EXPECT_EQ(nodes[1].group->node().config().voters, (std::vector<NodeId>{1}));
 
-    // Admit node 2 (rack-b), let it commit, then reconcile: meta voters -> {1,2}.
+    // Admission alone must never add a lagging voter. Add it as a learner,
+    // replicate the complete tail, then reconcile: meta voters -> {1,2}.
     co_await drive(controller.admitNode(rec(2, "rack-b")), nodes, router);
+    EXPECT_EQ(nodes[1].sm->state().nodes.at(2).state, NodeState::Joining);
+    EXPECT_FALSE(co_await controller.reconcileMetaVoters());
+    EXPECT_FALSE(co_await controller.activateCaughtUpLearner(2));
+    EXPECT_TRUE(co_await drive(controller.addLearner(2), nodes, router));
+    for (int i = 0; i < 3 && !controller.learnerCaughtUp(2); ++i)
+        co_await tickAndPump(nodes, router);
+    EXPECT_TRUE(controller.learnerCaughtUp(2));
+    EXPECT_TRUE(co_await drive(controller.activateCaughtUpLearner(2), nodes, router));
+    for (int i = 0; i < 3 && !controller.learnerCaughtUp(2); ++i)
+        co_await tickAndPump(nodes, router);
+    EXPECT_TRUE(controller.learnerCaughtUp(2));
     EXPECT_TRUE(co_await drive(controller.reconcileMetaVoters(), nodes, router));
     EXPECT_EQ(nodes[1].group->node().config().voters, (std::vector<NodeId>{1, 2}));
+    co_await controller.admitNode(rec(2, "rack-b"));
+    EXPECT_EQ(nodes[1].sm->state().nodes.at(2).state, NodeState::Active)
+        << "an admission retry must never regress an active node to Joining";
+    EXPECT_TRUE(co_await controller.activateCaughtUpLearner(2))
+        << "activation remains idempotent after learner promotion";
 
-    // Admit node 3 (rack-c), commit, reconcile: meta voters -> {1,2,3} (one per domain).
+    // Repeat for node 3. It cannot enter Cnew before learner catch-up.
     co_await drive(controller.admitNode(rec(3, "rack-c")), nodes, router);
+    EXPECT_EQ(nodes[1].sm->state().nodes.at(3).state, NodeState::Joining);
+    EXPECT_FALSE(co_await controller.reconcileMetaVoters());
+    EXPECT_TRUE(co_await drive(controller.addLearner(3), nodes, router));
+    for (int i = 0; i < 3 && !controller.learnerCaughtUp(3); ++i)
+        co_await tickAndPump(nodes, router);
+    EXPECT_TRUE(controller.learnerCaughtUp(3));
+    EXPECT_TRUE(co_await drive(controller.activateCaughtUpLearner(3), nodes, router));
+    for (int i = 0; i < 3 && !controller.learnerCaughtUp(3); ++i)
+        co_await tickAndPump(nodes, router);
+    EXPECT_TRUE(controller.learnerCaughtUp(3));
     EXPECT_TRUE(co_await drive(controller.reconcileMetaVoters(), nodes, router));
     EXPECT_EQ(nodes[1].group->node().config().voters, (std::vector<NodeId>{1, 2, 3}));
     EXPECT_FALSE(nodes[1].group->node().config().joint());
@@ -290,12 +317,18 @@ seastar::future<> testJoinTokenGatesAdmission() {
     EXPECT_TRUE(co_await controller.admitNodeWithToken(rec(2, "rack-b"), "join-42"));
     co_await router.pump();
     EXPECT_EQ(nodes[1].sm->state().nodes.count(2), 1u);
-    EXPECT_EQ(nodes[1].sm->state().nodes.at(2).state, NodeState::Active);
+    EXPECT_EQ(nodes[1].sm->state().nodes.at(2).state, NodeState::Joining);
     EXPECT_EQ(nodes[1].sm->state().joinTokens.count("join-42"), 0u);
     EXPECT_TRUE(co_await controller.admitNodeWithToken(rec(2, "rack-b"), "join-42"))
         << "an ambiguous retry for the admitted identity is idempotent";
     EXPECT_FALSE(co_await controller.admitNodeWithToken(rec(3, "rack-c"), "join-42"))
         << "a consumed token cannot admit another identity";
+
+    co_await controller.mintJoinToken("still-live");
+    co_await router.pump();
+    EXPECT_FALSE(co_await controller.admitNodeWithToken(rec(2, "rack-b"), "still-live"))
+        << "an existing identity must not appear to consume a still-live token";
+    EXPECT_EQ(nodes[1].sm->state().joinTokens.count("still-live"), 1u);
 
     bool conflictingInitRejected = false;
     try {

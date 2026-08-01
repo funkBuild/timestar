@@ -6,6 +6,15 @@
 
 namespace timestar::control {
 
+namespace {
+
+bool sameNodeIdentity(const NodeRecord& a, const NodeRecord& b) {
+    return a.raftId == b.raftId && a.uuid == b.uuid && a.address == b.address &&
+           a.failureDomain == b.failureDomain;
+}
+
+}  // namespace
+
 seastar::future<bool> Group0Controller::proposeCommand(ControlCommand cmd) {
     if (!g0_.isLeader())
         co_return false;
@@ -76,11 +85,16 @@ seastar::future<> Group0Controller::initCluster(std::string clusterUuid, NodeRec
 }
 
 seastar::future<> Group0Controller::admitNode(NodeRecord record) {
-    // Record the node. Meta-voter reconciliation is a SEPARATE step
-    // (reconcileMetaVoters) run once this command has COMMITTED and applied, so
-    // selectMetaVoters observes the new node -- the controller's reconcile loop
-    // drives it, not this call.
-    record.state = NodeState::Active;
+    // Admission records identity but grants no serving/voting role. A separate
+    // learner catch-up and committed state transition make it Active.
+    record.state = NodeState::Joining;
+    if (auto it = sm_.state().nodes.find(record.raftId); it != sm_.state().nodes.end()) {
+        if (!sameNodeIdentity(it->second, record))
+            throw std::runtime_error("group0 admission conflicts with the existing node identity");
+        // Never regress Active/Draining/Down on an admission retry. A replacement
+        // is a separate lifecycle operation, not an UpsertNode side effect.
+        co_return;
+    }
     co_await proposeCommand(UpsertNode{record});
 }
 
@@ -93,9 +107,18 @@ seastar::future<bool> Group0Controller::mintJoinToken(std::string token) {
 seastar::future<bool> Group0Controller::admitNodeWithToken(NodeRecord record, std::string token) {
     // The token is validated + consumed atomically at apply time; the command
     // is a no-op if the token is invalid. Reconcile runs as a separate step.
-    record.state = NodeState::Active;
+    record.state = NodeState::Joining;
     if (!g0_.isLeader())
         co_return false;
+    if (auto it = sm_.state().nodes.find(record.raftId); it != sm_.state().nodes.end()) {
+        if (!sameNodeIdentity(it->second, record))
+            co_return false;
+        // A missing token plus the exact committed identity is an ambiguous
+        // retry after admission. If the token is still live, however, no
+        // command consumed it: do not report a successful admission while
+        // leaving reusable authority behind.
+        co_return !sm_.state().joinTokens.contains(token);
+    }
     if (!sm_.state().joinTokens.contains(token)) {
         // An ambiguous retry after the first command committed is idempotently
         // successful only for the exact node record that consumed it. A replay
@@ -110,6 +133,47 @@ seastar::future<bool> Group0Controller::admitNodeWithToken(NodeRecord record, st
     co_return it != sm_.state().nodes.end() && it->second == record;
 }
 
+seastar::future<bool> Group0Controller::addLearner(raft::NodeId node) {
+    if (!g0_.isLeader() || node == raft::kNoNode || node == self())
+        co_return false;
+    const auto record = sm_.state().nodes.find(node);
+    if (record == sm_.state().nodes.end() ||
+        (record->second.state != NodeState::Joining && record->second.state != NodeState::Active))
+        co_return false;
+    const auto& config = g0_.node().config();
+    if (config.joint())
+        co_return false;
+    if (config.isVoter(node) || config.isLearner(node))
+        co_return true;
+    std::vector<NodeId> learners = config.learners;
+    learners.push_back(node);
+    std::sort(learners.begin(), learners.end());
+    co_return co_await g0_.proposeConfChangeAndAwaitApplied(config.voters, std::move(learners));
+}
+
+bool Group0Controller::learnerCaughtUp(raft::NodeId node) const {
+    if (!g0_.isLeader() || !g0_.node().isLearner(node))
+        return false;
+    // Equality is intentional. While a caller waits, new control proposals may
+    // extend the target; promotion is safe only after an acknowledgement for the
+    // leader's current tail, not a stale target sampled earlier.
+    return g0_.node().matchIndexOf(node) == g0_.node().log().lastIndex() &&
+           g0_.node().ticksSinceAck(node) <= g0_.node().heartbeatTimeout();
+}
+
+seastar::future<bool> Group0Controller::activateCaughtUpLearner(raft::NodeId node) {
+    if (!g0_.isLeader())
+        co_return false;
+    const auto record = sm_.state().nodes.find(node);
+    if (record == sm_.state().nodes.end())
+        co_return false;
+    if (record->second.state == NodeState::Active)
+        co_return true;
+    if (record->second.state != NodeState::Joining || !learnerCaughtUp(node))
+        co_return false;
+    co_return co_await proposeCommand(SetNodeState{node, NodeState::Active});
+}
+
 seastar::future<bool> Group0Controller::reconcileMetaVoters() {
     if (!g0_.isLeader())
         co_return false;
@@ -118,13 +182,26 @@ seastar::future<bool> Group0Controller::reconcileMetaVoters() {
     const std::vector<NodeId> desired = selectMetaVoters(sm_.state().nodes, current, metaTarget_);
     if (desired.empty())
         co_return false;
+    const auto& config = g0_.node().config();
+    if (config.joint())
+        co_return false;
+    for (NodeId node : desired) {
+        if (std::find(current.begin(), current.end(), node) != current.end())
+            continue;
+        if (!learnerCaughtUp(node))
+            co_return false;
+    }
     // Self-managed membership: the actual voter change is a joint-consensus
     // group-0 configuration entry; the SetMetaVoters command only mirrors the
     // result into the state machine for readers (config entries are not applied
     // to the SM).
     bool changed = false;
     if (metaVotersDiffer(current, desired)) {
-        changed = co_await g0_.proposeConfChangeAndAwaitApplied(desired, /*learners=*/{});
+        std::vector<NodeId> remainingLearners;
+        for (NodeId learner : config.learners)
+            if (std::find(desired.begin(), desired.end(), learner) == desired.end())
+                remainingLearners.push_back(learner);
+        changed = co_await g0_.proposeConfChangeAndAwaitApplied(desired, std::move(remainingLearners));
         if (!changed)
             co_return false;
     }
