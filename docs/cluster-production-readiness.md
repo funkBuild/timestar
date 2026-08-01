@@ -9,7 +9,8 @@
 `2e06cb8`, `7151f5d`, `5b22b81`, `fef4886`, `3d2d607`, `f0e28f0`,
 `da55952`, `a1beb94`, `bb5b871`, `e201343`, `6ad2c93`, `9a42d84`,
 `41fdc34`, `a58d2a9`, `6a73809`, `81692a4`, `d363348`, `2749027`,
-`1f61f49`, `b2c7d0b`, `872f7e1`
+`1f61f49`, `b2c7d0b`, `872f7e1`, `023d9c3`, `d5f4755`, `7f6d7e8`,
+`7760ebd`, `6557666`, `c8f28c8`
 
 **Scope:** The recent VShard/Raft cluster redesign, its production-server
 integration, the public HTTP surface, recovery paths, and the release evidence
@@ -22,12 +23,12 @@ used as evidence that the current server is production-ready.
 
 ## Implementation progress after the review
 
-Thirty-one remediation commits are now recorded. Cluster release status remains
-**BLOCKED** because group 0/movement, generation-atomic live snapshot
-replacement, atomic and retry-safe pattern-delete semantics, replicated
-retention, the large-snapshot path, and rolling wire-format compatibility remain
-open. The four previously stale live release gates now pass on the same
-executable candidate and no longer block release by themselves.
+Thirty-seven remediation commits are now recorded. Cluster release status
+remains **BLOCKED** because group 0/movement, atomic and retry-safe
+pattern-delete semantics, replicated retention, the large-snapshot path, and
+rolling wire-format compatibility remain open. The four previously stale live
+release gates now pass on the same executable candidate and no longer block
+release by themselves.
 
 Completed and covered in this pass:
 
@@ -61,12 +62,15 @@ Completed and covered in this pass:
   refuses missing/non-canonical metadata. Fresh-replica install reconstructs
   NativeIndex metadata, durable value types, and exact day membership, so normal
   series discovery works after catch-up.
-- Snapshot install validates payload VShard, extent/file agreement, VShard
-  purity, tombstone absence, wire basenames, catalog/data identity, and content
-  hashes. It allocates receiver-local immutable names and isolated staging
-  directories. A truly identical resident object is retryable after interruption;
-  any different TSM, WAL/memory, or index-only state fails closed until a real
-  generation swap exists.
+- Snapshot install validates the complete data and catalog payload before its
+  first mutation, then replaces a live VShard generation under one Engine-wide
+  install serialization point. It quiesces target WAL conversion, durably
+  deletes target WAL and TSM generations while preserving foreign data in mixed
+  files, publishes a receiver-ranked VShard-pure immutable object, replaces the
+  exact catalog/type/day view, retires superseded pure objects, and rolls to a
+  fresh WAL generation. Root-object reconciliation plus raw-byte identity makes
+  publication retryable after an interrupted directory barrier without
+  duplicating or resurrecting an object.
 - Partitioned production startup now enables VShard-partitioned compaction before
   the background loop. TSM sequence allocation is restored above both filename
   sequence and data sequence, preventing a post-snapshot local write from being
@@ -120,9 +124,12 @@ Completed and covered in this pass:
   `appliedIndex` behind the committed snapshot boundary until the complete
   state-machine install future resolves. The production apply fence therefore
   refuses data queries, metadata, and pattern discovery while an install is
-  partial, then exposes the rebuilt view only after completion. This closes the
-  external-read visibility subtask of CR-FIX-011; it does not make the storage
-  publication itself generation-atomic, which remains CR-FIX-012.
+  partial, then exposes the rebuilt view only after completion. The storage
+  replacement itself is now restart-safe at each durable checkpoint: tests
+  discard all in-memory manager and index state before retrying every injected
+  boundary, and prove immediate exact visibility without restart after a
+  successful non-empty install. This closes CR-FIX-012; CR-FIX-011 retains the
+  live empty-node, retention, and format-negotiation release gates.
 - Shared-journal GC now scans past an individually pinned segment and reclaims
   later fully released segments instead of allowing one idle VShard to retain
   the reactor's entire physical suffix. Recovery accepts only sequence gaps
@@ -222,7 +229,8 @@ identity/topology tests, and pre-proposal admission tests. The strict checkboxes
 below stay open where their stated multi-process or fault-injection “done when”
 evidence has not yet been run.
 
-Final local validation for these remediation commits is green: all 4,416 unit
+Final local validation for the pre-snapshot-replacement remediation commits is
+green: all 4,416 unit
 tests passed at `-c 2`, 47/47 socket-backed cluster tests passed, the
 first-pass 56/56 focused
 cluster/readiness/identity/admission regressions passed, and the second-pass
@@ -236,7 +244,12 @@ preflight, count/byte limits, and partial-fan-out ambiguity coverage. The
 production server links, every cluster-gate shell script passes `bash -n`, and
 `git diff --check` passes. The four named live multi-process gates also pass on
 `2e06cb8`; the additional topology, security, large-snapshot, non-empty
-live-install, and delete concurrency/restart gates remain open.
+live-install, and delete concurrency/restart gates remain open. The later live
+snapshot replacement pass adds 7/7 focused replacement/retirement/compactor
+regressions and 11/11 adjacent snapshot, restore, index-extract, metadata, and
+WAL regressions, all under `--smp 1 --memory 1G`. The every-checkpoint case was
+then rebuilt and rerun separately after strengthening it to reopen the Engine
+before every retry.
 
 ## Decision
 
@@ -734,39 +747,49 @@ the exact release candidate.
 
 ### CR-02 and CR-03 — snapshot contents and live installation were unsafe
 
-[`SnapshotPayload`](../lib/cluster/data/snapshot_payload.hpp) carries a manifest
-and raw TSM file bytes. The producer in
-[`engine_local_store.cpp`](../lib/cluster/integration/engine_local_store.cpp)
-passes an all-zero catalog hash and does not export NativeIndex/catalog records.
-The round-trip test documents that it verifies the installed data through a
-precomputed series ID rather than normal series discovery.
+At the reviewed baseline, `SnapshotPayload` carried a manifest and raw TSM file
+bytes, while the producer in `engine_local_store.cpp` passed an all-zero catalog
+hash and did not export NativeIndex/catalog records. The round-trip test verified
+installed data through a precomputed series ID rather than normal series
+discovery.
 
-The snapshot reader also requires deletes/tombstones to have already been
-materialised into the TSM view, while the producer does not enforce that
-precondition or ship tombstone sidecars. The architecture promises a snapshot
-containing catalog, index extract, data extents, and tombstone objects; the
-current payload does not meet that contract.
+The baseline snapshot reader also required deletes/tombstones to have already
+been materialised into the TSM view, while the producer neither enforced that
+precondition nor shipped tombstone sidecars. The architecture promised a
+snapshot containing catalog, index extract, data extents, and tombstone objects;
+the baseline payload did not meet that contract.
 
-Installation copies source filenames into the live TSM directory. If a rank is
-already registered, [`TSMFileManager::addTSMFile`](../lib/storage/tsm_file_manager.cpp)
-keeps the old open object and closes the new one. In addition, VShard-partitioned
-compaction is described in the integration plan but is not enabled by the
-production server, so a shipped TSM may contain data outside the target VShard.
+Baseline installation copied source filenames into the live TSM directory. If a
+rank was already registered, `TSMFileManager::addTSMFile` kept the old open
+object and closed the new one. VShard-partitioned compaction was also described
+in the integration plan but not enabled by the production server, so a shipped
+TSM could contain data outside the target VShard.
 
-The current snapshot-safety pass closes the silent versions of these failures:
-payload v2 includes the exact catalog, creation ships a resolved VShard-pure
-object, and the receiver uses local names and rejects mixed/non-empty state. It
-also makes an exact data publication retry idempotent, which covers the normal
-crash/replay boundary between file publication and catalog reconstruction.
-Raft does not advance `appliedIndex` until that whole two-step install completes,
-and production data, metadata, and catalog reads use the resulting apply-lag
-fence, so clients cannot observe the intermediate state. CR-FIX-011 remains open
-for the bounded empty-node live gate, replicated-retention coverage, and format
-negotiation. CR-FIX-012 remains open because the storage publication itself is
-not a single generation swap, live replacement is deliberately unsupported,
-and crash injection has not covered every publication boundary. The present
-producer emits at most one file and the receiver rejects multi-file payloads;
-removing that restriction requires atomic generation-directory publication.
+The snapshot-safety and live-replacement passes close these storage failures.
+Payload v2 includes the exact catalog, creation ships a resolved VShard-pure
+object, and the receiver preflights the whole data/catalog bundle before
+mutation. Installation serializes generation replacement, quiesces target WAL
+conversion, durably deletes the prior target generation from WALs and every TSM,
+preserves foreign VShards in mixed files, publishes a receiver-ranked object,
+and reconstructs the exact catalog, value types, and day membership. Exact
+metadata scans authoritative surviving primary rows, so replaced catalog
+aggregates cannot leave phantom series or measurements.
+
+Raft does not advance `appliedIndex` until the complete install resolves, and
+production data, metadata, and catalog reads use the resulting apply-lag fence,
+so clients cannot observe an intermediate generation. Restart tests inject at
+all six durable replacement checkpoints, reopen the Engine before each retry,
+and prove the resulting generation is exact. Separate coverage proves recovery
+from a post-rename directory-barrier failure, idempotent byte-exact retry,
+synchronous retirement of superseded pure snapshot objects, preservation of
+foreign mixed-file and WAL data, immediate visibility on a running non-empty
+Engine, and restart of background compaction after its install drain.
+
+This closes CR-FIX-012. CR-FIX-011 remains open for the bounded empty-node live
+gate, replicated-retention coverage, and format negotiation. The current
+producer deliberately emits at most one file and the receiver rejects
+multi-file payloads; chunking and multi-object transport are tracked by
+CR-FIX-060 rather than required by the current producer's install contract.
 
 ### CR-18 — snapshot upgrade compatibility is unspecified
 
@@ -988,20 +1011,30 @@ is not completion.
   node's entire durable root and drives live/deleted probes, but its first run
   was interrupted and supplies no completion evidence. A bounded rerun,
   replicated-retention coverage (blocked on CR-FIX-040), and format negotiation
-  remain. Generation-atomic storage replacement is tracked separately by
+  remain. Generation-atomic storage replacement is closed separately by
   CR-FIX-012.
-- [ ] **CR-FIX-012 — make live snapshot installation generation-safe and
+- [x] **CR-FIX-012 — make live snapshot installation generation-safe and
   atomic.** Owner: storage. Install into unique immutable object names or replace
   the manager's generation under a fence; remove superseded VShard state without
   colliding with open ranks. **Done when:** install onto a non-empty running
   Engine is immediately visible without restart, survives an injected crash at
   every publish step, and cannot expose old/new mixtures.
-  **Progress:** peer filenames can no longer select live paths; receiver-local
-  sequence/data ranks, per-operation staging, extent/purity validation, and an
-  exact byte+extent+logical-hash idempotent retry are implemented. Any different
-  resident TSM, WAL/memory, or index-only state fails closed. True non-empty
-  replacement, atomic data/index visibility, orphan handling at every injected
-  failure point, and generation cleanup remain open.
+  **Closed:** the complete payload is validated before mutation; installation
+  is serialized per Engine; target WAL conversion is quiesced; durable WAL and
+  TSM generation tombstones remove all old target state while mixed-file and
+  active-WAL foreign VShards remain visible. Publication uses receiver-local
+  ranks, reconciles an object left after an interrupted directory barrier, and
+  requires raw-byte plus logical/catalog identity before reuse. The exact
+  catalog/type/day view is installed under the Raft apply fence, superseded pure
+  objects are durably retired, and a fresh WAL generation is forced afterward.
+  A live non-empty regression proves immediate query and metadata visibility,
+  no old/new mixture, foreign-data preservation, and exact retry without object
+  duplication. Six injected durable checkpoints each close and reopen the
+  Engine before retry; separate post-rename barrier and second-generation
+  retirement tests prove orphan recovery and on-disk cleanup. A compactor
+  regression proves its loop and underlying enable flag resume after the
+  install drain. `023d9c3`, `d5f4755`, `7f6d7e8`, `7760ebd`, `6557666`, and
+  `c8f28c8`.
 - [ ] **CR-FIX-013 — enable and verify VShard-partitioned compaction in cluster
   mode.** Owner: storage. **Done when:** production startup enables the setting,
   tests prove generated snapshot files contain only permitted VShard data, and
@@ -1612,3 +1645,19 @@ all RaftGroup + EngineLocalStore regressions:   13/13 passed (-c 2, --memory 2G)
 timestar_unit_test:                             built successfully (-j2)
 git diff --check:                               passed
 ```
+
+Atomic live VShard replacement validation for `6557666` and `c8f28c8`:
+
+```text
+live replacement/retirement/compactor regressions:       7/7 passed
+adjacent snapshot/restore/index/metadata/WAL regressions: 11/11 passed
+every durable checkpoint reopened before retry:           1/1 passed
+timestar_unit_test:                       built successfully (-j2)
+all test processes:                              --smp 1 --memory 1G
+git diff --check:                                         passed
+```
+
+These tests are deterministic process-reopen fault simulations, not a
+multi-process release gate. They close the storage replacement contract in
+CR-FIX-012; the bounded empty-node public-path gate remains part of CR-FIX-011
+and CR-FIX-078.
