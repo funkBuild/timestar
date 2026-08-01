@@ -447,20 +447,12 @@ TEST(EngineSnapshotApply, EveryDurableCheckpointCanRetryToTheExactGeneration) {
                     .get();
                 EXPECT_THROW(store.installVShardSnapshot(incoming.vshard, incoming.payload).get(), std::runtime_error);
                 EXPECT_TRUE(injected);
-                (*dest)
-                    .invoke_on(assignCore(incoming.vshard, seastar::smp::count),
-                               [](Engine& engine) { engine.setSnapshotInstallCheckpointForTesting({}); })
-                    .get();
-
-                // DataPublished is the most important restart boundary: the
-                // immutable object exists but the exact catalog may not. Close
-                // and reopen here to prove retry does not depend on RAM state.
-                if (checkpoints[index] != SnapshotInstallCheckpoint::DataPublished) {
-                    ASSERT_TRUE(store.installVShardSnapshot(incoming.vshard, incoming.payload).get());
-                    EXPECT_EQ(readFloat(*dest, incoming.series).values, (std::vector<double>{7.0, 8.0}));
-                }
             }
-            if (checkpoints[index] == SnapshotInstallCheckpoint::DataPublished) {
+
+            // Discard every in-memory manager/index decision before retrying.
+            // This makes each hook a recovery boundary, including the
+            // pre-publication fences and post-catalog source retirement.
+            {
                 ScopedShardedEngine reopened;
                 reopened.startAt(destRoot);
                 cluster::EngineLocalStore store(*reopened);
