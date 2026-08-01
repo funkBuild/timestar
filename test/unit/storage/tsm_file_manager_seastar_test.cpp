@@ -240,6 +240,32 @@ TEST_F(TSMFileManagerSeastarTest, AddTSMFile) {
     testFMAddTSMFile(this).get();
 }
 
+seastar::future<> testFMAddTSMFileRejectsDuplicateRank(TSMFileManagerSeastarTest* self) {
+    self->createTestTSMFile("1_10_d8.tsm", "duplicate.first", {1000}, {1.0});
+
+    TSMFileManager mgr(timestar::StorageLayout("."), seastar::this_shard_id());
+    co_await mgr.init();
+
+    self->createTestTSMFile("1_10_d9.tsm", "duplicate.second", {2000}, {2.0});
+    const std::string duplicatePath = fs::canonical(fs::absolute(self->tsmDir + "/1_10_d9.tsm")).string();
+    auto duplicate = seastar::make_shared<TSM>(duplicatePath);
+    co_await duplicate->open();
+
+    bool failed = false;
+    try {
+        co_await mgr.addTSMFile(duplicate);
+    } catch (const std::runtime_error& e) {
+        failed = std::string(e.what()).find("Duplicate TSM rank") != std::string::npos;
+    }
+    EXPECT_TRUE(failed);
+    EXPECT_EQ(mgr.getSequencedTsmFiles().size(), 1u);
+    co_await mgr.stop();
+}
+
+TEST_F(TSMFileManagerSeastarTest, AddTSMFileRejectsDuplicateRank) {
+    testFMAddTSMFileRejectsDuplicateRank(this).get();
+}
+
 // ---------------------------------------------------------------------------
 // Test: removeTSMFiles removes from all tracking structures
 // ---------------------------------------------------------------------------
@@ -363,6 +389,44 @@ seastar::future<> testFMWriteMemstoreDirectorySyncFailureFailsClosed() {
 
 TEST_F(TSMFileManagerSeastarTest, WriteMemstoreDirectorySyncFailureFailsClosed) {
     testFMWriteMemstoreDirectorySyncFailureFailsClosed().get();
+}
+
+// A durably renamed TSM still has to open and validate before the conversion
+// can claim success. Corrupt the final file at that exact boundary and prove
+// the failure reaches the WAL owner instead of being logged and swallowed.
+seastar::future<> testFMWriteMemstoreOpenFailureFailsClosed() {
+    TSMFileManager mgr(timestar::StorageLayout("."), seastar::this_shard_id());
+    co_await mgr.init();
+    mgr.setDirectorySyncForTesting([](const std::string& directory) {
+        for (const auto& entry : fs::directory_iterator(directory)) {
+            if (entry.path().extension() == ".tsm") {
+                std::ofstream corrupt(entry.path(), std::ios::binary | std::ios::trunc);
+                corrupt << "corrupt after publish";
+                return seastar::make_ready_future<>();
+            }
+        }
+        return seastar::make_exception_future<>(std::runtime_error("published TSM was not found"));
+    });
+
+    auto store = seastar::make_shared<MemoryStore>(0);
+    TimeStarInsert<double> insert("open_failure", "value");
+    insert.addValue(1000, 1.0);
+    store->insertMemory(std::move(insert));
+
+    bool failed = false;
+    try {
+        co_await mgr.writeMemstore(store, 0);
+    } catch (const std::exception&) {
+        failed = true;
+    }
+    EXPECT_TRUE(failed);
+    EXPECT_TRUE(mgr.getSequencedTsmFiles().empty())
+        << "an unreadable output must not complete the WAL-to-TSM ownership handoff";
+    co_await mgr.stop();
+}
+
+TEST_F(TSMFileManagerSeastarTest, WriteMemstoreOpenFailureFailsClosed) {
+    testFMWriteMemstoreOpenFailureFailsClosed().get();
 }
 
 // ---------------------------------------------------------------------------
@@ -565,9 +629,9 @@ TEST_F(TSMFileManagerSeastarTest, InitIgnoresNonTSMFiles) {
 }
 
 // ---------------------------------------------------------------------------
-// Test: Init handles corrupted TSM file gracefully
+// Test: Init fails closed on a corrupted TSM file
 // ---------------------------------------------------------------------------
-seastar::future<> testFMInitHandlesCorruptedFile(TSMFileManagerSeastarTest* self) {
+seastar::future<> testFMInitRejectsCorruptedFile(TSMFileManagerSeastarTest* self) {
     // Create a valid TSM file
     self->createTestTSMFile("0_1.tsm", "valid.series", {1000, 2000}, {1.0, 2.0});
 
@@ -578,15 +642,39 @@ seastar::future<> testFMInitHandlesCorruptedFile(TSMFileManagerSeastarTest* self
     }
 
     TSMFileManager mgr(timestar::StorageLayout("."), seastar::this_shard_id());
-    co_await mgr.init();
-
-    // The valid file should still be loaded; the corrupted one should be skipped
-    // (openTsmFile catches runtime_error and logs it)
-    EXPECT_GE(mgr.getSequencedTsmFiles().size(), 1);
+    bool failed = false;
+    try {
+        co_await mgr.init();
+    } catch (const std::exception&) {
+        failed = true;
+    }
+    EXPECT_TRUE(failed) << "startup must not silently omit a corrupt immutable generation";
+    co_await mgr.stop();
 }
 
-TEST_F(TSMFileManagerSeastarTest, InitHandlesCorruptedFile) {
-    testFMInitHandlesCorruptedFile(this).get();
+TEST_F(TSMFileManagerSeastarTest, InitRejectsCorruptedFile) {
+    testFMInitRejectsCorruptedFile(this).get();
+}
+
+// Two different files with the same manager rank make data visibility depend
+// on directory iteration order. Startup must reject the ambiguity.
+seastar::future<> testFMInitRejectsDuplicateRank(TSMFileManagerSeastarTest* self) {
+    self->createTestTSMFile("1_7_d3.tsm", "duplicate.first", {1000}, {1.0});
+    self->createTestTSMFile("1_7_d4.tsm", "duplicate.second", {2000}, {2.0});
+
+    TSMFileManager mgr(timestar::StorageLayout("."), seastar::this_shard_id());
+    bool failed = false;
+    try {
+        co_await mgr.init();
+    } catch (const std::runtime_error& e) {
+        failed = std::string(e.what()).find("Duplicate TSM rank") != std::string::npos;
+    }
+    EXPECT_TRUE(failed);
+    co_await mgr.stop();
+}
+
+TEST_F(TSMFileManagerSeastarTest, InitRejectsDuplicateRank) {
+    testFMInitRejectsDuplicateRank(this).get();
 }
 
 // ---------------------------------------------------------------------------

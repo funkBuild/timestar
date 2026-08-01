@@ -196,9 +196,11 @@ layouts are unchanged from V2. New files are always written as V3, and compactio
 naturally rewrites V2 inputs as V3 output, so V2 files age out of a live system.
 `TSM_VERSION_MIN` is 2; V1 files (pre-universal-stats) are rejected on open.
 
-Note that rejection happens per file, and `TSMFileManager::openTsmFile()` logs and skips
-files that fail to open — so a V1 file's data is unavailable to queries until it is
-re-ingested. There is no migration tool.
+Rejection is fail-closed for the owning shard: `TSMFileManager::openTsmFile()`
+propagates any file-open or index-validation failure, so the server refuses to
+start rather than serving a partial dataset. V1 data must be restored from a
+supported backup or re-ingested before the shard can start; there is no V1
+migration tool.
 
 ## Footer (last 8 bytes)
 

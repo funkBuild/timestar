@@ -561,8 +561,9 @@ seastar::future<> TSM::readSparseIndex() {
     // (0 < bytesLeft < header size) means the index is truncated: accepting
     // the parsed prefix would register the file with only some of its series,
     // and a later compaction of that file DELETES the source — permanently
-    // destroying the unparsed series' data. Reject the whole file instead
-    // (openTsmFile() logs it loudly and leaves the file on disk).
+    // destroying the unparsed series' data. Reject the whole file instead;
+    // TSMFileManager propagates this failure so startup cannot serve a partial
+    // dataset and WAL conversion cannot retire its recoverable source.
     if (indexSlice.bytesLeft() != 0) {
         throw std::runtime_error("TSM index corrupt: " + std::to_string(indexSlice.bytesLeft()) +
                                  " trailing bytes after " + std::to_string(seriesIds.size()) +

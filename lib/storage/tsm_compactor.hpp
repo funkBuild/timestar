@@ -221,7 +221,8 @@ public:
     seastar::future<CompactionResult> compact(
         const std::vector<seastar::shared_ptr<TSM>>& files, uint64_t targetTier, uint64_t targetSeq,
         const std::unordered_map<std::string, RetentionPolicy>& retentionPolicies = {},
-        const std::unordered_map<SeriesId128, std::string, SeriesId128::Hash>& seriesMeasurementMap = {});
+        const std::unordered_map<SeriesId128, std::string, SeriesId128::Hash>& seriesMeasurementMap = {},
+        bool targetPreallocated = false);
 
     // Convenience overload for callers without a pre-allocated plan (auto-allocates tier/seq).
     seastar::future<CompactionResult> compact(

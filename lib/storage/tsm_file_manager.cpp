@@ -106,33 +106,24 @@ seastar::future<> TSMFileManager::openTsmFile(std::string path) {
         nextSequenceId = highestSequence + 1;
     }
 
-    try {
-        co_await tsmFile->open();
+    // Opening and indexing an immutable generation is part of both startup and
+    // the WAL->TSM ownership handoff. Never turn a failure into a successful
+    // return: startup must not serve an incomplete dataset, and writeMemstore's
+    // caller must retain the WAL when the published TSM cannot be registered.
+    co_await tsmFile->open();
 
-        uint64_t tsmSeqNum = tsmFile->rankAsInteger();
+    uint64_t tsmSeqNum = tsmFile->rankAsInteger();
 
-        auto [it, inserted] = sequencedTsmFiles.insert({tsmSeqNum, tsmFile});
-        if (!inserted) {
-            timestar::tsm_log.warn("Duplicate sequence number {} for TSM file: {}, existing file takes precedence",
-                                   tsmSeqNum, path);
-            co_await tsmFile->close();
-        } else {
-            uint64_t tier = tsmFile->tierNum;
-            if (tier < MAX_TIERS) {
-                tiers[tier].push_back(tsmFile);
-            }
-        }
-    } catch (const std::exception& e) {
-        // NOTE: this is a SKIP, not a failure. The file stays on disk but is never
-        // registered in sequencedTsmFiles/tiers, so its data silently disappears
-        // from query results and it is never compacted or reclaimed. Make that
-        // unmistakable in the log -- it is the difference between "one bad file"
-        // and "this node is serving incomplete data".
-        timestar::tsm_log.error(
-            "DATA UNAVAILABLE: failed to open TSM file {}: {}. This file's data will NOT be served by queries "
-            "and the file will not be compacted or deleted.",
-            path, e.what());
-        co_return;
+    auto [it, inserted] = sequencedTsmFiles.insert({tsmSeqNum, tsmFile});
+    if (!inserted) {
+        const std::string existingPath = it->second ? it->second->getFilePath() : "<unknown>";
+        co_await tsmFile->close();
+        throw std::runtime_error("Duplicate TSM rank " + std::to_string(tsmSeqNum) + " for " + path +
+                                 "; already registered by " + existingPath);
+    }
+    uint64_t tier = tsmFile->tierNum;
+    if (tier < MAX_TIERS) {
+        tiers[tier].push_back(tsmFile);
     }
 }
 
@@ -229,14 +220,15 @@ seastar::future<> TSMFileManager::addTSMFile(seastar::shared_ptr<TSM> file) {
     uint64_t tsmSeqNum = file->rankAsInteger();
     auto [it, inserted] = sequencedTsmFiles.insert({tsmSeqNum, file});
     if (!inserted) {
-        timestar::tsm_log.warn("Duplicate sequence number {} when adding TSM file, existing file takes precedence",
-                               tsmSeqNum);
+        const std::string newPath = file->getFilePath();
+        const std::string existingPath = it->second ? it->second->getFilePath() : "<unknown>";
         co_await file->close();
-    } else {
-        uint64_t tier = file->tierNum;
-        if (tier < MAX_TIERS) {
-            tiers[tier].push_back(file);
-        }
+        throw std::runtime_error("Duplicate TSM rank " + std::to_string(tsmSeqNum) + " for " + newPath +
+                                 "; already registered by " + existingPath);
+    }
+    uint64_t tier = file->tierNum;
+    if (tier < MAX_TIERS) {
+        tiers[tier].push_back(file);
     }
 
     // A remotely-created snapshot object can carry a dataSeq above this

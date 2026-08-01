@@ -977,15 +977,17 @@ seastar::future<> TSMCompactor::writeSeriesCompactionData(TSMWriter& writer, Ser
 seastar::future<CompactionResult> TSMCompactor::compact(
     const std::vector<seastar::shared_ptr<TSM>>& files, uint64_t targetTier, uint64_t targetSeq,
     const std::unordered_map<std::string, RetentionPolicy>& retentionPolicies,
-    const std::unordered_map<SeriesId128, std::string, SeriesId128::Hash>& seriesMeasurementMap) {
+    const std::unordered_map<SeriesId128, std::string, SeriesId128::Hash>& seriesMeasurementMap,
+    bool targetPreallocated) {
     if (files.empty()) {
         co_return CompactionResult{};
     }
 
-    // When called without a pre-allocated plan (targetSeq == 0), compute the
-    // target tier from the input files and allocate a fresh sequence ID.
-    // This preserves backward compatibility for direct callers (e.g. tests).
-    if (targetSeq == 0) {
+    // Direct callers use zero as the historical auto-allocation sentinel. A
+    // CompactionPlan cannot use that convention: sequence 0 is a valid first
+    // allocation. `targetPreallocated` keeps a planned (tier, seq=0) intact
+    // instead of silently recomputing the tier and consuming another ID.
+    if (!targetPreallocated && targetSeq == 0) {
         uint64_t maxTier = 0;
         for (const auto& file : files) {
             maxTier = std::max(maxTier, file->tierNum);
@@ -1427,8 +1429,8 @@ seastar::future<CompactionStats> TSMCompactor::executeCompaction(CompactionPlan 
         co_return finalStats;
     }
 
-    auto compactionResult =
-        co_await compact(plan.sourceFiles, plan.targetTier, plan.targetSeqNum, localRetention, localSeriesMap);
+    auto compactionResult = co_await compact(plan.sourceFiles, plan.targetTier, plan.targetSeqNum, localRetention,
+                                             localSeriesMap, /*targetPreallocated=*/true);
 
     if (!compactionResult.outputPath.empty()) {
         // Open the new file
