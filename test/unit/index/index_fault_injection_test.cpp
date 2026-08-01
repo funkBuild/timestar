@@ -181,10 +181,9 @@ SEASTAR_TEST_F(IndexWalFaultInjectionTest, TruncationAtEveryStructuralBoundaryRe
 }
 
 // ENOSPC-aftermath emulation: every acked (synced) record is on disk, followed
-// by a garbage tail in the shapes a failed/partial flush can leave behind.
-// Replay must recover ALL acked records and discard the tail — it must not
-// lose earlier data or fabricate records from the garbage.
-SEASTAR_TEST_F(IndexWalFaultInjectionTest, GarbageTailAfterSyncedRecordsIsDiscarded) {
+// by an incomplete tail in the shapes a failed/partial flush can leave behind.
+// Replay must recover ALL acked records and discard only the incomplete tail.
+SEASTAR_TEST_F(IndexWalFaultInjectionTest, IncompleteTailAfterSyncedRecordsIsDiscarded) {
     constexpr int kRecords = 3;
     auto pristineDir = self->root_ + "/pristine";
     std::filesystem::create_directories(pristineDir);
@@ -212,24 +211,7 @@ SEASTAR_TEST_F(IndexWalFaultInjectionTest, GarbageTailAfterSyncedRecordsIsDiscar
         tails.push_back({t, "length header promising 1MB"});
     }
 
-    // (c) A structurally complete record whose payload was corrupted (CRC
-    //     mismatch) — e.g. a block half-written over old data.
-    {
-        size_t r0end = starts[1];
-        std::string frame = pristine.substr(0, r0end);
-        frame[20] = static_cast<char>(frame[20] ^ 0x5A);  // flip a payload byte
-        tails.push_back({frame, "complete frame with corrupt CRC"});
-    }
-
-    // (d) Undersized record length (< CRC+sequence minimum of 12).
-    {
-        std::string t;
-        appendLE32(t, 4);
-        t += "12345678";
-        tails.push_back({t, "undersized record length"});
-    }
-
-    // (e) Zero-filled DMA padding block: crash between sync()'s padded
+    // (c) Zero-filled DMA padding block: crash between sync()'s padded
     //     dma_write and the logical truncate leaves trailing zeros.
     tails.push_back({std::string(4096, '\0'), "zero-filled DMA padding"});
 
@@ -240,6 +222,110 @@ SEASTAR_TEST_F(IndexWalFaultInjectionTest, GarbageTailAfterSyncedRecordsIsDiscar
         writeWholeFile(dir + "/idx_000000.wal", pristine + tail.bytes);
         co_await self->assertReplayPrefix(dir, kRecords, kRecords, tail.what);
     }
+}
+
+// A fully present record is not a crash tear. Silently discarding one with a
+// bad checksum would let startup serve an index missing acknowledged metadata.
+SEASTAR_TEST_F(IndexWalFaultInjectionTest, CompleteCorruptFrameFailsClosedAndIsPreserved) {
+    auto pristineDir = self->root_ + "/corrupt";
+    std::filesystem::create_directories(pristineDir);
+    auto bytes = co_await self->buildPristineWal(pristineDir, 2);
+    auto starts = parseWalBoundaries(bytes);
+    EXPECT_EQ(starts.size(), 2u);
+    if (starts.size() != 2u)
+        co_return;
+    bytes[starts[1] + 20] = static_cast<char>(bytes[starts[1] + 20] ^ 0x5A);
+
+    const auto path = pristineDir + "/idx_000000.wal";
+    writeWholeFile(path, bytes);
+    auto wal = co_await IndexWAL::open(pristineDir);
+    MemTable mt;
+    bool failed = false;
+    try {
+        (void)co_await wal.replay(mt);
+    } catch (const std::runtime_error&) {
+        failed = true;
+    }
+    EXPECT_TRUE(failed);
+    EXPECT_TRUE(std::filesystem::exists(path));
+    EXPECT_EQ(readWholeFile(path), bytes);
+    co_await wal.close();
+}
+
+SEASTAR_TEST_F(IndexWalFaultInjectionTest, DiscoveryRejectsNumericPrefixAliasAndPreservesIt) {
+    auto dir = self->root_ + "/bad_name";
+    std::filesystem::create_directories(dir);
+    const auto malformed = dir + "/idx_000000junk.wal";
+    writeWholeFile(malformed, "acknowledged-index-bytes");
+
+    bool failed = false;
+    try {
+        (void)co_await IndexWAL::open(dir);
+    } catch (const std::runtime_error&) {
+        failed = true;
+    }
+    EXPECT_TRUE(failed);
+    EXPECT_EQ(readWholeFile(malformed), "acknowledged-index-bytes");
+}
+
+SEASTAR_TEST_F(IndexWalFaultInjectionTest, DiscoveryRejectsSymlinkedWal) {
+    const auto dir = self->root_ + "/symlink";
+    std::filesystem::create_directories(dir);
+    const auto external = self->root_ + "/external.wal";
+    writeWholeFile(external, "external-index-bytes");
+    const auto link = dir + "/idx_000000.wal";
+    std::filesystem::create_symlink("../external.wal", link);
+
+    bool failed = false;
+    try {
+        (void)co_await IndexWAL::open(dir);
+    } catch (const std::runtime_error&) {
+        failed = true;
+    }
+    EXPECT_TRUE(failed);
+    EXPECT_TRUE(std::filesystem::is_symlink(link));
+    EXPECT_EQ(readWholeFile(external), "external-index-bytes");
+}
+
+SEASTAR_TEST_F(IndexWalFaultInjectionTest, FreshOpenRefusesNonemptyCollision) {
+    const auto dir = self->root_ + "/collision";
+    std::filesystem::create_directories(dir);
+    auto wal = co_await IndexWAL::open(dir);
+    const auto path = dir + "/idx_000000.wal";
+    writeWholeFile(path, "existing-index-wal");
+
+    IndexWriteBatch batch;
+    batch.put("new", "value");
+    co_await wal.append(batch);
+    bool failed = false;
+    try {
+        co_await wal.sync();
+    } catch (const std::runtime_error&) {
+        failed = true;
+    }
+    EXPECT_TRUE(failed);
+    EXPECT_EQ(readWholeFile(path), "existing-index-wal");
+}
+
+SEASTAR_TEST_F(IndexWalFaultInjectionTest, GenerationExhaustionCannotWrap) {
+    const auto dir = self->root_ + "/generation_exhaustion";
+    std::filesystem::create_directories(dir);
+    const auto path = dir + "/idx_18446744073709551615.wal";
+    writeWholeFile(path, "");
+
+    auto wal = co_await IndexWAL::open(dir);
+    MemTable mt;
+    EXPECT_EQ(co_await wal.replay(mt), 0u);
+    bool failed = false;
+    try {
+        (void)co_await wal.rotate();
+    } catch (const std::overflow_error&) {
+        failed = true;
+    }
+    EXPECT_TRUE(failed);
+    EXPECT_TRUE(std::filesystem::exists(path));
+    EXPECT_FALSE(std::filesystem::exists(dir + "/idx_000000.wal"));
+    co_await wal.close();
 }
 
 // Multi-generation crash: an old rotated generation is intact on disk, the
@@ -294,6 +380,41 @@ SEASTAR_TEST_F(IndexWalFaultInjectionTest, OldGenerationIntactNewGenerationTorn)
     co_await wal.close();
 }
 
+SEASTAR_TEST_F(IndexWalFaultInjectionTest, TornSealedGenerationFailsClosed) {
+    auto dir = self->root_ + "/sealed_torn";
+    std::filesystem::create_directories(dir);
+    {
+        auto wal = co_await IndexWAL::open(dir);
+        IndexWriteBatch oldBatch;
+        oldBatch.put("old", "durable");
+        co_await wal.append(oldBatch);
+        (void)co_await wal.rotate();
+
+        IndexWriteBatch currentBatch;
+        currentBatch.put("current", "durable");
+        co_await wal.append(currentBatch);
+        co_await wal.close();
+    }
+
+    const auto oldPath = dir + "/idx_000000.wal";
+    auto oldBytes = readWholeFile(oldPath);
+    EXPECT_GT(oldBytes.size(), 1u);
+    oldBytes.pop_back();
+    writeWholeFile(oldPath, oldBytes);
+
+    auto wal = co_await IndexWAL::open(dir);
+    MemTable mt;
+    bool failed = false;
+    try {
+        (void)co_await wal.replay(mt);
+    } catch (const std::runtime_error&) {
+        failed = true;
+    }
+    EXPECT_TRUE(failed);
+    EXPECT_TRUE(std::filesystem::exists(oldPath));
+    co_await wal.close();
+}
+
 // ============================================================================
 // NativeIndex: full-stack recovery over injected faults
 // ============================================================================
@@ -314,6 +435,31 @@ public:
         return best;
     }
 };
+
+// A crash may leave the first frame incomplete, so replay legitimately yields
+// no records while the recovered path is still nonempty. Startup must rotate
+// that generation before the first new mutation instead of truncating it lazily.
+SEASTAR_TEST_F(NativeIndexFaultInjectionTest, TornFirstFrameRotatesBeforeNewWrites) {
+    const std::string walDir = "shard_0/native_index/wal";
+    std::filesystem::create_directories(walDir);
+    writeWholeFile(walDir + "/idx_000000.wal", std::string("\x10\x00\x00", 3));
+
+    SeriesId128 id;
+    {
+        NativeIndex index(timestar::StorageLayout("."), 0);
+        co_await index.open();
+        EXPECT_FALSE(std::filesystem::exists(walDir + "/idx_000000.wal"));
+        id = co_await index.getOrCreateSeriesId("first_torn", {{"host", "a"}}, "value");
+        co_await index.close();
+    }
+
+    {
+        NativeIndex index(timestar::StorageLayout("."), 0);
+        co_await index.open();
+        EXPECT_TRUE((co_await index.getSeriesMetadata(id)).has_value());
+        co_await index.close();
+    }
+}
 
 // A crash leaves acked series records in the WAL followed by a torn tail (the
 // on-disk shape of an ENOSPC / power-cut mid-flush). Reopen must recover every

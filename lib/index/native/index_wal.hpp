@@ -64,6 +64,7 @@ public:
 
     uint64_t sequenceNumber() const { return sequence_; }
     const std::string& currentPath() const { return currentPath_; }
+    bool hasRecoveredFiles() const { return recoveredExistingFiles_; }
 
 private:
     IndexWAL() = default;
@@ -76,6 +77,9 @@ private:
     std::vector<std::string> oldWalPaths_;  // Older WAL generations found on open(), replayed before current
     uint64_t sequence_ = 0;
     uint64_t walGeneration_ = 0;
+    bool recoveredExistingFiles_ = false;
+    bool replaySequenceInitialized_ = false;
+    bool ownsCurrentPath_ = false;
 
     // Seastar DMA file handle and write positions
     std::optional<seastar::file> walFile_;
@@ -101,7 +105,7 @@ private:
     seastar::future<> flushTail();  // Write remaining partial DMA block before close/rotate
 
     // Replay a single WAL file into the target MemTable. Returns records replayed.
-    seastar::future<uint64_t> replayOneFile(const std::string& path, MemTable& target);
+    seastar::future<uint64_t> replayOneFile(const std::string& path, MemTable& target, bool allowTornTail);
 
     static uint32_t computeCrc32(const char* data, size_t len);
     static std::string walFileName(const std::string& dir, uint64_t generation);

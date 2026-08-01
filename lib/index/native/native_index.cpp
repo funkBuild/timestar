@@ -271,6 +271,12 @@ seastar::future<> NativeIndex::open() {
     if (!memtable_->empty()) {
         co_await flushMemTable();
         ::native_index_log.info("Recovered MemTable flushed to SSTable before WAL reuse");
+    } else if (wal_->hasRecoveredFiles()) {
+        // Even a zero-record recovered generation may contain a torn first
+        // frame or be an empty artifact from a crash. Move to a fresh identity
+        // before accepting mutations so lazy open can never truncate it.
+        const auto recoveredPath = co_await wal_->rotate();
+        co_await IndexWAL::deleteFile(recoveredPath);
     }
     co_await wal_->purgeReplayedFiles();
 

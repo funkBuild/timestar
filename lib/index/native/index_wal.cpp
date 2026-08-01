@@ -6,16 +6,21 @@
 #include <fmt/core.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
+#include <charconv>
 #include <cinttypes>
 #include <cstring>
 #include <filesystem>
+#include <limits>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/seastar.hh>
 #include <seastar/core/temporary_buffer.hh>
 #include <seastar/core/thread.hh>
 #include <seastar/util/log.hh>
 #include <stdexcept>
+#include <string_view>
+#include <tuple>
 
 namespace timestar::index {
 
@@ -99,10 +104,33 @@ static uint64_t decodeFixed64(const char* p) {
     return r;
 }
 
-std::string IndexWAL::walFileName(const std::string& dir, uint64_t generation) {
+static std::string walBasename(uint64_t generation) {
     char buf[32];
     snprintf(buf, sizeof(buf), "idx_%06" PRIu64 ".wal", generation);
-    return dir + "/" + buf;
+    return buf;
+}
+
+static std::optional<uint64_t> parseWalGeneration(const std::filesystem::path& path) {
+    const std::string basename = path.filename().string();
+    static constexpr std::string_view prefix = "idx_";
+    static constexpr std::string_view suffix = ".wal";
+    if (!basename.starts_with(prefix) || !basename.ends_with(suffix) ||
+        basename.size() <= prefix.size() + suffix.size()) {
+        return std::nullopt;
+    }
+
+    const std::string_view digits(basename.data() + prefix.size(), basename.size() - prefix.size() - suffix.size());
+    uint64_t generation = 0;
+    const auto result = std::from_chars(digits.data(), digits.data() + digits.size(), generation);
+    if (result.ec != std::errc{} || result.ptr != digits.data() + digits.size() ||
+        basename != walBasename(generation)) {
+        return std::nullopt;
+    }
+    return generation;
+}
+
+std::string IndexWAL::walFileName(const std::string& dir, uint64_t generation) {
+    return (std::filesystem::path(dir) / walBasename(generation)).string();
 }
 
 IndexWAL::~IndexWAL() {
@@ -112,7 +140,11 @@ IndexWAL::~IndexWAL() {
     // The data is durable enough via write() + OS page cache; WAL replay will
     // handle any incomplete records on next startup.
     if ((!buffer_.empty() || !tailBuf_.empty()) && !currentPath_.empty()) {
-        int fd = ::open(currentPath_.c_str(), O_WRONLY | O_CREAT, 0644);
+        int flags = O_WRONLY | O_NOFOLLOW;
+        if (!ownsCurrentPath_) {
+            flags |= O_CREAT | O_EXCL;
+        }
+        int fd = ::open(currentPath_.c_str(), flags, 0644);
         if (fd >= 0) {
             // Seek to dmaWritePos_ so we overwrite any zero-filled region
             // left by truncate, rather than appending after it (O_APPEND
@@ -137,16 +169,63 @@ IndexWAL::~IndexWAL() {
     }
 }
 
-// Open Seastar DMA file handle for the current WAL path.
-// Truncates any existing file — safe because NativeIndex::open() flushes all
-// replayed data to an SSTable (and rotates to a fresh generation) before the
-// first append can reach here.
+// Open Seastar DMA file handle for the current WAL path. A non-empty collision
+// may be the only durable copy of acknowledged index mutations, so fresh open
+// never truncates it. The only reusable artifact is an empty file whose prior
+// directory durability barrier did not complete.
 seastar::future<> IndexWAL::openFile() {
-    walFile_.emplace(co_await seastar::open_file_dma(
-        currentPath_, seastar::open_flags::rw | seastar::open_flags::create | seastar::open_flags::truncate));
+    const auto [pathExists, pathIsRegular] = co_await seastar::async([this] {
+        const auto status = std::filesystem::symlink_status(currentPath_);
+        return std::make_pair(std::filesystem::exists(status), std::filesystem::is_regular_file(status));
+    });
+    if (pathExists && !pathIsRegular) {
+        throw std::runtime_error("Refusing non-regular IndexWAL path: " + currentPath_);
+    }
+
+    const auto flags = pathExists
+                           ? seastar::open_flags::rw
+                           : seastar::open_flags::rw | seastar::open_flags::create | seastar::open_flags::exclusive;
+    walFile_.emplace(co_await seastar::open_file_dma(currentPath_, flags));
+    if (pathExists) {
+        uint64_t existingSize = 0;
+        std::exception_ptr sizeError;
+        try {
+            existingSize = co_await walFile_->size();
+        } catch (...) {
+            sizeError = std::current_exception();
+        }
+        if (sizeError || existingSize != 0) {
+            std::exception_ptr closeError;
+            try {
+                co_await walFile_->close();
+            } catch (...) {
+                closeError = std::current_exception();
+            }
+            walFile_.reset();
+            if (sizeError)
+                std::rethrow_exception(sizeError);
+            if (closeError)
+                std::rethrow_exception(closeError);
+            throw std::runtime_error("Refusing to overwrite existing non-empty IndexWAL: " + currentPath_);
+        }
+    }
+
     // Crash-edge hardening: make the new WAL file's directory entry durable.
     // Cheap — this runs once per WAL generation, not per append.
-    co_await seastar::sync_directory(directory_);
+    std::exception_ptr directorySyncError;
+    try {
+        co_await seastar::sync_directory(directory_);
+    } catch (...) {
+        directorySyncError = std::current_exception();
+    }
+    if (directorySyncError) {
+        try {
+            co_await walFile_->close();
+        } catch (...) {}
+        walFile_.reset();
+        std::rethrow_exception(directorySyncError);
+    }
+    ownsCurrentPath_ = true;
     dmaAlignment_ = walFile_->disk_write_dma_alignment();
     writePos_ = 0;
     dmaWritePos_ = 0;
@@ -217,27 +296,38 @@ seastar::future<> IndexWAL::flushBuffer() {
 
 seastar::future<IndexWAL> IndexWAL::open(std::string directory) {
     // Wrap blocking filesystem calls in seastar::async to avoid reactor stalls.
-    auto [dir, allGens] = co_await seastar::async([directory] {
-        std::filesystem::create_directories(directory);
+    auto [dir, allGens, directoryCreated] = co_await seastar::async([directory] {
+        const auto status = std::filesystem::symlink_status(directory);
+        const bool directoryExists = std::filesystem::exists(status);
+        if (directoryExists && !std::filesystem::is_directory(status)) {
+            throw std::runtime_error("IndexWAL path is not a directory: " + directory);
+        }
+        if (!directoryExists) {
+            std::filesystem::create_directories(directory);
+        }
 
         std::vector<uint64_t> gens;
         for (const auto& entry : std::filesystem::directory_iterator(directory)) {
-            if (entry.path().extension() == ".wal") {
-                auto name = entry.path().stem().string();
-                if (name.starts_with("idx_")) {
-                    try {
-                        uint64_t g = std::stoull(name.substr(4));
-                        gens.push_back(g);
-                    } catch (...) {}
-                }
+            if (!std::filesystem::is_regular_file(entry.symlink_status())) {
+                throw std::runtime_error("Non-regular IndexWAL directory entry: " + entry.path().string());
             }
+            auto generation = parseWalGeneration(entry.path());
+            if (!generation.has_value())
+                throw std::runtime_error("Non-canonical IndexWAL directory entry: " + entry.path().string());
+            gens.push_back(*generation);
         }
         std::sort(gens.begin(), gens.end());
-        return std::make_pair(directory, std::move(gens));
+        return std::make_tuple(directory, std::move(gens), !directoryExists);
     });
+
+    if (directoryCreated) {
+        const auto parent = std::filesystem::path(dir).parent_path();
+        co_await seastar::sync_directory(parent.empty() ? "." : parent.string());
+    }
 
     IndexWAL wal;
     wal.directory_ = dir;
+    wal.recoveredExistingFiles_ = !allGens.empty();
 
     if (allGens.empty()) {
         wal.walGeneration_ = 0;
@@ -259,6 +349,10 @@ seastar::future<> IndexWAL::append(const IndexWriteBatch& batch) {
     // Record layout: length(4) + CRC(4) + sequence(8) + payload(variable)
     // This section is fully synchronous (no co_await), so concurrent appends
     // cannot interleave inside it.
+
+    if (sequence_ == std::numeric_limits<uint64_t>::max()) [[unlikely]] {
+        throw std::overflow_error("IndexWAL record sequence exhausted");
+    }
 
     size_t headerOffset = buffer_.size();
     // Reserve space for header: length(4) + CRC(4) + sequence(8) = 16 bytes
@@ -359,11 +453,11 @@ seastar::future<uint64_t> IndexWAL::replay(MemTable& target) {
     // Replay older WAL generations first (ascending order) — these are from
     // pre-crash rotations where deleteFile() never completed.
     for (const auto& oldPath : oldWalPaths_) {
-        recordsReplayed += co_await replayOneFile(oldPath, target);
+        recordsReplayed += co_await replayOneFile(oldPath, target, false);
     }
 
     // Replay the current (latest) generation
-    recordsReplayed += co_await replayOneFile(currentPath_, target);
+    recordsReplayed += co_await replayOneFile(currentPath_, target, true);
 
     // NOTE: replayed files are NOT deleted here. The replayed data exists only
     // in the volatile MemTable at this point — the caller must first make it
@@ -380,7 +474,7 @@ seastar::future<> IndexWAL::purgeReplayedFiles() {
     oldWalPaths_.clear();
 }
 
-seastar::future<uint64_t> IndexWAL::replayOneFile(const std::string& path, MemTable& target) {
+seastar::future<uint64_t> IndexWAL::replayOneFile(const std::string& path, MemTable& target, bool allowTornTail) {
     uint64_t recordsReplayed = 0;
 
     if (!co_await seastar::file_exists(path)) {
@@ -401,49 +495,82 @@ seastar::future<uint64_t> IndexWAL::replayOneFile(const std::string& path, MemTa
 
     std::string data(buf.get(), buf.size());
     const char* p = data.data();
-    const char* end = p + data.size();
+    const char* const end = p + data.size();
+    bool discardedTornTail = false;
 
-    while (p + 4 <= end) {
-        uint32_t innerLen = decodeFixed32(p);
-        p += 4;
+    auto corruption = [&path, &data](size_t offset, std::string reason) -> void {
+        throw std::runtime_error("Corrupt IndexWAL " + path + " at offset " + std::to_string(offset) + ": " +
+                                 std::move(reason) + " (file size " + std::to_string(data.size()) + ")");
+    };
 
-        if (p + innerLen > end)
-            break;
-        if (innerLen < 12)
-            break;
-
-        uint32_t storedCrc = decodeFixed32(p);
-        p += 4;
-
-        size_t crcDataLen = innerLen - 4;
-        uint32_t computedCrc = computeCrc32(p, crcDataLen);
-        if (storedCrc != computedCrc)
-            break;
-
-        uint64_t seq = decodeFixed64(p);
-        p += 8;
-
-        size_t payloadLen = crcDataLen - 8;
-        std::string_view payload(p, payloadLen);
-        p += payloadLen;
-
-        try {
-            auto batchData = IndexWriteBatch::deserializeFrom(payload);
-            batchData.applyTo(target);
-            sequence_ = seq + 1;
-            ++recordsReplayed;
-        } catch (...) {
+    while (p < end) {
+        const char* const recordStart = p;
+        const size_t recordOffset = static_cast<size_t>(recordStart - data.data());
+        const size_t remaining = static_cast<size_t>(end - recordStart);
+        if (remaining < sizeof(uint32_t)) {
+            if (!allowTornTail)
+                corruption(recordOffset, "incomplete record-length header in sealed generation");
+            discardedTornTail = true;
             break;
         }
+
+        const uint32_t innerLen = decodeFixed32(recordStart);
+        if (innerLen < 12) {
+            // A failed truncate after a padded DMA tail can leave only zeros
+            // beyond the logical end. No other fully present short length is a
+            // crash tear: it is a malformed frame and must fence recovery.
+            const bool zeroPadding =
+                allowTornTail && std::all_of(recordStart, end, [](char byte) { return byte == '\0'; });
+            if (!zeroPadding)
+                corruption(recordOffset, "record length below CRC/sequence minimum");
+            discardedTornTail = true;
+            break;
+        }
+
+        const size_t bodyAvailable = remaining - sizeof(uint32_t);
+        if (innerLen > bodyAvailable) {
+            if (!allowTornTail)
+                corruption(recordOffset, "incomplete record body in sealed generation");
+            discardedTornTail = true;
+            break;
+        }
+
+        const char* const body = recordStart + sizeof(uint32_t);
+        const uint32_t storedCrc = decodeFixed32(body);
+        const size_t crcDataLen = innerLen - sizeof(uint32_t);
+        const uint32_t computedCrc = computeCrc32(body + sizeof(uint32_t), crcDataLen);
+        if (storedCrc != computedCrc)
+            corruption(recordOffset, "CRC32C mismatch in complete frame");
+
+        const uint64_t seq = decodeFixed64(body + sizeof(uint32_t));
+        if (seq == std::numeric_limits<uint64_t>::max())
+            corruption(recordOffset, "record sequence exhausts uint64_t identity");
+        if (replaySequenceInitialized_ && seq != sequence_) {
+            corruption(recordOffset,
+                       "non-contiguous sequence " + std::to_string(seq) + ", expected " + std::to_string(sequence_));
+        }
+
+        const char* const payloadData = body + sizeof(uint32_t) + sizeof(uint64_t);
+        const size_t payloadLen = crcDataLen - sizeof(uint64_t);
+        try {
+            auto batchData = IndexWriteBatch::deserializeFrom(std::string_view(payloadData, payloadLen));
+            batchData.applyTo(target);
+        } catch (const std::exception& e) {
+            corruption(recordOffset, "invalid complete payload: " + std::string(e.what()));
+        } catch (...) {
+            corruption(recordOffset, "invalid complete payload");
+        }
+
+        sequence_ = seq + 1;
+        replaySequenceInitialized_ = true;
+        ++recordsReplayed;
+        p = recordStart + sizeof(uint32_t) + innerLen;
     }
 
-    // Replay stopped before consuming the whole file: torn tail from a crash
-    // mid-append (normal) or corruption (CRC mismatch / bad record). Either
-    // way the remaining bytes are discarded — say so instead of silence.
-    if (p < end) {
+    if (discardedTornTail) {
         index_wal_log.warn(
-            "WAL replay of {} stopped with {} of {} bytes unconsumed ({} records replayed) — "
-            "torn tail or corrupt record, remaining bytes discarded",
+            "WAL replay of {} stopped with {} of {} bytes unconsumed ({} records replayed) — torn final frame "
+            "discarded",
             path, static_cast<size_t>(end - p), data.size(), recordsReplayed);
     }
 
@@ -452,6 +579,10 @@ seastar::future<uint64_t> IndexWAL::replayOneFile(const std::string& path, MemTa
 
 seastar::future<std::string> IndexWAL::rotate() {
     auto units = co_await seastar::get_units(*writeSem_, 1);
+
+    if (walGeneration_ == std::numeric_limits<uint64_t>::max()) [[unlikely]] {
+        throw std::overflow_error("IndexWAL generation exhausted");
+    }
 
     // Materialize buffered records that never hit the flush threshold —
     // append() opens the file lazily only when the buffer fills.
@@ -471,6 +602,7 @@ seastar::future<std::string> IndexWAL::rotate() {
     auto oldPath = currentPath_;
     ++walGeneration_;
     currentPath_ = walFileName(directory_, walGeneration_);
+    ownsCurrentPath_ = false;
 
     // File opened lazily on next append()
 
@@ -481,6 +613,8 @@ seastar::future<> IndexWAL::deleteFile(const std::string& path) {
     if (co_await seastar::file_exists(path)) {
         co_await seastar::remove_file(path);
     }
+    const auto parent = std::filesystem::path(path).parent_path();
+    co_await seastar::sync_directory(parent.empty() ? "." : parent.string());
 }
 
 // Write the remaining tail buffer (partial DMA block) to disk.
