@@ -584,33 +584,29 @@ HTTP write on any node
 ```
 
 Multi-VShard writes are not atomic transactions. The response reports which
-groups committed so a retry can complete the rest. There is no operation-ID
-deduplication machinery: every operation in the data model is idempotent by
-construction, so the retry contract is simply "retry the whole batch". Point
-writes are LWW-keyed by timestamp (a re-applied batch overwrites itself with
-identical values), series creation is get-or-create, range deletes are
-idempotent, and retention cutoffs are monotonic. A re-applied batch is an
-ordinary new log entry applied identically on every replica, so replicas
-cannot diverge. Operation IDs exist only for tracing and log correlation and
-carry no durable state. This idempotency is a standing invariant: any future
-operation type that is not naturally idempotent must ship its own dedup
-design first.
+groups committed so a retry can complete the rest. Point writes are LWW-keyed
+by timestamp, series creation is get-or-create, and retention cutoffs are
+monotonic, so a byte-identical retry converges without operation-ID state.
+Physical range delete is different: an acknowledgement can be lost after commit,
+and appending the delete again after an intervening write would erase that write.
+RF&gt;1 exact deletes therefore carry a durable per-VShard operation receipt derived
+from the client's `Idempotency-Key`, `Idempotency-Key-Timestamp`, request bytes,
+and VShard. The client must retry the same body with both original headers.
+Receipts are bounded to one hour and the most recent 1,024 operations per VShard;
+once the replicated retirement floor has passed an identity, its retry fails
+terminally instead of executing again. Pattern deletes remain fail-closed until
+their target expansion is immutable and replicated.
 
-Idempotency here means *replica convergence*, not *retry-invisibility across
-intervening operations*. Because a retry re-enters the log at a new, later
-position, it is ordered against whatever committed in the gap since the original
-proposal — exactly as the same operation issued once at that position would be.
-A retried delete therefore removes writes ordered before it and is superseded by
-writes ordered after it; a retried write likewise reappears after an intervening
-delete (resurrection). Both are valid linearizations: the client never received
-the first ack, so its operation is *concurrent* with anything that committed in
-the gap, and either order is legal. Consequently a `delete` acknowledgement does
-not mean data is destroyed forever while a concurrent write is still in flight,
-and the RF gate's "no acknowledged data loss" is failure-induced loss — never a
-write superseded by a later-ordered delete. Implemented in the per-VShard data
-state machine (`lib/cluster/data/data_state_machine.cpp`), where point revisions
-are assigned in log order and delete/write visibility is decided by revision;
-identical-range tombstones coalesce so repeated retries cannot grow state without
+For writes, idempotency means *replica convergence*, not retry-invisibility across
+intervening operations: a retried write is a new log entry and can reappear after
+an intervening delete. Exact-delete receipts deliberately provide the stronger
+retry-invisibility contract: a retained duplicate is a state-machine no-op at
+its new log position. A newly issued delete remains normally ordered against
+concurrent writes, so an acknowledgement does not promise that a later write is
+destroyed forever. Point revisions and delete receipts are applied in the
+per-VShard state machine
+(`lib/cluster/integration/engine_data_state_machine.cpp`); identical-range
+tombstones also coalesce so physical retry/replay does not grow them without
 bound.
 
 The schema path uses a group-0 compare-and-set only when a measurement/field
@@ -1162,9 +1158,9 @@ serve node-local subscriptions.
   membership changes, never as a target).
 - Apply catalog, data, indexes, deletes, and retention through Raft.
 - Add safe leader reads behind ReadIndex.
-- Document the client retry contract: batches are idempotent, so the rule is
-  "retry the whole batch on failure or timeout" — no tokens and no
-  operation-ID persistence.
+- Document the client retry contract: writes may retry the identical batch;
+  RF&gt;1 exact deletes require the same body, `Idempotency-Key`, and
+  `Idempotency-Key-Timestamp`, backed by bounded durable operation receipts.
 
 **Gate:** RF=3 tolerates one fail-stop or partitioned node without acknowledged
 data loss, duplicates, or split brain.

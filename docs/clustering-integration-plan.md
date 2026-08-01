@@ -344,8 +344,11 @@ the same partial-merge code once more over node partials.
   Retry replaces the contribution for `(taskId, vshard)`, never appends.
 - Metadata endpoints (`/measurements`, `/tags`, `/fields`, `/cardinality`):
   scatter to all owner nodes, union/HLL-merge — same merge shapes as the
-  cross-core versions. `/delete` by pattern: broadcast to all owner nodes,
-  each deletes what it owns, awaited, per-node counts summed.
+  cross-core versions. The originally planned owner-broadcast pattern delete is
+  superseded: expansion can change across an ambiguous retry and delete a newly
+  created series. Production now rejects pattern and mixed-pattern requests
+  before discovery or proposal; re-enablement requires a replicated immutable
+  expansion plan or an equivalently bounded selector command.
 
 ### Subscribe guard + operator surface
 
@@ -548,10 +551,13 @@ Tasks:
    balancing LOOP consumes the same telemetry M5's balancers export and lands
    with M5 (as the backlog notes).
 4. `GET /cluster/replica-decision?vshard=` — `traceReplicaDecision` surface.
-5. **Client bindings (X6):** JS/Python bindings implement retry-the-whole-
-   batch on failure/timeout (idempotent by construction, no tokens), plus
-   `QUERY_INCOMPLETE`-is-not-empty handling. External repo; contract text
-   from `docs/clustering.md` §"Write path".
+5. **Client bindings (X6):** JS/Python bindings retry byte-identical write
+   batches on failure/timeout. Exact RF&gt;1 deletes preserve the request body,
+   `Idempotency-Key`, and original `Idempotency-Key-Timestamp`; a retired
+   identity is terminal and requires reconciliation rather than a fresh token.
+   Bindings also implement `QUERY_INCOMPLETE`-is-not-empty handling. External
+   repo; contract text from `docs/clustering.md` §"Write path" and
+   `docs/api-delete.md` §"Clustered Mode".
 
 **Gate:** replica-read adversarial suite re-run over live RPC (lag, retries,
 placement change, mid-query leader failure, partition-reject — the

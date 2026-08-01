@@ -11,7 +11,7 @@
 `41fdc34`, `a58d2a9`, `6a73809`, `81692a4`, `d363348`, `2749027`,
 `1f61f49`, `b2c7d0b`, `872f7e1`, `023d9c3`, `d5f4755`, `7f6d7e8`,
 `7760ebd`, `6557666`, `c8f28c8`, `445f1f0`, `8b8536d`, `6912dfb`,
-`ecb63a5`
+`ecb63a5`, `a03fe1d`
 
 **Scope:** The recent VShard/Raft cluster redesign, its production-server
 integration, the public HTTP surface, recovery paths, and the release evidence
@@ -24,12 +24,12 @@ used as evidence that the current server is production-ready.
 
 ## Implementation progress after the review
 
-Forty-one remediation commits are now recorded. Cluster release status
+Forty-two remediation commits are now recorded. Cluster release status
 remains **BLOCKED** because group 0/movement, atomic and retry-safe
-pattern-delete semantics, replicated retention, the large-snapshot path, and
-rolling wire-format compatibility remain open. The four previously stale live
-release gates now pass on the same executable candidate and no longer block
-release by themselves.
+pattern-delete semantics, replicated retention, the large-snapshot path,
+delete-receipt compaction liveness, and rolling wire-format compatibility remain
+open. The four previously stale live release gates now pass on the same
+executable candidate and no longer block release by themselves.
 
 Completed and covered in this pass:
 
@@ -83,26 +83,28 @@ Completed and covered in this pass:
 - Source-inspection tests use build-provided absolute paths, so their result no
   longer depends on whether the binary is launched by CTest, from `build/test`,
   or from the repository root.
-- RF&gt;1 exact-series deletes now require a stable 128-bit `Idempotency-Key`,
-  group the request's canonical key/ranges into one operation per VShard, route
-  each batch to that VShard's current Raft leader, and acknowledge only after
-  quorum commit and apply. The state machine retains operation ID, batch hash,
-  and original apply index; a byte-identical retry is a no-op, while ID reuse
-  for another batch fail-stops. Payload v3 carries only receipts covered by its
-  exact Raft snapshot
-  boundary, and local recovery reads that small section without copying snapshot
-  objects. Ambiguous leader/transport retries and partial exact batches can
-  therefore return retryable failure instead of risking a second physical
-  delete. Pattern discovery infrastructure remains internally tested, but the
-  public clustered handler now rejects every pattern or mixed-pattern batch
-  before expansion and proposal: re-expanding after a partial attempt could add
-  a concurrently created series that had no original operation receipt. RF=1
-  remains unsupported. Commit `ecb63a5` reduces receipt growth from one receipt
-  per expanded exact target to one per request/VShard and rejects oversize or
-  cross-VShard batches before proposal; receipt retention is still not bounded.
-  Commit `6912dfb` closes the named in-process RF=3 leader-failure and
-  replica-restart evidence gap under CR-FIX-010; the external multi-process
-  release gate remains distinct.
+- RF&gt;1 exact-series deletes now require a stable 128-bit `Idempotency-Key` and
+  client issuance timestamp, group the request's canonical key/ranges into one
+  operation per VShard, route each batch to that VShard's current Raft leader,
+  and acknowledge only after quorum commit and apply. The state machine retains
+  operation ID, batch hash, original apply index, and issuance time; a
+  byte-identical retry is a no-op, while conflicting identity reuse fail-stops.
+  Payload v4 carries only receipts and the monotonic retirement floor covered by
+  its exact Raft snapshot boundary, and local recovery reads that small section
+  without copying snapshot objects. Modern receipts are bounded to the most
+  recent 1,024 operations per VShard and one hour; a retry below the replicated
+  floor is a terminal `409 DELETE_IDEMPOTENCY_EXPIRED`. A snapshot is deferred,
+  and `snapshots_skipped_delete_state` increments, if its flushed data boundary
+  cannot yet carry a receipt retirement. That closes the recovery corruption
+  path but creates the compaction-liveness obligation tracked by CR-FIX-065.
+  Pattern discovery infrastructure remains internally tested, but the public
+  clustered handler rejects every pattern or mixed-pattern batch before
+  expansion and proposal: re-expanding after a partial attempt could add a
+  concurrently created series that had no original operation receipt. RF=1
+  remains unsupported. Commits `6912dfb`, `ecb63a5`, and `a03fe1d` close the
+  named deterministic exact-delete failover, batching, and bounded-retention
+  gaps under CR-FIX-010; the external multi-process release gate remains
+  distinct.
 - Replicated startup now raises a low soft `RLIMIT_NOFILE` to 8,192 when the
   process hard limit permits it and otherwise fails before opening Engine or
   Raft state with a `LimitNOFILE`/`ulimit` diagnostic. `ClusterDataPlane::start`
@@ -395,16 +397,21 @@ replicated state machine records the operation ID, command hash, and first
 applied index only after storage deletion completes. Commit `ecb63a5` groups a
 request's canonical exact targets into one command and operation ID per VShard,
 so one legal 10,000-target request cannot consume 10,000 receipts in one group.
-The receipt is reconstructed by log replay or carried in snapshot payload v3;
-receipt recovery from a locally produced snapshot skips the large object bodies.
-A duplicate after an intervening write is now a state-machine no-op, including
+Legacy receipts are carried in snapshot payload v3. Commit `a03fe1d` adds the
+client-stable issuance time, replicated retirement floor, and payload v4 needed
+to bound modern receipts to one hour and 1,024 operations per VShard. Receipt
+recovery from a locally produced snapshot skips the large object bodies. A
+duplicate after an intervening write is now a state-machine no-op, including
 after journal compaction and host restart, so the router may safely retry an
-ambiguous exact command. Reusing an operation ID for different target bytes is a
+ambiguous exact command. A retry retired by the time or capacity floor is a
+typed terminal failure through the real socket path and becomes HTTP `409`, not
+a new physical delete. Reusing an operation ID for different target bytes is a
 fail-stop invariant breach rather than a false success. Commit `6912dfb` proves
-the same operation on three real Engines: a retry by a new leader in a later term
-and another retry after that replica reconstructs the receipt from durable journal
-replay both preserve a write ordered after the original delete. CR-FIX-010 remains
-open for bounded receipt retention; patterns remain fail-closed as described above.
+the same operation on three real Engines: a retry by a new leader in a later
+term and another retry after that replica reconstructs the receipt from durable
+journal replay both preserve a write ordered after the original delete.
+CR-FIX-010 remains open for patterns and the external release gate; CR-FIX-065
+tracks sustained compaction progress after receipt retirement.
 
 ### CR-23 — TSM publication did not fence deletion of its durable source
 
@@ -814,18 +821,24 @@ CR-FIX-060 rather than required by the current producer's install contract.
 
 Payload v2 is intentionally fail-closed: upgraded production code rejects
 legacy catalog-less v1 snapshots, while an older binary cannot decode v2.
-Snapshot-persistent exact-delete receipts add payload v3 once a VShard has such
-a receipt; v2 remains byte-identical for snapshots with none. No group-0
-capability bit, negotiated minimum version, upgrade order, or offline upgrade
-requirement currently prevents mixed versions from attempting either
-incompatible InstallSnapshot. This is an availability failure rather than
-silent state corruption, but it blocks a supported rolling production upgrade.
+Legacy exact-delete receipts add payload v3, and bounded receipts plus their
+monotonic retirement floor add payload v4; v2 remains byte-identical for
+snapshots with no delete state. No group-0 capability bit, negotiated minimum
+version, upgrade order, or offline upgrade requirement currently prevents mixed
+versions from attempting an incompatible InstallSnapshot. This is an
+availability failure rather than silent state corruption, but it blocks a
+supported rolling production upgrade.
 
-The exact-delete transport also introduces a v3-only replicated-command verb.
-The client negotiates before use and refuses to send it to a v1/v2 peer, so a
-mixed cluster fails closed rather than misframing a mutation, but deletes are
-unavailable across that version boundary. A supported rolling upgrade therefore
-needs the same committed capability floor or a documented offline upgrade rule.
+The exact-delete transport first introduced a v3-only replicated-command verb;
+bounded receipts now add command tag 5 and the typed `Expired` RPC outcome. The
+client negotiates before use and refuses to send an unsupported command to an
+old peer, so a mixed cluster fails closed rather than misframing a mutation, but
+deletes are unavailable across that version boundary. Existing payload-v3
+receipts have no issuance time, never expire, and consume the 1,024-receipt hard
+cap; a VShard containing more than that must fail startup rather than silently
+discard deduplication history. An upgrade therefore needs a preflight for that
+state plus a committed capability floor, or an explicit offline upgrade and
+rollback rule.
 
 ### CR-04 — control-plane and movement wiring are incomplete
 
@@ -1002,15 +1015,19 @@ is not completion.
   fail-stops on a cross-VShard command. HTTP tests cover exact and structured
   targets, mixed-batch preflight, retryable `503`, and a 32-proposal concurrency
   cap; a real single-voter Raft test proves write/delete/query ordering. Exact
-  commands now require a stable HTTP `Idempotency-Key`; each request's canonical
-  targets are encoded as one bounded command per VShard, and the derived batch
-  ID, batch hash, and original apply index form one replicated receipt. A retry
-  after an intervening write is a no-op, ambiguous router outcomes can safely be
-  retried, and partial cross-VShard batches return retryable failure. Receipt
-  prefixes are encoded in snapshot payload v3 only when covered by the compacted Raft
-  boundary. Tests prove command/receipt codec rejection, conflicting-ID
-  fail-stop, snapshot-boundary filtering, lightweight local snapshot recovery,
-  and a real compacted-journal restart followed by a harmless old-delete retry.
+  commands now require a stable HTTP `Idempotency-Key` plus the original Unix-ms
+  `Idempotency-Key-Timestamp`; each request's canonical targets are encoded as
+  one bounded command per VShard, and the derived batch ID, batch hash, original
+  apply index, and issuance time form one replicated receipt. A retry after an
+  intervening write is a no-op, ambiguous router outcomes can safely be retried,
+  and partial cross-VShard batches return retryable failure. Payload v4 encodes
+  retained receipts plus the monotonic retirement floor only when covered by the
+  compacted Raft boundary. Modern state is bounded by one hour and 1,024 receipts
+  per VShard; retired retries fail terminally as HTTP `409` rather than executing
+  again. Tests prove command/receipt codec rejection, conflicting-ID fail-stop,
+  snapshot-boundary filtering, lightweight local snapshot recovery, bounded
+  retirement, typed rejection through the real RPC socket, and a real
+  compacted-journal restart followed by a harmless old-delete retry.
   A three-real-Engine RF=3 test commits the delete, fails over leadership, retries,
   restarts a caught-up replica from its Engine directory and Raft journal, elects
   that replica, and retries again; both retries preserve a later write. The
@@ -1019,10 +1036,12 @@ is not completion.
   expansion/proposal because a retry could discover a concurrently created new
   target. The batch codec rejects empty, duplicate, unsorted, oversize, and
   cross-VShard input; HTTP preflights the exact encoded Raft-entry size and caps
-  concurrent VShard proposals at 32. CR-FIX-010 remains open for a
-  replicated/frozen pattern plan, bounded exact-receipt retention, and the
-  external multi-process release gate. `445f1f0`, `8b8536d`, `6912dfb`,
-  `ecb63a5`.
+  concurrent VShard proposals at 32. Snapshot production refuses an unsafe
+  boundary older than the last receipt-floor advancement and exposes
+  `snapshots_skipped_delete_state`; CR-FIX-065 tracks proof that this safe wait
+  cannot starve compaction. CR-FIX-010 remains open for a replicated/frozen
+  pattern plan and the external multi-process release gate. `445f1f0`,
+  `8b8536d`, `6912dfb`, `ecb63a5`, `a03fe1d`.
 - [ ] **CR-FIX-011 — define a self-contained VShard snapshot format.** Owner:
   snapshot/storage. Include catalog/index extract, data objects, tombstone
   objects or a proven materialised-delete boundary, and real content hashes.
@@ -1311,6 +1330,16 @@ is not completion.
   subprocess opens all 4,096 groups and serves HTTP with an effective 8,192
   limit; a hard=1,024 subprocess exits 1 before Engine startup; and lifecycle
   source regressions plus a live three-node gate pass. Completed in `69ac879`.
+- [ ] **CR-FIX-065 — prove receipt retirement cannot starve Raft-log
+  compaction.** Owner: snapshot/data. The safety fence in `a03fe1d` defers a
+  snapshot when its flushed data boundary predates the entry that advanced the
+  delete-receipt floor. A delete-only or delete-heavy VShard may not naturally
+  advance that boundary, so repeated safe deferral can still permit unbounded
+  journal growth. **Done when:** the implementation advances a safe snapshot
+  boundary without inventing data or truncating an unflushed write, and a
+  sustained delete/mixed workload proves `snapshots_skipped_delete_state` does
+  not grow forever, `snapshots_taken` advances, journal bytes plateau or reclaim,
+  and restart cannot re-execute a retired delete over a later write.
 
 ### 7. Release validation
 
@@ -1360,12 +1389,14 @@ is not completion.
   Engine tests without routing to a nonexistent core. Verified by the
   4,328-test full-suite run below.
 - [ ] **CR-FIX-076 — define snapshot and replicated-command wire-version
-  negotiation and upgrade policy.** Owner: control plane/release. Gate v2
-  snapshots and v3-only mutation verbs until group 0 or an equivalent handshake
-  proves every sender and receiver supports them, or require and document an
-  offline upgrade. **Done when:** old-to-new and new-to-old snapshot and command
-  attempts follow the documented safe path, mixed-version behavior is covered
-  by a multi-process test, and rollback constraints are explicit.
+  negotiation and upgrade policy.** Owner: control plane/release. Gate payload
+  v2-v4 snapshots, command tag 5, and the `Expired` RPC outcome until group 0 or
+  an equivalent handshake proves every sender and receiver supports them, or
+  require and document an offline upgrade. Preflight legacy non-expiring receipt
+  counts against the 1,024-per-VShard cap. **Done when:** old-to-new and
+  new-to-old snapshot and command attempts follow the documented safe path,
+  mixed-version behavior is covered by a multi-process test, and rollback
+  constraints are explicit.
 - [x] **CR-FIX-077 — make live-gate orchestration fail closed.** Owner:
   release/tests. Restrict reset targets to direct `/tmp/tsgate_*` roots, retry
   removal and prove absence before recreation, never delete a running arm's
@@ -1696,8 +1727,8 @@ multi-process release gate. They close the storage replacement contract in
 CR-FIX-012; the bounded empty-node public-path gate remains part of CR-FIX-011
 and CR-FIX-078.
 
-Snapshot-durable exact-delete retry validation for `445f1f0`, `8b8536d`,
-`6912dfb`, and `ecb63a5`:
+Snapshot-durable and bounded exact-delete retry validation for `445f1f0`,
+`8b8536d`, `6912dfb`, `ecb63a5`, and `a03fe1d`:
 
 ```text
 command/snapshot/state-machine/router/HTTP focused pass: 32/32 passed
@@ -1705,14 +1736,20 @@ real compacted-journal receipt recovery and retry:          1/1 passed
 three-real-Engine leader-failover/replica-restart retry:     1/1 passed
 partitioned exact/pattern fail-closed HTTP pass:           10/10 passed
 per-VShard batch codec/state/router/HTTP focused pass:     35/35 passed
+bounded receipt/state/snapshot/router/HTTP focused pass:   52/52 passed
+typed Expired outcome over the real v3 socket:               1/1 passed
 timestar_unit_test:                         built successfully (-j2)
 timestar_http_server:                       built successfully (-j2)
+timestar_cluster_socket_test:               built successfully (-j2)
 all test processes:                                --smp 1 --memory 1G
 git diff --check:                                           passed
 ```
 
-This closes the known exact-delete retry corruption path but not CR-FIX-010 as
-a whole. Receipt retention still needs a deterministic bound, pattern deletes
-need a replicated immutable expansion plan before re-enablement, and the external
-multi-process release gate remains required even though the deterministic RF=3
-leader-failure/replica-restart gate now passes.
+This closes the known exact-delete retry corruption path and bounds modern
+receipt memory, but not CR-FIX-010 as a whole. Pattern deletes need a replicated
+immutable expansion plan before re-enablement, and the external multi-process
+release gate remains required even though the deterministic RF=3
+leader-failure/replica-restart gate now passes. CR-FIX-065 must also show that
+safe snapshot deferral cannot turn sustained receipt retirement into unbounded
+journal growth. CR-FIX-076 remains an activation blocker: payload v4, command
+tag 5, and the new RPC failure outcome do not establish rolling compatibility.

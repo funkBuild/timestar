@@ -5,6 +5,45 @@
 
 Delete time series data by series key, structured query, pattern match, or batch.
 
+## Clustered Mode
+
+Partitioned RF&gt;1 mode currently accepts only exact targets: either `series`, or
+`measurement` plus one `field` and the complete tag set. RF=1 delete is
+unavailable. Requests using `fields`, omitting a field, or mixing an exact target
+with a pattern return `501` before discovery or mutation. Pattern deletes remain
+available in non-partitioned mode.
+
+Every RF&gt;1 request must include both of these headers:
+
+- `Idempotency-Key`: exactly 32 hexadecimal characters and not all zeroes.
+- `Idempotency-Key-Timestamp`: the request's Unix epoch time in milliseconds. It
+  must be less than one hour old and no more than five minutes in the future.
+
+Retry an uncertain request with the same body and both original headers. The
+request body, key, and timestamp together identify the operation; changing any
+of them creates a different delete.
+
+```bash
+DELETE_TS_MS="$(date +%s)000"
+curl -X POST http://localhost:8086/delete \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: 9f1d73046ce64e719adbc8a11f431b52" \
+  -H "Idempotency-Key-Timestamp: ${DELETE_TS_MS}" \
+  -d '{
+    "series": "temperature,location=us-west.value",
+    "startTime": 1704067200000000000,
+    "endTime": 1704153600000000000
+  }'
+```
+
+Each VShard retains at most the latest 1,024 operation receipts for at most one
+hour. Capacity can therefore retire a receipt sooner. A retry below the
+replicated capacity floor returns `409`, the JSON code
+`DELETE_IDEMPOTENCY_EXPIRED`, and `X-TimeStar-Idempotency-Window: expired`. A
+timestamp already outside the one-hour HTTP window returns `400`. In either
+case, reconcile the current data state; do not merely generate a new timestamp,
+because that would authorize a new delete which can erase intervening writes.
+
 ## Delete by Structured Query
 
 ```bash
@@ -21,7 +60,9 @@ curl -X POST http://localhost:8086/delete \
 
 ## Delete by Pattern
 
-Omit tags or fields to match broadly. Specify `fields` as an array to delete multiple fields.
+Use `fields`, or omit both `field` and `fields`, to select more than one exact
+series. Tags act as filters. This form is currently rejected in partitioned
+cluster mode.
 
 ```bash
 curl -X POST http://localhost:8086/delete \
@@ -104,7 +145,11 @@ Either `series` or `measurement` must be provided.
 
 **Success (200):**
 
-The response always includes `seriesDeleted` (number of series affected) and `totalRequests` (number of delete requests processed, i.e. 1 for a single delete, or the length of the `deletes` array for a batch).
+The response always includes `seriesDeleted` and `totalRequests` (1 for a single
+delete, or the length of the `deletes` array for a batch). In non-partitioned
+mode, `seriesDeleted` is the number of series the local operation affected. In
+RF&gt;1 mode, it is the number of unique exact targets covered by committed and
+applied VShard batches; it does not assert that points existed before apply.
 
 When 100 or fewer series are deleted, the response includes a `deletedSeries` array listing each affected series key:
 
@@ -143,7 +188,19 @@ When no series match, `seriesDeleted` is 0 and neither `deletedSeries` nor `dele
 }
 ```
 
-**Error (400/500):**
+**Error:**
 ```json
 {"status": "error", "error": "Missing required field: measurement or series"}
 ```
+
+Relevant status codes are:
+
+| Status | Meaning |
+|--------|---------|
+| `400` | Invalid body, idempotency header, timestamp, range, or safety limit |
+| `409` | The replicated idempotency receipt has been retired; outcome reconciliation is required |
+| `413` | HTTP body or encoded per-VShard Raft entry is too large |
+| `501` | Delete form is unsupported in the configured cluster mode |
+| `503` | Retryable pre-proposal cluster condition; honor `Retry-After` |
+| `504` | Mutation outcome is unknown; preserve the original retry identity |
+| `500` | Internal error or invalid cluster placement/state |
