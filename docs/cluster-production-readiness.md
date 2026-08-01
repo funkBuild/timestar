@@ -9,7 +9,7 @@
 `2e06cb8`, `7151f5d`, `5b22b81`, `fef4886`, `3d2d607`, `f0e28f0`,
 `da55952`, `a1beb94`, `bb5b871`, `e201343`, `6ad2c93`, `9a42d84`,
 `41fdc34`, `a58d2a9`, `6a73809`, `81692a4`, `d363348`, `2749027`,
-`1f61f49`
+`1f61f49`, `b2c7d0b`
 
 **Scope:** The recent VShard/Raft cluster redesign, its production-server
 integration, the public HTTP surface, recovery paths, and the release evidence
@@ -22,7 +22,7 @@ used as evidence that the current server is production-ready.
 
 ## Implementation progress after the review
 
-Twenty-nine remediation commits are now recorded. Cluster release status remains
+Thirty remediation commits are now recorded. Cluster release status remains
 **BLOCKED** because group 0/movement, generation-atomic live snapshot
 replacement, atomic and retry-safe pattern-delete semantics, replicated
 retention, the large-snapshot path, and rolling wire-format compatibility remain
@@ -106,6 +106,15 @@ Completed and covered in this pass:
   insert benchmark exits nonzero when its health preflight or argument parsing
   fails. This prevents an empty benchmark transcript from satisfying a gate's
   anti-vacuity checks.
+- Every live-gate server now receives an explicit, overrideable Seastar memory
+  budget (8 GiB per process by default). Previously each of three to five
+  colocated processes sized itself from the whole host, so aggregate allocation
+  was neither bounded nor reproducible and could terminate the harness during
+  catch-up. The empty-node catch-up gate now deletes and proves absence of the
+  returning node's complete durable root and includes surviving plus exactly
+  deleted public-path probes. Its first run on the current candidate was
+  interrupted during catch-up and is not release evidence; a bounded rerun
+  remains required.
 - Shared-journal GC now scans past an individually pinned segment and reclaims
   later fully released segments instead of allowing one idle VShard to retain
   the reactor's entire physical suffix. Recovery accepts only sequence gaps
@@ -291,6 +300,7 @@ item are recorded in the fix-up list.
 | CR-35 | P0 | NativeIndex WAL recovery aliased or skipped durable generations and discarded complete corruption | Acknowledged catalog/postings mutations could disappear while startup served an incomplete index; a colliding fresh generation could also truncate the last durable copy. |
 | CR-36 | P0 | NativeIndex manifest/SSTable recovery omitted or destroyed durable generations | Complete manifest corruption could be rewritten as a clean prefix, missing/swapped or metadata-corrupt SSTables could be served as an incomplete index, and compaction could delete a durable output after an ambiguous manifest publication. |
 | CR-37 | P0 | NativeIndex startup ignored unreferenced and ambiguous SSTable-namespace artifacts | Crash outputs and obsolete compaction sources could accumulate to disk exhaustion, while a malformed or non-regular possible durable generation was silently omitted instead of fencing incomplete recovery. |
+| CR-38 | P2 | Multi-process release gates gave every Seastar node an implicit host-sized memory budget | Three to five colocated nodes could overcommit RAM and terminate the runner before a gate reached its assertions, making the release evidence non-reproducible. |
 
 ### CR-01 — deletes bypass consensus
 
@@ -690,6 +700,30 @@ on restart. Regressions cover partial and complete orphan outputs, live-file
 preservation and queryability, malformed-name fail-closed behavior, symlink
 target preservation, and stale manifest-temporary cleanup.
 
+### CR-38 — colocated live gates had no aggregate memory bound
+
+Every gate launched three to five Seastar servers without `--memory`. Each
+process therefore derived its allocator size from the same host-wide available
+memory rather than from a per-node share. The aggregate was neither bounded nor
+stable across machines, and snapshot catch-up adds temporary payload, TSM-open,
+index, and compaction pressure exactly when the evidence is most valuable.
+
+The first strengthened empty-directory catch-up run reached 400/400 accepted
+bulk batches, nine donor snapshots, zero oversize refusals, and successful exact
+probe deletion, but the execution environment terminated the run while the
+fresh node was still opening and compacting its restored state. The run produced
+no final assertions and is explicitly neither a pass nor evidence of a product
+OOM; it demonstrates that the harness itself did not bound or isolate the
+resource question.
+
+Commit `b2c7d0b` gives every gate node an explicit 8 GiB default Seastar budget,
+overrideable through `GATE_SERVER_MEMORY`, and documents that the aggregate is
+`node count * per-node budget`. The same commit makes restart catch-up prove the
+returning durable root is empty and adds live plus exactly deleted probes. All
+gate scripts pass `bash -n`, and the server advertises the exercised `--memory`
+option. CR-FIX-078 remains open until the bounded empty-node gate completes on
+the exact release candidate.
+
 ### CR-02 and CR-03 — snapshot contents and live installation were unsafe
 
 [`SnapshotPayload`](../lib/cluster/data/snapshot_payload.hpp) carries a manifest
@@ -931,9 +965,14 @@ is not completion.
   logical view. Install binds the manifest's data revision to the Raft snapshot
   index, proves catalog/data identity and type, and rebuilds metadata,
   value-type bindings, and exact day postings. Unit coverage now catches up an
-  empty Engine and queries through normal discovery after a delete. The public
-  multi-process empty-node gate, retention/deletion coverage, format negotiation,
-  and a single visibility fence across data plus derived index still remain.
+  empty Engine through the real state-machine apply path: normal discovery
+  returns the surviving series while a fully deleted series in the same VShard
+  is absent from both installed data and the rebuilt catalog. The public
+  multi-process gate now wipes and proves absence of the returning node's entire
+  durable root and drives live/deleted probes, but its first run was interrupted
+  and supplies no completion evidence. A bounded rerun, replicated-retention
+  coverage (blocked on CR-FIX-040), format negotiation, and a single visibility
+  fence across data plus derived index still remain.
 - [ ] **CR-FIX-012 — make live snapshot installation generation-safe and
   atomic.** Owner: storage. Install into unique immutable object names or replace
   the manager's generation under a fence; remove superseded VShard state without
@@ -1252,6 +1291,14 @@ is not completion.
   unreachable benchmark endpoint exits nonzero, and the four gates in
   CR-FIX-071 pass without reset warnings or empty load transcripts. Completed in
   `09a62c5` and `2e06cb8`.
+- [ ] **CR-FIX-078 — bound aggregate memory in colocated live gates.** Owner:
+  release/tests. Every server launch now supplies an explicit, overrideable
+  8 GiB per-process Seastar memory limit; all ten launch sites and all shell
+  scripts pass source/syntax validation. **Done when:** the strengthened
+  empty-directory `restart_catchup_gate.sh` completes under that bound, records
+  peak RSS and `/tmp` use, installs at least one snapshot on the recreated node,
+  and proves both the surviving and exactly deleted public-path probes. The
+  pre-limit attempt was interrupted during catch-up and cannot close this task.
 
 ## Release exit criteria
 
@@ -1523,3 +1570,19 @@ current socket-backed cluster suite:                47/47 passed (8 suites, -c 2
 timestar_http_server:                               built successfully
 git diff --check:                                   passed
 ```
+
+Empty-snapshot coverage and live-gate memory-bound validation for `b2c7d0b`:
+
+```text
+fresh Engine snapshot apply/discovery/delete regression: 1/1 passed (-c 2, --memory 2G)
+cluster gate shell syntax:                              all scripts passed bash -n
+bounded live-server launches:                           10/10 use --memory
+timestar_http_server --help-seastar:                    --memory option present
+empty-node live gate:                                   INCOMPLETE; interrupted during catch-up
+```
+
+The incomplete live run is not counted as release evidence. Before interruption
+it accepted 400/400 campaign batches, produced nine donor snapshots, refused
+zero oversize snapshots, and committed the exact probe delete; it did not reach
+the caught-up/readback assertions. Its three test roots were about 3 GiB in
+aggregate and were reclaimed after preserving diagnostic tails.
