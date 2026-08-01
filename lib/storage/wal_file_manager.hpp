@@ -94,9 +94,16 @@ private:
     bool isRetainedStore(const seastar::shared_ptr<MemoryStore>& store) const;
     seastar::future<> runBackgroundConversion(seastar::shared_ptr<MemoryStore> store);
     seastar::future<> retryConversionUntilSuccess(seastar::shared_ptr<MemoryStore> store);
-    seastar::future<> rolloverMemoryStoreImpl(bool force);
+    seastar::future<bool> rolloverMemoryStoreImpl(bool force, std::optional<uint16_t> requiredVShard = std::nullopt);
 
 public:
+    struct VShardFlushState {
+        bool pendingConversion = false;
+        // The first surviving revision in the active store. Everything below
+        // this is already materialised in TSM or has been durably deleted.
+        std::optional<uint64_t> oldestUnflushedRevision;
+    };
+
     struct SnapshotQuiesce {
         seastar::semaphore_units<> rolloverUnits;
         seastar::semaphore_units<> conversionUnits;
@@ -149,6 +156,19 @@ public:
         return pendingConversionForVShard(memoryStores, vshard);
     }
 
+    // One non-suspending observation of both halves of the snapshot boundary:
+    // rolled stores can create holes through out-of-order conversion, while the
+    // active store identifies the first surviving unflushed revision.
+    VShardFlushState vshardFlushState(uint16_t vshard) const {
+        if (vshard >= timestar::VIRTUAL_SHARD_COUNT)
+            throw std::invalid_argument("WALFileManager::vshardFlushState: invalid VShard");
+        VShardFlushState state;
+        state.pendingConversion = pendingConversionForVShard(memoryStores, vshard);
+        if (!memoryStores.empty() && memoryStores.front())
+            state.oldestUnflushedRevision = memoryStores.front()->oldestRevisionForVShard(vshard);
+        return state;
+    }
+
     // The rule above as a pure function of the store list, so it can be tested against a
     // hand-built (active, rolled...) vector rather than only through a live shard whose
     // background conversions finish when they please.
@@ -179,6 +199,10 @@ public:
     // generation tombstone. This retires its old WAL bytes so the next suffix
     // write cannot get stuck behind the normal empty-store rollover shortcut.
     seastar::future<> forceRolloverMemoryStore();
+    // Rotate only if the active store still has surviving points for `vshard`
+    // after acquiring the rollover lock. Snapshot production uses this to make
+    // progress when receipt retirement is fenced behind an unflushed write.
+    seastar::future<bool> forceRolloverMemoryStoreForVShard(uint16_t vshard);
 
     // Stop rollovers/conversions and synchronously publish+retire every rolled
     // store that still contains `vshard`. Holding the returned units prevents

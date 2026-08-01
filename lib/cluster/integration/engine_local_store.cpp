@@ -49,6 +49,19 @@ seastar::future<bool> EngineLocalStore::hasUnconvertedStores(VShardId vshard) {
     co_return co_await engines_.invoke_on(core, [vs](Engine& e) { return e.hasPendingWalConversionsForVShard(vs); });
 }
 
+seastar::future<EngineLocalStore::VShardFlushState> EngineLocalStore::vshardFlushState(VShardId vshard) {
+    const unsigned core = timestar::assignCore(vshard, seastar::smp::count);
+    const uint16_t vs = vshard.value();
+    co_return co_await engines_.invoke_on(core, [vs](Engine& e) { return e.vshardFlushState(vs); });
+}
+
+seastar::future<bool> EngineLocalStore::forceSnapshotRollover(VShardId vshard) {
+    const unsigned core = timestar::assignCore(vshard, seastar::smp::count);
+    const uint16_t vs = vshard.value();
+    co_return co_await engines_.invoke_on(core,
+                                          [vs](Engine& e) { return e.forceRolloverMemoryStoreForVShardSnapshot(vs); });
+}
+
 seastar::future<bool> EngineLocalStore::installVShardSnapshot(VShardId vshard, data::SnapshotPayload payload) {
     if (!timestar::vshardsCohesiveOnCores(seastar::smp::count))
         throw std::runtime_error("installVShardSnapshot: core count is not VShard-cohesive");

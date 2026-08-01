@@ -333,6 +333,10 @@ public:
     seastar::future<> broadcastSchemaUpdate(timestar::index::SchemaUpdate update);
 
     seastar::future<> rolloverMemoryStore();
+    WALFileManager::VShardFlushState vshardFlushState(uint16_t vshard) const {
+        return walFileManager.vshardFlushState(vshard);
+    }
+    seastar::future<bool> forceRolloverMemoryStoreForVShardSnapshot(uint16_t vshard);
     // Returns std::nullopt if series doesn't exist (rather than throwing)
     seastar::future<std::optional<VariantQueryResult>> query(std::string series, uint64_t startTime, uint64_t endTime);
     // Overload accepting pre-computed SeriesId128 to avoid redundant SHA1

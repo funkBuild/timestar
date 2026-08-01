@@ -280,9 +280,15 @@ TEST_F(ReplicatedVShardHostTest, SnapshotVShardCompactsLogOverFlushedData) {
             return;
         }
 
-        // Before any flush: no TSM data -> nothing to compact, log untouched.
-        EXPECT_EQ(host.snapshotVShard(vs).get(), 0u);
-        EXPECT_EQ(g->node().log().snapshotIndex(), 0u);
+        // Before any flush, the active store's first write is still an exact
+        // fence. The preceding election/no-op entry may be compacted, but both
+        // unflushed write entries must remain replayable.
+        const uint64_t preFlushBoundary = host.snapshotVShard(vs).get();
+        EXPECT_GT(preFlushBoundary, 0u);
+        EXPECT_LT(preFlushBoundary, appliedBefore);
+        EXPECT_EQ(g->node().log().snapshotIndex(), preFlushBoundary);
+        for (uint64_t index = preFlushBoundary + 1; index <= appliedBefore; ++index)
+            EXPECT_NE(g->node().log().entryAt(index), nullptr);
 
         // Flush to TSM, then snapshot compacts the log.
         (*eng).invoke_on_all([](Engine& e) { return e.rolloverMemoryStore(); }).get();
@@ -294,7 +300,7 @@ TEST_F(ReplicatedVShardHostTest, SnapshotVShardCompactsLogOverFlushedData) {
         }
 
         const uint64_t compacted = host.snapshotVShard(vs).get();
-        EXPECT_GT(compacted, 0u) << "flushed data must be snapshotted";
+        EXPECT_GT(compacted, preFlushBoundary) << "flushed data must advance the snapshot";
         EXPECT_LE(compacted, appliedBefore) << "compact only over flushed (<= applied) data";
         EXPECT_EQ(g->node().log().snapshotIndex(), compacted) << "log truncated to the snapshot boundary";
 
@@ -590,7 +596,7 @@ TEST_F(ReplicatedVShardHostTest, TheTriggerSnapshotsOnlyOnceAThresholdIsCrossed)
     }).get();
 }
 
-TEST_F(ReplicatedVShardHostTest, TheTruncationBoundaryStaysBelowTheHighestFlushedRevision) {
+TEST_F(ReplicatedVShardHostTest, TruncationStopsBeforeTheFirstSurvivingUnflushedRevision) {
     seastar::async([] {
         if (!timestar::vshardsCohesiveOnCores(seastar::smp::count))
             GTEST_SKIP() << "core count is not VShard-cohesive";
@@ -619,25 +625,29 @@ TEST_F(ReplicatedVShardHostTest, TheTruncationBoundaryStaysBelowTheHighestFlushe
         ASSERT_GT(maxFlushed, 1u);
 
         const uint64_t compacted = host.snapshotVShard(series.vshard).get();
-        // STRICTLY below, by exactly one entry. A revision is one whole log ENTRY, but
-        // `EngineLocalStore::applyWrites` issues several insertBatch calls per entry and any
-        // of them can roll the memory store -- so entry `maxFlushed` may be only PARTIALLY
-        // flushed, and truncating AT it would discard the log entry holding the unflushed
-        // remainder. That is silent data loss on the one invariant this path protects.
-        EXPECT_EQ(compacted, maxFlushed - 1) << "one entry of slack, deliberately";
-        EXPECT_LT(compacted, maxFlushed);
-        EXPECT_LE(compacted, g->appliedIndex()) << "never above what this replica applied";
+        // The active store is empty after the completed rollover, which proves the
+        // whole applied prefix is represented by TSM/destructive state. The producer
+        // no longer has to retain an arbitrary one-entry tail in that case.
+        EXPECT_EQ(compacted, g->appliedIndex());
+        EXPECT_GE(compacted + 1, maxFlushed);
         EXPECT_EQ(g->node().log().snapshotIndex(), compacted);
-        // The entry AT the highest flushed revision is retained, so its (possibly
-        // unflushed) points still replay.
-        EXPECT_GE(g->node().log().lastIndex(), maxFlushed);
+
+        // A subsequent active write is different: its revision is the exact first
+        // unflushed fence, so snapshotting again must retain that entry.
+        const uint64_t priorBoundary = compacted;
+        commitWrites(host, g, series.key, series.vshard, 1);
+        const uint64_t activeWrite = g->appliedIndex();
+        ASSERT_EQ(activeWrite, priorBoundary + 1);
+        EXPECT_EQ(host.snapshotVShard(series.vshard).get(), 0u);
+        EXPECT_EQ(g->node().log().snapshotIndex(), priorBoundary);
+        EXPECT_NE(g->node().log().entryAt(activeWrite), nullptr);
 
         host.stop().get();
         fs::remove_all(jroot);
     }).get();
 }
 
-TEST_F(ReplicatedVShardHostTest, SnapshotWaitsUntilFlushedBoundaryCoversDeleteReceiptRetirement) {
+TEST_F(ReplicatedVShardHostTest, SnapshotAdvancesAcrossDeleteOnlyReceiptRetirement) {
     seastar::async([] {
         if (!timestar::vshardsCohesiveOnCores(seastar::smp::count))
             GTEST_SKIP() << "core count is not VShard-cohesive";
@@ -660,7 +670,6 @@ TEST_F(ReplicatedVShardHostTest, SnapshotWaitsUntilFlushedBoundaryCoversDeleteRe
 
         commitWrites(host, group, series.key, series.vshard, 4);
         flushToTsm(eng);
-        const size_t filesBeforeCatchUp = tsmFileCount(eng);
 
         const auto proposeAndTick = [&](data::DeleteRangeBatch batch) {
             auto proposed = host.propose(series.vshard, data::ReplicatedCommand{std::move(batch)});
@@ -683,19 +692,104 @@ TEST_F(ReplicatedVShardHostTest, SnapshotWaitsUntilFlushedBoundaryCoversDeleteRe
         EXPECT_EQ(expired.rejects[0].kind, data::WriteFailure::Expired)
             << "a remote coordinator needs a typed terminal outcome, not an opaque RPC failure";
 
-        EXPECT_EQ(host.snapshotVShard(series.vshard).get(), 0u)
-            << "an older data boundary cannot represent receipts retired by its retained suffix";
-        EXPECT_EQ(host.snapshotsSkippedDeleteState(), 1u);
-        EXPECT_EQ(group->node().log().snapshotIndex(), 0u);
-
-        // Once later writes move the flushed revision beyond the retirement entry,
-        // the same group is compactable again; the safeguard is a bounded wait for
-        // storage catch-up, not a permanent disable.
-        commitWrites(host, group, series.key, series.vshard, 4);
-        flushToTsm(eng, filesBeforeCatchUp);
-        EXPECT_GT(host.snapshotVShard(series.vshard).get(), 0u);
+        const uint64_t retirementEntry = group->appliedIndex();
+        EXPECT_EQ(host.snapshotVShard(series.vshard).get(), retirementEntry)
+            << "durable destructive state must let a delete-only VShard compact without inventing a later write";
+        EXPECT_EQ(host.snapshotsSkippedDeleteState(), 0u);
+        EXPECT_EQ(group->node().log().snapshotIndex(), retirementEntry);
 
         host.stop().get();
+        fs::remove_all(jroot);
+    }).get();
+}
+
+TEST_F(ReplicatedVShardHostTest, ReceiptRetirementFlushesItsActiveWriteBarrierAndRecoversSafely) {
+    seastar::async([] {
+        if (!timestar::vshardsCohesiveOnCores(seastar::smp::count))
+            GTEST_SKIP() << "core count is not VShard-cohesive";
+        ScopedShardedEngine eng;
+        eng.start();
+        cluster::EngineLocalStore store(*eng);
+        NoopTransport transport;
+        fs::path jroot = tmpDir();
+        RaftOptions opts;
+        opts.electionTimeoutMin = opts.electionTimeoutMax = 1;
+        opts.heartbeatTimeout = 1;
+        const auto series = core0Series("snap_delete_active_floor");
+
+        const uint64_t issuedAt = 2 * data::kDeleteReceiptRetentionMs;
+        const data::DeleteRangeBatch oldDelete{
+            {{series.key, BASE, BASE}}, SeriesId128::fromHex("40000000000000000000000000000001"), issuedAt};
+        const data::DeleteRangeBatch floorAdvancingDelete{{{series.key, BASE + 999, BASE + 999}},
+                                                          SeriesId128::fromHex("40000000000000000000000000000002"),
+                                                          issuedAt + data::kDeleteReceiptRetentionMs + 1};
+
+        const auto proposeAndTick = [&](cluster::ReplicatedVShardHost& host, RaftGroup* group,
+                                        data::ReplicatedCommand command) {
+            auto proposed = host.propose(series.vshard, std::move(command));
+            for (int i = 0; i < 40 && !proposed.available(); ++i)
+                group->tick().get();
+            ASSERT_TRUE(proposed.get());
+        };
+
+        {
+            cluster::ReplicatedVShardHost host(store, transport, 1, jroot);
+            host.addVShard(series.vshard, {1}, opts).get();
+            RaftGroup* group = host.group(series.vshard);
+            for (int i = 0; i < 10 && !group->isLeader(); ++i)
+                group->tick().get();
+            ASSERT_TRUE(group->isLeader());
+
+            proposeAndTick(host, group, writeCmd(series.key, 10.0));
+            flushToTsm(eng);
+            proposeAndTick(host, group, data::ReplicatedCommand{oldDelete});
+            proposeAndTick(host, group, writeCmd(series.key, 99.0));
+            const uint64_t activeWriteIndex = group->appliedIndex();
+            proposeAndTick(host, group, data::ReplicatedCommand{floorAdvancingDelete});
+            const uint64_t retirementIndex = group->appliedIndex();
+            ASSERT_GT(retirementIndex, activeWriteIndex);
+
+            EXPECT_EQ(host.snapshotVShard(series.vshard).get(), 0u)
+                << "the first attempt must retain the active write and trigger its conditional rollover";
+            EXPECT_EQ(host.snapshotsSkippedDeleteState(), 1u);
+            EXPECT_LT(group->node().log().snapshotIndex(), activeWriteIndex);
+
+            uint64_t compacted = 0;
+            for (int i = 0; i < 300 && compacted == 0; ++i) {
+                seastar::sleep(std::chrono::milliseconds(20)).get();
+                compacted = host.snapshotVShard(series.vshard).get();
+            }
+            ASSERT_GE(compacted, retirementIndex)
+                << "normal WAL conversion must unblock receipt-state compaction without another client write";
+            EXPECT_EQ(group->node().log().snapshotIndex(), compacted);
+            host.stop().get();
+        }
+
+        {
+            cluster::ReplicatedVShardHost recovered(store, transport, 1, jroot);
+            recovered.addVShard(series.vshard, {1}, opts).get();
+            RaftGroup* group = recovered.group(series.vshard);
+            for (int i = 0; i < 10 && !group->isLeader(); ++i)
+                group->tick().get();
+            ASSERT_TRUE(group->isLeader());
+
+            const auto expired =
+                recovered.proposeCommandHinted(series.vshard, data::ReplicatedCommand{oldDelete}, std::nullopt).get();
+            ASSERT_EQ(expired.rejects.size(), 1u);
+            EXPECT_EQ(expired.rejects[0].kind, data::WriteFailure::Expired);
+
+            auto result = (*eng)
+                              .invoke_on(0u,
+                                         [key = series.key](Engine& engine) {
+                                             return engine.query(key, SeriesId128::fromSeriesKey(key), BASE, BASE);
+                                         })
+                              .get();
+            ASSERT_TRUE(result.has_value());
+            ASSERT_EQ(std::get<QueryResult<double>>(*result).values.size(), 1u);
+            EXPECT_DOUBLE_EQ(std::get<QueryResult<double>>(*result).values[0], 99.0)
+                << "recovery must not execute the retired delete over the later write";
+            recovered.stop().get();
+        }
         fs::remove_all(jroot);
     }).get();
 }

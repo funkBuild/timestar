@@ -347,7 +347,9 @@ seastar::future<uint64_t> ReplicatedVShardHost::snapshotVShard(uint16_t vshard) 
     raft::RaftGroup* g = registry_.group(vshard);
     if (!g)
         co_return 0;  // not hosted here
-    // REFUSE WHILE ANY ROLLED-OVER STORE IS STILL AWAITING CONVERSION TO TSM.
+    // REFUSE WHILE ANY TARGET-BEARING ROLLED STORE IS STILL AWAITING
+    // CONVERSION TO TSM, and capture the active store's first surviving
+    // revision in the same reactor turn.
     //
     // This is the FIRST of two conditions that make the boundary below safe, and it is the
     // one the snapshot-durability gate caught: WAL->TSM conversions run 6 at a time and so
@@ -359,26 +361,33 @@ seastar::future<uint64_t> ReplicatedVShardHost::snapshotVShard(uint16_t vshard) 
     //
     // Skipping is free: the sweep comes back every few seconds and conversions finish in
     // seconds. A larger log is a cost; a truncated log is data loss.
-    if (co_await store_.hasUnconvertedStores(VShardId{vshard})) {
+    const uint64_t appliedAtStorageObservation = g->appliedIndex();
+    const auto flushState = co_await store_.vshardFlushState(VShardId{vshard});
+    if (flushState.pendingConversion) {
         ++snapshotsSkippedPendingConversion_;
         co_return 0;
     }
 
-    // Capture only FLUSHED (TSM) data. manifest.snapshotRevision is the highest
-    // revision the snapshot reproduces; since revisions are stamped from the log index
-    // (ADR 0003), it is a safe log-truncation boundary. Entries after it may hold data
-    // that lives only in the memory store, so they MUST stay in the log -- compacting to
-    // appliedIndex would truncate them and lose unflushed data on restart.
-    auto payload = co_await store_.buildVShardSnapshot(VShardId{vshard});
-    const uint64_t maxFlushedRevision = payload.manifest.snapshotRevision;
-    if (maxFlushedRevision == 0) {
-        ++snapshotsSkippedUnflushed_;
-        co_return 0;  // no flushed data yet -> nothing to compact
+    // The active store is the only possible unflushed suffix now. Its oldest
+    // surviving revision is therefore an exact fence: everything below it is
+    // either materialised in TSM or has been durably deleted. With no surviving
+    // target point, storage represents the whole applied prefix observed above.
+    uint64_t storageBoundary = appliedAtStorageObservation;
+    if (flushState.oldestUnflushedRevision) {
+        if (*flushState.oldestUnflushedRevision == 0)
+            throw std::runtime_error("cluster: active VShard data has a zero replicated revision");
+        storageBoundary = std::min<uint64_t>(storageBoundary, *flushState.oldestUnflushedRevision - 1);
     }
 
-    // TRUNCATE ONE ENTRY BELOW THE HIGHEST FLUSHED REVISION, not at it. The SECOND of the
-    // two conditions that make this boundary safe (the first is the pending-conversion
-    // refusal above). Found while wiring the trigger (D-6), and a real hole rather than
+    // Capture the resolved TSM view. Concurrent later writes are harmless: a
+    // newly converted extent can raise maxFlushedRevision, for which the
+    // conservative one-entry slack below remains safe, while an active write
+    // stays above the observed storage boundary and remains in the suffix.
+    auto payload = co_await store_.buildVShardSnapshot(VShardId{vshard});
+    const uint64_t maxFlushedRevision = payload.manifest.snapshotRevision;
+
+    // The TSM-derived fallback remains one entry below its highest revision.
+    // Found while wiring the trigger (D-6), and a real hole rather than
     // belt-and-braces.
     //
     // `snapshotRevision` is the MAXIMUM revision appearing in the flushed extents, and a
@@ -394,12 +403,28 @@ seastar::future<uint64_t> ReplicatedVShardHost::snapshotVShard(uint16_t vshard) 
     // Backing off by one entry closes it for the cost of retaining one entry: entry N stays
     // in the log and replays, and re-applying a fully-flushed entry is idempotent under LWW
     // (identical revision re-stamp, ADR 0003).
-    uint64_t upto = maxFlushedRevision - 1;
+    const uint64_t tsmBoundary = maxFlushedRevision == 0 ? 0 : maxFlushedRevision - 1;
+    uint64_t upto = std::max(storageBoundary, tsmBoundary);
     // And never above what this replica has APPLIED. RaftNode::compact clamps to
     // lastApplied_ itself, but clamping here too means the value we log and RETURN is the
     // one that was really used -- a caller that trusts the return value to mean "the log
     // below this is gone" would otherwise be wrong on a lagging replica.
     upto = std::min<uint64_t>(upto, g->appliedIndex());
+
+    // Receipt retirement destroys historical dedupe state. If its entry sits
+    // above the safe storage boundary, keeping the log is necessary but waiting
+    // forever is not: rotate the active store which holds the blocking point.
+    // The normal bounded conversion path publishes it; a later sweep then sees
+    // the next active suffix and advances. The conditional rollover re-checks
+    // the target after acquiring the shard-wide rollover lock, avoiding empty
+    // rotations when another writer already moved it.
+    if (auto state = vshards_.find(vshard);
+        state != vshards_.end() && state->second.sm && !state->second.sm->canSnapshotDeleteReceiptStateThrough(upto)) {
+        ++snapshotsSkippedDeleteState_;
+        if (flushState.oldestUnflushedRevision)
+            (void)co_await store_.forceSnapshotRollover(VShardId{vshard});
+        co_return 0;
+    }
     if (upto == 0) {
         ++snapshotsSkippedUnflushed_;
         co_return 0;
@@ -416,16 +441,6 @@ seastar::future<uint64_t> ReplicatedVShardHost::snapshotVShard(uint16_t vshard) 
         ++snapshotsSkippedNoAdvance_;
         co_return 0;
     }
-    // Receipt retirement destroys historical dedupe state. If retirement entry N
-    // sits in the retained suffix, an older snapshot cannot omit both its floor and
-    // the receipts it removed: a retry before N would execute again during replay
-    // and could erase a write which originally survived. Wait for the flushed data
-    // boundary to cover N; keeping the log is the safe side of this trade.
-    if (auto state = vshards_.find(vshard);
-        state != vshards_.end() && state->second.sm && !state->second.sm->canSnapshotDeleteReceiptStateThrough(upto)) {
-        ++snapshotsSkippedDeleteState_;
-        co_return 0;
-    }
     // Delete idempotency is replicated state just like the data. Include only
     // receipts covered by this exact boundary; suffix receipts must be rebuilt
     // by suffix replay or their deletes could be skipped after restore.
@@ -435,6 +450,13 @@ seastar::future<uint64_t> ReplicatedVShardHost::snapshotVShard(uint16_t vshard) 
         payload.deleteReceiptsRetiredAtIndex = deleteState.retiredAtIndex;
         payload.deleteReceipts = std::move(deleteState.receipts);
     }
+    // Bind the payload to the exact Raft boundary. The storage builder emits the
+    // minimal data fence (highest extent revision); the host may safely promote
+    // it across entries whose effects are already represented by the resolved
+    // storage state. The receiver requires this fence to equal snap.index + 1.
+    if (upto == UINT64_MAX)
+        throw std::overflow_error("cluster: Raft snapshot boundary exhausted");
+    payload.manifest.snapshotRevision = upto + 1;
     // CONSUMING encode (debt D-32). This `std::move` used to be dead -- the only overload
     // took a const&, so the rvalue bound to it and every file was copied, leaving the
     // producer holding the payload twice with `payload` still alive for the whole

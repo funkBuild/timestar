@@ -20,8 +20,12 @@ namespace timestar {
 // catalog snapshot), so a restore can validate integrity before installing.
 struct VShardSnapshotManifest {
     VShardId vshard{0};
-    // Highest revision captured by this snapshot (the applied watermark at
-    // snapshot time). Restore installs data up to and including it.
+    // Data/log fence for this snapshot. Every extent revision is <= this value;
+    // the replicated host binds it to Raft snapshot index + 1 so that entry N
+    // stays replayable when N may have been only partly flushed. The storage-only
+    // builder emits the minimal fence (the highest extent revision), while the
+    // host may raise it across an applied prefix whose surviving state is already
+    // represented by TSM plus durable deletes.
     uint64_t snapshotRevision = 0;
     // 32-hex-char (128-bit) whole-snapshot verification hash and catalog hash.
     std::string verificationHash;

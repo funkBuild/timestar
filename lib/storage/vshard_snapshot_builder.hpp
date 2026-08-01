@@ -18,8 +18,10 @@ namespace timestar {
 // (series, timestamp) order -- through the add* methods (which fold the
 // whole-snapshot verification hash), then calls build() with the VShard's
 // collected extents (from addTsmFileExtents), the catalog hash, and any tombstone
-// object ids. build() derives snapshotRevision from the extents' max revision and
-// emits a validated VShardSnapshotManifest.
+// object ids. build() derives the minimal snapshotRevision fence from the
+// extents' max revision and emits a validated VShardSnapshotManifest. A
+// replicated host may later raise that fence across a separately proven applied
+// storage prefix before binding it to its Raft snapshot boundary.
 //
 // It composes the pieces already built (verification hash + extent map + manifest)
 // into the snapshot descriptor; the actual reading of the resolved view is the
@@ -42,8 +44,9 @@ public:
     // manifest without assembling a whole new manifest.
     [[nodiscard]] std::string verificationHash() const { return hash_.digestHex(); }
 
-    // Build the manifest. snapshotRevision = the VShard's max revision across its
-    // extents (0 if none). Returns the assembled manifest; it satisfies valid().
+    // Build the manifest's minimal fence: snapshotRevision = the VShard's max
+    // revision across its extents (0 if none). Returns the assembled manifest; it
+    // satisfies valid().
     [[nodiscard]] VShardSnapshotManifest build(const VShardExtentMap& extents, std::string catalogHash,
                                                std::vector<uint64_t> tombstoneObjectIds = {}) const;
 

@@ -10,8 +10,9 @@ VShardSnapshotManifest VShardSnapshotBuilder::build(const VShardExtentMap& exten
     m.vshard = vshard_;
     m.dataExtents = extents.extents(vshard_);
 
-    // snapshotRevision is the highest revision the snapshot captures = the max of
-    // this VShard's extent ranges (0 when the VShard has no data).
+    // The storage builder emits the minimal fence: the max of this VShard's
+    // extent ranges (0 when it has no data). The replicated producer can promote
+    // it after proving a later applied prefix has no surviving unflushed point.
     const RevisionRange range = extents.revRange(vshard_);
     m.snapshotRevision = range.empty ? 0 : range.maxRev;
 

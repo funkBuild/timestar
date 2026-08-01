@@ -141,13 +141,13 @@ public:
     seastar::future<data::ProposeOutcome> proposeVShardBatchesHinted(data::VShardBatchView view,
                                                                      data::OptDeadline deadline) override;
 
-    // Compact this node's Raft log for `vshard` by snapshotting its FLUSHED data and
-    // handing the payload to RaftGroup::compact (the M3 snapshot PRODUCER). Truncates
-    // the log only up to the snapshot's covered revision (== the log index, ADR 0003):
-    // entries whose data is still in the memory store (revision > that) are RETAINED,
-    // so no unflushed data is lost -- compacting to appliedIndex instead would truncate
-    // them. Returns the revision compacted to (0 if the VShard is not hosted here or
-    // has no flushed data yet). Any replica may compact its own log (not leader-only).
+    // Compact this node's Raft log for `vshard` by snapshotting its resolved TSM view
+    // and handing the payload to RaftGroup::compact (the M3 snapshot PRODUCER). The
+    // active store's oldest surviving revision fences the retained suffix; an applied
+    // prefix represented entirely by durable deletes may therefore advance beyond the
+    // highest point revision without crossing unflushed data. Returns the Raft index
+    // compacted to (0 if the VShard is not hosted here or no safe boundary advances).
+    // Any replica may compact its own log (not leader-only).
     // Requires a VShard-cohesive core count (buildVShardSnapshot throws otherwise).
     seastar::future<uint64_t> snapshotVShard(uint16_t vshard);
 

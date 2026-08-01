@@ -38,9 +38,8 @@ seastar::future<> EngineDataStateMachine::apply(raft::LogEntry entry) {
     } else if (const auto* batch = std::get_if<data::DeleteRangeBatch>(&*cmd)) {
         targetsThisVShard = !batch->targets.empty();
         for (const auto& target : batch->targets)
-            targetsThisVShard =
-                targetsThisVShard &&
-                timestar::virtualShard(SeriesId128::fromSeriesKey(target.seriesKey)) == vshard_.value();
+            targetsThisVShard = targetsThisVShard &&
+                                timestar::virtualShard(SeriesId128::fromSeriesKey(target.seriesKey)) == vshard_.value();
     }
     if (!targetsThisVShard)
         throw std::runtime_error("EngineDataStateMachine: committed command targets a different VShard (fail-stop)");
@@ -117,12 +116,13 @@ seastar::future<> EngineDataStateMachine::applySnapshot(raft::Snapshot snap) {
     auto payload = data::decodeSnapshotPayload(snap.data);
     if (!payload)
         throw std::runtime_error("EngineDataStateMachine::applySnapshot: undecodable snapshot payload (fail-stop)");
-    // The producer deliberately compacts one entry below the highest flushed
-    // point revision: entry N can be only partly flushed, so N remains in the
-    // retained suffix and replays idempotently. Bind those two independently
-    // checksummed envelopes here. Without this check, a valid payload paired
-    // with the wrong Raft snapshot metadata could install state ahead of (or
-    // unrelated to) the log prefix being discarded.
+    // The manifest carries the producer's data/log fence. It is one above the
+    // compacted Raft index: entry N remains in the suffix when it could be only
+    // partly flushed, while the fence may move beyond the last point revision
+    // across an applied prefix represented entirely by durable destructive
+    // state. Bind those independently checksummed envelopes here. Without this
+    // check, a valid payload paired with the wrong Raft snapshot metadata could
+    // install state ahead of (or unrelated to) the log prefix being discarded.
     if (snap.index == UINT64_MAX || payload->manifest.snapshotRevision != snap.index + 1)
         throw std::runtime_error(
             "EngineDataStateMachine::applySnapshot: data revision does not match Raft snapshot boundary "

@@ -789,6 +789,32 @@ void MemoryStore::deleteRange(const SeriesId128& seriesId, uint64_t startTime, u
     }
 }
 
+std::optional<uint64_t> MemoryStore::oldestRevisionForVShard(uint16_t vshard) const {
+    if (vshard >= timestar::VIRTUAL_SHARD_COUNT)
+        throw std::invalid_argument("MemoryStore::oldestRevisionForVShard: invalid VShard");
+
+    std::optional<uint64_t> oldest;
+    for (const auto& [seriesId, values] : series) {
+        if (timestar::virtualShard(seriesId) != vshard)
+            continue;
+        std::visit(
+            [&](const auto& inMemorySeries) {
+                if (inMemorySeries.timestamps.empty())
+                    return;
+                if (inMemorySeries.revisions.size() != inMemorySeries.timestamps.size())
+                    throw std::runtime_error(
+                        "MemoryStore::oldestRevisionForVShard: unflushed cluster data has no complete revision column");
+                const auto found = std::min_element(inMemorySeries.revisions.begin(), inMemorySeries.revisions.end());
+                if (found == inMemorySeries.revisions.end() || *found == 0)
+                    throw std::runtime_error(
+                        "MemoryStore::oldestRevisionForVShard: unflushed cluster data has an invalid revision");
+                oldest = oldest ? std::min(*oldest, *found) : *found;
+            },
+            values);
+    }
+    return oldest;
+}
+
 size_t MemoryStore::deleteVShard(uint16_t vshard) {
     if (vshard >= timestar::VIRTUAL_SHARD_COUNT)
         throw std::invalid_argument("MemoryStore::deleteVShard: invalid VShard");

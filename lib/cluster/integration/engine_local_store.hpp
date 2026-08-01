@@ -60,8 +60,8 @@ public:
     // measured rather than theoretical -- it cost the snapshot-durability gate 7 of 200
     // acknowledged points on the first run.
     //
-    // A snapshot's truncation boundary is derived from the highest revision present in
-    // TSM. That is only a safe boundary if every revision BELOW it is also in TSM, and
+    // A snapshot's TSM fallback boundary is derived from the highest revision present in
+    // TSM. That is only safe if every surviving revision BELOW it is also in TSM, and
     // WAL->TSM conversions run `conversion_concurrency` at a time (6) and therefore
     // COMPLETE OUT OF ORDER. Store A (revisions 1..10) and store B (11..20) can both have
     // rolled with only B converted: TSM then holds 11..20, the max flushed revision is 20,
@@ -72,8 +72,8 @@ public:
     //
     // With no unconverted store, TSM is exactly the set of ROLLED stores and the only
     // unflushed data is the ACTIVE store, which holds a contiguous SUFFIX of each VShard's
-    // revisions -- so the max flushed revision has every revision below it in TSM, which is
-    // what makes it a boundary at all.
+    // surviving revisions. The oldest such revision is the precise fence; if none survives,
+    // durable deletes plus TSM represent the observed applied prefix.
     //
     // PER-VSHARD SINCE D-35, and the narrowing is what makes this usable under load. The
     // predicate was originally per-SHARD ("does ANY rolled store still await conversion?"),
@@ -85,14 +85,23 @@ public:
     //
     // The safety argument is unchanged, not weakened: if no unconverted rolled store holds
     // VShard V, every rolled point of V is already in TSM and the only unflushed remainder
-    // of V lives in the ACTIVE store -- a contiguous suffix of V's revisions. That is
-    // exactly the property the max-flushed-revision boundary needs, and it never depended
+    // of V lives in the ACTIVE store -- a contiguous suffix of V's surviving revisions.
+    // That is exactly the property the active revision fence needs, and it never depended
     // on the OTHER VShards' stores.
     //
     // Still conservative in the safe direction: a VShard whose own data is converting
     // continuously keeps its log until a conversion lands. A larger log is a cost; a
     // truncated log is data loss.
     seastar::future<bool> hasUnconvertedStores(VShardId vshard);
+    using VShardFlushState = WALFileManager::VShardFlushState;
+    // Observe pending rolled stores and the active store's oldest surviving
+    // replicated revision in one reactor turn. The latter lets the producer
+    // advance across durable deletes without crossing an unflushed point.
+    seastar::future<VShardFlushState> vshardFlushState(VShardId vshard);
+    // Receipt retirement behind the active suffix must eventually make progress.
+    // Rotate only while this VShard still has active points; the next sweep waits
+    // for its normal bounded background conversion.
+    seastar::future<bool> forceSnapshotRollover(VShardId vshard);
 
     // Install a received VShard snapshot (consumer side of the above). Same cohesion
     // precondition; dispatches to assignCore(vshard). Returns true iff installed.

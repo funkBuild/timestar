@@ -199,7 +199,6 @@ seastar::future<> WALFileManager::init(Engine& engine, TSMFileManager& _tsmFileM
 
     // Convert them to TSM's if they exist and are closed
     for (const auto& [seqNum, walFilename] : walFiles) {
-
         if (!walSequenceInitialized_ || seqNum > currentWalSequenceNumber) {
             currentWalSequenceNumber = seqNum;
             walSequenceInitialized_ = true;
@@ -429,18 +428,32 @@ seastar::future<> WALFileManager::insertBatch(std::vector<TimeStarInsert<T>>& in
 }
 
 seastar::future<> WALFileManager::rolloverMemoryStore() {
-    return rolloverMemoryStoreImpl(false);
+    (void)co_await rolloverMemoryStoreImpl(false);
 }
 
 seastar::future<> WALFileManager::forceRolloverMemoryStore() {
-    return rolloverMemoryStoreImpl(true);
+    (void)co_await rolloverMemoryStoreImpl(true);
 }
 
-seastar::future<> WALFileManager::rolloverMemoryStoreImpl(bool force) {
+seastar::future<bool> WALFileManager::forceRolloverMemoryStoreForVShard(uint16_t vshard) {
+    if (vshard >= timestar::VIRTUAL_SHARD_COUNT)
+        throw std::invalid_argument("WALFileManager::forceRolloverMemoryStoreForVShard: invalid VShard");
+    co_return co_await rolloverMemoryStoreImpl(true, vshard);
+}
+
+seastar::future<bool> WALFileManager::rolloverMemoryStoreImpl(bool force, std::optional<uint16_t> requiredVShard) {
     // Acquire the rollover semaphore to serialize concurrent rollover attempts.
     // Multiple insert coroutines may observe needsRollover=true and call this
     // method simultaneously; the semaphore ensures only one rollover executes.
     auto units = co_await seastar::get_units(compactionSemaphore, 1);
+
+    // The snapshot producer observed a target write before it suspended on this
+    // shard-wide lock. A concurrent ordinary rollover may already have moved
+    // that write out of the active store; do not rotate the replacement store
+    // (and every colocated VShard) for work which is already converting.
+    if (requiredVShard && (memoryStores.empty() || !memoryStores.front() ||
+                           !memoryStores.front()->oldestRevisionForVShard(*requiredVShard)))
+        co_return false;
 
     // After acquiring the semaphore, check whether the current store still
     // needs rollover. Another coroutine may have already completed a rollover
@@ -457,7 +470,7 @@ seastar::future<> WALFileManager::rolloverMemoryStoreImpl(bool force) {
     // rolled over.
     if (!force && !memoryStores.empty() && memoryStores[0]->isEmpty()) {
         timestar::wal_log.debug("Rollover already completed by another coroutine on shard {}, skipping", shardId);
-        co_return;
+        co_return false;
     }
 
     auto previousStore = memoryStores[0];
@@ -572,6 +585,7 @@ seastar::future<> WALFileManager::rolloverMemoryStoreImpl(bool force) {
 
     timestar::wal_log.info("Rollover complete, new memory store {} created for shard {}", store->sequenceNumber,
                            shardId);
+    co_return true;
 }
 
 seastar::future<WALFileManager::SnapshotQuiesce> WALFileManager::quiesceForVShardSnapshot(uint16_t vshard) {
@@ -697,11 +711,10 @@ seastar::future<> WALFileManager::convertWalToTsm(seastar::shared_ptr<MemoryStor
             timestar::wal_log.error(
                 "[BAD_ALLOC] Stats: {} series, {} points, ~{} MB "
                 "estimated, largest series: '{}' ({} points)",
-                totalSeries, totalPoints, totalMemoryEstimate / (1024 * 1024), largestSeriesKey,
-                largestSeriesPoints);
+                totalSeries, totalPoints, totalMemoryEstimate / (1024 * 1024), largestSeriesKey, largestSeriesPoints);
 #else
-            timestar::wal_log.error(
-                "[BAD_ALLOC] Stats: {} series (detailed stats require TIMESTAR_LOG_INSERT_PATH=1)", totalSeries);
+            timestar::wal_log.error("[BAD_ALLOC] Stats: {} series (detailed stats require TIMESTAR_LOG_INSERT_PATH=1)",
+                                    totalSeries);
 #endif
 
             timestar::wal_log.error(

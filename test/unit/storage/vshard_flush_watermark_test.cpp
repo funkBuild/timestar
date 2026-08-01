@@ -66,10 +66,12 @@ KeyAt keyIn(const std::string& measurement, uint16_t wanted) {
 // the single choke point the bitmap hangs off, and it is also what WAL replay drives
 // (initFromWAL -> WALReader::readAll -> insertMemory), so exercising it here is
 // exercising the recovery path too.
-void insertOne(MemoryStore& store, const std::string& key, uint64_t ts, double value) {
+void insertOne(MemoryStore& store, const std::string& key, uint64_t ts, double value, uint64_t revision = 0) {
     TimeStarInsert<double> ins = TimeStarInsert<double>::fromSeriesKey(key);
     ins.timestamps = {ts};
     ins.values = {value};
+    if (revision != 0)
+        ins.revisions = {revision};
     ins.setCachedSeriesKey(key);
     store.insertMemory(std::move(ins));
 }
@@ -137,6 +139,33 @@ TEST(VShardFlushWatermarkTest, AnActiveStoreAloneNeverBlocksCompaction) {
     std::vector<seastar::shared_ptr<MemoryStore>> stores{active};
     EXPECT_FALSE(WALFileManager::pendingConversion(stores));
     EXPECT_FALSE(WALFileManager::pendingConversionForVShard(stores, a.vshard));
+}
+
+TEST(VShardFlushWatermarkTest, ActiveStoreNamesTheFirstSurvivingUnflushedRevisionPerVShard) {
+    const KeyAt a = keyNotIn("d35revision", {});
+    const KeyAt aSecond = keyIn("d35revision_other", a.vshard);
+    const KeyAt b = keyNotIn("d35revision_foreign", {a.vshard});
+    MemoryStore active(1);
+
+    insertOne(active, a.key, 3'000, 1.0, 11);
+    insertOne(active, aSecond.key, 3'001, 2.0, 17);
+    insertOne(active, b.key, 3'002, 3.0, 7);
+    EXPECT_EQ(active.oldestRevisionForVShard(a.vshard), 11u);
+    EXPECT_EQ(active.oldestRevisionForVShard(b.vshard), 7u);
+
+    active.deleteRange(SeriesId128::fromSeriesKey(a.key), 0, UINT64_MAX);
+    EXPECT_EQ(active.oldestRevisionForVShard(a.vshard), 17u)
+        << "a durable delete may advance the unflushed suffix fence to the next surviving write";
+    active.deleteRange(SeriesId128::fromSeriesKey(aSecond.key), 0, UINT64_MAX);
+    EXPECT_FALSE(active.oldestRevisionForVShard(a.vshard).has_value())
+        << "no surviving active point means destructive state can cover the applied prefix";
+}
+
+TEST(VShardFlushWatermarkTest, ActiveStoreFailsClosedOnMissingReplicatedRevisions) {
+    const KeyAt a = keyNotIn("d35revision_missing", {});
+    MemoryStore active(1);
+    insertOne(active, a.key, 3'000, 1.0);
+    EXPECT_THROW((void)active.oldestRevisionForVShard(a.vshard), std::runtime_error);
 }
 
 // WAL-REPLAY PARITY. The bitmap hangs off `insertMemory` precisely so that recovery

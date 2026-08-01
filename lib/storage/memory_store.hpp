@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <seastar/core/coroutine.hh>
 #include <variant>
 #include <vector>
@@ -182,12 +183,14 @@ public:
     // the Engine only by being committed through its VShard's Raft group, which has
     // already appended it to the Raft journal and fsync'd it.
     //
-    // Safe because the Raft log is never compacted past what is durable in TSM:
-    // ReplicatedVShardHost::snapshotVShard compacts only up to the snapshot's
-    // FLUSHED-TSM revision, and RaftNode's constructor resets lastApplied_ to
-    // log_.snapshotIndex() -- so on restart every entry above that boundary is
-    // RE-APPLIED. Anything the memory store lost is therefore replayed from the Raft
-    // log. Re-application is idempotent (revisions are the log index, LWW).
+    // Safe because the Raft log is never compacted past the first surviving
+    // unflushed point revision: ReplicatedVShardHost::snapshotVShard observes the
+    // active suffix and refuses out-of-order rolled conversions. Destructive
+    // entries may advance the boundary only when their resulting state is already
+    // durable. RaftNode's constructor resets lastApplied_ to log_.snapshotIndex(),
+    // so every entry above that boundary is re-applied. Anything the memory store
+    // lost is therefore replayed from the Raft log; re-application is idempotent
+    // (revisions are the log index, LWW).
     //
     // Flush cadence is unaffected: estimatedAccumulatedSize still advances per batch
     // and rollover triggers on max(wal size, estimated) as well as resident bytes.
@@ -229,8 +232,9 @@ public:
     // does any UNCONVERTED rolled store hold data for THIS VShard? If none does, then
     // all of that VShard's rolled data is already in TSM and the only unflushed
     // remainder is in the ACTIVE store, which by construction holds a contiguous
-    // SUFFIX of the VShard's revisions -- which is exactly what makes the manifest's
-    // max flushed revision a safe truncation boundary.
+    // SUFFIX of the VShard's surviving revisions. Its oldest revision is the exact
+    // safe truncation fence; when it has no target points, durable destructive
+    // state represents the observed applied prefix.
     //
     // Set on the ONE lowest-level insertion path (insertMemory), so WAL replay
     // (initFromWAL -> WALReader::readAll -> insertMemory) populates it identically to
@@ -240,6 +244,11 @@ public:
     [[nodiscard]] bool touchesVShard(uint16_t vshard) const noexcept {
         return (vshardBits_[vshard >> 6] & (uint64_t{1} << (vshard & 63))) != 0;
     }
+    // Lowest replicated revision still represented only by this memory store for
+    // one VShard. No value means the store has no surviving target points. A
+    // malformed/missing revision column throws: treating it as an empty suffix
+    // would let the snapshot producer truncate unflushed data.
+    [[nodiscard]] std::optional<uint64_t> oldestRevisionForVShard(uint16_t vshard) const;
     // How many VShards this store has seen (diagnostics; O(64)).
     [[nodiscard]] size_t vshardsTouched() const noexcept {
         size_t n = 0;

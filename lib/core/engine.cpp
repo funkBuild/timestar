@@ -2109,6 +2109,16 @@ seastar::future<> Engine::rolloverMemoryStore() {
     co_return co_await walFileManager.rolloverMemoryStore();
 }
 
+seastar::future<bool> Engine::forceRolloverMemoryStoreForVShardSnapshot(uint16_t vshard) {
+    auto gateHolder = _insertGate.hold();
+    timestar::engine_log.debug("[ENGINE] Forcing memory-store rollover for VShard {} snapshot progress on shard {}",
+                               vshard, shardId);
+    const bool rolled = co_await walFileManager.forceRolloverMemoryStoreForVShard(vshard);
+    if (rolled)
+        ++_metrics.wal_rollovers_total;
+    co_return rolled;
+}
+
 template seastar::future<> Engine::insert<bool>(TimeStarInsert<bool> insertRequest, bool skipMetadataIndexing);
 template seastar::future<> Engine::insert<double>(TimeStarInsert<double> insertRequest, bool skipMetadataIndexing);
 template seastar::future<> Engine::insert<std::string>(TimeStarInsert<std::string> insertRequest,
