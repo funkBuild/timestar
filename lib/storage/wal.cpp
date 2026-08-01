@@ -880,7 +880,6 @@ seastar::future<> WALReader::readAll(MemoryStore* store) {
 
     size_t entriesRead = 0;
     size_t partialEntries = 0;
-    bool stopRecovery = false;
 
     // Stream the file; no aligned over-reads
     auto in = seastar::make_file_input_stream(walFile);
@@ -930,12 +929,9 @@ seastar::future<> WALReader::readAll(MemoryStore* store) {
                     // New-format padding: skip exactly skipBytes additional zero bytes.
                     static constexpr uint32_t MAX_SKIP = 16 * 1024 * 1024;
                     if (skipBytes > MAX_SKIP) {
-                        timestar::wal_log.warn(
-                            "WAL recovery: unreasonable padding skip count {}, "
-                            "stopping recovery",
-                            skipBytes);
                         partialEntries++;
-                        break;
+                        throw std::runtime_error("WAL recovery: unreasonable padding skip count " +
+                                                 std::to_string(skipBytes) + " in " + filename);
                     }
                     size_t remaining = skipBytes;
                     while (remaining > 0) {
@@ -958,9 +954,9 @@ seastar::future<> WALReader::readAll(MemoryStore* store) {
             static constexpr uint32_t MAX_ENTRY_SIZE = 10 * 1024 * 1024;  // 10MB
 
             if (entryLength < MIN_ENTRY_SIZE || entryLength > MAX_ENTRY_SIZE) {
-                timestar::wal_log.warn("WAL recovery: suspicious entry length {}, stopping recovery", entryLength);
                 partialEntries++;
-                break;
+                throw std::runtime_error("WAL recovery: suspicious entry length " + std::to_string(entryLength) +
+                                         " in " + filename);
             }
 
             std::vector<char> entry(entryLength);
@@ -1010,20 +1006,22 @@ seastar::future<> WALReader::readAll(MemoryStore* store) {
                 } else {
                     uint8_t firstByte = rawEntry[0];
                     bool byte0IsType = firstByte <= static_cast<uint8_t>(WALType::Close);
-                    if (byte0IsType) {
+                    const bool byte4IsType = crcPayload[0] <= static_cast<uint8_t>(WALType::Close);
+                    if (byte0IsType && !byte4IsType) {
                         // Old format entry (no CRC prefix) - skip CRC verification
                         timestar::wal_log.debug("WAL recovery: old format entry detected (no CRC), type={}", firstByte);
                         // payloadPtr and payloadSize already point to full entry
                     } else {
-                        // Neither valid new-format CRC nor old-format WALType:
-                        // entry is corrupt.
-                        timestar::wal_log.warn(
-                            "WAL recovery: CRC32 mismatch (stored=0x{:08X}, computed=0x{:08X}) "
-                            "and byte 0 (0x{:02X}) is not a valid WALType, "
-                            "discarding corrupt entry",
-                            storedCrc, computedCrc, firstByte);
+                        // A current-format entry always has WALType at byte 4.
+                        // If byte 0 also resembles an old-format type, the frame
+                        // is ambiguous; fail closed rather than interpreting a
+                        // corrupt CRC prefix as a legacy command. Complete-frame
+                        // corruption is never a legitimate torn-tail boundary.
                         partialEntries++;
-                        continue;
+                        throw std::runtime_error(fmt::format(
+                            "WAL recovery: CRC32 mismatch in {} (stored=0x{:08X}, computed=0x{:08X}, "
+                            "byte0=0x{:02X}, byte4=0x{:02X})",
+                            filename, storedCrc, computedCrc, firstByte, crcPayload[0]));
                     }
                 }
             }
@@ -1069,16 +1067,13 @@ seastar::future<> WALReader::readAll(MemoryStore* store) {
                                 store->insertMemory(std::move(insertReq));
                             } break;
                             default:
-                                timestar::wal_log.warn("WAL recovery: unknown value type {} in entry, skipping",
-                                                       valueType);
-                                partialEntries++;
-                                continue;
+                                throw std::runtime_error("unknown WAL value type " + std::to_string(valueType));
                         }
                         entriesRead++;
                     } catch (const std::exception& e) {
                         timestar::wal_log.error("WAL recovery: Failed to read Write entry: {}", e.what());
                         partialEntries++;
-                        continue;
+                        throw;
                     }
                 } break;
 
@@ -1102,21 +1097,17 @@ seastar::future<> WALReader::readAll(MemoryStore* store) {
                     } catch (const std::exception& e) {
                         timestar::wal_log.error("WAL recovery: Failed to read DeleteRange entry: {}", e.what());
                         partialEntries++;
+                        throw;
                     } catch (...) {
                         partialEntries++;
+                        throw;
                     }
                 } break;
 
                 default:
-                    timestar::wal_log.warn("WAL recovery: unknown entry type {}, stopping recovery",
-                                           static_cast<int>(type));
+                    timestar::wal_log.error("WAL recovery: unknown entry type {}", static_cast<int>(type));
                     partialEntries++;
-                    stopRecovery = true;
-                    break;
-            }
-
-            if (stopRecovery) {
-                break;
+                    throw std::runtime_error("unknown WAL entry type " + std::to_string(type));
             }
         }
 
@@ -1124,8 +1115,13 @@ seastar::future<> WALReader::readAll(MemoryStore* store) {
         recoveryException = std::current_exception();
     }
 
-    timestar::wal_log.info("WAL recovery complete: {} entries read, {} partial entries discarded", entriesRead,
-                           partialEntries);
+    if (recoveryException) {
+        timestar::wal_log.error("WAL recovery failed after {} entries; {} invalid or partial entries observed",
+                                entriesRead, partialEntries);
+    } else {
+        timestar::wal_log.info("WAL recovery complete: {} entries read, {} partial entries discarded", entriesRead,
+                               partialEntries);
+    }
 
     // Close the input stream & file — runs on both normal and exception paths
     try {

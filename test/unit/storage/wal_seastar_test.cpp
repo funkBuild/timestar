@@ -433,6 +433,71 @@ TEST_F(WALSeastarTest, CRC32RoundtripFloat) {
     testCRC32RoundtripFloat().get();
 }
 
+// Legacy WAL frames have no CRC prefix. Keep their recovery path, but only
+// when it cannot be confused with a corrupt current-format frame (whose type
+// byte is always at offset 4).
+seastar::future<> testLegacyNoCRCFrameStillRecoversWhenUnambiguous() {
+    constexpr unsigned int sequenceNumber = 205;
+    auto store = std::make_shared<MemoryStore>(sequenceNumber);
+
+    std::string field;
+    for (size_t i = 0; i < 1024; ++i) {
+        field = "legacy_" + std::to_string(i);
+        TimeStarInsert<double> candidate("crc_test", field);
+        if (candidate.seriesId128().getRawData()[3] > static_cast<uint8_t>(WALType::Close)) {
+            break;
+        }
+    }
+    TimeStarInsert<double> insert("crc_test", field);
+    if (insert.seriesId128().getRawData()[3] <= static_cast<uint8_t>(WALType::Close)) {
+        throw std::runtime_error("could not construct an unambiguous legacy WAL series id");
+    }
+    insert.addValue(1000, 55.5);
+
+    {
+        WAL wal(sequenceNumber, timestar::StorageLayout("."), seastar::this_shard_id());
+        co_await wal.init(store.get());
+        co_await wal.insert(insert);
+        co_await wal.close();
+    }
+
+    const std::string walFile = WAL::sequenceNumberToFilename(sequenceNumber);
+    std::ifstream fin(walFile, std::ios::binary);
+    std::vector<char> current((std::istreambuf_iterator<char>(fin)), std::istreambuf_iterator<char>());
+    fin.close();
+    if (current.size() < 8) {
+        throw std::runtime_error("current WAL frame is shorter than its header");
+    }
+    uint32_t currentLength = 0;
+    std::memcpy(&currentLength, current.data(), sizeof(currentLength));
+    if (currentLength < sizeof(uint32_t) || current.size() < sizeof(uint32_t) + currentLength) {
+        throw std::runtime_error("current WAL frame has an invalid length");
+    }
+
+    const uint32_t legacyLength = currentLength - sizeof(uint32_t);
+    std::vector<char> legacy(sizeof(uint32_t) + legacyLength);
+    std::memcpy(legacy.data(), &legacyLength, sizeof(legacyLength));
+    std::memcpy(legacy.data() + sizeof(uint32_t), current.data() + 2 * sizeof(uint32_t), legacyLength);
+    std::ofstream fout(walFile, std::ios::binary | std::ios::trunc);
+    fout.write(legacy.data(), legacy.size());
+    fout.close();
+
+    auto recoveredStore = std::make_shared<MemoryStore>(sequenceNumber);
+    WALReader reader(walFile);
+    co_await reader.readAll(recoveredStore.get());
+    auto it = recoveredStore->series.find(insert.seriesId128());
+    EXPECT_NE(it, recoveredStore->series.end());
+    if (it != recoveredStore->series.end()) {
+        const auto& recovered = std::get<InMemorySeries<double>>(it->second);
+        EXPECT_EQ(recovered.timestamps, (std::vector<uint64_t>{1000}));
+        EXPECT_EQ(recovered.values, (std::vector<double>{55.5}));
+    }
+}
+
+TEST_F(WALSeastarTest, LegacyNoCRCFrameStillRecoversWhenUnambiguous) {
+    testLegacyNoCRCFrameStillRecoversWhenUnambiguous().get();
+}
+
 seastar::future<> testCRC32CorruptionDetection() {
     unsigned int sequenceNumber = 201;
     auto store = std::make_shared<MemoryStore>(sequenceNumber);
@@ -467,15 +532,21 @@ seastar::future<> testCRC32CorruptionDetection() {
         fout.close();
     }
 
-    // Recovery should detect corruption and discard the entry
+    // A complete frame with a CRC mismatch is corruption, not a torn tail.
+    // Recovery must fail closed rather than silently dropping acknowledged data.
     auto recoveredStore = std::make_shared<MemoryStore>(sequenceNumber);
+    std::exception_ptr recoveryError;
     {
         std::string walFile = WAL::sequenceNumberToFilename(sequenceNumber);
         WALReader reader(walFile);
-        co_await reader.readAll(recoveredStore.get());
+        try {
+            co_await reader.readAll(recoveredStore.get());
+        } catch (...) {
+            recoveryError = std::current_exception();
+        }
     }
 
-    // The corrupted entry should have been discarded
+    EXPECT_NE(recoveryError, nullptr);
     EXPECT_EQ(recoveredStore->series.size(), 0);
 
     co_return;
@@ -542,13 +613,21 @@ seastar::future<> testCRC32PartialCorruption() {
         fout.close();
     }
 
-    // Recovery: first entry should survive, second should be discarded
+    // Recovery may decode the prefix into its temporary store, but the complete
+    // corrupt second frame must make the whole recovery operation fail.
     auto recoveredStore = std::make_shared<MemoryStore>(sequenceNumber);
+    std::exception_ptr recoveryError;
     {
         std::string walFile = WAL::sequenceNumberToFilename(sequenceNumber);
         WALReader reader(walFile);
-        co_await reader.readAll(recoveredStore.get());
+        try {
+            co_await reader.readAll(recoveredStore.get());
+        } catch (...) {
+            recoveryError = std::current_exception();
+        }
     }
+
+    EXPECT_NE(recoveryError, nullptr);
 
     // First entry should be recovered
     TimeStarInsert<double> testInsert1("partial_test", "first");
@@ -572,6 +651,59 @@ seastar::future<> testCRC32PartialCorruption() {
 
 TEST_F(WALSeastarTest, CRC32PartialCorruption) {
     testCRC32PartialCorruption().get();
+}
+
+// A crash may leave only a prefix of the final, unacknowledged frame. Unlike a
+// complete CRC-invalid frame, that EOF boundary is safe to discard while
+// retaining all earlier complete entries.
+seastar::future<> testTruncatedFinalFrameRemainsRecoverable() {
+    constexpr unsigned int sequenceNumber = 206;
+    const auto savedConfig = timestar::config();
+    auto cfg = savedConfig;
+    cfg.storage.wal_sync_mode = "rollover";
+    timestar::setGlobalConfig(cfg);
+    auto restoreConfig = seastar::defer([&savedConfig]() noexcept { timestar::setGlobalConfig(savedConfig); });
+
+    auto store = std::make_shared<MemoryStore>(sequenceNumber);
+    {
+        WAL wal(sequenceNumber, timestar::StorageLayout("."), seastar::this_shard_id());
+        co_await wal.init(store.get());
+        TimeStarInsert<double> first("tail_test", "complete");
+        first.addValue(1000, 1.0);
+        co_await wal.insert(first);
+        TimeStarInsert<double> second("tail_test", "torn");
+        second.addValue(2000, 2.0);
+        co_await wal.insert(second);
+        co_await wal.close();
+    }
+
+    const std::string walFile = WAL::sequenceNumberToFilename(sequenceNumber);
+    std::ifstream fin(walFile, std::ios::binary);
+    std::vector<char> contents((std::istreambuf_iterator<char>(fin)), std::istreambuf_iterator<char>());
+    fin.close();
+    if (contents.size() < sizeof(uint32_t)) {
+        throw std::runtime_error("WAL missing first frame length");
+    }
+    uint32_t firstLength = 0;
+    std::memcpy(&firstLength, contents.data(), sizeof(firstLength));
+    const size_t secondOffset = sizeof(uint32_t) + firstLength;
+    if (contents.size() < secondOffset + 2 * sizeof(uint32_t)) {
+        throw std::runtime_error("WAL missing second frame header");
+    }
+    fs::resize_file(walFile, secondOffset + 2 * sizeof(uint32_t));
+
+    auto recoveredStore = std::make_shared<MemoryStore>(sequenceNumber);
+    WALReader reader(walFile);
+    co_await reader.readAll(recoveredStore.get());
+
+    TimeStarInsert<double> first("tail_test", "complete");
+    TimeStarInsert<double> second("tail_test", "torn");
+    EXPECT_NE(recoveredStore->series.find(first.seriesId128()), recoveredStore->series.end());
+    EXPECT_EQ(recoveredStore->series.find(second.seriesId128()), recoveredStore->series.end());
+}
+
+TEST_F(WALSeastarTest, TruncatedFinalFrameRemainsRecoverable) {
+    testTruncatedFinalFrameRemainsRecoverable().get();
 }
 
 seastar::future<> testCRC32BatchInsertRoundtrip() {
