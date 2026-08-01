@@ -4,7 +4,7 @@
 
 **Reviewed baseline:** `cluster-design` at `f78e05d` (2026-08-01)
 
-**Remediation commits:** `95c10d2`, `a16b03a`
+**Remediation commits:** `95c10d2`, `a16b03a`, `d578e81`, `ddab705`
 
 **Scope:** The recent VShard/Raft cluster redesign, its production-server
 integration, the public HTTP surface, recovery paths, and the release evidence
@@ -17,16 +17,17 @@ used as evidence that the current server is production-ready.
 
 ## Implementation progress after the review
 
-Two remediation passes are now committed. Cluster release status remains
+Four remediation commits are now recorded. Cluster release status remains
 **BLOCKED** because group 0/movement, generation-atomic live snapshot
-replacement, replicated deletes/retention, the large-snapshot path, rolling
-snapshot-format compatibility, and final live release gates remain open.
+replacement, pattern-delete expansion, replicated retention, the large-snapshot
+path, rolling wire-format compatibility, and final live release gates remain
+open.
 
 Completed and covered in this pass:
 
-- Partitioned `/delete`, retention mutations, `/subscribe`, and unwired read
-  consistency modes fail closed before local work. The M1 Compose file is marked
-  development/demo-only.
+- Unsupported partitioned delete forms, retention mutations, `/subscribe`, and
+  unwired read consistency modes fail closed before local work. The M1 Compose
+  file is marked development/demo-only.
 - Leader reads now take a quorum-confirmed ReadIndex; RF&lt;N routing can retry an
   alternate assigned replica; read RPCs share a bounded deadline.
 - Storage-backlog admission runs before proposal, while committed apply/replay
@@ -71,6 +72,14 @@ Completed and covered in this pass:
 - Source-inspection tests use build-provided absolute paths, so their result no
   longer depends on whether the binary is launched by CTest, from `build/test`,
   or from the repository root.
+- RF&gt;1 exact-series deletes now route from the public HTTP handler to the
+  VShard's current Raft leader and acknowledge only after quorum commit and
+  apply. The command path carries corrected-leader hints, attempt deadlines,
+  retry classification, v3 wire negotiation, and VShard identity validation at
+  originating, peer-ingress, and state-machine boundaries. RF=1 and pattern
+  deletes remain fail-closed; a mixed exact/pattern batch is rejected before any
+  proposal. Legal 10,000-target batches are capped at 32 concurrent quorum
+  waits rather than creating an unbounded proposal fan-out.
 
 Focused evidence on this pass includes the rebuilt server, unit and socket test
 targets, journal negative tests, alternate-replica routing tests, a black-holed
@@ -79,13 +88,16 @@ identity/topology tests, and pre-proposal admission tests. The strict checkboxes
 below stay open where their stated multi-process or fault-injection “done when”
 evidence has not yet been run.
 
-Final local validation for these remediation commits is green: 4,327 unit tests
-passed and one hardware-specific CRC fallback test was skipped out of 4,328,
-43/43 socket-backed cluster tests passed, the first-pass 56/56 focused
+Final local validation for these remediation commits is green: 4,336 unit tests
+passed and one source-inspection test was skipped out of 4,337, 45/45
+socket-backed cluster tests passed, the first-pass 56/56 focused
 cluster/readiness/identity/admission regressions passed, and the second-pass
-24/24 snapshot/compaction regressions passed. The production server links, every
-cluster-gate shell script passes `bash -n`, and `git diff --check` passes. These
-checks do not replace the open live multi-process gates.
+24/24 snapshot/compaction regressions passed. The exact-delete pass additionally
+covers public HTTP behavior, bounded batch fan-out, leader-hint retry, v3 socket
+transport, old-peer refusal, VShard-spoof rejection, and real Raft
+write/delete/query apply. The production server links, every cluster-gate shell
+script passes `bash -n`, and `git diff --check` passes. These checks do not
+replace the open live multi-process gates.
 
 ## Decision
 
@@ -158,6 +170,17 @@ delete of a one-point block therefore returned false and persisted no tombstone.
 CR-FIX-016 corrects the boundary and covers it through the tombstone-resolving
 VShard compaction regression; this does not close the separate Raft-routing gap.
 
+Commit `ddab705` closes that routing gap for exact targets in RF&gt;1 mode. The
+HTTP path builds the canonical series key, routes a `DeleteRangeKey` through the
+current VShard leader, and returns success only after commit and apply. It does
+not claim that the series existed: `seriesDeleted` is explicitly the number of
+exact commands committed and applied, avoiding a racy pre-read. Pattern
+expansion remains unavailable because it requires a placement-pinned catalog
+view; RF=1 and pattern requests return an unsupported response before local
+mutation, and a mixed batch is preflighted before any exact command is proposed.
+CR-FIX-010 remains open for the named live leader-failure/restart evidence and
+for pattern-delete semantics.
+
 ### CR-02 and CR-03 — snapshot contents and live installation were unsafe
 
 [`SnapshotPayload`](../lib/cluster/data/snapshot_payload.hpp) carries a manifest
@@ -198,6 +221,12 @@ group-0 capability bit, negotiated minimum version, upgrade order, or offline
 upgrade requirement currently prevents mixed versions from attempting an
 incompatible InstallSnapshot. This is an availability failure rather than
 silent state corruption, but it blocks a supported rolling production upgrade.
+
+The exact-delete transport also introduces a v3-only replicated-command verb.
+The client negotiates before use and refuses to send it to a v1/v2 peer, so a
+mixed cluster fails closed rather than misframing a mutation, but deletes are
+unavailable across that version boundary. A supported rolling upgrade therefore
+needs the same committed capability floor or a documented offline upgrade rule.
 
 ### CR-04 — control-plane and movement wiring are incomplete
 
@@ -324,10 +353,12 @@ is not completion.
 
 ### 0. Fence unsafe public behavior immediately
 
-- [x] **CR-FIX-001 — reject `/delete` in partitioned mode until CR-FIX-010 is
-  complete.** Owner: HTTP/data path. **Done when:** the API returns an explicit
-  unsupported/conflict response before changing local state, and a test proves
-  no authenticated or forwarded-header variant bypasses the guard.
+- [x] **CR-FIX-001 — fail closed for delete forms without a safe cluster
+  implementation.** Owner: HTTP/data path. **Done when:** the API returns an
+  explicit unsupported/conflict response before changing local state, and a
+  test proves no authenticated or forwarded-header variant bypasses the guard.
+  The guard now remains active for RF=1 and pattern deletes; exact RF&gt;1 targets
+  use the partial CR-FIX-010 implementation.
 - [x] **CR-FIX-002 — reject retention create/update/delete in partitioned mode
   until CR-FIX-040 is complete.** Owner: HTTP/control plane. **Done when:** no
   node-local policy mutation is possible through the public API in cluster mode.
@@ -347,6 +378,14 @@ is not completion.
   **Done when:** concurrent write/delete ordering, leader failure, client retry,
   and replica restart tests show identical tombstone revisions and no
   resurrection.
+  **Progress:** exact RF&gt;1 targets are wired end to end through the current
+  leader with bounded retries/deadlines and applied-quorum acknowledgement. The
+  v3 socket path rejects old peers and VShard-prefix spoofing; state apply
+  fail-stops on a cross-VShard command. HTTP tests cover exact and structured
+  targets, mixed-batch preflight, retryable `503`, and a 32-proposal concurrency
+  cap; a real single-voter Raft test proves write/delete/query ordering. Pattern
+  expansion and the named multi-node leader-failure, ambiguous client retry,
+  and replica-restart gates remain open.
 - [ ] **CR-FIX-011 — define a self-contained VShard snapshot format.** Owner:
   snapshot/storage. Include catalog/index extract, data objects, tombstone
   objects or a proven materialised-delete boundary, and real content hashes.
@@ -540,12 +579,13 @@ is not completion.
   the runtime mapping and the complete two-core suite reaches the later sharded
   Engine tests without routing to a nonexistent core. Verified by the
   4,328-test full-suite run below.
-- [ ] **CR-FIX-076 — define snapshot wire-version negotiation and upgrade
-  policy.** Owner: control plane/release. Gate v2 production until group 0 or an
-  equivalent handshake proves every sender and receiver supports it, or require
-  and document an offline upgrade. **Done when:** old-to-new and new-to-old
-  snapshot attempts follow the documented safe path, mixed-version behavior is
-  covered by a multi-process test, and rollback constraints are explicit.
+- [ ] **CR-FIX-076 — define snapshot and replicated-command wire-version
+  negotiation and upgrade policy.** Owner: control plane/release. Gate v2
+  snapshots and v3-only mutation verbs until group 0 or an equivalent handshake
+  proves every sender and receiver supports them, or require and document an
+  offline upgrade. **Done when:** old-to-new and new-to-old snapshot and command
+  attempts follow the documented safe path, mixed-version behavior is covered
+  by a multi-process test, and rollback constraints are explicit.
 
 ## Release exit criteria
 
@@ -584,13 +624,14 @@ is recorded in the commits named at the top of this document. These results
 validate the exercised unit and socket paths; they do not supersede the missing
 live gates or the remaining production-composition findings above.
 
-Post-remediation validation through `a16b03a`:
+Post-remediation validation through `ddab705`:
 
 ```text
-timestar_unit_test:              4327 passed, 1 skipped / 4328 (442 suites, -c 2)
-timestar_cluster_socket_test:      43/43 passed (8 suites, -c 2)
+timestar_unit_test:              4336 passed, 1 skipped / 4337 (443 suites, -c 2)
+timestar_cluster_socket_test:      45/45 passed (8 suites, -c 2)
 first-pass focused regressions:     56/56 passed (15 suites, -c 2)
 snapshot/compaction regressions:    24/24 passed (9 suites, -c 2)
+exact-delete focused regressions:   HTTP/router/wire/Raft paths passed
 timestar_http_server:              built successfully
 test/cluster_gates/*.sh:           bash -n passed
 git diff --check:                  passed
