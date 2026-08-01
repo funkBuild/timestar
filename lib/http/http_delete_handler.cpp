@@ -168,6 +168,24 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDeleteHandler::handle
     auto reqFmt = timestar::http::requestFormat(*req);
     auto resFmt = timestar::http::responseFormat(*req);
 
+    // CR-FIX-001: the public delete path is not yet ordered through each
+    // VShard's Raft group. Applying locally and falling back to the M1
+    // best-effort broadcaster can acknowledge a tombstone that a replica never
+    // receives, allowing deleted data to reappear after failover. Refuse before
+    // parsing or touching the Engine; the forwarded loop-guard header must not
+    // bypass this fence either.
+    if (partitionedCluster_) {
+        reply->set_status(seastar::http::reply::status_type::not_implemented);
+        constexpr std::string_view message =
+            "Delete is unavailable in partitioned cluster mode until Raft-ordered deletes are enabled";
+        if (timestar::http::isProtobuf(resFmt))
+            reply->_content = timestar::proto::formatDeleteResponse("error", 0, 0, std::string(message));
+        else
+            reply->_content = createErrorResponse(std::string(message));
+        timestar::http::setContentType(*reply, resFmt);
+        co_return reply;
+    }
+
     // Cluster: replicate an accepted delete to peers (M1) so the deletion applies
     // cluster-wide, not just on the accepting node. A forwarded delete is applied
     // locally only (loop guard).

@@ -1,8 +1,13 @@
 # Cluster Architecture and Implementation Plan
 
-**Status:** Proposed
+**Status:** Target architecture — production implementation blocked
 
-**Last reviewed:** July 2026
+**Implementation status and release blockers:**
+[Cluster production-readiness review and fix-up plan](cluster-production-readiness.md).
+This document defines the intended architecture; it does not assert that the
+running server currently satisfies every contract below.
+
+**Last reviewed:** August 2026
 
 **Scope:** Multi-machine placement, replication, queries, failure recovery, and online rebalancing
 
@@ -961,6 +966,35 @@ Readiness distinguishes client coordination, read eligibility, write
 eligibility, joining, draining, and control-plane availability.
 
 ## Configuration outline
+
+### Current static RF=3 bootstrap
+
+Until group 0 replaces static placement, the running server uses the following
+keys. `cluster_uuid` must be the same 32-hex value on every node. The exact RF
+and ordered `peers` list are persisted in each data directory and cannot be
+edited in place; attempting to do so fails startup because remapping without
+movement is unsafe.
+
+```toml
+[cluster]
+enabled = true
+partitioned = true
+replication_factor = 3
+node_id = 1
+peers = ["ts-a:8086", "ts-b:8086", "ts-c:8086"]
+cluster_uuid = "00112233445566778899aabbccddeeff"
+tls_cert_file = "/run/secrets/timestar-node.crt"
+tls_key_file = "/run/secrets/timestar-node.key"
+tls_ca_file = "/run/secrets/timestar-cluster-ca.crt"
+tls_peer_name = "timestar-node"
+```
+
+The same mTLS identity protects both the data-plane port (HTTP port + 1000) and
+Raft port (HTTP port + 2000), with client certificates required. The
+`development_allow_insecure_transport` setting and corresponding environment
+variable exist only for local test gates; they are not production settings.
+
+### Target group-0-managed configuration
 
 Names are illustrative and should be finalised with the implementation:
 

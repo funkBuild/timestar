@@ -26,6 +26,7 @@
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/do_with.hh>
 #include <seastar/core/future.hh>
+#include <seastar/core/future-util.hh>
 #include <seastar/core/gate.hh>
 #include <seastar/core/lowres_clock.hh>
 #include <seastar/core/sharded.hh>
@@ -124,7 +125,7 @@ class ShardRaftPlane : public data::ProposeSink, public data::ReadIndexSink {
 public:
     seastar::future<> init(seastar::sharded<Engine>* engines, seastar::sharded<ShardRaftPlane>* peers,
                            const data::VShardDirectory* dir, data::NodeId self, std::string journalRoot,
-                           std::chrono::milliseconds tick) {
+                           std::chrono::milliseconds tick, JournalIdentity journalIdentity = JournalIdentity::testing()) {
         store_ = std::make_unique<EngineLocalStore>(*engines);
         peers_ = peers;
         // Retained for VShard->group resolution (debt D-11). The directory outlives every
@@ -145,13 +146,15 @@ public:
         // Journals are per-VShard directories under this root, and each VShard belongs
         // to exactly one shard, so shards never contend for the same journal.
         plane_ = std::make_unique<ReplicatedDataPlane>(*store_, *transport_, *rpc_, *dir, self,
-                                                       std::filesystem::path(journalRoot), tick);
+                                                       std::filesystem::path(journalRoot), journalIdentity, tick);
         // FENCE THE PEER-FACING READ TOO (debt D-36). This store is what a peer's query
         // is answered from, and a coordinator merges that answer as authoritative -- so
         // an unfenced peer leg reintroduces exactly the silent short answer the local leg
         // is fenced against, just one hop away. The bar is the whole NODE's apply lag,
         // not this shard's: the answer spans every shard's engines.
         store_->setApplyFence([this]() { return awaitNodeApplyCatchUp(applyFenceBudget()); });
+        store_->setLeaderReadFence(
+            [this](const std::vector<uint16_t>& vshards) { return quorumLeaderReadFence(vshards); });
         return seastar::make_ready_future<>();
     }
 
@@ -196,6 +199,43 @@ public:
             return seastar::make_ready_future<bool>(true);
         return peers_->map_reduce0([budget](ShardRaftPlane& p) { return p.awaitApplyCatchUp(budget); }, true,
                                    std::logical_and<bool>{});
+    }
+
+    // Confirm a quorum ReadIndex for every VShard this node is about to answer.
+    // Work is routed to the shard that owns each Raft group and bounded to 32
+    // simultaneous heartbeat rounds per shard so a broad query cannot allocate
+    // 4096 waiter/heartbeat chains at once.
+    seastar::future<bool> quorumLeaderReadFence(const std::vector<uint16_t>& vshards) {
+        if (!peers_ || vshards.empty())
+            co_return false;
+        std::map<unsigned, std::vector<uint16_t>> byShard;
+        for (uint16_t vs : vshards)
+            byShard[shardOwningVShard(vs, dir_)].push_back(vs);
+
+        std::vector<seastar::future<>> pending;
+        pending.reserve(byShard.size());
+        for (auto& [shard, list] : byShard) {
+            if (shard == seastar::this_shard_id())
+                pending.push_back(quorumLeaderReadFenceLocal(std::move(list)));
+            else
+                pending.push_back(peers_->invoke_on(
+                    shard, [v = std::move(list)](ShardRaftPlane& p) mutable {
+                        return p.quorumLeaderReadFenceLocal(std::move(v));
+                    }));
+        }
+        for (auto& f : pending)
+            co_await std::move(f);
+        co_return true;
+    }
+
+    seastar::future<> quorumLeaderReadFenceLocal(std::vector<uint16_t> vshards) {
+        if (!plane_)
+            throw std::runtime_error("cluster: leader read fence reached an uninitialised shard plane");
+        static constexpr size_t kMaxConcurrentReadBarriers = 32;
+        co_await seastar::max_concurrent_for_each(
+            vshards, kMaxConcurrentReadBarriers, [this](uint16_t vs) -> seastar::future<> {
+                (void)co_await plane_->host().leaderReadIndex(vs);
+            });
     }
 
     // Listen for peer data-plane traffic on the node's data-plane port from THIS shard.
@@ -272,7 +312,9 @@ public:
     // The raw deliver hook is installed BEFORE listening: a connection accepted between
     // start() and setRawDeliver would fall through to the no-op DeliverFn and drop its
     // envelope (Raft would retry, but there is no reason to allow the window).
-    seastar::future<> startTransport(seastar::socket_address local) {
+    seastar::future<> startTransport(seastar::socket_address local, const std::optional<DataPlaneTls>& tls) {
+        if (tls)
+            transport_->setTlsCredentials(tls->certPem, tls->keyPem, tls->caPem, tls->expectedPeerName);
         transport_->setRawDeliver([this](uint16_t groupId, const char* bytes, size_t len) {
             // Already a GROUP id (the transport's 2-byte peek reads the envelope's
             // groupId), so this is an identity-free integer op and needs no directory.

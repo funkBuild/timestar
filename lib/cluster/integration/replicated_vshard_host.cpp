@@ -17,9 +17,47 @@ namespace timestar::cluster {
 
 namespace fs = std::filesystem;
 
+namespace {
+uint8_t hexNibble(char c) {
+    if (c >= '0' && c <= '9')
+        return static_cast<uint8_t>(c - '0');
+    if (c >= 'a' && c <= 'f')
+        return static_cast<uint8_t>(c - 'a' + 10);
+    if (c >= 'A' && c <= 'F')
+        return static_cast<uint8_t>(c - 'A' + 10);
+    throw std::invalid_argument("journal identity must contain only hexadecimal characters");
+}
+
+std::array<uint8_t, 16> parseUuidBytes(std::string_view value) {
+    if (value.size() != 32)
+        throw std::invalid_argument("journal identity UUID must contain exactly 32 hexadecimal characters");
+    std::array<uint8_t, 16> out{};
+    for (size_t i = 0; i < out.size(); ++i)
+        out[i] = static_cast<uint8_t>((hexNibble(value[2 * i]) << 4) | hexNibble(value[2 * i + 1]));
+    return out;
+}
+}  // namespace
+
+JournalIdentity JournalIdentity::fromHex(std::string_view clusterUuid, std::string_view bootId) {
+    return JournalIdentity{parseUuidBytes(clusterUuid), parseUuidBytes(bootId)};
+}
+
+JournalIdentity JournalIdentity::testing() {
+    JournalIdentity out;
+    out.clusterUuid.fill(0x11);
+    out.bootId.fill(0x44);
+    return out;
+}
+
 ReplicatedVShardHost::ReplicatedVShardHost(EngineLocalStore& store, raft::RaftTransport& transport, NodeId self,
                                            std::filesystem::path journalRoot, std::chrono::milliseconds tick)
-    : store_(store), self_(self), journalRoot_(std::move(journalRoot)), registry_(transport, tick) {}
+    : ReplicatedVShardHost(store, transport, self, std::move(journalRoot), JournalIdentity::testing(), tick) {}
+
+ReplicatedVShardHost::ReplicatedVShardHost(EngineLocalStore& store, raft::RaftTransport& transport, NodeId self,
+                                           std::filesystem::path journalRoot, JournalIdentity identity,
+                                           std::chrono::milliseconds tick)
+    : store_(store), self_(self), journalRoot_(std::move(journalRoot)), journalIdentity_(identity),
+      registry_(transport, tick) {}
 
 ReplicatedVShardHost::~ReplicatedVShardHost() {
     // stop() (async: drains ticks, closes journal writers) MUST be called before
@@ -95,9 +133,9 @@ seastar::future<> ReplicatedVShardHost::addVShard(uint16_t vshard, std::vector<N
     opts.snapshotBudget = &snapshotBudget_;
     VShardState vs;
     JournalSegmentHeader hdr;
-    hdr.clusterUuid.fill(0x11);  // TODO(M3 group-0): the real cluster UUID from node.json
+    hdr.clusterUuid = journalIdentity_.clusterUuid;
     hdr.coreNumber = static_cast<uint16_t>(seastar::this_shard_id());
-    hdr.bootId.fill(0x44);
+    hdr.bootId = journalIdentity_.bootId;
 
     // ONE journal per shard (debt D-10, opt-in) or one per VShard (default).
     //
@@ -231,11 +269,13 @@ seastar::future<> ReplicatedVShardHost::addVShard(uint16_t vshard, std::vector<N
     co_return;
 }
 
-seastar::future<bool> ReplicatedVShardHost::propose(uint16_t vshard, const data::ReplicatedCommand& cmd) {
+seastar::future<bool> ReplicatedVShardHost::propose(uint16_t vshard, data::ReplicatedCommand cmd) {
     raft::RaftGroup* g = registry_.group(vshard);
     if (!g)
         throw std::runtime_error("ReplicatedVShardHost::propose: VShard not hosted here");
-    return g->proposeAndAwaitApplied(data::encodeReplicatedCommand(cmd));
+    if (const auto* writes = std::get_if<data::WriteBatch>(&cmd))
+        co_await store_.checkWriteAdmission(*writes);
+    co_return co_await g->proposeAndAwaitApplied(data::encodeReplicatedCommand(cmd));
 }
 
 seastar::future<uint64_t> ReplicatedVShardHost::snapshotVShard(uint16_t vshard) {
@@ -638,6 +678,9 @@ seastar::future<bool> ReplicatedVShardHost::proposeVShardBatches(data::VShardBat
     for (const auto& [vs, b] : byVShard)
         if (!registry_.group(vs))
             throw std::runtime_error("ReplicatedVShardHost::proposeBatch: VShard not led here");
+    // One admission decision for the whole request, before ANY group can append.
+    // Apply is unconditional after this point, including on followers and replay.
+    co_await store_.checkWriteAdmission(data::viewOf(byVShard));
     // Replicate every VShard group CONCURRENTLY; every group must commit for the
     // batch to ack.
     //
@@ -650,8 +693,10 @@ seastar::future<bool> ReplicatedVShardHost::proposeVShardBatches(data::VShardBat
     // fsync waits instead of stacking them.
     std::vector<seastar::future<bool>> pending;
     pending.reserve(byVShard.size());
-    for (auto& [vs, b] : byVShard)
-        pending.push_back(propose(vs, data::ReplicatedCommand{std::move(b)}));
+    for (auto& [vs, b] : byVShard) {
+        auto* g = registry_.group(vs);
+        pending.push_back(g->proposeAndAwaitApplied(data::encodeWriteCommand(b)));
+    }
 
     // Await EVERY proposal even after one fails -- abandoning an in-flight future
     // would let its group's commit land on a destroyed continuation.
@@ -696,6 +741,10 @@ seastar::future<data::ProposeOutcome> ReplicatedVShardHost::proposeVShardBatches
                 data::WriteFailure::NotLeader});
         co_return out;  // committedVShards stays empty: nothing was proposed
     }
+
+    // Reject overloaded work before the first Raft append. The caller classifies
+    // WriteOverloadedError as retryable and, critically, unambiguous.
+    co_await store_.checkWriteAdmission(view);
 
     // Replicate every group CONCURRENTLY (see proposeVShardBatches for why serialising
     // them cost a full quorum round trip per VShard).

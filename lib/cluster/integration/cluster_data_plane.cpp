@@ -1,5 +1,6 @@
 #include "cluster_data_plane.hpp"
 
+#include "../../core/vshard.hpp"
 #include "../../utils/logger.hpp"  // timestar::http_log
 #include "../data/read_routing.hpp"
 #include "checkquorum_policy.hpp"
@@ -163,11 +164,20 @@ seastar::future<seastar::net::inet_address> resolveHost(const std::string& host)
 }
 }  // namespace
 
+void ClusterDataPlane::validateCoreTopology(unsigned coreCount, uint16_t replicationFactor) {
+    if (replicationFactor > 1 && !timestar::vshardsCohesiveOnCores(coreCount))
+        throw std::invalid_argument("ClusterDataPlane: replicated cluster requires a core count that divides " +
+                                    std::to_string(timestar::VIRTUAL_SHARD_COUNT) +
+                                    " so every VShard has a complete single-core snapshot; got " +
+                                    std::to_string(coreCount));
+}
+
 seastar::future<> ClusterDataPlane::start(const ClusterConfig& cfg, seastar::sharded<Engine>& engines) {
     // Force the in-flight write budget to resolve (and LOG itself) during startup rather
     // than on the first write, so a mis-set TIMESTAR_CLUSTER_WRITE_INFLIGHT_BYTES is
     // visible in the boot log instead of being inferred from a wall of 503s.
     (void)WriteAdmission::limitBytes();
+    validateCoreTopology(seastar::smp::count, cfg.replication_factor);
     rt_ = ClusterRuntime::fromConfig(cfg);  // throws (fail-closed) on misconfig
     enginesPtr_ = &engines;
     rf_ = cfg.replication_factor < 1 ? 1 : cfg.replication_factor;
@@ -211,6 +221,9 @@ seastar::future<> ClusterDataPlane::start(const ClusterConfig& cfg, seastar::sha
     // placement model). Group instantiation is the real prod cost: RF*4096/N groups
     // per node (see the group-granularity note in the plan).
     if (replicated) {
+        if (!journalIdentity_)
+            throw std::invalid_argument(
+                "ClusterDataPlane: replicated production startup requires a persistent journal identity");
         std::filesystem::path journalRoot = timestar::dataRootPath();
         journalRoot /= "cluster_raft";
         // Start a Raft plane on EVERY shard; each will own only the VShards that
@@ -222,8 +235,10 @@ seastar::future<> ClusterDataPlane::start(const ClusterConfig& cfg, seastar::sha
             const data::NodeId selfId = rt_->selfId;
             const data::VShardDirectory* dirp = dir_.get();
             auto* peers = &shards_;
-            co_await shards_.invoke_on_all([enginesPtr = enginesPtr_, peers, dirp, selfId, jroot](ShardRaftPlane& p) {
-                return p.init(enginesPtr, peers, dirp, selfId, jroot, kRaftTickPeriod);
+            const JournalIdentity journalIdentity = *journalIdentity_;
+            co_await shards_.invoke_on_all([enginesPtr = enginesPtr_, peers, dirp, selfId, jroot,
+                                            journalIdentity](ShardRaftPlane& p) {
+                return p.init(enginesPtr, peers, dirp, selfId, jroot, kRaftTickPeriod, journalIdentity);
             });
         }
 
@@ -236,6 +251,12 @@ seastar::future<> ClusterDataPlane::start(const ClusterConfig& cfg, seastar::sha
             const auto budget = ShardRaftPlane::applyFenceBudget();
             return shards_.map_reduce0([budget](ShardRaftPlane& p) { return p.awaitApplyCatchUp(budget); }, true,
                                        std::logical_and<bool>{});
+        });
+        // A node-local leg is subject to the same quorum ReadIndex as a peer leg.
+        // Without this callback, queries coordinated on a partitioned former leader
+        // bypass the peer-facing LeaderFilteredNodeStore and can return stale data.
+        local_->setLeaderReadFence([this](const std::vector<uint16_t>& vshards) {
+            return shards_.local().quorumLeaderReadFence(vshards);
         });
 
         // Serve the DATA plane on this node's data-plane address FROM EVERY SHARD
@@ -262,7 +283,8 @@ seastar::future<> ClusterDataPlane::start(const ClusterConfig& cfg, seastar::sha
         // which then decodes it.
         seastar::net::inet_address rAddr = co_await resolveHost(self.host);
         const seastar::socket_address raftAddr(rAddr, static_cast<uint16_t>(self.port + kRaftPortOffset));
-        co_await shards_.invoke_on_all([raftAddr](ShardRaftPlane& p) { return p.startTransport(raftAddr); });
+        co_await shards_.invoke_on_all(
+            [raftAddr, tls = tls_](ShardRaftPlane& p) { return p.startTransport(raftAddr, tls); });
 
         // Register peers on BOTH planes, from ONE resolution each, now that every
         // transport that needs them exists (write-scaleout 4b-iii).
@@ -654,6 +676,10 @@ seastar::future<QueryResponse> ClusterDataPlane::queryReplicated(QueryRequest re
     std::vector<std::string> incompleteReasons;
     std::exception_ptr firstErr;
     std::set<data::NodeId> unreachableLeaders;
+    // Per-VShard targets already proved unusable (transport failure) or already
+    // asked to resolve leadership. The latter prevents a reachable follower that
+    // redirects to a dead leader from being selected as the resolver forever.
+    std::map<uint16_t, std::set<data::NodeId>> excludedReadTargets;
     // Peers that answered the handshake but predate the leader-resolve read protocol
     // (debt D-25). Kept apart from `unreachableLeaders` because the two want opposite
     // treatment: an unreachable leader is woken and the client is told to retry, while a
@@ -677,6 +703,7 @@ seastar::future<QueryResponse> ClusterDataPlane::queryReplicated(QueryRequest re
     // next to the Raft clocks they are derived from (debt D-26, ADR 0006).
     unsigned leaderlessRetries = 0;
     int redirectRounds = 0;
+    int replicaFallbackRounds = 0;
     size_t leaderless = 0;
     std::vector<uint16_t> unassigned;
     // THE BUDGET IS WALL CLOCK, NOT ITERATIONS (found in the D-25/D-26 review). Counting
@@ -685,9 +712,11 @@ seastar::future<QueryResponse> ClusterDataPlane::queryReplicated(QueryRequest re
     // read could spend far more than 1.2 s and sail past the 2.5 s election minimum the
     // static_assert in the header claims to exclude -- making the assertion a statement about
     // arithmetic rather than about behaviour. Checked BETWEEN rounds, so the real bound is the
-    // budget plus at most one in-flight round; the RPCs themselves are untimed (see the
-    // residual on debt D-41).
+    // budget plus at most one LOCAL in-flight operation. Remote node-query attempts and
+    // their optional version handshakes share `readRpcDeadline`, so a black-holed peer
+    // cannot extend the query past the coordinator's wall-clock policy.
     const auto readStart = std::chrono::steady_clock::now();
+    const auto readRpcDeadline = seastar::rpc::rpc_clock_type::now() + kReadLeaderlessBudget;
     const auto budgetSpent = [&readStart] {
         return std::chrono::steady_clock::now() - readStart >= kReadLeaderlessBudget;
     };
@@ -701,7 +730,8 @@ seastar::future<QueryResponse> ClusterDataPlane::queryReplicated(QueryRequest re
         // leadership view, the hints we have learned, the placement map) -- extracted
         // so it can be unit-tested against a directory where this node hosts a strict
         // subset, which is the configuration that was permanently broken.
-        data::ReadRouting plan = data::planReadRouting(outstanding, leaders, readLeaderHints_, *dir_, self);
+        data::ReadRouting plan =
+            data::planReadRouting(outstanding, leaders, readLeaderHints_, *dir_, self, excludedReadTargets);
         leaderless = plan.leaderless;
         unassigned = plan.unassigned;
         auto& byLeader = plan.byNode;
@@ -740,16 +770,22 @@ seastar::future<QueryResponse> ClusterDataPlane::queryReplicated(QueryRequest re
             nq.vshards = vshards;
             if (auto r = resolveAt.find(leader); r != resolveAt.end())
                 nq.resolveVShards = std::move(r->second);
+            // A holder used to RESOLVE leadership is a one-shot candidate for each
+            // VShard in this query. If it redirects us to an excluded/dead leader,
+            // the next round must ask another holder rather than loop back here.
+            for (uint16_t vs : nq.resolveVShards)
+                excludedReadTargets[vs].insert(leader);
             pendingLeaders.push_back(leader);
             pendingResolve.push_back(nq.resolveVShards);  // COPY: nq is moved into the call below
             pendingVShards.push_back(std::move(vshards));
             if (leader == self)
                 pending.push_back(local_->queryLocal(std::move(nq)));
             else
-                pending.push_back(rpc_->queryNode(leader, std::move(nq)));
+                pending.push_back(rpc_->queryNode(leader, std::move(nq), readRpcDeadline));
         }
 
         bool learnedHint = false;
+        bool targetFailed = false;
         for (size_t i = 0; i < pending.size(); ++i) {
             auto& f = pending[i];
             try {
@@ -787,6 +823,9 @@ seastar::future<QueryResponse> ClusterDataPlane::queryReplicated(QueryRequest re
                 // genuine internal error and still propagates.
                 if (pendingLeaders[i] != self) {
                     unreachableLeaders.insert(pendingLeaders[i]);
+                    targetFailed = true;
+                    for (uint16_t vs : pendingVShards[i])
+                        excludedReadTargets[vs].insert(pendingLeaders[i]);
                     // AND FORGET EVERY HINT THAT POINTED AT IT. A hint is otherwise only
                     // dropped on a reply, which a dead node cannot send, so a cached
                     // redirect naming a node that then died failed every subsequent read
@@ -798,10 +837,23 @@ seastar::future<QueryResponse> ClusterDataPlane::queryReplicated(QueryRequest re
             }
         }
 
-        if (!unreachableLeaders.empty() || !unversionedPeers.empty() || firstErr || !incompleteReasons.empty())
-            break;  // answered below; retrying an incomplete/unreachable read is the caller's job
         if (outstanding.empty())
+        {
+            // An earlier target may have failed before an alternate answered all
+            // of its VShards. The completed answer is still whole; do not turn a
+            // successful fallback into QUERY_INCOMPLETE merely to report the first
+            // transport error.
+            unreachableLeaders.clear();
             break;  // every VShard answered exactly once
+        }
+        if (!unversionedPeers.empty() || firstErr || !incompleteReasons.empty())
+            break;
+        if (targetFailed && replicaFallbackRounds < kReadReplicaFallbackRounds && !budgetSpent()) {
+            ++replicaFallbackRounds;
+            continue;  // re-plan outstanding VShards onto another placement replica
+        }
+        if (targetFailed)
+            break;
         if (learnedHint && redirectRounds < kReadRedirectRounds && !budgetSpent()) {
             ++redirectRounds;
             continue;  // we know somewhere new to ask -- no reason to sleep first
@@ -894,6 +946,7 @@ seastar::future<ClusterDataPlane::Status> ClusterDataPlane::status() const {
         co_return st;
     st.self = rt_->selfId;
     st.peers = rt_->peerAddresses;
+    st.unresolvedPeerCount = unresolvedPeers_.size();
     st.replicated = replicated_;
     st.replicationFactor = rf_;
     if (!replicated_ || !shardsStarted_)
@@ -903,6 +956,9 @@ seastar::future<ClusterDataPlane::Status> ClusterDataPlane::status() const {
         peers.push_back(id);
     const data::NodeId self = rt_->selfId;
     auto& shards = const_cast<seastar::sharded<ShardRaftPlane>&>(shards_);
+    // Readiness requires the trigger on EVERY shard. Starting false and OR-ing
+    // masked a dead snapshot loop on N-1 shards as long as one shard remained live.
+    st.snapshotTriggerEnabled = true;
     for (unsigned sh = 0; sh < seastar::smp::count; ++sh) {
         auto c = co_await shards.invoke_on(sh, [self, peers](ShardRaftPlane& p) { return p.counts(self, peers); });
         st.vshardsHostedHere += c.hosted;
@@ -926,7 +982,7 @@ seastar::future<ClusterDataPlane::Status> ClusterDataPlane::status() const {
         st.snapshotsUndeliverable += sc.undeliverable;
         st.snapshotTransfersRestarted += sc.transfersRestarted;
         st.snapshotTransfersAbandoned += sc.transfersAbandoned;
-        st.snapshotTriggerEnabled = st.snapshotTriggerEnabled || sc.triggerEnabled;
+        st.snapshotTriggerEnabled = st.snapshotTriggerEnabled && sc.triggerEnabled;
         auto jc = co_await shards.invoke_on(sh, [](ShardRaftPlane& p) { return p.journalCounts(); });
         st.journalFsyncs += jc.fsyncs;
         st.journalSyncRequests += jc.syncRequests;

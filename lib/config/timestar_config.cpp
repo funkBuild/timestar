@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
+#include <cctype>
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
@@ -66,6 +67,22 @@ std::vector<std::string> TimestarConfig::validate() const {
             errors.emplace_back("cluster.replication_factor must be odd (Raft majority quorum)");
         if (cluster.enabled && cluster.replication_factor > cluster.peers.size())
             errors.emplace_back("cluster.replication_factor must not exceed the number of nodes");
+        const bool validClusterUuid = cluster.cluster_uuid.size() == 32 &&
+                                      std::all_of(cluster.cluster_uuid.begin(), cluster.cluster_uuid.end(),
+                                                  [](unsigned char c) { return std::isxdigit(c) != 0; });
+        if (!validClusterUuid)
+            errors.emplace_back("cluster.cluster_uuid must be exactly 32 hexadecimal characters for RF > 1");
+
+        const bool anyTls = !cluster.tls_cert_file.empty() || !cluster.tls_key_file.empty() ||
+                            !cluster.tls_ca_file.empty() || !cluster.tls_peer_name.empty();
+        const bool completeTls = !cluster.tls_cert_file.empty() && !cluster.tls_key_file.empty() &&
+                                 !cluster.tls_ca_file.empty() && !cluster.tls_peer_name.empty();
+        if (anyTls && !completeTls)
+            errors.emplace_back("cluster TLS requires tls_cert_file, tls_key_file, tls_ca_file, and tls_peer_name");
+        if (!completeTls && !cluster.development_allow_insecure_transport)
+            errors.emplace_back(
+                "replicated cluster transport requires mTLS; set every cluster TLS field (the insecure override is "
+                "development-only)");
     }
 
     if (storage.wal_size_threshold == 0) {
@@ -500,6 +517,13 @@ void applyEnvironmentOverrides(TimestarConfig& cfg) {
     envBool("TIMESTAR_CLUSTER_PARTITIONED", cfg.cluster.partitioned);
     envU16("TIMESTAR_CLUSTER_REPLICATION_FACTOR", cfg.cluster.replication_factor);
     envU16("TIMESTAR_CLUSTER_NODE_ID", cfg.cluster.node_id);
+    envString("TIMESTAR_CLUSTER_UUID", cfg.cluster.cluster_uuid);
+    envString("TIMESTAR_CLUSTER_TLS_CERT_FILE", cfg.cluster.tls_cert_file);
+    envString("TIMESTAR_CLUSTER_TLS_KEY_FILE", cfg.cluster.tls_key_file);
+    envString("TIMESTAR_CLUSTER_TLS_CA_FILE", cfg.cluster.tls_ca_file);
+    envString("TIMESTAR_CLUSTER_TLS_PEER_NAME", cfg.cluster.tls_peer_name);
+    envBool("TIMESTAR_CLUSTER_DEVELOPMENT_ALLOW_INSECURE_TRANSPORT",
+            cfg.cluster.development_allow_insecure_transport);
     // TIMESTAR_CLUSTER_PEERS is a comma-separated list of "host:port" in node-id
     // order (index 0 == node 1), including this node's own address.
     if (auto v = envStr("TIMESTAR_CLUSTER_PEERS")) {

@@ -23,6 +23,62 @@ protected:
     void TearDown() override { cleanTestShardDirectories(); }
 };
 
+TEST_F(ClusterDataPlaneTest, ReplicatedStartupRejectsNonCohesiveCoreCounts) {
+    EXPECT_NO_THROW(cluster::ClusterDataPlane::validateCoreTopology(1, 3));
+    EXPECT_NO_THROW(cluster::ClusterDataPlane::validateCoreTopology(2, 3));
+    EXPECT_NO_THROW(cluster::ClusterDataPlane::validateCoreTopology(4, 3));
+    EXPECT_THROW(cluster::ClusterDataPlane::validateCoreTopology(3, 3), std::invalid_argument);
+    EXPECT_THROW(cluster::ClusterDataPlane::validateCoreTopology(6, 3), std::invalid_argument);
+    EXPECT_NO_THROW(cluster::ClusterDataPlane::validateCoreTopology(3, 1));
+}
+
+TEST_F(ClusterDataPlaneTest, ClusterReadinessFailsClosedOnCurrentServingBlockers) {
+    cluster::ClusterDataPlane::Status st;
+    st.replicated = true;
+    st.vshardsHostedHere = 10;
+    st.snapshotTriggerEnabled = true;
+    EXPECT_TRUE(st.readyForTraffic());
+
+    st.unresolvedPeerCount = 1;
+    EXPECT_FALSE(st.readyForTraffic());
+    EXPECT_NE(st.readinessReason().find("unresolved"), std::string::npos);
+    st.unresolvedPeerCount = 0;
+
+    st.vshardsLeaderless = 1;
+    EXPECT_FALSE(st.readyForTraffic());
+    EXPECT_NE(st.readinessReason().find("no elected leader"), std::string::npos);
+    st.vshardsLeaderless = 0;
+
+    st.applyLagEntries = 1;
+    EXPECT_FALSE(st.readyForTraffic());
+    EXPECT_NE(st.readinessReason().find("not applied"), std::string::npos);
+    st.applyLagEntries = 0;
+
+    st.applyFailures = 1;
+    EXPECT_FALSE(st.readyForTraffic());
+    EXPECT_NE(st.readinessReason().find("apply failure"), std::string::npos);
+    st.applyFailures = 0;
+
+    st.tickErrors = 1;
+    EXPECT_FALSE(st.readyForTraffic());
+    EXPECT_NE(st.readinessReason().find("tick error"), std::string::npos);
+    st.tickErrors = 0;
+
+    st.snapshotTriggerEnabled = false;
+    EXPECT_FALSE(st.readyForTraffic());
+    EXPECT_NE(st.readinessReason().find("snapshot"), std::string::npos);
+    st.snapshotTriggerEnabled = true;
+
+    st.snapshotsRefusedTooLarge = 1;
+    EXPECT_FALSE(st.readyForTraffic());
+    EXPECT_NE(st.readinessReason().find("size bound"), std::string::npos);
+    st.snapshotsRefusedTooLarge = 0;
+
+    st.snapshotsUndeliverable = 1;
+    EXPECT_FALSE(st.readyForTraffic());
+    EXPECT_NE(st.readinessReason().find("undeliverable"), std::string::npos);
+}
+
 data::WriteSeries series(const std::string& m, std::map<std::string, std::string> tags, const std::string& f,
                          TSMValueType type, std::vector<uint64_t> ts,
                          std::variant<std::vector<double>, std::vector<int64_t>, std::vector<bool>,

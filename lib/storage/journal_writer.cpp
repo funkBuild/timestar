@@ -74,17 +74,38 @@ seastar::future<std::vector<JournalRecord>> JournalWriter::open() {
         auto scan = scanJournalSegment(std::span<const char>(bytes.data(), bytes.size()));
 
         if (!scan) {
-            // No valid header. On the FINAL segment this is a crash before the
-            // header became durable -- it holds no records. DELETE it so a later
-            // recovery (once newer segments exist) does not see it as a fatal
-            // non-final corrupt segment. On a non-final segment it is genuine
-            // corruption: fail closed.
-            if (isFinal) {
+            // The only safe header-less segment is a zero-byte FINAL file: that
+            // is exactly what startSegment() leaves if the process dies before
+            // the first barrier writes its buffered header. A non-empty file may
+            // contain a partially-written header or durable records whose header
+            // was damaged. Preserve it and fence instead of silently deleting
+            // potentially-authoritative bytes.
+            if (isFinal && bytes.empty()) {
                 co_await seastar::remove_file(path.string());
                 co_await seastar::sync_directory(dir_.string());  // make the deletion durable
                 continue;
             }
             fence("corrupt journal segment header: " + path.string());
+            throw std::runtime_error(fenceReason_);
+        }
+
+        // The decoder establishes format integrity; recovery must also establish
+        // that the segment belongs to THIS cluster/core and that its embedded
+        // sequence agrees with its canonical filename. bootId is intentionally
+        // not compared with headerTemplate_: a clean restart creates a new boot
+        // id while all prior-boot segments remain authoritative and must replay.
+        // It remains part of the on-disk provenance for diagnostics and future
+        // manifest-backed boot-transition validation.
+        if (scan->header.clusterUuid != headerTemplate_.clusterUuid) {
+            fence("journal segment belongs to a different cluster: " + path.string());
+            throw std::runtime_error(fenceReason_);
+        }
+        if (scan->header.coreNumber != headerTemplate_.coreNumber) {
+            fence("journal segment belongs to a different core: " + path.string());
+            throw std::runtime_error(fenceReason_);
+        }
+        if (scan->header.segmentNumber != segments[i]) {
+            fence("journal segment number does not match filename: " + path.string());
             throw std::runtime_error(fenceReason_);
         }
 

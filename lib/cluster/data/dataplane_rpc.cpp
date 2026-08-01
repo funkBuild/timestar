@@ -274,6 +274,9 @@ struct DataPlaneRpc::Impl {
     std::function<seastar::future<seastar::sstring>(Client&, seastar::rpc::rpc_clock_type::time_point,
                                                     seastar::sstring)>
         negotiateVersionTimedStub;
+    std::function<seastar::future<seastar::sstring>(Client&, seastar::rpc::rpc_clock_type::time_point,
+                                                    seastar::sstring)>
+        queryNodeTimedStub;
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> leaderReadIndexStub;
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> leaderCommitIndexStub;
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> negotiateVersionStub;
@@ -354,6 +357,7 @@ struct DataPlaneRpc::Impl {
         proposeWriteTimedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kProposeWrite);
         proposeWriteHintedTimedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kProposeWriteHinted);
         negotiateVersionTimedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kNegotiateVersion);
+        queryNodeTimedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kQueryNode);
         leaderReadIndexStub = proto.make_client<seastar::sstring(seastar::sstring)>(kLeaderReadIndex);
         leaderCommitIndexStub = proto.make_client<seastar::sstring(seastar::sstring)>(kLeaderCommitIndex);
         negotiateVersionStub = proto.make_client<seastar::sstring(seastar::sstring)>(kNegotiateVersion);
@@ -717,6 +721,10 @@ seastar::future<> DataPlaneRpc::forwardWriteBatch(NodeId to, WriteBatch batch) {
 }
 
 seastar::future<NodeQueryPartial> DataPlaneRpc::queryNode(NodeId to, NodeQueryRequest req) {
+    return queryNode(to, std::move(req), std::nullopt);
+}
+
+seastar::future<NodeQueryPartial> DataPlaneRpc::queryNode(NodeId to, NodeQueryRequest req, OptDeadline deadline) {
     if (impl_->stopping)
         throw std::runtime_error("dataplane: shutting down");
     // WIRE-VERSION GATE FOR THE RESOLVE/REDIRECT PAIR (debt D-25). Handshaked ONLY when the
@@ -729,16 +737,8 @@ seastar::future<NodeQueryPartial> DataPlaneRpc::queryNode(NodeId to, NodeQueryRe
     // `versionFor`. Pre-existing on the write path, recorded as a residual on debt D-25.)
     // See node_query.hpp for why absence of a reply tail cannot be read as "no redirects".
     //
-    // DELIBERATELY THE UNTIMED `versionFor`, against the write path's own rule that a
-    // handshake must not put an unbounded suspension in front of a bounded one. That rule
-    // is about INVERSION, and there is nothing here to invert: the `queryNodeStub` call
-    // below is itself untimed, so the read path is uniformly unbounded and the handshake
-    // adds no new class of stall. A deadline here would be false reassurance while the query
-    // RPC it precedes can still hang forever on a black-holed peer -- the read path needs a
-    // per-attempt bound of its own first, filed with the rest of the read-side fault
-    // handling (debt D-41).
     if (!req.resolveVShards.empty()) {
-        const uint32_t version = co_await versionFor(to);
+        const uint32_t version = co_await versionFor(to, deadline);
         if (version < kNodeQueryResolveMinVersion)
             throw ReadResolveUnsupportedError(
                 "dataplane: peer " + std::to_string(to) + " negotiated wire v" + std::to_string(version) + ", below v" +
@@ -756,7 +756,9 @@ seastar::future<NodeQueryPartial> DataPlaneRpc::queryNode(NodeId to, NodeQueryRe
         return on;
     }();
     const auto tRpc0 = std::chrono::high_resolution_clock::now();
-    seastar::sstring reply = co_await impl_->queryNodeStub(*conn, seastar::sstring(bytes.data(), bytes.size()));
+    seastar::sstring frame(bytes.data(), bytes.size());
+    seastar::sstring reply = deadline ? co_await impl_->queryNodeTimedStub(*conn, *deadline, frame)
+                                      : co_await impl_->queryNodeStub(*conn, frame);
     const double rpcMs =
         std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - tRpc0).count();
     const auto tDec0 = std::chrono::high_resolution_clock::now();

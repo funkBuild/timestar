@@ -7,6 +7,7 @@
 #include <memory>
 #include <seastar/core/future.hh>
 #include <seastar/net/socket_defs.hh>
+#include <string>
 
 namespace timestar::raft {
 
@@ -51,6 +52,12 @@ public:
     seastar::future<> stop();
     // Register how to reach a peer node (its host RPC address).
     void addPeer(NodeId id, seastar::socket_address addr);
+
+    // Require mutual TLS for the listener and every peer connection. Must be set
+    // before start(); the server requires a client certificate and outbound peers
+    // are verified against expectedPeerName.
+    void setTlsCredentials(std::string certPem, std::string keyPem, std::string caPem,
+                           std::string expectedPeerName);
 
     seastar::future<> send(Envelope env) override;
 

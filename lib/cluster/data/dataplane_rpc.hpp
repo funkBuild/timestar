@@ -75,6 +75,10 @@ public:
     // NodeQueryPartial. Both awaited.
     seastar::future<> forwardWriteBatch(NodeId to, WriteBatch batch) override;
     seastar::future<NodeQueryPartial> queryNode(NodeId to, NodeQueryRequest req) override;
+    // Deadline-bearing read used by the replicated coordinator. It bounds both
+    // the optional version handshake and the query RPC; the interface overload
+    // above remains for legacy/test callers that own no wall-clock budget.
+    seastar::future<NodeQueryPartial> queryNode(NodeId to, NodeQueryRequest req, OptDeadline deadline);
     seastar::future<MetadataResult> queryMetadata(NodeId to, MetadataRequest req) override;
     seastar::future<bool> proposeWrite(NodeId to, WriteBatch batch) override;
     // The production remote propose (write-scaleout 3a/3b): borrows the caller's groups

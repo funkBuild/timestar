@@ -46,7 +46,7 @@ for i in 1 2 3; do rm -rf "/tmp/tsgate_nk$i"; mkdir -p "/tmp/tsgate_nk$i"; done
 PEERS="127.0.0.1:19610,127.0.0.1:19611,127.0.0.1:19612"
 start_node() {
     env $GATE_SERVER_ENV TIMESTAR_DATA_DIR="/tmp/tsgate_nk$1" TIMESTAR_CLUSTER_ENABLED=true TIMESTAR_CLUSTER_PARTITIONED=true \
-        TIMESTAR_CLUSTER_REPLICATION_FACTOR=3 TIMESTAR_CLUSTER_NODE_ID=$1 TIMESTAR_CLUSTER_PEERS="$PEERS" \
+        TIMESTAR_CLUSTER_REPLICATION_FACTOR=3 TIMESTAR_CLUSTER_UUID=00112233445566778899aabbccddeeff TIMESTAR_CLUSTER_DEVELOPMENT_ALLOW_INSECURE_TRANSPORT=true TIMESTAR_CLUSTER_NODE_ID=$1 TIMESTAR_CLUSTER_PEERS="$PEERS" \
         "$BIN" --port $((19609 + $1)) --smp 4 >>"/tmp/tsgate_nk$1/s.log" 2>&1 &
 }
 trap 'gate_cleanup 1961 /tmp/tsgate_nk1 /tmp/tsgate_nk2 /tmp/tsgate_nk3' EXIT

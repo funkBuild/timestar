@@ -1,4 +1,6 @@
 #include "cluster/integration/cluster_data_plane.hpp"
+#include "cluster/integration/group0_identity_bridge.hpp"
+#include "cluster/integration/node_identity.hpp"
 #include "config/timestar_config.hpp"
 #include "core/engine.hpp"
 #include "core/placement_table.hpp"
@@ -9,6 +11,7 @@
 #include "http/http_metadata_handler.hpp"
 #include "http/http_query_handler.hpp"
 #include "http/http_retention_handler.hpp"
+#include "http/http_routes.hpp"
 #include "http/http_stream_handler.hpp"
 #include "http/http_write_handler.hpp"
 #include "http/proto_converters.hpp"
@@ -23,6 +26,7 @@
 #include <atomic>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <seastar/core/app-template.hh>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/prometheus.hh>
@@ -83,6 +87,26 @@ static const std::string& authToken() {
     return p ? *p : empty;
 }
 
+static std::string readClusterCredential(const std::string& path, const char* label) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in)
+        throw std::runtime_error(std::string("cannot open cluster ") + label + " file: " + path);
+    std::ostringstream out;
+    out << in.rdbuf();
+    if (!in.good() && !in.eof())
+        throw std::runtime_error(std::string("cannot read cluster ") + label + " file: " + path);
+    if (out.str().empty())
+        throw std::runtime_error(std::string("cluster ") + label + " file is empty: " + path);
+    return out.str();
+}
+
+static std::string staticTopologyDescription(const timestar::ClusterConfig& cfg) {
+    std::string value = "rf=" + std::to_string(cfg.replication_factor) + ";peers=";
+    for (const auto& peer : cfg.peers)
+        value += std::to_string(peer.size()) + ":" + peer + ";";
+    return value;
+}
+
 void set_routes(routes& r) {
     // Per-shard handler instances. Each handler's registerRoutes() captures
     // `this` in route lambdas, so the handler must outlive set_routes().
@@ -126,12 +150,12 @@ void set_routes(routes& r) {
                   std::string body = "{\"clustered\":true,\"node_id\":" + std::to_string(st.self) +
                                      ",\"replication_factor\":" + std::to_string(st.replicationFactor) +
                                      ",\"replicated\":" + (st.replicated ? "true" : "false") + ",\"peers\":[" + peers +
-                                     "]";
+                                     "],\"unresolved_peers\":" + std::to_string(st.unresolvedPeerCount);
                   if (st.replicated) {
                       body += ",\"vshards_hosted\":" + std::to_string(st.vshardsHostedHere) +
                               ",\"vshards_led\":" + std::to_string(st.vshardsLedHere) +
                               ",\"vshards_leaderless\":" + std::to_string(st.vshardsLeaderless) +
-                              ",\"healthy\":" + (st.vshardsLeaderless == 0 ? "true" : "false");
+                              ",\"healthy\":" + (st.readyForTraffic() ? "true" : "false");
                       // Replication progress of each peer for the groups we lead. A peer
                       // far below vshards_led is not acking our appends.
                       std::string caught;
@@ -185,8 +209,8 @@ void set_routes(routes& r) {
     // Operator action: hand leadership of VShards this node leads beyond its fair
     // share to lighter peers (M5 leadership balancing == v1 read balancing). Bounded
     // per call via ?max=N (default 256); call repeatedly to converge.
-    r.add(operation_type::POST, url("/cluster/rebalance-leadership"),
-          new function_handler(
+    timestar::http::addJsonRoute(
+        r, operation_type::POST, "/cluster/rebalance-leadership", authToken(),
               [](std::unique_ptr<seastar::http::request> req,
                  std::unique_ptr<seastar::http::reply> rep) -> seastar::future<std::unique_ptr<seastar::http::reply>> {
                   size_t maxTransfers = 256;
@@ -220,8 +244,7 @@ void set_routes(routes& r) {
                                   ",\"vshards_led_before\":" + std::to_string(before) +
                                   ",\"vshards_led_after\":" + std::to_string(after) + "}";
                   co_return std::move(rep);
-              },
-              "json"));
+              });
 
     r.add(operation_type::GET, url("/health"),
           new function_handler(
@@ -229,6 +252,16 @@ void set_routes(routes& r) {
                  std::unique_ptr<seastar::http::reply> rep) -> seastar::future<std::unique_ptr<seastar::http::reply>> {
                   auto resFmt = timestar::http::responseFormat(*req);
                   if (g_ready.load(std::memory_order_acquire)) {
+                      bool clusterReady = true;
+                      std::string clusterReason;
+                      if (g_clusterPartitioned) {
+                          auto st = co_await seastar::smp::submit_to(0u, [] { return g_clusterDataPlane.status(); });
+                          if (!st.readyForTraffic()) {
+                              clusterReady = false;
+                              clusterReason = st.readinessReason();
+                          }
+                      }
+
                       // A tier that cannot merge is invisible until the server starts
                       // refusing writes: the production incident this guards against ran
                       // 15 minutes with /health saying "healthy" while compaction failed
@@ -238,15 +271,24 @@ void set_routes(routes& r) {
                       const uint64_t worstFailures = g_engine.local().getMaxConsecutiveCompactionFailures();
                       const bool compactionStuck = worstFailures >= HEALTH_COMPACTION_FAILURE_THRESHOLD;
 
-                      rep->set_status(seastar::http::reply::status_type::ok);
-                      if (timestar::http::isProtobuf(resFmt)) {
+                      if (!clusterReady) {
+                          rep->set_status(seastar::http::reply::status_type::service_unavailable);
+                          if (timestar::http::isProtobuf(resFmt))
+                              rep->_content = timestar::proto::formatHealthResponse("not_ready");
+                          else
+                              rep->_content = "{\"status\":\"not_ready\",\"reason\":\"" +
+                                              timestar::jsonEscape(clusterReason) + "\"}";
+                      } else if (timestar::http::isProtobuf(resFmt)) {
+                          rep->set_status(seastar::http::reply::status_type::ok);
                           rep->_content =
                               timestar::proto::formatHealthResponse(compactionStuck ? "degraded" : "healthy");
                       } else if (compactionStuck) {
+                          rep->set_status(seastar::http::reply::status_type::ok);
                           rep->_content =
                               "{\"status\":\"degraded\",\"reason\":\"compaction_failing\",\"consecutive_failures\":" +
                               std::to_string(worstFailures) + "}";
                       } else {
+                          rep->set_status(seastar::http::reply::status_type::ok);
                           rep->_content = "{\"status\":\"healthy\"}";
                       }
                   } else {
@@ -258,8 +300,7 @@ void set_routes(routes& r) {
                       }
                   }
                   timestar::http::setContentType(*rep, resFmt);
-                  rep->done();
-                  return seastar::make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
+                  co_return std::move(rep);
               },
               "json"));
 
@@ -293,19 +334,20 @@ void set_routes(routes& r) {
     auto* queryHandler = emplaceHandler(new timestar::http::HttpQueryHandler(&g_engine));
     queryHandler->registerRoutes(r, authToken());
 
-    auto* deleteHandler = emplaceHandler(new timestar::http::HttpDeleteHandler(&g_engine));
+    auto* deleteHandler = emplaceHandler(new timestar::http::HttpDeleteHandler(&g_engine, g_clusterPartitioned));
     deleteHandler->registerRoutes(r, authToken());
 
     auto* metadataHandler = emplaceHandler(new timestar::http::HttpMetadataHandler(&g_engine));
     metadataHandler->registerRoutes(r, authToken());
 
-    auto retentionHandlerPtr = std::make_shared<timestar::http::HttpRetentionHandler>(&g_engine);
+    auto retentionHandlerPtr =
+        std::make_shared<timestar::http::HttpRetentionHandler>(&g_engine, g_clusterPartitioned);
     retentionHandlerPtr->registerRoutes(r, authToken());
     handlers.emplace_back(new std::shared_ptr<timestar::http::HttpRetentionHandler>(retentionHandlerPtr), [](void* p) {
         delete static_cast<std::shared_ptr<timestar::http::HttpRetentionHandler>*>(p);
     });
 
-    auto* streamHandler = emplaceHandler(new timestar::http::HttpStreamHandler(&g_engine));
+    auto* streamHandler = emplaceHandler(new timestar::http::HttpStreamHandler(&g_engine, g_clusterPartitioned));
     streamHandler->registerRoutes(r, authToken());
     g_streamHandler = streamHandler;
 
@@ -465,6 +507,34 @@ int main(int argc, char** argv) {
                 return 1;
             }
 
+            // Until group 0 owns cluster bootstrap, bind the static placement inputs
+            // to this data directory and stamp the same durable cluster identity into
+            // every Raft journal. This turns peer-list edits and cross-wired data dirs
+            // into startup failures instead of silent VShard remaps/replay.
+            std::optional<timestar::cluster::JournalIdentity> clusterJournalIdentity;
+            std::optional<timestar::cluster::DataPlaneTls> clusterTls;
+            {
+                const auto& cc = timestar::config().cluster;
+                if (cc.enabled && cc.partitioned && cc.replication_factor > 1) {
+                    auto identity = timestar::cluster::NodeIdentity::loadOrCreate(dataRoot);
+                    timestar::cluster::bindClusterUuid(identity, dataRoot, cc.cluster_uuid);
+                    timestar::cluster::bindStaticTopology(identity, dataRoot, staticTopologyDescription(cc));
+                    clusterJournalIdentity = timestar::cluster::JournalIdentity::fromHex(
+                        identity.cluster_uuid, timestar::cluster::NodeIdentity::generateUuid());
+
+                    if (!cc.tls_cert_file.empty()) {
+                        clusterTls = timestar::cluster::DataPlaneTls{
+                            readClusterCredential(cc.tls_cert_file, "certificate"),
+                            readClusterCredential(cc.tls_key_file, "private key"),
+                            readClusterCredential(cc.tls_ca_file, "CA"), cc.tls_peer_name};
+                    } else {
+                        timestar::http_log.warn(
+                            "replicated cluster transport is PLAINTEXT because the explicit development-only insecure "
+                            "override is enabled");
+                    }
+                }
+            }
+
             // STEP 0: Fail-closed storage safety gate.
             //
             // Normal startup never runs the legacy core-count rebalancer, which
@@ -575,6 +645,10 @@ int main(int argc, char** argv) {
             {
                 const auto& cc = timestar::config().cluster;
                 if (cc.enabled && cc.partitioned) {
+                    if (clusterJournalIdentity)
+                        g_clusterDataPlane.setJournalIdentity(*clusterJournalIdentity);
+                    if (clusterTls)
+                        g_clusterDataPlane.setTlsCredentials(*clusterTls);
                     g_clusterDataPlane.start(cc, g_engine).get();
                     g_clusterPartitioned = true;
                     // Route /query through the data plane (fan out to owners + merge).

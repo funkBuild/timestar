@@ -12,6 +12,7 @@
 #include "engine_data_state_machine.hpp"
 
 #include <chrono>
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <map>
@@ -20,10 +21,22 @@
 #include <seastar/core/gate.hh>
 #include <seastar/core/lowres_clock.hh>
 #include <seastar/core/timer.hh>
+#include <string_view>
 
 namespace timestar::cluster {
 
 using timestar::raft::NodeId;
+
+// Durable identity stamped into every Raft journal segment. Production constructs
+// this from node.json's cluster UUID and a fresh process boot UUID. The testing
+// value exists only to keep isolated host tests independent of server bootstrap.
+struct JournalIdentity {
+    std::array<uint8_t, 16> clusterUuid{};
+    std::array<uint8_t, 16> bootId{};
+
+    static JournalIdentity fromHex(std::string_view clusterUuid, std::string_view bootId);
+    static JournalIdentity testing();
+};
 
 // Hosts the per-VShard Raft groups this node replicates, over the REAL Engine
 // (integration plan M3, the "per-core RaftGroupRegistry hosting an
@@ -39,6 +52,9 @@ class ReplicatedVShardHost : public data::ProposeSink, public data::LeaderResolv
 public:
     ReplicatedVShardHost(EngineLocalStore& store, raft::RaftTransport& transport, NodeId self,
                          std::filesystem::path journalRoot,
+                         std::chrono::milliseconds tick = std::chrono::milliseconds(20));
+    ReplicatedVShardHost(EngineLocalStore& store, raft::RaftTransport& transport, NodeId self,
+                         std::filesystem::path journalRoot, JournalIdentity identity,
                          std::chrono::milliseconds tick = std::chrono::milliseconds(20));
     ~ReplicatedVShardHost();
     ReplicatedVShardHost(const ReplicatedVShardHost&) = delete;
@@ -76,7 +92,9 @@ public:
 
     // Replicate a command to a VShard's group; resolves true on durable quorum commit
     // + apply, false if this node is not the leader (caller redirects to the leader).
-    seastar::future<bool> propose(uint16_t vshard, const data::ReplicatedCommand& cmd);
+    // Own the command because admission introduces a suspension before encoding.
+    // A const-reference parameter would dangle when callers pass a temporary.
+    seastar::future<bool> propose(uint16_t vshard, data::ReplicatedCommand cmd);
 
     // The write-path entry point: split a WriteBatch by VShard and replicate each
     // group through its Raft group. This node must LEAD every VShard in the batch
@@ -374,6 +392,7 @@ private:
     EngineLocalStore& store_;
     NodeId self_;
     std::filesystem::path journalRoot_;
+    JournalIdentity journalIdentity_;
     // ---- shared per-shard journal (debt D-10), null unless opted in ----
     //
     // Opened lazily on the first addVShard and shared by every group on this

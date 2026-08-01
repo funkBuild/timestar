@@ -511,7 +511,8 @@ seastar::future<> Engine::bindSeriesType(const SeriesId128& seriesId, TSMValueTy
 }
 
 template <class T>
-seastar::future<std::vector<TimeStarInsert<T>>> Engine::enforceSeriesTypes(std::vector<TimeStarInsert<T>> requests) {
+seastar::future<std::vector<TimeStarInsert<T>>> Engine::enforceSeriesTypes(std::vector<TimeStarInsert<T>> requests,
+                                                                           bool enforceAdmission) {
     constexpr TSMValueType kIncoming = timestar::valueTypeOf<T>();
 
     std::vector<TimeStarInsert<T>> kept;
@@ -606,36 +607,38 @@ seastar::future<std::vector<TimeStarInsert<T>>> Engine::enforceSeriesTypes(std::
     // matches its binding by construction, so it takes the `kept` path.
     if constexpr (!std::is_same_v<T, double>)
         if (!asDouble.empty())
-            co_await insertBatch<double>(std::move(asDouble));
+            co_await insertBatch<double>(std::move(asDouble), enforceAdmission);
     if constexpr (!std::is_same_v<T, bool>)
         if (!asBool.empty())
-            co_await insertBatch<bool>(std::move(asBool));
+            co_await insertBatch<bool>(std::move(asBool), enforceAdmission);
     if constexpr (!std::is_same_v<T, std::string>)
         if (!asString.empty())
-            co_await insertBatch<std::string>(std::move(asString));
+            co_await insertBatch<std::string>(std::move(asString), enforceAdmission);
     if constexpr (!std::is_same_v<T, int64_t>)
         if (!asInteger.empty())
-            co_await insertBatch<int64_t>(std::move(asInteger));
+            co_await insertBatch<int64_t>(std::move(asInteger), enforceAdmission);
 
     co_return kept;
 }
 
 template <class T>
-seastar::future<WALTimingInfo> Engine::insertBatch(std::vector<TimeStarInsert<T>> insertRequests) {
+seastar::future<WALTimingInfo> Engine::insertBatch(std::vector<TimeStarInsert<T>> insertRequests,
+                                                   bool enforceAdmission) {
     auto holder = _insertGate.hold();
 
     if (insertRequests.empty()) {
         co_return WALTimingInfo{};  // No work to do
     }
 
-    rejectIfIngestBacklogged();
+    if (enforceAdmission)
+        rejectIfIngestBacklogged();
 
     // Enforce the per-series type binding BEFORE anything durable happens, so a
     // rejected write leaves no WAL record and no memstore entry, and before
     // subscribers are notified, so a stream never sees a value the store
     // rejected. Recovery is unaffected: WALReader::readAll calls
     // MemoryStore::insertMemory directly and never reaches this method.
-    insertRequests = co_await enforceSeriesTypes<T>(std::move(insertRequests));
+    insertRequests = co_await enforceSeriesTypes<T>(std::move(insertRequests), enforceAdmission);
     if (insertRequests.empty()) {
         co_return WALTimingInfo{};  // everything was converted into other types
     }
@@ -1300,16 +1303,18 @@ template seastar::future<> Engine::insert<std::string>(TimeStarInsert<std::strin
                                                        bool skipMetadataIndexing);
 template seastar::future<> Engine::insert<int64_t>(TimeStarInsert<int64_t> insertRequest, bool skipMetadataIndexing);
 
-template seastar::future<WALTimingInfo> Engine::insertBatch<bool>(std::vector<TimeStarInsert<bool>> insertRequests);
-template seastar::future<WALTimingInfo> Engine::insertBatch<double>(std::vector<TimeStarInsert<double>> insertRequests);
+template seastar::future<WALTimingInfo> Engine::insertBatch<bool>(std::vector<TimeStarInsert<bool>> insertRequests,
+                                                                  bool enforceAdmission);
+template seastar::future<WALTimingInfo> Engine::insertBatch<double>(std::vector<TimeStarInsert<double>> insertRequests,
+                                                                    bool enforceAdmission);
 template seastar::future<WALTimingInfo> Engine::insertBatch<std::string>(
-    std::vector<TimeStarInsert<std::string>> insertRequests);
+    std::vector<TimeStarInsert<std::string>> insertRequests, bool enforceAdmission);
 template seastar::future<WALTimingInfo> Engine::insertBatch<int64_t>(
-    std::vector<TimeStarInsert<int64_t>> insertRequests);
+    std::vector<TimeStarInsert<int64_t>> insertRequests, bool enforceAdmission);
 
 #define TIMESTAR_INST_ENFORCE(T)                                                            \
     template seastar::future<std::vector<TimeStarInsert<T>>> Engine::enforceSeriesTypes<T>( \
-        std::vector<TimeStarInsert<T>>);
+        std::vector<TimeStarInsert<T>>, bool);
 TIMESTAR_INSTANTIATE_FOR_VALUE_TYPES(TIMESTAR_INST_ENFORCE)
 #undef TIMESTAR_INST_ENFORCE
 

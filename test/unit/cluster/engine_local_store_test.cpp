@@ -208,6 +208,44 @@ TEST_F(EngineLocalStoreTest, QueryLocalHonorsVShardFilter) {
     }).get();
 }
 
+TEST_F(EngineLocalStoreTest, ReplicatedQueryRequiresExactVShardLeaderFence) {
+    seastar::async([] {
+        ScopedShardedEngine eng;
+        eng.start();
+        cluster::EngineLocalStore store(*eng);
+
+        std::vector<uint16_t> fenced;
+        store.setLeaderReadFence([&fenced](const std::vector<uint16_t>& vshards) {
+            fenced = vshards;
+            return seastar::make_ready_future<bool>(true);
+        });
+
+        data::NodeQueryRequest req;
+        req.request.aggregation = AggregationMethod::LATEST;
+        req.request.measurement = "missing";
+        req.request.fields = {"value"};
+        req.request.startTime = BASE - 1;
+        req.request.endTime = BASE + 1;
+        req.vshards = {11, 22};
+        auto ok = store.queryLocal(req).get();
+        EXPECT_TRUE(ok.incompleteReasons.empty());
+        EXPECT_EQ(fenced, (std::vector<uint16_t>{11, 22}));
+
+        data::NodeQueryRequest unrestricted = req;
+        unrestricted.vshards.clear();
+        auto refused = store.queryLocal(std::move(unrestricted)).get();
+        ASSERT_EQ(refused.incompleteReasons.size(), 1u);
+        EXPECT_NE(refused.incompleteReasons.front().find("no VShard filter"), std::string::npos);
+
+        store.setLeaderReadFence([](const std::vector<uint16_t>&) {
+            return seastar::make_ready_future<bool>(false);
+        });
+        auto noQuorum = store.queryLocal(std::move(req)).get();
+        ASSERT_EQ(noQuorum.incompleteReasons.size(), 1u);
+        EXPECT_NE(noQuorum.incompleteReasons.front().find("quorum"), std::string::npos);
+    }).get();
+}
+
 TEST_F(EngineLocalStoreTest, QueryMetadataReturnsOwnedSchema) {
     seastar::async([] {
         ScopedShardedEngine eng;

@@ -558,6 +558,22 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpStreamHandler::handle
 
     auto resFmt = timestar::http::responseFormat(*req);
 
+    // CR-FIX-003: subscriptions currently observe one Engine node only. In a
+    // partitioned cluster that is a silently incomplete stream, so refuse it
+    // until the coordinator can follow VShard leaders and resume by commit
+    // position. This happens before parsing or allocating subscription state.
+    if (_partitionedCluster) {
+        rep->set_status(seastar::http::reply::status_type::not_implemented);
+        constexpr std::string_view message =
+            "Streaming subscriptions are unavailable in partitioned cluster mode";
+        if (timestar::http::isProtobuf(resFmt))
+            rep->_content = timestar::proto::formatErrorResponse(std::string(message), "CLUSTER_STREAM_UNSUPPORTED");
+        else
+            rep->_content = timestar::http::jsonError(std::string(message), "CLUSTER_STREAM_UNSUPPORTED");
+        timestar::http::setContentType(*rep, resFmt);
+        co_return rep;
+    }
+
     // Body size limit to prevent DoS via large payloads
     if (req->content.size() > timestar::config().http.max_query_body_size) {
         rep->set_status(seastar::http::reply::status_type::payload_too_large);

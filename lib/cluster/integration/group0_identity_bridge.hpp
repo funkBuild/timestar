@@ -31,4 +31,9 @@ control::NodeRecord nodeRecordFrom(const NodeIdentity& identity, raft::NodeId ra
 // uuid already matches. Returns true iff node.json was (re)written.
 bool bindClusterUuid(NodeIdentity& identity, const std::filesystem::path& dataDir, const std::string& clusterUuid);
 
+// Persist the exact static placement inputs used by the pre-group-0 server. A
+// different value on restart is an unsafe topology edit and is refused. Returns
+// true when the value was first bound.
+bool bindStaticTopology(NodeIdentity& identity, const std::filesystem::path& dataDir, const std::string& topology);
+
 }  // namespace timestar::cluster

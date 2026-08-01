@@ -14,6 +14,10 @@ namespace timestar::cluster {
 struct NodeIdentity {
     std::string node_uuid;
     std::string cluster_uuid;  // empty until init/join
+    // Canonical RF + ordered peer-list description for the static bootstrap
+    // implementation. Once set it is immutable: changing configured peers without
+    // group-0 movement would remap VShards and lose access to data.
+    std::string static_topology;
 
     // Load node.json from `dataDir`; if absent (or unreadable), generate a fresh
     // node_uuid (128-bit, 32 hex) with an empty cluster_uuid and persist it. Always

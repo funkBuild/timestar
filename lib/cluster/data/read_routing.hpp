@@ -39,26 +39,55 @@ struct ReadRouting {
 // primary, follow the leader hint it answers with" shape the write path uses.
 inline ReadRouting planReadRouting(const std::set<uint16_t>& outstanding,
                                    const std::map<uint16_t, NodeId>& hostedLeaders,
-                                   const std::map<uint16_t, NodeId>& hints, const VShardDirectory& dir, NodeId self) {
+                                   const std::map<uint16_t, NodeId>& hints, const VShardDirectory& dir, NodeId self,
+                                   const std::map<uint16_t, std::set<NodeId>>& excludedTargets = {}) {
     ReadRouting out;
     for (uint16_t vs : outstanding) {
+        const auto excludedIt = excludedTargets.find(vs);
+        const auto isExcluded = [&excludedIt, &excludedTargets](NodeId node) {
+            return excludedIt != excludedTargets.end() && excludedIt->second.count(node) != 0;
+        };
+        const auto placementIt = dir.map().placement.find(vs);
+        const auto alternateReplica = [&]() {
+            if (placementIt == dir.map().placement.end())
+                return raft::kNoNode;
+            for (NodeId replica : placementIt->second)
+                if (replica != self && !isExcluded(replica))
+                    return replica;
+            return raft::kNoNode;
+        };
+
         auto it = hostedLeaders.find(vs);
         if (it != hostedLeaders.end()) {
             // Hosted here: our own live view is authoritative and is re-read on every
             // attempt, so a cached hint can never survive a leadership transfer.
             if (it->second == raft::kNoNode)
                 ++out.leaderless;
-            else
+            else if (!isExcluded(it->second))
                 out.byNode[it->second].push_back(vs);
+            else if (NodeId target = alternateReplica(); target != raft::kNoNode) {
+                // Our live view still names a leader whose transport attempt failed.
+                // Ask another holder to resolve leadership instead of pinning the read
+                // to the dead node until this local group's election view catches up.
+                out.byNode[target].push_back(vs);
+                out.resolveAt[target].push_back(vs);
+            } else {
+                ++out.leaderless;
+            }
             continue;
         }
         NodeId target = raft::kNoNode;
-        if (auto h = hints.find(vs); h != hints.end())
+        if (auto h = hints.find(vs); h != hints.end() && !isExcluded(h->second))
             target = h->second;
         if (target == raft::kNoNode || target == self)
             target = dir.ownerOf(vs);  // a hint naming US is stale by construction
+        if (target != raft::kNoNode && isExcluded(target))
+            target = alternateReplica();
         if (target == raft::kNoNode) {
-            out.unassigned.push_back(vs);
+            if (placementIt == dir.map().placement.end() || placementIt->second.empty())
+                out.unassigned.push_back(vs);
+            else
+                ++out.leaderless;  // assigned, but every safe target was exhausted
             continue;
         }
         if (target == self) {

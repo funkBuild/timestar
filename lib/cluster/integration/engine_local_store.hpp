@@ -35,6 +35,13 @@ public:
     // swallowed). Revisions in the batch are passed through -- the Engine must not
     // re-stamp non-empty revision vectors.
     seastar::future<> applyWrites(data::WriteBatch batch) override;
+    // Apply an already-committed/replayed command. This deliberately bypasses
+    // ingest admission: rejecting after quorum commit stalls every retry of the
+    // same Ready and can never make the durable work disappear.
+    seastar::future<> applyCommittedWrites(data::WriteBatch batch);
+    // Admission probes used by the leader before it proposes any slice.
+    seastar::future<> checkWriteAdmission(const data::WriteBatch& batch);
+    seastar::future<> checkWriteAdmission(data::VShardBatchView view);
 
     seastar::future<bool> applyDelete(std::string seriesKey, uint64_t start, uint64_t end) override;
     seastar::future<> applyRetention(std::string measurement, uint64_t cutoff);
@@ -123,12 +130,22 @@ public:
     using ApplyFenceFn = std::function<seastar::future<bool>()>;
     void setApplyFence(ApplyFenceFn fn) { applyFence_ = std::move(fn); }
 
+    // THE LEADER READ FENCE. In replicated mode every VShard named by a query
+    // must complete its current leader's quorum-confirmed ReadIndex before any
+    // Engine state is read. A partitioned former leader therefore rejects instead
+    // of serving its locally-applied but stale state. The callback receives the
+    // exact filter because an unrestricted replicated read cannot be fenced safely.
+    using LeaderReadFenceFn = std::function<seastar::future<bool>(const std::vector<uint16_t>&)>;
+    void setLeaderReadFence(LeaderReadFenceFn fn) { leaderReadFence_ = std::move(fn); }
+
     // Routing helper (public for tests): the core that owns `id`.
     unsigned coreFor(const SeriesId128& id) const;
 
 private:
+    seastar::future<> applyWritesImpl(data::WriteBatch batch, bool enforceAdmission);
     seastar::sharded<Engine>& engines_;
     ApplyFenceFn applyFence_;
+    LeaderReadFenceFn leaderReadFence_;
 };
 
 }  // namespace timestar::cluster

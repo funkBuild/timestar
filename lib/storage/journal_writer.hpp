@@ -19,9 +19,10 @@ namespace timestar {
 // durable in group-commit barriers (stream flush + fdatasync). Segments rotate
 // at a target size and a record never straddles a segment boundary.
 //
-// Recovery (open()) reads existing segments in order, collecting their records
-// and cleanly dropping a torn/corrupt tail on the last one; new appends go to a
-// fresh segment, so recovery is read-only and idempotent over a torn tail.
+// Recovery (open()) reads existing segments in order, validates cluster/core/
+// segment identity, and cleanly drops a torn record tail on the last one. Only
+// a zero-byte final segment (crash before its buffered header was written) is
+// deleted; any non-empty invalid segment is preserved and fences recovery.
 //
 // Any append/barrier I/O error FENCES the writer: it rejects all further appends
 // and reports unhealthy (the journal safety contract -- no catch-and-continue on
@@ -34,7 +35,8 @@ public:
 
     // Recover existing segments and open a fresh segment for append. Returns all
     // recovered records across segments, in append order. Throws on a corrupt
-    // (bad-header, or torn-non-last) segment -- that is not a recoverable tail.
+    // (bad/foreign/misnamed header, or torn-non-last) segment -- that is not a
+    // recoverable tail.
     seastar::future<std::vector<JournalRecord>> open();
 
     // Append a record (buffered, not yet durable). Rotates first if the current

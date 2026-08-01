@@ -98,6 +98,10 @@ inline constexpr std::chrono::milliseconds kReadLeaderlessBudget =
 // retry is a wait, and charging redirects to the wait budget let the ordinary RF < N
 // cold-cache case spend its election tolerance before any election mattered.
 inline constexpr int kReadRedirectRounds = 2;
+// At RF=3, two alternates are enough to try every placement replica after the
+// first target fails. Separate from redirects: resolving leadership and losing a
+// transport are distinct events and must not consume each other's progress budget.
+inline constexpr int kReadReplicaFallbackRounds = 2;
 
 static_assert(kReadLeaderlessBudget >= raftTicksToWallClock(kRaftTransferTicks),
               "a read must outlast the leader-transfer abandon window, or routine rebalancing is user-visible "
@@ -168,6 +172,7 @@ public:
     // shard-0 clients would speak TLS while every per-shard listener and the whole write
     // path stayed plaintext -- queries fail loudly, writes go silently unencrypted.
     void setTlsCredentials(DataPlaneTls creds) { tls_ = std::move(creds); }
+    void setJournalIdentity(JournalIdentity identity) { journalIdentity_ = identity; }
     void setLocalVersion(features::VersionRange range) { localVersion_ = range; }
     // What this NODE advertises to peers (pushed to every per-shard transport in
     // start()). Exposed so a test can read the real value back instead of grepping for a
@@ -212,6 +217,7 @@ public:
         uint16_t replicationFactor = 1;
         bool replicated = false;
         std::map<NodeId, std::string> peers;  // node id -> "host:port"
+        size_t unresolvedPeerCount = 0;
         // Replicated mode only (all zero otherwise):
         size_t vshardsHostedHere = 0;  // Raft groups this node replicates
         size_t vshardsLedHere = 0;     // of those, ones this node currently leads
@@ -263,8 +269,47 @@ public:
         uint64_t journalFsyncs = 0;
         uint64_t journalSyncRequests = 0;
         bool journalShared = false;
+
+        [[nodiscard]] bool readyForTraffic() const {
+            if (unresolvedPeerCount != 0)
+                return false;
+            if (!replicated)
+                return true;
+            return vshardsHostedHere != 0 && vshardsLeaderless == 0 && applyLagEntries == 0 && applyFailures == 0 &&
+                   tickErrors == 0 && snapshotTriggerEnabled && snapshotsRefusedTooLarge == 0 &&
+                   snapshotsUndeliverable == 0;
+        }
+
+        [[nodiscard]] std::string readinessReason() const {
+            if (unresolvedPeerCount != 0)
+                return std::to_string(unresolvedPeerCount) + " configured peer(s) are unresolved";
+            if (!replicated)
+                return {};
+            if (vshardsHostedHere == 0)
+                return "this replicated node hosts no VShards";
+            if (vshardsLeaderless != 0)
+                return std::to_string(vshardsLeaderless) + " hosted VShard(s) have no elected leader";
+            if (applyFailures != 0)
+                return std::to_string(applyFailures) + " Raft apply failure(s) require operator investigation";
+            if (tickErrors != 0)
+                return std::to_string(tickErrors) + " Raft tick error(s) require operator investigation";
+            if (applyLagEntries != 0)
+                return std::to_string(applyLagEntries) + " committed Raft entrie(s) are not applied";
+            if (!snapshotTriggerEnabled)
+                return "Raft snapshot production is disabled";
+            if (snapshotsRefusedTooLarge != 0)
+                return std::to_string(snapshotsRefusedTooLarge) +
+                       " VShard snapshot(s) exceeded the safe in-memory size bound";
+            if (snapshotsUndeliverable != 0)
+                return std::to_string(snapshotsUndeliverable) + " VShard snapshot transfer(s) were undeliverable";
+            return {};
+        }
     };
     seastar::future<Status> status() const;
+
+    // Fail startup before accepting traffic when the configured reactor count
+    // cannot produce complete single-core VShard snapshots.
+    static void validateCoreTopology(unsigned coreCount, uint16_t replicationFactor);
 
     // Operator action (integration plan M5 leadership balancing, which is also v1's
     // READ balancing since reads go to leaders). Hands leadership of up to
@@ -329,6 +374,7 @@ private:
     seastar::sharded<Engine>* enginesPtr_ = nullptr;
     // Applied to this object's transport AND to every per-shard transport in start().
     std::optional<DataPlaneTls> tls_;
+    std::optional<JournalIdentity> journalIdentity_;
     // Everything this binary can read and write. Pushed to every per-shard transport
     // in start(), so peers negotiate against the node's REAL capability; leaving it at
     // the VersionRange default {1,1} would pin the whole cluster to the v1 wire format

@@ -231,6 +231,11 @@ public:
     [[nodiscard]] bool revisionAssignmentEnabled() const { return assignRevisions_; }
     // The next revision this shard would assign (test/observability).
     [[nodiscard]] uint64_t nextRevision() const { return nextRevision_; }
+    // Admission-only probe for a replicated leader. It performs the exact
+    // conversion/compaction/free-memory checks used by ordinary inserts without
+    // writing anything. Committed Raft apply calls insertBatch with admission
+    // disabled because a durable entry is no longer rejectable work.
+    void checkIngestAdmission() { rejectIfIngestBacklogged(); }
     seastar::future<> stop();
 
     // Start the background tier-compaction loop. Called after
@@ -240,7 +245,8 @@ public:
     template <class T>
     seastar::future<> insert(TimeStarInsert<T> insertRequest, bool skipMetadataIndexing = false);
     template <class T>
-    seastar::future<WALTimingInfo> insertBatch(std::vector<TimeStarInsert<T>> insertRequests);
+    seastar::future<WALTimingInfo> insertBatch(std::vector<TimeStarInsert<T>> insertRequests,
+                                              bool enforceAdmission = true);
 
     // Enforce each request's series type binding, converting losslessly where
     // possible. Returns the subset whose type matches T; anything bound to a
@@ -251,7 +257,8 @@ public:
     // Public only so tests can drive it directly; callers should use
     // insertBatch, which invokes it.
     template <class T>
-    seastar::future<std::vector<TimeStarInsert<T>>> enforceSeriesTypes(std::vector<TimeStarInsert<T>> requests);
+    seastar::future<std::vector<TimeStarInsert<T>>> enforceSeriesTypes(std::vector<TimeStarInsert<T>> requests,
+                                                                      bool enforceAdmission = true);
     template <class T>
     seastar::future<SeriesId128> indexMetadata(TimeStarInsert<T> insertRequest);
     seastar::future<> indexMetadataBatch(const std::vector<MetadataOp>& ops);

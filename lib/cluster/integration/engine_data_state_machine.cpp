@@ -29,7 +29,7 @@ seastar::future<> EngineDataStateMachine::apply(raft::LogEntry entry) {
         // pure function of the log on every replica.
         for (auto& s : w->series)
             s.revisions.assign(s.timestamps.size(), entry.index);
-        co_await store_.applyWrites(std::move(*w));
+        co_await store_.applyCommittedWrites(std::move(*w));
     } else if (auto* d = std::get_if<data::DeleteRangeKey>(&*cmd)) {
         co_await store_.applyDelete(d->seriesKey, d->startTime, d->endTime);
     } else {

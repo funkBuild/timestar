@@ -57,6 +57,15 @@ TEST(PlacementTableTest, CoreForHashEqualsModulo) {
 // ---------------------------------------------------------------------------
 
 TEST(PlacementTableTest, RouteToCoreMatchesManualHash) {
+    // The placement is process-global and the test binary keeps one Seastar
+    // runtime for every suite. Restore the runtime's real core-count mapping
+    // even if an assertion below fails; leaking the synthetic four-core table
+    // makes later two-core Engine tests route work to nonexistent cores.
+    struct PlacementRestore {
+        timestar::PlacementTable previous;
+        ~PlacementRestore() { timestar::setGlobalPlacement(std::move(previous)); }
+    } restore{timestar::placement()};
+
     unsigned N = 4;
     auto pt = timestar::PlacementTable::buildLocal(N);
     timestar::setGlobalPlacement(std::move(pt));

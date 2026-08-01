@@ -997,6 +997,24 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpQueryHandler::handleQ
             }
         }
 
+        // CR-FIX-032 safety fence: the production replicated coordinator does
+        // not yet consume session envelopes or enforce maxReadLagIndex. Accepting
+        // those values and serving the ordinary leader path is a false contract.
+        // The cluster hook is installed only in partitioned mode; single-node
+        // parsing/behavior remains unchanged.
+        if (clusterQueryHook && queryRequest.readConsistency != ReadConsistencyMode::Leader) {
+            rep->set_status(seastar::http::reply::status_type::not_implemented);
+            constexpr std::string_view message =
+                "Only leader consistency is currently supported in partitioned cluster mode";
+            if (timestar::http::isProtobuf(resFmt))
+                rep->_content =
+                    timestar::proto::formatQueryError("CLUSTER_READ_MODE_UNSUPPORTED", std::string(message));
+            else
+                rep->_content = createErrorResponse("CLUSTER_READ_MODE_UNSUPPORTED", std::string(message));
+            timestar::http::setContentType(*rep, resFmt);
+            co_return rep;
+        }
+
         // Execute query (executeQuery itself routes through the cluster in
         // partitioned mode, so every caller -- /query AND /derived sub-queries -- fans
         // out and merges).

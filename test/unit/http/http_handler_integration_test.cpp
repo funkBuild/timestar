@@ -34,6 +34,8 @@
 // HTTP handlers
 #include "../../../lib/http/http_metadata_handler.hpp"
 #include "../../../lib/http/http_query_handler.hpp"
+#include "../../../lib/http/http_retention_handler.hpp"
+#include "../../../lib/http/http_stream_handler.hpp"
 #include "../../../lib/http/http_write_handler.hpp"
 
 #include "../../../lib/http/http_delete_handler.hpp"
@@ -1241,6 +1243,64 @@ TEST_F(HttpHandlerIntegrationTest, DeleteMissingRequiredFieldsReturnsError) {
         auto delReq = makeDeleteRequest(R"({"startTime": 1000})");
         auto delRep = deleteHandler.handleDelete(std::move(delReq)).get();
         EXPECT_EQ(delRep->_status, seastar::http::reply::status_type::bad_request);
+    })
+        .join()
+        .get();
+}
+
+TEST_F(HttpHandlerIntegrationTest, PartitionedClusterRejectsDeleteBeforeLocalMutation) {
+    seastar::thread([] {
+        HttpDeleteHandler deleteHandler(nullptr, true);
+        auto req = makeDeleteRequest(R"({"series":"m value","startTime":0,"endTime":1})");
+        req->_headers["x-timestar-cluster-forwarded"] = "1";
+        auto rep = deleteHandler.handleDelete(std::move(req)).get();
+        EXPECT_EQ(rep->_status, seastar::http::reply::status_type::not_implemented);
+        EXPECT_NE(rep->_content.find("Raft-ordered deletes"), std::string::npos);
+    })
+        .join()
+        .get();
+}
+
+TEST_F(HttpHandlerIntegrationTest, PartitionedClusterRejectsRetentionAndStreamingBeforeLocalWork) {
+    seastar::thread([] {
+        auto retention = std::make_shared<HttpRetentionHandler>(nullptr, true);
+        auto retentionReq = std::make_unique<seastar::http::request>();
+        retentionReq->_headers["Content-Type"] = "application/json";
+        retentionReq->content = R"({"measurement":"m","ttl":"1h"})";
+        auto retentionRep = retention->handlePut(std::move(retentionReq)).get();
+        EXPECT_EQ(retentionRep->_status, seastar::http::reply::status_type::not_implemented);
+        EXPECT_NE(retentionRep->_content.find("CLUSTER_RETENTION_UNSUPPORTED"), std::string::npos);
+
+        HttpStreamHandler stream(nullptr, true);
+        auto streamReq = std::make_unique<seastar::http::request>();
+        streamReq->_headers["Content-Type"] = "application/json";
+        streamReq->content = R"json({"query":"latest:m(value)"})json";
+        auto streamRep = stream.handleSubscribe(std::move(streamReq)).get();
+        EXPECT_EQ(streamRep->_status, seastar::http::reply::status_type::not_implemented);
+        EXPECT_NE(streamRep->_content.find("CLUSTER_STREAM_UNSUPPORTED"), std::string::npos);
+    })
+        .join()
+        .get();
+}
+
+TEST_F(HttpHandlerIntegrationTest, PartitionedClusterRejectsUnwiredReadConsistencyModes) {
+    seastar::thread([] {
+        struct ResetHook {
+            ~ResetHook() { HttpQueryHandler::clusterQueryHook = {}; }
+        } reset;
+        HttpQueryHandler::clusterQueryHook = [](QueryRequest) {
+            ADD_FAILURE() << "unsupported read mode reached the cluster coordinator";
+            return seastar::make_ready_future<QueryResponse>();
+        };
+
+        HttpQueryHandler queryHandler(nullptr);
+        auto req = std::make_unique<seastar::http::request>();
+        req->_headers["Content-Type"] = "application/json";
+        req->content =
+            R"json({"query":"latest:m(value)","startTime":0,"endTime":1,"consistency":"session"})json";
+        auto rep = queryHandler.handleQuery(std::move(req)).get();
+        EXPECT_EQ(rep->_status, seastar::http::reply::status_type::not_implemented);
+        EXPECT_NE(rep->_content.find("CLUSTER_READ_MODE_UNSUPPORTED"), std::string::npos);
     })
         .join()
         .get();

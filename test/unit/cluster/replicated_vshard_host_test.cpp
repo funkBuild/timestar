@@ -31,6 +31,20 @@ using namespace timestar::raft;
 namespace fs = std::filesystem;
 
 namespace {
+
+TEST(JournalIdentityTest, ParsesConfiguredClusterAndBootUuids) {
+    auto id = cluster::JournalIdentity::fromHex("00112233445566778899aabbccddeeff",
+                                                "ffeeddccbbaa99887766554433221100");
+    EXPECT_EQ(id.clusterUuid.front(), 0x00);
+    EXPECT_EQ(id.clusterUuid.back(), 0xff);
+    EXPECT_EQ(id.bootId.front(), 0xff);
+    EXPECT_EQ(id.bootId.back(), 0x00);
+    EXPECT_THROW(cluster::JournalIdentity::fromHex("short", "ffeeddccbbaa99887766554433221100"),
+                 std::invalid_argument);
+    EXPECT_THROW(cluster::JournalIdentity::fromHex("00112233445566778899aabbccddeezz",
+                                                    "ffeeddccbbaa99887766554433221100"),
+                 std::invalid_argument);
+}
 constexpr uint64_t BASE = 1'700'000'000'000'000'000ULL;
 
 class ReplicatedVShardHostTest : public ::testing::Test {
@@ -310,7 +324,8 @@ TEST_F(ReplicatedVShardHostTest, LeaderReachSinkConfirmsReadIndexAndRejectsNonLe
         RaftOptions opts;
         opts.electionTimeoutMin = opts.electionTimeoutMax = 1;
         opts.heartbeatTimeout = 1;
-        const uint16_t V = 11;
+        const std::string key = buildSeriesKey("temp", {{"host", "h1"}}, "value");
+        const uint16_t V = timestar::virtualShard(SeriesId128::fromSeriesKey(key));
         host.addVShard(V, {1}, opts).get();
         RaftGroup* g = host.group(V);
         ASSERT_NE(g, nullptr);
@@ -325,7 +340,7 @@ TEST_F(ReplicatedVShardHostTest, LeaderReachSinkConfirmsReadIndexAndRejectsNonLe
         for (int i = 0; i < 10 && !g->isLeader(); ++i)
             g->tick().get();
         ASSERT_TRUE(g->isLeader());
-        auto f = host.propose(V, writeCmd(buildSeriesKey("temp", {{"host", "h1"}}, "value"), 1.0));
+        auto f = host.propose(V, writeCmd(key, 1.0));
         for (int i = 0; i < 20 && !f.available(); ++i)
             g->tick().get();
         EXPECT_TRUE(f.get());

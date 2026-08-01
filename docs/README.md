@@ -21,7 +21,8 @@
 ## Architecture
 
 - [Architecture Overview](architecture.md) - Storage engine, data flow, sharding, compression
-- [Cluster Architecture](clustering.md) - Multi-machine placement, replication, queries, HA, and online rebalancing
+- [Cluster Production Readiness](cluster-production-readiness.md) - Current deploy blockers and ordered fix-up checklist
+- [Cluster Architecture](clustering.md) - Target multi-machine placement, replication, queries, HA, and online rebalancing
 - [Cluster Starting Point](clustering-starting-point.md) - First implementation epic: safe startup and storage layout
 
 ## Operational

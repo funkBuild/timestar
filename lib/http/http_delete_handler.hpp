@@ -105,6 +105,7 @@ namespace timestar::http {
 class HttpDeleteHandler {
 private:
     seastar::sharded<Engine>* engineSharded;
+    bool partitionedCluster_ = false;
 
 public:
     struct DeleteRequest {
@@ -122,7 +123,8 @@ public:
     DeleteRequest parseDeleteRequest(const GlazeDeleteRequest& glazeReq);
     std::string createErrorResponse(const std::string& error);
 
-    explicit HttpDeleteHandler(seastar::sharded<Engine>* _engineSharded) : engineSharded(_engineSharded) {}
+    explicit HttpDeleteHandler(seastar::sharded<Engine>* _engineSharded, bool partitionedCluster = false)
+        : engineSharded(_engineSharded), partitionedCluster_(partitionedCluster) {}
 
     seastar::future<std::unique_ptr<seastar::http::reply>> handleDelete(std::unique_ptr<seastar::http::request> req);
 

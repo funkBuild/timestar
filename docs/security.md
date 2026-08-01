@@ -1,8 +1,23 @@
 # Security
 
-## Current State
+## Current state
 
-TimeStar does not include built-in authentication, authorization, or TLS. All HTTP endpoints are unauthenticated and communicate in plaintext. The server is designed to run behind a reverse proxy that handles these concerns.
+TimeStar supports an optional bearer token for HTTP APIs (`server.auth_enabled`
+and `server.auth_token`), but client-facing HTTP is still plaintext and has no
+fine-grained roles. `/cluster/status` is intentionally public for liveness
+diagnostics; cluster mutation routes such as leadership rebalance use the normal
+bearer-token wrapper.
+
+Replicated RF&gt;1 clusters require mutual TLS for both data-plane and Raft RPC by
+default. Configure `cluster.tls_cert_file`, `tls_key_file`, `tls_ca_file`, and
+`tls_peer_name`; listeners require a client certificate and outbound connections
+verify the CA and certificate SAN. Plaintext replicated transport is available
+only through `cluster.development_allow_insecure_transport` and must not be used
+in production. M1 best-effort full replication is still a demo mode and does not
+inherit these RF&gt;1 guarantees.
+
+The server is still designed to run behind a reverse proxy for client TLS,
+rate-limiting, network policy, and stronger authentication/authorization.
 
 ## Recommended Deployment
 
@@ -85,8 +100,11 @@ Additional validation:
 
 - **Bind to localhost or a private interface.** TimeStar listens on all interfaces by default. Use `--address 127.0.0.1` or a private VLAN address to restrict direct access.
 - **Firewall rules.** Block external access to port 8086 (or your configured port). Only the reverse proxy should reach TimeStar.
-- **Never expose TimeStar directly to the internet.** Without authentication and TLS, any client can read, write, and delete data.
-- **Separate data and management traffic.** If running in a multi-server cluster (Phase 6+), use a dedicated network for inter-node RPC traffic and restrict it with firewall rules.
+- **Never expose TimeStar directly to the internet.** Client-facing TLS still
+  belongs at the proxy, and disabling bearer authentication leaves data APIs
+  open to any network client.
+- **Separate data and management traffic.** Restrict the HTTP, data-plane, and
+  Raft ports independently even when cluster mTLS is enabled.
 
 ## Environment Variable Overrides
 

@@ -1,4 +1,9 @@
-# A 3-node TimeStar cluster (Milestone 1: full replication).
+# DEVELOPMENT/DEMO ONLY — NOT A PRODUCTION CLUSTER.
+#
+# A 3-node TimeStar cluster (Milestone 1: best-effort full replication).
+# It has no consensus and peer replication failures do not fail an accepted
+# mutation. Do not use this file as an RF=3 durability or failover example; the
+# production cluster release remains blocked by docs/cluster-production-readiness.md.
 #
 # Every node accepts writes and replicates them to its peers, so any node serves
 # any read. Bring it up with:

@@ -15,6 +15,24 @@ using namespace httpd;
 
 namespace timestar::http {
 
+namespace {
+
+std::unique_ptr<seastar::http::reply> partitionedRetentionUnsupported(const seastar::http::request& req) {
+    auto reply = std::make_unique<seastar::http::reply>();
+    const auto resFmt = timestar::http::responseFormat(req);
+    reply->set_status(seastar::http::reply::status_type::not_implemented);
+    constexpr std::string_view message =
+        "Retention policies are unavailable in partitioned cluster mode until they are replicated through group 0";
+    if (timestar::http::isProtobuf(resFmt))
+        reply->_content = timestar::proto::formatErrorResponse(std::string(message), "CLUSTER_RETENTION_UNSUPPORTED");
+    else
+        reply->_content = timestar::http::jsonError(std::string(message), "CLUSTER_RETENTION_UNSUPPORTED");
+    timestar::http::setContentType(*reply, resFmt);
+    return reply;
+}
+
+}  // namespace
+
 uint64_t HttpRetentionHandler::parseDuration(const std::string& duration) {
     // Reuse the existing parseInterval logic from HttpQueryHandler
     return HttpQueryHandler::parseInterval(duration);
@@ -33,6 +51,11 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpRetentionHandler::han
     auto reply = std::make_unique<seastar::http::reply>();
     auto reqFmt = timestar::http::requestFormat(*req);
     auto resFmt = timestar::http::responseFormat(*req);
+
+    // CR-FIX-002: policy storage and cutoff apply are node-local today. Fail
+    // before changing local state so replicas cannot expire different data.
+    if (partitionedCluster_)
+        co_return partitionedRetentionUnsupported(*req);
 
     if (!engineSharded) {
         reply->set_status(seastar::http::reply::status_type::internal_server_error);
@@ -243,6 +266,9 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpRetentionHandler::han
 
 seastar::future<std::unique_ptr<seastar::http::reply>> HttpRetentionHandler::handleGet(
     std::unique_ptr<seastar::http::request> req) {
+    if (partitionedCluster_)
+        co_return partitionedRetentionUnsupported(*req);
+
     auto reply = std::make_unique<seastar::http::reply>();
     auto resFmt = timestar::http::responseFormat(*req);
 
@@ -334,6 +360,9 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpRetentionHandler::han
 
 seastar::future<std::unique_ptr<seastar::http::reply>> HttpRetentionHandler::handleDelete(
     std::unique_ptr<seastar::http::request> req) {
+    if (partitionedCluster_)
+        co_return partitionedRetentionUnsupported(*req);
+
     auto reply = std::make_unique<seastar::http::reply>();
     auto resFmt = timestar::http::responseFormat(*req);
 

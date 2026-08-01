@@ -14,8 +14,10 @@ namespace timestar {
 
 // Fixed header at the start of every per-core journal segment file
 // (ADR 0001 sec 2). Recovery validates it before trusting a segment's records,
-// so a segment from a different cluster, format version, or (via boot id) a
-// different process incarnation is detected rather than silently replayed.
+// so a segment from a different cluster, core, format version, or filename
+// sequence is detected rather than silently replayed. bootId records process
+// provenance; JournalWriter deliberately accepts prior-boot segments because
+// they remain authoritative across a clean or crash restart.
 struct JournalSegmentHeader {
     static constexpr uint32_t kMagic = 0x4A524E4C;  // 'JRNL'
     static constexpr uint32_t kFormatVersion = 1;

@@ -17,6 +17,7 @@
 
 #include <cstdlib>
 #include <fstream>
+#include <optional>
 #include <seastar/core/thread.hh>
 #include <seastar/net/socket_defs.hh>
 #include <seastar/rpc/rpc.hh>
@@ -211,6 +212,7 @@ public:
     // Redirects this tap answers a queryNode with, whether or not it was asked to resolve
     // anything -- so a test can play a peer whose reply shape has drifted (debt D-25).
     std::vector<data::VShardRedirect> replyRedirects;
+    bool blockQueries = false;
 
     WireTapPeer(seastar::socket_address addr, uint32_t agreedVersion) {
         proto_.register_handler(9, [this, agreedVersion](seastar::sstring) {
@@ -226,6 +228,12 @@ public:
         });
         proto_.register_handler(4, [this](seastar::sstring data) {
             capturedQueries.emplace_back(data.data(), data.size());
+            if (blockQueries) {
+                if (blockedQuery_)
+                    throw std::runtime_error("only one blocked test query is supported");
+                blockedQuery_.emplace();
+                return blockedQuery_->get_future();
+            }
             data::NodeQueryPartial p;
             p.redirects = replyRedirects;
             const std::string bytes = data::encodeNodeQueryPartial(p);
@@ -237,12 +245,23 @@ public:
         server_ = std::make_unique<seastar::rpc::protocol<TapSerializer>::server>(proto_, seastar::listen(addr, lo));
     }
     void stop() {
+        releaseBlockedQuery();
         if (server_)
             server_->stop().get();
         server_.reset();
     }
 
+    void releaseBlockedQuery() {
+        if (!blockedQuery_)
+            return;
+        data::NodeQueryPartial p;
+        const std::string bytes = data::encodeNodeQueryPartial(p);
+        blockedQuery_->set_value(seastar::sstring(bytes.data(), bytes.size()));
+        blockedQuery_.reset();
+    }
+
 private:
+    std::optional<seastar::promise<seastar::sstring>> blockedQuery_;
     seastar::rpc::protocol<TapSerializer> proto_{TapSerializer{}};
     std::unique_ptr<seastar::rpc::protocol<TapSerializer>::server> server_;
 };
@@ -1207,6 +1226,38 @@ TEST_F(DataPlaneRpcEnrichedTest, RedirectsFromAPeerAskedToResolveNothingAreRefus
         EXPECT_EQ(part.redirects[0].vshard, 7);
         EXPECT_EQ(part.redirects[0].leader, 4u);
 
+        cli.stop().get();
+        tap.stop();
+    }).get();
+}
+
+TEST_F(DataPlaneRpcEnrichedTest, QueryNodeDeadlineBoundsABlackHoledPeer) {
+    seastar::async([] {
+        const uint16_t serverPort = 39377, clientPort = 39378;
+        const data::NodeId server = 2;
+        WireTapPeer tap(loopback(serverPort), data::kNodeQueryResolveMinVersion);
+        tap.blockQueries = true;
+        ThrowingNodeStore store;
+        data::DataPlaneRpc cli;
+        cli.start(loopback(clientPort), store).get();
+        cli.addPeer(server, loopback(serverPort));
+
+        data::NodeQueryRequest req;
+        req.request.measurement = "m";
+        req.vshards = {7};
+        const auto started = std::chrono::steady_clock::now();
+        bool timedOut = false;
+        try {
+            cli.queryNode(server, req, seastar::rpc::rpc_clock_type::now() + std::chrono::milliseconds(150)).get();
+        } catch (...) {
+            timedOut = true;
+        }
+        const auto elapsed = std::chrono::steady_clock::now() - started;
+        EXPECT_TRUE(timedOut) << "a peer that accepts the query and never answers must not hang the coordinator";
+        EXPECT_LT(elapsed, std::chrono::seconds(1));
+        ASSERT_EQ(tap.capturedQueries.size(), 1u) << "the deadline test must reach the peer, not fail to connect";
+
+        tap.releaseBlockedQuery();
         cli.stop().get();
         tap.stop();
     }).get();

@@ -19,7 +19,8 @@ namespace timestar::http {
 
 class HttpStreamHandler {
 public:
-    explicit HttpStreamHandler(seastar::sharded<Engine>* engine) : _engineSharded(engine) {}
+    explicit HttpStreamHandler(seastar::sharded<Engine>* engine, bool partitionedCluster = false)
+        : _engineSharded(engine), _partitionedCluster(partitionedCluster) {}
 
     void registerRoutes(seastar::httpd::routes& r, std::string_view authToken = "");
 
@@ -52,6 +53,7 @@ public:
 
 private:
     seastar::sharded<Engine>* _engineSharded;
+    bool _partitionedCluster = false;
     seastar::gate _connectionGate;
 };
 

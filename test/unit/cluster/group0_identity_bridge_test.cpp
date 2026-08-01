@@ -167,6 +167,16 @@ TEST(Group0IdentityBridge, RebindDifferentClusterIsRefused) {
     std::filesystem::remove_all(dir);
 }
 
+TEST(Group0IdentityBridge, StaticTopologyIsDurableAndCannotBeEditedInPlace) {
+    auto dir = freshDir("static_topology");
+    auto id = NodeIdentity::loadOrCreate(dir);
+    EXPECT_TRUE(bindStaticTopology(id, dir, "rf=3;peers=3:a:1;3:b:2;3:c:3;"));
+    EXPECT_FALSE(bindStaticTopology(id, dir, "rf=3;peers=3:a:1;3:b:2;3:c:3;"));
+    EXPECT_THROW(bindStaticTopology(id, dir, "rf=3;peers=3:a:1;3:b:2;3:d:4;"), std::runtime_error);
+    EXPECT_EQ(NodeIdentity::loadOrCreate(dir).static_topology, "rf=3;peers=3:a:1;3:b:2;3:c:3;");
+    std::filesystem::remove_all(dir);
+}
+
 TEST(Group0IdentityBridge, EmptyNodeUuidRejectedInRecord) {
     NodeIdentity blank;  // no node_uuid
     EXPECT_THROW(nodeRecordFrom(blank, 1, "mem:1", "rack-a"), std::invalid_argument);

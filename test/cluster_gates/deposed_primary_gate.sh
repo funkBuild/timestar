@@ -36,7 +36,7 @@ for i in 1 2 3 4 5; do rm -rf "/tmp/tsgate_dp$i"; mkdir -p "/tmp/tsgate_dp$i"; d
 PEERS="127.0.0.1:19310,127.0.0.1:19311,127.0.0.1:19312,127.0.0.1:19313,127.0.0.1:19314"
 for i in 1 2 3 4 5; do
     env $GATE_SERVER_ENV TIMESTAR_DATA_DIR="/tmp/tsgate_dp$i" TIMESTAR_CLUSTER_ENABLED=true TIMESTAR_CLUSTER_PARTITIONED=true \
-        TIMESTAR_CLUSTER_REPLICATION_FACTOR=3 TIMESTAR_CLUSTER_NODE_ID=$i TIMESTAR_CLUSTER_PEERS="$PEERS" \
+        TIMESTAR_CLUSTER_REPLICATION_FACTOR=3 TIMESTAR_CLUSTER_UUID=00112233445566778899aabbccddeeff TIMESTAR_CLUSTER_DEVELOPMENT_ALLOW_INSECURE_TRANSPORT=true TIMESTAR_CLUSTER_NODE_ID=$i TIMESTAR_CLUSTER_PEERS="$PEERS" \
         "$BIN" --port $((19309 + i)) --smp 2 >"/tmp/tsgate_dp$i/s.log" 2>&1 &
 done
 trap 'gate_cleanup 1931 /tmp/tsgate_dp1 /tmp/tsgate_dp2 /tmp/tsgate_dp3 /tmp/tsgate_dp4 /tmp/tsgate_dp5' EXIT

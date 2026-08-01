@@ -249,8 +249,44 @@ TEST(TimestarConfigValidateTest, ReplicationFactorThreeWithThreeNodesPasses) {
     cfg.cluster.node_id = 1;
     cfg.cluster.peers = {"a:1", "b:2", "c:3"};
     cfg.cluster.replication_factor = 3;
+    cfg.cluster.cluster_uuid = "00112233445566778899aabbccddeeff";
+    cfg.cluster.development_allow_insecure_transport = true;
     auto errs = errorsMatching(cfg.validate(), "replication_factor");
     EXPECT_TRUE(errs.empty());
+}
+
+TEST(TimestarConfigValidateTest, ReplicatedClusterRequiresPersistentHexIdentity) {
+    timestar::TimestarConfig cfg;
+    cfg.cluster.enabled = true;
+    cfg.cluster.partitioned = true;
+    cfg.cluster.node_id = 1;
+    cfg.cluster.peers = {"a:1", "b:2", "c:3"};
+    cfg.cluster.replication_factor = 3;
+    cfg.cluster.development_allow_insecure_transport = true;
+    EXPECT_FALSE(errorsMatching(cfg.validate(), "cluster.cluster_uuid").empty());
+    cfg.cluster.cluster_uuid = "not-a-128-bit-id";
+    EXPECT_FALSE(errorsMatching(cfg.validate(), "cluster.cluster_uuid").empty());
+    cfg.cluster.cluster_uuid = "00112233445566778899aabbccddeeff";
+    EXPECT_TRUE(errorsMatching(cfg.validate(), "cluster.cluster_uuid").empty());
+}
+
+TEST(TimestarConfigValidateTest, ReplicatedClusterRequiresCompleteTlsUnlessDevelopmentOverrideIsExplicit) {
+    timestar::TimestarConfig cfg;
+    cfg.cluster.enabled = true;
+    cfg.cluster.partitioned = true;
+    cfg.cluster.node_id = 1;
+    cfg.cluster.peers = {"a:1", "b:2", "c:3"};
+    cfg.cluster.replication_factor = 3;
+    cfg.cluster.cluster_uuid = "00112233445566778899aabbccddeeff";
+    EXPECT_FALSE(errorsMatching(cfg.validate(), "requires mTLS").empty());
+
+    cfg.cluster.tls_cert_file = "node.crt";
+    EXPECT_FALSE(errorsMatching(cfg.validate(), "cluster TLS requires").empty());
+    cfg.cluster.tls_key_file = "node.key";
+    cfg.cluster.tls_ca_file = "ca.crt";
+    cfg.cluster.tls_peer_name = "timestar-node";
+    EXPECT_TRUE(errorsMatching(cfg.validate(), "cluster TLS").empty());
+    EXPECT_TRUE(errorsMatching(cfg.validate(), "requires mTLS").empty());
 }
 
 // ===========================================================================

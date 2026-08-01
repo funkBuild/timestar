@@ -167,6 +167,34 @@ TEST(WriteAdmissionTest, TheOriginatedAndIngressBudgetsAreIndependent) {
     EXPECT_EQ(ingress.inFlight(), 0u);
 }
 
+TEST(WriteAdmissionTest, ReplicatedAdmissionIsBeforeProposalAndApplyBypassesIt) {
+#ifdef PROJECT_SOURCE_DIR
+    const std::string root = PROJECT_SOURCE_DIR;
+#else
+    const std::string root = "..";
+#endif
+    auto read = [](const std::string& path) {
+        std::ifstream in(path);
+        return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    };
+    const auto host = read(root + "/lib/cluster/integration/replicated_vshard_host.cpp");
+    const auto sm = read(root + "/lib/cluster/integration/engine_data_state_machine.cpp");
+    const auto store = read(root + "/lib/cluster/integration/engine_local_store.cpp");
+    ASSERT_FALSE(host.empty());
+    ASSERT_FALSE(sm.empty());
+    ASSERT_FALSE(store.empty());
+
+    const auto admission = host.find("co_await store_.checkWriteAdmission(view)");
+    const auto proposal = host.find("grp->proposeAndAwaitApplied", admission);
+    ASSERT_NE(admission, std::string::npos);
+    ASSERT_NE(proposal, std::string::npos);
+    EXPECT_LT(admission, proposal) << "storage backlog must reject before any Raft append";
+    EXPECT_NE(sm.find("applyCommittedWrites"), std::string::npos)
+        << "a committed/replayed entry must not re-enter front-door admission";
+    EXPECT_NE(store.find("insertBatch<double>(std::move(v), enforceAdmission)"), std::string::npos)
+        << "the committed-apply bypass must reach the Engine call, not stop at the adapter";
+}
+
 // The size estimate the bound is charged in tracks the payload, not the object count.
 TEST(WriteAdmissionTest, ResidentEstimateTracksThePayload) {
     const size_t small = data::approxResidentBytes(floatBatch(1, 10));

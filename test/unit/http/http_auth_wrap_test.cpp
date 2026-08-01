@@ -161,3 +161,18 @@ TEST_F(HttpAuthWrapTest, AllHandlersUseWrapWithAuthOrAuthHandlerWrapper) {
             << file << " must use wrapWithAuth, AuthHandlerWrapper, or addJsonRoute for auth support";
     }
 }
+
+TEST_F(HttpAuthWrapTest, ClusterLeadershipRebalanceRouteRequiresAuth) {
+#ifdef HTTP_SERVER_SOURCE_PATH
+    std::string src = readFile(HTTP_SERVER_SOURCE_PATH);
+#else
+    std::string src = readFile("../bin/timestar_http_server.cpp");
+#endif
+    ASSERT_FALSE(src.empty()) << "Could not read server source";
+    const auto route = src.find("\"/cluster/rebalance-leadership\"");
+    ASSERT_NE(route, std::string::npos);
+    const auto begin = route > 160 ? route - 160 : 0;
+    const auto registration = src.substr(begin, 320);
+    EXPECT_NE(registration.find("addJsonRoute"), std::string::npos);
+    EXPECT_NE(registration.find("authToken()"), std::string::npos);
+}

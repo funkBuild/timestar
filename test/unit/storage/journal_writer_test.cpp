@@ -228,6 +228,92 @@ TEST(JournalWriterTest, UnheadedFinalSegmentIsDiscarded) {
     testUnheadedFinalSegmentIsDiscarded().get();
 }
 
+TEST(JournalWriterTest, NonEmptyCorruptFinalSegmentFencesAndIsPreserved) {
+    const auto dir = tmpDir("corrupt_final");
+    fs::create_directories(dir);
+    const auto path = dir / JournalWriter::segmentFilename(0);
+    const std::string suspicious = "not-a-valid-journal-header-but-not-empty";
+    std::ofstream(path, std::ios::binary).write(suspicious.data(), suspicious.size());
+
+    JournalWriter w(dir, header(), 1u << 20);
+    EXPECT_THROW(w.open().get(), std::runtime_error);
+    EXPECT_TRUE(w.fenced());
+    EXPECT_TRUE(fs::exists(path));
+    EXPECT_EQ(fs::file_size(path), suspicious.size());
+    fs::remove_all(dir);
+}
+
+TEST(JournalWriterTest, ForeignClusterAndCoreSegmentsFenceRecovery) {
+    auto expectForeignHeaderToFence = [](std::string_view tag, JournalSegmentHeader diskHeader) {
+        const auto dir = tmpDir(std::string(tag));
+        fs::create_directories(dir);
+        diskHeader.segmentNumber = 0;
+        auto bytes = diskHeader.encode();
+        rec(0, 1, "must-not-replay").encodeInto(bytes);
+        const auto path = dir / JournalWriter::segmentFilename(0);
+        std::ofstream(path, std::ios::binary).write(bytes.data(), bytes.size());
+
+        JournalWriter w(dir, header(), 1u << 20);
+        EXPECT_THROW(w.open().get(), std::runtime_error);
+        EXPECT_TRUE(w.fenced());
+        EXPECT_TRUE(fs::exists(path));
+        fs::remove_all(dir);
+    };
+
+    auto foreignCluster = header();
+    foreignCluster.clusterUuid.fill(0x99);
+    expectForeignHeaderToFence("foreign_cluster", foreignCluster);
+
+    auto foreignCore = header();
+    foreignCore.coreNumber += 1;
+    expectForeignHeaderToFence("foreign_core", foreignCore);
+}
+
+TEST(JournalWriterTest, EmbeddedSegmentNumberMustMatchFilename) {
+    const auto dir = tmpDir("renamed");
+    fs::create_directories(dir);
+    auto diskHeader = header();
+    diskHeader.segmentNumber = 7;
+    auto bytes = diskHeader.encode();
+    rec(0, 1, "must-not-replay").encodeInto(bytes);
+    const auto path = dir / JournalWriter::segmentFilename(0);
+    std::ofstream(path, std::ios::binary).write(bytes.data(), bytes.size());
+
+    JournalWriter w(dir, header(), 1u << 20);
+    EXPECT_THROW(w.open().get(), std::runtime_error);
+    EXPECT_TRUE(w.fenced());
+    EXPECT_TRUE(fs::exists(path));
+    fs::remove_all(dir);
+}
+
+seastar::future<> testPriorBootSegmentsRemainRecoverable() {
+    const auto dir = tmpDir("prior_boot");
+    auto priorBoot = header();
+    priorBoot.bootId.fill(0x33);
+    {
+        JournalWriter w(dir, priorBoot, 1u << 20);
+        co_await w.open();
+        co_await w.append(rec(0, 1, "prior-boot-durable"));
+        co_await w.barrier();
+        co_await w.close();
+    }
+    {
+        auto currentBoot = header();
+        currentBoot.bootId.fill(0x44);
+        JournalWriter w(dir, currentBoot, 1u << 20);
+        auto recovered = co_await w.open();
+        EXPECT_EQ(recovered.size(), 1u);
+        if (!recovered.empty())
+            EXPECT_EQ(recovered.front().payload, "prior-boot-durable");
+        EXPECT_FALSE(w.fenced());
+        co_await w.close();
+    }
+    fs::remove_all(dir);
+}
+TEST(JournalWriterTest, PriorBootSegmentsRemainRecoverable) {
+    testPriorBootSegmentsRemainRecoverable().get();
+}
+
 // Regression for the O_DIRECT group-commit crash: appending AFTER a barrier --
 // the normal group-commit loop -- must work. The old output_stream-based writer
 // SIGILLed here because flushing a sub-alignment amount and then continuing to

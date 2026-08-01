@@ -27,25 +27,10 @@ namespace timestar::cluster {
 //     skipping would diverge this replica from the others. RaftGroup::drainReady
 //     propagates the throw BEFORE advancing the applied index, so the entry is not
 //     marked applied -- the replica halts/retries rather than skipping.
-//   - Backpressure: apply() CAN AND DOES throw IngestBacklogException, because it routes
-//     through Engine::insertBatch, which calls rejectIfIngestBacklogged unconditionally.
-//     Measured at 20,851 refusals across one RF=3 restart replay (debt D-36) -- so read
-//     this as "fires routinely under replay", not as a theoretical edge.
-//
-//     CORRECTING WHAT THIS NOTE USED TO SAY: it claimed admission "is meant to happen at
-//     PROPOSE time (the leader rejects if ingest-backlogged)" and called an apply-path
-//     bypass a mere follow-on. Propose-time admission DOES NOT EXIST --
-//     rejectIfIngestBacklogged has exactly two callers, both Engine::insert*, so in
-//     cluster mode APPLY IS THE INGEST PATH and a bare bypass would remove the clustered
-//     write path's only conversion/compaction-backlog backpressure. Both halves have to
-//     land together; filed as debt D-42.
-//
-//     The throw does NOT diverge (RaftGroup retries the whole Ready, and re-apply is
-//     idempotent). What it used to do was worse than stall one replica: it propagated out
-//     of RaftGroupRegistry::tickAll and aborted the WHOLE tick pass, starving every
-//     higher-numbered group on the reactor (D-36). Tick failures are now isolated per
-//     group and counted, and a cluster read fences on the node's own apply lag rather
-//     than answering out of state that is behind its committed log.
+//   - Backpressure is checked by ReplicatedVShardHost BEFORE proposal. Once an entry is
+//     committed it is unconditional work: applyCommittedWrites bypasses the Engine's
+//     front-door admission check, so restart replay cannot reject the same durable Ready
+//     forever. Ordinary non-Raft EngineLocalStore::applyWrites remains admitted.
 //   - appliedIndex(): the SM's watermark tracks the last DATA entry apply() ran on.
 //     The RaftGroup only invokes apply() for Normal non-empty entries, so a trailing
 //     config-change or empty term-start no-op is NOT counted here; the authoritative

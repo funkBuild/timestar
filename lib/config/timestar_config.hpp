@@ -215,6 +215,22 @@ struct ClusterConfig {
     // after durable quorum commit. Must be ODD (Raft majority) and <= the node count.
     // Requires `partitioned`. Off by default so M2 clusters are unchanged.
     uint16_t replication_factor = 1;
+    // Stable 128-bit cluster identity, encoded as exactly 32 hexadecimal
+    // characters. Required for replicated clusters until group-0 bootstrap owns
+    // identity minting. It is persisted in node.json and stamped into every Raft
+    // journal segment so a data directory cannot be cross-wired into another
+    // cluster.
+    std::string cluster_uuid;
+    // Mutual-TLS material shared by the data-plane and Raft transports. All four
+    // values are required together for RF>1. The peer name is matched against the
+    // certificate SAN on every outbound connection.
+    std::string tls_cert_file;
+    std::string tls_key_file;
+    std::string tls_ca_file;
+    std::string tls_peer_name;
+    // Development escape hatch for local fault tests only. Production deployments
+    // must leave this false; without it an RF>1 server refuses plaintext startup.
+    bool development_allow_insecure_transport = false;
 };
 
 // Seastar settings parsed from [seastar] TOML section.
@@ -354,8 +370,11 @@ struct glz::meta<timestar::StreamingConfig> {
 template <>
 struct glz::meta<timestar::ClusterConfig> {
     using T = timestar::ClusterConfig;
-    static constexpr auto value = object("enabled", &T::enabled, "node_id", &T::node_id, "peers", &T::peers,
-                                         "partitioned", &T::partitioned, "replication_factor", &T::replication_factor);
+    static constexpr auto value =
+        object("enabled", &T::enabled, "node_id", &T::node_id, "peers", &T::peers, "partitioned", &T::partitioned,
+               "replication_factor", &T::replication_factor, "cluster_uuid", &T::cluster_uuid, "tls_cert_file",
+               &T::tls_cert_file, "tls_key_file", &T::tls_key_file, "tls_ca_file", &T::tls_ca_file, "tls_peer_name",
+               &T::tls_peer_name, "development_allow_insecure_transport", &T::development_allow_insecure_transport);
 };
 
 template <>

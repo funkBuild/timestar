@@ -1,20 +1,33 @@
 # Clustering Integration Plan: Wiring the Bricks into the Production Server
 
-**Status:** Proposed (next phase after integration Milestone 1)
+**Status:** In progress — production deployment blocked
+
+**Current release authority:**
+[Cluster production-readiness review and fix-up plan](cluster-production-readiness.md).
+That review was performed against `cluster-design` at `f78e05d` on 2026-08-01
+and supersedes this document's historical completion/ground-truth statements.
+This file remains the milestone roadmap and target wiring sequence; it is not a
+claim that the milestones described below are complete in the running server.
 
 **Scope:** The milestone sequence that turns the gate-proven `lib/cluster/`
 bricks (Phases 0-8) into the running `timestar_http_server`, from the M1
 full-replication gateway to a Raft-replicated, online-rebalancing,
 feature-complete cluster. Parent design: [clustering.md](clustering.md).
-Authoritative deferred backlog: [clustering-deferred-tasks.md](clustering-deferred-tasks.md)
-— every open item there is mapped to a milestone in the coverage table at the
-end of this document.
+Historical deferred backlog:
+[clustering-deferred-tasks.md](clustering-deferred-tasks.md). Current correctness
+and production-release work is tracked in the production-readiness review.
 
 This is a plan, not a design revision: no decision in `docs/clustering.md` is
 reopened here. Where a milestone must re-open a previously proven gate, that is
 stated explicitly.
 
-## Ground truth (do not re-derive)
+## Historical starting point
+
+The statements in this section describe the starting point when this roadmap
+was written. Several foundation, M2, and RF>1 data-path pieces have since landed,
+while group-0 composition, complete snapshot state, topology movement, true
+ReadIndex leader reads, and several cluster-aware HTTP features remain open.
+Use the production-readiness review for current status.
 
 - All clustering phases 0-8 exist as reviewed library bricks with injected
   abstractions and green gates: multi-Raft engine + journals

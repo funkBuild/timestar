@@ -93,6 +93,39 @@ TimeStarInsert<T> makeInsert(const data::WriteSeries& s, const SeriesId128& id, 
 }  // namespace
 
 seastar::future<> EngineLocalStore::applyWrites(data::WriteBatch batch) {
+    return applyWritesImpl(std::move(batch), true);
+}
+
+seastar::future<> EngineLocalStore::applyCommittedWrites(data::WriteBatch batch) {
+    return applyWritesImpl(std::move(batch), false);
+}
+
+seastar::future<> EngineLocalStore::checkWriteAdmission(const data::WriteBatch& batch) {
+    std::set<unsigned> cores;
+    for (const auto& s : batch.series)
+        cores.insert(coreFor(SeriesId128::fromSeriesKey(s.seriesKey)));
+    try {
+        for (unsigned core : cores)
+            co_await engines_.invoke_on(core, [](Engine& e) { e.checkIngestAdmission(); });
+    } catch (const timestar::IngestBacklogException& e) {
+        throw data::WriteOverloadedError(e.what());
+    }
+}
+
+seastar::future<> EngineLocalStore::checkWriteAdmission(data::VShardBatchView view) {
+    std::set<unsigned> cores;
+    for (const auto* group : view)
+        for (const auto& s : group->second.series)
+            cores.insert(coreFor(SeriesId128::fromSeriesKey(s.seriesKey)));
+    try {
+        for (unsigned core : cores)
+            co_await engines_.invoke_on(core, [](Engine& e) { e.checkIngestAdmission(); });
+    } catch (const timestar::IngestBacklogException& e) {
+        throw data::WriteOverloadedError(e.what());
+    }
+}
+
+seastar::future<> EngineLocalStore::applyWritesImpl(data::WriteBatch batch, bool enforceAdmission) {
     std::map<unsigned, std::vector<TimeStarInsert<double>>> doubles;
     std::map<unsigned, std::vector<TimeStarInsert<int64_t>>> ints;
     std::map<unsigned, std::vector<TimeStarInsert<bool>>> bools;
@@ -170,20 +203,20 @@ seastar::future<> EngineLocalStore::applyWrites(data::WriteBatch batch) {
     // await all. Data first, then the schema sync (mirrors the write handler).
     std::vector<seastar::future<>> pending;
     for (auto& [core, v] : doubles)
-        pending.push_back(engines_.invoke_on(core, [v = std::move(v)](Engine& e) mutable {
-            return e.insertBatch<double>(std::move(v)).discard_result();
+        pending.push_back(engines_.invoke_on(core, [v = std::move(v), enforceAdmission](Engine& e) mutable {
+            return e.insertBatch<double>(std::move(v), enforceAdmission).discard_result();
         }));
     for (auto& [core, v] : ints)
-        pending.push_back(engines_.invoke_on(core, [v = std::move(v)](Engine& e) mutable {
-            return e.insertBatch<int64_t>(std::move(v)).discard_result();
+        pending.push_back(engines_.invoke_on(core, [v = std::move(v), enforceAdmission](Engine& e) mutable {
+            return e.insertBatch<int64_t>(std::move(v), enforceAdmission).discard_result();
         }));
     for (auto& [core, v] : bools)
-        pending.push_back(engines_.invoke_on(core, [v = std::move(v)](Engine& e) mutable {
-            return e.insertBatch<bool>(std::move(v)).discard_result();
+        pending.push_back(engines_.invoke_on(core, [v = std::move(v), enforceAdmission](Engine& e) mutable {
+            return e.insertBatch<bool>(std::move(v), enforceAdmission).discard_result();
         }));
     for (auto& [core, v] : strings)
-        pending.push_back(engines_.invoke_on(core, [v = std::move(v)](Engine& e) mutable {
-            return e.insertBatch<std::string>(std::move(v)).discard_result();
+        pending.push_back(engines_.invoke_on(core, [v = std::move(v), enforceAdmission](Engine& e) mutable {
+            return e.insertBatch<std::string>(std::move(v), enforceAdmission).discard_result();
         }));
 
     std::exception_ptr firstErr;
@@ -216,7 +249,27 @@ seastar::future<data::NodeQueryPartial> EngineLocalStore::queryLocal(data::NodeQ
     // with peers' partials and finalizes ONCE, so cross-node group-by / spread are
     // correct. A local early-exit (incomplete/timeout/limit) becomes an
     // incompleteReason, fail-closed -- never a silent empty success.
-    // FENCE ON THIS NODE'S OWN APPLY LAG FIRST (debt D-36). The Engine answers from
+    // Confirm CURRENT-TERM LEADERSHIP WITH A QUORUM before touching storage. Merely
+    // observing `isLeader()` is not sufficient: a partitioned former leader keeps that
+    // local role until CheckQuorum expires while the majority may already have elected
+    // another leader and committed newer data. readBarrier() also waits until this
+    // leader has applied through the confirmed index.
+    if (leaderReadFence_) {
+        if (req.vshards.empty()) {
+            data::NodeQueryPartial unfenced;
+            unfenced.incompleteReasons.push_back(
+                "replicated leader read has no VShard filter; quorum freshness cannot be established");
+            co_return unfenced;
+        }
+        if (!co_await leaderReadFence_(req.vshards)) {
+            data::NodeQueryPartial unfenced;
+            unfenced.incompleteReasons.push_back(
+                "one or more VShards could not confirm current leadership with a quorum");
+            co_return unfenced;
+        }
+    }
+
+    // FENCE ON THIS NODE'S OWN APPLY LAG NEXT (debt D-36). The Engine answers from
     // APPLIED state; a replicated node's committed log can be ahead of it, and every
     // entry in that gap is an acknowledged write this query would silently omit. Failing
     // closed here is the same rule the single-node path already applies to an unreadable

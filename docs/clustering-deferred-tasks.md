@@ -1,6 +1,13 @@
 # Clustering: deferred tasks
 
-## Integration status (wiring the bricks into the running server)
+> **Historical backlog notice (2026-08-01):** This file records work deferred
+> from the original isolated clustering phases. It is not the current
+> production-release backlog, and its older integration-status section is not a
+> statement that the running server is production-ready. Confirmed correctness,
+> security, recovery, and operability blockers are tracked in the
+> [cluster production-readiness review and fix-up plan](cluster-production-readiness.md).
+
+## Historical integration status (wiring the bricks into the running server)
 
 The Phase 4-8 bricks are gate-proven in isolation. Wiring them into the live
 `timestar_http_server`:
@@ -28,14 +35,14 @@ The Phase 4-8 bricks are gate-proven in isolation. Wiring them into the live
 ---
 
 
-Tasks that were consciously **deferred** out of the completed clustering phases,
-recorded here so the decisions aren't lost. This is the authoritative backlog for
-"things we chose not to do yet in a phase we called done."
+Tasks that were consciously **deferred** out of the completed clustering phases
+are recorded here so the decisions are not lost. This is the historical backlog
+for "things we chose not to do yet in a phase we called done." The current
+release task list is maintained in the production-readiness review.
 
-**Important:** none of the items below is a **correctness gap**. Each completed
-phase met its gate; these are optimizations, literal-gate-text test infrastructure,
-or non-correctness refinements. New correctness findings do **not** belong here —
-fix those in place.
+**Important:** the items below were classified as non-correctness deferrals when
+their phases closed. That classification does not apply to the newer findings in
+the production-readiness review.
 
 Phase mapping: Stage 1 = Phase 0 (storage layout), Stage 2 = Phase 1 (VShard
 storage / VShard-workers), Stage 3 = Phase 2 (multi-Raft), Stage 4 = Phase 3

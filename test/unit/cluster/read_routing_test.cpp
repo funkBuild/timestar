@@ -287,6 +287,47 @@ TEST(ReadRoundBookkeeping, AnUnreachableTargetsHintsAreForgottenSoTheNextRoundRe
     EXPECT_TRUE(second.unassigned.empty());
 }
 
+TEST(ReadRouting, ExcludedPrimaryFallsBackToAnotherPlacementReplica) {
+    ControlMap map;
+    map.epoch = 1;
+    map.placement[7] = {3, 4, 5};
+    VShardDirectory dir(kSelf, map);
+
+    ReadRouting plan = planReadRouting({7}, /*hostedLeaders=*/{}, /*hints=*/{}, dir, kSelf,
+                                       {{7, std::set<NodeId>{3}}});
+    ASSERT_EQ(plan.byNode.size(), 1u);
+    EXPECT_EQ(plan.byNode.begin()->first, 4u);
+    EXPECT_EQ(plan.resolveAt.at(4), (std::vector<uint16_t>{7}));
+    EXPECT_EQ(plan.leaderless, 0u);
+    EXPECT_TRUE(plan.unassigned.empty());
+}
+
+TEST(ReadRouting, KnownUnreachableLeaderIsResolvedThroughAnotherHolder) {
+    ControlMap map;
+    map.epoch = 1;
+    map.placement[7] = {2, 3, 4};  // this coordinator hosts the VShard
+    VShardDirectory dir(kSelf, map);
+
+    ReadRouting plan = planReadRouting({7}, /*hostedLeaders=*/{{7, 3}}, /*hints=*/{}, dir, kSelf,
+                                       {{7, std::set<NodeId>{3}}});
+    ASSERT_EQ(plan.byNode.size(), 1u);
+    EXPECT_EQ(plan.byNode.begin()->first, 4u) << "self must not bypass the leader-read fence";
+    EXPECT_EQ(plan.resolveAt.at(4), (std::vector<uint16_t>{7}));
+}
+
+TEST(ReadRouting, ExhaustedAssignedReplicasAreNotMisreportedAsUnassigned) {
+    ControlMap map;
+    map.epoch = 1;
+    map.placement[7] = {3, 4, 5};
+    VShardDirectory dir(kSelf, map);
+
+    ReadRouting plan = planReadRouting({7}, /*hostedLeaders=*/{}, /*hints=*/{}, dir, kSelf,
+                                       {{7, std::set<NodeId>{3, 4, 5}}});
+    EXPECT_TRUE(plan.byNode.empty());
+    EXPECT_EQ(plan.leaderless, 1u);
+    EXPECT_TRUE(plan.unassigned.empty());
+}
+
 // Only hints that pointed AT the unreachable node are forgotten: an unrelated VShard's hint
 // is still good, and throwing it away would cost a redirect round for no reason.
 TEST(ReadRoundBookkeeping, UnreachabilityDoesNotForgetOtherNodesHints) {

@@ -36,4 +36,17 @@ bool bindClusterUuid(NodeIdentity& identity, const std::filesystem::path& dataDi
     return true;
 }
 
+bool bindStaticTopology(NodeIdentity& identity, const std::filesystem::path& dataDir, const std::string& topology) {
+    if (topology.empty())
+        throw std::invalid_argument("bindStaticTopology: refusing to bind an empty topology");
+    if (identity.static_topology == topology)
+        return false;
+    if (!identity.static_topology.empty())
+        throw std::runtime_error("configured cluster topology differs from the topology bound to this data directory; "
+                                 "static peer-list edits are unsafe without group-0 movement");
+    identity.static_topology = topology;
+    identity.persist(dataDir);
+    return true;
+}
+
 }  // namespace timestar::cluster

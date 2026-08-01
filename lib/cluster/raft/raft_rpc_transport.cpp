@@ -15,6 +15,7 @@
 #include <seastar/core/loop.hh>
 #include <seastar/core/lowres_clock.hh>
 #include <seastar/core/sstring.hh>
+#include <seastar/net/tls.hh>
 #include <seastar/rpc/rpc.hh>
 #include <seastar/util/later.hh>
 #include <utility>
@@ -168,6 +169,10 @@ struct RaftRpcTransport::Impl {
     DeliverFn onDeliver;
     seastar::gate gate;
     bool stopping = false;
+    seastar::shared_ptr<seastar::tls::server_credentials> serverCreds;
+    seastar::shared_ptr<seastar::tls::certificate_credentials> clientCreds;
+    std::string tlsPeerName;
+    bool tlsEnabled = false;
 
     // The deliver stub is created ONCE. Allocating one per send (as this used to)
     // burns an allocation on every Raft message -- and a node ticking thousands of
@@ -412,7 +417,15 @@ struct RaftRpcTransport::Impl {
         auto pit = peers.find(to);
         if (pit == peers.end())
             return nullptr;
-        auto c = std::make_unique<Client>(proto, peerClientOptions(), pit->second);
+        std::unique_ptr<Client> c;
+        const auto opts = peerClientOptions();
+        if (tlsEnabled) {
+            seastar::tls::tls_options tlsOpts;
+            tlsOpts.server_name = seastar::sstring(tlsPeerName);
+            c = std::make_unique<Client>(proto, opts, seastar::tls::socket(clientCreds, tlsOpts), pit->second);
+        } else {
+            c = std::make_unique<Client>(proto, opts, pit->second);
+        }
         auto* p = c.get();
         clients[to] = std::move(c);
         // A NEW connection knows nothing until it answers: reset to "unknown" (which is
@@ -431,6 +444,21 @@ RaftRpcTransport::~RaftRpcTransport() = default;
 
 void RaftRpcTransport::addPeer(NodeId id, seastar::socket_address addr) {
     impl_->peers[id] = addr;
+}
+
+void RaftRpcTransport::setTlsCredentials(std::string certPem, std::string keyPem, std::string caPem,
+                                         std::string expectedPeerName) {
+    if (impl_->server)
+        throw std::logic_error("RaftRpcTransport TLS must be configured before start");
+    seastar::tls::credentials_builder builder;
+    builder.set_x509_trust(seastar::tls::blob(caPem.data(), caPem.size()), seastar::tls::x509_crt_format::PEM);
+    builder.set_x509_key(seastar::tls::blob(certPem.data(), certPem.size()),
+                         seastar::tls::blob(keyPem.data(), keyPem.size()), seastar::tls::x509_crt_format::PEM);
+    builder.set_client_auth(seastar::tls::client_auth::REQUIRE);
+    impl_->serverCreds = builder.build_server_credentials();
+    impl_->clientCreds = builder.build_certificate_credentials();
+    impl_->tlsPeerName = std::move(expectedPeerName);
+    impl_->tlsEnabled = true;
 }
 
 seastar::future<> RaftRpcTransport::start(seastar::socket_address local, DeliverFn onDeliver, bool perShardListener) {
@@ -615,8 +643,10 @@ seastar::future<> RaftRpcTransport::start(seastar::socket_address local, Deliver
     // the Raft protocol itself, not reachable by an unsolicited frame.
     seastar::rpc::resource_limits lim;
     lim.max_memory = kMaxInboundRaftMemory;
-    impl_->server =
-        std::make_unique<seastar::rpc::protocol<RaftSerializer>::server>(impl_->proto, seastar::listen(local, lo), lim);
+    seastar::server_socket listener =
+        impl_->tlsEnabled ? seastar::tls::listen(impl_->serverCreds, local, lo) : seastar::listen(local, lo);
+    impl_->server = std::make_unique<seastar::rpc::protocol<RaftSerializer>::server>(impl_->proto,
+                                                                                    std::move(listener), lim);
     return seastar::make_ready_future<>();
 }
 
