@@ -5,6 +5,7 @@
 #include <cstring>
 #include <exception>
 #include <format>
+#include <limits>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/seastar.hh>
 #include <seastar/core/temporary_buffer.hh>
@@ -54,17 +55,39 @@ seastar::future<std::vector<JournalRecord>> JournalWriter::open() {
     if (opened_)
         throw std::logic_error("JournalWriter::open called twice");
 
-    // Enumerate existing segments (blocking fs calls off the reactor).
-    std::vector<uint64_t> segments = co_await seastar::async([this] {
-        std::vector<uint64_t> found;
-        fs::create_directories(dir_);
-        for (const auto& entry : fs::directory_iterator(dir_)) {
-            if (auto n = parseSegmentFilename(entry.path().filename().string()))
+    // Enumerate existing segments (blocking fs calls off the reactor). This
+    // directory is owned exclusively by the journal and has no metadata or
+    // temporary-file namespace. Silently ignoring an unrecognised entry is not
+    // safe: it may be an acknowledged segment whose filename was damaged or
+    // only partially renamed. Preserve every suspicious entry and fence.
+    std::vector<uint64_t> segments;
+    try {
+        segments = co_await seastar::async([this] {
+            std::vector<uint64_t> found;
+            fs::create_directories(dir_);
+            for (const auto& entry : fs::directory_iterator(dir_)) {
+                const auto path = entry.path();
+                if (!fs::is_regular_file(entry.symlink_status()))
+                    throw std::runtime_error("non-regular journal directory entry: " + path.string());
+                auto n = parseSegmentFilename(path.filename().string());
+                if (!n)
+                    throw std::runtime_error("unrecognised journal directory entry: " + path.string());
                 found.push_back(*n);
-        }
-        std::sort(found.begin(), found.end());
-        return found;
-    });
+            }
+            std::sort(found.begin(), found.end());
+            return found;
+        });
+    } catch (const std::exception& e) {
+        fence(std::string("journal directory discovery failed: ") + e.what());
+        throw std::runtime_error(fenceReason_);
+    }
+
+    // Segment numbers are durable identities, not a wrapping counter. Allowing
+    // max+1 to become zero would make startSegment() target an old generation.
+    if (!segments.empty() && segments.back() == std::numeric_limits<uint64_t>::max()) {
+        fence("journal segment number space exhausted in " + dir_.string());
+        throw std::runtime_error(fenceReason_);
+    }
 
     std::vector<JournalRecord> recovered;
     for (size_t i = 0; i < segments.size(); ++i) {
@@ -131,7 +154,13 @@ seastar::future<std::vector<JournalRecord>> JournalWriter::open() {
     // New appends go to a fresh segment (segment numbers are never reused, even
     // if the final old one was deleted above -- back() is the max seen).
     const uint64_t next = segments.empty() ? 0 : segments.back() + 1;
-    co_await startSegment(next);
+    try {
+        co_await startSegment(next);
+    } catch (const std::exception& e) {
+        if (!fenced_)
+            fence(std::string("journal segment creation failed: ") + e.what());
+        throw;
+    }
     opened_ = true;
     co_return recovered;
 }
@@ -174,17 +203,34 @@ seastar::future<> JournalWriter::writePaddedBlock(uint64_t offset, const char* s
 
 seastar::future<> JournalWriter::startSegment(uint64_t segmentNumber) {
     const auto path = dir_ / segmentFilename(segmentNumber);
+    // A fresh segment identity must never alias an existing directory entry.
+    // In particular, do not use truncate-on-open here: a collision may be the
+    // only durable copy of acknowledged records.
     seastar::file file = co_await seastar::open_file_dma(
-        path.string(), seastar::open_flags::rw | seastar::open_flags::create | seastar::open_flags::truncate);
+        path.string(), seastar::open_flags::rw | seastar::open_flags::create | seastar::open_flags::exclusive);
+
+    // fsync the parent directory so the new segment's directory entry is durable
+    // before any barrier promises its records are (fdatasync alone syncs file
+    // contents, not the directory that names the file). Close the descriptor on
+    // failure; recovery will recognise and remove the resulting empty final
+    // segment before advancing past its identity.
+    std::exception_ptr directorySyncError;
+    try {
+        co_await seastar::sync_directory(dir_.string());
+    } catch (...) {
+        directorySyncError = std::current_exception();
+    }
+    if (directorySyncError) {
+        try {
+            co_await file.close();
+        } catch (...) {}
+        std::rethrow_exception(directorySyncError);
+    }
 
     file_ = std::move(file);
     alignment_ = file_.disk_write_dma_alignment();
     currentSegment_ = segmentNumber;
     alignedLen_ = 0;
-    // fsync the parent directory so the new segment's directory entry is durable
-    // before any barrier promises its records are (fdatasync alone syncs file
-    // contents, not the directory that names the file).
-    co_await seastar::sync_directory(dir_.string());
 
     JournalSegmentHeader header = headerTemplate_;
     header.segmentNumber = segmentNumber;
@@ -212,6 +258,8 @@ seastar::future<> JournalWriter::append(const JournalRecord& record) {
     // below segmentBytes by the write-batch limit).
     if (logicalLen() + bytes > segmentBytes_ && logicalLen() > JournalSegmentHeader::kEncodedBytes) {
         try {
+            if (currentSegment_ == std::numeric_limits<uint64_t>::max())
+                throw std::runtime_error("journal segment number space exhausted during rotation");
             co_await sealCurrent();  // flush + truncate + close the full segment
             co_await startSegment(currentSegment_ + 1);
         } catch (const std::exception& e) {

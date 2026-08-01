@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
 #include <string>
@@ -57,6 +58,88 @@ TEST(JournalWriterTest, SegmentFilenameRoundTrips) {
     EXPECT_FALSE(JournalWriter::parseSegmentFilename("seg_00000000000000000042").has_value());  // no suffix
     EXPECT_FALSE(JournalWriter::parseSegmentFilename("MANIFEST").has_value());
     EXPECT_FALSE(JournalWriter::parseSegmentFilename("seg_x.jnl").has_value());
+}
+
+TEST(JournalWriterTest, MalformedSegmentFilenameFencesAndPreservesSource) {
+    const auto dir = tmpDir("malformed_name");
+    fs::create_directories(dir);
+    auto diskHeader = header();
+    diskHeader.segmentNumber = 0;
+    auto bytes = diskHeader.encode();
+    rec(0, 1, "acknowledged-source").encodeInto(bytes);
+    const auto path = dir / "seg_00000000000000000000junk.jnl";
+    std::ofstream(path, std::ios::binary).write(bytes.data(), bytes.size());
+
+    JournalWriter w(dir, header(), 1u << 20);
+    EXPECT_THROW(w.open().get(), std::runtime_error);
+    EXPECT_TRUE(w.fenced());
+    EXPECT_TRUE(fs::exists(path));
+    EXPECT_EQ(fs::file_size(path), bytes.size());
+    EXPECT_FALSE(fs::exists(dir / JournalWriter::segmentFilename(0)));
+    fs::remove_all(dir);
+}
+
+TEST(JournalWriterTest, NonRegularSegmentEntryFencesAndIsPreserved) {
+    const auto dir = tmpDir("nonregular");
+    fs::create_directories(dir / JournalWriter::segmentFilename(0));
+
+    JournalWriter w(dir, header(), 1u << 20);
+    EXPECT_THROW(w.open().get(), std::runtime_error);
+    EXPECT_TRUE(w.fenced());
+    EXPECT_TRUE(fs::is_directory(dir / JournalWriter::segmentFilename(0)));
+    fs::remove_all(dir);
+}
+
+TEST(JournalWriterTest, ExhaustedSegmentIdentityFencesWithoutWrappingOrMutation) {
+    const auto dir = tmpDir("identity_exhausted");
+    fs::create_directories(dir);
+    auto diskHeader = header();
+    diskHeader.segmentNumber = std::numeric_limits<uint64_t>::max();
+    auto bytes = diskHeader.encode();
+    rec(0, 1, "last-identity").encodeInto(bytes);
+    const auto path = dir / JournalWriter::segmentFilename(diskHeader.segmentNumber);
+    std::ofstream(path, std::ios::binary).write(bytes.data(), bytes.size());
+
+    JournalWriter w(dir, header(), 1u << 20);
+    EXPECT_THROW(w.open().get(), std::runtime_error);
+    EXPECT_TRUE(w.fenced());
+    EXPECT_TRUE(fs::exists(path));
+    EXPECT_EQ(fs::file_size(path), bytes.size());
+    EXPECT_FALSE(fs::exists(dir / JournalWriter::segmentFilename(0)));
+    fs::remove_all(dir);
+}
+
+seastar::future<> testRotationAtLastSegmentIdentityFencesBeforeWrap() {
+    const auto dir = tmpDir("rotation_exhausted");
+    fs::create_directories(dir);
+    auto diskHeader = header();
+    diskHeader.segmentNumber = std::numeric_limits<uint64_t>::max() - 1;
+    const auto bytes = diskHeader.encode();
+    const auto priorPath = dir / JournalWriter::segmentFilename(diskHeader.segmentNumber);
+    std::ofstream(priorPath, std::ios::binary).write(bytes.data(), bytes.size());
+
+    const auto first = rec(0, 1, "fills-last-identity");
+    JournalWriter w(dir, header(), JournalSegmentHeader::kEncodedBytes + first.encodedBytes() + 1);
+    auto recovered = co_await w.open();
+    EXPECT_TRUE(recovered.empty());
+    EXPECT_EQ(w.currentSegmentNumber(), std::numeric_limits<uint64_t>::max());
+    co_await w.append(first);
+
+    bool rejected = false;
+    try {
+        co_await w.append(rec(0, 2, "would-wrap"));
+    } catch (const std::runtime_error&) {
+        rejected = true;
+    }
+    EXPECT_TRUE(rejected);
+    EXPECT_TRUE(w.fenced());
+    EXPECT_TRUE(fs::exists(priorPath));
+    EXPECT_FALSE(fs::exists(dir / JournalWriter::segmentFilename(0)));
+    co_await w.close();
+    fs::remove_all(dir);
+}
+TEST(JournalWriterTest, RotationAtLastSegmentIdentityFencesBeforeWrap) {
+    testRotationAtLastSegmentIdentityFencesBeforeWrap().get();
 }
 
 // ---- I/O tests (run on the reactor via .get()) ----

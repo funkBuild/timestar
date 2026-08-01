@@ -20,9 +20,11 @@ namespace timestar {
 // at a target size and a record never straddles a segment boundary.
 //
 // Recovery (open()) reads existing segments in order, validates cluster/core/
-// segment identity, and cleanly drops a torn record tail on the last one. Only
-// a zero-byte final segment (crash before its buffered header was written) is
-// deleted; any non-empty invalid segment is preserved and fences recovery.
+// segment identity, and cleanly drops a torn record tail on the last one. The
+// journal directory is an exclusive segment namespace: any non-canonical or
+// non-regular entry fences recovery because it may be a damaged durable segment.
+// Only a zero-byte final segment (crash before its buffered header was written)
+// is deleted; any non-empty invalid segment is preserved and fences recovery.
 //
 // Any append/barrier I/O error FENCES the writer: it rejects all further appends
 // and reports unhealthy (the journal safety contract -- no catch-and-continue on
@@ -36,7 +38,8 @@ public:
     // Recover existing segments and open a fresh segment for append. Returns all
     // recovered records across segments, in append order. Throws on a corrupt
     // (bad/foreign/misnamed header, or torn-non-last) segment -- that is not a
-    // recoverable tail.
+    // recoverable tail. Also throws and fences if the directory contains an
+    // unrecognised entry or the uint64 segment identity space is exhausted.
     seastar::future<std::vector<JournalRecord>> open();
 
     // Append a record (buffered, not yet durable). Rotates first if the current
