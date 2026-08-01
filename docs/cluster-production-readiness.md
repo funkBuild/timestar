@@ -4,7 +4,8 @@
 
 **Reviewed baseline:** `cluster-design` at `f78e05d` (2026-08-01)
 
-**Remediation commits:** `95c10d2`, `a16b03a`, `d578e81`, `ddab705`
+**Remediation commits:** `95c10d2`, `a16b03a`, `d578e81`, `ddab705`,
+`8620b9e`, `20639dc`
 
 **Scope:** The recent VShard/Raft cluster redesign, its production-server
 integration, the public HTTP surface, recovery paths, and the release evidence
@@ -17,7 +18,7 @@ used as evidence that the current server is production-ready.
 
 ## Implementation progress after the review
 
-Four remediation commits are now recorded. Cluster release status remains
+Six remediation commits are now recorded. Cluster release status remains
 **BLOCKED** because group 0/movement, generation-atomic live snapshot
 replacement, pattern-delete expansion, replicated retention, the large-snapshot
 path, rolling wire-format compatibility, and final live release gates remain
@@ -88,8 +89,8 @@ identity/topology tests, and pre-proposal admission tests. The strict checkboxes
 below stay open where their stated multi-process or fault-injection “done when”
 evidence has not yet been run.
 
-Final local validation for these remediation commits is green: 4,336 unit tests
-passed and one source-inspection test was skipped out of 4,337, 45/45
+Final local validation for these remediation commits is green: 4,337/4,337 unit
+tests passed with no skips, 45/45
 socket-backed cluster tests passed, the first-pass 56/56 focused
 cluster/readiness/identity/admission regressions passed, and the second-pass
 24/24 snapshot/compaction regressions passed. The exact-delete pass additionally
@@ -624,10 +625,10 @@ is recorded in the commits named at the top of this document. These results
 validate the exercised unit and socket paths; they do not supersede the missing
 live gates or the remaining production-composition findings above.
 
-Post-remediation validation through `ddab705`:
+Post-remediation validation through `20639dc`:
 
 ```text
-timestar_unit_test:              4336 passed, 1 skipped / 4337 (443 suites, -c 2)
+timestar_unit_test:              4337/4337 passed (443 suites, -c 2; no skips)
 timestar_cluster_socket_test:      45/45 passed (8 suites, -c 2)
 first-pass focused regressions:     56/56 passed (15 suites, -c 2)
 snapshot/compaction regressions:    24/24 passed (9 suites, -c 2)
