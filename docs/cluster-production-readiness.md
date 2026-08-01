@@ -8,7 +8,7 @@
 `8620b9e`, `20639dc`, `ea2511b`, `3ac9899`, `69ac879`, `09a62c5`,
 `2e06cb8`, `7151f5d`, `5b22b81`, `fef4886`, `3d2d607`, `f0e28f0`,
 `da55952`, `a1beb94`, `bb5b871`, `e201343`, `6ad2c93`, `9a42d84`,
-`41fdc34`, `a58d2a9`
+`41fdc34`, `a58d2a9`, `6a73809`
 
 **Scope:** The recent VShard/Raft cluster redesign, its production-server
 integration, the public HTTP surface, recovery paths, and the release evidence
@@ -21,7 +21,7 @@ used as evidence that the current server is production-ready.
 
 ## Implementation progress after the review
 
-Twenty-four remediation commits are now recorded. Cluster release status remains
+Twenty-five remediation commits are now recorded. Cluster release status remains
 **BLOCKED** because group 0/movement, generation-atomic live snapshot
 replacement, pattern-delete expansion, replicated retention, the large-snapshot
 path, and rolling wire-format compatibility remain open. The four previously
@@ -168,6 +168,11 @@ Completed and covered in this pass:
   startup and is preserved instead of being silently omitted from replay.
   Segment identities cannot wrap at startup or rotation, and a fresh segment is
   created exclusively rather than truncating a colliding durable path.
+- TSM discovery now accepts only the exact current and documented legacy
+  immutable-file schemas, rejects non-regular entries instead of following
+  symlinks, and validates both physical and data ranks before opening or
+  registration. Sequence allocation stops at the shared 60-bit rank boundary,
+  and invalid additions cannot leave a half-registered immutable generation.
 
 Focused evidence on this pass includes the rebuilt server, unit and socket test
 targets, journal negative tests, alternate-replica routing tests, a black-holed
@@ -176,8 +181,8 @@ identity/topology tests, and pre-proposal admission tests. The strict checkboxes
 below stay open where their stated multi-process or fault-injection “done when”
 evidence has not yet been run.
 
-Final local validation for these remediation commits is green: all 4,374 unit
-tests completed successfully (4,365 passed and 9 pre-existing SMP-dependent
+Final local validation for these remediation commits is green: all 4,380 unit
+tests completed successfully (4,371 passed and 9 pre-existing SMP-dependent
 tests skipped), 45/45 socket-backed cluster tests passed, the
 first-pass 56/56 focused
 cluster/readiness/identity/admission regressions passed, and the second-pass
@@ -255,6 +260,7 @@ item are recorded in the fix-up list.
 | CR-31 | P0 | WAL recovery discarded fully framed corruption and continued startup | A CRC-invalid or malformed acknowledged command could be omitted from the recovered store while the node served the remaining dataset as complete. |
 | CR-32 | P0 | WAL filename identity was permissive and fresh creation truncated collisions | Malformed names could be skipped or aliased to another sequence, 32-bit allocation could wrap recovery order, and a colliding fresh create could erase the only durable acknowledged segment. |
 | CR-33 | P0 | Raft journal discovery ignored unrecognized entries and segment creation could truncate after identity wrap | A damaged or partially renamed acknowledged segment could be omitted from replay; exhaustion could wrap to segment zero and overwrite an older durable generation. |
+| CR-34 | P0 | TSM discovery accepted numeric-prefix aliases and rank allocation exceeded its 60-bit identity space | Malformed or symlinked immutable files could enter recovery under the wrong identity; an out-of-range data generation could register and fail later queries, while exhaustion could publish an unusable TSM and strand its source WAL. |
 
 ### CR-01 — deletes bypass consensus
 
@@ -532,6 +538,28 @@ empty-final recovery protocol intact. Regressions cover a valid acknowledged
 segment under a malformed name, a canonical-named non-regular entry, startup at
 `UINT64_MAX`, and rotation from the final available identity without creating or
 truncating segment zero.
+
+### CR-34 — TSM discovery and allocation did not enforce immutable identity
+
+[`TSM::TSM`](../lib/storage/tsm.cpp) parsed tier and sequence with
+prefix-consuming `std::stoull`, so names such as `0_7junk.tsm` and
+`0junk_7.tsm` aliased a valid generation. Startup canonicalised `.tsm` entries
+before opening them, which also followed a symlink out of the immutable-file
+directory. Separately, both rank functions reserve 60 bits for sequence, but
+[`TSMFileManager`](../lib/storage/tsm_file_manager.cpp) allocated until
+`UINT64_MAX` and registered a file before validating its data rank. A generation
+at or above `2^60` could therefore be published or partially registered and
+only fail when a later query requested its rank.
+
+Commit `6a73809` parses complete filename components and explicitly preserves
+the current standard/compaction layouts plus the three documented legacy
+rebalance layouts. Startup rejects non-regular `.tsm` entries without following
+them and scans deterministic path order. Physical and data ranks are validated
+before file open or manager mutation, tier is bounded to four bits, and all
+fresh/reserved sequence allocation stops at the last valid 60-bit identity.
+Regressions cover numeric-prefix aliases, symlinked files, an out-of-range data
+generation, allocation at the final identity, legacy filename compatibility,
+and rejection without partial manager registration.
 
 ### CR-02 and CR-03 — snapshot contents and live installation were unsafe
 
@@ -874,6 +902,10 @@ is not completion.
   as an exclusive namespace and fences on non-canonical or non-regular entries.
   Startup and rotation cannot wrap the 64-bit identity, and fresh segment
   creation cannot truncate an existing path.
+- [x] **CR-FIX-019J — enforce TSM immutable identity and rank bounds.** Owner:
+  storage. Parsing consumes the exact supported schema, startup refuses
+  non-regular immutable entries, both packed ranks validate before open or
+  registration, and sequence allocation cannot cross its 60-bit identity space.
 
 ### 2. Complete control-plane and identity wiring
 
@@ -1276,6 +1308,17 @@ focused journal-writer identity/recovery tests: 17/17 passed
 related writer/sink/GC/Raft persistence tests:  47/47 passed
 current full unit suite:                    4374/4374 successful
   passed/skipped:                           4365/9 (444 suites, -c 2)
+current socket-backed cluster suite:          45/45 passed (8 suites, -c 2)
+timestar_http_server:                         built successfully
+git diff --check:                             passed
+```
+
+TSM immutable identity/rank validation for `6a73809`:
+
+```text
+focused TSM rank/manager suites:              49/49 passed
+current full unit suite:                    4380/4380 successful
+  passed/skipped:                           4371/9 (444 suites, -c 2)
 current socket-backed cluster suite:          45/45 passed (8 suites, -c 2)
 timestar_http_server:                         built successfully
 git diff --check:                             passed

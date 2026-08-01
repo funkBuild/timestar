@@ -6,7 +6,7 @@ The plan is closed.** **The carried-debt burndown that followed it is also close
 materially improved rather than closed, 3 are closed as recorded decisions (D-9, D-29, D-30 — CheckQuorum ships off, and ADR 0005 mechanism (c) is
 deliberately deferred with its trigger written down), and 2 remain open with a named
 owner** — D-40 and D-10, in that priority order. Current suites: unit
-**4374/4374**, cluster socket **45/45**. The gates re-run during the burndown
+**4380/4380**, cluster socket **45/45**. The gates re-run during the burndown
 pass, including `fault_injection_gate.sh` with the shared journal on (D-10) — but **four
 gates have NOT been re-run on this tree** and FINAL STATE names them; do not read this
 paragraph as "the gates are green". Start at **"FINAL STATE"** in the carried-debt register
