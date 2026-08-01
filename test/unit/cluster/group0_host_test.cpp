@@ -125,6 +125,31 @@ seastar::future<> corruptSnapshotRefusesStartup() {
     fs::remove_all(root);
 }
 
+seastar::future<> freshObserverNeverCampaigns() {
+    const fs::path root = tempRoot("observer");
+    NullTransport transport;
+    Group0Host observer(transport, /*self=*/2, root, identity());
+    co_await observer.start(/*known seed voters=*/{1}, singleVoterOptions());
+    EXPECT_TRUE(observer.started());
+    EXPECT_TRUE(observer.freshJournal());
+    auto* group = observer.group();
+    if (!group)
+        throw std::runtime_error("observer group was not registered");
+    EXPECT_EQ(group->role(), Role::Follower);
+
+    // Even with the shortest election timeout, a node outside the voter set is
+    // not promotable and must never form its own control-plane term/cluster.
+    for (int i = 0; i < 10; ++i)
+        co_await group->tick();
+    EXPECT_EQ(group->role(), Role::Follower);
+    EXPECT_FALSE(group->isLeader());
+    EXPECT_EQ(group->currentTerm(), kNoTerm);
+    EXPECT_TRUE(observer.state().clusterUuid.empty());
+
+    co_await observer.stop();
+    fs::remove_all(root);
+}
+
 }  // namespace
 
 TEST(Group0HostTest, UsesReservedWireIdAndRecoversDedicatedJournal) {
@@ -133,4 +158,8 @@ TEST(Group0HostTest, UsesReservedWireIdAndRecoversDedicatedJournal) {
 
 TEST(Group0HostTest, CorruptSnapshotFailsStartup) {
     corruptSnapshotRefusesStartup().get();
+}
+
+TEST(Group0HostTest, FreshNonVoterIsAnInertObserver) {
+    freshObserverNeverCampaigns().get();
 }

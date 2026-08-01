@@ -5,8 +5,8 @@
 #include "../../utils/logger.hpp"
 #include "../raft/raft_node.hpp"
 
-#include <algorithm>
 #include <seastar/core/coroutine.hh>
+#include <set>
 #include <stdexcept>
 #include <utility>
 
@@ -41,8 +41,12 @@ seastar::future<> Group0Host::start(std::vector<raft::NodeId> voters, raft::Raft
         throw std::logic_error("Group0Host::start called more than once");
     if (voters.empty())
         throw std::invalid_argument("Group0Host: control voter set must not be empty");
-    if (self_ == raft::kNoNode || std::find(voters.begin(), voters.end(), self_) == voters.end())
-        throw std::invalid_argument("Group0Host: this node must be a non-zero control voter");
+    if (self_ == raft::kNoNode)
+        throw std::invalid_argument("Group0Host: this node must have a non-zero id");
+    std::set<raft::NodeId> uniqueVoters;
+    for (raft::NodeId voter : voters)
+        if (voter == raft::kNoNode || !uniqueVoters.insert(voter).second)
+            throw std::invalid_argument("Group0Host: control voters must be non-zero and unique");
 
     const fs::path dir = journalRoot_ / "group0";
     fs::create_directories(dir);
@@ -111,7 +115,10 @@ seastar::future<> Group0Host::start(std::vector<raft::NodeId> voters, raft::Raft
 void Group0Host::startTicking() {
     if (!started_)
         throw std::logic_error("Group0Host::startTicking before start");
+    if (ticking_)
+        throw std::logic_error("Group0Host::startTicking called more than once");
     registry_.startTicking();
+    ticking_ = true;
 }
 
 seastar::future<> Group0Host::deliver(raft::Envelope env) {
@@ -145,6 +152,7 @@ seastar::future<> Group0Host::stop() {
     if (writer_)
         co_await writer_->close();
     started_ = false;
+    ticking_ = false;
 }
 
 }  // namespace timestar::cluster

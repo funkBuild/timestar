@@ -40,9 +40,11 @@ public:
     Group0Host(const Group0Host&) = delete;
     Group0Host& operator=(const Group0Host&) = delete;
 
-    // Open/recover the dedicated journal and register the control group. This
-    // never initializes cluster state and never campaigns; bootstrap is an
-    // explicit operation at the composition layer.
+    // Open/recover the dedicated journal and register the control group. `self`
+    // need not be a voter: a fresh joining node starts as a non-campaigning
+    // observer that knows the seed voter set, then receives the membership entry
+    // that admits/promotes it. This never initializes cluster state and never
+    // campaigns; bootstrap is an explicit operation at the composition layer.
     seastar::future<> start(std::vector<raft::NodeId> voters, raft::RaftOptions opts = {});
     void startTicking();
     seastar::future<> stop();
@@ -72,6 +74,7 @@ private:
     raft::RaftGroupRegistry registry_;
     bool freshJournal_ = false;
     bool started_ = false;
+    bool ticking_ = false;
     bool stopped_ = false;
 };
 

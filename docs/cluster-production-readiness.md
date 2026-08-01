@@ -1260,7 +1260,10 @@ is not completion.
   removes the old leader), and a subsequent controller repairs a stale
   state-machine voter mirror. The focused Raft/controller membership evidence
   passes 13/13; the combined controller/identity/host/codec/state evidence passes
-  28/28. A bounded, checksummed `control_map.cache` store now accepts only a
+  29/29. A fresh joining host can now receive group-0 traffic as an inert
+  non-voting observer: it does not campaign or form an implicit control cluster,
+  while a later committed configuration can admit it. A bounded, checksummed
+  `control_map.cache` store now accepts only a
   complete 4,096-VShard serving map, publishes it with file fsync + atomic rename
   + parent-directory fsync, survives restart, rejects corrupt/partial files, and
   refuses epoch regression or conflicting same-epoch content; its focused
