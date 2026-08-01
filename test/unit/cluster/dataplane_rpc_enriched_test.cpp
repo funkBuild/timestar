@@ -80,6 +80,19 @@ public:
     }
 };
 
+class RecordingPatternStore : public ThrowingNodeStore {
+public:
+    int calls = 0;
+    data::PatternSeriesRequest lastRequest;
+    data::PatternSeriesResult response;
+
+    seastar::future<data::PatternSeriesResult> findPatternSeries(data::PatternSeriesRequest request) override {
+        ++calls;
+        lastRequest = std::move(request);
+        return seastar::make_ready_future<data::PatternSeriesResult>(response);
+    }
+};
+
 // Minimal legacy DataPoint sink, so a node can be started on the LEGACY path and
 // we can prove an enriched verb sent to it fails cleanly (unknown verb), not hangs.
 class LegacyMemStore : public data::LocalStore {
@@ -1177,6 +1190,76 @@ TEST_F(DataPlaneRpcEnrichedTest, ResolveVShardsAndRedirectsCrossTheSocket) {
         EXPECT_DOUBLE_EQ(sumBoth, 33.0);
 
         rpc.stop().get();
+    }).get();
+}
+
+TEST_F(DataPlaneRpcEnrichedTest, PatternSeriesDiscoveryCrossesTheV4SocketWithoutLosingItsFence) {
+    seastar::async([] {
+        const uint16_t port = 39379;
+        const data::NodeId self = 1;
+        RecordingPatternStore store;
+        store.response.seriesKeys = {buildSeriesKey("cpu", {{"env", "prod"}, {"host", "a"}}, "usage")};
+        store.response.redirects = {{11, 4, true}};
+
+        data::DataPlaneRpc rpc;
+        rpc.start(loopback(port), store).get();
+        rpc.addPeer(self, loopback(port));
+
+        data::PatternSeriesRequest request;
+        request.selector.measurement = "cpu";
+        request.selector.tags = {{"env", "prod"}};
+        request.selector.fields = {"usage"};
+        request.vshards = {7, 11};
+        request.resolveVShards = {11};
+        request.mapEpoch = 42;
+        request.maxSeries = 100;
+
+        data::PatternSeriesResult result = rpc.findPatternSeries(self, request).get();
+        ASSERT_EQ(store.calls, 1);
+        EXPECT_EQ(store.lastRequest.selector.measurement, request.selector.measurement);
+        EXPECT_EQ(store.lastRequest.selector.tags, request.selector.tags);
+        EXPECT_EQ(store.lastRequest.selector.fields, request.selector.fields);
+        EXPECT_EQ(store.lastRequest.vshards, request.vshards);
+        EXPECT_EQ(store.lastRequest.resolveVShards, request.resolveVShards);
+        EXPECT_EQ(store.lastRequest.mapEpoch, request.mapEpoch);
+        EXPECT_EQ(store.lastRequest.maxSeries, request.maxSeries);
+        EXPECT_EQ(result.seriesKeys, store.response.seriesKeys);
+        ASSERT_EQ(result.redirects.size(), 1u);
+        EXPECT_EQ(result.redirects.front().vshard, 11);
+        EXPECT_EQ(result.redirects.front().leader, 4u);
+        EXPECT_TRUE(result.redirects.front().hosted);
+
+        rpc.stop().get();
+    }).get();
+}
+
+TEST_F(DataPlaneRpcEnrichedTest, PatternSeriesDiscoveryIsNotSentToAPeerBelowV4) {
+    seastar::async([] {
+        const uint16_t serverPort = 39380, clientPort = 39381;
+        const data::NodeId peer = 2;
+        WireTapPeer tap(loopback(serverPort), data::kWriteBatchFormatV3);
+        ThrowingNodeStore store;
+        data::DataPlaneRpc client;
+        client.start(loopback(clientPort), store).get();
+        client.addPeer(peer, loopback(serverPort));
+
+        data::PatternSeriesRequest request;
+        request.selector.measurement = "cpu";
+        request.vshards = {7};
+        request.maxSeries = 100;
+        bool refused = false;
+        try {
+            client.findPatternSeries(peer, std::move(request)).get();
+        } catch (const data::PatternSeriesUnsupportedError&) {
+            refused = true;
+        } catch (const std::exception& error) {
+            ADD_FAILURE() << "expected PatternSeriesUnsupportedError, got: " << error.what();
+        }
+        EXPECT_TRUE(refused);
+        EXPECT_EQ(tap.negotiateCalls, 1);
+
+        client.stop().get();
+        tap.stop();
     }).get();
 }
 

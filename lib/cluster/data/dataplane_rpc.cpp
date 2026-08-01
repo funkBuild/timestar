@@ -7,6 +7,7 @@
 #include "dataplane_limits.hpp"
 #include "node_metadata.hpp"
 #include "node_query.hpp"
+#include "pattern_series.hpp"
 #include "replicated_command.hpp"  // firstUnproposableSlice
 #include "write_record.hpp"
 
@@ -81,6 +82,9 @@ constexpr uint64_t kProposeWriteHinted = 10;
 // path). The request is u16 VShard + the checksummed ReplicatedCommand frame; the
 // response reuses the committed-set/hint shape above.
 constexpr uint64_t kProposeCommandHinted = 11;
+// Quorum-fenced, VShard-restricted catalog expansion for pattern deletes.
+// Requires data-plane wire v4; the client checks negotiation before calling it.
+constexpr uint64_t kFindPatternSeries = 12;
 
 // How long before re-attempting a peer connection that died. seastar's rpc::client
 // never reconnects itself, so we replace it -- but bounded, so a burst of concurrent
@@ -260,6 +264,7 @@ struct DataPlaneRpc::Impl {
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> forwardBatchStub;
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> queryNodeStub;
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> queryMetadataStub;
+    std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> findPatternSeriesStub;
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> proposeWriteStub;
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> proposeWriteHintedStub;
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> proposeCommandHintedStub;
@@ -285,6 +290,9 @@ struct DataPlaneRpc::Impl {
     std::function<seastar::future<seastar::sstring>(Client&, seastar::rpc::rpc_clock_type::time_point,
                                                     seastar::sstring)>
         queryNodeTimedStub;
+    std::function<seastar::future<seastar::sstring>(Client&, seastar::rpc::rpc_clock_type::time_point,
+                                                    seastar::sstring)>
+        findPatternSeriesTimedStub;
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> leaderReadIndexStub;
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> leaderCommitIndexStub;
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> negotiateVersionStub;
@@ -360,6 +368,7 @@ struct DataPlaneRpc::Impl {
         forwardBatchStub = proto.make_client<seastar::sstring(seastar::sstring)>(kForwardWriteBatch);
         queryNodeStub = proto.make_client<seastar::sstring(seastar::sstring)>(kQueryNode);
         queryMetadataStub = proto.make_client<seastar::sstring(seastar::sstring)>(kQueryMetadata);
+        findPatternSeriesStub = proto.make_client<seastar::sstring(seastar::sstring)>(kFindPatternSeries);
         proposeWriteStub = proto.make_client<seastar::sstring(seastar::sstring)>(kProposeWrite);
         proposeWriteHintedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kProposeWriteHinted);
         proposeCommandHintedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kProposeCommandHinted);
@@ -368,6 +377,7 @@ struct DataPlaneRpc::Impl {
         proposeCommandHintedTimedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kProposeCommandHinted);
         negotiateVersionTimedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kNegotiateVersion);
         queryNodeTimedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kQueryNode);
+        findPatternSeriesTimedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kFindPatternSeries);
         leaderReadIndexStub = proto.make_client<seastar::sstring(seastar::sstring)>(kLeaderReadIndex);
         leaderCommitIndexStub = proto.make_client<seastar::sstring(seastar::sstring)>(kLeaderCommitIndex);
         negotiateVersionStub = proto.make_client<seastar::sstring(seastar::sstring)>(kNegotiateVersion);
@@ -507,6 +517,16 @@ seastar::future<> DataPlaneRpc::start(seastar::socket_address local, NodeStore& 
         return impl_->nodeSink->queryMetadata(std::move(*req)).then([](MetadataResult res) {
             std::string enc = encodeMetadataResult(res);
             return seastar::sstring(enc.data(), enc.size());
+        });
+    });
+    impl_->proto.register_handler(kFindPatternSeries, [this](seastar::sstring data) {
+        auto req = decodePatternSeriesRequest(std::string(data.data(), data.size()));
+        if (!req)
+            return seastar::make_exception_future<seastar::sstring>(
+                std::runtime_error("dataplane: malformed pattern-series request"));
+        return impl_->nodeSink->findPatternSeries(std::move(*req)).then([](PatternSeriesResult result) {
+            std::string encoded = encodePatternSeriesResult(result);
+            return seastar::sstring(encoded.data(), encoded.size());
         });
     });
     impl_->proto.register_handler(kProposeWrite, [this](seastar::sstring data) {
@@ -836,6 +856,34 @@ seastar::future<MetadataResult> DataPlaneRpc::queryMetadata(NodeId to, MetadataR
     if (!res)
         throw std::runtime_error("dataplane: malformed metadata result");
     co_return std::move(*res);
+}
+
+seastar::future<PatternSeriesResult> DataPlaneRpc::findPatternSeries(NodeId to, PatternSeriesRequest req,
+                                                                     OptDeadline deadline) {
+    if (impl_->stopping)
+        throw std::runtime_error("dataplane: shutting down");
+    const uint32_t version = co_await versionFor(to, deadline);
+    if (version < kPatternSeriesMinVersion)
+        throw PatternSeriesUnsupportedError(
+            "dataplane: peer " + std::to_string(to) + " negotiated wire v" + std::to_string(version) + ", below v" +
+            std::to_string(kPatternSeriesMinVersion) + " -- it cannot provide quorum-fenced pattern-series discovery");
+    auto* conn = impl_->clientFor(to);
+    if (!conn)
+        throw std::runtime_error("dataplane: unknown peer");
+    std::string encoded = encodePatternSeriesRequest(req);
+    seastar::sstring frame(encoded.data(), encoded.size());
+    seastar::sstring reply = deadline ? co_await impl_->findPatternSeriesTimedStub(*conn, *deadline, frame)
+                                      : co_await impl_->findPatternSeriesStub(*conn, frame);
+    auto result = decodePatternSeriesResult(std::string(reply.data(), reply.size()));
+    if (!result)
+        throw std::runtime_error("dataplane: malformed pattern-series result");
+    if ((!result->limitExceeded && result->seriesKeys.size() > req.maxSeries) ||
+        (result->limitExceeded && !result->seriesKeys.empty()))
+        throw std::runtime_error("dataplane: peer returned an invalid pattern-series bound result");
+    if (req.resolveVShards.empty() && !result->redirects.empty())
+        throw std::runtime_error(
+            "dataplane: peer returned pattern-series redirects without being asked to resolve leadership");
+    co_return std::move(*result);
 }
 
 seastar::future<ProposeOutcome> DataPlaneRpc::proposeWriteHinted(NodeId to, VShardBatchView view,

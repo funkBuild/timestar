@@ -127,6 +127,14 @@ public:
     // order (SeriesId128 bytes).
     seastar::future<std::vector<std::pair<SeriesId128, SeriesMetadata>>> extractVShardSeriesMetadata(uint16_t vshard);
 
+    // Bounded pattern expansion over one VShard's catalog range. This is the
+    // storage primitive behind replicated pattern delete discovery: it never
+    // scans or returns a foreign VShard and stops as soon as the caller's bound
+    // is known to be exceeded.
+    seastar::future<std::expected<std::vector<std::string>, SeriesLimitExceeded>> findVShardSeriesKeys(
+        uint16_t vshard, const std::string& measurement, const std::map<std::string, std::string>& tagFilters,
+        const std::unordered_set<std::string>& fieldFilter, size_t maxSeries, size_t maxEncodedKeyBytes);
+
     // --- Per-series value-type binding (SERIES_VALUE_TYPE, 0x18) ---
     //
     // Not part of the IndexBackend interface: this is enforced by Engine on the

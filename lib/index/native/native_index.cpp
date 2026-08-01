@@ -1533,6 +1533,48 @@ seastar::future<std::vector<std::pair<SeriesId128, SeriesMetadata>>> NativeIndex
     co_return out;
 }
 
+seastar::future<std::expected<std::vector<std::string>, SeriesLimitExceeded>> NativeIndex::findVShardSeriesKeys(
+    uint16_t vshard, const std::string& measurement, const std::map<std::string, std::string>& tagFilters,
+    const std::unordered_set<std::string>& fieldFilter, size_t maxSeries, size_t maxEncodedKeyBytes) {
+    if (vshard >= timestar::VIRTUAL_SHARD_COUNT || maxSeries == 0)
+        throw std::invalid_argument("findVShardSeriesKeys requires a valid VShard and a non-zero bound");
+
+    std::vector<std::string> out;
+    out.reserve(std::min<size_t>(maxSeries, 64));
+    size_t encodedKeyBytes = 0;
+    bool exceeded = false;
+    const std::string prefix = ke::encodeSeriesMetadataVShardPrefix(vshard);
+    co_await kvPrefixScan(prefix, [&](std::string_view key, std::string_view value) -> bool {
+        if (key.size() < ke::kSeriesMetadataKeyIdOffset + 16)
+            return true;
+        const auto metadata = ke::decodeSeriesMetadata(value);
+        if (metadata.measurement != measurement || (!fieldFilter.empty() && !fieldFilter.contains(metadata.field)))
+            return true;
+        for (const auto& [tag, wanted] : tagFilters) {
+            auto found = metadata.tags.find(tag);
+            if (found == metadata.tags.end() || found->second != wanted)
+                return true;
+        }
+        std::string seriesKey = timestar::buildSeriesKey(metadata.measurement, metadata.tags, metadata.field);
+        // Each key occupies a u32 length plus its bytes in PatternSeriesResult.
+        // Express the check with subtraction so an adversarial key length cannot
+        // wrap the accumulator.
+        const bool byteLimitExceeded = seriesKey.size() > maxEncodedKeyBytes ||
+                                       maxEncodedKeyBytes - seriesKey.size() < sizeof(uint32_t) ||
+                                       encodedKeyBytes > maxEncodedKeyBytes - seriesKey.size() - sizeof(uint32_t);
+        if (out.size() == maxSeries || byteLimitExceeded) {
+            exceeded = true;
+            return false;
+        }
+        encodedKeyBytes += sizeof(uint32_t) + seriesKey.size();
+        out.push_back(std::move(seriesKey));
+        return true;
+    });
+    if (exceeded)
+        co_return std::unexpected(SeriesLimitExceeded{maxSeries + 1, maxSeries});
+    co_return out;
+}
+
 // ============================================================================
 // Measurement metadata
 // ============================================================================

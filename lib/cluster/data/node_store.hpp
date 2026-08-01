@@ -3,6 +3,7 @@
 #include "../raft/raft_types.hpp"  // NodeId
 #include "node_metadata.hpp"
 #include "node_query.hpp"
+#include "pattern_series.hpp"
 #include "replicated_command.hpp"
 #include "write_errors.hpp"
 #include "write_record.hpp"
@@ -13,6 +14,7 @@
 #include <seastar/core/do_with.hh>
 #include <seastar/core/future.hh>
 #include <seastar/rpc/rpc_types.hh>  // rpc_clock_type
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -83,6 +85,13 @@ public:
     virtual seastar::future<MetadataResult> queryMetadata(MetadataRequest) {
         return seastar::make_ready_future<MetadataResult>();
     }
+
+    // Expand a delete selector against only the named VShards. The production
+    // store quorum-fences this read before scanning its NativeIndex ranges.
+    virtual seastar::future<PatternSeriesResult> findPatternSeries(PatternSeriesRequest) {
+        return seastar::make_exception_future<PatternSeriesResult>(
+            std::logic_error("node store does not implement quorum-fenced pattern-series discovery"));
+    }
 };
 
 // The peer-facing client seam for the enriched command path (the client side of
@@ -102,6 +111,12 @@ public:
     // doubles need not implement it; DataPlaneRpc serves it over the wire.
     virtual seastar::future<MetadataResult> queryMetadata(NodeId, MetadataRequest) {
         return seastar::make_ready_future<MetadataResult>();
+    }
+
+    virtual seastar::future<PatternSeriesResult> findPatternSeries(NodeId, PatternSeriesRequest,
+                                                                   OptDeadline = std::nullopt) {
+        return seastar::make_exception_future<PatternSeriesResult>(
+            std::logic_error("node transport does not implement quorum-fenced pattern-series discovery"));
     }
 
     // Forward a WriteBatch to a peer that LEADS the batch's VShards, to be

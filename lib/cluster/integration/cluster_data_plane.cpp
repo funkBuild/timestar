@@ -1,7 +1,9 @@
 #include "cluster_data_plane.hpp"
 
 #include "../../core/vshard.hpp"
+#include "../../utils/line_parser.hpp"
 #include "../../utils/logger.hpp"  // timestar::http_log
+#include "../../utils/series_key.hpp"
 #include "../data/read_routing.hpp"
 #include "checkquorum_policy.hpp"
 #include "write_admission.hpp"
@@ -16,6 +18,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 
 namespace timestar::cluster {
 
@@ -262,10 +265,10 @@ seastar::future<> ClusterDataPlane::startImpl(const ClusterConfig& cfg, seastar:
             const data::VShardDirectory* dirp = dir_.get();
             auto* peers = &shards_;
             const JournalIdentity journalIdentity = *journalIdentity_;
-            co_await shards_.invoke_on_all([enginesPtr = enginesPtr_, peers, dirp, selfId, jroot,
-                                            journalIdentity](ShardRaftPlane& p) {
-                return p.init(enginesPtr, peers, dirp, selfId, jroot, kRaftTickPeriod, journalIdentity);
-            });
+            co_await shards_.invoke_on_all(
+                [enginesPtr = enginesPtr_, peers, dirp, selfId, jroot, journalIdentity](ShardRaftPlane& p) {
+                    return p.init(enginesPtr, peers, dirp, selfId, jroot, kRaftTickPeriod, journalIdentity);
+                });
         }
 
         // FENCE NODE-LOCAL READS ON NODE-LOCAL APPLY LAG (debt D-36). Wired only in the
@@ -281,9 +284,8 @@ seastar::future<> ClusterDataPlane::startImpl(const ClusterConfig& cfg, seastar:
         // A node-local leg is subject to the same quorum ReadIndex as a peer leg.
         // Without this callback, queries coordinated on a partitioned former leader
         // bypass the peer-facing LeaderFilteredNodeStore and can return stale data.
-        local_->setLeaderReadFence([this](const std::vector<uint16_t>& vshards) {
-            return shards_.local().quorumLeaderReadFence(vshards);
-        });
+        local_->setLeaderReadFence(
+            [this](const std::vector<uint16_t>& vshards) { return shards_.local().quorumLeaderReadFence(vshards); });
 
         // Serve the DATA plane on this node's data-plane address FROM EVERY SHARD
         // (connection_distribution, not SO_REUSEPORT -- this seastar disables reuseport,
@@ -863,8 +865,7 @@ seastar::future<QueryResponse> ClusterDataPlane::queryReplicated(QueryRequest re
             }
         }
 
-        if (outstanding.empty())
-        {
+        if (outstanding.empty()) {
             // An earlier target may have failed before an alternate answered all
             // of its VShards. The completed answer is still whole; do not turn a
             // successful fallback into QUERY_INCOMPLETE merely to report the first
@@ -964,6 +965,219 @@ seastar::future<QueryResponse> ClusterDataPlane::queryReplicated(QueryRequest re
     }
     co_return co_await finalizer_->finalizeClusterPartials(std::move(request), std::move(allPartials),
                                                            std::move(allNonNumeric));
+}
+
+seastar::future<std::vector<std::string>> ClusterDataPlane::findPatternSeries(data::PatternSeriesSelector selector,
+                                                                              uint32_t maxSeries) {
+    if (!replicated_ || !shardsStarted_ || !dir_ || !rt_ || !local_ || !rpc_)
+        throw std::runtime_error("ClusterDataPlane::findPatternSeries requires replicated mode after start()");
+    if (selector.measurement.empty() || maxSeries == 0 || maxSeries > data::kPatternSeriesMaxResults)
+        throw std::invalid_argument("pattern-series discovery requires a measurement and a supported result bound");
+
+    // Pin the complete placement value, not a reference into VShardDirectory:
+    // group 0 will eventually update that object in place. Every VShard in this
+    // expansion is routed against one epoch, and an epoch change before return
+    // invalidates the whole read before the HTTP layer can propose any mutation.
+    const data::NodeId self = rt_->selfId;
+    const control::ControlMap pinnedMap = dir_->map();
+    const uint64_t pinnedEpoch = pinnedMap.epoch;
+    const data::VShardDirectory pinnedDirectory(self, pinnedMap);
+
+    std::set<uint16_t> outstanding;
+    for (uint16_t vshard = 0; vshard < timestar::VIRTUAL_SHARD_COUNT; ++vshard)
+        outstanding.insert(vshard);
+
+    std::set<std::string> matchedKeys;
+    size_t matchedKeyBytes = 0;
+    std::set<data::NodeId> unreachableLeaders;
+    std::set<data::NodeId> unsupportedPeers;
+    std::map<uint16_t, std::set<data::NodeId>> excludedTargets;
+    std::exception_ptr firstError;
+    bool limitExceeded = false;
+    unsigned leaderlessRetries = 0;
+    int redirectRounds = 0;
+    int replicaFallbackRounds = 0;
+    size_t leaderless = 0;
+    std::vector<uint16_t> unassigned;
+
+    const std::unordered_set<std::string> fieldFilter(selector.fields.begin(), selector.fields.end());
+    const auto keyMatchesSelector = [&selector, &fieldFilter](const std::string& key) {
+        try {
+            SeriesKeyParser parsed(key);
+            if (timestar::buildSeriesKey(parsed.measurement, parsed.tags, parsed.field) != key ||
+                parsed.measurement != selector.measurement ||
+                (!fieldFilter.empty() && !fieldFilter.contains(parsed.field)))
+                return false;
+            for (const auto& [tag, value] : selector.tags) {
+                auto found = parsed.tags.find(tag);
+                if (found == parsed.tags.end() || found->second != value)
+                    return false;
+            }
+            return true;
+        } catch (...) {
+            return false;
+        }
+    };
+
+    const auto started = std::chrono::steady_clock::now();
+    const auto rpcDeadline = seastar::rpc::rpc_clock_type::now() + kReadLeaderlessBudget;
+    const auto budgetSpent = [&started] { return std::chrono::steady_clock::now() - started >= kReadLeaderlessBudget; };
+
+    while (true) {
+        leaderless = 0;
+        unassigned.clear();
+        const auto leaders = co_await gatherLeaders();
+        data::ReadRouting plan =
+            data::planReadRouting(outstanding, leaders, readLeaderHints_, pinnedDirectory, self, excludedTargets);
+        leaderless = plan.leaderless;
+        unassigned = plan.unassigned;
+        if (!unassigned.empty())
+            break;
+        if (leaderless > 0 && leaderlessRetries < kReadLeaderRetries && !budgetSpent()) {
+            ++leaderlessRetries;
+            co_await seastar::sleep(kReadLeaderRetryDelay);
+            continue;
+        }
+        if (leaderless > 0)
+            break;
+
+        std::vector<seastar::future<data::PatternSeriesResult>> pending;
+        std::vector<data::NodeId> pendingNodes;
+        std::vector<std::vector<uint16_t>> pendingVShards;
+        std::vector<std::vector<uint16_t>> pendingResolve;
+        pending.reserve(plan.byNode.size());
+        pendingNodes.reserve(plan.byNode.size());
+        pendingVShards.reserve(plan.byNode.size());
+        pendingResolve.reserve(plan.byNode.size());
+        for (auto& [node, vshards] : plan.byNode) {
+            data::PatternSeriesRequest request;
+            request.selector = selector;
+            request.vshards = vshards;
+            if (auto resolve = plan.resolveAt.find(node); resolve != plan.resolveAt.end())
+                request.resolveVShards = std::move(resolve->second);
+            request.mapEpoch = pinnedEpoch;
+            request.maxSeries = maxSeries;
+            for (uint16_t vshard : request.resolveVShards)
+                excludedTargets[vshard].insert(node);
+            pendingNodes.push_back(node);
+            pendingVShards.push_back(vshards);
+            pendingResolve.push_back(request.resolveVShards);
+            if (node == self)
+                pending.push_back(local_->findPatternSeries(std::move(request)));
+            else
+                pending.push_back(rpc_->findPatternSeries(node, std::move(request), rpcDeadline));
+        }
+
+        bool learnedHint = false;
+        bool targetFailed = false;
+        for (size_t i = 0; i < pending.size(); ++i) {
+            try {
+                data::PatternSeriesResult result = co_await std::move(pending[i]);
+                if (result.limitExceeded) {
+                    limitExceeded = true;
+                    continue;
+                }
+
+                std::set<uint16_t> redirected;
+                for (const auto& redirect : result.redirects)
+                    if (std::find(pendingResolve[i].begin(), pendingResolve[i].end(), redirect.vshard) !=
+                        pendingResolve[i].end())
+                        redirected.insert(redirect.vshard);
+
+                // A peer's catalog strings are not routing authority. Re-parse
+                // every one, require canonical encoding and selector agreement,
+                // and prove its hash belongs to a VShard this exact request asked
+                // that peer to answer (and that it did not redirect).
+                for (const auto& key : result.seriesKeys) {
+                    const uint16_t vshard = timestar::virtualShard(SeriesId128::fromSeriesKey(key));
+                    if (!keyMatchesSelector(key) ||
+                        !std::binary_search(pendingVShards[i].begin(), pendingVShards[i].end(), vshard) ||
+                        redirected.contains(vshard)) {
+                        throw std::runtime_error(
+                            "pattern-series peer returned a non-canonical, non-matching, or foreign-VShard key");
+                    }
+                    if (!matchedKeys.contains(key)) {
+                        const size_t encodedBytes = sizeof(uint32_t) + key.size();
+                        if (matchedKeys.size() == maxSeries || encodedBytes > data::kPatternSeriesMaxKeyBytes ||
+                            matchedKeyBytes > data::kPatternSeriesMaxKeyBytes - encodedBytes) {
+                            limitExceeded = true;
+                        } else {
+                            matchedKeys.insert(key);
+                            matchedKeyBytes += encodedBytes;
+                        }
+                    }
+                }
+
+                if (data::applyReadRedirects(pendingNodes[i], pendingVShards[i], pendingResolve[i], result.redirects,
+                                             outstanding, readLeaderHints_))
+                    learnedHint = true;
+            } catch (const data::PatternSeriesUnsupportedError&) {
+                unsupportedPeers.insert(pendingNodes[i]);
+            } catch (...) {
+                if (pendingNodes[i] != self) {
+                    unreachableLeaders.insert(pendingNodes[i]);
+                    targetFailed = true;
+                    for (uint16_t vshard : pendingVShards[i])
+                        excludedTargets[vshard].insert(pendingNodes[i]);
+                    data::applyReadTargetUnreachable(pendingNodes[i], pendingVShards[i], readLeaderHints_);
+                } else if (!firstError) {
+                    firstError = std::current_exception();
+                }
+            }
+        }
+
+        if (limitExceeded || firstError || !unsupportedPeers.empty())
+            break;
+        if (outstanding.empty()) {
+            unreachableLeaders.clear();
+            break;
+        }
+        if (targetFailed && replicaFallbackRounds < kReadReplicaFallbackRounds && !budgetSpent()) {
+            ++replicaFallbackRounds;
+            continue;
+        }
+        if (targetFailed)
+            break;
+        if (learnedHint && redirectRounds < kReadRedirectRounds && !budgetSpent()) {
+            ++redirectRounds;
+            continue;
+        }
+        if (leaderlessRetries < kReadLeaderRetries && !budgetSpent()) {
+            ++leaderlessRetries;
+            co_await seastar::sleep(kReadLeaderRetryDelay);
+            continue;
+        }
+        break;
+    }
+
+    if (firstError)
+        std::rethrow_exception(firstError);
+    if (limitExceeded)
+        throw data::DeleteExpansionLimitError("pattern delete exceeds the " + std::to_string(maxSeries) +
+                                              "-series or " + std::to_string(data::kPatternSeriesMaxKeyBytes) +
+                                              "-encoded-key-byte safety limit");
+    if (!unsupportedPeers.empty()) {
+        std::string nodes;
+        for (data::NodeId node : unsupportedPeers)
+            nodes += (nodes.empty() ? "" : ",") + std::to_string(node);
+        throw data::PatternSeriesUnsupportedError(
+            "peer node(s) " + nodes + " predate quorum-fenced pattern-series discovery (data-plane wire v" +
+            std::to_string(data::kPatternSeriesMinVersion) + "); finish the rolling upgrade");
+    }
+    if (!unreachableLeaders.empty()) {
+        for (data::NodeId dead : unreachableLeaders)
+            co_await shards_.invoke_on_all([dead](ShardRaftPlane& plane) { (void)plane.wakeFollowersOf(dead); });
+        throw data::RetryableWriteError("pattern delete could not read every VShard leader; retry after re-election");
+    }
+    if (!unassigned.empty())
+        throw data::UnassignedVShardError("pattern delete found " + std::to_string(unassigned.size()) +
+                                          " unassigned VShard(s)");
+    if (leaderless > 0 || !outstanding.empty())
+        throw data::RetryableWriteError("pattern delete could not establish a complete leader-fenced catalog view");
+    if (dir_->epoch() != pinnedEpoch)
+        throw data::RetryableWriteError("placement changed during pattern expansion; no delete was proposed");
+
+    co_return std::vector<std::string>(matchedKeys.begin(), matchedKeys.end());
 }
 
 seastar::future<ClusterDataPlane::Status> ClusterDataPlane::status() const {

@@ -1289,10 +1289,13 @@ TEST_F(HttpHandlerIntegrationTest, PartitionedRf3RoutesExactDeleteThroughCluster
         .get();
 }
 
-TEST_F(HttpHandlerIntegrationTest, PartitionedRf3RejectsMixedPatternBatchBeforeAnyProposal) {
+TEST_F(HttpHandlerIntegrationTest, PartitionedRf3RejectsUnwiredPatternDiscoveryBeforeAnyProposal) {
     seastar::thread([] {
         struct ResetHook {
-            ~ResetHook() { HttpDeleteHandler::clusterDeleteHook = {}; }
+            ~ResetHook() {
+                HttpDeleteHandler::clusterDeleteHook = {};
+                HttpDeleteHandler::clusterPatternExpandHook = {};
+            }
         } reset;
         ScopedShardedEngine eng;
         eng.start();
@@ -1308,7 +1311,153 @@ TEST_F(HttpHandlerIntegrationTest, PartitionedRf3RejectsMixedPatternBatchBeforeA
         auto rep = handler.handleDelete(std::move(req)).get();
         EXPECT_EQ(rep->_status, seastar::http::reply::status_type::not_implemented);
         EXPECT_EQ(calls, 0u) << "the exact prefix of a mixed batch must not partially commit";
-        EXPECT_NE(rep->_content.find("Pattern delete is unavailable"), std::string::npos);
+        EXPECT_NE(rep->_content.find("quorum-fenced catalog discovery"), std::string::npos);
+    })
+        .join()
+        .get();
+}
+
+TEST_F(HttpHandlerIntegrationTest, PartitionedRf3ExpandsEveryPatternBeforeProposingMixedBatch) {
+    seastar::thread([] {
+        struct ResetHook {
+            ~ResetHook() {
+                HttpDeleteHandler::clusterDeleteHook = {};
+                HttpDeleteHandler::clusterPatternExpandHook = {};
+            }
+        } reset;
+        ScopedShardedEngine eng;
+        eng.start();
+        unsigned proposals = 0;
+        unsigned expansions = 0;
+        std::vector<std::string> proposedKeys;
+        const std::string patternA = buildSeriesKey("m", {{"host", "a"}}, "value");
+        const std::string patternB = buildSeriesKey("m", {{"host", "b"}}, "value");
+        HttpDeleteHandler::clusterPatternExpandHook = [&](timestar::data::PatternSeriesSelector selector,
+                                                          uint32_t maxSeries) {
+            ++expansions;
+            EXPECT_EQ(proposals, 0u) << "mutation began before the whole batch finished expansion";
+            EXPECT_EQ(selector.measurement, "m");
+            EXPECT_EQ(selector.tags, (std::map<std::string, std::string>{{"env", "prod"}}));
+            EXPECT_EQ(selector.fields, (std::vector<std::string>{"value"}));
+            EXPECT_EQ(maxSeries, 10'000u);
+            return seastar::make_ready_future<std::vector<std::string>>(std::vector<std::string>{patternA, patternB});
+        };
+        HttpDeleteHandler::clusterDeleteHook = [&](std::string key, uint64_t start, uint64_t end) {
+            ++proposals;
+            EXPECT_EQ(start, 10u);
+            EXPECT_EQ(end, 20u);
+            proposedKeys.push_back(std::move(key));
+            return seastar::make_ready_future<>();
+        };
+
+        HttpDeleteHandler handler(&eng.eng, true);
+        auto request = makeDeleteRequest(
+            R"({"deletes":[{"series":"exact value","startTime":10,"endTime":20},{"measurement":"m","tags":{"env":"prod"},"fields":["value"],"startTime":10,"endTime":20}]})");
+        auto reply = handler.handleDelete(std::move(request)).get();
+        ASSERT_TRUE(isOk(*reply)) << reply->_content;
+        EXPECT_EQ(expansions, 1u);
+        EXPECT_EQ(proposals, 3u);
+        std::sort(proposedKeys.begin(), proposedKeys.end());
+        EXPECT_EQ(proposedKeys, (std::vector<std::string>{"exact value", patternA, patternB}));
+        EXPECT_NE(reply->_content.find("unique exact delete commands"), std::string::npos);
+    })
+        .join()
+        .get();
+}
+
+TEST_F(HttpHandlerIntegrationTest, PartitionedRf3ExpansionFailureLeavesExactPrefixUntouched) {
+    seastar::thread([] {
+        struct ResetHook {
+            ~ResetHook() {
+                HttpDeleteHandler::clusterDeleteHook = {};
+                HttpDeleteHandler::clusterPatternExpandHook = {};
+            }
+        } reset;
+        ScopedShardedEngine eng;
+        eng.start();
+        unsigned proposals = 0;
+        HttpDeleteHandler::clusterDeleteHook = [&](std::string, uint64_t, uint64_t) {
+            ++proposals;
+            return seastar::make_ready_future<>();
+        };
+        HttpDeleteHandler::clusterPatternExpandHook = [](timestar::data::PatternSeriesSelector, uint32_t) {
+            return seastar::make_exception_future<std::vector<std::string>>(
+                timestar::data::RetryableWriteError("catalog leader unavailable"));
+        };
+
+        HttpDeleteHandler handler(&eng.eng, true);
+        auto request = makeDeleteRequest(
+            R"({"deletes":[{"series":"exact value","startTime":0,"endTime":1},{"measurement":"m","startTime":0,"endTime":1}]})");
+        auto reply = handler.handleDelete(std::move(request)).get();
+        EXPECT_EQ(reply->_status, seastar::http::reply::status_type::service_unavailable);
+        EXPECT_EQ(proposals, 0u);
+        EXPECT_EQ(reply->_headers["Retry-After"], "1");
+    })
+        .join()
+        .get();
+}
+
+TEST_F(HttpHandlerIntegrationTest, PartitionedRf3BroadPatternFailsBeforeMutation) {
+    seastar::thread([] {
+        struct ResetHook {
+            ~ResetHook() {
+                HttpDeleteHandler::clusterDeleteHook = {};
+                HttpDeleteHandler::clusterPatternExpandHook = {};
+            }
+        } reset;
+        ScopedShardedEngine eng;
+        eng.start();
+        unsigned proposals = 0;
+        HttpDeleteHandler::clusterDeleteHook = [&](std::string, uint64_t, uint64_t) {
+            ++proposals;
+            return seastar::make_ready_future<>();
+        };
+        HttpDeleteHandler::clusterPatternExpandHook = [](timestar::data::PatternSeriesSelector, uint32_t) {
+            return seastar::make_exception_future<std::vector<std::string>>(
+                timestar::data::DeleteExpansionLimitError("pattern exceeds safety limit"));
+        };
+
+        HttpDeleteHandler handler(&eng.eng, true);
+        auto reply = handler.handleDelete(makeDeleteRequest(R"({"measurement":"m"})")).get();
+        EXPECT_EQ(reply->_status, seastar::http::reply::status_type::bad_request);
+        EXPECT_EQ(proposals, 0u);
+        EXPECT_NE(reply->_content.find("safety limit"), std::string::npos);
+    })
+        .join()
+        .get();
+}
+
+TEST_F(HttpHandlerIntegrationTest, PartitionedRf3PartialMultiTargetFailureIsNeverAdvertisedRetryable) {
+    seastar::thread([] {
+        struct ResetHook {
+            ~ResetHook() {
+                HttpDeleteHandler::clusterDeleteHook = {};
+                HttpDeleteHandler::clusterPatternExpandHook = {};
+            }
+        } reset;
+        ScopedShardedEngine eng;
+        eng.start();
+        unsigned committed = 0;
+        HttpDeleteHandler::clusterDeleteHook = [&](std::string key, uint64_t, uint64_t) {
+            if (key.starts_with("bad ")) {
+                return seastar::sleep(std::chrono::milliseconds(2)).then([] {
+                    return seastar::make_exception_future<>(
+                        timestar::data::RetryableWriteError("one target refused before proposal"));
+                });
+            }
+            ++committed;
+            return seastar::make_ready_future<>();
+        };
+
+        HttpDeleteHandler handler(&eng.eng, true);
+        auto request = makeDeleteRequest(
+            R"({"deletes":[{"series":"good value","startTime":0,"endTime":1},{"series":"bad value","startTime":0,"endTime":1}]})");
+        auto reply = handler.handleDelete(std::move(request)).get();
+        EXPECT_EQ(committed, 1u) << "the negative case must actually include a committed sibling command";
+        EXPECT_EQ(reply->_status, seastar::http::reply::status_type::gateway_timeout);
+        EXPECT_EQ(reply->_headers.count("Retry-After"), 0u);
+        EXPECT_EQ(reply->_headers["X-TimeStar-Mutation-Outcome"], "unknown");
+        EXPECT_NE(reply->_content.find("DELETE_OUTCOME_UNKNOWN"), std::string::npos);
     })
         .join()
         .get();

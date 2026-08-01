@@ -110,6 +110,10 @@ public:
     // coordinator unions items and sums cardinality across owners.
     seastar::future<data::MetadataResult> queryMetadata(data::MetadataRequest req) override;
 
+    // Quorum-fenced, bounded catalog expansion for replicated pattern deletes.
+    // The request must name the exact VShards this leader is responsible for.
+    seastar::future<data::PatternSeriesResult> findPatternSeries(data::PatternSeriesRequest req) override;
+
     // THE READ FENCE (debt D-36). Returns false if this node cannot prove it has applied
     // everything it had already committed, within its budget.
     //

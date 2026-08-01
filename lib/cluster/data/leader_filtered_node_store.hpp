@@ -66,6 +66,48 @@ public:
         return inner_.queryMetadata(std::move(req));
     }
 
+    seastar::future<PatternSeriesResult> findPatternSeries(PatternSeriesRequest req) override {
+        if (req.resolveVShards.empty())
+            co_return co_await inner_.findPatternSeries(std::move(req));
+        if (!resolve_)
+            throw std::logic_error("LeaderFilteredNodeStore: pattern discovery was asked to resolve " +
+                                   std::to_string(req.resolveVShards.size()) + " VShard(s) with no resolver wired");
+
+        std::vector<VShardRedirect> resolved = co_await resolve_(req.resolveVShards);
+        std::vector<VShardRedirect> redirects;
+        std::set<uint16_t> drop;
+        std::set<uint16_t> answered;
+        for (const auto& resolution : resolved) {
+            answered.insert(resolution.vshard);
+            if (resolution.hosted && resolution.leader == self_)
+                continue;
+            redirects.push_back(resolution);
+            drop.insert(resolution.vshard);
+        }
+        for (uint16_t vshard : req.resolveVShards) {
+            if (answered.contains(vshard))
+                continue;
+            redirects.push_back(VShardRedirect{vshard, kNoNode, false});
+            drop.insert(vshard);
+        }
+
+        std::vector<uint16_t> keep;
+        keep.reserve(req.vshards.size());
+        for (uint16_t vshard : req.vshards)
+            if (!drop.contains(vshard))
+                keep.push_back(vshard);
+        if (keep.empty()) {
+            PatternSeriesResult out;
+            out.redirects = std::move(redirects);
+            co_return out;
+        }
+        req.vshards = std::move(keep);
+        req.resolveVShards.clear();
+        PatternSeriesResult out = co_await inner_.findPatternSeries(std::move(req));
+        out.redirects = std::move(redirects);
+        co_return out;
+    }
+
     seastar::future<NodeQueryPartial> queryLocal(NodeQueryRequest req) override {
         if (req.resolveVShards.empty())
             co_return co_await inner_.queryLocal(std::move(req));

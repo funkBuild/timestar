@@ -1,5 +1,6 @@
 #pragma once
 
+#include "../cluster/data/pattern_series.hpp"
 #include "engine.hpp"
 #include "series_id.hpp"
 
@@ -111,7 +112,10 @@ private:
 public:
     using ClusterDeleteHook =
         std::function<seastar::future<>(std::string seriesKey, uint64_t startTime, uint64_t endTime)>;
+    using ClusterPatternExpandHook = std::function<seastar::future<std::vector<std::string>>(
+        timestar::data::PatternSeriesSelector selector, uint32_t maxSeries)>;
     static inline ClusterDeleteHook clusterDeleteHook{};
+    static inline ClusterPatternExpandHook clusterPatternExpandHook{};
 
     struct DeleteRequest {
         std::string seriesKey;

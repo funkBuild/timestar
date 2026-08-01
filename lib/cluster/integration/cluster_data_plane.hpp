@@ -200,6 +200,10 @@ public:
     // write() on shard 0.
     seastar::future<> writeFromShard(data::WriteBatch batch);
     seastar::future<> deleteRangeFromShard(std::string seriesKey, uint64_t startTime, uint64_t endTime);
+    // Expand a pattern against a placement-epoch-pinned, quorum-fenced catalog
+    // view. No mutation is proposed by this method.
+    seastar::future<std::vector<std::string>> findPatternSeries(data::PatternSeriesSelector selector,
+                                                                uint32_t maxSeries);
 
     // Scatter a metadata request to every VShard owner and merge: string-set union
     // for list kinds, SUM for cardinality (RF=1 disjoint series => exact).

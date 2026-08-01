@@ -3,6 +3,7 @@
 // flat DataPoint could NOT represent) is applied, then read back through the real
 // HTTP query pipeline, proving the enriched command is lossless end to end.
 #include "../../../lib/cluster/integration/engine_local_store.hpp"
+
 #include "../../../lib/core/placement_table.hpp"  // virtualShard
 #include "../../../lib/http/http_query_handler.hpp"
 #include "../../../lib/utils/series_key.hpp"
@@ -159,6 +160,67 @@ TEST_F(EngineLocalStoreTest, ApplyWritesAllTypesVisibleViaRealQuery) {
     }).get();
 }
 
+TEST_F(EngineLocalStoreTest, PatternDiscoveryIsLeaderFencedVShardScopedAndFiltered) {
+    seastar::async([] {
+        ScopedShardedEngine eng;
+        eng.start();
+        cluster::EngineLocalStore store(*eng);
+
+        const std::string keyA = buildSeriesKey("pattern_cpu", {{"env", "prod"}, {"host", "a"}}, "usage");
+        const uint16_t vsA = timestar::virtualShard(SeriesId128::fromSeriesKey(keyA));
+        std::string hostB = "b";
+        std::string keyB;
+        uint16_t vsB = vsA;
+        for (unsigned i = 0; i < 10'000 && vsB == vsA; ++i) {
+            hostB = "b" + std::to_string(i);
+            keyB = buildSeriesKey("pattern_cpu", {{"env", "prod"}, {"host", hostB}}, "usage");
+            vsB = timestar::virtualShard(SeriesId128::fromSeriesKey(keyB));
+        }
+        ASSERT_NE(vsA, vsB);
+
+        data::WriteSeries a;
+        a.seriesKey = keyA;
+        a.type = TSMValueType::Float;
+        a.timestamps = {BASE};
+        a.values = std::vector<double>{1.0};
+        data::WriteSeries b = a;
+        b.seriesKey = keyB;
+        b.values = std::vector<double>{2.0};
+        data::WriteBatch batch;
+        batch.series = {std::move(a), std::move(b)};
+        store.applyWrites(std::move(batch)).get();
+
+        data::PatternSeriesRequest unfenced;
+        unfenced.selector.measurement = "pattern_cpu";
+        unfenced.vshards = {vsA};
+        unfenced.maxSeries = 10;
+        EXPECT_THROW(store.findPatternSeries(std::move(unfenced)).get(), std::logic_error)
+            << "cluster catalog discovery must not silently run before its quorum/apply fences are composed";
+
+        std::vector<std::string> fenceOrder;
+        store.setLeaderReadFence([&](const std::vector<uint16_t>& vshards) {
+            fenceOrder.push_back("leader");
+            EXPECT_EQ(vshards, (std::vector<uint16_t>{vsA}));
+            return seastar::make_ready_future<bool>(true);
+        });
+        store.setApplyFence([&] {
+            fenceOrder.push_back("apply");
+            return seastar::make_ready_future<bool>(true);
+        });
+
+        data::PatternSeriesRequest request;
+        request.selector.measurement = "pattern_cpu";
+        request.selector.tags = {{"env", "prod"}};
+        request.selector.fields = {"usage"};
+        request.vshards = {vsA};
+        request.maxSeries = 10;
+        auto result = store.findPatternSeries(std::move(request)).get();
+        EXPECT_FALSE(result.limitExceeded);
+        EXPECT_EQ(result.seriesKeys, (std::vector<std::string>{keyA}));
+        EXPECT_EQ(fenceOrder, (std::vector<std::string>{"leader", "apply"}));
+    }).get();
+}
+
 // M3 RF=3 read: queryLocal restricted to req.vshards returns ONLY series in those
 // VShards, so a series replicated on every node is counted once cluster-wide (the
 // coordinator asks each leader for only the VShards it leads). The correctness-
@@ -237,9 +299,7 @@ TEST_F(EngineLocalStoreTest, ReplicatedQueryRequiresExactVShardLeaderFence) {
         ASSERT_EQ(refused.incompleteReasons.size(), 1u);
         EXPECT_NE(refused.incompleteReasons.front().find("no VShard filter"), std::string::npos);
 
-        store.setLeaderReadFence([](const std::vector<uint16_t>&) {
-            return seastar::make_ready_future<bool>(false);
-        });
+        store.setLeaderReadFence([](const std::vector<uint16_t>&) { return seastar::make_ready_future<bool>(false); });
         auto noQuorum = store.queryLocal(std::move(req)).get();
         ASSERT_EQ(noQuorum.incompleteReasons.size(), 1u);
         EXPECT_NE(noQuorum.incompleteReasons.front().find("quorum"), std::string::npos);

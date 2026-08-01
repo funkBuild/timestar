@@ -29,8 +29,17 @@ public:
         p.seriesFound = 1;
         return seastar::make_ready_future<NodeQueryPartial>(std::move(p));
     }
+    seastar::future<PatternSeriesResult> findPatternSeries(PatternSeriesRequest req) override {
+        ++patternCalls;
+        lastPatternFilter = req.vshards;
+        PatternSeriesResult result;
+        result.seriesKeys = {"cpu,host=a usage"};
+        return seastar::make_ready_future<PatternSeriesResult>(std::move(result));
+    }
     int calls = 0;
     std::vector<uint16_t> lastFilter;
+    int patternCalls = 0;
+    std::vector<uint16_t> lastPatternFilter;
 };
 
 constexpr timestar::raft::NodeId kSelf = 2;
@@ -186,5 +195,39 @@ TEST(LeaderFilteredNodeStore, AResolveListWithNoResolverFailsLoudlyRatherThanSer
         auto out = store.queryLocal(plain).get();
         EXPECT_EQ(inner.calls, 1);
         EXPECT_TRUE(out.redirects.empty());
+    }).get();
+}
+
+TEST(LeaderFilteredNodeStore, PatternDiscoveryNeverIncludesRedirectedReplicaCatalogs) {
+    seastar::async([] {
+        RecordingStore inner;
+        LeaderFilteredNodeStore store(inner, kSelf, fixedResolver());
+        PatternSeriesRequest req;
+        req.selector.measurement = "cpu";
+        req.vshards = {10, 11, 12, 13};
+        req.resolveVShards = req.vshards;
+        req.maxSeries = 10;
+        auto out = store.findPatternSeries(std::move(req)).get();
+
+        ASSERT_EQ(inner.patternCalls, 1);
+        EXPECT_EQ(inner.lastPatternFilter, (std::vector<uint16_t>{10}));
+        EXPECT_EQ(out.seriesKeys, (std::vector<std::string>{"cpu,host=a usage"}));
+        ASSERT_EQ(out.redirects.size(), 3u);
+    }).get();
+}
+
+TEST(LeaderFilteredNodeStore, FullyRedirectedPatternDiscoveryDoesNotUseEmptyAsUnrestricted) {
+    seastar::async([] {
+        RecordingStore inner;
+        LeaderFilteredNodeStore store(inner, kSelf, fixedResolver());
+        PatternSeriesRequest req;
+        req.selector.measurement = "cpu";
+        req.vshards = {11, 12, 13};
+        req.resolveVShards = req.vshards;
+        req.maxSeries = 10;
+        auto out = store.findPatternSeries(std::move(req)).get();
+        EXPECT_EQ(inner.patternCalls, 0);
+        EXPECT_TRUE(out.seriesKeys.empty());
+        EXPECT_EQ(out.redirects.size(), 3u);
     }).get();
 }

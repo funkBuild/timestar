@@ -80,6 +80,8 @@ public:
     // above remains for legacy/test callers that own no wall-clock budget.
     seastar::future<NodeQueryPartial> queryNode(NodeId to, NodeQueryRequest req, OptDeadline deadline);
     seastar::future<MetadataResult> queryMetadata(NodeId to, MetadataRequest req) override;
+    seastar::future<PatternSeriesResult> findPatternSeries(NodeId to, PatternSeriesRequest req,
+                                                           OptDeadline deadline = std::nullopt) override;
     seastar::future<bool> proposeWrite(NodeId to, WriteBatch batch) override;
     // The production remote propose (write-scaleout 3a/3b): borrows the caller's groups
     // (no merge allocation, and the caller keeps them so it can retry the failed ones)

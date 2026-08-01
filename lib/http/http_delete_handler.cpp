@@ -15,6 +15,7 @@
 #include <seastar/core/loop.hh>
 #include <seastar/core/smp.hh>
 #include <seastar/core/when_all.hh>
+#include <tuple>
 
 using namespace seastar;
 using namespace httpd;
@@ -362,23 +363,67 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDeleteHandler::handle
         }
 
         if (partitionedCluster_) {
-            // Expand nothing after the first proposal: a mixed batch containing a
-            // pattern delete must fail atomically before any targeted command can
-            // commit. Cluster-wide pattern expansion needs a placement-pinned
-            // catalog snapshot and remains deliberately unsupported.
+            // Preflight and expand the WHOLE batch before proposing its first
+            // command. Pattern discovery is a quorum-fenced catalog read at each
+            // VShard's current leader; the production hook also pins one placement
+            // epoch. A failed/oversize expansion therefore leaves every exact
+            // prefix untouched.
+            static constexpr size_t kMaxExpandedClusterDeletes = timestar::data::kPatternSeriesMaxResults;
+            struct ExpandedDelete {
+                std::string seriesKey;
+                uint64_t startTime;
+                uint64_t endTime;
+
+                auto tie() const { return std::tie(seriesKey, startTime, endTime); }
+            };
+            std::vector<ExpandedDelete> expanded;
+            expanded.reserve(deleteRequests.size());
             for (const auto& delReq : deleteRequests) {
                 if (delReq.isPattern) {
-                    reply->set_status(seastar::http::reply::status_type::not_implemented);
-                    constexpr std::string_view message =
-                        "Pattern delete is unavailable in partitioned cluster mode; use exact series targets";
-                    if (timestar::http::isProtobuf(resFmt))
-                        reply->_content = timestar::proto::formatDeleteResponse("error", 0, 0, std::string(message));
-                    else
-                        reply->_content = createErrorResponse(std::string(message));
-                    timestar::http::setContentType(*reply, resFmt);
-                    co_return reply;
+                    if (!clusterPatternExpandHook) {
+                        reply->set_status(seastar::http::reply::status_type::not_implemented);
+                        constexpr std::string_view message =
+                            "Pattern delete requires quorum-fenced catalog discovery on every cluster peer";
+                        if (timestar::http::isProtobuf(resFmt))
+                            reply->_content =
+                                timestar::proto::formatDeleteResponse("error", 0, 0, std::string(message));
+                        else
+                            reply->_content = createErrorResponse(std::string(message));
+                        timestar::http::setContentType(*reply, resFmt);
+                        co_return reply;
+                    }
+                    timestar::data::PatternSeriesSelector selector;
+                    selector.measurement = delReq.measurement;
+                    selector.tags = delReq.tags;
+                    selector.fields = delReq.fields;
+                    auto keys = co_await clusterPatternExpandHook(std::move(selector), kMaxExpandedClusterDeletes);
+                    for (auto& key : keys)
+                        expanded.push_back(ExpandedDelete{std::move(key), delReq.startTime, delReq.endTime});
+                } else {
+                    std::string key = delReq.isStructured
+                                          ? buildSeriesKey(delReq.measurement, delReq.tags, delReq.field)
+                                          : delReq.seriesKey;
+                    expanded.push_back(ExpandedDelete{std::move(key), delReq.startTime, delReq.endTime});
                 }
+                if (expanded.size() > kMaxExpandedClusterDeletes)
+                    throw timestar::data::DeleteExpansionLimitError(
+                        "delete request expands beyond the 10000-series safety limit");
             }
+
+            // Overlapping selectors commonly name the same exact command. Remove
+            // byte-identical triples before proposal: duplicate range tombstones in
+            // one HTTP operation only enlarge the ambiguity window for concurrent
+            // writes and provide no semantic value.
+            std::sort(expanded.begin(), expanded.end(),
+                      [](const ExpandedDelete& lhs, const ExpandedDelete& rhs) { return lhs.tie() < rhs.tie(); });
+            expanded.erase(std::unique(expanded.begin(), expanded.end(),
+                                       [](const ExpandedDelete& lhs, const ExpandedDelete& rhs) {
+                                           return lhs.tie() == rhs.tie();
+                                       }),
+                           expanded.end());
+            if (expanded.size() > kMaxExpandedClusterDeletes)
+                throw timestar::data::DeleteExpansionLimitError(
+                    "delete request expands beyond the 10000-series safety limit");
 
             // A legal request may contain 10,000 targets. Starting all 10,000
             // quorum waits at once exhausts Raft waiter and connection capacity
@@ -386,26 +431,58 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDeleteHandler::handle
             // parallelism to spread work across leaders without allowing one HTTP
             // request to create an unbounded proposal fan-out.
             static constexpr size_t kMaxConcurrentClusterDeletes = 32;
-            co_await seastar::max_concurrent_for_each(
-                deleteRequests, kMaxConcurrentClusterDeletes, [](const DeleteRequest& delReq) {
-                    std::string key = delReq.isStructured
-                                          ? buildSeriesKey(delReq.measurement, delReq.tags, delReq.field)
-                                          : delReq.seriesKey;
-                    return clusterDeleteHook(std::move(key), delReq.startTime, delReq.endTime);
-                });
+            try {
+                co_await seastar::max_concurrent_for_each(
+                    expanded, kMaxConcurrentClusterDeletes, [](const ExpandedDelete& command) {
+                        return clusterDeleteHook(command.seriesKey, command.startTime, command.endTime);
+                    });
+            } catch (...) {
+                if (expanded.size() > 1) {
+                    // Other concurrent commands may already have committed even
+                    // when this particular failure was an unambiguous refusal.
+                    // Advertising the whole batch as retryable could then erase a
+                    // write ordered after one of those committed deletes.
+                    try {
+                        throw;
+                    } catch (const timestar::data::AmbiguousMutationError&) {
+                        throw;
+                    } catch (...) {
+                        throw timestar::data::AmbiguousMutationError(
+                            "multi-target delete outcome is unknown: one or more exact commands may have committed");
+                    }
+                }
+                throw;
+            }
 
-            // Raft's acknowledgement proves that every exact target committed
-            // and applied, not whether a point happened to exist before apply.
-            // Report committed targets rather than performing a racy pre-read.
+            // Raft's acknowledgement proves that every expanded exact target
+            // committed and applied, not whether a point happened to exist before
+            // apply. An empty expansion is a successful no-op.
             reply->set_status(seastar::http::reply::status_type::ok);
             if (timestar::http::isProtobuf(resFmt)) {
                 reply->_content =
-                    timestar::proto::formatDeleteResponse("success", deleteRequests.size(), deleteRequests.size());
+                    timestar::proto::formatDeleteResponse("success", expanded.size(), deleteRequests.size());
             } else {
                 DeleteDetailedResponse response;
-                response.seriesDeleted = deleteRequests.size();
+                response.seriesDeleted = expanded.size();
                 response.totalRequests = deleteRequests.size();
-                response.note = "seriesDeleted is the number of exact delete commands committed and applied";
+                static constexpr size_t kMaxReportedDeleteKeyBytes = 64 << 10;
+                size_t reportedKeyBytes = 0;
+                for (const auto& command : expanded) {
+                    if (command.seriesKey.size() > kMaxReportedDeleteKeyBytes - reportedKeyBytes) {
+                        reportedKeyBytes = kMaxReportedDeleteKeyBytes + 1;
+                        break;
+                    }
+                    reportedKeyBytes += command.seriesKey.size();
+                }
+                if (expanded.size() <= 100 && reportedKeyBytes <= kMaxReportedDeleteKeyBytes) {
+                    response.deletedSeries.emplace();
+                    response.deletedSeries->reserve(expanded.size());
+                    for (const auto& command : expanded)
+                        response.deletedSeries->push_back(command.seriesKey);
+                } else {
+                    response.deletedSeriesCount = expanded.size();
+                }
+                response.note = "seriesDeleted is the number of unique exact delete commands committed and applied";
                 reply->_content = glz::write_json(response).value_or("{}");
             }
             timestar::http::setContentType(*reply, resFmt);
@@ -560,6 +637,18 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDeleteHandler::handle
             reply->_content = glz::write_json(response).value_or("{}");
         }
 
+    } catch (const timestar::data::DeleteExpansionLimitError& e) {
+        reply->set_status(seastar::http::reply::status_type::bad_request);
+        if (timestar::http::isProtobuf(resFmt))
+            reply->_content = timestar::proto::formatDeleteResponse("error", 0, 0, e.what());
+        else
+            reply->_content = createErrorResponse(e.what());
+    } catch (const timestar::data::PatternSeriesUnsupportedError& e) {
+        reply->set_status(seastar::http::reply::status_type::not_implemented);
+        if (timestar::http::isProtobuf(resFmt))
+            reply->_content = timestar::proto::formatDeleteResponse("error", 0, 0, e.what());
+        else
+            reply->_content = createErrorResponse(e.what());
     } catch (const timestar::data::AmbiguousMutationError& e) {
         // Do not attach Retry-After: unlike an unambiguous pre-proposal refusal,
         // this command may already be committed. Repeating a range delete after a

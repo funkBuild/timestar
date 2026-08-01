@@ -6,6 +6,8 @@
 
 #include <map>
 #include <seastar/core/coroutine.hh>
+#include <set>
+#include <unordered_set>
 #include <utility>
 
 namespace timestar::cluster {
@@ -315,6 +317,80 @@ seastar::future<data::NodeQueryPartial> EngineLocalStore::queryLocal(data::NodeQ
     partial.nonNumeric = std::move(np.nonNumeric);
     partial.seriesFound = np.seriesFound;
     co_return partial;
+}
+
+seastar::future<data::PatternSeriesResult> EngineLocalStore::findPatternSeries(data::PatternSeriesRequest req) {
+    if (req.vshards.empty() || req.maxSeries == 0 || req.maxSeries > data::kPatternSeriesMaxResults)
+        throw std::invalid_argument("pattern-series discovery requires VShards and a supported result bound");
+    if (!leaderReadFence_ || !applyFence_)
+        throw std::logic_error("pattern-series discovery is unavailable until both cluster read fences are wired");
+
+    // This is the same catalog that query discovery reads. Prove current-term
+    // leadership and apply through the confirmed ReadIndex before inspecting it;
+    // otherwise a partitioned former leader could omit an acknowledged series and
+    // turn a broad delete into a silent partial success.
+    if (!co_await leaderReadFence_(req.vshards))
+        throw std::runtime_error("pattern-series discovery could not confirm current leadership with a quorum");
+    if (!co_await applyFence_())
+        throw std::runtime_error(
+            "node has committed but unapplied writes; pattern-series discovery would omit acknowledged series");
+
+    std::map<unsigned, std::vector<uint16_t>> byCore;
+    for (uint16_t vshard : req.vshards) {
+        if (vshard >= timestar::VIRTUAL_SHARD_COUNT)
+            throw std::invalid_argument("pattern-series discovery contains an invalid VShard");
+        byCore[timestar::assignCore(timestar::VShardId{vshard}, seastar::smp::count)].push_back(vshard);
+    }
+
+    data::PatternSeriesResult result;
+    size_t resultKeyBytes = 0;
+    for (auto& [core, vshards] : byCore) {
+        const uint32_t remaining = result.seriesKeys.size() < req.maxSeries
+                                       ? req.maxSeries - static_cast<uint32_t>(result.seriesKeys.size())
+                                       : 0;
+        const size_t remainingKeyBytes =
+            resultKeyBytes < data::kPatternSeriesMaxKeyBytes ? data::kPatternSeriesMaxKeyBytes - resultKeyBytes : 0;
+        auto part = co_await engines_.invoke_on(
+            core,
+            [selector = req.selector, vshards = std::move(vshards), remaining,
+             remainingKeyBytes](Engine& engine) mutable -> seastar::future<data::PatternSeriesResult> {
+                data::PatternSeriesResult local;
+                size_t localKeyBytes = 0;
+                std::unordered_set<std::string> fieldFilter(selector.fields.begin(), selector.fields.end());
+                for (uint16_t vshard : vshards) {
+                    const size_t left = remaining > local.seriesKeys.size() ? remaining - local.seriesKeys.size() : 0;
+                    const size_t bytesLeft = remainingKeyBytes > localKeyBytes ? remainingKeyBytes - localKeyBytes : 0;
+                    // When the global budget is exactly full, probe one key per
+                    // remaining VShard: empty is valid; any match proves overflow.
+                    const size_t scanLimit = left == 0 ? 1 : left;
+                    auto found = co_await engine.getIndex().findVShardSeriesKeys(
+                        vshard, selector.measurement, selector.tags, fieldFilter, scanLimit, bytesLeft);
+                    if (!found.has_value()) {
+                        local.limitExceeded = true;
+                        co_return local;
+                    }
+                    if (left == 0 && !found->empty()) {
+                        local.limitExceeded = true;
+                        co_return local;
+                    }
+                    for (const auto& key : *found)
+                        localKeyBytes += sizeof(uint32_t) + key.size();
+                    local.seriesKeys.insert(local.seriesKeys.end(), std::make_move_iterator(found->begin()),
+                                            std::make_move_iterator(found->end()));
+                }
+                co_return local;
+            });
+        if (part.limitExceeded) {
+            result.limitExceeded = true;
+            result.seriesKeys.clear();
+            co_return result;
+        }
+        for (const auto& key : part.seriesKeys)
+            resultKeyBytes += sizeof(uint32_t) + key.size();
+        result.seriesKeys.insert(result.seriesKeys.end(), std::make_move_iterator(part.seriesKeys.begin()),
+                                 std::make_move_iterator(part.seriesKeys.end()));
+    }
+    co_return result;
 }
 
 seastar::future<data::MetadataResult> EngineLocalStore::queryMetadata(data::MetadataRequest req) {
