@@ -95,6 +95,9 @@ TEST(ControlCommandV1, RejectsTruncationCorruptionAndTrailingBytes) {
     auto badMagic = encoded;
     badMagic[0] ^= 1;
     EXPECT_FALSE(decodeCommand(badMagic));
+    auto unknownVersion = encoded;
+    unknownVersion[3] = '2';
+    EXPECT_FALSE(decodeCommand(unknownVersion));
     EXPECT_FALSE(decodeCommand(encoded + "x"));
 
     auto move = encodeCommand(PlanVShardMove{"move-42", movePlan()});
@@ -461,6 +464,9 @@ TEST(Group0SnapshotV1, RoundTripsAndRejectsMalformedState) {
     auto corrupt = snapshot;
     corrupt[0] ^= 1;
     EXPECT_FALSE(restored.loadSnapshot(corrupt));
+    auto unknownVersion = snapshot;
+    unknownVersion[7] = '2';
+    EXPECT_FALSE(restored.loadSnapshot(unknownVersion));
     EXPECT_EQ(restored.state(), source.state());
 }
 

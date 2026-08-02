@@ -240,9 +240,15 @@ evidence below.
 - [ ] **Rerun empty-node catch-up and snapshot durability gates on the final
   candidate.** Each process must use an explicit memory budget; tests run one at
   a time and must prove the returning node's durable root was actually absent.
-- [ ] **Run the homogeneous-v1 rejection gate.** A node or artifact with an
-  unknown version must fail before serving; no test should expect fallback,
-  negotiation above v1, or activation.
+- [x] **Run the homogeneous-v1 rejection gate.** The 2026-08-03 bounded run
+  passed six current-format codec checks and a real-socket data-plane test in
+  both directions: an unsupported handshake applied no state, and a production
+  client sent no application verb after an unsupported reply. The production
+  restart arm acknowledged a write, changed only its WAL version field from 1
+  to 2, and observed a non-zero exit before `/health`. Startup named version 2
+  as unsupported and preserved the rejected WAL byte-for-byte. One 1-GiB,
+  one-reactor process ran at a time and all artifacts were under `build/tmp`.
+  There is no fallback, negotiation above v1, or activation path.
 - [ ] **Run multi-host topology, security, and fault gates.** Verify mTLS peer
   identity, authenticated operator mutations, network partitions, restart,
   disk-full behavior, and bounded recovery on distinct hosts.

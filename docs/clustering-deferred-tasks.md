@@ -26,6 +26,10 @@ Production blockers take priority and are authoritative in
 - [x] Prove bounded delete-receipt retirement, snapshot progress, journal
   reclaim, and one-current-sidecar retention under sustained delete-heavy RF=3
   load.
+- [x] Prove homogeneous-v1 fail-closed startup and peer behavior. Unsupported
+  data-plane handshakes are fenced before application verbs, and a production
+  restart over an unsupported WAL version exits before serving without
+  rewriting the source.
 - [ ] Run final multi-host topology, security, durability, and SLO gates against
   the exact release candidate.
 

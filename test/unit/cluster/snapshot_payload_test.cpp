@@ -94,6 +94,9 @@ TEST(SnapshotPayloadV1, RejectsMalformedFrames) {
     auto corrupt = encoded;
     corrupt[4] ^= 1;
     EXPECT_FALSE(decodeSnapshotPayload(corrupt));
+    auto unknownVersion = encoded;
+    unknownVersion[3] = '2';
+    EXPECT_FALSE(decodeSnapshotPayload(unknownVersion));
     EXPECT_FALSE(decodeSnapshotPayload(encoded + "x"));
 }
 

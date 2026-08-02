@@ -22,6 +22,7 @@ not probes, so they can be run from CI or a release checklist.
 | `pattern_delete_failover_gate.sh` | an ambiguous coordinator crash only after another Group-0 voter applies a complete 6,000-target frozen plan, exact retry under a new leader without capturing a newly matching series, changed-body conflict, and killed-node restart recovery |
 | `large_snapshot_streaming_gate.sh` | an exact-v1 snapshot of 128 MiB + 1 byte crosses leader hydration, v1 Raft framing and receiver disk staging in chunks no larger than 4 MiB, with a 1 GiB process limit and all temporary data under `build/tmp` |
 | `delete_receipt_retirement_gate.sh` | sustained exact deletes cross the 1,024-receipt per-VShard capacity on every replica, advance the replicated retirement floor twice, preserve expired/retained retry outcomes, become snapshot-covered, reclaim production-sized sealed v1 journal segments, and retain only the current snapshot sidecar |
+| `homogeneous_v1_rejection_gate.sh` | exact-v1 codec and real-socket handshake rejection, plus a production restart over a real acknowledged WAL whose version field is changed to an unsupported value; startup must exit before HTTP and preserve the source byte-for-byte |
 
 All of them take an optional server binary as `$1` (default
 `build/bin/timestar_http_server`), so a "before" binary can be measured the same way.
@@ -60,6 +61,12 @@ target without a high-cardinality dataset. It waits through the normal five-
 second snapshot sweep and one-minute journal-GC cadence, rejects superseded
 canonical sidecar leaks, and removes all roots and its bounded response
 workspace on exit.
+
+`homogeneous_v1_rejection_gate.sh` runs one 1-GiB process at a time. Its codec,
+socket, and production-restart arms keep every temporary and durable artifact
+under `build/tmp`. The live arm changes only the version field of a real
+acknowledged WAL, then requires a non-zero startup exit before `/health`, an
+explicit unsupported-version diagnostic, and byte-for-byte source preservation.
 
 ## Run them ONE AT A TIME, with the previous run's data dirs deleted
 
@@ -203,6 +210,7 @@ cannot reintroduce the race.
 | `retention_failover_gate.sh` | 19830-19832 | 20830-20832 | 21830-21832 | `1983` | `build/tmp/tsgate_rt*` |
 | `pattern_delete_failover_gate.sh` | 19850-19852 | 20850-20852 | 21850-21852 | `1985` | `build/tmp/tsgate_pd*` |
 | `delete_receipt_retirement_gate.sh` | 19870-19872 | 20870-20872 | 21870-21872 | `1987` | `build/tmp/tsgate_dr*` |
+| `homogeneous_v1_rejection_gate.sh` | 19890 | 20890 | 21890 | `1989` | `build/tmp/tsgate_v1*` |
 
 The prefixes are now four digits and unique per gate — they used to be three, so `492`
 covered both `backpressure` and `rolling_rebalance` and `197` also matched `--port 19730`,

@@ -36,6 +36,7 @@
 #include <memory>
 #include <seastar/core/sleep.hh>
 #include <seastar/core/thread.hh>
+#include <seastar/rpc/rpc.hh>
 #include <set>
 #include <string>
 #include <vector>
@@ -58,6 +59,38 @@ fs::path tmpDir(const std::string& t) {
 seastar::socket_address loopback(uint16_t port) {
     return seastar::socket_address(seastar::net::inet_address("127.0.0.1"), port);
 }
+
+// Wire-compatible test peer for the production data-plane RPC.  Keep the
+// unsupported value local to the test: the product has one version constant,
+// not a dormant v2 implementation or a compatibility mode.
+struct DataPlaneProbeSerializer {};
+
+template <typename Output>
+void write(DataPlaneProbeSerializer, Output& out, const seastar::sstring& value) {
+    const uint32_t size = static_cast<uint32_t>(value.size());
+    out.write(reinterpret_cast<const char*>(&size), sizeof(size));
+    out.write(value.data(), value.size());
+}
+
+template <typename Input>
+seastar::sstring read(DataPlaneProbeSerializer, Input& in, seastar::rpc::type<seastar::sstring>) {
+    uint32_t size = 0;
+    in.read(reinterpret_cast<char*>(&size), sizeof(size));
+    seastar::sstring value = seastar::uninitialized_string(size);
+    in.read(value.data(), size);
+    return value;
+}
+
+seastar::sstring probeU32(uint32_t value) {
+    char bytes[4];
+    for (int i = 0; i < 4; ++i)
+        bytes[i] = static_cast<char>((value >> (8 * i)) & 0xff);
+    return seastar::sstring(bytes, sizeof(bytes));
+}
+
+using DataPlaneProbeProtocol = seastar::rpc::protocol<DataPlaneProbeSerializer>;
+constexpr uint64_t kProbeForwardWriteBatch = 3;
+constexpr uint64_t kProbeRequireV1 = 9;
 
 data::WriteSeries floatSeries(const std::string& key, double v, uint64_t ts = BASE) {
     data::WriteSeries s;
@@ -354,6 +387,64 @@ TEST_F(ShardRaftPlaneTest, MovementControlFencesCrossTheExactV1Socket) {
 
         client.stop().get();
         server.stop().get();
+    }).get();
+}
+
+TEST_F(ShardRaftPlaneTest, DataPlaneRejectsUnknownPeerVersionBeforeServingTraffic) {
+    seastar::async([] {
+        const auto productionAddress = loopback(18145);
+        RecordingStore store;
+        data::DataPlaneRpc server;
+        server.start(productionAddress, store).get();
+
+        // An unknown request version is rejected by the real listener.  A valid
+        // handshake and normal production client still work afterwards, proving
+        // this was a fail-closed negotiation rather than a server crash.
+        DataPlaneProbeProtocol probeProtocol{DataPlaneProbeSerializer{}};
+        auto handshake = probeProtocol.make_client<seastar::sstring(seastar::sstring)>(kProbeRequireV1);
+        DataPlaneProbeProtocol::client probe(probeProtocol, seastar::rpc::client_options{}, productionAddress);
+        EXPECT_THROW(handshake(probe, probeU32(2)).get(), std::exception);
+        EXPECT_EQ(handshake(probe, probeU32(1)).get(), probeU32(1));
+        EXPECT_EQ(store.served, 0u) << "version negotiation must never apply application state";
+        probe.stop().get();
+
+        data::DataPlaneRpc client;
+        client.addPeer(2, productionAddress);
+        client.startClientOnly().get();
+        data::WriteBatch accepted;
+        accepted.series = {floatSeries(buildSeriesKey("v1", {{"peer", "accepted"}}, "value"), 1.0)};
+        client.forwardWriteBatch(2, std::move(accepted)).get();
+        EXPECT_EQ(store.served, 1u);
+        client.stop().get();
+        server.stop().get();
+
+        // Conversely, a production client must not send the application verb
+        // when a peer replies with an unknown version.
+        const auto incompatibleAddress = loopback(18146);
+        DataPlaneProbeProtocol incompatibleProtocol{DataPlaneProbeSerializer{}};
+        size_t writesReceived = 0;
+        incompatibleProtocol.register_handler(kProbeRequireV1, [](seastar::sstring) {
+            return seastar::make_ready_future<seastar::sstring>(probeU32(2));
+        });
+        incompatibleProtocol.register_handler(kProbeForwardWriteBatch, [&writesReceived](seastar::sstring) {
+            ++writesReceived;
+            return seastar::make_ready_future<seastar::sstring>("k");
+        });
+        seastar::listen_options options;
+        options.reuse_address = true;
+        options.set_fixed_cpu(seastar::this_shard_id());
+        auto socket = seastar::listen(incompatibleAddress, options);
+        DataPlaneProbeProtocol::server incompatibleServer(incompatibleProtocol, std::move(socket));
+
+        data::DataPlaneRpc rejectingClient;
+        rejectingClient.addPeer(3, incompatibleAddress);
+        rejectingClient.startClientOnly().get();
+        data::WriteBatch rejected;
+        rejected.series = {floatSeries(buildSeriesKey("v1", {{"peer", "rejected"}}, "value"), 2.0)};
+        EXPECT_THROW(rejectingClient.forwardWriteBatch(3, std::move(rejected)).get(), std::exception);
+        EXPECT_EQ(writesReceived, 0u) << "the application RPC must be fenced behind the exact-v1 handshake";
+        rejectingClient.stop().get();
+        incompatibleServer.stop().get();
     }).get();
 }
 
