@@ -26,8 +26,7 @@ struct DeleteOperationReceipt {
     SeriesId128 operationId{};
     uint64_t appliedIndex = 0;
     uint64_t commandHash = 0;
-    // Zero is the legacy, non-expiring receipt form. Modern receipts use the
-    // client-stable issuance time carried by their replicated command.
+    // Client-stable issuance time carried by the replicated command. Non-zero.
     uint64_t issuedAtMs = 0;
 
     auto operator<=>(const DeleteOperationReceipt&) const = default;
@@ -51,26 +50,16 @@ struct DeleteReceiptSnapshotState {
 // to temp -> Engine::restoreVShardSnapshot -> rebuild NativeIndex).
 struct SnapshotPayload {
     VShardSnapshotManifest manifest;
-    // Deterministic SeriesCatalog::snapshot() bytes. Non-empty payloads use
-    // snapshot format v2 and manifest.catalogHash authenticates these bytes.
-    // Empty means a decoded legacy v1 payload; production install rejects it
-    // because it cannot restore discovery metadata.
+    // Deterministic SeriesCatalog::snapshot() bytes, authenticated by catalogHash.
     std::string catalog;
-    // Present in payload v3 (legacy receipts) or v4 (bounded modern receipts).
-    // Canonically sorted by operationId and limited to state at or below the
-    // Raft snapshot boundary.
+    // Canonically sorted bounded receipts at or below the Raft snapshot boundary.
     uint64_t deleteReceiptsRetiredBeforeMs = 0;
     uint64_t deleteReceiptsRetiredAtIndex = 0;
     std::vector<DeleteOperationReceipt> deleteReceipts;
     std::vector<SnapshotFile> files;  // one per manifest.dataExtents entry, same order
 };
 
-// Cluster-wide committed format required before this payload may be installed
-// as a Raft snapshot. The decoder remains able to read every historical version;
-// this helper gates emission only.
-uint32_t requiredClusterFormatVersion(const SnapshotPayload& payload);
-
-// FNV-trailer-checksummed, bounds-checked codec (the manifest carries its own CRC in
+// Explicitly-versioned v1, FNV-trailer-checksummed, bounds-checked codec.
 // its encode()); decode returns nullopt on ANY malformed/truncated/checksum-mismatch,
 // so a corrupt snapshot can never be installed as valid state.
 std::string encodeSnapshotPayload(const SnapshotPayload& payload);
@@ -78,9 +67,7 @@ std::optional<SnapshotPayload> decodeSnapshotPayload(const std::string& bytes);
 
 // Recovery of a locally-produced snapshot must restore state-machine receipt
 // state without decoding/copying its potentially 128 MiB data objects. Both
-// helpers verify the outer checksum and complete framing. The vector-only form
-// is retained for legacy callers; bounded recovery must use the state form so it
-// does not discard the retired-before floor.
+// helpers verify the outer checksum and complete framing.
 std::optional<std::vector<DeleteOperationReceipt>> decodeSnapshotDeleteReceipts(const std::string& bytes);
 std::optional<DeleteReceiptSnapshotState> decodeSnapshotDeleteReceiptState(const std::string& bytes);
 

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <stdexcept>
 
 namespace timestar::data {
 
@@ -17,25 +18,12 @@ uint64_t fnv1a(const char* p, size_t n) {
 }
 
 // ---------------------------------------------------------------------------
-// Wire/journal formats. BOTH are decodable forever -- the Raft journal stores
-// encoded commands, so a cluster restarting on a newer binary replays entries
-// written by an older one, and a rolling upgrade has peers of both vintages.
-//
-// v1 (original, unversioned): little-endian, every integer fixed width.
-//     u64 schemaVersion | u32 seriesCount | series* | u64 fnv1a(body)
-//     series := u8 type | u32 keyLen | key | u32 count | count*u64 ts |
-//               values | u32 revCount | revCount*u64
-// v2 ("TSW2" magic prefix): identical EXCEPT that a series' timestamps are
-//     delta-encoded -- first as a fixed u64, the rest as zigzag varints of the
-//     delta from the previous one. Timestamps are monotone per series on the
-//     canonical path, so the 8 bytes/point become 1-3 and a float point drops
-//     from 16 wire bytes to ~10.
-//
-// The value columns are byte-identical in both: doubles are stored as raw IEEE
+// v1 is explicitly framed with "TSW1". Timestamps are delta encoded: the first
+// is a fixed u64 and the rest are zigzag varints. Doubles are stored as raw IEEE
 // bits, so NaN payloads, +/-Inf and -0.0 survive exactly, and int64 keeps full
 // 64-bit precision.
-constexpr char kV2Magic[4] = {'T', 'S', 'W', '2'};
-static_assert(sizeof(kV2Magic) == kWriteBatchV2MagicBytes, "the charge arithmetic in the header counts this magic");
+constexpr char kV1Magic[4] = {'T', 'S', 'W', '1'};
+static_assert(sizeof(kV1Magic) == kWriteBatchV1MagicBytes, "the charge arithmetic counts this magic");
 constexpr size_t kTrailerBytes = 8;  // fnv1a checksum
 
 // A varint is at most 10 bytes (64 bits / 7).
@@ -110,9 +98,9 @@ struct Writer {
 //
 // A count is bound-checked against the bytes remaining, which stops an over-READ but
 // NOT an over-ALLOCATION whenever the in-memory element is bigger than its minimum
-// wire footprint: a v2 delta timestamp is >= 1 wire byte but 8 bytes resident (8x),
+// wire footprint: a delta timestamp is >= 1 wire byte but 8 bytes resident (8x),
 // and a string is >= 4 wire bytes but sizeof(std::string) = 32 resident (8x). A
-// checksum-valid 16 MiB v2 frame declaring 16.7M timestamps allocated ~134 MB up
+// checksum-valid 16 MiB frame declaring 16.7M timestamps allocated ~134 MB up
 // front -- the frame's own size is the only thing an inbound RPC bounds, and neither
 // DataPlaneRpc nor RaftRpcTransport sets rpc::resource_limits today.
 //
@@ -120,7 +108,7 @@ struct Writer {
 // geometrically as bytes are ACTUALLY consumed. Peak allocation then tracks what was
 // really decoded (within the vector's own 2x growth slack) instead of what a frame
 // merely claimed, and a frame that lies is rejected having allocated ~32 KB. The
-// residual 8-bytes-resident-per-wire-byte ratio of a genuinely dense v2 frame is
+// residual 8-bytes-resident-per-wire-byte ratio of a genuinely dense frame is
 // inherent to delta encoding and is a matter for an inbound frame-size limit, not for
 // the decoder.
 constexpr size_t kMaxPrereserveElems = 4096;
@@ -239,46 +227,52 @@ struct Reader {
     }
 };
 
-// Exact encoded size of `batch` in v1. Used to reserve once up front: v1 hits it
-// exactly, and v2 is smaller in every realistic case (varint deltas beat 8-byte
-// timestamps unless timestamps jump by >2^49 between adjacent points), so this is
-// a good single-allocation target for both.
-size_t v1EncodedSize(const WriteBatch& batch) {
-    size_t n = 8 + 4 + kTrailerBytes;
-    for (const auto& s : batch.series) {
-        const size_t count = s.timestamps.size();
-        n += 1 + 4 + s.seriesKey.size() + 4 + count * 8 + 4 + s.revisions.size() * 8;
-        switch (s.type) {
-            case TSMValueType::Float:
-            case TSMValueType::Integer:
-                n += count * 8;
-                break;
-            case TSMValueType::Boolean:
-                n += count;
-                break;
-            case TSMValueType::String:
-                for (const std::string& v : std::get<3>(s.values))
-                    n += 4 + v.size();
-                break;
-        }
+size_t varintBytes(uint64_t value) {
+    size_t bytes = 1;
+    while (value >= 0x80) {
+        value >>= 7;
+        ++bytes;
+    }
+    return bytes;
+}
+
+size_t encodedSeriesBytes(const WriteSeries& s) {
+    if (!s.consistent())
+        throw std::invalid_argument("inconsistent WriteSeries");
+    const size_t count = s.timestamps.size();
+    size_t n = 1 + 4 + s.seriesKey.size() + 4 + (count == 0 ? 0 : 8) + 4 + s.revisions.size() * 8;
+    for (size_t i = 1; i < count; ++i) {
+        const auto delta = static_cast<int64_t>(s.timestamps[i] - s.timestamps[i - 1]);
+        const uint64_t zigzag = (static_cast<uint64_t>(delta) << 1) ^ static_cast<uint64_t>(delta >> 63);
+        n += varintBytes(zigzag);
+    }
+    switch (s.type) {
+        case TSMValueType::Float:
+            n += std::get<0>(s.values).size() * 8;
+            break;
+        case TSMValueType::Integer:
+            n += std::get<1>(s.values).size() * 8;
+            break;
+        case TSMValueType::Boolean:
+            n += std::get<2>(s.values).size();
+            break;
+        case TSMValueType::String:
+            for (const std::string& value : std::get<3>(s.values))
+                n += 4 + value.size();
+            break;
     }
     return n;
 }
 
-// One series' body, shared by both versions -- only the timestamp column differs.
-void encodeSeries(Writer& w, const WriteSeries& s, uint32_t version) {
+void encodeSeries(Writer& w, const WriteSeries& s) {
     w.u8(static_cast<uint8_t>(s.type));
     w.str(s.seriesKey);
     const uint32_t count = static_cast<uint32_t>(s.timestamps.size());
     w.u32(count);
-    if (version >= kWriteBatchFormatV2) {
-        if (count > 0) {
-            w.u64(s.timestamps[0]);
-            for (uint32_t i = 1; i < count; ++i)
-                w.zigzag(static_cast<int64_t>(s.timestamps[i] - s.timestamps[i - 1]));
-        }
-    } else {
-        w.u64Column(s.timestamps.data(), count);
+    if (count > 0) {
+        w.u64(s.timestamps[0]);
+        for (uint32_t i = 1; i < count; ++i)
+            w.zigzag(static_cast<int64_t>(s.timestamps[i] - s.timestamps[i - 1]));
     }
     switch (s.type) {
         case TSMValueType::Float: {
@@ -315,23 +309,23 @@ void encodeSeries(Writer& w, const WriteSeries& s, uint32_t version) {
 // The minimum number of WIRE bytes one POINT of this series costs -- timestamp plus
 // value, which is what a declared count must actually be paid for.
 //
-// Bounding the count by the timestamp alone is what let a v2 frame amplify: a delta is
+// Bounding the count by the timestamp alone lets a dense frame amplify: a delta is
 // >= 1 wire byte but 8 bytes resident, so a 16 MiB frame could declare 16.7M
 // timestamps, build 134 MB of them, and only THEN fail on the value column it could
 // never have contained. Every point owes a value too, so charge for it up front: a
-// float point is >= 9 v2 wire bytes, and the same frame can now declare at most ~1.86M
+// float point is >= 9 wire bytes, and the same frame can now declare at most ~1.86M
 // of them. This rejects nothing legitimate -- it is a true lower bound on what the
 // format requires -- and it caps resident growth at ~2x the frame for the densest
-// legal v2 frame (16 resident bytes per >= 9 wire bytes) instead of 8x.
+// legal frame (16 resident bytes per >= 9 wire bytes) instead of 8x.
 //
-// It is EXACTLY TIGHT for all eight (type, version) pairs: a densest-legal frame pays
+// It is exactly tight for every value type: a densest-legal frame pays
 // precisely this many bytes per point (the first timestamp costs 8 rather than 1, which
 // only ever leaves slack). DO NOT RAISE IT. In particular do not add the revision
 // column's 8 bytes: revisions are OPTIONAL (`nrev == 0 || nrev == count`), and a batch
 // on the write path carries none at all -- charging for them would reject every real
 // pre-apply frame. Any addition here must be something EVERY point provably pays for.
-size_t minWireBytesPerPoint(TSMValueType type, uint32_t version) {
-    const size_t ts = version >= kWriteBatchFormatV2 ? 1 : 8;  // varint delta vs fixed u64
+size_t minWireBytesPerPoint(TSMValueType type) {
+    const size_t ts = 1;
     size_t value = 0;
     switch (type) {
         case TSMValueType::Float:
@@ -349,7 +343,7 @@ size_t minWireBytesPerPoint(TSMValueType type, uint32_t version) {
 }
 
 // One series' body. Returns false on any malformed/inconsistent input.
-bool decodeSeries(Reader& r, WriteSeries& s, uint32_t version) {
+bool decodeSeries(Reader& r, WriteSeries& s) {
     uint8_t t = r.u8();
     if (!r.ok || t > static_cast<uint8_t>(TSMValueType::Integer))
         return false;
@@ -360,19 +354,15 @@ bool decodeSeries(Reader& r, WriteSeries& s, uint32_t version) {
     // see minWireBytesPerPoint. The reserve is ALSO capped and grown as bytes are
     // really consumed (kMaxPrereserveElems), so neither the bound nor the reserve
     // trusts a declared count on its own.
-    if (!r.boundCount(count, minWireBytesPerPoint(s.type, version)))
+    if (!r.boundCount(count, minWireBytesPerPoint(s.type)))
         return false;
-    if (version >= kWriteBatchFormatV2) {
-        s.timestamps.reserve(std::min<size_t>(count, kMaxPrereserveElems));
-        uint64_t prev = 0;
-        for (uint32_t k = 0; k < count; ++k) {
-            prev = (k == 0) ? r.u64() : prev + static_cast<uint64_t>(r.zigzag());
-            if (!r.ok)
-                return false;
-            s.timestamps.push_back(prev);
-        }
-    } else {
-        r.u64Column(s.timestamps, count);
+    s.timestamps.reserve(std::min<size_t>(count, kMaxPrereserveElems));
+    uint64_t prev = 0;
+    for (uint32_t k = 0; k < count; ++k) {
+        prev = (k == 0) ? r.u64() : prev + static_cast<uint64_t>(r.zigzag());
+        if (!r.ok)
+            return false;
+        s.timestamps.push_back(prev);
     }
     switch (s.type) {
         case TSMValueType::Float: {
@@ -419,7 +409,7 @@ bool decodeSeries(Reader& r, WriteSeries& s, uint32_t version) {
     return r.ok && s.consistent();
 }
 
-std::optional<WriteBatch> decodeBody(const char* body, size_t bodyLen, uint32_t version) {
+std::optional<WriteBatch> decodeBody(const char* body, size_t bodyLen) {
     Reader r{body, body + bodyLen};
     WriteBatch batch;
     batch.schemaVersion = r.u64();
@@ -433,7 +423,7 @@ std::optional<WriteBatch> decodeBody(const char* body, size_t bodyLen, uint32_t 
         // s.vshard stays kUnroutedVShard: the routing hint is never on the wire, so a
         // decoded series is routed by re-deriving it from seriesKey (see vshardOf).
         WriteSeries s;
-        if (!decodeSeries(r, s, version))
+        if (!decodeSeries(r, s))
             return std::nullopt;
         batch.series.push_back(std::move(s));
     }
@@ -553,15 +543,11 @@ size_t approxResidentBytes(const VShardBatchView& view) {
     return n;
 }
 
-size_t maxEncodedBytes(const WriteBatch& batch) {
-    size_t points = 0;
+size_t encodedWriteBatchBytes(const WriteBatch& batch) {
+    size_t bytes = sizeof(kV1Magic) + 8 + 4 + kTrailerBytes;
     for (const auto& s : batch.series)
-        points += s.timestamps.size();
-    // v1 exactly (v1EncodedSize is that, and is what both encoders reserve), plus the
-    // only two ways v2 can come out LARGER: its magic, and a 10-byte varint delta where
-    // v1 pays a flat 8. See the header for why a version-independent bound is required
-    // rather than "whatever version I am holding".
-    return v1EncodedSize(batch) + sizeof(kV2Magic) + 2 * points;
+        bytes += encodedSeriesBytes(s);
+    return bytes;
 }
 
 std::string encodeWriteBatch(const WriteBatch& batch) {
@@ -569,41 +555,39 @@ std::string encodeWriteBatch(const WriteBatch& batch) {
 }
 
 std::string encodeWriteBatch(const WriteBatch& batch, uint32_t version) {
-    // Emit the highest format we know that the caller says the reader accepts. A
-    // caller never gets a format newer than it asked for, so an unknown (future)
-    // version degrades to the newest we can actually write rather than mis-framing.
-    const uint32_t v = version >= kWriteBatchFormatV2 ? kWriteBatchFormatV2 : kWriteBatchFormatV1;
+    if (version != kWriteBatchFormatV1)
+        throw std::invalid_argument("unsupported WriteBatch format version");
     Writer w;
-    w.out.reserve(v1EncodedSize(batch));
-    if (v >= kWriteBatchFormatV2)
-        w.out.append(kV2Magic, sizeof(kV2Magic));
+    w.out.reserve(encodedWriteBatchBytes(batch));
+    w.out.append(kV1Magic, sizeof(kV1Magic));
     w.u64(batch.schemaVersion);
     w.u32(static_cast<uint32_t>(batch.series.size()));
     for (const auto& s : batch.series)
-        encodeSeries(w, s, v);
+        encodeSeries(w, s);
     w.u64(fnv1a(w.out.data(), w.out.size()));
     return std::move(w.out);
 }
 
 std::string encodeWriteBatch(const VShardBatchView& view, uint32_t version) {
-    const uint32_t v = version >= kWriteBatchFormatV2 ? kWriteBatchFormatV2 : kWriteBatchFormatV1;
-    size_t nSeries = 0, reserve = 8 + 4 + kTrailerBytes;
+    if (version != kWriteBatchFormatV1)
+        throw std::invalid_argument("unsupported WriteBatch format version");
+    size_t nSeries = 0, reserve = sizeof(kV1Magic) + 8 + 4 + kTrailerBytes;
     uint64_t schemaVersion = 0;
     for (const auto* g : view) {
         nSeries += g->second.series.size();
         // Identical across the groups of one batch (splitByVShard copies it into each).
         schemaVersion = g->second.schemaVersion;
-        reserve += v1EncodedSize(g->second) - (8 + 4 + kTrailerBytes);
+        for (const auto& series : g->second.series)
+            reserve += encodedSeriesBytes(series);
     }
     Writer w;
     w.out.reserve(reserve);
-    if (v >= kWriteBatchFormatV2)
-        w.out.append(kV2Magic, sizeof(kV2Magic));
+    w.out.append(kV1Magic, sizeof(kV1Magic));
     w.u64(schemaVersion);
     w.u32(static_cast<uint32_t>(nSeries));
     for (const auto* g : view)
         for (const auto& s : g->second.series)
-            encodeSeries(w, s, v);
+            encodeSeries(w, s);
     w.u64(fnv1a(w.out.data(), w.out.size()));
     return std::move(w.out);
 }
@@ -612,16 +596,9 @@ std::optional<WriteBatch> decodeWriteBatch(const std::string& bytes) {
     size_t bodyLen = 0;
     if (!checkTrailer(bytes, bodyLen))
         return std::nullopt;
-    // Version sniff. A v2 frame is self-identifying; anything else is v1 (which has
-    // no version field at all -- it starts straight in on schemaVersion). If a v1
-    // frame's schemaVersion low bytes ever happened to spell the magic, the v2 decode
-    // fails and we still fall back to v1, so the sniff can only ever be an
-    // optimisation, never a way to lose a decodable frame.
-    if (bodyLen >= sizeof(kV2Magic) && std::memcmp(bytes.data(), kV2Magic, sizeof(kV2Magic)) == 0) {
-        if (auto v2 = decodeBody(bytes.data() + sizeof(kV2Magic), bodyLen - sizeof(kV2Magic), kWriteBatchFormatV2))
-            return v2;
-    }
-    return decodeBody(bytes.data(), bodyLen, kWriteBatchFormatV1);
+    if (bodyLen < sizeof(kV1Magic) || std::memcmp(bytes.data(), kV1Magic, sizeof(kV1Magic)) != 0)
+        return std::nullopt;
+    return decodeBody(bytes.data() + sizeof(kV1Magic), bodyLen - sizeof(kV1Magic));
 }
 
 }  // namespace timestar::data

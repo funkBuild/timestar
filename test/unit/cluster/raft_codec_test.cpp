@@ -122,10 +122,6 @@ TEST(RaftCodecTest, TimeoutNowRoundTrip) {
     EXPECT_EQ(got->leaderId, 1u);
 }
 
-// ---------------------------------------------------------------------------
-// The leader-transfer vote (ADR 0005 / debt D-9). It travels under its OWN type byte,
-// and these three tests are mechanism (b)'s whole claim, asserted rather than assumed.
-
 TEST(RaftCodecTest, TransferVoteRoundTripsAndKeepsItsFlag) {
     RequestVote rv;
     rv.term = 5;
@@ -143,75 +139,35 @@ TEST(RaftCodecTest, TransferVoteRoundTripsAndKeepsItsFlag) {
     EXPECT_EQ(got->lastLogIndex, 9u);
     EXPECT_EQ(got->lastLogTerm, 4u);
 
-    // An ORDINARY vote is unchanged on the wire -- same tag, same bytes as before the
-    // flag existed -- so nothing about the old format moved.
     RequestVote plain = rv;
     plain.campaignTransfer = false;
-    const std::string plainBytes = encodeEnvelope(wrap(7, 3, 2, plain));
-    const std::string xferBytes = encodeEnvelope(wrap(7, 3, 2, rv));
-    ASSERT_EQ(plainBytes.size(), xferBytes.size());  // same body, different tag only
-    const size_t tagOff = 2 + 8 + 8;                 // groupId + to + from
-    EXPECT_NE(plainBytes[tagOff], xferBytes[tagOff]);
-    EXPECT_EQ(plainBytes.substr(tagOff + 1), xferBytes.substr(tagOff + 1));
     const Envelope plainRound = roundTrip(wrap(7, 3, 2, plain));
     const auto* plainBack = std::get_if<RequestVote>(&plainRound.message.payload);
     ASSERT_NE(plainBack, nullptr);
     EXPECT_FALSE(plainBack->campaignTransfer);
 }
 
-// THE MIXED-VERSION CLAIM. A decoder that predates the flag knows tags 1-7 and answers
-// `default: return nullopt` for anything else. Model it exactly (the bodies of tags 1-7
-// are untouched, so deferring to the real decoder for them is faithful) and assert that
-// a transfer vote is DROPPED WHOLE rather than misparsed into a plausible-looking vote
-// request with a garbage term -- which is what adding a byte inside kRequestVote would
-// have produced, since the envelope has no version field.
-TEST(RaftCodecTest, AnOldDecoderDropsTheTransferVoteAndStillReadsAnOrdinaryOne) {
-    auto decodeAsOldBinary = [](const std::string& bytes) -> std::optional<Envelope> {
-        if (bytes.size() < 19)
-            return std::nullopt;
-        const uint8_t tag = static_cast<uint8_t>(bytes[2 + 8 + 8]);
-        if (tag == 0 || tag > 7)
-            return std::nullopt;  // the pre-flag switch had no case for it
-        return decodeEnvelope(bytes);
-    };
-
-    RequestVote rv;
-    rv.term = 5;
-    rv.candidateId = 2;
-    rv.lastLogIndex = 9;
-    rv.lastLogTerm = 4;
-    rv.campaignTransfer = true;
-    EXPECT_FALSE(decodeAsOldBinary(encodeEnvelope(wrap(7, 3, 2, rv))).has_value())
-        << "an old voter must DROP the transfer vote, not decode a garbled one";
-
-    // The same node's ordinary votes still reach that old peer untouched, so only the
-    // transfer degrades -- and it degrades to the pre-bypass path (the outgoing leader
-    // abandons the transfer after one election timeout and the group elects normally),
-    // never to a wedge and never to a misparse.
-    rv.campaignTransfer = false;
-    auto old = decodeAsOldBinary(encodeEnvelope(wrap(7, 3, 2, rv)));
-    ASSERT_TRUE(old.has_value());
-    const auto* got = std::get_if<RequestVote>(&old->message.payload);
-    ASSERT_NE(got, nullptr);
-    EXPECT_EQ(got->term, 5u);
-    EXPECT_EQ(got->lastLogIndex, 9u);
-}
-
-// A peer that sets BOTH bits cannot use the transfer tag to bypass a lease on a PREVOTE:
-// the tag decides, and the tag means "real vote".
-TEST(RaftCodecTest, TheTransferTagIsNeverAPreVoteEvenIfTheByteSaysSo) {
+TEST(RaftCodecTest, TransferPreVoteCombinationIsRejected) {
     RequestVote rv;
     rv.preVote = true;
     rv.term = 5;
     rv.campaignTransfer = true;
-    std::string bytes = encodeEnvelope(wrap(7, 3, 2, rv));
-    bytes[2 + 8 + 8 + 1] = 1;  // force the preVote byte on, whatever the encoder wrote
-    auto decoded = decodeEnvelope(bytes);
-    ASSERT_TRUE(decoded.has_value());
-    const auto* got = std::get_if<RequestVote>(&decoded->message.payload);
-    ASSERT_NE(got, nullptr);
-    EXPECT_TRUE(got->campaignTransfer);
-    EXPECT_FALSE(got->preVote);
+    EXPECT_FALSE(decodeEnvelope(encodeEnvelope(wrap(7, 3, 2, rv))).has_value());
+}
+
+TEST(RaftCodecTest, RequiresExplicitV1Marker) {
+    std::string bytes = encodeEnvelope(wrap(7, 2, 1, TimeoutNow{7, 1}));
+    ASSERT_GE(bytes.size(), kRaftEnvelopeV1MagicBytes);
+    EXPECT_EQ(bytes.substr(0, kRaftEnvelopeV1MagicBytes), "TSR1");
+    bytes[3] = '2';
+    EXPECT_FALSE(decodeEnvelope(bytes).has_value());
+}
+
+TEST(RaftCodecTest, RejectsNonCanonicalBooleanBytes) {
+    std::string bytes = encodeEnvelope(wrap(7, 2, 1, RequestVote{true, 5, 1, 9, 4}));
+    constexpr size_t headerBytes = kRaftEnvelopeV1MagicBytes + 2 + 8 + 8;
+    bytes[headerBytes + 1] = 2;  // preVote follows the payload tag
+    EXPECT_FALSE(decodeEnvelope(bytes).has_value());
 }
 
 TEST(RaftCodecTest, TruncatedInputIsRejected) {
@@ -226,12 +182,8 @@ TEST(RaftCodecTest, TruncatedInputIsRejected) {
 
 TEST(RaftCodecTest, UnknownTagAndBogusEntryCountRejected) {
     // Unknown payload tag.
-    std::string s;
-    s.push_back(1);  // group lo
-    s.push_back(0);  // group hi
-    for (int i = 0; i < 16; ++i)
-        s.push_back(0);  // to + from
-    s.push_back(99);     // unknown tag
+    std::string s = encodeEnvelope(wrap(1, 1, 2, TimeoutNow{1, 2}));
+    s[kRaftEnvelopeV1MagicBytes + 2 + 8 + 8] = 99;
     EXPECT_FALSE(decodeEnvelope(s).has_value());
 
     // AppendEntries claiming a huge entry count with no bytes behind it.

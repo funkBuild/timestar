@@ -123,55 +123,9 @@ public:
 // So `kMaxProposalBytes` is what the chain is sized for: a log entry is ONE VShard's
 // slice of ONE write batch.
 //
-// WHAT D-31 CHANGED: 28 MiB -> 14 MiB, i.e. the proposal bound is now DERIVED from the
-// largest slice the data plane will actually carry instead of being a round number
-// chosen above it. D-5 left the number at 28 MiB and filed the rest, on the reading that
-// closing it required SPLITTING an oversized slice across several proposals (a write-path
-// change: the slice stops being one atomic entry). That is still the only way to reach
-// "one chunk plus headroom", and it is still not done -- but it was never needed to get
-// most of the way there, because a bound already exists a layer down:
-//
-//   * a slice that arrives from a PEER rode `kMaxOutboundFrameBytes` (~10.67 MiB, the
-//     peer's data-plane inbound admission divided by its bloat factor), and a single
-//     slice is a subset of that frame, so it can never exceed it;
-//   * a slice proposed LOCALLY (coordinator and leader on the same node) has no frame to
-//     ride, which is why the propose-side refusal exists at all;
-//   * and the two are now measured in the SAME unit -- `firstUnproposableSlice`
-//     (data/replicated_command.hpp) refuses, client-side and terminally, any slice whose
-//     encoded COMMAND could exceed this bound, so the remote path fails as a local 413
-//     naming the VShard instead of an opaque remote error retried against every leader.
-//
-// 14 MiB IS THAT FRAME BOUND EXPRESSED IN THE UNIT THE REFUSAL ACTUALLY USES, and getting
-// that wrong is what review F1 caught in the first version of this work. The refusal does
-// not compare a slice's BYTES against this number, it compares its CHARGE -- what
-// `maxEncodedBytes` says the slice could encode to under the worst format version, because
-// the journal gate's version is independent of the version the frame arrived in. A charge
-// is up to 11/9 of a v1 encoding (see kChargeOverV1Num in data/write_record.hpp: v1's
-// cheapest point is a 9-byte boolean and the charge adds 2 per point), so the number this
-// chain must clear is not 10.67 MB but:
-//
-//     chargeCeilingForV1Bytes(kMaxOutboundFrameBytes) + kWriteCommandFramingBytes
-//       = 10.67 MB * 11/9 + 4 + 13  ~=  13.67 MB
-//
-// which 12 MiB did NOT clear. Measured on real batches: a maximal FLOAT frame charges
-// 12,582,911 bytes against a 12,582,912-byte bound -- one byte of margin, not the ~1.3 MiB
-// this comment used to claim -- and a maximal BOOLEAN frame charges ~13.67 MB and was
-// REFUSED, i.e. a forwarded ~1.24M-point boolean write that proposed cleanly at 28 MiB
-// drew a terminal 413. 14 MiB clears the boolean case with ~1 MB to spare, and the
-// relationship is asserted IN THE CHARGE UNIT in `cluster_data_plane.hpp` (the D-20
-// pattern), because an assertion on raw bytes cannot fire on the mismatch it exists to
-// catch.
-//
-// WHAT THIS STILL NARROWS, stated with numbers rather than "the largest legitimate payload
-// is untouched" (which was wrong). The bound the assertion guarantees is over a frame whose
-// OWN encoding is v1 -- the pessimal one. A v2 frame carries up to 8x more timestamps per
-// byte, so a slice that fits the wire bound in v2 can re-encode far above this: a boolean
-// slice whose v1 entry is 12.7-28 MB rides a v2 frame of 2.3-5.1 MB and USED to propose at
-// the 28 MiB bound. It now gets a 413. That shape is a single VShard of 4096 holding >1.4M
-// points from one request -- the adversarial concentration this bound exists to refuse,
-// not a batch shape a client produces by spreading writes -- and it is refused LOCALLY and
-// terminally, naming the VShard, rather than becoming an opaque remote error. It is a real
-// narrowing all the same, and the register row says so.
+// A data-plane frame and its Raft entry use the same v1 WriteBatch bytes. A VShard slice
+// is no larger than the containing frame, and the proposal-side check adds only the
+// command wrapper. The cross-layer assertion is in cluster_data_plane.hpp.
 //
 // RESIDUAL (D-31): 14 MiB is still 3.5x a chunk. Closing the rest needs the split.
 //

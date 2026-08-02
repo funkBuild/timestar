@@ -168,8 +168,7 @@ seastar::future<> testBatchedDelivery(bool batchingEnabled) {
     sender->setBatchingEnabled(batchingEnabled);  // OFF by default since Phase 5; see the header
     sender->addPeer(2, loopback(rxPort));
 
-    // First send opens the connection and fires the capability probe; batching only
-    // starts once the peer has ANSWERED, so the probe has to land before the burst.
+    // First send opens the connection before the burst.
     Envelope warm;
     warm.groupId = 0;
     warm.message = Message{.to = 2, .from = 1, .payload = TimeoutNow{1, 1}};
@@ -270,8 +269,7 @@ seastar::future<> testBatchDispatchIsPerGroupOrderedAndCrossGroupConcurrent() {
     sender->setBatchingEnabled(true);
     sender->addPeer(2, loopback(kRxPort));
 
-    // Open the connection and let the capability probe land: batching only engages once
-    // the peer has answered it.
+    // Open the connection before the measured burst.
     Envelope warm;
     warm.groupId = 0;
     warm.message = Message{.to = 2, .from = 1, .payload = TimeoutNow{1, 1}};
@@ -322,71 +320,6 @@ seastar::future<> testBatchDispatchIsPerGroupOrderedAndCrossGroupConcurrent() {
     co_await receiver->stop();
 }
 
-// A peer that speaks only the ORIGINAL protocol: one handler, kDeliverVerb, and nothing
-// else. This is the mixed-version case the capability probe exists for. seastar answers an
-// unknown verb with an unknown-verb reply that a no_wait sender IGNORES, so a sender that
-// batched optimistically would lose every message in the frame SILENTLY -- the peer's
-// groups would simply never hear from their leader.
-struct LegacySerializer {};
-template <typename Output>
-void write(LegacySerializer, Output& out, const seastar::sstring& v) {
-    const uint32_t n = static_cast<uint32_t>(v.size());
-    out.write(reinterpret_cast<const char*>(&n), sizeof(n));
-    out.write(v.data(), v.size());
-}
-template <typename Input>
-seastar::sstring read(LegacySerializer, Input& in, seastar::rpc::type<seastar::sstring>) {
-    uint32_t n = 0;
-    in.read(reinterpret_cast<char*>(&n), sizeof(n));
-    seastar::sstring s = seastar::uninitialized_string(n);
-    in.read(s.data(), n);
-    return s;
-}
-
-seastar::future<> testLegacyPeerGetsNoBatchFrames() {
-    constexpr uint16_t kPort = 39164;
-    seastar::rpc::protocol<LegacySerializer> proto{LegacySerializer{}};
-    size_t deliveredFrames = 0;
-    proto.register_handler(1, [&](seastar::sstring data) {
-        (void)data;
-        ++deliveredFrames;
-        return seastar::rpc::no_wait;
-    });
-    seastar::listen_options lo;
-    lo.reuse_address = true;
-    lo.set_fixed_cpu(seastar::this_shard_id());
-    auto server =
-        std::make_unique<seastar::rpc::protocol<LegacySerializer>::server>(proto, seastar::listen(loopback(kPort), lo));
-
-    auto sender = std::make_unique<RaftRpcTransport>();
-    co_await sender->start(loopback(39165), [](Envelope) { return seastar::make_ready_future<>(); });
-    // Batching is OFF by default since Phase 5 (it cost more CPU than the frames it saved
-    // -- see the transport header). Turn it ON here on purpose: the point of this test is
-    // that even a sender WILLING to batch must not batch to a peer that cannot decode it.
-    sender->setBatchingEnabled(true);
-    sender->addPeer(2, loopback(kPort));
-
-    constexpr int kGroups = 32;
-    for (int round = 0; round < 3; ++round) {
-        for (int g = 1; g <= kGroups; ++g) {
-            Envelope env;
-            env.groupId = static_cast<uint16_t>(g);
-            env.message = Message{.to = 2, .from = 1, .payload = TimeoutNow{1, 1}};
-            co_await sender->send(env);
-        }
-        co_await seastar::sleep(50ms);  // let the probe fail and the flushes drain
-    }
-
-    bool ok = co_await waitFor([&] { return deliveredFrames >= 3 * kGroups; });
-    EXPECT_TRUE(ok) << "legacy peer received " << deliveredFrames << " of " << (3 * kGroups)
-                    << " -- a batch frame was sent to a peer that cannot decode it, and seastar dropped it silently";
-    // One frame per envelope: the probe failed (unknown verb), so batching stayed off.
-    EXPECT_EQ(sender->stats().framesSent, sender->stats().envelopesSent);
-
-    co_await sender->stop();
-    co_await server->stop();
-}
-
 }  // namespace
 
 TEST(RaftRpcTransportTest, LoopbackDelivery) {
@@ -403,10 +336,6 @@ TEST(RaftRpcTransportTest, BatchingOffIsOneFramePerEnvelope) {
 
 TEST(RaftRpcTransportTest, BatchDispatchKeepsGroupOrderAndRunsGroupsConcurrently) {
     testBatchDispatchIsPerGroupOrderedAndCrossGroupConcurrent().get();
-}
-
-TEST(RaftRpcTransportTest, LegacyPeerNeverReceivesABatchFrame) {
-    testLegacyPeerGetsNoBatchFrames().get();
 }
 
 TEST(RaftRpcTransportTest, ThreeNodeClusterElectsAndReplicatesOverRpc) {

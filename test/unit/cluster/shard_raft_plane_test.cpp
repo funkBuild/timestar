@@ -202,7 +202,7 @@ TEST_F(ShardRaftPlaneTest, ProposeOverSocketSplitsAcrossOwningShardsAndFailsClea
                 .get();
             shards
                 .invoke_on_all([addr](cluster::ShardRaftPlane& p) {
-                    return p.startDataPlane(addr, std::nullopt, timestar::features::VersionRange{});
+                    return p.startDataPlane(addr, std::nullopt);
                 })
                 .get();
 
@@ -235,7 +235,7 @@ TEST_F(ShardRaftPlaneTest, ProposeOverSocketSplitsAcrossOwningShardsAndFailsClea
                 seastar::sleep(std::chrono::milliseconds(20)).get();
             ASSERT_TRUE(isLeader(vs1) && isLeader(vs2)) << "single-voter groups did not elect";
 
-            // (a) A PEER's proposeWrite over the real socket: it lands on whichever shard the
+            // (a) A peer proposal over the real socket lands on whichever shard the
             // listener gives it, must be split across the two owning shards, committed on
             // both, and applied into the real Engine.
             data::DataPlaneRpc peer;
@@ -246,8 +246,9 @@ TEST_F(ShardRaftPlaneTest, ProposeOverSocketSplitsAcrossOwningShardsAndFailsClea
             // series at EQUAL timestamps, so same-timestamp points would fold into one and
             // hide a lost slice.
             batch.series = {floatSeries(k1, 11.0, BASE), floatSeries(k2, 22.0, BASE + 1'000'000'000ULL)};
-            EXPECT_TRUE(peer.proposeWrite(self, std::move(batch)).get())
-                << "an inbound proposeWrite must commit on every owning shard";
+            auto groups = data::splitByVShard(std::move(batch));
+            EXPECT_TRUE(peer.proposeWriteHinted(self, data::viewOf(groups), std::nullopt).get().committed)
+                << "an inbound proposal must commit on every owning shard";
 
             http::HttpQueryHandler h(&*eng);
             QueryRequest q;
@@ -280,7 +281,8 @@ TEST_F(ShardRaftPlaneTest, ProposeOverSocketSplitsAcrossOwningShardsAndFailsClea
                     c->startClientOnly().get();
                     data::WriteBatch b;
                     b.series = {floatSeries(k1, 1.0 + static_cast<double>(i), BASE + 10'000'000'000ULL)};
-                    EXPECT_TRUE(c->proposeWrite(self, std::move(b)).get());
+                    auto oneGroup = data::splitByVShard(std::move(b));
+                    EXPECT_TRUE(c->proposeWriteHinted(self, data::viewOf(oneGroup), std::nullopt).get().committed);
                     peers.push_back(std::move(c));
                 }
                 size_t served = 0, shardsThatServed = 0;
@@ -479,9 +481,9 @@ TEST_F(ShardRaftPlaneTest, PeerIngressIsChargedAndRejectsWithoutWedgingOrDoubleR
             EXPECT_EQ(ingress.inFlight(), 0u) << "the charge must be released on the failure path too";
         }
 
-        // The bool (legacy) verb has no way to say "overloaded", so it THROWS -- which the
-        // coordinator classifies as the retryable Transport class. Still retryable, still
-        // not election-shaped; the hinted path above is the one production uses.
+        // The coarse bool convenience path has no way to say "overloaded", so it THROWS.
+        // The coordinator classifies that as retryable Transport: still retryable and not
+        // election-shaped. Production uses the detailed path above.
         {
             cluster::WriteAdmissionGuard full(lim, cluster::AdmissionClass::PeerIngress);
             data::WriteBatch copy;

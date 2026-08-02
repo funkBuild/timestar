@@ -220,9 +220,8 @@ seastar::future<> ReplicatedBatchWriteRouter::write(VShardBatches groups) {
                 // reachable by. There are two silences and they mean different things:
                 //
                 //   * The target named NOTHING AT ALL. It reported one uniform answer
-                //     about the whole dispatch and gave no reason, and the only sink that
-                //     can (the legacy bool shim over a pre-v3 peer) means precisely "I did
-                //     not lead these". Treated as a plain NotLeader, so the retry
+                //     about the whole dispatch and gave no reason. Treat that as plain
+                //     NotLeader, so the retry
                 //     re-resolves and goes elsewhere at once. Unchanged, and it must stay
                 //     INSIDE the "named nothing" case -- applying it unconditionally
                 //     MANUFACTURED the label, so a 503 said "not-leader" whatever the
@@ -241,8 +240,8 @@ seastar::future<> ReplicatedBatchWriteRouter::write(VShardBatches groups) {
                 //
                 // The test is `rejects.empty()` and not "explained none of ours" on
                 // purpose: a target whose rejects name ONLY VShards we never sent it (the
-                // loop above ignores those entirely) is not the silent pre-v3 shim -- it
-                // is a peer talking about something else -- so it takes the ambiguous
+                // loop above ignores those entirely) is a peer talking about something
+                // else, so it takes the ambiguous
                 // arm rather than the election-shaped one.
                 std::vector<uint16_t> unexplained;
                 for (const auto* g : *pendingViews[i])

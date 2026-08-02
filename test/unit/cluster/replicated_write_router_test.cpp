@@ -46,10 +46,18 @@ public:
     seastar::future<NodeQueryPartial> queryNode(NodeId, NodeQueryRequest) override {
         return seastar::make_exception_future<NodeQueryPartial>(std::runtime_error("unused"));
     }
-    seastar::future<bool> proposeWrite(NodeId to, WriteBatch batch) override {
-        for (auto& s : batch.series)
-            keys[to].push_back(s.seriesKey);
-        return seastar::make_ready_future<bool>(committed);
+    seastar::future<ProposeOutcome> proposeWriteHinted(NodeId to, VShardBatchView view, OptDeadline) override {
+        ProposeOutcome out;
+        for (const auto* group : view) {
+            for (const auto& s : group->second.series)
+                keys[to].push_back(s.seriesKey);
+            if (committed)
+                out.committedVShards.push_back(group->first);
+            else
+                out.rejects.push_back({group->first, timestar::raft::kNoNode, WriteFailure::NotLeader});
+        }
+        out.committed = committed;
+        return seastar::make_ready_future<ProposeOutcome>(std::move(out));
     }
 };
 
@@ -1058,10 +1066,9 @@ seastar::future<> testUnexplainedUncommittedSlicesDoNotBuyTheElectionWindow() {
         << "the batch spent the EXTENDED attempt budget on an unexplained failure";
 }
 
-// The other arm, unchanged and deliberately different: a target that names NOTHING AT ALL
-// gave one uniform answer about the whole dispatch, and the only sink that can (the bool
-// shim over a pre-v3 peer) means precisely "I did not lead these". That stays NotLeader,
-// election-shaped, so a group mid-election is still waited out.
+// The other arm is deliberately different: a current sink that names nothing gives one
+// uniform answer about the whole dispatch. That stays NotLeader and election-shaped, so
+// a group mid-election is still waited out.
 class SilentSink : public ProposeSink {
 public:
     unsigned attempts = 0;

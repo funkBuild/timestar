@@ -56,11 +56,9 @@ using timestar::raft::NodeId;
 //   operations OVERLAP in real time and either order is correct. An acked-then-reverted
 //   sequence is impossible, because a slice that returned success is never retried.
 //
-//   ReplicatedCommandRouter also uses this taxonomy for deletes. Legacy commands without
-//   an operation ID still refuse the two ambiguous classes below: re-applying a physical
-//   delete after a concurrent write would erase data ordered after the first attempt.
-//   Modern per-VShard batches carry snapshot-durable operation receipts, so their exact
-//   retries are replicated no-ops and may use the ordinary retry policy safely.
+//   ReplicatedCommandRouter also uses this taxonomy for deletes. Per-VShard delete
+//   batches carry snapshot-durable operation receipts, so exact retries are replicated
+//   no-ops and may use the ordinary retry policy safely.
 //
 // `Unassigned` and `Fatal` are terminal: no amount of retrying fixes an unowned VShard
 // or a journal I/O error, and hiding either behind a retry budget only delays the
@@ -285,14 +283,6 @@ public:
     explicit RetryableWriteError(const std::string& what) : std::runtime_error(what) {}
 };
 
-// A non-idempotent mutation may already have committed, so repeating it could change
-// the result relative to concurrent operations. The HTTP layer reports an UNKNOWN
-// outcome without Retry-After; callers must verify state rather than blindly retry.
-class AmbiguousMutationError : public std::runtime_error {
-public:
-    explicit AmbiguousMutationError(const std::string& what) : std::runtime_error(what) {}
-};
-
 // A slice was routed to a shard whose data plane is tearing down (shutdown in progress).
 // The write never reached Raft, so nothing was committed and it is safe to re-route.
 //
@@ -337,15 +327,6 @@ public:
     explicit DeletePlanConflictError(const std::string& what) : std::runtime_error(what) {}
 };
 
-// A command/snapshot feature is newer than either the cluster-wide committed
-// format or the destination peer's negotiated protocol. This is a terminal,
-// pre-emission refusal: retrying another leader cannot make mixed-version bytes
-// safe. The HTTP layer reports an explicit upgrade/activation conflict.
-class ClusterFormatUnsupportedError : public std::runtime_error {
-public:
-    explicit ClusterFormatUnsupportedError(const std::string& what) : std::runtime_error(what) {}
-};
-
 // ---------------------------------------------------------------------------
 // Classify an exception raised by a LOCAL propose (same process, so the cause is
 // knowable). Anything not explicitly recognised is Fatal: a retry budget must never be
@@ -375,8 +356,6 @@ inline WriteFailure classifyLocalWriteFailure(const std::exception_ptr& e) {
         return WriteFailure::Fatal;
     } catch (const DeleteReceiptExpiredError&) {
         return WriteFailure::Expired;
-    } catch (const ClusterFormatUnsupportedError&) {
-        return WriteFailure::Fatal;
     } catch (const UnassignedVShardError&) {
         return WriteFailure::Unassigned;
     } catch (...) {
@@ -398,8 +377,6 @@ inline WriteFailure classifyRemoteWriteFailure(const std::exception_ptr& e) {
         return WriteFailure::Fatal;  // our own frame is too big; a different peer will refuse it too
     } catch (const UnassignedVShardError&) {
         return WriteFailure::Unassigned;
-    } catch (const ClusterFormatUnsupportedError&) {
-        return WriteFailure::Fatal;  // client-side negotiation refusal; no frame was sent
     } catch (...) {
         return WriteFailure::Transport;
     }

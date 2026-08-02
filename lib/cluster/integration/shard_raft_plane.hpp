@@ -5,12 +5,10 @@
 #include "../../utils/logger.hpp"          // timestar::http_log
 #include "../control/group0_controller.hpp"
 #include "../data/dataplane_rpc.hpp"
-#include "../data/journal_format.hpp"
 #include "../data/leader_filtered_node_store.hpp"
 #include "../data/leadership_balance.hpp"  // the balancer's arithmetic, pure (debt D-22)
 #include "../data/node_store.hpp"
 #include "../data/vshard_directory.hpp"  // VShardDirectory::groupOf (debt D-11)
-#include "../features/feature_gate.hpp"  // VersionRange
 #include "../raft/raft_codec.hpp"        // decodeEnvelope
 #include "../raft/raft_driver.hpp"       // RaftTransport
 #include "../raft/raft_rpc_transport.hpp"
@@ -130,8 +128,7 @@ struct DataPlaneTls {
 class ShardRaftPlane : public data::ProposeSink,
                        public data::ReadIndexSink,
                        public data::FrozenDeletePlanSink,
-                       public data::ControlJoinSink,
-                       public data::LegacyReceiptInventorySink {
+                       public data::ControlJoinSink {
 public:
     seastar::future<> init(seastar::sharded<Engine>* engines, seastar::sharded<ShardRaftPlane>* peers,
                            const data::VShardDirectory* dir, data::NodeId self, std::string journalRoot,
@@ -261,20 +258,13 @@ public:
     // Every peer-facing SETTING must be applied here, not just to ClusterDataPlane's
     // instance: in replicated mode these are the node's only data-plane servers and the
     // write path's only peer clients.
-    seastar::future<> startDataPlane(seastar::socket_address local, const std::optional<DataPlaneTls>& tls,
-                                     features::VersionRange localVersion,
-                                     const std::optional<control::NodeCapabilityAdvertisement>& capability =
-                                         std::nullopt) {
+    seastar::future<> startDataPlane(seastar::socket_address local, const std::optional<DataPlaneTls>& tls) {
         if (tls)
             rpc_->setTlsCredentials(tls->certPem, tls->keyPem, tls->caPem, tls->expectedPeerName);
-        rpc_->setLocalVersion(localVersion);
-        if (capability)
-            rpc_->setLocalNodeCapability(capability->clusterUuid, capability->record);
         rpc_->setProposeSink(*this);
         rpc_->setReadIndexSink(*this);
         rpc_->setFrozenDeletePlanSink(*this);
         rpc_->setControlJoinSink(*this);
-        rpc_->setLegacyReceiptInventorySink(*this);
         return rpc_->start(local, *queryStore_, /*perShardListener=*/true);
     }
 
@@ -351,39 +341,6 @@ public:
             active && caughtUpAfterActivation ? control::ControlJoinStatus::Active
                                                : control::ControlJoinStatus::Joining,
             currentLeader()};
-    }
-
-    std::vector<control::LegacyReceiptInventoryEntry> localLegacyReceiptInventory() {
-        std::vector<control::LegacyReceiptInventoryEntry> entries;
-        if (!plane_)
-            return entries;
-        auto& host = plane_->host();
-        entries.reserve(host.vshardCount());
-        for (uint16_t vshard = 0; vshard < timestar::VIRTUAL_SHARD_COUNT; ++vshard) {
-            auto counts = host.deleteReceiptCounts(vshard);
-            if (counts)
-                entries.push_back({vshard, counts->legacy, counts->total, counts->hasUnappliedEntries});
-        }
-        return entries;
-    }
-
-    seastar::future<std::vector<control::LegacyReceiptInventoryEntry>> handleLegacyReceiptInventory() override {
-        if (seastar::this_shard_id() != 0) {
-            auto* peers = peers_;
-            co_return co_await peers->invoke_on(
-                0, [](ShardRaftPlane& plane) { return plane.handleLegacyReceiptInventory(); });
-        }
-        std::vector<control::LegacyReceiptInventoryEntry> entries;
-        for (unsigned shard = 0; shard < seastar::smp::count; ++shard) {
-            auto local = co_await peers_->invoke_on(
-                shard, [](ShardRaftPlane& plane) { return plane.localLegacyReceiptInventory(); });
-            entries.insert(entries.end(), std::make_move_iterator(local.begin()),
-                           std::make_move_iterator(local.end()));
-        }
-        std::sort(entries.begin(), entries.end(), [](const auto& a, const auto& b) {
-            return a.vshard < b.vshard;
-        });
-        co_return entries;
     }
 
     // ProposeSink: a peer forwarded a batch because this NODE leads those VShards. The
@@ -501,15 +458,13 @@ public:
                                 std::string expectedClusterUuid = {},
                                 std::optional<control::NodeRecord> localRecord = std::nullopt,
                                 std::optional<control::ControlMap> expectedInitialServingMap = std::nullopt,
-                                control::Group0StateMachine::ServingMapObserver servingMapObserver = {},
-                                control::Group0StateMachine::ActiveFormatObserver activeFormatObserver = {}) {
+                                control::Group0StateMachine::ServingMapObserver servingMapObserver = {}) {
         if (seastar::this_shard_id() != 0)
             throw std::logic_error("group 0 may only be hosted on reactor shard 0");
         if (!group0_)
             throw std::logic_error("group 0 host was not constructed");
         return group0_->start(std::move(voters), opts, std::move(expectedClusterUuid), std::move(localRecord),
-                              std::move(expectedInitialServingMap), std::move(servingMapObserver),
-                              std::move(activeFormatObserver));
+                              std::move(expectedInitialServingMap), std::move(servingMapObserver));
     }
 
     Group0Host* group0() { return group0_.get(); }
@@ -530,7 +485,6 @@ public:
         raft::LogIndex snapshotIndex = raft::kNoIndex;
         uint64_t mapEpoch = 0;
         uint64_t servingMapEpoch = 0;
-        uint32_t activeFormat = 1;
         size_t nodes = 0;
         size_t voters = 0;
         size_t learners = 0;
@@ -571,7 +525,6 @@ public:
         c.snapshotIndex = group->node().log().snapshotIndex();
         c.mapEpoch = state.mapEpoch;
         c.servingMapEpoch = state.servingMap.epoch;
-        c.activeFormat = state.activeFormatVersion;
         c.nodes = state.nodes.size();
         c.voters = config.voters.size();
         c.learners = config.learners.size();
@@ -641,8 +594,6 @@ public:
         size_t transferCap = 0;
         size_t productionLimit = 0;  // sequential snapshots attempted per sweep on this shard
         bool triggerEnabled = false;
-        uint32_t activeClusterFormat = 1;
-        bool snapshotFormatReady = false;
     };
 
     // Journal fsync accounting (debt D-10). `syncRequests / fsyncs` is the
@@ -698,8 +649,6 @@ public:
         c.sweeps = host.snapshotSweeps();
         c.maxEntriesSinceSeen = host.snapshotMaxEntriesSinceSeen();
         c.triggerEnabled = host.snapshotTriggerEnabled();
-        c.activeClusterFormat = data::JournalFormatGate::activeVersion();
-        c.snapshotFormatReady = data::JournalFormatGate::supports(data::kSnapshotV2ActivationVersion);
         c.transfersActive = host.snapshotTransfersActive();
         c.transfersWaiting = host.snapshotTransfersWaiting();
         c.transferCap = ReplicatedVShardHost::snapshotTransferCap();

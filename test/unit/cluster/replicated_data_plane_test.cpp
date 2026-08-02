@@ -67,8 +67,7 @@ private:
     MemRaftRouter& r_;
 };
 
-// Direct proposeWrite transport: forwards a batch to the target node's host in-process
-// (stands in for DataPlaneRpc::proposeWrite over the wire).
+// Direct propose transport: forwards each VShard batch to the target node's host in-process.
 class DirectProposeTransport : public data::NodeTransport {
 public:
     std::map<NodeId, cluster::ReplicatedDataPlane*>* nodes = nullptr;
@@ -76,8 +75,17 @@ public:
     seastar::future<data::NodeQueryPartial> queryNode(NodeId, data::NodeQueryRequest) override {
         return seastar::make_exception_future<data::NodeQueryPartial>(std::runtime_error("unused"));
     }
-    seastar::future<bool> proposeWrite(NodeId to, data::WriteBatch batch) override {
-        return (*nodes).at(to)->host().proposeBatch(std::move(batch));
+    seastar::future<data::ProposeOutcome> proposeWriteHinted(NodeId to, data::VShardBatchView view,
+                                                             data::OptDeadline) override {
+        data::ProposeOutcome out;
+        for (const auto* group : view) {
+            if (co_await (*nodes).at(to)->host().proposeBatch(group->second))
+                out.committedVShards.push_back(group->first);
+            else
+                out.rejects.push_back({group->first, timestar::raft::kNoNode, data::WriteFailure::NotLeader});
+        }
+        out.committed = out.rejects.empty();
+        co_return out;
     }
 };
 

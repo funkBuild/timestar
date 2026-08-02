@@ -22,7 +22,7 @@ protected:
     std::string path(const std::string& f) { return testDir + "/" + f; }
 };
 
-// A V4 file stamps each block's [minRev, maxRev] from the per-point revisions,
+// A v1 file stamps each block's [minRev, maxRev] from the per-point revisions,
 // and the reader parses them back exactly (min/max in the right order).
 seastar::future<> testRevisionRangeRoundTrips(std::string p) {
     SeriesId128 series = SeriesId128::fromSeriesKey("revtest.value");
@@ -39,7 +39,7 @@ seastar::future<> testRevisionRangeRoundTrips(std::string p) {
 
     TSM tsm(p);
     co_await tsm.open();
-    EXPECT_EQ(tsm.fileFormatVersion(), 4u);
+    EXPECT_EQ(tsm.fileFormatVersion(), 1u);
 
     auto* entry = co_await tsm.getFullIndexEntry(series);
     EXPECT_NE(entry, nullptr);
@@ -70,7 +70,7 @@ seastar::future<> testNoRevisionsIsMigratedFloor(std::string p) {
 
     TSM tsm(p);
     co_await tsm.open();
-    EXPECT_EQ(tsm.fileFormatVersion(), 4u);
+    EXPECT_EQ(tsm.fileFormatVersion(), 1u);
     auto* entry = co_await tsm.getFullIndexEntry(series);
     EXPECT_NE(entry, nullptr);
     if (entry && entry->indexBlocks.size() == 1u) {
@@ -85,7 +85,7 @@ TEST_F(TSMRevisionRangeTest, NoRevisionsIsMigratedFloor) {
     seastar::async([&] { testNoRevisionsIsMigratedFloor(path("0_2.tsm")).get(); }).get();
 }
 
-// The file-level max-revision trailer (V4) is read cheaply at open() and equals
+// The file-level max-revision trailer is read cheaply at open() and equals
 // the maximum block revision across the whole file.
 seastar::future<> testMaxRevisionTrailer(std::string p) {
     {
@@ -103,7 +103,7 @@ seastar::future<> testMaxRevisionTrailer(std::string p) {
     }
     TSM tsm(p);
     co_await tsm.open();
-    EXPECT_EQ(tsm.fileFormatVersion(), 4u);
+    EXPECT_EQ(tsm.fileFormatVersion(), 1u);
     EXPECT_EQ(tsm.maxRevision(), 42u) << "file-level max across both series";
     co_return;
 }

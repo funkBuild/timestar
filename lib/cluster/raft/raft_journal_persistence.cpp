@@ -24,12 +24,8 @@ uint64_t getU64(const char* p) {
     return v;
 }
 
-// Snapshot payload, v2: [magic 8][flags u8][index u64][term u64][configLen u64][config][data]
-// Legacy (pre-provenance): [index u64][term u64][configLen u64][config][data]
-//
-// The magic prefix is what lets the two be told apart, and a prefix rather than a trailer
-// because `data` is the unbounded tail. Legacy records read as produced-here -- the
-// pre-D-6 shape, and there are none in the wild since nothing ever compacted before it.
+// Snapshot journal record v1:
+// [magic 8][flags u8][index u64][term u64][configLen u64][config][data]
 constexpr char kSnapshotRecordMagic[8] = {'T', 'S', 'R', 'S', 'N', 'A', 'P', '1'};
 constexpr uint8_t kSnapshotFlagReceivedFromPeer = 0x01;
 
@@ -50,21 +46,16 @@ std::string encodeSnapshotPayload(const Snapshot& s, bool receivedFromPeer) {
 // payload (fail closed). `index`/`term` are taken from the record header by the
 // caller and cross-checked against the payload.
 std::optional<Snapshot> decodeSnapshotPayload(const std::string& p, bool* receivedFromPeer) {
-    size_t off = 0;
+    constexpr size_t off = sizeof(kSnapshotRecordMagic) + 1;
     if (receivedFromPeer)
         *receivedFromPeer = false;
-    if (p.size() >= sizeof(kSnapshotRecordMagic) &&
-        std::memcmp(p.data(), kSnapshotRecordMagic, sizeof(kSnapshotRecordMagic)) == 0) {
-        off = sizeof(kSnapshotRecordMagic);
-        if (p.size() < off + 1)
-            return std::nullopt;
-        const uint8_t flags = static_cast<uint8_t>(p[off]);
-        ++off;
-        if (receivedFromPeer)
-            *receivedFromPeer = (flags & kSnapshotFlagReceivedFromPeer) != 0;
-    }
-    if (p.size() < off + 24)
-        return std::nullopt;  // index + term + configLen
+    if (p.size() < off + 24 || std::memcmp(p.data(), kSnapshotRecordMagic, sizeof(kSnapshotRecordMagic)) != 0)
+        return std::nullopt;
+    const uint8_t flags = static_cast<uint8_t>(p[sizeof(kSnapshotRecordMagic)]);
+    if ((flags & ~kSnapshotFlagReceivedFromPeer) != 0)
+        return std::nullopt;
+    if (receivedFromPeer)
+        *receivedFromPeer = (flags & kSnapshotFlagReceivedFromPeer) != 0;
     Snapshot s;
     s.index = getU64(p.data() + off);
     s.term = getU64(p.data() + off + 8);

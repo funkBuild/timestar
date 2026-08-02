@@ -14,8 +14,7 @@ namespace timestar::cluster {
 
 // The per-VShard Raft state machine over the REAL Engine (integration plan M3):
 // applies each committed ReplicatedCommand through EngineLocalStore deterministically
-// on every replica, so replicas converge. This is the M3 analogue of the Phase-5
-// DataStateMachine (which used a toy in-memory store).
+// on every replica, so replicas converge.
 //
 // Determinism / revision assignment (ADR 0003): point revisions are stamped at APPLY
 // time from the LOG POSITION -- every point in a committed entry gets that entry's
@@ -43,7 +42,6 @@ class EngineDataStateMachine : public raft::RaftStateMachine {
 public:
     enum class DeleteReceiptStatus { Retained, Expired, Missing };
     struct DeleteReceiptCounts {
-        size_t legacy = 0;
         size_t total = 0;
         bool hasUnappliedEntries = false;
 

@@ -337,27 +337,21 @@ seastar::future<> TSM::open() {
     try {
         length = co_await tsmFile.size();
 
-        // Read and validate file header (magic "TASM" + 1-byte version)
-        if (length >= 5) {
-            auto hdrBuf = co_await tsmFile.dma_read_exactly<uint8_t>(0, 5);
-            // Validate magic bytes "TASM"
-            if (hdrBuf.get()[0] != 'T' || hdrBuf.get()[1] != 'A' || hdrBuf.get()[2] != 'S' || hdrBuf.get()[3] != 'M') {
-                throw std::runtime_error("Not a TSM file (bad magic): " + filePath);
-            }
-            fileVersion = hdrBuf.get()[4];
-            if (fileVersion < TSM_VERSION_MIN || fileVersion > TSM_VERSION) {
-                throw std::runtime_error("Unsupported TSM file version " + std::to_string(fileVersion) +
-                                         " (supported: " + std::to_string(TSM_VERSION_MIN) + "-" +
-                                         std::to_string(TSM_VERSION) + "): " + filePath);
-            }
+        // Minimum valid file: 5-byte header + max-revision and index-offset trailers.
+        if (length < 21) {
+            throw std::runtime_error("TSM file too small (" + std::to_string(length) +
+                                     " bytes, minimum 21): " + filePath);
+        }
+        auto hdrBuf = co_await tsmFile.dma_read_exactly<uint8_t>(0, 5);
+        if (hdrBuf.get()[0] != 'T' || hdrBuf.get()[1] != 'A' || hdrBuf.get()[2] != 'S' || hdrBuf.get()[3] != 'M') {
+            throw std::runtime_error("Not a TSM file (bad magic): " + filePath);
+        }
+        if (hdrBuf.get()[4] != TSM_VERSION) {
+            throw std::runtime_error("Unsupported TSM file version " + std::to_string(hdrBuf.get()[4]) +
+                                     " (supported: 1): " + filePath);
         }
 
         // Use lazy loading: read sparse index + bloom filter (not full index).
-        // Minimum valid file: 5-byte header + 8-byte index offset footer = 13 bytes.
-        if (length < 13) {
-            throw std::runtime_error("TSM file too small (" + std::to_string(length) +
-                                     " bytes, minimum 13): " + filePath);
-        }
         co_await readSparseIndex();
 
         // Load tombstones if they exist
@@ -415,17 +409,9 @@ seastar::future<> TSM::readSparseIndex() {
     uint64_t indexOffset;
     std::memcpy(&indexOffset, indexOffsetBuf.get(), sizeof(uint64_t));
 
-    // V4 files carry a file-level max-revision trailer between the index and the
-    // index-offset (which stays the last 8 bytes). Read it, and exclude its 8
-    // bytes from the index section so the entry parse never sees it.
-    const size_t trailerBytes = (fileVersion >= 4) ? 2 * sizeof(uint64_t) : sizeof(uint64_t);
-    if (fileVersion >= 4) {
-        if (length < trailerBytes) {
-            throw std::runtime_error("Corrupted TSM file: too small for V4 trailer: " + filePath);
-        }
-        auto maxRevBuf = co_await tsmFile.dma_read_exactly<uint8_t>(length - trailerBytes, sizeof(uint64_t));
-        std::memcpy(&maxRevision_, maxRevBuf.get(), sizeof(uint64_t));
-    }
+    constexpr size_t trailerBytes = 2 * sizeof(uint64_t);
+    auto maxRevBuf = co_await tsmFile.dma_read_exactly<uint8_t>(length - trailerBytes, sizeof(uint64_t));
+    std::memcpy(&maxRevision_, maxRevBuf.get(), sizeof(uint64_t));
 
     // Validate indexOffset is within file bounds
     if (indexOffset >= length - trailerBytes) {
@@ -433,7 +419,7 @@ seastar::future<> TSM::readSparseIndex() {
                                  " is out of bounds (file size: " + std::to_string(length) + "): " + filePath);
     }
 
-    // Read entire index section (excluding the trailer: max-rev [V4] + index offset)
+    // Read entire index section (excluding max-revision and index-offset trailers).
     auto indexBuf = co_await tsmFile.dma_read_exactly<uint8_t>(indexOffset, length - indexOffset - trailerBytes);
     Slice indexSlice(indexBuf.get(), indexBuf.size());
 
@@ -445,8 +431,7 @@ seastar::future<> TSM::readSparseIndex() {
     // takes a raw pointer and does NOT bounds-check (unlike Slice::read), so a
     // few trailing bytes here would read past the buffer before the following
     // block-count read could throw.
-    const uint32_t entryHeaderSize = tsmIndexEntryHeaderSize(fileVersion);
-    while (indexSlice.bytesLeft() >= entryHeaderSize) {
+    while (indexSlice.bytesLeft() >= TSM_INDEX_ENTRY_HEADER_SIZE) {
         uint64_t entryStartOffset = indexOffset + indexSlice.offset;
 
         // Read series ID (16 bytes) — zero-copy from index buffer
@@ -454,16 +439,15 @@ seastar::future<> TSM::readSparseIndex() {
             SeriesId128::fromBytes(reinterpret_cast<const char*>(indexSlice.data + indexSlice.offset), 16);
         indexSlice.offset += 16;
 
-        // Read type (1 byte) and block count (u32 in V3, u16 before)
+        // Read type (1 byte) and block count (u32).
         uint8_t type = indexSlice.read<uint8_t>();
-        uint32_t blockCount = (fileVersion >= 3) ? indexSlice.read<uint32_t>() : indexSlice.read<uint16_t>();
+        uint32_t blockCount = indexSlice.read<uint32_t>();
 
-        // Block size depends on type and file version
         if (type > static_cast<uint8_t>(TSMValueType::Integer)) {
             throw std::runtime_error("TSM index corrupt: invalid type byte " + std::to_string(type));
         }
         auto seriesType = static_cast<TSMValueType>(type);
-        size_t perBlockBytes = indexBlockBytes(seriesType, fileVersion);
+        size_t perBlockBytes = indexBlockBytes(seriesType);
 
         // Validate blockCount against remaining index data to prevent
         // reads past the end of the index on malformed files.
@@ -501,10 +485,10 @@ seastar::future<> TSM::readSparseIndex() {
                 // shortcuts must decode instead (see parseIndexBlocksFromSlice).
                 hasExtStats = !std::isnan(firstValue) && !std::isnan(latestValue);
             }
-            // Integer (V2): first/latest as int64 at offset 56 and 64 within block
+            // Integer: first/latest as int64 at offset 56 and 64 within block
             // Layout: minTime(8) maxTime(8) offset(8) size(4) count(4) sum(8) min(8) max(8) first(8) latest(8)
             //         0         8          16        24      28       32      40      48      56       64
-            else if (seriesType == TSMValueType::Integer && fileVersion >= 2) {
+            else if (seriesType == TSMValueType::Integer) {
                 int64_t intFirst, intLatest;
                 std::memcpy(&intFirst, indexSlice.data + blockStart + 56, sizeof(int64_t));
                 std::memcpy(&intLatest, indexSlice.data + lastBlockStart + 64, sizeof(int64_t));
@@ -512,8 +496,8 @@ seastar::future<> TSM::readSparseIndex() {
                 latestValue = static_cast<double>(intLatest);
                 hasExtStats = true;
             }
-            // Boolean (V2): first/latest as uint8 at offset 36 and 37
-            else if (seriesType == TSMValueType::Boolean && fileVersion >= 2) {
+            // Boolean: first/latest as uint8 at offset 36 and 37
+            else if (seriesType == TSMValueType::Boolean) {
                 boolFirst = (indexSlice.data[blockStart + 36] != 0);
                 boolLatest = (indexSlice.data[lastBlockStart + 37] != 0);
                 firstValue = boolFirst ? 1.0 : 0.0;
@@ -525,9 +509,9 @@ seastar::future<> TSM::readSparseIndex() {
         // Skip over the blocks (don't parse them yet)
         indexSlice.offset += blockBytes;
 
-        // Phase 3: Skip over string dictionary if present (V2 String series)
+        // Skip over the optional string dictionary.
         uint32_t dictBytes = 0;
-        if (seriesType == TSMValueType::String && fileVersion >= 2) {
+        if (seriesType == TSMValueType::String) {
             if (indexSlice.offset + 4 > indexSlice.length_) {
                 // No room for the dictionary length — the entry is truncated.
                 // Must THROW, not tolerate: a partially parsed index registers
@@ -555,8 +539,8 @@ seastar::future<> TSM::readSparseIndex() {
         // entrySize is uint64 so it cannot cap the widened uint32 blockCount;
         // blockBytes is already bounded by the bytesLeft() check above, i.e. by
         // the real index size, so no separate overflow guard is needed.
-        uint64_t entrySize = entryHeaderSize + static_cast<uint64_t>(blockBytes);
-        if (seriesType == TSMValueType::String && fileVersion >= 2) {
+        uint64_t entrySize = TSM_INDEX_ENTRY_HEADER_SIZE + static_cast<uint64_t>(blockBytes);
+        if (seriesType == TSMValueType::String) {
             entrySize += 4 + dictBytes;
         }
 
@@ -621,7 +605,7 @@ void TSM::parseIndexBlocksFromSlice(Slice& indexSlice, TSMIndexEntry& entry, uin
     // corrupt uint32 count can ask for ~378 GB and throw std::bad_alloc before
     // any read is attempted. The sparse-index path pre-validates this, but
     // getFullIndexEntry()/prefetchFullIndexEntries() do not.
-    const size_t perBlockBytes = indexBlockBytes(entry.seriesType, fileVersion);
+    const size_t perBlockBytes = indexBlockBytes(entry.seriesType);
     const size_t maxBlocks = perBlockBytes ? indexSlice.bytesLeft() / perBlockBytes : 0;
     if (blockCount > maxBlocks) {
         throw std::runtime_error("TSM index corrupt: blockCount " + std::to_string(blockCount) + " exceeds " +
@@ -649,8 +633,7 @@ void TSM::parseIndexBlocksFromSlice(Slice& indexSlice, TSMIndexEntry& entry, uin
             // and legacy files whose block endpoints were genuinely NaN are
             // caught by the same predicate. See docs/nan_policy.md.
             block.hasExtendedStats = !std::isnan(block.blockFirstValue) && !std::isnan(block.blockLatestValue);
-        } else if (fileVersion >= 2) {
-            // V2: all non-Float types have at least blockCount
+        } else {
             if (entry.seriesType == TSMValueType::Integer) {
                 // 72 bytes: 28 base + count(4) + sum(8) + min(8) + max(8) + first(8) + latest(8)
                 block.blockCount = indexSlice.read<uint32_t>();
@@ -685,17 +668,13 @@ void TSM::parseIndexBlocksFromSlice(Slice& indexSlice, TSMIndexEntry& entry, uin
                 // No value stats for strings — blockCount enables COUNT pushdown
             }
         }
-        // V4: per-block revision range, appended after the per-type stats. Pre-V4
-        // files leave [0,0] (the migrated-floor default).
-        if (fileVersion >= 4) {
-            block.blockMinRev = indexSlice.read<uint64_t>();
-            block.blockMaxRev = indexSlice.read<uint64_t>();
-        }
+        block.blockMinRev = indexSlice.read<uint64_t>();
+        block.blockMaxRev = indexSlice.read<uint64_t>();
         entry.indexBlocks.push_back(block);
     }
 
-    // Phase 3: Parse string dictionary if present
-    if (entry.seriesType == TSMValueType::String && fileVersion >= 2 && indexSlice.offset + 4 <= indexSlice.length_) {
+    // Parse string dictionary if present.
+    if (entry.seriesType == TSMValueType::String && indexSlice.offset + 4 <= indexSlice.length_) {
         uint32_t dictSize = indexSlice.read<uint32_t>();
         if (dictSize > 0 && indexSlice.offset + dictSize <= indexSlice.length_) {
             auto dict = StringEncoder::deserializeDictionary(indexSlice, dictSize);
@@ -754,8 +733,7 @@ seastar::future<TSMIndexEntry*> TSM::getFullIndexEntry(const SeriesId128& series
         }
         fullEntry.seriesType = static_cast<TSMValueType>(typeByte);
     }
-    // Block count is u32 in V3, u16 before.
-    uint32_t blockCount = (fileVersion >= 3) ? entrySlice.read<uint32_t>() : entrySlice.read<uint16_t>();
+    uint32_t blockCount = entrySlice.read<uint32_t>();
 
     // Parse all blocks and optional string dictionary
     parseIndexBlocksFromSlice(entrySlice, fullEntry, blockCount);
@@ -893,8 +871,7 @@ seastar::future<> TSM::prefetchFullIndexEntries(const std::vector<SeriesId128>& 
                 }
                 fullEntry.seriesType = static_cast<TSMValueType>(typeByte);
             }
-            // Block count is u32 in V3, u16 before.
-            uint32_t blockCount = (fileVersion >= 3) ? entrySlice.read<uint32_t>() : entrySlice.read<uint16_t>();
+            uint32_t blockCount = entrySlice.read<uint32_t>();
 
             // Parse all blocks and optional string dictionary
             parseIndexBlocksFromSlice(entrySlice, fullEntry, blockCount);

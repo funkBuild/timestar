@@ -1,5 +1,6 @@
 #include "control_command.hpp"
 
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 
@@ -7,11 +8,10 @@ namespace timestar::control {
 
 namespace {
 
-constexpr uint8_t kNodeCapabilityFrameTag = 1;
-constexpr size_t kMaxNodeCapabilityFrameBytes = 4096;
+constexpr char kCommandMagic[4] = {'T', 'C', 'C', '1'};
+constexpr uint8_t kFrozenDeletePlanFrameVersion = 1;
 constexpr uint8_t kControlJoinRequestFrameTag = 1;
 constexpr uint8_t kControlJoinResultFrameTag = 1;
-constexpr uint8_t kLegacyReceiptInventoryFrameTag = 1;
 
 bool canonicalHex128(const std::string& value) {
     if (value.size() != 32)
@@ -20,14 +20,6 @@ bool canonicalHex128(const std::string& value) {
         if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')))
             return false;
     return true;
-}
-
-bool validNodeCapability(const NodeCapabilityAdvertisement& capability) {
-    return canonicalHex128(capability.clusterUuid) && capability.record.raftId != raft::kNoNode &&
-           canonicalHex128(capability.record.uuid) && !capability.record.address.empty() &&
-           capability.record.address.size() <= 1024 && !capability.record.failureDomain.empty() &&
-           capability.record.failureDomain.size() <= 1024 && capability.formats.min != 0 &&
-           capability.formats.min <= capability.formats.max;
 }
 
 bool validControlJoinRequest(const ControlJoinRequest& request) {
@@ -43,25 +35,6 @@ bool validControlJoinResult(const ControlJoinResult& result) {
         return false;
     return (result.status == ControlJoinStatus::NotLeader || result.status == ControlJoinStatus::Rejected) ||
            result.leader != raft::kNoNode;
-}
-
-bool validLegacyReceiptInventory(const LegacyReceiptInventoryAdvertisement& inventory) {
-    if (!canonicalHex128(inventory.clusterUuid) || inventory.record.raftId == raft::kNoNode ||
-        !canonicalHex128(inventory.record.uuid) || inventory.record.address.empty() ||
-        inventory.record.address.size() > 1024 || inventory.record.failureDomain.empty() ||
-        inventory.record.failureDomain.size() > 1024 || !isValidNodeState(inventory.record.state) ||
-        inventory.entries.size() > kMaxLegacyReceiptInventoryEntries)
-        return false;
-    uint16_t previous = 0;
-    bool first = true;
-    for (const auto& entry : inventory.entries) {
-        if (entry.vshard >= kMaxLegacyReceiptInventoryEntries ||
-            entry.legacyReceipts > entry.totalReceipts || (!first && entry.vshard <= previous))
-            return false;
-        first = false;
-        previous = entry.vshard;
-    }
-    return true;
 }
 
 struct Writer {
@@ -167,10 +140,8 @@ enum : uint8_t {
     kUpsertJob = 8,
     kMintJoinToken = 9,
     kAdmitWithToken = 10,
-    kSetActiveVersion = 11,
-    kSetInitialServingMap = 12,
-    kSetActiveVersionCovered = 13,
-    kStoreFrozenDeletePlan = 14,
+    kSetInitialServingMap = 11,
+    kStoreFrozenDeletePlan = 12,
 };
 
 void writeNode(Writer& w, const NodeRecord& r) {
@@ -271,6 +242,7 @@ std::string encodeCommand(const ControlCommand& cmd) {
     if (const auto* admission = std::get_if<AdmitWithToken>(&cmd); admission && !validJoinToken(admission->token))
         throw std::invalid_argument("invalid group-0 admission token");
     Writer w;
+    w.out.append(kCommandMagic, sizeof(kCommandMagic));
     std::visit(
         [&](const auto& c) {
             using T = std::decay_t<decltype(c)>;
@@ -316,10 +288,6 @@ std::string encodeCommand(const ControlCommand& cmd) {
             } else if constexpr (std::is_same_v<T, StoreFrozenDeletePlan>) {
                 w.u8(kStoreFrozenDeletePlan);
                 writeFrozenDeletePlan(w, c.plan);
-            } else if constexpr (std::is_same_v<T, SetActiveVersion>) {
-                w.u8(kSetActiveVersionCovered);
-                w.u64(c.version);
-                w.ids(c.coveredVoters);
             } else if constexpr (std::is_same_v<T, SetInitialServingMap>) {
                 w.u8(kSetInitialServingMap);
                 writeControlMap(w, c.map);
@@ -330,7 +298,10 @@ std::string encodeCommand(const ControlCommand& cmd) {
 }
 
 std::optional<ControlCommand> decodeCommand(const std::string& bytes) {
-    Reader r{bytes.data(), bytes.data() + bytes.size()};
+    if (bytes.size() < sizeof(kCommandMagic) ||
+        std::memcmp(bytes.data(), kCommandMagic, sizeof(kCommandMagic)) != 0)
+        return std::nullopt;
+    Reader r{bytes.data() + sizeof(kCommandMagic), bytes.data() + bytes.size()};
     const uint8_t tag = r.u8();
     ControlCommand cmd;
     switch (tag) {
@@ -409,22 +380,6 @@ std::optional<ControlCommand> decodeCommand(const std::string& bytes) {
             cmd = std::move(c);
             break;
         }
-        case kSetActiveVersion: {
-            SetActiveVersion c;
-            c.version = r.u32();
-            // Backward-compatible decode of the pre-coverage command. Its empty
-            // proof is rejected by production apply. The covered form has a new
-            // tag so a truncated current command cannot masquerade as this one.
-            cmd = std::move(c);
-            break;
-        }
-        case kSetActiveVersionCovered: {
-            SetActiveVersion c;
-            c.version = r.u32();
-            c.coveredVoters = r.ids();
-            cmd = std::move(c);
-            break;
-        }
         case kSetInitialServingMap: {
             SetInitialServingMap c;
             c.map = readControlMap(r);
@@ -455,6 +410,7 @@ std::string encodeFrozenDeletePlanRpcRequest(const FrozenDeletePlanRpcRequest& r
          request.operation != FrozenDeletePlanRpcOperation::Freeze))
         throw std::invalid_argument("invalid frozen delete-plan RPC request");
     Writer w;
+    w.u8(kFrozenDeletePlanFrameVersion);
     w.u8(static_cast<uint8_t>(request.operation));
     writeFrozenDeletePlan(w, request.plan);
     return std::move(w.out);
@@ -467,6 +423,8 @@ std::optional<FrozenDeletePlanRpcRequest> decodeFrozenDeletePlanRpcRequest(const
     if (bytes.size() > kMaxFrozenDeletePlanBytes)
         return std::nullopt;
     Reader r{bytes.data(), bytes.data() + bytes.size()};
+    if (r.u8() != kFrozenDeletePlanFrameVersion)
+        return std::nullopt;
     const uint8_t operation = r.u8();
     FrozenDeletePlanRpcRequest request;
     if (operation > static_cast<uint8_t>(FrozenDeletePlanRpcOperation::Freeze))
@@ -486,6 +444,7 @@ std::string encodeFrozenDeletePlanRpcResult(const FreezeDeletePlanResult& result
         (carriesPlan ? !validFrozenDeletePlan(result.plan) : result.plan != FrozenDeletePlan{}))
         throw std::invalid_argument("invalid frozen delete-plan RPC result");
     Writer w;
+    w.u8(kFrozenDeletePlanFrameVersion);
     w.u8(static_cast<uint8_t>(result.status));
     if (carriesPlan)
         writeFrozenDeletePlan(w, result.plan);
@@ -496,6 +455,8 @@ std::optional<FreezeDeletePlanResult> decodeFrozenDeletePlanRpcResult(const std:
     if (bytes.size() > kMaxFrozenDeletePlanBytes)
         return std::nullopt;
     Reader r{bytes.data(), bytes.data() + bytes.size()};
+    if (r.u8() != kFrozenDeletePlanFrameVersion)
+        return std::nullopt;
     const uint8_t status = r.u8();
     if (status > static_cast<uint8_t>(FreezeDeletePlanStatus::Invalid))
         return std::nullopt;
@@ -508,36 +469,6 @@ std::optional<FreezeDeletePlanResult> decodeFrozenDeletePlanRpcResult(const std:
     if (!r.ok || r.p != r.end || (carriesPlan && !validFrozenDeletePlan(result.plan)))
         return std::nullopt;
     return result;
-}
-
-std::string encodeNodeCapabilityAdvertisement(const NodeCapabilityAdvertisement& capability) {
-    if (!validNodeCapability(capability))
-        throw std::invalid_argument("invalid node capability advertisement");
-    Writer w;
-    w.u8(kNodeCapabilityFrameTag);
-    w.str(capability.clusterUuid);
-    writeNode(w, capability.record);
-    w.u64(capability.formats.min);
-    w.u64(capability.formats.max);
-    if (w.out.size() > kMaxNodeCapabilityFrameBytes)
-        throw std::invalid_argument("node capability advertisement exceeds its wire bound");
-    return std::move(w.out);
-}
-
-std::optional<NodeCapabilityAdvertisement> decodeNodeCapabilityAdvertisement(const std::string& bytes) {
-    if (bytes.size() > kMaxNodeCapabilityFrameBytes)
-        return std::nullopt;
-    Reader r{bytes.data(), bytes.data() + bytes.size()};
-    if (r.u8() != kNodeCapabilityFrameTag)
-        return std::nullopt;
-    NodeCapabilityAdvertisement capability;
-    capability.clusterUuid = r.str();
-    capability.record = readNode(r);
-    capability.formats.min = r.u32();
-    capability.formats.max = r.u32();
-    if (!r.ok || r.p != r.end || !validNodeCapability(capability))
-        return std::nullopt;
-    return capability;
 }
 
 std::string encodeControlJoinRequest(const ControlJoinRequest& request) {
@@ -589,54 +520,6 @@ std::optional<ControlJoinResult> decodeControlJoinResult(const std::string& byte
     if (!r.ok || r.p != r.end || !validControlJoinResult(result))
         return std::nullopt;
     return result;
-}
-
-std::string encodeLegacyReceiptInventory(const LegacyReceiptInventoryAdvertisement& inventory) {
-    if (!validLegacyReceiptInventory(inventory))
-        throw std::invalid_argument("invalid legacy receipt inventory");
-    Writer w;
-    w.u8(kLegacyReceiptInventoryFrameTag);
-    w.str(inventory.clusterUuid);
-    writeNode(w, inventory.record);
-    w.u64(inventory.entries.size());
-    for (const auto& entry : inventory.entries) {
-        w.u16(entry.vshard);
-        w.u64(entry.legacyReceipts);
-        w.u64(entry.totalReceipts);
-        w.u8(entry.hasUnappliedEntries ? 1 : 0);
-    }
-    if (w.out.size() > kMaxLegacyReceiptInventoryFrameBytes)
-        throw std::invalid_argument("legacy receipt inventory exceeds its wire bound");
-    return std::move(w.out);
-}
-
-std::optional<LegacyReceiptInventoryAdvertisement> decodeLegacyReceiptInventory(const std::string& bytes) {
-    if (bytes.size() > kMaxLegacyReceiptInventoryFrameBytes)
-        return std::nullopt;
-    Reader r{bytes.data(), bytes.data() + bytes.size()};
-    if (r.u8() != kLegacyReceiptInventoryFrameTag)
-        return std::nullopt;
-    LegacyReceiptInventoryAdvertisement inventory;
-    inventory.clusterUuid = r.str();
-    inventory.record = readNode(r);
-    const uint64_t count = r.u64();
-    constexpr uint64_t kEntryBytes = sizeof(uint16_t) + 2 * sizeof(uint64_t) + sizeof(uint8_t);
-    if (!r.ok || count > kMaxLegacyReceiptInventoryEntries ||
-        count > static_cast<uint64_t>(r.end - r.p) / kEntryBytes)
-        return std::nullopt;
-    inventory.entries.reserve(count);
-    for (uint64_t i = 0; i < count && r.ok; ++i) {
-        const uint16_t vshard = r.u16();
-        const uint64_t legacy = r.u64();
-        const uint64_t total = r.u64();
-        const uint8_t hasUnapplied = r.u8();
-        if (hasUnapplied > 1)
-            r.ok = false;
-        inventory.entries.push_back({vshard, legacy, total, hasUnapplied == 1});
-    }
-    if (!r.ok || r.p != r.end || !validLegacyReceiptInventory(inventory))
-        return std::nullopt;
-    return inventory;
 }
 
 }  // namespace timestar::control

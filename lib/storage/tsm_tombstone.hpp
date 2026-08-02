@@ -19,8 +19,7 @@ namespace timestar {
 
 // Magic number for tombstone files ('TSMT' in hex)
 constexpr uint32_t TOMBSTONE_MAGIC = 0x54534D54;
-constexpr uint32_t TOMBSTONE_VERSION = 2;
-constexpr uint32_t TOMBSTONE_VERSION_V1 = 1;  // Legacy version with uint64_t seriesId
+constexpr uint32_t TOMBSTONE_VERSION = 1;
 
 // Individual tombstone entry
 struct TombstoneEntry {
@@ -31,9 +30,6 @@ struct TombstoneEntry {
 
     // Total size: 36 bytes (16+8+8+4)
     static constexpr size_t SIZE = 36;
-
-    // V1 entry size for backward compatibility (uint64_t seriesId was 8 bytes)
-    static constexpr size_t V1_SIZE = 28;
 
     // Comparison operators for sorting
     bool operator<(const TombstoneEntry& other) const {

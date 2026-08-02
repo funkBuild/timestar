@@ -15,8 +15,6 @@
 // in-memory router: the no-deadline overload is shown to hang (and is then healed and
 // resolved, so nothing is left dangling), and the deadline overload is shown to fail
 // inside its deadline.
-#include "../../../lib/cluster/data/data_command.hpp"
-#include "../../../lib/cluster/data/data_state_machine.hpp"
 #include "../../../lib/cluster/data/write_errors.hpp"
 #include "../../../lib/cluster/raft/raft_group.hpp"
 #include "../../../lib/cluster/raft/raft_journal_persistence.hpp"
@@ -106,13 +104,19 @@ seastar::future<> RouterTransport::send(Envelope env) {
 }
 
 struct NodeBox {
+    class NoopStateMachine final : public RaftStateMachine {
+    public:
+        seastar::future<> apply(LogEntry) override { return seastar::make_ready_future<>(); }
+        seastar::future<> applySnapshot(Snapshot) override { return seastar::make_ready_future<>(); }
+    };
+
     fs::path dir;
     NodeId id;
     Router* router = nullptr;
     RouterTransport* transport = nullptr;
     std::unique_ptr<JournalWriter> writer;
     std::unique_ptr<JournalRaftPersistence> persistence;
-    std::unique_ptr<data::DataStateMachine> sm;
+    std::unique_ptr<NoopStateMachine> sm;
     std::unique_ptr<RaftGroup> group;
 
     seastar::future<> boot(const std::vector<NodeId>& voters, RaftOptions opts) {
@@ -120,7 +124,7 @@ struct NodeBox {
         auto recovered = co_await writer->open();
         RecoveredRaftState st = recoverRaftState(recovered, VShardId{1});
         persistence = std::make_unique<JournalRaftPersistence>(*writer, VShardId{1}, st.nextSeq);
-        sm = std::make_unique<data::DataStateMachine>();
+        sm = std::make_unique<NoopStateMachine>();
         RaftNode node(id, voters, std::move(st.log), st.hardState, opts, {});
         group = std::make_unique<RaftGroup>(1, std::move(node), *persistence, *transport, *sm);
         router->setGroup(id, group.get());
@@ -157,13 +161,8 @@ seastar::future<> tickAndPump(Nodes& nodes, Router& router, int rounds) {
     }
 }
 
-// The Phase-5 DataStateMachine used here speaks DataCommand (it is the reactor-free
-// double the RF=3 gate runs on), not the production EngineDataStateMachine's
-// ReplicatedCommand. Either would do: what is under test is the WAITER, not the payload.
 std::string cmd(const std::string& key, double v) {
-    data::WritePoints wp;
-    wp.points.push_back(data::DataPoint{SeriesId128::fromSeriesKey(key), 1'700'000'000'000'000'000ULL, v});
-    return data::encodeDataCommand(wp);
+    return key + '=' + std::to_string(v);
 }
 
 // Boot a 3-voter group with node 1 preferred leader, elect it, and commit one write.

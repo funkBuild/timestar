@@ -1,6 +1,5 @@
 #pragma once
 
-#include "../features/feature_gate.hpp"  // FeatureGate, VersionRange
 #include "../raft/raft_group.hpp"
 #include "control_command.hpp"
 #include "group0_state_machine.hpp"
@@ -8,7 +7,6 @@
 
 #include <chrono>
 #include <cstdint>
-#include <map>
 #include <seastar/core/future.hh>
 #include <seastar/core/lowres_clock.hh>
 #include <optional>
@@ -88,15 +86,6 @@ public:
     seastar::future<bool> proposeCommand(
         ControlCommand cmd,
         std::optional<seastar::lowres_clock::time_point> deadline = std::nullopt);
-
-    // Activate wire/storage format `version` only when identity-keyed
-    // capabilities cover both the current stable group-0 voters and the union of
-    // voters in the committed serving map. Activation also waits for the
-    // state-machine meta-voter mirror to match the stable Raft configuration;
-    // the command then embeds that covered union for deterministic apply-time
-    // validation.
-    seastar::future<bool> activateFormat(
-        uint32_t version, const std::map<raft::NodeId, features::VersionRange>& nodeVersions);
 
     // Freeze a complete canonical pattern expansion in one group-0 entry before
     // any data-group proposal. A same-request retry returns the first stored

@@ -39,6 +39,10 @@ enum class WALValueType { Float = 0, Boolean, String, Integer };
 
 enum class WALInsertResult { Success, RolloverNeeded };
 
+inline constexpr char WAL_V1_MAGIC[4] = {'T', 'S', 'W', 'L'};
+inline constexpr uint32_t WAL_VERSION = 1;
+inline constexpr size_t WAL_HEADER_SIZE = sizeof(WAL_V1_MAGIC) + sizeof(WAL_VERSION);
+
 // Structure to track timing information for WAL operations
 struct WALTimingInfo {
     std::chrono::microseconds compressionTime{0};
@@ -197,7 +201,7 @@ public:
     // This segment's on-disk path, derived from the injected layout.
     [[nodiscard]] std::string filename() const;
 
-    seastar::future<> init(MemoryStore* store, bool isRecovery = false);
+    seastar::future<> init(MemoryStore* store);
 
     // Insert a single series write
     template <class T>

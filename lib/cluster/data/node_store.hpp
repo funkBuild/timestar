@@ -98,9 +98,8 @@ public:
 // what NodeStore serves): sends a lossless WriteBatch to an owner node and awaits
 // its durable apply, and runs a query on a peer returning its NodeQueryPartial.
 // DataPlaneRpc is the production implementation over seastar::rpc; F.5's
-// generalized WriteRouter/QueryCoordinator depend on THIS interface, not the
+// generalized routers and coordinators depend on THIS interface, not the
 // concrete transport, so they can be unit-tested against an in-memory double.
-// Replaces the lossy DataPoint-based DataPlaneClient.
 class NodeTransport {
 public:
     virtual ~NodeTransport() = default;
@@ -119,54 +118,28 @@ public:
             std::logic_error("node transport does not implement quorum-fenced pattern-series discovery"));
     }
 
-    // Forward a WriteBatch to a peer that LEADS the batch's VShards, to be
-    // REPLICATED through Raft there (M3 RF=3). Resolves true on durable quorum commit,
-    // false if the peer is not the leader (caller redirects). Default false so doubles
-    // need not implement it.
-    virtual seastar::future<bool> proposeWrite(NodeId, WriteBatch) { return seastar::make_ready_future<bool>(false); }
-
-    // proposeWrite with LEADER HINTS and without consuming the caller's groups
-    // (write-scaleout 3a/3b) -- the production remote path. `view` borrows groups the
+    // Propose with leader hints and without consuming the caller's groups.
+    // `view` borrows groups the
     // CALLER owns and must outlive the returned future (see VShardBatchView).
     //
-    // The default forwards to proposeWrite, copying the view into a WriteBatch and
-    // reporting hintless rejects, so an in-memory double that only implements
-    // proposeWrite keeps working (and so does a peer too old to answer the hinted verb).
     // `deadline` bounds the whole call (handshake included); std::nullopt means no
-    // bound. The in-memory default ignores it -- a double answers instantly -- but the
-    // real transport MUST honour it: the router only checks its budget BETWEEN attempts,
-    // so an unbounded attempt holds its in-flight-bytes charge for as long as a peer
-    // cares to stay silent, and every other write on that shard queues behind it.
-    virtual seastar::future<ProposeOutcome> proposeWriteHinted(NodeId to, VShardBatchView view,
-                                                               OptDeadline deadline = std::nullopt) {
-        (void)deadline;
-        std::vector<uint16_t> vshards;
-        WriteBatch merged;
-        for (const auto* g : view) {
-            vshards.push_back(g->first);
-            merged.schemaVersion = g->second.schemaVersion;
-            merged.series.insert(merged.series.end(), g->second.series.begin(), g->second.series.end());
-        }
-        return proposeWrite(to, std::move(merged)).then([vshards = std::move(vshards)](bool ok) {
-            ProposeOutcome out;
-            out.committed = ok;
-            // A bool answer cannot name a partial commit, so on failure NOTHING is
-            // reported committed and the caller retries the whole view -- which is the
-            // safe reading, and the only one available from a pre-v3 peer.
-            if (ok)
-                out.committedVShards = vshards;
-            else
-                for (uint16_t vs : vshards)
-                    out.rejects.push_back(SliceReject{vs, kNoNode, WriteFailure::NotLeader});
-            return out;
-        });
+    // bound. The real transport MUST honour it: the router only checks its budget
+    // BETWEEN attempts, so an unbounded attempt holds its in-flight-bytes charge for
+    // as long as a peer cares to stay silent, and every other write on that shard queues
+    // behind it. Minimal transports fail closed without needing an unused test stub.
+    virtual seastar::future<ProposeOutcome> proposeWriteHinted(NodeId, VShardBatchView view,
+                                                               OptDeadline = std::nullopt) {
+        ProposeOutcome out;
+        for (const auto* group : view)
+            out.rejects.push_back(SliceReject{group->first, kNoNode, WriteFailure::NotLeader});
+        return seastar::make_ready_future<ProposeOutcome>(std::move(out));
     }
 
     // Forward one non-batch replicated command to the node believed to lead its
     // VShard. The one-slice ProposeOutcome has the same committed-set contract as
     // the write path, including an advisory corrected-leader hint on rejection.
-    // The default is a clean not-leader response so existing test transports stay
-    // source-compatible while callers still fail closed and retry elsewhere.
+    // The default is a clean not-leader response so minimal transports still fail
+    // closed and callers retry elsewhere.
     virtual seastar::future<ProposeOutcome> proposeCommandHinted(NodeId, uint16_t vshard, ReplicatedCommand,
                                                                  OptDeadline = std::nullopt) {
         ProposeOutcome out;
@@ -253,7 +226,7 @@ public:
     //
     // TIME: the forwarding node bounds its RPC, but that cannot cancel a receiver
     // coroutine after timeout/disconnect. Concrete production sinks must apply a
-    // receiver-side default when this compatibility seam supplies nullopt.
+    // receiver-side default when this convenience overload supplies nullopt.
     virtual seastar::future<ProposeOutcome> proposeBatchHinted(WriteBatch batch) {
         return seastar::do_with(splitByVShard(std::move(batch)), [this](VShardBatches& groups) {
             return proposeVShardBatchesHinted(viewOf(groups), std::nullopt);
@@ -286,7 +259,7 @@ public:
 
 // The node-local LEADER-REACH target for replica reads (M4). A follower/learner
 // replica of a VShard confirms freshness at the CURRENT leader before serving a
-// linearizable or bounded-staleness read (the ReplicaVShard `LeaderReadIndexFn`/
+// linearizable or bounded-staleness read (the ReplicaEngineReader leader-index/
 // `LeaderCommitFn`); DataPlaneRpc's leaderReadIndex/leaderCommitIndex verbs dispatch
 // the RPC into this sink on the leader node. ReplicatedVShardHost implements it.
 class ReadIndexSink {

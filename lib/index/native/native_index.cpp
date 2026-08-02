@@ -656,7 +656,7 @@ seastar::future<> NativeIndex::refreshSSTables() {
             const bool metadataMatches =
                 diskMeta.fileSize == fileMeta.fileSize && diskMeta.entryCount == fileMeta.entryCount &&
                 diskMeta.minKey == fileMeta.minKey && diskMeta.maxKey == fileMeta.maxKey &&
-                (diskMeta.formatVersion == SSTABLE_LEGACY_VERSION || diskMeta.fileNumber == fileMeta.fileNumber) &&
+                diskMeta.fileNumber == fileMeta.fileNumber &&
                 (fileMeta.writeTimestamp == 0 || diskMeta.writeTimestamp == fileMeta.writeTimestamp);
             if (!metadataMatches) {
                 co_await reader->close();

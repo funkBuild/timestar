@@ -54,14 +54,13 @@ struct TSMIndexBlock {
     uint64_t minTime;
     uint64_t maxTime;
     uint64_t offset;
-    // Per-block replicated revision range [minRev, maxRev] (V4; ADR 0003 sec 4).
-    // Serialized after the per-type stats. 0 = migrated-floor default, which is
-    // also what pre-V4 files decode to. Drives the LWW read-path merge: two blocks
+    // Per-block replicated revision range [minRev, maxRev] (ADR 0003 sec 4).
+    // Serialized after the per-type stats. Drives the LWW read-path merge: two blocks
     // whose ranges are disjoint resolve by range alone (higher wins, no per-point
     // read); overlap falls back to per-point revisions.
     uint64_t blockMinRev = 0;
     uint64_t blockMaxRev = 0;
-    // Block-level statistics (all types in V2; Float-only in V1)
+    // Block-level statistics.
     // For Float: native double values.
     // For Integer: int64 values stored as double (lossless up to 2^53).
     // For Boolean: blockSum = trueCount, blockMin/blockMax = 0.0/1.0 or unused.
@@ -69,7 +68,7 @@ struct TSMIndexBlock {
     double blockSum = 0.0;
     double blockMin = std::numeric_limits<double>::max();
     double blockMax = std::numeric_limits<double>::lowest();
-    // Extended statistics (Float/Integer in V2)
+    // Extended statistics for Float/Integer blocks.
     double blockM2 = 0.0;           // Welford's M2 accumulator for STDDEV/STDVAR (Float only)
     double blockFirstValue = 0.0;   // Value at earliest timestamp (for FIRST)
     double blockLatestValue = 0.0;  // Value at latest timestamp (for LATEST)
@@ -109,7 +108,7 @@ struct SparseIndexEntry {
     uint64_t minTime = 0;
     uint64_t maxTime = 0;
     // Block-level stats cached from first/last block for zero-I/O LATEST/FIRST.
-    // Populated during readSparseIndex() for Float and Integer series (V2).
+    // Populated during readSparseIndex() for Float and Integer series.
     double firstValue = 0.0;   // blockFirstValue from the first block
     double latestValue = 0.0;  // blockLatestValue from the last block
     bool hasExtendedStats = false;
@@ -169,57 +168,35 @@ struct CacheSizeEstimator<::TSMIndexEntry> {
 };
 }  // namespace timestar
 
-// TSM file format version.
-// V1: Float blocks have stats (80 bytes), non-Float blocks are base-only (28 bytes).
-// V2: All types have block stats (Float=80, Integer=72, Boolean=40, String=32).
-// V3: per-series index block count widened from uint16 to uint32.
-// V4: each index block carries a [minRev, maxRev] revision range (16 bytes,
-//     appended after the per-type stats) for replicated LWW (ADR 0003).
-static constexpr uint8_t TSM_VERSION = 4;
-// Oldest version we can READ. Dropping V2 readability would orphan every
-// pre-V3 file on upgrade (data invisible to queries, file never compacted or
-// reclaimed) — V2 files stay readable and are rewritten as V3 by compaction.
-static constexpr uint8_t TSM_VERSION_MIN = 2;
+// Greenfield v1 layout: uint32 block counts, per-type statistics, optional
+// string dictionaries, per-block revision ranges, and a file max-revision trailer.
+static constexpr uint8_t TSM_VERSION = 1;
 
 // Fixed part of an index entry: SeriesId128 (16) + type (1) + block count.
-// Blocks and the optional string dictionary follow. V3 widened the block
-// count from uint16 to uint32; readers must size and parse by file version.
+// Blocks and the optional string dictionary follow.
 static constexpr uint32_t TSM_INDEX_ENTRY_HEADER_SIZE = 16 + 1 + 4;
-static constexpr uint32_t TSM_INDEX_ENTRY_HEADER_SIZE_V2 = 16 + 1 + 2;
-inline uint32_t tsmIndexEntryHeaderSize(uint8_t fileVersion) {
-    return fileVersion >= 3 ? TSM_INDEX_ENTRY_HEADER_SIZE : TSM_INDEX_ENTRY_HEADER_SIZE_V2;
-}
 
-// Per-type index block byte size for V2 files.
-// V1 files: Float=80, all others=28 (no stats).
-// V2 files: Float=80, Integer=72, Boolean=40, String=32.
-inline size_t indexBlockBytesV2(TSMValueType type) {
+// Per-type statistics plus a replicated revision range for every block.
+inline size_t indexBlockBytes(TSMValueType type) {
+    size_t bytes;
     switch (type) {
         case TSMValueType::Float:
-            return 80;  // 28 base + 52 stats
+            bytes = 80;  // 28 base + 52 stats
+            break;
         case TSMValueType::Integer:
-            return 72;  // 28 base + 4 count + 40 (sum/min/max/first/latest as int64)
+            bytes = 72;  // 28 base + 4 count + 40 (sum/min/max/first/latest as int64)
+            break;
         case TSMValueType::Boolean:
-            return 40;  // 28 base + 4 count + 4 trueCount + 1 first + 1 latest + 2 pad
+            bytes = 40;  // 28 base + 4 count + 4 trueCount + 1 first + 1 latest + 2 pad
+            break;
         case TSMValueType::String:
-            return 32;  // 28 base + 4 count
+            bytes = 32;  // 28 base + 4 count
+            break;
         default:
-            return 28;
+            bytes = 28;
+            break;
     }
-}
-
-// Per-block revision range [minRev, maxRev] added in V4 (appended after stats).
-static constexpr size_t TSM_BLOCK_REVISION_BYTES = 16;
-
-inline size_t indexBlockBytes(TSMValueType type, uint8_t version) {
-    if (version < 2) {
-        // V1: only Float has stats
-        return (type == TSMValueType::Float) ? 80 : 28;
-    }
-    size_t bytes = indexBlockBytesV2(type);
-    if (version >= 4)
-        bytes += TSM_BLOCK_REVISION_BYTES;  // [minRev, maxRev]
-    return bytes;
+    return bytes + 16;  // [minRev, maxRev]
 }
 
 class TSM {
@@ -229,11 +206,9 @@ public:
     // compaction) rather than leaving an operator to guess.
     const std::string& getFilePath() const { return filePath; }
 
-    // On-disk format version of this file (set on open()). Exposed for tests and
-    // for format-gated behaviour (e.g. V4 carries per-block revision ranges).
-    uint8_t fileFormatVersion() const { return fileVersion; }
+    uint8_t fileFormatVersion() const { return TSM_VERSION; }
 
-    // File-level max revision (V4 trailer; 0 for pre-V4 files). Read from the
+    // File-level max revision. Read from the
     // trailer during readSparseIndex() so startup can restore a revision counter
     // above all flushed data without loading every index entry (ADR 0003).
     uint64_t maxRevision() const { return maxRevision_; }
@@ -242,10 +217,7 @@ private:
     std::string filePath;
     seastar::file tsmFile;
     uint64_t length = 0;
-    // Defaults to the current version: a truncated header must never leave this
-    // at 1 and silently select the V1 index-block layout.
-    uint8_t fileVersion = TSM_VERSION;
-    uint64_t maxRevision_ = 0;  // V4 trailer, read in readSparseIndex()
+    uint64_t maxRevision_ = 0;
     // Set by scheduleDelete(): the on-disk file was unlinked but the fd must
     // stay open for in-flight snapshot readers; the destructor closes it.
     bool deferCloseOnDestroy_ = false;

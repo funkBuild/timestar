@@ -98,22 +98,4 @@ struct QueryPartial {
     std::map<SeriesId128, AggState> perSeries;
 };
 
-// This node's local storage (the Engine in production). The data plane routes
-// only the writes/reads it OWNS to here.
-class LocalStore {
-public:
-    virtual ~LocalStore() = default;
-    virtual seastar::future<> applyWrites(std::vector<DataPoint> points) = 0;
-    virtual seastar::future<QueryPartial> queryLocal(QuerySpec spec) = 0;
-};
-
-// Sends writes/queries to a peer node (seastar RPC in production). Fire-and-block
-// per RPC; the router/coordinator handle fan-out concurrency.
-class DataPlaneClient {
-public:
-    virtual ~DataPlaneClient() = default;
-    virtual seastar::future<> forwardWrites(NodeId to, std::vector<DataPoint> points) = 0;
-    virtual seastar::future<QueryPartial> queryRemote(NodeId to, QuerySpec spec) = 0;
-};
-
 }  // namespace timestar::data

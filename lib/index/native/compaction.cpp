@@ -130,8 +130,7 @@ seastar::future<> CompactionEngine::doCompaction(CompactionJob job) {
         int priority = static_cast<int>(job.inputFiles.size()) - 1;
         for (const auto& fileMeta : job.inputFiles) {
             auto reader = co_await SSTableReader::open(sstFilename(fileMeta.fileNumber));
-            if (reader->metadata().formatVersion != SSTABLE_LEGACY_VERSION &&
-                reader->metadata().fileNumber != fileMeta.fileNumber) {
+            if (reader->metadata().fileNumber != fileMeta.fileNumber) {
                 co_await reader->close();
                 throw std::runtime_error("SSTable identity does not match manifest during compaction for file " +
                                          std::to_string(fileMeta.fileNumber));

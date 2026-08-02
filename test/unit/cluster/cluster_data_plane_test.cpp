@@ -37,8 +37,6 @@ TEST_F(ClusterDataPlaneTest, ClusterReadinessFailsClosedOnCurrentServingBlockers
     st.replicated = true;
     st.vshardsHostedHere = 10;
     st.snapshotTriggerEnabled = true;
-    st.activeClusterFormat = data::kSnapshotV2ActivationVersion;
-    st.snapshotFormatReady = true;
     EXPECT_TRUE(st.readyForTraffic());
 
     st.unresolvedPeerCount = 1;
@@ -71,13 +69,6 @@ TEST_F(ClusterDataPlaneTest, ClusterReadinessFailsClosedOnCurrentServingBlockers
     EXPECT_NE(st.readinessReason().find("snapshot"), std::string::npos);
     st.snapshotTriggerEnabled = true;
 
-    st.activeClusterFormat = 1;
-    st.snapshotFormatReady = false;
-    EXPECT_FALSE(st.readyForTraffic());
-    EXPECT_NE(st.readinessReason().find("below snapshot requirement v2"), std::string::npos);
-    st.activeClusterFormat = data::kSnapshotV2ActivationVersion;
-    st.snapshotFormatReady = true;
-
     st.snapshotsRefusedTooLarge = 1;
     EXPECT_FALSE(st.readyForTraffic());
     EXPECT_NE(st.readinessReason().find("size bound"), std::string::npos);
@@ -93,7 +84,6 @@ TEST_F(ClusterDataPlaneTest, ControlHealthIsVisibleWithoutBlockingExistingDataGr
     st.replicated = true;
     st.vshardsHostedHere = 10;
     st.snapshotTriggerEnabled = true;
-    st.snapshotFormatReady = true;
     EXPECT_TRUE(st.controlLocallyReady());
     EXPECT_TRUE(st.readyForTraffic());
 
@@ -109,14 +99,7 @@ TEST_F(ClusterDataPlaneTest, ControlHealthIsVisibleWithoutBlockingExistingDataGr
     st.controlControllerLeader = 1;
     st.controlControllerTerm = 7;
     st.controlCurrentTermCommit = true;
-    st.controlCapabilitiesComplete = true;
     EXPECT_TRUE(st.controlLocallyReady());
-
-    st.controlIdentityConflict = true;
-    EXPECT_FALSE(st.controlLocallyReady());
-    EXPECT_FALSE(st.readyForTraffic());
-    EXPECT_NE(st.readinessReason().find("conflicting persistent cluster identity"), std::string::npos);
-    st.controlIdentityConflict = false;
 
     st.controlControllerTerm = 6;
     EXPECT_FALSE(st.controlLocallyReady()) << "a leader is not actuating until its Raft term is durably stamped";

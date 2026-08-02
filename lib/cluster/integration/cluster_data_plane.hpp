@@ -5,7 +5,6 @@
 #include "../../http/http_query_handler.hpp"  // HttpQueryHandler, QueryResponse
 #include "../data/dataplane_limits.hpp"       // kMaxOutboundFrameBytes (the D-31 assertions below)
 #include "../data/dataplane_rpc.hpp"
-#include "../data/journal_format.hpp"
 #include "../data/node_query_coordinator.hpp"
 #include "../data/node_write_router.hpp"
 #include "../data/replicated_command.hpp"  // kWriteCommandFramingBytes
@@ -116,37 +115,16 @@ static_assert(kReadLeaderlessBudget < data::ReplicatedBatchWriteRouter::kElectio
               "silently would make reads the slow half [debt D-26, ADR 0006]");
 
 // ---------------------------------------------------------------------------
-// THE MESSAGE-SIZE CHAIN, asserted where both ends of it are visible (debt D-31).
-//
-// raft_types.hpp states the chain and can assert the links INSIDE it, but its top link --
-// "the largest producer payload is a write slice, and a write slice is bounded by what the
-// data plane will carry" -- reaches into data/dataplane_limits.hpp, which the deterministic
-// Raft core must not include. This header includes both, which is why the join lives here
-// (the same reason the tick-period assertions above do).
-// IN THE CHARGE UNIT, NOT IN RAW BYTES (review F1). The refusal this guards
-// (`firstUnproposableSlice`) compares `maxEncodedBytes(slice) + framing` against the
-// proposal bound -- a CHARGE, up to 11/9 of a v1 encoding, because the journal gate's
-// format version is independent of the one the frame arrived in. The first version of this
-// assertion compared raw frame bytes, which left it unable to fire on the very mismatch it
-// exists to catch: at a 12 MiB proposal bound it passed with ~1.3 MiB of apparent headroom
-// while a maximal float frame cleared the real bound by ONE byte and a maximal boolean
-// frame was refused outright.
-static_assert(data::chargeCeilingForV1Bytes(data::kMaxOutboundFrameBytes) + data::kWriteCommandFramingBytes <=
-                  raft::RaftGroup::kMaxProposalBytes,
-              "a write frame the data plane will SEND must be proposable as a Raft entry AS CHARGED, or a "
-              "legitimate forwarded batch draws a terminal 413 [debt D-31]");
+// The v1 wire frame and Raft command carry the same WriteBatch encoding. Keep one full
+// outbound frame proposable after adding the command wrapper.
+static_assert(data::kMaxOutboundFrameBytes + data::kWriteCommandFramingBytes <=
+              raft::RaftGroup::kMaxProposalBytes);
 // ...and the proposal bound must not be so far above it that it has stopped being derived
 // from anything. Two frames' worth is the slack budget; more than that is the pre-D-31
 // state, where the number floated free of every producer.
 static_assert(raft::RaftGroup::kMaxProposalBytes < 2 * data::kMaxOutboundFrameBytes,
               "the Raft entry bound is meant to be the wire bound plus margin, not an independent opinion "
               "[debt D-31]");
-// (The chain's last link -- send refusal vs the peer's RAFT inbound admission -- is
-// asserted in raft_types.hpp, which owns both constants. It used to be stated HERE against
-// `data::kMaxInboundRpcMemory`, the DATA plane's 128 MiB budget, which never admits a Raft
-// frame at all: a comparison that could not fail and would not have meant anything if it
-// had. Review F3.)
-
 // The node-level composition that wires every M2 brick into one live service
 // (integration plan M2): ClusterRuntime placement -> EngineLocalStore sink ->
 // DataPlaneRpc transport (server + peer clients) -> NodeWriteRouter (writes) +
@@ -176,12 +154,6 @@ public:
     void setJournalIdentity(JournalIdentity identity) { journalIdentity_ = identity; }
     void setGroup0Identity(control::NodeRecord record) { group0Identity_ = std::move(record); }
     void requestGroup0Bootstrap(bool requested = true) { group0BootstrapRequested_ = requested; }
-    void setLocalVersion(features::VersionRange range) { localVersion_ = range; }
-    // What this NODE advertises to peers (pushed to every per-shard transport in
-    // start()). Exposed so a test can read the real value back instead of grepping for a
-    // literal: a grep cannot see a regression in DataPlaneRpc's own default, a third
-    // advertiser, or a setLocalVersion() call that overrides the initializer.
-    features::VersionRange localVersion() const { return localVersion_; }
 
     // Route a partitioned write to VShard owners (local applied directly, remote
     // forwarded), and a query fanned out to owners then merged to the single-node
@@ -286,11 +258,6 @@ public:
         uint64_t snapshotTransfersAbandoned = 0;
         size_t snapshotProductionLimitPerShard = 0;
         bool snapshotTriggerEnabled = false;
-        // The minimum committed format observed across local reactor shards. Snapshot
-        // payload v2 is the first self-contained production format; a running timer
-        // cannot make progress while its emission gate remains below this version.
-        uint32_t activeClusterFormat = 1;
-        bool snapshotFormatReady = false;
         // Raft journal fsync accounting (debt D-10). journalSyncRequests /
         // journalFsyncs is the coalescing factor -- 1.0 for the default per-VShard
         // journal, > 1 when the shared per-shard journal is enabled.
@@ -330,7 +297,6 @@ public:
         raft::LogIndex controlSnapshotIndex = raft::kNoIndex;
         uint64_t controlMapEpoch = 0;
         uint64_t controlServingMapEpoch = 0;
-        uint32_t controlActiveFormat = 1;
         size_t controlNodes = 0;
         size_t controlVoters = 0;
         size_t controlLearners = 0;
@@ -344,10 +310,6 @@ public:
         uint64_t controlJournalSegmentsDeleted = 0;
         uint64_t controlControllerStampProposals = 0;
         uint64_t controlControllerActuationFailures = 0;
-        bool controlCapabilitiesComplete = false;
-        bool controlIdentityConflict = false;
-        size_t controlCapabilitiesObserved = 0;
-        uint64_t controlCapabilityFailures = 0;
 
         // This is intentionally LOCAL readiness, not a quorum-health claim.
         // With CheckQuorum disabled an isolated former leader can retain its role;
@@ -356,7 +318,6 @@ public:
             if (!controlEnabled)
                 return true;
             return controlHosted && controlInitialized && controlServingMapEpoch != 0 &&
-                   controlCapabilitiesComplete && !controlIdentityConflict &&
                    controlLeader != raft::kNoNode && controlControllerTerm == controlTerm &&
                    controlControllerLeader == controlLeader && controlCurrentTermCommit && controlApplyLagEntries == 0 &&
                    controlApplyFailures == 0 && controlTickErrors == 0 && controlMaintenanceFailures == 0 &&
@@ -366,20 +327,16 @@ public:
         [[nodiscard]] bool readyForTraffic() const {
             if (unresolvedPeerCount != 0)
                 return false;
-            if (controlIdentityConflict)
-                return false;
             if (!replicated)
                 return true;
             return vshardsHostedHere != 0 && vshardsLeaderless == 0 && applyLagEntries == 0 && applyFailures == 0 &&
-                   tickErrors == 0 && snapshotTriggerEnabled && snapshotFormatReady && snapshotsRefusedTooLarge == 0 &&
+                   tickErrors == 0 && snapshotTriggerEnabled && snapshotsRefusedTooLarge == 0 &&
                    snapshotsUndeliverable == 0;
         }
 
         [[nodiscard]] std::string readinessReason() const {
             if (unresolvedPeerCount != 0)
                 return std::to_string(unresolvedPeerCount) + " configured peer(s) are unresolved";
-            if (controlIdentityConflict)
-                return "configured nodes advertise a conflicting persistent cluster identity";
             if (!replicated)
                 return {};
             if (vshardsHostedHere == 0)
@@ -394,9 +351,6 @@ public:
                 return std::to_string(applyLagEntries) + " committed Raft entrie(s) are not applied";
             if (!snapshotTriggerEnabled)
                 return "Raft snapshot production is disabled";
-            if (!snapshotFormatReady)
-                return "committed cluster format v" + std::to_string(activeClusterFormat) +
-                       " is below snapshot requirement v" + std::to_string(data::kSnapshotV2ActivationVersion);
             if (snapshotsRefusedTooLarge != 0)
                 return std::to_string(snapshotsRefusedTooLarge) +
                        " VShard snapshot(s) exceeded the safe in-memory size bound";
@@ -407,14 +361,6 @@ public:
     };
     seastar::future<Status> status() const;
 
-    // One bounded, all-peer identity/capability collection. Production refreshes
-    // this periodically; exposing the operation keeps the exact validation seam
-    // testable without waiting for a timer.
-    seastar::future<std::map<NodeId, control::NodeCapabilityAdvertisement>> collectControlCapabilities(
-        data::OptDeadline deadline = std::nullopt);
-    seastar::future<std::map<NodeId, control::LegacyReceiptInventoryAdvertisement>>
-    collectLegacyReceiptInventories(data::OptDeadline deadline = std::nullopt);
-
     struct ControlTokenMintResult {
         bool minted = false;
         NodeId leader = raft::kNoNode;
@@ -424,18 +370,6 @@ public:
     // identity; Joining is an idempotent, retryable learner-catch-up result.
     seastar::future<ControlTokenMintResult> mintControlJoinToken(std::string token);
     seastar::future<control::ControlJoinResult> joinControlPlane(std::string token);
-
-    struct ControlFormatActivationResult {
-        bool activated = false;
-        NodeId leader = raft::kNoNode;
-        uint32_t activeFormat = 1;
-        uint64_t maxLegacyReceipts = 0;
-        uint64_t maxTotalReceipts = 0;
-    };
-    // Explicit operator actuator. Crossing into bounded receipt format v5
-    // requires a complete v9 inventory from every static replica immediately
-    // before the covered group-0 activation proposal.
-    seastar::future<ControlFormatActivationResult> activateControlFormat(uint32_t version);
 
     // Fail startup before accepting traffic when the configured reactor count
     // cannot produce complete single-core VShard snapshots.
@@ -506,8 +440,6 @@ private:
     // coroutine frame the gate keeps alive -- see startPeerResolver.
     seastar::future<> resolvePendingPeers(bool replicated);
     void startPeerResolver(bool replicated);
-    seastar::future<> refreshControlCapabilities();
-    void startControlCapabilityCollector();
 
     std::optional<ClusterRuntime> rt_;
     seastar::sharded<Engine>* enginesPtr_ = nullptr;
@@ -516,23 +448,10 @@ private:
     std::optional<JournalIdentity> journalIdentity_;
     std::optional<control::NodeRecord> group0Identity_;
     // ClusterRuntime intentionally contains only derived placement. Retain the
-    // exact configured identity separately for capability validation; UUID
-    // comparisons are byte-exact so a probe cannot silently cross clusters.
+    // exact configured identity separately for group-0 join validation.
     std::string controlClusterUuid_;
     NodeId controlSeedNode_ = raft::kNoNode;
     bool group0BootstrapRequested_ = false;
-    // Everything this binary can read and write. Pushed to every per-shard transport
-    // in start(), so peers negotiate against the node's REAL capability; leaving it at
-    // the VersionRange default {1,1} would pin the whole cluster to the v1 wire format
-    // no matter what the binaries support.
-    //
-    // It MUST track the newest version this binary supports, not a literal that happens
-    // to be current. Spelling v2 here after v3 landed silently capped every negotiation
-    // at 2, so no peer ever spoke the hinted-propose verb and the whole 3a leader-hint
-    // path was dead in production while every unit and socket test passed (they build
-    // their own DataPlaneRpc, whose own default was already v3). The 5-node
-    // deposed-primary gate is what caught it. Track kWriteBatchFormatMax.
-    features::VersionRange localVersion_{1, data::kWriteBatchFormatMax};
     // Declared in dependency order: deps before the router/coordinator that reference
     // them, so destruction (reverse order) tears the referrers down first.
     std::unique_ptr<data::VShardDirectory> dir_;
@@ -554,10 +473,6 @@ private:
     seastar::sharded<ShardRaftPlane> shards_;
     bool shardsStarted_ = false;
     bool replicated_ = false;
-    std::map<NodeId, control::NodeCapabilityAdvertisement> controlCapabilities_;
-    bool controlCapabilitiesComplete_ = false;
-    bool controlIdentityConflict_ = false;
-    uint64_t controlCapabilityFailures_ = 0;
     uint16_t rf_ = 1;  // configured replication factor (reported by status())
     bool controlEnabled_ = false;
 
@@ -576,9 +491,6 @@ private:
     seastar::timer<> peerResolveTimer_;
     seastar::gate peerResolveGate_;
     bool peerResolveRunning_ = false;
-    seastar::timer<> controlCapabilityTimer_;
-    seastar::gate controlCapabilityGate_;
-    bool controlCapabilityRunning_ = false;
 };
 
 }  // namespace timestar::cluster

@@ -1,10 +1,7 @@
 #include "group0_controller.hpp"
 
-#include "../data/journal_format.hpp"
-
 #include <algorithm>
 #include <seastar/core/coroutine.hh>
-#include <set>
 #include <stdexcept>
 
 namespace timestar::control {
@@ -40,48 +37,10 @@ seastar::future<bool> Group0Controller::proposeCommand(
     co_return co_await g0_.proposeAndAwaitApplied(encodeCommand(cmd), deadline.value_or(proposalDeadline()));
 }
 
-seastar::future<bool> Group0Controller::activateFormat(
-    uint32_t version, const std::map<raft::NodeId, features::VersionRange>& nodeVersions) {
-    if (!g0_.isLeader())
-        co_return false;
-    if (version <= sm_.state().activeFormatVersion)
-        co_return false;
-    const auto& config = g0_.node().config();
-    if (config.joint() || metaVotersDiffer(sm_.state().metaVoters, config.voters) ||
-        !isCompleteControlMap(sm_.state().servingMap))
-        co_return false;
-    std::set<raft::NodeId> required(config.voters.begin(), config.voters.end());
-    for (const auto& placement : sm_.state().servingMap.placement)
-        required.insert(placement.second.begin(), placement.second.end());
-    std::vector<features::VersionRange> ranges;
-    ranges.reserve(required.size());
-    for (raft::NodeId voter : required) {
-        // Capability alone is not delivery. A fresh production node starts as
-        // an observer and does not receive committed group-0 entries, so raising
-        // the cluster format before it is at least a learner can leave its local
-        // emission/readiness gate at v1 forever. Membership is the delivery
-        // precondition; decoder support remains the wire-safety precondition.
-        if (!config.isVoter(voter) && !config.isLearner(voter))
-            co_return false;
-        auto capability = nodeVersions.find(voter);
-        if (capability == nodeVersions.end())
-            co_return false;
-        ranges.push_back(capability->second);
-    }
-    if (!features::FeatureGate::canActivate(version, ranges))
-        co_return false;
-    std::vector<raft::NodeId> covered(required.begin(), required.end());
-    if (!co_await proposeCommand(SetActiveVersion{version, std::move(covered)}))
-        co_return false;
-    co_return sm_.state().activeFormatVersion >= version;
-}
-
 seastar::future<FreezeDeletePlanResult> Group0Controller::freezeDeletePlan(
     FrozenDeletePlan candidate, std::optional<seastar::lowres_clock::time_point> deadline) {
     if (!g0_.isLeader())
         co_return FreezeDeletePlanResult{FreezeDeletePlanStatus::NotLeader, {}};
-    if (sm_.state().activeFormatVersion < data::kFrozenDeletePlanActivationVersion)
-        co_return FreezeDeletePlanResult{FreezeDeletePlanStatus::FormatInactive, {}};
     if (!validFrozenDeletePlan(candidate) || !isCompleteControlMap(sm_.state().servingMap))
         co_return FreezeDeletePlanResult{FreezeDeletePlanStatus::Invalid, {}};
 
@@ -110,8 +69,6 @@ seastar::future<FreezeDeletePlanResult> Group0Controller::freezeDeletePlan(
 FreezeDeletePlanResult Group0Controller::lookupDeletePlan(const FrozenDeletePlan& request) const {
     if (!g0_.isLeader())
         return {FreezeDeletePlanStatus::NotLeader, {}};
-    if (sm_.state().activeFormatVersion < data::kFrozenDeletePlanActivationVersion)
-        return {FreezeDeletePlanStatus::FormatInactive, {}};
     if (!validFrozenDeletePlan(request) || !request.targets.empty() ||
         !isCompleteControlMap(sm_.state().servingMap))
         return {FreezeDeletePlanStatus::Invalid, {}};

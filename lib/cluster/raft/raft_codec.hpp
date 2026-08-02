@@ -17,6 +17,8 @@ struct Envelope {
     Message message;
 };
 
+inline constexpr size_t kRaftEnvelopeV1MagicBytes = 4;
+
 // Compact little-endian wire serialization for an Envelope. Pure and
 // transport-agnostic: the Seastar-RPC layer ships the resulting bytes and the
 // receiver decodes them. Length-prefixed throughout so it is self-delimiting.

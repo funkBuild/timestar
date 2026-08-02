@@ -6,12 +6,9 @@
 #include "../../utils/series_key.hpp"
 #include "../control/durable_control_map.hpp"
 #include "../control/group0_controller.hpp"
-#include "../data/journal_format.hpp"
 #include "../data/read_routing.hpp"
 #include "../data/write_errors.hpp"
-#include "checkquorum_policy.hpp"
 #include "group0_startup.hpp"
-#include "journal_format_bridge.hpp"
 #include "write_admission.hpp"
 
 #include <algorithm>
@@ -48,89 +45,6 @@ HostPort parseHostPort(const std::string& s) {
         hp.port = static_cast<uint16_t>(std::stoul(s.substr(colon + 1)));
     } catch (...) {}
     return hp;
-}
-
-// CheckQuorum: the BUILD default, and the ONE-WAY switch an operator has over it
-// (debt D-9/D-29/D-30).
-//
-// THE DEFAULT IS OFF FOR THIS RELEASE, and flipping it is this one line plus a re-run of
-// node_kill_round -- see the construction site for the measurement that decided it and for
-// the release ordering that makes flipping it safe next time.
-//
-// `TIMESTAR_CLUSTER_CHECKQUORUM` can only ever turn it OFF. It is retained while the
-// default is off (where it is a no-op) precisely so it is already in place, already logged
-// and already documented on the release that enables the guard -- an operator meeting a
-// CheckQuorum-shaped incident at 3am should not be the first person to use this knob. An
-// ENABLE knob is refused on purpose: with ADR 0005's mechanism (c) unbuilt, enabling per
-// node is exactly the mixed-version hazard that ADR exists to prevent.
-inline constexpr bool kCheckQuorumDefault = false;
-
-// The PARSE and the DECISION live in `checkquorum_policy.hpp` and are pinned there
-// (D-30). Only the environment read and the logging are here: the property the release
-// ordering depends on -- that no runtime input can turn the guard ON -- is a claim about
-// `resolveCheckQuorum`, and a claim nothing can call is a claim nothing can check.
-//
-// WHICH LEAVES *THIS FUNCTION* AS THE REMAINING WAY TO REVOKE IT, and no test covers this
-// body: it reads the real environment of a real process, so a unit test cannot exercise it
-// without mutating global state the rest of the suite shares. The pinned property protects
-// the DECISION, not this call site. Concretely, the edit shapes that would defeat it, none
-// of which would fail a single test:
-//
-//   * returning something other than `on` from any branch below -- e.g. "return true" in
-//     the EnableRefused arm, which reads like completing an obvious omission;
-//   * `resolveCheckQuorum(kCheckQuorumDefault || ov == ...EnableRefused, ov)`, or any other
-//     expression that lets the override reach the first argument;
-//   * a second getenv here (`..._FORCE`, `..._ENABLE`) consulted after the resolve;
-//   * assigning `ropts.checkQuorum` at the construction site from anything but this
-//     function.
-//
-// The rule is one line: **the override may only ever narrow the build default.** If a
-// future change needs an enable knob, it needs ADR 0005 mechanism (c) first -- that is the
-// whole of debt D-30. The construction site backs this up with a runtime fail-closed check
-// on the value this returns, so the first four shapes above throw at node start rather than
-// shipping; only an edit that also removes THAT check gets through.
-bool checkQuorumEnabled() {
-    const char* e = std::getenv("TIMESTAR_CLUSTER_CHECKQUORUM");
-    const auto ov = parseCheckQuorumOverride(e);
-    const bool on = resolveCheckQuorum(kCheckQuorumDefault, ov);
-
-    if (!kCheckQuorumDefault) {
-        // Nothing to disable, and nothing may enable. Say so if someone tried, so the
-        // knob's absence of effect is visible rather than mysterious.
-        if (ov != CheckQuorumOverride::None)
-            timestar::http_log.info(
-                "cluster: TIMESTAR_CLUSTER_CHECKQUORUM='{}' has no effect -- Raft CheckQuorum is OFF in this build "
-                "(debt D-9/D-29) and this override is disable-only",
-                e);
-        return on;
-    }
-    switch (ov) {
-        case CheckQuorumOverride::Disable:
-            timestar::http_log.warn(
-                "cluster: Raft CheckQuorum DISABLED on this node by TIMESTAR_CLUSTER_CHECKQUORUM='{}'. A partitioned "
-                "or stale leader will now keep accepting proposals it cannot commit until each one's own deadline, "
-                "and leader-only reads on the losing side of a partition converge per request rather than promptly. "
-                "Nothing is unsafe (commit still needs a quorum ack); this is the configuration that shipped before "
-                "debt D-9.",
-                e);
-            break;
-        case CheckQuorumOverride::EnableRefused:
-            timestar::http_log.warn(
-                "cluster: TIMESTAR_CLUSTER_CHECKQUORUM='{}' is ignored -- the override is DISABLE-ONLY and "
-                "CheckQuorum is already on. Enabling it per node is exactly the mixed-version hazard ADR 0005 exists "
-                "to prevent (one node running the disruption guard while an older peer drops its transfer votes).",
-                e);
-            break;
-        case CheckQuorumOverride::Invalid:
-            timestar::http_log.error(
-                "cluster: TIMESTAR_CLUSTER_CHECKQUORUM='{}' is not a boolean (0/false/no/off disable, case- and "
-                "whitespace-insensitive; nothing enables); leaving CheckQuorum ON",
-                e);
-            break;
-        case CheckQuorumOverride::None:
-            break;
-    }
-    return on;
 }
 
 // Snapshot-trigger policy overrides (debt D-6). The defaults
@@ -242,7 +156,6 @@ seastar::future<> ClusterDataPlane::startImpl(const ClusterConfig& cfg, seastar:
     // get the identical settings.
     if (tls_)
         rpc_->setTlsCredentials(tls_->certPem, tls_->keyPem, tls_->caPem, tls_->expectedPeerName);
-    rpc_->setLocalVersion(localVersion_);
     if (replicated)
         // Replicated mode serves the data plane from EVERY shard (see below); this
         // instance stays client-only, for the shard-0 query/metadata fan-out.
@@ -315,18 +228,12 @@ seastar::future<> ClusterDataPlane::startImpl(const ClusterConfig& cfg, seastar:
         // An inbound proposeWrite is split across the shards owning its VShards by
         // ShardRaftPlane::proposeBatch, so which shard the kernel handed the connection
         // to no longer decides where the work runs.
-        std::optional<control::NodeCapabilityAdvertisement> localCapability;
-        if (cfg.control_enabled) {
-            if (!group0Identity_)
-                throw std::invalid_argument("cluster: group 0 requires the persistent node identity");
-            localCapability = control::NodeCapabilityAdvertisement{cfg.cluster_uuid, *group0Identity_, localVersion_};
-        }
         co_await shards_.invoke_on_all(
-            [dataPlaneAddr, tls = tls_, ver = localVersion_, localCapability](ShardRaftPlane& p) {
+            [dataPlaneAddr, tls = tls_](ShardRaftPlane& p) {
             // `tls` is read from this shard's copy and the PEM strings are copied into
             // each shard's own credentials -- setTlsCredentials takes them by value, so
             // nothing cross-shard is retained.
-            return p.startDataPlane(dataPlaneAddr, tls, ver, localCapability);
+            return p.startDataPlane(dataPlaneAddr, tls);
         });
 
         // Serve Raft on this node's own Raft address FROM EVERY SHARD (again
@@ -425,88 +332,9 @@ seastar::future<> ClusterDataPlane::startImpl(const ClusterConfig& cfg, seastar:
                 "cluster: Raft snapshotChunkTimeout must be well below electionTimeoutMin -- a follower being fed "
                 "snapshot chunks receives no heartbeats, so a chunk resend slower than an election timeout lets it "
                 "campaign against a healthy leader mid-install");
-        // CHECKQUORUM IS OFF, AND EVERYTHING NEEDED TO TURN IT ON IS IN THIS BINARY.
-        // That combination is deliberate; it is a RELEASE-ORDERING decision, not an
-        // unfinished one. Read this before flipping `kCheckQuorumDefault` in either
-        // direction.
-        //
-        // WHY IT WAS OFF BEFORE (1f2e752, reverting the commit before it): with CheckQuorum
-        // on and no transfer marker, LEADERSHIP TRANSFER BREAKS. TimeoutNow lets the
-        // TRANSFEREE skip its own lease, but the vote it broadcast was an ordinary
-        // RequestVote and every OTHER voter was still hearing the outgoing leader, so
-        // `checkQuorum && leaderId_ != kNoNode && electionElapsed_ < electionTimeout_` held
-        // on all of them and the disruption guard SILENTLY DROPPED the vote without even
-        // bumping a term. A transfer that takes 0 tick rounds became a full election
-        // timeout -- 2.5-5 s of leaderlessness, thousands of times per rebalance storm.
-        //
-        // WHAT IS FIXED NOW, all three tested and all three staying in:
-        //   1. `RequestVote::campaignTransfer` (ADR 0005 mechanism (b)), honoured at the
-        //      inLease check, riding its OWN message-type byte so an older peer DROPS the
-        //      envelope rather than misparsing it. Transfers under CheckQuorum measured at
-        //      2216 in one rolling_rebalance storm, 600/600 OK, leadership settling at 0
-        //      moved.
-        //   2. A TimeoutNow is honoured only from the PRE-STEP believed leader
-        //      (RaftNode::step). Without it a forged TimeoutNow -- same term or higher --
-        //      produced a transfer-flagged campaign from any peer and stood every voter's
-        //      lease down at will (F1).
-        //   3. Hibernation credits the passes it skips (RaftGroupRegistry::tickAll ->
-        //      RaftNode::tick(passes)), so the lease expires in REAL time instead of 10x
-        //      long. This one is a WIN IN ITS OWN RIGHT, independent of CheckQuorum: with
-        //      the guard off it took node_kill_round's band from 49/400 to 32/400 and the
-        //      recovery from 8 s to 7 s, because a dead leader's idle groups no longer wait
-        //      out a stretched election timeout.
-        //
-        // WHY IT IS STILL OFF -- THE MEASUREMENT. Same binary, same session,
-        // node_kill_round.sh (3-node RF=3, kill -9 of the node leading 1364 of 4096
-        // mid-bench), flag the only difference (via the override below):
-        //
-        //     OFF  32/400 failed batches, 7 s recovery, 3.88 M pts/s   (twice, identical)
-        //     ON   50/400 / 11 s / 2.60 M   and   59/400 / 13 s / 2.12 M
-        //
-        // So the guard still costs ~1.6-1.8x on the client-visible one-node-down band and
-        // ~4-6 s of extra failover. It buys no safety (Raft never depended on it; commit
-        // needs a quorum ack, and RaftGroup::proposeAndAwaitApplied already bounds every
-        // write and bounds waiter accumulation). What it buys is PROMPTNESS under partition:
-        // a stale leader stops accepting proposals it cannot commit within one election
-        // timeout instead of one deadline per write, and leader-only reads on the losing
-        // side converge on "not leader" promptly rather than per request. That is worth
-        // having, and it is not worth a worse single-node failure -- which is the far more
-        // common event. Residual filed as D-29.
-        //
-        // WHY THE CODE SHIPS ANYWAY, and this is the point: the tag-8 decoder ships in THIS
-        // release, so every node in a rolling upgrade to the release AFTER this one can
-        // already READ a transfer vote. Enabling the guard then needs no wire change and no
-        // mixed-version window -- it becomes exactly the one-line flip above, plus a
-        // re-run of node_kill_round to confirm the band. Enabling it in the same release as
-        // the decoder is what would have required ADR mechanism (c) (D-30) to be built
-        // first. Shipping the reader first is the cheaper half of that design.
-        //
-        // Pinned, so none of the three can rot while the flag is off:
-        //   RaftClusterTest.LeaderTransferUnderCheckQuorumCompletesInZeroTickRounds
-        //     -- the direct regression test for 1f2e752; it advances NO clock
-        //   RaftClusterTest.{CheckQuorumStillRefusesAnUnsolicitedCampaign,
-        //     CheckQuorumStepsDownIsolatedLeader}
-        //   RaftNodeTest.TransferVote{StillObeysTheLogUpToDateCheck,
-        //     StillObeysOneVotePerTerm,AtAStaleTermIsRejectedWithOurTerm} -- vote safety
-        //   RaftNodeTest.AForged{SameTerm,HigherTerm}TimeoutNowIsIgnored -- (2)
-        //   RaftGroupRegistryTest.HibernationDoesNotStretchTheLease -- (3)
-        //   RaftCodecTest.AnOldDecoderDropsTheTransferVoteAndStillReadsAnOrdinaryOne
-        //   RaftProposeDeadlineTest.CheckQuorumFailsAQuorumLessWriteOnItsOwn -- the
-        //     property the guard is wanted FOR, on its own RaftOptions
-        ropts.checkQuorum = checkQuorumEnabled();
-        // FAIL-CLOSED AT THE ONLY SITE THAT MATTERS (debt D-30). `resolveCheckQuorum` is
-        // pure and pinned; `checkQuorumEnabled()` above is not covered by any test,
-        // because it reads a real process environment. This assertion is what makes the
-        // uncovered part unable to lie: whatever that function grows into, the guard
-        // cannot end up ON while the BUILD default is off -- which is the exact property
-        // the release ordering rests on (no runtime input may enable it; see ADR 0005
-        // mechanism (c)). Cheap: once per node start.
-        if (ropts.checkQuorum && !kCheckQuorumDefault)
-            throw std::runtime_error(
-                "cluster: CheckQuorum resolved ON while the build default is OFF -- the override is disable-only by "
-                "design (ADR 0005 mechanism (c) is not built, so enabling per node is the mixed-version hazard that "
-                "ADR exists to prevent). Flip kCheckQuorumDefault to enable it, in a build, for the whole cluster");
-
+        // CheckQuorum remains an explicit Raft tuning choice. This deployment keeps it
+        // disabled because bounded proposal deadlines already fail closed on lost quorum.
+        ropts.checkQuorum = false;
         // Compose the control group only when explicitly enabled. The startup
         // policy keeps a fresh seed completely inert without --cluster-init,
         // starts fresh non-seeds as non-voting observers, and recovers any
@@ -536,10 +364,8 @@ seastar::future<> ClusterDataPlane::startImpl(const ClusterConfig& cfg, seastar:
                                 control::DurableControlMapStore(dataRoot).persist(map);
                             });
                         };
-                        auto publishFormat = [](uint32_t version) { return publishJournalFormat(version); };
                         co_await plane.addGroup0(std::move(voters), ropts, clusterUuid, record,
-                                                 initialServingMap, std::move(publishCache),
-                                                 std::move(publishFormat));
+                                                 initialServingMap, std::move(publishCache));
                         auto* host = plane.group0();
                         if (!host || !host->group() || !host->stateMachine())
                             throw std::runtime_error("cluster: group-0 host failed to register its Raft group");
@@ -615,8 +441,6 @@ seastar::future<> ClusterDataPlane::startImpl(const ClusterConfig& cfg, seastar:
         });
         replicated_ = true;
         startLeadershipBalancer();
-        if (controlEnabled_)
-            startControlCapabilityCollector();
     }
     co_return;
 }
@@ -725,88 +549,6 @@ void ClusterDataPlane::startPeerResolver(bool replicated) {
     peerResolveTimer_.arm_periodic(kInterval);
 }
 
-seastar::future<std::map<NodeId, control::NodeCapabilityAdvertisement>>
-ClusterDataPlane::collectControlCapabilities(data::OptDeadline deadline) {
-    if (!controlEnabled_ || !rt_ || !rpc_ || !group0Identity_)
-        throw std::runtime_error("cluster: control capability collection is not configured");
-    deadline = deadline.value_or(seastar::lowres_clock::now() + std::chrono::milliseconds(600));
-
-    std::map<NodeId, control::NodeCapabilityAdvertisement> collected;
-    collected.emplace(rt_->selfId,
-                      control::NodeCapabilityAdvertisement{controlClusterUuid_, *group0Identity_, localVersion_});
-    std::vector<std::pair<NodeId, seastar::future<control::NodeCapabilityAdvertisement>>> pending;
-    if (!rt_->peerAddresses.empty())
-        pending.reserve(rt_->peerAddresses.size() - 1);
-    for (const auto& peer : rt_->peerAddresses) {
-        if (peer.first != rt_->selfId)
-            pending.emplace_back(peer.first, rpc_->nodeCapability(peer.first, deadline));
-    }
-
-    std::exception_ptr firstFailure;
-    std::exception_ptr permanentFailure;
-    for (auto& [id, future] : pending) {
-        try {
-            collected.emplace(id, co_await std::move(future));
-        } catch (const data::NodeCapabilityMismatchError&) {
-            if (!permanentFailure)
-                permanentFailure = std::current_exception();
-        } catch (...) {
-            if (!firstFailure)
-                firstFailure = std::current_exception();
-        }
-    }
-    try {
-        validateObservedNodeCapabilities(controlClusterUuid_, rt_->peerAddresses, collected);
-    } catch (...) {
-        if (!permanentFailure)
-            permanentFailure = std::current_exception();
-    }
-    if (permanentFailure)
-        std::rethrow_exception(permanentFailure);
-    if (firstFailure)
-        std::rethrow_exception(firstFailure);
-    (void)validateNodeCapabilities(controlClusterUuid_, rt_->peerAddresses, collected);
-    co_return collected;
-}
-
-seastar::future<std::map<NodeId, control::LegacyReceiptInventoryAdvertisement>>
-ClusterDataPlane::collectLegacyReceiptInventories(data::OptDeadline deadline) {
-    if (!controlEnabled_ || !rt_ || !rpc_ || !group0Identity_ || !shardsStarted_)
-        throw std::runtime_error("cluster: legacy receipt inventory collection is not configured");
-    deadline = deadline.value_or(seastar::lowres_clock::now() + std::chrono::seconds(2));
-
-    std::map<NodeId, control::LegacyReceiptInventoryAdvertisement> collected;
-    auto localEntries = co_await shards_.invoke_on(
-        0, [](ShardRaftPlane& plane) { return plane.handleLegacyReceiptInventory(); });
-    collected.emplace(rt_->selfId, control::LegacyReceiptInventoryAdvertisement{
-                                       controlClusterUuid_, *group0Identity_, std::move(localEntries)});
-    std::vector<std::pair<NodeId, seastar::future<control::LegacyReceiptInventoryAdvertisement>>> pending;
-    if (!rt_->peerAddresses.empty())
-        pending.reserve(rt_->peerAddresses.size() - 1);
-    for (const auto& peer : rt_->peerAddresses) {
-        if (peer.first != rt_->selfId)
-            pending.emplace_back(peer.first, rpc_->legacyReceiptInventory(peer.first, deadline));
-    }
-    std::exception_ptr firstFailure;
-    std::exception_ptr permanentFailure;
-    for (auto& [id, future] : pending) {
-        try {
-            collected.emplace(id, co_await std::move(future));
-        } catch (const data::NodeCapabilityMismatchError&) {
-            if (!permanentFailure)
-                permanentFailure = std::current_exception();
-        } catch (...) {
-            if (!firstFailure)
-                firstFailure = std::current_exception();
-        }
-    }
-    if (permanentFailure)
-        std::rethrow_exception(permanentFailure);
-    if (firstFailure)
-        std::rethrow_exception(firstFailure);
-    co_return collected;
-}
-
 seastar::future<ClusterDataPlane::ControlTokenMintResult> ClusterDataPlane::mintControlJoinToken(
     std::string token) {
     if (!controlEnabled_ || !shardsStarted_ || !control::validJoinToken(token))
@@ -850,100 +592,11 @@ seastar::future<control::ControlJoinResult> ClusterDataPlane::joinControlPlane(s
     co_return result;
 }
 
-seastar::future<ClusterDataPlane::ControlFormatActivationResult> ClusterDataPlane::activateControlFormat(
-    uint32_t version) {
-    if (!controlEnabled_ || !shardsStarted_ || !rt_ || !rpc_ || !group0Identity_ || version == 0 ||
-        version > data::kWriteBatchFormatMax)
-        throw std::invalid_argument("cluster: requested control format is invalid or group 0 is not configured");
-
-    auto* host = shards_.local().group0();
-    if (!host || !host->group() || !host->stateMachine())
-        throw std::runtime_error("cluster: group-0 activation host is unavailable");
-    auto* group = host->group();
-    const NodeId leader = group->isLeader() ? group->node().id() : group->leader();
-    if (!group->isLeader())
-        co_return ControlFormatActivationResult{false, leader, host->state().activeFormatVersion};
-    if (version <= host->state().activeFormatVersion)
-        co_return ControlFormatActivationResult{true, leader, host->state().activeFormatVersion};
-
-    const auto capabilityDeadline = seastar::lowres_clock::now() + std::chrono::seconds(2);
-    auto capabilities = co_await collectControlCapabilities(capabilityDeadline);
-    auto versions = validateNodeCapabilities(controlClusterUuid_, rt_->peerAddresses, capabilities);
-    controlCapabilities_ = capabilities;
-    controlCapabilitiesComplete_ = true;
-    controlIdentityConflict_ = false;
-
-    LegacyReceiptPreflightSummary receiptSummary;
-    if (host->state().activeFormatVersion < data::kBoundedDeleteReceiptActivationVersion &&
-        version >= data::kBoundedDeleteReceiptActivationVersion) {
-        // Capability and inventory fan-outs are separate bounded phases. Reusing the
-        // capability deadline here made a successful but slow first phase leave an
-        // already-expired deadline for every v9 inventory RPC.
-        const auto inventoryDeadline = seastar::lowres_clock::now() + std::chrono::seconds(2);
-        auto inventories = co_await collectLegacyReceiptInventories(inventoryDeadline);
-        receiptSummary = validateLegacyReceiptInventories(
-            controlClusterUuid_, rt_->peerAddresses, host->state().servingMap, inventories);
-    }
-
-    control::Group0Controller controller(*group, *host->stateMachine());
-    const bool activated = co_await controller.activateFormat(version, versions);
-    co_return ControlFormatActivationResult{activated, group->isLeader() ? group->node().id() : group->leader(),
-                                            host->state().activeFormatVersion,
-                                            receiptSummary.maxLegacyReceipts,
-                                            receiptSummary.maxTotalReceipts};
-}
-
-seastar::future<> ClusterDataPlane::refreshControlCapabilities() {
-    try {
-        auto collected = co_await collectControlCapabilities();
-        controlCapabilities_ = std::move(collected);
-        controlCapabilitiesComplete_ = true;
-        controlIdentityConflict_ = false;
-    } catch (const NodeCapabilityValidationError& e) {
-        ++controlCapabilityFailures_;
-        controlCapabilitiesComplete_ = false;
-        if (!controlIdentityConflict_)
-            timestar::http_log.error("cluster: rejecting control capability collection: {}", e.what());
-        controlIdentityConflict_ = true;
-        throw;
-    } catch (const data::NodeCapabilityMismatchError& e) {
-        ++controlCapabilityFailures_;
-        controlCapabilitiesComplete_ = false;
-        if (!controlIdentityConflict_)
-            timestar::http_log.error("cluster: rejecting control capability reply: {}", e.what());
-        controlIdentityConflict_ = true;
-        throw;
-    } catch (...) {
-        ++controlCapabilityFailures_;
-        controlCapabilitiesComplete_ = false;
-        throw;
-    }
-}
-
-void ClusterDataPlane::startControlCapabilityCollector() {
-    static constexpr auto kInterval = std::chrono::seconds(1);
-    controlCapabilityTimer_.set_callback([this] {
-        if (controlCapabilityRunning_ || controlCapabilityGate_.is_closed())
-            return;
-        controlCapabilityRunning_ = true;
-        (void)seastar::with_gate(controlCapabilityGate_, [this] {
-            return refreshControlCapabilities().then_wrapped([this](seastar::future<> f) {
-                f.ignore_ready_future();  // peer startup/outage is retried on the next bounded pass
-                controlCapabilityRunning_ = false;
-            });
-        });
-    });
-    controlCapabilityTimer_.arm_periodic(kInterval);
-}
-
 seastar::future<> ClusterDataPlane::stop() {
     // The peer re-resolution loop touches rpc_ and shards_; quiesce it first.
     peerResolveTimer_.cancel();
     if (!peerResolveGate_.is_closed())
         co_await peerResolveGate_.close();
-    controlCapabilityTimer_.cancel();
-    if (!controlCapabilityGate_.is_closed())
-        co_await controlCapabilityGate_.close();
     // Stop the balancing loop FIRST and drain any in-flight pass: it touches the Raft
     // groups, so it must be quiescent before rdp_ tears them down.
     balanceTimer_.cancel();
@@ -1014,12 +667,6 @@ seastar::future<QueryResponse> ClusterDataPlane::queryReplicated(QueryRequest re
     // asked to resolve leadership. The latter prevents a reachable follower that
     // redirects to a dead leader from being selected as the resolver forever.
     std::map<uint16_t, std::set<data::NodeId>> excludedReadTargets;
-    // Peers that answered the handshake but predate the leader-resolve read protocol
-    // (debt D-25). Kept apart from `unreachableLeaders` because the two want opposite
-    // treatment: an unreachable leader is woken and the client is told to retry, while a
-    // peer mid-rolling-upgrade will answer exactly the same way until it is upgraded.
-    std::set<data::NodeId> unversionedPeers;
-
     // Every VShard still owing an answer. Each one leaves this set exactly once -- when
     // a target answers for it -- so no VShard is dropped and none is asked twice.
     std::set<uint16_t> outstanding;
@@ -1142,13 +789,6 @@ seastar::future<QueryResponse> ClusterDataPlane::queryReplicated(QueryRequest re
                                    std::make_move_iterator(part.partials.end()));
                 allNonNumeric.insert(allNonNumeric.end(), std::make_move_iterator(part.nonNumeric.begin()),
                                      std::make_move_iterator(part.nonNumeric.end()));
-            } catch (const data::ReadResolveUnsupportedError&) {
-                // The peer is REACHABLE and healthy; it simply predates the resolve/redirect
-                // exchange, so it cannot tell us which of these VShards it leads (debt
-                // D-25). Degrade KNOWINGLY: fail the read closed naming the peer, rather
-                // than counting a follower's possibly-stale answer as a leader read. Not
-                // retried and not woken -- neither can change the peer's binary.
-                unversionedPeers.insert(pendingLeaders[i]);
             } catch (...) {
                 // A REMOTE leader we could not reach is an availability problem, not an
                 // internal error: the node is down (or partitioned) but its VShards have
@@ -1179,7 +819,7 @@ seastar::future<QueryResponse> ClusterDataPlane::queryReplicated(QueryRequest re
             unreachableLeaders.clear();
             break;  // every VShard answered exactly once
         }
-        if (!unversionedPeers.empty() || firstErr || !incompleteReasons.empty())
+        if (firstErr || !incompleteReasons.empty())
             break;
         if (targetFailed && replicaFallbackRounds < kReadReplicaFallbackRounds && !budgetSpent()) {
             ++replicaFallbackRounds;
@@ -1209,23 +849,6 @@ seastar::future<QueryResponse> ClusterDataPlane::queryReplicated(QueryRequest re
     // so it goes first and restores the contract the catch already claimed.
     if (firstErr)
         std::rethrow_exception(firstErr);
-    if (!unversionedPeers.empty()) {
-        // Then the version refusal, BEFORE the unreachable branch: a peer can only land
-        // here by ANSWERING the version handshake, so "too old" is the more specific and
-        // more actionable of the two, and it must not be reported as an outage the operator
-        // will go looking for. Deliberately no wake and no "retry shortly" -- retrying is
-        // futile until the rolling upgrade finishes (debt D-25).
-        std::string nodes;
-        for (data::NodeId n : unversionedPeers)
-            nodes += (nodes.empty() ? "" : ",") + std::to_string(n);
-        QueryResponse r;
-        r.success = false;
-        r.errorCode = "QUERY_INCOMPLETE";
-        r.errorMessage = "peer node(s) " + nodes + " predate the leader-resolve read protocol (data-plane wire v" +
-                         std::to_string(data::kNodeQueryResolveMinVersion) +
-                         "); this node cannot verify who leads their VShards -- finish the rolling upgrade";
-        co_return r;
-    }
     if (!unreachableLeaders.empty()) {
         // Those VShards are hibernating behind a dead leader, so their election
         // timeout is stretched ~10x (25-50s of cluster-wide read failure, measured).
@@ -1296,7 +919,6 @@ seastar::future<std::vector<std::string>> ClusterDataPlane::findPatternSeries(da
     std::set<std::string> matchedKeys;
     size_t matchedKeyBytes = 0;
     std::set<data::NodeId> unreachableLeaders;
-    std::set<data::NodeId> unsupportedPeers;
     std::map<uint16_t, std::set<data::NodeId>> excludedTargets;
     std::exception_ptr firstError;
     bool limitExceeded = false;
@@ -1417,8 +1039,6 @@ seastar::future<std::vector<std::string>> ClusterDataPlane::findPatternSeries(da
                 if (data::applyReadRedirects(pendingNodes[i], pendingVShards[i], pendingResolve[i], result.redirects,
                                              outstanding, readLeaderHints_))
                     learnedHint = true;
-            } catch (const data::PatternSeriesUnsupportedError&) {
-                unsupportedPeers.insert(pendingNodes[i]);
             } catch (...) {
                 if (pendingNodes[i] != self) {
                     unreachableLeaders.insert(pendingNodes[i]);
@@ -1432,7 +1052,7 @@ seastar::future<std::vector<std::string>> ClusterDataPlane::findPatternSeries(da
             }
         }
 
-        if (limitExceeded || firstError || !unsupportedPeers.empty())
+        if (limitExceeded || firstError)
             break;
         if (outstanding.empty()) {
             unreachableLeaders.clear();
@@ -1462,14 +1082,6 @@ seastar::future<std::vector<std::string>> ClusterDataPlane::findPatternSeries(da
         throw data::DeleteExpansionLimitError("pattern delete exceeds the " + std::to_string(maxSeries) +
                                               "-series or " + std::to_string(data::kPatternSeriesMaxKeyBytes) +
                                               "-encoded-key-byte safety limit");
-    if (!unsupportedPeers.empty()) {
-        std::string nodes;
-        for (data::NodeId node : unsupportedPeers)
-            nodes += (nodes.empty() ? "" : ",") + std::to_string(node);
-        throw data::PatternSeriesUnsupportedError(
-            "peer node(s) " + nodes + " predate quorum-fenced pattern-series discovery (data-plane wire v" +
-            std::to_string(data::kPatternSeriesMinVersion) + "); finish the rolling upgrade");
-    }
     if (!unreachableLeaders.empty()) {
         for (data::NodeId dead : unreachableLeaders)
             co_await shards_.invoke_on_all([dead](ShardRaftPlane& plane) { (void)plane.wakeFollowersOf(dead); });
@@ -1493,14 +1105,6 @@ seastar::future<std::vector<data::DeleteRangeTarget>> ClusterDataPlane::freezeDe
         throw std::logic_error("ClusterDataPlane::freezeDeletePlan must run on shard 0");
     if (!replicated_ || !shardsStarted_)
         throw std::runtime_error("ClusterDataPlane::freezeDeletePlan requires replicated mode after start()");
-    // Freeze only requests whose eventual VShard command can be emitted. A
-    // premature plan is durable group-0 state: storing one while v6 is inactive
-    // would bind the client's key even though no data mutation was possible.
-    if (!data::JournalFormatGate::supports(data::kFrozenDeletePlanActivationVersion))
-        throw data::ClusterFormatUnsupportedError("frozen pattern deletes require committed cluster format v" +
-                                                  std::to_string(data::kFrozenDeletePlanActivationVersion) +
-                                                  ", but shard 0 has activated only v" +
-                                                  std::to_string(data::JournalFormatGate::activeVersion()));
     auto* host = shards_.local().group0();
     if (!host || !host->group() || !host->stateMachine())
         throw data::RetryableWriteError("pattern delete requires the local group-0 host");
@@ -1536,8 +1140,6 @@ seastar::future<std::vector<data::DeleteRangeTarget>> ClusterDataPlane::freezeDe
                     seastar::rpc::rpc_clock_type::now() +
                         data::ReplicatedBatchWriteRouter::kAttemptTimeout);
         }
-    } catch (const data::ClusterFormatUnsupportedError&) {
-        throw;
     } catch (const seastar::timed_out_error&) {
         // The group-0 entry may still commit after the local waiter expires, but
         // no data-group proposal has started. The retry's lookup-first path will
@@ -1570,10 +1172,6 @@ seastar::future<std::vector<data::DeleteRangeTarget>> ClusterDataPlane::freezeDe
         case control::FreezeDeletePlanStatus::Capacity:
             throw data::RetryableWriteError(
                 "group-0 frozen delete-plan capacity is full; retry after the oldest plan expires");
-        case control::FreezeDeletePlanStatus::FormatInactive:
-            throw data::ClusterFormatUnsupportedError(
-                "frozen pattern deletes require committed cluster format v" +
-                std::to_string(data::kFrozenDeletePlanActivationVersion));
         case control::FreezeDeletePlanStatus::NotFound:
             throw std::logic_error("freezeDeletePlan returned NotFound after proposing a plan");
         case control::FreezeDeletePlanStatus::Invalid:
@@ -1588,11 +1186,6 @@ seastar::future<std::optional<std::vector<data::DeleteRangeTarget>>> ClusterData
         throw std::logic_error("ClusterDataPlane::lookupDeletePlan must run on shard 0");
     if (!replicated_ || !shardsStarted_)
         throw std::runtime_error("ClusterDataPlane::lookupDeletePlan requires replicated mode after start()");
-    if (!data::JournalFormatGate::supports(data::kFrozenDeletePlanActivationVersion))
-        throw data::ClusterFormatUnsupportedError("frozen pattern deletes require committed cluster format v" +
-                                                  std::to_string(data::kFrozenDeletePlanActivationVersion) +
-                                                  ", but shard 0 has activated only v" +
-                                                  std::to_string(data::JournalFormatGate::activeVersion()));
     auto* host = shards_.local().group0();
     if (!host || !host->group() || !host->stateMachine())
         throw data::RetryableWriteError("pattern delete requires the local group-0 host");
@@ -1618,8 +1211,6 @@ seastar::future<std::optional<std::vector<data::DeleteRangeTarget>>> ClusterData
                     seastar::rpc::rpc_clock_type::now() +
                         data::ReplicatedBatchWriteRouter::kAttemptTimeout);
         }
-    } catch (const data::ClusterFormatUnsupportedError&) {
-        throw;
     } catch (const std::exception& e) {
         throw data::RetryableWriteError(
             "could not reach the group-0 leader to look up the delete plan: " + std::string(e.what()));
@@ -1641,10 +1232,6 @@ seastar::future<std::optional<std::vector<data::DeleteRangeTarget>>> ClusterData
         case control::FreezeDeletePlanStatus::Conflict:
             throw data::DeletePlanConflictError(
                 "Idempotency-Key is already bound to a different retained delete request");
-        case control::FreezeDeletePlanStatus::FormatInactive:
-            throw data::ClusterFormatUnsupportedError(
-                "frozen pattern deletes require committed cluster format v" +
-                std::to_string(data::kFrozenDeletePlanActivationVersion));
         case control::FreezeDeletePlanStatus::Invalid:
             throw std::invalid_argument("invalid frozen pattern-delete request identity");
         case control::FreezeDeletePlanStatus::Capacity:
@@ -1663,10 +1250,6 @@ seastar::future<ClusterDataPlane::Status> ClusterDataPlane::status() const {
     st.replicated = replicated_;
     st.replicationFactor = rf_;
     st.controlEnabled = controlEnabled_;
-    st.controlCapabilitiesComplete = controlCapabilitiesComplete_;
-    st.controlIdentityConflict = controlIdentityConflict_;
-    st.controlCapabilitiesObserved = controlCapabilities_.size();
-    st.controlCapabilityFailures = controlCapabilityFailures_;
     if (!replicated_ || !shardsStarted_)
         co_return st;
     std::vector<data::NodeId> peers;
@@ -1677,8 +1260,6 @@ seastar::future<ClusterDataPlane::Status> ClusterDataPlane::status() const {
     // Readiness requires the trigger on EVERY shard. Starting false and OR-ing
     // masked a dead snapshot loop on N-1 shards as long as one shard remained live.
     st.snapshotTriggerEnabled = true;
-    st.snapshotFormatReady = true;
-    st.activeClusterFormat = std::numeric_limits<uint32_t>::max();
     for (unsigned sh = 0; sh < seastar::smp::count; ++sh) {
         auto c = co_await shards.invoke_on(sh, [self, peers](ShardRaftPlane& p) { return p.counts(self, peers); });
         st.vshardsHostedHere += c.hosted;
@@ -1705,8 +1286,6 @@ seastar::future<ClusterDataPlane::Status> ClusterDataPlane::status() const {
         st.snapshotTransfersAbandoned += sc.transfersAbandoned;
         st.snapshotProductionLimitPerShard = std::max(st.snapshotProductionLimitPerShard, sc.productionLimit);
         st.snapshotTriggerEnabled = st.snapshotTriggerEnabled && sc.triggerEnabled;
-        st.snapshotFormatReady = st.snapshotFormatReady && sc.snapshotFormatReady;
-        st.activeClusterFormat = std::min(st.activeClusterFormat, sc.activeClusterFormat);
         auto jc = co_await shards.invoke_on(sh, [](ShardRaftPlane& p) { return p.journalCounts(); });
         st.journalFsyncs += jc.fsyncs;
         st.journalSyncRequests += jc.syncRequests;
@@ -1722,8 +1301,6 @@ seastar::future<ClusterDataPlane::Status> ClusterDataPlane::status() const {
         st.uncommittedRaftRefusals += jc.uncommittedRefusals;
         st.journalShared = st.journalShared || jc.shared;
     }
-    if (st.activeClusterFormat == std::numeric_limits<uint32_t>::max())
-        st.activeClusterFormat = 1;
     auto control = co_await shards.invoke_on(0, [](ShardRaftPlane& p) { return p.group0Counts(); });
     st.controlHosted = control.hosted;
     st.controlInitialized = control.initialized;
@@ -1740,7 +1317,6 @@ seastar::future<ClusterDataPlane::Status> ClusterDataPlane::status() const {
     st.controlSnapshotIndex = control.snapshotIndex;
     st.controlMapEpoch = control.mapEpoch;
     st.controlServingMapEpoch = control.servingMapEpoch;
-    st.controlActiveFormat = control.activeFormat;
     st.controlNodes = control.nodes;
     st.controlVoters = control.voters;
     st.controlLearners = control.learners;
@@ -1821,11 +1397,6 @@ seastar::future<> ClusterDataPlane::deleteRangesFromShard(std::vector<data::Dele
         throw std::invalid_argument("ClusterDataPlane::deleteRangesFromShard requires a non-zero operation ID");
     if (issuedAtMs == 0)
         throw std::invalid_argument("ClusterDataPlane::deleteRangesFromShard requires an issuance timestamp");
-    if (!data::JournalFormatGate::supports(data::kBoundedDeleteReceiptActivationVersion))
-        throw data::ClusterFormatUnsupportedError("bounded replicated deletes require committed cluster format v" +
-                                                  std::to_string(data::kBoundedDeleteReceiptActivationVersion) +
-                                                  ", but this shard has activated only v" +
-                                                  std::to_string(data::JournalFormatGate::activeVersion()));
     if (targets.empty() || targets.size() > data::kMaxDeleteRangeBatchTargets)
         throw std::invalid_argument("ClusterDataPlane::deleteRangesFromShard requires a bounded non-empty batch");
     const uint16_t vshard = timestar::virtualShard(SeriesId128::fromSeriesKey(targets.front().seriesKey));

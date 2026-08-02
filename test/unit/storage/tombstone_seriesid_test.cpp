@@ -124,7 +124,6 @@ TEST(TombstoneSeriesIdTest, EntryComparisonOperators) {
     EXPECT_TRUE(e1 == e1);
 }
 
-// Test the TOMBSTONE_VERSION was bumped to 2
-TEST(TombstoneSeriesIdTest, VersionBumped) {
-    EXPECT_EQ(TOMBSTONE_VERSION, 2u);
+TEST(TombstoneSeriesIdTest, FormatIsV1) {
+    EXPECT_EQ(TOMBSTONE_VERSION, 1u);
 }

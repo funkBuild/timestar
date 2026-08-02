@@ -12,7 +12,7 @@ using timestar::FieldValues;
 using timestar::QueryRequest;
 using timestar::http::SeriesResult;
 
-TEST(NodeQueryCodec, RequestRoundTripIncludingCompatFields) {
+TEST(NodeQueryCodec, RequestRoundTripIncludingVShardResolution) {
     NodeQueryRequest req;
     req.request.aggregation = AggregationMethod::SUM;
     req.request.measurement = "cpu";
@@ -134,50 +134,43 @@ TEST(NodeQueryCodec, OutOfRangeAggregationMethodRejected) {
     EXPECT_FALSE(decodeNodeQueryRequest(f).has_value()) << "out-of-range method must be rejected";
 }
 
-// --- debt D-13: the RF < N leader-resolution fields ---------------------------------
-//
 // A coordinator can only resolve the leader of a VShard it HOSTS, so at RF < N it names
 // the rest for the HOLDER to resolve (`resolveVShards`) and the holder answers for what
-// it leads, redirecting the rest (`redirects`). Both are OPTIONAL TAILS: a request that
-// resolves everything locally -- which is every request an RF == N cluster sends, and
-// every request a pre-D-13 peer sends -- must encode byte-for-byte as before, or a
-// mixed-version cluster stops talking.
+// it leads, redirecting the rest (`redirects`). The v1 layout always carries both counts.
 
-TEST(NodeQueryCodec, ResolveVShardsRoundTripAndAbsentWhenEmpty) {
+TEST(NodeQueryCodec, ResolveVShardsRoundTripAndEmptyList) {
     NodeQueryRequest req;
     req.request.measurement = "m";
     req.vshards = {1, 2, 3, 4};
-    const std::string withoutTail = encodeNodeQueryRequest(req);
+    const std::string emptyList = encodeNodeQueryRequest(req);
 
     req.resolveVShards = {2, 4};
     const std::string withTail = encodeNodeQueryRequest(req);
-    EXPECT_NE(withTail, withoutTail) << "the tail must actually be written";
+    EXPECT_NE(withTail, emptyList);
 
     auto back = decodeNodeQueryRequest(withTail);
     ASSERT_TRUE(back.has_value());
     EXPECT_EQ(back->vshards, (std::vector<uint16_t>{1, 2, 3, 4}));
     EXPECT_EQ(back->resolveVShards, (std::vector<uint16_t>{2, 4}));
 
-    // The pre-D-13 encoding still decodes, and to an EMPTY resolve list -- i.e. "answer
-    // everything named, no leadership check", which is the old behaviour exactly.
-    auto old = decodeNodeQueryRequest(withoutTail);
-    ASSERT_TRUE(old.has_value());
-    EXPECT_TRUE(old->resolveVShards.empty());
+    auto empty = decodeNodeQueryRequest(emptyList);
+    ASSERT_TRUE(empty.has_value());
+    EXPECT_TRUE(empty->resolveVShards.empty());
     NodeQueryRequest same = req;
     same.resolveVShards.clear();
-    EXPECT_EQ(encodeNodeQueryRequest(same), withoutTail) << "empty resolve list must not change the bytes";
+    EXPECT_EQ(encodeNodeQueryRequest(same), emptyList);
 }
 
-TEST(NodeQueryCodec, RedirectsRoundTripAndAbsentWhenEmpty) {
+TEST(NodeQueryCodec, RedirectsRoundTripAndEmptyList) {
     NodeQueryPartial p;
     p.seriesFound = 3;
-    const std::string withoutTail = encodeNodeQueryPartial(p);
+    const std::string emptyList = encodeNodeQueryPartial(p);
 
     p.redirects.push_back(VShardRedirect{7, 4, true});     // hosted, node 4 leads it
     p.redirects.push_back(VShardRedirect{9, 0, true});     // hosted, no elected leader
     p.redirects.push_back(VShardRedirect{11, 0, false});   // not hosted here at all
     const std::string withTail = encodeNodeQueryPartial(p);
-    EXPECT_NE(withTail, withoutTail);
+    EXPECT_NE(withTail, emptyList);
 
     auto back = decodeNodeQueryPartial(withTail);
     ASSERT_TRUE(back.has_value());
@@ -190,9 +183,9 @@ TEST(NodeQueryCodec, RedirectsRoundTripAndAbsentWhenEmpty) {
     EXPECT_FALSE(back->redirects[2].hosted);
     EXPECT_EQ(back->seriesFound, 3u);
 
-    auto old = decodeNodeQueryPartial(withoutTail);
-    ASSERT_TRUE(old.has_value());
-    EXPECT_TRUE(old->redirects.empty());
+    auto empty = decodeNodeQueryPartial(emptyList);
+    ASSERT_TRUE(empty.has_value());
+    EXPECT_TRUE(empty->redirects.empty());
 }
 
 TEST(NodeQueryCodec, TruncatedRedirectTailIsRejected) {

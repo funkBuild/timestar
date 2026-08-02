@@ -268,15 +268,9 @@ std::string encodeNodeQueryRequest(const NodeQueryRequest& req) {
         w.u16(v);
     w.u64(req.taskId);
     w.u64(req.mapEpoch);
-    // OPTIONAL TAIL (D-13). Written only when non-empty, so a request that names no
-    // VShards to resolve is byte-identical to the pre-D-13 encoding -- which is every
-    // request an RF == N cluster ever sends, and the reason a mixed-version RF == N
-    // cluster is unaffected by this field.
-    if (!req.resolveVShards.empty()) {
-        w.u32(static_cast<uint32_t>(req.resolveVShards.size()));
-        for (uint16_t v : req.resolveVShards)
-            w.u16(v);
-    }
+    w.u32(static_cast<uint32_t>(req.resolveVShards.size()));
+    for (uint16_t v : req.resolveVShards)
+        w.u16(v);
     return finish(w);
 }
 
@@ -296,17 +290,12 @@ std::optional<NodeQueryRequest> decodeNodeQueryRequest(const std::string& bytes)
         req.vshards.push_back(r.u16());
     req.taskId = r.u64();
     req.mapEpoch = r.u64();
-    // OPTIONAL TAIL (D-13): absent from a pre-D-13 peer's request, and absent from any
-    // request that names nothing to resolve. Present => read it and still require full
-    // consumption, so a truncated or padded tail is a decode failure like any other.
-    if (r.ok && r.p != r.end) {
-        uint32_t nr = r.u32();
-        if (!r.ok || nr > static_cast<uint64_t>(r.end - r.p) / 2)
-            return std::nullopt;
-        req.resolveVShards.reserve(nr);
-        for (uint32_t i = 0; i < nr; ++i)
-            req.resolveVShards.push_back(r.u16());
-    }
+    uint32_t nr = r.u32();
+    if (!r.ok || nr > static_cast<uint64_t>(r.end - r.p) / 2)
+        return std::nullopt;
+    req.resolveVShards.reserve(nr);
+    for (uint32_t i = 0; i < nr; ++i)
+        req.resolveVShards.push_back(r.u16());
     if (!r.ok || r.p != r.end)
         return std::nullopt;
     return req;
@@ -334,16 +323,11 @@ std::string encodeNodeQueryPartial(const NodeQueryPartial& partial) {
     }
     w.u64(partial.seriesFound);
     w.strvec(partial.incompleteReasons);
-    // OPTIONAL TAIL (D-13), written only when this node redirected something -- which
-    // it can only do for VShards the coordinator explicitly asked it to resolve. An
-    // RF == N cluster never sends that list, so its partials stay byte-identical.
-    if (!partial.redirects.empty()) {
-        w.u32(static_cast<uint32_t>(partial.redirects.size()));
-        for (const auto& rd : partial.redirects) {
-            w.u16(rd.vshard);
-            w.u64(rd.leader);
-            w.u8(rd.hosted ? 1 : 0);
-        }
+    w.u32(static_cast<uint32_t>(partial.redirects.size()));
+    for (const auto& rd : partial.redirects) {
+        w.u16(rd.vshard);
+        w.u64(rd.leader);
+        w.u8(rd.hosted ? 1 : 0);
     }
     return finish(w);
 }
@@ -397,19 +381,16 @@ std::optional<NodeQueryPartial> decodeNodeQueryPartial(const std::string& bytes)
     }
     partial.seriesFound = r.u64();
     partial.incompleteReasons = r.strvec();
-    // OPTIONAL TAIL (D-13); see the encoder.
-    if (r.ok && r.p != r.end) {
-        uint32_t nr = r.u32();
-        if (!r.ok || nr > static_cast<uint64_t>(r.end - r.p) / 11)  // u16 + u64 + u8
-            return std::nullopt;
-        partial.redirects.reserve(nr);
-        for (uint32_t i = 0; i < nr; ++i) {
-            VShardRedirect rd;
-            rd.vshard = r.u16();
-            rd.leader = r.u64();
-            rd.hosted = r.u8() != 0;
-            partial.redirects.push_back(rd);
-        }
+    uint32_t nr = r.u32();
+    if (!r.ok || nr > static_cast<uint64_t>(r.end - r.p) / 11)  // u16 + u64 + u8
+        return std::nullopt;
+    partial.redirects.reserve(nr);
+    for (uint32_t i = 0; i < nr; ++i) {
+        VShardRedirect rd;
+        rd.vshard = r.u16();
+        rd.leader = r.u64();
+        rd.hosted = r.u8() != 0;
+        partial.redirects.push_back(rd);
     }
     if (!r.ok || r.p != r.end)
         return std::nullopt;

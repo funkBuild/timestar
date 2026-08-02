@@ -33,8 +33,6 @@ seastar::future<> EngineDataStateMachine::apply(raft::LogEntry entry) {
         targetsThisVShard = !w->series.empty();
         for (auto& series : w->series)
             targetsThisVShard = targetsThisVShard && data::vshardOf(series) == vshard_.value();
-    } else if (const auto* d = std::get_if<data::DeleteRangeKey>(&*cmd)) {
-        targetsThisVShard = timestar::virtualShard(SeriesId128::fromSeriesKey(d->seriesKey)) == vshard_.value();
     } else if (const auto* batch = std::get_if<data::DeleteRangeBatch>(&*cmd)) {
         targetsThisVShard = !batch->targets.empty();
         for (const auto& target : batch->targets)
@@ -52,25 +50,6 @@ seastar::future<> EngineDataStateMachine::apply(raft::LogEntry entry) {
         for (auto& s : w->series)
             s.revisions.assign(s.timestamps.size(), entry.index);
         co_await store_.applyCommittedWrites(std::move(*w));
-    } else if (auto* d = std::get_if<data::DeleteRangeKey>(&*cmd)) {
-        const bool idempotent = d->operationId != SeriesId128{};
-        const uint64_t commandHash = data::deleteRangeCommandHash(*d);
-        if (idempotent) {
-            if (const auto found = deleteReceipts_.find(d->operationId); found != deleteReceipts_.end()) {
-                if (found->second.commandHash != commandHash)
-                    throw std::runtime_error(
-                        "EngineDataStateMachine: delete operation ID reused for another command (fail-stop)");
-                co_return;
-            }
-            makeRoomForDeleteReceipt(entry.index);
-        }
-        co_await store_.applyDelete(d->seriesKey, d->startTime, d->endTime);
-        // Publish the receipt only after every Engine delete effect is durable.
-        // A failure before here leaves the Raft entry unapplied; replay uses the
-        // same log index and safely completes the same physical mutation.
-        if (idempotent)
-            deleteReceipts_.emplace(d->operationId,
-                                    data::DeleteOperationReceipt{d->operationId, entry.index, commandHash, 0});
     } else if (auto* batch = std::get_if<data::DeleteRangeBatch>(&*cmd)) {
         const uint64_t commandHash = data::deleteRangeCommandHash(*batch);
         if (const auto found = deleteReceipts_.find(batch->operationId); found != deleteReceipts_.end()) {
@@ -79,19 +58,15 @@ seastar::future<> EngineDataStateMachine::apply(raft::LogEntry entry) {
                     "EngineDataStateMachine: delete operation ID reused for another command (fail-stop)");
             co_return;
         }
-        if (batch->issuedAtMs != 0) {
-            const uint64_t timeFloor = batch->issuedAtMs > data::kDeleteReceiptRetentionMs
-                                           ? batch->issuedAtMs - data::kDeleteReceiptRetentionMs
-                                           : 0;
-            advanceDeleteReceiptFloor(timeFloor, entry.index);
-            if (batch->issuedAtMs <= deleteReceiptsRetiredBeforeMs_)
-                co_return;
-            makeRoomForDeleteReceipt(entry.index);
-            if (batch->issuedAtMs <= deleteReceiptsRetiredBeforeMs_)
-                co_return;
-        } else {
-            makeRoomForDeleteReceipt(entry.index);
-        }
+        const uint64_t timeFloor = batch->issuedAtMs > data::kDeleteReceiptRetentionMs
+                                       ? batch->issuedAtMs - data::kDeleteReceiptRetentionMs
+                                       : 0;
+        advanceDeleteReceiptFloor(timeFloor, entry.index);
+        if (batch->issuedAtMs <= deleteReceiptsRetiredBeforeMs_)
+            co_return;
+        makeRoomForDeleteReceipt(entry.index);
+        if (batch->issuedAtMs <= deleteReceiptsRetiredBeforeMs_)
+            co_return;
         // One Raft entry is the ordering boundary for the whole canonical
         // VShard batch. If applyDelete fails halfway, no receipt is published;
         // replay repeats the prefix before any later entry can apply, so it
@@ -171,7 +146,7 @@ void EngineDataStateMachine::restoreDeleteReceiptState(data::DeleteReceiptSnapsh
     std::map<SeriesId128, data::DeleteOperationReceipt> replacement;
     for (auto& receipt : state.receipts) {
         if (receipt.operationId == SeriesId128{} || receipt.appliedIndex == 0 || receipt.appliedIndex > snapshotIndex ||
-            (receipt.issuedAtMs != 0 && receipt.issuedAtMs <= state.retiredBeforeMs) ||
+            receipt.issuedAtMs == 0 || receipt.issuedAtMs <= state.retiredBeforeMs ||
             !replacement.emplace(receipt.operationId, receipt).second)
             throw std::runtime_error("EngineDataStateMachine: invalid snapshot delete receipt (fail-stop)");
     }
@@ -181,16 +156,12 @@ void EngineDataStateMachine::restoreDeleteReceiptState(data::DeleteReceiptSnapsh
 }
 
 void EngineDataStateMachine::checkDeleteAdmission(const data::DeleteRangeBatch& command) const {
+    if (command.issuedAtMs == 0)
+        throw std::invalid_argument("delete command must have a non-zero issue time");
     const uint64_t commandHash = data::deleteRangeCommandHash(command);
     if (const auto found = deleteReceipts_.find(command.operationId); found != deleteReceipts_.end()) {
         if (found->second.commandHash != commandHash)
             throw std::invalid_argument("delete operation ID is already bound to another command");
-        return;
-    }
-    if (command.issuedAtMs == 0) {
-        if (deleteReceipts_.size() >= maxDeleteReceipts_ &&
-            std::ranges::none_of(deleteReceipts_, [](const auto& item) { return item.second.issuedAtMs != 0; }))
-            throw data::WriteOverloadedError("legacy delete receipt capacity is exhausted for this VShard");
         return;
     }
     const uint64_t timeFloor =
@@ -200,20 +171,17 @@ void EngineDataStateMachine::checkDeleteAdmission(const data::DeleteRangeBatch& 
         throw data::DeleteReceiptExpiredError("delete idempotency receipt is outside the retained VShard window");
 
     size_t receiptsAfterTimeRetirement = 0;
-    uint64_t oldestModernReceipt = UINT64_MAX;
+    uint64_t oldestReceipt = UINT64_MAX;
     for (const auto& item : deleteReceipts_) {
         const auto& receipt = item.second;
-        if (receipt.issuedAtMs == 0 || receipt.issuedAtMs > prospectiveFloor) {
+        if (receipt.issuedAtMs > prospectiveFloor) {
             ++receiptsAfterTimeRetirement;
-            if (receipt.issuedAtMs != 0)
-                oldestModernReceipt = std::min(oldestModernReceipt, receipt.issuedAtMs);
+            oldestReceipt = std::min(oldestReceipt, receipt.issuedAtMs);
         }
     }
     if (receiptsAfterTimeRetirement < maxDeleteReceipts_)
         return;
-    if (oldestModernReceipt == UINT64_MAX)
-        throw data::WriteOverloadedError("legacy delete receipts consume this VShard's bounded capacity");
-    if (command.issuedAtMs <= oldestModernReceipt)
+    if (command.issuedAtMs <= oldestReceipt)
         throw data::DeleteReceiptExpiredError("delete idempotency receipt is outside the retained VShard capacity");
 }
 
@@ -222,17 +190,13 @@ EngineDataStateMachine::DeleteReceiptStatus EngineDataStateMachine::deleteReceip
     const uint64_t commandHash = data::deleteRangeCommandHash(command);
     if (const auto found = deleteReceipts_.find(command.operationId); found != deleteReceipts_.end())
         return found->second.commandHash == commandHash ? DeleteReceiptStatus::Retained : DeleteReceiptStatus::Missing;
-    if (command.issuedAtMs != 0 && command.issuedAtMs <= deleteReceiptsRetiredBeforeMs_)
+    if (command.issuedAtMs <= deleteReceiptsRetiredBeforeMs_)
         return DeleteReceiptStatus::Expired;
     return DeleteReceiptStatus::Missing;
 }
 
 EngineDataStateMachine::DeleteReceiptCounts EngineDataStateMachine::deleteReceiptCounts() const {
-    DeleteReceiptCounts counts{0, deleteReceipts_.size()};
-    for (const auto& item : deleteReceipts_)
-        if (item.second.issuedAtMs == 0)
-            ++counts.legacy;
-    return counts;
+    return DeleteReceiptCounts{deleteReceipts_.size()};
 }
 
 void EngineDataStateMachine::advanceDeleteReceiptFloor(uint64_t floorMs, uint64_t appliedIndex) {
@@ -240,24 +204,18 @@ void EngineDataStateMachine::advanceDeleteReceiptFloor(uint64_t floorMs, uint64_
         return;
     deleteReceiptsRetiredBeforeMs_ = floorMs;
     deleteReceiptsRetiredAtIndex_ = appliedIndex;
-    std::erase_if(deleteReceipts_, [floorMs](const auto& item) {
-        return item.second.issuedAtMs != 0 && item.second.issuedAtMs <= floorMs;
-    });
+    std::erase_if(deleteReceipts_, [floorMs](const auto& item) { return item.second.issuedAtMs <= floorMs; });
 }
 
 void EngineDataStateMachine::makeRoomForDeleteReceipt(uint64_t appliedIndex) {
     if (deleteReceipts_.size() < maxDeleteReceipts_)
         return;
-    uint64_t oldestModernReceipt = UINT64_MAX;
+    uint64_t oldestReceipt = UINT64_MAX;
     for (const auto& item : deleteReceipts_) {
         const auto& receipt = item.second;
-        if (receipt.issuedAtMs != 0)
-            oldestModernReceipt = std::min(oldestModernReceipt, receipt.issuedAtMs);
+        oldestReceipt = std::min(oldestReceipt, receipt.issuedAtMs);
     }
-    if (oldestModernReceipt == UINT64_MAX)
-        throw std::runtime_error(
-            "EngineDataStateMachine: legacy delete receipts consume the configured hard cap (fail-stop)");
-    advanceDeleteReceiptFloor(oldestModernReceipt, appliedIndex);
+    advanceDeleteReceiptFloor(oldestReceipt, appliedIndex);
 }
 
 }  // namespace timestar::cluster

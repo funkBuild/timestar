@@ -26,7 +26,7 @@ protected:
     void TearDown() override { fs::remove_all(dir); }
 };
 
-// Write a single float series (with revisions) to a V4 file and open it.
+// Write a single float series (with revisions) to a v1 file and open it.
 seastar::future<seastar::shared_ptr<::TSM>> writeRevFile(std::string p, uint64_t seq, const std::string& key,
                                                          std::vector<uint64_t> ts, std::vector<double> vs,
                                                          std::vector<uint64_t> revs) {

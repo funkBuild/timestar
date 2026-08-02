@@ -4,7 +4,6 @@
 // Runs the real group-0 RaftGroup + Group0StateMachine + Group0Controller over
 // an in-memory router (no sockets).
 #include "../../../lib/cluster/control/group0_controller.hpp"
-#include "../../../lib/cluster/data/journal_format.hpp"
 #include "../../../lib/cluster/raft/raft_group.hpp"
 
 #include <gtest/gtest.h>
@@ -369,87 +368,6 @@ seastar::future<> testJoinTokenGatesAdmission() {
     EXPECT_EQ(nodes[1].sm->state().clusterUuid, "c1");
 }
 
-// M6 rolling-upgrade format activation: activateFormat commits a new active version
-// ONLY if every voter can read it, monotonically; an unsupported version is refused.
-seastar::future<> testFormatActivationGatedByVoterSupport() {
-    Router router;
-    std::vector<std::unique_ptr<RouterTransport>> transports;
-    Nodes nodes;
-    auto makeNode = [&](NodeId id) {
-        transports.push_back(std::make_unique<RouterTransport>(router));
-        NodeBox box;
-        box.persistence = std::make_unique<NoopPersistence>();
-        box.sm = std::make_unique<Group0StateMachine>();
-        RaftNode rn(id, {1}, RaftLog{}, HardState{}, optsFor(id));
-        box.group = std::make_unique<RaftGroup>(0, std::move(rn), *box.persistence, *transports.back(), *box.sm);
-        router.setGroup(id, box.group.get());
-        nodes[id] = std::move(box);
-    };
-    makeNode(1);
-    makeNode(2);
-    makeNode(3);
-
-    Group0Controller controller(*nodes[1].group, *nodes[1].sm, 3);
-    co_await nodes[1].group->campaign();
-    co_await router.pump();
-    co_await controller.initCluster("c1", rec(1, "rack-a"));
-    co_await router.pump();
-    EXPECT_TRUE(co_await controller.publishInitialServingMap(initialServingMap()));
-    EXPECT_EQ(nodes[1].sm->state().activeFormatVersion, 1u) << "starts at format 1";
-
-    // Group 0 has one voter, but the serving map has three. A meta-only
-    // capability proof is rejected rather than activating a format on data
-    // voters whose decoders were never checked.
-    EXPECT_FALSE(co_await controller.activateFormat(
-        3, {{1, timestar::features::VersionRange{1, 3}}}));
-    EXPECT_EQ(nodes[1].sm->state().activeFormatVersion, 1u);
-
-    const std::map<NodeId, timestar::features::VersionRange> v3 = {
-        {1, {1, 3}}, {2, {1, 3}}, {3, {1, 3}}};
-    EXPECT_FALSE(co_await controller.activateFormat(3, v3))
-        << "capability does not prove that an observer receives group-0 activation";
-    co_await drive(controller.admitNode(rec(2, "rack-b")), nodes, router);
-    EXPECT_TRUE(co_await drive(controller.addLearner(2), nodes, router));
-    co_await drive(controller.admitNode(rec(3, "rack-c")), nodes, router);
-    EXPECT_TRUE(co_await drive(controller.addLearner(3), nodes, router));
-
-    EXPECT_TRUE(co_await drive(controller.activateFormat(3, v3), nodes, router));
-    co_await router.pump();
-    EXPECT_EQ(nodes[1].sm->state().activeFormatVersion, 3u);
-    EXPECT_EQ(nodes[2].sm->state().activeFormatVersion, 3u);
-    EXPECT_EQ(nodes[3].sm->state().activeFormatVersion, 3u);
-
-    // Re-activating the already committed version is a no-op, not a successful
-    // cluster decision.
-    EXPECT_FALSE(co_await controller.activateFormat(3, v3));
-
-    // Version 5 exceeds the voter's max (3) -> REFUSED, no proposal, version unchanged.
-    EXPECT_FALSE(co_await controller.activateFormat(5, v3));
-    co_await router.pump();
-    EXPECT_EQ(nodes[1].sm->state().activeFormatVersion, 3u) << "unsupported version must not activate";
-
-    // One lagging data voter blocks activation even though the sole meta-voter
-    // supports it.
-    EXPECT_FALSE(co_await controller.activateFormat(
-        4, {{1, {1, 4}}, {2, {1, 4}}, {3, {1, 3}}}));
-    co_await router.pump();
-    EXPECT_EQ(nodes[1].sm->state().activeFormatVersion, 3u) << "one lagging voter blocks activation";
-
-    // Once every voter advertises v5, the same committed mechanism activates
-    // bounded delete commands, payload v4, and the Expired reply contract.
-    EXPECT_TRUE(co_await drive(
-        controller.activateFormat(5, {{1, {1, 5}}, {2, {1, 5}}, {3, {1, 5}}}), nodes, router));
-    co_await router.pump();
-    EXPECT_EQ(nodes[1].sm->state().activeFormatVersion, 5u);
-
-    // A controller that committed the real config and then lost leadership can
-    // leave only the state-machine mirror stale. The next reconcile repairs it
-    // even though no further Raft membership transition is needed.
-    EXPECT_TRUE(co_await controller.proposeCommand(SetMetaVoters{{9}}));
-    EXPECT_TRUE(co_await controller.reconcileMetaVoters());
-    EXPECT_EQ(nodes[1].sm->state().metaVoters, (std::vector<NodeId>{1}));
-}
-
 seastar::future<> testDeletePlanFreezesFirstExpansion() {
     Router router;
     std::vector<std::unique_ptr<RouterTransport>> transports;
@@ -475,13 +393,6 @@ seastar::future<> testDeletePlanFreezesFirstExpansion() {
     EXPECT_TRUE(co_await controller.publishInitialServingMap(initialServingMap({1})));
 
     const auto original = frozenPlan('1', 'a', {{"m,host=a value", 10, 20}});
-    auto inactive = co_await controller.freezeDeletePlan(original);
-    EXPECT_EQ(inactive.status, FreezeDeletePlanStatus::FormatInactive)
-        << "tag 14 must not ride the older v5 activation";
-    EXPECT_TRUE(co_await controller.activateFormat(
-        timestar::data::kFrozenDeletePlanActivationVersion,
-        {{1, {1, timestar::data::kFrozenDeletePlanActivationVersion}}}));
-
     auto identity = original;
     identity.targets.clear();
     EXPECT_EQ(controller.lookupDeletePlan(identity).status, FreezeDeletePlanStatus::NotFound);
@@ -545,14 +456,6 @@ seastar::future<> testDeletePlanProposalDeadlineBoundsQuorumLoss() {
     EXPECT_TRUE(nodes[1].group->isLeader());
     co_await drive(controller.initCluster("c1", rec(1, "rack-a")), nodes, router);
     EXPECT_TRUE(co_await drive(controller.publishInitialServingMap(initialServingMap()), nodes, router));
-    EXPECT_TRUE(co_await drive(
-        controller.activateFormat(
-            timestar::data::kFrozenDeletePlanActivationVersion,
-            {{1, {1, timestar::data::kFrozenDeletePlanActivationVersion}},
-             {2, {1, timestar::data::kFrozenDeletePlanActivationVersion}},
-             {3, {1, timestar::data::kFrozenDeletePlanActivationVersion}}}),
-        nodes, router));
-
     // Leave node 1 believing it is leader, but make its next entry unable to
     // reach either follower. Group 0 intentionally does not use CheckQuorum,
     // so the controller's default proposal deadline is what bounds this request.
@@ -573,10 +476,6 @@ seastar::future<> testDeletePlanProposalDeadlineBoundsQuorumLoss() {
 }
 
 }  // namespace
-
-TEST(Group0ControllerTest, FormatActivationGatedByVoterSupport) {
-    testFormatActivationGatedByVoterSupport().get();
-}
 
 TEST(Group0ControllerTest, ClusterInitGrowsMetaVotersAcrossFailureDomains) {
     testClusterInitGrowsMetaVotersAcrossDomains().get();

@@ -21,10 +21,6 @@
 //      from the one the leader assumed.
 //   4. A RESTARTED TRANSFER DISCARDS A STALE PARTIAL, keyed by (index, term), so one
 //      snapshot's bytes can never be spliced onto another's.
-//   5. MIXED VERSIONS FAIL CLOSED. A one-message snapshot still goes out under the
-//      ORIGINAL wire tag (so an un-upgraded peer is caught up normally); a real chunk
-//      rides a NEW tag that an old decoder drops whole rather than misparsing -- which it
-//      would otherwise do, installing a prefix as if it were complete.
 #include "../../../lib/cluster/raft/raft_codec.hpp"
 #include "../../../lib/cluster/raft/raft_group.hpp"  // kMaxProposalBytes
 #include "../../../lib/cluster/raft/raft_node.hpp"
@@ -165,29 +161,13 @@ Envelope wrap(uint16_t gid, NodeId to, NodeId from, MessagePayload p) {
     return e;
 }
 
-// The message-type byte sits after the envelope header (u16 group + u64 to + u64 from).
-constexpr size_t kTagOffset = 2 + 8 + 8;
-uint8_t tagOf(const std::string& bytes) {
-    return static_cast<uint8_t>(bytes.at(kTagOffset));
-}
-
-// A model of a decoder that predates D-5: it knows tags 1..8 and nothing else. This is
-// the ONLY way to assert the mixed-version property, since the real old decoder is not in
-// this tree -- and the property it proves is the reason the chunk needed a new tag at all.
-bool preD5DecoderAccepts(const std::string& bytes) {
-    return bytes.size() > kTagOffset && tagOf(bytes) >= 1 && tagOf(bytes) <= 8;
-}
-
 }  // namespace
 
 // ---------------------------------------------------------------------------
 // Wire format
 // ---------------------------------------------------------------------------
 
-TEST(RaftSnapshotChunkingTest, AOneMessageSnapshotStillUsesTheOriginalWireTag) {
-    // THE MIXED-VERSION ESCAPE HATCH. A snapshot that fits in one chunk must be
-    // byte-identical to what a pre-D-5 leader emitted, or every un-upgraded peer loses
-    // snapshot catch-up the moment one node in the cluster is upgraded.
+TEST(RaftSnapshotChunkingTest, AOneMessageSnapshotUsesTheV1ChunkLayout) {
     InstallSnapshot is;
     is.term = 4;
     is.leaderId = 1;
@@ -195,13 +175,7 @@ TEST(RaftSnapshotChunkingTest, AOneMessageSnapshotStillUsesTheOriginalWireTag) {
     is.lastIncludedTerm = 3;
     is.config.voters = {1, 2, 3};
     is.data = "whole-payload";
-    // The defaults ARE the whole-payload shape, which is also what a pre-D-5 peer produces.
-    ASSERT_TRUE(is.isWholePayload());
     const std::string enc = encodeEnvelope(wrap(7, 2, 1, is));
-    EXPECT_EQ(tagOf(enc), 5) << "a one-message snapshot must keep the original tag";
-    EXPECT_TRUE(preD5DecoderAccepts(enc));
-
-    // ... and it decodes back into the normalized chunked representation.
     auto back = decodeEnvelope(enc);
     ASSERT_TRUE(back.has_value());
     const auto* got = std::get_if<InstallSnapshot>(&back->message.payload);
@@ -212,12 +186,7 @@ TEST(RaftSnapshotChunkingTest, AOneMessageSnapshotStillUsesTheOriginalWireTag) {
     EXPECT_TRUE(got->done);
 }
 
-TEST(RaftSnapshotChunkingTest, ARealChunkRidesANewTagAnOldDecoderDropsWhole) {
-    // WHY THE CHUNK FIELDS COULD NOT GO INSIDE TAG 5. `data` is the last field of that
-    // body and decodeEnvelope does not require every byte to be consumed, so an old
-    // decoder would read the header, take `data`, ignore the offset/total/done trailer --
-    // and INSTALL A PREFIX AS COMPLETE, reporting matchIndex for data it does not hold.
-    // An unknown tag is dropped whole instead: slow, counted, never wrong.
+TEST(RaftSnapshotChunkingTest, AChunkRoundTripsInV1) {
     InstallSnapshot chunk;
     chunk.term = 4;
     chunk.leaderId = 1;
@@ -228,12 +197,7 @@ TEST(RaftSnapshotChunkingTest, ARealChunkRidesANewTagAnOldDecoderDropsWhole) {
     chunk.offset = 0;
     chunk.totalBytes = 20;
     chunk.done = false;
-    ASSERT_FALSE(chunk.isWholePayload());
-
     const std::string enc = encodeEnvelope(wrap(7, 2, 1, chunk));
-    EXPECT_EQ(tagOf(enc), 9);
-    EXPECT_FALSE(preD5DecoderAccepts(enc)) << "an old peer must DROP this, not misparse it";
-
     auto back = decodeEnvelope(enc);
     ASSERT_TRUE(back.has_value());
     const auto* got = std::get_if<InstallSnapshot>(&back->message.payload);
@@ -282,17 +246,13 @@ TEST(RaftSnapshotChunkingTest, AChunkThatContradictsItsOwnArithmeticIsRejected) 
     EXPECT_TRUE(decodeEnvelope(encWith(0, 10, false, "12345")).has_value());
 }
 
-TEST(RaftSnapshotChunkingTest, AnInstallOutcomeReplyKeepsTheOriginalTagAndProgressDoesNot) {
-    // The ONE reply an old leader must be able to read is the completion, and it can: both
-    // progress fields sit at their defaults for an outcome, so it encodes as the original
-    // two-field reply. Progress rides tag 10, which pairs exactly with the tag-9 request.
+TEST(RaftSnapshotChunkingTest, InstallOutcomeAndProgressRepliesRoundTrip) {
     InstallSnapshotReply outcome;
     outcome.term = 4;
     outcome.matchIndex = 42;
     ASSERT_TRUE(outcome.isInstallOutcome());
     const std::string encOutcome = encodeEnvelope(wrap(1, 1, 2, outcome));
-    EXPECT_EQ(tagOf(encOutcome), 6);
-    EXPECT_TRUE(preD5DecoderAccepts(encOutcome));
+    EXPECT_TRUE(decodeEnvelope(encOutcome).has_value());
 
     InstallSnapshotReply progress;
     progress.term = 4;
@@ -301,8 +261,6 @@ TEST(RaftSnapshotChunkingTest, AnInstallOutcomeReplyKeepsTheOriginalTagAndProgre
     progress.stagedBytes = 4096;
     ASSERT_FALSE(progress.isInstallOutcome());
     const std::string encProgress = encodeEnvelope(wrap(1, 1, 2, progress));
-    EXPECT_EQ(tagOf(encProgress), 10);
-    EXPECT_FALSE(preD5DecoderAccepts(encProgress));
 
     auto back = decodeEnvelope(encProgress);
     ASSERT_TRUE(back.has_value());
@@ -310,30 +268,6 @@ TEST(RaftSnapshotChunkingTest, AnInstallOutcomeReplyKeepsTheOriginalTagAndProgre
     EXPECT_EQ(got.pendingSnapshotIndex, 42u);
     EXPECT_EQ(got.stagedBytes, 4096u);
     EXPECT_EQ(got.matchIndex, 7u);
-}
-
-TEST(RaftSnapshotChunkingTest, AnOutcomeShapedProgressReplyIsRejected) {
-    // A tag-10 reply with both progress fields at their defaults is a peer contradicting
-    // itself, and admitting it would have the leader read a mid-transfer ack as a
-    // completed install -- the exact confusion the two tags exist to make impossible.
-    std::string bytes;
-    auto u16 = [&](uint16_t v) {
-        bytes.push_back(static_cast<char>(v & 0xff));
-        bytes.push_back(static_cast<char>((v >> 8) & 0xff));
-    };
-    auto u64 = [&](uint64_t v) {
-        for (int i = 0; i < 8; ++i)
-            bytes.push_back(static_cast<char>((v >> (8 * i)) & 0xff));
-    };
-    u16(1);
-    u64(1);
-    u64(2);
-    bytes.push_back(static_cast<char>(10));  // kInstallSnapshotChunkReply
-    u64(4);                                  // term
-    u64(9);                                  // matchIndex
-    u64(0);                                  // pendingSnapshotIndex -- outcome-shaped
-    u64(0);                                  // stagedBytes
-    EXPECT_FALSE(decodeEnvelope(bytes).has_value());
 }
 
 // ---------------------------------------------------------------------------

@@ -850,7 +850,7 @@ SEASTAR_TEST_F(TSMCompactorTest, CompactionErrorHandling) {
     co_return;
 }
 
-// V4 revision ranges must survive the zero-copy compaction path: a block copied
+// Revision ranges must survive the zero-copy compaction path: a block copied
 // verbatim keeps its exact [minRev, maxRev]. Two files each holding a distinct
 // single series take the zero-copy path (all blocks non-overlapping), so their
 // ranges must be preserved in the compacted output (regression for the
@@ -897,7 +897,7 @@ SEASTAR_TEST_F(TSMCompactorTest, ZeroCopyCompactionPreservesRevisionRanges) {
 
     auto out = seastar::make_shared<TSM>(compactedResult.outputPath);
     co_await out->open();
-    EXPECT_EQ(out->fileFormatVersion(), 4u);
+    EXPECT_EQ(out->fileFormatVersion(), 1u);
 
     auto checkRange = [&](const SeriesId128& series, uint64_t wantMin, uint64_t wantMax) -> seastar::future<> {
         auto* entry = co_await out->getFullIndexEntry(series);
@@ -915,7 +915,7 @@ SEASTAR_TEST_F(TSMCompactorTest, ZeroCopyCompactionPreservesRevisionRanges) {
     co_return;
 }
 
-// V4 revision ranges must survive the MERGE (slow) compaction path too: two files
+// Revision ranges must survive the MERGE (slow) compaction path too: two files
 // with the SAME series and overlapping timestamps force a merge/re-block, and the
 // compacted file's max-revision trailer must still reflect the inputs' max (else
 // compaction erases revisions and breaks recovery-counter restoration -- LWW
@@ -956,7 +956,7 @@ SEASTAR_TEST_F(TSMCompactorTest, MergeCompactionPreservesMaxRevision) {
     co_await out->open();
     // Inputs' max revision is 1049 (file 1: 1000 + 49 + 1 - 1 = 1049). The merge
     // path must preserve it in the file-level trailer, not collapse to 0.
-    EXPECT_EQ(out->fileFormatVersion(), 4u);
+    EXPECT_EQ(out->fileFormatVersion(), 1u);
     EXPECT_GE(out->maxRevision(), 1049u) << "merge compaction erased revisions -> recovery counter would invert LWW";
     co_return;
 }

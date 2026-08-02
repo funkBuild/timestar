@@ -132,10 +132,6 @@ struct ClusterJoinRequestBody {
     std::string token;
 };
 
-struct ClusterFormatActivationRequestBody {
-    uint32_t version = 0;
-};
-
 static std::string readClusterCredential(const std::string& path, const char* label) {
     std::ifstream in(path, std::ios::binary);
     if (!in)
@@ -304,14 +300,7 @@ void set_routes(routes& r) {
                           std::to_string(st.controlControllerStampProposals) +
                           ",\"control_controller_actuation_failures\":" +
                           std::to_string(st.controlControllerActuationFailures) +
-                          ",\"control_capabilities_complete\":" +
-                          std::string(st.controlCapabilitiesComplete ? "true" : "false") +
-                          ",\"control_identity_conflict\":" +
-                          std::string(st.controlIdentityConflict ? "true" : "false") +
-                          ",\"control_capabilities_observed\":" +
-                          std::to_string(st.controlCapabilitiesObserved) +
-                          ",\"control_capability_failures\":" +
-                          std::to_string(st.controlCapabilityFailures);
+                          ",\"protocol_version\":1";
                   }
                   body += "}";
                   rep->_content = std::move(body);
@@ -452,66 +441,6 @@ void set_routes(routes& r) {
                         rep->_content = "{\"status\":\"rejected\",\"leader\":" + leader + "}";
                         break;
                 }
-            } catch (const std::exception& e) {
-                rep->set_status(seastar::http::reply::status_type::service_unavailable);
-                rep->_content = "{\"status\":\"error\",\"message\":\"" +
-                                timestar::jsonEscape(e.what()) + "\"}";
-            }
-            co_return std::move(rep);
-        });
-
-    timestar::http::addJsonRoute(
-        r, operation_type::POST, "/cluster/activate-format", authToken(),
-        [](std::unique_ptr<seastar::http::request> req,
-           std::unique_ptr<seastar::http::reply> rep) -> seastar::future<std::unique_ptr<seastar::http::reply>> {
-            if (authToken().empty()) {
-                rep->set_status(seastar::http::reply::status_type::unauthorized);
-                rep->_content = R"({"status":"error","message":"cluster format activation requires server authentication"})";
-                co_return std::move(rep);
-            }
-            if (!g_clusterPartitioned) {
-                rep->set_status(seastar::http::reply::status_type::bad_request);
-                rep->_content = R"({"status":"error","message":"node is not clustered"})";
-                co_return std::move(rep);
-            }
-            if (req->content.size() > 4096) {
-                rep->set_status(seastar::http::reply::status_type::bad_request);
-                rep->_content = R"({"status":"error","message":"activation request is too large"})";
-                co_return std::move(rep);
-            }
-            ClusterFormatActivationRequestBody body;
-            if (auto error = glz::read_json(body, req->content); error || body.version == 0 ||
-                body.version > timestar::data::kWriteBatchFormatMax) {
-                rep->set_status(seastar::http::reply::status_type::bad_request);
-                rep->_content = R"({"status":"error","message":"a supported non-zero version is required"})";
-                co_return std::move(rep);
-            }
-            try {
-                const auto result = co_await seastar::smp::submit_to(
-                    0u, [version = body.version] { return g_clusterDataPlane.activateControlFormat(version); });
-                if (!result.activated) {
-                    rep->set_status(seastar::http::reply::status_type::conflict);
-                    rep->_content = "{\"status\":\"error\",\"message\":\"this node is not the control "
-                                    "leader or the activation preconditions changed\",\"leader\":" +
-                                    std::to_string(result.leader) + ",\"active_format\":" +
-                                    std::to_string(result.activeFormat) + "}";
-                    co_return std::move(rep);
-                }
-                rep->set_status(seastar::http::reply::status_type::ok);
-                rep->_content = "{\"status\":\"active\",\"leader\":" + std::to_string(result.leader) +
-                                ",\"active_format\":" + std::to_string(result.activeFormat) +
-                                ",\"max_legacy_receipts\":" + std::to_string(result.maxLegacyReceipts) +
-                                ",\"max_total_receipts\":" + std::to_string(result.maxTotalReceipts) + "}";
-            } catch (const timestar::cluster::NodeCapabilityValidationError& e) {
-                rep->set_status(seastar::http::reply::status_type::conflict);
-                rep->_content = "{\"status\":\"error\",\"message\":\"" +
-                                timestar::jsonEscape(e.what()) + "\"}";
-            } catch (const timestar::data::NodeCapabilityMismatchError& e) {
-                // A reply from the wrong persistent Raft identity is a stable
-                // activation-precondition conflict, not a transient outage.
-                rep->set_status(seastar::http::reply::status_type::conflict);
-                rep->_content = "{\"status\":\"error\",\"message\":\"" +
-                                timestar::jsonEscape(e.what()) + "\"}";
             } catch (const std::exception& e) {
                 rep->set_status(seastar::http::reply::status_type::service_unavailable);
                 rep->_content = "{\"status\":\"error\",\"message\":\"" +

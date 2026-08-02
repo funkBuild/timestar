@@ -1,15 +1,9 @@
 // D-11: the EXPLICIT VShard -> Raft-group id in the VShard directory (ADR 0004's
 // recommended prep step for a possible later N:1 consolidation).
 //
-// Two things have to be true at once, and each of these tests pins one of them:
-//
-//  1. TODAY IS UNCHANGED. `ControlMap::groups` is empty on every cluster in existence,
-//     `groupOf(v) == v`, and the serialized control map is byte-for-byte what it was
-//     before the field existed. If this is not exactly true the prep step has a cost,
-//     and the ADR's whole argument is that it does not.
-//
-//  2. THE INDIRECTION IS REAL. A NON-identity mapping must actually change where a
-//     VShard's Raft work is routed -- otherwise the accessor is decoration, every call
+// Two things have to be true at once: identity remains the default, while a
+// NON-identity mapping must actually change where a VShard's Raft work is routed --
+// otherwise the accessor is decoration, every call
 //     site still assumes the identity, and the migration it was added to enable would
 //     still be a rebuild. The routing tests below therefore assert BOTH that a
 //     non-identity map co-locates a group's VShards AND that the identity map does not
@@ -63,11 +57,12 @@ unsigned coreOf(uint16_t id, unsigned cores) {
 }  // namespace
 
 // ---------------------------------------------------------------------------
-// 1. Today is unchanged.
+// 1. Identity is the default.
 // ---------------------------------------------------------------------------
 
 TEST(VShardGroupDirectoryTest, IdentityIsTheDefault) {
-    VShardDirectory dir(1, placementOnly());
+    const auto map = placementOnly();
+    VShardDirectory dir(1, map);
     EXPECT_TRUE(dir.identityGroupMapping());
     for (uint16_t vs = 0; vs < kVShards; ++vs)
         EXPECT_EQ(dir.groupOf(vs), vs) << vs;
@@ -75,26 +70,19 @@ TEST(VShardGroupDirectoryTest, IdentityIsTheDefault) {
     // total, and an absent entry means identity, not "unassigned". Routing a Raft
     // envelope and owning the data are different questions (ownerOf answers the latter).
     EXPECT_EQ(dir.groupOf(4095), 4095);
-}
 
-TEST(VShardGroupDirectoryTest, AnIdentityMapSerializesToExactlyTheLegacyBytes) {
-    ControlMapCache legacy;
-    ASSERT_TRUE(legacy.update(placementOnly()));
-    const std::string before = legacy.serialize();
-
-    ControlMapCache withGroups;
-    ASSERT_TRUE(withGroups.update(consolidated()));
-    const std::string after = withGroups.serialize();
-
-    // The group section is a pure TRAILER: an identity map emits none of it (so the
-    // bytes on disk are unchanged today), and a non-identity map appends to -- never
-    // rewrites -- the legacy prefix.
-    EXPECT_GT(after.size(), before.size());
-    EXPECT_EQ(after.compare(0, before.size(), before), 0);
+    ControlMapCache source, restored;
+    ASSERT_TRUE(source.update(map));
+    const auto encoded = source.serialize();
+    ASSERT_TRUE(restored.load(encoded));
+    EXPECT_EQ(restored.current(), map);
+    ControlMapCache truncated;
+    EXPECT_FALSE(truncated.load(encoded.substr(0, encoded.size() - 8)))
+        << "the mandatory zero group count may not be omitted";
 }
 
 // ---------------------------------------------------------------------------
-// 2. The mapping survives a restart, and an unknown shape fails CLOSED.
+// 2. The current v1 mapping survives a restart and malformed frames fail closed.
 // ---------------------------------------------------------------------------
 
 TEST(VShardGroupDirectoryTest, NonIdentityMappingRoundTripsThroughTheDurableCache) {
@@ -107,7 +95,7 @@ TEST(VShardGroupDirectoryTest, NonIdentityMappingRoundTripsThroughTheDurableCach
     EXPECT_EQ(VShardDirectory(1, dst.current()).groupOf(17), 1);
 }
 
-TEST(VShardGroupDirectoryTest, AnUnknownTrailerFailsClosedAndLeavesTheCacheUntouched) {
+TEST(VShardGroupDirectoryTest, MalformedV1FailsClosedAndLeavesTheCacheUntouched) {
     ControlMapCache src;
     ASSERT_TRUE(src.update(consolidated()));
     const std::string good = src.serialize();
@@ -121,19 +109,21 @@ TEST(VShardGroupDirectoryTest, AnUnknownTrailerFailsClosedAndLeavesTheCacheUntou
     };
     const ControlMap intact = freshCache().current();
 
-    {  // a trailer too short to be a section header
+    {  // truncated group entries
         ControlMapCache c = freshCache();
         EXPECT_FALSE(c.load(good.substr(0, good.size() - 4)));
         EXPECT_EQ(c.current(), intact);
     }
-    {  // a section whose magic we do not recognise -- a FUTURE format, never "assume identity"
+    {  // impossible group count
         ControlMapCache c = freshCache();
         std::string bad = good;
-        bad[bad.size() - (16 + kVShards * 4)] ^= 0xff;  // first byte of the magic
+        const size_t groupCountOffset = bad.size() - (8 + kVShards * 4);
+        for (size_t i = 0; i < 8; ++i)
+            bad[groupCountOffset + i] = static_cast<char>(0xff);
         EXPECT_FALSE(c.load(bad));
         EXPECT_EQ(c.current(), intact);
     }
-    {  // bytes past a section we DID understand
+    {  // trailing bytes
         ControlMapCache c = freshCache();
         EXPECT_FALSE(c.load(good + std::string(3, '\0')));
         EXPECT_EQ(c.current(), intact);

@@ -89,7 +89,7 @@ SEASTAR_TEST_F(NativeIndexCompactionGateTest, ManyFlushesKeepSSTableCountBounded
         co_await manifest.close();
     }
 
-    // Reopen: recovery must see the compacted state (manifest v2 + maxKey
+    // Reopen: recovery must see the compacted state (manifest v1 + maxKey
     // pruning) and still return correct data.
     {
         NativeIndex index(timestar::StorageLayout("."), 0);

@@ -195,8 +195,7 @@ struct RecoveredRaftState {
     // MUST re-install its payload into the state machine before serving anything: the
     // record is fsync'd before the install, so a crash in between leaves the log truncated
     // to the boundary and the Engine holding only whichever files landed. See
-    // RaftPersistence::persistSnapshot. Absent/legacy records read as produced-here, which
-    // is the pre-D-6 shape (nothing ever compacted, so none exist in the wild).
+    // RaftPersistence::persistSnapshot.
     bool snapshotFromPeer = false;
     uint64_t nextSeq = 1;  // resume point for a new JournalRaftPersistence
     // Reclaim-floor bookkeeping for the recovered records (debt D-34). MUST be handed

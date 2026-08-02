@@ -2,7 +2,6 @@
 
 #include "dataplane_limits.hpp"
 #include "node_query.hpp"    // VShardRedirect
-#include "write_record.hpp"  // kWriteBatchFormatV4
 
 #include <cstddef>
 #include <cstdint>
@@ -13,13 +12,6 @@
 #include <vector>
 
 namespace timestar::data {
-
-// Pattern expansion is a catalog READ that precedes replicated exact-range
-// commands. It is available only on the same v4 peers that can resolve an RF<N
-// leader read: an older peer has no verb for this request and must be refused,
-// never mistaken for an empty catalog contribution.
-inline constexpr uint32_t kPatternSeriesMinVersion = kWriteBatchFormatV4;
-static_assert(kPatternSeriesMinVersion <= kWriteBatchFormatMax);
 
 // Count bounds do not protect the receiver when catalog keys are unusually
 // large. Keep the key-vector portion below the ordinary outbound frame limit,

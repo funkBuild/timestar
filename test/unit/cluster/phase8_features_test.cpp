@@ -3,15 +3,11 @@
 // scrubbed membership, verified), rolling-upgrade feature gating, conservative
 // routing summaries (no false negatives), and hierarchical query merge.
 #include "../../../lib/cluster/features/backup_restore.hpp"
-#include "../../../lib/cluster/features/feature_gate.hpp"
 #include "../../../lib/cluster/features/operator_surface.hpp"
 #include "../../../lib/cluster/features/routing_summary.hpp"
 #include "../../../lib/cluster/features/stream_subscription.hpp"
-#include "../../../lib/cluster/integration/journal_format_bridge.hpp"
 
 #include <gtest/gtest.h>
-
-#include <seastar/core/smp.hh>
 
 #include <string>
 #include <vector>
@@ -146,28 +142,6 @@ TEST(BackupRestore, RejectsTruncatedAndEmptyBackups) {
     EXPECT_FALSE(BackupRestore::restore(empty, "cluster-NEW", fakeHash).ok);
 }
 
-// ---- Rolling-upgrade feature gating ----
-
-TEST(FeatureGate, ActivatesOnlyWhenEveryVoterSupports) {
-    std::vector<VersionRange> mixed = {{1, 3}, {1, 2}, {1, 3}};  // one voter maxes at 2
-    EXPECT_FALSE(FeatureGate::canActivate(3, mixed));            // not all support v3
-    EXPECT_TRUE(FeatureGate::canActivate(2, mixed));             // all support v2
-    auto common = FeatureGate::maxCommonVersion(mixed);
-    ASSERT_TRUE(common.has_value());
-    EXPECT_EQ(*common, 2u);  // safe active version is 2 until the laggard upgrades
-
-    std::vector<VersionRange> upgraded = {{1, 3}, {1, 3}, {1, 3}};
-    EXPECT_TRUE(FeatureGate::canActivate(3, upgraded));  // now v3 may be gated on
-    EXPECT_EQ(*FeatureGate::maxCommonVersion(upgraded), 3u);
-}
-TEST(FeatureGate, IncompatibleVotersHaveNoCommonVersion) {
-    std::vector<VersionRange> incompatible = {{1, 2}, {3, 4}};  // ranges don't overlap
-    EXPECT_FALSE(FeatureGate::maxCommonVersion(incompatible).has_value());
-    EXPECT_FALSE(compatible(VersionRange{1, 2}, VersionRange{3, 4}));
-    EXPECT_TRUE(compatible(VersionRange{1, 3}, VersionRange{2, 4}));
-    EXPECT_EQ(*negotiate(VersionRange{1, 3}, VersionRange{2, 4}), 3u);
-}
-
 // ---- Conservative routing summaries ----
 
 TEST(RoutingSummary, PrunesOnlyWhenSealedAndCurrent_NoFalseNegative) {
@@ -252,39 +226,4 @@ TEST(OperatorSurface, ReplicaDecisionTrace) {
     EXPECT_EQ(d.eligible.size(), 3u);
     auto none = traceReplicaDecision(7, "bounded_staleness", {});
     EXPECT_EQ(none.chosen, 0);  // no eligible replica -> fails closed
-}
-
-// The group-0 -> journal-codec seam (debt D-7). `publishJournalFormat` is the ONE way the
-// journal's emission version may move, and it must be fail-closed and monotonic in exactly
-// the way `Group0State::activeFormatVersion` is: the activation is a committed group-0
-// decision, and a node that has not observed one emits v1.
-TEST(JournalFormatBridge, OnlyACommittedGroup0ActivationRaisesTheJournalFormat) {
-    timestar::data::JournalFormatGate::resetForTesting();
-    timestar::control::Group0State st;
-    ASSERT_EQ(st.activeFormatVersion, 1u) << "group-0 starts at format 1";
-
-    // A fresh cluster: nothing activated, so the journal stays on v1. Production now
-    // publishes an activation after it is committed, but does not originate one until
-    // every data-group voter capability and the upgrade preflight are proven.
-    timestar::cluster::publishJournalFormat(st).get();
-    EXPECT_EQ(timestar::data::JournalFormatGate::writeBatchFormat(), timestar::data::kWriteBatchFormatV1);
-
-    // A committed activation reaches EVERY shard (the gate is per-shard because it is read
-    // on the write hot path; a shard that was not reached would silently keep emitting v1).
-    st.activeFormatVersion = timestar::data::kJournalV2ActivationVersion;
-    timestar::cluster::publishJournalFormat(st).get();
-    for (unsigned sh = 0; sh < seastar::smp::count; ++sh) {
-        const auto fmt =
-            seastar::smp::submit_to(sh, [] { return timestar::data::JournalFormatGate::writeBatchFormat(); }).get();
-        EXPECT_EQ(fmt, timestar::data::kWriteBatchFormatV2) << "shard " << sh << " was not told";
-    }
-
-    // A LOWER observation cannot un-activate it: group-0 state is rebuilt by replaying its
-    // log, so a mid-replay observer can transiently report an older version than the one
-    // already committed.
-    st.activeFormatVersion = 1;
-    timestar::cluster::publishJournalFormat(st).get();
-    EXPECT_EQ(timestar::data::JournalFormatGate::writeBatchFormat(), timestar::data::kWriteBatchFormatV2);
-
-    seastar::smp::invoke_on_all([] { timestar::data::JournalFormatGate::resetForTesting(); }).get();
 }

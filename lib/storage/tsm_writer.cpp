@@ -116,7 +116,7 @@ seastar::future<> TSMWriter::flushIfNeeded() {
 void TSMWriter::writeHeader() {
     std::string magic("TASM");
     buffer.write(magic);
-    buffer.write(TSM_VERSION);  // V3: uint32 per-series block count (V2 added universal block stats)
+    buffer.write(TSM_VERSION);
 }
 
 // Build the series' index entry shell (and, for strings, its dictionary).
@@ -237,7 +237,7 @@ seastar::future<> TSMWriter::writeSeriesStreaming(TSMValueType seriesType, const
     LOG_INSERT_PATH(timestar::tsm_log, debug, "Streaming blocks for series '{}' ({} total points, up to {} per block)",
                     seriesId.toHex(), timestamps.size(), maxPointsPerBlock_);
 
-    // V4 revision ranges: this is the compaction MERGE path. It re-blocks decoded
+    // Revision ranges on the compaction merge path. It re-blocks decoded
     // points across inputs, so an output block does not correspond 1:1 to any
     // input block and per-point revisions are not available here. It therefore
     // stamps the whole-series union range (from the inputs) on every output
@@ -358,7 +358,7 @@ void TSMWriter::writeIndexBlock(std::span<const uint64_t> timestamps, TSMIndexEn
     indexBlock.maxTime = blockMaxTime;
     indexBlock.offset = blockStartOffset;
     indexBlock.size = static_cast<uint32_t>(blockSize);
-    // V2: set blockCount for all types (enables COUNT pushdown for String)
+    // Record blockCount for every type (enables COUNT pushdown for String).
     indexBlock.blockCount = static_cast<uint32_t>(timestamps.size());
 
     indexEntry.indexBlocks.push_back(std::move(indexBlock));
@@ -638,7 +638,7 @@ void TSMWriter::writeCompressedBlockWithStats(TSMValueType seriesType, const Ser
     indexBlock.boolTrueCount = srcBlock.boolTrueCount;
     indexBlock.boolFirstValue = srcBlock.boolFirstValue;
     indexBlock.boolLatestValue = srcBlock.boolLatestValue;
-    // V4 revision range: this path copies the block's compressed bytes verbatim,
+    // This path copies the block's compressed bytes and revision range verbatim,
     // so its points -- and hence its [minRev, maxRev] -- are unchanged. Carry the
     // range forward (dropping it would let a later stale flush win the LWW merge
     // outright; see ADR 0003 / point_revision.hpp rangeWinner).
@@ -671,7 +671,7 @@ void TSMWriter::writeIndexEntryFor(const TSMIndexEntry& indexEntry) {
     }
     buffer.write(static_cast<uint32_t>(indexEntry.indexBlocks.size()));
 
-    // for each block — per-type stats (V2 format)
+    // Write each block's per-type statistics and revision range.
     for (auto const& block : indexEntry.indexBlocks) {
         buffer.write(block.minTime);  // minTime
         buffer.write(block.maxTime);  // maxTime
@@ -716,7 +716,7 @@ void TSMWriter::writeIndexEntryFor(const TSMIndexEntry& indexEntry) {
             // String: 32 bytes (28 base + count(4))
             buffer.write(block.blockCount);
         }
-        // V4: per-block revision range, appended after the per-type stats so the
+        // Per-block revision range is appended after the per-type stats so the
         // stat field offsets the sparse-index fast path reads stay unchanged.
         buffer.write(block.blockMinRev);
         buffer.write(block.blockMaxRev);
@@ -740,7 +740,7 @@ void TSMWriter::writeIndexEntryFor(const TSMIndexEntry& indexEntry) {
 }
 
 uint64_t TSMWriter::computeMaxRevision() const {
-    // File-level max of every block's revision range. Read cheaply at open() (V4
+    // File-level max of every block's revision range. Read cheaply at open() from the
     // trailer) so recovery can restore a per-shard revision counter above all
     // flushed data without loading every index entry.
     uint64_t maxRev = 0;
@@ -763,7 +763,7 @@ void TSMWriter::writeIndex() {
         writeIndexEntryFor(indexEntry);
     }
 
-    // V4 trailer: file-level max revision, written BEFORE the index offset (which
+    // File-level max revision, written BEFORE the index offset (which
     // stays the file's last 8 bytes, so its reader is unchanged).
     buffer.write(computeMaxRevision());
     buffer.write(static_cast<uint64_t>(indexStartOffset));
@@ -782,7 +782,7 @@ seastar::future<> TSMWriter::writeIndexStreaming() {
         co_await flushIfNeeded();
     }
 
-    // V4 trailer: file-level max revision, before the index offset (see writeIndex).
+    // File-level max revision, before the index offset (see writeIndex).
     buffer.write(computeMaxRevision());
     buffer.write(static_cast<uint64_t>(indexStartOffset));
 }

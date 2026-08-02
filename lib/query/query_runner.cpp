@@ -1045,7 +1045,7 @@ seastar::future<std::optional<timestar::PushdownResult>> QueryRunner::queryTsmAg
         timestar::BlockAggregator aggregator(aggregationInterval, startTime, endTime, method, true);
 
         // Zero-I/O fast path: for LATEST/FIRST needing only 1 point, use the
-        // v3 block stats cached in the sparse index. Files are already sorted
+        // block stats cached in the sparse index. Files are already sorted
         // by time bounds, so the first candidate has the best point. No DMA
         // reads required — pure in-memory lookup.
         // One point suffices when the whole TSM range lands in one bucket.

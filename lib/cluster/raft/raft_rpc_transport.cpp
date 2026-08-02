@@ -45,20 +45,6 @@ seastar::sstring read(RaftSerializer, Input& in, seastar::rpc::type<seastar::sst
     return s;
 }
 
-// ...and a bare u32, for the capability probe's reply. Every type crossing this
-// transport needs its own write/read here; there is no default.
-template <typename Output>
-void write(RaftSerializer, Output& out, uint32_t v) {
-    out.write(reinterpret_cast<const char*>(&v), sizeof(v));
-}
-
-template <typename Input>
-uint32_t read(RaftSerializer, Input& in, seastar::rpc::type<uint32_t>) {
-    uint32_t v = 0;
-    in.read(reinterpret_cast<char*>(&v), sizeof(v));
-    return v;
-}
-
 constexpr uint64_t kDeliverVerb = 1;
 // MULTI-ENVELOPE FRAME (write-scaleout 5a). Payload is a concatenation of
 // [u32 len LE][envelope bytes] records; the receiver routes each by group id exactly as
@@ -67,21 +53,6 @@ constexpr uint64_t kDeliverVerb = 1;
 // resource permit and its own write; a tick that produces messages for many groups can
 // carry them in one.
 constexpr uint64_t kDeliverBatchVerb = 2;
-// CAPABILITY PROBE. This transport has NO version negotiation -- the single deliver verb
-// has been the whole protocol -- and an unknown verb on seastar's rpc is answered with an
-// unknown-verb reply that a no_wait sender IGNORES. So an old peer sent a batch frame
-// would silently discard every Raft message in it: no error, no reply, just a node whose
-// groups never hear from their leader. The sender therefore has to KNOW before it batches.
-//
-// A waited verb is the mechanism, because only a reply can distinguish "peer understands
-// this" from "peer dropped it": a new peer answers with its capability bits, an old peer
-// fails the call with unknown_verb_error, and either way the sender learns the truth
-// before the first batch frame. Fail-closed: unknown or failed probe == no batching, and
-// the probe is redone for every new connection (a peer can be RESTARTED into an older
-// binary on the same address).
-constexpr uint64_t kCapabilitiesVerb = 3;
-constexpr uint32_t kCapBatchedDeliver = 1u << 0;
-
 // Flush thresholds for the per-peer batch buffer. The normal flush is one reactor
 // task-queue round later (`seastar::yield()`), which is what lets one tick's worth of
 // group messages accumulate; these bound the buffer when a single round produces an
@@ -182,45 +153,17 @@ struct RaftRpcTransport::Impl {
         proto.make_client<seastar::rpc::no_wait_type(seastar::sstring)>(kDeliverVerb);
     std::function<seastar::future<>(Client&, seastar::sstring)> deliverBatchStub =
         proto.make_client<seastar::rpc::no_wait_type(seastar::sstring)>(kDeliverBatchVerb);
-    std::function<seastar::future<uint32_t>(Client&)> capabilitiesStub =
-        proto.make_client<uint32_t()>(kCapabilitiesVerb);
-
     // --- write-scaleout 5a: per-peer outbound batching ---
-    struct PeerCaps {
-        // Which connection these bits describe. clientFor() bumps the generation when it
-        // builds a new client, so a probe reply that lands after a reconnect is ignored
-        // rather than applied to a connection it never spoke to (a peer can restart into
-        // an older binary on the same address).
-        uint64_t generation = 0;
-        bool known = false;
-        uint32_t bits = 0;
-    };
     struct PendingFrames {
         std::vector<seastar::sstring> envelopes;
         size_t bytes = 0;
     };
-    std::map<NodeId, PeerCaps> caps;
     std::map<NodeId, PendingFrames> pending;
     // (group, peer) pairs whose oversized-message refusal has already been logged.
     std::set<std::pair<uint16_t, NodeId>> oversizeLogged;
-    uint64_t nextGeneration = 1;
     bool flushScheduled = false;
-    // OFF BY DEFAULT, and the measurement that made it so is recorded in
-    // docs/write-scaleout-plan.md Phase 5. Batching does what it says -- it cut idle RPC
-    // frames per shard from 2724/s to ~700/s -- but on this cluster that is not a
-    // resource under pressure, and the buffering it costs IS: measured against the
-    // pre-Phase-5 binary on the same box, minutes apart, idle CPU went 4% -> 7-8% per
-    // node and canonical-bench median throughput 5.16 -> 4.90 M pts/s.
-    //
-    // That is the Phase-2 lesson restated: removing work from a system that is ~80% CPU
-    // idle cannot raise its throughput, but ADDING per-message work (a buffer insert, a
-    // gate hold and a `yield()`-scheduled flush task per round) can lower it. The
-    // capability, its wire format and its tests stay; the default does not.
-    //
-    // TIMESTAR_RAFT_BATCH_SENDS=1 turns it on for a deployment where the frame rate is
-    // the binding cost (many more peers, or a NIC/syscall-bound node) -- and where it is
-    // on, `send()` takes the buffered path; where it is off, `send()` dispatches
-    // immediately exactly as it did before 5a, so the default costs nothing at all.
+    // Batching is an optional performance setting. Both the single and batch verbs carry
+    // v1 envelopes; enabling batching changes dispatch frequency, not protocol version.
     bool batchingEnabled = [] {
         const char* e = std::getenv("TIMESTAR_RAFT_BATCH_SENDS");
         return e && e[0] == '1';
@@ -257,33 +200,6 @@ struct RaftRpcTransport::Impl {
             (stats.dropped - windowBase.dropped) / secs);
         windowStart = now;
         windowBase = stats;
-    }
-
-    bool peerSupportsBatch(NodeId to) const {
-        auto it = caps.find(to);
-        return it != caps.end() && it->second.known && (it->second.bits & kCapBatchedDeliver) != 0;
-    }
-
-    // Ask a freshly-built connection what it understands. Fail-closed on ANY error --
-    // unknown verb (an old peer), a dead connection, a timeout -- because "not known to
-    // support batching" and "known not to" must behave identically.
-    void probeCapabilities(NodeId to, Client* conn, uint64_t generation) {
-        if (gate.is_closed())
-            return;
-        (void)seastar::with_gate(gate, [this, to, conn, generation] {
-            return capabilitiesStub(*conn).then_wrapped([this, to, generation](seastar::future<uint32_t> f) {
-                uint32_t bits = 0;
-                if (f.failed())
-                    f.ignore_ready_future();
-                else
-                    bits = f.get();
-                auto it = caps.find(to);
-                if (it != caps.end() && it->second.generation == generation) {
-                    it->second.known = true;
-                    it->second.bits = bits;
-                }
-            });
-        });
     }
 
     // Dispatch one envelope straight to the peer -- the pre-5a path, and the default.
@@ -345,7 +261,7 @@ struct RaftRpcTransport::Impl {
             stats.dropped += envelopes.size();
             return;  // unknown/backing-off peer: drop (Raft retries)
         }
-        const bool batch = batchingEnabled && envelopes.size() > 1 && peerSupportsBatch(to);
+        const bool batch = batchingEnabled && envelopes.size() > 1;
         if (batch) {
             size_t total = 0;
             for (const auto& e : envelopes)
@@ -428,13 +344,6 @@ struct RaftRpcTransport::Impl {
         }
         auto* p = c.get();
         clients[to] = std::move(c);
-        // A NEW connection knows nothing until it answers: reset to "unknown" (which is
-        // "no batching") and probe. Never carry the old connection's bits forward.
-        auto& cap = caps[to];
-        cap.generation = nextGeneration++;
-        cap.known = false;
-        cap.bits = 0;
-        probeCapabilities(to, p, cap.generation);
         return p;
     }
 };
@@ -471,15 +380,17 @@ seastar::future<> RaftRpcTransport::start(seastar::socket_address local, Deliver
             // Fast path: route by group id without decoding, so the (potentially
             // 100s of KB) AppendEntries payload is decoded on the shard that owns
             // the group rather than on this single listening shard. groupId is the
-            // first field encodeEnvelope writes: u16, little-endian, at offset 0.
+            // The group id follows the four-byte TSR1 marker.
             ++impl_->stats.framesRecv;
             ++impl_->stats.envelopesRecv;
             impl_->maybeReport();
             if (impl_->onDeliverRaw) {
-                if (data.size() < 2)
+                if (data.size() < kRaftEnvelopeV1MagicBytes + 2)
                     co_return seastar::rpc::no_wait;
-                const uint16_t gid = static_cast<uint16_t>(static_cast<unsigned char>(data[0])) |
-                                     static_cast<uint16_t>(static_cast<unsigned char>(data[1]) << 8);
+                const uint16_t gid =
+                    static_cast<uint16_t>(static_cast<unsigned char>(data[kRaftEnvelopeV1MagicBytes])) |
+                    static_cast<uint16_t>(
+                        static_cast<unsigned char>(data[kRaftEnvelopeV1MagicBytes + 1]) << 8);
                 // `data` outlives the call: we await before it is destroyed.
                 co_await impl_->onDeliverRaw(gid, data.data(), data.size());
                 co_return seastar::rpc::no_wait;
@@ -532,10 +443,12 @@ seastar::future<> RaftRpcTransport::start(seastar::socket_address local, Deliver
                 const char* bytes = data.data() + off;
                 off += n;
                 ++impl_->stats.envelopesRecv;
-                if (n < 2)
+                if (n < kRaftEnvelopeV1MagicBytes + 2)
                     continue;
-                const uint16_t gid = static_cast<uint16_t>(static_cast<unsigned char>(bytes[0])) |
-                                     static_cast<uint16_t>(static_cast<unsigned char>(bytes[1]) << 8);
+                const uint16_t gid =
+                    static_cast<uint16_t>(static_cast<unsigned char>(bytes[kRaftEnvelopeV1MagicBytes])) |
+                    static_cast<uint16_t>(
+                        static_cast<unsigned char>(bytes[kRaftEnvelopeV1MagicBytes + 1]) << 8);
                 recs.push_back(BatchRecord{bytes, n, gid});
             }
             if (recs.empty())
@@ -580,10 +493,6 @@ seastar::future<> RaftRpcTransport::start(seastar::socket_address local, Deliver
                 });
             co_return seastar::rpc::no_wait;
         });
-    // The capability probe. Stateless and constant, so it does not matter which shard's
-    // server instance answers it under connection_distribution.
-    impl_->proto.register_handler(kCapabilitiesVerb,
-                                  [] { return seastar::make_ready_future<uint32_t>(kCapBatchedDeliver); });
     // Where inbound connections are accepted.
     //
     // `perShardListener == false` (a single instance, on one shard) PINS the listening

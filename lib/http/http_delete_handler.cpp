@@ -824,23 +824,6 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDeleteHandler::handle
             reply->_content = timestar::proto::formatDeleteResponse("error", 0, 0, e.what());
         else
             reply->_content = timestar::http::jsonError(e.what(), "DELETE_IDEMPOTENCY_CONFLICT");
-    } catch (const timestar::data::ClusterFormatUnsupportedError& e) {
-        reply->set_status(seastar::http::reply::status_type::conflict);
-        if (timestar::http::isProtobuf(resFmt))
-            reply->_content = timestar::proto::formatDeleteResponse("error", 0, 0, e.what());
-        else
-            reply->_content = timestar::http::jsonError(e.what(), "CLUSTER_FORMAT_NOT_ACTIVE");
-    } catch (const timestar::data::AmbiguousMutationError& e) {
-        // Do not attach Retry-After: unlike an unambiguous pre-proposal refusal,
-        // this command may already be committed. Repeating a range delete after a
-        // concurrent write can erase data the first command was ordered before.
-        timestar::http_log.warn("Delete returned an unknown cluster outcome: {}", e.what());
-        reply->set_status(seastar::http::reply::status_type::gateway_timeout);
-        reply->_headers["X-TimeStar-Mutation-Outcome"] = "unknown";
-        if (timestar::http::isProtobuf(resFmt))
-            reply->_content = timestar::proto::formatDeleteResponse("unknown", 0, 0, e.what());
-        else
-            reply->_content = timestar::http::jsonError(e.what(), "DELETE_OUTCOME_UNKNOWN");
     } catch (const timestar::data::RetryableWriteError& e) {
         timestar::http_log.warn("Delete rejected by retryable cluster condition: {}", e.what());
         reply->set_status(seastar::http::reply::status_type::service_unavailable);

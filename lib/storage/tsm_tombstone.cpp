@@ -6,6 +6,7 @@
 #include <array>
 #include <cstring>
 #include <filesystem>
+#include <limits>
 #include <seastar/core/file.hh>
 #include <seastar/core/fstream.hh>
 #include <seastar/core/seastar.hh>
@@ -181,8 +182,7 @@ seastar::future<> TSMTombstone::load() {
             throw std::runtime_error("Invalid tombstone file magic number");
         }
 
-        bool isV1 = (header.version == TOMBSTONE_VERSION_V1);
-        if (header.version != TOMBSTONE_VERSION && !isV1) {
+        if (header.version != TOMBSTONE_VERSION) {
             throw std::runtime_error("Unsupported tombstone file version");
         }
 
@@ -195,10 +195,8 @@ seastar::future<> TSMTombstone::load() {
             throw std::runtime_error("Tombstone header checksum mismatch");
         }
 
-        // Calculate expected file size based on version
-        size_t entrySize = isV1 ? TombstoneEntry::V1_SIZE : TombstoneEntry::SIZE;
-        size_t expectedSize =
-            TombstoneHeader::SIZE + (header.entryCount * entrySize) + sizeof(uint64_t);  // Footer checksum
+        const size_t expectedSize = TombstoneHeader::SIZE + (header.entryCount * TombstoneEntry::SIZE) +
+                                    sizeof(uint64_t);  // Footer checksum
 
         if (static_cast<size_t>(fileSize) != expectedSize) {
             throw std::runtime_error("Tombstone file corrupt: file size mismatch");
@@ -213,59 +211,31 @@ seastar::future<> TSMTombstone::load() {
             const char* entryPtr = data + offset;
 
             TombstoneEntry entry;
-            if (isV1) {
-                // V1 format: uint64_t seriesId (8 bytes) + startTime (8) + endTime (8) + checksum (4)
-                uint64_t legacySeriesId;
-                std::memcpy(&legacySeriesId, entryPtr, 8);
-                std::memcpy(&entry.startTime, entryPtr + 8, 8);
-                std::memcpy(&entry.endTime, entryPtr + 16, 8);
-                std::memcpy(&entry.checksum, entryPtr + 24, 4);
+            auto& rawData = entry.seriesId.getRawData();
+            std::memcpy(rawData.data(), entryPtr, 16);
+            std::memcpy(&entry.startTime, entryPtr + 16, 8);
+            std::memcpy(&entry.endTime, entryPtr + 24, 8);
+            std::memcpy(&entry.checksum, entryPtr + 32, 4);
 
-                // Convert legacy uint64_t seriesId to SeriesId128 by zero-padding
-                // Place the uint64_t in the first 8 bytes, zero the rest
-                SeriesId128 convertedId;
-                auto& rawData = convertedId.getRawData();
-                std::memcpy(rawData.data(), &legacySeriesId, 8);
-                // Remaining 8 bytes are already zero from SeriesId128 default constructor
-                entry.seriesId = convertedId;
-
-                // Recompute checksum with new format (don't verify V1 checksum
-                // since the checksum algorithm changed with the seriesId size change)
-                entry.checksum = calculateChecksum(entry);
-            } else {
-                // V2 format: SeriesId128 (16 bytes) + startTime (8) + endTime (8) + checksum (4)
-                auto& rawData = entry.seriesId.getRawData();
-                std::memcpy(rawData.data(), entryPtr, 16);
-                std::memcpy(&entry.startTime, entryPtr + 16, 8);
-                std::memcpy(&entry.endTime, entryPtr + 24, 8);
-                std::memcpy(&entry.checksum, entryPtr + 32, 4);
-
-                // Verify entry checksum
-                uint32_t expectedEntryChecksum = entry.checksum;
-                entry.checksum = 0;
-                uint32_t actualEntryChecksum = calculateChecksum(entry);
-                entry.checksum = expectedEntryChecksum;
-
-                if (expectedEntryChecksum != actualEntryChecksum) {
-                    throw std::runtime_error("Tombstone entry checksum mismatch at index " + std::to_string(i));
-                }
+            const uint32_t expectedEntryChecksum = entry.checksum;
+            entry.checksum = 0;
+            const uint32_t actualEntryChecksum = calculateChecksum(entry);
+            entry.checksum = expectedEntryChecksum;
+            if (expectedEntryChecksum != actualEntryChecksum) {
+                throw std::runtime_error("Tombstone entry checksum mismatch at index " + std::to_string(i));
             }
 
             entries.push_back(entry);
-            offset += entrySize;
+            offset += TombstoneEntry::SIZE;
         }
 
         // Parse and verify file checksum from the in-memory buffer
         uint64_t fileChecksum;
         std::memcpy(&fileChecksum, data + offset, sizeof(uint64_t));
 
-        // For V1 files, we recomputed entry checksums after conversion to SeriesId128,
-        // so the file checksum won't match the original. Only verify for V2 files.
-        if (!isV1) {
-            uint64_t actualFileChecksum = calculateFileChecksum();
-            if (fileChecksum != actualFileChecksum) {
-                throw std::runtime_error("Tombstone file checksum mismatch");
-            }
+        const uint64_t actualFileChecksum = calculateFileChecksum();
+        if (fileChecksum != actualFileChecksum) {
+            throw std::runtime_error("Tombstone file checksum mismatch");
         }
 
         // Rebuild index for fast lookups
@@ -322,7 +292,10 @@ seastar::future<> TSMTombstone::flush() {
         TombstoneHeader header;
         header.magic = TOMBSTONE_MAGIC;
         header.version = TOMBSTONE_VERSION;
-        header.entryCount = entries.size();
+        if (entries.size() > std::numeric_limits<uint32_t>::max()) {
+            throw std::overflow_error("Too many tombstone entries");
+        }
+        header.entryCount = static_cast<uint32_t>(entries.size());
         header.headerChecksum = 0;
         header.headerChecksum = calculateHeaderChecksum(header);
 

@@ -28,11 +28,8 @@ public:
                                                      data::ReadEnvelope token, uint64_t maxLagIndex) = 0;
 };
 
-// Serves reads from ONE replica of a VShard over the REAL Engine (integration plan
-// M4). This is the production analogue of the Phase-6 data::ReplicaVShard, which
-// serves from the toy DataStateMachine's in-memory query; here the freshness gate is
-// identical but the answer comes from EngineLocalStore::queryLocal, restricted to this
-// reader's VShard (a replica must only answer for the VShards it hosts; the coordinator
+// Serves reads from one VShard replica over EngineLocalStore, restricted to this
+// reader's VShard. A replica must only answer for the VShards it hosts; the coordinator
 // accounts completeness per VShard).
 //
 // A linearizable replica read needs NO new Raft protocol: confirm a quorum ReadIndex

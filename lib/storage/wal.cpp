@@ -55,7 +55,7 @@ WAL::~WAL() {
     }
 }
 
-seastar::future<> WAL::init(MemoryStore* /*store*/, bool isRecovery) {
+seastar::future<> WAL::init(MemoryStore* /*store*/) {
     std::string filename = this->filename();
 
     // Ensure directory exists (blocking call, run off reactor thread)
@@ -71,26 +71,16 @@ seastar::future<> WAL::init(MemoryStore* /*store*/, bool isRecovery) {
 
     std::string_view filenameView{filename};
 
-    // Determine open flags based on whether this is recovery or fresh creation
+    // A WAL segment is created once and never reopened for append.
     seastar::open_flags openFlags;
-    if (isRecovery) {
-        // Recovery mode: open existing file for append, don't truncate
-        if (!fileExisted) {
-            timestar::wal_log.error("WAL file {} does not exist for recovery", filename);
-            throw std::runtime_error("WAL file not found for recovery");
-        }
+    if (fileExisted) {
         openFlags = seastar::open_flags::rw;
-        timestar::wal_log.debug("Opening WAL {} for recovery", filename);
     } else {
         // A non-empty path may be the only durable copy of acknowledged data.
         // Never truncate it merely because sequence allocation collided. The
         // one safe retry case is an empty artifact left by a prior creation
         // whose directory barrier failed before the WAL became writable.
-        if (fileExisted) {
-            openFlags = seastar::open_flags::rw;
-        } else {
-            openFlags = seastar::open_flags::rw | seastar::open_flags::create | seastar::open_flags::exclusive;
-        }
+        openFlags = seastar::open_flags::rw | seastar::open_flags::create | seastar::open_flags::exclusive;
         timestar::wal_log.debug("Creating fresh WAL {}", filename);
     }
 
@@ -100,7 +90,7 @@ seastar::future<> WAL::init(MemoryStore* /*store*/, bool isRecovery) {
         throw std::runtime_error("Failed to open WAL file: " + filename);
     }
 
-    if (!isRecovery && fileExisted) {
+    if (fileExisted) {
         uint64_t existingSize = 0;
         std::exception_ptr sizeError;
         try {
@@ -165,11 +155,6 @@ seastar::future<> WAL::init(MemoryStore* /*store*/, bool isRecovery) {
     // Get current file size
     currentSize = co_await walFile.size();
 
-    if (!isRecovery && currentSize > 0) {
-        timestar::wal_log.error("Fresh WAL {} has non-zero size {} after truncate - this is unexpected", filename,
-                                currentSize);
-    }
-
     // Capture DMA alignment from the file so we can pad before flushing
     _dma_alignment = walFile.disk_write_dma_alignment();
     _unflushed_bytes = 0;
@@ -186,6 +171,14 @@ seastar::future<> WAL::init(MemoryStore* /*store*/, bool isRecovery) {
     opts.preallocation_size = maxWalSize_;
     auto s = co_await seastar::make_file_output_stream(walFile, opts);
     out.emplace(std::move(s));
+
+    char header[WAL_HEADER_SIZE];
+    std::memcpy(header, WAL_V1_MAGIC, sizeof(WAL_V1_MAGIC));
+    for (size_t i = 0; i < sizeof(WAL_VERSION); ++i)
+        header[sizeof(WAL_V1_MAGIC) + i] = static_cast<char>((WAL_VERSION >> (8 * i)) & 0xff);
+    co_await out->write(header, sizeof(header));
+    currentSize = sizeof(header);
+    _unflushed_bytes = sizeof(header);
 
     // Durability mode (see wal_sync_mode in timestar_config.hpp).  Validation
     // already rejected unknown strings; default to the safe mode regardless.
@@ -524,7 +517,7 @@ size_t WAL::estimateInsertSize(TimeStarInsert<T>& insertRequest) {
 // encoding logic.  All allocations go into the caller's buffer; the only
 // temporaries are the encoder outputs (which are memcpy'd in and destroyed).
 //
-// On-disk format per entry (unchanged, recovery-compatible):
+// On-disk v1 format per entry:
 //   [uint32_t entryLength]  -- CRC + payload size
 //   [uint32_t CRC32]        -- over the payload bytes
 //   [payload bytes ...]
@@ -952,10 +945,9 @@ seastar::future<> WALReader::readAll(MemoryStore* store) {
     }
 
     length = co_await walFile.size();
-    if (length == 0) {
-        timestar::wal_log.info("WAL recovery complete: 0 entries read, 0 partial entries discarded");
+    if (length < WAL_HEADER_SIZE) {
         co_await walFile.close();
-        co_return;
+        throw std::runtime_error("WAL recovery: missing or truncated v1 header in " + filename);
     }
 
     timestar::wal_log.info("WAL recovery starting for file {} with size {} bytes", filename, length);
@@ -980,6 +972,20 @@ seastar::future<> WALReader::readAll(MemoryStore* store) {
         co_return true;
     };
 
+    char header[WAL_HEADER_SIZE];
+    if (!(co_await read_exact(header, sizeof(header))) ||
+        std::memcmp(header, WAL_V1_MAGIC, sizeof(WAL_V1_MAGIC)) != 0) {
+        co_await in.close();
+        throw std::runtime_error("WAL recovery: unsupported format in " + filename);
+    }
+    uint32_t version = 0;
+    for (size_t i = 0; i < sizeof(version); ++i)
+        version |= static_cast<uint32_t>(static_cast<unsigned char>(header[sizeof(WAL_V1_MAGIC) + i])) << (8 * i);
+    if (version != WAL_VERSION) {
+        co_await in.close();
+        throw std::runtime_error("WAL recovery: unsupported version " + std::to_string(version) + " in " + filename);
+    }
+
     std::exception_ptr recoveryException;
     try {
         while (true) {
@@ -991,16 +997,11 @@ seastar::future<> WALReader::readAll(MemoryStore* store) {
 
             // Skip DMA alignment padding.
             //
-            // New format (Issue #11 fix): padding is written as
+            // Padding is written as
             //   [uint32_t  0]          <-- padding marker (already consumed above)
             //   [uint32_t  skipBytes]  <-- number of additional zero bytes to skip
             //   [skipBytes zero bytes]
             //
-            // Backward compatibility with old format (raw zero-filled padding):
-            //   Old WAL files wrote only zero bytes for padding. In that case
-            //   skipBytes will itself be 0 (since the next 4 bytes are also zero).
-            //   We simply loop back and read the next uint32_t, continuing until
-            //   we hit a non-zero entryLength or EOF.
             if (entryLength == 0) {
                 uint32_t skipBytes = 0;
                 if (!(co_await read_exact(&skipBytes, sizeof(skipBytes)))) {
@@ -1008,7 +1009,7 @@ seastar::future<> WALReader::readAll(MemoryStore* store) {
                 }
 
                 if (skipBytes > 0) {
-                    // New-format padding: skip exactly skipBytes additional zero bytes.
+                    // Skip exactly skipBytes additional zero bytes.
                     static constexpr uint32_t MAX_SKIP = 16 * 1024 * 1024;
                     if (skipBytes > MAX_SKIP) {
                         partialEntries++;
@@ -1025,14 +1026,11 @@ seastar::future<> WALReader::readAll(MemoryStore* store) {
                         remaining -= toRead;
                     }
                 }
-                // For old-format padding (skipBytes == 0), we just consumed 8 zero
-                // bytes total (the marker + skipBytes).  Loop back to read the next
-                // entryLength; eventually we will reach a non-zero entry or EOF.
                 continue;
             }
 
             // sanity
-            static constexpr uint32_t MIN_ENTRY_SIZE = 4;
+            static constexpr uint32_t MIN_ENTRY_SIZE = 5;  // CRC32 + WALType
             static constexpr uint32_t MAX_ENTRY_SIZE = 10 * 1024 * 1024;  // 10MB
 
             if (entryLength < MIN_ENTRY_SIZE || entryLength > MAX_ENTRY_SIZE) {
@@ -1048,66 +1046,19 @@ seastar::future<> WALReader::readAll(MemoryStore* store) {
                 break;
             }
 
-            // ---- CRC32 verification ----
-            // New format: [crc32 (4 bytes)][payload...]
-            // entryLength includes the CRC, so payload = entryLength - 4
-            // Old format: [WALType byte][payload...] (no CRC)
-            //
-            // Format detection: new format has 4-byte CRC prefix + WALType at byte 4;
-            // old format has WALType at byte 0 with no CRC. Try CRC first (definitive
-            // if it matches), fall back to old-format detection if CRC fails.
+            // [crc32 (4 bytes)][payload...]; entryLength includes the CRC.
             const uint8_t* rawEntry = reinterpret_cast<const uint8_t*>(entry.data());
-            const uint8_t* payloadPtr = rawEntry;
-            size_t payloadSize = entryLength;
-
-            if (entryLength >= 8) {
-                uint32_t storedCrc;
-                std::memcpy(&storedCrc, rawEntry, sizeof(uint32_t));
-
-                const uint8_t* crcPayload = rawEntry + 4;
-                size_t crcPayloadSize = entryLength - 4;
-                uint32_t computedCrc = CRC32::compute(crcPayload, crcPayloadSize);
-
-                // Try new format first: new-format entries have a 4-byte CRC prefix
-                // followed by WALType at byte 4. If CRC matches, it's definitively
-                // a new-format entry.
-                //
-                // If CRC doesn't match, try old format: old-format entries have
-                // WALType at byte 0 with no CRC prefix. We accept the entry as
-                // old-format if byte 0 is a valid WALType.
-                //
-                // Previous heuristic checked byte0IsType && !byte4IsType first,
-                // which failed when byte 4 of SeriesId128 happened to be <= 3
-                // (a valid WALType value), causing old entries to be silently
-                // discarded as corrupt.
-                if (storedCrc == computedCrc) {
-                    // New format with valid CRC - use payload after CRC
-                    payloadPtr = crcPayload;
-                    payloadSize = crcPayloadSize;
-                    timestar::wal_log.trace("WAL recovery: CRC32 verified for entry");
-                } else {
-                    uint8_t firstByte = rawEntry[0];
-                    bool byte0IsType = firstByte <= static_cast<uint8_t>(WALType::DeleteVShard);
-                    const bool byte4IsType = crcPayload[0] <= static_cast<uint8_t>(WALType::DeleteVShard);
-                    if (byte0IsType && !byte4IsType) {
-                        // Old format entry (no CRC prefix) - skip CRC verification
-                        timestar::wal_log.debug("WAL recovery: old format entry detected (no CRC), type={}", firstByte);
-                        // payloadPtr and payloadSize already point to full entry
-                    } else {
-                        // A current-format entry always has WALType at byte 4.
-                        // If byte 0 also resembles an old-format type, the frame
-                        // is ambiguous; fail closed rather than interpreting a
-                        // corrupt CRC prefix as a legacy command. Complete-frame
-                        // corruption is never a legitimate torn-tail boundary.
-                        partialEntries++;
-                        throw std::runtime_error(fmt::format(
-                            "WAL recovery: CRC32 mismatch in {} (stored=0x{:08X}, computed=0x{:08X}, "
-                            "byte0=0x{:02X}, byte4=0x{:02X})",
-                            filename, storedCrc, computedCrc, firstByte, crcPayload[0]));
-                    }
-                }
+            uint32_t storedCrc;
+            std::memcpy(&storedCrc, rawEntry, sizeof(storedCrc));
+            const uint8_t* payloadPtr = rawEntry + sizeof(storedCrc);
+            const size_t payloadSize = entryLength - sizeof(storedCrc);
+            const uint32_t computedCrc = CRC32::compute(payloadPtr, payloadSize);
+            if (storedCrc != computedCrc) {
+                ++partialEntries;
+                throw std::runtime_error(fmt::format(
+                    "WAL recovery: CRC32 mismatch in {} (stored=0x{:08X}, computed=0x{:08X})", filename,
+                    storedCrc, computedCrc));
             }
-            // If entryLength < 8, it's too small for new format; treat as old format
 
             Slice entrySlice(payloadPtr, payloadSize);
             uint8_t type = entrySlice.read<uint8_t>();

@@ -471,71 +471,6 @@ TEST_F(WALSeastarTest, CRC32RoundtripFloat) {
     testCRC32RoundtripFloat().get();
 }
 
-// Legacy WAL frames have no CRC prefix. Keep their recovery path, but only
-// when it cannot be confused with a corrupt current-format frame (whose type
-// byte is always at offset 4).
-seastar::future<> testLegacyNoCRCFrameStillRecoversWhenUnambiguous() {
-    constexpr unsigned int sequenceNumber = 205;
-    auto store = std::make_shared<MemoryStore>(sequenceNumber);
-
-    std::string field;
-    for (size_t i = 0; i < 1024; ++i) {
-        field = "legacy_" + std::to_string(i);
-        TimeStarInsert<double> candidate("crc_test", field);
-        if (candidate.seriesId128().getRawData()[3] > static_cast<uint8_t>(WALType::DeleteVShard)) {
-            break;
-        }
-    }
-    TimeStarInsert<double> insert("crc_test", field);
-    if (insert.seriesId128().getRawData()[3] <= static_cast<uint8_t>(WALType::DeleteVShard)) {
-        throw std::runtime_error("could not construct an unambiguous legacy WAL series id");
-    }
-    insert.addValue(1000, 55.5);
-
-    {
-        WAL wal(sequenceNumber, timestar::StorageLayout("."), seastar::this_shard_id());
-        co_await wal.init(store.get());
-        co_await wal.insert(insert);
-        co_await wal.close();
-    }
-
-    const std::string walFile = WAL::sequenceNumberToFilename(sequenceNumber);
-    std::ifstream fin(walFile, std::ios::binary);
-    std::vector<char> current((std::istreambuf_iterator<char>(fin)), std::istreambuf_iterator<char>());
-    fin.close();
-    if (current.size() < 8) {
-        throw std::runtime_error("current WAL frame is shorter than its header");
-    }
-    uint32_t currentLength = 0;
-    std::memcpy(&currentLength, current.data(), sizeof(currentLength));
-    if (currentLength < sizeof(uint32_t) || current.size() < sizeof(uint32_t) + currentLength) {
-        throw std::runtime_error("current WAL frame has an invalid length");
-    }
-
-    const uint32_t legacyLength = currentLength - sizeof(uint32_t);
-    std::vector<char> legacy(sizeof(uint32_t) + legacyLength);
-    std::memcpy(legacy.data(), &legacyLength, sizeof(legacyLength));
-    std::memcpy(legacy.data() + sizeof(uint32_t), current.data() + 2 * sizeof(uint32_t), legacyLength);
-    std::ofstream fout(walFile, std::ios::binary | std::ios::trunc);
-    fout.write(legacy.data(), legacy.size());
-    fout.close();
-
-    auto recoveredStore = std::make_shared<MemoryStore>(sequenceNumber);
-    WALReader reader(walFile);
-    co_await reader.readAll(recoveredStore.get());
-    auto it = recoveredStore->series.find(insert.seriesId128());
-    EXPECT_NE(it, recoveredStore->series.end());
-    if (it != recoveredStore->series.end()) {
-        const auto& recovered = std::get<InMemorySeries<double>>(it->second);
-        EXPECT_EQ(recovered.timestamps, (std::vector<uint64_t>{1000}));
-        EXPECT_EQ(recovered.values, (std::vector<double>{55.5}));
-    }
-}
-
-TEST_F(WALSeastarTest, LegacyNoCRCFrameStillRecoversWhenUnambiguous) {
-    testLegacyNoCRCFrameStillRecoversWhenUnambiguous().get();
-}
-
 seastar::future<> testCRC32CorruptionDetection() {
     unsigned int sequenceNumber = 201;
     auto store = std::make_shared<MemoryStore>(sequenceNumber);
@@ -554,15 +489,15 @@ seastar::future<> testCRC32CorruptionDetection() {
     // Corrupt a payload byte in the WAL file
     {
         std::string walFile = WAL::sequenceNumberToFilename(sequenceNumber);
-        // Read the file, flip a byte in the payload area (after length + CRC = 8 bytes),
+        // Read the file, flip a byte in the payload area after the v1 header,
         // then write it back
         std::ifstream fin(walFile, std::ios::binary);
         std::vector<char> contents((std::istreambuf_iterator<char>(fin)), std::istreambuf_iterator<char>());
         fin.close();
 
-        // Corrupt a byte well into the payload (offset 12 = past length(4) + crc(4) + a few payload bytes)
-        if (contents.size() > 12) {
-            contents[12] ^= 0xFF;  // flip all bits in one payload byte
+        const size_t corruptOffset = WAL_HEADER_SIZE + 12;
+        if (contents.size() > corruptOffset) {
+            contents[corruptOffset] ^= 0xFF;
         }
 
         std::ofstream fout(walFile, std::ios::binary | std::ios::trunc);
@@ -602,7 +537,7 @@ seastar::future<> testCRC32PartialCorruption() {
     // immediately after entry 1.  Group commit (wal_sync_mode="always", the
     // default) inserts alignment padding between per-insert flush rounds,
     // which would put the corruption inside padding instead of entry 2 — so
-    // pin the legacy contiguous layout for the duration of this test.
+    // pin the contiguous layout for the duration of this test.
     const auto savedConfig = timestar::config();
     auto cfg = savedConfig;
     cfg.storage.wal_sync_mode = "rollover";
@@ -634,9 +569,8 @@ seastar::future<> testCRC32PartialCorruption() {
 
         // Read the first entry length to find where the second entry starts
         uint32_t firstEntryLen;
-        std::memcpy(&firstEntryLen, contents.data(), sizeof(uint32_t));
-        // Second entry starts at offset = 4 (first length) + firstEntryLen
-        size_t secondEntryOffset = 4 + firstEntryLen;
+        std::memcpy(&firstEntryLen, contents.data() + WAL_HEADER_SIZE, sizeof(uint32_t));
+        size_t secondEntryOffset = WAL_HEADER_SIZE + sizeof(uint32_t) + firstEntryLen;
 
         // Corrupt a byte in the second entry's payload area
         // Second entry: [length(4)][crc(4)][payload...]
@@ -719,12 +653,12 @@ seastar::future<> testTruncatedFinalFrameRemainsRecoverable() {
     std::ifstream fin(walFile, std::ios::binary);
     std::vector<char> contents((std::istreambuf_iterator<char>(fin)), std::istreambuf_iterator<char>());
     fin.close();
-    if (contents.size() < sizeof(uint32_t)) {
+    if (contents.size() < WAL_HEADER_SIZE + sizeof(uint32_t)) {
         throw std::runtime_error("WAL missing first frame length");
     }
     uint32_t firstLength = 0;
-    std::memcpy(&firstLength, contents.data(), sizeof(firstLength));
-    const size_t secondOffset = sizeof(uint32_t) + firstLength;
+    std::memcpy(&firstLength, contents.data() + WAL_HEADER_SIZE, sizeof(firstLength));
+    const size_t secondOffset = WAL_HEADER_SIZE + sizeof(uint32_t) + firstLength;
     if (contents.size() < secondOffset + 2 * sizeof(uint32_t)) {
         throw std::runtime_error("WAL missing second frame header");
     }
@@ -1404,8 +1338,8 @@ TEST_F(WALSeastarTest, RecoversRevisions) {
     testWALRecoversRevisions().get();
 }
 
-// Back-compat: an untracked insert writes no revision block, and recovery leaves
-// the series untracked (revisions empty) -- exactly how old WAL files decode.
+// An untracked insert writes no revision block, and recovery leaves the series
+// untracked (revisions empty) in the current v1 frame.
 seastar::future<> testWALUntrackedHasNoRevisions() {
     unsigned int sequenceNumber = 92;
     auto store = std::make_shared<MemoryStore>(sequenceNumber);

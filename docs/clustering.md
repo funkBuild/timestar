@@ -598,12 +598,10 @@ terminally instead of executing again. RF&gt;1 pattern deletes first freeze the
 complete quorum-fenced catalog expansion in group 0, keyed by the original
 request body and timestamp, before any data-group proposal. Retries look up the
 snapshot-durable plan before rediscovery, so new matching series cannot join an
-ambiguous retry. The group-0 command/snapshot feature is gated at cluster format
-v6. A follower forwards plan lookup/freeze to the reported group-0 leader over
-the v6 peer protocol; the RPC and leader quorum-apply wait are bounded, and an
-ambiguous timeout is safely retryable through lookup-first recovery. Until an
-operator completes the authenticated format-activation workflow through v6,
-this path remains fail-closed rather than silently degrading.
+ambiguous retry. A follower forwards plan lookup/freeze to the reported group-0
+leader over the v1 peer protocol; the RPC and leader quorum-apply wait are
+bounded, and an ambiguous timeout is safely retryable through lookup-first
+recovery.
 
 For writes, idempotency means *replica convergence*, not retry-invisibility across
 intervening operations: a retried write is a new log entry and can reappear after
@@ -933,69 +931,30 @@ Cluster-aware SSE is implemented after replicated writes and queries:
 Until this exists, cluster mode must reject or clearly mark streaming as
 unsupported rather than silently providing node-local subscriptions.
 
-## Networking, security, and compatibility
+## Networking, security, and versioning
 
-Inter-node RPC uses a versioned protobuf protocol over a dedicated mTLS port.
+Inter-node RPC uses versioned v1 protocols over dedicated mTLS ports.
 It requires:
 
 - Mutual node identity bound to cluster UUID.
-- Minimum/maximum wire-version negotiation.
+- A v1-only data-plane handshake; a peer without v1 is rejected.
 - Deadlines, cancellation, bounded queues, and connection backpressure.
 - Batched append, query, heartbeat, and snapshot messages per peer.
 - Epoch/term/configuration checks on every state-changing RPC.
 - Separate client and inter-node authentication policies.
 - Certificate rotation without restarting the entire cluster.
 
-Rolling upgrades allow adjacent compatible versions. A group does not activate
-a storage or log format until every current voter can read it and the feature
-gate is committed.
+TimeStar is greenfield: every wire and persisted boundary keeps an explicit v1
+marker, while readers and writers support v1 only. The v1 layout is updated in
+place and development data is recreated after incompatible changes. There is no
+cluster-format activation, capability fan-out, historical decoder, rolling
+upgrade, or downgrade contract. Unknown versions fail closed before state is
+applied or served. See [protocol-versioning.md](protocol-versioning.md).
 
-The implemented ordered capability line currently reserves v2 for self-contained
-snapshot payloads, v3 for legacy durable delete receipts, v4 for node-query
-redirects, v5 for bounded delete command tag 5, snapshot payload v4, and the
-typed `Expired` proposal result, v6 for frozen pattern-delete plans, v7 for
-the exact identity/full-range capability RPC, and v8 for token-authorized
-group-0 observer admission. Protocol-only v9 carries the identity-bound legacy
-delete-receipt inventory used by format activation. Emission fails closed:
-snapshots
-require at least v2, and bounded deletes require both committed format v5 and
-peer protocol v5.
-Decoders continue to read historical formats regardless of the active emission
-gate. `/cluster/status` reports `active_cluster_format` and
-`snapshot_format_ready`; `/health` is not ready below snapshot format v2.
-
-This is not yet an operable rolling-upgrade path. The current server can opt into
-a persistent group-0 host and explicitly initialize its one-voter seed with
-`--cluster-init`. An applied activation command or recovered group-0 snapshot is
-now published to every reactor-local data gate before group 0 advances its applied
-boundary. The controller and command now require identity-keyed capability
-coverage of the stable meta-voters plus every voter in the committed serving
-map. Production now collects a v7 advertisement from every configured peer,
-binding cluster UUID, expected Raft id/address, persistent node UUID, and the
-full range under one bounded fan-out. It reports incomplete/transient collection
-separately from permanent identity conflict. Activation nevertheless refuses a
-covered node until it is a group-0 voter or learner: capability is not proof that
-an observer receives the committed decision.
-Fresh observers can now join through a one-use token and the v8 inter-node RPC;
-membership does not change static data placement. A fresh data plane remains at
-format v1 until an operator explicitly activates a version. On the current
-control leader, authenticated `POST /cluster/activate-format` accepts
-`{"version":N}` and performs a fresh exact capability collection before
-proposing the covered activation. Crossing from below v5 to v5 or later also
-requires every configured node to speak v9 and inventories every serving
-replica. The activation is refused if an identity or replica is missing, any
-replica still has an unapplied data-group log tail, receipt counts disagree, a
-VShard exceeds the 1,024-receipt cap, or legacy receipts alone fill that cap.
-The endpoint is leader-only, monotonic, and must remain behind the same
-TLS-protected operator ingress as join. It makes snapshot, bounded-delete,
-and frozen-plan activation operable; production release still requires the
-documented mixed-binary/live gates and downgrade-startup enforcement.
-
-Format activation is monotonic. Once version N is committed, a binary whose
-maximum supported version is below N must not start against that node data and a
-rolling downgrade is unsupported. The only safe rollback is restoration of a
-complete pre-activation backup or an offline rebuild into a cluster whose active
-format the older binary supports; there is no command that lowers the activation.
+The current server can opt into a persistent group-0 host and explicitly
+initialize its one-voter seed with `--cluster-init`. Observer admission remains
+an authenticated control operation, but it changes membership rather than a
+protocol-version gate.
 
 ## Observability and administration
 
@@ -1202,14 +1161,14 @@ Follow the task boundaries and safety gates in
 - Add VShard-tagged journals, catalog, manifests, and VShard-partitioned TSM,
   following the multiplexed object model above.
 - Add point revisions, block CRCs, file hashes, and rebuildable indexes.
-- Build the old-format migration tool (epic-sized; tracked as Task 6 of the
-  VShard-workers doc, dependent on the Task 4 format).
+- Reject retired development layouts before mutation. Greenfield data is
+  recreated; there is no old-format migration tool or compatibility reader.
 
 Three ADRs must land before Task 4 starts — they are on its critical path, not
 Phase 2's: journal segmentation/retention (decision 2), physical
 TSM/NativeIndex layout (decision 3), and pre-Raft point-revision assignment
 with its Raft-index compatibility rule (part of decision 1). The verification
-hash consumed by the Task 4 gate and migration is the whole-snapshot stream
+hash consumed by the Task 4 gate is the whole-snapshot stream
 hash defined in the anti-entropy section; the deferred Merkle machinery needs
 no ADR now.
 
@@ -1334,7 +1293,7 @@ Named deliverables, several epic-sized — not a checkbox list:
   bootstraps a new cluster UUID, imports snapshots as generation-one state,
   and scrubs old membership. Task 4's snapshot export format is the backup
   unit.
-- Rolling upgrades and feature gating (decision 8).
+- A post-production upgrade/migration design before introducing any v2 format.
 - Remaining operator APIs and CLI beyond the Phase 4 minimum surface.
 - Routing summaries (conservative measurement-to-VShard pruning) and
   hierarchical query merge.
@@ -1456,8 +1415,8 @@ architecture's claims rather than demonstrate only happy paths.
   for startup time, file descriptors, timers, cache memory, heartbeat traffic,
   and Seastar reactor stalls.
 - Change Seastar core count and verify no data rewrite and identical queries.
-- Roll compatible versions through the cluster while writing, querying, and
-  rebalancing.
+- Restart a homogeneous v1 cluster under load and prove that an unknown-version
+  peer or artifact is rejected before serving.
 - Restore a backup into a new cluster UUID and verify replicas are rebuilt
   rather than confusing old membership with the restored cluster.
 
@@ -1497,7 +1456,9 @@ or ADRs before Phase 2:
 6. Resolved: hot-series lanes are not in the first cluster release.
 7. Whether a later closed-timestamp/HLC mechanism should provide a cluster-wide
    query timestamp.
-8. Wire protocol and storage feature-gating rules for rolling upgrades.
+8. Resolved for greenfield: wire and storage layouts are explicitly v1-only and
+   updated in place. A future v2 requires a separate post-production migration
+   and deployment decision.
 9. Client-facing authentication in cluster mode: the current HTTP API has no
    authentication, while the networking section promises "separate client and
    inter-node authentication policies". Decide whether client auth is in

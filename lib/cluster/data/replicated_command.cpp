@@ -1,7 +1,5 @@
 #include "replicated_command.hpp"
 
-#include "journal_format.hpp"  // JournalFormatGate (debt D-7)
-
 #include <algorithm>
 #include <cstring>
 #include <stdexcept>
@@ -68,12 +66,10 @@ struct Reader {
     }
 };
 
+constexpr char kCommandMagic[4] = {'T', 'S', 'C', '1'};
 constexpr uint8_t kWrite = 0;
-constexpr uint8_t kDelete = 1;
+constexpr uint8_t kDeleteBatch = 1;
 constexpr uint8_t kRetention = 2;
-constexpr uint8_t kIdempotentDelete = 3;
-constexpr uint8_t kIdempotentDeleteBatch = 4;
-constexpr uint8_t kBoundedIdempotentDeleteBatch = 5;
 constexpr size_t kMinimumDeleteRangeTargetBytes = 4 + 8 + 8;
 
 bool validDeleteRangeTargets(const std::vector<DeleteRangeTarget>& targets) {
@@ -89,25 +85,17 @@ bool validDeleteRangeTargets(const std::vector<DeleteRangeTarget>& targets) {
 
 }  // namespace
 
-uint32_t requiredClusterFormatVersion(const ReplicatedCommand& cmd) {
-    if (const auto* d = std::get_if<DeleteRangeKey>(&cmd))
-        return d->operationId == SeriesId128{} ? 1 : kDeleteReceiptActivationVersion;
-    if (const auto* batch = std::get_if<DeleteRangeBatch>(&cmd))
-        return batch->issuedAtMs == 0 ? kDeleteReceiptActivationVersion : kBoundedDeleteReceiptActivationVersion;
-    return 1;
-}
-
 std::string encodeWriteCommand(const WriteBatch& batch) {
-    std::string out;
+    std::string out(kCommandMagic, sizeof(kCommandMagic));
     out.push_back(static_cast<char>(kWrite));
-    putStr(out, encodeWriteBatch(batch, JournalFormatGate::writeBatchFormat()));  // see encodeReplicatedCommand
+    putStr(out, encodeWriteBatch(batch));
     putU64(out, fnv1a(out.data(), out.size()));
     return out;
 }
 
 std::optional<OversizeSlice> firstUnproposableSlice(const VShardBatchView& view, size_t bound) {
     for (const auto* g : view) {
-        const size_t n = maxEncodedWriteCommandBytes(g->second);
+        const size_t n = encodedWriteCommandBytes(g->second);
         if (n > bound)
             return OversizeSlice{g->first, n};
     }
@@ -115,44 +103,17 @@ std::optional<OversizeSlice> firstUnproposableSlice(const VShardBatchView& view,
 }
 
 std::string encodeReplicatedCommand(const ReplicatedCommand& cmd) {
-    std::string out;
+    std::string out(kCommandMagic, sizeof(kCommandMagic));
     if (const auto* w = std::get_if<WriteBatch>(&cmd)) {
         out.push_back(static_cast<char>(kWrite));
-        // WriteBatch arm reuses the tested encoder as a length-prefixed sub-blob
-        // (it carries its own FNV; the outer trailer covers the tag + blob).
-        //
-        // The version comes from the CLUSTER-WIDE JOURNAL GATE, never from the encoder's
-        // default (debt D-7). These bytes become a Raft log entry: replicated to every
-        // voter and written to each one's journal, so the format must be one every voter
-        // -- and every binary that may later replay that journal -- can read. A voter takes
-        // no part in the pairwise data-plane handshake, so per-peer negotiation cannot gate
-        // it; the gate is group-0's COMMITTED format activation, which the controller
-        // proposes only once FeatureGate::canActivate confirms every voter supports the
-        // version. It defaults to v1 and only ever rises, so a node that has heard no
-        // activation emits v1 -- fail closed. See data/journal_format.hpp for the full
-        // ordering argument (including why "an old binary reads a v2 journal" is
-        // unreachable rather than untested).
-        //
-        // Naming the gate here rather than a literal is also what keeps a change to
-        // encodeWriteBatch's DEFAULT from silently promoting the journal format
-        // (docs/write-scaleout-plan.md §6).
-        putStr(out, encodeWriteBatch(*w, JournalFormatGate::writeBatchFormat()));
-    } else if (const auto* d = std::get_if<DeleteRangeKey>(&cmd)) {
-        const bool idempotent = d->operationId != SeriesId128{};
-        out.push_back(static_cast<char>(idempotent ? kIdempotentDelete : kDelete));
-        if (idempotent)
-            d->operationId.appendTo(out);
-        putStr(out, d->seriesKey);
-        putU64(out, d->startTime);
-        putU64(out, d->endTime);
+        putStr(out, encodeWriteBatch(*w));
     } else if (const auto* batch = std::get_if<DeleteRangeBatch>(&cmd)) {
-        if (batch->operationId == SeriesId128{} || !validDeleteRangeTargets(batch->targets))
+        if (batch->operationId == SeriesId128{} || batch->issuedAtMs == 0 ||
+            !validDeleteRangeTargets(batch->targets))
             throw std::invalid_argument("encodeReplicatedCommand: invalid idempotent delete batch");
-        out.push_back(
-            static_cast<char>(batch->issuedAtMs == 0 ? kIdempotentDeleteBatch : kBoundedIdempotentDeleteBatch));
+        out.push_back(static_cast<char>(kDeleteBatch));
         batch->operationId.appendTo(out);
-        if (batch->issuedAtMs != 0)
-            putU64(out, batch->issuedAtMs);
+        putU64(out, batch->issuedAtMs);
         putU32(out, static_cast<uint32_t>(batch->targets.size()));
         for (const auto& target : batch->targets) {
             putStr(out, target.seriesKey);
@@ -169,7 +130,7 @@ std::string encodeReplicatedCommand(const ReplicatedCommand& cmd) {
 }
 
 std::optional<ReplicatedCommand> decodeReplicatedCommand(const std::string& bytes) {
-    if (bytes.size() < 8)
+    if (bytes.size() < sizeof(kCommandMagic) + 1 + 8)
         return std::nullopt;
     const size_t bodyLen = bytes.size() - 8;
     uint64_t stored = 0;
@@ -178,7 +139,9 @@ std::optional<ReplicatedCommand> decodeReplicatedCommand(const std::string& byte
     if (fnv1a(bytes.data(), bodyLen) != stored)
         return std::nullopt;
 
-    Reader r{bytes.data(), bytes.data() + bodyLen};
+    if (std::memcmp(bytes.data(), kCommandMagic, sizeof(kCommandMagic)) != 0)
+        return std::nullopt;
+    Reader r{bytes.data() + sizeof(kCommandMagic), bytes.data() + bodyLen};
     uint8_t tag = r.u8();
     if (!r.ok)
         return std::nullopt;
@@ -191,33 +154,15 @@ std::optional<ReplicatedCommand> decodeReplicatedCommand(const std::string& byte
         if (!batch)
             return std::nullopt;
         cmd = std::move(*batch);
-    } else if (tag == kDelete || tag == kIdempotentDelete) {
-        DeleteRangeKey d;
-        if (tag == kIdempotentDelete) {
-            if (!r.avail(16))
-                return std::nullopt;
-            d.operationId = SeriesId128::fromBytes(r.p, 16);
-            r.p += 16;
-            if (d.operationId == SeriesId128{})
-                return std::nullopt;
-        }
-        d.seriesKey = r.str();
-        d.startTime = r.u64();
-        d.endTime = r.u64();
-        if (!r.ok)
-            return std::nullopt;
-        cmd = std::move(d);
-    } else if (tag == kIdempotentDeleteBatch || tag == kBoundedIdempotentDeleteBatch) {
+    } else if (tag == kDeleteBatch) {
         DeleteRangeBatch d;
         if (!r.avail(16))
             return std::nullopt;
         d.operationId = SeriesId128::fromBytes(r.p, 16);
         r.p += 16;
-        if (tag == kBoundedIdempotentDeleteBatch) {
-            d.issuedAtMs = r.u64();
-            if (!r.ok || d.issuedAtMs == 0)
-                return std::nullopt;
-        }
+        d.issuedAtMs = r.u64();
+        if (!r.ok || d.issuedAtMs == 0)
+            return std::nullopt;
         const uint32_t count = r.u32();
         if (!r.ok || d.operationId == SeriesId128{} || count == 0 || count > kMaxDeleteRangeBatchTargets ||
             count > static_cast<size_t>(r.end - r.p) / kMinimumDeleteRangeTargetBytes)
@@ -249,23 +194,13 @@ std::optional<ReplicatedCommand> decodeReplicatedCommand(const std::string& byte
     return cmd;
 }
 
-uint64_t deleteRangeCommandHash(const DeleteRangeKey& command) {
-    std::string canonical;
-    canonical.reserve(4 + command.seriesKey.size() + 16);
-    putStr(canonical, command.seriesKey);
-    putU64(canonical, command.startTime);
-    putU64(canonical, command.endTime);
-    return fnv1a(canonical.data(), canonical.size());
-}
-
 uint64_t deleteRangeCommandHash(const DeleteRangeBatch& command) {
     std::string canonical;
-    size_t bytes = 4 + (command.issuedAtMs == 0 ? 0 : 8);
+    size_t bytes = 4 + 8;
     for (const auto& target : command.targets)
         bytes += 4 + target.seriesKey.size() + 16;
     canonical.reserve(bytes);
-    if (command.issuedAtMs != 0)
-        putU64(canonical, command.issuedAtMs);
+    putU64(canonical, command.issuedAtMs);
     putU32(canonical, static_cast<uint32_t>(command.targets.size()));
     for (const auto& target : command.targets) {
         putStr(canonical, target.seriesKey);

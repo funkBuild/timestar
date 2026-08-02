@@ -14,7 +14,7 @@ namespace timestar {
 // the block ranges of the VShard's series). A VShard's series are identified by
 // virtualShard(seriesId), so extraction is derived and stable across core counts.
 //
-// This composes the metadata models -- VShardExtentMap + the V4 per-block
+// This composes the metadata models -- VShardExtentMap + the v1 per-block
 // [minRev,maxRev] -- into the "which files cover a VShard" index a snapshot
 // (VShardSnapshotManifest) or migration reads. It changes no on-disk format and
 // touches no hot path; it is the offline read side.

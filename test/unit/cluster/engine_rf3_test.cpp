@@ -123,7 +123,7 @@ std::string writeCmd(const std::string& key, double value) {
 }
 
 std::string deleteCmd(const std::string& key, const SeriesId128& operationId) {
-    data::DeleteRangeKey command{key, BASE, BASE, operationId};
+    data::DeleteRangeBatch command{{{key, BASE, BASE}}, operationId, 1'000};
     return data::encodeReplicatedCommand(data::ReplicatedCommand{std::move(command)});
 }
 

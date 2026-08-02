@@ -69,17 +69,6 @@ public:
     }
 };
 
-class AmbiguousTransport : public CommandTransport {
-public:
-    seastar::future<ProposeOutcome> proposeCommandHinted(NodeId to, uint16_t, ReplicatedCommand,
-                                                         OptDeadline deadline) override {
-        ++calls;
-        targets.push_back(to);
-        deadlines.push_back(deadline);
-        return seastar::make_exception_future<ProposeOutcome>(std::runtime_error("connection lost after send"));
-    }
-};
-
 class OneShotAmbiguousTransport : public CommandTransport {
 public:
     seastar::future<ProposeOutcome> proposeCommandHinted(NodeId to, uint16_t vshard, ReplicatedCommand command,
@@ -116,13 +105,9 @@ ControlMap mapWith(uint16_t vshard) {
     return map;
 }
 
-DeleteRangeKey deleteFor(const std::string& key) {
-    return DeleteRangeKey{key, 10, 20};
-}
-
-DeleteRangeBatch deleteBatchFor(const std::string& key) {
+DeleteRangeBatch deleteFor(const std::string& key) {
     return DeleteRangeBatch{{DeleteRangeTarget{key, 10, 20}},
-                            SeriesId128::fromHex("0fedcba9876543210fedcba987654321")};
+                            SeriesId128::fromHex("0fedcba9876543210fedcba987654321"), 1'800'000'000'000};
 }
 
 }  // namespace
@@ -169,21 +154,6 @@ TEST(ReplicatedCommandRouterTest, PreservesTheCommandAcrossALeaderHintRetry) {
     EXPECT_TRUE(remote.deadlines[0].has_value());
 }
 
-TEST(ReplicatedCommandRouterTest, DoesNotReproposeDeleteAfterAmbiguousRemoteFailure) {
-    const std::string key = buildSeriesKey("delete", {{"host", "ambiguous-remote"}}, "value");
-    const uint16_t vshard = timestar::virtualShard(SeriesId128::fromSeriesKey(key));
-    VShardDirectory dir(1, mapWith(vshard));
-    CommandSink local;
-    AmbiguousTransport remote;
-    MapLeaders leaders;
-    leaders.leaders[vshard] = 2;
-    ReplicatedCommandRouter router(dir, local, remote, leaders);
-
-    EXPECT_THROW(router.propose(vshard, ReplicatedCommand{deleteFor(key)}).get(), AmbiguousMutationError);
-    EXPECT_EQ(local.calls, 0u);
-    EXPECT_EQ(remote.calls, 1u) << "an unknown delete outcome must never be re-proposed";
-}
-
 TEST(ReplicatedCommandRouterTest, SnapshotPersistentDeleteIdentityMakesAmbiguousRetrySafe) {
     const std::string key = buildSeriesKey("delete", {{"host", "idempotent-remote"}}, "value");
     const uint16_t vshard = timestar::virtualShard(SeriesId128::fromSeriesKey(key));
@@ -195,7 +165,6 @@ TEST(ReplicatedCommandRouterTest, SnapshotPersistentDeleteIdentityMakesAmbiguous
     ReplicatedCommandRouter router(dir, local, remote, leaders);
 
     auto command = deleteFor(key);
-    command.operationId = SeriesId128::fromHex("fedcba9876543210fedcba9876543210");
     const std::string expected = encodeReplicatedCommand(ReplicatedCommand{command});
     EXPECT_NO_THROW(router.propose(vshard, ReplicatedCommand{command}).get());
     ASSERT_EQ(remote.calls, 2u);
@@ -214,7 +183,7 @@ TEST(ReplicatedCommandRouterTest, VShardDeleteBatchRetriesTheExactBytesAfterAmbi
     leaders.leaders[vshard] = 2;
     ReplicatedCommandRouter router(dir, local, remote, leaders);
 
-    const ReplicatedCommand command{deleteBatchFor(key)};
+    const ReplicatedCommand command{deleteFor(key)};
     const std::string expected = encodeReplicatedCommand(command);
     EXPECT_NO_THROW(router.propose(vshard, command).get());
     ASSERT_EQ(remote.encoded.size(), 2u);
@@ -232,27 +201,10 @@ TEST(ReplicatedCommandRouterTest, RetiredDeleteIdentityIsTerminalWithoutRepropos
     CommandTransport remote;
     MapLeaders leaders;
     ReplicatedCommandRouter router(dir, local, remote, leaders);
-    auto batch = deleteBatchFor(key);
-    batch.issuedAtMs = 1'800'000'000'000;
+    auto batch = deleteFor(key);
 
     EXPECT_THROW(router.propose(vshard, ReplicatedCommand{batch}).get(), DeleteReceiptExpiredError);
     EXPECT_EQ(local.calls, 1u);
-    EXPECT_EQ(remote.calls, 0u);
-}
-
-TEST(ReplicatedCommandRouterTest, DoesNotReproposeDeleteAfterLeadershipLoss) {
-    const std::string key = buildSeriesKey("delete", {{"host", "ambiguous-local"}}, "value");
-    const uint16_t vshard = timestar::virtualShard(SeriesId128::fromSeriesKey(key));
-    VShardDirectory dir(1, mapWith(vshard));
-    CommandSink local;
-    local.commit = false;
-    local.rejectKind = WriteFailure::LeadershipLost;
-    CommandTransport remote;
-    MapLeaders leaders;
-    ReplicatedCommandRouter router(dir, local, remote, leaders);
-
-    EXPECT_THROW(router.propose(vshard, ReplicatedCommand{deleteFor(key)}).get(), AmbiguousMutationError);
-    EXPECT_EQ(local.calls, 1u) << "a leadership-lost delete may already be in the successor's log";
     EXPECT_EQ(remote.calls, 0u);
 }
 
@@ -281,7 +233,7 @@ TEST(ReplicatedCommandRouterTest, RejectsCrossVShardDeleteBatchBeforeProposal) {
             break;
     }
     DeleteRangeBatch batch{{DeleteRangeTarget{first, 10, 20}, DeleteRangeTarget{foreign, 10, 20}},
-                           SeriesId128::fromHex("123456789abcdef0123456789abcdef0")};
+                           SeriesId128::fromHex("123456789abcdef0123456789abcdef0"), 1'800'000'000'000};
     std::sort(batch.targets.begin(), batch.targets.end());
     VShardDirectory dir(1, mapWith(requested));
     CommandSink local;

@@ -298,157 +298,9 @@ TEST_F(TSMUniversalStatsTest, StringAggregationReturnsZero) {
     seastar::async([&] { testStringAggregationReturnsZero(getTestFilePath("0_7.tsm")).get(); }).get();
 }
 
-// ==================== Phase 1: Version V3 ====================
-
-TEST_F(TSMUniversalStatsTest, TSMVersionIsV4AndV2StaysReadable) {
-    EXPECT_EQ(TSM_VERSION, 4u);
-    // V4 appends a per-block [minRev, maxRev] revision range. V2/V3 files MUST
-    // remain readable: rejecting them on open would orphan every pre-upgrade file
-    // (data invisible to queries, never compacted or reclaimed). The reader parses
-    // by file version; compaction rewrites older files as V4.
-    EXPECT_EQ(TSM_VERSION_MIN, 2u);
-}
-
-TEST_F(TSMUniversalStatsTest, IndexEntryHeaderIsSeriesIdTypeAndVersionSizedCount) {
+TEST_F(TSMUniversalStatsTest, TSMFormatIsV1) {
+    EXPECT_EQ(TSM_VERSION, 1u);
     EXPECT_EQ(TSM_INDEX_ENTRY_HEADER_SIZE, 16u + 1u + 4u);
-    EXPECT_EQ(TSM_INDEX_ENTRY_HEADER_SIZE_V2, 16u + 1u + 2u);
-    EXPECT_EQ(tsmIndexEntryHeaderSize(3), TSM_INDEX_ENTRY_HEADER_SIZE);
-    EXPECT_EQ(tsmIndexEntryHeaderSize(2), TSM_INDEX_ENTRY_HEADER_SIZE_V2);
-}
-
-// A V2-format file must round-trip through the V3 reader: sparse index, full
-// index entry (stats), and raw reads all intact. The V2 file is synthesized
-// from a real V3 file written by the current writer, by narrowing each index
-// entry's block count from u32 to u16 and stamping the version byte — the
-// only two things V3 changed.
-seastar::future<> testV2FileRemainsReadable(std::string v3Path, std::string v2Path) {
-    SeriesId128 seriesId = SeriesId128::fromSeriesKey("test.v2_compat");
-    const std::vector<uint64_t> timestamps = {1000, 2000, 3000, 4000, 5000};
-    const std::vector<double> values = {1.5, 2.5, 3.5, 4.5, 5.5};
-
-    {
-        TSMWriter writer(v3Path);
-        std::vector<uint64_t> ts = timestamps;
-        std::vector<double> vs = values;
-        writer.writeSeries(TSMValueType::Float, seriesId, ts, vs);
-        writer.writeIndex();
-        writer.close();
-    }
-
-    // ---- Transform V3 -> V2 on the raw bytes ----
-    std::string v3Bytes;
-    {
-        std::ifstream in(v3Path, std::ios::binary);
-        std::ostringstream ss;
-        ss << in.rdbuf();
-        v3Bytes = ss.str();
-    }
-    EXPECT_GE(v3Bytes.size(), 16u);
-    if (v3Bytes.size() < 16u) {
-        co_return;
-    }
-    uint64_t indexOffset = 0;
-    std::memcpy(&indexOffset, v3Bytes.data() + v3Bytes.size() - 8, 8);
-    EXPECT_LT(indexOffset, v3Bytes.size());
-    if (indexOffset >= v3Bytes.size()) {
-        co_return;
-    }
-
-    std::string v2Bytes(v3Bytes.begin(), v3Bytes.begin() + static_cast<std::ptrdiff_t>(indexOffset));
-    v2Bytes[4] = 2;  // version byte follows the "TASM" magic
-
-    size_t off = indexOffset;
-    // V4 source has a 16-byte trailer: max-revision(8) + index-offset(8). The
-    // index section ends before both; the synthesized V2 file keeps only the
-    // 8-byte index offset (no max-revision trailer).
-    const size_t indexEnd = v3Bytes.size() - 16;
-    while (off < indexEnd) {
-        EXPECT_GE(indexEnd - off, static_cast<size_t>(TSM_INDEX_ENTRY_HEADER_SIZE));
-        if (indexEnd - off < TSM_INDEX_ENTRY_HEADER_SIZE) {
-            co_return;
-        }
-        v2Bytes.append(v3Bytes, off, 17);  // seriesId + type unchanged
-        const uint8_t type = static_cast<uint8_t>(v3Bytes[off + 16]);
-        uint32_t count = 0;
-        std::memcpy(&count, v3Bytes.data() + off + 17, 4);
-        EXPECT_LE(count, 0xFFFFu);
-        const uint16_t count16 = static_cast<uint16_t>(count);
-        v2Bytes.append(reinterpret_cast<const char*>(&count16), 2);
-        off += TSM_INDEX_ENTRY_HEADER_SIZE;
-
-        // The source file is V4 (current writer): each block is V2 size + a
-        // trailing 16-byte [minRev,maxRev]. Convert to V2 by copying each block's
-        // V2-sized prefix and dropping the revision range.
-        const auto vtype = static_cast<TSMValueType>(type);
-        const size_t srcBlockBytes = indexBlockBytes(vtype, TSM_VERSION);
-        const size_t dstBlockBytes = indexBlockBytes(vtype, 2);
-        const size_t srcBlocksTotal = count * srcBlockBytes;
-        EXPECT_LE(srcBlocksTotal, indexEnd - off);
-        if (srcBlocksTotal > indexEnd - off) {
-            co_return;
-        }
-        for (uint32_t b = 0; b < count; ++b)
-            v2Bytes.append(v3Bytes, off + b * srcBlockBytes, dstBlockBytes);
-        off += srcBlocksTotal;
-
-        // String dictionary (dictSize(4) + data) follows the blocks, verbatim.
-        if (vtype == TSMValueType::String) {
-            uint32_t dictBytes = 0;
-            std::memcpy(&dictBytes, v3Bytes.data() + off, 4);
-            const size_t dictTotal = 4 + dictBytes;
-            EXPECT_LE(dictTotal, indexEnd - off);
-            if (dictTotal > indexEnd - off) {
-                co_return;
-            }
-            v2Bytes.append(v3Bytes, off, dictTotal);
-            off += dictTotal;
-        }
-    }
-    // Index section start is unchanged; only its interior shrank.
-    v2Bytes.append(reinterpret_cast<const char*>(&indexOffset), 8);
-    {
-        std::ofstream out(v2Path, std::ios::binary | std::ios::trunc);
-        out.write(v2Bytes.data(), static_cast<std::streamsize>(v2Bytes.size()));
-    }
-
-    // ---- Read the V2 file through the current reader ----
-    TSM tsm(v2Path);
-    co_await tsm.open();
-
-    auto* entry = co_await tsm.getFullIndexEntry(seriesId);
-    EXPECT_NE(entry, nullptr);
-    if (entry && entry->indexBlocks.size() == 1u) {
-        EXPECT_EQ(entry->seriesType, TSMValueType::Float);
-        const auto& block = entry->indexBlocks[0];
-        EXPECT_EQ(block.blockCount, 5u);
-        EXPECT_DOUBLE_EQ(block.blockMin, 1.5);
-        EXPECT_DOUBLE_EQ(block.blockMax, 5.5);
-        EXPECT_DOUBLE_EQ(block.blockSum, 17.5);
-    } else if (entry) {
-        ADD_FAILURE() << "expected exactly 1 index block, got " << entry->indexBlocks.size();
-    }
-
-    TSMResult<double> result(0);
-    co_await tsm.readSeries(seriesId, 0, UINT64_MAX, result);
-    std::vector<uint64_t> readTs;
-    std::vector<double> readVals;
-    for (auto& block : result.blocks) {
-        readTs.insert(readTs.end(), block->timestamps.begin(), block->timestamps.end());
-        readVals.insert(readVals.end(), block->values.begin(), block->values.end());
-    }
-    EXPECT_EQ(readTs.size(), timestamps.size());
-    for (size_t i = 0; i < std::min(readTs.size(), timestamps.size()); ++i) {
-        EXPECT_EQ(readTs[i], timestamps[i]);
-        EXPECT_DOUBLE_EQ(readVals[i], values[i]);
-    }
-
-    co_await tsm.close();
-}
-
-TEST_F(TSMUniversalStatsTest, V2FileRemainsReadable) {
-    seastar::async([&] {
-        testV2FileRemainsReadable(getTestFilePath("0_90.tsm"), getTestFilePath("0_91.tsm")).get();
-    }).get();
 }
 
 // A truncated index must FAIL open(), never parse as a prefix. A silently
@@ -543,17 +395,10 @@ TEST_F(TSMUniversalStatsTest, DensestTimestampEncodingStaysInsidePlausibilityBou
 }
 
 TEST_F(TSMUniversalStatsTest, IndexBlockByteSizes) {
-    // V2 sizes
-    EXPECT_EQ(indexBlockBytesV2(TSMValueType::Float), 80u);
-    EXPECT_EQ(indexBlockBytesV2(TSMValueType::Integer), 72u);
-    EXPECT_EQ(indexBlockBytesV2(TSMValueType::Boolean), 40u);
-    EXPECT_EQ(indexBlockBytesV2(TSMValueType::String), 32u);
-
-    // V1 backward compat: non-Float is 28 bytes
-    EXPECT_EQ(indexBlockBytes(TSMValueType::Float, 1), 80u);
-    EXPECT_EQ(indexBlockBytes(TSMValueType::Integer, 1), 28u);
-    EXPECT_EQ(indexBlockBytes(TSMValueType::Boolean, 1), 28u);
-    EXPECT_EQ(indexBlockBytes(TSMValueType::String, 1), 28u);
+    EXPECT_EQ(indexBlockBytes(TSMValueType::Float), 96u);
+    EXPECT_EQ(indexBlockBytes(TSMValueType::Integer), 88u);
+    EXPECT_EQ(indexBlockBytes(TSMValueType::Boolean), 56u);
+    EXPECT_EQ(indexBlockBytes(TSMValueType::String), 48u);
 }
 
 // ==================== Phase 1: Integer LATEST/FIRST from sparse index ====================

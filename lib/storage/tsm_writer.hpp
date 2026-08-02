@@ -64,7 +64,7 @@ private:
                             size_t blockSize, TSMIndexEntry& indexEntry);
     // Serialise one series' index entry into the buffer.
     void writeIndexEntryFor(const TSMIndexEntry& indexEntry);
-    // File-level max of every block's revision range (V4 trailer).
+    // File-level max of every block's revision range.
     [[nodiscard]] uint64_t computeMaxRevision() const;
 
     // Absolute offset of the next byte to be written, i.e. what a block's index

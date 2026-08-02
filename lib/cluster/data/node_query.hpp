@@ -3,7 +3,6 @@
 #include "../../http/http_query_handler.hpp"  // http::SeriesResult, QueryResponse
 #include "../../query/aggregator.hpp"         // PartialAggregationResult
 #include "../../query/query_parser.hpp"       // QueryRequest, AggregationMethod
-#include "write_record.hpp"                   // kWriteBatchFormatV4/Max (the negotiated protocol line)
 
 #include <cstdint>
 #include <optional>
@@ -14,41 +13,6 @@
 namespace timestar::data {
 
 using timestar::PartialAggregationResult;
-
-// THE READ PATH'S WIRE GATE (debt D-25). A peer must negotiate at least this version
-// before it may be sent a `resolveVShards` list, because a peer below it cannot honour one
-// and NOTHING IN THE REPLY SAYS SO: `redirects` is an optional tail, so "this holder leads
-// every VShard you named" and "this holder never read your resolve list" arrive as the same
-// bytes -- an empty tail. The coordinator would then count a follower's possibly-stale
-// answer as a complete leader read, which is the one thing the D-13 exchange exists to
-// prevent. (A pre-D-13 peer is in fact stricter than that: its decoder requires full frame
-// consumption, so it REFUSES the request outright -- and the coordinator reads that refusal
-// as "this node is unreachable", wakes its Raft groups and tells the client to retry
-// shortly, forever. Fail-closed, but for the wrong reason and with the wrong advice.)
-//
-// THE RULE THAT MAKES BOTH DIRECTIONS SAFE, and it is not "gate every tail on the version":
-// a REQUEST tail is gated by the SENDER's negotiated version (the client chose the peer and
-// knows what it agreed to), while a REPLY tail is gated by SOMETHING IN THE REQUEST -- never
-// by the server's own version, which is what the v3 note in write_record.hpp explains a
-// server cannot know. `redirects` obeys this already: it is emitted only in answer to a
-// non-empty `resolveVShards` (LeaderFilteredNodeStore returns early otherwise), so the
-// coordinator's own request is the permission slip. Any future reply tail must be
-// introduced the same way, or it will be sent to a coordinator that cannot parse it.
-inline constexpr uint32_t kNodeQueryResolveMinVersion = kWriteBatchFormatV4;
-static_assert(kNodeQueryResolveMinVersion <= kWriteBatchFormatMax,
-              "this binary must advertise a version at least as new as the read protocol it speaks, or it "
-              "gates itself out of its own feature [debt D-25]");
-
-// A peer that cannot honour a `resolveVShards` list. DISTINCT from a transport failure on
-// purpose: an unreachable leader is an availability event whose cure is a retry (and whose
-// treatment includes waking the hibernating groups behind it), whereas this is a
-// rolling-upgrade state whose cure is finishing the upgrade -- retrying and waking are both
-// useless, and reporting it as "node N unreachable" sends the operator after the wrong
-// thing.
-class ReadResolveUnsupportedError : public std::runtime_error {
-public:
-    explicit ReadResolveUnsupportedError(const std::string& what) : std::runtime_error(what) {}
-};
 
 // The inter-node query request (integration plan F.2). Production cluster queries
 // fan out the REAL parsed query (measurement, scopes, fields, groupBy, interval,

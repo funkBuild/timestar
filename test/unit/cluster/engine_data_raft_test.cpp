@@ -68,7 +68,9 @@ std::string writeCommand(const std::string& key, double value) {
 }
 
 std::string deleteCommand(const std::string& key) {
-    return data::encodeReplicatedCommand(data::ReplicatedCommand{data::DeleteRangeKey{key, BASE - 1, BASE + 1}});
+    data::DeleteRangeBatch command{{{key, BASE - 1, BASE + 1}},
+                                   SeriesId128::fromHex("123456789abcdef0123456789abcdef0"), 1'000};
+    return data::encodeReplicatedCommand(data::ReplicatedCommand{std::move(command)});
 }
 }  // namespace
 

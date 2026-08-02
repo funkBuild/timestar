@@ -13,7 +13,7 @@ namespace timestar::features {
 // verification-hash machinery); the snapshot is the backup unit.
 struct VShardBackup {
     uint16_t vshard = 0;
-    std::string snapshot;          // DataStateMachine::snapshot() bytes
+    std::string snapshot;          // encoded SnapshotPayload bytes
     std::string verificationHash;  // logical hash of the snapshot's state
 };
 

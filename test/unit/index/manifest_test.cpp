@@ -155,7 +155,7 @@ SEASTAR_TEST_F(ManifestTest, FilesAtLevel) {
 }
 
 // ============================================================================
-// CRC framing (manifest format v2) tests
+// CRC-framed v1 manifest tests
 // ============================================================================
 
 namespace {
@@ -239,7 +239,7 @@ SEASTAR_TEST_F(ManifestTest, CompleteMalformedRecordFailsClosedAndIsPreserved) {
     EXPECT_EQ(readWholeFile(path), data);
 }
 
-SEASTAR_TEST_F(ManifestTest, CorruptMagicCannotDowngradeToEmptyLegacyState) {
+SEASTAR_TEST_F(ManifestTest, CorruptMagicFailsClosed) {
     {
         auto m = co_await Manifest::open(self->dir_);
         co_await m.close();
@@ -311,66 +311,6 @@ SEASTAR_TEST_F(ManifestTest, SymlinkedSnapshotTempIsRejectedWithoutTouchingTarge
     EXPECT_EQ(readWholeFile(target), contents);
     EXPECT_TRUE(std::filesystem::is_symlink(std::filesystem::symlink_status(temp)));
     co_await m.close();
-}
-
-// Legacy (v1, pre-CRC) manifests must recover correctly and be upgraded to
-// the CRC-framed v2 format on open.
-SEASTAR_TEST_F(ManifestTest, LegacyFormatBackwardCompat) {
-    // Hand-craft a legacy manifest: no header, frames are [len][record].
-    // Record: AddFile = type(1) fileNumber(8) level(4) fileSize(8)
-    //         entryCount(8) minKeyLen(4)+minKey maxKeyLen(4)+maxKey writeTs(8)
-    std::string record;
-    record.push_back(static_cast<char>(1));  // RecordType::AddFile
-    appendLE64(record, 7);                   // fileNumber
-    appendLE32(record, 2);                   // level
-    appendLE64(record, 12345);               // fileSize
-    appendLE64(record, 678);                 // entryCount
-    appendLE32(record, 3);
-    record.append("abc");  // minKey
-    appendLE32(record, 3);
-    record.append("xyz");        // maxKey
-    appendLE64(record, 999999);  // writeTimestamp
-
-    std::string file;
-    appendLE32(file, static_cast<uint32_t>(record.size()));  // legacy frame: no CRC
-    file.append(record);
-
-    auto path = self->dir_ + "/MANIFEST";
-    writeWholeFile(path, file);
-
-    {
-        auto m = co_await Manifest::open(self->dir_);
-        EXPECT_EQ(m.files().size(), 1u);
-        if (m.files().size() != 1) {
-            co_await m.close();
-            co_return;
-        }
-        EXPECT_EQ(m.files()[0].fileNumber, 7u);
-        EXPECT_EQ(m.files()[0].level, 2);
-        EXPECT_EQ(m.files()[0].fileSize, 12345u);
-        EXPECT_EQ(m.files()[0].entryCount, 678u);
-        EXPECT_EQ(m.files()[0].minKey, "abc");
-        EXPECT_EQ(m.files()[0].maxKey, "xyz");
-        EXPECT_EQ(m.files()[0].writeTimestamp, 999999u);
-        EXPECT_EQ(m.currentFileNumber(), 8u);
-        co_await m.close();
-    }
-
-    // The file must now be v2: starts with the "TSMF" magic.
-    auto upgraded = readWholeFile(path);
-    EXPECT_GE(upgraded.size(), 8u);
-    EXPECT_EQ(upgraded.substr(0, 4), upgraded.size() >= 4 ? "TSMF" : "");
-
-    // And it must still recover the same state through the v2 path.
-    {
-        auto m = co_await Manifest::open(self->dir_);
-        EXPECT_EQ(m.files().size(), 1u);
-        if (m.files().size() == 1) {
-            EXPECT_EQ(m.files()[0].fileNumber, 7u);
-            EXPECT_EQ(m.files()[0].maxKey, "xyz");
-        }
-        co_await m.close();
-    }
 }
 
 // A torn tail (partial frame from a crash mid-append) must not lose the

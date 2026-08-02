@@ -279,7 +279,7 @@ SEASTAR_TEST_F(SSTableTest, PrefixScan) {
 }
 
 // ============================================================================
-// SSTable metadata v2 tests — write timestamp in extended footer
+// SSTable v1 metadata tests — write timestamp in the current footer
 // ============================================================================
 
 SEASTAR_TEST_F(SSTableTest, WriteTimestampRecorded) {
@@ -684,7 +684,7 @@ SEASTAR_TEST_F(SSTableTest, MetadataCorruptionFailsClosed) {
     EXPECT_THROW(co_await SSTableReader::open(path), std::runtime_error);
 }
 
-SEASTAR_TEST_F(SSTableTest, V2MetadataBindsCanonicalFileIdentity) {
+SEASTAR_TEST_F(SSTableTest, V1MetadataBindsCanonicalFileIdentity) {
     auto path = self->sstPath("idx_000123.sst");
     auto writer = co_await SSTableWriter::create(path);
     writer.add("key", "value");
@@ -695,37 +695,6 @@ SEASTAR_TEST_F(SSTableTest, V2MetadataBindsCanonicalFileIdentity) {
     auto reader = co_await SSTableReader::open(path);
     EXPECT_EQ(reader->metadata().fileNumber, 123u);
     EXPECT_EQ(reader->metadata().formatVersion, SSTABLE_VERSION);
-    co_await reader->close();
-}
-
-SEASTAR_TEST_F(SSTableTest, LegacyV1FileIsValidatedAndReadableWithoutBloomTrust) {
-    auto path = self->sstPath("legacy_v1.sst");
-    {
-        auto writer = co_await SSTableWriter::create(path, 128);
-        for (int i = 0; i < 50; ++i)
-            writer.add(std::format("key:{:04d}", i), std::format("value:{:04d}", i));
-        co_await writer.finish();
-    }
-
-    int fd = ::open(path.c_str(), O_RDWR);
-    EXPECT_GE(fd, 0);
-    if (fd < 0)
-        co_return;
-    const auto fileSize = ::lseek(fd, 0, SEEK_END);
-    char legacyReserved[8]{};
-    char legacyVersion[4];
-    encodeLE32(legacyVersion, SSTABLE_LEGACY_VERSION);
-    EXPECT_EQ(::pwrite(fd, legacyReserved, sizeof(legacyReserved), fileSize - 16),
-              static_cast<ssize_t>(sizeof(legacyReserved)));
-    EXPECT_EQ(::pwrite(fd, legacyVersion, sizeof(legacyVersion), fileSize - 4),
-              static_cast<ssize_t>(sizeof(legacyVersion)));
-    ::close(fd);
-
-    auto reader = co_await SSTableReader::open(path);
-    auto first = co_await reader->get("key:0000");
-    auto last = co_await reader->get("key:0049");
-    EXPECT_EQ(first, std::optional<std::string>("value:0000"));
-    EXPECT_EQ(last, std::optional<std::string>("value:0049"));
     co_await reader->close();
 }
 

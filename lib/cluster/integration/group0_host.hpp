@@ -67,8 +67,7 @@ public:
                             std::string expectedClusterUuid = {},
                             std::optional<control::NodeRecord> localRecord = std::nullopt,
                             std::optional<control::ControlMap> expectedInitialServingMap = std::nullopt,
-                            control::Group0StateMachine::ServingMapObserver servingMapObserver = {},
-                            control::Group0StateMachine::ActiveFormatObserver activeFormatObserver = {});
+                            control::Group0StateMachine::ServingMapObserver servingMapObserver = {});
     void startTicking();
     seastar::future<> stop();
 

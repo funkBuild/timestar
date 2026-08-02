@@ -2,16 +2,12 @@
 // byte bound. Pure logic -- no sockets, no Raft.
 #include "../../../lib/cluster/integration/write_admission.hpp"
 
-#include "../../../lib/cluster/data/dataplane_rpc.hpp"
-#include "../../../lib/cluster/data/journal_format.hpp"
 #include "../../../lib/cluster/data/write_errors.hpp"
 #include "../../../lib/cluster/data/write_record.hpp"
-#include "../../../lib/cluster/integration/cluster_data_plane.hpp"
 #include "../../../lib/utils/series_key.hpp"
 
 #include <gtest/gtest.h>
 
-#include <fstream>
 #include <stdexcept>
 
 using namespace timestar;
@@ -70,8 +66,6 @@ TEST(WriteFailureTaxonomyTest, LocalClassificationIsConservative) {
     EXPECT_EQ(cls(std::make_exception_ptr(data::UnassignedVShardError("none"))), WriteFailure::Unassigned);
     EXPECT_EQ(cls(std::make_exception_ptr(data::WriteFrameTooLargeError("big"))), WriteFailure::Fatal);
     EXPECT_EQ(cls(std::make_exception_ptr(data::DeleteReceiptExpiredError("old"))), WriteFailure::Expired);
-    EXPECT_EQ(cls(std::make_exception_ptr(data::ClusterFormatUnsupportedError("upgrade required"))),
-              WriteFailure::Fatal);
     EXPECT_EQ(cls(std::make_exception_ptr(data::ShardStoppingError("shard data plane is stopping"))),
               WriteFailure::ShardStopping);
     // Matched by TYPE now, not by message. A plain runtime_error wearing the same words is
@@ -94,7 +88,6 @@ TEST(WriteFailureTaxonomyTest, RemoteClassificationTreatsPeerErrorsAsAvailabilit
     EXPECT_EQ(cls(std::make_exception_ptr(std::runtime_error("dataplane: unknown peer"))), WriteFailure::Transport);
     EXPECT_EQ(cls(std::make_exception_ptr(data::WriteFrameTooLargeError("big"))), WriteFailure::Fatal);
     EXPECT_EQ(cls(std::make_exception_ptr(data::UnassignedVShardError("none"))), WriteFailure::Unassigned);
-    EXPECT_EQ(cls(std::make_exception_ptr(data::ClusterFormatUnsupportedError("old peer"))), WriteFailure::Fatal);
 }
 
 // The in-flight bound admits, charges, releases, and REJECTS rather than queueing.
@@ -212,140 +205,4 @@ TEST(WriteAdmissionTest, ResidentEstimateTracksThePayload) {
 
     data::VShardBatches groups = data::splitByVShard(floatBatch(20, 100));
     EXPECT_EQ(data::approxResidentBytes(data::viewOf(groups)), data::approxResidentBytes(floatBatch(20, 100)));
-}
-
-// A node must advertise the NEWEST wire version this binary supports, and this asserts
-// the ADVERTISED VALUE, not the source text that produces it.
-//
-// The bug it guards: ClusterDataPlane::localVersion_ still said kWriteBatchFormatV2 after
-// v3 landed, so every negotiation capped at 2, no peer spoke the hinted-propose verb, and
-// the whole leader-hint path was dead in production with a green suite -- unit and socket
-// tests build their own DataPlaneRpc, whose default was already correct.
-//
-// A source grep for the initializer (the first version of this test) was too weak: it
-// cannot see DataPlaneRpc's own default regressing, a third advertiser appearing, or a
-// setLocalVersion({1,2}) overriding the initializer afterwards. Reading the value back
-// from each advertiser sees all three.
-TEST(WriteAdmissionTest, EveryAdvertiserOffersTheNewestSupportedWireVersion) {
-    // Advertiser 1: the transport's own default (what a peer handshakes against).
-    data::DataPlaneRpc rpc;
-    EXPECT_EQ(rpc.localVersion().min, 1u);
-    EXPECT_EQ(rpc.localVersion().max, data::kWriteBatchFormatMax)
-        << "DataPlaneRpc must advertise the newest format this binary can write";
-
-    // Advertiser 2: the NODE, which pushes its range to every per-shard transport in
-    // start(). This is the one that regressed.
-    cluster::ClusterDataPlane node;
-    EXPECT_EQ(node.localVersion().min, 1u);
-    EXPECT_EQ(node.localVersion().max, data::kWriteBatchFormatMax)
-        << "ClusterDataPlane must advertise the newest format this binary can write; "
-           "pinning a literal silently disables every protocol step newer than it, cluster-wide";
-
-    // ... and a narrowed range still round-trips, so the getter reads the live value
-    // rather than a constant (a getter returning kWriteBatchFormatMax unconditionally
-    // would pass everything above and prove nothing).
-    rpc.setLocalVersion(features::VersionRange{1, 1});
-    EXPECT_EQ(rpc.localVersion().max, 1u);
-
-    // ... and Max must be able to REACH every gated protocol step in the tree. Listed
-    // individually, and as `>=`, because a future v5 must be able to land by moving Max
-    // alone: an equality here would instruct the next person to drag a gate forward with
-    // it, which is the opposite of what a gate is for (see the next test).
-    EXPECT_GE(data::kWriteBatchFormatMax, data::kWriteBatchFormatV3) << "the hinted-propose gate";
-    EXPECT_GE(data::kWriteBatchFormatMax, data::kNodeQueryResolveMinVersion) << "the leader-resolve read gate (D-25)";
-    EXPECT_GE(data::kWriteBatchFormatMax, data::kBoundedDeleteReceiptActivationVersion)
-        << "the bounded-delete command and Expired-outcome gate";
-    EXPECT_GE(data::kWriteBatchFormatMax, data::kFrozenDeletePlanActivationVersion)
-        << "the group-0 frozen pattern-delete command and snapshot gate";
-    EXPECT_GE(data::kWriteBatchFormatMax, data::kWriteBatchFormatV7)
-        << "the identity-bound capability protocol gate";
-}
-
-// A CAPABILITY GATE IS A HISTORICAL FACT AND MUST NOT MOVE (debt D-25).
-//
-// `kNodeQueryResolveMinVersion` records the version at which the resolve/redirect exchange
-// became speakable. Raising it with a later protocol step -- the reflex a
-// "Max == the read gate" tripwire would have taught -- REFUSES peers that are perfectly
-// capable of resolving, turning working mixed-version reads into QUERY_INCOMPLETE with a
-// false diagnosis for the whole upgrade window. Lowering it is worse: it sends resolve
-// lists to peers that cannot honour them, which is the bug D-25 closed.
-TEST(WriteAdmissionTest, TheReadResolveGateIsPinnedToTheVersionThatIntroducedIt) {
-    EXPECT_EQ(data::kNodeQueryResolveMinVersion, data::kWriteBatchFormatV4)
-        << "the leader-resolve read exchange became speakable at v4 and that is a fact about history, not a "
-           "number to keep current: RAISING it refuses capable peers for a whole rolling upgrade, LOWERING it "
-           "sends resolve lists to peers that predate the exchange. A new read-path capability needs a NEW "
-           "constant at a NEW version, not an edit to this one [debt D-25]";
-    // v3 is the hinted-propose gate and predates the resolve exchange (6bf2d18 is an
-    // ancestor of D-13's 6314ab8), so the two must not be conflated -- negotiating v3 says
-    // nothing about whether a peer can resolve leadership.
-    EXPECT_GT(data::kNodeQueryResolveMinVersion, data::kWriteBatchFormatV3);
-}
-
-// ... and the list of advertisers must be EXHAUSTIVE.
-//
-// Reading the value back from the two known advertisers cannot see a THIRD one appearing,
-// nor a setLocalVersion() call that overrides a correct initializer after start(). Both
-// are how the original bug would come back. So: enumerate every site in the tree that
-// declares or sets an advertised range, and require it to be one of the reviewed ones. A
-// new site fails this test and has to be added deliberately -- which is the point.
-TEST(WriteAdmissionTest, TheAdvertiserListIsExhaustive) {
-    auto readSource = [](const std::string& rel) {
-        for (const std::string& prefix : {"", "../", "../../", "../../../"}) {
-            std::ifstream in(prefix + rel);
-            if (in.good()) {
-                std::ostringstream ss;
-                ss << in.rdbuf();
-                return ss.str();
-            }
-        }
-        return std::string();
-    };
-    // (file, needle, why it is allowed to exist)
-    const std::vector<std::array<std::string, 2>> reviewed = {
-        // The two DEFAULTS, both of which must name kWriteBatchFormatMax.
-        {"lib/cluster/data/dataplane_rpc.cpp", "features::VersionRange localVersion{1, kWriteBatchFormatMax};"},
-        {"lib/cluster/integration/cluster_data_plane.hpp", "localVersion_{1, data::kWriteBatchFormatMax}"},
-        // The one PROPAGATION path: the node pushes its range to every per-shard
-        // transport. It forwards a value, it does not invent one.
-        {"lib/cluster/integration/cluster_data_plane.cpp", "rpc_->setLocalVersion(localVersion_)"},
-        {"lib/cluster/integration/shard_raft_plane.hpp", "rpc_->setLocalVersion(localVersion)"},
-    };
-    for (const auto& [file, needle] : reviewed) {
-        const std::string src = readSource(file);
-        ASSERT_FALSE(src.empty()) << "could not locate " << file;
-        EXPECT_NE(src.find(needle), std::string::npos)
-            << file << " no longer contains the reviewed advertiser/propagation: " << needle;
-    }
-
-    // Now the exhaustiveness half: no OTHER file may declare or set an advertised range.
-    const std::vector<std::string> allowed = {
-        "lib/cluster/data/dataplane_rpc.cpp", "lib/cluster/data/dataplane_rpc.hpp",
-        "lib/cluster/integration/cluster_data_plane.cpp", "lib/cluster/integration/cluster_data_plane.hpp",
-        "lib/cluster/integration/shard_raft_plane.hpp"};
-    for (const std::string& prefix : {"", "../", "../../", "../../../"}) {
-        if (!std::filesystem::exists(prefix + std::string("lib/cluster")))
-            continue;
-        std::vector<std::string> offenders;
-        for (auto& e : std::filesystem::recursive_directory_iterator(prefix + std::string("lib"))) {
-            if (!e.is_regular_file())
-                continue;
-            const std::string ext = e.path().extension().string();
-            if (ext != ".cpp" && ext != ".hpp")
-                continue;
-            std::string rel = e.path().string().substr(std::string(prefix).size());
-            std::ifstream in(e.path());
-            std::ostringstream ss;
-            ss << in.rdbuf();
-            const std::string body = ss.str();
-            const bool touches = body.find("setLocalVersion(") != std::string::npos ||
-                                 body.find("VersionRange localVersion") != std::string::npos;
-            if (touches && std::find(allowed.begin(), allowed.end(), rel) == allowed.end())
-                offenders.push_back(rel);
-        }
-        EXPECT_TRUE(offenders.empty())
-            << "a NEW wire-version advertiser appeared and was not reviewed: " << offenders.front()
-            << " -- add it to this list only after checking it advertises kWriteBatchFormatMax";
-        return;  // one prefix resolved; done
-    }
-    GTEST_SKIP() << "could not locate the lib tree from the test's working directory";
 }

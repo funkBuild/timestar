@@ -1,6 +1,7 @@
 #pragma once
 
-#include "../data/replica_read.hpp"  // ReadConsistency, ReadEnvelope, QueryIncomplete
+#include "../data/data_plane.hpp"  // QueryIncomplete
+#include "../data/replica_read.hpp"  // ReadConsistency, ReadEnvelope
 #include "replica_engine_reader.hpp"
 
 #include <algorithm>
@@ -13,7 +14,7 @@
 namespace timestar::cluster {
 
 // The replicas of one VShard available to a query, in preference order (best first --
-// the selector's job, data::ReplicaSelector). Captured (pinned) at query start so a
+// the selector's job). Captured (pinned) at query start so a
 // placement change mid-query cannot add or drop a VShard's contribution.
 struct EngineVShardReplicas {
     uint16_t vshard = 0;
@@ -25,8 +26,7 @@ struct EngineReplicaQueryResult {
     std::vector<uint16_t> missing;   // VShards no replica could serve (allowPartial only)
 };
 
-// The production analogue of data::ReplicaQueryCoordinator (which merges the toy
-// QueryPartial): coordinates a replica read across VShards over ReplicaEngineReaders,
+// Coordinates a replica read across VShards over ReplicaEngineReaders,
 // merging NodeQueryPartials, guaranteeing each VShard contributes EXACTLY ONCE. For
 // each VShard it tries replicas in waves of `hedgeWidth`: a wave launches that many
 // reads concurrently and takes the FIRST success in preference order (the rest are

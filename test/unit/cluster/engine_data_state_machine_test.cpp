@@ -1,6 +1,6 @@
 // Integration M3: EngineDataStateMachine applies a replicated command log through the
 // REAL Engine. Proves apply() lands a WriteBatch (with log-index-derived revisions)
-// visibly, a DeleteRangeKey removes it, log-ordered LWW holds (a higher-index write
+// visibly, a DeleteRangeBatch removes it, log-ordered LWW holds (a higher-index write
 // wins), and an undecodable committed entry is fail-stop.
 #include "../../../lib/cluster/integration/engine_data_state_machine.hpp"
 
@@ -38,14 +38,6 @@ raft::LogEntry writeEntry(uint64_t index, const std::string& key, double value) 
     e.type = raft::EntryType::Normal;
     e.data = data::encodeReplicatedCommand(data::ReplicatedCommand{std::move(b)});
     return e;
-}
-
-raft::LogEntry deleteEntry(uint64_t index, data::DeleteRangeKey command) {
-    raft::LogEntry entry;
-    entry.index = index;
-    entry.type = raft::EntryType::Normal;
-    entry.data = data::encodeReplicatedCommand(data::ReplicatedCommand{std::move(command)});
-    return entry;
 }
 
 raft::LogEntry deleteBatchEntry(uint64_t index, data::DeleteRangeBatch command) {
@@ -106,12 +98,10 @@ TEST_F(EngineDataStateMachineTest, AppliesWriteDeleteAndLwwFromLog) {
         EXPECT_DOUBLE_EQ(latest(*eng, "temp", "value"), 20.0);
 
         // Entry 12: delete the range -> gone.
-        data::DeleteRangeKey d{key, BASE - 1, BASE + 1};
-        raft::LogEntry del;
-        del.index = 12;
-        del.type = raft::EntryType::Normal;
-        del.data = data::encodeReplicatedCommand(data::ReplicatedCommand{d});
-        sm.apply(std::move(del)).get();
+        auto command = boundedDelete(key, "00000000000000000000000000000001", 1'000);
+        command.targets[0].startTime = BASE - 1;
+        command.targets[0].endTime = BASE + 1;
+        sm.apply(deleteBatchEntry(12, std::move(command))).get();
         EXPECT_EQ(sm.appliedIndex(), 12u);
         EXPECT_DOUBLE_EQ(latest(*eng, "temp", "value"), -1);  // absent
     }).get();
@@ -126,15 +116,15 @@ TEST_F(EngineDataStateMachineTest, IdempotentDeleteRetryCannotEraseAnIntervening
         const uint16_t vshard = timestar::virtualShard(SeriesId128::fromSeriesKey(key));
         cluster::EngineDataStateMachine sm(store, timestar::VShardId{vshard});
         const SeriesId128 operationId = SeriesId128::fromHex("123456789abcdef0123456789abcdef0");
-        data::DeleteRangeKey command{key, BASE - 1, BASE + 1, operationId};
+        data::DeleteRangeBatch command{{{key, BASE - 1, BASE + 1}}, operationId, 1'000};
 
         sm.apply(writeEntry(5, key, 10.0)).get();
-        sm.apply(deleteEntry(9, command)).get();
+        sm.apply(deleteBatchEntry(9, command)).get();
         EXPECT_DOUBLE_EQ(latest(*eng, "delete_retry", "value"), -1);
 
         sm.apply(writeEntry(10, key, 20.0)).get();
         EXPECT_DOUBLE_EQ(latest(*eng, "delete_retry", "value"), 20.0);
-        sm.apply(deleteEntry(12, command)).get();
+        sm.apply(deleteBatchEntry(12, command)).get();
         EXPECT_DOUBLE_EQ(latest(*eng, "delete_retry", "value"), 20.0)
             << "a client retry physically deleted a write ordered after the first attempt";
 
@@ -143,12 +133,11 @@ TEST_F(EngineDataStateMachineTest, IdempotentDeleteRetryCannotEraseAnIntervening
         EXPECT_EQ(receiptState.receipts[0].operationId, operationId);
         EXPECT_EQ(receiptState.receipts[0].appliedIndex, 9u);
         EXPECT_TRUE(sm.deleteReceiptStateThrough(8).receipts.empty());
-        EXPECT_EQ(sm.deleteReceiptCounts(),
-                  (cluster::EngineDataStateMachine::DeleteReceiptCounts{1, 1}));
+        EXPECT_EQ(sm.deleteReceiptCounts(), (cluster::EngineDataStateMachine::DeleteReceiptCounts{1}));
 
         auto conflicting = command;
-        conflicting.endTime = BASE + 2;
-        EXPECT_THROW(sm.apply(deleteEntry(13, std::move(conflicting))).get(), std::runtime_error)
+        conflicting.targets[0].endTime = BASE + 2;
+        EXPECT_THROW(sm.apply(deleteBatchEntry(13, std::move(conflicting))).get(), std::runtime_error)
             << "operation-ID reuse for another target must fail-stop";
     }).get();
 }
@@ -162,11 +151,11 @@ TEST_F(EngineDataStateMachineTest, RestoredDeleteReceiptProtectsPostSnapshotWrit
         const uint16_t vshard = timestar::virtualShard(SeriesId128::fromSeriesKey(key));
         cluster::EngineDataStateMachine sm(store, timestar::VShardId{vshard});
         const SeriesId128 operationId = SeriesId128::fromHex("abcdef0123456789abcdef0123456789");
-        data::DeleteRangeKey command{key, BASE - 1, BASE + 1, operationId};
-        sm.restoreDeleteReceiptState({0, 0, {{operationId, 7, data::deleteRangeCommandHash(command), 0}}}, 7);
+        data::DeleteRangeBatch command{{{key, BASE - 1, BASE + 1}}, operationId, 1'000};
+        sm.restoreDeleteReceiptState({0, 0, {{operationId, 7, data::deleteRangeCommandHash(command), 1'000}}}, 7);
 
         sm.apply(writeEntry(8, key, 30.0)).get();
-        sm.apply(deleteEntry(9, command)).get();
+        sm.apply(deleteBatchEntry(9, command)).get();
         EXPECT_DOUBLE_EQ(latest(*eng, "delete_snapshot_retry", "value"), 30.0)
             << "a retry after snapshot compaction forgot its durable receipt";
     }).get();
@@ -183,6 +172,7 @@ TEST_F(EngineDataStateMachineTest, OneBatchReceiptProtectsEveryTargetFromRetry) 
         cluster::EngineDataStateMachine sm(store, timestar::VShardId{vshard});
         data::DeleteRangeBatch command;
         command.operationId = SeriesId128::fromHex("1029384756abcdef1029384756abcdef");
+        command.issuedAtMs = 1'000;
         command.targets = {{first, BASE, BASE}, {second, BASE, BASE}};
         std::sort(command.targets.begin(), command.targets.end());
 
@@ -202,8 +192,7 @@ TEST_F(EngineDataStateMachineTest, OneBatchReceiptProtectsEveryTargetFromRetry) 
         ASSERT_EQ(receiptState.receipts.size(), 1u) << "one VShard batch must consume one durable receipt";
         EXPECT_EQ(receiptState.receipts[0].operationId, command.operationId);
         EXPECT_EQ(receiptState.receipts[0].commandHash, data::deleteRangeCommandHash(command));
-        EXPECT_EQ(sm.deleteReceiptCounts(),
-                  (cluster::EngineDataStateMachine::DeleteReceiptCounts{1, 1}));
+        EXPECT_EQ(sm.deleteReceiptCounts(), (cluster::EngineDataStateMachine::DeleteReceiptCounts{1}));
     }).get();
 }
 

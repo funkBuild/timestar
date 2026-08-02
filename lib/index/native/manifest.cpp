@@ -169,12 +169,10 @@ seastar::future<Manifest> Manifest::open(std::string directory) {
     bool needsRewrite = false;
     if (exists) {
         co_await m.recover();
-        // Rewrite a clean v2 snapshot when:
-        //  - the manifest is legacy (v1, no CRC framing): upgrade in place, or
-        //  - recovery stopped early at a physically incomplete tail: discard the
+        // Rewrite a clean snapshot when recovery stopped early at a physically
+        // incomplete tail. This discards the
         //    unreachable garbage so future appends stay recoverable.
-        // Both use the atomic temp-file + rename path in writeSnapshot().
-        needsRewrite = !m.crcFraming_ || m.recoveryTruncated_;
+        needsRewrite = m.recoveryTruncated_;
     }
 
     // Open the file handle for subsequent appends (rw mode for read-modify-write).
@@ -182,9 +180,6 @@ seastar::future<Manifest> Manifest::open(std::string directory) {
     co_await m.openFileForAppend();
 
     if (!exists || needsRewrite) {
-        if (exists && !m.crcFraming_) {
-            manifest_log.info("Upgrading legacy manifest to CRC-framed format (v2): {}", m.manifestPath_);
-        }
         co_await m.writeSnapshot();
         m.recoveryTruncated_ = false;
     }
@@ -244,9 +239,8 @@ std::string Manifest::serializeRemoveFile(uint64_t fileNumber) const {
     return record;
 }
 
-// Frame one record in the v2 format: [record_len(4)][record_crc(4)][record].
-// The CRC covers the record payload only. Appends are always v2 — open()
-// upgrades legacy manifests before any append can happen.
+// Frame one record as [record_len(4)][record_crc(4)][record].
+// The CRC covers the record payload only.
 void Manifest::appendRecordFrame(std::string& out, const std::string& record) {
     encodeFixed32(out, static_cast<uint32_t>(record.size()));
     encodeFixed32(out, CRC32::compute(record.data(), record.size()));
@@ -381,14 +375,12 @@ seastar::future<> Manifest::atomicReplaceFiles(const SSTableMetadata& newFile,
 
 seastar::future<> Manifest::writeSnapshot() {
     auto snapshot = serializeSnapshot();
-    // Snapshot files are always written in the v2 CRC-framed format:
+    // Snapshot files use the v1 CRC-framed format:
     // [magic][version] header followed by the CRC-framed snapshot record.
     std::string frame;
     encodeFixed32(frame, MANIFEST_MAGIC);
     encodeFixed32(frame, MANIFEST_VERSION);
     appendRecordFrame(frame, snapshot);
-    crcFraming_ = true;
-
     // Write atomically: write to temp file via DMA, fsync, then rename.
     auto tmpPath = manifestPath_ + ".tmp";
     const auto staleTempExists = co_await seastar::async([tmpPath] {
@@ -452,7 +444,6 @@ seastar::future<> Manifest::writeSnapshot() {
 
 seastar::future<> Manifest::recover() {
     files_.clear();
-    crcFraming_ = false;
     recoveryTruncated_ = false;
 
     auto readFile = co_await seastar::open_file_dma(manifestPath_, seastar::open_flags::ro | OPEN_NOFOLLOW);
@@ -470,87 +461,51 @@ seastar::future<> Manifest::recover() {
     const char* p = fileBuf.get();
     const char* end = p + fileSize;
 
-    // Detect the format: v2 manifests start with a magic+version header and
-    // CRC-framed records; legacy (v1) manifests start directly with
-    // [len][record] frames and carry no checksums.
-    if (static_cast<size_t>(end - p) >= MANIFEST_HEADER_SIZE && decodeFixed32(p) == MANIFEST_MAGIC) {
-        uint32_t version = decodeFixed32(p + 4);
-        if (version != MANIFEST_VERSION) {
-            throw std::runtime_error("Manifest unsupported version " + std::to_string(version) + ": " + manifestPath_);
-        }
-        crcFraming_ = true;
-        p += MANIFEST_HEADER_SIZE;
+    if (static_cast<size_t>(end - p) < MANIFEST_HEADER_SIZE || decodeFixed32(p) != MANIFEST_MAGIC) {
+        throw std::runtime_error("Manifest has invalid v1 header: " + manifestPath_);
     }
-
-    if (crcFraming_) {
-        // v2: [record_len(4)][record_crc(4)][record]
-        size_t completeRecords = 0;
-        while (static_cast<size_t>(end - p) >= 8) {
-            uint32_t recordLen = decodeFixed32(p);
-            uint32_t storedCrc = decodeFixed32(p + 4);
-            if (recordLen > static_cast<size_t>(end - p) - 8) {
-                recoveryTruncated_ = true;  // torn tail from a crash mid-append
-                break;
-            }
-            if (recordLen == 0) {
-                throw std::runtime_error("Manifest contains an empty record: " + manifestPath_);
-            }
-            p += 8;
-
-            uint32_t computedCrc = CRC32::compute(p, recordLen);
-            if (computedCrc != storedCrc) {
-                throw std::runtime_error("Manifest record CRC mismatch at offset " +
-                                         std::to_string(static_cast<size_t>(p - 8 - fileBuf.get())) + " in " +
-                                         manifestPath_);
-            }
-
-            const auto recordType = static_cast<uint8_t>(*p);
-            if ((completeRecords == 0 && recordType != RecordType::Snapshot) ||
-                (completeRecords != 0 && recordType == RecordType::Snapshot)) {
-                throw std::runtime_error("Manifest record sequence does not begin with exactly one snapshot: " +
-                                         manifestPath_);
-            }
-            applyRecord(p, p + recordLen, false);
-            p += recordLen;
-            ++completeRecords;
-        }
-        if (completeRecords == 0) {
-            throw std::runtime_error("Manifest contains no complete snapshot: " + manifestPath_);
-        }
-        if (p < end && !recoveryTruncated_) {
-            recoveryTruncated_ = true;  // trailing partial length header
-        }
-        co_return;
+    const uint32_t version = decodeFixed32(p + 4);
+    if (version != MANIFEST_VERSION) {
+        throw std::runtime_error("Manifest unsupported version " + std::to_string(version) + ": " + manifestPath_);
     }
+    p += MANIFEST_HEADER_SIZE;
 
-    // Legacy v1: [record_len(4)][record], no CRC. Legacy manifests are always
-    // rewritten as v2 snapshots by open(), which also discards any torn tail.
     size_t completeRecords = 0;
-    while (static_cast<size_t>(end - p) >= 4) {
+    while (static_cast<size_t>(end - p) >= 8) {
         uint32_t recordLen = decodeFixed32(p);
-        p += 4;
-        if (recordLen > static_cast<size_t>(end - p))
+        uint32_t storedCrc = decodeFixed32(p + 4);
+        if (recordLen > static_cast<size_t>(end - p) - 8) {
+            recoveryTruncated_ = true;
             break;
+        }
         if (recordLen == 0) {
-            throw std::runtime_error("Legacy manifest contains an empty record: " + manifestPath_);
+            throw std::runtime_error("Manifest contains an empty record: " + manifestPath_);
+        }
+        p += 8;
+        if (CRC32::compute(p, recordLen) != storedCrc) {
+            throw std::runtime_error("Manifest record CRC mismatch at offset " +
+                                     std::to_string(static_cast<size_t>(p - 8 - fileBuf.get())) + " in " + manifestPath_);
         }
 
         const auto recordType = static_cast<uint8_t>(*p);
-        if ((completeRecords == 0 && recordType != RecordType::Snapshot && recordType != RecordType::AddFile) ||
+        if ((completeRecords == 0 && recordType != RecordType::Snapshot) ||
             (completeRecords != 0 && recordType == RecordType::Snapshot)) {
-            throw std::runtime_error("Legacy manifest contains an invalid snapshot/delta sequence: " + manifestPath_);
+            throw std::runtime_error("Manifest record sequence does not begin with exactly one snapshot: " + manifestPath_);
         }
-        applyRecord(p, p + recordLen, true);
+        applyRecord(p, p + recordLen);
         p += recordLen;
         ++completeRecords;
     }
     if (completeRecords == 0) {
-        throw std::runtime_error("Legacy manifest contains no complete snapshot: " + manifestPath_);
+        throw std::runtime_error("Manifest contains no complete snapshot: " + manifestPath_);
+    }
+    if (p < end && !recoveryTruncated_) {
+        recoveryTruncated_ = true;
     }
 }
 
 // Apply one decoded record (type byte + payload) to the in-memory file set.
-void Manifest::applyRecord(const char* rp, const char* rend, bool legacyFormat) {
+void Manifest::applyRecord(const char* rp, const char* rend) {
     requireBytes(rp, rend, 1, "record type");
     auto type = static_cast<RecordType>(*rp);
     ++rp;
@@ -581,18 +536,7 @@ void Manifest::applyRecord(const char* rp, const char* rend, bool legacyFormat) 
             return parsedFiles;
         };
 
-        std::vector<SSTableMetadata> recoveredFiles;
-        if (legacyFormat) {
-            try {
-                recoveredFiles = parseFiles(true);
-            } catch (const std::runtime_error&) {
-                // Manifests written before writeTimestamp was added carry the
-                // same metadata sequence without the final eight-byte field.
-                recoveredFiles = parseFiles(false);
-            }
-        } else {
-            recoveredFiles = parseFiles(true);
-        }
+        auto recoveredFiles = parseFiles(true);
 
         if (recoveredNextFileNumber == 0) {
             throw std::runtime_error("Malformed manifest snapshot: next file number is zero");
@@ -606,11 +550,7 @@ void Manifest::applyRecord(const char* rp, const char* rend, bool legacyFormat) 
         files_ = std::move(recoveredFiles);
         nextFileNumber_ = recoveredNextFileNumber;
     } else if (type == RecordType::AddFile) {
-        auto file = decodeFileMetadata(rp, rend, !legacyFormat);
-        if (legacyFormat && static_cast<size_t>(rend - rp) == 8) {
-            file.writeTimestamp = decodeFixed64(rp);
-            rp += 8;
-        }
+        auto file = decodeFileMetadata(rp, rend, true);
         if (rp != rend) {
             throw std::runtime_error("Malformed manifest add-file record: trailing bytes");
         }

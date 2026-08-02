@@ -19,7 +19,6 @@ namespace timestar::control {
 class Group0StateMachine : public raft::RaftStateMachine {
 public:
     using ServingMapObserver = std::function<seastar::future<>(ControlMap)>;
-    using ActiveFormatObserver = std::function<seastar::future<>(uint32_t)>;
 
     // Install the node-local recovery fence before any snapshot/log entry is
     // applied. The replicated state remains node-independent; this expectation
@@ -31,10 +30,6 @@ public:
     // advances its applied boundary. Production uses this to durably publish
     // control_map.cache; failure retries the same idempotent entry.
     void setServingMapObserver(ServingMapObserver observer);
-    // Called after a format activation is logically applied but before Raft
-    // advances its applied boundary. Production uses this to publish the
-    // committed value to every reactor-local emission gate.
-    void setActiveFormatObserver(ActiveFormatObserver observer);
 
     // Apply one committed command entry. Deterministic; no I/O.
     seastar::future<> apply(raft::LogEntry entry) override;
@@ -65,7 +60,6 @@ private:
     std::optional<NodeRecord> expectedLocalRecord_;
     std::optional<ControlMap> expectedInitialServingMap_;
     ServingMapObserver servingMapObserver_;
-    ActiveFormatObserver activeFormatObserver_;
 };
 
 }  // namespace timestar::control

@@ -8,27 +8,11 @@ Delete time series data by series key, structured query, pattern match, or batch
 ## Clustered Mode
 
 Partitioned RF&gt;1 mode has replicated paths for exact and pattern targets. RF=1
-delete is unavailable. Exact targets require cluster format v5; pattern or mixed
-batches require v6. An incompletely wired pattern path returns `501` before
-discovery or mutation. Pattern deletes remain available in non-partitioned mode.
-
-Exact RF&gt;1 deletion uses bounded receipt command tag 5 and is accepted only
-after group 0 has committed cluster format v5. Until then the request fails
-before any Raft proposal with HTTP `409` and JSON code
-`CLUSTER_FORMAT_NOT_ACTIVE`. The server can now opt into a persistent group-0
-host, and an already committed activation is published to every reactor-local
-data gate before group 0 advances its applied boundary. Exact v7
-identity/full-range collection covers the static data voters and activation
-refuses observers that are not group-0 members. Protocol v8 admits observers as
-caught-up learners with one-use tokens. Protocol v9 inventories legacy receipts
-on every serving replica, and authenticated `POST /cluster/activate-format` on
-the current control leader performs that preflight before crossing v5. Pattern
-plans additionally require v6. The preflight refuses unapplied data-group log
-tails as well as missing/disagreeing receipt inventories, so an old legacy entry
-cannot be hidden behind applied counts. These paths are operable only after explicit
-activation; the cluster release remains production-blocked until mixed-binary
-snapshot/command tests, the live activation gate, and downgrade-startup
-enforcement are complete.
+delete is unavailable. Both paths use the current v1 peer, command, snapshot,
+and group-0 schemas; there is no cluster-format activation step. A peer that
+does not negotiate v1 is rejected before mutation. An incompletely wired pattern
+path returns `501` before discovery or mutation. Pattern deletes remain available
+in non-partitioned mode.
 
 Every RF&gt;1 request must include both of these headers:
 
@@ -75,7 +59,7 @@ One pattern plan is limited to 10,000 exact target/range triples and 512 KiB.
 Group 0 retains at most 1,024 plans and 16 MiB total for the one-hour retry
 window plus allowed clock skew. A full plan budget returns retryable `503` before
 any data proposal. A node that does not lead group 0 forwards plan lookup/freeze
-to the leader over the version-6 peer protocol. Leader discovery, the RPC, and
+to the leader over the v1 peer protocol. Leader discovery, the RPC, and
 the quorum-apply wait are bounded; a missing or changing leader and an ambiguous
 timeout return retryable `503`. Retry with the same identity so lookup can
 recover a plan that committed after the timeout.
@@ -98,7 +82,7 @@ curl -X POST http://localhost:8086/delete \
 
 Use `fields`, or omit both `field` and `fields`, to select more than one exact
 series. Tags act as filters. In partitioned cluster mode this form requires the
-same idempotency headers and committed format v6; any node may receive it and
+same idempotency headers; any node may receive it and
 will forward the plan operation to the current group-0 leader as described
 above.
 
@@ -236,7 +220,7 @@ Relevant status codes are:
 | Status | Meaning |
 |--------|---------|
 | `400` | Invalid body, idempotency header, timestamp, range, or safety limit |
-| `409` | `DELETE_IDEMPOTENCY_EXPIRED`: the replicated receipt was retired and reconciliation is required; or `CLUSTER_FORMAT_NOT_ACTIVE`: committed format v5 is not active and no delete was proposed |
+| `409` | `DELETE_IDEMPOTENCY_EXPIRED`: the replicated receipt was retired and reconciliation is required; or `DELETE_IDEMPOTENCY_CONFLICT`: an idempotency key was reused with different content |
 | `413` | HTTP body or encoded per-VShard Raft entry is too large |
 | `501` | Delete form is unsupported in the configured cluster mode |
 | `503` | Retryable pre-proposal cluster condition; honor `Retry-After` |

@@ -84,26 +84,8 @@ public:
     const ControlMap& current() const { return map_; }
     uint64_t epoch() const { return map_.epoch; }
 
-    // Trailer magic for the optional VShard->group section (debt D-11). The
-    // section is emitted ONLY when a non-identity mapping exists, so an identity
-    // map -- i.e. every map any cluster produces today -- serializes to exactly
-    // the bytes it did before the field existed. That is what makes this change
-    // byte-identical on disk rather than merely compatible.
-    //
-    // FAIL-CLOSED ON UNKNOWN SHAPES: load() rejects ANY trailing bytes it does not
-    // recognise instead of ignoring them, because silently ignoring a group
-    // section is precisely the failure that matters -- a node would route by the
-    // identity while its peers route by the consolidated mapping.
-    //
-    // WHAT THIS DOES *NOT* BUY, stated plainly: a PRE-D-11 binary's load() stops
-    // after the placement entries and ignores trailing bytes, so it cannot be made
-    // to fail closed retroactively. That exposure is zero today (nothing produces
-    // a non-identity map) and it is why ADR 0004 lists a mixed-K handshake refusal
-    // as a prerequisite of consolidation, not of this prep step.
-    static constexpr uint64_t kGroupSectionMagic = 0x4d475343'52475031ull;  // "MGSC" "RGP1"
-
-    // Durable serialization so the cache survives restart (route during a cold
-    // start before group 0 is reachable).
+    // Current v1 payload. The group count is mandatory, including zero; truncated
+    // pre-v1 layouts are rejected rather than interpreted as identity mappings.
     std::string serialize() const {
         std::string out;
         auto put16 = [&](uint16_t v) {
@@ -122,13 +104,10 @@ public:
             for (NodeId n : reps)
                 put64(n);
         }
-        if (!map_.groups.empty()) {
-            put64(kGroupSectionMagic);
-            put64(map_.groups.size());
-            for (const auto& [vs, g] : map_.groups) {  // std::map: canonical order
-                put16(vs);
-                put16(g);
-            }
+        put64(map_.groups.size());
+        for (const auto& [vs, g] : map_.groups) {  // std::map: canonical order
+            put16(vs);
+            put16(g);
         }
         return out;
     }
@@ -168,25 +147,18 @@ public:
             if (!m.placement.emplace(vs, std::move(reps)).second)
                 return false;
         }
-        // Optional VShard->group section (debt D-11). Absent == identity mapping.
-        if (p != end) {
-            if (!avail(16))
-                return false;  // a trailer too short to even be one: fail closed
-            if (get64() != kGroupSectionMagic)
-                return false;  // unknown trailing shape: fail closed, never assume identity
-            uint64_t ng = get64();
-            if (ng > static_cast<uint64_t>(end - p) / 4)
-                return false;  // non-wrapping bound
-            for (uint64_t i = 0; i < ng; ++i) {
-                uint16_t vs = get16();
-                uint16_t g = get16();
-                if (!m.groups.emplace(vs, g).second)
-                    return false;
-            }
-            if (p != end)
-                return false;  // bytes past a section we DID understand: still fail closed
+        if (!avail(8))
+            return false;
+        uint64_t ng = get64();
+        if (ng > static_cast<uint64_t>(end - p) / 4)
+            return false;
+        for (uint64_t i = 0; i < ng; ++i) {
+            uint16_t vs = get16();
+            uint16_t g = get16();
+            if (!m.groups.emplace(vs, g).second)
+                return false;
         }
-        if (!isValidControlMap(m))
+        if (p != end || !isValidControlMap(m))
             return false;
         map_ = std::move(m);
         return true;

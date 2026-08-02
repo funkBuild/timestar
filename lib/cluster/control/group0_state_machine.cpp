@@ -1,7 +1,6 @@
 #include "group0_state_machine.hpp"
 
 #include "../../core/vshard.hpp"
-#include "../data/journal_format.hpp"
 
 #include <seastar/core/coroutine.hh>
 #include <limits>
@@ -12,9 +11,7 @@ namespace timestar::control {
 
 namespace {
 
-constexpr uint64_t kServingMapSnapshotMagic = 0x54534730'4d415031ull;  // "TSG0MAP1"
-constexpr uint64_t kFormatVotersSnapshotMagic = 0x54534730'46564f31ull;  // "TSG0FVO1"
-constexpr uint64_t kFrozenDeletePlansSnapshotMagic = 0x54534730'44504c31ull;  // "TSG0DPL1"
+constexpr uint64_t kSnapshotMagic = 0x31504e53'30475354ull;  // "TSG0SNP1"
 
 // State (snapshot) serialization -- distinct from command serialization: it
 // encodes the whole Group0State so a snapshot fully reconstructs a node.
@@ -184,8 +181,7 @@ FrozenDeletePlan readFrozenDeletePlan(SR& r) {
 bool validFrozenDeletePlanState(const Group0State& state) {
     if (state.frozenDeletePlans.empty())
         return true;
-    if (state.activeFormatVersion < data::kFrozenDeletePlanActivationVersion ||
-        !isCompleteControlMap(state.servingMap) || state.frozenDeletePlans.size() > kMaxFrozenDeletePlans)
+    if (!isCompleteControlMap(state.servingMap) || state.frozenDeletePlans.size() > kMaxFrozenDeletePlans)
         return false;
     size_t aggregateBytes = 0;
     for (const auto& [requestId, plan] : state.frozenDeletePlans) {
@@ -211,9 +207,6 @@ bool validNodeRecord(const Group0State& state, const NodeRecord& record) {
 }
 
 bool validNodeSet(const std::vector<NodeId>& nodes);
-bool activationCoversServingVoters(const Group0State& state, const std::vector<NodeId>& coveredVoters);
-bool activeFormatProofCoversCurrentServingMap(
-    const Group0State& state, const std::vector<NodeId>& coveredVoters);
 
 bool validSnapshotState(const Group0State& state) {
     std::set<std::string> nodeUuids;
@@ -245,13 +238,7 @@ bool validSnapshotState(const Group0State& state) {
             return false;
     if (!validFrozenDeletePlanState(state))
         return false;
-    if ((state.controllerTerm == 0) != (state.controllerLeader == raft::kNoNode))
-        return false;
-    if (state.activeFormatVersion == 0)
-        return false;
-    if (state.activeFormatVersion == 1)
-        return state.activeFormatVoters.empty();
-    return activeFormatProofCoversCurrentServingMap(state, state.activeFormatVoters);
+    return (state.controllerTerm == 0) == (state.controllerLeader == raft::kNoNode);
 }
 
 bool validNodeSet(const std::vector<NodeId>& nodes) {
@@ -261,35 +248,6 @@ bool validNodeSet(const std::vector<NodeId>& nodes) {
     for (NodeId id : nodes)
         if (id == raft::kNoNode || !unique.insert(id).second)
             return false;
-    return true;
-}
-
-bool activationCoversServingVoters(const Group0State& state, const std::vector<NodeId>& coveredVoters) {
-    if (!isCompleteControlMap(state.servingMap) || !validNodeSet(coveredVoters) ||
-        !std::is_sorted(coveredVoters.begin(), coveredVoters.end()))
-        return false;
-    std::set<NodeId> required(state.metaVoters.begin(), state.metaVoters.end());
-    for (const auto& placement : state.servingMap.placement)
-        required.insert(placement.second.begin(), placement.second.end());
-    return std::equal(required.begin(), required.end(), coveredVoters.begin(), coveredVoters.end());
-}
-
-bool activeFormatProofCoversCurrentServingMap(
-    const Group0State& state, const std::vector<NodeId>& coveredVoters) {
-    if (!isCompleteControlMap(state.servingMap) || !validNodeSet(coveredVoters) ||
-        !std::is_sorted(coveredVoters.begin(), coveredVoters.end()))
-        return false;
-    // This vector records the exact meta+data voter union at activation time.
-    // Later group-0 membership changes must not invalidate an otherwise safe
-    // snapshot, but every node that can currently serve data must still appear
-    // in the proof. A future serving-map cutover that introduces an uncovered
-    // replica therefore fails closed until a new activation/proof is committed.
-    for (const auto& [vshard, replicas] : state.servingMap.placement) {
-        (void)vshard;
-        for (NodeId replica : replicas)
-            if (!std::binary_search(coveredVoters.begin(), coveredVoters.end(), replica))
-                return false;
-    }
     return true;
 }
 
@@ -323,14 +281,6 @@ void Group0StateMachine::setServingMapObserver(ServingMapObserver observer) {
     if (servingMapObserver_)
         throw std::logic_error("group0: serving-map observer was configured more than once");
     servingMapObserver_ = std::move(observer);
-}
-
-void Group0StateMachine::setActiveFormatObserver(ActiveFormatObserver observer) {
-    if (!observer)
-        throw std::invalid_argument("group0: active-format observer is empty");
-    if (activeFormatObserver_)
-        throw std::logic_error("group0: active-format observer was configured more than once");
-    activeFormatObserver_ = std::move(observer);
 }
 
 bool Group0StateMachine::stateMatchesLocalExpectations(const Group0State& state) const {
@@ -482,8 +432,7 @@ bool Group0StateMachine::applyCommand(const ControlCommand& cmd) {
                     ok = false;  // rejected: no such token
                 }
             } else if constexpr (std::is_same_v<T, StoreFrozenDeletePlan>) {
-                if (state_.activeFormatVersion < data::kFrozenDeletePlanActivationVersion ||
-                    !isCompleteControlMap(state_.servingMap) || !validFrozenDeletePlan(c.plan)) {
+                if (!isCompleteControlMap(state_.servingMap) || !validFrozenDeletePlan(c.plan)) {
                     ok = false;
                 } else {
                     // A request timestamp may be up to five minutes in the
@@ -518,18 +467,6 @@ bool Group0StateMachine::applyCommand(const ControlCommand& cmd) {
                         }
                     }
                 }
-            } else if constexpr (std::is_same_v<T, SetActiveVersion>) {
-                // Monotonic: a stale/replayed lower version must never regress the
-                // active format (nodes only ever move formats forward). The safety
-                // proof is also checked here against replicated membership. A
-                // controller that checked only meta-voters cannot activate data
-                // emission, even if its command reaches consensus.
-                if (c.version > state_.activeFormatVersion &&
-                    activationCoversServingVoters(state_, c.coveredVoters)) {
-                    state_.activeFormatVersion = c.version;
-                    state_.activeFormatVoters = c.coveredVoters;
-                } else
-                    ok = false;  // no-op: not an advance or incomplete proof
             } else if constexpr (std::is_same_v<T, SetInitialServingMap>) {
                 // Single-assignment by construction. A later serving-map epoch
                 // is a topology cutover and must go through the resumable data
@@ -565,10 +502,8 @@ seastar::future<> Group0StateMachine::apply(raft::LogEntry entry) {
     rejectConflictingLocalCommand(*cmd);
     const bool publishesServingMap =
         servingMapObserver_ && std::holds_alternative<SetInitialServingMap>(*cmd);
-    const bool publishesActiveFormat =
-        activeFormatObserver_ && std::holds_alternative<SetActiveVersion>(*cmd);
     std::optional<Group0State> previous;
-    if (publishesServingMap || publishesActiveFormat)
+    if (publishesServingMap)
         previous = state_;
     const bool applied = applyCommand(*cmd);
     if (applied && previous) {
@@ -580,8 +515,6 @@ seastar::future<> Group0StateMachine::apply(raft::LogEntry entry) {
         // exact same committed entry.
         if (publishesServingMap)
             co_await servingMapObserver_(staged.servingMap);
-        if (publishesActiveFormat)
-            co_await activeFormatObserver_(staged.activeFormatVersion);
         state_ = std::move(staged);
     }
     state_.appliedIndex = entry.index;
@@ -590,6 +523,7 @@ seastar::future<> Group0StateMachine::apply(raft::LogEntry entry) {
 
 std::string Group0StateMachine::snapshot() const {
     SW w;
+    w.u64(kSnapshotMagic);
     w.str(state_.clusterUuid);
     w.u64(state_.mapEpoch);
     w.u64(state_.appliedIndex);
@@ -625,22 +559,11 @@ std::string Group0StateMachine::snapshot() const {
     w.u64(state_.joinTokens.size());
     for (const auto& t : state_.joinTokens)  // std::set: canonical order
         w.str(t);
-    w.u64(state_.activeFormatVersion);  // trailing (back-compat: read only if present)
-    if (state_.servingMap.epoch != 0) {
-        w.u64(kServingMapSnapshotMagic);
-        writeControlMap(w, state_.servingMap);
-    }
-    if (!state_.activeFormatVoters.empty() || !state_.frozenDeletePlans.empty()) {
-        w.u64(kFormatVotersSnapshotMagic);
-        w.ids(state_.activeFormatVoters);
-    }
-    if (!state_.frozenDeletePlans.empty()) {
-        w.u64(kFrozenDeletePlansSnapshotMagic);
-        w.u64(state_.frozenDeletePlans.size());
-        for (const auto& [requestId, plan] : state_.frozenDeletePlans) {
-            (void)requestId;
-            writeFrozenDeletePlan(w, plan);
-        }
+    writeControlMap(w, state_.servingMap);
+    w.u64(state_.frozenDeletePlans.size());
+    for (const auto& [requestId, plan] : state_.frozenDeletePlans) {
+        (void)requestId;
+        writeFrozenDeletePlan(w, plan);
     }
     return std::move(w.out);
 }
@@ -648,6 +571,8 @@ std::string Group0StateMachine::snapshot() const {
 bool Group0StateMachine::decodeSnapshot(const std::string& data, Group0State& decoded) const {
     SR r{data.data(), data.data() + data.size()};
     Group0State s;
+    if (r.u64() != kSnapshotMagic)
+        return false;
     s.clusterUuid = r.str();
     s.mapEpoch = r.u64();
     s.appliedIndex = r.u64();
@@ -707,49 +632,16 @@ bool Group0StateMachine::decodeSnapshot(const std::string& data, Group0State& de
         if (r.ok && (!validJoinToken(token) || !s.joinTokens.insert(std::move(token)).second))
             r.ok = false;
     }
-    // Trailing, optional for backward compatibility: a pre-format-version snapshot has
-    // no field here, so default to 1. A current snapshot carries active version, then an
-    // optional magic-tagged initial serving map. Unknown/partial trailers fail closed.
-    size_t remaining = static_cast<size_t>(r.end - r.p);
-    if (r.ok && remaining >= 8) {
-        const uint64_t activeFormatVersion = r.u64();
-        if (activeFormatVersion == 0 || activeFormatVersion > std::numeric_limits<uint32_t>::max())
-            r.ok = false;
-        else
-            s.activeFormatVersion = static_cast<uint32_t>(activeFormatVersion);
-    } else if (remaining != 0) {
+    s.servingMap = readControlMap(r);
+    const uint64_t frozenPlanCount = r.u64();
+    if (!r.ok || frozenPlanCount > kMaxFrozenDeletePlans ||
+        frozenPlanCount > static_cast<uint64_t>(r.end - r.p) / (sizeof(uint64_t) * 4)) {
         r.ok = false;
-    }
-    remaining = static_cast<size_t>(r.end - r.p);
-    if (r.ok && remaining != 0) {
-        if (remaining < 8 || r.u64() != kServingMapSnapshotMagic)
-            r.ok = false;
-        else
-            s.servingMap = readControlMap(r);
-    }
-    remaining = static_cast<size_t>(r.end - r.p);
-    if (r.ok && remaining != 0) {
-        if (remaining < 16 || r.u64() != kFormatVotersSnapshotMagic)
-            r.ok = false;
-        else
-            s.activeFormatVoters = r.ids();
-    }
-    remaining = static_cast<size_t>(r.end - r.p);
-    if (r.ok && remaining != 0) {
-        if (remaining < 16 || r.u64() != kFrozenDeletePlansSnapshotMagic) {
-            r.ok = false;
-        } else {
-            const uint64_t count = r.u64();
-            if (!r.ok || count > kMaxFrozenDeletePlans ||
-                count > static_cast<uint64_t>(r.end - r.p) / (sizeof(uint64_t) * 4)) {
+    } else {
+        for (uint64_t i = 0; i < frozenPlanCount && r.ok; ++i) {
+            FrozenDeletePlan plan = readFrozenDeletePlan(r);
+            if (r.ok && !s.frozenDeletePlans.emplace(plan.requestId, std::move(plan)).second)
                 r.ok = false;
-            } else {
-                for (uint64_t i = 0; i < count && r.ok; ++i) {
-                    FrozenDeletePlan plan = readFrozenDeletePlan(r);
-                    if (r.ok && !s.frozenDeletePlans.emplace(plan.requestId, std::move(plan)).second)
-                        r.ok = false;
-                }
-            }
         }
     }
     if (!r.ok || r.p != r.end || !validSnapshotState(s) || !stateMatchesLocalExpectations(s))
@@ -776,8 +668,6 @@ seastar::future<> Group0StateMachine::applySnapshot(raft::Snapshot snap) {
         throw std::runtime_error("group0: invalid control-state snapshot");
     if (servingMapObserver_ && decoded.servingMap.epoch != 0)
         co_await servingMapObserver_(decoded.servingMap);
-    if (activeFormatObserver_)
-        co_await activeFormatObserver_(decoded.activeFormatVersion);
     // The snapshot boundary is at least this index.
     if (snap.index > decoded.appliedIndex)
         decoded.appliedIndex = snap.index;

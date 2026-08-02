@@ -20,7 +20,7 @@ namespace timestar::index {
 // SSTable file format:
 //   [Data Block 0] [Data Block 1] ... [Data Block N]
 //     Each block: [uncompressed_size(4)] [compressed_data(N)] [crc32(4)]
-//   [Bloom Filter Block] [file_number (uint64_t), v2]
+//   [Bloom Filter Block] [file_number (uint64_t)]
 //   [Index Block]
 //   [Footer (64 bytes)]
 //
@@ -31,14 +31,13 @@ namespace timestar::index {
 //   index_size         (uint64_t)  offset 24
 //   entry_count        (uint64_t)  offset 32
 //   write_timestamp_ns (uint64_t)  offset 40  — wall-clock ns when SSTable was created
-//   metadata_crc32     (uint32_t)  offset 48  — v2 CRC over bloom + index
+//   metadata_crc32     (uint32_t)  offset 48  — CRC over bloom + index
 //   reserved           (uint32_t)  offset 52  — zero
 //   magic              (uint32_t)  offset 56  0x54534958 = "TSIX"
-//   version            (uint32_t)  offset 60  2
+//   version            (uint32_t)  offset 60  1
 
 static constexpr uint32_t SSTABLE_MAGIC = 0x54534958;  // "TSIX"
-static constexpr uint32_t SSTABLE_LEGACY_VERSION = 1;
-static constexpr uint32_t SSTABLE_VERSION = 2;
+static constexpr uint32_t SSTABLE_VERSION = 1;
 static constexpr size_t SSTABLE_FOOTER_SIZE = 64;
 
 struct SSTableMetadata {
@@ -108,7 +107,7 @@ private:
     std::string lastKey_;
     std::string currentBlockFirstKey_;
     uint64_t writeTimestampNs_ = 0;  // Captured at create() time
-    uint64_t fileNumber_ = 0;        // Bound into v2 metadata for manifest identity validation
+    uint64_t fileNumber_ = 0;        // Bound into v1 metadata for manifest identity validation
 
     // Step 3: Streaming I/O
     seastar::file file_;

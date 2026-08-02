@@ -95,8 +95,7 @@ enum class FreezeDeletePlanStatus : uint8_t {
     NotLeader = 2,
     Conflict = 3,
     Capacity = 4,
-    FormatInactive = 5,
-    Invalid = 6
+    Invalid = 5
 };
 
 struct FreezeDeletePlanResult {
@@ -173,9 +172,6 @@ struct Group0State {
     std::map<std::string, Job> jobs;                           // jobs/<uuid>
     std::set<std::string> joinTokens;                          // valid unused group-0-minted join tokens
     std::map<std::string, FrozenDeletePlan> frozenDeletePlans; // retry-stable pattern expansion plans
-    uint32_t activeFormatVersion = 1;                          // active wire/storage format (rolling upgrade)
-    std::vector<NodeId> activeFormatVoters;                    // canonical activation-time voter proof
-
     friend bool operator==(const Group0State&, const Group0State&) = default;
 };
 

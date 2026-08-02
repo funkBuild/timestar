@@ -112,93 +112,10 @@ size_t approxResidentBytes(const VShardBatchView& view);
 // forwarded propose, and the fallback for ProposeSinks that do their own splitting).
 WriteBatch mergeVShardBatches(VShardBatches groups);
 
-// Wire/journal format versions this codec can EMIT (write-scaleout 2c).
-//
-// v1 is the original fixed-width layout. v2 keeps it but delta-varints a series'
-// timestamps, which are monotone per series on the canonical path -- ~6 bytes off
-// every point.
-//
-// FORMAT SAFETY: decodeWriteBatch reads BOTH, always, and that is not optional.
-// The Raft journal stores encoded commands, so a cluster restarting on a newer
-// binary replays entries an older one wrote; and a Raft entry is replicated to
-// replicas that never take part in the pairwise data-plane handshake. Emission is
-// therefore version-GATED per destination:
-//   - the data-plane wire (forwardWriteBatch / proposeWrite) emits the version
-//     negotiated with that specific peer via kNegotiateVersion, so a mixed-version
-//     cluster degrades to v1 and an INCOMPATIBLE peer fails closed rather than
-//     misparsing;
-//   - the Raft command path (and hence the journal) emits the version the
-//     CLUSTER-WIDE journal gate allows (debt D-7, `data/journal_format.hpp`). It
-//     cannot use per-peer negotiation: a log entry goes to voters that never did the
-//     pairwise handshake, and the journal outlives the process that wrote it. The gate
-//     is group-0's COMMITTED format activation (`activeFormatVersion`, proposed only
-//     after `features::FeatureGate::canActivate` confirms every voter supports the
-//     version), it defaults to v1 and only ever RISES -- so a node that has heard no
-//     activation emits v1, which every binary can read. journal_format.hpp carries the
-//     ordering argument for why "an old binary reads a v2 journal" is unreachable.
+// This greenfield protocol retains explicit versioning but supports one version.
+// The v1 frame is self-identifying and uses delta-varint timestamps. A caller must
+// pass exactly v1; unknown versions fail closed rather than being silently coerced.
 constexpr uint32_t kWriteBatchFormatV1 = 1;
-constexpr uint32_t kWriteBatchFormatV2 = 2;
-
-// v3 is a PROTOCOL version, not a payload format (write-scaleout 3a): a peer that
-// negotiates >= 3 answers the hinted-propose verb, whose reply carries the ACTUAL
-// leader of each rejected VShard instead of a bare "0". The batch bytes are unchanged
-// -- encodeWriteBatch(batch, 3) still emits v2 -- so nothing about the journal or the
-// on-wire payload moves with it. It rides the SAME negotiated range because that is
-// already the cluster's one mechanism for "what may I say to this peer", and a peer
-// that does not know v3 simply keeps getting the v1-shaped verb-6 reply.
-constexpr uint32_t kWriteBatchFormatV3 = 3;
-
-// v4 is a PROTOCOL version like v3, and it belongs to the READ path (debt D-25): a peer
-// that negotiates >= 4 understands `NodeQueryRequest::resolveVShards` and answers with
-// `NodeQueryPartial::redirects` -- D-13's optional tails on the node-query frames. Nothing
-// about the write payload moves with it: `encodeWriteBatch(batch, 4)` still emits v2, and
-// the hinted-propose gate is still `>= 3`.
-//
-// It rides the SAME negotiated range for the reason v3 does: that range is already the
-// cluster's one mechanism for "what may I say to this peer", and the read path had no
-// mechanism at all. The range is a single scalar, so a read-path step consumes a number the
-// write path could have used -- deliberately, because ONE ordered protocol line is what
-// makes a peer's answer to `kNegotiateVersion` a complete statement of what it speaks. The
-// read path names it through `kNodeQueryResolveMinVersion` (node_query.hpp), so no read
-// site reads a `kWriteBatchFormat*` spelling.
-constexpr uint32_t kWriteBatchFormatV4 = 4;
-
-// v5 gates the bounded-delete command/reply contract. The WriteBatch bytes are
-// still v2; this number says a peer understands command tag 5 and the typed
-// `Expired` proposal outcome. Snapshot payload v4 uses the same cluster-wide
-// activation through JournalFormatGate because snapshots and Raft entries reach
-// voters outside the pairwise data-plane handshake.
-constexpr uint32_t kWriteBatchFormatV5 = 5;
-
-// v6 gates the group-0 frozen pattern-delete plan command and snapshot trailer.
-// It changes neither WriteBatch bytes nor a data-plane RPC frame, but it must
-// consume a new point on the cluster's single ordered capability line: a v5
-// group-0 voter cannot decode StoreFrozenDeletePlan (command tag 14).
-constexpr uint32_t kWriteBatchFormatV6 = 6;
-
-// v7 is a PROTOCOL-only exact capability/identity exchange used by the group-0
-// activation collector. Unlike the older negotiation reply (which reports only
-// the highest mutually agreed scalar), the v7 verb returns the peer's persistent
-// identity, cluster binding, and complete supported range. WriteBatch bytes remain
-// v2; the new point only says the peer knows this separate RPC verb and reply shape.
-constexpr uint32_t kWriteBatchFormatV7 = 7;
-
-// v8 is a PROTOCOL-only token-authorized group-0 join exchange. It lets an
-// already-running observer ask the current controller to admit its persistent
-// identity and add it as a learner. WriteBatch and snapshot bytes are unchanged.
-constexpr uint32_t kWriteBatchFormatV8 = 8;
-
-// v9 is a PROTOCOL-only identity-bound legacy delete-receipt inventory. The
-// operator activation path uses it to preflight every static replica before it
-// can enable bounded receipt commands. Data and snapshot bytes are unchanged.
-constexpr uint32_t kWriteBatchFormatV9 = 9;
-
-// The newest version this binary supports. Every place that advertises this node's
-// capability must use THIS, never the literal that happens to be current: naming v2 in
-// ClusterDataPlane after v3 landed capped every negotiation at 2, so no peer spoke the
-// hinted-propose verb and the leader-hint path was dead in production while every test
-// passed (tests construct their own DataPlaneRpc, whose default was already correct).
-constexpr uint32_t kWriteBatchFormatMax = kWriteBatchFormatV9;
 
 // Wire codec (bounds-checked; decode returns nullopt on ANY malformed/truncated/
 // inconsistent input so a hostile frame can never fabricate a batch). Bounds-checking
@@ -208,9 +125,7 @@ constexpr uint32_t kWriteBatchFormatMax = kWriteBatchFormatV9;
 // (kMaxPrereserveElems in the .cpp). Note that an inbound RPC frame itself is
 // currently unbounded: neither DataPlaneRpc nor RaftRpcTransport sets
 // seastar::rpc::resource_limits. FNV-checksum
-// trailer, same discipline as data_command. The no-version overload emits v1; the
-// versioned one emits the highest format it knows that is <= `version` (so a caller
-// can pass a negotiated version straight through).
+// trailer. Both overloads emit v1.
 std::string encodeWriteBatch(const WriteBatch& batch);
 std::string encodeWriteBatch(const WriteBatch& batch, uint32_t version);
 // Encode the CONCATENATION of a borrowed selection of groups, byte-for-byte identical
@@ -221,51 +136,9 @@ std::string encodeWriteBatch(const WriteBatch& batch, uint32_t version);
 std::string encodeWriteBatch(const VShardBatchView& view, uint32_t version);
 std::optional<WriteBatch> decodeWriteBatch(const std::string& bytes);
 
-// An upper bound on `encodeWriteBatch(batch, v).size()` for EVERY version v this codec
-// can emit, computed without encoding anything (debt D-31).
-//
-// It exists because the two ends of a forwarded write do not agree on a version and do
-// not have to: the data-plane wire emits what was NEGOTIATED with that peer, while the
-// slice the receiver re-encodes as a Raft command emits what the CLUSTER-WIDE journal
-// gate allows (see the FORMAT SAFETY note above). So a size measured at one end says
-// nothing about the other end unless it is version-independent, and the direction that
-// bites is v2 -> v1: v2's zigzag timestamp deltas are 1-10 bytes where v1's are a flat 8,
-// so the SAME batch is usually smaller in v2 and can be larger. Anything that refuses an
-// oversized slice must therefore charge the worst version, not the one in its hand.
-//
-// The bound is v1's exact size plus the two things only v2 can add: its 4-byte magic and
-// up to 2 bytes per point (a 10-byte varint where v1 pays 8; the first timestamp of a
-// series is a fixed u64 in both, so this is slack, not a shortfall). It is an upper
-// bound, never an estimate -- a refusal computed from it must not be able to admit
-// something the encoder will then exceed.
-size_t maxEncodedBytes(const WriteBatch& batch);
+// The exact v1 encoded size, computed without allocating the frame.
+size_t encodedWriteBatchBytes(const WriteBatch& batch);
 
-// The v2 format magic, as a size (the bytes themselves are private to the .cpp, which
-// static_asserts they agree). Part of the charge arithmetic below.
-inline constexpr size_t kWriteBatchV2MagicBytes = 4;
-
-// HOW MUCH THE CHARGE CAN EXCEED A v1 ENCODING OF THE SAME BATCH -- 11/9, and this ratio
-// is the whole reason a size measured on the wire cannot be compared to the proposal bound
-// as a raw byte count (debt D-31, review F1).
-//
-// `maxEncodedBytes` charges `v1 + magic + 2 bytes per point`, and v1's CHEAPEST point is a
-// boolean: an 8-byte timestamp plus a 1-byte value, 9 bytes. So the charge is at most
-// (9+2)/9 = 11/9 of v1 for a boolean column, 18/16 for float/int, 14/12 for the shortest
-// strings -- booleans bind. Every other term of v1 (per-series key and count headers, the
-// per-batch header and trailer, revisions when present) only makes the ratio smaller, so
-// 11/9 is a true ceiling rather than a typical case.
-//
-// COMPARING RAW BYTES INSTEAD OF THIS IS THE BUG REVIEW F1 FOUND: `kMaxOutboundFrameBytes`
-// (~10.67 MB) looks like it leaves ~1.3 MiB of headroom under a 12 MiB proposal bound, and
-// leaves NONE -- a maximal float frame charges 12,582,911 bytes against a 12,582,912-byte
-// bound, and a maximal boolean frame charges 13.67 MB and is REFUSED. Anything relating the
-// two bounds must go through `chargeCeilingForV1Bytes`.
-inline constexpr size_t kChargeOverV1Num = 11;
-inline constexpr size_t kChargeOverV1Den = 9;
-
-// The most `maxEncodedBytes` can charge for a batch whose v1 encoding is `v1Bytes`.
-constexpr size_t chargeCeilingForV1Bytes(size_t v1Bytes) {
-    return v1Bytes * kChargeOverV1Num / kChargeOverV1Den + kWriteBatchV2MagicBytes;
-}
+inline constexpr size_t kWriteBatchV1MagicBytes = 4;
 
 }  // namespace timestar::data

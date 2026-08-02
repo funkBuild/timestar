@@ -82,7 +82,7 @@ seastar::future<> testMigrateResolvesAndFloorsRevisions(std::string dir) {
     co_await out->readSparseIndex();
 
     // Migrated data is at the migrated floor -- no revisions written.
-    EXPECT_EQ(out->fileFormatVersion(), 4u);
+    EXPECT_EQ(out->fileFormatVersion(), 1u);
     EXPECT_EQ(out->maxRevision(), 0u) << "migrated data must sit at the migrated-floor revision 0";
 
     // Series A is present with the LWW-resolved view (newest wins at ts 200).

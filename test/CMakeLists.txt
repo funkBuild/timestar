@@ -40,8 +40,6 @@ file(GLOB_RECURSE UNIT_CLUSTER_TESTS CONFIGURE_DEPENDS unit/cluster/*.cpp)
 set(UNIT_CLUSTER_SOCKET_TESTS
     ${CMAKE_CURRENT_SOURCE_DIR}/unit/cluster/raft_rpc_transport_test.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/unit/cluster/raft_group_registry_test.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/unit/cluster/dataplane_rpc_test.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/unit/cluster/dataplane_rpc_enriched_test.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/unit/cluster/cluster_data_plane_test.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/unit/cluster/shard_raft_plane_test.cpp
 )

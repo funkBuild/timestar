@@ -437,7 +437,7 @@ seastar::future<std::unique_ptr<SSTableReader>> SSTableReader::open(std::string 
         co_await file.close();
         throw std::runtime_error("SSTable bad magic: " + filename);
     }
-    if (version != SSTABLE_LEGACY_VERSION && version != SSTABLE_VERSION) {
+    if (version != SSTABLE_VERSION) {
         co_await file.close();
         throw std::runtime_error("SSTable unsupported version " + std::to_string(version) + ": " + filename);
     }
@@ -450,8 +450,7 @@ seastar::future<std::unique_ptr<SSTableReader>> SSTableReader::open(std::string 
     uint64_t writeTimestampNs = decodeFixed64(fp + 40);
     const uint32_t storedMetadataCrc = decodeFixed32(fp + 48);
 
-    const size_t reservedStart = version == SSTABLE_LEGACY_VERSION ? 48 : 52;
-    for (size_t i = reservedStart; i < 56; ++i) {
+    for (size_t i = 52; i < 56; ++i) {
         if (static_cast<unsigned char>(fp[i]) != 0) {
             co_await file.close();
             throw std::runtime_error("SSTable footer reserved bytes are nonzero: " + filename);
@@ -495,29 +494,21 @@ seastar::future<std::unique_ptr<SSTableReader>> SSTableReader::open(std::string 
 
         const char* metaBase = metaBuf.get() + (metaStart - alignedMetaOffset);
 
-        if (version == SSTABLE_VERSION &&
-            CRC32::compute(metaBase, static_cast<size_t>(metaEnd - metaStart)) != storedMetadataCrc) {
+        if (CRC32::compute(metaBase, static_cast<size_t>(metaEnd - metaStart)) != storedMetadataCrc) {
             throw std::runtime_error("SSTable metadata CRC32 mismatch: " + filename);
         }
 
         // Parse bloom filter
         if (bloomSize > 0) {
-            if (version == SSTABLE_LEGACY_VERSION) {
-                // V1 did not checksum its bloom/index region. A corrupted bloom
-                // can create false negatives, so legacy files deliberately use
-                // a null filter until compaction rewrites them as v2.
-                reader->bloom_ = BloomFilter::createNull();
-            } else {
-                if (bloomSize < 13) {
-                    throw std::runtime_error("SSTable v2 bloom/identity block is truncated: " + filename);
-                }
-                const auto filterSize = static_cast<size_t>(bloomSize - 8);
-                const auto* bloomData = metaBase + (bloomOffset - metaStart);
-                reader->metadata_.fileNumber = decodeFixed64(bloomData + filterSize);
-                reader->bloom_ = BloomFilter::deserializeFrom(std::string_view(bloomData, filterSize));
-                if (reader->bloom_.isNull() || reader->bloom_.filterSize() + 5 != filterSize) {
-                    throw std::runtime_error("SSTable bloom filter is malformed: " + filename);
-                }
+            if (bloomSize < 13) {
+                throw std::runtime_error("SSTable v1 bloom/identity block is truncated: " + filename);
+            }
+            const auto filterSize = static_cast<size_t>(bloomSize - 8);
+            const auto* bloomData = metaBase + (bloomOffset - metaStart);
+            reader->metadata_.fileNumber = decodeFixed64(bloomData + filterSize);
+            reader->bloom_ = BloomFilter::deserializeFrom(std::string_view(bloomData, filterSize));
+            if (reader->bloom_.isNull() || reader->bloom_.filterSize() + 5 != filterSize) {
+                throw std::runtime_error("SSTable bloom filter is malformed: " + filename);
             }
         } else {
             throw std::runtime_error("SSTable bloom filter is missing: " + filename);
@@ -593,47 +584,11 @@ seastar::future<std::unique_ptr<SSTableReader>> SSTableReader::open(std::string 
     reader->readFile_ = std::move(file);
     reader->readFileOpen_ = true;
 
-    if (version == SSTABLE_LEGACY_VERSION) {
-        // V1's index was not checksummed either. Bind every index entry to its
-        // CRC-protected data block once at open so a structurally plausible
-        // interior-key corruption cannot make lookups silently skip a block.
-        uint64_t recoveredEntryCount = 0;
-        std::string previousKey;
-        for (size_t blockIndex = 0; blockIndex < reader->index_.size(); ++blockIndex) {
-            auto blockData = co_await reader->decompressBlock(blockIndex);
-            BlockReader block(blockData);
-            if (!block.valid()) {
-                throw std::runtime_error("Legacy SSTable contains a malformed data block: " + filename);
-            }
-            auto blockIt = block.newIterator();
-            blockIt.seekToFirst();
-            bool firstInBlock = true;
-            while (blockIt.valid()) {
-                const std::string key(blockIt.key());
-                if ((firstInBlock && key != reader->index_[blockIndex].firstKey) ||
-                    (!previousKey.empty() && key <= previousKey)) {
-                    throw std::runtime_error("Legacy SSTable index/data keys do not match: " + filename);
-                }
-                firstInBlock = false;
-                previousKey = key;
-                ++recoveredEntryCount;
-                blockIt.next();
-            }
-            if (firstInBlock) {
-                throw std::runtime_error("Legacy SSTable contains an empty indexed block: " + filename);
-            }
-        }
-        if (recoveredEntryCount != entryCount) {
-            throw std::runtime_error("Legacy SSTable entry count does not match its data blocks: " + filename);
-        }
-        reader->metadata_.maxKey = std::move(previousKey);
-    }
-
     // Populate the key range: minKey comes from the index (first key of the
     // first block, set above); maxKey requires reading the last data block —
     // the index only stores each block's FIRST key. One extra block read at
     // open() enables range-based pruning in kvGet/kvExists/kvPrefixScan.
-    if (version == SSTABLE_VERSION && !reader->index_.empty() && reader->metadata_.maxKey.empty()) {
+    if (!reader->index_.empty() && reader->metadata_.maxKey.empty()) {
         auto lastBlockData = co_await reader->decompressBlock(reader->index_.size() - 1);
         BlockReader lastBlock(lastBlockData);
         if (lastBlock.valid()) {

@@ -430,7 +430,7 @@ seastar::future<> MemoryStore::close() {
 
 seastar::future<> MemoryStore::initWAL(const timestar::StorageLayout& layout, unsigned shardId) {
     wal = std::make_unique<WAL>(sequenceNumber, layout, shardId);
-    co_await wal->init(this, false);  // false = not recovery, create fresh WAL
+    co_await wal->init(this);
 }
 
 size_t MemoryStore::walSizeOnDisk() const {

@@ -22,23 +22,18 @@ struct RequestVote {
     NodeId candidateId = kNoNode;
     LogIndex lastLogIndex = kNoIndex;
     Term lastLogTerm = kNoTerm;
-    // §3.10 + CheckQuorum: "the leader I currently follow sent me a TimeoutNow", set ONLY
+    // §3.10 + CheckQuorum: "the leader I currently follow sent me a TimeoutNow", set only
     // by a campaign started from a TimeoutNow (see RaftNode::step). It makes the voter's
     // CheckQuorum disruption guard stand aside (raft_node.cpp, `inLease`), which is the
-    // whole reason CheckQuorum can be on at all: TimeoutNow skips the TRANSFEREE's lease,
+    // reason CheckQuorum can be enabled in direct Raft configurations: TimeoutNow skips the transferee's lease,
     // but every OTHER voter is still hearing the outgoing leader's heartbeats and would
     // otherwise drop the vote silently -- see ADR 0005 and the revert in 1f2e752.
     //
     // IT IS A LEASE BYPASS AND NOTHING ELSE. Every other vote condition still applies
     // (§5.4.1 log up-to-date, one vote per term, term ordering), so a lying peer gains
-    // exactly what it already has when CheckQuorum is off -- which was the shipped
-    // configuration until this landed.
+    // exactly what it already has when CheckQuorum is off.
     //
-    // DELIBERATELY THE LAST FIELD: RequestVote is aggregate-initialized positionally in
-    // several tests, and a new member in the middle would change what those braces mean.
-    // The wire layout does not depend on it either way -- the codec writes named fields,
-    // and a transfer-flagged vote travels under its OWN message-type byte (raft_codec.cpp)
-    // rather than as an extra byte inside the ordinary one.
+    // Kept last because RequestVote is aggregate-initialized positionally in tests.
     bool campaignTransfer = false;
 };
 
@@ -86,10 +81,7 @@ struct AppendEntriesReply {
 // and installs only on `done`, so no single message has to carry a whole VShard snapshot
 // -- which is what let the size chain in raft_types.hpp come down by 3x.
 //
-// The defaults describe the pre-D-5 shape (one message, whole payload), so a
-// positionally- or partially-initialized InstallSnapshot still means what it always did;
-// `isWholePayload()` is what the codec uses to keep emitting the OLD wire tag for a
-// snapshot that fits in one chunk, which is what keeps an un-upgraded peer working.
+// The defaults describe a one-message transfer; larger payloads set the progress fields.
 struct InstallSnapshot {
     Term term = kNoTerm;
     NodeId leaderId = kNoNode;
@@ -98,12 +90,8 @@ struct InstallSnapshot {
     Config config;  // membership as of the snapshot boundary (rides EVERY chunk)
     std::string data;
     uint64_t offset = 0;      // byte offset of `data` within the whole payload
-    uint64_t totalBytes = 0;  // whole payload size (0 == "data is the whole payload")
+    uint64_t totalBytes = 0;  // whole payload size (0 is normalized to data.size() on wire)
     bool done = true;         // `data` ends the payload
-
-    // Is this the single-message shape a pre-D-5 peer understands? (Also the shape a
-    // pre-D-5 peer PRODUCES, since it can set none of the three fields above.)
-    bool isWholePayload() const { return offset == 0 && done && (totalBytes == 0 || totalBytes == data.size()); }
 };
 
 struct InstallSnapshotReply {
@@ -115,9 +103,7 @@ struct InstallSnapshotReply {
     // resume point it restarts from, and it is what makes a dropped chunk recoverable at
     // all on a fire-and-forget transport: without it the only signal would be silence.
     //
-    // A COMPLETED install (or any reply from a pre-D-5 peer) leaves both at their
-    // defaults, which is exactly the old two-field reply -- see the codec for why that
-    // matters for mixed versions.
+    // A completed install leaves both at their defaults.
     LogIndex pendingSnapshotIndex = kNoIndex;
     uint64_t stagedBytes = 0;
 
