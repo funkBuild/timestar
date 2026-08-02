@@ -48,6 +48,14 @@ raft::LogEntry deleteBatchEntry(uint64_t index, data::DeleteRangeBatch command) 
     return entry;
 }
 
+raft::LogEntry retentionEntry(uint64_t index, std::string measurement, uint64_t cutoff) {
+    raft::LogEntry entry;
+    entry.index = index;
+    entry.type = raft::EntryType::Normal;
+    entry.data = data::encodeReplicatedCommand(data::RetentionCutoffCmd{std::move(measurement), cutoff});
+    return entry;
+}
+
 std::string keyOnVShard(const std::string& measurement, uint16_t vshard) {
     for (unsigned i = 0;; ++i) {
         auto key = buildSeriesKey(measurement, {{"host", "h" + std::to_string(i)}}, "value");
@@ -74,6 +82,19 @@ double latest(seastar::sharded<Engine>& eng, const std::string& m, const std::st
         return -1;
     auto* v = std::get_if<std::vector<double>>(&r.series[0].fields.at(f).second);
     return (v && !v->empty()) ? (*v)[0] : -1;
+}
+
+std::vector<double> readFloatSeries(seastar::sharded<Engine>& eng, const std::string& key) {
+    const SeriesId128 id = SeriesId128::fromSeriesKey(key);
+    auto result =
+        eng.invoke_on(routeToCore(id), [key, id](Engine& engine) { return engine.query(key, id, 0, UINT64_MAX); })
+            .get();
+    if (!result)
+        return {};
+    const auto* values = std::get_if<QueryResult<double>>(&*result);
+    if (!values)
+        throw std::runtime_error("retention test series resolved to a different value type");
+    return values->values;
 }
 }  // namespace
 
@@ -139,6 +160,48 @@ TEST_F(EngineDataStateMachineTest, IdempotentDeleteRetryCannotEraseAnIntervening
         conflicting.targets[0].endTime = BASE + 2;
         EXPECT_THROW(sm.apply(deleteBatchEntry(13, std::move(conflicting))).get(), std::runtime_error)
             << "operation-ID reuse for another target must fail-stop";
+    }).get();
+}
+
+TEST_F(EngineDataStateMachineTest, ReplicatedRetentionIsMeasurementAndVShardScoped) {
+    seastar::async([] {
+        ScopedShardedEngine eng;
+        eng.start();
+        cluster::EngineLocalStore store(*eng);
+        const std::string targetOld = buildSeriesKey("retained_scope", {{"host", "old"}}, "value");
+        const uint16_t vshard = timestar::virtualShard(SeriesId128::fromSeriesKey(targetOld));
+        const std::string targetNew = keyOnVShard("retained_scope", vshard);
+        const std::string otherMeasurement = keyOnVShard("retained_other", vshard);
+        std::string foreignVShard;
+        for (unsigned i = 0;; ++i) {
+            foreignVShard = buildSeriesKey("retained_scope", {{"host", "foreign" + std::to_string(i)}}, "value");
+            if (timestar::virtualShard(SeriesId128::fromSeriesKey(foreignVShard)) != vshard)
+                break;
+        }
+        cluster::EngineDataStateMachine sm(store, timestar::VShardId{vshard});
+
+        auto writeAt = [&](uint64_t index, const std::string& key, uint64_t timestamp, double value) {
+            auto entry = writeEntry(index, key, value);
+            auto decoded = data::decodeReplicatedCommand(entry.data);
+            auto& batch = std::get<data::WriteBatch>(*decoded);
+            batch.series[0].timestamps[0] = timestamp;
+            entry.data = data::encodeReplicatedCommand(std::move(batch));
+            sm.apply(std::move(entry)).get();
+        };
+        writeAt(1, targetOld, BASE - 100, 1.0);
+        writeAt(2, targetNew, BASE + 100, 2.0);
+        writeAt(3, otherMeasurement, BASE - 100, 3.0);
+        store
+            .applyCommittedWrites(
+                std::get<data::WriteBatch>(*data::decodeReplicatedCommand(writeEntry(4, foreignVShard, 4.0).data)))
+            .get();
+
+        sm.apply(retentionEntry(5, "retained_scope", BASE)).get();
+        EXPECT_TRUE(readFloatSeries(*eng, targetOld).empty());
+        EXPECT_EQ(readFloatSeries(*eng, targetNew), (std::vector<double>{2.0}));
+        EXPECT_EQ(readFloatSeries(*eng, otherMeasurement), (std::vector<double>{3.0}));
+        EXPECT_EQ(readFloatSeries(*eng, foreignVShard), (std::vector<double>{4.0}))
+            << "a foreign VShard must not be touched by this group's cutoff";
     }).get();
 }
 

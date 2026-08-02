@@ -44,7 +44,7 @@ public:
     seastar::future<> checkWriteAdmission(data::VShardBatchView view);
 
     seastar::future<bool> applyDelete(std::string seriesKey, uint64_t start, uint64_t end) override;
-    seastar::future<> applyRetention(std::string measurement, uint64_t cutoff);
+    seastar::future<> applyRetention(VShardId vshard, std::string measurement, uint64_t cutoff);
 
     // Build a self-contained InstallSnapshot payload for one VShard (M3). Precondition:
     // vshardsCohesiveOnCores(smp::count) -- a VShard's data must live entirely on

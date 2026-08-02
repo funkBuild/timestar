@@ -77,9 +77,7 @@ seastar::future<> EngineDataStateMachine::apply(raft::LogEntry entry) {
                                                                                  commandHash, batch->issuedAtMs});
     } else {
         const auto& rc = std::get<data::RetentionCutoffCmd>(*cmd);
-        // VShard-wide retention cutoff (EngineLocalStore::applyRetention is the M1.x/M6
-        // wiring point; measurement-scoping is applied there).
-        co_await store_.applyRetention(std::string(), rc.cutoffTime);
+        co_await store_.applyRetention(vshard_, rc.measurement, rc.cutoffTime);
     }
 }
 

@@ -116,6 +116,69 @@ TEST_F(NativeIndexVShardExtractTest, PatternExpansionIsVShardScopedFilteredAndBo
     testBoundedVShardPatternExpansion().get();
 }
 
+seastar::future<> testPagedVShardSeriesWalk() {
+    timestar::index::NativeIndex index(timestar::StorageLayout("."), 0);
+    co_await index.open();
+
+    const std::string first = timestar::buildSeriesKey("retention_page", {{"host", "h0"}}, "value");
+    const uint16_t target = timestar::virtualShard(SeriesId128::fromSeriesKey(first));
+    std::set<std::string> expected{first};
+    for (unsigned i = 1; expected.size() < 5 && i < 100'000; ++i) {
+        const std::string key =
+            timestar::buildSeriesKey("retention_page", {{"host", "h" + std::to_string(i)}}, "value");
+        if (timestar::virtualShard(SeriesId128::fromSeriesKey(key)) == target)
+            expected.insert(key);
+    }
+    EXPECT_EQ(expected.size(), 5u);
+    if (expected.size() != 5) {
+        co_await index.close();
+        co_return;
+    }
+    for (const auto& key : expected) {
+        const auto split = key.find(",host=");
+        const auto field = key.rfind(' ');
+        EXPECT_NE(split, std::string::npos);
+        EXPECT_NE(field, std::string::npos);
+        if (split == std::string::npos || field == std::string::npos) {
+            co_await index.close();
+            co_return;
+        }
+        co_await index.getOrCreateSeriesId("retention_page", {{"host", key.substr(split + 6, field - split - 6)}},
+                                           "value");
+    }
+
+    // A foreign measurement in the same VShard must be scanned past without
+    // consuming the page budget or appearing in the result.
+    for (unsigned i = 0;; ++i) {
+        const std::string host = "x" + std::to_string(i);
+        const auto id =
+            SeriesId128::fromSeriesKey(timestar::buildSeriesKey("retention_foreign", {{"host", host}}, "value"));
+        if (timestar::virtualShard(id) == target) {
+            co_await index.getOrCreateSeriesId("retention_foreign", {{"host", host}}, "value");
+            break;
+        }
+    }
+
+    std::set<std::string> actual;
+    std::string cursor;
+    size_t pages = 0;
+    do {
+        auto page = co_await index.pageVShardSeriesKeys(target, "retention_page", std::move(cursor), 2);
+        EXPECT_LE(page.seriesKeys.size(), 2u);
+        actual.insert(page.seriesKeys.begin(), page.seriesKeys.end());
+        cursor = std::move(page.resumeAfter);
+        ++pages;
+    } while (!cursor.empty());
+    EXPECT_EQ(actual, expected);
+    EXPECT_EQ(pages, 3u);
+
+    co_await index.close();
+}
+
+TEST_F(NativeIndexVShardExtractTest, RetentionCatalogWalkIsVShardScopedAndBoundedByPage) {
+    testPagedVShardSeriesWalk().get();
+}
+
 seastar::future<> testReplaceVShardCatalogRemovesObsoleteDiscoveryState() {
     const std::map<std::string, std::string> keepTags{{"env", "prod"}, {"host", "keep"}};
     const std::string keepKey = timestar::buildSeriesKey("cpu", keepTags, "usage");
@@ -158,8 +221,7 @@ seastar::future<> testReplaceVShardCatalogRemovesObsoleteDiscoveryState() {
         auto all = co_await index.findSeries("cpu");
         EXPECT_TRUE(all.has_value());
         if (all.has_value())
-            EXPECT_EQ(std::set<SeriesId128>(all->begin(), all->end()),
-                      (std::set<SeriesId128>{keepId, foreignId}));
+            EXPECT_EQ(std::set<SeriesId128>(all->begin(), all->end()), (std::set<SeriesId128>{keepId, foreignId}));
 
         auto sharedTag = co_await index.findSeries("cpu", {{"env", "prod"}});
         EXPECT_TRUE(sharedTag.has_value());

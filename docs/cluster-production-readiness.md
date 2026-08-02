@@ -104,6 +104,12 @@ inventory and rules.
   protected from being mistaken for obsolete replicas. Group-0 topology startup
   rejects the optional shared-journal layout until it has an equally safe
   per-group retirement generation protocol.
+- [x] Disable the standalone, local-clock retention sweeper in partitioned mode
+  and make the exact-v1 replicated cutoff command measurement-scoped. Replicas
+  apply the controller-provided cutoff without consulting local time, walk the
+  VShard catalog in bounded pages, and delete only the selected measurement's
+  expired prefix. Validation rejects empty, oversized, NUL-containing, and
+  zero-cutoff commands; focused tests prove measurement and VShard isolation.
 
 ## Remaining production blockers
 
@@ -126,8 +132,11 @@ production deploy.
   Engine cleanup or journal quarantine, grace expiry, and later movement back.
   Editing a static peer list is not a safe topology operation.
 - [ ] **Replicate retention policy and cutoff decisions.** Partitioned mode must
-  never let replicas expire or compact different logical ranges. Until then,
-  retention mutation must remain fail-closed.
+  never let replicas expire or compact different logical ranges. Local-clock
+  sweeping is now disabled and a bounded per-VShard replicated cutoff can be
+  applied safely. Group-0 policy CAS, durable controller cutoff fan-out, and the
+  clustered HTTP policy API remain unfinished; mutation must remain
+  fail-closed until all three are wired and tested.
 - [ ] **Finish the large-snapshot production path.** Snapshot transfer is
   chunked, but snapshot construction/install still needs a bounded streaming
   path that cannot strand a VShard above the current in-memory payload ceiling.
@@ -208,3 +217,8 @@ removal of a retired VShard from a day-discovery bitmap shared with a live
 VShard. The production server build pins the authenticated route composition;
 the remaining multi-process topology gate must exercise those routes over HTTP
 and prove Engine-data reclaim as well as journal teardown/reclaim.
+
+The retention-cutoff gate covers exact-v1 validation and round trip, bounded
+catalog pagination, measurement isolation, VShard isolation, and preservation
+of points at or newer than the replicated cutoff. It does not yet constitute
+evidence for Group-0 policy mutation or durable all-VShard controller fan-out.

@@ -108,8 +108,7 @@ std::string encodeReplicatedCommand(const ReplicatedCommand& cmd) {
         out.push_back(static_cast<char>(kWrite));
         putStr(out, encodeWriteBatch(*w));
     } else if (const auto* batch = std::get_if<DeleteRangeBatch>(&cmd)) {
-        if (batch->operationId == SeriesId128{} || batch->issuedAtMs == 0 ||
-            !validDeleteRangeTargets(batch->targets))
+        if (batch->operationId == SeriesId128{} || batch->issuedAtMs == 0 || !validDeleteRangeTargets(batch->targets))
             throw std::invalid_argument("encodeReplicatedCommand: invalid idempotent delete batch");
         out.push_back(static_cast<char>(kDeleteBatch));
         batch->operationId.appendTo(out);
@@ -122,7 +121,11 @@ std::string encodeReplicatedCommand(const ReplicatedCommand& cmd) {
         }
     } else {
         const auto& r = std::get<RetentionCutoffCmd>(cmd);
+        if (r.measurement.empty() || r.measurement.size() > kMaxRetentionMeasurementBytes ||
+            r.measurement.find('\0') != std::string::npos || r.cutoffTime == 0)
+            throw std::invalid_argument("encodeReplicatedCommand: invalid retention cutoff");
         out.push_back(static_cast<char>(kRetention));
+        putStr(out, r.measurement);
         putU64(out, r.cutoffTime);
     }
     putU64(out, fnv1a(out.data(), out.size()));
@@ -182,10 +185,12 @@ std::optional<ReplicatedCommand> decodeReplicatedCommand(const std::string& byte
         cmd = std::move(d);
     } else if (tag == kRetention) {
         RetentionCutoffCmd rc;
+        rc.measurement = r.str();
         rc.cutoffTime = r.u64();
-        if (!r.ok)
+        if (!r.ok || rc.measurement.empty() || rc.measurement.size() > kMaxRetentionMeasurementBytes ||
+            rc.measurement.find('\0') != std::string::npos || rc.cutoffTime == 0)
             return std::nullopt;
-        cmd = rc;
+        cmd = std::move(rc);
     } else {
         return std::nullopt;  // unknown kind
     }

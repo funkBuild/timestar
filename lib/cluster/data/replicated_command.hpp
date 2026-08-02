@@ -67,11 +67,13 @@ inline size_t encodedDeleteRangeBatchBytes(const DeleteRangeBatch& command) {
 // command bytes fail-stops instead of silently acknowledging the wrong delete.
 uint64_t deleteRangeCommandHash(const DeleteRangeBatch& command);
 
-// Drop every point older than `cutoffTime` across the VShard. Monotonic. NOTE: in v1
-// EngineDataStateMachine's apply of this command is a NO-OP (EngineLocalStore::
-// applyRetention is a stub, wired in M1.x/M6) -- it is a uniform no-op on every
-// replica (not divergent), but replicated retention is not yet functional.
+inline constexpr size_t kMaxRetentionMeasurementBytes = 1024;
+
+// Drop every point for `measurement` older than `cutoffTime` across this
+// command's VShard. The controller computes the cutoff once and replicates this
+// exact value; apply never consults a replica's wall clock.
 struct RetentionCutoffCmd {
+    std::string measurement;
     uint64_t cutoffTime = 0;
 };
 

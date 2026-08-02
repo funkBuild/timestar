@@ -487,10 +487,28 @@ seastar::future<data::MetadataResult> EngineLocalStore::queryMetadata(data::Meta
     co_return out;
 }
 
-seastar::future<> EngineLocalStore::applyRetention(std::string, uint64_t) {
-    // Retention-cutoff application is wired in a later milestone (M1.x/M6); the
-    // command type carries it, but the M2 write path does not use it yet.
-    co_return;
+seastar::future<> EngineLocalStore::applyRetention(VShardId vshard, std::string measurement, uint64_t cutoff) {
+    if (!vshard.valid() || measurement.empty() || cutoff == 0)
+        throw std::invalid_argument("applyRetention: invalid VShard, measurement, or cutoff");
+    if (!timestar::vshardsCohesiveOnCores(seastar::smp::count))
+        throw std::runtime_error("applyRetention: core count is not VShard-cohesive");
+    const unsigned core = timestar::assignCore(vshard, seastar::smp::count);
+    co_await engines_.invoke_on(
+        core, [vshard, measurement = std::move(measurement), cutoff](Engine& engine) mutable -> seastar::future<> {
+            // Retention keeps catalog identity and only removes the expired
+            // point prefix, so the opaque primary-key cursor remains stable
+            // across pages. Bounded pages avoid materialising a large
+            // measurement's complete series set during Raft apply.
+            static constexpr size_t kPageSize = 1024;
+            std::string cursor;
+            do {
+                auto page = co_await engine.getIndex().pageVShardSeriesKeys(vshard.value(), measurement,
+                                                                            std::move(cursor), kPageSize);
+                for (auto& seriesKey : page.seriesKeys)
+                    co_await engine.deleteRange(std::move(seriesKey), 0, cutoff - 1);
+                cursor = std::move(page.resumeAfter);
+            } while (!cursor.empty());
+        });
 }
 
 }  // namespace timestar::cluster

@@ -840,6 +840,13 @@ seastar::future<> NativeIndex::kvWriteBatch(const IndexWriteBatch& batch) {
 // Async streaming kvPrefixScan using MergeIterator.
 // SSTable block reads may require DMA I/O on cache miss.
 seastar::future<> NativeIndex::kvPrefixScan(const std::string& prefix, ScanCallback fn) {
+    return kvPrefixScanFrom(prefix, prefix, std::move(fn));
+}
+
+seastar::future<> NativeIndex::kvPrefixScanFrom(const std::string& prefix, const std::string& lowerBound,
+                                                ScanCallback fn) {
+    if (lowerBound.size() < prefix.size() || std::memcmp(lowerBound.data(), prefix.data(), prefix.size()) != 0)
+        throw std::invalid_argument("kvPrefixScanFrom: lower bound is outside prefix");
     // Count valid sources and track if we can use the single-source fast path
     bool memtableEmpty = memtable_->empty();
     bool immutableEmpty = !immutableMemtable_ || immutableMemtable_->empty();
@@ -856,7 +863,7 @@ seastar::future<> NativeIndex::kvPrefixScan(const std::string& prefix, ScanCallb
             co_return;  // key range cannot intersect the prefix
         }
         auto iter = reader->newIterator();
-        co_await iter->seek(prefix);
+        co_await iter->seek(lowerBound);
         while (iter->valid()) {
             auto key = iter->key();
             if (key.size() < prefix.size() || std::memcmp(key.data(), prefix.data(), prefix.size()) != 0) {
@@ -876,7 +883,7 @@ seastar::future<> NativeIndex::kvPrefixScan(const std::string& prefix, ScanCallb
     // Fast path: single MemTable, no SSTables — skip MergeIterator entirely.
     if (!memtableEmpty && immutableEmpty && sstCount == 0) {
         auto iter = memtable_->newIterator();
-        iter.seek(prefix);
+        iter.seek(lowerBound);
         while (iter.valid()) {
             auto key = iter.key();
             if (key.size() < prefix.size() || std::memcmp(key.data(), prefix.data(), prefix.size()) != 0) {
@@ -924,7 +931,7 @@ seastar::future<> NativeIndex::kvPrefixScan(const std::string& prefix, ScanCallb
     }
 
     MergeIterator merger(std::move(sources));
-    co_await merger.seek(prefix);
+    co_await merger.seek(lowerBound);
 
     while (merger.valid()) {
         auto key = merger.key();
@@ -1748,6 +1755,52 @@ seastar::future<std::expected<std::vector<std::string>, SeriesLimitExceeded>> Na
     if (exceeded)
         co_return std::unexpected(SeriesLimitExceeded{maxSeries + 1, maxSeries});
     co_return out;
+}
+
+seastar::future<NativeIndex::VShardSeriesKeyPage> NativeIndex::pageVShardSeriesKeys(uint16_t vshard,
+                                                                                    const std::string& measurement,
+                                                                                    std::string resumeAfter,
+                                                                                    size_t pageSize) {
+    static constexpr size_t kMaxPageSize = 4096;
+    if (vshard >= timestar::VIRTUAL_SHARD_COUNT || measurement.empty() || pageSize == 0 || pageSize > kMaxPageSize)
+        throw std::invalid_argument("pageVShardSeriesKeys: invalid scan request");
+
+    const std::string prefix = ke::encodeSeriesMetadataVShardPrefix(vshard);
+    if (resumeAfter.empty())
+        resumeAfter = prefix;
+    else if (resumeAfter.size() < prefix.size() || std::memcmp(resumeAfter.data(), prefix.data(), prefix.size()) != 0)
+        throw std::invalid_argument("pageVShardSeriesKeys: cursor belongs to another VShard");
+
+    struct Found {
+        std::string metadataKey;
+        std::string seriesKey;
+    };
+    std::vector<Found> found;
+    found.reserve(pageSize + 1);
+    co_await kvPrefixScanFrom(prefix, resumeAfter, [&](std::string_view key, std::string_view value) {
+        // seek() is inclusive; the public cursor is exclusive.
+        if (key.compare(resumeAfter) <= 0)
+            return true;
+        if (key.size() < ke::kSeriesMetadataKeyIdOffset + 16)
+            return true;
+        const auto metadata = ke::decodeSeriesMetadata(value);
+        if (metadata.measurement != measurement)
+            return true;
+        found.push_back(
+            {std::string(key), timestar::buildSeriesKey(metadata.measurement, metadata.tags, metadata.field)});
+        return found.size() <= pageSize;
+    });
+
+    VShardSeriesKeyPage page;
+    const bool more = found.size() > pageSize;
+    if (more)
+        found.pop_back();
+    page.seriesKeys.reserve(found.size());
+    for (auto& item : found)
+        page.seriesKeys.push_back(std::move(item.seriesKey));
+    if (more)
+        page.resumeAfter = std::move(found.back().metadataKey);
+    co_return page;
 }
 
 // ============================================================================

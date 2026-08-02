@@ -167,6 +167,17 @@ public:
         uint16_t vshard, const std::string& measurement, const std::map<std::string, std::string>& tagFilters,
         const std::unordered_set<std::string>& fieldFilter, size_t maxSeries, size_t maxEncodedKeyBytes);
 
+    struct VShardSeriesKeyPage {
+        std::vector<std::string> seriesKeys;
+        // Opaque full metadata key. Empty means the scan is complete.
+        std::string resumeAfter;
+    };
+    // Bounded, resumable catalog walk used by replicated retention apply. The
+    // cursor is exclusive and stable because primary series metadata is retained
+    // by a bounded-range delete.
+    seastar::future<VShardSeriesKeyPage> pageVShardSeriesKeys(uint16_t vshard, const std::string& measurement,
+                                                              std::string resumeAfter, size_t pageSize);
+
     // --- Per-series value-type binding (SERIES_VALUE_TYPE, 0x18) ---
     //
     // Not part of the IndexBackend interface: this is enforced by Engine on the
@@ -376,6 +387,7 @@ private:
     // Async — SSTable block reads may require DMA I/O on cache miss.
     using ScanCallback = std::function<bool(std::string_view key, std::string_view value)>;
     seastar::future<> kvPrefixScan(const std::string& prefix, ScanCallback fn);
+    seastar::future<> kvPrefixScanFrom(const std::string& prefix, const std::string& lowerBound, ScanCallback fn);
 
     // Non-blocking memtable flush (double-buffered).
     // maybeFlushMemTable swaps the active memtable to immutable and returns immediately.

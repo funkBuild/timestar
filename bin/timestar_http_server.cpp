@@ -967,17 +967,21 @@ int main(int argc, char** argv) {
                     })
                     .get();
 
-                // Load retention policies from NativeIndex and broadcast to all shards
-                g_engine.invoke_on(0, [](Engine& engine) { return engine.loadAndBroadcastRetentionPolicies(); }).get();
-
-                // Start the retention sweep timer on shard 0 (15-minute interval)
-                g_engine
-                    .invoke_on(0,
-                               [](Engine& engine) {
-                                   engine.startRetentionSweepTimer();
-                                   return seastar::make_ready_future<>();
-                               })
-                    .get();
+                // The standalone sweeper derives cutoffs independently from
+                // each node's wall clock and local policy store. It must never
+                // run in partitioned mode: clustered retention is applied only
+                // through explicit per-VShard Raft cutoff commands.
+                if (!partitionCompaction) {
+                    g_engine.invoke_on(0, [](Engine& engine) { return engine.loadAndBroadcastRetentionPolicies(); })
+                        .get();
+                    g_engine
+                        .invoke_on(0,
+                                   [](Engine& engine) {
+                                       engine.startRetentionSweepTimer();
+                                       return seastar::make_ready_future<>();
+                                   })
+                        .get();
+                }
 
                 // Commit the shard count now that Engine initialization has
                 // produced the canonical shard directories. Idempotent for a
