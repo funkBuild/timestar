@@ -33,8 +33,9 @@ nothing can exercise.
 persistent group-0 host and explicitly bootstrap its configured seed. That
 removes the old “no group 0 is composed” premise, but not this decision: the
 publication bridge now has a production caller and F9 covers the immutable
-serving-map voter union. Fresh observers still have no join RPC, and production
-has no capability/receipt-preflight actuator that can originate an activation.
+serving-map voter union. Protocol v8 now provides the token-authorized observer
+join RPC, but production has no capability/receipt-preflight actuator that can
+originate an activation.
 CheckQuorum therefore remains build-default OFF and runtime-disable-only.
 
 *The condition, and it is load-bearing.* The ordering argument holds **only while enabling

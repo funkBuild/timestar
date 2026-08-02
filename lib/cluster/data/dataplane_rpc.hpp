@@ -27,6 +27,13 @@ public:
         control::FrozenDeletePlanRpcRequest request) = 0;
 };
 
+class ControlJoinSink {
+public:
+    virtual ~ControlJoinSink() = default;
+    virtual seastar::future<control::ControlJoinResult> handleControlJoin(
+        control::ControlJoinRequest request) = 0;
+};
+
 // OptDeadline (node_store.hpp): a wall-clock point past which an awaited data-plane RPC
 // must give up. std::nullopt = no timeout, the pre-3f behaviour, kept for callers with no
 // deadline of their own (tests, the legacy verbs). seastar's rpc clock is lowres_clock,
@@ -107,6 +114,11 @@ public:
     // different identity with NodeCapabilityMismatchError.
     seastar::future<control::NodeCapabilityAdvertisement> nodeCapability(
         NodeId to, OptDeadline deadline = std::nullopt);
+    // Version-8 token-authorized observer admission. The reply is deliberately
+    // a step result: Joining is safe to retry while learner catch-up proceeds.
+    seastar::future<control::ControlJoinResult> controlJoin(
+        NodeId to, control::ControlJoinRequest request,
+        OptDeadline deadline = std::nullopt);
     seastar::future<bool> proposeWrite(NodeId to, WriteBatch batch) override;
     // The production remote propose (write-scaleout 3a/3b): borrows the caller's groups
     // (no merge allocation, and the caller keeps them so it can retry the failed ones)
@@ -127,6 +139,7 @@ public:
     // transport.
     void setReadIndexSink(ReadIndexSink& sink);
     void setFrozenDeletePlanSink(FrozenDeletePlanSink& sink);
+    void setControlJoinSink(ControlJoinSink& sink);
 
     // Identity advertised by the v7 capability verb. The supported range is
     // read from setLocalVersion() at reply time so the two cannot drift.

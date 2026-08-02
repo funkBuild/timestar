@@ -20,6 +20,13 @@ using timestar::raft::NodeId;
 // A node's lifecycle state in the cluster (the plan's node lifecycle).
 enum class NodeState : uint8_t { Joining = 0, Active = 1, Draining = 2, Down = 3 };
 
+inline constexpr size_t kMaxJoinTokenBytes = 1024;
+inline constexpr size_t kMaxOutstandingJoinTokens = 1024;
+
+inline bool validJoinToken(const std::string& token) {
+    return !token.empty() && token.size() <= kMaxJoinTokenBytes;
+}
+
 constexpr bool isValidNodeState(NodeState state) {
     return state >= NodeState::Joining && state <= NodeState::Down;
 }

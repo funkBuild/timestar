@@ -107,6 +107,20 @@ public:
     }
 };
 
+class RecordingControlJoinSink : public data::ControlJoinSink {
+public:
+    int calls = 0;
+    control::ControlJoinRequest lastRequest;
+    control::ControlJoinResult response{control::ControlJoinStatus::Joining, 1};
+
+    seastar::future<control::ControlJoinResult> handleControlJoin(
+        control::ControlJoinRequest request) override {
+        ++calls;
+        lastRequest = std::move(request);
+        return seastar::make_ready_future<control::ControlJoinResult>(response);
+    }
+};
+
 // Minimal legacy DataPoint sink, so a node can be started on the LEGACY path and
 // we can prove an enriched verb sent to it fails cleanly (unknown verb), not hangs.
 class LegacyMemStore : public data::LocalStore {
@@ -715,6 +729,42 @@ TEST_F(DataPlaneRpcEnrichedTest, NodeCapabilityBindsNegotiatedRangeAndExpectedId
         oldCli.addPeer(server, loopback(serverPort));
         EXPECT_THROW(oldCli.nodeCapability(server).get(), data::ClusterFormatUnsupportedError)
             << "pre-v7 clients must refuse before sending an unknown verb";
+
+        oldCli.stop().get();
+        cli.stop().get();
+        srv.stop().get();
+    }).get();
+}
+
+TEST_F(DataPlaneRpcEnrichedTest, ControlJoinUsesVersionEightAndRoundTripsTypedResult) {
+    seastar::async([] {
+        const uint16_t serverPort = 39388;
+        const data::NodeId server = 1;
+        ThrowingNodeStore store;
+        RecordingControlJoinSink sink;
+        data::DataPlaneRpc srv, cli, oldCli;
+        srv.setLocalVersion(features::VersionRange{1, data::kWriteBatchFormatV8});
+        srv.setControlJoinSink(sink);
+        srv.start(loopback(serverPort), store).get();
+
+        control::ControlJoinRequest request{
+            std::string(32, 'a'),
+            control::NodeRecord{2, std::string(32, 'b'), "127.0.0.1:8087", "rack-b",
+                                control::NodeState::Joining},
+            "one-use-token"};
+        cli.setLocalVersion(features::VersionRange{1, data::kWriteBatchFormatV8});
+        cli.startClientOnly().get();
+        cli.addPeer(server, loopback(serverPort));
+        const auto result = cli.controlJoin(server, request).get();
+        EXPECT_EQ(result, sink.response);
+        EXPECT_EQ(sink.calls, 1);
+        EXPECT_EQ(sink.lastRequest, request);
+
+        oldCli.setLocalVersion(features::VersionRange{1, data::kWriteBatchFormatV7});
+        oldCli.startClientOnly().get();
+        oldCli.addPeer(server, loopback(serverPort));
+        EXPECT_THROW(oldCli.controlJoin(server, request).get(), data::ClusterFormatUnsupportedError);
+        EXPECT_EQ(sink.calls, 1) << "a pre-v8 client must refuse before sending an unknown verb";
 
         oldCli.stop().get();
         cli.stop().get();

@@ -3,6 +3,7 @@
 #include "../features/feature_gate.hpp"
 #include "group0_state.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -127,6 +128,27 @@ struct NodeCapabilityAdvertisement {
     }
 };
 
+// Version-8 request used by a fresh, already-running observer to present its
+// persistent identity and one-use group-0 token to the current controller.
+struct ControlJoinRequest {
+    std::string clusterUuid;
+    NodeRecord record;
+    std::string token;
+
+    friend bool operator==(const ControlJoinRequest&, const ControlJoinRequest&) = default;
+};
+
+enum class ControlJoinStatus : uint8_t { NotLeader = 0, Rejected = 1, Joining = 2, Active = 3 };
+
+struct ControlJoinResult {
+    ControlJoinStatus status = ControlJoinStatus::Rejected;
+    NodeId leader = raft::kNoNode;
+
+    friend bool operator==(const ControlJoinResult&, const ControlJoinResult&) = default;
+};
+
+inline constexpr size_t kMaxControlJoinFrameBytes = 4096;
+
 using ControlCommand =
     std::variant<InitCluster, UpsertNode, SetNodeState, SetDesiredPlacement, SetMetaVoters, CasPolicy,
                  SetControllerTerm, UpsertJob, MintJoinToken, AdmitWithToken, StoreFrozenDeletePlan, SetActiveVersion,
@@ -148,5 +170,10 @@ std::optional<FreezeDeletePlanResult> decodeFrozenDeletePlanRpcResult(const std:
 
 std::string encodeNodeCapabilityAdvertisement(const NodeCapabilityAdvertisement& capability);
 std::optional<NodeCapabilityAdvertisement> decodeNodeCapabilityAdvertisement(const std::string& bytes);
+
+std::string encodeControlJoinRequest(const ControlJoinRequest& request);
+std::optional<ControlJoinRequest> decodeControlJoinRequest(const std::string& bytes);
+std::string encodeControlJoinResult(const ControlJoinResult& result);
+std::optional<ControlJoinResult> decodeControlJoinResult(const std::string& bytes);
 
 }  // namespace timestar::control

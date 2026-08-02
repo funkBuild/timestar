@@ -177,16 +177,20 @@ seastar::future<> Group0Controller::admitNode(NodeRecord record) {
 }
 
 seastar::future<bool> Group0Controller::mintJoinToken(std::string token) {
-    if (token.empty() || sm_.state().joinTokens.contains(token))
+    if (!validJoinToken(token) || sm_.state().joinTokens.size() >= kMaxOutstandingJoinTokens ||
+        sm_.state().joinTokens.contains(token))
         co_return false;
-    co_return co_await proposeCommand(MintJoinToken{std::move(token)});
+    const std::string expected = token;
+    if (!co_await proposeCommand(MintJoinToken{std::move(token)}))
+        co_return false;
+    co_return sm_.state().joinTokens.contains(expected);
 }
 
 seastar::future<bool> Group0Controller::admitNodeWithToken(NodeRecord record, std::string token) {
     // The token is validated + consumed atomically at apply time; the command
     // is a no-op if the token is invalid. Reconcile runs as a separate step.
     record.state = NodeState::Joining;
-    if (!g0_.isLeader())
+    if (!g0_.isLeader() || !validJoinToken(token))
         co_return false;
     if (auto it = sm_.state().nodes.find(record.raftId); it != sm_.state().nodes.end()) {
         if (!sameNodeIdentity(it->second, record))

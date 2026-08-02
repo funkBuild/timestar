@@ -142,6 +142,44 @@ TEST(ControlCommandCodecTest, NodeCapabilitiesRoundTripAndFailClosed) {
     EXPECT_THROW(encodeNodeCapabilityAdvertisement(invalid), std::invalid_argument);
 }
 
+TEST(ControlCommandCodecTest, ControlJoinFramesRoundTripAndFailClosed) {
+    const ControlJoinRequest request{
+        std::string(32, 'a'),
+        NodeRecord{7, std::string(32, 'b'), "node-7.example:8086", "rack-a", NodeState::Joining},
+        "one-use-token"};
+    const std::string encoded = encodeControlJoinRequest(request);
+    auto decoded = decodeControlJoinRequest(encoded);
+    ASSERT_TRUE(decoded);
+    EXPECT_EQ(*decoded, request);
+    for (size_t n = 0; n < encoded.size(); ++n)
+        EXPECT_FALSE(decodeControlJoinRequest(encoded.substr(0, n))) << "prefix " << n;
+
+    std::string trailing = encoded;
+    trailing.push_back('\0');
+    EXPECT_FALSE(decodeControlJoinRequest(trailing));
+    auto invalid = request;
+    invalid.record.state = NodeState::Active;
+    EXPECT_THROW(encodeControlJoinRequest(invalid), std::invalid_argument);
+    invalid = request;
+    invalid.token.assign(kMaxJoinTokenBytes + 1, 'x');
+    EXPECT_THROW(encodeControlJoinRequest(invalid), std::invalid_argument);
+
+    for (const auto result :
+         {ControlJoinResult{ControlJoinStatus::NotLeader, 0},
+          ControlJoinResult{ControlJoinStatus::Rejected, 1},
+          ControlJoinResult{ControlJoinStatus::Joining, 1},
+          ControlJoinResult{ControlJoinStatus::Active, 1}}) {
+        const auto resultBytes = encodeControlJoinResult(result);
+        EXPECT_EQ(decodeControlJoinResult(resultBytes), result);
+        for (size_t n = 0; n < resultBytes.size(); ++n)
+            EXPECT_FALSE(decodeControlJoinResult(resultBytes.substr(0, n))) << "prefix " << n;
+    }
+    EXPECT_THROW(encodeControlJoinResult({ControlJoinStatus::Active, 0}), std::invalid_argument);
+    std::string unknown = encodeControlJoinResult({ControlJoinStatus::Rejected, 1});
+    unknown[1] = static_cast<char>(0xff);
+    EXPECT_FALSE(decodeControlJoinResult(unknown));
+}
+
 TEST(ControlCommandCodecTest, CoveredActivationCannotTruncateIntoLegacyActivation) {
     const std::string covered = encodeCommand(SetActiveVersion{5, {1, 2, 3}});
     for (size_t n = 0; n < covered.size(); ++n)

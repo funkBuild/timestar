@@ -183,12 +183,17 @@ constexpr uint32_t kWriteBatchFormatV6 = 6;
 // v2; the new point only says the peer knows this separate RPC verb and reply shape.
 constexpr uint32_t kWriteBatchFormatV7 = 7;
 
+// v8 is a PROTOCOL-only token-authorized group-0 join exchange. It lets an
+// already-running observer ask the current controller to admit its persistent
+// identity and add it as a learner. WriteBatch and snapshot bytes are unchanged.
+constexpr uint32_t kWriteBatchFormatV8 = 8;
+
 // The newest version this binary supports. Every place that advertises this node's
 // capability must use THIS, never the literal that happens to be current: naming v2 in
 // ClusterDataPlane after v3 landed capped every negotiation at 2, so no peer spoke the
 // hinted-propose verb and the leader-hint path was dead in production while every test
 // passed (tests construct their own DataPlaneRpc, whose default was already correct).
-constexpr uint32_t kWriteBatchFormatMax = kWriteBatchFormatV7;
+constexpr uint32_t kWriteBatchFormatMax = kWriteBatchFormatV8;
 
 // Wire codec (bounds-checked; decode returns nullopt on ANY malformed/truncated/
 // inconsistent input so a hostile frame can never fabricate a batch). Bounds-checking

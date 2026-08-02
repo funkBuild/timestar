@@ -31,6 +31,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <glaze/json.hpp>
 #include <seastar/core/app-template.hh>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/prometheus.hh>
@@ -125,6 +126,10 @@ static const std::string& authToken() {
     auto* p = g_authToken.load(std::memory_order_acquire);
     return p ? *p : empty;
 }
+
+struct ClusterJoinRequestBody {
+    std::string token;
+};
 
 static std::string readClusterCredential(const std::string& path, const char* label) {
     std::ifstream in(path, std::ios::binary);
@@ -346,6 +351,107 @@ void set_routes(routes& r) {
             rep->_content = "{\"status\":\"success\",\"transfers_initiated\":" + std::to_string(moved) +
                             ",\"vshards_led_before\":" + std::to_string(before) +
                             ",\"vshards_led_after\":" + std::to_string(after) + "}";
+            co_return std::move(rep);
+        });
+
+    // Join tokens are bearer authority, so these routes stay unavailable when
+    // server authentication is disabled even though ordinary data endpoints
+    // support an unauthenticated development mode.
+    timestar::http::addJsonRoute(
+        r, operation_type::POST, "/cluster/join-token", authToken(),
+        [](std::unique_ptr<seastar::http::request>,
+           std::unique_ptr<seastar::http::reply> rep) -> seastar::future<std::unique_ptr<seastar::http::reply>> {
+            if (authToken().empty()) {
+                rep->set_status(seastar::http::reply::status_type::unauthorized);
+                rep->_content = R"({"status":"error","message":"cluster join-token minting requires server authentication"})";
+                co_return std::move(rep);
+            }
+            if (!g_clusterPartitioned) {
+                rep->set_status(seastar::http::reply::status_type::bad_request);
+                rep->_content = R"({"status":"error","message":"node is not clustered"})";
+                co_return std::move(rep);
+            }
+            const std::string token = timestar::http::generateToken(32);
+            try {
+                const auto result = co_await seastar::smp::submit_to(
+                    0u, [token] { return g_clusterDataPlane.mintControlJoinToken(token); });
+                if (!result.minted) {
+                    rep->set_status(result.leader == timestar::raft::kNoNode
+                                        ? seastar::http::reply::status_type::service_unavailable
+                                        : seastar::http::reply::status_type::conflict);
+                    rep->_content = "{\"status\":\"error\",\"message\":\"this node is not the control "
+                                    "leader or the outstanding-token limit is reached\",\"leader\":" +
+                                    std::to_string(result.leader) + "}";
+                    co_return std::move(rep);
+                }
+                rep->add_header("Cache-Control", "no-store");
+                rep->set_status(seastar::http::reply::status_type::ok);
+                rep->_content = "{\"status\":\"success\",\"token\":\"" +
+                                timestar::jsonEscape(token) + "\"}";
+            } catch (const std::exception& e) {
+                rep->set_status(seastar::http::reply::status_type::service_unavailable);
+                rep->_content = "{\"status\":\"error\",\"message\":\"" +
+                                timestar::jsonEscape(e.what()) + "\"}";
+            }
+            co_return std::move(rep);
+        });
+
+    timestar::http::addJsonRoute(
+        r, operation_type::POST, "/cluster/join", authToken(),
+        [](std::unique_ptr<seastar::http::request> req,
+           std::unique_ptr<seastar::http::reply> rep) -> seastar::future<std::unique_ptr<seastar::http::reply>> {
+            if (authToken().empty()) {
+                rep->set_status(seastar::http::reply::status_type::unauthorized);
+                rep->_content = R"({"status":"error","message":"cluster join requires server authentication"})";
+                co_return std::move(rep);
+            }
+            if (!g_clusterPartitioned) {
+                rep->set_status(seastar::http::reply::status_type::bad_request);
+                rep->_content = R"({"status":"error","message":"node is not clustered"})";
+                co_return std::move(rep);
+            }
+            if (req->content.size() > 4096) {
+                rep->set_status(seastar::http::reply::status_type::bad_request);
+                rep->_content = R"({"status":"error","message":"join request is too large"})";
+                co_return std::move(rep);
+            }
+            ClusterJoinRequestBody body;
+            if (auto error = glz::read_json(body, req->content); error || !timestar::control::validJoinToken(body.token)) {
+                rep->set_status(seastar::http::reply::status_type::bad_request);
+                rep->_content = R"({"status":"error","message":"a valid token is required"})";
+                co_return std::move(rep);
+            }
+            try {
+                const auto result = co_await seastar::smp::submit_to(
+                    0u, [token = std::move(body.token)]() mutable {
+                        return g_clusterDataPlane.joinControlPlane(std::move(token));
+                    });
+                const std::string leader = std::to_string(result.leader);
+                switch (result.status) {
+                    case timestar::control::ControlJoinStatus::Active:
+                        rep->set_status(seastar::http::reply::status_type::ok);
+                        rep->_content = "{\"status\":\"active\",\"leader\":" + leader + "}";
+                        break;
+                    case timestar::control::ControlJoinStatus::Joining:
+                        rep->set_status(seastar::http::reply::status_type::ok);
+                        rep->_content = "{\"status\":\"joining\",\"leader\":" + leader +
+                                        ",\"retry\":true}";
+                        break;
+                    case timestar::control::ControlJoinStatus::NotLeader:
+                        rep->set_status(seastar::http::reply::status_type::conflict);
+                        rep->_content = "{\"status\":\"error\",\"message\":\"control leader is not known or "
+                                        "changed\",\"leader\":" + leader + "}";
+                        break;
+                    case timestar::control::ControlJoinStatus::Rejected:
+                        rep->set_status(seastar::http::reply::status_type::unauthorized);
+                        rep->_content = "{\"status\":\"rejected\",\"leader\":" + leader + "}";
+                        break;
+                }
+            } catch (const std::exception& e) {
+                rep->set_status(seastar::http::reply::status_type::service_unavailable);
+                rep->_content = "{\"status\":\"error\",\"message\":\"" +
+                                timestar::jsonEscape(e.what()) + "\"}";
+            }
             co_return std::move(rep);
         });
 

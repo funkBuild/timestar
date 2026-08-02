@@ -1310,9 +1310,17 @@ is not completion.
   clusters. Startup/config/host/controller evidence passes 11/11, the complete
   config validation suite passes 62/62, and the affected socket composition
   passes 7 tests with 2 SMP>1-only skips; the production server target builds.
-  **Still open:** there is no seed join/token RPC to add observers to the real
-  group and no dynamic effective-membership/cutover command or ordered live-map
-  reconciler. The initial committed map is intentionally single-assignment;
+  Authenticated operator endpoints now mint a cryptographically random,
+  replicated one-use token on the current control leader and ask the joining
+  node to present that token plus its own persistent identity over the mTLS
+  data plane. Protocol v8 returns a typed leader/pending/active result. Exact
+  retries survive token consumption and ambiguous membership timeouts; the
+  controller adds only a learner, requires full-tail acknowledgement before
+  `Active`, then requires catch-up through that transition before voter
+  reconciliation. Token/frame size and outstanding-token count are bounded and
+  snapshot recovery rejects an over-limit state. **Still open:** there is no
+  dynamic effective-membership/cutover command or ordered live-map reconciler.
+  The initial committed map is intentionally single-assignment;
   static placement remains the only permitted content until VShard movement can
   prove the destination ready before cutover. The host now
   snapshots after 1,024 newly applied control entries on a 60-second maintenance
@@ -1349,9 +1357,10 @@ is not completion.
   fresh non-seed is only an inert observer that knows the seed voter set, not a
   replicated group-0 learner/member. `activateFormat` now refuses every covered
   data voter that is neither a stable group-0 voter nor learner, so capability
-  cannot be mistaken for delivery. The join/token RPC and actuator that turn
-  these collected ranges into a safe activation are still absent; this task is
-  not closed.
+  cannot be mistaken for delivery. The token-authorized join RPC now supplies
+  that membership, but the capability/receipt-preflight actuator that turns the
+  collected ranges into a safe activation is still absent; this task is not
+  closed.
 - [ ] **CR-FIX-022 — wire resumable join, drain, remove, replace, and VShard
   movement.** Owner: movement/control plane. Include learner catch-up, verified
   snapshot, log catch-up, joint consensus, leadership transfer, cutover, and
@@ -1372,7 +1381,9 @@ is not completion.
   final `Cnew` that has been appended but not committed now continues to fence
   new membership proposals, so a timeout/retry cannot overlap transitions.
   Focused controller/host/Raft consensus evidence passes 50/50. The production
-  join RPC, retrying orchestration, and data-VShard movement remain open.
+  v8 join RPC is operator-retryable and uses those exact controller seams; its
+  codec/limit and real-socket tests pass. An automatic retry/job driver and
+  data-VShard movement remain open.
 - [ ] **CR-FIX-023 — implement ordered VShard teardown and reclaim-floor
   retirement.** Owner: movement/snapshot. **Done when:** both per-VShard and
   shared journals reclaim departed groups, re-adding the same VShard cannot
@@ -1596,17 +1607,18 @@ is not completion.
   counters. Pre-v7 peers are refused before the new verb is sent. Activation
   additionally requires every covered data voter to be a stable group-0 voter
   or learner, which proves the committed decision can be delivered rather than
-  merely decoded. **Still open:** add the seed join/token orchestration and
-  capability/receipt-preflight actuator that can safely originate an activation,
-  preflight legacy receipt counts, and run old/new multi-process snapshot and
-  command tests.
+  merely decoded. Protocol v8 now wires one-use token minting and an
+  operator-retryable observer-to-learner join through the production server.
+  **Still open:** add the capability/receipt-preflight actuator that can safely
+  originate an activation, preflight legacy receipt counts, and run old/new
+  multi-process snapshot and command tests.
   Because no production path originates an activation, this fail-closed slice
   deliberately leaves clustered readiness false, exact bounded deletes
   unavailable below v5, and frozen pattern deletes unavailable below v6; it does
   not close this task. The scalar negotiation response is deliberately not
   treated as an advertised maximum; the v7 reply is the exact range/identity
-  source. The remaining actuator must admit each node as a group-0 learner/member
-  before including it in an activation proof, because observers do not receive
+  source. The remaining actuator may include a node only after the v8 join path
+  has made it a group-0 learner/member, because observers do not receive
   committed group-0 state. Once version N is committed,
   the state machine cannot lower it and a binary whose maximum supported version
   is below N must not start against that data. Rollback requires restoring a
@@ -1712,8 +1724,27 @@ is not completion.
   cannot receive the activation can never authorize emission. Codec truncation,
   validator conflict, real loopback identity/range/pre-v7 refusal, and
   three-node delivery regressions pass. This closes the collector/delivery-fence
-  slice, not CR-FIX-076: join orchestration, the activation/legacy-receipt
-  preflight actuator, and mixed-binary live evidence remain open.
+  slice, not CR-FIX-076: the v8 join path now supplies delivery membership, but
+  the activation/legacy-receipt preflight actuator and mixed-binary live evidence
+  remain open.
+- [x] **CR-FIX-083 — wire bounded, token-authorized group-0 observer
+  admission.** Owner: control plane/security. Protocol v8 carries a canonical
+  cluster UUID, the joining node's persistent record, and one-use token over the
+  mTLS data plane; pre-v8 clients refuse before sending the unknown verb. The
+  current controller atomically consumes the token, adds only a learner, commits
+  `Active` after a current-tail acknowledgement, and does not report completion
+  until the learner acknowledges that activation entry too. Exact retries remain
+  valid after token consumption or an ambiguous membership timeout, and a
+  non-leader reply can redirect once to the observed controller. Authenticated
+  `POST /cluster/join-token` and `POST /cluster/join` expose the workflow without
+  putting the secret in TOML or a process argument; both refuse operation when
+  server bearer authentication is disabled. Individual tokens, join frames, and
+  the replicated outstanding-token set are bounded, including snapshot recovery.
+  **Evidence limitation:** deterministic controller/codec tests and real loopback
+  RPC tests pass and the server builds, but the required three-process
+  mint/join/restart/leader-change gate has not run in this memory-constrained
+  review. CR-FIX-021/022 remain open for dynamic serving-map reconciliation and
+  data-VShard movement; CR-FIX-076 remains open for activation/preflight.
 
 ## Release exit criteria
 
@@ -2129,9 +2160,9 @@ starvation path; the sustained live workload must still show that snapshots
 keep advancing and journal bytes plateau or reclaim.
 CR-FIX-076 remains an activation blocker: `9ecd0e6` prevents unsafe emission and
 false readiness, and CR-FIX-082 supplies exact identity/range collection plus
-the delivery-membership fence, but production join/activation orchestration,
-legacy-receipt preflight, downgrade enforcement, and mixed-binary evidence are
-still missing.
+the delivery-membership fence. Protocol v8 now supplies the operator-driven
+join path; activation actuation, legacy-receipt preflight, downgrade enforcement,
+and mixed-binary evidence are still missing.
 
 Receiver-side data proposal deadline validation for CR-FIX-081:
 
@@ -2170,4 +2201,21 @@ build and repository-local 4 KiB temporary tree respect the host-memory limit.
 This proves exact v7 framing, pre-v7 refusal, identity/range consistency,
 partial and complete topology validation, status/readiness behavior, and
 delivery membership in deterministic and loopback tests. It does not replace
-the remaining join/activation actuator or mixed-binary live gate.
+the remaining activation/receipt-preflight actuator or mixed-binary live gate.
+
+Token-authorized production join validation:
+
+```text
+join/codec/controller/feature focused unit tests: 20/20 passed
+v7 capability + v8 join real-socket tests:          2/2 passed
+timestar_unit_test:                     built successfully (-j1)
+timestar_cluster_socket_test:           built successfully (-j1)
+timestar_http_server:                   built successfully (-j1)
+all test processes:                            --smp 1 --memory 1G
+compiler and test temporary directory:                   build/tmp
+```
+
+No live or multi-process server was started. This proves bounded v8 framing,
+pre-v8 refusal, token limits, controller admission idempotency, and the real RPC
+dispatch/result path. The remaining production evidence is a three-process
+operator join through the HTTP endpoints, including leader change and restart.

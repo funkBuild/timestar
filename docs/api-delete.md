@@ -20,8 +20,9 @@ host, and an already committed activation is published to every reactor-local
 data gate before group 0 advances its applied boundary. No production path can
 yet safely originate activation: exact v7 identity/full-range collection now
 covers the static data voters and activation refuses observers that are not
-group-0 members, but join orchestration and the legacy-receipt preflight
-actuator are incomplete. Pattern plans also require v6. These
+group-0 members. Protocol v8 now admits observers as caught-up learners with
+one-use tokens, but the legacy-receipt preflight/activation actuator is
+incomplete. Pattern plans also require v6. These
 operations are therefore intentionally unavailable in the current production
 composition and cluster readiness remains false; do not deploy them as a
 production delete path.

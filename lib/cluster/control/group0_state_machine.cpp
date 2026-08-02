@@ -84,9 +84,9 @@ struct SR {
             ok = false;
         return state;
     }
-    std::string str() {
+    std::string str(uint64_t maxBytes = std::numeric_limits<uint64_t>::max()) {
         uint64_t n = u64();
-        if (!ok || !avail(n)) {
+        if (!ok || n > maxBytes || !avail(n)) {
             ok = false;
             return {};
         }
@@ -238,8 +238,10 @@ bool validSnapshotState(const Group0State& state) {
     for (const auto& [id, job] : state.jobs)
         if (id.empty() || id != job.id)
             return false;
+    if (state.joinTokens.size() > kMaxOutstandingJoinTokens)
+        return false;
     for (const auto& token : state.joinTokens)
-        if (token.empty())
+        if (!validJoinToken(token))
             return false;
     if (!validFrozenDeletePlanState(state))
         return false;
@@ -460,13 +462,15 @@ bool Group0StateMachine::applyCommand(const ControlCommand& cmd) {
                     }
                 }
             } else if constexpr (std::is_same_v<T, MintJoinToken>) {
-                if (c.token.empty() || !state_.joinTokens.insert(c.token).second)
+                if (!validJoinToken(c.token) || state_.joinTokens.size() >= kMaxOutstandingJoinTokens ||
+                    !state_.joinTokens.insert(c.token).second)
                     ok = false;
             } else if constexpr (std::is_same_v<T, AdmitWithToken>) {
                 // Admit ONLY on a valid unused token, consumed atomically. An
                 // invalid/replayed token is a no-op (never implicitly initialize).
                 auto it = state_.joinTokens.find(c.token);
-                if (it != state_.joinTokens.end() && validNodeRecord(state_, c.record)) {
+                if (validJoinToken(c.token) && it != state_.joinTokens.end() &&
+                    validNodeRecord(state_, c.record)) {
                     state_.joinTokens.erase(it);
                     NodeRecord record = c.record;
                     // Admission is a state-machine invariant, not merely a
@@ -696,11 +700,11 @@ bool Group0StateMachine::decodeSnapshot(const std::string& data, Group0State& de
             r.ok = false;
     }
     uint64_t nTok = r.u64();
-    if (!r.ok || nTok > static_cast<uint64_t>(r.end - r.p) / 8)
+    if (!r.ok || nTok > kMaxOutstandingJoinTokens || nTok > static_cast<uint64_t>(r.end - r.p) / 8)
         r.ok = false;  // each token has at least its string length
     for (uint64_t i = 0; i < nTok && r.ok; ++i) {
-        auto token = r.str();
-        if (r.ok && !s.joinTokens.insert(std::move(token)).second)
+        auto token = r.str(kMaxJoinTokenBytes);
+        if (r.ok && (!validJoinToken(token) || !s.joinTokens.insert(std::move(token)).second))
             r.ok = false;
     }
     // Trailing, optional for backward compatibility: a pre-format-version snapshot has

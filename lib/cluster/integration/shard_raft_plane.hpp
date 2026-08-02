@@ -128,7 +128,8 @@ struct DataPlaneTls {
 // seastar::sharded<ShardRaftPlane>, so each reactor ticks only its own groups.
 class ShardRaftPlane : public data::ProposeSink,
                        public data::ReadIndexSink,
-                       public data::FrozenDeletePlanSink {
+                       public data::FrozenDeletePlanSink,
+                       public data::ControlJoinSink {
 public:
     seastar::future<> init(seastar::sharded<Engine>* engines, seastar::sharded<ShardRaftPlane>* peers,
                            const data::VShardDirectory* dir, data::NodeId self, std::string journalRoot,
@@ -270,6 +271,7 @@ public:
         rpc_->setProposeSink(*this);
         rpc_->setReadIndexSink(*this);
         rpc_->setFrozenDeletePlanSink(*this);
+        rpc_->setControlJoinSink(*this);
         return rpc_->start(local, *queryStore_, /*perShardListener=*/true);
     }
 
@@ -301,6 +303,51 @@ public:
         co_return co_await controller.freezeDeletePlan(
             std::move(request.plan),
             seastar::lowres_clock::now() + data::ReplicatedBatchWriteRouter::kAttemptTimeout);
+    }
+
+    seastar::future<control::ControlJoinResult> handleControlJoin(
+        control::ControlJoinRequest request) override {
+        if (seastar::this_shard_id() != 0) {
+            auto* peers = peers_;
+            co_return co_await peers->invoke_on(
+                0, [request = std::move(request)](ShardRaftPlane& plane) mutable {
+                    return plane.handleControlJoin(std::move(request));
+                });
+        }
+        if (!group0_ || !group0_->group() || !group0_->stateMachine())
+            co_return control::ControlJoinResult{control::ControlJoinStatus::NotLeader, raft::kNoNode};
+        auto* group = group0_->group();
+        const auto currentLeader = [&] { return group->isLeader() ? group->node().id() : group->leader(); };
+        if (!group->isLeader())
+            co_return control::ControlJoinResult{control::ControlJoinStatus::NotLeader, currentLeader()};
+        if (request.clusterUuid != group0_->state().clusterUuid)
+            co_return control::ControlJoinResult{control::ControlJoinStatus::Rejected, currentLeader()};
+
+        control::Group0Controller controller(*group, *group0_->stateMachine());
+        if (!co_await controller.admitNodeWithToken(request.record, std::move(request.token))) {
+            if (!group->isLeader())
+                co_return control::ControlJoinResult{control::ControlJoinStatus::NotLeader, currentLeader()};
+            co_return control::ControlJoinResult{control::ControlJoinStatus::Rejected, currentLeader()};
+        }
+        if (!co_await controller.addLearner(request.record.raftId)) {
+            if (!group->isLeader())
+                co_return control::ControlJoinResult{control::ControlJoinStatus::NotLeader, currentLeader()};
+            co_return control::ControlJoinResult{control::ControlJoinStatus::Joining, currentLeader()};
+        }
+        if (controller.learnerCaughtUp(request.record.raftId))
+            (void)co_await controller.activateCaughtUpLearner(request.record.raftId);
+
+        const auto found = group0_->state().nodes.find(request.record.raftId);
+        const bool active = found != group0_->state().nodes.end() &&
+                            found->second.state == control::NodeState::Active;
+        const bool caughtUpAfterActivation = group->node().config().isVoter(request.record.raftId) ||
+                                             controller.learnerCaughtUp(request.record.raftId);
+        if (active && caughtUpAfterActivation)
+            (void)co_await controller.reconcileMetaVoters();
+        co_return control::ControlJoinResult{
+            active && caughtUpAfterActivation ? control::ControlJoinStatus::Active
+                                               : control::ControlJoinStatus::Joining,
+            currentLeader()};
     }
 
     // ProposeSink: a peer forwarded a batch because this NODE leads those VShards. The

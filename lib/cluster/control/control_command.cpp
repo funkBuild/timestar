@@ -9,6 +9,8 @@ namespace {
 
 constexpr uint8_t kNodeCapabilityFrameTag = 1;
 constexpr size_t kMaxNodeCapabilityFrameBytes = 4096;
+constexpr uint8_t kControlJoinRequestFrameTag = 1;
+constexpr uint8_t kControlJoinResultFrameTag = 1;
 
 bool canonicalHex128(const std::string& value) {
     if (value.size() != 32)
@@ -25,6 +27,21 @@ bool validNodeCapability(const NodeCapabilityAdvertisement& capability) {
            capability.record.address.size() <= 1024 && !capability.record.failureDomain.empty() &&
            capability.record.failureDomain.size() <= 1024 && capability.formats.min != 0 &&
            capability.formats.min <= capability.formats.max;
+}
+
+bool validControlJoinRequest(const ControlJoinRequest& request) {
+    return canonicalHex128(request.clusterUuid) && request.record.raftId != raft::kNoNode &&
+           canonicalHex128(request.record.uuid) && !request.record.address.empty() &&
+           request.record.address.size() <= 1024 && !request.record.failureDomain.empty() &&
+           request.record.failureDomain.size() <= 1024 && request.record.state == NodeState::Joining &&
+           validJoinToken(request.token);
+}
+
+bool validControlJoinResult(const ControlJoinResult& result) {
+    if (result.status > ControlJoinStatus::Active)
+        return false;
+    return (result.status == ControlJoinStatus::NotLeader || result.status == ControlJoinStatus::Rejected) ||
+           result.leader != raft::kNoNode;
 }
 
 struct Writer {
@@ -229,6 +246,10 @@ FrozenDeletePlan readFrozenDeletePlan(Reader& r) {
 }  // namespace
 
 std::string encodeCommand(const ControlCommand& cmd) {
+    if (const auto* mint = std::get_if<MintJoinToken>(&cmd); mint && !validJoinToken(mint->token))
+        throw std::invalid_argument("invalid group-0 join token");
+    if (const auto* admission = std::get_if<AdmitWithToken>(&cmd); admission && !validJoinToken(admission->token))
+        throw std::invalid_argument("invalid group-0 admission token");
     Writer w;
     std::visit(
         [&](const auto& c) {
@@ -399,6 +420,11 @@ std::optional<ControlCommand> decodeCommand(const std::string& bytes) {
     // only its old prefix, permanently diverging group-0 state.
     if (!r.ok || r.p != r.end)
         return std::nullopt;
+    if (const auto* mint = std::get_if<MintJoinToken>(&cmd); mint && !validJoinToken(mint->token))
+        return std::nullopt;
+    if (const auto* admission = std::get_if<AdmitWithToken>(&cmd);
+        admission && !validJoinToken(admission->token))
+        return std::nullopt;
     return cmd;
 }
 
@@ -492,6 +518,57 @@ std::optional<NodeCapabilityAdvertisement> decodeNodeCapabilityAdvertisement(con
     if (!r.ok || r.p != r.end || !validNodeCapability(capability))
         return std::nullopt;
     return capability;
+}
+
+std::string encodeControlJoinRequest(const ControlJoinRequest& request) {
+    if (!validControlJoinRequest(request))
+        throw std::invalid_argument("invalid control join request");
+    Writer w;
+    w.u8(kControlJoinRequestFrameTag);
+    w.str(request.clusterUuid);
+    writeNode(w, request.record);
+    w.str(request.token);
+    if (w.out.size() > kMaxControlJoinFrameBytes)
+        throw std::invalid_argument("control join request exceeds its wire bound");
+    return std::move(w.out);
+}
+
+std::optional<ControlJoinRequest> decodeControlJoinRequest(const std::string& bytes) {
+    if (bytes.size() > kMaxControlJoinFrameBytes)
+        return std::nullopt;
+    Reader r{bytes.data(), bytes.data() + bytes.size()};
+    if (r.u8() != kControlJoinRequestFrameTag)
+        return std::nullopt;
+    ControlJoinRequest request;
+    request.clusterUuid = r.str();
+    request.record = readNode(r);
+    request.token = r.str();
+    if (!r.ok || r.p != r.end || !validControlJoinRequest(request))
+        return std::nullopt;
+    return request;
+}
+
+std::string encodeControlJoinResult(const ControlJoinResult& result) {
+    if (!validControlJoinResult(result))
+        throw std::invalid_argument("invalid control join result");
+    Writer w;
+    w.u8(kControlJoinResultFrameTag);
+    w.u8(static_cast<uint8_t>(result.status));
+    w.u64(result.leader);
+    return std::move(w.out);
+}
+
+std::optional<ControlJoinResult> decodeControlJoinResult(const std::string& bytes) {
+    Reader r{bytes.data(), bytes.data() + bytes.size()};
+    if (r.u8() != kControlJoinResultFrameTag)
+        return std::nullopt;
+    const uint8_t status = r.u8();
+    if (status > static_cast<uint8_t>(ControlJoinStatus::Active))
+        return std::nullopt;
+    ControlJoinResult result{static_cast<ControlJoinStatus>(status), r.u64()};
+    if (!r.ok || r.p != r.end || !validControlJoinResult(result))
+        return std::nullopt;
+    return result;
 }
 
 }  // namespace timestar::control

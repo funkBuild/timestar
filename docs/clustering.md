@@ -953,8 +953,9 @@ gate is committed.
 The implemented ordered capability line currently reserves v2 for self-contained
 snapshot payloads, v3 for legacy durable delete receipts, v4 for node-query
 redirects, v5 for bounded delete command tag 5, snapshot payload v4, and the
-typed `Expired` proposal result, v6 for frozen pattern-delete plans, and v7 for
-the exact identity/full-range capability RPC. Emission fails closed: snapshots
+typed `Expired` proposal result, v6 for frozen pattern-delete plans, v7 for
+the exact identity/full-range capability RPC, and v8 for token-authorized
+group-0 observer admission. Emission fails closed: snapshots
 require at least v2, and bounded deletes require both committed format v5 and
 peer protocol v5.
 Decoders continue to read historical formats regardless of the active emission
@@ -973,11 +974,11 @@ full range under one bounded fan-out. It reports incomplete/transient collection
 separately from permanent identity conflict. Activation nevertheless refuses a
 covered node until it is a group-0 voter or learner: capability is not proof that
 an observer receives the committed decision.
-Fresh observers still lack a seed/join RPC. Static placement remains authoritative
-and a fresh data plane remains at format v1, so snapshot production and bounded
-deletes are refused and readiness stays false. Production enablement still
-requires join admission plus the activation/legacy-receipt preflight actuator
-and mixed-binary tests.
+Fresh observers can now join through a one-use token and the v8 inter-node RPC;
+membership does not change static data placement. A fresh data plane therefore
+still remains at format v1, so snapshot production and bounded deletes are
+refused and readiness stays false. Production enablement still requires the
+activation/legacy-receipt preflight actuator and mixed-binary tests.
 
 Format activation is monotonic. Once version N is committed, a binary whose
 maximum supported version is below N must not start against that node data and a
@@ -1060,12 +1061,19 @@ variable exist only for local test gates; they are not production settings.
 
 On a fresh seed data directory, start once with `--cluster-init`; ordinary
 startup never initializes group 0 implicitly. Existing group-0 journals recover,
-and fresh non-seed nodes host inert observers. The seed/token admission RPC that
-promotes those observers is still outstanding, so this opt-in is not yet a
-multi-node production bootstrap procedure.
+and fresh non-seed nodes host inert observers. With server authentication
+enabled, `POST /cluster/join-token` on the current control leader mints a
+replicated one-use token. Send it in `{"token":"..."}` to
+`POST /cluster/join` on the fresh node and retry while the response says
+`joining`; the node presents its bound identity over the mTLS data plane and the
+controller returns `active` only after learner catch-up through its activation
+record. Join tokens are returned with `Cache-Control: no-store`, are limited to
+1,024 bytes, and at most 1,024 may remain outstanding. Keep both endpoints behind
+a TLS-protected operator ingress; they refuse operation when server bearer
+authentication is disabled.
 
-The controller-side admission sequence is fail-closed even before that RPC is
-wired: token admission records `Joining`, adds the node only as a learner,
+The controller-side admission sequence remains fail-closed: token admission
+records `Joining`, adds the node only as a learner,
 requires a recent acknowledgement of the complete leader log before committing
 `Active`, then requires catch-up through that state transition before voter
 reconciliation. Reconciliation cannot promote an unknown or lagging node.

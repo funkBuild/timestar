@@ -413,6 +413,16 @@ public:
     seastar::future<std::map<NodeId, control::NodeCapabilityAdvertisement>> collectControlCapabilities(
         data::OptDeadline deadline = std::nullopt);
 
+    struct ControlTokenMintResult {
+        bool minted = false;
+        NodeId leader = raft::kNoNode;
+    };
+    // Operator-facing group-0 admission seams. Token minting is accepted only
+    // by the current controller. A joining observer presents its own persistent
+    // identity; Joining is an idempotent, retryable learner-catch-up result.
+    seastar::future<ControlTokenMintResult> mintControlJoinToken(std::string token);
+    seastar::future<control::ControlJoinResult> joinControlPlane(std::string token);
+
     // Fail startup before accepting traffic when the configured reactor count
     // cannot produce complete single-core VShard snapshots.
     static void validateCoreTopology(unsigned coreCount, uint16_t replicationFactor);
@@ -495,6 +505,7 @@ private:
     // exact configured identity separately for capability validation; UUID
     // comparisons are byte-exact so a probe cannot silently cross clusters.
     std::string controlClusterUuid_;
+    NodeId controlSeedNode_ = raft::kNoNode;
     bool group0BootstrapRequested_ = false;
     // Everything this binary can read and write. Pushed to every per-shard transport
     // in start(), so peers negotiate against the node's REAL capability; leaving it at

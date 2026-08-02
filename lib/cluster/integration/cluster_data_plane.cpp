@@ -226,6 +226,7 @@ seastar::future<> ClusterDataPlane::startImpl(const ClusterConfig& cfg, seastar:
     rf_ = cfg.replication_factor < 1 ? 1 : cfg.replication_factor;
     controlEnabled_ = cfg.control_enabled;
     controlClusterUuid_ = cfg.control_enabled ? cfg.cluster_uuid : std::string{};
+    controlSeedNode_ = cfg.control_enabled ? cfg.control_seed_node_id : raft::kNoNode;
     dir_ = std::make_unique<data::VShardDirectory>(rt_->directory());
     local_ = std::make_unique<EngineLocalStore>(engines);
     rpc_ = std::make_unique<data::DataPlaneRpc>();
@@ -766,6 +767,49 @@ ClusterDataPlane::collectControlCapabilities(data::OptDeadline deadline) {
         std::rethrow_exception(firstFailure);
     (void)validateNodeCapabilities(controlClusterUuid_, rt_->peerAddresses, collected);
     co_return collected;
+}
+
+seastar::future<ClusterDataPlane::ControlTokenMintResult> ClusterDataPlane::mintControlJoinToken(
+    std::string token) {
+    if (!controlEnabled_ || !shardsStarted_ || !control::validJoinToken(token))
+        throw std::invalid_argument("cluster: group-0 token minting is not configured or the token is invalid");
+    co_return co_await shards_.invoke_on(
+        0, [token = std::move(token)](ShardRaftPlane& plane) mutable -> seastar::future<ControlTokenMintResult> {
+            auto* host = plane.group0();
+            if (!host || !host->group() || !host->stateMachine())
+                co_return ControlTokenMintResult{};
+            auto* group = host->group();
+            const NodeId leader = group->isLeader() ? group->node().id() : group->leader();
+            if (!group->isLeader())
+                co_return ControlTokenMintResult{false, leader};
+            control::Group0Controller controller(*group, *host->stateMachine());
+            co_return ControlTokenMintResult{co_await controller.mintJoinToken(std::move(token)), leader};
+        });
+}
+
+seastar::future<control::ControlJoinResult> ClusterDataPlane::joinControlPlane(std::string token) {
+    if (!controlEnabled_ || !shardsStarted_ || !rt_ || !rpc_ || !group0Identity_ ||
+        !control::validJoinToken(token) || controlSeedNode_ == raft::kNoNode)
+        throw std::invalid_argument("cluster: group-0 join is not configured or the token is invalid");
+
+    control::ControlJoinRequest request{controlClusterUuid_, *group0Identity_, std::move(token)};
+    request.record.state = control::NodeState::Joining;
+    NodeId target = controlSeedNode_;
+    auto* localHost = shards_.local().group0();
+    if (localHost && localHost->group() && localHost->group()->leader() != raft::kNoNode)
+        target = localHost->group()->leader();
+    const auto deadline = seastar::lowres_clock::now() + control::Group0Controller::kDefaultProposalTimeout +
+                          std::chrono::seconds(1);
+    auto send = [this, &request, deadline](NodeId to) {
+        if (to == rt_->selfId)
+            return shards_.local().handleControlJoin(request);
+        return rpc_->controlJoin(to, request, deadline);
+    };
+    auto result = co_await send(target);
+    if (result.status == control::ControlJoinStatus::NotLeader && result.leader != raft::kNoNode &&
+        result.leader != target)
+        result = co_await send(result.leader);
+    co_return result;
 }
 
 seastar::future<> ClusterDataPlane::refreshControlCapabilities() {

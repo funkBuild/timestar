@@ -335,6 +335,10 @@ seastar::future<> testJoinTokenGatesAdmission() {
     EXPECT_FALSE(co_await controller.admitNodeWithToken(rec(9, "rack-x"), "bad-token"));
     co_await router.pump();
     EXPECT_EQ(nodes[1].sm->state().nodes.count(9), 0u);
+    EXPECT_FALSE(co_await controller.mintJoinToken(std::string(kMaxJoinTokenBytes + 1, 'x')))
+        << "an operator token cannot inflate every command and control snapshot without bound";
+    EXPECT_FALSE(co_await controller.admitNodeWithToken(
+        rec(9, "rack-x"), std::string(kMaxJoinTokenBytes + 1, 'x')));
 
     // Mint a token, then the node joins with it -> admitted, token consumed.
     co_await controller.mintJoinToken("join-42");
