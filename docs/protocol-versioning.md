@@ -14,7 +14,7 @@ historical-reader guarantees during the greenfield phase.
 
 | Surface | v1 marker |
 |---|---|
-| Data-plane connection negotiation | every peer call requires a range containing `1`; agreed version is `1` |
+| Data-plane connection handshake | exact version `1`; any other value is rejected |
 | Write batch | `TSW1` |
 | Replicated data command | `TSC1` |
 | VShard snapshot payload | `TSP1` |

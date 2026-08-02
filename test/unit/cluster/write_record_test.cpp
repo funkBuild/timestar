@@ -45,11 +45,12 @@ TEST(WriteRecordV1, RoundTripsEveryValueTypeAndRevision) {
 }
 
 TEST(WriteRecordV1, IsSelfIdentifyingAndRejectsOtherVersions) {
-    const std::string encoded = encodeWriteBatch(allTypes(), kWriteBatchFormatV1);
+    const std::string encoded = encodeWriteBatch(allTypes());
     ASSERT_GE(encoded.size(), 4u);
     EXPECT_EQ(encoded.substr(0, 4), "TSW1");
-    EXPECT_THROW(encodeWriteBatch(allTypes(), 0), std::invalid_argument);
-    EXPECT_THROW(encodeWriteBatch(allTypes(), 2), std::invalid_argument);
+    auto otherVersion = encoded;
+    otherVersion[3] = '2';
+    EXPECT_FALSE(decodeWriteBatch(otherVersion));
 }
 
 TEST(WriteRecordV1, RejectsTruncationCorruptionAndTrailingBytes) {
@@ -81,7 +82,7 @@ TEST(WriteRecordV1, RejectsInconsistentSeriesBeforeEncoding) {
 TEST(WriteRecordV1, BorrowedVShardViewMatchesMergedEncoding) {
     auto groups = splitByVShard(allTypes());
     auto view = viewOf(groups);
-    const auto direct = encodeWriteBatch(view, kWriteBatchFormatV1);
+    const auto direct = encodeWriteBatch(view);
     const auto merged = encodeWriteBatch(mergeVShardBatches(std::move(groups)));
     EXPECT_EQ(direct, merged);
 }

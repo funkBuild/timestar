@@ -86,7 +86,7 @@ using VShardBatches = std::vector<VShardBatchGroup>;
 // means the coordinator must still OWN every group after a dispatch -- so the propose
 // APIs below the router take a view instead of consuming a VShardBatches. That keeps the
 // hot path copy-free (a retry costs one vector of pointers, not a second copy of the
-// batch) and it is what lets `encodeWriteBatch(view, ...)` replace the mergeVShardBatches
+// batch) and it is what lets `encodeWriteBatch(view)` replace the mergeVShardBatches
 // allocation the remote path used to pay on EVERY write.
 //
 // LIFETIME: the pointees are owned by the caller's frame and every propose future is
@@ -113,8 +113,7 @@ size_t approxResidentBytes(const VShardBatchView& view);
 WriteBatch mergeVShardBatches(VShardBatches groups);
 
 // This greenfield protocol retains explicit versioning but supports one version.
-// The v1 frame is self-identifying and uses delta-varint timestamps. A caller must
-// pass exactly v1; unknown versions fail closed rather than being silently coerced.
+// The v1 frame is self-identifying and uses delta-varint timestamps.
 constexpr uint32_t kWriteBatchFormatV1 = 1;
 
 // Wire codec (bounds-checked; decode returns nullopt on ANY malformed/truncated/
@@ -125,15 +124,14 @@ constexpr uint32_t kWriteBatchFormatV1 = 1;
 // (kMaxPrereserveElems in the .cpp). Note that an inbound RPC frame itself is
 // currently unbounded: neither DataPlaneRpc nor RaftRpcTransport sets
 // seastar::rpc::resource_limits. FNV-checksum
-// trailer. Both overloads emit v1.
+// trailer. Writers always emit v1.
 std::string encodeWriteBatch(const WriteBatch& batch);
-std::string encodeWriteBatch(const WriteBatch& batch, uint32_t version);
 // Encode the CONCATENATION of a borrowed selection of groups, byte-for-byte identical
 // to encoding mergeVShardBatches(copy-of-view) -- the receiver re-derives each series'
 // VShard from its key, so the grouping is not on the wire and merging was only ever an
 // allocation. Used by the remote propose path, which must not consume its groups (they
 // may need re-dispatching to a different leader).
-std::string encodeWriteBatch(const VShardBatchView& view, uint32_t version);
+std::string encodeWriteBatch(const VShardBatchView& view);
 std::optional<WriteBatch> decodeWriteBatch(const std::string& bytes);
 
 // The exact v1 encoded size, computed without allocating the frame.

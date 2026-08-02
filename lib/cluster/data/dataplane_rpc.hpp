@@ -79,14 +79,14 @@ public:
     seastar::future<> forwardWriteBatch(NodeId to, WriteBatch batch) override;
     seastar::future<NodeQueryPartial> queryNode(NodeId to, NodeQueryRequest req) override;
     // Deadline-bearing read used by the replicated coordinator. It bounds both
-    // the optional version handshake and the query RPC; the interface overload
+    // the exact-v1 connection check and the query RPC; the interface overload
     // above remains for callers that own no wall-clock budget.
     seastar::future<NodeQueryPartial> queryNode(NodeId to, NodeQueryRequest req, OptDeadline deadline);
     seastar::future<MetadataResult> queryMetadata(NodeId to, MetadataRequest req) override;
     seastar::future<PatternSeriesResult> findPatternSeries(NodeId to, PatternSeriesRequest req,
                                                            OptDeadline deadline = std::nullopt) override;
     // v1 request forwarding to the peer believed to lead group 0. The
-    // deadline bounds negotiation and the waited request/reply exchange.
+    // deadline bounds the v1 check and the waited request/reply exchange.
     seastar::future<control::FreezeDeletePlanResult> frozenDeletePlan(
         NodeId to, control::FrozenDeletePlanRpcRequest request,
         OptDeadline deadline = std::nullopt);
@@ -129,20 +129,10 @@ public:
     // sign -- cannot connect. All PEM (x509).
     void setTlsCredentials(std::string certPem, std::string keyPem, std::string caPem, std::string expectedPeerName);
 
-    // The data-plane protocol version agreed with peer `to`, handshaked once per
-    // connection and cached. Every peer call requires v1 before sending its frame.
-    seastar::future<uint32_t> versionFor(NodeId to);
-    seastar::future<uint32_t> versionFor(NodeId to, OptDeadline deadline);
-
-    // Negotiate the wire version with peer `to`. This v1-only binary fails closed
-    // unless the peer advertises v1.
-    seastar::future<uint32_t> negotiateVersion(NodeId to);
-    // ... bounded by `deadline`. The handshake precedes the write it gates and talks to
-    // the same peer, so leaving it unbounded put an untimed suspension in front of a
-    // timed one -- a black-holed peer hung the caller before the batch was even encoded.
-    seastar::future<uint32_t> negotiateVersion(NodeId to, OptDeadline deadline);
-
 private:
+    // Require an exact-v1 handshake once per connection. The optional deadline
+    // is shared with the request this check gates.
+    seastar::future<> ensureV1(NodeId to, OptDeadline deadline = std::nullopt);
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

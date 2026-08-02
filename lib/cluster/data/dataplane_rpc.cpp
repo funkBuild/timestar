@@ -16,6 +16,7 @@
 #include <functional>
 #include <map>
 #include <optional>
+#include <set>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future-util.hh>
 #include <seastar/core/gate.hh>
@@ -53,7 +54,7 @@ constexpr uint64_t kQueryNode = 4;          // sstring -> sstring (enriched Node
 constexpr uint64_t kQueryMetadata = 5;      // sstring -> sstring (MetadataRequest, waited: MetadataResult)
 constexpr uint64_t kLeaderReadIndex = 7;    // sstring(u16 vshard) -> sstring(u64 readIndex); throws if not leader
 constexpr uint64_t kLeaderCommitIndex = 8;  // sstring(u16 vshard) -> sstring(u64 commitIndex); throws if not leader
-constexpr uint64_t kNegotiateVersion = 9;   // sstring(u32 min,u32 max) -> sstring(u32 agreed); throws if incompatible
+constexpr uint64_t kRequireV1 = 9;          // sstring(u32 version) -> sstring(u32 version); exact v1 only
 // The propose reply carries the committed set plus a leader hint per rejected VShard:
 //     '1'  -> every slice committed
 //     '0' u16 committedCount {u16 vshard}* u16 rejectCount {u16 vshard u64 leader u8 kind}*
@@ -219,10 +220,9 @@ struct DataPlaneRpc::Impl {
     ReadIndexSink* readIndexSink = nullptr;  // replica-read leader-reach target (M4)
     FrozenDeletePlanSink* frozenDeletePlanSink = nullptr;  // group-0 request target
     ControlJoinSink* controlJoinSink = nullptr;             // group-0 observer admission target
-    // Version agreed with each peer (kNegotiateVersion), cached per connection: a
-    // handshake per peer, not per write. Dropped when a connection is retired, because
-    // the peer may come back on a different binary.
-    std::map<NodeId, uint32_t> agreedVersion;
+    // Connections that completed the exact-v1 handshake. Dropped when a
+    // connection is retired because the peer may return on another binary.
+    std::set<NodeId> v1Connections;
     // Mutual TLS (X1b): null unless setTlsCredentials was called. serverCreds requires a
     // client cert; clientCreds presents ours + trusts the CA; peerName is the SAN we
     // verify the server against.
@@ -260,7 +260,7 @@ struct DataPlaneRpc::Impl {
         proposeCommandHintedTimedStub;
     std::function<seastar::future<seastar::sstring>(Client&, seastar::rpc::rpc_clock_type::time_point,
                                                     seastar::sstring)>
-        negotiateVersionTimedStub;
+        requireV1TimedStub;
     std::function<seastar::future<seastar::sstring>(Client&, seastar::rpc::rpc_clock_type::time_point,
                                                     seastar::sstring)>
         queryNodeTimedStub;
@@ -275,7 +275,7 @@ struct DataPlaneRpc::Impl {
         controlJoinTimedStub;
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> leaderReadIndexStub;
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> leaderCommitIndexStub;
-    std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> negotiateVersionStub;
+    std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> requireV1Stub;
 
     // Retire a dead connection without blocking the caller: stop it in the background
     // under a gate, keeping it alive until stop resolves.
@@ -316,9 +316,8 @@ struct DataPlaneRpc::Impl {
             nextRetry[to] = cluster::nextReconnectAt(now);
             retire(std::move(it->second));
             clients.erase(it);
-            // A reconnect may reach a RESTARTED peer running a different binary --
-            // re-handshake rather than keep speaking the old connection's version.
-            agreedVersion.erase(to);
+            // A reconnect may reach a restarted peer running a different binary.
+            v1Connections.erase(to);
         }
         auto pit = peers.find(to);
         if (pit == peers.end())
@@ -351,14 +350,14 @@ struct DataPlaneRpc::Impl {
         controlJoinStub = proto.make_client<seastar::sstring(seastar::sstring)>(kControlJoin);
         proposeWriteHintedTimedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kProposeWriteHinted);
         proposeCommandHintedTimedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kProposeCommandHinted);
-        negotiateVersionTimedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kNegotiateVersion);
+        requireV1TimedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kRequireV1);
         queryNodeTimedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kQueryNode);
         findPatternSeriesTimedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kFindPatternSeries);
         frozenDeletePlanTimedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kFrozenDeletePlan);
         controlJoinTimedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kControlJoin);
         leaderReadIndexStub = proto.make_client<seastar::sstring(seastar::sstring)>(kLeaderReadIndex);
         leaderCommitIndexStub = proto.make_client<seastar::sstring(seastar::sstring)>(kLeaderCommitIndex);
-        negotiateVersionStub = proto.make_client<seastar::sstring(seastar::sstring)>(kNegotiateVersion);
+        requireV1Stub = proto.make_client<seastar::sstring(seastar::sstring)>(kRequireV1);
     }
 
     // Where inbound connections are accepted.
@@ -578,15 +577,14 @@ seastar::future<> DataPlaneRpc::start(seastar::socket_address local, NodeStore& 
         return seastar::futurize_invoke([this, vs = *vs] { return impl_->readIndexSink->leaderCommitIndex(vs); })
             .then([](raft::LogIndex idx) { return encU64(idx); });
     });
-    impl_->proto.register_handler(kNegotiateVersion, [this](seastar::sstring data) {
-        auto peerMin = decU32At(data, 0);
-        auto peerMax = decU32At(data, 4);
-        if (!peerMin || !peerMax || *peerMin > *peerMax)
+    impl_->proto.register_handler(kRequireV1, [this](seastar::sstring data) {
+        auto version = decU32At(data, 0);
+        if (!version || data.size() != sizeof(uint32_t))
             return seastar::make_exception_future<seastar::sstring>(
-                std::runtime_error("dataplane: malformed negotiateVersion request"));
-        if (*peerMin > kWriteBatchFormatV1 || *peerMax < kWriteBatchFormatV1)
+                std::runtime_error("dataplane: malformed v1 handshake"));
+        if (*version != kWriteBatchFormatV1)
             return seastar::make_exception_future<seastar::sstring>(
-                std::runtime_error("dataplane: incompatible wire versions (no overlap with peer)"));
+                std::runtime_error("dataplane: peer does not speak wire v1"));
         return seastar::make_ready_future<seastar::sstring>(encU32(kWriteBatchFormatV1));
     });
     impl_->makeStubs();
@@ -632,36 +630,27 @@ void DataPlaneRpc::setTlsCredentials(std::string certPem, std::string keyPem, st
     impl_->tlsEnabled = true;
 }
 
-seastar::future<uint32_t> DataPlaneRpc::negotiateVersion(NodeId to) {
-    return negotiateVersion(to, std::nullopt);
-}
-
-seastar::future<uint32_t> DataPlaneRpc::negotiateVersion(NodeId to, OptDeadline deadline) {
+seastar::future<> DataPlaneRpc::ensureV1(NodeId to, OptDeadline deadline) {
     if (impl_->stopping)
         throw std::runtime_error("dataplane: shutting down");
     auto* conn = impl_->clientFor(to);
     if (!conn)
         throw std::runtime_error("dataplane: unknown peer");
-    seastar::sstring req = encU32(kWriteBatchFormatV1) + encU32(kWriteBatchFormatV1);
-    // A non-overlapping peer throws server-side; that exception propagates here so the
-    // caller refuses the peer (never falls back to a silently-mismatched version).
-    //
-    // The handshake is bounded by the SAME deadline as the write it precedes: it is an
-    // awaited round trip to the same peer, so a black-holed connection would otherwise
-    // hang here, before a single byte of the batch was even encoded -- an unbounded
-    // suspension in front of a bounded one.
-    seastar::sstring reply = deadline ? co_await impl_->negotiateVersionTimedStub(*conn, *deadline, req)
-                                      : co_await impl_->negotiateVersionStub(*conn, req);
-    auto agreed = decU32At(reply, 0);
-    if (!agreed || reply.size() != 4 || *agreed != kWriteBatchFormatV1)
-        throw std::runtime_error("dataplane: malformed negotiateVersion reply");
-    co_return *agreed;
+    if (impl_->v1Connections.contains(to))
+        co_return;
+    const seastar::sstring request = encU32(kWriteBatchFormatV1);
+    seastar::sstring reply = deadline ? co_await impl_->requireV1TimedStub(*conn, *deadline, request)
+                                      : co_await impl_->requireV1Stub(*conn, request);
+    const auto version = decU32At(reply, 0);
+    if (!version || reply.size() != sizeof(uint32_t) || *version != kWriteBatchFormatV1)
+        throw std::runtime_error("dataplane: malformed v1 handshake reply");
+    impl_->v1Connections.insert(to);
 }
 
 seastar::future<raft::LogIndex> DataPlaneRpc::leaderReadIndex(NodeId to, uint16_t vshard) {
     if (impl_->stopping)
         throw std::runtime_error("dataplane: shutting down");
-    (void)co_await versionFor(to);
+    co_await ensureV1(to);
     auto* conn = impl_->clientFor(to);
     if (!conn)
         throw std::runtime_error("dataplane: unknown peer");
@@ -675,7 +664,7 @@ seastar::future<raft::LogIndex> DataPlaneRpc::leaderReadIndex(NodeId to, uint16_
 seastar::future<raft::LogIndex> DataPlaneRpc::leaderCommitIndex(NodeId to, uint16_t vshard) {
     if (impl_->stopping)
         throw std::runtime_error("dataplane: shutting down");
-    (void)co_await versionFor(to);
+    co_await ensureV1(to);
     auto* conn = impl_->clientFor(to);
     if (!conn)
         throw std::runtime_error("dataplane: unknown peer");
@@ -686,40 +675,14 @@ seastar::future<raft::LogIndex> DataPlaneRpc::leaderCommitIndex(NodeId to, uint1
     co_return *idx;
 }
 
-seastar::future<uint32_t> DataPlaneRpc::versionFor(NodeId to) {
-    return versionFor(to, std::nullopt);
-}
-
-seastar::future<uint32_t> DataPlaneRpc::versionFor(NodeId to, OptDeadline deadline) {
-    // The WriteBatch format to speak with this peer. Handshake once per connection and
-    // cache it; a peer that cannot read anything we can write THROWS out of
-    // negotiateVersion (no overlapping range), which fails the write closed instead of
-    // shipping it a frame it would misparse. Failures are not cached, so the next
-    // attempt re-handshakes.
-    //
-    // Resolve the CONNECTION FIRST, before reading the cache. clientFor is what notices
-    // a dead client, retires it and drops the cached version with it -- so reading the
-    // cache first would hand back the DEAD connection's version and send exactly one
-    // frame at it over the fresh connection. Resolving the connection first ensures the
-    // v1 handshake always belongs to the connection that will carry the request.
-    if (!impl_->clientFor(to))
-        throw std::runtime_error("dataplane: unknown peer");
-    auto it = impl_->agreedVersion.find(to);
-    if (it != impl_->agreedVersion.end())
-        co_return it->second;
-    const uint32_t agreed = co_await negotiateVersion(to, deadline);
-    impl_->agreedVersion[to] = agreed;
-    co_return agreed;
-}
-
 seastar::future<> DataPlaneRpc::forwardWriteBatch(NodeId to, WriteBatch batch) {
     if (impl_->stopping)
         throw std::runtime_error("dataplane: shutting down");
-    const uint32_t version = co_await versionFor(to);
+    co_await ensureV1(to);
     auto* conn = impl_->clientFor(to);
     if (!conn)
         throw std::runtime_error("dataplane: unknown peer");
-    std::string bytes = encodeWriteBatch(batch, version);
+    std::string bytes = encodeWriteBatch(batch);
     co_await impl_->forwardBatchStub(*conn, seastar::sstring(bytes.data(), bytes.size()));  // waited
 }
 
@@ -730,7 +693,7 @@ seastar::future<NodeQueryPartial> DataPlaneRpc::queryNode(NodeId to, NodeQueryRe
 seastar::future<NodeQueryPartial> DataPlaneRpc::queryNode(NodeId to, NodeQueryRequest req, OptDeadline deadline) {
     if (impl_->stopping)
         throw std::runtime_error("dataplane: shutting down");
-    (void)co_await versionFor(to, deadline);
+    co_await ensureV1(to, deadline);
     auto* conn = impl_->clientFor(to);
     if (!conn)
         throw std::runtime_error("dataplane: unknown peer");
@@ -772,7 +735,7 @@ seastar::future<NodeQueryPartial> DataPlaneRpc::queryNode(NodeId to, NodeQueryRe
 seastar::future<MetadataResult> DataPlaneRpc::queryMetadata(NodeId to, MetadataRequest req) {
     if (impl_->stopping)
         throw std::runtime_error("dataplane: shutting down");
-    (void)co_await versionFor(to);
+    co_await ensureV1(to);
     auto* conn = impl_->clientFor(to);
     if (!conn)
         throw std::runtime_error("dataplane: unknown peer");
@@ -788,7 +751,7 @@ seastar::future<PatternSeriesResult> DataPlaneRpc::findPatternSeries(NodeId to, 
                                                                      OptDeadline deadline) {
     if (impl_->stopping)
         throw std::runtime_error("dataplane: shutting down");
-    (void)co_await versionFor(to, deadline);
+    co_await ensureV1(to, deadline);
     auto* conn = impl_->clientFor(to);
     if (!conn)
         throw std::runtime_error("dataplane: unknown peer");
@@ -812,7 +775,7 @@ seastar::future<control::FreezeDeletePlanResult> DataPlaneRpc::frozenDeletePlan(
     NodeId to, control::FrozenDeletePlanRpcRequest request, OptDeadline deadline) {
     if (impl_->stopping)
         throw std::runtime_error("dataplane: shutting down");
-    (void)co_await versionFor(to, deadline);
+    co_await ensureV1(to, deadline);
     auto* conn = impl_->clientFor(to);
     if (!conn)
         throw std::runtime_error("dataplane: unknown peer");
@@ -835,7 +798,7 @@ seastar::future<control::ControlJoinResult> DataPlaneRpc::controlJoin(
     NodeId to, control::ControlJoinRequest request, OptDeadline deadline) {
     if (impl_->stopping)
         throw std::runtime_error("dataplane: shutting down");
-    (void)co_await versionFor(to, deadline);
+    co_await ensureV1(to, deadline);
     auto* conn = impl_->clientFor(to);
     if (!conn)
         throw std::runtime_error("dataplane: unknown peer");
@@ -861,8 +824,8 @@ seastar::future<ProposeOutcome> DataPlaneRpc::proposeWriteHinted(NodeId to, VSha
     vshards.reserve(view.size());
     for (const auto* g : view)
         vshards.push_back(g->first);
-    // Bounded by the SAME deadline as the propose it gates -- see negotiateVersion.
-    const uint32_t version = co_await versionFor(to, deadline);
+    // Bounded by the same deadline as the propose it gates.
+    co_await ensureV1(to, deadline);
     auto* conn = impl_->clientFor(to);
     if (!conn)
         throw std::runtime_error("dataplane: unknown peer");
@@ -877,7 +840,7 @@ seastar::future<ProposeOutcome> DataPlaneRpc::proposeWriteHinted(NodeId to, VSha
                                       std::to_string(raft::RaftGroup::kMaxProposalBytes) +
                                       "-byte Raft entry limit; split the batch");
     // Encode straight from the borrowed groups -- no mergeVShardBatches allocation.
-    std::string bytes = encodeWriteBatch(view, version);
+    std::string bytes = encodeWriteBatch(view);
     if (bytes.size() > kMaxOutboundFrameBytes)
         throw WriteFrameTooLargeError("dataplane: encoded write slice of " + std::to_string(bytes.size()) +
                                       " bytes exceeds the " + std::to_string(kMaxOutboundFrameBytes) +
@@ -899,7 +862,7 @@ seastar::future<ProposeOutcome> DataPlaneRpc::proposeCommandHinted(NodeId to, ui
                                                                    ReplicatedCommand command, OptDeadline deadline) {
     if (impl_->stopping)
         throw std::runtime_error("dataplane: shutting down");
-    (void)co_await versionFor(to, deadline);
+    co_await ensureV1(to, deadline);
     auto* conn = impl_->clientFor(to);
     if (!conn)
         throw std::runtime_error("dataplane: unknown peer");

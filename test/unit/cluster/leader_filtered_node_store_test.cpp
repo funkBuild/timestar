@@ -175,7 +175,7 @@ TEST(LeaderFilteredNodeStore, OnlyTheNamedSubsetIsChecked) {
 // A resolve list with NO RESOLVER is a construction error, not a pass-through (found in the
 // D-25 review). Passing it through is the exact hazard the exchange exists to prevent --
 // this node answers from replicas it may not lead while the coordinator counts it as a
-// leader read -- and it is INVISIBLE to the coordinator's wire-version gate, because a
+// leader read -- and it is INVISIBLE to the coordinator's v1 handshake, because a
 // mis-wired node advertises the same version as a correctly wired one.
 TEST(LeaderFilteredNodeStore, AResolveListWithNoResolverFailsLoudlyRatherThanServingAFollowerRead) {
     seastar::async([] {

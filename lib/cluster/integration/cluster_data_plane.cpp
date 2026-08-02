@@ -694,7 +694,7 @@ seastar::future<QueryResponse> ClusterDataPlane::queryReplicated(QueryRequest re
     // static_assert in the header claims to exclude -- making the assertion a statement about
     // arithmetic rather than about behaviour. Checked BETWEEN rounds, so the real bound is the
     // budget plus at most one LOCAL in-flight operation. Remote node-query attempts and
-    // their optional version handshakes share `readRpcDeadline`, so a black-holed peer
+    // their exact-v1 handshakes share `readRpcDeadline`, so a black-holed peer
     // cannot extend the query past the coordinator's wall-clock policy.
     const auto readStart = std::chrono::steady_clock::now();
     const auto readRpcDeadline = seastar::rpc::rpc_clock_type::now() + kReadLeaderlessBudget;

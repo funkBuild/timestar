@@ -30,8 +30,8 @@ inventory and rules.
 - [x] Removed old encoder/decoder branches, compatibility fallbacks, format
   activation state, capability/inventory RPCs, and cluster-format readiness
   fields.
-- [x] Made DataPlane negotiation v1-only and reject peers that do not advertise
-  v1.
+- [x] Replaced DataPlane version-range negotiation with an exact-v1 connection
+  handshake and reject peers that do not speak v1.
 - [x] Made Raft use one v1 tag layout, including transfer votes and chunked
   snapshots; removed peer capability probing and old-tag normalization.
 - [x] Made WAL recovery require the v1 header and CRC-framed entries; removed

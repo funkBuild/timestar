@@ -173,6 +173,6 @@ D-41 also carries the read path's missing **per-attempt bound**: `queryNode` is 
 a peer that accepts the connection and then goes silent hangs a read indefinitely, and the
 wall-clock budget above cannot help because it is only checked between rounds. The write
 path closed this in write-scaleout 3f (`kAttemptTimeout`, pushed into the RPC itself); the
-read path has no equivalent. That is also why the D-25 version handshake deliberately uses
-the UNTIMED `versionFor`: a bounded handshake in front of an unbounded query is false
-reassurance, not defence in depth.
+read path has no equivalent. The exact-v1 handshake shares the caller's deadline when one
+exists; the legacy no-deadline query overload necessarily leaves both handshake and query
+unbounded.

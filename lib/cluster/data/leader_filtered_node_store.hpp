@@ -45,7 +45,7 @@ namespace timestar::data {
 //  - A resolve list with NO RESOLVER is a construction error and THROWS. It used to pass
 //    straight through, which is the exact hazard the whole exchange exists to prevent --
 //    this node answering from a replica it may not lead while the coordinator counts it as
-//    a leader read -- and it is INVISIBLE to the coordinator's wire-version gate (debt
+//    a leader read -- and it is INVISIBLE to the coordinator's v1 handshake (debt
 //    D-25), because a mis-wired node advertises the same version as a correct one. There is
 //    no safe silent behaviour here: answering is a stale read and staying quiet is a
 //    dropped VShard, so it fails loudly at the one place that can tell the difference.

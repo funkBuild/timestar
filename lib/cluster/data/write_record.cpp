@@ -551,12 +551,6 @@ size_t encodedWriteBatchBytes(const WriteBatch& batch) {
 }
 
 std::string encodeWriteBatch(const WriteBatch& batch) {
-    return encodeWriteBatch(batch, kWriteBatchFormatV1);
-}
-
-std::string encodeWriteBatch(const WriteBatch& batch, uint32_t version) {
-    if (version != kWriteBatchFormatV1)
-        throw std::invalid_argument("unsupported WriteBatch format version");
     Writer w;
     w.out.reserve(encodedWriteBatchBytes(batch));
     w.out.append(kV1Magic, sizeof(kV1Magic));
@@ -568,9 +562,7 @@ std::string encodeWriteBatch(const WriteBatch& batch, uint32_t version) {
     return std::move(w.out);
 }
 
-std::string encodeWriteBatch(const VShardBatchView& view, uint32_t version) {
-    if (version != kWriteBatchFormatV1)
-        throw std::invalid_argument("unsupported WriteBatch format version");
+std::string encodeWriteBatch(const VShardBatchView& view) {
     size_t nSeries = 0, reserve = sizeof(kV1Magic) + 8 + 4 + kTrailerBytes;
     uint64_t schemaVersion = 0;
     for (const auto* g : view) {
