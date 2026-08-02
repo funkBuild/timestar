@@ -133,6 +133,41 @@ struct ClusterJoinRequestBody {
     std::string token;
 };
 
+struct ClusterMoveRequestBody {
+    std::string job_id;
+    uint32_t vshard = UINT32_MAX;
+    uint64_t destination = timestar::raft::kNoNode;
+    uint64_t victim = timestar::raft::kNoNode;
+};
+
+struct ClusterNodeRequestBody {
+    uint64_t node = timestar::raft::kNoNode;
+};
+
+static void setControlMutationReply(seastar::http::reply& rep,
+                                    const timestar::cluster::ClusterDataPlane::ControlMutationResult& result,
+                                    std::string_view acceptedStatus) {
+    using Status = timestar::cluster::ClusterDataPlane::ControlMutationStatus;
+    const std::string suffix =
+        ",\"leader\":" + std::to_string(result.leader) + ",\"map_epoch\":" + std::to_string(result.mapEpoch) + "}";
+    switch (result.status) {
+        case Status::Accepted:
+            rep.set_status(seastar::http::reply::status_type::accepted);
+            rep._content = "{\"status\":\"" + std::string(acceptedStatus) + "\"" + suffix;
+            break;
+        case Status::NotLeader:
+            rep.set_status(result.leader == timestar::raft::kNoNode
+                               ? seastar::http::reply::status_type::service_unavailable
+                               : seastar::http::reply::status_type::conflict);
+            rep._content = "{\"status\":\"error\",\"message\":\"control leader changed\"" + suffix;
+            break;
+        case Status::Rejected:
+            rep.set_status(seastar::http::reply::status_type::conflict);
+            rep._content = "{\"status\":\"rejected\"" + suffix;
+            break;
+    }
+}
+
 static std::string readClusterCredential(const std::string& path, const char* label) {
     std::ifstream in(path, std::ios::binary);
     if (!in)
@@ -446,6 +481,85 @@ void set_routes(routes& r) {
             }
             co_return std::move(rep);
         });
+
+    // Topology decisions are durable Group-0 commands. They deliberately stay
+    // unavailable in unauthenticated development mode, and the move request
+    // carries intent only: committed v1 state supplies source voters and epoch.
+    timestar::http::addJsonRoute(
+        r, operation_type::POST, "/cluster/vshards/move", authToken(),
+        [](std::unique_ptr<seastar::http::request> req,
+           std::unique_ptr<seastar::http::reply> rep) -> seastar::future<std::unique_ptr<seastar::http::reply>> {
+            if (authToken().empty()) {
+                rep->set_status(seastar::http::reply::status_type::unauthorized);
+                rep->_content =
+                    R"({"status":"error","message":"cluster topology mutation requires server authentication"})";
+                co_return std::move(rep);
+            }
+            if (!g_clusterPartitioned) {
+                rep->set_status(seastar::http::reply::status_type::bad_request);
+                rep->_content = R"({"status":"error","message":"node is not clustered"})";
+                co_return std::move(rep);
+            }
+            ClusterMoveRequestBody body;
+            if (req->content.size() > 4096 || glz::read_json(body, req->content) ||
+                !timestar::control::validControlJobId(body.job_id) || body.vshard >= timestar::VIRTUAL_SHARD_COUNT ||
+                body.destination == timestar::raft::kNoNode || body.destination == body.victim) {
+                rep->set_status(seastar::http::reply::status_type::bad_request);
+                rep->_content =
+                    R"({"status":"error","message":"job_id, vshard, and destination must identify a valid v1 move"})";
+                co_return std::move(rep);
+            }
+            try {
+                const auto result = co_await seastar::smp::submit_to(0u, [body = std::move(body)]() mutable {
+                    return g_clusterDataPlane.planControlMove(
+                        std::move(body.job_id), static_cast<uint16_t>(body.vshard), body.destination, body.victim);
+                });
+                setControlMutationReply(*rep, result, "planned");
+            } catch (const std::exception& e) {
+                rep->set_status(seastar::http::reply::status_type::service_unavailable);
+                rep->_content = "{\"status\":\"error\",\"message\":\"" + timestar::jsonEscape(e.what()) + "\"}";
+            }
+            co_return std::move(rep);
+        });
+
+    auto addNodeMutationRoute = [&r](const char* path, bool remove) {
+        timestar::http::addJsonRoute(
+            r, operation_type::POST, path, authToken(),
+            [remove](std::unique_ptr<seastar::http::request> req, std::unique_ptr<seastar::http::reply> rep)
+                -> seastar::future<std::unique_ptr<seastar::http::reply>> {
+                if (authToken().empty()) {
+                    rep->set_status(seastar::http::reply::status_type::unauthorized);
+                    rep->_content =
+                        R"({"status":"error","message":"cluster topology mutation requires server authentication"})";
+                    co_return std::move(rep);
+                }
+                if (!g_clusterPartitioned) {
+                    rep->set_status(seastar::http::reply::status_type::bad_request);
+                    rep->_content = R"({"status":"error","message":"node is not clustered"})";
+                    co_return std::move(rep);
+                }
+                ClusterNodeRequestBody body;
+                if (req->content.size() > 4096 || glz::read_json(body, req->content) ||
+                    body.node == timestar::raft::kNoNode) {
+                    rep->set_status(seastar::http::reply::status_type::bad_request);
+                    rep->_content = R"({"status":"error","message":"a non-zero node id is required"})";
+                    co_return std::move(rep);
+                }
+                try {
+                    const auto result = co_await seastar::smp::submit_to(0u, [node = body.node, remove] {
+                        return remove ? g_clusterDataPlane.removeControlNode(node)
+                                      : g_clusterDataPlane.drainControlNode(node);
+                    });
+                    setControlMutationReply(*rep, result, remove ? "removed" : "draining");
+                } catch (const std::exception& e) {
+                    rep->set_status(seastar::http::reply::status_type::service_unavailable);
+                    rep->_content = "{\"status\":\"error\",\"message\":\"" + timestar::jsonEscape(e.what()) + "\"}";
+                }
+                co_return std::move(rep);
+            });
+    };
+    addNodeMutationRoute("/cluster/nodes/drain", false);
+    addNodeMutationRoute("/cluster/nodes/remove", true);
 
     r.add(operation_type::GET, url("/health"),
           new function_handler(

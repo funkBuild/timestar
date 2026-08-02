@@ -7,9 +7,9 @@
 
 #include <chrono>
 #include <cstdint>
+#include <optional>
 #include <seastar/core/future.hh>
 #include <seastar/core/lowres_clock.hh>
-#include <optional>
 #include <string>
 #include <vector>
 
@@ -59,6 +59,12 @@ public:
     // before reconcileMetaVoters may promote the learner.
     seastar::future<bool> activateCaughtUpLearner(raft::NodeId node);
 
+    // Forward-only operator lifecycle. Draining first removes the node from
+    // future meta-voter selection; Removed is accepted only after no effective
+    // data placement or Group-0 membership still references the node.
+    seastar::future<bool> drainNode(raft::NodeId node);
+    seastar::future<bool> removeDrainedNode(raft::NodeId node);
+
     // Commit the complete epoch-1 serving map exactly once. Exact retries are
     // idempotent; any different/later map is refused until movement/cutover has
     // its own resumable protocol.
@@ -68,7 +74,7 @@ public:
     // The controller, not the caller, supplies the authoritative source voters
     // and next map epoch so an operator cannot forge a stale removal plan.
     seastar::future<bool> planVShardMove(std::string jobId, uint16_t vshard, NodeId destination,
-                                        NodeId victim = raft::kNoNode);
+                                         NodeId victim = raft::kNoNode);
 
     // Publish the next serving-map epoch only after the named movement job is
     // durably Done. The state machine independently re-derives and validates the
@@ -94,16 +100,14 @@ public:
     // false means it was rejected before append because this node was not leader.
     // Leadership loss or the default bounded deadline after append is an
     // ambiguous outcome and throws. An explicit deadline replaces the default.
-    seastar::future<bool> proposeCommand(
-        ControlCommand cmd,
-        std::optional<seastar::lowres_clock::time_point> deadline = std::nullopt);
+    seastar::future<bool> proposeCommand(ControlCommand cmd,
+                                         std::optional<seastar::lowres_clock::time_point> deadline = std::nullopt);
 
     // Freeze a complete canonical pattern expansion in one group-0 entry before
     // any data-group proposal. A same-request retry returns the first stored
     // target vector even if a fresh catalog read found different series.
     seastar::future<FreezeDeletePlanResult> freezeDeletePlan(
-        FrozenDeletePlan candidate,
-        std::optional<seastar::lowres_clock::time_point> deadline = std::nullopt);
+        FrozenDeletePlan candidate, std::optional<seastar::lowres_clock::time_point> deadline = std::nullopt);
 
     // Consult an already-frozen plan before repeating catalog discovery. The
     // request identity carries an empty target vector; NotFound authorizes the

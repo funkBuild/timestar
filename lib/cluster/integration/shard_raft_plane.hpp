@@ -462,6 +462,25 @@ public:
         if (!group->isLeader())
             co_return control::ActuateMoveResult{control::ActuateMoveStatus::NotLeader, leader(), {}};
         try {
+            // A replacement's Promoted -> OldRemoved transition may never
+            // remove the current leader. Hand leadership to a live caught-up
+            // survivor first; the next bounded controller pass follows the new
+            // leader and performs the membership change. No job step is claimed
+            // until that later pass actually commits it.
+            const auto move = ControllerJobDriver::decodeMoveJob(job);
+            if (move && move->step() == movement::MoveStep::Promoted && move->plan().isReplace() &&
+                group->node().id() == move->plan().victim) {
+                for (NodeId candidate : group->node().config().voters) {
+                    if (candidate == move->plan().victim || !transferrableTo(*group, candidate))
+                        continue;
+                    (void)co_await group->transferLeadership(candidate);
+                    break;
+                }
+                co_return control::ActuateMoveResult{
+                    group->isLeader() ? control::ActuateMoveStatus::Unavailable : control::ActuateMoveStatus::NotLeader,
+                    leader(),
+                    {}};
+            }
             auto advanced = co_await ControllerJobDriver::driveMoveJobStep(std::move(job), *group, minRf);
             if (advanced)
                 co_return control::ActuateMoveResult{control::ActuateMoveStatus::Advanced, group->node().id(),

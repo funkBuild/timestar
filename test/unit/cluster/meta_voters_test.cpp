@@ -30,9 +30,8 @@ TEST(MetaVotersTest, SingleNodeGroupOfOne) {
 
 TEST(MetaVotersTest, GrowsAcrossDistinctDomains) {
     // Three nodes in three domains -> one voter per domain.
-    auto nodes = makeNodes({{1, "rack-a", NodeState::Active},
-                            {2, "rack-b", NodeState::Active},
-                            {3, "rack-c", NodeState::Active}});
+    auto nodes = makeNodes(
+        {{1, "rack-a", NodeState::Active}, {2, "rack-b", NodeState::Active}, {3, "rack-c", NodeState::Active}});
     EXPECT_EQ(selectMetaVoters(nodes, {}, 3), (std::vector<NodeId>{1, 2, 3}));
 }
 
@@ -50,9 +49,8 @@ TEST(MetaVotersTest, PrefersDomainDiversityOverPacking) {
 TEST(MetaVotersTest, FewerDomainsThanTargetPacksSecondPass) {
     // Only two domains but target 3: one per domain first, then a second from the
     // domain with spare capacity.
-    auto nodes = makeNodes({{1, "rack-a", NodeState::Active},
-                            {2, "rack-a", NodeState::Active},
-                            {3, "rack-b", NodeState::Active}});
+    auto nodes = makeNodes(
+        {{1, "rack-a", NodeState::Active}, {2, "rack-a", NodeState::Active}, {3, "rack-b", NodeState::Active}});
     auto v = selectMetaVoters(nodes, {}, 3);
     EXPECT_EQ(v, (std::vector<NodeId>{1, 2, 3}));
 }
@@ -60,7 +58,7 @@ TEST(MetaVotersTest, FewerDomainsThanTargetPacksSecondPass) {
 TEST(MetaVotersTest, SkipsNonActiveNodes) {
     auto nodes = makeNodes({{1, "rack-a", NodeState::Active},
                             {2, "rack-b", NodeState::Draining},
-                            {3, "rack-c", NodeState::Down},
+                            {3, "rack-c", NodeState::Removed},
                             {4, "rack-d", NodeState::Joining}});
     EXPECT_EQ(selectMetaVoters(nodes, {}, 3), (std::vector<NodeId>{1}));  // only node 1 is Active
 }

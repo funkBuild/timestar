@@ -39,12 +39,9 @@ struct MovePlan {
 
     bool isReplace() const { return victim != 0; }
     friend bool operator==(const MovePlan&, const MovePlan&) = default;
-    // NOTE: `victim` must NOT be the group's current leader. The plan removes a
-    // voter only after its replacement is committed; a leader is removed only
-    // after a completed leadership transfer (docs/clustering.md §"Membership
-    // changes"). The controller transfers leadership away first (via the
-    // LeadershipBalancer, plan step 10) and then issues a follower-victim move --
-    // so this brick only ever removes a follower. No two attempts of the same
+    // A leader victim is supported: after the replacement is committed, the
+    // production actuator transfers leadership to a live caught-up survivor and
+    // a later controller pass removes the now-follower victim. No two attempts of the same
     // batch double-count: re-application is idempotent (LWW) and Raft applied_index
     // is monotonic, so a re-installed snapshot + replay reaches the same state.
 };

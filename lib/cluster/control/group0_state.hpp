@@ -1,11 +1,11 @@
 #pragma once
 
-#include "control_map_cache.hpp"
 #include "../raft/raft_types.hpp"  // NodeId
+#include "control_map_cache.hpp"
 
 #include <algorithm>
-#include <cstdint>
 #include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <map>
 #include <set>
@@ -18,7 +18,7 @@ namespace timestar::control {
 using timestar::raft::NodeId;
 
 // A node's lifecycle state in the cluster (the plan's node lifecycle).
-enum class NodeState : uint8_t { Joining = 0, Active = 1, Draining = 2, Down = 3 };
+enum class NodeState : uint8_t { Joining = 0, Active = 1, Draining = 2, Removed = 3 };
 
 inline constexpr size_t kMaxJoinTokenBytes = 1024;
 inline constexpr size_t kMaxOutstandingJoinTokens = 1024;
@@ -34,7 +34,13 @@ inline bool validJoinToken(const std::string& token) {
 }
 
 constexpr bool isValidNodeState(NodeState state) {
-    return state >= NodeState::Joining && state <= NodeState::Down;
+    return state >= NodeState::Joining && state <= NodeState::Removed;
+}
+
+constexpr bool isForwardNodeStateTransition(NodeState from, NodeState to) {
+    return (from == NodeState::Joining && to == NodeState::Active) ||
+           (from == NodeState::Active && to == NodeState::Draining) ||
+           (from == NodeState::Draining && to == NodeState::Removed);
 }
 
 // One member node's control-plane record (key family nodes/<uuid>). raftId is
@@ -119,8 +125,7 @@ inline constexpr uint64_t kFrozenDeletePlanFutureSkewMs = 5u * 60u * 1'000u;
 inline size_t frozenDeletePlanBytes(const FrozenDeletePlan& plan) {
     // Include the ControlCommand tag so the per-entry limit describes the
     // complete encoded Raft payload, not merely the nested plan fields.
-    size_t bytes = sizeof(uint8_t) + sizeof(uint64_t) * 4 + plan.requestId.size() +
-                   plan.requestFingerprint.size();
+    size_t bytes = sizeof(uint8_t) + sizeof(uint64_t) * 4 + plan.requestId.size() + plan.requestFingerprint.size();
     for (const auto& target : plan.targets) {
         const size_t itemBytes = sizeof(uint64_t) * 3 + target.seriesKey.size();
         if (bytes > std::numeric_limits<size_t>::max() - itemBytes)
@@ -165,19 +170,19 @@ inline bool frozenDeletePlanExpiredAt(const FrozenDeletePlan& plan, uint64_t can
 // The full replicated group-0 control state. This is a deterministic function of
 // the committed command log; every field is rebuilt identically on every node.
 struct Group0State {
-    std::string clusterUuid;                                   // meta
-    uint64_t mapEpoch = 0;                                     // topology/policy version
-    uint64_t appliedIndex = 0;                                 // last group-0 log index applied
-    uint64_t controllerTerm = 0;                               // controller epoch (group-0 term)
-    NodeId controllerLeader = 0;                               // node that owns controllerTerm
-    std::map<NodeId, NodeRecord> nodes;                        // nodes/<uuid>
-    std::map<uint16_t, std::vector<NodeId>> desiredPlacement;  // desired-placement/<vshard>
-    ControlMap servingMap;                                     // current effective serving map
-    std::vector<NodeId> metaVoters;                            // group-0 voter set (self-managed)
-    std::map<std::string, PolicyCell> policies;                // schema/retention CAS cells
-    std::map<std::string, Job> jobs;                           // jobs/<uuid>
-    std::set<std::string> joinTokens;                          // valid unused group-0-minted join tokens
-    std::map<std::string, FrozenDeletePlan> frozenDeletePlans; // retry-stable pattern expansion plans
+    std::string clusterUuid;                                    // meta
+    uint64_t mapEpoch = 0;                                      // topology/policy version
+    uint64_t appliedIndex = 0;                                  // last group-0 log index applied
+    uint64_t controllerTerm = 0;                                // controller epoch (group-0 term)
+    NodeId controllerLeader = 0;                                // node that owns controllerTerm
+    std::map<NodeId, NodeRecord> nodes;                         // nodes/<uuid>
+    std::map<uint16_t, std::vector<NodeId>> desiredPlacement;   // desired-placement/<vshard>
+    ControlMap servingMap;                                      // current effective serving map
+    std::vector<NodeId> metaVoters;                             // group-0 voter set (self-managed)
+    std::map<std::string, PolicyCell> policies;                 // schema/retention CAS cells
+    std::map<std::string, Job> jobs;                            // jobs/<uuid>
+    std::set<std::string> joinTokens;                           // valid unused group-0-minted join tokens
+    std::map<std::string, FrozenDeletePlan> frozenDeletePlans;  // retry-stable pattern expansion plans
     friend bool operator==(const Group0State&, const Group0State&) = default;
 };
 

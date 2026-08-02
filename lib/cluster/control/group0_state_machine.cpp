@@ -2,8 +2,8 @@
 
 #include "../../core/vshard.hpp"
 
-#include <seastar/core/coroutine.hh>
 #include <limits>
+#include <seastar/core/coroutine.hh>
 #include <set>
 #include <stdexcept>
 
@@ -283,17 +283,17 @@ bool allJobsDone(const Group0State& state) {
 bool validNewMove(const Group0State& state, const PlanVShardMove& command) {
     movement::MoveJob job(command.plan);
     if (!validControlJobId(command.jobId) || state.jobs.size() >= kMaxControlJobs || !job.valid() ||
-        !isCompleteControlMap(state.servingMap) ||
-        state.mapEpoch != state.servingMap.epoch || state.mapEpoch == std::numeric_limits<uint64_t>::max() ||
-        command.plan.mapEpoch != state.mapEpoch + 1 || state.jobs.contains(command.jobId) || !allJobsDone(state))
+        !isCompleteControlMap(state.servingMap) || state.mapEpoch != state.servingMap.epoch ||
+        state.mapEpoch == std::numeric_limits<uint64_t>::max() || command.plan.mapEpoch != state.mapEpoch + 1 ||
+        state.jobs.contains(command.jobId) || !allJobsDone(state))
         return false;
 
     const auto current = state.servingMap.placement.find(command.plan.vshard);
     const auto destination = state.nodes.find(command.plan.dest);
     const auto target = job.targetVoters();
     return current != state.servingMap.placement.end() && current->second == command.plan.sourceVoters &&
-           destination != state.nodes.end() && destination->second.state == NodeState::Active &&
-           validNodeSet(target) && !sameNodeSet(target, current->second);
+           destination != state.nodes.end() && destination->second.state == NodeState::Active && validNodeSet(target) &&
+           !sameNodeSet(target, current->second);
 }
 
 }  // namespace
@@ -334,9 +334,8 @@ bool Group0StateMachine::stateMatchesLocalExpectations(const Group0State& state)
             return false;
         const NodeRecord& local = *expectedLocalRecord_;
         for (const auto& [id, record] : state.nodes) {
-            if (id == local.raftId &&
-                (record.uuid != local.uuid || record.address != local.address ||
-                 record.failureDomain != local.failureDomain))
+            if (id == local.raftId && (record.uuid != local.uuid || record.address != local.address ||
+                                       record.failureDomain != local.failureDomain))
                 return false;
             if (id != local.raftId && record.uuid == local.uuid)
                 return false;
@@ -377,9 +376,8 @@ void Group0StateMachine::rejectConflictingLocalCommand(const ControlCommand& com
     if (!record)
         return;
     const NodeRecord& local = *expectedLocalRecord_;
-    if ((record->raftId == local.raftId &&
-         (record->uuid != local.uuid || record->address != local.address ||
-          record->failureDomain != local.failureDomain)) ||
+    if ((record->raftId == local.raftId && (record->uuid != local.uuid || record->address != local.address ||
+                                            record->failureDomain != local.failureDomain)) ||
         (record->raftId != local.raftId && record->uuid == local.uuid))
         throw std::runtime_error("group0: committed node record conflicts with local persistent identity");
 }
@@ -395,17 +393,17 @@ bool Group0StateMachine::applyCommand(const ControlCommand& cmd) {
                 else
                     state_.clusterUuid = c.clusterUuid;  // never re-init
             } else if constexpr (std::is_same_v<T, UpsertNode>) {
-                if (!validNodeRecord(state_, c.record)) {
-                    ok = false;
-                } else if (auto it = state_.nodes.find(c.record.raftId);
-                           it != state_.nodes.end() && it->second == c.record) {
+                // Node identity and lifecycle are immutable through Upsert.
+                // Admission inserts once; SetNodeState is the only lifecycle
+                // path, so a raw command cannot skip or regress a transition.
+                if (!validNodeRecord(state_, c.record) || state_.nodes.contains(c.record.raftId)) {
                     ok = false;
                 } else {
                     state_.nodes[c.record.raftId] = c.record;
                 }
             } else if constexpr (std::is_same_v<T, SetNodeState>) {
-                if (auto it = state_.nodes.find(c.raftId);
-                    it != state_.nodes.end() && isValidNodeState(c.state) && it->second.state != c.state)
+                if (auto it = state_.nodes.find(c.raftId); it != state_.nodes.end() && isValidNodeState(c.state) &&
+                                                           isForwardNodeStateTransition(it->second.state, c.state))
                     it->second.state = c.state;
                 else
                     ok = false;
@@ -417,8 +415,8 @@ bool Group0StateMachine::applyCommand(const ControlCommand& cmd) {
                     const std::string payload = job.encode();
                     state_.mapEpoch = c.plan.mapEpoch;
                     state_.desiredPlacement[c.plan.vshard] = job.targetVoters();
-                    state_.jobs.emplace(c.jobId, Job{c.jobId, static_cast<uint32_t>(movement::MoveStep::Planned),
-                                                     false, payload});
+                    state_.jobs.emplace(
+                        c.jobId, Job{c.jobId, static_cast<uint32_t>(movement::MoveStep::Planned), false, payload});
                 }
             } else if constexpr (std::is_same_v<T, SetMetaVoters>) {
                 if (!validNodeSet(c.voters) || state_.metaVoters == c.voters)
@@ -475,8 +473,7 @@ bool Group0StateMachine::applyCommand(const ControlCommand& cmd) {
                 // Admit ONLY on a valid unused token, consumed atomically. An
                 // invalid/replayed token is a no-op (never implicitly initialize).
                 auto it = state_.joinTokens.find(c.token);
-                if (validJoinToken(c.token) && it != state_.joinTokens.end() &&
-                    validNodeRecord(state_, c.record)) {
+                if (validJoinToken(c.token) && it != state_.joinTokens.end() && validNodeRecord(state_, c.record)) {
                     state_.joinTokens.erase(it);
                     NodeRecord record = c.record;
                     // Admission is a state-machine invariant, not merely a
@@ -539,8 +536,8 @@ bool Group0StateMachine::applyCommand(const ControlCommand& cmd) {
                     const auto persisted = state_.jobs.find(c.completedJobId);
                     const auto move = persisted == state_.jobs.end() ? std::optional<movement::MoveJob>{}
                                                                      : decodeJob(persisted->second);
-                    const auto desired = move ? state_.desiredPlacement.find(move->plan().vshard)
-                                              : state_.desiredPlacement.end();
+                    const auto desired =
+                        move ? state_.desiredPlacement.find(move->plan().vshard) : state_.desiredPlacement.end();
                     if (!move || !persisted->second.done || move->plan().mapEpoch != state_.mapEpoch ||
                         c.map.epoch != state_.mapEpoch || state_.servingMap.epoch + 1 != c.map.epoch ||
                         desired == state_.desiredPlacement.end()) {
@@ -580,9 +577,8 @@ seastar::future<> Group0StateMachine::apply(raft::LogEntry entry) {
         stamp->term = entry.term;
     rejectConflictingLocalCommand(*cmd);
     const auto* publication = std::get_if<PublishServingMap>(&*cmd);
-    const bool advancesDurableServingMap = publication &&
-                                           (!expectedServingMap_ ||
-                                            publication->map.epoch > expectedServingMap_->epoch);
+    const bool advancesDurableServingMap =
+        publication && (!expectedServingMap_ || publication->map.epoch > expectedServingMap_->epoch);
     const bool publishesServingMap = servingMapObserver_ && advancesDurableServingMap;
     std::optional<Group0State> previous;
     if (publishesServingMap)

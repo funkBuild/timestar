@@ -4,6 +4,7 @@
 // Runs the real group-0 RaftGroup + Group0StateMachine + Group0Controller over
 // an in-memory router (no sockets).
 #include "../../../lib/cluster/control/group0_controller.hpp"
+
 #include "../../../lib/cluster/raft/raft_group.hpp"
 
 #include <gtest/gtest.h>
@@ -104,11 +105,10 @@ seastar::future<T> drive(seastar::future<T> future, Nodes& nodes, Router& router
         co_await tickAndPump(nodes, router);
     if (!future.available()) {
         const auto& first = nodes.begin()->second;
-        throw std::runtime_error("group0 test future did not settle: commit=" +
-                                 std::to_string(first.group->commitIndex()) + " applied=" +
-                                 std::to_string(first.group->appliedIndex()) + " state-applied=" +
-                                 std::to_string(first.sm->state().appliedIndex) + " cluster=" +
-                                 first.sm->state().clusterUuid);
+        throw std::runtime_error(
+            "group0 test future did not settle: commit=" + std::to_string(first.group->commitIndex()) +
+            " applied=" + std::to_string(first.group->appliedIndex()) + " state-applied=" +
+            std::to_string(first.sm->state().appliedIndex) + " cluster=" + first.sm->state().clusterUuid);
     }
     co_return co_await std::move(future);
 }
@@ -118,11 +118,10 @@ seastar::future<> drive(seastar::future<> future, Nodes& nodes, Router& router, 
         co_await tickAndPump(nodes, router);
     if (!future.available()) {
         const auto& first = nodes.begin()->second;
-        throw std::runtime_error("group0 test future did not settle: commit=" +
-                                 std::to_string(first.group->commitIndex()) + " applied=" +
-                                 std::to_string(first.group->appliedIndex()) + " state-applied=" +
-                                 std::to_string(first.sm->state().appliedIndex) + " cluster=" +
-                                 first.sm->state().clusterUuid);
+        throw std::runtime_error(
+            "group0 test future did not settle: commit=" + std::to_string(first.group->commitIndex()) +
+            " applied=" + std::to_string(first.group->appliedIndex()) + " state-applied=" +
+            std::to_string(first.sm->state().appliedIndex) + " cluster=" + first.sm->state().clusterUuid);
     }
     co_await std::move(future);
 }
@@ -153,8 +152,7 @@ ControlMap initialServingMap(std::vector<NodeId> replicas = {1, 2, 3}) {
 }
 
 FrozenDeletePlan frozenPlan(char id, char fingerprint, std::vector<FrozenDeleteTarget> targets) {
-    return FrozenDeletePlan{std::string(32, id), std::string(32, fingerprint), 1'800'000'000'000,
-                            std::move(targets)};
+    return FrozenDeletePlan{std::string(32, id), std::string(32, fingerprint), 1'800'000'000'000, std::move(targets)};
 }
 
 UpsertJob advanceMove(std::string id, movement::MoveStep step, const movement::MovePlan& plan) {
@@ -174,8 +172,8 @@ seastar::future<> testClusterInitGrowsMetaVotersAcrossDomains() {
         box.persistence = std::make_unique<NoopPersistence>();
         box.sm = std::make_unique<Group0StateMachine>();
         RaftNode rn(id, knownVoters, RaftLog{}, HardState{}, optsFor(id));
-        box.group = std::make_unique<RaftGroup>(/*groupId=*/0, std::move(rn), *box.persistence,
-                                                *transports.back(), *box.sm);
+        box.group =
+            std::make_unique<RaftGroup>(/*groupId=*/0, std::move(rn), *box.persistence, *transports.back(), *box.sm);
         router.setGroup(id, box.group.get());
         nodes[id] = std::move(box);
     };
@@ -259,8 +257,7 @@ seastar::future<> testReadBarrierReconcilesControlMap() {
         box.persistence = std::make_unique<NoopPersistence>();
         box.sm = std::make_unique<Group0StateMachine>();
         RaftNode rn(id, knownVoters, RaftLog{}, HardState{}, optsFor(id));
-        box.group = std::make_unique<RaftGroup>(0, std::move(rn), *box.persistence, *transports.back(),
-                                                *box.sm);
+        box.group = std::make_unique<RaftGroup>(0, std::move(rn), *box.persistence, *transports.back(), *box.sm);
         router.setGroup(id, box.group.get());
         nodes[id] = std::move(box);
     };
@@ -311,8 +308,7 @@ seastar::future<> testReadBarrierReconcilesControlMap() {
     if (!planned)
         throw std::runtime_error("controller persisted an invalid movement job");
     for (const auto step : {movement::MoveStep::LearnerAdded, movement::MoveStep::CaughtUp,
-                            movement::MoveStep::Promoted, movement::MoveStep::OldRemoved,
-                            movement::MoveStep::Done}) {
+                            movement::MoveStep::Promoted, movement::MoveStep::OldRemoved, movement::MoveStep::Done}) {
         auto persist = controller.proposeCommand(advanceMove("move-5", step, planned->plan()));
         EXPECT_FALSE(persist.available()) << "job progress must wait for quorum apply";
         EXPECT_TRUE(co_await drive(std::move(persist), nodes, router));
@@ -352,8 +348,7 @@ seastar::future<> testJoinTokenGatesAdmission() {
         box.persistence = std::make_unique<NoopPersistence>();
         box.sm = std::make_unique<Group0StateMachine>();
         RaftNode rn(id, {1}, RaftLog{}, HardState{}, optsFor(id));
-        box.group = std::make_unique<RaftGroup>(0, std::move(rn), *box.persistence, *transports.back(),
-                                                *box.sm);
+        box.group = std::make_unique<RaftGroup>(0, std::move(rn), *box.persistence, *transports.back(), *box.sm);
         router.setGroup(id, box.group.get());
         nodes[id] = std::move(box);
     };
@@ -371,8 +366,7 @@ seastar::future<> testJoinTokenGatesAdmission() {
     EXPECT_EQ(nodes[1].sm->state().nodes.count(9), 0u);
     EXPECT_FALSE(co_await controller.mintJoinToken(std::string(kMaxJoinTokenBytes + 1, 'x')))
         << "an operator token cannot inflate every command and control snapshot without bound";
-    EXPECT_FALSE(co_await controller.admitNodeWithToken(
-        rec(9, "rack-x"), std::string(kMaxJoinTokenBytes + 1, 'x')));
+    EXPECT_FALSE(co_await controller.admitNodeWithToken(rec(9, "rack-x"), std::string(kMaxJoinTokenBytes + 1, 'x')));
 
     // Mint a token, then the node joins with it -> admitted, token consumed.
     co_await controller.mintJoinToken("join-42");
@@ -403,6 +397,35 @@ seastar::future<> testJoinTokenGatesAdmission() {
     EXPECT_EQ(nodes[1].sm->state().clusterUuid, "c1");
 }
 
+seastar::future<> testNodeRemovalRequiresDrainAndClearedReferences() {
+    Router router;
+    std::vector<std::unique_ptr<RouterTransport>> transports;
+    Nodes nodes;
+    transports.push_back(std::make_unique<RouterTransport>(router));
+    NodeBox box;
+    box.persistence = std::make_unique<NoopPersistence>();
+    box.sm = std::make_unique<Group0StateMachine>();
+    RaftNode rn(1, {1}, RaftLog{}, HardState{}, optsFor(1));
+    box.group = std::make_unique<RaftGroup>(0, std::move(rn), *box.persistence, *transports.back(), *box.sm);
+    router.setGroup(1, box.group.get());
+    nodes[1] = std::move(box);
+
+    Group0Controller controller(*nodes[1].group, *nodes[1].sm, 1);
+    co_await nodes[1].group->campaign();
+    co_await router.pump();
+    co_await controller.initCluster("c1", rec(1, "rack-a"));
+    EXPECT_TRUE(co_await controller.publishInitialServingMap(initialServingMap({1})));
+    EXPECT_TRUE(co_await controller.proposeCommand(UpsertNode{rec(2, "rack-b")}));
+
+    EXPECT_FALSE(co_await controller.removeDrainedNode(2));
+    EXPECT_TRUE(co_await controller.drainNode(2));
+    EXPECT_EQ(nodes[1].sm->state().nodes.at(2).state, NodeState::Draining);
+    EXPECT_TRUE(co_await controller.drainNode(2)) << "a drain retry must be idempotent";
+    EXPECT_TRUE(co_await controller.removeDrainedNode(2));
+    EXPECT_EQ(nodes[1].sm->state().nodes.at(2).state, NodeState::Removed);
+    EXPECT_TRUE(co_await controller.removeDrainedNode(2)) << "a remove retry must be idempotent";
+}
+
 seastar::future<> testDeletePlanFreezesFirstExpansion() {
     Router router;
     std::vector<std::unique_ptr<RouterTransport>> transports;
@@ -417,8 +440,7 @@ seastar::future<> testDeletePlanFreezesFirstExpansion() {
     nodes[1] = std::move(box);
 
     Group0Controller controller(*nodes[1].group, *nodes[1].sm, 3);
-    auto beforeLeadership = co_await controller.freezeDeletePlan(
-        frozenPlan('1', 'a', {{"m,host=a value", 10, 20}}));
+    auto beforeLeadership = co_await controller.freezeDeletePlan(frozenPlan('1', 'a', {{"m,host=a value", 10, 20}}));
     EXPECT_EQ(beforeLeadership.status, FreezeDeletePlanStatus::NotLeader);
 
     co_await nodes[1].group->campaign();
@@ -440,8 +462,7 @@ seastar::future<> testDeletePlanFreezesFirstExpansion() {
     changedExpansion.targets.push_back({"m,host=new value", 10, 20});
     auto retry = co_await controller.freezeDeletePlan(std::move(changedExpansion));
     EXPECT_EQ(retry.status, FreezeDeletePlanStatus::Stored);
-    EXPECT_EQ(retry.plan, original)
-        << "a catalog change during retry must return the first committed expansion";
+    EXPECT_EQ(retry.plan, original) << "a catalog change during retry must return the first committed expansion";
 
     auto conflictingBody = original;
     conflictingBody.requestFingerprint = std::string(32, 'b');
@@ -454,8 +475,7 @@ seastar::future<> testDeletePlanFreezesFirstExpansion() {
     // skew window has passed. Lookup must report a miss so the caller can
     // discover a new operation, and apply atomically prunes/replaces the old one.
     auto replacement = original;
-    replacement.issuedAtMs +=
-        kFrozenDeletePlanRetentionMs + kFrozenDeletePlanFutureSkewMs + 1;
+    replacement.issuedAtMs += kFrozenDeletePlanRetentionMs + kFrozenDeletePlanFutureSkewMs + 1;
     replacement.targets = {{"m,host=reused value", 30, 40}};
     auto replacementIdentity = replacement;
     replacementIdentity.targets.clear();
@@ -476,8 +496,7 @@ seastar::future<> testDeletePlanProposalDeadlineBoundsQuorumLoss() {
         box.persistence = std::make_unique<NoopPersistence>();
         box.sm = std::make_unique<Group0StateMachine>();
         RaftNode rn(id, {1, 2, 3}, RaftLog{}, HardState{}, optsFor(id));
-        box.group = std::make_unique<RaftGroup>(0, std::move(rn), *box.persistence,
-                                                *transports.back(), *box.sm);
+        box.group = std::make_unique<RaftGroup>(0, std::move(rn), *box.persistence, *transports.back(), *box.sm);
         router.setGroup(id, box.group.get());
         nodes[id] = std::move(box);
     };
@@ -499,8 +518,7 @@ seastar::future<> testDeletePlanProposalDeadlineBoundsQuorumLoss() {
     Group0Controller boundedController(*nodes[1].group, *nodes[1].sm, 3, std::chrono::milliseconds(20));
     bool timedOut = false;
     try {
-        (void)co_await boundedController.freezeDeletePlan(
-            frozenPlan('1', 'a', {{"m,host=a value", 10, 20}}));
+        (void)co_await boundedController.freezeDeletePlan(frozenPlan('1', 'a', {{"m,host=a value", 10, 20}}));
     } catch (const seastar::timed_out_error&) {
         timedOut = true;
     }
@@ -518,6 +536,10 @@ TEST(Group0ControllerTest, ClusterInitGrowsMetaVotersAcrossFailureDomains) {
 
 TEST(Group0ControllerTest, JoinTokenGatesAdmission) {
     testJoinTokenGatesAdmission().get();
+}
+
+TEST(Group0ControllerTest, NodeRemovalRequiresDrainAndClearedReferences) {
+    testNodeRemovalRequiresDrainAndClearedReferences().get();
 }
 
 TEST(Group0ControllerTest, ReadBarrierReconcilesControlMap) {

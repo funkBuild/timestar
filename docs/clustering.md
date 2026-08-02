@@ -987,7 +987,7 @@ eligibility, joining, draining, and control-plane availability.
 
 The current `/cluster/status` endpoint now exposes group-0 enablement, hosting,
 initialization, leader/voter/config state, term/commit/applied/snapshot indices,
-replicated controller term/owner, map epochs, active format, apply/tick errors,
+replicated controller term/owner, map epochs, exact protocol version, apply/tick errors,
 controller actuation, and snapshot/GC maintenance. Its
 `control_locally_ready` field requires a current-term controller stamp and
 commit but deliberately
@@ -1041,6 +1041,32 @@ record. Join tokens are returned with `Cache-Control: no-store`, are limited to
 a TLS-protected operator ingress; they refuse operation when server bearer
 authentication is disabled.
 
+Authenticated topology mutations use the same bearer policy and deliberately
+refuse unauthenticated development mode:
+
+```text
+POST /cluster/vshards/move  {"job_id":"move-0042","vshard":42,"destination":4,"victim":3}
+POST /cluster/nodes/drain   {"node":3}
+POST /cluster/nodes/remove  {"node":3}
+```
+
+Omit `victim` (or use zero) for a grow. A caller cannot supply source voters or
+the map epoch: the current Group-0 leader derives both from committed v1 state.
+An accepted command returns HTTP 202 with the control leader and map epoch. A
+known-leader redirect or policy conflict returns 409; an unknown control leader
+or unavailable control plane returns 503. Planning one move does not evacuate a
+whole node: drain the node, submit bounded replacement moves until no serving
+placement references it, then request removal. Removal remains blocked while a
+serving placement, unfinished job, Group-0 learner/voter, or replicated
+meta-voter reference exists.
+
+Node lifecycle is exactly `Joining -> Active -> Draining -> Removed`; retries of
+the drain and remove operations are idempotent and no backward or skipped state
+transition is accepted. A replacement whose victim still leads the data group
+first transfers leadership to a live caught-up surviving voter. A later bounded
+controller pass removes the now-follower victim and only then publishes the new
+serving map.
+
 The controller-side admission sequence remains fail-closed: token admission
 records `Joining`, adds the node only as a learner,
 requires a recent acknowledgement of the complete leader log before committing
@@ -1054,11 +1080,12 @@ UUID is rejected before application instead of being hosted as control state.
 
 The explicit bootstrap commits the complete epoch-1 serving map atomically and
 then publishes `control_map.cache` on every applying node before Raft advances
-its applied index. Restart reads that durable map off the reactor and refuses it
-if it differs from the data directory's bound static topology. This is an
-initial-map durability bridge, not topology movement: the command is immutable,
-and a different/later serving map is rejected until ordered VShard catch-up,
-membership change, cutover, and teardown are implemented.
+its applied index. A completed movement publishes the next map only after its
+exact membership job reaches `Done`; applying nodes persist that map before
+advancing their Group-0 applied boundary and fan it out to every reactor. Restart
+selects a newer valid durable map over the epoch-1 static seed and instantiates
+replica groups from that recovered map. Same-epoch conflicts, incomplete maps,
+and epoch regression fail closed.
 
 After bootstrap, the group-0 host checks leadership every 250 ms and durably
 proposes at most one controller stamp in each new term. It deliberately does not

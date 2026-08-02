@@ -10,8 +10,7 @@ namespace timestar::control {
 namespace {
 
 bool sameNodeIdentity(const NodeRecord& a, const NodeRecord& b) {
-    return a.raftId == b.raftId && a.uuid == b.uuid && a.address == b.address &&
-           a.failureDomain == b.failureDomain;
+    return a.raftId == b.raftId && a.uuid == b.uuid && a.address == b.address && a.failureDomain == b.failureDomain;
 }
 
 }  // namespace
@@ -27,8 +26,8 @@ seastar::lowres_clock::time_point Group0Controller::proposalDeadline() const {
     return seastar::lowres_clock::now() + proposalTimeout_;
 }
 
-seastar::future<bool> Group0Controller::proposeCommand(
-    ControlCommand cmd, std::optional<seastar::lowres_clock::time_point> deadline) {
+seastar::future<bool> Group0Controller::proposeCommand(ControlCommand cmd,
+                                                       std::optional<seastar::lowres_clock::time_point> deadline) {
     if (!g0_.isLeader())
         co_return false;
     // A control-plane success is a published cluster decision, not merely a
@@ -51,8 +50,7 @@ seastar::future<FreezeDeletePlanResult> Group0Controller::freezeDeletePlan(
         return FreezeDeletePlanResult{FreezeDeletePlanStatus::Conflict, existing};
     };
     if (auto found = sm_.state().frozenDeletePlans.find(candidate.requestId);
-        found != sm_.state().frozenDeletePlans.end() &&
-        !frozenDeletePlanExpiredAt(found->second, candidate.issuedAtMs))
+        found != sm_.state().frozenDeletePlans.end() && !frozenDeletePlanExpiredAt(found->second, candidate.issuedAtMs))
         co_return classifyExisting(found->second);
 
     if (!co_await proposeCommand(StoreFrozenDeletePlan{candidate}, deadline))
@@ -70,12 +68,10 @@ seastar::future<FreezeDeletePlanResult> Group0Controller::freezeDeletePlan(
 FreezeDeletePlanResult Group0Controller::lookupDeletePlan(const FrozenDeletePlan& request) const {
     if (!g0_.isLeader())
         return {FreezeDeletePlanStatus::NotLeader, {}};
-    if (!validFrozenDeletePlan(request) || !request.targets.empty() ||
-        !isCompleteControlMap(sm_.state().servingMap))
+    if (!validFrozenDeletePlan(request) || !request.targets.empty() || !isCompleteControlMap(sm_.state().servingMap))
         return {FreezeDeletePlanStatus::Invalid, {}};
     auto found = sm_.state().frozenDeletePlans.find(request.requestId);
-    if (found == sm_.state().frozenDeletePlans.end() ||
-        frozenDeletePlanExpiredAt(found->second, request.issuedAtMs))
+    if (found == sm_.state().frozenDeletePlans.end() || frozenDeletePlanExpiredAt(found->second, request.issuedAtMs))
         return {FreezeDeletePlanStatus::NotFound, {}};
     if (sameFrozenDeleteRequest(found->second, request))
         return {FreezeDeletePlanStatus::Stored, found->second};
@@ -91,8 +87,8 @@ seastar::future<> Group0Controller::initCluster(std::string clusterUuid, NodeRec
         throw std::invalid_argument("group0 init: self node id, UUID, and address must be set");
 
     const auto& config = g0_.node().config();
-    if (config.joint() || std::find(config.voters.begin(), config.voters.end(), selfRecord.raftId) ==
-                              config.voters.end())
+    if (config.joint() ||
+        std::find(config.voters.begin(), config.voters.end(), selfRecord.raftId) == config.voters.end())
         throw std::logic_error("group0 init: self must belong to a stable initial voter set");
     const std::vector<NodeId> initialVoters = config.voters;
 
@@ -127,7 +123,7 @@ seastar::future<> Group0Controller::admitNode(NodeRecord record) {
     if (auto it = sm_.state().nodes.find(record.raftId); it != sm_.state().nodes.end()) {
         if (!sameNodeIdentity(it->second, record))
             throw std::runtime_error("group0 admission conflicts with the existing node identity");
-        // Never regress Active/Draining/Down on an admission retry. A replacement
+        // Never regress Active/Draining/Removed on an admission retry. A replacement
         // is a separate lifecycle operation, not an UpsertNode side effect.
         co_return;
     }
@@ -214,6 +210,62 @@ seastar::future<bool> Group0Controller::activateCaughtUpLearner(raft::NodeId nod
     co_return co_await proposeCommand(SetNodeState{node, NodeState::Active});
 }
 
+seastar::future<bool> Group0Controller::drainNode(raft::NodeId node) {
+    if (!g0_.isLeader() || node == raft::kNoNode)
+        co_return false;
+    auto record = sm_.state().nodes.find(node);
+    if (record == sm_.state().nodes.end())
+        co_return false;
+    if (record->second.state != NodeState::Draining) {
+        if (record->second.state != NodeState::Active ||
+            !co_await proposeCommand(SetNodeState{node, NodeState::Draining}))
+            co_return false;
+    }
+    record = sm_.state().nodes.find(node);
+    if (record == sm_.state().nodes.end() || record->second.state != NodeState::Draining)
+        co_return false;
+
+    // A retry also retries meta-voter eviction. The lifecycle decision is
+    // already durable even when there are not yet enough caught-up Active
+    // learners to replace this voter.
+    (void)co_await reconcileMetaVoters();
+    co_return true;
+}
+
+seastar::future<bool> Group0Controller::removeDrainedNode(raft::NodeId node) {
+    if (!g0_.isLeader() || node == raft::kNoNode)
+        co_return false;
+    auto record = sm_.state().nodes.find(node);
+    if (record == sm_.state().nodes.end())
+        co_return false;
+    if (record->second.state == NodeState::Removed)
+        co_return true;
+    if (record->second.state != NodeState::Draining)
+        co_return false;
+
+    const auto contains = [node](const std::vector<NodeId>& nodes) {
+        return std::find(nodes.begin(), nodes.end(), node) != nodes.end();
+    };
+    for (const auto& [vshard, replicas] : sm_.state().servingMap.placement) {
+        (void)vshard;
+        if (contains(replicas))
+            co_return false;
+    }
+    if (std::ranges::any_of(sm_.state().jobs, [](const auto& entry) { return !entry.second.done; }))
+        co_return false;
+
+    // The actual Raft configuration and its state-machine mirror must both be
+    // clear. Never publish Removed while this identity can still vote in Group
+    // 0 or while a lagging mirror could select it again after failover.
+    const auto& config = g0_.node().config();
+    if (config.isVoter(node) || config.isLearner(node) || contains(sm_.state().metaVoters))
+        co_return false;
+    if (!co_await proposeCommand(SetNodeState{node, NodeState::Removed}))
+        co_return false;
+    record = sm_.state().nodes.find(node);
+    co_return record != sm_.state().nodes.end() && record->second.state == NodeState::Removed;
+}
+
 seastar::future<bool> Group0Controller::publishInitialServingMap(ControlMap map) {
     if (!g0_.isLeader() || map.epoch != 1 || !isCompleteControlMap(map))
         co_return false;
@@ -224,18 +276,17 @@ seastar::future<bool> Group0Controller::publishInitialServingMap(ControlMap map)
     co_return sm_.state().servingMap == map;
 }
 
-seastar::future<bool> Group0Controller::planVShardMove(std::string jobId, uint16_t vshard,
-                                                       NodeId destination, NodeId victim) {
+seastar::future<bool> Group0Controller::planVShardMove(std::string jobId, uint16_t vshard, NodeId destination,
+                                                       NodeId victim) {
     if (!g0_.isLeader() || !validControlJobId(jobId) || destination == raft::kNoNode ||
         vshard >= timestar::VIRTUAL_SHARD_COUNT)
         co_return false;
     if (const auto existing = sm_.state().jobs.find(jobId); existing != sm_.state().jobs.end()) {
         const auto move = movement::MoveJob::decode(existing->second.payload);
         co_return move && move->plan().vshard == vshard && move->plan().dest == destination &&
-                  move->plan().victim == victim;
+            move->plan().victim == victim;
     }
-    if (!isCompleteControlMap(sm_.state().servingMap) ||
-        sm_.state().mapEpoch != sm_.state().servingMap.epoch ||
+    if (!isCompleteControlMap(sm_.state().servingMap) || sm_.state().mapEpoch != sm_.state().servingMap.epoch ||
         sm_.state().mapEpoch == std::numeric_limits<uint64_t>::max())
         co_return false;
     const auto source = sm_.state().servingMap.placement.find(vshard);
@@ -253,7 +304,7 @@ seastar::future<bool> Group0Controller::planVShardMove(std::string jobId, uint16
         co_return false;
     auto decoded = movement::MoveJob::decode(persisted->second.payload);
     co_return decoded && persisted->second.step == static_cast<uint32_t>(decoded->step()) &&
-              persisted->second.done == decoded->done();
+        persisted->second.done == decoded->done();
 }
 
 seastar::future<bool> Group0Controller::publishCompletedMove(std::string jobId) {
@@ -267,8 +318,7 @@ seastar::future<bool> Group0Controller::publishCompletedMove(std::string jobId) 
         co_return false;
     const auto current = sm_.state().servingMap.placement.find(move->plan().vshard);
     if (sm_.state().servingMap.epoch == move->plan().mapEpoch)
-        co_return current != sm_.state().servingMap.placement.end() &&
-                  current->second == move->targetVoters();
+        co_return current != sm_.state().servingMap.placement.end() && current->second == move->targetVoters();
     if (sm_.state().servingMap.epoch + 1 != move->plan().mapEpoch)
         co_return false;
     ControlMap next = sm_.state().servingMap;
@@ -306,8 +356,8 @@ seastar::future<bool> Group0Controller::reconcileMetaVoters() {
         for (NodeId learner : config.learners)
             if (std::find(desired.begin(), desired.end(), learner) == desired.end())
                 remainingLearners.push_back(learner);
-        changed = co_await g0_.proposeConfChangeAndAwaitApplied(desired, std::move(remainingLearners),
-                                                                proposalDeadline());
+        changed =
+            co_await g0_.proposeConfChangeAndAwaitApplied(desired, std::move(remainingLearners), proposalDeadline());
         if (!changed)
             co_return false;
     }

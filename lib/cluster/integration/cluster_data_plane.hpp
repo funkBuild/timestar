@@ -374,6 +374,20 @@ public:
     seastar::future<ControlTokenMintResult> mintControlJoinToken(std::string token);
     seastar::future<control::ControlJoinResult> joinControlPlane(std::string token);
 
+    enum class ControlMutationStatus : uint8_t { Accepted = 0, NotLeader = 1, Rejected = 2 };
+    struct ControlMutationResult {
+        ControlMutationStatus status = ControlMutationStatus::Rejected;
+        NodeId leader = raft::kNoNode;
+        uint64_t mapEpoch = 0;
+    };
+    // Authenticated HTTP handlers call these shard-0 seams. The controller
+    // derives source placement and the next map epoch from committed Group 0;
+    // callers supply only stable identities and intent.
+    seastar::future<ControlMutationResult> planControlMove(std::string jobId, uint16_t vshard, NodeId destination,
+                                                           NodeId victim = raft::kNoNode);
+    seastar::future<ControlMutationResult> drainControlNode(NodeId node);
+    seastar::future<ControlMutationResult> removeControlNode(NodeId node);
+
     // Fail startup before accepting traffic when the configured reactor count
     // cannot produce complete single-core VShard snapshots.
     static void validateCoreTopology(unsigned coreCount, uint16_t replicationFactor);

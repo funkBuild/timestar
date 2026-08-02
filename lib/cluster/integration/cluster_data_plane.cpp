@@ -656,6 +656,72 @@ seastar::future<control::ControlJoinResult> ClusterDataPlane::joinControlPlane(s
     co_return result;
 }
 
+seastar::future<ClusterDataPlane::ControlMutationResult> ClusterDataPlane::planControlMove(std::string jobId,
+                                                                                           uint16_t vshard,
+                                                                                           NodeId destination,
+                                                                                           NodeId victim) {
+    if (!controlEnabled_ || !replicated_ || !shardsStarted_)
+        throw std::invalid_argument("cluster: group-0 topology control is not configured");
+    co_return co_await shards_.invoke_on(
+        0,
+        [jobId = std::move(jobId), vshard, destination,
+         victim](ShardRaftPlane& plane) mutable -> seastar::future<ControlMutationResult> {
+            auto* host = plane.group0();
+            if (!host || !host->group() || !host->stateMachine())
+                co_return ControlMutationResult{ControlMutationStatus::NotLeader, raft::kNoNode, 0};
+            auto* group = host->group();
+            const auto leader = [&] { return group->isLeader() ? group->node().id() : group->leader(); };
+            if (!group->isLeader())
+                co_return ControlMutationResult{ControlMutationStatus::NotLeader, leader(), host->state().mapEpoch};
+            control::Group0Controller controller(*group, *host->stateMachine());
+            const bool accepted = co_await controller.planVShardMove(std::move(jobId), vshard, destination, victim);
+            co_return ControlMutationResult{
+                accepted ? ControlMutationStatus::Accepted
+                         : (group->isLeader() ? ControlMutationStatus::Rejected : ControlMutationStatus::NotLeader),
+                leader(), host->state().mapEpoch};
+        });
+}
+
+seastar::future<ClusterDataPlane::ControlMutationResult> ClusterDataPlane::drainControlNode(NodeId node) {
+    if (!controlEnabled_ || !replicated_ || !shardsStarted_)
+        throw std::invalid_argument("cluster: group-0 topology control is not configured");
+    co_return co_await shards_.invoke_on(0, [node](ShardRaftPlane& plane) -> seastar::future<ControlMutationResult> {
+        auto* host = plane.group0();
+        if (!host || !host->group() || !host->stateMachine())
+            co_return ControlMutationResult{ControlMutationStatus::NotLeader, raft::kNoNode, 0};
+        auto* group = host->group();
+        const auto leader = [&] { return group->isLeader() ? group->node().id() : group->leader(); };
+        if (!group->isLeader())
+            co_return ControlMutationResult{ControlMutationStatus::NotLeader, leader(), host->state().mapEpoch};
+        control::Group0Controller controller(*group, *host->stateMachine());
+        const bool accepted = co_await controller.drainNode(node);
+        co_return ControlMutationResult{
+            accepted ? ControlMutationStatus::Accepted
+                     : (group->isLeader() ? ControlMutationStatus::Rejected : ControlMutationStatus::NotLeader),
+            leader(), host->state().mapEpoch};
+    });
+}
+
+seastar::future<ClusterDataPlane::ControlMutationResult> ClusterDataPlane::removeControlNode(NodeId node) {
+    if (!controlEnabled_ || !replicated_ || !shardsStarted_)
+        throw std::invalid_argument("cluster: group-0 topology control is not configured");
+    co_return co_await shards_.invoke_on(0, [node](ShardRaftPlane& plane) -> seastar::future<ControlMutationResult> {
+        auto* host = plane.group0();
+        if (!host || !host->group() || !host->stateMachine())
+            co_return ControlMutationResult{ControlMutationStatus::NotLeader, raft::kNoNode, 0};
+        auto* group = host->group();
+        const auto leader = [&] { return group->isLeader() ? group->node().id() : group->leader(); };
+        if (!group->isLeader())
+            co_return ControlMutationResult{ControlMutationStatus::NotLeader, leader(), host->state().mapEpoch};
+        control::Group0Controller controller(*group, *host->stateMachine());
+        const bool accepted = co_await controller.removeDrainedNode(node);
+        co_return ControlMutationResult{
+            accepted ? ControlMutationStatus::Accepted
+                     : (group->isLeader() ? ControlMutationStatus::Rejected : ControlMutationStatus::NotLeader),
+            leader(), host->state().mapEpoch};
+    });
+}
+
 seastar::future<> ClusterDataPlane::stop() {
     // The peer re-resolution loop touches rpc_ and shards_; quiesce it first.
     peerResolveTimer_.cancel();

@@ -79,6 +79,12 @@ inventory and rules.
   every suspension, validates the returned job, and commits that one step through
   Group 0 before another pass can continue. Shutdown drains the loop, and status
   exposes pass, failure, and durable-advance counters.
+- [x] Add authenticated, intent-only production topology routes for planning a
+  VShard move and advancing a node through `Active -> Draining -> Removed`.
+  Group 0 derives source voters and the next epoch, rejects backward or skipped
+  lifecycle transitions, keeps a node non-removable while any serving-map, job,
+  learner, or voter reference remains, and transfers data-group leadership away
+  from a replacement victim before removing it.
 
 ## Remaining production blockers
 
@@ -92,9 +98,12 @@ production deploy.
   be exercised through the production server. Group 0 now validates durable
   movement plans/progress, exact one-VShard cutover, and live sharded directory
   publication, dynamic peer registration, and destination data-group creation,
-  plus the bounded production scheduler/remote leader actuator. The authenticated
-  operator mutation API and teardown/reclaim sequence remain unfinished.
-  Editing a static peer list is not a safe topology operation.
+  plus the bounded production scheduler/remote leader actuator and authenticated
+  intent-only move/drain/remove routes. The server still does not perform the
+  post-cutover local replica teardown, quarantine/grace period, durable-file
+  reclamation, or reclaim-floor publication, and the complete workflow still
+  needs a multi-process production-server gate. Editing a static peer list is
+  not a safe topology operation.
 - [ ] **Replicate retention policy and cutoff decisions.** Partitioned mode must
   never let replicas expire or compact different logical ranges. Until then,
   retention mutation must remain fail-closed.
@@ -163,7 +172,13 @@ consumption, registration-before-learner ordering, peer address replacement on
 both transports, malformed port rejection, and idempotent failed-start cleanup.
 
 The movement-control gate covers exact-v1 destination and one-step actuation
-socket transport, stale term/job rejection, inactive or non-member actuators,
+socket transport, stale term/job rejection, inactive or non-member actuators
+(except the draining victim authorized to finish its own evacuation),
 skipped-step and changed-plan rejection, adjacent stable/joint recovery shapes,
 refusal before registry insertion when an on-disk configuration conflicts with
 the committed Group-0 job, and one durable transition per live-Raft driver call.
+The lifecycle tests additionally cover exact forward-only state changes,
+idempotent drain/remove retries, and refusal to remove an active or still
+referenced node. The production server build pins the authenticated route
+composition; the remaining multi-process topology gate must exercise those
+routes over HTTP and prove post-cutover teardown/reclaim.

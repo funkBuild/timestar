@@ -215,7 +215,11 @@ TEST(ControllerJobDriverV1, ActuationRequiresAnActiveReplicaAndExactlyOneForward
     EXPECT_TRUE(timestar::cluster::ControllerJobDriver::authorizeActuation(state, 4, request));
     EXPECT_FALSE(timestar::cluster::ControllerJobDriver::authorizeActuation(state, 5, request));
     state.nodes.at(1).state = NodeState::Draining;
-    EXPECT_FALSE(timestar::cluster::ControllerJobDriver::authorizeActuation(state, 1, request));
+    EXPECT_TRUE(timestar::cluster::ControllerJobDriver::authorizeActuation(state, 1, request))
+        << "a draining victim must be able to transfer leadership and finish evacuation";
+    state.nodes.at(2).state = NodeState::Draining;
+    EXPECT_FALSE(timestar::cluster::ControllerJobDriver::authorizeActuation(state, 2, request))
+        << "draining does not grant unrelated actuation authority";
 
     movement::MoveJob learnerAdded(movePlan(), movement::MoveStep::LearnerAdded);
     const Job next{current.id, static_cast<uint32_t>(learnerAdded.step()), learnerAdded.done(), learnerAdded.encode()};
@@ -267,6 +271,23 @@ TEST(Group0StateMachineV1, AppliesIdentityPolicyMembershipAndTokens) {
     EXPECT_TRUE(sm.applyCommand(AdmitWithToken{node(5, "uuid-5", NodeState::Joining), "join-once"}));
     EXPECT_FALSE(sm.applyCommand(AdmitWithToken{node(6, "uuid-6", NodeState::Joining), "join-once"}));
     EXPECT_TRUE(sm.applyCommand(SetNodeState{5, NodeState::Active}));
+}
+
+TEST(Group0StateMachineV1, NodeLifecycleIsForwardOnly) {
+    Group0StateMachine sm;
+    ASSERT_TRUE(sm.applyCommand(UpsertNode{node(7, "uuid-7", NodeState::Joining)}));
+
+    EXPECT_FALSE(sm.applyCommand(UpsertNode{node(7, "uuid-7", NodeState::Active)}));
+    EXPECT_EQ(sm.state().nodes.at(7).state, NodeState::Joining);
+    EXPECT_FALSE(sm.applyCommand(SetNodeState{7, NodeState::Draining}));
+    EXPECT_FALSE(sm.applyCommand(SetNodeState{7, NodeState::Removed}));
+    EXPECT_TRUE(sm.applyCommand(SetNodeState{7, NodeState::Active}));
+    EXPECT_FALSE(sm.applyCommand(SetNodeState{7, NodeState::Joining}));
+    EXPECT_FALSE(sm.applyCommand(SetNodeState{7, NodeState::Active}));
+    EXPECT_TRUE(sm.applyCommand(SetNodeState{7, NodeState::Draining}));
+    EXPECT_FALSE(sm.applyCommand(SetNodeState{7, NodeState::Active}));
+    EXPECT_TRUE(sm.applyCommand(SetNodeState{7, NodeState::Removed}));
+    EXPECT_FALSE(sm.applyCommand(SetNodeState{7, NodeState::Draining}));
 }
 
 TEST(Group0StateMachineV1, ServingMapCutoverRequiresExactCompletedMovementJob) {

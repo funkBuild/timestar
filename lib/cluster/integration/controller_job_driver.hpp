@@ -97,10 +97,16 @@ public:
     static std::optional<movement::MoveJob> authorizeActuation(const control::Group0State& state, NodeId self,
                                                                const control::ActuateMoveRequest& request) {
         const auto node = state.nodes.find(self);
-        if (node == state.nodes.end() || node->second.state != control::NodeState::Active)
-            return std::nullopt;
         auto move = authorizeMove(state, request);
-        if (!move || move->done())
+        if (node == state.nodes.end() || !move || move->done())
+            return std::nullopt;
+        // Draining removes a node from new placement and meta-voter selection,
+        // but its own evacuation must remain executable. In particular, a
+        // draining victim may still lead the data group and must be able to
+        // transfer leadership before the later removal step. No other inactive
+        // node receives actuation authority.
+        if (node->second.state != control::NodeState::Active &&
+            !(node->second.state == control::NodeState::Draining && move->plan().victim == self))
             return std::nullopt;
         const auto member = [self](const std::vector<NodeId>& nodes) {
             return std::find(nodes.begin(), nodes.end(), self) != nodes.end();
