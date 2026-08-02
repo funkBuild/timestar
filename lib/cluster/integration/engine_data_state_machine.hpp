@@ -45,6 +45,8 @@ public:
     struct DeleteReceiptCounts {
         size_t total = 0;
         bool hasUnappliedEntries = false;
+        uint64_t retiredBeforeMs = 0;
+        uint64_t retiredAtIndex = 0;
 
         friend bool operator==(const DeleteReceiptCounts&, const DeleteReceiptCounts&) = default;
     };

@@ -70,6 +70,18 @@ recover a plan that committed after the timeout.
 state. These fields expose retained retry-state capacity and catch-up; they are
 observability counters, not a quorum read or a mutation precondition.
 
+The same endpoint reports data-group receipt retirement through
+`delete_receipts_retained`, `delete_receipts_max_per_vshard`,
+`delete_receipt_capacity_per_vshard`,
+`delete_receipt_groups_with_retired_floor`,
+`delete_receipt_retirement_snapshot_pending`,
+`delete_receipt_retired_before_max_ms`, and
+`delete_receipt_retired_at_max_index`. Counts cover replicas hosted by that
+process. The per-VShard maximum is the direct bounded-memory signal; a nonzero
+snapshot-pending count means at least one destructive retirement entry is not
+yet covered by its local durable snapshot. These too are local observability,
+not a quorum read.
+
 ## Delete by Structured Query
 
 ```bash

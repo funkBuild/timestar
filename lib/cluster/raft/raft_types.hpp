@@ -407,9 +407,11 @@ struct Config {
 // copy of the bytes.
 //
 // `removeOnDestroy` is true only for an uncommitted staging object or for a
-// durable object that a newer, fsync'd snapshot superseded.  The newest durable
-// object keeps it false so ordinary process teardown cannot unlink the only
-// payload referenced by the journal.
+// durable object that a newer, fsync'd snapshot superseded.  Supersession also
+// unlinks the old path immediately; this flag is the best-effort retry for a
+// failed unlink or an uncommitted producer.  The newest durable object keeps it
+// false so ordinary process teardown cannot unlink the only payload referenced
+// by the journal.
 struct SnapshotFile {
     std::filesystem::path path;
     uint64_t size = 0;

@@ -483,6 +483,7 @@ seastar::future<> JournalRaftPersistence::persistSnapshot(Snapshot snap, bool re
             pendingSnapshotFile_.reset();
             pendingSupersededFile_ = currentSnapshotFile_;
         }
+        pendingSnapshotUpdate_ = true;
         r.payload = encodeSnapshotPayload(snap, receivedFromPeer);
         co_await appendFenced(r);
     } catch (...) {
@@ -515,15 +516,34 @@ seastar::future<> JournalRaftPersistence::sync() {
         throw;
     }
     durableFloor_ = std::max(durableFloor_, candidate);
-    // The journal descriptor is now durable. Only now may this become the
-    // retained sidecar and the prior one become collectible.
-    if (pendingSupersededFile_ && pendingSupersededFile_ != pendingSnapshotFile_)
-        pendingSupersededFile_->removeOnDestroy = true;
-    if (pendingSnapshotFile_)
-        pendingSnapshotFile_->removeOnDestroy = false;
-    currentSnapshotFile_ = pendingSnapshotFile_;
-    pendingSnapshotFile_.reset();
-    pendingSupersededFile_.reset();
+    if (pendingSnapshotUpdate_) {
+        // The journal descriptor is now durable. Only now may this become the
+        // retained sidecar and the prior one become collectible. An ordinary
+        // entry/hard-state sync does not enter this branch: clearing the current
+        // handle on every sync made the next snapshot forget its predecessor and
+        // leaked every canonical sidecar until restart cleanup.
+        if (pendingSupersededFile_ && pendingSupersededFile_ != pendingSnapshotFile_) {
+            pendingSupersededFile_->removeOnDestroy = true;
+            // Do not wait for the last shared_ptr to disappear before unlinking the
+            // superseded payload. Ready copies and completed snapshot-transfer state
+            // may legitimately retain the handle after a later descriptor is durable;
+            // relying on SnapshotFile's destructor therefore leaked one sidecar per
+            // compaction until those unrelated owners happened to drain.  Unlinking is
+            // safe now: the new descriptor is past the journal durability barrier and
+            // Raft clears transfers whenever it replaces its servable snapshot.  Keep
+            // removeOnDestroy armed as a best-effort retry if the unlink fails.  A crash
+            // before the directory entry is durably retired is harmless because startup
+            // cleanup retains only the latest descriptor.
+            std::error_code ec;
+            std::filesystem::remove(pendingSupersededFile_->path, ec);
+        }
+        if (pendingSnapshotFile_)
+            pendingSnapshotFile_->removeOnDestroy = false;
+        currentSnapshotFile_ = pendingSnapshotFile_;
+        pendingSnapshotFile_.reset();
+        pendingSupersededFile_.reset();
+        pendingSnapshotUpdate_ = false;
+    }
 }
 
 seastar::future<> validateSnapshotFile(const SnapshotFile& file) {

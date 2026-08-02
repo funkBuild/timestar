@@ -1581,6 +1581,13 @@ seastar::future<ClusterDataPlane::Status> ClusterDataPlane::status() const {
         st.snapshotTransfersAbandoned += sc.transfersAbandoned;
         st.snapshotProductionLimitPerShard = std::max(st.snapshotProductionLimitPerShard, sc.productionLimit);
         st.snapshotTriggerEnabled = st.snapshotTriggerEnabled && sc.triggerEnabled;
+        auto rc = co_await shards.invoke_on(sh, [](ShardRaftPlane& p) { return p.deleteReceiptStats(); });
+        st.deleteReceiptsRetained += rc.retained;
+        st.deleteReceiptsMaxPerVShard = std::max<uint64_t>(st.deleteReceiptsMaxPerVShard, rc.maxPerVShard);
+        st.deleteReceiptGroupsWithRetiredFloor += rc.groupsWithRetiredFloor;
+        st.deleteReceiptRetirementSnapshotPending += rc.retirementSnapshotPending;
+        st.deleteReceiptRetiredBeforeMaxMs = std::max(st.deleteReceiptRetiredBeforeMaxMs, rc.retiredBeforeMaxMs);
+        st.deleteReceiptRetiredAtMaxIndex = std::max(st.deleteReceiptRetiredAtMaxIndex, rc.retiredAtMaxIndex);
         auto jc = co_await shards.invoke_on(sh, [](ShardRaftPlane& p) { return p.journalCounts(); });
         st.journalFsyncs += jc.fsyncs;
         st.journalSyncRequests += jc.syncRequests;

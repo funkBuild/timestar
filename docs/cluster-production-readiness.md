@@ -208,6 +208,22 @@ inventory and rules.
   one-reactor, 1-GiB gate streamed 128 MiB + 1 byte through leader hydration,
   exact-v1 framing, receiver disk staging, and final validation without a
   reactor-stall report, then returned `build/tmp` to its pre-gate size.
+- [x] Prove bounded delete-receipt retirement under sustained load. The
+  `delete_receipt_retirement_gate.sh` run on 2026-08-03 sent 1,100 sequential
+  exact deletes to one RF=3 VShard, crossing its 1,024-receipt capacity on all
+  replicas. Every replica stayed at exactly 1,024 receipts; the replicated
+  capacity floor advanced once at the first eviction and again through all 76
+  evictions; an evicted retry returned the stable expired `409` while
+  the newest retained retry remained an idempotent `200`. All three replicas
+  snapshotted through the retirement entry, reported no retirement awaiting a
+  snapshot, and reclaimed at least one sealed production-sized private journal
+  segment. The gate also exposed and fixed a sidecar-lifetime leak: ordinary
+  Raft syncs no longer forget the current durable sidecar, and a replacement is
+  unlinked after its new descriptor is durable even if another Raft owner still
+  holds the old handle. With 5, 1, and 2 snapshots taken by the replicas, each
+  VShard directory retained exactly one current canonical v1 sidecar. The three
+  one-reactor, 1-GiB nodes used about 360 MiB aggregate RSS during the sampled
+  run, and all 108 MiB of gate roots were removed afterward.
 
 ## Remaining production blockers
 
@@ -221,9 +237,6 @@ evidence below.
 
 ### P1 — bounded operation and live evidence
 
-- [ ] **Prove delete-receipt retirement under sustained load.** A long-running
-  delete-heavy gate must demonstrate bounded receipt memory, progress of the
-  replicated retirement floor, snapshot eligibility, and Raft journal reclaim.
 - [ ] **Rerun empty-node catch-up and snapshot durability gates on the final
   candidate.** Each process must use an explicit memory budget; tests run one at
   a time and must prove the returning node's durable root was actually absent.
@@ -305,3 +318,10 @@ IDs, constant-space fence snapshot/restore, catalog pagination, and measurement
 and VShard isolation. The production retention gate adds current-leader HTTP
 CAS, controller kill after partial progress, durable all-VShard resume, data
 readback, old-controller restart, and tombstone-version recreation.
+
+The delete-receipt suites cover capacity- and time-based retirement, stable
+expired/conflict outcomes, snapshot state, recovery, and the write barrier
+needed before destructive history can be compacted. The production gate adds
+sustained RF=3 load, per-replica receipt/floor/snapshot observability, two
+distinct floor advances, exact old/new retry outcomes, sealed journal reclaim,
+and single-generation sidecar retention across repeated snapshots.

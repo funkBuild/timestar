@@ -1390,6 +1390,26 @@ std::optional<EngineDataStateMachine::DeleteReceiptCounts> ReplicatedVShardHost:
     return counts;
 }
 
+ReplicatedVShardHost::DeleteReceiptStats ReplicatedVShardHost::deleteReceiptStats() {
+    DeleteReceiptStats stats;
+    for (const auto& [vshard, state] : vshards_) {
+        if (!state.sm)
+            continue;
+        const auto counts = state.sm->deleteReceiptCounts();
+        stats.retained += counts.total;
+        stats.maxPerVShard = std::max(stats.maxPerVShard, counts.total);
+        stats.retiredBeforeMaxMs = std::max(stats.retiredBeforeMaxMs, counts.retiredBeforeMs);
+        stats.retiredAtMaxIndex = std::max(stats.retiredAtMaxIndex, counts.retiredAtIndex);
+        if (counts.retiredAtIndex == 0)
+            continue;
+        ++stats.groupsWithRetiredFloor;
+        auto* group = registry_.group(vshard);
+        if (!group || group->node().log().snapshotIndex() < counts.retiredAtIndex)
+            ++stats.retirementSnapshotPending;
+    }
+    return stats;
+}
+
 seastar::future<raft::LogIndex> ReplicatedVShardHost::leaderReadIndex(uint16_t vshard) {
     auto operation = holdVShardOperation(vshard);
     if (!operation)

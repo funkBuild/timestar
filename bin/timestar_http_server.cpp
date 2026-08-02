@@ -289,6 +289,19 @@ void set_routes(routes& r) {
                             ",\"snapshot_transfers_abandoned\":" + std::to_string(st.snapshotTransfersAbandoned) +
                             ",\"snapshot_production_limit_per_shard\":" +
                             std::to_string(st.snapshotProductionLimitPerShard);
+                    body += ",\"delete_receipts_retained\":" + std::to_string(st.deleteReceiptsRetained) +
+                            ",\"delete_receipts_max_per_vshard\":" +
+                            std::to_string(st.deleteReceiptsMaxPerVShard) +
+                            ",\"delete_receipt_capacity_per_vshard\":" +
+                            std::to_string(st.deleteReceiptCapacityPerVShard) +
+                            ",\"delete_receipt_groups_with_retired_floor\":" +
+                            std::to_string(st.deleteReceiptGroupsWithRetiredFloor) +
+                            ",\"delete_receipt_retirement_snapshot_pending\":" +
+                            std::to_string(st.deleteReceiptRetirementSnapshotPending) +
+                            ",\"delete_receipt_retired_before_max_ms\":" +
+                            std::to_string(st.deleteReceiptRetiredBeforeMaxMs) +
+                            ",\"delete_receipt_retired_at_max_index\":" +
+                            std::to_string(st.deleteReceiptRetiredAtMaxIndex);
                     // Raft journal fsyncs (debt D-10). journal_sync_requests /
                     // journal_fsyncs is the coalescing factor: 1.0 per-VShard, > 1
                     // with the shared per-shard journal. The DISK win is invisible on

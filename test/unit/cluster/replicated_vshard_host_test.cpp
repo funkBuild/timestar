@@ -1001,10 +1001,19 @@ TEST_F(ReplicatedVShardHostTest, SnapshotAdvancesAcrossDeleteOnlyReceiptRetireme
             << "a remote coordinator needs a typed terminal outcome, not an opaque RPC failure";
 
         const uint64_t retirementEntry = group->appliedIndex();
+        auto receiptStats = host.deleteReceiptStats();
+        EXPECT_EQ(receiptStats.retained, 1u);
+        EXPECT_EQ(receiptStats.maxPerVShard, 1u);
+        EXPECT_EQ(receiptStats.groupsWithRetiredFloor, 1u);
+        EXPECT_EQ(receiptStats.retirementSnapshotPending, 1u);
+        EXPECT_EQ(receiptStats.retiredAtMaxIndex, retirementEntry);
         EXPECT_EQ(host.snapshotVShard(series.vshard).get(), retirementEntry)
             << "durable destructive state must let a delete-only VShard compact without inventing a later write";
         EXPECT_EQ(host.snapshotsSkippedDeleteState(), 0u);
         EXPECT_EQ(group->node().log().snapshotIndex(), retirementEntry);
+        receiptStats = host.deleteReceiptStats();
+        EXPECT_EQ(receiptStats.groupsWithRetiredFloor, 1u);
+        EXPECT_EQ(receiptStats.retirementSnapshotPending, 0u);
 
         host.stop().get();
         fs::remove_all(jroot);

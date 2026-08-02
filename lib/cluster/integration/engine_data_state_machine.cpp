@@ -260,7 +260,8 @@ EngineDataStateMachine::DeleteReceiptStatus EngineDataStateMachine::deleteReceip
 }
 
 EngineDataStateMachine::DeleteReceiptCounts EngineDataStateMachine::deleteReceiptCounts() const {
-    return DeleteReceiptCounts{deleteReceipts_.size()};
+    return DeleteReceiptCounts{deleteReceipts_.size(), false, deleteReceiptsRetiredBeforeMs_,
+                               deleteReceiptsRetiredAtIndex_};
 }
 
 void EngineDataStateMachine::advanceDeleteReceiptFloor(uint64_t floorMs, uint64_t appliedIndex) {

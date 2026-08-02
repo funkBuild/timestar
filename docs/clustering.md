@@ -986,8 +986,9 @@ eligibility, joining, draining, and control-plane availability.
 
 The current `/cluster/status` endpoint now exposes group-0 enablement, hosting,
 initialization, leader/voter/config state, term/commit/applied/snapshot indices,
-replicated controller term/owner, map epochs, exact protocol version, apply/tick errors,
-controller actuation, and snapshot/GC maintenance. Its
+replicated controller term/owner, map epochs, exact protocol version, apply/tick
+errors, controller actuation, snapshot/GC maintenance, and bounded delete-receipt
+retirement/floor/snapshot coverage. Its
 `control_locally_ready` field requires a current-term controller stamp and
 commit but deliberately
 does not claim current quorum reachability; that requires an active ReadIndex

@@ -347,6 +347,8 @@ TEST_F(EngineDataStateMachineTest, ReceiptCapacityRetiresOldRetryWithoutDeleting
         ASSERT_EQ(state.receipts.size(), 2u);
         EXPECT_EQ(state.retiredBeforeMs, issuedAt);
         EXPECT_EQ(state.retiredAtIndex, 5u);
+        EXPECT_EQ(sm.deleteReceiptCounts(),
+                  (cluster::EngineDataStateMachine::DeleteReceiptCounts{2, false, issuedAt, 5}));
         EXPECT_EQ(sm.deleteReceiptStatus(a), cluster::EngineDataStateMachine::DeleteReceiptStatus::Expired);
         EXPECT_THROW(sm.checkDeleteAdmission(a), data::DeleteReceiptExpiredError);
 

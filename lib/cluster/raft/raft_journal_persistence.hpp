@@ -203,6 +203,10 @@ private:
     SnapshotFilePtr currentSnapshotFile_;
     SnapshotFilePtr pendingSnapshotFile_;
     SnapshotFilePtr pendingSupersededFile_;
+    // Distinguishes an ordinary append/sync (which must preserve the current
+    // sidecar) from a pending inline snapshot (whose new file is intentionally
+    // null and therefore retires the current sidecar).
+    bool pendingSnapshotUpdate_ = false;
 };
 
 // The Raft state reconstructed for one group from its recovered journal records.

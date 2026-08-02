@@ -260,6 +260,7 @@ seastar::future<> testFileSnapshotReplacementAndRecovery() {
     const VShardId vs{13};
     fs::path oldPath;
     fs::path latestPath;
+    SnapshotFilePtr staleOwner;
     {
         JournalWriter w(dir / "journal", header(), 1u << 20);
         co_await w.open();
@@ -273,7 +274,21 @@ seastar::future<> testFileSnapshotReplacementAndRecovery() {
         co_await p.persistSnapshot(first, false);
         co_await p.sync();
         oldPath = first.file->path;
+        // Model a Ready/transfer owner that outlives replacement. Sidecar
+        // retirement must follow descriptor durability, not shared_ptr lifetime.
+        staleOwner = first.file;
         first.file.reset();
+
+        // Real groups persist many ordinary Ready batches between compactions.
+        // Their sync barriers must not erase the persistence object's knowledge
+        // of the currently durable sidecar.
+        LogEntry between;
+        between.index = 6;
+        between.term = 2;
+        between.type = EntryType::Normal;
+        between.data = "ordinary-entry-between-snapshots";
+        co_await p.persistEntries({between});
+        co_await p.sync();
 
         Snapshot second;
         second.index = 9;
@@ -286,9 +301,11 @@ seastar::future<> testFileSnapshotReplacementAndRecovery() {
         second.file.reset();
 
         EXPECT_FALSE(fs::exists(oldPath)) << "a durably superseded sidecar must not leak forever";
+        EXPECT_TRUE(staleOwner) << "the old shared handle is deliberately still live";
         EXPECT_TRUE(fs::exists(latestPath));
         co_await w.close();
     }
+    staleOwner.reset();
 
     // The append-only journal still contains the first descriptor, whose file
     // was correctly retired above. Recovery must require only the latest one.

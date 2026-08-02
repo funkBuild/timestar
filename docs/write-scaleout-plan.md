@@ -136,8 +136,8 @@ see [ADR 0005](adr/0005-checkquorum-transfer-bypass.md).
 
 - [x] Stream complete VShard snapshots so the former 128 MiB full-payload cap
   cannot strand a hot VShard.
-- [ ] Prove sustained receipt retirement, snapshot progress, and journal reclaim
-  under delete-heavy live load.
+- [x] Prove sustained receipt retirement, snapshot progress, journal reclaim,
+  and superseded-sidecar cleanup under delete-heavy RF=3 live load.
 - [x] Complete production topology changes and ordered VShard teardown through
   group 0.
 - [x] Replicate exact-version TTL policies and one globally serialized,

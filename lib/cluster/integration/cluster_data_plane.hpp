@@ -260,6 +260,17 @@ public:
         uint64_t snapshotTransfersAbandoned = 0;
         size_t snapshotProductionLimitPerShard = 0;
         bool snapshotTriggerEnabled = false;
+        // Delete idempotency state over every data-group replica hosted by this
+        // process. The per-VShard maximum is the bounded-memory signal. A
+        // retirement remains pending until its advancing log entry is covered
+        // by that group's durable snapshot boundary.
+        uint64_t deleteReceiptsRetained = 0;
+        uint64_t deleteReceiptsMaxPerVShard = 0;
+        uint64_t deleteReceiptCapacityPerVShard = data::kMaxDeleteReceiptsPerVShard;
+        uint64_t deleteReceiptGroupsWithRetiredFloor = 0;
+        uint64_t deleteReceiptRetirementSnapshotPending = 0;
+        uint64_t deleteReceiptRetiredBeforeMaxMs = 0;
+        uint64_t deleteReceiptRetiredAtMaxIndex = 0;
         // Raft journal fsync accounting (debt D-10). journalSyncRequests /
         // journalFsyncs is the coalescing factor -- 1.0 for the default per-VShard
         // journal, > 1 when the shared per-shard journal is enabled.

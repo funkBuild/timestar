@@ -21,6 +21,7 @@ not probes, so they can be run from CI or a release checklist.
 | `retention_failover_gate.sh` | exact-version clustered retention policy CRUD and tombstone recreation, a controller kill after durable partial fan-out, completion of one global cutoff sequence across all 4,096 VShards by a new Group-0 leader, measurement isolation, and old-controller restart recovery |
 | `pattern_delete_failover_gate.sh` | an ambiguous coordinator crash only after another Group-0 voter applies a complete 6,000-target frozen plan, exact retry under a new leader without capturing a newly matching series, changed-body conflict, and killed-node restart recovery |
 | `large_snapshot_streaming_gate.sh` | an exact-v1 snapshot of 128 MiB + 1 byte crosses leader hydration, v1 Raft framing and receiver disk staging in chunks no larger than 4 MiB, with a 1 GiB process limit and all temporary data under `build/tmp` |
+| `delete_receipt_retirement_gate.sh` | sustained exact deletes cross the 1,024-receipt per-VShard capacity on every replica, advance the replicated retirement floor twice, preserve expired/retained retry outcomes, become snapshot-covered, reclaim production-sized sealed v1 journal segments, and retain only the current snapshot sidecar |
 
 All of them take an optional server binary as `$1` (default
 `build/bin/timestar_http_server`), so a "before" binary can be measured the same way.
@@ -51,6 +52,14 @@ and `build/tmp` roots. Its 6,000 one-point series keep the post-freeze fan-out
 observable without load-test volume. It polls a different voter for the exact
 plan/target count before killing the coordinator, and removes its three durable
 roots plus bounded request workspace on exit.
+
+`delete_receipt_retirement_gate.sh` uses three 1 GiB, one-reactor processes and
+`build/tmp` roots. Its 1,100 sequential exact deletes carry a legal 2-KiB series
+key so the hot VShard crosses the production 1-MiB private-journal rotation
+target without a high-cardinality dataset. It waits through the normal five-
+second snapshot sweep and one-minute journal-GC cadence, rejects superseded
+canonical sidecar leaks, and removes all roots and its bounded response
+workspace on exit.
 
 ## Run them ONE AT A TIME, with the previous run's data dirs deleted
 
@@ -193,6 +202,7 @@ cannot reintroduce the race.
 | `topology_mutation_gate.sh` | 19810-19813 | 20810-20813 | 21810-21813 | `1981` | `build/tmp/tsgate_tm*` |
 | `retention_failover_gate.sh` | 19830-19832 | 20830-20832 | 21830-21832 | `1983` | `build/tmp/tsgate_rt*` |
 | `pattern_delete_failover_gate.sh` | 19850-19852 | 20850-20852 | 21850-21852 | `1985` | `build/tmp/tsgate_pd*` |
+| `delete_receipt_retirement_gate.sh` | 19870-19872 | 20870-20872 | 21870-21872 | `1987` | `build/tmp/tsgate_dr*` |
 
 The prefixes are now four digits and unique per gate — they used to be three, so `492`
 covered both `backpressure` and `rolling_rebalance` and `197` also matched `--port 19730`,

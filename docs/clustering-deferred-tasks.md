@@ -23,8 +23,9 @@ Production blockers take priority and are authoritative in
   restart in a multi-process gate. The production-server gate makes the first
   response ambiguous only after another voter applies the complete plan, then
   proves exact target reuse, changed-body conflict, and restart recovery.
-- [ ] Prove bounded delete-receipt retirement, snapshot progress, and journal
-  reclaim under sustained delete-heavy load.
+- [x] Prove bounded delete-receipt retirement, snapshot progress, journal
+  reclaim, and one-current-sidecar retention under sustained delete-heavy RF=3
+  load.
 - [ ] Run final multi-host topology, security, durability, and SLO gates against
   the exact release candidate.
 

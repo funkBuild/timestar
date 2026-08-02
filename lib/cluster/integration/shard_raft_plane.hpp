@@ -825,6 +825,12 @@ public:
         bool shared = false;
     };
 
+    ReplicatedVShardHost::DeleteReceiptStats deleteReceiptStats() {
+        if (!plane_)
+            return {};
+        return plane_->host().deleteReceiptStats();
+    }
+
     JournalCounts journalCounts() const {
         JournalCounts c;
         if (!plane_)

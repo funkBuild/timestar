@@ -271,6 +271,19 @@ public:
     uint64_t proposeRefusedWhileLeader() const { return proposeRefusedWhileLeader_; }
     size_t vshardCount() const { return vshards_.size(); }
     std::optional<EngineDataStateMachine::DeleteReceiptCounts> deleteReceiptCounts(uint16_t vshard);
+    struct DeleteReceiptStats {
+        size_t retained = 0;
+        size_t maxPerVShard = 0;
+        size_t groupsWithRetiredFloor = 0;
+        size_t retirementSnapshotPending = 0;
+        uint64_t retiredBeforeMaxMs = 0;
+        uint64_t retiredAtMaxIndex = 0;
+    };
+    // Bounded aggregate observability for `/cluster/status`. The retained count
+    // includes each replica hosted by this process; maxPerVShard is the direct
+    // memory-bound signal. A retirement is pending until that group's durable
+    // Raft snapshot boundary covers the entry which advanced the floor.
+    DeleteReceiptStats deleteReceiptStats();
 
     void startTicking() { registry_.startTicking(); }
     seastar::future<> stop();
