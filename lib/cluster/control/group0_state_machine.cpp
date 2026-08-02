@@ -230,18 +230,28 @@ bool validSnapshotState(const Group0State& state) {
     for (const auto& [key, cell] : state.policies)
         if (key.empty() || cell.version == 0)
             return false;
+    if (state.jobs.size() > kMaxControlJobs || state.desiredPlacement.size() > kMaxControlJobs ||
+        state.jobs.size() != state.desiredPlacement.size())
+        return false;
     size_t unfinishedJobs = 0;
     for (const auto& [id, job] : state.jobs) {
         const auto move = decodeJob(job);
-        if (!validControlJobId(id) || id != job.id || !move || move->plan().mapEpoch > state.mapEpoch)
+        if (!validControlJobId(id) || id != job.id || !move || move->plan().mapEpoch != state.mapEpoch)
+            return false;
+        const auto desired = state.desiredPlacement.find(move->plan().vshard);
+        if (desired == state.desiredPlacement.end() || desired->second != move->targetVoters())
             return false;
         if (!job.done) {
             ++unfinishedJobs;
             if (move->plan().mapEpoch != state.mapEpoch || state.servingMap.epoch + 1 != state.mapEpoch)
                 return false;
+        } else if (state.servingMap.epoch != state.mapEpoch && state.servingMap.epoch + 1 != state.mapEpoch) {
+            return false;
         }
     }
     if (unfinishedJobs > 1)
+        return false;
+    if (state.jobs.empty() && state.servingMap.epoch != state.mapEpoch)
         return false;
     if (state.joinTokens.size() > kMaxOutstandingJoinTokens)
         return false;
@@ -282,7 +292,7 @@ bool allJobsDone(const Group0State& state) {
 
 bool validNewMove(const Group0State& state, const PlanVShardMove& command) {
     movement::MoveJob job(command.plan);
-    if (!validControlJobId(command.jobId) || state.jobs.size() >= kMaxControlJobs || !job.valid() ||
+    if (!validControlJobId(command.jobId) || state.jobs.size() > kMaxControlJobs || !job.valid() ||
         !isCompleteControlMap(state.servingMap) || state.mapEpoch != state.servingMap.epoch ||
         state.mapEpoch == std::numeric_limits<uint64_t>::max() || command.plan.mapEpoch != state.mapEpoch + 1 ||
         state.jobs.contains(command.jobId) || !allJobsDone(state))
@@ -413,6 +423,11 @@ bool Group0StateMachine::applyCommand(const ControlCommand& cmd) {
                 } else {
                     movement::MoveJob job(c.plan);
                     const std::string payload = job.encode();
+                    // A completed predecessor is no longer needed once the new
+                    // exact plan is committed. Replace both maps atomically so
+                    // full-node evacuation retains O(1) movement state.
+                    state_.jobs.clear();
+                    state_.desiredPlacement.clear();
                     state_.mapEpoch = c.plan.mapEpoch;
                     state_.desiredPlacement[c.plan.vshard] = job.targetVoters();
                     state_.jobs.emplace(
@@ -695,7 +710,7 @@ bool Group0StateMachine::decodeSnapshot(const std::string& data, Group0State& de
             r.ok = false;
     }
     uint64_t nJobs = r.u64();
-    if (!r.ok || nJobs > static_cast<uint64_t>(r.end - r.p) / 25)
+    if (!r.ok || nJobs > kMaxControlJobs || nJobs > static_cast<uint64_t>(r.end - r.p) / 25)
         r.ok = false;  // minimum job: id length + step + done + payload length
     for (uint64_t i = 0; i < nJobs && r.ok; ++i) {
         Job j;

@@ -72,6 +72,61 @@ TEST(RaftNodeTest, SingleVoterElectsItselfImmediately) {
     EXPECT_EQ(n.leader(), 1u);
 }
 
+TEST(RaftNodeTest, ReplicationAcknowledgementDoesNotImplyStateMachineApplication) {
+    RaftNode n(1, {1}, RaftLog{}, HardState{}, fixedTimeout(5), {2});
+    n.campaign();
+    ASSERT_TRUE(n.isLeader());
+    const LogIndex tail = n.log().lastIndex();
+    ASSERT_GT(tail, 0u);
+
+    AppendEntriesReply replicated;
+    replicated.term = n.currentTerm();
+    replicated.success = true;
+    replicated.matchIndex = tail;
+    replicated.appliedIndex = 0;
+    n.step(Message{.to = 1, .from = 2, .payload = replicated});
+    EXPECT_EQ(n.matchIndexOf(2), tail);
+    EXPECT_EQ(n.appliedIndexOf(2), 0u);
+
+    replicated.appliedIndex = tail;
+    n.step(Message{.to = 1, .from = 2, .payload = replicated});
+    EXPECT_EQ(n.appliedIndexOf(2), tail);
+}
+
+TEST(RaftNodeTest, RemovedAndReaddedPeerStartsWithUnknownReplicationProgress) {
+    RaftNode n(1, {1}, RaftLog{}, HardState{}, fixedTimeout(5), {2});
+    n.campaign();
+    ASSERT_TRUE(n.isLeader());
+    const LogIndex oldTail = n.log().lastIndex();
+
+    AppendEntriesReply caughtUp;
+    caughtUp.term = n.currentTerm();
+    caughtUp.success = true;
+    caughtUp.matchIndex = oldTail;
+    caughtUp.appliedIndex = oldTail;
+    n.step(Message{.to = 1, .from = 2, .payload = caughtUp});
+    ASSERT_EQ(n.matchIndexOf(2), oldTail);
+    ASSERT_EQ(n.appliedIndexOf(2), oldTail);
+    ASSERT_NE(n.ticksSinceAck(2), RaftNode::kNeverAcked);
+
+    ASSERT_TRUE(n.proposeConfChange({1}, {}));
+    ASSERT_FALSE(n.config().isLearner(2));
+    EXPECT_EQ(n.matchIndexOf(2), kNoIndex);
+    EXPECT_EQ(n.appliedIndexOf(2), kNoIndex);
+    EXPECT_EQ(n.ticksSinceAck(2), RaftNode::kNeverAcked);
+    ASSERT_TRUE(n.isLeader());
+    ASSERT_FALSE(n.config().joint());
+    ASSERT_EQ(n.commitIndex(), n.latestConfigIndex());
+
+    ASSERT_TRUE(n.proposeConfChange({1}, {2}));
+    ASSERT_TRUE(n.config().isLearner(2));
+    ASSERT_GT(n.nextIndexOf(2), kNoIndex);
+    EXPECT_EQ(n.matchIndexOf(2), kNoIndex)
+        << "a rebuilt replica must backtrack from the log tail, not its previous incarnation's match";
+    EXPECT_EQ(n.appliedIndexOf(2), kNoIndex);
+    EXPECT_EQ(n.ticksSinceAck(2), RaftNode::kNeverAcked);
+}
+
 TEST(RaftNodeTest, ElectionTimeoutStartsCandidacyAndRequestsVotes) {
     RaftNode n(1, {1, 2, 3}, RaftLog{}, HardState{}, fixedTimeout(3));
     for (int i = 0; i < 2; ++i) {

@@ -181,6 +181,7 @@ std::string encodeEnvelope(const Envelope& env) {
                 w.u64(p.conflictIndex);
                 w.u64(p.conflictTerm);
                 w.u64(p.readSeq);
+                w.u64(p.appliedIndex);
             } else if constexpr (std::is_same_v<T, InstallSnapshot>) {
                 w.u8(kInstallSnapshot);
                 w.u64(p.term);
@@ -269,6 +270,7 @@ std::optional<Envelope> decodeEnvelope(const std::string& bytes) {
             p.conflictIndex = r.u64();
             p.conflictTerm = r.u64();
             p.readSeq = r.u64();
+            p.appliedIndex = r.u64();
             env.message.payload = p;
             break;
         }

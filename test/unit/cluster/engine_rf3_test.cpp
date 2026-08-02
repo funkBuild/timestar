@@ -77,16 +77,30 @@ public:
             queue_.pop_front();
             if (down_.count(e.message.to) || down_.count(e.message.from))
                 continue;
+            if (std::holds_alternative<AppendEntries>(e.message.payload))
+                ++appendEntriesDelivered_[{e.message.from, e.message.to}];
             auto it = groups_.find(e.message.to);
             if (it != groups_.end() && it->second)
                 co_await it->second->step(std::move(e.message));
         }
+    }
+    size_t appendEntriesDelivered(NodeId from, NodeId to) const {
+        auto it = appendEntriesDelivered_.find({from, to});
+        return it == appendEntriesDelivered_.end() ? 0 : it->second;
+    }
+    size_t appendEntriesDeliveredTo(NodeId to) const {
+        size_t total = 0;
+        for (const auto& [route, count] : appendEntriesDelivered_)
+            if (route.second == to)
+                total += count;
+        return total;
     }
 
 private:
     std::map<NodeId, RaftGroup*> groups_;
     std::set<NodeId> down_;
     std::deque<Envelope> queue_;
+    std::map<std::pair<NodeId, NodeId>, size_t> appendEntriesDelivered_;
 };
 seastar::future<> RouterTransport::send(Envelope env) {
     r_.enqueue(std::move(env));
@@ -687,13 +701,102 @@ TEST_F(EngineRf3Test, MoverReplacesFollowerAcrossFourNodes) {
         EXPECT_EQ(finalVoters, (std::vector<NodeId>{1, 2, 4})) << "voters must be {1,2,4} after the replace";
         EXPECT_FALSE(reps[leader].group->node().config().joint());
 
-        // The moved data is present on the NEW replica (node 4 caught up + applied).
-        tick(30);
-        EXPECT_DOUBLE_EQ(latestOn(*reps[4].engine, "mv", "value"), 3.14) << "node 4 has the moved data";
-
         // The job persisted forward steps through Promoted/OldRemoved to Done.
         EXPECT_FALSE(persisted.empty());
         EXPECT_EQ(persisted.back(), movement::MoveStep::Done);
+
+        // Model production retirement: node 3 discards the removed replica's
+        // journal and later materializes a fresh group from the surviving
+        // {1,2,4} configuration. Reusing the same node ID must not reuse its old
+        // replication progress on the leader.
+        router.setGroup(3, nullptr);
+        reps[3].group.reset();
+        // Once the stale removed replica is silent, the surviving configuration
+        // keeps its leader and finishes applying the destination's tail.
+        tick(30);
+        EXPECT_DOUBLE_EQ(latestOn(*reps[4].engine, "mv", "value"), 3.14) << "node 4 has the moved data";
+        reps[3].persistence.reset();
+        reps[3].writer->close().get();
+        reps[3].writer.reset();
+        reps[3].sm.reset();
+        reps[3].store.reset();
+        reps[3].engine.reset();
+        fs::remove_all(journalDirs[2]);
+        fs::remove_all(engineDirs[2]);
+
+        Replica rebuilt;
+        rebuilt.engine = std::make_unique<ScopedShardedEngine>();
+        rebuilt.engine->startAt(engineDirs[2].string());
+        rebuilt.store = std::make_unique<cluster::EngineLocalStore>(**rebuilt.engine);
+        rebuilt.sm = std::make_unique<cluster::EngineDataStateMachine>(*rebuilt.store, timestar::VShardId{1});
+        rebuilt.writer = std::make_unique<JournalWriter>(journalDirs[2], header(), 1u << 20);
+        auto rebuiltRecovered = rebuilt.writer->open().get();
+        RecoveredRaftState rebuiltState = recoverRaftState(rebuiltRecovered, VShardId{1});
+        rebuilt.persistence =
+            std::make_unique<JournalRaftPersistence>(*rebuilt.writer, VShardId{1}, rebuiltState.nextSeq);
+        rebuilt.transport = std::make_unique<RouterTransport>(router);
+        RaftNode rebuiltNode(3, {1, 2, 4}, std::move(rebuiltState.log), rebuiltState.hardState, optsFor(3, leader), {});
+        rebuilt.group = std::make_unique<RaftGroup>(1, std::move(rebuiltNode), *rebuilt.persistence, *rebuilt.transport,
+                                                    *rebuilt.sm);
+        router.setGroup(3, rebuilt.group.get());
+        reps[3] = std::move(rebuilt);
+
+        NodeId returnLeader = kNoNode;
+        for (const auto& [id, replica] : reps)
+            if (replica.group && replica.group->isLeader())
+                returnLeader = id;
+        ASSERT_NE(returnLeader, kNoNode);
+
+        std::vector<movement::MoveStep> returnPersisted;
+        cluster::RaftGroupMoveExecutor returnExec(*reps[returnLeader].group,
+                                                  [&returnPersisted](const movement::MoveJob& j) {
+                                                      returnPersisted.push_back(j.step());
+                                                      return seastar::make_ready_future<>();
+                                                  });
+        movement::MoveJob returnJob(
+            movement::MovePlan{/*vshard=*/1, /*dest=*/3, /*victim=*/4, /*mapEpoch=*/3, {1, 2, 4}});
+        ASSERT_FALSE(reps[returnLeader].group->node().config().isLearner(3));
+        ASSERT_EQ(reps[returnLeader].group->matchIndexOf(3), kNoIndex);
+        unsigned stepsAllowed = 1;
+        auto addLearner = mover.run(returnJob, returnExec, [&stepsAllowed] { return stepsAllowed-- > 0; });
+        for (int i = 0; i < 8000 && !addLearner.available(); ++i)
+            tickAll();
+        addLearner.get();
+        ASSERT_EQ(returnJob.step(), movement::MoveStep::LearnerAdded);
+        ASSERT_TRUE(reps[returnLeader].group->isLeader());
+        ASSERT_TRUE(reps[returnLeader].group->node().config().isLearner(3));
+        const size_t appendBefore = router.appendEntriesDeliveredTo(3);
+        tick(1);
+        ASSERT_TRUE(reps[returnLeader].group->isLeader());
+        ASSERT_TRUE(reps[returnLeader].group->node().config().isLearner(3));
+        ASSERT_GT(reps[returnLeader].group->node().nextIndexOf(3), kNoIndex)
+            << "returnLeader=" << returnLeader << ", role=" << static_cast<unsigned>(reps[returnLeader].group->role())
+            << ", leader=" << reps[returnLeader].group->leader()
+            << ", config_index=" << reps[returnLeader].group->node().latestConfigIndex()
+            << ", commit=" << reps[returnLeader].group->commitIndex();
+        ASSERT_GT(router.appendEntriesDeliveredTo(3), appendBefore)
+            << "the re-added learner must remain in the active leader's replication peer set; prior leader role="
+            << static_cast<unsigned>(reps[returnLeader].group->role())
+            << ", leader=" << reps[returnLeader].group->leader();
+        ASSERT_GT(reps[3].group->node().log().lastIndex(), kNoIndex)
+            << "the freshly materialized learner must accept an AppendEntries prefix; leader term="
+            << reps[returnLeader].group->node().currentTerm()
+            << ", learner term=" << reps[3].group->node().currentTerm()
+            << ", learner leader=" << reps[3].group->leader();
+        ASSERT_GT(reps[returnLeader].group->matchIndexOf(3), kNoIndex);
+
+        auto returnMove = mover.run(returnJob, returnExec);
+        for (int i = 0; i < 8000 && !returnMove.available(); ++i)
+            tickAll();
+        returnMove.get();
+        ASSERT_TRUE(returnJob.done()) << "a retired node ID must be reusable for a fresh replica; stopped at step "
+                                      << static_cast<unsigned>(returnJob.step())
+                                      << ", leader=" << reps[returnLeader].group->leader();
+        auto returnedVoters = reps[returnLeader].group->node().config().voters;
+        std::sort(returnedVoters.begin(), returnedVoters.end());
+        EXPECT_EQ(returnedVoters, (std::vector<NodeId>{1, 2, 3}));
+        EXPECT_DOUBLE_EQ(latestOn(*reps[3].engine, "mv", "value"), 3.14)
+            << "the rebuilt replica receives the full missing log prefix";
 
         for (auto& [id, r] : reps) {
             router.setGroup(id, nullptr);

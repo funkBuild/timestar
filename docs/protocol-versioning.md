@@ -24,7 +24,7 @@ historical-reader guarantees during the greenfield phase.
 | Movement destination/actuation RPC frames | version byte `1`, carried only after the exact-v1 connection handshake |
 | Group-0 snapshot | `TSG0SNP1` |
 | Persisted VShard movement job | `TSMJ1`: step, VShard, target map epoch, full-width destination/victim IDs, exact source voters |
-| Raft envelope | `TSR1` |
+| Raft envelope | `TSR1`; `AppendEntriesReply` carries both replicated match index and state-machine applied index |
 | Raft journal snapshot record | `TSRSNAP1` |
 | WAL segment | `TSWL` plus little-endian `uint32(1)` |
 | TSM file | `TASM` plus byte `1` |
@@ -44,6 +44,12 @@ Nested request/reply payloads carried over the negotiated data-plane connection
 use the one current v1 schema. Fields are mandatory according to that schema;
 decoders do not accept truncated historical layouts or optional compatibility
 tails.
+
+The exact-v1 Raft append reply reports application progress separately from log
+replication progress. Group-0 lifecycle code uses that distinction to retain a
+departing learner until it has applied the final serving map and its own
+`Removed` record. This is an in-place `TSR1` schema update for the greenfield
+format, not a second protocol version.
 
 NativeIndex v1 uses local-ID forward mappings, roaring postings, and per-value
 tag markers directly. It has no pre-bitmap migration or tag-value blob reader;

@@ -36,6 +36,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <optional>
 #include <seastar/core/app-template.hh>
 #include <seastar/core/coroutine.hh>
@@ -146,6 +147,7 @@ struct ClusterJoinRequestBody {
 
 struct ClusterMoveRequestBody {
     std::string job_id;
+    uint64_t map_epoch = 0;
     uint32_t vshard = UINT32_MAX;
     uint64_t destination = timestar::raft::kNoNode;
     uint64_t victim = timestar::raft::kNoNode;
@@ -330,6 +332,10 @@ void set_routes(routes& r) {
                           ",\"control_nodes\":" + std::to_string(st.controlNodes) +
                           ",\"control_voters\":" + std::to_string(st.controlVoters) +
                           ",\"control_learners\":" + std::to_string(st.controlLearners) +
+                          ",\"control_draining_nodes\":" + std::to_string(st.controlDrainingNodes) +
+                          ",\"control_drain_references\":" + std::to_string(st.controlDrainReferences) +
+                          ",\"control_drain_blocked\":" + std::string(st.controlDrainBlocked ? "true" : "false") +
+                          ",\"control_removals_pending\":" + std::to_string(st.controlRemovalsPending) +
                           ",\"control_apply_lag_entries\":" + std::to_string(st.controlApplyLagEntries) +
                           ",\"control_apply_failures\":" + std::to_string(st.controlApplyFailures) +
                           ",\"control_tick_errors\":" + std::to_string(st.controlTickErrors) +
@@ -345,6 +351,8 @@ void set_routes(routes& r) {
                           std::to_string(st.controlControllerActuationFailures) +
                           ",\"control_topology_passes\":" + std::to_string(st.controlTopologyPasses) +
                           ",\"control_topology_failures\":" + std::to_string(st.controlTopologyFailures) +
+                          ",\"control_topology_plans\":" + std::to_string(st.controlTopologyPlans) +
+                          ",\"control_topology_cutovers\":" + std::to_string(st.controlTopologyCutovers) +
                           ",\"control_topology_advances\":" + std::to_string(st.controlTopologyAdvances) +
                           ",\"protocol_version\":1";
                   }
@@ -515,17 +523,20 @@ void set_routes(routes& r) {
             }
             ClusterMoveRequestBody body;
             if (req->content.size() > 4096 || glz::read_json(body, req->content) ||
-                !timestar::control::validControlJobId(body.job_id) || body.vshard >= timestar::VIRTUAL_SHARD_COUNT ||
-                body.destination == timestar::raft::kNoNode || body.destination == body.victim) {
+                !timestar::control::validControlJobId(body.job_id) || body.map_epoch == 0 ||
+                body.map_epoch == std::numeric_limits<uint64_t>::max() ||
+                body.vshard >= timestar::VIRTUAL_SHARD_COUNT || body.destination == timestar::raft::kNoNode ||
+                body.destination == body.victim) {
                 rep->set_status(seastar::http::reply::status_type::bad_request);
                 rep->_content =
-                    R"({"status":"error","message":"job_id, vshard, and destination must identify a valid v1 move"})";
+                    R"({"status":"error","message":"job_id, map_epoch, vshard, and destination must identify a valid v1 move"})";
                 co_return std::move(rep);
             }
             try {
                 const auto result = co_await seastar::smp::submit_to(0u, [body = std::move(body)]() mutable {
-                    return g_clusterDataPlane.planControlMove(
-                        std::move(body.job_id), static_cast<uint16_t>(body.vshard), body.destination, body.victim);
+                    return g_clusterDataPlane.planControlMove(std::move(body.job_id), body.map_epoch,
+                                                              static_cast<uint16_t>(body.vshard), body.destination,
+                                                              body.victim);
                 });
                 setControlMutationReply(*rep, result, "planned");
             } catch (const std::exception& e) {
@@ -821,14 +832,18 @@ int main(int argc, char** argv) {
             }
 
             std::optional<timestar::cluster::RetirementCrashSpec> retirementCrash;
+            std::optional<std::vector<timestar::raft::NodeId>> initialReplicaSetForTesting;
             try {
                 const auto& cc = timestar::config().cluster;
                 retirementCrash = timestar::cluster::parseRetirementCrashSpec(
                     std::getenv("TIMESTAR_UNSAFE_TEST_RETIREMENT_CRASH"),
                     std::getenv("TIMESTAR_UNSAFE_TEST_RETIREMENT_VSHARD"), cc.development_allow_insecure_transport,
                     cc.control_enabled);
+                initialReplicaSetForTesting = timestar::cluster::parseInitialReplicaSetForTesting(
+                    std::getenv("TIMESTAR_UNSAFE_TEST_INITIAL_REPLICAS"), cc.development_allow_insecure_transport,
+                    cc.control_enabled, cc.replication_factor, cc.peers.size());
             } catch (const std::exception& e) {
-                timestar::http_log.error("Invalid unsafe retirement test failpoint: {}", e.what());
+                timestar::http_log.error("Invalid unsafe cluster test configuration: {}", e.what());
                 return 1;
             }
 
@@ -1040,6 +1055,8 @@ int main(int argc, char** argv) {
                     if (group0Identity)
                         g_clusterDataPlane.setGroup0Identity(*group0Identity);
                     g_clusterDataPlane.requestGroup0Bootstrap(clusterInitRequested);
+                    if (initialReplicaSetForTesting)
+                        g_clusterDataPlane.setInitialReplicaSetForTesting(*initialReplicaSetForTesting);
                     if (clusterTls)
                         g_clusterDataPlane.setTlsCredentials(*clusterTls);
                     g_clusterDataPlane.start(cc, g_engine).get();

@@ -159,6 +159,35 @@ public:
         return false;
     }
 
+    // A materialized destination is a follower of the data group and may apply
+    // a membership entry after the leader has already persisted the matching
+    // job step in Group 0. Accept every exact stable/joint configuration on this
+    // immutable move's path so that lag does not create a circular wait. This is
+    // deliberately separate from acceptsConfig(), which remains step-exact for
+    // the leader that is authorized to perform the next mutation.
+    bool acceptsMaterializedConfig(const std::vector<NodeId>& voters, const std::vector<NodeId>& outgoing,
+                                   const std::vector<NodeId>& learners) const {
+        if (!valid())
+            return false;
+        const auto source = canonical(plan_.sourceVoters);
+        const auto promoted = canonical(withNode(source, plan_.dest));
+        const auto final = plan_.isReplace() ? canonical(withoutNode(promoted, plan_.victim)) : promoted;
+        const auto liveVoters = canonical(voters);
+        const auto liveOutgoing = canonical(outgoing);
+        const auto liveLearners = canonical(learners);
+        const std::vector<NodeId> none;
+        const auto destinationLearner = canonical(std::vector<NodeId>{plan_.dest});
+
+        if (liveOutgoing.empty())
+            return (liveVoters == source && (liveLearners == none || liveLearners == destinationLearner)) ||
+                   ((liveVoters == promoted || liveVoters == final) && liveLearners == none);
+        if (liveVoters == source && liveOutgoing == source && liveLearners == destinationLearner)
+            return true;  // adding the learner
+        if (liveVoters == promoted && liveOutgoing == source && liveLearners == none)
+            return true;  // promoting the caught-up learner
+        return plan_.isReplace() && liveVoters == final && liveOutgoing == promoted && liveLearners == none;
+    }
+
     // The step that must be performed next (the transition OUT of the current
     // step). Done stays Done.
     MoveStep nextStep() const {

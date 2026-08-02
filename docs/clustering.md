@@ -1023,27 +1023,48 @@ Authenticated topology mutations use the same bearer policy and deliberately
 refuse unauthenticated development mode:
 
 ```text
-POST /cluster/vshards/move  {"job_id":"move-0042","vshard":42,"destination":4,"victim":3}
+POST /cluster/vshards/move  {"job_id":"move-0042","map_epoch":17,"vshard":42,"destination":4,"victim":3}
 POST /cluster/nodes/drain   {"node":3}
 POST /cluster/nodes/remove  {"node":3}
 ```
 
-Omit `victim` (or use zero) for a grow. A caller cannot supply source voters or
-the map epoch: the current Group-0 leader derives both from committed v1 state.
-An accepted command returns HTTP 202 with the control leader and map epoch. A
-known-leader redirect or policy conflict returns 409; an unknown control leader
-or unavailable control plane returns 503. Planning one move does not evacuate a
-whole node: drain the node, submit bounded replacement moves until no serving
-placement references it, then request removal. Removal remains blocked while a
-serving placement, unfinished job, Group-0 learner/voter, or replicated
-meta-voter reference exists.
+Omit `victim` (or use zero) for a grow. `map_epoch` is the caller's required
+optimistic-concurrency fence and must equal the currently observed serving-map
+epoch; the Group-0 leader derives the source voters and next epoch. A delayed
+retry from an older epoch is rejected even after the one retained v1 movement
+record has been replaced. An accepted command returns HTTP 202 with the control
+leader and map epoch. A known-leader redirect, stale epoch, or policy conflict
+returns 409; an unknown control leader or unavailable control plane returns 503.
+
+`drain` is the durable whole-node workflow. After committing `Draining`, the
+controller scans VShards in canonical order and drives one exact replacement at
+a time. It chooses an Active destination in a distinct failure domain from the
+remaining replicas, then minimizes current replica load and node ID. A new
+controller repeats the same decision from Group-0 state; there is no local
+cursor. Each new plan atomically replaces its completed predecessor, so draining
+thousands of VShards keeps one bounded v1 job and desired-placement record.
+`control_drain_references` reaches zero only after every cutover is published;
+`control_drain_blocked` reports that references remain but no safe destination
+exists.
 
 Node lifecycle is exactly `Joining -> Active -> Draining -> Removed`; retries of
 the drain and remove operations are idempotent and no backward or skipped state
 transition is accepted. A replacement whose victim still leads the data group
 first transfers leadership to a live caught-up surviving voter. A later bounded
 controller pass removes the now-follower victim and only then publishes the new
-serving map.
+serving map. The draining node is demoted from Group-0 voter to learner but is
+retained through evacuation. Removal remains blocked by a serving-map reference,
+unfinished job, or voter/meta-voter role. It is committed only after the learner
+reports state-machine application of the final serving map; the learner is
+evicted only after it also reports application of its own `Removed` record.
+Replication acknowledgement alone is not treated as application proof.
+
+`GET /cluster/status` exposes this workflow through
+`control_draining_nodes`, `control_drain_references`,
+`control_drain_blocked`, `control_removals_pending`,
+`control_topology_plans`, `control_topology_advances`, and
+`control_topology_cutovers`. A rate-limited warning names a durable movement job
+that repeatedly waits on destination materialization or data-group actuation.
 
 The controller-side admission sequence remains fail-closed: token admission
 records `Joining`, adds the node only as a learner,

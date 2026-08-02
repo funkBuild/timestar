@@ -153,6 +153,9 @@ public:
     void setJournalIdentity(JournalIdentity identity) { journalIdentity_ = identity; }
     void setGroup0Identity(control::NodeRecord record) { group0Identity_ = std::move(record); }
     void requestGroup0Bootstrap(bool requested = true) { group0BootstrapRequested_ = requested; }
+    void setInitialReplicaSetForTesting(std::vector<NodeId> replicas) {
+        initialReplicaSetForTesting_ = std::move(replicas);
+    }
 
     // Route a partitioned write to VShard owners (local applied directly, remote
     // forwarded), and a query fanned out to owners then merged to the single-node
@@ -301,6 +304,10 @@ public:
         size_t controlNodes = 0;
         size_t controlVoters = 0;
         size_t controlLearners = 0;
+        size_t controlDrainingNodes = 0;
+        size_t controlDrainReferences = 0;
+        bool controlDrainBlocked = false;
+        size_t controlRemovalsPending = 0;
         uint64_t controlApplyLagEntries = 0;
         uint64_t controlApplyFailures = 0;
         uint64_t controlTickErrors = 0;
@@ -313,6 +320,8 @@ public:
         uint64_t controlControllerActuationFailures = 0;
         uint64_t controlTopologyPasses = 0;
         uint64_t controlTopologyFailures = 0;
+        uint64_t controlTopologyPlans = 0;
+        uint64_t controlTopologyCutovers = 0;
         uint64_t controlTopologyAdvances = 0;
 
         // This is intentionally LOCAL readiness, not a quorum-health claim.
@@ -385,7 +394,8 @@ public:
     // Authenticated HTTP handlers call these shard-0 seams. The controller
     // derives source placement and the next map epoch from committed Group 0;
     // callers supply only stable identities and intent.
-    seastar::future<ControlMutationResult> planControlMove(std::string jobId, uint16_t vshard, NodeId destination,
+    seastar::future<ControlMutationResult> planControlMove(std::string jobId, uint64_t expectedMapEpoch,
+                                                           uint16_t vshard, NodeId destination,
                                                            NodeId victim = raft::kNoNode);
     seastar::future<ControlMutationResult> drainControlNode(NodeId node);
     seastar::future<ControlMutationResult> removeControlNode(NodeId node);
@@ -486,6 +496,7 @@ private:
     std::string controlClusterUuid_;
     NodeId controlSeedNode_ = raft::kNoNode;
     bool group0BootstrapRequested_ = false;
+    std::optional<std::vector<NodeId>> initialReplicaSetForTesting_;
     // Declared in dependency order: deps before the router/coordinator that reference
     // them, so destruction (reverse order) tears the referrers down first.
     std::unique_ptr<data::VShardDirectory> dir_;
@@ -517,6 +528,8 @@ private:
     bool topologyRunning_ = false;
     uint64_t topologyPasses_ = 0;
     uint64_t topologyFailures_ = 0;
+    uint64_t topologyPlans_ = 0;
+    uint64_t topologyCutovers_ = 0;
     uint64_t topologyAdvances_ = 0;
 
     // Standing leadership-balancing loop (M5). Without it a fresh cluster leaves ALL

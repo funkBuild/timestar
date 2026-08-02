@@ -167,6 +167,7 @@ private:
     const LeaderResolver& leaders_;
     // Last time we asked the plane to wake groups behind a given peer.
     std::map<NodeId, seastar::lowres_clock::time_point> lastWake_;
+    uint64_t remoteTransportFailures_ = 0;
     static constexpr auto kWakeInterval = std::chrono::milliseconds(500);
 };
 

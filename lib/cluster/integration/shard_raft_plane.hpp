@@ -419,14 +419,14 @@ public:
         auto& host = plane_->host();
         if (raft::RaftGroup* existing = host.group(move.plan().vshard)) {
             const auto& config = existing->node().config();
-            co_return move.acceptsConfig(config.voters, config.votersOutgoing, config.learners);
+            co_return move.acceptsMaterializedConfig(config.voters, config.votersOutgoing, config.learners);
         }
         if (!dataRaftOptionsConfigured_)
             co_return false;
         try {
             co_await plane_->addVShard(
                 move.plan().vshard, move.plan().sourceVoters, dataRaftOptions_, [move](const raft::Config& config) {
-                    return move.acceptsConfig(config.voters, config.votersOutgoing, config.learners);
+                    return move.acceptsMaterializedConfig(config.voters, config.votersOutgoing, config.learners);
                 });
         } catch (const std::exception& e) {
             timestar::http_log.warn("cluster: refused movement destination group {}: {}", move.plan().vshard, e.what());
@@ -660,6 +660,10 @@ public:
         size_t nodes = 0;
         size_t voters = 0;
         size_t learners = 0;
+        size_t drainingNodes = 0;
+        size_t drainReferences = 0;
+        bool drainBlocked = false;
+        size_t removalsPending = 0;
         uint64_t applyLagEntries = 0;
         uint64_t applyFailures = 0;
         uint64_t tickErrors = 0;
@@ -700,6 +704,15 @@ public:
         c.nodes = state.nodes.size();
         c.voters = config.voters.size();
         c.learners = config.learners.size();
+        const auto drain = control::selectNextDrainMove(state);
+        c.drainingNodes = drain.drainingNodes;
+        c.drainReferences = drain.remainingReferences;
+        c.drainBlocked = drain.state == control::DrainMoveState::Blocked;
+        for (const auto& [id, record] : state.nodes)
+            if (record.state == control::NodeState::Removed &&
+                (config.isVoter(id) || config.isLearner(id) ||
+                 std::find(state.metaVoters.begin(), state.metaVoters.end(), id) != state.metaVoters.end()))
+                ++c.removalsPending;
         c.applyLagEntries = group->applyLag();
         c.applyFailures = group->applyFailures();
         c.tickErrors = host->tickErrors();

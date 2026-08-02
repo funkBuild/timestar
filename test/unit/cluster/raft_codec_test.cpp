@@ -88,12 +88,15 @@ TEST(RaftCodecTest, AppendEntriesEmptyHeartbeatRoundTrip) {
 }
 
 TEST(RaftCodecTest, AppendEntriesReplyRoundTrip) {
-    auto e = roundTrip(wrap(2, 1, 3, AppendEntriesReply{4, false, 0, 7, 2}));
+    AppendEntriesReply reply{4, false, 0, 7, 2};
+    reply.appliedIndex = 6;
+    auto e = roundTrip(wrap(2, 1, 3, reply));
     const auto* got = std::get_if<AppendEntriesReply>(&e.message.payload);
     ASSERT_NE(got, nullptr);
     EXPECT_FALSE(got->success);
     EXPECT_EQ(got->conflictIndex, 7u);
     EXPECT_EQ(got->conflictTerm, 2u);
+    EXPECT_EQ(got->appliedIndex, 6u);
 }
 
 TEST(RaftCodecTest, InstallSnapshotRoundTrip) {

@@ -71,6 +71,10 @@ struct AppendEntriesReply {
     Term conflictTerm = kNoTerm;
     // Echoed AppendEntries.readSeq (for the ReadIndex confirmation round).
     uint64_t readSeq = 0;
+    // Highest state-machine index applied before this AppendEntries was
+    // handled. Unlike matchIndex, this lets a controller prove a departing
+    // learner consumed a committed serving-map decision before eviction.
+    LogIndex appliedIndex = kNoIndex;
 };
 
 // §7 snapshot install, when the follower has fallen behind the leader's

@@ -15,6 +15,30 @@
 
 namespace timestar::control {
 
+enum class DrainMoveState : uint8_t {
+    Idle = 0,
+    InProgress = 1,
+    Ready = 2,
+    Blocked = 3,
+};
+
+// Pure, deterministic view of node-drain progress. `remainingReferences`
+// counts serving-map replica slots owned by Draining nodes. Ready identifies
+// the next exact one-VShard replacement; Blocked means references remain but
+// no Active, failure-domain-safe destination exists in committed Group-0 state.
+struct DrainMoveDecision {
+    DrainMoveState state = DrainMoveState::Idle;
+    size_t drainingNodes = 0;
+    size_t remainingReferences = 0;
+    NodeId victim = raft::kNoNode;
+    uint16_t vshard = 0;
+    NodeId destination = raft::kNoNode;
+
+    friend bool operator==(const DrainMoveDecision&, const DrainMoveDecision&) = default;
+};
+
+DrainMoveDecision selectNextDrainMove(const Group0State& state);
+
 // Orchestrates the group-0 control plane on top of its RaftGroup: the bootstrap
 // ceremony, node admission, self-managed meta-voter membership (via joint
 // consensus), and controller-term stamping. All mutations are ordinary group-0
@@ -73,8 +97,16 @@ public:
     // Atomically create one movement job from the current serving membership.
     // The controller, not the caller, supplies the authoritative source voters
     // and next map epoch so an operator cannot forge a stale removal plan.
-    seastar::future<bool> planVShardMove(std::string jobId, uint16_t vshard, NodeId destination,
-                                         NodeId victim = raft::kNoNode);
+    // `expectedMapEpoch` is an optimistic-concurrency fence supplied by an
+    // operator from the last status/mutation response. It makes a delayed retry
+    // harmless after the single retained v1 movement record has been replaced.
+    seastar::future<bool> planVShardMove(std::string jobId, uint64_t expectedMapEpoch, uint16_t vshard,
+                                         NodeId destination, NodeId victim = raft::kNoNode);
+
+    // Plan the next deterministic replacement for any Draining node. Exactly
+    // one Group-0 command is proposed; a new controller recomputes the same
+    // decision from the committed serving map after a crash.
+    seastar::future<DrainMoveDecision> planNextDrainMove();
 
     // Publish the next serving-map epoch only after the named movement job is
     // durably Done. The state machine independently re-derives and validates the
@@ -116,6 +148,7 @@ public:
 
 private:
     seastar::lowres_clock::time_point proposalDeadline() const;
+    bool memberCaughtUp(raft::NodeId node) const;
 
     raft::RaftGroup& g0_;
     Group0StateMachine& sm_;

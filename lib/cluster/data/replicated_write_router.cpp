@@ -268,8 +268,23 @@ seastar::future<> ReplicatedBatchWriteRouter::write(VShardBatches groups) {
                 noteKind(kind);
                 // Remember WHO was unreachable; whether to wake the groups behind it is
                 // decided at give-up time, not here (see wakeGroupsBehind).
-                if (kind == WriteFailure::Transport && !isLocal)
+                if (kind == WriteFailure::Transport && !isLocal) {
                     unreachable.insert(pendingTargets[i]);
+                    if (remoteTransportFailures_++ % 1024 == 0) {
+                        try {
+                            std::rethrow_exception(std::current_exception());
+                        } catch (const std::exception& e) {
+                            timestar::http_log.warn(
+                                "cluster: forwarded write transport to node {} failed: {} (occurrence {})",
+                                pendingTargets[i], e.what(), remoteTransportFailures_);
+                        } catch (...) {
+                            timestar::http_log.warn(
+                                "cluster: forwarded write transport to node {} failed with a non-standard exception "
+                                "(occurrence {})",
+                                pendingTargets[i], remoteTransportFailures_);
+                        }
+                    }
+                }
                 for (const auto* g : *pendingViews[i])
                     failed[g->first] = g;
             }

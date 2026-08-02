@@ -3,7 +3,7 @@
 **Status:** BLOCKED — clustered deployment is not approved for production.
 
 **Reviewed baseline:** `cluster-design`, reviewed 2026-08-01 and updated
-2026-08-02.
+2026-08-03.
 
 This is the authoritative blocker list for the cluster redesign. Historical
 milestone documents describe how the design evolved; they are not release
@@ -91,6 +91,14 @@ inventory and rules.
   lifecycle transitions, keeps a node non-removable while any serving-map, job,
   learner, or voter reference remains, and transfers data-group leadership away
   from a replacement victim before removing it.
+- [x] Complete bounded whole-node evacuation and application-fenced removal.
+  The Group-0 controller scans referenced VShards in canonical order, chooses a
+  deterministic failure-domain-safe destination, retains only one current v1
+  movement record, and drives one replacement through cutover before planning
+  the next. The workflow is restart-safe because every decision is derived from
+  committed Group-0 state. A draining Group-0 voter is first demoted to learner;
+  removal waits for zero data references, final-map application on the departing
+  node, application of its own `Removed` record, and learner eviction.
 - [x] Retire a removed local data-group replica after committed serving-map
   cutover. The complete committed Group-0 map, whose publication required the
   exact movement job to reach `Done`, is the cluster-wide retirement
@@ -129,12 +137,15 @@ inventory and rules.
   VShard away and back twice under writes, forces process exit after Engine WAL
   generation deletion and after journal quarantine, recovers both windows,
   expires and reclaims the v1 quarantine, and materializes the deleted replica
-  again from survivors. The 2026-08-02 run reached serving-map epoch 5: 1,219 of
-  1,220 writes were acknowledged (one bounded retryable response), every
-  acknowledged point was visible on all four nodes, no node returned a larger
-  count, unauthenticated drain was rejected, premature removal failed closed,
-  every node reported protocol version 1, and no process crashed outside the two
-  asserted exit-86 checkpoints.
+  again from survivors. It then drains the replacement node, automatically
+  evacuates its only VShard, fences Group-0 learner removal on state-machine
+  application, and accepts the final lifecycle transition. The 2026-08-03 run
+  reached serving-map epoch 5: 1,212 of 1,220 writes were acknowledged and the
+  remaining responses were bounded retryable outcomes during leader movement.
+  Every acknowledged point was visible on all four nodes, no node returned more
+  points than were attempted, unauthenticated drain was rejected, premature
+  removal failed closed, every node reported protocol version 1, and no process
+  crashed outside the two asserted exit-86 checkpoints.
 - [x] Disable the standalone, local-clock retention sweeper in partitioned mode
   and make the exact-v1 replicated cutoff command measurement-scoped. Replicas
   apply the controller-provided cutoff without consulting local time, walk the
@@ -149,16 +160,6 @@ production deploy.
 
 ### P0 — correctness and topology
 
-- [ ] **Complete node-wide evacuation and successful removal.** The production
-  gate now proves admission, exact one-VShard replacement, ordered teardown,
-  reclaim-floor publication, both retirement crash windows, authenticated drain,
-  and fail-closed premature removal. `drainNode` currently commits `Draining` and
-  reconciles Group-0 voters, but it does not create and drive the complete set of
-  VShard movement jobs needed to evacuate the node. Implement the bounded,
-  restart-safe evacuation workflow (or an equally explicit durable operator
-  workflow), then exercise the final accepted `Draining -> Removed` transition
-  through the production server. Editing a static peer list is not a safe
-  topology operation.
 - [ ] **Replicate retention policy and cutoff decisions.** Partitioned mode must
   never let replicas expire or compact different logical ranges. Local-clock
   sweeping is now disabled and a bounded per-VShard replicated cutoff can be
@@ -247,8 +248,9 @@ destination. They also cover durable empty Engine-generation installation and
 removal of a retired VShard from a day-discovery bitmap shared with a live
 VShard. The production server gate exercises those routes over HTTP and proves
 Engine-data reclaim, journal teardown/reclaim, exact failpoint exit status and
-all acknowledged-point readback. It does not yet prove whole-node evacuation or
-a successful final node removal.
+all acknowledged-point readback. It also proves deterministic whole-node
+evacuation, application-fenced Group-0 eviction, and successful final node
+removal.
 
 The retention-cutoff gate covers exact-v1 validation and round trip, bounded
 catalog pagination, measurement isolation, VShard isolation, and preservation

@@ -89,7 +89,9 @@ public:
                 throw movement::UnsafeMove("catchUp: lost leadership");
             co_await seastar::sleep(std::chrono::milliseconds(1));
         }
-        throw movement::UnsafeMove("catchUp: destination did not catch up in time");
+        throw movement::UnsafeMove(
+            "catchUp: destination did not catch up in time (match=" + std::to_string(group_.matchIndexOf(dest)) +
+            ", target=" + std::to_string(target) + ", tail=" + std::to_string(group_.node().log().lastIndex()) + ")");
     }
 
     seastar::future<> persist(const MoveJob& job) override { return persist_(job); }

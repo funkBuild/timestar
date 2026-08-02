@@ -159,6 +159,39 @@ void RaftNode::recomputeConfigFromLog() {
     latestConfigIndex_ = kNoIndex;
 }
 
+void RaftNode::reconcilePeerProgress() {
+    const auto removed = [this](const auto& item) {
+        return item.first != id_ && !isReplicationPeer(config_, id_, item.first);
+    };
+    std::erase_if(nextIndex_, removed);
+    std::erase_if(matchIndex_, removed);
+    std::erase_if(peerAppliedIndex_, removed);
+    std::erase_if(lastAckTick_, removed);
+    std::erase_if(ackedReadSeq_, removed);
+    std::erase_if(recentActive_, [this](NodeId peer) { return peer != id_ && !isReplicationPeer(config_, id_, peer); });
+    for (auto it = snapTransfers_.begin(); it != snapTransfers_.end();) {
+        if (isReplicationPeer(config_, id_, it->first)) {
+            ++it;
+            continue;
+        }
+        const NodeId peer = it->first;
+        ++it;
+        endTransfer(peer);
+    }
+    // Config installation and replication progress are one invariant: every
+    // remote voter/learner must have a valid probe position. In particular, a
+    // peer ID removed by one transition and re-added by the next must not be
+    // left absent after the final Cnew entry is appended. sendAppend() indexes
+    // nextIndex_ directly; an absent entry would default to zero and underflow
+    // prevLogIndex, silently suppressing every catch-up attempt.
+    for (NodeId peer : replicationPeers(config_, id_)) {
+        auto [next, inserted] = nextIndex_.try_emplace(peer, log_.lastIndex() + 1);
+        if (!inserted && next->second == kNoIndex)
+            next->second = log_.lastIndex() + 1;
+        matchIndex_.try_emplace(peer, kNoIndex);
+    }
+}
+
 void RaftNode::resetElectionTimer() {
     electionElapsed_ = 0;
     const unsigned lo = opts_.electionTimeoutMin;
@@ -209,6 +242,7 @@ void RaftNode::becomeFollower(Term term, NodeId leader) {
     votes_.clear();
     nextIndex_.clear();
     matchIndex_.clear();
+    peerAppliedIndex_.clear();
     recentActive_.clear();
     lastAckTick_.clear();  // liveness is per-term; see ticksSinceAck()
     clearTransfers();      // chunked-snapshot progress is per-term too (D-5); releases the shard budget
@@ -268,6 +302,7 @@ void RaftNode::becomeLeader() {
     // learners): optimistically probe from our log end.
     nextIndex_.clear();
     matchIndex_.clear();
+    peerAppliedIndex_.clear();
     // Deliberately NOT seeded: a brand-new leader has heard from nobody, so every
     // peer reads as kNeverAcked until it answers our first heartbeat (one
     // heartbeatTimeout away). That errs toward "not live", which is the safe
@@ -301,7 +336,16 @@ void RaftNode::becomeLeader() {
 }
 
 void RaftNode::sendAppend(NodeId peer) {
-    const LogIndex ni = nextIndex_[peer];
+    // Membership is authoritative. If a recovered/idempotent configuration
+    // makes a peer active before this leader has local progress for that peer,
+    // start an ordinary optimistic probe. Never use operator[] here: its zero
+    // default underflows prevLogIndex and turns a recoverable missing progress
+    // record into a silent, permanent replication stall.
+    auto next = nextIndex_.try_emplace(peer, log_.lastIndex() + 1).first;
+    if (next->second == kNoIndex)
+        next->second = log_.lastIndex() + 1;
+    matchIndex_.try_emplace(peer, kNoIndex);
+    const LogIndex ni = next->second;
     const LogIndex prevIndex = ni - 1;
     const auto prevTerm = log_.term(prevIndex);
     if (!prevTerm) {
@@ -848,6 +892,8 @@ void RaftNode::handleAppendEntriesReply(NodeId from, const AppendEntriesReply& r
     // Liveness, independent of what the reply SAYS: a rejected append still proves
     // the peer is up and reachable. See ticksSinceAck().
     lastAckTick_[from] = tick_;
+    auto& applied = peerAppliedIndex_[from];
+    applied = std::max(applied, rr.appliedIndex);
 
     // ReadIndex: record the highest readSeq this voter has echoed, then re-check
     // whether any pending read is now quorum-confirmed.
@@ -958,6 +1004,12 @@ bool RaftNode::maybeAppendLeaveJoint() {
     latestConfigIndex_ = log_.lastIndex();
     matchIndex_[id_] = log_.lastIndex();
     nextIndex_[id_] = log_.lastIndex() + 1;
+    // A removed replica may later be added back with an empty/rebuilt journal.
+    // Its old match index is then a lie: rejection backtracking is clamped above
+    // matchIndex, so retaining it makes the missing prefix permanently
+    // unreachable. Application, liveness, ReadIndex, and snapshot-transfer
+    // state are incarnation-specific for the same reason.
+    reconcilePeerProgress();
     return true;
 }
 
@@ -1207,6 +1259,7 @@ void RaftNode::step(Message m) {
             AppendEntriesReply r;
             r.term = currentTerm_;
             r.success = false;
+            r.appliedIndex = lastApplied_;
             send(Message{.to = m.from, .from = id_, .payload = r});
         } else if (auto* rv = std::get_if<RequestVote>(&m.payload)) {
             RequestVoteReply r;
@@ -1335,6 +1388,7 @@ void RaftNode::handleAppendEntries(NodeId from, const AppendEntries& ae) {
         AppendEntriesReply r;
         r.term = currentTerm_;
         r.success = false;
+        r.appliedIndex = lastApplied_;
         r.readSeq = ae.readSeq;  // echo for ReadIndex confirmation
         if (log_.lastIndex() < ae.prevLogIndex) {
             // Our log is too short: tell the leader to back up to our end.
@@ -1373,6 +1427,7 @@ void RaftNode::handleAppendEntries(NodeId from, const AppendEntries& ae) {
     r.success = true;
     r.matchIndex = lastNew;
     r.readSeq = ae.readSeq;  // echo for ReadIndex confirmation
+    r.appliedIndex = lastApplied_;
     send(Message{.to = from, .from = id_, .payload = r});
 }
 

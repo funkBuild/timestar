@@ -146,6 +146,20 @@ seastar::future<> ClusterDataPlane::startImpl(const ClusterConfig& cfg, seastar:
             "cluster: Group-0 topology changes require private v1 VShard journals; unset "
             "TIMESTAR_CLUSTER_SHARED_JOURNAL");
     rt_ = ClusterRuntime::fromConfig(cfg);  // throws (fail-closed) on misconfig
+    if (initialReplicaSetForTesting_) {
+        const std::set<NodeId> distinct(initialReplicaSetForTesting_->begin(), initialReplicaSetForTesting_->end());
+        if (!cfg.control_enabled || !cfg.development_allow_insecure_transport ||
+            initialReplicaSetForTesting_->size() != cfg.replication_factor ||
+            distinct.size() != initialReplicaSetForTesting_->size())
+            throw std::invalid_argument("cluster: invalid unsafe test initial replica set");
+        for (NodeId node : *initialReplicaSetForTesting_)
+            if (!rt_->peerAddresses.contains(node))
+                throw std::invalid_argument("cluster: unsafe test initial replica is not a configured peer");
+        for (auto& [vshard, replicas] : rt_->map.placement) {
+            (void)vshard;
+            replicas = *initialReplicaSetForTesting_;
+        }
+    }
     const std::filesystem::path dataRoot = timestar::dataRootPath();
     if (cfg.control_enabled) {
         auto cached = co_await seastar::async([dataRoot] { return control::DurableControlMapStore(dataRoot).load(); });
@@ -457,20 +471,19 @@ seastar::future<> ClusterDataPlane::startImpl(const ClusterConfig& cfg, seastar:
             for (const auto& [vshard, voters] : rt_->localReplicaGroups())
                 byShard[shardOwningVShard(vshard, dir_.get())].push_back({vshard, voters});
             for (auto& [shard, groups] : byShard) {
-                co_await shards_.invoke_on(shard,
-                                           [g = std::move(groups), ropts](ShardRaftPlane& p) -> seastar::future<> {
-                                               const size_t total = g.size();
-                                               size_t recovered = 0;
-                                               for (const auto& [vs, voters] : g) {
-                                                   co_await p.addVShard(vs, voters, ropts);
-                                                   ++recovered;
-                                                   if (recovered % 256 == 0 || recovered == total)
-                                                       timestar::http_log.info(
-                                                           "cluster: reactor {} opened {}/{} local VShard groups",
-                                                           seastar::this_shard_id(), recovered, total);
-                                               }
-                                               co_return;
-                                           });
+                co_await shards_.invoke_on(
+                    shard, [g = std::move(groups), ropts](ShardRaftPlane& p) -> seastar::future<> {
+                        const size_t total = g.size();
+                        size_t recovered = 0;
+                        for (const auto& [vs, voters] : g) {
+                            co_await p.addVShard(vs, voters, ropts);
+                            ++recovered;
+                            if (recovered % 256 == 0 || recovered == total)
+                                timestar::http_log.info("cluster: reactor {} opened {}/{} local VShard groups",
+                                                        seastar::this_shard_id(), recovered, total);
+                        }
+                        co_return;
+                    });
             }
         }
         // Snapshot-trigger policy, resolved and LOGGED here so a mis-set override is
@@ -679,15 +692,13 @@ seastar::future<control::ControlJoinResult> ClusterDataPlane::joinControlPlane(s
     co_return result;
 }
 
-seastar::future<ClusterDataPlane::ControlMutationResult> ClusterDataPlane::planControlMove(std::string jobId,
-                                                                                           uint16_t vshard,
-                                                                                           NodeId destination,
-                                                                                           NodeId victim) {
+seastar::future<ClusterDataPlane::ControlMutationResult> ClusterDataPlane::planControlMove(
+    std::string jobId, uint64_t expectedMapEpoch, uint16_t vshard, NodeId destination, NodeId victim) {
     if (!controlEnabled_ || !replicated_ || !shardsStarted_)
         throw std::invalid_argument("cluster: group-0 topology control is not configured");
     co_return co_await shards_.invoke_on(
         0,
-        [jobId = std::move(jobId), vshard, destination,
+        [jobId = std::move(jobId), expectedMapEpoch, vshard, destination,
          victim](ShardRaftPlane& plane) mutable -> seastar::future<ControlMutationResult> {
             auto* host = plane.group0();
             if (!host || !host->group() || !host->stateMachine())
@@ -697,7 +708,8 @@ seastar::future<ClusterDataPlane::ControlMutationResult> ClusterDataPlane::planC
             if (!group->isLeader())
                 co_return ControlMutationResult{ControlMutationStatus::NotLeader, leader(), host->state().mapEpoch};
             control::Group0Controller controller(*group, *host->stateMachine());
-            const bool accepted = co_await controller.planVShardMove(std::move(jobId), vshard, destination, victim);
+            const bool accepted =
+                co_await controller.planVShardMove(std::move(jobId), expectedMapEpoch, vshard, destination, victim);
             co_return ControlMutationResult{
                 accepted ? ControlMutationStatus::Accepted
                          : (group->isLeader() ? ControlMutationStatus::Rejected : ControlMutationStatus::NotLeader),
@@ -1486,6 +1498,10 @@ seastar::future<ClusterDataPlane::Status> ClusterDataPlane::status() const {
     st.controlNodes = control.nodes;
     st.controlVoters = control.voters;
     st.controlLearners = control.learners;
+    st.controlDrainingNodes = control.drainingNodes;
+    st.controlDrainReferences = control.drainReferences;
+    st.controlDrainBlocked = control.drainBlocked;
+    st.controlRemovalsPending = control.removalsPending;
     st.controlApplyLagEntries = control.applyLagEntries;
     st.controlApplyFailures = control.applyFailures;
     st.controlTickErrors = control.tickErrors;
@@ -1498,6 +1514,8 @@ seastar::future<ClusterDataPlane::Status> ClusterDataPlane::status() const {
     st.controlControllerActuationFailures = control.controllerActuationFailures;
     st.controlTopologyPasses = topologyPasses_;
     st.controlTopologyFailures = topologyFailures_;
+    st.controlTopologyPlans = topologyPlans_;
+    st.controlTopologyCutovers = topologyCutovers_;
     st.controlTopologyAdvances = topologyAdvances_;
     co_return st;
 }
@@ -1520,8 +1538,36 @@ seastar::future<> ClusterDataPlane::topologyControllerSweep() {
     if (!stillController())
         co_return;
 
-    // A v1 plan permits only one unfinished move. Ignore retained historical
-    // jobs and select the job bound to the current desired-map epoch.
+    control::Group0Controller controller(*group0, *host->stateMachine());
+    if (host->state().mapEpoch == host->state().servingMap.epoch) {
+        // A committed Draining record is the durable work queue. Reconcile its
+        // Group-0 role first, then derive at most one exact replacement from the
+        // current complete serving map. A new leader repeats this scan; no local
+        // cursor or clock participates in the decision.
+        const auto before = control::selectNextDrainMove(host->state());
+        const auto& config = group0->node().config();
+        const bool removalPending = std::ranges::any_of(host->state().nodes, [&](const auto& entry) {
+            return entry.second.state == control::NodeState::Removed &&
+                   (config.isVoter(entry.first) || config.isLearner(entry.first) ||
+                    std::find(host->state().metaVoters.begin(), host->state().metaVoters.end(), entry.first) !=
+                        host->state().metaVoters.end());
+        });
+        if (before.drainingNodes != 0 || removalPending) {
+            if (co_await controller.reconcileMetaVoters())
+                co_return;
+            if (!stillController())
+                co_return;
+            if (before.drainingNodes != 0) {
+                const uint64_t oldEpoch = host->state().mapEpoch;
+                const auto planned = co_await controller.planNextDrainMove();
+                if (planned.state == control::DrainMoveState::Ready && host->state().mapEpoch == oldEpoch + 1)
+                    ++topologyPlans_;
+            }
+        }
+        co_return;
+    }
+
+    // v1 retains exactly the move bound to the current desired-map epoch.
     std::optional<control::Job> selected;
     std::optional<movement::MoveJob> selectedMove;
     for (const auto& [id, job] : host->state().jobs) {
@@ -1536,13 +1582,13 @@ seastar::future<> ClusterDataPlane::topologyControllerSweep() {
     if (!selected || !selectedMove)
         co_return;
 
-    control::Group0Controller controller(*group0, *host->stateMachine());
     if (selected->done) {
         // The data-group transition is already durable. Publish the serving map
         // as a distinct final Group-0 decision; a crash between the two retries
         // this exact idempotent cutover.
-        if (host->state().servingMap.epoch < selectedMove->plan().mapEpoch)
-            (void)co_await controller.publishCompletedMove(selected->id);
+        if (host->state().servingMap.epoch < selectedMove->plan().mapEpoch &&
+            co_await controller.publishCompletedMove(selected->id))
+            ++topologyCutovers_;
         co_return;
     }
 
@@ -1556,8 +1602,13 @@ seastar::future<> ClusterDataPlane::topologyControllerSweep() {
         const auto deadline = seastar::lowres_clock::now() + std::chrono::seconds(5);
         destinationResult = co_await rpc_->ensureMoveDestination(destination, request, deadline);
     }
-    if (destinationResult.status != control::EnsureMoveDestinationStatus::Ready || !stillController())
+    if (destinationResult.status != control::EnsureMoveDestinationStatus::Ready || !stillController()) {
+        if (stillController() && topologyPasses_ % 60 == 0)
+            timestar::http_log.warn("cluster: topology job {} step {} is waiting for destination {} (status {})",
+                                    selected->id, selected->step, destination,
+                                    static_cast<unsigned>(destinationResult.status));
         co_return;
+    }
 
     // Ask only authorized source/target replicas. Try this controller first
     // when it hosts the group because a local follower supplies the current
@@ -1615,8 +1666,13 @@ seastar::future<> ClusterDataPlane::topologyControllerSweep() {
             !attempted.contains(actuation.leader))
             leaderHint = actuation.leader;
     }
-    if (actuation.status != control::ActuateMoveStatus::Advanced || !stillController())
+    if (actuation.status != control::ActuateMoveStatus::Advanced || !stillController()) {
+        if (stillController() && topologyPasses_ % 60 == 0)
+            timestar::http_log.warn(
+                "cluster: topology job {} step {} made no data-group progress (status {}, leader hint {})",
+                selected->id, selected->step, static_cast<unsigned>(actuation.status), actuation.leader);
         co_return;
+    }
     if (!ControllerJobDriver::isNextMoveJob(*selected, actuation.job))
         throw std::runtime_error("cluster: data-group actuator returned invalid movement progress");
 

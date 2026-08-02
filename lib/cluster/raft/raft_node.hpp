@@ -334,6 +334,20 @@ public:
         auto it = matchIndex_.find(peer);
         return it == matchIndex_.end() ? kNoIndex : it->second;
     }
+    LogIndex nextIndexOf(NodeId peer) const {
+        auto it = nextIndex_.find(peer);
+        return it == nextIndex_.end() ? kNoIndex : it->second;
+    }
+
+    // Highest state-machine index this leader has observed applied on `peer`
+    // in the current term. Self is exact; peers report it on AppendEntries
+    // replies after a prior Ready batch has completed application.
+    LogIndex appliedIndexOf(NodeId peer) const {
+        if (peer == id_)
+            return lastApplied_;
+        auto it = peerAppliedIndex_.find(peer);
+        return it == peerAppliedIndex_.end() ? kNoIndex : it->second;
+    }
 
     // Ticks since `peer` last REPLIED to us in this leadership term (any
     // AppendEntries or InstallSnapshot reply, success or reject -- a reply is a
@@ -374,6 +388,7 @@ private:
     // above the snapshot-boundary base config.
     void recomputeConfigFromLog();
     bool maybeAppendLeaveJoint();  // leader: after Cold,new commits, append Cnew (true if appended)
+    void reconcilePeerProgress();
 
     void becomeFollower(Term term, NodeId leader);
     void becomePreCandidate();
@@ -453,8 +468,9 @@ private:
     std::mt19937_64 rng_;
 
     // Leader-only replication progress, one per voter (self included).
-    std::map<NodeId, LogIndex> nextIndex_;   // next index to send to the peer
-    std::map<NodeId, LogIndex> matchIndex_;  // highest index known replicated on the peer
+    std::map<NodeId, LogIndex> nextIndex_;         // next index to send to the peer
+    std::map<NodeId, LogIndex> matchIndex_;        // highest index known replicated on the peer
+    std::map<NodeId, LogIndex> peerAppliedIndex_;  // highest index reported applied by the peer
     // CheckQuorum: voters we have heard from since the last quorum check.
     std::set<NodeId> recentActive_;
     // Monotonic tick counter, and the tick at which each peer last replied to us as

@@ -23,7 +23,10 @@ enum class NodeState : uint8_t { Joining = 0, Active = 1, Draining = 2, Removed 
 inline constexpr size_t kMaxJoinTokenBytes = 1024;
 inline constexpr size_t kMaxOutstandingJoinTokens = 1024;
 inline constexpr size_t kMaxControlJobIdBytes = 256;
-inline constexpr size_t kMaxControlJobs = 4096;
+// v1 retains only the current/latest movement proof. Planning the next move
+// atomically replaces the completed predecessor, so evacuating thousands of
+// VShards cannot grow every Group-0 snapshot without bound.
+inline constexpr size_t kMaxControlJobs = 1;
 
 inline bool validControlJobId(const std::string& id) {
     return !id.empty() && id.size() <= kMaxControlJobIdBytes;

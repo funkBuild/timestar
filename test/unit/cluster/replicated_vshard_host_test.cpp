@@ -125,6 +125,20 @@ TEST(RetirementFaultInjectionTest, ParsesOnlyNamedBoundariesAndBoundedDecimalVSh
         EXPECT_THROW(parseRetirementCrashSpec("journal-quarantined", badVShard, true, true), std::invalid_argument);
 }
 
+TEST(RetirementFaultInjectionTest, InitialReplicaOverrideIsExactAndGuarded) {
+    using timestar::cluster::parseInitialReplicaSetForTesting;
+    EXPECT_FALSE(parseInitialReplicaSetForTesting(nullptr, true, true, 3, 4));
+    EXPECT_EQ(parseInitialReplicaSetForTesting("1,2,3", true, true, 3, 4),
+              (std::vector<timestar::raft::NodeId>{1, 2, 3}));
+    EXPECT_THROW(parseInitialReplicaSetForTesting("1,2,3", false, true, 3, 4), std::invalid_argument);
+    EXPECT_THROW(parseInitialReplicaSetForTesting("1,2,3", true, false, 3, 4), std::invalid_argument);
+    EXPECT_THROW(parseInitialReplicaSetForTesting("1,2", true, true, 3, 4), std::invalid_argument);
+    EXPECT_THROW(parseInitialReplicaSetForTesting("1,2,2", true, true, 3, 4), std::invalid_argument);
+    EXPECT_THROW(parseInitialReplicaSetForTesting("1,2,5", true, true, 3, 4), std::invalid_argument);
+    EXPECT_THROW(parseInitialReplicaSetForTesting("1,2,", true, true, 3, 4), std::invalid_argument);
+    EXPECT_THROW(parseInitialReplicaSetForTesting("1, 2,3", true, true, 3, 4), std::invalid_argument);
+}
+
 TEST_F(ReplicatedVShardHostTest, HostsVShardAndReplicatesThroughRaft) {
     seastar::async([] {
         ScopedShardedEngine eng;

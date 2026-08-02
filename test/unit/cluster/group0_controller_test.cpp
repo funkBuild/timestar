@@ -288,7 +288,10 @@ seastar::future<> testReadBarrierReconcilesControlMap() {
     // target, persisted job, and next map epoch.
     auto addDestination = controller.proposeCommand(UpsertNode{rec(4, "rack-d")});
     EXPECT_TRUE(co_await drive(std::move(addDestination), nodes, router));
-    auto placement = controller.planVShardMove("move-5", 5, /*destination=*/4, /*victim=*/3);
+    EXPECT_FALSE(co_await controller.planVShardMove("move-5", /*expectedMapEpoch=*/2, 5, 4, 3))
+        << "an operator cannot plan against an epoch it has not observed";
+    auto placement = controller.planVShardMove("move-5", /*expectedMapEpoch=*/1, 5, /*destination=*/4,
+                                               /*victim=*/3);
     EXPECT_FALSE(placement.available()) << "control mutation must wait for quorum commit and apply";
     EXPECT_TRUE(co_await drive(std::move(placement), nodes, router));
     const uint64_t epoch = nodes[1].sm->state().mapEpoch;
@@ -336,6 +339,12 @@ seastar::future<> testReadBarrierReconcilesControlMap() {
         rejected = true;
     }
     EXPECT_TRUE(rejected);
+
+    EXPECT_TRUE(co_await drive(controller.planVShardMove("move-6", /*expectedMapEpoch=*/2, 6, 4, 3), nodes, router));
+    EXPECT_EQ(nodes[1].sm->state().jobs.size(), 1u);
+    EXPECT_TRUE(nodes[1].sm->state().jobs.contains("move-6"));
+    EXPECT_FALSE(co_await controller.planVShardMove("move-5", /*expectedMapEpoch=*/1, 5, 4, 3))
+        << "a delayed retry must fail after its retained v1 proof is replaced by a later epoch";
 }
 
 seastar::future<> testJoinTokenGatesAdmission() {
@@ -424,6 +433,92 @@ seastar::future<> testNodeRemovalRequiresDrainAndClearedReferences() {
     EXPECT_TRUE(co_await controller.removeDrainedNode(2));
     EXPECT_EQ(nodes[1].sm->state().nodes.at(2).state, NodeState::Removed);
     EXPECT_TRUE(co_await controller.removeDrainedNode(2)) << "a remove retry must be idempotent";
+}
+
+seastar::future<> testDrainKeepsVictimInGroup0UntilAutomaticEvacuationCompletes() {
+    Router router;
+    std::vector<std::unique_ptr<RouterTransport>> transports;
+    Nodes nodes;
+    const std::vector<NodeId> initialVoters{1, 2, 3, 4};
+    for (NodeId id : initialVoters) {
+        transports.push_back(std::make_unique<RouterTransport>(router));
+        NodeBox box;
+        box.persistence = std::make_unique<NoopPersistence>();
+        box.sm = std::make_unique<Group0StateMachine>();
+        RaftNode rn(id, initialVoters, RaftLog{}, HardState{}, optsFor(id));
+        box.group = std::make_unique<RaftGroup>(0, std::move(rn), *box.persistence, *transports.back(), *box.sm);
+        router.setGroup(id, box.group.get());
+        nodes[id] = std::move(box);
+    }
+
+    Group0Controller controller(*nodes[1].group, *nodes[1].sm, 3);
+    co_await nodes[1].group->campaign();
+    co_await router.pump();
+    if (!nodes[1].group->isLeader())
+        throw std::runtime_error("node 1 did not win the Group-0 test election");
+    co_await drive(controller.initCluster("c1", rec(1, "rack-a")), nodes, router);
+    for (const auto& [id, domain] :
+         std::vector<std::pair<NodeId, std::string>>{{2, "rack-b"}, {3, "rack-c"}, {4, "rack-d"}})
+        EXPECT_TRUE(co_await drive(controller.proposeCommand(UpsertNode{rec(id, domain)}), nodes, router));
+
+    ControlMap map = initialServingMap();
+    map.placement.at(0) = {1, 2, 4};
+    EXPECT_TRUE(co_await drive(controller.publishInitialServingMap(map), nodes, router));
+
+    EXPECT_TRUE(co_await drive(controller.drainNode(4), nodes, router));
+    EXPECT_EQ(nodes[1].group->node().config().voters, (std::vector<NodeId>{1, 2, 3}));
+    EXPECT_EQ(nodes[1].group->node().config().learners, (std::vector<NodeId>{4}))
+        << "the victim must keep receiving Group-0 movement and serving-map decisions";
+    EXPECT_FALSE(co_await controller.removeDrainedNode(4));
+
+    const auto selected = selectNextDrainMove(nodes[1].sm->state());
+    EXPECT_EQ(selected.state, DrainMoveState::Ready);
+    EXPECT_EQ(selected.drainingNodes, 1u);
+    EXPECT_EQ(selected.remainingReferences, 1u);
+    EXPECT_EQ(selected.victim, 4u);
+    EXPECT_EQ(selected.vshard, 0u);
+    EXPECT_EQ(selected.destination, 3u);
+    const auto restartSelection = selectNextDrainMove(nodes[1].sm->state());
+    EXPECT_EQ(restartSelection, selected) << "controller restart must not need a local drain cursor";
+
+    const auto plannedDecision = co_await drive(controller.planNextDrainMove(), nodes, router);
+    EXPECT_EQ(plannedDecision, selected);
+    if (nodes[1].sm->state().jobs.size() != 1)
+        throw std::runtime_error("automatic drain did not persist exactly one movement job");
+    const std::string jobId = nodes[1].sm->state().jobs.begin()->first;
+    EXPECT_EQ(jobId, "drain-v1-4-0-2");
+    const auto move = movement::MoveJob::decode(nodes[1].sm->state().jobs.begin()->second.payload);
+    if (!move)
+        throw std::runtime_error("automatic drain persisted an undecodable movement job");
+    for (const auto step : {movement::MoveStep::LearnerAdded, movement::MoveStep::CaughtUp,
+                            movement::MoveStep::Promoted, movement::MoveStep::OldRemoved, movement::MoveStep::Done})
+        EXPECT_TRUE(co_await drive(controller.proposeCommand(advanceMove(jobId, step, move->plan())), nodes, router));
+    EXPECT_TRUE(co_await drive(controller.publishCompletedMove(jobId), nodes, router));
+    co_await router.pump();
+
+    for (const auto& [id, box] : nodes) {
+        EXPECT_EQ(box.sm->state().servingMap.epoch, 2u) << "node " << id;
+        EXPECT_EQ(box.sm->state().servingMap.placement.at(0), (std::vector<NodeId>{1, 2, 3})) << "node " << id;
+    }
+    EXPECT_EQ(selectNextDrainMove(nodes[1].sm->state()).remainingReferences, 0u);
+
+    for (int i = 0; i < 3 && !controller.learnerCaughtUp(4); ++i)
+        co_await tickAndPump(nodes, router);
+    EXPECT_TRUE(controller.learnerCaughtUp(4)) << "a heartbeat must report application of the final serving-map entry";
+    EXPECT_TRUE(co_await drive(controller.removeDrainedNode(4), nodes, router));
+    EXPECT_EQ(nodes[1].sm->state().nodes.at(4).state, NodeState::Removed);
+    EXPECT_FALSE(nodes[1].group->node().config().isVoter(4));
+    EXPECT_TRUE(nodes[1].group->node().config().isLearner(4))
+        << "Removed must be delivered before final learner eviction";
+    for (int i = 0; i < 3 && !controller.learnerCaughtUp(4); ++i)
+        co_await tickAndPump(nodes, router);
+    EXPECT_TRUE(controller.learnerCaughtUp(4));
+    EXPECT_EQ(nodes[4].sm->state().nodes.at(4).state, NodeState::Removed);
+    EXPECT_TRUE(co_await drive(controller.reconcileMetaVoters(), nodes, router));
+    EXPECT_FALSE(nodes[1].group->node().config().isLearner(4));
+    EXPECT_EQ(nodes[4].sm->state().servingMap.epoch, 2u)
+        << "the departed learner must receive the safe cutover before Group-0 eviction";
+    EXPECT_TRUE(co_await controller.removeDrainedNode(4)) << "a final removal retry must remain idempotent";
 }
 
 seastar::future<> testDeletePlanFreezesFirstExpansion() {
@@ -540,6 +635,44 @@ TEST(Group0ControllerTest, JoinTokenGatesAdmission) {
 
 TEST(Group0ControllerTest, NodeRemovalRequiresDrainAndClearedReferences) {
     testNodeRemovalRequiresDrainAndClearedReferences().get();
+}
+
+TEST(Group0ControllerTest, DrainKeepsVictimInGroup0UntilAutomaticEvacuationCompletes) {
+    testDrainKeepsVictimInGroup0UntilAutomaticEvacuationCompletes().get();
+}
+
+TEST(Group0ControllerTest, DrainSelectionIsDeterministicBalancedAndFailureDomainSafe) {
+    Group0State state;
+    state.mapEpoch = 1;
+    state.servingMap = initialServingMap();
+    for (const auto& [id, domain] : std::vector<std::pair<NodeId, std::string>>{
+             {1, "rack-a"}, {2, "rack-b"}, {3, "rack-c"}, {4, "rack-d"}, {5, "rack-e"}})
+        state.nodes.emplace(id, rec(id, domain));
+    state.nodes.at(3).state = NodeState::Draining;
+    state.servingMap.placement.at(100) = {1, 2, 4};
+
+    auto decision = selectNextDrainMove(state);
+    EXPECT_EQ(decision.state, DrainMoveState::Ready);
+    EXPECT_EQ(decision.victim, 3u);
+    EXPECT_EQ(decision.vshard, 0u);
+    EXPECT_EQ(decision.destination, 5u) << "the less-loaded eligible node must win";
+    EXPECT_EQ(decision.remainingReferences, timestar::VIRTUAL_SHARD_COUNT - 1);
+    EXPECT_EQ(selectNextDrainMove(state), decision);
+
+    state.nodes.at(5).failureDomain = "rack-a";
+    decision = selectNextDrainMove(state);
+    EXPECT_EQ(decision.state, DrainMoveState::Ready);
+    EXPECT_EQ(decision.destination, 4u) << "a domain shared with a surviving replica is ineligible";
+
+    state.nodes.at(4).failureDomain = "rack-b";
+    decision = selectNextDrainMove(state);
+    EXPECT_EQ(decision.state, DrainMoveState::Blocked);
+    EXPECT_EQ(decision.remainingReferences, timestar::VIRTUAL_SHARD_COUNT - 1);
+
+    state.mapEpoch = 2;
+    decision = selectNextDrainMove(state);
+    EXPECT_EQ(decision.state, DrainMoveState::InProgress)
+        << "a second drain plan cannot overlap the unpublished current move";
 }
 
 TEST(Group0ControllerTest, ReadBarrierReconcilesControlMap) {

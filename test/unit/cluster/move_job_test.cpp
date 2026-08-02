@@ -3,8 +3,8 @@
 // member at a time, promote the destination to voter BEFORE removing the old
 // voter, resume correctly from any persisted step (crash-resume), and abort rather
 // than commit an unsafe (sub-RF) membership.
-#include "../../../lib/cluster/movement/mover.hpp"
 #include "../../../lib/cluster/integration/controller_job_driver.hpp"
+#include "../../../lib/cluster/movement/mover.hpp"
 
 #include <gtest/gtest.h>
 
@@ -53,8 +53,7 @@ bool sameSet(std::vector<NodeId> a, std::vector<NodeId> b) {
     return a == b;
 }
 
-MovePlan replacePlan(uint16_t vshard = 7, NodeId dest = 4, NodeId victim = 1,
-                     std::vector<NodeId> source = {1, 2, 3}) {
+MovePlan replacePlan(uint16_t vshard = 7, NodeId dest = 4, NodeId victim = 1, std::vector<NodeId> source = {1, 2, 3}) {
     return MovePlan{vshard, dest, victim, /*mapEpoch=*/9, std::move(source)};
 }
 
@@ -260,6 +259,22 @@ TEST(MoveJobTest, NotLeaderStopsCleanly) {
 TEST(MoveJobTest, StaleJobRejectsConfigurationDrift) {
     testStaleJobRejectsConfigurationDrift().get();
 }
+TEST(MoveJobTest, MaterializedDestinationAcceptsOnlyExactMovePathConfigurations) {
+    MoveJob job(replacePlan(), MoveStep::LearnerAdded);
+    EXPECT_TRUE(job.acceptsMaterializedConfig({1, 2, 3}, {}, {}));
+    EXPECT_TRUE(job.acceptsMaterializedConfig({1, 2, 3}, {1, 2, 3}, {4}));
+    EXPECT_TRUE(job.acceptsMaterializedConfig({1, 2, 3}, {}, {4}));
+    EXPECT_TRUE(job.acceptsMaterializedConfig({1, 2, 3, 4}, {1, 2, 3}, {}));
+    EXPECT_TRUE(job.acceptsMaterializedConfig({1, 2, 3, 4}, {}, {}));
+    EXPECT_TRUE(job.acceptsMaterializedConfig({2, 3, 4}, {1, 2, 3, 4}, {}));
+    EXPECT_TRUE(job.acceptsMaterializedConfig({2, 3, 4}, {}, {}));
+
+    EXPECT_FALSE(job.acceptsConfig({1, 2, 3}, {}, {}))
+        << "leader actuation remains strict even when destination validation tolerates apply lag";
+    EXPECT_FALSE(job.acceptsMaterializedConfig({1, 2, 3, 5}, {}, {}));
+    EXPECT_FALSE(job.acceptsMaterializedConfig({2, 3, 4}, {1, 2, 3}, {}));
+    EXPECT_FALSE(job.acceptsMaterializedConfig({1, 2, 3}, {}, {4, 5}));
+}
 TEST(MoveJobTest, EncodeDecodeRoundTrip) {
     constexpr NodeId largeDestination = (NodeId{1} << 48) + 4;
     constexpr NodeId largeVictim = (NodeId{1} << 40) + 1;
@@ -301,8 +316,7 @@ TEST(MoveJobTest, RejectsUnknownOrMalformedV1Records) {
 
     EXPECT_THROW(MoveJob(MovePlan{7, 0, 1, 9, {1, 2, 3}}).encode(), std::invalid_argument);
     EXPECT_THROW(MoveJob(MovePlan{7, 4, 4, 9, {1, 2, 4}}).encode(), std::invalid_argument);
-    EXPECT_THROW(MoveJob(MovePlan{timestar::VIRTUAL_SHARD_COUNT, 4, 1, 9, {1, 2, 3}}).encode(),
-                 std::invalid_argument);
+    EXPECT_THROW(MoveJob(MovePlan{timestar::VIRTUAL_SHARD_COUNT, 4, 1, 9, {1, 2, 3}}).encode(), std::invalid_argument);
     EXPECT_THROW(MoveJob(MovePlan{7, 4, 1, 0, {1, 2, 3}}).encode(), std::invalid_argument);
     EXPECT_THROW(MoveJob(MovePlan{7, 4, 1, 9, {1, 1, 2}}).encode(), std::invalid_argument);
     EXPECT_THROW(MoveJob(MovePlan{7, 4, 1, 9, {1, 2, 4}}).encode(), std::invalid_argument);

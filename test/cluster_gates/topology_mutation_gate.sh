@@ -3,10 +3,11 @@
 # routes through two crash-recovery windows and prove one VShard's contribution
 # is neither lost nor duplicated.
 #
-# VShard 0 starts on voters {1,2,3} in this four-node/RF=3 topology. The probe
-# key is a checked golden vector for VShard 0 (placement_table_test.cpp), so a
-# move to node 4 cannot be vacuous. Four moves exercise replacement in both
-# directions while writes continue:
+# The unsafe, startup-validated test placement assigns all 4096 VShards to
+# {1,2,3}, leaving node 4 as a real spare. The probe key is a checked golden
+# vector for VShard 0 (placement_table_test.cpp), so a move to node 4 cannot be
+# vacuous. Four moves exercise replacement in both directions while writes
+# continue; node 4 has exactly one serving reference when it is drained:
 #
 #   epoch 1 {1,2,3}
 #       -> 2 {1,2,4}, node 3 exits after its Engine WAL generation is deleted
@@ -92,6 +93,7 @@ start_node() { # NODE [FAILPOINT] [init]
         TIMESTAR_CLUSTER_REPLICATION_FACTOR=3 TIMESTAR_CLUSTER_UUID="$CLUSTER_UUID" \
         TIMESTAR_CLUSTER_DEVELOPMENT_ALLOW_INSECURE_TRANSPORT=true \
         TIMESTAR_CLUSTER_CONTROL_ENABLED=true TIMESTAR_CLUSTER_CONTROL_SEED_NODE_ID=1 \
+        TIMESTAR_UNSAFE_TEST_INITIAL_REPLICAS=1,2,3 \
         TIMESTAR_CLUSTER_FAILURE_DOMAIN="rack-$node" \
         TIMESTAR_CLUSTER_NODE_ID="$node" TIMESTAR_CLUSTER_PEERS="$PEERS" \
         "${unsafe_env[@]}" \
@@ -379,7 +381,11 @@ start_node 2
 start_node 3 engine-wal-generation-deleted
 start_node 4
 wait_all_led "$PORTS" 4096 180 || gate_exit
-wait_healthy "$PORTS" 180 || gate_exit
+# The intentionally empty spare is correctly not ready to serve until the first
+# move materializes VShard 0 there. Require readiness from the initial serving
+# set now. Later checks follow the current serving set because an intentionally
+# empty spare is not ready to serve until it receives a VShard.
+wait_healthy "19810 19811 19812" 180 || gate_exit
 wait_for_control_leader || gate_exit
 join_node 2 || gate_exit
 join_node 3 || gate_exit
@@ -394,7 +400,7 @@ verify_probe baseline "$PORTS"
 
 echo "=== move VShard 0 to node 4; crash node 3 inside Engine cleanup ==="
 start_campaign engine_crash 300
-post_control /cluster/vshards/move '{"job_id":"topology-engine-crash","vshard":0,"destination":4,"victim":3}' 202 || gate_exit
+post_control /cluster/vshards/move '{"job_id":"topology-engine-crash","map_epoch":1,"vshard":0,"destination":4,"victim":3}' 202 || gate_exit
 wait_serving_epoch 2 "19810 19811 19813" 180 || gate_exit
 wait_expected_crash 3 "Engine cleanup"
 finish_campaign engine_crash
@@ -413,7 +419,7 @@ verify_probe "after Engine-cleanup recovery" "$PORTS"
 
 echo "=== move VShard 0 back; node 3 is materialized from the surviving replicas ==="
 start_campaign first_return 300
-post_control /cluster/vshards/move '{"job_id":"topology-first-return","vshard":0,"destination":3,"victim":4}' 202 || gate_exit
+post_control /cluster/vshards/move '{"job_id":"topology-first-return","map_epoch":2,"vshard":0,"destination":3,"victim":4}' 202 || gate_exit
 wait_serving_epoch 3 "$PORTS" 180 || gate_exit
 finish_campaign first_return
 wait_retired_counter 19813 1 || gate_exit
@@ -422,10 +428,10 @@ verify_probe "after first movement back" "$PORTS"
 echo "=== re-arm node 3 and crash after durable journal quarantine, before its marker ==="
 stop_node 3
 start_node 3 journal-quarantined
-wait_healthy "$PORTS" 600 || gate_exit
+wait_healthy "19810 19811 19812" 600 || gate_exit
 wait_serving_epoch 3 "$PORTS" 120 || gate_exit
 start_campaign journal_crash 300
-post_control /cluster/vshards/move '{"job_id":"topology-journal-crash","vshard":0,"destination":4,"victim":3}' 202 || gate_exit
+post_control /cluster/vshards/move '{"job_id":"topology-journal-crash","map_epoch":3,"vshard":0,"destination":4,"victim":3}' 202 || gate_exit
 wait_serving_epoch 4 "19810 19811 19813" 180 || gate_exit
 wait_expected_crash 3 "journal quarantine"
 finish_campaign journal_crash
@@ -438,12 +444,12 @@ else
 fi
 
 start_node 3
-wait_healthy "$PORTS" 600 || gate_exit
+wait_healthy "19810 19811 19813" 600 || gate_exit
 wait_serving_epoch 4 "$PORTS" 120 || gate_exit
 wait_for_marker "$JOURNAL_RETIRED" || gate_exit
 verify_probe "after journal-quarantine recovery" "$PORTS"
 
-echo "=== age and reclaim the quarantined generation, then move VShard 0 back again ==="
+echo "=== age and reclaim the quarantine, then automatically evacuate draining node 4 ==="
 stop_node 3
 MARKER=$(find "$JOURNAL_RETIRED" -maxdepth 1 -type f -name 'retired_at_*.v1')
 if [ "$(printf '%s\n' "$MARKER" | grep -c .)" -ne 1 ]; then
@@ -452,7 +458,7 @@ if [ "$(printf '%s\n' "$MARKER" | grep -c .)" -ne 1 ]; then
 fi
 mv -- "$MARKER" "$JOURNAL_RETIRED/retired_at_0.v1"
 start_node 3
-wait_healthy "$PORTS" 600 || gate_exit
+wait_healthy "19810 19811 19813" 600 || gate_exit
 for _ in $(seq 1 120); do
     RECLAIMED=$(status_field "$(cluster_status 19812)" retired_journals_reclaimed)
     [ "${RECLAIMED:-0}" -ge 1 ] && [ ! -e "$JOURNAL_RETIRED" ] && break
@@ -465,24 +471,54 @@ else
     gate_fail "expired VShard-0 journal generation still exists"
 fi
 
-start_campaign final_return 300
-post_control /cluster/vshards/move '{"job_id":"topology-final-return","vshard":0,"destination":3,"victim":4}' 202 || gate_exit
-wait_serving_epoch 5 "$PORTS" 180 || gate_exit
-finish_campaign final_return
-wait_retired_counter 19813 2 || gate_exit
-verify_probe "after reclaim and final movement back" "$PORTS"
-
-echo "=== exercise authenticated drain and fail-closed removal ==="
+start_campaign automatic_evacuation 300
 UNAUTH_CODE=$(curl -sS -m10 -o "$GATE_ROOT/tsgate_tm_unauth.json" -w '%{http_code}' -X POST \
     http://127.0.0.1:19810/cluster/nodes/drain -H 'Content-Type: application/json' -d '{"node":4}' 2>/dev/null)
 assert_eq "unauthenticated drain is rejected" "$UNAUTH_CODE" 401
 post_control /cluster/nodes/drain '{"node":4}' 202 || gate_exit
 post_control /cluster/nodes/drain '{"node":4}' 202 || gate_exit
+CONTROL_STATUS=$(cluster_status 19810)
+assert_eq "drain victim starts with exactly one serving-map reference" \
+    "$(status_field "$CONTROL_STATUS" control_drain_references)" 1
 post_control /cluster/nodes/remove '{"node":4}' 409 || gate_exit
 if printf '%s' "$CONTROL_BODY" | grep -q '"status":"rejected"'; then
-    gate_ok "removal remains blocked while node 4 has serving-map references"
+    gate_ok "removal remains blocked while node 4 has a serving-map reference"
 else
-    gate_fail "node 4 removal conflict did not report a policy rejection: $CONTROL_BODY"
+    gate_fail "premature node 4 removal did not report a policy rejection: $CONTROL_BODY"
+fi
+wait_serving_epoch 5 "$PORTS" 180 || gate_exit
+finish_campaign automatic_evacuation
+wait_retired_counter 19813 2 || gate_exit
+verify_probe "after automatic drain evacuation" "$PORTS"
+
+echo "=== evict the caught-up Group-0 learner and accept final removal ==="
+for _ in $(seq 1 120); do
+    CONTROL_STATUS=$(cluster_status 19810)
+    DRAIN_REFS=$(status_field "$CONTROL_STATUS" control_drain_references)
+    TOPOLOGY_PLANS=$(status_field "$CONTROL_STATUS" control_topology_plans)
+    TOPOLOGY_CUTOVERS=$(status_field "$CONTROL_STATUS" control_topology_cutovers)
+    [ "${DRAIN_REFS:-1}" -eq 0 ] && [ "${TOPOLOGY_PLANS:-0}" -ge 1 ] && \
+        [ "${TOPOLOGY_CUTOVERS:-0}" -ge 1 ] && break
+    sleep 1
+done
+assert_eq "automatic drain has no serving-map references" "${DRAIN_REFS:-missing}" 0
+assert_ge "automatic drain planned a replacement" "${TOPOLOGY_PLANS:-0}" 1
+assert_ge "automatic drain published a cutover" "${TOPOLOGY_CUTOVERS:-0}" 1
+post_control /cluster/nodes/remove '{"node":4}' 202 || gate_exit
+for _ in $(seq 1 120); do
+    CONTROL_STATUS=$(cluster_status 19810)
+    CONTROL_LEARNERS=$(status_field "$CONTROL_STATUS" control_learners)
+    REMOVALS_PENDING=$(status_field "$CONTROL_STATUS" control_removals_pending)
+    [ "${CONTROL_LEARNERS:-1}" -eq 0 ] && [ "${REMOVALS_PENDING:-1}" -eq 0 ] && break
+    sleep 1
+done
+assert_eq "removed node applied its record before Group-0 eviction" "${CONTROL_LEARNERS:-missing}" 0
+assert_eq "final Group-0 membership cleanup completed" "${REMOVALS_PENDING:-missing}" 0
+post_control /cluster/nodes/remove '{"node":4}' 202 || gate_exit
+if printf '%s' "$CONTROL_BODY" | grep -q '"status":"removed"'; then
+    gate_ok "Draining -> Removed is accepted after complete evacuation"
+else
+    gate_fail "idempotent final removal did not report removed: $CONTROL_BODY"
 fi
 
 for p in $PORTS; do

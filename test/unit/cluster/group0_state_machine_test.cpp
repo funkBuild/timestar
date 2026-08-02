@@ -332,6 +332,32 @@ TEST(Group0StateMachineV1, ServingMapCutoverRequiresExactCompletedMovementJob) {
     EXPECT_EQ(sm.state().frozenDeletePlans.at(plan().requestId), plan());
 }
 
+TEST(Group0StateMachineV1, NextMoveAtomicallyReplacesCompletedHistory) {
+    Group0StateMachine sm;
+    ControlMap current = servingMap();
+    ASSERT_TRUE(sm.applyCommand(PublishServingMap{current, {}}));
+    ASSERT_TRUE(sm.applyCommand(UpsertNode{node(4, "uuid-4")}));
+    ASSERT_TRUE(sm.applyCommand(UpsertNode{node(5, "uuid-5")}));
+    ASSERT_TRUE(sm.applyCommand(PlanVShardMove{"first", movePlan()}));
+    for (auto step : {movement::MoveStep::LearnerAdded, movement::MoveStep::CaughtUp, movement::MoveStep::Promoted,
+                      movement::MoveStep::OldRemoved, movement::MoveStep::Done})
+        ASSERT_TRUE(sm.applyCommand(advance("first", step)));
+    current.epoch = 2;
+    current.placement.at(7) = {4, 2, 3};
+    ASSERT_TRUE(sm.applyCommand(PublishServingMap{current, "first"}));
+
+    movement::MovePlan second{/*vshard=*/8, /*dest=*/5, /*victim=*/3, /*mapEpoch=*/3,
+                              /*sourceVoters=*/{1, 2, 3}};
+    ASSERT_TRUE(sm.applyCommand(PlanVShardMove{"second", second}));
+    ASSERT_EQ(sm.state().jobs.size(), 1u);
+    EXPECT_TRUE(sm.state().jobs.contains("second"));
+    EXPECT_FALSE(sm.state().jobs.contains("first"));
+    ASSERT_EQ(sm.state().desiredPlacement.size(), 1u);
+    EXPECT_EQ(sm.state().desiredPlacement.at(8), (std::vector<NodeId>{1, 2, 5}));
+    EXPECT_EQ(sm.snapshot().substr(0, 8), "TSG0SNP1")
+        << "the bounded current-only history remains part of the same exact v1 snapshot";
+}
+
 TEST(Group0SnapshotV1, RoundTripsAndRejectsMalformedState) {
     Group0StateMachine source;
     ASSERT_TRUE(source.applyCommand(InitCluster{"cluster-a"}));
