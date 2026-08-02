@@ -118,6 +118,7 @@ public:
     // Trigger a state-machine snapshot compaction up to `upto` with the given
     // opaque payload (the caller produced it from its state machine).
     seastar::future<> compact(LogIndex upto, std::string snapshotData);
+    seastar::future<> compact(LogIndex upto, SnapshotFilePtr snapshotFile);
 
     // Linearizable read barrier: resolves with a ReadIndex once a quorum has
     // confirmed current-term leadership AND this node has applied through that
@@ -182,6 +183,7 @@ public:
     const RaftNode& node() const { return node_; }
 
 private:
+    seastar::future<> compactImpl(LogIndex upto, std::string snapshotData, SnapshotFilePtr snapshotFile);
     seastar::gate::holder holdOperation();
     void ensureActive() const;
     // The ready/persist/send/apply/advance loop. MUST run under the group lock so

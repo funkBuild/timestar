@@ -508,6 +508,16 @@ physical partitioning:
   segments or multiplexed index files exist: unrelated VShards' logical
   hashes and manifests are unchanged, and shared segment bytes are exempt.
 
+Production VShard snapshots keep the exact `TSP1` v1 logical stream but store
+it in an owned sidecar instead of one reactor-memory string. Engine data objects
+are encoded and extracted through cooperatively yielded 1-MiB buffers, Raft
+hydrates and stages paced 4-MiB chunks, and the validated final sidecar is
+fsynced before publication. The complete sidecar has a finite 1-TiB disk
+admission ceiling. Manifest, catalog, receipt, retention, and
+data/log fences remain part of that same v1 stream. Journal descriptors retain
+only canonical sidecar names; replacement and orphan cleanup obey file and
+directory durability barriers.
+
 ### TSM and catalog requirements
 
 - TSM output must be VShard-partitioned, or its manifest must permit efficient

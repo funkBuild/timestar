@@ -385,7 +385,7 @@ void RaftNode::sendInstallSnapshot(NodeId peer) {
     // a whole stall-and-abandon cycle before anyone else can have it.
     if (!isReplicationPeer(config_, id_, peer))
         return;
-    const uint64_t total = snapshot_.data.size();
+    const uint64_t total = snapshot_.dataSize();
     // 0 == chunking disabled: one message carries the whole payload (pre-D-5 behaviour,
     // and what the core unit tests exercise).
     const size_t chunk =
@@ -399,12 +399,15 @@ void RaftNode::sendInstallSnapshot(NodeId peer) {
     // recorded, so a refusal leaves the peer's progress and this node's state exactly as
     // they were. The peer stays uncaught-up, which is the truth, and the counter says why.
     //
-    //  (1) the TOTAL payload against opts_.maxSnapshotBytes -- a memory bound now that
-    //      chunking removed the message one (see kMaxVShardSnapshotBytes);
+    //  (1) the TOTAL payload against the inline-memory or file-backed disk bound;
     //  (2) the FIRST CHUNK against opts_.maxMessageBytes. With chunking on this can only
     //      fire on a misconfiguration (chunk > message bound); with chunking OFF the first
     //      chunk IS the whole payload, so this reproduces the original F3a check exactly.
-    if (opts_.maxSnapshotBytes != 0 && total > opts_.maxSnapshotBytes) {
+    if (!snapshot_.fileBacked() && opts_.maxSnapshotBytes != 0 && total > opts_.maxSnapshotBytes) {
+        ++undeliverableSnapshots_;
+        return;
+    }
+    if (snapshot_.fileBacked() && opts_.maxFileSnapshotBytes != 0 && total > opts_.maxFileSnapshotBytes) {
         ++undeliverableSnapshots_;
         return;
     }
@@ -491,7 +494,7 @@ void RaftNode::clearTransfers() {
 }
 
 void RaftNode::sendSnapshotChunk(NodeId peer, uint64_t offset, size_t chunkLen) {
-    const uint64_t total = snapshot_.data.size();
+    const uint64_t total = snapshot_.dataSize();
     if (offset > total)
         offset = total;  // defensive: a peer cannot make us read past the payload
     const size_t len = static_cast<size_t>(std::min<uint64_t>(chunkLen, total - offset));
@@ -502,7 +505,12 @@ void RaftNode::sendSnapshotChunk(NodeId peer, uint64_t offset, size_t chunkLen) 
     is.lastIncludedIndex = snapshot_.index;
     is.lastIncludedTerm = snapshot_.term;
     is.config = snapshot_.config;  // the boundary config rides every chunk
-    is.data = snapshot_.data.substr(static_cast<size_t>(offset), len);
+    if (snapshot_.fileBacked()) {
+        is.sourceFile = snapshot_.file;
+        is.sourceLength = len;
+    } else {
+        is.data = snapshot_.data.substr(static_cast<size_t>(offset), len);
+    }
     is.offset = offset;
     is.totalBytes = total;
     is.done = (offset + len == total);
@@ -599,6 +607,20 @@ void RaftNode::sweepStalledSnapshotTransfers(unsigned passes) {
 }
 
 void RaftNode::compact(LogIndex upto, std::string snapshotData) {
+    Snapshot payload;
+    payload.data = std::move(snapshotData);
+    compactSnapshot(upto, std::move(payload));
+}
+
+void RaftNode::compact(LogIndex upto, SnapshotFilePtr snapshotFile) {
+    if (!snapshotFile || snapshotFile->path.empty())
+        throw std::invalid_argument("RaftNode::compact: missing snapshot sidecar");
+    Snapshot payload;
+    payload.file = std::move(snapshotFile);
+    compactSnapshot(upto, std::move(payload));
+}
+
+void RaftNode::compactSnapshot(LogIndex upto, Snapshot payload) {
     // Never compact past applied state: the snapshot payload must reflect what the
     // state machine has actually applied, and lastApplied_ <= commitIndex_ always,
     // so this is the safe (and more defensive) bound.
@@ -614,10 +636,10 @@ void RaftNode::compact(LogIndex upto, std::string snapshotData) {
     log_.compactTo(upto);
     baseConfig_ = base;
     recomputeConfigFromLog();  // fix latestConfigIndex_/config_ if the latest was folded
-    snapshot_.index = log_.snapshotIndex();
-    snapshot_.term = log_.snapshotTerm();
-    snapshot_.config = baseConfig_;
-    snapshot_.data = std::move(snapshotData);
+    payload.index = log_.snapshotIndex();
+    payload.term = log_.snapshotTerm();
+    payload.config = baseConfig_;
+    snapshot_ = std::move(payload);
 
     // EVERY IN-FLIGHT TRANSFER IS NOW FEEDING BYTES THAT NO LONGER EXIST (review F3).
     // `snapshot_.data` was just REPLACED IN PLACE, so a transfer mid-way through the old
@@ -690,7 +712,7 @@ void RaftNode::handleInstallSnapshot(NodeId from, const InstallSnapshot& is) {
     // a mismatched or hostile peer. Answer with an install-shaped reply carrying our real
     // commitIndex, which tells the leader nothing was installed and lets it fall back to
     // appends; the counter is what makes the stall diagnosable.
-    if (opts_.maxSnapshotBytes != 0 && total > opts_.maxSnapshotBytes) {
+    if (!is.externallyStaged && opts_.maxSnapshotBytes != 0 && total > opts_.maxSnapshotBytes) {
         ++snapshotsRefusedTooLarge_;
         snapStaging_.reset();
         reply.matchIndex = commitIndex_;
@@ -713,6 +735,7 @@ void RaftNode::handleInstallSnapshot(NodeId from, const InstallSnapshot& is) {
         fresh.index = is.lastIncludedIndex;
         fresh.term = is.lastIncludedTerm;
         fresh.totalBytes = total;
+        fresh.external = is.externallyStaged;
         snapStaging_ = std::move(fresh);
     } else if (!snapStaging_) {
         // A chunk from the middle with nothing staged: we restarted, or the leader's
@@ -724,26 +747,33 @@ void RaftNode::handleInstallSnapshot(NodeId from, const InstallSnapshot& is) {
         return;
     }
 
-    if (is.offset != snapStaging_->data.size() || total != snapStaging_->totalBytes) {
+    if (is.offset != snapStaging_->size() || total != snapStaging_->totalBytes ||
+        is.externallyStaged != snapStaging_->external) {
         // Out of order, or a DUPLICATE of a chunk we already hold. Neither is applied;
         // both are answered with where we actually are, so the leader resumes from the
         // truth instead of from its own (possibly stale) idea of it.
         reply.matchIndex = commitIndex_;
         reply.pendingSnapshotIndex = snapStaging_->index;
-        reply.stagedBytes = snapStaging_->data.size();
+        reply.stagedBytes = snapStaging_->size();
         send(Message{.to = from, .from = id_, .payload = reply});
         return;
     }
 
     snapStaging_->config = is.config;  // the boundary config rides every chunk
-    snapStaging_->data.append(is.data);
+    if (snapStaging_->external) {
+        if (!is.data.empty() || is.stagedBytes < is.offset || is.stagedBytes > total)
+            throw std::runtime_error("RaftNode: invalid externally staged snapshot progress");
+        snapStaging_->receivedBytes = is.stagedBytes;
+    } else {
+        snapStaging_->data.append(is.data);
+    }
 
     if (!is.done) {
         // Mid-transfer ack. This is the per-chunk reply the leader paces on: exactly one
         // chunk is in flight at a time, so this is what releases the next one.
         reply.matchIndex = commitIndex_;
         reply.pendingSnapshotIndex = snapStaging_->index;
-        reply.stagedBytes = snapStaging_->data.size();
+        reply.stagedBytes = snapStaging_->size();
         send(Message{.to = from, .from = id_, .payload = reply});
         return;
     }
@@ -753,7 +783,13 @@ void RaftNode::handleInstallSnapshot(NodeId from, const InstallSnapshot& is) {
     full.index = snapStaging_->index;
     full.term = snapStaging_->term;
     full.config = std::move(snapStaging_->config);
-    full.data = std::move(snapStaging_->data);
+    if (snapStaging_->external) {
+        if (snapStaging_->size() != total || !is.completedFile || is.completedFile->size != total)
+            throw std::runtime_error("RaftNode: final externally staged snapshot is incomplete");
+        full.file = is.completedFile;
+    } else {
+        full.data = std::move(snapStaging_->data);
+    }
     snapStaging_.reset();
     installReceivedSnapshot(std::move(full), reply);
     send(Message{.to = from, .from = id_, .payload = reply});

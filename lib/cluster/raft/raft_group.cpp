@@ -172,8 +172,11 @@ seastar::future<> RaftGroup::drainReady() {
 
         // 2. Only now may we tell peers what we have committed to durably.
         const uint64_t tS0 = profileEnabled() ? nowNs() : 0;
-        for (auto& m : rd.messages)
+        for (auto& m : rd.messages) {
+            if (auto* snapshot = std::get_if<InstallSnapshot>(&m.payload))
+                co_await persistence_.hydrateSnapshotChunk(*snapshot);
             co_await transport_.send(Envelope{groupId_, m});
+        }
         if (profileEnabled())
             g_prof.sendNs += nowNs() - tS0;
 
@@ -477,6 +480,14 @@ seastar::future<> RaftGroup::step(Message m) {
     auto units = co_await seastar::get_units(lock_, 1);
     if (retiring_)
         co_return;
+    if (auto* snapshot = std::get_if<InstallSnapshot>(&m.payload)) {
+        // Do no disk work for a message the deterministic core will reject
+        // before snapshot handling. Without these two cheap fences, a stale or
+        // already-committed peer could fill the staging directory even though
+        // Raft would immediately answer without installing its bytes.
+        if (snapshot->term >= node_.currentTerm() && snapshot->lastIncludedIndex > node_.commitIndex())
+            co_await persistence_.stageSnapshotChunk(*snapshot);
+    }
     try {
         node_.step(std::move(m));
     } catch (...) {
@@ -657,11 +668,22 @@ seastar::future<bool> RaftGroup::transferLeadership(NodeId target, bool* armed) 
 }
 
 seastar::future<> RaftGroup::compact(LogIndex upto, std::string snapshotData) {
+    return compactImpl(upto, std::move(snapshotData), {});
+}
+
+seastar::future<> RaftGroup::compact(LogIndex upto, SnapshotFilePtr snapshotFile) {
+    return compactImpl(upto, {}, std::move(snapshotFile));
+}
+
+seastar::future<> RaftGroup::compactImpl(LogIndex upto, std::string snapshotData, SnapshotFilePtr snapshotFile) {
     auto operation = holdOperation();
     auto units = co_await seastar::get_units(lock_, 1);
     ensureActive();
     const LogIndex before = node_.log().snapshotIndex();
-    node_.compact(upto, std::move(snapshotData));
+    if (snapshotFile)
+        node_.compact(upto, std::move(snapshotFile));
+    else
+        node_.compact(upto, std::move(snapshotData));
     syncUncommittedBudget();
     // PERSIST THE PRODUCED SNAPSHOT (debt D-6). Found by the recovery test the moment the
     // producer had a caller at all.

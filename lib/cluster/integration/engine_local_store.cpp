@@ -32,6 +32,24 @@ seastar::future<data::SnapshotPayload> EngineLocalStore::buildVShardSnapshot(VSh
     co_return payload;
 }
 
+seastar::future<data::SnapshotPayloadFile> EngineLocalStore::buildVShardSnapshotFile(VShardId vshard) {
+    if (!timestar::vshardsCohesiveOnCores(seastar::smp::count))
+        throw std::runtime_error(
+            "buildVShardSnapshotFile: core count is not VShard-cohesive; refusing a partial snapshot");
+    const unsigned core = timestar::assignCore(vshard, seastar::smp::count);
+    auto built =
+        co_await engines_.invoke_on(core, [vshard](Engine& e) { return e.buildVShardSnapshotFilesOnDisk(vshard); });
+    data::SnapshotPayloadFile payload;
+    payload.manifest = std::move(built.manifest);
+    payload.catalog = std::move(built.catalog);
+    payload.files.reserve(built.files.size());
+    for (auto& file : built.files) {
+        payload.files.emplace_back(std::move(file.name), std::move(file.path), file.size);
+        file.release();
+    }
+    co_return payload;
+}
+
 seastar::future<bool> EngineLocalStore::hasUnconvertedStores(VShardId vshard) {
     const unsigned core = timestar::assignCore(vshard, seastar::smp::count);
     // ONE predicate, one spelling (review F7): `WALFileManager` is the authority on "a
@@ -78,6 +96,25 @@ seastar::future<bool> EngineLocalStore::installVShardSnapshot(VShardId vshard, d
         for (auto& f : payload.files)
             files.emplace_back(std::move(f.name), std::move(f.bytes));
         return e.installVShardSnapshotBundle(std::move(payload.manifest), std::move(files), std::move(payload.catalog));
+    });
+}
+
+seastar::future<bool> EngineLocalStore::installVShardSnapshotFile(VShardId vshard,
+                                                                  data::SnapshotPayloadFile payload) {
+    if (!timestar::vshardsCohesiveOnCores(seastar::smp::count))
+        throw std::runtime_error("installVShardSnapshotFile: core count is not VShard-cohesive");
+    if (payload.manifest.vshard != vshard)
+        co_return false;
+    const unsigned core = timestar::assignCore(vshard, seastar::smp::count);
+    co_return co_await engines_.invoke_on(core, [payload = std::move(payload)](Engine& e) mutable {
+        if (payload.catalog.empty())
+            return seastar::make_ready_future<bool>(false);
+        std::vector<std::pair<std::string, std::filesystem::path>> files;
+        files.reserve(payload.files.size());
+        for (auto& file : payload.files)
+            files.emplace_back(file.name, file.path);
+        return e.installVShardSnapshotBundleFromFiles(std::move(payload.manifest), std::move(files),
+                                                      std::move(payload.catalog));
     });
 }
 

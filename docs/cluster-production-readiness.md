@@ -189,6 +189,25 @@ inventory and rules.
   node recovered the same one-plan/6,000-target state without resurrection. The
   three one-reactor nodes stayed within their 1-GiB process limits and the gate
   removed all four `build/tmp` roots afterward.
+- [x] Remove the VShard snapshot reactor-memory ceiling without adding another
+  protocol version. Production snapshots now encode the exact existing `TSP1`
+  v1 bytes directly from immutable Engine objects into owned sidecars, hydrate
+  and stage exact `TSR1` v1 InstallSnapshot messages in paced chunks no larger
+  than 4 MiB, and decode/install objects from disk through 1-MiB heap buffers
+  with a cooperative yield after every buffer. Manifest and catalog metadata
+  remain explicitly bounded at 16 MiB and 64 MiB, delete receipts at 1,024, and
+  the complete file-backed snapshot at 1 TiB. A received chunk is staged only
+  after its Raft term and snapshot boundary pass the preflight fence; the final
+  file is size/hash validated and fsynced before it can become Ready state.
+  Journal v1 records reference canonical sidecars, recover only the newest
+  descriptor, retain the prior file until the replacement descriptor is
+  durable, and remove crash-orphan producer/stage/extract files. Engine validates
+  the Raft/manifest boundary before mutation. The 2026-08-03 focused run passed
+  24 journal/sidecar tests, 40 Raft group/chunk/budget tests, 22
+  replicated-host tests, and 18 Engine/payload tests. The dedicated
+  one-reactor, 1-GiB gate streamed 128 MiB + 1 byte through leader hydration,
+  exact-v1 framing, receiver disk staging, and final validation without a
+  reactor-stall report, then returned `build/tmp` to its pre-gate size.
 
 ## Remaining production blockers
 
@@ -197,9 +216,8 @@ production deploy.
 
 ### P0 — correctness and topology
 
-- [ ] **Finish the large-snapshot production path.** Snapshot transfer is
-  chunked, but snapshot construction/install still needs a bounded streaming
-  path that cannot strand a VShard above the current in-memory payload ceiling.
+No open P0 item remains from this review. Production remains blocked on the P1
+evidence below.
 
 ### P1 — bounded operation and live evidence
 

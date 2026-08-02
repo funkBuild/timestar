@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <limits>
 #include <map>
+#include <filesystem>
+#include <memory>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -180,47 +182,16 @@ static_assert(kMaxRaftSendBytes * 3 <= kMaxInboundRaftMemory,
 // snapshot.
 inline constexpr size_t kMaxSnapshotChunkBytes = size_t{4} << 20;
 
-// The largest TOTAL snapshot payload this node will build, serve, or stage (D-5/D-6).
-//
-// Chunking removed the MESSAGE limit on a snapshot; it did not remove the MEMORY one.
-// `EngineLocalStore::buildVShardSnapshot` materializes the whole payload (manifest plus
-// every referenced TSM file's bytes) in RAM on the producer, `RaftNode` holds it in
-// `snapshot_` for as long as it is servable, and the receiver stages the whole thing in
-// RAM before installing it. Copies of an unbounded payload on a reactor with a fixed
-// memory pool are an OOM, not a slow transfer.
-//
-// THE MULTIPLE IS NOT THREE (debt D-32, correcting what this comment said). D-5 wrote
-// "three copies" from the three PLACES a payload lives; counting what is CONCURRENT on
-// each path found seven on the producer and eight on the receiver, because the journal
-// record encode chain re-materialized it several times over. D-32 removed four of them
-// (the producer's dead `std::move` into the payload encoder, the journal record's `body`
-// scratch, the journal writer's `encode()` temporary, and the receiver's copy into
-// `applySnapshot`); the remainder, all still concurrent during the journal append:
-//
-//   producer  ~4x: snapshot_.data | persistSnapshot's by-value Snapshot |
-//                  JournalRecord::payload | JournalWriter::tail_
-//   receiver  ~6x: the four above, plus pendingSnapshotApply_ and Ready::snapshot,
-//                  which are two live things by contract (servable state vs undrained
-//                  Ready output) and can only be collapsed by sharing the buffer
-//
-// So the bound STAYS AT 128 MiB rather than rising: the multiple it was set against was
-// understated, and 4-6x of 128 MiB is already 0.5-0.75 GiB on one reactor. Raising it
-// waits on the structural fix D-32 names -- streaming to and from DISK, after which this
-// is a disk bound -- or on making `Snapshot::data` a shared buffer, which would collapse
-// the receiver's two contract-mandated copies into refcounts. NOTE that the multiples
-// above are a CENSUS OF THE CODE, not a measurement: no RSS number has ever been taken on
-// this path.
-//
-// So the compaction refusal SURVIVES D-5 but changes meaning and RISES: it was
-// "> kMaxRaftPayloadBytes, because no single message could carry it" (which after the
-// retuning above would have FALLEN to 28 MiB); it is now "> kMaxVShardSnapshotBytes,
-// because we will not hold this much of one VShard in memory three times over". 128 MiB
-// is ~4.5x the old effective ceiling and 32 chunks, which is a real rise -- big
-// snapshots that used to block compaction now ship.
-//
-// RESIDUAL (D-32): the honest fix is to stream the payload to and from DISK rather than
-// staging it in RAM, after which this bound is a disk bound and can be far larger.
+// Compatibility ceiling for snapshots intentionally represented as one in-memory
+// string (Group 0 and deterministic unit tests). Production VShard snapshots use
+// SnapshotFile and the disk bound below; they never pass through this allowance.
 inline constexpr size_t kMaxVShardSnapshotBytes = size_t{128} << 20;
+
+// File-backed snapshots replace the reactor-memory ceiling with an explicit
+// disk/admission ceiling. One TiB is intentionally generous for a hot VShard,
+// yet finite so a corrupt or hostile peer cannot stream an unbounded object
+// into the snapshot staging directory.
+inline constexpr uint64_t kMaxVShardSnapshotFileBytes = uint64_t{1} << 40;
 
 // ===========================================================================
 // THE SHARD-LEVEL SNAPSHOT TRANSFER BUDGET (debt D-37)
@@ -429,11 +400,41 @@ struct Config {
 // (index, term) boundary and relays the payload. `config` is the active
 // membership as of the boundary (config entries below it are folded in here).
 // index==0 means "no snapshot".
+// A complete snapshot payload may live in a durable sidecar instead of one
+// reactor-sized std::string.  The handle is shared because Raft deliberately
+// has several logical owners while a received snapshot is persisted, applied,
+// and retained for later catch-up.  Sharing the handle must not share a second
+// copy of the bytes.
+//
+// `removeOnDestroy` is true only for an uncommitted staging object or for a
+// durable object that a newer, fsync'd snapshot superseded.  The newest durable
+// object keeps it false so ordinary process teardown cannot unlink the only
+// payload referenced by the journal.
+struct SnapshotFile {
+    std::filesystem::path path;
+    uint64_t size = 0;
+    uint64_t hash = 0;  // FNV-1a over the exact file bytes
+    bool removeOnDestroy = false;
+
+    ~SnapshotFile();
+};
+
+using SnapshotFilePtr = std::shared_ptr<SnapshotFile>;
+
 struct Snapshot {
     LogIndex index = kNoIndex;
     Term term = kNoTerm;
     Config config;
+    // Small snapshots (including Group 0 and deterministic core tests) remain
+    // inline. Production VShard snapshots use `file`; exactly one backing must
+    // be non-empty.
     std::string data;
+    SnapshotFilePtr file;
+
+    [[nodiscard]] uint64_t dataSize() const {
+        return file ? file->size : static_cast<uint64_t>(data.size());
+    }
+    [[nodiscard]] bool fileBacked() const { return static_cast<bool>(file); }
 };
 
 }  // namespace timestar::raft

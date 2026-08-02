@@ -83,7 +83,9 @@ The size chain is compile-time checked:
 | Raft send including envelope headroom | 18 MiB |
 | Raft inbound memory estimate | 64 MiB per shard |
 | Snapshot chunk | 4 MiB |
-| Complete VShard snapshot | 128 MiB (remaining blocker) |
+| Snapshot object I/O buffer | 1 MiB, cooperatively yielded |
+| Snapshot manifest / catalog metadata | 16 MiB / 64 MiB |
+| Complete VShard snapshot | 1 TiB file-backed disk admission ceiling |
 
 WriteBatch proposal charging computes the exact v1 encoded bytes without an
 allocation. It no longer applies a ratio between retired layouts. A slice that
@@ -100,9 +102,13 @@ Single-envelope delivery is the default. Optional per-peer batching carries the
 same v1 envelopes and changes only dispatch frequency. It can be enabled with
 `TIMESTAR_RAFT_BATCH_SENDS=1` where syscall/frame rate is the measured bottleneck.
 
-Snapshot transfer is chunked and paced. Install requests carry offset, total,
-and completion state; replies carry the accepted offset and staged byte count.
-The receiver bounds staged memory and rejects inconsistent chunks.
+Snapshot transfer is file-backed, chunked, and paced. Install requests retain
+the exact v1 wire layout and carry offset, total, and completion state; replies
+carry the accepted offset and staged byte count. The sender hydrates only the
+current chunk and the receiver stages it on disk; the complete final sidecar is
+size/hash checked and fsynced before Ready publication. Stale terms,
+already-applied boundaries, gaps, inconsistent totals, oversized descriptors,
+and final size/hash mismatches fail before installation.
 
 CheckQuorum is disabled in the production data plane. Lost-quorum writes still
 fail within their bounded proposal deadline. The transfer-vote bypass remains
@@ -120,13 +126,16 @@ see [ADR 0005](adr/0005-checkquorum-transfer-bypass.md).
 - [x] Added bounded uncommitted-log accounting and expired-waiter reclamation.
 - [x] Added chunked snapshot catch-up and bounded inbound Raft memory.
 - [x] Added shared-journal reclaim floors and fair snapshot scanning.
+- [x] Streamed exact-v1 VShard snapshot construction, transfer, recovery, and
+  Engine installation through owned disk sidecars with bounded metadata and
+  cooperatively yielded object I/O.
 - [x] Added current v1 markers and removed old protocol/layout branches.
 - [x] Removed the superseded data model and duplicated tests.
 
 ## Remaining work
 
-- [ ] Stream complete VShard snapshots so the 128 MiB full-payload cap cannot
-  strand a hot VShard.
+- [x] Stream complete VShard snapshots so the former 128 MiB full-payload cap
+  cannot strand a hot VShard.
 - [ ] Prove sustained receipt retirement, snapshot progress, and journal reclaim
   under delete-heavy live load.
 - [x] Complete production topology changes and ordered VShard teardown through

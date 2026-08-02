@@ -90,6 +90,19 @@ TEST(JournalWriterTest, NonRegularSegmentEntryFencesAndIsPreserved) {
     fs::remove_all(dir);
 }
 
+TEST(JournalWriterTest, ExactSnapshotSidecarNamespaceSurvivesJournalRecovery) {
+    const auto dir = tmpDir("snapshot_sidecars");
+    fs::create_directories(dir / "snapshot_sidecars" / "vshard_7");
+    std::ofstream(dir / "snapshot_sidecars" / "vshard_7" / "snapshot_v1_test.bin") << "sidecar";
+
+    JournalWriter w(dir, header(), 1u << 20);
+    EXPECT_NO_THROW(w.open().get());
+    EXPECT_FALSE(w.fenced());
+    w.close().get();
+    EXPECT_TRUE(fs::exists(dir / "snapshot_sidecars" / "vshard_7" / "snapshot_v1_test.bin"));
+    fs::remove_all(dir);
+}
+
 TEST(JournalWriterTest, ExhaustedSegmentIdentityFencesWithoutWrappingOrMutation) {
     const auto dir = tmpDir("identity_exhausted");
     fs::create_directories(dir);

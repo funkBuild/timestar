@@ -52,6 +52,7 @@ public:
     // Dispatches to that core and includes the exact catalog/index reconstruction
     // records bound by manifest.catalogHash.
     seastar::future<data::SnapshotPayload> buildVShardSnapshot(VShardId vshard);
+    seastar::future<data::SnapshotPayloadFile> buildVShardSnapshotFile(VShardId vshard);
 
     // Are there rolled-over memory stores holding THIS VSHARD's data that have NOT yet
     // been converted to TSM? (debt D-6, narrowed from per-shard to per-VShard by D-35.)
@@ -106,6 +107,7 @@ public:
     // Install a received VShard snapshot (consumer side of the above). Same cohesion
     // precondition; dispatches to assignCore(vshard). Returns true iff installed.
     seastar::future<bool> installVShardSnapshot(VShardId vshard, data::SnapshotPayload payload);
+    seastar::future<bool> installVShardSnapshotFile(VShardId vshard, data::SnapshotPayloadFile payload);
 
     // Discard the local Engine generation after Group 0 and the applied data
     // group configuration have both removed this replica. Replica retirement

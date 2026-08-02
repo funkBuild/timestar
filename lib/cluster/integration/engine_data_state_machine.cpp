@@ -104,9 +104,44 @@ seastar::future<> EngineDataStateMachine::applySnapshot(raft::Snapshot snap) {
     // install it into this VShard's Engine core, verify-then-install all-or-nothing. A
     // malformed payload or a failed verification is FAIL-STOP (throws) -- never a silent
     // partial install, which would leave this replica diverged.
-    auto payload = data::decodeSnapshotPayload(snap.data);
-    if (!payload)
-        throw std::runtime_error("EngineDataStateMachine::applySnapshot: undecodable snapshot payload (fail-stop)");
+    data::DeleteReceiptSnapshotState deleteState;
+    std::optional<data::RetentionCutoffSnapshotState> retentionState;
+    bool installed = false;
+    uint64_t snapshotRevision = 0;
+    if (snap.fileBacked()) {
+        const auto extraction = snap.file->path.parent_path() / "extract_tmp";
+        auto payload = co_await data::decodeSnapshotPayloadFile(snap.file->path, extraction);
+        if (!payload)
+            throw std::runtime_error(
+                "EngineDataStateMachine::applySnapshot: undecodable file-backed snapshot payload (fail-stop)");
+        snapshotRevision = payload->manifest.snapshotRevision;
+        // Authenticate the payload-to-Raft boundary before changing Engine
+        // state. A valid TSP1 object paired with the wrong Raft metadata must
+        // fail without installing anything.
+        if (snap.index == UINT64_MAX || snapshotRevision != snap.index + 1)
+            throw std::runtime_error(
+                "EngineDataStateMachine::applySnapshot: data revision does not match Raft snapshot boundary "
+                "(fail-stop)");
+        deleteState = data::DeleteReceiptSnapshotState{payload->deleteReceiptsRetiredBeforeMs,
+                                                       payload->deleteReceiptsRetiredAtIndex,
+                                                       std::move(payload->deleteReceipts)};
+        retentionState = std::move(payload->retentionCutoff);
+        installed = co_await store_.installVShardSnapshotFile(vshard_, std::move(*payload));
+    } else {
+        auto payload = data::decodeSnapshotPayload(snap.data);
+        if (!payload)
+            throw std::runtime_error("EngineDataStateMachine::applySnapshot: undecodable snapshot payload (fail-stop)");
+        snapshotRevision = payload->manifest.snapshotRevision;
+        if (snap.index == UINT64_MAX || snapshotRevision != snap.index + 1)
+            throw std::runtime_error(
+                "EngineDataStateMachine::applySnapshot: data revision does not match Raft snapshot boundary "
+                "(fail-stop)");
+        deleteState = data::DeleteReceiptSnapshotState{payload->deleteReceiptsRetiredBeforeMs,
+                                                       payload->deleteReceiptsRetiredAtIndex,
+                                                       std::move(payload->deleteReceipts)};
+        retentionState = std::move(payload->retentionCutoff);
+        installed = co_await store_.installVShardSnapshot(vshard_, std::move(*payload));
+    }
     // The manifest carries the producer's data/log fence. It is one above the
     // compacted Raft index: entry N remains in the suffix when it could be only
     // partly flushed, while the fence may move beyond the last point revision
@@ -114,15 +149,6 @@ seastar::future<> EngineDataStateMachine::applySnapshot(raft::Snapshot snap) {
     // state. Bind those independently checksummed envelopes here. Without this
     // check, a valid payload paired with the wrong Raft snapshot metadata could
     // install state ahead of (or unrelated to) the log prefix being discarded.
-    if (snap.index == UINT64_MAX || payload->manifest.snapshotRevision != snap.index + 1)
-        throw std::runtime_error(
-            "EngineDataStateMachine::applySnapshot: data revision does not match Raft snapshot boundary "
-            "(fail-stop)");
-    data::DeleteReceiptSnapshotState deleteState{payload->deleteReceiptsRetiredBeforeMs,
-                                                 payload->deleteReceiptsRetiredAtIndex,
-                                                 std::move(payload->deleteReceipts)};
-    auto retentionState = std::move(payload->retentionCutoff);
-    const bool installed = co_await store_.installVShardSnapshot(vshard_, std::move(*payload));
     if (!installed)
         throw std::runtime_error(
             "EngineDataStateMachine::applySnapshot: snapshot failed verification and was not installed (fail-stop)");

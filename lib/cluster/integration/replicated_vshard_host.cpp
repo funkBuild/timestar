@@ -55,6 +55,14 @@ data::OptDeadline boundedProposalDeadline(data::OptDeadline requested) {
     return requested;
 }
 
+fs::path snapshotDirectoryFor(const fs::path& journalRoot, uint16_t vshard, bool sharedJournal) {
+    const auto journalDirectory = sharedJournal
+                                      ? journalRoot / ("shard_" + std::to_string(seastar::this_shard_id()))
+                                      : journalRoot / ("vshard_" + std::to_string(vshard));
+    const auto sidecars = journalDirectory / "snapshot_sidecars";
+    return sharedJournal ? sidecars / ("vshard_" + std::to_string(vshard)) : sidecars;
+}
+
 constexpr std::string_view kRetiredDirectoryPrefix = "v1_vshard_";
 constexpr std::string_view kRetiredMarkerPrefix = "retired_at_";
 constexpr std::string_view kRetiredMarkerSuffix = ".v1";
@@ -263,7 +271,15 @@ seastar::future<> ReplicatedVShardHost::addVShard(uint16_t vshard, std::vector<N
     // records and every addVShard on this shard needs it); per-VShard mode reads
     // this VShard's own, which is dropped at the end of this frame.
     const std::vector<JournalRecord>& recovered = sharedSink_ ? sharedRecovered_ : ownRecovered;
-    raft::RecoveredRaftState st = raft::recoverRaftState(recovered, VShardId{vshard});
+    const fs::path snapshotDirectory = snapshotDirectoryFor(journalRoot_, vshard, sharedSink_ != nullptr);
+    raft::RecoveredRaftState st = raft::recoverRaftState(recovered, VShardId{vshard}, snapshotDirectory);
+    if (st.snapshot && st.snapshot->file)
+        co_await raft::validateSnapshotFile(*st.snapshot->file);
+    // This directory is private to the VShard, so recovery can safely retire
+    // partial receives, interrupted producers, old extracted TSM objects and
+    // superseded sidecars without racing another group.
+    co_await raft::cleanupSnapshotDirectory(snapshotDirectory,
+                                            st.snapshot && st.snapshot->file ? st.snapshot->file : nullptr);
 
     std::vector<NodeId> baseVoters = voters;
     std::vector<NodeId> baseLearners;
@@ -277,14 +293,18 @@ seastar::future<> ReplicatedVShardHost::addVShard(uint16_t vshard, std::vector<N
 
     vs.persistence = sharedSink_
                          ? std::make_unique<raft::JournalRaftPersistence>(static_cast<JournalSink&>(*sharedSink_),
-                                                                          VShardId{vshard}, st.nextSeq)
-                         : std::make_unique<raft::JournalRaftPersistence>(*vs.writer, VShardId{vshard}, st.nextSeq);
+                                                                          VShardId{vshard}, st.nextSeq,
+                                                                          snapshotDirectory)
+                         : std::make_unique<raft::JournalRaftPersistence>(*vs.writer, VShardId{vshard}, st.nextSeq,
+                                                                           snapshotDirectory);
     // SEED THE RECLAIM FLOOR FROM WHAT WAS ACTUALLY RECOVERED (debt D-34). Mandatory,
     // not an optimisation: a fresh persistence object knows none of the on-disk records'
     // seqs, so its "oldest live entry" would be the first entry appended AFTER this
     // restart -- a much higher seq -- and the floor would jump straight over the
     // recovered log suffix and release the records it is made of.
     vs.persistence->seedRetention(std::move(st.retention));
+    if (st.snapshot && st.snapshot->file)
+        vs.persistence->seedSnapshotFile(st.snapshot->file);
     // The recovered floor is the starting point for reclamation too, so a node that
     // restarts over an already-compacted journal can collect on its FIRST pass instead
     // of waiting for the next compaction.
@@ -356,7 +376,9 @@ seastar::future<> ReplicatedVShardHost::addVShard(uint16_t vshard, std::vector<N
         // branch above for why the move is worth having.
         const uint64_t snapIndex = st.snapshot->index;
         const uint64_t snapTerm = st.snapshot->term;
-        auto stateMachineState = data::decodeSnapshotStateMachineState(st.snapshot->data);
+        auto stateMachineState = st.snapshot->file
+                                     ? co_await data::decodeSnapshotStateMachineStateFile(st.snapshot->file->path)
+                                     : data::decodeSnapshotStateMachineState(st.snapshot->data);
         if (!stateMachineState)
             throw std::runtime_error(
                 "ReplicatedVShardHost: locally produced snapshot has invalid state-machine framing");
@@ -753,7 +775,7 @@ seastar::future<uint64_t> ReplicatedVShardHost::snapshotVShard(uint16_t vshard) 
     // newly converted extent can raise maxFlushedRevision, for which the
     // conservative one-entry slack below remains safe, while an active write
     // stays above the observed storage boundary and remains in the suffix.
-    auto payload = co_await store_.buildVShardSnapshot(VShardId{vshard});
+    auto payload = co_await store_.buildVShardSnapshotFile(VShardId{vshard});
     const uint64_t maxFlushedRevision = payload.manifest.snapshotRevision;
 
     // The TSM-derived fallback remains one entry below its highest revision.
@@ -829,43 +851,31 @@ seastar::future<uint64_t> ReplicatedVShardHost::snapshotVShard(uint16_t vshard) 
     if (upto == UINT64_MAX)
         throw std::overflow_error("cluster: Raft snapshot boundary exhausted");
     payload.manifest.snapshotRevision = upto + 1;
-    // CONSUMING encode (debt D-32). This `std::move` used to be dead -- the only overload
-    // took a const&, so the rvalue bound to it and every file was copied, leaving the
-    // producer holding the payload twice with `payload` still alive for the whole
-    // compaction below it. It now really does consume: `payload`'s file bodies are gone
-    // when this returns.
-    std::string encoded = data::encodeSnapshotPayload(std::move(payload));
-    // REFUSE TO COMPACT INTO A SNAPSHOT NOBODY CAN RECEIVE (write-scaleout 5 review, F3c).
-    // Compaction is the point of no return: it DISCARDS the log prefix this snapshot
-    // replaces, so a follower that later needs catching up has only the snapshot to be
-    // caught up WITH. If that snapshot cannot be delivered, the follower can never be
-    // caught up at all -- and the log entries that would have done it are gone. Declining
-    // to compact leaves the group exactly as it was: larger log, working replication.
-    //
-    // RECONCILED WITH CHUNKING (D-5/D-6). The threshold was `kMaxRaftPayloadBytes`, i.e.
-    // "no single message could carry it". Chunking removed that limit, and the retuned size
-    // chain would have DROPPED that number to 28 MiB -- so leaving the check as it stood
-    // would have made compaction refuse MORE often after the fix meant to enable it.
-    //
-    // It is now `kMaxVShardSnapshotBytes` (128 MiB), which is a MEMORY bound rather than a
-    // message bound: `buildVShardSnapshot` materializes the whole payload in RAM here, the
-    // leader holds it for as long as it is servable, and the receiver stages it in RAM
-    // before installing. Copies of an unbounded payload on a reactor with a fixed memory
-    // pool are an OOM. That is a ~4.5x RISE over the old effective ceiling, so snapshots
-    // that used to block compaction now ship -- as a pipeline of 4 MiB chunks.
-    //
-    // D-32 removed four of the concurrent copies and left the bound where it is; the
-    // corrected census (and why the number stays) is at kMaxVShardSnapshotBytes.
-    if (encoded.size() > raft::kMaxVShardSnapshotBytes) {
+    // Encode exact-v1 TSP1 directly from the Engine's immutable objects into a
+    // sidecar. Both directions copy through fixed-size buffers: the producer,
+    // the Raft leader and the receiver no longer hold a whole VShard snapshot
+    // in reactor memory. The file-backed bound protects disk from a corrupt or
+    // hostile descriptor; unlike the former 128-MiB RAM ceiling, it does not
+    // strand a healthy large VShard behind an ever-growing uncompacted log.
+    const auto snapshotDirectory = snapshotDirectoryFor(journalRoot_, vshard, sharedSink_ != nullptr);
+    const auto output = snapshotDirectory /
+                        ("snapshot_v1_produce_g" + std::to_string(vshard) + "_i" + std::to_string(upto) + ".bin");
+    auto encoded = co_await data::encodeSnapshotPayloadFile(std::move(payload), output);
+    if (encoded.size > raft::kMaxVShardSnapshotFileBytes) {
         timestar::http_log.error(
-            "cluster: NOT compacting VShard {}: its snapshot is {} bytes, over the {} byte total-snapshot bound, so it "
-            "cannot be held in memory to serve (chunking bounds the MESSAGE, not the payload). The log is kept instead "
-            "(it will keep growing). Streaming the payload via disk rather than staging it in RAM is the fix (D-32).",
-            vshard, encoded.size(), raft::kMaxVShardSnapshotBytes);
+            "cluster: NOT compacting VShard {}: its snapshot is {} bytes, over the {} byte file-backed snapshot "
+            "bound. The log is kept instead.",
+            vshard, encoded.size, raft::kMaxVShardSnapshotFileBytes);
         ++snapshotsRefusedTooLarge_;
         co_return 0;
     }
-    co_await g->compact(upto, std::move(encoded));
+    auto snapshotFile = std::make_shared<raft::SnapshotFile>();
+    snapshotFile->path = encoded.path;
+    snapshotFile->size = encoded.size;
+    snapshotFile->hash = encoded.hash;
+    snapshotFile->removeOnDestroy = true;
+    encoded.release();
+    co_await g->compact(upto, std::move(snapshotFile));
     ++snapshotsTaken_;
     if (auto it = vshards_.find(vshard); it != vshards_.end()) {
         it->second.lastSnapshot = seastar::lowres_clock::now();

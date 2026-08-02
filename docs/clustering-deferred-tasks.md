@@ -16,8 +16,9 @@ Production blockers take priority and are authoritative in
   enabled after unit, snapshot/replay, controller-failover, restart, and
   tombstone-recreation gates; clustered downsampling remains intentionally
   unsupported in v1.
-- [ ] Replace monolithic snapshot construction/install buffers with bounded
-  streaming beyond 128 MiB.
+- [x] Replace monolithic VShard snapshot construction/install buffers with
+  exact-v1 file-backed streaming beyond 128 MiB, bounded metadata, paced 4-MiB
+  Raft chunks, and crash-safe sidecar recovery/cleanup.
 - [x] Prove frozen pattern-delete retry through group-0 leader failover and
   restart in a multi-process gate. The production-server gate makes the first
   response ambiguous only after another voter applies the complete plan, then

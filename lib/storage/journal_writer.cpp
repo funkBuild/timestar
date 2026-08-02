@@ -55,11 +55,11 @@ seastar::future<std::vector<JournalRecord>> JournalWriter::open() {
     if (opened_)
         throw std::logic_error("JournalWriter::open called twice");
 
-    // Enumerate existing segments (blocking fs calls off the reactor). This
-    // directory is owned exclusively by the journal and has no metadata or
-    // temporary-file namespace. Silently ignoring an unrecognised entry is not
-    // safe: it may be an acknowledged segment whose filename was damaged or
-    // only partially renamed. Preserve every suspicious entry and fence.
+    // Enumerate existing segments inside the cooperative thread. The one
+    // exact auxiliary namespace is `snapshot_sidecars`: keeping it under the
+    // journal generation makes private-VShard quarantine/reclaim atomic with
+    // the descriptor that names it. Every other unrecognised entry still
+    // fences recovery; it may be a damaged acknowledged segment.
     std::vector<uint64_t> segments;
     try {
         segments = co_await seastar::async([this] {
@@ -67,6 +67,8 @@ seastar::future<std::vector<JournalRecord>> JournalWriter::open() {
             fs::create_directories(dir_);
             for (const auto& entry : fs::directory_iterator(dir_)) {
                 const auto path = entry.path();
+                if (path.filename() == "snapshot_sidecars" && !entry.is_symlink() && entry.is_directory())
+                    continue;
                 if (!fs::is_regular_file(entry.symlink_status()))
                     throw std::runtime_error("non-regular journal directory entry: " + path.string());
                 auto n = parseSegmentFilename(path.filename().string());

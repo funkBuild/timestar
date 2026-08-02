@@ -378,7 +378,7 @@ public:
                 return "Raft snapshot production is disabled";
             if (snapshotsRefusedTooLarge != 0)
                 return std::to_string(snapshotsRefusedTooLarge) +
-                       " VShard snapshot(s) exceeded the safe in-memory size bound";
+                       " VShard snapshot(s) exceeded the configured file size bound";
             if (snapshotsUndeliverable != 0)
                 return std::to_string(snapshotsUndeliverable) + " VShard snapshot transfer(s) were undeliverable";
             return {};

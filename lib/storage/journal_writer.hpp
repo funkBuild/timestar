@@ -21,7 +21,8 @@ namespace timestar {
 //
 // Recovery (open()) reads existing segments in order, validates cluster/core/
 // segment identity, and cleanly drops a torn record tail on the last one. The
-// journal directory is an exclusive segment namespace: any non-canonical or
+// journal directory contains canonical segments plus the exact
+// `snapshot_sidecars` auxiliary directory; any other non-canonical or
 // non-regular entry fences recovery because it may be a damaged durable segment.
 // Only a zero-byte final segment (crash before its buffered header was written)
 // is deleted; any non-empty invalid segment is preserved and fences recovery.

@@ -111,9 +111,9 @@ struct RaftOptions {
     // ---- chunked InstallSnapshot (debt D-5) ----
     //
     // The largest slice of a snapshot payload one InstallSnapshot may carry. 0 disables
-    // chunking (one message per snapshot, the pre-D-5 behaviour), which is what the core
-    // unit tests use: their payloads are bytes, so chunking would be untestably invisible
-    // there, and the unchunked path must keep working for a peer that predates tag 9.
+    // chunking (one message per snapshot), which deterministic core unit tests use:
+    // their payloads are small bytes, so chunking would add no coverage there. Every
+    // production data group configures a non-zero bound and uses exact-v1 chunks.
     size_t maxSnapshotChunkBytes = kMaxSnapshotChunkBytes;
 
     // The largest TOTAL snapshot payload this node will serve or stage. 0 == no bound
@@ -121,6 +121,7 @@ struct RaftOptions {
     // counts `undeliverableSnapshots()` -- the F3a discipline, now keyed on memory rather
     // than on message size (see kMaxVShardSnapshotBytes).
     size_t maxSnapshotBytes = 0;
+    uint64_t maxFileSnapshotBytes = 0;
 
     // The SHARD-LEVEL cap on concurrently active snapshot transfers (debt D-37), shared by
     // every group on this reactor. nullptr == unbounded, which is the pre-D-37 behaviour
@@ -214,6 +215,7 @@ public:
     // resulting snapshot so the leader can serve it to lagging followers. Called
     // by the driver after it has durably written the snapshot payload.
     void compact(LogIndex upto, std::string snapshotData);
+    void compact(LogIndex upto, SnapshotFilePtr snapshotFile);
 
     // Seed the SERVABLE snapshot from one recovered off this node's journal, at
     // construction time only (debt D-6).
@@ -256,10 +258,9 @@ public:
     bool transferInFlight() const { return leadTransferee_ != kNoNode; }
     size_t uncommittedLogBytes() const;
     UncommittedProposalBudget* uncommittedProposalBudget() const { return opts_.uncommittedProposalBudget; }
-    // Snapshots this node declined to send because they exceed opts_.maxSnapshotBytes (or,
-    // with chunking disabled, opts_.maxMessageBytes). Non-zero means a follower CANNOT be
-    // caught up by snapshot and needs a SMALLER snapshot before it can rejoin -- since
-    // D-5 chunked the transfer, the remaining reason is memory, not message size.
+    // Snapshots this node declined to send because they exceed the configured
+    // inline-memory/file bound (or, with chunking disabled, maxMessageBytes).
+    // Non-zero means the follower cannot be caught up by this snapshot.
     uint64_t undeliverableSnapshots() const { return undeliverableSnapshots_; }
 
     // ---- chunked-transfer observability (debt D-5) ----
@@ -272,7 +273,7 @@ public:
     // Snapshots this node has INSTALLED as a follower (final chunk received and applied).
     uint64_t snapshotsInstalled() const { return snapshotsInstalled_; }
     // Transfers restarted because a chunk went unacked for opts_.snapshotChunkTimeout
-    // ticks. Steady non-zero means chunks are being dropped (or the peer predates tag 9).
+    // ticks. Steady non-zero means chunks are being dropped or not acknowledged.
     uint64_t snapshotTransfersRestarted() const { return snapshotTransfersRestarted_; }
     // Transfers given up on after opts_.maxSnapshotResends stalls. The peer is left
     // exactly as far behind as it is; the next heartbeat starts over.
@@ -440,6 +441,7 @@ private:
     void handleInstallSnapshotReply(NodeId from, const InstallSnapshotReply& rr);
     // Adopt a fully-received snapshot (the final chunk's payload) and fill in `reply`.
     void installReceivedSnapshot(Snapshot full, InstallSnapshotReply& reply);
+    void compactSnapshot(LogIndex upto, Snapshot payload);
 
     // Election tally over the (possibly joint) configuration: won needs a
     // majority grant in every voting set; lost means no set can still reach one.
@@ -543,7 +545,13 @@ private:
         Term term = kNoTerm;
         Config config;  // the boundary config, refreshed by every chunk
         uint64_t totalBytes = 0;
-        std::string data;  // the contiguous prefix received so far
+        std::string data;  // the contiguous prefix for the in-memory/test path
+        uint64_t receivedBytes = 0;
+        bool external = false;
+
+        [[nodiscard]] uint64_t size() const {
+            return external ? receivedBytes : static_cast<uint64_t>(data.size());
+        }
     };
     std::optional<SnapshotStaging> snapStaging_;
     uint64_t snapshotsInstalled_ = 0;

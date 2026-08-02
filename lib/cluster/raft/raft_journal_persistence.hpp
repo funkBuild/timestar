@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <deque>
+#include <filesystem>
 #include <optional>
 #include <seastar/core/future.hh>
 #include <utility>
@@ -56,14 +57,18 @@ public:
     // `startSeq` is the next vshard_seq to assign (recovered max + 1, or 1 fresh).
     // This overload OWNS a DirectJournalSink over `writer` -- today's shape, and
     // what the tests construct.
-    JournalRaftPersistence(JournalWriter& writer, VShardId vshard, uint64_t startSeq = 1);
+    JournalRaftPersistence(JournalWriter& writer, VShardId vshard, uint64_t startSeq = 1,
+                           std::filesystem::path snapshotDirectory = {});
     // Append into a sink the caller owns (a per-shard SharedShardJournal). The sink
     // must outlive this object.
-    JournalRaftPersistence(JournalSink& sink, VShardId vshard, uint64_t startSeq = 1);
+    JournalRaftPersistence(JournalSink& sink, VShardId vshard, uint64_t startSeq = 1,
+                           std::filesystem::path snapshotDirectory = {});
 
     seastar::future<> persistHardState(HardState hs) override;
     seastar::future<> persistEntries(std::vector<LogEntry> entries) override;
     seastar::future<> persistSnapshot(Snapshot snap, bool receivedFromPeer) override;
+    seastar::future<> hydrateSnapshotChunk(InstallSnapshot& chunk) override;
+    seastar::future<> stageSnapshotChunk(InstallSnapshot& chunk) override;
     seastar::future<> sync() override;
 
     uint64_t nextSeq() const { return nextSeq_; }
@@ -151,6 +156,9 @@ public:
     // branch on a path that runs once per group per process, and the thing it prevents is
     // a replica restarting with no vote.
     void seedRetention(JournalRetentionSeed seed);
+    // Seed the live sidecar handle recovered from the journal so a later
+    // durable snapshot can retire it. Must precede the first append.
+    void seedSnapshotFile(SnapshotFilePtr file);
 
 private:
     // DECLARATION ORDER IS LOAD-BEARING: sink_ may reference owned_.
@@ -180,6 +188,21 @@ private:
     // the log length, which compaction bounds; 16 bytes per entry against a log entry
     // that is a whole WriteBatch.
     std::deque<std::pair<uint64_t, uint64_t>> entrySeqs_;
+
+    std::filesystem::path snapshotDirectory_;
+    uint64_t snapshotNonce_ = 0;
+    struct IncomingSnapshotStage {
+        LogIndex index = kNoIndex;
+        Term term = kNoTerm;
+        uint64_t totalBytes = 0;
+        uint64_t receivedBytes = 0;
+        uint64_t hash = 1469598103934665603ull;
+        SnapshotFilePtr file;
+    };
+    std::optional<IncomingSnapshotStage> incomingStage_;
+    SnapshotFilePtr currentSnapshotFile_;
+    SnapshotFilePtr pendingSnapshotFile_;
+    SnapshotFilePtr pendingSupersededFile_;
 };
 
 // The Raft state reconstructed for one group from its recovered journal records.
@@ -209,6 +232,17 @@ struct RecoveredRaftState {
 // vshard_seq order: HardState records set term/vote, Data/Config records place a
 // log entry at their raft_index (a re-append overwrites), and Truncation records
 // drop the suffix at/after their index. See ADR 0003 for the seq/revision link.
-RecoveredRaftState recoverRaftState(const std::vector<JournalRecord>& records, VShardId vshard);
+RecoveredRaftState recoverRaftState(const std::vector<JournalRecord>& records, VShardId vshard,
+                                    const std::filesystem::path& snapshotDirectory = {});
+
+// Verify a recovered/produced sidecar without materialising it. Missing,
+// truncated, extended, or hash-mismatched files fail closed.
+seastar::future<> validateSnapshotFile(const SnapshotFile& file);
+
+// Remove crash-orphaned producer/receiver/extraction files after recovery has
+// identified and validated the one durable sidecar named by the latest journal
+// snapshot record. The directory must be private to one VShard.
+seastar::future<> cleanupSnapshotDirectory(const std::filesystem::path& directory,
+                                           const SnapshotFilePtr& retained = {});
 
 }  // namespace timestar::raft

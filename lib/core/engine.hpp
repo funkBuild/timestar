@@ -21,6 +21,7 @@
 #include "wal_file_manager.hpp"
 
 #include <functional>
+#include <filesystem>
 #include <map>
 #include <memory>
 #include <seastar/core/coroutine.hh>
@@ -31,12 +32,61 @@
 #include <seastar/core/semaphore.hh>
 #include <seastar/core/sharded.hh>
 #include <seastar/core/timer.hh>
+#include <utility>
 #include <vector>
 
 struct EngineVShardSnapshot {
     timestar::VShardSnapshotManifest manifest;
     std::vector<std::pair<std::string, std::string>> files;
     std::string catalog;
+};
+
+struct EngineSnapshotFile {
+    std::string name;
+    std::filesystem::path path;
+    uint64_t size = 0;
+    bool removeOnDestroy = true;
+
+    EngineSnapshotFile() = default;
+    EngineSnapshotFile(std::string n, std::filesystem::path p, uint64_t s)
+        : name(std::move(n)), path(std::move(p)), size(s) {}
+    EngineSnapshotFile(const EngineSnapshotFile&) = delete;
+    EngineSnapshotFile& operator=(const EngineSnapshotFile&) = delete;
+    EngineSnapshotFile(EngineSnapshotFile&& other) noexcept
+        : name(std::move(other.name)), path(std::move(other.path)), size(other.size),
+          removeOnDestroy(std::exchange(other.removeOnDestroy, false)) {}
+    EngineSnapshotFile& operator=(EngineSnapshotFile&& other) noexcept {
+        if (this != &other) {
+            if (removeOnDestroy && !path.empty()) {
+                std::error_code ec;
+                std::filesystem::remove(path, ec);
+            }
+            name = std::move(other.name);
+            path = std::move(other.path);
+            size = other.size;
+            removeOnDestroy = std::exchange(other.removeOnDestroy, false);
+        }
+        return *this;
+    }
+    ~EngineSnapshotFile() {
+        if (removeOnDestroy && !path.empty()) {
+            std::error_code ec;
+            std::filesystem::remove(path, ec);
+        }
+    }
+    void release() noexcept { removeOnDestroy = false; }
+};
+
+struct EngineVShardSnapshotOnDisk {
+    timestar::VShardSnapshotManifest manifest;
+    std::vector<EngineSnapshotFile> files;
+    std::string catalog;
+};
+
+struct EngineSnapshotInstallFile {
+    std::string wireName;
+    std::string bytes;
+    std::filesystem::path sourcePath;
 };
 
 // Durable boundaries in the live VShard snapshot replacement transaction.
@@ -211,7 +261,7 @@ private:
         std::vector<std::pair<std::string, std::string>> files);
     seastar::future<bool> installVShardSnapshotBundleOwned(
         std::shared_ptr<const timestar::VShardSnapshotManifest> manifest,
-        std::vector<std::pair<std::string, std::string>> files, std::string catalog,
+        std::vector<EngineSnapshotInstallFile> files, std::string catalog,
         SnapshotInstallPurpose purpose = SnapshotInstallPurpose::Snapshot);
     enum class SnapshotInstallDisposition { Fresh, Idempotent, Reject };
     seastar::future<SnapshotInstallDisposition> classifySnapshotInstall(
@@ -247,6 +297,10 @@ public:
     // the manifest. Precondition: memory for this VShard has been flushed and
     // the caller runs on assignCore(vshard) under a cohesive core count.
     seastar::future<EngineVShardSnapshot> buildVShardSnapshotFiles(timestar::VShardId vshard);
+    // Production form: the VShard-pure TSM remains a temporary immutable file
+    // and is never read into one reactor-sized string. The returned object's
+    // RAII cleanup removes it after the outer snapshot encoder consumes it.
+    seastar::future<EngineVShardSnapshotOnDisk> buildVShardSnapshotFilesOnDisk(timestar::VShardId vshard);
 
     // Install a received VShard snapshot (the consumer side of the above): write each
     // (name, bytes) to a temp file in this shard's tsm dir, then verify-then-install
@@ -261,6 +315,9 @@ public:
     seastar::future<bool> installVShardSnapshotBundle(timestar::VShardSnapshotManifest manifest,
                                                       std::vector<std::pair<std::string, std::string>> files,
                                                       std::string catalog);
+    seastar::future<bool> installVShardSnapshotBundleFromFiles(
+        timestar::VShardSnapshotManifest manifest,
+        std::vector<std::pair<std::string, std::filesystem::path>> files, std::string catalog);
 
     // Durably discard one retired replica's complete storage generation. This
     // is the empty-generation form of snapshot replacement: it quiesces the

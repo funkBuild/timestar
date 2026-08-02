@@ -359,6 +359,31 @@ seastar::future<bool> fileMatchesBytes(std::string path, const std::string& expe
     });
 }
 
+void copyFileCooperatively(const std::filesystem::path& source, const std::filesystem::path& target) {
+    std::ifstream in(source, std::ios::binary);
+    if (!in)
+        throw std::runtime_error("cannot open snapshot source " + source.string());
+    std::ofstream out(target, std::ios::binary | std::ios::trunc);
+    if (!out)
+        throw std::runtime_error("cannot create snapshot copy " + target.string());
+    std::vector<char> buffer(size_t{1} << 20);
+    while (in) {
+        in.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+        const auto count = in.gcount();
+        if (count > 0)
+            out.write(buffer.data(), count);
+        if (!out)
+            throw std::runtime_error("cannot write snapshot copy " + target.string());
+        if (count > 0)
+            seastar::thread::yield();
+    }
+    if (in.bad())
+        throw std::runtime_error("cannot read snapshot source " + source.string());
+    out.flush();
+    if (!out)
+        throw std::runtime_error("cannot flush snapshot copy " + target.string());
+}
+
 template <typename T>
 seastar::future<std::vector<uint64_t>> snapshotSeriesTimestamps(const SeriesId128& id,
                                                                 const std::vector<seastar::shared_ptr<::TSM>>& files) {
@@ -447,6 +472,17 @@ seastar::future<bool> Engine::restoreVShardSnapshot(const timestar::VShardSnapsh
 }
 
 seastar::future<EngineVShardSnapshot> Engine::buildVShardSnapshotFiles(timestar::VShardId vshard) {
+    auto disk = co_await buildVShardSnapshotFilesOnDisk(vshard);
+    std::vector<std::pair<std::string, std::string>> files;
+    files.reserve(disk.files.size());
+    for (const auto& file : disk.files) {
+        seastar::sstring raw = co_await seastar::util::read_entire_file_contiguous(file.path);
+        files.emplace_back(file.name, std::string(raw.data(), raw.size()));
+    }
+    co_return EngineVShardSnapshot{std::move(disk.manifest), std::move(files), std::move(disk.catalog)};
+}
+
+seastar::future<EngineVShardSnapshotOnDisk> Engine::buildVShardSnapshotFilesOnDisk(timestar::VShardId vshard) {
     if (!vshard.valid())
         throw std::invalid_argument("buildVShardSnapshotFiles: invalid VShard");
 
@@ -476,7 +512,7 @@ seastar::future<EngineVShardSnapshot> Engine::buildVShardSnapshotFiles(timestar:
         std::string catalogBytes = catalog.snapshot();
         const std::string catalogHash = timestar::SeriesCatalog::snapshotHash(catalogBytes);
         timestar::VShardSnapshotBuilder empty(vshard);
-        co_return EngineVShardSnapshot{empty.build({}, catalogHash), {}, std::move(catalogBytes)};
+        co_return EngineVShardSnapshotOnDisk{empty.build({}, catalogHash), {}, std::move(catalogBytes)};
     }
 
     const uint64_t sequence = tsmFileManager.allocateSequenceId();
@@ -488,7 +524,8 @@ seastar::future<EngineVShardSnapshot> Engine::buildVShardSnapshotFiles(timestar:
     seastar::shared_ptr<::TSM> materialized;
     std::exception_ptr error;
     timestar::VShardSnapshotManifest manifest;
-    std::string bytes;
+    uint64_t fileBytes = 0;
+    bool haveSnapshotFile = false;
     std::string catalogBytes;
     try {
         const size_t seriesWritten = co_await timestar::compactVShardToFile(vshard, inputs, path);
@@ -547,8 +584,8 @@ seastar::future<EngineVShardSnapshot> Engine::buildVShardSnapshotFiles(timestar:
         }
 
         if (seriesWritten != 0) {
-            seastar::sstring raw = co_await seastar::util::read_entire_file_contiguous(path);
-            bytes.assign(raw.data(), raw.size());
+            fileBytes = co_await seastar::async([path] { return std::filesystem::file_size(path); });
+            haveSnapshotFile = true;
         }
     } catch (...) {
         error = std::current_exception();
@@ -561,17 +598,18 @@ seastar::future<EngineVShardSnapshot> Engine::buildVShardSnapshotFiles(timestar:
                 error = std::current_exception();
         }
     }
-    co_await seastar::async([path] {
-        std::error_code ec;
-        std::filesystem::remove(path, ec);
-    });
+    if (error || !haveSnapshotFile)
+        co_await seastar::async([path] {
+            std::error_code ec;
+            std::filesystem::remove(path, ec);
+        });
     if (error)
         std::rethrow_exception(error);
 
-    std::vector<std::pair<std::string, std::string>> files;
-    if (!bytes.empty())
-        files.emplace_back(name, std::move(bytes));
-    co_return EngineVShardSnapshot{std::move(manifest), std::move(files), std::move(catalogBytes)};
+    std::vector<EngineSnapshotFile> files;
+    if (haveSnapshotFile)
+        files.emplace_back(name, path, fileBytes);
+    co_return EngineVShardSnapshotOnDisk{std::move(manifest), std::move(files), std::move(catalogBytes)};
 }
 
 seastar::future<Engine::SnapshotInstallDisposition> Engine::classifySnapshotInstall(
@@ -735,7 +773,22 @@ seastar::future<bool> Engine::installVShardSnapshotBundle(timestar::VShardSnapsh
                                                           std::vector<std::pair<std::string, std::string>> files,
                                                           std::string catalog) {
     auto owned = std::make_shared<const timestar::VShardSnapshotManifest>(std::move(manifest));
-    return installVShardSnapshotBundleOwned(std::move(owned), std::move(files), std::move(catalog));
+    std::vector<EngineSnapshotInstallFile> sources;
+    sources.reserve(files.size());
+    for (auto& [name, bytes] : files)
+        sources.push_back(EngineSnapshotInstallFile{std::move(name), std::move(bytes), {}});
+    return installVShardSnapshotBundleOwned(std::move(owned), std::move(sources), std::move(catalog));
+}
+
+seastar::future<bool> Engine::installVShardSnapshotBundleFromFiles(
+    timestar::VShardSnapshotManifest manifest,
+    std::vector<std::pair<std::string, std::filesystem::path>> files, std::string catalog) {
+    auto owned = std::make_shared<const timestar::VShardSnapshotManifest>(std::move(manifest));
+    std::vector<EngineSnapshotInstallFile> sources;
+    sources.reserve(files.size());
+    for (auto& [name, path] : files)
+        sources.push_back(EngineSnapshotInstallFile{std::move(name), {}, std::move(path)});
+    return installVShardSnapshotBundleOwned(std::move(owned), std::move(sources), std::move(catalog));
 }
 
 seastar::future<> Engine::retireVShardData(timestar::VShardId vshard) {
@@ -754,7 +807,7 @@ seastar::future<> Engine::retireVShardData(timestar::VShardId vshard) {
 
 seastar::future<bool> Engine::installVShardSnapshotBundleOwned(
     std::shared_ptr<const timestar::VShardSnapshotManifest> manifestOwner,
-    std::vector<std::pair<std::string, std::string>> files, std::string catalogBytes, SnapshotInstallPurpose purpose) {
+    std::vector<EngineSnapshotInstallFile> files, std::string catalogBytes, SnapshotInstallPurpose purpose) {
     auto installUnits = co_await seastar::get_units(_snapshotInstallSemaphore, 1);
     const auto& manifest = *manifestOwner;
 
@@ -777,11 +830,12 @@ seastar::future<bool> Engine::installVShardSnapshotBundleOwned(
         // are wire metadata only; live names are receiver-allocated below.
         std::set<std::string> wireNames;
         if (!rejected) {
-            for (const auto& [wireName, bytes] : files) {
-                (void)bytes;
+            for (const auto& source : files) {
+                const auto& wireName = source.wireName;
                 const fs::path wirePath(wireName);
                 if (wireName.empty() || wirePath.has_parent_path() || wirePath.filename() != wirePath ||
-                    wirePath.extension() != ".tsm" || !wireNames.insert(wireName).second) {
+                    wirePath.extension() != ".tsm" || !wireNames.insert(wireName).second ||
+                    (!source.sourcePath.empty() && !source.bytes.empty())) {
                     rejected = true;
                     break;
                 }
@@ -795,19 +849,22 @@ seastar::future<bool> Engine::installVShardSnapshotBundleOwned(
                         "-" + std::to_string(stageNonce));
             co_await seastar::async([stageDir] { fs::create_directories(stageDir); });
 
-            for (auto& [wireName, bytes] : files) {
-                (void)wireName;
+            for (auto& source : files) {
                 // TSM parses rank from its basename, including for staged
                 // files, so give the stage a locally valid identity. A fresh
                 // live identity is allocated only after orphan reconciliation.
                 const uint64_t stageSeq = tsmFileManager.allocateSequenceId();
                 const auto stagedPath = stageDir / layout_.compactedTsmFile(shardId, 9, stageSeq, stageSeq).filename();
-                co_await seastar::async([stagedPath, &bytes] {
+                co_await seastar::async([stagedPath, &source] {
+                    if (!source.sourcePath.empty()) {
+                        copyFileCooperatively(source.sourcePath, stagedPath);
+                        return;
+                    }
                     std::ofstream out(stagedPath, std::ios::binary | std::ios::trunc);
                     if (!out)
                         throw std::runtime_error("installVShardSnapshotBundle: cannot open stage " +
                                                  stagedPath.string());
-                    out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+                    out.write(source.bytes.data(), static_cast<std::streamsize>(source.bytes.size()));
                     out.flush();
                     if (!out)
                         throw std::runtime_error("installVShardSnapshotBundle: write failed for " +
@@ -898,7 +955,40 @@ seastar::future<bool> Engine::installVShardSnapshotBundleOwned(
                         continue;
                     std::set<SeriesId128> fileIds;
                     file->forEachSeriesId([&](const SeriesId128& id) { fileIds.insert(id); });
-                    if (fileIds != catalogIds || !co_await fileMatchesBytes(file->getFilePath(), files.front().second))
+                    const auto& source = files.front();
+                    bool exact = false;
+                    if (source.sourcePath.empty()) {
+                        exact = co_await fileMatchesBytes(file->getFilePath(), source.bytes);
+                    } else {
+                        exact = co_await seastar::async([resident = file->getFilePath(), incoming = source.sourcePath] {
+                            std::error_code ec;
+                            const auto residentSize = std::filesystem::file_size(resident, ec);
+                            if (ec)
+                                return false;
+                            ec.clear();
+                            const auto incomingSize = std::filesystem::file_size(incoming, ec);
+                            if (ec || residentSize != incomingSize)
+                                return false;
+                            std::ifstream a(resident, std::ios::binary);
+                            std::ifstream b(incoming, std::ios::binary);
+                            if (!a || !b)
+                                return false;
+                            // Seastar cooperative-thread stacks are deliberately
+                            // small; keep bounded comparison buffers on the heap.
+                            std::vector<char> ab(size_t{1} << 20);
+                            std::vector<char> bb(size_t{1} << 20);
+                            while (a && b) {
+                                a.read(ab.data(), static_cast<std::streamsize>(ab.size()));
+                                b.read(bb.data(), static_cast<std::streamsize>(bb.size()));
+                                if (a.gcount() != b.gcount() ||
+                                    std::memcmp(ab.data(), bb.data(), static_cast<size_t>(a.gcount())) != 0)
+                                    return false;
+                                seastar::thread::yield();
+                            }
+                            return !a.bad() && !b.bad();
+                        });
+                    }
+                    if (fileIds != catalogIds || !exact)
                         continue;
                     if (!incoming || file->dataRank() > incoming->dataRank())
                         incoming = file;

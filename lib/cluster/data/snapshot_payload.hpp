@@ -4,7 +4,10 @@
 #include "../../storage/vshard_snapshot_manifest.hpp"
 
 #include <optional>
+#include <filesystem>
+#include <seastar/core/future.hh>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace timestar::data {
@@ -16,6 +19,26 @@ using timestar::VShardSnapshotManifest;
 struct SnapshotFile {
     std::string name;
     std::string bytes;
+};
+
+// Disk-backed form used by the production snapshot path. Ownership is
+// explicit: temporary producer/extraction objects are removed unless moved to
+// another owner or released after a durable promotion.
+struct SnapshotFilePath {
+    std::string name;
+    std::filesystem::path path;
+    uint64_t size = 0;
+    bool removeOnDestroy = true;
+
+    SnapshotFilePath() = default;
+    SnapshotFilePath(std::string n, std::filesystem::path p, uint64_t s)
+        : name(std::move(n)), path(std::move(p)), size(s) {}
+    SnapshotFilePath(const SnapshotFilePath&) = delete;
+    SnapshotFilePath& operator=(const SnapshotFilePath&) = delete;
+    SnapshotFilePath(SnapshotFilePath&& other) noexcept;
+    SnapshotFilePath& operator=(SnapshotFilePath&& other) noexcept;
+    ~SnapshotFilePath();
+    void release() noexcept { removeOnDestroy = false; }
 };
 
 // A replicated delete operation already applied at `appliedIndex`. These are
@@ -58,14 +81,11 @@ struct DataStateMachineSnapshotState {
     std::optional<RetentionCutoffSnapshotState> retentionCutoff;
 };
 
-// The monolithic Raft InstallSnapshot payload for a VShard (integration plan M3): the
-// VShardSnapshotManifest, deterministic series catalog, and every data file it
-// references, self-contained so a
-// lagging replica (or a joining node) can install the whole VShard state without the
-// leader's live files. This is the "manifest + object stream" M3 wires as ONE payload;
-// on-the-wire chunking is M5. EngineDataStateMachine::snapshot() builds it (from
-// Engine::buildVShardSnapshotFiles) and applySnapshot() installs it (write files
-// to temp -> Engine::restoreVShardSnapshot -> rebuild NativeIndex).
+// The exact-v1 logical snapshot payload for one VShard: manifest, catalog,
+// state-machine fences and exactly one data object per manifest extent. The
+// inline representation remains for Group-0-sized and codec tests; the
+// production VShard path uses SnapshotPayloadFile and never materializes the
+// data objects in one string.
 struct SnapshotPayload {
     VShardSnapshotManifest manifest;
     // Deterministic SeriesCatalog::snapshot() bytes, authenticated by catalogHash.
@@ -78,34 +98,58 @@ struct SnapshotPayload {
     std::vector<SnapshotFile> files;  // one per manifest.dataExtents entry, same order
 };
 
+struct SnapshotPayloadFile {
+    VShardSnapshotManifest manifest;
+    std::string catalog;
+    uint64_t deleteReceiptsRetiredBeforeMs = 0;
+    uint64_t deleteReceiptsRetiredAtIndex = 0;
+    std::vector<DeleteOperationReceipt> deleteReceipts;
+    std::optional<RetentionCutoffSnapshotState> retentionCutoff;
+    std::vector<SnapshotFilePath> files;
+};
+
+struct EncodedSnapshotFile {
+    std::filesystem::path path;
+    uint64_t size = 0;
+    uint64_t hash = 0;  // FNV-1a over the complete TSP1 file, including trailer
+    bool removeOnDestroy = true;
+
+    EncodedSnapshotFile() = default;
+    EncodedSnapshotFile(const EncodedSnapshotFile&) = delete;
+    EncodedSnapshotFile& operator=(const EncodedSnapshotFile&) = delete;
+    EncodedSnapshotFile(EncodedSnapshotFile&& other) noexcept;
+    EncodedSnapshotFile& operator=(EncodedSnapshotFile&& other) noexcept;
+    ~EncodedSnapshotFile();
+    void release() noexcept { removeOnDestroy = false; }
+};
+
 // Explicitly-versioned v1, FNV-trailer-checksummed, bounds-checked codec.
-// its encode()); decode returns nullopt on ANY malformed/truncated/checksum-mismatch,
-// so a corrupt snapshot can never be installed as valid state.
+// Decode returns nullopt on any malformed, truncated, or checksum-mismatched
+// frame, so a corrupt snapshot can never be installed as valid state.
 std::string encodeSnapshotPayload(const SnapshotPayload& payload);
 std::optional<SnapshotPayload> decodeSnapshotPayload(const std::string& bytes);
 
-// Recovery of a locally-produced snapshot must restore state-machine receipt
-// state without decoding/copying its potentially 128 MiB data objects. Both
-// helpers verify the outer checksum and complete framing.
+// Helpers for inline exact-v1 payloads. Recovery can restore
+// state-machine metadata without decoding/copying data objects; each helper
+// verifies the outer checksum and complete framing.
 std::optional<std::vector<DeleteOperationReceipt>> decodeSnapshotDeleteReceipts(const std::string& bytes);
 std::optional<DeleteReceiptSnapshotState> decodeSnapshotDeleteReceiptState(const std::string& bytes);
 std::optional<DataStateMachineSnapshotState> decodeSnapshotStateMachineState(const std::string& bytes);
 
-// CONSUMING overload (debt D-32). Byte-for-byte identical output; the difference is
-// what is resident while it runs.
-//
-// The const& overload copies every file into the output, so the producer holds the whole
-// payload TWICE at its peak -- and it grows the output geometrically from empty, so the
-// realloc that crosses the last power of two briefly holds a third partial copy. It is
-// the biggest single term in the memory multiple that `kMaxVShardSnapshotBytes` exists to
-// bound, and it is pure waste on the one caller that matters: `snapshotVShard` builds a
-// payload, encodes it, and never looks at it again.
-//
-// This overload reserves the exact size up front (no growth spikes) and RELEASES each
-// file's bytes as it appends them, so peak residency is the output plus one file rather
-// than the output plus the whole input. `payload` is left valid but unspecified -- its
-// catalog and file bodies are gone. The const& overload stays for the callers that keep
-// their payload (tests, and anything that encodes to compare).
+// Consuming overload: byte-identical to the const-reference
+// encoder, with one exact reservation and released input object bodies.
 std::string encodeSnapshotPayload(SnapshotPayload&& payload);
+
+// Byte-for-byte TSP1 v1 encoding/decoding without materialising any data object
+// in memory. Only catalog/receipt metadata remains resident; each object is
+// copied through a fixed 1-MiB buffer. The encoder consumes and cleans its
+// temporary source objects. The decoder writes verified objects below
+// `extractionDirectory`; its result owns those files.
+seastar::future<EncodedSnapshotFile> encodeSnapshotPayloadFile(SnapshotPayloadFile payload,
+                                                               std::filesystem::path outputPath);
+seastar::future<std::optional<SnapshotPayloadFile>> decodeSnapshotPayloadFile(
+    const std::filesystem::path& encodedPath, const std::filesystem::path& extractionDirectory);
+seastar::future<std::optional<DataStateMachineSnapshotState>> decodeSnapshotStateMachineStateFile(
+    const std::filesystem::path& encodedPath);
 
 }  // namespace timestar::data

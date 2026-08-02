@@ -1,8 +1,8 @@
 # Cluster integration plan
 
 **Status:** the RF=3 data path, persistent Group 0, production topology changes,
-replicated TTL retention, and pattern-delete failover/restart are integrated.
-Streaming large snapshots and final release gates remain incomplete.
+replicated TTL retention, pattern-delete failover/restart, and file-backed
+exact-v1 VShard snapshots are integrated. Final release gates remain incomplete.
 
 The authoritative deploy blockers are in
 [cluster-production-readiness.md](cluster-production-readiness.md).
@@ -82,21 +82,26 @@ core, boot identity, and segment number. Discovery treats the journal directory
 as an exclusive namespace and fails closed on ambiguous artifacts.
 
 Raft envelopes use `TSR1`. Snapshot journal records use `TSRSNAP1`. Snapshot
-transfer uses paced 4 MiB chunks with bounded staged memory. Complete VShard
-snapshot construction is still capped at 128 MiB and must become streaming
-before production approval.
+transfer uses paced 4 MiB chunks hydrated from and staged into owned disk
+sidecars. Inline snapshots retain a 128 MiB ceiling for Group 0
+and deterministic tests; production VShard snapshots have a finite 1 TiB disk
+admission ceiling and do not pass through that reactor-memory allowance.
 
 ### Snapshots and Engine replacement
 
 The v1 `SnapshotPayload` is self-contained: immutable data objects, series
 catalog, VShard identity, data/log fence, and delete-receipt state. Creation
-materializes VShard-pure data and detects concurrent tombstone mutation.
+materializes VShard-pure data and detects concurrent tombstone mutation. The
+production codec updates exact `TSP1` v1 in place: data objects stream through
+1-MiB heap buffers with cooperative yields while the 16-MiB manifest,
+64-MiB catalog, and bounded receipt state remain resident.
 
-Installation validates the complete payload before mutation, quiesces target
-WAL conversion, replaces the VShard generation under an Engine-wide install
-serialization point, reconstructs catalog/index state, and advances the Raft
-applied boundary only after publication completes. Restart checkpoints make the
-replacement retryable.
+Installation validates the complete payload and its Raft/manifest boundary
+before mutation, extracts each object from the sidecar without materializing the
+complete snapshot, quiesces target WAL conversion, replaces the VShard
+generation under an Engine-wide install serialization point, reconstructs
+catalog/index state, and advances the Raft applied boundary only after
+publication completes. Restart checkpoints make the replacement retryable.
 
 ### Reads
 
@@ -131,10 +136,10 @@ recovery. Status reports retained plan, target, and encoded-byte totals.
 
 The production driver, runtime publication, and local Raft retirement seam are
 wired: dynamic peer/group creation, live directory cutover, applied-membership
-fencing, terminal reclaim-floor publication, and exact-v1 journal
-quarantine/grace/deletion run in process. Safe reclamation of retired logical
-data from shared Engine WAL/TSM/index files and the multi-process end-to-end
-proof remain open. Static peer-list editing is not a substitute.
+fencing, terminal reclaim-floor publication, exact-v1 journal
+quarantine/grace/deletion, and logical Engine WAL/TSM/index retirement run in
+process and are covered by the bounded topology gate. Final multi-host proof
+remains open. Static peer-list editing is not a substitute.
 
 ### Storage durability
 
@@ -164,6 +169,8 @@ changes. See [protocol-versioning.md](protocol-versioning.md).
 - [x] Leader-hint write routing and bounded retry tests.
 - [x] ReadIndex, alternate-replica routing, and apply-fence tests.
 - [x] Snapshot build/install and restart-boundary fault tests.
+- [x] Exact-v1 file-backed snapshot encode/decode, latest-sidecar recovery,
+  orphan cleanup, Raft pacing, and 128 MiB + 1 byte streaming gate.
 - [x] Journal, WAL, TSM, tombstone, manifest, SSTable, and namespace negative
   recovery tests.
 - [x] Group-0 persistence, frozen-plan bounds, observer admission, and current
@@ -191,9 +198,10 @@ changes. See [protocol-versioning.md](protocol-versioning.md).
 - **Done:** publish the terminal Raft-journal reclaim floor and quarantine the
   local replica only after durable ownership transfer and applied membership
   removal.
-- Reclaim the retired VShard's logical Engine data without deleting shared-file
-  extents belonging to live VShards.
-- Prove no acknowledged loss or duplicate VShard contribution during movement.
+- **Done:** reclaim the retired VShard's logical Engine data without deleting
+  shared-file extents belonging to live VShards.
+- **Done:** prove no acknowledged loss or duplicate VShard contribution during
+  movement.
 
 ### 2. Replicate retention
 
@@ -208,11 +216,13 @@ changes. See [protocol-versioning.md](protocol-versioning.md).
 
 ### 3. Stream large snapshots
 
-- Replace the monolithic encoded snapshot string with bounded object streaming.
-- Keep verification, catalog, receipt, and data/log fences end to end.
-- Resume or safely restart interrupted transfer without retaining two full
+- [x] Replace the monolithic encoded snapshot string with bounded object
+  streaming while retaining exact `TSP1` v1.
+- [x] Keep verification, catalog, receipt, and data/log fences end to end.
+- [x] Resume or safely restart interrupted transfer without retaining two full
   payloads in memory.
-- Prove catch-up for a VShard larger than the current 128 MiB cap.
+- [x] Prove leader hydration and receiver staging for 128 MiB + 1 byte under a
+  1-GiB process budget.
 
 ### 4. Close API failover gates
 

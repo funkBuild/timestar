@@ -81,8 +81,8 @@ struct AppendEntriesReply {
 // compacted prefix. `data` is opaque to Raft (a VShard snapshot payload here).
 //
 // CHUNKED (debt D-5). `data` is a SLICE of the payload at byte `offset` of `totalBytes`,
-// and `done` marks the last one. The receiver accumulates slices into a staging buffer
-// and installs only on `done`, so no single message has to carry a whole VShard snapshot
+// and `done` marks the last one. The receiver stages slices and installs only on
+// `done`, so no single message has to carry a whole VShard snapshot
 // -- which is what let the size chain in raft_types.hpp come down by 3x.
 //
 // The defaults describe a one-message transfer; larger payloads set the progress fields.
@@ -93,6 +93,18 @@ struct InstallSnapshot {
     Term lastIncludedTerm = kNoTerm;
     Config config;  // membership as of the snapshot boundary (rides EVERY chunk)
     std::string data;
+    // Internal driver-only backing. It is never encoded on the wire: the async
+    // RaftGroup driver reads just this message's bounded slice into `data`
+    // immediately before transport send. On receive, the persistence driver
+    // stages `data` to disk and supplies `completedFile` only with the final
+    // chunk. Keeping this metadata beside the ordinary v1 fields lets the
+    // deterministic Raft core preserve all ordering/retry rules without doing
+    // blocking file I/O.
+    SnapshotFilePtr sourceFile;
+    size_t sourceLength = 0;
+    SnapshotFilePtr completedFile;
+    uint64_t stagedBytes = 0;
+    bool externallyStaged = false;
     uint64_t offset = 0;      // byte offset of `data` within the whole payload
     uint64_t totalBytes = 0;  // whole payload size (0 is normalized to data.size() on wire)
     bool done = true;         // `data` ends the payload

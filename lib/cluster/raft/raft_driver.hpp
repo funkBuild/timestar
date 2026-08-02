@@ -30,6 +30,15 @@ public:
     // produced one. The two are byte-identical in shape, so the flag is the only thing that
     // can tell them apart.
     virtual seastar::future<> persistSnapshot(Snapshot snap, bool receivedFromPeer) = 0;
+    // Production persistence overrides these two hooks to keep snapshot bytes
+    // on disk. The deterministic/in-memory implementations need no staging and
+    // retain the original string path used by core tests.
+    virtual seastar::future<> hydrateSnapshotChunk(InstallSnapshot& chunk) {
+        if (chunk.sourceFile)
+            throw std::runtime_error("RaftPersistence cannot hydrate a file-backed snapshot chunk");
+        return seastar::make_ready_future<>();
+    }
+    virtual seastar::future<> stageSnapshotChunk(InstallSnapshot&) { return seastar::make_ready_future<>(); }
     // Make everything appended since the last sync() durable (fsync).
     virtual seastar::future<> sync() = 0;
 };

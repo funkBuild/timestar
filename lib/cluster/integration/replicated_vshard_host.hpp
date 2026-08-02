@@ -210,7 +210,7 @@ public:
     // highest point revision without crossing unflushed data. Returns the Raft index
     // compacted to (0 if the VShard is not hosted here or no safe boundary advances).
     // Any replica may compact its own log (not leader-only).
-    // Requires a VShard-cohesive core count (buildVShardSnapshot throws otherwise).
+    // Requires a VShard-cohesive core count (buildVShardSnapshotFile throws otherwise).
     seastar::future<uint64_t> snapshotVShard(uint16_t vshard);
 
     // ProposeSink (debt D-14): un-hibernate the groups on THIS shard that still believe
@@ -296,9 +296,9 @@ public:
     // segment on the reactor, so one-per-pass takes 85 minutes even on the supported
     // four-core topology (and 5.7 hours at one core). Derive a SEQUENTIAL per-pass batch
     // that targets one fair scan every 15 minutes. The snapshots are never concurrent --
-    // maybeSnapshotOnce awaits each before starting the next -- so this does not multiply
-    // the 128 MiB per-snapshot memory ceiling. A slow disk naturally stretches the cycle
-    // because the one sweep remains in flight and later timer callbacks skip it.
+    // maybeSnapshotOnce awaits each before starting the next, bounding concurrent
+    // snapshot disk/CPU work. A slow disk naturally stretches the cycle because the
+    // one sweep remains in flight and later timer callbacks skip it.
     static constexpr size_t kPrivateJournalSnapshotsPerSweep = 1;
     static constexpr std::chrono::minutes kSharedJournalSnapshotTargetCycle{15};
     static constexpr size_t sharedJournalSnapshotsPerSweep(size_t hostedVShards) {

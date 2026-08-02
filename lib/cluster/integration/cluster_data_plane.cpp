@@ -311,12 +311,12 @@ seastar::future<> ClusterDataPlane::startImpl(const ClusterConfig& cfg, seastar:
         // send bound, because the transport measures the encoded envelope while
         // `maxMessageBytes` is compared against the payload alone.
         ropts.maxMessageBytes = raft::kMaxRaftPayloadBytes;
-        // CHUNKED INstallSnapshot (debt D-5). The chunk size is what the whole size chain
-        // above is now sized against; the total bound is a MEMORY bound (the payload is
-        // materialized in RAM on the producer, held by the leader, and staged in RAM by the
-        // receiver) and it is also the threshold `snapshotVShard` refuses to compact over.
+        // CHUNKED InstallSnapshot (debt D-5). Inline snapshots retain the bounded
+        // memory ceiling for Group 0 and tests. Production VShard snapshots use
+        // disk-backed staging and the separate file bound below.
         ropts.maxSnapshotChunkBytes = raft::kMaxSnapshotChunkBytes;
         ropts.maxSnapshotBytes = raft::kMaxVShardSnapshotBytes;
+        ropts.maxFileSnapshotBytes = raft::kMaxVShardSnapshotFileBytes;
         // Two heartbeat intervals (25 ticks each at the 20 ms tick) with no reply before an
         // in-flight chunk is resent -- the transport is fire-and-forget, so this timer is
         // the only thing that notices a dropped chunk.

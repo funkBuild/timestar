@@ -7,6 +7,7 @@
 
 #include <cerrno>
 #include <filesystem>
+#include <fstream>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/thread.hh>
 #include <set>
@@ -38,6 +39,31 @@ void fsyncPath(const std::string& path, int flags) {
         throw std::system_error(errno, std::generic_category(), "close after fsync: " + path);
 }
 
+void copyFileCooperatively(const std::string& source, const std::string& target) {
+    std::ifstream in(source, std::ios::binary);
+    if (!in)
+        throw std::runtime_error("cannot open snapshot source: " + source);
+    std::ofstream out(target, std::ios::binary | std::ios::trunc);
+    if (!out)
+        throw std::runtime_error("cannot create snapshot target: " + target);
+    std::vector<char> buffer(size_t{1} << 20);
+    while (in) {
+        in.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+        const auto count = in.gcount();
+        if (count > 0)
+            out.write(buffer.data(), count);
+        if (!out)
+            throw std::runtime_error("cannot write snapshot target: " + target);
+        if (count > 0)
+            seastar::thread::yield();
+    }
+    if (in.bad())
+        throw std::runtime_error("cannot read snapshot source: " + source);
+    out.flush();
+    if (!out)
+        throw std::runtime_error("cannot flush snapshot target: " + target);
+}
+
 }  // namespace
 
 seastar::future<bool> restoreVShardSnapshot(const VShardSnapshotManifest& manifest,
@@ -67,7 +93,9 @@ seastar::future<bool> restoreVShardSnapshot(const VShardSnapshotManifest& manife
     // Install all-or-nothing: copy EVERY file to a unique temp (fsync'd) FIRST;
     // only once all copies succeed do we rename them into place. A copy failure
     // (e.g. disk full) removes the temps and installs nothing, honouring the
-    // "installs NOTHING on failure" contract. Blocking fs runs off the reactor.
+    // "installs NOTHING on failure" contract. The cooperative thread yields
+    // after every bounded copy buffer so a large restore cannot monopolize the
+    // reactor.
     co_await seastar::async([&sources, &targetPaths] {
         const std::string tag = "." + std::to_string(::getpid()) + ".restore-tmp";
         std::vector<std::string> temps(sources.size());
@@ -78,7 +106,7 @@ seastar::future<bool> restoreVShardSnapshot(const VShardSnapshotManifest& manife
                 if (target.has_parent_path())
                     fs::create_directories(target.parent_path());
                 temps[i] = targetPaths[i] + tag + std::to_string(i);
-                fs::copy_file(sources[i], temps[i], fs::copy_options::overwrite_existing);
+                copyFileCooperatively(sources[i], temps[i]);
                 fsyncPath(temps[i], O_RDONLY);  // temp data durable before publish
             }
             // Phase 2: publish by rename (metadata-only), then fsync parent dirs.

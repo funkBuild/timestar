@@ -20,6 +20,7 @@ not probes, so they can be run from CI or a release checklist.
 | `topology_mutation_gate.sh` | the authenticated production Group-0 routes move one non-vacuous VShard away and back twice under sustained unique writes, recover crashes after Engine-generation deletion and journal quarantine, reclaim an expired exact-v1 journal, rematerialize deleted storage from survivors, and reject unauthenticated drain or premature removal without losing or duplicating a contribution |
 | `retention_failover_gate.sh` | exact-version clustered retention policy CRUD and tombstone recreation, a controller kill after durable partial fan-out, completion of one global cutoff sequence across all 4,096 VShards by a new Group-0 leader, measurement isolation, and old-controller restart recovery |
 | `pattern_delete_failover_gate.sh` | an ambiguous coordinator crash only after another Group-0 voter applies a complete 6,000-target frozen plan, exact retry under a new leader without capturing a newly matching series, changed-body conflict, and killed-node restart recovery |
+| `large_snapshot_streaming_gate.sh` | an exact-v1 snapshot of 128 MiB + 1 byte crosses leader hydration, v1 Raft framing and receiver disk staging in chunks no larger than 4 MiB, with a 1 GiB process limit and all temporary data under `build/tmp` |
 
 All of them take an optional server binary as `$1` (default
 `build/bin/timestar_http_server`), so a "before" binary can be measured the same way.

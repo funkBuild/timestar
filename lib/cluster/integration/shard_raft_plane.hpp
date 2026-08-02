@@ -779,7 +779,7 @@ public:
     // rather than ordinary appends, and cannot tell the two apart without a counter.
     struct SnapshotCounts {
         uint64_t taken = 0;             // snapshots produced + logs compacted here
-        uint64_t refusedTooLarge = 0;   // over kMaxVShardSnapshotBytes: log kept
+        uint64_t refusedTooLarge = 0;   // over kMaxVShardSnapshotFileBytes: log kept
         uint64_t skippedUnflushed = 0;  // eligible, but the VShard has no FLUSHED data yet
         uint64_t skippedPendingConversion = 0;
         uint64_t skippedDeleteState = 0;
