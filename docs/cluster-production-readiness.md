@@ -1663,6 +1663,21 @@ is not completion.
   quorum-loss/heal sequence. This row remains unchecked until a memory-bounded
   live partition run records RSS and journal plateau; no server process was
   started in this pass because the preceding unbounded run exhausted the host.
+- [x] **CR-FIX-081 — bound receiver-side data proposal waits.** Owner:
+  data plane/consensus. The forwarding RPC's deadline cannot cancel a handler
+  coroutine after the client times out or disconnects. The production
+  `ReplicatedVShardHost` therefore clamps legacy writes, current hinted writes,
+  and direct replicated commands to a receiver-local 600 ms maximum, matching
+  one coordinator attempt. An earlier caller deadline is retained, and one
+  absolute deadline is shared by every VShard slice so fan-out cannot multiply
+  the wait. A deadline that expires while queued for the Raft group lock is
+  refused before append, so stale work cannot consume the uncommitted-tail
+  budget. The real RF=3 quorum-loss regression covers both the legacy/null
+  path and a hinted caller attempting a later deadline; both release their
+  exact Raft waiter after expiry. This bounds server coroutines/waiter metadata
+  independently of client connection lifetime. The ambiguous log entry remains
+  subject to CR-FIX-080's already implemented admission budget and may still
+  commit after quorum returns.
 
 ## Release exit criteria
 
@@ -2080,3 +2095,22 @@ CR-FIX-076 remains an activation blocker: `9ecd0e6` prevents unsafe emission and
 false readiness, but production group-0 activation, voter/admission coverage,
 legacy-receipt preflight, downgrade policy, and mixed-binary evidence are still
 missing.
+
+Receiver-side data proposal deadline validation for CR-FIX-081:
+
+```text
+real RF=3 legacy/hinted quorum-loss regression: 1/1 passed
+host/deadline/write-router affected suites:   49/49 passed
+data-plane real-socket affected suite:        28/28 passed
+receiver deadline:                 600 ms maximum per proposal fan-out
+timestar_unit_test:                       built successfully (-j1)
+timestar_cluster_socket_test:             built successfully (-j1)
+timestar_http_server:                     built successfully (-j1)
+all test processes:                              --smp 1 --memory 1G
+compiler and test temporary directory:                     build/tmp
+```
+
+No live or multi-process server was started for this validation. Client RPC
+expiry is deliberately not treated as receiver cancellation; the regression
+instead observes both receiver-side waits expire and the group's pending apply
+waiter count return to zero.

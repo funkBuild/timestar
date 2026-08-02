@@ -251,8 +251,9 @@ public:
     // plane implements over the same guarded helper. An override that bypasses both would
     // be unbounded, so keep the charge in the helpers rather than at a call site.
     //
-    // TIME: unchanged -- the forwarding node bounds this call with its own RPC deadline and
-    // the propose inherits no deadline here.
+    // TIME: the forwarding node bounds its RPC, but that cannot cancel a receiver
+    // coroutine after timeout/disconnect. Concrete production sinks must apply a
+    // receiver-side default when this compatibility seam supplies nullopt.
     virtual seastar::future<ProposeOutcome> proposeBatchHinted(WriteBatch batch) {
         return seastar::do_with(splitByVShard(std::move(batch)), [this](VShardBatches& groups) {
             return proposeVShardBatchesHinted(viewOf(groups), std::nullopt);

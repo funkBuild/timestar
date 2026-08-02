@@ -25,6 +25,7 @@
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/sleep.hh>
 #include <seastar/core/thread.hh>
+#include <seastar/core/timed_out_error.hh>
 #include <set>
 
 using namespace timestar;
@@ -217,6 +218,70 @@ TEST_F(ReplicatedVShardHostTest, ProposeBatchSplitsAcrossVShards) {
         };
         EXPECT_DOUBLE_EQ(latest("a"), 10.0);
         EXPECT_DOUBLE_EQ(latest("b"), 20.0);
+
+        host.stop().get();
+        fs::remove_all(jroot);
+    }).get();
+}
+
+TEST_F(ReplicatedVShardHostTest, ReceiverDefaultsBoundLegacyAndHintedQuorumWaits) {
+    seastar::async([] {
+        ScopedShardedEngine eng;
+        eng.start();
+        cluster::EngineLocalStore store(*eng);
+        NoopTransport transport;
+        fs::path jroot = tmpDir();
+        cluster::ReplicatedVShardHost host(store, transport, /*self=*/1, jroot);
+
+        constexpr uint16_t vshard = 5;
+        RaftOptions opts;
+        opts.electionTimeoutMin = opts.electionTimeoutMax = 50;
+        opts.heartbeatTimeout = 1;
+        opts.preVote = false;
+        host.addVShard(vshard, {1, 2, 3}, opts).get();
+        RaftGroup* group = host.group(vshard);
+        ASSERT_NE(group, nullptr);
+        group->campaign().get();
+        RequestVoteReply grant;
+        grant.term = group->currentTerm();
+        grant.voteGranted = true;
+        group->step(Message{.to = 1, .from = 2, .payload = grant}).get();
+        ASSERT_TRUE(group->isLeader());
+
+        std::string key;
+        for (unsigned i = 0;; ++i) {
+            key = buildSeriesKey("bounded_receiver", {{"host", "h" + std::to_string(i)}}, "value");
+            if (timestar::virtualShard(SeriesId128::fromSeriesKey(key)) == vshard)
+                break;
+        }
+        auto makeBatch = [&key](double value) {
+            data::ReplicatedCommand command = writeCmd(key, value);
+            return std::get<data::WriteBatch>(std::move(command));
+        };
+
+        // Legacy PROPOSE_WRITE reaches this bool sink with no server deadline.
+        // The client-side RPC timeout cannot cancel it, so the host must bound
+        // and reclaim its own Raft waiter.
+        bool legacyTimedOut = false;
+        try {
+            (void)host.proposeBatch(makeBatch(1.0)).get();
+        } catch (const seastar::timed_out_error&) {
+            legacyTimedOut = true;
+        }
+        EXPECT_TRUE(legacyTimedOut);
+        EXPECT_EQ(group->pendingApplyWaiters(), 0u);
+
+        // Current hinted peer ingress normally supplies nullopt because the RPC
+        // deadline exists only on the forwarding client. A later explicit value
+        // must not bypass the receiver maximum either. The host returns a typed
+        // retryable reject, but must release the receiver waiter just the same.
+        data::VShardBatches groups = data::splitByVShard(makeBatch(2.0));
+        const auto tooLate = seastar::lowres_clock::now() + std::chrono::hours(1);
+        data::ProposeOutcome hinted = host.proposeVShardBatchesHinted(data::viewOf(groups), tooLate).get();
+        EXPECT_FALSE(hinted.committed);
+        ASSERT_EQ(hinted.rejects.size(), 1u);
+        EXPECT_EQ(hinted.rejects.front().kind, data::WriteFailure::Transport);
+        EXPECT_EQ(group->pendingApplyWaiters(), 0u);
 
         host.stop().get();
         fs::remove_all(jroot);

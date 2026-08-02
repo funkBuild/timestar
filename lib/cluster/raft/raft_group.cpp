@@ -7,6 +7,7 @@
 #include <optional>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/semaphore.hh>
+#include <seastar/core/timed_out_error.hh>
 #include <seastar/core/with_timeout.hh>
 #include <stdexcept>
 
@@ -320,6 +321,12 @@ seastar::future<bool> RaftGroup::proposeAndAwaitApplied(std::string data,
     {
         auto units = co_await seastar::get_units(lock_, 1);
         const uint64_t tL0 = profileEnabled() ? nowNs() : 0;
+        // The absolute deadline also covers time queued for this lock. Refuse
+        // before append if it has already expired; appending and only then
+        // timing out would consume the uncommitted-tail budget for work whose
+        // caller can no longer be waiting for it.
+        if (deadline && seastar::lowres_clock::now() >= *deadline)
+            throw seastar::timed_out_error{};
         if (node_.isLeader() && !node_.transferInFlight())
             requireUncommittedBudget(data.size());
         if (!node_.propose(std::move(data)))

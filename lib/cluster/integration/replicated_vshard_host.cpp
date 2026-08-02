@@ -4,6 +4,7 @@
 #include "../../core/vshard.hpp"
 #include "../../utils/logger.hpp"  // timestar::http_log
 #include "../data/journal_format.hpp"
+#include "../data/replicated_write_router.hpp"
 #include "../data/write_errors.hpp"
 #include "../raft/raft_node.hpp"
 
@@ -20,6 +21,9 @@ namespace timestar::cluster {
 namespace fs = std::filesystem;
 
 namespace {
+static_assert(ReplicatedVShardHost::kProposalTimeout == data::ReplicatedBatchWriteRouter::kAttemptTimeout,
+              "receiver proposal bound must track one forwarding attempt");
+
 uint8_t hexNibble(char c) {
     if (c >= '0' && c <= '9')
         return static_cast<uint8_t>(c - '0');
@@ -37,6 +41,13 @@ std::array<uint8_t, 16> parseUuidBytes(std::string_view value) {
     for (size_t i = 0; i < out.size(); ++i)
         out[i] = static_cast<uint8_t>((hexNibble(value[2 * i]) << 4) | hexNibble(value[2 * i + 1]));
     return out;
+}
+
+data::OptDeadline boundedProposalDeadline(data::OptDeadline requested) {
+    const auto localLimit = seastar::lowres_clock::now() + ReplicatedVShardHost::kProposalTimeout;
+    if (!requested || *requested > localLimit)
+        return localLimit;
+    return requested;
 }
 }  // namespace
 
@@ -297,6 +308,7 @@ seastar::future<bool> ReplicatedVShardHost::propose(uint16_t vshard, data::Repli
         throw data::ClusterFormatUnsupportedError(
             "cluster: replicated command requires committed format v" + std::to_string(requiredFormat) +
             ", but this shard has activated only v" + std::to_string(data::JournalFormatGate::activeVersion()));
+    deadline = boundedProposalDeadline(deadline);
     if (const auto* writes = std::get_if<data::WriteBatch>(&cmd))
         co_await store_.checkWriteAdmission(*writes);
     if (const auto* batch = std::get_if<data::DeleteRangeBatch>(&cmd)) {
@@ -832,9 +844,10 @@ seastar::future<bool> ReplicatedVShardHost::proposeVShardBatches(data::VShardBat
     // fsync waits instead of stacking them.
     std::vector<seastar::future<bool>> pending;
     pending.reserve(byVShard.size());
+    const auto deadline = seastar::lowres_clock::now() + kProposalTimeout;
     for (auto& [vs, b] : byVShard) {
         auto* g = registry_.group(vs);
-        pending.push_back(g->proposeAndAwaitApplied(data::encodeWriteCommand(b)));
+        pending.push_back(g->proposeAndAwaitApplied(data::encodeWriteCommand(b), deadline));
     }
 
     // Await EVERY proposal even after one fails -- abandoning an in-flight future
@@ -884,6 +897,13 @@ seastar::future<data::ProposeOutcome> ReplicatedVShardHost::proposeVShardBatches
     // Reject overloaded work before the first Raft append. The caller classifies
     // WriteOverloadedError as retryable and, critically, unambiguous.
     co_await store_.checkWriteAdmission(view);
+
+    // The RPC deadline lives only in the forwarding client; expiry or disconnect
+    // does not cancel this server coroutine. Apply an independent receiver-side
+    // maximum even when a caller supplies a later deadline, and share one absolute
+    // point across every VShard so fan-out cannot multiply the wait. Earlier caller
+    // deadlines remain authoritative.
+    deadline = boundedProposalDeadline(deadline);
 
     // Replicate every group CONCURRENTLY (see proposeVShardBatches for why serialising
     // them cost a full quorum round trip per VShard).

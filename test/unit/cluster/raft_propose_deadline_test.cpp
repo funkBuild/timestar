@@ -310,6 +310,20 @@ seastar::future<> testUncommittedTailIsBoundedAndRecovers() {
     co_await bootLedCluster(nodes, transports, router, /*checkQuorum=*/false, "budget", &budget);
     EXPECT_EQ(budget.current(), 0u) << "the healthy bootstrap/write must already be committed";
 
+    const LogIndex beforeExpired = nodes[1]->group->node().log().lastIndex();
+    bool expiredBeforeAppend = false;
+    try {
+        co_await nodes[1]->group->proposeAndAwaitApplied(
+            cmd("already-expired", 3.0), seastar::lowres_clock::now() - std::chrono::milliseconds(1));
+    } catch (const seastar::timed_out_error&) {
+        expiredBeforeAppend = true;
+    }
+    EXPECT_TRUE(expiredBeforeAppend);
+    EXPECT_EQ(nodes[1]->group->node().log().lastIndex(), beforeExpired)
+        << "an already-expired proposal must be refused before append";
+    EXPECT_EQ(nodes[1]->group->pendingApplyWaiters(), 0u);
+    EXPECT_EQ(budget.current(), 0u);
+
     router.partition(2);
     router.partition(3);
     bool timedOut = false;

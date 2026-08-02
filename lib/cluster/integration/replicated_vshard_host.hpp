@@ -52,6 +52,11 @@ struct JournalIdentity {
 // resolves only on durable-quorum commit + apply.
 class ReplicatedVShardHost : public data::ProposeSink, public data::LeaderResolver, public data::ReadIndexSink {
 public:
+    // The coordinator uses the same 600 ms per-attempt bound. Receiver-side
+    // enforcement is independently required: an RPC timeout/disconnect does
+    // not cancel the server coroutine or its Raft apply waiter.
+    static constexpr std::chrono::milliseconds kProposalTimeout{600};
+
     ReplicatedVShardHost(EngineLocalStore& store, raft::RaftTransport& transport, NodeId self,
                          std::filesystem::path journalRoot,
                          std::chrono::milliseconds tick = std::chrono::milliseconds(20));
