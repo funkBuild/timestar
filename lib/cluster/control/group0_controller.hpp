@@ -6,6 +6,7 @@
 #include "group0_state_machine.hpp"
 #include "meta_voters.hpp"
 
+#include <chrono>
 #include <cstdint>
 #include <map>
 #include <seastar/core/future.hh>
@@ -25,8 +26,10 @@ namespace timestar::control {
 // this node is the group-0 leader (the controller).
 class Group0Controller {
 public:
-    Group0Controller(raft::RaftGroup& group0, Group0StateMachine& sm, unsigned metaTarget = 3)
-        : g0_(group0), sm_(sm), metaTarget_(metaTarget) {}
+    static constexpr std::chrono::seconds kDefaultProposalTimeout{6};
+
+    Group0Controller(raft::RaftGroup& group0, Group0StateMachine& sm, unsigned metaTarget = 3,
+                     std::chrono::milliseconds proposalTimeout = kDefaultProposalTimeout);
 
     bool isController() const { return g0_.isLeader(); }
     raft::NodeId self() const { return g0_.node().id(); }
@@ -80,7 +83,8 @@ public:
     // Propose a single control command (leader only). Returns true only after
     // this exact entry is quorum committed and applied on this controller;
     // false means it was rejected before append because this node was not leader.
-    // Leadership loss after append is an ambiguous outcome and throws.
+    // Leadership loss or the default bounded deadline after append is an
+    // ambiguous outcome and throws. An explicit deadline replaces the default.
     seastar::future<bool> proposeCommand(
         ControlCommand cmd,
         std::optional<seastar::lowres_clock::time_point> deadline = std::nullopt);
@@ -107,9 +111,12 @@ public:
     FreezeDeletePlanResult lookupDeletePlan(const FrozenDeletePlan& request) const;
 
 private:
+    seastar::lowres_clock::time_point proposalDeadline() const;
+
     raft::RaftGroup& g0_;
     Group0StateMachine& sm_;
     unsigned metaTarget_;
+    std::chrono::milliseconds proposalTimeout_;
 };
 
 }  // namespace timestar::control

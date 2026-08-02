@@ -46,6 +46,7 @@ public:
     static constexpr uint64_t kCompactionEntryThreshold = 1024;
     static constexpr std::chrono::seconds kMaintenanceInterval{60};
     static constexpr std::chrono::milliseconds kControllerActuationInterval{250};
+    static constexpr std::chrono::seconds kProposalTimeout{6};
 
     Group0Host(raft::RaftTransport& transport, raft::NodeId self, std::filesystem::path journalRoot,
                const JournalIdentity& identity,

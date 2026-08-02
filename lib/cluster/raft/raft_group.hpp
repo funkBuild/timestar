@@ -90,8 +90,11 @@ public:
     // Propose a joint-consensus transition and acknowledge only after the
     // automatically appended final Cnew entry is committed and applied. A
     // successful removal of this node may make it a follower at that instant.
-    seastar::future<bool> proposeConfChangeAndAwaitApplied(std::vector<NodeId> voters,
-                                                           std::vector<NodeId> learners);
+    // The optional absolute deadline bounds the complete joint+final operation;
+    // expiry removes the exact waiter from whichever phase is currently pending.
+    seastar::future<bool> proposeConfChangeAndAwaitApplied(
+        std::vector<NodeId> voters, std::vector<NodeId> learners,
+        std::optional<seastar::lowres_clock::time_point> deadline = std::nullopt);
     // true iff a transfer was actually ARMED by this call (debt D-24); see
     // RaftNode::transferLeadership for the early returns that answer false.
     //
@@ -161,6 +164,7 @@ public:
     // Primarily operational/test visibility for bounded deadline cleanup. Read only on
     // the owning shard between async operations, like the other observers above.
     size_t pendingApplyWaiters() const { return applyWaiters_.size(); }
+    size_t pendingConfigWaiters() const { return configWaiters_.size(); }
     // Highest index this leader knows replicated on `peer` (M5 move catchUp signal).
     LogIndex matchIndexOf(NodeId peer) const { return node_.matchIndexOf(peer); }
     // Ticks since `peer` last replied to us in this term (RaftNode::kNeverAcked if

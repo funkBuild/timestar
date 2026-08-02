@@ -344,8 +344,25 @@ seastar::future<bool> RaftGroup::proposeAndAwaitApplied(std::string data,
         // worst. Latency is unaffected in practice: the proposal has to await a quorum
         // round trip regardless, and the deferral only lasts until the already-queued
         // callers finish appending.
-        if (lock_.waiters() == 0)
-            co_await drainReady();  // may commit+apply (single voter) and resolve
+        if (lock_.waiters() == 0) {
+            try {
+                co_await drainReady();  // may commit+apply (single voter) and resolve
+            } catch (...) {
+                // The caller receives this ambiguous drain failure directly;
+                // retaining its now-unreachable waiter would leak until a
+                // later apply or leadership change (which may never arrive).
+                auto waiter = std::find_if(applyWaiters_.begin(), applyWaiters_.end(),
+                                           [waiterIndex](const auto& item) { return item.first == waiterIndex; });
+                if (waiter != applyWaiters_.end())
+                    applyWaiters_.erase(waiter);
+                // Erasure breaks the promise. This coroutine still owns the
+                // otherwise unreachable future, so consume that expected
+                // broken-promise result before propagating the real drain error.
+                if (fut->available())
+                    fut->ignore_ready_future();
+                throw;
+            }
+        }
         if (profileEnabled())
             g_prof.inLockNs += nowNs() - tL0;
     }  // lock released here -- the apply wait below must NOT hold it
@@ -455,8 +472,9 @@ seastar::future<bool> RaftGroup::proposeConfChange(std::vector<NodeId> voters, s
     co_return ok;
 }
 
-seastar::future<bool> RaftGroup::proposeConfChangeAndAwaitApplied(std::vector<NodeId> voters,
-                                                                  std::vector<NodeId> learners) {
+seastar::future<bool> RaftGroup::proposeConfChangeAndAwaitApplied(
+    std::vector<NodeId> voters, std::vector<NodeId> learners,
+    std::optional<seastar::lowres_clock::time_point> deadline) {
     Config expected{voters, /*votersOutgoing=*/{}, learners};
     std::optional<seastar::future<bool>> jointApplied;
     LogIndex jointIndex = kNoIndex;
@@ -476,18 +494,50 @@ seastar::future<bool> RaftGroup::proposeConfChangeAndAwaitApplied(std::vector<No
         seastar::promise<bool> promise;
         jointApplied = promise.get_future();
         applyWaiters_.emplace_back(jointIndex, std::move(promise));
-        co_await drainReady();
+        try {
+            co_await drainReady();
+        } catch (...) {
+            // The proposal outcome is ambiguous, but the caller is already
+            // receiving the drain failure. Do not retain a second, unreachable
+            // waiter when persistence, transport, or apply throws here.
+            auto waiter = std::find_if(applyWaiters_.begin(), applyWaiters_.end(),
+                                       [jointIndex](const auto& item) { return item.first == jointIndex; });
+            if (waiter != applyWaiters_.end())
+                applyWaiters_.erase(waiter);
+            if (jointApplied->available())
+                jointApplied->ignore_ready_future();
+            throw;
+        }
     }
 
     // The core appends final Cnew synchronously when the joint entry commits.
     // Waiting for the joint entry first gives this wrapper the final entry's
     // stable index without polling or guessing.
-    co_await std::move(*jointApplied);
+    if (!deadline) {
+        co_await std::move(*jointApplied);
+    } else {
+        std::exception_ptr failure;
+        try {
+            co_await seastar::with_timeout(*deadline, std::move(*jointApplied));
+        } catch (...) {
+            failure = std::current_exception();
+        }
+        if (failure) {
+            auto units = co_await seastar::get_units(lock_, 1);
+            auto waiter = std::find_if(applyWaiters_.begin(), applyWaiters_.end(),
+                                       [jointIndex](const auto& item) { return item.first == jointIndex; });
+            if (waiter != applyWaiters_.end())
+                applyWaiters_.erase(waiter);
+            units.return_all();
+            std::rethrow_exception(failure);
+        }
+    }
 
     std::optional<seastar::future<bool>> finalApplied;
+    LogIndex finalIndex = kNoIndex;
     {
         auto units = co_await seastar::get_units(lock_, 1);
-        const LogIndex finalIndex = node_.latestConfigIndex();
+        finalIndex = node_.latestConfigIndex();
         if (node_.config().joint() || node_.config() != expected || finalIndex <= jointIndex)
             throw LeadershipLostError("membership proposal lost leadership before final config was appended");
         if (appliedIndex_ >= finalIndex)
@@ -498,7 +548,26 @@ seastar::future<bool> RaftGroup::proposeConfChangeAndAwaitApplied(std::vector<No
         finalApplied = promise.get_future();
         configWaiters_.push_back(ConfigApplyWaiter{finalIndex, std::move(expected), std::move(promise)});
     }
-    co_return co_await std::move(*finalApplied);
+    if (!deadline)
+        co_return co_await std::move(*finalApplied);
+
+    std::exception_ptr failure;
+    bool ok = false;
+    try {
+        ok = co_await seastar::with_timeout(*deadline, std::move(*finalApplied));
+    } catch (...) {
+        failure = std::current_exception();
+    }
+    if (failure) {
+        auto units = co_await seastar::get_units(lock_, 1);
+        auto waiter = std::find_if(configWaiters_.begin(), configWaiters_.end(),
+                                   [finalIndex](const ConfigApplyWaiter& item) { return item.index == finalIndex; });
+        if (waiter != configWaiters_.end())
+            configWaiters_.erase(waiter);
+        units.return_all();
+        std::rethrow_exception(failure);
+    }
+    co_return ok;
 }
 
 seastar::future<bool> RaftGroup::transferLeadership(NodeId target, bool* armed) {

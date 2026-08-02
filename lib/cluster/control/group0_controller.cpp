@@ -18,6 +18,17 @@ bool sameNodeIdentity(const NodeRecord& a, const NodeRecord& b) {
 
 }  // namespace
 
+Group0Controller::Group0Controller(raft::RaftGroup& group0, Group0StateMachine& sm, unsigned metaTarget,
+                                   std::chrono::milliseconds proposalTimeout)
+    : g0_(group0), sm_(sm), metaTarget_(metaTarget), proposalTimeout_(proposalTimeout) {
+    if (proposalTimeout_ <= std::chrono::milliseconds::zero())
+        throw std::invalid_argument("group0 controller: proposal timeout must be positive");
+}
+
+seastar::lowres_clock::time_point Group0Controller::proposalDeadline() const {
+    return seastar::lowres_clock::now() + proposalTimeout_;
+}
+
 seastar::future<bool> Group0Controller::proposeCommand(
     ControlCommand cmd, std::optional<seastar::lowres_clock::time_point> deadline) {
     if (!g0_.isLeader())
@@ -26,7 +37,7 @@ seastar::future<bool> Group0Controller::proposeCommand(
     // local log append. In particular, callers use this return as the format
     // activation and placement-policy fence. Resolve only after this exact
     // entry is quorum committed and applied on the controller.
-    co_return co_await g0_.proposeAndAwaitApplied(encodeCommand(cmd), deadline);
+    co_return co_await g0_.proposeAndAwaitApplied(encodeCommand(cmd), deadline.value_or(proposalDeadline()));
 }
 
 seastar::future<bool> Group0Controller::activateFormat(
@@ -208,7 +219,7 @@ seastar::future<bool> Group0Controller::addLearner(raft::NodeId node) {
     std::vector<NodeId> learners = config.learners;
     learners.push_back(node);
     std::sort(learners.begin(), learners.end());
-    co_return co_await g0_.proposeConfChangeAndAwaitApplied(config.voters, std::move(learners));
+    co_return co_await g0_.proposeConfChangeAndAwaitApplied(config.voters, std::move(learners), proposalDeadline());
 }
 
 bool Group0Controller::learnerCaughtUp(raft::NodeId node) const {
@@ -271,7 +282,8 @@ seastar::future<bool> Group0Controller::reconcileMetaVoters() {
         for (NodeId learner : config.learners)
             if (std::find(desired.begin(), desired.end(), learner) == desired.end())
                 remainingLearners.push_back(learner);
-        changed = co_await g0_.proposeConfChangeAndAwaitApplied(desired, std::move(remainingLearners));
+        changed = co_await g0_.proposeConfChangeAndAwaitApplied(desired, std::move(remainingLearners),
+                                                                proposalDeadline());
         if (!changed)
             co_return false;
     }

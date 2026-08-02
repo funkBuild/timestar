@@ -361,7 +361,8 @@ public:
     // Propose a §6 membership change to the given target voters/learners. The
     // leader enters a joint configuration (Cold,new) immediately, and once that
     // commits it auto-appends the final Cnew. false if not the leader or a change
-    // is already in flight.
+    // is already in flight, including the stable-looking window while final Cnew
+    // has been appended but is not yet committed.
     bool proposeConfChange(std::vector<NodeId> voters, std::vector<NodeId> learners);
 
 private:

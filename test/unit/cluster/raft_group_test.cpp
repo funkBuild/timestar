@@ -6,11 +6,13 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <deque>
 #include <map>
 #include <memory>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
+#include <seastar/core/timed_out_error.hh>
 #include <seastar/util/later.hh>
 #include <stdexcept>
 #include <vector>
@@ -119,6 +121,7 @@ public:
     const std::vector<std::string>& persistedSnapshots(NodeId id) const { return persistence_.at(id)->snapshots; }
 
     void enqueue(Envelope e) { queue_.push_back(std::move(e)); }
+    void discardQueued() { queue_.clear(); }
 
     // Deliver all queued envelopes (and any they cascade) until quiescent.
     seastar::future<bool> pumpOne() {
@@ -379,6 +382,82 @@ seastar::future<> testSingleVoterLearnerChangeTracksTheJointEntry() {
     EXPECT_EQ(group.node().config().learners, (std::vector<NodeId>{2}));
 }
 
+seastar::future<> testConfigChangeDeadlineReclaimsJointWaiter() {
+    GroupNetwork net({1, 2, 3}, opts());
+    co_await net.group(1).campaign();
+    co_await net.pump();
+    EXPECT_EQ(net.leader(), 1u);
+
+    // Do not deliver the joint proposal to either follower. With CheckQuorum
+    // disabled this leader remains leader, so only the request deadline can
+    // release the joint-entry waiter.
+    auto changing = net.group(1).proposeConfChangeAndAwaitApplied(
+        {1, 2}, {}, seastar::lowres_clock::now() + std::chrono::milliseconds(20));
+    co_await seastar::yield();
+    EXPECT_EQ(net.group(1).pendingApplyWaiters(), 1u);
+    EXPECT_THROW(co_await std::move(changing), seastar::timed_out_error);
+    EXPECT_EQ(net.group(1).pendingApplyWaiters(), 0u);
+    EXPECT_EQ(net.group(1).pendingConfigWaiters(), 0u);
+}
+
+seastar::future<> testConfigChangeDeadlineReclaimsFinalWaiter() {
+    GroupNetwork net({1, 2, 3}, opts());
+    co_await net.group(1).campaign();
+    co_await net.pump();
+    EXPECT_EQ(net.leader(), 1u);
+
+    const LogIndex jointIndex = net.group(1).node().log().lastIndex() + 1;
+    auto changing = net.group(1).proposeConfChangeAndAwaitApplied(
+        {1, 2}, {}, seastar::lowres_clock::now() + std::chrono::milliseconds(100));
+    co_await seastar::yield();
+    for (int i = 0; i < 100 && net.group(1).appliedIndex() < jointIndex; ++i) {
+        EXPECT_TRUE(co_await net.pumpOne());
+        co_await seastar::yield();
+    }
+    EXPECT_EQ(net.group(1).appliedIndex(), jointIndex);
+    co_await seastar::yield();
+    EXPECT_EQ(net.group(1).pendingApplyWaiters(), 0u);
+    EXPECT_EQ(net.group(1).pendingConfigWaiters(), 1u);
+
+    const LogIndex beforeRetry = net.group(1).node().log().lastIndex();
+    EXPECT_FALSE(co_await net.group(1).proposeConfChange({1, 3}, {}))
+        << "final Cnew is stable-looking but still uncommitted; a retry must not overlap it";
+    EXPECT_EQ(net.group(1).node().log().lastIndex(), beforeRetry)
+        << "refusing an overlapping membership change must happen before append";
+
+    // The final Cnew is appended locally, but discard its queued replication.
+    // The same absolute operation deadline must reclaim this second waiter.
+    net.discardQueued();
+    EXPECT_THROW(co_await std::move(changing), seastar::timed_out_error);
+    EXPECT_EQ(net.group(1).pendingConfigWaiters(), 0u);
+}
+
+seastar::future<> testReadyDrainFailuresReclaimProposalWaiters() {
+    {
+        GroupNetwork net({1, 2, 3}, opts());
+        co_await net.group(1).campaign();
+        co_await net.pump();
+        EXPECT_EQ(net.leader(), 1u);
+
+        net.failSends = true;
+        EXPECT_THROW(co_await net.group(1).proposeAndAwaitApplied("will-not-send"), std::runtime_error);
+        EXPECT_EQ(net.group(1).pendingApplyWaiters(), 0u)
+            << "a Ready-drain error must not strand an unreachable ordinary proposal waiter";
+    }
+    {
+        GroupNetwork net({1, 2, 3}, opts());
+        co_await net.group(1).campaign();
+        co_await net.pump();
+        EXPECT_EQ(net.leader(), 1u);
+
+        net.failSends = true;
+        EXPECT_THROW(co_await net.group(1).proposeConfChangeAndAwaitApplied({1, 2}, {}), std::runtime_error);
+        EXPECT_EQ(net.group(1).pendingApplyWaiters(), 0u)
+            << "a Ready-drain error must not strand an unreachable membership waiter";
+        EXPECT_EQ(net.group(1).pendingConfigWaiters(), 0u);
+    }
+}
+
 // THE DRIVER MUST PROPAGATE "did a transfer actually start?" (debt D-24). The balancer's
 // `transfers_initiated` counter reaches RaftNode through THIS seam, so a driver that
 // swallowed the answer would leave the counter inflated no matter what the core reports --
@@ -471,4 +550,16 @@ TEST(RaftGroupTest, AwaitedConfigChangeSucceedsWhenFinalConfigRemovesLeader) {
 
 TEST(RaftGroupTest, SingleVoterLearnerChangeTracksTheJointEntry) {
     testSingleVoterLearnerChangeTracksTheJointEntry().get();
+}
+
+TEST(RaftGroupTest, ConfigChangeDeadlineReclaimsJointWaiter) {
+    testConfigChangeDeadlineReclaimsJointWaiter().get();
+}
+
+TEST(RaftGroupTest, ConfigChangeDeadlineReclaimsFinalWaiter) {
+    testConfigChangeDeadlineReclaimsFinalWaiter().get();
+}
+
+TEST(RaftGroupTest, ReadyDrainFailuresReclaimProposalWaiters) {
+    testReadyDrainFailuresReclaimProposalWaiters().get();
 }

@@ -165,7 +165,8 @@ seastar::future<bool> Group0Host::propose(control::ControlCommand command) {
     raft::RaftGroup* g = group();
     if (!g)
         throw std::logic_error("Group0Host::propose before start");
-    co_return co_await g->proposeAndAwaitApplied(control::encodeCommand(command));
+    co_return co_await g->proposeAndAwaitApplied(control::encodeCommand(command),
+                                                 seastar::lowres_clock::now() + kProposalTimeout);
 }
 
 seastar::future<bool> Group0Host::compactAppliedState() {

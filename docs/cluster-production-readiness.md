@@ -1338,7 +1338,11 @@ is not completion.
   active version to every reactor-local data gate before group 0 advances its
   applied boundary; a failed publication retries the same entry. This closes
   the publication half of CR-FIX-076, but no production path originates an
-  activation yet. This task is not closed.
+  activation yet. The activation audit confirmed that a fresh non-seed is only
+  an inert observer that knows the seed voter set, not a replicated group-0
+  learner/member. Activation therefore cannot safely precede join: a seed-side
+  capability check could raise the seed's local gates without delivering the
+  committed activation to those observers. This task is not closed.
 - [ ] **CR-FIX-022 — wire resumable join, drain, remove, replace, and VShard
   movement.** Owner: movement/control plane. Include learner catch-up, verified
   snapshot, log catch-up, joint consensus, leadership transfer, cutover, and
@@ -1350,8 +1354,16 @@ is not completion.
   acknowledgement, and voter reconciliation refuses every selected newcomer
   that is not still a caught-up learner. The membership waiter also handles the
   one-voter fast path where joint and final entries append synchronously.
-  Controller/waiter evidence passes 7/7. The production join RPC, retrying
-  orchestration, and data-VShard movement remain open.
+  Both the joint-entry and final-`Cnew` waits now share one absolute deadline;
+  expiry removes the exact waiter from the applicable list under the group
+  lock. Every controller command and membership operation has a six-second
+  default bound (tests inject a shorter budget), and the direct group-0 host
+  proposal seam is bounded too. Ready-drain failures also reclaim and consume
+  their unreachable waiter before propagating the real error. A stable-looking
+  final `Cnew` that has been appended but not committed now continues to fence
+  new membership proposals, so a timeout/retry cannot overlap transitions.
+  Focused controller/host/Raft consensus evidence passes 50/50. The production
+  join RPC, retrying orchestration, and data-VShard movement remain open.
 - [ ] **CR-FIX-023 — implement ordered VShard teardown and reclaim-floor
   retirement.** Owner: movement/snapshot. **Done when:** both per-VShard and
   shared journals reclaim departed groups, re-adding the same VShard cannot
@@ -1573,7 +1585,13 @@ is not completion.
   Because no production path originates an activation, this fail-closed slice
   deliberately leaves clustered readiness false, exact bounded deletes
   unavailable below v5, and frozen pattern deletes unavailable below v6; it does
-  not close this task. Once version N is committed,
+  not close this task. The current socket negotiation response reports only the
+  highest mutually agreed version, not an independently authenticated peer
+  range; the remaining collector must use exact-version probes or add an
+  identity-bound capability message rather than treating that response as an
+  advertised maximum. It must also admit the node as a group-0 learner/member
+  before including it in an activation proof, because observers do not receive
+  committed group-0 state. Once version N is committed,
   the state machine cannot lower it and a binary whose maximum supported version
   is below N must not start against that data. Rollback requires restoring a
   complete pre-activation backup or rebuilding the cluster offline; rolling
@@ -1601,16 +1619,23 @@ is not completion.
   peak RSS and `/tmp` use, installs at least one snapshot on the recreated node,
   and proves both the surviving and exactly deleted public-path probes. The
   pre-limit attempt was interrupted during catch-up and cannot close this task.
-- [x] **CR-FIX-079 — reclaim deadline-expired Raft apply waiters.** Owner:
+- [x] **CR-FIX-079 — reclaim expired or unreachable Raft apply waiters.** Owner:
   consensus. A proposal timeout now reacquires the group lock and removes its
   exact apply waiter, serialized against the same apply path that resolves it.
   Seastar's timeout continuation continues to own and consume the inner future,
   so erasing the promise cannot race apply or create an abandoned exception.
   The ambiguous durable log entry is deliberately not cancelled and may still
-  commit after quorum returns. The real quorum-loss test proves one deliberately
+  commit after quorum returns. Membership changes apply the same cleanup to both
+  the joint-entry waiter and final-configuration waiter under one absolute
+  deadline. A Ready-drain exception before either timeout wrapper is reached
+  also removes the registered waiter and consumes its expected broken promise.
+  The Raft core refuses an overlapping membership proposal until the latest
+  final configuration is committed, including after the first caller times out.
+  All production group-0 controller/host quorum waits now supply a default
+  six-second deadline. The real quorum-loss test proves one deliberately
   unbounded waiter remains, a bounded waiter disappears at its deadline, and
-  healing drains the last waiter; the focused Raft/controller evidence passes
-  19/19.
+  healing drains the last waiter; focused Raft/controller/host evidence passes
+  50/50.
 - [ ] **CR-FIX-080 — bound the aggregate uncommitted Raft log tail.** Owner:
   consensus/resource control. Deadline cleanup bounds waiter metadata but not
   the locally durable entry: with CheckQuorum disabled, an isolated leader can

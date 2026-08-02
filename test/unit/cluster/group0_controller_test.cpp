@@ -541,18 +541,19 @@ seastar::future<> testDeletePlanProposalDeadlineBoundsQuorumLoss() {
 
     // Leave node 1 believing it is leader, but make its next entry unable to
     // reach either follower. Group 0 intentionally does not use CheckQuorum,
-    // so the explicit proposal deadline is what bounds this request.
+    // so the controller's default proposal deadline is what bounds this request.
     router.setGroup(2, nullptr);
     router.setGroup(3, nullptr);
+    Group0Controller boundedController(*nodes[1].group, *nodes[1].sm, 3, std::chrono::milliseconds(20));
     bool timedOut = false;
     try {
-        (void)co_await controller.freezeDeletePlan(
-            frozenPlan('1', 'a', {{"m,host=a value", 10, 20}}),
-            seastar::lowres_clock::now() + std::chrono::milliseconds(20));
+        (void)co_await boundedController.freezeDeletePlan(
+            frozenPlan('1', 'a', {{"m,host=a value", 10, 20}}));
     } catch (const seastar::timed_out_error&) {
         timedOut = true;
     }
-    EXPECT_TRUE(timedOut) << "a quorum-lost group-0 leader must not retain an unbounded request waiter";
+    EXPECT_TRUE(timedOut) << "a quorum-lost group-0 leader must apply its default request deadline";
+    EXPECT_EQ(nodes[1].group->pendingApplyWaiters(), 0u);
     EXPECT_TRUE(nodes[1].sm->state().frozenDeletePlans.empty())
         << "an uncommitted timed-out proposal must not become a visible frozen plan";
 }

@@ -1459,6 +1459,12 @@ bool RaftNode::proposeConfChange(std::vector<NodeId> voters, std::vector<NodeId>
         return false;
     if (config_.joint())
         return false;  // one membership change at a time
+    // Committing the joint entry auto-appends final Cnew and immediately makes
+    // that stable config active for quorum calculations. Until Cnew itself is
+    // committed, however, the transition is still in flight. A timed-out or
+    // concurrent caller must not append another joint config in this window.
+    if (latestConfigIndex_ != kNoIndex && commitIndex_ < latestConfigIndex_)
+        return false;
     if (voters.empty())
         return false;  // a config with no voters would permanently wedge the group
 
