@@ -54,7 +54,7 @@ seastar::future<> testRestoreVerifiesAndInstalls(std::string dir) {
 
     std::vector<uint64_t> ts = {100, 200};
     std::vector<double> vs = {1.0, 2.0};
-    auto src = co_await writeSrc(dir + "/src/00_0000000000.tsm", 0, key, ts, vs);
+    auto src = co_await writeSrc(dir + "/src/0_0.tsm", 0, key, ts, vs);
     std::vector<seastar::shared_ptr<::TSM>> files = {src};
 
     // Build the snapshot manifest from the source file.
@@ -62,7 +62,7 @@ seastar::future<> testRestoreVerifiesAndInstalls(std::string dir) {
     co_await timestar::feedVShardResolvedView(vshard, files, builder);
     const auto manifest = builder.build(timestar::VShardExtentMap{}, std::string(32, 'c'));
 
-    const std::string target = dir + "/dst/00_0000000000.tsm";
+    const std::string target = dir + "/dst/0_0.tsm";
 
     // A tampered manifest must be REJECTED and install nothing.
     auto bad = manifest;
@@ -106,12 +106,12 @@ seastar::future<> testRestoreRejectsWatermarkMismatch(std::string dir) {
     std::vector<uint64_t> revs = {50};
     seastar::shared_ptr<::TSM> src;
     {
-        TSMWriter w(dir + "/src/00_0000000000.tsm");
+        TSMWriter w(dir + "/src/0_0.tsm");
         w.writeSeries(TSMValueType::Float, s, ts, vs, revs);
         w.writeIndex();
         w.close();
     }
-    src = seastar::make_shared<::TSM>(dir + "/src/00_0000000000.tsm");
+    src = seastar::make_shared<::TSM>(dir + "/src/0_0.tsm");
     src->tierNum = 0;
     src->seqNum = 0;
     co_await src->open();
@@ -124,7 +124,7 @@ seastar::future<> testRestoreRejectsWatermarkMismatch(std::string dir) {
     // Force the manifest watermark BELOW the source's revision (50).
     manifest.snapshotRevision = 10;
 
-    const std::string target = dir + "/dst/00_0000000000.tsm";
+    const std::string target = dir + "/dst/0_0.tsm";
     const bool ok = co_await timestar::restoreVShardSnapshot(manifest, files, {target});
     EXPECT_FALSE(ok) << "source revision beyond snapshotRevision must be rejected";
     EXPECT_FALSE(fs::exists(target));
@@ -144,18 +144,18 @@ seastar::future<> testRestoreAllOrNothingOnInstallFailure(std::string dir) {
 
     std::vector<uint64_t> ts = {100};
     std::vector<double> vs = {1.0};
-    auto src0 = co_await writeSrc(dir + "/src/00_0000000000.tsm", 0, key, ts, vs);
-    auto src1 = co_await writeSrc(dir + "/src/00_0000000001.tsm", 1, key, ts, vs);
+    auto src0 = co_await writeSrc(dir + "/src/0_0.tsm", 0, key, ts, vs);
+    auto src1 = co_await writeSrc(dir + "/src/0_1.tsm", 1, key, ts, vs);
     std::vector<seastar::shared_ptr<::TSM>> files = {src0, src1};
 
     timestar::VShardSnapshotBuilder builder(vshard);
     co_await timestar::feedVShardResolvedView(vshard, files, builder);
     const auto manifest = builder.build(timestar::VShardExtentMap{}, std::string(32, 'c'));
 
-    const std::string good = dir + "/dst/00_0000000000.tsm";
+    const std::string good = dir + "/dst/0_0.tsm";
     // A regular file that blocks create_directories() for target1's parent.
     { std::ofstream(dir + "/dst/blocker") << "x"; }
-    const std::string bad = dir + "/dst/blocker/00_0000000000.tsm";  // parent "blocker" is a file
+    const std::string bad = dir + "/dst/blocker/0_0.tsm";  // parent "blocker" is a file
 
     bool threw = false;
     try {

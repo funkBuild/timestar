@@ -57,8 +57,7 @@ public:
     // Create a TSM file with a single float series (explicit timestamps/values).
     seastar::shared_ptr<TSM> createTSMFile(uint64_t tier, uint64_t seqNum, const std::string& seriesKey,
                                            const std::vector<uint64_t>& timestamps, const std::vector<double>& values) {
-        char filename[256];
-        snprintf(filename, sizeof(filename), "shard_0/tsm/%02lu_%010lu.tsm", tier, seqNum);
+        const std::string filename = "shard_0/tsm/" + std::to_string(tier) + "_" + std::to_string(seqNum) + ".tsm";
 
         TSMWriter writer(filename);
         SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
@@ -76,8 +75,7 @@ public:
     seastar::shared_ptr<TSM> createMultiSeriesTSMFile(uint64_t tier, uint64_t seqNum, const std::string& seriesPrefix,
                                                       int numSeries, int pointsPerSeries,
                                                       uint64_t startTime = 1000000) {
-        char filename[256];
-        snprintf(filename, sizeof(filename), "shard_0/tsm/%02lu_%010lu.tsm", tier, seqNum);
+        const std::string filename = "shard_0/tsm/" + std::to_string(tier) + "_" + std::to_string(seqNum) + ".tsm";
 
         TSMWriter writer(filename);
 

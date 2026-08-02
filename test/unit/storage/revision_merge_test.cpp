@@ -56,10 +56,10 @@ TEST(RevisionMergeTest, OverlapHighestRevisionWinsPerTimestamp) {
     EXPECT_EQ(out[1].value, 200.0);
 }
 
-TEST(RevisionMergeTest, MigratedFloorLosesToAssignedRevision) {
-    // Migrated data (revision 0) must lose to any assigned write (revision >= 1).
+TEST(RevisionMergeTest, UntrackedFloorLosesToAssignedRevision) {
+    // Untracked data (revision 0) must lose to any assigned write (revision >= 1).
     std::vector<std::vector<DP>> runs = {
-        {{10, -1.0, 0}},  // migrated
+        {{10, -1.0, 0}},  // untracked
         {{10, 42.0, 1}},  // assigned
     };
     auto out = mergeByRevision(runs);

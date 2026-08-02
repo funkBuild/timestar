@@ -31,16 +31,15 @@ is assigned to at most one write of a given point.
 
 Reserved values:
 
-- **Revision 0** is reserved for **migrated pre-cluster data** (from `shard_N`).
-  It is the global floor: any replicated write (revision ≥ 1) beats migrated
-  data at the same point. Migration (Task 6) emits every point at revision 0.
+- **Revision 0** is the untracked single-node floor. Clustered writes never use
+  it; any replicated write has revision ≥ 1.
 - **Revisions ≥ 1** are assigned to writes accepted by the VShard.
 
 ### 2. Phase 1 (pre-Raft, single node): revision = per-VShard journal sequence
 
 Journals are already per-VShard sequenced (`vshard_seq`, ADR 0001). In Phase 1
 the point revision **is** the `vshard_seq` of the journal record that carried the
-write (starting at 1; 0 stays reserved for migration). This is:
+write (starting at 1). This is:
 
 - **Deterministic** — assigned by the durable journal append, replay reproduces
   it exactly.
@@ -67,7 +66,7 @@ log index** of the entry that carried the write — also a per-VShard monotonic
 Because both the pre-Raft `vshard_seq` and the Raft index are "the position of
 the write in that VShard's authoritative log", the revision is *always* "the log
 position", and the handoff is a monotonic continuation, not a re-numbering. The
-reserved 0 (migration) stays below both.
+reserved 0 stays below both.
 
 ### 4. Storage of revisions
 
@@ -102,8 +101,8 @@ Per ADR 0002 section 5:
   means there is exactly one source of truth for ordering, and the pre-Raft →
   Raft transition is a monotonic continuation rather than a migration of
   revisions.
-- Reserving 0 for migrated data encodes the intended precedence (any real write
-  beats imported legacy data) without a separate "is-migrated" flag.
+- Reserving 0 for untracked single-node data keeps it below every replicated
+  write without another state flag.
 - Keeping the per-point revision column only in tier-0 (where intra-file
   duplicates can exist) keeps steady-state blocks lean — the common case pays
   only 16 bytes of `[minRev,maxRev]` per block, not a column.
@@ -128,6 +127,7 @@ Per ADR 0002 section 5:
   reproduces LWW deterministically.
 - Task 4c stores `[minRev,maxRev]` per block and a revision column in tier-0
   blocks, and implements the overlap-aware read-path merge.
-- Task 6 (migration) emits revision 0 for all imported points.
+- Current single-node writes without revision assignment use revision 0; any
+  assigned VShard revision is therefore newer.
 - Phase 2 (Multi-Raft) must enforce `first_raft_index > max_pre_raft_revision`
   per VShard at the handoff; this ADR is the contract it implements against.

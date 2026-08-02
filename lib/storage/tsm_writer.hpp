@@ -99,7 +99,7 @@ public:
     // `revisions`, when non-empty, supplies a per-point replicated revision
     // (ADR 0003) parallel to `values`; each block's [minRev, maxRev] is set from
     // its points' revisions. Empty (the default) leaves every block at the
-    // migrated-floor range [0, 0].
+    // untracked floor range [0, 0].
     template <class T>
     void writeSeries(TSMValueType seriesType, const SeriesId128& seriesId, const std::vector<uint64_t>& timestamps,
                      const std::vector<T>& values, std::span<const uint64_t> revisions = {});

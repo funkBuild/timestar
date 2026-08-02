@@ -720,8 +720,8 @@ seastar::future<SeriesCompactionData<T>> TSMCompactor::processSeriesForCompactio
                     break;
                 }
 
-                // Last copy at minTs within the winning file (legacy intra-file
-                // duplicates), mirroring BulkMergeContext::takeLastAtCurrentTs.
+                // Last copy at minTs within the winning file, mirroring
+                // BulkMergeContext::takeLastAtCurrentTs.
                 T value = winner->block->values[winner->pointIdx];
                 if (advanceSync(*winner)) {
                     co_await refill(*winner);

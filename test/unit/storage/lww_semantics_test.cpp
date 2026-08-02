@@ -238,9 +238,8 @@ TEST(LwwQueryResultMergeTest, TwoWayCrossFileDuplicateNewestRankWins) {
     EXPECT_DOUBLE_EQ(merged.values[2], 3.0);
 }
 
-TEST(LwwQueryResultMergeTest, SingleSourceLegacyRunKeepsLastCopy) {
-    // Legacy files (written before ingest dedup) may hold intra-file
-    // duplicate runs; within a file, later position = later write.
+TEST(LwwQueryResultMergeTest, SingleSourceDuplicateRunKeepsLastCopy) {
+    // Defensive duplicate handling: within a file, later position = later write.
     std::vector<TSMResult<double>> results;
     results.emplace_back(uint64_t{5} << 4);
     results.back().appendBlock(makeBlock({100, 100, 200}, {1.0, 5.0, 2.0}));
@@ -281,7 +280,7 @@ TEST(LwwQueryResultMergeTest, HeapMergeDuplicateResolution) {
 }
 
 TEST(LwwQueryResultMergeTest, DrainPathKeepsLastCopyOfRuns) {
-    // Source 0 exhausts early; source 1's remaining legacy run at ts=900
+    // Source 0 exhausts early; source 1's remaining duplicate run at ts=900
     // must still collapse to its last copy during the drain.
     std::vector<TSMResult<double>> results;
     results.emplace_back(uint64_t{2} << 4);

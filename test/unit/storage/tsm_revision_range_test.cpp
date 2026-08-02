@@ -39,7 +39,6 @@ seastar::future<> testRevisionRangeRoundTrips(std::string p) {
 
     TSM tsm(p);
     co_await tsm.open();
-    EXPECT_EQ(tsm.fileFormatVersion(), 1u);
 
     auto* entry = co_await tsm.getFullIndexEntry(series);
     EXPECT_NE(entry, nullptr);
@@ -55,8 +54,8 @@ TEST_F(TSMRevisionRangeTest, RevisionRangeRoundTrips) {
     seastar::async([&] { testRevisionRangeRoundTrips(path("0_1.tsm")).get(); }).get();
 }
 
-// Without revisions the writer leaves every block at the migrated-floor [0, 0].
-seastar::future<> testNoRevisionsIsMigratedFloor(std::string p) {
+// Without revisions the writer leaves every block at the untracked floor [0, 0].
+seastar::future<> testNoRevisionsIsUntrackedFloor(std::string p) {
     SeriesId128 series = SeriesId128::fromSeriesKey("norev.value");
     std::vector<uint64_t> ts = {10, 20, 30};
     std::vector<double> vs = {1.0, 2.0, 3.0};
@@ -70,7 +69,6 @@ seastar::future<> testNoRevisionsIsMigratedFloor(std::string p) {
 
     TSM tsm(p);
     co_await tsm.open();
-    EXPECT_EQ(tsm.fileFormatVersion(), 1u);
     auto* entry = co_await tsm.getFullIndexEntry(series);
     EXPECT_NE(entry, nullptr);
     if (entry && entry->indexBlocks.size() == 1u) {
@@ -81,8 +79,8 @@ seastar::future<> testNoRevisionsIsMigratedFloor(std::string p) {
     }
     co_return;
 }
-TEST_F(TSMRevisionRangeTest, NoRevisionsIsMigratedFloor) {
-    seastar::async([&] { testNoRevisionsIsMigratedFloor(path("0_2.tsm")).get(); }).get();
+TEST_F(TSMRevisionRangeTest, NoRevisionsIsUntrackedFloor) {
+    seastar::async([&] { testNoRevisionsIsUntrackedFloor(path("0_2.tsm")).get(); }).get();
 }
 
 // The file-level max-revision trailer is read cheaply at open() and equals
@@ -103,7 +101,6 @@ seastar::future<> testMaxRevisionTrailer(std::string p) {
     }
     TSM tsm(p);
     co_await tsm.open();
-    EXPECT_EQ(tsm.fileFormatVersion(), 1u);
     EXPECT_EQ(tsm.maxRevision(), 42u) << "file-level max across both series";
     co_return;
 }
@@ -122,7 +119,7 @@ seastar::future<> testMaxRevisionZeroWhenUntracked(std::string p) {
     }
     TSM tsm(p);
     co_await tsm.open();
-    EXPECT_EQ(tsm.maxRevision(), 0u) << "untracked file's max revision is the migrated floor";
+    EXPECT_EQ(tsm.maxRevision(), 0u) << "untracked file's max revision is the untracked floor";
     co_return;
 }
 TEST_F(TSMRevisionRangeTest, MaxRevisionZeroWhenUntracked) {

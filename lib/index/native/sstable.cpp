@@ -368,7 +368,6 @@ seastar::future<SSTableMetadata> SSTableWriter::finish() {
     meta.minKey = firstKey_;
     meta.maxKey = lastKey_;
     meta.writeTimestamp = writeTimestampNs_;
-    meta.formatVersion = SSTABLE_VERSION;
     co_return meta;
 }
 
@@ -460,8 +459,6 @@ seastar::future<std::unique_ptr<SSTableReader>> SSTableReader::open(std::string 
     reader->metadata_.entryCount = entryCount;
     reader->metadata_.fileSize = fileSize;
     reader->metadata_.writeTimestamp = writeTimestampNs;
-    reader->metadata_.formatVersion = version;
-
     // Read bloom + index in a single DMA read (they're contiguous at the end of the file).
     uint64_t metaEnd = fileSize - SSTABLE_FOOTER_SIZE;
     if (bloomOffset > metaEnd || bloomSize > metaEnd - bloomOffset || indexOffset != bloomOffset + bloomSize ||

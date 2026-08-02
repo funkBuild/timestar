@@ -49,7 +49,13 @@ inventory and rules.
   variants of the same v1 contract and consolidated their shared header and
   full-buffer decode logic.
 - [x] Removed the unused core-count rebalancer and its test suite; TSM readers
-  now reject its retired filenames and non-canonical numeric aliases.
+  now reject its retired filenames and non-canonical numeric aliases. Active
+  compaction, snapshot, restore, and pushdown fixtures use canonical v1 names.
+- [x] Removed the remaining unused `shard_N` migration planner, rewrite path,
+  Engine migration/repartition scaffolding, and their migration-only tests.
+  Retired development roots are detected only to fail before mutation; they
+  are never decoded or rewritten. Runtime metadata no longer carries redundant
+  copies of v1 constants after a footer has already been validated.
 - [x] Removed NativeIndex's pre-bitmap migration and tag-value blob fallback;
   current v1 local-ID state restores normally and incomplete state fails closed.
 - [x] Bound each `TSMJ1` movement job to its exact source voters and target map

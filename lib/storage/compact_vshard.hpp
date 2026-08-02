@@ -16,8 +16,7 @@ namespace timestar {
 // `inputs`, resolves last-write-wins across them (keep-last, matching the query
 // path), and writes them into ONE VShard-PURE TSM file at `outputPath`,
 // PRESERVING each series' revision range (the union of its input blocks'
-// [minRev,maxRev]). Unlike migration -- which floors imported data to revision 0
-// -- this is the steady-state repartition of already-revisioned data into
+// [minRev,maxRev]). This is the steady-state repartition of already-revisioned data into
 // VShard-pure tier>=1 files, so cross-file LWW-by-range and the recovery counter
 // stay correct (ADR 0003). Streamed (bounded memory). Returns series written.
 seastar::future<size_t> compactVShardToFile(VShardId vshard, std::vector<seastar::shared_ptr<::TSM>> inputs,

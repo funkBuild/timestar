@@ -65,8 +65,7 @@ public:
     // Helper to create TSM files with test data
     seastar::shared_ptr<TSM> createTestTSMFile(uint64_t tier, uint64_t seqNum, const std::string& seriesPrefix,
                                                int numSeries, int pointsPerSeries, uint64_t startTime = 1000000) {
-        char filename[256];
-        snprintf(filename, sizeof(filename), "shard_0/tsm/%02lu_%010lu.tsm", tier, seqNum);
+        const std::string filename = "shard_0/tsm/" + std::to_string(tier) + "_" + std::to_string(seqNum) + ".tsm";
 
         TSMWriter writer(filename);
 
@@ -137,8 +136,7 @@ SEASTAR_TEST_F(TSMCompactorTest, DeduplicationDuringCompaction) {
 
     // Create files with overlapping timestamps
     for (int i = 0; i < 3; i++) {
-        char filename[256];
-        snprintf(filename, sizeof(filename), "shard_0/tsm/00_%010d.tsm", i);
+        const std::string filename = "shard_0/tsm/0_" + std::to_string(i) + ".tsm";
 
         TSMWriter writer(filename);
 
@@ -196,8 +194,7 @@ SEASTAR_TEST_F(TSMCompactorTest, NewerValuesOverwriteOlderDuringCompaction) {
     // Create 3 TSM files with overlapping timestamps but different values
     // File 0: oldest data (seqNum=0)
     {
-        char filename[256];
-        snprintf(filename, sizeof(filename), "shard_0/tsm/00_0000000000.tsm");
+        const std::string filename = "shard_0/tsm/0_0.tsm";
 
         TSMWriter writer(filename);
         std::vector<uint64_t> timestamps;
@@ -223,8 +220,7 @@ SEASTAR_TEST_F(TSMCompactorTest, NewerValuesOverwriteOlderDuringCompaction) {
 
     // File 1: overlapping data with some new timestamps (seqNum=1)
     {
-        char filename[256];
-        snprintf(filename, sizeof(filename), "shard_0/tsm/00_0000000001.tsm");
+        const std::string filename = "shard_0/tsm/0_1.tsm";
 
         TSMWriter writer(filename);
         std::vector<uint64_t> timestamps;
@@ -255,8 +251,7 @@ SEASTAR_TEST_F(TSMCompactorTest, NewerValuesOverwriteOlderDuringCompaction) {
 
     // File 2: newest data overlapping both previous files (seqNum=2)
     {
-        char filename[256];
-        snprintf(filename, sizeof(filename), "shard_0/tsm/00_0000000002.tsm");
+        const std::string filename = "shard_0/tsm/0_2.tsm";
 
         TSMWriter writer(filename);
         std::vector<uint64_t> timestamps;
@@ -367,12 +362,12 @@ SEASTAR_TEST_F(TSMCompactorTest, TSMReaderAccess) {
         EXPECT_TRUE(static_cast<bool>(reader));
 
         // File should exist on disk
-        EXPECT_TRUE(fs::exists("shard_0/tsm/00_0000000001.tsm"));
+        EXPECT_TRUE(fs::exists("shard_0/tsm/0_1.tsm"));
     }
 
     // After reader is destroyed, file should still exist (deletion is
     // handled by removeTSMFiles -> scheduleDelete, not by reader scope)
-    EXPECT_TRUE(fs::exists("shard_0/tsm/00_0000000001.tsm"));
+    EXPECT_TRUE(fs::exists("shard_0/tsm/0_1.tsm"));
 
     co_return;
 }
@@ -567,8 +562,7 @@ TEST_F(TSMCompactorTest, LeveledCompactionStrategy) {
     // Test file selection
     std::vector<seastar::shared_ptr<TSM>> availableFiles;
     for (int i = 0; i < 10; i++) {
-        char filename[256];
-        snprintf(filename, sizeof(filename), "shard_0/tsm/00_%010d.tsm", i);
+        const std::string filename = "shard_0/tsm/0_" + std::to_string(i) + ".tsm";
         auto tsm = seastar::make_shared<TSM>(filename);
         // TSM constructor already sets tierNum and seqNum from filename
         availableFiles.push_back(tsm);
@@ -655,8 +649,7 @@ SEASTAR_TEST_F(TSMCompactorTest, CompactionStatistics) {
     std::vector<seastar::shared_ptr<TSM>> files;
 
     for (int i = 0; i < 3; i++) {
-        char filename[256];
-        snprintf(filename, sizeof(filename), "shard_0/tsm/00_%010d.tsm", i);
+        const std::string filename = "shard_0/tsm/0_" + std::to_string(i) + ".tsm";
 
         TSMWriter writer(filename);
 
@@ -687,7 +680,7 @@ SEASTAR_TEST_F(TSMCompactorTest, CompactionStatistics) {
     plan.sourceFiles = files;
     plan.targetTier = 1;
     plan.targetSeqNum = 100;
-    plan.targetPath = "shard_0/tsm/01_0000000100.tsm";
+    plan.targetPath = "shard_0/tsm/1_100.tsm";
 
     auto stats = co_await self->compactor->executeCompaction(plan);
 
@@ -726,7 +719,7 @@ SEASTAR_TEST_F(TSMCompactorTest, DirectorySyncFailureKeepsOrdinaryCompactionSour
     plan.sourceFiles = sources;
     plan.targetTier = 1;
     plan.targetSeqNum = 100;
-    plan.targetPath = "shard_0/tsm/01_0000000100.tsm";
+    plan.targetPath = "shard_0/tsm/1_100.tsm";
 
     bool failed = false;
     try {
@@ -775,8 +768,7 @@ SEASTAR_TEST_F(TSMCompactorTest, MixedDataTypeCompaction) {
 
     // Create files with both float and boolean data
     for (int i = 0; i < 2; i++) {
-        char filename[256];
-        snprintf(filename, sizeof(filename), "shard_0/tsm/00_%010d.tsm", i);
+        const std::string filename = "shard_0/tsm/0_" + std::to_string(i) + ".tsm";
 
         TSMWriter writer(filename);
 
@@ -868,8 +860,8 @@ SEASTAR_TEST_F(TSMCompactorTest, ZeroCopyCompactionPreservesRevisionRanges) {
         int seq;
     };
     const std::vector<Spec> specs = {
-        {"shard_0/tsm/00_0000000000.tsm", seriesA, {10, 11, 12, 13, 14}, 1000000, 0},
-        {"shard_0/tsm/00_0000000001.tsm", seriesB, {20, 25, 22, 23, 21}, 5000000, 1},
+        {"shard_0/tsm/0_0.tsm", seriesA, {10, 11, 12, 13, 14}, 1000000, 0},
+        {"shard_0/tsm/0_1.tsm", seriesB, {20, 25, 22, 23, 21}, 5000000, 1},
     };
 
     for (const auto& spec : specs) {
@@ -897,7 +889,6 @@ SEASTAR_TEST_F(TSMCompactorTest, ZeroCopyCompactionPreservesRevisionRanges) {
 
     auto out = seastar::make_shared<TSM>(compactedResult.outputPath);
     co_await out->open();
-    EXPECT_EQ(out->fileFormatVersion(), 1u);
 
     auto checkRange = [&](const SeriesId128& series, uint64_t wantMin, uint64_t wantMax) -> seastar::future<> {
         auto* entry = co_await out->getFullIndexEntry(series);
@@ -925,8 +916,7 @@ SEASTAR_TEST_F(TSMCompactorTest, MergeCompactionPreservesMaxRevision) {
     const SeriesId128 series = SeriesId128::fromSeriesKey("revmerge.value");
 
     for (int i = 0; i < 2; ++i) {
-        char filename[256];
-        snprintf(filename, sizeof(filename), "shard_0/tsm/00_%010d.tsm", i);
+        const std::string filename = "shard_0/tsm/0_" + std::to_string(i) + ".tsm";
 
         std::vector<uint64_t> ts;
         std::vector<double> vs;
@@ -956,7 +946,6 @@ SEASTAR_TEST_F(TSMCompactorTest, MergeCompactionPreservesMaxRevision) {
     co_await out->open();
     // Inputs' max revision is 1049 (file 1: 1000 + 49 + 1 - 1 = 1049). The merge
     // path must preserve it in the file-level trailer, not collapse to 0.
-    EXPECT_EQ(out->fileFormatVersion(), 1u);
     EXPECT_GE(out->maxRevision(), 1049u) << "merge compaction erased revisions -> recovery counter would invert LWW";
     co_return;
 }
@@ -972,8 +961,7 @@ SEASTAR_TEST_F(TSMCompactorTest, VShardPartitionedBackgroundCompaction) {
     // not fall back to publishing another mixed file or resurrect the point.
     std::vector<seastar::shared_ptr<TSM>> sources;
     for (int i = 0; i < 2; ++i) {
-        char fn[256];
-        snprintf(fn, sizeof(fn), "shard_0/tsm/00_%010d.tsm", i);
+        const std::string fn = "shard_0/tsm/0_" + std::to_string(i) + ".tsm";
         TSMWriter w(fn);
         for (const char* h : {"a", "b", "c", "d"}) {
             std::vector<uint64_t> ts = {static_cast<uint64_t>(1000 + i * 100)};
@@ -1000,7 +988,7 @@ SEASTAR_TEST_F(TSMCompactorTest, VShardPartitionedBackgroundCompaction) {
     plan.sourceFiles = sources;
     plan.targetTier = 1;
     plan.targetSeqNum = self->fileManager->allocateSequenceId();
-    plan.targetPath = "shard_0/tsm/01_0000000099.tsm";  // non-empty for isValid; partition allocates its own outputs
+    plan.targetPath = "shard_0/tsm/1_99.tsm";  // non-empty for isValid; partition allocates its own outputs
     EXPECT_TRUE(plan.isValid());
     co_await self->compactor->executeCompaction(plan);
 
@@ -1051,7 +1039,7 @@ SEASTAR_TEST_F(TSMCompactorTest, DirectorySyncFailureKeepsVShardPartitionedSourc
     plan.sourceFiles = sources;
     plan.targetTier = 1;
     plan.targetSeqNum = 100;
-    plan.targetPath = "shard_0/tsm/01_0000000100.tsm";
+    plan.targetPath = "shard_0/tsm/1_100.tsm";
 
     bool failed = false;
     try {

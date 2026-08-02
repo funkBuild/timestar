@@ -123,8 +123,8 @@ This epic does not:
 - repair the current core-count rebalancer; or
 - promise that a single hot series scales across nodes.
 
-The rebalancer is disabled on unsafe core-count changes until a metadata-safe
-offline or VShard-aware migration is implemented.
+The retired layout remains fail-closed on unsafe core-count changes. Greenfield
+data is recreated; no compatibility migration will be added.
 
 This is a temporary legacy-format guard, not the final scaling behaviour. In
 the VShard format, storage is addressed by VShard identity and core execution
@@ -432,10 +432,10 @@ The next epic is tracked in
 its task list is authoritative. (The epic was simplified on 2026-07-23: the
 persisted worker-registry and ownership-generation machinery originally built
 as its early tasks was dissolved in favour of boot-derived core assignment,
-and the epic now centres on decommissioning, derived assignment, the Task 4
-storage boundary — whose first slice, Task 4.0, is the durable
-acknowledgement boundary — and the Task 6 migration tool. Multi-Raft is the
-parent plan's Phase 2, not part of that epic.)
+and the epic now centres on decommissioning, derived assignment, and the Task 4
+storage boundary — whose first slice, Task 4.0, is the durable acknowledgement
+boundary. The former Task 6 migration tool was retired by the greenfield v1
+reset. Multi-Raft is the parent plan's Phase 2, not part of that epic.)
 
 ## Verification plan
 
@@ -494,7 +494,7 @@ The starting epic is complete only when all of the following are true:
 - normal startup never runs the unsafe automatic core-count rebalancer;
 - all persistent paths are derived from one injected immutable layout;
 - `server.data_dir` contains all storage and node-local control artifacts;
-- the default root opens the existing `shard_N` layout without migration;
+- startup rejects a retired `shard_N` root before mutating it;
 - a non-default-root ingest/restart/query test passes;
 - existing storage, index, WAL, and compaction tests pass;
 - a core-count mismatch fails before mutating stored data;
@@ -504,6 +504,6 @@ The starting epic is complete only when all of the following are true:
 Passing this gate does not make TimeStar clustered. It creates the safe local
 storage boundary on which the VShard and replicated-state-machine work can be
 built without immediately rewriting every storage component again. The
-fail-closed rule remains for legacy `shard_N` data; the subsequent VShard
-storage epic replaces it with automatic storage-worker rebalancing for the new
-format.
+fail-closed rule remains for retired `shard_N` data; the subsequent VShard
+storage epic replaces CPU-core ownership with storage-worker rebalancing for
+the current v1 format.

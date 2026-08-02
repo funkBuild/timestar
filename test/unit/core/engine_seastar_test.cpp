@@ -1111,7 +1111,7 @@ TEST_F(EngineSeastarTest, RevisionAssignmentAdvancesAndRestores) {
             eng2.init();  // did NOT call setRevisionAssignment
             EXPECT_EQ(eng2->nextRevision(), 3u) << "counter restored above the max durable revision (2)";
             // Tracking is sticky: recovering revision-bearing data auto-enables
-            // assignment, so new writes don't drop to the migrated floor and lose
+            // assignment, so new writes don't drop to the untracked floor and lose
             // LWW to recovered data (adversarial-review finding).
             EXPECT_TRUE(eng2->revisionAssignmentEnabled()) << "recovered tracked data must re-enable assignment";
         }
@@ -1152,81 +1152,6 @@ TEST_F(EngineSeastarTest, CreateVShardSnapshotFromFlushedData) {
         EXPECT_EQ(manifest.verificationHash.size(), 32u);
         EXPECT_FALSE(manifest.dataExtents.empty()) << "the flushed file must appear as a data extent";
         EXPECT_GT(manifest.snapshotRevision, 0u) << "assigned revisions must survive into the snapshot watermark";
-    })
-        .join()
-        .get();
-}
-
-// Engine-level migration: legacy TSM files -> a VShard-pure file in this shard's
-// tsm dir at the migrated floor (Task 6 lifecycle wiring).
-TEST_F(EngineSeastarTest, MigrateVShardViaEngine) {
-    seastar::thread([] {
-        fs::remove_all("legacy_src");
-        fs::create_directories("legacy_src");
-        const std::string key = "leg,host=h1 v";
-        const auto s = SeriesId128::fromSeriesKey(key);
-        const timestar::VShardId vshard{timestar::virtualShard(s)};
-        {
-            TSMWriter w("legacy_src/00_0000000000.tsm");
-            std::vector<uint64_t> ts = {100, 200};
-            std::vector<double> vs = {1.0, 2.0};
-            w.writeSeries(TSMValueType::Float, s, ts, vs);
-            w.writeIndex();
-            w.close();
-        }
-
-        ScopedEngine eng;
-        eng.init();
-        const size_t n =
-            eng->migrateVShard(vshard, {std::string("legacy_src/00_0000000000.tsm")}, "09_0000000000.tsm").get();
-        EXPECT_EQ(n, 1u);
-
-        // The migrated file lands in the engine's tsm dir at the migrated floor.
-        auto out = seastar::make_shared<::TSM>("shard_0/tsm/09_0000000000.tsm");
-        out->open().get();
-        out->readSparseIndex().get();
-        EXPECT_EQ(out->maxRevision(), 0u) << "migrated data sits at the migrated floor";
-        TSMResult<double> r(0);
-        out->readSeries<double>(s, 0, UINT64_MAX, r).get();
-        auto [rts, rvs] = r.getAllData();
-        EXPECT_EQ(rts, (std::vector<uint64_t>{100, 200}));
-        EXPECT_EQ(rvs, (std::vector<double>{1.0, 2.0}));
-        out->close().get();
-        fs::remove_all("legacy_src");
-    })
-        .join()
-        .get();
-}
-
-// Engine-level VShard-partitioned compaction: flushed data repartitioned into
-// VShard-pure files (Task 4c lifecycle wiring).
-TEST_F(EngineSeastarTest, RepartitionByVShardViaEngine) {
-    seastar::thread([] {
-        ScopedEngine eng;
-        eng.init();
-
-        for (const char* host : {"a", "b", "c"}) {
-            TimeStarInsert<double> ins("part", "value");
-            ins.addTag("host", host);
-            ins.addValue(1000, 1.0);
-            ins.addValue(2000, 2.0);
-            eng->insert(std::move(ins)).get();
-        }
-        eng->rolloverMemoryStore().get();
-        for (int i = 0; i < 300 && eng->getTSMFileCount() == 0; ++i)
-            seastar::sleep(std::chrono::milliseconds(100)).get();
-        ASSERT_GT(eng->getTSMFileCount(), 0u);
-
-        auto parts = eng->repartitionByVShard().get();
-        EXPECT_FALSE(parts.empty()) << "repartition must produce at least one VShard-pure file";
-        for (const auto& [vs, path] : parts) {
-            auto tsm = seastar::make_shared<::TSM>(path);
-            tsm->open().get();
-            tsm->readSparseIndex().get();
-            for (const auto& sid : tsm->getSeriesIds())
-                EXPECT_EQ(timestar::virtualShard(sid), vs.value()) << "partition output must be VShard-pure";
-            tsm->close().get();
-        }
     })
         .join()
         .get();

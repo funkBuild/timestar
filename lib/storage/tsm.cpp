@@ -232,8 +232,7 @@ static size_t decodeBoolBlockIntoAggregator(const uint8_t* data, uint32_t blockS
 // not count them (canonical: NaN = missing data — docs/nan_policy.md). The
 // index blockCount is the block's non-NaN count; when it disagrees with the
 // header's total point count, NaN is present and the values must be decoded
-// so the fold can skip it. Legacy files (blockCount written pre-NaN-fix as
-// the raw total) never mismatch and keep the fast timestamp-only path.
+// so the fold can skip it.
 static size_t decodeBlockCountOnly(const uint8_t* data, uint32_t blockSize, uint64_t startTime, uint64_t endTime,
                                    timestar::BlockAggregator& aggregator, TSMValueType seriesType,
                                    uint32_t statsValidCount) {
@@ -462,9 +461,8 @@ seastar::future<> TSM::readSparseIndex() {
             if (seriesType == TSMValueType::Float) {
                 std::memcpy(&firstValue, indexSlice.data + blockStart + 64, sizeof(double));
                 std::memcpy(&latestValue, indexSlice.data + lastBlockStart + 72, sizeof(double));
-                // NaN endpoints mark NaN-carrying blocks (writer sentinel, or
-                // legacy blocks whose real endpoints were NaN): first/latest
-                // shortcuts must decode instead (see parseIndexBlocksFromSlice).
+                // NaN endpoints mark NaN-carrying blocks: first/latest shortcuts
+                // must decode instead (see parseIndexBlocksFromSlice).
                 hasExtStats = !std::isnan(firstValue) && !std::isnan(latestValue);
             }
             // Integer: first/latest as int64 at offset 56 and 64 within block
@@ -611,9 +609,8 @@ void TSM::parseIndexBlocksFromSlice(Slice& indexSlice, TSMIndexEntry& entry, uin
             block.blockLatestValue = indexSlice.read<double>();
             // Extended stats are unusable when the endpoint values are NaN:
             // the writer stores NaN first/latest sentinels for NaN-carrying
-            // blocks (LATEST/FIRST/STDDEV must decode and skip per value),
-            // and legacy files whose block endpoints were genuinely NaN are
-            // caught by the same predicate. See docs/nan_policy.md.
+            // blocks (LATEST/FIRST/STDDEV must decode and skip per value).
+            // See docs/nan_policy.md.
             block.hasExtendedStats = !std::isnan(block.blockFirstValue) && !std::isnan(block.blockLatestValue);
         } else {
             if (entry.seriesType == TSMValueType::Integer) {

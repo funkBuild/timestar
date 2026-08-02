@@ -205,7 +205,7 @@ void InMemorySeries<T>::insert(TimeStarInsert<T>&& insertRequest) {
     values.insert(values.end(), std::make_move_iterator(insertRequest.values.begin()),
                   std::make_move_iterator(insertRequest.values.end()));
     if (trackRev) {
-        // Backfill the migrated-floor 0 for pre-existing points if the series was
+        // Backfill the untracked floor 0 for pre-existing points if the series was
         // previously untracked (a transition), so revisions stays parallel.
         if (revisions.empty() && oldSize > 0)
             revisions.assign(oldSize, 0);

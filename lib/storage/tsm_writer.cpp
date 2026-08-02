@@ -284,10 +284,8 @@ void TSMWriter::writeBlock(TSMValueType seriesType, [[maybe_unused]] const Serie
         // FloatEncoder::encode() -> CompressedBuffer, which itself calls encodeInto
         // into a temporary AlignedBuffer and then copies word-by-word into the
         // CompressedBuffer, which buffer.write() then copies a third time. encodeInto
-        // writes once. We then zero-pad to an 8-byte boundary so the on-disk value
-        // region stays byte-identical to the old CompressedBuffer (vector<uint64_t>)
-        // layout — preserving format compatibility and the zero-copy CompressedSlice
-        // word-read invariant on decode.
+        // writes once. We then zero-pad to an 8-byte boundary to preserve the
+        // zero-copy CompressedSlice word-read invariant on decode.
         size_t beforeSize = buffer.size();
         FloatEncoder::encodeInto(values, buffer);
         size_t pad = (8 - ((buffer.size() - beforeSize) % 8)) % 8;

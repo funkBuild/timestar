@@ -48,7 +48,6 @@ struct SSTableMetadata {
     std::string maxKey;
     int level = 0;
     uint64_t writeTimestamp = 0;  // Wall-clock nanoseconds when SSTable was created
-    uint32_t formatVersion = 0;   // Reader-only; not serialized in the manifest
 };
 
 struct IndexEntry {

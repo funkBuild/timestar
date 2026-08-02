@@ -21,7 +21,7 @@ namespace {
 
 // Resolve one series' LWW view across `files` (oldest-first) into (ts, values),
 // accumulate the union of its input block revision ranges, and STREAM it to the
-// output with that range stamped -- preserving revisions (vs migration's floor).
+// output with that range stamped.
 template <class T>
 seastar::future<bool> compactSeries(TSMValueType type, const SeriesId128& seriesId,
                                     const std::vector<seastar::shared_ptr<::TSM>>& files, TSMWriter& writer) {
@@ -36,7 +36,7 @@ seastar::future<bool> compactSeries(TSMValueType type, const SeriesId128& series
             for (const auto& block : entry->indexBlocks)
                 range.merge(RevisionRange{block.blockMinRev, block.blockMaxRev, /*empty=*/false});
         }
-        // Merge the points (last write wins; see snapshot read / migration).
+        // Merge the points (last write wins; see snapshot reads).
         // Snapshot/partition materialisation must resolve tombstone sidecars
         // into the output. readSeries() returns raw points and silently
         // resurrects deletes when the sidecar is not shipped.

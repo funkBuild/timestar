@@ -54,8 +54,8 @@ seastar::future<> testResolvedViewIsNewestWins(std::string dir) {
     const timestar::VShardId vshard{timestar::virtualShard(series)};
 
     seastar::shared_ptr<::TSM> older, newer;
-    co_await writeFloatFile(dir + "/00_0000000000.tsm", 0, key, {100, 200}, {1.0, 2.0}, older);
-    co_await writeFloatFile(dir + "/00_0000000001.tsm", 1, key, {200, 300}, {22.0, 3.0}, newer);
+    co_await writeFloatFile(dir + "/0_0.tsm", 0, key, {100, 200}, {1.0, 2.0}, older);
+    co_await writeFloatFile(dir + "/0_1.tsm", 1, key, {200, 300}, {22.0, 3.0}, newer);
 
     timestar::VShardSnapshotBuilder builder(vshard);
     // Pass files in the "wrong" (oldest-first) order to prove the reader sorts.
@@ -87,7 +87,7 @@ seastar::future<> testIntraFileDuplicateKeepsLast(std::string dir) {
     // One file whose series has a duplicate at ts 200: the later position (9.0)
     // is the newer write and must win.
     seastar::shared_ptr<::TSM> file;
-    co_await writeFloatFile(dir + "/00_0000000000.tsm", 0, key, {100, 200, 200, 300}, {1.0, 5.0, 9.0, 3.0}, file);
+    co_await writeFloatFile(dir + "/0_0.tsm", 0, key, {100, 200, 200, 300}, {1.0, 5.0, 9.0, 3.0}, file);
 
     timestar::VShardSnapshotBuilder builder(vshard);
     co_await timestar::feedVShardResolvedView(vshard, {file}, builder);
@@ -114,8 +114,8 @@ seastar::future<> testVerifyRoundTrip(std::string dir) {
     const timestar::VShardId vshard{timestar::virtualShard(series)};
 
     seastar::shared_ptr<::TSM> f0, f1;
-    co_await writeFloatFile(dir + "/00_0000000000.tsm", 0, key, {100, 200}, {1.0, 2.0}, f0);
-    co_await writeFloatFile(dir + "/00_0000000001.tsm", 1, key, {200, 300}, {22.0, 3.0}, f1);
+    co_await writeFloatFile(dir + "/0_0.tsm", 0, key, {100, 200}, {1.0, 2.0}, f0);
+    co_await writeFloatFile(dir + "/0_1.tsm", 1, key, {200, 300}, {22.0, 3.0}, f1);
     std::vector<seastar::shared_ptr<::TSM>> files = {f0, f1};
 
     // Create the snapshot manifest from these files.

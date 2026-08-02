@@ -72,8 +72,7 @@ public:
     // Build a TSM file that holds exactly one float series.
     seastar::shared_ptr<TSM> makeFloatFile(uint64_t tier, uint64_t seqNum, const std::string& seriesKey,
                                            const std::vector<uint64_t>& timestamps, const std::vector<double>& values) {
-        char filename[256];
-        snprintf(filename, sizeof(filename), "shard_0/tsm/%02lu_%010lu.tsm", tier, seqNum);
+        const std::string filename = "shard_0/tsm/" + std::to_string(tier) + "_" + std::to_string(seqNum) + ".tsm";
 
         TSMWriter writer(filename);
         SeriesId128 sid = SeriesId128::fromSeriesKey(seriesKey);
@@ -165,8 +164,8 @@ SEASTAR_TEST_F(CompactionRetentionTest, OldDataDroppedAfterCompaction) {
     auto compactedSize = fs::file_size(compactedPath);
 
     // Each source file has 3 data-points; the compacted file must be far smaller.
-    auto sourceSize0 = fs::file_size("shard_0/tsm/00_0000000000.tsm");
-    auto sourceSize1 = fs::file_size("shard_0/tsm/00_0000000001.tsm");
+    auto sourceSize0 = fs::file_size("shard_0/tsm/0_0.tsm");
+    auto sourceSize1 = fs::file_size("shard_0/tsm/0_1.tsm");
     EXPECT_LT(compactedSize, sourceSize0) << "Compacted file should be much smaller than source file 0 "
                                           << "(all data was expired)";
     EXPECT_LT(compactedSize, sourceSize1) << "Compacted file should be much smaller than source file 1 "
@@ -405,14 +404,14 @@ SEASTAR_TEST_F(CompactionRetentionTest, RetentionAppliedOnlyToTargetMeasurement)
     // File 0: old data for both series A and B.
     {
         std::vector<uint64_t> ts_old = {twoDaysAgo, twoDaysAgo + 1'000'000'000ULL};
-        TSMWriter writer0("shard_0/tsm/00_0000000000.tsm");
+        TSMWriter writer0("shard_0/tsm/0_0.tsm");
         writer0.writeSeries(TSMValueType::Float, sid_a, ts_old, std::vector<double>{10.0, 11.0});
         writer0.writeSeries(TSMValueType::Float, sid_b, ts_old, std::vector<double>{200.0, 201.0});
         writer0.writeIndex();
         writer0.close();
     }
 
-    auto f0 = seastar::make_shared<TSM>("shard_0/tsm/00_0000000000.tsm");
+    auto f0 = seastar::make_shared<TSM>("shard_0/tsm/0_0.tsm");
     f0->tierNum = 0;
     f0->seqNum = 0;
     co_await f0->open();
@@ -421,14 +420,14 @@ SEASTAR_TEST_F(CompactionRetentionTest, RetentionAppliedOnlyToTargetMeasurement)
     // File 1: recent data for both series.
     {
         std::vector<uint64_t> ts_new = {oneHourAgo, oneHourAgo + 1'000'000'000ULL};
-        TSMWriter writer1("shard_0/tsm/00_0000000001.tsm");
+        TSMWriter writer1("shard_0/tsm/0_1.tsm");
         writer1.writeSeries(TSMValueType::Float, sid_a, ts_new, std::vector<double>{50.0, 51.0});
         writer1.writeSeries(TSMValueType::Float, sid_b, ts_new, std::vector<double>{300.0, 301.0});
         writer1.writeIndex();
         writer1.close();
     }
 
-    auto f1 = seastar::make_shared<TSM>("shard_0/tsm/00_0000000001.tsm");
+    auto f1 = seastar::make_shared<TSM>("shard_0/tsm/0_1.tsm");
     f1->tierNum = 0;
     f1->seqNum = 1;
     co_await f1->open();

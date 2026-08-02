@@ -88,7 +88,7 @@ available failure domains cannot satisfy.
 
 | Storage nodes | Voting replicas | Majority | One-node write availability | Capacity/throughput effect |
 | ---: | ---: | ---: | --- | --- |
-| 1 | 1 | 1 | No | Single-node development or migration mode |
+| 1 | 1 | 1 | No | Single-node development mode |
 | 2 | transitional | — | No | Never a supported target: only a passing state while growing 1 -> 3 |
 | 3 | 3 | 2 | Yes | First HA topology; each node holds nearly all logical data |
 | 4+ | 3 | 2 | Yes | Usable storage and aggregate throughput grow with each node |
@@ -523,9 +523,8 @@ physical partitioning:
   materialize the LWW winner, steady-state blocks store only a per-block
   `[minRev, maxRev]` range in the index entry, and a per-point revision
   column exists only in tier-0 blocks that may hold intra-file duplicates.
-  Read-path merge compares revisions where ranges overlap. Migrated
-  pre-cluster data is emitted at reserved revision 0; replicated writes start
-  at revision 1.
+  Read-path merge compares revisions where ranges overlap. Revision 0 is the
+  untracked single-node floor; replicated writes start at revision 1.
 - Compaction may run independently on replicas but must preserve logical
   revisions and expose logical time-block hashes for anti-entropy.
 - A snapshot pins its referenced manifest objects until all consumers release
@@ -540,33 +539,12 @@ physical partitioning:
   `(series, range, creating revision)`. Legacy per-TSM sidecar tombstone
   files are migration input only and are never written inside `vshards/`.
 
-### Migration from `shard_N`
+### Retired `shard_N` layouts
 
-Migration is an offline, exclusive operation under the existing root lock:
-the server is stopped, no catch-up pass exists, and a multi-terabyte node is
-down for the rewrite duration. Free space of at least the old generation's
-size plus configured slack is verified before any write; otherwise migration
-fails closed. The on-disk migration tool must:
-
-1. Read existing core-owned WAL, NativeIndex, TSM, and tombstones together.
-2. Recover the full series catalog before discarding any old index.
-3. Partition output by VShard and write a complete generation to staging.
-4. Verify counts, time bounds, logical hashes, and representative queries.
-5. Atomically select the new format generation.
-6. Preserve the old generation until a successful restart and grace period.
-
-Crash recovery must choose one complete generation; it must never combine a
-partially migrated index with old TSM data.
-
-Two source anomalies need explicit policy. Series present in data but absent
-from every index source (possible today: index and data WAL have independent
-durability clocks, and deletes remove index entries before compaction removes
-data) are exported to a quarantine catalog with synthetic identity, counted,
-and reconciled in verification — never silently dropped. A series found in
-more than one `shard_N` directory has incomparable local dataSeq values;
-migration resolves LWW within one source directory only and fails closed on
-cross-directory duplicates unless the operator selects a documented
-directory-precedence rule.
+There is no old-layout migration path. Startup recognizes retired development
+artifacts only to reject them before mutation. Operators must recreate
+greenfield data in the current v1 layout; no compatibility reader or rewrite
+tool is shipped.
 
 ## Write path
 

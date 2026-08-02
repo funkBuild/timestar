@@ -5,7 +5,7 @@
 namespace {
 
 using timestar::kFirstAssignedRevision;
-using timestar::kMigratedRevision;
+using timestar::kUntrackedRevision;
 using timestar::lwwWinnerRevision;
 using timestar::overlaps;
 using timestar::RangeWinner;
@@ -13,10 +13,10 @@ using timestar::rangeWinner;
 using timestar::RevisionRange;
 
 TEST(PointRevisionTest, ReservedFloorAndLwwWinner) {
-    EXPECT_EQ(kMigratedRevision, 0u);
+    EXPECT_EQ(kUntrackedRevision, 0u);
     EXPECT_EQ(kFirstAssignedRevision, 1u);
-    // Any assigned write beats migrated data at the same point.
-    EXPECT_EQ(lwwWinnerRevision(kMigratedRevision, kFirstAssignedRevision), kFirstAssignedRevision);
+    // Any assigned write beats untracked data at the same point.
+    EXPECT_EQ(lwwWinnerRevision(kUntrackedRevision, kFirstAssignedRevision), kFirstAssignedRevision);
     EXPECT_EQ(lwwWinnerRevision(5, 9), 9u);
     EXPECT_EQ(lwwWinnerRevision(9, 5), 9u);
     EXPECT_EQ(lwwWinnerRevision(7, 7), 7u);  // same write, either answer identical
@@ -78,11 +78,11 @@ TEST(PointRevisionTest, RangeWinnerDisjointResolvesWithoutPerPoint) {
     EXPECT_EQ(rangeWinner(high, low), RangeWinner::A);  // A strictly above
     EXPECT_EQ(rangeWinner(low, high), RangeWinner::B);  // B strictly above
 
-    // Migrated block [0,0] loses outright to any assigned block.
-    RevisionRange migrated{0, 0, false};
+    // An untracked block [0,0] loses outright to any assigned block.
+    RevisionRange untracked{0, 0, false};
     RevisionRange assigned{1, 100, false};
-    EXPECT_EQ(rangeWinner(assigned, migrated), RangeWinner::A);
-    EXPECT_EQ(rangeWinner(migrated, assigned), RangeWinner::B);
+    EXPECT_EQ(rangeWinner(assigned, untracked), RangeWinner::A);
+    EXPECT_EQ(rangeWinner(untracked, assigned), RangeWinner::B);
 }
 
 TEST(PointRevisionTest, RangeWinnerOverlapFallsBackToPerPoint) {

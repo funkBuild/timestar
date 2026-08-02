@@ -71,7 +71,7 @@ TEST(MemoryStoreRevisionTest, UntrackedThenTrackedBackfillsFloor) {
     s.insert(makeInsert({10, 20}, {1.0, 2.0}));  // untracked
     s.insert(makeInsert({30}, {3.0}, {7}));      // now tracked
     ASSERT_EQ(s.revisions.size(), 3u);
-    EXPECT_EQ(s.revisions, (std::vector<uint64_t>{0, 0, 7})) << "pre-existing points backfilled to migrated floor";
+    EXPECT_EQ(s.revisions, (std::vector<uint64_t>{0, 0, 7})) << "pre-existing points backfilled to untracked floor";
 }
 
 TEST(MemoryStoreRevisionTest, TrackedThenUntrackedIncomingIsFloor) {

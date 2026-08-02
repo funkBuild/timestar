@@ -153,20 +153,12 @@ while unrelated VShards remain logically untouched — their verification
 hashes and manifests unchanged, with shared tier-0 segment and multiplexed
 index bytes exempt from byte-identity.
 
-### Task 6: shard_N to VShard migration tool
+### Retired Task 6: shard_N migration
 
-Epic-sized and dependent on the Task 4 format; scheduled here so finishing
-Task 4 does not falsely close the epic. (Task numbering is kept from the
-earlier revision so parent-plan references stay valid; Tasks 2, 3, and 5 of
-that revision are dissolved.) Offline and exclusive under the root lock, with
-the free-space precondition, orphan-series quarantine policy, and
-cross-directory dataSeq fail-closed rule from the parent plan's migration
-section. Verification replays representative queries and compares the
-whole-snapshot verification hash.
-
-Gate: crash injection at every step chooses one complete generation; the old
-generation is preserved through a restart and grace period; orphaned series
-are quarantined and counted, never silently dropped.
+The migration tool was removed by the greenfield v1 reset. A root containing
+the retired `shard_N` layout fails before mutation; development data must be
+recreated in the current v1 layout. There is no compatibility reader, offline
+rewriter, migrated generation, or migration-only test suite to maintain.
 
 ## Boundary with multi-machine replication
 

@@ -690,11 +690,9 @@ SEASTAR_TEST_F(SSTableTest, V1MetadataBindsCanonicalFileIdentity) {
     writer.add("key", "value");
     const auto writtenMetadata = co_await writer.finish();
     EXPECT_EQ(writtenMetadata.fileNumber, 123u);
-    EXPECT_EQ(writtenMetadata.formatVersion, SSTABLE_VERSION);
 
     auto reader = co_await SSTableReader::open(path);
     EXPECT_EQ(reader->metadata().fileNumber, 123u);
-    EXPECT_EQ(reader->metadata().formatVersion, SSTABLE_VERSION);
     co_await reader->close();
 }
 

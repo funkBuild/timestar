@@ -4,17 +4,17 @@
 
 namespace timestar {
 
-// Pre-Raft point revisions and the block revision-range primitives that drive
+// Point revisions and the block revision-range primitives that drive
 // last-write-wins across VShard-partitioned storage (ADR 0003 sec 1/4/5).
 //
 // A point revision is a per-VShard monotonic u64 = the vshard_seq of the journal
 // record that carried the write (Phase 1); the Raft log index later (Phase 2).
 // LWW winner at a given (series, timestamp) is the HIGHEST revision. Revision 0
-// is reserved for migrated pre-cluster data (the global floor): any replicated
-// write (revision >= 1) beats migrated data at the same point.
+// is the global floor for current single-node writes that do not track revisions:
+// any replicated write (revision >= 1) beats untracked data at the same point.
 
-// Revision reserved for data migrated from the pre-cluster shard_N layout.
-inline constexpr uint64_t kMigratedRevision = 0;
+// Revision used when the current write path is not assigning revisions.
+inline constexpr uint64_t kUntrackedRevision = 0;
 // The first revision a VShard assigns to an accepted write.
 inline constexpr uint64_t kFirstAssignedRevision = 1;
 

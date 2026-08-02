@@ -206,8 +206,6 @@ public:
     // compaction) rather than leaving an operator to guess.
     const std::string& getFilePath() const { return filePath; }
 
-    uint8_t fileFormatVersion() const { return TSM_VERSION; }
-
     // File-level max revision. Read from the
     // trailer during readSparseIndex() so startup can restore a revision counter
     // above all flushed data without loading every index entry (ADR 0003).
@@ -348,8 +346,8 @@ public:
     // TSMFileManager::reserveSequenceId().
     // Compaction outputs: max(dataSeq) of the inputs, carried in the filename
     // as a `_d<N>` suffix — a fresh seqNum would wrongly outrank newer
-    // tier-0 files whose data was written later.  Legacy files without the
-    // suffix fall back to seqNum.
+    // tier-0 files whose data was written later. Files without the optional
+    // suffix use seqNum.
     uint64_t dataSeq;
 
     TSM(std::string _absoluteFilePath);
@@ -519,9 +517,7 @@ public:
     // Get tombstone manager (for compaction)
     timestar::TSMTombstone* getTombstones() { return tombstones.get(); }
     bool hasTombstones() const { return tombstones && tombstones->getEntryCount() > 0; }
-    uint64_t tombstoneGeneration() const noexcept {
-        return tombstones ? tombstones->mutationGeneration() : 0;
-    }
+    uint64_t tombstoneGeneration() const noexcept { return tombstones ? tombstones->mutationGeneration() : 0; }
 
     // Pushdown aggregation: decode blocks and fold directly into BlockAggregator
     // instead of materialising TSMResult. Returns the number of points aggregated.

@@ -50,7 +50,7 @@ public:
     std::vector<uint64_t> timestamps;
     std::vector<T> values;
     // Optional per-point replicated revision (ADR 0003), parallel to `values`.
-    // Empty means untracked (revision = migrated-floor 0); when non-empty it must
+    // Empty means untracked (revision floor 0); when non-empty it must
     // match values.size(). The Engine assigns these from the journal sequence.
     std::vector<uint64_t> revisions;
 

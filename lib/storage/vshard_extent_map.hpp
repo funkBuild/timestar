@@ -23,8 +23,8 @@ struct VShardExtent {
 
 // Per-core "VShard extents in the tier-0 manifest" (Task 4c): the set of TSM
 // files covering each VShard, with per-VShard revision ranges. It is the
-// metadata a VShard snapshot (Task 4d) and the offline migration (Task 6) read
-// to find exactly which files hold a VShard's data without scanning every file.
+// metadata a VShard snapshot (Task 4d) reads to find exactly which files hold a
+// VShard's data without scanning every file.
 //
 // Because tier-0 TSM files are (for now) multiplexed across VShards, one file
 // appears as an extent under every VShard whose series it contains. Extraction

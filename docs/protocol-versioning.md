@@ -48,6 +48,8 @@ tails.
 NativeIndex v1 uses local-ID forward mappings, roaring postings, and per-value
 tag markers directly. It has no pre-bitmap migration or tag-value blob reader;
 series metadata without the atomically persisted local-ID counter fails closed.
+The retired `shard_N` migration planner and rewriter are not shipped. Startup
+recognizes those development roots only to reject them before mutation.
 
 ## Rules while greenfield
 

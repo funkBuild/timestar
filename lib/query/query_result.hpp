@@ -119,9 +119,8 @@ public:
 
     // Take the LAST value of the source's run at its current timestamp and
     // advance past the run.  Within one file, a later position is a later
-    // write (append order), so the last copy is the newest — last-write-wins
-    // for legacy intra-file duplicates.  Files written after ingest dedup
-    // never contain such runs, so the loop body normally runs zero times.
+    // write (append order), so the last copy is the newest. Current ingest
+    // deduplicates these runs, but readers remain deterministic defensively.
     static T takeLastOfRun(TSMIterationState& state, std::vector<TSMResult<T>>& tsmResults) {
         const uint64_t ts = state.currentTimestamp;
         T value = state.block->valueAt(state.blockOffset);
@@ -132,8 +131,8 @@ public:
     }
 
     // In-place collapse of equal-timestamp runs keeping the LAST value
-    // (last-write-wins for legacy intra-file duplicates).  Used by the
-    // single-source concatenation paths, which bypass the merge loops.
+    // (last-write-wins). Used by single-source concatenation paths, which
+    // bypass the merge loops.
     void dedupAdjacentKeepLast() {
         const size_t n = timestamps.size();
         if (n < 2)
@@ -158,7 +157,7 @@ public:
     }
 
     // Single-source fast path: concatenate all blocks' data directly, then
-    // collapse legacy equal-timestamp runs (keep-last).
+    // collapse equal-timestamp runs (keep-last).
     void mergeSingleSource(TSMIterationState& state, std::vector<TSMResult<T>>& tsmResults) {
         auto& result = tsmResults[state.tsmResultIndex];
         for (size_t b = 0;; ++b) {

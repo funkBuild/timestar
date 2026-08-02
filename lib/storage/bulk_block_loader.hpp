@@ -243,9 +243,8 @@ struct BulkMergeContext {
 
     // Take the LAST value of the run of points at the current timestamp and
     // advance past the whole run.  Within one file, a later position is a
-    // later write (append order), so the last copy is the newest —
-    // last-write-wins for legacy intra-file duplicates.  Files written after
-    // ingest dedup never contain such runs, so this loop runs once.
+    // later write (append order), so the last copy is the newest. Current
+    // ingest deduplicates these runs, but this stays deterministic defensively.
     T takeLastAtCurrentTs() {
         const uint64_t ts = currentTimestamp();
         T value = currentValue();

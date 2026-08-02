@@ -72,8 +72,7 @@ public:
     // data points starting at `startTime` with a stride of 1000 ns.
     seastar::shared_ptr<TSM> createTestTSMFile(uint64_t tier, uint64_t seqNum, const std::string& seriesPrefix,
                                                int numSeries, int pointsPerSeries, uint64_t startTime = 1000000) {
-        char filename[256];
-        snprintf(filename, sizeof(filename), "shard_0/tsm/%02lu_%010lu.tsm", tier, seqNum);
+        const std::string filename = "shard_0/tsm/" + std::to_string(tier) + "_" + std::to_string(seqNum) + ".tsm";
 
         TSMWriter writer(filename);
 
@@ -105,8 +104,7 @@ public:
     seastar::shared_ptr<TSM> createTestTSMFileExplicit(uint64_t tier, uint64_t seqNum, const std::string& seriesKey,
                                                        const std::vector<uint64_t>& timestamps,
                                                        const std::vector<double>& values) {
-        char filename[256];
-        snprintf(filename, sizeof(filename), "shard_0/tsm/%02lu_%010lu.tsm", tier, seqNum);
+        const std::string filename = "shard_0/tsm/" + std::to_string(tier) + "_" + std::to_string(seqNum) + ".tsm";
 
         TSMWriter writer(filename);
         SeriesId128 seriesId = SeriesId128::fromSeriesKey(seriesKey);
@@ -320,8 +318,7 @@ SEASTAR_TEST_F(TSMCompactorAsyncTest, TombstoneIntegrationDuringCompaction) {
     std::vector<seastar::shared_ptr<TSM>> files;
 
     for (int f = 0; f < 2; f++) {
-        char filename[256];
-        snprintf(filename, sizeof(filename), "shard_0/tsm/00_%010d.tsm", f);
+        const std::string filename = "shard_0/tsm/0_" + std::to_string(f) + ".tsm";
 
         TSMWriter writer(filename);
         std::vector<uint64_t> ts;
@@ -462,8 +459,7 @@ SEASTAR_TEST_F(TSMCompactorAsyncTest, DataIntegrityAfterCompaction) {
     std::vector<FileSpec> specs = {{1000, 5000, 10.0}, {3000, 7000, 130.0}, {5000, 9000, 250.0}, {7000, 11000, 370.0}};
 
     for (int f = 0; f < 4; f++) {
-        char filename[256];
-        snprintf(filename, sizeof(filename), "shard_0/tsm/00_%010d.tsm", f);
+        const std::string filename = "shard_0/tsm/0_" + std::to_string(f) + ".tsm";
 
         TSMWriter writer(filename);
         std::vector<uint64_t> ts;
@@ -547,8 +543,7 @@ SEASTAR_TEST_F(TSMCompactorAsyncTest, MixedDataTypeCompaction) {
     std::vector<seastar::shared_ptr<TSM>> files;
 
     for (int i = 0; i < 3; i++) {
-        char filename[256];
-        snprintf(filename, sizeof(filename), "shard_0/tsm/00_%010d.tsm", i);
+        const std::string filename = "shard_0/tsm/0_" + std::to_string(i) + ".tsm";
 
         TSMWriter writer(filename);
 
@@ -689,8 +684,7 @@ SEASTAR_TEST_F(TSMCompactorAsyncTest, TombstoneMultipleFilesCompaction) {
     std::vector<seastar::shared_ptr<TSM>> files;
 
     for (int f = 0; f < 2; f++) {
-        char filename[256];
-        snprintf(filename, sizeof(filename), "shard_0/tsm/00_%010d.tsm", f);
+        const std::string filename = "shard_0/tsm/0_" + std::to_string(f) + ".tsm";
 
         TSMWriter writer(filename);
         std::vector<uint64_t> ts = {1000, 2000, 3000, 4000, 5000};
@@ -864,8 +858,7 @@ SEASTAR_TEST_F(TSMCompactorAsyncTest, CompactionStatisticsTracking) {
     std::vector<seastar::shared_ptr<TSM>> files;
 
     for (int i = 0; i < 3; i++) {
-        char filename[256];
-        snprintf(filename, sizeof(filename), "shard_0/tsm/00_%010d.tsm", i);
+        const std::string filename = "shard_0/tsm/0_" + std::to_string(i) + ".tsm";
 
         TSMWriter writer(filename);
         std::vector<uint64_t> ts;
@@ -891,7 +884,7 @@ SEASTAR_TEST_F(TSMCompactorAsyncTest, CompactionStatisticsTracking) {
     plan.sourceFiles = files;
     plan.targetTier = 1;
     plan.targetSeqNum = 100;
-    plan.targetPath = "shard_0/tsm/01_0000000100.tsm";
+    plan.targetPath = "shard_0/tsm/1_100.tsm";
 
     auto stats = co_await self->compactor->executeCompaction(plan);
 

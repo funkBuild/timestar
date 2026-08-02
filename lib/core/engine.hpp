@@ -276,19 +276,6 @@ public:
     seastar::future<bool> installVShardSnapshotCatalog(timestar::VShardId vshard, std::string catalog,
                                                        std::string expectedHash);
 
-    // Migrate a VShard's data from legacy `sourcePaths` into a VShard-pure file
-    // `outputName` in this shard's tsm dir at the migrated floor (Task 6). Returns
-    // the number of series written.
-    seastar::future<size_t> migrateVShard(timestar::VShardId vshard, std::vector<std::string> sourcePaths,
-                                          std::string outputName);
-
-    // VShard-partitioned compaction of this shard's flushed TSM files (Task 4c):
-    // repartition them into one VShard-pure file per VShard (tier 9,
-    // seq=vshard), PRESERVING revision ranges. Returns (vshard, path) for each
-    // file written. Offline operation (does not register the outputs with the
-    // running compaction loop; that lifecycle wiring is a separate step).
-    seastar::future<std::vector<std::pair<timestar::VShardId, std::string>>> repartitionByVShard();
-
     // Enable/disable per-point replicated revision assignment (cluster LWW).
     // Off by default; the server turns it on when cluster mode is configured.
     void setRevisionAssignment(bool on) { assignRevisions_ = on; }

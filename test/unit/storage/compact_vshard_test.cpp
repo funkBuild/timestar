@@ -51,12 +51,12 @@ seastar::future<> testCompactPreservesRevisionRange(std::string dir) {
 
     std::vector<uint64_t> t0 = {100, 200}, r0 = {5, 6};
     std::vector<double> v0 = {1.0, 2.0};
-    auto f0 = co_await writeRevFile(dir + "/00_0000000000.tsm", 0, key, t0, v0, r0);
+    auto f0 = co_await writeRevFile(dir + "/0_0.tsm", 0, key, t0, v0, r0);
     std::vector<uint64_t> t1 = {200, 300}, r1 = {60, 61};
     std::vector<double> v1 = {22.0, 3.0};
-    auto f1 = co_await writeRevFile(dir + "/00_0000000001.tsm", 1, key, t1, v1, r1);
+    auto f1 = co_await writeRevFile(dir + "/0_1.tsm", 1, key, t1, v1, r1);
 
-    const std::string out = dir + "/01_0000000000.tsm";
+    const std::string out = dir + "/1_0.tsm";
     const size_t n = co_await timestar::compactVShardToFile(vshard, {f0, f1}, out);
     EXPECT_EQ(n, 1u);
     co_await f0->close();
@@ -65,7 +65,7 @@ seastar::future<> testCompactPreservesRevisionRange(std::string dir) {
     auto tsm = seastar::make_shared<::TSM>(out);
     co_await tsm->open();
     co_await tsm->readSparseIndex();
-    // Revisions PRESERVED (union max 61), unlike migration which floors to 0.
+    // Revisions are preserved; compaction must not replace them with the untracked floor.
     EXPECT_EQ(tsm->maxRevision(), 61u) << "compaction must preserve the revision range max";
     // LWW-resolved data (newest wins at ts 200).
     TSMResult<double> r(0);
@@ -91,18 +91,14 @@ seastar::future<> testPartitionByVShardIsPure(std::string dir) {
 
     std::vector<uint64_t> ta = {100}, ra = {5};
     std::vector<double> va = {1.0};
-    auto fA = co_await writeRevFile(dir + "/00_0000000000.tsm", 0, keyA, ta, va, ra);
+    auto fA = co_await writeRevFile(dir + "/0_0.tsm", 0, keyA, ta, va, ra);
     std::vector<uint64_t> tb = {100}, rb = {9};
     std::vector<double> vb = {2.0};
-    auto fB = co_await writeRevFile(dir + "/00_0000000001.tsm", 1, keyB, tb, vb, rb);
+    auto fB = co_await writeRevFile(dir + "/0_1.tsm", 1, keyB, tb, vb, rb);
 
     // Output files must follow the TSM tier_seq.tsm convention (use the vshard as
     // the sequence number, tier 9 to distinguish partitioned output).
-    auto pathFor = [&](timestar::VShardId vs) {
-        char name[64];
-        snprintf(name, sizeof(name), "/09_%010u.tsm", static_cast<unsigned>(vs.value()));
-        return dir + name;
-    };
+    auto pathFor = [&](timestar::VShardId vs) { return dir + "/9_" + std::to_string(vs.value()) + ".tsm"; };
     auto parts = co_await timestar::partitionByVShard({fA, fB}, pathFor);
     co_await fA->close();
     co_await fB->close();
