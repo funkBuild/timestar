@@ -148,10 +148,11 @@ public:
 
     // Remove every catalog row for `vshard` except the retained identities. The
     // primary metadata key, measurement-series key, durable value-type binding,
-    // and tag-postings memberships are published in one IndexWriteBatch. This is
-    // the destructive half of live snapshot catalog replacement: callers first
-    // validate the complete incoming catalog, invoke this method, then index that
-    // catalog while their external apply/read fence remains closed.
+    // tag-postings memberships, and per-day discovery memberships are published
+    // in one IndexWriteBatch. This is the destructive half of live snapshot
+    // catalog replacement: callers first validate the complete incoming catalog,
+    // invoke this method, then index that catalog while their external apply/read
+    // fence remains closed.
     //
     // Returns the identities that were removed so Engine can evict its own
     // value-type cache. Repeating the operation is a no-op.

@@ -18,6 +18,7 @@
 #include <seastar/core/thread.hh>
 #include <seastar/util/file.hh>
 #include <stdexcept>
+#include <tuple>
 #include <utility>
 
 namespace timestar::cluster {
@@ -419,9 +420,15 @@ seastar::future<bool> ReplicatedVShardHost::retireVShard(uint16_t vshard, uint64
         co_await state->second.operationGate->close();
     groupLifetime.reset();
 
-    // With no live replica, every record in this generation is dead. Publish the
-    // terminal floor before moving the files so observability and the shared GC
-    // rule cannot mistake a retired generation for a laggard.
+    // No apply can now reach the Engine. Replace this replica's storage with a
+    // durable empty generation before quarantining its journal: if storage
+    // cleanup fails, the still-active journal directory makes startup retry the
+    // same idempotent cleanup before it can finish retirement.
+    co_await store_.retireVShardData(VShardId{vshard});
+
+    // With no live replica, every journal record in this generation is dead.
+    // Publish the terminal floor before moving the files so observability and
+    // the shared GC rule cannot mistake a retired generation for a laggard.
     retention_.setReleased(VShardId{vshard}, std::numeric_limits<uint64_t>::max());
     if (state->second.writer)
         co_await state->second.writer->close();
@@ -517,10 +524,9 @@ seastar::future<size_t> ReplicatedVShardHost::recoverReplicaRetirements(control:
         throw std::runtime_error("cluster: replica-retirement recovery requires private v1 VShard journals");
     auto maintenance = co_await seastar::get_units(maintenanceLock_, 1);
     const fs::path retiredRoot = journalRoot_ / "retired";
-    auto recovered = co_await seastar::async([this, &map, retiredRoot] {
+    auto discovered = co_await seastar::async([this, &map, retiredRoot] {
         std::vector<fs::path> retired;
-        std::vector<std::pair<fs::path, uint16_t>> stale;
-        size_t moved = 0;
+        std::vector<std::tuple<fs::path, fs::path, uint16_t>> stale;
         fs::create_directories(retiredRoot);
         for (const auto& entry : fs::directory_iterator(journalRoot_)) {
             if (entry.is_symlink() || !entry.is_directory())
@@ -532,30 +538,44 @@ seastar::future<size_t> ReplicatedVShardHost::recoverReplicaRetirements(control:
             const bool placedHere =
                 placement != map.placement.end() &&
                 std::find(placement->second.begin(), placement->second.end(), self_) != placement->second.end();
-            if (!placedHere)
-                stale.emplace_back(entry.path(), *vshard);
-        }
-        for (const auto& [source, vshard] : stale) {
-            const fs::path destination =
-                retiredRoot / ("v1_vshard_" + std::to_string(vshard) + "_epoch_" + std::to_string(map.epoch));
-            if (fs::exists(destination))
-                throw std::runtime_error(
-                    "cluster: active and retired VShard journal generations collide during recovery");
-            fs::rename(source, destination);
-            ++moved;
+            if (!placedHere) {
+                const fs::path destination =
+                    retiredRoot / ("v1_vshard_" + std::to_string(*vshard) + "_epoch_" + std::to_string(map.epoch));
+                if (fs::exists(destination))
+                    throw std::runtime_error(
+                        "cluster: active and retired VShard journal generations collide during recovery");
+                stale.emplace_back(entry.path(), std::move(destination), *vshard);
+            }
         }
         for (const auto& entry : fs::directory_iterator(retiredRoot)) {
             if (!entry.is_symlink() && entry.is_directory() && retiredDirectoryName(entry.path().filename().string()))
                 retired.push_back(entry.path());
         }
-        return std::pair{moved, std::move(retired)};
+        return std::pair{std::move(stale), std::move(retired)};
+    });
+
+    // The active directory is the durable retry token for a crash-interrupted
+    // retirement. Do not rename it until the Engine's empty generation is
+    // durable; a crash at any earlier storage checkpoint leaves this exact work
+    // discoverable on the next startup.
+    for (const auto& [source, destination, vshard] : discovered.first) {
+        (void)source;
+        (void)destination;
+        co_await store_.retireVShardData(VShardId{vshard});
+    }
+    co_await seastar::async([&discovered] {
+        for (const auto& [source, destination, vshard] : discovered.first) {
+            (void)vshard;
+            fs::rename(source, destination);
+            discovered.second.push_back(destination);
+        }
     });
     co_await seastar::sync_directory(journalRoot_.string());
     co_await seastar::sync_directory(retiredRoot.string());
-    for (const auto& directory : recovered.second)
+    for (const auto& directory : discovered.second)
         co_await ensureRetiredJournalMarker(directory);
-    replicasRetired_ += recovered.first;
-    co_return recovered.first;
+    replicasRetired_ += discovered.first.size();
+    co_return discovered.first.size();
 }
 
 seastar::future<size_t> ReplicatedVShardHost::reclaimRetiredJournals(std::chrono::system_clock::time_point now) {

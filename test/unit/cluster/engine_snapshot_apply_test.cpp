@@ -380,8 +380,12 @@ TEST(EngineSnapshotApply, InvalidPreflightDoesNotMutateAndEmptySnapshotClearsOnl
                 floatSeriesOnVShard("snapshot_preflight_old", incoming.vshard, "old", 50'000, 50.0, 50);
             const auto foreign =
                 floatSeriesOnVShard("snapshot_preflight_foreign", foreignVShard, "foreign", 60'000, 60.0, 60);
+            const auto sharedTarget =
+                floatSeriesOnVShard("snapshot_shared_day", incoming.vshard, "target", 65'000, 65.0, 65);
+            const auto sharedForeign =
+                floatSeriesOnVShard("snapshot_shared_day", foreignVShard, "foreign", 66'000, 66.0, 66);
             data::WriteBatch batch;
-            batch.series = {oldTarget.write, foreign.write};
+            batch.series = {oldTarget.write, foreign.write, sharedTarget.write, sharedForeign.write};
             store.applyWrites(std::move(batch)).get();
 
             auto corrupt = incoming.payload;
@@ -396,9 +400,27 @@ TEST(EngineSnapshotApply, InvalidPreflightDoesNotMutateAndEmptySnapshotClearsOnl
             ASSERT_TRUE(store.installVShardSnapshot(incoming.vshard, emptySnapshot(incoming.vshard)).get());
             EXPECT_TRUE(readFloat(*dest, oldTarget).timestamps.empty());
             EXPECT_EQ(readFloat(*dest, foreign).values, (std::vector<double>{60.0, 61.0}));
+            EXPECT_TRUE(readFloat(*dest, sharedTarget).timestamps.empty());
+            EXPECT_EQ(readFloat(*dest, sharedForeign).values, (std::vector<double>{66.0, 67.0}));
             auto after = store.queryMetadata({data::MetadataKind::Measurements, "", "", ""}).get().items;
             EXPECT_EQ(std::find(after.begin(), after.end(), "snapshot_preflight_old"), after.end());
             EXPECT_NE(std::find(after.begin(), after.end(), "snapshot_preflight_foreign"), after.end());
+
+            // Removing one VShard must subtract its local IDs from shared
+            // (measurement, day) bitmaps. Leaving the stale membership would
+            // trip maxSeries=1 before metadata filtering even though exactly one
+            // live foreign identity remains.
+            const unsigned core = assignCore(incoming.vshard, seastar::smp::count);
+            auto dayScoped = (*dest)
+                                 .invoke_on(core,
+                                            [](Engine& engine) {
+                                                return engine.getIndex().findSeriesWithMetadataTimeScoped(
+                                                    "snapshot_shared_day", {}, {}, BASE, BASE + 1'000'000, 1);
+                                            })
+                                 .get();
+            ASSERT_TRUE(dayScoped.has_value());
+            ASSERT_EQ(dayScoped->size(), 1u);
+            EXPECT_EQ(dayScoped->front().seriesId, sharedForeign.id);
             EXPECT_TRUE(store.installVShardSnapshot(incoming.vshard, emptySnapshot(incoming.vshard)).get());
         }
 

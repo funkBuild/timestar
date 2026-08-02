@@ -88,16 +88,22 @@ inventory and rules.
 - [x] Retire a removed local data-group replica after committed serving-map
   cutover. The victim first proves its applied Raft configuration no longer
   contains this node, refuses new host operations, drains in-flight Raft work,
-  publishes a terminal reclaim floor, closes the writer, and atomically moves
-  the journal into an exact-v1, epoch-named quarantine. A durable marker starts
-  a fixed 24-hour grace period, after which the maintenance sweep deletes the
-  generation and publishes retirement/reclamation counters. Exact map replay is
-  idempotent; startup uses only the durable Group-0 serving map to finish crashes
-  before or after the quarantine rename and restarts the full grace period when
-  its marker was not durable. Pre-cutover movement destinations are protected
-  from being mistaken for obsolete replicas. Group-0 topology startup rejects
-  the optional shared-journal layout until it has an equally safe per-group
-  retirement generation protocol.
+  installs a durable empty Engine generation, publishes a terminal reclaim
+  floor, closes the writer, and atomically moves the journal into an exact-v1,
+  epoch-named quarantine. Empty-generation install quiesces the VShard WAL,
+  publishes durable memory and mixed-TSM fences, removes exact primary, type,
+  postings, and day-discovery index state, immediately unlinks VShard-pure TSM
+  objects, and leaves mixed-object bytes for the ordinary tombstone rewrite.
+  The active journal remains the retry token until Engine cleanup succeeds. A
+  durable marker then starts a fixed 24-hour grace period, after which the
+  maintenance sweep deletes the journal generation and publishes
+  retirement/reclamation counters. Exact map replay is idempotent; startup uses
+  only the durable Group-0 serving map to finish crashes before or after the
+  Engine transaction or quarantine rename and restarts the full grace period
+  when its marker was not durable. Pre-cutover movement destinations are
+  protected from being mistaken for obsolete replicas. Group-0 topology startup
+  rejects the optional shared-journal layout until it has an equally safe
+  per-group retirement generation protocol.
 
 ## Remaining production blockers
 
@@ -114,11 +120,10 @@ production deploy.
   plus the bounded production scheduler/remote leader actuator and authenticated
   intent-only move/drain/remove routes. Post-cutover local Raft teardown,
   terminal reclaim-floor publication, exact-v1 journal quarantine, grace, and
-  journal-file deletion are now wired. The remaining code blocker is safe
-  reclamation of the retired VShard's logical bytes from the Engine's shared
-  WAL/TSM/index files; the complete workflow also needs a multi-process
-  production-server gate that proves no lost or duplicate contribution across
-  cutover, restart during quarantine, grace expiry, and later movement back.
+  journal-file deletion and crash-retryable Engine-generation reclamation are
+  now wired. The remaining blocker is a multi-process production-server gate
+  that proves no lost or duplicate contribution across cutover, crash during
+  Engine cleanup or journal quarantine, grace expiry, and later movement back.
   Editing a static peer list is not a safe topology operation.
 - [ ] **Replicate retention policy and cutoff decisions.** Partitioned mode must
   never let replicas expire or compact different logical ranges. Until then,
@@ -198,7 +203,8 @@ idempotent drain/remove retries, and refusal to remove an active or still
 referenced node. Focused host tests cover the applied-membership fence, terminal
 floor, exact-v1 quarantine, both restart recovery windows, grace-period no-op,
 durable generation deletion, and protection of a materialized pre-cutover
-destination. The production server build pins the authenticated route
-composition; the remaining multi-process topology gate must exercise those
-routes over HTTP and prove Engine-data reclaim as well as journal
-teardown/reclaim.
+destination. They also cover durable empty Engine-generation installation and
+removal of a retired VShard from a day-discovery bitmap shared with a live
+VShard. The production server build pins the authenticated route composition;
+the remaining multi-process topology gate must exercise those routes over HTTP
+and prove Engine-data reclaim as well as journal teardown/reclaim.

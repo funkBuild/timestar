@@ -81,6 +81,13 @@ seastar::future<bool> EngineLocalStore::installVShardSnapshot(VShardId vshard, d
     });
 }
 
+seastar::future<> EngineLocalStore::retireVShardData(VShardId vshard) {
+    if (!timestar::vshardsCohesiveOnCores(seastar::smp::count))
+        throw std::runtime_error("retireVShardData: core count is not VShard-cohesive");
+    const unsigned core = timestar::assignCore(vshard, seastar::smp::count);
+    co_await engines_.invoke_on(core, [vshard](Engine& engine) { return engine.retireVShardData(vshard); });
+}
+
 unsigned EngineLocalStore::coreFor(const SeriesId128& id) const {
     // MUST match the routing authority the metadata/query path uses:
     // Engine::indexMetadataSync routes each op by routeToCore(id), and query

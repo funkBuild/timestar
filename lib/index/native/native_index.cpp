@@ -1599,12 +1599,14 @@ seastar::future<std::vector<SeriesId128>> NativeIndex::removeVShardSeriesMetadat
     co_await flushDirtyCaches();
 
     std::map<std::string, std::set<uint32_t>> postingsRemovals;
+    std::map<std::string, std::set<uint32_t>> measurementLocalIds;
     std::set<std::string> affectedMeasurements;
     for (const auto& [id, metadata] : obsolete) {
         affectedMeasurements.insert(metadata.measurement);
         const auto localId = localIdMap_.getLocalId(id);
         if (!localId)
             continue;
+        measurementLocalIds[metadata.measurement].insert(*localId);
         for (const auto& [tagKey, tagValue] : metadata.tags) {
             std::string cacheKey;
             buildBitmapCacheKey(cacheKey, metadata.measurement, tagKey, tagValue);
@@ -1616,8 +1618,25 @@ seastar::future<std::vector<SeriesId128>> NativeIndex::removeVShardSeriesMetadat
     for (const auto& [cacheKey, ids] : postingsRemovals)
         postings.emplace(cacheKey, co_await getPostingsBitmapByKey(cacheKey));
 
+    // Day rows are keyed by (measurement, day), not by series, so discover the
+    // finite set of affected rows through one prefix scan per affected
+    // measurement. Dirty application-cache state was flushed above; the scan
+    // and the pinned handles therefore start from the same complete generation.
+    std::map<std::string, std::set<uint32_t>> dayRemovals;
+    for (const auto& [measurement, localIds] : measurementLocalIds) {
+        const std::string prefix = ke::encodeDayBitmapPrefix(measurement);
+        co_await kvPrefixScan(prefix, [&](std::string_view key, std::string_view) {
+            if (key.size() > 1)
+                dayRemovals.emplace(std::string(key.substr(1)), localIds);
+            return true;
+        });
+    }
+    std::map<std::string, BitmapHandle> days;
+    for (const auto& [cacheKey, ids] : dayRemovals)
+        days.emplace(cacheKey, co_await getDayBitmapByKey(cacheKey));
+
     IndexWriteBatch batch;
-    batch.reserve(obsolete.size() * 3 + postings.size());
+    batch.reserve(obsolete.size() * 3 + postings.size() + days.size());
     std::vector<SeriesId128> removed;
     removed.reserve(obsolete.size());
     for (const auto& [id, metadata] : obsolete) {
@@ -1632,38 +1651,42 @@ seastar::future<std::vector<SeriesId128>> NativeIndex::removeVShardSeriesMetadat
     // such unrelated add is retained in the serialized result. An insert that
     // races the WAL append below re-dirties the same heap-stable entry and is
     // picked up by the next ordinary cache flush.
-    for (auto& [cacheKey, handle] : postings) {
-        if (!handle)
-            continue;
-        bool changed = false;
-        for (uint32_t localId : postingsRemovals.at(cacheKey)) {
-            if (handle->bitmap.contains(localId)) {
-                handle->bitmap.remove(localId);
-                changed = true;
+    const auto removeBitmapMemberships = [&batch](auto& handles, const auto& removals, char keyType, auto& dirtyKeys) {
+        for (auto& [cacheKey, handle] : handles) {
+            if (!handle)
+                continue;
+            bool changed = false;
+            for (uint32_t localId : removals.at(cacheKey)) {
+                if (handle->bitmap.contains(localId)) {
+                    handle->bitmap.remove(localId);
+                    changed = true;
+                }
             }
-        }
-        if (!changed)
-            continue;
+            if (!changed)
+                continue;
 
-        std::string kvKey;
-        kvKey.reserve(1 + cacheKey.size());
-        kvKey.push_back(static_cast<char>(POSTINGS_BITMAP));
-        kvKey.append(cacheKey);
-        if (handle->bitmap.isEmpty()) {
-            handle->approxBytes = 0;
-            batch.remove(std::move(kvKey));
-        } else {
-            handle->bitmap.runOptimize();
-            handle->bitmap.shrinkToFit();
-            const size_t bytes = handle->bitmap.getSizeInBytes();
-            handle->approxBytes = bytes;
-            std::string encoded(bytes, '\0');
-            handle->bitmap.write(encoded.data());
-            batch.put(std::move(kvKey), std::move(encoded));
+            std::string kvKey;
+            kvKey.reserve(1 + cacheKey.size());
+            kvKey.push_back(keyType);
+            kvKey.append(cacheKey);
+            if (handle->bitmap.isEmpty()) {
+                handle->approxBytes = 0;
+                batch.remove(std::move(kvKey));
+            } else {
+                handle->bitmap.runOptimize();
+                handle->bitmap.shrinkToFit();
+                const size_t bytes = handle->bitmap.getSizeInBytes();
+                handle->approxBytes = bytes;
+                std::string encoded(bytes, '\0');
+                handle->bitmap.write(encoded.data());
+                batch.put(std::move(kvKey), std::move(encoded));
+            }
+            handle->dirty = false;
+            dirtyKeys.erase(cacheKey);
         }
-        handle->dirty = false;
-        bitmapCacheDirtyKeys_.erase(cacheKey);
-    }
+    };
+    removeBitmapMemberships(postings, postingsRemovals, static_cast<char>(POSTINGS_BITMAP), bitmapCacheDirtyKeys_);
+    removeBitmapMemberships(days, dayRemovals, static_cast<char>(TIME_SERIES_DAY), dayBitmapCacheDirtyKeys_);
 
     for (const auto& id : removed) {
         indexedSeriesCache_.erase(id);

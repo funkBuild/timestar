@@ -107,6 +107,11 @@ public:
     // precondition; dispatches to assignCore(vshard). Returns true iff installed.
     seastar::future<bool> installVShardSnapshot(VShardId vshard, data::SnapshotPayload payload);
 
+    // Discard the local Engine generation after Group 0 and the applied data
+    // group configuration have both removed this replica. Replica retirement
+    // drains Raft apply before calling this storage-only primitive.
+    seastar::future<> retireVShardData(VShardId vshard);
+
     // Run the node's local query (the real HTTP query pipeline over this node's
     // engines) and return the per-series results as a NodeQueryPartial. In a
     // partitioned cluster the node only stores its owned VShards' series, so a

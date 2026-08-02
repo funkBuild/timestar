@@ -255,6 +255,15 @@ public:
                                                       std::vector<std::pair<std::string, std::string>> files,
                                                       std::string catalog);
 
+    // Durably discard one retired replica's complete storage generation. This
+    // is the empty-generation form of snapshot replacement: it quiesces the
+    // VShard WAL, fences memory/TSM data, removes exact catalog/index state, and
+    // unlinks VShard-pure immutable objects. Mixed objects remain protected by
+    // durable tombstones until the ordinary rewrite sweeper materialises them.
+    // The caller must already have stopped and drained replicated writes for
+    // this VShard. Exact retries, including after restart, are idempotent.
+    seastar::future<> retireVShardData(timestar::VShardId vshard);
+
     void setSnapshotInstallCheckpointForTesting(std::function<void(SnapshotInstallCheckpoint)> hook) {
         _snapshotInstallCheckpointHook = std::move(hook);
     }

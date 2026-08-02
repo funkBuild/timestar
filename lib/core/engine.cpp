@@ -739,6 +739,18 @@ seastar::future<bool> Engine::installVShardSnapshotBundle(timestar::VShardSnapsh
     return installVShardSnapshotBundleOwned(std::move(owned), std::move(files), std::move(catalog));
 }
 
+seastar::future<> Engine::retireVShardData(timestar::VShardId vshard) {
+    if (!vshard.valid())
+        throw std::invalid_argument("Engine::retireVShardData: invalid VShard");
+
+    timestar::SeriesCatalog emptyCatalog;
+    std::string catalog = emptyCatalog.snapshot();
+    timestar::VShardSnapshotBuilder builder(vshard);
+    auto manifest = builder.build({}, timestar::SeriesCatalog::snapshotHash(catalog));
+    if (!co_await installVShardSnapshotBundle(std::move(manifest), {}, std::move(catalog)))
+        throw std::runtime_error("Engine::retireVShardData: empty generation was rejected");
+}
+
 seastar::future<bool> Engine::installVShardSnapshotBundleOwned(
     std::shared_ptr<const timestar::VShardSnapshotManifest> manifestOwner,
     std::vector<std::pair<std::string, std::string>> files, std::string catalogBytes) {

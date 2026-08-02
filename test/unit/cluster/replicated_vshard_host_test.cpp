@@ -74,6 +74,28 @@ data::ReplicatedCommand writeCmd(const std::string& key, double value) {
     b.series = {std::move(s)};
     return data::ReplicatedCommand{std::move(b)};
 }
+
+std::string seriesKeyOnVShard(std::string_view measurement, uint16_t vshard) {
+    for (uint64_t i = 0;; ++i) {
+        auto key = buildSeriesKey(std::string(measurement), {{"host", "h" + std::to_string(i)}}, "value");
+        if (timestar::virtualShard(SeriesId128::fromSeriesKey(key)) == vshard)
+            return key;
+    }
+}
+
+bool engineHasMeasurement(seastar::sharded<Engine>& engines, const std::string& measurement) {
+    http::HttpQueryHandler handler(&engines);
+    QueryRequest request;
+    request.aggregation = AggregationMethod::LATEST;
+    request.measurement = measurement;
+    request.fields = {"value"};
+    request.startTime = BASE - 1'000'000'000ULL;
+    request.endTime = BASE + 1'000'000'000ULL;
+    const auto result = handler.executeQuery(request).get();
+    if (!result.success)
+        throw std::runtime_error("retirement test query failed: " + result.errorMessage);
+    return !result.series.empty();
+}
 }  // namespace
 
 TEST_F(ReplicatedVShardHostTest, HostsVShardAndReplicatesThroughRaft) {
@@ -192,6 +214,12 @@ TEST_F(ReplicatedVShardHostTest, RetiredReplicaJournalIsQuarantinedThenReclaimed
         cluster::ReplicatedVShardHost host(store, transport, /*self=*/1, jroot);
         constexpr uint16_t vshard = 9;
 
+        const std::string retiredMeasurement = "retired_replica_data";
+        const std::string retiredKey = seriesKeyOnVShard(retiredMeasurement, vshard);
+        auto retiredWrite = writeCmd(retiredKey, 19.0);
+        store.applyCommittedWrites(std::get<data::WriteBatch>(std::move(retiredWrite))).get();
+        ASSERT_TRUE(engineHasMeasurement(*eng, retiredMeasurement));
+
         // This node is no longer in the applied data-group configuration, which
         // is the local safety proof required after the Group-0 map cutover.
         host.addVShard(vshard, {2, 3, 4}).get();
@@ -212,6 +240,8 @@ TEST_F(ReplicatedVShardHostTest, RetiredReplicaJournalIsQuarantinedThenReclaimed
         EXPECT_FALSE(host.hosts(vshard));
         EXPECT_EQ(host.replicasRetired(), 1u);
         EXPECT_EQ(host.journalRetention().released(VShardId{vshard}), UINT64_MAX);
+        EXPECT_FALSE(engineHasMeasurement(*eng, retiredMeasurement))
+            << "replica teardown must durably replace its Engine generation with empty state";
         const fs::path retired = jroot / "retired" / "v1_vshard_9_epoch_7";
         ASSERT_TRUE(fs::is_directory(retired));
         EXPECT_FALSE(fs::exists(jroot / "vshard_9"));
@@ -230,9 +260,16 @@ TEST_F(ReplicatedVShardHostTest, RetiredReplicaJournalIsQuarantinedThenReclaimed
         // that lacks its marker receives a fresh full grace period.
         fs::create_directories(jroot / "vshard_11");
         fs::create_directories(jroot / "retired" / "v1_vshard_12_epoch_6");
+        const std::string recoveredMeasurement = "recovered_retirement_data";
+        const std::string recoveredKey = seriesKeyOnVShard(recoveredMeasurement, 11);
+        auto recoveredWrite = writeCmd(recoveredKey, 21.0);
+        store.applyCommittedWrites(std::get<data::WriteBatch>(std::move(recoveredWrite))).get();
+        ASSERT_TRUE(engineHasMeasurement(*eng, recoveredMeasurement));
         cutover.epoch = 8;
         cluster::ReplicatedVShardHost recovered(store, transport, /*self=*/1, jroot);
         EXPECT_EQ(recovered.recoverReplicaRetirements(cutover).get(), 1u);
+        EXPECT_FALSE(engineHasMeasurement(*eng, recoveredMeasurement))
+            << "the stale active journal must remain a retry token until Engine cleanup completes";
         EXPECT_FALSE(fs::exists(jroot / "vshard_11"));
         EXPECT_TRUE(fs::is_directory(jroot / "retired" / "v1_vshard_11_epoch_8"));
         EXPECT_EQ(recovered.reclaimRetiredJournals(std::chrono::system_clock::now() + std::chrono::hours(25)).get(),
