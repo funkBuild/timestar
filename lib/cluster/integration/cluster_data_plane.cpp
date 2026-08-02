@@ -480,6 +480,8 @@ seastar::future<> ClusterDataPlane::startImpl(const ClusterConfig& cfg, seastar:
         });
         replicated_ = true;
         startLeadershipBalancer();
+        if (controlEnabled_)
+            startTopologyController();
     }
     co_return;
 }
@@ -659,6 +661,11 @@ seastar::future<> ClusterDataPlane::stop() {
     peerResolveTimer_.cancel();
     if (!peerResolveGate_.is_closed())
         co_await peerResolveGate_.close();
+    // Topology actuation borrows both Group 0 and data groups. Drain it before
+    // either the balancer or the per-shard Raft planes can be torn down.
+    topologyTimer_.cancel();
+    if (!topologyGate_.is_closed())
+        co_await topologyGate_.close();
     // Stop the balancing loop FIRST and drain any in-flight pass: it touches the Raft
     // groups, so it must be quiescent before rdp_ tears them down.
     balanceTimer_.cancel();
@@ -1388,7 +1395,170 @@ seastar::future<ClusterDataPlane::Status> ClusterDataPlane::status() const {
     st.controlJournalSegmentsDeleted = control.journalSegmentsDeleted;
     st.controlControllerStampProposals = control.controllerStampProposals;
     st.controlControllerActuationFailures = control.controllerActuationFailures;
+    st.controlTopologyPasses = topologyPasses_;
+    st.controlTopologyFailures = topologyFailures_;
+    st.controlTopologyAdvances = topologyAdvances_;
     co_return st;
+}
+
+seastar::future<> ClusterDataPlane::topologyControllerSweep() {
+    ++topologyPasses_;
+    if (!controlEnabled_ || !replicated_ || !shardsStarted_ || !rt_ || !rpc_)
+        co_return;
+
+    auto* host = shards_.local().group0();
+    if (!host || !host->group() || !host->stateMachine())
+        co_return;
+    auto* group0 = host->group();
+    const NodeId self = rt_->selfId;
+    const auto stillController = [&] {
+        const auto& state = host->state();
+        return group0->isLeader() && group0->node().id() == self && state.controllerLeader == self &&
+               state.controllerTerm == group0->currentTerm();
+    };
+    if (!stillController())
+        co_return;
+
+    // A v1 plan permits only one unfinished move. Ignore retained historical
+    // jobs and select the job bound to the current desired-map epoch.
+    std::optional<control::Job> selected;
+    std::optional<movement::MoveJob> selectedMove;
+    for (const auto& [id, job] : host->state().jobs) {
+        auto move = ControllerJobDriver::decodeMoveJob(job);
+        if (!move || move->plan().mapEpoch != host->state().mapEpoch)
+            continue;
+        selected = job;
+        selectedMove = std::move(*move);
+        if (!job.done)
+            break;
+    }
+    if (!selected || !selectedMove)
+        co_return;
+
+    control::Group0Controller controller(*group0, *host->stateMachine());
+    if (selected->done) {
+        // The data-group transition is already durable. Publish the serving map
+        // as a distinct final Group-0 decision; a crash between the two retries
+        // this exact idempotent cutover.
+        if (host->state().servingMap.epoch < selectedMove->plan().mapEpoch)
+            (void)co_await controller.publishCompletedMove(selected->id);
+        co_return;
+    }
+
+    const control::ActuateMoveRequest request{host->state().clusterUuid, selected->id, host->state().controllerTerm,
+                                              self};
+    const NodeId destination = selectedMove->plan().dest;
+    control::EnsureMoveDestinationResult destinationResult;
+    if (destination == self) {
+        destinationResult = co_await shards_.local().handleEnsureMoveDestination(request);
+    } else {
+        const auto deadline = seastar::lowres_clock::now() + std::chrono::seconds(5);
+        destinationResult = co_await rpc_->ensureMoveDestination(destination, request, deadline);
+    }
+    if (destinationResult.status != control::EnsureMoveDestinationStatus::Ready || !stillController())
+        co_return;
+
+    // Ask only authorized source/target replicas. Try this controller first
+    // when it hosts the group because a local follower supplies the current
+    // leader hint without a network timeout. Otherwise rotate the bounded
+    // starting point so one unreachable first replica cannot starve a large
+    // (though unusual) voter set forever.
+    std::vector<NodeId> candidates = selectedMove->plan().sourceVoters;
+    for (NodeId node : selectedMove->targetVoters())
+        if (std::find(candidates.begin(), candidates.end(), node) == candidates.end())
+            candidates.push_back(node);
+    if (auto local = std::find(candidates.begin(), candidates.end(), self); local != candidates.end()) {
+        std::rotate(candidates.begin(), local, std::next(local));
+    } else if (!candidates.empty()) {
+        const size_t offset = static_cast<size_t>((topologyPasses_ - 1) % candidates.size());
+        std::rotate(candidates.begin(), candidates.begin() + offset, candidates.end());
+    }
+
+    constexpr size_t kMaxAttemptsPerPass = 16;
+    std::set<NodeId> allowed(candidates.begin(), candidates.end());
+    std::set<NodeId> attempted;
+    std::optional<NodeId> leaderHint;
+    size_t nextCandidate = 0;
+    control::ActuateMoveResult actuation;
+    for (size_t attempts = 0; attempts < kMaxAttemptsPerPass;) {
+        NodeId target = raft::kNoNode;
+        if (leaderHint && !attempted.contains(*leaderHint)) {
+            target = *leaderHint;
+            leaderHint.reset();
+        } else {
+            while (nextCandidate < candidates.size() && attempted.contains(candidates[nextCandidate]))
+                ++nextCandidate;
+            if (nextCandidate == candidates.size())
+                break;
+            target = candidates[nextCandidate++];
+        }
+        attempted.insert(target);
+        ++attempts;
+        try {
+            if (target == self) {
+                actuation = co_await shards_.local().handleActuateMove(request);
+            } else {
+                const auto deadline = seastar::lowres_clock::now() + std::chrono::seconds(5);
+                actuation = co_await rpc_->actuateMove(target, request, deadline);
+            }
+        } catch (const std::exception&) {
+            // A transport loss says nothing about whether the target was the
+            // leader. Try another authorized replica; the old step is safe to
+            // reissue on the next pass because no later step is authorized until
+            // Group 0 persists this response.
+            continue;
+        }
+        if (actuation.status == control::ActuateMoveStatus::Advanced)
+            break;
+        if (actuation.status == control::ActuateMoveStatus::NotLeader && allowed.contains(actuation.leader) &&
+            !attempted.contains(actuation.leader))
+            leaderHint = actuation.leader;
+    }
+    if (actuation.status != control::ActuateMoveStatus::Advanced || !stillController())
+        co_return;
+    if (!ControllerJobDriver::isNextMoveJob(*selected, actuation.job))
+        throw std::runtime_error("cluster: data-group actuator returned invalid movement progress");
+
+    // Reacquire committed state after every suspension. Another controller may
+    // already have persisted this idempotent data-group transition while our
+    // response was in flight; never propose progress relative to a stale Job.
+    const auto current = host->state().jobs.find(selected->id);
+    if (current == host->state().jobs.end() || current->second != *selected || !stillController())
+        co_return;
+    if (co_await controller.proposeCommand(
+            control::UpsertJob{actuation.job.id, actuation.job.step, actuation.job.done, actuation.job.payload}))
+        ++topologyAdvances_;
+}
+
+void ClusterDataPlane::startTopologyController() {
+    static constexpr auto kInterval = std::chrono::seconds(1);
+    topologyTimer_.set_callback([this] {
+        if (topologyRunning_ || topologyGate_.is_closed())
+            return;
+        topologyRunning_ = true;
+        (void)seastar::with_gate(topologyGate_, [this] {
+            return topologyControllerSweep().then_wrapped([this](seastar::future<> f) {
+                try {
+                    f.get();
+                } catch (const std::exception& e) {
+                    ++topologyFailures_;
+                    if (topologyFailures_ == 1 || topologyFailures_ % 1024 == 0)
+                        timestar::http_log.warn(
+                            "cluster: topology-controller pass failed: {} (will retry; occurrence {})", e.what(),
+                            topologyFailures_);
+                } catch (...) {
+                    ++topologyFailures_;
+                    if (topologyFailures_ == 1 || topologyFailures_ % 1024 == 0)
+                        timestar::http_log.warn(
+                            "cluster: topology-controller pass failed with an unknown error (will retry; "
+                            "occurrence {})",
+                            topologyFailures_);
+                }
+                topologyRunning_ = false;
+            });
+        });
+    });
+    topologyTimer_.arm_periodic(kInterval);
 }
 
 void ClusterDataPlane::startLeadershipBalancer() {

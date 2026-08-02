@@ -29,7 +29,7 @@ inventory and rules.
   boundary, including `TSR1` Raft envelopes and the `TSWL` WAL header.
 - [x] Removed old encoder/decoder branches, compatibility fallbacks, format
   activation state, capability/inventory RPCs, and cluster-format readiness
-  fields.
+  fields, including the retired fields in the production status endpoint.
 - [x] Replaced DataPlane version-range negotiation with an exact-v1 connection
   handshake and reject peers that do not speak v1.
 - [x] Made Raft use one v1 tag layout, including transfer votes and chunked
@@ -73,6 +73,12 @@ inventory and rules.
   mismatched destinations, and conflicting placement, uses the production Raft
   limits, and validates any recovered stable or joint configuration before the
   group is registered or allowed to tick.
+- [x] Run the production Group-0 movement scheduler and remote data-group leader
+  actuator. A pass materializes the destination, follows bounded leader hints,
+  executes exactly one idempotent transition, rechecks the controller term after
+  every suspension, validates the returned job, and commits that one step through
+  Group 0 before another pass can continue. Shutdown drains the loop, and status
+  exposes pass, failure, and durable-advance counters.
 
 ## Remaining production blockers
 
@@ -86,8 +92,8 @@ production deploy.
   be exercised through the production server. Group 0 now validates durable
   movement plans/progress, exact one-VShard cutover, and live sharded directory
   publication, dynamic peer registration, and destination data-group creation,
-  but the production job scheduler/remote leader actuator, authenticated
-  operator mutation API, and teardown/reclaim sequence remain unfinished.
+  plus the bounded production scheduler/remote leader actuator. The authenticated
+  operator mutation API and teardown/reclaim sequence remain unfinished.
   Editing a static peer list is not a safe topology operation.
 - [ ] **Replicate retention policy and cutoff decisions.** Partitioned mode must
   never let replicas expire or compact different logical ranges. Until then,
@@ -156,7 +162,8 @@ The dynamic-admission gate covers unresolved-address retry after durable token
 consumption, registration-before-learner ordering, peer address replacement on
 both transports, malformed port rejection, and idempotent failed-start cleanup.
 
-The movement-destination gate covers exact-v1 socket transport, stale term/job
-rejection, inactive destinations, adjacent stable/joint recovery shapes, and
+The movement-control gate covers exact-v1 destination and one-step actuation
+socket transport, stale term/job rejection, inactive or non-member actuators,
+skipped-step and changed-plan rejection, adjacent stable/joint recovery shapes,
 refusal before registry insertion when an on-disk configuration conflicts with
-the committed Group-0 job.
+the committed Group-0 job, and one durable transition per live-Raft driver call.

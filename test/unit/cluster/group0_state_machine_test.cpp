@@ -138,6 +138,37 @@ TEST(ControlRpcV1, MoveDestinationFramesRoundTripAndRejectMalformedInput) {
     }
 }
 
+TEST(ControlRpcV1, MoveActuationFramesAreBoundedAndCarryExactNextJob) {
+    movement::MoveJob next(movePlan(), movement::MoveStep::LearnerAdded);
+    ActuateMoveResult advanced{ActuateMoveStatus::Advanced, 2,
+                               Job{"move-7", static_cast<uint32_t>(next.step()), next.done(), next.encode()}};
+    const auto encoded = encodeActuateMoveResult(advanced);
+    EXPECT_EQ(decodeActuateMoveResult(encoded), advanced);
+    for (size_t n = 0; n < encoded.size(); ++n)
+        EXPECT_FALSE(decodeActuateMoveResult(encoded.substr(0, n))) << n;
+    EXPECT_FALSE(decodeActuateMoveResult(encoded + "x"));
+
+    for (auto status : {ActuateMoveStatus::NotLeader, ActuateMoveStatus::Rejected, ActuateMoveStatus::Unavailable}) {
+        const ActuateMoveResult result{status, 3, {}};
+        EXPECT_EQ(decodeActuateMoveResult(encodeActuateMoveResult(result)), result);
+    }
+    advanced.job.step += 1;
+    EXPECT_THROW(encodeActuateMoveResult(advanced), std::invalid_argument);
+
+    movement::MovePlan largest{/*vshard=*/7, /*dest=*/2000, /*victim=*/1, /*mapEpoch=*/2, {}};
+    for (NodeId id = 1; id <= 1024; ++id)
+        largest.sourceVoters.push_back(id);
+    movement::MoveJob largestNext(std::move(largest), movement::MoveStep::LearnerAdded);
+    const ActuateMoveResult largestResult{
+        ActuateMoveStatus::Advanced, 2,
+        Job{std::string(kMaxControlJobIdBytes, 'j'), static_cast<uint32_t>(largestNext.step()), largestNext.done(),
+            largestNext.encode()}};
+    const auto largestFrame = encodeActuateMoveResult(largestResult);
+    EXPECT_LE(largestFrame.size(), kMaxActuateMoveFrameBytes);
+    EXPECT_EQ(decodeActuateMoveResult(largestFrame), largestResult)
+        << "every structurally valid v1 movement job must fit its actuator frame";
+}
+
 TEST(ControllerJobDriverV1, DestinationAuthorizationComesOnlyFromExactCommittedState) {
     Group0State state;
     state.clusterUuid = std::string(32, 'a');
@@ -163,6 +194,40 @@ TEST(ControllerJobDriverV1, DestinationAuthorizationComesOnlyFromExactCommittedS
     EXPECT_FALSE(timestar::cluster::ControllerJobDriver::authorizeDestination(state, 4, wrongJob));
     state.nodes.at(4).state = NodeState::Draining;
     EXPECT_FALSE(timestar::cluster::ControllerJobDriver::authorizeDestination(state, 4, request));
+}
+
+TEST(ControllerJobDriverV1, ActuationRequiresAnActiveReplicaAndExactlyOneForwardStep) {
+    Group0State state;
+    state.clusterUuid = std::string(32, 'a');
+    state.controllerTerm = 9;
+    state.controllerLeader = 2;
+    state.mapEpoch = 2;
+    for (NodeId id : {1, 2, 3, 4, 5})
+        state.nodes.emplace(id, node(id, std::string(32, static_cast<char>('0' + id))));
+    state.servingMap = servingMap();
+    movement::MoveJob planned(movePlan());
+    state.desiredPlacement.emplace(7, planned.targetVoters());
+    const Job current{"move-7", 0, false, planned.encode()};
+    state.jobs.emplace(current.id, current);
+    const ActuateMoveRequest request{state.clusterUuid, current.id, 9, 2};
+
+    EXPECT_TRUE(timestar::cluster::ControllerJobDriver::authorizeActuation(state, 1, request));
+    EXPECT_TRUE(timestar::cluster::ControllerJobDriver::authorizeActuation(state, 4, request));
+    EXPECT_FALSE(timestar::cluster::ControllerJobDriver::authorizeActuation(state, 5, request));
+    state.nodes.at(1).state = NodeState::Draining;
+    EXPECT_FALSE(timestar::cluster::ControllerJobDriver::authorizeActuation(state, 1, request));
+
+    movement::MoveJob learnerAdded(movePlan(), movement::MoveStep::LearnerAdded);
+    const Job next{current.id, static_cast<uint32_t>(learnerAdded.step()), learnerAdded.done(), learnerAdded.encode()};
+    EXPECT_TRUE(timestar::cluster::ControllerJobDriver::isNextMoveJob(current, next));
+    movement::MoveJob skipped(movePlan(), movement::MoveStep::CaughtUp);
+    EXPECT_FALSE(timestar::cluster::ControllerJobDriver::isNextMoveJob(
+        current, Job{current.id, static_cast<uint32_t>(skipped.step()), skipped.done(), skipped.encode()}));
+    auto changedPlan = movePlan();
+    changedPlan.vshard = 8;
+    movement::MoveJob changed(std::move(changedPlan), movement::MoveStep::LearnerAdded);
+    EXPECT_FALSE(timestar::cluster::ControllerJobDriver::isNextMoveJob(
+        current, Job{current.id, static_cast<uint32_t>(changed.step()), changed.done(), changed.encode()}));
 }
 
 TEST(MoveJobV1, RecoveredJointConfigurationsAreAuthorizedOnlyAtTheirAdjacentStep) {

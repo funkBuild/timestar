@@ -1,6 +1,6 @@
 #include "cluster/integration/cluster_data_plane.hpp"
-#include "cluster/integration/group0_startup.hpp"
 #include "cluster/integration/group0_identity_bridge.hpp"
+#include "cluster/integration/group0_startup.hpp"
 #include "cluster/integration/node_identity.hpp"
 #include "config/timestar_config.hpp"
 #include "core/engine.hpp"
@@ -25,6 +25,8 @@
 #include "utils/logger.hpp"
 #include "utils/stop_signal.hpp"
 
+#include <glaze/json.hpp>
+
 #include <sys/resource.h>
 
 #include <atomic>
@@ -32,7 +34,6 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
-#include <glaze/json.hpp>
 #include <seastar/core/app-template.hh>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/prometheus.hh>
@@ -190,8 +191,8 @@ void set_routes(routes& r) {
                   for (const auto& [id, addr] : st.peers) {
                       if (!peers.empty())
                           peers += ",";
-                      peers += "{\"node\":" + std::to_string(id) + ",\"address\":\"" +
-                               timestar::jsonEscape(addr) + "\"}";
+                      peers +=
+                          "{\"node\":" + std::to_string(id) + ",\"address\":\"" + timestar::jsonEscape(addr) + "\"}";
                   }
                   std::string body = "{\"clustered\":true,\"node_id\":" + std::to_string(st.self) +
                                      ",\"replication_factor\":" + std::to_string(st.replicationFactor) +
@@ -224,10 +225,7 @@ void set_routes(routes& r) {
                       // rising is how an operator sees compaction running at all; the chunk
                       // and install counters are the ONLY way to tell a snapshot-based
                       // catch-up from an append-based one.
-                      body += ",\"active_cluster_format\":" + std::to_string(st.activeClusterFormat) +
-                              ",\"snapshot_format_ready\":" +
-                              std::string(st.snapshotFormatReady ? "true" : "false") +
-                              ",\"snapshot_trigger\":" + std::string(st.snapshotTriggerEnabled ? "true" : "false") +
+                      body += ",\"snapshot_trigger\":" + std::string(st.snapshotTriggerEnabled ? "true" : "false") +
                               ",\"snapshots_taken\":" + std::to_string(st.snapshotsTaken) +
                               ",\"snapshots_refused_too_large\":" + std::to_string(st.snapshotsRefusedTooLarge) +
                               ",\"snapshots_skipped_unflushed\":" + std::to_string(st.snapshotsSkippedUnflushed) +
@@ -266,8 +264,7 @@ void set_routes(routes& r) {
                           ",\"control_enabled\":" + std::string(st.controlEnabled ? "true" : "false") +
                           ",\"control_hosted\":" + std::string(st.controlHosted ? "true" : "false") +
                           ",\"control_initialized\":" + std::string(st.controlInitialized ? "true" : "false") +
-                          ",\"control_locally_ready\":" +
-                          std::string(st.controlLocallyReady() ? "true" : "false") +
+                          ",\"control_locally_ready\":" + std::string(st.controlLocallyReady() ? "true" : "false") +
                           ",\"control_leader_here\":" + std::string(st.controlLeaderHere ? "true" : "false") +
                           ",\"control_voter\":" + std::string(st.controlVoter ? "true" : "false") +
                           ",\"control_joint_config\":" + std::string(st.controlJointConfig ? "true" : "false") +
@@ -282,7 +279,6 @@ void set_routes(routes& r) {
                           ",\"control_snapshot_index\":" + std::to_string(st.controlSnapshotIndex) +
                           ",\"control_map_epoch\":" + std::to_string(st.controlMapEpoch) +
                           ",\"control_serving_map_epoch\":" + std::to_string(st.controlServingMapEpoch) +
-                          ",\"control_active_format\":" + std::to_string(st.controlActiveFormat) +
                           ",\"control_nodes\":" + std::to_string(st.controlNodes) +
                           ",\"control_voters\":" + std::to_string(st.controlVoters) +
                           ",\"control_learners\":" + std::to_string(st.controlLearners) +
@@ -294,12 +290,14 @@ void set_routes(routes& r) {
                           ",\"control_compactions_taken\":" + std::to_string(st.controlCompactionsTaken) +
                           ",\"control_compactions_refused_too_large\":" +
                           std::to_string(st.controlCompactionsRefusedTooLarge) +
-                          ",\"control_journal_segments_deleted\":" +
-                          std::to_string(st.controlJournalSegmentsDeleted) +
+                          ",\"control_journal_segments_deleted\":" + std::to_string(st.controlJournalSegmentsDeleted) +
                           ",\"control_controller_stamp_proposals\":" +
                           std::to_string(st.controlControllerStampProposals) +
                           ",\"control_controller_actuation_failures\":" +
                           std::to_string(st.controlControllerActuationFailures) +
+                          ",\"control_topology_passes\":" + std::to_string(st.controlTopologyPasses) +
+                          ",\"control_topology_failures\":" + std::to_string(st.controlTopologyFailures) +
+                          ",\"control_topology_advances\":" + std::to_string(st.controlTopologyAdvances) +
                           ",\"protocol_version\":1";
                   }
                   body += "}";
@@ -357,7 +355,8 @@ void set_routes(routes& r) {
            std::unique_ptr<seastar::http::reply> rep) -> seastar::future<std::unique_ptr<seastar::http::reply>> {
             if (authToken().empty()) {
                 rep->set_status(seastar::http::reply::status_type::unauthorized);
-                rep->_content = R"({"status":"error","message":"cluster join-token minting requires server authentication"})";
+                rep->_content =
+                    R"({"status":"error","message":"cluster join-token minting requires server authentication"})";
                 co_return std::move(rep);
             }
             if (!g_clusterPartitioned) {
@@ -373,19 +372,18 @@ void set_routes(routes& r) {
                     rep->set_status(result.leader == timestar::raft::kNoNode
                                         ? seastar::http::reply::status_type::service_unavailable
                                         : seastar::http::reply::status_type::conflict);
-                    rep->_content = "{\"status\":\"error\",\"message\":\"this node is not the control "
-                                    "leader or the outstanding-token limit is reached\",\"leader\":" +
-                                    std::to_string(result.leader) + "}";
+                    rep->_content =
+                        "{\"status\":\"error\",\"message\":\"this node is not the control "
+                        "leader or the outstanding-token limit is reached\",\"leader\":" +
+                        std::to_string(result.leader) + "}";
                     co_return std::move(rep);
                 }
                 rep->add_header("Cache-Control", "no-store");
                 rep->set_status(seastar::http::reply::status_type::ok);
-                rep->_content = "{\"status\":\"success\",\"token\":\"" +
-                                timestar::jsonEscape(token) + "\"}";
+                rep->_content = "{\"status\":\"success\",\"token\":\"" + timestar::jsonEscape(token) + "\"}";
             } catch (const std::exception& e) {
                 rep->set_status(seastar::http::reply::status_type::service_unavailable);
-                rep->_content = "{\"status\":\"error\",\"message\":\"" +
-                                timestar::jsonEscape(e.what()) + "\"}";
+                rep->_content = "{\"status\":\"error\",\"message\":\"" + timestar::jsonEscape(e.what()) + "\"}";
             }
             co_return std::move(rep);
         });
@@ -410,16 +408,16 @@ void set_routes(routes& r) {
                 co_return std::move(rep);
             }
             ClusterJoinRequestBody body;
-            if (auto error = glz::read_json(body, req->content); error || !timestar::control::validJoinToken(body.token)) {
+            if (auto error = glz::read_json(body, req->content);
+                error || !timestar::control::validJoinToken(body.token)) {
                 rep->set_status(seastar::http::reply::status_type::bad_request);
                 rep->_content = R"({"status":"error","message":"a valid token is required"})";
                 co_return std::move(rep);
             }
             try {
-                const auto result = co_await seastar::smp::submit_to(
-                    0u, [token = std::move(body.token)]() mutable {
-                        return g_clusterDataPlane.joinControlPlane(std::move(token));
-                    });
+                const auto result = co_await seastar::smp::submit_to(0u, [token = std::move(body.token)]() mutable {
+                    return g_clusterDataPlane.joinControlPlane(std::move(token));
+                });
                 const std::string leader = std::to_string(result.leader);
                 switch (result.status) {
                     case timestar::control::ControlJoinStatus::Active:
@@ -428,13 +426,14 @@ void set_routes(routes& r) {
                         break;
                     case timestar::control::ControlJoinStatus::Joining:
                         rep->set_status(seastar::http::reply::status_type::ok);
-                        rep->_content = "{\"status\":\"joining\",\"leader\":" + leader +
-                                        ",\"retry\":true}";
+                        rep->_content = "{\"status\":\"joining\",\"leader\":" + leader + ",\"retry\":true}";
                         break;
                     case timestar::control::ControlJoinStatus::NotLeader:
                         rep->set_status(seastar::http::reply::status_type::conflict);
-                        rep->_content = "{\"status\":\"error\",\"message\":\"control leader is not known or "
-                                        "changed\",\"leader\":" + leader + "}";
+                        rep->_content =
+                            "{\"status\":\"error\",\"message\":\"control leader is not known or "
+                            "changed\",\"leader\":" +
+                            leader + "}";
                         break;
                     case timestar::control::ControlJoinStatus::Rejected:
                         rep->set_status(seastar::http::reply::status_type::unauthorized);
@@ -443,8 +442,7 @@ void set_routes(routes& r) {
                 }
             } catch (const std::exception& e) {
                 rep->set_status(seastar::http::reply::status_type::service_unavailable);
-                rep->_content = "{\"status\":\"error\",\"message\":\"" +
-                                timestar::jsonEscape(e.what()) + "\"}";
+                rep->_content = "{\"status\":\"error\",\"message\":\"" + timestar::jsonEscape(e.what()) + "\"}";
             }
             co_return std::move(rep);
         });
@@ -949,18 +947,17 @@ int main(int argc, char** argv) {
                         timestar::http::HttpDeleteHandler::clusterDeletePlanHook =
                             [](SeriesId128 requestId, SeriesId128 requestFingerprint, uint64_t issuedAtMs,
                                std::vector<timestar::data::DeleteRangeTarget> targets) {
-                                return seastar::smp::submit_to(
-                                    0u, [requestId, requestFingerprint, issuedAtMs,
-                                         targets = std::move(targets)]() mutable {
-                                        return g_clusterDataPlane.freezeDeletePlan(
-                                            requestId, requestFingerprint, issuedAtMs, std::move(targets));
-                                    });
+                                return seastar::smp::submit_to(0u, [requestId, requestFingerprint, issuedAtMs,
+                                                                    targets = std::move(targets)]() mutable {
+                                    return g_clusterDataPlane.freezeDeletePlan(requestId, requestFingerprint,
+                                                                               issuedAtMs, std::move(targets));
+                                });
                             };
                         timestar::http::HttpDeleteHandler::clusterDeletePlanLookupHook =
                             [](SeriesId128 requestId, SeriesId128 requestFingerprint, uint64_t issuedAtMs) {
                                 return seastar::smp::submit_to(0u, [requestId, requestFingerprint, issuedAtMs] {
-                                    return g_clusterDataPlane.lookupDeletePlan(
-                                        requestId, requestFingerprint, issuedAtMs);
+                                    return g_clusterDataPlane.lookupDeletePlan(requestId, requestFingerprint,
+                                                                               issuedAtMs);
                                 });
                             };
                     }

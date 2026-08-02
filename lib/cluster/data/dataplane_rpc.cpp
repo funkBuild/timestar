@@ -69,6 +69,7 @@ constexpr uint64_t kFindPatternSeries = 12;
 constexpr uint64_t kFrozenDeletePlan = 13;
 constexpr uint64_t kControlJoin = 14;
 constexpr uint64_t kEnsureMoveDestination = 15;
+constexpr uint64_t kActuateMove = 16;
 
 // How long before re-attempting a peer connection that died. seastar's rpc::client
 // never reconnects itself, so we replace it -- but bounded, so a burst of concurrent
@@ -222,6 +223,7 @@ struct DataPlaneRpc::Impl {
     FrozenDeletePlanSink* frozenDeletePlanSink = nullptr;  // group-0 request target
     ControlJoinSink* controlJoinSink = nullptr;            // group-0 observer admission target
     MoveDestinationSink* moveDestinationSink = nullptr;    // Group-0-authorized data-group creation
+    MoveActuationSink* moveActuationSink = nullptr;        // one fenced data-group movement step
     // Connections that completed the exact-v1 handshake. Dropped when a
     // connection is retired because the peer may return on another binary.
     std::set<NodeId> v1Connections;
@@ -248,6 +250,7 @@ struct DataPlaneRpc::Impl {
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> frozenDeletePlanStub;
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> controlJoinStub;
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> ensureMoveDestinationStub;
+    std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> actuateMoveStub;
     // DEADLINE-CARRYING variants of the three verbs the write path awaits
     // (write-scaleout 3f). seastar's rpc client stub has a time_point overload; without
     // it an awaited call has NO timeout at all, so a peer that accepts the connection and
@@ -279,6 +282,9 @@ struct DataPlaneRpc::Impl {
     std::function<seastar::future<seastar::sstring>(Client&, seastar::rpc::rpc_clock_type::time_point,
                                                     seastar::sstring)>
         ensureMoveDestinationTimedStub;
+    std::function<seastar::future<seastar::sstring>(Client&, seastar::rpc::rpc_clock_type::time_point,
+                                                    seastar::sstring)>
+        actuateMoveTimedStub;
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> leaderReadIndexStub;
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> leaderCommitIndexStub;
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> requireV1Stub;
@@ -355,6 +361,7 @@ struct DataPlaneRpc::Impl {
         frozenDeletePlanStub = proto.make_client<seastar::sstring(seastar::sstring)>(kFrozenDeletePlan);
         controlJoinStub = proto.make_client<seastar::sstring(seastar::sstring)>(kControlJoin);
         ensureMoveDestinationStub = proto.make_client<seastar::sstring(seastar::sstring)>(kEnsureMoveDestination);
+        actuateMoveStub = proto.make_client<seastar::sstring(seastar::sstring)>(kActuateMove);
         proposeWriteHintedTimedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kProposeWriteHinted);
         proposeCommandHintedTimedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kProposeCommandHinted);
         requireV1TimedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kRequireV1);
@@ -363,6 +370,7 @@ struct DataPlaneRpc::Impl {
         frozenDeletePlanTimedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kFrozenDeletePlan);
         controlJoinTimedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kControlJoin);
         ensureMoveDestinationTimedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kEnsureMoveDestination);
+        actuateMoveTimedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kActuateMove);
         leaderReadIndexStub = proto.make_client<seastar::sstring(seastar::sstring)>(kLeaderReadIndex);
         leaderCommitIndexStub = proto.make_client<seastar::sstring(seastar::sstring)>(kLeaderCommitIndex);
         requireV1Stub = proto.make_client<seastar::sstring(seastar::sstring)>(kRequireV1);
@@ -540,6 +548,23 @@ seastar::future<> DataPlaneRpc::start(seastar::socket_address local, NodeStore& 
                 return seastar::sstring(encoded.data(), encoded.size());
             });
     });
+    impl_->proto.register_handler(kActuateMove, [this](seastar::sstring data) {
+        if (!impl_->moveActuationSink)
+            return seastar::make_exception_future<seastar::sstring>(
+                std::runtime_error("dataplane: no move-actuation sink"));
+        if (data.size() > control::kMaxEnsureMoveDestinationFrameBytes)
+            return seastar::make_exception_future<seastar::sstring>(
+                std::runtime_error("dataplane: oversized actuate-move request"));
+        auto request = control::decodeEnsureMoveDestinationRequest(std::string(data.data(), data.size()));
+        if (!request)
+            return seastar::make_exception_future<seastar::sstring>(
+                std::runtime_error("dataplane: malformed actuate-move request"));
+        return impl_->moveActuationSink->handleActuateMove(std::move(*request))
+            .then([](control::ActuateMoveResult result) {
+                std::string encoded = control::encodeActuateMoveResult(result);
+                return seastar::sstring(encoded.data(), encoded.size());
+            });
+    });
     impl_->proto.register_handler(kProposeWriteHinted, [this](seastar::sstring data) {
         if (!impl_->proposeSink)
             return seastar::make_exception_future<seastar::sstring>(
@@ -651,6 +676,10 @@ void DataPlaneRpc::setControlJoinSink(ControlJoinSink& sink) {
 
 void DataPlaneRpc::setMoveDestinationSink(MoveDestinationSink& sink) {
     impl_->moveDestinationSink = &sink;
+}
+
+void DataPlaneRpc::setMoveActuationSink(MoveActuationSink& sink) {
+    impl_->moveActuationSink = &sink;
 }
 
 void DataPlaneRpc::setTlsCredentials(std::string certPem, std::string keyPem, std::string caPem,
@@ -866,6 +895,24 @@ seastar::future<control::EnsureMoveDestinationResult> DataPlaneRpc::ensureMoveDe
     if (!result)
         throw std::runtime_error("dataplane: malformed ensure-move-destination result");
     co_return *result;
+}
+
+seastar::future<control::ActuateMoveResult> DataPlaneRpc::actuateMove(NodeId to, control::ActuateMoveRequest request,
+                                                                      OptDeadline deadline) {
+    if (impl_->stopping)
+        throw std::runtime_error("dataplane: shutting down");
+    co_await ensureV1(to, deadline);
+    auto* conn = impl_->clientFor(to);
+    if (!conn)
+        throw std::runtime_error("dataplane: unknown peer");
+    std::string encoded = control::encodeEnsureMoveDestinationRequest(request);
+    seastar::sstring frame(encoded.data(), encoded.size());
+    seastar::sstring reply = deadline ? co_await impl_->actuateMoveTimedStub(*conn, *deadline, frame)
+                                      : co_await impl_->actuateMoveStub(*conn, frame);
+    auto result = control::decodeActuateMoveResult(std::string(reply.data(), reply.size()));
+    if (!result)
+        throw std::runtime_error("dataplane: malformed actuate-move result");
+    co_return std::move(*result);
 }
 
 seastar::future<ProposeOutcome> DataPlaneRpc::proposeWriteHinted(NodeId to, VShardBatchView view,

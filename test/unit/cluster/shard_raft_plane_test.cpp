@@ -104,6 +104,16 @@ public:
     }
 };
 
+class RecordingMoveActuation : public data::MoveActuationSink {
+public:
+    std::optional<control::ActuateMoveRequest> received;
+    control::ActuateMoveResult response;
+    seastar::future<control::ActuateMoveResult> handleActuateMove(control::ActuateMoveRequest request) override {
+        received = std::move(request);
+        return seastar::make_ready_future<control::ActuateMoveResult>(response);
+    }
+};
+
 // One shard's listener, so sharded<> can start one per shard on the same address.
 class ShardListener {
 public:
@@ -312,14 +322,16 @@ TEST_F(ShardRaftPlaneTest, DataPeerAddressChangeRetiresTheCachedConnection) {
     }).get();
 }
 
-TEST_F(ShardRaftPlaneTest, MoveDestinationFenceCrossesTheExactV1Socket) {
+TEST_F(ShardRaftPlaneTest, MovementControlFencesCrossTheExactV1Socket) {
     seastar::async([] {
         RecordingStore store;
-        RecordingMoveDestination sink;
+        RecordingMoveDestination destinationSink;
+        RecordingMoveActuation actuationSink;
         data::DataPlaneRpc server;
         data::DataPlaneRpc client;
         const auto address = loopback(18144);
-        server.setMoveDestinationSink(sink);
+        server.setMoveDestinationSink(destinationSink);
+        server.setMoveActuationSink(actuationSink);
         server.start(address, store).get();
         client.addPeer(2, address);
         client.startClientOnly().get();
@@ -327,8 +339,18 @@ TEST_F(ShardRaftPlaneTest, MoveDestinationFenceCrossesTheExactV1Socket) {
         control::EnsureMoveDestinationRequest request{std::string(32, 'a'), "move-7", 11, 2};
         const auto result = client.ensureMoveDestination(2, request).get();
         EXPECT_EQ(result.status, control::EnsureMoveDestinationStatus::Ready);
-        ASSERT_TRUE(sink.received);
-        EXPECT_EQ(*sink.received, request);
+        ASSERT_TRUE(destinationSink.received);
+        EXPECT_EQ(*destinationSink.received, request);
+
+        movement::MoveJob moved(movement::MovePlan{/*vshard=*/7, /*dest=*/4, /*victim=*/1, /*mapEpoch=*/2, {1, 2, 3}},
+                                movement::MoveStep::LearnerAdded);
+        actuationSink.response = control::ActuateMoveResult{
+            control::ActuateMoveStatus::Advanced, 3,
+            control::Job{request.jobId, static_cast<uint32_t>(moved.step()), moved.done(), moved.encode()}};
+        const auto actuation = client.actuateMove(2, request).get();
+        EXPECT_EQ(actuation, actuationSink.response);
+        ASSERT_TRUE(actuationSink.received);
+        EXPECT_EQ(*actuationSink.received, request);
 
         client.stop().get();
         server.stop().get();

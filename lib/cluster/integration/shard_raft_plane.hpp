@@ -131,7 +131,8 @@ class ShardRaftPlane : public data::ProposeSink,
                        public data::ReadIndexSink,
                        public data::FrozenDeletePlanSink,
                        public data::ControlJoinSink,
-                       public data::MoveDestinationSink {
+                       public data::MoveDestinationSink,
+                       public data::MoveActuationSink {
 public:
     using DynamicPeerRegistrar = std::function<seastar::future<bool>(data::NodeId, std::string)>;
 
@@ -288,6 +289,7 @@ public:
         rpc_->setFrozenDeletePlanSink(*this);
         rpc_->setControlJoinSink(*this);
         rpc_->setMoveDestinationSink(*this);
+        rpc_->setMoveActuationSink(*this);
         return rpc_->start(local, *queryStore_, /*perShardListener=*/true);
     }
 
@@ -421,6 +423,59 @@ public:
             co_return false;
         }
         co_return true;
+    }
+
+    seastar::future<control::ActuateMoveResult> handleActuateMove(control::ActuateMoveRequest request) override {
+        if (seastar::this_shard_id() != 0) {
+            auto* peers = peers_;
+            co_return co_await peers->invoke_on(0, [request = std::move(request)](ShardRaftPlane& plane) mutable {
+                return plane.handleActuateMove(std::move(request));
+            });
+        }
+        if (!group0_ || !group0_->group() || !group0_->stateMachine())
+            co_return control::ActuateMoveResult{control::ActuateMoveStatus::Unavailable, raft::kNoNode, {}};
+        const NodeId self = group0_->group()->node().id();
+        auto move = ControllerJobDriver::authorizeActuation(group0_->state(), self, request);
+        if (!move)
+            co_return control::ActuateMoveResult{control::ActuateMoveStatus::Rejected, raft::kNoNode, {}};
+        const auto persisted = group0_->state().jobs.find(request.jobId);
+        if (persisted == group0_->state().jobs.end())
+            co_return control::ActuateMoveResult{control::ActuateMoveStatus::Rejected, raft::kNoNode, {}};
+        const unsigned owner = shardOwningVShard(move->plan().vshard, dir_.get());
+        control::Job job = persisted->second;
+        const size_t minRf = move->plan().sourceVoters.size();
+        if (owner == seastar::this_shard_id())
+            co_return co_await actuateMoveLocal(std::move(job), move->plan().vshard, minRf);
+        co_return co_await peers_->invoke_on(
+            owner, [job = std::move(job), vshard = move->plan().vshard, minRf](ShardRaftPlane& plane) mutable {
+                return plane.actuateMoveLocal(std::move(job), vshard, minRf);
+            });
+    }
+
+    seastar::future<control::ActuateMoveResult> actuateMoveLocal(control::Job job, uint16_t vshard, size_t minRf) {
+        if (!ready() || shardOwningVShard(vshard, dir_.get()) != seastar::this_shard_id())
+            co_return control::ActuateMoveResult{control::ActuateMoveStatus::Unavailable, raft::kNoNode, {}};
+        raft::RaftGroup* group = plane_->host().group(vshard);
+        if (!group)
+            co_return control::ActuateMoveResult{control::ActuateMoveStatus::Unavailable, raft::kNoNode, {}};
+        const auto leader = [&] { return group->isLeader() ? group->node().id() : group->leader(); };
+        if (!group->isLeader())
+            co_return control::ActuateMoveResult{control::ActuateMoveStatus::NotLeader, leader(), {}};
+        try {
+            auto advanced = co_await ControllerJobDriver::driveMoveJobStep(std::move(job), *group, minRf);
+            if (advanced)
+                co_return control::ActuateMoveResult{control::ActuateMoveStatus::Advanced, group->node().id(),
+                                                     std::move(*advanced)};
+            co_return control::ActuateMoveResult{
+                group->isLeader() ? control::ActuateMoveStatus::Unavailable : control::ActuateMoveStatus::NotLeader,
+                leader(),
+                {}};
+        } catch (const std::exception& e) {
+            if (!group->isLeader())
+                co_return control::ActuateMoveResult{control::ActuateMoveStatus::NotLeader, leader(), {}};
+            timestar::http_log.warn("cluster: movement actuation for VShard {} was rejected: {}", vshard, e.what());
+            co_return control::ActuateMoveResult{control::ActuateMoveStatus::Rejected, leader(), {}};
+        }
     }
 
     // ProposeSink: a peer forwarded a batch because this NODE leads those VShards. The

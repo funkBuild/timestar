@@ -4,15 +4,15 @@
 // (2/3 quorum), and the partitioned node catches up on heal -- no acknowledged loss,
 // no duplicate, no split brain. This is the Phase-5 RF=3 gate re-proven with the
 // enriched command over the real Engine (not the toy store).
+#include "../../../lib/cluster/features/operator_surface.hpp"
+#include "../../../lib/cluster/features/stream_subscription.hpp"
 #include "../../../lib/cluster/integration/controller_job_driver.hpp"
 #include "../../../lib/cluster/integration/engine_data_state_machine.hpp"
 #include "../../../lib/cluster/integration/raft_move_executor.hpp"
-#include "../../../lib/cluster/features/operator_surface.hpp"
-#include "../../../lib/cluster/features/stream_subscription.hpp"
-#include "../../../lib/cluster/movement/movement_throttle.hpp"
-#include "../../../lib/cluster/movement/placement_balancer.hpp"
 #include "../../../lib/cluster/integration/replica_engine_coordinator.hpp"
 #include "../../../lib/cluster/integration/replica_engine_reader.hpp"
+#include "../../../lib/cluster/movement/movement_throttle.hpp"
+#include "../../../lib/cluster/movement/placement_balancer.hpp"
 #include "../../../lib/cluster/raft/raft_group.hpp"
 #include "../../../lib/cluster/raft/raft_journal_persistence.hpp"
 #include "../../../lib/core/placement_table.hpp"  // virtualShard
@@ -285,21 +285,19 @@ TEST_F(EngineRf3Test, ExactDeleteRetrySurvivesLeaderFailoverAndReplicaRestart) {
             replica.engine = std::make_unique<ScopedShardedEngine>();
             replica.engine->startAt(engineDirs.at(id).string());
             replica.store = std::make_unique<cluster::EngineLocalStore>(**replica.engine);
-            replica.sm =
-                std::make_unique<cluster::EngineDataStateMachine>(*replica.store, timestar::VShardId{1});
+            replica.sm = std::make_unique<cluster::EngineDataStateMachine>(*replica.store, timestar::VShardId{1});
             replica.writer = std::make_unique<JournalWriter>(journalDirs.at(id), header(), 1u << 20);
             auto recovered = replica.writer->open().get();
             RecoveredRaftState state = recoverRaftState(recovered, VShardId{1});
-            replica.persistence =
-                std::make_unique<JournalRaftPersistence>(*replica.writer, VShardId{1}, state.nextSeq);
+            replica.persistence = std::make_unique<JournalRaftPersistence>(*replica.writer, VShardId{1}, state.nextSeq);
             if (!replica.transport)
                 replica.transport = std::make_unique<RouterTransport>(router);
 
             ASSERT_FALSE(state.snapshot.has_value())
                 << "this gate proves committed-log receipt replay; snapshot receipt recovery has its own host gate";
             RaftNode node(id, voters, std::move(state.log), state.hardState, optsFor(id, preferredLeader), {});
-            replica.group = std::make_unique<RaftGroup>(1, std::move(node), *replica.persistence,
-                                                        *replica.transport, *replica.sm);
+            replica.group =
+                std::make_unique<RaftGroup>(1, std::move(node), *replica.persistence, *replica.transport, *replica.sm);
             router.setGroup(id, replica.group.get());
         };
         auto commit = [&](NodeId leader, const std::string& command) {
@@ -475,8 +473,8 @@ TEST_F(EngineRf3Test, ReplicaReadServesFromFollowerAcrossNodes) {
         cluster::ReplicaEngineReader reader2(*reps[2].group, *reps[2].store, 1, leaderReadIndex, leaderCommit);
         cluster::ReplicaEngineReader reader3(*reps[3].group, *reps[3].store, 1, leaderReadIndex, leaderCommit);
 
-        cluster::ReplicaEngineQueryCoordinator coord(
-            {{1, {&reader2, &reader3}}}, /*hedgeWidth=*/1, /*allowPartial=*/false);
+        cluster::ReplicaEngineQueryCoordinator coord({{1, {&reader2, &reader3}}}, /*hedgeWidth=*/1,
+                                                     /*allowPartial=*/false);
 
         data::NodeQueryRequest nq;
         nq.request.aggregation = AggregationMethod::LATEST;
@@ -496,9 +494,9 @@ TEST_F(EngineRf3Test, ReplicaReadServesFromFollowerAcrossNodes) {
 
         // Finalize to confirm the actual value round-trips from the follower.
         http::HttpQueryHandler fin(&**reps[2].engine);
-        auto resp = fin.finalizeClusterPartials(nq.request, std::move(res.partial.partials),
-                                                std::move(res.partial.nonNumeric))
-                        .get();
+        auto resp =
+            fin.finalizeClusterPartials(nq.request, std::move(res.partial.partials), std::move(res.partial.nonNumeric))
+                .get();
         ASSERT_TRUE(resp.success) << resp.errorMessage;
         ASSERT_EQ(resp.series.size(), 1u);
         EXPECT_DOUBLE_EQ(std::get<std::vector<double>>(resp.series[0].fields.at("value").second)[0], 7.25);
@@ -669,14 +667,11 @@ TEST_F(EngineRf3Test, MoverReplacesFollowerAcrossFourNodes) {
 
         // Drive the replace move 3 -> 4 through the production executor.
         std::vector<movement::MoveStep> persisted;
-        cluster::RaftGroupMoveExecutor exec(
-            *reps[leader].group,
-            [&persisted](const movement::MoveJob& j) {
-                persisted.push_back(j.step());
-                return seastar::make_ready_future<>();
-            });
-        movement::MoveJob job(
-            movement::MovePlan{/*vshard=*/1, /*dest=*/4, /*victim=*/3, /*mapEpoch=*/2, voters});
+        cluster::RaftGroupMoveExecutor exec(*reps[leader].group, [&persisted](const movement::MoveJob& j) {
+            persisted.push_back(j.step());
+            return seastar::make_ready_future<>();
+        });
+        movement::MoveJob job(movement::MovePlan{/*vshard=*/1, /*dest=*/4, /*victim=*/3, /*mapEpoch=*/2, voters});
         movement::Mover mover(/*minRf=*/3);
 
         auto mf = mover.run(job, exec);
@@ -773,16 +768,16 @@ TEST_F(EngineRf3Test, BalancerSelectedMoveExecutesEndToEnd) {
         };
         std::map<uint16_t, std::vector<NodeId>> placement = {{1, {1, 2, 3}}};
 
-        auto plan = movement::PlacementBalancer::planOneMove(/*mapEpoch=*/2, placement, loads,
-                                                              movement::BalancerConfig{});
+        auto plan =
+            movement::PlacementBalancer::planOneMove(/*mapEpoch=*/2, placement, loads, movement::BalancerConfig{});
         ASSERT_TRUE(plan.has_value()) << "balancer must propose a move off the overloaded node";
         EXPECT_EQ(plan->dest, 4u);
         EXPECT_EQ(plan->victim, 3u) << "the overloaded node's replica is the one moved";
         EXPECT_EQ(plan->vshard, 1u);
 
         // Execute the balancer's chosen move over live Raft.
-        cluster::RaftGroupMoveExecutor exec(
-            *reps[leader].group, [](const movement::MoveJob&) { return seastar::make_ready_future<>(); });
+        cluster::RaftGroupMoveExecutor exec(*reps[leader].group,
+                                            [](const movement::MoveJob&) { return seastar::make_ready_future<>(); });
         movement::MoveJob job(*plan);
         movement::Mover mover(/*minRf=*/3);
         auto mf = mover.run(job, exec);
@@ -868,10 +863,9 @@ TEST_F(EngineRf3Test, ThrottlePausesMoveSafeForwardThenResumes) {
         tick(40);
         ASSERT_TRUE(reps[leader].group->isLeader());
 
-        cluster::RaftGroupMoveExecutor exec(
-            *reps[leader].group, [](const movement::MoveJob&) { return seastar::make_ready_future<>(); });
-        movement::MoveJob job(
-            movement::MovePlan{/*vshard=*/1, /*dest=*/4, /*victim=*/3, /*mapEpoch=*/2, voters});
+        cluster::RaftGroupMoveExecutor exec(*reps[leader].group,
+                                            [](const movement::MoveJob&) { return seastar::make_ready_future<>(); });
+        movement::MoveJob job(movement::MovePlan{/*vshard=*/1, /*dest=*/4, /*victim=*/3, /*mapEpoch=*/2, voters});
         movement::Mover mover(/*minRf=*/3);
 
         // Run 1: pause AFTER the learner is added (mayProceed false on the 2nd check),
@@ -964,21 +958,22 @@ TEST_F(EngineRf3Test, ControllerDrivesPersistedMoveJobToCompletion) {
         ASSERT_TRUE(reps[leader].group->isLeader());
 
         // A persisted group-0 Job carrying a replace-move 3 -> 4.
-        movement::MoveJob mj(
-            movement::MovePlan{/*vshard=*/1, /*dest=*/4, /*victim=*/3, /*mapEpoch=*/2, voters});
+        movement::MoveJob mj(movement::MovePlan{/*vshard=*/1, /*dest=*/4, /*victim=*/3, /*mapEpoch=*/2, voters});
         control::Job job{"job-move-1", 0, false, mj.encode()};
 
         std::vector<control::Job> persisted;
-        auto persistJob = [&persisted](control::Job j) {
-            persisted.push_back(std::move(j));
-            return seastar::make_ready_future<>();
-        };
-
-        auto df = cluster::ControllerJobDriver::driveMoveJob(job, *reps[leader].group, /*minRf=*/3, persistJob);
-        for (int i = 0; i < 8000 && !df.available(); ++i)
-            tickAll();
-        const bool done = df.get();
-        EXPECT_TRUE(done) << "the driver ran the persisted job to completion";
+        while (!job.done) {
+            const control::Job before = job;
+            auto step = cluster::ControllerJobDriver::driveMoveJobStep(job, *reps[leader].group, /*minRf=*/3);
+            for (int i = 0; i < 8000 && !step.available(); ++i)
+                tickAll();
+            auto next = step.get();
+            ASSERT_TRUE(next) << "the current data leader must advance one durable transition";
+            EXPECT_TRUE(cluster::ControllerJobDriver::isNextMoveJob(before, *next));
+            EXPECT_EQ(next->step, before.step + 1) << "one scheduler pass must never run ahead of Group 0";
+            persisted.push_back(*next);
+            job = std::move(*next);  // simulate the intervening Group-0 UpsertJob
+        }
 
         auto finalVoters = reps[leader].group->node().config().voters;
         std::sort(finalVoters.begin(), finalVoters.end());
@@ -986,7 +981,7 @@ TEST_F(EngineRf3Test, ControllerDrivesPersistedMoveJobToCompletion) {
 
         // The driver persisted advancing steps, ending done -- what the next controller
         // would resume from (and see already complete).
-        ASSERT_FALSE(persisted.empty());
+        ASSERT_EQ(persisted.size(), static_cast<size_t>(movement::MoveStep::Done));
         EXPECT_EQ(persisted.back().id, "job-move-1");
         EXPECT_TRUE(persisted.back().done);
         EXPECT_EQ(persisted.back().step, static_cast<uint32_t>(movement::MoveStep::Done));
@@ -1055,16 +1050,15 @@ TEST_F(EngineRf3Test, OperatorPauseResumeGovernsRealMove) {
         tick(40);
         ASSERT_TRUE(reps[leader].group->isLeader());
 
-        cluster::RaftGroupMoveExecutor exec(
-            *reps[leader].group, [](const movement::MoveJob&) { return seastar::make_ready_future<>(); });
+        cluster::RaftGroupMoveExecutor exec(*reps[leader].group,
+                                            [](const movement::MoveJob&) { return seastar::make_ready_future<>(); });
         movement::Mover mover(/*minRf=*/3);
         auto mayProceed = [&throttle] { return throttle.mayProceed(); };
 
         // Operator PAUSE: movement must not proceed; a move started now does nothing.
         ops.pause();
         EXPECT_FALSE(ops.status().running);
-        movement::MoveJob job(
-            movement::MovePlan{/*vshard=*/1, /*dest=*/4, /*victim=*/3, /*mapEpoch=*/2, voters});
+        movement::MoveJob job(movement::MovePlan{/*vshard=*/1, /*dest=*/4, /*victim=*/3, /*mapEpoch=*/2, voters});
         auto paused = mover.run(job, exec, mayProceed);
         for (int i = 0; i < 200 && !paused.available(); ++i)
             tickAll();

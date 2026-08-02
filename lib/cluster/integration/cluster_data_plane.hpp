@@ -117,8 +117,7 @@ static_assert(kReadLeaderlessBudget < data::ReplicatedBatchWriteRouter::kElectio
 // ---------------------------------------------------------------------------
 // The v1 wire frame and Raft command carry the same WriteBatch encoding. Keep one full
 // outbound frame proposable after adding the command wrapper.
-static_assert(data::kMaxOutboundFrameBytes + data::kWriteCommandFramingBytes <=
-              raft::RaftGroup::kMaxProposalBytes);
+static_assert(data::kMaxOutboundFrameBytes + data::kWriteCommandFramingBytes <= raft::RaftGroup::kMaxProposalBytes);
 // ...and the proposal bound must not be so far above it that it has stopped being derived
 // from anything. Two frames' worth is the slack budget; more than that is the pre-D-31
 // state, where the number floated free of every producer.
@@ -310,6 +309,9 @@ public:
         uint64_t controlJournalSegmentsDeleted = 0;
         uint64_t controlControllerStampProposals = 0;
         uint64_t controlControllerActuationFailures = 0;
+        uint64_t controlTopologyPasses = 0;
+        uint64_t controlTopologyFailures = 0;
+        uint64_t controlTopologyAdvances = 0;
 
         // This is intentionally LOCAL readiness, not a quorum-health claim.
         // With CheckQuorum disabled an isolated former leader can retain its role;
@@ -319,9 +321,10 @@ public:
                 return true;
             return controlHosted && controlInitialized && controlServingMapEpoch != 0 &&
                    controlLeader != raft::kNoNode && controlControllerTerm == controlTerm &&
-                   controlControllerLeader == controlLeader && controlCurrentTermCommit && controlApplyLagEntries == 0 &&
-                   controlApplyFailures == 0 && controlTickErrors == 0 && controlMaintenanceFailures == 0 &&
-                   controlControllerActuationFailures == 0 && controlCompactionsRefusedTooLarge == 0;
+                   controlControllerLeader == controlLeader && controlCurrentTermCommit &&
+                   controlApplyLagEntries == 0 && controlApplyFailures == 0 && controlTickErrors == 0 &&
+                   controlMaintenanceFailures == 0 && controlControllerActuationFailures == 0 &&
+                   controlCompactionsRefusedTooLarge == 0;
         }
 
         [[nodiscard]] bool readyForTraffic() const {
@@ -443,6 +446,11 @@ private:
     // coroutine frame the gate keeps alive -- see startPeerResolver.
     seastar::future<> resolvePendingPeers(bool replicated);
     void startPeerResolver(bool replicated);
+    // On the current Group-0 controller, materialize a move destination,
+    // execute one data-group transition, then durably publish exactly that one
+    // transition before any later pass may continue.
+    seastar::future<> topologyControllerSweep();
+    void startTopologyController();
 
     std::optional<ClusterRuntime> rt_;
     seastar::sharded<Engine>* enginesPtr_ = nullptr;
@@ -478,6 +486,15 @@ private:
     bool replicated_ = false;
     uint16_t rf_ = 1;  // configured replication factor (reported by status())
     bool controlEnabled_ = false;
+
+    // Production topology actuation. Passes never overlap and each successful
+    // pass persists at most one MoveJob step through Group 0.
+    seastar::timer<> topologyTimer_;
+    seastar::gate topologyGate_;
+    bool topologyRunning_ = false;
+    uint64_t topologyPasses_ = 0;
+    uint64_t topologyFailures_ = 0;
+    uint64_t topologyAdvances_ = 0;
 
     // Standing leadership-balancing loop (M5). Without it a fresh cluster leaves ALL
     // leadership on the first node to start, since it wins every election. Runs a

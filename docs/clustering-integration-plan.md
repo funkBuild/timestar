@@ -173,16 +173,17 @@ changes. See [protocol-versioning.md](protocol-versioning.md).
 ### 1. Complete topology ownership
 
 - Wire production join, drain, replace, and remove to group-0 jobs.
-- Wire the bounded production driver that locates the VShard group and drives
-  add-learner, catch-up, promote, leadership transfer, remove-old, and cleanup
-  steps idempotently after restart.
+- **Done:** wire the bounded production driver that locates the VShard group and drives
+  add-learner, catch-up, promote, remove-old, and completion
+  steps idempotently after restart. Each pass executes and Group-0-persists one
+  step before a later pass can proceed.
 - Apply each committed serving-map epoch to the live sharded routing directory.
   **Done:** publication is durable-before-applied, reactor-local, monotonic, and
   idempotent; restart selects the durable high-water map and instantiates groups
   from recovered placement. **Done:** token-authorized destination peers are
   registered on every transport before Group-0 learner membership and restored
-  from recovered node records. Creating destination data groups before movement
-  starts remains open.
+  from recovered node records. **Done:** destination data groups are created from
+  the receiver's committed Group-0 job before movement starts.
 - Publish teardown/reclaim floors only after durable ownership transfer.
 - Prove no acknowledged loss or duplicate VShard contribution during movement.
 

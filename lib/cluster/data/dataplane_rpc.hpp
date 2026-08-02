@@ -34,6 +34,12 @@ public:
         control::EnsureMoveDestinationRequest request) = 0;
 };
 
+class MoveActuationSink {
+public:
+    virtual ~MoveActuationSink() = default;
+    virtual seastar::future<control::ActuateMoveResult> handleActuateMove(control::ActuateMoveRequest request) = 0;
+};
+
 // OptDeadline (node_store.hpp): a wall-clock point past which an awaited data-plane RPC
 // must give up. std::nullopt is available to callers with no deadline of their own.
 // seastar's rpc clock is lowres_clock,
@@ -102,6 +108,8 @@ public:
                                                             OptDeadline deadline = std::nullopt);
     seastar::future<control::EnsureMoveDestinationResult> ensureMoveDestination(
         NodeId to, control::EnsureMoveDestinationRequest request, OptDeadline deadline = std::nullopt);
+    seastar::future<control::ActuateMoveResult> actuateMove(NodeId to, control::ActuateMoveRequest request,
+                                                            OptDeadline deadline = std::nullopt);
     // The production remote propose (write-scaleout 3a/3b): borrows the caller's groups
     // (no merge allocation, and the caller keeps them so it can retry the failed ones)
     // and returns per-VShard rejects carrying the peer's view of the real leader.
@@ -121,6 +129,7 @@ public:
     void setFrozenDeletePlanSink(FrozenDeletePlanSink& sink);
     void setControlJoinSink(ControlJoinSink& sink);
     void setMoveDestinationSink(MoveDestinationSink& sink);
+    void setMoveActuationSink(MoveActuationSink& sink);
 
     // M4 replica-read leader-reach client calls: confirm a linearizable ReadIndex /
     // fetch the commit index for `vshard` at peer `to` (which must be its leader). The

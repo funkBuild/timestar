@@ -150,6 +150,25 @@ struct EnsureMoveDestinationResult {
 
 inline constexpr size_t kMaxEnsureMoveDestinationFrameBytes = 2048;
 
+// The same controller fence selects a movement job at a node that may lead its
+// data group. An actuator advances at most one step and returns that exact next
+// Job; only the Group-0 leader can then make the progress durable.
+using ActuateMoveRequest = EnsureMoveDestinationRequest;
+
+enum class ActuateMoveStatus : uint8_t { Advanced = 0, NotLeader = 1, Rejected = 2, Unavailable = 3 };
+
+struct ActuateMoveResult {
+    ActuateMoveStatus status = ActuateMoveStatus::Rejected;
+    NodeId leader = raft::kNoNode;
+    Job job;
+
+    friend bool operator==(const ActuateMoveResult&, const ActuateMoveResult&) = default;
+};
+
+// Covers the largest structurally valid v1 MoveJob (1024 voters) plus the
+// bounded job id and framing. Keep the decoder's pre-allocation bound explicit.
+inline constexpr size_t kMaxActuateMoveFrameBytes = 16 * 1024;
+
 using ControlCommand =
     std::variant<InitCluster, UpsertNode, SetNodeState, PlanVShardMove, SetMetaVoters, CasPolicy, SetControllerTerm,
                  UpsertJob, MintJoinToken, AdmitWithToken, StoreFrozenDeletePlan, PublishServingMap>;
@@ -177,5 +196,7 @@ std::string encodeEnsureMoveDestinationRequest(const EnsureMoveDestinationReques
 std::optional<EnsureMoveDestinationRequest> decodeEnsureMoveDestinationRequest(const std::string& bytes);
 std::string encodeEnsureMoveDestinationResult(const EnsureMoveDestinationResult& result);
 std::optional<EnsureMoveDestinationResult> decodeEnsureMoveDestinationResult(const std::string& bytes);
+std::string encodeActuateMoveResult(const ActuateMoveResult& result);
+std::optional<ActuateMoveResult> decodeActuateMoveResult(const std::string& bytes);
 
 }  // namespace timestar::control

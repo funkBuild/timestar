@@ -4,12 +4,14 @@
 #include "../movement/mover.hpp"
 #include "raft_move_executor.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <functional>
 #include <optional>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
 #include <string>
+#include <vector>
 
 namespace timestar::cluster {
 
@@ -40,22 +42,30 @@ public:
         return decoded;
     }
 
-    // Authorize destination materialization exclusively from the receiver's
-    // committed Group-0 state. The caller-supplied job id and controller fence
-    // select an existing decision; they do not supply any topology fields.
-    static std::optional<movement::MoveJob> authorizeDestination(const control::Group0State& state, NodeId self,
-                                                                 const control::EnsureMoveDestinationRequest& request) {
+    // Validate an untrusted actuator reply before the controller proposes it
+    // through Group 0. The state machine repeats this forward-only check at
+    // apply time, but rejecting here prevents a stale or malicious peer from
+    // filling the control log with deterministic no-ops.
+    static bool isNextMoveJob(const control::Job& current, const control::Job& next) {
+        const auto before = decodeMoveJob(current);
+        const auto after = decodeMoveJob(next);
+        return before && after && !before->done() && next.id == current.id && next.step == current.step + 1 &&
+               after->plan() == before->plan();
+    }
+
+    // Resolve an exact movement decision from committed Group-0 state. The
+    // request is only a selector plus controller fence; no topology supplied by
+    // the caller is trusted.
+    static std::optional<movement::MoveJob> authorizeMove(const control::Group0State& state,
+                                                          const control::EnsureMoveDestinationRequest& request) {
         if (state.clusterUuid != request.clusterUuid || state.controllerTerm != request.controllerTerm ||
             state.controllerLeader != request.controllerLeader || state.mapEpoch == 0)
-            return std::nullopt;
-        const auto node = state.nodes.find(self);
-        if (node == state.nodes.end() || node->second.state != control::NodeState::Active)
             return std::nullopt;
         const auto found = state.jobs.find(request.jobId);
         if (found == state.jobs.end())
             return std::nullopt;
         auto move = decodeMoveJob(found->second);
-        if (!move || move->plan().dest != self || move->plan().mapEpoch != state.mapEpoch)
+        if (!move || move->plan().mapEpoch != state.mapEpoch)
             return std::nullopt;
         const auto desired = state.desiredPlacement.find(move->plan().vshard);
         if (desired == state.desiredPlacement.end() || desired->second != move->targetVoters())
@@ -68,6 +78,58 @@ public:
         const bool afterCutover =
             state.servingMap.epoch == move->plan().mapEpoch && serving->second == move->targetVoters() && move->done();
         return beforeCutover || afterCutover ? std::move(move) : std::nullopt;
+    }
+
+    // Authorize destination materialization exclusively from the receiver's
+    // committed Group-0 state.
+    static std::optional<movement::MoveJob> authorizeDestination(const control::Group0State& state, NodeId self,
+                                                                 const control::EnsureMoveDestinationRequest& request) {
+        const auto node = state.nodes.find(self);
+        if (node == state.nodes.end() || node->second.state != control::NodeState::Active)
+            return std::nullopt;
+        auto move = authorizeMove(state, request);
+        return move && move->plan().dest == self ? std::move(move) : std::nullopt;
+    }
+
+    // A source/target replica may actuate one step only while active. This does
+    // not grant authority to persist progress; the Group-0 leader validates and
+    // proposes the returned next Job separately.
+    static std::optional<movement::MoveJob> authorizeActuation(const control::Group0State& state, NodeId self,
+                                                               const control::ActuateMoveRequest& request) {
+        const auto node = state.nodes.find(self);
+        if (node == state.nodes.end() || node->second.state != control::NodeState::Active)
+            return std::nullopt;
+        auto move = authorizeMove(state, request);
+        if (!move || move->done())
+            return std::nullopt;
+        const auto member = [self](const std::vector<NodeId>& nodes) {
+            return std::find(nodes.begin(), nodes.end(), self) != nodes.end();
+        };
+        return member(move->plan().sourceVoters) || member(move->targetVoters()) ? std::move(move) : std::nullopt;
+    }
+
+    // Execute exactly one forward step. Its returned Job is not durable yet;
+    // the controller must commit it through Group 0 before another call may
+    // advance the next step.
+    static seastar::future<std::optional<control::Job>> driveMoveJobStep(control::Job job, raft::RaftGroup& group,
+                                                                         size_t minRf) {
+        auto move = decodeMoveJob(job);
+        if (!move || move->done())
+            co_return std::nullopt;
+        std::optional<control::Job> advanced;
+        const std::string jobId = job.id;
+        RaftGroupMoveExecutor exec(group, [&advanced, jobId](const movement::MoveJob& current) {
+            advanced = control::Job{jobId, static_cast<uint32_t>(current.step()), current.done(), current.encode()};
+            return seastar::make_ready_future<>();
+        });
+        movement::Mover mover(minRf);
+        bool first = true;
+        co_await mover.run(*move, exec, [&first] {
+            const bool proceed = first;
+            first = false;
+            return proceed;
+        });
+        co_return advanced;
     }
 
     // Drive one persisted job whose payload is a MoveJob. Decodes it, runs it against a

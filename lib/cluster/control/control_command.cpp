@@ -14,6 +14,7 @@ constexpr uint8_t kControlJoinRequestFrameTag = 1;
 constexpr uint8_t kControlJoinResultFrameTag = 1;
 constexpr uint8_t kEnsureMoveDestinationRequestFrameTag = 1;
 constexpr uint8_t kEnsureMoveDestinationResultFrameTag = 1;
+constexpr uint8_t kActuateMoveResultFrameTag = 1;
 
 bool canonicalHex128(const std::string& value) {
     if (value.size() != 32)
@@ -42,6 +43,17 @@ bool validControlJoinResult(const ControlJoinResult& result) {
 bool validEnsureMoveDestinationRequest(const EnsureMoveDestinationRequest& request) {
     return canonicalHex128(request.clusterUuid) && validControlJobId(request.jobId) &&
            request.controllerTerm != raft::kNoTerm && request.controllerLeader != raft::kNoNode;
+}
+
+bool validActuateMoveResult(const ActuateMoveResult& result) {
+    if (result.status > ActuateMoveStatus::Unavailable)
+        return false;
+    if (result.status != ActuateMoveStatus::Advanced)
+        return result.job == Job{};
+    if (result.leader == raft::kNoNode || !validControlJobId(result.job.id))
+        return false;
+    auto move = movement::MoveJob::decode(result.job.payload);
+    return move && result.job.step == static_cast<uint32_t>(move->step()) && result.job.done == move->done();
 }
 
 struct Writer {
@@ -580,6 +592,47 @@ std::optional<EnsureMoveDestinationResult> decodeEnsureMoveDestinationResult(con
     if (!r.ok || r.p != r.end || status > static_cast<uint8_t>(EnsureMoveDestinationStatus::Unavailable))
         return std::nullopt;
     return EnsureMoveDestinationResult{static_cast<EnsureMoveDestinationStatus>(status)};
+}
+
+std::string encodeActuateMoveResult(const ActuateMoveResult& result) {
+    if (!validActuateMoveResult(result))
+        throw std::invalid_argument("invalid actuate-move result");
+    Writer w;
+    w.u8(kActuateMoveResultFrameTag);
+    w.u8(static_cast<uint8_t>(result.status));
+    w.u64(result.leader);
+    if (result.status == ActuateMoveStatus::Advanced) {
+        w.str(result.job.id);
+        w.u64(result.job.step);
+        w.u8(result.job.done ? 1 : 0);
+        w.str(result.job.payload);
+    }
+    if (w.out.size() > kMaxActuateMoveFrameBytes)
+        throw std::invalid_argument("actuate-move result exceeds its wire bound");
+    return std::move(w.out);
+}
+
+std::optional<ActuateMoveResult> decodeActuateMoveResult(const std::string& bytes) {
+    if (bytes.size() > kMaxActuateMoveFrameBytes)
+        return std::nullopt;
+    Reader r{bytes.data(), bytes.data() + bytes.size()};
+    if (r.u8() != kActuateMoveResultFrameTag)
+        return std::nullopt;
+    const uint8_t status = r.u8();
+    if (status > static_cast<uint8_t>(ActuateMoveStatus::Unavailable))
+        return std::nullopt;
+    ActuateMoveResult result;
+    result.status = static_cast<ActuateMoveStatus>(status);
+    result.leader = r.u64();
+    if (result.status == ActuateMoveStatus::Advanced) {
+        result.job.id = r.str();
+        result.job.step = r.u32();
+        result.job.done = r.boolean();
+        result.job.payload = r.str();
+    }
+    if (!r.ok || r.p != r.end || !validActuateMoveResult(result))
+        return std::nullopt;
+    return result;
 }
 
 }  // namespace timestar::control
