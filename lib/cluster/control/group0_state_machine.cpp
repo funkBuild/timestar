@@ -207,6 +207,7 @@ bool validNodeRecord(const Group0State& state, const NodeRecord& record) {
 }
 
 bool validNodeSet(const std::vector<NodeId>& nodes);
+std::optional<movement::MoveJob> decodeJob(const Job& job);
 
 bool validSnapshotState(const Group0State& state) {
     std::set<std::string> nodeUuids;
@@ -219,18 +220,29 @@ bool validSnapshotState(const Group0State& state) {
         if (vshard >= timestar::VIRTUAL_SHARD_COUNT || !validNodeSet(replicas))
             return false;
     if ((state.servingMap.epoch == 0 &&
-         (!state.servingMap.placement.empty() || !state.servingMap.groups.empty())) ||
+         (state.mapEpoch != 0 || !state.servingMap.placement.empty() || !state.servingMap.groups.empty())) ||
         (state.servingMap.epoch != 0 &&
-         (state.servingMap.epoch != 1 || !isCompleteControlMap(state.servingMap))))
+         (!isCompleteControlMap(state.servingMap) || state.servingMap.epoch > state.mapEpoch ||
+          state.mapEpoch - state.servingMap.epoch > 1)))
         return false;
     if (!state.metaVoters.empty() && !validNodeSet(state.metaVoters))
         return false;
     for (const auto& [key, cell] : state.policies)
         if (key.empty() || cell.version == 0)
             return false;
-    for (const auto& [id, job] : state.jobs)
-        if (id.empty() || id != job.id)
+    size_t unfinishedJobs = 0;
+    for (const auto& [id, job] : state.jobs) {
+        const auto move = decodeJob(job);
+        if (!validControlJobId(id) || id != job.id || !move || move->plan().mapEpoch > state.mapEpoch)
             return false;
+        if (!job.done) {
+            ++unfinishedJobs;
+            if (move->plan().mapEpoch != state.mapEpoch || state.servingMap.epoch + 1 != state.mapEpoch)
+                return false;
+        }
+    }
+    if (unfinishedJobs > 1)
+        return false;
     if (state.joinTokens.size() > kMaxOutstandingJoinTokens)
         return false;
     for (const auto& token : state.joinTokens)
@@ -251,6 +263,39 @@ bool validNodeSet(const std::vector<NodeId>& nodes) {
     return true;
 }
 
+bool sameNodeSet(std::vector<NodeId> lhs, std::vector<NodeId> rhs) {
+    std::sort(lhs.begin(), lhs.end());
+    std::sort(rhs.begin(), rhs.end());
+    return lhs == rhs;
+}
+
+std::optional<movement::MoveJob> decodeJob(const Job& job) {
+    auto move = movement::MoveJob::decode(job.payload);
+    if (!move || job.step != static_cast<uint32_t>(move->step()) || job.done != move->done())
+        return std::nullopt;
+    return move;
+}
+
+bool allJobsDone(const Group0State& state) {
+    return std::ranges::all_of(state.jobs, [](const auto& item) { return item.second.done; });
+}
+
+bool validNewMove(const Group0State& state, const PlanVShardMove& command) {
+    movement::MoveJob job(command.plan);
+    if (!validControlJobId(command.jobId) || state.jobs.size() >= kMaxControlJobs || !job.valid() ||
+        !isCompleteControlMap(state.servingMap) ||
+        state.mapEpoch != state.servingMap.epoch || state.mapEpoch == std::numeric_limits<uint64_t>::max() ||
+        command.plan.mapEpoch != state.mapEpoch + 1 || state.jobs.contains(command.jobId) || !allJobsDone(state))
+        return false;
+
+    const auto current = state.servingMap.placement.find(command.plan.vshard);
+    const auto destination = state.nodes.find(command.plan.dest);
+    const auto target = job.targetVoters();
+    return current != state.servingMap.placement.end() && current->second == command.plan.sourceVoters &&
+           destination != state.nodes.end() && destination->second.state == NodeState::Active &&
+           validNodeSet(target) && !sameNodeSet(target, current->second);
+}
+
 }  // namespace
 
 void Group0StateMachine::expectLocalIdentity(std::string clusterUuid, NodeRecord localRecord) {
@@ -265,14 +310,14 @@ void Group0StateMachine::expectLocalIdentity(std::string clusterUuid, NodeRecord
         throw std::runtime_error("group0: existing control state conflicts with the local persistent identity");
 }
 
-void Group0StateMachine::expectInitialServingMap(ControlMap map) {
-    if (map.epoch != 1 || !isCompleteControlMap(map))
-        throw std::invalid_argument("group0: expected initial serving map is incomplete or not epoch 1");
-    if (expectedInitialServingMap_)
-        throw std::logic_error("group0: initial serving-map expectation was configured more than once");
-    expectedInitialServingMap_ = std::move(map);
+void Group0StateMachine::expectServingMap(ControlMap map) {
+    if (!isCompleteControlMap(map))
+        throw std::invalid_argument("group0: expected serving map is incomplete");
+    if (expectedServingMap_)
+        throw std::logic_error("group0: serving-map expectation was configured more than once");
+    expectedServingMap_ = std::move(map);
     if (!stateMatchesLocalExpectations(state_))
-        throw std::runtime_error("group0: existing control state conflicts with the expected initial serving map");
+        throw std::runtime_error("group0: existing control state conflicts with the durable serving map");
 }
 
 void Group0StateMachine::setServingMapObserver(ServingMapObserver observer) {
@@ -297,16 +342,24 @@ bool Group0StateMachine::stateMatchesLocalExpectations(const Group0State& state)
                 return false;
         }
     }
-    if (expectedInitialServingMap_ && state.servingMap.epoch != 0 &&
-        state.servingMap != *expectedInitialServingMap_)
+    // A recovered Group-0 snapshot may legitimately predate the durable local
+    // routing cache: publication is persisted before the committed entry's
+    // applied boundary advances, and the retained log then catches Group 0 back
+    // up. Only two different maps claiming the same epoch are irreconcilable.
+    if (expectedServingMap_ && state.servingMap.epoch == expectedServingMap_->epoch &&
+        state.servingMap != *expectedServingMap_)
         return false;
     return true;
 }
 
 void Group0StateMachine::rejectConflictingLocalCommand(const ControlCommand& command) const {
-    if (const auto* serving = std::get_if<SetInitialServingMap>(&command)) {
-        if (expectedInitialServingMap_ && serving->map != *expectedInitialServingMap_)
-            throw std::runtime_error("group0: committed initial serving map conflicts with local placement");
+    if (const auto* serving = std::get_if<PublishServingMap>(&command)) {
+        // The startup expectation fences the recovered/current map. Once that
+        // exact state is established, a later quorum-committed movement cutover
+        // may advance it and the observer durably replaces the local cache.
+        if (expectedServingMap_ && serving->map.epoch == expectedServingMap_->epoch &&
+            serving->map != *expectedServingMap_)
+            throw std::runtime_error("group0: committed serving map conflicts with local durable placement");
         return;
     }
     if (!expectedLocalRecord_)
@@ -356,14 +409,16 @@ bool Group0StateMachine::applyCommand(const ControlCommand& cmd) {
                     it->second.state = c.state;
                 else
                     ok = false;
-            } else if constexpr (std::is_same_v<T, SetDesiredPlacement>) {
-                auto it = state_.desiredPlacement.find(c.vshard);
-                if (c.vshard >= timestar::VIRTUAL_SHARD_COUNT || !validNodeSet(c.replicas) ||
-                    (it != state_.desiredPlacement.end() && it->second == c.replicas)) {
+            } else if constexpr (std::is_same_v<T, PlanVShardMove>) {
+                if (!validNewMove(state_, c)) {
                     ok = false;
                 } else {
-                    state_.desiredPlacement[c.vshard] = c.replicas;
-                    ++state_.mapEpoch;  // only a real topology change bumps the epoch
+                    movement::MoveJob job(c.plan);
+                    const std::string payload = job.encode();
+                    state_.mapEpoch = c.plan.mapEpoch;
+                    state_.desiredPlacement[c.plan.vshard] = job.targetVoters();
+                    state_.jobs.emplace(c.jobId, Job{c.jobId, static_cast<uint32_t>(movement::MoveStep::Planned),
+                                                     false, payload});
                 }
             } else if constexpr (std::is_same_v<T, SetMetaVoters>) {
                 if (!validNodeSet(c.voters) || state_.metaVoters == c.voters)
@@ -389,26 +444,27 @@ bool Group0StateMachine::applyCommand(const ControlCommand& cmd) {
                 } else
                     ok = false;
             } else if constexpr (std::is_same_v<T, UpsertJob>) {
-                if (c.jobId.empty()) {
+                const Job incoming{c.jobId, c.step, c.done, c.payload};
+                const auto incomingMove = decodeJob(incoming);
+                auto it = state_.jobs.find(c.jobId);
+                if (!incomingMove || it == state_.jobs.end()) {
                     ok = false;
-                } else if (auto it = state_.jobs.find(c.jobId); it == state_.jobs.end()) {
-                    state_.jobs.emplace(c.jobId, Job{c.jobId, c.step, c.done, c.payload});
                 } else {
                     Job& j = it->second;
-                    // A step number identifies one immutable operation. Conflicting
-                    // payloads at the same step are rejected, as are regressions and
-                    // attempts to resurrect a completed job. The one allowed same-step
-                    // mutation is making completion sticky.
-                    if (j.done || c.step < j.step || (c.step == j.step && c.payload != j.payload)) {
+                    const auto existingMove = decodeJob(j);
+                    // A planned operation is immutable and advances exactly one
+                    // durable step at a time. Skipping a step would turn the
+                    // summary into an assertion that catch-up/config work happened
+                    // without evidence; changing the plan would authorize a
+                    // different removal under an existing job id.
+                    if (!existingMove || j.done || c.step != j.step + 1 ||
+                        incomingMove->plan() != existingMove->plan() ||
+                        incomingMove->plan().mapEpoch != state_.mapEpoch) {
                         ok = false;
-                    } else if (c.step > j.step) {
+                    } else {
                         j.step = c.step;
                         j.payload = c.payload;
                         j.done = c.done;
-                    } else if (!j.done && c.done) {
-                        j.done = true;
-                    } else {
-                        ok = false;  // exact idempotent replay
                     }
                 }
             } else if constexpr (std::is_same_v<T, MintJoinToken>) {
@@ -467,15 +523,38 @@ bool Group0StateMachine::applyCommand(const ControlCommand& cmd) {
                         }
                     }
                 }
-            } else if constexpr (std::is_same_v<T, SetInitialServingMap>) {
-                // Single-assignment by construction. A later serving-map epoch
-                // is a topology cutover and must go through the resumable data
-                // movement protocol, which is intentionally not implemented by
-                // this command.
-                if (c.map.epoch != 1 || !isCompleteControlMap(c.map) || state_.servingMap.epoch != 0)
+            } else if constexpr (std::is_same_v<T, PublishServingMap>) {
+                if (!isCompleteControlMap(c.map)) {
                     ok = false;
-                else
-                    state_.servingMap = c.map;
+                } else if (state_.servingMap.epoch == 0) {
+                    // Bootstrap is the only publication without a completed
+                    // movement proof.
+                    if (!c.completedJobId.empty() || c.map.epoch != 1 || state_.mapEpoch != 0)
+                        ok = false;
+                    else {
+                        state_.mapEpoch = 1;
+                        state_.servingMap = c.map;
+                    }
+                } else {
+                    const auto persisted = state_.jobs.find(c.completedJobId);
+                    const auto move = persisted == state_.jobs.end() ? std::optional<movement::MoveJob>{}
+                                                                     : decodeJob(persisted->second);
+                    const auto desired = move ? state_.desiredPlacement.find(move->plan().vshard)
+                                              : state_.desiredPlacement.end();
+                    if (!move || !persisted->second.done || move->plan().mapEpoch != state_.mapEpoch ||
+                        c.map.epoch != state_.mapEpoch || state_.servingMap.epoch + 1 != c.map.epoch ||
+                        desired == state_.desiredPlacement.end()) {
+                        ok = false;
+                    } else {
+                        ControlMap expected = state_.servingMap;
+                        expected.epoch = c.map.epoch;
+                        expected.placement[move->plan().vshard] = desired->second;
+                        if (desired->second != move->targetVoters() || c.map != expected)
+                            ok = false;
+                        else
+                            state_.servingMap = c.map;
+                    }
+                }
             }
         },
         cmd);
@@ -500,8 +579,11 @@ seastar::future<> Group0StateMachine::apply(raft::LogEntry entry) {
     if (auto* stamp = std::get_if<SetControllerTerm>(&*cmd))
         stamp->term = entry.term;
     rejectConflictingLocalCommand(*cmd);
-    const bool publishesServingMap =
-        servingMapObserver_ && std::holds_alternative<SetInitialServingMap>(*cmd);
+    const auto* publication = std::get_if<PublishServingMap>(&*cmd);
+    const bool advancesDurableServingMap = publication &&
+                                           (!expectedServingMap_ ||
+                                            publication->map.epoch > expectedServingMap_->epoch);
+    const bool publishesServingMap = servingMapObserver_ && advancesDurableServingMap;
     std::optional<Group0State> previous;
     if (publishesServingMap)
         previous = state_;
@@ -515,7 +597,11 @@ seastar::future<> Group0StateMachine::apply(raft::LogEntry entry) {
         // exact same committed entry.
         if (publishesServingMap)
             co_await servingMapObserver_(staged.servingMap);
+        expectedServingMap_ = staged.servingMap;
         state_ = std::move(staged);
+    } else if (applied && publication &&
+               (!expectedServingMap_ || state_.servingMap.epoch > expectedServingMap_->epoch)) {
+        expectedServingMap_ = state_.servingMap;
     }
     state_.appliedIndex = entry.index;
     co_return;
@@ -654,6 +740,9 @@ bool Group0StateMachine::loadSnapshot(const std::string& data) {
     Group0State decoded;
     if (!decodeSnapshot(data, decoded))
         return false;
+    if (decoded.servingMap.epoch != 0 &&
+        (!expectedServingMap_ || decoded.servingMap.epoch > expectedServingMap_->epoch))
+        expectedServingMap_ = decoded.servingMap;
     state_ = std::move(decoded);
     return true;
 }
@@ -666,8 +755,13 @@ seastar::future<> Group0StateMachine::applySnapshot(raft::Snapshot snap) {
     Group0State decoded;
     if (!decodeSnapshot(snap.data, decoded))
         throw std::runtime_error("group0: invalid control-state snapshot");
-    if (servingMapObserver_ && decoded.servingMap.epoch != 0)
+    const bool advancesDurableServingMap =
+        decoded.servingMap.epoch != 0 &&
+        (!expectedServingMap_ || decoded.servingMap.epoch > expectedServingMap_->epoch);
+    if (servingMapObserver_ && advancesDurableServingMap)
         co_await servingMapObserver_(decoded.servingMap);
+    if (advancesDurableServingMap)
+        expectedServingMap_ = decoded.servingMap;
     // The snapshot boundary is at least this index.
     if (snap.index > decoded.appliedIndex)
         decoded.appliedIndex = snap.index;

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "../../core/vshard.hpp"
 #include "../raft/raft_types.hpp"  // NodeId
 
 #include <algorithm>
@@ -30,6 +31,12 @@ struct MovePlan {
     uint16_t vshard = 0;
     NodeId dest = 0;
     NodeId victim = 0;  // 0 == pure grow (no removal)
+    // The group-0 desired-map epoch that authorized this move and the exact
+    // stable voter set it was planned from. A restarted controller must not
+    // apply an old removal to a group that has since changed for another reason.
+    uint64_t mapEpoch = 0;
+    std::vector<NodeId> sourceVoters;
+
     bool isReplace() const { return victim != 0; }
     friend bool operator==(const MovePlan&, const MovePlan&) = default;
     // NOTE: `victim` must NOT be the group's current leader. The plan removes a
@@ -61,6 +68,66 @@ public:
     MoveStep step() const { return step_; }
     const MovePlan& plan() const { return plan_; }
     bool done() const { return step_ == MoveStep::Done; }
+
+    std::vector<NodeId> targetVoters() const {
+        std::vector<NodeId> target = plan_.sourceVoters;
+        if (plan_.isReplace()) {
+            auto victim = std::find(target.begin(), target.end(), plan_.victim);
+            if (victim != target.end())
+                *victim = plan_.dest;  // preserve the placement/primary slot
+        } else {
+            target.push_back(plan_.dest);
+        }
+        return target;
+    }
+
+    // Structural validity is independent of live group state. The source voter
+    // vector is a set (order does not matter), contains the replace victim, and
+    // deliberately excludes the destination.
+    bool valid() const {
+        if (plan_.vshard >= timestar::VIRTUAL_SHARD_COUNT || plan_.dest == raft::kNoNode ||
+            plan_.dest == plan_.victim || plan_.mapEpoch == 0 || plan_.sourceVoters.empty() ||
+            static_cast<uint8_t>(step_) > static_cast<uint8_t>(MoveStep::Done) ||
+            (!plan_.isReplace() && step_ == MoveStep::OldRemoved))
+            return false;
+        std::vector<NodeId> source = canonical(plan_.sourceVoters);
+        if (source.front() == raft::kNoNode || std::adjacent_find(source.begin(), source.end()) != source.end() ||
+            contains(source, plan_.dest))
+            return false;
+        return !plan_.isReplace() || contains(source, plan_.victim);
+    }
+
+    // A persisted step may lag one membership commit when the controller dies
+    // after Raft applies the transition but before group 0 records the next job
+    // payload. Accept exactly those two adjacent forward states—never an
+    // arbitrary configuration that merely happens to remain above RF.
+    bool acceptsConfig(const std::vector<NodeId>& voters, const std::vector<NodeId>& learners) const {
+        if (!valid())
+            return false;
+        const auto source = canonical(plan_.sourceVoters);
+        const auto withLearner = canonical(std::vector<NodeId>{plan_.dest});
+        const auto promoted = canonical(withNode(source, plan_.dest));
+        const auto final = plan_.isReplace() ? canonical(withoutNode(promoted, plan_.victim)) : promoted;
+        const auto liveVoters = canonical(voters);
+        const auto liveLearners = canonical(learners);
+        const std::vector<NodeId> noLearners;
+
+        switch (step_) {
+            case MoveStep::Planned:
+                return liveVoters == source && (liveLearners == noLearners || liveLearners == withLearner);
+            case MoveStep::LearnerAdded:
+                return liveVoters == source && liveLearners == withLearner;
+            case MoveStep::CaughtUp:
+                return (liveVoters == source && liveLearners == withLearner) ||
+                       (liveVoters == promoted && liveLearners == noLearners);
+            case MoveStep::Promoted:
+                return (liveVoters == promoted || liveVoters == final) && liveLearners == noLearners;
+            case MoveStep::OldRemoved:
+            case MoveStep::Done:
+                return liveVoters == final && liveLearners == noLearners;
+        }
+        return false;
+    }
 
     // The step that must be performed next (the transition OUT of the current
     // step). Done stays Done.
@@ -151,6 +218,10 @@ private:
     }
     static std::vector<NodeId> withoutNode(std::vector<NodeId> v, NodeId n) {
         v.erase(std::remove(v.begin(), v.end(), n), v.end());
+        return v;
+    }
+    static std::vector<NodeId> canonical(std::vector<NodeId> v) {
+        std::sort(v.begin(), v.end());
         return v;
     }
 

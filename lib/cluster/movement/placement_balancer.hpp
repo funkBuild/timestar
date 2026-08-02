@@ -33,8 +33,11 @@ struct BalancerConfig {
 // not churn placement). Returns nullopt when no safe, beneficial move exists.
 class PlacementBalancer {
 public:
-    static std::optional<MovePlan> planOneMove(const std::map<uint16_t, std::vector<NodeId>>& placement,
+    static std::optional<MovePlan> planOneMove(uint64_t mapEpoch,
+                                               const std::map<uint16_t, std::vector<NodeId>>& placement,
                                                const std::map<NodeId, NodeLoad>& loads, const BalancerConfig& cfg) {
+        if (mapEpoch == 0)
+            return std::nullopt;
         auto normLoad = [&](NodeId n) -> double {
             auto it = loads.find(n);
             if (it == loads.end() || it->second.weight <= 0)
@@ -100,7 +103,7 @@ public:
             }
             if (domainClash)
                 continue;
-            return MovePlan{vshard, /*dest=*/dst, /*victim=*/src};
+            return MovePlan{vshard, /*dest=*/dst, /*victim=*/src, mapEpoch, /*sourceVoters=*/reps};
         }
         return std::nullopt;
     }

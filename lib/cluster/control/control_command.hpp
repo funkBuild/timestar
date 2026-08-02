@@ -1,6 +1,7 @@
 #pragma once
 
 #include "group0_state.hpp"
+#include "../movement/move_job.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -27,10 +28,12 @@ struct SetNodeState {
     NodeState state = NodeState::Joining;
 };
 
-// Sets a VShard's desired replicas and bumps mapEpoch (topology change).
-struct SetDesiredPlacement {
-    uint16_t vshard = 0;
-    std::vector<NodeId> replicas;
+// Atomically records one authorized VShard movement and its desired placement.
+// The plan is bound to the current serving map and next map epoch; only one
+// unfinished movement may exist at a time in v1.
+struct PlanVShardMove {
+    std::string jobId;
+    movement::MovePlan plan;
 };
 
 // Records the group-0 voter set (self-managed membership; the actual Raft config
@@ -88,11 +91,12 @@ struct StoreFrozenDeletePlan {
     FrozenDeletePlan plan;
 };
 
-// Publish the complete initial data-serving map atomically. This is deliberately
-// single-assignment: later topology cutovers require the resumable movement
-// protocol and must not be smuggled in as desired placement.
-struct SetInitialServingMap {
+// Publish a complete effective serving map. `completedJobId` is empty only for
+// the epoch-1 bootstrap map; later epochs require the named movement job to be
+// durably Done and must change exactly that job's VShard.
+struct PublishServingMap {
     ControlMap map;
+    std::string completedJobId;
 };
 
 enum class FrozenDeletePlanRpcOperation : uint8_t { Lookup = 0, Freeze = 1 };
@@ -124,9 +128,9 @@ struct ControlJoinResult {
 inline constexpr size_t kMaxControlJoinFrameBytes = 4096;
 
 using ControlCommand =
-    std::variant<InitCluster, UpsertNode, SetNodeState, SetDesiredPlacement, SetMetaVoters, CasPolicy,
+    std::variant<InitCluster, UpsertNode, SetNodeState, PlanVShardMove, SetMetaVoters, CasPolicy,
                  SetControllerTerm, UpsertJob, MintJoinToken, AdmitWithToken, StoreFrozenDeletePlan,
-                 SetInitialServingMap>;
+                 PublishServingMap>;
 
 // Wire serialization for a command (the Raft entry payload). Length-prefixed,
 // self-delimiting; decode returns nullopt on any malformed, truncated, or

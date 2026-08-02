@@ -133,14 +133,14 @@ enum : uint8_t {
     kInitCluster = 1,
     kUpsertNode = 2,
     kSetNodeState = 3,
-    kSetDesiredPlacement = 4,
+    kPlanVShardMove = 4,
     kSetMetaVoters = 5,
     kCasPolicy = 6,
     kSetControllerTerm = 7,
     kUpsertJob = 8,
     kMintJoinToken = 9,
     kAdmitWithToken = 10,
-    kSetInitialServingMap = 11,
+    kPublishServingMap = 11,
     kStoreFrozenDeletePlan = 12,
 };
 
@@ -256,10 +256,10 @@ std::string encodeCommand(const ControlCommand& cmd) {
                 w.u8(kSetNodeState);
                 w.u64(c.raftId);
                 w.u8(static_cast<uint8_t>(c.state));
-            } else if constexpr (std::is_same_v<T, SetDesiredPlacement>) {
-                w.u8(kSetDesiredPlacement);
-                w.u16(c.vshard);
-                w.ids(c.replicas);
+            } else if constexpr (std::is_same_v<T, PlanVShardMove>) {
+                w.u8(kPlanVShardMove);
+                w.str(c.jobId);
+                w.str(movement::MoveJob(c.plan).encode());
             } else if constexpr (std::is_same_v<T, SetMetaVoters>) {
                 w.u8(kSetMetaVoters);
                 w.ids(c.voters);
@@ -288,8 +288,9 @@ std::string encodeCommand(const ControlCommand& cmd) {
             } else if constexpr (std::is_same_v<T, StoreFrozenDeletePlan>) {
                 w.u8(kStoreFrozenDeletePlan);
                 writeFrozenDeletePlan(w, c.plan);
-            } else if constexpr (std::is_same_v<T, SetInitialServingMap>) {
-                w.u8(kSetInitialServingMap);
+            } else if constexpr (std::is_same_v<T, PublishServingMap>) {
+                w.u8(kPublishServingMap);
+                w.str(c.completedJobId);
                 writeControlMap(w, c.map);
             }
         },
@@ -324,10 +325,14 @@ std::optional<ControlCommand> decodeCommand(const std::string& bytes) {
             cmd = c;
             break;
         }
-        case kSetDesiredPlacement: {
-            SetDesiredPlacement c;
-            c.vshard = r.u16();
-            c.replicas = r.ids();
+        case kPlanVShardMove: {
+            PlanVShardMove c;
+            c.jobId = r.str();
+            auto job = movement::MoveJob::decode(r.str());
+            if (!job || job->step() != movement::MoveStep::Planned)
+                r.ok = false;
+            else
+                c.plan = job->plan();
             cmd = std::move(c);
             break;
         }
@@ -380,8 +385,9 @@ std::optional<ControlCommand> decodeCommand(const std::string& bytes) {
             cmd = std::move(c);
             break;
         }
-        case kSetInitialServingMap: {
-            SetInitialServingMap c;
+        case kPublishServingMap: {
+            PublishServingMap c;
+            c.completedJobId = r.str();
             c.map = readControlMap(r);
             cmd = std::move(c);
             break;

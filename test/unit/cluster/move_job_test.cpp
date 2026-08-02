@@ -53,10 +53,19 @@ bool sameSet(std::vector<NodeId> a, std::vector<NodeId> b) {
     return a == b;
 }
 
+MovePlan replacePlan(uint16_t vshard = 7, NodeId dest = 4, NodeId victim = 1,
+                     std::vector<NodeId> source = {1, 2, 3}) {
+    return MovePlan{vshard, dest, victim, /*mapEpoch=*/9, std::move(source)};
+}
+
+MovePlan growPlan(uint16_t vshard = 7, NodeId dest = 4, std::vector<NodeId> source = {1, 2, 3}) {
+    return MovePlan{vshard, dest, /*victim=*/0, /*mapEpoch=*/9, std::move(source)};
+}
+
 seastar::future<> testReplaceMaintainsRf() {
     MockExecutor ex;
     ex.voters_ = {1, 2, 3};
-    MoveJob job(MovePlan{/*vshard=*/7, /*dest=*/4, /*victim=*/1});
+    MoveJob job(replacePlan());
     Mover mover(/*minRf=*/3);
     co_await mover.run(job, ex);
 
@@ -80,7 +89,7 @@ seastar::future<> testReplaceMaintainsRf() {
 seastar::future<> testGrowMaintainsRf() {
     MockExecutor ex;
     ex.voters_ = {1, 2, 3};
-    MoveJob job(MovePlan{/*vshard=*/7, /*dest=*/4, /*victim=*/0});  // pure grow
+    MoveJob job(growPlan());
     Mover mover(/*minRf=*/3);
     co_await mover.run(job, ex);
     EXPECT_TRUE(job.done());
@@ -109,7 +118,7 @@ seastar::future<> testCrashResumeFromEveryStep() {
         MockExecutor ex;
         ex.voters_ = seed.voters;
         ex.learners_ = seed.learners;
-        MoveJob job(MovePlan{7, 4, 1}, seed.step);
+        MoveJob job(replacePlan(), seed.step);
         auto decoded = MoveJob::decode(job.encode());  // as persisted in a group-0 Job
         EXPECT_TRUE(decoded.has_value());
         if (decoded)
@@ -131,7 +140,7 @@ seastar::future<> testMoverGuardFiresOnUnderReplicated() {
     // rebalance progress". Nothing is committed.
     MockExecutor ex;
     ex.voters_ = {1, 2};
-    MoveJob job(MovePlan{7, 4, 1});
+    MoveJob job(replacePlan());
     Mover mover(/*minRf=*/3);
     bool threw = false;
     try {
@@ -150,7 +159,7 @@ seastar::future<> testPromoteRefusesMissingLearner() {
     MockExecutor ex;
     ex.voters_ = {1, 2, 3};
     ex.learners_ = {};  // dest 4 vanished
-    MoveJob job(MovePlan{7, 4, 1}, MoveStep::CaughtUp);
+    MoveJob job(replacePlan(), MoveStep::CaughtUp);
     Mover mover(3);
     bool threw = false;
     try {
@@ -165,11 +174,31 @@ seastar::future<> testNotLeaderStopsCleanly() {
     MockExecutor ex;
     ex.voters_ = {1, 2, 3};
     ex.leader = false;  // this node lost leadership
-    MoveJob job(MovePlan{7, 4, 1});
+    MoveJob job(replacePlan());
     Mover mover(3);
     co_await mover.run(job, ex);  // must not throw or hang
     EXPECT_FALSE(job.done());     // stopped; the current leader will redrive it
     EXPECT_TRUE(ex.voterHistory.empty());
+}
+
+seastar::future<> testStaleJobRejectsConfigurationDrift() {
+    // The persisted job says destination 4 was promoted from source {1,2,3},
+    // but the live group was independently changed to include node 5 instead.
+    // Merely checking RF would allow removal of victim 1 and silently complete
+    // with {2,3,5}; the source/step fence must reject before any config proposal.
+    MockExecutor ex;
+    ex.voters_ = {1, 2, 3, 5};
+    MoveJob job(replacePlan(), MoveStep::Promoted);
+    Mover mover(3);
+    bool threw = false;
+    try {
+        co_await mover.run(job, ex);
+    } catch (const UnsafeMove&) {
+        threw = true;
+    }
+    EXPECT_TRUE(threw);
+    EXPECT_TRUE(ex.voterHistory.empty());
+    EXPECT_EQ(job.step(), MoveStep::Promoted);
 }
 
 // A move paused (SLO breach / manual pause / cancel) after a membership change
@@ -178,7 +207,7 @@ seastar::future<> testNotLeaderStopsCleanly() {
 seastar::future<> testPauseResumeSafeForward() {
     MockExecutor ex;
     ex.voters_ = {1, 2, 3};
-    MoveJob job(MovePlan{7, 4, 1});
+    MoveJob job(replacePlan());
     Mover mover(3);
     // Gate stops the move the moment the learner has been added.
     co_await mover.run(job, ex, [&]() { return job.step() != MoveStep::LearnerAdded; });
@@ -228,20 +257,23 @@ TEST(MoveJobTest, PromoteRefusesMissingLearner) {
 TEST(MoveJobTest, NotLeaderStopsCleanly) {
     testNotLeaderStopsCleanly().get();
 }
+TEST(MoveJobTest, StaleJobRejectsConfigurationDrift) {
+    testStaleJobRejectsConfigurationDrift().get();
+}
 TEST(MoveJobTest, EncodeDecodeRoundTrip) {
     constexpr NodeId largeDestination = (NodeId{1} << 48) + 4;
     constexpr NodeId largeVictim = (NodeId{1} << 40) + 1;
-    MoveJob j(MovePlan{7, largeDestination, largeVictim}, MoveStep::Promoted);
+    MoveJob j(replacePlan(7, largeDestination, largeVictim, {1, 2, largeVictim}), MoveStep::Promoted);
     const std::string encoded = j.encode();
     EXPECT_EQ(encoded.substr(0, 5), "TSMJ1");
     auto d = MoveJob::decode(encoded);
     ASSERT_TRUE(d.has_value());
-    EXPECT_EQ(d->plan(), (MovePlan{7, largeDestination, largeVictim}));
+    EXPECT_EQ(d->plan(), replacePlan(7, largeDestination, largeVictim, {1, 2, largeVictim}));
     EXPECT_EQ(d->step(), MoveStep::Promoted);
 }
 
 TEST(MoveJobTest, RejectsUnknownOrMalformedV1Records) {
-    const std::string valid = MoveJob(MovePlan{7, 4, 1}, MoveStep::Promoted).encode();
+    const std::string valid = MoveJob(replacePlan(), MoveStep::Promoted).encode();
 
     std::string unknownVersion = valid;
     unknownVersion[4] = '2';
@@ -259,21 +291,25 @@ TEST(MoveJobTest, RejectsUnknownOrMalformedV1Records) {
     EXPECT_FALSE(MoveJob::decode(invalidVShard).has_value());
 
     std::string noDestination = valid;
-    std::fill(noDestination.begin() + 8, noDestination.begin() + 16, '\0');
+    std::fill(noDestination.begin() + 16, noDestination.begin() + 24, '\0');
     EXPECT_FALSE(MoveJob::decode(noDestination).has_value());
 
     std::string sameDestinationAndVictim = valid;
-    std::copy(sameDestinationAndVictim.begin() + 8, sameDestinationAndVictim.begin() + 16,
-              sameDestinationAndVictim.begin() + 16);
+    std::copy(sameDestinationAndVictim.begin() + 16, sameDestinationAndVictim.begin() + 24,
+              sameDestinationAndVictim.begin() + 24);
     EXPECT_FALSE(MoveJob::decode(sameDestinationAndVictim).has_value());
 
-    EXPECT_THROW(MoveJob(MovePlan{7, 0, 1}).encode(), std::invalid_argument);
-    EXPECT_THROW(MoveJob(MovePlan{7, 4, 4}).encode(), std::invalid_argument);
-    EXPECT_THROW(MoveJob(MovePlan{timestar::VIRTUAL_SHARD_COUNT, 4, 1}).encode(), std::invalid_argument);
+    EXPECT_THROW(MoveJob(MovePlan{7, 0, 1, 9, {1, 2, 3}}).encode(), std::invalid_argument);
+    EXPECT_THROW(MoveJob(MovePlan{7, 4, 4, 9, {1, 2, 4}}).encode(), std::invalid_argument);
+    EXPECT_THROW(MoveJob(MovePlan{timestar::VIRTUAL_SHARD_COUNT, 4, 1, 9, {1, 2, 3}}).encode(),
+                 std::invalid_argument);
+    EXPECT_THROW(MoveJob(MovePlan{7, 4, 1, 0, {1, 2, 3}}).encode(), std::invalid_argument);
+    EXPECT_THROW(MoveJob(MovePlan{7, 4, 1, 9, {1, 1, 2}}).encode(), std::invalid_argument);
+    EXPECT_THROW(MoveJob(MovePlan{7, 4, 1, 9, {1, 2, 4}}).encode(), std::invalid_argument);
 }
 
 TEST(MoveJobTest, ControllerRejectsInconsistentDurableJobMetadata) {
-    MoveJob move(MovePlan{7, 4, 1}, MoveStep::Promoted);
+    MoveJob move(replacePlan(), MoveStep::Promoted);
     timestar::control::Job valid{"move-7", static_cast<uint32_t>(MoveStep::Promoted), false, move.encode()};
     ASSERT_TRUE(timestar::cluster::ControllerJobDriver::decodeMoveJob(valid).has_value());
 

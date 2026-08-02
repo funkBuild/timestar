@@ -22,6 +22,12 @@ enum class NodeState : uint8_t { Joining = 0, Active = 1, Draining = 2, Down = 3
 
 inline constexpr size_t kMaxJoinTokenBytes = 1024;
 inline constexpr size_t kMaxOutstandingJoinTokens = 1024;
+inline constexpr size_t kMaxControlJobIdBytes = 256;
+inline constexpr size_t kMaxControlJobs = 4096;
+
+inline bool validControlJobId(const std::string& id) {
+    return !id.empty() && id.size() <= kMaxControlJobIdBytes;
+}
 
 inline bool validJoinToken(const std::string& token) {
     return !token.empty() && token.size() <= kMaxJoinTokenBytes;
@@ -166,7 +172,7 @@ struct Group0State {
     NodeId controllerLeader = 0;                               // node that owns controllerTerm
     std::map<NodeId, NodeRecord> nodes;                        // nodes/<uuid>
     std::map<uint16_t, std::vector<NodeId>> desiredPlacement;  // desired-placement/<vshard>
-    ControlMap servingMap;                                     // immutable initial effective serving map
+    ControlMap servingMap;                                     // current effective serving map
     std::vector<NodeId> metaVoters;                            // group-0 voter set (self-managed)
     std::map<std::string, PolicyCell> policies;                // schema/retention CAS cells
     std::map<std::string, Job> jobs;                           // jobs/<uuid>

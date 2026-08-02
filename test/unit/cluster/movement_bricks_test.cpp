@@ -52,11 +52,13 @@ TEST(PlacementBalancer, MovesFromLoadedToLightRespectingDomainAndDisk) {
         {3, {3, "rack-c", 1.0, 90, 1}},
         {4, {4, "rack-d", 1.0, 90, 0}},
     };
-    auto move = PlacementBalancer::planOneMove(placement, loads, BalancerConfig{});
+    auto move = PlacementBalancer::planOneMove(/*mapEpoch=*/9, placement, loads, BalancerConfig{});
     ASSERT_TRUE(move.has_value());
     EXPECT_EQ(move->victim, 1);  // from the most-loaded node
     EXPECT_EQ(move->dest, 4);    // to the least-loaded eligible node
     EXPECT_EQ(move->vshard, 10);
+    EXPECT_EQ(move->mapEpoch, 9u);
+    EXPECT_EQ(move->sourceVoters, (std::vector<NodeId>{1, 2, 3}));
 }
 TEST(PlacementBalancer, RejectsDiskWatermarkAndDomainClash) {
     std::map<uint16_t, std::vector<NodeId>> placement = {{10, {1, 2, 3}}};
@@ -67,7 +69,7 @@ TEST(PlacementBalancer, RejectsDiskWatermarkAndDomainClash) {
         {3, {3, "rack-c", 1.0, 90, 1}},
         {4, {4, "rack-d", 1.0, /*disk*/ 5, 0}},
     };
-    EXPECT_FALSE(PlacementBalancer::planOneMove(placement, lowDisk, BalancerConfig{}).has_value());
+    EXPECT_FALSE(PlacementBalancer::planOneMove(9, placement, lowDisk, BalancerConfig{}).has_value());
 
     // The only idle node shares a failure domain with an existing replica -> the
     // anti-affinity constraint forbids the move.
@@ -77,7 +79,7 @@ TEST(PlacementBalancer, RejectsDiskWatermarkAndDomainClash) {
         {3, {3, "rack-c", 1.0, 90, 1}},
         {4, {4, "rack-b", 1.0, 90, 0}},  // same domain as node 2
     };
-    EXPECT_FALSE(PlacementBalancer::planOneMove(placement, clash, BalancerConfig{}).has_value());
+    EXPECT_FALSE(PlacementBalancer::planOneMove(9, placement, clash, BalancerConfig{}).has_value());
 }
 TEST(PlacementBalancer, RefusesMoveToUnlabeledDomain) {
     // Destination has NO failure-domain label: distinctness cannot be proven, so
@@ -90,7 +92,7 @@ TEST(PlacementBalancer, RefusesMoveToUnlabeledDomain) {
         {3, {3, "rack-c", 1.0, 90, 1}},
         {4, {4, "", 1.0, 90, 0}},  // unlabeled destination
     };
-    EXPECT_FALSE(PlacementBalancer::planOneMove(placement, loads, BalancerConfig{}).has_value());
+    EXPECT_FALSE(PlacementBalancer::planOneMove(9, placement, loads, BalancerConfig{}).has_value());
 }
 TEST(PlacementBalancer, HysteresisSuppressesMinorImbalance) {
     std::map<uint16_t, std::vector<NodeId>> placement = {{10, {1, 2, 3}}};
@@ -101,7 +103,18 @@ TEST(PlacementBalancer, HysteresisSuppressesMinorImbalance) {
         {3, {3, "rack-c", 1.0, 90, 4}},
         {4, {4, "rack-d", 1.0, 90, 5}},
     };
-    EXPECT_FALSE(PlacementBalancer::planOneMove(placement, loads, BalancerConfig{}).has_value());
+    EXPECT_FALSE(PlacementBalancer::planOneMove(9, placement, loads, BalancerConfig{}).has_value());
+}
+
+TEST(PlacementBalancer, RefusesUnversionedTopology) {
+    std::map<uint16_t, std::vector<NodeId>> placement = {{10, {1, 2, 3}}};
+    std::map<NodeId, NodeLoad> loads = {
+        {1, {1, "rack-a", 1.0, 90, 5}},
+        {2, {2, "rack-b", 1.0, 90, 1}},
+        {3, {3, "rack-c", 1.0, 90, 1}},
+        {4, {4, "rack-d", 1.0, 90, 0}},
+    };
+    EXPECT_FALSE(PlacementBalancer::planOneMove(/*mapEpoch=*/0, placement, loads, BalancerConfig{}).has_value());
 }
 
 // ---- LeadershipBalancer ----

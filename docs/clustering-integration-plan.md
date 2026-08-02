@@ -117,14 +117,20 @@ seed. Group 0 owns cluster identity, membership/control map, jobs, join tokens,
 and frozen pattern-delete plans. Control commands use `TCC1`; snapshots use
 `TSG0SNP1`.
 
+Movement planning now atomically binds a `TSMJ1` job to the exact source voter
+set and next map epoch. Durable progress may advance only one step at a time,
+and Group 0 publishes the next complete serving map only after that exact job
+is `Done` and only when the submitted map changes its authorized VShard.
+
 Pattern delete freezes a bounded canonical target expansion in group 0 before
 any VShard delete proposal. Lookup-first retry recovers a plan that may have
 committed after an ambiguous reply. The external leader-failover/restart proof
 is still outstanding.
 
-Safe join, drain, replace, remove, movement, ordered teardown, and reclaim-floor
-publication are not yet complete through the production server. Static peer-list
-editing is not a substitute.
+The production driver and runtime publication seam are still incomplete: safe
+join, drain, replace, remove, dynamic peer/group creation, live directory
+cutover, ordered teardown, and reclaim-floor publication do not yet run end to
+end through the production server. Static peer-list editing is not a substitute.
 
 ### Storage durability
 
@@ -158,6 +164,8 @@ changes. See [protocol-versioning.md](protocol-versioning.md).
   recovery tests.
 - [x] Group-0 persistence, frozen-plan bounds, observer admission, and current
   v1 framing tests.
+- [x] Group-0 movement-plan ownership, stale-configuration fencing, sequential
+  durable progress, and exact completed-job serving-map cutover tests.
 - [x] Removal of format activation and retired protocol/layout tests.
 
 ## Remaining milestones
@@ -165,8 +173,11 @@ changes. See [protocol-versioning.md](protocol-versioning.md).
 ### 1. Complete topology ownership
 
 - Wire production join, drain, replace, and remove to group-0 jobs.
-- Drive add-learner, catch-up, promote, leadership transfer, remove-old, and
-  cleanup steps idempotently after restart.
+- Wire the bounded production driver that locates the VShard group and drives
+  add-learner, catch-up, promote, leadership transfer, remove-old, and cleanup
+  steps idempotently after restart.
+- Apply each committed serving-map epoch to the live sharded routing directory,
+  and create/register destination peers and groups before movement starts.
 - Publish teardown/reclaim floors only after durable ownership transfer.
 - Prove no acknowledged loss or duplicate VShard contribution during movement.
 

@@ -66,7 +66,7 @@ public:
     seastar::future<> start(std::vector<raft::NodeId> voters, raft::RaftOptions opts = {},
                             std::string expectedClusterUuid = {},
                             std::optional<control::NodeRecord> localRecord = std::nullopt,
-                            std::optional<control::ControlMap> expectedInitialServingMap = std::nullopt,
+                            std::optional<control::ControlMap> expectedServingMap = std::nullopt,
                             control::Group0StateMachine::ServingMapObserver servingMapObserver = {});
     void startTicking();
     seastar::future<> stop();

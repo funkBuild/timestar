@@ -29,6 +29,7 @@ using timestar::raft::RaftOptions;
 using timestar::raft::RaftPersistence;
 using timestar::raft::RaftTransport;
 using timestar::raft::Snapshot;
+namespace movement = timestar::movement;
 
 namespace {
 
@@ -156,6 +157,11 @@ FrozenDeletePlan frozenPlan(char id, char fingerprint, std::vector<FrozenDeleteT
                             std::move(targets)};
 }
 
+UpsertJob advanceMove(std::string id, movement::MoveStep step, const movement::MovePlan& plan) {
+    movement::MoveJob move(plan, step);
+    return UpsertJob{std::move(id), static_cast<uint32_t>(step), move.done(), move.encode()};
+}
+
 seastar::future<> testClusterInitGrowsMetaVotersAcrossDomains() {
     Router router;
     std::vector<std::unique_ptr<RouterTransport>> transports;
@@ -281,8 +287,11 @@ seastar::future<> testReadBarrierReconcilesControlMap() {
     conflicting.placement.at(0) = {3, 2, 1};
     EXPECT_FALSE(co_await controller.publishInitialServingMap(std::move(conflicting)));
 
-    // A committed topology change bumps the map epoch.
-    auto placement = controller.proposeCommand(SetDesiredPlacement{5, {1, 2, 3}});
+    // A movement plan atomically binds the current source membership, desired
+    // target, persisted job, and next map epoch.
+    auto addDestination = controller.proposeCommand(UpsertNode{rec(4, "rack-d")});
+    EXPECT_TRUE(co_await drive(std::move(addDestination), nodes, router));
+    auto placement = controller.planVShardMove("move-5", 5, /*destination=*/4, /*victim=*/3);
     EXPECT_FALSE(placement.available()) << "control mutation must wait for quorum commit and apply";
     EXPECT_TRUE(co_await drive(std::move(placement), nodes, router));
     const uint64_t epoch = nodes[1].sm->state().mapEpoch;
@@ -295,7 +304,33 @@ seastar::future<> testReadBarrierReconcilesControlMap() {
     timestar::raft::LogIndex readIndex = co_await drive(std::move(rb), nodes, router);
     EXPECT_GT(readIndex, 0u);
     EXPECT_EQ(nodes[1].sm->state().mapEpoch, epoch);
-    EXPECT_EQ(nodes[1].sm->state().desiredPlacement.at(5), (std::vector<NodeId>{1, 2, 3}));
+    EXPECT_EQ(nodes[1].sm->state().desiredPlacement.at(5), (std::vector<NodeId>{1, 2, 4}));
+    EXPECT_TRUE(nodes[1].sm->state().jobs.contains("move-5"));
+
+    const auto planned = movement::MoveJob::decode(nodes[1].sm->state().jobs.at("move-5").payload);
+    if (!planned)
+        throw std::runtime_error("controller persisted an invalid movement job");
+    for (const auto step : {movement::MoveStep::LearnerAdded, movement::MoveStep::CaughtUp,
+                            movement::MoveStep::Promoted, movement::MoveStep::OldRemoved,
+                            movement::MoveStep::Done}) {
+        auto persist = controller.proposeCommand(advanceMove("move-5", step, planned->plan()));
+        EXPECT_FALSE(persist.available()) << "job progress must wait for quorum apply";
+        EXPECT_TRUE(co_await drive(std::move(persist), nodes, router));
+    }
+
+    auto cutover = controller.publishCompletedMove("move-5");
+    EXPECT_FALSE(cutover.available()) << "serving-map cutover must wait for quorum apply";
+    EXPECT_TRUE(co_await drive(std::move(cutover), nodes, router));
+    ControlMap expected = serving;
+    expected.epoch = 2;
+    expected.placement.at(5) = {1, 2, 4};
+    co_await router.pump();
+    for (const auto& [id, node] : nodes)
+        EXPECT_EQ(node.sm->state().servingMap, expected) << "node " << id;
+    const auto committed = nodes[1].group->commitIndex();
+    EXPECT_TRUE(co_await controller.publishCompletedMove("move-5"));
+    EXPECT_EQ(nodes[1].group->commitIndex(), committed)
+        << "an exact cutover retry should not append another group-0 entry";
 
     // A follower's read barrier is rejected (redirect to the leader).
     bool rejected = false;

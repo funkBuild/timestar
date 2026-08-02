@@ -5,6 +5,7 @@
 #include <gtest/gtest.h>
 
 using namespace timestar::control;
+namespace movement = timestar::movement;
 
 namespace {
 NodeRecord node(NodeId id, std::string uuid, NodeState state = NodeState::Active) {
@@ -19,6 +20,16 @@ ControlMap servingMap() {
     return map;
 }
 
+movement::MovePlan movePlan() {
+    return movement::MovePlan{/*vshard=*/7, /*dest=*/4, /*victim=*/1, /*mapEpoch=*/2,
+                              /*sourceVoters=*/{1, 2, 3}};
+}
+
+UpsertJob advance(std::string id, movement::MoveStep step, movement::MovePlan plan = movePlan()) {
+    movement::MoveJob move(std::move(plan), step);
+    return UpsertJob{std::move(id), static_cast<uint32_t>(step), move.done(), move.encode()};
+}
+
 FrozenDeletePlan plan() {
     return FrozenDeletePlan{std::string(32, '1'), std::string(32, 'a'), 1'800'000'000'000,
                             {{"cpu,host=a value", 10, 20}, {"cpu,host=b value", 30, 40}}};
@@ -30,15 +41,15 @@ TEST(ControlCommandV1, RoundTripsEveryCommand) {
         InitCluster{"cluster-a"},
         UpsertNode{node(7, "uuid-7")},
         SetNodeState{7, NodeState::Draining},
-        SetDesiredPlacement{42, {1, 2, 3}},
+        PlanVShardMove{"move-42", movePlan()},
         SetMetaVoters{{1, 2, 3}},
         CasPolicy{"schema/cpu/value", 0, "float"},
         SetControllerTerm{9, 3},
-        UpsertJob{"job-1", 5, true, "payload"},
+        advance("move-42", movement::MoveStep::Done),
         MintJoinToken{"token"},
         AdmitWithToken{node(8, "uuid-8", NodeState::Joining), "token"},
         StoreFrozenDeletePlan{plan()},
-        SetInitialServingMap{ControlMap{1, {{0, {1, 2, 3}}}, {{0, 7}}}}};
+        PublishServingMap{ControlMap{1, {{0, {1, 2, 3}}}, {{0, 7}}}, {}}};
 
     for (const auto& command : commands) {
         const auto encoded = encodeCommand(command);
@@ -57,6 +68,12 @@ TEST(ControlCommandV1, RejectsTruncationCorruptionAndTrailingBytes) {
     badMagic[0] ^= 1;
     EXPECT_FALSE(decodeCommand(badMagic));
     EXPECT_FALSE(decodeCommand(encoded + "x"));
+
+    auto move = encodeCommand(PlanVShardMove{"move-42", movePlan()});
+    const auto nested = move.find("TSMJ1");
+    ASSERT_NE(nested, std::string::npos);
+    move[nested + 4] = '2';
+    EXPECT_FALSE(decodeCommand(move)) << "TCC1 must not hide a retired nested movement version";
 }
 
 TEST(ControlRpcV1, FrozenPlanFramesRoundTripAndFailClosed) {
@@ -108,24 +125,61 @@ TEST(Group0StateMachineV1, AppliesIdentityPolicyMembershipAndTokens) {
     EXPECT_FALSE(sm.applyCommand(InitCluster{"cluster-b"}));
     EXPECT_TRUE(sm.applyCommand(UpsertNode{node(1, "uuid-1")}));
     EXPECT_FALSE(sm.applyCommand(UpsertNode{node(2, "uuid-1")}));
-    EXPECT_TRUE(sm.applyCommand(SetDesiredPlacement{7, {1, 2, 3}}));
-    EXPECT_EQ(sm.state().mapEpoch, 1u);
+    EXPECT_TRUE(sm.applyCommand(PublishServingMap{servingMap(), {}}));
+    EXPECT_TRUE(sm.applyCommand(UpsertNode{node(4, "uuid-4")}));
+    EXPECT_TRUE(sm.applyCommand(PlanVShardMove{"move-7", movePlan()}));
+    EXPECT_EQ(sm.state().desiredPlacement.at(7), (std::vector<NodeId>{4, 2, 3}));
+    EXPECT_EQ(sm.state().jobs.at("move-7").step, 0u);
+    EXPECT_FALSE(sm.applyCommand(PlanVShardMove{"move-8", movePlan()}))
+        << "only one unfinished topology mutation is allowed";
+    EXPECT_EQ(sm.state().mapEpoch, 2u);
     EXPECT_TRUE(sm.applyCommand(SetMetaVoters{{1, 2, 3}}));
     EXPECT_TRUE(sm.applyCommand(CasPolicy{"schema/cpu/value", 0, "float"}));
     EXPECT_FALSE(sm.applyCommand(CasPolicy{"schema/cpu/value", 0, "integer"}));
     EXPECT_EQ(sm.state().policies.at("schema/cpu/value").version, 1u);
 
     EXPECT_TRUE(sm.applyCommand(MintJoinToken{"join-once"}));
-    EXPECT_TRUE(sm.applyCommand(AdmitWithToken{node(4, "uuid-4", NodeState::Joining), "join-once"}));
-    EXPECT_FALSE(sm.applyCommand(AdmitWithToken{node(5, "uuid-5", NodeState::Joining), "join-once"}));
-    EXPECT_TRUE(sm.applyCommand(SetNodeState{4, NodeState::Active}));
+    EXPECT_TRUE(sm.applyCommand(AdmitWithToken{node(5, "uuid-5", NodeState::Joining), "join-once"}));
+    EXPECT_FALSE(sm.applyCommand(AdmitWithToken{node(6, "uuid-6", NodeState::Joining), "join-once"}));
+    EXPECT_TRUE(sm.applyCommand(SetNodeState{5, NodeState::Active}));
 }
 
-TEST(Group0StateMachineV1, ServingMapAndFrozenPlansAreSingleAssignmentAndIdempotent) {
+TEST(Group0StateMachineV1, ServingMapCutoverRequiresExactCompletedMovementJob) {
     Group0StateMachine sm;
     const auto map = servingMap();
-    EXPECT_TRUE(sm.applyCommand(SetInitialServingMap{map}));
-    EXPECT_FALSE(sm.applyCommand(SetInitialServingMap{map}));
+    EXPECT_TRUE(sm.applyCommand(PublishServingMap{map, {}}));
+    EXPECT_FALSE(sm.applyCommand(PublishServingMap{map, {}}));
+    EXPECT_TRUE(sm.applyCommand(UpsertNode{node(4, "uuid-4")}));
+    ASSERT_TRUE(sm.applyCommand(PlanVShardMove{"move-7", movePlan()}));
+
+    ControlMap next = map;
+    next.epoch = 2;
+    next.placement.at(7) = {4, 2, 3};
+    EXPECT_FALSE(sm.applyCommand(PublishServingMap{next, "move-7"}))
+        << "routing must not cut over before the membership job is done";
+    EXPECT_FALSE(sm.applyCommand(advance("move-7", movement::MoveStep::CaughtUp)))
+        << "durable job progress cannot skip LearnerAdded";
+    auto inconsistent = advance("move-7", movement::MoveStep::LearnerAdded);
+    inconsistent.step = static_cast<uint32_t>(movement::MoveStep::CaughtUp);
+    EXPECT_FALSE(sm.applyCommand(inconsistent))
+        << "the replicated job summary must match its TSMJ1 payload";
+    auto changed = movePlan();
+    changed.dest = 5;
+    EXPECT_FALSE(sm.applyCommand(advance("move-7", movement::MoveStep::LearnerAdded, changed)))
+        << "a persisted job id cannot be rebound to another topology plan";
+    for (auto step : {movement::MoveStep::LearnerAdded, movement::MoveStep::CaughtUp,
+                      movement::MoveStep::Promoted, movement::MoveStep::OldRemoved,
+                      movement::MoveStep::Done})
+        ASSERT_TRUE(sm.applyCommand(advance("move-7", step))) << static_cast<unsigned>(step);
+
+    auto wrong = next;
+    wrong.placement.at(8) = {4, 2, 3};
+    EXPECT_FALSE(sm.applyCommand(PublishServingMap{wrong, "move-7"}))
+        << "one completed job cannot authorize an unrelated VShard cutover";
+    EXPECT_TRUE(sm.applyCommand(PublishServingMap{next, "move-7"}));
+    EXPECT_EQ(sm.state().servingMap, next);
+    EXPECT_FALSE(sm.applyCommand(PublishServingMap{next, "move-7"}));
+
     EXPECT_TRUE(sm.applyCommand(StoreFrozenDeletePlan{plan()}));
     EXPECT_FALSE(sm.applyCommand(StoreFrozenDeletePlan{plan()}));
     auto conflicting = plan();
@@ -138,7 +192,7 @@ TEST(Group0SnapshotV1, RoundTripsAndRejectsMalformedState) {
     Group0StateMachine source;
     ASSERT_TRUE(source.applyCommand(InitCluster{"cluster-a"}));
     ASSERT_TRUE(source.applyCommand(UpsertNode{node(1, "uuid-1")}));
-    ASSERT_TRUE(source.applyCommand(SetInitialServingMap{servingMap()}));
+    ASSERT_TRUE(source.applyCommand(PublishServingMap{servingMap(), {}}));
     ASSERT_TRUE(source.applyCommand(StoreFrozenDeletePlan{plan()}));
 
     const auto snapshot = source.snapshot();
@@ -155,4 +209,57 @@ TEST(Group0SnapshotV1, RoundTripsAndRejectsMalformedState) {
     corrupt[0] ^= 1;
     EXPECT_FALSE(restored.loadSnapshot(corrupt));
     EXPECT_EQ(restored.state(), source.state());
+}
+
+TEST(Group0SnapshotV1, DurableServingMapHighWaterDoesNotRegressDuringReplay) {
+    Group0StateMachine source;
+    const auto initial = servingMap();
+    ASSERT_TRUE(source.applyCommand(PublishServingMap{initial, {}}));
+    ASSERT_TRUE(source.applyCommand(UpsertNode{node(4, "uuid-4")}));
+    ASSERT_TRUE(source.applyCommand(PlanVShardMove{"move-7", movePlan()}));
+    for (const auto step : {movement::MoveStep::LearnerAdded, movement::MoveStep::CaughtUp,
+                            movement::MoveStep::Promoted, movement::MoveStep::OldRemoved,
+                            movement::MoveStep::Done})
+        ASSERT_TRUE(source.applyCommand(advance("move-7", step)));
+
+    ControlMap cutover = initial;
+    cutover.epoch = 2;
+    cutover.placement.at(7) = {4, 2, 3};
+    const std::string beforeCutover = source.snapshot();
+
+    Group0StateMachine recovered;
+    recovered.expectServingMap(cutover);
+    size_t cacheWrites = 0;
+    recovered.setServingMapObserver([&cacheWrites](ControlMap) {
+        ++cacheWrites;
+        return seastar::make_ready_future<>();
+    });
+    ASSERT_TRUE(recovered.loadSnapshot(beforeCutover));
+    EXPECT_EQ(recovered.state().servingMap, initial)
+        << "the retained Group-0 log still has to replay the cutover";
+
+    timestar::raft::LogEntry entry;
+    entry.term = 3;
+    entry.index = 50;
+    entry.data = encodeCommand(PublishServingMap{cutover, "move-7"});
+    EXPECT_NO_THROW(recovered.apply(std::move(entry)).get());
+    EXPECT_EQ(recovered.state().servingMap, cutover);
+    EXPECT_EQ(cacheWrites, 0u)
+        << "replaying an older snapshot/log must not rewrite an already-current durable cache";
+
+    Group0StateMachine staleCache;
+    staleCache.expectServingMap(initial);
+    std::optional<ControlMap> published;
+    staleCache.setServingMapObserver([&published](ControlMap map) {
+        published = std::move(map);
+        return seastar::make_ready_future<>();
+    });
+    timestar::raft::Snapshot snapshot;
+    snapshot.index = 50;
+    snapshot.term = 3;
+    snapshot.data = recovered.snapshot();
+    EXPECT_NO_THROW(staleCache.applySnapshot(std::move(snapshot)).get());
+    ASSERT_TRUE(published);
+    EXPECT_EQ(*published, cutover)
+        << "a newer recovered map must advance the durable local routing cache";
 }

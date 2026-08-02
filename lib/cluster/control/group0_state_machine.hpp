@@ -20,13 +20,13 @@ class Group0StateMachine : public raft::RaftStateMachine {
 public:
     using ServingMapObserver = std::function<seastar::future<>(ControlMap)>;
 
-    // Install the node-local recovery fence before any snapshot/log entry is
-    // applied. The replicated state remains node-independent; this expectation
-    // only makes this process fail-stop if committed control state names a
-    // different cluster or rebinds its persistent identity.
+    // Install node-local recovery fences before any snapshot/log entry is
+    // applied. The serving-map value is a durable high-water mark: older
+    // snapshots/log entries may replay without regressing it, while a different
+    // map claiming the same epoch fails closed.
     void expectLocalIdentity(std::string clusterUuid, NodeRecord localRecord);
-    void expectInitialServingMap(ControlMap map);
-    // Called after an initial serving map is logically applied but before Raft
+    void expectServingMap(ControlMap map);
+    // Called after a serving map is logically applied but before Raft
     // advances its applied boundary. Production uses this to durably publish
     // control_map.cache; failure retries the same idempotent entry.
     void setServingMapObserver(ServingMapObserver observer);
@@ -58,7 +58,7 @@ private:
     Group0State state_;
     std::string expectedClusterUuid_;
     std::optional<NodeRecord> expectedLocalRecord_;
-    std::optional<ControlMap> expectedInitialServingMap_;
+    std::optional<ControlMap> expectedServingMap_;
     ServingMapObserver servingMapObserver_;
 };
 

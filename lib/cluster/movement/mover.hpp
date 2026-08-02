@@ -62,9 +62,13 @@ public:
     // completes the SAFE FORWARD transition rather than rolling anything back.
     seastar::future<> run(MoveJob& job, MoveExecutor& exec, std::function<bool()> mayProceed = [] { return true; }) {
         const size_t minRf = minRf_;
+        if (!job.valid())
+            throw UnsafeMove("movement job is structurally invalid");
         while (!job.done()) {
             if (!mayProceed())
                 co_return;  // paused/cancelled: stop in a safe forward-committed state
+            if (!job.acceptsConfig(exec.voters(), exec.learners()))
+                throw UnsafeMove("live membership does not match the movement job's authorized source/step");
             const MoveStep next = job.nextStep();
             if (next == MoveStep::CaughtUp) {
                 // Snapshot install + log replay to the cutover. Not a membership

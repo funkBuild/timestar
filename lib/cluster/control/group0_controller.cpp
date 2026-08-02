@@ -1,6 +1,7 @@
 #include "group0_controller.hpp"
 
 #include <algorithm>
+#include <limits>
 #include <seastar/core/coroutine.hh>
 #include <stdexcept>
 
@@ -218,9 +219,64 @@ seastar::future<bool> Group0Controller::publishInitialServingMap(ControlMap map)
         co_return false;
     if (sm_.state().servingMap.epoch != 0)
         co_return sm_.state().servingMap == map;
-    if (!co_await proposeCommand(SetInitialServingMap{map}))
+    if (!co_await proposeCommand(PublishServingMap{map, {}}))
         co_return false;
     co_return sm_.state().servingMap == map;
+}
+
+seastar::future<bool> Group0Controller::planVShardMove(std::string jobId, uint16_t vshard,
+                                                       NodeId destination, NodeId victim) {
+    if (!g0_.isLeader() || !validControlJobId(jobId) || destination == raft::kNoNode ||
+        vshard >= timestar::VIRTUAL_SHARD_COUNT)
+        co_return false;
+    if (const auto existing = sm_.state().jobs.find(jobId); existing != sm_.state().jobs.end()) {
+        const auto move = movement::MoveJob::decode(existing->second.payload);
+        co_return move && move->plan().vshard == vshard && move->plan().dest == destination &&
+                  move->plan().victim == victim;
+    }
+    if (!isCompleteControlMap(sm_.state().servingMap) ||
+        sm_.state().mapEpoch != sm_.state().servingMap.epoch ||
+        sm_.state().mapEpoch == std::numeric_limits<uint64_t>::max())
+        co_return false;
+    const auto source = sm_.state().servingMap.placement.find(vshard);
+    if (source == sm_.state().servingMap.placement.end())
+        co_return false;
+    movement::MovePlan plan{vshard, destination, victim, sm_.state().mapEpoch + 1, source->second};
+    movement::MoveJob job(plan);
+    if (!job.valid())
+        co_return false;
+    const std::string expectedId = jobId;
+    if (!co_await proposeCommand(PlanVShardMove{std::move(jobId), std::move(plan)}))
+        co_return false;
+    const auto persisted = sm_.state().jobs.find(expectedId);
+    if (persisted == sm_.state().jobs.end())
+        co_return false;
+    auto decoded = movement::MoveJob::decode(persisted->second.payload);
+    co_return decoded && persisted->second.step == static_cast<uint32_t>(decoded->step()) &&
+              persisted->second.done == decoded->done();
+}
+
+seastar::future<bool> Group0Controller::publishCompletedMove(std::string jobId) {
+    if (!g0_.isLeader() || !validControlJobId(jobId))
+        co_return false;
+    const auto persisted = sm_.state().jobs.find(jobId);
+    if (persisted == sm_.state().jobs.end() || !persisted->second.done)
+        co_return false;
+    auto move = movement::MoveJob::decode(persisted->second.payload);
+    if (!move || !move->done() || move->plan().mapEpoch != sm_.state().mapEpoch)
+        co_return false;
+    const auto current = sm_.state().servingMap.placement.find(move->plan().vshard);
+    if (sm_.state().servingMap.epoch == move->plan().mapEpoch)
+        co_return current != sm_.state().servingMap.placement.end() &&
+                  current->second == move->targetVoters();
+    if (sm_.state().servingMap.epoch + 1 != move->plan().mapEpoch)
+        co_return false;
+    ControlMap next = sm_.state().servingMap;
+    next.epoch = move->plan().mapEpoch;
+    next.placement[move->plan().vshard] = move->targetVoters();
+    if (!co_await proposeCommand(PublishServingMap{next, std::move(jobId)}))
+        co_return false;
+    co_return sm_.state().servingMap == next;
 }
 
 seastar::future<bool> Group0Controller::reconcileMetaVoters() {

@@ -675,7 +675,8 @@ TEST_F(EngineRf3Test, MoverReplacesFollowerAcrossFourNodes) {
                 persisted.push_back(j.step());
                 return seastar::make_ready_future<>();
             });
-        movement::MoveJob job(movement::MovePlan{/*vshard=*/1, /*dest=*/4, /*victim=*/3});
+        movement::MoveJob job(
+            movement::MovePlan{/*vshard=*/1, /*dest=*/4, /*victim=*/3, /*mapEpoch=*/2, voters});
         movement::Mover mover(/*minRf=*/3);
 
         auto mf = mover.run(job, exec);
@@ -772,7 +773,8 @@ TEST_F(EngineRf3Test, BalancerSelectedMoveExecutesEndToEnd) {
         };
         std::map<uint16_t, std::vector<NodeId>> placement = {{1, {1, 2, 3}}};
 
-        auto plan = movement::PlacementBalancer::planOneMove(placement, loads, movement::BalancerConfig{});
+        auto plan = movement::PlacementBalancer::planOneMove(/*mapEpoch=*/2, placement, loads,
+                                                              movement::BalancerConfig{});
         ASSERT_TRUE(plan.has_value()) << "balancer must propose a move off the overloaded node";
         EXPECT_EQ(plan->dest, 4u);
         EXPECT_EQ(plan->victim, 3u) << "the overloaded node's replica is the one moved";
@@ -868,7 +870,8 @@ TEST_F(EngineRf3Test, ThrottlePausesMoveSafeForwardThenResumes) {
 
         cluster::RaftGroupMoveExecutor exec(
             *reps[leader].group, [](const movement::MoveJob&) { return seastar::make_ready_future<>(); });
-        movement::MoveJob job(movement::MovePlan{/*vshard=*/1, /*dest=*/4, /*victim=*/3});
+        movement::MoveJob job(
+            movement::MovePlan{/*vshard=*/1, /*dest=*/4, /*victim=*/3, /*mapEpoch=*/2, voters});
         movement::Mover mover(/*minRf=*/3);
 
         // Run 1: pause AFTER the learner is added (mayProceed false on the 2nd check),
@@ -961,7 +964,8 @@ TEST_F(EngineRf3Test, ControllerDrivesPersistedMoveJobToCompletion) {
         ASSERT_TRUE(reps[leader].group->isLeader());
 
         // A persisted group-0 Job carrying a replace-move 3 -> 4.
-        movement::MoveJob mj(movement::MovePlan{/*vshard=*/1, /*dest=*/4, /*victim=*/3});
+        movement::MoveJob mj(
+            movement::MovePlan{/*vshard=*/1, /*dest=*/4, /*victim=*/3, /*mapEpoch=*/2, voters});
         control::Job job{"job-move-1", 0, false, mj.encode()};
 
         std::vector<control::Job> persisted;
@@ -1059,7 +1063,8 @@ TEST_F(EngineRf3Test, OperatorPauseResumeGovernsRealMove) {
         // Operator PAUSE: movement must not proceed; a move started now does nothing.
         ops.pause();
         EXPECT_FALSE(ops.status().running);
-        movement::MoveJob job(movement::MovePlan{/*vshard=*/1, /*dest=*/4, /*victim=*/3});
+        movement::MoveJob job(
+            movement::MovePlan{/*vshard=*/1, /*dest=*/4, /*victim=*/3, /*mapEpoch=*/2, voters});
         auto paused = mover.run(job, exec, mayProceed);
         for (int i = 0; i < 200 && !paused.available(); ++i)
             tickAll();

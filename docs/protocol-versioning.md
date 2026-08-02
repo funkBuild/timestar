@@ -21,7 +21,7 @@ historical-reader guarantees during the greenfield phase.
 | Control command | `TCC1` |
 | Frozen delete-plan RPC frame | version byte `1` |
 | Group-0 snapshot | `TSG0SNP1` |
-| Persisted VShard movement job | `TSMJ1` |
+| Persisted VShard movement job | `TSMJ1`: step, VShard, target map epoch, full-width destination/victim IDs, exact source voters |
 | Raft envelope | `TSR1` |
 | Raft journal snapshot record | `TSRSNAP1` |
 | WAL segment | `TSWL` plus little-endian `uint32(1)` |

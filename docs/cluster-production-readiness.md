@@ -45,6 +45,9 @@ inventory and rules.
   round-trip, bounds, corruption, and unknown-version rejection tests.
 - [x] Corrected proposal sizing for the promoted delta-varint v1 layout by
   charging the exact encoded size rather than a retired cross-version ratio.
+- [x] Bound each `TSMJ1` movement job to its exact source voters and target map
+  epoch, made Group 0 create the job and desired placement atomically, and made
+  serving-map cutover require that exact job to reach `Done`.
 
 ## Remaining production blockers
 
@@ -55,8 +58,11 @@ production deploy.
 
 - [ ] **Complete topology mutation through group 0.** Join, drain, replace,
   remove, VShard movement, ordered teardown, and reclaim-floor publication must
-  be exercised through the production server. Editing a static peer list is not
-  a safe topology operation.
+  be exercised through the production server. Group 0 now validates durable
+  movement plans/progress and exact one-VShard cutover, but the production job
+  driver, live directory update, dynamic peer/group creation, operator API, and
+  teardown/reclaim sequence remain unfinished. Editing a static peer list is
+  not a safe topology operation.
 - [ ] **Replicate retention policy and cutoff decisions.** Partitioned mode must
   never let replicas expire or compact different logical ranges. Until then,
   retention mutation must remain fail-closed.

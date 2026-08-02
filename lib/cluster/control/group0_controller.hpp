@@ -64,6 +64,17 @@ public:
     // its own resumable protocol.
     seastar::future<bool> publishInitialServingMap(ControlMap map);
 
+    // Atomically create one movement job from the current serving membership.
+    // The controller, not the caller, supplies the authoritative source voters
+    // and next map epoch so an operator cannot forge a stale removal plan.
+    seastar::future<bool> planVShardMove(std::string jobId, uint16_t vshard, NodeId destination,
+                                        NodeId victim = raft::kNoNode);
+
+    // Publish the next serving-map epoch only after the named movement job is
+    // durably Done. The state machine independently re-derives and validates the
+    // one-VShard cutover before accepting it.
+    seastar::future<bool> publishCompletedMove(std::string jobId);
+
     // Recompute the desired meta voters and, if they differ from the current
     // group-0 configuration, drive a joint-consensus membership change and mirror
     // the new set into the state machine. The acknowledgement waits for final
