@@ -15,8 +15,12 @@
 #include "tsm.hpp"
 #include "zigzag.hpp"
 
+#include <fcntl.h>
+
 #include <array>
 #include <chrono>
+#include <cstring>
+#include <exception>
 #include <filesystem>
 #include <optional>
 #include <seastar/core/file.hh>
@@ -24,6 +28,7 @@
 #include <seastar/core/iostream.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/seastar.hh>
+#include <seastar/core/temporary_buffer.hh>
 #include <seastar/core/thread.hh>
 #include <seastar/core/timer.hh>
 #include <seastar/coroutine/maybe_yield.hh>
@@ -36,6 +41,20 @@ static_assert(static_cast<int>(WALValueType::String) == static_cast<int>(TSMValu
 static_assert(static_cast<int>(WALValueType::Integer) == static_cast<int>(TSMValueType::Integer));
 
 namespace fs = std::filesystem;
+
+namespace {
+
+constexpr auto OPEN_NOFOLLOW = static_cast<seastar::open_flags>(O_NOFOLLOW);
+
+std::array<char, WAL_HEADER_SIZE> walV1Header() {
+    std::array<char, WAL_HEADER_SIZE> header{};
+    std::memcpy(header.data(), WAL_V1_MAGIC, sizeof(WAL_V1_MAGIC));
+    for (size_t i = 0; i < sizeof(WAL_VERSION); ++i)
+        header[sizeof(WAL_V1_MAGIC) + i] = static_cast<char>((WAL_VERSION >> (8 * i)) & 0xff);
+    return header;
+}
+
+}  // namespace
 
 // ------------------------ WAL ------------------------
 
@@ -56,83 +75,134 @@ WAL::~WAL() {
 }
 
 seastar::future<> WAL::init(MemoryStore* /*store*/) {
-    std::string filename = this->filename();
+    const std::string filename = this->filename();
+    const std::string creatingFilename = layout_.walCreationTemporaryFile(shardId_, sequenceNumber).string();
+    const fs::path parentPath = fs::path(filename).parent_path();
+    const std::string parent = parentPath.empty() ? "." : parentPath.string();
 
-    // Ensure directory exists (blocking call, run off reactor thread)
-    bool fileExisted = false;
-    co_await seastar::async([&] {
-        try {
-            fs::create_directories(fs::path(filename).parent_path());
-        } catch (...) {
-            // best-effort
-        }
-        fileExisted = fs::exists(filename);
-    });
+    struct ExistingPaths {
+        bool final = false;
+        bool creating = false;
+    };
 
-    std::string_view filenameView{filename};
-
-    // A WAL segment is created once and never reopened for append.
-    seastar::open_flags openFlags;
-    if (fileExisted) {
-        openFlags = seastar::open_flags::rw;
-    } else {
-        // A non-empty path may be the only durable copy of acknowledged data.
-        // Never truncate it merely because sequence allocation collided. The
-        // one safe retry case is an empty artifact left by a prior creation
-        // whose directory barrier failed before the WAL became writable.
-        openFlags = seastar::open_flags::rw | seastar::open_flags::create | seastar::open_flags::exclusive;
-        timestar::wal_log.debug("Creating fresh WAL {}", filename);
+    ExistingPaths existing;
+    try {
+        existing = co_await seastar::async([&] {
+            fs::create_directories(parentPath);
+            const auto inspect = [](const std::string& path, std::string_view role) {
+                const auto status = fs::symlink_status(path);
+                if (!fs::exists(status))
+                    return false;
+                if (!fs::is_regular_file(status))
+                    throw std::runtime_error("WAL " + std::string(role) + " path is not a regular file: " + path);
+                return true;
+            };
+            return ExistingPaths{inspect(filename, "final"), inspect(creatingFilename, "creation temporary")};
+        });
+    } catch (...) {
+        _closed = true;
+        throw;
     }
 
-    walFile = co_await seastar::open_file_dma(filenameView, openFlags);
+    // A final segment is immutable and may be the only copy of acknowledged
+    // writes. Atomic publication means even a zero-entry final contains its v1
+    // header, so there is no longer a legitimate empty-final retry case.
+    if (existing.final) {
+        _closed = true;
+        throw std::runtime_error("Refusing to overwrite existing WAL file: " + filename);
+    }
+
+    // The reserved temporary never receives entries, so a crash can leave no
+    // acknowledged state there. Remove an exact stale temporary before retrying
+    // the same sequence, and make that namespace transition durable.
+    if (existing.creating) {
+        try {
+            co_await seastar::remove_file(creatingFilename);
+            co_await directorySync_(parent);
+        } catch (...) {
+            _closed = true;
+            throw;
+        }
+    }
+
+    timestar::wal_log.debug("Creating fresh WAL {} through {}", filename, creatingFilename);
+
+    // Build a complete, durable v1 header in a private inode. A final `.wal`
+    // name must never refer to this inode until the header flush succeeds.
+    seastar::file creatingFile;
+    std::exception_ptr creationError;
+    try {
+        creatingFile =
+            co_await seastar::open_file_dma(creatingFilename, seastar::open_flags::rw | seastar::open_flags::create |
+                                                                  seastar::open_flags::exclusive | OPEN_NOFOLLOW);
+        if (!creatingFile)
+            throw std::runtime_error("Failed to open WAL creation temporary: " + creatingFilename);
+
+        const auto header = walV1Header();
+        const size_t diskAlignment = creatingFile.disk_write_dma_alignment();
+        if (diskAlignment == 0)
+            throw std::runtime_error("WAL creation temporary reported zero DMA alignment: " + creatingFilename);
+        const size_t paddedSize = ((header.size() + diskAlignment - 1) / diskAlignment) * diskAlignment;
+        auto buffer = seastar::temporary_buffer<char>::aligned(creatingFile.memory_dma_alignment(), paddedSize);
+        std::memset(buffer.get_write(), 0, paddedSize);
+        std::memcpy(buffer.get_write(), header.data(), header.size());
+
+        size_t offset = 0;
+        size_t remaining = paddedSize;
+        while (remaining > 0) {
+            const size_t written = co_await creatingFile.dma_write(offset, buffer.get(), remaining);
+            if (written == 0 || written > remaining || (written % diskAlignment) != 0)
+                throw std::runtime_error("WAL creation temporary returned an invalid DMA write count: " +
+                                         creatingFilename);
+            offset += written;
+            remaining -= written;
+            if (remaining > 0)
+                std::memmove(buffer.get_write(), buffer.get() + written, remaining);
+        }
+        co_await creatingFile.truncate(header.size());
+        co_await creatingFile.flush();
+    } catch (...) {
+        creationError = std::current_exception();
+    }
+    if (creatingFile) {
+        try {
+            co_await creatingFile.close();
+        } catch (...) {
+            if (!creationError)
+                creationError = std::current_exception();
+        }
+    }
+    if (creationError) {
+        _closed = true;
+        std::rethrow_exception(creationError);
+    }
+
+    try {
+        if (creationCheckpointHook_)
+            creationCheckpointHook_(WALCreationCheckpoint::HeaderDurable);
+
+        // link(2) is the no-replace publication primitive: unlike rename, it
+        // cannot overwrite a segment that appeared after the preflight check.
+        // The temporary and final names are in one directory and briefly refer
+        // to the same already-synced inode.
+        co_await seastar::link_file(creatingFilename, filename);
+        if (creationCheckpointHook_)
+            creationCheckpointHook_(WALCreationCheckpoint::FinalNameLinked);
+        co_await seastar::remove_file(creatingFilename);
+        co_await directorySync_(parent);
+
+        // The stream starts at offset zero, so it rewrites the identical header
+        // before appending entries. Until that buffered rewrite reaches disk,
+        // the atomically-published header above remains a valid recovery image.
+        walFile = co_await seastar::open_file_dma(filename, seastar::open_flags::rw | OPEN_NOFOLLOW);
+    } catch (...) {
+        _closed = true;
+        throw;
+    }
 
     if (!walFile) {
-        throw std::runtime_error("Failed to open WAL file: " + filename);
-    }
-
-    if (fileExisted) {
-        uint64_t existingSize = 0;
-        std::exception_ptr sizeError;
-        try {
-            existingSize = co_await walFile.size();
-        } catch (...) {
-            sizeError = std::current_exception();
-        }
-        if (sizeError) {
-            try {
-                co_await walFile.close();
-            } catch (...) {}
-            _closed = true;
-            std::rethrow_exception(sizeError);
-        }
-        if (existingSize != 0) {
-            try {
-                co_await walFile.close();
-            } catch (...) {}
-            _closed = true;
-            throw std::runtime_error("Refusing to overwrite existing non-empty WAL file: " + filename);
-        }
-        timestar::wal_log.info("Retrying fresh creation over empty WAL artifact {}", filename);
-    }
-
-    // Make the segment name durable before any write can be acknowledged. This
-    // is required even when a prior failed init left the path visible: only a
-    // successful directory sync closes that earlier uncertain create window.
-    // On failure, close the just-opened descriptor before propagating so startup
-    // and rollover fail cleanly without leaking a file handle.
-    std::exception_ptr directorySyncError;
-    try {
-        fs::path parent = fs::path(filename).parent_path();
-        co_await directorySync_(parent.empty() ? "." : parent.string());
-    } catch (...) {
-        directorySyncError = std::current_exception();
-    }
-    if (directorySyncError) {
-        try {
-            co_await walFile.close();
-        } catch (...) {}
         _closed = true;
-        std::rethrow_exception(directorySyncError);
+        throw std::runtime_error("Failed to open WAL file: " + filename);
     }
 
     timestar::wal_log.debug("WAL file opened: {}", filename);
@@ -172,13 +242,10 @@ seastar::future<> WAL::init(MemoryStore* /*store*/) {
     auto s = co_await seastar::make_file_output_stream(walFile, opts);
     out.emplace(std::move(s));
 
-    char header[WAL_HEADER_SIZE];
-    std::memcpy(header, WAL_V1_MAGIC, sizeof(WAL_V1_MAGIC));
-    for (size_t i = 0; i < sizeof(WAL_VERSION); ++i)
-        header[sizeof(WAL_V1_MAGIC) + i] = static_cast<char>((WAL_VERSION >> (8 * i)) & 0xff);
-    co_await out->write(header, sizeof(header));
-    currentSize = sizeof(header);
-    _unflushed_bytes = sizeof(header);
+    const auto header = walV1Header();
+    co_await out->write(header.data(), header.size());
+    currentSize = header.size();
+    _unflushed_bytes = header.size();
 
     // Durability mode (see wal_sync_mode in timestar_config.hpp).  Validation
     // already rejected unknown strings; default to the safe mode regardless.
@@ -1030,7 +1097,7 @@ seastar::future<> WALReader::readAll(MemoryStore* store) {
             }
 
             // sanity
-            static constexpr uint32_t MIN_ENTRY_SIZE = 5;  // CRC32 + WALType
+            static constexpr uint32_t MIN_ENTRY_SIZE = 5;                 // CRC32 + WALType
             static constexpr uint32_t MAX_ENTRY_SIZE = 10 * 1024 * 1024;  // 10MB
 
             if (entryLength < MIN_ENTRY_SIZE || entryLength > MAX_ENTRY_SIZE) {
@@ -1055,9 +1122,9 @@ seastar::future<> WALReader::readAll(MemoryStore* store) {
             const uint32_t computedCrc = CRC32::compute(payloadPtr, payloadSize);
             if (storedCrc != computedCrc) {
                 ++partialEntries;
-                throw std::runtime_error(fmt::format(
-                    "WAL recovery: CRC32 mismatch in {} (stored=0x{:08X}, computed=0x{:08X})", filename,
-                    storedCrc, computedCrc));
+                throw std::runtime_error(
+                    fmt::format("WAL recovery: CRC32 mismatch in {} (stored=0x{:08X}, computed=0x{:08X})", filename,
+                                storedCrc, computedCrc));
             }
 
             Slice entrySlice(payloadPtr, payloadSize);

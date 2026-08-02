@@ -1,7 +1,9 @@
 // Unit tests for the PlacementTable virtual shard abstraction (Phase 5).
 
 #include "../../../lib/core/placement_table.hpp"
+
 #include "../../../lib/core/series_id.hpp"
+#include "../../../lib/utils/series_key.hpp"
 
 #include <gtest/gtest.h>
 
@@ -46,8 +48,7 @@ TEST(PlacementTableTest, CoreForHashEqualsModulo) {
         auto pt = timestar::PlacementTable::buildLocal(N);
         for (size_t h = 0; h < 10000; ++h) {
             unsigned expected = N <= 1 ? 0 : static_cast<unsigned>(h % N);
-            EXPECT_EQ(pt.coreForHash(h), expected)
-                << "N=" << N << " hash=" << h;
+            EXPECT_EQ(pt.coreForHash(h), expected) << "N=" << N << " hash=" << h;
         }
     }
 }
@@ -71,10 +72,8 @@ TEST(PlacementTableTest, RouteToCoreMatchesManualHash) {
     timestar::setGlobalPlacement(std::move(pt));
 
     std::vector<std::string> keys = {
-        "cpu,host=server01 usage",
-        "memory,host=server02 free",
-        "disk,dc=us-east,host=db01 iops",
-        "temperature,location=us-west value",
+        "cpu,host=server01 usage",        "memory,host=server02 free",
+        "disk,dc=us-east,host=db01 iops", "temperature,location=us-west value",
         "network,host=router01 bytes_in",
     };
 
@@ -82,8 +81,7 @@ TEST(PlacementTableTest, RouteToCoreMatchesManualHash) {
         SeriesId128 id = SeriesId128::fromSeriesKey(key);
         size_t hash = SeriesId128::Hash{}(id);
         unsigned expected = static_cast<unsigned>(hash % N);
-        EXPECT_EQ(timestar::routeToCore(id), expected)
-            << "key=" << key;
+        EXPECT_EQ(timestar::routeToCore(id), expected) << "key=" << key;
     }
 }
 
@@ -102,8 +100,14 @@ TEST(PlacementTableTest, VshardForHashMasks12Bits) {
 TEST(PlacementTableTest, VirtualShardConvenience) {
     SeriesId128 id = SeriesId128::fromSeriesKey("test,tag=value field");
     size_t hash = SeriesId128::Hash{}(id);
-    EXPECT_EQ(timestar::virtualShard(id),
-              static_cast<uint16_t>(hash & timestar::VIRTUAL_SHARD_MASK));
+    EXPECT_EQ(timestar::virtualShard(id), static_cast<uint16_t>(hash & timestar::VIRTUAL_SHARD_MASK));
+}
+
+TEST(PlacementTableTest, TopologyGateProbeIsPinnedToVShardZero) {
+    const auto key = timestar::buildSeriesKey("topology_probe", {{"host", "h1438"}}, "value");
+    EXPECT_EQ(key, "topology_probe,host=h1438 value");
+    EXPECT_EQ(timestar::virtualShard(SeriesId128::fromSeriesKey(key)), 0u)
+        << "the production topology gate moves VShard 0 and must not become vacuous";
 }
 
 // ---------------------------------------------------------------------------
@@ -120,10 +124,8 @@ TEST(PlacementTableTest, JsonRoundTrip) {
 
     // Verify every vshard mapping matches
     for (uint16_t v = 0; v < timestar::VIRTUAL_SHARD_COUNT; ++v) {
-        EXPECT_EQ(restored.mapping(v).serverId, original.mapping(v).serverId)
-            << "vshard=" << v;
-        EXPECT_EQ(restored.mapping(v).coreId, original.mapping(v).coreId)
-            << "vshard=" << v;
+        EXPECT_EQ(restored.mapping(v).serverId, original.mapping(v).serverId) << "vshard=" << v;
+        EXPECT_EQ(restored.mapping(v).coreId, original.mapping(v).coreId) << "vshard=" << v;
     }
 }
 

@@ -486,6 +486,24 @@ TEST_F(ShardRaftPlaneTest, ProposeOverSocketSplitsAcrossOwningShardsAndFailsClea
             shards.invoke_on_all([published](cluster::ShardRaftPlane& p) { EXPECT_EQ(p.directory().map(), published); })
                 .get();
 
+            // A delayed lower-epoch notification must be rejected for both
+            // routing and teardown. Before the reconciliation fence, the
+            // directory stayed at epoch 2 but this stale placement still
+            // retired vs1 from the host.
+            ControlMap stale = published;
+            stale.epoch = 1;
+            stale.placement[vs1] = {2};
+            const unsigned vs1Shard = cluster::shardForGroup(vs1);
+            EXPECT_FALSE(
+                shards.invoke_on(vs1Shard, [stale](cluster::ShardRaftPlane& p) { return p.updateServingMap(stale); })
+                    .get());
+            EXPECT_TRUE(
+                shards.invoke_on(vs1Shard, [vs1](cluster::ShardRaftPlane& p) { return p.plane().host().hosts(vs1); })
+                    .get())
+                << "a stale serving map must not authorize replica retirement";
+            EXPECT_EQ(
+                shards.invoke_on(vs1Shard, [](cluster::ShardRaftPlane& p) { return p.directory().epoch(); }).get(), 2u);
+
             // (a2) The PRODUCTION listener is per-shard-distributing. Several peer
             // connections must be SERVED by more than one shard: this is what pins
             // ShardRaftPlane::startDataPlane's perShardListener=true. Flipping it to

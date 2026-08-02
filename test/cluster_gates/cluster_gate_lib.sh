@@ -60,7 +60,10 @@ gate_exit() {
 }
 
 # remove_gate_data_dirs DIR... -- remove only this harness's narrowly-named
-# /tmp roots, retrying races and proving they are gone before returning.
+# roots under /tmp or build/tmp, retrying races and proving they are gone before
+# returning. New low-volume correctness gates prefer build/tmp so they do not
+# consume the host's quota-limited tmpfs; historical load gates retain /tmp so
+# their recorded I/O shape stays comparable.
 #
 # A plain `rm -rf; mkdir -p` is not a reset unless removal actually succeeded.
 # snapshot_durability_gate exposed this with "Directory not empty" and then
@@ -70,8 +73,12 @@ gate_exit() {
 remove_gate_data_dirs() {
     local d suffix pass remaining
     for d in "$@"; do
-        suffix="${d#/tmp/tsgate_}"
-        if [ "$suffix" = "$d" ] || [ -z "$suffix" ] || [[ "$suffix" == */* ]]; then
+        case "$d" in
+            /tmp/tsgate_*) suffix="${d#/tmp/tsgate_}" ;;
+            "$BUILD_DIR"/tmp/tsgate_*) suffix="${d#"$BUILD_DIR"/tmp/tsgate_}" ;;
+            *) suffix="" ;;
+        esac
+        if [ -z "$suffix" ] || [[ "$suffix" == */* ]]; then
             echo "ABORT: refusing to recursively remove non-gate path: $d" >&2
             return 2
         fi

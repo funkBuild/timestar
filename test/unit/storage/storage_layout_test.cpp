@@ -25,6 +25,7 @@ TEST(StorageLayoutTest, DefaultRootProducesCanonicalV1Names) {
     EXPECT_EQ(layout.shardDir(0), "shard_0");
     EXPECT_EQ(layout.shardDir(17), "shard_17");
     EXPECT_EQ(layout.walFile(3, 42), "shard_3/0000000042.wal");
+    EXPECT_EQ(layout.walCreationTemporaryFile(3, 42), "shard_3/0000000042.wal.creating");
     EXPECT_EQ(layout.tsmDir(3), "shard_3/tsm");
     EXPECT_EQ(layout.tsmFile(3, "2_99.tsm"), "shard_3/tsm/2_99.tsm");
     EXPECT_EQ(layout.tsmTombstoneFile(3, "2_99.tsm"), "shard_3/tsm/2_99.tombstone");

@@ -9,6 +9,7 @@
 #include "../../../lib/cluster/control/control_map_cache.hpp"
 #include "../../../lib/cluster/data/snapshot_payload.hpp"
 #include "../../../lib/cluster/integration/replica_engine_reader.hpp"
+#include "../../../lib/cluster/integration/retirement_fault_injection.hpp"
 #include "../../../lib/cluster/raft/raft_journal_persistence.hpp"
 #include "../../../lib/core/placement_table.hpp"  // virtualShard
 #include "../../../lib/core/vshard.hpp"
@@ -97,6 +98,32 @@ bool engineHasMeasurement(seastar::sharded<Engine>& engines, const std::string& 
     return !result.series.empty();
 }
 }  // namespace
+
+TEST(RetirementFaultInjectionTest, IsAbsentUnlessBothValuesAreUnset) {
+    using timestar::cluster::parseRetirementCrashSpec;
+    EXPECT_FALSE(parseRetirementCrashSpec(nullptr, nullptr, true, true));
+    EXPECT_FALSE(parseRetirementCrashSpec("", "", true, true));
+    EXPECT_THROW(parseRetirementCrashSpec("journal-quarantined", nullptr, true, true), std::invalid_argument);
+    EXPECT_THROW(parseRetirementCrashSpec(nullptr, "0", true, true), std::invalid_argument);
+}
+
+TEST(RetirementFaultInjectionTest, RequiresTheExplicitLocalControlTestShape) {
+    using timestar::cluster::parseRetirementCrashSpec;
+    EXPECT_THROW(parseRetirementCrashSpec("journal-quarantined", "0", false, true), std::invalid_argument);
+    EXPECT_THROW(parseRetirementCrashSpec("journal-quarantined", "0", true, false), std::invalid_argument);
+}
+
+TEST(RetirementFaultInjectionTest, ParsesOnlyNamedBoundariesAndBoundedDecimalVShards) {
+    using namespace timestar::cluster;
+    EXPECT_EQ(parseRetirementCrashSpec("engine-wal-generation-deleted", "0", true, true),
+              (RetirementCrashSpec{0, RetirementCrashPoint::EngineWalGenerationDeleted}));
+    EXPECT_EQ(parseRetirementCrashSpec("journal-quarantined", "4095", true, true),
+              (RetirementCrashSpec{4095, RetirementCrashPoint::JournalQuarantined}));
+    for (const char* badPoint : {"", "engine", "JournalQuarantined"})
+        EXPECT_THROW(parseRetirementCrashSpec(badPoint, "0", true, true), std::invalid_argument);
+    for (const char* badVShard : {"", "-1", "+1", "1x", "4096", "999999999999999999999"})
+        EXPECT_THROW(parseRetirementCrashSpec("journal-quarantined", badVShard, true, true), std::invalid_argument);
+}
 
 TEST_F(ReplicatedVShardHostTest, HostsVShardAndReplicatesThroughRaft) {
     seastar::async([] {
@@ -195,8 +222,9 @@ TEST_F(ReplicatedVShardHostTest, DynamicCreationValidatesRecoveredConfigBeforeRe
         EXPECT_TRUE(host.hosts(8));
         control::ControlMap preCutover;
         preCutover.epoch = 1;
-        preCutover.placement[8] = {2, 3};
-        EXPECT_EQ(host.reconcileServingMap(preCutover).get(), 0u)
+        for (uint16_t vs = 0; vs < timestar::VIRTUAL_SHARD_COUNT; ++vs)
+            preCutover.placement[vs] = {2, 3};
+        EXPECT_EQ(host.reconcileCommittedServingMap(preCutover).get(), 0u)
             << "a materialized movement destination must survive while the old serving map still excludes it";
         EXPECT_TRUE(host.hosts(8));
         host.stop().get();
@@ -228,15 +256,48 @@ TEST_F(ReplicatedVShardHostTest, RetiredReplicaJournalIsQuarantinedThenReclaimed
         for (uint16_t vs = 0; vs < timestar::VIRTUAL_SHARD_COUNT; ++vs)
             cutover.placement[vs] = {2, 3, 4};
 
+        bool sawEngineRetirementBoundary = false;
+        eng->invoke_on(assignCore(VShardId{vshard}, seastar::smp::count),
+                       [&](Engine& engine) {
+                           engine.setSnapshotInstallCheckpointForTesting([&](VShardId reachedVShard,
+                                                                             SnapshotInstallCheckpoint checkpoint,
+                                                                             SnapshotInstallPurpose purpose) {
+                               EXPECT_EQ(reachedVShard, VShardId{vshard});
+                               EXPECT_EQ(purpose, SnapshotInstallPurpose::ReplicaRetirement);
+                               if (checkpoint == SnapshotInstallCheckpoint::WalGenerationDeleted)
+                                   sawEngineRetirementBoundary = true;
+                           });
+                       })
+            .get();
+        bool sawQuarantineBoundary = false;
+        host.setRetirementCheckpointForTesting(
+            [&](uint16_t reachedVShard, cluster::ReplicaRetirementCheckpoint checkpoint) {
+                EXPECT_EQ(reachedVShard, vshard);
+                EXPECT_EQ(checkpoint, cluster::ReplicaRetirementCheckpoint::JournalQuarantined);
+                sawQuarantineBoundary = true;
+                const fs::path retired = jroot / "retired" / "v1_vshard_9_epoch_7";
+                EXPECT_TRUE(fs::is_directory(retired));
+                EXPECT_FALSE(fs::exists(jroot / "vshard_9"));
+                size_t markers = 0;
+                for (const auto& entry : fs::directory_iterator(retired))
+                    markers += entry.path().filename().string().starts_with("retired_at_") ? 1u : 0u;
+                EXPECT_EQ(markers, 0u) << "the crash boundary must precede grace-marker creation";
+            });
+
         auto inFlightHostOperation = host.holdVShardOperation(vshard);
         ASSERT_TRUE(inFlightHostOperation);
         auto pendingApply = host.group(vshard)->waitApplied(UINT64_MAX);
         ASSERT_FALSE(pendingApply.available());
-        auto retirement = host.reconcileServingMap(cutover);
+        auto retirement = host.reconcileCommittedServingMap(cutover);
         EXPECT_FALSE(retirement.available());
         EXPECT_THROW(pendingApply.get(), std::runtime_error);
         inFlightHostOperation.reset();
         EXPECT_EQ(retirement.get(), 1u);
+        EXPECT_TRUE(sawEngineRetirementBoundary);
+        EXPECT_TRUE(sawQuarantineBoundary);
+        eng->invoke_on(assignCore(VShardId{vshard}, seastar::smp::count),
+                       [](Engine& engine) { engine.setSnapshotInstallCheckpointForTesting({}); })
+            .get();
         EXPECT_FALSE(host.hosts(vshard));
         EXPECT_EQ(host.replicasRetired(), 1u);
         EXPECT_EQ(host.journalRetention().released(VShardId{vshard}), UINT64_MAX);
@@ -279,7 +340,7 @@ TEST_F(ReplicatedVShardHostTest, RetiredReplicaJournalIsQuarantinedThenReclaimed
     }).get();
 }
 
-TEST_F(ReplicatedVShardHostTest, ReplicaRetirementRequiresAppliedMembershipRemoval) {
+TEST_F(ReplicatedVShardHostTest, CommittedServingMapCanFenceAVictimThatDidNotReceiveFinalCnew) {
     seastar::async([] {
         ScopedShardedEngine eng;
         eng.start();
@@ -292,6 +353,24 @@ TEST_F(ReplicatedVShardHostTest, ReplicaRetirementRequiresAppliedMembershipRemov
         EXPECT_THROW(host.retireVShard(10, 2).get(), std::runtime_error);
         EXPECT_TRUE(host.hosts(10));
         EXPECT_TRUE(fs::is_directory(jroot / "vshard_10"));
+
+        // Joint consensus needs an old-config quorum, not an acknowledgement
+        // from every old voter. A removed member can therefore remain on the
+        // preceding config forever. The validated Group-0 cutover is the
+        // cluster-wide proof that the exact move reached Done; depending on a
+        // victim-local final Cnew would make removal depend on the victim.
+        control::ControlMap cutover;
+        cutover.epoch = 2;
+        cutover.placement[10] = {2, 3, 4};
+        EXPECT_THROW(host.reconcileCommittedServingMap(cutover).get(), std::invalid_argument)
+            << "a partial placement is not a Group-0 retirement certificate";
+        cutover.placement.clear();
+        for (uint16_t vs = 0; vs < timestar::VIRTUAL_SHARD_COUNT; ++vs)
+            cutover.placement[vs] = {2, 3, 4};
+        EXPECT_EQ(host.reconcileCommittedServingMap(cutover).get(), 1u);
+        EXPECT_FALSE(host.hosts(10));
+        EXPECT_FALSE(fs::exists(jroot / "vshard_10"));
+        EXPECT_TRUE(fs::is_directory(jroot / "retired" / "v1_vshard_10_epoch_2"));
 
         host.stop().get();
         fs::remove_all(jroot);

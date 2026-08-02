@@ -34,6 +34,10 @@ public:
     [[nodiscard]] std::optional<unsigned> parseShardDirName(std::string_view name) const;
     [[nodiscard]] bool isShardNamespaceEntry(std::string_view name) const noexcept;
     [[nodiscard]] std::filesystem::path walFile(unsigned shard, uint64_t sequence) const;
+    // Reserved publication temporary for a WAL segment. It never receives
+    // entries: only a durable v1 header is written before the inode is linked
+    // into its final `.wal` name.
+    [[nodiscard]] std::filesystem::path walCreationTemporaryFile(unsigned shard, uint64_t sequence) const;
     [[nodiscard]] std::filesystem::path tsmDir(unsigned shard) const;
     [[nodiscard]] std::filesystem::path tsmFile(unsigned shard, const std::filesystem::path& filename) const;
     [[nodiscard]] std::filesystem::path tsmTombstoneFile(unsigned shard,

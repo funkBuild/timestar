@@ -383,6 +383,11 @@ std::optional<seastar::gate::holder> ReplicatedVShardHost::holdVShardOperation(u
 }
 
 seastar::future<bool> ReplicatedVShardHost::retireVShard(uint16_t vshard, uint64_t mapEpoch) {
+    co_return co_await retireVShard(vshard, mapEpoch, RetirementAuthority::AppliedRaftConfiguration);
+}
+
+seastar::future<bool> ReplicatedVShardHost::retireVShard(uint16_t vshard, uint64_t mapEpoch,
+                                                         RetirementAuthority authority) {
     if (mapEpoch == 0)
         throw std::invalid_argument("ReplicatedVShardHost::retireVShard: map epoch must be non-zero");
     if (sharedJournalEnabled())
@@ -399,9 +404,16 @@ seastar::future<bool> ReplicatedVShardHost::retireVShard(uint16_t vshard, uint64
         const auto containsSelf = [this](const std::vector<NodeId>& nodes) {
             return std::find(nodes.begin(), nodes.end(), self_) != nodes.end();
         };
-        if (containsSelf(config.voters) || containsSelf(config.votersOutgoing) || containsSelf(config.learners))
+        const bool locallyStillMember =
+            containsSelf(config.voters) || containsSelf(config.votersOutgoing) || containsSelf(config.learners);
+        if (locallyStillMember && authority != RetirementAuthority::CommittedServingMap)
             throw std::runtime_error("cluster: refusing to retire VShard " + std::to_string(vshard) +
                                      " before this node is absent from its applied Raft configuration");
+        if (locallyStillMember)
+            timestar::http_log.info(
+                "cluster: retiring VShard {} from committed serving-map epoch {}; the removed member did not "
+                "receive final Cnew, but Group 0 committed the exact completed movement proof",
+                vshard, mapEpoch);
     } else if (!state->second.retiring || state->second.retirementEpoch == 0) {
         throw std::runtime_error("cluster: refusing to retire VShard " + std::to_string(vshard) +
                                  " without its applied Raft configuration");
@@ -451,6 +463,9 @@ seastar::future<bool> ReplicatedVShardHost::retireVShard(uint16_t vshard, uint64
     co_await seastar::sync_directory(journalRoot_.string());
     co_await seastar::sync_directory(retiredRoot.string());
 
+    if (retirementCheckpointHook_)
+        retirementCheckpointHook_(vshard, ReplicaRetirementCheckpoint::JournalQuarantined);
+
     co_await ensureRetiredJournalMarker(destination);
 
     vshards_.erase(state);
@@ -460,7 +475,9 @@ seastar::future<bool> ReplicatedVShardHost::retireVShard(uint16_t vshard, uint64
     co_return true;
 }
 
-seastar::future<size_t> ReplicatedVShardHost::reconcileServingMap(const control::ControlMap& map) {
+seastar::future<size_t> ReplicatedVShardHost::reconcileCommittedServingMap(const control::ControlMap& map) {
+    if (!control::isCompleteControlMap(map))
+        throw std::invalid_argument("cluster: replica retirement requires a complete committed serving map");
     std::vector<uint16_t> retired;
     retired.reserve(vshards_.size());
     for (auto& [vshard, state] : vshards_) {
@@ -479,7 +496,7 @@ seastar::future<size_t> ReplicatedVShardHost::reconcileServingMap(const control:
     }
     size_t count = 0;
     for (uint16_t vshard : retired)
-        if (co_await retireVShard(vshard, map.epoch))
+        if (co_await retireVShard(vshard, map.epoch, RetirementAuthority::CommittedServingMap))
             ++count;
     co_return count;
 }

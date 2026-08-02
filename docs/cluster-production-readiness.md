@@ -92,11 +92,15 @@ inventory and rules.
   learner, or voter reference remains, and transfers data-group leadership away
   from a replacement victim before removing it.
 - [x] Retire a removed local data-group replica after committed serving-map
-  cutover. The victim first proves its applied Raft configuration no longer
-  contains this node, refuses new host operations, drains in-flight Raft work,
-  installs a durable empty Engine generation, publishes a terminal reclaim
-  floor, closes the writer, and atomically moves the journal into an exact-v1,
-  epoch-named quarantine. Empty-generation install quiesces the VShard WAL,
+  cutover. The complete committed Group-0 map, whose publication required the
+  exact movement job to reach `Done`, is the cluster-wide retirement
+  certificate; teardown cannot depend on a removed victim receiving final
+  `Cnew`. The lower-level direct retirement API remains stricter and requires a
+  victim-local configuration that excludes this node. Retirement refuses new
+  host operations, drains in-flight Raft work, installs a durable empty Engine
+  generation, publishes a terminal reclaim floor, closes the writer, and
+  atomically moves the journal into an exact-v1, epoch-named quarantine.
+  Empty-generation install quiesces the VShard WAL,
   publishes durable memory and mixed-TSM fences, removes exact primary, type,
   postings, and day-discovery index state, immediately unlinks VShard-pure TSM
   objects, and leaves mixed-object bytes for the ordinary tombstone rewrite.
@@ -110,6 +114,27 @@ inventory and rules.
   protected from being mistaken for obsolete replicas. Group-0 topology startup
   rejects the optional shared-journal layout until it has an equally safe
   per-group retirement generation protocol.
+- [x] Publish every fresh Engine WAL atomically with a valid v1 header. Creation
+  writes and flushes the exact header under a canonical `.wal.creating` name,
+  publishes it with a no-replace same-directory link, removes the private name,
+  and syncs the parent directory. Startup removes only exact reserved creation
+  temporaries and rejects non-regular or non-canonical entries. A forced process
+  exit can therefore expose either no final WAL or a recoverable final WAL,
+  never the empty final file found by the topology crash gate. Focused tests
+  cover failure before publication, failure after final-name publication,
+  immediate independent recovery before append/close, retry, and refusal to
+  truncate an existing generation.
+- [x] Exercise exact VShard topology mutation through the production server.
+  `topology_mutation_gate.sh` admits four nodes through Group 0, moves a checked
+  VShard away and back twice under writes, forces process exit after Engine WAL
+  generation deletion and after journal quarantine, recovers both windows,
+  expires and reclaims the v1 quarantine, and materializes the deleted replica
+  again from survivors. The 2026-08-02 run reached serving-map epoch 5: 1,219 of
+  1,220 writes were acknowledged (one bounded retryable response), every
+  acknowledged point was visible on all four nodes, no node returned a larger
+  count, unauthenticated drain was rejected, premature removal failed closed,
+  every node reported protocol version 1, and no process crashed outside the two
+  asserted exit-86 checkpoints.
 - [x] Disable the standalone, local-clock retention sweeper in partitioned mode
   and make the exact-v1 replicated cutoff command measurement-scoped. Replicas
   apply the controller-provided cutoff without consulting local time, walk the
@@ -124,19 +149,16 @@ production deploy.
 
 ### P0 — correctness and topology
 
-- [ ] **Complete topology mutation through group 0.** Join, drain, replace,
-  remove, VShard movement, ordered teardown, and reclaim-floor publication must
-  be exercised through the production server. Group 0 now validates durable
-  movement plans/progress, exact one-VShard cutover, and live sharded directory
-  publication, dynamic peer registration, and destination data-group creation,
-  plus the bounded production scheduler/remote leader actuator and authenticated
-  intent-only move/drain/remove routes. Post-cutover local Raft teardown,
-  terminal reclaim-floor publication, exact-v1 journal quarantine, grace, and
-  journal-file deletion and crash-retryable Engine-generation reclamation are
-  now wired. The remaining blocker is a multi-process production-server gate
-  that proves no lost or duplicate contribution across cutover, crash during
-  Engine cleanup or journal quarantine, grace expiry, and later movement back.
-  Editing a static peer list is not a safe topology operation.
+- [ ] **Complete node-wide evacuation and successful removal.** The production
+  gate now proves admission, exact one-VShard replacement, ordered teardown,
+  reclaim-floor publication, both retirement crash windows, authenticated drain,
+  and fail-closed premature removal. `drainNode` currently commits `Draining` and
+  reconciles Group-0 voters, but it does not create and drive the complete set of
+  VShard movement jobs needed to evacuate the node. Implement the bounded,
+  restart-safe evacuation workflow (or an equally explicit durable operator
+  workflow), then exercise the final accepted `Draining -> Removed` transition
+  through the production server. Editing a static peer list is not a safe
+  topology operation.
 - [ ] **Replicate retention policy and cutoff decisions.** Partitioned mode must
   never let replicas expire or compact different logical ranges. Local-clock
   sweeping is now disabled and a bounded per-VShard replicated cutoff can be
@@ -195,9 +217,12 @@ Production approval requires all of the following:
 
 ## Verification policy
 
-Memory-sensitive verification is serial: build with `-j1`, run Seastar tests
-with `--smp=1` and an explicit memory limit, and keep temporary files under
-`build/tmp`. Live multi-process gates are not run concurrently on one host.
+Builds may compile concurrently, but compiler temporaries must stay under the
+disk-backed `build/tmp` rather than the quota-limited `/tmp`. Run memory-heavy
+Seastar test processes one at a time with explicit `--smp` and `--memory`
+limits. Live multi-process gates use an explicit per-process memory cap, keep
+low-volume correctness roots under `build/tmp`, and are not run concurrently on
+one host.
 
 The live-directory gate covers stale update rejection, idempotent replay,
 same-epoch conflict, incomplete-map rejection, and independent routing views on
@@ -220,9 +245,10 @@ floor, exact-v1 quarantine, both restart recovery windows, grace-period no-op,
 durable generation deletion, and protection of a materialized pre-cutover
 destination. They also cover durable empty Engine-generation installation and
 removal of a retired VShard from a day-discovery bitmap shared with a live
-VShard. The production server build pins the authenticated route composition;
-the remaining multi-process topology gate must exercise those routes over HTTP
-and prove Engine-data reclaim as well as journal teardown/reclaim.
+VShard. The production server gate exercises those routes over HTTP and proves
+Engine-data reclaim, journal teardown/reclaim, exact failpoint exit status and
+all acknowledged-point readback. It does not yet prove whole-node evacuation or
+a successful final node removal.
 
 The retention-cutoff gate covers exact-v1 validation and round trip, bounded
 catalog pagination, measurement isolation, VShard isolation, and preservation

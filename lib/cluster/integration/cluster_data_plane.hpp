@@ -390,6 +390,13 @@ public:
     seastar::future<ControlMutationResult> drainControlNode(NodeId node);
     seastar::future<ControlMutationResult> removeControlNode(NodeId node);
 
+    // Process-level acceptance gates use this seam to stop at the exact durable
+    // active->quarantine boundary. It is inert unless the server explicitly
+    // arms an unsafe local-test failpoint; ordinary production configuration
+    // has no caller and pays only the host's predictable empty-hook branch.
+    seastar::future<> setReplicaRetirementCheckpointForTesting(uint16_t vshard,
+                                                               ReplicatedVShardHost::RetirementCheckpointHook hook);
+
     // Fail startup before accepting traffic when the configured reactor count
     // cannot produce complete single-core VShard snapshots.
     static void validateCoreTopology(unsigned coreCount, uint16_t replicationFactor);

@@ -2,6 +2,7 @@
 #include "cluster/integration/group0_identity_bridge.hpp"
 #include "cluster/integration/group0_startup.hpp"
 #include "cluster/integration/node_identity.hpp"
+#include "cluster/integration/retirement_fault_injection.hpp"
 #include "config/timestar_config.hpp"
 #include "core/engine.hpp"
 #include "core/placement_table.hpp"
@@ -31,9 +32,11 @@
 
 #include <atomic>
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <seastar/core/app-template.hh>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/prometheus.hh>
@@ -105,6 +108,14 @@ static bool ensureReplicatedClusterOpenFileLimit() {
     timestar::http_log.info("Raised RLIMIT_NOFILE soft limit from {} to {} for replicated VShard journals", previous,
                             REPLICATED_CLUSTER_MIN_OPEN_FILES);
     return true;
+}
+
+[[noreturn]] static void crashAtRetirementCheckpoint(const timestar::cluster::RetirementCrashSpec& spec,
+                                                     std::string_view checkpoint) {
+    timestar::http_log.error(
+        "UNSAFE TEST FAILPOINT: exiting at replica-retirement checkpoint '{}' for VShard {} with status {}", checkpoint,
+        spec.vshard, timestar::cluster::kRetirementCrashExitCode);
+    std::_Exit(timestar::cluster::kRetirementCrashExitCode);
 }
 
 // Per-shard stream handler pointer, used to call stop() during shutdown.
@@ -809,6 +820,18 @@ int main(int argc, char** argv) {
                 }
             }
 
+            std::optional<timestar::cluster::RetirementCrashSpec> retirementCrash;
+            try {
+                const auto& cc = timestar::config().cluster;
+                retirementCrash = timestar::cluster::parseRetirementCrashSpec(
+                    std::getenv("TIMESTAR_UNSAFE_TEST_RETIREMENT_CRASH"),
+                    std::getenv("TIMESTAR_UNSAFE_TEST_RETIREMENT_VSHARD"), cc.development_allow_insecure_transport,
+                    cc.control_enabled);
+            } catch (const std::exception& e) {
+                timestar::http_log.error("Invalid unsafe retirement test failpoint: {}", e.what());
+                return 1;
+            }
+
             // Resolve the data root from [server] data_dir (default "." = CWD).
             // All shard directories (shard_N), placement.json and
             // shard_count.meta live under this directory.
@@ -1021,6 +1044,44 @@ int main(int argc, char** argv) {
                         g_clusterDataPlane.setTlsCredentials(*clusterTls);
                     g_clusterDataPlane.start(cc, g_engine).get();
                     g_clusterPartitioned = true;
+                    if (retirementCrash) {
+                        const auto spec = *retirementCrash;
+                        timestar::http_log.warn(
+                            "UNSAFE TEST FAILPOINT armed for VShard {}; this process will exit during replica "
+                            "retirement",
+                            spec.vshard);
+                        if (spec.point == timestar::cluster::RetirementCrashPoint::EngineWalGenerationDeleted) {
+                            const unsigned owner =
+                                timestar::assignCore(timestar::VShardId{spec.vshard}, seastar::smp::count);
+                            g_engine
+                                .invoke_on(
+                                    owner,
+                                    [spec](Engine& engine) {
+                                        engine.setSnapshotInstallCheckpointForTesting(
+                                            [spec](timestar::VShardId vshard, SnapshotInstallCheckpoint checkpoint,
+                                                   SnapshotInstallPurpose purpose) {
+                                                if (vshard.value() == spec.vshard &&
+                                                    purpose == SnapshotInstallPurpose::ReplicaRetirement &&
+                                                    checkpoint == SnapshotInstallCheckpoint::WalGenerationDeleted) {
+                                                    crashAtRetirementCheckpoint(spec, "engine-wal-generation-deleted");
+                                                }
+                                            });
+                                    })
+                                .get();
+                        } else {
+                            g_clusterDataPlane
+                                .setReplicaRetirementCheckpointForTesting(
+                                    spec.vshard,
+                                    [spec](uint16_t vshard, timestar::cluster::ReplicaRetirementCheckpoint checkpoint) {
+                                        if (vshard == spec.vshard &&
+                                            checkpoint ==
+                                                timestar::cluster::ReplicaRetirementCheckpoint::JournalQuarantined) {
+                                            crashAtRetirementCheckpoint(spec, "journal-quarantined");
+                                        }
+                                    })
+                                .get();
+                        }
+                    }
                     // Route /query through the data plane (fan out to owners + merge).
                     // The data plane lives on shard 0; hop there from the request shard.
                     timestar::http::HttpQueryHandler::clusterQueryHook = [](timestar::QueryRequest q) {

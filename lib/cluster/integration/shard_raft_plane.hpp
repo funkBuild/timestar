@@ -224,8 +224,15 @@ public:
         if (!dir_)
             throw std::logic_error("cluster: serving-map update before shard-plane initialisation");
         const bool changed = dir_->updateMap(map);
+        // updateMap rejects a lower epoch by returning false. Such a map is not
+        // a retirement certificate: reconciling it against the host could tear
+        // down a replica retained by the newer serving map. Exact same-epoch
+        // replay still reaches reconciliation so a crash-partial retirement is
+        // repairable.
+        if (map.epoch != dir_->epoch())
+            co_return false;
         if (plane_)
-            (void)co_await plane_->host().reconcileServingMap(map);
+            (void)co_await plane_->host().reconcileCommittedServingMap(map);
         co_return changed;
     }
 
@@ -609,6 +616,12 @@ public:
     // Add a VShard group -- only called on the shard that owns it.
     seastar::future<> addVShard(uint16_t vshard, std::vector<data::NodeId> voters, raft::RaftOptions opts) {
         return plane_->addVShard(vshard, std::move(voters), opts);
+    }
+
+    void setReplicaRetirementCheckpointForTesting(ReplicatedVShardHost::RetirementCheckpointHook hook) {
+        if (!plane_)
+            throw std::logic_error("cluster: replica-retirement hook armed before shard-plane initialisation");
+        plane_->host().setRetirementCheckpointForTesting(std::move(hook));
     }
 
     // Group 0 is a separate Raft registry on shard 0, sharing this shard's

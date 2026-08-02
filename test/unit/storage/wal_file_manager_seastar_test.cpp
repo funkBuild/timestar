@@ -37,6 +37,52 @@ protected:
     void TearDown() override { cleanTestShardDirectories(); }
 };
 
+// A crash after the durable header inode is linked into its final name can
+// leave both names visible. Startup must discard only the reserved temporary,
+// recover the valid header-only final, and advance the sequence rather than
+// failing on the artifact or reusing its identity.
+TEST_F(WALFileManagerSeastarTest, RecoversFinalLinkedWALAndCleansCreationTemporary) {
+    seastar::thread([] {
+        const unsigned shard = seastar::this_shard_id();
+        constexpr uint64_t sequence = 9012;
+        const timestar::StorageLayout layout(".");
+        const std::string finalPath = layout.walFile(shard, sequence).string();
+        const std::string temporaryPath = layout.walCreationTemporaryFile(shard, sequence).string();
+
+        {
+            WAL interrupted(sequence, layout, shard);
+            interrupted.setCreationCheckpointForTesting([](WALCreationCheckpoint checkpoint) {
+                if (checkpoint == WALCreationCheckpoint::FinalNameLinked)
+                    throw std::runtime_error("injected crash after final WAL link");
+            });
+            EXPECT_THROW(interrupted.init(nullptr).get(), std::runtime_error);
+        }
+
+        ASSERT_TRUE(fs::exists(finalPath));
+        ASSERT_TRUE(fs::exists(temporaryPath));
+        EXPECT_TRUE(fs::equivalent(finalPath, temporaryPath));
+        EXPECT_EQ(fs::file_size(finalPath), WAL_HEADER_SIZE);
+
+        Engine engine(layout);
+        TSMFileManager tsmManager(layout, shard);
+        tsmManager.init().get();
+        WALFileManager walManager(layout, shard);
+        EXPECT_NO_THROW(walManager.init(engine, tsmManager).get());
+
+        EXPECT_FALSE(fs::exists(temporaryPath));
+        EXPECT_FALSE(fs::exists(finalPath)) << "the recovered empty segment should be durably retired";
+        const std::string successor = layout.walFile(shard, sequence + 1).string();
+        EXPECT_TRUE(fs::exists(successor)) << "startup must advance past the recovered segment identity";
+        ASSERT_EQ(walManager.getMemoryStores().size(), 1u);
+        EXPECT_EQ(walManager.getMemoryStores().front()->sequenceNumber, sequence + 1);
+
+        walManager.close().get();
+        tsmManager.stop().get();
+    })
+        .join()
+        .get();
+}
+
 // A post-publication WAL-retirement failure must not make the retry publish the
 // same immutable generation again. It retries only the idempotent unlink +
 // directory barrier, preserving one registered TSM rank.
@@ -162,8 +208,7 @@ TEST_F(WALFileManagerSeastarTest, RecoveryConversionFailurePreservesWalAndFailsS
         size_t publicationSyncCalls = 0;
         tsmManager.setDirectorySyncForTesting([&](const std::string&) {
             ++publicationSyncCalls;
-            return seastar::make_exception_future<>(
-                std::runtime_error("injected recovered TSM publication failure"));
+            return seastar::make_exception_future<>(std::runtime_error("injected recovered TSM publication failure"));
         });
         WALFileManager walManager(layout, shard);
 
@@ -562,8 +607,7 @@ TEST_F(WALFileManagerSeastarTest, RepeatedWalRetirementFailuresRemainAdmissionAc
         retiringWal->setDirectorySyncForTesting([&](const std::string& directory) {
             ++retirementAttempts;
             if (!allowRetirement) {
-                return seastar::make_exception_future<>(
-                    std::runtime_error("injected repeated WAL retirement failure"));
+                return seastar::make_exception_future<>(std::runtime_error("injected repeated WAL retirement failure"));
             }
             return seastar::sync_directory(directory);
         });
@@ -578,10 +622,8 @@ TEST_F(WALFileManagerSeastarTest, RepeatedWalRetirementFailuresRemainAdmissionAc
         }
         EXPECT_GE(retirementAttempts, 3u);
         EXPECT_EQ(tsmManager.getSequencedTsmFiles().size(), 1u);
-        EXPECT_FALSE(walManager.hasPendingConversions())
-            << "published data is no longer pending conversion";
-        EXPECT_EQ(walManager.getMemoryStores().size(), 1u)
-            << "published store must leave memory queries";
+        EXPECT_FALSE(walManager.hasPendingConversions()) << "published data is no longer pending conversion";
+        EXPECT_EQ(walManager.getMemoryStores().size(), 1u) << "published store must leave memory queries";
         EXPECT_EQ(walManager.retainedMemoryStoreCount(), 2u)
             << "published store must remain in retained-memory admission";
 
@@ -590,8 +632,7 @@ TEST_F(WALFileManagerSeastarTest, RepeatedWalRetirementFailuresRemainAdmissionAc
             seastar::sleep(std::chrono::milliseconds(1)).get();
         }
         EXPECT_EQ(walManager.retainedMemoryStoreCount(), 1u);
-        EXPECT_EQ(tsmManager.getSequencedTsmFiles().size(), 1u)
-            << "WAL retirement retries must not republish the TSM";
+        EXPECT_EQ(tsmManager.getSequencedTsmFiles().size(), 1u) << "WAL retirement retries must not republish the TSM";
 
         walManager.close().get();
         tsmManager.stop().get();

@@ -746,13 +746,15 @@ seastar::future<> Engine::retireVShardData(timestar::VShardId vshard) {
     std::string catalog = emptyCatalog.snapshot();
     timestar::VShardSnapshotBuilder builder(vshard);
     auto manifest = builder.build({}, timestar::SeriesCatalog::snapshotHash(catalog));
-    if (!co_await installVShardSnapshotBundle(std::move(manifest), {}, std::move(catalog)))
+    auto owned = std::make_shared<const timestar::VShardSnapshotManifest>(std::move(manifest));
+    if (!co_await installVShardSnapshotBundleOwned(std::move(owned), {}, std::move(catalog),
+                                                   SnapshotInstallPurpose::ReplicaRetirement))
         throw std::runtime_error("Engine::retireVShardData: empty generation was rejected");
 }
 
 seastar::future<bool> Engine::installVShardSnapshotBundleOwned(
     std::shared_ptr<const timestar::VShardSnapshotManifest> manifestOwner,
-    std::vector<std::pair<std::string, std::string>> files, std::string catalogBytes) {
+    std::vector<std::pair<std::string, std::string>> files, std::string catalogBytes, SnapshotInstallPurpose purpose) {
     auto installUnits = co_await seastar::get_units(_snapshotInstallSemaphore, 1);
     const auto& manifest = *manifestOwner;
 
@@ -909,7 +911,8 @@ seastar::future<bool> Engine::installVShardSnapshotBundleOwned(
             // store from publishing target data between these two barriers.
             co_await walFileManager.deleteVShardFromMemoryStores(vshard);
             if (_snapshotInstallCheckpointHook)
-                _snapshotInstallCheckpointHook(SnapshotInstallCheckpoint::WalGenerationDeleted);
+                _snapshotInstallCheckpointHook(manifest.vshard, SnapshotInstallCheckpoint::WalGenerationDeleted,
+                                               purpose);
 
             std::vector<seastar::shared_ptr<::TSM>> currentFiles;
             std::vector<seastar::shared_ptr<::TSM>> supersededPureFiles;
@@ -926,7 +929,8 @@ seastar::future<bool> Engine::installVShardSnapshotBundleOwned(
                     co_await file->deleteVShard(vshard);
             }
             if (_snapshotInstallCheckpointHook)
-                _snapshotInstallCheckpointHook(SnapshotInstallCheckpoint::TsmGenerationDeleted);
+                _snapshotInstallCheckpointHook(manifest.vshard, SnapshotInstallCheckpoint::TsmGenerationDeleted,
+                                               purpose);
 
             if (!files.empty() && !incoming) {
                 const uint64_t localSeq = tsmFileManager.allocateSequenceId();
@@ -945,7 +949,7 @@ seastar::future<bool> Engine::installVShardSnapshotBundleOwned(
                 co_await tsmFileManager.addTSMFile(incoming);
             }
             if (_snapshotInstallCheckpointHook)
-                _snapshotInstallCheckpointHook(SnapshotInstallCheckpoint::DataPublished);
+                _snapshotInstallCheckpointHook(manifest.vshard, SnapshotInstallCheckpoint::DataPublished, purpose);
 
             // Primary discovery/catalog state becomes the exact incoming set.
             // Evict every target binding, including retained identities: a
@@ -955,7 +959,7 @@ seastar::future<bool> Engine::installVShardSnapshotBundleOwned(
             std::erase_if(_seriesTypeCache,
                           [vshard](const auto& entry) { return timestar::virtualShard(entry.first) == vshard; });
             if (_snapshotInstallCheckpointHook)
-                _snapshotInstallCheckpointHook(SnapshotInstallCheckpoint::CatalogPruned);
+                _snapshotInstallCheckpointHook(manifest.vshard, SnapshotInstallCheckpoint::CatalogPruned, purpose);
 
             std::vector<MetadataOp> ops;
             ops.reserve(catalogRecords->size());
@@ -993,7 +997,7 @@ seastar::future<bool> Engine::installVShardSnapshotBundleOwned(
                 co_await index.recordInsertDays(record.entry.measurement, record.seriesId, timestamps);
             }
             if (_snapshotInstallCheckpointHook)
-                _snapshotInstallCheckpointHook(SnapshotInstallCheckpoint::CatalogInstalled);
+                _snapshotInstallCheckpointHook(manifest.vshard, SnapshotInstallCheckpoint::CatalogInstalled, purpose);
 
             // A snapshot object is written at the terminal tier, so ordinary
             // tier compaction will never reclaim an older pure snapshot. Once
@@ -1004,7 +1008,8 @@ seastar::future<bool> Engine::installVShardSnapshotBundleOwned(
             // can later materialise them safely.
             co_await tsmFileManager.removeTSMFiles(supersededPureFiles);
             if (_snapshotInstallCheckpointHook)
-                _snapshotInstallCheckpointHook(SnapshotInstallCheckpoint::SupersededObjectsRetired);
+                _snapshotInstallCheckpointHook(manifest.vshard, SnapshotInstallCheckpoint::SupersededObjectsRetired,
+                                               purpose);
 
             // Release quiescence before acquiring the rollover semaphore again.
             // The VShard's Raft apply isolation still prevents a target suffix

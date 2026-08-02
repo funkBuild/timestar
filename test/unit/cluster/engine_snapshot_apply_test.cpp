@@ -456,16 +456,20 @@ TEST(EngineSnapshotApply, EveryDurableCheckpointCanRetryToTheExactGeneration) {
                 flushAndWaitForTsm(*dest, assignCore(incoming.vshard, seastar::smp::count));
 
                 (*dest)
-                    .invoke_on(assignCore(incoming.vshard, seastar::smp::count),
-                               [checkpoint = checkpoints[index], &injected](Engine& engine) {
-                                   engine.setSnapshotInstallCheckpointForTesting(
-                                       [checkpoint, &injected](SnapshotInstallCheckpoint reached) {
-                                           if (!injected && reached == checkpoint) {
-                                               injected = true;
-                                               throw std::runtime_error("injected snapshot-install interruption");
-                                           }
-                                       });
-                               })
+                    .invoke_on(
+                        assignCore(incoming.vshard, seastar::smp::count),
+                        [checkpoint = checkpoints[index], expected = incoming.vshard, &injected](Engine& engine) {
+                            engine.setSnapshotInstallCheckpointForTesting(
+                                [checkpoint, expected, &injected](VShardId vshard, SnapshotInstallCheckpoint reached,
+                                                                  SnapshotInstallPurpose purpose) {
+                                    EXPECT_EQ(vshard, expected);
+                                    EXPECT_EQ(purpose, SnapshotInstallPurpose::Snapshot);
+                                    if (!injected && vshard == expected && reached == checkpoint) {
+                                        injected = true;
+                                        throw std::runtime_error("injected snapshot-install interruption");
+                                    }
+                                });
+                        })
                     .get();
                 EXPECT_THROW(store.installVShardSnapshot(incoming.vshard, incoming.payload).get(), std::runtime_error);
                 EXPECT_TRUE(injected);

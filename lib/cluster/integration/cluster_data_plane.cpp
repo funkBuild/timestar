@@ -459,8 +459,16 @@ seastar::future<> ClusterDataPlane::startImpl(const ClusterConfig& cfg, seastar:
             for (auto& [shard, groups] : byShard) {
                 co_await shards_.invoke_on(shard,
                                            [g = std::move(groups), ropts](ShardRaftPlane& p) -> seastar::future<> {
-                                               for (const auto& [vs, voters] : g)
+                                               const size_t total = g.size();
+                                               size_t recovered = 0;
+                                               for (const auto& [vs, voters] : g) {
                                                    co_await p.addVShard(vs, voters, ropts);
+                                                   ++recovered;
+                                                   if (recovered % 256 == 0 || recovered == total)
+                                                       timestar::http_log.info(
+                                                           "cluster: reactor {} opened {}/{} local VShard groups",
+                                                           seastar::this_shard_id(), recovered, total);
+                                               }
                                                co_return;
                                            });
             }
@@ -734,6 +742,16 @@ seastar::future<ClusterDataPlane::ControlMutationResult> ClusterDataPlane::remov
             accepted ? ControlMutationStatus::Accepted
                      : (group->isLeader() ? ControlMutationStatus::Rejected : ControlMutationStatus::NotLeader),
             leader(), host->state().mapEpoch};
+    });
+}
+
+seastar::future<> ClusterDataPlane::setReplicaRetirementCheckpointForTesting(
+    uint16_t vshard, ReplicatedVShardHost::RetirementCheckpointHook hook) {
+    if (!replicated_ || !shardsStarted_ || vshard >= VIRTUAL_SHARD_COUNT)
+        throw std::invalid_argument("cluster: replica-retirement hook requires a live replicated VShard");
+    const unsigned owner = assignCore(VShardId{vshard}, seastar::smp::count);
+    co_await shards_.invoke_on(owner, [hook = std::move(hook)](ShardRaftPlane& plane) mutable {
+        plane.setReplicaRetirementCheckpointForTesting(std::move(hook));
     });
 }
 

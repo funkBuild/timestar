@@ -17,6 +17,7 @@ not probes, so they can be run from CI or a release checklist.
 | `node_kill_round.sh` | `kill -9` of one node MID-BENCH: no 500s, no crashes, every ACKED write readable afterwards on both survivors — and it prints the one-node-down 503 band (debt D-14), which stays advisory |
 | `snapshot_durability_gate.sh` | TAKING SNAPSHOTS DOES NOT COST DURABILITY (debt D-6): under a light load, every acked point is readable after the whole cluster is `kill -9`'d and restarted OVER COMPACTED JOURNALS; the heavy-load A/B is advisory |
 | `restart_readback_gate.sh` | AN ACKED WRITE IS READABLE AFTER A RESTART THAT FOLLOWS A HEAVY CAMPAIGN (debt D-36). It re-reads REPEATEDLY, which is the whole point: a single read cannot tell 25 lost points from 25 durable ones that apply() has not reached, and that ambiguity is what left D-36 undetermined for a session. A count that climbs is a stall; one that stays flat is loss. Reports `apply_lag_entries` / `apply_failures` / `tick_errors` while it waits |
+| `topology_mutation_gate.sh` | the authenticated production Group-0 routes move one non-vacuous VShard away and back twice under sustained unique writes, recover crashes after Engine-generation deletion and journal quarantine, reclaim an expired exact-v1 journal, rematerialize deleted storage from survivors, and reject unauthenticated drain or premature removal without losing or duplicating a contribution |
 
 All of them take an optional server binary as `$1` (default
 `build/bin/timestar_http_server`), so a "before" binary can be measured the same way.
@@ -25,6 +26,16 @@ overrideable with `GATE_SERVER_MEMORY`. This is a per-process limit, so size the
 aggregate as `node count * GATE_SERVER_MEMORY`; leaving it implicit lets every
 Seastar process size itself from the whole host and can overcommit a multi-node
 gate before the property under test is reached.
+
+`topology_mutation_gate.sh` is a low-volume correctness gate and deliberately
+pins a smaller 1 GiB per-process default (4 GiB aggregate). Its four durable
+roots live under `build/tmp`, not `/tmp`; overriding its budget should be a
+recorded exception, and it must still run alone. It also pins a 120-second
+server shutdown budget because a graceful stop closes roughly 4,096 Raft
+groups; `GATE_SHUTDOWN_TIMEOUT_SECONDS` can override that recorded value. Crash
+recovery readiness allows up to 600 seconds for group elections, while server
+logs report local VShard-open progress every 256 groups so slow recovery is
+distinguishable from a hang.
 
 ## Run them ONE AT A TIME, with the previous run's data dirs deleted
 
@@ -52,9 +63,10 @@ Check `df -h /tmp` and `ls -d /tmp/tsgate_*` before and after a run anyway — a
 between its `mkdir` and its trap leaves dirs behind.
 
 Data reset is a VERIFIED operation, not a best-effort `rm -rf; mkdir`. The shared
-`fresh_gate_data_dirs` helper accepts only direct `/tmp/tsgate_*` roots (never a nested or
-arbitrary path), retries a removal race five times, proves every old root is absent, and
-only then recreates it. A gate aborts before starting a node if that proof fails. This is
+`fresh_gate_data_dirs` helper accepts only direct `/tmp/tsgate_*` or
+`build/tmp/tsgate_*` roots (never a nested or arbitrary path), retries a removal race five
+times, proves every old root is absent, and only then recreates it. A gate aborts before
+starting a node if that proof fails. This is
 load-bearing for multi-arm gates: `snapshot_durability_gate.sh` once had extra `rm -rf`
 calls between arms while the prior arm's post-crash readback servers were still RUNNING.
 They predictably reported `Directory not empty`; worse, the script ignored that and went
@@ -104,6 +116,38 @@ writer widens a barrier failure's blast radius from one group to every group on 
 and a reset storm is the fault most likely to produce one. The default per-VShard layout
 reports 1.00 by construction (each group syncs its own fd; there is nothing to coalesce).
 
+## `topology_mutation_gate.sh` — exact storage crash boundaries
+
+This gate uses the normal server binary and production topology routes. Two
+process-only environment variables arm a one-shot exit at a named durable
+replica-retirement boundary:
+
+```text
+TIMESTAR_UNSAFE_TEST_RETIREMENT_CRASH=engine-wal-generation-deleted|journal-quarantined
+TIMESTAR_UNSAFE_TEST_RETIREMENT_VSHARD=0..4095
+```
+
+The server rejects a partial pair, an unknown name, an out-of-range VShard, or
+either variable outside the explicit local-test shape: Group 0 enabled together
+with `development_allow_insecure_transport`. The gate requires exit status 86
+and checks the corresponding disk shape, so a missing or renamed checkpoint
+cannot silently turn into a happy-path pass. These are test controls, not a
+protocol or persisted format; v1 remains the only wire and storage identity.
+
+For the Engine boundary, the hook is also tagged with the operation purpose.
+Ordinary snapshot install therefore cannot trigger a failpoint armed for replica
+retirement. For the journal boundary, the exit occurs after the atomic rename and
+both parent-directory barriers but before the grace marker is created. Restart
+must complete each interrupted operation from the committed serving map.
+
+The Engine-boundary run also guards fresh WAL publication. A prior run exposed a
+final `.wal` name before its buffered v1 header was durable, so the intentional
+exit left an empty file and strict restart correctly refused it. Fresh WALs now
+flush the exact v1 header under `.wal.creating` and atomically link the final name
+only afterwards; startup safely cleans either private-name crash residue. Thus a
+checkpoint exit can leave no final WAL or a valid recoverable one, never an empty
+published generation.
+
 ## Ports: every gate sits BELOW the kernel's ephemeral range (debt D-27)
 
 A node binds three listeners — HTTP at `P`, the data plane at `P+1000`, Raft at `P+2000` —
@@ -131,6 +175,7 @@ cannot reintroduce the race.
 | `node_kill_round.sh` | 19610-19612 | 20610-20612 | 21610-21612 | `1961` | `/tmp/tsgate_nk*` |
 | `snapshot_durability_gate.sh` | 19710-19712 | 20710-20712 | 21710-21712 | `1971` | `/tmp/tsgate_sd*` |
 | `restart_readback_gate.sh` | 19730-19732 | 20730-20732 | 21730-21732 | `1973` | `/tmp/tsgate_rr*` |
+| `topology_mutation_gate.sh` | 19810-19813 | 20810-20813 | 21810-21813 | `1981` | `build/tmp/tsgate_tm*` |
 
 The prefixes are now four digits and unique per gate — they used to be three, so `492`
 covered both `backpressure` and `rolling_rebalance` and `197` also matched `--port 19730`,

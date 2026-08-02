@@ -35,6 +35,14 @@ namespace timestar::cluster {
 
 using timestar::raft::NodeId;
 
+// Durable boundaries in online replica retirement. This is a test seam, not a
+// configuration protocol: production leaves the hook unset. In particular,
+// JournalQuarantined is reached only after the active->retired rename and both
+// parent-directory barriers, but before the grace-period marker is created.
+enum class ReplicaRetirementCheckpoint {
+    JournalQuarantined,
+};
+
 // Durable identity stamped into every Raft journal segment. Production constructs
 // this from node.json's cluster UUID and a fresh process boot UUID. The testing
 // value exists only to keep isolated host tests independent of server bootstrap.
@@ -120,13 +128,24 @@ public:
     seastar::future<> addVShard(uint16_t vshard, std::vector<NodeId> voters, raft::RaftOptions opts = {},
                                 RecoveredConfigValidator recoveredConfigValidator = {});
 
-    // Retire a replica only after the committed serving map no longer places it
-    // here and the local Raft configuration has applied removal of this node.
-    // Private v1 journals are atomically quarantined; their files are deleted
-    // only after the fixed grace period. Exact retries are idempotent.
+    // A direct retirement requires the local Raft configuration to have applied
+    // removal of this node. Production serving-map reconciliation has a second,
+    // stronger authority: Group 0 publishes a map only after the exact movement
+    // job reached Done, so a removed member need not receive final Cnew before it
+    // can stop its obsolete group. Private v1 journals are atomically
+    // quarantined; their files are deleted only after the fixed grace period.
+    // Exact retries are idempotent.
     static constexpr std::chrono::hours kRetiredJournalGrace{24};
+    using RetirementCheckpointHook = std::function<void(uint16_t, ReplicaRetirementCheckpoint)>;
+    void setRetirementCheckpointForTesting(RetirementCheckpointHook hook) {
+        retirementCheckpointHook_ = std::move(hook);
+    }
     seastar::future<bool> retireVShard(uint16_t vshard, uint64_t mapEpoch);
-    seastar::future<size_t> reconcileServingMap(const control::ControlMap& map);
+    // `map` must be the complete value delivered by Group0StateMachine's
+    // post-validation observer. Naming that authority explicitly prevents a
+    // caller with an arbitrary placement guess from bypassing retireVShard's
+    // applied-membership fence.
+    seastar::future<size_t> reconcileCommittedServingMap(const control::ControlMap& map);
     // Complete any crash-interrupted retirement before current-map groups are
     // opened. The durable serving map is the authority for stale active dirs.
     seastar::future<size_t> recoverReplicaRetirements(control::ControlMap map);
@@ -512,6 +531,11 @@ private:
     // foreground write path.
     seastar::semaphore maintenanceLock_{1};
     bool stopped_ = false;
+    enum class RetirementAuthority {
+        AppliedRaftConfiguration,
+        CommittedServingMap,
+    };
+    seastar::future<bool> retireVShard(uint16_t vshard, uint64_t mapEpoch, RetirementAuthority authority);
     // See classifyRefusal / proposeRefusedWhileLeader.
     data::SliceReject classifyRefusal(uint16_t vshard);
     seastar::future<> ensureRetiredJournalMarker(const std::filesystem::path& directory);
@@ -561,6 +585,7 @@ private:
     uint64_t journalGcPasses_ = 0;
     uint64_t replicasRetired_ = 0;
     uint64_t retiredJournalsReclaimed_ = 0;
+    RetirementCheckpointHook retirementCheckpointHook_;
 };
 
 }  // namespace timestar::cluster

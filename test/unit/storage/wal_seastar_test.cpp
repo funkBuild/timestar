@@ -44,13 +44,14 @@ protected:
 
 seastar::future<> testWALDirectoryDurabilityBoundaries() {
     const unsigned shard = seastar::this_shard_id();
-    const unsigned sequence = 9001;
     const timestar::StorageLayout layout(".");
-    const std::string path = layout.walFile(shard, sequence).string();
 
-    // Creation is not a usable WAL boundary until the segment name itself is
-    // durable. A failed barrier must propagate and close the opened descriptor.
+    // A failed final-name barrier must propagate, but the visible final file is
+    // already a complete recovery image. The old implementation exposed an
+    // empty final here and restart rejected its missing v1 header.
     {
+        constexpr uint64_t sequence = 9001;
+        const std::string path = layout.walFile(shard, sequence).string();
         WAL wal(sequence, layout, shard);
         size_t syncCalls = 0;
         wal.setDirectorySyncForTesting([&](const std::string&) {
@@ -66,12 +67,23 @@ seastar::future<> testWALDirectoryDurabilityBoundaries() {
         }
         EXPECT_TRUE(failed);
         EXPECT_EQ(syncCalls, 1u);
+        EXPECT_TRUE(co_await seastar::file_exists(path));
+        EXPECT_FALSE(co_await seastar::file_exists(layout.walCreationTemporaryFile(shard, sequence).string()));
+
+        auto recovered = std::make_shared<MemoryStore>(sequence);
+        WALReader reader(path);
+        EXPECT_NO_THROW(co_await reader.readAll(recovered.get()));
+        EXPECT_TRUE(recovered->isEmpty());
+
+        co_await seastar::remove_file(path);
+        co_await seastar::sync_directory(layout.shardDir(shard).string());
     }
 
-    // A fresh owner can safely retry the uncertain creation, then a removal
-    // whose unlink succeeds but directory barrier fails must itself be
+    // Removal whose unlink succeeds but directory barrier fails remains
     // retryable even though the path is already absent.
     {
+        constexpr uint64_t sequence = 9002;
+        const std::string path = layout.walFile(shard, sequence).string();
         WAL wal(sequence, layout, shard);
         co_await wal.init(nullptr);
         co_await wal.close();
@@ -104,6 +116,79 @@ seastar::future<> testWALDirectoryDurabilityBoundaries() {
 
 TEST_F(WALSeastarTest, CreationAndRemovalAreDirectoryDurableAndRetryable) {
     testWALDirectoryDurabilityBoundaries().get();
+}
+
+seastar::future<> testFreshWALIsRecoverableBeforeFirstAppendOrClose() {
+    const unsigned shard = seastar::this_shard_id();
+    constexpr uint64_t sequence = 9003;
+    const timestar::StorageLayout layout(".");
+    const std::string path = layout.walFile(shard, sequence).string();
+
+    WAL wal(sequence, layout, shard);
+    co_await wal.init(nullptr);
+
+    // Read through an independent descriptor while the writer's header is
+    // still buffered. This directly exercises the forced-exit window observed
+    // by the production topology gate.
+    auto recovered = std::make_shared<MemoryStore>(sequence);
+    WALReader reader(path);
+    EXPECT_NO_THROW(co_await reader.readAll(recovered.get()));
+    EXPECT_TRUE(recovered->isEmpty());
+    EXPECT_EQ(fs::file_size(path), WAL_HEADER_SIZE);
+    EXPECT_FALSE(co_await seastar::file_exists(layout.walCreationTemporaryFile(shard, sequence).string()));
+
+    co_await wal.close();
+}
+
+TEST_F(WALSeastarTest, FreshWALIsRecoverableBeforeFirstAppendOrClose) {
+    testFreshWALIsRecoverableBeforeFirstAppendOrClose().get();
+}
+
+seastar::future<> testDurablePrivateHeaderRetriesWithoutPublishingPartialFinal() {
+    const unsigned shard = seastar::this_shard_id();
+    constexpr uint64_t sequence = 9004;
+    const timestar::StorageLayout layout(".");
+    const std::string path = layout.walFile(shard, sequence).string();
+    const std::string temporary = layout.walCreationTemporaryFile(shard, sequence).string();
+
+    {
+        WAL interrupted(sequence, layout, shard);
+        interrupted.setCreationCheckpointForTesting([](WALCreationCheckpoint checkpoint) {
+            if (checkpoint == WALCreationCheckpoint::HeaderDurable)
+                throw std::runtime_error("injected crash after private WAL header flush");
+        });
+        bool failed = false;
+        try {
+            co_await interrupted.init(nullptr);
+        } catch (const std::runtime_error&) {
+            failed = true;
+        }
+        EXPECT_TRUE(failed);
+    }
+
+    EXPECT_FALSE(co_await seastar::file_exists(path));
+    EXPECT_TRUE(co_await seastar::file_exists(temporary));
+    EXPECT_EQ(fs::file_size(temporary), WAL_HEADER_SIZE);
+    auto privateRecovery = std::make_shared<MemoryStore>(sequence);
+    WALReader privateReader(temporary);
+    EXPECT_NO_THROW(co_await privateReader.readAll(privateRecovery.get()));
+    EXPECT_TRUE(privateRecovery->isEmpty());
+
+    // A fresh owner for the same allocated sequence removes the reserved
+    // header-only temporary durably and republishes a valid final segment.
+    WAL retried(sequence, layout, shard);
+    co_await retried.init(nullptr);
+    EXPECT_FALSE(co_await seastar::file_exists(temporary));
+    EXPECT_TRUE(co_await seastar::file_exists(path));
+    auto finalRecovery = std::make_shared<MemoryStore>(sequence);
+    WALReader finalReader(path);
+    EXPECT_NO_THROW(co_await finalReader.readAll(finalRecovery.get()));
+    EXPECT_TRUE(finalRecovery->isEmpty());
+    co_await retried.close();
+}
+
+TEST_F(WALSeastarTest, DurablePrivateHeaderRetriesWithoutPublishingPartialFinal) {
+    testDurablePrivateHeaderRetriesWithoutPublishingPartialFinal().get();
 }
 
 seastar::future<> testFreshWALRefusesToTruncateExistingData() {

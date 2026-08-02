@@ -92,6 +92,10 @@ fs::path StorageLayout::walFile(unsigned shard, uint64_t sequence) const {
     return shardDir(shard) / std::format("{:010}.wal", sequence);
 }
 
+fs::path StorageLayout::walCreationTemporaryFile(unsigned shard, uint64_t sequence) const {
+    return shardDir(shard) / std::format("{:010}.wal.creating", sequence);
+}
+
 fs::path StorageLayout::tsmDir(unsigned shard) const {
     return shardDir(shard) / "tsm";
 }

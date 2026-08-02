@@ -39,6 +39,13 @@ enum class WALValueType { Float = 0, Boolean, String, Integer };
 
 enum class WALInsertResult { Success, RolloverNeeded };
 
+// Test seam for the two crash-sensitive publication boundaries. Hooks run
+// synchronously and may throw; production leaves the hook empty.
+enum class WALCreationCheckpoint : uint8_t {
+    HeaderDurable,
+    FinalNameLinked,
+};
+
 inline constexpr char WAL_V1_MAGIC[4] = {'T', 'S', 'W', 'L'};
 inline constexpr uint32_t WAL_VERSION = 1;
 inline constexpr size_t WAL_HEADER_SIZE = sizeof(WAL_V1_MAGIC) + sizeof(WAL_VERSION);
@@ -124,6 +131,7 @@ private:
     // durable. Keep this injectable so both crash boundaries can be tested
     // without process-global filesystem hooks.
     std::function<seastar::future<>(const std::string&)> directorySync_;
+    std::function<void(WALCreationCheckpoint)> creationCheckpointHook_;
 
     // Streamed, unaligned I/O (buffered internally by Seastar)
     std::optional<seastar::output_stream<char>> out;
@@ -241,6 +249,9 @@ public:
     void setImmediateFlush(bool immediate) { requiresImmediateFlush = immediate; }
     void setDirectorySyncForTesting(std::function<seastar::future<>(const std::string&)> sync) {
         directorySync_ = std::move(sync);
+    }
+    void setCreationCheckpointForTesting(std::function<void(WALCreationCheckpoint)> hook) {
+        creationCheckpointHook_ = std::move(hook);
     }
 
     // Utilities

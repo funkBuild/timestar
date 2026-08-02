@@ -51,6 +51,11 @@ enum class SnapshotInstallCheckpoint {
     SupersededObjectsRetired,
 };
 
+enum class SnapshotInstallPurpose {
+    Snapshot,
+    ReplicaRetirement,
+};
+
 class Engine {
 private:
     // Injected, immutable path authority for this shard's storage. Declared
@@ -85,7 +90,8 @@ private:
     // groups on the same reactor. They mutate the shared WAL/TSM managers, so
     // the complete preflight+swap is serialized per Engine.
     seastar::semaphore _snapshotInstallSemaphore{1};
-    std::function<void(SnapshotInstallCheckpoint)> _snapshotInstallCheckpointHook;
+    std::function<void(timestar::VShardId, SnapshotInstallCheckpoint, SnapshotInstallPurpose)>
+        _snapshotInstallCheckpointHook;
 
     // Back-reference to the sharded<Engine> container for cross-shard communication.
     // Used for schema broadcasts and cross-shard operations; metadata is indexed locally per-shard.
@@ -205,7 +211,8 @@ private:
         std::vector<std::pair<std::string, std::string>> files);
     seastar::future<bool> installVShardSnapshotBundleOwned(
         std::shared_ptr<const timestar::VShardSnapshotManifest> manifest,
-        std::vector<std::pair<std::string, std::string>> files, std::string catalog);
+        std::vector<std::pair<std::string, std::string>> files, std::string catalog,
+        SnapshotInstallPurpose purpose = SnapshotInstallPurpose::Snapshot);
     enum class SnapshotInstallDisposition { Fresh, Idempotent, Reject };
     seastar::future<SnapshotInstallDisposition> classifySnapshotInstall(
         const timestar::VShardSnapshotManifest& manifest,
@@ -264,7 +271,8 @@ public:
     // this VShard. Exact retries, including after restart, are idempotent.
     seastar::future<> retireVShardData(timestar::VShardId vshard);
 
-    void setSnapshotInstallCheckpointForTesting(std::function<void(SnapshotInstallCheckpoint)> hook) {
+    void setSnapshotInstallCheckpointForTesting(
+        std::function<void(timestar::VShardId, SnapshotInstallCheckpoint, SnapshotInstallPurpose)> hook) {
         _snapshotInstallCheckpointHook = std::move(hook);
     }
     void setSnapshotDirectorySyncForTesting(std::function<seastar::future<>(const std::string&)> sync) {

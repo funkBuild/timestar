@@ -103,7 +103,6 @@ set(SOURCE_INSPECTION_DEFS
     HTTP_METADATA_HANDLER_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/http/http_metadata_handler.cpp"
     DERIVED_QUERY_EXECUTOR_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/query/derived_query_executor.cpp"
     HTTP_DERIVED_QUERY_HANDLER_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/http/http_derived_query_handler.cpp"
-    WAL_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/storage/wal.cpp"
     HTTP_WRITE_HANDLER_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/http/http_write_handler.cpp"
     TSM_CPP_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/storage/tsm.cpp"
     ALP_ENCODER_SOURCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../lib/encoding/alp/alp_encoder.cpp"

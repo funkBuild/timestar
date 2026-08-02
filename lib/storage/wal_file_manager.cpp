@@ -49,6 +49,14 @@ static std::optional<uint64_t> parseWalSeqNum(const std::string& path) {
     return sequence;
 }
 
+static std::optional<uint64_t> parseWalCreationTempSeqNum(const std::string& path) {
+    const std::string basename = fs::path(path).filename().string();
+    static constexpr std::string_view kSuffix = ".creating";
+    if (!basename.ends_with(kSuffix))
+        return std::nullopt;
+    return parseWalSeqNum(basename.substr(0, basename.size() - kSuffix.size()));
+}
+
 WALFileManager::WALFileManager(timestar::StorageLayout layout, unsigned shard)
     : layout_(std::move(layout)),
       shardId(static_cast<int>(shard)),
@@ -157,27 +165,54 @@ seastar::future<> WALFileManager::init(Engine& engine, TSMFileManager& _tsmFileM
     std::string path = engine.basePath() + '/';
     timestar::wal_log.debug("Scanning for WAL files in {} on shard {}", path, shardId);
 
-    std::vector<std::string> discoveredWalPaths;
+    struct WalDiscovery {
+        std::vector<std::string> walPaths;
+        std::vector<std::string> creationTemporaries;
+    };
 
     // Wrap blocking std::filesystem calls in seastar::async to avoid
     // blocking the Seastar reactor thread (important for NFS / high I/O).
-    discoveredWalPaths = co_await seastar::async([&path]() {
-        std::vector<std::string> files;
+    WalDiscovery discovered = co_await seastar::async([&path]() {
+        WalDiscovery result;
         if (fs::exists(path)) {
             for (const auto& entry : fs::directory_iterator(path)) {
-                if (endsWith(entry.path(), ".wal"))
-                    files.push_back(entry.path());
+                const std::string entryPath = entry.path().string();
+                if (endsWith(entry.path(), ".wal")) {
+                    if (!fs::is_regular_file(entry.symlink_status()))
+                        throw std::runtime_error("Non-regular WAL directory entry: " + entryPath);
+                    result.walPaths.push_back(entryPath);
+                } else if (endsWith(entry.path(), ".wal.creating")) {
+                    // WAL::init never appends records under this reserved name;
+                    // it contains at most a private v1 header. A crash before
+                    // or just after final-name publication can leave it behind.
+                    if (!fs::is_regular_file(entry.symlink_status()))
+                        throw std::runtime_error("Non-regular WAL creation temporary: " + entryPath);
+                    if (!parseWalCreationTempSeqNum(entryPath))
+                        throw std::runtime_error("Non-canonical WAL creation temporary: " + entryPath);
+                    result.creationTemporaries.push_back(entryPath);
+                }
             }
         }
-        return files;
+        return result;
     });
+
+    // These files cannot contain acknowledged entries: the final hard link is
+    // published only after the header flush, and the append stream is opened
+    // only after this temporary has been unlinked and the directory synced.
+    // Make cleanup durable before recovery or allocation proceeds.
+    for (const auto& temporary : discovered.creationTemporaries) {
+        co_await seastar::remove_file(temporary);
+        timestar::wal_log.info("Removed stale WAL creation temporary {} on shard {}", temporary, shardId);
+    }
+    if (!discovered.creationTemporaries.empty())
+        co_await directorySync_(fs::path(path).lexically_normal().string());
 
     // Never ignore an artifact in the WAL namespace. It may be the only durable
     // copy of acknowledged data whose name was damaged or partially migrated.
     // Starting without it would expose a silently incomplete history.
     std::vector<std::pair<uint64_t, std::string>> walFiles;
-    walFiles.reserve(discoveredWalPaths.size());
-    for (auto& walPath : discoveredWalPaths) {
+    walFiles.reserve(discovered.walPaths.size());
+    for (auto& walPath : discovered.walPaths) {
         auto seq = parseWalSeqNum(walPath);
         if (!seq.has_value()) {
             throw std::runtime_error("Refusing startup because WAL filename is not canonical: " + walPath);
