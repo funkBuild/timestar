@@ -42,6 +42,13 @@ namespace timestar::cluster {
 class EngineDataStateMachine : public raft::RaftStateMachine {
 public:
     enum class DeleteReceiptStatus { Retained, Expired, Missing };
+    struct DeleteReceiptCounts {
+        size_t legacy = 0;
+        size_t total = 0;
+        bool hasUnappliedEntries = false;
+
+        friend bool operator==(const DeleteReceiptCounts&, const DeleteReceiptCounts&) = default;
+    };
 
     EngineDataStateMachine(EngineLocalStore& store, VShardId vshard,
                            size_t maxDeleteReceipts = data::kMaxDeleteReceiptsPerVShard)
@@ -71,6 +78,7 @@ public:
     // retired no-op is never reported as a newly executed delete.
     void checkDeleteAdmission(const data::DeleteRangeBatch& command) const;
     DeleteReceiptStatus deleteReceiptStatus(const data::DeleteRangeBatch& command) const;
+    DeleteReceiptCounts deleteReceiptCounts() const;
 
     // Restore the small state-machine-only part of a locally produced snapshot
     // without reinstalling (or even decoding/copying) its TSM objects.

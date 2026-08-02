@@ -227,6 +227,14 @@ EngineDataStateMachine::DeleteReceiptStatus EngineDataStateMachine::deleteReceip
     return DeleteReceiptStatus::Missing;
 }
 
+EngineDataStateMachine::DeleteReceiptCounts EngineDataStateMachine::deleteReceiptCounts() const {
+    DeleteReceiptCounts counts{0, deleteReceipts_.size()};
+    for (const auto& item : deleteReceipts_)
+        if (item.second.issuedAtMs == 0)
+            ++counts.legacy;
+    return counts;
+}
+
 void EngineDataStateMachine::advanceDeleteReceiptFloor(uint64_t floorMs, uint64_t appliedIndex) {
     if (floorMs <= deleteReceiptsRetiredBeforeMs_)
         return;

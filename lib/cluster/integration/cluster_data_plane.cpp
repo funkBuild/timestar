@@ -769,6 +769,44 @@ ClusterDataPlane::collectControlCapabilities(data::OptDeadline deadline) {
     co_return collected;
 }
 
+seastar::future<std::map<NodeId, control::LegacyReceiptInventoryAdvertisement>>
+ClusterDataPlane::collectLegacyReceiptInventories(data::OptDeadline deadline) {
+    if (!controlEnabled_ || !rt_ || !rpc_ || !group0Identity_ || !shardsStarted_)
+        throw std::runtime_error("cluster: legacy receipt inventory collection is not configured");
+    deadline = deadline.value_or(seastar::lowres_clock::now() + std::chrono::seconds(2));
+
+    std::map<NodeId, control::LegacyReceiptInventoryAdvertisement> collected;
+    auto localEntries = co_await shards_.invoke_on(
+        0, [](ShardRaftPlane& plane) { return plane.handleLegacyReceiptInventory(); });
+    collected.emplace(rt_->selfId, control::LegacyReceiptInventoryAdvertisement{
+                                       controlClusterUuid_, *group0Identity_, std::move(localEntries)});
+    std::vector<std::pair<NodeId, seastar::future<control::LegacyReceiptInventoryAdvertisement>>> pending;
+    if (!rt_->peerAddresses.empty())
+        pending.reserve(rt_->peerAddresses.size() - 1);
+    for (const auto& peer : rt_->peerAddresses) {
+        if (peer.first != rt_->selfId)
+            pending.emplace_back(peer.first, rpc_->legacyReceiptInventory(peer.first, deadline));
+    }
+    std::exception_ptr firstFailure;
+    std::exception_ptr permanentFailure;
+    for (auto& [id, future] : pending) {
+        try {
+            collected.emplace(id, co_await std::move(future));
+        } catch (const data::NodeCapabilityMismatchError&) {
+            if (!permanentFailure)
+                permanentFailure = std::current_exception();
+        } catch (...) {
+            if (!firstFailure)
+                firstFailure = std::current_exception();
+        }
+    }
+    if (permanentFailure)
+        std::rethrow_exception(permanentFailure);
+    if (firstFailure)
+        std::rethrow_exception(firstFailure);
+    co_return collected;
+}
+
 seastar::future<ClusterDataPlane::ControlTokenMintResult> ClusterDataPlane::mintControlJoinToken(
     std::string token) {
     if (!controlEnabled_ || !shardsStarted_ || !control::validJoinToken(token))
@@ -810,6 +848,49 @@ seastar::future<control::ControlJoinResult> ClusterDataPlane::joinControlPlane(s
         result.leader != target)
         result = co_await send(result.leader);
     co_return result;
+}
+
+seastar::future<ClusterDataPlane::ControlFormatActivationResult> ClusterDataPlane::activateControlFormat(
+    uint32_t version) {
+    if (!controlEnabled_ || !shardsStarted_ || !rt_ || !rpc_ || !group0Identity_ || version == 0 ||
+        version > data::kWriteBatchFormatMax)
+        throw std::invalid_argument("cluster: requested control format is invalid or group 0 is not configured");
+
+    auto* host = shards_.local().group0();
+    if (!host || !host->group() || !host->stateMachine())
+        throw std::runtime_error("cluster: group-0 activation host is unavailable");
+    auto* group = host->group();
+    const NodeId leader = group->isLeader() ? group->node().id() : group->leader();
+    if (!group->isLeader())
+        co_return ControlFormatActivationResult{false, leader, host->state().activeFormatVersion};
+    if (version <= host->state().activeFormatVersion)
+        co_return ControlFormatActivationResult{true, leader, host->state().activeFormatVersion};
+
+    const auto capabilityDeadline = seastar::lowres_clock::now() + std::chrono::seconds(2);
+    auto capabilities = co_await collectControlCapabilities(capabilityDeadline);
+    auto versions = validateNodeCapabilities(controlClusterUuid_, rt_->peerAddresses, capabilities);
+    controlCapabilities_ = capabilities;
+    controlCapabilitiesComplete_ = true;
+    controlIdentityConflict_ = false;
+
+    LegacyReceiptPreflightSummary receiptSummary;
+    if (host->state().activeFormatVersion < data::kBoundedDeleteReceiptActivationVersion &&
+        version >= data::kBoundedDeleteReceiptActivationVersion) {
+        // Capability and inventory fan-outs are separate bounded phases. Reusing the
+        // capability deadline here made a successful but slow first phase leave an
+        // already-expired deadline for every v9 inventory RPC.
+        const auto inventoryDeadline = seastar::lowres_clock::now() + std::chrono::seconds(2);
+        auto inventories = co_await collectLegacyReceiptInventories(inventoryDeadline);
+        receiptSummary = validateLegacyReceiptInventories(
+            controlClusterUuid_, rt_->peerAddresses, host->state().servingMap, inventories);
+    }
+
+    control::Group0Controller controller(*group, *host->stateMachine());
+    const bool activated = co_await controller.activateFormat(version, versions);
+    co_return ControlFormatActivationResult{activated, group->isLeader() ? group->node().id() : group->leader(),
+                                            host->state().activeFormatVersion,
+                                            receiptSummary.maxLegacyReceipts,
+                                            receiptSummary.maxTotalReceipts};
 }
 
 seastar::future<> ClusterDataPlane::refreshControlCapabilities() {

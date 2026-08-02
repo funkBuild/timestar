@@ -2,8 +2,12 @@
 
 #include "../control/control_map_cache.hpp"
 #include "../control/control_command.hpp"
+#include "../data/replicated_command.hpp"
 #include "../raft/raft_types.hpp"
 
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
 #include <map>
 #include <optional>
 #include <set>
@@ -119,6 +123,82 @@ inline std::map<raft::NodeId, features::VersionRange> validateNodeCapabilities(
         versions.emplace(peer.first, found->second.formats);
     }
     return versions;
+}
+
+struct LegacyReceiptPreflightSummary {
+    size_t vshards = 0;
+    uint64_t maxLegacyReceipts = 0;
+    uint64_t maxTotalReceipts = 0;
+};
+
+// Validate the v9 inventory against every replica in the immutable serving map.
+// Requiring equal counts across replicas makes apply lag a retryable preflight
+// failure instead of allowing a stale follower to hide legacy state. A VShard
+// whose entire 1,024-entry capacity is legacy can never admit the first bounded
+// receipt, so activation is refused rather than enabling a permanently unusable
+// command format.
+inline LegacyReceiptPreflightSummary validateLegacyReceiptInventories(
+    const std::string& clusterUuid, const std::map<raft::NodeId, std::string>& expectedPeers,
+    const control::ControlMap& servingMap,
+    const std::map<raft::NodeId, control::LegacyReceiptInventoryAdvertisement>& inventories) {
+    if (!control::isCompleteControlMap(servingMap))
+        throw NodeCapabilityValidationError("legacy receipt preflight has no complete serving map");
+    if (inventories.size() != expectedPeers.size())
+        throw NodeCapabilityValidationError("legacy receipt inventory collection is incomplete");
+
+    std::set<std::string> persistentUuids;
+    std::map<raft::NodeId, std::map<uint16_t, control::LegacyReceiptInventoryEntry>> byNode;
+    for (const auto& [id, inventory] : inventories) {
+        auto expected = expectedPeers.find(id);
+        if (expected == expectedPeers.end())
+            throw NodeCapabilityValidationError("legacy receipt inventory contains an unconfigured node");
+        if (inventory.clusterUuid != clusterUuid || inventory.record.raftId != id ||
+            inventory.record.address != expected->second)
+            throw NodeCapabilityValidationError("legacy receipt inventory identity does not match configured node " +
+                                                std::to_string(id));
+        if (!persistentUuids.insert(inventory.record.uuid).second)
+            throw NodeCapabilityValidationError("duplicate persistent node identity in legacy receipt inventory");
+        auto& nodeEntries = byNode[id];
+        for (const auto& entry : inventory.entries) {
+            auto placement = servingMap.placement.find(entry.vshard);
+            if (placement == servingMap.placement.end() ||
+                std::find(placement->second.begin(), placement->second.end(), id) == placement->second.end())
+                throw NodeCapabilityValidationError("legacy receipt inventory advertises an unowned VShard");
+            if (entry.legacyReceipts > entry.totalReceipts ||
+                entry.totalReceipts > data::kMaxDeleteReceiptsPerVShard)
+                throw NodeCapabilityValidationError("legacy receipt inventory exceeds the per-VShard hard cap");
+            if (entry.hasUnappliedEntries)
+                throw NodeCapabilityValidationError(
+                    "legacy receipt inventory has an unapplied data-group log tail");
+            if (!nodeEntries.emplace(entry.vshard, entry).second)
+                throw NodeCapabilityValidationError("legacy receipt inventory repeats a VShard");
+        }
+    }
+
+    LegacyReceiptPreflightSummary summary;
+    for (const auto& [vshard, replicas] : servingMap.placement) {
+        std::optional<control::LegacyReceiptInventoryEntry> expectedCounts;
+        for (raft::NodeId replica : replicas) {
+            auto node = byNode.find(replica);
+            if (node == byNode.end())
+                throw NodeCapabilityValidationError("serving map names an unconfigured receipt-inventory node");
+            auto entry = node->second.find(vshard);
+            if (entry == node->second.end())
+                throw NodeCapabilityValidationError("legacy receipt inventory is missing a serving replica");
+            if (expectedCounts && (entry->second.legacyReceipts != expectedCounts->legacyReceipts ||
+                                   entry->second.totalReceipts != expectedCounts->totalReceipts))
+                throw NodeCapabilityValidationError("legacy receipt counts disagree across serving replicas");
+            expectedCounts = entry->second;
+        }
+        if (!expectedCounts)
+            throw NodeCapabilityValidationError("serving VShard has no legacy receipt inventory");
+        if (expectedCounts->legacyReceipts >= data::kMaxDeleteReceiptsPerVShard)
+            throw NodeCapabilityValidationError("legacy receipts exhaust a VShard's bounded receipt capacity");
+        ++summary.vshards;
+        summary.maxLegacyReceipts = std::max(summary.maxLegacyReceipts, expectedCounts->legacyReceipts);
+        summary.maxTotalReceipts = std::max(summary.maxTotalReceipts, expectedCounts->totalReceipts);
+    }
+    return summary;
 }
 
 }  // namespace timestar::cluster

@@ -11,6 +11,7 @@ constexpr uint8_t kNodeCapabilityFrameTag = 1;
 constexpr size_t kMaxNodeCapabilityFrameBytes = 4096;
 constexpr uint8_t kControlJoinRequestFrameTag = 1;
 constexpr uint8_t kControlJoinResultFrameTag = 1;
+constexpr uint8_t kLegacyReceiptInventoryFrameTag = 1;
 
 bool canonicalHex128(const std::string& value) {
     if (value.size() != 32)
@@ -42,6 +43,25 @@ bool validControlJoinResult(const ControlJoinResult& result) {
         return false;
     return (result.status == ControlJoinStatus::NotLeader || result.status == ControlJoinStatus::Rejected) ||
            result.leader != raft::kNoNode;
+}
+
+bool validLegacyReceiptInventory(const LegacyReceiptInventoryAdvertisement& inventory) {
+    if (!canonicalHex128(inventory.clusterUuid) || inventory.record.raftId == raft::kNoNode ||
+        !canonicalHex128(inventory.record.uuid) || inventory.record.address.empty() ||
+        inventory.record.address.size() > 1024 || inventory.record.failureDomain.empty() ||
+        inventory.record.failureDomain.size() > 1024 || !isValidNodeState(inventory.record.state) ||
+        inventory.entries.size() > kMaxLegacyReceiptInventoryEntries)
+        return false;
+    uint16_t previous = 0;
+    bool first = true;
+    for (const auto& entry : inventory.entries) {
+        if (entry.vshard >= kMaxLegacyReceiptInventoryEntries ||
+            entry.legacyReceipts > entry.totalReceipts || (!first && entry.vshard <= previous))
+            return false;
+        first = false;
+        previous = entry.vshard;
+    }
+    return true;
 }
 
 struct Writer {
@@ -569,6 +589,54 @@ std::optional<ControlJoinResult> decodeControlJoinResult(const std::string& byte
     if (!r.ok || r.p != r.end || !validControlJoinResult(result))
         return std::nullopt;
     return result;
+}
+
+std::string encodeLegacyReceiptInventory(const LegacyReceiptInventoryAdvertisement& inventory) {
+    if (!validLegacyReceiptInventory(inventory))
+        throw std::invalid_argument("invalid legacy receipt inventory");
+    Writer w;
+    w.u8(kLegacyReceiptInventoryFrameTag);
+    w.str(inventory.clusterUuid);
+    writeNode(w, inventory.record);
+    w.u64(inventory.entries.size());
+    for (const auto& entry : inventory.entries) {
+        w.u16(entry.vshard);
+        w.u64(entry.legacyReceipts);
+        w.u64(entry.totalReceipts);
+        w.u8(entry.hasUnappliedEntries ? 1 : 0);
+    }
+    if (w.out.size() > kMaxLegacyReceiptInventoryFrameBytes)
+        throw std::invalid_argument("legacy receipt inventory exceeds its wire bound");
+    return std::move(w.out);
+}
+
+std::optional<LegacyReceiptInventoryAdvertisement> decodeLegacyReceiptInventory(const std::string& bytes) {
+    if (bytes.size() > kMaxLegacyReceiptInventoryFrameBytes)
+        return std::nullopt;
+    Reader r{bytes.data(), bytes.data() + bytes.size()};
+    if (r.u8() != kLegacyReceiptInventoryFrameTag)
+        return std::nullopt;
+    LegacyReceiptInventoryAdvertisement inventory;
+    inventory.clusterUuid = r.str();
+    inventory.record = readNode(r);
+    const uint64_t count = r.u64();
+    constexpr uint64_t kEntryBytes = sizeof(uint16_t) + 2 * sizeof(uint64_t) + sizeof(uint8_t);
+    if (!r.ok || count > kMaxLegacyReceiptInventoryEntries ||
+        count > static_cast<uint64_t>(r.end - r.p) / kEntryBytes)
+        return std::nullopt;
+    inventory.entries.reserve(count);
+    for (uint64_t i = 0; i < count && r.ok; ++i) {
+        const uint16_t vshard = r.u16();
+        const uint64_t legacy = r.u64();
+        const uint64_t total = r.u64();
+        const uint8_t hasUnapplied = r.u8();
+        if (hasUnapplied > 1)
+            r.ok = false;
+        inventory.entries.push_back({vshard, legacy, total, hasUnapplied == 1});
+    }
+    if (!r.ok || r.p != r.end || !validLegacyReceiptInventory(inventory))
+        return std::nullopt;
+    return inventory;
 }
 
 }  // namespace timestar::control

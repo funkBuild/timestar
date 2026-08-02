@@ -18,6 +18,7 @@
 #include <filesystem>
 #include <map>
 #include <memory>
+#include <optional>
 #include <seastar/core/future.hh>
 #include <seastar/core/gate.hh>
 #include <seastar/core/lowres_clock.hh>
@@ -225,6 +226,7 @@ public:
     // amount of re-routing can fix -- see classifyRefusal (write-scaleout 5 review, F1).
     uint64_t proposeRefusedWhileLeader() const { return proposeRefusedWhileLeader_; }
     size_t vshardCount() const { return vshards_.size(); }
+    std::optional<EngineDataStateMachine::DeleteReceiptCounts> deleteReceiptCounts(uint16_t vshard);
 
     void startTicking() { registry_.startTicking(); }
     seastar::future<> stop();

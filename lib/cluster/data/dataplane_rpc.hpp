@@ -34,6 +34,12 @@ public:
         control::ControlJoinRequest request) = 0;
 };
 
+class LegacyReceiptInventorySink {
+public:
+    virtual ~LegacyReceiptInventorySink() = default;
+    virtual seastar::future<std::vector<control::LegacyReceiptInventoryEntry>> handleLegacyReceiptInventory() = 0;
+};
+
 // OptDeadline (node_store.hpp): a wall-clock point past which an awaited data-plane RPC
 // must give up. std::nullopt = no timeout, the pre-3f behaviour, kept for callers with no
 // deadline of their own (tests, the legacy verbs). seastar's rpc clock is lowres_clock,
@@ -119,6 +125,10 @@ public:
     seastar::future<control::ControlJoinResult> controlJoin(
         NodeId to, control::ControlJoinRequest request,
         OptDeadline deadline = std::nullopt);
+    // Version-9 identity-bound inventory used immediately before an operator
+    // activates bounded delete receipts.
+    seastar::future<control::LegacyReceiptInventoryAdvertisement> legacyReceiptInventory(
+        NodeId to, OptDeadline deadline = std::nullopt);
     seastar::future<bool> proposeWrite(NodeId to, WriteBatch batch) override;
     // The production remote propose (write-scaleout 3a/3b): borrows the caller's groups
     // (no merge allocation, and the caller keeps them so it can retry the failed ones)
@@ -140,6 +150,7 @@ public:
     void setReadIndexSink(ReadIndexSink& sink);
     void setFrozenDeletePlanSink(FrozenDeletePlanSink& sink);
     void setControlJoinSink(ControlJoinSink& sink);
+    void setLegacyReceiptInventorySink(LegacyReceiptInventorySink& sink);
 
     // Identity advertised by the v7 capability verb. The supported range is
     // read from setLocalVersion() at reply time so the two cannot drift.

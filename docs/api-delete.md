@@ -17,15 +17,18 @@ after group 0 has committed cluster format v5. Until then the request fails
 before any Raft proposal with HTTP `409` and JSON code
 `CLUSTER_FORMAT_NOT_ACTIVE`. The server can now opt into a persistent group-0
 host, and an already committed activation is published to every reactor-local
-data gate before group 0 advances its applied boundary. No production path can
-yet safely originate activation: exact v7 identity/full-range collection now
-covers the static data voters and activation refuses observers that are not
-group-0 members. Protocol v8 now admits observers as caught-up learners with
-one-use tokens, but the legacy-receipt preflight/activation actuator is
-incomplete. Pattern plans also require v6. These
-operations are therefore intentionally unavailable in the current production
-composition and cluster readiness remains false; do not deploy them as a
-production delete path.
+data gate before group 0 advances its applied boundary. Exact v7
+identity/full-range collection covers the static data voters and activation
+refuses observers that are not group-0 members. Protocol v8 admits observers as
+caught-up learners with one-use tokens. Protocol v9 inventories legacy receipts
+on every serving replica, and authenticated `POST /cluster/activate-format` on
+the current control leader performs that preflight before crossing v5. Pattern
+plans additionally require v6. The preflight refuses unapplied data-group log
+tails as well as missing/disagreeing receipt inventories, so an old legacy entry
+cannot be hidden behind applied counts. These paths are operable only after explicit
+activation; the cluster release remains production-blocked until mixed-binary
+snapshot/command tests, the live activation gate, and downgrade-startup
+enforcement are complete.
 
 Every RF&gt;1 request must include both of these headers:
 

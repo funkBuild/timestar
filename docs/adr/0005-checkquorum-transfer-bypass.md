@@ -24,19 +24,24 @@ decision that machinery had **no caller in a running server** and no live group 
 `ClusterDataPlane`. The opt-in host and publication bridge now remove that composition
 part, and F9 is closed for the immutable serving map: activation capabilities cover the
 identity-keyed union of stable meta-voters and every data voter, with the covered union
-revalidated from the committed command at apply. What remains is the production
-capability/receipt-preflight actuator and the separate decision to bind CheckQuorum to an
-activated version. Building only that latter boolean gate would still produce a mechanism
-nothing can exercise.
+revalidated from the committed command at apply. What remained at that decision point was
+the production capability/receipt-preflight actuator and the separate decision to bind
+CheckQuorum to an activated version.
 
 **Implementation update (2026-08-02):** the server can now opt into a live,
 persistent group-0 host and explicitly bootstrap its configured seed. That
 removes the old “no group 0 is composed” premise, but not this decision: the
 publication bridge now has a production caller and F9 covers the immutable
-serving-map voter union. Protocol v8 now provides the token-authorized observer
-join RPC, but production has no capability/receipt-preflight actuator that can
-originate an activation.
+serving-map voter union. Protocol v8 provides the token-authorized observer join
+RPC; protocol v9 and the authenticated leader-only activation endpoint now
+provide the capability/legacy-receipt preflight actuator.
 CheckQuorum therefore remains build-default OFF and runtime-disable-only.
+
+This actuator satisfies trigger (4) below, so mechanism (c) is reopened as
+future-release debt: before any build flips `kCheckQuorumDefault`, the guard must
+also require an active cluster format whose covered voter set can decode the
+transfer-vote tag. It does not block this release while the guard is impossible
+to enable, and it must not be mistaken for permission to flip the build default.
 
 *The condition, and it is load-bearing.* The ordering argument holds **only while enabling
 is a BUILD decision**. That property is now pinned rather than asserted: the parse and the
@@ -54,7 +59,9 @@ the one-release gap the ordering depends on; (3) any future behaviour change of 
 whose wire form is not fail-closed, since (b) is what makes "the old peer drops it" true and
 not every change has a (b); (4) the production activation actuator acquiring a caller — at which point
 the machinery is live, (c) is cheap, and it must remain bound to D-7's voter-set
-closure. Absent all four, (c) stays unbuilt and this is the record of why.
+closure. Trigger (4) occurred on 2026-08-02 with the v9 receipt preflight and
+`/cluster/activate-format`; (c) is therefore required before CheckQuorum can be
+enabled, while the present build remains safely OFF.
 
 **Why enabling is deferred, on a measurement rather than a doubt.** Same binary, same
 session, `node_kill_round.sh`, the flag the only difference: **OFF 32/400 failed batches /

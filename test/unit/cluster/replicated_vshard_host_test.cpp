@@ -270,6 +270,10 @@ TEST_F(ReplicatedVShardHostTest, ReceiverDefaultsBoundLegacyAndHintedQuorumWaits
         }
         EXPECT_TRUE(legacyTimedOut);
         EXPECT_EQ(group->pendingApplyWaiters(), 0u);
+        const auto inventoryCounts = host.deleteReceiptCounts(vshard);
+        ASSERT_TRUE(inventoryCounts.has_value());
+        EXPECT_TRUE(inventoryCounts->hasUnappliedEntries)
+            << "activation inventory must expose the ambiguous uncommitted tail after RPC timeout";
 
         // Current hinted peer ingress normally supplies nullopt because the RPC
         // deadline exists only on the forwarding client. A later explicit value

@@ -149,6 +149,31 @@ struct ControlJoinResult {
 
 inline constexpr size_t kMaxControlJoinFrameBytes = 4096;
 
+// Version-9 upgrade preflight. Every node reports the durable delete-receipt
+// state of the VShards it actually hosts, bound to the same persistent identity
+// used by capability collection. Counts are 64-bit so an over-limit legacy
+// state can be reported and rejected rather than truncated on the wire.
+struct LegacyReceiptInventoryEntry {
+    uint16_t vshard = 0;
+    uint64_t legacyReceipts = 0;
+    uint64_t totalReceipts = 0;
+    bool hasUnappliedEntries = false;
+
+    friend bool operator==(const LegacyReceiptInventoryEntry&, const LegacyReceiptInventoryEntry&) = default;
+};
+
+struct LegacyReceiptInventoryAdvertisement {
+    std::string clusterUuid;
+    NodeRecord record;
+    std::vector<LegacyReceiptInventoryEntry> entries;
+
+    friend bool operator==(const LegacyReceiptInventoryAdvertisement&,
+                           const LegacyReceiptInventoryAdvertisement&) = default;
+};
+
+inline constexpr size_t kMaxLegacyReceiptInventoryEntries = 4096;
+inline constexpr size_t kMaxLegacyReceiptInventoryFrameBytes = 96 * 1024;
+
 using ControlCommand =
     std::variant<InitCluster, UpsertNode, SetNodeState, SetDesiredPlacement, SetMetaVoters, CasPolicy,
                  SetControllerTerm, UpsertJob, MintJoinToken, AdmitWithToken, StoreFrozenDeletePlan, SetActiveVersion,
@@ -175,5 +200,8 @@ std::string encodeControlJoinRequest(const ControlJoinRequest& request);
 std::optional<ControlJoinRequest> decodeControlJoinRequest(const std::string& bytes);
 std::string encodeControlJoinResult(const ControlJoinResult& result);
 std::optional<ControlJoinResult> decodeControlJoinResult(const std::string& bytes);
+
+std::string encodeLegacyReceiptInventory(const LegacyReceiptInventoryAdvertisement& inventory);
+std::optional<LegacyReceiptInventoryAdvertisement> decodeLegacyReceiptInventory(const std::string& bytes);
 
 }  // namespace timestar::control

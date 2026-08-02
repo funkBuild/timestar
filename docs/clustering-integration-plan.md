@@ -681,7 +681,7 @@ Tasks:
 5. Remaining operator/metrics surface per plan §"Observability".
 
 Current feature-gating work (`9ecd0e6` plus the frozen-plan/capability slices): pairwise
-protocol negotiation now advertises through v8 and refuses bounded delete tag
+protocol negotiation now advertises through v9 and refuses bounded delete tag
 5/`Expired` exchanges with older peers. The cluster-wide emission gate
 independently refuses snapshot
 payload v2-v4 and durable receipt command tags until their committed activation
@@ -693,10 +693,14 @@ committed data voters. Production now collects an exact v7 identity/full-range
 advertisement from the complete static topology under one bounded fan-out, and
 activation refuses covered observers until group-0 learner/voter membership
 proves delivery. Protocol v8 now provides authenticated one-use token admission
-and an operator-retryable observer-to-learner path. This remains partial because
-no activation/legacy-receipt-preflight actuator safely originates an activation,
-mixed-binary gates are missing, and most control requests are not forwarded to
-the group-0 leader. No static configuration bypass may raise the gate.
+and an operator-retryable observer-to-learner path. Protocol v9 provides a
+bounded identity-bound inventory from every static serving replica, and the
+authenticated leader-only `/cluster/activate-format` actuator validates those
+inventories before crossing bounded-receipt format v5. This remains partial
+because mixed-binary/live gates and explicit downgrade-startup enforcement are
+missing, dynamic placement is not implemented, and most control requests are
+not forwarded to the group-0 leader. No static configuration bypass may raise
+the gate.
 
 **Re-opens:** the SSE handler's node-local guard (deliberately — that guard
 exists to be replaced by exactly this). **Defers:** hot-series lanes (out of

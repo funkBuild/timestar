@@ -412,6 +412,8 @@ public:
     // testable without waiting for a timer.
     seastar::future<std::map<NodeId, control::NodeCapabilityAdvertisement>> collectControlCapabilities(
         data::OptDeadline deadline = std::nullopt);
+    seastar::future<std::map<NodeId, control::LegacyReceiptInventoryAdvertisement>>
+    collectLegacyReceiptInventories(data::OptDeadline deadline = std::nullopt);
 
     struct ControlTokenMintResult {
         bool minted = false;
@@ -422,6 +424,18 @@ public:
     // identity; Joining is an idempotent, retryable learner-catch-up result.
     seastar::future<ControlTokenMintResult> mintControlJoinToken(std::string token);
     seastar::future<control::ControlJoinResult> joinControlPlane(std::string token);
+
+    struct ControlFormatActivationResult {
+        bool activated = false;
+        NodeId leader = raft::kNoNode;
+        uint32_t activeFormat = 1;
+        uint64_t maxLegacyReceipts = 0;
+        uint64_t maxTotalReceipts = 0;
+    };
+    // Explicit operator actuator. Crossing into bounded receipt format v5
+    // requires a complete v9 inventory from every static replica immediately
+    // before the covered group-0 activation proposal.
+    seastar::future<ControlFormatActivationResult> activateControlFormat(uint32_t version);
 
     // Fail startup before accepting traffic when the configured reactor count
     // cannot produce complete single-core VShard snapshots.

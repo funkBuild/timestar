@@ -601,9 +601,9 @@ snapshot-durable plan before rediscovery, so new matching series cannot join an
 ambiguous retry. The group-0 command/snapshot feature is gated at cluster format
 v6. A follower forwards plan lookup/freeze to the reported group-0 leader over
 the v6 peer protocol; the RPC and leader quorum-apply wait are bounded, and an
-ambiguous timeout is safely retryable through lookup-first recovery. Until
-production can originate v6 activation, this path remains fail-closed rather
-than silently degrading.
+ambiguous timeout is safely retryable through lookup-first recovery. Until an
+operator completes the authenticated format-activation workflow through v6,
+this path remains fail-closed rather than silently degrading.
 
 For writes, idempotency means *replica convergence*, not retry-invisibility across
 intervening operations: a retried write is a new log entry and can reappear after
@@ -955,7 +955,9 @@ snapshot payloads, v3 for legacy durable delete receipts, v4 for node-query
 redirects, v5 for bounded delete command tag 5, snapshot payload v4, and the
 typed `Expired` proposal result, v6 for frozen pattern-delete plans, v7 for
 the exact identity/full-range capability RPC, and v8 for token-authorized
-group-0 observer admission. Emission fails closed: snapshots
+group-0 observer admission. Protocol-only v9 carries the identity-bound legacy
+delete-receipt inventory used by format activation. Emission fails closed:
+snapshots
 require at least v2, and bounded deletes require both committed format v5 and
 peer protocol v5.
 Decoders continue to read historical formats regardless of the active emission
@@ -975,10 +977,19 @@ separately from permanent identity conflict. Activation nevertheless refuses a
 covered node until it is a group-0 voter or learner: capability is not proof that
 an observer receives the committed decision.
 Fresh observers can now join through a one-use token and the v8 inter-node RPC;
-membership does not change static data placement. A fresh data plane therefore
-still remains at format v1, so snapshot production and bounded deletes are
-refused and readiness stays false. Production enablement still requires the
-activation/legacy-receipt preflight actuator and mixed-binary tests.
+membership does not change static data placement. A fresh data plane remains at
+format v1 until an operator explicitly activates a version. On the current
+control leader, authenticated `POST /cluster/activate-format` accepts
+`{"version":N}` and performs a fresh exact capability collection before
+proposing the covered activation. Crossing from below v5 to v5 or later also
+requires every configured node to speak v9 and inventories every serving
+replica. The activation is refused if an identity or replica is missing, any
+replica still has an unapplied data-group log tail, receipt counts disagree, a
+VShard exceeds the 1,024-receipt cap, or legacy receipts alone fill that cap.
+The endpoint is leader-only, monotonic, and must remain behind the same
+TLS-protected operator ingress as join. It makes snapshot, bounded-delete,
+and frozen-plan activation operable; production release still requires the
+documented mixed-binary/live gates and downgrade-startup enforcement.
 
 Format activation is monotonic. Once version N is committed, a binary whose
 maximum supported version is below N must not start against that node data and a

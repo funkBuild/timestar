@@ -1344,9 +1344,8 @@ is not completion.
   Focused state/controller/host/readiness evidence passes 28/28. Committed
   format changes and recovered control snapshots now publish the replicated
   active version to every reactor-local data gate before group 0 advances its
-  applied boundary; a failed publication retries the same entry. This closes
-  the publication half of CR-FIX-076, but no production path originates an
-  activation yet. Production now periodically collects a version-7 exact
+  applied boundary; a failed publication retries the same entry. Production
+  now periodically collects a version-7 exact
   identity/full-range advertisement from every statically configured node over
   the authenticated data-plane channel. One 600 ms absolute deadline bounds the
   complete fan-out; validation binds cluster UUID, expected Raft id and address,
@@ -1358,9 +1357,11 @@ is not completion.
   replicated group-0 learner/member. `activateFormat` now refuses every covered
   data voter that is neither a stable group-0 voter nor learner, so capability
   cannot be mistaken for delivery. The token-authorized join RPC now supplies
-  that membership, but the capability/receipt-preflight actuator that turns the
-  collected ranges into a safe activation is still absent; this task is not
-  closed.
+  that membership. Protocol v9 and authenticated leader-only
+  `/cluster/activate-format` now turn a fresh capability collection and complete
+  agreeing legacy-receipt inventory into the existing covered activation
+  proposal. This task remains open for dynamic effective membership and
+  serving-map movement, not format actuation.
 - [ ] **CR-FIX-022 — wire resumable join, drain, remove, replace, and VShard
   movement.** Owner: movement/control plane. Include learner catch-up, verified
   snapshot, log catch-up, joint consensus, leadership transfer, cutover, and
@@ -1609,15 +1610,21 @@ is not completion.
   or learner, which proves the committed decision can be delivered rather than
   merely decoded. Protocol v8 now wires one-use token minting and an
   operator-retryable observer-to-learner join through the production server.
-  **Still open:** add the capability/receipt-preflight actuator that can safely
-  originate an activation, preflight legacy receipt counts, and run old/new
-  multi-process snapshot and command tests.
-  Because no production path originates an activation, this fail-closed slice
-  deliberately leaves clustered readiness false, exact bounded deletes
-  unavailable below v5, and frozen pattern deletes unavailable below v6; it does
-  not close this task. The scalar negotiation response is deliberately not
+  Protocol v9 now carries a bounded identity-bound inventory from every static
+  serving replica. Authenticated `POST /cluster/activate-format` on the current
+  control leader performs a fresh capability fan-out; when crossing v5 it also
+  requires complete replica inventory, no unapplied data-group log tails,
+  agreeing counts, totals within the 1,024-receipt cap, and at least one
+  non-legacy slot. Only then does it invoke the existing covered group-0
+  activation proposal. **Still open:** run old/new
+  multi-process snapshot and command tests, add an end-to-end live activation
+  gate, and fail startup explicitly when recovered active format exceeds the
+  binary maximum. Exact bounded deletes remain unavailable below v5 and frozen
+  pattern deletes below v6, but the operator can now activate them after all
+  preconditions pass; this does not close the release task. The scalar
+  negotiation response is deliberately not
   treated as an advertised maximum; the v7 reply is the exact range/identity
-  source. The remaining actuator may include a node only after the v8 join path
+  source. The actuator may include a node only after the v8 join path
   has made it a group-0 learner/member, because observers do not receive
   committed group-0 state. Once version N is committed,
   the state machine cannot lower it and a binary whose maximum supported version
@@ -1724,9 +1731,9 @@ is not completion.
   cannot receive the activation can never authorize emission. Codec truncation,
   validator conflict, real loopback identity/range/pre-v7 refusal, and
   three-node delivery regressions pass. This closes the collector/delivery-fence
-  slice, not CR-FIX-076: the v8 join path now supplies delivery membership, but
-  the activation/legacy-receipt preflight actuator and mixed-binary live evidence
-  remain open.
+  slice, not CR-FIX-076: the v8 join path supplies delivery membership and
+  CR-FIX-084 supplies activation/legacy-receipt preflight. Mixed-binary/live
+  evidence and downgrade-startup enforcement remain open.
 - [x] **CR-FIX-083 — wire bounded, token-authorized group-0 observer
   admission.** Owner: control plane/security. Protocol v8 carries a canonical
   cluster UUID, the joining node's persistent record, and one-use token over the
@@ -1744,7 +1751,39 @@ is not completion.
   RPC tests pass and the server builds, but the required three-process
   mint/join/restart/leader-change gate has not run in this memory-constrained
   review. CR-FIX-021/022 remain open for dynamic serving-map reconciliation and
-  data-VShard movement; CR-FIX-076 remains open for activation/preflight.
+  data-VShard movement; CR-FIX-076 remains open for mixed-version/live evidence
+  and downgrade-startup enforcement.
+- [x] **CR-FIX-084 — wire identity-bound legacy-receipt preflight and explicit
+  format activation.** Owner: control plane/release. Protocol v9 carries a
+  canonical cluster UUID, persistent node record, sorted per-VShard legacy and
+  total receipt counts, and an unapplied-tail flag in a bounded 96 KiB frame. The client refuses a
+  pre-v9 peer before sending the unknown verb and requires the responder to
+  reproduce the exact requested Raft id. Authenticated, leader-only
+  `POST /cluster/activate-format` performs a fresh exact capability collection;
+  crossing from below format v5 additionally inventories every configured node
+  and validates every replica in the complete immutable serving map. Missing or
+  unowned VShards, identity conflicts, duplicate persistent UUIDs, unapplied log
+  tails, replica count disagreement, totals over 1,024, and a cap filled entirely
+  by non-expiring legacy receipts all fail before proposal. Successful preflight
+  invokes the existing monotonic covered group-0 activation and reports the active version
+  and observed receipt maxima. Capability and inventory fan-outs each have one
+  absolute two-second deadline, so one slow phase cannot leave the next with an
+  expired budget. Deterministic codec/truncation, inventory, validator, and
+  advertiser tests pass; a real v9 loopback proves success, wrong-target
+  rejection, and pre-v9 refusal, and all affected targets build serially.
+  **Evidence limitation:** no live or multi-process server was started in this
+  memory-constrained review. CR-FIX-076 remains open for old/new process gates,
+  the live HTTP activation ceremony, and explicit startup refusal on downgrade.
+- [ ] **CR-FIX-085 — bind any future CheckQuorum enablement to committed
+  cluster format.** Owner: consensus/release. The v9 production actuator
+  satisfies ADR 0005's trigger (4), reopening mechanism (c). Before any build
+  flips `kCheckQuorumDefault`, data-group construction must require a committed
+  activation whose covered voter union supports the transfer-vote tag; an
+  operator or per-node runtime input must never bypass that decision. This does
+  not block a release that keeps the current build default off and the runtime
+  override disable-only. **Done when:** the startup/runtime composition is
+  pinned by a negative mixed-version test and the existing ON/OFF failure gate
+  is rerun before the default changes.
 
 ## Release exit criteria
 
@@ -2158,11 +2197,11 @@ is still required. The deterministic exact-delete RF=3 leader-failure/replica-
 restart gate already passes. `8ae846c` removes CR-FIX-065's known implementation
 starvation path; the sustained live workload must still show that snapshots
 keep advancing and journal bytes plateau or reclaim.
-CR-FIX-076 remains an activation blocker: `9ecd0e6` prevents unsafe emission and
+CR-FIX-076 remains a release blocker: `9ecd0e6` prevents unsafe emission and
 false readiness, and CR-FIX-082 supplies exact identity/range collection plus
 the delivery-membership fence. Protocol v8 now supplies the operator-driven
-join path; activation actuation, legacy-receipt preflight, downgrade enforcement,
-and mixed-binary evidence are still missing.
+join path; CR-FIX-084 supplies activation actuation and legacy-receipt preflight.
+Downgrade-startup enforcement and mixed-binary/live evidence are still missing.
 
 Receiver-side data proposal deadline validation for CR-FIX-081:
 
@@ -2201,7 +2240,7 @@ build and repository-local 4 KiB temporary tree respect the host-memory limit.
 This proves exact v7 framing, pre-v7 refusal, identity/range consistency,
 partial and complete topology validation, status/readiness behavior, and
 delivery membership in deterministic and loopback tests. It does not replace
-the remaining activation/receipt-preflight actuator or mixed-binary live gate.
+the v9 activation/receipt-preflight slice or mixed-binary live gate.
 
 Token-authorized production join validation:
 
@@ -2219,3 +2258,21 @@ No live or multi-process server was started. This proves bounded v8 framing,
 pre-v8 refusal, token limits, controller admission idempotency, and the real RPC
 dispatch/result path. The remaining production evidence is a three-process
 operator join through the HTTP endpoints, including leader change and restart.
+
+Identity-bound receipt preflight and explicit activation validation:
+
+```text
+receipt codec/startup/count/tail/advertiser focused unit tests: 6/6 passed
+v9 receipt inventory real-socket loopback test:            1/1 passed
+timestar_unit_test:                         built successfully (-j1)
+timestar_cluster_socket_test:               built successfully (-j1)
+timestar_http_server:                       built successfully (-j1)
+all test processes:                                --smp 1 --memory 1G
+compiler and test temporary directory:                       build/tmp
+```
+
+No live or multi-process server was started. This proves bounded v9 framing,
+truncation rejection, pre-v9 refusal before dispatch, exact responder identity,
+complete static-replica validation, receipt-cap handling, and exhaustive newest
+version advertisement, including rejection of hidden unapplied tails. It does not replace the old/new mixed-process or live
+operator activation gates required by CR-FIX-076.

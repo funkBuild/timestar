@@ -1015,6 +1015,17 @@ NodeId ReplicatedVShardHost::leaderOf(uint16_t vshard) const {
     return g ? g->leader() : raft::kNoNode;
 }
 
+std::optional<EngineDataStateMachine::DeleteReceiptCounts> ReplicatedVShardHost::deleteReceiptCounts(
+    uint16_t vshard) {
+    auto found = vshards_.find(vshard);
+    auto* group = registry_.group(vshard);
+    if (found == vshards_.end() || !found->second.sm || !group)
+        return std::nullopt;
+    auto counts = found->second.sm->deleteReceiptCounts();
+    counts.hasUnappliedEntries = group->node().log().lastIndex() > group->appliedIndex();
+    return counts;
+}
+
 seastar::future<raft::LogIndex> ReplicatedVShardHost::leaderReadIndex(uint16_t vshard) {
     raft::RaftGroup* g = registry_.group(vshard);
     if (!g)

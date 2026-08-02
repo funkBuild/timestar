@@ -98,6 +98,9 @@ constexpr uint64_t kNodeCapability = 14;
 // Token-authorized observer admission. A client selects this verb only after
 // negotiating protocol v8, so older peers never see an unknown request.
 constexpr uint64_t kControlJoin = 15;
+// Identity-bound legacy delete-receipt inventory used by the format activation
+// preflight. Clients negotiate v9 before sending this verb.
+constexpr uint64_t kLegacyReceiptInventory = 16;
 
 // How long before re-attempting a peer connection that died. seastar's rpc::client
 // never reconnects itself, so we replace it -- but bounded, so a burst of concurrent
@@ -253,6 +256,7 @@ struct DataPlaneRpc::Impl {
     ReadIndexSink* readIndexSink = nullptr;  // replica-read leader-reach target (M4)
     FrozenDeletePlanSink* frozenDeletePlanSink = nullptr;  // group-0 request target
     ControlJoinSink* controlJoinSink = nullptr;             // group-0 observer admission target
+    LegacyReceiptInventorySink* legacyReceiptInventorySink = nullptr;  // format preflight target
     std::optional<std::pair<std::string, control::NodeRecord>> localNodeCapability;
     // Ordered wire/protocol range this node supports (M6/X). Some versions change
     // WriteBatch bytes and others add separate RPC verbs; peers negotiate down to
@@ -288,6 +292,7 @@ struct DataPlaneRpc::Impl {
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> frozenDeletePlanStub;
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> nodeCapabilityStub;
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> controlJoinStub;
+    std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> legacyReceiptInventoryStub;
     // DEADLINE-CARRYING variants of the three verbs the write path awaits
     // (write-scaleout 3f). seastar's rpc client stub has a time_point overload; without
     // it an awaited call has NO timeout at all, so a peer that accepts the connection and
@@ -322,6 +327,9 @@ struct DataPlaneRpc::Impl {
     std::function<seastar::future<seastar::sstring>(Client&, seastar::rpc::rpc_clock_type::time_point,
                                                     seastar::sstring)>
         controlJoinTimedStub;
+    std::function<seastar::future<seastar::sstring>(Client&, seastar::rpc::rpc_clock_type::time_point,
+                                                    seastar::sstring)>
+        legacyReceiptInventoryTimedStub;
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> leaderReadIndexStub;
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> leaderCommitIndexStub;
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> negotiateVersionStub;
@@ -404,6 +412,8 @@ struct DataPlaneRpc::Impl {
         frozenDeletePlanStub = proto.make_client<seastar::sstring(seastar::sstring)>(kFrozenDeletePlan);
         nodeCapabilityStub = proto.make_client<seastar::sstring(seastar::sstring)>(kNodeCapability);
         controlJoinStub = proto.make_client<seastar::sstring(seastar::sstring)>(kControlJoin);
+        legacyReceiptInventoryStub =
+            proto.make_client<seastar::sstring(seastar::sstring)>(kLegacyReceiptInventory);
         proposeWriteTimedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kProposeWrite);
         proposeWriteHintedTimedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kProposeWriteHinted);
         proposeCommandHintedTimedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kProposeCommandHinted);
@@ -413,6 +423,8 @@ struct DataPlaneRpc::Impl {
         frozenDeletePlanTimedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kFrozenDeletePlan);
         nodeCapabilityTimedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kNodeCapability);
         controlJoinTimedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kControlJoin);
+        legacyReceiptInventoryTimedStub =
+            proto.make_client<seastar::sstring(seastar::sstring)>(kLegacyReceiptInventory);
         leaderReadIndexStub = proto.make_client<seastar::sstring(seastar::sstring)>(kLeaderReadIndex);
         leaderCommitIndexStub = proto.make_client<seastar::sstring(seastar::sstring)>(kLeaderCommitIndex);
         negotiateVersionStub = proto.make_client<seastar::sstring(seastar::sstring)>(kNegotiateVersion);
@@ -613,6 +625,23 @@ seastar::future<> DataPlaneRpc::start(seastar::socket_address local, NodeStore& 
                 return seastar::sstring(encoded.data(), encoded.size());
             });
     });
+    impl_->proto.register_handler(kLegacyReceiptInventory, [this](seastar::sstring data) {
+        const auto expected = decU64(data);
+        if (!expected)
+            return seastar::make_exception_future<seastar::sstring>(
+                std::runtime_error("dataplane: malformed legacy receipt inventory request"));
+        if (!impl_->legacyReceiptInventorySink || !impl_->localNodeCapability)
+            return seastar::make_ready_future<seastar::sstring>(seastar::sstring{});
+        // As with capability replies, disclose the actual bound identity so the
+        // caller can classify a wrong-node response as a permanent conflict.
+        return impl_->legacyReceiptInventorySink->handleLegacyReceiptInventory().then(
+            [this](std::vector<control::LegacyReceiptInventoryEntry> entries) {
+                control::LegacyReceiptInventoryAdvertisement inventory{
+                    impl_->localNodeCapability->first, impl_->localNodeCapability->second, std::move(entries)};
+                std::string encoded = control::encodeLegacyReceiptInventory(inventory);
+                return seastar::sstring(encoded.data(), encoded.size());
+            });
+    });
     impl_->proto.register_handler(kProposeWrite, [this](seastar::sstring data) {
         if (!impl_->proposeSink)
             return seastar::make_exception_future<seastar::sstring>(
@@ -738,6 +767,10 @@ void DataPlaneRpc::setFrozenDeletePlanSink(FrozenDeletePlanSink& sink) {
 
 void DataPlaneRpc::setControlJoinSink(ControlJoinSink& sink) {
     impl_->controlJoinSink = &sink;
+}
+
+void DataPlaneRpc::setLegacyReceiptInventorySink(LegacyReceiptInventorySink& sink) {
+    impl_->legacyReceiptInventorySink = &sink;
 }
 
 void DataPlaneRpc::setLocalNodeCapability(std::string clusterUuid, control::NodeRecord record) {
@@ -1064,6 +1097,30 @@ seastar::future<control::ControlJoinResult> DataPlaneRpc::controlJoin(
     if (!result)
         throw std::runtime_error("dataplane: malformed control join result");
     co_return *result;
+}
+
+seastar::future<control::LegacyReceiptInventoryAdvertisement> DataPlaneRpc::legacyReceiptInventory(
+    NodeId to, OptDeadline deadline) {
+    if (impl_->stopping)
+        throw std::runtime_error("dataplane: shutting down");
+    const uint32_t agreed = co_await versionFor(to, deadline);
+    if (agreed < kWriteBatchFormatV9)
+        throw ClusterFormatUnsupportedError(
+            "dataplane: peer " + std::to_string(to) + " negotiated wire v" + std::to_string(agreed) +
+            ", below v" + std::to_string(kWriteBatchFormatV9) +
+            " -- it cannot provide the legacy receipt activation preflight");
+    auto* conn = impl_->clientFor(to);
+    if (!conn)
+        throw std::runtime_error("dataplane: unknown peer");
+    const seastar::sstring request = encU64(to);
+    seastar::sstring reply = deadline ? co_await impl_->legacyReceiptInventoryTimedStub(*conn, *deadline, request)
+                                      : co_await impl_->legacyReceiptInventoryStub(*conn, request);
+    if (reply.size() > control::kMaxLegacyReceiptInventoryFrameBytes)
+        throw NodeCapabilityMismatchError("dataplane: oversized legacy receipt inventory reply");
+    auto inventory = control::decodeLegacyReceiptInventory(std::string(reply.data(), reply.size()));
+    if (!inventory || inventory->record.raftId != to)
+        throw NodeCapabilityMismatchError("dataplane: malformed or inconsistent legacy receipt inventory reply");
+    co_return std::move(*inventory);
 }
 
 seastar::future<ProposeOutcome> DataPlaneRpc::proposeWriteHinted(NodeId to, VShardBatchView view,

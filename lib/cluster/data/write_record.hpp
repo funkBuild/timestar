@@ -188,12 +188,17 @@ constexpr uint32_t kWriteBatchFormatV7 = 7;
 // identity and add it as a learner. WriteBatch and snapshot bytes are unchanged.
 constexpr uint32_t kWriteBatchFormatV8 = 8;
 
+// v9 is a PROTOCOL-only identity-bound legacy delete-receipt inventory. The
+// operator activation path uses it to preflight every static replica before it
+// can enable bounded receipt commands. Data and snapshot bytes are unchanged.
+constexpr uint32_t kWriteBatchFormatV9 = 9;
+
 // The newest version this binary supports. Every place that advertises this node's
 // capability must use THIS, never the literal that happens to be current: naming v2 in
 // ClusterDataPlane after v3 landed capped every negotiation at 2, so no peer spoke the
 // hinted-propose verb and the leader-hint path was dead in production while every test
 // passed (tests construct their own DataPlaneRpc, whose default was already correct).
-constexpr uint32_t kWriteBatchFormatMax = kWriteBatchFormatV8;
+constexpr uint32_t kWriteBatchFormatMax = kWriteBatchFormatV9;
 
 // Wire codec (bounds-checked; decode returns nullopt on ANY malformed/truncated/
 // inconsistent input so a hostile frame can never fabricate a batch). Bounds-checking

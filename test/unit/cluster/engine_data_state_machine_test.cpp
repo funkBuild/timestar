@@ -143,6 +143,8 @@ TEST_F(EngineDataStateMachineTest, IdempotentDeleteRetryCannotEraseAnIntervening
         EXPECT_EQ(receiptState.receipts[0].operationId, operationId);
         EXPECT_EQ(receiptState.receipts[0].appliedIndex, 9u);
         EXPECT_TRUE(sm.deleteReceiptStateThrough(8).receipts.empty());
+        EXPECT_EQ(sm.deleteReceiptCounts(),
+                  (cluster::EngineDataStateMachine::DeleteReceiptCounts{1, 1}));
 
         auto conflicting = command;
         conflicting.endTime = BASE + 2;
@@ -200,6 +202,8 @@ TEST_F(EngineDataStateMachineTest, OneBatchReceiptProtectsEveryTargetFromRetry) 
         ASSERT_EQ(receiptState.receipts.size(), 1u) << "one VShard batch must consume one durable receipt";
         EXPECT_EQ(receiptState.receipts[0].operationId, command.operationId);
         EXPECT_EQ(receiptState.receipts[0].commandHash, data::deleteRangeCommandHash(command));
+        EXPECT_EQ(sm.deleteReceiptCounts(),
+                  (cluster::EngineDataStateMachine::DeleteReceiptCounts{1, 1}));
     }).get();
 }
 

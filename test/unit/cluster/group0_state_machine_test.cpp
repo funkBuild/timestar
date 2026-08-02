@@ -180,6 +180,30 @@ TEST(ControlCommandCodecTest, ControlJoinFramesRoundTripAndFailClosed) {
     EXPECT_FALSE(decodeControlJoinResult(unknown));
 }
 
+TEST(ControlCommandCodecTest, LegacyReceiptInventoryRoundTripsAndFailsClosed) {
+    const LegacyReceiptInventoryAdvertisement inventory{
+        std::string(32, 'a'),
+        NodeRecord{7, std::string(32, 'b'), "node-7.example:8086", "rack-a", NodeState::Active},
+        {{0, 3, 4}, {4095, 7, 9}}};
+    const std::string encoded = encodeLegacyReceiptInventory(inventory);
+    EXPECT_EQ(decodeLegacyReceiptInventory(encoded), inventory);
+    for (size_t n = 0; n < encoded.size(); ++n)
+        EXPECT_FALSE(decodeLegacyReceiptInventory(encoded.substr(0, n))) << "prefix " << n;
+
+    auto invalid = inventory;
+    invalid.entries = {{7, 1, 1}, {7, 1, 1}};
+    EXPECT_THROW(encodeLegacyReceiptInventory(invalid), std::invalid_argument);
+    invalid = inventory;
+    invalid.entries[0].legacyReceipts = invalid.entries[0].totalReceipts + 1;
+    EXPECT_THROW(encodeLegacyReceiptInventory(invalid), std::invalid_argument);
+    invalid = inventory;
+    invalid.entries = {{4096, 0, 0}};
+    EXPECT_THROW(encodeLegacyReceiptInventory(invalid), std::invalid_argument);
+    std::string invalidBoolean = encoded;
+    invalidBoolean.back() = 2;
+    EXPECT_FALSE(decodeLegacyReceiptInventory(invalidBoolean));
+}
+
 TEST(ControlCommandCodecTest, CoveredActivationCannotTruncateIntoLegacyActivation) {
     const std::string covered = encodeCommand(SetActiveVersion{5, {1, 2, 3}});
     for (size_t n = 0; n < covered.size(); ++n)

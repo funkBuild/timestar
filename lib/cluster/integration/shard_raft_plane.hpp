@@ -23,6 +23,7 @@
 #include <chrono>
 #include <exception>
 #include <filesystem>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <optional>
@@ -129,7 +130,8 @@ struct DataPlaneTls {
 class ShardRaftPlane : public data::ProposeSink,
                        public data::ReadIndexSink,
                        public data::FrozenDeletePlanSink,
-                       public data::ControlJoinSink {
+                       public data::ControlJoinSink,
+                       public data::LegacyReceiptInventorySink {
 public:
     seastar::future<> init(seastar::sharded<Engine>* engines, seastar::sharded<ShardRaftPlane>* peers,
                            const data::VShardDirectory* dir, data::NodeId self, std::string journalRoot,
@@ -272,6 +274,7 @@ public:
         rpc_->setReadIndexSink(*this);
         rpc_->setFrozenDeletePlanSink(*this);
         rpc_->setControlJoinSink(*this);
+        rpc_->setLegacyReceiptInventorySink(*this);
         return rpc_->start(local, *queryStore_, /*perShardListener=*/true);
     }
 
@@ -348,6 +351,39 @@ public:
             active && caughtUpAfterActivation ? control::ControlJoinStatus::Active
                                                : control::ControlJoinStatus::Joining,
             currentLeader()};
+    }
+
+    std::vector<control::LegacyReceiptInventoryEntry> localLegacyReceiptInventory() {
+        std::vector<control::LegacyReceiptInventoryEntry> entries;
+        if (!plane_)
+            return entries;
+        auto& host = plane_->host();
+        entries.reserve(host.vshardCount());
+        for (uint16_t vshard = 0; vshard < timestar::VIRTUAL_SHARD_COUNT; ++vshard) {
+            auto counts = host.deleteReceiptCounts(vshard);
+            if (counts)
+                entries.push_back({vshard, counts->legacy, counts->total, counts->hasUnappliedEntries});
+        }
+        return entries;
+    }
+
+    seastar::future<std::vector<control::LegacyReceiptInventoryEntry>> handleLegacyReceiptInventory() override {
+        if (seastar::this_shard_id() != 0) {
+            auto* peers = peers_;
+            co_return co_await peers->invoke_on(
+                0, [](ShardRaftPlane& plane) { return plane.handleLegacyReceiptInventory(); });
+        }
+        std::vector<control::LegacyReceiptInventoryEntry> entries;
+        for (unsigned shard = 0; shard < seastar::smp::count; ++shard) {
+            auto local = co_await peers_->invoke_on(
+                shard, [](ShardRaftPlane& plane) { return plane.localLegacyReceiptInventory(); });
+            entries.insert(entries.end(), std::make_move_iterator(local.begin()),
+                           std::make_move_iterator(local.end()));
+        }
+        std::sort(entries.begin(), entries.end(), [](const auto& a, const auto& b) {
+            return a.vshard < b.vshard;
+        });
+        co_return entries;
     }
 
     // ProposeSink: a peer forwarded a batch because this NODE leads those VShards. The

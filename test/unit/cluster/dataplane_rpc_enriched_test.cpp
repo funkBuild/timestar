@@ -121,6 +121,17 @@ public:
     }
 };
 
+class RecordingLegacyReceiptInventorySink : public data::LegacyReceiptInventorySink {
+public:
+    int calls = 0;
+    std::vector<control::LegacyReceiptInventoryEntry> entries{{7, 2, 3}, {19, 4, 5}};
+
+    seastar::future<std::vector<control::LegacyReceiptInventoryEntry>> handleLegacyReceiptInventory() override {
+        ++calls;
+        return seastar::make_ready_future<std::vector<control::LegacyReceiptInventoryEntry>>(entries);
+    }
+};
+
 // Minimal legacy DataPoint sink, so a node can be started on the LEGACY path and
 // we can prove an enriched verb sent to it fails cleanly (unknown verb), not hangs.
 class LegacyMemStore : public data::LocalStore {
@@ -765,6 +776,44 @@ TEST_F(DataPlaneRpcEnrichedTest, ControlJoinUsesVersionEightAndRoundTripsTypedRe
         oldCli.addPeer(server, loopback(serverPort));
         EXPECT_THROW(oldCli.controlJoin(server, request).get(), data::ClusterFormatUnsupportedError);
         EXPECT_EQ(sink.calls, 1) << "a pre-v8 client must refuse before sending an unknown verb";
+
+        oldCli.stop().get();
+        cli.stop().get();
+        srv.stop().get();
+    }).get();
+}
+
+TEST_F(DataPlaneRpcEnrichedTest, LegacyReceiptInventoryUsesVersionNineAndBindsIdentity) {
+    seastar::async([] {
+        const uint16_t serverPort = 39389;
+        const data::NodeId server = 2;
+        ThrowingNodeStore store;
+        RecordingLegacyReceiptInventorySink sink;
+        data::DataPlaneRpc srv, cli, oldCli;
+        const control::NodeRecord identity{server, std::string(32, 'b'), "127.0.0.1:8087", "rack-b",
+                                           control::NodeState::Active};
+        srv.setLocalVersion(features::VersionRange{1, data::kWriteBatchFormatV9});
+        srv.setLocalNodeCapability(std::string(32, 'a'), identity);
+        srv.setLegacyReceiptInventorySink(sink);
+        srv.start(loopback(serverPort), store).get();
+
+        cli.setLocalVersion(features::VersionRange{1, data::kWriteBatchFormatV9});
+        cli.startClientOnly().get();
+        cli.addPeer(server, loopback(serverPort));
+        const auto inventory = cli.legacyReceiptInventory(server).get();
+        EXPECT_EQ(inventory.clusterUuid, std::string(32, 'a'));
+        EXPECT_EQ(inventory.record, identity);
+        EXPECT_EQ(inventory.entries, sink.entries);
+        EXPECT_EQ(sink.calls, 1);
+
+        cli.addPeer(3, loopback(serverPort));
+        EXPECT_THROW(cli.legacyReceiptInventory(3).get(), data::NodeCapabilityMismatchError);
+
+        oldCli.setLocalVersion(features::VersionRange{1, data::kWriteBatchFormatV8});
+        oldCli.startClientOnly().get();
+        oldCli.addPeer(server, loopback(serverPort));
+        EXPECT_THROW(oldCli.legacyReceiptInventory(server).get(), data::ClusterFormatUnsupportedError);
+        EXPECT_EQ(sink.calls, 2) << "the wrong-id probe reaches the sink; the pre-v9 client must not";
 
         oldCli.stop().get();
         cli.stop().get();
