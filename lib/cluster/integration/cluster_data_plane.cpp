@@ -192,12 +192,13 @@ seastar::future<> ClusterDataPlane::startImpl(const ClusterConfig& cfg, seastar:
         {
             const std::string jroot = journalRoot.string();
             const data::NodeId selfId = rt_->selfId;
-            const data::VShardDirectory* dirp = dir_.get();
+            const control::ControlMap initialMap = dir_->map();
             auto* peers = &shards_;
             const JournalIdentity journalIdentity = *journalIdentity_;
             co_await shards_.invoke_on_all(
-                [enginesPtr = enginesPtr_, peers, dirp, selfId, jroot, journalIdentity](ShardRaftPlane& p) {
-                    return p.init(enginesPtr, peers, dirp, selfId, jroot, kRaftTickPeriod, journalIdentity);
+                [enginesPtr = enginesPtr_, peers, initialMap, selfId, jroot,
+                 journalIdentity](ShardRaftPlane& p) {
+                    return p.init(enginesPtr, peers, initialMap, selfId, jroot, kRaftTickPeriod, journalIdentity);
                 });
         }
 
@@ -356,13 +357,22 @@ seastar::future<> ClusterDataPlane::startImpl(const ClusterConfig& cfg, seastar:
                 const std::string clusterUuid = cfg.cluster_uuid;
                 const control::ControlMap initialServingMap = rt_->map;
                 co_await shards_.invoke_on(
-                    0, [voters = decision.initialVoters, ropts, bootstrap = decision.bootstrap(),
+                    0, [this, voters = decision.initialVoters, ropts, bootstrap = decision.bootstrap(),
                         record = std::move(record), clusterUuid, initialServingMap,
                         dataRoot](ShardRaftPlane& plane) mutable -> seastar::future<> {
-                        auto publishCache = [dataRoot](control::ControlMap map) {
-                            return seastar::async([dataRoot, map = std::move(map)] {
+                        auto publishCache = [this, dataRoot](control::ControlMap map) -> seastar::future<> {
+                            // The durable high-water mark is written first. If a later
+                            // reactor update fails, Group 0 retains its old applied
+                            // boundary and retries this exact idempotent publication.
+                            co_await seastar::async([dataRoot, map] {
                                 control::DurableControlMapStore(dataRoot).persist(map);
                             });
+                            if (!dir_)
+                                throw std::logic_error("cluster: serving-map publication without a directory");
+                            // Each callback mutates only that reactor's own directory.
+                            // Exact replay repairs a partially completed fan-out; a
+                            // different map reusing the epoch is rejected everywhere.
+                            co_await publishServingMapOnShards(shards_, *dir_, map);
                         };
                         co_await plane.addGroup0(std::move(voters), ropts, clusterUuid, record,
                                                  initialServingMap, std::move(publishCache));
@@ -1386,7 +1396,7 @@ seastar::future<> ClusterDataPlane::writeFromShard(data::WriteBatch batch) {
     // would silently resolve against a null one.
     if (!replicated_ || !shardsStarted_)
         throw std::runtime_error("ClusterDataPlane::writeFromShard requires replicated mode after start()");
-    return writeSlicesToOwningShards(shards_, std::move(batch), dir_.get());
+    return writeSlicesToOwningShards(shards_, std::move(batch), &shards_.local().directory());
 }
 
 seastar::future<> ClusterDataPlane::deleteRangesFromShard(std::vector<data::DeleteRangeTarget> targets,
@@ -1407,7 +1417,7 @@ seastar::future<> ClusterDataPlane::deleteRangesFromShard(std::vector<data::Dele
             throw std::invalid_argument(
                 "ClusterDataPlane::deleteRangesFromShard requires canonical targets from one VShard");
     }
-    const unsigned owner = shardOwningVShard(vshard, dir_.get());
+    const unsigned owner = shardOwningVShard(vshard, &shards_.local().directory());
     data::DeleteRangeBatch batch{std::move(targets), operationId, issuedAtMs};
     return shards_.invoke_on(owner, [vshard, batch = std::move(batch)](ShardRaftPlane& plane) mutable {
         return plane.command(vshard, data::ReplicatedCommand{std::move(batch)});
@@ -1417,18 +1427,19 @@ seastar::future<> ClusterDataPlane::deleteRangesFromShard(std::vector<data::Dele
 seastar::future<bool> ClusterDataPlane::proposeBatch(data::WriteBatch batch) {
     // A peer forwarded this batch because we lead those VShards. Replicate each
     // slice through the Raft group on its owning shard.
-    return proposeSlicesToOwningShards(shards_, std::move(batch), dir_.get());
+    return proposeSlicesToOwningShards(shards_, std::move(batch), &shards_.local().directory());
 }
 
 seastar::future<std::map<uint16_t, data::NodeId>> ClusterDataPlane::gatherLeaders() const {
     std::map<uint16_t, NodeId> leaders;
     auto& shards = const_cast<seastar::sharded<ShardRaftPlane>&>(shards_);
     for (unsigned sh = 0; sh < seastar::smp::count; ++sh) {
-        auto part = co_await shards.invoke_on(sh, [dirp = dir_.get()](ShardRaftPlane& p) {
+        auto part = co_await shards.invoke_on(sh, [](ShardRaftPlane& p) {
             std::map<uint16_t, data::NodeId> out;
             if (!p.ready())
                 return out;
             auto& host = p.plane().host();
+            const auto* dirp = &p.directory();
             for (uint16_t vs = 0; vs < timestar::VIRTUAL_SHARD_COUNT; ++vs) {
                 if (shardOwningVShard(vs, dirp) != seastar::this_shard_id())
                     continue;

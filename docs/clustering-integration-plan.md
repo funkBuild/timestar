@@ -176,8 +176,10 @@ changes. See [protocol-versioning.md](protocol-versioning.md).
 - Wire the bounded production driver that locates the VShard group and drives
   add-learner, catch-up, promote, leadership transfer, remove-old, and cleanup
   steps idempotently after restart.
-- Apply each committed serving-map epoch to the live sharded routing directory,
-  and create/register destination peers and groups before movement starts.
+- Apply each committed serving-map epoch to the live sharded routing directory.
+  **Done:** publication is durable-before-applied, reactor-local, monotonic, and
+  idempotent. Creating/registering destination peers and groups before movement
+  starts remains open.
 - Publish teardown/reclaim floors only after durable ownership transfer.
 - Prove no acknowledged loss or duplicate VShard contribution during movement.
 

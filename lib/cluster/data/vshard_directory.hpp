@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <set>
+#include <stdexcept>
 
 namespace timestar::data {
 
@@ -27,7 +28,7 @@ public:
     NodeId self() const { return self_; }
     uint64_t epoch() const { return map_.epoch; }
     // The live control map. A caller MUST NOT retain this reference (or an
-    // iterator into it) across a co_await: updateMap() move-reassigns map_, so a
+    // iterator into it) across a co_await: updateMap() replaces map_, so a
     // reference held across a suspension can dangle. The router/coordinator
     // snapshot everything they need before their first await.
     const ControlMap& map() const { return map_; }
@@ -82,12 +83,21 @@ public:
         return out;
     }
 
-    // Adopt a newer control map (epoch advance). Ignores a non-newer map so a
-    // stale notification can never regress routing.
-    bool updateMap(ControlMap fresh) {
-        if (fresh.epoch <= map_.epoch)
+    // Adopt a complete newer serving map. Exact retransmits are idempotent and
+    // stale notifications cannot regress routing. An epoch uniquely identifies
+    // one placement, so a conflicting same-epoch map is a fatal local
+    // consistency error rather than an update to silently ignore.
+    bool updateMap(const ControlMap& fresh) {
+        if (!control::isCompleteControlMap(fresh))
+            throw std::invalid_argument("VShardDirectory: refusing an incomplete serving map");
+        if (fresh.epoch < map_.epoch)
             return false;
-        map_ = std::move(fresh);
+        if (fresh.epoch == map_.epoch) {
+            if (fresh != map_)
+                throw std::invalid_argument("VShardDirectory: conflicting serving maps have the same epoch");
+            return false;
+        }
+        map_ = fresh;
         return true;
     }
 

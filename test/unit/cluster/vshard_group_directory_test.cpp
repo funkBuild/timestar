@@ -54,6 +54,14 @@ unsigned coreOf(uint16_t id, unsigned cores) {
     return assignCore(VShardId{id}, cores);
 }
 
+ControlMap completePlacement(uint64_t epoch, timestar::raft::NodeId owner = 1) {
+    ControlMap map;
+    map.epoch = epoch;
+    for (uint16_t vshard = 0; vshard < timestar::VIRTUAL_SHARD_COUNT; ++vshard)
+        map.placement[vshard] = {owner};
+    return map;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -133,6 +141,29 @@ TEST(VShardGroupDirectoryTest, MalformedV1FailsClosedAndLeavesTheCacheUntouched)
         EXPECT_TRUE(c.load(good));
         EXPECT_EQ(c.current().groups.size(), kVShards);
     }
+}
+
+TEST(VShardGroupDirectoryTest, LiveUpdatesAreMonotonicIdempotentAndEpochImmutable) {
+    VShardDirectory dir(1, completePlacement(2));
+
+    EXPECT_FALSE(dir.updateMap(completePlacement(1))) << "a delayed publication may not regress routing";
+    EXPECT_FALSE(dir.updateMap(completePlacement(2))) << "exact replay must be idempotent";
+
+    ControlMap conflict = completePlacement(2);
+    conflict.placement.at(7) = {2};
+    EXPECT_THROW(dir.updateMap(std::move(conflict)), std::invalid_argument)
+        << "one epoch may not identify two different placements";
+
+    ControlMap incomplete = completePlacement(3);
+    incomplete.placement.erase(9);
+    EXPECT_THROW(dir.updateMap(std::move(incomplete)), std::invalid_argument)
+        << "a partial committed map must never become routable";
+
+    ControlMap next = completePlacement(3);
+    next.placement.at(7) = {2};
+    EXPECT_TRUE(dir.updateMap(next));
+    EXPECT_EQ(dir.epoch(), 3u);
+    EXPECT_EQ(dir.ownerOf(7), 2u);
 }
 
 // ---------------------------------------------------------------------------

@@ -48,6 +48,11 @@ inventory and rules.
 - [x] Bound each `TSMJ1` movement job to its exact source voters and target map
   epoch, made Group 0 create the job and desired placement atomically, and made
   serving-map cutover require that exact job to reach `Done`.
+- [x] Wired committed Group-0 serving-map cutover into the running node: the
+  durable cache is persisted before the applied boundary advances, every
+  reactor owns and updates its own routing directory, stale epochs cannot
+  regress routing, exact replay repairs partial fan-out, and conflicting or
+  incomplete maps fail closed.
 
 ## Remaining production blockers
 
@@ -59,10 +64,10 @@ production deploy.
 - [ ] **Complete topology mutation through group 0.** Join, drain, replace,
   remove, VShard movement, ordered teardown, and reclaim-floor publication must
   be exercised through the production server. Group 0 now validates durable
-  movement plans/progress and exact one-VShard cutover, but the production job
-  driver, live directory update, dynamic peer/group creation, operator API, and
-  teardown/reclaim sequence remain unfinished. Editing a static peer list is
-  not a safe topology operation.
+  movement plans/progress, exact one-VShard cutover, and live sharded directory
+  publication, but the production job driver, dynamic peer/group creation,
+  operator API, and teardown/reclaim sequence remain unfinished. Editing a
+  static peer list is not a safe topology operation.
 - [ ] **Replicate retention policy and cutoff decisions.** Partitioned mode must
   never let replicas expire or compact different logical ranges. Until then,
   retention mutation must remain fail-closed.
@@ -121,3 +126,7 @@ Production approval requires all of the following:
 Memory-sensitive verification is serial: build with `-j1`, run Seastar tests
 with `--smp=1` and an explicit memory limit, and keep temporary files under
 `build/tmp`. Live multi-process gates are not run concurrently on one host.
+
+The live-directory gate covers stale update rejection, idempotent replay,
+same-epoch conflict, incomplete-map rejection, and independent routing views on
+two reactor shards.

@@ -83,8 +83,8 @@ inline unsigned shardForGroup(uint16_t groupId) {
 // `dir` is optional only because a handful of unit tests exercise the shard fan-out
 // with no control map at all; a null directory means the identity mapping, which is
 // what those tests (and every production cluster today) run. Production call sites
-// pass the real directory -- it is immutable after start() and already shared with
-// every shard's router.
+// pass their reactor-local live directory, which is also the stable object borrowed
+// by that shard's routers.
 inline unsigned shardOwningVShard(uint16_t vshard, const data::VShardDirectory* dir) {
     return shardForGroup(dir ? dir->groupOf(vshard) : vshard);
 }
@@ -131,14 +131,15 @@ class ShardRaftPlane : public data::ProposeSink,
                        public data::ControlJoinSink {
 public:
     seastar::future<> init(seastar::sharded<Engine>* engines, seastar::sharded<ShardRaftPlane>* peers,
-                           const data::VShardDirectory* dir, data::NodeId self, std::string journalRoot,
+                           control::ControlMap initialMap, data::NodeId self, std::string journalRoot,
                            std::chrono::milliseconds tick, JournalIdentity journalIdentity = JournalIdentity::testing()) {
         store_ = std::make_unique<EngineLocalStore>(*engines);
         peers_ = peers;
-        // Retained for VShard->group resolution (debt D-11). The directory outlives every
-        // shard plane (ClusterDataPlane owns it and stops the planes first) and is
-        // immutable after start(), which is the same access the routers already make.
-        dir_ = dir;
+        // Every reactor owns its routing directory. Sharing ClusterDataPlane's
+        // shard-0 object was only safe while placement was immutable; a committed
+        // Group-0 cutover must never make other reactors read shard-0-owned mutable
+        // memory.
+        dir_ = std::make_unique<data::VShardDirectory>(self, std::move(initialMap));
         // What peers actually read through (debt D-13): the real store, wrapped so a
         // VShard the coordinator could not resolve itself is answered only if we LEAD
         // it and REDIRECTED otherwise. Inert unless the request names VShards to
@@ -155,7 +156,7 @@ public:
         rpc_ = std::make_unique<data::DataPlaneRpc>();
         // Journals are per-VShard directories under this root, and each VShard belongs
         // to exactly one shard, so shards never contend for the same journal.
-        plane_ = std::make_unique<ReplicatedDataPlane>(*store_, *transport_, *rpc_, *dir, self,
+        plane_ = std::make_unique<ReplicatedDataPlane>(*store_, *transport_, *rpc_, *dir_, self,
                                                        std::filesystem::path(journalRoot), journalIdentity, tick);
         // FENCE THE PEER-FACING READ TOO (debt D-36). This store is what a peer's query
         // is answered from, and a coordinator merges that answer as authoritative -- so
@@ -201,6 +202,21 @@ public:
         return plane_->host().awaitApplyCatchUp(budget);
     }
 
+    const data::VShardDirectory& directory() const {
+        if (!dir_)
+            throw std::logic_error("cluster: routing directory requested before shard-plane initialisation");
+        return *dir_;
+    }
+
+    // Called on this directory's owning reactor after Group 0 commits a serving
+    // map. The directory object stays at a stable address because the replicated
+    // routers borrow it; only its validated map value changes in place.
+    bool updateServingMap(const control::ControlMap& map) {
+        if (!dir_)
+            throw std::logic_error("cluster: serving-map update before shard-plane initialisation");
+        return dir_->updateMap(map);
+    }
+
     // Every shard on this node. `peers_` is the sharded<> container this instance lives
     // in, so this is the same reduction ClusterDataPlane performs, reachable from a shard
     // that has no handle on the data plane.
@@ -220,7 +236,7 @@ public:
             co_return false;
         std::map<unsigned, std::vector<uint16_t>> byShard;
         for (uint16_t vs : vshards)
-            byShard[shardOwningVShard(vs, dir_)].push_back(vs);
+            byShard[shardOwningVShard(vs, dir_.get())].push_back(vs);
 
         std::vector<seastar::future<>> pending;
         pending.reserve(byShard.size());
@@ -714,7 +730,7 @@ public:
         c.hosted = host.vshardCount();
         c.tickErrors = host.registry().tickErrors();
         for (uint16_t vs = 0; vs < timestar::VIRTUAL_SHARD_COUNT; ++vs) {
-            if (shardOwningVShard(vs, dir_) != seastar::this_shard_id())
+            if (shardOwningVShard(vs, dir_.get()) != seastar::this_shard_id())
                 continue;  // not ours
             // A VShard we do not HOST is not leaderless, it is someone else's (debt
             // D-13). Counting it here is what made `vshards_leaderless` meaningless at
@@ -785,7 +801,7 @@ public:
         auto& host = plane_->host();
         std::vector<data::BalanceGroup> groups;
         for (uint16_t vs = 0; vs < timestar::VIRTUAL_SHARD_COUNT; ++vs) {
-            if (shardOwningVShard(vs, dir_) != seastar::this_shard_id())
+            if (shardOwningVShard(vs, dir_.get()) != seastar::this_shard_id())
                 continue;
             // A group we do not REPLICATE tells us nothing: leaderOf reads kNoNode for it
             // whether or not it has a leader, and it can never be ours to give away.
@@ -870,12 +886,26 @@ private:
     // Shard 0 only. Borrows transport_; destroyed before it by declaration order.
     std::unique_ptr<Group0Host> group0_;
     seastar::sharded<ShardRaftPlane>* peers_ = nullptr;
-    const data::VShardDirectory* dir_ = nullptr;  // VShard -> group resolution (debt D-11); not owned
+    // Shard-local live VShard -> group/placement resolution. Declared before
+    // plane_ so the routers that borrow it are destroyed first.
+    std::unique_ptr<data::VShardDirectory> dir_;
     std::unique_ptr<data::DataPlaneRpc> rpc_;     // this shard's own data-plane listener + peer clients
     std::unique_ptr<ReplicatedDataPlane> plane_;
     bool stopping_ = false;          // set at the top of stop(); see ready()
     uint64_t inboundProposals_ = 0;  // peer proposals served BY THIS SHARD's listener
 };
+
+// Publish one committed Group-0 serving map into every live routing view on
+// this node. `coordinatorDirectory` belongs to shard 0; each ShardRaftPlane
+// owns the directory its local routers borrow. An exception leaves Group 0's
+// applied boundary unchanged, and exact replay advances any reactor that did
+// not finish the first fan-out.
+inline seastar::future<> publishServingMapOnShards(seastar::sharded<ShardRaftPlane>& shards,
+                                                   data::VShardDirectory& coordinatorDirectory,
+                                                   const control::ControlMap& map) {
+    coordinatorDirectory.updateMap(map);
+    co_await shards.invoke_on_all([map](ShardRaftPlane& shard) { shard.updateServingMap(map); });
+}
 
 // Split `batch` by the shard that OWNS each series' VShard Raft group and dispatch
 // every slice CONCURRENTLY, then await them all.
@@ -895,8 +925,8 @@ private:
 // it only sees ITS OWN slice, so a batch whose unassigned VShard happened to land on the
 // last shard could durably commit the other shards' slices and only then fail the client
 // -- a partial commit reported as an error, which is precisely the state the ack contract
-// forbids. The directory is immutable after start() and is already shared with every
-// shard's router, so reading it here is the same access those do.
+// forbids. The caller passes its reactor-local directory and snapshots all required
+// routing information before the first suspension.
 inline seastar::future<> writeSlicesToOwningShards(seastar::sharded<ShardRaftPlane>& shards, data::WriteBatch batch,
                                                    const data::VShardDirectory* dir = nullptr) {
     if (dir) {
@@ -1124,19 +1154,19 @@ inline seastar::future<data::ProposeOutcome> proposeSlicesToOwningShardsHinted(
 
 inline seastar::future<bool> ShardRaftPlane::proposeBatch(data::WriteBatch batch) {
     ++inboundProposals_;  // served on THIS shard, whichever shards end up owning the slices
-    return proposeSlicesToOwningShards(*peers_, std::move(batch), dir_);
+    return proposeSlicesToOwningShards(*peers_, std::move(batch), dir_.get());
 }
 
 inline seastar::future<data::ProposeOutcome> ShardRaftPlane::proposeBatchHinted(data::WriteBatch batch) {
     ++inboundProposals_;
-    return proposeSlicesToOwningShardsHinted(*peers_, std::move(batch), dir_);
+    return proposeSlicesToOwningShardsHinted(*peers_, std::move(batch), dir_.get());
 }
 
 inline seastar::future<data::ProposeOutcome> ShardRaftPlane::proposeCommandHinted(uint16_t vshard,
                                                                                   data::ReplicatedCommand command,
                                                                                   data::OptDeadline deadline) {
     ++inboundProposals_;
-    return peers_->invoke_on(shardOwningVShard(vshard, dir_), [vshard, command = std::move(command),
+    return peers_->invoke_on(shardOwningVShard(vshard, dir_.get()), [vshard, command = std::move(command),
                                                                deadline](ShardRaftPlane& p) mutable {
         if (!p.ready())
             return seastar::make_exception_future<data::ProposeOutcome>(data::ShardStoppingError(kShardStoppingError));
@@ -1145,7 +1175,7 @@ inline seastar::future<data::ProposeOutcome> ShardRaftPlane::proposeCommandHinte
 }
 
 inline seastar::future<raft::LogIndex> ShardRaftPlane::leaderReadIndex(uint16_t vshard) {
-    return peers_->invoke_on(shardOwningVShard(vshard, dir_), [vshard](ShardRaftPlane& p) {
+    return peers_->invoke_on(shardOwningVShard(vshard, dir_.get()), [vshard](ShardRaftPlane& p) {
         if (!p.ready())
             return seastar::make_exception_future<raft::LogIndex>(data::ShardStoppingError(kShardStoppingError));
         return p.plane().host().leaderReadIndex(vshard);
@@ -1156,7 +1186,7 @@ inline seastar::future<std::vector<data::VShardRedirect>> ShardRaftPlane::resolv
     std::vector<uint16_t> vshards) {
     std::map<unsigned, std::vector<uint16_t>> byShard;
     for (uint16_t vs : vshards)
-        byShard[shardOwningVShard(vs, dir_)].push_back(vs);
+        byShard[shardOwningVShard(vs, dir_.get())].push_back(vs);
     std::vector<data::VShardRedirect> out;
     out.reserve(vshards.size());
     for (auto& [shard, list] : byShard) {
@@ -1180,7 +1210,7 @@ inline seastar::future<std::vector<data::VShardRedirect>> ShardRaftPlane::resolv
 }
 
 inline seastar::future<raft::LogIndex> ShardRaftPlane::leaderCommitIndex(uint16_t vshard) {
-    return peers_->invoke_on(shardOwningVShard(vshard, dir_), [vshard](ShardRaftPlane& p) {
+    return peers_->invoke_on(shardOwningVShard(vshard, dir_.get()), [vshard](ShardRaftPlane& p) {
         if (!p.ready())
             return seastar::make_exception_future<raft::LogIndex>(data::ShardStoppingError(kShardStoppingError));
         return p.plane().host().leaderCommitIndex(vshard);

@@ -190,14 +190,12 @@ TEST_F(ShardRaftPlaneTest, ProposeOverSocketSplitsAcrossOwningShardsAndFailsClea
             map.epoch = 1;
             map.placement[vs1] = {self};
             map.placement[vs2] = {self};
-            data::VShardDirectory dir(self, map);
-
             seastar::sharded<cluster::ShardRaftPlane> shards;
             shards.start().get();
             shards
-                .invoke_on_all([engines = &eng.eng, peers = &shards, dirp = &dir, self,
+                .invoke_on_all([engines = &eng.eng, peers = &shards, map, self,
                                 jroot = jroot.string()](cluster::ShardRaftPlane& p) {
-                    return p.init(engines, peers, dirp, self, jroot, std::chrono::milliseconds(10));
+                    return p.init(engines, peers, map, self, jroot, std::chrono::milliseconds(10));
                 })
                 .get();
             shards
@@ -264,6 +262,34 @@ TEST_F(ShardRaftPlaneTest, ProposeOverSocketSplitsAcrossOwningShardsAndFailsClea
             EXPECT_EQ(vals, (std::vector<double>{11.0, 22.0}))
                 << "both slices must have been applied -- one value missing means a shard's "
                 << "slice never committed";
+
+            // A Group-0 publication is copied into EACH reactor's directory, not
+            // written through a shard-0 pointer. Every copy advances, and exact
+            // replay is harmless (the retry path after a partial observer failure).
+            ControlMap published;
+            published.epoch = 2;
+            for (uint16_t vshard = 0; vshard < timestar::VIRTUAL_SHARD_COUNT; ++vshard)
+                published.placement[vshard] = {self};
+            data::VShardDirectory coordinatorDirectory(self, map);
+            // Simulate an observer failure after only shard 0 changed. The
+            // production helper must accept the exact map there and still
+            // advance the reactor that missed the first attempt.
+            EXPECT_TRUE(shards.invoke_on(0, [published](cluster::ShardRaftPlane& p) {
+                return p.updateServingMap(published);
+            }).get());
+            EXPECT_EQ(shards.invoke_on(0, [](cluster::ShardRaftPlane& p) { return p.directory().epoch(); }).get(),
+                      2u);
+            EXPECT_EQ(shards.invoke_on(1, [](cluster::ShardRaftPlane& p) { return p.directory().epoch(); }).get(),
+                      1u);
+            cluster::publishServingMapOnShards(shards, coordinatorDirectory, published).get();
+            EXPECT_EQ(coordinatorDirectory.epoch(), 2u);
+            shards.invoke_on_all([](cluster::ShardRaftPlane& p) { EXPECT_EQ(p.directory().epoch(), 2u); }).get();
+            cluster::publishServingMapOnShards(shards, coordinatorDirectory, published).get();
+            shards
+                .invoke_on_all([published](cluster::ShardRaftPlane& p) {
+                    EXPECT_EQ(p.directory().map(), published);
+                })
+                .get();
 
             // (a2) The PRODUCTION listener is per-shard-distributing. Several peer
             // connections must be SERVED by more than one shard: this is what pins
