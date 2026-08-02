@@ -40,19 +40,6 @@ std::string encodeMeasurementTagsKey(const std::string& measurement) {
     return key;
 }
 
-std::string encodeTagValuesKey(const std::string& measurement, const std::string& tagKey) {
-    if (measurement.find('\0') != std::string::npos || tagKey.find('\0') != std::string::npos) {
-        throw std::invalid_argument("Measurement or tag key contains null byte");
-    }
-    std::string key;
-    key.reserve(1 + measurement.size() + 1 + tagKey.size());
-    key.push_back(static_cast<char>(TAG_VALUES));
-    key += measurement;
-    key.push_back('\0');
-    key += tagKey;
-    return key;
-}
-
 // SERIES_METADATA key layout is TYPE-first-then-VShard: [type:1][vshard:2 BE]
 // [seriesId:16]. Type-first preserves the by-type full scan (prefix [type]);
 // the VShard sub-prefix ([type][vshard]) makes per-VShard extraction a range

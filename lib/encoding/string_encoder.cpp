@@ -27,22 +27,53 @@ static thread_local std::vector<char> tlCompBuf;
 // raw pointer, so no DMA alignment is required.
 static thread_local std::vector<uint8_t> tlUncompBuf;
 
-// Magics for the two on-disk string block formats (also defined in the
-// dictionary section below; hoisted here so the raw decoder can produce a
-// precise diagnostic when a dictionary-encoded block reaches it).
-static constexpr uint32_t STRG_MAGIC_V = 0x53545247;  // "STRG" raw zstd blocks
-static constexpr uint32_t STR2_MAGIC_V = 0x53545232;  // "STR2" dictionary-ID blocks
+// One greenfield v1 string-block format with two encoding variants. The final
+// byte is the format version; the middle bytes identify the active encoding.
+// Both variants have the same 16-byte header and are updated in place together.
+static constexpr uint32_t kRawStringV1Magic = 0x31525453;         // "STR1"
+static constexpr uint32_t kDictionaryStringV1Magic = 0x31445453;  // "STD1"
+static constexpr size_t kStringHeaderBytes = 4 * sizeof(uint32_t);
 
-// A STR2 block reaching the raw decoder means its TSM index entry carries no
-// string dictionary — historically caused by compaction dropping the
-// dictionary. Emit a precise error instead of a generic magic mismatch.
-[[noreturn]] static void throwBadStringMagic(uint32_t magic) {
-    if (magic == STR2_MAGIC_V) {
-        throw std::runtime_error(
-            "Dictionary-encoded (STR2) string block has no dictionary in its TSM index entry — "
-            "file written by a compaction that dropped the string dictionary (corrupt block)");
+struct StringBlockHeader {
+    uint32_t uncompressedSize = 0;
+    uint32_t compressedSize = 0;
+    uint32_t count = 0;
+};
+
+static void writeStringHeader(AlignedBuffer& buffer, uint32_t magic, uint32_t uncompressedSize,
+                              uint32_t compressedSize, uint32_t count) {
+    buffer.write(magic);
+    buffer.write(uncompressedSize);
+    buffer.write(compressedSize);
+    buffer.write(count);
+}
+
+static StringBlockHeader readStringHeader(Slice& encoded, uint32_t expectedMagic) {
+    if (encoded.offset > encoded.length_)
+        throw std::runtime_error("String decoder: slice offset past end");
+    if (encoded.length_ - encoded.offset < kStringHeaderBytes)
+        throw std::runtime_error("Invalid encoded string buffer: too small for v1 header");
+
+    uint32_t magic = 0;
+    StringBlockHeader header;
+    std::memcpy(&magic, encoded.data + encoded.offset, sizeof(magic));
+    std::memcpy(&header.uncompressedSize, encoded.data + encoded.offset + 4, sizeof(header.uncompressedSize));
+    std::memcpy(&header.compressedSize, encoded.data + encoded.offset + 8, sizeof(header.compressedSize));
+    std::memcpy(&header.count, encoded.data + encoded.offset + 12, sizeof(header.count));
+    encoded.offset += kStringHeaderBytes;
+
+    if (magic != expectedMagic) {
+        if (expectedMagic == kRawStringV1Magic && magic == kDictionaryStringV1Magic) {
+            throw std::runtime_error(
+                "Dictionary-encoded v1 string block has no dictionary in its TSM index entry");
+        }
+        throw std::runtime_error("Invalid or unsupported v1 string block marker");
     }
-    throw std::runtime_error("Invalid magic number in string encoding");
+    if (header.compressedSize > encoded.length_ - encoded.offset)
+        throw std::runtime_error("Invalid encoded string buffer: size mismatch");
+    if (header.uncompressedSize > MAX_UNCOMPRESSED_SIZE)
+        throw std::runtime_error("String block uncompressed size exceeds limit");
+    return header;
 }
 
 // Validate zstd decompression result: check for errors and size mismatch.
@@ -192,23 +223,14 @@ StringEncoder::CompressedPayload StringEncoder::compressStrings(std::span<const 
             static_cast<uint32_t>(values.size())};
 }
 
-// Write the standard STRG header into an AlignedBuffer.
-static void writeStringHeader(AlignedBuffer& buf, uint32_t uncompSize, uint32_t compSize, uint32_t count) {
-    static constexpr uint32_t STRG_MAGIC = 0x53545247;
-    buf.write(STRG_MAGIC);
-    buf.write(uncompSize);
-    buf.write(compSize);
-    buf.write(count);
-}
-
 AlignedBuffer StringEncoder::encode(std::span<const std::string> values, int compressionLevel) {
     AlignedBuffer result;
     if (values.empty()) [[unlikely]] {
-        writeStringHeader(result, 0, 0, 0);
+        writeStringHeader(result, kRawStringV1Magic, 0, 0, 0);
         return result;
     }
     auto payload = compressStrings(values, compressionLevel);
-    writeStringHeader(result, payload.uncompressedSize, payload.compressedSize, payload.count);
+    writeStringHeader(result, kRawStringV1Magic, payload.uncompressedSize, payload.compressedSize, payload.count);
     result.write_bytes(payload.data, payload.compressedSize);
     return result;
 }
@@ -217,12 +239,12 @@ size_t StringEncoder::encodeInto(std::span<const std::string> values, AlignedBuf
     const size_t startPos = target.size();
 
     if (values.empty()) [[unlikely]] {
-        writeStringHeader(target, 0, 0, 0);
+        writeStringHeader(target, kRawStringV1Magic, 0, 0, 0);
         return target.size() - startPos;
     }
 
     auto payload = compressStrings(values, compressionLevel);
-    writeStringHeader(target, payload.uncompressedSize, payload.compressedSize, payload.count);
+    writeStringHeader(target, kRawStringV1Magic, payload.uncompressedSize, payload.compressedSize, payload.count);
     target.write_bytes(payload.data, payload.compressedSize);
     return target.size() - startPos;
 }
@@ -234,92 +256,18 @@ void StringEncoder::decode(AlignedBuffer& encoded, size_t count, std::vector<std
 }
 
 void StringEncoder::decode(Slice& encoded, size_t count, std::vector<std::string>& out) {
-    if (encoded.offset > encoded.length_) {
-        throw std::runtime_error("String decoder: slice offset past end");
-    }
-    if (encoded.length_ - encoded.offset < 16) {
-        throw std::runtime_error("Invalid encoded string buffer: too small for header");
-    }
-
-    // Read header
-    uint32_t magic;
-    std::memcpy(&magic, encoded.data + encoded.offset, 4);
-    if (magic != STRG_MAGIC_V) {
-        throwBadStringMagic(magic);
-    }
-    encoded.offset += 4;
-
-    uint32_t uncompressedSize;
-    std::memcpy(&uncompressedSize, encoded.data + encoded.offset, 4);
-    encoded.offset += 4;
-
-    uint32_t compressedSize;
-    std::memcpy(&compressedSize, encoded.data + encoded.offset, 4);
-    encoded.offset += 4;
-
-    uint32_t storedCount;
-    std::memcpy(&storedCount, encoded.data + encoded.offset, 4);
-    encoded.offset += 4;
-
-    if (storedCount < count) {
-        throw std::runtime_error("String block has fewer entries than requested: header=" +
-                                 std::to_string(storedCount) + " requested=" + std::to_string(count));
-    }
-
-    if (encoded.length_ - encoded.offset < compressedSize) {
-        throw std::runtime_error("Invalid encoded buffer: size mismatch");
-    }
-
-    // Empty block: nothing to decompress — advance past compressed data and return.
-    if (uncompressedSize == 0) {
-        encoded.offset += compressedSize;
-        out.clear();
-        return;
-    }
-
-    // Decompress (guard against crafted payloads claiming excessive uncompressed size)
-    if (uncompressedSize > MAX_UNCOMPRESSED_SIZE) {
-        throw std::runtime_error("String block uncompressedSize (" + std::to_string(uncompressedSize) +
-                                 ") exceeds limit");
-    }
-    // Reuse thread-local buffer — grows to high-water mark, no alloc after warmup.
-    tlDecompBuf.resize(uncompressedSize);
-    auto& uncompressed = tlDecompBuf;
-
-    {
-        size_t ret =
-            ZSTD_decompressDCtx(getThreadDCtx(), reinterpret_cast<char*>(uncompressed.data()), uncompressedSize,
-                                reinterpret_cast<const char*>(encoded.data + encoded.offset), compressedSize);
-        validateDecompress(ret, uncompressedSize);
-    }
-    encoded.offset += compressedSize;
-
-    // Decode strings
-    Slice uncompSlice(uncompressed.data(), uncompressedSize);
+    if (encoded.offset > encoded.length_ || encoded.length_ - encoded.offset < kStringHeaderBytes)
+        throw std::runtime_error("Invalid encoded string buffer: too small for v1 header");
+    uint32_t storedCount = 0;
+    std::memcpy(&storedCount, encoded.data + encoded.offset + 12, sizeof(storedCount));
+    if (count > storedCount)
+        throw std::runtime_error("String block has fewer entries than requested");
     out.clear();
-    // `count` reaches here from a client-supplied protobuf field, so it must not
-    // be trusted to size an allocation: at 32 bytes per std::string a uint32 max
-    // asks for ~137 GB. The decoded data cannot contain more strings than the
-    // uncompressed buffer has room for -- each needs at least a 1-byte varint
-    // length -- so clamp to that. The loop below already stops at the real end of
-    // the buffer, so a too-large `count` simply yields fewer strings.
-    out.reserve(std::min(static_cast<size_t>(count), static_cast<size_t>(uncompressedSize)));
-
-    for (size_t i = 0; i < count && uncompSlice.offset < uncompSlice.length_; i++) {
-        uint32_t strLen = readVarInt(uncompSlice);
-
-        if (strLen > uncompSlice.length_ - uncompSlice.offset) {
-            throw std::runtime_error("Invalid string length in encoded data");
-        }
-
-        out.emplace_back(reinterpret_cast<const char*>(uncompSlice.data + uncompSlice.offset), strLen);
-        uncompSlice.offset += strLen;
-    }
+    if (decode(encoded, storedCount, 0, count, out) != count)
+        throw std::runtime_error("String block contains fewer values than its v1 header declares");
 }
 
 // ==================== Dictionary Encoding (Phase 3) ====================
-
-static constexpr uint32_t STR2_MAGIC = STR2_MAGIC_V;  // "STR2"
 
 StringEncoder::Dictionary StringEncoder::buildDictionary(std::span<const std::string> values) {
     Dictionary dict;
@@ -441,64 +389,35 @@ size_t StringEncoder::encodeDictionaryInto(std::span<const std::string> values, 
                                  ZSTD_getErrorName(compressedSize));
     }
 
-    // Write header + compressed data straight into the target buffer
-    target.write(STR2_MAGIC);                             // magic
-    target.write(static_cast<uint32_t>(writePos));        // uncompressed size
-    target.write(static_cast<uint32_t>(compressedSize));  // compressed size
-    target.write(static_cast<uint32_t>(values.size()));   // count
+    // Write the dictionary variant of the shared v1 header and payload.
+    writeStringHeader(target, kDictionaryStringV1Magic, static_cast<uint32_t>(writePos),
+                      static_cast<uint32_t>(compressedSize), static_cast<uint32_t>(values.size()));
     target.write_bytes(tlCompBuf.data(), compressedSize);
     return target.size() - startPos;
 }
 
 size_t StringEncoder::decodeDictionary(Slice& encoded, size_t totalCount, size_t skipCount, size_t limitCount,
                                        const std::vector<std::string>& dictEntries, std::vector<std::string>& out) {
-    if (encoded.offset > encoded.length_) {
-        throw std::runtime_error("String decoder: slice offset past end");
-    }
-    if (encoded.length_ - encoded.offset < 16) {
-        throw std::runtime_error("Invalid dictionary-encoded string buffer: too small for header");
-    }
-
-    uint32_t magic;
-    std::memcpy(&magic, encoded.data + encoded.offset, 4);
-    if (magic != STR2_MAGIC) {
-        throw std::runtime_error("Invalid magic in dictionary-encoded string block");
-    }
-    encoded.offset += 4;
-
-    uint32_t uncompressedSize;
-    std::memcpy(&uncompressedSize, encoded.data + encoded.offset, 4);
-    encoded.offset += 4;
-
-    uint32_t compressedSize;
-    std::memcpy(&compressedSize, encoded.data + encoded.offset, 4);
-    encoded.offset += 4;
-
-    uint32_t storedCount;
-    std::memcpy(&storedCount, encoded.data + encoded.offset, 4);
-    encoded.offset += 4;
-
-    if (encoded.length_ - encoded.offset < compressedSize) {
-        throw std::runtime_error("Dictionary-encoded string buffer: size mismatch");
-    }
-    if (uncompressedSize > MAX_UNCOMPRESSED_SIZE) {
-        throw std::runtime_error("Dictionary-encoded block uncompressedSize exceeds limit");
-    }
+    const StringBlockHeader header = readStringHeader(encoded, kDictionaryStringV1Magic);
+    if (header.count != totalCount)
+        throw std::runtime_error("Dictionary string block count does not match its v1 header");
 
     // Empty block: nothing to decompress — advance past compressed data and
     // return. APPENDS, so `out` must be left exactly as it was found.
-    if (uncompressedSize == 0) {
-        encoded.offset += compressedSize;
+    if (header.uncompressedSize == 0) {
+        encoded.offset += header.compressedSize;
         return 0;
     }
 
-    tlDecompBuf.resize(uncompressedSize);
-    size_t ret = ZSTD_decompressDCtx(getThreadDCtx(), reinterpret_cast<char*>(tlDecompBuf.data()), uncompressedSize,
-                                     reinterpret_cast<const char*>(encoded.data + encoded.offset), compressedSize);
-    validateDecompress(ret, uncompressedSize);
-    encoded.offset += compressedSize;
+    tlDecompBuf.resize(header.uncompressedSize);
+    size_t ret = ZSTD_decompressDCtx(getThreadDCtx(), reinterpret_cast<char*>(tlDecompBuf.data()),
+                                     header.uncompressedSize,
+                                     reinterpret_cast<const char*>(encoded.data + encoded.offset),
+                                     header.compressedSize);
+    validateDecompress(ret, header.uncompressedSize);
+    encoded.offset += header.compressedSize;
 
-    Slice idSlice(tlDecompBuf.data(), uncompressedSize);
+    Slice idSlice(tlDecompBuf.data(), header.uncompressedSize);
     out.reserve(out.size() + limitCount);
     size_t produced = 0;
     for (size_t i = 0; i < totalCount && idSlice.offset < idSlice.length_; ++i) {
@@ -523,65 +442,35 @@ bool StringEncoder::isDictionaryEncoded(Slice& slice) {
         return false;
     uint32_t magic;
     std::memcpy(&magic, slice.data + slice.offset, 4);
-    return magic == STR2_MAGIC;
+    return magic == kDictionaryStringV1Magic;
 }
 
 size_t StringEncoder::decode(Slice& encoded, size_t totalCount, size_t skipCount, size_t limitCount,
                              std::vector<std::string>& out) {
-    if (encoded.offset > encoded.length_) {
-        throw std::runtime_error("String decoder: slice offset past end");
-    }
-    if (encoded.length_ - encoded.offset < 16) {
-        throw std::runtime_error("Invalid encoded string buffer: too small for header");
-    }
-
-    // Read header
-    uint32_t magic;
-    std::memcpy(&magic, encoded.data + encoded.offset, 4);
-    if (magic != STRG_MAGIC_V) {
-        throwBadStringMagic(magic);
-    }
-    encoded.offset += 4;
-
-    uint32_t uncompressedSize;
-    std::memcpy(&uncompressedSize, encoded.data + encoded.offset, 4);
-    encoded.offset += 4;
-
-    uint32_t compressedSize;
-    std::memcpy(&compressedSize, encoded.data + encoded.offset, 4);
-    encoded.offset += 4;
-
-    uint32_t storedCount;
-    std::memcpy(&storedCount, encoded.data + encoded.offset, 4);
-    encoded.offset += 4;
-
-    if (encoded.length_ - encoded.offset < compressedSize) {
-        throw std::runtime_error("Invalid encoded buffer: size mismatch");
-    }
+    const StringBlockHeader header = readStringHeader(encoded, kRawStringV1Magic);
+    if (header.count != totalCount)
+        throw std::runtime_error("Raw string block count does not match its v1 header");
 
     // Empty block: nothing to decompress — advance past compressed data and
     // return. APPENDS, so `out` must be left exactly as it was found.
-    if (uncompressedSize == 0) {
-        encoded.offset += compressedSize;
+    if (header.uncompressedSize == 0) {
+        encoded.offset += header.compressedSize;
         return 0;
     }
 
     // Decompress (zstd doesn't support random access, so we must decompress the full block)
-    if (uncompressedSize > MAX_UNCOMPRESSED_SIZE) {
-        throw std::runtime_error("String block uncompressedSize (" + std::to_string(uncompressedSize) +
-                                 ") exceeds limit");
-    }
     // Reuse thread-local buffer — grows to high-water mark, no alloc after warmup.
-    tlDecompBuf.resize(uncompressedSize);
+    tlDecompBuf.resize(header.uncompressedSize);
     auto& uncompressed = tlDecompBuf;
 
     {
         size_t ret =
-            ZSTD_decompressDCtx(getThreadDCtx(), reinterpret_cast<char*>(uncompressed.data()), uncompressedSize,
-                                reinterpret_cast<const char*>(encoded.data + encoded.offset), compressedSize);
-        validateDecompress(ret, uncompressedSize);
+            ZSTD_decompressDCtx(getThreadDCtx(), reinterpret_cast<char*>(uncompressed.data()),
+                                header.uncompressedSize,
+                                reinterpret_cast<const char*>(encoded.data + encoded.offset), header.compressedSize);
+        validateDecompress(ret, header.uncompressedSize);
     }
-    encoded.offset += compressedSize;
+    encoded.offset += header.compressedSize;
 
     // Decode strings with skip/limit: skip the first skipCount strings without allocating,
     // then collect the next limitCount strings.
@@ -591,7 +480,7 @@ size_t StringEncoder::decode(Slice& encoded, size_t totalCount, size_t skipCount
     // decoded block's values while their timestamps remained. TSM now rejects a
     // decoder that shrinks the output, so this would fail the query loudly rather
     // than corrupt memory -- but the contract still belongs here.
-    Slice uncompSlice(uncompressed.data(), uncompressedSize);
+    Slice uncompSlice(uncompressed.data(), header.uncompressedSize);
     out.reserve(out.size() + limitCount);
 
     size_t produced = 0;

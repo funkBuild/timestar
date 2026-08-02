@@ -264,16 +264,14 @@ Required behaviour:
   of the committed size.
 - The configured root remains bound to the locked directory inode throughout
   inspection and commit; root replacement fails closed.
-- The mutating legacy rebalancer may remain for tests or a future explicit
-  offline tool, but normal startup must not call `execute()` or
-  `recoverIfNeeded()`.
+- The mutating legacy rebalancer is removed. Retired state/staging artifacts
+  are detected and rejected, never resumed.
 
-Likely files:
+Primary files:
 
 - `bin/timestar_http_server.cpp`
-- `lib/storage/shard_rebalancer.hpp`
-- `lib/storage/shard_rebalancer.cpp`
-- `test/unit/storage/shard_rebalancer_test.cpp`
+- `lib/storage/shard_store_startup.hpp`
+- `lib/storage/shard_store_startup.cpp`
 
 Tests:
 
@@ -346,7 +344,6 @@ path builders. Components known to require conversion include:
 | `TSMCompactor` | generates compacted TSM filenames | asks layout |
 | WAL classes | generate `shard_N` WAL filenames | ask layout |
 | `NativeIndex` | opens `shard_N/native_index` | asks layout |
-| `ShardRebalancer` | builds root and staging paths | asks layout |
 | server startup | placement and shard-count control files | asks layout |
 | benchmark reporting | scans `shard_N` below the working directory | scans paths supplied by layout |
 
@@ -362,7 +359,6 @@ Likely files include:
 - `lib/storage/wal.hpp` and `.cpp`
 - `lib/storage/memory_store.hpp` and `.cpp`, if it constructs WAL objects
 - `lib/index/native/native_index.hpp` and `.cpp`
-- `lib/storage/shard_rebalancer.hpp` and `.cpp`
 - `bin/timestar_http_server.cpp`
 - `bin/timestar_benchmark.cpp`
 - affected unit fixtures
@@ -379,12 +375,12 @@ Constraints:
 Exit criteria:
 
 - the default configuration passes existing storage, index, compaction, WAL,
-  restart, and rebalancer safety tests;
+  restart, and startup-safety tests;
 - production path literals are centralized;
 - no leaf storage class reads the global configuration to discover its root;
   and
 - source inspection finds no independent `shard_` path construction outside
-  `StorageLayout`, legacy-layout parsing/migration code, and tests.
+  `StorageLayout` and startup artifact detection.
 
 ### Step 4: Preserve and centralize `server.data_dir`
 

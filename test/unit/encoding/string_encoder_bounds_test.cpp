@@ -164,7 +164,7 @@ TEST_F(StringEncoderBoundsTest, CompressedSizeCannotExceedUncompressed) {
 // Header integrity tests: verify the encoder writes correct header values
 // ---------------------------------------------------------------------------
 
-TEST_F(StringEncoderBoundsTest, HeaderContainsCorrectCount) {
+TEST_F(StringEncoderBoundsTest, HeaderContainsV1MarkerAndCorrectCount) {
     std::vector<std::string> data = {"a", "bb", "ccc", "dddd", "eeeee"};
     auto encoded = StringEncoder::encode(data);
 
@@ -173,11 +173,22 @@ TEST_F(StringEncoderBoundsTest, HeaderContainsCorrectCount) {
 
     uint32_t magic;
     std::memcpy(&magic, encoded.data.data(), 4);
-    EXPECT_EQ(magic, 0x53545247u);  // "STRG"
+    EXPECT_EQ(magic, 0x31525453u);  // "STR1"
 
     uint32_t count;
     std::memcpy(&count, encoded.data.data() + 12, 4);
     EXPECT_EQ(count, 5u);
+
+    auto dict = StringEncoder::buildDictionary(data);
+    ASSERT_TRUE(dict.valid);
+    AlignedBuffer dictionaryEncoded;
+    StringEncoder::encodeDictionaryInto(data, dict, dictionaryEncoded);
+    std::memcpy(&magic, dictionaryEncoded.data.data(), 4);
+    EXPECT_EQ(magic, 0x31445453u);  // "STD1"
+
+    encoded.writeAt<uint32_t>(0, 0xDEADBEEFu);  // unsupported marker
+    std::vector<std::string> out;
+    EXPECT_THROW(StringEncoder::decode(encoded, data.size(), out), std::runtime_error);
 }
 
 TEST_F(StringEncoderBoundsTest, HeaderUncompressedSizeIsConsistent) {

@@ -268,11 +268,11 @@ TSM::TSM(std::string _absoluteFilePath) {
         begin = end + 1;
     }
 
-    auto parseExact = [](std::string_view text, uint64_t& out) {
+    auto parseCanonical = [](std::string_view text, uint64_t& out) {
         if (text.empty())
             return false;
         const auto result = std::from_chars(text.data(), text.data() + text.size(), out);
-        return result.ec == std::errc{} && result.ptr == text.data() + text.size();
+        return result.ec == std::errc{} && result.ptr == text.data() + text.size() && text == std::to_string(out);
     };
 
     bool valid = false;
@@ -280,33 +280,15 @@ TSM::TSM(std::string _absoluteFilePath) {
     uint64_t parsedSeq = 0;
     uint64_t parsedDataSeq = 0;
 
-    // Current layouts:
+    // Canonical v1 layouts:
     //   <tier>_<seq>.tsm
     //   <tier>_<seq>_d<data-seq>.tsm
-    // Leading zero padding remains valid for legacy files.
-    if (parts.size() == 2 && parseExact(parts[0], parsedTier) && parseExact(parts[1], parsedSeq)) {
+    if (parts.size() == 2 && parseCanonical(parts[0], parsedTier) && parseCanonical(parts[1], parsedSeq)) {
         parsedDataSeq = parsedSeq;
         valid = true;
     } else if (parts.size() == 3 && parts[2].starts_with('d') && parts[2].size() > 1 &&
-               parseExact(parts[0], parsedTier) && parseExact(parts[1], parsedSeq) &&
-               parseExact(parts[2].substr(1), parsedDataSeq)) {
-        valid = true;
-    }
-
-    // Legacy offline core-count rebalance outputs remain readable, but their
-    // schemas are explicit. The old prefix-consuming stoull parser accepted
-    // arbitrary spellings such as "0junk_7.tsm" as a real generation.
-    if (!valid && parts.size() == 3 && parts[0] == "0" && (parts[1] == "rebal" || parts[1] == "split") &&
-        parseExact(parts[2], parsedSeq)) {
-        parsedTier = 0;
-        parsedDataSeq = parsedSeq;
-        valid = true;
-    }
-    uint64_t ignoredSourceShard = 0;
-    if (!valid && parts.size() == 4 && parts[0] == "0" && parts[1] == "wal" &&
-        parseExact(parts[2], ignoredSourceShard) && parseExact(parts[3], parsedSeq)) {
-        parsedTier = 0;
-        parsedDataSeq = parsedSeq;
+               parseCanonical(parts[0], parsedTier) && parseCanonical(parts[1], parsedSeq) &&
+               parseCanonical(parts[2].substr(1), parsedDataSeq)) {
         valid = true;
     }
 
@@ -1147,7 +1129,7 @@ seastar::future<std::unique_ptr<TSMBlock<T>>> TSM::readSingleBlockImpl(const TSM
         BoolEncoderRLE::decode(valuesSlice, nSkipped, nTimestamps, blockResults->values);
     } else if constexpr (std::is_same_v<T, std::string>) {
         auto valuesSlice = blockSlice.getSlice(valueByteSize);
-        // Phase 3: Check if dictionary-encoded (STR2 magic)
+        // Select the dictionary variant of the v1 string-block format.
         if (StringEncoder::isDictionaryEncoded(valuesSlice) && localDict && !localDict->empty()) {
             StringEncoder::decodeDictionary(valuesSlice, timestampSize, nSkipped, nTimestamps, *localDict,
                                             blockResults->values);

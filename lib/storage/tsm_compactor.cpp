@@ -228,14 +228,14 @@ seastar::future<SeriesCompactionData<T>> TSMCompactor::processSeriesForCompactio
 
     bool hasPerPointRetention = (ttlCutoff > 0 || downsampleThreshold > 0);
 
-    // String dictionaries (STR2 blocks store per-file dictionary IDs): the
+    // String dictionaries (STD1 blocks store per-file dictionary IDs): the
     // zero-copy carry is only sound when the output file's index entry can
     // hold ONE dictionary that resolves every carried block's IDs — i.e. all
     // blocks come from a single source file. Dictionaries from different
     // source files have incompatible ID→string mappings, so such series must
     // take the slow path (decode each file with its own dictionary, re-encode
     // with a fresh one). Previously the zero-copy path NEVER propagated the
-    // dictionary: the compacted file contained STR2 blocks with dictSize=0 in
+    // dictionary: the compacted file contained STD1 blocks with dictSize=0 in
     // its index, making the series' values permanently undecodable ("Invalid
     // magic number in string encoding") after their first compaction.
     bool stringDictForcesSlowPath = false;
@@ -332,7 +332,7 @@ seastar::future<SeriesCompactionData<T>> TSMCompactor::processSeriesForCompactio
         }
 
         // Carry the single-source string dictionary so the output file's
-        // index entry can decode the carried STR2 blocks.
+        // index entry can decode the carried STD1 blocks.
         result.stringDictionary = std::move(carriedStringDict);
 
         co_return result;
@@ -920,7 +920,7 @@ seastar::future<> TSMCompactor::writeSeriesCompactionData(TSMWriter& writer, Ser
         // O(block size) rather than O(series size).
         //
         // The dictionary must be attached BEFORE any block is written, so a flush
-        // mid-series cannot land STR2 blocks in the file with no dictionary
+        // mid-series cannot land STD1 blocks in the file with no dictionary
         // recorded for them yet.
         if (data.stringDictionary && !data.blockRefs.empty()) {
             writer.setSeriesStringDictionary(data.seriesId, std::move(data.stringDictionary));

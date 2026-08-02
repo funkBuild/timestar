@@ -18,7 +18,6 @@ namespace timestar::index::keys {
 
 std::string encodeMeasurementFieldsKey(const std::string& measurement);
 std::string encodeMeasurementTagsKey(const std::string& measurement);
-std::string encodeTagValuesKey(const std::string& measurement, const std::string& tagKey);
 std::string encodeSeriesMetadataKey(const SeriesId128& seriesId);
 // Prefix covering all SERIES_METADATA of one VShard: [type:1][vshard:2 BE].
 std::string encodeSeriesMetadataVShardPrefix(uint16_t vshard);
@@ -32,7 +31,7 @@ std::string encodeMeasurementSeriesKey(const std::string& measurement, const Ser
 std::string encodeMeasurementSeriesPrefix(const std::string& measurement);
 std::string encodeRetentionPolicyKey(const std::string& measurement);
 
-// Per-value tag value marker keys (replace the TAG_VALUES blob write path).
+// Per-value tag value marker keys.
 std::string encodeTagValueMarkerKey(const std::string& measurement, const std::string& tagKey,
                                     const std::string& tagValue);
 std::string encodeTagValueMarkerPrefix(const std::string& measurement, const std::string& tagKey);

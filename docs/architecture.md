@@ -78,18 +78,22 @@ Key prefixes separate index types within the LSM-tree:
 
 | Prefix | Name | Description |
 |--------|------|-------------|
-| `0x01` | `SERIES_INDEX` | Series key → series ID |
 | `0x02` | `MEASUREMENT_FIELDS` | Measurement → set of field names |
 | `0x03` | `MEASUREMENT_TAGS` | Measurement → set of tag keys |
-| `0x04` | `TAG_VALUES` | Measurement + tag key → set of tag values |
 | `0x05` | `SERIES_METADATA` | Series ID → metadata (measurement, tags, field) |
 | `0x08` | `FIELD_STATS` | Series ID + field → stats |
 | `0x09` | `FIELD_TYPE` | Measurement + field → field type |
 | `0x0A` | `MEASUREMENT_SERIES` | Measurement + series ID → (empty) |
 | `0x0B` | `RETENTION_POLICY` | Measurement → JSON retention policy |
-| `0x0D` | `DAY_BITMAP` | Measurement + day → roaring bitmap of active series |
+| `0x0D` | `TIME_SERIES_DAY` | Measurement + day → roaring bitmap of active series |
+| `0x10` | `LOCAL_ID_FORWARD` | Local ID → series ID |
+| `0x12` | `LOCAL_ID_COUNTER` | Next local ID |
+| `0x13` | `POSTINGS_BITMAP` | Measurement + tag pair → roaring bitmap of series |
 | `0x14` | `CARDINALITY_HLL` | Measurement → HyperLogLog sketch |
 | `0x15` | `MEASUREMENT_BLOOM` | Measurement → bloom filter for tag combinations |
+| `0x16` | `POSTINGS_WATERMARK` | Crash-repair watermark for postings |
+| `0x17` | `TAG_VALUE_MARKER` | One key per measurement, tag key, and tag value |
+| `0x18` | `SERIES_VALUE_TYPE` | Series ID → immutable value type |
 
 **Key features:**
 - **Roaring bitmap postings** for tag-filtered series discovery (replaces prefix scans)
@@ -107,7 +111,7 @@ Key prefixes separate index types within the LSM-tree:
 | Floats | ALP | Adaptive Lossless floating-Point compression with Highway SIMD |
 | Integers | FFOR + exceptions | Bit-width optimized packing with SIMD |
 | Booleans | Bit-packed + RLE | 1 bit/value (bit-pack) or run-length for biased data |
-| Strings | zstd | Variable-length prefix + zstd block compression |
+| Strings | zstd | `STR1` raw or `STD1` dictionary-ID v1 blocks |
 
 ## Sharding
 

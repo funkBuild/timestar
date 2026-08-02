@@ -66,15 +66,6 @@ fs::path StorageLayout::requireTsmFilename(const fs::path& filename) {
     return filename;
 }
 
-std::string StorageLayout::requireFilenameSegment(std::string_view segment, std::string_view field) {
-    const auto value = fs::path(segment);
-    if (segment.empty() || segment.find('\0') != std::string_view::npos || value.has_parent_path() || value == "." ||
-        value == "..") {
-        throw std::invalid_argument(std::string(field) + " must be one non-empty filename segment");
-    }
-    return std::string(segment);
-}
-
 fs::path StorageLayout::shardDir(unsigned shard) const {
     return underRoot(std::string(shardDirectoryPrefix) + std::to_string(shard));
 }
@@ -95,22 +86,6 @@ std::optional<unsigned> StorageLayout::parseShardDirName(std::string_view name) 
 
 bool StorageLayout::isShardNamespaceEntry(std::string_view name) const noexcept {
     return name.starts_with(shardDirectoryPrefix);
-}
-
-fs::path StorageLayout::shardStagingDir(unsigned shard) const {
-    return underRoot("shard_" + std::to_string(shard) + "_new");
-}
-
-fs::path StorageLayout::shardStagingTsmDir(unsigned shard) const {
-    return shardStagingDir(shard) / "tsm";
-}
-
-fs::path StorageLayout::shardStagingNativeIndexDir(unsigned shard) const {
-    return shardStagingDir(shard) / "native_index";
-}
-
-fs::path StorageLayout::shardRetiredDir(unsigned shard) const {
-    return underRoot("shard_" + std::to_string(shard) + "_old");
 }
 
 fs::path StorageLayout::walFile(unsigned shard, uint64_t sequence) const {
@@ -155,28 +130,6 @@ fs::path StorageLayout::compactedTsmTemporaryFile(unsigned shard, uint64_t tier,
 fs::path StorageLayout::compactedTsmTombstoneFile(unsigned shard, uint64_t tier, uint64_t sequence,
                                                   uint64_t dataSequence) const {
     return withExtension(compactedTsmFile(shard, tier, sequence, dataSequence), ".tombstone");
-}
-
-fs::path StorageLayout::shardStagingTsmFile(unsigned shard, const fs::path& filename) const {
-    return shardStagingTsmDir(shard) / requireTsmFilename(filename);
-}
-
-fs::path StorageLayout::shardStagingTombstoneFile(unsigned shard, const fs::path& tsmFilename) const {
-    return withExtension(shardStagingTsmFile(shard, tsmFilename), ".tombstone");
-}
-
-fs::path StorageLayout::rebalanceWalTsmFile(unsigned targetShard, unsigned sourceShard,
-                                            std::string_view walStem) const {
-    return shardStagingTsmDir(targetShard) /
-           ("0_wal_" + std::to_string(sourceShard) + "_" + requireFilenameSegment(walStem, "WAL stem") + ".tsm");
-}
-
-fs::path StorageLayout::rebalanceCollisionTsmFile(unsigned targetShard, uint64_t sequence) const {
-    return shardStagingTsmDir(targetShard) / ("0_rebal_" + std::to_string(sequence) + ".tsm");
-}
-
-fs::path StorageLayout::rebalanceSplitTsmFile(unsigned targetShard, uint64_t sequence) const {
-    return shardStagingTsmDir(targetShard) / ("0_split_" + std::to_string(sequence) + ".tsm");
 }
 
 fs::path StorageLayout::nativeIndexDir(unsigned shard) const {

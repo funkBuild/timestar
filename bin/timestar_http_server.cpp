@@ -768,9 +768,9 @@ int main(int argc, char** argv) {
 
             // STEP 0: Fail-closed storage safety gate.
             //
-            // Normal startup never runs the legacy core-count rebalancer, which
-            // rewrites shard layout and can leave an existing series
-            // undiscoverable. Instead it inspects the store read-only and
+            // The retired core-count rebalancer could rewrite shard layout and
+            // leave an existing series undiscoverable. Startup only inspects
+            // the store read-only and
             // refuses to proceed on an unsafe or ambiguous change (a --smp/core
             // count that does not match the stored shard count, an interrupted
             // rebalance, or unreadable metadata). The inspection creates and

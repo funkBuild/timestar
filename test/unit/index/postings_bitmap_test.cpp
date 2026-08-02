@@ -7,7 +7,7 @@
  * - Multi-tag intersection via findSeries returns correct results
  * - Mutable postings (unflushed) visible in queries
  * - After flush + compact, queries still correct
- * - Migration from Phase 1 data (TAG_INDEX → bitmap)
+ * - Current v1 LocalIdMap restoration across restart
  * - getSeriesGroupedByTag via bitmap prefix scan
  */
 
@@ -293,8 +293,7 @@ SEASTAR_TEST_F(PostingsBitmapTest, BulkInsertWithMultipleFlushes) {
     co_await index.close();
 }
 
-SEASTAR_TEST_F(PostingsBitmapTest, MigrationFromPhase1) {
-    // Simulate Phase 1 data: create index, close, reopen (triggers migration)
+SEASTAR_TEST_F(PostingsBitmapTest, RestoresCurrentLocalIdsAcrossReopen) {
     std::vector<SeriesId128> ids;
 
     {

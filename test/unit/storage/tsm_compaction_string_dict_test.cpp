@@ -1,12 +1,12 @@
 // Regression tests for the string-dictionary compaction bug.
 //
-// ROOT CAUSE (pre-fix): TSMCompactor's zero-copy path copied compressed STR2
+// ROOT CAUSE (pre-fix): TSMCompactor's zero-copy path copied compressed STD1
 // (dictionary-encoded) string blocks verbatim into the compacted file, but the
 // output file's TSM index entry never received the source file's string
 // dictionary (writeCompressedBlockWithStats never set it, and
 // SeriesCompactionData had no field to carry it). The compacted file's index
-// stored dictSize=0 for the series, so every read of the carried STR2 blocks
-// fell into the raw STRG decoder and threw "Invalid magic number in string
+// stored dictSize=0 for the series, so every read of the carried STD1 blocks
+// fell into the raw STR1 decoder and threw "Invalid magic number in string
 // encoding". The query layer swallows per-series read errors, so string-field
 // series silently vanished from query results after their first compaction —
 // permanently, surviving restarts — while sibling numeric fields (self-
@@ -116,13 +116,13 @@ public:
 };
 
 // Single-source zero-copy carry: the string series exists in one input file
-// with a dictionary (repeated values => STR2 blocks). Pre-fix, the compacted
+// with a dictionary (repeated values => STD1 blocks). Pre-fix, the compacted
 // file's index entry lost the dictionary and every read threw. Post-fix, the
 // dictionary is carried into the output index entry and values round-trip.
 SEASTAR_TEST_F(TSMCompactionStringDictTest, ZeroCopyCarryPreservesDictionary) {
     SeriesId128 sid = SeriesId128::fromSeriesKey("strings.dictseries");
 
-    // 8 points from a 2-value alphabet => buildDictionary succeeds => STR2.
+    // 8 points from a 2-value alphabet => buildDictionary succeeds => STD1.
     std::vector<uint64_t> ts;
     std::vector<std::string> vals;
     for (int i = 0; i < 8; ++i) {
@@ -175,7 +175,7 @@ SEASTAR_TEST_F(TSMCompactionStringDictTest, ZeroCopyCarryPreservesDictionary) {
 // Multi-source dictionaries: the same string series exists in TWO input files,
 // each with its own dictionary and non-overlapping time ranges. Zero-copy
 // carry is unsound here (the two files' dictionary IDs are incompatible), so
-// the series must be re-encoded. Pre-fix this produced dictionary-less STR2
+// the series must be re-encoded. Pre-fix this produced dictionary-less STD1
 // blocks that could never be decoded.
 SEASTAR_TEST_F(TSMCompactionStringDictTest, MultiSourceDictionariesReencodeCorrectly) {
     SeriesId128 sid = SeriesId128::fromSeriesKey("strings.multisource");
@@ -211,7 +211,7 @@ SEASTAR_TEST_F(TSMCompactionStringDictTest, MultiSourceDictionariesReencodeCorre
     co_return;
 }
 
-// Raw (STRG) string blocks are self-contained; the zero-copy carry must keep
+// Raw (STR1) string blocks are self-contained; the zero-copy carry must keep
 // working for them. Use >MAX_DICT_ENTRIES unique values so buildDictionary
 // declines and the writer emits raw blocks.
 SEASTAR_TEST_F(TSMCompactionStringDictTest, RawStringBlocksStillZeroCopy) {

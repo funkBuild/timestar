@@ -36,11 +36,11 @@ struct ShardStoreInspection {
 
 // Read-only startup safety gate for the legacy shard_N storage layout.
 //
-// This class deliberately has no dependency on ShardRebalancer: normal server
-// startup may inspect the store and, on success, record a safe shard count, but
-// it must never invoke the legacy mutating migration (execute/recoverIfNeeded)
-// automatically. Exclusion between processes is provided by the data-directory
-// lock the server already holds, so this gate performs no locking itself.
+// The mutating rebalancer has been removed. Normal server startup may inspect
+// the store and, on success, record a safe shard count, but it never interprets
+// or resumes retired migration artifacts. Exclusion between processes is
+// provided by the data-directory lock the server already holds, so this gate
+// performs no locking itself.
 class ShardStoreStartup {
 public:
     explicit ShardStoreStartup(StorageLayout layout);

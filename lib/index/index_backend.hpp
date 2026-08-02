@@ -38,22 +38,15 @@ struct MetadataOp {
 };
 
 enum IndexKeyType : uint8_t {
-    // 0x01 retired (legacy escaped series index)
     MEASUREMENT_FIELDS = 0x02,  // measurement -> fields set
     MEASUREMENT_TAGS = 0x03,    // measurement -> tag keys set
-    TAG_VALUES = 0x04,          // measurement+tag_key -> values set
     SERIES_METADATA = 0x05,     // series_id -> metadata
-    TAG_INDEX = 0x06,           // measurement+tag_key+tag_value -> series_ids
-    // 0x07 retired (GROUP_BY_INDEX — removed in Phase 3)
     FIELD_STATS = 0x08,         // series_id+field -> stats
     FIELD_TYPE = 0x09,          // measurement+field -> field type (float, bool, string, integer)
     MEASUREMENT_SERIES = 0x0A,  // measurement+\0+series_id -> (empty) for fast measurement->series lookup
     RETENTION_POLICY = 0x0B,    // measurement -> JSON retention policy
-    // 0x0C was MEASUREMENT_FIELD_SERIES — removed in cleanup; never read.
 
-    // Phase 2: Roaring bitmap postings
     LOCAL_ID_FORWARD = 0x10,  // localId (4B LE) -> SeriesId128 (16B)
-    // 0x11 retired (LOCAL_ID_REVERSE — reverse mapping now held in-memory by LocalIdMap)
     LOCAL_ID_COUNTER = 0x12,  // singleton -> next localId counter (4B LE)
     POSTINGS_BITMAP = 0x13,   // measurement\0tagKey\0tagValue -> serialized roaring bitmap
 
@@ -66,10 +59,8 @@ enum IndexKeyType : uint8_t {
     MEASUREMENT_BLOOM = 0x15,   // measurement\0 -> serialized bloom filter of all LocalIds
     POSTINGS_WATERMARK = 0x16,  // singleton -> localIdMap.nextId() at last bitmap flush (crash-repair bound)
 
-    // Per-value tag value markers: replace the TAG_VALUES blob write path.
-    // One empty-value key per (measurement, tagKey, tagValue) — appending a new
-    // value is O(1) instead of re-encoding the whole value set (O(V²) write
-    // amplification). Read path unions these with any legacy TAG_VALUES blob.
+    // One empty-value key per (measurement, tagKey, tagValue) makes appending a
+    // new value O(1) instead of re-encoding the whole set (O(V²) amplification).
     TAG_VALUE_MARKER = 0x17,  // measurement+\0+tagKey+\0+tagValue -> (empty)
 
     // Per-series value type binding, enforced on ingest.

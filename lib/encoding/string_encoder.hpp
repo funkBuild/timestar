@@ -35,7 +35,7 @@ public:
     // Accepts std::span for zero-copy sub-range encoding; std::vector
     // converts implicitly.
     // Format: [header][compressed_data]
-    // Header: magic_number(4) | uncompressed_size(4) | compressed_size(4) | count(4)
+    // V1 header: magic "STR1"(4) | uncompressed_size(4) | compressed_size(4) | count(4)
     // Data (before compression): [length_prefix][string_data] for each string
     // compressionLevel: zstd level (1=fast for fresh writes, 3=better ratio for compacted data).
     static AlignedBuffer encode(std::span<const std::string> values, int compressionLevel = 1);
@@ -66,10 +66,11 @@ public:
     static size_t decode(Slice& encoded, size_t totalCount, size_t skipCount, size_t limitCount,
                          std::vector<std::string>& out);
 
-    // ==================== Dictionary Encoding (Phase 3) ====================
+    // ==================== Dictionary encoding ====================
     // For low-cardinality string series, dictionary encoding stores varint IDs
     // instead of raw strings, then compresses the IDs with zstd.
-    // Magic: "STR2" (0x53545232) distinguishes from raw "STRG" (0x53545247).
+    // Its "STD1" marker identifies the dictionary variant of the same v1 block
+    // contract; it is not a second format version.
 
     // Dictionary limits — fall back to raw encoding if exceeded.
     // Benchmarking showed dictionary encoding is only beneficial for cardinality <= ~50.
@@ -95,7 +96,7 @@ public:
 
     // Encode strings using dictionary directly into an existing AlignedBuffer (no
     // intermediate result buffer + copy). Returns bytes written to target.
-    // Header: magic("STR2") + uncompressedSize(4) + compressedSize(4) + count(4)
+    // V1 header: magic("STD1") + uncompressedSize(4) + compressedSize(4) + count(4)
     // Data: zstd-compressed varint IDs
     static size_t encodeDictionaryInto(std::span<const std::string> values, const Dictionary& dict,
                                        AlignedBuffer& target, int compressionLevel = 1);

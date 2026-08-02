@@ -343,7 +343,7 @@ TEST_F(StringEncoderTest, StringEncoder_Decode_InvalidLengthThrows) {
 
     // Assemble the full encoded buffer with the standard 16-byte header.
     AlignedBuffer buf;
-    uint32_t magic = 0x53545247u;  // "STRG"
+    uint32_t magic = 0x31525453u;  // "STR1"
     uint32_t count = 1u;
     uint32_t cSize = static_cast<uint32_t>(compSize);
     buf.write(magic);
@@ -384,7 +384,7 @@ TEST_F(StringEncoderTest, StringEncoder_Decode_VarIntTooLargeThrows) {
 
     // Build the 16-byte header + compressed payload.
     AlignedBuffer buf;
-    uint32_t magic = 0x53545247u;  // "STRG"
+    uint32_t magic = 0x31525453u;  // "STR1"
     uint32_t count = 1u;
     uint32_t cSize = static_cast<uint32_t>(compSize);
     buf.write(magic);

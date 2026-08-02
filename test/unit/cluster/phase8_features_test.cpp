@@ -1,6 +1,6 @@
 // Phase 8 feature-completion bricks: cluster-aware streaming (backfill/live at one
 // barrier, no loss / no silent duplication), backup/restore (fresh cluster UUID,
-// scrubbed membership, verified), rolling-upgrade feature gating, conservative
+// scrubbed membership, verified), conservative
 // routing summaries (no false negatives), and hierarchical query merge.
 #include "../../../lib/cluster/features/backup_restore.hpp"
 #include "../../../lib/cluster/features/operator_surface.hpp"

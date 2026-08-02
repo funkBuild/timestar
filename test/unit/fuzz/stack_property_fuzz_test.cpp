@@ -403,8 +403,8 @@ Workload generateWorkload(size_t index, uint64_t seed) {
     }
     w.irregular = (rng() % 3) == 0;
     w.baseStepSec = 1 + (rng() % 5);
-    // Low cardinality (<= 50 uniques) takes the STR2 dictionary path; high
-    // cardinality takes the raw STRG path. Both are real branches in
+    // Low cardinality (<= 50 uniques) takes the STD1 dictionary path; high
+    // cardinality takes the raw STR1 path. Both are real branches in
     // decodeBlockFlat.
     w.stringCardinality = (rng() % 2 == 0) ? (1 + rng() % 40) : 5000;
 
@@ -1018,7 +1018,7 @@ Workload shrinkWorkload(const Workload& failing, const std::string& wantedSignat
     }
 
     // 4. string cardinality -> 1 (a single repeated value is the simplest case,
-    //    and also forces the STR2 dictionary path)
+    //    and also forces the STD1 dictionary path)
     if (best.type == FieldType::String && best.stringCardinality > 1) {
         Workload cand = best;
         cand.stringCardinality = 1;

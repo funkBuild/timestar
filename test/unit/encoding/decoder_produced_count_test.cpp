@@ -39,7 +39,7 @@
 class DecoderProducedCountTest : public ::testing::Test {};
 
 // ---------------------------------------------------------------------------
-// String (raw STRG)
+// String (raw STR1)
 // ---------------------------------------------------------------------------
 
 TEST_F(DecoderProducedCountTest, StringDecodeReportsExactCount) {

@@ -94,8 +94,8 @@ Dimensions chosen because they are where the bugs actually lived:
 
 1. **Schema** — series count, tag cardinality, field types (float / int64 / bool
    / string).
-2. **String cardinality** — low (≤50 uniques → STR2 dictionary path) and high
-   (→ raw STRG path). *The dictionary/raw split is a real branch in
+2. **String cardinality** — low (≤50 uniques → STD1 dictionary path) and high
+   (→ raw STR1 path). *The dictionary/raw split is a real branch in
    `decodeBlockFlat`; both must be exercised.*
 3. **Point counts straddling block edges** — derived at runtime from
    `MaxPointsPerBlock()` (config, default **3000**) and

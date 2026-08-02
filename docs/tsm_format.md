@@ -53,6 +53,11 @@ The body contains compressed timestamps followed by compressed values.
 | 2 | String | `std::string` | raw or dictionary IDs |
 | 3 | Integer | `int64_t` | ZigZag + FFOR |
 
+String value payloads use a 16-byte v1 header: marker, uncompressed byte
+count, compressed byte count, and value count. Raw zstd blocks use `STR1`;
+dictionary-ID blocks use `STD1`. These are two encodings within TSM v1, not
+separate format versions.
+
 Timestamp FFOR encoding has a densest theoretical representation of 64 values
 per byte. The reader applies a four-times safety margin when validating the
 declared point count, then verifies decoded timestamp and value counts agree.
@@ -96,7 +101,7 @@ FIRST/LATEST/M2 pushdown so the values are decoded and folded canonically.
 
 String series append `dictionarySize:uint32` and that many serialized
 dictionary bytes after their block metadata. A zero size means raw string
-blocks. A dictionary-ID block without its dictionary is corrupt and fails open.
+blocks. A dictionary-ID block without its dictionary is corrupt and fails closed.
 
 ## Trailers
 
@@ -124,6 +129,9 @@ generation.
 {TIER}_{SEQUENCE}.tsm
 {TIER}_{SEQUENCE}_d{DATA_SEQUENCE}.tsm
 ```
+
+Numeric fields use canonical decimal spelling: no sign or leading-zero alias is
+accepted. Retired offline-rebalance names are unsupported.
 
 `(tier << 60) | sequence` is the unique file identity. `dataSequence` is the
 newest write generation represented by the file and determines last-write-wins

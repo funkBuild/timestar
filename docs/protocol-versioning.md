@@ -26,6 +26,8 @@ historical-reader guarantees during the greenfield phase.
 | Raft journal snapshot record | `TSRSNAP1` |
 | WAL segment | `TSWL` plus little-endian `uint32(1)` |
 | TSM file | `TASM` plus byte `1` |
+| TSM string value block | `STR1` (raw) or `STD1` (dictionary), both v1 variants |
+| TSM filename | `<tier>_<sequence>[_d<data-sequence>].tsm` canonical decimal fields |
 | TSM tombstone | `TSMT` plus `uint32(1)` |
 | NativeIndex manifest | `TSMF` plus `uint32(1)` |
 | NativeIndex SSTable footer | `TSIX` plus `uint32(1)` |
@@ -40,6 +42,10 @@ Nested request/reply payloads carried over the negotiated data-plane connection
 use the one current v1 schema. Fields are mandatory according to that schema;
 decoders do not accept truncated historical layouts or optional compatibility
 tails.
+
+NativeIndex v1 uses local-ID forward mappings, roaring postings, and per-value
+tag markers directly. It has no pre-bitmap migration or tag-value blob reader;
+series metadata without the atomically persisted local-ID counter fails closed.
 
 ## Rules while greenfield
 

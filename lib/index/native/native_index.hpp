@@ -560,8 +560,7 @@ private:
     // Bounded tag values cache: cleared when exceeding limit (repopulated on miss from KV).
     std::unordered_map<std::string, std::set<std::string>> tagValuesCache_;
     static constexpr size_t MAX_TAG_VALUES_CACHE_ENTRIES = 4096;
-    // Full tag-value load: union of the legacy TAG_VALUES blob (old DBs, no
-    // migration needed) and a prefix scan over TAG_VALUE_MARKER keys.
+    // Full tag-value load from the v1 per-value marker keys.
     seastar::future<std::set<std::string>> loadTagValuesFromKv(const std::string& measurement,
                                                                const std::string& tagKey);
     std::unordered_set<std::string> knownFieldTypes_;
@@ -683,8 +682,6 @@ private:
     // out first, so a concurrent re-dirty during a suspension survives into the
     // NEXT round instead of being dropped by a trailing clear() (the D-2 shape).
     seastar::future<> flushDirtyBitmaps(IndexWriteBatch& batch);
-    // Migration: build LocalIdMap + bitmaps from existing TAG_INDEX data on first open.
-    seastar::future<> migrateToLocalIds(IndexWriteBatch& batch);
     // Build a bitmap cache key: "measurement\0tagKey\0tagValue"
     static void buildBitmapCacheKey(std::string& out, const std::string& measurement, const std::string& tagKey,
                                     const std::string& tagValue);

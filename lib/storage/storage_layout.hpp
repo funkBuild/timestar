@@ -9,7 +9,7 @@
 
 namespace timestar {
 
-// Immutable, lexical authority for every legacy shard_N storage path.
+// Immutable, lexical authority for every shard_N storage path.
 //
 // It performs no filesystem I/O and reads no global configuration: it is a pure
 // function of the root it is constructed with. Storage components must obtain
@@ -33,11 +33,6 @@ public:
     [[nodiscard]] std::filesystem::path shardDir(unsigned shard) const;
     [[nodiscard]] std::optional<unsigned> parseShardDirName(std::string_view name) const;
     [[nodiscard]] bool isShardNamespaceEntry(std::string_view name) const noexcept;
-    [[nodiscard]] std::filesystem::path shardStagingDir(unsigned shard) const;
-    [[nodiscard]] std::filesystem::path shardStagingTsmDir(unsigned shard) const;
-    [[nodiscard]] std::filesystem::path shardStagingNativeIndexDir(unsigned shard) const;
-    [[nodiscard]] std::filesystem::path shardRetiredDir(unsigned shard) const;
-
     [[nodiscard]] std::filesystem::path walFile(unsigned shard, uint64_t sequence) const;
     [[nodiscard]] std::filesystem::path tsmDir(unsigned shard) const;
     [[nodiscard]] std::filesystem::path tsmFile(unsigned shard, const std::filesystem::path& filename) const;
@@ -52,17 +47,6 @@ public:
                                                                   uint64_t dataSequence) const;
     [[nodiscard]] std::filesystem::path compactedTsmTombstoneFile(unsigned shard, uint64_t tier, uint64_t sequence,
                                                                   uint64_t dataSequence) const;
-
-    // Legacy CPU-shard rebalance paths. Basename overloads are deliberately
-    // restricted to one .tsm filename so callers cannot escape the layout root.
-    [[nodiscard]] std::filesystem::path shardStagingTsmFile(unsigned shard,
-                                                            const std::filesystem::path& filename) const;
-    [[nodiscard]] std::filesystem::path shardStagingTombstoneFile(unsigned shard,
-                                                                  const std::filesystem::path& tsmFilename) const;
-    [[nodiscard]] std::filesystem::path rebalanceWalTsmFile(unsigned targetShard, unsigned sourceShard,
-                                                            std::string_view walStem) const;
-    [[nodiscard]] std::filesystem::path rebalanceCollisionTsmFile(unsigned targetShard, uint64_t sequence) const;
-    [[nodiscard]] std::filesystem::path rebalanceSplitTsmFile(unsigned targetShard, uint64_t sequence) const;
 
     [[nodiscard]] std::filesystem::path nativeIndexDir(unsigned shard) const;
     [[nodiscard]] std::filesystem::path nativeManifestFile(unsigned shard) const;
@@ -98,8 +82,6 @@ private:
     [[nodiscard]] static std::filesystem::path withSuffix(const std::filesystem::path& path, const char* suffix);
     [[nodiscard]] static std::filesystem::path withExtension(const std::filesystem::path& path, const char* extension);
     [[nodiscard]] static std::filesystem::path requireTsmFilename(const std::filesystem::path& filename);
-    [[nodiscard]] static std::string requireFilenameSegment(std::string_view segment, std::string_view field);
-
     std::filesystem::path root_;
 };
 

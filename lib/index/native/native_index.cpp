@@ -309,21 +309,7 @@ seastar::future<> NativeIndex::open() {
     }
     co_await wal_->purgeReplayedFiles();
 
-    // Bound the WAL buffering loss window: append() only buffers in user space,
-    // so periodically sync (flush + fsync) when there is unpersisted data.
-    walSyncTimer_.set_callback([this] {
-        if (walSyncGate_.is_closed()) {
-            return;
-        }
-        (void)seastar::with_gate(walSyncGate_, [this] {
-            return wal_->sync();
-        }).handle_exception([](std::exception_ptr ep) {
-            ::native_index_log.warn("Background WAL sync failed: {}", ep);
-        });
-    });
-    walSyncTimer_.arm_periodic(kWalSyncInterval);
-
-    // Phase 2: Load or migrate LocalIdMap for roaring bitmap postings
+    // Load the v1 LocalIdMap used by roaring bitmap postings.
     auto counterKey = ke::encodeLocalIdCounterKey();
     auto counterVal = co_await kvGet(counterKey);
     if (counterVal.has_value()) {
@@ -351,14 +337,17 @@ seastar::future<> NativeIndex::open() {
         lastFlushedLocalId_ = localIdMap_.nextId();  // All restored IDs are already persisted
         ::native_index_log.info("Restored LocalIdMap: {} mappings", localIdMap_.size());
     } else {
-        // Phase 1 → Phase 2 migration: build LocalIdMap + bitmaps from existing data
-        IndexWriteBatch migrationBatch;
-        co_await migrateToLocalIds(migrationBatch);
-        if (!migrationBatch.empty()) {
-            co_await kvWriteBatch(migrationBatch);
-            lastFlushedLocalId_ = localIdMap_.nextId();  // Migration persisted all IDs
-            ::native_index_log.info("Phase 2 migration complete: {} local IDs assigned", localIdMap_.size());
-        }
+        // A fresh v1 index has neither a counter nor series metadata. Metadata
+        // without the atomically-written counter is an unsupported development
+        // layout or corruption; never reinterpret it through a migration path.
+        bool hasSeriesMetadata = false;
+        std::string metaPrefix(1, static_cast<char>(SERIES_METADATA));
+        co_await kvPrefixScan(metaPrefix, [&](std::string_view, std::string_view) {
+            hasSeriesMetadata = true;
+            return false;
+        });
+        if (hasSeriesMetadata)
+            throw std::runtime_error("NativeIndex v1 series metadata is missing its local-ID counter");
     }
 
     // Crash-window postings repair: series created after the last bitmap flush
@@ -404,6 +393,21 @@ seastar::future<> NativeIndex::open() {
     // This avoids scanning all HLL/bloom KV entries at startup, which can stall for
     // 10K+ measurements.
 
+    // Start background work only after all v1 validation and recovery succeeds.
+    // A rejected index must not leave a timer referring to a failed-open object.
+    // Bound the WAL buffering loss window: append() only buffers in user space,
+    // so periodically sync (flush + fsync) when there is unpersisted data.
+    walSyncTimer_.set_callback([this] {
+        if (walSyncGate_.is_closed())
+            return;
+        (void)seastar::with_gate(walSyncGate_, [this] {
+            return wal_->sync();
+        }).handle_exception([](std::exception_ptr ep) {
+            ::native_index_log.warn("Background WAL sync failed: {}", ep);
+        });
+    });
+    walSyncTimer_.arm_periodic(kWalSyncInterval);
+
     // Bound the AGE of dirty application-cache state (write-scaleout debt D-17).
     // The size trigger on the insert path cannot cover the steady state that
     // motivated this: a fixed fleet re-touching the same day bitmap dirties ONE
@@ -411,10 +415,8 @@ seastar::future<> NativeIndex::open() {
     // while creating no series and writing nothing to the memtable. Without an
     // age bound that state can sit only in RAM for a whole day.
     //
-    // Armed HERE, at the end of open(), rather than beside walSyncTimer_: the
-    // migration and crash-window repair above dirty these very caches, and there
-    // is no reason to let a background flush interleave with a repair that is
-    // still reconstructing them.
+    // Armed here because crash-window repair above dirties these caches and no
+    // background flush should interleave while it is still reconstructing them.
     dirtyCacheTimer_.set_callback([this] {
         if (dirtyCacheGate_.is_closed())
             return;
@@ -1299,7 +1301,7 @@ seastar::future<SeriesId128> NativeIndex::getOrCreateSeriesId(SeriesId128 series
     batch.put(ke::encodeLocalIdForwardKey(localId), seriesId.toBytes());
     batch.put(ke::encodeLocalIdCounterKey(), ke::encodeLocalId(localId + 1));
 
-    // Phase 2: Add local ID to dirty postings bitmaps (TAG_INDEX/GROUP_BY_INDEX removed in Phase 3)
+    // Add the local ID to the current postings bitmaps.
     std::string bitmapCacheKey;
     bitmapCacheKey.reserve(measurement.size() + 1 + 32 + 1 + 32);
     // Phase 4: Update cardinality HLLs.
@@ -1393,7 +1395,6 @@ seastar::future<SeriesId128> NativeIndex::getOrCreateSeriesId(SeriesId128 series
         if (tagVals->insert(tagValue).second) {
             // Per-value marker key: O(1) append instead of re-encoding the
             // measurement's entire value set (O(V²) write amplification).
-            // The legacy TAG_VALUES blob is no longer written; reads union it.
             batch.put(ke::encodeTagValueMarkerKey(measurement, tagKey, tagValue), "");
             pendingSchemaUpdate_.newTagValues[tvCacheKey].insert(tagValue);
         }
@@ -1852,15 +1853,10 @@ seastar::future<std::set<std::string>> NativeIndex::getTagValues(std::string mea
     co_return std::set<std::string>{};
 }
 
-// Union of the legacy TAG_VALUES blob (pre-marker DBs keep working without
-// migration) and the per-value TAG_VALUE_MARKER keys.
+// Load the current v1 per-value TAG_VALUE_MARKER keys.
 seastar::future<std::set<std::string>> NativeIndex::loadTagValuesFromKv(const std::string& measurement,
                                                                         const std::string& tagKey) {
     std::set<std::string> result;
-    auto blob = co_await kvGet(ke::encodeTagValuesKey(measurement, tagKey));
-    if (blob.has_value()) {
-        result = ke::decodeStringSet(*blob);
-    }
     std::string prefix = ke::encodeTagValueMarkerPrefix(measurement, tagKey);
     co_await kvPrefixScan(prefix, [&](std::string_view key, std::string_view) {
         if (key.size() > prefix.size()) {
@@ -2856,76 +2852,6 @@ seastar::future<uint64_t> NativeIndex::addToPostingsBitmapForInsert(std::string&
     co_return entry->bitmap.cardinality();
 }
 
-seastar::future<> NativeIndex::migrateToLocalIds(IndexWriteBatch& batch) {
-    // Scan all SERIES_METADATA entries to assign local IDs
-    std::string metaPrefix(1, static_cast<char>(SERIES_METADATA));
-    co_await kvPrefixScan(metaPrefix, [&](std::string_view key, std::string_view) {
-        if (key.size() >= ke::kSeriesMetadataKeyIdOffset + 16) {
-            // Key = [type:1][vshard:2][seriesId:16]; the id follows the type+vshard.
-            SeriesId128 globalId = SeriesId128::fromBytes(key.data() + ke::kSeriesMetadataKeyIdOffset, 16);
-            uint32_t localId = localIdMap_.getOrAssign(globalId);
-            batch.put(ke::encodeLocalIdForwardKey(localId), globalId.toBytes());
-        }
-        return true;
-    });
-
-    if (localIdMap_.size() == 0)
-        co_return;
-
-    // Persist the counter
-    batch.put(ke::encodeLocalIdCounterKey(), ke::encodeLocalId(localIdMap_.nextId()));
-
-    // Scan TAG_INDEX entries to build initial POSTINGS_BITMAP entries.
-    // Populate bitmapCache_ directly so they're immediately available for queries.
-    std::string tagPrefix(1, static_cast<char>(TAG_INDEX));
-    co_await kvPrefixScan(tagPrefix, [&](std::string_view key, std::string_view value) {
-        if (value.size() < 16)
-            return true;
-        SeriesId128 globalId = SeriesId128::fromBytes(value.data(), 16);
-        auto localOpt = localIdMap_.getLocalId(globalId);
-        if (!localOpt.has_value())
-            return true;
-
-        // Extract measurement\0tagKey\0tagValue from key (skip prefix byte, strip trailing \0+seriesId)
-        auto afterPrefix = key.substr(1);
-        if (afterPrefix.size() < 17)
-            return true;
-        auto mtvPart = afterPrefix.substr(0, afterPrefix.size() - 16);
-        if (!mtvPart.empty() && mtvPart.back() == '\0') {
-            mtvPart = mtvPart.substr(0, mtvPart.size() - 1);
-        }
-        std::string postingsKey(mtvPart);
-        auto entry = ensureEntry(bitmapCache_, postingsKey);
-        entry->bitmap.add(*localOpt);
-        entry->dirty = true;
-        return true;
-    });
-
-    // Serialize dirty bitmaps into the migration batch
-    std::string bitmapKey;
-    size_t bitmapCount = 0;
-    for (auto it = bitmapCache_.begin(); it != bitmapCache_.end(); ++it) {
-        auto& entry = *it.value();
-        if (!entry.dirty)
-            continue;
-        entry.bitmap.runOptimize();
-        entry.bitmap.shrinkToFit();
-        entry.dirty = false;
-
-        bitmapKey.clear();
-        bitmapKey.push_back(static_cast<char>(POSTINGS_BITMAP));
-        bitmapKey.append(it->first);
-        size_t serializedSize = entry.bitmap.getSizeInBytes();
-        std::string serialized(serializedSize, '\0');
-        entry.bitmap.write(serialized.data());
-        batch.put(bitmapKey, serialized);
-        ++bitmapCount;
-    }
-
-    ::native_index_log.info("Migration: assigned {} local IDs, built {} postings bitmaps", localIdMap_.size(),
-                            bitmapCount);
-}
-
 // ============================================================================
 // Phase 3: Time-scoped per-day bitmaps
 // ============================================================================
@@ -3898,7 +3824,7 @@ seastar::future<SchemaUpdate> NativeIndex::indexMetadataBatchWithSchema(const st
 
 // Persist broadcast schema deltas into the LOCAL shard's KV store so every
 // shard's KV becomes a complete schema replica. Without this, each shard's KV
-// only held MEASUREMENT_FIELDS/TAGS/TAG_VALUES for series it owns; once
+// only held MEASUREMENT_FIELDS/TAGS/TAG_VALUE_MARKER entries for series it owns; once
 // trimSchemaCaches() cleared the broadcast deltas (or the process restarted),
 // /fields//tags//tag-values served from a non-owning shard returned partial
 // data. Broadcasts are idempotent unions, so the origin shard re-applying its

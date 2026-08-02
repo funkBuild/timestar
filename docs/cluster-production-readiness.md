@@ -45,6 +45,13 @@ inventory and rules.
   round-trip, bounds, corruption, and unknown-version rejection tests.
 - [x] Corrected proposal sizing for the promoted delta-varint v1 layout by
   charging the exact encoded size rather than a retired cross-version ratio.
+- [x] Reframed raw and dictionary string blocks as explicit `STR1`/`STD1`
+  variants of the same v1 contract and consolidated their shared header and
+  full-buffer decode logic.
+- [x] Removed the unused core-count rebalancer and its test suite; TSM readers
+  now reject its retired filenames and non-canonical numeric aliases.
+- [x] Removed NativeIndex's pre-bitmap migration and tag-value blob fallback;
+  current v1 local-ID state restores normally and incomplete state fails closed.
 - [x] Bound each `TSMJ1` movement job to its exact source voters and target map
   epoch, made Group 0 create the job and desired placement atomically, and made
   serving-map cutover require that exact job to reach `Done`.

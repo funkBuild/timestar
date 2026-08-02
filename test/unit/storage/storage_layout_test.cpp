@@ -18,31 +18,22 @@ TEST(StorageLayoutTest, EmptyRootIsRejectedInsteadOfSilentlySelectingTheWorkingD
     EXPECT_THROW(timestar::StorageLayout(fs::path(std::string("data\0outside", 12))), std::invalid_argument);
 }
 
-TEST(StorageLayoutTest, DefaultRootExactlyPreservesLegacyNames) {
+TEST(StorageLayoutTest, DefaultRootProducesCanonicalV1Names) {
     const timestar::StorageLayout layout(".");
 
     EXPECT_EQ(layout.root(), ".");
     EXPECT_EQ(layout.shardDir(0), "shard_0");
     EXPECT_EQ(layout.shardDir(17), "shard_17");
-    EXPECT_EQ(layout.shardStagingDir(2), "shard_2_new");
-    EXPECT_EQ(layout.shardStagingTsmDir(2), "shard_2_new/tsm");
-    EXPECT_EQ(layout.shardStagingNativeIndexDir(2), "shard_2_new/native_index");
-    EXPECT_EQ(layout.shardRetiredDir(2), "shard_2_old");
     EXPECT_EQ(layout.walFile(3, 42), "shard_3/0000000042.wal");
     EXPECT_EQ(layout.tsmDir(3), "shard_3/tsm");
-    EXPECT_EQ(layout.tsmFile(3, "0_wal_8_0000000042.tsm"), "shard_3/tsm/0_wal_8_0000000042.tsm");
-    EXPECT_EQ(layout.tsmTombstoneFile(3, "0_wal_8_0000000042.tsm"), "shard_3/tsm/0_wal_8_0000000042.tombstone");
+    EXPECT_EQ(layout.tsmFile(3, "2_99.tsm"), "shard_3/tsm/2_99.tsm");
+    EXPECT_EQ(layout.tsmTombstoneFile(3, "2_99.tsm"), "shard_3/tsm/2_99.tombstone");
     EXPECT_EQ(layout.tsmFile(3, 2, 99), "shard_3/tsm/2_99.tsm");
     EXPECT_EQ(layout.tsmTemporaryFile(3, 2, 99), "shard_3/tsm/2_99.tsm.tmp");
     EXPECT_EQ(layout.tsmTombstoneFile(3, 2, 99), "shard_3/tsm/2_99.tombstone");
     EXPECT_EQ(layout.compactedTsmFile(3, 2, 99, 81), "shard_3/tsm/2_99_d81.tsm");
     EXPECT_EQ(layout.compactedTsmTemporaryFile(3, 2, 99, 81), "shard_3/tsm/2_99_d81.tsm.tmp");
     EXPECT_EQ(layout.compactedTsmTombstoneFile(3, 2, 99, 81), "shard_3/tsm/2_99_d81.tombstone");
-    EXPECT_EQ(layout.shardStagingTsmFile(3, "2_99.tsm"), "shard_3_new/tsm/2_99.tsm");
-    EXPECT_EQ(layout.shardStagingTombstoneFile(3, "2_99.tsm"), "shard_3_new/tsm/2_99.tombstone");
-    EXPECT_EQ(layout.rebalanceWalTsmFile(3, 8, "0000000042"), "shard_3_new/tsm/0_wal_8_0000000042.tsm");
-    EXPECT_EQ(layout.rebalanceCollisionTsmFile(3, 11), "shard_3_new/tsm/0_rebal_11.tsm");
-    EXPECT_EQ(layout.rebalanceSplitTsmFile(3, 12), "shard_3_new/tsm/0_split_12.tsm");
     EXPECT_EQ(layout.nativeIndexDir(3), "shard_3/native_index");
     EXPECT_EQ(layout.nativeManifestFile(3), "shard_3/native_index/MANIFEST");
     EXPECT_EQ(layout.nativeManifestTemporaryFile(3), "shard_3/native_index/MANIFEST.tmp");
@@ -63,8 +54,6 @@ TEST(StorageLayoutTest, RelativeRootWithSpacesIsPreservedLexically) {
     EXPECT_EQ(layout.shardDir(1), "tenant data/primary/shard_1");
     EXPECT_EQ(layout.walFile(1, 10000000000ULL), "tenant data/primary/shard_1/10000000000.wal");
     EXPECT_EQ(layout.nativeSstableFile(1, 1000000), "tenant data/primary/shard_1/native_index/idx_1000000.sst");
-    EXPECT_EQ(layout.shardStagingTsmDir(1), "tenant data/primary/shard_1_new/tsm");
-    EXPECT_EQ(layout.rebalanceSplitTsmFile(1, 44), "tenant data/primary/shard_1_new/tsm/0_split_44.tsm");
     EXPECT_EQ(layout.placementFile(), "tenant data/primary/placement.json");
 }
 
@@ -97,18 +86,14 @@ TEST(StorageLayoutTest, LexicalNormalizationIsPurePathComposition) {
     EXPECT_EQ(layout.nativeIndexDir(9), normalized / "shard_9/native_index");
 }
 
-TEST(StorageLayoutTest, StagingBasenamesCannotEscapeTheirShard) {
+TEST(StorageLayoutTest, TsmBasenamesCannotEscapeTheirShard) {
     const timestar::StorageLayout layout("data");
     const fs::path nulFilename(std::string("safe\0.tsm", 9));
 
     EXPECT_THROW((void)layout.tsmFile(1, "../outside.tsm"), std::invalid_argument);
     EXPECT_THROW((void)layout.tsmFile(1, nulFilename), std::invalid_argument);
-    EXPECT_THROW((void)layout.shardStagingTsmFile(1, "../outside.tsm"), std::invalid_argument);
-    EXPECT_THROW((void)layout.shardStagingTsmFile(1, nulFilename), std::invalid_argument);
-    EXPECT_THROW((void)layout.shardStagingTsmFile(1, "nested/file.tsm"), std::invalid_argument);
-    EXPECT_THROW((void)layout.shardStagingTsmFile(1, "not-tsm.wal"), std::invalid_argument);
-    EXPECT_THROW((void)layout.rebalanceWalTsmFile(1, 2, "../outside"), std::invalid_argument);
-    EXPECT_THROW((void)layout.rebalanceWalTsmFile(1, 2, ""), std::invalid_argument);
+    EXPECT_THROW((void)layout.tsmFile(1, "nested/file.tsm"), std::invalid_argument);
+    EXPECT_THROW((void)layout.tsmFile(1, "not-tsm.wal"), std::invalid_argument);
 }
 
 TEST(StorageLayoutTest, NumericNamesCoverBoundariesWithoutTruncation) {

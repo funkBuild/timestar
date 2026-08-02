@@ -40,7 +40,7 @@ struct SeriesCompactionData {
     timestar::RevisionRange revRange;
 
     // String series only: dictionary carried from the single source file when
-    // the zero-copy path is taken. STR2 blocks store dictionary IDs, so the
+    // the zero-copy path is taken. STD1 blocks store dictionary IDs, so the
     // output file's index entry MUST persist this dictionary — otherwise every
     // value of the series becomes permanently undecodable after compaction.
     std::shared_ptr<const std::vector<std::string>> stringDictionary;

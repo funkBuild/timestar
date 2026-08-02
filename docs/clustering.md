@@ -118,7 +118,7 @@ The following are prerequisites, not networking tasks:
    constraint is core-count-based identity, not path plumbing.
 3. A core-owned TSM file may contain series from many virtual shards. It cannot
    be transferred as one placement group without filtering and rewriting.
-4. The current core-count rebalancer deliberately creates an empty NativeIndex,
+4. The retired core-count rebalancer deliberately created an empty NativeIndex,
    while TSM stores only `SeriesId128` rather than the measurement, tags, and
    field required to reconstruct discovery metadata.
 5. On this branch WAL immediate flush defaults to disabled, so a successful
@@ -135,8 +135,8 @@ The following are prerequisites, not networking tasks:
 8. `lib/cluster/scatter_gather.hpp` and storage-side partial aggregation are
    useful boundaries to retain and extend across machines.
 
-The unsafe automatic `ShardRebalancer` is already disabled: startup now runs
-the fail-closed `ShardStoreStartupSession` gate before any storage opens (see
+The unsafe automatic core-count rebalancer has been removed. Startup runs the
+fail-closed `ShardStoreStartupSession` gate before any storage opens (see
 [storage layout foundation](clustering-starting-point.md), Step 1). Once
 storage identity is decoupled from Seastar cores, changing `smp::count` will
 reassign local execution only and will not rewrite data.
@@ -241,7 +241,6 @@ A node record contains:
 
 - Node UUID and cluster UUID.
 - Client and inter-node endpoints.
-- Software and wire-protocol versions.
 - Capacity weight and storage class (deferred: v1 assumes homogeneous nodes —
   weight 1, no storage classes; the fields exist but only those values are
   accepted).

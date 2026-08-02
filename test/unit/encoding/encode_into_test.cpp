@@ -316,7 +316,7 @@ TEST(StringEncodeIntoTest, EmptyVector) {
     // encodeInto's header is structurally valid by checking the magic number.
     uint32_t magic;
     std::memcpy(&magic, buf.data.data(), 4);
-    EXPECT_EQ(magic, 0x53545247u);  // "STRG"
+    EXPECT_EQ(magic, 0x31525453u);  // "STR1"
 
     uint32_t count;
     std::memcpy(&count, buf.data.data() + 12, 4);
