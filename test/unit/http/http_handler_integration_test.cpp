@@ -55,7 +55,15 @@ protected:
 
     static void SetUpTestSuite() { expectedCwd = fs::current_path(); }
 
+    static void resetClusterHooks() {
+        HttpDeleteHandler::clusterDeleteHook = {};
+        HttpDeleteHandler::clusterPatternExpandHook = {};
+        HttpDeleteHandler::clusterDeletePlanHook = {};
+        HttpDeleteHandler::clusterDeletePlanLookupHook = {};
+    }
+
     void SetUp() override {
+        resetClusterHooks();
         // Recover from CWD corruption: if a previous test fixture (e.g.
         // WALSeastarTest) failed to restore the working directory, we must
         // restore it before cleaning shard directories.
@@ -65,7 +73,10 @@ protected:
         robustCleanShardDirectories();
     }
 
-    void TearDown() override { robustCleanShardDirectories(); }
+    void TearDown() override {
+        resetClusterHooks();
+        robustCleanShardDirectories();
+    }
 
     // More robust cleanup that tolerates partially-cleaned directories.
     // Uses the non-throwing overload of fs::remove_all and retries
@@ -1441,6 +1452,7 @@ TEST_F(HttpHandlerIntegrationTest, PartitionedRf3RejectsUnwiredPatternDiscoveryB
             ~ResetHook() {
                 HttpDeleteHandler::clusterDeleteHook = {};
                 HttpDeleteHandler::clusterPatternExpandHook = {};
+                HttpDeleteHandler::clusterDeletePlanHook = {};
             }
         } reset;
         ScopedShardedEngine eng;
@@ -1458,7 +1470,7 @@ TEST_F(HttpHandlerIntegrationTest, PartitionedRf3RejectsUnwiredPatternDiscoveryB
         auto rep = handler.handleDelete(std::move(req)).get();
         EXPECT_EQ(rep->_status, seastar::http::reply::status_type::not_implemented);
         EXPECT_EQ(calls, 0u) << "the exact prefix of a mixed batch must not partially commit";
-        EXPECT_NE(rep->_content.find("expansion plan is replicated"), std::string::npos);
+        EXPECT_NE(rep->_content.find("frozen expansion plan"), std::string::npos);
     })
         .join()
         .get();
@@ -1470,6 +1482,7 @@ TEST_F(HttpHandlerIntegrationTest, PartitionedRf3RejectsPatternBeforeExpansionOr
             ~ResetHook() {
                 HttpDeleteHandler::clusterDeleteHook = {};
                 HttpDeleteHandler::clusterPatternExpandHook = {};
+                HttpDeleteHandler::clusterDeletePlanHook = {};
             }
         } reset;
         ScopedShardedEngine eng;
@@ -1508,7 +1521,7 @@ TEST_F(HttpHandlerIntegrationTest, PartitionedRf3RejectsPatternBeforeExpansionOr
         EXPECT_EQ(expansions, 0u);
         EXPECT_EQ(proposals, 0u);
         EXPECT_TRUE(proposedKeys.empty());
-        EXPECT_NE(reply->_content.find("expansion plan is replicated"), std::string::npos);
+        EXPECT_NE(reply->_content.find("frozen expansion plan"), std::string::npos);
     })
         .join()
         .get();
@@ -1520,6 +1533,7 @@ TEST_F(HttpHandlerIntegrationTest, PartitionedRf3ExpansionFailureLeavesExactPref
             ~ResetHook() {
                 HttpDeleteHandler::clusterDeleteHook = {};
                 HttpDeleteHandler::clusterPatternExpandHook = {};
+                HttpDeleteHandler::clusterDeletePlanHook = {};
             }
         } reset;
         ScopedShardedEngine eng;
@@ -1534,15 +1548,26 @@ TEST_F(HttpHandlerIntegrationTest, PartitionedRf3ExpansionFailureLeavesExactPref
             return seastar::make_exception_future<std::vector<std::string>>(
                 timestar::data::RetryableWriteError("catalog leader unavailable"));
         };
+        HttpDeleteHandler::clusterDeletePlanLookupHook = [](SeriesId128, SeriesId128, uint64_t) {
+            return seastar::make_ready_future<
+                std::optional<std::vector<timestar::data::DeleteRangeTarget>>>(std::nullopt);
+        };
+        HttpDeleteHandler::clusterDeletePlanHook =
+            [](SeriesId128, SeriesId128, uint64_t,
+               std::vector<timestar::data::DeleteRangeTarget> targets) {
+                ADD_FAILURE() << "a failed catalog expansion reached the plan-freeze step";
+                return seastar::make_ready_future<std::vector<timestar::data::DeleteRangeTarget>>(
+                    std::move(targets));
+            };
 
         HttpDeleteHandler handler(&eng.eng, true);
         auto request = makeDeleteRequest(
             R"({"deletes":[{"series":"exact value","startTime":0,"endTime":1},{"measurement":"m","startTime":0,"endTime":1}]})");
         auto reply = handler.handleDelete(std::move(request)).get();
-        EXPECT_EQ(reply->_status, seastar::http::reply::status_type::not_implemented);
+        EXPECT_EQ(reply->_status, seastar::http::reply::status_type::service_unavailable);
         EXPECT_EQ(proposals, 0u);
-        EXPECT_EQ(reply->_headers.count("Retry-After"), 0u);
-        EXPECT_NE(reply->_content.find("expansion plan is replicated"), std::string::npos);
+        EXPECT_EQ(reply->_headers["Retry-After"], "1");
+        EXPECT_NE(reply->_content.find("catalog leader unavailable"), std::string::npos);
     })
         .join()
         .get();
@@ -1554,6 +1579,7 @@ TEST_F(HttpHandlerIntegrationTest, PartitionedRf3BroadPatternFailsBeforeMutation
             ~ResetHook() {
                 HttpDeleteHandler::clusterDeleteHook = {};
                 HttpDeleteHandler::clusterPatternExpandHook = {};
+                HttpDeleteHandler::clusterDeletePlanHook = {};
             }
         } reset;
         ScopedShardedEngine eng;
@@ -1568,12 +1594,273 @@ TEST_F(HttpHandlerIntegrationTest, PartitionedRf3BroadPatternFailsBeforeMutation
             return seastar::make_exception_future<std::vector<std::string>>(
                 timestar::data::DeleteExpansionLimitError("pattern exceeds safety limit"));
         };
+        HttpDeleteHandler::clusterDeletePlanLookupHook = [](SeriesId128, SeriesId128, uint64_t) {
+            return seastar::make_ready_future<
+                std::optional<std::vector<timestar::data::DeleteRangeTarget>>>(std::nullopt);
+        };
+        HttpDeleteHandler::clusterDeletePlanHook =
+            [](SeriesId128, SeriesId128, uint64_t,
+               std::vector<timestar::data::DeleteRangeTarget> targets) {
+                ADD_FAILURE() << "an oversized expansion reached the plan-freeze step";
+                return seastar::make_ready_future<std::vector<timestar::data::DeleteRangeTarget>>(
+                    std::move(targets));
+            };
 
         HttpDeleteHandler handler(&eng.eng, true);
         auto reply = handler.handleDelete(makeDeleteRequest(R"({"measurement":"m"})")).get();
-        EXPECT_EQ(reply->_status, seastar::http::reply::status_type::not_implemented);
+        EXPECT_EQ(reply->_status, seastar::http::reply::status_type::bad_request);
         EXPECT_EQ(proposals, 0u);
-        EXPECT_NE(reply->_content.find("expansion plan is replicated"), std::string::npos);
+        EXPECT_NE(reply->_content.find("pattern exceeds safety limit"), std::string::npos);
+    })
+        .join()
+        .get();
+}
+
+TEST_F(HttpHandlerIntegrationTest, PartitionedRf3RetryUsesFirstFrozenPatternExpansion) {
+    seastar::thread([] {
+        struct ResetHook {
+            ~ResetHook() {
+                HttpDeleteHandler::clusterDeleteHook = {};
+                HttpDeleteHandler::clusterPatternExpandHook = {};
+                HttpDeleteHandler::clusterDeletePlanHook = {};
+            }
+        } reset;
+        ScopedShardedEngine eng;
+        eng.start();
+
+        const std::string firstKey = buildSeriesKey("m", {{"host", "a"}}, "value");
+        const std::string laterKey = buildSeriesKey("m", {{"host", "later"}}, "value");
+        unsigned expansions = 0;
+        unsigned freezes = 0;
+        unsigned lookups = 0;
+        std::vector<timestar::data::DeleteRangeTarget> frozen;
+        std::vector<std::string> proposed;
+        SeriesId128 frozenRequestId;
+        SeriesId128 frozenFingerprint;
+        uint64_t frozenIssuedAtMs = 0;
+
+        HttpDeleteHandler::clusterPatternExpandHook =
+            [&](timestar::data::PatternSeriesSelector, uint32_t) {
+                ++expansions;
+                std::vector<std::string> keys{firstKey};
+                if (expansions > 1)
+                    keys.push_back(laterKey);
+                return seastar::make_ready_future<std::vector<std::string>>(std::move(keys));
+            };
+        HttpDeleteHandler::clusterDeletePlanLookupHook =
+            [&](SeriesId128 requestId, SeriesId128 fingerprint, uint64_t issuedAtMs) {
+                ++lookups;
+                if (frozen.empty())
+                    return seastar::make_ready_future<
+                        std::optional<std::vector<timestar::data::DeleteRangeTarget>>>(std::nullopt);
+                EXPECT_EQ(requestId, frozenRequestId);
+                EXPECT_EQ(fingerprint, frozenFingerprint);
+                EXPECT_EQ(issuedAtMs, frozenIssuedAtMs);
+                return seastar::make_ready_future<
+                    std::optional<std::vector<timestar::data::DeleteRangeTarget>>>(frozen);
+            };
+        HttpDeleteHandler::clusterDeletePlanHook =
+            [&](SeriesId128 requestId, SeriesId128 fingerprint, uint64_t issuedAtMs,
+                std::vector<timestar::data::DeleteRangeTarget> candidates) {
+                ++freezes;
+                if (freezes == 1) {
+                    EXPECT_NE(requestId, SeriesId128{});
+                    EXPECT_NE(fingerprint, SeriesId128{});
+                    EXPECT_NE(issuedAtMs, 0u);
+                    EXPECT_EQ(candidates.size(), 1u);
+                    frozenRequestId = requestId;
+                    frozenFingerprint = fingerprint;
+                    frozenIssuedAtMs = issuedAtMs;
+                    frozen = std::move(candidates);
+                } else {
+                    ADD_FAILURE() << "a retry re-froze instead of loading the retained plan";
+                }
+                return seastar::make_ready_future<std::vector<timestar::data::DeleteRangeTarget>>(frozen);
+            };
+        HttpDeleteHandler::clusterDeleteHook =
+            [&](std::vector<timestar::data::DeleteRangeTarget> targets, SeriesId128, uint64_t) {
+                for (auto& target : targets)
+                    proposed.push_back(std::move(target.seriesKey));
+                return seastar::make_ready_future<>();
+            };
+
+        HttpDeleteHandler handler(&eng.eng, true);
+        constexpr std::string_view body =
+            R"({"measurement":"m","tags":{},"fields":["value"],"startTime":10,"endTime":20})";
+        auto firstReply = handler.handleDelete(makeDeleteRequest(std::string(body))).get();
+        ASSERT_TRUE(isOk(*firstReply)) << firstReply->_content;
+        EXPECT_EQ(proposed, (std::vector<std::string>{firstKey}));
+
+        proposed.clear();
+        auto retryReply = handler.handleDelete(makeDeleteRequest(std::string(body))).get();
+        ASSERT_TRUE(isOk(*retryReply)) << retryReply->_content;
+        EXPECT_EQ(lookups, 2u);
+        EXPECT_EQ(expansions, 1u) << "a retained plan must bypass a changed or unavailable catalog";
+        EXPECT_EQ(freezes, 1u);
+        EXPECT_EQ(proposed, (std::vector<std::string>{firstKey}));
+        EXPECT_EQ(retryReply->_content.find(laterKey), decltype(retryReply->_content)::npos)
+            << "a series created after the first attempt escaped the frozen plan";
+    })
+        .join()
+        .get();
+}
+
+TEST_F(HttpHandlerIntegrationTest, PartitionedRf3RetryPreservesFrozenEmptyPatternExpansion) {
+    seastar::thread([] {
+        struct ResetHook {
+            ~ResetHook() {
+                HttpDeleteHandler::clusterDeleteHook = {};
+                HttpDeleteHandler::clusterPatternExpandHook = {};
+                HttpDeleteHandler::clusterDeletePlanHook = {};
+            }
+        } reset;
+        ScopedShardedEngine eng;
+        eng.start();
+
+        const std::string laterKey = buildSeriesKey("m", {{"host", "later"}}, "value");
+        unsigned expansions = 0;
+        unsigned freezes = 0;
+        unsigned lookups = 0;
+        unsigned proposals = 0;
+        bool planStored = false;
+        std::vector<timestar::data::DeleteRangeTarget> frozen;
+        HttpDeleteHandler::clusterPatternExpandHook =
+            [&](timestar::data::PatternSeriesSelector, uint32_t) {
+                ++expansions;
+                return seastar::make_ready_future<std::vector<std::string>>(
+                    expansions == 1 ? std::vector<std::string>{} : std::vector<std::string>{laterKey});
+            };
+        HttpDeleteHandler::clusterDeletePlanLookupHook =
+            [&](SeriesId128, SeriesId128, uint64_t) {
+                ++lookups;
+                if (!planStored)
+                    return seastar::make_ready_future<
+                        std::optional<std::vector<timestar::data::DeleteRangeTarget>>>(std::nullopt);
+                return seastar::make_ready_future<
+                    std::optional<std::vector<timestar::data::DeleteRangeTarget>>>(frozen);
+            };
+        HttpDeleteHandler::clusterDeletePlanHook =
+            [&](SeriesId128, SeriesId128, uint64_t,
+                std::vector<timestar::data::DeleteRangeTarget> candidates) {
+                ++freezes;
+                if (freezes == 1) {
+                    EXPECT_TRUE(candidates.empty());
+                    frozen = std::move(candidates);
+                    planStored = true;
+                } else {
+                    ADD_FAILURE() << "an empty retained plan was mistaken for a lookup miss";
+                }
+                return seastar::make_ready_future<std::vector<timestar::data::DeleteRangeTarget>>(frozen);
+            };
+        HttpDeleteHandler::clusterDeleteHook =
+            [&](std::vector<timestar::data::DeleteRangeTarget>, SeriesId128, uint64_t) {
+                ++proposals;
+                return seastar::make_ready_future<>();
+            };
+
+        HttpDeleteHandler handler(&eng.eng, true);
+        constexpr std::string_view body = R"({"measurement":"m","startTime":0,"endTime":1})";
+        auto firstReply = handler.handleDelete(makeDeleteRequest(std::string(body))).get();
+        auto retryReply = handler.handleDelete(makeDeleteRequest(std::string(body))).get();
+        ASSERT_TRUE(isOk(*firstReply)) << firstReply->_content;
+        ASSERT_TRUE(isOk(*retryReply)) << retryReply->_content;
+        EXPECT_EQ(lookups, 2u);
+        EXPECT_EQ(expansions, 1u) << "an empty retained plan must still bypass later catalog growth";
+        EXPECT_EQ(freezes, 1u);
+        EXPECT_EQ(proposals, 0u);
+        EXPECT_NE(retryReply->_content.find(R"("seriesDeleted":0)"), std::string::npos);
+        EXPECT_EQ(retryReply->_content.find(laterKey), decltype(retryReply->_content)::npos);
+    })
+        .join()
+        .get();
+}
+
+TEST_F(HttpHandlerIntegrationTest, PartitionedRf3PlanFreezeFailureLeavesEveryTargetUntouched) {
+    seastar::thread([] {
+        struct ResetHook {
+            ~ResetHook() {
+                HttpDeleteHandler::clusterDeleteHook = {};
+                HttpDeleteHandler::clusterPatternExpandHook = {};
+                HttpDeleteHandler::clusterDeletePlanHook = {};
+            }
+        } reset;
+        ScopedShardedEngine eng;
+        eng.start();
+
+        unsigned proposals = 0;
+        HttpDeleteHandler::clusterPatternExpandHook = [](timestar::data::PatternSeriesSelector, uint32_t) {
+            return seastar::make_ready_future<std::vector<std::string>>(
+                std::vector<std::string>{buildSeriesKey("m", {{"host", "a"}}, "value")});
+        };
+        HttpDeleteHandler::clusterDeletePlanLookupHook = [](SeriesId128, SeriesId128, uint64_t) {
+            return seastar::make_ready_future<
+                std::optional<std::vector<timestar::data::DeleteRangeTarget>>>(std::nullopt);
+        };
+        HttpDeleteHandler::clusterDeletePlanHook =
+            [](SeriesId128, SeriesId128, uint64_t, std::vector<timestar::data::DeleteRangeTarget>) {
+                return seastar::make_exception_future<std::vector<timestar::data::DeleteRangeTarget>>(
+                    timestar::data::RetryableWriteError("group-0 leader unavailable"));
+            };
+        HttpDeleteHandler::clusterDeleteHook =
+            [&](std::vector<timestar::data::DeleteRangeTarget>, SeriesId128, uint64_t) {
+                ++proposals;
+                return seastar::make_ready_future<>();
+            };
+
+        HttpDeleteHandler handler(&eng.eng, true);
+        auto reply = handler.handleDelete(makeDeleteRequest(
+            R"({"deletes":[{"series":"exact value","startTime":0,"endTime":1},{"measurement":"m","startTime":0,"endTime":1}]})"))
+                         .get();
+        EXPECT_EQ(reply->_status, seastar::http::reply::status_type::service_unavailable);
+        EXPECT_EQ(reply->_headers["Retry-After"], "1");
+        EXPECT_EQ(proposals, 0u) << "the exact prefix committed before group 0 froze the whole expansion";
+        EXPECT_NE(reply->_content.find("group-0 leader unavailable"), std::string::npos);
+    })
+        .join()
+        .get();
+}
+
+TEST_F(HttpHandlerIntegrationTest, PartitionedRf3ReportsFrozenPlanIdentityConflict) {
+    seastar::thread([] {
+        struct ResetHook {
+            ~ResetHook() {
+                HttpDeleteHandler::clusterDeleteHook = {};
+                HttpDeleteHandler::clusterPatternExpandHook = {};
+                HttpDeleteHandler::clusterDeletePlanHook = {};
+            }
+        } reset;
+        ScopedShardedEngine eng;
+        eng.start();
+
+        unsigned proposals = 0;
+        HttpDeleteHandler::clusterPatternExpandHook = [](timestar::data::PatternSeriesSelector, uint32_t) {
+            ADD_FAILURE() << "an identity conflict reached catalog discovery";
+            return seastar::make_ready_future<std::vector<std::string>>(
+                std::vector<std::string>{buildSeriesKey("m", {}, "value")});
+        };
+        HttpDeleteHandler::clusterDeletePlanLookupHook = [](SeriesId128, SeriesId128, uint64_t) {
+            return seastar::make_exception_future<
+                std::optional<std::vector<timestar::data::DeleteRangeTarget>>>(
+                timestar::data::DeletePlanConflictError("the key already names another retained request"));
+        };
+        HttpDeleteHandler::clusterDeletePlanHook =
+            [](SeriesId128, SeriesId128, uint64_t, std::vector<timestar::data::DeleteRangeTarget>) {
+                ADD_FAILURE() << "an identity conflict reached catalog discovery/plan freeze";
+                return seastar::make_ready_future<std::vector<timestar::data::DeleteRangeTarget>>(
+                    std::vector<timestar::data::DeleteRangeTarget>{});
+            };
+        HttpDeleteHandler::clusterDeleteHook =
+            [&](std::vector<timestar::data::DeleteRangeTarget>, SeriesId128, uint64_t) {
+                ++proposals;
+                return seastar::make_ready_future<>();
+            };
+
+        HttpDeleteHandler handler(&eng.eng, true);
+        auto reply = handler.handleDelete(makeDeleteRequest(R"({"measurement":"m"})")).get();
+        EXPECT_EQ(reply->_status, seastar::http::reply::status_type::conflict);
+        EXPECT_EQ(proposals, 0u);
+        EXPECT_NE(reply->_content.find("DELETE_IDEMPOTENCY_CONFLICT"), std::string::npos);
+        EXPECT_EQ(reply->_headers.count("Retry-After"), 0u);
     })
         .join()
         .get();
@@ -1585,6 +1872,7 @@ TEST_F(HttpHandlerIntegrationTest, PartitionedRf3PartialMultiTargetFailureIsSafe
             ~ResetHook() {
                 HttpDeleteHandler::clusterDeleteHook = {};
                 HttpDeleteHandler::clusterPatternExpandHook = {};
+                HttpDeleteHandler::clusterDeletePlanHook = {};
             }
         } reset;
         ScopedShardedEngine eng;

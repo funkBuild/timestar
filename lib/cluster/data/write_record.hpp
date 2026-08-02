@@ -170,12 +170,18 @@ constexpr uint32_t kWriteBatchFormatV4 = 4;
 // voters outside the pairwise data-plane handshake.
 constexpr uint32_t kWriteBatchFormatV5 = 5;
 
+// v6 gates the group-0 frozen pattern-delete plan command and snapshot trailer.
+// It changes neither WriteBatch bytes nor a data-plane RPC frame, but it must
+// consume a new point on the cluster's single ordered capability line: a v5
+// group-0 voter cannot decode StoreFrozenDeletePlan (command tag 14).
+constexpr uint32_t kWriteBatchFormatV6 = 6;
+
 // The newest version this binary supports. Every place that advertises this node's
 // capability must use THIS, never the literal that happens to be current: naming v2 in
 // ClusterDataPlane after v3 landed capped every negotiation at 2, so no peer spoke the
 // hinted-propose verb and the leader-hint path was dead in production while every test
 // passed (tests construct their own DataPlaneRpc, whose default was already correct).
-constexpr uint32_t kWriteBatchFormatMax = kWriteBatchFormatV5;
+constexpr uint32_t kWriteBatchFormatMax = kWriteBatchFormatV6;
 
 // Wire codec (bounds-checked; decode returns nullopt on ANY malformed/truncated/
 // inconsistent input so a hostile frame can never fabricate a batch). Bounds-checking

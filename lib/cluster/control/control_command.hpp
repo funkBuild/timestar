@@ -80,6 +80,13 @@ struct AdmitWithToken {
     std::string token;
 };
 
+// Atomically freeze a complete bounded pattern-delete expansion before any
+// data-group proposal. An exact retry with the same request identity returns
+// the stored plan; a later catalog expansion can never replace it.
+struct StoreFrozenDeletePlan {
+    FrozenDeletePlan plan;
+};
+
 // Activate a storage/log wire-format version cluster-wide (rolling-upgrade,
 // decision 8). `coveredVoters` is the canonical union of the stable group-0
 // voters and every voter in the committed serving map whose capability the
@@ -99,7 +106,7 @@ struct SetInitialServingMap {
 
 using ControlCommand =
     std::variant<InitCluster, UpsertNode, SetNodeState, SetDesiredPlacement, SetMetaVoters, CasPolicy,
-                 SetControllerTerm, UpsertJob, MintJoinToken, AdmitWithToken, SetActiveVersion,
+                 SetControllerTerm, UpsertJob, MintJoinToken, AdmitWithToken, StoreFrozenDeletePlan, SetActiveVersion,
                  SetInitialServingMap>;
 
 // Wire serialization for a command (the Raft entry payload). Length-prefixed,

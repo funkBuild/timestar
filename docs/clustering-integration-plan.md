@@ -347,9 +347,12 @@ the same partial-merge code once more over node partials.
   scatter to all owner nodes, union/HLL-merge — same merge shapes as the
   cross-core versions. The originally planned owner-broadcast pattern delete is
   superseded: expansion can change across an ambiguous retry and delete a newly
-  created series. Production now rejects pattern and mixed-pattern requests
-  before discovery or proposal; re-enablement requires a replicated immutable
-  expansion plan or an equivalently bounded selector command.
+  created series. The implemented replacement takes a quorum-fenced catalog
+  view, freezes the whole bounded canonical expansion in group 0 before any data
+  proposal, and consults that snapshot-durable plan before rediscovery on retry.
+  It is separately gated at cluster format v6. Production activation, group-0
+  request forwarding, and the external pattern failover/restart gate remain
+  release blockers.
 
 ### Subscribe guard + operator surface
 
@@ -676,16 +679,20 @@ Tasks:
    pinned by the brick's gate).
 5. Remaining operator/metrics surface per plan §"Observability".
 
-Current feature-gating slice (`9ecd0e6`): pairwise protocol negotiation now
-advertises through v5 and refuses bounded delete tag 5/`Expired` exchanges with
-older peers. The cluster-wide emission gate independently refuses snapshot
+Current feature-gating work (`9ecd0e6` plus the frozen-plan slice): pairwise
+protocol negotiation now advertises through v6 and refuses bounded delete tag
+5/`Expired` exchanges with older peers. The cluster-wide emission gate
+independently refuses snapshot
 payload v2-v4 and durable receipt command tags until their committed activation
-(v2, v3, and v5 respectively). Readiness exposes and enforces the snapshot
-minimum. This is deliberately partial: the production server still has no live
-group-0 composition/bridge, activation currently reasons about meta-voters
-rather than the union of data voters, and the docker mixed-binary gate has not
-run. Those are task 3's remaining production blockers; no static configuration
-bypass may raise the gate.
+(v2, v3, and v5 respectively); v6 additionally gates the group-0 frozen
+pattern-plan command and snapshot trailer. Readiness exposes and enforces the
+snapshot minimum. Production group 0 and the all-shard publication bridge are
+now composed, and activation validates the union of stable meta-voters and
+committed data voters. This remains partial because no identity-bound production
+capability collector/join rule safely originates an activation, legacy receipt
+preflight and mixed-binary gates are missing, and control requests are not
+forwarded to the group-0 leader. No static configuration bypass may raise the
+gate.
 
 **Re-opens:** the SSE handler's node-local guard (deliberately — that guard
 exists to be replaced by exactly this). **Defers:** hot-series lanes (out of

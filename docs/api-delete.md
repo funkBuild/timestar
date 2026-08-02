@@ -7,11 +7,10 @@ Delete time series data by series key, structured query, pattern match, or batch
 
 ## Clustered Mode
 
-Partitioned RF&gt;1 mode currently accepts only exact targets: either `series`, or
-`measurement` plus one `field` and the complete tag set. RF=1 delete is
-unavailable. Requests using `fields`, omitting a field, or mixing an exact target
-with a pattern return `501` before discovery or mutation. Pattern deletes remain
-available in non-partitioned mode.
+Partitioned RF&gt;1 mode has replicated paths for exact and pattern targets. RF=1
+delete is unavailable. Exact targets require cluster format v5; pattern or mixed
+batches require v6. An incompletely wired pattern path returns `501` before
+discovery or mutation. Pattern deletes remain available in non-partitioned mode.
 
 Exact RF&gt;1 deletion uses bounded receipt command tag 5 and is accepted only
 after group 0 has committed cluster format v5. Until then the request fails
@@ -19,9 +18,10 @@ before any Raft proposal with HTTP `409` and JSON code
 `CLUSTER_FORMAT_NOT_ACTIVE`. The server can now opt into a persistent group-0
 host, and an already committed activation is published to every reactor-local
 data gate before group 0 advances its applied boundary. No production path can
-yet safely originate that activation because data-voter capability and legacy
-receipt preflight are incomplete. This operation is therefore intentionally
-unavailable and cluster readiness remains false; do not deploy it as a
+yet safely originate activation because data-voter capability collection and
+legacy receipt preflight are incomplete. Pattern plans also require v6. These
+operations are therefore intentionally unavailable in the current production
+composition and cluster readiness remains false; do not deploy them as a
 production delete path.
 
 Every RF&gt;1 request must include both of these headers:
@@ -30,9 +30,11 @@ Every RF&gt;1 request must include both of these headers:
 - `Idempotency-Key-Timestamp`: the request's Unix epoch time in milliseconds. It
   must be less than one hour old and no more than five minutes in the future.
 
-Retry an uncertain request with the same body and both original headers. The
-request body, key, and timestamp together identify the operation; changing any
-of them creates a different delete.
+Retry an uncertain request with the same body and both original headers. For an
+exact-only request, the body, key, and timestamp together derive each VShard
+operation ID. For a pattern or mixed request, group 0 additionally binds the key
+to that exact body and timestamp for the retained window; changing either while
+reusing the key is a conflict, not a new operation.
 
 ```bash
 DELETE_TS_MS="$(date +%s)000"
@@ -55,6 +57,21 @@ timestamp already outside the one-hour HTTP window returns `400`. In either
 case, reconcile the current data state; do not merely generate a new timestamp,
 because that would authorize a new delete which can erase intervening writes.
 
+For a pattern or mixed batch, the coordinator first checks group 0 for an
+existing plan. On a miss it discovers the complete target set against a
+quorum-fenced catalog view and commits that canonical set to group 0 before any
+VShard proposal. A retry therefore reuses the first expansion—even an empty
+one—without consulting a changed catalog. Reusing a retained idempotency key
+with a different body or original timestamp returns `409` with
+`DELETE_IDEMPOTENCY_CONFLICT`.
+
+One pattern plan is limited to 10,000 exact target/range triples and 512 KiB.
+Group 0 retains at most 1,024 plans and 16 MiB total for the one-hour retry
+window plus allowed clock skew. A full plan budget returns retryable `503` before
+any data proposal. Plan lookup and freeze currently execute only on the node
+that locally leads group 0; sending the request to another node also returns
+retryable `503` because control-request forwarding is not yet implemented.
+
 ## Delete by Structured Query
 
 ```bash
@@ -72,8 +89,9 @@ curl -X POST http://localhost:8086/delete \
 ## Delete by Pattern
 
 Use `fields`, or omit both `field` and `fields`, to select more than one exact
-series. Tags act as filters. This form is currently rejected in partitioned
-cluster mode.
+series. Tags act as filters. In partitioned cluster mode this form requires the
+same idempotency headers, committed format v6, and routing to the current local
+group-0 leader as described above.
 
 ```bash
 curl -X POST http://localhost:8086/delete \

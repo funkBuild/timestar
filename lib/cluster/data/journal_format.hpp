@@ -70,9 +70,13 @@ constexpr uint32_t kJournalV2ActivationVersion = 2;
 //       pairwise `Expired` proposal outcome. Version 4 was already consumed by
 //       the node-query redirect protocol, so one ordered capability line moves
 //       the bounded-delete feature to 5 rather than reusing 4 ambiguously.
+//   v6: group-0 frozen pattern-delete plans (command tag 14 plus the group-0
+//       snapshot trailer). It must not ride v5: a v5 voter predates both bytes.
 constexpr uint32_t kSnapshotV2ActivationVersion = 2;
 constexpr uint32_t kDeleteReceiptActivationVersion = 3;
 constexpr uint32_t kBoundedDeleteReceiptActivationVersion = 5;
+constexpr uint32_t kFrozenDeletePlanActivationVersion = 6;
+static_assert(kFrozenDeletePlanActivationVersion <= kWriteBatchFormatMax);
 
 // Per-shard, because a Seastar shard is a thread and this is read on the write hot path:
 // one thread_local load beats any synchronization. An activation is pushed to every shard

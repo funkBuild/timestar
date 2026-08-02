@@ -204,6 +204,15 @@ public:
     seastar::future<> writeFromShard(data::WriteBatch batch);
     seastar::future<> deleteRangesFromShard(std::vector<data::DeleteRangeTarget> targets, SeriesId128 operationId,
                                             uint64_t issuedAtMs);
+    // Persist and return the first complete target set for a pattern delete.
+    // Must run on shard 0 because group 0 is hosted there.
+    seastar::future<std::vector<data::DeleteRangeTarget>> freezeDeletePlan(
+        SeriesId128 requestId, SeriesId128 requestFingerprint, uint64_t issuedAtMs,
+        std::vector<data::DeleteRangeTarget> targets);
+    // Return a matching retained plan without repeating catalog discovery.
+    // nullopt means no plan exists and the caller may discover then freeze one.
+    seastar::future<std::optional<std::vector<data::DeleteRangeTarget>>> lookupDeletePlan(
+        SeriesId128 requestId, SeriesId128 requestFingerprint, uint64_t issuedAtMs);
     // Expand a pattern against a placement-epoch-pinned, quorum-fenced catalog
     // view. No mutation is proposed by this method.
     seastar::future<std::vector<std::string>> findPatternSeries(data::PatternSeriesSelector selector,

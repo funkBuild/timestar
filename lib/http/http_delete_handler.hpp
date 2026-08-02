@@ -115,8 +115,16 @@ public:
                                                               SeriesId128 operationId, uint64_t issuedAtMs)>;
     using ClusterPatternExpandHook = std::function<seastar::future<std::vector<std::string>>(
         timestar::data::PatternSeriesSelector selector, uint32_t maxSeries)>;
+    using ClusterDeletePlanHook = std::function<seastar::future<std::vector<timestar::data::DeleteRangeTarget>>(
+        SeriesId128 requestId, SeriesId128 requestFingerprint, uint64_t issuedAtMs,
+        std::vector<timestar::data::DeleteRangeTarget> candidateTargets)>;
+    using ClusterDeletePlanLookupHook =
+        std::function<seastar::future<std::optional<std::vector<timestar::data::DeleteRangeTarget>>>(
+            SeriesId128 requestId, SeriesId128 requestFingerprint, uint64_t issuedAtMs)>;
     static inline ClusterDeleteHook clusterDeleteHook{};
     static inline ClusterPatternExpandHook clusterPatternExpandHook{};
+    static inline ClusterDeletePlanHook clusterDeletePlanHook{};
+    static inline ClusterDeletePlanLookupHook clusterDeletePlanLookupHook{};
 
     struct DeleteRequest {
         std::string seriesKey;

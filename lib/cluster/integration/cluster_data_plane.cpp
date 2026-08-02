@@ -1260,6 +1260,119 @@ seastar::future<std::vector<std::string>> ClusterDataPlane::findPatternSeries(da
     co_return std::vector<std::string>(matchedKeys.begin(), matchedKeys.end());
 }
 
+seastar::future<std::vector<data::DeleteRangeTarget>> ClusterDataPlane::freezeDeletePlan(
+    SeriesId128 requestId, SeriesId128 requestFingerprint, uint64_t issuedAtMs,
+    std::vector<data::DeleteRangeTarget> targets) {
+    if (seastar::this_shard_id() != 0)
+        throw std::logic_error("ClusterDataPlane::freezeDeletePlan must run on shard 0");
+    if (!replicated_ || !shardsStarted_)
+        throw std::runtime_error("ClusterDataPlane::freezeDeletePlan requires replicated mode after start()");
+    // Freeze only requests whose eventual VShard command can be emitted. A
+    // premature plan is durable group-0 state: storing one while v6 is inactive
+    // would bind the client's key even though no data mutation was possible.
+    if (!data::JournalFormatGate::supports(data::kFrozenDeletePlanActivationVersion))
+        throw data::ClusterFormatUnsupportedError("frozen pattern deletes require committed cluster format v" +
+                                                  std::to_string(data::kFrozenDeletePlanActivationVersion) +
+                                                  ", but shard 0 has activated only v" +
+                                                  std::to_string(data::JournalFormatGate::activeVersion()));
+    auto* host = shards_.local().group0();
+    if (!host || !host->group() || !host->stateMachine())
+        throw data::RetryableWriteError("pattern delete requires the local group-0 host");
+
+    control::FrozenDeletePlan candidate;
+    candidate.requestId = requestId.toHex();
+    candidate.requestFingerprint = requestFingerprint.toHex();
+    candidate.issuedAtMs = issuedAtMs;
+    candidate.targets.reserve(targets.size());
+    for (auto& target : targets)
+        candidate.targets.push_back(
+            control::FrozenDeleteTarget{std::move(target.seriesKey), target.startTime, target.endTime});
+    if (!control::validFrozenDeletePlan(candidate))
+        throw data::WriteFrameTooLargeError(
+            "pattern delete expansion exceeds the bounded group-0 plan entry");
+
+    control::Group0Controller controller(*host->group(), *host->stateMachine());
+    control::FreezeDeletePlanResult result = co_await controller.freezeDeletePlan(std::move(candidate));
+    switch (result.status) {
+        case control::FreezeDeletePlanStatus::Stored: {
+            std::vector<data::DeleteRangeTarget> frozen;
+            frozen.reserve(result.plan.targets.size());
+            for (auto& target : result.plan.targets)
+                frozen.push_back(
+                    data::DeleteRangeTarget{std::move(target.seriesKey), target.startTime, target.endTime});
+            co_return frozen;
+        }
+        case control::FreezeDeletePlanStatus::NotLeader:
+            throw data::RetryableWriteError(
+                "pattern delete must be retried through the current group-0 leader");
+        case control::FreezeDeletePlanStatus::Conflict:
+            throw data::DeletePlanConflictError(
+                "Idempotency-Key is already bound to a different retained delete request");
+        case control::FreezeDeletePlanStatus::Capacity:
+            throw data::RetryableWriteError(
+                "group-0 frozen delete-plan capacity is full; retry after the oldest plan expires");
+        case control::FreezeDeletePlanStatus::FormatInactive:
+            throw data::ClusterFormatUnsupportedError(
+                "frozen pattern deletes require committed cluster format v" +
+                std::to_string(data::kFrozenDeletePlanActivationVersion));
+        case control::FreezeDeletePlanStatus::NotFound:
+            throw std::logic_error("freezeDeletePlan returned NotFound after proposing a plan");
+        case control::FreezeDeletePlanStatus::Invalid:
+            throw data::WriteFrameTooLargeError("pattern delete expansion cannot be encoded as one safe plan");
+    }
+    throw std::logic_error("unknown frozen delete-plan result");
+}
+
+seastar::future<std::optional<std::vector<data::DeleteRangeTarget>>> ClusterDataPlane::lookupDeletePlan(
+    SeriesId128 requestId, SeriesId128 requestFingerprint, uint64_t issuedAtMs) {
+    if (seastar::this_shard_id() != 0)
+        throw std::logic_error("ClusterDataPlane::lookupDeletePlan must run on shard 0");
+    if (!replicated_ || !shardsStarted_)
+        throw std::runtime_error("ClusterDataPlane::lookupDeletePlan requires replicated mode after start()");
+    if (!data::JournalFormatGate::supports(data::kFrozenDeletePlanActivationVersion))
+        throw data::ClusterFormatUnsupportedError("frozen pattern deletes require committed cluster format v" +
+                                                  std::to_string(data::kFrozenDeletePlanActivationVersion) +
+                                                  ", but shard 0 has activated only v" +
+                                                  std::to_string(data::JournalFormatGate::activeVersion()));
+    auto* host = shards_.local().group0();
+    if (!host || !host->group() || !host->stateMachine())
+        throw data::RetryableWriteError("pattern delete requires the local group-0 host");
+
+    control::FrozenDeletePlan request;
+    request.requestId = requestId.toHex();
+    request.requestFingerprint = requestFingerprint.toHex();
+    request.issuedAtMs = issuedAtMs;
+    control::Group0Controller controller(*host->group(), *host->stateMachine());
+    control::FreezeDeletePlanResult result = controller.lookupDeletePlan(request);
+    switch (result.status) {
+        case control::FreezeDeletePlanStatus::Stored: {
+            std::vector<data::DeleteRangeTarget> frozen;
+            frozen.reserve(result.plan.targets.size());
+            for (auto& target : result.plan.targets)
+                frozen.push_back(
+                    data::DeleteRangeTarget{std::move(target.seriesKey), target.startTime, target.endTime});
+            co_return std::optional<std::vector<data::DeleteRangeTarget>>(std::move(frozen));
+        }
+        case control::FreezeDeletePlanStatus::NotFound:
+            co_return std::nullopt;
+        case control::FreezeDeletePlanStatus::NotLeader:
+            throw data::RetryableWriteError(
+                "pattern delete must be retried through the current group-0 leader");
+        case control::FreezeDeletePlanStatus::Conflict:
+            throw data::DeletePlanConflictError(
+                "Idempotency-Key is already bound to a different retained delete request");
+        case control::FreezeDeletePlanStatus::FormatInactive:
+            throw data::ClusterFormatUnsupportedError(
+                "frozen pattern deletes require committed cluster format v" +
+                std::to_string(data::kFrozenDeletePlanActivationVersion));
+        case control::FreezeDeletePlanStatus::Invalid:
+            throw std::invalid_argument("invalid frozen pattern-delete request identity");
+        case control::FreezeDeletePlanStatus::Capacity:
+            throw std::logic_error("lookupDeletePlan returned a capacity result");
+    }
+    throw std::logic_error("unknown frozen delete-plan lookup result");
+}
+
 seastar::future<ClusterDataPlane::Status> ClusterDataPlane::status() const {
     Status st;
     if (!rt_)

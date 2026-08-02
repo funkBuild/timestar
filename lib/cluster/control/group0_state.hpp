@@ -3,10 +3,14 @@
 #include "control_map_cache.hpp"
 #include "../raft/raft_types.hpp"  // NodeId
 
+#include <algorithm>
 #include <cstdint>
+#include <cstddef>
+#include <limits>
 #include <map>
 #include <set>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace timestar::control {
@@ -53,6 +57,84 @@ struct PolicyCell {
     friend bool operator==(const PolicyCell&, const PolicyCell&) = default;
 };
 
+// One exact target captured by a quorum-fenced pattern expansion. Group 0
+// freezes the complete canonical target vector before any data-group mutation,
+// so an HTTP retry can never expand into a series created after the first
+// attempt.
+struct FrozenDeleteTarget {
+    std::string seriesKey;
+    uint64_t startTime = 0;
+    uint64_t endTime = 0;
+
+    friend bool operator==(const FrozenDeleteTarget&, const FrozenDeleteTarget&) = default;
+    friend bool operator<(const FrozenDeleteTarget& lhs, const FrozenDeleteTarget& rhs) {
+        return std::tie(lhs.seriesKey, lhs.startTime, lhs.endTime) <
+               std::tie(rhs.seriesKey, rhs.startTime, rhs.endTime);
+    }
+};
+
+struct FrozenDeletePlan {
+    std::string requestId;           // canonical 32-hex Idempotency-Key
+    std::string requestFingerprint;  // canonical 32-hex hash of the original request bytes
+    uint64_t issuedAtMs = 0;
+    std::vector<FrozenDeleteTarget> targets;  // sorted, unique; empty is a meaningful frozen no-op
+
+    friend bool operator==(const FrozenDeletePlan&, const FrozenDeletePlan&) = default;
+};
+
+inline constexpr size_t kMaxFrozenDeletePlanTargets = 10'000;
+inline constexpr size_t kMaxFrozenDeletePlanBytes = 512u << 10;
+inline constexpr size_t kMaxFrozenDeletePlans = 1'024;
+inline constexpr size_t kMaxFrozenDeletePlanAggregateBytes = 16u << 20;
+inline constexpr uint64_t kFrozenDeletePlanRetentionMs = 60u * 60u * 1'000u;
+inline constexpr uint64_t kFrozenDeletePlanFutureSkewMs = 5u * 60u * 1'000u;
+
+inline size_t frozenDeletePlanBytes(const FrozenDeletePlan& plan) {
+    // Include the ControlCommand tag so the per-entry limit describes the
+    // complete encoded Raft payload, not merely the nested plan fields.
+    size_t bytes = sizeof(uint8_t) + sizeof(uint64_t) * 4 + plan.requestId.size() +
+                   plan.requestFingerprint.size();
+    for (const auto& target : plan.targets) {
+        const size_t itemBytes = sizeof(uint64_t) * 3 + target.seriesKey.size();
+        if (bytes > std::numeric_limits<size_t>::max() - itemBytes)
+            return std::numeric_limits<size_t>::max();
+        bytes += itemBytes;
+    }
+    return bytes;
+}
+
+inline bool validFrozenDeletePlan(const FrozenDeletePlan& plan) {
+    const auto canonicalHex128 = [](const std::string& value) {
+        return value.size() == 32 && std::ranges::all_of(value, [](unsigned char c) {
+                   return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+               });
+    };
+    if (!canonicalHex128(plan.requestId) || !canonicalHex128(plan.requestFingerprint) || plan.issuedAtMs == 0 ||
+        plan.targets.size() > kMaxFrozenDeletePlanTargets || frozenDeletePlanBytes(plan) > kMaxFrozenDeletePlanBytes)
+        return false;
+    for (size_t i = 0; i < plan.targets.size(); ++i) {
+        const auto& target = plan.targets[i];
+        if (target.seriesKey.empty() || target.startTime > target.endTime ||
+            (i != 0 && !(plan.targets[i - 1] < target)))
+            return false;
+    }
+    return true;
+}
+
+inline bool sameFrozenDeleteRequest(const FrozenDeletePlan& lhs, const FrozenDeletePlan& rhs) {
+    return lhs.requestId == rhs.requestId && lhs.requestFingerprint == rhs.requestFingerprint &&
+           lhs.issuedAtMs == rhs.issuedAtMs;
+}
+
+// State-machine time is carried by the command rather than read from a wall
+// clock. The extra future-skew interval prevents a legally future-dated request
+// from retiring another request before its HTTP retry window has elapsed.
+inline bool frozenDeletePlanExpiredAt(const FrozenDeletePlan& plan, uint64_t candidateIssuedAtMs) {
+    constexpr uint64_t kRetainFor = kFrozenDeletePlanRetentionMs + kFrozenDeletePlanFutureSkewMs;
+    const uint64_t retireThrough = candidateIssuedAtMs > kRetainFor ? candidateIssuedAtMs - kRetainFor : 0;
+    return plan.issuedAtMs <= retireThrough;
+}
+
 // The full replicated group-0 control state. This is a deterministic function of
 // the committed command log; every field is rebuilt identically on every node.
 struct Group0State {
@@ -68,6 +150,7 @@ struct Group0State {
     std::map<std::string, PolicyCell> policies;                // schema/retention CAS cells
     std::map<std::string, Job> jobs;                           // jobs/<uuid>
     std::set<std::string> joinTokens;                          // valid unused group-0-minted join tokens
+    std::map<std::string, FrozenDeletePlan> frozenDeletePlans; // retry-stable pattern expansion plans
     uint32_t activeFormatVersion = 1;                          // active wire/storage format (rolling upgrade)
     std::vector<NodeId> activeFormatVoters;                    // canonical activation-time voter proof
 

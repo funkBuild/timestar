@@ -12,7 +12,7 @@
 `1f61f49`, `b2c7d0b`, `872f7e1`, `023d9c3`, `d5f4755`, `7f6d7e8`,
 `7760ebd`, `6557666`, `c8f28c8`, `445f1f0`, `8b8536d`, `6912dfb`,
 `ecb63a5`, `a03fe1d`, `8ae846c`, `9ecd0e6`, `66049e7`, `470d14c`,
-`3af373a`, `88c90b0`
+`3af373a`, `88c90b0`, `e4b74cb`
 
 **Scope:** The recent VShard/Raft cluster redesign, its production-server
 integration, the public HTTP surface, recovery paths, and the release evidence
@@ -25,13 +25,13 @@ used as evidence that the current server is production-ready.
 
 ## Implementation progress after the review
 
-Forty-eight remediation commits and the current CR-FIX-076 publication bridge are
-now recorded. Cluster release status
-remains **BLOCKED** because group 0/movement, atomic and retry-safe
-pattern-delete semantics, replicated retention, the large-snapshot path,
-sustained live receipt-retirement compaction evidence, and rolling wire-format
-compatibility remain open. The four previously stale live release gates now pass
-on the same executable candidate and no longer block release by themselves.
+Forty-nine remediation commits and the current CR-FIX-010 frozen-plan slice are
+now recorded. Cluster release status remains **BLOCKED** because group
+0/movement, group-0 request forwarding and the external pattern-delete
+failover/restart gate, replicated retention, the large-snapshot path, sustained
+live receipt-retirement compaction evidence, and rolling wire-format
+compatibility remain open. The four previously stale live release gates now
+pass on the same executable candidate and no longer block release by themselves.
 
 Completed and covered in this pass:
 
@@ -112,14 +112,20 @@ Completed and covered in this pass:
   then bound to the exact Raft boundary. Commit `8ae846c` resolves the identified
   implementation liveness defect; CR-FIX-065 retains only its sustained live
   delete-heavy/journal-reclamation evidence.
-  Pattern discovery infrastructure remains internally tested, but the public
-  clustered handler rejects every pattern or mixed-pattern batch before
-  expansion and proposal: re-expanding after a partial attempt could add a
-  concurrently created series that had no original operation receipt. RF=1
-  remains unsupported. Commits `6912dfb`, `ecb63a5`, and `a03fe1d` close the
-  named deterministic exact-delete failover, batching, and bounded-retention
-  gaps under CR-FIX-010; the external multi-process release gate remains
-  distinct.
+  Pattern and mixed-pattern batches now take a quorum-fenced catalog view and
+  freeze the complete canonical expansion in one bounded group-0 entry before
+  proposing any VShard delete. A retry looks up that plan before rediscovery,
+  including an empty no-op plan, so catalog growth cannot acquire new targets.
+  The request body and original timestamp are bound to the idempotency key;
+  conflicting reuse returns 409. Plans survive group-0 snapshots and are bounded
+  by 10,000 targets, 512 KiB per command, 1,024 retained requests, 16 MiB total,
+  and the one-hour retry window plus allowed clock skew. Emission is separately
+  gated at cluster format v6 so a v5 group-0 voter never sees the new command or
+  snapshot trailer. RF=1 remains unsupported. Production currently serves plan
+  lookup/freeze only on the node that locally leads group 0; another node returns
+  retryable 503 because control-request forwarding is not yet composed. The
+  external multi-process pattern leader-failover/restart gate also remains
+  outstanding.
 - Replicated startup now raises a low soft `RLIMIT_NOFILE` to 8,192 when the
   process hard limit permits it and otherwise fails before opening Engine or
   Raft state with a `LimitNOFILE`/`ulimit` diagnostic. `ClusterDataPlane::start`
@@ -1005,10 +1011,10 @@ is not completion.
   implementation.** Owner: HTTP/data path. **Done when:** the API returns an
   explicit unsupported/conflict response before changing local state, and a
   test proves no authenticated or forwarded-header variant bypasses the guard.
-  The guard remains active for RF=1, old peers, and every RF&gt;1 pattern or
-  mixed-pattern request. Exact targets alone use the partial CR-FIX-010
-  implementation; the discovery building block is not production-wired because
-  retrying its expansion can change the target set.
+  The guard remains active for RF=1, old cluster formats, and any incompletely
+  composed RF&gt;1 pattern path. Exact targets use the v5 receipt path; pattern and
+  mixed-pattern targets require the complete v6 lookup/discovery/freeze path.
+  No request may fall through to local or unfrozen mutation.
 - [x] **CR-FIX-002 — reject retention create/update/delete in partitioned mode
   until CR-FIX-040 is complete.** Owner: HTTP/control plane. **Done when:** no
   node-local policy mutation is possible through the public API in cluster mode.
@@ -1049,21 +1055,29 @@ is not completion.
   compacted-journal restart followed by a harmless old-delete retry.
   A three-real-Engine RF=3 test commits the delete, fails over leadership, retries,
   restarts a caught-up replica from its Engine directory and Raft journal, elects
-  that replica, and retries again; both retries preserve a later write. The
-  previously implemented v4 pattern discovery remains internally covered,
-  but production now fails every pattern or mixed-pattern request before
-  expansion/proposal because a retry could discover a concurrently created new
-  target. The batch codec rejects empty, duplicate, unsorted, oversize, and
-  cross-VShard input; HTTP preflights the exact encoded Raft-entry size and caps
-  concurrent VShard proposals at 32. Snapshot production refuses an unsafe
-  boundary older than the last receipt-floor advancement and exposes
+  that replica, and retries again; both retries preserve a later write. Pattern
+  and mixed batches now discover against the quorum-fenced catalog and then
+  commit one complete canonical frozen plan to group 0 before the first data
+  proposal. Lookup precedes discovery on retry, so the first expansion wins even
+  when the catalog changes or the frozen result is empty. The plan binds the
+  original body fingerprint and timestamp to its key, is persisted in group-0
+  snapshots, and is bounded to 10,000 targets/512 KiB per command, 1,024 plans,
+  16 MiB aggregate, and conservative one-hour retirement. Cluster capability v6
+  independently gates group-0 command tag 14 and its snapshot trailer; v5 still
+  gates the exact data command. The batch codec rejects empty, duplicate,
+  unsorted, oversize, and cross-VShard input; HTTP preflights the exact encoded
+  Raft-entry size and caps concurrent VShard proposals at 32. Snapshot
+  production refuses an unsafe boundary older than the last receipt-floor
+  advancement and exposes
   `snapshots_skipped_delete_state`. `8ae846c` derives an exact boundary from the
   first surviving active revision, advances delete-only snapshots directly, and
   conditionally rolls an active write barrier so the next sweep can compact.
   CR-FIX-065 retains the sustained live workload and journal-reclamation proof.
-  CR-FIX-010 remains open for a replicated/frozen pattern plan and the external
-  multi-process release gate. `445f1f0`, `8b8536d`, `6912dfb`, `ecb63a5`,
-  `a03fe1d`, `8ae846c`.
+  CR-FIX-010 remains open because plan lookup/freeze is currently local to the
+  group-0 leader (a request through another node fails retryably rather than
+  forwarding), and the external multi-process pattern leader-failover/restart
+  gate has not run. `445f1f0`, `8b8536d`, `6912dfb`, `ecb63a5`, `a03fe1d`,
+  `8ae846c` plus the current frozen-plan slice.
 - [ ] **CR-FIX-011 — define a self-contained VShard snapshot format.** Owner:
   snapshot/storage. Include catalog/index extract, data objects, tombstone
   objects or a proven materialised-delete boundary, and real content hashes.
@@ -1545,13 +1559,17 @@ is not completion.
   coverage; a later group-0 membership change does not invalidate the historical
   proof while every current data-serving replica remains covered. An injected
   failure/retry, fail-closed snapshot recovery, and membership-change regression
-  prove these fences; the affected 29 focused tests pass. **Still open:** add the
+  prove these fences; the affected 29 focused tests pass. Cluster format v6 now
+  additionally gates group-0 frozen pattern-delete command tag 14 and its
+  snapshot trailer; both deterministic apply and local emission refuse it under
+  v5, while decoders retain recovery compatibility. **Still open:** add the
   identity-bound capability collector and join
   admission rule that can safely originate an activation, preflight legacy
   receipt counts, and run old/new multi-process snapshot and command tests.
-  Because no production path originates an activation, this
-  fail-closed slice deliberately leaves clustered readiness false and bounded
-  deletes unavailable; it does not close this task. Once version N is committed,
+  Because no production path originates an activation, this fail-closed slice
+  deliberately leaves clustered readiness false, exact bounded deletes
+  unavailable below v5, and frozen pattern deletes unavailable below v6; it does
+  not close this task. Once version N is committed,
   the state machine cannot lower it and a binary whose maximum supported version
   is below N must not start against that data. Rollback requires restoring a
   complete pre-activation backup or rebuilding the cluster offline; rolling
@@ -1985,11 +2003,30 @@ socket targets had built; the correctly named `timestar_http_server` target was
 then built successfully. This is deterministic fail-closed coverage, not the
 mixed-binary evidence required to close CR-FIX-076.
 
+Frozen pattern-delete plan validation for the current CR-FIX-010 slice:
+
+```text
+control codec/state/controller, HTTP, and advertiser regressions: 43/43 passed
+broader partitioned RF3 delete and write-admission regressions:   25/25 passed
+timestar_unit_test:                                  built successfully (-j1)
+timestar_http_server:                                built successfully (-j1)
+all test processes:                                      --smp 1 --memory 1G
+compiler and test temporary directory:                         build/tmp
+git diff --check:                                                   passed
+```
+
+No live or multi-process server was started for this validation. The bounded
+single-job build and repository-local temporary directory avoid the host-memory
+and `/tmp` exhaustion seen in an earlier live run. This proves deterministic
+plan identity, first-writer behavior, snapshot recovery, limits, and HTTP
+lookup-first retry behavior; it is not the external RF=3 pattern failover gate.
+
 This closes the known exact-delete retry corruption path and bounds modern
-receipt memory, but not CR-FIX-010 as a whole. Pattern deletes need a replicated
-immutable expansion plan before re-enablement, and the external multi-process
-release gate remains required even though the deterministic RF=3
-leader-failure/replica-restart gate now passes. `8ae846c` removes CR-FIX-065's
+receipt memory, and the frozen group-0 plan closes the known pattern re-expansion
+corruption path, but not CR-FIX-010 as a whole. The production server still
+needs group-0 request forwarding (or an explicit leader redirect) and the
+external multi-process pattern gate; the deterministic exact-delete RF=3
+leader-failure/replica-restart gate already passes. `8ae846c` removes CR-FIX-065's
 known implementation starvation path; the sustained live workload must still
 show that snapshots keep advancing and journal bytes plateau or reclaim.
 CR-FIX-076 remains an activation blocker: `9ecd0e6` prevents unsafe emission and

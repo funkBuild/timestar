@@ -594,8 +594,14 @@ from the client's `Idempotency-Key`, `Idempotency-Key-Timestamp`, request bytes,
 and VShard. The client must retry the same body with both original headers.
 Receipts are bounded to one hour and the most recent 1,024 operations per VShard;
 once the replicated retirement floor has passed an identity, its retry fails
-terminally instead of executing again. Pattern deletes remain fail-closed until
-their target expansion is immutable and replicated.
+terminally instead of executing again. RF&gt;1 pattern deletes first freeze the
+complete quorum-fenced catalog expansion in group 0, keyed by the original
+request body and timestamp, before any data-group proposal. Retries look up the
+snapshot-durable plan before rediscovery, so new matching series cannot join an
+ambiguous retry. The group-0 command/snapshot feature is gated at cluster format
+v6. Until production can originate that activation and forward requests to the
+current group-0 leader, this path remains fail-closed or retryable rather than
+silently degrading.
 
 For writes, idempotency means *replica convergence*, not retry-invisibility across
 intervening operations: a retried write is a new log entry and can reappear after

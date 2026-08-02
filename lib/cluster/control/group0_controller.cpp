@@ -1,5 +1,7 @@
 #include "group0_controller.hpp"
 
+#include "../data/journal_format.hpp"
+
 #include <algorithm>
 #include <seastar/core/coroutine.hh>
 #include <set>
@@ -53,6 +55,53 @@ seastar::future<bool> Group0Controller::activateFormat(
     if (!co_await proposeCommand(SetActiveVersion{version, std::move(covered)}))
         co_return false;
     co_return sm_.state().activeFormatVersion >= version;
+}
+
+seastar::future<FreezeDeletePlanResult> Group0Controller::freezeDeletePlan(FrozenDeletePlan candidate) {
+    if (!g0_.isLeader())
+        co_return FreezeDeletePlanResult{FreezeDeletePlanStatus::NotLeader, {}};
+    if (sm_.state().activeFormatVersion < data::kFrozenDeletePlanActivationVersion)
+        co_return FreezeDeletePlanResult{FreezeDeletePlanStatus::FormatInactive, {}};
+    if (!validFrozenDeletePlan(candidate) || !isCompleteControlMap(sm_.state().servingMap))
+        co_return FreezeDeletePlanResult{FreezeDeletePlanStatus::Invalid, {}};
+
+    const auto classifyExisting = [&](const FrozenDeletePlan& existing) {
+        if (sameFrozenDeleteRequest(existing, candidate))
+            return FreezeDeletePlanResult{FreezeDeletePlanStatus::Stored, existing};
+        return FreezeDeletePlanResult{FreezeDeletePlanStatus::Conflict, existing};
+    };
+    if (auto found = sm_.state().frozenDeletePlans.find(candidate.requestId);
+        found != sm_.state().frozenDeletePlans.end() &&
+        !frozenDeletePlanExpiredAt(found->second, candidate.issuedAtMs))
+        co_return classifyExisting(found->second);
+
+    if (!co_await proposeCommand(StoreFrozenDeletePlan{candidate}))
+        co_return FreezeDeletePlanResult{FreezeDeletePlanStatus::NotLeader, {}};
+
+    // A racing controller/request may have won the same key. Inspect the
+    // applied state instead of assuming our proposal was the mutation: Raft
+    // commits deterministic no-ops as successfully as insertions.
+    if (auto found = sm_.state().frozenDeletePlans.find(candidate.requestId);
+        found != sm_.state().frozenDeletePlans.end())
+        co_return classifyExisting(found->second);
+    co_return FreezeDeletePlanResult{FreezeDeletePlanStatus::Capacity, {}};
+}
+
+FreezeDeletePlanResult Group0Controller::lookupDeletePlan(const FrozenDeletePlan& request) const {
+    if (!g0_.isLeader())
+        return {FreezeDeletePlanStatus::NotLeader, {}};
+    if (sm_.state().activeFormatVersion < data::kFrozenDeletePlanActivationVersion)
+        return {FreezeDeletePlanStatus::FormatInactive, {}};
+    if (!validFrozenDeletePlan(request) || !request.targets.empty() ||
+        !isCompleteControlMap(sm_.state().servingMap))
+        return {FreezeDeletePlanStatus::Invalid, {}};
+    auto found = sm_.state().frozenDeletePlans.find(request.requestId);
+    if (found == sm_.state().frozenDeletePlans.end() ||
+        frozenDeletePlanExpiredAt(found->second, request.issuedAtMs))
+        return {FreezeDeletePlanStatus::NotFound, {}};
+    if (sameFrozenDeleteRequest(found->second, request))
+        return {FreezeDeletePlanStatus::Stored, found->second};
+    return {FreezeDeletePlanStatus::Conflict, found->second};
 }
 
 seastar::future<> Group0Controller::initCluster(std::string clusterUuid, NodeRecord selfRecord) {

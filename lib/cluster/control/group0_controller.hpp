@@ -14,6 +14,21 @@
 
 namespace timestar::control {
 
+enum class FreezeDeletePlanStatus : uint8_t {
+    Stored,
+    NotFound,
+    NotLeader,
+    Conflict,
+    Capacity,
+    FormatInactive,
+    Invalid
+};
+
+struct FreezeDeletePlanResult {
+    FreezeDeletePlanStatus status = FreezeDeletePlanStatus::Invalid;
+    FrozenDeletePlan plan;
+};
+
 // Orchestrates the group-0 control plane on top of its RaftGroup: the bootstrap
 // ceremony, node admission, self-managed meta-voter membership (via joint
 // consensus), and controller-term stamping. All mutations are ordinary group-0
@@ -89,6 +104,16 @@ public:
     // validation.
     seastar::future<bool> activateFormat(
         uint32_t version, const std::map<raft::NodeId, features::VersionRange>& nodeVersions);
+
+    // Freeze a complete canonical pattern expansion in one group-0 entry before
+    // any data-group proposal. A same-request retry returns the first stored
+    // target vector even if a fresh catalog read found different series.
+    seastar::future<FreezeDeletePlanResult> freezeDeletePlan(FrozenDeletePlan candidate);
+
+    // Consult an already-frozen plan before repeating catalog discovery. The
+    // request identity carries an empty target vector; NotFound authorizes the
+    // caller to discover and then race safely through freezeDeletePlan().
+    FreezeDeletePlanResult lookupDeletePlan(const FrozenDeletePlan& request) const;
 
 private:
     raft::RaftGroup& g0_;

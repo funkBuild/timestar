@@ -826,6 +826,35 @@ int main(int argc, char** argv) {
                                 return g_clusterDataPlane.deleteRangesFromShard(std::move(targets), operationId,
                                                                                 issuedAtMs);
                             };
+                        // Pattern deletes first take a leader-fenced catalog
+                        // snapshot, then durably freeze that exact expansion in
+                        // group 0 before proposing any data-group tombstone.
+                        // Both coordinators live on shard 0; HTTP may run on any
+                        // shard, so make the ownership hop explicit.
+                        timestar::http::HttpDeleteHandler::clusterPatternExpandHook =
+                            [](timestar::data::PatternSeriesSelector selector, uint32_t maxSeries) {
+                                return seastar::smp::submit_to(
+                                    0u, [selector = std::move(selector), maxSeries]() mutable {
+                                        return g_clusterDataPlane.findPatternSeries(std::move(selector), maxSeries);
+                                    });
+                            };
+                        timestar::http::HttpDeleteHandler::clusterDeletePlanHook =
+                            [](SeriesId128 requestId, SeriesId128 requestFingerprint, uint64_t issuedAtMs,
+                               std::vector<timestar::data::DeleteRangeTarget> targets) {
+                                return seastar::smp::submit_to(
+                                    0u, [requestId, requestFingerprint, issuedAtMs,
+                                         targets = std::move(targets)]() mutable {
+                                        return g_clusterDataPlane.freezeDeletePlan(
+                                            requestId, requestFingerprint, issuedAtMs, std::move(targets));
+                                    });
+                            };
+                        timestar::http::HttpDeleteHandler::clusterDeletePlanLookupHook =
+                            [](SeriesId128 requestId, SeriesId128 requestFingerprint, uint64_t issuedAtMs) {
+                                return seastar::smp::submit_to(0u, [requestId, requestFingerprint, issuedAtMs] {
+                                    return g_clusterDataPlane.lookupDeletePlan(
+                                        requestId, requestFingerprint, issuedAtMs);
+                                });
+                            };
                     }
                     // Route metadata endpoints through the scatter+merge.
                     timestar::http::HttpMetadataHandler::clusterMetadataHook = [](timestar::data::MetadataRequest r) {

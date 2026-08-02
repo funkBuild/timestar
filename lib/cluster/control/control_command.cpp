@@ -112,6 +112,7 @@ enum : uint8_t {
     kSetActiveVersion = 11,
     kSetInitialServingMap = 12,
     kSetActiveVersionCovered = 13,
+    kStoreFrozenDeletePlan = 14,
 };
 
 void writeNode(Writer& w, const NodeRecord& r) {
@@ -174,6 +175,36 @@ ControlMap readControlMap(Reader& r) {
     return map;
 }
 
+void writeFrozenDeletePlan(Writer& w, const FrozenDeletePlan& plan) {
+    w.str(plan.requestId);
+    w.str(plan.requestFingerprint);
+    w.u64(plan.issuedAtMs);
+    w.u64(plan.targets.size());
+    for (const auto& target : plan.targets) {
+        w.str(target.seriesKey);
+        w.u64(target.startTime);
+        w.u64(target.endTime);
+    }
+}
+
+FrozenDeletePlan readFrozenDeletePlan(Reader& r) {
+    FrozenDeletePlan plan;
+    plan.requestId = r.str();
+    plan.requestFingerprint = r.str();
+    plan.issuedAtMs = r.u64();
+    const uint64_t count = r.u64();
+    constexpr uint64_t kMinimumTargetBytes = sizeof(uint64_t) * 3;
+    if (!r.ok || count > kMaxFrozenDeletePlanTargets ||
+        count > static_cast<uint64_t>(r.end - r.p) / kMinimumTargetBytes) {
+        r.ok = false;
+        return plan;
+    }
+    plan.targets.reserve(count);
+    for (uint64_t i = 0; i < count && r.ok; ++i)
+        plan.targets.push_back(FrozenDeleteTarget{r.str(), r.u64(), r.u64()});
+    return plan;
+}
+
 }  // namespace
 
 std::string encodeCommand(const ControlCommand& cmd) {
@@ -220,6 +251,9 @@ std::string encodeCommand(const ControlCommand& cmd) {
                 w.u8(kAdmitWithToken);
                 writeNode(w, c.record);
                 w.str(c.token);
+            } else if constexpr (std::is_same_v<T, StoreFrozenDeletePlan>) {
+                w.u8(kStoreFrozenDeletePlan);
+                writeFrozenDeletePlan(w, c.plan);
             } else if constexpr (std::is_same_v<T, SetActiveVersion>) {
                 w.u8(kSetActiveVersionCovered);
                 w.u64(c.version);
@@ -304,6 +338,12 @@ std::optional<ControlCommand> decodeCommand(const std::string& bytes) {
             AdmitWithToken c;
             c.record = readNode(r);
             c.token = r.str();
+            cmd = std::move(c);
+            break;
+        }
+        case kStoreFrozenDeletePlan: {
+            StoreFrozenDeletePlan c;
+            c.plan = readFrozenDeletePlan(r);
             cmd = std::move(c);
             break;
         }

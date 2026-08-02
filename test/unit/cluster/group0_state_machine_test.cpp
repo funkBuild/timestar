@@ -3,9 +3,13 @@
 // command wire codec (round-trip + truncation robustness). All pure -- no reactor.
 #include "../../../lib/cluster/control/control_command.hpp"
 #include "../../../lib/cluster/control/group0_state_machine.hpp"
+#include "../../../lib/cluster/data/journal_format.hpp"
 #include "../../../lib/core/vshard.hpp"
 
 #include <gtest/gtest.h>
+
+#include <cstdio>
+#include <seastar/core/thread.hh>
 
 using namespace timestar::control;
 
@@ -27,6 +31,11 @@ ControlMap completeServingMap(uint64_t epoch = 1) {
     for (uint16_t vshard = 0; vshard < timestar::VIRTUAL_SHARD_COUNT; ++vshard)
         map.placement.emplace(vshard, std::vector<NodeId>{1, 2, 3});
     return map;
+}
+
+FrozenDeletePlan deletePlan(char id, char fingerprint, uint64_t issuedAtMs,
+                            std::vector<FrozenDeleteTarget> targets = {}) {
+    return FrozenDeletePlan{std::string(32, id), std::string(32, fingerprint), issuedAtMs, std::move(targets)};
 }
 
 uint64_t readU64(const std::string& bytes, size_t& offset) {
@@ -61,6 +70,8 @@ TEST(ControlCommandCodecTest, RoundTripAllCommands) {
         UpsertJob{"job-1", 5, true, "move v42"},
         MintJoinToken{"tok-abc"},
         AdmitWithToken{node(8, "u8", "rack-h"), "tok-abc"},
+        StoreFrozenDeletePlan{deletePlan('1', 'a', 1'800'000'000'000,
+                                               {{"m,host=a value", 10, 20}})},
         SetActiveVersion{5, {1, 2, 3}},
         SetInitialServingMap{ControlMap{1, {{0, {1, 2, 3}}}, {{0, 7}}}},
     };
@@ -83,6 +94,10 @@ TEST(ControlCommandCodecTest, RoundTripAllCommands) {
     auto activation = decodeCommand(encodeCommand(SetActiveVersion{5, {1, 2, 3}}));
     ASSERT_TRUE(activation && std::holds_alternative<SetActiveVersion>(*activation));
     EXPECT_EQ(std::get<SetActiveVersion>(*activation).coveredVoters, (std::vector<NodeId>{1, 2, 3}));
+    auto plan = decodeCommand(encodeCommand(StoreFrozenDeletePlan{
+        deletePlan('1', 'a', 1'800'000'000'000, {{"m,host=a value", 10, 20}})}));
+    ASSERT_TRUE(plan && std::holds_alternative<StoreFrozenDeletePlan>(*plan));
+    EXPECT_EQ(std::get<StoreFrozenDeletePlan>(*plan).plan.targets[0].seriesKey, "m,host=a value");
 }
 
 TEST(ControlCommandCodecTest, TruncatedAndUnknownRejected) {
@@ -110,6 +125,15 @@ TEST(ControlCommandCodecTest, CoveredActivationCannotTruncateIntoLegacyActivatio
     auto decoded = decodeCommand(legacy);
     ASSERT_TRUE(decoded && std::holds_alternative<SetActiveVersion>(*decoded));
     EXPECT_TRUE(std::get<SetActiveVersion>(*decoded).coveredVoters.empty());
+}
+
+TEST(ControlCommandCodecTest, FrozenDeletePlanRejectsEveryTruncatedPrefix) {
+    const std::string full = encodeCommand(StoreFrozenDeletePlan{
+        deletePlan('1', 'a', 1'800'000'000'000,
+                   {{"m,host=a value", 10, 20}, {"m,host=b value", 30, 40}})});
+    for (size_t n = 0; n < full.size(); ++n)
+        EXPECT_FALSE(decodeCommand(full.substr(0, n)).has_value()) << "prefix " << n;
+    EXPECT_TRUE(decodeCommand(full).has_value());
 }
 
 TEST(ControlCommandCodecTest, NarrowFieldsAndEnumsFailClosed) {
@@ -268,6 +292,92 @@ TEST(Group0StateMachineTest, JoinTokenGatesAdmission) {
     // Replaying the same token is rejected (already consumed).
     EXPECT_FALSE(sm.applyCommand(AdmitWithToken{node(6, "u6", "rack-f"), "tok-1"}));
     EXPECT_EQ(sm.state().nodes.count(6), 0u);
+}
+
+TEST(Group0StateMachineTest, FrozenDeletePlanIsFirstWriterWinsAndSnapshotDurable) {
+    Group0StateMachine sm;
+    const auto original = deletePlan('1', 'a', 1'800'000'000'000,
+                                     {{"m,host=a value", 10, 20}});
+    EXPECT_FALSE(sm.applyCommand(StoreFrozenDeletePlan{original}))
+        << "a plan cannot exist before the complete serving map";
+    ASSERT_TRUE(sm.applyCommand(SetInitialServingMap{completeServingMap()}));
+    EXPECT_FALSE(sm.applyCommand(StoreFrozenDeletePlan{original}))
+        << "group-0 tag 14 must stay disabled under the older format line";
+    ASSERT_TRUE(sm.applyCommand(SetActiveVersion{
+        timestar::data::kFrozenDeletePlanActivationVersion, {1, 2, 3}}));
+    ASSERT_TRUE(sm.applyCommand(StoreFrozenDeletePlan{original}));
+
+    auto reexpanded = original;
+    reexpanded.targets = {{"m,host=a value", 10, 20}, {"m,host=new value", 10, 20}};
+    EXPECT_FALSE(sm.applyCommand(StoreFrozenDeletePlan{reexpanded}));
+    EXPECT_EQ(sm.state().frozenDeletePlans.at(original.requestId), original)
+        << "a retry must retain the first expansion, not newly discovered series";
+
+    auto conflictingBody = original;
+    conflictingBody.requestFingerprint = std::string(32, 'b');
+    EXPECT_FALSE(sm.applyCommand(StoreFrozenDeletePlan{conflictingBody}));
+    EXPECT_EQ(sm.state().frozenDeletePlans.at(original.requestId), original);
+
+    const auto empty = deletePlan('2', 'c', original.issuedAtMs);
+    ASSERT_TRUE(sm.applyCommand(StoreFrozenDeletePlan{empty}));
+    ASSERT_TRUE(sm.state().frozenDeletePlans.at(empty.requestId).targets.empty());
+
+    Group0StateMachine restored;
+    ASSERT_TRUE(restored.loadSnapshot(sm.snapshot()));
+    EXPECT_EQ(restored.state().frozenDeletePlans, sm.state().frozenDeletePlans);
+}
+
+TEST(Group0StateMachineTest, FrozenDeletePlanRetentionAllowsFutureSkewButBoundsCount) {
+    Group0StateMachine sm;
+    ASSERT_TRUE(sm.applyCommand(SetInitialServingMap{completeServingMap()}));
+    ASSERT_TRUE(sm.applyCommand(SetActiveVersion{
+        timestar::data::kFrozenDeletePlanActivationVersion, {1, 2, 3}}));
+    const uint64_t base = 1'800'000'000'000;
+    const auto oldest = deletePlan('1', 'a', base);
+    ASSERT_TRUE(sm.applyCommand(StoreFrozenDeletePlan{oldest}));
+
+    // A request timestamp may legally be five minutes in the future. It must
+    // not shorten an older request's real one-hour retry window.
+    ASSERT_TRUE(sm.applyCommand(StoreFrozenDeletePlan{
+        deletePlan('2', 'b', base + kFrozenDeletePlanRetentionMs)}));
+    EXPECT_TRUE(sm.state().frozenDeletePlans.contains(oldest.requestId));
+    ASSERT_TRUE(sm.applyCommand(StoreFrozenDeletePlan{
+        deletePlan('3', 'c', base + kFrozenDeletePlanRetentionMs + kFrozenDeletePlanFutureSkewMs + 1)}));
+    EXPECT_FALSE(sm.state().frozenDeletePlans.contains(oldest.requestId));
+
+    Group0StateMachine bounded;
+    ASSERT_TRUE(bounded.applyCommand(SetInitialServingMap{completeServingMap()}));
+    ASSERT_TRUE(bounded.applyCommand(SetActiveVersion{
+        timestar::data::kFrozenDeletePlanActivationVersion, {1, 2, 3}}));
+    seastar::thread([&bounded, base] {
+        for (size_t i = 0; i < kMaxFrozenDeletePlans; ++i) {
+            char key[33];
+            std::snprintf(key, sizeof(key), "%032zx", i + 1);
+            ASSERT_TRUE(bounded.applyCommand(StoreFrozenDeletePlan{
+                FrozenDeletePlan{key, std::string(32, 'd'), base, {}}}));
+            if ((i & 31u) == 31u)
+                seastar::thread::yield();
+        }
+    }).join().get();
+    EXPECT_FALSE(bounded.applyCommand(StoreFrozenDeletePlan{
+        FrozenDeletePlan{std::string(32, 'e'), std::string(32, 'f'), base, {}}}));
+    EXPECT_EQ(bounded.state().frozenDeletePlans.size(), kMaxFrozenDeletePlans);
+}
+
+TEST(Group0StateMachineTest, FrozenDeletePlanRejectsNonCanonicalOrOversizeTargets) {
+    Group0StateMachine sm;
+    ASSERT_TRUE(sm.applyCommand(SetInitialServingMap{completeServingMap()}));
+    ASSERT_TRUE(sm.applyCommand(SetActiveVersion{
+        timestar::data::kFrozenDeletePlanActivationVersion, {1, 2, 3}}));
+    auto unsorted = deletePlan('1', 'a', 1'800'000'000'000,
+                               {{"z value", 1, 2}, {"a value", 1, 2}});
+    EXPECT_FALSE(sm.applyCommand(StoreFrozenDeletePlan{unsorted}));
+    auto oversize = deletePlan('2', 'b', 1'800'000'000'000,
+                               {{std::string(kMaxFrozenDeletePlanBytes, 'x'), 1, 2}});
+    EXPECT_FALSE(sm.applyCommand(StoreFrozenDeletePlan{oversize}));
+    auto badId = deletePlan('G', 'b', 1'800'000'000'000);
+    EXPECT_FALSE(sm.applyCommand(StoreFrozenDeletePlan{badId}));
+    EXPECT_TRUE(sm.state().frozenDeletePlans.empty());
 }
 
 TEST(Group0StateMachineTest, FailedCasDoesNotCreatePhantomCell) {

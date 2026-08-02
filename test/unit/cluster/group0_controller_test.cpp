@@ -4,6 +4,7 @@
 // Runs the real group-0 RaftGroup + Group0StateMachine + Group0Controller over
 // an in-memory router (no sockets).
 #include "../../../lib/cluster/control/group0_controller.hpp"
+#include "../../../lib/cluster/data/journal_format.hpp"
 #include "../../../lib/cluster/raft/raft_group.hpp"
 
 #include <gtest/gtest.h>
@@ -148,6 +149,11 @@ ControlMap initialServingMap() {
     for (uint16_t vshard = 0; vshard < timestar::VIRTUAL_SHARD_COUNT; ++vshard)
         map.placement.emplace(vshard, std::vector<NodeId>{1, 2, 3});
     return map;
+}
+
+FrozenDeletePlan frozenPlan(char id, char fingerprint, std::vector<FrozenDeleteTarget> targets) {
+    return FrozenDeletePlan{std::string(32, id), std::string(32, fingerprint), 1'800'000'000'000,
+                            std::move(targets)};
 }
 
 seastar::future<> testClusterInitGrowsMetaVotersAcrossDomains() {
@@ -427,6 +433,78 @@ seastar::future<> testFormatActivationGatedByVoterSupport() {
     EXPECT_EQ(nodes[1].sm->state().metaVoters, (std::vector<NodeId>{1}));
 }
 
+seastar::future<> testDeletePlanFreezesFirstExpansion() {
+    Router router;
+    std::vector<std::unique_ptr<RouterTransport>> transports;
+    Nodes nodes;
+    transports.push_back(std::make_unique<RouterTransport>(router));
+    NodeBox box;
+    box.persistence = std::make_unique<NoopPersistence>();
+    box.sm = std::make_unique<Group0StateMachine>();
+    RaftNode rn(1, {1}, RaftLog{}, HardState{}, optsFor(1));
+    box.group = std::make_unique<RaftGroup>(0, std::move(rn), *box.persistence, *transports.back(), *box.sm);
+    router.setGroup(1, box.group.get());
+    nodes[1] = std::move(box);
+
+    Group0Controller controller(*nodes[1].group, *nodes[1].sm, 3);
+    auto beforeLeadership = co_await controller.freezeDeletePlan(
+        frozenPlan('1', 'a', {{"m,host=a value", 10, 20}}));
+    EXPECT_EQ(beforeLeadership.status, FreezeDeletePlanStatus::NotLeader);
+
+    co_await nodes[1].group->campaign();
+    co_await router.pump();
+    co_await controller.initCluster("c1", rec(1, "rack-a"));
+    co_await router.pump();
+    EXPECT_TRUE(co_await controller.publishInitialServingMap(initialServingMap()));
+
+    const auto original = frozenPlan('1', 'a', {{"m,host=a value", 10, 20}});
+    auto inactive = co_await controller.freezeDeletePlan(original);
+    EXPECT_EQ(inactive.status, FreezeDeletePlanStatus::FormatInactive)
+        << "tag 14 must not ride the older v5 activation";
+    EXPECT_TRUE(co_await controller.activateFormat(
+        timestar::data::kFrozenDeletePlanActivationVersion,
+        {{1, {1, timestar::data::kFrozenDeletePlanActivationVersion}},
+         {2, {1, timestar::data::kFrozenDeletePlanActivationVersion}},
+         {3, {1, timestar::data::kFrozenDeletePlanActivationVersion}}}));
+
+    auto identity = original;
+    identity.targets.clear();
+    EXPECT_EQ(controller.lookupDeletePlan(identity).status, FreezeDeletePlanStatus::NotFound);
+    auto stored = co_await controller.freezeDeletePlan(original);
+    EXPECT_EQ(stored.status, FreezeDeletePlanStatus::Stored);
+    EXPECT_EQ(stored.plan, original);
+    EXPECT_EQ(controller.lookupDeletePlan(identity).plan, original);
+
+    auto changedExpansion = original;
+    changedExpansion.targets.push_back({"m,host=new value", 10, 20});
+    auto retry = co_await controller.freezeDeletePlan(std::move(changedExpansion));
+    EXPECT_EQ(retry.status, FreezeDeletePlanStatus::Stored);
+    EXPECT_EQ(retry.plan, original)
+        << "a catalog change during retry must return the first committed expansion";
+
+    auto conflictingBody = original;
+    conflictingBody.requestFingerprint = std::string(32, 'b');
+    auto conflict = co_await controller.freezeDeletePlan(std::move(conflictingBody));
+    EXPECT_EQ(conflict.status, FreezeDeletePlanStatus::Conflict);
+    EXPECT_EQ(conflict.plan, original);
+    EXPECT_EQ(nodes[1].sm->state().frozenDeletePlans.at(original.requestId), original);
+
+    // A retained key becomes reusable once its conservative one-hour + future
+    // skew window has passed. Lookup must report a miss so the caller can
+    // discover a new operation, and apply atomically prunes/replaces the old one.
+    auto replacement = original;
+    replacement.issuedAtMs +=
+        kFrozenDeletePlanRetentionMs + kFrozenDeletePlanFutureSkewMs + 1;
+    replacement.targets = {{"m,host=reused value", 30, 40}};
+    auto replacementIdentity = replacement;
+    replacementIdentity.targets.clear();
+    EXPECT_EQ(controller.lookupDeletePlan(replacementIdentity).status, FreezeDeletePlanStatus::NotFound);
+    auto replaced = co_await controller.freezeDeletePlan(replacement);
+    EXPECT_EQ(replaced.status, FreezeDeletePlanStatus::Stored);
+    EXPECT_EQ(replaced.plan, replacement);
+    EXPECT_EQ(nodes[1].sm->state().frozenDeletePlans.at(original.requestId), replacement);
+}
+
 }  // namespace
 
 TEST(Group0ControllerTest, FormatActivationGatedByVoterSupport) {
@@ -443,4 +521,8 @@ TEST(Group0ControllerTest, JoinTokenGatesAdmission) {
 
 TEST(Group0ControllerTest, ReadBarrierReconcilesControlMap) {
     testReadBarrierReconcilesControlMap().get();
+}
+
+TEST(Group0ControllerTest, DeletePlanFreezesFirstExpansion) {
+    testDeletePlanFreezesFirstExpansion().get();
 }

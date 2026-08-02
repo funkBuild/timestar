@@ -329,6 +329,14 @@ public:
     explicit DeleteReceiptExpiredError(const std::string& what) : std::runtime_error(what) {}
 };
 
+// The same HTTP Idempotency-Key was reused with a different original request
+// body or issuance timestamp while its frozen pattern plan is still retained.
+// Executing either plan would make the key ambiguous, so this is a terminal 409.
+class DeletePlanConflictError : public std::runtime_error {
+public:
+    explicit DeletePlanConflictError(const std::string& what) : std::runtime_error(what) {}
+};
+
 // A command/snapshot feature is newer than either the cluster-wide committed
 // format or the destination peer's negotiated protocol. This is a terminal,
 // pre-emission refusal: retrying another leader cannot make mixed-version bytes

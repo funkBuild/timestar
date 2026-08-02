@@ -223,6 +223,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDeleteHandler::handle
     // Reusing this header with a different body deliberately derives different
     // operations: the contract is "same key AND same request".
     SeriesId128 clusterRequestId;
+    SeriesId128 clusterRequestFingerprint;
     uint64_t clusterRequestIssuedAtMs = 0;
     if (partitionedCluster_) {
         const std::string idempotencyKey = req->get_header("Idempotency-Key");
@@ -291,6 +292,14 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDeleteHandler::handle
         }
         timestar::http::setContentType(*reply, resFmt);
         co_return reply;
+    }
+    if (partitionedCluster_) {
+        // Include the decoded media family and a NUL separator so identical
+        // bytes interpreted as JSON and protobuf cannot share a frozen plan.
+        std::string fingerprintBytes = timestar::http::isProtobuf(reqFmt) ? std::string("protobuf\0", 9)
+                                                                          : std::string("json\0", 5);
+        fingerprintBytes.append(req->content.data(), req->content.size());
+        clusterRequestFingerprint = SeriesId128::fromSeriesKey(fingerprintBytes);
     }
 
     timestar::http_log.debug("[DELETE_HANDLER] Received delete request");
@@ -443,17 +452,17 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDeleteHandler::handle
         }
 
         if (partitionedCluster_) {
-            // A pattern retry cannot safely re-run catalog expansion: a series
-            // created after an earlier partial attempt would acquire a brand-new
-            // exact operation identity and could be deleted by the retry. A
-            // durable replicated expansion plan (or a per-VShard selector
-            // command with bounded result semantics) is required before this can
-            // be retry-safe. Reject the whole mixed batch before either catalog
-            // discovery or the first exact proposal.
-            if (std::ranges::any_of(deleteRequests, [](const DeleteRequest& request) { return request.isPattern; })) {
+            const bool hasPattern =
+                std::ranges::any_of(deleteRequests, [](const DeleteRequest& request) { return request.isPattern; });
+            // Pattern expansion is permitted only when all three operations are
+            // wired: lookup, quorum-fenced catalog discovery, and group-0 plan
+            // freeze. Check before discovery so an incompletely composed server
+            // does no work and can never fall through to an unfrozen mutation.
+            if (hasPattern &&
+                (!clusterPatternExpandHook || !clusterDeletePlanLookupHook || !clusterDeletePlanHook)) {
                 reply->set_status(seastar::http::reply::status_type::not_implemented);
                 constexpr std::string_view message =
-                    "Pattern delete is unavailable in partitioned mode until its expansion plan is replicated";
+                    "Pattern delete requires quorum-fenced discovery and a replicated frozen expansion plan";
                 if (timestar::http::isProtobuf(resFmt))
                     reply->_content =
                         timestar::proto::formatDeleteResponse("error", 0, deleteRequests.size(), std::string(message));
@@ -478,52 +487,85 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDeleteHandler::handle
             };
             std::vector<ExpandedDelete> expanded;
             expanded.reserve(deleteRequests.size());
-            for (const auto& delReq : deleteRequests) {
-                if (delReq.isPattern) {
-                    if (!clusterPatternExpandHook) {
-                        reply->set_status(seastar::http::reply::status_type::not_implemented);
-                        constexpr std::string_view message =
-                            "Pattern delete requires quorum-fenced catalog discovery on every cluster peer";
-                        if (timestar::http::isProtobuf(resFmt))
-                            reply->_content =
-                                timestar::proto::formatDeleteResponse("error", 0, 0, std::string(message));
-                        else
-                            reply->_content = createErrorResponse(std::string(message));
-                        timestar::http::setContentType(*reply, resFmt);
-                        co_return reply;
-                    }
-                    timestar::data::PatternSeriesSelector selector;
-                    selector.measurement = delReq.measurement;
-                    selector.tags = delReq.tags;
-                    selector.fields = delReq.fields;
-                    auto keys = co_await clusterPatternExpandHook(std::move(selector), kMaxExpandedClusterDeletes);
-                    for (auto& key : keys)
-                        expanded.push_back(ExpandedDelete{std::move(key), delReq.startTime, delReq.endTime});
-                } else {
-                    std::string key = delReq.isStructured
-                                          ? buildSeriesKey(delReq.measurement, delReq.tags, delReq.field)
-                                          : delReq.seriesKey;
-                    expanded.push_back(ExpandedDelete{std::move(key), delReq.startTime, delReq.endTime});
+            const auto installFrozen = [&](std::vector<timestar::data::DeleteRangeTarget> frozen) {
+                if (frozen.size() > kMaxExpandedClusterDeletes)
+                    throw std::runtime_error("group-0 returned an oversized frozen delete plan");
+                for (size_t i = 0; i < frozen.size(); ++i) {
+                    if (frozen[i].seriesKey.empty() || frozen[i].startTime > frozen[i].endTime ||
+                        (i != 0 && !(frozen[i - 1] < frozen[i])))
+                        throw std::runtime_error("group-0 returned a non-canonical frozen delete plan");
                 }
+                expanded.clear();
+                expanded.reserve(frozen.size());
+                for (auto& target : frozen)
+                    expanded.push_back(
+                        ExpandedDelete{std::move(target.seriesKey), target.startTime, target.endTime});
+            };
+
+            // An ambiguous first attempt may already have frozen and partially
+            // executed this request. Consult that durable plan BEFORE touching
+            // the catalog: a later outage, newly matching series, or expansion
+            // overflow must not make the original operation impossible to
+            // finish safely.
+            bool loadedFrozen = false;
+            if (hasPattern) {
+                auto existing = co_await clusterDeletePlanLookupHook(
+                    clusterRequestId, clusterRequestFingerprint, clusterRequestIssuedAtMs);
+                if (existing) {
+                    installFrozen(std::move(*existing));
+                    loadedFrozen = true;
+                }
+            }
+
+            if (!loadedFrozen) {
+                for (const auto& delReq : deleteRequests) {
+                    if (delReq.isPattern) {
+                        timestar::data::PatternSeriesSelector selector;
+                        selector.measurement = delReq.measurement;
+                        selector.tags = delReq.tags;
+                        selector.fields = delReq.fields;
+                        auto keys =
+                            co_await clusterPatternExpandHook(std::move(selector), kMaxExpandedClusterDeletes);
+                        for (auto& key : keys)
+                            expanded.push_back(ExpandedDelete{std::move(key), delReq.startTime, delReq.endTime});
+                    } else {
+                        std::string key = delReq.isStructured
+                                              ? buildSeriesKey(delReq.measurement, delReq.tags, delReq.field)
+                                              : delReq.seriesKey;
+                        expanded.push_back(ExpandedDelete{std::move(key), delReq.startTime, delReq.endTime});
+                    }
+                    if (expanded.size() > kMaxExpandedClusterDeletes)
+                        throw timestar::data::DeleteExpansionLimitError(
+                            "delete request expands beyond the 10000-series safety limit");
+                }
+
+                // Overlapping selectors commonly name the same exact command. Remove
+                // byte-identical triples before proposal: duplicate range tombstones in
+                // one HTTP operation only enlarge the ambiguity window for concurrent
+                // writes and provide no semantic value.
+                std::sort(expanded.begin(), expanded.end(), [](const ExpandedDelete& lhs, const ExpandedDelete& rhs) {
+                    return lhs.tie() < rhs.tie();
+                });
+                expanded.erase(std::unique(expanded.begin(), expanded.end(),
+                                           [](const ExpandedDelete& lhs, const ExpandedDelete& rhs) {
+                                               return lhs.tie() == rhs.tie();
+                                           }),
+                               expanded.end());
                 if (expanded.size() > kMaxExpandedClusterDeletes)
                     throw timestar::data::DeleteExpansionLimitError(
                         "delete request expands beyond the 10000-series safety limit");
-            }
 
-            // Overlapping selectors commonly name the same exact command. Remove
-            // byte-identical triples before proposal: duplicate range tombstones in
-            // one HTTP operation only enlarge the ambiguity window for concurrent
-            // writes and provide no semantic value.
-            std::sort(expanded.begin(), expanded.end(),
-                      [](const ExpandedDelete& lhs, const ExpandedDelete& rhs) { return lhs.tie() < rhs.tie(); });
-            expanded.erase(std::unique(expanded.begin(), expanded.end(),
-                                       [](const ExpandedDelete& lhs, const ExpandedDelete& rhs) {
-                                           return lhs.tie() == rhs.tie();
-                                       }),
-                           expanded.end());
-            if (expanded.size() > kMaxExpandedClusterDeletes)
-                throw timestar::data::DeleteExpansionLimitError(
-                    "delete request expands beyond the 10000-series safety limit");
+                if (hasPattern) {
+                    std::vector<timestar::data::DeleteRangeTarget> candidateTargets;
+                    candidateTargets.reserve(expanded.size());
+                    for (const auto& target : expanded)
+                        candidateTargets.push_back({target.seriesKey, target.startTime, target.endTime});
+                    auto frozen = co_await clusterDeletePlanHook(
+                        clusterRequestId, clusterRequestFingerprint, clusterRequestIssuedAtMs,
+                        std::move(candidateTargets));
+                    installFrozen(std::move(frozen));
+                }
+            }
 
             // One canonical command per VShard gives the whole request/VShard one
             // durable receipt rather than one receipt per exact series. It also
@@ -776,6 +818,12 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDeleteHandler::handle
             reply->_content = timestar::proto::formatDeleteResponse("error", 0, 0, e.what());
         else
             reply->_content = timestar::http::jsonError(e.what(), "DELETE_IDEMPOTENCY_EXPIRED");
+    } catch (const timestar::data::DeletePlanConflictError& e) {
+        reply->set_status(seastar::http::reply::status_type::conflict);
+        if (timestar::http::isProtobuf(resFmt))
+            reply->_content = timestar::proto::formatDeleteResponse("error", 0, 0, e.what());
+        else
+            reply->_content = timestar::http::jsonError(e.what(), "DELETE_IDEMPOTENCY_CONFLICT");
     } catch (const timestar::data::ClusterFormatUnsupportedError& e) {
         reply->set_status(seastar::http::reply::status_type::conflict);
         if (timestar::http::isProtobuf(resFmt))

@@ -1,6 +1,7 @@
 #include "group0_state_machine.hpp"
 
 #include "../../core/vshard.hpp"
+#include "../data/journal_format.hpp"
 
 #include <seastar/core/coroutine.hh>
 #include <limits>
@@ -13,6 +14,7 @@ namespace {
 
 constexpr uint64_t kServingMapSnapshotMagic = 0x54534730'4d415031ull;  // "TSG0MAP1"
 constexpr uint64_t kFormatVotersSnapshotMagic = 0x54534730'46564f31ull;  // "TSG0FVO1"
+constexpr uint64_t kFrozenDeletePlansSnapshotMagic = 0x54534730'44504c31ull;  // "TSG0DPL1"
 
 // State (snapshot) serialization -- distinct from command serialization: it
 // encodes the whole Group0State so a snapshot fully reconstructs a node.
@@ -149,6 +151,53 @@ ControlMap readControlMap(SR& r) {
     return map;
 }
 
+void writeFrozenDeletePlan(SW& w, const FrozenDeletePlan& plan) {
+    w.str(plan.requestId);
+    w.str(plan.requestFingerprint);
+    w.u64(plan.issuedAtMs);
+    w.u64(plan.targets.size());
+    for (const auto& target : plan.targets) {
+        w.str(target.seriesKey);
+        w.u64(target.startTime);
+        w.u64(target.endTime);
+    }
+}
+
+FrozenDeletePlan readFrozenDeletePlan(SR& r) {
+    FrozenDeletePlan plan;
+    plan.requestId = r.str();
+    plan.requestFingerprint = r.str();
+    plan.issuedAtMs = r.u64();
+    const uint64_t count = r.u64();
+    constexpr uint64_t kMinimumTargetBytes = sizeof(uint64_t) * 3;
+    if (!r.ok || count > kMaxFrozenDeletePlanTargets ||
+        count > static_cast<uint64_t>(r.end - r.p) / kMinimumTargetBytes) {
+        r.ok = false;
+        return plan;
+    }
+    plan.targets.reserve(count);
+    for (uint64_t i = 0; i < count && r.ok; ++i)
+        plan.targets.push_back(FrozenDeleteTarget{r.str(), r.u64(), r.u64()});
+    return plan;
+}
+
+bool validFrozenDeletePlanState(const Group0State& state) {
+    if (state.frozenDeletePlans.empty())
+        return true;
+    if (state.activeFormatVersion < data::kFrozenDeletePlanActivationVersion ||
+        !isCompleteControlMap(state.servingMap) || state.frozenDeletePlans.size() > kMaxFrozenDeletePlans)
+        return false;
+    size_t aggregateBytes = 0;
+    for (const auto& [requestId, plan] : state.frozenDeletePlans) {
+        const size_t planBytes = frozenDeletePlanBytes(plan);
+        if (requestId != plan.requestId || !validFrozenDeletePlan(plan) ||
+            aggregateBytes > kMaxFrozenDeletePlanAggregateBytes - planBytes)
+            return false;
+        aggregateBytes += planBytes;
+    }
+    return true;
+}
+
 bool validNodeRecord(const Group0State& state, const NodeRecord& record) {
     if (record.raftId == raft::kNoNode || record.uuid.empty() || record.address.empty() ||
         !isValidNodeState(record.state))
@@ -192,6 +241,8 @@ bool validSnapshotState(const Group0State& state) {
     for (const auto& token : state.joinTokens)
         if (token.empty())
             return false;
+    if (!validFrozenDeletePlanState(state))
+        return false;
     if ((state.controllerTerm == 0) != (state.controllerLeader == raft::kNoNode))
         return false;
     if (state.activeFormatVersion == 0)
@@ -426,6 +477,43 @@ bool Group0StateMachine::applyCommand(const ControlCommand& cmd) {
                 } else {
                     ok = false;  // rejected: no such token
                 }
+            } else if constexpr (std::is_same_v<T, StoreFrozenDeletePlan>) {
+                if (state_.activeFormatVersion < data::kFrozenDeletePlanActivationVersion ||
+                    !isCompleteControlMap(state_.servingMap) || !validFrozenDeletePlan(c.plan)) {
+                    ok = false;
+                } else {
+                    // A request timestamp may be up to five minutes in the
+                    // future. Retain that extra skew so a future-dated request
+                    // cannot evict a plan whose one-hour HTTP retry window is
+                    // still open according to wall clock.
+                    bool pruned = false;
+                    std::erase_if(state_.frozenDeletePlans, [&](const auto& item) {
+                        const bool expired = frozenDeletePlanExpiredAt(item.second, c.plan.issuedAtMs);
+                        pruned = pruned || expired;
+                        return expired;
+                    });
+
+                    if (auto found = state_.frozenDeletePlans.find(c.plan.requestId);
+                        found != state_.frozenDeletePlans.end()) {
+                        // The identity and original request bytes, not a later
+                        // catalog result, define an idempotent retry. Preserve
+                        // the first target vector even if re-expansion changed.
+                        ok = pruned;
+                    } else {
+                        size_t aggregateBytes = 0;
+                        for (const auto& [id, plan] : state_.frozenDeletePlans) {
+                            (void)id;
+                            aggregateBytes += frozenDeletePlanBytes(plan);
+                        }
+                        const size_t planBytes = frozenDeletePlanBytes(c.plan);
+                        if (state_.frozenDeletePlans.size() == kMaxFrozenDeletePlans ||
+                            aggregateBytes > kMaxFrozenDeletePlanAggregateBytes - planBytes) {
+                            ok = pruned;
+                        } else {
+                            state_.frozenDeletePlans.emplace(c.plan.requestId, c.plan);
+                        }
+                    }
+                }
             } else if constexpr (std::is_same_v<T, SetActiveVersion>) {
                 // Monotonic: a stale/replayed lower version must never regress the
                 // active format (nodes only ever move formats forward). The safety
@@ -538,9 +626,17 @@ std::string Group0StateMachine::snapshot() const {
         w.u64(kServingMapSnapshotMagic);
         writeControlMap(w, state_.servingMap);
     }
-    if (!state_.activeFormatVoters.empty()) {
+    if (!state_.activeFormatVoters.empty() || !state_.frozenDeletePlans.empty()) {
         w.u64(kFormatVotersSnapshotMagic);
         w.ids(state_.activeFormatVoters);
+    }
+    if (!state_.frozenDeletePlans.empty()) {
+        w.u64(kFrozenDeletePlansSnapshotMagic);
+        w.u64(state_.frozenDeletePlans.size());
+        for (const auto& [requestId, plan] : state_.frozenDeletePlans) {
+            (void)requestId;
+            writeFrozenDeletePlan(w, plan);
+        }
     }
     return std::move(w.out);
 }
@@ -633,6 +729,24 @@ bool Group0StateMachine::decodeSnapshot(const std::string& data, Group0State& de
             r.ok = false;
         else
             s.activeFormatVoters = r.ids();
+    }
+    remaining = static_cast<size_t>(r.end - r.p);
+    if (r.ok && remaining != 0) {
+        if (remaining < 16 || r.u64() != kFrozenDeletePlansSnapshotMagic) {
+            r.ok = false;
+        } else {
+            const uint64_t count = r.u64();
+            if (!r.ok || count > kMaxFrozenDeletePlans ||
+                count > static_cast<uint64_t>(r.end - r.p) / (sizeof(uint64_t) * 4)) {
+                r.ok = false;
+            } else {
+                for (uint64_t i = 0; i < count && r.ok; ++i) {
+                    FrozenDeletePlan plan = readFrozenDeletePlan(r);
+                    if (r.ok && !s.frozenDeletePlans.emplace(plan.requestId, std::move(plan)).second)
+                        r.ok = false;
+                }
+            }
+        }
     }
     if (!r.ok || r.p != r.end || !validSnapshotState(s) || !stateMatchesLocalExpectations(s))
         return false;  // reject a corrupt snapshot without half-applying it

@@ -255,6 +255,8 @@ TEST(WriteAdmissionTest, EveryAdvertiserOffersTheNewestSupportedWireVersion) {
     EXPECT_GE(data::kWriteBatchFormatMax, data::kNodeQueryResolveMinVersion) << "the leader-resolve read gate (D-25)";
     EXPECT_GE(data::kWriteBatchFormatMax, data::kBoundedDeleteReceiptActivationVersion)
         << "the bounded-delete command and Expired-outcome gate";
+    EXPECT_GE(data::kWriteBatchFormatMax, data::kFrozenDeletePlanActivationVersion)
+        << "the group-0 frozen pattern-delete command and snapshot gate";
 }
 
 // A CAPABILITY GATE IS A HISTORICAL FACT AND MUST NOT MOVE (debt D-25).
