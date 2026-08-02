@@ -178,8 +178,9 @@ changes. See [protocol-versioning.md](protocol-versioning.md).
   steps idempotently after restart.
 - Apply each committed serving-map epoch to the live sharded routing directory.
   **Done:** publication is durable-before-applied, reactor-local, monotonic, and
-  idempotent. Creating/registering destination peers and groups before movement
-  starts remains open.
+  idempotent; restart selects the durable high-water map and instantiates groups
+  from recovered placement. Creating/registering destination peers and groups
+  before movement starts remains open.
 - Publish teardown/reclaim floors only after durable ownership transfer.
 - Prove no acknowledged loss or duplicate VShard contribution during movement.
 

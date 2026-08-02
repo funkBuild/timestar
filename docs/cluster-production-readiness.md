@@ -52,7 +52,9 @@ inventory and rules.
   durable cache is persisted before the applied boundary advances, every
   reactor owns and updates its own routing directory, stale epochs cannot
   regress routing, exact replay repairs partial fan-out, and conflicting or
-  incomplete maps fail closed.
+  incomplete maps fail closed. Restart selects a newer durable map over the
+  static epoch-1 seed, and Group-0 recovery updates the runtime before local
+  replica groups are instantiated.
 
 ## Remaining production blockers
 

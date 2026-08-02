@@ -56,21 +56,22 @@ inline Group0StartupDecision decideGroup0Startup(bool enabled, raft::NodeId self
     return {Group0StartMode::Observe, {seed}};
 }
 
-// Until resumable VShard movement exists, the only serving map production may
-// activate is the immutable epoch-1 map derived from the bound static topology.
-// A durable cache is still the restart source of truth, but it must be exactly
-// that committed initial map; silently adopting a different map would start the
-// wrong Raft groups without performing membership changes or data catch-up.
+// The static map is only the epoch-1 bootstrap seed. After Group 0 completes a
+// movement, the durable cache is the restart routing high-water mark and must
+// win over that seed. Equal epochs remain immutable: two placements claiming
+// the same epoch are irreconcilable and fail startup closed.
 inline control::ControlMap selectServingMapForStartup(control::ControlMap configured,
                                                        std::optional<control::ControlMap> cached) {
     if (!control::isCompleteControlMap(configured))
         throw std::invalid_argument("group0 startup requires a complete configured serving map");
     if (!cached)
         return configured;
-    if (!control::isCompleteControlMap(*cached) || *cached != configured)
-        throw std::runtime_error(
-            "durable serving map differs from static bootstrap placement; dynamic control-map cutover is not "
-            "implemented");
+    if (!control::isCompleteControlMap(*cached))
+        throw std::runtime_error("durable serving map is incomplete or invalid");
+    if (cached->epoch < configured.epoch)
+        throw std::runtime_error("durable serving-map epoch regresses the configured bootstrap epoch");
+    if (cached->epoch == configured.epoch && *cached != configured)
+        throw std::runtime_error("durable and configured serving maps conflict at the same epoch");
     return std::move(*cached);
 }
 

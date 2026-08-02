@@ -373,6 +373,13 @@ seastar::future<> ClusterDataPlane::startImpl(const ClusterConfig& cfg, seastar:
                             // Exact replay repairs a partially completed fan-out; a
                             // different map reusing the epoch is rejected everywhere.
                             co_await publishServingMapOnShards(shards_, *dir_, map);
+                            // Group creation happens after Group-0 recovery and reads
+                            // ClusterRuntime. Keep that source in lock-step with the
+                            // live directories so a snapshot/log-recovered cutover
+                            // instantiates the post-move local replica set.
+                            if (!rt_)
+                                throw std::logic_error("cluster: serving-map publication without a runtime");
+                            rt_->map = map;
                         };
                         co_await plane.addGroup0(std::move(voters), ropts, clusterUuid, record,
                                                  initialServingMap, std::move(publishCache));
