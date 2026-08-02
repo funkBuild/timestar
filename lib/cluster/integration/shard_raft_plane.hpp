@@ -664,6 +664,11 @@ public:
         size_t drainReferences = 0;
         bool drainBlocked = false;
         size_t removalsPending = 0;
+        size_t retentionPolicies = 0;
+        bool retentionSweepActive = false;
+        uint32_t retentionNextVShard = 0;
+        uint64_t lastRetentionSweepId = 0;
+        size_t retentionCutoffRecords = 0;
         uint64_t applyLagEntries = 0;
         uint64_t applyFailures = 0;
         uint64_t tickErrors = 0;
@@ -713,6 +718,14 @@ public:
                 (config.isVoter(id) || config.isLearner(id) ||
                  std::find(state.metaVoters.begin(), state.metaVoters.end(), id) != state.metaVoters.end()))
                 ++c.removalsPending;
+        for (const auto& [key, cell] : state.policies) {
+            if (control::retentionMeasurementFromKey(key) && !cell.value.empty())
+                ++c.retentionPolicies;
+        }
+        c.retentionSweepActive = state.retentionSweep.has_value();
+        c.retentionNextVShard = state.retentionSweep ? state.retentionSweep->nextVShard : 0;
+        c.lastRetentionSweepId = state.lastRetentionSweepId;
+        c.retentionCutoffRecords = state.retentionCutoffs.size();
         c.applyLagEntries = group->applyLag();
         c.applyFailures = group->applyFailures();
         c.tickErrors = host->tickErrors();

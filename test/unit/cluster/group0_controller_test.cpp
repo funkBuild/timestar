@@ -406,6 +406,46 @@ seastar::future<> testJoinTokenGatesAdmission() {
     EXPECT_EQ(nodes[1].sm->state().clusterUuid, "c1");
 }
 
+seastar::future<> testRetentionCasAndSweepProposal() {
+    Router router;
+    std::vector<std::unique_ptr<RouterTransport>> transports;
+    Nodes nodes;
+    transports.push_back(std::make_unique<RouterTransport>(router));
+    NodeBox box;
+    box.persistence = std::make_unique<NoopPersistence>();
+    box.sm = std::make_unique<Group0StateMachine>();
+    RaftNode rn(1, {1}, RaftLog{}, HardState{}, optsFor(1));
+    box.group = std::make_unique<RaftGroup>(0, std::move(rn), *box.persistence, *transports.back(), *box.sm);
+    router.setGroup(1, box.group.get());
+    nodes[1] = std::move(box);
+
+    Group0Controller controller(*nodes[1].group, *nodes[1].sm, 1);
+    co_await nodes[1].group->campaign();
+    co_await router.pump();
+    co_await controller.initCluster("c1", rec(1, "rack-a"));
+
+    const RetentionPolicyValue value{"1s", 1'000};
+    EXPECT_TRUE(co_await controller.casRetentionPolicy("cpu", 0, value));
+    const auto firstCommit = nodes[1].group->commitIndex();
+    EXPECT_TRUE(co_await controller.casRetentionPolicy("cpu", 0, value));
+    EXPECT_EQ(nodes[1].group->commitIndex(), firstCommit) << "an exact successful CAS retry should not append";
+    EXPECT_FALSE(co_await controller.casRetentionPolicy("cpu", 0, RetentionPolicyValue{"2s", 2'000}));
+    EXPECT_EQ(nodes[1].sm->state().policies.at(retentionPolicyKey("cpu")).value, encodeRetentionPolicyValue(value));
+
+    auto sweep = selectNextRetentionSweep(nodes[1].sm->state(), 5'000);
+    if (!sweep)
+        throw std::runtime_error("due retention policy was not selected");
+    EXPECT_TRUE(co_await controller.startRetentionSweep(*sweep));
+    const auto startCommit = nodes[1].group->commitIndex();
+    EXPECT_TRUE(co_await controller.startRetentionSweep(*sweep));
+    EXPECT_EQ(nodes[1].group->commitIndex(), startCommit) << "an exact sweep-start retry should not append";
+    EXPECT_FALSE(co_await controller.casRetentionPolicy("cpu", 1, RetentionPolicyValue{"2s", 2'000}));
+    EXPECT_TRUE(co_await controller.advanceRetentionSweep(kRetentionFanoutBatch));
+    if (!nodes[1].sm->state().retentionSweep)
+        throw std::runtime_error("retention sweep was not persisted");
+    EXPECT_EQ(nodes[1].sm->state().retentionSweep->nextVShard, kRetentionFanoutBatch);
+}
+
 seastar::future<> testNodeRemovalRequiresDrainAndClearedReferences() {
     Router router;
     std::vector<std::unique_ptr<RouterTransport>> transports;
@@ -633,6 +673,10 @@ TEST(Group0ControllerTest, JoinTokenGatesAdmission) {
     testJoinTokenGatesAdmission().get();
 }
 
+TEST(Group0ControllerTest, RetentionCasAndSweepProposal) {
+    testRetentionCasAndSweepProposal().get();
+}
+
 TEST(Group0ControllerTest, NodeRemovalRequiresDrainAndClearedReferences) {
     testNodeRemovalRequiresDrainAndClearedReferences().get();
 }
@@ -673,6 +717,33 @@ TEST(Group0ControllerTest, DrainSelectionIsDeterministicBalancedAndFailureDomain
     decision = selectNextDrainMove(state);
     EXPECT_EQ(decision.state, DrainMoveState::InProgress)
         << "a second drain plan cannot overlap the unpublished current move";
+}
+
+TEST(Group0ControllerTest, RetentionSelectionIsDeterministicDueAndSingleFlight) {
+    Group0State state;
+    const auto value = encodeRetentionPolicyValue({"1m", 60'000'000'000ULL});
+    state.policies.emplace(retentionPolicyKey("b"), PolicyCell{1, value});
+    state.policies.emplace(retentionPolicyKey("a"), PolicyCell{2, value});
+    state.policies.emplace(retentionPolicyKey("deleted"), PolicyCell{3, {}});
+
+    EXPECT_FALSE(selectNextRetentionSweep(state, 60'000'000'000ULL));
+    auto selected = selectNextRetentionSweep(state, 120'000'000'000ULL);
+    ASSERT_TRUE(selected);
+    EXPECT_EQ(selected->sweepId, 1u);
+    EXPECT_EQ(selected->measurement, "a");
+    EXPECT_EQ(selected->policyVersion, 2u);
+    EXPECT_EQ(selected->issuedAtNanos, 120'000'000'000ULL);
+    EXPECT_EQ(selected->cutoffTime, 60'000'000'000ULL);
+
+    state.retentionSweep = RetentionSweep{1, "a", 2, selected->cutoffTime, 0};
+    EXPECT_FALSE(selectNextRetentionSweep(state, 130'000'000'000ULL));
+    state.retentionSweep.reset();
+    state.lastRetentionSweepId = 1;
+    state.retentionCutoffs.emplace("a", RetentionCutoffRecord{2, selected->cutoffTime});
+    selected = selectNextRetentionSweep(state, 130'000'000'000ULL);
+    ASSERT_TRUE(selected);
+    EXPECT_EQ(selected->sweepId, 2u);
+    EXPECT_EQ(selected->measurement, "b") << "a policy below its minimum interval cannot starve another policy";
 }
 
 TEST(Group0ControllerTest, ReadBarrierReconcilesControlMap) {

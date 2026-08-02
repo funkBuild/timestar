@@ -356,11 +356,12 @@ seastar::future<> ReplicatedVShardHost::addVShard(uint16_t vshard, std::vector<N
         // branch above for why the move is worth having.
         const uint64_t snapIndex = st.snapshot->index;
         const uint64_t snapTerm = st.snapshot->term;
-        auto deleteState = data::decodeSnapshotDeleteReceiptState(st.snapshot->data);
-        if (!deleteState)
+        auto stateMachineState = data::decodeSnapshotStateMachineState(st.snapshot->data);
+        if (!stateMachineState)
             throw std::runtime_error(
-                "ReplicatedVShardHost: locally produced snapshot has invalid delete-receipt framing");
-        vs.sm->restoreDeleteReceiptState(std::move(*deleteState), snapIndex);
+                "ReplicatedVShardHost: locally produced snapshot has invalid state-machine framing");
+        vs.sm->restoreDeleteReceiptState(std::move(stateMachineState->deleteReceipts), snapIndex);
+        vs.sm->restoreRetentionState(std::move(stateMachineState->retentionCutoff), snapIndex);
         node.seedRecoveredSnapshot(std::move(*st.snapshot));
         timestar::http_log.info(
             "cluster: VShard {} recovered from a compacted journal at boundary index {} (term {}); the local Engine "
@@ -787,8 +788,9 @@ seastar::future<uint64_t> ReplicatedVShardHost::snapshotVShard(uint16_t vshard) 
     // the next active suffix and advances. The conditional rollover re-checks
     // the target after acquiring the shard-wide rollover lock, avoiding empty
     // rotations when another writer already moved it.
-    if (auto state = vshards_.find(vshard);
-        state != vshards_.end() && state->second.sm && !state->second.sm->canSnapshotDeleteReceiptStateThrough(upto)) {
+    if (auto state = vshards_.find(vshard); state != vshards_.end() && state->second.sm &&
+                                            (!state->second.sm->canSnapshotDeleteReceiptStateThrough(upto) ||
+                                             !state->second.sm->canSnapshotRetentionStateThrough(upto))) {
         ++snapshotsSkippedDeleteState_;
         if (flushState.oldestUnflushedRevision)
             (void)co_await store_.forceSnapshotRollover(VShardId{vshard});
@@ -818,6 +820,7 @@ seastar::future<uint64_t> ReplicatedVShardHost::snapshotVShard(uint16_t vshard) 
         payload.deleteReceiptsRetiredBeforeMs = deleteState.retiredBeforeMs;
         payload.deleteReceiptsRetiredAtIndex = deleteState.retiredAtIndex;
         payload.deleteReceipts = std::move(deleteState.receipts);
+        payload.retentionCutoff = state->second.sm->retentionStateThrough(upto);
     }
     // Bind the payload to the exact Raft boundary. The storage builder emits the
     // minimal data fence (highest extent revision); the host may safely promote

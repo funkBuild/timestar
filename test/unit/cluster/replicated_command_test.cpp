@@ -22,7 +22,8 @@ DeleteRangeBatch deleteBatch() {
 }  // namespace
 
 TEST(ReplicatedCommandV1, RoundTripsEveryCommand) {
-    const std::vector<ReplicatedCommand> commands = {writeBatch(), deleteBatch(), RetentionCutoffCmd{"cpu", 1234}};
+    const std::vector<ReplicatedCommand> commands = {writeBatch(), deleteBatch(),
+                                                     RetentionCutoffCmd{3, "cpu", 7, 1234}};
     for (const auto& command : commands) {
         const auto encoded = encodeReplicatedCommand(command);
         ASSERT_EQ(encoded.substr(0, 4), "TSC1");
@@ -35,18 +36,23 @@ TEST(ReplicatedCommandV1, RoundTripsEveryCommand) {
     ASSERT_TRUE(decodedDelete);
     EXPECT_EQ(std::get<DeleteRangeBatch>(*decodedDelete).targets, deleteBatch().targets);
     EXPECT_EQ(std::get<DeleteRangeBatch>(*decodedDelete).issuedAtMs, deleteBatch().issuedAtMs);
-    auto decodedRetention = decodeReplicatedCommand(encodeReplicatedCommand(RetentionCutoffCmd{"cpu", 1234}));
+    auto decodedRetention = decodeReplicatedCommand(encodeReplicatedCommand(RetentionCutoffCmd{3, "cpu", 7, 1234}));
     ASSERT_TRUE(decodedRetention);
+    EXPECT_EQ(std::get<RetentionCutoffCmd>(*decodedRetention).sweepId, 3u);
     EXPECT_EQ(std::get<RetentionCutoffCmd>(*decodedRetention).measurement, "cpu");
+    EXPECT_EQ(std::get<RetentionCutoffCmd>(*decodedRetention).policyVersion, 7u);
     EXPECT_EQ(std::get<RetentionCutoffCmd>(*decodedRetention).cutoffTime, 1234u);
 }
 
 TEST(ReplicatedCommandV1, RetentionRequiresAnExactScopedCutoff) {
-    EXPECT_THROW(encodeReplicatedCommand(RetentionCutoffCmd{"", 1}), std::invalid_argument);
-    EXPECT_THROW(encodeReplicatedCommand(RetentionCutoffCmd{"cpu", 0}), std::invalid_argument);
-    EXPECT_THROW(encodeReplicatedCommand(RetentionCutoffCmd{std::string(1025, 'x'), 1}), std::invalid_argument);
-    EXPECT_THROW(encodeReplicatedCommand(RetentionCutoffCmd{std::string("cpu\0foreign", 11), 1}),
+    EXPECT_THROW(encodeReplicatedCommand(RetentionCutoffCmd{0, "cpu", 1, 1}), std::invalid_argument);
+    EXPECT_THROW(encodeReplicatedCommand(RetentionCutoffCmd{1, "", 1, 1}), std::invalid_argument);
+    EXPECT_THROW(encodeReplicatedCommand(RetentionCutoffCmd{1, "cpu", 0, 1}), std::invalid_argument);
+    EXPECT_THROW(encodeReplicatedCommand(RetentionCutoffCmd{1, "cpu", 1, 0}), std::invalid_argument);
+    EXPECT_THROW(encodeReplicatedCommand(RetentionCutoffCmd{1, std::string(1025, 'x'), 1, 1}), std::invalid_argument);
+    EXPECT_THROW(encodeReplicatedCommand(RetentionCutoffCmd{1, std::string("cpu\0foreign", 11), 1, 1}),
                  std::invalid_argument);
+    EXPECT_THROW(encodeReplicatedCommand(RetentionCutoffCmd{1, "cpu\nforeign", 1, 1}), std::invalid_argument);
 }
 
 TEST(ReplicatedCommandV1, DirectWriteEncodingMatchesVariantEncoding) {

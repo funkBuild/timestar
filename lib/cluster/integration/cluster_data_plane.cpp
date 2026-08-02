@@ -19,6 +19,7 @@
 #include <seastar/core/sleep.hh>
 #include <seastar/core/thread.hh>
 #include <seastar/core/timed_out_error.hh>
+#include <seastar/core/when_all.hh>
 #include <seastar/net/dns.hh>
 #include <seastar/net/inet_address.hh>
 #include <set>
@@ -98,6 +99,20 @@ seastar::future<seastar::net::inet_address> resolveHost(const std::string& host)
     if (numeric)
         co_return *numeric;
     co_return co_await seastar::net::dns::resolve_name(seastar::sstring(host));
+}
+
+std::optional<RetentionPolicy> retentionPolicyFromCell(std::string_view measurement, const control::PolicyCell& cell) {
+    if (cell.value.empty())
+        return std::nullopt;
+    const auto value = control::decodeRetentionPolicyValue(cell.value);
+    if (!value)
+        throw std::runtime_error("cluster: committed retention policy value is invalid");
+    RetentionPolicy policy;
+    policy.measurement = measurement;
+    policy.version = cell.version;
+    policy.ttl = value->ttl;
+    policy.ttlNanos = value->ttlNanos;
+    return policy;
 }
 }  // namespace
 
@@ -516,8 +531,10 @@ seastar::future<> ClusterDataPlane::startImpl(const ClusterConfig& cfg, seastar:
         });
         replicated_ = true;
         startLeadershipBalancer();
-        if (controlEnabled_)
+        if (controlEnabled_) {
             startTopologyController();
+            startRetentionController();
+        }
     }
     co_return;
 }
@@ -757,6 +774,105 @@ seastar::future<ClusterDataPlane::ControlMutationResult> ClusterDataPlane::remov
     });
 }
 
+seastar::future<ClusterDataPlane::RetentionMutationResult> ClusterDataPlane::casRetentionPolicy(
+    RetentionPolicy policy, uint64_t expectedVersion) {
+    if (!controlEnabled_ || !replicated_ || !shardsStarted_)
+        throw std::invalid_argument("cluster: group-0 retention control is not configured");
+    if (!control::validRetentionMeasurement(policy.measurement) || policy.ttl.empty() || policy.ttlNanos == 0 ||
+        policy.downsample)
+        throw std::invalid_argument("cluster: v1 retention requires a valid TTL-only policy");
+    co_return co_await shards_.invoke_on(
+        0,
+        [policy = std::move(policy),
+         expectedVersion](ShardRaftPlane& plane) mutable -> seastar::future<RetentionMutationResult> {
+            auto* host = plane.group0();
+            if (!host || !host->group() || !host->stateMachine())
+                co_return RetentionMutationResult{RetentionMutationStatus::NotLeader, raft::kNoNode, 0};
+            auto* group = host->group();
+            const auto leader = [&] { return group->isLeader() ? group->node().id() : group->leader(); };
+            if (!group->isLeader())
+                co_return RetentionMutationResult{RetentionMutationStatus::NotLeader, leader(), 0};
+            control::Group0Controller controller(*group, *host->stateMachine());
+            const bool accepted = co_await controller.casRetentionPolicy(
+                policy.measurement, expectedVersion, control::RetentionPolicyValue{policy.ttl, policy.ttlNanos});
+            const auto current = host->state().policies.find(control::retentionPolicyKey(policy.measurement));
+            const uint64_t version = current == host->state().policies.end() ? 0 : current->second.version;
+            co_return RetentionMutationResult{
+                accepted ? RetentionMutationStatus::Accepted
+                         : (group->isLeader() ? RetentionMutationStatus::Conflict : RetentionMutationStatus::NotLeader),
+                leader(), version};
+        });
+}
+
+seastar::future<ClusterDataPlane::RetentionMutationResult> ClusterDataPlane::deleteRetentionPolicy(
+    std::string measurement, uint64_t expectedVersion) {
+    if (!controlEnabled_ || !replicated_ || !shardsStarted_)
+        throw std::invalid_argument("cluster: group-0 retention control is not configured");
+    if (!control::validRetentionMeasurement(measurement))
+        throw std::invalid_argument("cluster: invalid retention measurement");
+    co_return co_await shards_.invoke_on(
+        0,
+        [measurement = std::move(measurement),
+         expectedVersion](ShardRaftPlane& plane) mutable -> seastar::future<RetentionMutationResult> {
+            auto* host = plane.group0();
+            if (!host || !host->group() || !host->stateMachine())
+                co_return RetentionMutationResult{RetentionMutationStatus::NotLeader, raft::kNoNode, 0};
+            auto* group = host->group();
+            const auto leader = [&] { return group->isLeader() ? group->node().id() : group->leader(); };
+            if (!group->isLeader())
+                co_return RetentionMutationResult{RetentionMutationStatus::NotLeader, leader(), 0};
+            const auto key = control::retentionPolicyKey(measurement);
+            const auto before = host->state().policies.find(key);
+            if (before != host->state().policies.end() && before->second.value.empty() &&
+                expectedVersion != UINT64_MAX && before->second.version == expectedVersion + 1)
+                co_return RetentionMutationResult{RetentionMutationStatus::Accepted, leader(), before->second.version};
+            if (before == host->state().policies.end() || before->second.value.empty())
+                co_return RetentionMutationResult{RetentionMutationStatus::NotFound, leader(),
+                                                  before == host->state().policies.end() ? 0 : before->second.version};
+            control::Group0Controller controller(*group, *host->stateMachine());
+            const bool accepted = co_await controller.casRetentionPolicy(measurement, expectedVersion, std::nullopt);
+            const auto current = host->state().policies.find(key);
+            const uint64_t version = current == host->state().policies.end() ? 0 : current->second.version;
+            co_return RetentionMutationResult{
+                accepted ? RetentionMutationStatus::Accepted
+                         : (group->isLeader() ? RetentionMutationStatus::Conflict : RetentionMutationStatus::NotLeader),
+                leader(), version};
+        });
+}
+
+seastar::future<ClusterDataPlane::RetentionReadResult> ClusterDataPlane::retentionPolicies(
+    std::optional<std::string> measurement) const {
+    if (!controlEnabled_ || !replicated_ || !shardsStarted_)
+        throw std::invalid_argument("cluster: group-0 retention control is not configured");
+    if (measurement && !control::validRetentionMeasurement(*measurement))
+        throw std::invalid_argument("cluster: invalid retention measurement");
+    auto& shards = const_cast<seastar::sharded<ShardRaftPlane>&>(shards_);
+    co_return co_await shards.invoke_on(
+        0, [measurement = std::move(measurement)](ShardRaftPlane& plane) -> RetentionReadResult {
+            auto* host = plane.group0();
+            if (!host || !host->stateMachine())
+                throw std::runtime_error("cluster: group-0 retention state is unavailable");
+            RetentionReadResult out;
+            if (measurement) {
+                const auto found = host->state().policies.find(control::retentionPolicyKey(*measurement));
+                if (found != host->state().policies.end()) {
+                    out.currentVersion = found->second.version;
+                    if (auto policy = retentionPolicyFromCell(*measurement, found->second))
+                        out.policies.push_back(std::move(*policy));
+                }
+                return out;
+            }
+            for (const auto& [key, cell] : host->state().policies) {
+                const auto name = control::retentionMeasurementFromKey(key);
+                if (!name)
+                    continue;
+                if (auto policy = retentionPolicyFromCell(*name, cell))
+                    out.policies.push_back(std::move(*policy));
+            }
+            return out;
+        });
+}
+
 seastar::future<> ClusterDataPlane::setReplicaRetirementCheckpointForTesting(
     uint16_t vshard, ReplicatedVShardHost::RetirementCheckpointHook hook) {
     if (!replicated_ || !shardsStarted_ || vshard >= VIRTUAL_SHARD_COUNT)
@@ -772,6 +888,9 @@ seastar::future<> ClusterDataPlane::stop() {
     peerResolveTimer_.cancel();
     if (!peerResolveGate_.is_closed())
         co_await peerResolveGate_.close();
+    retentionTimer_.cancel();
+    if (!retentionGate_.is_closed())
+        co_await retentionGate_.close();
     // Topology actuation borrows both Group 0 and data groups. Drain it before
     // either the balancer or the per-shard Raft planes can be torn down.
     topologyTimer_.cancel();
@@ -1502,6 +1621,11 @@ seastar::future<ClusterDataPlane::Status> ClusterDataPlane::status() const {
     st.controlDrainReferences = control.drainReferences;
     st.controlDrainBlocked = control.drainBlocked;
     st.controlRemovalsPending = control.removalsPending;
+    st.controlRetentionPolicies = control.retentionPolicies;
+    st.controlRetentionSweepActive = control.retentionSweepActive;
+    st.controlRetentionNextVShard = control.retentionNextVShard;
+    st.controlLastRetentionSweepId = control.lastRetentionSweepId;
+    st.controlRetentionCutoffRecords = control.retentionCutoffRecords;
     st.controlApplyLagEntries = control.applyLagEntries;
     st.controlApplyFailures = control.applyFailures;
     st.controlTickErrors = control.tickErrors;
@@ -1517,6 +1641,9 @@ seastar::future<ClusterDataPlane::Status> ClusterDataPlane::status() const {
     st.controlTopologyPlans = topologyPlans_;
     st.controlTopologyCutovers = topologyCutovers_;
     st.controlTopologyAdvances = topologyAdvances_;
+    st.controlRetentionPasses = retentionPasses_;
+    st.controlRetentionFailures = retentionFailures_;
+    st.controlRetentionCutoffsApplied = retentionCutoffsApplied_;
     co_return st;
 }
 
@@ -1716,6 +1843,89 @@ void ClusterDataPlane::startTopologyController() {
         });
     });
     topologyTimer_.arm_periodic(kInterval);
+}
+
+seastar::future<> ClusterDataPlane::retentionControllerSweep() {
+    ++retentionPasses_;
+    if (!controlEnabled_ || !replicated_ || !shardsStarted_ || !rt_)
+        co_return;
+    auto* host = shards_.local().group0();
+    if (!host || !host->group() || !host->stateMachine())
+        co_return;
+    auto* group0 = host->group();
+    const NodeId self = rt_->selfId;
+    const auto stillController = [&] {
+        const auto& state = host->state();
+        return group0->isLeader() && group0->node().id() == self && state.controllerLeader == self &&
+               state.controllerTerm == group0->currentTerm();
+    };
+    if (!stillController())
+        co_return;
+
+    control::Group0Controller controller(*group0, *host->stateMachine());
+    if (!host->state().retentionSweep) {
+        const auto signedNow =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch())
+                .count();
+        if (signedNow <= 0)
+            co_return;
+        if (auto sweep = control::selectNextRetentionSweep(host->state(), static_cast<uint64_t>(signedNow)))
+            (void)co_await controller.startRetentionSweep(std::move(*sweep));
+        co_return;
+    }
+
+    const control::RetentionSweep sweep = *host->state().retentionSweep;
+    const uint32_t end =
+        std::min<uint32_t>(timestar::VIRTUAL_SHARD_COUNT, sweep.nextVShard + control::kRetentionFanoutBatch);
+    const data::ReplicatedCommand command{
+        data::RetentionCutoffCmd{sweep.sweepId, sweep.measurement, sweep.policyVersion, sweep.cutoffTime}};
+    std::vector<seastar::future<>> proposals;
+    proposals.reserve(end - sweep.nextVShard);
+    for (uint32_t vshard = sweep.nextVShard; vshard < end; ++vshard) {
+        if (!stillController() || host->state().retentionSweep != std::optional<control::RetentionSweep>{sweep})
+            co_return;
+        proposals.push_back(shards_.invoke_on(shardOwningVShard(static_cast<uint16_t>(vshard), dir_.get()),
+                                              [vshard, command](ShardRaftPlane& plane) mutable {
+                                                  return plane.command(static_cast<uint16_t>(vshard),
+                                                                       std::move(command));
+                                              }));
+    }
+    co_await seastar::when_all_succeed(proposals.begin(), proposals.end());
+    retentionCutoffsApplied_ += proposals.size();
+    if (!stillController() || host->state().retentionSweep != std::optional<control::RetentionSweep>{sweep})
+        co_return;
+    (void)co_await controller.advanceRetentionSweep(end);
+}
+
+void ClusterDataPlane::startRetentionController() {
+    static constexpr auto kInterval = std::chrono::seconds(1);
+    retentionTimer_.set_callback([this] {
+        if (retentionRunning_ || retentionGate_.is_closed())
+            return;
+        retentionRunning_ = true;
+        (void)seastar::with_gate(retentionGate_, [this] {
+            return retentionControllerSweep().then_wrapped([this](seastar::future<> f) {
+                try {
+                    f.get();
+                } catch (const std::exception& e) {
+                    ++retentionFailures_;
+                    if (retentionFailures_ == 1 || retentionFailures_ % 1024 == 0)
+                        timestar::http_log.warn(
+                            "cluster: retention-controller pass failed: {} (will retry; occurrence {})", e.what(),
+                            retentionFailures_);
+                } catch (...) {
+                    ++retentionFailures_;
+                    if (retentionFailures_ == 1 || retentionFailures_ % 1024 == 0)
+                        timestar::http_log.warn(
+                            "cluster: retention-controller pass failed with an unknown error (will retry; "
+                            "occurrence {})",
+                            retentionFailures_);
+                }
+                retentionRunning_ = false;
+            });
+        });
+    });
+    retentionTimer_.arm_periodic(kInterval);
 }
 
 void ClusterDataPlane::startLeadershipBalancer() {

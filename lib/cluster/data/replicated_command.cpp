@@ -121,11 +121,12 @@ std::string encodeReplicatedCommand(const ReplicatedCommand& cmd) {
         }
     } else {
         const auto& r = std::get<RetentionCutoffCmd>(cmd);
-        if (r.measurement.empty() || r.measurement.size() > kMaxRetentionMeasurementBytes ||
-            r.measurement.find('\0') != std::string::npos || r.cutoffTime == 0)
+        if (r.sweepId == 0 || !validRetentionMeasurement(r.measurement) || r.policyVersion == 0 || r.cutoffTime == 0)
             throw std::invalid_argument("encodeReplicatedCommand: invalid retention cutoff");
         out.push_back(static_cast<char>(kRetention));
+        putU64(out, r.sweepId);
         putStr(out, r.measurement);
+        putU64(out, r.policyVersion);
         putU64(out, r.cutoffTime);
     }
     putU64(out, fnv1a(out.data(), out.size()));
@@ -185,10 +186,12 @@ std::optional<ReplicatedCommand> decodeReplicatedCommand(const std::string& byte
         cmd = std::move(d);
     } else if (tag == kRetention) {
         RetentionCutoffCmd rc;
+        rc.sweepId = r.u64();
         rc.measurement = r.str();
+        rc.policyVersion = r.u64();
         rc.cutoffTime = r.u64();
-        if (!r.ok || rc.measurement.empty() || rc.measurement.size() > kMaxRetentionMeasurementBytes ||
-            rc.measurement.find('\0') != std::string::npos || rc.cutoffTime == 0)
+        if (!r.ok || rc.sweepId == 0 || !validRetentionMeasurement(rc.measurement) || rc.policyVersion == 0 ||
+            rc.cutoffTime == 0)
             return std::nullopt;
         cmd = std::move(rc);
     } else {

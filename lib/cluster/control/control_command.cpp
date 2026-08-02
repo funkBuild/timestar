@@ -1,5 +1,7 @@
 #include "control_command.hpp"
 
+#include "../../core/vshard.hpp"
+
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -122,9 +124,9 @@ struct Reader {
             ok = false;
         return state;
     }
-    std::string str() {
+    std::string str(size_t maxBytes = std::numeric_limits<size_t>::max()) {
         uint64_t n = u64();
-        if (!ok || !avail(n)) {
+        if (!ok || n > maxBytes || !avail(n)) {
             ok = false;
             return {};
         }
@@ -161,6 +163,8 @@ enum : uint8_t {
     kAdmitWithToken = 10,
     kPublishServingMap = 11,
     kStoreFrozenDeletePlan = 12,
+    kStartRetentionSweep = 13,
+    kAdvanceRetentionSweep = 14,
 };
 
 void writeNode(Writer& w, const NodeRecord& r) {
@@ -260,6 +264,19 @@ std::string encodeCommand(const ControlCommand& cmd) {
         throw std::invalid_argument("invalid group-0 join token");
     if (const auto* admission = std::get_if<AdmitWithToken>(&cmd); admission && !validJoinToken(admission->token))
         throw std::invalid_argument("invalid group-0 admission token");
+    if (const auto* policy = std::get_if<CasPolicy>(&cmd);
+        policy &&
+        (policy->key.empty() || policy->key.size() > kMaxPolicyKeyBytes || policy->value.size() > kMaxPolicyValueBytes))
+        throw std::invalid_argument("invalid group-0 policy cell");
+    if (const auto* sweep = std::get_if<StartRetentionSweep>(&cmd);
+        sweep && (sweep->sweepId == 0 || !validRetentionMeasurement(sweep->measurement) || sweep->policyVersion == 0 ||
+                  sweep->issuedAtNanos == 0 || sweep->cutoffTime == 0))
+        throw std::invalid_argument("invalid group-0 retention sweep");
+    if (const auto* advance = std::get_if<AdvanceRetentionSweep>(&cmd);
+        advance &&
+        (advance->sweepId == 0 || !validRetentionMeasurement(advance->measurement) || advance->policyVersion == 0 ||
+         advance->cutoffTime == 0 || advance->nextVShard > timestar::VIRTUAL_SHARD_COUNT))
+        throw std::invalid_argument("invalid group-0 retention advance");
     Writer w;
     w.out.append(kCommandMagic, sizeof(kCommandMagic));
     std::visit(
@@ -311,6 +328,20 @@ std::string encodeCommand(const ControlCommand& cmd) {
                 w.u8(kPublishServingMap);
                 w.str(c.completedJobId);
                 writeControlMap(w, c.map);
+            } else if constexpr (std::is_same_v<T, StartRetentionSweep>) {
+                w.u8(kStartRetentionSweep);
+                w.u64(c.sweepId);
+                w.str(c.measurement);
+                w.u64(c.policyVersion);
+                w.u64(c.issuedAtNanos);
+                w.u64(c.cutoffTime);
+            } else if constexpr (std::is_same_v<T, AdvanceRetentionSweep>) {
+                w.u8(kAdvanceRetentionSweep);
+                w.u64(c.sweepId);
+                w.str(c.measurement);
+                w.u64(c.policyVersion);
+                w.u64(c.cutoffTime);
+                w.u64(c.nextVShard);
             }
         },
         cmd);
@@ -362,9 +393,9 @@ std::optional<ControlCommand> decodeCommand(const std::string& bytes) {
         }
         case kCasPolicy: {
             CasPolicy c;
-            c.key = r.str();
+            c.key = r.str(kMaxPolicyKeyBytes);
             c.expectedVersion = r.u64();
-            c.value = r.str();
+            c.value = r.str(kMaxPolicyValueBytes);
             cmd = std::move(c);
             break;
         }
@@ -410,6 +441,26 @@ std::optional<ControlCommand> decodeCommand(const std::string& bytes) {
             cmd = std::move(c);
             break;
         }
+        case kStartRetentionSweep: {
+            StartRetentionSweep c;
+            c.sweepId = r.u64();
+            c.measurement = r.str(kMaxRetentionMeasurementBytes);
+            c.policyVersion = r.u64();
+            c.issuedAtNanos = r.u64();
+            c.cutoffTime = r.u64();
+            cmd = std::move(c);
+            break;
+        }
+        case kAdvanceRetentionSweep: {
+            AdvanceRetentionSweep c;
+            c.sweepId = r.u64();
+            c.measurement = r.str(kMaxRetentionMeasurementBytes);
+            c.policyVersion = r.u64();
+            c.cutoffTime = r.u64();
+            c.nextVShard = r.u32();
+            cmd = std::move(c);
+            break;
+        }
         default:
             return std::nullopt;
     }
@@ -422,6 +473,15 @@ std::optional<ControlCommand> decodeCommand(const std::string& bytes) {
     if (const auto* mint = std::get_if<MintJoinToken>(&cmd); mint && !validJoinToken(mint->token))
         return std::nullopt;
     if (const auto* admission = std::get_if<AdmitWithToken>(&cmd); admission && !validJoinToken(admission->token))
+        return std::nullopt;
+    if (const auto* sweep = std::get_if<StartRetentionSweep>(&cmd);
+        sweep && (sweep->sweepId == 0 || !validRetentionMeasurement(sweep->measurement) || sweep->policyVersion == 0 ||
+                  sweep->issuedAtNanos == 0 || sweep->cutoffTime == 0))
+        return std::nullopt;
+    if (const auto* advance = std::get_if<AdvanceRetentionSweep>(&cmd);
+        advance &&
+        (advance->sweepId == 0 || !validRetentionMeasurement(advance->measurement) || advance->policyVersion == 0 ||
+         advance->cutoffTime == 0 || advance->nextVShard > timestar::VIRTUAL_SHARD_COUNT))
         return std::nullopt;
     return cmd;
 }

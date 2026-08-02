@@ -19,6 +19,7 @@ historical-reader guarantees during the greenfield phase.
 | Replicated data command | `TSC1` |
 | VShard snapshot payload | `TSP1` |
 | Control command | `TCC1` |
+| Group-0 retention policy value | `TSRP1` |
 | Frozen delete-plan RPC frame | version byte `1` |
 | Control join RPC frames | version byte `1` |
 | Movement destination/actuation RPC frames | version byte `1`, carried only after the exact-v1 connection handshake |

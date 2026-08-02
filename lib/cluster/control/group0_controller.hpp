@@ -39,6 +39,11 @@ struct DrainMoveDecision {
 
 DrainMoveDecision selectNextDrainMove(const Group0State& state);
 
+// Deterministically choose the first due live retention policy. Wall time is
+// sampled by the current Group-0 leader and carried in the command; replicas
+// never consult their clocks. nullopt also covers an active fan-out.
+std::optional<StartRetentionSweep> selectNextRetentionSweep(const Group0State& state, uint64_t nowNanos);
+
 // Orchestrates the group-0 control plane on top of its RaftGroup: the bootstrap
 // ceremony, node admission, self-managed meta-voter membership (via joint
 // consensus), and controller-term stamping. All mutations are ordinary group-0
@@ -107,6 +112,18 @@ public:
     // one Group-0 command is proposed; a new controller recomputes the same
     // decision from the committed serving map after a crash.
     seastar::future<DrainMoveDecision> planNextDrainMove();
+
+    // Exact-version retention mutation. An empty value is a tombstone and is
+    // accepted only for an existing policy. A same-request retry after success
+    // is idempotent; a different value at the next version is a conflict.
+    seastar::future<bool> casRetentionPolicy(std::string measurement, uint64_t expectedVersion,
+                                             std::optional<RetentionPolicyValue> value);
+
+    // Durable all-VShard fan-out bookkeeping. Starting validates the policy
+    // version/TTL in the state machine; advancing is accepted only for the
+    // exact current sweep and by at most kRetentionFanoutBatch VShards.
+    seastar::future<bool> startRetentionSweep(StartRetentionSweep sweep);
+    seastar::future<bool> advanceRetentionSweep(uint32_t nextVShard);
 
     // Publish the next serving-map epoch only after the named movement job is
     // durably Done. The state machine independently re-derives and validates the

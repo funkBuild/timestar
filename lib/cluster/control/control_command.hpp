@@ -51,6 +51,27 @@ struct CasPolicy {
     std::string value;
 };
 
+// Begin one durable fan-out for the exact current retention policy. sweepId is
+// the next global sequence number. issuedAt is sampled once by the Group-0
+// leader and cutoffTime must equal issuedAtNanos - the committed policy TTL.
+struct StartRetentionSweep {
+    uint64_t sweepId = 0;
+    std::string measurement;
+    uint64_t policyVersion = 0;
+    uint64_t issuedAtNanos = 0;
+    uint64_t cutoffTime = 0;
+};
+
+// Advance the first-not-completed VShard cursor after the controller has
+// observed apply of the exact cutoff through every VShard in the skipped span.
+struct AdvanceRetentionSweep {
+    uint64_t sweepId = 0;
+    std::string measurement;
+    uint64_t policyVersion = 0;
+    uint64_t cutoffTime = 0;
+    uint32_t nextVShard = 0;
+};
+
 // Records the controller epoch (= group-0 term the leader was elected under) and
 // its owning node. The serialized term is a proposal-time hint; committed apply
 // always substitutes the enclosing log entry's term so it cannot be fabricated
@@ -169,9 +190,9 @@ struct ActuateMoveResult {
 // bounded job id and framing. Keep the decoder's pre-allocation bound explicit.
 inline constexpr size_t kMaxActuateMoveFrameBytes = 16 * 1024;
 
-using ControlCommand =
-    std::variant<InitCluster, UpsertNode, SetNodeState, PlanVShardMove, SetMetaVoters, CasPolicy, SetControllerTerm,
-                 UpsertJob, MintJoinToken, AdmitWithToken, StoreFrozenDeletePlan, PublishServingMap>;
+using ControlCommand = std::variant<InitCluster, UpsertNode, SetNodeState, PlanVShardMove, SetMetaVoters, CasPolicy,
+                                    SetControllerTerm, UpsertJob, MintJoinToken, AdmitWithToken, StoreFrozenDeletePlan,
+                                    PublishServingMap, StartRetentionSweep, AdvanceRetentionSweep>;
 
 // Wire serialization for a command (the Raft entry payload). Length-prefixed,
 // self-delimiting; decode returns nullopt on any malformed, truncated, or

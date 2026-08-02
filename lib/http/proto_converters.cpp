@@ -509,6 +509,7 @@ ParsedRetentionPutRequest parseRetentionPutRequest(const void* data, size_t size
     ParsedRetentionPutRequest result;
     result.measurement = req.measurement();
     result.ttl = req.ttl();
+    result.expectedVersion = req.expected_version();
 
     if (req.has_downsample()) {
         ParsedRetentionPutRequest::DownsampleData ds;
@@ -529,6 +530,7 @@ std::string formatRetentionGetResponse(const RetentionPolicyData& policy) {
 
     auto* pbPolicy = resp.mutable_policy();
     pbPolicy->set_measurement(policy.measurement);
+    pbPolicy->set_version(policy.version);
     pbPolicy->set_ttl(policy.ttl);
     pbPolicy->set_ttl_nanos(policy.ttlNanos);
 
@@ -546,7 +548,8 @@ std::string formatRetentionGetResponse(const RetentionPolicyData& policy) {
     return out;
 }
 
-std::string formatStatusResponse(const std::string& status, const std::string& message, const std::string& code) {
+std::string formatStatusResponse(const std::string& status, const std::string& message, const std::string& code,
+                                 uint64_t currentVersion, uint64_t leader) {
     ::timestar_pb::StatusResponse resp;
     resp.set_status(status);
     if (!message.empty()) {
@@ -555,6 +558,10 @@ std::string formatStatusResponse(const std::string& status, const std::string& m
     if (!code.empty()) {
         resp.set_code(code);
     }
+    if (currentVersion)
+        resp.set_current_version(currentVersion);
+    if (leader)
+        resp.set_leader(leader);
 
     std::string out;
     resp.SerializeToString(&out);
@@ -832,17 +839,9 @@ std::string formatHealthResponse(const std::string& status) {
     return out;
 }
 
-std::string formatErrorResponse(const std::string& message, const std::string& code) {
-    ::timestar_pb::StatusResponse resp;
-    resp.set_status("error");
-    resp.set_message(message);
-    if (!code.empty()) {
-        resp.set_code(code);
-    }
-
-    std::string out;
-    resp.SerializeToString(&out);
-    return out;
+std::string formatErrorResponse(const std::string& message, const std::string& code, uint64_t currentVersion,
+                                uint64_t leader) {
+    return formatStatusResponse("error", message, code, currentVersion, leader);
 }
 
 }  // namespace timestar::proto

@@ -872,6 +872,42 @@ TEST(ProtoConverterGap, ParseFunctionsThrowOnCorruptBytes) {
     EXPECT_THROW(parseWriteRequestFast(corrupt, n, 0), std::runtime_error);
 }
 
+TEST(ProtoConverterGap, RetentionCarriesExactCasVersion) {
+    ::timestar_pb::RetentionPutRequest request;
+    request.set_measurement("cpu");
+    request.set_ttl("1h");
+    request.set_expected_version(7);
+    const auto requestBytes = request.SerializeAsString();
+    const auto parsed = parseRetentionPutRequest(requestBytes.data(), requestBytes.size());
+    EXPECT_EQ(parsed.measurement, "cpu");
+    EXPECT_EQ(parsed.ttl, "1h");
+    EXPECT_EQ(parsed.expectedVersion, 7u);
+
+    RetentionPolicyData policy;
+    policy.measurement = "cpu";
+    policy.version = 8;
+    policy.ttl = "1h";
+    policy.ttlNanos = 3'600'000'000'000ULL;
+    ::timestar_pb::RetentionGetResponse response;
+    ASSERT_TRUE(response.ParseFromString(formatRetentionGetResponse(policy)));
+    ASSERT_TRUE(response.has_policy());
+    EXPECT_EQ(response.policy().version(), 8u);
+}
+
+TEST(ProtoConverterGap, StatusResponseCarriesCasRecoveryHints) {
+    ::timestar_pb::StatusResponse response;
+    ASSERT_TRUE(response.ParseFromString(formatErrorResponse("conflict", "RETENTION_CAS_CONFLICT", 8, 3)));
+    EXPECT_EQ(response.status(), "error");
+    EXPECT_EQ(response.code(), "RETENTION_CAS_CONFLICT");
+    EXPECT_EQ(response.current_version(), 8u);
+    EXPECT_EQ(response.leader(), 3u);
+
+    ASSERT_TRUE(response.ParseFromString(formatStatusResponse("success", "deleted", "", 9)));
+    EXPECT_EQ(response.status(), "success");
+    EXPECT_EQ(response.current_version(), 9u);
+    EXPECT_EQ(response.leader(), 0u);
+}
+
 // ============================================================================
 // Fast path: invalid tag VALUE (key validation is covered elsewhere)
 // ============================================================================

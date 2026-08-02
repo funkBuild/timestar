@@ -223,144 +223,153 @@ void set_routes(routes& r) {
     // VShards it hosts, leads, and -- critically -- how many have NO elected leader.
     // A non-zero leaderless count is exactly the condition that makes reads and writes
     // fail, and before this it could only be inferred from query errors.
-    r.add(operation_type::GET, url("/cluster/status"),
-          new function_handler(
-              [](std::unique_ptr<seastar::http::request> /*req*/,
-                 std::unique_ptr<seastar::http::reply> rep) -> seastar::future<std::unique_ptr<seastar::http::reply>> {
-                  rep->set_status(seastar::http::reply::status_type::ok);
-                  rep->set_content_type("json");
-                  if (!g_clusterPartitioned) {
-                      rep->_content = R"({"clustered":false})";
-                      co_return std::move(rep);
-                  }
-                  // The data plane lives on shard 0; hop there for its view.
-                  auto st = co_await seastar::smp::submit_to(0u, [] { return g_clusterDataPlane.status(); });
-                  std::string peers;
-                  for (const auto& [id, addr] : st.peers) {
-                      if (!peers.empty())
-                          peers += ",";
-                      peers +=
-                          "{\"node\":" + std::to_string(id) + ",\"address\":\"" + timestar::jsonEscape(addr) + "\"}";
-                  }
-                  std::string body = "{\"clustered\":true,\"node_id\":" + std::to_string(st.self) +
-                                     ",\"replication_factor\":" + std::to_string(st.replicationFactor) +
-                                     ",\"replicated\":" + (st.replicated ? "true" : "false") + ",\"peers\":[" + peers +
-                                     "],\"unresolved_peers\":" + std::to_string(st.unresolvedPeerCount);
-                  if (st.replicated) {
-                      body += ",\"vshards_hosted\":" + std::to_string(st.vshardsHostedHere) +
-                              ",\"vshards_led\":" + std::to_string(st.vshardsLedHere) +
-                              ",\"vshards_leaderless\":" + std::to_string(st.vshardsLeaderless) +
-                              ",\"healthy\":" + (st.readyForTraffic() ? "true" : "false");
-                      // Replication progress of each peer for the groups we lead. A peer
-                      // far below vshards_led is not acking our appends.
-                      std::string caught;
-                      for (const auto& [peer, n] : st.peerCaughtUp) {
-                          if (!caught.empty())
-                              caught += ",";
-                          caught += "\"" + std::to_string(peer) + "\":" + std::to_string(n);
-                      }
-                      body += ",\"peer_caught_up\":{" + caught + "}";
-                      // THE ACK-CONTRACT GAP (debt D-36). An acknowledged write is
-                      // durable at commit and readable only at apply, so
-                      // apply_lag_entries > 0 names promises this node cannot currently
-                      // keep -- and distinguishes a restart still replaying from data
-                      // that is actually gone, which nothing else here could.
-                      body += ",\"apply_lag_entries\":" + std::to_string(st.applyLagEntries) +
-                              ",\"apply_groups_behind\":" + std::to_string(st.applyGroupsBehind) +
-                              ",\"apply_failures\":" + std::to_string(st.applyFailures) +
-                              ",\"tick_errors\":" + std::to_string(st.tickErrors);
-                      // Raft-log snapshot/compaction (debt D-5/D-6). `snapshots_taken`
-                      // rising is how an operator sees compaction running at all; the chunk
-                      // and install counters are the ONLY way to tell a snapshot-based
-                      // catch-up from an append-based one.
-                      body += ",\"snapshot_trigger\":" + std::string(st.snapshotTriggerEnabled ? "true" : "false") +
-                              ",\"snapshots_taken\":" + std::to_string(st.snapshotsTaken) +
-                              ",\"snapshots_refused_too_large\":" + std::to_string(st.snapshotsRefusedTooLarge) +
-                              ",\"snapshots_skipped_unflushed\":" + std::to_string(st.snapshotsSkippedUnflushed) +
-                              ",\"snapshots_skipped_pending_conversion\":" +
-                              std::to_string(st.snapshotsSkippedPendingConversion) +
-                              ",\"snapshots_skipped_delete_state\":" + std::to_string(st.snapshotsSkippedDeleteState) +
-                              ",\"snapshot_sweeps\":" + std::to_string(st.snapshotSweeps) +
-                              ",\"snapshot_max_entries_since\":" + std::to_string(st.snapshotMaxEntriesSince) +
-                              ",\"snapshot_chunks_sent\":" + std::to_string(st.snapshotChunksSent) +
-                              ",\"snapshots_installed\":" + std::to_string(st.snapshotsInstalled) +
-                              ",\"snapshots_undeliverable\":" + std::to_string(st.snapshotsUndeliverable) +
-                              ",\"snapshot_transfers_restarted\":" + std::to_string(st.snapshotTransfersRestarted) +
-                              ",\"snapshot_transfers_abandoned\":" + std::to_string(st.snapshotTransfersAbandoned) +
-                              ",\"snapshot_production_limit_per_shard\":" +
-                              std::to_string(st.snapshotProductionLimitPerShard);
-                      // Raft journal fsyncs (debt D-10). journal_sync_requests /
-                      // journal_fsyncs is the coalescing factor: 1.0 per-VShard, > 1
-                      // with the shared per-shard journal. The DISK win is invisible on
-                      // tmpfs, so this ratio -- not a throughput number -- is the honest
-                      // evidence that the coalescer is doing anything.
-                      body +=
-                          ",\"journal_shared\":" + std::string(st.journalShared ? "true" : "false") +
-                          ",\"journal_fsyncs\":" + std::to_string(st.journalFsyncs) +
-                          ",\"journal_sync_requests\":" + std::to_string(st.journalSyncRequests) +
-                          ",\"journal_gc_passes\":" + std::to_string(st.journalGcPasses) +
-                          ",\"replicas_retired\":" + std::to_string(st.replicasRetired) +
-                          ",\"retired_journals_reclaimed\":" + std::to_string(st.retiredJournalsReclaimed) +
-                          ",\"journal_segments_deleted\":" + std::to_string(st.journalSegmentsDeleted) +
-                          ",\"journal_segments_pinned_last_pass\":" + std::to_string(st.journalSegmentsPinnedLastPass) +
-                          ",\"journal_records_copied_forward\":" + std::to_string(st.journalRecordsCopiedForward) +
-                          ",\"uncommitted_raft_bytes\":" + std::to_string(st.uncommittedRaftBytes) +
-                          ",\"uncommitted_raft_peak_bytes\":" + std::to_string(st.uncommittedRaftPeakBytes) +
-                          ",\"uncommitted_raft_limit_bytes\":" + std::to_string(st.uncommittedRaftLimitBytes) +
-                          ",\"uncommitted_raft_per_group_limit_bytes\":" +
-                          std::to_string(st.uncommittedRaftPerGroupLimitBytes) +
-                          ",\"uncommitted_raft_refusals\":" + std::to_string(st.uncommittedRaftRefusals);
-                      body +=
-                          ",\"control_enabled\":" + std::string(st.controlEnabled ? "true" : "false") +
-                          ",\"control_hosted\":" + std::string(st.controlHosted ? "true" : "false") +
-                          ",\"control_initialized\":" + std::string(st.controlInitialized ? "true" : "false") +
-                          ",\"control_locally_ready\":" + std::string(st.controlLocallyReady() ? "true" : "false") +
-                          ",\"control_leader_here\":" + std::string(st.controlLeaderHere ? "true" : "false") +
-                          ",\"control_voter\":" + std::string(st.controlVoter ? "true" : "false") +
-                          ",\"control_joint_config\":" + std::string(st.controlJointConfig ? "true" : "false") +
-                          ",\"control_current_term_commit\":" +
-                          std::string(st.controlCurrentTermCommit ? "true" : "false") +
-                          ",\"control_leader\":" + std::to_string(st.controlLeader) +
-                          ",\"control_term\":" + std::to_string(st.controlTerm) +
-                          ",\"control_controller_leader\":" + std::to_string(st.controlControllerLeader) +
-                          ",\"control_controller_term\":" + std::to_string(st.controlControllerTerm) +
-                          ",\"control_commit_index\":" + std::to_string(st.controlCommitIndex) +
-                          ",\"control_applied_index\":" + std::to_string(st.controlAppliedIndex) +
-                          ",\"control_snapshot_index\":" + std::to_string(st.controlSnapshotIndex) +
-                          ",\"control_map_epoch\":" + std::to_string(st.controlMapEpoch) +
-                          ",\"control_serving_map_epoch\":" + std::to_string(st.controlServingMapEpoch) +
-                          ",\"control_nodes\":" + std::to_string(st.controlNodes) +
-                          ",\"control_voters\":" + std::to_string(st.controlVoters) +
-                          ",\"control_learners\":" + std::to_string(st.controlLearners) +
-                          ",\"control_draining_nodes\":" + std::to_string(st.controlDrainingNodes) +
-                          ",\"control_drain_references\":" + std::to_string(st.controlDrainReferences) +
-                          ",\"control_drain_blocked\":" + std::string(st.controlDrainBlocked ? "true" : "false") +
-                          ",\"control_removals_pending\":" + std::to_string(st.controlRemovalsPending) +
-                          ",\"control_apply_lag_entries\":" + std::to_string(st.controlApplyLagEntries) +
-                          ",\"control_apply_failures\":" + std::to_string(st.controlApplyFailures) +
-                          ",\"control_tick_errors\":" + std::to_string(st.controlTickErrors) +
-                          ",\"control_maintenance_passes\":" + std::to_string(st.controlMaintenancePasses) +
-                          ",\"control_maintenance_failures\":" + std::to_string(st.controlMaintenanceFailures) +
-                          ",\"control_compactions_taken\":" + std::to_string(st.controlCompactionsTaken) +
-                          ",\"control_compactions_refused_too_large\":" +
-                          std::to_string(st.controlCompactionsRefusedTooLarge) +
-                          ",\"control_journal_segments_deleted\":" + std::to_string(st.controlJournalSegmentsDeleted) +
-                          ",\"control_controller_stamp_proposals\":" +
-                          std::to_string(st.controlControllerStampProposals) +
-                          ",\"control_controller_actuation_failures\":" +
-                          std::to_string(st.controlControllerActuationFailures) +
-                          ",\"control_topology_passes\":" + std::to_string(st.controlTopologyPasses) +
-                          ",\"control_topology_failures\":" + std::to_string(st.controlTopologyFailures) +
-                          ",\"control_topology_plans\":" + std::to_string(st.controlTopologyPlans) +
-                          ",\"control_topology_cutovers\":" + std::to_string(st.controlTopologyCutovers) +
-                          ",\"control_topology_advances\":" + std::to_string(st.controlTopologyAdvances) +
-                          ",\"protocol_version\":1";
-                  }
-                  body += "}";
-                  rep->_content = std::move(body);
-                  co_return std::move(rep);
-              },
-              "json"));
+    r.add(
+        operation_type::GET, url("/cluster/status"),
+        new function_handler(
+            [](std::unique_ptr<seastar::http::request> /*req*/,
+               std::unique_ptr<seastar::http::reply> rep) -> seastar::future<std::unique_ptr<seastar::http::reply>> {
+                rep->set_status(seastar::http::reply::status_type::ok);
+                rep->set_content_type("json");
+                if (!g_clusterPartitioned) {
+                    rep->_content = R"({"clustered":false})";
+                    co_return std::move(rep);
+                }
+                // The data plane lives on shard 0; hop there for its view.
+                auto st = co_await seastar::smp::submit_to(0u, [] { return g_clusterDataPlane.status(); });
+                std::string peers;
+                for (const auto& [id, addr] : st.peers) {
+                    if (!peers.empty())
+                        peers += ",";
+                    peers += "{\"node\":" + std::to_string(id) + ",\"address\":\"" + timestar::jsonEscape(addr) + "\"}";
+                }
+                std::string body = "{\"clustered\":true,\"node_id\":" + std::to_string(st.self) +
+                                   ",\"replication_factor\":" + std::to_string(st.replicationFactor) +
+                                   ",\"replicated\":" + (st.replicated ? "true" : "false") + ",\"peers\":[" + peers +
+                                   "],\"unresolved_peers\":" + std::to_string(st.unresolvedPeerCount);
+                if (st.replicated) {
+                    body += ",\"vshards_hosted\":" + std::to_string(st.vshardsHostedHere) +
+                            ",\"vshards_led\":" + std::to_string(st.vshardsLedHere) +
+                            ",\"vshards_leaderless\":" + std::to_string(st.vshardsLeaderless) +
+                            ",\"healthy\":" + (st.readyForTraffic() ? "true" : "false");
+                    // Replication progress of each peer for the groups we lead. A peer
+                    // far below vshards_led is not acking our appends.
+                    std::string caught;
+                    for (const auto& [peer, n] : st.peerCaughtUp) {
+                        if (!caught.empty())
+                            caught += ",";
+                        caught += "\"" + std::to_string(peer) + "\":" + std::to_string(n);
+                    }
+                    body += ",\"peer_caught_up\":{" + caught + "}";
+                    // THE ACK-CONTRACT GAP (debt D-36). An acknowledged write is
+                    // durable at commit and readable only at apply, so
+                    // apply_lag_entries > 0 names promises this node cannot currently
+                    // keep -- and distinguishes a restart still replaying from data
+                    // that is actually gone, which nothing else here could.
+                    body += ",\"apply_lag_entries\":" + std::to_string(st.applyLagEntries) +
+                            ",\"apply_groups_behind\":" + std::to_string(st.applyGroupsBehind) +
+                            ",\"apply_failures\":" + std::to_string(st.applyFailures) +
+                            ",\"tick_errors\":" + std::to_string(st.tickErrors);
+                    // Raft-log snapshot/compaction (debt D-5/D-6). `snapshots_taken`
+                    // rising is how an operator sees compaction running at all; the chunk
+                    // and install counters are the ONLY way to tell a snapshot-based
+                    // catch-up from an append-based one.
+                    body += ",\"snapshot_trigger\":" + std::string(st.snapshotTriggerEnabled ? "true" : "false") +
+                            ",\"snapshots_taken\":" + std::to_string(st.snapshotsTaken) +
+                            ",\"snapshots_refused_too_large\":" + std::to_string(st.snapshotsRefusedTooLarge) +
+                            ",\"snapshots_skipped_unflushed\":" + std::to_string(st.snapshotsSkippedUnflushed) +
+                            ",\"snapshots_skipped_pending_conversion\":" +
+                            std::to_string(st.snapshotsSkippedPendingConversion) +
+                            ",\"snapshots_skipped_delete_state\":" + std::to_string(st.snapshotsSkippedDeleteState) +
+                            ",\"snapshot_sweeps\":" + std::to_string(st.snapshotSweeps) +
+                            ",\"snapshot_max_entries_since\":" + std::to_string(st.snapshotMaxEntriesSince) +
+                            ",\"snapshot_chunks_sent\":" + std::to_string(st.snapshotChunksSent) +
+                            ",\"snapshots_installed\":" + std::to_string(st.snapshotsInstalled) +
+                            ",\"snapshots_undeliverable\":" + std::to_string(st.snapshotsUndeliverable) +
+                            ",\"snapshot_transfers_restarted\":" + std::to_string(st.snapshotTransfersRestarted) +
+                            ",\"snapshot_transfers_abandoned\":" + std::to_string(st.snapshotTransfersAbandoned) +
+                            ",\"snapshot_production_limit_per_shard\":" +
+                            std::to_string(st.snapshotProductionLimitPerShard);
+                    // Raft journal fsyncs (debt D-10). journal_sync_requests /
+                    // journal_fsyncs is the coalescing factor: 1.0 per-VShard, > 1
+                    // with the shared per-shard journal. The DISK win is invisible on
+                    // tmpfs, so this ratio -- not a throughput number -- is the honest
+                    // evidence that the coalescer is doing anything.
+                    body +=
+                        ",\"journal_shared\":" + std::string(st.journalShared ? "true" : "false") +
+                        ",\"journal_fsyncs\":" + std::to_string(st.journalFsyncs) +
+                        ",\"journal_sync_requests\":" + std::to_string(st.journalSyncRequests) +
+                        ",\"journal_gc_passes\":" + std::to_string(st.journalGcPasses) +
+                        ",\"replicas_retired\":" + std::to_string(st.replicasRetired) +
+                        ",\"retired_journals_reclaimed\":" + std::to_string(st.retiredJournalsReclaimed) +
+                        ",\"journal_segments_deleted\":" + std::to_string(st.journalSegmentsDeleted) +
+                        ",\"journal_segments_pinned_last_pass\":" + std::to_string(st.journalSegmentsPinnedLastPass) +
+                        ",\"journal_records_copied_forward\":" + std::to_string(st.journalRecordsCopiedForward) +
+                        ",\"uncommitted_raft_bytes\":" + std::to_string(st.uncommittedRaftBytes) +
+                        ",\"uncommitted_raft_peak_bytes\":" + std::to_string(st.uncommittedRaftPeakBytes) +
+                        ",\"uncommitted_raft_limit_bytes\":" + std::to_string(st.uncommittedRaftLimitBytes) +
+                        ",\"uncommitted_raft_per_group_limit_bytes\":" +
+                        std::to_string(st.uncommittedRaftPerGroupLimitBytes) +
+                        ",\"uncommitted_raft_refusals\":" + std::to_string(st.uncommittedRaftRefusals);
+                    body +=
+                        ",\"control_enabled\":" + std::string(st.controlEnabled ? "true" : "false") +
+                        ",\"control_hosted\":" + std::string(st.controlHosted ? "true" : "false") +
+                        ",\"control_initialized\":" + std::string(st.controlInitialized ? "true" : "false") +
+                        ",\"control_locally_ready\":" + std::string(st.controlLocallyReady() ? "true" : "false") +
+                        ",\"control_leader_here\":" + std::string(st.controlLeaderHere ? "true" : "false") +
+                        ",\"control_voter\":" + std::string(st.controlVoter ? "true" : "false") +
+                        ",\"control_joint_config\":" + std::string(st.controlJointConfig ? "true" : "false") +
+                        ",\"control_current_term_commit\":" +
+                        std::string(st.controlCurrentTermCommit ? "true" : "false") +
+                        ",\"control_leader\":" + std::to_string(st.controlLeader) +
+                        ",\"control_term\":" + std::to_string(st.controlTerm) +
+                        ",\"control_controller_leader\":" + std::to_string(st.controlControllerLeader) +
+                        ",\"control_controller_term\":" + std::to_string(st.controlControllerTerm) +
+                        ",\"control_commit_index\":" + std::to_string(st.controlCommitIndex) +
+                        ",\"control_applied_index\":" + std::to_string(st.controlAppliedIndex) +
+                        ",\"control_snapshot_index\":" + std::to_string(st.controlSnapshotIndex) +
+                        ",\"control_map_epoch\":" + std::to_string(st.controlMapEpoch) +
+                        ",\"control_serving_map_epoch\":" + std::to_string(st.controlServingMapEpoch) +
+                        ",\"control_nodes\":" + std::to_string(st.controlNodes) +
+                        ",\"control_voters\":" + std::to_string(st.controlVoters) +
+                        ",\"control_learners\":" + std::to_string(st.controlLearners) +
+                        ",\"control_draining_nodes\":" + std::to_string(st.controlDrainingNodes) +
+                        ",\"control_drain_references\":" + std::to_string(st.controlDrainReferences) +
+                        ",\"control_drain_blocked\":" + std::string(st.controlDrainBlocked ? "true" : "false") +
+                        ",\"control_removals_pending\":" + std::to_string(st.controlRemovalsPending) +
+                        ",\"control_apply_lag_entries\":" + std::to_string(st.controlApplyLagEntries) +
+                        ",\"control_apply_failures\":" + std::to_string(st.controlApplyFailures) +
+                        ",\"control_tick_errors\":" + std::to_string(st.controlTickErrors) +
+                        ",\"control_maintenance_passes\":" + std::to_string(st.controlMaintenancePasses) +
+                        ",\"control_maintenance_failures\":" + std::to_string(st.controlMaintenanceFailures) +
+                        ",\"control_compactions_taken\":" + std::to_string(st.controlCompactionsTaken) +
+                        ",\"control_compactions_refused_too_large\":" +
+                        std::to_string(st.controlCompactionsRefusedTooLarge) +
+                        ",\"control_journal_segments_deleted\":" + std::to_string(st.controlJournalSegmentsDeleted) +
+                        ",\"control_controller_stamp_proposals\":" +
+                        std::to_string(st.controlControllerStampProposals) +
+                        ",\"control_controller_actuation_failures\":" +
+                        std::to_string(st.controlControllerActuationFailures) +
+                        ",\"control_topology_passes\":" + std::to_string(st.controlTopologyPasses) +
+                        ",\"control_topology_failures\":" + std::to_string(st.controlTopologyFailures) +
+                        ",\"control_topology_plans\":" + std::to_string(st.controlTopologyPlans) +
+                        ",\"control_topology_cutovers\":" + std::to_string(st.controlTopologyCutovers) +
+                        ",\"control_topology_advances\":" + std::to_string(st.controlTopologyAdvances) +
+                        ",\"control_retention_policies\":" + std::to_string(st.controlRetentionPolicies) +
+                        ",\"control_retention_sweep_active\":" +
+                        std::string(st.controlRetentionSweepActive ? "true" : "false") +
+                        ",\"control_retention_next_vshard\":" + std::to_string(st.controlRetentionNextVShard) +
+                        ",\"control_retention_last_sweep_id\":" + std::to_string(st.controlLastRetentionSweepId) +
+                        ",\"control_retention_cutoff_records\":" + std::to_string(st.controlRetentionCutoffRecords) +
+                        ",\"control_retention_passes\":" + std::to_string(st.controlRetentionPasses) +
+                        ",\"control_retention_failures\":" + std::to_string(st.controlRetentionFailures) +
+                        ",\"control_retention_cutoffs_applied\":" + std::to_string(st.controlRetentionCutoffsApplied) +
+                        ",\"protocol_version\":1";
+                }
+                body += "}";
+                rep->_content = std::move(body);
+                co_return std::move(rep);
+            },
+            "json"));
 
     // Operator action: hand leadership of VShards this node leads beyond its fair
     // share to lighter peers (M5 leadership balancing == v1 read balancing). Bounded
@@ -679,7 +688,8 @@ void set_routes(routes& r) {
     auto* metadataHandler = emplaceHandler(new timestar::http::HttpMetadataHandler(&g_engine));
     metadataHandler->registerRoutes(r, authToken());
 
-    auto retentionHandlerPtr = std::make_shared<timestar::http::HttpRetentionHandler>(&g_engine, g_clusterPartitioned);
+    auto retentionHandlerPtr = std::make_shared<timestar::http::HttpRetentionHandler>(
+        &g_engine, g_clusterPartitioned, g_clusterPartitioned ? &g_clusterDataPlane : nullptr);
     retentionHandlerPtr->registerRoutes(r, authToken());
     handlers.emplace_back(new std::shared_ptr<timestar::http::HttpRetentionHandler>(retentionHandlerPtr), [](void* p) {
         delete static_cast<std::shared_ptr<timestar::http::HttpRetentionHandler>*>(p);

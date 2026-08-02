@@ -316,6 +316,7 @@ std::string formatCardinalityResponse(const std::string& measurement, double est
 struct ParsedRetentionPutRequest {
     std::string measurement;
     std::string ttl;
+    uint64_t expectedVersion = 0;
     struct DownsampleData {
         std::string after;
         uint64_t afterNanos = 0;
@@ -332,6 +333,7 @@ ParsedRetentionPutRequest parseRetentionPutRequest(const void* data, size_t size
 // Retention policy data for formatting (mirrors RetentionPolicy)
 struct RetentionPolicyData {
     std::string measurement;
+    uint64_t version = 0;
     std::string ttl;
     uint64_t ttlNanos = 0;
     std::optional<ParsedRetentionPutRequest::DownsampleData> downsample;
@@ -342,7 +344,7 @@ std::string formatRetentionGetResponse(const RetentionPolicyData& policy);
 
 // Format a generic status response as serialized StatusResponse proto bytes.
 std::string formatStatusResponse(const std::string& status, const std::string& message = "",
-                                 const std::string& code = "");
+                                 const std::string& code = "", uint64_t currentVersion = 0, uint64_t leader = 0);
 
 // ============================================================================
 // Streaming converters
@@ -403,6 +405,7 @@ std::string formatDerivedQueryError(const std::string& code, const std::string& 
 
 std::string formatHealthResponse(const std::string& status);
 
-std::string formatErrorResponse(const std::string& message, const std::string& code = "");
+std::string formatErrorResponse(const std::string& message, const std::string& code = "", uint64_t currentVersion = 0,
+                                uint64_t leader = 0);
 
 }  // namespace timestar::proto

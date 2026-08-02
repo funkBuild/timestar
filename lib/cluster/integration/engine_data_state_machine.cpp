@@ -77,7 +77,25 @@ seastar::future<> EngineDataStateMachine::apply(raft::LogEntry entry) {
                                                                                  commandHash, batch->issuedAtMs});
     } else {
         const auto& rc = std::get<data::RetentionCutoffCmd>(*cmd);
+        if (retentionCutoff_) {
+            if (rc.sweepId < retentionCutoff_->sweepId)
+                co_return;
+            if (rc.sweepId == retentionCutoff_->sweepId) {
+                if (rc.measurement != retentionCutoff_->measurement ||
+                    rc.policyVersion != retentionCutoff_->policyVersion ||
+                    rc.cutoffTime != retentionCutoff_->cutoffTime)
+                    throw std::runtime_error("EngineDataStateMachine: retention sweep ID collision (fail-stop)");
+                co_return;
+            }
+            if (retentionCutoff_->sweepId == UINT64_MAX || rc.sweepId != retentionCutoff_->sweepId + 1)
+                throw std::runtime_error("EngineDataStateMachine: retention sweep sequence gap (fail-stop)");
+        } else if (rc.sweepId != 1) {
+            throw std::runtime_error(
+                "EngineDataStateMachine: retention sweep sequence does not start at one (fail-stop)");
+        }
         co_await store_.applyRetention(vshard_, rc.measurement, rc.cutoffTime);
+        retentionCutoff_ = data::RetentionCutoffSnapshotState{rc.sweepId, rc.measurement, rc.policyVersion,
+                                                              rc.cutoffTime, entry.index};
     }
 }
 
@@ -103,11 +121,13 @@ seastar::future<> EngineDataStateMachine::applySnapshot(raft::Snapshot snap) {
     data::DeleteReceiptSnapshotState deleteState{payload->deleteReceiptsRetiredBeforeMs,
                                                  payload->deleteReceiptsRetiredAtIndex,
                                                  std::move(payload->deleteReceipts)};
+    auto retentionState = std::move(payload->retentionCutoff);
     const bool installed = co_await store_.installVShardSnapshot(vshard_, std::move(*payload));
     if (!installed)
         throw std::runtime_error(
             "EngineDataStateMachine::applySnapshot: snapshot failed verification and was not installed (fail-stop)");
     restoreDeleteReceiptState(std::move(deleteState), snap.index);
+    restoreRetentionState(std::move(retentionState), snap.index);
     // The snapshot subsumes the log up to snap.index; advance the applied watermark so a
     // subsequent apply() of the post-snapshot suffix is correctly ordered.
     appliedIndex_ = snap.index;
@@ -151,6 +171,26 @@ void EngineDataStateMachine::restoreDeleteReceiptState(data::DeleteReceiptSnapsh
     deleteReceipts_ = std::move(replacement);
     deleteReceiptsRetiredBeforeMs_ = state.retiredBeforeMs;
     deleteReceiptsRetiredAtIndex_ = state.retiredAtIndex;
+}
+
+bool EngineDataStateMachine::canSnapshotRetentionStateThrough(uint64_t snapshotIndex) const {
+    return !retentionCutoff_ || retentionCutoff_->appliedIndex <= snapshotIndex;
+}
+
+std::optional<data::RetentionCutoffSnapshotState> EngineDataStateMachine::retentionStateThrough(
+    uint64_t snapshotIndex) const {
+    if (!canSnapshotRetentionStateThrough(snapshotIndex))
+        throw std::logic_error("EngineDataStateMachine: snapshot boundary precedes retention state");
+    return retentionCutoff_;
+}
+
+void EngineDataStateMachine::restoreRetentionState(std::optional<data::RetentionCutoffSnapshotState> state,
+                                                   uint64_t snapshotIndex) {
+    if (state &&
+        (state->sweepId == 0 || !data::validRetentionMeasurement(state->measurement) || state->policyVersion == 0 ||
+         state->cutoffTime == 0 || state->appliedIndex == 0 || state->appliedIndex > snapshotIndex))
+        throw std::runtime_error("EngineDataStateMachine: invalid snapshot retention cutoff (fail-stop)");
+    retentionCutoff_ = std::move(state);
 }
 
 void EngineDataStateMachine::checkDeleteAdmission(const data::DeleteRangeBatch& command) const {

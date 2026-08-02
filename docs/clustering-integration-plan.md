@@ -1,8 +1,8 @@
 # Cluster integration plan
 
-**Status:** the static RF=3 data path and persistent group-0 host are integrated;
-dynamic topology, replicated retention, streaming snapshots, and final live
-release evidence remain incomplete.
+**Status:** the RF=3 data path, persistent Group 0, production topology changes,
+and replicated TTL retention are integrated. Streaming large snapshots,
+pattern-delete failover evidence, and final release gates remain incomplete.
 
 The authoritative deploy blockers are in
 [cluster-production-readiness.md](cluster-production-readiness.md).
@@ -195,10 +195,14 @@ changes. See [protocol-versioning.md](protocol-versioning.md).
 
 ### 2. Replicate retention
 
-- Store retention policies in group 0.
-- Propose monotonic cutoff commands through every affected VShard group.
-- Gate compaction on committed cutoffs and prove replica convergence.
-- Keep public retention mutation disabled until the complete path passes.
+- [x] Store bounded exact-version TTL policy cells and tombstones in Group 0.
+- [x] Serialize one leader-derived cutoff through all 4,096 VShards with a
+  durable cursor and globally contiguous sweep ID.
+- [x] Snapshot one constant-space retry fence per VShard and fail-stop on ID
+  collision or a missing sequence.
+- [x] Enable clustered HTTP mutation after unit/snapshot tests and a bounded
+  production-server controller-failover/restart gate. Cluster downsampling is
+  rejected in v1.
 
 ### 3. Stream large snapshots
 

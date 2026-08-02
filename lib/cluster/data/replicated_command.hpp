@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <variant>
 #include <vector>
 
@@ -69,11 +70,23 @@ uint64_t deleteRangeCommandHash(const DeleteRangeBatch& command);
 
 inline constexpr size_t kMaxRetentionMeasurementBytes = 1024;
 
+inline bool validRetentionMeasurement(std::string_view measurement) {
+    if (measurement.empty() || measurement.size() > kMaxRetentionMeasurementBytes)
+        return false;
+    for (const unsigned char c : measurement)
+        if (c < 0x20 || c == 0x7f)
+            return false;
+    return true;
+}
+
 // Drop every point for `measurement` older than `cutoffTime` across this
-// command's VShard. The controller computes the cutoff once and replicates this
-// exact value; apply never consults a replica's wall clock.
+// command's VShard. Group 0 assigns a globally contiguous sweepId and permits
+// only one all-VShard fan-out at a time, allowing constant-space retry fencing.
+// The controller computes the cutoff once; apply never consults a local clock.
 struct RetentionCutoffCmd {
+    uint64_t sweepId = 0;
     std::string measurement;
+    uint64_t policyVersion = 0;
     uint64_t cutoffTime = 0;
 };
 

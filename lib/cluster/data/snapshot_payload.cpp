@@ -66,9 +66,9 @@ struct Reader {
         return v;
     }
 
-    std::string blob() {
+    std::string blob(size_t maxBytes = std::numeric_limits<size_t>::max()) {
         const uint64_t n = u64();
-        if (!ok || !avail(n)) {
+        if (!ok || n > maxBytes || !avail(n)) {
             ok = false;
             return {};
         }
@@ -116,6 +116,15 @@ bool validDeleteReceipts(const SnapshotPayload& payload) {
     return true;
 }
 
+bool validRetentionCutoff(const SnapshotPayload& payload) {
+    if (!payload.retentionCutoff)
+        return true;
+    const auto& cutoff = *payload.retentionCutoff;
+    return cutoff.sweepId != 0 && validRetentionMeasurement(cutoff.measurement) && cutoff.policyVersion != 0 &&
+           cutoff.cutoffTime != 0 && cutoff.appliedIndex != 0 &&
+           cutoff.appliedIndex < payload.manifest.snapshotRevision;
+}
+
 void putDeleteReceipts(std::string& out, const std::vector<DeleteOperationReceipt>& receipts) {
     if (receipts.size() > UINT32_MAX)
         throw std::invalid_argument("encodeSnapshotPayload: too many delete receipts");
@@ -152,6 +161,38 @@ bool readDeleteReceipts(Reader& r, const VShardSnapshotManifest& manifest,
     return true;
 }
 
+void putRetentionCutoff(std::string& out, const std::optional<RetentionCutoffSnapshotState>& cutoff) {
+    putU32(out, cutoff ? 1 : 0);
+    if (!cutoff)
+        return;
+    putU64(out, cutoff->sweepId);
+    putBlob(out, cutoff->measurement);
+    putU64(out, cutoff->policyVersion);
+    putU64(out, cutoff->cutoffTime);
+    putU64(out, cutoff->appliedIndex);
+}
+
+bool readRetentionCutoff(Reader& r, const VShardSnapshotManifest& manifest,
+                         std::optional<RetentionCutoffSnapshotState>& cutoff) {
+    const uint32_t present = r.u32();
+    if (!r.ok || present > 1)
+        return false;
+    if (!present)
+        return true;
+    RetentionCutoffSnapshotState decoded;
+    decoded.sweepId = r.u64();
+    decoded.measurement = r.blob(kMaxRetentionMeasurementBytes);
+    decoded.policyVersion = r.u64();
+    decoded.cutoffTime = r.u64();
+    decoded.appliedIndex = r.u64();
+    if (!r.ok || decoded.sweepId == 0 || !validRetentionMeasurement(decoded.measurement) ||
+        decoded.policyVersion == 0 || decoded.cutoffTime == 0 || decoded.appliedIndex == 0 ||
+        decoded.appliedIndex >= manifest.snapshotRevision)
+        return false;
+    cutoff = std::move(decoded);
+    return true;
+}
+
 bool checkTrailer(const std::string& bytes, size_t& bodyLen) {
     if (bytes.size() < 4 + 8)
         return false;
@@ -172,12 +213,14 @@ std::string encodeSnapshotPayload(SnapshotPayload&& payload) {
     if (payload.catalog.empty() || !payload.manifest.valid() ||
         timestar::SeriesCatalog::snapshotHash(payload.catalog) != payload.manifest.catalogHash ||
         !timestar::SeriesCatalog::loadSnapshot(std::span<const char>(payload.catalog.data(), payload.catalog.size())) ||
-        !validDeleteReceipts(payload))
+        !validDeleteReceipts(payload) || !validRetentionCutoff(payload))
         throw std::invalid_argument("encodeSnapshotPayload: invalid v1 snapshot state");
 
     const std::string manifest = payload.manifest.encode();
     size_t total = 4 + 8 + manifest.size() + 8 + payload.catalog.size() + 16 + 4 +
-                   payload.deleteReceipts.size() * kDeleteReceiptBytes + 4 + 8;
+                   payload.deleteReceipts.size() * kDeleteReceiptBytes + 4 + 4 + 8;
+    if (payload.retentionCutoff)
+        total += 8 + payload.retentionCutoff->measurement.size() + 32;
     for (const auto& file : payload.files)
         total += 8 + file.name.size() + 8 + file.bytes.size();
 
@@ -190,6 +233,7 @@ std::string encodeSnapshotPayload(SnapshotPayload&& payload) {
     putU64(out, payload.deleteReceiptsRetiredBeforeMs);
     putU64(out, payload.deleteReceiptsRetiredAtIndex);
     putDeleteReceipts(out, payload.deleteReceipts);
+    putRetentionCutoff(out, payload.retentionCutoff);
     putU32(out, static_cast<uint32_t>(payload.files.size()));
     for (auto& file : payload.files) {
         putBlob(out, file.name);
@@ -225,6 +269,8 @@ std::optional<SnapshotPayload> decodeSnapshotPayload(const std::string& bytes) {
         out.deleteReceiptsRetiredAtIndex >= out.manifest.snapshotRevision ||
         !readDeleteReceipts(r, out.manifest, out.deleteReceipts, out.deleteReceiptsRetiredBeforeMs))
         return std::nullopt;
+    if (!readRetentionCutoff(r, out.manifest, out.retentionCutoff))
+        return std::nullopt;
 
     const uint32_t fileCount = r.u32();
     if (!r.ok || fileCount > static_cast<uint64_t>(r.end - r.p) / 16)
@@ -241,7 +287,7 @@ std::optional<SnapshotPayload> decodeSnapshotPayload(const std::string& bytes) {
     return out;
 }
 
-std::optional<DeleteReceiptSnapshotState> decodeSnapshotDeleteReceiptState(const std::string& bytes) {
+std::optional<DataStateMachineSnapshotState> decodeSnapshotStateMachineState(const std::string& bytes) {
     size_t bodyLen = 0;
     if (!checkTrailer(bytes, bodyLen))
         return std::nullopt;
@@ -252,12 +298,13 @@ std::optional<DeleteReceiptSnapshotState> decodeSnapshotDeleteReceiptState(const
     if (!r.ok || !manifest || !r.skipBlob())
         return std::nullopt;
 
-    DeleteReceiptSnapshotState state;
-    state.retiredBeforeMs = r.u64();
-    state.retiredAtIndex = r.u64();
-    if (!r.ok || (state.retiredBeforeMs == 0) != (state.retiredAtIndex == 0) ||
-        state.retiredAtIndex >= manifest->snapshotRevision ||
-        !readDeleteReceipts(r, *manifest, state.receipts, state.retiredBeforeMs))
+    DataStateMachineSnapshotState state;
+    state.deleteReceipts.retiredBeforeMs = r.u64();
+    state.deleteReceipts.retiredAtIndex = r.u64();
+    if (!r.ok || (state.deleteReceipts.retiredBeforeMs == 0) != (state.deleteReceipts.retiredAtIndex == 0) ||
+        state.deleteReceipts.retiredAtIndex >= manifest->snapshotRevision ||
+        !readDeleteReceipts(r, *manifest, state.deleteReceipts.receipts, state.deleteReceipts.retiredBeforeMs) ||
+        !readRetentionCutoff(r, *manifest, state.retentionCutoff))
         return std::nullopt;
 
     const uint32_t fileCount = r.u32();
@@ -276,6 +323,13 @@ std::optional<std::vector<DeleteOperationReceipt>> decodeSnapshotDeleteReceipts(
     if (!state)
         return std::nullopt;
     return std::move(state->receipts);
+}
+
+std::optional<DeleteReceiptSnapshotState> decodeSnapshotDeleteReceiptState(const std::string& bytes) {
+    auto state = decodeSnapshotStateMachineState(bytes);
+    if (!state)
+        return std::nullopt;
+    return std::move(state->deleteReceipts);
 }
 
 }  // namespace timestar::data

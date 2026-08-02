@@ -97,6 +97,29 @@ DrainMoveDecision selectNextDrainMove(const Group0State& state) {
     return decision;
 }
 
+std::optional<StartRetentionSweep> selectNextRetentionSweep(const Group0State& state, uint64_t nowNanos) {
+    if (state.retentionSweep || nowNanos == 0 || state.lastRetentionSweepId == UINT64_MAX)
+        return std::nullopt;
+    for (const auto& [key, cell] : state.policies) {
+        const auto measurement = retentionMeasurementFromKey(key);
+        if (!measurement || cell.value.empty())
+            continue;
+        const auto policy = decodeRetentionPolicyValue(cell.value);
+        if (!policy || nowNanos <= policy->ttlNanos)
+            continue;
+        const uint64_t cutoff = nowNanos - policy->ttlNanos;
+        uint64_t previous = 0;
+        if (const auto found = state.retentionCutoffs.find(std::string(*measurement));
+            found != state.retentionCutoffs.end())
+            previous = found->second.cutoffTime;
+        if (cutoff <= previous || (previous != 0 && cutoff - previous < kRetentionSweepIntervalNanos))
+            continue;
+        return StartRetentionSweep{state.lastRetentionSweepId + 1, std::string(*measurement), cell.version, nowNanos,
+                                   cutoff};
+    }
+    return std::nullopt;
+}
+
 Group0Controller::Group0Controller(raft::RaftGroup& group0, Group0StateMachine& sm, unsigned metaTarget,
                                    std::chrono::milliseconds proposalTimeout)
     : g0_(group0), sm_(sm), metaTarget_(metaTarget), proposalTimeout_(proposalTimeout) {
@@ -425,6 +448,62 @@ seastar::future<DrainMoveDecision> Group0Controller::planNextDrainMove() {
         co_return decision;
     }
     co_return decision;
+}
+
+seastar::future<bool> Group0Controller::casRetentionPolicy(std::string measurement, uint64_t expectedVersion,
+                                                           std::optional<RetentionPolicyValue> value) {
+    if (!g0_.isLeader() || !validRetentionMeasurement(measurement) || expectedVersion == UINT64_MAX ||
+        (value && !validRetentionPolicyValue(*value)))
+        co_return false;
+    const std::string key = retentionPolicyKey(measurement);
+    const std::string encoded = value ? encodeRetentionPolicyValue(*value) : std::string{};
+    if (const auto existing = sm_.state().policies.find(key); existing != sm_.state().policies.end() &&
+                                                              existing->second.version == expectedVersion + 1 &&
+                                                              existing->second.value == encoded)
+        co_return true;
+    if (!value && !sm_.state().policies.contains(key))
+        co_return false;
+    if (!co_await proposeCommand(CasPolicy{key, expectedVersion, encoded}))
+        co_return false;
+    const auto persisted = sm_.state().policies.find(key);
+    co_return persisted != sm_.state().policies.end() && persisted->second.version == expectedVersion + 1 &&
+        persisted->second.value == encoded;
+}
+
+seastar::future<bool> Group0Controller::startRetentionSweep(StartRetentionSweep sweep) {
+    if (!g0_.isLeader() || sweep.sweepId == 0 || !validRetentionMeasurement(sweep.measurement) ||
+        sweep.policyVersion == 0 || sweep.issuedAtNanos == 0 || sweep.cutoffTime == 0)
+        co_return false;
+    if (sm_.state().retentionSweep == std::optional<RetentionSweep>{RetentionSweep{
+                                          sweep.sweepId, sweep.measurement, sweep.policyVersion, sweep.cutoffTime, 0}})
+        co_return true;
+    if (!co_await proposeCommand(sweep))
+        co_return false;
+    co_return sm_.state().retentionSweep ==
+        std::optional<RetentionSweep>{
+            RetentionSweep{sweep.sweepId, sweep.measurement, sweep.policyVersion, sweep.cutoffTime, 0}};
+}
+
+seastar::future<bool> Group0Controller::advanceRetentionSweep(uint32_t nextVShard) {
+    if (!g0_.isLeader() || !sm_.state().retentionSweep)
+        co_return false;
+    const RetentionSweep current = *sm_.state().retentionSweep;
+    if (nextVShard <= current.nextVShard || nextVShard > timestar::VIRTUAL_SHARD_COUNT ||
+        nextVShard - current.nextVShard > kRetentionFanoutBatch)
+        co_return false;
+    if (!co_await proposeCommand(AdvanceRetentionSweep{current.sweepId, current.measurement, current.policyVersion,
+                                                       current.cutoffTime, nextVShard}))
+        co_return false;
+    if (nextVShard == timestar::VIRTUAL_SHARD_COUNT) {
+        const auto complete = sm_.state().retentionCutoffs.find(current.measurement);
+        co_return !sm_.state().retentionSweep && complete != sm_.state().retentionCutoffs.end() &&
+            complete->second == RetentionCutoffRecord{current.policyVersion, current.cutoffTime};
+    }
+    co_return sm_.state().retentionSweep&& sm_.state().retentionSweep->measurement ==
+        current.measurement&& sm_.state().retentionSweep->sweepId ==
+        current.sweepId&& sm_.state().retentionSweep->policyVersion ==
+        current.policyVersion&& sm_.state().retentionSweep->cutoffTime ==
+        current.cutoffTime&& sm_.state().retentionSweep->nextVShard == nextVShard;
 }
 
 seastar::future<bool> Group0Controller::publishCompletedMove(std::string jobId) {

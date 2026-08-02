@@ -48,11 +48,13 @@ raft::LogEntry deleteBatchEntry(uint64_t index, data::DeleteRangeBatch command) 
     return entry;
 }
 
-raft::LogEntry retentionEntry(uint64_t index, std::string measurement, uint64_t cutoff) {
+raft::LogEntry retentionEntry(uint64_t index, std::string measurement, uint64_t cutoff, uint64_t sweepId = 1,
+                              uint64_t policyVersion = 1) {
     raft::LogEntry entry;
     entry.index = index;
     entry.type = raft::EntryType::Normal;
-    entry.data = data::encodeReplicatedCommand(data::RetentionCutoffCmd{std::move(measurement), cutoff});
+    entry.data =
+        data::encodeReplicatedCommand(data::RetentionCutoffCmd{sweepId, std::move(measurement), policyVersion, cutoff});
     return entry;
 }
 
@@ -202,6 +204,67 @@ TEST_F(EngineDataStateMachineTest, ReplicatedRetentionIsMeasurementAndVShardScop
         EXPECT_EQ(readFloatSeries(*eng, otherMeasurement), (std::vector<double>{3.0}));
         EXPECT_EQ(readFloatSeries(*eng, foreignVShard), (std::vector<double>{4.0}))
             << "a foreign VShard must not be touched by this group's cutoff";
+    }).get();
+}
+
+TEST_F(EngineDataStateMachineTest, RetentionReplayIsIdempotentAndSweepIdsAreContiguous) {
+    seastar::async([] {
+        ScopedShardedEngine eng;
+        eng.start();
+        cluster::EngineLocalStore store(*eng);
+        const std::string key = buildSeriesKey("retention_replay", {{"host", "h1"}}, "value");
+        const uint16_t vshard = timestar::virtualShard(SeriesId128::fromSeriesKey(key));
+        cluster::EngineDataStateMachine sm(store, timestar::VShardId{vshard});
+
+        auto writeAt = [&](uint64_t index, uint64_t timestamp, double value) {
+            auto entry = writeEntry(index, key, value);
+            auto decoded = data::decodeReplicatedCommand(entry.data);
+            auto& batch = std::get<data::WriteBatch>(*decoded);
+            batch.series[0].timestamps[0] = timestamp;
+            entry.data = data::encodeReplicatedCommand(std::move(batch));
+            sm.apply(std::move(entry)).get();
+        };
+
+        writeAt(1, BASE - 100, 1.0);
+        sm.apply(retentionEntry(2, "retention_replay", BASE)).get();
+        EXPECT_TRUE(readFloatSeries(*eng, key).empty());
+
+        writeAt(3, BASE - 50, 2.0);
+        sm.apply(retentionEntry(4, "retention_replay", BASE)).get();
+        EXPECT_EQ(readFloatSeries(*eng, key), (std::vector<double>{2.0}))
+            << "an exact retry must not erase a write ordered after the original cutoff command";
+
+        sm.apply(retentionEntry(5, "retention_replay", BASE + 1, 2, 2)).get();
+        EXPECT_TRUE(readFloatSeries(*eng, key).empty());
+        auto retained = sm.retentionStateThrough(5);
+        ASSERT_TRUE(retained);
+        EXPECT_EQ(retained->sweepId, 2u);
+        EXPECT_EQ(retained->policyVersion, 2u);
+        EXPECT_EQ(retained->cutoffTime, BASE + 1);
+        EXPECT_EQ(retained->appliedIndex, 5u);
+
+        sm.apply(retentionEntry(6, "retention_replay", BASE, 1, 1)).get();
+        EXPECT_EQ(sm.retentionStateThrough(6), retained) << "a superseded sweep retry must be a no-op";
+        EXPECT_THROW(sm.apply(retentionEntry(7, "retention_replay", BASE + 2, 4, 2)).get(), std::runtime_error)
+            << "skipping a globally serialized sweep would lose an idempotency fence";
+    }).get();
+}
+
+TEST_F(EngineDataStateMachineTest, RestoredRetentionFenceProtectsPostSnapshotWrites) {
+    seastar::async([] {
+        ScopedShardedEngine eng;
+        eng.start();
+        cluster::EngineLocalStore store(*eng);
+        const std::string key = buildSeriesKey("retention_snapshot", {{"host", "h1"}}, "value");
+        const uint16_t vshard = timestar::virtualShard(SeriesId128::fromSeriesKey(key));
+        cluster::EngineDataStateMachine sm(store, timestar::VShardId{vshard});
+        sm.restoreRetentionState(data::RetentionCutoffSnapshotState{4, "retention_snapshot", 4, BASE + 1, 7}, 7);
+
+        sm.apply(writeEntry(8, key, 3.0)).get();
+        sm.apply(retentionEntry(9, "retention_snapshot", BASE + 1, 4, 4)).get();
+        EXPECT_EQ(readFloatSeries(*eng, key), (std::vector<double>{3.0}));
+        EXPECT_THROW(sm.restoreRetentionState(data::RetentionCutoffSnapshotState{1, "bad\nname", 1, BASE, 1}, 7),
+                     std::runtime_error);
     }).get();
 }
 

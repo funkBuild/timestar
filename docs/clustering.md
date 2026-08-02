@@ -862,21 +862,29 @@ validation through quorum reads is not part of the initial design.
 ## Deletes, retention, and compaction
 
 - Deletes and retention cutoffs are ordered Raft operations.
-- Only the leader proposes scheduled retention for its VShard. A retention
-  entry embeds the policy version it used; apply validates it and rejects or
-  parks the entry if a newer policy with longer retention is known. Cutoffs
-  are monotonic per VShard (a new cutoff is never below the last committed
-  one), and a leader proposes one only if it refreshed the policy within a
-  bounded freshness window — retention is never urgent enough to act on a
-  stale cache.
+- Group 0 owns exact-version TTL-only policy cells and tombstones. Its current
+  controller samples wall time once, verifies `cutoff = issuedAt - ttl` against
+  the committed policy in the Group-0 state machine, and serializes at most one
+  all-VShard sweep. The durable cursor identifies the first VShard not yet
+  acknowledged; it advances by at most 32 only after every cutoff command in
+  that batch commits and applies.
+- Every completed sweep has one globally contiguous ID. Each VShard stores only
+  its latest ID, measurement, policy version, cutoff, and applied index, so the
+  retry/snapshot fence is constant-space. Exact or older retries are no-ops;
+  reusing an ID for different fields or skipping an ID fail-stops. A snapshot
+  includes the fence only at a boundary covering its apply index; otherwise
+  compaction waits so suffix replay cannot lose the preceding sequence.
+- Completed cutoffs increase per measurement and the same measurement is not
+  swept more often than every 15 minutes. Its policy cannot mutate while its
+  sweep is active. Deletion retains a versioned tombstone and never reverses a
+  completed physical deletion.
 - Followers do not independently choose a wall-clock cutoff. This bans the
   current single-node behaviour inside cluster storage: compaction-embedded
   TTL drops and downsampling both compute `now()` locally today
   (`tsm_compactor.cpp`), which would make replicas diverge permanently. In
   cluster mode compaction may apply only cutoffs at or below the last
   replicated retention operation, and downsampling is disabled in cluster
-  mode v1 (making it a leader-proposed replicated operation is the post-v1
-  path).
+  mode v1 (making it an ordered replicated operation is future work).
 - Tombstones include the replicated revision/index that created them. A
   tombstone object is GC'd only when subsumed by a replicated cutoff or
   compaction watermark at or below the snapshot index any live verification

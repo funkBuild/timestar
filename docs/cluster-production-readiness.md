@@ -152,6 +152,32 @@ inventory and rules.
   VShard catalog in bounded pages, and delete only the selected measurement's
   expired prefix. Validation rejects empty, oversized, NUL-containing, and
   zero-cutoff commands; focused tests prove measurement and VShard isolation.
+- [x] Replicate retention policy and cutoff decisions. Group 0 now owns bounded
+  TTL-only policy cells with exact-version CAS and tombstones, serializes one
+  all-VShard sweep at a time, assigns a globally contiguous sweep ID, verifies
+  the leader-sampled cutoff against the committed policy, and persists the
+  first-unacknowledged VShard cursor. Each batch advances that cursor only after
+  every routed cutoff proposal has committed and applied. Exact and superseded
+  retries are no-ops; ID collisions or sequence gaps fail-stop. Each VShard
+  therefore snapshots only its latest constant-space fence rather than a
+  measurement-by-VShard map. Policy mutation for the measurement being swept is
+  fenced until completion, and clustered downsampling remains rejected.
+- [x] Enable the clustered `PUT/GET/DELETE /retention` API. Mutations reach only
+  the current Group-0 leader, return the committed CAS version, reject stale
+  versions, and make an exact ambiguous retry idempotent. A deleted cell retains
+  its version; JSON and protobuf conflict/not-found responses expose the current
+  version so another client can safely recreate the policy. Input and snapshot
+  codecs bound policy count, measurement, TTL, cursor, and optional fence state.
+- [x] Exercise retention through the production server. The bounded
+  `retention_failover_gate.sh` run on 2026-08-03 started three one-reactor,
+  1-GiB nodes with roots under `build/tmp`, admitted all three Group-0 voters,
+  created/retried/conflicted a policy, killed the controller at durable VShard
+  cursor 128, and completed sweep ID 1 under a new leader across all 4,096
+  VShards. It removed only the expired target point, preserved another
+  measurement and the newer target point, restarted the old leader, recovered
+  the sweep/cutoff state, then proved delete version 2 and recreation as version
+  3. Observed aggregate RSS was about 350 MiB and each live root about 32 MiB;
+  the gate removed all three roots afterward.
 
 ## Remaining production blockers
 
@@ -160,12 +186,6 @@ production deploy.
 
 ### P0 — correctness and topology
 
-- [ ] **Replicate retention policy and cutoff decisions.** Partitioned mode must
-  never let replicas expire or compact different logical ranges. Local-clock
-  sweeping is now disabled and a bounded per-VShard replicated cutoff can be
-  applied safely. Group-0 policy CAS, durable controller cutoff fan-out, and the
-  clustered HTTP policy API remain unfinished; mutation must remain
-  fail-closed until all three are wired and tested.
 - [ ] **Finish the large-snapshot production path.** Snapshot transfer is
   chunked, but snapshot construction/install still needs a bounded streaming
   path that cannot strand a VShard above the current in-memory payload ceiling.
@@ -252,7 +272,10 @@ all acknowledged-point readback. It also proves deterministic whole-node
 evacuation, application-fenced Group-0 eviction, and successful final node
 removal.
 
-The retention-cutoff gate covers exact-v1 validation and round trip, bounded
-catalog pagination, measurement isolation, VShard isolation, and preservation
-of points at or newer than the replicated cutoff. It does not yet constitute
-evidence for Group-0 policy mutation or durable all-VShard controller fan-out.
+The retention unit/socket suites cover exact-v1 command and snapshot framing,
+bounds/corruption rejection, policy CAS and active-sweep fencing, the full
+4,096-VShard cursor, Group-0 snapshot/crash resume, contiguous data-group sweep
+IDs, constant-space fence snapshot/restore, catalog pagination, and measurement
+and VShard isolation. The production retention gate adds current-leader HTTP
+CAS, controller kill after partial progress, durable all-VShard resume, data
+readback, old-controller restart, and tombstone-version recreation.

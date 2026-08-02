@@ -52,7 +52,9 @@ TEST(ControlCommandV1, RoundTripsEveryCommand) {
                                                   MintJoinToken{"token"},
                                                   AdmitWithToken{node(8, "uuid-8", NodeState::Joining), "token"},
                                                   StoreFrozenDeletePlan{plan()},
-                                                  PublishServingMap{ControlMap{1, {{0, {1, 2, 3}}}, {{0, 7}}}, {}}};
+                                                  PublishServingMap{ControlMap{1, {{0, {1, 2, 3}}}, {{0, 7}}}, {}},
+                                                  StartRetentionSweep{1, "cpu", 1, 2'000, 1'000},
+                                                  AdvanceRetentionSweep{1, "cpu", 1, 1'000, 32}};
 
     for (const auto& command : commands) {
         const auto encoded = encodeCommand(command);
@@ -61,6 +63,29 @@ TEST(ControlCommandV1, RoundTripsEveryCommand) {
         ASSERT_TRUE(decoded);
         EXPECT_EQ(decoded->index(), command.index());
     }
+}
+
+TEST(ControlCommandV1, RetentionFramesAreExactAndBounded) {
+    const auto start = StartRetentionSweep{1, "cpu", 7, 10'000, 9'000};
+    const auto decodedStart = decodeCommand(encodeCommand(start));
+    ASSERT_TRUE(decodedStart);
+    EXPECT_EQ(std::get<StartRetentionSweep>(*decodedStart).sweepId, start.sweepId);
+    EXPECT_EQ(std::get<StartRetentionSweep>(*decodedStart).measurement, start.measurement);
+    EXPECT_EQ(std::get<StartRetentionSweep>(*decodedStart).policyVersion, start.policyVersion);
+    EXPECT_EQ(std::get<StartRetentionSweep>(*decodedStart).issuedAtNanos, start.issuedAtNanos);
+    EXPECT_EQ(std::get<StartRetentionSweep>(*decodedStart).cutoffTime, start.cutoffTime);
+
+    const auto advance = AdvanceRetentionSweep{1, "cpu", 7, 9'000, kRetentionFanoutBatch};
+    const auto decodedAdvance = decodeCommand(encodeCommand(advance));
+    ASSERT_TRUE(decodedAdvance);
+    EXPECT_EQ(std::get<AdvanceRetentionSweep>(*decodedAdvance).nextVShard, kRetentionFanoutBatch);
+
+    EXPECT_THROW(encodeCommand(StartRetentionSweep{0, "cpu", 7, 10'000, 9'000}), std::invalid_argument);
+    EXPECT_THROW(encodeCommand(StartRetentionSweep{1, "", 7, 10'000, 9'000}), std::invalid_argument);
+    EXPECT_THROW(encodeCommand(StartRetentionSweep{1, "cpu", 0, 10'000, 9'000}), std::invalid_argument);
+    EXPECT_THROW(encodeCommand(AdvanceRetentionSweep{1, "cpu", 7, 9'000,
+                                                     static_cast<uint32_t>(timestar::VIRTUAL_SHARD_COUNT) + 1}),
+                 std::invalid_argument);
 }
 
 TEST(ControlCommandV1, RejectsTruncationCorruptionAndTrailingBytes) {
@@ -271,6 +296,64 @@ TEST(Group0StateMachineV1, AppliesIdentityPolicyMembershipAndTokens) {
     EXPECT_TRUE(sm.applyCommand(AdmitWithToken{node(5, "uuid-5", NodeState::Joining), "join-once"}));
     EXPECT_FALSE(sm.applyCommand(AdmitWithToken{node(6, "uuid-6", NodeState::Joining), "join-once"}));
     EXPECT_TRUE(sm.applyCommand(SetNodeState{5, NodeState::Active}));
+}
+
+TEST(Group0StateMachineV1, RetentionCasAndFanoutAreCrashReplaySafe) {
+    Group0StateMachine sm;
+    const RetentionPolicyValue policy{"1s", 1'000};
+    const std::string key = retentionPolicyKey("cpu");
+    EXPECT_TRUE(encodeRetentionPolicyValue({"overflow", UINT64_MAX}).empty());
+    ASSERT_TRUE(sm.applyCommand(CasPolicy{key, 0, encodeRetentionPolicyValue(policy)}));
+    EXPECT_EQ(sm.state().policies.at(key), (PolicyCell{1, encodeRetentionPolicyValue(policy)}));
+    EXPECT_FALSE(sm.applyCommand(CasPolicy{key, 0, encodeRetentionPolicyValue({"2s", 2'000})}));
+
+    EXPECT_FALSE(sm.applyCommand(StartRetentionSweep{1, "cpu", 1, 1'000, 1}))
+        << "issued time must be strictly beyond the TTL";
+    EXPECT_FALSE(sm.applyCommand(StartRetentionSweep{1, "cpu", 1, 5'000, 3'999}))
+        << "replicas independently verify the leader-computed cutoff";
+    ASSERT_TRUE(sm.applyCommand(StartRetentionSweep{1, "cpu", 1, 5'000, 4'000}));
+    EXPECT_FALSE(sm.applyCommand(CasPolicy{key, 1, encodeRetentionPolicyValue({"2s", 2'000})}))
+        << "a policy cannot change under an in-flight exact-version fanout";
+    EXPECT_FALSE(sm.applyCommand(AdvanceRetentionSweep{1, "cpu", 1, 4'000, kRetentionFanoutBatch + 1}));
+
+    for (uint32_t next = kRetentionFanoutBatch; next < timestar::VIRTUAL_SHARD_COUNT; next += kRetentionFanoutBatch)
+        ASSERT_TRUE(sm.applyCommand(AdvanceRetentionSweep{1, "cpu", 1, 4'000, next})) << next;
+    ASSERT_TRUE(sm.applyCommand(
+        AdvanceRetentionSweep{1, "cpu", 1, 4'000, static_cast<uint32_t>(timestar::VIRTUAL_SHARD_COUNT)}));
+    EXPECT_FALSE(sm.state().retentionSweep);
+    EXPECT_EQ(sm.state().lastRetentionSweepId, 1u);
+    EXPECT_EQ(sm.state().retentionCutoffs.at("cpu"), (RetentionCutoffRecord{1, 4'000}));
+    EXPECT_FALSE(sm.applyCommand(
+        AdvanceRetentionSweep{1, "cpu", 1, 4'000, static_cast<uint32_t>(timestar::VIRTUAL_SHARD_COUNT)}));
+
+    ASSERT_TRUE(sm.applyCommand(CasPolicy{key, 1, encodeRetentionPolicyValue({"2s", 2'000})}));
+    ASSERT_TRUE(sm.applyCommand(CasPolicy{key, 2, {}}));
+    EXPECT_TRUE(sm.state().policies.at(key).value.empty());
+    EXPECT_FALSE(sm.applyCommand(StartRetentionSweep{2, "cpu", 3, 10'000, 8'000}));
+}
+
+TEST(Group0StateMachineV1, RetentionSweepAndCutoffSurviveSnapshot) {
+    Group0StateMachine source;
+    const auto encoded = encodeRetentionPolicyValue({"15m", kRetentionSweepIntervalNanos});
+    ASSERT_TRUE(source.applyCommand(CasPolicy{retentionPolicyKey("a"), 0, encoded}));
+    ASSERT_TRUE(source.applyCommand(CasPolicy{retentionPolicyKey("b"), 0, encoded}));
+    const uint64_t issued = 2 * kRetentionSweepIntervalNanos;
+    ASSERT_TRUE(source.applyCommand(StartRetentionSweep{1, "a", 1, issued, kRetentionSweepIntervalNanos}));
+    ASSERT_TRUE(source.applyCommand(AdvanceRetentionSweep{1, "a", 1, kRetentionSweepIntervalNanos, 25}));
+
+    Group0StateMachine restored;
+    ASSERT_TRUE(restored.loadSnapshot(source.snapshot()));
+    EXPECT_EQ(restored.state(), source.state());
+
+    for (uint32_t next = 25 + kRetentionFanoutBatch; next < timestar::VIRTUAL_SHARD_COUNT;
+         next += kRetentionFanoutBatch)
+        ASSERT_TRUE(restored.applyCommand(AdvanceRetentionSweep{1, "a", 1, kRetentionSweepIntervalNanos, next}))
+            << next;
+    ASSERT_TRUE(restored.applyCommand(AdvanceRetentionSweep{1, "a", 1, kRetentionSweepIntervalNanos,
+                                                            static_cast<uint32_t>(timestar::VIRTUAL_SHARD_COUNT)}));
+    Group0StateMachine completed;
+    ASSERT_TRUE(completed.loadSnapshot(restored.snapshot()));
+    EXPECT_EQ(completed.state().retentionCutoffs.at("a"), (RetentionCutoffRecord{1, kRetentionSweepIntervalNanos}));
 }
 
 TEST(Group0StateMachineV1, NodeLifecycleIsForwardOnly) {

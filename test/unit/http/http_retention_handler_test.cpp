@@ -281,9 +281,10 @@ TEST_F(HttpRetentionHandlerParseDurationTest, OverflowSaturates) {
 class RetentionPolicyRequestParsingTest : public ::testing::Test {};
 
 TEST_F(RetentionPolicyRequestParsingTest, ParseValidTtlOnly) {
-    auto req = parseRequest(R"({"measurement":"cpu","ttl":"90d"})");
+    auto req = parseRequest(R"({"measurement":"cpu","expectedVersion":7,"ttl":"90d"})");
 
     EXPECT_EQ(req.measurement, "cpu");
+    EXPECT_EQ(req.expectedVersion, 7u);
     ASSERT_TRUE(req.ttl.has_value());
     EXPECT_EQ(*req.ttl, "90d");
     EXPECT_FALSE(req.downsample.has_value());
@@ -600,6 +601,7 @@ class HttpRetentionHandlerGetResponseTest : public ::testing::Test {};
 TEST_F(HttpRetentionHandlerGetResponseTest, SinglePolicyResponseFormat) {
     RetentionPolicy policy;
     policy.measurement = "cpu";
+    policy.version = 7;
     policy.ttl = "90d";
     policy.ttlNanos = 90ULL * 86400ULL * 1'000'000'000ULL;
 
@@ -614,6 +616,7 @@ TEST_F(HttpRetentionHandlerGetResponseTest, SinglePolicyResponseFormat) {
     auto& obj = parsed.get<glz::generic::object_t>();
     EXPECT_EQ(obj["status"].get<std::string>(), "success");
     EXPECT_TRUE(obj.count("policy") > 0);
+    EXPECT_EQ(obj["policy"].get<glz::generic::object_t>()["version"].get<double>(), 7);
 }
 
 TEST_F(HttpRetentionHandlerGetResponseTest, AllPoliciesResponseFormat) {
@@ -710,6 +713,7 @@ class HttpRetentionHandlerPutResponseTest : public ::testing::Test {};
 TEST_F(HttpRetentionHandlerPutResponseTest, SuccessResponseContainsStatusAndPolicy) {
     RetentionPolicy policy;
     policy.measurement = "cpu";
+    policy.version = 3;
     policy.ttl = "90d";
     policy.ttlNanos = 90ULL * 86400ULL * 1'000'000'000ULL;
 
@@ -724,6 +728,7 @@ TEST_F(HttpRetentionHandlerPutResponseTest, SuccessResponseContainsStatusAndPoli
     auto& obj = parsed.get<glz::generic::object_t>();
     EXPECT_EQ(obj["status"].get<std::string>(), "success");
     EXPECT_TRUE(obj.count("policy") > 0);
+    EXPECT_EQ(obj["policy"].get<glz::generic::object_t>()["version"].get<double>(), 3);
 }
 
 TEST_F(HttpRetentionHandlerPutResponseTest, DeleteSuccessResponseFormat) {

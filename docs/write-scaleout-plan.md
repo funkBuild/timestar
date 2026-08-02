@@ -129,10 +129,11 @@ see [ADR 0005](adr/0005-checkquorum-transfer-bypass.md).
   strand a hot VShard.
 - [ ] Prove sustained receipt retirement, snapshot progress, and journal reclaim
   under delete-heavy live load.
-- [ ] Complete production topology changes and ordered VShard teardown through
+- [x] Complete production topology changes and ordered VShard teardown through
   group 0.
-- [ ] Replicate retention decisions before enabling retention mutation in
-  partitioned mode.
+- [x] Replicate exact-version TTL policies and one globally serialized,
+  restart-safe cutoff sequence through every VShard before enabling clustered
+  retention mutation.
 - [ ] Run final same-candidate multi-process gates with explicit per-process
   memory budgets: node kill, restart catch-up, empty-node snapshot, pattern
   delete failover/restart, and durability fault injection.

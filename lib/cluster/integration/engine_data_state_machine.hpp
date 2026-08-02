@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <optional>
 #include <seastar/core/future.hh>
 #include <stdexcept>
 
@@ -82,6 +83,13 @@ public:
     // without reinstalling (or even decoding/copying) its TSM objects.
     void restoreDeleteReceiptState(data::DeleteReceiptSnapshotState state, uint64_t snapshotIndex);
 
+    // Retention policy versions/cutoffs are replicated state too. A snapshot
+    // may include the one global sweep fence only when its boundary covers that
+    // update; otherwise suffix replay would lose the prior fence.
+    bool canSnapshotRetentionStateThrough(uint64_t snapshotIndex) const;
+    std::optional<data::RetentionCutoffSnapshotState> retentionStateThrough(uint64_t snapshotIndex) const;
+    void restoreRetentionState(std::optional<data::RetentionCutoffSnapshotState> state, uint64_t snapshotIndex);
+
     // Entry-payload BYTES applied since the last snapshot install/produce (debt D-6).
     //
     // Half of the snapshot trigger. Entry COUNT bounds restart REPLAY TIME (each entry is
@@ -107,6 +115,7 @@ private:
     std::map<SeriesId128, data::DeleteOperationReceipt> deleteReceipts_;
     uint64_t deleteReceiptsRetiredBeforeMs_ = 0;
     uint64_t deleteReceiptsRetiredAtIndex_ = 0;
+    std::optional<data::RetentionCutoffSnapshotState> retentionCutoff_;
     size_t maxDeleteReceipts_;
 
     void advanceDeleteReceiptFloor(uint64_t floorMs, uint64_t appliedIndex);

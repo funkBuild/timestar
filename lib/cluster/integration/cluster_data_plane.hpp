@@ -323,6 +323,14 @@ public:
         uint64_t controlTopologyPlans = 0;
         uint64_t controlTopologyCutovers = 0;
         uint64_t controlTopologyAdvances = 0;
+        size_t controlRetentionPolicies = 0;
+        bool controlRetentionSweepActive = false;
+        uint32_t controlRetentionNextVShard = 0;
+        uint64_t controlLastRetentionSweepId = 0;
+        size_t controlRetentionCutoffRecords = 0;
+        uint64_t controlRetentionPasses = 0;
+        uint64_t controlRetentionFailures = 0;
+        uint64_t controlRetentionCutoffsApplied = 0;
 
         // This is intentionally LOCAL readiness, not a quorum-health claim.
         // With CheckQuorum disabled an isolated former leader can retain its role;
@@ -399,6 +407,23 @@ public:
                                                            NodeId victim = raft::kNoNode);
     seastar::future<ControlMutationResult> drainControlNode(NodeId node);
     seastar::future<ControlMutationResult> removeControlNode(NodeId node);
+
+    enum class RetentionMutationStatus : uint8_t { Accepted = 0, NotLeader = 1, Conflict = 2, NotFound = 3 };
+    struct RetentionMutationResult {
+        RetentionMutationStatus status = RetentionMutationStatus::Conflict;
+        NodeId leader = raft::kNoNode;
+        uint64_t version = 0;
+    };
+    struct RetentionReadResult {
+        std::vector<RetentionPolicy> policies;
+        // For a single-measurement lookup this is the CAS version of either
+        // the live value or its tombstone. A 404 must expose the latter or a
+        // client that did not perform the delete can never safely recreate it.
+        uint64_t currentVersion = 0;
+    };
+    seastar::future<RetentionMutationResult> casRetentionPolicy(RetentionPolicy policy, uint64_t expectedVersion);
+    seastar::future<RetentionMutationResult> deleteRetentionPolicy(std::string measurement, uint64_t expectedVersion);
+    seastar::future<RetentionReadResult> retentionPolicies(std::optional<std::string> measurement = std::nullopt) const;
 
     // Process-level acceptance gates use this seam to stop at the exact durable
     // active->quarantine boundary. It is inert unless the server explicitly
@@ -484,6 +509,8 @@ private:
     // transition before any later pass may continue.
     seastar::future<> topologyControllerSweep();
     void startTopologyController();
+    seastar::future<> retentionControllerSweep();
+    void startRetentionController();
 
     std::optional<ClusterRuntime> rt_;
     seastar::sharded<Engine>* enginesPtr_ = nullptr;
@@ -531,6 +558,15 @@ private:
     uint64_t topologyPlans_ = 0;
     uint64_t topologyCutovers_ = 0;
     uint64_t topologyAdvances_ = 0;
+
+    // Group-0-persisted retention fan-out. Each pass applies at most one fixed
+    // batch and then advances the durable cursor once.
+    seastar::timer<> retentionTimer_;
+    seastar::gate retentionGate_;
+    bool retentionRunning_ = false;
+    uint64_t retentionPasses_ = 0;
+    uint64_t retentionFailures_ = 0;
+    uint64_t retentionCutoffsApplied_ = 0;
 
     // Standing leadership-balancing loop (M5). Without it a fresh cluster leaves ALL
     // leadership on the first node to start, since it wins every election. Runs a

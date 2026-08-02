@@ -75,6 +75,8 @@ message StatusResponse {
     string status  = 1;  // "success" or "error"
     string message = 2;
     string code    = 3;  // Error code (e.g. "INVALID_JSON", "INVALID_QUERY")
+    uint64 current_version = 4;  // CAS recovery hint (zero when not applicable)
+    uint64 leader = 5;           // Raft leader hint (zero when unknown/not applicable)
 }
 
 // ============================================================================
@@ -285,6 +287,7 @@ message RetentionPolicy {
     string           ttl         = 2;  // Duration string, e.g. "90d"
     uint64           ttl_nanos   = 3;  // Computed nanoseconds
     DownsamplePolicy downsample  = 4;  // Optional downsampling
+    uint64           version     = 5;  // Group-0 CAS version (zero standalone)
 }
 
 // PUT /retention
@@ -292,6 +295,7 @@ message RetentionPutRequest {
     string           measurement = 1;
     string           ttl         = 2;  // Duration string
     DownsamplePolicy downsample  = 3;
+    uint64           expected_version = 4;  // zero creates; updates require the observed version
 }
 
 // GET /retention?measurement=...

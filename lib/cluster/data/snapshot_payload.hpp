@@ -40,6 +40,24 @@ struct DeleteReceiptSnapshotState {
     std::vector<DeleteOperationReceipt> receipts;
 };
 
+// The latest globally ordered sweep applied by this VShard. Group 0 permits
+// only one sweep at a time, so one sequence fence makes every old/exact retry
+// recognizable without a per-measurement map in each of 4,096 state machines.
+struct RetentionCutoffSnapshotState {
+    uint64_t sweepId = 0;
+    std::string measurement;
+    uint64_t policyVersion = 0;
+    uint64_t cutoffTime = 0;
+    uint64_t appliedIndex = 0;
+
+    friend bool operator==(const RetentionCutoffSnapshotState&, const RetentionCutoffSnapshotState&) = default;
+};
+
+struct DataStateMachineSnapshotState {
+    DeleteReceiptSnapshotState deleteReceipts;
+    std::optional<RetentionCutoffSnapshotState> retentionCutoff;
+};
+
 // The monolithic Raft InstallSnapshot payload for a VShard (integration plan M3): the
 // VShardSnapshotManifest, deterministic series catalog, and every data file it
 // references, self-contained so a
@@ -56,6 +74,7 @@ struct SnapshotPayload {
     uint64_t deleteReceiptsRetiredBeforeMs = 0;
     uint64_t deleteReceiptsRetiredAtIndex = 0;
     std::vector<DeleteOperationReceipt> deleteReceipts;
+    std::optional<RetentionCutoffSnapshotState> retentionCutoff;
     std::vector<SnapshotFile> files;  // one per manifest.dataExtents entry, same order
 };
 
@@ -70,6 +89,7 @@ std::optional<SnapshotPayload> decodeSnapshotPayload(const std::string& bytes);
 // helpers verify the outer checksum and complete framing.
 std::optional<std::vector<DeleteOperationReceipt>> decodeSnapshotDeleteReceipts(const std::string& bytes);
 std::optional<DeleteReceiptSnapshotState> decodeSnapshotDeleteReceiptState(const std::string& bytes);
+std::optional<DataStateMachineSnapshotState> decodeSnapshotStateMachineState(const std::string& bytes);
 
 // CONSUMING overload (debt D-32). Byte-for-byte identical output; the difference is
 // what is resident while it runs.

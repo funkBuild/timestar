@@ -1,5 +1,8 @@
 #include "http_retention_handler.hpp"
 
+#include "../cluster/control/group0_state.hpp"
+#include "../cluster/integration/cluster_data_plane.hpp"
+#include "../utils/json_escape.hpp"
 #include "content_negotiation.hpp"
 #include "http_auth.hpp"
 #include "http_error.hpp"
@@ -17,16 +20,15 @@ namespace timestar::http {
 
 namespace {
 
-std::unique_ptr<seastar::http::reply> partitionedRetentionUnsupported(const seastar::http::request& req) {
+std::unique_ptr<seastar::http::reply> partitionedRetentionUnavailable(const seastar::http::request& req) {
     auto reply = std::make_unique<seastar::http::reply>();
     const auto resFmt = timestar::http::responseFormat(req);
-    reply->set_status(seastar::http::reply::status_type::not_implemented);
-    constexpr std::string_view message =
-        "Retention policies are unavailable in partitioned cluster mode until they are replicated through group 0";
+    reply->set_status(seastar::http::reply::status_type::service_unavailable);
+    constexpr std::string_view message = "Cluster retention control is not initialized";
     if (timestar::http::isProtobuf(resFmt))
-        reply->_content = timestar::proto::formatErrorResponse(std::string(message), "CLUSTER_RETENTION_UNSUPPORTED");
+        reply->_content = timestar::proto::formatErrorResponse(std::string(message), "CLUSTER_RETENTION_UNAVAILABLE");
     else
-        reply->_content = timestar::http::jsonError(std::string(message), "CLUSTER_RETENTION_UNSUPPORTED");
+        reply->_content = timestar::http::jsonError(std::string(message), "CLUSTER_RETENTION_UNAVAILABLE");
     timestar::http::setContentType(*reply, resFmt);
     return reply;
 }
@@ -52,10 +54,8 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpRetentionHandler::han
     auto reqFmt = timestar::http::requestFormat(*req);
     auto resFmt = timestar::http::responseFormat(*req);
 
-    // CR-FIX-002: policy storage and cutoff apply are node-local today. Fail
-    // before changing local state so replicas cannot expire different data.
-    if (partitionedCluster_)
-        co_return partitionedRetentionUnsupported(*req);
+    if (partitionedCluster_ && !clusterDataPlane_)
+        co_return partitionedRetentionUnavailable(*req);
 
     if (!engineSharded) {
         reply->set_status(seastar::http::reply::status_type::internal_server_error);
@@ -81,8 +81,17 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpRetentionHandler::han
 
         if (timestar::http::isProtobuf(reqFmt)) {
             // Parse protobuf request
-            auto parsed = timestar::proto::parseRetentionPutRequest(req->content.data(), req->content.size());
+            timestar::proto::ParsedRetentionPutRequest parsed;
+            try {
+                parsed = timestar::proto::parseRetentionPutRequest(req->content.data(), req->content.size());
+            } catch (const std::runtime_error& e) {
+                reply->set_status(seastar::http::reply::status_type::bad_request);
+                reply->_content = timestar::proto::formatErrorResponse(e.what());
+                timestar::http::setContentType(*reply, resFmt);
+                co_return reply;
+            }
             policyReq.measurement = std::move(parsed.measurement);
+            policyReq.expectedVersion = parsed.expectedVersion;
             policyReq.ttl = std::move(parsed.ttl);
             if (parsed.downsample.has_value()) {
                 DownsamplePolicy ds;
@@ -115,6 +124,13 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpRetentionHandler::han
             co_return reply;
         }
 
+        if (partitionedCluster_ && policyReq.measurement.size() > timestar::control::kMaxRetentionMeasurementBytes) {
+            reply->set_status(seastar::http::reply::status_type::bad_request);
+            reply->_content = createErrorResponse("Measurement name is too long");
+            timestar::http::setContentType(*reply, resFmt);
+            co_return reply;
+        }
+
         // Validate measurement name (no control characters or index key separators)
         for (char c : policyReq.measurement) {
             if (static_cast<unsigned char>(c) < 0x20 || c == '\x7f') {
@@ -138,6 +154,12 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpRetentionHandler::han
 
         if (policyReq.ttl.has_value()) {
             policy.ttl = *policyReq.ttl;
+            if (partitionedCluster_ && policy.ttl.size() > timestar::control::kMaxRetentionTtlBytes) {
+                reply->set_status(seastar::http::reply::status_type::bad_request);
+                reply->_content = createErrorResponse("Cluster retention ttl is too long");
+                timestar::http::setContentType(*reply, resFmt);
+                co_return reply;
+            }
             try {
                 policy.ttlNanos = parseDuration(policy.ttl);
             } catch (const std::exception& e) {
@@ -207,24 +229,57 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpRetentionHandler::han
             }
         }
 
-        // Write to NativeIndex on shard 0
-        // NOTE: Retention policies are stored on shard 0 only. In a future multi-server
-        // deployment, this should be replicated to all shards or moved to cluster-wide config.
-        co_await engineSharded->invoke_on(0, [policy](Engine& engine) -> seastar::future<> {
-            co_await engine.getIndex().setRetentionPolicy(policy);
-        });
+        if (partitionedCluster_) {
+            if (!policy.ttlNanos || policy.ttlNanos == UINT64_MAX || policy.downsample) {
+                reply->set_status(seastar::http::reply::status_type::bad_request);
+                reply->_content = createErrorResponse(
+                    "Cluster v1 retention requires a finite, positive ttl and does not support downsampling");
+                timestar::http::setContentType(*reply, resFmt);
+                co_return reply;
+            }
+            const auto result = co_await seastar::smp::submit_to(
+                0u, [cluster = clusterDataPlane_, policy, expected = policyReq.expectedVersion]() mutable {
+                    return cluster->casRetentionPolicy(std::move(policy), expected);
+                });
+            using Status = timestar::cluster::ClusterDataPlane::RetentionMutationStatus;
+            if (result.status != Status::Accepted) {
+                if (result.status == Status::NotLeader)
+                    reply->set_status(result.leader == timestar::raft::kNoNode
+                                          ? seastar::http::reply::status_type::service_unavailable
+                                          : seastar::http::reply::status_type::conflict);
+                else
+                    reply->set_status(seastar::http::reply::status_type::conflict);
+                const std::string message =
+                    result.status == Status::NotLeader ? "control leader changed" : "retention policy CAS conflict";
+                if (timestar::http::isProtobuf(resFmt))
+                    reply->_content = timestar::proto::formatErrorResponse(message, "RETENTION_CAS_CONFLICT",
+                                                                           result.version, result.leader);
+                else
+                    reply->_content = "{\"status\":\"error\",\"error\":\"" + timestar::jsonEscape(message) +
+                                      "\",\"leader\":" + std::to_string(result.leader) +
+                                      ",\"currentVersion\":" + std::to_string(result.version) + "}";
+                timestar::http::setContentType(*reply, resFmt);
+                co_return reply;
+            }
+            policy.version = result.version;
+        } else {
+            // Standalone mode retains the local NativeIndex/cache path.
+            co_await engineSharded->invoke_on(0, [policy](Engine& engine) -> seastar::future<> {
+                co_await engine.getIndex().setRetentionPolicy(policy);
+            });
 
-        // Broadcast to all shards' caches
-        co_await engineSharded->invoke_on_all([policy](Engine& engine) {
-            engine.updateRetentionPolicyCache(policy);
-            return seastar::make_ready_future<>();
-        });
+            co_await engineSharded->invoke_on_all([policy](Engine& engine) {
+                engine.updateRetentionPolicyCache(policy);
+                return seastar::make_ready_future<>();
+            });
+        }
 
         // Build response
         reply->set_status(seastar::http::reply::status_type::ok);
         if (timestar::http::isProtobuf(resFmt)) {
             timestar::proto::RetentionPolicyData policyData;
             policyData.measurement = policy.measurement;
+            policyData.version = policy.version;
             policyData.ttl = policy.ttl;
             policyData.ttlNanos = policy.ttlNanos;
             if (policy.downsample.has_value()) {
@@ -242,14 +297,10 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpRetentionHandler::han
             reply->_content = glz::write_json(responseObj).value_or("{}");
         }
 
-    } catch (const std::runtime_error& e) {
-        // Protobuf parse errors come as runtime_error
+    } catch (const std::invalid_argument& e) {
         reply->set_status(seastar::http::reply::status_type::bad_request);
-        if (timestar::http::isProtobuf(resFmt)) {
-            reply->_content = timestar::proto::formatErrorResponse(e.what());
-        } else {
-            reply->_content = createErrorResponse(e.what());
-        }
+        reply->_content = timestar::http::isProtobuf(resFmt) ? timestar::proto::formatErrorResponse(e.what())
+                                                             : createErrorResponse(e.what());
     } catch (const std::exception& e) {
         timestar::http_log.error("Retention PUT handler error: {}", e.what());
         reply->set_status(seastar::http::reply::status_type::internal_server_error);
@@ -266,8 +317,8 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpRetentionHandler::han
 
 seastar::future<std::unique_ptr<seastar::http::reply>> HttpRetentionHandler::handleGet(
     std::unique_ptr<seastar::http::request> req) {
-    if (partitionedCluster_)
-        co_return partitionedRetentionUnsupported(*req);
+    if (partitionedCluster_ && !clusterDataPlane_)
+        co_return partitionedRetentionUnavailable(*req);
 
     auto reply = std::make_unique<seastar::http::reply>();
     auto resFmt = timestar::http::responseFormat(*req);
@@ -292,6 +343,52 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpRetentionHandler::han
                 co_return reply;
             }
         }
+        if (partitionedCluster_ && measurement.size() > timestar::control::kMaxRetentionMeasurementBytes) {
+            reply->set_status(seastar::http::reply::status_type::bad_request);
+            reply->_content = createErrorResponse("Measurement name is too long");
+            timestar::http::setContentType(*reply, resFmt);
+            co_return reply;
+        }
+
+        if (partitionedCluster_) {
+            auto result = co_await seastar::smp::submit_to(0u, [cluster = clusterDataPlane_, measurement]() {
+                return cluster->retentionPolicies(measurement.empty() ? std::nullopt
+                                                                      : std::optional<std::string>{measurement});
+            });
+            if (!measurement.empty() && result.policies.empty()) {
+                reply->set_status(seastar::http::reply::status_type::not_found);
+                const std::string message = "No retention policy found for measurement: " + measurement;
+                reply->_content =
+                    timestar::http::isProtobuf(resFmt)
+                        ? timestar::proto::formatErrorResponse(message, "RETENTION_NOT_FOUND", result.currentVersion)
+                        : "{\"status\":\"error\",\"error\":\"" + timestar::jsonEscape(message) +
+                              "\",\"currentVersion\":" + std::to_string(result.currentVersion) + "}";
+            } else if (!measurement.empty()) {
+                reply->set_status(seastar::http::reply::status_type::ok);
+                if (timestar::http::isProtobuf(resFmt)) {
+                    timestar::proto::RetentionPolicyData policyData;
+                    policyData.measurement = result.policies.front().measurement;
+                    policyData.version = result.policies.front().version;
+                    policyData.ttl = result.policies.front().ttl;
+                    policyData.ttlNanos = result.policies.front().ttlNanos;
+                    reply->_content = timestar::proto::formatRetentionGetResponse(policyData);
+                } else {
+                    auto responseObj = glz::obj{"status", "success", "policy", result.policies.front()};
+                    reply->_content = glz::write_json(responseObj).value_or("{}");
+                }
+            } else {
+                reply->set_status(seastar::http::reply::status_type::ok);
+                if (timestar::http::isProtobuf(resFmt))
+                    reply->_content = timestar::proto::formatStatusResponse(
+                        "success", std::to_string(result.policies.size()) + " retention policies");
+                else {
+                    auto responseObj = glz::obj{"status", "success", "policies", result.policies};
+                    reply->_content = glz::write_json(responseObj).value_or("{}");
+                }
+            }
+            timestar::http::setContentType(*reply, resFmt);
+            co_return reply;
+        }
 
         if (!measurement.empty()) {
             // Get single policy
@@ -303,6 +400,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpRetentionHandler::han
                 if (timestar::http::isProtobuf(resFmt)) {
                     timestar::proto::RetentionPolicyData policyData;
                     policyData.measurement = policyOpt->measurement;
+                    policyData.version = policyOpt->version;
                     policyData.ttl = policyOpt->ttl;
                     policyData.ttlNanos = policyOpt->ttlNanos;
                     if (policyOpt->downsample.has_value()) {
@@ -360,8 +458,8 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpRetentionHandler::han
 
 seastar::future<std::unique_ptr<seastar::http::reply>> HttpRetentionHandler::handleDelete(
     std::unique_ptr<seastar::http::request> req) {
-    if (partitionedCluster_)
-        co_return partitionedRetentionUnsupported(*req);
+    if (partitionedCluster_ && !clusterDataPlane_)
+        co_return partitionedRetentionUnavailable(*req);
 
     auto reply = std::make_unique<seastar::http::reply>();
     auto resFmt = timestar::http::responseFormat(*req);
@@ -391,6 +489,72 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpRetentionHandler::han
                 timestar::http::setContentType(*reply, resFmt);
                 co_return reply;
             }
+        }
+        if (partitionedCluster_ && measurement.size() > timestar::control::kMaxRetentionMeasurementBytes) {
+            reply->set_status(seastar::http::reply::status_type::bad_request);
+            reply->_content = createErrorResponse("Measurement name is too long");
+            timestar::http::setContentType(*reply, resFmt);
+            co_return reply;
+        }
+
+        if (partitionedCluster_) {
+            uint64_t expectedVersion = 0;
+            const std::string expectedText = req->get_query_param("expected_version");
+            if (!expectedText.empty()) {
+                try {
+                    size_t parsed = 0;
+                    expectedVersion = std::stoull(expectedText, &parsed);
+                    if (parsed != expectedText.size())
+                        throw std::invalid_argument("trailing characters");
+                } catch (const std::exception&) {
+                    reply->set_status(seastar::http::reply::status_type::bad_request);
+                    reply->_content = createErrorResponse("expected_version must be an unsigned integer");
+                    timestar::http::setContentType(*reply, resFmt);
+                    co_return reply;
+                }
+            }
+            const auto result = co_await seastar::smp::submit_to(
+                0u, [cluster = clusterDataPlane_, measurement, expectedVersion]() mutable {
+                    return cluster->deleteRetentionPolicy(std::move(measurement), expectedVersion);
+                });
+            using Status = timestar::cluster::ClusterDataPlane::RetentionMutationStatus;
+            if (result.status == Status::Accepted) {
+                reply->set_status(seastar::http::reply::status_type::ok);
+                if (timestar::http::isProtobuf(resFmt))
+                    reply->_content = timestar::proto::formatStatusResponse(
+                        "success", "Retention policy deleted for measurement: " + measurement, "", result.version);
+                else {
+                    std::string deletedMsg = "Retention policy deleted for measurement: " + measurement;
+                    auto responseObj = glz::obj{"status", "success", "message", deletedMsg, "version", result.version};
+                    reply->_content = glz::write_json(responseObj).value_or("{}");
+                }
+            } else if (result.status == Status::NotFound) {
+                reply->set_status(seastar::http::reply::status_type::not_found);
+                const std::string message = "No retention policy found for measurement: " + measurement;
+                reply->_content =
+                    timestar::http::isProtobuf(resFmt)
+                        ? timestar::proto::formatErrorResponse(message, "RETENTION_NOT_FOUND", result.version)
+                        : "{\"status\":\"error\",\"error\":\"" + timestar::jsonEscape(message) +
+                              "\",\"currentVersion\":" + std::to_string(result.version) + "}";
+            } else {
+                if (result.status == Status::NotLeader)
+                    reply->set_status(result.leader == timestar::raft::kNoNode
+                                          ? seastar::http::reply::status_type::service_unavailable
+                                          : seastar::http::reply::status_type::conflict);
+                else
+                    reply->set_status(seastar::http::reply::status_type::conflict);
+                const std::string message =
+                    result.status == Status::NotLeader ? "control leader changed" : "retention policy CAS conflict";
+                if (timestar::http::isProtobuf(resFmt))
+                    reply->_content = timestar::proto::formatErrorResponse(message, "RETENTION_CAS_CONFLICT",
+                                                                           result.version, result.leader);
+                else
+                    reply->_content = "{\"status\":\"error\",\"error\":\"" + timestar::jsonEscape(message) +
+                                      "\",\"leader\":" + std::to_string(result.leader) +
+                                      ",\"currentVersion\":" + std::to_string(result.version) + "}";
+            }
+            timestar::http::setContentType(*reply, resFmt);
+            co_return reply;
         }
 
         bool deleted = co_await engineSharded->invoke_on(

@@ -227,9 +227,43 @@ bool validSnapshotState(const Group0State& state) {
         return false;
     if (!state.metaVoters.empty() && !validNodeSet(state.metaVoters))
         return false;
-    for (const auto& [key, cell] : state.policies)
-        if (key.empty() || cell.version == 0)
+    size_t retentionPolicies = 0;
+    for (const auto& [key, cell] : state.policies) {
+        if (key.empty() || key.size() > kMaxPolicyKeyBytes || cell.version == 0 ||
+            cell.value.size() > kMaxPolicyValueBytes)
             return false;
+        const auto measurement = retentionMeasurementFromKey(key);
+        if (key.starts_with(kRetentionPolicyPrefix) && !measurement)
+            return false;
+        if (measurement) {
+            ++retentionPolicies;
+            if ((!cell.value.empty() && !decodeRetentionPolicyValue(cell.value)) ||
+                !validRetentionMeasurement(*measurement))
+                return false;
+        }
+    }
+    if (retentionPolicies > kMaxRetentionPolicies || state.retentionCutoffs.size() > kMaxRetentionPolicies ||
+        (state.lastRetentionSweepId == 0) != state.retentionCutoffs.empty())
+        return false;
+    for (const auto& [measurement, cutoff] : state.retentionCutoffs) {
+        const auto policy = state.policies.find(retentionPolicyKey(measurement));
+        if (!validRetentionMeasurement(measurement) || cutoff.policyVersion == 0 || cutoff.cutoffTime == 0 ||
+            policy == state.policies.end() || cutoff.policyVersion > policy->second.version)
+            return false;
+    }
+    if (state.retentionSweep) {
+        const auto& sweep = *state.retentionSweep;
+        const auto policy = state.policies.find(retentionPolicyKey(sweep.measurement));
+        if (state.lastRetentionSweepId == UINT64_MAX || sweep.sweepId != state.lastRetentionSweepId + 1 ||
+            !validRetentionMeasurement(sweep.measurement) || sweep.policyVersion == 0 || sweep.cutoffTime == 0 ||
+            sweep.nextVShard >= timestar::VIRTUAL_SHARD_COUNT || policy == state.policies.end() ||
+            policy->second.version != sweep.policyVersion || policy->second.value.empty() ||
+            !decodeRetentionPolicyValue(policy->second.value))
+            return false;
+        if (const auto previous = state.retentionCutoffs.find(sweep.measurement);
+            previous != state.retentionCutoffs.end() && sweep.cutoffTime <= previous->second.cutoffTime)
+            return false;
+    }
     if (state.jobs.size() > kMaxControlJobs || state.desiredPlacement.size() > kMaxControlJobs ||
         state.jobs.size() != state.desiredPlacement.size())
         return false;
@@ -443,7 +477,25 @@ bool Group0StateMachine::applyCommand(const ControlCommand& cmd) {
                 // leave state exactly unchanged (no phantom version-0 cell).
                 auto it = state_.policies.find(c.key);
                 const uint64_t curVer = (it == state_.policies.end()) ? 0 : it->second.version;
-                if (!c.key.empty() && curVer == c.expectedVersion) {
+                bool valid = !c.key.empty() && c.key.size() <= kMaxPolicyKeyBytes &&
+                             c.value.size() <= kMaxPolicyValueBytes && curVer == c.expectedVersion &&
+                             curVer != UINT64_MAX;
+                const auto measurement = retentionMeasurementFromKey(c.key);
+                if (c.key.starts_with(kRetentionPolicyPrefix) && !measurement)
+                    valid = false;
+                if (measurement) {
+                    size_t retentionPolicies = 0;
+                    for (const auto& [key, cell] : state_.policies) {
+                        (void)cell;
+                        retentionPolicies += retentionMeasurementFromKey(key).has_value();
+                    }
+                    valid = valid &&
+                            (!c.value.empty() ? decodeRetentionPolicyValue(c.value).has_value()
+                                              : it != state_.policies.end()) &&
+                            (!state_.retentionSweep || state_.retentionSweep->measurement != *measurement) &&
+                            (it != state_.policies.end() || retentionPolicies < kMaxRetentionPolicies);
+                }
+                if (valid) {
                     PolicyCell& cell = state_.policies[c.key];  // insert only on success
                     ++cell.version;
                     cell.value = c.value;
@@ -567,6 +619,42 @@ bool Group0StateMachine::applyCommand(const ControlCommand& cmd) {
                             state_.servingMap = c.map;
                     }
                 }
+            } else if constexpr (std::is_same_v<T, StartRetentionSweep>) {
+                const auto policy = state_.policies.find(retentionPolicyKey(c.measurement));
+                const auto decoded = policy == state_.policies.end() || policy->second.value.empty()
+                                         ? std::optional<RetentionPolicyValue>{}
+                                         : decodeRetentionPolicyValue(policy->second.value);
+                uint64_t previousCutoff = 0;
+                if (const auto previous = state_.retentionCutoffs.find(c.measurement);
+                    previous != state_.retentionCutoffs.end())
+                    previousCutoff = previous->second.cutoffTime;
+                const bool sufficientlyAdvanced =
+                    c.cutoffTime > previousCutoff &&
+                    (previousCutoff == 0 || c.cutoffTime - previousCutoff >= kRetentionSweepIntervalNanos);
+                if (state_.retentionSweep || state_.lastRetentionSweepId == UINT64_MAX ||
+                    c.sweepId != state_.lastRetentionSweepId + 1 || !validRetentionMeasurement(c.measurement) ||
+                    !decoded || policy->second.version != c.policyVersion || c.issuedAtNanos <= decoded->ttlNanos ||
+                    c.cutoffTime != c.issuedAtNanos - decoded->ttlNanos || !sufficientlyAdvanced) {
+                    ok = false;
+                } else {
+                    state_.retentionSweep = RetentionSweep{c.sweepId, c.measurement, c.policyVersion, c.cutoffTime, 0};
+                }
+            } else if constexpr (std::is_same_v<T, AdvanceRetentionSweep>) {
+                if (!state_.retentionSweep || state_.retentionSweep->sweepId != c.sweepId ||
+                    state_.retentionSweep->measurement != c.measurement ||
+                    state_.retentionSweep->policyVersion != c.policyVersion ||
+                    state_.retentionSweep->cutoffTime != c.cutoffTime ||
+                    c.nextVShard <= state_.retentionSweep->nextVShard ||
+                    c.nextVShard - state_.retentionSweep->nextVShard > kRetentionFanoutBatch ||
+                    c.nextVShard > timestar::VIRTUAL_SHARD_COUNT) {
+                    ok = false;
+                } else if (c.nextVShard == timestar::VIRTUAL_SHARD_COUNT) {
+                    state_.retentionCutoffs[c.measurement] = RetentionCutoffRecord{c.policyVersion, c.cutoffTime};
+                    state_.lastRetentionSweepId = c.sweepId;
+                    state_.retentionSweep.reset();
+                } else {
+                    state_.retentionSweep->nextVShard = c.nextVShard;
+                }
             }
         },
         cmd);
@@ -662,6 +750,21 @@ std::string Group0StateMachine::snapshot() const {
         (void)requestId;
         writeFrozenDeletePlan(w, plan);
     }
+    w.u64(state_.lastRetentionSweepId);
+    w.u8(state_.retentionSweep.has_value() ? 1 : 0);
+    if (state_.retentionSweep) {
+        w.u64(state_.retentionSweep->sweepId);
+        w.str(state_.retentionSweep->measurement);
+        w.u64(state_.retentionSweep->policyVersion);
+        w.u64(state_.retentionSweep->cutoffTime);
+        w.u64(state_.retentionSweep->nextVShard);
+    }
+    w.u64(state_.retentionCutoffs.size());
+    for (const auto& [measurement, cutoff] : state_.retentionCutoffs) {
+        w.str(measurement);
+        w.u64(cutoff.policyVersion);
+        w.u64(cutoff.cutoffTime);
+    }
     return std::move(w.out);
 }
 
@@ -702,10 +805,10 @@ bool Group0StateMachine::decodeSnapshot(const std::string& data, Group0State& de
     if (!r.ok || nPol > static_cast<uint64_t>(r.end - r.p) / 24)
         r.ok = false;  // minimum policy: key length + version + value length
     for (uint64_t i = 0; i < nPol && r.ok; ++i) {
-        std::string k = r.str();
+        std::string k = r.str(kMaxPolicyKeyBytes);
         PolicyCell cell;
         cell.version = r.u64();
-        cell.value = r.str();
+        cell.value = r.str(kMaxPolicyValueBytes);
         if (r.ok && !s.policies.emplace(std::move(k), std::move(cell)).second)
             r.ok = false;
     }
@@ -738,6 +841,29 @@ bool Group0StateMachine::decodeSnapshot(const std::string& data, Group0State& de
         for (uint64_t i = 0; i < frozenPlanCount && r.ok; ++i) {
             FrozenDeletePlan plan = readFrozenDeletePlan(r);
             if (r.ok && !s.frozenDeletePlans.emplace(plan.requestId, std::move(plan)).second)
+                r.ok = false;
+        }
+    }
+    s.lastRetentionSweepId = r.u64();
+    const bool hasRetentionSweep = r.boolean();
+    if (hasRetentionSweep) {
+        RetentionSweep sweep;
+        sweep.sweepId = r.u64();
+        sweep.measurement = r.str(kMaxRetentionMeasurementBytes);
+        sweep.policyVersion = r.u64();
+        sweep.cutoffTime = r.u64();
+        sweep.nextVShard = r.u32();
+        s.retentionSweep = std::move(sweep);
+    }
+    const uint64_t retentionCutoffCount = r.u64();
+    if (!r.ok || retentionCutoffCount > kMaxRetentionPolicies ||
+        retentionCutoffCount > static_cast<uint64_t>(r.end - r.p) / 25) {
+        r.ok = false;
+    } else {
+        for (uint64_t i = 0; i < retentionCutoffCount && r.ok; ++i) {
+            auto measurement = r.str(kMaxRetentionMeasurementBytes);
+            RetentionCutoffRecord cutoff{r.u64(), r.u64()};
+            if (r.ok && !s.retentionCutoffs.emplace(std::move(measurement), cutoff).second)
                 r.ok = false;
         }
     }

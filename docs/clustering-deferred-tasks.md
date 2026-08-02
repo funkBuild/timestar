@@ -6,13 +6,16 @@ Production blockers take priority and are authoritative in
 
 ## Production blockers
 
-- [ ] Complete group-0-driven drain, replace, remove, and Engine-data reclaim.
+- [x] Complete group-0-driven drain, replace, remove, and Engine-data reclaim.
   Ordered local Raft teardown, its terminal reclaim floor, and exact-v1 journal
   quarantine/grace/deletion are wired. Join, destination data-group
   materialization, and the bounded production scheduler/remote leader actuator
-  are wired.
-- [ ] Replicate retention policies and monotonic cutoff decisions through the
-  data groups; keep mutation disabled until complete.
+  are wired and covered by the bounded production topology gate.
+- [x] Replicate exact-version TTL policies through Group 0 and serialize
+  constant-space cutoff decisions through all data groups. Cluster mutation is
+  enabled after unit, snapshot/replay, controller-failover, restart, and
+  tombstone-recreation gates; clustered downsampling remains intentionally
+  unsupported in v1.
 - [ ] Replace monolithic snapshot construction/install buffers with bounded
   streaming beyond 128 MiB.
 - [ ] Prove frozen pattern-delete retry through group-0 leader failover and

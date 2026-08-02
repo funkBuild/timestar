@@ -8,8 +8,10 @@
 #include <cstdint>
 #include <limits>
 #include <map>
+#include <optional>
 #include <set>
 #include <string>
+#include <string_view>
 #include <tuple>
 #include <vector>
 
@@ -27,6 +29,16 @@ inline constexpr size_t kMaxControlJobIdBytes = 256;
 // atomically replaces the completed predecessor, so evacuating thousands of
 // VShards cannot grow every Group-0 snapshot without bound.
 inline constexpr size_t kMaxControlJobs = 1;
+inline constexpr std::string_view kRetentionPolicyPrefix = "retention/";
+inline constexpr size_t kMaxRetentionPolicies = 1024;
+inline constexpr size_t kMaxRetentionMeasurementBytes = 1024;
+inline constexpr size_t kMaxRetentionTtlBytes = 64;
+inline constexpr size_t kMaxPolicyKeyBytes = 2048;
+inline constexpr size_t kMaxPolicyValueBytes = 64 * 1024;
+// Revisit a policy no more often than the standalone sweep interval. A new
+// policy is eligible immediately; later cutoffs must advance by this much.
+inline constexpr uint64_t kRetentionSweepIntervalNanos = 15ULL * 60 * 1'000'000'000;
+inline constexpr uint32_t kRetentionFanoutBatch = 32;
 
 inline bool validControlJobId(const std::string& id) {
     return !id.empty() && id.size() <= kMaxControlJobIdBytes;
@@ -77,6 +89,92 @@ struct PolicyCell {
     std::string value;
 
     friend bool operator==(const PolicyCell&, const PolicyCell&) = default;
+};
+
+// Exact-v1 TTL policy stored in the generic retention/<measurement> CAS cell.
+// Cluster downsampling is deliberately absent: it remains disabled until it is
+// itself an ordered replicated data operation.
+struct RetentionPolicyValue {
+    std::string ttl;
+    uint64_t ttlNanos = 0;
+
+    friend bool operator==(const RetentionPolicyValue&, const RetentionPolicyValue&) = default;
+};
+
+inline bool validRetentionMeasurement(std::string_view measurement) {
+    if (measurement.empty() || measurement.size() > kMaxRetentionMeasurementBytes)
+        return false;
+    return std::ranges::none_of(measurement, [](unsigned char c) { return c < 0x20 || c == 0x7f; });
+}
+
+inline std::string retentionPolicyKey(std::string_view measurement) {
+    return std::string(kRetentionPolicyPrefix) + std::string(measurement);
+}
+
+inline std::optional<std::string_view> retentionMeasurementFromKey(std::string_view key) {
+    if (!key.starts_with(kRetentionPolicyPrefix))
+        return std::nullopt;
+    const auto measurement = key.substr(kRetentionPolicyPrefix.size());
+    if (!validRetentionMeasurement(measurement))
+        return std::nullopt;
+    return measurement;
+}
+
+inline bool validRetentionPolicyValue(const RetentionPolicyValue& policy) {
+    return !policy.ttl.empty() && policy.ttl.size() <= kMaxRetentionTtlBytes && policy.ttlNanos != 0 &&
+           policy.ttlNanos != UINT64_MAX &&
+           std::ranges::none_of(policy.ttl, [](unsigned char c) { return c < 0x20 || c == 0x7f; });
+}
+
+// Small nested v1 value. It is already protected by the TCC1 command or
+// TSG0SNP1 snapshot framing, but remains self-identifying so a schema cell can
+// never be interpreted as retention state.
+inline std::string encodeRetentionPolicyValue(const RetentionPolicyValue& policy) {
+    if (!validRetentionPolicyValue(policy))
+        return {};
+    std::string out = "TSRP1";
+    out.push_back(static_cast<char>(policy.ttl.size()));
+    out.append(policy.ttl);
+    for (int i = 0; i < 8; ++i)
+        out.push_back(static_cast<char>((policy.ttlNanos >> (8 * i)) & 0xff));
+    return out;
+}
+
+inline std::optional<RetentionPolicyValue> decodeRetentionPolicyValue(std::string_view encoded) {
+    constexpr std::string_view magic = "TSRP1";
+    if (!encoded.starts_with(magic) || encoded.size() < magic.size() + 1 + 8)
+        return std::nullopt;
+    const size_t ttlBytes = static_cast<uint8_t>(encoded[magic.size()]);
+    if (ttlBytes == 0 || ttlBytes > kMaxRetentionTtlBytes || encoded.size() != magic.size() + 1 + ttlBytes + 8)
+        return std::nullopt;
+    RetentionPolicyValue out;
+    out.ttl.assign(encoded.substr(magic.size() + 1, ttlBytes));
+    for (int i = 0; i < 8; ++i)
+        out.ttlNanos |= static_cast<uint64_t>(static_cast<uint8_t>(encoded[magic.size() + 1 + ttlBytes + i]))
+                        << (8 * i);
+    if (!validRetentionPolicyValue(out))
+        return std::nullopt;
+    return out;
+}
+
+// At most one all-VShard sweep is in flight. Its globally contiguous ID lets
+// every VShard retain one constant-space retry fence. The cursor names the
+// first VShard not yet durably acknowledged in Group 0.
+struct RetentionSweep {
+    uint64_t sweepId = 0;
+    std::string measurement;
+    uint64_t policyVersion = 0;
+    uint64_t cutoffTime = 0;
+    uint32_t nextVShard = 0;
+
+    friend bool operator==(const RetentionSweep&, const RetentionSweep&) = default;
+};
+
+struct RetentionCutoffRecord {
+    uint64_t policyVersion = 0;
+    uint64_t cutoffTime = 0;
+
+    friend bool operator==(const RetentionCutoffRecord&, const RetentionCutoffRecord&) = default;
 };
 
 // One exact target captured by a quorum-fenced pattern expansion. Group 0
@@ -173,19 +271,22 @@ inline bool frozenDeletePlanExpiredAt(const FrozenDeletePlan& plan, uint64_t can
 // The full replicated group-0 control state. This is a deterministic function of
 // the committed command log; every field is rebuilt identically on every node.
 struct Group0State {
-    std::string clusterUuid;                                    // meta
-    uint64_t mapEpoch = 0;                                      // topology/policy version
-    uint64_t appliedIndex = 0;                                  // last group-0 log index applied
-    uint64_t controllerTerm = 0;                                // controller epoch (group-0 term)
-    NodeId controllerLeader = 0;                                // node that owns controllerTerm
-    std::map<NodeId, NodeRecord> nodes;                         // nodes/<uuid>
-    std::map<uint16_t, std::vector<NodeId>> desiredPlacement;   // desired-placement/<vshard>
-    ControlMap servingMap;                                      // current effective serving map
-    std::vector<NodeId> metaVoters;                             // group-0 voter set (self-managed)
-    std::map<std::string, PolicyCell> policies;                 // schema/retention CAS cells
-    std::map<std::string, Job> jobs;                            // jobs/<uuid>
-    std::set<std::string> joinTokens;                           // valid unused group-0-minted join tokens
-    std::map<std::string, FrozenDeletePlan> frozenDeletePlans;  // retry-stable pattern expansion plans
+    std::string clusterUuid;                                        // meta
+    uint64_t mapEpoch = 0;                                          // topology/policy version
+    uint64_t appliedIndex = 0;                                      // last group-0 log index applied
+    uint64_t controllerTerm = 0;                                    // controller epoch (group-0 term)
+    NodeId controllerLeader = 0;                                    // node that owns controllerTerm
+    std::map<NodeId, NodeRecord> nodes;                             // nodes/<uuid>
+    std::map<uint16_t, std::vector<NodeId>> desiredPlacement;       // desired-placement/<vshard>
+    ControlMap servingMap;                                          // current effective serving map
+    std::vector<NodeId> metaVoters;                                 // group-0 voter set (self-managed)
+    std::map<std::string, PolicyCell> policies;                     // schema/retention CAS cells
+    uint64_t lastRetentionSweepId = 0;                              // last all-VShard fan-out completed
+    std::optional<RetentionSweep> retentionSweep;                   // one durable all-VShard fan-out cursor
+    std::map<std::string, RetentionCutoffRecord> retentionCutoffs;  // last completed cutoff per measurement
+    std::map<std::string, Job> jobs;                                // jobs/<uuid>
+    std::set<std::string> joinTokens;                               // valid unused group-0-minted join tokens
+    std::map<std::string, FrozenDeletePlan> frozenDeletePlans;      // retry-stable pattern expansion plans
     friend bool operator==(const Group0State&, const Group0State&) = default;
 };
 

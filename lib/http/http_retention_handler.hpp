@@ -13,20 +13,28 @@
 #include <seastar/http/httpd.hh>
 #include <string>
 
+namespace timestar::cluster {
+class ClusterDataPlane;
+}
+
 namespace timestar::http {
 
 class HttpRetentionHandler : public std::enable_shared_from_this<HttpRetentionHandler> {
 private:
     seastar::sharded<Engine>* engineSharded;
     bool partitionedCluster_ = false;
+    timestar::cluster::ClusterDataPlane* clusterDataPlane_ = nullptr;
 
     // Parse and validate a duration string, returning nanoseconds.
     // Throws std::runtime_error on invalid format.
     static uint64_t parseDuration(const std::string& duration);
 
 public:
-    explicit HttpRetentionHandler(seastar::sharded<Engine>* _engineSharded, bool partitionedCluster = false)
-        : engineSharded(_engineSharded), partitionedCluster_(partitionedCluster) {}
+    explicit HttpRetentionHandler(seastar::sharded<Engine>* _engineSharded, bool partitionedCluster = false,
+                                  timestar::cluster::ClusterDataPlane* clusterDataPlane = nullptr)
+        : engineSharded(_engineSharded),
+          partitionedCluster_(partitionedCluster),
+          clusterDataPlane_(clusterDataPlane) {}
 
     // Validate an aggregation method string.
     // Exposed publicly to allow direct unit testing.
