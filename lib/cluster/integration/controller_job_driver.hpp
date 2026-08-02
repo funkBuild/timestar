@@ -26,6 +26,20 @@ namespace timestar::cluster {
 // group-0 propose path is proven in group0_controller_test).
 class ControllerJobDriver {
 public:
+    // Decode only internally consistent persisted movement jobs. Group0State
+    // stores the step/done summary beside the payload so operators can inspect
+    // jobs without decoding them; disagreement means the durable record is
+    // corrupt or was constructed by a buggy controller and must never actuate a
+    // membership change.
+    static std::optional<movement::MoveJob> decodeMoveJob(const control::Job& job) {
+        if (job.id.empty())
+            return std::nullopt;
+        auto decoded = movement::MoveJob::decode(job.payload);
+        if (!decoded || job.step != static_cast<uint32_t>(decoded->step()) || job.done != decoded->done())
+            return std::nullopt;
+        return decoded;
+    }
+
     // Drive one persisted job whose payload is a MoveJob. Decodes it, runs it against a
     // RaftGroupMoveExecutor over `group` (the data VShard's group, on which this node
     // must lead), and reports each advanced step through `persistJob` as an updated
@@ -33,9 +47,9 @@ public:
     // MoveJob is skipped (returns false without touching the group).
     static seastar::future<bool> driveMoveJob(control::Job job, raft::RaftGroup& group, size_t minRf,
                                               std::function<seastar::future<>(control::Job)> persistJob) {
-        auto mj = movement::MoveJob::decode(job.payload);
+        auto mj = decodeMoveJob(job);
         if (!mj)
-            co_return false;  // corrupt / not a move job -> skip, don't touch the group
+            co_return false;  // corrupt / inconsistent / not a move job -> do not actuate
         const std::string jobId = job.id;
         RaftGroupMoveExecutor exec(group, [jobId, persistJob](const movement::MoveJob& m) {
             // Mirror the advanced MoveJob back into a group-0 Job (jobId preserved,

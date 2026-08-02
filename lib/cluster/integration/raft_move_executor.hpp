@@ -8,6 +8,7 @@
 #include <functional>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/sleep.hh>
+#include <seastar/core/timed_out_error.hh>
 #include <vector>
 
 namespace timestar::cluster {
@@ -38,22 +39,43 @@ public:
     std::vector<NodeId> learners() const override { return group_.node().config().learners; }
 
     seastar::future<bool> commitConfig(ConfigTarget target) override {
-        if (configActive(target))
-            co_return true;  // idempotent: already committed and active
+        if (configApplied(target))
+            co_return true;  // idempotent: the exact stable config is durable and applied
+
+        // A controller can restart after the joint entry committed and appended
+        // final Cnew but before that final entry committed. Raft's active config
+        // already looks stable in this window, yet proposing the next transition
+        // is forbidden. Wait for the existing target to cross the apply boundary
+        // instead of mistaking "appended" for "finished".
+        if (configActive(target)) {
+            for (unsigned i = 0; i < maxWait_; ++i) {
+                if (configApplied(target))
+                    co_return true;
+                if (!group_.isLeader())
+                    co_return false;
+                if (!configActive(target))
+                    throw movement::UnsafeMove("commitConfig: in-flight target configuration was replaced");
+                co_await seastar::sleep(std::chrono::milliseconds(1));
+            }
+            throw movement::UnsafeMove("commitConfig: existing target configuration was not applied in time");
+        }
+
         if (!group_.isLeader())
             co_return false;  // not the leader -> the current leader redrives the job
-        const bool proposed = co_await group_.proposeConfChange(target.voters, target.learners);
-        if (!proposed)
-            co_return false;
-        // Await the joint transition committing and leaving joint (Cnew active).
-        for (unsigned i = 0; i < maxWait_; ++i) {
-            if (configActive(target))
-                co_return true;
-            if (!group_.isLeader())
-                co_return false;  // lost leadership mid-change; a new leader redrives
-            co_await seastar::sleep(std::chrono::milliseconds(1));
+        try {
+            // The group-level waiter covers BOTH the joint entry and the
+            // automatically appended final Cnew entry. Returning before final
+            // apply is what used to strand every replace at Promoted: the
+            // immediate remove-old proposal saw an outstanding config and was
+            // rejected.
+            co_return co_await group_.proposeConfChangeAndAwaitApplied(
+                std::move(target.voters), std::move(target.learners),
+                seastar::lowres_clock::now() + std::chrono::milliseconds(maxWait_));
+        } catch (const raft::LeadershipLostError&) {
+            co_return false;  // the current data-group leader will redrive the durable job
+        } catch (const seastar::timed_out_error&) {
+            throw movement::UnsafeMove("commitConfig: target configuration did not apply in time");
         }
-        throw movement::UnsafeMove("commitConfig: target config did not become active in time");
     }
 
     seastar::future<uint64_t> catchUp(NodeId dest) override {
@@ -76,6 +98,14 @@ private:
     bool configActive(const ConfigTarget& t) const {
         const auto& c = group_.node().config();
         return !c.joint() && sameSet(c.voters, t.voters) && sameSet(c.learners, t.learners);
+    }
+    bool configApplied(const ConfigTarget& t) const {
+        if (!configActive(t))
+            return false;
+        const raft::LogIndex index = group_.node().latestConfigIndex();
+        // kNoIndex means this is the snapshot/base configuration, which was
+        // necessarily installed before the group became available.
+        return index == raft::kNoIndex || (group_.commitIndex() >= index && group_.appliedIndex() >= index);
     }
     static bool sameSet(std::vector<NodeId> a, std::vector<NodeId> b) {
         std::sort(a.begin(), a.end());

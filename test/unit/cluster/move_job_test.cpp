@@ -4,6 +4,7 @@
 // voter, resume correctly from any persisted step (crash-resume), and abort rather
 // than commit an unsafe (sub-RF) membership.
 #include "../../../lib/cluster/movement/mover.hpp"
+#include "../../../lib/cluster/integration/controller_job_driver.hpp"
 
 #include <gtest/gtest.h>
 
@@ -228,13 +229,63 @@ TEST(MoveJobTest, NotLeaderStopsCleanly) {
     testNotLeaderStopsCleanly().get();
 }
 TEST(MoveJobTest, EncodeDecodeRoundTrip) {
-    MoveJob j(MovePlan{7, 4, 1}, MoveStep::Promoted);
-    auto d = MoveJob::decode(j.encode());
+    constexpr NodeId largeDestination = (NodeId{1} << 48) + 4;
+    constexpr NodeId largeVictim = (NodeId{1} << 40) + 1;
+    MoveJob j(MovePlan{7, largeDestination, largeVictim}, MoveStep::Promoted);
+    const std::string encoded = j.encode();
+    EXPECT_EQ(encoded.substr(0, 5), "TSMJ1");
+    auto d = MoveJob::decode(encoded);
     ASSERT_TRUE(d.has_value());
-    EXPECT_EQ(d->plan(), (MovePlan{7, 4, 1}));
+    EXPECT_EQ(d->plan(), (MovePlan{7, largeDestination, largeVictim}));
     EXPECT_EQ(d->step(), MoveStep::Promoted);
-    EXPECT_FALSE(MoveJob::decode("short").has_value());
-    EXPECT_FALSE(MoveJob::decode(std::string(7, '\xff')).has_value());               // bad step byte
-    EXPECT_FALSE(MoveJob::decode(MoveJob(MovePlan{7, 0, 1}).encode()).has_value());  // dest 0
-    EXPECT_FALSE(MoveJob::decode(MoveJob(MovePlan{7, 4, 4}).encode()).has_value());  // victim==dest
+}
+
+TEST(MoveJobTest, RejectsUnknownOrMalformedV1Records) {
+    const std::string valid = MoveJob(MovePlan{7, 4, 1}, MoveStep::Promoted).encode();
+
+    std::string unknownVersion = valid;
+    unknownVersion[4] = '2';
+    EXPECT_FALSE(MoveJob::decode(unknownVersion).has_value());
+    EXPECT_FALSE(MoveJob::decode(valid.substr(0, valid.size() - 1)).has_value());
+    EXPECT_FALSE(MoveJob::decode(valid + "x").has_value());
+
+    std::string badStep = valid;
+    badStep[5] = static_cast<char>(0xff);
+    EXPECT_FALSE(MoveJob::decode(badStep).has_value());
+
+    std::string invalidVShard = valid;
+    invalidVShard[6] = static_cast<char>(0xff);
+    invalidVShard[7] = static_cast<char>(0xff);
+    EXPECT_FALSE(MoveJob::decode(invalidVShard).has_value());
+
+    std::string noDestination = valid;
+    std::fill(noDestination.begin() + 8, noDestination.begin() + 16, '\0');
+    EXPECT_FALSE(MoveJob::decode(noDestination).has_value());
+
+    std::string sameDestinationAndVictim = valid;
+    std::copy(sameDestinationAndVictim.begin() + 8, sameDestinationAndVictim.begin() + 16,
+              sameDestinationAndVictim.begin() + 16);
+    EXPECT_FALSE(MoveJob::decode(sameDestinationAndVictim).has_value());
+
+    EXPECT_THROW(MoveJob(MovePlan{7, 0, 1}).encode(), std::invalid_argument);
+    EXPECT_THROW(MoveJob(MovePlan{7, 4, 4}).encode(), std::invalid_argument);
+    EXPECT_THROW(MoveJob(MovePlan{timestar::VIRTUAL_SHARD_COUNT, 4, 1}).encode(), std::invalid_argument);
+}
+
+TEST(MoveJobTest, ControllerRejectsInconsistentDurableJobMetadata) {
+    MoveJob move(MovePlan{7, 4, 1}, MoveStep::Promoted);
+    timestar::control::Job valid{"move-7", static_cast<uint32_t>(MoveStep::Promoted), false, move.encode()};
+    ASSERT_TRUE(timestar::cluster::ControllerJobDriver::decodeMoveJob(valid).has_value());
+
+    auto wrongStep = valid;
+    wrongStep.step = static_cast<uint32_t>(MoveStep::CaughtUp);
+    EXPECT_FALSE(timestar::cluster::ControllerJobDriver::decodeMoveJob(wrongStep).has_value());
+
+    auto falseCompletion = valid;
+    falseCompletion.done = true;
+    EXPECT_FALSE(timestar::cluster::ControllerJobDriver::decodeMoveJob(falseCompletion).has_value());
+
+    auto emptyId = valid;
+    emptyId.id.clear();
+    EXPECT_FALSE(timestar::cluster::ControllerJobDriver::decodeMoveJob(emptyId).has_value());
 }
