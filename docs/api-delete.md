@@ -10,9 +10,9 @@ Delete time series data by series key, structured query, pattern match, or batch
 Partitioned RF&gt;1 mode has replicated paths for exact and pattern targets. RF=1
 delete is unavailable. Both paths use the current v1 peer, command, snapshot,
 and group-0 schemas; there is no cluster-format activation step. A peer that
-does not negotiate v1 is rejected before mutation. An incompletely wired pattern
-path returns `501` before discovery or mutation. Pattern deletes remain available
-in non-partitioned mode.
+does not negotiate v1 is rejected before mutation. A partitioned RF=1 server or
+an RF&gt;1 server missing the replicated delete hooks returns `501` before discovery
+or mutation. Pattern deletes remain available in non-partitioned mode.
 
 Every RF&gt;1 request must include both of these headers:
 
@@ -63,6 +63,12 @@ to the leader over the v1 peer protocol. Leader discovery, the RPC, and
 the quorum-apply wait are bounded; a missing or changing leader and an ambiguous
 timeout return retryable `503`. Retry with the same identity so lookup can
 recover a plan that committed after the timeout.
+
+`GET /cluster/status` reports `control_frozen_delete_plans`,
+`control_frozen_delete_plan_targets`, and
+`control_frozen_delete_plan_bytes` from this node's locally applied Group-0
+state. These fields expose retained retry-state capacity and catch-up; they are
+observability counters, not a quorum read or a mutation precondition.
 
 ## Delete by Structured Query
 

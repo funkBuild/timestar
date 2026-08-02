@@ -1621,6 +1621,9 @@ seastar::future<ClusterDataPlane::Status> ClusterDataPlane::status() const {
     st.controlDrainReferences = control.drainReferences;
     st.controlDrainBlocked = control.drainBlocked;
     st.controlRemovalsPending = control.removalsPending;
+    st.controlFrozenDeletePlans = control.frozenDeletePlans;
+    st.controlFrozenDeletePlanTargets = control.frozenDeletePlanTargets;
+    st.controlFrozenDeletePlanBytes = control.frozenDeletePlanBytes;
     st.controlRetentionPolicies = control.retentionPolicies;
     st.controlRetentionSweepActive = control.retentionSweepActive;
     st.controlRetentionNextVShard = control.retentionNextVShard;

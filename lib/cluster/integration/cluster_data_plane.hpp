@@ -308,6 +308,9 @@ public:
         size_t controlDrainReferences = 0;
         bool controlDrainBlocked = false;
         size_t controlRemovalsPending = 0;
+        size_t controlFrozenDeletePlans = 0;
+        size_t controlFrozenDeletePlanTargets = 0;
+        size_t controlFrozenDeletePlanBytes = 0;
         uint64_t controlApplyLagEntries = 0;
         uint64_t controlApplyFailures = 0;
         uint64_t controlTickErrors = 0;

@@ -578,7 +578,10 @@ snapshot-durable plan before rediscovery, so new matching series cannot join an
 ambiguous retry. A follower forwards plan lookup/freeze to the reported group-0
 leader over the v1 peer protocol; the RPC and leader quorum-apply wait are
 bounded, and an ambiguous timeout is safely retryable through lookup-first
-recovery.
+recovery. `/cluster/status` exposes the locally applied retained plan, target,
+and encoded-byte totals. The production gate kills a coordinator only after a
+second voter reports the complete plan, then proves exact reuse under a new
+leader and recovery after restart.
 
 For writes, idempotency means *replica convergence*, not retry-invisibility across
 intervening operations: a retried write is a new log entry and can reappear after

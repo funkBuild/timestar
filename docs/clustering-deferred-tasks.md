@@ -18,8 +18,10 @@ Production blockers take priority and are authoritative in
   unsupported in v1.
 - [ ] Replace monolithic snapshot construction/install buffers with bounded
   streaming beyond 128 MiB.
-- [ ] Prove frozen pattern-delete retry through group-0 leader failover and
-  restart in a multi-process gate.
+- [x] Prove frozen pattern-delete retry through group-0 leader failover and
+  restart in a multi-process gate. The production-server gate makes the first
+  response ambiguous only after another voter applies the complete plan, then
+  proves exact target reuse, changed-body conflict, and restart recovery.
 - [ ] Prove bounded delete-receipt retirement, snapshot progress, and journal
   reclaim under sustained delete-heavy load.
 - [ ] Run final multi-host topology, security, durability, and SLO gates against

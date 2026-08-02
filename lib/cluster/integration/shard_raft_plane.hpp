@@ -664,6 +664,9 @@ public:
         size_t drainReferences = 0;
         bool drainBlocked = false;
         size_t removalsPending = 0;
+        size_t frozenDeletePlans = 0;
+        size_t frozenDeletePlanTargets = 0;
+        size_t frozenDeletePlanBytes = 0;
         size_t retentionPolicies = 0;
         bool retentionSweepActive = false;
         uint32_t retentionNextVShard = 0;
@@ -718,6 +721,12 @@ public:
                 (config.isVoter(id) || config.isLearner(id) ||
                  std::find(state.metaVoters.begin(), state.metaVoters.end(), id) != state.metaVoters.end()))
                 ++c.removalsPending;
+        c.frozenDeletePlans = state.frozenDeletePlans.size();
+        for (const auto& [requestId, plan] : state.frozenDeletePlans) {
+            (void)requestId;
+            c.frozenDeletePlanTargets += plan.targets.size();
+            c.frozenDeletePlanBytes += control::frozenDeletePlanBytes(plan);
+        }
         for (const auto& [key, cell] : state.policies) {
             if (control::retentionMeasurementFromKey(key) && !cell.value.empty())
                 ++c.retentionPolicies;

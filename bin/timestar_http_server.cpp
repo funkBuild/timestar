@@ -336,6 +336,10 @@ void set_routes(routes& r) {
                         ",\"control_drain_references\":" + std::to_string(st.controlDrainReferences) +
                         ",\"control_drain_blocked\":" + std::string(st.controlDrainBlocked ? "true" : "false") +
                         ",\"control_removals_pending\":" + std::to_string(st.controlRemovalsPending) +
+                        ",\"control_frozen_delete_plans\":" + std::to_string(st.controlFrozenDeletePlans) +
+                        ",\"control_frozen_delete_plan_targets\":" +
+                        std::to_string(st.controlFrozenDeletePlanTargets) +
+                        ",\"control_frozen_delete_plan_bytes\":" + std::to_string(st.controlFrozenDeletePlanBytes) +
                         ",\"control_apply_lag_entries\":" + std::to_string(st.controlApplyLagEntries) +
                         ",\"control_apply_failures\":" + std::to_string(st.controlApplyFailures) +
                         ",\"control_tick_errors\":" + std::to_string(st.controlTickErrors) +

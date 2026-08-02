@@ -178,6 +178,17 @@ inventory and rules.
   the sweep/cutoff state, then proved delete version 2 and recreation as version
   3. Observed aggregate RSS was about 350 MiB and each live root about 32 MiB;
   the gate removed all three roots afterward.
+- [x] Prove frozen pattern-delete retry through leader loss and restart. The
+  bounded `pattern_delete_failover_gate.sh` run on 2026-08-03 wrote and indexed
+  6,000 targets, then observed the complete 402,097-byte frozen plan on a second
+  Group-0 voter while the original client was still waiting. It killed that
+  coordinator, elected a new Group-0 leader, recovered all data-group leaders,
+  inserted a newly matching series, and retried with the original identity. The
+  retry reused exactly the 6,000 frozen targets and preserved the new match;
+  changed request bytes returned the stable 409 conflict. Restarting the killed
+  node recovered the same one-plan/6,000-target state without resurrection. The
+  three one-reactor nodes stayed within their 1-GiB process limits and the gate
+  removed all four `build/tmp` roots afterward.
 
 ## Remaining production blockers
 
@@ -189,9 +200,6 @@ production deploy.
 - [ ] **Finish the large-snapshot production path.** Snapshot transfer is
   chunked, but snapshot construction/install still needs a bounded streaming
   path that cannot strand a VShard above the current in-memory payload ceiling.
-- [ ] **Prove pattern-delete failover and restart externally.** A multi-process
-  gate must cover group-0 leader loss after an ambiguous freeze, retry by the
-  same idempotency identity, restart, and exact frozen-plan reuse.
 
 ### P1 — bounded operation and live evidence
 

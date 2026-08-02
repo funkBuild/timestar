@@ -134,6 +134,8 @@ see [ADR 0005](adr/0005-checkquorum-transfer-bypass.md).
 - [x] Replicate exact-version TTL policies and one globally serialized,
   restart-safe cutoff sequence through every VShard before enabling clustered
   retention mutation.
+- [x] Prove ambiguous frozen pattern-delete retry through Group-0 leader loss,
+  exact target reuse, changed-body conflict, and killed-node restart.
 - [ ] Run final same-candidate multi-process gates with explicit per-process
   memory budgets: node kill, restart catch-up, empty-node snapshot, pattern
   delete failover/restart, and durability fault injection.

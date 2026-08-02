@@ -1,8 +1,8 @@
 # Cluster integration plan
 
 **Status:** the RF=3 data path, persistent Group 0, production topology changes,
-and replicated TTL retention are integrated. Streaming large snapshots,
-pattern-delete failover evidence, and final release gates remain incomplete.
+replicated TTL retention, and pattern-delete failover/restart are integrated.
+Streaming large snapshots and final release gates remain incomplete.
 
 The authoritative deploy blockers are in
 [cluster-production-readiness.md](cluster-production-readiness.md).
@@ -124,8 +124,10 @@ is `Done` and only when the submitted map changes its authorized VShard.
 
 Pattern delete freezes a bounded canonical target expansion in group 0 before
 any VShard delete proposal. Lookup-first retry recovers a plan that may have
-committed after an ambiguous reply. The external leader-failover/restart proof
-is still outstanding.
+committed after an ambiguous reply. A bounded three-process production-server
+gate proves complete-plan visibility on a second voter before coordinator loss,
+exact target reuse under a new leader, changed-body conflict, and restart
+recovery. Status reports retained plan, target, and encoded-byte totals.
 
 The production driver, runtime publication, and local Raft retirement seam are
 wired: dynamic peer/group creation, live directory cutover, applied-membership
@@ -214,8 +216,8 @@ changes. See [protocol-versioning.md](protocol-versioning.md).
 
 ### 4. Close API failover gates
 
-- Pattern delete: ambiguous freeze, group-0 leader loss, retry, restart, exact
-  target reuse.
+- [x] Pattern delete: ambiguous freeze, group-0 leader loss, retry, restart, and
+  exact target reuse.
 - Receipt retirement: sustained delete-heavy work, bounded memory, advancing
   floor, snapshot progress, and journal reclaim.
 - Cluster-aware streaming: one backfill/live barrier, resumable cursor, no loss
