@@ -24,8 +24,14 @@ public:
 class ControlJoinSink {
 public:
     virtual ~ControlJoinSink() = default;
-    virtual seastar::future<control::ControlJoinResult> handleControlJoin(
-        control::ControlJoinRequest request) = 0;
+    virtual seastar::future<control::ControlJoinResult> handleControlJoin(control::ControlJoinRequest request) = 0;
+};
+
+class MoveDestinationSink {
+public:
+    virtual ~MoveDestinationSink() = default;
+    virtual seastar::future<control::EnsureMoveDestinationResult> handleEnsureMoveDestination(
+        control::EnsureMoveDestinationRequest request) = 0;
 };
 
 // OptDeadline (node_store.hpp): a wall-clock point past which an awaited data-plane RPC
@@ -87,14 +93,15 @@ public:
                                                            OptDeadline deadline = std::nullopt) override;
     // v1 request forwarding to the peer believed to lead group 0. The
     // deadline bounds the v1 check and the waited request/reply exchange.
-    seastar::future<control::FreezeDeletePlanResult> frozenDeletePlan(
-        NodeId to, control::FrozenDeletePlanRpcRequest request,
-        OptDeadline deadline = std::nullopt);
+    seastar::future<control::FreezeDeletePlanResult> frozenDeletePlan(NodeId to,
+                                                                      control::FrozenDeletePlanRpcRequest request,
+                                                                      OptDeadline deadline = std::nullopt);
     // Token-authorized observer admission. The reply is deliberately
     // a step result: Joining is safe to retry while learner catch-up proceeds.
-    seastar::future<control::ControlJoinResult> controlJoin(
-        NodeId to, control::ControlJoinRequest request,
-        OptDeadline deadline = std::nullopt);
+    seastar::future<control::ControlJoinResult> controlJoin(NodeId to, control::ControlJoinRequest request,
+                                                            OptDeadline deadline = std::nullopt);
+    seastar::future<control::EnsureMoveDestinationResult> ensureMoveDestination(
+        NodeId to, control::EnsureMoveDestinationRequest request, OptDeadline deadline = std::nullopt);
     // The production remote propose (write-scaleout 3a/3b): borrows the caller's groups
     // (no merge allocation, and the caller keeps them so it can retry the failed ones)
     // and returns per-VShard rejects carrying the peer's view of the real leader.
@@ -113,6 +120,7 @@ public:
     void setReadIndexSink(ReadIndexSink& sink);
     void setFrozenDeletePlanSink(FrozenDeletePlanSink& sink);
     void setControlJoinSink(ControlJoinSink& sink);
+    void setMoveDestinationSink(MoveDestinationSink& sink);
 
     // M4 replica-read leader-reach client calls: confirm a linearizable ReadIndex /
     // fetch the commit index for `vshard` at peer `to` (which must be its leader). The

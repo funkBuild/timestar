@@ -150,6 +150,31 @@ TEST_F(ReplicatedVShardHostTest, ReAddingAVShardIsRejected) {
     }).get();
 }
 
+TEST_F(ReplicatedVShardHostTest, DynamicCreationValidatesRecoveredConfigBeforeRegisteringGroup) {
+    seastar::async([] {
+        ScopedShardedEngine eng;
+        eng.start();
+        cluster::EngineLocalStore store(*eng);
+        NoopTransport transport;
+        fs::path jroot = tmpDir();
+        cluster::ReplicatedVShardHost host(store, transport, 1, jroot);
+
+        EXPECT_THROW(host.addVShard(8, {1, 2, 3}, {}, [](const Config&) { return false; }).get(), std::runtime_error);
+        EXPECT_FALSE(host.hosts(8));
+        EXPECT_EQ(host.vshardCount(), 0u);
+
+        host.addVShard(8, {1, 2, 3}, {},
+                       [](const Config& config) {
+                           return config.voters == std::vector<NodeId>({1, 2, 3}) && config.votersOutgoing.empty() &&
+                                  config.learners.empty();
+                       })
+            .get();
+        EXPECT_TRUE(host.hosts(8));
+        host.stop().get();
+        fs::remove_all(jroot);
+    }).get();
+}
+
 TEST_F(ReplicatedVShardHostTest, ProposeBatchSplitsAcrossVShards) {
     seastar::async([] {
         ScopedShardedEngine eng;

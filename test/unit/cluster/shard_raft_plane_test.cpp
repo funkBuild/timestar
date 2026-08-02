@@ -93,6 +93,17 @@ public:
     }
 };
 
+class RecordingMoveDestination : public data::MoveDestinationSink {
+public:
+    std::optional<control::EnsureMoveDestinationRequest> received;
+    seastar::future<control::EnsureMoveDestinationResult> handleEnsureMoveDestination(
+        control::EnsureMoveDestinationRequest request) override {
+        received = std::move(request);
+        return seastar::make_ready_future<control::EnsureMoveDestinationResult>(
+            control::EnsureMoveDestinationResult{control::EnsureMoveDestinationStatus::Ready});
+    }
+};
+
 // One shard's listener, so sharded<> can start one per shard on the same address.
 class ShardListener {
 public:
@@ -176,8 +187,7 @@ TEST_F(ShardRaftPlaneTest, DynamicJoinRegistersPeerBeforeLearnerAndRetriesAfterR
             size_t registrationAttempts = 0;
             std::vector<std::pair<data::NodeId, std::string>> registrations;
             cluster::ShardRaftPlane::DynamicPeerRegistrar registrar =
-                [&addressResolved, &registrationAttempts,
-                 &registrations](data::NodeId id, std::string address) {
+                [&addressResolved, &registrationAttempts, &registrations](data::NodeId id, std::string address) {
                     ++registrationAttempts;
                     registrations.emplace_back(id, std::move(address));
                     return seastar::make_ready_future<bool>(addressResolved);
@@ -194,51 +204,55 @@ TEST_F(ShardRaftPlaneTest, DynamicJoinRegistersPeerBeforeLearnerAndRetriesAfterR
                 .get();
 
             shards
-                .invoke_on(0, [map](cluster::ShardRaftPlane& p) -> seastar::future<> {
-                    raft::RaftOptions opts;
-                    opts.electionTimeoutMin = opts.electionTimeoutMax = 1;
-                    opts.heartbeatTimeout = 1;
-                    co_await p.addGroup0({self}, opts);
-                    auto* host = p.group0();
-                    if (!host || !host->group() || !host->stateMachine())
-                        throw std::runtime_error("test group-0 host was not initialized");
-                    co_await host->group()->campaign();
-                    if (!host->group()->isLeader())
-                        throw std::runtime_error("test group-0 host did not become leader");
-                    control::Group0Controller controller(*host->group(), *host->stateMachine());
-                    control::NodeRecord seed{self, "seed-uuid", "127.0.0.1:18140", "rack-a",
-                                             control::NodeState::Active};
-                    co_await controller.initCluster("cluster-dynamic-join", seed);
-                    if (!co_await controller.publishInitialServingMap(map) ||
-                        !co_await controller.mintJoinToken("join-token"))
-                        throw std::runtime_error("test group-0 bootstrap commands did not commit");
-                    p.startGroup0Ticking();
-                })
+                .invoke_on(0,
+                           [map](cluster::ShardRaftPlane& p) -> seastar::future<> {
+                               raft::RaftOptions opts;
+                               opts.electionTimeoutMin = opts.electionTimeoutMax = 1;
+                               opts.heartbeatTimeout = 1;
+                               co_await p.addGroup0({self}, opts);
+                               auto* host = p.group0();
+                               if (!host || !host->group() || !host->stateMachine())
+                                   throw std::runtime_error("test group-0 host was not initialized");
+                               co_await host->group()->campaign();
+                               if (!host->group()->isLeader())
+                                   throw std::runtime_error("test group-0 host did not become leader");
+                               control::Group0Controller controller(*host->group(), *host->stateMachine());
+                               control::NodeRecord seed{self, "seed-uuid", "127.0.0.1:18140", "rack-a",
+                                                        control::NodeState::Active};
+                               co_await controller.initCluster("cluster-dynamic-join", seed);
+                               if (!co_await controller.publishInitialServingMap(map) ||
+                                   !co_await controller.mintJoinToken("join-token"))
+                                   throw std::runtime_error("test group-0 bootstrap commands did not commit");
+                               p.startGroup0Ticking();
+                           })
                 .get();
 
             control::ControlJoinRequest request;
             request.clusterUuid = "cluster-dynamic-join";
-            request.record = control::NodeRecord{joining, "joining-uuid", "127.0.0.1:18141", "rack-b",
-                                                 control::NodeState::Joining};
+            request.record =
+                control::NodeRecord{joining, "joining-uuid", "127.0.0.1:18141", "rack-b", control::NodeState::Joining};
             request.token = "join-token";
             auto join = [&] {
                 return shards
-                    .invoke_on(0, [request](cluster::ShardRaftPlane& p) mutable {
-                        return p.handleControlJoin(std::move(request));
-                    })
+                    .invoke_on(0,
+                               [request](cluster::ShardRaftPlane& p) mutable {
+                                   return p.handleControlJoin(std::move(request));
+                               })
                     .get();
             };
 
             const auto unresolved = join();
             EXPECT_EQ(unresolved.status, control::ControlJoinStatus::Joining);
             EXPECT_EQ(registrationAttempts, 1u);
-            const auto beforeRetry = shards
-                                         .invoke_on(0, [joining](cluster::ShardRaftPlane& p) {
-                                             auto* host = p.group0();
-                                             return std::pair{host->state().nodes.contains(joining),
-                                                              host->group()->node().config().isLearner(joining)};
-                                         })
-                                         .get();
+            const auto beforeRetry =
+                shards
+                    .invoke_on(0,
+                               [joining](cluster::ShardRaftPlane& p) {
+                                   auto* host = p.group0();
+                                   return std::pair{host->state().nodes.contains(joining),
+                                                    host->group()->node().config().isLearner(joining)};
+                               })
+                    .get();
             EXPECT_TRUE(beforeRetry.first) << "the consumed-token admission must be durable and retryable";
             EXPECT_FALSE(beforeRetry.second) << "an unreachable peer must not be committed as a learner";
 
@@ -250,9 +264,10 @@ TEST_F(ShardRaftPlaneTest, DynamicJoinRegistersPeerBeforeLearnerAndRetriesAfterR
             ASSERT_EQ(registrations.size(), 2u);
             EXPECT_EQ(registrations.back(), (std::pair<data::NodeId, std::string>{joining, request.record.address}));
             EXPECT_TRUE(shards
-                            .invoke_on(0, [joining](cluster::ShardRaftPlane& p) {
-                                return p.group0()->group()->node().config().isLearner(joining);
-                            })
+                            .invoke_on(0,
+                                       [joining](cluster::ShardRaftPlane& p) {
+                                           return p.group0()->group()->node().config().isLearner(joining);
+                                       })
                             .get())
                 << "peer registration must complete before learner membership is committed";
 
@@ -294,6 +309,29 @@ TEST_F(ShardRaftPlaneTest, DataPeerAddressChangeRetiresTheCachedConnection) {
         EXPECT_NO_THROW(client.stop().get()) << "failed-start/owner cleanup may stop a transport twice";
         oldServer.stop().get();
         newServer.stop().get();
+    }).get();
+}
+
+TEST_F(ShardRaftPlaneTest, MoveDestinationFenceCrossesTheExactV1Socket) {
+    seastar::async([] {
+        RecordingStore store;
+        RecordingMoveDestination sink;
+        data::DataPlaneRpc server;
+        data::DataPlaneRpc client;
+        const auto address = loopback(18144);
+        server.setMoveDestinationSink(sink);
+        server.start(address, store).get();
+        client.addPeer(2, address);
+        client.startClientOnly().get();
+
+        control::EnsureMoveDestinationRequest request{std::string(32, 'a'), "move-7", 11, 2};
+        const auto result = client.ensureMoveDestination(2, request).get();
+        EXPECT_EQ(result.status, control::EnsureMoveDestinationStatus::Ready);
+        ASSERT_TRUE(sink.received);
+        EXPECT_EQ(*sink.received, request);
+
+        client.stop().get();
+        server.stop().get();
     }).get();
 }
 
@@ -341,10 +379,7 @@ TEST_F(ShardRaftPlaneTest, ProposeOverSocketSplitsAcrossOwningShardsAndFailsClea
                     return p.init(engines, peers, map, self, jroot, std::chrono::milliseconds(10));
                 })
                 .get();
-            shards
-                .invoke_on_all([addr](cluster::ShardRaftPlane& p) {
-                    return p.startDataPlane(addr, std::nullopt);
-                })
+            shards.invoke_on_all([addr](cluster::ShardRaftPlane& p) { return p.startDataPlane(addr, std::nullopt); })
                 .get();
 
             raft::RaftOptions opts;
@@ -417,21 +452,16 @@ TEST_F(ShardRaftPlaneTest, ProposeOverSocketSplitsAcrossOwningShardsAndFailsClea
             // Simulate an observer failure after only shard 0 changed. The
             // production helper must accept the exact map there and still
             // advance the reactor that missed the first attempt.
-            EXPECT_TRUE(shards.invoke_on(0, [published](cluster::ShardRaftPlane& p) {
-                return p.updateServingMap(published);
-            }).get());
-            EXPECT_EQ(shards.invoke_on(0, [](cluster::ShardRaftPlane& p) { return p.directory().epoch(); }).get(),
-                      2u);
-            EXPECT_EQ(shards.invoke_on(1, [](cluster::ShardRaftPlane& p) { return p.directory().epoch(); }).get(),
-                      1u);
+            EXPECT_TRUE(
+                shards.invoke_on(0, [published](cluster::ShardRaftPlane& p) { return p.updateServingMap(published); })
+                    .get());
+            EXPECT_EQ(shards.invoke_on(0, [](cluster::ShardRaftPlane& p) { return p.directory().epoch(); }).get(), 2u);
+            EXPECT_EQ(shards.invoke_on(1, [](cluster::ShardRaftPlane& p) { return p.directory().epoch(); }).get(), 1u);
             cluster::publishServingMapOnShards(shards, coordinatorDirectory, published).get();
             EXPECT_EQ(coordinatorDirectory.epoch(), 2u);
             shards.invoke_on_all([](cluster::ShardRaftPlane& p) { EXPECT_EQ(p.directory().epoch(), 2u); }).get();
             cluster::publishServingMapOnShards(shards, coordinatorDirectory, published).get();
-            shards
-                .invoke_on_all([published](cluster::ShardRaftPlane& p) {
-                    EXPECT_EQ(p.directory().map(), published);
-                })
+            shards.invoke_on_all([published](cluster::ShardRaftPlane& p) { EXPECT_EQ(p.directory().map(), published); })
                 .get();
 
             // (a2) The PRODUCTION listener is per-shard-distributing. Several peer

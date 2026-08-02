@@ -67,6 +67,12 @@ inventory and rules.
   durably `Joining` and retry safely; recovered node records repopulate the
   runtime peer directory, and an address change retires cached clients instead
   of continuing to use the old endpoint.
+- [x] Materialize a movement destination's data group through an exact-v1 peer
+  RPC before learner addition. The destination derives all topology from its
+  own committed Group-0 job, rejects stale controller terms, non-active or
+  mismatched destinations, and conflicting placement, uses the production Raft
+  limits, and validates any recovered stable or joint configuration before the
+  group is registered or allowed to tick.
 
 ## Remaining production blockers
 
@@ -79,10 +85,10 @@ production deploy.
   remove, VShard movement, ordered teardown, and reclaim-floor publication must
   be exercised through the production server. Group 0 now validates durable
   movement plans/progress, exact one-VShard cutover, and live sharded directory
-  publication and dynamic peer registration, but the production job driver,
-  destination data-group creation, operator API, and teardown/reclaim sequence
-  remain unfinished. Editing a static peer list is not a safe topology
-  operation.
+  publication, dynamic peer registration, and destination data-group creation,
+  but the production job scheduler/remote leader actuator, authenticated
+  operator mutation API, and teardown/reclaim sequence remain unfinished.
+  Editing a static peer list is not a safe topology operation.
 - [ ] **Replicate retention policy and cutoff decisions.** Partitioned mode must
   never let replicas expire or compact different logical ranges. Until then,
   retention mutation must remain fail-closed.
@@ -149,3 +155,8 @@ two reactor shards.
 The dynamic-admission gate covers unresolved-address retry after durable token
 consumption, registration-before-learner ordering, peer address replacement on
 both transports, malformed port rejection, and idempotent failed-start cleanup.
+
+The movement-destination gate covers exact-v1 socket transport, stale term/job
+rejection, inactive destinations, adjacent stable/joint recovery shapes, and
+refusal before registry insertion when an on-disk configuration conflicts with
+the committed Group-0 job.

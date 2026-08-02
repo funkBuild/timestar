@@ -206,16 +206,14 @@ seastar::future<> ClusterDataPlane::startImpl(const ClusterConfig& cfg, seastar:
             const control::ControlMap initialMap = dir_->map();
             auto* peers = &shards_;
             const JournalIdentity journalIdentity = *journalIdentity_;
-            ShardRaftPlane::DynamicPeerRegistrar dynamicPeerRegistrar =
-                [this](data::NodeId id, std::string address) {
-                    return registerDynamicPeer(id, std::move(address));
-                };
-            co_await shards_.invoke_on_all(
-                [enginesPtr = enginesPtr_, peers, initialMap, selfId, jroot,
-                 journalIdentity, dynamicPeerRegistrar](ShardRaftPlane& p) {
-                    return p.init(enginesPtr, peers, initialMap, selfId, jroot, kRaftTickPeriod, journalIdentity,
-                                  dynamicPeerRegistrar);
-                });
+            ShardRaftPlane::DynamicPeerRegistrar dynamicPeerRegistrar = [this](data::NodeId id, std::string address) {
+                return registerDynamicPeer(id, std::move(address));
+            };
+            co_await shards_.invoke_on_all([enginesPtr = enginesPtr_, peers, initialMap, selfId, jroot, journalIdentity,
+                                            dynamicPeerRegistrar](ShardRaftPlane& p) {
+                return p.init(enginesPtr, peers, initialMap, selfId, jroot, kRaftTickPeriod, journalIdentity,
+                              dynamicPeerRegistrar);
+            });
         }
 
         // FENCE NODE-LOCAL READS ON NODE-LOCAL APPLY LAG (debt D-36). Wired only in the
@@ -245,8 +243,7 @@ seastar::future<> ClusterDataPlane::startImpl(const ClusterConfig& cfg, seastar:
         // An inbound proposeWrite is split across the shards owning its VShards by
         // ShardRaftPlane::proposeBatch, so which shard the kernel handed the connection
         // to no longer decides where the work runs.
-        co_await shards_.invoke_on_all(
-            [dataPlaneAddr, tls = tls_](ShardRaftPlane& p) {
+        co_await shards_.invoke_on_all([dataPlaneAddr, tls = tls_](ShardRaftPlane& p) {
             // `tls` is read from this shard's copy and the PEM strings are copied into
             // each shard's own credentials -- setTlsCredentials takes them by value, so
             // nothing cross-shard is retained.
@@ -352,6 +349,10 @@ seastar::future<> ClusterDataPlane::startImpl(const ClusterConfig& cfg, seastar:
         // CheckQuorum remains an explicit Raft tuning choice. This deployment keeps it
         // disabled because bounded proposal deadlines already fail closed on lost quorum.
         ropts.checkQuorum = false;
+        // The data-plane listener is already live at this point. Publish the exact
+        // production options to every owning reactor before Group 0 can authorize a
+        // destination-group creation request; an earlier request fails Unavailable.
+        co_await shards_.invoke_on_all([ropts](ShardRaftPlane& plane) { plane.configureDataRaftOptions(ropts); });
         // Compose the control group only when explicitly enabled. The startup
         // policy keeps a fresh seed completely inert without --cluster-init,
         // starts fresh non-seeds as non-voting observers, and recovers any
@@ -365,24 +366,23 @@ seastar::future<> ClusterDataPlane::startImpl(const ClusterConfig& cfg, seastar:
             if (journalError)
                 throw std::filesystem::filesystem_error("inspect group-0 journal", journalRoot / "group0",
                                                         journalError);
-            const Group0StartupDecision decision =
-                decideGroup0Startup(true, rt_->selfId, cfg.control_seed_node_id, group0BootstrapRequested_,
-                                    journalExists);
+            const Group0StartupDecision decision = decideGroup0Startup(true, rt_->selfId, cfg.control_seed_node_id,
+                                                                       group0BootstrapRequested_, journalExists);
             if (decision.host()) {
                 auto record = *group0Identity_;
                 const std::string clusterUuid = cfg.cluster_uuid;
                 const control::ControlMap initialServingMap = rt_->map;
                 co_await shards_.invoke_on(
-                    0, [this, voters = decision.initialVoters, ropts, bootstrap = decision.bootstrap(),
-                        record = std::move(record), clusterUuid, initialServingMap,
-                        dataRoot](ShardRaftPlane& plane) mutable -> seastar::future<> {
+                    0,
+                    [this, voters = decision.initialVoters, ropts, bootstrap = decision.bootstrap(),
+                     record = std::move(record), clusterUuid, initialServingMap,
+                     dataRoot](ShardRaftPlane& plane) mutable -> seastar::future<> {
                         auto publishCache = [this, dataRoot](control::ControlMap map) -> seastar::future<> {
                             // The durable high-water mark is written first. If a later
                             // reactor update fails, Group 0 retains its old applied
                             // boundary and retries this exact idempotent publication.
-                            co_await seastar::async([dataRoot, map] {
-                                control::DurableControlMapStore(dataRoot).persist(map);
-                            });
+                            co_await seastar::async(
+                                [dataRoot, map] { control::DurableControlMapStore(dataRoot).persist(map); });
                             if (!dir_)
                                 throw std::logic_error("cluster: serving-map publication without a directory");
                             // Each callback mutates only that reactor's own directory.
@@ -397,8 +397,8 @@ seastar::future<> ClusterDataPlane::startImpl(const ClusterConfig& cfg, seastar:
                                 throw std::logic_error("cluster: serving-map publication without a runtime");
                             rt_->map = map;
                         };
-                        co_await plane.addGroup0(std::move(voters), ropts, clusterUuid, record,
-                                                 initialServingMap, std::move(publishCache));
+                        co_await plane.addGroup0(std::move(voters), ropts, clusterUuid, record, initialServingMap,
+                                                 std::move(publishCache));
                         auto* host = plane.group0();
                         if (!host || !host->group() || !host->stateMachine())
                             throw std::runtime_error("cluster: group-0 host failed to register its Raft group");
@@ -612,8 +612,7 @@ void ClusterDataPlane::startPeerResolver(bool replicated) {
     peerResolveTimer_.arm_periodic(kInterval);
 }
 
-seastar::future<ClusterDataPlane::ControlTokenMintResult> ClusterDataPlane::mintControlJoinToken(
-    std::string token) {
+seastar::future<ClusterDataPlane::ControlTokenMintResult> ClusterDataPlane::mintControlJoinToken(std::string token) {
     if (!controlEnabled_ || !shardsStarted_ || !control::validJoinToken(token))
         throw std::invalid_argument("cluster: group-0 token minting is not configured or the token is invalid");
     co_return co_await shards_.invoke_on(
@@ -631,8 +630,8 @@ seastar::future<ClusterDataPlane::ControlTokenMintResult> ClusterDataPlane::mint
 }
 
 seastar::future<control::ControlJoinResult> ClusterDataPlane::joinControlPlane(std::string token) {
-    if (!controlEnabled_ || !shardsStarted_ || !rt_ || !rpc_ || !group0Identity_ ||
-        !control::validJoinToken(token) || controlSeedNode_ == raft::kNoNode)
+    if (!controlEnabled_ || !shardsStarted_ || !rt_ || !rpc_ || !group0Identity_ || !control::validJoinToken(token) ||
+        controlSeedNode_ == raft::kNoNode)
         throw std::invalid_argument("cluster: group-0 join is not configured or the token is invalid");
 
     control::ControlJoinRequest request{controlClusterUuid_, *group0Identity_, std::move(token)};
@@ -641,8 +640,8 @@ seastar::future<control::ControlJoinResult> ClusterDataPlane::joinControlPlane(s
     auto* localHost = shards_.local().group0();
     if (localHost && localHost->group() && localHost->group()->leader() != raft::kNoNode)
         target = localHost->group()->leader();
-    const auto deadline = seastar::lowres_clock::now() + control::Group0Controller::kDefaultProposalTimeout +
-                          std::chrono::seconds(1);
+    const auto deadline =
+        seastar::lowres_clock::now() + control::Group0Controller::kDefaultProposalTimeout + std::chrono::seconds(1);
     auto send = [this, &request, deadline](NodeId to) {
         if (to == rt_->selfId)
             return shards_.local().handleControlJoin(request);
@@ -1181,16 +1180,14 @@ seastar::future<std::vector<data::DeleteRangeTarget>> ClusterDataPlane::freezeDe
         candidate.targets.push_back(
             control::FrozenDeleteTarget{std::move(target.seriesKey), target.startTime, target.endTime});
     if (!control::validFrozenDeletePlan(candidate))
-        throw data::WriteFrameTooLargeError(
-            "pattern delete expansion exceeds the bounded group-0 plan entry");
+        throw data::WriteFrameTooLargeError("pattern delete expansion exceeds the bounded group-0 plan entry");
 
     control::FreezeDeletePlanResult result;
     try {
         if (host->group()->isLeader()) {
             control::Group0Controller controller(*host->group(), *host->stateMachine());
             result = co_await controller.freezeDeletePlan(
-                std::move(candidate),
-                seastar::lowres_clock::now() + data::ReplicatedBatchWriteRouter::kAttemptTimeout);
+                std::move(candidate), seastar::lowres_clock::now() + data::ReplicatedBatchWriteRouter::kAttemptTimeout);
         } else {
             const data::NodeId leader = host->group()->leader();
             if (leader == raft::kNoNode || leader == host->group()->node().id())
@@ -1198,10 +1195,9 @@ seastar::future<std::vector<data::DeleteRangeTarget>> ClusterDataPlane::freezeDe
             else
                 result = co_await shards_.local().forwardFrozenDeletePlan(
                     leader,
-                    control::FrozenDeletePlanRpcRequest{
-                        control::FrozenDeletePlanRpcOperation::Freeze, std::move(candidate)},
-                    seastar::rpc::rpc_clock_type::now() +
-                        data::ReplicatedBatchWriteRouter::kAttemptTimeout);
+                    control::FrozenDeletePlanRpcRequest{control::FrozenDeletePlanRpcOperation::Freeze,
+                                                        std::move(candidate)},
+                    seastar::rpc::rpc_clock_type::now() + data::ReplicatedBatchWriteRouter::kAttemptTimeout);
         }
     } catch (const seastar::timed_out_error&) {
         // The group-0 entry may still commit after the local waiter expires, but
@@ -1214,8 +1210,8 @@ seastar::future<std::vector<data::DeleteRangeTarget>> ClusterDataPlane::freezeDe
         throw data::RetryableWriteError(
             "group-0 leadership changed while freezing the delete plan; retry the same request identity");
     } catch (const std::exception& e) {
-        throw data::RetryableWriteError(
-            "could not reach the group-0 leader to freeze the delete plan: " + std::string(e.what()));
+        throw data::RetryableWriteError("could not reach the group-0 leader to freeze the delete plan: " +
+                                        std::string(e.what()));
     }
     switch (result.status) {
         case control::FreezeDeletePlanStatus::Stored: {
@@ -1269,14 +1265,13 @@ seastar::future<std::optional<std::vector<data::DeleteRangeTarget>>> ClusterData
             else
                 result = co_await shards_.local().forwardFrozenDeletePlan(
                     leader,
-                    control::FrozenDeletePlanRpcRequest{
-                        control::FrozenDeletePlanRpcOperation::Lookup, std::move(request)},
-                    seastar::rpc::rpc_clock_type::now() +
-                        data::ReplicatedBatchWriteRouter::kAttemptTimeout);
+                    control::FrozenDeletePlanRpcRequest{control::FrozenDeletePlanRpcOperation::Lookup,
+                                                        std::move(request)},
+                    seastar::rpc::rpc_clock_type::now() + data::ReplicatedBatchWriteRouter::kAttemptTimeout);
         }
     } catch (const std::exception& e) {
-        throw data::RetryableWriteError(
-            "could not reach the group-0 leader to look up the delete plan: " + std::string(e.what()));
+        throw data::RetryableWriteError("could not reach the group-0 leader to look up the delete plan: " +
+                                        std::string(e.what()));
     }
     switch (result.status) {
         case control::FreezeDeletePlanStatus::Stored: {

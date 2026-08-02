@@ -36,8 +36,9 @@ public:
 
     // Instantiate the local Raft groups this node replicates (one per entry of
     // ClusterRuntime::localReplicaGroups()).
-    seastar::future<> addVShard(uint16_t vshard, std::vector<data::NodeId> voters, raft::RaftOptions opts = {}) {
-        return host_.addVShard(vshard, std::move(voters), opts);
+    seastar::future<> addVShard(uint16_t vshard, std::vector<data::NodeId> voters, raft::RaftOptions opts = {},
+                                ReplicatedVShardHost::RecoveredConfigValidator recoveredConfigValidator = {}) {
+        return host_.addVShard(vshard, std::move(voters), opts, std::move(recoveredConfigValidator));
     }
 
     // Route + replicate a write to each VShard's leader (durable quorum commit). The

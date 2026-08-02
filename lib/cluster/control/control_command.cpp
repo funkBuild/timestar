@@ -12,6 +12,8 @@ constexpr char kCommandMagic[4] = {'T', 'C', 'C', '1'};
 constexpr uint8_t kFrozenDeletePlanFrameVersion = 1;
 constexpr uint8_t kControlJoinRequestFrameTag = 1;
 constexpr uint8_t kControlJoinResultFrameTag = 1;
+constexpr uint8_t kEnsureMoveDestinationRequestFrameTag = 1;
+constexpr uint8_t kEnsureMoveDestinationResultFrameTag = 1;
 
 bool canonicalHex128(const std::string& value) {
     if (value.size() != 32)
@@ -35,6 +37,11 @@ bool validControlJoinResult(const ControlJoinResult& result) {
         return false;
     return (result.status == ControlJoinStatus::NotLeader || result.status == ControlJoinStatus::Rejected) ||
            result.leader != raft::kNoNode;
+}
+
+bool validEnsureMoveDestinationRequest(const EnsureMoveDestinationRequest& request) {
+    return canonicalHex128(request.clusterUuid) && validControlJobId(request.jobId) &&
+           request.controllerTerm != raft::kNoTerm && request.controllerLeader != raft::kNoNode;
 }
 
 struct Writer {
@@ -299,8 +306,7 @@ std::string encodeCommand(const ControlCommand& cmd) {
 }
 
 std::optional<ControlCommand> decodeCommand(const std::string& bytes) {
-    if (bytes.size() < sizeof(kCommandMagic) ||
-        std::memcmp(bytes.data(), kCommandMagic, sizeof(kCommandMagic)) != 0)
+    if (bytes.size() < sizeof(kCommandMagic) || std::memcmp(bytes.data(), kCommandMagic, sizeof(kCommandMagic)) != 0)
         return std::nullopt;
     Reader r{bytes.data() + sizeof(kCommandMagic), bytes.data() + bytes.size()};
     const uint8_t tag = r.u8();
@@ -403,8 +409,7 @@ std::optional<ControlCommand> decodeCommand(const std::string& bytes) {
         return std::nullopt;
     if (const auto* mint = std::get_if<MintJoinToken>(&cmd); mint && !validJoinToken(mint->token))
         return std::nullopt;
-    if (const auto* admission = std::get_if<AdmitWithToken>(&cmd);
-        admission && !validJoinToken(admission->token))
+    if (const auto* admission = std::get_if<AdmitWithToken>(&cmd); admission && !validJoinToken(admission->token))
         return std::nullopt;
     return cmd;
 }
@@ -444,8 +449,8 @@ std::optional<FrozenDeletePlanRpcRequest> decodeFrozenDeletePlanRpcRequest(const
 }
 
 std::string encodeFrozenDeletePlanRpcResult(const FreezeDeletePlanResult& result) {
-    const bool carriesPlan = result.status == FreezeDeletePlanStatus::Stored ||
-                             result.status == FreezeDeletePlanStatus::Conflict;
+    const bool carriesPlan =
+        result.status == FreezeDeletePlanStatus::Stored || result.status == FreezeDeletePlanStatus::Conflict;
     if (result.status > FreezeDeletePlanStatus::Invalid ||
         (carriesPlan ? !validFrozenDeletePlan(result.plan) : result.plan != FrozenDeletePlan{}))
         throw std::invalid_argument("invalid frozen delete-plan RPC result");
@@ -468,8 +473,8 @@ std::optional<FreezeDeletePlanResult> decodeFrozenDeletePlanRpcResult(const std:
         return std::nullopt;
     FreezeDeletePlanResult result;
     result.status = static_cast<FreezeDeletePlanStatus>(status);
-    const bool carriesPlan = result.status == FreezeDeletePlanStatus::Stored ||
-                             result.status == FreezeDeletePlanStatus::Conflict;
+    const bool carriesPlan =
+        result.status == FreezeDeletePlanStatus::Stored || result.status == FreezeDeletePlanStatus::Conflict;
     if (carriesPlan)
         result.plan = readFrozenDeletePlan(r);
     if (!r.ok || r.p != r.end || (carriesPlan && !validFrozenDeletePlan(result.plan)))
@@ -526,6 +531,55 @@ std::optional<ControlJoinResult> decodeControlJoinResult(const std::string& byte
     if (!r.ok || r.p != r.end || !validControlJoinResult(result))
         return std::nullopt;
     return result;
+}
+
+std::string encodeEnsureMoveDestinationRequest(const EnsureMoveDestinationRequest& request) {
+    if (!validEnsureMoveDestinationRequest(request))
+        throw std::invalid_argument("invalid ensure-move-destination request");
+    Writer w;
+    w.u8(kEnsureMoveDestinationRequestFrameTag);
+    w.str(request.clusterUuid);
+    w.str(request.jobId);
+    w.u64(request.controllerTerm);
+    w.u64(request.controllerLeader);
+    if (w.out.size() > kMaxEnsureMoveDestinationFrameBytes)
+        throw std::invalid_argument("ensure-move-destination request exceeds its wire bound");
+    return std::move(w.out);
+}
+
+std::optional<EnsureMoveDestinationRequest> decodeEnsureMoveDestinationRequest(const std::string& bytes) {
+    if (bytes.size() > kMaxEnsureMoveDestinationFrameBytes)
+        return std::nullopt;
+    Reader r{bytes.data(), bytes.data() + bytes.size()};
+    if (r.u8() != kEnsureMoveDestinationRequestFrameTag)
+        return std::nullopt;
+    EnsureMoveDestinationRequest request;
+    request.clusterUuid = r.str();
+    request.jobId = r.str();
+    request.controllerTerm = r.u64();
+    request.controllerLeader = r.u64();
+    if (!r.ok || r.p != r.end || !validEnsureMoveDestinationRequest(request))
+        return std::nullopt;
+    return request;
+}
+
+std::string encodeEnsureMoveDestinationResult(const EnsureMoveDestinationResult& result) {
+    if (result.status > EnsureMoveDestinationStatus::Unavailable)
+        throw std::invalid_argument("invalid ensure-move-destination result");
+    Writer w;
+    w.u8(kEnsureMoveDestinationResultFrameTag);
+    w.u8(static_cast<uint8_t>(result.status));
+    return std::move(w.out);
+}
+
+std::optional<EnsureMoveDestinationResult> decodeEnsureMoveDestinationResult(const std::string& bytes) {
+    Reader r{bytes.data(), bytes.data() + bytes.size()};
+    if (r.u8() != kEnsureMoveDestinationResultFrameTag)
+        return std::nullopt;
+    const uint8_t status = r.u8();
+    if (!r.ok || r.p != r.end || status > static_cast<uint8_t>(EnsureMoveDestinationStatus::Unavailable))
+        return std::nullopt;
+    return EnsureMoveDestinationResult{static_cast<EnsureMoveDestinationStatus>(status)};
 }
 
 }  // namespace timestar::control

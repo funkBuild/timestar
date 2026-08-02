@@ -6,8 +6,9 @@ Production blockers take priority and are authoritative in
 
 ## Production blockers
 
-- [ ] Complete group-0-driven join, drain, replace, remove, VShard movement,
-  ordered teardown, and reclaim-floor publication.
+- [ ] Complete group-0-driven drain, replace, remove, the production movement
+  scheduler/remote leader actuator, ordered teardown, and reclaim-floor
+  publication. Join and destination data-group materialization are wired.
 - [ ] Replicate retention policies and monotonic cutoff decisions through the
   data groups; keep mutation disabled until complete.
 - [ ] Replace monolithic snapshot construction/install buffers with bounded

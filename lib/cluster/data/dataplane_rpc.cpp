@@ -16,7 +16,6 @@
 #include <functional>
 #include <map>
 #include <optional>
-#include <set>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future-util.hh>
 #include <seastar/core/gate.hh>
@@ -26,6 +25,7 @@
 #include <seastar/net/api.hh>
 #include <seastar/net/tls.hh>
 #include <seastar/rpc/rpc.hh>
+#include <set>
 #include <stdexcept>
 
 namespace timestar::data {
@@ -68,6 +68,7 @@ constexpr uint64_t kFindPatternSeries = 12;
 // Lookup/freeze a group-0 pattern-delete plan through its current leader.
 constexpr uint64_t kFrozenDeletePlan = 13;
 constexpr uint64_t kControlJoin = 14;
+constexpr uint64_t kEnsureMoveDestination = 15;
 
 // How long before re-attempting a peer connection that died. seastar's rpc::client
 // never reconnects itself, so we replace it -- but bounded, so a burst of concurrent
@@ -216,10 +217,11 @@ struct DataPlaneRpc::Impl {
     std::map<NodeId, seastar::socket_address> peers;
     std::map<NodeId, std::unique_ptr<Client>> clients;
     NodeStore* nodeSink = nullptr;
-    ProposeSink* proposeSink = nullptr;      // RF=3 Raft propose target (M3)
-    ReadIndexSink* readIndexSink = nullptr;  // replica-read leader-reach target (M4)
+    ProposeSink* proposeSink = nullptr;                    // RF=3 Raft propose target (M3)
+    ReadIndexSink* readIndexSink = nullptr;                // replica-read leader-reach target (M4)
     FrozenDeletePlanSink* frozenDeletePlanSink = nullptr;  // group-0 request target
-    ControlJoinSink* controlJoinSink = nullptr;             // group-0 observer admission target
+    ControlJoinSink* controlJoinSink = nullptr;            // group-0 observer admission target
+    MoveDestinationSink* moveDestinationSink = nullptr;    // Group-0-authorized data-group creation
     // Connections that completed the exact-v1 handshake. Dropped when a
     // connection is retired because the peer may return on another binary.
     std::set<NodeId> v1Connections;
@@ -245,6 +247,7 @@ struct DataPlaneRpc::Impl {
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> proposeCommandHintedStub;
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> frozenDeletePlanStub;
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> controlJoinStub;
+    std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> ensureMoveDestinationStub;
     // DEADLINE-CARRYING variants of the three verbs the write path awaits
     // (write-scaleout 3f). seastar's rpc client stub has a time_point overload; without
     // it an awaited call has NO timeout at all, so a peer that accepts the connection and
@@ -273,6 +276,9 @@ struct DataPlaneRpc::Impl {
     std::function<seastar::future<seastar::sstring>(Client&, seastar::rpc::rpc_clock_type::time_point,
                                                     seastar::sstring)>
         controlJoinTimedStub;
+    std::function<seastar::future<seastar::sstring>(Client&, seastar::rpc::rpc_clock_type::time_point,
+                                                    seastar::sstring)>
+        ensureMoveDestinationTimedStub;
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> leaderReadIndexStub;
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> leaderCommitIndexStub;
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> requireV1Stub;
@@ -348,6 +354,7 @@ struct DataPlaneRpc::Impl {
         proposeCommandHintedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kProposeCommandHinted);
         frozenDeletePlanStub = proto.make_client<seastar::sstring(seastar::sstring)>(kFrozenDeletePlan);
         controlJoinStub = proto.make_client<seastar::sstring(seastar::sstring)>(kControlJoin);
+        ensureMoveDestinationStub = proto.make_client<seastar::sstring(seastar::sstring)>(kEnsureMoveDestination);
         proposeWriteHintedTimedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kProposeWriteHinted);
         proposeCommandHintedTimedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kProposeCommandHinted);
         requireV1TimedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kRequireV1);
@@ -355,6 +362,7 @@ struct DataPlaneRpc::Impl {
         findPatternSeriesTimedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kFindPatternSeries);
         frozenDeletePlanTimedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kFrozenDeletePlan);
         controlJoinTimedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kControlJoin);
+        ensureMoveDestinationTimedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kEnsureMoveDestination);
         leaderReadIndexStub = proto.make_client<seastar::sstring(seastar::sstring)>(kLeaderReadIndex);
         leaderCommitIndexStub = proto.make_client<seastar::sstring(seastar::sstring)>(kLeaderCommitIndex);
         requireV1Stub = proto.make_client<seastar::sstring(seastar::sstring)>(kRequireV1);
@@ -490,8 +498,8 @@ seastar::future<> DataPlaneRpc::start(seastar::socket_address local, NodeStore& 
         if (!request)
             return seastar::make_exception_future<seastar::sstring>(
                 std::runtime_error("dataplane: malformed frozen delete-plan request"));
-        return impl_->frozenDeletePlanSink->handleFrozenDeletePlan(std::move(*request)).then(
-            [](control::FreezeDeletePlanResult result) {
+        return impl_->frozenDeletePlanSink->handleFrozenDeletePlan(std::move(*request))
+            .then([](control::FreezeDeletePlanResult result) {
                 std::string encoded = control::encodeFrozenDeletePlanRpcResult(result);
                 return seastar::sstring(encoded.data(), encoded.size());
             });
@@ -509,9 +517,26 @@ seastar::future<> DataPlaneRpc::start(seastar::socket_address local, NodeStore& 
         if (!request)
             return seastar::make_exception_future<seastar::sstring>(
                 std::runtime_error("dataplane: malformed control join request"));
-        return impl_->controlJoinSink->handleControlJoin(std::move(*request)).then(
-            [](control::ControlJoinResult result) {
+        return impl_->controlJoinSink->handleControlJoin(std::move(*request))
+            .then([](control::ControlJoinResult result) {
                 std::string encoded = control::encodeControlJoinResult(result);
+                return seastar::sstring(encoded.data(), encoded.size());
+            });
+    });
+    impl_->proto.register_handler(kEnsureMoveDestination, [this](seastar::sstring data) {
+        if (!impl_->moveDestinationSink)
+            return seastar::make_exception_future<seastar::sstring>(
+                std::runtime_error("dataplane: no move-destination sink"));
+        if (data.size() > control::kMaxEnsureMoveDestinationFrameBytes)
+            return seastar::make_exception_future<seastar::sstring>(
+                std::runtime_error("dataplane: oversized ensure-move-destination request"));
+        auto request = control::decodeEnsureMoveDestinationRequest(std::string(data.data(), data.size()));
+        if (!request)
+            return seastar::make_exception_future<seastar::sstring>(
+                std::runtime_error("dataplane: malformed ensure-move-destination request"));
+        return impl_->moveDestinationSink->handleEnsureMoveDestination(std::move(*request))
+            .then([](control::EnsureMoveDestinationResult result) {
+                std::string encoded = control::encodeEnsureMoveDestinationResult(result);
                 return seastar::sstring(encoded.data(), encoded.size());
             });
     });
@@ -622,6 +647,10 @@ void DataPlaneRpc::setFrozenDeletePlanSink(FrozenDeletePlanSink& sink) {
 
 void DataPlaneRpc::setControlJoinSink(ControlJoinSink& sink) {
     impl_->controlJoinSink = &sink;
+}
+
+void DataPlaneRpc::setMoveDestinationSink(MoveDestinationSink& sink) {
+    impl_->moveDestinationSink = &sink;
 }
 
 void DataPlaneRpc::setTlsCredentials(std::string certPem, std::string keyPem, std::string caPem,
@@ -803,8 +832,8 @@ seastar::future<control::FreezeDeletePlanResult> DataPlaneRpc::frozenDeletePlan(
     co_return std::move(*result);
 }
 
-seastar::future<control::ControlJoinResult> DataPlaneRpc::controlJoin(
-    NodeId to, control::ControlJoinRequest request, OptDeadline deadline) {
+seastar::future<control::ControlJoinResult> DataPlaneRpc::controlJoin(NodeId to, control::ControlJoinRequest request,
+                                                                      OptDeadline deadline) {
     if (impl_->stopping)
         throw std::runtime_error("dataplane: shutting down");
     co_await ensureV1(to, deadline);
@@ -818,6 +847,24 @@ seastar::future<control::ControlJoinResult> DataPlaneRpc::controlJoin(
     auto result = control::decodeControlJoinResult(std::string(reply.data(), reply.size()));
     if (!result)
         throw std::runtime_error("dataplane: malformed control join result");
+    co_return *result;
+}
+
+seastar::future<control::EnsureMoveDestinationResult> DataPlaneRpc::ensureMoveDestination(
+    NodeId to, control::EnsureMoveDestinationRequest request, OptDeadline deadline) {
+    if (impl_->stopping)
+        throw std::runtime_error("dataplane: shutting down");
+    co_await ensureV1(to, deadline);
+    auto* conn = impl_->clientFor(to);
+    if (!conn)
+        throw std::runtime_error("dataplane: unknown peer");
+    std::string encoded = control::encodeEnsureMoveDestinationRequest(request);
+    seastar::sstring frame(encoded.data(), encoded.size());
+    seastar::sstring reply = deadline ? co_await impl_->ensureMoveDestinationTimedStub(*conn, *deadline, frame)
+                                      : co_await impl_->ensureMoveDestinationStub(*conn, frame);
+    auto result = control::decodeEnsureMoveDestinationResult(std::string(reply.data(), reply.size()));
+    if (!result)
+        throw std::runtime_error("dataplane: malformed ensure-move-destination result");
     co_return *result;
 }
 

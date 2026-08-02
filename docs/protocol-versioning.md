@@ -20,6 +20,8 @@ historical-reader guarantees during the greenfield phase.
 | VShard snapshot payload | `TSP1` |
 | Control command | `TCC1` |
 | Frozen delete-plan RPC frame | version byte `1` |
+| Control join RPC frames | version byte `1` |
+| Movement destination RPC frames | version byte `1`, carried only after the exact-v1 connection handshake |
 | Group-0 snapshot | `TSG0SNP1` |
 | Persisted VShard movement job | `TSMJ1`: step, VShard, target map epoch, full-width destination/victim IDs, exact source voters |
 | Raft envelope | `TSR1` |

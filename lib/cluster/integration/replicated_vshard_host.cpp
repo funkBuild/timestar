@@ -122,7 +122,8 @@ uint64_t ReplicatedVShardHost::journalSyncRequests() const {
     return n;
 }
 
-seastar::future<> ReplicatedVShardHost::addVShard(uint16_t vshard, std::vector<NodeId> voters, raft::RaftOptions opts) {
+seastar::future<> ReplicatedVShardHost::addVShard(uint16_t vshard, std::vector<NodeId> voters, raft::RaftOptions opts,
+                                                  RecoveredConfigValidator recoveredConfigValidator) {
     // AN IDENTITY-ASSUMING SITE, deliberately left so (debt D-11, ADR 0004). Three
     // things below are keyed by the VShard id AS a group id:
     //   * `registry_.addGroup(vshard, ...)` -- the group id the transport peeks and
@@ -221,6 +222,14 @@ seastar::future<> ReplicatedVShardHost::addVShard(uint16_t vshard, std::vector<N
         retention_.setReleased(VShardId{vshard}, floor);
     vs.sm = std::make_unique<EngineDataStateMachine>(store_, VShardId{vshard});
     raft::RaftNode node(self_, baseVoters, std::move(st.log), st.hardState, opts, baseLearners);
+    // Dynamic destination creation may reopen a journal left by an interrupted
+    // earlier movement. Validate the fully recovered active configuration before
+    // installing snapshot files or registering a ticking group. A stale journal
+    // must fail closed; letting it campaign under an unrelated configuration is
+    // worse than leaving the approved move pending.
+    if (recoveredConfigValidator && !recoveredConfigValidator(node.config()))
+        throw std::runtime_error(
+            "ReplicatedVShardHost::addVShard: recovered configuration is not authorized by Group 0");
     if (st.snapshot && st.snapshotFromPeer) {
         // A RECEIVED SNAPSHOT MUST BE RE-INSTALLED (review F2), and this is the case that
         // turned a fail-closed refusal into silent loss before it was caught.
@@ -996,8 +1005,7 @@ NodeId ReplicatedVShardHost::leaderOf(uint16_t vshard) const {
     return g ? g->leader() : raft::kNoNode;
 }
 
-std::optional<EngineDataStateMachine::DeleteReceiptCounts> ReplicatedVShardHost::deleteReceiptCounts(
-    uint16_t vshard) {
+std::optional<EngineDataStateMachine::DeleteReceiptCounts> ReplicatedVShardHost::deleteReceiptCounts(uint16_t vshard) {
     auto found = vshards_.find(vshard);
     auto* group = registry_.group(vshard);
     if (found == vshards_.end() || !found->second.sm || !group)

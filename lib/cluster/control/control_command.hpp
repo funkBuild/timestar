@@ -1,7 +1,7 @@
 #pragma once
 
-#include "group0_state.hpp"
 #include "../movement/move_job.hpp"
+#include "group0_state.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -127,10 +127,32 @@ struct ControlJoinResult {
 
 inline constexpr size_t kMaxControlJoinFrameBytes = 4096;
 
+// A controller asks the destination node to materialize the data Raft group
+// before adding that node as a learner. The request carries only fencing and
+// identity: the receiver derives the VShard, source voters, and destination
+// from its own committed Group-0 job, so a peer cannot invent membership.
+struct EnsureMoveDestinationRequest {
+    std::string clusterUuid;
+    std::string jobId;
+    uint64_t controllerTerm = 0;
+    NodeId controllerLeader = raft::kNoNode;
+
+    friend bool operator==(const EnsureMoveDestinationRequest&, const EnsureMoveDestinationRequest&) = default;
+};
+
+enum class EnsureMoveDestinationStatus : uint8_t { Ready = 0, Rejected = 1, Unavailable = 2 };
+
+struct EnsureMoveDestinationResult {
+    EnsureMoveDestinationStatus status = EnsureMoveDestinationStatus::Rejected;
+
+    friend bool operator==(const EnsureMoveDestinationResult&, const EnsureMoveDestinationResult&) = default;
+};
+
+inline constexpr size_t kMaxEnsureMoveDestinationFrameBytes = 2048;
+
 using ControlCommand =
-    std::variant<InitCluster, UpsertNode, SetNodeState, PlanVShardMove, SetMetaVoters, CasPolicy,
-                 SetControllerTerm, UpsertJob, MintJoinToken, AdmitWithToken, StoreFrozenDeletePlan,
-                 PublishServingMap>;
+    std::variant<InitCluster, UpsertNode, SetNodeState, PlanVShardMove, SetMetaVoters, CasPolicy, SetControllerTerm,
+                 UpsertJob, MintJoinToken, AdmitWithToken, StoreFrozenDeletePlan, PublishServingMap>;
 
 // Wire serialization for a command (the Raft entry payload). Length-prefixed,
 // self-delimiting; decode returns nullopt on any malformed, truncated, or
@@ -150,5 +172,10 @@ std::string encodeControlJoinRequest(const ControlJoinRequest& request);
 std::optional<ControlJoinRequest> decodeControlJoinRequest(const std::string& bytes);
 std::string encodeControlJoinResult(const ControlJoinResult& result);
 std::optional<ControlJoinResult> decodeControlJoinResult(const std::string& bytes);
+
+std::string encodeEnsureMoveDestinationRequest(const EnsureMoveDestinationRequest& request);
+std::optional<EnsureMoveDestinationRequest> decodeEnsureMoveDestinationRequest(const std::string& bytes);
+std::string encodeEnsureMoveDestinationResult(const EnsureMoveDestinationResult& result);
+std::optional<EnsureMoveDestinationResult> decodeEnsureMoveDestinationResult(const std::string& bytes);
 
 }  // namespace timestar::control

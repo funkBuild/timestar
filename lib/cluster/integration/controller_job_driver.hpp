@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../control/group0_state.hpp"  // control::Job
+#include "../control/control_command.hpp"
 #include "../movement/mover.hpp"
 #include "raft_move_executor.hpp"
 
@@ -38,6 +38,36 @@ public:
         if (!decoded || job.step != static_cast<uint32_t>(decoded->step()) || job.done != decoded->done())
             return std::nullopt;
         return decoded;
+    }
+
+    // Authorize destination materialization exclusively from the receiver's
+    // committed Group-0 state. The caller-supplied job id and controller fence
+    // select an existing decision; they do not supply any topology fields.
+    static std::optional<movement::MoveJob> authorizeDestination(const control::Group0State& state, NodeId self,
+                                                                 const control::EnsureMoveDestinationRequest& request) {
+        if (state.clusterUuid != request.clusterUuid || state.controllerTerm != request.controllerTerm ||
+            state.controllerLeader != request.controllerLeader || state.mapEpoch == 0)
+            return std::nullopt;
+        const auto node = state.nodes.find(self);
+        if (node == state.nodes.end() || node->second.state != control::NodeState::Active)
+            return std::nullopt;
+        const auto found = state.jobs.find(request.jobId);
+        if (found == state.jobs.end())
+            return std::nullopt;
+        auto move = decodeMoveJob(found->second);
+        if (!move || move->plan().dest != self || move->plan().mapEpoch != state.mapEpoch)
+            return std::nullopt;
+        const auto desired = state.desiredPlacement.find(move->plan().vshard);
+        if (desired == state.desiredPlacement.end() || desired->second != move->targetVoters())
+            return std::nullopt;
+        const auto serving = state.servingMap.placement.find(move->plan().vshard);
+        if (serving == state.servingMap.placement.end())
+            return std::nullopt;
+        const bool beforeCutover =
+            state.servingMap.epoch + 1 == move->plan().mapEpoch && serving->second == move->plan().sourceVoters;
+        const bool afterCutover =
+            state.servingMap.epoch == move->plan().mapEpoch && serving->second == move->targetVoters() && move->done();
+        return beforeCutover || afterCutover ? std::move(move) : std::nullopt;
     }
 
     // Drive one persisted job whose payload is a MoveJob. Decodes it, runs it against a

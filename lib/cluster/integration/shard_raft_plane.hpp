@@ -12,6 +12,7 @@
 #include "../raft/raft_codec.hpp"        // decodeEnvelope
 #include "../raft/raft_driver.hpp"       // RaftTransport
 #include "../raft/raft_rpc_transport.hpp"
+#include "controller_job_driver.hpp"
 #include "engine_local_store.hpp"
 #include "group0_host.hpp"
 #include "replicated_data_plane.hpp"
@@ -28,8 +29,8 @@
 #include <optional>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/do_with.hh>
-#include <seastar/core/future.hh>
 #include <seastar/core/future-util.hh>
+#include <seastar/core/future.hh>
 #include <seastar/core/gate.hh>
 #include <seastar/core/lowres_clock.hh>
 #include <seastar/core/sharded.hh>
@@ -129,7 +130,8 @@ struct DataPlaneTls {
 class ShardRaftPlane : public data::ProposeSink,
                        public data::ReadIndexSink,
                        public data::FrozenDeletePlanSink,
-                       public data::ControlJoinSink {
+                       public data::ControlJoinSink,
+                       public data::MoveDestinationSink {
 public:
     using DynamicPeerRegistrar = std::function<seastar::future<bool>(data::NodeId, std::string)>;
 
@@ -250,10 +252,9 @@ public:
             if (shard == seastar::this_shard_id())
                 pending.push_back(quorumLeaderReadFenceLocal(std::move(list)));
             else
-                pending.push_back(peers_->invoke_on(
-                    shard, [v = std::move(list)](ShardRaftPlane& p) mutable {
-                        return p.quorumLeaderReadFenceLocal(std::move(v));
-                    }));
+                pending.push_back(peers_->invoke_on(shard, [v = std::move(list)](ShardRaftPlane& p) mutable {
+                    return p.quorumLeaderReadFenceLocal(std::move(v));
+                }));
         }
         for (auto& f : pending)
             co_await std::move(f);
@@ -265,9 +266,8 @@ public:
             throw std::runtime_error("cluster: leader read fence reached an uninitialised shard plane");
         static constexpr size_t kMaxConcurrentReadBarriers = 32;
         co_await seastar::max_concurrent_for_each(
-            vshards, kMaxConcurrentReadBarriers, [this](uint16_t vs) -> seastar::future<> {
-                (void)co_await plane_->host().leaderReadIndex(vs);
-            });
+            vshards, kMaxConcurrentReadBarriers,
+            [this](uint16_t vs) -> seastar::future<> { (void)co_await plane_->host().leaderReadIndex(vs); });
     }
 
     // Listen for peer data-plane traffic on the node's data-plane port from THIS shard.
@@ -287,14 +287,14 @@ public:
         rpc_->setReadIndexSink(*this);
         rpc_->setFrozenDeletePlanSink(*this);
         rpc_->setControlJoinSink(*this);
+        rpc_->setMoveDestinationSink(*this);
         return rpc_->start(local, *queryStore_, /*perShardListener=*/true);
     }
 
     void addDataPeer(data::NodeId id, seastar::socket_address addr) { rpc_->addPeer(id, addr); }
 
     seastar::future<control::FreezeDeletePlanResult> forwardFrozenDeletePlan(
-        data::NodeId leader, control::FrozenDeletePlanRpcRequest request,
-        data::OptDeadline deadline = std::nullopt) {
+        data::NodeId leader, control::FrozenDeletePlanRpcRequest request, data::OptDeadline deadline = std::nullopt) {
         return rpc_->frozenDeletePlan(leader, std::move(request), deadline);
     }
 
@@ -305,10 +305,9 @@ public:
         control::FrozenDeletePlanRpcRequest request) override {
         if (seastar::this_shard_id() != 0) {
             auto* peers = peers_;
-            co_return co_await peers->invoke_on(
-                0, [request = std::move(request)](ShardRaftPlane& plane) mutable {
-                    return plane.handleFrozenDeletePlan(std::move(request));
-                });
+            co_return co_await peers->invoke_on(0, [request = std::move(request)](ShardRaftPlane& plane) mutable {
+                return plane.handleFrozenDeletePlan(std::move(request));
+            });
         }
         if (!group0_ || !group0_->group() || !group0_->stateMachine())
             co_return control::FreezeDeletePlanResult{control::FreezeDeletePlanStatus::NotLeader, {}};
@@ -316,18 +315,15 @@ public:
         if (request.operation == control::FrozenDeletePlanRpcOperation::Lookup)
             co_return controller.lookupDeletePlan(request.plan);
         co_return co_await controller.freezeDeletePlan(
-            std::move(request.plan),
-            seastar::lowres_clock::now() + data::ReplicatedBatchWriteRouter::kAttemptTimeout);
+            std::move(request.plan), seastar::lowres_clock::now() + data::ReplicatedBatchWriteRouter::kAttemptTimeout);
     }
 
-    seastar::future<control::ControlJoinResult> handleControlJoin(
-        control::ControlJoinRequest request) override {
+    seastar::future<control::ControlJoinResult> handleControlJoin(control::ControlJoinRequest request) override {
         if (seastar::this_shard_id() != 0) {
             auto* peers = peers_;
-            co_return co_await peers->invoke_on(
-                0, [request = std::move(request)](ShardRaftPlane& plane) mutable {
-                    return plane.handleControlJoin(std::move(request));
-                });
+            co_return co_await peers->invoke_on(0, [request = std::move(request)](ShardRaftPlane& plane) mutable {
+                return plane.handleControlJoin(std::move(request));
+            });
         }
         if (!group0_ || !group0_->group() || !group0_->stateMachine())
             co_return control::ControlJoinResult{control::ControlJoinStatus::NotLeader, raft::kNoNode};
@@ -349,8 +345,7 @@ public:
         // genuinely dynamic node (absent from static config) can never receive
         // the configuration entry or catch up. A failed resolution leaves the
         // durable Joining record and consumed token retry-safe.
-        if (!dynamicPeerRegistrar_ ||
-            !co_await dynamicPeerRegistrar_(request.record.raftId, request.record.address))
+        if (!dynamicPeerRegistrar_ || !co_await dynamicPeerRegistrar_(request.record.raftId, request.record.address))
             co_return control::ControlJoinResult{control::ControlJoinStatus::Joining, currentLeader()};
         if (!co_await controller.addLearner(request.record.raftId)) {
             if (!group->isLeader())
@@ -361,16 +356,71 @@ public:
             (void)co_await controller.activateCaughtUpLearner(request.record.raftId);
 
         const auto found = group0_->state().nodes.find(request.record.raftId);
-        const bool active = found != group0_->state().nodes.end() &&
-                            found->second.state == control::NodeState::Active;
-        const bool caughtUpAfterActivation = group->node().config().isVoter(request.record.raftId) ||
-                                             controller.learnerCaughtUp(request.record.raftId);
+        const bool active = found != group0_->state().nodes.end() && found->second.state == control::NodeState::Active;
+        const bool caughtUpAfterActivation =
+            group->node().config().isVoter(request.record.raftId) || controller.learnerCaughtUp(request.record.raftId);
         if (active && caughtUpAfterActivation)
             (void)co_await controller.reconcileMetaVoters();
-        co_return control::ControlJoinResult{
-            active && caughtUpAfterActivation ? control::ControlJoinStatus::Active
-                                               : control::ControlJoinStatus::Joining,
-            currentLeader()};
+        co_return control::ControlJoinResult{active && caughtUpAfterActivation ? control::ControlJoinStatus::Active
+                                                                               : control::ControlJoinStatus::Joining,
+                                             currentLeader()};
+    }
+
+    // Install the production data-group options before topology actuation is
+    // enabled. The inter-node listener starts earlier during boot, so an early
+    // request receives Unavailable instead of creating a group with test/default
+    // timing and memory bounds.
+    void configureDataRaftOptions(raft::RaftOptions opts) {
+        dataRaftOptions_ = opts;
+        dataRaftOptionsConfigured_ = true;
+    }
+
+    seastar::future<control::EnsureMoveDestinationResult> handleEnsureMoveDestination(
+        control::EnsureMoveDestinationRequest request) override {
+        if (seastar::this_shard_id() != 0) {
+            auto* peers = peers_;
+            co_return co_await peers->invoke_on(0, [request = std::move(request)](ShardRaftPlane& plane) mutable {
+                return plane.handleEnsureMoveDestination(std::move(request));
+            });
+        }
+        if (!group0_ || !group0_->group() || !group0_->stateMachine())
+            co_return control::EnsureMoveDestinationResult{control::EnsureMoveDestinationStatus::Unavailable};
+        auto move = ControllerJobDriver::authorizeDestination(group0_->state(), group0_->group()->node().id(), request);
+        if (!move)
+            co_return control::EnsureMoveDestinationResult{control::EnsureMoveDestinationStatus::Rejected};
+        const unsigned owner = shardOwningVShard(move->plan().vshard, dir_.get());
+        const bool ready =
+            owner == seastar::this_shard_id()
+                ? co_await ensureMoveDestinationLocal(*move)
+                : co_await peers_->invoke_on(owner, [move = std::move(*move)](ShardRaftPlane& plane) mutable {
+                      return plane.ensureMoveDestinationLocal(std::move(move));
+                  });
+        co_return control::EnsureMoveDestinationResult{ready ? control::EnsureMoveDestinationStatus::Ready
+                                                             : control::EnsureMoveDestinationStatus::Unavailable};
+    }
+
+    // Owning-reactor half of destination materialization. Public for the shard-0
+    // dispatcher and focused tests; authorization must already have happened.
+    seastar::future<bool> ensureMoveDestinationLocal(movement::MoveJob move) {
+        if (!ready() || shardOwningVShard(move.plan().vshard, dir_.get()) != seastar::this_shard_id())
+            co_return false;
+        auto& host = plane_->host();
+        if (raft::RaftGroup* existing = host.group(move.plan().vshard)) {
+            const auto& config = existing->node().config();
+            co_return move.acceptsConfig(config.voters, config.votersOutgoing, config.learners);
+        }
+        if (!dataRaftOptionsConfigured_)
+            co_return false;
+        try {
+            co_await plane_->addVShard(
+                move.plan().vshard, move.plan().sourceVoters, dataRaftOptions_, [move](const raft::Config& config) {
+                    return move.acceptsConfig(config.voters, config.votersOutgoing, config.learners);
+                });
+        } catch (const std::exception& e) {
+            timestar::http_log.warn("cluster: refused movement destination group {}: {}", move.plan().vshard, e.what());
+            co_return false;
+        }
+        co_return true;
     }
 
     // ProposeSink: a peer forwarded a batch because this NODE leads those VShards. The
@@ -906,8 +956,10 @@ private:
     // Shard-local live VShard -> group/placement resolution. Declared before
     // plane_ so the routers that borrow it are destroyed first.
     std::unique_ptr<data::VShardDirectory> dir_;
-    std::unique_ptr<data::DataPlaneRpc> rpc_;     // this shard's own data-plane listener + peer clients
+    std::unique_ptr<data::DataPlaneRpc> rpc_;  // this shard's own data-plane listener + peer clients
     std::unique_ptr<ReplicatedDataPlane> plane_;
+    raft::RaftOptions dataRaftOptions_{};
+    bool dataRaftOptionsConfigured_ = false;
     bool stopping_ = false;          // set at the top of stop(); see ready()
     uint64_t inboundProposals_ = 0;  // peer proposals served BY THIS SHARD's listener
 };
@@ -1184,7 +1236,7 @@ inline seastar::future<data::ProposeOutcome> ShardRaftPlane::proposeCommandHinte
                                                                                   data::OptDeadline deadline) {
     ++inboundProposals_;
     return peers_->invoke_on(shardOwningVShard(vshard, dir_.get()), [vshard, command = std::move(command),
-                                                               deadline](ShardRaftPlane& p) mutable {
+                                                                     deadline](ShardRaftPlane& p) mutable {
         if (!p.ready())
             return seastar::make_exception_future<data::ProposeOutcome>(data::ShardStoppingError(kShardStoppingError));
         return p.plane().host().proposeCommandHinted(vshard, std::move(command), deadline);

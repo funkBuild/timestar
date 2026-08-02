@@ -16,6 +16,7 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -111,7 +112,9 @@ public:
     // timing (production: uniform; tests: preferred leader). The journal lives
     // under journalRoot/vshard_<id> (default) or, with the shared journal enabled,
     // journalRoot/shard_<core> shared by every group on this reactor.
-    seastar::future<> addVShard(uint16_t vshard, std::vector<NodeId> voters, raft::RaftOptions opts = {});
+    using RecoveredConfigValidator = std::function<bool(const raft::Config&)>;
+    seastar::future<> addVShard(uint16_t vshard, std::vector<NodeId> voters, raft::RaftOptions opts = {},
+                                RecoveredConfigValidator recoveredConfigValidator = {});
 
     // Replicate a command to a VShard's group; resolves true on durable quorum commit
     // + apply, false if this node is not the leader (caller redirects to the leader).

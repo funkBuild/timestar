@@ -129,6 +129,39 @@ public:
         return false;
     }
 
+    // Recovery can stop after the joint entry is durable but before Raft appends
+    // or applies the final stable configuration. Destination materialization
+    // validates that in-flight shape before registering the recovered group.
+    bool acceptsConfig(const std::vector<NodeId>& voters, const std::vector<NodeId>& outgoing,
+                       const std::vector<NodeId>& learners) const {
+        if (outgoing.empty())
+            return acceptsConfig(voters, learners);
+        if (!valid())
+            return false;
+        const auto source = canonical(plan_.sourceVoters);
+        const auto promoted = canonical(withNode(source, plan_.dest));
+        const auto final = plan_.isReplace() ? canonical(withoutNode(promoted, plan_.victim)) : promoted;
+        const auto liveVoters = canonical(voters);
+        const auto liveOutgoing = canonical(outgoing);
+        const auto liveLearners = canonical(learners);
+        const std::vector<NodeId> noLearners;
+        const auto destinationLearner = canonical(std::vector<NodeId>{plan_.dest});
+        switch (step_) {
+            case MoveStep::Planned:
+                return liveVoters == source && liveOutgoing == source && liveLearners == destinationLearner;
+            case MoveStep::CaughtUp:
+                return liveVoters == promoted && liveOutgoing == source && liveLearners == noLearners;
+            case MoveStep::Promoted:
+                return plan_.isReplace() && liveVoters == final && liveOutgoing == promoted &&
+                       liveLearners == noLearners;
+            case MoveStep::LearnerAdded:
+            case MoveStep::OldRemoved:
+            case MoveStep::Done:
+                return false;
+        }
+        return false;
+    }
+
     // The step that must be performed next (the transition OUT of the current
     // step). Done stays Done.
     MoveStep nextStep() const {
