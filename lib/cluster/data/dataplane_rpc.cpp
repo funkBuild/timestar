@@ -399,6 +399,15 @@ DataPlaneRpc::DataPlaneRpc() : impl_(std::make_unique<Impl>()) {}
 DataPlaneRpc::~DataPlaneRpc() = default;
 
 void DataPlaneRpc::addPeer(NodeId id, seastar::socket_address addr) {
+    auto existing = impl_->peers.find(id);
+    if (existing != impl_->peers.end() && existing->second == addr)
+        return;
+    if (auto client = impl_->clients.find(id); client != impl_->clients.end()) {
+        impl_->retire(std::move(client->second));
+        impl_->clients.erase(client);
+    }
+    impl_->nextRetry.erase(id);
+    impl_->v1Connections.erase(id);
     impl_->peers[id] = addr;
 }
 
@@ -889,6 +898,8 @@ seastar::future<ProposeOutcome> DataPlaneRpc::proposeCommandHinted(NodeId to, ui
 }
 
 seastar::future<> DataPlaneRpc::stop() {
+    if (impl_->stopping)
+        co_return;  // failed-start cleanup and an explicit owner stop may both arrive
     // Stop peer clients FIRST (aborts our outbound calls and closes our
     // connections into peers' servers), THEN stop our server. Doing the server
     // first would wait for peers' still-open inbound connections to close -- a

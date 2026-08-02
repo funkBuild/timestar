@@ -21,6 +21,7 @@
 #include <chrono>
 #include <exception>
 #include <filesystem>
+#include <functional>
 #include <iterator>
 #include <map>
 #include <memory>
@@ -130,11 +131,16 @@ class ShardRaftPlane : public data::ProposeSink,
                        public data::FrozenDeletePlanSink,
                        public data::ControlJoinSink {
 public:
+    using DynamicPeerRegistrar = std::function<seastar::future<bool>(data::NodeId, std::string)>;
+
     seastar::future<> init(seastar::sharded<Engine>* engines, seastar::sharded<ShardRaftPlane>* peers,
                            control::ControlMap initialMap, data::NodeId self, std::string journalRoot,
-                           std::chrono::milliseconds tick, JournalIdentity journalIdentity = JournalIdentity::testing()) {
+                           std::chrono::milliseconds tick, JournalIdentity journalIdentity = JournalIdentity::testing(),
+                           DynamicPeerRegistrar dynamicPeerRegistrar = {}) {
         store_ = std::make_unique<EngineLocalStore>(*engines);
         peers_ = peers;
+        if (seastar::this_shard_id() == 0)
+            dynamicPeerRegistrar_ = std::move(dynamicPeerRegistrar);
         // Every reactor owns its routing directory. Sharing ClusterDataPlane's
         // shard-0 object was only safe while placement was immutable; a committed
         // Group-0 cutover must never make other reactors read shard-0-owned mutable
@@ -338,6 +344,14 @@ public:
                 co_return control::ControlJoinResult{control::ControlJoinStatus::NotLeader, currentLeader()};
             co_return control::ControlJoinResult{control::ControlJoinStatus::Rejected, currentLeader()};
         }
+        // Admission alone only records identity. The live transports must know
+        // how to reach this node BEFORE Group 0 commits it as a learner, or a
+        // genuinely dynamic node (absent from static config) can never receive
+        // the configuration entry or catch up. A failed resolution leaves the
+        // durable Joining record and consumed token retry-safe.
+        if (!dynamicPeerRegistrar_ ||
+            !co_await dynamicPeerRegistrar_(request.record.raftId, request.record.address))
+            co_return control::ControlJoinResult{control::ControlJoinStatus::Joining, currentLeader()};
         if (!co_await controller.addLearner(request.record.raftId)) {
             if (!group->isLeader())
                 co_return control::ControlJoinResult{control::ControlJoinStatus::NotLeader, currentLeader()};
@@ -886,6 +900,9 @@ private:
     // Shard 0 only. Borrows transport_; destroyed before it by declaration order.
     std::unique_ptr<Group0Host> group0_;
     seastar::sharded<ShardRaftPlane>* peers_ = nullptr;
+    // Shard 0 only. Captures ClusterDataPlane, which owns/stops shards_ before
+    // its own peer registries are destroyed.
+    DynamicPeerRegistrar dynamicPeerRegistrar_;
     // Shard-local live VShard -> group/placement resolution. Declared before
     // plane_ so the routers that borrow it are destroyed first.
     std::unique_ptr<data::VShardDirectory> dir_;

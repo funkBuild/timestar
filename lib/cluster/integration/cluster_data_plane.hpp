@@ -435,6 +435,9 @@ private:
     // `addr` BY VALUE: this coroutine suspends in DNS, and every caller passes a reference
     // into a member map that the same pass rewrites.
     seastar::future<bool> registerPeer(NodeId id, std::string addr, bool replicated);
+    // Register a Group-0-admitted node in the live runtime and every transport.
+    // Unresolved DNS is retained for the standing retry loop.
+    seastar::future<bool> registerDynamicPeer(NodeId id, std::string addr);
     seastar::future<> registerAllPeers(bool replicated);
     // One re-resolution pass. Named (not a lambda-coroutine) so its captures live in a
     // coroutine frame the gate keeps alive -- see startPeerResolver.

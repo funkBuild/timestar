@@ -68,6 +68,14 @@ data::WriteSeries floatSeries(const std::string& key, double v, uint64_t ts = BA
     return s;
 }
 
+ControlMap completeMap(data::NodeId owner) {
+    ControlMap map;
+    map.epoch = 1;
+    for (uint16_t vshard = 0; vshard < timestar::VIRTUAL_SHARD_COUNT; ++vshard)
+        map.placement[vshard] = {owner};
+    return map;
+}
+
 // Records WHICH shard served each inbound request -- the only way to tell a listener
 // that distributes from one that quietly funnels every connection to shard 0.
 class RecordingStore : public data::NodeStore {
@@ -151,6 +159,141 @@ TEST_F(ShardRaftPlaneTest, PerShardListenersDistributeInboundConnections) {
         for (auto& c : clients)
             c->stop().get();
         listeners.stop().get();
+    }).get();
+}
+
+TEST_F(ShardRaftPlaneTest, DynamicJoinRegistersPeerBeforeLearnerAndRetriesAfterResolutionFailure) {
+    seastar::async([] {
+        constexpr data::NodeId self = 1;
+        constexpr data::NodeId joining = 2;
+        const ControlMap map = completeMap(self);
+        fs::path edir = tmpDir("join_eng");
+        fs::path jroot = tmpDir("join_journal");
+        {
+            ScopedShardedEngine eng;
+            eng.startAt(edir.string());
+            bool addressResolved = false;
+            size_t registrationAttempts = 0;
+            std::vector<std::pair<data::NodeId, std::string>> registrations;
+            cluster::ShardRaftPlane::DynamicPeerRegistrar registrar =
+                [&addressResolved, &registrationAttempts,
+                 &registrations](data::NodeId id, std::string address) {
+                    ++registrationAttempts;
+                    registrations.emplace_back(id, std::move(address));
+                    return seastar::make_ready_future<bool>(addressResolved);
+                };
+
+            seastar::sharded<cluster::ShardRaftPlane> shards;
+            shards.start().get();
+            shards
+                .invoke_on_all([engines = &eng.eng, peers = &shards, map, self, registrar,
+                                jroot = jroot.string()](cluster::ShardRaftPlane& p) {
+                    return p.init(engines, peers, map, self, jroot, std::chrono::milliseconds(10),
+                                  cluster::JournalIdentity::testing(), registrar);
+                })
+                .get();
+
+            shards
+                .invoke_on(0, [map](cluster::ShardRaftPlane& p) -> seastar::future<> {
+                    raft::RaftOptions opts;
+                    opts.electionTimeoutMin = opts.electionTimeoutMax = 1;
+                    opts.heartbeatTimeout = 1;
+                    co_await p.addGroup0({self}, opts);
+                    auto* host = p.group0();
+                    if (!host || !host->group() || !host->stateMachine())
+                        throw std::runtime_error("test group-0 host was not initialized");
+                    co_await host->group()->campaign();
+                    if (!host->group()->isLeader())
+                        throw std::runtime_error("test group-0 host did not become leader");
+                    control::Group0Controller controller(*host->group(), *host->stateMachine());
+                    control::NodeRecord seed{self, "seed-uuid", "127.0.0.1:18140", "rack-a",
+                                             control::NodeState::Active};
+                    co_await controller.initCluster("cluster-dynamic-join", seed);
+                    if (!co_await controller.publishInitialServingMap(map) ||
+                        !co_await controller.mintJoinToken("join-token"))
+                        throw std::runtime_error("test group-0 bootstrap commands did not commit");
+                    p.startGroup0Ticking();
+                })
+                .get();
+
+            control::ControlJoinRequest request;
+            request.clusterUuid = "cluster-dynamic-join";
+            request.record = control::NodeRecord{joining, "joining-uuid", "127.0.0.1:18141", "rack-b",
+                                                 control::NodeState::Joining};
+            request.token = "join-token";
+            auto join = [&] {
+                return shards
+                    .invoke_on(0, [request](cluster::ShardRaftPlane& p) mutable {
+                        return p.handleControlJoin(std::move(request));
+                    })
+                    .get();
+            };
+
+            const auto unresolved = join();
+            EXPECT_EQ(unresolved.status, control::ControlJoinStatus::Joining);
+            EXPECT_EQ(registrationAttempts, 1u);
+            const auto beforeRetry = shards
+                                         .invoke_on(0, [joining](cluster::ShardRaftPlane& p) {
+                                             auto* host = p.group0();
+                                             return std::pair{host->state().nodes.contains(joining),
+                                                              host->group()->node().config().isLearner(joining)};
+                                         })
+                                         .get();
+            EXPECT_TRUE(beforeRetry.first) << "the consumed-token admission must be durable and retryable";
+            EXPECT_FALSE(beforeRetry.second) << "an unreachable peer must not be committed as a learner";
+
+            addressResolved = true;
+            const auto retried = join();
+            EXPECT_EQ(retried.status, control::ControlJoinStatus::Joining)
+                << "registration succeeded, but activation still waits for real learner catch-up";
+            EXPECT_EQ(registrationAttempts, 2u);
+            ASSERT_EQ(registrations.size(), 2u);
+            EXPECT_EQ(registrations.back(), (std::pair<data::NodeId, std::string>{joining, request.record.address}));
+            EXPECT_TRUE(shards
+                            .invoke_on(0, [joining](cluster::ShardRaftPlane& p) {
+                                return p.group0()->group()->node().config().isLearner(joining);
+                            })
+                            .get())
+                << "peer registration must complete before learner membership is committed";
+
+            shards.stop().get();
+        }
+        fs::remove_all(jroot);
+        fs::remove_all(edir);
+    }).get();
+}
+
+TEST_F(ShardRaftPlaneTest, DataPeerAddressChangeRetiresTheCachedConnection) {
+    seastar::async([] {
+        RecordingStore oldStore;
+        RecordingStore newStore;
+        data::DataPlaneRpc oldServer;
+        data::DataPlaneRpc newServer;
+        data::DataPlaneRpc client;
+        const auto oldAddress = loopback(18142);
+        const auto newAddress = loopback(18143);
+        oldServer.start(oldAddress, oldStore).get();
+        newServer.start(newAddress, newStore).get();
+        client.startClientOnly().get();
+
+        data::WriteBatch first;
+        first.series = {floatSeries(buildSeriesKey("peer_move", {{"host", "old"}}, "value"), 1.0)};
+        client.addPeer(2, oldAddress);
+        client.forwardWriteBatch(2, std::move(first)).get();
+        EXPECT_EQ(oldStore.served, 1u);
+        EXPECT_EQ(newStore.served, 0u);
+
+        data::WriteBatch second;
+        second.series = {floatSeries(buildSeriesKey("peer_move", {{"host", "new"}}, "value"), 2.0)};
+        client.addPeer(2, newAddress);
+        client.forwardWriteBatch(2, std::move(second)).get();
+        EXPECT_EQ(oldStore.served, 1u) << "the cached client must not keep using the retired address";
+        EXPECT_EQ(newStore.served, 1u);
+
+        client.stop().get();
+        EXPECT_NO_THROW(client.stop().get()) << "failed-start/owner cleanup may stop a transport twice";
+        oldServer.stop().get();
+        newServer.stop().get();
     }).get();
 }
 

@@ -55,6 +55,11 @@ inventory and rules.
   incomplete maps fail closed. Restart selects a newer durable map over the
   static epoch-1 seed, and Group-0 recovery updates the runtime before local
   replica groups are instantiated.
+- [x] Register token-authorized joining nodes in every live Raft/data transport
+  before committing Group-0 learner membership. Unresolved addresses remain
+  durably `Joining` and retry safely; recovered node records repopulate the
+  runtime peer directory, and an address change retires cached clients instead
+  of continuing to use the old endpoint.
 
 ## Remaining production blockers
 
@@ -67,9 +72,10 @@ production deploy.
   remove, VShard movement, ordered teardown, and reclaim-floor publication must
   be exercised through the production server. Group 0 now validates durable
   movement plans/progress, exact one-VShard cutover, and live sharded directory
-  publication, but the production job driver, dynamic peer/group creation,
-  operator API, and teardown/reclaim sequence remain unfinished. Editing a
-  static peer list is not a safe topology operation.
+  publication and dynamic peer registration, but the production job driver,
+  destination data-group creation, operator API, and teardown/reclaim sequence
+  remain unfinished. Editing a static peer list is not a safe topology
+  operation.
 - [ ] **Replicate retention policy and cutoff decisions.** Partitioned mode must
   never let replicas expire or compact different logical ranges. Until then,
   retention mutation must remain fail-closed.
@@ -132,3 +138,7 @@ with `--smp=1` and an explicit memory limit, and keep temporary files under
 The live-directory gate covers stale update rejection, idempotent replay,
 same-epoch conflict, incomplete-map rejection, and independent routing views on
 two reactor shards.
+
+The dynamic-admission gate covers unresolved-address retry after durable token
+consumption, registration-before-learner ordering, peer address replacement on
+both transports, malformed port rejection, and idempotent failed-start cleanup.

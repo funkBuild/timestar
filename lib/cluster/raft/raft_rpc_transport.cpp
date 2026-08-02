@@ -352,6 +352,14 @@ RaftRpcTransport::RaftRpcTransport() : impl_(std::make_unique<Impl>()) {}
 RaftRpcTransport::~RaftRpcTransport() = default;
 
 void RaftRpcTransport::addPeer(NodeId id, seastar::socket_address addr) {
+    auto existing = impl_->peers.find(id);
+    if (existing != impl_->peers.end() && existing->second == addr)
+        return;
+    if (auto client = impl_->clients.find(id); client != impl_->clients.end()) {
+        impl_->retire(std::move(client->second));
+        impl_->clients.erase(client);
+    }
+    impl_->nextRetry.erase(id);
     impl_->peers[id] = addr;
 }
 
@@ -624,6 +632,8 @@ void RaftRpcTransport::setRawDeliver(DeliverRawFn onDeliverRaw) {
 }
 
 seastar::future<> RaftRpcTransport::stop() {
+    if (impl_->stopping)
+        co_return;
     // Block new sends first, then ABORT in-flight ones by stopping the peer
     // clients -- otherwise a background send stuck reconnecting to an
     // already-stopped peer would keep the gate from ever closing. Only then is it

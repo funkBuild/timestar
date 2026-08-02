@@ -179,8 +179,10 @@ changes. See [protocol-versioning.md](protocol-versioning.md).
 - Apply each committed serving-map epoch to the live sharded routing directory.
   **Done:** publication is durable-before-applied, reactor-local, monotonic, and
   idempotent; restart selects the durable high-water map and instantiates groups
-  from recovered placement. Creating/registering destination peers and groups
-  before movement starts remains open.
+  from recovered placement. **Done:** token-authorized destination peers are
+  registered on every transport before Group-0 learner membership and restored
+  from recovered node records. Creating destination data groups before movement
+  starts remains open.
 - Publish teardown/reclaim floors only after durable ownership transfer.
 - Prove no acknowledged loss or duplicate VShard contribution during movement.
 

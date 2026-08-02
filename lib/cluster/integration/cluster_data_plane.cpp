@@ -36,14 +36,25 @@ struct HostPort {
     uint16_t port = 8086;
 };
 HostPort parseHostPort(const std::string& s) {
+    if (s.empty())
+        throw std::invalid_argument("cluster peer address is empty");
     auto colon = s.rfind(':');
     if (colon == std::string::npos)
         return {s, 8086};
+    if (colon == 0 || colon + 1 == s.size())
+        throw std::invalid_argument("cluster peer address must be host:port");
     HostPort hp;
     hp.host = s.substr(0, colon);
     try {
-        hp.port = static_cast<uint16_t>(std::stoul(s.substr(colon + 1)));
-    } catch (...) {}
+        size_t parsed = 0;
+        const std::string portText = s.substr(colon + 1);
+        const unsigned long port = std::stoul(portText, &parsed);
+        if (parsed != portText.size() || port == 0 || port > UINT16_MAX - kRaftPortOffset)
+            throw std::out_of_range("cluster peer port is outside the usable range");
+        hp.port = static_cast<uint16_t>(port);
+    } catch (const std::exception&) {
+        throw std::invalid_argument("cluster peer address has an invalid port: " + s);
+    }
     return hp;
 }
 
@@ -195,10 +206,15 @@ seastar::future<> ClusterDataPlane::startImpl(const ClusterConfig& cfg, seastar:
             const control::ControlMap initialMap = dir_->map();
             auto* peers = &shards_;
             const JournalIdentity journalIdentity = *journalIdentity_;
+            ShardRaftPlane::DynamicPeerRegistrar dynamicPeerRegistrar =
+                [this](data::NodeId id, std::string address) {
+                    return registerDynamicPeer(id, std::move(address));
+                };
             co_await shards_.invoke_on_all(
                 [enginesPtr = enginesPtr_, peers, initialMap, selfId, jroot,
-                 journalIdentity](ShardRaftPlane& p) {
-                    return p.init(enginesPtr, peers, initialMap, selfId, jroot, kRaftTickPeriod, journalIdentity);
+                 journalIdentity, dynamicPeerRegistrar](ShardRaftPlane& p) {
+                    return p.init(enginesPtr, peers, initialMap, selfId, jroot, kRaftTickPeriod, journalIdentity,
+                                  dynamicPeerRegistrar);
                 });
         }
 
@@ -403,6 +419,12 @@ seastar::future<> ClusterDataPlane::startImpl(const ClusterConfig& cfg, seastar:
                                 throw std::runtime_error(
                                     "cluster: explicit group-0 bootstrap did not commit the initial serving map");
                         }
+                        // Recovery can contain nodes that were admitted after the
+                        // static config was written. Restore their live transports
+                        // before any movement or meta-membership retry uses them.
+                        for (const auto& [id, node] : host->state().nodes)
+                            if (id != rt_->selfId)
+                                (void)co_await registerDynamicPeer(id, node.address);
                         plane.startGroup0Ticking();
                     });
             } else {
@@ -498,6 +520,27 @@ seastar::future<bool> ClusterDataPlane::registerPeer(NodeId id, std::string addr
     co_return true;
 }
 
+seastar::future<bool> ClusterDataPlane::registerDynamicPeer(NodeId id, std::string addr) {
+    if (!rt_ || !rpc_ || !shardsStarted_ || id == raft::kNoNode || id == rt_->selfId || addr.empty())
+        throw std::invalid_argument("cluster: dynamic peer registration has an invalid node or address");
+
+    // Group 0 is authoritative after admission. Keep status, balancing and all
+    // later restart/reconciliation passes on the same address as the committed
+    // NodeRecord, including a legitimate address change for the same identity.
+    rt_->peerAddresses[id] = addr;
+    const bool registered = co_await registerPeer(id, addr, /*replicated=*/true);
+    if (registered) {
+        if (auto it = unresolvedPeers_.find(id); it != unresolvedPeers_.end() && it->second == addr)
+            unresolvedPeers_.erase(it);
+        co_return true;
+    }
+
+    unresolvedPeers_[id] = std::move(addr);
+    if (!peerResolveGate_.is_closed() && !peerResolveTimer_.armed())
+        startPeerResolver(/*replicated=*/true);
+    co_return false;
+}
+
 seastar::future<> ClusterDataPlane::registerAllPeers(bool replicated) {
     unresolvedPeers_.clear();
     for (const auto& [id, addr] : rt_->peerAddresses) {
@@ -518,14 +561,17 @@ seastar::future<> ClusterDataPlane::resolvePendingPeers(bool replicated) {
     // member that this same pass rewrites at the end; iterating it directly would hold an
     // iterator (and a reference to its key/value) across those suspensions.
     std::map<NodeId, std::string> pending = unresolvedPeers_;
-    std::map<NodeId, std::string> still;
     for (const auto& [id, addr] : pending) {
-        if (!co_await registerPeer(id, addr, replicated))
-            still[id] = addr;
-        else
+        const bool registered = co_await registerPeer(id, addr, replicated);
+        // Reacquire after the await. A concurrent Group-0 admission may have
+        // replaced this id's address or inserted another unresolved peer; never
+        // overwrite that newer live map with the stale pass snapshot.
+        auto current = unresolvedPeers_.find(id);
+        if (registered && current != unresolvedPeers_.end() && current->second == addr) {
+            unresolvedPeers_.erase(current);
             timestar::http_log.info("cluster: peer {} ({}) resolved and registered on retry", id, addr);
+        }
     }
-    unresolvedPeers_ = std::move(still);
     if (unresolvedPeers_.empty())
         peerResolveTimer_.cancel();
     co_return;

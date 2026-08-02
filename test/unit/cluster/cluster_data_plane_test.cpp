@@ -241,5 +241,14 @@ TEST_F(ClusterDataPlaneTest, MisconfiguredFailsToStart) {
         cluster::ClusterDataPlane cdp;
         EXPECT_THROW(cdp.start(cfg, *eng).get(), std::invalid_argument);
         cdp.stop().get();
+
+        ClusterConfig badAddress;
+        badAddress.enabled = true;
+        badAddress.node_id = 1;
+        badAddress.peers = {"127.0.0.1:not-a-port"};
+        cluster::ClusterDataPlane malformed;
+        EXPECT_THROW(malformed.start(badAddress, *eng).get(), std::invalid_argument)
+            << "a malformed dynamic/static peer address must not silently fall back to port 8086";
+        malformed.stop().get();
     }).get();
 }

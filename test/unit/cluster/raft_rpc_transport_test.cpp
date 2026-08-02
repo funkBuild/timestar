@@ -149,6 +149,44 @@ seastar::future<> testThreeNodeClusterOverRpc() {
         co_await std::move(f);
 }
 
+seastar::future<> testPeerAddressChangeRetiresCachedConnection() {
+    auto sender = std::make_unique<RaftRpcTransport>();
+    auto oldReceiver = std::make_unique<RaftRpcTransport>();
+    auto newReceiver = std::make_unique<RaftRpcTransport>();
+    size_t oldReceived = 0;
+    size_t newReceived = 0;
+    constexpr uint16_t kOldPort = 39166;
+    constexpr uint16_t kNewPort = 39167;
+    constexpr uint16_t kSenderPort = 39168;
+
+    co_await oldReceiver->start(loopback(kOldPort), [&](Envelope) {
+        ++oldReceived;
+        return seastar::make_ready_future<>();
+    });
+    co_await newReceiver->start(loopback(kNewPort), [&](Envelope) {
+        ++newReceived;
+        return seastar::make_ready_future<>();
+    });
+    co_await sender->start(loopback(kSenderPort), [](Envelope) { return seastar::make_ready_future<>(); });
+
+    Envelope env;
+    env.groupId = 7;
+    env.message = Message{.to = 2, .from = 1, .payload = TimeoutNow{1, 1}};
+    sender->addPeer(2, loopback(kOldPort));
+    co_await sender->send(env);
+    EXPECT_TRUE(co_await waitFor([&] { return oldReceived == 1; }));
+
+    sender->addPeer(2, loopback(kNewPort));
+    co_await sender->send(env);
+    EXPECT_TRUE(co_await waitFor([&] { return newReceived == 1; }));
+    EXPECT_EQ(oldReceived, 1u) << "the cached Raft client must not keep using the retired address";
+
+    co_await sender->stop();
+    co_await sender->stop();  // failed-start cleanup plus owner cleanup is idempotent
+    co_await oldReceiver->stop();
+    co_await newReceiver->stop();
+}
+
 // --- write-scaleout 5a: multi-envelope frames ---------------------------------------
 //
 // Many groups' messages to the same peer, produced in one reactor task, must arrive
@@ -324,6 +362,10 @@ seastar::future<> testBatchDispatchIsPerGroupOrderedAndCrossGroupConcurrent() {
 
 TEST(RaftRpcTransportTest, LoopbackDelivery) {
     testLoopbackDelivery().get();
+}
+
+TEST(RaftRpcTransportTest, PeerAddressChangeRetiresTheCachedConnection) {
+    testPeerAddressChangeRetiresCachedConnection().get();
 }
 
 TEST(RaftRpcTransportTest, ManyGroupMessagesToOnePeerShareFrames) {
