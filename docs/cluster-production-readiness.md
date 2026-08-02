@@ -85,6 +85,19 @@ inventory and rules.
   lifecycle transitions, keeps a node non-removable while any serving-map, job,
   learner, or voter reference remains, and transfers data-group leadership away
   from a replacement victim before removing it.
+- [x] Retire a removed local data-group replica after committed serving-map
+  cutover. The victim first proves its applied Raft configuration no longer
+  contains this node, refuses new host operations, drains in-flight Raft work,
+  publishes a terminal reclaim floor, closes the writer, and atomically moves
+  the journal into an exact-v1, epoch-named quarantine. A durable marker starts
+  a fixed 24-hour grace period, after which the maintenance sweep deletes the
+  generation and publishes retirement/reclamation counters. Exact map replay is
+  idempotent; startup uses only the durable Group-0 serving map to finish crashes
+  before or after the quarantine rename and restarts the full grace period when
+  its marker was not durable. Pre-cutover movement destinations are protected
+  from being mistaken for obsolete replicas. Group-0 topology startup rejects
+  the optional shared-journal layout until it has an equally safe per-group
+  retirement generation protocol.
 
 ## Remaining production blockers
 
@@ -99,11 +112,14 @@ production deploy.
   movement plans/progress, exact one-VShard cutover, and live sharded directory
   publication, dynamic peer registration, and destination data-group creation,
   plus the bounded production scheduler/remote leader actuator and authenticated
-  intent-only move/drain/remove routes. The server still does not perform the
-  post-cutover local replica teardown, quarantine/grace period, durable-file
-  reclamation, or reclaim-floor publication, and the complete workflow still
-  needs a multi-process production-server gate. Editing a static peer list is
-  not a safe topology operation.
+  intent-only move/drain/remove routes. Post-cutover local Raft teardown,
+  terminal reclaim-floor publication, exact-v1 journal quarantine, grace, and
+  journal-file deletion are now wired. The remaining code blocker is safe
+  reclamation of the retired VShard's logical bytes from the Engine's shared
+  WAL/TSM/index files; the complete workflow also needs a multi-process
+  production-server gate that proves no lost or duplicate contribution across
+  cutover, restart during quarantine, grace expiry, and later movement back.
+  Editing a static peer list is not a safe topology operation.
 - [ ] **Replicate retention policy and cutoff decisions.** Partitioned mode must
   never let replicas expire or compact different logical ranges. Until then,
   retention mutation must remain fail-closed.
@@ -179,6 +195,10 @@ refusal before registry insertion when an on-disk configuration conflicts with
 the committed Group-0 job, and one durable transition per live-Raft driver call.
 The lifecycle tests additionally cover exact forward-only state changes,
 idempotent drain/remove retries, and refusal to remove an active or still
-referenced node. The production server build pins the authenticated route
+referenced node. Focused host tests cover the applied-membership fence, terminal
+floor, exact-v1 quarantine, both restart recovery windows, grace-period no-op,
+durable generation deletion, and protection of a materialized pre-cutover
+destination. The production server build pins the authenticated route
 composition; the remaining multi-process topology gate must exercise those
-routes over HTTP and prove post-cutover teardown/reclaim.
+routes over HTTP and prove Engine-data reclaim as well as journal
+teardown/reclaim.

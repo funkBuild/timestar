@@ -27,6 +27,10 @@
 #include <seastar/core/timer.hh>
 #include <string_view>
 
+namespace timestar::control {
+struct ControlMap;
+}
+
 namespace timestar::cluster {
 
 using timestar::raft::NodeId;
@@ -116,6 +120,21 @@ public:
     seastar::future<> addVShard(uint16_t vshard, std::vector<NodeId> voters, raft::RaftOptions opts = {},
                                 RecoveredConfigValidator recoveredConfigValidator = {});
 
+    // Retire a replica only after the committed serving map no longer places it
+    // here and the local Raft configuration has applied removal of this node.
+    // Private v1 journals are atomically quarantined; their files are deleted
+    // only after the fixed grace period. Exact retries are idempotent.
+    static constexpr std::chrono::hours kRetiredJournalGrace{24};
+    seastar::future<bool> retireVShard(uint16_t vshard, uint64_t mapEpoch);
+    seastar::future<size_t> reconcileServingMap(const control::ControlMap& map);
+    // Complete any crash-interrupted retirement before current-map groups are
+    // opened. The durable serving map is the authority for stale active dirs.
+    seastar::future<size_t> recoverReplicaRetirements(control::ControlMap map);
+    seastar::future<size_t> reclaimRetiredJournals(
+        std::chrono::system_clock::time_point now = std::chrono::system_clock::now());
+    uint64_t replicasRetired() const { return replicasRetired_; }
+    uint64_t retiredJournalsReclaimed() const { return retiredJournalsReclaimed_; }
+
     // Replicate a command to a VShard's group; resolves true on durable quorum commit
     // + apply, false if this node is not the leader (caller redirects to the leader).
     // Own the command because admission introduces a suspension before encoding.
@@ -182,6 +201,9 @@ public:
     size_t wakeGroupsLedBy(NodeId node) override { return registry_.wakeFollowersOf(node); }
 
     raft::RaftGroup* group(uint16_t vshard);
+    // Keep one VShard's host-owned state alive across an external async group
+    // operation. Empty means absent or already retiring.
+    std::optional<seastar::gate::holder> holdVShardOperation(uint16_t vshard);
     // LeaderResolver: the current Raft leader of `vshard` per this node's local group
     // (kNoNode if not hosted here or no leader elected yet).
     NodeId leaderOf(uint16_t vshard) const override;
@@ -428,6 +450,12 @@ private:
         // operation per group; otherwise a concurrent newer delete could retire
         // this request between its floor check and log append.
         std::unique_ptr<seastar::semaphore> deleteProposalLock = std::make_unique<seastar::semaphore>(1);
+        std::unique_ptr<seastar::gate> operationGate = std::make_unique<seastar::gate>();
+        bool retiring = false;
+        uint64_t retirementEpoch = 0;
+        // Dynamic movement destinations exist before the serving map names this
+        // node. Do not mistake that pre-cutover learner for an obsolete replica.
+        bool seenInServingMap = true;
         // When this group was last snapshotted (default-constructed == never), for
         // kMinSnapshotInterval.
         seastar::lowres_clock::time_point lastSnapshot{};
@@ -479,9 +507,14 @@ private:
     raft::UncommittedProposalBudget uncommittedProposalBudget_{kMaxUncommittedProposalBytes,
                                                                kMaxUncommittedProposalBytesPerGroup};
     raft::RaftGroupRegistry registry_;
+    // Snapshot/GC and replica retirement all suspend while walking or mutating
+    // vshards_. Serialize those maintenance operations without serializing the
+    // foreground write path.
+    seastar::semaphore maintenanceLock_{1};
     bool stopped_ = false;
     // See classifyRefusal / proposeRefusedWhileLeader.
     data::SliceReject classifyRefusal(uint16_t vshard);
+    seastar::future<> ensureRetiredJournalMarker(const std::filesystem::path& directory);
     uint64_t proposeRefusedWhileLeader_ = 0;
     seastar::lowres_clock::time_point lastRefusalLog_{};
 
@@ -526,6 +559,8 @@ private:
     uint64_t journalSegmentsPinnedLastPass_ = 0;
     uint64_t journalRecordsCopiedForward_ = 0;
     uint64_t journalGcPasses_ = 0;
+    uint64_t replicasRetired_ = 0;
+    uint64_t retiredJournalsReclaimed_ = 0;
 };
 
 }  // namespace timestar::cluster

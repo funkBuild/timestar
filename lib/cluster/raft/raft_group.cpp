@@ -88,6 +88,42 @@ RaftGroup::~RaftGroup() {
         uncommittedProposalBudget_->update(groupId_, 0);
 }
 
+seastar::gate::holder RaftGroup::holdOperation() {
+    ensureActive();
+    return operationGate_.hold();
+}
+
+void RaftGroup::ensureActive() const {
+    if (retiring_)
+        throw std::runtime_error("raft: group " + std::to_string(groupId_) + " is retired");
+}
+
+seastar::future<> RaftGroup::retire() {
+    if (retiring_)
+        co_return;
+    retiring_ = true;
+    {
+        auto units = co_await seastar::get_units(lock_, 1);
+        auto failure = std::make_exception_ptr(std::runtime_error("raft: group retired"));
+        for (auto& [ctx, promise] : readWaiters_)
+            promise.set_exception(failure);
+        readWaiters_.clear();
+        confirmedReads_.clear();
+        for (auto& [index, promise] : applyWaiters_)
+            promise.set_exception(failure);
+        applyWaiters_.clear();
+        for (auto& waiter : configWaiters_)
+            waiter.promise.set_exception(failure);
+        configWaiters_.clear();
+        for (auto& [index, promise] : appliedWaiters_)
+            promise.set_exception(failure);
+        appliedWaiters_.clear();
+        if (uncommittedProposalBudget_)
+            uncommittedProposalBudget_->update(groupId_, 0);
+    }
+    co_await operationGate_.close();
+}
+
 void RaftGroup::syncUncommittedBudget() {
     if (uncommittedProposalBudget_)
         uncommittedProposalBudget_->update(groupId_, node_.uncommittedLogBytes());
@@ -279,12 +315,14 @@ void RaftGroup::releaseAppliedWaiters() {
 }
 
 seastar::future<> RaftGroup::waitApplied(LogIndex index) {
+    auto operation = holdOperation();
     // Register the waiter under the lock so no concurrent drainReady observes a
     // half-created waiter. Resolve immediately if we have already applied through
     // `index` (common for a caught-up replica). No leadership requirement.
     std::optional<seastar::future<>> fut;
     {
         auto units = co_await seastar::get_units(lock_, 1);
+        ensureActive();
         if (appliedIndex_ >= index) {
             fut = seastar::make_ready_future<>();
         } else {
@@ -302,6 +340,7 @@ seastar::future<bool> RaftGroup::proposeAndAwaitApplied(std::string data) {
 
 seastar::future<bool> RaftGroup::proposeAndAwaitApplied(std::string data,
                                                         std::optional<seastar::lowres_clock::time_point> deadline) {
+    auto operation = holdOperation();
     // FAIL CLOSED before the entry is durable (write-scaleout 5 review, F3b). An entry
     // over the transport's send bound can commit here and then never reach a follower,
     // leaving the group permanently one replica short with the offending entry already in
@@ -320,6 +359,7 @@ seastar::future<bool> RaftGroup::proposeAndAwaitApplied(std::string data,
     LogIndex waiterIndex = kNoIndex;
     {
         auto units = co_await seastar::get_units(lock_, 1);
+        ensureActive();
         const uint64_t tL0 = profileEnabled() ? nowNs() : 0;
         // The absolute deadline also covers time queued for this lock. Refuse
         // before append if it has already expired; appending and only then
@@ -330,7 +370,7 @@ seastar::future<bool> RaftGroup::proposeAndAwaitApplied(std::string data,
         if (node_.isLeader() && !node_.transferInFlight())
             requireUncommittedBudget(data.size());
         if (!node_.propose(std::move(data)))
-            co_return false;                           // not the leader (units released by the frame's unwind)
+            co_return false;  // not the leader (units released by the frame's unwind)
         syncUncommittedBudget();
         const LogIndex idx = node_.log().lastIndex();  // the entry we just appended
         waiterIndex = idx;
@@ -407,6 +447,7 @@ seastar::future<bool> RaftGroup::proposeAndAwaitApplied(std::string data,
 }
 
 seastar::future<LogIndex> RaftGroup::readBarrier() {
+    auto operation = holdOperation();
     // Register the waiter INSIDE the lock (with requestReadIndex), so no
     // concurrent drainReady can observe/fail a half-created waiter and so a
     // leader->follower->leader flap between here and acquiring the lock cannot
@@ -414,6 +455,7 @@ seastar::future<LogIndex> RaftGroup::readBarrier() {
     std::optional<seastar::future<LogIndex>> fut;
     {
         auto units = co_await seastar::get_units(lock_, 1);
+        ensureActive();
         if (node_.isLeader()) {  // otherwise fut stays empty -> not leader
             const uint64_t ctx = nextReadCtx_++;
             seastar::promise<LogIndex> promise;
@@ -429,7 +471,12 @@ seastar::future<LogIndex> RaftGroup::readBarrier() {
 }
 
 seastar::future<> RaftGroup::step(Message m) {
+    if (retiring_)
+        co_return;
+    auto operation = operationGate_.hold();
     auto units = co_await seastar::get_units(lock_, 1);
+    if (retiring_)
+        co_return;
     try {
         node_.step(std::move(m));
     } catch (...) {
@@ -441,12 +488,18 @@ seastar::future<> RaftGroup::step(Message m) {
 }
 
 seastar::future<> RaftGroup::tick(unsigned passes) {
+    if (retiring_)
+        co_return;
+    auto operation = operationGate_.hold();
     auto units = co_await seastar::get_units(lock_, 1);
+    if (retiring_)
+        co_return;
     node_.tick(passes);
     co_await drainReady();
 }
 
 seastar::future<bool> RaftGroup::propose(std::string data) {
+    auto operation = holdOperation();
     // Refused BEFORE the lock, as it always was: the throw becomes this coroutine's
     // exceptional future, which is what `make_exception_future` produced here before.
     if (data.size() > kMaxProposalBytes)
@@ -454,6 +507,7 @@ seastar::future<bool> RaftGroup::propose(std::string data) {
                                     " bytes exceeds the deliverable maximum of " + std::to_string(kMaxProposalBytes) +
                                     " bytes for group " + std::to_string(groupId_));
     auto units = co_await seastar::get_units(lock_, 1);
+    ensureActive();
     if (node_.isLeader() && !node_.transferInFlight())
         requireUncommittedBudget(data.size());
     const bool ok = node_.propose(std::move(data));
@@ -464,14 +518,18 @@ seastar::future<bool> RaftGroup::propose(std::string data) {
 }
 
 seastar::future<> RaftGroup::campaign() {
+    auto operation = holdOperation();
     auto units = co_await seastar::get_units(lock_, 1);
+    ensureActive();
     node_.campaign();
     syncUncommittedBudget();
     co_await drainReady();
 }
 
 seastar::future<bool> RaftGroup::proposeConfChange(std::vector<NodeId> voters, std::vector<NodeId> learners) {
+    auto operation = holdOperation();
     auto units = co_await seastar::get_units(lock_, 1);
+    ensureActive();
     const bool ok = node_.proposeConfChange(std::move(voters), std::move(learners));
     if (ok)
         syncUncommittedBudget();
@@ -482,11 +540,13 @@ seastar::future<bool> RaftGroup::proposeConfChange(std::vector<NodeId> voters, s
 seastar::future<bool> RaftGroup::proposeConfChangeAndAwaitApplied(
     std::vector<NodeId> voters, std::vector<NodeId> learners,
     std::optional<seastar::lowres_clock::time_point> deadline) {
+    auto operation = holdOperation();
     Config expected{voters, /*votersOutgoing=*/{}, learners};
     std::optional<seastar::future<bool>> jointApplied;
     LogIndex jointIndex = kNoIndex;
     {
         auto units = co_await seastar::get_units(lock_, 1);
+        ensureActive();
         const LogIndex before = node_.log().lastIndex();
         if (!node_.proposeConfChange(std::move(voters), std::move(learners)))
             co_return false;
@@ -544,6 +604,7 @@ seastar::future<bool> RaftGroup::proposeConfChangeAndAwaitApplied(
     LogIndex finalIndex = kNoIndex;
     {
         auto units = co_await seastar::get_units(lock_, 1);
+        ensureActive();
         finalIndex = node_.latestConfigIndex();
         if (node_.config().joint() || node_.config() != expected || finalIndex <= jointIndex)
             throw LeadershipLostError("membership proposal lost leadership before final config was appended");
@@ -578,7 +639,9 @@ seastar::future<bool> RaftGroup::proposeConfChangeAndAwaitApplied(
 }
 
 seastar::future<bool> RaftGroup::transferLeadership(NodeId target, bool* armed) {
+    auto operation = holdOperation();
     auto units = co_await seastar::get_units(lock_, 1);
+    ensureActive();
     // Propagated, not discarded (debt D-24): the balancer's transfers_initiated counter is
     // only honest if it counts transfers that were actually ARMED, and this is the only
     // layer that knows. Ready is drained either way -- a call that started nothing may
@@ -594,7 +657,9 @@ seastar::future<bool> RaftGroup::transferLeadership(NodeId target, bool* armed) 
 }
 
 seastar::future<> RaftGroup::compact(LogIndex upto, std::string snapshotData) {
+    auto operation = holdOperation();
     auto units = co_await seastar::get_units(lock_, 1);
+    ensureActive();
     const LogIndex before = node_.log().snapshotIndex();
     node_.compact(upto, std::move(snapshotData));
     syncUncommittedBudget();

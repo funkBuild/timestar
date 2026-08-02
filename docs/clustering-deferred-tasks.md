@@ -6,9 +6,11 @@ Production blockers take priority and are authoritative in
 
 ## Production blockers
 
-- [ ] Complete group-0-driven drain, replace, remove, ordered teardown, and
-  reclaim-floor publication. Join, destination data-group materialization, and
-  the bounded production scheduler/remote leader actuator are wired.
+- [ ] Complete group-0-driven drain, replace, remove, and Engine-data reclaim.
+  Ordered local Raft teardown, its terminal reclaim floor, and exact-v1 journal
+  quarantine/grace/deletion are wired. Join, destination data-group
+  materialization, and the bounded production scheduler/remote leader actuator
+  are wired.
 - [ ] Replicate retention policies and monotonic cutoff decisions through the
   data groups; keep mutation disabled until complete.
 - [ ] Replace monolithic snapshot construction/install buffers with bounded

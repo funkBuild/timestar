@@ -286,6 +286,8 @@ void set_routes(routes& r) {
                           ",\"journal_fsyncs\":" + std::to_string(st.journalFsyncs) +
                           ",\"journal_sync_requests\":" + std::to_string(st.journalSyncRequests) +
                           ",\"journal_gc_passes\":" + std::to_string(st.journalGcPasses) +
+                          ",\"replicas_retired\":" + std::to_string(st.replicasRetired) +
+                          ",\"retired_journals_reclaimed\":" + std::to_string(st.retiredJournalsReclaimed) +
                           ",\"journal_segments_deleted\":" + std::to_string(st.journalSegmentsDeleted) +
                           ",\"journal_segments_pinned_last_pass\":" + std::to_string(st.journalSegmentsPinnedLastPass) +
                           ",\"journal_records_copied_forward\":" + std::to_string(st.journalRecordsCopiedForward) +

@@ -6,6 +6,7 @@
 // in engine_rf3_test).
 #include "../../../lib/cluster/integration/replicated_vshard_host.hpp"
 
+#include "../../../lib/cluster/control/control_map_cache.hpp"
 #include "../../../lib/cluster/data/snapshot_payload.hpp"
 #include "../../../lib/cluster/integration/replica_engine_reader.hpp"
 #include "../../../lib/cluster/raft/raft_journal_persistence.hpp"
@@ -170,6 +171,91 @@ TEST_F(ReplicatedVShardHostTest, DynamicCreationValidatesRecoveredConfigBeforeRe
                        })
             .get();
         EXPECT_TRUE(host.hosts(8));
+        control::ControlMap preCutover;
+        preCutover.epoch = 1;
+        preCutover.placement[8] = {2, 3};
+        EXPECT_EQ(host.reconcileServingMap(preCutover).get(), 0u)
+            << "a materialized movement destination must survive while the old serving map still excludes it";
+        EXPECT_TRUE(host.hosts(8));
+        host.stop().get();
+        fs::remove_all(jroot);
+    }).get();
+}
+
+TEST_F(ReplicatedVShardHostTest, RetiredReplicaJournalIsQuarantinedThenReclaimedAfterGrace) {
+    seastar::async([] {
+        ScopedShardedEngine eng;
+        eng.start();
+        cluster::EngineLocalStore store(*eng);
+        NoopTransport transport;
+        fs::path jroot = tmpDir();
+        cluster::ReplicatedVShardHost host(store, transport, /*self=*/1, jroot);
+        constexpr uint16_t vshard = 9;
+
+        // This node is no longer in the applied data-group configuration, which
+        // is the local safety proof required after the Group-0 map cutover.
+        host.addVShard(vshard, {2, 3, 4}).get();
+        control::ControlMap cutover;
+        cutover.epoch = 7;
+        for (uint16_t vs = 0; vs < timestar::VIRTUAL_SHARD_COUNT; ++vs)
+            cutover.placement[vs] = {2, 3, 4};
+
+        auto inFlightHostOperation = host.holdVShardOperation(vshard);
+        ASSERT_TRUE(inFlightHostOperation);
+        auto pendingApply = host.group(vshard)->waitApplied(UINT64_MAX);
+        ASSERT_FALSE(pendingApply.available());
+        auto retirement = host.reconcileServingMap(cutover);
+        EXPECT_FALSE(retirement.available());
+        EXPECT_THROW(pendingApply.get(), std::runtime_error);
+        inFlightHostOperation.reset();
+        EXPECT_EQ(retirement.get(), 1u);
+        EXPECT_FALSE(host.hosts(vshard));
+        EXPECT_EQ(host.replicasRetired(), 1u);
+        EXPECT_EQ(host.journalRetention().released(VShardId{vshard}), UINT64_MAX);
+        const fs::path retired = jroot / "retired" / "v1_vshard_9_epoch_7";
+        ASSERT_TRUE(fs::is_directory(retired));
+        EXPECT_FALSE(fs::exists(jroot / "vshard_9"));
+
+        // The v1 marker starts a fixed grace period; cleanup before it expires
+        // is a no-op, and a later pass durably removes the whole generation.
+        EXPECT_EQ(host.reclaimRetiredJournals().get(), 0u);
+        EXPECT_EQ(host.reclaimRetiredJournals(std::chrono::system_clock::now() + std::chrono::hours(25)).get(), 1u);
+        EXPECT_FALSE(fs::exists(retired));
+        EXPECT_EQ(host.retiredJournalsReclaimed(), 1u);
+
+        host.stop().get();
+
+        // Both crash windows are recovered from the durable map on restart:
+        // an obsolete active directory is moved, and an already-moved directory
+        // that lacks its marker receives a fresh full grace period.
+        fs::create_directories(jroot / "vshard_11");
+        fs::create_directories(jroot / "retired" / "v1_vshard_12_epoch_6");
+        cutover.epoch = 8;
+        cluster::ReplicatedVShardHost recovered(store, transport, /*self=*/1, jroot);
+        EXPECT_EQ(recovered.recoverReplicaRetirements(cutover).get(), 1u);
+        EXPECT_FALSE(fs::exists(jroot / "vshard_11"));
+        EXPECT_TRUE(fs::is_directory(jroot / "retired" / "v1_vshard_11_epoch_8"));
+        EXPECT_EQ(recovered.reclaimRetiredJournals(std::chrono::system_clock::now() + std::chrono::hours(25)).get(),
+                  2u);
+        recovered.stop().get();
+        fs::remove_all(jroot);
+    }).get();
+}
+
+TEST_F(ReplicatedVShardHostTest, ReplicaRetirementRequiresAppliedMembershipRemoval) {
+    seastar::async([] {
+        ScopedShardedEngine eng;
+        eng.start();
+        cluster::EngineLocalStore store(*eng);
+        NoopTransport transport;
+        fs::path jroot = tmpDir();
+        cluster::ReplicatedVShardHost host(store, transport, /*self=*/1, jroot);
+        host.addVShard(10, {1, 2, 3}).get();
+
+        EXPECT_THROW(host.retireVShard(10, 2).get(), std::runtime_error);
+        EXPECT_TRUE(host.hosts(10));
+        EXPECT_TRUE(fs::is_directory(jroot / "vshard_10"));
+
         host.stop().get();
         fs::remove_all(jroot);
     }).get();

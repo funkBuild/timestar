@@ -3,15 +3,20 @@
 #include "../../core/placement_table.hpp"  // virtualShard
 #include "../../core/vshard.hpp"
 #include "../../utils/logger.hpp"  // timestar::http_log
+#include "../control/control_map_cache.hpp"
 #include "../data/replicated_write_router.hpp"
 #include "../data/write_errors.hpp"
 #include "../raft/raft_node.hpp"
 
 #include <algorithm>
+#include <charconv>
 #include <cstdlib>
+#include <limits>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/reactor.hh>
 #include <seastar/core/sleep.hh>
+#include <seastar/core/thread.hh>
+#include <seastar/util/file.hh>
 #include <stdexcept>
 #include <utility>
 
@@ -47,6 +52,63 @@ data::OptDeadline boundedProposalDeadline(data::OptDeadline requested) {
     if (!requested || *requested > localLimit)
         return localLimit;
     return requested;
+}
+
+constexpr std::string_view kRetiredDirectoryPrefix = "v1_vshard_";
+constexpr std::string_view kRetiredMarkerPrefix = "retired_at_";
+constexpr std::string_view kRetiredMarkerSuffix = ".v1";
+
+bool consumeUnsigned(std::string_view& text, uint64_t& value, std::string_view delimiter) {
+    const size_t end = delimiter.empty() ? text.size() : text.find(delimiter);
+    if (end == std::string_view::npos || end == 0)
+        return false;
+    const std::string_view digits = text.substr(0, end);
+    if (digits.size() > 1 && digits.front() == '0')
+        return false;
+    const auto parsed = std::from_chars(digits.data(), digits.data() + digits.size(), value);
+    if (parsed.ec != std::errc{} || parsed.ptr != digits.data() + digits.size())
+        return false;
+    text.remove_prefix(end + delimiter.size());
+    return true;
+}
+
+struct RetiredDirectoryName {
+    uint16_t vshard = 0;
+    uint64_t epoch = 0;
+};
+
+std::optional<uint16_t> activeVShardDirectoryName(std::string_view name) {
+    constexpr std::string_view prefix = "vshard_";
+    if (!name.starts_with(prefix))
+        return std::nullopt;
+    name.remove_prefix(prefix.size());
+    uint64_t vshard = 0;
+    if (!consumeUnsigned(name, vshard, {}) || !name.empty() || vshard >= timestar::VIRTUAL_SHARD_COUNT)
+        return std::nullopt;
+    return static_cast<uint16_t>(vshard);
+}
+
+std::optional<RetiredDirectoryName> retiredDirectoryName(std::string_view name) {
+    if (!name.starts_with(kRetiredDirectoryPrefix))
+        return std::nullopt;
+    name.remove_prefix(kRetiredDirectoryPrefix.size());
+    uint64_t vshard = 0;
+    uint64_t epoch = 0;
+    if (!consumeUnsigned(name, vshard, "_epoch_") || vshard >= timestar::VIRTUAL_SHARD_COUNT ||
+        !consumeUnsigned(name, epoch, {}) || epoch == 0 || !name.empty())
+        return std::nullopt;
+    return RetiredDirectoryName{static_cast<uint16_t>(vshard), epoch};
+}
+
+std::optional<uint64_t> retiredAtMillis(std::string_view name) {
+    if (!name.starts_with(kRetiredMarkerPrefix) || !name.ends_with(kRetiredMarkerSuffix))
+        return std::nullopt;
+    name.remove_prefix(kRetiredMarkerPrefix.size());
+    name.remove_suffix(kRetiredMarkerSuffix.size());
+    uint64_t millis = 0;
+    if (!consumeUnsigned(name, millis, {}) || !name.empty())
+        return std::nullopt;
+    return millis;
 }
 }  // namespace
 
@@ -124,6 +186,7 @@ uint64_t ReplicatedVShardHost::journalSyncRequests() const {
 
 seastar::future<> ReplicatedVShardHost::addVShard(uint16_t vshard, std::vector<NodeId> voters, raft::RaftOptions opts,
                                                   RecoveredConfigValidator recoveredConfigValidator) {
+    auto maintenance = co_await seastar::get_units(maintenanceLock_, 1);
     // AN IDENTITY-ASSUMING SITE, deliberately left so (debt D-11, ADR 0004). Three
     // things below are keyed by the VShard id AS a group id:
     //   * `registry_.addGroup(vshard, ...)` -- the group id the transport peeks and
@@ -141,6 +204,11 @@ seastar::future<> ReplicatedVShardHost::addVShard(uint16_t vshard, std::vector<N
     // the same dir (two recoverers over one journal) and leak the old writer's fd.
     if (registry_.group(vshard))
         throw std::runtime_error("ReplicatedVShardHost::addVShard: VShard already hosted");
+    // A private journal re-add starts a fresh v1 sequence namespace. A terminal
+    // watermark from its previous retired generation must never be inherited by
+    // the new files.
+    if (!sharedJournalEnabled())
+        retention_.clearReleased(VShardId{vshard});
     // EVERY group on this shard shares ONE snapshot transfer budget (debt D-37), stamped
     // in here rather than at the ClusterDataPlane call site that builds `opts`: the budget
     // is a per-SHARD object and that site builds one options struct for the whole node.
@@ -152,6 +220,7 @@ seastar::future<> ReplicatedVShardHost::addVShard(uint16_t vshard, std::vector<N
     // before the group can accept a proposal or tick.
     opts.uncommittedProposalBudget = &uncommittedProposalBudget_;
     VShardState vs;
+    vs.seenInServingMap = !static_cast<bool>(recoveredConfigValidator);
     JournalSegmentHeader hdr;
     hdr.clusterUuid = journalIdentity_.clusterUuid;
     hdr.coreNumber = static_cast<uint16_t>(seastar::this_shard_id());
@@ -302,12 +371,244 @@ seastar::future<> ReplicatedVShardHost::addVShard(uint16_t vshard, std::vector<N
     co_return;
 }
 
+std::optional<seastar::gate::holder> ReplicatedVShardHost::holdVShardOperation(uint16_t vshard) {
+    if (stopped_)
+        return std::nullopt;
+    auto state = vshards_.find(vshard);
+    if (state == vshards_.end() || state->second.retiring || !state->second.operationGate ||
+        state->second.operationGate->is_closed())
+        return std::nullopt;
+    return state->second.operationGate->hold();
+}
+
+seastar::future<bool> ReplicatedVShardHost::retireVShard(uint16_t vshard, uint64_t mapEpoch) {
+    if (mapEpoch == 0)
+        throw std::invalid_argument("ReplicatedVShardHost::retireVShard: map epoch must be non-zero");
+    if (sharedJournalEnabled())
+        throw std::runtime_error(
+            "cluster: online VShard retirement requires private v1 journals; shared journals are not supported");
+    auto maintenance = co_await seastar::get_units(maintenanceLock_, 1);
+    auto state = vshards_.find(vshard);
+    if (state == vshards_.end())
+        co_return false;
+
+    auto groupLifetime = registry_.groupHandle(vshard);
+    if (auto* group = groupLifetime.get()) {
+        const auto& config = group->node().config();
+        const auto containsSelf = [this](const std::vector<NodeId>& nodes) {
+            return std::find(nodes.begin(), nodes.end(), self_) != nodes.end();
+        };
+        if (containsSelf(config.voters) || containsSelf(config.votersOutgoing) || containsSelf(config.learners))
+            throw std::runtime_error("cluster: refusing to retire VShard " + std::to_string(vshard) +
+                                     " before this node is absent from its applied Raft configuration");
+    } else if (!state->second.retiring || state->second.retirementEpoch == 0) {
+        throw std::runtime_error("cluster: refusing to retire VShard " + std::to_string(vshard) +
+                                 " without its applied Raft configuration");
+    }
+
+    state->second.retiring = true;
+    if (state->second.retirementEpoch == 0)
+        state->second.retirementEpoch = mapEpoch;
+    const uint64_t retirementEpoch = state->second.retirementEpoch;
+    // Retire Raft first: it fails every pending apply/read/config waiter and
+    // drains group work. Those failures let host wrapper operations release the
+    // VShard gate; closing that gate first could wait forever on an unbounded
+    // read barrier whose cancellation was still queued behind it.
+    (void)co_await registry_.removeGroup(vshard);
+    if (state->second.operationGate && !state->second.operationGate->is_closed())
+        co_await state->second.operationGate->close();
+    groupLifetime.reset();
+
+    // With no live replica, every record in this generation is dead. Publish the
+    // terminal floor before moving the files so observability and the shared GC
+    // rule cannot mistake a retired generation for a laggard.
+    retention_.setReleased(VShardId{vshard}, std::numeric_limits<uint64_t>::max());
+    if (state->second.writer)
+        co_await state->second.writer->close();
+
+    const fs::path source = journalRoot_ / ("vshard_" + std::to_string(vshard));
+    const fs::path retiredRoot = journalRoot_ / "retired";
+    const fs::path destination =
+        retiredRoot / ("v1_vshard_" + std::to_string(vshard) + "_epoch_" + std::to_string(retirementEpoch));
+    co_await seastar::async([&] {
+        fs::create_directories(retiredRoot);
+        const bool sourceExists = fs::exists(source);
+        const bool destinationExists = fs::exists(destination);
+        if (sourceExists && destinationExists)
+            throw std::runtime_error("cluster: both active and retired VShard journal generations exist");
+        if (sourceExists)
+            fs::rename(source, destination);
+        else if (!destinationExists)
+            throw std::runtime_error("cluster: VShard journal disappeared before it could be quarantined");
+    });
+    co_await seastar::sync_directory(journalRoot_.string());
+    co_await seastar::sync_directory(retiredRoot.string());
+
+    co_await ensureRetiredJournalMarker(destination);
+
+    vshards_.erase(state);
+    ++replicasRetired_;
+    timestar::http_log.info("cluster: retired VShard {} at serving-map epoch {}; its v1 journal is quarantined at {}",
+                            vshard, retirementEpoch, destination.string());
+    co_return true;
+}
+
+seastar::future<size_t> ReplicatedVShardHost::reconcileServingMap(const control::ControlMap& map) {
+    std::vector<uint16_t> retired;
+    retired.reserve(vshards_.size());
+    for (auto& [vshard, state] : vshards_) {
+        const auto placement = map.placement.find(vshard);
+        const bool placedHere =
+            placement != map.placement.end() &&
+            std::find(placement->second.begin(), placement->second.end(), self_) != placement->second.end();
+        if (placedHere) {
+            state.seenInServingMap = true;
+        } else if (state.seenInServingMap) {
+            // A prior retirement attempt may have drained the replica and moved
+            // its journal before failing to persist the marker. Replay must run
+            // the idempotent tail again instead of stranding retiring state.
+            retired.push_back(vshard);
+        }
+    }
+    size_t count = 0;
+    for (uint16_t vshard : retired)
+        if (co_await retireVShard(vshard, map.epoch))
+            ++count;
+    co_return count;
+}
+
+seastar::future<> ReplicatedVShardHost::ensureRetiredJournalMarker(const fs::path& directory) {
+    const auto marker = co_await seastar::async([directory] {
+        std::optional<fs::path> found;
+        for (const auto& entry : fs::directory_iterator(directory)) {
+            const auto parsed = retiredAtMillis(entry.path().filename().string());
+            if (!parsed)
+                continue;
+            if (entry.is_symlink() || !entry.is_regular_file() || found)
+                throw std::runtime_error("cluster: retired VShard journal has an invalid or ambiguous v1 marker");
+            found = entry.path();
+        }
+        return found;
+    });
+    fs::path path;
+    seastar::open_flags flags = seastar::open_flags::rw;
+    if (marker) {
+        path = *marker;
+    } else {
+        const auto now = std::chrono::system_clock::now().time_since_epoch();
+        const auto millis = std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
+        if (millis < 0)
+            throw std::runtime_error("cluster: system clock predates the v1 retirement marker epoch");
+        path = directory / ("retired_at_" + std::to_string(millis) + ".v1");
+        flags |= seastar::open_flags::create | seastar::open_flags::exclusive;
+    }
+    // Re-flush an existing marker too. This makes an exact retry repair a prior
+    // file/directory sync failure instead of trusting mere namespace presence.
+    auto file = co_await seastar::open_file_dma(path.string(), flags);
+    co_await file.flush();
+    co_await file.close();
+    co_await seastar::sync_directory(directory.string());
+}
+
+seastar::future<size_t> ReplicatedVShardHost::recoverReplicaRetirements(control::ControlMap map) {
+    if (!control::isCompleteControlMap(map))
+        throw std::invalid_argument("cluster: replica-retirement recovery requires a complete serving map");
+    if (sharedJournalEnabled())
+        throw std::runtime_error("cluster: replica-retirement recovery requires private v1 VShard journals");
+    auto maintenance = co_await seastar::get_units(maintenanceLock_, 1);
+    const fs::path retiredRoot = journalRoot_ / "retired";
+    auto recovered = co_await seastar::async([this, &map, retiredRoot] {
+        std::vector<fs::path> retired;
+        std::vector<std::pair<fs::path, uint16_t>> stale;
+        size_t moved = 0;
+        fs::create_directories(retiredRoot);
+        for (const auto& entry : fs::directory_iterator(journalRoot_)) {
+            if (entry.is_symlink() || !entry.is_directory())
+                continue;
+            const auto vshard = activeVShardDirectoryName(entry.path().filename().string());
+            if (!vshard)
+                continue;
+            const auto placement = map.placement.find(*vshard);
+            const bool placedHere =
+                placement != map.placement.end() &&
+                std::find(placement->second.begin(), placement->second.end(), self_) != placement->second.end();
+            if (!placedHere)
+                stale.emplace_back(entry.path(), *vshard);
+        }
+        for (const auto& [source, vshard] : stale) {
+            const fs::path destination =
+                retiredRoot / ("v1_vshard_" + std::to_string(vshard) + "_epoch_" + std::to_string(map.epoch));
+            if (fs::exists(destination))
+                throw std::runtime_error(
+                    "cluster: active and retired VShard journal generations collide during recovery");
+            fs::rename(source, destination);
+            ++moved;
+        }
+        for (const auto& entry : fs::directory_iterator(retiredRoot)) {
+            if (!entry.is_symlink() && entry.is_directory() && retiredDirectoryName(entry.path().filename().string()))
+                retired.push_back(entry.path());
+        }
+        return std::pair{moved, std::move(retired)};
+    });
+    co_await seastar::sync_directory(journalRoot_.string());
+    co_await seastar::sync_directory(retiredRoot.string());
+    for (const auto& directory : recovered.second)
+        co_await ensureRetiredJournalMarker(directory);
+    replicasRetired_ += recovered.first;
+    co_return recovered.first;
+}
+
+seastar::future<size_t> ReplicatedVShardHost::reclaimRetiredJournals(std::chrono::system_clock::time_point now) {
+    auto maintenance = co_await seastar::get_units(maintenanceLock_, 1);
+    const fs::path retiredRoot = journalRoot_ / "retired";
+    const uint64_t nowMillis =
+        static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count());
+    const uint64_t graceMillis =
+        static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(kRetiredJournalGrace).count());
+    auto expired = co_await seastar::async([retiredRoot, nowMillis, graceMillis] {
+        std::vector<fs::path> paths;
+        if (!fs::exists(retiredRoot))
+            return paths;
+        for (const auto& entry : fs::directory_iterator(retiredRoot)) {
+            if (entry.is_symlink() || !entry.is_directory() || !retiredDirectoryName(entry.path().filename().string()))
+                continue;
+            std::optional<uint64_t> retiredAt;
+            bool ambiguous = false;
+            for (const auto& child : fs::directory_iterator(entry.path())) {
+                const auto parsed = retiredAtMillis(child.path().filename().string());
+                if (!parsed)
+                    continue;
+                if (child.is_symlink() || !child.is_regular_file() || retiredAt) {
+                    ambiguous = true;
+                    break;
+                }
+                retiredAt = parsed;
+            }
+            if (!ambiguous && retiredAt && nowMillis >= *retiredAt && nowMillis - *retiredAt >= graceMillis)
+                paths.push_back(entry.path());
+        }
+        return paths;
+    });
+
+    size_t reclaimed = 0;
+    for (const auto& path : expired) {
+        co_await seastar::async([path] { fs::remove_all(path); });
+        co_await seastar::sync_directory(retiredRoot.string());
+        ++reclaimed;
+    }
+    retiredJournalsReclaimed_ += reclaimed;
+    co_return reclaimed;
+}
+
 seastar::future<bool> ReplicatedVShardHost::propose(uint16_t vshard, data::ReplicatedCommand cmd) {
     return propose(vshard, std::move(cmd), std::nullopt);
 }
 
 seastar::future<bool> ReplicatedVShardHost::propose(uint16_t vshard, data::ReplicatedCommand cmd,
                                                     data::OptDeadline deadline) {
+    auto operation = holdVShardOperation(vshard);
+    if (!operation)
+        throw std::runtime_error("ReplicatedVShardHost::propose: VShard not hosted here");
     raft::RaftGroup* g = registry_.group(vshard);
     if (!g)
         throw std::runtime_error("ReplicatedVShardHost::propose: VShard not hosted here");
@@ -342,8 +643,9 @@ seastar::future<data::ProposeOutcome> ReplicatedVShardHost::proposeCommandHinted
                                                                                  data::ReplicatedCommand cmd,
                                                                                  data::OptDeadline deadline) {
     data::ProposeOutcome out;
+    auto operation = holdVShardOperation(vshard);
     raft::RaftGroup* g = registry_.group(vshard);
-    if (!g) {
+    if (!operation || !g) {
         out.rejects.push_back(data::SliceReject{vshard, raft::kNoNode, data::WriteFailure::NotLeader});
         co_return out;
     }
@@ -370,6 +672,10 @@ seastar::future<data::ProposeOutcome> ReplicatedVShardHost::proposeCommandHinted
 }
 
 seastar::future<uint64_t> ReplicatedVShardHost::snapshotVShard(uint16_t vshard) {
+    auto maintenance = co_await seastar::get_units(maintenanceLock_, 1);
+    auto operation = holdVShardOperation(vshard);
+    if (!operation)
+        co_return 0;
     raft::RaftGroup* g = registry_.group(vshard);
     if (!g)
         co_return 0;  // not hosted here
@@ -555,6 +861,7 @@ seastar::future<size_t> ReplicatedVShardHost::reclaimJournalSegments() {
     // the same directory would both plan against the same segment and race the unlink.
     if (stopped_ || journalGcRunning_ || snapshotGate_.is_closed())
         co_return 0;
+    auto maintenance = co_await seastar::get_units(maintenanceLock_, 1);
     // UNDER THE SAME GATE AS THE SWEEP. This is a public entry (tests, and an operator
     // action later), so it can be called from outside snapshotSweep(); without the hold, a
     // pass in flight when stop() runs would keep unlinking against writers that stop() is
@@ -684,11 +991,17 @@ seastar::future<> ReplicatedVShardHost::snapshotSweep() {
         if (lastJournalGc_.time_since_epoch().count() == 0 || now - lastJournalGc_ >= kJournalGcInterval) {
             lastJournalGc_ = now;
             const size_t deleted = co_await reclaimJournalSegments();
+            const size_t retired = co_await reclaimRetiredJournals();
             if (deleted > 0)
                 timestar::http_log.info(
                     "cluster: shard {} reclaimed {} sealed Raft journal segment(s) below the snapshot boundary "
                     "({} total, {} record(s) copied forward)",
                     seastar::this_shard_id(), deleted, journalSegmentsDeleted_, journalRecordsCopiedForward_);
+            if (retired > 0)
+                timestar::http_log.info(
+                    "cluster: shard {} reclaimed {} retired v1 VShard journal generation(s) after the {} hour grace "
+                    "period ({} total)",
+                    seastar::this_shard_id(), retired, kRetiredJournalGrace.count(), retiredJournalsReclaimed_);
         }
     } catch (const std::exception& e) {
         // (e) A FAILED SNAPSHOT MUST NEVER TAKE THE WRITE PATH WITH IT. Nothing was
@@ -816,9 +1129,14 @@ data::SliceReject ReplicatedVShardHost::classifyRefusal(uint16_t vshard) {
 seastar::future<bool> ReplicatedVShardHost::proposeVShardBatches(data::VShardBatches byVShard) {
     // Membership check for the WHOLE batch BEFORE any replication, so a routing error
     // fails atomically (nothing proposed) rather than after some groups committed.
-    for (const auto& [vs, b] : byVShard)
-        if (!registry_.group(vs))
+    std::vector<seastar::gate::holder> operations;
+    operations.reserve(byVShard.size());
+    for (const auto& [vs, b] : byVShard) {
+        auto held = holdVShardOperation(vs);
+        if (!held || !registry_.group(vs))
             throw std::runtime_error("ReplicatedVShardHost::proposeBatch: VShard not led here");
+        operations.push_back(std::move(*held));
+    }
     // One admission decision for the whole request, before ANY group can append.
     // Apply is unconditional after this point, including on followers and replay.
     co_await store_.checkWriteAdmission(data::viewOf(byVShard));
@@ -872,10 +1190,17 @@ seastar::future<data::ProposeOutcome> ReplicatedVShardHost::proposeVShardBatches
     // "uncommitted == rejects" then acked slices this node never replicated. The
     // committed-set contract in node_store.hpp is the caller-side half of the same fix;
     // both halves are needed, because either alone leaves the other's mistake fatal.
+    std::vector<seastar::gate::holder> operations;
+    operations.reserve(view.size());
     bool anyMissing = false;
-    for (const auto* g : view)
-        if (!registry_.group(g->first))
+    for (const auto* g : view) {
+        auto held = holdVShardOperation(g->first);
+        if (!held || !registry_.group(g->first)) {
             anyMissing = true;
+            continue;
+        }
+        operations.push_back(std::move(*held));
+    }
     if (anyMissing) {
         for (const auto* g : view)
             out.rejects.push_back(data::SliceReject{
@@ -1016,13 +1341,16 @@ std::optional<EngineDataStateMachine::DeleteReceiptCounts> ReplicatedVShardHost:
 }
 
 seastar::future<raft::LogIndex> ReplicatedVShardHost::leaderReadIndex(uint16_t vshard) {
+    auto operation = holdVShardOperation(vshard);
+    if (!operation)
+        throw std::runtime_error("ReplicatedVShardHost::leaderReadIndex: VShard not hosted here");
     raft::RaftGroup* g = registry_.group(vshard);
     if (!g)
         throw std::runtime_error("ReplicatedVShardHost::leaderReadIndex: VShard not hosted here");
     // readBarrier() runs a quorum-confirmed ReadIndex round and REJECTS (throws) if this
     // node is not the current-term leader -- exactly the partition/redirect signal the
     // reaching replica needs, so no forwarding of stale barriers.
-    return g->readBarrier();
+    co_return co_await g->readBarrier();
 }
 
 seastar::future<raft::LogIndex> ReplicatedVShardHost::leaderCommitIndex(uint16_t vshard) {
@@ -1052,6 +1380,23 @@ seastar::future<> ReplicatedVShardHost::stop() {
     if (!snapshotGate_.is_closed())
         co_await snapshotGate_.close();
     co_await registry_.stop();  // stops the tick loop + drains
+    // Block new host entry, cancel group waiters, then drain the wrappers that
+    // own VShardState references. This is the same ordering as live retirement.
+    std::vector<uint16_t> hosted;
+    std::vector<std::shared_ptr<raft::RaftGroup>> groupLifetimes;
+    hosted.reserve(vshards_.size());
+    groupLifetimes.reserve(vshards_.size());
+    for (auto& [vshard, state] : vshards_) {
+        state.retiring = true;
+        hosted.push_back(vshard);
+        groupLifetimes.push_back(registry_.groupHandle(vshard));
+    }
+    for (uint16_t vshard : hosted)
+        (void)co_await registry_.removeGroup(vshard);
+    for (auto& [vshard, state] : vshards_)
+        if (state.operationGate && !state.operationGate->is_closed())
+            co_await state.operationGate->close();
+    groupLifetimes.clear();
     // The shared sink first: a round in flight holds a reference to the writer, and
     // a waiter it has not yet resolved must be failed rather than left hanging.
     if (sharedSink_)

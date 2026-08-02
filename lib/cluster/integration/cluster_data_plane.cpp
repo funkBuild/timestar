@@ -141,6 +141,10 @@ seastar::future<> ClusterDataPlane::startImpl(const ClusterConfig& cfg, seastar:
     // visible in the boot log instead of being inferred from a wall of 503s.
     (void)WriteAdmission::limitBytes();
     validateCoreTopology(seastar::smp::count, cfg.replication_factor);
+    if (cfg.control_enabled && ReplicatedVShardHost::sharedJournalEnabled())
+        throw std::invalid_argument(
+            "cluster: Group-0 topology changes require private v1 VShard journals; unset "
+            "TIMESTAR_CLUSTER_SHARED_JOURNAL");
     rt_ = ClusterRuntime::fromConfig(cfg);  // throws (fail-closed) on misconfig
     const std::filesystem::path dataRoot = timestar::dataRootPath();
     if (cfg.control_enabled) {
@@ -436,6 +440,17 @@ seastar::future<> ClusterDataPlane::startImpl(const ClusterConfig& cfg, seastar:
             // Normally caught by the server before storage opens. Keep the
             // composition fail closed for non-server embedders too.
             throw std::invalid_argument("--cluster-init requires cluster.control_enabled=true");
+        }
+        if (cfg.control_enabled) {
+            // Only the durable Group-0 serving map may classify an active
+            // journal as stale. A fresh non-seed has merely configured an
+            // initial map, so it has no retirement authority yet.
+            auto servingMap =
+                co_await seastar::async([dataRoot] { return control::DurableControlMapStore(dataRoot).load(); });
+            if (servingMap)
+                co_await shards_.invoke_on(0, [map = std::move(*servingMap)](ShardRaftPlane& plane) mutable {
+                    return plane.plane().host().recoverReplicaRetirements(std::move(map));
+                });
         }
         {
             std::map<unsigned, std::vector<std::pair<uint16_t, std::vector<data::NodeId>>>> byShard;
@@ -1424,6 +1439,8 @@ seastar::future<ClusterDataPlane::Status> ClusterDataPlane::status() const {
         st.journalSegmentsPinnedLastPass += jc.segmentsPinnedLastPass;
         st.journalRecordsCopiedForward += jc.recordsCopiedForward;
         st.journalGcPasses += jc.gcPasses;
+        st.replicasRetired += jc.replicasRetired;
+        st.retiredJournalsReclaimed += jc.retiredJournalsReclaimed;
         st.uncommittedRaftBytes += jc.uncommittedBytes;
         st.uncommittedRaftPeakBytes += jc.uncommittedPeakBytes;
         st.uncommittedRaftLimitBytes += jc.uncommittedLimitBytes;

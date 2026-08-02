@@ -220,10 +220,13 @@ public:
     // Called on this directory's owning reactor after Group 0 commits a serving
     // map. The directory object stays at a stable address because the replicated
     // routers borrow it; only its validated map value changes in place.
-    bool updateServingMap(const control::ControlMap& map) {
+    seastar::future<bool> updateServingMap(control::ControlMap map) {
         if (!dir_)
             throw std::logic_error("cluster: serving-map update before shard-plane initialisation");
-        return dir_->updateMap(map);
+        const bool changed = dir_->updateMap(map);
+        if (plane_)
+            (void)co_await plane_->host().reconcileServingMap(map);
+        co_return changed;
     }
 
     // Every shard on this node. `peers_` is the sharded<> container this instance lives
@@ -455,8 +458,10 @@ public:
     seastar::future<control::ActuateMoveResult> actuateMoveLocal(control::Job job, uint16_t vshard, size_t minRf) {
         if (!ready() || shardOwningVShard(vshard, dir_.get()) != seastar::this_shard_id())
             co_return control::ActuateMoveResult{control::ActuateMoveStatus::Unavailable, raft::kNoNode, {}};
-        raft::RaftGroup* group = plane_->host().group(vshard);
-        if (!group)
+        auto& host = plane_->host();
+        auto operation = host.holdVShardOperation(vshard);
+        raft::RaftGroup* group = host.group(vshard);
+        if (!operation || !group)
             co_return control::ActuateMoveResult{control::ActuateMoveStatus::Unavailable, raft::kNoNode, {}};
         const auto leader = [&] { return group->isLeader() ? group->node().id() : group->leader(); };
         if (!group->isLeader())
@@ -762,6 +767,8 @@ public:
         uint64_t segmentsPinnedLastPass = 0;
         uint64_t recordsCopiedForward = 0;
         uint64_t gcPasses = 0;
+        uint64_t replicasRetired = 0;
+        uint64_t retiredJournalsReclaimed = 0;
         size_t uncommittedBytes = 0;
         size_t uncommittedPeakBytes = 0;
         size_t uncommittedLimitBytes = 0;
@@ -781,6 +788,8 @@ public:
         c.segmentsPinnedLastPass = host.journalSegmentsPinnedLastPass();
         c.recordsCopiedForward = host.journalRecordsCopiedForward();
         c.gcPasses = host.journalGcPasses();
+        c.replicasRetired = host.replicasRetired();
+        c.retiredJournalsReclaimed = host.retiredJournalsReclaimed();
         c.uncommittedBytes = host.uncommittedProposalBytes();
         c.uncommittedPeakBytes = host.uncommittedProposalPeakBytes();
         c.uncommittedLimitBytes = ReplicatedVShardHost::uncommittedProposalLimitBytes();
@@ -963,8 +972,9 @@ public:
             if (pass.exhausted())
                 break;
             const data::BalanceGroup& bg = groups[gi];
+            auto operation = host.holdVShardOperation(bg.vshard);
             raft::RaftGroup* g = host.group(bg.vshard);
-            if (!g || !g->isLeader())
+            if (!operation || !g || !g->isLeader())
                 continue;
             const size_t chosen =
                 pass.chooseTarget(bg.voters, [&](data::NodeId cand) { return transferrableTo(*g, cand); });
@@ -1047,7 +1057,8 @@ inline seastar::future<> publishServingMapOnShards(seastar::sharded<ShardRaftPla
                                                    data::VShardDirectory& coordinatorDirectory,
                                                    const control::ControlMap& map) {
     coordinatorDirectory.updateMap(map);
-    co_await shards.invoke_on_all([map](ShardRaftPlane& shard) { shard.updateServingMap(map); });
+    co_await shards.invoke_on_all(
+        [map](ShardRaftPlane& shard) { return shard.updateServingMap(map).discard_result(); });
 }
 
 // Split `batch` by the shard that OWNS each series' VShard Raft group and dispatch

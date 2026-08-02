@@ -9,15 +9,32 @@ RaftGroupRegistry::RaftGroupRegistry(RaftTransport& transport, std::chrono::mill
 
 RaftGroup& RaftGroupRegistry::addGroup(uint16_t groupId, RaftNode node, RaftPersistence& persistence,
                                        RaftStateMachine& sm) {
-    auto g = std::make_unique<RaftGroup>(groupId, std::move(node), persistence, transport_, sm);
+    auto g = std::make_shared<RaftGroup>(groupId, std::move(node), persistence, transport_, sm);
     RaftGroup& ref = *g;
     groups_[groupId] = std::move(g);
     return ref;
 }
 
+seastar::future<bool> RaftGroupRegistry::removeGroup(uint16_t groupId) {
+    auto it = groups_.find(groupId);
+    if (it == groups_.end())
+        co_return false;
+    auto group = std::move(it->second);
+    groups_.erase(it);
+    skips_.erase(groupId);
+    awakeFor_.erase(groupId);
+    co_await group->retire();
+    co_return true;
+}
+
 RaftGroup* RaftGroupRegistry::group(uint16_t groupId) {
     auto it = groups_.find(groupId);
     return it == groups_.end() ? nullptr : it->second.get();
+}
+
+std::shared_ptr<RaftGroup> RaftGroupRegistry::groupHandle(uint16_t groupId) {
+    auto it = groups_.find(groupId);
+    return it == groups_.end() ? nullptr : it->second;
 }
 
 seastar::future<> RaftGroupRegistry::deliver(Envelope env) {
@@ -28,8 +45,9 @@ seastar::future<> RaftGroupRegistry::deliver(Envelope env) {
         return seastar::make_ready_future<>();  // no such group here; drop
     // Run the step under the gate so stop()'s gate.close() waits for it -- the
     // group must not be destroyed while a delivery is mid-flight in its step().
-    RaftGroup* g = it->second.get();
-    return seastar::with_gate(gate_, [g, m = std::move(env.message)]() mutable { return g->step(std::move(m)); });
+    auto g = it->second;
+    return seastar::with_gate(
+        gate_, [g = std::move(g), m = std::move(env.message)]() mutable { return g->step(std::move(m)); });
 }
 
 void RaftGroupRegistry::startTicking() {
@@ -64,9 +82,18 @@ size_t RaftGroupRegistry::wakeFollowersOf(NodeId leader) {
 }
 
 seastar::future<> RaftGroupRegistry::tickAll() {
-    for (auto& [gid, g] : groups_) {
+    // Never suspend an iterator into groups_: removeGroup() may erase from the
+    // map while this pass is awaiting another group. The shared references also
+    // keep already-selected groups alive until this pass observes retirement.
+    std::vector<std::pair<uint16_t, std::shared_ptr<RaftGroup>>> groups;
+    groups.reserve(groups_.size());
+    for (const auto& item : groups_)
+        groups.push_back(item);
+    for (auto& [gid, g] : groups) {
         if (stopping_)
             co_return;
+        if (g->retiring())
+            continue;
         // Hibernate a quiescent follower: skip its tick for up to followerSkip_
         // passes. A live leader's heartbeats (delivered via step, independent of
         // this group's own ticking) keep it a follower; a dead leader stops

@@ -27,7 +27,13 @@ public:
     // multiplex over the same per-host connections). persistence/sm are borrowed
     // and must outlive the registry.
     RaftGroup& addGroup(uint16_t groupId, RaftNode node, RaftPersistence& persistence, RaftStateMachine& sm);
+    // Remove one live group, refusing new lookups first and then draining all
+    // operations that already entered it. Idempotent for an absent group.
+    seastar::future<bool> removeGroup(uint16_t groupId);
     RaftGroup* group(uint16_t groupId);
+    // Keep a removed group object alive while an owning layer drains wrappers
+    // that may still hold a raw pointer between group operations.
+    std::shared_ptr<RaftGroup> groupHandle(uint16_t groupId);
     size_t size() const { return groups_.size(); }
 
     // Route an incoming envelope to its group (wire this as the transport's
@@ -89,7 +95,10 @@ private:
 
     RaftTransport& transport_;
     std::chrono::milliseconds tickInterval_;
-    std::map<uint16_t, std::unique_ptr<RaftGroup>> groups_;
+    // shared_ptr is intentional: a tick pass snapshots the live group set before
+    // its first suspension. Concurrent removal can erase the registry entry while
+    // that pass still owns a safe, already-retired group object.
+    std::map<uint16_t, std::shared_ptr<RaftGroup>> groups_;
     std::map<uint16_t, unsigned> skips_;     // consecutive passes a group has been skipped
     std::map<uint16_t, unsigned> awakeFor_;  // passes left of forced full-rate ticking
     // Must exceed the election timeout in passes (125-250) so a woken group campaigns.

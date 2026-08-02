@@ -127,10 +127,12 @@ any VShard delete proposal. Lookup-first retry recovers a plan that may have
 committed after an ambiguous reply. The external leader-failover/restart proof
 is still outstanding.
 
-The production driver and runtime publication seam are still incomplete: safe
-join, drain, replace, remove, dynamic peer/group creation, live directory
-cutover, ordered teardown, and reclaim-floor publication do not yet run end to
-end through the production server. Static peer-list editing is not a substitute.
+The production driver, runtime publication, and local Raft retirement seam are
+wired: dynamic peer/group creation, live directory cutover, applied-membership
+fencing, terminal reclaim-floor publication, and exact-v1 journal
+quarantine/grace/deletion run in process. Safe reclamation of retired logical
+data from shared Engine WAL/TSM/index files and the multi-process end-to-end
+proof remain open. Static peer-list editing is not a substitute.
 
 ### Storage durability
 
@@ -184,7 +186,11 @@ changes. See [protocol-versioning.md](protocol-versioning.md).
   registered on every transport before Group-0 learner membership and restored
   from recovered node records. **Done:** destination data groups are created from
   the receiver's committed Group-0 job before movement starts.
-- Publish teardown/reclaim floors only after durable ownership transfer.
+- **Done:** publish the terminal Raft-journal reclaim floor and quarantine the
+  local replica only after durable ownership transfer and applied membership
+  removal.
+- Reclaim the retired VShard's logical Engine data without deleting shared-file
+  extents belonging to live VShards.
 - Prove no acknowledged loss or duplicate VShard contribution during movement.
 
 ### 2. Replicate retention

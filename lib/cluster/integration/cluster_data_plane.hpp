@@ -266,6 +266,8 @@ public:
         uint64_t journalSegmentsPinnedLastPass = 0;
         uint64_t journalRecordsCopiedForward = 0;
         uint64_t journalGcPasses = 0;
+        uint64_t replicasRetired = 0;
+        uint64_t retiredJournalsReclaimed = 0;
         // Locally materialized Raft entries above commit, across this node's
         // reactor shards (CR-FIX-080). Refusals happen before append and are
         // therefore unambiguous, retryable overload rather than unknown writes.

@@ -7,6 +7,7 @@
 #include <map>
 #include <optional>
 #include <seastar/core/future.hh>
+#include <seastar/core/gate.hh>
 #include <seastar/core/lowres_clock.hh>
 #include <seastar/core/semaphore.hh>
 #include <string>
@@ -31,6 +32,13 @@ public:
         syncUncommittedBudget();
     }
     ~RaftGroup();
+
+    // Permanently stop this group and wait for every operation that already
+    // entered it. New client operations fail; late transport deliveries and
+    // ticks are harmless no-ops. The registry calls this before destroying the
+    // persistence/state-machine objects borrowed by the group.
+    seastar::future<> retire();
+    bool retiring() const { return retiring_; }
 
     // Inputs. Each mutates the node then drains its Ready under the group lock.
     seastar::future<> step(Message m);
@@ -174,6 +182,8 @@ public:
     const RaftNode& node() const { return node_; }
 
 private:
+    seastar::gate::holder holdOperation();
+    void ensureActive() const;
     // The ready/persist/send/apply/advance loop. MUST run under the group lock so
     // no step()/tick()/propose() interleaves a ready()..advance() pair.
     seastar::future<> drainReady();
@@ -208,6 +218,8 @@ private:
     // while the coroutine frame is still pointing into it (rule at the top of
     // raft_group.cpp; debt D-33).
     seastar::semaphore lock_{1};
+    seastar::gate operationGate_;
+    bool retiring_ = false;
 
     // Read-barrier tracking.
     uint64_t appliedIndex_ = 0;   // highest entry index applied to the SM
