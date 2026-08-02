@@ -136,6 +136,86 @@ TEST(ControlCommandCodecTest, FrozenDeletePlanRejectsEveryTruncatedPrefix) {
     EXPECT_TRUE(decodeCommand(full).has_value());
 }
 
+TEST(ControlCommandCodecTest, FrozenDeletePlanRpcRequestsRoundTripAndFailClosed) {
+    const FrozenDeletePlan lookupPlan = deletePlan('1', 'a', 1'800'000'000'000);
+    const FrozenDeletePlan freezePlan = deletePlan(
+        '2', 'b', 1'800'000'000'001,
+        {{"m,host=a value", 10, 20}, {"m,host=b value", 30, 40}});
+
+    for (const auto& request :
+         {FrozenDeletePlanRpcRequest{FrozenDeletePlanRpcOperation::Lookup, lookupPlan},
+          FrozenDeletePlanRpcRequest{FrozenDeletePlanRpcOperation::Freeze, freezePlan}}) {
+        const std::string encoded = encodeFrozenDeletePlanRpcRequest(request);
+        auto decoded = decodeFrozenDeletePlanRpcRequest(encoded);
+        ASSERT_TRUE(decoded);
+        EXPECT_EQ(decoded->operation, request.operation);
+        EXPECT_EQ(decoded->plan, request.plan);
+        for (size_t n = 0; n < encoded.size(); ++n)
+            EXPECT_FALSE(decodeFrozenDeletePlanRpcRequest(encoded.substr(0, n))) << "prefix " << n;
+
+        std::string trailing = encoded;
+        trailing.push_back('\0');
+        EXPECT_FALSE(decodeFrozenDeletePlanRpcRequest(trailing));
+    }
+
+    std::string unknown = encodeFrozenDeletePlanRpcRequest(
+        {FrozenDeletePlanRpcOperation::Lookup, lookupPlan});
+    unknown.front() = static_cast<char>(0xff);
+    EXPECT_FALSE(decodeFrozenDeletePlanRpcRequest(unknown));
+
+    auto lookupWithTargets = freezePlan;
+    EXPECT_THROW(encodeFrozenDeletePlanRpcRequest(
+                     {FrozenDeletePlanRpcOperation::Lookup, lookupWithTargets}),
+                 std::invalid_argument);
+    std::string mislabeled = encodeFrozenDeletePlanRpcRequest(
+        {FrozenDeletePlanRpcOperation::Freeze, lookupWithTargets});
+    mislabeled.front() = static_cast<char>(FrozenDeletePlanRpcOperation::Lookup);
+    EXPECT_FALSE(decodeFrozenDeletePlanRpcRequest(mislabeled));
+    EXPECT_FALSE(decodeFrozenDeletePlanRpcRequest(
+        std::string(kMaxFrozenDeletePlanBytes + 1, '\0')));
+}
+
+TEST(ControlCommandCodecTest, FrozenDeletePlanRpcResultsRoundTripAndFailClosed) {
+    const FrozenDeletePlan plan = deletePlan(
+        '1', 'a', 1'800'000'000'000, {{"m,host=a value", 10, 20}});
+    const std::vector<FreezeDeletePlanResult> results = {
+        {FreezeDeletePlanStatus::Stored, plan},
+        {FreezeDeletePlanStatus::Conflict, plan},
+        {FreezeDeletePlanStatus::NotFound, {}},
+        {FreezeDeletePlanStatus::NotLeader, {}},
+        {FreezeDeletePlanStatus::Capacity, {}},
+        {FreezeDeletePlanStatus::FormatInactive, {}},
+        {FreezeDeletePlanStatus::Invalid, {}},
+    };
+    for (const auto& result : results) {
+        const std::string encoded = encodeFrozenDeletePlanRpcResult(result);
+        auto decoded = decodeFrozenDeletePlanRpcResult(encoded);
+        ASSERT_TRUE(decoded);
+        EXPECT_EQ(decoded->status, result.status);
+        EXPECT_EQ(decoded->plan, result.plan);
+        for (size_t n = 0; n < encoded.size(); ++n)
+            EXPECT_FALSE(decodeFrozenDeletePlanRpcResult(encoded.substr(0, n))) << "prefix " << n;
+
+        std::string trailing = encoded;
+        trailing.push_back('\0');
+        EXPECT_FALSE(decodeFrozenDeletePlanRpcResult(trailing));
+    }
+
+    EXPECT_THROW(encodeFrozenDeletePlanRpcResult({FreezeDeletePlanStatus::NotFound, plan}),
+                 std::invalid_argument);
+    EXPECT_THROW(encodeFrozenDeletePlanRpcResult(
+                     {static_cast<FreezeDeletePlanStatus>(0xff), {}}),
+                 std::invalid_argument);
+    EXPECT_FALSE(decodeFrozenDeletePlanRpcResult(std::string(1, static_cast<char>(0xff))));
+
+    std::string planOnNoPlanStatus =
+        encodeFrozenDeletePlanRpcResult({FreezeDeletePlanStatus::Stored, plan});
+    planOnNoPlanStatus.front() = static_cast<char>(FreezeDeletePlanStatus::NotFound);
+    EXPECT_FALSE(decodeFrozenDeletePlanRpcResult(planOnNoPlanStatus));
+    EXPECT_FALSE(decodeFrozenDeletePlanRpcResult(
+        std::string(kMaxFrozenDeletePlanBytes + 1, '\0')));
+}
+
 TEST(ControlCommandCodecTest, NarrowFieldsAndEnumsFailClosed) {
     std::string state = encodeCommand(SetNodeState{7, NodeState::Joining});
     state.back() = static_cast<char>(0xff);

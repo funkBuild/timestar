@@ -87,6 +87,10 @@ constexpr uint64_t kProposeCommandHinted = 11;
 // Quorum-fenced, VShard-restricted catalog expansion for pattern deletes.
 // Requires data-plane wire v4; the client checks negotiation before calling it.
 constexpr uint64_t kFindPatternSeries = 12;
+// Lookup/freeze a version-6 group-0 pattern-delete plan through the node that
+// currently leads the control group. This is a separate verb because older
+// peers do not register it; the client negotiates v6 before selecting it.
+constexpr uint64_t kFrozenDeletePlan = 13;
 
 // How long before re-attempting a peer connection that died. seastar's rpc::client
 // never reconnects itself, so we replace it -- but bounded, so a burst of concurrent
@@ -240,6 +244,7 @@ struct DataPlaneRpc::Impl {
     NodeStore* nodeSink = nullptr;           // enriched WriteBatch path (F.4)
     ProposeSink* proposeSink = nullptr;      // RF=3 Raft propose target (M3)
     ReadIndexSink* readIndexSink = nullptr;  // replica-read leader-reach target (M4)
+    FrozenDeletePlanSink* frozenDeletePlanSink = nullptr;  // group-0 request target
     // Wire-version range this node supports (M6/X). The max is the newest WriteBatch
     // format this binary can WRITE; peers negotiate down to the highest both know.
     features::VersionRange localVersion{1, kWriteBatchFormatMax};
@@ -270,6 +275,7 @@ struct DataPlaneRpc::Impl {
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> proposeWriteStub;
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> proposeWriteHintedStub;
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> proposeCommandHintedStub;
+    std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> frozenDeletePlanStub;
     // DEADLINE-CARRYING variants of the three verbs the write path awaits
     // (write-scaleout 3f). seastar's rpc client stub has a time_point overload; without
     // it an awaited call has NO timeout at all, so a peer that accepts the connection and
@@ -295,6 +301,9 @@ struct DataPlaneRpc::Impl {
     std::function<seastar::future<seastar::sstring>(Client&, seastar::rpc::rpc_clock_type::time_point,
                                                     seastar::sstring)>
         findPatternSeriesTimedStub;
+    std::function<seastar::future<seastar::sstring>(Client&, seastar::rpc::rpc_clock_type::time_point,
+                                                    seastar::sstring)>
+        frozenDeletePlanTimedStub;
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> leaderReadIndexStub;
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> leaderCommitIndexStub;
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> negotiateVersionStub;
@@ -374,12 +383,14 @@ struct DataPlaneRpc::Impl {
         proposeWriteStub = proto.make_client<seastar::sstring(seastar::sstring)>(kProposeWrite);
         proposeWriteHintedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kProposeWriteHinted);
         proposeCommandHintedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kProposeCommandHinted);
+        frozenDeletePlanStub = proto.make_client<seastar::sstring(seastar::sstring)>(kFrozenDeletePlan);
         proposeWriteTimedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kProposeWrite);
         proposeWriteHintedTimedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kProposeWriteHinted);
         proposeCommandHintedTimedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kProposeCommandHinted);
         negotiateVersionTimedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kNegotiateVersion);
         queryNodeTimedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kQueryNode);
         findPatternSeriesTimedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kFindPatternSeries);
+        frozenDeletePlanTimedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kFrozenDeletePlan);
         leaderReadIndexStub = proto.make_client<seastar::sstring(seastar::sstring)>(kLeaderReadIndex);
         leaderCommitIndexStub = proto.make_client<seastar::sstring(seastar::sstring)>(kLeaderCommitIndex);
         negotiateVersionStub = proto.make_client<seastar::sstring(seastar::sstring)>(kNegotiateVersion);
@@ -531,6 +542,20 @@ seastar::future<> DataPlaneRpc::start(seastar::socket_address local, NodeStore& 
             return seastar::sstring(encoded.data(), encoded.size());
         });
     });
+    impl_->proto.register_handler(kFrozenDeletePlan, [this](seastar::sstring data) {
+        if (!impl_->frozenDeletePlanSink)
+            return seastar::make_exception_future<seastar::sstring>(
+                std::runtime_error("dataplane: no frozen delete-plan sink"));
+        auto request = control::decodeFrozenDeletePlanRpcRequest(std::string(data.data(), data.size()));
+        if (!request)
+            return seastar::make_exception_future<seastar::sstring>(
+                std::runtime_error("dataplane: malformed frozen delete-plan request"));
+        return impl_->frozenDeletePlanSink->handleFrozenDeletePlan(std::move(*request)).then(
+            [](control::FreezeDeletePlanResult result) {
+                std::string encoded = control::encodeFrozenDeletePlanRpcResult(result);
+                return seastar::sstring(encoded.data(), encoded.size());
+            });
+    });
     impl_->proto.register_handler(kProposeWrite, [this](seastar::sstring data) {
         if (!impl_->proposeSink)
             return seastar::make_exception_future<seastar::sstring>(
@@ -648,6 +673,10 @@ void DataPlaneRpc::setProposeSink(ProposeSink& sink) {
 
 void DataPlaneRpc::setReadIndexSink(ReadIndexSink& sink) {
     impl_->readIndexSink = &sink;
+}
+
+void DataPlaneRpc::setFrozenDeletePlanSink(FrozenDeletePlanSink& sink) {
+    impl_->frozenDeletePlanSink = &sink;
 }
 
 void DataPlaneRpc::setTlsCredentials(std::string certPem, std::string keyPem, std::string caPem,
@@ -889,6 +918,34 @@ seastar::future<PatternSeriesResult> DataPlaneRpc::findPatternSeries(NodeId to, 
     if (req.resolveVShards.empty() && !result->redirects.empty())
         throw std::runtime_error(
             "dataplane: peer returned pattern-series redirects without being asked to resolve leadership");
+    co_return std::move(*result);
+}
+
+seastar::future<control::FreezeDeletePlanResult> DataPlaneRpc::frozenDeletePlan(
+    NodeId to, control::FrozenDeletePlanRpcRequest request, OptDeadline deadline) {
+    if (impl_->stopping)
+        throw std::runtime_error("dataplane: shutting down");
+    const uint32_t version = co_await versionFor(to, deadline);
+    if (version < kFrozenDeletePlanActivationVersion)
+        throw ClusterFormatUnsupportedError(
+            "dataplane: peer " + std::to_string(to) + " negotiated wire v" + std::to_string(version) +
+            ", below v" + std::to_string(kFrozenDeletePlanActivationVersion) +
+            " -- it cannot forward frozen pattern-delete plans");
+    auto* conn = impl_->clientFor(to);
+    if (!conn)
+        throw std::runtime_error("dataplane: unknown peer");
+    std::string encoded = control::encodeFrozenDeletePlanRpcRequest(request);
+    seastar::sstring frame(encoded.data(), encoded.size());
+    seastar::sstring reply = deadline ? co_await impl_->frozenDeletePlanTimedStub(*conn, *deadline, frame)
+                                      : co_await impl_->frozenDeletePlanStub(*conn, frame);
+    auto result = control::decodeFrozenDeletePlanRpcResult(std::string(reply.data(), reply.size()));
+    if (!result)
+        throw std::runtime_error("dataplane: malformed frozen delete-plan result");
+    if ((request.operation == control::FrozenDeletePlanRpcOperation::Lookup &&
+         result->status == control::FreezeDeletePlanStatus::Capacity) ||
+        (request.operation == control::FrozenDeletePlanRpcOperation::Freeze &&
+         result->status == control::FreezeDeletePlanStatus::NotFound))
+        throw std::runtime_error("dataplane: invalid frozen delete-plan result for requested operation");
     co_return std::move(*result);
 }
 

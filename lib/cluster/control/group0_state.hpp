@@ -82,6 +82,21 @@ struct FrozenDeletePlan {
     friend bool operator==(const FrozenDeletePlan&, const FrozenDeletePlan&) = default;
 };
 
+enum class FreezeDeletePlanStatus : uint8_t {
+    Stored = 0,
+    NotFound = 1,
+    NotLeader = 2,
+    Conflict = 3,
+    Capacity = 4,
+    FormatInactive = 5,
+    Invalid = 6
+};
+
+struct FreezeDeletePlanResult {
+    FreezeDeletePlanStatus status = FreezeDeletePlanStatus::Invalid;
+    FrozenDeletePlan plan;
+};
+
 inline constexpr size_t kMaxFrozenDeletePlanTargets = 10'000;
 inline constexpr size_t kMaxFrozenDeletePlanBytes = 512u << 10;
 inline constexpr size_t kMaxFrozenDeletePlans = 1'024;

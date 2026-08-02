@@ -3,6 +3,7 @@
 #include "../../core/placement_table.hpp"  // virtualShard
 #include "../../core/vshard.hpp"           // assignCore
 #include "../../utils/logger.hpp"          // timestar::http_log
+#include "../control/group0_controller.hpp"
 #include "../data/dataplane_rpc.hpp"
 #include "../data/journal_format.hpp"
 #include "../data/leader_filtered_node_store.hpp"
@@ -125,7 +126,9 @@ struct DataPlaneTls {
 // One shard's slice of the replicated data plane: a full ReplicatedDataPlane holding
 // only the VShards this shard owns. Constructed on every shard via
 // seastar::sharded<ShardRaftPlane>, so each reactor ticks only its own groups.
-class ShardRaftPlane : public data::ProposeSink, public data::ReadIndexSink {
+class ShardRaftPlane : public data::ProposeSink,
+                       public data::ReadIndexSink,
+                       public data::FrozenDeletePlanSink {
 public:
     seastar::future<> init(seastar::sharded<Engine>* engines, seastar::sharded<ShardRaftPlane>* peers,
                            const data::VShardDirectory* dir, data::NodeId self, std::string journalRoot,
@@ -262,10 +265,39 @@ public:
         rpc_->setLocalVersion(localVersion);
         rpc_->setProposeSink(*this);
         rpc_->setReadIndexSink(*this);
+        rpc_->setFrozenDeletePlanSink(*this);
         return rpc_->start(local, *queryStore_, /*perShardListener=*/true);
     }
 
     void addDataPeer(data::NodeId id, seastar::socket_address addr) { rpc_->addPeer(id, addr); }
+
+    seastar::future<control::FreezeDeletePlanResult> forwardFrozenDeletePlan(
+        data::NodeId leader, control::FrozenDeletePlanRpcRequest request,
+        data::OptDeadline deadline = std::nullopt) {
+        return rpc_->frozenDeletePlan(leader, std::move(request), deadline);
+    }
+
+    // A control request may land on any reactor because the data-plane listener
+    // distributes accepted connections. Hop to shard 0, then consult/propose to
+    // the dedicated group-0 host there.
+    seastar::future<control::FreezeDeletePlanResult> handleFrozenDeletePlan(
+        control::FrozenDeletePlanRpcRequest request) override {
+        if (seastar::this_shard_id() != 0) {
+            auto* peers = peers_;
+            co_return co_await peers->invoke_on(
+                0, [request = std::move(request)](ShardRaftPlane& plane) mutable {
+                    return plane.handleFrozenDeletePlan(std::move(request));
+                });
+        }
+        if (!group0_ || !group0_->group() || !group0_->stateMachine())
+            co_return control::FreezeDeletePlanResult{control::FreezeDeletePlanStatus::NotLeader, {}};
+        control::Group0Controller controller(*group0_->group(), *group0_->stateMachine());
+        if (request.operation == control::FrozenDeletePlanRpcOperation::Lookup)
+            co_return controller.lookupDeletePlan(request.plan);
+        co_return co_await controller.freezeDeletePlan(
+            std::move(request.plan),
+            seastar::lowres_clock::now() + data::ReplicatedBatchWriteRouter::kAttemptTimeout);
+    }
 
     // ProposeSink: a peer forwarded a batch because this NODE leads those VShards. The
     // connection landed on whichever shard the kernel gave it, which is unrelated to

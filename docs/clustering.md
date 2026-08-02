@@ -599,9 +599,11 @@ complete quorum-fenced catalog expansion in group 0, keyed by the original
 request body and timestamp, before any data-group proposal. Retries look up the
 snapshot-durable plan before rediscovery, so new matching series cannot join an
 ambiguous retry. The group-0 command/snapshot feature is gated at cluster format
-v6. Until production can originate that activation and forward requests to the
-current group-0 leader, this path remains fail-closed or retryable rather than
-silently degrading.
+v6. A follower forwards plan lookup/freeze to the reported group-0 leader over
+the v6 peer protocol; the RPC and leader quorum-apply wait are bounded, and an
+ambiguous timeout is safely retryable through lookup-first recovery. Until
+production can originate v6 activation, this path remains fail-closed rather
+than silently degrading.
 
 For writes, idempotency means *replica convergence*, not retry-invisibility across
 intervening operations: a retried write is a new log entry and can reappear after

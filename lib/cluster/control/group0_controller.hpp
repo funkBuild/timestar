@@ -9,25 +9,12 @@
 #include <cstdint>
 #include <map>
 #include <seastar/core/future.hh>
+#include <seastar/core/lowres_clock.hh>
+#include <optional>
 #include <string>
 #include <vector>
 
 namespace timestar::control {
-
-enum class FreezeDeletePlanStatus : uint8_t {
-    Stored,
-    NotFound,
-    NotLeader,
-    Conflict,
-    Capacity,
-    FormatInactive,
-    Invalid
-};
-
-struct FreezeDeletePlanResult {
-    FreezeDeletePlanStatus status = FreezeDeletePlanStatus::Invalid;
-    FrozenDeletePlan plan;
-};
 
 // Orchestrates the group-0 control plane on top of its RaftGroup: the bootstrap
 // ceremony, node admission, self-managed meta-voter membership (via joint
@@ -94,7 +81,9 @@ public:
     // this exact entry is quorum committed and applied on this controller;
     // false means it was rejected before append because this node was not leader.
     // Leadership loss after append is an ambiguous outcome and throws.
-    seastar::future<bool> proposeCommand(ControlCommand cmd);
+    seastar::future<bool> proposeCommand(
+        ControlCommand cmd,
+        std::optional<seastar::lowres_clock::time_point> deadline = std::nullopt);
 
     // Activate wire/storage format `version` only when identity-keyed
     // capabilities cover both the current stable group-0 voters and the union of
@@ -108,7 +97,9 @@ public:
     // Freeze a complete canonical pattern expansion in one group-0 entry before
     // any data-group proposal. A same-request retry returns the first stored
     // target vector even if a fresh catalog read found different series.
-    seastar::future<FreezeDeletePlanResult> freezeDeletePlan(FrozenDeletePlan candidate);
+    seastar::future<FreezeDeletePlanResult> freezeDeletePlan(
+        FrozenDeletePlan candidate,
+        std::optional<seastar::lowres_clock::time_point> deadline = std::nullopt);
 
     // Consult an already-frozen plan before repeating catalog discovery. The
     // request identity carries an empty target vector; NotFound authorizes the

@@ -350,9 +350,10 @@ the same partial-merge code once more over node partials.
   created series. The implemented replacement takes a quorum-fenced catalog
   view, freezes the whole bounded canonical expansion in group 0 before any data
   proposal, and consults that snapshot-durable plan before rediscovery on retry.
-  It is separately gated at cluster format v6. Production activation, group-0
-  request forwarding, and the external pattern failover/restart gate remain
-  release blockers.
+  It is separately gated at cluster format v6. Follower nodes forward plan
+  lookup/freeze to the reported group-0 leader over a bounded v6 peer RPC, and
+  the leader's quorum-apply wait is bounded too. Production activation and the
+  external pattern failover/restart gate remain release blockers.
 
 ### Subscribe guard + operator surface
 

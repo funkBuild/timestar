@@ -21,6 +21,7 @@
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/sleep.hh>
 #include <seastar/core/thread.hh>
+#include <seastar/core/timed_out_error.hh>
 #include <seastar/net/dns.hh>
 #include <seastar/net/inet_address.hh>
 #include <set>
@@ -1291,8 +1292,41 @@ seastar::future<std::vector<data::DeleteRangeTarget>> ClusterDataPlane::freezeDe
         throw data::WriteFrameTooLargeError(
             "pattern delete expansion exceeds the bounded group-0 plan entry");
 
-    control::Group0Controller controller(*host->group(), *host->stateMachine());
-    control::FreezeDeletePlanResult result = co_await controller.freezeDeletePlan(std::move(candidate));
+    control::FreezeDeletePlanResult result;
+    try {
+        if (host->group()->isLeader()) {
+            control::Group0Controller controller(*host->group(), *host->stateMachine());
+            result = co_await controller.freezeDeletePlan(
+                std::move(candidate),
+                seastar::lowres_clock::now() + data::ReplicatedBatchWriteRouter::kAttemptTimeout);
+        } else {
+            const data::NodeId leader = host->group()->leader();
+            if (leader == raft::kNoNode || leader == host->group()->node().id())
+                result = {control::FreezeDeletePlanStatus::NotLeader, {}};
+            else
+                result = co_await shards_.local().forwardFrozenDeletePlan(
+                    leader,
+                    control::FrozenDeletePlanRpcRequest{
+                        control::FrozenDeletePlanRpcOperation::Freeze, std::move(candidate)},
+                    seastar::rpc::rpc_clock_type::now() +
+                        data::ReplicatedBatchWriteRouter::kAttemptTimeout);
+        }
+    } catch (const data::ClusterFormatUnsupportedError&) {
+        throw;
+    } catch (const seastar::timed_out_error&) {
+        // The group-0 entry may still commit after the local waiter expires, but
+        // no data-group proposal has started. The retry's lookup-first path will
+        // recover that exact plan, so this is safely retryable rather than an
+        // unbounded request or a generic 500.
+        throw data::RetryableWriteError(
+            "group-0 delete-plan proposal timed out and may have committed; retry the same request identity");
+    } catch (const raft::LeadershipLostError&) {
+        throw data::RetryableWriteError(
+            "group-0 leadership changed while freezing the delete plan; retry the same request identity");
+    } catch (const std::exception& e) {
+        throw data::RetryableWriteError(
+            "could not reach the group-0 leader to freeze the delete plan: " + std::string(e.what()));
+    }
     switch (result.status) {
         case control::FreezeDeletePlanStatus::Stored: {
             std::vector<data::DeleteRangeTarget> frozen;
@@ -1304,7 +1338,7 @@ seastar::future<std::vector<data::DeleteRangeTarget>> ClusterDataPlane::freezeDe
         }
         case control::FreezeDeletePlanStatus::NotLeader:
             throw data::RetryableWriteError(
-                "pattern delete must be retried through the current group-0 leader");
+                "the current group-0 leader could not freeze the pattern-delete plan; retry shortly");
         case control::FreezeDeletePlanStatus::Conflict:
             throw data::DeletePlanConflictError(
                 "Idempotency-Key is already bound to a different retained delete request");
@@ -1342,8 +1376,29 @@ seastar::future<std::optional<std::vector<data::DeleteRangeTarget>>> ClusterData
     request.requestId = requestId.toHex();
     request.requestFingerprint = requestFingerprint.toHex();
     request.issuedAtMs = issuedAtMs;
-    control::Group0Controller controller(*host->group(), *host->stateMachine());
-    control::FreezeDeletePlanResult result = controller.lookupDeletePlan(request);
+    control::FreezeDeletePlanResult result;
+    try {
+        if (host->group()->isLeader()) {
+            control::Group0Controller controller(*host->group(), *host->stateMachine());
+            result = controller.lookupDeletePlan(request);
+        } else {
+            const data::NodeId leader = host->group()->leader();
+            if (leader == raft::kNoNode || leader == host->group()->node().id())
+                result = {control::FreezeDeletePlanStatus::NotLeader, {}};
+            else
+                result = co_await shards_.local().forwardFrozenDeletePlan(
+                    leader,
+                    control::FrozenDeletePlanRpcRequest{
+                        control::FrozenDeletePlanRpcOperation::Lookup, std::move(request)},
+                    seastar::rpc::rpc_clock_type::now() +
+                        data::ReplicatedBatchWriteRouter::kAttemptTimeout);
+        }
+    } catch (const data::ClusterFormatUnsupportedError&) {
+        throw;
+    } catch (const std::exception& e) {
+        throw data::RetryableWriteError(
+            "could not reach the group-0 leader to look up the delete plan: " + std::string(e.what()));
+    }
     switch (result.status) {
         case control::FreezeDeletePlanStatus::Stored: {
             std::vector<data::DeleteRangeTarget> frozen;
@@ -1357,7 +1412,7 @@ seastar::future<std::optional<std::vector<data::DeleteRangeTarget>>> ClusterData
             co_return std::nullopt;
         case control::FreezeDeletePlanStatus::NotLeader:
             throw data::RetryableWriteError(
-                "pattern delete must be retried through the current group-0 leader");
+                "the current group-0 leader could not serve the pattern-delete plan lookup; retry shortly");
         case control::FreezeDeletePlanStatus::Conflict:
             throw data::DeletePlanConflictError(
                 "Idempotency-Key is already bound to a different retained delete request");

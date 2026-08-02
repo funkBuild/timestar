@@ -1,5 +1,6 @@
 #pragma once
 
+#include "../control/control_command.hpp"
 #include "../features/feature_gate.hpp"  // VersionRange
 #include "data_plane.hpp"
 #include "node_store.hpp"
@@ -12,6 +13,13 @@
 #include <seastar/rpc/rpc_types.hh>  // rpc_clock_type
 
 namespace timestar::data {
+
+class FrozenDeletePlanSink {
+public:
+    virtual ~FrozenDeletePlanSink() = default;
+    virtual seastar::future<control::FreezeDeletePlanResult> handleFrozenDeletePlan(
+        control::FrozenDeletePlanRpcRequest request) = 0;
+};
 
 // OptDeadline (node_store.hpp): a wall-clock point past which an awaited data-plane RPC
 // must give up. std::nullopt = no timeout, the pre-3f behaviour, kept for callers with no
@@ -82,6 +90,11 @@ public:
     seastar::future<MetadataResult> queryMetadata(NodeId to, MetadataRequest req) override;
     seastar::future<PatternSeriesResult> findPatternSeries(NodeId to, PatternSeriesRequest req,
                                                            OptDeadline deadline = std::nullopt) override;
+    // Version-6 request forwarding to the peer believed to lead group 0. The
+    // deadline bounds negotiation and the waited request/reply exchange.
+    seastar::future<control::FreezeDeletePlanResult> frozenDeletePlan(
+        NodeId to, control::FrozenDeletePlanRpcRequest request,
+        OptDeadline deadline = std::nullopt);
     seastar::future<bool> proposeWrite(NodeId to, WriteBatch batch) override;
     // The production remote propose (write-scaleout 3a/3b): borrows the caller's groups
     // (no merge allocation, and the caller keeps them so it can retry the failed ones)
@@ -101,6 +114,7 @@ public:
     // into (M4 replica reads). Must be set before a peer sends them; outlives the
     // transport.
     void setReadIndexSink(ReadIndexSink& sink);
+    void setFrozenDeletePlanSink(FrozenDeletePlanSink& sink);
 
     // M4 replica-read leader-reach client calls: confirm a linearizable ReadIndex /
     // fetch the commit index for `vshard` at peer `to` (which must be its leader). The

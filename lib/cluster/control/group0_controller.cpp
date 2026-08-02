@@ -18,14 +18,15 @@ bool sameNodeIdentity(const NodeRecord& a, const NodeRecord& b) {
 
 }  // namespace
 
-seastar::future<bool> Group0Controller::proposeCommand(ControlCommand cmd) {
+seastar::future<bool> Group0Controller::proposeCommand(
+    ControlCommand cmd, std::optional<seastar::lowres_clock::time_point> deadline) {
     if (!g0_.isLeader())
         co_return false;
     // A control-plane success is a published cluster decision, not merely a
     // local log append. In particular, callers use this return as the format
     // activation and placement-policy fence. Resolve only after this exact
     // entry is quorum committed and applied on the controller.
-    co_return co_await g0_.proposeAndAwaitApplied(encodeCommand(cmd));
+    co_return co_await g0_.proposeAndAwaitApplied(encodeCommand(cmd), deadline);
 }
 
 seastar::future<bool> Group0Controller::activateFormat(
@@ -57,7 +58,8 @@ seastar::future<bool> Group0Controller::activateFormat(
     co_return sm_.state().activeFormatVersion >= version;
 }
 
-seastar::future<FreezeDeletePlanResult> Group0Controller::freezeDeletePlan(FrozenDeletePlan candidate) {
+seastar::future<FreezeDeletePlanResult> Group0Controller::freezeDeletePlan(
+    FrozenDeletePlan candidate, std::optional<seastar::lowres_clock::time_point> deadline) {
     if (!g0_.isLeader())
         co_return FreezeDeletePlanResult{FreezeDeletePlanStatus::NotLeader, {}};
     if (sm_.state().activeFormatVersion < data::kFrozenDeletePlanActivationVersion)
@@ -75,7 +77,7 @@ seastar::future<FreezeDeletePlanResult> Group0Controller::freezeDeletePlan(Froze
         !frozenDeletePlanExpiredAt(found->second, candidate.issuedAtMs))
         co_return classifyExisting(found->second);
 
-    if (!co_await proposeCommand(StoreFrozenDeletePlan{candidate}))
+    if (!co_await proposeCommand(StoreFrozenDeletePlan{candidate}, deadline))
         co_return FreezeDeletePlanResult{FreezeDeletePlanStatus::NotLeader, {}};
 
     // A racing controller/request may have won the same key. Inspect the

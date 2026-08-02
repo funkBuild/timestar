@@ -68,9 +68,11 @@ with a different body or original timestamp returns `409` with
 One pattern plan is limited to 10,000 exact target/range triples and 512 KiB.
 Group 0 retains at most 1,024 plans and 16 MiB total for the one-hour retry
 window plus allowed clock skew. A full plan budget returns retryable `503` before
-any data proposal. Plan lookup and freeze currently execute only on the node
-that locally leads group 0; sending the request to another node also returns
-retryable `503` because control-request forwarding is not yet implemented.
+any data proposal. A node that does not lead group 0 forwards plan lookup/freeze
+to the leader over the version-6 peer protocol. Leader discovery, the RPC, and
+the quorum-apply wait are bounded; a missing or changing leader and an ambiguous
+timeout return retryable `503`. Retry with the same identity so lookup can
+recover a plan that committed after the timeout.
 
 ## Delete by Structured Query
 
@@ -90,8 +92,9 @@ curl -X POST http://localhost:8086/delete \
 
 Use `fields`, or omit both `field` and `fields`, to select more than one exact
 series. Tags act as filters. In partitioned cluster mode this form requires the
-same idempotency headers, committed format v6, and routing to the current local
-group-0 leader as described above.
+same idempotency headers and committed format v6; any node may receive it and
+will forward the plan operation to the current group-0 leader as described
+above.
 
 ```bash
 curl -X POST http://localhost:8086/delete \

@@ -104,6 +104,13 @@ struct SetInitialServingMap {
     ControlMap map;
 };
 
+enum class FrozenDeletePlanRpcOperation : uint8_t { Lookup = 0, Freeze = 1 };
+
+struct FrozenDeletePlanRpcRequest {
+    FrozenDeletePlanRpcOperation operation = FrozenDeletePlanRpcOperation::Lookup;
+    FrozenDeletePlan plan;
+};
+
 using ControlCommand =
     std::variant<InitCluster, UpsertNode, SetNodeState, SetDesiredPlacement, SetMetaVoters, CasPolicy,
                  SetControllerTerm, UpsertJob, MintJoinToken, AdmitWithToken, StoreFrozenDeletePlan, SetActiveVersion,
@@ -114,5 +121,13 @@ using ControlCommand =
 // trailing input. One Raft entry must contain exactly one command.
 std::string encodeCommand(const ControlCommand& cmd);
 std::optional<ControlCommand> decodeCommand(const std::string& bytes);
+
+// Version-6 peer request/reply frames used only to reach the current group-0
+// leader. They reuse the same bounded plan fields as command tag 14 but keep a
+// distinct operation byte so lookup can never be mistaken for a mutation.
+std::string encodeFrozenDeletePlanRpcRequest(const FrozenDeletePlanRpcRequest& request);
+std::optional<FrozenDeletePlanRpcRequest> decodeFrozenDeletePlanRpcRequest(const std::string& bytes);
+std::string encodeFrozenDeletePlanRpcResult(const FreezeDeletePlanResult& result);
+std::optional<FreezeDeletePlanResult> decodeFrozenDeletePlanRpcResult(const std::string& bytes);
 
 }  // namespace timestar::control

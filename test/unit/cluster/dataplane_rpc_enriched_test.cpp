@@ -93,6 +93,20 @@ public:
     }
 };
 
+class RecordingFrozenDeletePlanSink : public data::FrozenDeletePlanSink {
+public:
+    int calls = 0;
+    control::FrozenDeletePlanRpcRequest lastRequest;
+    control::FreezeDeletePlanResult response;
+
+    seastar::future<control::FreezeDeletePlanResult> handleFrozenDeletePlan(
+        control::FrozenDeletePlanRpcRequest request) override {
+        ++calls;
+        lastRequest = std::move(request);
+        return seastar::make_ready_future<control::FreezeDeletePlanResult>(response);
+    }
+};
+
 // Minimal legacy DataPoint sink, so a node can be started on the LEGACY path and
 // we can prove an enriched verb sent to it fails cleanly (unknown verb), not hangs.
 class LegacyMemStore : public data::LocalStore {
@@ -1294,6 +1308,80 @@ TEST_F(DataPlaneRpcEnrichedTest, PatternSeriesDiscoveryIsNotSentToAPeerBelowV4) 
             ADD_FAILURE() << "expected PatternSeriesUnsupportedError, got: " << error.what();
         }
         EXPECT_TRUE(refused);
+        EXPECT_EQ(tap.negotiateCalls, 1);
+
+        client.stop().get();
+        tap.stop();
+    }).get();
+}
+
+TEST_F(DataPlaneRpcEnrichedTest, FrozenDeletePlanRequestsCrossTheV6Socket) {
+    seastar::async([] {
+        const uint16_t port = 39384;
+        const data::NodeId self = 1;
+        ThrowingNodeStore store;
+        RecordingFrozenDeletePlanSink sink;
+        data::DataPlaneRpc rpc;
+        rpc.setFrozenDeletePlanSink(sink);
+        rpc.start(loopback(port), store).get();
+        rpc.addPeer(self, loopback(port));
+
+        const control::FrozenDeletePlan identity{
+            std::string(32, '1'), std::string(32, 'a'), 1'800'000'000'000, {}};
+        const control::FrozenDeletePlan frozen{
+            identity.requestId,
+            identity.requestFingerprint,
+            identity.issuedAtMs,
+            {{buildSeriesKey("cpu", {{"host", "a"}}, "usage"), BASE, BASE + 10}}};
+        sink.response = {control::FreezeDeletePlanStatus::Stored, frozen};
+        auto lookup = rpc
+                          .frozenDeletePlan(
+                              self,
+                              {control::FrozenDeletePlanRpcOperation::Lookup, identity},
+                              seastar::rpc::rpc_clock_type::now() + std::chrono::seconds(1))
+                          .get();
+        ASSERT_EQ(sink.calls, 1);
+        EXPECT_EQ(sink.lastRequest.operation, control::FrozenDeletePlanRpcOperation::Lookup);
+        EXPECT_EQ(sink.lastRequest.plan, identity);
+        EXPECT_EQ(lookup.status, control::FreezeDeletePlanStatus::Stored);
+        EXPECT_EQ(lookup.plan, frozen);
+
+        sink.response = {control::FreezeDeletePlanStatus::Conflict, frozen};
+        auto conflict = rpc
+                            .frozenDeletePlan(
+                                self,
+                                {control::FrozenDeletePlanRpcOperation::Freeze, frozen},
+                                seastar::rpc::rpc_clock_type::now() + std::chrono::seconds(1))
+                            .get();
+        ASSERT_EQ(sink.calls, 2);
+        EXPECT_EQ(sink.lastRequest.operation, control::FrozenDeletePlanRpcOperation::Freeze);
+        EXPECT_EQ(sink.lastRequest.plan, frozen);
+        EXPECT_EQ(conflict.status, control::FreezeDeletePlanStatus::Conflict);
+        EXPECT_EQ(conflict.plan, frozen);
+
+        rpc.stop().get();
+    }).get();
+}
+
+TEST_F(DataPlaneRpcEnrichedTest, FrozenDeletePlanIsNotSentToAPeerBelowV6) {
+    seastar::async([] {
+        const uint16_t serverPort = 39384, clientPort = 39385;
+        const data::NodeId peer = 2;
+        WireTapPeer tap(loopback(serverPort), /*agreedVersion=*/5);
+        ThrowingNodeStore store;
+        data::DataPlaneRpc client;
+        client.start(loopback(clientPort), store).get();
+        client.addPeer(peer, loopback(serverPort));
+
+        const control::FrozenDeletePlan identity{
+            std::string(32, '1'), std::string(32, 'a'), 1'800'000'000'000, {}};
+        EXPECT_THROW(client
+                         .frozenDeletePlan(
+                             peer,
+                             {control::FrozenDeletePlanRpcOperation::Lookup, identity},
+                             seastar::rpc::rpc_clock_type::now() + std::chrono::seconds(1))
+                         .get(),
+                     data::ClusterFormatUnsupportedError);
         EXPECT_EQ(tap.negotiateCalls, 1);
 
         client.stop().get();

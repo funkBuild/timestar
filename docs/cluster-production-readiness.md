@@ -12,7 +12,7 @@
 `1f61f49`, `b2c7d0b`, `872f7e1`, `023d9c3`, `d5f4755`, `7f6d7e8`,
 `7760ebd`, `6557666`, `c8f28c8`, `445f1f0`, `8b8536d`, `6912dfb`,
 `ecb63a5`, `a03fe1d`, `8ae846c`, `9ecd0e6`, `66049e7`, `470d14c`,
-`3af373a`, `88c90b0`, `e4b74cb`
+`3af373a`, `88c90b0`, `e4b74cb`, `c8845e6`
 
 **Scope:** The recent VShard/Raft cluster redesign, its production-server
 integration, the public HTTP surface, recovery paths, and the release evidence
@@ -25,13 +25,13 @@ used as evidence that the current server is production-ready.
 
 ## Implementation progress after the review
 
-Forty-nine remediation commits and the current CR-FIX-010 frozen-plan slice are
-now recorded. Cluster release status remains **BLOCKED** because group
-0/movement, group-0 request forwarding and the external pattern-delete
-failover/restart gate, replicated retention, the large-snapshot path, sustained
-live receipt-retirement compaction evidence, and rolling wire-format
-compatibility remain open. The four previously stale live release gates now
-pass on the same executable candidate and no longer block release by themselves.
+Fifty remediation commits and the current CR-FIX-010 group-0 forwarding slice
+are now recorded. Cluster release status remains **BLOCKED** because group
+0/movement and the external pattern-delete failover/restart gate, replicated
+retention, the large-snapshot path, sustained live receipt-retirement
+compaction evidence, and rolling wire-format compatibility remain open. The
+four previously stale live release gates now pass on the same executable
+candidate and no longer block release by themselves.
 
 Completed and covered in this pass:
 
@@ -121,10 +121,12 @@ Completed and covered in this pass:
   by 10,000 targets, 512 KiB per command, 1,024 retained requests, 16 MiB total,
   and the one-hour retry window plus allowed clock skew. Emission is separately
   gated at cluster format v6 so a v5 group-0 voter never sees the new command or
-  snapshot trailer. RF=1 remains unsupported. Production currently serves plan
-  lookup/freeze only on the node that locally leads group 0; another node returns
-  retryable 503 because control-request forwarding is not yet composed. The
-  external multi-process pattern leader-failover/restart gate also remains
+  snapshot trailer. RF=1 remains unsupported. A request received by a group-0
+  follower now forwards lookup/freeze over the version-6 peer RPC to its current
+  leader; negotiation, request/reply, and the leader's quorum-apply wait are
+  bounded. A missing/changing leader or ambiguous timeout returns retryable 503,
+  and the lookup-first retry recovers a plan that committed after the timeout.
+  The external multi-process pattern leader-failover/restart gate remains
   outstanding.
 - Replicated startup now raises a low soft `RLIMIT_NOFILE` to 8,192 when the
   process hard limit permits it and otherwise fails before opening Engine or
@@ -1073,11 +1075,13 @@ is not completion.
   first surviving active revision, advances delete-only snapshots directly, and
   conditionally rolls an active write barrier so the next sweep can compact.
   CR-FIX-065 retains the sustained live workload and journal-reclamation proof.
-  CR-FIX-010 remains open because plan lookup/freeze is currently local to the
-  group-0 leader (a request through another node fails retryably rather than
-  forwarding), and the external multi-process pattern leader-failover/restart
-  gate has not run. `445f1f0`, `8b8536d`, `6912dfb`, `ecb63a5`, `a03fe1d`,
-  `8ae846c` plus the current frozen-plan slice.
+  Plan lookup/freeze received by a follower is now forwarded over the v6 peer
+  protocol to the reported group-0 leader. Both the RPC and the leader's
+  quorum-apply waiter are bounded at 600 ms; an ambiguous timeout is retryable
+  and cannot start a data-group proposal. CR-FIX-010 remains open because the
+  external multi-process pattern leader-failover/restart gate has not run.
+  `445f1f0`, `8b8536d`, `6912dfb`, `ecb63a5`, `a03fe1d`, `8ae846c`, `c8845e6`
+  plus the current forwarding slice.
 - [ ] **CR-FIX-011 — define a self-contained VShard snapshot format.** Owner:
   snapshot/storage. Include catalog/index extract, data objects, tombstone
   objects or a proven materialised-delete boundary, and real content hashes.
@@ -2021,14 +2025,32 @@ and `/tmp` exhaustion seen in an earlier live run. This proves deterministic
 plan identity, first-writer behavior, snapshot recovery, limits, and HTTP
 lookup-first retry behavior; it is not the external RF=3 pattern failover gate.
 
+Group-0 pattern-plan forwarding and proposal-bound validation for the current
+CR-FIX-010 slice:
+
+```text
+RPC request/result codec and quorum-loss deadline regressions: 3/3 passed
+v6 loopback forwarding and pre-v6 refusal socket regressions:  2/2 passed
+timestar_unit_test:                              built successfully (-j1)
+timestar_cluster_socket_test:                    built successfully (-j1)
+all test processes:                                  --smp 1 --memory 1G
+compiler and test temporary directory:                     build/tmp
+git diff --check:                                               passed
+```
+
+No live or multi-process server was started for this validation. The tests prove
+bounded local quorum loss, exact v6 frame transport, fail-closed truncation, and
+pre-v6 refusal without sending the new verb. They do not replace the external
+RF=3 pattern leader-failover/restart gate.
+
 This closes the known exact-delete retry corruption path and bounds modern
 receipt memory, and the frozen group-0 plan closes the known pattern re-expansion
-corruption path, but not CR-FIX-010 as a whole. The production server still
-needs group-0 request forwarding (or an explicit leader redirect) and the
-external multi-process pattern gate; the deterministic exact-delete RF=3
-leader-failure/replica-restart gate already passes. `8ae846c` removes CR-FIX-065's
-known implementation starvation path; the sustained live workload must still
-show that snapshots keep advancing and journal bytes plateau or reclaim.
+corruption path, but not CR-FIX-010 as a whole. The production server now
+forwards pattern-plan control requests; the external multi-process pattern gate
+is still required. The deterministic exact-delete RF=3 leader-failure/replica-
+restart gate already passes. `8ae846c` removes CR-FIX-065's known implementation
+starvation path; the sustained live workload must still show that snapshots
+keep advancing and journal bytes plateau or reclaim.
 CR-FIX-076 remains an activation blocker: `9ecd0e6` prevents unsafe emission and
 false readiness, but production group-0 activation, voter/admission coverage,
 legacy-receipt preflight, downgrade policy, and mixed-binary evidence are still

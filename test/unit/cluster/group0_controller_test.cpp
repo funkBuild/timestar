@@ -14,6 +14,7 @@
 #include <memory>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
+#include <seastar/core/timed_out_error.hh>
 #include <seastar/util/later.hh>
 #include <vector>
 
@@ -505,6 +506,57 @@ seastar::future<> testDeletePlanFreezesFirstExpansion() {
     EXPECT_EQ(nodes[1].sm->state().frozenDeletePlans.at(original.requestId), replacement);
 }
 
+seastar::future<> testDeletePlanProposalDeadlineBoundsQuorumLoss() {
+    Router router;
+    std::vector<std::unique_ptr<RouterTransport>> transports;
+    Nodes nodes;
+    auto makeNode = [&](NodeId id) {
+        transports.push_back(std::make_unique<RouterTransport>(router));
+        NodeBox box;
+        box.persistence = std::make_unique<NoopPersistence>();
+        box.sm = std::make_unique<Group0StateMachine>();
+        RaftNode rn(id, {1, 2, 3}, RaftLog{}, HardState{}, optsFor(id));
+        box.group = std::make_unique<RaftGroup>(0, std::move(rn), *box.persistence,
+                                                *transports.back(), *box.sm);
+        router.setGroup(id, box.group.get());
+        nodes[id] = std::move(box);
+    };
+    makeNode(1);
+    makeNode(2);
+    makeNode(3);
+
+    Group0Controller controller(*nodes[1].group, *nodes[1].sm, 3);
+    co_await nodes[1].group->campaign();
+    co_await router.pump();
+    EXPECT_TRUE(nodes[1].group->isLeader());
+    co_await drive(controller.initCluster("c1", rec(1, "rack-a")), nodes, router);
+    EXPECT_TRUE(co_await drive(controller.publishInitialServingMap(initialServingMap()), nodes, router));
+    EXPECT_TRUE(co_await drive(
+        controller.activateFormat(
+            timestar::data::kFrozenDeletePlanActivationVersion,
+            {{1, {1, timestar::data::kFrozenDeletePlanActivationVersion}},
+             {2, {1, timestar::data::kFrozenDeletePlanActivationVersion}},
+             {3, {1, timestar::data::kFrozenDeletePlanActivationVersion}}}),
+        nodes, router));
+
+    // Leave node 1 believing it is leader, but make its next entry unable to
+    // reach either follower. Group 0 intentionally does not use CheckQuorum,
+    // so the explicit proposal deadline is what bounds this request.
+    router.setGroup(2, nullptr);
+    router.setGroup(3, nullptr);
+    bool timedOut = false;
+    try {
+        (void)co_await controller.freezeDeletePlan(
+            frozenPlan('1', 'a', {{"m,host=a value", 10, 20}}),
+            seastar::lowres_clock::now() + std::chrono::milliseconds(20));
+    } catch (const seastar::timed_out_error&) {
+        timedOut = true;
+    }
+    EXPECT_TRUE(timedOut) << "a quorum-lost group-0 leader must not retain an unbounded request waiter";
+    EXPECT_TRUE(nodes[1].sm->state().frozenDeletePlans.empty())
+        << "an uncommitted timed-out proposal must not become a visible frozen plan";
+}
+
 }  // namespace
 
 TEST(Group0ControllerTest, FormatActivationGatedByVoterSupport) {
@@ -525,4 +577,8 @@ TEST(Group0ControllerTest, ReadBarrierReconcilesControlMap) {
 
 TEST(Group0ControllerTest, DeletePlanFreezesFirstExpansion) {
     testDeletePlanFreezesFirstExpansion().get();
+}
+
+TEST(Group0ControllerTest, DeletePlanProposalDeadlineBoundsQuorumLoss) {
+    testDeletePlanProposalDeadlineBoundsQuorumLoss().get();
 }

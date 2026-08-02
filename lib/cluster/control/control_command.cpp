@@ -1,6 +1,7 @@
 #include "control_command.hpp"
 
 #include <limits>
+#include <stdexcept>
 
 namespace timestar::control {
 
@@ -379,6 +380,68 @@ std::optional<ControlCommand> decodeCommand(const std::string& bytes) {
     if (!r.ok || r.p != r.end)
         return std::nullopt;
     return cmd;
+}
+
+std::string encodeFrozenDeletePlanRpcRequest(const FrozenDeletePlanRpcRequest& request) {
+    if (!validFrozenDeletePlan(request.plan) ||
+        (request.operation == FrozenDeletePlanRpcOperation::Lookup && !request.plan.targets.empty()) ||
+        (request.operation != FrozenDeletePlanRpcOperation::Lookup &&
+         request.operation != FrozenDeletePlanRpcOperation::Freeze))
+        throw std::invalid_argument("invalid frozen delete-plan RPC request");
+    Writer w;
+    w.u8(static_cast<uint8_t>(request.operation));
+    writeFrozenDeletePlan(w, request.plan);
+    return std::move(w.out);
+}
+
+std::optional<FrozenDeletePlanRpcRequest> decodeFrozenDeletePlanRpcRequest(const std::string& bytes) {
+    // Reject an over-budget frame before Reader materialises attacker-sized
+    // strings. The RPC admission bound protects the process globally; this
+    // tighter protocol bound protects this one 512-KiB control operation.
+    if (bytes.size() > kMaxFrozenDeletePlanBytes)
+        return std::nullopt;
+    Reader r{bytes.data(), bytes.data() + bytes.size()};
+    const uint8_t operation = r.u8();
+    FrozenDeletePlanRpcRequest request;
+    if (operation > static_cast<uint8_t>(FrozenDeletePlanRpcOperation::Freeze))
+        return std::nullopt;
+    request.operation = static_cast<FrozenDeletePlanRpcOperation>(operation);
+    request.plan = readFrozenDeletePlan(r);
+    if (!r.ok || r.p != r.end || !validFrozenDeletePlan(request.plan) ||
+        (request.operation == FrozenDeletePlanRpcOperation::Lookup && !request.plan.targets.empty()))
+        return std::nullopt;
+    return request;
+}
+
+std::string encodeFrozenDeletePlanRpcResult(const FreezeDeletePlanResult& result) {
+    const bool carriesPlan = result.status == FreezeDeletePlanStatus::Stored ||
+                             result.status == FreezeDeletePlanStatus::Conflict;
+    if (result.status > FreezeDeletePlanStatus::Invalid ||
+        (carriesPlan ? !validFrozenDeletePlan(result.plan) : result.plan != FrozenDeletePlan{}))
+        throw std::invalid_argument("invalid frozen delete-plan RPC result");
+    Writer w;
+    w.u8(static_cast<uint8_t>(result.status));
+    if (carriesPlan)
+        writeFrozenDeletePlan(w, result.plan);
+    return std::move(w.out);
+}
+
+std::optional<FreezeDeletePlanResult> decodeFrozenDeletePlanRpcResult(const std::string& bytes) {
+    if (bytes.size() > kMaxFrozenDeletePlanBytes)
+        return std::nullopt;
+    Reader r{bytes.data(), bytes.data() + bytes.size()};
+    const uint8_t status = r.u8();
+    if (status > static_cast<uint8_t>(FreezeDeletePlanStatus::Invalid))
+        return std::nullopt;
+    FreezeDeletePlanResult result;
+    result.status = static_cast<FreezeDeletePlanStatus>(status);
+    const bool carriesPlan = result.status == FreezeDeletePlanStatus::Stored ||
+                             result.status == FreezeDeletePlanStatus::Conflict;
+    if (carriesPlan)
+        result.plan = readFrozenDeletePlan(r);
+    if (!r.ok || r.p != r.end || (carriesPlan && !validFrozenDeletePlan(result.plan)))
+        return std::nullopt;
+    return result;
 }
 
 }  // namespace timestar::control
