@@ -293,7 +293,15 @@ void set_routes(routes& r) {
                           ",\"control_controller_stamp_proposals\":" +
                           std::to_string(st.controlControllerStampProposals) +
                           ",\"control_controller_actuation_failures\":" +
-                          std::to_string(st.controlControllerActuationFailures);
+                          std::to_string(st.controlControllerActuationFailures) +
+                          ",\"control_capabilities_complete\":" +
+                          std::string(st.controlCapabilitiesComplete ? "true" : "false") +
+                          ",\"control_identity_conflict\":" +
+                          std::string(st.controlIdentityConflict ? "true" : "false") +
+                          ",\"control_capabilities_observed\":" +
+                          std::to_string(st.controlCapabilitiesObserved) +
+                          ",\"control_capability_failures\":" +
+                          std::to_string(st.controlCapabilityFailures);
                   }
                   body += "}";
                   rep->_content = std::move(body);

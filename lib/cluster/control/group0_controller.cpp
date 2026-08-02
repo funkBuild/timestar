@@ -56,6 +56,13 @@ seastar::future<bool> Group0Controller::activateFormat(
     std::vector<features::VersionRange> ranges;
     ranges.reserve(required.size());
     for (raft::NodeId voter : required) {
+        // Capability alone is not delivery. A fresh production node starts as
+        // an observer and does not receive committed group-0 entries, so raising
+        // the cluster format before it is at least a learner can leave its local
+        // emission/readiness gate at v1 forever. Membership is the delivery
+        // precondition; decoder support remains the wire-safety precondition.
+        if (!config.isVoter(voter) && !config.isLearner(voter))
+            co_return false;
         auto capability = nodeVersions.find(voter);
         if (capability == nodeVersions.end())
             co_return false;

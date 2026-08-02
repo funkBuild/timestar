@@ -257,6 +257,8 @@ TEST(WriteAdmissionTest, EveryAdvertiserOffersTheNewestSupportedWireVersion) {
         << "the bounded-delete command and Expired-outcome gate";
     EXPECT_GE(data::kWriteBatchFormatMax, data::kFrozenDeletePlanActivationVersion)
         << "the group-0 frozen pattern-delete command and snapshot gate";
+    EXPECT_GE(data::kWriteBatchFormatMax, data::kWriteBatchFormatV7)
+        << "the identity-bound capability protocol gate";
 }
 
 // A CAPABILITY GATE IS A HISTORICAL FACT AND MUST NOT MOVE (debt D-25).

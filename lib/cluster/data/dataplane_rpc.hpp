@@ -11,8 +11,14 @@
 #include <seastar/core/future.hh>
 #include <seastar/net/socket_defs.hh>
 #include <seastar/rpc/rpc_types.hh>  // rpc_clock_type
+#include <stdexcept>
 
 namespace timestar::data {
+
+class NodeCapabilityMismatchError : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
 
 class FrozenDeletePlanSink {
 public:
@@ -95,6 +101,12 @@ public:
     seastar::future<control::FreezeDeletePlanResult> frozenDeletePlan(
         NodeId to, control::FrozenDeletePlanRpcRequest request,
         OptDeadline deadline = std::nullopt);
+    // Version-7 exact capability probe. Unlike negotiateVersion(), this returns
+    // the responder's persistent/cluster identity and full supported range. The
+    // request names the expected Raft id and the client rejects a reply from a
+    // different identity with NodeCapabilityMismatchError.
+    seastar::future<control::NodeCapabilityAdvertisement> nodeCapability(
+        NodeId to, OptDeadline deadline = std::nullopt);
     seastar::future<bool> proposeWrite(NodeId to, WriteBatch batch) override;
     // The production remote propose (write-scaleout 3a/3b): borrows the caller's groups
     // (no merge allocation, and the caller keeps them so it can retry the failed ones)
@@ -115,6 +127,10 @@ public:
     // transport.
     void setReadIndexSink(ReadIndexSink& sink);
     void setFrozenDeletePlanSink(FrozenDeletePlanSink& sink);
+
+    // Identity advertised by the v7 capability verb. The supported range is
+    // read from setLocalVersion() at reply time so the two cannot drift.
+    void setLocalNodeCapability(std::string clusterUuid, control::NodeRecord record);
 
     // M4 replica-read leader-reach client calls: confirm a linearizable ReadIndex /
     // fetch the commit index for `vshard` at peer `to` (which must be its leader). The

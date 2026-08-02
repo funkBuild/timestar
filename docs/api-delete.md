@@ -18,8 +18,10 @@ before any Raft proposal with HTTP `409` and JSON code
 `CLUSTER_FORMAT_NOT_ACTIVE`. The server can now opt into a persistent group-0
 host, and an already committed activation is published to every reactor-local
 data gate before group 0 advances its applied boundary. No production path can
-yet safely originate activation because data-voter capability collection and
-legacy receipt preflight are incomplete. Pattern plans also require v6. These
+yet safely originate activation: exact v7 identity/full-range collection now
+covers the static data voters and activation refuses observers that are not
+group-0 members, but join orchestration and the legacy-receipt preflight
+actuator are incomplete. Pattern plans also require v6. These
 operations are therefore intentionally unavailable in the current production
 composition and cluster readiness remains false; do not deploy them as a
 production delete path.

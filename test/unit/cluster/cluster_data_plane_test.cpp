@@ -109,7 +109,14 @@ TEST_F(ClusterDataPlaneTest, ControlHealthIsVisibleWithoutBlockingExistingDataGr
     st.controlControllerLeader = 1;
     st.controlControllerTerm = 7;
     st.controlCurrentTermCommit = true;
+    st.controlCapabilitiesComplete = true;
     EXPECT_TRUE(st.controlLocallyReady());
+
+    st.controlIdentityConflict = true;
+    EXPECT_FALSE(st.controlLocallyReady());
+    EXPECT_FALSE(st.readyForTraffic());
+    EXPECT_NE(st.readinessReason().find("conflicting persistent cluster identity"), std::string::npos);
+    st.controlIdentityConflict = false;
 
     st.controlControllerTerm = 6;
     EXPECT_FALSE(st.controlLocallyReady()) << "a leader is not actuating until its Raft term is durably stamped";

@@ -952,9 +952,11 @@ gate is committed.
 
 The implemented ordered capability line currently reserves v2 for self-contained
 snapshot payloads, v3 for legacy durable delete receipts, v4 for node-query
-redirects, and v5 for bounded delete command tag 5, snapshot payload v4, and the
-typed `Expired` proposal result. Emission fails closed: snapshots require at least
-v2, and bounded deletes require both committed format v5 and peer protocol v5.
+redirects, v5 for bounded delete command tag 5, snapshot payload v4, and the
+typed `Expired` proposal result, v6 for frozen pattern-delete plans, and v7 for
+the exact identity/full-range capability RPC. Emission fails closed: snapshots
+require at least v2, and bounded deletes require both committed format v5 and
+peer protocol v5.
 Decoders continue to read historical formats regardless of the active emission
 gate. `/cluster/status` reports `active_cluster_format` and
 `snapshot_format_ready`; `/health` is not ready below snapshot format v2.
@@ -965,13 +967,17 @@ a persistent group-0 host and explicitly initialize its one-voter seed with
 now published to every reactor-local data gate before group 0 advances its applied
 boundary. The controller and command now require identity-keyed capability
 coverage of the stable meta-voters plus every voter in the committed serving
-map, but no production path collects that proof or preflights legacy receipt
-counts, so none originates an activation.
-Fresh observers also lack a seed/join RPC. Static placement remains authoritative
+map. Production now collects a v7 advertisement from every configured peer,
+binding cluster UUID, expected Raft id/address, persistent node UUID, and the
+full range under one bounded fan-out. It reports incomplete/transient collection
+separately from permanent identity conflict. Activation nevertheless refuses a
+covered node until it is a group-0 voter or learner: capability is not proof that
+an observer receives the committed decision.
+Fresh observers still lack a seed/join RPC. Static placement remains authoritative
 and a fresh data plane remains at format v1, so snapshot production and bounded
 deletes are refused and readiness stays false. Production enablement still
-requires an identity-bound capability collector (including join admission), the
-receipt preflight, and mixed-binary tests.
+requires join admission plus the activation/legacy-receipt preflight actuator
+and mixed-binary tests.
 
 Format activation is monotonic. Once version N is committed, a binary whose
 maximum supported version is below N must not start against that node data and a

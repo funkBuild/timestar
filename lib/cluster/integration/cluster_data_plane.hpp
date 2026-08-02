@@ -344,6 +344,10 @@ public:
         uint64_t controlJournalSegmentsDeleted = 0;
         uint64_t controlControllerStampProposals = 0;
         uint64_t controlControllerActuationFailures = 0;
+        bool controlCapabilitiesComplete = false;
+        bool controlIdentityConflict = false;
+        size_t controlCapabilitiesObserved = 0;
+        uint64_t controlCapabilityFailures = 0;
 
         // This is intentionally LOCAL readiness, not a quorum-health claim.
         // With CheckQuorum disabled an isolated former leader can retain its role;
@@ -352,6 +356,7 @@ public:
             if (!controlEnabled)
                 return true;
             return controlHosted && controlInitialized && controlServingMapEpoch != 0 &&
+                   controlCapabilitiesComplete && !controlIdentityConflict &&
                    controlLeader != raft::kNoNode && controlControllerTerm == controlTerm &&
                    controlControllerLeader == controlLeader && controlCurrentTermCommit && controlApplyLagEntries == 0 &&
                    controlApplyFailures == 0 && controlTickErrors == 0 && controlMaintenanceFailures == 0 &&
@@ -360,6 +365,8 @@ public:
 
         [[nodiscard]] bool readyForTraffic() const {
             if (unresolvedPeerCount != 0)
+                return false;
+            if (controlIdentityConflict)
                 return false;
             if (!replicated)
                 return true;
@@ -371,6 +378,8 @@ public:
         [[nodiscard]] std::string readinessReason() const {
             if (unresolvedPeerCount != 0)
                 return std::to_string(unresolvedPeerCount) + " configured peer(s) are unresolved";
+            if (controlIdentityConflict)
+                return "configured nodes advertise a conflicting persistent cluster identity";
             if (!replicated)
                 return {};
             if (vshardsHostedHere == 0)
@@ -397,6 +406,12 @@ public:
         }
     };
     seastar::future<Status> status() const;
+
+    // One bounded, all-peer identity/capability collection. Production refreshes
+    // this periodically; exposing the operation keeps the exact validation seam
+    // testable without waiting for a timer.
+    seastar::future<std::map<NodeId, control::NodeCapabilityAdvertisement>> collectControlCapabilities(
+        data::OptDeadline deadline = std::nullopt);
 
     // Fail startup before accepting traffic when the configured reactor count
     // cannot produce complete single-core VShard snapshots.
@@ -467,6 +482,8 @@ private:
     // coroutine frame the gate keeps alive -- see startPeerResolver.
     seastar::future<> resolvePendingPeers(bool replicated);
     void startPeerResolver(bool replicated);
+    seastar::future<> refreshControlCapabilities();
+    void startControlCapabilityCollector();
 
     std::optional<ClusterRuntime> rt_;
     seastar::sharded<Engine>* enginesPtr_ = nullptr;
@@ -474,6 +491,10 @@ private:
     std::optional<DataPlaneTls> tls_;
     std::optional<JournalIdentity> journalIdentity_;
     std::optional<control::NodeRecord> group0Identity_;
+    // ClusterRuntime intentionally contains only derived placement. Retain the
+    // exact configured identity separately for capability validation; UUID
+    // comparisons are byte-exact so a probe cannot silently cross clusters.
+    std::string controlClusterUuid_;
     bool group0BootstrapRequested_ = false;
     // Everything this binary can read and write. Pushed to every per-shard transport
     // in start(), so peers negotiate against the node's REAL capability; leaving it at
@@ -508,6 +529,10 @@ private:
     seastar::sharded<ShardRaftPlane> shards_;
     bool shardsStarted_ = false;
     bool replicated_ = false;
+    std::map<NodeId, control::NodeCapabilityAdvertisement> controlCapabilities_;
+    bool controlCapabilitiesComplete_ = false;
+    bool controlIdentityConflict_ = false;
+    uint64_t controlCapabilityFailures_ = 0;
     uint16_t rf_ = 1;  // configured replication factor (reported by status())
     bool controlEnabled_ = false;
 
@@ -526,6 +551,9 @@ private:
     seastar::timer<> peerResolveTimer_;
     seastar::gate peerResolveGate_;
     bool peerResolveRunning_ = false;
+    seastar::timer<> controlCapabilityTimer_;
+    seastar::gate controlCapabilityGate_;
+    bool controlCapabilityRunning_ = false;
 };
 
 }  // namespace timestar::cluster

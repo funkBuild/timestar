@@ -176,12 +176,19 @@ constexpr uint32_t kWriteBatchFormatV5 = 5;
 // group-0 voter cannot decode StoreFrozenDeletePlan (command tag 14).
 constexpr uint32_t kWriteBatchFormatV6 = 6;
 
+// v7 is a PROTOCOL-only exact capability/identity exchange used by the group-0
+// activation collector. Unlike the older negotiation reply (which reports only
+// the highest mutually agreed scalar), the v7 verb returns the peer's persistent
+// identity, cluster binding, and complete supported range. WriteBatch bytes remain
+// v2; the new point only says the peer knows this separate RPC verb and reply shape.
+constexpr uint32_t kWriteBatchFormatV7 = 7;
+
 // The newest version this binary supports. Every place that advertises this node's
 // capability must use THIS, never the literal that happens to be current: naming v2 in
 // ClusterDataPlane after v3 landed capped every negotiation at 2, so no peer spoke the
 // hinted-propose verb and the leader-hint path was dead in production while every test
 // passed (tests construct their own DataPlaneRpc, whose default was already correct).
-constexpr uint32_t kWriteBatchFormatMax = kWriteBatchFormatV6;
+constexpr uint32_t kWriteBatchFormatMax = kWriteBatchFormatV7;
 
 // Wire codec (bounds-checked; decode returns nullopt on ANY malformed/truncated/
 // inconsistent input so a hostile frame can never fabricate a batch). Bounds-checking

@@ -225,6 +225,7 @@ seastar::future<> ClusterDataPlane::startImpl(const ClusterConfig& cfg, seastar:
     enginesPtr_ = &engines;
     rf_ = cfg.replication_factor < 1 ? 1 : cfg.replication_factor;
     controlEnabled_ = cfg.control_enabled;
+    controlClusterUuid_ = cfg.control_enabled ? cfg.cluster_uuid : std::string{};
     dir_ = std::make_unique<data::VShardDirectory>(rt_->directory());
     local_ = std::make_unique<EngineLocalStore>(engines);
     rpc_ = std::make_unique<data::DataPlaneRpc>();
@@ -313,11 +314,18 @@ seastar::future<> ClusterDataPlane::startImpl(const ClusterConfig& cfg, seastar:
         // An inbound proposeWrite is split across the shards owning its VShards by
         // ShardRaftPlane::proposeBatch, so which shard the kernel handed the connection
         // to no longer decides where the work runs.
-        co_await shards_.invoke_on_all([dataPlaneAddr, tls = tls_, ver = localVersion_](ShardRaftPlane& p) {
+        std::optional<control::NodeCapabilityAdvertisement> localCapability;
+        if (cfg.control_enabled) {
+            if (!group0Identity_)
+                throw std::invalid_argument("cluster: group 0 requires the persistent node identity");
+            localCapability = control::NodeCapabilityAdvertisement{cfg.cluster_uuid, *group0Identity_, localVersion_};
+        }
+        co_await shards_.invoke_on_all(
+            [dataPlaneAddr, tls = tls_, ver = localVersion_, localCapability](ShardRaftPlane& p) {
             // `tls` is read from this shard's copy and the PEM strings are copied into
             // each shard's own credentials -- setTlsCredentials takes them by value, so
             // nothing cross-shard is retained.
-            return p.startDataPlane(dataPlaneAddr, tls, ver);
+            return p.startDataPlane(dataPlaneAddr, tls, ver, localCapability);
         });
 
         // Serve Raft on this node's own Raft address FROM EVERY SHARD (again
@@ -606,6 +614,8 @@ seastar::future<> ClusterDataPlane::startImpl(const ClusterConfig& cfg, seastar:
         });
         replicated_ = true;
         startLeadershipBalancer();
+        if (controlEnabled_)
+            startControlCapabilityCollector();
     }
     co_return;
 }
@@ -714,11 +724,101 @@ void ClusterDataPlane::startPeerResolver(bool replicated) {
     peerResolveTimer_.arm_periodic(kInterval);
 }
 
+seastar::future<std::map<NodeId, control::NodeCapabilityAdvertisement>>
+ClusterDataPlane::collectControlCapabilities(data::OptDeadline deadline) {
+    if (!controlEnabled_ || !rt_ || !rpc_ || !group0Identity_)
+        throw std::runtime_error("cluster: control capability collection is not configured");
+    deadline = deadline.value_or(seastar::lowres_clock::now() + std::chrono::milliseconds(600));
+
+    std::map<NodeId, control::NodeCapabilityAdvertisement> collected;
+    collected.emplace(rt_->selfId,
+                      control::NodeCapabilityAdvertisement{controlClusterUuid_, *group0Identity_, localVersion_});
+    std::vector<std::pair<NodeId, seastar::future<control::NodeCapabilityAdvertisement>>> pending;
+    if (!rt_->peerAddresses.empty())
+        pending.reserve(rt_->peerAddresses.size() - 1);
+    for (const auto& peer : rt_->peerAddresses) {
+        if (peer.first != rt_->selfId)
+            pending.emplace_back(peer.first, rpc_->nodeCapability(peer.first, deadline));
+    }
+
+    std::exception_ptr firstFailure;
+    std::exception_ptr permanentFailure;
+    for (auto& [id, future] : pending) {
+        try {
+            collected.emplace(id, co_await std::move(future));
+        } catch (const data::NodeCapabilityMismatchError&) {
+            if (!permanentFailure)
+                permanentFailure = std::current_exception();
+        } catch (...) {
+            if (!firstFailure)
+                firstFailure = std::current_exception();
+        }
+    }
+    try {
+        validateObservedNodeCapabilities(controlClusterUuid_, rt_->peerAddresses, collected);
+    } catch (...) {
+        if (!permanentFailure)
+            permanentFailure = std::current_exception();
+    }
+    if (permanentFailure)
+        std::rethrow_exception(permanentFailure);
+    if (firstFailure)
+        std::rethrow_exception(firstFailure);
+    (void)validateNodeCapabilities(controlClusterUuid_, rt_->peerAddresses, collected);
+    co_return collected;
+}
+
+seastar::future<> ClusterDataPlane::refreshControlCapabilities() {
+    try {
+        auto collected = co_await collectControlCapabilities();
+        controlCapabilities_ = std::move(collected);
+        controlCapabilitiesComplete_ = true;
+        controlIdentityConflict_ = false;
+    } catch (const NodeCapabilityValidationError& e) {
+        ++controlCapabilityFailures_;
+        controlCapabilitiesComplete_ = false;
+        if (!controlIdentityConflict_)
+            timestar::http_log.error("cluster: rejecting control capability collection: {}", e.what());
+        controlIdentityConflict_ = true;
+        throw;
+    } catch (const data::NodeCapabilityMismatchError& e) {
+        ++controlCapabilityFailures_;
+        controlCapabilitiesComplete_ = false;
+        if (!controlIdentityConflict_)
+            timestar::http_log.error("cluster: rejecting control capability reply: {}", e.what());
+        controlIdentityConflict_ = true;
+        throw;
+    } catch (...) {
+        ++controlCapabilityFailures_;
+        controlCapabilitiesComplete_ = false;
+        throw;
+    }
+}
+
+void ClusterDataPlane::startControlCapabilityCollector() {
+    static constexpr auto kInterval = std::chrono::seconds(1);
+    controlCapabilityTimer_.set_callback([this] {
+        if (controlCapabilityRunning_ || controlCapabilityGate_.is_closed())
+            return;
+        controlCapabilityRunning_ = true;
+        (void)seastar::with_gate(controlCapabilityGate_, [this] {
+            return refreshControlCapabilities().then_wrapped([this](seastar::future<> f) {
+                f.ignore_ready_future();  // peer startup/outage is retried on the next bounded pass
+                controlCapabilityRunning_ = false;
+            });
+        });
+    });
+    controlCapabilityTimer_.arm_periodic(kInterval);
+}
+
 seastar::future<> ClusterDataPlane::stop() {
     // The peer re-resolution loop touches rpc_ and shards_; quiesce it first.
     peerResolveTimer_.cancel();
     if (!peerResolveGate_.is_closed())
         co_await peerResolveGate_.close();
+    controlCapabilityTimer_.cancel();
+    if (!controlCapabilityGate_.is_closed())
+        co_await controlCapabilityGate_.close();
     // Stop the balancing loop FIRST and drain any in-flight pass: it touches the Raft
     // groups, so it must be quiescent before rdp_ tears them down.
     balanceTimer_.cancel();
@@ -1438,6 +1538,10 @@ seastar::future<ClusterDataPlane::Status> ClusterDataPlane::status() const {
     st.replicated = replicated_;
     st.replicationFactor = rf_;
     st.controlEnabled = controlEnabled_;
+    st.controlCapabilitiesComplete = controlCapabilitiesComplete_;
+    st.controlIdentityConflict = controlIdentityConflict_;
+    st.controlCapabilitiesObserved = controlCapabilities_.size();
+    st.controlCapabilityFailures = controlCapabilityFailures_;
     if (!replicated_ || !shardsStarted_)
         co_return st;
     std::vector<data::NodeId> peers;

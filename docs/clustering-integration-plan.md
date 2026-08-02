@@ -680,8 +680,8 @@ Tasks:
    pinned by the brick's gate).
 5. Remaining operator/metrics surface per plan §"Observability".
 
-Current feature-gating work (`9ecd0e6` plus the frozen-plan slice): pairwise
-protocol negotiation now advertises through v6 and refuses bounded delete tag
+Current feature-gating work (`9ecd0e6` plus the frozen-plan/capability slices): pairwise
+protocol negotiation now advertises through v7 and refuses bounded delete tag
 5/`Expired` exchanges with older peers. The cluster-wide emission gate
 independently refuses snapshot
 payload v2-v4 and durable receipt command tags until their committed activation
@@ -689,11 +689,14 @@ payload v2-v4 and durable receipt command tags until their committed activation
 pattern-plan command and snapshot trailer. Readiness exposes and enforces the
 snapshot minimum. Production group 0 and the all-shard publication bridge are
 now composed, and activation validates the union of stable meta-voters and
-committed data voters. This remains partial because no identity-bound production
-capability collector/join rule safely originates an activation, legacy receipt
-preflight and mixed-binary gates are missing, and control requests are not
-forwarded to the group-0 leader. No static configuration bypass may raise the
-gate.
+committed data voters. Production now collects an exact v7 identity/full-range
+advertisement from the complete static topology under one bounded fan-out, and
+activation refuses covered observers until group-0 learner/voter membership
+proves delivery. This remains partial because no join plus activation/legacy-
+receipt-preflight actuator safely originates an activation, mixed-binary gates
+are missing, and control requests other than frozen delete-plan lookup/freeze
+are not forwarded to the group-0 leader. No static configuration bypass may
+raise the gate.
 
 **Re-opens:** the SSE handler's node-local guard (deliberately — that guard
 exists to be replaced by exactly this). **Defers:** hot-series lanes (out of

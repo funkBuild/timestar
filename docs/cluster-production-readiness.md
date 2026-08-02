@@ -1338,11 +1338,20 @@ is not completion.
   active version to every reactor-local data gate before group 0 advances its
   applied boundary; a failed publication retries the same entry. This closes
   the publication half of CR-FIX-076, but no production path originates an
-  activation yet. The activation audit confirmed that a fresh non-seed is only
-  an inert observer that knows the seed voter set, not a replicated group-0
-  learner/member. Activation therefore cannot safely precede join: a seed-side
-  capability check could raise the seed's local gates without delivering the
-  committed activation to those observers. This task is not closed.
+  activation yet. Production now periodically collects a version-7 exact
+  identity/full-range advertisement from every statically configured node over
+  the authenticated data-plane channel. One 600 ms absolute deadline bounds the
+  complete fan-out; validation binds cluster UUID, expected Raft id and address,
+  rejects duplicate persistent node UUIDs, and reports completeness/conflicts
+  on `/cluster/status`. A conflict fails traffic readiness closed. Partial
+  collections are also inspected so an offline peer cannot conceal a permanent
+  conflict in a reply that did arrive. The activation audit confirmed that a
+  fresh non-seed is only an inert observer that knows the seed voter set, not a
+  replicated group-0 learner/member. `activateFormat` now refuses every covered
+  data voter that is neither a stable group-0 voter nor learner, so capability
+  cannot be mistaken for delivery. The join/token RPC and actuator that turn
+  these collected ranges into a safe activation are still absent; this task is
+  not closed.
 - [ ] **CR-FIX-022 — wire resumable join, drain, remove, replace, and VShard
   movement.** Owner: movement/control plane. Include learner catch-up, verified
   snapshot, log catch-up, joint consensus, leadership transfer, cutover, and
@@ -1578,18 +1587,25 @@ is not completion.
   prove these fences; the affected 29 focused tests pass. Cluster format v6 now
   additionally gates group-0 frozen pattern-delete command tag 14 and its
   snapshot trailer; both deterministic apply and local emission refuse it under
-  v5, while decoders retain recovery compatibility. **Still open:** add the
-  identity-bound capability collector and join
-  admission rule that can safely originate an activation, preflight legacy
-  receipt counts, and run old/new multi-process snapshot and command tests.
+  v5, while decoders retain recovery compatibility. Protocol v7 now provides an
+  exact identity-bound capability advertisement containing the peer's full
+  supported range. The production collector concurrently probes the complete
+  static topology under one 600 ms deadline, validates cluster/node/address
+  bindings and persistent-UUID uniqueness, preserves permanent-conflict
+  classification even alongside transient peer failures, and publishes status
+  counters. Pre-v7 peers are refused before the new verb is sent. Activation
+  additionally requires every covered data voter to be a stable group-0 voter
+  or learner, which proves the committed decision can be delivered rather than
+  merely decoded. **Still open:** add the seed join/token orchestration and
+  capability/receipt-preflight actuator that can safely originate an activation,
+  preflight legacy receipt counts, and run old/new multi-process snapshot and
+  command tests.
   Because no production path originates an activation, this fail-closed slice
   deliberately leaves clustered readiness false, exact bounded deletes
   unavailable below v5, and frozen pattern deletes unavailable below v6; it does
-  not close this task. The current socket negotiation response reports only the
-  highest mutually agreed version, not an independently authenticated peer
-  range; the remaining collector must use exact-version probes or add an
-  identity-bound capability message rather than treating that response as an
-  advertised maximum. It must also admit the node as a group-0 learner/member
+  not close this task. The scalar negotiation response is deliberately not
+  treated as an advertised maximum; the v7 reply is the exact range/identity
+  source. The remaining actuator must admit each node as a group-0 learner/member
   before including it in an activation proof, because observers do not receive
   committed group-0 state. Once version N is committed,
   the state machine cannot lower it and a binary whose maximum supported version
@@ -1678,6 +1694,26 @@ is not completion.
   independently of client connection lifetime. The ambiguous log entry remains
   subject to CR-FIX-080's already implemented admission budget and may still
   commit after quorum returns.
+- [x] **CR-FIX-082 — bind capability collection to persistent node identity and
+  group-0 delivery membership.** Owner: control plane/security. Protocol v7
+  returns the responder's cluster UUID, persistent `NodeRecord`, and complete
+  supported version range; pairwise negotiation must reach v7 before the client
+  sends the new verb, and the response must reproduce the negotiated scalar.
+  The client names the expected Raft id and classifies an actual-id/malformed
+  reply as a permanent conflict rather than a transient remote error. Production
+  advertises the same local identity from every per-shard listener and probes all
+  configured peers concurrently with one 600 ms deadline. Complete and partial
+  validation reject wrong cluster/id/address, unconfigured ids, and copied data
+  directories whose persistent UUID appears under more than one node id. Status
+  exposes collection completeness, observed count, conflict, and failure count;
+  an established conflict fails readiness until a complete clean pass clears it.
+  Finally, `activateFormat` refuses a covered data voter unless it is already a
+  stable group-0 voter or learner, so an observer that supports the decoder but
+  cannot receive the activation can never authorize emission. Codec truncation,
+  validator conflict, real loopback identity/range/pre-v7 refusal, and
+  three-node delivery regressions pass. This closes the collector/delivery-fence
+  slice, not CR-FIX-076: join orchestration, the activation/legacy-receipt
+  preflight actuator, and mixed-binary live evidence remain open.
 
 ## Release exit criteria
 
@@ -2092,9 +2128,10 @@ restart gate already passes. `8ae846c` removes CR-FIX-065's known implementation
 starvation path; the sustained live workload must still show that snapshots
 keep advancing and journal bytes plateau or reclaim.
 CR-FIX-076 remains an activation blocker: `9ecd0e6` prevents unsafe emission and
-false readiness, but production group-0 activation, voter/admission coverage,
-legacy-receipt preflight, downgrade policy, and mixed-binary evidence are still
-missing.
+false readiness, and CR-FIX-082 supplies exact identity/range collection plus
+the delivery-membership fence, but production join/activation orchestration,
+legacy-receipt preflight, downgrade enforcement, and mixed-binary evidence are
+still missing.
 
 Receiver-side data proposal deadline validation for CR-FIX-081:
 
@@ -2114,3 +2151,23 @@ No live or multi-process server was started for this validation. Client RPC
 expiry is deliberately not treated as receiver cancellation; the regression
 instead observes both receiver-side waits expire and the group's pending apply
 waiter count return to zero.
+
+Identity-bound capability and activation-delivery validation for CR-FIX-082:
+
+```text
+codec/startup/controller/feature/advertiser suites: 29/29 passed
+complete real-socket enriched data-plane suite:     29/29 passed
+readiness/conflict focused socket tests:              2/2 passed
+timestar_unit_test:                       built successfully (-j1)
+timestar_cluster_socket_test:             built successfully (-j1)
+timestar_http_server:                     built successfully (-j1)
+all test processes:                              --smp 1 --memory 1G
+compiler and test temporary directory:                     build/tmp
+```
+
+No live or multi-process server was started for this validation. The serial
+build and repository-local 4 KiB temporary tree respect the host-memory limit.
+This proves exact v7 framing, pre-v7 refusal, identity/range consistency,
+partial and complete topology validation, status/readiness behavior, and
+delivery membership in deterministic and loopback tests. It does not replace
+the remaining join/activation actuator or mixed-binary live gate.

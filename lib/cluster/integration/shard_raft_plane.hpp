@@ -259,10 +259,14 @@ public:
     // instance: in replicated mode these are the node's only data-plane servers and the
     // write path's only peer clients.
     seastar::future<> startDataPlane(seastar::socket_address local, const std::optional<DataPlaneTls>& tls,
-                                     features::VersionRange localVersion) {
+                                     features::VersionRange localVersion,
+                                     const std::optional<control::NodeCapabilityAdvertisement>& capability =
+                                         std::nullopt) {
         if (tls)
             rpc_->setTlsCredentials(tls->certPem, tls->keyPem, tls->caPem, tls->expectedPeerName);
         rpc_->setLocalVersion(localVersion);
+        if (capability)
+            rpc_->setLocalNodeCapability(capability->clusterUuid, capability->record);
         rpc_->setProposeSink(*this);
         rpc_->setReadIndexSink(*this);
         rpc_->setFrozenDeletePlanSink(*this);

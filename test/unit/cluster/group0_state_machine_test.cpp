@@ -115,6 +115,33 @@ TEST(ControlCommandCodecTest, TrailingBytesRejected) {
     EXPECT_FALSE(decodeCommand(full).has_value());
 }
 
+TEST(ControlCommandCodecTest, NodeCapabilitiesRoundTripAndFailClosed) {
+    NodeCapabilityAdvertisement capability{
+        std::string(32, 'A'),
+        NodeRecord{7, std::string(32, 'b'), "node-7.example:8086", "rack-a", NodeState::Active},
+        {1, timestar::data::kWriteBatchFormatV7}};
+    const std::string encoded = encodeNodeCapabilityAdvertisement(capability);
+    const auto decoded = decodeNodeCapabilityAdvertisement(encoded);
+    ASSERT_TRUE(decoded);
+    EXPECT_EQ(*decoded, capability);
+    for (size_t n = 0; n < encoded.size(); ++n)
+        EXPECT_FALSE(decodeNodeCapabilityAdvertisement(encoded.substr(0, n))) << "prefix " << n;
+
+    std::string trailing = encoded;
+    trailing.push_back('\0');
+    EXPECT_FALSE(decodeNodeCapabilityAdvertisement(trailing));
+    std::string unknown = encoded;
+    unknown.front() = static_cast<char>(0xff);
+    EXPECT_FALSE(decodeNodeCapabilityAdvertisement(unknown));
+
+    auto invalid = capability;
+    invalid.formats = {3, 2};
+    EXPECT_THROW(encodeNodeCapabilityAdvertisement(invalid), std::invalid_argument);
+    invalid = capability;
+    invalid.record.uuid = "not-a-persistent-uuid";
+    EXPECT_THROW(encodeNodeCapabilityAdvertisement(invalid), std::invalid_argument);
+}
+
 TEST(ControlCommandCodecTest, CoveredActivationCannotTruncateIntoLegacyActivation) {
     const std::string covered = encodeCommand(SetActiveVersion{5, {1, 2, 3}});
     for (size_t n = 0; n < covered.size(); ++n)

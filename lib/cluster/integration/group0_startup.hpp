@@ -1,13 +1,22 @@
 #pragma once
 
 #include "../control/control_map_cache.hpp"
+#include "../control/control_command.hpp"
 #include "../raft/raft_types.hpp"
 
+#include <map>
 #include <optional>
+#include <set>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace timestar::cluster {
+
+class NodeCapabilityValidationError : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
 
 enum class Group0StartMode {
     Disabled,
@@ -67,6 +76,49 @@ inline control::ControlMap selectServingMapForStartup(control::ControlMap config
             "durable serving map differs from static bootstrap placement; dynamic control-map cutover is not "
             "implemented");
     return std::move(*cached);
+}
+
+// Validate every reply that was observed, even when some other peer timed out.
+// A down node must not hide a permanent wrong-cluster/address/UUID conflict in
+// another reply merely because the complete collection could not be assembled.
+inline void validateObservedNodeCapabilities(
+    const std::string& clusterUuid, const std::map<raft::NodeId, std::string>& expectedPeers,
+    const std::map<raft::NodeId, control::NodeCapabilityAdvertisement>& capabilities) {
+    if (clusterUuid.empty())
+        throw NodeCapabilityValidationError("control cluster identity is empty");
+    std::set<std::string> persistentUuids;
+    for (const auto& [id, capability] : capabilities) {
+        auto expected = expectedPeers.find(id);
+        if (expected == expectedPeers.end())
+            throw NodeCapabilityValidationError("control capability collection contains an unconfigured node");
+        if (capability.clusterUuid != clusterUuid || capability.record.raftId != id ||
+            capability.record.address != expected->second)
+            throw NodeCapabilityValidationError("control capability identity does not match configured node " +
+                                                std::to_string(id));
+        if (!persistentUuids.insert(capability.record.uuid).second)
+            throw NodeCapabilityValidationError("duplicate persistent node identity in control capability collection");
+    }
+}
+
+// Validate one complete capability collection against the operator-bound static
+// topology. The authenticated RPC protects the frame in transit; these checks
+// bind its claims to the node id/address we dialled and reject a copied data
+// directory (one persistent UUID answering for multiple Raft ids).
+inline std::map<raft::NodeId, features::VersionRange> validateNodeCapabilities(
+    const std::string& clusterUuid, const std::map<raft::NodeId, std::string>& expectedPeers,
+    const std::map<raft::NodeId, control::NodeCapabilityAdvertisement>& capabilities) {
+    validateObservedNodeCapabilities(clusterUuid, expectedPeers, capabilities);
+    if (capabilities.size() != expectedPeers.size())
+        throw NodeCapabilityValidationError("control capability collection is incomplete");
+    std::map<raft::NodeId, features::VersionRange> versions;
+    for (const auto& peer : expectedPeers) {
+        auto found = capabilities.find(peer.first);
+        if (found == capabilities.end())
+            throw NodeCapabilityValidationError("control capability collection is missing node " +
+                                                std::to_string(peer.first));
+        versions.emplace(peer.first, found->second.formats);
+    }
+    return versions;
 }
 
 }  // namespace timestar::cluster

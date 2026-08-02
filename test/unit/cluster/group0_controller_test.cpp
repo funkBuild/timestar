@@ -144,11 +144,11 @@ NodeRecord rec(NodeId id, std::string dom) {
     return r;
 }
 
-ControlMap initialServingMap() {
+ControlMap initialServingMap(std::vector<NodeId> replicas = {1, 2, 3}) {
     ControlMap map;
     map.epoch = 1;
     for (uint16_t vshard = 0; vshard < timestar::VIRTUAL_SHARD_COUNT; ++vshard)
-        map.placement.emplace(vshard, std::vector<NodeId>{1, 2, 3});
+        map.placement.emplace(vshard, replicas);
     return map;
 }
 
@@ -382,6 +382,8 @@ seastar::future<> testFormatActivationGatedByVoterSupport() {
         nodes[id] = std::move(box);
     };
     makeNode(1);
+    makeNode(2);
+    makeNode(3);
 
     Group0Controller controller(*nodes[1].group, *nodes[1].sm, 3);
     co_await nodes[1].group->campaign();
@@ -400,8 +402,18 @@ seastar::future<> testFormatActivationGatedByVoterSupport() {
 
     const std::map<NodeId, timestar::features::VersionRange> v3 = {
         {1, {1, 3}}, {2, {1, 3}}, {3, {1, 3}}};
-    EXPECT_TRUE(co_await controller.activateFormat(3, v3));
+    EXPECT_FALSE(co_await controller.activateFormat(3, v3))
+        << "capability does not prove that an observer receives group-0 activation";
+    co_await drive(controller.admitNode(rec(2, "rack-b")), nodes, router);
+    EXPECT_TRUE(co_await drive(controller.addLearner(2), nodes, router));
+    co_await drive(controller.admitNode(rec(3, "rack-c")), nodes, router);
+    EXPECT_TRUE(co_await drive(controller.addLearner(3), nodes, router));
+
+    EXPECT_TRUE(co_await drive(controller.activateFormat(3, v3), nodes, router));
+    co_await router.pump();
     EXPECT_EQ(nodes[1].sm->state().activeFormatVersion, 3u);
+    EXPECT_EQ(nodes[2].sm->state().activeFormatVersion, 3u);
+    EXPECT_EQ(nodes[3].sm->state().activeFormatVersion, 3u);
 
     // Re-activating the already committed version is a no-op, not a successful
     // cluster decision.
@@ -421,8 +433,8 @@ seastar::future<> testFormatActivationGatedByVoterSupport() {
 
     // Once every voter advertises v5, the same committed mechanism activates
     // bounded delete commands, payload v4, and the Expired reply contract.
-    EXPECT_TRUE(co_await controller.activateFormat(
-        5, {{1, {1, 5}}, {2, {1, 5}}, {3, {1, 5}}}));
+    EXPECT_TRUE(co_await drive(
+        controller.activateFormat(5, {{1, {1, 5}}, {2, {1, 5}}, {3, {1, 5}}}), nodes, router));
     co_await router.pump();
     EXPECT_EQ(nodes[1].sm->state().activeFormatVersion, 5u);
 
@@ -456,7 +468,7 @@ seastar::future<> testDeletePlanFreezesFirstExpansion() {
     co_await router.pump();
     co_await controller.initCluster("c1", rec(1, "rack-a"));
     co_await router.pump();
-    EXPECT_TRUE(co_await controller.publishInitialServingMap(initialServingMap()));
+    EXPECT_TRUE(co_await controller.publishInitialServingMap(initialServingMap({1})));
 
     const auto original = frozenPlan('1', 'a', {{"m,host=a value", 10, 20}});
     auto inactive = co_await controller.freezeDeletePlan(original);
@@ -464,9 +476,7 @@ seastar::future<> testDeletePlanFreezesFirstExpansion() {
         << "tag 14 must not ride the older v5 activation";
     EXPECT_TRUE(co_await controller.activateFormat(
         timestar::data::kFrozenDeletePlanActivationVersion,
-        {{1, {1, timestar::data::kFrozenDeletePlanActivationVersion}},
-         {2, {1, timestar::data::kFrozenDeletePlanActivationVersion}},
-         {3, {1, timestar::data::kFrozenDeletePlanActivationVersion}}}));
+        {{1, {1, timestar::data::kFrozenDeletePlanActivationVersion}}}));
 
     auto identity = original;
     identity.targets.clear();

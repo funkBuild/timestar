@@ -1,5 +1,6 @@
 #pragma once
 
+#include "../features/feature_gate.hpp"
 #include "group0_state.hpp"
 
 #include <cstdint>
@@ -111,6 +112,21 @@ struct FrozenDeletePlanRpcRequest {
     FrozenDeletePlan plan;
 };
 
+// Version-7 identity-bound capability reply. The ordinary negotiation response
+// is only an agreed scalar; it cannot prove which persistent node answered or
+// what full range that node advertises. This frame is integrity-protected by the
+// authenticated data-plane channel in production and binds those facts together.
+struct NodeCapabilityAdvertisement {
+    std::string clusterUuid;
+    NodeRecord record;
+    features::VersionRange formats;
+
+    friend bool operator==(const NodeCapabilityAdvertisement& a, const NodeCapabilityAdvertisement& b) {
+        return a.clusterUuid == b.clusterUuid && a.record == b.record && a.formats.min == b.formats.min &&
+               a.formats.max == b.formats.max;
+    }
+};
+
 using ControlCommand =
     std::variant<InitCluster, UpsertNode, SetNodeState, SetDesiredPlacement, SetMetaVoters, CasPolicy,
                  SetControllerTerm, UpsertJob, MintJoinToken, AdmitWithToken, StoreFrozenDeletePlan, SetActiveVersion,
@@ -129,5 +145,8 @@ std::string encodeFrozenDeletePlanRpcRequest(const FrozenDeletePlanRpcRequest& r
 std::optional<FrozenDeletePlanRpcRequest> decodeFrozenDeletePlanRpcRequest(const std::string& bytes);
 std::string encodeFrozenDeletePlanRpcResult(const FreezeDeletePlanResult& result);
 std::optional<FreezeDeletePlanResult> decodeFrozenDeletePlanRpcResult(const std::string& bytes);
+
+std::string encodeNodeCapabilityAdvertisement(const NodeCapabilityAdvertisement& capability);
+std::optional<NodeCapabilityAdvertisement> decodeNodeCapabilityAdvertisement(const std::string& bytes);
 
 }  // namespace timestar::control

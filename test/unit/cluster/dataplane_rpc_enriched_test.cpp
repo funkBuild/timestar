@@ -685,6 +685,43 @@ TEST_F(DataPlaneRpcEnrichedTest, VersionNegotiationRefusesIncompatiblePeer) {
     }).get();
 }
 
+TEST_F(DataPlaneRpcEnrichedTest, NodeCapabilityBindsNegotiatedRangeAndExpectedIdentity) {
+    seastar::async([] {
+        const uint16_t serverPort = 39387;
+        const data::NodeId server = 2;
+        ThrowingNodeStore sink;
+        data::DataPlaneRpc srv, cli, oldCli;
+        srv.setLocalVersion(features::VersionRange{1, data::kWriteBatchFormatV7});
+        srv.setLocalNodeCapability(
+            std::string(32, 'a'),
+            control::NodeRecord{server, std::string(32, 'b'), "127.0.0.1:8087", "rack-b",
+                                control::NodeState::Active});
+        srv.start(loopback(serverPort), sink).get();
+
+        cli.setLocalVersion(features::VersionRange{1, data::kWriteBatchFormatV7});
+        cli.startClientOnly().get();
+        cli.addPeer(server, loopback(serverPort));
+        const auto capability = cli.nodeCapability(server).get();
+        EXPECT_EQ(capability.clusterUuid, std::string(32, 'a'));
+        EXPECT_EQ(capability.record.raftId, server);
+        EXPECT_EQ(capability.formats.max, data::kWriteBatchFormatV7);
+
+        cli.addPeer(3, loopback(serverPort));
+        EXPECT_THROW(cli.nodeCapability(3).get(), data::NodeCapabilityMismatchError)
+            << "a configured Raft id must not accept another node's advertisement";
+
+        oldCli.setLocalVersion(features::VersionRange{1, data::kWriteBatchFormatV6});
+        oldCli.startClientOnly().get();
+        oldCli.addPeer(server, loopback(serverPort));
+        EXPECT_THROW(oldCli.nodeCapability(server).get(), data::ClusterFormatUnsupportedError)
+            << "pre-v7 clients must refuse before sending an unknown verb";
+
+        oldCli.stop().get();
+        cli.stop().get();
+        srv.stop().get();
+    }).get();
+}
+
 // A node with NO read-index sink set fails leader-reach cleanly (fail-closed).
 TEST_F(DataPlaneRpcEnrichedTest, LeaderReachWithoutSinkFailsClosed) {
     seastar::async([] {
@@ -826,7 +863,11 @@ TEST_F(DataPlaneRpcEnrichedTest, ForwardedWritesSpeakTheNegotiatedWireVersion) {
             RecordingProposeSink propose;
             ThrowingNodeStore s1, s2;
             data::DataPlaneRpc srv, cli;
-            srv.setLocalVersion(features::VersionRange{7, 8});  // nothing in common
+            // Pin BOTH ends. Using the client's moving default made this
+            // negative case silently become compatible when protocol v7 landed.
+            srv.setLocalVersion(features::VersionRange{data::kWriteBatchFormatV7,
+                                                       data::kWriteBatchFormatV7});
+            cli.setLocalVersion(features::VersionRange{1, data::kWriteBatchFormatV6});
             srv.setProposeSink(propose);
             srv.start(loopback(serverPort), s1).get();
             cli.start(loopback(clientPort), s2).get();

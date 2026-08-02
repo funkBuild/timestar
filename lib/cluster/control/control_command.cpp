@@ -7,6 +7,26 @@ namespace timestar::control {
 
 namespace {
 
+constexpr uint8_t kNodeCapabilityFrameTag = 1;
+constexpr size_t kMaxNodeCapabilityFrameBytes = 4096;
+
+bool canonicalHex128(const std::string& value) {
+    if (value.size() != 32)
+        return false;
+    for (unsigned char c : value)
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')))
+            return false;
+    return true;
+}
+
+bool validNodeCapability(const NodeCapabilityAdvertisement& capability) {
+    return canonicalHex128(capability.clusterUuid) && capability.record.raftId != raft::kNoNode &&
+           canonicalHex128(capability.record.uuid) && !capability.record.address.empty() &&
+           capability.record.address.size() <= 1024 && !capability.record.failureDomain.empty() &&
+           capability.record.failureDomain.size() <= 1024 && capability.formats.min != 0 &&
+           capability.formats.min <= capability.formats.max;
+}
+
 struct Writer {
     std::string out;
     void u8(uint8_t v) { out.push_back(static_cast<char>(v)); }
@@ -442,6 +462,36 @@ std::optional<FreezeDeletePlanResult> decodeFrozenDeletePlanRpcResult(const std:
     if (!r.ok || r.p != r.end || (carriesPlan && !validFrozenDeletePlan(result.plan)))
         return std::nullopt;
     return result;
+}
+
+std::string encodeNodeCapabilityAdvertisement(const NodeCapabilityAdvertisement& capability) {
+    if (!validNodeCapability(capability))
+        throw std::invalid_argument("invalid node capability advertisement");
+    Writer w;
+    w.u8(kNodeCapabilityFrameTag);
+    w.str(capability.clusterUuid);
+    writeNode(w, capability.record);
+    w.u64(capability.formats.min);
+    w.u64(capability.formats.max);
+    if (w.out.size() > kMaxNodeCapabilityFrameBytes)
+        throw std::invalid_argument("node capability advertisement exceeds its wire bound");
+    return std::move(w.out);
+}
+
+std::optional<NodeCapabilityAdvertisement> decodeNodeCapabilityAdvertisement(const std::string& bytes) {
+    if (bytes.size() > kMaxNodeCapabilityFrameBytes)
+        return std::nullopt;
+    Reader r{bytes.data(), bytes.data() + bytes.size()};
+    if (r.u8() != kNodeCapabilityFrameTag)
+        return std::nullopt;
+    NodeCapabilityAdvertisement capability;
+    capability.clusterUuid = r.str();
+    capability.record = readNode(r);
+    capability.formats.min = r.u32();
+    capability.formats.max = r.u32();
+    if (!r.ok || r.p != r.end || !validNodeCapability(capability))
+        return std::nullopt;
+    return capability;
 }
 
 }  // namespace timestar::control
