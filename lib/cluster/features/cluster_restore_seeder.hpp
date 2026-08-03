@@ -1,5 +1,6 @@
 #pragma once
 
+#include "backup_restore.hpp"
 #include "../control/group0_state.hpp"
 #include "../raft/raft_types.hpp"
 
@@ -22,6 +23,7 @@ enum class ClusterRestoreTargetState : uint8_t { Absent, InProgress, Prepared, A
 struct ClusterRestoreSeedRequest {
     std::filesystem::path archiveDirectory;
     std::filesystem::path dataDirectory;
+    std::optional<ClusterBackupAuthenticationKey> authenticationKey;
     std::string newClusterUuid;
     std::array<uint8_t, 16> clusterUuidBytes{};
     std::array<uint8_t, 16> bootId{};

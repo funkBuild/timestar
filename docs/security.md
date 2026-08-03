@@ -17,6 +17,14 @@ Plaintext replicated transport is available only through
 production. The obsolete best-effort static full-replication mode remains an
 explicitly quarantined demo and does not inherit these RF&gt;1 guarantees.
 
+Cluster backup manifests require a separate 256-bit HMAC-SHA-256 key configured
+through `cluster.backup_auth_key_file`. Export and restore fail closed without
+it or when a manifest tag does not match. The protected owner-only key file is
+never accepted over HTTP or embedded in the artifact. TSBK units remain
+plaintext, so encrypted staging, KMS-backed immutable off-site storage, key
+rotation/retention, and the recovery ceremony in
+[backup-restore.md](backup-restore.md) are mandatory production controls.
+
 Rotate a node certificate by issuing a replacement from the existing cluster
 CA with the same DNS/IP SAN, updating that node's protected certificate/key
 files, and restarting only that node. Wait for it to recover before rotating

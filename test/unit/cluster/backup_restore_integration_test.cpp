@@ -15,6 +15,7 @@
 #include "../../../lib/utils/crc32.hpp"
 
 #include <gtest/gtest.h>
+#include <gnutls/crypto.h>
 
 #include <chrono>
 #include <filesystem>
@@ -26,13 +27,17 @@ using namespace timestar;
 namespace fs = std::filesystem;
 
 namespace {
-uint64_t fnv1a(std::string_view value) {
-    uint64_t hash = 1469598103934665603ull;
-    for (unsigned char byte : value) {
-        hash ^= byte;
-        hash *= 1099511628211ull;
+std::string sha256(std::string_view value) {
+    std::array<unsigned char, 32> digest{};
+    if (gnutls_hash_fast(GNUTLS_DIG_SHA256, value.data(), value.size(), digest.data()) < 0)
+        throw std::runtime_error("failed to hash backup test fixture");
+    static constexpr std::string_view digits = "0123456789abcdef";
+    std::string out(digest.size() * 2, '0');
+    for (size_t i = 0; i < digest.size(); ++i) {
+        out[2 * i] = digits[digest[i] >> 4];
+        out[2 * i + 1] = digits[digest[i] & 0x0f];
     }
-    return hash;
+    return out;
 }
 
 void writeBytes(const fs::path& path, std::string_view bytes) {
@@ -107,12 +112,14 @@ features::VShardBackupUnit unitFor(uint16_t vshard, const std::string& bytes) {
                                       payload->manifest.verificationHash,
                                       payload->manifest.catalogHash,
                                       bytes.size(),
-                                      fnv1a(bytes)};
+                                      sha256(bytes)};
 }
 }  // namespace
 
 TEST(BackupRestoreIntegration, ExportRestoreInstallAndFailClosed) {
     seastar::thread([] {
+        const auto authenticationKey = features::ClusterBackupAuthenticationKey::fromHex(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
         ASSERT_TRUE(vshardsCohesiveOnCores(seastar::smp::count));
         fs::remove_all("bkp_src");
         fs::remove_all("bkp_dst");
@@ -194,21 +201,23 @@ TEST(BackupRestoreIntegration, ExportRestoreInstallAndFailClosed) {
             if ((i & 63u) == 63u)
                 seastar::thread::yield();
         }
+        backup.authenticate(authenticationKey);
         ASSERT_TRUE(backup.valid());
-        EXPECT_FALSE(features::ClusterBackupArchive::publish("bkp_stage", backup).get())
+        EXPECT_FALSE(features::ClusterBackupArchive::publish("bkp_stage", backup, authenticationKey).get())
             << "one staged unit is never a complete cluster archive";
         writeBytes("bkp_archive/.manifest.tsbk1.partial", "interrupted");
-        ASSERT_TRUE(features::ClusterBackupArchive::publish("bkp_archive", backup).get());
+        ASSERT_TRUE(features::ClusterBackupArchive::publish("bkp_archive", backup, authenticationKey).get());
         EXPECT_FALSE(fs::exists("bkp_archive/.manifest.tsbk1.partial"));
         fs::create_hard_link("bkp_archive/manifest.tsbk1", "bkp_archive/.manifest.tsbk1.partial");
-        EXPECT_TRUE(features::ClusterBackupArchive::publish("bkp_archive", backup).get());
+        EXPECT_TRUE(features::ClusterBackupArchive::publish("bkp_archive", backup, authenticationKey).get());
         EXPECT_FALSE(fs::exists("bkp_archive/.manifest.tsbk1.partial"))
             << "retry must close the crash window after manifest-link publication";
-        auto decodedManifest = features::ClusterBackupArchive::validate("bkp_archive").get();
+        auto decodedManifest = features::ClusterBackupArchive::validate("bkp_archive", authenticationKey).get();
         ASSERT_TRUE(decodedManifest);
         EXPECT_EQ(*decodedManifest, backup);
 
-        auto restored = features::BackupRestore::planRestore(*decodedManifest, "ffeeddccbbaa00998877665544332211");
+        auto restored = features::BackupRestore::planRestore(*decodedManifest, "ffeeddccbbaa00998877665544332211",
+                                                             authenticationKey);
         ASSERT_TRUE(restored.ok) << restored.error;
         EXPECT_EQ(restored.newClusterUuid, "ffeeddccbbaa00998877665544332211");
         ASSERT_EQ(restored.vshards.size(), VIRTUAL_SHARD_COUNT);
@@ -250,7 +259,7 @@ TEST(BackupRestoreIntegration, ExportRestoreInstallAndFailClosed) {
         }
 
         // Fail-closed: restoring under the SOURCE uuid is refused (identity scrub).
-        EXPECT_FALSE(features::BackupRestore::planRestore(backup, backup.sourceClusterUuid).ok);
+        EXPECT_FALSE(features::BackupRestore::planRestore(backup, backup.sourceClusterUuid, authenticationKey).ok);
 
         // Fail-closed: a tampered snapshot fails the hash check -> nothing restored.
         {
@@ -259,24 +268,24 @@ TEST(BackupRestoreIntegration, ExportRestoreInstallAndFailClosed) {
             auto tampered = emptyUnits[target];
             tampered[tampered.size() / 2] ^= 0xff;
             writeBytes(path, tampered);
-            EXPECT_FALSE(features::ClusterBackupArchive::validate("bkp_archive").get());
+            EXPECT_FALSE(features::ClusterBackupArchive::validate("bkp_archive", authenticationKey).get());
             writeBytes(path, emptyUnits[target]);
-            ASSERT_TRUE(features::ClusterBackupArchive::validate("bkp_archive").get());
+            ASSERT_TRUE(features::ClusterBackupArchive::validate("bkp_archive", authenticationKey).get());
         }
 
         // Fail-closed: extra and missing filesystem entries are not aliases for
         // a complete canonical 4,096-unit artifact set.
         {
             writeBytes("bkp_archive/vshards/alias.tsp1", emptyUnits[0]);
-            EXPECT_FALSE(features::ClusterBackupArchive::validate("bkp_archive").get());
+            EXPECT_FALSE(features::ClusterBackupArchive::validate("bkp_archive", authenticationKey).get());
             fs::remove("bkp_archive/vshards/alias.tsp1");
 
             const auto missing = fs::path("bkp_archive") / features::BackupRestore::unitRelativePath(0);
             const std::string missingBytes = vshard.value() == 0 ? snapBytes : emptyUnits[0];
             fs::remove(missing);
-            EXPECT_FALSE(features::ClusterBackupArchive::validate("bkp_archive").get());
+            EXPECT_FALSE(features::ClusterBackupArchive::validate("bkp_archive", authenticationKey).get());
             writeBytes(missing, missingBytes);
-            ASSERT_TRUE(features::ClusterBackupArchive::validate("bkp_archive").get());
+            ASSERT_TRUE(features::ClusterBackupArchive::validate("bkp_archive", authenticationKey).get());
         }
 
         // Seed a genuinely new Raft generation. Only two VShards belong to this
@@ -288,6 +297,7 @@ TEST(BackupRestoreIntegration, ExportRestoreInstallAndFailClosed) {
             features::ClusterRestoreSeedRequest request;
             request.archiveDirectory = "bkp_archive";
             request.dataDirectory = "bkp_seed";
+            request.authenticationKey = authenticationKey;
             request.newClusterUuid = "ffeeddccbbaa00998877665544332211";
             request.clusterUuidBytes = hexBytes(request.newClusterUuid);
             request.bootId.fill(0x5a);

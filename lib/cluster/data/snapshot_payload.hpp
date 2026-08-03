@@ -132,6 +132,7 @@ struct SnapshotPayloadFileInfo {
     VShardSnapshotManifest manifest;
     uint64_t encodedSize = 0;
     uint64_t encodedHash = 0;  // FNV-1a over the complete TSP1 file
+    std::string encodedSha256;  // lowercase SHA-256 over the complete TSP1 file
 };
 
 // Explicitly-versioned v1, FNV-trailer-checksummed, bounds-checked codec.

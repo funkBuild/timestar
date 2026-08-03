@@ -227,6 +227,9 @@ struct ClusterConfig {
     std::string tls_cert_file;
     std::string tls_key_file;
     std::string tls_ca_file;
+    // Owner-only file containing a 256-bit lowercase-hex HMAC key. Clustered
+    // backup export and restore refuse to run when this is absent or invalid.
+    std::string backup_auth_key_file;
     // Development escape hatch for local fault tests only. Production deployments
     // must leave this false; without it an RF>1 server refuses plaintext startup.
     bool development_allow_insecure_transport = false;
@@ -382,6 +385,7 @@ struct glz::meta<timestar::ClusterConfig> {
         object("enabled", &T::enabled, "node_id", &T::node_id, "peers", &T::peers, "partitioned", &T::partitioned,
                "replication_factor", &T::replication_factor, "cluster_uuid", &T::cluster_uuid, "tls_cert_file",
                &T::tls_cert_file, "tls_key_file", &T::tls_key_file, "tls_ca_file", &T::tls_ca_file,
+               "backup_auth_key_file", &T::backup_auth_key_file,
                "development_allow_insecure_transport", &T::development_allow_insecure_transport,
                "control_enabled", &T::control_enabled, "control_seed_node_id", &T::control_seed_node_id,
                "failure_domain", &T::failure_domain);

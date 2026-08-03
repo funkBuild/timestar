@@ -772,6 +772,13 @@ TEST(TimestarConfigEnvTest, IndexOverrides) {
     EXPECT_EQ(cfg.index.series_cache_size, 2000000u);
 }
 
+TEST(TimestarConfigEnvTest, ClusterBackupAuthenticationKeyFileOverride) {
+    ScopedEnv key("TIMESTAR_CLUSTER_BACKUP_AUTH_KEY_FILE", "/run/secrets/backup.key");
+    timestar::TimestarConfig cfg;
+    timestar::applyEnvironmentOverrides(cfg);
+    EXPECT_EQ(cfg.cluster.backup_auth_key_file, "/run/secrets/backup.key");
+}
+
 TEST(TimestarConfigEnvTest, SeastarOverrides) {
     ScopedEnv e1("TIMESTAR_SMP", "4");
     ScopedEnv e2("TIMESTAR_MEMORY", "8G");

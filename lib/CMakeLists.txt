@@ -22,6 +22,7 @@ list(FILTER SRC_FILES EXCLUDE REGEX ".*/proto_converters\\.cpp$")
 list(FILTER SRC_FILES EXCLUDE REGEX ".*/proto_write_fast_path\\.cpp$")
 
 find_package (Threads REQUIRED)
+find_package(GnuTLS REQUIRED)
 # Seastar is added via add_subdirectory in the top-level CMakeLists.txt,
 # so find_package is only needed when building against a system-installed Seastar.
 if(NOT TARGET Seastar::seastar)
@@ -49,7 +50,7 @@ timestar_set_project_warnings(libtimestar)
 # Precompiled header: parse the heavy Seastar-core + common-STL headers once
 # instead of in every TU. See lib/pch.hpp for what's in (and deliberately out).
 target_precompile_headers(libtimestar PRIVATE pch.hpp)
-target_link_libraries(libtimestar Threads::Threads Seastar::seastar libzstd_static glaze::glaze ${XXHASH_LIBRARY} hwy roaring)
+target_link_libraries(libtimestar Threads::Threads Seastar::seastar ${GNUTLS_LIBRARIES} libzstd_static glaze::glaze ${XXHASH_LIBRARY} hwy roaring)
 
 # Include both the lib directory and all subdirectories for header resolution
 target_include_directories(libtimestar PUBLIC
@@ -70,6 +71,7 @@ target_include_directories(libtimestar PUBLIC
 # Third-party headers consumed via plain paths go in as SYSTEM so their
 # diagnostics do not count against our warning set.
 target_include_directories(libtimestar SYSTEM PUBLIC
+    ${GNUTLS_INCLUDE_DIRS}
     ${XXHASH_INCLUDE_DIR}
     ${CMAKE_BINARY_DIR}/_deps/robin-map-src/include
 )

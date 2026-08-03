@@ -4,6 +4,8 @@
 #include "../data/snapshot_payload.hpp"
 
 #include <fcntl.h>
+#include <gnutls/crypto.h>
+#include <gnutls/gnutls.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -26,6 +28,7 @@ constexpr uint32_t kMagic = 0x4b425354;  // "TSBK" little-endian
 constexpr uint32_t kVersion = 1;
 constexpr uint32_t kPortableMagic = 0x43505354;  // "TSPC" little-endian
 constexpr size_t kHashHexBytes = 32;
+constexpr size_t kAuthenticationHexBytes = 64;
 constexpr size_t kMaxManifestBytes = 64u << 20;
 constexpr size_t kMaxPortableControlEncodedBytes = kMaxManifestBytes - (size_t{1} << 20);
 // Schema CAS cells share Group-0's policy map with retention cells, but only
@@ -258,6 +261,36 @@ bool canonicalHex128(std::string_view value) {
            std::ranges::all_of(value, [](unsigned char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); });
 }
 
+bool canonicalHex256(std::string_view value) {
+    return value.size() == kAuthenticationHexBytes &&
+           std::ranges::all_of(value, [](unsigned char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); });
+}
+
+unsigned char decodeHexNibble(unsigned char value) {
+    return value <= '9' ? static_cast<unsigned char>(value - '0')
+                        : static_cast<unsigned char>(value - 'a' + 10);
+}
+
+std::array<unsigned char, 32> decodeHex256(std::string_view value) {
+    if (!canonicalHex256(value))
+        throw std::invalid_argument("cluster backup authentication key must be 64 lowercase hexadecimal characters");
+    std::array<unsigned char, 32> out{};
+    for (size_t i = 0; i < out.size(); ++i)
+        out[i] = static_cast<unsigned char>((decodeHexNibble(static_cast<unsigned char>(value[2 * i])) << 4) |
+                                            decodeHexNibble(static_cast<unsigned char>(value[2 * i + 1])));
+    return out;
+}
+
+std::string encodeHex256(const std::array<unsigned char, 32>& value) {
+    static constexpr std::string_view digits = "0123456789abcdef";
+    std::string out(value.size() * 2, '0');
+    for (size_t i = 0; i < value.size(); ++i) {
+        out[2 * i] = digits[value[i] >> 4];
+        out[2 * i + 1] = digits[value[i] & 0x0f];
+    }
+    return out;
+}
+
 void putU16(std::string& out, uint16_t value) {
     for (int i = 0; i < 2; ++i)
         out.push_back(static_cast<char>((value >> (8 * i)) & 0xff));
@@ -374,6 +407,80 @@ bool validPolicy(const std::string& key, const control::PolicyCell& cell) {
 }
 
 }  // namespace
+
+ClusterBackupAuthenticationKey ClusterBackupAuthenticationKey::load(const std::filesystem::path& path) {
+    if (path.empty())
+        throw std::invalid_argument("cluster backup authentication key file is not configured");
+    UniqueFd fd(::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
+    if (fd.get() < 0)
+        throwIo("open cluster backup authentication key", path);
+    struct stat metadata {};
+    if (::fstat(fd.get(), &metadata) < 0)
+        throwIo("stat cluster backup authentication key", path);
+    if (!S_ISREG(metadata.st_mode) || metadata.st_uid != ::geteuid() || (metadata.st_mode & 0077) != 0 ||
+        (metadata.st_size != 64 && metadata.st_size != 65))
+        throw std::invalid_argument(
+            "cluster backup authentication key must be an owner-only regular file owned by the server user");
+
+    std::string encoded(static_cast<size_t>(metadata.st_size), '\0');
+    size_t offset = 0;
+    while (offset < encoded.size()) {
+        ssize_t count = ::read(fd.get(), encoded.data() + offset, encoded.size() - offset);
+        if (count < 0) {
+            if (errno == EINTR)
+                continue;
+            throwIo("read cluster backup authentication key", path);
+        }
+        if (count == 0)
+            throw std::invalid_argument("cluster backup authentication key was truncated while reading");
+        offset += static_cast<size_t>(count);
+    }
+    char extra = 0;
+    ssize_t trailing = 0;
+    do {
+        trailing = ::read(fd.get(), &extra, 1);
+    } while (trailing < 0 && errno == EINTR);
+    if (trailing < 0)
+        throwIo("read cluster backup authentication key trailer", path);
+    if (trailing != 0)
+        throw std::invalid_argument("cluster backup authentication key changed while reading");
+    closeChecked(fd, path);
+    if (encoded.size() == 65) {
+        if (encoded.back() != '\n')
+            throw std::invalid_argument("cluster backup authentication key has invalid trailing data");
+        encoded.pop_back();
+    }
+    return fromHex(encoded);
+}
+
+ClusterBackupAuthenticationKey ClusterBackupAuthenticationKey::fromHex(std::string_view hex) {
+    auto bytes = decodeHex256(hex);
+    if (std::ranges::all_of(bytes, [](unsigned char value) { return value == 0; }))
+        throw std::invalid_argument("cluster backup authentication key must not be all zero");
+    return ClusterBackupAuthenticationKey(bytes);
+}
+
+std::string ClusterBackupAuthenticationKey::keyId() const {
+    std::array<unsigned char, 32> digest{};
+    if (gnutls_hash_fast(GNUTLS_DIG_SHA256, bytes_.data(), bytes_.size(), digest.data()) < 0)
+        throw std::runtime_error("failed to derive cluster backup authentication key identifier");
+    return encodeHex256(digest);
+}
+
+std::string ClusterBackupAuthenticationKey::authenticate(std::string_view bytes) const {
+    std::array<unsigned char, 32> tag{};
+    if (gnutls_hmac_fast(GNUTLS_MAC_SHA256, bytes_.data(), bytes_.size(), bytes.data(), bytes.size(), tag.data()) < 0)
+        throw std::runtime_error("failed to authenticate cluster backup manifest");
+    return encodeHex256(tag);
+}
+
+bool ClusterBackupAuthenticationKey::verifies(std::string_view bytes, std::string_view lowercaseHexTag) const {
+    if (!canonicalHex256(lowercaseHexTag))
+        return false;
+    const auto supplied = decodeHex256(lowercaseHexTag);
+    const auto expected = decodeHex256(authenticate(bytes));
+    return gnutls_memcmp(supplied.data(), expected.data(), supplied.size()) == 0;
+}
 
 bool PortableControlBackup::valid() const {
     if (policies.size() > kMaxPortablePolicies || retentionCutoffs.size() > control::kMaxRetentionPolicies ||
@@ -505,11 +612,56 @@ std::optional<PortableControlBackup> PortableControlBackup::decode(std::string_v
 
 bool VShardBackupUnit::valid() const {
     return vshard < VIRTUAL_SHARD_COUNT && snapshotRevision != 0 && canonicalHex128(verificationHash) &&
-           canonicalHex128(catalogHash) && encodedSize >= 12 && encodedSize <= (uint64_t{1} << 40);
+           canonicalHex128(catalogHash) && encodedSize >= 12 && encodedSize <= (uint64_t{1} << 40) &&
+           canonicalHex256(encodedSha256);
 }
 
+namespace {
+
+std::string encodeManifestAuthenticationPayload(const ClusterBackupManifest& manifest) {
+    std::string out;
+    out.reserve(512u << 10);
+    putU32(out, kMagic);
+    putU32(out, kVersion);
+    putBlob(out, manifest.authenticationKeyId);
+    putBlob(out, manifest.sourceClusterUuid);
+
+    putU32(out, static_cast<uint32_t>(manifest.control.policies.size()));
+    for (const auto& [key, cell] : manifest.control.policies) {
+        putBlob(out, key);
+        putU64(out, cell.version);
+        putBlob(out, cell.value);
+    }
+    putU64(out, manifest.control.lastRetentionSweepId);
+    putU32(out, static_cast<uint32_t>(manifest.control.retentionCutoffs.size()));
+    for (const auto& [measurement, cutoff] : manifest.control.retentionCutoffs) {
+        putBlob(out, measurement);
+        putU64(out, cutoff.policyVersion);
+        putU64(out, cutoff.cutoffTime);
+    }
+    putU32(out, static_cast<uint32_t>(manifest.control.frozenDeletePlans.size()));
+    for (const auto& [id, plan] : manifest.control.frozenDeletePlans) {
+        (void)id;
+        putFrozenPlan(out, plan);
+    }
+
+    putU32(out, static_cast<uint32_t>(manifest.vshards.size()));
+    for (const auto& unit : manifest.vshards) {
+        putU16(out, unit.vshard);
+        putU64(out, unit.snapshotRevision);
+        putBlob(out, unit.verificationHash);
+        putBlob(out, unit.catalogHash);
+        putU64(out, unit.encodedSize);
+        putBlob(out, unit.encodedSha256);
+    }
+    return out;
+}
+
+}  // namespace
+
 bool ClusterBackupManifest::valid() const {
-    if (!canonicalHex128(sourceClusterUuid) || !control.valid() || vshards.size() != VIRTUAL_SHARD_COUNT)
+    if (!canonicalHex256(authenticationKeyId) || !canonicalHex256(authenticationTag) ||
+        !canonicalHex128(sourceClusterUuid) || !control.valid() || vshards.size() != VIRTUAL_SHARD_COUNT)
         return false;
     for (size_t i = 0; i < vshards.size(); ++i)
         if (!vshards[i].valid() || vshards[i].vshard != i)
@@ -517,43 +669,22 @@ bool ClusterBackupManifest::valid() const {
     return true;
 }
 
+void ClusterBackupManifest::authenticate(const ClusterBackupAuthenticationKey& key) {
+    authenticationKeyId = key.keyId();
+    authenticationTag.clear();
+    authenticationTag = key.authenticate(encodeManifestAuthenticationPayload(*this));
+}
+
+bool ClusterBackupManifest::authenticatedBy(const ClusterBackupAuthenticationKey& key) const {
+    return valid() && authenticationKeyId == key.keyId() &&
+           key.verifies(encodeManifestAuthenticationPayload(*this), authenticationTag);
+}
+
 std::string ClusterBackupManifest::encode() const {
     if (!valid())
         throw std::invalid_argument("cannot encode invalid TSBK v1 manifest");
-    std::string out;
-    out.reserve(512u << 10);
-    putU32(out, kMagic);
-    putU32(out, kVersion);
-    putBlob(out, sourceClusterUuid);
-
-    putU32(out, static_cast<uint32_t>(control.policies.size()));
-    for (const auto& [key, cell] : control.policies) {
-        putBlob(out, key);
-        putU64(out, cell.version);
-        putBlob(out, cell.value);
-    }
-    putU64(out, control.lastRetentionSweepId);
-    putU32(out, static_cast<uint32_t>(control.retentionCutoffs.size()));
-    for (const auto& [measurement, cutoff] : control.retentionCutoffs) {
-        putBlob(out, measurement);
-        putU64(out, cutoff.policyVersion);
-        putU64(out, cutoff.cutoffTime);
-    }
-    putU32(out, static_cast<uint32_t>(control.frozenDeletePlans.size()));
-    for (const auto& [id, plan] : control.frozenDeletePlans) {
-        (void)id;
-        putFrozenPlan(out, plan);
-    }
-
-    putU32(out, static_cast<uint32_t>(vshards.size()));
-    for (const auto& unit : vshards) {
-        putU16(out, unit.vshard);
-        putU64(out, unit.snapshotRevision);
-        putBlob(out, unit.verificationHash);
-        putBlob(out, unit.catalogHash);
-        putU64(out, unit.encodedSize);
-        putU64(out, unit.encodedHash);
-    }
+    std::string out = encodeManifestAuthenticationPayload(*this);
+    putBlob(out, authenticationTag);
     const uint32_t crc = CRC32::compute(out.data(), out.size());
     putU32(out, crc);
     if (out.size() > kMaxManifestBytes)
@@ -574,6 +705,7 @@ std::optional<ClusterBackupManifest> ClusterBackupManifest::decode(std::string_v
         return std::nullopt;
 
     ClusterBackupManifest out;
+    out.authenticationKeyId = reader.blob(kAuthenticationHexBytes);
     out.sourceClusterUuid = reader.blob(32);
     const uint32_t policyCount = reader.u32();
     if (!reader.ok() || policyCount > kMaxPortablePolicies)
@@ -616,11 +748,12 @@ std::optional<ClusterBackupManifest> ClusterBackupManifest::decode(std::string_v
         unit.verificationHash = reader.blob(kHashHexBytes);
         unit.catalogHash = reader.blob(kHashHexBytes);
         unit.encodedSize = reader.u64();
-        unit.encodedHash = reader.u64();
+        unit.encodedSha256 = reader.blob(kAuthenticationHexBytes);
         if (!reader.ok() || !unit.valid() || unit.vshard != i)
             return std::nullopt;
         out.vshards.push_back(std::move(unit));
     }
+    out.authenticationTag = reader.blob(kAuthenticationHexBytes);
     if (!reader.exhausted() || !out.valid())
         return std::nullopt;
     return out;
@@ -639,11 +772,12 @@ std::optional<PortableControlBackup> BackupRestore::capturePortableControl(const
     return out;
 }
 
-RestorePlan BackupRestore::planRestore(const ClusterBackupManifest& backup, std::string newClusterUuid) {
+RestorePlan BackupRestore::planRestore(const ClusterBackupManifest& backup, std::string newClusterUuid,
+                                       const ClusterBackupAuthenticationKey& authenticationKey) {
     RestorePlan out;
     out.newClusterUuid = std::move(newClusterUuid);
-    if (!backup.valid()) {
-        out.error = "restore: invalid or incomplete TSBK v1 manifest";
+    if (!backup.authenticatedBy(authenticationKey)) {
+        out.error = "restore: invalid, incomplete, or unauthenticated TSBK v1 manifest";
         return out;
     }
     if (!canonicalClusterUuid(out.newClusterUuid)) {
@@ -683,13 +817,13 @@ VShardBackupUnit unitFromInfo(uint16_t vshard, const data::SnapshotPayloadFileIn
                             info.manifest.verificationHash,
                             info.manifest.catalogHash,
                             info.encodedSize,
-                            info.encodedHash};
+                            info.encodedSha256};
 }
 
 bool infoMatchesUnit(const data::SnapshotPayloadFileInfo& info, const VShardBackupUnit& unit) {
     return info.manifest.vshard.value() == unit.vshard && info.manifest.snapshotRevision == unit.snapshotRevision &&
            info.manifest.verificationHash == unit.verificationHash && info.manifest.catalogHash == unit.catalogHash &&
-           info.encodedSize == unit.encodedSize && info.encodedHash == unit.encodedHash;
+           info.encodedSize == unit.encodedSize && info.encodedSha256 == unit.encodedSha256;
 }
 
 std::optional<uint16_t> parseCanonicalUnitFilename(std::string_view name) {
@@ -817,8 +951,9 @@ seastar::future<std::optional<VShardBackupUnit>> ClusterBackupArchive::stageVSha
 }
 
 seastar::future<bool> ClusterBackupArchive::publish(const std::filesystem::path& archiveDirectory,
-                                                    const ClusterBackupManifest& manifest) {
-    if (!manifest.valid())
+                                                    const ClusterBackupManifest& manifest,
+                                                    const ClusterBackupAuthenticationKey& authenticationKey) {
+    if (!manifest.authenticatedBy(authenticationKey))
         co_return false;
     const auto manifestPath = archiveDirectory / kManifestFilename;
     const auto temporaryPath = archiveDirectory / kManifestTemporaryFilename;
@@ -837,7 +972,7 @@ seastar::future<bool> ClusterBackupArchive::publish(const std::filesystem::path&
         }
     });
     if (!pathAbsent(manifestPath)) {
-        auto existing = co_await validate(archiveDirectory);
+        auto existing = co_await validate(archiveDirectory, authenticationKey);
         co_return existing && *existing == manifest;
     }
     if (!co_await seastar::async([archiveDirectory] { return archiveShapeValid(archiveDirectory, false); }))
@@ -854,13 +989,13 @@ seastar::future<bool> ClusterBackupArchive::publish(const std::filesystem::path&
 }
 
 seastar::future<std::optional<ClusterBackupManifest>> ClusterBackupArchive::validate(
-    const std::filesystem::path& archiveDirectory) {
+    const std::filesystem::path& archiveDirectory, const ClusterBackupAuthenticationKey& authenticationKey) {
     const auto bytes = co_await seastar::async(
         [path = archiveDirectory / kManifestFilename] { return readBoundedFile(path, kMaxManifestBytes); });
     if (!bytes)
         co_return std::nullopt;
     auto manifest = ClusterBackupManifest::decode(*bytes);
-    if (!manifest)
+    if (!manifest || !manifest->authenticatedBy(authenticationKey))
         co_return std::nullopt;
     if (!co_await seastar::async([archiveDirectory] { return archiveShapeValid(archiveDirectory, true); }))
         co_return std::nullopt;

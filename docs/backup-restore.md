@@ -12,11 +12,13 @@ journals. Copying only `shard_*` directories omits cluster authority and cannot
 produce a restorable cluster backup. Independently copying three live replicas
 also does not create one coordinated recovery point.
 
-The internal exact-v1 cluster artifact, coordinated export, and node-local
-restore layers are implemented, but they are not yet an approved production
-workflow. The bounded all-voter RF=3 recovery gate passes, but authenticated
-artifact handling, capacity policy, and the disaster-recovery runbook remain
-incomplete, so clustered deployment remains blocked for production. Do not clone
+The exact-v1 cluster artifact, coordinated export, authenticated manifest,
+node-local restore, capacity/retention policy, and disaster-recovery procedure
+are implemented below. The bounded all-voter RF=3 recovery gate passes. This
+closes the backup-specific implementation blocker, but does not by itself
+approve the whole clustered server for production: the final multi-host fault
+matrix and production SLO measurements in
+[cluster-production-readiness.md](cluster-production-readiness.md) remain. Do not clone
 `node.json`, `control_map.cache`, or `cluster_raft/` into a new node or cluster;
 that can duplicate identity or resurrect obsolete membership.
 
@@ -36,19 +38,22 @@ cluster-backup/
 ```
 
 `manifest.tsbk1` is checksummed `TSBK` version 1. It records the source cluster
-UUID, portable schema/retention/delete-plan state, and metadata for exactly
-4,096 canonical `TSP1` files. Node identities, join tokens, controller
-ownership, serving placement, movement jobs, and old Raft membership are
-deliberately absent.
+UUID, portable schema/retention/delete-plan state, metadata for exactly 4,096
+canonical `TSP1` files, a SHA-256 key identifier, and an HMAC-SHA-256 tag over
+all of those fields. The tag therefore authenticates every unit's complete-file
+SHA-256, encoded size, and embedded verification/catalog hashes. Node identities, join
+tokens, controller ownership, serving placement, movement jobs, and old Raft
+membership are deliberately absent.
 
 Each unit is copied through a fixed 1-MiB buffer, revalidated from the copied
 file, fsynced, and published without replacement. The manifest is fsynced and
 published last, so its presence is the completeness marker. Validation streams
 object bytes without extraction and rejects a bad checksum/catalog/fence,
 metadata mismatch, missing or extra unit, noncanonical name, symlink, partial
-temporary, or unsupported version. These hashes detect corruption; the
-artifact is not an authenticated or encrypted container and must not yet be
-treated as a complete off-site backup product.
+temporary, unsupported version, unknown key, or invalid authentication tag.
+The CRC and unit hashes detect accidental corruption; only the HMAC establishes
+authenticity. Unit contents are not encrypted by the TSBK format, so the
+encrypted-storage rules below are mandatory for confidentiality.
 
 The bounded in-process gate creates all 4,096 units, includes one real Engine
 snapshot, exercises interrupted staging and manifest publication, rejects
@@ -85,13 +90,49 @@ VShards captured later can include later concurrent writes. The RF=3 gate proves
 that every acknowledged pre-export write is present after restore and bounds
 the captured concurrent-write set by the source result.
 
+## Cluster backup key and encryption policy
+
+Generate a dedicated 256-bit key under a restrictive umask; do not reuse the
+HTTP bearer token, a TLS private key, or the cluster UUID:
+
+```sh
+umask 077
+openssl rand -hex 32 > /run/secrets/timestar-backup-auth.key
+```
+
+Set `cluster.backup_auth_key_file` to that path, or set
+`TIMESTAR_CLUSTER_BACKUP_AUTH_KEY_FILE`. The file must be a nonsymlink regular
+file owned by the server's effective user, have no group/other permission bits,
+and contain exactly 64 lowercase hexadecimal characters plus an optional final
+line feed. An invalid configured file fails server startup. Export returns 503
+when no key is configured, and offline restore refuses a missing or wrong key
+before it imports a VShard. Every host eligible to coordinate an export and
+every restore-preparation host needs the same protected key version.
+
+The manifest contains only `SHA-256(key)` as its key identifier; the secret is
+never placed in the archive, HTTP request, response, or log. Keep each retired
+key version in the organization's secrets manager for at least as long as any
+backup made with it is retained. Rotate by installing a new owner-only file and
+restarting coordinators between backup operations. Restoring an older artifact
+requires selecting its recorded key version from the secrets manager; never
+overwrite or discard an old key while its backup is inside retention.
+
+HMAC does not hide the dataset. The live staging filesystem and every retained
+copy must use encryption at rest with a separately managed KMS key, and all
+replication/download traffic must use an authenticated encrypted channel. For
+object storage, require server-side encryption with a customer-managed key (or
+a bounded streaming client-side envelope), object versioning, and an immutable
+retention/lock policy. Deny plaintext buckets, public access, and key deletion
+before the last dependent backup expires. The backup HMAC key and storage
+encryption key must have different access policies so compromise of one does
+not silently grant both plaintext access and forgery.
+
 ## Pre-release cluster export API
 
-These routes remain pre-release while artifact security and operations are
-unfinished; the passing RF=3 gate does not remove the production block above.
-They are unavailable when server
-bearer authentication is disabled and must be called on the current Group-0
-leader.
+These routes remain part of the pre-release clustered server until the
+repository-wide release gates named above pass. They are unavailable when
+server bearer authentication or the backup authentication key is absent and
+must be called on the current Group-0 leader.
 
 Start a new export (the server returns a generated 32-hex operation ID), or
 resume by resubmitting the returned ID and exact archive path:
@@ -105,11 +146,11 @@ Content-Type: application/json
 ```
 
 The archive and its sibling `<archive>.export.v1` checkpoint must be on the
-same durable filesystem. To resume after the Group-0 leader moves to another
-host, that filesystem must be mounted at the same path on every eligible
-coordinator; otherwise resume is limited to a process restart on the original
-host. Do not place either path on ephemeral node-local storage when node-loss
-resume is required.
+same durable, encrypted filesystem. To resume after the Group-0 leader moves to
+another host, that filesystem must be mounted at the same path on every
+eligible coordinator; otherwise resume is limited to a process restart on the
+original host. Do not place either path on ephemeral node-local storage when
+node-loss resume is required.
 
 Observe the in-process task with `GET /cluster/backup/export`. The response
 reports `running`, `cancelled`, `failed`, or `complete`, the operation and
@@ -183,11 +224,97 @@ release remains fenced offline.
 
 This closes the accidental empty-majority hole in the restore composition: no
 prepared voter can start until the offline finalizer has observed every voter's
-complete marker. The markers and release are checksummed integrity records, not
-cryptographic signatures; the operator and distribution channel remain trusted.
-Cluster backup/restore is still unsupported for production until coordinated
-artifact authentication/encryption, capacity and retention policy, off-site
-replication, and the recovery runbook are complete.
+complete marker. The markers and release are checksummed local ceremony
+records, not cryptographic signatures; distribute them over the authenticated
+operator channel and protect each prepared data root with the same host/storage
+controls used for live data. The source archive itself must pass its HMAC before
+any marker can be produced.
+
+## Capacity, retention, and off-site policy
+
+An export temporarily holds the final archive, one downloaded source unit, and
+one destination partial copy of that unit. Before starting, reserve on the
+shared staging filesystem at least:
+
+```
+estimated complete TSP1 bytes + (2 * largest estimated VShard unit) + 1 GiB
+```
+
+Also keep the filesystem's normal operational reserve (at least 20% free is the
+default deployment floor). If the estimate or reserve cannot be established,
+do not start the export. A disk-full failure leaves the exact operation's
+checkpoint and already-published units for resume; it does not make an archive
+complete. Restore roots need room for their selected imported TSP1 units plus
+the normal Engine/Raft growth and compaction reserve. Do not colocate staging
+with a live node's data volume when filling staging could exhaust live storage.
+
+Adopt and record an RPO/RTO-specific schedule. The minimum production policy is:
+
+- retain at least three independently completed generations;
+- keep copies in two failure domains, with at least one off-site immutable
+  encrypted copy;
+- never count an archive until `manifest.tsbk1` was published, the off-site
+  transfer completed, and inventory records its operation ID, source UUID,
+  HMAC key ID, byte count, creation time, and object-store version;
+- never delete the newest verified off-site generation until a newer generation
+  has passed a full restore drill; and
+- expire the archive, sibling `.export.v1` checkpoint, object versions, and
+  corresponding key-version dependency as one reviewed retention action. There
+  is intentionally no server-side delete API.
+
+Copy the 4,096 immutable units first and `manifest.tsbk1` last. Preserve
+canonical paths; do not unpack/repack into a layout that adds entries. Upload
+through TLS, enable object versioning and retention lock, then compare the
+remote object count and byte inventory with the local archive before removing
+staging. A mere successful upload is not a recovery test. At least quarterly,
+and after key/storage/deployment changes, retrieve one retained copy into a
+fresh encrypted staging directory and perform the complete recovery drill
+below.
+
+## Cluster disaster-recovery runbook
+
+1. Declare the source cluster unavailable and fence all old nodes, load
+   balancers, automation, and credentials from the recovery network. Do not let
+   a restored cluster share peer addresses or client write traffic with the
+   source.
+2. Select the newest backup satisfying the incident's recovery point. Record
+   its immutable object versions and retrieve all unit objects followed by the
+   manifest over an authenticated encrypted channel into a fresh directory.
+   Select the matching HMAC key version from the secrets manager.
+3. Provision fresh encrypted data roots and fresh persistent node identities.
+   Choose a new lowercase 32-hex cluster UUID, configure the final RF=3 peer
+   set/Group-0 seed/failure domains, mTLS, operator authentication, and
+   `cluster.backup_auth_key_file`. Confirm every root is empty and no peer/data
+   port is reachable from the old cluster.
+4. On every data voter, run the server once with
+   `--cluster-restore <retrieved-archive>`. Run preparation offline. A wrong
+   key, corrupt/missing/extra unit, conflicting resume request, or nonfresh root
+   must fail closed. If interrupted, rerun the exact command with the same
+   archive, identity, UUID, core count, and serving map.
+5. Collect `cluster_restore.v1` from every voter named by the serving map and
+   the Group-0 seed. On an isolated operator host, finalize one release with
+   `timestar_cluster_restore finalize --output restore.tsrr1 <all-markers>`.
+   Treat a missing/extra/duplicate marker as an incident; do not bypass it.
+6. Distribute that exact release over the authenticated operator channel.
+   Activate the control seed first with the release option and `--cluster-init`,
+   then activate every other prepared voter with the same release. An
+   interrupted activation is safe to restart without the option once its
+   receipt is durable.
+7. Before admitting client traffic, require all 4,096 groups led with RF=3,
+   Group-0 quorum healthy, no restore/import errors, expected schema and
+   retention state, and readback of the recorded canary/query set on every
+   node. Restart all restored nodes once and repeat health and readback. Mint
+   new join/operator credentials; verify source join tokens and node identities
+   are rejected.
+8. Record actual recovery point and recovery time, archive operation/key/object
+   versions, all marker identities, validation results, and deviations. Keep
+   the old cluster fenced and the selected backup locked until incident review
+   explicitly releases them.
+
+Abort rather than improvise around HMAC failure, incomplete participants,
+identity reuse, same source/new cluster UUID, map disagreement, insufficient
+capacity, or a failed restart/readback. Those conditions mean the recovery is
+not proven safe to serve.
 
 ## Data Directory Structure
 

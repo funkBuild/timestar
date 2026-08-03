@@ -529,6 +529,7 @@ void applyEnvironmentOverrides(TimestarConfig& cfg) {
     envString("TIMESTAR_CLUSTER_TLS_CERT_FILE", cfg.cluster.tls_cert_file);
     envString("TIMESTAR_CLUSTER_TLS_KEY_FILE", cfg.cluster.tls_key_file);
     envString("TIMESTAR_CLUSTER_TLS_CA_FILE", cfg.cluster.tls_ca_file);
+    envString("TIMESTAR_CLUSTER_BACKUP_AUTH_KEY_FILE", cfg.cluster.backup_auth_key_file);
     envBool("TIMESTAR_CLUSTER_DEVELOPMENT_ALLOW_INSECURE_TRANSPORT",
             cfg.cluster.development_allow_insecure_transport);
     envBool("TIMESTAR_CLUSTER_CONTROL_ENABLED", cfg.cluster.control_enabled);

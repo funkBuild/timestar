@@ -108,27 +108,37 @@ TEST(StreamSubscription, ResumeFromTokenDropsAlreadySeen) {
 
 // ---- Backup / restore ----
 
+const ClusterBackupAuthenticationKey& backupAuthenticationKey() {
+    static const auto key = ClusterBackupAuthenticationKey::fromHex(
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+    return key;
+}
+
 ClusterBackupManifest completeBackup() {
     ClusterBackupManifest backup;
     backup.sourceClusterUuid = "00112233445566778899aabbccddeeff";
     backup.vshards.reserve(VIRTUAL_SHARD_COUNT);
     for (uint16_t i = 0; i < VIRTUAL_SHARD_COUNT; ++i) {
         backup.vshards.push_back(VShardBackupUnit{i, uint64_t{i} + 1, "00112233445566778899aabbccddeeff",
-                                                  "ffeeddccbbaa00998877665544332211", 12, uint64_t{i} + 9});
+                                                  "ffeeddccbbaa00998877665544332211", 12, std::string(64, 'a')});
     }
+    backup.authenticate(backupAuthenticationKey());
     return backup;
 }
 
 TEST(BackupRestore, ExactV1ManifestRoundTripPlansFreshClusterRestore) {
     auto backup = completeBackup();
     backup.control.policies.emplace("schema/cpu", PolicyCell{7, "portable-schema"});
+    backup.authenticate(backupAuthenticationKey());
     ASSERT_TRUE(backup.valid());
+    ASSERT_TRUE(backup.authenticatedBy(backupAuthenticationKey()));
     const auto encoded = backup.encode();
     auto decoded = ClusterBackupManifest::decode(encoded);
     ASSERT_TRUE(decoded.has_value());
     EXPECT_EQ(*decoded, backup);
 
-    auto plan = BackupRestore::planRestore(*decoded, "ffeeddccbbaa00998877665544332211");
+    auto plan = BackupRestore::planRestore(*decoded, "ffeeddccbbaa00998877665544332211",
+                                           backupAuthenticationKey());
     ASSERT_TRUE(plan.ok) << plan.error;
     EXPECT_EQ(plan.newClusterUuid, "ffeeddccbbaa00998877665544332211");
     EXPECT_EQ(plan.vshards.size(), VIRTUAL_SHARD_COUNT);
@@ -137,13 +147,15 @@ TEST(BackupRestore, ExactV1ManifestRoundTripPlansFreshClusterRestore) {
 
 TEST(BackupRestore, RejectsSameOrNonCanonicalUuidAndIncompleteManifest) {
     auto backup = completeBackup();
-    auto same = BackupRestore::planRestore(backup, backup.sourceClusterUuid);
+    auto same = BackupRestore::planRestore(backup, backup.sourceClusterUuid, backupAuthenticationKey());
     EXPECT_FALSE(same.ok);
-    EXPECT_FALSE(BackupRestore::planRestore(backup, "FFEEDDCCBBAA00998877665544332211").ok);
+    EXPECT_FALSE(
+        BackupRestore::planRestore(backup, "FFEEDDCCBBAA00998877665544332211", backupAuthenticationKey()).ok);
 
     backup.vshards.pop_back();
     EXPECT_FALSE(backup.valid());
-    auto truncated = BackupRestore::planRestore(backup, "ffeeddccbbaa00998877665544332211");
+    auto truncated =
+        BackupRestore::planRestore(backup, "ffeeddccbbaa00998877665544332211", backupAuthenticationKey());
     EXPECT_FALSE(truncated.ok);
     EXPECT_TRUE(truncated.vshards.empty());
 }
@@ -160,10 +172,43 @@ TEST(BackupRestore, ManifestDecoderRejectsCorruptionUnknownVersionAndAliases) {
         badVersion[badVersion.size() - 4 + i] = static_cast<char>((crc >> (8 * i)) & 0xff);
     EXPECT_FALSE(ClusterBackupManifest::decode(badVersion).has_value());
 
+    auto retaggedCorruption = completeBackup();
+    retaggedCorruption.sourceClusterUuid[0] = '1';
+    auto structurallyValidTamper = ClusterBackupManifest::decode(retaggedCorruption.encode());
+    ASSERT_TRUE(structurallyValidTamper);
+    EXPECT_FALSE(structurallyValidTamper->authenticatedBy(backupAuthenticationKey()));
+
+    const auto wrongKey = ClusterBackupAuthenticationKey::fromHex(
+        "1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+    EXPECT_FALSE(completeBackup().authenticatedBy(wrongKey));
+    EXPECT_FALSE(BackupRestore::planRestore(completeBackup(), "ffeeddccbbaa00998877665544332211", wrongKey).ok);
+
     auto duplicate = completeBackup();
     duplicate.vshards[17].vshard = 16;
     EXPECT_FALSE(duplicate.valid());
     EXPECT_THROW((void)duplicate.encode(), std::invalid_argument);
+}
+
+TEST(BackupRestore, AuthenticationKeyFileMustBeOwnerOnlyCanonicalAndNotASymlink) {
+    namespace fs = std::filesystem;
+    const fs::path root = "backup_auth_key_test";
+    const fs::path keyFile = root / "key";
+    const fs::path alias = root / "alias";
+    fs::remove_all(root);
+    fs::create_directory(root);
+    {
+        std::ofstream out(keyFile);
+        out << "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n";
+    }
+    fs::permissions(keyFile, fs::perms::owner_read | fs::perms::owner_write, fs::perm_options::replace);
+    EXPECT_EQ(ClusterBackupAuthenticationKey::load(keyFile), backupAuthenticationKey());
+
+    fs::permissions(keyFile, fs::perms::owner_read | fs::perms::group_read, fs::perm_options::replace);
+    EXPECT_THROW((void)ClusterBackupAuthenticationKey::load(keyFile), std::invalid_argument);
+    fs::permissions(keyFile, fs::perms::owner_read | fs::perms::owner_write, fs::perm_options::replace);
+    fs::create_symlink(fs::absolute(keyFile), alias);
+    EXPECT_THROW((void)ClusterBackupAuthenticationKey::load(alias), std::system_error);
+    fs::remove_all(root);
 }
 
 TEST(BackupRestore, PortableControlCaptureScrubsAuthorityAndFencesActiveSweep) {

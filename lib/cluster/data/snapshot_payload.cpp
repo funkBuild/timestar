@@ -3,6 +3,8 @@
 #include "../../storage/series_catalog.hpp"
 #include "replicated_command.hpp"
 
+#include <gnutls/crypto.h>
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -36,6 +38,16 @@ uint64_t fnvExtend(uint64_t hash, const char* data, size_t size) {
 
 uint64_t fnv1a(const char* p, size_t n) {
     return fnvExtend(1469598103934665603ull, p, n);
+}
+
+std::string encodeSha256(const std::array<unsigned char, 32>& digest) {
+    static constexpr std::string_view digits = "0123456789abcdef";
+    std::string out(digest.size() * 2, '0');
+    for (size_t i = 0; i < digest.size(); ++i) {
+        out[2 * i] = digits[digest[i] >> 4];
+        out[2 * i + 1] = digits[digest[i] & 0x0f];
+    }
+    return out;
 }
 
 void putU32(std::string& out, uint32_t v) {
@@ -341,8 +353,13 @@ public:
         encodedSize_ = static_cast<uint64_t>(end);
         remaining_ = encodedSize_ - 8;
         in_.seekg(0, std::ios::beg);
-        if (!in_)
+        if (!in_ || gnutls_hash_init(&sha256_, GNUTLS_DIG_SHA256) < 0)
             ok = false;
+    }
+
+    ~StreamReader() {
+        if (sha256_)
+            gnutls_hash_deinit(sha256_, nullptr);
     }
 
     bool ok = true;  // Reader-compatible field used by shared helpers
@@ -351,6 +368,7 @@ public:
                                                                : static_cast<size_t>(remaining_);
     }
     uint64_t encodedSize() const { return encodedSize_; }
+    const std::string& encodedSha256() const { return encodedSha256_; }
     uint32_t u32() {
         char data[4]{};
         if (!read(data, sizeof(data)))
@@ -440,6 +458,14 @@ public:
             ok = false;
             return std::nullopt;
         }
+        if (!sha256_ || gnutls_hash(sha256_, trailer, sizeof(trailer)) < 0) {
+            ok = false;
+            return std::nullopt;
+        }
+        std::array<unsigned char, 32> digest{};
+        gnutls_hash_deinit(sha256_, digest.data());
+        sha256_ = nullptr;
+        encodedSha256_ = encodeSha256(digest);
         return fnvExtend(hash_, trailer, sizeof(trailer));
     }
 
@@ -459,8 +485,13 @@ private:
                 ok = false;
                 return false;
             }
-            if (hashReads_)
+            if (hashReads_) {
                 hash_ = fnvExtend(hash_, output + offset, count);
+                if (!sha256_ || gnutls_hash(sha256_, output + offset, count) < 0) {
+                    ok = false;
+                    return false;
+                }
+            }
             offset += count;
             if (size >= (size_t{1} << 20))
                 seastar::thread::yield();
@@ -499,6 +530,8 @@ private:
     bool hashReads_ = false;
     uint64_t hash_ = 1469598103934665603ull;
     uint64_t encodedSize_ = 0;
+    gnutls_hash_hd_t sha256_ = nullptr;
+    std::string encodedSha256_;
 };
 
 std::optional<uint64_t> verifiedFileBodyLength(const std::filesystem::path& path) {
@@ -927,7 +960,8 @@ seastar::future<std::optional<SnapshotPayloadFileInfo>> inspectSnapshotPayloadFi
         const auto encodedHash = reader.finishAndVerifyTrailer();
         if (!encodedHash)
             return std::nullopt;
-        return SnapshotPayloadFileInfo{std::move(*manifest), reader.encodedSize(), *encodedHash};
+        return SnapshotPayloadFileInfo{std::move(*manifest), reader.encodedSize(), *encodedHash,
+                                       reader.encodedSha256()};
     });
 }
 

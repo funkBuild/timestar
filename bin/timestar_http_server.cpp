@@ -72,6 +72,7 @@ seastar::sharded<Engine> g_engine;
 // node and M1 full-replication clusters are byte-identical.
 timestar::cluster::ClusterDataPlane g_clusterDataPlane;
 bool g_clusterPartitioned = false;
+static std::optional<timestar::features::ClusterBackupAuthenticationKey> g_clusterBackupAuthenticationKey;
 
 // Consecutive compaction failures on any one tier before /health reports
 // "degraded". One failure can be transient; a run of them means the tier is
@@ -430,6 +431,12 @@ void set_routes(routes& r) {
                 rep->_content = R"({"status":"error","message":"node is not clustered"})";
                 co_return std::move(rep);
             }
+            if (!g_clusterBackupAuthenticationKey) {
+                rep->set_status(seastar::http::reply::status_type::service_unavailable);
+                rep->_content =
+                    R"({"status":"error","message":"cluster backup authentication key is not configured"})";
+                co_return std::move(rep);
+            }
             const auto status =
                 co_await seastar::smp::submit_to(0u, [] { return g_clusterDataPlane.backupExportStatus(); });
             rep->set_status(seastar::http::reply::status_type::ok);
@@ -452,6 +459,12 @@ void set_routes(routes& r) {
                 rep->_content = R"({"status":"error","message":"node is not clustered"})";
                 co_return std::move(rep);
             }
+            if (!g_clusterBackupAuthenticationKey) {
+                rep->set_status(seastar::http::reply::status_type::service_unavailable);
+                rep->_content =
+                    R"({"status":"error","message":"cluster backup authentication key is not configured"})";
+                co_return std::move(rep);
+            }
             ClusterBackupExportRequestBody body;
             if (req->content.size() > 4096 || glz::read_json(body, req->content) || body.archive_directory.empty() ||
                 body.archive_directory.size() > 2048 ||
@@ -467,8 +480,10 @@ void set_routes(routes& r) {
             try {
                 auto status = co_await seastar::smp::submit_to(
                     0u,
-                    [archive = std::move(body.archive_directory), operation = std::move(body.operation_id)]() mutable {
-                        return g_clusterDataPlane.startBackupExport(std::move(archive), std::move(operation));
+                    [archive = std::move(body.archive_directory), operation = std::move(body.operation_id),
+                     authenticationKey = *g_clusterBackupAuthenticationKey]() mutable {
+                        return g_clusterDataPlane.startBackupExport(std::move(archive), std::move(operation),
+                                                                    std::move(authenticationKey));
                     });
                 rep->add_header("Cache-Control", "no-store");
                 rep->set_status(status.phase == timestar::cluster::ClusterDataPlane::BackupExportPhase::Complete
@@ -982,6 +997,16 @@ int main(int argc, char** argv) {
             timestar::http_log.info("Starting TimeStar {} ({}) built {} with {}", timestar::VERSION,
                                     timestar::GIT_COMMIT, timestar::BUILD_TIME, timestar::COMPILER);
 
+            try {
+                const auto& keyFile = timestar::config().cluster.backup_auth_key_file;
+                if (!keyFile.empty())
+                    g_clusterBackupAuthenticationKey =
+                        timestar::features::ClusterBackupAuthenticationKey::load(keyFile);
+            } catch (const std::exception& e) {
+                timestar::http_log.error("cluster backup authentication key refused: {}", e.what());
+                return 1;
+            }
+
             {
                 const auto& cc = timestar::config().cluster;
                 if (clusterInitRequested && !cc.control_enabled) {
@@ -1018,6 +1043,11 @@ int main(int argc, char** argv) {
                     (!cc.enabled || !cc.partitioned || cc.replication_factor <= 1 || !cc.control_enabled)) {
                     timestar::http_log.error(
                         "cluster restore requires a VShard-partitioned replicated cluster with Group 0 enabled");
+                    return 1;
+                }
+                if (clusterRestoreArchive && !g_clusterBackupAuthenticationKey) {
+                    timestar::http_log.error(
+                        "--cluster-restore requires cluster.backup_auth_key_file for manifest authentication");
                     return 1;
                 }
                 if ((clusterRestoreArchive || clusterRestoreRelease) &&
@@ -1169,6 +1199,7 @@ int main(int argc, char** argv) {
                     timestar::features::ClusterRestoreSeedRequest request;
                     request.archiveDirectory = *clusterRestoreArchive;
                     request.dataDirectory = dataRoot;
+                    request.authenticationKey = *g_clusterBackupAuthenticationKey;
                     request.newClusterUuid = timestar::config().cluster.cluster_uuid;
                     request.clusterUuidBytes = clusterJournalIdentity->clusterUuid;
                     request.bootId = clusterJournalIdentity->bootId;

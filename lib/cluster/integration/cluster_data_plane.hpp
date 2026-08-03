@@ -477,7 +477,8 @@ public:
     // a different operation/fence for an archive is rejected. Work runs in the
     // background and is observed through backupExportStatus().
     seastar::future<BackupExportStatus> startBackupExport(std::filesystem::path archiveDirectory,
-                                                          std::string operationId);
+                                                          std::string operationId,
+                                                          features::ClusterBackupAuthenticationKey authenticationKey);
     BackupExportStatus backupExportStatus() const { return backupExportStatus_; }
     BackupExportStatus cancelBackupExport(std::string_view operationId);
     static std::string_view backupExportPhaseName(BackupExportPhase phase);
@@ -607,6 +608,7 @@ private:
     BackupExportStatus backupExportStatus_;
     std::filesystem::path backupExportArchive_;
     std::optional<features::ClusterBackupExportCheckpoint> backupExportCheckpoint_;
+    std::optional<features::ClusterBackupAuthenticationKey> backupExportAuthenticationKey_;
 
     // Production topology actuation. Passes never overlap and each successful
     // pass persists at most one MoveJob step through Group 0.

@@ -616,6 +616,8 @@ uint64_t targetFingerprint(const ClusterRestoreSeedRequest& request) {
 void validateRequest(const ClusterRestoreSeedRequest& request) {
     if (request.archiveDirectory.empty() || request.dataDirectory.empty())
         throw std::invalid_argument("cluster restore archive and data directories are required");
+    if (!request.authenticationKey)
+        throw std::invalid_argument("cluster restore authentication key is required");
     if (!BackupRestore::canonicalClusterUuid(request.newClusterUuid) ||
         decodeHex128(request.newClusterUuid) != request.clusterUuidBytes)
         throw std::invalid_argument("cluster restore UUID text and journal identity do not match");
@@ -687,20 +689,29 @@ seastar::future<std::shared_ptr<raft::SnapshotFile>> prepareImportedSnapshot(
     const std::filesystem::path& source, const std::filesystem::path& snapshotDirectory, const VShardBackupUnit& unit) {
     co_await seastar::async([snapshotDirectory] { ensureDirectoryDurable(snapshotDirectory); });
     const auto staging = snapshotDirectory / ("snapshot_v1_import_g" + std::to_string(unit.vshard) + ".bin");
+    const std::filesystem::path authenticated = staging.string() + ".authenticated";
     const auto extraction = snapshotDirectory / "import_extract_tmp";
-    co_await seastar::async([staging, extraction] {
+    co_await seastar::async([staging, authenticated, extraction] {
         std::error_code ec;
         std::filesystem::remove(staging, ec);
+        ec.clear();
+        std::filesystem::remove(authenticated, ec);
         ec.clear();
         std::filesystem::remove_all(extraction, ec);
         if (ec)
             throw std::filesystem::filesystem_error("clean interrupted restore staging", extraction, ec);
     });
 
-    uint64_t size = unit.encodedSize;
-    uint64_t hash = unit.encodedHash;
+    co_await seastar::async(
+        [source, authenticated, expectedSize = unit.encodedSize] { copyFileDurably(source, authenticated, expectedSize); });
+    auto importedInfo = co_await data::inspectSnapshotPayloadFile(authenticated);
+    if (!importedInfo || importedInfo->manifest.vshard.value() != unit.vshard ||
+        importedInfo->encodedSize != unit.encodedSize || importedInfo->encodedSha256 != unit.encodedSha256)
+        throw std::runtime_error("cluster restore TSP1 changed after authenticated archive validation");
+    uint64_t size = importedInfo->encodedSize;
+    uint64_t hash = importedInfo->encodedHash;
     if (unit.snapshotRevision == 1) {
-        auto decoded = co_await data::decodeSnapshotPayloadFile(source, extraction);
+        auto decoded = co_await data::decodeSnapshotPayloadFile(authenticated, extraction);
         if (!decoded)
             throw std::runtime_error("cluster restore could not decode revision-one TSP1 unit");
         decoded->manifest.snapshotRevision = 2;
@@ -708,15 +719,21 @@ seastar::future<std::shared_ptr<raft::SnapshotFile>> prepareImportedSnapshot(
         size = encoded.size;
         hash = encoded.hash;
         encoded.release();
-        co_await seastar::async([extraction] {
+        co_await seastar::async([authenticated, extraction] {
             std::error_code ec;
+            std::filesystem::remove(authenticated, ec);
+            if (ec)
+                throw std::filesystem::filesystem_error("remove authenticated restore staging", authenticated, ec);
             std::filesystem::remove_all(extraction, ec);
             if (ec)
                 throw std::filesystem::filesystem_error("remove restore extraction directory", extraction, ec);
         });
     } else {
-        co_await seastar::async(
-            [source, staging, expectedSize = unit.encodedSize] { copyFileDurably(source, staging, expectedSize); });
+        co_await seastar::async([authenticated, staging, snapshotDirectory] {
+            if (::rename(authenticated.c_str(), staging.c_str()) < 0)
+                throwIo("publish authenticated restore staging", staging);
+            fsyncDirectory(snapshotDirectory);
+        });
     }
 
     auto file = std::make_shared<raft::SnapshotFile>();
@@ -892,10 +909,10 @@ ClusterRestoreTargetState ClusterRestoreSeeder::inspectTarget(const std::filesys
 
 seastar::future<ClusterRestoreSeedResult> ClusterRestoreSeeder::seed(ClusterRestoreSeedRequest request) {
     validateRequest(request);
-    auto manifest = co_await ClusterBackupArchive::validate(request.archiveDirectory);
+    auto manifest = co_await ClusterBackupArchive::validate(request.archiveDirectory, *request.authenticationKey);
     if (!manifest)
-        throw std::runtime_error("cluster restore archive is incomplete, corrupt, or not exact v1");
-    auto plan = BackupRestore::planRestore(*manifest, request.newClusterUuid);
+        throw std::runtime_error("cluster restore archive is incomplete, corrupt, unauthenticated, or not exact v1");
+    auto plan = BackupRestore::planRestore(*manifest, request.newClusterUuid, *request.authenticationKey);
     if (!plan.ok)
         throw std::runtime_error(plan.error);
 

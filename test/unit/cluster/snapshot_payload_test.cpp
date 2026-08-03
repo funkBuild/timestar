@@ -5,6 +5,7 @@
 #include <gtest/gtest.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <filesystem>
 #include <fstream>
@@ -163,6 +164,9 @@ TEST(SnapshotPayloadV1, FileCodecIsExactV1AndStreamsBothDirections) {
         EXPECT_EQ(inspected->manifest, original.manifest);
         EXPECT_EQ(inspected->encodedSize, encoded.size);
         EXPECT_EQ(inspected->encodedHash, encoded.hash);
+        ASSERT_EQ(inspected->encodedSha256.size(), 64u);
+        EXPECT_TRUE(std::all_of(inspected->encodedSha256.begin(), inspected->encodedSha256.end(),
+                                [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); }));
 
         auto decoded = decodeSnapshotPayloadFile(encoded.path, dir / "extract").get();
         ASSERT_TRUE(decoded);

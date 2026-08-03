@@ -44,12 +44,15 @@ RESTORE3="$GATE_ROOT/tsgate_br_restore3"
 BADROOT1="$GATE_ROOT/tsgate_br_badroot1"
 BADROOT2="$GATE_ROOT/tsgate_br_badroot2"
 BADROOT3="$GATE_ROOT/tsgate_br_badroot3"
+BADROOT4="$GATE_ROOT/tsgate_br_badroot4"
 MISSING_ARCHIVE="$GATE_ROOT/tsgate_br_missing"
 CORRUPT_ARCHIVE="$GATE_ROOT/tsgate_br_corrupt"
 EXTRA_ARCHIVE="$GATE_ROOT/tsgate_br_extra"
 RELEASE="$WORK/restore.tsrr1"
 BAD_RELEASE="$WORK/incomplete.tsrr1"
-ALL_ROOTS="$SOURCE1 $SOURCE2 $SOURCE3 $RESTORE1 $RESTORE2 $RESTORE3 $BADROOT1 $BADROOT2 $BADROOT3 $WORK $ARCHIVE $EXPORT_STATE $MISSING_ARCHIVE $CORRUPT_ARCHIVE $EXTRA_ARCHIVE"
+BACKUP_KEY="$WORK/backup-auth.key"
+WRONG_BACKUP_KEY="$WORK/wrong-backup-auth.key"
+ALL_ROOTS="$SOURCE1 $SOURCE2 $SOURCE3 $RESTORE1 $RESTORE2 $RESTORE3 $BADROOT1 $BADROOT2 $BADROOT3 $BADROOT4 $WORK $ARCHIVE $EXPORT_STATE $MISSING_ARCHIVE $CORRUPT_ARCHIVE $EXTRA_ARCHIVE"
 declare -a NODE_PIDS
 declare -a SOURCE_NODE_UUIDS
 
@@ -57,8 +60,11 @@ mkdir -p "$GATE_ROOT"
 kill_cluster "$PREFIX"
 require_ports_free $PORTS
 fresh_gate_data_dirs "$SOURCE1" "$SOURCE2" "$SOURCE3" "$RESTORE1" "$RESTORE2" "$RESTORE3" \
-    "$BADROOT1" "$BADROOT2" "$BADROOT3" "$WORK" "$ARCHIVE" || exit 2
+    "$BADROOT1" "$BADROOT2" "$BADROOT3" "$BADROOT4" "$WORK" "$ARCHIVE" || exit 2
 remove_gate_data_dirs "$EXPORT_STATE" "$MISSING_ARCHIVE" "$CORRUPT_ARCHIVE" "$EXTRA_ARCHIVE" || exit 2
+printf '%s\n' '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef' >"$BACKUP_KEY"
+printf '%s\n' '1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef' >"$WRONG_BACKUP_KEY"
+chmod 600 "$BACKUP_KEY" "$WRONG_BACKUP_KEY"
 trap 'gate_cleanup 1994 $ALL_ROOTS' EXIT
 
 node_port() { echo $((19939 + $1)); }
@@ -92,6 +98,7 @@ launch_node() { # NODE DATA_DIR CLUSTER_UUID LOG [server arguments...]
         TIMESTAR_CLUSTER_REPLICATION_FACTOR=3 TIMESTAR_CLUSTER_UUID="$uuid" \
         TIMESTAR_CLUSTER_DEVELOPMENT_ALLOW_INSECURE_TRANSPORT=true \
         TIMESTAR_CLUSTER_CONTROL_ENABLED=true TIMESTAR_CLUSTER_CONTROL_SEED_NODE_ID=1 \
+        TIMESTAR_CLUSTER_BACKUP_AUTH_KEY_FILE="$BACKUP_KEY" \
         TIMESTAR_CLUSTER_FAILURE_DOMAIN="rack-$node" \
         TIMESTAR_CLUSTER_NODE_ID="$node" TIMESTAR_CLUSTER_PEERS="$PEERS" \
         "$BIN" --port "$(node_port "$node")" --smp 1 --memory "$GATE_SERVER_MEMORY" "$@" \
@@ -320,6 +327,7 @@ run_prepare() { # NODE DATA_DIR ARCHIVE LOG [background]
         "TIMESTAR_CLUSTER_REPLICATION_FACTOR=3" "TIMESTAR_CLUSTER_UUID=$RESTORED_UUID"
         "TIMESTAR_CLUSTER_DEVELOPMENT_ALLOW_INSECURE_TRANSPORT=true"
         "TIMESTAR_CLUSTER_CONTROL_ENABLED=true" "TIMESTAR_CLUSTER_CONTROL_SEED_NODE_ID=1"
+        "TIMESTAR_CLUSTER_BACKUP_AUTH_KEY_FILE=$BACKUP_KEY"
         "TIMESTAR_CLUSTER_FAILURE_DOMAIN=rack-$node"
         "TIMESTAR_CLUSTER_NODE_ID=$node" "TIMESTAR_CLUSTER_PEERS=$PEERS"
         "$BIN" --port "$(node_port "$node")" --smp 1 --memory "$GATE_SERVER_MEMORY"
@@ -332,8 +340,8 @@ run_prepare() { # NODE DATA_DIR ARCHIVE LOG [background]
     "${command[@]}" >>"$log" 2>&1
 }
 
-run_bad_archive() { # LABEL NODE DATA_DIR ARCHIVE
-    local label="$1" node="$2" dir="$3" archive="$4" rc log="$WORK/bad_$1.log"
+run_bad_archive() { # LABEL NODE DATA_DIR ARCHIVE [AUTH_KEY]
+    local label="$1" node="$2" dir="$3" archive="$4" key="${5:-$BACKUP_KEY}" rc log="$WORK/bad_$1.log"
     timeout 300 env $GATE_SERVER_ENV TMPDIR="$WORK" \
         TIMESTAR_DATA_DIR="$dir" \
         TIMESTAR_AUTH_ENABLED=true TIMESTAR_AUTH_TOKEN="$AUTH_TOKEN" \
@@ -341,12 +349,13 @@ run_bad_archive() { # LABEL NODE DATA_DIR ARCHIVE
         TIMESTAR_CLUSTER_REPLICATION_FACTOR=3 TIMESTAR_CLUSTER_UUID="$RESTORED_UUID" \
         TIMESTAR_CLUSTER_DEVELOPMENT_ALLOW_INSECURE_TRANSPORT=true \
         TIMESTAR_CLUSTER_CONTROL_ENABLED=true TIMESTAR_CLUSTER_CONTROL_SEED_NODE_ID=1 \
+        TIMESTAR_CLUSTER_BACKUP_AUTH_KEY_FILE="$key" \
         TIMESTAR_CLUSTER_FAILURE_DOMAIN="rack-$node" \
         TIMESTAR_CLUSTER_NODE_ID="$node" TIMESTAR_CLUSTER_PEERS="$PEERS" \
         "$BIN" --port "$(node_port "$node")" --smp 1 --memory "$GATE_SERVER_MEMORY" \
         --cluster-restore "$archive" >"$log" 2>&1
     rc=$?
-    if [ "$rc" -ne 0 ] && grep -q 'archive is incomplete, corrupt, or not exact v1' "$log"; then
+    if [ "$rc" -ne 0 ] && grep -q 'archive is incomplete, corrupt, unauthenticated, or not exact v1' "$log"; then
         gate_ok "$label artifact was rejected before restore"
     else
         gate_fail "$label artifact rejection returned $rc without the exact validation diagnostic"
@@ -440,6 +449,7 @@ forget_cluster_pids
 require_ports_free $PORTS
 
 echo "=== reject missing, corrupt, and extra exact-v1 artifact shapes ==="
+run_bad_archive unauthenticated 1 "$BADROOT4" "$ARCHIVE" "$WRONG_BACKUP_KEY"
 cp -al -- "$ARCHIVE" "$MISSING_ARCHIVE"
 rm -- "$MISSING_ARCHIVE/vshards/0000.tsp1"
 cp -al -- "$ARCHIVE" "$CORRUPT_ARCHIVE"

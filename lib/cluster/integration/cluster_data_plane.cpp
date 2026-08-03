@@ -1014,13 +1014,15 @@ seastar::future<features::ClusterBackupExportCheckpoint> ClusterDataPlane::captu
 }
 
 seastar::future<ClusterDataPlane::BackupExportStatus> ClusterDataPlane::startBackupExport(
-    std::filesystem::path archiveDirectory, std::string operationId) {
+    std::filesystem::path archiveDirectory, std::string operationId,
+    features::ClusterBackupAuthenticationKey authenticationKey) {
     if (!features::ClusterBackupExportCheckpoint::canonicalOperationId(operationId))
         throw std::invalid_argument("cluster backup operation_id must be 32 lowercase hexadecimal characters");
     if (backupExportGate_.is_closed())
         throw std::runtime_error("cluster backup export is shutting down");
     if (backupExportRunning_) {
-        if (backupExportStatus_.operationId == operationId && backupExportArchive_ == archiveDirectory)
+        if (backupExportStatus_.operationId == operationId && backupExportArchive_ == archiveDirectory &&
+            backupExportAuthenticationKey_ && *backupExportAuthenticationKey_ == authenticationKey)
             co_return backupExportStatus_;
         throw std::runtime_error("another cluster backup export is already running");
     }
@@ -1031,12 +1033,13 @@ seastar::future<ClusterDataPlane::BackupExportStatus> ClusterDataPlane::startBac
         throw std::invalid_argument("backup archive belongs to a different operation_id");
 
     if (existing) {
-        auto published = co_await features::ClusterBackupArchive::validate(archiveDirectory);
+        auto published = co_await features::ClusterBackupArchive::validate(archiveDirectory, authenticationKey);
         if (published) {
             if (published->sourceClusterUuid != existing->sourceClusterUuid || published->control != existing->control)
                 throw std::runtime_error("published backup archive conflicts with its durable export checkpoint");
             backupExportArchive_ = std::move(archiveDirectory);
             backupExportCheckpoint_ = std::move(*existing);
+            backupExportAuthenticationKey_ = std::move(authenticationKey);
             backupExportStatus_ = BackupExportStatus{BackupExportPhase::Complete,
                                                      operationId,
                                                      backupExportArchive_.string(),
@@ -1059,6 +1062,7 @@ seastar::future<ClusterDataPlane::BackupExportStatus> ClusterDataPlane::startBac
 
     backupExportArchive_ = std::move(archiveDirectory);
     backupExportCheckpoint_ = std::move(checkpoint);
+    backupExportAuthenticationKey_ = std::move(authenticationKey);
     backupExportCancelRequested_ = false;
     backupExportRunning_ = true;
     backupExportStatus_ = BackupExportStatus{BackupExportPhase::Running,
@@ -1244,8 +1248,8 @@ seastar::future<std::optional<features::VShardBackupUnit>> ClusterDataPlane::cap
 }
 
 seastar::future<> ClusterDataPlane::runBackupExport() {
-    if (!backupExportCheckpoint_)
-        throw std::runtime_error("cluster backup export started without a durable checkpoint");
+    if (!backupExportCheckpoint_ || !backupExportAuthenticationKey_)
+        throw std::runtime_error("cluster backup export started without a durable checkpoint and authentication key");
     const auto& checkpoint = *backupExportCheckpoint_;
     std::vector<features::VShardBackupUnit> units;
     units.reserve(VIRTUAL_SHARD_COUNT);
@@ -1288,11 +1292,16 @@ seastar::future<> ClusterDataPlane::runBackupExport() {
     if (finalFence != checkpoint)
         throw std::runtime_error(
             "cluster serving map or portable Group-0 state changed during export; publication refused");
-    features::ClusterBackupManifest manifest{checkpoint.sourceClusterUuid, std::move(finalFence.control),
-                                             std::move(units)};
-    if (!co_await features::ClusterBackupArchive::publish(backupExportArchive_, manifest))
+    features::ClusterBackupManifest manifest;
+    manifest.sourceClusterUuid = checkpoint.sourceClusterUuid;
+    manifest.control = std::move(finalFence.control);
+    manifest.vshards = std::move(units);
+    manifest.authenticate(*backupExportAuthenticationKey_);
+    if (!co_await features::ClusterBackupArchive::publish(backupExportArchive_, manifest,
+                                                          *backupExportAuthenticationKey_))
         throw std::runtime_error("complete backup units failed manifest-last publication");
-    auto validated = co_await features::ClusterBackupArchive::validate(backupExportArchive_);
+    auto validated =
+        co_await features::ClusterBackupArchive::validate(backupExportArchive_, *backupExportAuthenticationKey_);
     if (!validated || *validated != manifest)
         throw std::runtime_error("published cluster backup did not pass exact-v1 validation");
     backupExportStatus_.phase = BackupExportPhase::Complete;

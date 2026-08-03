@@ -1020,6 +1020,7 @@ failure_domain = "rack-a"          # stable rack/AZ/host label for this node
 tls_cert_file = "/run/secrets/timestar-node.crt"
 tls_key_file = "/run/secrets/timestar-node.key"
 tls_ca_file = "/run/secrets/timestar-cluster-ca.crt"
+backup_auth_key_file = "/run/secrets/timestar-backup-auth.key"
 ```
 
 The same mTLS identity protects both the data-plane port (HTTP port + 1000) and
@@ -1357,8 +1358,10 @@ Named deliverables, several epic-sized — not a checkbox list:
   crash resume before Engine/network startup. Preparation exits offline; one
   exact-v1 release requires matching complete markers from every data voter and
   the control seed before those roots can activate. The bounded RF=3
-  export/restore/restart/corruption gate passes. Artifact security/capacity
-  policy and the disaster-recovery runbook remain release blockers.
+  export/restore/restart/corruption gate passes. The v1 manifest is authenticated
+  with a required external HMAC key, while encrypted staging/off-site storage,
+  capacity/retention rules, key-version lifetime, and the isolated RF=3
+  disaster-recovery drill are defined in the operator runbook.
 - A post-production upgrade/migration design before introducing any v2 format.
 - Remaining operator APIs and CLI beyond the Phase 4 minimum surface.
 - Routing summaries (conservative measurement-to-VShard pruning) and

@@ -302,7 +302,7 @@ evidence below.
 - [ ] **Measure production SLOs.** Record one-node-failure write error band,
   recovery time, query latency, snapshot catch-up, and movement impact using the
   final binary and deployment settings.
-- [ ] **Deliver and prove clustered backup/restore.** The existing filesystem
+- [x] **Deliver and prove clustered backup/restore.** The existing filesystem
   copy guidance is now explicitly limited to standalone mode: it omitted
   persistent node identity, Group-0/control state, the committed serving map,
   and per-VShard Raft journals, and independent live replica copies are not one
@@ -333,9 +333,12 @@ evidence below.
   gate now covers coordinator loss/resume, concurrent writes, all 4,096 units,
   corrupt/missing/extra rejection, interrupted import and activation, the
   all-voter release fence, fresh identities, old-authority rejection, exact
-  three-node readback, and full-cluster restart. This does not close the
-  blocker: artifact authentication/encryption and
-  capacity/retention/disaster-recovery procedures remain.
+  three-node readback, and full-cluster restart. The exact-v1 manifest now
+  requires HMAC-SHA-256 over all portable control and unit metadata; export and
+  restore fail closed without the protected configured key, and the gate adds
+  wrong-key rejection. The backup runbook now defines encrypted staging and
+  off-site storage, capacity reserve, retention/key-version coupling,
+  manifest-last replication, and the complete isolated RF=3 recovery drill.
 
 ### P2 — release and operations
 
@@ -413,14 +416,16 @@ readback, old-controller restart, and tombstone-version recreation.
 The backup-export coordinator build covers the production server and unit-test
 targets with compiler temporaries under `build/tmp`. Focused one-reactor,
 1-GiB tests cover portable-control/checkpoint exact-v1 round trips and corruption
-rejection, durable checkpoint conflicts and retained progress, and explicit
-refusal of every backup lifecycle route when authentication is disabled. The
-bounded production gate runs at most three one-reactor, 1-GiB processes,
-observed aggregate RSS below 400 MiB, retained every artifact under `build/tmp`,
-and left `/tmp` at 105 MiB. It passed live leader-loss resume, 4,096-unit
-publication, malformed-artifact rejection, killed-import resume, all-voter
-release, killed activation, old-authority rejection, exact three-node readback,
-and a full restored-cluster restart.
+rejection, HMAC round trip and structurally valid tamper rejection, protected
+key-file loading, complete-file SHA-256 inspection, durable checkpoint conflicts
+and retained progress, and explicit refusal of every backup lifecycle route
+when authentication is disabled. The bounded production gate runs at most three
+one-reactor, 1-GiB processes, observed aggregate RSS below 400 MiB, retained
+every artifact under `build/tmp`, and left `/tmp` at 105 MiB. Its 2026-08-03 run
+passed live leader-loss resume, 4,096-unit manifest-last publication, wrong-key
+and malformed-artifact rejection, killed-import resume, all-voter release,
+killed activation, old-authority rejection, exact three-node readback, and a
+full restored-cluster restart.
 
 The delete-receipt suites cover capacity- and time-based retirement, stable
 expired/conflict outcomes, snapshot state, recovery, and the write barrier
