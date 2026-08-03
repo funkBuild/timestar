@@ -98,6 +98,7 @@ Key prefixes separate index types within the LSM-tree:
 
 **Key features:**
 - **Roaring bitmap postings** for tag-filtered series discovery (replaces prefix scans)
+- **Chunked O(1) local-ID reverse mapping** allocated only for durable entries, not counter holes
 - **Time-scoped day bitmaps** to prune inactive series during queries
 - **HyperLogLog cardinality estimation** (~0.8% error, O(1) per measurement)
 - **Bloom filters** per measurement for early tag combination rejection

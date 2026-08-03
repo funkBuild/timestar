@@ -271,6 +271,15 @@ inventory and rules.
   checksum-consistent out-of-range metadata.
   A separate checksum-consistent fixture rejects a footer revision fence that
   disagrees with the authenticated block maximum.
+- [x] Bound NativeIndex local-ID restore memory without narrowing the v1 ID
+  space. A persisted high-water counter no longer resizes one contiguous
+  reverse vector or reserves capacity proportional to unverified holes.
+  Reverse mappings use lazy 4,096-entry chunks, forward-map preallocation is
+  capped independently, and the next runtime assignment is installed at its
+  exact restored ID rather than appended at the wrong reverse index. Restore
+  rejects reserved-zero, conflicting, exhausted, or implausibly distant
+  entries. A 50,000,000 counter with sparse mappings and a subsequent new
+  assignment now round-trips under the one-reactor, 1-GiB unit-test budget.
 - [x] Remove the shared mTLS peer-name override. Both inter-node transports now
   bind outbound certificate SAN verification to each peer's configured or
   Group-0-committed DNS/IP address, retire a cached connection when that identity

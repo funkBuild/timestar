@@ -774,25 +774,40 @@ TEST(ProtoCompressedWriteGap, CompressedTimestamps300kNotTruncated) {
 TEST(ProtoCompressedWriteGap, CompressedTimestampsAtLimitAccepted) {
     // Exactly kMaxCompressedPointsPerWritePoint values must be accepted in full.
     const size_t kCount = kMaxCompressedPointsPerWritePoint;
-    auto ts = makeTimestamps(kCount);
-    auto bytes = buildCompressedTsRequest(ts);
+    constexpr uint64_t kBaseTimestamp = 1704067200000000000ULL;
+    const uint64_t expectedLast = kBaseTimestamp + (kCount - 1) * 1000000000ULL;
 
-    auto generic = parseWriteRequest(bytes.data(), bytes.size());
-    ASSERT_EQ(generic.size(), 1u);
-    EXPECT_EQ(generic[0].timestamps.size(), kCount);
-    EXPECT_EQ(generic[0].timestamps.back(), ts.back());
+    // Release the client-side input after serialization. Keeping it alive while
+    // retaining both parser outputs adds hundreds of MiB that the server never
+    // owns and makes this boundary test depend on the preceding suite order.
+    std::string bytes;
+    {
+        auto ts = makeTimestamps(kCount);
+        bytes = buildCompressedTsRequest(ts);
+    }
+
+    {
+        auto generic = parseWriteRequest(bytes.data(), bytes.size());
+        ASSERT_EQ(generic.size(), 1u);
+        EXPECT_EQ(generic[0].timestamps.size(), kCount);
+        EXPECT_EQ(generic[0].timestamps.back(), expectedLast);
+    }
 
     auto fast = parseWriteRequestFast(bytes.data(), bytes.size(), 0);
-    EXPECT_EQ(fast.failedWrites, 0);
+    ASSERT_EQ(fast.failedWrites, 0) << (fast.errors.empty() ? "" : fast.errors.front());
     ASSERT_EQ(fast.inserts.size(), 1u);
     EXPECT_EQ(fast.inserts[0].timestamps->size(), kCount);
+    EXPECT_EQ(fast.inserts[0].timestamps->back(), expectedLast);
 }
 
 TEST(ProtoCompressedWriteGap, CompressedTimestampsOverLimitRejectedNotTruncated) {
     // One value past the limit: a loud rejection, never a stored prefix.
     const size_t kCount = kMaxCompressedPointsPerWritePoint + 1;
-    auto ts = makeTimestamps(kCount);
-    auto bytes = buildCompressedTsRequest(ts);
+    std::string bytes;
+    {
+        auto ts = makeTimestamps(kCount);
+        bytes = buildCompressedTsRequest(ts);
+    }
 
     // Generic parser: whole-request error.
     EXPECT_THROW(parseWriteRequest(bytes.data(), bytes.size()), std::runtime_error);
@@ -1048,21 +1063,24 @@ TEST(ProtoWriteGap, TruncatedBytesNeverCrash) {
 // the bad_alloc class the budgets exist to prevent. An over-cap point must be
 // rejected whole with a recorded error, never truncated or silently admitted.
 TEST(ProtoWriteFastPathBudget, UncompressedTimestampsRespectPerPointCap) {
-    ::timestar_pb::WriteRequest req;
-    auto* wp = req.add_writes();
-    wp->set_measurement("budget_metric");
-    (*wp->mutable_tags())["host"] = "server-01";
-    // Small values -> 1-5 byte varints; count just past the per-point cap.
-    const size_t count = kMaxCompressedPointsPerWritePoint + 1;
-    wp->mutable_timestamps()->Reserve(static_cast<int>(count));
-    for (size_t i = 0; i < count; ++i) {
-        wp->add_timestamps(i);
-    }
-    ::timestar_pb::WriteField wf;
-    wf.mutable_double_values()->add_values(1.0);
-    (*wp->mutable_fields())["v"] = wf;
-
-    auto bytes = serialize(req);
+    // Build the wire body as a client would, then release that client-side
+    // protobuf before exercising the server parser under its 1 GiB budget.
+    auto bytes = [] {
+        ::timestar_pb::WriteRequest req;
+        auto* wp = req.add_writes();
+        wp->set_measurement("budget_metric");
+        (*wp->mutable_tags())["host"] = "server-01";
+        // Small values -> 1-5 byte varints; count just past the per-point cap.
+        const size_t count = kMaxCompressedPointsPerWritePoint + 1;
+        wp->mutable_timestamps()->Reserve(static_cast<int>(count));
+        for (size_t i = 0; i < count; ++i) {
+            wp->add_timestamps(i);
+        }
+        ::timestar_pb::WriteField wf;
+        wf.mutable_double_values()->add_values(1.0);
+        (*wp->mutable_fields())["v"] = wf;
+        return serialize(req);
+    }();
     auto fast = parseWriteRequestFast(bytes.data(), bytes.size(), 0);
 
     EXPECT_EQ(fast.failedWrites, 1);

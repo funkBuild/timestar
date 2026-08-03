@@ -330,8 +330,8 @@ seastar::future<> NativeIndex::open() {
         });
         if (skippedRestoreEntries > 0) {
             ::native_index_log.error(
-                "LocalIdMap restore: skipped {} forward entries with ids implausibly far past the persisted "
-                "counter {} — corrupt index keys; the affected series will be re-assigned on next write",
+                "LocalIdMap restore: skipped {} invalid or conflicting forward entries at persisted counter {} — "
+                "corrupt index keys; the affected series will be re-assigned on next write",
                 skippedRestoreEntries, localIdMap_.nextId());
         }
         lastFlushedLocalId_ = localIdMap_.nextId();  // All restored IDs are already persisted

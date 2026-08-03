@@ -111,8 +111,10 @@ TEST_F(LocalIdMapTest, RestoreToleratesCounterAboveSpeculativeCap) {
     // getOrAssign() issues ids up to UINT32_MAX at runtime and persists the
     // counter; restore must accept the same range or a legitimately large
     // shard runs fine until its next restart and then can never open again.
-    // Only the up-front pre-allocation is capped — entries grow the map.
-    const uint32_t bigCounter = LocalIdMap::kMaxSpeculativeRestoreIds + 5000;
+    // Only modest forward-map capacity is reserved up front; reverse entries
+    // allocate fixed-size chunks on demand. This counter would require an
+    // 800 MB contiguous reverse vector in the old implementation.
+    const uint32_t bigCounter = 50'000'000;
 
     LocalIdMap restored;
     restored.restoreBegin(bigCounter, bigCounter);  // must not throw
@@ -131,6 +133,7 @@ TEST_F(LocalIdMapTest, RestoreToleratesCounterAboveSpeculativeCap) {
     // New assignments continue past the restored counter — no id reuse.
     SeriesId128 fresh = SeriesId128::fromSeriesKey("big_shard_new");
     EXPECT_EQ(restored.getOrAssign(fresh), bigCounter);
+    EXPECT_EQ(restored.getGlobalId(bigCounter), fresh);
 }
 
 TEST_F(LocalIdMapTest, RestoreSkipsImplausiblyLargeEntryIds) {
@@ -152,6 +155,27 @@ TEST_F(LocalIdMapTest, RestoreSkipsImplausiblyLargeEntryIds) {
     EXPECT_FALSE(restored.restoreEntry(100 + LocalIdMap::kRestoreIdSlack, evil));
     EXPECT_EQ(restored.nextId(), 111u);
     EXPECT_FALSE(restored.getLocalId(evil).has_value());
+}
+
+TEST_F(LocalIdMapTest, RestoreRejectsReservedConflictingAndExhaustedMappings) {
+    LocalIdMap restored;
+    restored.restoreBegin(10, 10);
+
+    const SeriesId128 first = SeriesId128::fromSeriesKey("restore_first");
+    const SeriesId128 second = SeriesId128::fromSeriesKey("restore_second");
+    EXPECT_TRUE(restored.restoreEntry(2, first));
+
+    EXPECT_FALSE(restored.restoreEntry(2, second)) << "one local ID cannot resolve to two series";
+    EXPECT_FALSE(restored.restoreEntry(3, first)) << "one series cannot resolve to two local IDs";
+    EXPECT_FALSE(restored.restoreEntry(4, SeriesId128{})) << "zero is the reserved missing-entry sentinel";
+    EXPECT_FALSE(restored.restoreEntry(UINT32_MAX, second)) << "the exhausted ID cannot advance the counter";
+
+    EXPECT_EQ(restored.getGlobalId(2), first);
+    const auto restoredFirst = restored.getLocalId(first);
+    ASSERT_TRUE(restoredFirst.has_value());
+    EXPECT_EQ(*restoredFirst, 2u);
+    EXPECT_FALSE(restored.isValid(3));
+    EXPECT_EQ(restored.nextId(), 10u);
 }
 
 TEST_F(LocalIdMapTest, ManySeriesRoundTrip) {
