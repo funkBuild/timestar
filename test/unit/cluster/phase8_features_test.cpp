@@ -6,12 +6,15 @@
 #include "../../../lib/cluster/features/operator_surface.hpp"
 #include "../../../lib/cluster/features/routing_summary.hpp"
 #include "../../../lib/cluster/features/stream_subscription.hpp"
+#include "../../../lib/utils/crc32.hpp"
 
 #include <gtest/gtest.h>
 
 #include <string>
 #include <vector>
 
+using namespace timestar;
+using namespace timestar::control;
 using namespace timestar::features;
 
 namespace {
@@ -102,44 +105,110 @@ TEST(StreamSubscription, ResumeFromTokenDropsAlreadySeen) {
 
 // ---- Backup / restore ----
 
-std::string fakeHash(const std::string& s) {
-    return "h:" + std::to_string(s.size()) + ":" + (s.empty() ? "" : std::string(1, s[0]));
+ClusterBackupManifest completeBackup() {
+    ClusterBackupManifest backup;
+    backup.sourceClusterUuid = "00112233445566778899aabbccddeeff";
+    backup.vshards.reserve(VIRTUAL_SHARD_COUNT);
+    for (uint16_t i = 0; i < VIRTUAL_SHARD_COUNT; ++i) {
+        backup.vshards.push_back(VShardBackupUnit{i, uint64_t{i} + 1, "00112233445566778899aabbccddeeff",
+                                                  "ffeeddccbbaa00998877665544332211", 12, uint64_t{i} + 9});
+    }
+    return backup;
 }
 
-TEST(BackupRestore, ExportRestoreRoundTripIntoNewClusterUuid) {
-    auto backup = BackupRestore::exportCluster("cluster-OLD", {{1, "snapA"}, {2, "snapB"}}, fakeHash);
-    EXPECT_EQ(backup.sourceClusterUuid, "cluster-OLD");
-    ASSERT_EQ(backup.vshards.size(), 2u);
+TEST(BackupRestore, ExactV1ManifestRoundTripPlansFreshClusterRestore) {
+    auto backup = completeBackup();
+    backup.control.policies.emplace("schema/cpu", PolicyCell{7, "portable-schema"});
+    ASSERT_TRUE(backup.valid());
+    const auto encoded = backup.encode();
+    auto decoded = ClusterBackupManifest::decode(encoded);
+    ASSERT_TRUE(decoded.has_value());
+    EXPECT_EQ(*decoded, backup);
 
-    auto r = BackupRestore::restore(backup, "cluster-NEW", fakeHash);
-    EXPECT_TRUE(r.ok);
-    EXPECT_EQ(r.newClusterUuid, "cluster-NEW");
-    ASSERT_EQ(r.vshards.size(), 2u);
-    EXPECT_EQ(r.vshards[0].snapshot, "snapA");  // generation-one state restored
+    auto plan = BackupRestore::planRestore(*decoded, "ffeeddccbbaa00998877665544332211");
+    ASSERT_TRUE(plan.ok) << plan.error;
+    EXPECT_EQ(plan.newClusterUuid, "ffeeddccbbaa00998877665544332211");
+    EXPECT_EQ(plan.vshards.size(), VIRTUAL_SHARD_COUNT);
+    EXPECT_EQ(plan.control, backup.control);
 }
 
-TEST(BackupRestore, RejectsSameUuidAndFailsClosedOnCorruption) {
-    auto backup = BackupRestore::exportCluster("cluster-OLD", {{1, "snapA"}}, fakeHash);
-    // Restoring under the SAME UUID would resurrect the old cluster identity.
-    auto same = BackupRestore::restore(backup, "cluster-OLD", fakeHash);
+TEST(BackupRestore, RejectsSameOrNonCanonicalUuidAndIncompleteManifest) {
+    auto backup = completeBackup();
+    auto same = BackupRestore::planRestore(backup, backup.sourceClusterUuid);
     EXPECT_FALSE(same.ok);
-    // A corrupt unit fails the whole restore closed (nothing restored).
-    backup.vshards[0].verificationHash = "WRONG";
-    auto corrupt = BackupRestore::restore(backup, "cluster-NEW", fakeHash);
-    EXPECT_FALSE(corrupt.ok);
-    EXPECT_TRUE(corrupt.vshards.empty());
-}
-TEST(BackupRestore, RejectsTruncatedAndEmptyBackups) {
-    auto backup = BackupRestore::exportCluster("cluster-OLD", {{1, "a"}, {2, "b"}, {3, "c"}}, fakeHash);
-    EXPECT_EQ(backup.expectedVShards, 3u);
-    // Drop a unit: a truncated backup must NOT restore as a valid partial cluster.
+    EXPECT_FALSE(BackupRestore::planRestore(backup, "FFEEDDCCBBAA00998877665544332211").ok);
+
     backup.vshards.pop_back();
-    auto truncated = BackupRestore::restore(backup, "cluster-NEW", fakeHash);
+    EXPECT_FALSE(backup.valid());
+    auto truncated = BackupRestore::planRestore(backup, "ffeeddccbbaa00998877665544332211");
     EXPECT_FALSE(truncated.ok);
-    // An empty backup fails closed too.
-    ClusterBackup empty;
-    empty.sourceClusterUuid = "cluster-OLD";
-    EXPECT_FALSE(BackupRestore::restore(empty, "cluster-NEW", fakeHash).ok);
+    EXPECT_TRUE(truncated.vshards.empty());
+}
+
+TEST(BackupRestore, ManifestDecoderRejectsCorruptionUnknownVersionAndAliases) {
+    auto encoded = completeBackup().encode();
+    encoded[encoded.size() / 2] ^= 0x40;
+    EXPECT_FALSE(ClusterBackupManifest::decode(encoded).has_value());
+
+    auto badVersion = completeBackup().encode();
+    badVersion[4] = 2;
+    const uint32_t crc = CRC32::compute(badVersion.data(), badVersion.size() - 4);
+    for (int i = 0; i < 4; ++i)
+        badVersion[badVersion.size() - 4 + i] = static_cast<char>((crc >> (8 * i)) & 0xff);
+    EXPECT_FALSE(ClusterBackupManifest::decode(badVersion).has_value());
+
+    auto duplicate = completeBackup();
+    duplicate.vshards[17].vshard = 16;
+    EXPECT_FALSE(duplicate.valid());
+    EXPECT_THROW((void)duplicate.encode(), std::invalid_argument);
+}
+
+TEST(BackupRestore, PortableControlCaptureScrubsAuthorityAndFencesActiveSweep) {
+    Group0State state;
+    state.clusterUuid = "00112233445566778899aabbccddeeff";
+    state.nodes.emplace(1, NodeRecord{1, "node", "host:1", "rack", NodeState::Active});
+    state.jobs.emplace("move", Job{"move", 2, false, "membership-authority"});
+    state.joinTokens.insert("secret");
+    state.policies.emplace("schema/cpu", PolicyCell{3, "portable"});
+    state.policies.emplace(retentionPolicyKey("cpu"),
+                           PolicyCell{3, encodeRetentionPolicyValue(RetentionPolicyValue{"1h", 3'600'000'000'000})});
+    state.lastRetentionSweepId = 9;
+    state.retentionCutoffs.emplace("cpu", RetentionCutoffRecord{3, 1000});
+
+    auto portable = BackupRestore::capturePortableControl(state);
+    ASSERT_TRUE(portable.has_value());
+    EXPECT_EQ(portable->policies, state.policies);
+    EXPECT_EQ(portable->lastRetentionSweepId, 9u);
+    EXPECT_EQ(portable->retentionCutoffs, state.retentionCutoffs);
+
+    state.retentionSweep = RetentionSweep{10, "cpu", 3, 2000, 17};
+    EXPECT_FALSE(BackupRestore::capturePortableControl(state).has_value())
+        << "a partially fanned-out retention decision has no portable restore state";
+}
+
+TEST(BackupRestore, PortableControlRejectsInconsistentRetentionState) {
+    auto backup = completeBackup();
+    backup.control.lastRetentionSweepId = 1;
+    EXPECT_FALSE(backup.valid()) << "a sweep id without any completed cutoff is not restorable state";
+
+    backup = completeBackup();
+    backup.control.policies.emplace(retentionPolicyKey("cpu"), PolicyCell{1, "not-TSRP1"});
+    EXPECT_FALSE(backup.valid());
+
+    backup = completeBackup();
+    backup.control.lastRetentionSweepId = 1;
+    backup.control.retentionCutoffs.emplace("cpu", RetentionCutoffRecord{2, 100});
+    backup.control.policies.emplace(
+        retentionPolicyKey("cpu"),
+        PolicyCell{1, encodeRetentionPolicyValue(RetentionPolicyValue{"1h", 3'600'000'000'000})});
+    EXPECT_FALSE(backup.valid()) << "a cutoff cannot name a policy version which was never committed";
+}
+
+TEST(BackupRestore, UnitPathsAreCanonicalAndBounded) {
+    EXPECT_EQ(BackupRestore::unitRelativePath(0), "vshards/0000.tsp1");
+    EXPECT_EQ(BackupRestore::unitRelativePath(42), "vshards/0042.tsp1");
+    EXPECT_EQ(BackupRestore::unitRelativePath(4095), "vshards/4095.tsp1");
+    EXPECT_THROW((void)BackupRestore::unitRelativePath(4096), std::out_of_range);
 }
 
 // ---- Conservative routing summaries ----

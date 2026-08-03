@@ -12,11 +12,48 @@ journals. Copying only `shard_*` directories omits cluster authority and cannot
 produce a restorable cluster backup. Independently copying three live replicas
 also does not create one coordinated recovery point.
 
-Cluster export/import into a fresh cluster UUID is not implemented yet. Until
-the pinned per-VShard export, membership-scrubbing restore, and recovery gate
-are shipped, clustered deployment remains blocked for production. Do not clone
-`node.json`, `control_map.cache`, or `cluster_raft/` into a new node or cluster;
-that can duplicate identity or resurrect obsolete membership.
+The internal exact-v1 cluster artifact layer is implemented, but a supported
+server export/import workflow is not. Until leader-pinned export, generation-one
+membership-scrubbing import, and the RF=3 recovery gate are shipped, clustered
+deployment remains blocked for production. Do not clone `node.json`,
+`control_map.cache`, or `cluster_raft/` into a new node or cluster; that can
+duplicate identity or resurrect obsolete membership.
+
+## Cluster artifact foundation (not yet an operator procedure)
+
+The in-tree artifact primitives now define one layout, updated in place during
+the greenfield phase:
+
+```
+cluster-backup/
+  manifest.tsbk1
+  vshards/
+    0000.tsp1
+    0001.tsp1
+    ...
+    4095.tsp1
+```
+
+`manifest.tsbk1` is checksummed `TSBK` version 1. It records the source cluster
+UUID, portable schema/retention/delete-plan state, and metadata for exactly
+4,096 canonical `TSP1` files. Node identities, join tokens, controller
+ownership, serving placement, movement jobs, and old Raft membership are
+deliberately absent.
+
+Each unit is copied through a fixed 1-MiB buffer, revalidated from the copied
+file, fsynced, and published without replacement. The manifest is fsynced and
+published last, so its presence is the completeness marker. Validation streams
+object bytes without extraction and rejects a bad checksum/catalog/fence,
+metadata mismatch, missing or extra unit, noncanonical name, symlink, partial
+temporary, or unsupported version. These hashes detect corruption; the
+artifact is not an authenticated or encrypted container and must not yet be
+treated as a complete off-site backup product.
+
+The bounded in-process gate creates all 4,096 units, includes one real Engine
+snapshot, exercises interrupted staging and manifest publication, rejects
+corruption/extra/missing entries, restores that real unit into a fresh Engine,
+and reads the exact value back. It does not simulate leader ReadIndex capture,
+new Raft membership, or an RF=3 disaster recovery.
 
 ## Data Directory Structure
 
@@ -106,16 +143,25 @@ No additional manual steps are required -- the NativeIndex rebuilds its in-memor
 
 ## Required Cluster Backup/Restore Work
 
-The clustered implementation still needs all of the following before this
-document can provide an RF=3 procedure:
+The remaining ordered task list before this document can provide an RF=3
+procedure is:
 
-1. Export a pinned, hash-verified snapshot for every VShard while recording the
-   exact logical backup boundary.
-2. Include replicated schema, retention, and delete-plan state without copying
-   old Raft membership or node identities into the destination.
-3. Bootstrap a fresh cluster UUID and import each snapshot as generation-one
-   state with new membership.
-4. Prove full restore, partial/corrupt backup rejection, interrupted import
-   resume, and post-restore readback in a bounded live gate.
-5. Publish retention, encryption, key-management, and disaster-recovery
-   procedures for the resulting artifact set.
+- [x] Define and validate a bounded exact-v1 artifact containing all canonical
+  VShard units and portable schema, retention, and frozen delete-plan state,
+  without old identity, membership, placement, tokens, or controller authority.
+- [x] Make unit staging and manifest-last publication crash-safe, reject partial
+  or corrupt artifacts, and prove one real Engine snapshot readback.
+- [ ] Obtain a quorum-confirmed ReadIndex from each VShard leader, force/wait a
+  safe snapshot boundary at or beyond it, pin the sidecar while copying, and
+  coordinate all 4,096 results with the portable Group-0 capture.
+- [ ] Expose authenticated, authorized server/operator commands for starting,
+  observing, resuming, cancelling, and safely retaining an export.
+- [ ] Bootstrap a different cluster UUID and import every `TSP1` as
+  generation-one state under newly selected Raft membership. Import must be
+  idempotent, durably resumable, and must never expose a partially restored map.
+- [ ] Run the RF=3 live gate: writes during export, full restore, exact readback,
+  corrupt/missing/extra artifact rejection, interrupted export/import resume,
+  restart during import, and proof that old identities cannot join or actuate.
+- [ ] Publish artifact retention, capacity/headroom, authenticated integrity or
+  encryption, key management, off-site replication, restore, and disaster-
+  recovery procedures.

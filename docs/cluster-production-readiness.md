@@ -306,9 +306,14 @@ evidence below.
   copy guidance is now explicitly limited to standalone mode: it omitted
   persistent node identity, Group-0/control state, the committed serving map,
   and per-VShard Raft journals, and independent live replica copies are not one
-  recovery point. Production requires pinned VShard export plus restore into a
-  fresh cluster UUID with old membership scrubbed, corruption/interruption
-  rejection, and exact readback evidence.
+  recovery point. The exact-v1 artifact foundation now encodes portable control
+  state, streams and durably stages canonical `TSP1` units, publishes a `TSBK`
+  manifest only after all 4,096 units validate, and rejects corrupt, missing,
+  extra, aliased, or symlinked entries. Its bounded in-process gate covers an
+  interrupted stage/manifest write and restores one real Engine payload with
+  exact readback. This does not close the blocker: the server still needs
+  leader-ReadIndex-pinned export orchestration and generation-one import into a
+  fresh cluster UUID/new Raft membership, followed by a live RF=3 recovery gate.
 
 ### P2 — release and operations
 

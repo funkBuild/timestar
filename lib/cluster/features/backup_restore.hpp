@@ -1,102 +1,111 @@
 #pragma once
 
+#include "../../core/vshard.hpp"
+#include "../control/group0_state.hpp"
+
 #include <cstdint>
-#include <functional>
+#include <filesystem>
+#include <map>
+#include <optional>
+#include <seastar/core/future.hh>
 #include <string>
-#include <utility>
+#include <string_view>
 #include <vector>
 
 namespace timestar::features {
 
-// One VShard's backup unit: its whole-state snapshot plus a verification hash.
-// This is the per-VShard snapshot export format (reusing the Phase 7 snapshot +
-// verification-hash machinery); the snapshot is the backup unit.
-struct VShardBackup {
+// Portable Group-0 state. Topology, node identities, Raft membership, movement
+// jobs, controller ownership and join tokens are deliberately absent: restore
+// creates a new cluster and must never resurrect any of those authorities.
+struct PortableControlBackup {
+    std::map<std::string, control::PolicyCell> policies;
+    uint64_t lastRetentionSweepId = 0;
+    std::map<std::string, control::RetentionCutoffRecord> retentionCutoffs;
+    std::map<std::string, control::FrozenDeletePlan> frozenDeletePlans;
+
+    friend bool operator==(const PortableControlBackup&, const PortableControlBackup&) = default;
+    [[nodiscard]] bool valid() const;
+};
+
+// One immutable TSP1 file in a completed archive. The filename is derived from
+// vshard (vshards/NNNN.tsp1), never supplied by the archive. encodedHash is the
+// FNV-1a hash over the complete file; the TSP1 trailer independently protects
+// and validates its body, catalog and logical verification hash.
+struct VShardBackupUnit {
     uint16_t vshard = 0;
-    std::string snapshot;          // encoded SnapshotPayload bytes
-    std::string verificationHash;  // logical hash of the snapshot's state
+    uint64_t snapshotRevision = 0;
+    std::string verificationHash;
+    std::string catalogHash;
+    uint64_t encodedSize = 0;
+    uint64_t encodedHash = 0;
+
+    friend bool operator==(const VShardBackupUnit&, const VShardBackupUnit&) = default;
+    [[nodiscard]] bool valid() const;
 };
 
-// A backup of a whole cluster: the SOURCE cluster UUID (provenance only), the
-// number of VShards the cluster HAS (so restore can detect a truncated backup),
-// and every VShard's unit. Membership/config is deliberately NOT part of the
-// backup -- restore bootstraps fresh membership.
-struct ClusterBackup {
+// TSBK v1: a complete cluster backup descriptor. It is published only after
+// all exact-v1 TSP1 units are durable. There is intentionally no configurable
+// expected count: this build has exactly VIRTUAL_SHARD_COUNT VShards and a
+// shorter archive is incomplete, not a smaller valid cluster.
+struct ClusterBackupManifest {
     std::string sourceClusterUuid;
-    uint32_t expectedVShards = 0;  // total VShards the source cluster has (completeness check)
-    std::vector<VShardBackup> vshards;
+    PortableControlBackup control;
+    std::vector<VShardBackupUnit> vshards;
+
+    friend bool operator==(const ClusterBackupManifest&, const ClusterBackupManifest&) = default;
+    [[nodiscard]] bool valid() const;
+    [[nodiscard]] std::string encode() const;
+    [[nodiscard]] static std::optional<ClusterBackupManifest> decode(std::string_view bytes);
 };
 
-// The outcome of a restore: the NEW cluster identity and the verified per-VShard
-// state ready to load as generation-one state. `ok` is false (with `error`) if the
-// restore failed closed.
-struct RestoreResult {
+struct RestorePlan {
     std::string newClusterUuid;
-    std::vector<VShardBackup> vshards;
+    PortableControlBackup control;
+    std::vector<VShardBackupUnit> vshards;
     bool ok = false;
     std::string error;
 };
 
-// Backup export + restore (docs/clustering.md §Phase 8). The hash function
-// recomputes a snapshot's logical hash to prove integrity.
 class BackupRestore {
 public:
-    using HashFn = std::function<std::string(const std::string& snapshot)>;
+    // Capture only state which is meaningful in a new cluster. An active
+    // retention sweep is refused: different per-VShard archive boundaries could
+    // otherwise preserve an unrepresentable partially-fanned-out operation.
+    static std::optional<PortableControlBackup> capturePortableControl(const control::Group0State& state);
 
-    // Export: stamp each (vshard, snapshot) with its verification hash under the
-    // source cluster UUID, and record the expected VShard count so a truncated
-    // backup is detectable at restore.
-    static ClusterBackup exportCluster(const std::string& sourceUuid,
-                                       const std::vector<std::pair<uint16_t, std::string>>& snapshots,
-                                       const HashFn& hash) {
-        ClusterBackup b;
-        b.sourceClusterUuid = sourceUuid;
-        b.expectedVShards = static_cast<uint32_t>(snapshots.size());
-        for (const auto& [vs, snap] : snapshots)
-            b.vshards.push_back(VShardBackup{vs, snap, hash(snap)});
-        return b;
-    }
+    // Validate the complete manifest before exposing a restore plan. The new
+    // UUID is canonical lowercase 128-bit hex and must differ from the source.
+    // No snapshot is installed by this pure planning step.
+    static RestorePlan planRestore(const ClusterBackupManifest& backup, std::string newClusterUuid);
 
-    // Restore into a NEW cluster UUID as generation-one state. Verifies every
-    // unit's hash and fails closed on any mismatch (no partial restore). The new
-    // cluster UUID MUST differ from the source: a restore bootstraps a fresh
-    // cluster and SCRUBS old membership -- it never resurrects the old identity or
-    // reuses its node config. Membership is intentionally absent from the backup,
-    // so the restored cluster cannot confuse old membership with the new cluster.
-    static RestoreResult restore(const ClusterBackup& backup, const std::string& newClusterUuid, const HashFn& hash) {
-        RestoreResult r;
-        r.newClusterUuid = newClusterUuid;
-        if (newClusterUuid.empty()) {
-            r.error = "restore: empty new cluster UUID";
-            return r;
-        }
-        if (newClusterUuid == backup.sourceClusterUuid) {
-            // Byte-exact compare: the caller must pass CANONICAL cluster UUIDs
-            // (the node-identity binding compares them the same way).
-            r.error = "restore: new cluster UUID must differ from the source (scrub old identity)";
-            return r;
-        }
-        // Completeness: an empty or truncated backup must NOT restore as a valid
-        // partial cluster. Require every expected VShard unit to be present.
-        if (backup.vshards.empty()) {
-            r.error = "restore: empty backup";
-            return r;
-        }
-        if (backup.expectedVShards != 0 && backup.vshards.size() != backup.expectedVShards) {
-            r.error = "restore: truncated backup (" + std::to_string(backup.vshards.size()) + " of " +
-                      std::to_string(backup.expectedVShards) + " VShards)";
-            return r;
-        }
-        for (const auto& u : backup.vshards) {
-            if (hash(u.snapshot) != u.verificationHash) {
-                r.error = "restore: verification hash mismatch for VShard " + std::to_string(u.vshard);
-                return r;  // fail closed: nothing restored
-            }
-        }
-        r.vshards = backup.vshards;  // verified; membership scrubbed (not copied from the backup)
-        r.ok = true;
-        return r;
-    }
+    [[nodiscard]] static bool canonicalClusterUuid(std::string_view uuid);
+    [[nodiscard]] static std::string unitRelativePath(uint16_t vshard);
+};
+
+// Crash-safe exact-v1 archive assembly. VShard units are copied through a
+// fixed buffer, re-inspected at their destination, fsync'd, and atomically
+// linked without replacement. The manifest is written last and is the sole completeness marker.
+// Validation rejects aliases, symlinks, extra files, incomplete unit sets, and
+// any disagreement between TSBK metadata and the embedded TSP1 payloads.
+class ClusterBackupArchive {
+public:
+    [[nodiscard]] static std::string manifestRelativePath();
+
+    // Stage one immutable source TSP1 as vshards/NNNN.tsp1. A published
+    // archive is immutable and refuses further staging. nullopt means the
+    // source or copied payload is invalid; filesystem failures throw.
+    static seastar::future<std::optional<VShardBackupUnit>> stageVShard(const std::filesystem::path& archiveDirectory,
+                                                                        uint16_t vshard,
+                                                                        const std::filesystem::path& sourceTsp1);
+
+    // Verify all 4,096 staged units against `manifest`, then durably publish
+    // manifest.tsbk1. Returns false for an incomplete or mismatched archive.
+    static seastar::future<bool> publish(const std::filesystem::path& archiveDirectory,
+                                         const ClusterBackupManifest& manifest);
+
+    // Validate a published archive in bounded memory. No unit is extracted.
+    static seastar::future<std::optional<ClusterBackupManifest>> validate(
+        const std::filesystem::path& archiveDirectory);
 };
 
 }  // namespace timestar::features

@@ -38,7 +38,11 @@ Production blockers take priority and are authoritative in
 - [ ] Deliver a cluster backup/restore workflow over pinned, hash-verified
   VShard snapshot streams. Restore must create a fresh cluster UUID, scrub old
   node/Raft membership, reject partial or corrupt artifacts, resume interrupted
-  import safely, and pass exact post-restore readback.
+  import safely, and pass exact post-restore readback. The exact-v1 `TSBK` /
+  4,096-`TSP1` artifact codec, bounded staging, manifest-last publication,
+  portable control-state capture, full-set validation, and in-process readback
+  gate are complete. Live leader-pinned capture, fresh-membership import,
+  resumable import state, and the RF=3 operator gate remain.
 
 ## Feature completion
 

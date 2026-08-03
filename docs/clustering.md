@@ -1341,7 +1341,10 @@ Named deliverables, several epic-sized — not a checkbox list:
   stream (reusing Task 4 snapshot and Phase 7 movement machinery); restore
   bootstraps a new cluster UUID, imports snapshots as generation-one state,
   and scrubs old membership. Task 4's snapshot export format is the backup
-  unit.
+  unit. The artifact layer uses one exact-v1 `TSP1` per canonical VShard and a
+  manifest-last `TSBK` v1 descriptor containing only portable control state;
+  bounded staging and full-set validation are implemented. Live ReadIndex-
+  pinned collection and generation-one Raft import remain release blockers.
 - A post-production upgrade/migration design before introducing any v2 format.
 - Remaining operator APIs and CLI beyond the Phase 4 minimum surface.
 - Routing summaries (conservative measurement-to-VShard pruning) and

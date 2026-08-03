@@ -3,12 +3,12 @@
 #include "../../../lib/storage/series_catalog.hpp"
 
 #include <gtest/gtest.h>
+#include <unistd.h>
 
 #include <atomic>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
-#include <unistd.h>
 
 using namespace timestar::data;
 namespace fs = std::filesystem;
@@ -158,6 +158,12 @@ TEST(SnapshotPayloadV1, FileCodecIsExactV1AndStreamsBothDirections) {
         EXPECT_EQ(readFile(encoded.path), encodeSnapshotPayload(original))
             << "the disk-backed path must update exact TSP1 v1 in place, not introduce another protocol";
 
+        auto inspected = inspectSnapshotPayloadFile(encoded.path).get();
+        ASSERT_TRUE(inspected);
+        EXPECT_EQ(inspected->manifest, original.manifest);
+        EXPECT_EQ(inspected->encodedSize, encoded.size);
+        EXPECT_EQ(inspected->encodedHash, encoded.hash);
+
         auto decoded = decodeSnapshotPayloadFile(encoded.path, dir / "extract").get();
         ASSERT_TRUE(decoded);
         EXPECT_EQ(decoded->manifest, original.manifest);
@@ -186,6 +192,7 @@ TEST(SnapshotPayloadV1, FileCodecIsExactV1AndStreamsBothDirections) {
         damaged.write(&byte, 1);
         damaged.close();
         EXPECT_FALSE(decodeSnapshotPayloadFile(corrupt, dir / "bad_extract").get());
+        EXPECT_FALSE(inspectSnapshotPayloadFile(corrupt).get());
     }
     fs::remove_all(dir);
 }

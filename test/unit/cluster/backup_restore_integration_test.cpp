@@ -1,9 +1,7 @@
-// M6 backup/restore gate (in-process): composes the BackupRestore brick with the
-// REAL VShard snapshot payloads. A cluster backup is exported from a live Engine's
-// VShard snapshot, restored into a FRESH cluster UUID (old identity scrubbed, hashes
-// verified, completeness checked, fail-closed on any mismatch), and the verified
-// snapshot is installed into a fresh Engine that serves the data. Fail-closed cases:
-// same-UUID restore, tampered snapshot, and a truncated backup are all refused.
+// Backup/restore composition gate (in-process): a real Engine produces a TSP1
+// VShard unit, the complete 4,096-unit TSBK v1 manifest validates into a fresh
+// cluster UUID, and that real unit installs into a fresh Engine which serves the
+// original data. Same-UUID restore, corrupt TSP1 and incomplete manifest fail.
 #include "../../../lib/cluster/data/snapshot_payload.hpp"
 #include "../../../lib/cluster/features/backup_restore.hpp"
 #include "../../../lib/core/engine.hpp"
@@ -11,11 +9,11 @@
 #include "../../../lib/core/vshard.hpp"           // vshardsCohesiveOnCores
 #include "../../../lib/storage/series_catalog.hpp"
 
-#include <functional>
 #include <gtest/gtest.h>
 
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <seastar/core/sleep.hh>
 #include <seastar/core/thread.hh>
 
@@ -23,8 +21,46 @@ using namespace timestar;
 namespace fs = std::filesystem;
 
 namespace {
-// A deterministic content hash so a single flipped byte is detected at restore.
-std::string contentHash(const std::string& s) { return std::to_string(std::hash<std::string>{}(s)); }
+uint64_t fnv1a(std::string_view value) {
+    uint64_t hash = 1469598103934665603ull;
+    for (unsigned char byte : value) {
+        hash ^= byte;
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
+
+void writeBytes(const fs::path& path, std::string_view bytes) {
+    if (!path.parent_path().empty())
+        fs::create_directories(path.parent_path());
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    output.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    if (!output)
+        throw std::runtime_error("failed to write backup test fixture " + path.string());
+}
+
+std::string emptyVShardSnapshot(uint16_t vshard) {
+    data::SnapshotPayload payload;
+    payload.manifest.vshard = VShardId{vshard};
+    payload.manifest.snapshotRevision = 1;
+    payload.manifest.verificationHash = std::string(32, '0');
+    SeriesCatalog catalog;
+    payload.catalog = catalog.snapshot();
+    payload.manifest.catalogHash = SeriesCatalog::snapshotHash(payload.catalog);
+    return data::encodeSnapshotPayload(std::move(payload));
+}
+
+features::VShardBackupUnit unitFor(uint16_t vshard, const std::string& bytes) {
+    auto payload = data::decodeSnapshotPayload(bytes);
+    if (!payload || payload->manifest.vshard.value() != vshard)
+        throw std::logic_error("invalid backup test TSP1 unit");
+    return features::VShardBackupUnit{vshard,
+                                      payload->manifest.snapshotRevision,
+                                      payload->manifest.verificationHash,
+                                      payload->manifest.catalogHash,
+                                      bytes.size(),
+                                      fnv1a(bytes)};
+}
 }  // namespace
 
 TEST(BackupRestoreIntegration, ExportRestoreInstallAndFailClosed) {
@@ -32,6 +68,9 @@ TEST(BackupRestoreIntegration, ExportRestoreInstallAndFailClosed) {
         ASSERT_TRUE(vshardsCohesiveOnCores(seastar::smp::count));
         fs::remove_all("bkp_src");
         fs::remove_all("bkp_dst");
+        fs::remove_all("bkp_archive");
+        fs::remove_all("bkp_stage");
+        fs::remove_all("bkp_stage_fresh");
 
         // --- Live source: build a real VShard snapshot payload. ---
         VShardId vshard{0};
@@ -66,20 +105,69 @@ TEST(BackupRestoreIntegration, ExportRestoreInstallAndFailClosed) {
         }
         ASSERT_FALSE(snapBytes.empty());
 
-        using features::BackupRestore;
-        const std::string srcUuid = "cluster-src-uuid";
-        auto backup = BackupRestore::exportCluster(srcUuid, {{vshard.value(), snapBytes}}, contentHash);
-        EXPECT_EQ(backup.expectedVShards, 1u);
+        // The staging API is bounded, durable, idempotent, and refuses to
+        // relabel a source TSP1 as another VShard. A partial archive cannot be
+        // published as complete.
+        writeBytes("bkp_source.tsp1", snapBytes);
+        auto sourceInspection = data::inspectSnapshotPayloadFile("bkp_source.tsp1").get();
+        ASSERT_TRUE(sourceInspection);
+        EXPECT_EQ(sourceInspection->manifest.vshard, vshard);
+        ASSERT_TRUE(
+            features::ClusterBackupArchive::stageVShard("bkp_stage_fresh", vshard.value(), "bkp_source.tsp1").get())
+            << "staging must create a previously absent archive root";
+        fs::remove_all("bkp_stage_fresh");
+        const auto interruptedStage =
+            fs::path("bkp_stage") / (features::BackupRestore::unitRelativePath(vshard.value()) + ".partial");
+        writeBytes(interruptedStage, "interrupted");
+        auto staged = features::ClusterBackupArchive::stageVShard("bkp_stage", vshard.value(), "bkp_source.tsp1").get();
+        ASSERT_TRUE(staged);
+        EXPECT_FALSE(fs::exists(interruptedStage));
+        const auto stagedFinal = fs::path("bkp_stage") / features::BackupRestore::unitRelativePath(vshard.value());
+        fs::create_hard_link(stagedFinal, interruptedStage);
+        EXPECT_EQ(features::ClusterBackupArchive::stageVShard("bkp_stage", vshard.value(), "bkp_source.tsp1").get(),
+                  staged);
+        EXPECT_FALSE(fs::exists(interruptedStage)) << "retry must close the crash window after final-link publication";
+        EXPECT_FALSE(
+            features::ClusterBackupArchive::stageVShard(
+                "bkp_stage", static_cast<uint16_t>((vshard.value() + 1) % VIRTUAL_SHARD_COUNT), "bkp_source.tsp1")
+                .get());
 
-        // Restore into a FRESH cluster UUID: verifies + scrubs old identity.
-        auto restored = BackupRestore::restore(backup, "cluster-new-uuid", contentHash);
+        // Assemble one canonical artifact per VShard. One is the live Engine
+        // payload above; the rest are minimal exact-v1 empty VShard payloads.
+        features::ClusterBackupManifest backup;
+        backup.sourceClusterUuid = "00112233445566778899aabbccddeeff";
+        backup.vshards.reserve(VIRTUAL_SHARD_COUNT);
+        std::vector<std::string> emptyUnits(VIRTUAL_SHARD_COUNT);
+        for (uint16_t i = 0; i < VIRTUAL_SHARD_COUNT; ++i) {
+            const std::string& bytes = i == vshard.value() ? snapBytes : (emptyUnits[i] = emptyVShardSnapshot(i));
+            writeBytes(fs::path("bkp_archive") / features::BackupRestore::unitRelativePath(i), bytes);
+            backup.vshards.push_back(unitFor(i, bytes));
+            if ((i & 63u) == 63u)
+                seastar::thread::yield();
+        }
+        ASSERT_TRUE(backup.valid());
+        EXPECT_FALSE(features::ClusterBackupArchive::publish("bkp_stage", backup).get())
+            << "one staged unit is never a complete cluster archive";
+        writeBytes("bkp_archive/.manifest.tsbk1.partial", "interrupted");
+        ASSERT_TRUE(features::ClusterBackupArchive::publish("bkp_archive", backup).get());
+        EXPECT_FALSE(fs::exists("bkp_archive/.manifest.tsbk1.partial"));
+        fs::create_hard_link("bkp_archive/manifest.tsbk1", "bkp_archive/.manifest.tsbk1.partial");
+        EXPECT_TRUE(features::ClusterBackupArchive::publish("bkp_archive", backup).get());
+        EXPECT_FALSE(fs::exists("bkp_archive/.manifest.tsbk1.partial"))
+            << "retry must close the crash window after manifest-link publication";
+        auto decodedManifest = features::ClusterBackupArchive::validate("bkp_archive").get();
+        ASSERT_TRUE(decodedManifest);
+        EXPECT_EQ(*decodedManifest, backup);
+
+        auto restored = features::BackupRestore::planRestore(*decodedManifest, "ffeeddccbbaa00998877665544332211");
         ASSERT_TRUE(restored.ok) << restored.error;
-        EXPECT_EQ(restored.newClusterUuid, "cluster-new-uuid");
-        ASSERT_EQ(restored.vshards.size(), 1u);
+        EXPECT_EQ(restored.newClusterUuid, "ffeeddccbbaa00998877665544332211");
+        ASSERT_EQ(restored.vshards.size(), VIRTUAL_SHARD_COUNT);
+        EXPECT_EQ(restored.vshards[vshard.value()], backup.vshards[vshard.value()]);
 
         // Install the verified snapshot into a fresh Engine and read the data back.
         {
-            auto payload = data::decodeSnapshotPayload(restored.vshards[0].snapshot);
+            auto payload = data::decodeSnapshotPayload(snapBytes);
             ASSERT_TRUE(payload.has_value()) << "restored snapshot bytes must decode";
             std::vector<std::pair<std::string, std::string>> files;
             for (auto& f : payload->files)
@@ -102,8 +190,8 @@ TEST(BackupRestoreIntegration, ExportRestoreInstallAndFailClosed) {
             wrongEntry.valueType = TSMValueType::Integer;
             EXPECT_TRUE(wrongCatalog.apply(CatalogRecord{sid, std::move(wrongEntry)}));
             auto wrongBytes = wrongCatalog.snapshot();
-            EXPECT_FALSE(dst.installVShardSnapshotCatalog(
-                                payload->manifest.vshard, wrongBytes, SeriesCatalog::snapshotHash(wrongBytes))
+            EXPECT_FALSE(dst.installVShardSnapshotCatalog(payload->manifest.vshard, wrongBytes,
+                                                          SeriesCatalog::snapshotHash(wrongBytes))
                              .get());
             auto r = dst.query(key, sid, 0, UINT64_MAX).get();
             ASSERT_TRUE(r.has_value());
@@ -113,26 +201,41 @@ TEST(BackupRestoreIntegration, ExportRestoreInstallAndFailClosed) {
         }
 
         // Fail-closed: restoring under the SOURCE uuid is refused (identity scrub).
-        EXPECT_FALSE(BackupRestore::restore(backup, srcUuid, contentHash).ok);
+        EXPECT_FALSE(features::BackupRestore::planRestore(backup, backup.sourceClusterUuid).ok);
 
         // Fail-closed: a tampered snapshot fails the hash check -> nothing restored.
         {
-            auto tampered = backup;
-            tampered.vshards[0].snapshot[tampered.vshards[0].snapshot.size() / 2] ^= 0xff;
-            auto rr = BackupRestore::restore(tampered, "cluster-new-uuid", contentHash);
-            EXPECT_FALSE(rr.ok);
-            EXPECT_TRUE(rr.vshards.empty()) << "a hash mismatch restores nothing";
+            const uint16_t target = static_cast<uint16_t>((vshard.value() + 1) % VIRTUAL_SHARD_COUNT);
+            const auto path = fs::path("bkp_archive") / features::BackupRestore::unitRelativePath(target);
+            auto tampered = emptyUnits[target];
+            tampered[tampered.size() / 2] ^= 0xff;
+            writeBytes(path, tampered);
+            EXPECT_FALSE(features::ClusterBackupArchive::validate("bkp_archive").get());
+            writeBytes(path, emptyUnits[target]);
+            ASSERT_TRUE(features::ClusterBackupArchive::validate("bkp_archive").get());
         }
 
-        // Fail-closed: a truncated backup (fewer units than expected) is refused.
+        // Fail-closed: extra and missing filesystem entries are not aliases for
+        // a complete canonical 4,096-unit artifact set.
         {
-            auto truncated = backup;
-            truncated.expectedVShards = 2;  // claims 2 but carries 1
-            EXPECT_FALSE(BackupRestore::restore(truncated, "cluster-new-uuid", contentHash).ok);
+            writeBytes("bkp_archive/vshards/alias.tsp1", emptyUnits[0]);
+            EXPECT_FALSE(features::ClusterBackupArchive::validate("bkp_archive").get());
+            fs::remove("bkp_archive/vshards/alias.tsp1");
+
+            const auto missing = fs::path("bkp_archive") / features::BackupRestore::unitRelativePath(0);
+            const std::string missingBytes = vshard.value() == 0 ? snapBytes : emptyUnits[0];
+            fs::remove(missing);
+            EXPECT_FALSE(features::ClusterBackupArchive::validate("bkp_archive").get());
+            writeBytes(missing, missingBytes);
+            ASSERT_TRUE(features::ClusterBackupArchive::validate("bkp_archive").get());
         }
 
         fs::remove_all("bkp_src");
         fs::remove_all("bkp_dst");
+        fs::remove_all("bkp_archive");
+        fs::remove_all("bkp_stage");
+        fs::remove_all("bkp_stage_fresh");
+        fs::remove("bkp_source.tsp1");
     })
         .join()
         .get();

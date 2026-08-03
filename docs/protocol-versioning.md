@@ -18,6 +18,7 @@ historical-reader guarantees during the greenfield phase.
 | Write batch | `TSW1` |
 | Replicated data command | `TSC1` |
 | VShard snapshot payload | `TSP1` |
+| Cluster backup manifest | `TSBK` plus little-endian `uint32(1)`; exactly 4,096 canonical `TSP1` units |
 | Control command | `TCC1` |
 | Group-0 retention policy value | `TSRP1` |
 | Frozen delete-plan RPC frame | version byte `1` |

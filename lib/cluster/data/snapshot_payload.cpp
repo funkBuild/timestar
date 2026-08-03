@@ -24,14 +24,18 @@ constexpr size_t kDeleteReceiptBytes = 16 + 8 + 8 + 8;
 constexpr size_t kMaxSnapshotManifestBytes = size_t{16} << 20;
 constexpr size_t kMaxSnapshotCatalogBytes = size_t{64} << 20;
 constexpr size_t kMaxSnapshotObjectNameBytes = 4096;
+constexpr uint64_t kMaxEncodedSnapshotBytes = uint64_t{1} << 40;
+
+uint64_t fnvExtend(uint64_t hash, const char* data, size_t size) {
+    for (size_t i = 0; i < size; ++i) {
+        hash ^= static_cast<uint8_t>(data[i]);
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
 
 uint64_t fnv1a(const char* p, size_t n) {
-    uint64_t h = 1469598103934665603ull;
-    for (size_t i = 0; i < n; ++i) {
-        h ^= static_cast<uint8_t>(p[i]);
-        h *= 1099511628211ull;
-    }
-    return h;
+    return fnvExtend(1469598103934665603ull, p, n);
 }
 
 void putU32(std::string& out, uint32_t v) {
@@ -167,8 +171,8 @@ void putDeleteReceipts(std::string& out, const std::vector<DeleteOperationReceip
 }
 
 template <typename Input>
-bool readDeleteReceipts(Input& r, const VShardSnapshotManifest& manifest,
-                        std::vector<DeleteOperationReceipt>& receipts, uint64_t retiredBeforeMs) {
+bool readDeleteReceipts(Input& r, const VShardSnapshotManifest& manifest, std::vector<DeleteOperationReceipt>& receipts,
+                        uint64_t retiredBeforeMs) {
     const uint32_t count = r.u32();
     if (!r.ok || count > kMaxDeleteReceiptsPerVShard ||
         count > static_cast<uint64_t>(r.remaining()) / kDeleteReceiptBytes)
@@ -308,14 +312,6 @@ public:
     uint64_t size() const { return size_; }
 
 private:
-    static uint64_t fnvExtend(uint64_t hash, const char* data, size_t size) {
-        for (size_t i = 0; i < size; ++i) {
-            hash ^= static_cast<uint8_t>(data[i]);
-            hash *= 1099511628211ull;
-        }
-        return hash;
-    }
-
     std::ofstream out_;
     uint64_t hash_ = 1469598103934665603ull;
     uint64_t size_ = 0;
@@ -323,8 +319,28 @@ private:
 
 class StreamReader {
 public:
-    StreamReader(const std::filesystem::path& path, uint64_t limit)
-        : in_(path, std::ios::binary), remaining_(limit) {
+    StreamReader(const std::filesystem::path& path, uint64_t limit) : in_(path, std::ios::binary), remaining_(limit) {
+        if (!in_)
+            ok = false;
+    }
+
+    // Hashing reader for a complete TSP1 file. The size is taken from the same
+    // opened stream which is subsequently parsed, avoiding a path stat/open
+    // race. The final eight bytes remain outside `remaining_` as the trailer.
+    explicit StreamReader(const std::filesystem::path& path) : in_(path, std::ios::binary), hashReads_(true) {
+        if (!in_) {
+            ok = false;
+            return;
+        }
+        in_.seekg(0, std::ios::end);
+        const std::streampos end = in_.tellg();
+        if (!in_ || end < std::streampos{12}) {
+            ok = false;
+            return;
+        }
+        encodedSize_ = static_cast<uint64_t>(end);
+        remaining_ = encodedSize_ - 8;
+        in_.seekg(0, std::ios::beg);
         if (!in_)
             ok = false;
     }
@@ -332,8 +348,9 @@ public:
     bool ok = true;  // Reader-compatible field used by shared helpers
     size_t remaining() const {
         return remaining_ > std::numeric_limits<size_t>::max() ? std::numeric_limits<size_t>::max()
-                                                                : static_cast<size_t>(remaining_);
+                                                               : static_cast<size_t>(remaining_);
     }
+    uint64_t encodedSize() const { return encodedSize_; }
     uint32_t u32() {
         char data[4]{};
         if (!read(data, sizeof(data)))
@@ -407,6 +424,25 @@ public:
         return ok;
     }
 
+    std::optional<uint64_t> finishAndVerifyTrailer() {
+        if (!ok || !hashReads_ || remaining_ != 0)
+            return std::nullopt;
+        char trailer[8]{};
+        in_.read(trailer, sizeof(trailer));
+        if (in_.gcount() != static_cast<std::streamsize>(sizeof(trailer))) {
+            ok = false;
+            return std::nullopt;
+        }
+        uint64_t stored = 0;
+        for (int i = 0; i < 8; ++i)
+            stored |= static_cast<uint64_t>(static_cast<uint8_t>(trailer[i])) << (8 * i);
+        if (stored != hash_ || in_.peek() != std::char_traits<char>::eof()) {
+            ok = false;
+            return std::nullopt;
+        }
+        return fnvExtend(hash_, trailer, sizeof(trailer));
+    }
+
 private:
     bool read(char* output, size_t size) {
         if (!ok || size > remaining_) {
@@ -423,6 +459,8 @@ private:
                 ok = false;
                 return false;
             }
+            if (hashReads_)
+                hash_ = fnvExtend(hash_, output + offset, count);
             offset += count;
             if (size >= (size_t{1} << 20))
                 seastar::thread::yield();
@@ -435,6 +473,18 @@ private:
             ok = false;
             return false;
         }
+        if (hashReads_) {
+            std::array<char, 64u << 10> buffer{};
+            uint64_t skipped = 0;
+            while (skipped < size) {
+                const size_t count = static_cast<size_t>(std::min<uint64_t>(buffer.size(), size - skipped));
+                if (!read(buffer.data(), count))
+                    return false;
+                skipped += count;
+                seastar::thread::yield();
+            }
+            return true;
+        }
         in_.seekg(static_cast<std::streamoff>(size), std::ios::cur);
         if (!in_) {
             ok = false;
@@ -445,7 +495,10 @@ private:
     }
 
     std::ifstream in_;
-    uint64_t remaining_;
+    uint64_t remaining_ = 0;
+    bool hashReads_ = false;
+    uint64_t hash_ = 1469598103934665603ull;
+    uint64_t encodedSize_ = 0;
 };
 
 std::optional<uint64_t> verifiedFileBodyLength(const std::filesystem::path& path) {
@@ -555,8 +608,7 @@ std::optional<SnapshotPayload> decodeSnapshotPayload(const std::string& bytes) {
         return std::nullopt;
 
     const uint32_t fileCount = r.u32();
-    if (!r.ok || fileCount != out.manifest.dataExtents.size() ||
-        fileCount > static_cast<uint64_t>(r.end - r.p) / 16)
+    if (!r.ok || fileCount != out.manifest.dataExtents.size() || fileCount > static_cast<uint64_t>(r.end - r.p) / 16)
         return std::nullopt;
     out.files.reserve(fileCount);
     for (uint32_t i = 0; i < fileCount; ++i) {
@@ -593,8 +645,7 @@ std::optional<DataStateMachineSnapshotState> decodeSnapshotStateMachineState(con
         return std::nullopt;
 
     const uint32_t fileCount = r.u32();
-    if (!r.ok || fileCount != manifest->dataExtents.size() ||
-        fileCount > static_cast<uint64_t>(r.end - r.p) / 16)
+    if (!r.ok || fileCount != manifest->dataExtents.size() || fileCount > static_cast<uint64_t>(r.end - r.p) / 16)
         return std::nullopt;
     for (uint32_t i = 0; i < fileCount; ++i)
         if (!r.skipBlob() || !r.skipBlob())
@@ -762,8 +813,7 @@ seastar::future<std::optional<SnapshotPayloadFile>> decodeSnapshotPayloadFile(
 
         out.deleteReceiptsRetiredBeforeMs = reader.u64();
         out.deleteReceiptsRetiredAtIndex = reader.u64();
-        if (!reader.ok ||
-            (out.deleteReceiptsRetiredBeforeMs == 0) != (out.deleteReceiptsRetiredAtIndex == 0) ||
+        if (!reader.ok || (out.deleteReceiptsRetiredBeforeMs == 0) != (out.deleteReceiptsRetiredAtIndex == 0) ||
             out.deleteReceiptsRetiredAtIndex >= out.manifest.snapshotRevision ||
             !readDeleteReceipts(reader, out.manifest, out.deleteReceipts, out.deleteReceiptsRetiredBeforeMs) ||
             !readRetentionCutoff(reader, out.manifest, out.retentionCutoff))
@@ -784,8 +834,7 @@ seastar::future<std::optional<SnapshotPayloadFile>> decodeSnapshotPayloadFile(
                 wireName.extension() != ".tsm" || !wireNames.insert(name).second)
                 return std::nullopt;
             const auto path = extractionDirectory /
-                              ("snapshot_v1_extract_" + std::to_string(generation) + "_" + std::to_string(i) +
-                               ".tsm");
+                              ("snapshot_v1_extract_" + std::to_string(generation) + "_" + std::to_string(i) + ".tsm");
             uint64_t size = 0;
             if (!reader.copyBlob(path, size)) {
                 std::error_code ec;
@@ -816,8 +865,7 @@ seastar::future<std::optional<DataStateMachineSnapshotState>> decodeSnapshotStat
         DataStateMachineSnapshotState state;
         state.deleteReceipts.retiredBeforeMs = reader.u64();
         state.deleteReceipts.retiredAtIndex = reader.u64();
-        if (!reader.ok ||
-            (state.deleteReceipts.retiredBeforeMs == 0) != (state.deleteReceipts.retiredAtIndex == 0) ||
+        if (!reader.ok || (state.deleteReceipts.retiredBeforeMs == 0) != (state.deleteReceipts.retiredAtIndex == 0) ||
             state.deleteReceipts.retiredAtIndex >= manifest->snapshotRevision ||
             !readDeleteReceipts(reader, *manifest, state.deleteReceipts.receipts,
                                 state.deleteReceipts.retiredBeforeMs) ||
@@ -832,6 +880,54 @@ seastar::future<std::optional<DataStateMachineSnapshotState>> decodeSnapshotStat
         if (!reader.ok || reader.remaining() != 0)
             return std::nullopt;
         return state;
+    });
+}
+
+seastar::future<std::optional<SnapshotPayloadFileInfo>> inspectSnapshotPayloadFile(
+    const std::filesystem::path& encodedPath) {
+    co_return co_await seastar::async([encodedPath]() -> std::optional<SnapshotPayloadFileInfo> {
+        std::error_code statusError;
+        if (std::filesystem::symlink_status(encodedPath, statusError).type() != std::filesystem::file_type::regular ||
+            statusError)
+            return std::nullopt;
+        StreamReader reader(encodedPath);
+        if (!reader.ok || reader.encodedSize() > kMaxEncodedSnapshotBytes || reader.u32() != kPayloadMagic)
+            return std::nullopt;
+
+        auto manifest = VShardSnapshotManifest::decode(reader.blob(kMaxSnapshotManifestBytes));
+        if (!reader.ok || !manifest)
+            return std::nullopt;
+        const std::string catalog = reader.blob(kMaxSnapshotCatalogBytes);
+        if (!reader.ok || catalog.empty() || timestar::SeriesCatalog::snapshotHash(catalog) != manifest->catalogHash ||
+            !timestar::SeriesCatalog::loadSnapshot(std::span<const char>(catalog.data(), catalog.size())))
+            return std::nullopt;
+
+        SnapshotPayloadFile metadata;
+        metadata.manifest = *manifest;
+        metadata.deleteReceiptsRetiredBeforeMs = reader.u64();
+        metadata.deleteReceiptsRetiredAtIndex = reader.u64();
+        if (!reader.ok ||
+            (metadata.deleteReceiptsRetiredBeforeMs == 0) != (metadata.deleteReceiptsRetiredAtIndex == 0) ||
+            metadata.deleteReceiptsRetiredAtIndex >= manifest->snapshotRevision ||
+            !readDeleteReceipts(reader, *manifest, metadata.deleteReceipts, metadata.deleteReceiptsRetiredBeforeMs) ||
+            !readRetentionCutoff(reader, *manifest, metadata.retentionCutoff))
+            return std::nullopt;
+
+        const uint32_t fileCount = reader.u32();
+        if (!reader.ok || fileCount != manifest->dataExtents.size() || fileCount > reader.remaining() / 16)
+            return std::nullopt;
+        std::set<std::string> names;
+        for (uint32_t i = 0; i < fileCount; ++i) {
+            const std::string name = reader.blob(kMaxSnapshotObjectNameBytes);
+            const std::filesystem::path wireName(name);
+            if (!reader.ok || name.empty() || wireName.has_parent_path() || wireName.filename() != wireName ||
+                wireName.extension() != ".tsm" || !names.insert(name).second || !reader.skipBlob())
+                return std::nullopt;
+        }
+        const auto encodedHash = reader.finishAndVerifyTrailer();
+        if (!encodedHash)
+            return std::nullopt;
+        return SnapshotPayloadFileInfo{std::move(*manifest), reader.encodedSize(), *encodedHash};
     });
 }
 

@@ -3,8 +3,8 @@
 #include "../../core/series_id.hpp"
 #include "../../storage/vshard_snapshot_manifest.hpp"
 
-#include <optional>
 #include <filesystem>
+#include <optional>
 #include <seastar/core/future.hh>
 #include <string>
 #include <utility>
@@ -123,6 +123,17 @@ struct EncodedSnapshotFile {
     void release() noexcept { removeOnDestroy = false; }
 };
 
+// Validated metadata for an immutable TSP1 file. Inspection verifies the
+// complete body/trailer, catalog, state-machine fences, object framing and
+// canonical object names while discarding object bytes through a fixed buffer.
+// It is therefore suitable for checking backup units without extracting them
+// or materialising their TSM objects in memory.
+struct SnapshotPayloadFileInfo {
+    VShardSnapshotManifest manifest;
+    uint64_t encodedSize = 0;
+    uint64_t encodedHash = 0;  // FNV-1a over the complete TSP1 file
+};
+
 // Explicitly-versioned v1, FNV-trailer-checksummed, bounds-checked codec.
 // Decode returns nullopt on any malformed, truncated, or checksum-mismatched
 // frame, so a corrupt snapshot can never be installed as valid state.
@@ -150,6 +161,8 @@ seastar::future<EncodedSnapshotFile> encodeSnapshotPayloadFile(SnapshotPayloadFi
 seastar::future<std::optional<SnapshotPayloadFile>> decodeSnapshotPayloadFile(
     const std::filesystem::path& encodedPath, const std::filesystem::path& extractionDirectory);
 seastar::future<std::optional<DataStateMachineSnapshotState>> decodeSnapshotStateMachineStateFile(
+    const std::filesystem::path& encodedPath);
+seastar::future<std::optional<SnapshotPayloadFileInfo>> inspectSnapshotPayloadFile(
     const std::filesystem::path& encodedPath);
 
 }  // namespace timestar::data
