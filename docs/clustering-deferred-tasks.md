@@ -45,8 +45,10 @@ Production blockers take priority and are authoritative in
   safe-boundary rollover/wait, and supersession pin are also complete.
   Fresh-node term-1 membership import, old-authority scrubbing, an offline
   partial-startup fence, and resumable node-local import state are complete.
-  Cross-node resumable export coordination, an all-voter pre-network restore
-  barrier, and the RF=3 operator gate remain.
+  The exact-v1 offline release now requires complete matching markers from
+  every configured data voter plus the Group-0 seed before any prepared root
+  can open Engine/networking. Cross-node resumable export coordination and the
+  RF=3 operator gate remain.
 
 ## Feature completion
 

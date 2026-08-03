@@ -792,7 +792,9 @@ int main(int argc, char** argv) {
         "dump-config", "Print default config to stdout and exit")(
         "cluster-init", "Explicitly bootstrap group 0 on the configured control seed (never implied by startup)")(
         "cluster-restore", bpo::value<std::string>(),
-        "Offline exact-v1 cluster archive to seed into this fresh data directory before startup");
+        "Offline exact-v1 cluster archive to prepare in this fresh data directory, then exit")(
+        "cluster-restore-release", bpo::value<std::string>(),
+        "Exact-v1 all-participant restore release to activate before cluster startup");
 
     // Inject Seastar settings from TOML [seastar] section.
     // CLI args are already stored first, so bpo::store won't overwrite them.
@@ -844,6 +846,10 @@ int main(int argc, char** argv) {
                 config.count("cluster-restore") != 0
                     ? std::optional<std::string>{config["cluster-restore"].as<std::string>()}
                     : std::nullopt;
+            const std::optional<std::string> clusterRestoreRelease =
+                config.count("cluster-restore-release") != 0
+                    ? std::optional<std::string>{config["cluster-restore-release"].as<std::string>()}
+                    : std::nullopt;
 
             // Initialize logging
             timestar::init_logging(log_level);
@@ -867,16 +873,31 @@ int main(int argc, char** argv) {
                     timestar::http_log.error("--cluster-restore requires a non-empty archive directory");
                     return 1;
                 }
-                if (clusterRestoreArchive &&
-                    (!cc.enabled || !cc.partitioned || cc.replication_factor <= 1 || !cc.control_enabled)) {
-                    timestar::http_log.error(
-                        "--cluster-restore requires a VShard-partitioned replicated cluster with Group 0 enabled");
+                if (clusterRestoreRelease && clusterRestoreRelease->empty()) {
+                    timestar::http_log.error("--cluster-restore-release requires a non-empty release file");
                     return 1;
                 }
-                if (clusterRestoreArchive &&
+                if (clusterRestoreArchive && clusterRestoreRelease) {
+                    timestar::http_log.error(
+                        "--cluster-restore and --cluster-restore-release are separate prepare/activate steps");
+                    return 1;
+                }
+                if (clusterRestoreArchive && clusterInitRequested) {
+                    timestar::http_log.error(
+                        "--cluster-restore only prepares and exits; use --cluster-init with the later release on the "
+                        "control seed");
+                    return 1;
+                }
+                if ((clusterRestoreArchive || clusterRestoreRelease) &&
+                    (!cc.enabled || !cc.partitioned || cc.replication_factor <= 1 || !cc.control_enabled)) {
+                    timestar::http_log.error(
+                        "cluster restore requires a VShard-partitioned replicated cluster with Group 0 enabled");
+                    return 1;
+                }
+                if ((clusterRestoreArchive || clusterRestoreRelease) &&
                     timestar::cluster::ReplicatedVShardHost::sharedJournalEnabled()) {
                     timestar::http_log.error(
-                        "--cluster-restore requires private v1 VShard journals; unset "
+                        "cluster restore requires private v1 VShard journals; unset "
                         "TIMESTAR_CLUSTER_SHARED_JOURNAL");
                     return 1;
                 }
@@ -990,11 +1011,10 @@ int main(int argc, char** argv) {
             // normal recovery then installs the imported TSP1 payloads through
             // the same received-snapshot path used for peer catch-up. The marker
             // prevents a restart from serving a partial all-group import.
-            const auto restoreState = timestar::features::ClusterRestoreSeeder::inspectTarget(dataRoot);
+            auto restoreState = timestar::features::ClusterRestoreSeeder::inspectTarget(dataRoot);
             if (restoreState == timestar::features::ClusterRestoreTargetState::Invalid) {
                 timestar::http_log.error(
-                    "cluster restore marker is corrupt or unreadable; refusing to guess whether the import is "
-                    "complete");
+                    "cluster restore marker/release is corrupt or inconsistent; refusing to guess restore state");
                 return 1;
             }
             if (restoreState == timestar::features::ClusterRestoreTargetState::InProgress && !clusterRestoreArchive) {
@@ -1003,22 +1023,19 @@ int main(int argc, char** argv) {
                 return 1;
             }
             if (clusterRestoreArchive) {
-                const auto& clusterConfig = timestar::config().cluster;
-                if (restoreState != timestar::features::ClusterRestoreTargetState::Complete &&
-                    clusterConfig.node_id == clusterConfig.control_seed_node_id && !clusterInitRequested) {
+                if (restoreState == timestar::features::ClusterRestoreTargetState::Activated) {
                     timestar::http_log.error(
-                        "the control seed requires --cluster-init with its first --cluster-restore invocation");
+                        "cluster restore is already activated; start normally without --cluster-restore");
                     return 1;
                 }
                 if (!clusterJournalIdentity) {
                     timestar::http_log.error("cluster restore has no durable replicated-cluster journal identity");
                     return 1;
                 }
-                if (restoreState != timestar::features::ClusterRestoreTargetState::Complete &&
-                    !shardStoreStartup.inspection().isFresh()) {
+                if (!shardStoreStartup.inspection().isFresh()) {
                     timestar::http_log.error(
-                        "--cluster-restore requires the Engine store to remain fresh until local import completes; "
-                        "existing data will not be overwritten");
+                        "--cluster-restore requires the Engine store to remain fresh until activation; existing data "
+                        "will not be overwritten");
                     return 1;
                 }
                 try {
@@ -1043,10 +1060,49 @@ int main(int argc, char** argv) {
                         "cluster restore seed complete on node {}: {} local VShards ({} written or revalidated this "
                         "run, resumed={})",
                         runtime.selfId, result.localVShards, result.seededThisRun, result.resumed);
+                    restoreState = timestar::features::ClusterRestoreSeeder::inspectTarget(dataRoot);
+                    if (restoreState != timestar::features::ClusterRestoreTargetState::Prepared)
+                        throw std::runtime_error("local restore did not finish in the prepared state");
+                    timestar::http_log.info(
+                        "cluster restore PREPARED on node {}; collect {} with every participant marker, finalize one "
+                        "release with timestar_cluster_restore, distribute it, and activate in a separate startup",
+                        runtime.selfId, timestar::features::ClusterRestoreSeeder::markerPath(dataRoot).string());
+                    return 0;
                 } catch (const std::exception& e) {
                     timestar::http_log.error("cluster restore refused or failed: {}", e.what());
                     return 1;
                 }
+            }
+            if (clusterRestoreRelease) {
+                const auto& clusterConfig = timestar::config().cluster;
+                if (restoreState == timestar::features::ClusterRestoreTargetState::Prepared &&
+                    clusterConfig.node_id == clusterConfig.control_seed_node_id && !clusterInitRequested) {
+                    timestar::http_log.error(
+                        "the control seed requires --cluster-init with its first --cluster-restore-release startup");
+                    return 1;
+                }
+                if (restoreState == timestar::features::ClusterRestoreTargetState::Prepared &&
+                    !shardStoreStartup.inspection().isFresh()) {
+                    timestar::http_log.error(
+                        "cluster restore activation requires the Engine store to remain fresh after preparation");
+                    return 1;
+                }
+                try {
+                    timestar::features::ClusterRestoreSeeder::activate(dataRoot, *clusterRestoreRelease);
+                    restoreState = timestar::features::ClusterRestoreSeeder::inspectTarget(dataRoot);
+                    if (restoreState != timestar::features::ClusterRestoreTargetState::Activated)
+                        throw std::runtime_error("cluster restore release receipt did not become durable");
+                    timestar::http_log.info("cluster restore release activated for this data root");
+                } catch (const std::exception& e) {
+                    timestar::http_log.error("cluster restore activation refused or failed: {}", e.what());
+                    return 1;
+                }
+            }
+            if (restoreState == timestar::features::ClusterRestoreTargetState::Prepared) {
+                timestar::http_log.error(
+                    "cluster restore is prepared but not released; startup requires --cluster-restore-release from "
+                    "the all-participant finalization ceremony");
+                return 1;
             }
 
             // Initialize virtual shard placement table (Phase 5).

@@ -75,23 +75,38 @@ serving map, and only the portable policy/retention/frozen-delete state. Old
 nodes, voters, tokens, jobs, placement authority, and controller ownership are
 not imported.
 
-The control seed's first restore invocation also requires `--cluster-init`.
-Once the local marker is complete, ordinary recovery does not require either
-restore option.
-
 The importer writes a checksummed marker before creating `cluster_raft/`,
 durably advances batched progress, revalidates already-written journals after a
 crash, publishes `control_map.cache` before marking the node complete, and
 refuses ordinary startup while the marker is incomplete. Resume requires the
 same archive, cluster UUID, identity, core count, and serving map.
 
-**This is not yet a safe RF=3 restore procedure.** Every voter named for every
-data group must import the same archive before any restored node opens its
-cluster transport. That cluster-wide barrier is not implemented. Starting one
-restored voter beside two fresh empty voters can allow the empty majority to
-elect and overwrite restored state. The local importer is recovery machinery
-for the eventual coordinated procedure, not authorization to deploy clustered
-backup/restore in production.
+Preparation now exits successfully without opening Engine or a network
+listener. It does not authorize that node to start. Collect the immutable
+`cluster_restore.v1` marker from every data voter named by the new serving map
+and from the Group-0 seed, then finalize one release offline:
+
+```
+timestar_cluster_restore finalize --output restore.tsrr1 \
+  node1.cluster_restore.v1 node2.cluster_restore.v1 node3.cluster_restore.v1
+```
+
+The finalizer refuses an incomplete/duplicate participant set or markers that
+disagree on source archive, new cluster UUID, serving map, control seed, or
+participant set. Distribute the exact release to every prepared root and start
+each with `--cluster-restore-release <release>`. The control seed's first
+activation also requires `--cluster-init`. Activation durably installs an
+immutable local receipt before normal recovery can open Engine or networking;
+later restarts need neither restore option. A prepared root without a matching
+release remains fenced offline.
+
+This closes the accidental empty-majority hole in the restore composition: no
+prepared voter can start until the offline finalizer has observed every voter's
+complete marker. The markers and release are checksummed integrity records, not
+cryptographic signatures; the operator and distribution channel remain trusted.
+Cluster backup/restore is still unsupported for production until coordinated
+live export, the full RF=3 recovery gate, authenticated artifact handling, and
+the runbook are complete.
 
 ## Data Directory Structure
 
@@ -201,10 +216,13 @@ procedure is:
   `TSP1` units as generation-one state under new Raft membership. The offline
   importer is idempotent and durably resumable, rejects conflicting progress,
   and does not open Engine or networking while the local marker is partial.
+- [x] Fence prepared nodes behind one exact-v1 offline release. Finalization
+  requires a complete, consistent marker set for every configured data voter
+  plus the Group-0 seed; activation persists a matching receipt before startup.
 - [ ] Run the RF=3 live gate: writes during export, full restore, exact readback,
   corrupt/missing/extra artifact rejection, interrupted export/import resume,
-  restart during import, proof that every configured voter was seeded before
-  networking, and proof that old identities cannot join or actuate.
+  restart during import/activation, all-voter release rejection, and proof that
+  old identities cannot join or actuate.
 - [ ] Publish artifact retention, capacity/headroom, authenticated integrity or
   encryption, key management, off-site replication, restore, and disaster-
   recovery procedures.

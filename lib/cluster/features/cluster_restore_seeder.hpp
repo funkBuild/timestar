@@ -11,12 +11,13 @@
 #include <optional>
 #include <seastar/core/future.hh>
 #include <string>
+#include <vector>
 
 namespace timestar::features {
 
 // The restore marker is outside cluster_raft so ordinary Raft recovery cannot
 // accidentally treat a partial all-group import as a complete cluster.
-enum class ClusterRestoreTargetState : uint8_t { Absent, InProgress, Complete, Invalid };
+enum class ClusterRestoreTargetState : uint8_t { Absent, InProgress, Prepared, Activated, Invalid };
 
 struct ClusterRestoreSeedRequest {
     std::filesystem::path archiveDirectory;
@@ -51,8 +52,17 @@ struct ClusterRestoreSeedResult {
 class ClusterRestoreSeeder {
 public:
     static std::filesystem::path markerPath(const std::filesystem::path& dataDirectory);
+    static std::filesystem::path releaseReceiptPath(const std::filesystem::path& dataDirectory);
     static ClusterRestoreTargetState inspectTarget(const std::filesystem::path& dataDirectory);
     static seastar::future<ClusterRestoreSeedResult> seed(ClusterRestoreSeedRequest request);
+
+    // Offline ceremony: collect the completed marker from every participant,
+    // finalize one exact-v1 release, distribute that release back to the same
+    // nodes, then activate each data root. No node may open Raft networking from
+    // a merely Prepared marker.
+    static void finalizeRelease(const std::vector<std::filesystem::path>& markerFiles,
+                                const std::filesystem::path& output);
+    static void activate(const std::filesystem::path& dataDirectory, const std::filesystem::path& releaseFile);
 };
 
 }  // namespace timestar::features

@@ -36,6 +36,9 @@ namespace {
 constexpr uint32_t kMarkerMagic = 0x49525354;  // "TSRI" little-endian
 constexpr uint32_t kMarkerVersion = 1;
 constexpr size_t kMaxMarkerBytes = 512;
+constexpr uint32_t kReleaseMagic = 0x52525354;  // "TSRR" little-endian
+constexpr uint32_t kReleaseVersion = 1;
+constexpr size_t kMaxReleaseBytes = 4u << 20;
 constexpr size_t kJournalSegmentBytes = 1u << 20;
 constexpr uint64_t kImportTerm = 1;
 constexpr uint64_t kFnvOffset = 1469598103934665603ull;
@@ -50,10 +53,32 @@ struct Marker {
     std::string newClusterUuid;
     uint64_t manifestBytes = 0;
     uint64_t manifestHash = 0;
+    uint64_t ceremonyHash = 0;
+    uint64_t participantsHash = 0;
     uint64_t targetHash = 0;
     uint64_t self = 0;
+    uint32_t participantCount = 0;
     uint32_t localCount = 0;
     uint32_t nextLocal = 0;
+};
+
+struct ReleaseEntry {
+    uint64_t self = 0;
+    uint64_t markerBytes = 0;
+    uint64_t markerHash = 0;
+
+    friend bool operator==(const ReleaseEntry&, const ReleaseEntry&) = default;
+};
+
+struct Release {
+    std::string sourceClusterUuid;
+    std::string newClusterUuid;
+    uint64_t manifestBytes = 0;
+    uint64_t manifestHash = 0;
+    uint64_t ceremonyHash = 0;
+    uint64_t participantsHash = 0;
+    uint32_t participantCount = 0;
+    std::vector<ReleaseEntry> entries;
 };
 
 class UniqueFd {
@@ -205,6 +230,20 @@ uint64_t fnvString(std::string_view value) {
     return fnvExtend(kFnvOffset, value.data(), value.size());
 }
 
+uint64_t fnvU64(uint64_t hash, uint64_t value) {
+    std::array<uint8_t, 8> encoded{};
+    for (int i = 0; i < 8; ++i)
+        encoded[i] = static_cast<uint8_t>((value >> (8 * i)) & 0xff);
+    return fnvExtend(hash, encoded.data(), encoded.size());
+}
+
+uint64_t hashParticipants(const std::vector<raft::NodeId>& participants) {
+    uint64_t hash = kFnvOffset;
+    for (const auto node : participants)
+        hash = fnvU64(hash, node);
+    return hash;
+}
+
 void putU32(std::string& out, uint32_t value) {
     for (int i = 0; i < 4; ++i)
         out.push_back(static_cast<char>((value >> (8 * i)) & 0xff));
@@ -278,8 +317,11 @@ std::string encodeMarker(const Marker& marker) {
     putBlob(out, marker.newClusterUuid);
     putU64(out, marker.manifestBytes);
     putU64(out, marker.manifestHash);
+    putU64(out, marker.ceremonyHash);
+    putU64(out, marker.participantsHash);
     putU64(out, marker.targetHash);
     putU64(out, marker.self);
+    putU32(out, marker.participantCount);
     putU32(out, marker.localCount);
     putU32(out, marker.nextLocal);
     putU32(out, CRC32::compute(out.data(), out.size()));
@@ -307,29 +349,111 @@ std::optional<Marker> decodeMarker(const std::string& bytes) {
     marker.newClusterUuid = reader.blob(32);
     marker.manifestBytes = reader.u64();
     marker.manifestHash = reader.u64();
+    marker.ceremonyHash = reader.u64();
+    marker.participantsHash = reader.u64();
     marker.targetHash = reader.u64();
     marker.self = reader.u64();
+    marker.participantCount = reader.u32();
     marker.localCount = reader.u32();
     marker.nextLocal = reader.u32();
     if (complete > 1 || controlDone > 1 || !reader.exhausted() || marker.sourceClusterUuid.size() != 32 ||
-        marker.newClusterUuid.size() != 32 || marker.manifestBytes == 0 || marker.nextLocal > marker.localCount ||
+        marker.newClusterUuid.size() != 32 || marker.manifestBytes == 0 || marker.self == raft::kNoNode ||
+        marker.participantCount == 0 || marker.nextLocal > marker.localCount ||
         (marker.complete && marker.nextLocal != marker.localCount))
         return std::nullopt;
     return marker;
 }
 
-std::optional<std::string> readMarkerFile(const std::filesystem::path& path) {
+std::string encodeRelease(const Release& release) {
+    std::string out;
+    out.reserve(96 + release.entries.size() * 24);
+    putU32(out, kReleaseMagic);
+    putU32(out, kReleaseVersion);
+    putBlob(out, release.sourceClusterUuid);
+    putBlob(out, release.newClusterUuid);
+    putU64(out, release.manifestBytes);
+    putU64(out, release.manifestHash);
+    putU64(out, release.ceremonyHash);
+    putU64(out, release.participantsHash);
+    putU32(out, release.participantCount);
+    putU32(out, static_cast<uint32_t>(release.entries.size()));
+    for (const auto& entry : release.entries) {
+        putU64(out, entry.self);
+        putU64(out, entry.markerBytes);
+        putU64(out, entry.markerHash);
+    }
+    putU32(out, CRC32::compute(out.data(), out.size()));
+    if (out.size() > kMaxReleaseBytes)
+        throw std::length_error("cluster restore release exceeds the exact-v1 size bound");
+    return out;
+}
+
+std::optional<Release> decodeRelease(const std::string& bytes) {
+    if (bytes.size() < 4 || bytes.size() > kMaxReleaseBytes)
+        return std::nullopt;
+    const size_t bodySize = bytes.size() - 4;
+    uint32_t storedCrc = 0;
+    for (int i = 0; i < 4; ++i)
+        storedCrc |= static_cast<uint32_t>(static_cast<uint8_t>(bytes[bodySize + i])) << (8 * i);
+    if (CRC32::compute(bytes.data(), bodySize) != storedCrc)
+        return std::nullopt;
+    Reader reader(std::span<const char>(bytes.data(), bodySize));
+    if (reader.u32() != kReleaseMagic || reader.u32() != kReleaseVersion)
+        return std::nullopt;
+    Release release;
+    release.sourceClusterUuid = reader.blob(32);
+    release.newClusterUuid = reader.blob(32);
+    release.manifestBytes = reader.u64();
+    release.manifestHash = reader.u64();
+    release.ceremonyHash = reader.u64();
+    release.participantsHash = reader.u64();
+    release.participantCount = reader.u32();
+    const uint32_t entryCount = reader.u32();
+    if (entryCount == 0 || entryCount != release.participantCount || entryCount > (kMaxReleaseBytes - 96) / 24)
+        return std::nullopt;
+    release.entries.reserve(entryCount);
+    std::vector<raft::NodeId> participants;
+    participants.reserve(entryCount);
+    uint64_t previous = 0;
+    for (uint32_t i = 0; i < entryCount; ++i) {
+        ReleaseEntry entry{reader.u64(), reader.u64(), reader.u64()};
+        if (entry.self == raft::kNoNode || entry.self <= previous || entry.markerBytes == 0 ||
+            entry.markerBytes > kMaxMarkerBytes)
+            return std::nullopt;
+        previous = entry.self;
+        participants.push_back(entry.self);
+        release.entries.push_back(entry);
+    }
+    if (!reader.exhausted() || release.sourceClusterUuid.size() != 32 || release.newClusterUuid.size() != 32 ||
+        release.manifestBytes == 0 || hashParticipants(participants) != release.participantsHash)
+        return std::nullopt;
+    return release;
+}
+
+bool releaseMatchesMarker(const Release& release, const Marker& marker, std::string_view markerBytes) {
+    if (!marker.complete || !marker.controlDone || release.sourceClusterUuid != marker.sourceClusterUuid ||
+        release.newClusterUuid != marker.newClusterUuid || release.manifestBytes != marker.manifestBytes ||
+        release.manifestHash != marker.manifestHash || release.ceremonyHash != marker.ceremonyHash ||
+        release.participantsHash != marker.participantsHash || release.participantCount != marker.participantCount)
+        return false;
+    const auto entry = std::ranges::lower_bound(release.entries, marker.self, {}, &ReleaseEntry::self);
+    return entry != release.entries.end() && entry->self == marker.self && entry->markerBytes == markerBytes.size() &&
+           entry->markerHash == fnvString(markerBytes);
+}
+
+std::optional<std::string> readBoundedRegularFile(const std::filesystem::path& path, size_t maximum,
+                                                  std::string_view description) {
     UniqueFd fd(::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
     if (fd.get() < 0) {
         if (errno == ENOENT)
             return std::nullopt;
-        throwIo("open cluster restore marker", path);
+        throwIo("open " + std::string(description), path);
     }
     struct stat st{};
     if (::fstat(fd.get(), &st) < 0)
-        throwIo("stat cluster restore marker", path);
-    if (!S_ISREG(st.st_mode) || st.st_size <= 0 || static_cast<size_t>(st.st_size) > kMaxMarkerBytes)
-        throw std::runtime_error("cluster restore marker has an invalid type or size: " + path.string());
+        throwIo("stat " + std::string(description), path);
+    if (!S_ISREG(st.st_mode) || st.st_size <= 0 || static_cast<size_t>(st.st_size) > maximum)
+        throw std::runtime_error(std::string(description) + " has an invalid type or size: " + path.string());
     std::string bytes(static_cast<size_t>(st.st_size), '\0');
     size_t offset = 0;
     while (offset < bytes.size()) {
@@ -337,14 +461,18 @@ std::optional<std::string> readMarkerFile(const std::filesystem::path& path) {
         if (count < 0) {
             if (errno == EINTR)
                 continue;
-            throwIo("read cluster restore marker", path);
+            throwIo("read " + std::string(description), path);
         }
         if (count == 0)
-            throw std::runtime_error("cluster restore marker was truncated while reading");
+            throw std::runtime_error(std::string(description) + " was truncated while reading");
         offset += static_cast<size_t>(count);
     }
     closeChecked(fd, path);
     return bytes;
+}
+
+std::optional<std::string> readMarkerFile(const std::filesystem::path& path) {
+    return readBoundedRegularFile(path, kMaxMarkerBytes, "cluster restore marker");
 }
 
 void writeMarkerAtomically(const std::filesystem::path& path, const Marker& marker) {
@@ -374,6 +502,53 @@ void writeMarkerAtomically(const std::filesystem::path& path, const Marker& mark
     }
 }
 
+void writeFileNoReplaceDurably(const std::filesystem::path& path, std::string_view bytes, size_t maximum,
+                               std::string_view description) {
+    const auto directory = path.parent_path().empty() ? std::filesystem::path(".") : path.parent_path();
+    ensureDirectoryDurable(directory);
+    if (auto existing = readBoundedRegularFile(path, maximum, description)) {
+        if (*existing == bytes) {
+            fsyncDirectory(directory);
+            return;
+        }
+        throw std::runtime_error(std::string(description) + " already exists with different bytes: " + path.string());
+    }
+
+    const auto temporary = path.string() + ".tmp." + std::to_string(::getpid());
+    UniqueFd fd(::open(temporary.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600));
+    if (fd.get() < 0)
+        throwIo("create temporary " + std::string(description), temporary);
+    bool published = false;
+    try {
+        writeAll(fd.get(), bytes.data(), bytes.size(), temporary);
+        int rc;
+        do {
+            rc = ::fsync(fd.get());
+        } while (rc < 0 && errno == EINTR);
+        if (rc < 0)
+            throwIo("fsync temporary " + std::string(description), temporary);
+        closeChecked(fd, temporary);
+        if (::link(temporary.c_str(), path.c_str()) < 0) {
+            if (errno != EEXIST)
+                throwIo("publish " + std::string(description), path);
+            auto existing = readBoundedRegularFile(path, maximum, description);
+            if (!existing || *existing != bytes)
+                throw std::runtime_error(std::string(description) +
+                                         " was concurrently published with different bytes: " + path.string());
+        }
+        published = true;
+        const int unlinkResult = ::unlink(temporary.c_str());
+        const int unlinkError = errno;
+        fsyncDirectory(directory);
+        if (unlinkResult < 0)
+            throwIo("remove temporary " + std::string(description), temporary, unlinkError);
+    } catch (...) {
+        if (!published)
+            ::unlink(temporary.c_str());
+        throw;
+    }
+}
+
 std::array<uint8_t, 16> decodeHex128(std::string_view value) {
     if (value.size() != 32)
         throw std::invalid_argument("cluster restore UUID must contain 32 hexadecimal characters");
@@ -398,19 +573,39 @@ std::vector<std::pair<uint16_t, std::vector<raft::NodeId>>> localGroups(const Cl
     return groups;
 }
 
+std::vector<raft::NodeId> restoreParticipants(const ClusterRestoreSeedRequest& request) {
+    std::set<raft::NodeId> unique{request.controlSeed};
+    for (const auto& [vshard, voters] : request.servingMap.placement) {
+        (void)vshard;
+        unique.insert(voters.begin(), voters.end());
+    }
+    return {unique.begin(), unique.end()};
+}
+
+uint64_t ceremonyFingerprint(const ClusterRestoreSeedRequest& request) {
+    control::ControlMapCache encoded;
+    if (!encoded.update(request.servingMap))
+        throw std::invalid_argument("cluster restore target has an invalid serving map");
+    const std::string mapBytes = encoded.serialize();
+    uint64_t hash = fnvExtend(kFnvOffset, request.newClusterUuid.data(), request.newClusterUuid.size());
+    hash = fnvU64(hash, request.controlSeed);
+    hash = fnvExtend(hash, mapBytes.data(), mapBytes.size());
+    return hash;
+}
+
 uint64_t targetFingerprint(const ClusterRestoreSeedRequest& request) {
     control::ControlMapCache encoded;
     if (!encoded.update(request.servingMap))
         throw std::invalid_argument("cluster restore target has an invalid serving map");
     const std::string mapBytes = encoded.serialize();
     uint64_t hash = fnvExtend(kFnvOffset, request.newClusterUuid.data(), request.newClusterUuid.size());
-    hash = fnvExtend(hash, &request.self, sizeof(request.self));
-    hash = fnvExtend(hash, &request.controlSeed, sizeof(request.controlSeed));
-    hash = fnvExtend(hash, &request.coreCount, sizeof(request.coreCount));
+    hash = fnvU64(hash, request.self);
+    hash = fnvU64(hash, request.controlSeed);
+    hash = fnvU64(hash, request.coreCount);
     hash = fnvExtend(hash, mapBytes.data(), mapBytes.size());
     if (request.controlSeedRecord) {
         const auto& record = *request.controlSeedRecord;
-        hash = fnvExtend(hash, &record.raftId, sizeof(record.raftId));
+        hash = fnvU64(hash, record.raftId);
         hash = fnvExtend(hash, record.uuid.data(), record.uuid.size());
         hash = fnvExtend(hash, record.address.data(), record.address.size());
         hash = fnvExtend(hash, record.failureDomain.data(), record.failureDomain.size());
@@ -430,6 +625,9 @@ void validateRequest(const ClusterRestoreSeedRequest& request) {
         throw std::invalid_argument("cluster restore core count does not keep VShards cohesive");
     if (!control::isCompleteControlMap(request.servingMap) || !request.servingMap.groups.empty())
         throw std::invalid_argument("cluster restore requires one complete identity-mapped v1 serving map");
+    const auto participants = restoreParticipants(request);
+    if (!std::ranges::binary_search(participants, request.self))
+        throw std::invalid_argument("cluster restore node is not a Group-0 seed or configured data voter");
     if (request.self == request.controlSeed) {
         if (!request.controlSeedRecord || request.controlSeedRecord->raftId != request.self)
             throw std::invalid_argument("control seed restore requires this node's persistent identity record");
@@ -665,15 +863,28 @@ std::filesystem::path ClusterRestoreSeeder::markerPath(const std::filesystem::pa
     return dataDirectory / "cluster_restore.v1";
 }
 
+std::filesystem::path ClusterRestoreSeeder::releaseReceiptPath(const std::filesystem::path& dataDirectory) {
+    return dataDirectory / "cluster_restore_release.v1";
+}
+
 ClusterRestoreTargetState ClusterRestoreSeeder::inspectTarget(const std::filesystem::path& dataDirectory) {
     try {
         auto bytes = readMarkerFile(markerPath(dataDirectory));
+        auto releaseBytes = readBoundedRegularFile(releaseReceiptPath(dataDirectory), kMaxReleaseBytes,
+                                                   "cluster restore release receipt");
         if (!bytes)
-            return ClusterRestoreTargetState::Absent;
+            return releaseBytes ? ClusterRestoreTargetState::Invalid : ClusterRestoreTargetState::Absent;
         auto marker = decodeMarker(*bytes);
         if (!marker)
             return ClusterRestoreTargetState::Invalid;
-        return marker->complete ? ClusterRestoreTargetState::Complete : ClusterRestoreTargetState::InProgress;
+        if (!marker->complete)
+            return releaseBytes ? ClusterRestoreTargetState::Invalid : ClusterRestoreTargetState::InProgress;
+        if (!releaseBytes)
+            return ClusterRestoreTargetState::Prepared;
+        auto release = decodeRelease(*releaseBytes);
+        if (!release || !releaseMatchesMarker(*release, *marker, *bytes))
+            return ClusterRestoreTargetState::Invalid;
+        return ClusterRestoreTargetState::Activated;
     } catch (...) {
         return ClusterRestoreTargetState::Invalid;
     }
@@ -691,9 +902,11 @@ seastar::future<ClusterRestoreSeedResult> ClusterRestoreSeeder::seed(ClusterRest
     const std::string manifestBytes = manifest->encode();
     const uint64_t manifestHash = fnvString(manifestBytes);
     const uint64_t targetHash = targetFingerprint(request);
+    const uint64_t ceremonyHash = ceremonyFingerprint(request);
+    const auto participants = restoreParticipants(request);
     auto groups = localGroups(request);
-    if (groups.size() > UINT32_MAX)
-        throw std::length_error("cluster restore local VShard count exceeds marker framing");
+    if (participants.size() > UINT32_MAX || groups.size() > UINT32_MAX)
+        throw std::length_error("cluster restore participant or local VShard count exceeds marker framing");
 
     const auto statePath = markerPath(request.dataDirectory);
     auto existingBytes = co_await seastar::async([statePath] { return readMarkerFile(statePath); });
@@ -710,13 +923,18 @@ seastar::future<ClusterRestoreSeedResult> ClusterRestoreSeeder::seed(ClusterRest
     marker.newClusterUuid = request.newClusterUuid;
     marker.manifestBytes = manifestBytes.size();
     marker.manifestHash = manifestHash;
+    marker.ceremonyHash = ceremonyHash;
+    marker.participantsHash = hashParticipants(participants);
     marker.targetHash = targetHash;
     marker.self = request.self;
+    marker.participantCount = static_cast<uint32_t>(participants.size());
     marker.localCount = static_cast<uint32_t>(groups.size());
     if (existing) {
         if (existing->sourceClusterUuid != marker.sourceClusterUuid ||
             existing->newClusterUuid != marker.newClusterUuid || existing->manifestBytes != marker.manifestBytes ||
-            existing->manifestHash != marker.manifestHash || existing->targetHash != marker.targetHash ||
+            existing->manifestHash != marker.manifestHash || existing->ceremonyHash != marker.ceremonyHash ||
+            existing->participantsHash != marker.participantsHash ||
+            existing->participantCount != marker.participantCount || existing->targetHash != marker.targetHash ||
             existing->self != marker.self || existing->localCount != marker.localCount)
             throw std::runtime_error("cluster restore request conflicts with the durable in-progress import");
         marker = *existing;
@@ -767,6 +985,71 @@ seastar::future<ClusterRestoreSeedResult> ClusterRestoreSeeder::seed(ClusterRest
     marker.complete = true;
     co_await seastar::async([statePath, marker] { writeMarkerAtomically(statePath, marker); });
     co_return result;
+}
+
+void ClusterRestoreSeeder::finalizeRelease(const std::vector<std::filesystem::path>& markerFiles,
+                                           const std::filesystem::path& output) {
+    if (markerFiles.empty() || output.empty())
+        throw std::invalid_argument("cluster restore finalization requires marker files and an output path");
+
+    Release release;
+    bool haveCommon = false;
+    for (const auto& path : markerFiles) {
+        auto bytes = readMarkerFile(path);
+        if (!bytes)
+            throw std::runtime_error("cluster restore participant marker is missing: " + path.string());
+        auto marker = decodeMarker(*bytes);
+        if (!marker || !marker->complete || !marker->controlDone)
+            throw std::runtime_error("cluster restore participant marker is invalid or incomplete: " + path.string());
+        if (!haveCommon) {
+            release.sourceClusterUuid = marker->sourceClusterUuid;
+            release.newClusterUuid = marker->newClusterUuid;
+            release.manifestBytes = marker->manifestBytes;
+            release.manifestHash = marker->manifestHash;
+            release.ceremonyHash = marker->ceremonyHash;
+            release.participantsHash = marker->participantsHash;
+            release.participantCount = marker->participantCount;
+            haveCommon = true;
+        } else if (release.sourceClusterUuid != marker->sourceClusterUuid ||
+                   release.newClusterUuid != marker->newClusterUuid || release.manifestBytes != marker->manifestBytes ||
+                   release.manifestHash != marker->manifestHash || release.ceremonyHash != marker->ceremonyHash ||
+                   release.participantsHash != marker->participantsHash ||
+                   release.participantCount != marker->participantCount) {
+            throw std::runtime_error("cluster restore participant markers describe different ceremonies");
+        }
+        release.entries.push_back(ReleaseEntry{marker->self, bytes->size(), fnvString(*bytes)});
+    }
+    std::ranges::sort(release.entries, {}, &ReleaseEntry::self);
+    if (release.entries.size() != release.participantCount)
+        throw std::runtime_error("cluster restore release is missing or has extra participant markers");
+    std::vector<raft::NodeId> participants;
+    participants.reserve(release.entries.size());
+    for (size_t i = 0; i < release.entries.size(); ++i) {
+        if (i != 0 && release.entries[i - 1].self == release.entries[i].self)
+            throw std::runtime_error("cluster restore release contains a duplicate participant marker");
+        participants.push_back(release.entries[i].self);
+    }
+    if (hashParticipants(participants) != release.participantsHash)
+        throw std::runtime_error("cluster restore release participant set does not match the target serving map");
+
+    const std::string encoded = encodeRelease(release);
+    writeFileNoReplaceDurably(output, encoded, kMaxReleaseBytes, "cluster restore release");
+}
+
+void ClusterRestoreSeeder::activate(const std::filesystem::path& dataDirectory,
+                                    const std::filesystem::path& releaseFile) {
+    if (dataDirectory.empty() || releaseFile.empty())
+        throw std::invalid_argument("cluster restore activation requires a data directory and release file");
+    auto markerBytes = readMarkerFile(markerPath(dataDirectory));
+    auto releaseBytes = readBoundedRegularFile(releaseFile, kMaxReleaseBytes, "cluster restore release");
+    if (!markerBytes || !releaseBytes)
+        throw std::runtime_error("cluster restore activation requires a prepared marker and release");
+    auto marker = decodeMarker(*markerBytes);
+    auto release = decodeRelease(*releaseBytes);
+    if (!marker || !release || !releaseMatchesMarker(*release, *marker, *markerBytes))
+        throw std::runtime_error("cluster restore release does not authorize this prepared data root");
+    writeFileNoReplaceDurably(releaseReceiptPath(dataDirectory), *releaseBytes, kMaxReleaseBytes,
+                              "cluster restore release receipt");
 }
 
 }  // namespace timestar::features

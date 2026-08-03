@@ -2,6 +2,11 @@
 add_executable(timestar_http_server timestar_http_server.cpp)
 target_link_libraries(timestar_http_server libtimestar libtimestar_proto_conv)
 
+# Offline exact-v1 all-voter restore release finalizer. It intentionally has no
+# network client: operators must collect every prepared node marker first.
+add_executable(timestar_cluster_restore timestar_cluster_restore.cpp)
+target_link_libraries(timestar_cluster_restore libtimestar)
+
 # Benchmark tool for performance testing
 add_executable(timestar_benchmark timestar_benchmark.cpp)
 target_link_libraries(timestar_benchmark libtimestar libtimestar_proto_conv)
@@ -28,6 +33,7 @@ target_link_libraries(forecast_benchmark libtimestar libtimestar_proto_conv benc
 # (see cmake/CompilerWarnings.cmake).
 foreach(_bin_target
         timestar_http_server
+        timestar_cluster_restore
         timestar_benchmark
         timestar_insert_bench
         timestar_query_bench
@@ -36,8 +42,8 @@ foreach(_bin_target
     timestar_set_project_warnings(${_bin_target})
 endforeach()
 
-# Install the server binary (prefix-relative via GNUInstallDirs, included in
+# Install production binaries (prefix-relative via GNUInstallDirs, included in
 # the top-level CMakeLists.txt).
-install(TARGETS timestar_http_server
+install(TARGETS timestar_http_server timestar_cluster_restore
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
         COMPONENT timestar)

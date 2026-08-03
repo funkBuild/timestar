@@ -12,6 +12,7 @@
 #include "../../../lib/core/placement_table.hpp"  // virtualShard
 #include "../../../lib/core/vshard.hpp"           // vshardsCohesiveOnCores
 #include "../../../lib/storage/series_catalog.hpp"
+#include "../../../lib/utils/crc32.hpp"
 
 #include <gtest/gtest.h>
 
@@ -41,6 +42,37 @@ void writeBytes(const fs::path& path, std::string_view bytes) {
     output.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
     if (!output)
         throw std::runtime_error("failed to write backup test fixture " + path.string());
+}
+
+std::string readBytes(const fs::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in)
+        throw std::runtime_error("failed to read backup test fixture " + path.string());
+    return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+}
+
+std::string markerForParticipant(std::string bytes, uint64_t self) {
+    auto getU32 = [&](size_t offset) {
+        uint32_t value = 0;
+        for (int i = 0; i < 4; ++i)
+            value |= static_cast<uint32_t>(static_cast<uint8_t>(bytes[offset + i])) << (8 * i);
+        return value;
+    };
+    size_t offset = 10;  // magic, version, complete, controlDone
+    for (int field = 0; field < 2; ++field) {
+        const uint32_t size = getU32(offset);
+        offset += 4 + size;
+    }
+    offset += 5 * sizeof(uint64_t);  // manifest size/hash, ceremony, participants, node-target hashes
+    if (offset + sizeof(uint64_t) + sizeof(uint32_t) > bytes.size())
+        throw std::runtime_error("restore marker fixture is truncated");
+    for (int i = 0; i < 8; ++i)
+        bytes[offset + i] = static_cast<char>((self >> (8 * i)) & 0xff);
+    const size_t crcOffset = bytes.size() - 4;
+    const uint32_t crc = CRC32::compute(bytes.data(), crcOffset);
+    for (int i = 0; i < 4; ++i)
+        bytes[crcOffset + i] = static_cast<char>((crc >> (8 * i)) & 0xff);
+    return bytes;
 }
 
 std::array<uint8_t, 16> hexBytes(std::string_view value) {
@@ -288,7 +320,7 @@ TEST(BackupRestoreIntegration, ExportRestoreInstallAndFailClosed) {
             EXPECT_TRUE(seeded.resumed);
             EXPECT_EQ(seeded.localVShards, 2u);
             EXPECT_EQ(features::ClusterRestoreSeeder::inspectTarget("bkp_seed"),
-                      features::ClusterRestoreTargetState::Complete);
+                      features::ClusterRestoreTargetState::Prepared);
             auto cached = control::DurableControlMapStore("bkp_seed").load();
             ASSERT_TRUE(cached);
             EXPECT_EQ(*cached, request.servingMap);
@@ -297,6 +329,31 @@ TEST(BackupRestoreIntegration, ExportRestoreInstallAndFailClosed) {
             EXPECT_TRUE(alreadyComplete.resumed);
             EXPECT_EQ(alreadyComplete.localVShards, 2u);
             EXPECT_EQ(alreadyComplete.seededThisRun, 0u);
+
+            // The release finalizer refuses a subset. Synthetic peer markers
+            // exercise only the exact-v1 ceremony framing; the import assertions
+            // above are intentionally grounded in node 1's real journals.
+            const auto ownMarker = features::ClusterRestoreSeeder::markerPath("bkp_seed");
+            EXPECT_THROW(features::ClusterRestoreSeeder::finalizeRelease({ownMarker}, "bkp_release.tsr1"),
+                         std::runtime_error);
+            std::vector<fs::path> markers{ownMarker};
+            const std::string markerBytes = readBytes(ownMarker);
+            for (uint64_t node = 2; node <= 4; ++node) {
+                const fs::path path = "bkp_marker_node_" + std::to_string(node);
+                writeBytes(path, markerForParticipant(markerBytes, node));
+                markers.push_back(path);
+            }
+            features::ClusterRestoreSeeder::finalizeRelease(markers, "bkp_release.tsr1");
+            features::ClusterRestoreSeeder::finalizeRelease(markers, "bkp_release.tsr1");
+            auto corruptRelease = readBytes("bkp_release.tsr1");
+            corruptRelease.back() ^= 0x01;
+            writeBytes("bkp_bad_release.tsr1", corruptRelease);
+            EXPECT_THROW(features::ClusterRestoreSeeder::activate("bkp_seed", "bkp_bad_release.tsr1"),
+                         std::runtime_error);
+            features::ClusterRestoreSeeder::activate("bkp_seed", "bkp_release.tsr1");
+            EXPECT_EQ(features::ClusterRestoreSeeder::inspectTarget("bkp_seed"),
+                      features::ClusterRestoreTargetState::Activated);
+            features::ClusterRestoreSeeder::activate("bkp_seed", "bkp_release.tsr1");
 
             JournalSegmentHeader header;
             header.clusterUuid = request.clusterUuidBytes;
@@ -345,6 +402,10 @@ TEST(BackupRestoreIntegration, ExportRestoreInstallAndFailClosed) {
         fs::remove_all("bkp_stage");
         fs::remove_all("bkp_stage_fresh");
         fs::remove_all("bkp_seed");
+        fs::remove("bkp_release.tsr1");
+        fs::remove("bkp_bad_release.tsr1");
+        for (uint64_t node = 2; node <= 4; ++node)
+            fs::remove("bkp_marker_node_" + std::to_string(node));
         fs::remove("bkp_source.tsp1");
     })
         .join()

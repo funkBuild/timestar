@@ -317,10 +317,12 @@ evidence below.
   fresh node's selected data groups at term 1 under new voters, reconstructs a
   scrubbed one-seed Group-0 snapshot under a new cluster UUID, persists the new
   serving-map cache before completion, and resumes crashes from a checksummed
-  marker while Engine and networking remain closed. This does not close the
-  blocker: the server still needs durable cross-node export orchestration and a
-  restore ceremony which proves every configured data voter imported the same
-  archive before any cluster transport opens, followed by the live RF=3 gate.
+  marker while Engine and networking remain closed. Preparation now exits, and
+  ordinary startup remains fenced until the offline finalizer has validated a
+  consistent marker from every data voter plus the Group-0 seed and activation
+  has persisted that exact release locally. This does not close the blocker:
+  the server still needs durable cross-node export orchestration and the live
+  RF=3 restore/restart/corruption gate.
 
 ### P2 — release and operations
 
