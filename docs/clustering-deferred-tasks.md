@@ -53,9 +53,11 @@ Production blockers take priority and are authoritative in
   chunks. The durable exact-v1 coordinator now binds one operation to a stable
   serving map and portable Group-0 capture, retries leaders sequentially,
   resumes immutable staged units, publishes the manifest after a final quorum
-  fence, and exposes authenticated start/status/cancel commands. The RF=3
-  export/restore/restart/corruption gate, artifact security, capacity policy,
-  and production runbook remain.
+  fence, and exposes authenticated start/status/cancel commands. The bounded
+  RF=3 export/restore/restart/corruption gate now passes, including leader-loss
+  resume, malformed artifacts, killed import/activation, all-voter release,
+  fresh identities, old-authority rejection, exact readback, and restart.
+  Artifact security, capacity policy, and the production runbook remain.
 
 ## Feature completion
 

@@ -329,10 +329,13 @@ evidence below.
   marker while Engine and networking remain closed. Preparation now exits, and
   ordinary startup remains fenced until the offline finalizer has validated a
   consistent marker from every data voter plus the Group-0 seed and activation
-  has persisted that exact release locally. This does not close the blocker:
-  the live RF=3 export/restore/restart/corruption gate, artifact
-  authentication/encryption, and capacity/retention/disaster-recovery
-  procedures remain.
+  has persisted that exact release locally. The bounded RF=3 production-server
+  gate now covers coordinator loss/resume, concurrent writes, all 4,096 units,
+  corrupt/missing/extra rejection, interrupted import and activation, the
+  all-voter release fence, fresh identities, old-authority rejection, exact
+  three-node readback, and full-cluster restart. This does not close the
+  blocker: artifact authentication/encryption and
+  capacity/retention/disaster-recovery procedures remain.
 
 ### P2 — release and operations
 
@@ -412,7 +415,12 @@ targets with compiler temporaries under `build/tmp`. Focused one-reactor,
 1-GiB tests cover portable-control/checkpoint exact-v1 round trips and corruption
 rejection, durable checkpoint conflicts and retained progress, and explicit
 refusal of every backup lifecycle route when authentication is disabled. The
-remaining evidence is the multi-process RF=3 workflow gate listed above.
+bounded production gate runs at most three one-reactor, 1-GiB processes,
+observed aggregate RSS below 400 MiB, retained every artifact under `build/tmp`,
+and left `/tmp` at 105 MiB. It passed live leader-loss resume, 4,096-unit
+publication, malformed-artifact rejection, killed-import resume, all-voter
+release, killed activation, old-authority rejection, exact three-node readback,
+and a full restored-cluster restart.
 
 The delete-receipt suites cover capacity- and time-based retirement, stable
 expired/conflict outcomes, snapshot state, recovery, and the write barrier

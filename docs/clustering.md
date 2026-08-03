@@ -1356,9 +1356,9 @@ Named deliverables, several epic-sized — not a checkbox list:
   one-seed Group-0 snapshot under a new cluster UUID, with durable node-local
   crash resume before Engine/network startup. Preparation exits offline; one
   exact-v1 release requires matching complete markers from every data voter and
-  the control seed before those roots can activate. The RF=3
-  export/restore/restart/corruption gate, artifact security/capacity policy, and
-  disaster-recovery runbook remain release blockers.
+  the control seed before those roots can activate. The bounded RF=3
+  export/restore/restart/corruption gate passes. Artifact security/capacity
+  policy and the disaster-recovery runbook remain release blockers.
 - A post-production upgrade/migration design before introducing any v2 format.
 - Remaining operator APIs and CLI beyond the Phase 4 minimum surface.
 - Routing summaries (conservative measurement-to-VShard pruning) and

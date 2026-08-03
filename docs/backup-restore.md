@@ -14,9 +14,9 @@ also does not create one coordinated recovery point.
 
 The internal exact-v1 cluster artifact, coordinated export, and node-local
 restore layers are implemented, but they are not yet an approved production
-workflow. Until the all-voter RF=3 recovery gate, authenticated artifact
-handling, capacity policy, and disaster-recovery runbook are complete,
-clustered deployment remains blocked for production. Do not clone
+workflow. The bounded all-voter RF=3 recovery gate passes, but authenticated
+artifact handling, capacity policy, and the disaster-recovery runbook remain
+incomplete, so clustered deployment remains blocked for production. Do not clone
 `node.json`, `control_map.cache`, or `cluster_raft/` into a new node or cluster;
 that can duplicate identity or resurrect obsolete membership.
 
@@ -81,13 +81,15 @@ checked before `manifest.tsbk1` is published last.
 
 Each `TSP1` is a quorum-confirmed prefix of its own VShard. The export does not
 claim one cluster-wide write timestamp: v1 has no cross-VShard transactions, so
-VShards captured later can include later concurrent writes. The RF=3 gate must
-still prove that every acknowledged pre-export write is present after restore.
+VShards captured later can include later concurrent writes. The RF=3 gate proves
+that every acknowledged pre-export write is present after restore and bounds
+the captured concurrent-write set by the source result.
 
 ## Pre-release cluster export API
 
-These routes exist for the remaining RF=3 qualification work; their presence
-does not remove the production block above. They are unavailable when server
+These routes remain pre-release while artifact security and operations are
+unfinished; the passing RF=3 gate does not remove the production block above.
+They are unavailable when server
 bearer authentication is disabled and must be called on the current Group-0
 leader.
 
@@ -101,6 +103,13 @@ Content-Type: application/json
 
 {"archive_directory":"/srv/timestar-backups/2026-08-03"}
 ```
+
+The archive and its sibling `<archive>.export.v1` checkpoint must be on the
+same durable filesystem. To resume after the Group-0 leader moves to another
+host, that filesystem must be mounted at the same path on every eligible
+coordinator; otherwise resume is limited to a process restart on the original
+host. Do not place either path on ephemeral node-local storage when node-loss
+resume is required.
 
 Observe the in-process task with `GET /cluster/backup/export`. The response
 reports `running`, `cancelled`, `failed`, or `complete`, the operation and
@@ -177,8 +186,8 @@ prepared voter can start until the offline finalizer has observed every voter's
 complete marker. The markers and release are checksummed integrity records, not
 cryptographic signatures; the operator and distribution channel remain trusted.
 Cluster backup/restore is still unsupported for production until coordinated
-live export, the full RF=3 recovery gate, authenticated artifact handling, and
-the runbook are complete.
+artifact authentication/encryption, capacity and retention policy, off-site
+replication, and the recovery runbook are complete.
 
 ## Data Directory Structure
 
@@ -295,10 +304,17 @@ procedure is:
 - [x] Fence prepared nodes behind one exact-v1 offline release. Finalization
   requires a complete, consistent marker set for every configured data voter
   plus the Group-0 seed; activation persists a matching receipt before startup.
-- [ ] Run the RF=3 live gate: writes during export, full restore, exact readback,
-  corrupt/missing/extra artifact rejection, interrupted export/import resume,
-  restart during import/activation, all-voter release rejection, and proof that
-  old identities cannot join or actuate.
+- [x] Run the bounded RF=3 production-server gate. It acknowledged writes while
+  export reported `running`, killed the coordinator after 16 durable units,
+  resumed on a different Group-0 leader, and published/validated all 4,096
+  units. Missing, corrupt, and extra artifacts were refused offline. Import was
+  killed after durable partial progress and resumed; two of three markers could
+  not finalize a release; activation was killed after its durable receipt; old
+  join authority was rejected; all nodes used fresh persistent identities; and
+  all three restored nodes read exactly 24/24 pre-export points and the bounded
+  concurrent set before and after a full-cluster restart. At most three
+  one-reactor, 1-GiB processes ran, observed aggregate RSS stayed below 400 MiB,
+  every artifact stayed under `build/tmp`, and `/tmp` stayed at 105 MiB.
 - [ ] Publish artifact retention, capacity/headroom, authenticated integrity or
   encryption, key management, off-site replication, restore, and disaster-
   recovery procedures.
