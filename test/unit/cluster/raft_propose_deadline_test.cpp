@@ -301,8 +301,10 @@ seastar::future<> testCheckQuorumFailsWritesWithoutADeadline() {
 // the charge so normal admission resumes.
 seastar::future<> testUncommittedTailIsBoundedAndRecovers() {
     const std::string retained = cmd("retained", 4.0);
+    const std::string admittedAgain = cmd("admitted-again", 6.0);
     const size_t oneEntry = estimatedLogEntryBytes(retained.size());
-    UncommittedProposalBudget budget(/*shard limit=*/oneEntry * 2, /*per-group limit=*/oneEntry);
+    const size_t largestEntry = std::max(oneEntry, estimatedLogEntryBytes(admittedAgain.size()));
+    UncommittedProposalBudget budget(/*shard limit=*/largestEntry * 2, /*per-group limit=*/largestEntry);
     Router router;
     std::vector<RouterTransport> transports;
     Nodes nodes;
@@ -356,7 +358,7 @@ seastar::future<> testUncommittedTailIsBoundedAndRecovers() {
         co_await tickAndPump(nodes, router, 1);
     EXPECT_EQ(budget.current(), 0u) << "commit after healing must return the tail charge";
 
-    auto recovered = nodes[1]->group->proposeAndAwaitApplied(cmd("admitted-again", 6.0),
+    auto recovered = nodes[1]->group->proposeAndAwaitApplied(admittedAgain,
                                                              seastar::lowres_clock::now() + std::chrono::seconds(2));
     for (int i = 0; i < 400 && !recovered.available(); ++i)
         co_await tickAndPump(nodes, router, 1);

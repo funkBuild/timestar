@@ -4,6 +4,9 @@
 
 #include <gtest/gtest.h>
 
+#include <random>
+#include <set>
+
 using namespace timestar::raft;
 
 namespace {
@@ -42,6 +45,34 @@ const T* payloadIf(const Message& m) {
 }
 
 }  // namespace
+
+TEST(RaftNodeTest, GroupElectionSeedsSpreadManyGroupCampaigns) {
+    constexpr unsigned minTicks = 125;
+    constexpr unsigned maxTicks = 250;
+    constexpr unsigned buckets = maxTicks - minTicks + 1;
+    std::set<uint64_t> node1Seeds;
+    std::set<unsigned> node1Timeouts;
+    size_t sameTimeoutOnBothSurvivors = 0;
+
+    for (uint16_t group = 0; group < 4096; ++group) {
+        const uint64_t seed1 = groupElectionRngSeed(1, group);
+        const uint64_t seed2 = groupElectionRngSeed(2, group);
+        EXPECT_NE(seed1, 0u);
+        EXPECT_NE(seed1, seed2);
+        node1Seeds.insert(seed1);
+        std::mt19937_64 rng1(seed1);
+        std::mt19937_64 rng2(seed2);
+        const unsigned timeout1 = minTicks + static_cast<unsigned>(rng1() % buckets);
+        const unsigned timeout2 = minTicks + static_cast<unsigned>(rng2() % buckets);
+        node1Timeouts.insert(timeout1);
+        sameTimeoutOnBothSurvivors += timeout1 == timeout2;
+    }
+
+    EXPECT_EQ(node1Seeds.size(), 4096u) << "every production VShard needs its own election stream";
+    EXPECT_EQ(node1Timeouts.size(), buckets) << "campaigns must cover the complete randomized timeout window";
+    EXPECT_LT(sameTimeoutOnBothSurvivors, 100u)
+        << "peer survivors still collide often enough to recreate a split-vote tail";
+}
 
 TEST(RaftConfigTest, EncodeDecodeRoundTrip) {
     Config c;

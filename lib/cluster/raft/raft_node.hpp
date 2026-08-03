@@ -23,7 +23,11 @@ struct RaftOptions {
     unsigned heartbeatTimeout = 1;  // leader heartbeat interval in ticks (replication brick)
     bool preVote = false;           // §PreVote (added in the pre-vote brick)
     bool checkQuorum = false;       // §CheckQuorum leader lease (added later)
-    uint64_t rngSeed = 0;           // 0 => derive deterministically from node id
+    // A direct single-group caller may leave this zero and gets a deterministic
+    // node-id seed. A multi-group host MUST stamp a group-specific seed: using
+    // the same stream for every group synchronizes thousands of elections and
+    // turns one node failure into a transport/journal burst.
+    uint64_t rngSeed = 0;
 
     // HOW LONG A STUCK LEADER TRANSFER IS TOLERATED before it is abandoned (§3.10,
     // debt D-20), in ticks. 0 => derive as 2 * heartbeatTimeout, clamped to at least
@@ -147,6 +151,22 @@ struct RaftOptions {
     // it truly is and the next heartbeat starts a fresh transfer.
     unsigned maxSnapshotResends = 6;
 };
+
+// Deterministic per-(node, group) election stream. SplitMix64's finalizer gives
+// neighboring VShard ids unrelated draws while remaining stable across restart.
+// Stability is useful for repeatable recovery; diversity, not unpredictability,
+// is what prevents every group on a node campaigning in the same tick.
+inline uint64_t groupElectionRngSeed(NodeId nodeId, uint16_t groupId) {
+    uint64_t z = nodeId + 0x9E3779B97F4A7C15ull;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    z ^= z >> 31;
+    z ^= static_cast<uint64_t>(groupId) + 0x9E3779B97F4A7C15ull + (z << 6) + (z >> 2);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    z ^= z >> 31;
+    return z == 0 ? 1 : z;
+}
 
 // One replica of one Raft group (one VShard). Deterministic and reactor-free:
 // inputs are tick()/step()/propose(); outputs are drained via ready()/advance().

@@ -279,6 +279,14 @@ seastar::future<> ReplicatedVShardHost::addVShard(uint16_t vshard, std::vector<N
     // (CR-FIX-080). Recovery is accounted when RaftGroup is constructed below,
     // before the group can accept a proposal or tick.
     opts.uncommittedProposalBudget = &uncommittedProposalBudget_;
+    // Every VShard on a node used to inherit RaftNode's node-id-only default
+    // RNG stream. Consequently all ~1,000 groups on one reactor drew the same
+    // timeout sequence and campaigned together after a node failure. The
+    // resulting transport/journal burst made the slowest group take 15-20 s to
+    // recover despite a 2.5-5 s election window. Preserve explicit test seeds,
+    // but production/default groups get a stable per-(node, VShard) stream.
+    if (opts.rngSeed == 0)
+        opts.rngSeed = raft::groupElectionRngSeed(self_, vshard);
     VShardState vs;
     vs.seenInServingMap = !static_cast<bool>(recoveredConfigValidator);
     JournalSegmentHeader hdr;
