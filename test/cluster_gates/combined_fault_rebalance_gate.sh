@@ -19,7 +19,7 @@
 #   GATE_REBALANCE_STORM=1   a rebalance loop runs through every reset storm
 #   GATE_CONNECTIONS=16      4x the reset gate's connection count
 #   GATE_STORM_ROUNDS=2      two storms, not three -- see the disk note below
-#   GATE_BENCH_BATCHES=1200  keeps each fast arm above the per-storm reset floor
+#   GATE_BENCH_BATCHES=1500  keeps each fast arm alive through all 50 reset rounds
 #   GATE_RESET_ROUNDS=50     exact per-arm reset exposure on every host
 #
 # THE BUDGET IS ITS OWN, AND IT IS NOT THE RESET GATE'S. Two faults produce more client
@@ -41,6 +41,11 @@
 # fast arms passed at 50--67 rounds, while slow arms hit 70 and crossed the error ceiling.
 # The profile now fixes every arm at 50 rounds (15 seconds of repeated RSTs). Its 150-call
 # run-total floor proves the 0.2-second three-node rebalance loop ran throughout both arms.
+# The combined workload is 1,500 requests: an exact-candidate draw at the old 1,200 finished
+# its second arm at 49/50 rounds and was correctly VOID, so that size did not reliably span
+# the fixed exposure on the production resource profile. The resized draw executed 50/50
+# rounds, destroyed 401 connections, admitted 41 typed 503s, retained 32% in its worst arm,
+# issued 231 rebalance calls, and preserved exact probe read-back on all three replicas.
 #
 # The error ceiling remains ~2x the historical worst draw (36). Note the reset gate's own
 # budget is 60 across THREE storms at 4 connections: the extra headroom here is for the
@@ -64,7 +69,7 @@
 # the filter permissive would show up as a transfer count that suddenly is not zero.
 #
 # DISK. Each storm is a full bench and nothing is deleted between them (see the reset
-# gate's BENCH_BATCHES note). The durable profile is about 0.7 GiB at RF=3 for
+# gate's BENCH_BATCHES note). The durable profile is about 0.9 GiB at RF=3 for
 # two storms plus the baseline; the historical ~20-GiB figure used the retired 10,000-
 # timestamp request. Do not raise GATE_STORM_ROUNDS or either bench dimension without
 # doing that arithmetic and raising the scratch preflight when needed.
@@ -77,7 +82,7 @@ cd "$(dirname "$0")" || exit 2
 export GATE_REBALANCE_STORM=1
 export GATE_CONNECTIONS="${GATE_CONNECTIONS:-16}"
 export GATE_STORM_ROUNDS="${GATE_STORM_ROUNDS:-2}"
-export GATE_BENCH_BATCHES="${GATE_BENCH_BATCHES:-1200}"
+export GATE_BENCH_BATCHES="${GATE_BENCH_BATCHES:-1500}"
 export GATE_RESET_ROUNDS="${GATE_RESET_ROUNDS:-50}"
 export GATE_MAX_STORM_ERRORS="${GATE_MAX_STORM_ERRORS:-80}"
 export GATE_MIN_COMBINED_CALLS="${GATE_MIN_COMBINED_CALLS:-150}"

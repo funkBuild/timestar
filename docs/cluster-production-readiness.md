@@ -215,6 +215,8 @@ inventory and rules.
   50--67 rounds, while slow arms reached 70 and crossed the error ceiling. Every
   arm now requires exactly 50 rounds (15 seconds of repeated RSTs); an early end
   is VOID, so machine speed can neither strengthen nor weaken the fault silently.
+  The combined profile now runs 1,500 timed requests per arm: its old 1,200-request
+  size produced a correctly VOID 49/50-round exact-candidate arm on a fast draw.
   Its old durable-disk control was invalid: 920/1,000 fault-free requests were
   shed as overloaded. A later 1,500-by-500 profile passed one storm but turned
   successive storms into a storage-overload feedback loop, with errors
@@ -272,10 +274,10 @@ inventory and rules.
   cooldown. Exact 50-round exposure removes the machine-speed feedback that had
   motivated the longer suppression. With the 500-ms bound restored, the node-kill
   diagnostic recovered every leader in 15.22 s with 57/400 typed errors and a
-  28-ms survivor-query p99. The corrected combined diagnostic admitted 34 typed
-  `503`s, retained 44% in its worst arm, executed 186 rebalance calls, drained
-  admission, and read all 200 probes from every replica with zero connection
-  failure, `500`, or crash.
+  28-ms survivor-query p99. The resized 1,500-request combined diagnostic
+  admitted 41 typed `503`s, retained 32% in its worst arm, executed 231
+  rebalance calls, drained admission, and read all 200 probes from every replica
+  with zero connection failure, `500`, or crash.
 - [x] Fence the skewed-movement control/storm arm boundary on public readiness.
   The SLO collector found a clean 500/500 control whose final acknowledged
   writes were still applying when the storm client's strict, one-shot health

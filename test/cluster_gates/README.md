@@ -410,7 +410,9 @@ exactly that). The cluster planes only ever dial `port+1000` / `port+2000`.
    hidden tolerance. The former 35--70 range made a slower benchmark receive up to twice
    the disturbance of a faster one: exact same-binary combined draws passed at 50--67 and
    failed at 70. Exact per-arm intensity prevents machine speed from changing the tested
-   property, and prevents one strong arm from hiding an anaemic one in the run total.
+   property, and prevents one strong arm from hiding an anaemic one in the run total. The
+   combined profile uses 1,500 timed requests per arm; its former 1,200-request workload
+   produced a correctly VOID 49/50-round fast arm on the exact candidate.
 2. Node 3 must LEAD at least 800 VShards before every storm. The first node to start wins every election, and
    a converged-but-skewed cluster left node 3 leading 128 of 4096 — 3% of traffic crossing
    the fault. The old 400-pass targeted wake could also keep those groups active long
@@ -434,9 +436,10 @@ feedback cliff: 249 typed `503`s and 22% retained throughput failed its 80-error
 bounds. A targeted wake now lasts one registry pass. Repeated requests are coalesced for
 500 ms, not for the whole election: a provisional six-second cooldown made a loaded
 registry advance too slowly and failed the node-kill SLO at 51.11 s recovery (30 s ceiling).
-With exact 50-round arms the corrected live profile admitted 34 typed `503`s, retained 44%
-in its worst arm, issued 186 rebalance calls, drained public readiness before read-back, and
-preserved all 200 probes on all three replicas with no connection failure, `500`, or crash.
+With exact 50-round, 1,500-request arms the corrected live profile admitted 41 typed
+`503`s, retained 32% in its worst arm, issued 231 rebalance calls, drained public readiness
+before read-back, and preserved all 200 probes on all three replicas with no connection
+failure, `500`, or crash.
 
 `fault_injection_ab.sh` is now a deterministic counterfactual, not a second noisy capacity
 run. The former sequential A/B was invalidated by a measured reversed draw: the flat-pacing
