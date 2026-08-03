@@ -52,7 +52,8 @@ Production blockers take priority and are authoritative in
 
 ## Operational hardening
 
-- [ ] Replace or quarantine static/demo deployment examples.
+- [x] Quarantine the static full-replication Compose example behind an explicit
+  unsafe profile, acknowledgement variable, and unsupported-deployment labels.
 - [ ] Exercise disk-full, directory-sync failure, corrupt artifact, network
   partition, and restart at every remaining durable boundary.
 - [ ] Record supported memory, file-descriptor, snapshot, proposal, journal,

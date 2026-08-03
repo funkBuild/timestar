@@ -1,14 +1,18 @@
-# DEVELOPMENT/DEMO ONLY — NOT A PRODUCTION CLUSTER.
+# UNSAFE STATIC DEMO ONLY — NOT A PRODUCTION CLUSTER.
 #
-# A 3-node TimeStar cluster (Milestone 1: best-effort full replication).
-# It has no consensus and peer replication failures do not fail an accepted
-# mutation. Do not use this file as an RF=3 durability or failover example; the
-# production cluster release remains blocked by docs/cluster-production-readiness.md.
+# This obsolete best-effort full-replication mode has no consensus, and peer
+# replication failures do not fail an accepted mutation. It is retained only as
+# a client-routing demo. Do not use it as an RF=3 durability, failover, bootstrap,
+# topology, or security example. Production deployment requires the partitioned
+# Group-0 path, mTLS, authenticated operator routes, and the still-open evidence
+# in docs/cluster-production-readiness.md.
 #
-# Every node accepts writes and replicates them to its peers, so any node serves
-# any read. Bring it up with:
+# Compose excludes every service unless the unsafe profile is named, and config
+# expansion also requires an explicit acknowledgement. Bring it up only with:
 #
-#   docker compose -f docker-compose.cluster.yml up --build
+#   TIMESTAR_ACK_UNSAFE_STATIC_CLUSTER=yes \
+#     docker compose -f docker-compose.cluster.yml \
+#       --profile unsafe-static-demo up --build
 #
 # Then write to any node and read from any other:
 #   curl -XPOST localhost:8086/write -d '{"measurement":"t","fields":{"v":1},"timestamp":1700000000000000000}'
@@ -17,7 +21,12 @@
 x-node: &node
   build: .
   image: funkbuild/timestar:latest
+  profiles: ["unsafe-static-demo"]
   restart: unless-stopped
+  labels:
+    com.timestar.deployment-class: "unsafe-static-demo"
+    com.timestar.production-supported: "false"
+    com.timestar.unsafe-static-cluster-ack: "${TIMESTAR_ACK_UNSAFE_STATIC_CLUSTER:?Set TIMESTAR_ACK_UNSAFE_STATIC_CLUSTER=yes after reading docker-compose.cluster.yml}"
   environment: &node-env
     TIMESTAR_CLUSTER_ENABLED: "true"
     # All nodes, in node-id order (index 0 == node 1). Docker DNS resolves the

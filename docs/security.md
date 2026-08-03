@@ -13,8 +13,8 @@ default. Configure `cluster.tls_cert_file`, `tls_key_file`, `tls_ca_file`, and
 `tls_peer_name`; listeners require a client certificate and outbound connections
 verify the CA and certificate SAN. Plaintext replicated transport is available
 only through `cluster.development_allow_insecure_transport` and must not be used
-in production. M1 best-effort full replication is still a demo mode and does not
-inherit these RF&gt;1 guarantees.
+in production. The obsolete best-effort static full-replication mode remains an
+explicitly quarantined demo and does not inherit these RF&gt;1 guarantees.
 
 The server is still designed to run behind a reverse proxy for client TLS,
 rate-limiting, network policy, and stronger authentication/authorization.

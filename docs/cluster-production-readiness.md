@@ -291,8 +291,11 @@ evidence below.
 
 ### P2 — release and operations
 
-- [ ] Replace or clearly quarantine demo/static cluster deployment examples so
-  they cannot be mistaken for a topology-managed production deployment.
+- [x] Quarantine the obsolete static cluster Compose demo. Its services now live
+  behind the explicit `unsafe-static-demo` profile, configuration expansion
+  requires `TIMESTAR_ACK_UNSAFE_STATIC_CLUSTER`, container labels state that it
+  is unsupported for production, and the file names the partitioned Group-0,
+  mTLS, and authenticated-operator requirements it does not demonstrate.
 - [ ] Reconcile architecture, API, runbook, and deployment documentation after
   the remaining behavior is complete.
 - [ ] Record one final serial build, focused unit/socket tests, and each required
