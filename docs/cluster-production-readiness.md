@@ -313,7 +313,10 @@ evidence below.
   interrupted stage/manifest write and restores one real Engine payload with
   exact readback. A local leader capture now obtains a deadline-bounded quorum
   ReadIndex, waits/rolls to a TSP1 boundary at or beyond it, and pins the
-  sidecar across supersession and archival. The offline server path now seeds a
+  sidecar across supersession and archival. Exact-v1 peer RPCs now route capture
+  requests to the owning reactor and stream that pinned sidecar in bounded,
+  hash-identified 1-MiB chunks under bounded expiring sessions. The offline
+  server path now seeds a
   fresh node's selected data groups at term 1 under new voters, reconstructs a
   scrubbed one-seed Group-0 snapshot under a new cluster UUID, persists the new
   serving-map cache before completion, and resumes crashes from a checksummed
@@ -321,8 +324,8 @@ evidence below.
   ordinary startup remains fenced until the offline finalizer has validated a
   consistent marker from every data voter plus the Group-0 seed and activation
   has persisted that exact release locally. This does not close the blocker:
-  the server still needs durable cross-node export orchestration and the live
-  RF=3 restore/restart/corruption gate.
+  the server still needs a durable operation coordinator above those peer RPCs
+  and the live RF=3 restore/restart/corruption gate.
 
 ### P2 — release and operations
 

@@ -131,7 +131,8 @@ class ShardRaftPlane : public data::ProposeSink,
                        public data::FrozenDeletePlanSink,
                        public data::ControlJoinSink,
                        public data::MoveDestinationSink,
-                       public data::MoveActuationSink {
+                       public data::MoveActuationSink,
+                       public data::BackupCaptureSink {
 public:
     using DynamicPeerRegistrar = std::function<seastar::future<bool>(data::NodeId, std::string)>;
 
@@ -299,6 +300,7 @@ public:
         rpc_->setControlJoinSink(*this);
         rpc_->setMoveDestinationSink(*this);
         rpc_->setMoveActuationSink(*this);
+        rpc_->setBackupCaptureSink(*this);
         return rpc_->start(local, *queryStore_, /*perShardListener=*/true);
     }
 
@@ -538,6 +540,12 @@ public:
     // replica needs; that rejection propagates unchanged.
     seastar::future<raft::LogIndex> leaderReadIndex(uint16_t vshard) override;
     seastar::future<raft::LogIndex> leaderCommitIndex(uint16_t vshard) override;
+    seastar::future<data::BackupCaptureDescriptor> beginBackupCapture(std::string operationId, std::string clusterUuid,
+                                                                      uint16_t vshard) override;
+    seastar::future<data::BackupCaptureChunk> readBackupCapture(std::string operationId, std::string clusterUuid,
+                                                                uint16_t vshard, uint64_t offset,
+                                                                uint32_t maximumBytes) override;
+    seastar::future<> finishBackupCapture(std::string operationId, std::string clusterUuid, uint16_t vshard) override;
 
     // Leadership of `vshards` as THIS NODE sees it (debt D-13). One entry per input,
     // carrying both halves of the question a coordinator cannot answer for a VShard it
@@ -1456,6 +1464,45 @@ inline seastar::future<raft::LogIndex> ShardRaftPlane::leaderCommitIndex(uint16_
         if (!p.ready())
             return seastar::make_exception_future<raft::LogIndex>(data::ShardStoppingError(kShardStoppingError));
         return p.plane().host().leaderCommitIndex(vshard);
+    });
+}
+
+inline seastar::future<data::BackupCaptureDescriptor> ShardRaftPlane::beginBackupCapture(std::string operationId,
+                                                                                         std::string clusterUuid,
+                                                                                         uint16_t vshard) {
+    return peers_->invoke_on(shardOwningVShard(vshard, dir_.get()), [operationId = std::move(operationId),
+                                                                     clusterUuid = std::move(clusterUuid),
+                                                                     vshard](ShardRaftPlane& p) mutable {
+        if (!p.ready())
+            return seastar::make_exception_future<data::BackupCaptureDescriptor>(
+                data::ShardStoppingError(kShardStoppingError));
+        return p.plane().host().beginBackupCapture(std::move(operationId), std::move(clusterUuid), vshard);
+    });
+}
+
+inline seastar::future<data::BackupCaptureChunk> ShardRaftPlane::readBackupCapture(std::string operationId,
+                                                                                   std::string clusterUuid,
+                                                                                   uint16_t vshard, uint64_t offset,
+                                                                                   uint32_t maximumBytes) {
+    return peers_->invoke_on(shardOwningVShard(vshard, dir_.get()),
+                             [operationId = std::move(operationId), clusterUuid = std::move(clusterUuid), vshard,
+                              offset, maximumBytes](ShardRaftPlane& p) mutable {
+                                 if (!p.ready())
+                                     return seastar::make_exception_future<data::BackupCaptureChunk>(
+                                         data::ShardStoppingError(kShardStoppingError));
+                                 return p.plane().host().readBackupCapture(
+                                     std::move(operationId), std::move(clusterUuid), vshard, offset, maximumBytes);
+                             });
+}
+
+inline seastar::future<> ShardRaftPlane::finishBackupCapture(std::string operationId, std::string clusterUuid,
+                                                             uint16_t vshard) {
+    return peers_->invoke_on(shardOwningVShard(vshard, dir_.get()), [operationId = std::move(operationId),
+                                                                     clusterUuid = std::move(clusterUuid),
+                                                                     vshard](ShardRaftPlane& p) mutable {
+        if (!p.ready())
+            return seastar::make_exception_future<>(data::ShardStoppingError(kShardStoppingError));
+        return p.plane().host().finishBackupCapture(std::move(operationId), std::move(clusterUuid), vshard);
     });
 }
 

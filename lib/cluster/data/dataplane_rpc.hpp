@@ -11,6 +11,7 @@
 #include <seastar/net/socket_defs.hh>
 #include <seastar/rpc/rpc_types.hh>  // rpc_clock_type
 #include <stdexcept>
+#include <string>
 
 namespace timestar::data {
 
@@ -38,6 +39,39 @@ class MoveActuationSink {
 public:
     virtual ~MoveActuationSink() = default;
     virtual seastar::future<control::ActuateMoveResult> handleActuateMove(control::ActuateMoveRequest request) = 0;
+};
+
+enum class BackupCaptureStatus : uint8_t { Captured = 0, Redirect = 1, Unavailable = 2 };
+
+struct BackupCaptureDescriptor {
+    BackupCaptureStatus status = BackupCaptureStatus::Unavailable;
+    NodeId leaderHint = raft::kNoNode;
+    uint16_t vshard = 0;
+    raft::LogIndex readIndex = raft::kNoIndex;
+    raft::LogIndex snapshotIndex = raft::kNoIndex;
+    raft::Term snapshotTerm = raft::kNoTerm;
+    uint64_t encodedSize = 0;
+    uint64_t encodedHash = 0;
+};
+
+struct BackupCaptureChunk {
+    uint16_t vshard = 0;
+    uint64_t offset = 0;
+    uint64_t totalSize = 0;
+    uint64_t totalHash = 0;
+    std::string bytes;
+};
+
+class BackupCaptureSink {
+public:
+    virtual ~BackupCaptureSink() = default;
+    virtual seastar::future<BackupCaptureDescriptor> beginBackupCapture(std::string operationId,
+                                                                        std::string clusterUuid, uint16_t vshard) = 0;
+    virtual seastar::future<BackupCaptureChunk> readBackupCapture(std::string operationId, std::string clusterUuid,
+                                                                  uint16_t vshard, uint64_t offset,
+                                                                  uint32_t maximumBytes) = 0;
+    virtual seastar::future<> finishBackupCapture(std::string operationId, std::string clusterUuid,
+                                                  uint16_t vshard) = 0;
 };
 
 // OptDeadline (node_store.hpp): a wall-clock point past which an awaited data-plane RPC
@@ -110,6 +144,14 @@ public:
         NodeId to, control::EnsureMoveDestinationRequest request, OptDeadline deadline = std::nullopt);
     seastar::future<control::ActuateMoveResult> actuateMove(NodeId to, control::ActuateMoveRequest request,
                                                             OptDeadline deadline = std::nullopt);
+    seastar::future<BackupCaptureDescriptor> beginBackupCapture(NodeId to, std::string operationId,
+                                                                std::string clusterUuid, uint16_t vshard,
+                                                                OptDeadline deadline = std::nullopt);
+    seastar::future<BackupCaptureChunk> readBackupCapture(NodeId to, std::string operationId, std::string clusterUuid,
+                                                          uint16_t vshard, uint64_t offset, uint32_t maximumBytes,
+                                                          OptDeadline deadline = std::nullopt);
+    seastar::future<> finishBackupCapture(NodeId to, std::string operationId, std::string clusterUuid, uint16_t vshard,
+                                          OptDeadline deadline = std::nullopt);
     // The production remote propose (write-scaleout 3a/3b): borrows the caller's groups
     // (no merge allocation, and the caller keeps them so it can retry the failed ones)
     // and returns per-VShard rejects carrying the peer's view of the real leader.
@@ -130,6 +172,7 @@ public:
     void setControlJoinSink(ControlJoinSink& sink);
     void setMoveDestinationSink(MoveDestinationSink& sink);
     void setMoveActuationSink(MoveActuationSink& sink);
+    void setBackupCaptureSink(BackupCaptureSink& sink);
 
     // M4 replica-read leader-reach client calls: confirm a linearizable ReadIndex /
     // fetch the commit index for `vshard` at peer `to` (which must be its leader). The

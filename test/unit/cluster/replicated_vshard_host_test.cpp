@@ -689,6 +689,49 @@ TEST_F(ReplicatedVShardHostTest, BackupCaptureFencesLeaderReadAndPinsSupersededS
         ASSERT_TRUE(staged);
         EXPECT_EQ(staged->snapshotRevision, first->snapshotIndex + 1);
 
+        // The remote-export session presents the same fenced sidecar through
+        // bounded chunks. Begin is idempotent for an operation/VShard pair,
+        // every chunk repeats the immutable size/hash, and finish releases the
+        // session so stale clients cannot keep reading by operation ID.
+        const std::string operationId(32, 'a');
+        const std::string clusterUuid(32, '1');  // JournalIdentity::testing()
+        const auto descriptor = host.beginBackupCapture(operationId, clusterUuid, vs).get();
+        EXPECT_EQ(descriptor.status, data::BackupCaptureStatus::Captured);
+        EXPECT_EQ(descriptor.leaderHint, 1u);
+        EXPECT_EQ(descriptor.vshard, vs);
+        EXPECT_GT(descriptor.encodedSize, 0u);
+        const auto duplicate = host.beginBackupCapture(operationId, clusterUuid, vs).get();
+        EXPECT_EQ(duplicate.readIndex, descriptor.readIndex);
+        EXPECT_EQ(duplicate.snapshotIndex, descriptor.snapshotIndex);
+        EXPECT_EQ(duplicate.encodedSize, descriptor.encodedSize);
+        EXPECT_EQ(duplicate.encodedHash, descriptor.encodedHash);
+
+        uint64_t hash = 1469598103934665603ull;
+        uint64_t offset = 0;
+        size_t chunks = 0;
+        while (offset < descriptor.encodedSize) {
+            const auto chunk = host.readBackupCapture(operationId, clusterUuid, vs, offset, 257).get();
+            EXPECT_EQ(chunk.vshard, vs);
+            EXPECT_EQ(chunk.offset, offset);
+            EXPECT_EQ(chunk.totalSize, descriptor.encodedSize);
+            EXPECT_EQ(chunk.totalHash, descriptor.encodedHash);
+            ASSERT_FALSE(chunk.bytes.empty());
+            for (unsigned char byte : chunk.bytes) {
+                hash ^= byte;
+                hash *= 1099511628211ull;
+            }
+            offset += chunk.bytes.size();
+            ++chunks;
+        }
+        EXPECT_GT(chunks, 1u);
+        EXPECT_EQ(hash, descriptor.encodedHash);
+        const auto eof = host.readBackupCapture(operationId, clusterUuid, vs, offset, 257).get();
+        EXPECT_TRUE(eof.bytes.empty());
+        host.finishBackupCapture(operationId, clusterUuid, vs).get();
+        EXPECT_NO_THROW(host.finishBackupCapture(operationId, clusterUuid, vs).get());
+        EXPECT_THROW(host.readBackupCapture(operationId, clusterUuid, vs, 0, 257).get(), std::runtime_error);
+        EXPECT_THROW(host.beginBackupCapture(operationId, std::string(32, '2'), vs).get(), std::invalid_argument);
+
         first.reset();
         second.reset();
         host.stop().get();

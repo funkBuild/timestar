@@ -55,13 +55,18 @@ corruption/extra/missing entries, restores that real unit into a fresh Engine,
 and reads the exact value back. That artifact-only gate does not simulate live
 leader capture, new Raft membership, or an RF=3 disaster recovery.
 
-The VShard host now also has the local live-capture primitive required by the
-eventual coordinator. It obtains a deadline-bounded quorum ReadIndex while the
-host is leader, waits for a TSP1 boundary at or beyond that index, conditionally
-rolls the active store once, and pins the durable sidecar name while it is being
-archived. A newer Raft snapshot cannot unlink the pinned source mid-copy. This
-is not yet a cluster export: no authenticated command dispatches work to every
-current leader or durably tracks the 4,096-unit operation across nodes.
+The VShard host now also has the live-capture and peer-transfer primitives
+required by the eventual coordinator. A hosting leader obtains a
+deadline-bounded quorum ReadIndex, waits for a TSP1 boundary at or beyond that
+index, conditionally rolls the active store once, and pins the durable sidecar
+name. Exact-v1 peer RPCs can then begin an idempotent operation/VShard session,
+read the immutable file in at most 1-MiB binary chunks, and finish it
+idempotently. The reply repeats the total size and whole-file hash, a maximum of
+eight sessions are retained per reactor, inactive sessions expire after five
+minutes, and shutdown drains reads before releasing their pins. A newer Raft
+snapshot therefore cannot unlink a source during remote transfer. This is not
+yet a cluster export: no operator command durably assigns and resumes all 4,096
+captures or publishes one stable Group-0 view with them.
 
 The server also has an offline, node-local generation-one importer. On a fresh
 data root, `--cluster-restore <archive>` validates the complete exact-v1 archive
@@ -207,6 +212,10 @@ procedure is:
 - [x] On one hosting leader, obtain a deadline-bounded quorum ReadIndex,
   force/wait a safe snapshot boundary at or beyond it, and pin a superseded
   sidecar while it is copied and revalidated.
+- [x] Expose the pinned capture to mTLS cluster peers through exact-v1,
+  fixed-shape begin/read/finish RPCs with canonical operation/cluster identity,
+  bounded binary chunks, bounded expiring sessions, leader redirection, and
+  cross-reactor VShard routing.
 - [ ] Dispatch that capture to every current VShard leader and durably
   coordinate all 4,096 results with one portable Group-0 capture. Retry must
   survive leader changes and process/node restarts without mixing operations.

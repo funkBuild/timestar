@@ -4,6 +4,7 @@
 #include "../../storage/journal_retention.hpp"
 #include "../../storage/journal_segment.hpp"
 #include "../../storage/journal_sink.hpp"
+#include "../data/dataplane_rpc.hpp"
 #include "../data/node_store.hpp"  // ProposeSink
 #include "../data/replicated_command.hpp"
 #include "../raft/raft_group_registry.hpp"
@@ -227,6 +228,15 @@ public:
     seastar::future<std::optional<BackupSnapshotCapture>> captureVShardBackup(
         uint16_t vshard, std::chrono::milliseconds budget =
                              std::chrono::duration_cast<std::chrono::milliseconds>(kBackupSnapshotCaptureTimeout));
+    static constexpr uint32_t kMaxBackupCaptureChunkBytes = 1u << 20;
+    static constexpr size_t kMaxBackupCaptureSessions = 8;
+    static constexpr std::chrono::minutes kBackupCaptureSessionTtl{5};
+    seastar::future<data::BackupCaptureDescriptor> beginBackupCapture(std::string operationId, std::string clusterUuid,
+                                                                      uint16_t vshard);
+    seastar::future<data::BackupCaptureChunk> readBackupCapture(std::string operationId, std::string clusterUuid,
+                                                                uint16_t vshard, uint64_t offset,
+                                                                uint32_t maximumBytes);
+    seastar::future<> finishBackupCapture(std::string operationId, std::string clusterUuid, uint16_t vshard);
 
     // ProposeSink (debt D-14): un-hibernate the groups on THIS shard that still believe
     // `node` leads them, so a killed leader costs an election rather than a
@@ -587,6 +597,15 @@ private:
     // refused rather than started. Its own gate rather than snapshotGate_'s: a read must
     // not be held up by a snapshot sweep's lifetime, nor a shutdown by a read's.
     seastar::gate readFenceGate_;
+    struct BackupCaptureSession {
+        BackupSnapshotCapture capture;
+        seastar::lowres_clock::time_point expires;
+    };
+    using BackupCaptureKey = std::pair<std::string, uint16_t>;
+    std::map<BackupCaptureKey, BackupCaptureSession> backupCaptureSessions_;
+    seastar::timer<seastar::lowres_clock> backupCaptureTimer_;
+    seastar::gate backupCaptureGate_;
+    void expireBackupCaptureSessions();
     bool snapshotSweepRunning_ = false;  // one sweep at a time; the timer skips if busy
     bool snapshotTriggerEnabled_ = false;
     // STAGGER. The sweep starts scanning at a rotating offset, so the same low-numbered

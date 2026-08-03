@@ -8,6 +8,10 @@
 #include "../data/write_errors.hpp"
 #include "../raft/raft_node.hpp"
 
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <charconv>
 #include <cstdlib>
@@ -16,8 +20,10 @@
 #include <seastar/core/reactor.hh>
 #include <seastar/core/sleep.hh>
 #include <seastar/core/thread.hh>
+#include <seastar/util/defer.hh>
 #include <seastar/util/file.hh>
 #include <stdexcept>
+#include <system_error>
 #include <tuple>
 #include <utility>
 
@@ -48,6 +54,48 @@ std::array<uint8_t, 16> parseUuidBytes(std::string_view value) {
     for (size_t i = 0; i < out.size(); ++i)
         out[i] = static_cast<uint8_t>((hexNibble(value[2 * i]) << 4) | hexNibble(value[2 * i + 1]));
     return out;
+}
+
+bool canonicalBackupId(std::string_view value) {
+    if (value.size() != 32)
+        return false;
+    bool nonzero = false;
+    for (char c : value) {
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
+            return false;
+        nonzero = nonzero || c != '0';
+    }
+    return nonzero;
+}
+
+std::string readPinnedBackupChunk(raft::PinnedSnapshotFile pin, uint64_t offset, uint32_t maximumBytes) {
+    const auto path = pin->path;
+    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0)
+        throw std::system_error(errno, std::generic_category(), "open backup capture sidecar: " + path.string());
+    auto closeFd = seastar::defer([fd] { ::close(fd); });
+    struct stat st{};
+    if (::fstat(fd, &st) < 0)
+        throw std::system_error(errno, std::generic_category(), "stat backup capture sidecar: " + path.string());
+    if (!S_ISREG(st.st_mode) || st.st_size < 0 || static_cast<uint64_t>(st.st_size) != pin->size)
+        throw std::runtime_error("backup capture sidecar changed while pinned: " + path.string());
+    if (offset > pin->size)
+        throw std::out_of_range("backup capture chunk offset exceeds the sidecar size");
+    const size_t wanted = static_cast<size_t>(std::min<uint64_t>(maximumBytes, pin->size - offset));
+    std::string bytes(wanted, '\0');
+    size_t done = 0;
+    while (done < wanted) {
+        const ssize_t count = ::pread(fd, bytes.data() + done, wanted - done, static_cast<off_t>(offset + done));
+        if (count < 0) {
+            if (errno == EINTR)
+                continue;
+            throw std::system_error(errno, std::generic_category(), "read backup capture sidecar: " + path.string());
+        }
+        if (count == 0)
+            throw std::runtime_error("backup capture sidecar was truncated while pinned: " + path.string());
+        done += static_cast<size_t>(count);
+    }
+    return bytes;
 }
 
 data::OptDeadline boundedProposalDeadline(data::OptDeadline requested) {
@@ -144,7 +192,9 @@ ReplicatedVShardHost::ReplicatedVShardHost(EngineLocalStore& store, raft::RaftTr
       self_(self),
       journalRoot_(std::move(journalRoot)),
       journalIdentity_(identity),
-      registry_(transport, tick) {}
+      registry_(transport, tick) {
+    backupCaptureTimer_.set_callback([this] { expireBackupCaptureSessions(); });
+}
 
 ReplicatedVShardHost::~ReplicatedVShardHost() {
     // stop() (async: drains ticks, closes journal writers) MUST be called before
@@ -949,6 +999,142 @@ seastar::future<std::optional<ReplicatedVShardHost::BackupSnapshotCapture>> Repl
     }
 }
 
+void ReplicatedVShardHost::expireBackupCaptureSessions() {
+    backupCaptureTimer_.cancel();
+    const auto now = seastar::lowres_clock::now();
+    for (auto it = backupCaptureSessions_.begin(); it != backupCaptureSessions_.end();) {
+        if (it->second.expires <= now)
+            it = backupCaptureSessions_.erase(it);
+        else
+            ++it;
+    }
+    if (backupCaptureSessions_.empty() || stopped_)
+        return;
+    auto earliest = backupCaptureSessions_.begin()->second.expires;
+    for (const auto& [key, session] : backupCaptureSessions_)
+        earliest = std::min(earliest, session.expires);
+    backupCaptureTimer_.arm(earliest);
+}
+
+seastar::future<data::BackupCaptureDescriptor> ReplicatedVShardHost::beginBackupCapture(std::string operationId,
+                                                                                        std::string clusterUuid,
+                                                                                        uint16_t vshard) {
+    auto held = backupCaptureGate_.hold();
+    if (stopped_)
+        throw std::runtime_error("cluster backup capture stopped with its VShard host");
+    if (!VShardId{vshard}.valid() || !canonicalBackupId(operationId) || !canonicalBackupId(clusterUuid) ||
+        parseUuidBytes(clusterUuid) != journalIdentity_.clusterUuid)
+        throw std::invalid_argument("cluster backup capture identity does not match this node");
+
+    expireBackupCaptureSessions();
+    BackupCaptureKey key{operationId, vshard};
+    if (auto existing = backupCaptureSessions_.find(key); existing != backupCaptureSessions_.end()) {
+        existing->second.expires = seastar::lowres_clock::now() + kBackupCaptureSessionTtl;
+        const auto& capture = existing->second.capture;
+        data::BackupCaptureDescriptor descriptor{data::BackupCaptureStatus::Captured,
+                                                 self_,
+                                                 capture.vshard,
+                                                 capture.readIndex,
+                                                 capture.snapshotIndex,
+                                                 capture.snapshotTerm,
+                                                 capture.file->size,
+                                                 capture.file->hash};
+        expireBackupCaptureSessions();
+        co_return descriptor;
+    }
+    if (backupCaptureSessions_.size() >= kMaxBackupCaptureSessions)
+        throw std::runtime_error("cluster backup capture session capacity exhausted");
+
+    raft::RaftGroup* g = registry_.group(vshard);
+    if (!g)
+        co_return data::BackupCaptureDescriptor{data::BackupCaptureStatus::Unavailable, raft::kNoNode, vshard};
+    if (!g->isLeader())
+        co_return data::BackupCaptureDescriptor{data::BackupCaptureStatus::Redirect, g->leader(), vshard};
+
+    auto captured = co_await captureVShardBackup(vshard);
+    if (!captured)
+        co_return data::BackupCaptureDescriptor{data::BackupCaptureStatus::Unavailable, raft::kNoNode, vshard};
+    if (stopped_)
+        throw std::runtime_error("cluster backup capture stopped with its VShard host");
+
+    // A duplicate begin can wait behind the host's maintenance semaphore while the
+    // first request creates the durable snapshot. Recheck after the await so retries
+    // return the first immutable capture instead of replacing its session.
+    expireBackupCaptureSessions();
+    if (auto existing = backupCaptureSessions_.find(key); existing != backupCaptureSessions_.end()) {
+        existing->second.expires = seastar::lowres_clock::now() + kBackupCaptureSessionTtl;
+        const auto& first = existing->second.capture;
+        data::BackupCaptureDescriptor descriptor{data::BackupCaptureStatus::Captured,
+                                                 self_,
+                                                 first.vshard,
+                                                 first.readIndex,
+                                                 first.snapshotIndex,
+                                                 first.snapshotTerm,
+                                                 first.file->size,
+                                                 first.file->hash};
+        expireBackupCaptureSessions();
+        co_return descriptor;
+    }
+    if (backupCaptureSessions_.size() >= kMaxBackupCaptureSessions)
+        throw std::runtime_error("cluster backup capture session capacity exhausted");
+
+    data::BackupCaptureDescriptor descriptor{data::BackupCaptureStatus::Captured,
+                                             self_,
+                                             captured->vshard,
+                                             captured->readIndex,
+                                             captured->snapshotIndex,
+                                             captured->snapshotTerm,
+                                             captured->file->size,
+                                             captured->file->hash};
+    backupCaptureSessions_.emplace(
+        std::move(key),
+        BackupCaptureSession{std::move(*captured), seastar::lowres_clock::now() + kBackupCaptureSessionTtl});
+    expireBackupCaptureSessions();
+    co_return descriptor;
+}
+
+seastar::future<data::BackupCaptureChunk> ReplicatedVShardHost::readBackupCapture(std::string operationId,
+                                                                                  std::string clusterUuid,
+                                                                                  uint16_t vshard, uint64_t offset,
+                                                                                  uint32_t maximumBytes) {
+    auto held = backupCaptureGate_.hold();
+    if (stopped_)
+        throw std::runtime_error("cluster backup capture stopped with its VShard host");
+    if (!VShardId{vshard}.valid() || !canonicalBackupId(operationId) || !canonicalBackupId(clusterUuid) ||
+        parseUuidBytes(clusterUuid) != journalIdentity_.clusterUuid)
+        throw std::invalid_argument("cluster backup capture identity does not match this node");
+    if (maximumBytes == 0 || maximumBytes > kMaxBackupCaptureChunkBytes)
+        throw std::invalid_argument("cluster backup capture chunk bound is invalid");
+
+    expireBackupCaptureSessions();
+    auto found = backupCaptureSessions_.find(BackupCaptureKey{operationId, vshard});
+    if (found == backupCaptureSessions_.end())
+        throw std::runtime_error("cluster backup capture session is absent or expired");
+    if (offset > found->second.capture.file->size)
+        throw std::out_of_range("cluster backup capture offset exceeds the snapshot size");
+
+    const uint64_t totalSize = found->second.capture.file->size;
+    const uint64_t totalHash = found->second.capture.file->hash;
+    auto pin = found->second.capture.file.pinAgain();
+    found->second.expires = seastar::lowres_clock::now() + kBackupCaptureSessionTtl;
+    expireBackupCaptureSessions();
+    auto bytes = co_await seastar::async([pin = std::move(pin), offset, maximumBytes]() mutable {
+        return readPinnedBackupChunk(std::move(pin), offset, maximumBytes);
+    });
+    co_return data::BackupCaptureChunk{vshard, offset, totalSize, totalHash, std::move(bytes)};
+}
+
+seastar::future<> ReplicatedVShardHost::finishBackupCapture(std::string operationId, std::string clusterUuid,
+                                                            uint16_t vshard) {
+    auto held = backupCaptureGate_.hold();
+    if (!VShardId{vshard}.valid() || !canonicalBackupId(operationId) || !canonicalBackupId(clusterUuid) ||
+        parseUuidBytes(clusterUuid) != journalIdentity_.clusterUuid)
+        throw std::invalid_argument("cluster backup capture identity does not match this node");
+    backupCaptureSessions_.erase(BackupCaptureKey{std::move(operationId), vshard});
+    expireBackupCaptureSessions();
+    co_return;
+}
+
 // ---------------------------------------------------------------------------
 // Journal segment reclamation (debt D-34)
 // ---------------------------------------------------------------------------
@@ -1507,6 +1693,10 @@ seastar::future<> ReplicatedVShardHost::stop() {
     // still standing. (e) honours stop() -- an unclosed gate here is a compaction landing
     // on a torn-down group.
     snapshotTimer_.cancel();
+    backupCaptureTimer_.cancel();
+    if (!backupCaptureGate_.is_closed())
+        co_await backupCaptureGate_.close();
+    backupCaptureSessions_.clear();
     // The read fence FIRST: a waiting fence resumes into `registry_`/`vshards_`, so it has
     // to be drained while both still stand (debt D-36). It waits at most its own budget.
     if (!readFenceGate_.is_closed())

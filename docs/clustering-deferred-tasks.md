@@ -47,8 +47,10 @@ Production blockers take priority and are authoritative in
   partial-startup fence, and resumable node-local import state are complete.
   The exact-v1 offline release now requires complete matching markers from
   every configured data voter plus the Group-0 seed before any prepared root
-  can open Engine/networking. Cross-node resumable export coordination and the
-  RF=3 operator gate remain.
+  can open Engine/networking. Exact-v1 peer capture sessions now route to the
+  owning reactor and transfer pinned snapshots in bounded hash-identified
+  chunks. The durable all-VShard operation coordinator above those sessions and
+  the RF=3 operator gate remain.
 
 ## Feature completion
 

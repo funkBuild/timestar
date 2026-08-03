@@ -1,5 +1,6 @@
 #include "dataplane_rpc.hpp"
 
+#include "../../core/vshard.hpp"
 #include "../../utils/logger.hpp"
 #include "../raft/raft_group.hpp"  // kMaxProposalBytes -- the bound a slice must fit (D-31)
 #include "../reconnect_policy.hpp"
@@ -70,6 +71,13 @@ constexpr uint64_t kFrozenDeletePlan = 13;
 constexpr uint64_t kControlJoin = 14;
 constexpr uint64_t kEnsureMoveDestination = 15;
 constexpr uint64_t kActuateMove = 16;
+constexpr uint64_t kBeginBackupCapture = 17;
+constexpr uint64_t kReadBackupCapture = 18;
+constexpr uint64_t kFinishBackupCapture = 19;
+
+constexpr size_t kBackupIdBytes = 32;
+constexpr size_t kBackupCaptureKeyBytes = kBackupIdBytes * 2 + sizeof(uint16_t);
+constexpr uint32_t kMaxBackupCaptureChunkBytes = 1u << 20;
 
 // How long before re-attempting a peer connection that died. seastar's rpc::client
 // never reconnects itself, so we replace it -- but bounded, so a burst of concurrent
@@ -135,6 +143,149 @@ std::optional<uint64_t> decU64(const seastar::sstring& s) {
     for (int i = 0; i < 8; ++i)
         v |= static_cast<uint64_t>(static_cast<uint8_t>(s[i])) << (8 * i);
     return v;
+}
+
+void appendU16(std::string& out, uint16_t value) {
+    out.push_back(static_cast<char>(value & 0xff));
+    out.push_back(static_cast<char>((value >> 8) & 0xff));
+}
+
+void appendU32(std::string& out, uint32_t value) {
+    for (int i = 0; i < 4; ++i)
+        out.push_back(static_cast<char>((value >> (8 * i)) & 0xff));
+}
+
+void appendU64(std::string& out, uint64_t value) {
+    for (int i = 0; i < 8; ++i)
+        out.push_back(static_cast<char>((value >> (8 * i)) & 0xff));
+}
+
+uint16_t readU16At(const seastar::sstring& value, size_t offset) {
+    return static_cast<uint16_t>(static_cast<uint8_t>(value[offset]) |
+                                 (static_cast<uint16_t>(static_cast<uint8_t>(value[offset + 1])) << 8));
+}
+
+uint32_t readU32At(const seastar::sstring& value, size_t offset) {
+    uint32_t result = 0;
+    for (int i = 0; i < 4; ++i)
+        result |= static_cast<uint32_t>(static_cast<uint8_t>(value[offset + i])) << (8 * i);
+    return result;
+}
+
+uint64_t readU64At(const seastar::sstring& value, size_t offset) {
+    uint64_t result = 0;
+    for (int i = 0; i < 8; ++i)
+        result |= static_cast<uint64_t>(static_cast<uint8_t>(value[offset + i])) << (8 * i);
+    return result;
+}
+
+bool canonicalBackupId(std::string_view value) {
+    if (value.size() != kBackupIdBytes)
+        return false;
+    bool nonzero = false;
+    for (char c : value) {
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')))
+            return false;
+        nonzero = nonzero || c != '0';
+    }
+    return nonzero;
+}
+
+struct BackupCaptureKey {
+    std::string operationId;
+    std::string clusterUuid;
+    uint16_t vshard = 0;
+};
+
+std::optional<BackupCaptureKey> decodeBackupCaptureKey(const seastar::sstring& frame, size_t expectedSize) {
+    if (frame.size() != expectedSize)
+        return std::nullopt;
+    BackupCaptureKey key{std::string(frame.data(), kBackupIdBytes),
+                         std::string(frame.data() + kBackupIdBytes, kBackupIdBytes),
+                         readU16At(frame, kBackupIdBytes * 2)};
+    if (!canonicalBackupId(key.operationId) || !canonicalBackupId(key.clusterUuid) || !VShardId{key.vshard}.valid())
+        return std::nullopt;
+    return key;
+}
+
+seastar::sstring encodeBackupCaptureKey(std::string_view operationId, std::string_view clusterUuid, uint16_t vshard) {
+    if (!canonicalBackupId(operationId) || !canonicalBackupId(clusterUuid) || !VShardId{vshard}.valid())
+        throw std::invalid_argument("dataplane: backup operation and cluster IDs must be canonical nonzero UUIDs");
+    std::string frame;
+    frame.reserve(kBackupCaptureKeyBytes);
+    frame.append(operationId);
+    frame.append(clusterUuid);
+    appendU16(frame, vshard);
+    return seastar::sstring(frame.data(), frame.size());
+}
+
+seastar::sstring encodeBackupCaptureDescriptor(const BackupCaptureDescriptor& descriptor) {
+    std::string frame;
+    frame.reserve(51);
+    frame.push_back(static_cast<char>(descriptor.status));
+    appendU64(frame, descriptor.leaderHint);
+    appendU16(frame, descriptor.vshard);
+    appendU64(frame, descriptor.readIndex);
+    appendU64(frame, descriptor.snapshotIndex);
+    appendU64(frame, descriptor.snapshotTerm);
+    appendU64(frame, descriptor.encodedSize);
+    appendU64(frame, descriptor.encodedHash);
+    return seastar::sstring(frame.data(), frame.size());
+}
+
+std::optional<BackupCaptureDescriptor> decodeBackupCaptureDescriptor(const seastar::sstring& frame) {
+    if (frame.size() != 51)
+        return std::nullopt;
+    const auto rawStatus = static_cast<uint8_t>(frame[0]);
+    if (rawStatus > static_cast<uint8_t>(BackupCaptureStatus::Unavailable))
+        return std::nullopt;
+    BackupCaptureDescriptor descriptor;
+    descriptor.status = static_cast<BackupCaptureStatus>(rawStatus);
+    descriptor.leaderHint = readU64At(frame, 1);
+    descriptor.vshard = readU16At(frame, 9);
+    descriptor.readIndex = readU64At(frame, 11);
+    descriptor.snapshotIndex = readU64At(frame, 19);
+    descriptor.snapshotTerm = readU64At(frame, 27);
+    descriptor.encodedSize = readU64At(frame, 35);
+    descriptor.encodedHash = readU64At(frame, 43);
+    if (descriptor.status == BackupCaptureStatus::Captured &&
+        (descriptor.readIndex == raft::kNoIndex || descriptor.snapshotIndex < descriptor.readIndex ||
+         descriptor.snapshotTerm == raft::kNoTerm || descriptor.encodedSize == 0))
+        return std::nullopt;
+    if (descriptor.status != BackupCaptureStatus::Captured &&
+        (descriptor.readIndex != raft::kNoIndex || descriptor.snapshotIndex != raft::kNoIndex ||
+         descriptor.snapshotTerm != raft::kNoTerm || descriptor.encodedSize != 0 || descriptor.encodedHash != 0))
+        return std::nullopt;
+    return descriptor;
+}
+
+seastar::sstring encodeBackupCaptureChunk(const BackupCaptureChunk& chunk) {
+    if (chunk.bytes.size() > kMaxBackupCaptureChunkBytes || chunk.offset > chunk.totalSize ||
+        chunk.bytes.size() > chunk.totalSize - chunk.offset)
+        throw std::runtime_error("dataplane: invalid backup capture chunk from sink");
+    std::string frame;
+    frame.reserve(26 + chunk.bytes.size());
+    appendU16(frame, chunk.vshard);
+    appendU64(frame, chunk.offset);
+    appendU64(frame, chunk.totalSize);
+    appendU64(frame, chunk.totalHash);
+    frame.append(chunk.bytes);
+    return seastar::sstring(frame.data(), frame.size());
+}
+
+std::optional<BackupCaptureChunk> decodeBackupCaptureChunk(const seastar::sstring& frame, uint32_t maximumBytes) {
+    if (frame.size() < 26 || frame.size() > 26 + maximumBytes || maximumBytes > kMaxBackupCaptureChunkBytes)
+        return std::nullopt;
+    BackupCaptureChunk chunk;
+    chunk.vshard = readU16At(frame, 0);
+    chunk.offset = readU64At(frame, 2);
+    chunk.totalSize = readU64At(frame, 10);
+    chunk.totalHash = readU64At(frame, 18);
+    chunk.bytes.assign(frame.data() + 26, frame.size() - 26);
+    if (chunk.offset > chunk.totalSize || chunk.bytes.size() > chunk.totalSize - chunk.offset ||
+        (chunk.bytes.empty() && chunk.offset != chunk.totalSize))
+        return std::nullopt;
+    return chunk;
 }
 
 // The v1 propose reply keeps the all-committed case to one byte. Otherwise:
@@ -228,6 +379,7 @@ struct DataPlaneRpc::Impl {
     ControlJoinSink* controlJoinSink = nullptr;            // group-0 observer admission target
     MoveDestinationSink* moveDestinationSink = nullptr;    // Group-0-authorized data-group creation
     MoveActuationSink* moveActuationSink = nullptr;        // one fenced data-group movement step
+    BackupCaptureSink* backupCaptureSink = nullptr;        // bounded pinned VShard export sessions
     // Connections that completed the exact-v1 handshake. Dropped when a
     // connection is retired because the peer may return on another binary.
     std::set<NodeId> v1Connections;
@@ -254,6 +406,9 @@ struct DataPlaneRpc::Impl {
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> controlJoinStub;
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> ensureMoveDestinationStub;
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> actuateMoveStub;
+    std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> beginBackupCaptureStub;
+    std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> readBackupCaptureStub;
+    std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> finishBackupCaptureStub;
     // DEADLINE-CARRYING variants of the three verbs the write path awaits
     // (write-scaleout 3f). seastar's rpc client stub has a time_point overload; without
     // it an awaited call has NO timeout at all, so a peer that accepts the connection and
@@ -294,6 +449,15 @@ struct DataPlaneRpc::Impl {
     std::function<seastar::future<seastar::sstring>(Client&, seastar::rpc::rpc_clock_type::time_point,
                                                     seastar::sstring)>
         leaderCommitIndexTimedStub;
+    std::function<seastar::future<seastar::sstring>(Client&, seastar::rpc::rpc_clock_type::time_point,
+                                                    seastar::sstring)>
+        beginBackupCaptureTimedStub;
+    std::function<seastar::future<seastar::sstring>(Client&, seastar::rpc::rpc_clock_type::time_point,
+                                                    seastar::sstring)>
+        readBackupCaptureTimedStub;
+    std::function<seastar::future<seastar::sstring>(Client&, seastar::rpc::rpc_clock_type::time_point,
+                                                    seastar::sstring)>
+        finishBackupCaptureTimedStub;
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> requireV1Stub;
 
     // Retire a dead connection without blocking the caller: stop it in the background
@@ -369,6 +533,9 @@ struct DataPlaneRpc::Impl {
         controlJoinStub = proto.make_client<seastar::sstring(seastar::sstring)>(kControlJoin);
         ensureMoveDestinationStub = proto.make_client<seastar::sstring(seastar::sstring)>(kEnsureMoveDestination);
         actuateMoveStub = proto.make_client<seastar::sstring(seastar::sstring)>(kActuateMove);
+        beginBackupCaptureStub = proto.make_client<seastar::sstring(seastar::sstring)>(kBeginBackupCapture);
+        readBackupCaptureStub = proto.make_client<seastar::sstring(seastar::sstring)>(kReadBackupCapture);
+        finishBackupCaptureStub = proto.make_client<seastar::sstring(seastar::sstring)>(kFinishBackupCapture);
         proposeWriteHintedTimedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kProposeWriteHinted);
         proposeCommandHintedTimedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kProposeCommandHinted);
         requireV1TimedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kRequireV1);
@@ -380,6 +547,9 @@ struct DataPlaneRpc::Impl {
         actuateMoveTimedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kActuateMove);
         leaderReadIndexTimedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kLeaderReadIndex);
         leaderCommitIndexTimedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kLeaderCommitIndex);
+        beginBackupCaptureTimedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kBeginBackupCapture);
+        readBackupCaptureTimedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kReadBackupCapture);
+        finishBackupCaptureTimedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kFinishBackupCapture);
         requireV1Stub = proto.make_client<seastar::sstring(seastar::sstring)>(kRequireV1);
     }
 
@@ -646,6 +816,48 @@ seastar::future<> DataPlaneRpc::start(seastar::socket_address local, NodeStore& 
         return seastar::futurize_invoke([this, vs = *vs] { return impl_->readIndexSink->leaderCommitIndex(vs); })
             .then([](raft::LogIndex idx) { return encU64(idx); });
     });
+    impl_->proto.register_handler(kBeginBackupCapture, [this](seastar::sstring data) {
+        if (!impl_->backupCaptureSink)
+            return seastar::make_exception_future<seastar::sstring>(
+                std::runtime_error("dataplane: no backup capture sink"));
+        auto key = decodeBackupCaptureKey(data, kBackupCaptureKeyBytes);
+        if (!key)
+            return seastar::make_exception_future<seastar::sstring>(
+                std::runtime_error("dataplane: malformed begin-backup-capture request"));
+        return impl_->backupCaptureSink
+            ->beginBackupCapture(std::move(key->operationId), std::move(key->clusterUuid), key->vshard)
+            .then([](BackupCaptureDescriptor descriptor) { return encodeBackupCaptureDescriptor(descriptor); });
+    });
+    impl_->proto.register_handler(kReadBackupCapture, [this](seastar::sstring data) {
+        if (!impl_->backupCaptureSink)
+            return seastar::make_exception_future<seastar::sstring>(
+                std::runtime_error("dataplane: no backup capture sink"));
+        auto key = decodeBackupCaptureKey(data, kBackupCaptureKeyBytes + 12);
+        if (!key)
+            return seastar::make_exception_future<seastar::sstring>(
+                std::runtime_error("dataplane: malformed read-backup-capture request"));
+        const uint64_t offset = readU64At(data, kBackupCaptureKeyBytes);
+        const uint32_t maximumBytes = readU32At(data, kBackupCaptureKeyBytes + 8);
+        if (maximumBytes == 0 || maximumBytes > kMaxBackupCaptureChunkBytes)
+            return seastar::make_exception_future<seastar::sstring>(
+                std::runtime_error("dataplane: invalid backup capture chunk bound"));
+        return impl_->backupCaptureSink
+            ->readBackupCapture(std::move(key->operationId), std::move(key->clusterUuid), key->vshard, offset,
+                                maximumBytes)
+            .then([](BackupCaptureChunk chunk) { return encodeBackupCaptureChunk(chunk); });
+    });
+    impl_->proto.register_handler(kFinishBackupCapture, [this](seastar::sstring data) {
+        if (!impl_->backupCaptureSink)
+            return seastar::make_exception_future<seastar::sstring>(
+                std::runtime_error("dataplane: no backup capture sink"));
+        auto key = decodeBackupCaptureKey(data, kBackupCaptureKeyBytes);
+        if (!key)
+            return seastar::make_exception_future<seastar::sstring>(
+                std::runtime_error("dataplane: malformed finish-backup-capture request"));
+        return impl_->backupCaptureSink
+            ->finishBackupCapture(std::move(key->operationId), std::move(key->clusterUuid), key->vshard)
+            .then([] { return seastar::sstring("k", 1); });
+    });
     impl_->proto.register_handler(kRequireV1, [this](seastar::sstring data) {
         auto version = decU32At(data, 0);
         if (!version || data.size() != sizeof(uint32_t))
@@ -690,6 +902,10 @@ void DataPlaneRpc::setMoveDestinationSink(MoveDestinationSink& sink) {
 
 void DataPlaneRpc::setMoveActuationSink(MoveActuationSink& sink) {
     impl_->moveActuationSink = &sink;
+}
+
+void DataPlaneRpc::setBackupCaptureSink(BackupCaptureSink& sink) {
+    impl_->backupCaptureSink = &sink;
 }
 
 void DataPlaneRpc::setTlsCredentials(std::string certPem, std::string keyPem, std::string caPem) {
@@ -925,6 +1141,64 @@ seastar::future<control::ActuateMoveResult> DataPlaneRpc::actuateMove(NodeId to,
     if (!result)
         throw std::runtime_error("dataplane: malformed actuate-move result");
     co_return std::move(*result);
+}
+
+seastar::future<BackupCaptureDescriptor> DataPlaneRpc::beginBackupCapture(NodeId to, std::string operationId,
+                                                                          std::string clusterUuid, uint16_t vshard,
+                                                                          OptDeadline deadline) {
+    if (impl_->stopping)
+        throw std::runtime_error("dataplane: shutting down");
+    co_await ensureV1(to, deadline);
+    auto* conn = impl_->clientFor(to);
+    if (!conn)
+        throw std::runtime_error("dataplane: unknown peer");
+    auto frame = encodeBackupCaptureKey(operationId, clusterUuid, vshard);
+    auto reply = deadline ? co_await impl_->beginBackupCaptureTimedStub(*conn, *deadline, frame)
+                          : co_await impl_->beginBackupCaptureStub(*conn, frame);
+    auto descriptor = decodeBackupCaptureDescriptor(reply);
+    if (!descriptor || descriptor->vshard != vshard)
+        throw std::runtime_error("dataplane: malformed begin-backup-capture reply");
+    co_return *descriptor;
+}
+
+seastar::future<BackupCaptureChunk> DataPlaneRpc::readBackupCapture(NodeId to, std::string operationId,
+                                                                    std::string clusterUuid, uint16_t vshard,
+                                                                    uint64_t offset, uint32_t maximumBytes,
+                                                                    OptDeadline deadline) {
+    if (impl_->stopping)
+        throw std::runtime_error("dataplane: shutting down");
+    if (maximumBytes == 0 || maximumBytes > kMaxBackupCaptureChunkBytes)
+        throw std::invalid_argument("dataplane: invalid backup capture chunk bound");
+    co_await ensureV1(to, deadline);
+    auto* conn = impl_->clientFor(to);
+    if (!conn)
+        throw std::runtime_error("dataplane: unknown peer");
+    auto key = encodeBackupCaptureKey(operationId, clusterUuid, vshard);
+    std::string request(key.data(), key.size());
+    appendU64(request, offset);
+    appendU32(request, maximumBytes);
+    seastar::sstring frame(request.data(), request.size());
+    auto reply = deadline ? co_await impl_->readBackupCaptureTimedStub(*conn, *deadline, frame)
+                          : co_await impl_->readBackupCaptureStub(*conn, frame);
+    auto chunk = decodeBackupCaptureChunk(reply, maximumBytes);
+    if (!chunk || chunk->vshard != vshard || chunk->offset != offset)
+        throw std::runtime_error("dataplane: malformed read-backup-capture reply");
+    co_return std::move(*chunk);
+}
+
+seastar::future<> DataPlaneRpc::finishBackupCapture(NodeId to, std::string operationId, std::string clusterUuid,
+                                                    uint16_t vshard, OptDeadline deadline) {
+    if (impl_->stopping)
+        throw std::runtime_error("dataplane: shutting down");
+    co_await ensureV1(to, deadline);
+    auto* conn = impl_->clientFor(to);
+    if (!conn)
+        throw std::runtime_error("dataplane: unknown peer");
+    auto frame = encodeBackupCaptureKey(operationId, clusterUuid, vshard);
+    auto reply = deadline ? co_await impl_->finishBackupCaptureTimedStub(*conn, *deadline, frame)
+                          : co_await impl_->finishBackupCaptureStub(*conn, frame);
+    if (reply != "k")
+        throw std::runtime_error("dataplane: malformed finish-backup-capture reply");
 }
 
 seastar::future<ProposeOutcome> DataPlaneRpc::proposeWriteHinted(NodeId to, VShardBatchView view,

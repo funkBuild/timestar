@@ -465,6 +465,11 @@ public:
     [[nodiscard]] explicit operator bool() const noexcept { return static_cast<bool>(file_); }
     [[nodiscard]] const SnapshotFile* operator->() const noexcept { return file_.get(); }
     [[nodiscard]] const SnapshotFile& operator*() const noexcept { return *file_; }
+    [[nodiscard]] PinnedSnapshotFile pinAgain() const {
+        if (!file_)
+            throw std::logic_error("cannot duplicate an empty snapshot pin");
+        return PinnedSnapshotFile(file_);
+    }
 
 private:
     SnapshotFilePtr file_;

@@ -1345,13 +1345,16 @@ Named deliverables, several epic-sized — not a checkbox list:
   manifest-last `TSBK` v1 descriptor containing only portable control state;
   bounded staging and full-set validation are implemented. A hosting leader can
   now obtain a deadline-bounded quorum ReadIndex, wait/roll to a TSP1 boundary,
-  and pin the sidecar across archival and snapshot supersession. The offline
+  and pin the sidecar across archival and snapshot supersession. Exact-v1 peer
+  RPCs route begin/read/finish to the owning reactor and transfer the pinned
+  file in bounded chunks under bounded expiring sessions. The offline
   importer now seeds fresh term-1 data journals under new voters and a scrubbed
   one-seed Group-0 snapshot under a new cluster UUID, with durable node-local
   crash resume before Engine/network startup. Preparation exits offline; one
   exact-v1 release requires matching complete markers from every data voter and
-  the control seed before those roots can activate. Durable all-leader export
-  coordination and the RF=3 recovery gate remain release blockers.
+  the control seed before those roots can activate. The durable all-leader
+  operation coordinator above the peer transfer RPCs and the RF=3 recovery gate
+  remain release blockers.
 - A post-production upgrade/migration design before introducing any v2 format.
 - Remaining operator APIs and CLI beyond the Phase 4 minimum surface.
 - Routing summaries (conservative measurement-to-VShard pruning) and

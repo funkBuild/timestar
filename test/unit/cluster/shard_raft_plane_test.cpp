@@ -147,6 +147,40 @@ public:
     }
 };
 
+class RecordingBackupCapture : public data::BackupCaptureSink {
+public:
+    std::string payload{"ab\0cdef", 7};
+    std::string operationId;
+    std::string clusterUuid;
+    uint16_t vshard = 0;
+    bool finished = false;
+
+    seastar::future<data::BackupCaptureDescriptor> beginBackupCapture(std::string operation, std::string cluster,
+                                                                      uint16_t vs) override {
+        operationId = std::move(operation);
+        clusterUuid = std::move(cluster);
+        vshard = vs;
+        return seastar::make_ready_future<data::BackupCaptureDescriptor>(data::BackupCaptureDescriptor{
+            data::BackupCaptureStatus::Captured, 2, vs, 11, 13, 3, payload.size(), 0x123456789abcdef0ull});
+    }
+
+    seastar::future<data::BackupCaptureChunk> readBackupCapture(std::string operation, std::string cluster, uint16_t vs,
+                                                                uint64_t offset, uint32_t maximumBytes) override {
+        if (operation != operationId || cluster != clusterUuid || vs != vshard || offset > payload.size())
+            throw std::runtime_error("recording backup capture request mismatch");
+        const size_t count = std::min<size_t>(maximumBytes, payload.size() - offset);
+        return seastar::make_ready_future<data::BackupCaptureChunk>(
+            data::BackupCaptureChunk{vs, offset, payload.size(), 0x123456789abcdef0ull, payload.substr(offset, count)});
+    }
+
+    seastar::future<> finishBackupCapture(std::string operation, std::string cluster, uint16_t vs) override {
+        if (operation != operationId || cluster != clusterUuid || vs != vshard)
+            throw std::runtime_error("recording backup finish mismatch");
+        finished = true;
+        return seastar::make_ready_future<>();
+    }
+};
+
 // One shard's listener, so sharded<> can start one per shard on the same address.
 class ShardListener {
 public:
@@ -391,6 +425,46 @@ TEST_F(ShardRaftPlaneTest, MovementControlFencesCrossTheExactV1Socket) {
         ASSERT_TRUE(actuationSink.received);
         EXPECT_EQ(*actuationSink.received, request);
 
+        client.stop().get();
+        server.stop().get();
+    }).get();
+}
+
+TEST_F(ShardRaftPlaneTest, BackupCaptureStreamsBoundedBinaryChunksAcrossExactV1Socket) {
+    seastar::async([] {
+        RecordingStore store;
+        RecordingBackupCapture capture;
+        data::DataPlaneRpc server;
+        data::DataPlaneRpc client;
+        const auto address = loopback(18147);
+        server.setBackupCaptureSink(capture);
+        server.start(address, store).get();
+        client.addPeer(2, address);
+        client.startClientOnly().get();
+
+        const std::string operationId(32, 'a');
+        const std::string clusterUuid(32, 'b');
+        const auto descriptor = client.beginBackupCapture(2, operationId, clusterUuid, 77).get();
+        EXPECT_EQ(descriptor.status, data::BackupCaptureStatus::Captured);
+        EXPECT_EQ(descriptor.leaderHint, 2u);
+        EXPECT_EQ(descriptor.vshard, 77u);
+        EXPECT_EQ(descriptor.encodedSize, capture.payload.size());
+        EXPECT_EQ(capture.operationId, operationId);
+        EXPECT_EQ(capture.clusterUuid, clusterUuid);
+
+        auto first = client.readBackupCapture(2, operationId, clusterUuid, 77, 0, 3).get();
+        EXPECT_EQ(first.bytes, capture.payload.substr(0, 3));
+        EXPECT_EQ(first.totalSize, capture.payload.size());
+        EXPECT_EQ(first.totalHash, descriptor.encodedHash);
+        auto second = client.readBackupCapture(2, operationId, clusterUuid, 77, 3, 4).get();
+        EXPECT_EQ(second.bytes, capture.payload.substr(3));
+        auto eof = client.readBackupCapture(2, operationId, clusterUuid, 77, capture.payload.size(), 1).get();
+        EXPECT_TRUE(eof.bytes.empty());
+        EXPECT_THROW(client.readBackupCapture(2, operationId, clusterUuid, 77, 0, (1u << 20) + 1).get(),
+                     std::invalid_argument);
+
+        client.finishBackupCapture(2, operationId, clusterUuid, 77).get();
+        EXPECT_TRUE(capture.finished);
         client.stop().get();
         server.stop().get();
     }).get();
