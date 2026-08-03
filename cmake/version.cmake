@@ -30,15 +30,26 @@ if(TIMESTAR_GIT_COMMIT_OVERRIDE)
     set(TIMESTAR_GIT_COMMIT "${TIMESTAR_GIT_COMMIT_OVERRIDE}")
 else()
     execute_process(
-        COMMAND git describe --always --dirty
+        COMMAND git describe --always
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
         OUTPUT_VARIABLE TIMESTAR_GIT_COMMIT
         OUTPUT_STRIP_TRAILING_WHITESPACE
         ERROR_QUIET
         RESULT_VARIABLE _git_result
     )
-    if(NOT _git_result EQUAL 0 OR TIMESTAR_GIT_COMMIT STREQUAL "")
+    execute_process(
+        COMMAND git status --porcelain --untracked-files=no --ignore-submodules=all
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+        OUTPUT_VARIABLE _git_status
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+        RESULT_VARIABLE _git_status_result
+    )
+    if(NOT _git_result EQUAL 0 OR TIMESTAR_GIT_COMMIT STREQUAL "" OR
+       NOT _git_status_result EQUAL 0)
         set(TIMESTAR_GIT_COMMIT "unknown")
+    elseif(NOT _git_status STREQUAL "")
+        string(APPEND TIMESTAR_GIT_COMMIT "-dirty")
     endif()
 endif()
 

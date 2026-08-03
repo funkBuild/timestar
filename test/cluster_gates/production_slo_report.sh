@@ -20,6 +20,32 @@ if [ -n "$DIRTY" ]; then
     printf '%s\n' "$DIRTY" | sed 's/^/  /' >&2
     exit 2
 fi
+CANDIDATE_COMMIT=$(git -C "$REPO" rev-parse HEAD) || {
+    echo "ABORT: could not resolve the candidate commit" >&2
+    exit 2
+}
+if ! BINARY_VERSION_OUTPUT=$("$BIN" --version 2>&1); then
+    echo "ABORT: candidate binary did not report its version" >&2
+    printf '%s\n' "$BINARY_VERSION_OUTPUT" >&2
+    exit 2
+fi
+BINARY_REVISION=$(printf '%s\n' "$BINARY_VERSION_OUTPUT" |
+    awk -F'[()]' '/^TimeStar / && NF >= 3 { print $2; exit }')
+case "$BINARY_REVISION" in
+    ''|unknown|*-dirty)
+        echo "ABORT: candidate binary has an unqualified embedded revision: ${BINARY_REVISION:-<missing>}" >&2
+        exit 2
+        ;;
+esac
+if ! BINARY_SOURCE_COMMIT=$(git -C "$REPO" rev-parse --verify --end-of-options \
+    "${BINARY_REVISION}^{commit}" 2>/dev/null); then
+    echo "ABORT: candidate binary revision '$BINARY_REVISION' does not resolve in this repository" >&2
+    exit 2
+fi
+if [ "$BINARY_SOURCE_COMMIT" != "$CANDIDATE_COMMIT" ]; then
+    echo "ABORT: candidate binary is from $BINARY_SOURCE_COMMIT, not clean HEAD $CANDIDATE_COMMIT" >&2
+    exit 2
+fi
 
 export GATE_SERVER_MEMORY="${GATE_SERVER_MEMORY:-2G}"
 export GATE_SERVER_SMP="${GATE_SERVER_SMP:-4}"
@@ -125,13 +151,13 @@ MOVEMENT_BATCH_SIZE=$(require_metric "$MOVEMENT_LOG" movement_batch_size)
 MOVEMENT_CONNECTIONS=$(require_metric "$MOVEMENT_LOG" movement_connections)
 MOVEMENT_HOSTS=$(require_metric "$MOVEMENT_LOG" movement_hosts)
 
-COMMIT=$(git -C "$REPO" rev-parse HEAD)
+COMMIT="$CANDIDATE_COMMIT"
 BINARY_SHA256=$(sha256sum "$BIN" | awk '{print $1}')
 SERVER_ENV_SHA256=$(printf '%s' "$GATE_SERVER_ENV" | sha256sum | awk '{print $1}')
 GENERATED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 HOST=$(hostname)
 
-export COMMIT BINARY_SHA256 SERVER_ENV_SHA256 GENERATED_AT HOST BIN GATE_SERVER_MEMORY GATE_SERVER_SMP
+export COMMIT BINARY_REVISION BINARY_SHA256 SERVER_ENV_SHA256 GENERATED_AT HOST BIN GATE_SERVER_MEMORY GATE_SERVER_SMP
 export GATE_BENCH_SMP GATE_BENCH_MEMORY NODE_BATCHES NODE_BATCH_SIZE NODE_CONNECTIONS
 export NODE_HOSTS NODE_PROBES NODE_ERRORS NODE_ERROR_BPS NODE_RECOVERY_MS
 export NODE_QUERY_P99_MS NODE_QUERY_SAMPLES SNAPSHOT_INSTALL_MS SNAPSHOT_CATCHUP_MS
@@ -161,6 +187,7 @@ report = {
     "host": os.environ["HOST"],
     "candidate": {
         "commit": os.environ["COMMIT"],
+        "embedded_revision": os.environ["BINARY_REVISION"],
         "binary": os.environ["BIN"],
         "binary_sha256": os.environ["BINARY_SHA256"],
     },
