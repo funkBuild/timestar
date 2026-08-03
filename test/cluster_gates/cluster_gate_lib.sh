@@ -257,11 +257,14 @@ kill_cluster() { # $1 = port prefix used by this gate, e.g. 492
     # what that costs. With only one gate live, anything else in ITS band is a stray from a
     # crashed run and killing it is the cleanup you want.
     #
-    # Safe to match loosely here because this lives in a SCRIPT FILE: the same pattern
+    # The server match is safe here because this lives in a SCRIPT FILE: the same pattern
     # inlined into `bash -c` would match the invoking shell's own argv and kill it
-    # mid-command (see the note at the top of this file).
+    # mid-command (see the note at the top of this file). Keep the benchmark match anchored
+    # to argv[0] as well. A caller may set GATE_BENCH_BINARY in an outer `bash -c`; the old
+    # loose name match killed that parent shell and orphaned the gate before any arm ran.
     pkill -u "$(id -u)" -9 -f -- "--port $1" 2>/dev/null
-    pkill -u "$(id -u)" -9 -f 'timestar_insert_bench' 2>/dev/null
+    pkill -u "$(id -u)" -9 -f \
+        '^(timestar_insert_bench|[^[:space:]]*/timestar_insert_bench)([[:space:]]|$)' 2>/dev/null
     sleep 2
 }
 

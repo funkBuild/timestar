@@ -203,7 +203,10 @@ inventory and rules.
   driver's 1-GiB limit. Overflow-safe policy tests pin the boundary. The gate
   now rejects a nonzero or incomplete benchmark result, retains the complete
   failed transcript outside disposable node roots, and hard-kills a benchmark
-  that cannot finish its graceful shutdown after the configured deadline.
+  that cannot finish its graceful shutdown after the configured deadline. Its
+  stale-benchmark cleanup is anchored to the benchmark executable at argv[0];
+  the former loose name match could kill a caller shell whose environment named
+  `GATE_BENCH_BINARY`, orphaning a live gate before it emitted any result.
   Reset intensity was first capped at 70 rounds per storm as well as floored at
   35: an uncapped exact-candidate arm that transiently ran slower injected 154
   rounds, then amplified its own latency and error count even though Raft
@@ -260,14 +263,19 @@ inventory and rules.
   crash. A later slow draw exposed the remaining cross-request seam: every shard
   could schedule that one-pass wake again for the same leader every 500 ms.
   Repeated transport give-ups then added whole-leader scans and tick bursts while
-  the data plane was already distressed. One prompt pass plus credited periodic
-  passes already spans the election, so per-node wakes are now coalesced for the
-  six-second election window. The regression runs two complete dead-peer writes
-  (longer than the retired cooldown) and requires only one wake per peer; the
-  full router suite remains green. With fixed 50-round exposure, the corrected
-  combined diagnostic admitted 29 typed `503`s, retained 45% in its worst arm,
-  executed 189 rebalance calls, drained admission, and read all 200 probes from
-  every replica with zero connection failure, `500`, or crash.
+  the data plane was already distressed. A provisional change coalesced per-node
+  wakes for the full six-second election window, but the same-candidate SLO run
+  disproved its key assumption: an O(groups) registry pass can outlast its nominal
+  timer interval, and the one-pass wake then took 51.11 s to recover all leaders
+  after a node kill (30 s ceiling). The safe bound remains one prompt pass with a
+  500-ms per-node coalescing window; zero-selection calls no longer start that
+  cooldown. Exact 50-round exposure removes the machine-speed feedback that had
+  motivated the longer suppression. With the 500-ms bound restored, the node-kill
+  diagnostic recovered every leader in 15.22 s with 57/400 typed errors and a
+  28-ms survivor-query p99. The corrected combined diagnostic admitted 34 typed
+  `503`s, retained 44% in its worst arm, executed 186 rebalance calls, drained
+  admission, and read all 200 probes from every replica with zero connection
+  failure, `500`, or crash.
 - [x] Fence the skewed-movement control/storm arm boundary on public readiness.
   The SLO collector found a clean 500/500 control whose final acknowledged
   writes were still applying when the storm client's strict, one-shot health

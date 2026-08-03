@@ -14,6 +14,7 @@
 #include <map>
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future.hh>
+#include <seastar/core/when_all.hh>
 #include <set>
 #include <string>
 #include <vector>
@@ -901,12 +902,7 @@ seastar::future<> testUnreachablePeerWakesItsGroups() {
     EXPECT_EQ(local.wakes[3], 1u);
 }
 
-// A second client give-up inside the SAME election window has no new timing information.
-// The first wake already schedules a prompt check, and the registry's ordinary credited
-// passes carry every dead follower through its election timeout. Repeating the O(groups)
-// scan/tick every 500 ms created a feedback loop under combined storage pressure, where
-// healthy peers began timing out and caused still more whole-leader wakes.
-seastar::future<> testRepeatedGiveupsCoalesceWakeForOneElection() {
+seastar::future<> testConcurrentGiveupsShareTheWakeCooldown() {
     VShardDirectory dir(1, rf3Map(3));
     WakeCountingSink local;
     ScriptedTransport client;
@@ -914,14 +910,19 @@ seastar::future<> testRepeatedGiveupsCoalesceWakeForOneElection() {
     NoLeaderResolver leaders;
     ReplicatedBatchWriteRouter router(dir, local, client, leaders);
 
-    EXPECT_THROW(co_await router.write(manySeries(30)), RetryableWriteError);
-    EXPECT_EQ(local.wakes[2], 1u);
-    EXPECT_EQ(local.wakes[3], 1u);
+    auto failedWrite = [&router]() -> seastar::future<> {
+        bool failedRetryably = false;
+        try {
+            co_await router.write(manySeries(30));
+        } catch (const RetryableWriteError&) {
+            failedRetryably = true;
+        }
+        EXPECT_TRUE(failedRetryably);
+    };
+    co_await seastar::when_all_succeed(failedWrite(), failedWrite());
 
-    // A complete failed write spans more than the retired 500-ms cooldown, so the old
-    // behavior wakes both peers again here. It is still far inside the six-second
-    // election window and must now be coalesced.
-    EXPECT_THROW(co_await router.write(manySeries(30)), RetryableWriteError);
+    // Both callers give up together. Only one may run the O(groups) selection for each
+    // dead peer inside the 500-ms coalescing window.
     EXPECT_EQ(local.wakes[2], 1u);
     EXPECT_EQ(local.wakes[3], 1u);
 }
@@ -947,7 +948,7 @@ seastar::future<> testEmptyWakeDoesNotStartTheCooldown() {
     EXPECT_EQ(local.calls[3], 1u);
 
     // Raft may learn that this peer leads local groups after the first give-up. A zero
-    // selection did no work and must not suppress that newly actionable wake for 6 s.
+    // selection did no work and must not suppress that newly actionable wake.
     EXPECT_THROW(co_await router.write(manySeries(30)), RetryableWriteError);
     EXPECT_EQ(local.calls[2], 2u);
     EXPECT_EQ(local.calls[3], 2u);
@@ -1241,8 +1242,8 @@ TEST(ReplicatedBatchWriteRouterTest, OneTransportFailureRevokesTheElectionWindow
 TEST(ReplicatedBatchWriteRouterTest, UnreachablePeerWakesItsGroups) {
     testUnreachablePeerWakesItsGroups().get();
 }
-TEST(ReplicatedBatchWriteRouterTest, RepeatedGiveupsCoalesceWakeForOneElection) {
-    testRepeatedGiveupsCoalesceWakeForOneElection().get();
+TEST(ReplicatedBatchWriteRouterTest, ConcurrentGiveupsShareTheWakeCooldown) {
+    testConcurrentGiveupsShareTheWakeCooldown().get();
 }
 TEST(ReplicatedBatchWriteRouterTest, EmptyWakeDoesNotStartTheCooldown) {
     testEmptyWakeDoesNotStartTheCooldown().get();

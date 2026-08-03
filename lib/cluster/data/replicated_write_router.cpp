@@ -22,10 +22,11 @@ namespace timestar::data {
 // A RESET connection to a HEALTHY peer is absorbed inside the retry budget -- that is
 // exactly what 4a's schedule is for -- so it never reaches here and never touches Raft. A
 // peer that is really GONE fails the batch, and only then do we schedule one prompt
-// check-tick for the groups behind it. Skipped passes are credited, so ordinary periodic
-// checks carry a dead follower through the rest of its election timeout. Another client
-// give-up inside that same election window cannot make it campaign earlier; coalescing it
-// avoids another O(groups) selection and tick burst while the data plane is distressed.
+// check-tick for the groups behind it. Calls are coalesced for 500 ms per peer so
+// concurrent give-ups cannot repeat the O(groups) selection, but sustained proof that a
+// peer is dead may schedule later prompt passes. That repetition is load-bearing when a
+// registry pass itself runs longer than its nominal timer interval: a full-election
+// cooldown measured 51 s of all-group recovery against the 30 s SLO.
 //
 // Waking on every failed ATTEMPT instead was measured to cost errors on the reset gate: it
 // puts ~1364 groups (a third of the map) on full-rate ticking for 8 s, and a follower

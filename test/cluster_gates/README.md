@@ -297,6 +297,10 @@ None of that is licence to run two gates at once: they fight over data dirs, dis
 long before they fight over a pkill, and the self-amplifying disk failure above is what that
 costs.
 
+`kill_cluster` anchors its benchmark cleanup at argv[0]. Do not loosen that match: a caller
+shell can legitimately contain `GATE_BENCH_BINARY=/path/timestar_insert_bench` in its own
+command text, and the former substring match killed that shell and orphaned the gate.
+
 ## Why the topologies differ
 
 `deposed_primary_gate.sh` uses **five** nodes at RF=3 on purpose. At RF=3 on THREE nodes
@@ -411,9 +415,9 @@ exactly that). The cluster planes only ever dial `port+1000` / `port+2000`.
    a converged-but-skewed cluster left node 3 leading 128 of 4096 — 3% of traffic crossing
    the fault. The old 400-pass targeted wake could also keep those groups active long
    enough for a reset draw to move leadership away from the proxy. Targeted wake is now
-   one prompt check-tick, coalesced per leader for a complete election window, but the gate
-   still rebalances and reasserts the traffic floor for every arm so any future leadership
-   change cannot make later arms vacuous.
+   one prompt check-tick, with concurrent requests coalesced per leader for 500 ms, but the
+   gate still rebalances and reasserts the traffic floor for every arm so any future
+   leadership change cannot make later arms vacuous.
 3. The baseline run through the proxy must itself be error-free, so a proxy bug cannot be
    read as a server property.
 
@@ -427,11 +431,12 @@ The combined reset/rebalance profile also guards the cost of Raft wake work. D-2
 hibernated groups credit skipped passes, but the wake hook still pinned every matching
 group at full rate for 400 passes (about eight seconds). One combined draw crossed that
 feedback cliff: 249 typed `503`s and 22% retained throughput failed its 80-error/25%
-bounds. A targeted wake now lasts one registry pass, and repeated client give-ups for the
-same leader are coalesced for the six-second election window. With exact 50-round arms the
-corrected live profile admitted 29 typed `503`s, retained 45% in its worst arm, issued 189
-rebalance calls, drained public readiness before read-back, and preserved all 200 probes on
-all three replicas with no connection failure, `500`, or crash.
+bounds. A targeted wake now lasts one registry pass. Repeated requests are coalesced for
+500 ms, not for the whole election: a provisional six-second cooldown made a loaded
+registry advance too slowly and failed the node-kill SLO at 51.11 s recovery (30 s ceiling).
+With exact 50-round arms the corrected live profile admitted 34 typed `503`s, retained 44%
+in its worst arm, issued 186 rebalance calls, drained public readiness before read-back, and
+preserved all 200 probes on all three replicas with no connection failure, `500`, or crash.
 
 `fault_injection_ab.sh` is now a deterministic counterfactual, not a second noisy capacity
 run. The former sequential A/B was invalidated by a measured reversed draw: the flat-pacing
