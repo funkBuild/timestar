@@ -323,11 +323,11 @@ TEST_F(TSMBlockCorruptionTest, ReadSingleBlock_StringHappyPath) {
 }
 
 // ---------------------------------------------------------------------------
-// Type-mismatch via file corruption: write a Float block, then overwrite
+// Corruption: write a Float block, then overwrite
 // the type byte (at block_offset+0) with 1 (Boolean).
-// readSingleBlock<double> must throw std::runtime_error.
+// readSingleBlock<double> must fail checksum validation before decoding.
 // ---------------------------------------------------------------------------
-seastar::future<> testReadSingleBlockTypeMismatchFloatCorruptedToBool(std::string filename) {
+seastar::future<> testReadSingleBlockTypeByteCorruptionFloatToBool(std::string filename) {
     SeriesId128 seriesId = SeriesId128::fromSeriesKey("corrupt.type.float2bool");
 
     // Write valid float block.
@@ -376,23 +376,23 @@ seastar::future<> testReadSingleBlockTypeMismatchFloatCorruptedToBool(std::strin
     } catch (const std::runtime_error& e) {
         threw = true;
         std::string msg(e.what());
-        EXPECT_NE(msg.find("type mismatch"), std::string::npos)
-            << "Expected 'type mismatch' in exception message, got: " << msg;
+        EXPECT_NE(msg.find("block checksum mismatch"), std::string::npos)
+            << "Expected 'block checksum mismatch' in exception message, got: " << msg;
     }
-    EXPECT_TRUE(threw) << "Expected std::runtime_error for type mismatch";
+    EXPECT_TRUE(threw) << "Expected std::runtime_error for block checksum mismatch";
 
     co_await tsm.close();
 }
 
-TEST_F(TSMBlockCorruptionTest, ReadSingleBlock_TypeMismatch_FloatCorruptedToBool) {
-    testReadSingleBlockTypeMismatchFloatCorruptedToBool(getTestFilePath("0_202.tsm")).get();
+TEST_F(TSMBlockCorruptionTest, ReadSingleBlock_TypeByteCorruption_FloatToBool) {
+    testReadSingleBlockTypeByteCorruptionFloatToBool(getTestFilePath("0_202.tsm")).get();
 }
 
 // ---------------------------------------------------------------------------
-// Type-mismatch: write a Boolean block, corrupt type byte to Float (0),
-// then readSingleBlock<bool> must throw.
+// Corruption: write a Boolean block, corrupt type byte to Float (0),
+// then readSingleBlock<bool> must fail checksum validation before decoding.
 // ---------------------------------------------------------------------------
-seastar::future<> testReadSingleBlockTypeMismatchBoolCorruptedToFloat(std::string filename) {
+seastar::future<> testReadSingleBlockTypeByteCorruptionBoolToFloat(std::string filename) {
     SeriesId128 seriesId = SeriesId128::fromSeriesKey("corrupt.type.bool2float");
 
     uint64_t blockOffset = 0;
@@ -438,23 +438,23 @@ seastar::future<> testReadSingleBlockTypeMismatchBoolCorruptedToFloat(std::strin
     } catch (const std::runtime_error& e) {
         threw = true;
         std::string msg(e.what());
-        EXPECT_NE(msg.find("type mismatch"), std::string::npos)
-            << "Expected 'type mismatch' in exception message, got: " << msg;
+        EXPECT_NE(msg.find("block checksum mismatch"), std::string::npos)
+            << "Expected 'block checksum mismatch' in exception message, got: " << msg;
     }
-    EXPECT_TRUE(threw) << "Expected std::runtime_error for type mismatch";
+    EXPECT_TRUE(threw) << "Expected std::runtime_error for block checksum mismatch";
 
     co_await tsm.close();
 }
 
-TEST_F(TSMBlockCorruptionTest, ReadSingleBlock_TypeMismatch_BoolCorruptedToFloat) {
-    testReadSingleBlockTypeMismatchBoolCorruptedToFloat(getTestFilePath("0_203.tsm")).get();
+TEST_F(TSMBlockCorruptionTest, ReadSingleBlock_TypeByteCorruption_BoolToFloat) {
+    testReadSingleBlockTypeByteCorruptionBoolToFloat(getTestFilePath("0_203.tsm")).get();
 }
 
 // ---------------------------------------------------------------------------
-// Type-mismatch: write a String block, corrupt type byte to Float (0),
-// then readSingleBlock<std::string> must throw.
+// Corruption: write a String block, corrupt type byte to Float (0),
+// then readSingleBlock<std::string> must fail checksum validation before decoding.
 // ---------------------------------------------------------------------------
-seastar::future<> testReadSingleBlockTypeMismatchStringCorruptedToFloat(std::string filename) {
+seastar::future<> testReadSingleBlockTypeByteCorruptionStringToFloat(std::string filename) {
     SeriesId128 seriesId = SeriesId128::fromSeriesKey("corrupt.type.str2float");
 
     uint64_t blockOffset = 0;
@@ -500,16 +500,16 @@ seastar::future<> testReadSingleBlockTypeMismatchStringCorruptedToFloat(std::str
     } catch (const std::runtime_error& e) {
         threw = true;
         std::string msg(e.what());
-        EXPECT_NE(msg.find("type mismatch"), std::string::npos)
-            << "Expected 'type mismatch' in exception, got: " << msg;
+        EXPECT_NE(msg.find("block checksum mismatch"), std::string::npos)
+            << "Expected 'block checksum mismatch' in exception, got: " << msg;
     }
-    EXPECT_TRUE(threw) << "Expected std::runtime_error for type mismatch";
+    EXPECT_TRUE(threw) << "Expected std::runtime_error for block checksum mismatch";
 
     co_await tsm.close();
 }
 
-TEST_F(TSMBlockCorruptionTest, ReadSingleBlock_TypeMismatch_StringCorruptedToFloat) {
-    testReadSingleBlockTypeMismatchStringCorruptedToFloat(getTestFilePath("0_204.tsm")).get();
+TEST_F(TSMBlockCorruptionTest, ReadSingleBlock_TypeByteCorruption_StringToFloat) {
+    testReadSingleBlockTypeByteCorruptionStringToFloat(getTestFilePath("0_204.tsm")).get();
 }
 
 // ---------------------------------------------------------------------------

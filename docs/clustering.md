@@ -116,6 +116,13 @@ reserve their store sequence at rollover; compaction inherits the newest input
 rank, preserving immutable-generation last-write-wins even when conversions
 finish out of order.
 
+Exact-v1 TSM open authenticates the footer and complete sorted index, rejects
+duplicate/out-of-order series metadata or block ranges outside the data region,
+and checks the file revision fence against its blocks. Each lazily reread index
+entry and every data block actually accessed are authenticated independently;
+ordinary, batched, pushdown-data, and zero-copy compaction reads therefore fail
+closed on local immutable corruption.
+
 One VShard snapshot pins the current Engine generation, resolves tombstones,
 and materializes a VShard-pure TSM object plus deterministic catalog, retention,
 delete-receipt, and revision-fence state. The exact-v1 `TSP1` stream is produced

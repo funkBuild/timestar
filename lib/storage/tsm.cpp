@@ -1,6 +1,7 @@
 #include "tsm.hpp"
 
 #include "bool_encoder_rle.hpp"
+#include "crc32.hpp"
 #include "float_encoder.hpp"
 #include "integer_encoder.hpp"
 #include "logger.hpp"
@@ -318,10 +319,12 @@ seastar::future<> TSM::open() {
     try {
         length = co_await tsmFile.size();
 
-        // Minimum valid file: 5-byte header + max-revision and index-offset trailers.
-        if (length < 21) {
-            throw std::runtime_error("TSM file too small (" + std::to_string(length) +
-                                     " bytes, minimum 21): " + filePath);
+        // Minimum valid file: 5-byte header plus the exact-v1 footer. An empty
+        // index is valid for an empty immutable generation.
+        constexpr size_t minimumBytes = 5 + TSM_FOOTER_SIZE;
+        if (length < minimumBytes) {
+            throw std::runtime_error("TSM file too small (" + std::to_string(length) + " bytes, minimum " +
+                                     std::to_string(minimumBytes) + "): " + filePath);
         }
         auto hdrBuf = co_await tsmFile.dma_read_exactly<uint8_t>(0, 5);
         if (hdrBuf.get()[0] != 'T' || hdrBuf.get()[1] != 'A' || hdrBuf.get()[2] != 'S' || hdrBuf.get()[3] != 'M') {
@@ -385,40 +388,58 @@ uint64_t TSM::dataRank() {
 
 // Lazy loading: read sparse index + build bloom filter
 seastar::future<> TSM::readSparseIndex() {
-    // Read index offset (last 8 bytes of file)
-    auto indexOffsetBuf = co_await tsmFile.dma_read_exactly<uint8_t>(length - sizeof(uint64_t), sizeof(uint64_t));
-    uint64_t indexOffset;
-    std::memcpy(&indexOffset, indexOffsetBuf.get(), sizeof(uint64_t));
+    auto footer = co_await tsmFile.dma_read_exactly<uint8_t>(length - TSM_FOOTER_SIZE, TSM_FOOTER_SIZE);
+    uint32_t storedFooterCrc = 0;
+    std::memcpy(&storedFooterCrc, footer.get() + TSM_FOOTER_BODY_SIZE, sizeof(storedFooterCrc));
+    if (CRC32::compute(footer.get(), TSM_FOOTER_BODY_SIZE) != storedFooterCrc) {
+        throw std::runtime_error("TSM footer checksum mismatch: " + filePath);
+    }
 
-    constexpr size_t trailerBytes = 2 * sizeof(uint64_t);
-    auto maxRevBuf = co_await tsmFile.dma_read_exactly<uint8_t>(length - trailerBytes, sizeof(uint64_t));
-    std::memcpy(&maxRevision_, maxRevBuf.get(), sizeof(uint64_t));
+    uint32_t storedIndexCrc = 0;
+    uint64_t indexOffset = 0;
+    std::memcpy(&storedIndexCrc, footer.get(), sizeof(storedIndexCrc));
+    std::memcpy(&maxRevision_, footer.get() + sizeof(storedIndexCrc), sizeof(maxRevision_));
+    std::memcpy(&indexOffset, footer.get() + sizeof(storedIndexCrc) + sizeof(maxRevision_), sizeof(indexOffset));
 
     // Validate indexOffset is within file bounds
-    if (indexOffset >= length - trailerBytes) {
+    const uint64_t footerOffset = length - TSM_FOOTER_SIZE;
+    if (indexOffset < 5 || indexOffset > footerOffset) {
         throw std::runtime_error("Corrupted TSM file: indexOffset " + std::to_string(indexOffset) +
                                  " is out of bounds (file size: " + std::to_string(length) + "): " + filePath);
     }
-
-    // Read entire index section (excluding max-revision and index-offset trailers).
-    auto indexBuf = co_await tsmFile.dma_read_exactly<uint8_t>(indexOffset, length - indexOffset - trailerBytes);
+    // Read and authenticate the entire index once at file open. Individual
+    // entries carry their own CRC because lazy loads re-read them later.
+    const size_t indexBytes = static_cast<size_t>(footerOffset - indexOffset);
+    seastar::temporary_buffer<uint8_t> indexBuf;
+    if (indexBytes > 0) {
+        indexBuf = co_await tsmFile.dma_read_exactly<uint8_t>(indexOffset, indexBytes);
+    }
+    const uint32_t actualIndexCrc = indexBytes == 0 ? 0 : CRC32::compute(indexBuf.get(), indexBuf.size());
+    if (actualIndexCrc != storedIndexCrc) {
+        throw std::runtime_error("TSM index checksum mismatch: " + filePath);
+    }
     Slice indexSlice(indexBuf.get(), indexBuf.size());
 
     // First pass: Parse index to collect series and build sparse index
     // We need the actual count before initializing the bloom filter
     std::vector<SeriesId128> seriesIds;
+    uint64_t actualMaxRevision = 0;
 
     // Require a whole fixed header before touching it: SeriesId128::fromBytes
     // takes a raw pointer and does NOT bounds-check (unlike Slice::read), so a
     // few trailing bytes here would read past the buffer before the following
     // block-count read could throw.
     while (indexSlice.bytesLeft() >= TSM_INDEX_ENTRY_HEADER_SIZE) {
+        const size_t entryStart = indexSlice.offset;
         uint64_t entryStartOffset = indexOffset + indexSlice.offset;
 
         // Read series ID (16 bytes) — zero-copy from index buffer
         SeriesId128 seriesId =
             SeriesId128::fromBytes(reinterpret_cast<const char*>(indexSlice.data + indexSlice.offset), 16);
         indexSlice.offset += 16;
+        if (!seriesIds.empty() && !(seriesIds.back() < seriesId)) {
+            throw std::runtime_error("TSM index corrupt: series IDs are duplicated or not strictly sorted");
+        }
 
         // Read type (1 byte) and block count (u32).
         uint8_t type = indexSlice.read<uint8_t>();
@@ -432,12 +453,12 @@ seastar::future<> TSM::readSparseIndex() {
 
         // Validate blockCount against remaining index data to prevent
         // reads past the end of the index on malformed files.
-        size_t blockBytes = static_cast<size_t>(blockCount) * perBlockBytes;
-        if (blockBytes > indexSlice.bytesLeft()) {
+        if (blockCount > indexSlice.bytesLeft() / perBlockBytes) {
             throw std::runtime_error("TSM index corrupt: blockCount " + std::to_string(blockCount) + " requires " +
-                                     std::to_string(blockBytes) + " bytes but only " +
-                                     std::to_string(indexSlice.bytesLeft()) + " remain");
+                                     std::to_string(static_cast<uint64_t>(blockCount) * perBlockBytes) +
+                                     " bytes but only " + std::to_string(indexSlice.bytesLeft()) + " remain");
         }
+        const size_t blockBytes = static_cast<size_t>(blockCount) * perBlockBytes;
 
         // Peek at first/last block metadata from the index for sparse lookups.
         uint64_t seriesMinTime = 0;
@@ -451,6 +472,42 @@ seastar::future<> TSM::readSparseIndex() {
         if (blockCount > 0) {
             size_t blockStart = indexSlice.offset;
             size_t lastBlockStart = blockStart + (blockCount - 1) * perBlockBytes;
+
+            uint64_t previousMinTime = 0;
+            uint64_t previousMaxTime = 0;
+            for (uint32_t i = 0; i < blockCount; ++i) {
+                const size_t current = blockStart + static_cast<size_t>(i) * perBlockBytes;
+                uint64_t minTime = 0;
+                uint64_t maxTime = 0;
+                uint64_t blockOffset = 0;
+                uint32_t blockSize = 0;
+                uint64_t blockMinRev = 0;
+                uint64_t blockMaxRev = 0;
+                std::memcpy(&minTime, indexSlice.data + current, sizeof(minTime));
+                std::memcpy(&maxTime, indexSlice.data + current + 8, sizeof(maxTime));
+                std::memcpy(&blockOffset, indexSlice.data + current + 16, sizeof(blockOffset));
+                std::memcpy(&blockSize, indexSlice.data + current + 24, sizeof(blockSize));
+                std::memcpy(&blockMinRev, indexSlice.data + current + perBlockBytes - 20, sizeof(blockMinRev));
+                std::memcpy(&blockMaxRev, indexSlice.data + current + perBlockBytes - 12, sizeof(blockMaxRev));
+
+                if (minTime > maxTime) {
+                    throw std::runtime_error("TSM index corrupt: block minimum timestamp exceeds maximum");
+                }
+                if (i > 0 && (minTime < previousMinTime || maxTime < previousMaxTime)) {
+                    throw std::runtime_error("TSM index corrupt: blocks are not sorted by time");
+                }
+                if (blockSize < BLOCK_HEADER_SIZE || blockOffset < 5 || blockOffset > indexOffset ||
+                    blockSize > indexOffset - blockOffset) {
+                    throw std::runtime_error("TSM index corrupt: block range crosses the data region");
+                }
+                if (blockMinRev > blockMaxRev) {
+                    throw std::runtime_error("TSM index corrupt: block minimum revision exceeds maximum");
+                }
+
+                previousMinTime = minTime;
+                previousMaxTime = maxTime;
+                actualMaxRevision = std::max(actualMaxRevision, blockMaxRev);
+            }
 
             // First block: minTime at offset 0
             std::memcpy(&seriesMinTime, indexSlice.data + blockStart, sizeof(uint64_t));
@@ -505,7 +562,7 @@ seastar::future<> TSM::readSparseIndex() {
             if (dictBytes > 16 * 1024 * 1024) {
                 throw std::runtime_error("Corrupt TSM: dictionary too large");
             }
-            if (indexSlice.offset + 4 + dictBytes > indexSlice.length_) {
+            if (dictBytes > indexSlice.length_ - indexSlice.offset - 4) {
                 // Dictionary extends past index end — same rule as above:
                 // reject the whole file rather than silently keeping a prefix.
                 throw std::runtime_error("TSM index corrupt: dictionary size " + std::to_string(dictBytes) +
@@ -513,6 +570,15 @@ seastar::future<> TSM::readSparseIndex() {
                                          " extends past index end (" + std::to_string(indexSlice.length_) + ")");
             }
             indexSlice.offset += 4 + dictBytes;
+        }
+
+        if (indexSlice.bytesLeft() < sizeof(uint32_t)) {
+            throw std::runtime_error("TSM index corrupt: entry truncated before checksum");
+        }
+        const size_t entryBodyBytes = indexSlice.offset - entryStart;
+        const uint32_t storedEntryCrc = indexSlice.read<uint32_t>();
+        if (CRC32::compute(indexSlice.data + entryStart, entryBodyBytes) != storedEntryCrc) {
+            throw std::runtime_error("TSM index entry checksum mismatch for series " + seriesId.toHex());
         }
 
         // Calculate total entry size (header + blocks + optional dictionary).
@@ -523,6 +589,7 @@ seastar::future<> TSM::readSparseIndex() {
         if (seriesType == TSMValueType::String) {
             entrySize += 4 + dictBytes;
         }
+        entrySize += sizeof(uint32_t);
 
         // Store sparse entry with time bounds + first/latest values
         SparseIndexEntry sparseEntry{.seriesId = seriesId,
@@ -553,6 +620,9 @@ seastar::future<> TSM::readSparseIndex() {
         throw std::runtime_error("TSM index corrupt: " + std::to_string(indexSlice.bytesLeft()) +
                                  " trailing bytes after " + std::to_string(seriesIds.size()) +
                                  " index entries — index is truncated: " + filePath);
+    }
+    if (actualMaxRevision != maxRevision_) {
+        throw std::runtime_error("TSM footer maximum revision disagrees with authenticated index: " + filePath);
     }
 
     // Now initialize bloom filter with the ACTUAL series count
@@ -649,18 +719,49 @@ void TSM::parseIndexBlocksFromSlice(Slice& indexSlice, TSMIndexEntry& entry, uin
         }
         block.blockMinRev = indexSlice.read<uint64_t>();
         block.blockMaxRev = indexSlice.read<uint64_t>();
+        block.checksum = indexSlice.read<uint32_t>();
         entry.indexBlocks.push_back(block);
     }
 
     // Parse string dictionary if present.
-    if (entry.seriesType == TSMValueType::String && indexSlice.offset + 4 <= indexSlice.length_) {
-        uint32_t dictSize = indexSlice.read<uint32_t>();
-        if (dictSize > 0 && indexSlice.offset + dictSize <= indexSlice.length_) {
-            auto dict = StringEncoder::deserializeDictionary(indexSlice, dictSize);
-            if (dict.valid) {
-                entry.stringDictionary = std::make_shared<const std::vector<std::string>>(std::move(dict.entries));
-            }
+    if (entry.seriesType == TSMValueType::String) {
+        if (indexSlice.bytesLeft() < sizeof(uint32_t)) {
+            throw std::runtime_error("TSM index corrupt: string entry has no dictionary length");
         }
+        uint32_t dictSize = indexSlice.read<uint32_t>();
+        if (dictSize > 16 * 1024 * 1024 || dictSize > indexSlice.bytesLeft()) {
+            throw std::runtime_error("TSM index corrupt: invalid string dictionary size " + std::to_string(dictSize));
+        }
+        if (dictSize > 0) {
+            auto dict = StringEncoder::deserializeDictionary(indexSlice, dictSize);
+            if (!dict.valid) {
+                throw std::runtime_error("TSM index corrupt: invalid string dictionary");
+            }
+            entry.stringDictionary = std::make_shared<const std::vector<std::string>>(std::move(dict.entries));
+        }
+    }
+}
+
+size_t TSM::authenticatedEntryBodySize(const uint8_t* data, size_t size) const {
+    if (size < TSM_INDEX_ENTRY_HEADER_SIZE + sizeof(uint32_t)) {
+        throw std::runtime_error("TSM index entry too small: " + filePath);
+    }
+    const size_t bodyBytes = size - sizeof(uint32_t);
+    uint32_t storedCrc = 0;
+    std::memcpy(&storedCrc, data + bodyBytes, sizeof(storedCrc));
+    if (CRC32::compute(data, bodyBytes) != storedCrc) {
+        throw std::runtime_error("TSM index entry checksum mismatch: " + filePath);
+    }
+    return bodyBytes;
+}
+
+void TSM::verifyBlockChecksum(const TSMIndexBlock& block, const uint8_t* data, size_t size) const {
+    if (size != block.size) {
+        throw std::runtime_error("TSM block read size disagrees with authenticated index");
+    }
+    const uint32_t actual = CRC32::compute(data, size);
+    if (actual != block.checksum) {
+        throw timestar::BlockDecodeError("TSM block checksum mismatch at offset " + std::to_string(block.offset));
     }
 }
 
@@ -692,13 +793,17 @@ seastar::future<TSMIndexEntry*> TSM::getFullIndexEntry(const SeriesId128& series
     auto entryBuf = co_await coalescedDmaRead(sparse.fileOffset, sparse.entrySize);
 
     // Step 5: Parse the full entry
-    Slice entrySlice(entryBuf.get(), entryBuf.size());
+    const size_t entryBodyBytes = authenticatedEntryBodySize(entryBuf.get(), entryBuf.size());
+    Slice entrySlice(entryBuf.get(), entryBodyBytes);
 
     TSMIndexEntry fullEntry;
 
     // Parse series ID (verify) — zero-copy from entry buffer
     fullEntry.seriesId = SeriesId128::fromBytes(reinterpret_cast<const char*>(entrySlice.data + entrySlice.offset), 16);
     entrySlice.offset += 16;
+    if (fullEntry.seriesId != seriesId) {
+        throw std::runtime_error("TSM index entry series ID disagrees with sparse index");
+    }
 
     // Parse type and block count
     // Validate before casting: an out-of-range type byte falls through every
@@ -711,11 +816,17 @@ seastar::future<TSMIndexEntry*> TSM::getFullIndexEntry(const SeriesId128& series
             throw std::runtime_error("TSM index corrupt: invalid type byte " + std::to_string(typeByte));
         }
         fullEntry.seriesType = static_cast<TSMValueType>(typeByte);
+        if (fullEntry.seriesType != sparse.seriesType) {
+            throw std::runtime_error("TSM index entry type disagrees with sparse index");
+        }
     }
     uint32_t blockCount = entrySlice.read<uint32_t>();
 
     // Parse all blocks and optional string dictionary
     parseIndexBlocksFromSlice(entrySlice, fullEntry, blockCount);
+    if (entrySlice.bytesLeft() != 0) {
+        throw std::runtime_error("TSM index entry has trailing bytes");
+    }
 
     // Step 6: Cache it with LRU eviction.
     //
@@ -756,6 +867,7 @@ seastar::future<> TSM::prefetchFullIndexEntries(const std::vector<SeriesId128>& 
         SeriesId128 id;
         uint64_t offset;
         uint64_t size;  // matches SparseIndexEntry::entrySize
+        TSMValueType type;
     };
     std::vector<FetchEntry> toFetch;
     toFetch.reserve(seriesIds.size());
@@ -768,7 +880,8 @@ seastar::future<> TSM::prefetchFullIndexEntries(const std::vector<SeriesId128>& 
         auto sparseIt = sparseIndex.find(seriesId);
         if (sparseIt == sparseIndex.end())
             continue;
-        toFetch.push_back({seriesId, sparseIt->second.fileOffset, sparseIt->second.entrySize});
+        toFetch.push_back(
+            {seriesId, sparseIt->second.fileOffset, sparseIt->second.entrySize, sparseIt->second.seriesType});
     }
 
     if (toFetch.empty())
@@ -831,13 +944,18 @@ seastar::future<> TSM::prefetchFullIndexEntries(const std::vector<SeriesId128>& 
             if (localOffset + entry->size > buf.size())
                 continue;
 
-            Slice entrySlice(reinterpret_cast<const uint8_t*>(buf.get() + localOffset), entry->size);
+            const auto* entryData = reinterpret_cast<const uint8_t*>(buf.get() + localOffset);
+            const size_t entryBodyBytes = authenticatedEntryBodySize(entryData, entry->size);
+            Slice entrySlice(entryData, entryBodyBytes);
 
             TSMIndexEntry fullEntry;
             // Zero-copy series ID from entry buffer
             fullEntry.seriesId =
                 SeriesId128::fromBytes(reinterpret_cast<const char*>(entrySlice.data + entrySlice.offset), 16);
             entrySlice.offset += 16;
+            if (fullEntry.seriesId != entry->id) {
+                throw std::runtime_error("TSM prefetched index entry series ID disagrees with sparse index");
+            }
             {
                 uint8_t typeByte = entrySlice.read<uint8_t>();
                 if (typeByte > static_cast<uint8_t>(TSMValueType::Integer)) {
@@ -849,11 +967,17 @@ seastar::future<> TSM::prefetchFullIndexEntries(const std::vector<SeriesId128>& 
                     continue;
                 }
                 fullEntry.seriesType = static_cast<TSMValueType>(typeByte);
+                if (fullEntry.seriesType != entry->type) {
+                    throw std::runtime_error("TSM prefetched index entry type disagrees with sparse index");
+                }
             }
             uint32_t blockCount = entrySlice.read<uint32_t>();
 
             // Parse all blocks and optional string dictionary
             parseIndexBlocksFromSlice(entrySlice, fullEntry, blockCount);
+            if (entrySlice.bytesLeft() != 0) {
+                throw std::runtime_error("TSM prefetched index entry has trailing bytes");
+            }
 
             // Cache the entry (LRUCache evicts to stay under the byte budget)
             fullIndexCache.put(entry->id, std::move(fullEntry));
@@ -1086,6 +1210,7 @@ seastar::future<std::unique_ptr<TSMBlock<T>>> TSM::readSingleBlockImpl(const TSM
     }
 
     auto blockBuf = co_await coalescedDmaRead(indexBlock.offset, indexBlock.size);
+    verifyBlockChecksum(indexBlock, blockBuf.get(), blockBuf.size());
     Slice blockSlice(blockBuf.get(), blockBuf.size());
 
     if (indexBlock.size < BLOCK_HEADER_SIZE) {
@@ -1188,6 +1313,7 @@ seastar::future<seastar::temporary_buffer<uint8_t>> TSM::readCompressedBlock(con
     // Read the entire block as-is (already compressed)
     // No decompression - just read the raw bytes for zero-copy transfer
     auto blockBuf = co_await tsmFile.dma_read_exactly<uint8_t>(indexBlock.offset, indexBlock.size);
+    verifyBlockChecksum(indexBlock, blockBuf.get(), blockBuf.size());
     co_return blockBuf;
 }
 
@@ -1235,7 +1361,7 @@ TSM::~TSM() {
 
 // Group blocks into contiguous batches for optimized I/O.
 // Batches are consecutive runs of the input, so each batch holds a zero-copy
-// span into `blocks` instead of copying the 88-byte index structs.
+// span into `blocks` instead of copying the index structs.
 std::vector<BlockBatch> TSM::groupContiguousBlocks(std::span<const TSMIndexBlock> blocks) const {
     std::vector<BlockBatch> batches;
     if (blocks.empty()) {
@@ -1511,6 +1637,7 @@ seastar::future<> TSM::readBlockBatch(const BlockBatch& batch, uint64_t startTim
 
     uint32_t bufferOffset = 0;
     for (const auto& block : batch.blocks) {
+        verifyBlockChecksum(block, batchBuf.get() + bufferOffset, block.size);
         // Fully-contained blocks (index bounds prove every point passes the time
         // filter) decode with sentinel bounds — hits the branch-free timestamp
         // decode fast path with identical results.
@@ -1787,6 +1914,7 @@ seastar::future<size_t> TSM::aggregateSeriesImpl(const SeriesId128& seriesId, ui
         uint32_t bufferOffset = 0;
         for (size_t bi = 0; bi < batch.blocks.size(); ++bi) {
             const auto& block = batch.blocks[bi];
+            verifyBlockChecksum(block, batchBuf.get() + bufferOffset, block.size);
             // Every block in the batch needs decoding (stats-answered blocks
             // were removed before batching and their bytes were never read).
 

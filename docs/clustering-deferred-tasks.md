@@ -89,7 +89,8 @@ Production blockers take priority and are authoritative in
   partition, and restart at every remaining durable boundary. Local Raft durable
   `Ready` failures now quarantine before send/apply/ack, propagate across a shared
   journal, release waiters, fail readiness, and permit healthy-voter re-election;
-  live distinct-host injection and repair/restart evidence remain.
+  exact-v1 local TSM block/entry/index/footer corruption now fails closed in
+  focused tests. Live distinct-host injection and repair/restart evidence remain.
 - [x] Record the enforced memory, file-descriptor, snapshot, proposal, journal,
   and background-work budgets in
   [cluster-operations.md](cluster-operations.md). Deployment-specific capacity

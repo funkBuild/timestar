@@ -1,6 +1,7 @@
 #pragma once
 
 #include "aligned_buffer.hpp"
+#include "crc32.hpp"
 #include "memory_store.hpp"
 #include "point_revision.hpp"
 #include "series_id.hpp"
@@ -29,6 +30,9 @@ private:
     std::map<SeriesId128, TSMIndexEntry> indexEntries;
     std::string filename;
     int compressionLevel_ = 1;  // zstd level: 1=fast (fresh writes), 3=better ratio (compacted)
+    uint32_t indexCrcState_ = CRC32::INIT;
+    bool indexWriteStarted_ = false;
+    bool indexWritten_ = false;
 
     // Per-instance block size cap, defaulting to the config value. Compaction
     // raises it for deep-tier outputs (see TSMCompactor::blockCapForTier):
@@ -64,6 +68,8 @@ private:
                             size_t blockSize, TSMIndexEntry& indexEntry);
     // Serialise one series' index entry into the buffer.
     void writeIndexEntryFor(const TSMIndexEntry& indexEntry);
+    void writeFooter(uint64_t indexStartOffset);
+    [[nodiscard]] uint32_t bufferedBlockChecksum(uint64_t blockStartOffset, uint32_t blockSize) const;
     // File-level max of every block's revision range.
     [[nodiscard]] uint64_t computeMaxRevision() const;
 

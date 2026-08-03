@@ -40,8 +40,8 @@ struct StringBlockHeader {
     uint32_t count = 0;
 };
 
-static void writeStringHeader(AlignedBuffer& buffer, uint32_t magic, uint32_t uncompressedSize,
-                              uint32_t compressedSize, uint32_t count) {
+static void writeStringHeader(AlignedBuffer& buffer, uint32_t magic, uint32_t uncompressedSize, uint32_t compressedSize,
+                              uint32_t count) {
     buffer.write(magic);
     buffer.write(uncompressedSize);
     buffer.write(compressedSize);
@@ -64,8 +64,7 @@ static StringBlockHeader readStringHeader(Slice& encoded, uint32_t expectedMagic
 
     if (magic != expectedMagic) {
         if (expectedMagic == kRawStringV1Magic && magic == kDictionaryStringV1Magic) {
-            throw std::runtime_error(
-                "Dictionary-encoded v1 string block has no dictionary in its TSM index entry");
+            throw std::runtime_error("Dictionary-encoded v1 string block has no dictionary in its TSM index entry");
         }
         throw std::runtime_error("Invalid or unsupported v1 string block marker");
     }
@@ -314,13 +313,14 @@ AlignedBuffer StringEncoder::serializeDictionary(const Dictionary& dict) {
 
 StringEncoder::Dictionary StringEncoder::deserializeDictionary(Slice& encoded, size_t dictSize) {
     Dictionary dict;
-    if (dictSize < 4)
+    if (dictSize > encoded.bytesLeft()) {
+        throw std::runtime_error("Dictionary extends beyond its containing slice");
+    }
+    Slice dictSlice = encoded.getSlice(dictSize);
+    if (dictSize < sizeof(uint32_t))
         return dict;
 
-    size_t startOffset = encoded.offset;
-    uint32_t count;
-    std::memcpy(&count, encoded.data + encoded.offset, 4);
-    encoded.offset += 4;
+    uint32_t count = dictSlice.read<uint32_t>();
 
     // Guard against crafted payloads with absurdly large count
     if (count > MAX_DICT_ENTRIES || count > dictSize) {
@@ -328,13 +328,16 @@ StringEncoder::Dictionary StringEncoder::deserializeDictionary(Slice& encoded, s
     }
 
     dict.entries.reserve(count);
-    for (uint32_t i = 0; i < count && encoded.offset < startOffset + dictSize; ++i) {
-        uint32_t strLen = readVarInt(encoded);
-        if (strLen > encoded.length_ - encoded.offset) {
+    for (uint32_t i = 0; i < count; ++i) {
+        uint32_t strLen = readVarInt(dictSlice);
+        if (strLen > dictSlice.bytesLeft()) {
             throw std::runtime_error("Invalid string length in dictionary");
         }
-        dict.entries.emplace_back(reinterpret_cast<const char*>(encoded.data + encoded.offset), strLen);
-        encoded.offset += strLen;
+        dict.entries.emplace_back(reinterpret_cast<const char*>(dictSlice.data + dictSlice.offset), strLen);
+        dictSlice.offset += strLen;
+    }
+    if (dictSlice.bytesLeft() != 0) {
+        throw std::runtime_error("Dictionary has trailing bytes");
     }
     dict.totalBytes = dictSize;
     dict.valid = true;
@@ -410,10 +413,9 @@ size_t StringEncoder::decodeDictionary(Slice& encoded, size_t totalCount, size_t
     }
 
     tlDecompBuf.resize(header.uncompressedSize);
-    size_t ret = ZSTD_decompressDCtx(getThreadDCtx(), reinterpret_cast<char*>(tlDecompBuf.data()),
-                                     header.uncompressedSize,
-                                     reinterpret_cast<const char*>(encoded.data + encoded.offset),
-                                     header.compressedSize);
+    size_t ret =
+        ZSTD_decompressDCtx(getThreadDCtx(), reinterpret_cast<char*>(tlDecompBuf.data()), header.uncompressedSize,
+                            reinterpret_cast<const char*>(encoded.data + encoded.offset), header.compressedSize);
     validateDecompress(ret, header.uncompressedSize);
     encoded.offset += header.compressedSize;
 
@@ -465,8 +467,7 @@ size_t StringEncoder::decode(Slice& encoded, size_t totalCount, size_t skipCount
 
     {
         size_t ret =
-            ZSTD_decompressDCtx(getThreadDCtx(), reinterpret_cast<char*>(uncompressed.data()),
-                                header.uncompressedSize,
+            ZSTD_decompressDCtx(getThreadDCtx(), reinterpret_cast<char*>(uncompressed.data()), header.uncompressedSize,
                                 reinterpret_cast<const char*>(encoded.data + encoded.offset), header.compressedSize);
         validateDecompress(ret, header.uncompressedSize);
     }

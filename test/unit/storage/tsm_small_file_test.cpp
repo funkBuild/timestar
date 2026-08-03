@@ -1,5 +1,5 @@
-// Regression test: opening a TSM file smaller than 13 bytes must throw
-// instead of underflowing length - sizeof(uint64_t).
+// Regression test: opening a TSM file smaller than the exact-v1 minimum must
+// throw instead of underflowing a trailer/footer offset.
 
 #include "../../../lib/storage/tsm.hpp"
 
@@ -17,7 +17,7 @@ protected:
 };
 
 static seastar::future<> testTooSmallFile(std::string path) {
-    // Create a 4-byte file — well below the 13-byte minimum
+    // Create a 4-byte file — well below the 29-byte minimum.
     { std::ofstream(path, std::ios::binary) << "TASM"; }
 
     TSM tsm(path);
@@ -29,7 +29,7 @@ static seastar::future<> testTooSmallFile(std::string path) {
         EXPECT_NE(std::string(e.what()).find("too small"), std::string::npos)
             << "Error message should mention file too small, got: " << e.what();
     }
-    EXPECT_TRUE(threw) << "Opening a <13 byte TSM file must throw";
+    EXPECT_TRUE(threw) << "Opening a <29 byte TSM file must throw";
 }
 
 TEST_F(TSMSmallFileTest, TooSmallFileThrowsInsteadOfUnderflow) {

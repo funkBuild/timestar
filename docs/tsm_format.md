@@ -16,9 +16,13 @@ place during development. A file with any other version is rejected.
 +-------------------------------+
 | sorted series index           |
 +-------------------------------+
+| index CRC32             4 B    |
++-------------------------------+
 | maximum revision       8 B    |
 +-------------------------------+
 | index offset           8 B    |
++-------------------------------+
+| footer CRC32            4 B    |
 +-------------------------------+
 ```
 
@@ -31,7 +35,8 @@ All multi-byte integers are little-endian.
 | 0 | 4 | `char[4]` | `TASM` |
 | 4 | 1 | `uint8` | `1` |
 
-The minimum valid file is 21 bytes: the header plus both trailers.
+The minimum valid file is 29 bytes: the header plus the 24-byte authenticated
+footer. An empty sorted index is valid and has CRC32 value zero.
 
 ## Data blocks
 
@@ -45,6 +50,11 @@ block header is:
 | 5 | 4 | `uint32` | compressed timestamp byte count |
 
 The body contains compressed timestamps followed by compressed values.
+The complete block header and body are covered by the CRC32 stored with that
+block's authenticated index metadata. A data block is verified whenever its
+bytes are read, including ordinary queries, batched queries, pushdown paths
+that need data, and zero-copy compaction. Metadata-only answers use the
+authenticated index and do not read the block.
 
 | Value | Type | C++ representation | Encoding |
 |---:|---|---|---|
@@ -91,9 +101,10 @@ Type-specific statistics follow the common fields:
 | Boolean | 12 | count, true count, first, latest, padding |
 | String | 4 | count |
 
-Each type-specific section is followed by `minRevision` and `maxRevision`, both
-`uint64`. Total serialized block metadata sizes are therefore 96 bytes for
-Float, 88 for Integer, 56 for Boolean, and 48 for String.
+Each type-specific section is followed by `minRevision:uint64`,
+`maxRevision:uint64`, and a `blockCRC32:uint32`. Total serialized block
+metadata sizes are therefore 100 bytes for Float, 92 for Integer, 60 for
+Boolean, and 52 for String.
 
 Float statistics follow the canonical NaN policy in `docs/nan_policy.md`:
 statistics and `blockCount` exclude NaNs. A NaN endpoint sentinel disables
@@ -103,17 +114,28 @@ String series append `dictionarySize:uint32` and that many serialized
 dictionary bytes after their block metadata. A zero size means raw string
 blocks. A dictionary-ID block without its dictionary is corrupt and fails closed.
 
-## Trailers
+Every complete series entry ends with a CRC32 covering the series ID, type,
+block count, all block metadata, and the optional string dictionary. The whole
+sorted index has a second CRC32 in the footer. Open authenticates and
+structurally parses the complete index before registering the file; lazy index
+loads authenticate the individual entry again. Series IDs must be strictly
+ascending and unique. Block time/revision ranges must be ordered and valid,
+and every block byte range must remain between the header and index boundary.
 
-The final 16 bytes are:
+## Footer
+
+The final 24 bytes are:
 
 | Offset | Size | Type | Description |
 |---:|---:|---|---|
-| file size - 16 | 8 | `uint64` | maximum revision in the file |
-| file size - 8 | 8 | `uint64` | index start offset |
+| file size - 24 | 4 | `uint32` | CRC32 of the complete sorted index |
+| file size - 20 | 8 | `uint64` | maximum revision in the file |
+| file size - 12 | 8 | `uint64` | index start offset |
+| file size - 4 | 4 | `uint32` | CRC32 of the preceding 20 footer bytes |
 
 The maximum revision lets recovery restore its revision allocator without
-loading every full index entry.
+loading every full index entry. Open checks that it equals the maximum block
+revision found while structurally validating the authenticated index.
 
 ## Tombstone sidecar
 

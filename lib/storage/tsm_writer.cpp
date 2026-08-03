@@ -2,6 +2,7 @@
 
 #include "../query/simd_aggregator.hpp"
 #include "bool_encoder_rle.hpp"
+#include "crc32.hpp"
 #include "float_encoder.hpp"
 #include "integer_encoder.hpp"
 #include "logger.hpp"
@@ -117,6 +118,17 @@ void TSMWriter::writeHeader() {
     std::string magic("TASM");
     buffer.write(magic);
     buffer.write(TSM_VERSION);
+}
+
+uint32_t TSMWriter::bufferedBlockChecksum(uint64_t blockStartOffset, uint32_t blockSize) const {
+    if (blockStartOffset < flushedBytes_) {
+        throw std::logic_error("TSMWriter: block was flushed before its checksum was recorded");
+    }
+    const uint64_t localOffset64 = blockStartOffset - flushedBytes_;
+    if (localOffset64 > buffer.size() || blockSize > buffer.size() - static_cast<size_t>(localOffset64)) {
+        throw std::logic_error("TSMWriter: block checksum range is outside the output buffer");
+    }
+    return CRC32::compute(buffer.data.data() + static_cast<size_t>(localOffset64), blockSize);
 }
 
 // Build the series' index entry shell (and, for strings, its dictionary).
@@ -356,6 +368,7 @@ void TSMWriter::writeIndexBlock(std::span<const uint64_t> timestamps, TSMIndexEn
     indexBlock.maxTime = blockMaxTime;
     indexBlock.offset = blockStartOffset;
     indexBlock.size = static_cast<uint32_t>(blockSize);
+    indexBlock.checksum = bufferedBlockChecksum(blockStartOffset, indexBlock.size);
     // Record blockCount for every type (enables COUNT pushdown for String).
     indexBlock.blockCount = static_cast<uint32_t>(timestamps.size());
 
@@ -387,6 +400,7 @@ void TSMWriter::writeIndexBlock(std::span<const uint64_t> timestamps, std::span<
     indexBlock.maxTime = blockMaxTime;
     indexBlock.offset = blockStartOffset;
     indexBlock.size = static_cast<uint32_t>(blockSize);
+    indexBlock.checksum = bufferedBlockChecksum(blockStartOffset, indexBlock.size);
 
     // Compute block-level statistics for Float series.
     // Two-pass approach: first pass computes sum/min/max (vectorizable),
@@ -500,6 +514,7 @@ void TSMWriter::writeIndexBlock(std::span<const uint64_t> timestamps, std::span<
     indexBlock.maxTime = blockMaxTime;
     indexBlock.offset = blockStartOffset;
     indexBlock.size = static_cast<uint32_t>(blockSize);
+    indexBlock.checksum = bufferedBlockChecksum(blockStartOffset, indexBlock.size);
 
     const size_t n = values.size();
     double sum = 0.0;
@@ -550,6 +565,7 @@ void TSMWriter::writeIndexBlock(std::span<const uint64_t> timestamps, const std:
     indexBlock.maxTime = blockMaxTime;
     indexBlock.offset = blockStartOffset;
     indexBlock.size = static_cast<uint32_t>(blockSize);
+    indexBlock.checksum = bufferedBlockChecksum(blockStartOffset, indexBlock.size);
     indexBlock.blockCount = static_cast<uint32_t>(valCount);
 
     uint32_t trueCount = 0;
@@ -623,6 +639,7 @@ void TSMWriter::writeCompressedBlockWithStats(TSMValueType seriesType, const Ser
     indexBlock.maxTime = srcBlock.maxTime;
     indexBlock.offset = blockStartOffset;
     indexBlock.size = static_cast<uint32_t>(compressedData.size());
+    indexBlock.checksum = CRC32::compute(compressedData.get(), compressedData.size());
     // Carry forward block stats from source file (all types)
     indexBlock.blockSum = srcBlock.blockSum;
     indexBlock.blockMin = srcBlock.blockMin;
@@ -648,6 +665,7 @@ void TSMWriter::writeCompressedBlockWithStats(TSMValueType seriesType, const Ser
 // writeIndexStreaming(); contains no suspension point, so a drain may happen
 // only between entries.
 void TSMWriter::writeIndexEntryFor(const TSMIndexEntry& indexEntry) {
+    const size_t entryStart = buffer.size();
     // Write SeriesId128 as 16 bytes (no length prefix needed since it's fixed size).
     // write_bytes straight from the raw 16-byte array avoids the per-series
     // std::string that toBytes() would allocate.
@@ -716,6 +734,7 @@ void TSMWriter::writeIndexEntryFor(const TSMIndexEntry& indexEntry) {
         // stat field offsets the sparse-index fast path reads stay unchanged.
         buffer.write(block.blockMinRev);
         buffer.write(block.blockMaxRev);
+        buffer.write(block.checksum);
     }
 
     // Phase 3: Write string dictionary after block metadata for String series.
@@ -733,6 +752,10 @@ void TSMWriter::writeIndexEntryFor(const TSMIndexEntry& indexEntry) {
             buffer.write(static_cast<uint32_t>(0));  // no dictionary
         }
     }
+
+    const uint32_t entryCrc = CRC32::compute(buffer.data.data() + entryStart, buffer.size() - entryStart);
+    buffer.write(entryCrc);
+    indexCrcState_ = CRC32::update(indexCrcState_, buffer.data.data() + entryStart, buffer.size() - entryStart);
 }
 
 uint64_t TSMWriter::computeMaxRevision() const {
@@ -749,7 +772,20 @@ uint64_t TSMWriter::computeMaxRevision() const {
     return maxRev;
 }
 
+void TSMWriter::writeFooter(uint64_t indexStartOffset) {
+    const size_t footerStart = buffer.size();
+    buffer.write(CRC32::finalize(indexCrcState_));
+    buffer.write(computeMaxRevision());
+    buffer.write(indexStartOffset);
+    const uint32_t footerCrc = CRC32::compute(buffer.data.data() + footerStart, TSM_FOOTER_BODY_SIZE);
+    buffer.write(footerCrc);
+}
+
 void TSMWriter::writeIndex() {
+    if (indexWriteStarted_) {
+        throw std::logic_error("TSMWriter::writeIndex() called more than once for " + filename);
+    }
+    indexWriteStarted_ = true;
     // std::map maintains sorted order automatically
     size_t indexStartOffset = currentOffset();
     LOG_INSERT_PATH(timestar::tsm_log, debug, "Index starts at offset: {} ({:#x}), writing {} index entries",
@@ -759,15 +795,17 @@ void TSMWriter::writeIndex() {
         writeIndexEntryFor(indexEntry);
     }
 
-    // File-level max revision, written BEFORE the index offset (which
-    // stays the file's last 8 bytes, so its reader is unchanged).
-    buffer.write(computeMaxRevision());
-    buffer.write(static_cast<uint64_t>(indexStartOffset));
+    writeFooter(static_cast<uint64_t>(indexStartOffset));
+    indexWritten_ = true;
     LOG_INSERT_PATH(timestar::tsm_log, debug, "Wrote index offset: {} ({:#x}), final buffer size: {}", indexStartOffset,
                     indexStartOffset, buffer.size());
 }
 
 seastar::future<> TSMWriter::writeIndexStreaming() {
+    if (indexWriteStarted_) {
+        throw std::logic_error("TSMWriter::writeIndexStreaming() called after index finalization for " + filename);
+    }
+    indexWriteStarted_ = true;
     size_t indexStartOffset = currentOffset();
     LOG_INSERT_PATH(timestar::tsm_log, debug, "Index starts at offset: {} ({:#x}), streaming {} index entries",
                     indexStartOffset, indexStartOffset, indexEntries.size());
@@ -778,9 +816,8 @@ seastar::future<> TSMWriter::writeIndexStreaming() {
         co_await flushIfNeeded();
     }
 
-    // File-level max revision, before the index offset (see writeIndex).
-    buffer.write(computeMaxRevision());
-    buffer.write(static_cast<uint64_t>(indexStartOffset));
+    writeFooter(static_cast<uint64_t>(indexStartOffset));
+    indexWritten_ = true;
 }
 
 // fsync the parent directory to ensure a newly-created file's directory
@@ -806,6 +843,9 @@ static void fsyncParentDir(const std::string& filepath) {
 }
 
 void TSMWriter::close() {
+    if (!indexWritten_) {
+        throw std::logic_error("TSMWriter::close() called before exact-v1 index finalization for " + filename);
+    }
     LOG_INSERT_PATH(timestar::tsm_log, debug, "Writing file: {}, buffer size: {} ({:#x}), capacity: {}", filename,
                     buffer.size(), buffer.size(), buffer.capacity());
 
@@ -894,6 +934,9 @@ seastar::future<> TSMWriter::abortStream() {
 }
 
 seastar::future<> TSMWriter::closeDMA() {
+    if (!indexWritten_) {
+        throw std::logic_error("TSMWriter::closeDMA() called before exact-v1 index finalization for " + filename);
+    }
     LOG_INSERT_PATH(timestar::tsm_log, debug, "DMA finalising file: {}, buffered: {}, already flushed: {}", filename,
                     buffer.size(), flushedBytes_);
 

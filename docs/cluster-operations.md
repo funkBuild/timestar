@@ -192,10 +192,13 @@ storage fault facility with a separately verified recovery path.
 ## Monitoring and recovery
 
 Page on `/health` failure, any `raft_durability_failures`, apply failure, control
-durability failure, persistent leaderless group, snapshot refusal, or growing
-apply lag. Investigate steadily increasing pinned journal segments, abandoned
-snapshot transfers, uncommitted-proposal refusals, and compaction degradation
-before capacity is exhausted.
+durability failure, persistent leaderless group, snapshot refusal, a TSM
+checksum/structural-integrity error, or growing apply lag. Investigate steadily
+increasing pinned journal segments, abandoned snapshot transfers,
+uncommitted-proposal refusals, and compaction degradation before capacity is
+exhausted. A TSM integrity failure is not repairable in place: keep the affected
+generation offline and recover it through replica snapshot catch-up or the
+authenticated cluster restore workflow.
 
 After a crash, restart the same node identity only with its original data root,
 cluster UUID, peer position, and failure domain. A foreign/corrupt/non-v1 root

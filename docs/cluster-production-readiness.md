@@ -256,6 +256,21 @@ inventory and rules.
   three compacted journals, and read all 128 acknowledged points exactly once
   from every node. Both gates used one reactor and 1 GiB per process, stored all
   artifacts under `build/tmp`, and removed their data roots on exit.
+- [x] Close the local immutable-TSM integrity blocker in exact v1. Writers now
+  record CRC32 for every compressed data block and complete series-index entry,
+  a CRC32 for the complete sorted index, and a CRC32-authenticated footer that
+  carries the index checksum, maximum revision, and index boundary. Open
+  authenticates and structurally validates the complete index before the file
+  can register: series IDs must be unique and strictly sorted, block time and
+  revision ranges must be valid and ordered, every block must remain in the data
+  region, and the footer revision must equal the block maximum. Lazy entry
+  rereads authenticate again. Ordinary, batched, pushdown paths that access
+  bytes, and zero-copy compaction reads authenticate each block. Focused tests
+  cover empty framing, one-shot writer finalization, footer/index corruption,
+  mutation between open and lazy load, all block read modes, and
+  checksum-consistent out-of-range metadata.
+  A separate checksum-consistent fixture rejects a footer revision fence that
+  disagrees with the authenticated block maximum.
 - [x] Remove the shared mTLS peer-name override. Both inter-node transports now
   bind outbound certificate SAN verification to each peer's configured or
   Group-0-committed DNS/IP address, retire a cached connection when that identity
@@ -276,8 +291,8 @@ production deploy.
 
 ### P0 — correctness and topology
 
-No open P0 item remains from this review. Production remains blocked on the P1
-evidence below.
+No open P0 implementation item remains from this review, including local TSM
+integrity. Production remains blocked on the P1 evidence below.
 
 ### P1 — bounded operation and live evidence
 

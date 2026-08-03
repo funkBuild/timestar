@@ -158,8 +158,8 @@ SEASTAR_TEST_F(CompactionRetentionTest, OldDataDroppedAfterCompaction) {
     EXPECT_TRUE(fs::exists(compactedPath));
 
     // When all data is expired the compactor writes an empty output:
-    // 5-byte header ("TASM" + version) + 8-byte max-revision trailer +
-    // 8-byte index-offset trailer = 21 bytes. This is significantly smaller than
+    // 5-byte header ("TASM" + version) + 24-byte authenticated footer = 29 bytes.
+    // This is significantly smaller than
     // either source file and confirms no series data was written.
     auto compactedSize = fs::file_size(compactedPath);
 
@@ -171,10 +171,10 @@ SEASTAR_TEST_F(CompactionRetentionTest, OldDataDroppedAfterCompaction) {
     EXPECT_LT(compactedSize, sourceSize1) << "Compacted file should be much smaller than source file 1 "
                                           << "(all data was expired)";
 
-    // The minimal empty v1 TSM is exactly 21 bytes (header + max-revision trailer
-    // + index offset trailer). Confirm the compacted file has no series data.
-    EXPECT_LE(compactedSize, 21u) << "Expected empty compacted file (<=21 bytes) when all data is expired, "
-                                  << "got " << compactedSize << " bytes";
+    // The minimal empty v1 TSM is exactly 29 bytes (header + authenticated
+    // index/revision/offset footer). Confirm the compacted file has no series data.
+    EXPECT_EQ(compactedSize, 5u + TSM_FOOTER_SIZE) << "Expected empty compacted file when all data is expired, "
+                                                   << "got " << compactedSize << " bytes";
 
     co_return;
 }

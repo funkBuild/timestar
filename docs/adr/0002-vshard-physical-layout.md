@@ -84,7 +84,9 @@ the same timestamp appears in multiple generations.
 Exact-v1 TSM framing, block metadata, revision ranges, and tombstone sidecars are
 defined in [tsm_format.md](../tsm_format.md). There is no object UUID, live
 per-VShard manifest, whole-file BLAKE3 field, or old-layout reader in the local
-TSM format.
+TSM format. The local v1 format instead authenticates each compressed block and
+series entry with CRC32, authenticates the complete index and footer at open,
+and rejects structurally inconsistent authenticated metadata before registration.
 
 ### NativeIndex layout
 
@@ -125,6 +127,5 @@ state; unrelated series in mixed Engine objects remain live.
   VShard count changes require a future format/migration design.
 - Raft state is isolated by private VShard journals, while Engine files remain
   bounded by reactor count and are isolated logically.
-- Snapshot/backup integrity is self-contained in `TSP1`; local TSM integrity is
-  governed separately by the exact-v1 TSM format and its production-readiness
-  gate.
+- Snapshot/backup integrity is self-contained in `TSP1`; local TSM block,
+  entry, index, and footer integrity is enforced independently by exact v1.

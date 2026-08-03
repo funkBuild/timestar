@@ -8,6 +8,7 @@
 #include "../../../lib/query/query_parser.hpp"
 #include "../../../lib/storage/tsm.hpp"
 #include "../../../lib/storage/tsm_writer.hpp"
+#include "../../../lib/utils/crc32.hpp"
 
 #include <gtest/gtest.h>
 
@@ -325,13 +326,32 @@ seastar::future<> testTruncatedIndexRejectsWholeFile(std::string goodPath, std::
         ss << in.rdbuf();
         bytes = ss.str();
     }
-    // Inject a short garbage tail between the last index entry and the footer:
+    // Inject a short garbage tail between the last index entry and the footer,
+    // then recompute the enclosing exact-v1 checksums. That deliberately gets
+    // past the CRC gates so this test continues to exercise the parser's
+    // reject-partial-index invariant rather than merely testing a bad checksum.
     // the parse loop cannot consume it, so bytesLeft() lands in
     // (0, headerSize) — exactly the truncation shape that used to be accepted.
-    const std::string footer = bytes.substr(bytes.size() - 8);
-    bytes.resize(bytes.size() - 8);
+    if (bytes.size() < TSM_FOOTER_SIZE) {
+        throw std::runtime_error("writer produced a file smaller than the exact-v1 footer");
+    }
+    const size_t oldFooterOffset = bytes.size() - TSM_FOOTER_SIZE;
+    uint64_t indexOffset = 0;
+    uint64_t maxRevision = 0;
+    std::memcpy(&maxRevision, bytes.data() + oldFooterOffset + sizeof(uint32_t), sizeof(maxRevision));
+    std::memcpy(&indexOffset, bytes.data() + oldFooterOffset + sizeof(uint32_t) + sizeof(uint64_t),
+                sizeof(indexOffset));
+    bytes.resize(oldFooterOffset);
     bytes.append("\x01\x02\x03\x04\x05", 5);
-    bytes.append(footer);
+    const uint32_t indexCrc =
+        CRC32::compute(reinterpret_cast<const uint8_t*>(bytes.data() + indexOffset), bytes.size() - indexOffset);
+    const size_t footerStart = bytes.size();
+    bytes.append(reinterpret_cast<const char*>(&indexCrc), sizeof(indexCrc));
+    bytes.append(reinterpret_cast<const char*>(&maxRevision), sizeof(maxRevision));
+    bytes.append(reinterpret_cast<const char*>(&indexOffset), sizeof(indexOffset));
+    const uint32_t footerCrc =
+        CRC32::compute(reinterpret_cast<const uint8_t*>(bytes.data() + footerStart), TSM_FOOTER_BODY_SIZE);
+    bytes.append(reinterpret_cast<const char*>(&footerCrc), sizeof(footerCrc));
     {
         std::ofstream out(badPath, std::ios::binary | std::ios::trunc);
         out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
@@ -395,10 +415,10 @@ TEST_F(TSMUniversalStatsTest, DensestTimestampEncodingStaysInsidePlausibilityBou
 }
 
 TEST_F(TSMUniversalStatsTest, IndexBlockByteSizes) {
-    EXPECT_EQ(indexBlockBytes(TSMValueType::Float), 96u);
-    EXPECT_EQ(indexBlockBytes(TSMValueType::Integer), 88u);
-    EXPECT_EQ(indexBlockBytes(TSMValueType::Boolean), 56u);
-    EXPECT_EQ(indexBlockBytes(TSMValueType::String), 48u);
+    EXPECT_EQ(indexBlockBytes(TSMValueType::Float), 100u);
+    EXPECT_EQ(indexBlockBytes(TSMValueType::Integer), 92u);
+    EXPECT_EQ(indexBlockBytes(TSMValueType::Boolean), 60u);
+    EXPECT_EQ(indexBlockBytes(TSMValueType::String), 52u);
 }
 
 // ==================== Phase 1: Integer LATEST/FIRST from sparse index ====================
@@ -754,6 +774,27 @@ TEST_F(TSMUniversalStatsTest, StringDictionarySerializeDeserialize) {
     EXPECT_EQ(deserialized.entries[0], "hello");
     EXPECT_EQ(deserialized.entries[1], "world");
     EXPECT_EQ(deserialized.entries[2], "test");
+}
+
+TEST_F(TSMUniversalStatsTest, StringDictionaryRejectsTrailingBytes) {
+    StringEncoder::Dictionary dict;
+    dict.entries = {"hello"};
+    dict.valid = true;
+    auto serialized = StringEncoder::serializeDictionary(dict);
+    serialized.write(static_cast<uint8_t>(0xa5));
+
+    Slice slice(serialized.data.data(), serialized.size());
+    EXPECT_THROW(StringEncoder::deserializeDictionary(slice, serialized.size()), std::runtime_error);
+}
+
+TEST_F(TSMUniversalStatsTest, StringDictionaryRejectsTruncatedEntryCount) {
+    AlignedBuffer serialized;
+    serialized.write(static_cast<uint32_t>(2));
+    serialized.write(static_cast<uint8_t>(1));
+    serialized.write(static_cast<uint8_t>('a'));
+
+    Slice slice(serialized.data.data(), serialized.size());
+    EXPECT_THROW(StringEncoder::deserializeDictionary(slice, serialized.size()), std::runtime_error);
 }
 
 // An all-NaN Float block reports blockCount == 0, because NaN is skipped by every

@@ -47,7 +47,7 @@ enum class TSMValueType { Float = 0, Boolean, String, Integer };
 
 struct TSMIndexBlock {
     // Field order groups all 8-byte members first, then 4-byte, then 1-byte, to
-    // minimise alignment padding (104 -> 88 bytes). This struct is in-memory only
+    // minimise alignment padding. This struct is in-memory only
     // and cached per-block in the TSM full-index LRU; the on-disk format writes
     // each field individually (see tsm_writer writeIndexBlock), so member order
     // here is independent of the serialized layout.
@@ -72,6 +72,9 @@ struct TSMIndexBlock {
     double blockLatestValue = 0.0;  // Value at latest timestamp (for LATEST)
     // 4-byte fields grouped together
     uint32_t size;
+    // CRC32 of the complete compressed block framing and payload. The index
+    // entry carrying this checksum is itself CRC-covered.
+    uint32_t checksum = 0;
     uint32_t blockCount = 0;     // 0 means stats not available
     uint32_t boolTrueCount = 0;  // Number of true values in block (Boolean)
     // 1-byte fields grouped together
@@ -167,14 +170,21 @@ struct CacheSizeEstimator<::TSMIndexEntry> {
 }  // namespace timestar
 
 // Greenfield v1 layout: uint32 block counts, per-type statistics, optional
-// string dictionaries, per-block revision ranges, and a file max-revision trailer.
+// string dictionaries, block/entry/index/footer CRCs, per-block revision
+// ranges, and a file max-revision trailer.
 static constexpr uint8_t TSM_VERSION = 1;
+
+// Footer body: index CRC32, maximum revision, and index offset. The final CRC32
+// covers that body. These constants are part of exact-v1 framing.
+static constexpr size_t TSM_FOOTER_BODY_SIZE = sizeof(uint32_t) + 2 * sizeof(uint64_t);
+static constexpr size_t TSM_FOOTER_SIZE = TSM_FOOTER_BODY_SIZE + sizeof(uint32_t);
 
 // Fixed part of an index entry: SeriesId128 (16) + type (1) + block count.
 // Blocks and the optional string dictionary follow.
 static constexpr uint32_t TSM_INDEX_ENTRY_HEADER_SIZE = 16 + 1 + 4;
 
-// Per-type statistics plus a replicated revision range for every block.
+// Per-type statistics plus a replicated revision range and data CRC for every
+// block. Every series entry also ends with a CRC32, outside this stride.
 inline size_t indexBlockBytes(TSMValueType type) {
     size_t bytes;
     switch (type) {
@@ -194,7 +204,7 @@ inline size_t indexBlockBytes(TSMValueType type) {
             bytes = 28;
             break;
     }
-    return bytes + 16;  // [minRev, maxRev]
+    return bytes + 16 + 4;  // [minRev, maxRev] + block CRC32
 }
 
 class TSM {
@@ -235,6 +245,8 @@ private:
     // and block-count fields have already been read.  On return the Slice offset is
     // advanced past all block data and the optional string dictionary.
     void parseIndexBlocksFromSlice(Slice& indexSlice, TSMIndexEntry& entry, uint32_t blockCount) const;
+    [[nodiscard]] size_t authenticatedEntryBodySize(const uint8_t* data, size_t size) const;
+    void verifyBlockChecksum(const TSMIndexBlock& block, const uint8_t* data, size_t size) const;
 
     // Value-type dispatch for pushdown aggregation: decode one block as the
     // series' runtime type (Float/Integer/Boolean) and hand the decoded points

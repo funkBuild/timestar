@@ -29,7 +29,7 @@ historical-reader guarantees during the greenfield phase.
 | Raft envelope | `TSR1`; `AppendEntriesReply` carries both replicated match index and state-machine applied index |
 | Raft journal snapshot record | `TSRSNAP1` |
 | WAL segment | `TSWL` plus little-endian `uint32(1)` |
-| TSM file | `TASM` plus byte `1` |
+| TSM file | `TASM` plus byte `1`; CRC32 per data block and series entry, complete-index CRC32, and authenticated footer |
 | TSM string value block | `STR1` (raw) or `STD1` (dictionary), both v1 variants |
 | TSM filename | `<tier>_<sequence>[_d<data-sequence>].tsm` canonical decimal fields |
 | TSM tombstone | `TSMT` plus `uint32(1)` |

@@ -63,10 +63,11 @@ HTTP POST /query
 Immutable, compressed data files in `shard_N/tsm/`:
 
 - Indexed by SeriesId128 (XXH3 128-bit hash) with min/max time bounds
-- Blocks contain compressed timestamps + values
+- Blocks contain compressed timestamps + values and are CRC32-authenticated on access
 - Tiered by compaction level (tier 0 = freshly flushed, higher = compacted)
 - Sparse index for O(1) series lookup without scanning
 - Bloom filters for fast negative lookups
+- Complete index/footer authentication at open, plus per-entry authentication on lazy reread
 
 ### NativeIndex (Metadata)
 
