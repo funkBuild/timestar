@@ -508,30 +508,29 @@ integrity. Production remains blocked on the P1 evidence below.
   collector's provisional thresholds, not approved production SLOs. Approved
   thresholds and distinct-host deployment evidence remain open release work.
 
-  The final local collector rerun after the benchmark-memory and network-gate
-  fixes passed on exact runtime candidate
-  `b9dd41749fd1eb49e891354b4cb9147ec4c9fa43`. A clean full build, 4,398 passed
-  unit tests plus nine intentional skips and one disabled test, and 28 passed
-  socket tests plus two one-shard skips preceded it. The report authenticated
+  The latest complete local collector passed on exact runtime candidate
+  `dc3fd0e669a86068e28b3c9cafa41aebb17efba6`. The final regression battery had
+  4,400 passed unit tests plus nine intentional skips and one disabled test,
+  and 29 passed socket tests plus two one-shard skips. The report authenticated
   server
-  `ed3d67721a4dc8b9aeac1f1bfe3e6d3083e89bc02fee1a94f5372a7a6a0db101`
+  `cb4cc9fe80f078026c2cf6d6be6cfb823b6f718e9c213a429ff8a91877401ec6`
   and benchmark
-  `1f79dc373c1aa6f871d1c87f3f79c5da83269092013f2a72073f430020663216`
-  before and after the campaign. It measured 57/400 retryable node-kill
-  errors, 16.420-s recovery, and 29-ms query p99; 64.380-s snapshot
-  installation and 68.800-s exact catch-up; and a movement arm that retained
-  58% throughput with 1.757-s p99, 12 benchmark errors, 2,851 transfers, and
-  136/150 successful live probes. Every acknowledged probe was durable and no
-  arm observed a server 500 or crash. The later `1e76f1d` commit changes only
-  gates and documentation; its bounded deterministic retry-pacing
-  counterfactual failed both required invariants while HEAD passed both. Local
-  implementation qualification is therefore complete. The collector now marks
-  default runs provisional and accepts an exact-v1 approved policy whose
-  deployment, thresholds, authority/reference, bounded validity window, and
-  canonical/source hashes are embedded in the report and rechecked after the
-  serial run. The multi-host preflight rejects provisional, expired,
-  hash-mismatched, or policy-divergent evidence. Selecting that policy and
-  recording distinct-host deployment measurements remain open release work.
+  `a93d6ee2c9a8b39a7c1b192cce64e1300fbeee4414340adf10a7bef94bb77881`
+  before and after the campaign. It measured 61/400 retryable node-kill errors,
+  16.080-s recovery, and 27-ms query p99; 64.370-s snapshot installation and
+  68.820-s exact catch-up; and a movement arm that retained 33% throughput with
+  1.818-s p99, 33 benchmark errors, 5,014 transfers, and 104/150 acknowledged
+  live probes. Every acknowledged probe was durable and no arm observed a
+  server 500 or crash. The later `cdf94da` commit changes only gate sizing and
+  documentation: it raises the combined workload from 1,200 to 1,500 requests
+  so both arms span the exact 50-round exposure, which then passed 50/50 with
+  the `dc3fd0e` binaries. The collector marks this local report provisional and
+  accepts an exact-v1 approved policy whose deployment, thresholds,
+  authority/reference, bounded validity window, and canonical/source hashes
+  are embedded in the report and rechecked after the serial run. The multi-host
+  preflight rejects provisional, expired, hash-mismatched, or policy-divergent
+  evidence. Selecting that policy and recording distinct-host deployment
+  measurements remain open release work.
 - [x] **Deliver and prove clustered backup/restore.** The existing filesystem
   copy guidance is now explicitly limited to standalone mode: it omitted
   persistent node identity, Group-0/control state, the committed serving map,
@@ -585,23 +584,15 @@ integrity. Production remains blocked on the P1 evidence below.
   snapshot, barrier, GC, and file-descriptor contract instead of the retired
   per-reactor/4-ms/256-MiB proposal.
 - [ ] Record one final serial build, focused unit/socket tests, and each required
-  live gate against the exact release commit. Exact runtime candidate `b9dd417`
-  completed the full bounded local serial battery: build, unit/socket tests,
-  6,000-target pattern-delete failover/restart, three reset storms, combined
-  reset plus rebalance, node-kill durability, empty-root snapshot catch-up, and
-  skewed movement. Its reset-only run retained 87--89% throughput with 202
-  bounded reset rounds, 804 destroyed connections, zero errors, and exact
-  replica readback. The combined run admitted 47 typed `503`s under its
-  80-error ceiling, retained 36--45% throughput, completed 216 rebalance calls,
-  and preserved every acknowledged write with no other status, server 500, or
-  crash. The later `1e76f1d` gate/documentation-only commit replaced the noisy
-  live pacing A/B with a passing deterministic counterfactual. The remaining
-  step is procedural: choose the release identity, build that exact identity,
-  repeat the serial battery once, then run the distinct-host arms. It is not an
-  unresolved storage defect. A later exact-candidate combined run found and
-  corrected the stale 400-pass Raft wake described above; its corrected live
-  reproduction is green, but the final exact-commit battery must include that
-  change before this release step can close.
+  live gate against the exact release commit. Exact runtime candidate `dc3fd0e`
+  now has the clean authenticated SLO collector results above; the final 1,500-
+  request combined profile also passed with those product binaries. This closes
+  the known local product and harness defects, including stale 400-pass wake
+  work, variable reset intensity, false pre-readback loss, and the rejected
+  six-second cooldown. The remaining step is procedural: select the release
+  identity and approved policy, build that exact identity, repeat the complete
+  serial battery once, then run the distinct-host arms and bind their evidence.
+  It is not an unresolved storage defect.
 
 ## Release exit criteria
 
