@@ -42,6 +42,7 @@
 #include <optional>
 #include <seastar/core/app-template.hh>
 #include <seastar/core/coroutine.hh>
+#include <seastar/core/memory.hh>
 #include <seastar/core/prometheus.hh>
 #include <seastar/core/scheduling.hh>
 #include <seastar/core/seastar.hh>
@@ -72,6 +73,7 @@ seastar::sharded<Engine> g_engine;
 // node and M1 full-replication clusters are byte-identical.
 timestar::cluster::ClusterDataPlane g_clusterDataPlane;
 bool g_clusterPartitioned = false;
+std::atomic<uint64_t> g_serverMemoryBytes{0};
 static std::optional<timestar::features::ClusterBackupAuthenticationKey> g_clusterBackupAuthenticationKey;
 
 // Consecutive compaction failures on any one tier before /health reports
@@ -272,6 +274,8 @@ void set_routes(routes& r) {
                                    "\",\"failure_domain\":\"" +
                                    timestar::jsonEscape(clusterConfig.failure_domain) + "\"" +
                                    ",\"reactor_count\":" + std::to_string(seastar::smp::count) +
+                                   ",\"server_memory_bytes\":" +
+                                   std::to_string(g_serverMemoryBytes.load(std::memory_order_acquire)) +
                                    ",\"replication_factor\":" + std::to_string(st.replicationFactor) +
                                    ",\"replicated\":" + (st.replicated ? "true" : "false") + ",\"peers\":[" + peers +
                                    "],\"unresolved_peers\":" + std::to_string(st.unresolvedPeerCount);
@@ -1005,6 +1009,18 @@ int main(int argc, char** argv) {
             timestar::init_logging(log_level);
             timestar::http_log.info("Starting TimeStar {} ({}) built {} with {}", timestar::VERSION,
                                     timestar::GIT_COMMIT, timestar::BUILD_TIME, timestar::COMPILER);
+
+            // Bind release evidence to the memory the Seastar allocator actually
+            // received, rather than trusting a deployment transcript to repeat the
+            // requested --memory value. The allocator is split across reactors, so
+            // retain the process-wide sum before the read-only status route starts.
+            uint64_t serverMemoryBytes = 0;
+            for (unsigned shard = 0; shard < seastar::smp::count; ++shard) {
+                serverMemoryBytes += seastar::smp::submit_to(shard, [] {
+                    return static_cast<uint64_t>(seastar::memory::stats().total_memory());
+                }).get();
+            }
+            g_serverMemoryBytes.store(serverMemoryBytes, std::memory_order_release);
 
             try {
                 const auto& keyFile = timestar::config().cluster.backup_auth_key_file;

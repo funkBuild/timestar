@@ -430,10 +430,12 @@ integrity. Production remains blocked on the P1 evidence below.
   components/revisions/cluster UUIDs, divergent or overlapping peer maps,
   disabled snapshotting, the optional shared journal, unstable map or lifecycle
   state, incomplete RF=3 totals, or any apply/durability fault. It also binds the
-  server's explicit reactor count and aggregate uncommitted-proposal budget to
-  the high-volume SLO profile; this avoids rejecting a correct four-reactor
-  deployment as though its process-wide 256-MiB budget were a one-reactor
-  64-MiB budget. An exact-v1 evidence binder now rejects before/after reports
+  server's explicit reactor count, observed process-wide Seastar allocator
+  bytes, and aggregate uncommitted-proposal budget to the high-volume SLO
+  profile; a configured 2-GiB policy can no longer qualify a process actually
+  started with 1 GiB. This also avoids rejecting a correct four-reactor
+  deployment as though its process-wide 256-MiB proposal budget were a
+  one-reactor 64-MiB budget. An exact-v1 evidence binder now rejects before/after reports
   from different candidates, deployments, clusters, node/peer/failure-domain
   identities, or stable map epochs and requires distinct hashed infrastructure,
   workload, and per-node transcripts for every arm. Repeat identity and

@@ -16,6 +16,7 @@ SPEC.loader.exec_module(preflight)
 REVISION = "v1.2.1-571-gc28066d"
 NODES = ["https://node1.example:8443", "https://node2.example:8443", "https://node3.example:8443"]
 SERVER_SMP = 4
+SERVER_MEMORY_BYTES = 2 << 30
 
 
 def policy_document() -> dict:
@@ -81,6 +82,7 @@ def status(node_id: int, domain: str, led: int) -> dict:
         "cluster_uuid": "00112233445566778899aabbccddeeff",
         "failure_domain": domain,
         "reactor_count": SERVER_SMP,
+        "server_memory_bytes": SERVER_MEMORY_BYTES,
         "peers": [
             {"node": 1, "address": "node1.example:8086"},
             {"node": 2, "address": "node2.example:8086"},
@@ -157,7 +159,14 @@ class Fixture:
         return copy.deepcopy(self.responses[url])
 
     def qualify(self):
-        return preflight.qualify(NODES, REVISION, SERVER_SMP, resolver=self.resolver, fetcher=self.fetcher)
+        return preflight.qualify(
+            NODES,
+            REVISION,
+            SERVER_SMP,
+            SERVER_MEMORY_BYTES,
+            resolver=self.resolver,
+            fetcher=self.fetcher,
+        )
 
 
 class MultiHostCandidatePreflightTest(unittest.TestCase):
@@ -228,6 +237,12 @@ class MultiHostCandidatePreflightTest(unittest.TestCase):
         with self.assertRaisesRegex(preflight.QualificationError, "reactor_count"):
             fixture.qualify()
 
+    def test_rejects_wrong_memory_allocation_for_candidate_profile(self):
+        fixture = Fixture()
+        fixture.responses[f"{NODES[0]}/cluster/status"]["server_memory_bytes"] = 1 << 30
+        with self.assertRaisesRegex(preflight.QualificationError, "server_memory_bytes"):
+            fixture.qualify()
+
     def test_rejects_boolean_where_an_integer_status_counter_is_required(self):
         fixture = Fixture()
         fixture.responses[f"{NODES[0]}/cluster/status"]["apply_failures"] = False
@@ -277,7 +292,12 @@ class MultiHostCandidatePreflightTest(unittest.TestCase):
         fixture = Fixture()
         with self.assertRaisesRegex(preflight.QualificationError, "clean"):
             preflight.qualify(
-                NODES, f"{REVISION}-dirty", SERVER_SMP, resolver=fixture.resolver, fetcher=fixture.fetcher
+                NODES,
+                f"{REVISION}-dirty",
+                SERVER_SMP,
+                SERVER_MEMORY_BYTES,
+                resolver=fixture.resolver,
+                fetcher=fixture.fetcher,
             )
 
     def test_rejects_non_production_endpoint(self):

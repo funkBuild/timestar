@@ -145,6 +145,12 @@ def validate_preflight(report: object, label: str) -> None:
         raise EvidenceError(f"{label} expected deployment is invalid: {exc}") from exc
     if parsed_deployment != deployment:
         raise EvidenceError(f"{label} expected deployment is not canonical")
+    try:
+        expected_memory_bytes = preflight.production_slo_policy.parse_memory_bytes(
+            memory, "high_volume_server_memory_per_process"
+        )
+    except preflight.production_slo_policy.PolicyError as exc:
+        raise EvidenceError(f"{label} expected deployment memory is invalid: {exc}") from exc
     policy_evidence = report["slo_policy"]
     if not isinstance(policy_evidence, dict) or policy_evidence.get("status") != "approved":
         raise EvidenceError(f"{label} is not bound to an approved SLO policy")
@@ -178,6 +184,7 @@ def validate_preflight(report: object, label: str) -> None:
         "embedded_revision",
         "peers",
         "server_smp",
+        "server_memory_bytes",
         "uncommitted_raft_limit_bytes",
         "control_leader_here",
         "control_leader",
@@ -220,10 +227,13 @@ def validate_preflight(report: object, label: str) -> None:
             raise EvidenceError(f"{label} node {node_id} is not bound to its report identity")
         if node["server_smp"] != smp:
             raise EvidenceError(f"{label} node {node_id} does not match the expected reactor count")
+        if node["server_memory_bytes"] != expected_memory_bytes:
+            raise EvidenceError(f"{label} node {node_id} does not match the expected memory allocation")
         if node["uncommitted_raft_limit_bytes"] != smp * preflight.UNCOMMITTED_RAFT_BYTES_PER_REACTOR:
             raise EvidenceError(f"{label} node {node_id} does not match the expected proposal budget")
         numeric_fields = (
             "server_smp",
+            "server_memory_bytes",
             "uncommitted_raft_limit_bytes",
             "control_leader",
             "control_term",
@@ -332,6 +342,7 @@ def stable_node_identity(node: dict) -> dict:
         "embedded_revision",
         "peers",
         "server_smp",
+        "server_memory_bytes",
         "uncommitted_raft_limit_bytes",
         "control_nodes",
         "control_voters",

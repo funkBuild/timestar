@@ -230,6 +230,7 @@ def qualify(
     nodes: list[str],
     expected_revision: str,
     expected_server_smp: int,
+    expected_server_memory_bytes: int,
     resolver=resolve_addresses,
     fetcher=None,
 ) -> dict:
@@ -239,6 +240,8 @@ def qualify(
         raise QualificationError("expected revision must be a clean, known embedded revision")
     if type(expected_server_smp) is not int or expected_server_smp <= 0 or expected_server_smp > 1024:
         raise QualificationError("expected server reactor count must be an integer from 1 through 1,024")
+    if type(expected_server_memory_bytes) is not int or expected_server_memory_bytes <= 0:
+        raise QualificationError("expected server memory must be a positive integer byte count")
     expected_uncommitted_limit = expected_server_smp * UNCOMMITTED_RAFT_BYTES_PER_REACTOR
 
     normalized: list[tuple[str, str, int]] = [normalize_endpoint(node) for node in nodes]
@@ -284,6 +287,7 @@ def qualify(
             ("replication_factor", 3),
             ("healthy", True),
             ("reactor_count", expected_server_smp),
+            ("server_memory_bytes", expected_server_memory_bytes),
             ("snapshot_trigger", True),
             ("snapshot_production_limit_per_shard", 1),
             ("journal_shared", False),
@@ -327,6 +331,7 @@ def qualify(
                 "embedded_revision": version["git_commit"],
                 "peers": [{"node": peer_id, "address": peer_map[peer_id]} for peer_id in sorted(peer_map)],
                 "server_smp": status.get("reactor_count"),
+                "server_memory_bytes": status.get("server_memory_bytes"),
                 "uncommitted_raft_limit_bytes": status.get("uncommitted_raft_limit_bytes"),
                 "control_leader_here": status.get("control_leader_here"),
                 "control_leader": status.get("control_leader"),
@@ -454,6 +459,7 @@ def qualify(
         "generated_at": dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
         "expected_revision": expected_revision,
         "expected_server_smp": expected_server_smp,
+        "expected_server_memory_bytes": expected_server_memory_bytes,
         "cluster_uuid": cluster_uuid,
         "nodes": records,
     }
@@ -494,14 +500,19 @@ def main(argv: list[str] | None = None) -> int:
         candidate = candidate_from_slo_report(candidate_report)
         deployment = deployment_settings_from_slo_report(candidate_report)
         slo_policy = approved_policy_from_slo_report(candidate_report)
+        expected_server_memory_bytes = production_slo_policy.parse_memory_bytes(
+            deployment["server_memory_per_process"], "high_volume_server_memory_per_process"
+        )
         report = qualify(
             args.node,
             candidate["server"]["embedded_revision"],
             deployment["server_smp"],
+            expected_server_memory_bytes,
             fetcher=live_fetch,
         )
         report.pop("expected_revision")
         report.pop("expected_server_smp")
+        report.pop("expected_server_memory_bytes")
         report["candidate"] = candidate
         report["expected_deployment"] = deployment
         report["slo_policy"] = slo_policy

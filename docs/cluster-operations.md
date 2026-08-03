@@ -186,10 +186,12 @@ journal; unstable maps or lifecycle work; incomplete RF=3 totals; and any
 apply/durability fault. Every endpoint must cover the exact all-voter Group-0
 and inter-node peer topology. The deployed reactor count and its aggregate
 64-MiB-per-reactor uncommitted-proposal budget must match the high-volume server
-profile authenticated by the candidate SLO report. Retain separate
-infrastructure evidence that the report's per-process memory setting is also
-the deployed limit. Run the preflight before and after every fault arm and
-retain server, load-client, infrastructure, and preflight transcripts.
+profile authenticated by the candidate SLO report. `server_memory_bytes` is the
+process-wide sum actually assigned to the running Seastar allocators and must
+exactly match that profile as well; it is not copied from configuration. Retain
+separate infrastructure evidence for the enclosing service/container limit.
+Run the preflight before and after every fault arm and retain server,
+load-client, infrastructure, and preflight transcripts.
 
 After each recovered post-fault preflight, bind it to the pre-fault report and
 to distinct transcripts for the infrastructure action, workload, and every

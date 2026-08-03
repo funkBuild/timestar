@@ -14,6 +14,7 @@ def report(timestamp: str) -> dict:
     value = preflight_test.Fixture().qualify()
     value.pop("expected_revision")
     value.pop("expected_server_smp")
+    value.pop("expected_server_memory_bytes")
     source = preflight_test.candidate_report()
     value["candidate"] = copy.deepcopy(source["candidate"])
     value["slo_policy"] = copy.deepcopy(source["slo_policy"])
@@ -73,6 +74,11 @@ class MultiHostEvidenceBundleTest(unittest.TestCase):
             node["serving_map_epoch"] = 8
         with self.assertRaisesRegex(bundle.EvidenceError, "stable-map topology"):
             bundle.pair_reports(self.before, self.after, "authenticated-rebalance")
+
+    def test_rejects_memory_allocation_not_bound_to_deployment(self):
+        self.after["nodes"][0]["server_memory_bytes"] = 1 << 30
+        with self.assertRaisesRegex(bundle.EvidenceError, "expected memory allocation"):
+            bundle.pair_reports(self.before, self.after, "voter-stop-restart")
 
     def test_rejects_non_monotonic_evidence_time(self):
         self.after["generated_at"] = self.before["generated_at"]

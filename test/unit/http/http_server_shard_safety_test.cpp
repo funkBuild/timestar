@@ -360,6 +360,8 @@ TEST_F(HttpServerShardSafetyTest, ClusterStatusPublishesTopologyProvenance) {
     EXPECT_NE(setRoutes.find("clusterConfig.failure_domain"), std::string::npos);
     EXPECT_NE(setRoutes.find("\\\"reactor_count\\\""), std::string::npos);
     EXPECT_NE(setRoutes.find("seastar::smp::count"), std::string::npos);
+    EXPECT_NE(setRoutes.find("\\\"server_memory_bytes\\\""), std::string::npos);
+    EXPECT_NE(sourceCode.find("seastar::memory::stats().total_memory()"), std::string::npos);
 }
 
 TEST_F(HttpServerShardSafetyTest, VersionEndpointIdentifiesTheServerComponent) {
