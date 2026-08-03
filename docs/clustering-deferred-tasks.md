@@ -50,7 +50,13 @@ Production blockers take priority and are authoritative in
   merge order.
 - [ ] Public session and bounded-staleness read tokens after end-to-end API and
   partition tests.
-- [ ] Certificate rotation without a cluster restart.
+- [x] Certificate rotation without a cluster restart. Credentials reload on a
+  one-node restart; the bounded mTLS gate replaces one node's key/certificate
+  with a separately issued certificate for the same endpoint SAN. With the
+  other voter deliberately down, the remaining node stays online and commits
+  the exact previously blocked write as soon as the rotated peer returns; the
+  third voter then returns to full health. Runtime hot reload remains optional
+  future work.
 
 ## Operational hardening
 

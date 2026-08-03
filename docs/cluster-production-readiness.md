@@ -262,9 +262,12 @@ inventory and rules.
   changes, and refuse TLS activation if any registered peer lacks a name. A
   bounded three-node live gate converged with three distinct IP identities,
   returned retryable `503` when node 2 presented node 3's otherwise trusted
-  certificate, then committed that exact write after node 2 restored its own
-  certificate. The obsolete `tls_peer_name` config and environment paths are
-  removed rather than retained as aliases.
+  certificate, then committed that exact write after node 2 restarted with a
+  separately issued certificate for its own SAN. The negative arm held the
+  other voter down so node 2 was required for quorum; node 1 stayed online,
+  certificate renewal restored the write without a cluster restart, and the
+  third voter then returned to full health. The obsolete `tls_peer_name` config
+  and environment paths are removed rather than retained as aliases.
 
 ## Remaining production blockers
 

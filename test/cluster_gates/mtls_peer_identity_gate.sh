@@ -28,26 +28,34 @@ mkdir -p "$CERTS" "$ROOT/n1" "$ROOT/n2" "$ROOT/n3"
 
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 -sha256 \
     -subj '/CN=TimeStar test CA' -keyout "$CERTS/ca.key" -out "$CERTS/ca.crt" >/dev/null 2>&1 || exit 2
-for node in 1 2 3; do
-    ip="127.0.0.$((10 + node))"
+
+issue_certificate() { # file stem, endpoint IP
+    local stem="$1" ip="$2"
     openssl req -newkey rsa:2048 -nodes -sha256 -subj "/CN=$ip" \
-        -keyout "$CERTS/n$node.key" -out "$CERTS/n$node.csr" >/dev/null 2>&1 || exit 2
-    openssl x509 -req -in "$CERTS/n$node.csr" -CA "$CERTS/ca.crt" -CAkey "$CERTS/ca.key" \
-        -CAcreateserial -days 1 -sha256 -out "$CERTS/n$node.crt" \
+        -keyout "$CERTS/$stem.key" -out "$CERTS/$stem.csr" >/dev/null 2>&1 || exit 2
+    openssl x509 -req -in "$CERTS/$stem.csr" -CA "$CERTS/ca.crt" -CAkey "$CERTS/ca.key" \
+        -CAcreateserial -days 1 -sha256 -out "$CERTS/$stem.crt" \
         -extfile <(printf 'subjectAltName=IP:%s\nextendedKeyUsage=serverAuth,clientAuth\n' "$ip") \
         >/dev/null 2>&1 || exit 2
-done
+}
 
-start_node() { # logical node, certificate owner (defaults to logical node)
-    local node="$1" cert_node="${2:-$1}" port
+for node in 1 2 3; do
+    issue_certificate "n$node" "127.0.0.$((10 + node))"
+done
+# A separately issued certificate with node 2's exact endpoint identity proves
+# rolling renewal, rather than merely restoring the original private key.
+issue_certificate n2-rotated 127.0.0.12
+
+start_node() { # logical node, certificate stem (defaults to n<logical node>)
+    local node="$1" cert_stem="${2:-n$1}" port
     port=$((19919 + node))
     env $GATE_SERVER_ENV TMPDIR="$ROOT" TIMESTAR_DATA_DIR="$ROOT/n$node" \
         TIMESTAR_CLUSTER_ENABLED=true TIMESTAR_CLUSTER_PARTITIONED=true \
         TIMESTAR_CLUSTER_REPLICATION_FACTOR=3 \
         TIMESTAR_CLUSTER_UUID=11223344556677889900aabbccddeeff \
         TIMESTAR_CLUSTER_NODE_ID="$node" TIMESTAR_CLUSTER_PEERS="$PEERS" \
-        TIMESTAR_CLUSTER_TLS_CERT_FILE="$CERTS/n$cert_node.crt" \
-        TIMESTAR_CLUSTER_TLS_KEY_FILE="$CERTS/n$cert_node.key" \
+        TIMESTAR_CLUSTER_TLS_CERT_FILE="$CERTS/$cert_stem.crt" \
+        TIMESTAR_CLUSTER_TLS_KEY_FILE="$CERTS/$cert_stem.key" \
         TIMESTAR_CLUSTER_TLS_CA_FILE="$CERTS/ca.crt" \
         "$BIN" --port "$port" --smp 1 --memory "$GATE_SERVER_MEMORY" --overprovisioned \
         >>"$ROOT/node${node}.log" 2>&1 &
@@ -82,44 +90,36 @@ assert_eq "matching endpoint identities commit a replicated write" "$BASELINE_CO
 
 echo "=== restart node 2 with node 3's otherwise trusted certificate ==="
 stop_node 2
-start_node 2 3
+start_node 2 n3
 for _ in $(seq 1 60); do
     cluster_status 19921 >/dev/null && break
     sleep 1
 done
 sleep 5
 
-# Roughly one third of these VShards are led by node 2. A correct per-endpoint
-# SAN check makes node 1's data-plane connection to node 2 fail before the RPC;
-# the write router must return bounded retryable 503, never accept the write.
-FAILED_BODY=""
-for i in $(seq 1 80); do
-    body=$(write_body "$i")
-    code=$(write_code "$body" wrong.json)
-    if [ "$code" = 503 ]; then
-        FAILED_BODY="$body"
-        break
-    fi
-done
-if [ -n "$FAILED_BODY" ]; then
-    gate_ok "trusted certificate for the wrong endpoint blocked a real commit with 503"
-else
-    gate_fail "wrong endpoint certificate did not block any of 80 distributed writes"
-fi
+# A restarted voter normally loses leadership to the two uninterrupted voters,
+# so random leader-routed writes need not touch it. Remove node 3 after node 2
+# is back: node 1 must now reach node 2 for a majority. A correct per-endpoint
+# SAN check fails before the RPC and the router must return bounded retryable
+# 503, never acknowledge the write.
+stop_node 3
+FAILED_BODY=$(write_body 1)
+FAILED_CODE=$(write_code "$FAILED_BODY" wrong.json)
+assert_eq "wrong endpoint identity with the other voter down blocks commit" "$FAILED_CODE" 503
 
-echo "=== restore node 2's endpoint certificate and retry the exact write ==="
+echo "=== roll node 2 to a newly issued certificate and retry the exact write ==="
 stop_node 2
-start_node 2 2
+start_node 2 n2-rotated
 RECOVERED_CODE=000
-if [ -n "$FAILED_BODY" ]; then
-    for _ in $(seq 1 60); do
-        RECOVERED_CODE=$(write_code "$FAILED_BODY" recovered.json)
-        [ "$RECOVERED_CODE" = 200 ] && break
-        sleep 1
-    done
-    assert_eq "correct endpoint identity restores the blocked commit" "$RECOVERED_CODE" 200
-else
-    gate_fail "recovery check has no blocked write to retry"
-fi
+for _ in $(seq 1 60); do
+    RECOVERED_CODE=$(write_code "$FAILED_BODY" recovered.json)
+    [ "$RECOVERED_CODE" = 200 ] && break
+    sleep 1
+done
+assert_eq "rotated certificate with the correct identity restores the blocked commit" "$RECOVERED_CODE" 200
+
+echo "=== restart the other voter and restore full health ==="
+start_node 3
+wait_healthy "$PORTS" 60 || gate_exit
 
 gate_exit

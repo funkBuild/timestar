@@ -17,6 +17,13 @@ Plaintext replicated transport is available only through
 production. The obsolete best-effort static full-replication mode remains an
 explicitly quarantined demo and does not inherit these RF&gt;1 guarantees.
 
+Rotate a node certificate by issuing a replacement from the existing cluster
+CA with the same DNS/IP SAN, updating that node's protected certificate/key
+files, and restarting only that node. Wait for it to recover before rotating
+the next node. Runtime credential hot reload is not implemented; replacing the
+CA requires an explicitly planned trust-overlap ceremony and is not yet a
+documented production operation.
+
 The server is still designed to run behind a reverse proxy for client TLS,
 rate-limiting, network policy, and stronger authentication/authorization.
 
