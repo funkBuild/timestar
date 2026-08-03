@@ -213,17 +213,49 @@ inventory and rules.
   exact deletes to one RF=3 VShard, crossing its 1,024-receipt capacity on all
   replicas. Every replica stayed at exactly 1,024 receipts; the replicated
   capacity floor advanced once at the first eviction and again through all 76
-  evictions; an evicted retry returned the stable expired `409` while
-  the newest retained retry remained an idempotent `200`. All three replicas
+  evictions; four real seed points became exactly three on every node, proving
+  the canonical exact-series delete changed data rather than merely recording
+  a receipt. An evicted retry returned the stable expired `409` while the newest
+  retained retry remained an idempotent `200`. All three replicas
   snapshotted through the retirement entry, reported no retirement awaiting a
   snapshot, and reclaimed at least one sealed production-sized private journal
   segment. The gate also exposed and fixed a sidecar-lifetime leak: ordinary
   Raft syncs no longer forget the current durable sidecar, and a replacement is
   unlinked after its new descriptor is durable even if another Raft owner still
-  holds the old handle. With 5, 1, and 2 snapshots taken by the replicas, each
-  VShard directory retained exactly one current canonical v1 sidecar. The three
-  one-reactor, 1-GiB nodes used about 360 MiB aggregate RSS during the sampled
-  run, and all 108 MiB of gate roots were removed afterward.
+  holds the old handle. The corrected run took 7, 4, and 4 snapshots and deleted
+  387, 2, and 2 sealed journal segments respectively; each VShard directory
+  retained exactly one current canonical v1 sidecar. The three one-reactor,
+  1-GiB nodes started at about 108--110 MiB RSS each, and the gate removed its
+  repository-local roots afterward.
+- [x] Close the bounded empty-node and compacted-restart storage blockers. The
+  first empty-root run exposed two independent production defects: automatic
+  leadership transfer flooded a recovering voter, and fire-and-forget Raft RPC
+  futures accumulated without outbound admission until a 1-GiB Seastar node
+  threw `std::bad_alloc`. Periodic balancing is now jittered and limited to 32
+  transfers per node, requires exact target log match, pauses for leaderless or
+  live-behind recovery, and observes a 30-second recovery quiet period. Raft
+  transport now has one v1 delivery verb, always encoded as a per-peer batch
+  frame even for one envelope, and admits at most 256 unresolved frames and 64
+  MiB of encoded outbound data. There is no scalar fallback or negotiation
+  branch. Registry tick order rotates so a bounded queue cannot permanently
+  favor low VShard IDs. Separate real-socket tests exercise both admission
+  bounds. The gate also corrected a documented exact
+  series key from the invalid dot form to canonical
+  `measurement,tag=value field`, then proved the delete on a survivor before
+  restart so a successful no-op can no longer satisfy it.
+- [x] Run both bounded storage gates on the resulting candidate. On 2026-08-03,
+  `restart_catchup_gate.sh` removed node 3's complete durable root, compacted the
+  same non-empty VShard 1738 snapshot on both survivors, acknowledged 104
+  writes, applied one post-snapshot exact delete, installed the snapshot into
+  the empty node, caught up its retained suffix, and read exactly 103 points.
+  A final rerun through the single v1 batch verb sent 18 chunks, abandoned only
+  two bounded attempts, returned no undeliverable snapshot, no 500, and crashed
+  no process; the preceding resource sample was about 233 MiB on the recovering
+  node and 120--125 MiB per donor. `snapshot_durability_gate.sh` then forced a
+  non-empty snapshot on all replicas, killed all three processes, recovered
+  three compacted journals, and read all 128 acknowledged points exactly once
+  from every node. Both gates used one reactor and 1 GiB per process, stored all
+  artifacts under `build/tmp`, and removed their data roots on exit.
 
 ## Remaining production blockers
 
@@ -237,9 +269,10 @@ evidence below.
 
 ### P1 — bounded operation and live evidence
 
-- [ ] **Rerun empty-node catch-up and snapshot durability gates on the final
-  candidate.** Each process must use an explicit memory budget; tests run one at
-  a time and must prove the returning node's durable root was actually absent.
+- [x] **Rerun empty-node catch-up and snapshot durability gates on the bounded
+  candidate.** The exact assertions and resource observations are recorded in
+  the completed evidence above. The final release-commit battery remains a P2
+  release step, not an unresolved storage implementation blocker.
 - [x] **Run the homogeneous-v1 rejection gate.** The 2026-08-03 bounded run
   passed six current-format codec checks and a real-socket data-plane test in
   both directions: an unsupported handshake applied no state, and a production

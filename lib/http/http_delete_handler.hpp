@@ -54,7 +54,7 @@ struct glz::meta<timestar::http::GlazeDeleteRequest> {
  *
  * Delete by series key:
  * {
- *   "series": "temperature,location=us-west.value",
+ *   "series": "temperature,location=us-west value",
  *   "startTime": 1465839830100400200,  // nanoseconds since epoch
  *   "endTime": 1465839930100400200     // nanoseconds since epoch
  * }

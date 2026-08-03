@@ -123,10 +123,19 @@ using timestar::raft::NodeId;
 inline constexpr LogIndex kMaxTransferLagEntries = 64;
 
 inline bool transferrableTo(LogIndex lastIndex, LogIndex matchIndex, uint64_t ticksSinceAck,
-                            uint64_t heartbeatTimeout) {
-    const bool caughtUp = matchIndex >= lastIndex || (lastIndex - matchIndex) <= kMaxTransferLagEntries;
+                            uint64_t heartbeatTimeout, bool requireExactMatch = false) {
+    const LogIndex maxLagEntries = requireExactMatch ? 0 : kMaxTransferLagEntries;
+    const bool caughtUp = matchIndex >= lastIndex || (lastIndex - matchIndex) <= maxLagEntries;
     const bool live = ticksSinceAck <= heartbeatTimeout;
     return caughtUp && live;
+}
+
+// A live peer that is still behind is recovering and automatic leadership
+// movement must yield to it. A dead peer must not freeze balancing among the
+// surviving quorum; liveness filtering already prevents selecting it.
+inline bool automaticBalancePeerReady(LogIndex lastIndex, LogIndex matchIndex, uint64_t ticksSinceAck,
+                                      uint64_t heartbeatTimeout) {
+    return ticksSinceAck > heartbeatTimeout || matchIndex >= lastIndex;
 }
 
 // A FAIR SHARE IS A SUM OF 1/|voters| IN DOUBLE, AND MUST BE CONSUMED WITH A TOLERANCE.

@@ -30,7 +30,8 @@
 // the balancer could be changed, or the bound retuned, with every test here still green:
 // the copy would have kept pinning the OLD rule and nothing pinned the new one. The
 // predicate is now a pure scalar function in lib/cluster/data/leadership_balance.hpp
-// taking exactly what it reads (lastIndex, matchIndex, ticksSinceAck, heartbeatTimeout);
+// taking what it reads (lastIndex, matchIndex, ticksSinceAck, heartbeatTimeout) plus the
+// automatic balancer's exact-match mode;
 // `ShardRaftPlane::transferrableTo` is a RaftGroup adapter over it and nothing else, which
 // the last test in this file asserts -- one implementation is what makes calling it here
 // equivalent to calling it in the balancer.
@@ -175,6 +176,32 @@ TEST(RaftPeerLivenessTest, APeerFarBehindIsExcludedByTheLagBound) {
 
     EXPECT_EQ(leader.ticksSinceAck(2), 0u) << "still live";
     EXPECT_FALSE(isTransferTarget(leader, 2)) << "200 entries behind is past the 64-entry bound";
+}
+
+TEST(RaftPeerLivenessTest, AutomaticRecoveryRequiresAnExactMatch) {
+    RaftNode leader = makeLeader({1, 2, 3});
+    ackFully(leader, 2);
+    ASSERT_TRUE(leader.propose("still-in-flight"));
+    ASSERT_LT(leader.matchIndexOf(2), leader.log().lastIndex());
+
+    EXPECT_TRUE(isTransferTarget(leader, 2))
+        << "the operator path retains its bounded live-write tolerance";
+    EXPECT_FALSE(timestar::data::transferrableTo(
+        leader.log().lastIndex(), leader.matchIndexOf(2), leader.ticksSinceAck(2), leader.heartbeatTimeout(), true))
+        << "automatic balancing must not race a recovering replica's remaining log";
+
+    ackFully(leader, 2);
+    EXPECT_TRUE(timestar::data::transferrableTo(
+        leader.log().lastIndex(), leader.matchIndexOf(2), leader.ticksSinceAck(2), leader.heartbeatTimeout(), true));
+}
+
+TEST(RaftPeerLivenessTest, AutomaticBalanceYieldsOnlyToLiveRecoveringPeers) {
+    EXPECT_FALSE(timestar::data::automaticBalancePeerReady(10, 9, 0, 2))
+        << "a live behind voter must finish recovery before automatic movement";
+    EXPECT_TRUE(timestar::data::automaticBalancePeerReady(10, 9, 3, 2))
+        << "a dead voter must not freeze balancing among its surviving quorum";
+    EXPECT_TRUE(timestar::data::automaticBalancePeerReady(10, 10, 0, 2))
+        << "an exact live voter is ready";
 }
 
 TEST(RaftPeerLivenessTest, TheLagBoundIsExactlyKMaxTransferLagEntries) {

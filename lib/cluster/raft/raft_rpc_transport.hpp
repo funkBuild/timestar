@@ -71,14 +71,10 @@ public:
         uint64_t bytesSent = 0;
         uint64_t envelopesRecv = 0;
         uint64_t framesRecv = 0;
-        uint64_t dropped = 0;  // no known peer, or inside a reconnect backoff
+        uint64_t dropped = 0;  // no peer, reconnect backoff, or outbound admission bound
+        uint64_t backpressured = 0;  // outbound envelopes dropped at the frame/byte bound
     };
     [[nodiscard]] Stats stats() const;
-
-    // Test seam: force the pre-5a behaviour (one envelope per frame) regardless of what
-    // the peer supports. Not a production knob -- it exists so a test can prove the
-    // batched and unbatched paths deliver the same thing.
-    void setBatchingEnabled(bool enabled);
 
 private:
     struct Impl;

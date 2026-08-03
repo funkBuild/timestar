@@ -11,26 +11,28 @@ not probes, so they can be run from CI or a release checklist.
 | `skewed_rebalance_gate.sh` | the same, under a SKEWED load — 40 series, so the whole campaign lands on ~1% of the 4096 groups and those groups are continuously mid-append while the balancer storms (debt D-18). The concentration is MEASURED per VShard, from the per-VShard journal sizes, so the gate cannot silently decay into a copy of the rolling one |
 | `backpressure_gate.sh` | the per-shard in-flight write bound degrades to 503 + `Retry-After`, never to 500s or timeouts, and the DEFAULT budget never gets in the way |
 | `fault_injection_gate.sh` | a BURST of TCP connection resets between two live nodes costs latency, not client errors, and loses/duplicates nothing (write-scaleout 4c) |
-| `restart_catchup_gate.sh` | a follower whose entire data directory is removed while DOWN catches up through chunked snapshots plus the retained suffix, then preserves live and exactly deleted probes (write-scaleout 5.4 / CR-FIX-011) |
+| `restart_catchup_gate.sh` | a follower whose entire durable root is removed while DOWN catches up through a non-empty chunked snapshot plus the retained suffix, then reads an exact delete correctly; it also bounds transfer abandonment, server RSS, and crashes (write-scaleout 5.4 / CR-FIX-011) |
 | `combined_fault_rebalance_gate.sh` | **(debt D-19)** TCP resets **and** a leadership rebalance **and** 4x the connections, all at once — the faults a single-fault gate cannot compose. It is `fault_injection_gate.sh` in combined mode, not a copy. Its finding: under the reset storm `transfers_initiated` collapses to ~0 because D-1's liveness filter refuses the peer behind the fault |
 | `fault_injection_ab.sh` | **(expensive, on-demand — not a CI gate)** that `fault_injection_gate.sh` DISCRIMINATES: builds the 4a-reverted binary and asserts it fails the same storm HEAD passes |
 | `node_kill_round.sh` | `kill -9` of one node MID-BENCH: no 500s, no crashes, every ACKED write readable afterwards on both survivors — and it prints the one-node-down 503 band (debt D-14), which stays advisory |
-| `snapshot_durability_gate.sh` | TAKING SNAPSHOTS DOES NOT COST DURABILITY (debt D-6): under a light load, every acked point is readable after the whole cluster is `kill -9`'d and restarted OVER COMPACTED JOURNALS; the heavy-load A/B is advisory |
+| `snapshot_durability_gate.sh` | TAKING SNAPSHOTS DOES NOT COST DURABILITY (debt D-6): a focused hot VShard is snapshotted on every replica, then every acked point is readable exactly once after the whole cluster is `kill -9`'d and restarted OVER COMPACTED JOURNALS |
 | `restart_readback_gate.sh` | AN ACKED WRITE IS READABLE AFTER A RESTART THAT FOLLOWS A HEAVY CAMPAIGN (debt D-36). It re-reads REPEATEDLY, which is the whole point: a single read cannot tell 25 lost points from 25 durable ones that apply() has not reached, and that ambiguity is what left D-36 undetermined for a session. A count that climbs is a stall; one that stays flat is loss. Reports `apply_lag_entries` / `apply_failures` / `tick_errors` while it waits |
 | `topology_mutation_gate.sh` | the authenticated production Group-0 routes move one non-vacuous VShard away and back twice under sustained unique writes, recover crashes after Engine-generation deletion and journal quarantine, reclaim an expired exact-v1 journal, rematerialize deleted storage from survivors, and reject unauthenticated drain or premature removal without losing or duplicating a contribution |
 | `retention_failover_gate.sh` | exact-version clustered retention policy CRUD and tombstone recreation, a controller kill after durable partial fan-out, completion of one global cutoff sequence across all 4,096 VShards by a new Group-0 leader, measurement isolation, and old-controller restart recovery |
 | `pattern_delete_failover_gate.sh` | an ambiguous coordinator crash only after another Group-0 voter applies a complete 6,000-target frozen plan, exact retry under a new leader without capturing a newly matching series, changed-body conflict, and killed-node restart recovery |
 | `large_snapshot_streaming_gate.sh` | an exact-v1 snapshot of 128 MiB + 1 byte crosses leader hydration, v1 Raft framing and receiver disk staging in chunks no larger than 4 MiB, with a 1 GiB process limit and all temporary data under `build/tmp` |
-| `delete_receipt_retirement_gate.sh` | sustained exact deletes cross the 1,024-receipt per-VShard capacity on every replica, advance the replicated retirement floor twice, preserve expired/retained retry outcomes, become snapshot-covered, reclaim production-sized sealed v1 journal segments, and retain only the current snapshot sidecar |
+| `delete_receipt_retirement_gate.sh` | a real canonical exact delete changes four seed points to three on every node, then sustained deletes cross the 1,024-receipt per-VShard capacity on every replica, advance the replicated retirement floor twice, preserve expired/retained retry outcomes, become snapshot-covered, reclaim production-sized sealed v1 journal segments, and retain only the current snapshot sidecar |
 | `homogeneous_v1_rejection_gate.sh` | exact-v1 codec and real-socket handshake rejection, plus a production restart over a real acknowledged WAL whose version field is changed to an unsupported value; startup must exit before HTTP and preserve the source byte-for-byte |
 
 All of them take an optional server binary as `$1` (default
 `build/bin/timestar_http_server`), so a "before" binary can be measured the same way.
 Every node also receives an explicit `--memory` budget: 8 GiB by default,
-overrideable with `GATE_SERVER_MEMORY`. This is a per-process limit, so size the
-aggregate as `node count * GATE_SERVER_MEMORY`; leaving it implicit lets every
-Seastar process size itself from the whole host and can overcommit a multi-node
-gate before the property under test is reached.
+overrideable with `GATE_SERVER_MEMORY`. The low-volume `restart_catchup`,
+`snapshot_durability`, topology, retention, pattern-delete, receipt-retirement,
+and homogeneous-v1 gates pin 1 GiB per process. This is a per-process limit, so
+size the aggregate as `node count * GATE_SERVER_MEMORY`; leaving it implicit
+lets every Seastar process size itself from the whole host and can overcommit a
+multi-node gate before the property under test is reached.
 
 `topology_mutation_gate.sh` is a low-volume correctness gate and deliberately
 pins a smaller 1 GiB per-process default (4 GiB aggregate). Its four durable
@@ -88,7 +90,7 @@ than a slow bench — /tmp here is a tmpfs with a per-user quota, and exhausting
 "Disk quota exceeded" in EVERY process on the box, including the shell driving the gate.
 One session lost its whole harness that way mid-run.
 
-The tail of each node log is copied to `/tmp/tsgate_<prefix>_tails.log` before the delete,
+The tail of each node log is copied to `build/tmp/tsgate_<prefix>_tails.log` before the delete,
 so a failed run is still diagnosable; `GATE_KEEP_DATA=1` keeps everything when it is not.
 Check `df -h /tmp` and `ls -d /tmp/tsgate_*` before and after a run anyway — a gate killed
 between its `mkdir` and its trap leaves dirs behind.
@@ -111,14 +113,15 @@ runs K+1 benches against ONE cluster and nothing is deleted between them, which 
 bench size came DOWN when it went to K storms (see its `BENCH_BATCHES` note): its measured
 peak is 27 G of the 62 G tmpfs.
 
-`restart_catchup_gate.sh` is a REGRESSION FENCE, and it says so in its own header: the
-pre-5.4 binary passes it, because at 400 batches the log tail still fits under the old
-1 GiB admission bound. What it fences is the 8x-tightened 128 MiB bound. Its client-error
-count is ADVISORY for a measured reason -- writing to a 3-node RF=3 cluster with one node
-down produces 50-201 of 400 bounded 503s, and the pre-Phase-5 binary produces 111/400, so
-the number cannot credit or blame a change. That defect (every rejection on the
-COORDINATOR, none on the node actually holding leadership -- i.e. leader RESOLUTION, not
-consensus) is filed in the plan doc's Phase 5 outcome.
+`restart_catchup_gate.sh` is now a focused correctness and resource gate. It
+uses 96 awaited hot-series prefix writes to force the same non-empty VShard
+snapshot on both surviving donors, appends one exact delete and eight retained
+suffix writes, then starts a voter from a verified empty root. It requires
+snapshot installation, exact all-group catch-up, 103-point readback, bounded
+abandonment, zero undeliverable snapshots/500s/crashes, and keeps all roots,
+responses, logs, and process temporaries under `build/tmp`. This shape replaced
+the old four-million-point campaign that could consume tens of GiB without
+proving the returning root was empty.
 
 ## Running a gate against a FLAGGED server: `GATE_SERVER_ENV`
 
@@ -202,9 +205,9 @@ cannot reintroduce the race.
 | `deposed_primary_gate.sh` | 19310-19314 | 20310-20314 | 21310-21314 | `1931` | `/tmp/tsgate_dp*` |
 | `fault_injection_gate.sh` | 19410-19412 | 20410-20412 | 21410-21412 | `1941` | `/tmp/tsgate_fi*` |
 | `combined_fault_rebalance_gate.sh` | (runs `fault_injection_gate.sh` in combined mode — same ports, dirs and prefix; never run both at once) |||||
-| `restart_catchup_gate.sh` | 19510-19512 | 20510-20512 | 21510-21512 | `1951` | `/tmp/tsgate_cu*` |
+| `restart_catchup_gate.sh` | 19510-19512 | 20510-20512 | 21510-21512 | `1951` | `build/tmp/tsgate_cu*` |
 | `node_kill_round.sh` | 19610-19612 | 20610-20612 | 21610-21612 | `1961` | `/tmp/tsgate_nk*` |
-| `snapshot_durability_gate.sh` | 19710-19712 | 20710-20712 | 21710-21712 | `1971` | `/tmp/tsgate_sd*` |
+| `snapshot_durability_gate.sh` | 19710-19712 | 20710-20712 | 21710-21712 | `1971` | `build/tmp/tsgate_sd*` |
 | `restart_readback_gate.sh` | 19730-19732 | 20730-20732 | 21730-21732 | `1973` | `/tmp/tsgate_rr*` |
 | `topology_mutation_gate.sh` | 19810-19813 | 20810-20813 | 21810-21813 | `1981` | `build/tmp/tsgate_tm*` |
 | `retention_failover_gate.sh` | 19830-19832 | 20830-20832 | 21830-21832 | `1983` | `build/tmp/tsgate_rt*` |

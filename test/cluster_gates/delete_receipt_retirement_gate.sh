@@ -85,7 +85,7 @@ wait_leadership_settled "$PORTS" 40 || gate_exit
 # while making every replicated delete large enough to rotate real journals.
 printf -v MEASUREMENT '%*s' 2000 ''
 MEASUREMENT=${MEASUREMENT// /r}
-SERIES_KEY="$MEASUREMENT,host=receipt.value"
+SERIES_KEY="$MEASUREMENT,host=receipt value"
 POINT_TS=1700000000000000000
 WRITE_BODY="{\"measurement\":\"$MEASUREMENT\",\"tags\":{\"host\":\"receipt\"},\"fields\":{\"value\":1.0},\"timestamp\":$POINT_TS}"
 
@@ -127,7 +127,7 @@ run_delete_wave() { # first last
                 -H "Idempotency-Key: $key" -H "Idempotency-Key-Timestamp: $issued" \
                 -d "$DELETE_BODY")
             [ "$code" = 200 ] && break
-            if [ "$code" != 503 ]; then break; fi
+            case "$code" in 000|503) ;; *) break ;; esac
             RETRYABLE_DELETE_RESPONSES=$((RETRYABLE_DELETE_RESPONSES + 1))
             sleep 0.1
         done
@@ -185,6 +185,24 @@ receipt_census() {
 
 echo "=== drive the first capacity-crossing delete wave ==="
 run_delete_wave 1 "$FIRST_WAVE" || gate_exit
+
+# Four seed points were written and every receipt targets only POINT_TS. Prove
+# the canonical raw-series key erased that real point; receipt accounting alone
+# also advances for a syntactically valid no-op target.
+DELETE_READBACK_OK=0
+for _ in $(seq 1 30); do
+    DELETE_READBACK_OK=1
+    for p in $PORTS; do
+        response=$(curl -sS -m20 -X POST "http://127.0.0.1:$p/query" -H 'Content-Type: application/json' \
+            -d "{\"query\":\"count:$MEASUREMENT(value){host:receipt}\",\"startTime\":$((POINT_TS - 1)),\"endTime\":$((POINT_TS + 4))}")
+        count=$(printf '%s' "$response" | grep -o '"point_count":[0-9]*' | head -1 | cut -d: -f2)
+        [ "${count:-0}" -eq 3 ] || DELETE_READBACK_OK=0
+    done
+    [ "$DELETE_READBACK_OK" = 1 ] && break
+    sleep 1
+done
+assert_eq "exact raw-series delete removed one real seed point on every node" "$DELETE_READBACK_OK" 1
+
 FIRST_CAPACITY_FLOOR=$((BASE_MS + 1))
 for _ in $(seq 1 60); do
     receipt_census && [ "$CENSUS_MIN_FLOOR" -ge "$FIRST_CAPACITY_FLOOR" ] && \

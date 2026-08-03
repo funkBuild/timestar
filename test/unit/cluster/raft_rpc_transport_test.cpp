@@ -17,6 +17,7 @@
 #include <seastar/core/sleep.hh>
 #include <seastar/net/socket_defs.hh>
 #include <seastar/rpc/rpc.hh>
+#include <seastar/util/later.hh>
 #include <vector>
 
 using namespace timestar::raft;
@@ -191,19 +192,18 @@ seastar::future<> testPeerAddressChangeRetiresCachedConnection() {
 //
 // Many groups' messages to the same peer, produced in one reactor task, must arrive
 // intact AND must not each pay for their own RPC frame.
-seastar::future<> testBatchedDelivery(bool batchingEnabled) {
+seastar::future<> testBatchedDelivery() {
     auto sender = std::make_unique<RaftRpcTransport>();
     auto receiver = std::make_unique<RaftRpcTransport>();
     std::vector<Envelope> received;
 
-    const uint16_t rxPort = batchingEnabled ? 39160 : 39162;
-    const uint16_t txPort = batchingEnabled ? 39161 : 39163;
+    constexpr uint16_t rxPort = 39160;
+    constexpr uint16_t txPort = 39161;
     co_await receiver->start(loopback(rxPort), [&](Envelope e) {
         received.push_back(std::move(e));
         return seastar::make_ready_future<>();
     });
     co_await sender->start(loopback(txPort), [](Envelope) { return seastar::make_ready_future<>(); });
-    sender->setBatchingEnabled(batchingEnabled);  // OFF by default since Phase 5; see the header
     sender->addPeer(2, loopback(rxPort));
 
     // First send opens the connection before the burst.
@@ -237,17 +237,10 @@ seastar::future<> testBatchedDelivery(bool batchingEnabled) {
 
     const auto s = sender->stats();
     EXPECT_EQ(s.envelopesSent, static_cast<uint64_t>(kGroups + 1));
-    if (batchingEnabled) {
-        // THE MEASUREMENT 5a exists for. 65 envelopes must not cost 65 frames.
-        EXPECT_LT(s.framesSent, static_cast<uint64_t>(kGroups))
-            << "batching did not take: " << s.envelopesSent << " envelopes in " << s.framesSent << " frames";
-        EXPECT_EQ(receiver->stats().envelopesRecv, s.envelopesSent);
-    } else {
-        // The control: with batching off it is exactly one frame per envelope, which is
-        // what the transport did before 5a -- so the assertion above is measuring the
-        // change and not the harness.
-        EXPECT_EQ(s.framesSent, s.envelopesSent);
-    }
+    // THE MEASUREMENT 5a exists for. 65 envelopes must not cost 65 frames.
+    EXPECT_LT(s.framesSent, static_cast<uint64_t>(kGroups))
+        << "batching did not take: " << s.envelopesSent << " envelopes in " << s.framesSent << " frames";
+    EXPECT_EQ(receiver->stats().envelopesRecv, s.envelopesSent);
 
     co_await sender->stop();
     co_await receiver->stop();
@@ -304,7 +297,6 @@ seastar::future<> testBatchDispatchIsPerGroupOrderedAndCrossGroupConcurrent() {
     });
 
     co_await sender->start(loopback(kTxPort), [](Envelope) { return seastar::make_ready_future<>(); });
-    sender->setBatchingEnabled(true);
     sender->addPeer(2, loopback(kRxPort));
 
     // Open the connection before the measured burst.
@@ -358,6 +350,66 @@ seastar::future<> testBatchDispatchIsPerGroupOrderedAndCrossGroupConcurrent() {
     co_await receiver->stop();
 }
 
+seastar::future<> testOutboundSendAdmissionIsBounded() {
+    auto sink = seastar::listen(loopback(39170));
+    auto sender = std::make_unique<RaftRpcTransport>();
+    co_await sender->start(loopback(39169), [](Envelope) { return seastar::make_ready_future<>(); });
+    sender->addPeer(2, loopback(39170));
+
+    constexpr int kMessages = 1024;
+    for (int i = 0; i < kMessages; ++i) {
+        Envelope env;
+        env.groupId = static_cast<uint16_t>(i);
+        env.message = Message{.to = 2, .from = 1, .payload = RequestVote{false, 7, 1, 0, 0}};
+        co_await sender->send(std::move(env));
+        // Let the one v1 batch flush as a one-envelope frame while the local
+        // non-reading socket keeps every RPC send unresolved.
+        co_await seastar::yield();
+    }
+
+    const auto stats = sender->stats();
+    EXPECT_GT(stats.backpressured, 0u)
+        << "all 1024 unresolved sends were admitted; outbound task memory is unbounded";
+    EXPECT_LT(stats.framesSent, static_cast<uint64_t>(kMessages));
+    EXPECT_GE(stats.dropped, stats.backpressured);
+    co_await sender->stop();
+    sink.abort_accept();
+}
+
+seastar::future<> testOutboundSendByteAdmissionIsBounded() {
+    // A local TCP listener that never accepts or reads keeps the RPC connection
+    // unresolved without depending on external routing behavior.
+    auto sink = seastar::listen(loopback(39172));
+    auto sender = std::make_unique<RaftRpcTransport>();
+    co_await sender->start(loopback(39171), [](Envelope) { return seastar::make_ready_future<>(); });
+    sender->addPeer(2, loopback(39172));
+
+    constexpr int kMessages = 40;
+    constexpr size_t kPayloadBytes = 2 * 1024 * 1024;
+    for (int i = 0; i < kMessages; ++i) {
+        InstallSnapshot snap;
+        snap.term = 7;
+        snap.leaderId = 1;
+        snap.lastIncludedIndex = 10;
+        snap.lastIncludedTerm = 6;
+        snap.data.assign(kPayloadBytes, 's');
+        snap.totalBytes = kPayloadBytes;
+
+        Envelope env;
+        env.groupId = static_cast<uint16_t>(i);
+        env.message = Message{.to = 2, .from = 1, .payload = std::move(snap)};
+        co_await sender->send(std::move(env));
+    }
+
+    const auto stats = sender->stats();
+    EXPECT_GT(stats.backpressured, 0u)
+        << "forty 2-MiB unresolved frames were admitted; outbound encoded bytes are unbounded";
+    EXPECT_LT(stats.framesSent, static_cast<uint64_t>(kMessages));
+    EXPECT_GE(stats.dropped, stats.backpressured);
+    co_await sender->stop();
+    sink.abort_accept();
+}
+
 }  // namespace
 
 TEST(RaftRpcTransportTest, LoopbackDelivery) {
@@ -369,11 +421,7 @@ TEST(RaftRpcTransportTest, PeerAddressChangeRetiresTheCachedConnection) {
 }
 
 TEST(RaftRpcTransportTest, ManyGroupMessagesToOnePeerShareFrames) {
-    testBatchedDelivery(/*batchingEnabled=*/true).get();
-}
-
-TEST(RaftRpcTransportTest, BatchingOffIsOneFramePerEnvelope) {
-    testBatchedDelivery(/*batchingEnabled=*/false).get();
+    testBatchedDelivery().get();
 }
 
 TEST(RaftRpcTransportTest, BatchDispatchKeepsGroupOrderAndRunsGroupsConcurrently) {
@@ -382,4 +430,12 @@ TEST(RaftRpcTransportTest, BatchDispatchKeepsGroupOrderAndRunsGroupsConcurrently
 
 TEST(RaftRpcTransportTest, ThreeNodeClusterElectsAndReplicatesOverRpc) {
     testThreeNodeClusterOverRpc().get();
+}
+
+TEST(RaftRpcTransportTest, OutboundSendAdmissionIsBounded) {
+    testOutboundSendAdmissionIsBounded().get();
+}
+
+TEST(RaftRpcTransportTest, OutboundSendByteAdmissionIsBounded) {
+    testOutboundSendByteAdmissionIsBounded().get();
 }

@@ -108,6 +108,7 @@ private:
     unsigned followerSkip_ = 9;  // idle followers tick every 10th pass by default
     uint64_t skippedTicks_ = 0;  // metric: total idle-follower ticks skipped
     uint64_t tickErrors_ = 0;    // metric: ticks that threw (debt D-36)
+    size_t tickStart_ = 0;       // rotating fairness cursor for bounded outbound admission
     bool ticking_ = false;       // guards against overlapping tick passes
     bool stopping_ = false;
 };

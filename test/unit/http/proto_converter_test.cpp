@@ -518,7 +518,7 @@ TEST(ProtoConverterQuery, FormatQueryResponseNaNDoubles) {
 
 TEST(ProtoConverterDelete, ParseSingleDeleteBySeriesKey) {
     ::timestar_pb::DeleteRequest dr;
-    dr.set_series("temperature,location=us-west.value");
+    dr.set_series("temperature,location=us-west value");
     dr.set_start_time(1000ULL);
     dr.set_end_time(2000ULL);
 
@@ -526,7 +526,7 @@ TEST(ProtoConverterDelete, ParseSingleDeleteBySeriesKey) {
     dr.SerializeToString(&bytes);
 
     auto parsed = parseSingleDeleteRequest(bytes.data(), bytes.size());
-    EXPECT_EQ(parsed.seriesKey, "temperature,location=us-west.value");
+    EXPECT_EQ(parsed.seriesKey, "temperature,location=us-west value");
     EXPECT_FALSE(parsed.isStructured);
     EXPECT_EQ(parsed.startTime, 1000ULL);
     EXPECT_EQ(parsed.endTime, 2000ULL);

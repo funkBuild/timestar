@@ -979,9 +979,9 @@ public:
     // pure forward: `raft_peer_liveness_test` used to re-implement the predicate by hand,
     // so the test and the balancer could drift apart while the test kept passing (debt
     // D-23). It now calls the real one, which only works while there is exactly one.
-    static bool transferrableTo(raft::RaftGroup& g, data::NodeId target) {
+    static bool transferrableTo(raft::RaftGroup& g, data::NodeId target, bool requireExactMatch = false) {
         return data::transferrableTo(g.node().log().lastIndex(), g.matchIndexOf(target), g.ticksSinceAck(target),
-                                     g.heartbeatTimeout());
+                                     g.heartbeatTimeout(), requireExactMatch);
     }
 
     // Rebalance leadership among THIS shard's groups. Because assignCore spreads
@@ -996,11 +996,13 @@ public:
     // the D-24 armed-only accounting. What is left here is exactly what needs the live
     // plane: reading the Raft view into a survey, and awaiting the transfer. Keep it that
     // way -- arithmetic that creeps back into this loop is arithmetic nothing pins.
-    seastar::future<size_t> rebalance(size_t maxTransfers, data::NodeId self, std::vector<data::NodeId> peers) {
+    seastar::future<size_t> rebalance(size_t maxTransfers, data::NodeId self, std::vector<data::NodeId> peers,
+                                     bool requireExactMatch = false) {
         if (!plane_ || maxTransfers == 0 || peers.empty())
             co_return 0;  // (planLeadershipBalance refuses these too; this skips the survey)
         auto& host = plane_->host();
         std::vector<data::BalanceGroup> groups;
+        bool recoveringPeer = false;
         for (uint16_t vs = 0; vs < timestar::VIRTUAL_SHARD_COUNT; ++vs) {
             if (shardOwningVShard(vs, dir_.get()) != seastar::this_shard_id())
                 continue;
@@ -1014,8 +1016,36 @@ public:
             const auto& voters = g->node().config().voters;
             if (voters.empty())
                 continue;
+            const data::NodeId leader = host.leaderOf(vs);
+            if (requireExactMatch && leader == self) {
+                const auto last = g->node().log().lastIndex();
+                for (data::NodeId voter : voters) {
+                    if (voter != self && !data::automaticBalancePeerReady(
+                                             last, g->matchIndexOf(voter), g->ticksSinceAck(voter),
+                                             g->heartbeatTimeout())) {
+                        recoveringPeer = true;
+                        break;
+                    }
+                }
+            }
             groups.push_back(
-                data::BalanceGroup{vs, std::vector<data::NodeId>(voters.begin(), voters.end()), host.leaderOf(vs)});
+                data::BalanceGroup{vs, std::vector<data::NodeId>(voters.begin(), voters.end()), leader});
+        }
+
+        // Periodic balancing is background maintenance, not recovery. Starting
+        // another wave while an earlier transfer is still leaderless floods a
+        // returning one-reactor node with elections, delays snapshot acks, and
+        // can keep the cluster oscillating indefinitely. Operator-requested
+        // passes retain their existing behavior. Keep a quiet period after the
+        // last live-behind observation so the newly recovered replica can serve
+        // reads before the first redistribution wave begins.
+        if (requireExactMatch) {
+            const auto now = seastar::lowres_clock::now();
+            if (recoveringPeer)
+                automaticBalanceResumeAt_ = now + std::chrono::seconds(30);
+            if (recoveringPeer || now < automaticBalanceResumeAt_ ||
+                std::any_of(groups.begin(), groups.end(), [](const auto& g) { return g.leader == raft::kNoNode; }))
+                co_return 0;
         }
 
         data::LeadershipBalancePass pass = data::planLeadershipBalance(groups, self, peers, maxTransfers);
@@ -1030,8 +1060,8 @@ public:
             raft::RaftGroup* g = host.group(bg.vshard);
             if (!operation || !g || !g->isLeader())
                 continue;
-            const size_t chosen =
-                pass.chooseTarget(bg.voters, [&](data::NodeId cand) { return transferrableTo(*g, cand); });
+            const size_t chosen = pass.chooseTarget(
+                bg.voters, [&](data::NodeId cand) { return transferrableTo(*g, cand, requireExactMatch); });
             if (chosen == data::LeadershipBalancePass::kNoTarget)
                 continue;  // no peer can take this group right now; try the next one
             // Accounted from the OUT-PARAM rather than from the returned bool, because the
@@ -1100,6 +1130,7 @@ private:
     bool dataRaftOptionsConfigured_ = false;
     bool stopping_ = false;          // set at the top of stop(); see ready()
     uint64_t inboundProposals_ = 0;  // peer proposals served BY THIS SHARD's listener
+    seastar::lowres_clock::time_point automaticBalanceResumeAt_{};
 };
 
 // Publish one committed Group-0 serving map into every live routing view on

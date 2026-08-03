@@ -33,7 +33,7 @@ curl -X POST http://localhost:8086/delete \
   -H "Idempotency-Key: 9f1d73046ce64e719adbc8a11f431b52" \
   -H "Idempotency-Key-Timestamp: ${DELETE_TS_MS}" \
   -d '{
-    "series": "temperature,location=us-west.value",
+    "series": "temperature,location=us-west value",
     "startTime": 1704067200000000000,
     "endTime": 1704153600000000000
   }'
@@ -130,13 +130,14 @@ curl -X POST http://localhost:8086/delete \
 
 ## Delete by Series Key
 
-Use a pre-formatted series key string:
+Use a pre-formatted canonical series key string. The field is separated from
+the measurement and tags by a space: `measurement,tag=value field`.
 
 ```bash
 curl -X POST http://localhost:8086/delete \
   -H "Content-Type: application/json" \
   -d '{
-    "series": "temperature,location=us-west.value",
+    "series": "temperature,location=us-west value",
     "startTime": 1704067200000000000,
     "endTime": 1704153600000000000
   }'
@@ -170,7 +171,7 @@ curl -X POST http://localhost:8086/delete \
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `series` | string | no | Pre-formatted series key |
+| `series` | string | no | Canonical `measurement,tag=value field` series key |
 | `measurement` | string | no | Measurement name (used with structured delete) |
 | `tags` | object | no | Tag filters; omit to match all tags |
 | `field` | string | no | Single field to delete |

@@ -81,6 +81,7 @@ The size chain is compile-time checked:
 | Data-plane inbound memory estimate | 128 MiB per shard |
 | Raft proposal payload | 14 MiB |
 | Raft send including envelope headroom | 18 MiB |
+| Raft outbound unresolved work | 256 frames and 64 MiB per shard |
 | Raft inbound memory estimate | 64 MiB per shard |
 | Snapshot chunk | 4 MiB |
 | Snapshot object I/O buffer | 1 MiB, cooperatively yielded |
@@ -98,9 +99,10 @@ per-group and per-shard budgets.
 
 ## Raft transport
 
-Single-envelope delivery is the default. Optional per-peer batching carries the
-same v1 envelopes and changes only dispatch frequency. It can be enabled with
-`TIMESTAR_RAFT_BATCH_SENDS=1` where syscall/frame rate is the measured bottleneck.
+The one v1 Raft delivery verb uses per-peer batch frames, including for a single
+envelope. Batching keeps 4,096-group heartbeat and recovery work fair under
+bounded outbound admission; there is no retired scalar verb or runtime
+negotiation path.
 
 Snapshot transfer is file-backed, chunked, and paced. Install requests retain
 the exact v1 wire layout and carry offset, total, and completion state; replies
@@ -148,9 +150,11 @@ see [ADR 0005](adr/0005-checkquorum-transfer-bypass.md).
 - [x] Prove exact-v1 fail-closed behavior at codec, real data-plane socket, and
   production restart boundaries, including byte-for-byte preservation of an
   acknowledged WAL carrying an unsupported version.
+- [x] Prove bounded empty-root snapshot install plus retained-log replay and
+  whole-cluster restart over compacted journals with one-reactor, 1-GiB nodes.
 - [ ] Run final same-candidate multi-process gates with explicit per-process
-  memory budgets: node kill, restart catch-up, empty-node snapshot, pattern
-  delete failover/restart, and durability fault injection.
+  memory budgets: node kill, pattern-delete failover/restart, network fault
+  injection, and the final serial release rerun of the completed storage gates.
 - [ ] Measure final multi-host throughput, latency, recovery, and movement SLOs.
 
 ## Acceptance gates

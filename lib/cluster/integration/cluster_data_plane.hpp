@@ -458,7 +458,7 @@ public:
     //
     // This matters in practice: the first node to start wins every election, so a
     // fresh cluster puts ALL write coordination on one node until this runs.
-    seastar::future<size_t> rebalanceLeadership(size_t maxTransfers);
+    seastar::future<size_t> rebalanceLeadership(size_t maxTransfers, bool requireExactMatch = false);
 
     // ProposeSink: a peer forwarded a batch for VShards THIS node leads. Split it by
     // the shard owning each VShard's Raft group and replicate each slice there.

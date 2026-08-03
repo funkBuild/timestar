@@ -1,5 +1,6 @@
 #include "raft_group_registry.hpp"
 
+#include <algorithm>
 #include <seastar/core/coroutine.hh>
 
 namespace timestar::raft {
@@ -89,6 +90,16 @@ seastar::future<> RaftGroupRegistry::tickAll() {
     groups.reserve(groups_.size());
     for (const auto& item : groups_)
         groups.push_back(item);
+    // Do not let ordered-map position become transport priority. Outbound Raft
+    // admission is intentionally bounded, so starting every pass at the lowest
+    // group id would let the same early groups fill it and starve a high-id
+    // catch-up forever. Rotate by about a quarter (plus one to avoid permanent
+    // quadrants) so every region gets early service within a handful of passes.
+    if (!groups.empty()) {
+        tickStart_ %= groups.size();
+        std::rotate(groups.begin(), groups.begin() + tickStart_, groups.end());
+        tickStart_ = (tickStart_ + groups.size() / 4 + 1) % groups.size();
+    }
     for (auto& [gid, g] : groups) {
         if (stopping_)
             co_return;

@@ -8,6 +8,7 @@
 #include "../control/group0_controller.hpp"
 #include "../data/read_routing.hpp"
 #include "../data/write_errors.hpp"
+#include "../reconnect_policy.hpp"
 #include "group0_startup.hpp"
 #include "write_admission.hpp"
 
@@ -30,6 +31,13 @@
 namespace timestar::cluster {
 
 namespace {
+constexpr std::chrono::milliseconds kLeadershipBalanceInterval{5000};
+constexpr unsigned kLeadershipBalanceJitterPercent = 40;
+
+std::chrono::milliseconds nextLeadershipBalanceDelay() {
+    return jitteredDelay(kLeadershipBalanceInterval, kLeadershipBalanceJitterPercent);
+}
+
 // Split "host:port" -> {host, port}; missing port defaults to 8086 (same rule as
 // the M1 gateway). The data-plane listener uses port + kDataPlanePortOffset.
 struct HostPort {
@@ -1942,26 +1950,51 @@ void ClusterDataPlane::startLeadershipBalancer() {
     // A bounded pass every few seconds, split across shards. Without it a fresh
     // cluster leaves ALL leadership on the first node to start (it wins every
     // election), putting all write coordination and leader-reads on one node.
-    static constexpr auto kInterval = std::chrono::seconds(5);
-    static constexpr size_t kBudget = 256;
+    // This is a per-node budget. Two overloaded survivors may both donate to a
+    // returning voter, so the cluster-wide burst is up to twice this at RF=3.
+    // 256 made that 512 simultaneous elections on a single reactor and kept an
+    // idle rejoin oscillating beyond six minutes. Thirty-two caps an RF=3
+    // two-donor wave at 64 elections; the shard-side leaderless precondition
+    // drains each wave before another begins.
+    static constexpr size_t kBudget = 32;
     balanceTimer_.set_callback([this] {
-        if (balanceRunning_ || balanceGate_.is_closed())
-            return;  // never overlap passes
+        if (balanceGate_.is_closed())
+            return;
+        if (balanceRunning_) {
+            // A one-shot timer should not overlap, but preserve progress if a
+            // future scheduling change makes that state reachable.
+            balanceTimer_.arm(nextLeadershipBalanceDelay());
+            return;
+        }
         balanceRunning_ = true;
         // NOT a coroutine lambda: with_gate invokes a TEMPORARY closure, and a
         // coroutine lambda's frame keeps referencing it after destruction (reads freed
         // memory, and the flag never clears so the loop silently dies).
         (void)seastar::with_gate(balanceGate_, [this] {
-            return rebalanceLeadership(kBudget).then_wrapped([this](seastar::future<size_t> f) {
+            // Automatic recovery must not hand leadership to a voter that is
+            // still finishing even a bounded log/snapshot catch-up. The explicit
+            // operator endpoint retains the normal live-write lag tolerance.
+            return rebalanceLeadership(kBudget, true).then_wrapped([this](seastar::future<size_t> f) {
                 f.ignore_ready_future();  // best effort; next tick retries
                 balanceRunning_ = false;
+                if (!balanceGate_.is_closed())
+                    balanceTimer_.arm(nextLeadershipBalanceDelay());
             });
         });
     });
-    balanceTimer_.arm_periodic(kInterval);
+    // Do not put every node on the same five-second grid. After an empty voter
+    // rejoins, both overloaded survivors otherwise launch 256 transfers at the
+    // same instant, then repeat from equally stale surveys. On one reactor that
+    // produced a self-sustaining 250-500-leader oscillation for more than six
+    // minutes on an idle RF=3 cluster. Per-process jitter makes passes
+    // independent, allowing one donor's handoffs to become visible before the
+    // next donor surveys, while retaining the same bounded average cadence.
+    // This is a one-shot timer rearmed after completion so a slow pass cannot
+    // overlap or silently skip its next opportunity.
+    balanceTimer_.arm(nextLeadershipBalanceDelay());
 }
 
-seastar::future<size_t> ClusterDataPlane::rebalanceLeadership(size_t maxTransfers) {
+seastar::future<size_t> ClusterDataPlane::rebalanceLeadership(size_t maxTransfers, bool requireExactMatch) {
     if (!replicated_ || !shardsStarted_ || maxTransfers == 0)
         co_return 0;
     std::vector<data::NodeId> peers;
@@ -1974,8 +2007,9 @@ seastar::future<size_t> ClusterDataPlane::rebalanceLeadership(size_t maxTransfer
     const size_t per = std::max<size_t>(1, maxTransfers / seastar::smp::count);
     size_t total = 0;
     for (unsigned sh = 0; sh < seastar::smp::count; ++sh) {
-        total += co_await shards_.invoke_on(
-            sh, [per, self, peers](ShardRaftPlane& p) { return p.rebalance(per, self, peers); });
+        total += co_await shards_.invoke_on(sh, [per, self, peers, requireExactMatch](ShardRaftPlane& p) {
+            return p.rebalance(per, self, peers, requireExactMatch);
+        });
     }
     co_return total;
 }

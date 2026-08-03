@@ -30,6 +30,9 @@ Production blockers take priority and are authoritative in
   data-plane handshakes are fenced before application verbs, and a production
   restart over an unsupported WAL version exits before serving without
   rewriting the source.
+- [x] Prove empty-node snapshot catch-up plus retained suffix and full-cluster
+  restart over compacted journals with explicit 1-GiB process budgets and
+  repository-local temporary storage.
 - [ ] Run final multi-host topology, security, durability, and SLO gates against
   the exact release candidate.
 
@@ -51,7 +54,7 @@ Production blockers take priority and are authoritative in
 
 - [ ] Replace or quarantine static/demo deployment examples.
 - [ ] Exercise disk-full, directory-sync failure, corrupt artifact, network
-  partition, empty-node catch-up, and restart at every durable boundary.
+  partition, and restart at every remaining durable boundary.
 - [ ] Record supported memory, file-descriptor, snapshot, proposal, journal,
   and background-work budgets.
 - [ ] Publish production runbooks for bootstrap, join, drain, replace, backup,

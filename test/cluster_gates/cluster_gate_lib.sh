@@ -162,7 +162,11 @@ gate_cleanup() {
         echo "  GATE_KEEP_DATA=1: leaving $* in place ($(du -shc "$@" 2>/dev/null | tail -1 | cut -f1))"
         return
     fi
-    local tails="/tmp/tsgate_${prefix}_tails.log" d f
+    # Keep even diagnostic output off the quota-limited /tmp tmpfs. The tails
+    # are small, but a correctness harness should have one storage policy for
+    # all of its own artifacts.
+    mkdir -p "$BUILD_DIR/tmp"
+    local tails="$BUILD_DIR/tmp/tsgate_${prefix}_tails.log" d f
     : >"$tails"
     for d in "$@"; do
         [ -d "$d" ] || continue
