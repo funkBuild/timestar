@@ -25,7 +25,8 @@ not probes, so they can be run from CI or a release checklist.
 | `homogeneous_v1_rejection_gate.sh` | exact-v1 codec and real-socket handshake rejection, plus a production restart over a real acknowledged WAL whose version field is changed to an unsupported value; startup must exit before HTTP and preserve the source byte-for-byte |
 | `mtls_peer_identity_gate.sh` | matching per-peer IP SANs converge and commit; with the other voter down, a certificate signed by the cluster CA for the wrong configured endpoint produces bounded 503, while rolling that node to a newly issued certificate for the correct endpoint commits that exact write and restores full health |
 | `cluster_backup_restore_gate.sh` | an authenticated live export survives Group-0 leader loss, validates all 4,096 exact-v1 units, rejects wrong-key/missing/corrupt/extra artifacts, resumes a killed offline import, requires every prepared voter for release, rejects source authority, restores under fresh identities, and preserves the acknowledged baseline through full-cluster restart |
-| `production_slo_report.sh` | serially runs the node-kill, bounded empty-node catch-up, and skewed-movement gates against one clean candidate, then binds their error-band, recovery, query-latency, snapshot, and movement measurements to the commit, authenticated server and benchmark hashes, resource settings, thresholds, and raw transcripts in one exact-v1 JSON report |
+| `production_slo_report.sh` | serially runs the node-kill, bounded empty-node catch-up, and skewed-movement gates against one clean candidate, then binds their error-band, recovery, query-latency, snapshot, and movement measurements to the commit, authenticated server and benchmark hashes, resource settings, exact-v1 approved-policy identity, thresholds, and raw transcripts in one report |
+| `production_slo_policy.py` | validates a bounded exact-v1 deployment/SLO approval, rejects expired/future/overlong approval, the invalid 4-reactor/1-GiB shape, unbounded driver/catch-up reactors, or thresholds weaker than the local safety envelope, and emits the fixed-order values consumed by the serial collector |
 | `multi_host_candidate_preflight.py` | HTTPS-only read-only preflight for an already deployed production candidate; proves distinct endpoint and inter-node peer hosts/failure domains, one exact clean server revision/cluster UUID/map epoch, the candidate's reactor profile and aggregate proposal budget, complete all-voter RF=3 hosting/leadership, healthy Group 0, and zero apply/durability faults before and after infrastructure fault arms |
 | `multi_host_evidence_bundle.py` | exact-v1 before/after binder for one distinct-host arm; rejects a changed candidate, deployment, cluster, node/peer/failure-domain/map topology, missing per-node logs, reused evidence files, or non-monotonic timestamps, then records bounded streaming SHA-256 identities for both preflights and every required transcript |
 
@@ -65,13 +66,18 @@ The report records both executable paths, revisions, and hashes because the
 driver controls the offered load, error accounting, and readback verification.
 Its report is retained at
 `build/tmp/tsgate_slo_report/report.v1.json`, beside the complete arm logs. The
-local safety defaults are a 50% post-kill write-error ceiling, 30 s for complete
+Local safety defaults are a 50% post-kill write-error ceiling, 30 s for complete
 leader recovery, 2 s for survivor query p99, 360 s for snapshot installation,
 750 s for exact catch-up, 10% retained movement throughput, and 5 s for movement
-batch p99. Set the corresponding
-`GATE_MAX_*` values to the approved deployment SLOs before release
-qualification; the report records the actual thresholds so a relaxed run
-cannot be mistaken for production evidence.
+batch p99. A run without `GATE_SLO_POLICY_FILE` is marked `provisional` and the
+multi-host preflight rejects it. For release qualification, copy
+`production_slo_policy.example.v1.json` to protected release evidence, replace
+every placeholder with an independently approved authority/reference and UTC
+validity window, and set `GATE_SLO_POLICY_FILE` to it. The policy replaces every
+resource/threshold environment seam, may tighten but never relax the safety
+envelope, is hashed before and after the serial run, and is embedded in the
+report. Direct `GATE_MAX_*` overrides are therefore local diagnostics, never
+approval provenance.
 
 `topology_mutation_gate.sh` is a low-volume correctness gate and deliberately
 pins a smaller 1 GiB per-process default (4 GiB aggregate). Its four durable

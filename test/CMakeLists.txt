@@ -157,6 +157,8 @@ add_test(NAME cluster_gate_multi_host_candidate_preflight
     COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/cluster_gates/multi_host_candidate_preflight_test.py)
 add_test(NAME cluster_gate_multi_host_evidence_bundle
     COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/cluster_gates/multi_host_evidence_bundle_test.py)
+add_test(NAME cluster_gate_production_slo_policy
+    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/cluster_gates/production_slo_policy_test.py)
 add_test(NAME cluster_gate_benchmark_result_helpers
     COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/cluster_gates/benchmark_result_lib_test.sh)
 

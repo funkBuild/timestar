@@ -52,6 +52,25 @@ universal capacity recommendation. Replace it only with the exact deployment
 shape whose SLO report is approved. Four reactors at 1 GiB is invalid: it begins
 at the 256-MiB-per-reactor ingest free-memory floor and sheds all writes.
 
+Before release qualification, copy
+`test/cluster_gates/production_slo_policy.example.v1.json` into protected
+release evidence and replace every placeholder with the approved policy name,
+authority, change/release reference, and UTC validity window of at most 366
+days. The deployment shape must be the one that will ship; thresholds may be
+stricter but cannot be weaker than the repository's bounded safety envelope.
+Validate and use it as follows:
+
+```sh
+python3 test/cluster_gates/production_slo_policy.py \
+  --policy /protected/timestar-production-slo.v1.json
+GATE_SLO_POLICY_FILE=/protected/timestar-production-slo.v1.json \
+  test/cluster_gates/production_slo_report.sh
+```
+
+Without `GATE_SLO_POLICY_FILE`, the collector remains useful as a local
+regression but marks its report `provisional`. The distinct-host preflight
+rejects provisional, expired, hash-mismatched, or policy-divergent reports.
+
 Replicated transport listens on HTTP port + 1000 for data RPC and HTTP port +
 2000 for Raft RPC. Permit those ports only between cluster nodes. The
 certificate SAN must match that node's configured address; a certificate valid

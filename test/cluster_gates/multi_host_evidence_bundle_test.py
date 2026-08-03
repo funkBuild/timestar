@@ -16,6 +16,7 @@ def report(timestamp: str) -> dict:
     value.pop("expected_server_smp")
     source = preflight_test.candidate_report()
     value["candidate"] = copy.deepcopy(source["candidate"])
+    value["slo_policy"] = copy.deepcopy(source["slo_policy"])
     value["expected_deployment"] = {
         "server_smp": source["settings"]["high_volume_server_smp"],
         "server_memory_per_process": source["settings"]["high_volume_server_memory_per_process"],

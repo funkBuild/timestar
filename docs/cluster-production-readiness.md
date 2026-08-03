@@ -465,8 +465,13 @@ integrity. Production remains blocked on the P1 evidence below.
   arm observed a server 500 or crash. The later `1e76f1d` commit changes only
   gates and documentation; its bounded deterministic retry-pacing
   counterfactual failed both required invariants while HEAD passed both. Local
-  implementation qualification is therefore complete. Approved thresholds and
-  distinct-host deployment evidence remain open release work.
+  implementation qualification is therefore complete. The collector now marks
+  default runs provisional and accepts an exact-v1 approved policy whose
+  deployment, thresholds, authority/reference, bounded validity window, and
+  canonical/source hashes are embedded in the report and rechecked after the
+  serial run. The multi-host preflight rejects provisional, expired,
+  hash-mismatched, or policy-divergent evidence. Selecting that policy and
+  recording distinct-host deployment measurements remain open release work.
 - [x] **Deliver and prove clustered backup/restore.** The existing filesystem
   copy guidance is now explicitly limited to standalone mode: it omitted
   persistent node identity, Group-0/control state, the committed serving map,

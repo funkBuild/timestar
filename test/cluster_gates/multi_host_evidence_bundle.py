@@ -103,7 +103,15 @@ def load_preflight(path: pathlib.Path, label: str) -> tuple[dict, dict]:
 def validate_preflight(report: object, label: str) -> None:
     if not isinstance(report, dict) or type(report.get("version")) is not int or report.get("version") != 1:
         raise EvidenceError(f"{label} is not an exact-v1 multi-host preflight report")
-    required = {"version", "generated_at", "candidate", "expected_deployment", "cluster_uuid", "nodes"}
+    required = {
+        "version",
+        "generated_at",
+        "candidate",
+        "slo_policy",
+        "expected_deployment",
+        "cluster_uuid",
+        "nodes",
+    }
     if set(report) != required:
         raise EvidenceError(f"{label} has an incomplete or obsolete exact-v1 report shape")
     try:
@@ -137,6 +145,26 @@ def validate_preflight(report: object, label: str) -> None:
         raise EvidenceError(f"{label} expected deployment is invalid: {exc}") from exc
     if parsed_deployment != deployment:
         raise EvidenceError(f"{label} expected deployment is not canonical")
+    policy_evidence = report["slo_policy"]
+    if not isinstance(policy_evidence, dict) or policy_evidence.get("status") != "approved":
+        raise EvidenceError(f"{label} is not bound to an approved SLO policy")
+    document = policy_evidence.get("document")
+    synthetic_slo_report = {
+        "version": 1,
+        "slo_policy": policy_evidence,
+        "thresholds": document.get("thresholds") if isinstance(document, dict) else None,
+        "settings": document.get("deployment") if isinstance(document, dict) else None,
+    }
+    try:
+        preflight.approved_policy_from_slo_report(synthetic_slo_report)
+    except preflight.QualificationError as exc:
+        raise EvidenceError(f"{label} approved SLO policy is invalid: {exc}") from exc
+    if (
+        document["deployment"]["high_volume_server_smp"] != deployment["server_smp"]
+        or document["deployment"]["high_volume_server_memory_per_process"]
+        != deployment["server_memory_per_process"]
+    ):
+        raise EvidenceError(f"{label} deployment does not match its approved SLO policy")
 
     nodes = report["nodes"]
     if not isinstance(nodes, list) or len(nodes) < 3:
@@ -325,6 +353,7 @@ def pair_reports(before: dict, after: dict, fault_arm: str) -> dict:
         raise EvidenceError("after report must have a later generated_at than before report")
     for key, description in (
         ("candidate", "candidate identity"),
+        ("slo_policy", "approved SLO policy"),
         ("expected_deployment", "deployment profile"),
         ("cluster_uuid", "cluster UUID"),
     ):
@@ -337,6 +366,7 @@ def pair_reports(before: dict, after: dict, fault_arm: str) -> dict:
     return {
         "fault_arm": fault_arm,
         "candidate": before["candidate"],
+        "slo_policy": before["slo_policy"],
         "expected_deployment": before["expected_deployment"],
         "cluster_uuid": before["cluster_uuid"],
         "node_ids": sorted(before_nodes),

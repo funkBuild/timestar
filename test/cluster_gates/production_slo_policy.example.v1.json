@@ -1,0 +1,28 @@
+{
+  "approval": {
+    "authority": "REPLACE_WITH_APPROVING_AUTHORITY",
+    "reference": "REPLACE_WITH_CHANGE_OR_RELEASE_REFERENCE"
+  },
+  "approved_at": "REPLACE_WITH_UTC_TIMESTAMP",
+  "deployment": {
+    "bench_memory": "1G",
+    "bench_smp": 1,
+    "high_volume_server_memory_per_process": "2G",
+    "high_volume_server_smp": 4,
+    "snapshot_catchup_server_memory_per_process": "1G",
+    "snapshot_catchup_smp": 1
+  },
+  "expires_at": "REPLACE_WITH_UTC_TIMESTAMP_NO_MORE_THAN_366_DAYS_LATER",
+  "name": "REPLACE_WITH_POLICY_NAME",
+  "thresholds": {
+    "movement_http_errors": 100,
+    "movement_p99_ms": 5000,
+    "movement_throughput_retained_percent": 10,
+    "node_failure_error_basis_points": 5000,
+    "node_failure_query_p99_ms": 2000,
+    "node_failure_recovery_ms": 30000,
+    "snapshot_catchup_ms": 750000,
+    "snapshot_install_ms": 360000
+  },
+  "version": 1
+}

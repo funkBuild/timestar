@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import ipaddress
 import json
 import math
@@ -16,6 +17,8 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+
+import production_slo_policy
 
 MAX_RESPONSE_BYTES = 1 << 20
 MAX_TOKEN_BYTES = 64 << 10
@@ -185,6 +188,37 @@ def deployment_settings_from_slo_report(report: object) -> dict:
     if not isinstance(memory, str) or re.fullmatch(r"[1-9][0-9]*[KMGT]?", memory) is None:
         raise QualificationError("candidate SLO report has an invalid high-volume server memory setting")
     return {"server_smp": reactors, "server_memory_per_process": memory}
+
+
+def approved_policy_from_slo_report(report: object) -> dict:
+    if not isinstance(report, dict) or type(report.get("version")) is not int or report.get("version") != 1:
+        raise QualificationError("candidate SLO report is not exact version 1")
+    evidence = report.get("slo_policy")
+    if not isinstance(evidence, dict) or set(evidence) != {"status", "sha256", "source_sha256", "document"}:
+        raise QualificationError("candidate SLO report has no exact-v1 approved policy identity")
+    if evidence["status"] != "approved":
+        raise QualificationError("candidate SLO report is provisional, not approved for production")
+    for key in ("sha256", "source_sha256"):
+        digest = evidence[key]
+        if not isinstance(digest, str) or len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+            raise QualificationError(f"candidate SLO report has an invalid policy {key}")
+    try:
+        document = production_slo_policy.validate_policy(evidence["document"])
+    except production_slo_policy.PolicyError as exc:
+        raise QualificationError(f"candidate SLO policy is invalid: {exc}") from exc
+    canonical = json.dumps(document, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    if hashlib.sha256(canonical).hexdigest() != evidence["sha256"]:
+        raise QualificationError("candidate SLO policy canonical SHA-256 does not match its document")
+    if report.get("thresholds") != document["thresholds"]:
+        raise QualificationError("candidate SLO report thresholds do not match the approved policy")
+    settings = report.get("settings")
+    if not isinstance(settings, dict):
+        raise QualificationError("candidate SLO report has no resource settings")
+    deployment = document["deployment"]
+    for key, value in deployment.items():
+        if settings.get(key) != value:
+            raise QualificationError(f"candidate SLO setting {key} does not match the approved policy")
+    return copy_json(evidence)
 
 
 def copy_json(value: object) -> object:
@@ -459,6 +493,7 @@ def main(argv: list[str] | None = None) -> int:
         candidate_report = json.loads(candidate_text)
         candidate = candidate_from_slo_report(candidate_report)
         deployment = deployment_settings_from_slo_report(candidate_report)
+        slo_policy = approved_policy_from_slo_report(candidate_report)
         report = qualify(
             args.node,
             candidate["server"]["embedded_revision"],
@@ -469,6 +504,7 @@ def main(argv: list[str] | None = None) -> int:
         report.pop("expected_server_smp")
         report["candidate"] = candidate
         report["expected_deployment"] = deployment
+        report["slo_policy"] = slo_policy
         args.output.parent.mkdir(parents=True, exist_ok=True)
         with args.output.open("x", encoding="utf-8") as destination:
             json.dump(report, destination, indent=2, sort_keys=True)

@@ -3,6 +3,7 @@
 # live gates and publishes one exact-v1 JSON report bound to the binary hash,
 # commit, resource settings, thresholds, and raw transcripts.
 set -u
+CALLER_DIR=$PWD
 cd "$(dirname "$0")" || exit 2
 . ./cluster_gate_lib.sh
 
@@ -36,6 +37,7 @@ BENCH_SHA256="$VERIFIED_BINARY_SHA256"
 export GATE_SERVER_MEMORY="${GATE_SERVER_MEMORY:-2G}"
 export GATE_SERVER_SMP="${GATE_SERVER_SMP:-4}"
 GATE_SNAPSHOT_SERVER_MEMORY="${GATE_SNAPSHOT_SERVER_MEMORY:-1G}"
+GATE_SNAPSHOT_SERVER_SMP=1
 export GATE_BENCH_SMP="${GATE_BENCH_SMP:-1}"
 export GATE_BENCH_MEMORY="${GATE_BENCH_MEMORY:-1G}"
 export GATE_BENCH_BINARY
@@ -47,6 +49,44 @@ export GATE_MAX_SNAPSHOT_CATCHUP_MS="${GATE_MAX_SNAPSHOT_CATCHUP_MS:-750000}"
 export GATE_MAX_MOVEMENT_P99_MS="${GATE_MAX_MOVEMENT_P99_MS:-5000}"
 export GATE_MIN_DIP_PCT="${GATE_MIN_DIP_PCT:-10}"
 export GATE_MAX_STORM_5XX="${GATE_MAX_STORM_5XX:-100}"
+
+# A local regression may use the bounded defaults above, but it is explicitly
+# provisional. Production evidence must name one independently approved,
+# time-bounded exact-v1 policy. Its values replace every resource/threshold
+# seam, and both its canonical and source-byte identities are checked again
+# after the long serial campaign.
+SLO_POLICY_FILE="${GATE_SLO_POLICY_FILE:-}"
+SLO_POLICY_STATUS=provisional
+SLO_POLICY_SHA256=""
+SLO_POLICY_SOURCE_SHA256=""
+POLICY_VALUES_BEFORE=""
+if [ -n "$SLO_POLICY_FILE" ]; then
+    case "$SLO_POLICY_FILE" in
+        /*) ;;
+        *) SLO_POLICY_FILE="$CALLER_DIR/$SLO_POLICY_FILE" ;;
+    esac
+    POLICY_VALUES_BEFORE=$(python3 ./production_slo_policy.py --policy "$SLO_POLICY_FILE" --emit-values) || exit $?
+    mapfile -t POLICY_VALUES <<<"$POLICY_VALUES_BEFORE"
+    [ "${#POLICY_VALUES[@]}" -eq 16 ] || {
+        echo "ABORT: approved SLO policy emitted ${#POLICY_VALUES[@]} values, expected 16" >&2; exit 2; }
+    SLO_POLICY_STATUS=approved
+    SLO_POLICY_SHA256="${POLICY_VALUES[0]}"
+    SLO_POLICY_SOURCE_SHA256="${POLICY_VALUES[1]}"
+    export GATE_SERVER_MEMORY="${POLICY_VALUES[2]}"
+    export GATE_SERVER_SMP="${POLICY_VALUES[3]}"
+    GATE_SNAPSHOT_SERVER_MEMORY="${POLICY_VALUES[4]}"
+    GATE_SNAPSHOT_SERVER_SMP="${POLICY_VALUES[5]}"
+    export GATE_BENCH_MEMORY="${POLICY_VALUES[6]}"
+    export GATE_BENCH_SMP="${POLICY_VALUES[7]}"
+    export GATE_MAX_NODE_FAILURE_ERROR_BPS="${POLICY_VALUES[8]}"
+    export GATE_MAX_FAILOVER_RECOVERY_MS="${POLICY_VALUES[9]}"
+    export GATE_MAX_FAILOVER_QUERY_P99_MS="${POLICY_VALUES[10]}"
+    export GATE_MAX_SNAPSHOT_INSTALL_MS="${POLICY_VALUES[11]}"
+    export GATE_MAX_SNAPSHOT_CATCHUP_MS="${POLICY_VALUES[12]}"
+    export GATE_MAX_MOVEMENT_P99_MS="${POLICY_VALUES[13]}"
+    export GATE_MIN_DIP_PCT="${POLICY_VALUES[14]}"
+    export GATE_MAX_STORM_5XX="${POLICY_VALUES[15]}"
+fi
 for threshold_name in GATE_MAX_FAILOVER_RECOVERY_MS GATE_MAX_FAILOVER_QUERY_P99_MS GATE_MAX_SNAPSHOT_INSTALL_MS \
     GATE_MAX_SNAPSHOT_CATCHUP_MS GATE_MAX_MOVEMENT_P99_MS GATE_MIN_DIP_PCT; do
     threshold_value="${!threshold_name}"
@@ -104,6 +144,11 @@ run_gate "leadership-movement throughput and latency impact" \
 # exact bytes authenticated before the first arm.
 verify_candidate_binary_unchanged "$BIN" "$SERVER_SHA256" timestar_http_server || exit $?
 verify_candidate_binary_unchanged "$BENCH" "$BENCH_SHA256" timestar_insert_bench || exit $?
+if [ "$SLO_POLICY_STATUS" = approved ]; then
+    POLICY_VALUES_AFTER=$(python3 ./production_slo_policy.py --policy "$SLO_POLICY_FILE" --emit-values) || exit $?
+    [ "$POLICY_VALUES_AFTER" = "$POLICY_VALUES_BEFORE" ] || {
+        echo "ABORT: approved SLO policy changed while qualification was running" >&2; exit 2; }
+fi
 
 metric() { # LOG NAME
     awk -v name="$2" '$1 == "GATE_METRIC" && $2 == name { print $3; exit }' "$1"
@@ -152,7 +197,7 @@ HOST=$(hostname)
 
 export COMMIT SERVER_REVISION SERVER_SHA256 BENCH_REVISION BENCH_SHA256 SERVER_ENV_SHA256 GENERATED_AT HOST
 export BIN BENCH GATE_SERVER_MEMORY GATE_SERVER_SMP
-export GATE_SNAPSHOT_SERVER_MEMORY
+export GATE_SNAPSHOT_SERVER_MEMORY GATE_SNAPSHOT_SERVER_SMP
 export GATE_BENCH_SMP GATE_BENCH_MEMORY NODE_BATCHES NODE_BATCH_SIZE NODE_CONNECTIONS
 export NODE_HOSTS NODE_PROBES NODE_ERRORS NODE_ERROR_BPS NODE_RECOVERY_MS
 export NODE_QUERY_P99_MS NODE_QUERY_SAMPLES SNAPSHOT_INSTALL_MS SNAPSHOT_CATCHUP_MS
@@ -164,17 +209,35 @@ export GATE_MAX_NODE_FAILURE_ERROR_BPS GATE_MAX_FAILOVER_RECOVERY_MS
 export GATE_MAX_FAILOVER_QUERY_P99_MS GATE_MAX_SNAPSHOT_INSTALL_MS
 export GATE_MAX_SNAPSHOT_CATCHUP_MS GATE_MAX_MOVEMENT_P99_MS GATE_MIN_DIP_PCT
 export GATE_MAX_STORM_5XX
+export SLO_POLICY_FILE SLO_POLICY_STATUS SLO_POLICY_SHA256 SLO_POLICY_SOURCE_SHA256
 
 python3 - "$REPORT" <<'PY'
 import json
 import os
+import pathlib
 import sys
+
+import production_slo_policy
 
 def integer(name):
     return int(os.environ[name])
 
 def number(name):
     return float(os.environ[name])
+
+if os.environ["SLO_POLICY_STATUS"] == "approved":
+    policy_document, policy_sha256, policy_source_sha256 = production_slo_policy.load_policy(
+        pathlib.Path(os.environ["SLO_POLICY_FILE"])
+    )
+    if (
+        policy_sha256 != os.environ["SLO_POLICY_SHA256"]
+        or policy_source_sha256 != os.environ["SLO_POLICY_SOURCE_SHA256"]
+    ):
+        raise SystemExit("approved SLO policy identity changed before report publication")
+else:
+    policy_document = None
+    policy_sha256 = None
+    policy_source_sha256 = None
 
 report = {
     "version": 1,
@@ -193,6 +256,12 @@ report = {
             "sha256": os.environ["BENCH_SHA256"],
         },
     },
+    "slo_policy": {
+        "status": os.environ["SLO_POLICY_STATUS"],
+        "sha256": policy_sha256,
+        "source_sha256": policy_source_sha256,
+        "document": policy_document,
+    },
     "settings": {
         "high_volume_server_memory_per_process": os.environ["GATE_SERVER_MEMORY"],
         "high_volume_server_smp": integer("GATE_SERVER_SMP"),
@@ -201,7 +270,7 @@ report = {
         "server_environment_sha256": os.environ["SERVER_ENV_SHA256"],
         "node_failure_smp": integer("GATE_SERVER_SMP"),
         "snapshot_catchup_server_memory_per_process": os.environ["GATE_SNAPSHOT_SERVER_MEMORY"],
-        "snapshot_catchup_smp": 1,
+        "snapshot_catchup_smp": integer("GATE_SNAPSHOT_SERVER_SMP"),
         "movement_smp": integer("GATE_SERVER_SMP"),
         "scratch_root": os.environ["GATE_TMP_ROOT"],
     },
@@ -264,6 +333,7 @@ PY
 echo "PRODUCTION_SLO_REPORT PASSED"
 echo "  report: $REPORT"
 echo "  candidate: $COMMIT"
+echo "  SLO policy: $SLO_POLICY_STATUS${SLO_POLICY_SHA256:+ ($SLO_POLICY_SHA256)}"
 echo "  server sha256: $SERVER_SHA256"
 echo "  benchmark sha256: $BENCH_SHA256"
 echo "  node failure: $NODE_ERRORS/$NODE_BATCHES errors, ${NODE_RECOVERY_MS}ms recovery, ${NODE_QUERY_P99_MS}ms query p99"

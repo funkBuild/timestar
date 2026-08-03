@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import copy
+import hashlib
 import importlib.util
+import json
 import pathlib
 import tempfile
 import unittest
@@ -16,7 +18,37 @@ NODES = ["https://node1.example:8443", "https://node2.example:8443", "https://no
 SERVER_SMP = 4
 
 
+def policy_document() -> dict:
+    return {
+        "version": 1,
+        "name": "production-rf3-2026q3",
+        "approval": {"authority": "release board", "reference": "CHANGE-1234"},
+        "approved_at": "2026-08-03T00:00:00Z",
+        "expires_at": "2027-02-04T00:00:00Z",
+        "deployment": {
+            "high_volume_server_memory_per_process": "2G",
+            "high_volume_server_smp": SERVER_SMP,
+            "snapshot_catchup_server_memory_per_process": "1G",
+            "snapshot_catchup_smp": 1,
+            "bench_memory": "1G",
+            "bench_smp": 1,
+        },
+        "thresholds": {
+            "node_failure_error_basis_points": 5000,
+            "node_failure_recovery_ms": 30000,
+            "node_failure_query_p99_ms": 2000,
+            "snapshot_install_ms": 360000,
+            "snapshot_catchup_ms": 750000,
+            "movement_p99_ms": 5000,
+            "movement_throughput_retained_percent": 10,
+            "movement_http_errors": 100,
+        },
+    }
+
+
 def candidate_report() -> dict:
+    document = policy_document()
+    canonical = json.dumps(document, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return {
         "version": 1,
         "candidate": {
@@ -27,6 +59,17 @@ def candidate_report() -> dict:
         "settings": {
             "high_volume_server_smp": SERVER_SMP,
             "high_volume_server_memory_per_process": "2G",
+            "snapshot_catchup_server_memory_per_process": "1G",
+            "snapshot_catchup_smp": 1,
+            "bench_memory": "1G",
+            "bench_smp": 1,
+        },
+        "thresholds": copy.deepcopy(document["thresholds"]),
+        "slo_policy": {
+            "status": "approved",
+            "sha256": hashlib.sha256(canonical).hexdigest(),
+            "source_sha256": "d" * 64,
+            "document": document,
         },
     }
 
@@ -278,6 +321,34 @@ class MultiHostCandidatePreflightTest(unittest.TestCase):
     def test_accepts_explicit_high_volume_deployment_settings(self):
         settings = preflight.deployment_settings_from_slo_report(candidate_report())
         self.assertEqual(settings, {"server_smp": 4, "server_memory_per_process": "2G"})
+
+    def test_accepts_policy_bound_to_the_report_thresholds_and_settings(self):
+        evidence = preflight.approved_policy_from_slo_report(candidate_report())
+        self.assertEqual(evidence["status"], "approved")
+
+    def test_rejects_provisional_slo_report_for_multi_host_qualification(self):
+        report = candidate_report()
+        report["slo_policy"] = {"status": "provisional", "sha256": None, "source_sha256": None, "document": None}
+        with self.assertRaisesRegex(preflight.QualificationError, "provisional"):
+            preflight.approved_policy_from_slo_report(report)
+
+    def test_rejects_threshold_not_bound_to_approved_policy(self):
+        report = candidate_report()
+        report["thresholds"]["node_failure_recovery_ms"] = 29999
+        with self.assertRaisesRegex(preflight.QualificationError, "thresholds do not match"):
+            preflight.approved_policy_from_slo_report(report)
+
+    def test_rejects_policy_document_not_bound_to_its_canonical_hash(self):
+        report = candidate_report()
+        report["slo_policy"]["sha256"] = "e" * 64
+        with self.assertRaisesRegex(preflight.QualificationError, "canonical SHA-256"):
+            preflight.approved_policy_from_slo_report(report)
+
+    def test_rejects_deployment_not_bound_to_approved_policy(self):
+        report = candidate_report()
+        report["settings"]["high_volume_server_smp"] = 3
+        with self.assertRaisesRegex(preflight.QualificationError, "does not match"):
+            preflight.approved_policy_from_slo_report(report)
 
     def test_rejects_boolean_report_version_as_not_exact_v1(self):
         report = candidate_report()
