@@ -1,3 +1,4 @@
+#include "cluster/features/cluster_restore_seeder.hpp"
 #include "cluster/integration/cluster_data_plane.hpp"
 #include "cluster/integration/group0_identity_bridge.hpp"
 #include "cluster/integration/group0_startup.hpp"
@@ -789,7 +790,9 @@ int main(int argc, char** argv) {
         "log-level", bpo::value<seastar::log_level>()->default_value(seastar::log_level::info),
         "Log level (error, warn, info, debug, trace)")("config", bpo::value<std::string>(), "Path to TOML config file")(
         "dump-config", "Print default config to stdout and exit")(
-        "cluster-init", "Explicitly bootstrap group 0 on the configured control seed (never implied by startup)");
+        "cluster-init", "Explicitly bootstrap group 0 on the configured control seed (never implied by startup)")(
+        "cluster-restore", bpo::value<std::string>(),
+        "Offline exact-v1 cluster archive to seed into this fresh data directory before startup");
 
     // Inject Seastar settings from TOML [seastar] section.
     // CLI args are already stored first, so bpo::store won't overwrite them.
@@ -837,6 +840,10 @@ int main(int argc, char** argv) {
             uint16_t port = config["port"].as<uint16_t>();
             auto log_level = config["log-level"].as<seastar::log_level>();
             const bool clusterInitRequested = config.count("cluster-init") != 0;
+            const std::optional<std::string> clusterRestoreArchive =
+                config.count("cluster-restore") != 0
+                    ? std::optional<std::string>{config["cluster-restore"].as<std::string>()}
+                    : std::nullopt;
 
             // Initialize logging
             timestar::init_logging(log_level);
@@ -854,6 +861,23 @@ int main(int argc, char** argv) {
                         "--cluster-init may run only on cluster.control_seed_node_id (configured seed {}, this node "
                         "{})",
                         cc.control_seed_node_id, cc.node_id);
+                    return 1;
+                }
+                if (clusterRestoreArchive && clusterRestoreArchive->empty()) {
+                    timestar::http_log.error("--cluster-restore requires a non-empty archive directory");
+                    return 1;
+                }
+                if (clusterRestoreArchive &&
+                    (!cc.enabled || !cc.partitioned || cc.replication_factor <= 1 || !cc.control_enabled)) {
+                    timestar::http_log.error(
+                        "--cluster-restore requires a VShard-partitioned replicated cluster with Group 0 enabled");
+                    return 1;
+                }
+                if (clusterRestoreArchive &&
+                    timestar::cluster::ReplicatedVShardHost::sharedJournalEnabled()) {
+                    timestar::http_log.error(
+                        "--cluster-restore requires private v1 VShard journals; unset "
+                        "TIMESTAR_CLUSTER_SHARED_JOURNAL");
                     return 1;
                 }
             }
@@ -959,6 +983,70 @@ int main(int argc, char** argv) {
             if (!shardStoreStartup.canStart()) {
                 timestar::http_log.error("{}", shardStoreStartup.failureMessage());
                 return 1;
+            }
+
+            // A restore is an OFFLINE fresh-cluster operation. It completes all
+            // local Raft journal seeds before Engine or any RPC listener opens;
+            // normal recovery then installs the imported TSP1 payloads through
+            // the same received-snapshot path used for peer catch-up. The marker
+            // prevents a restart from serving a partial all-group import.
+            const auto restoreState = timestar::features::ClusterRestoreSeeder::inspectTarget(dataRoot);
+            if (restoreState == timestar::features::ClusterRestoreTargetState::Invalid) {
+                timestar::http_log.error(
+                    "cluster restore marker is corrupt or unreadable; refusing to guess whether the import is "
+                    "complete");
+                return 1;
+            }
+            if (restoreState == timestar::features::ClusterRestoreTargetState::InProgress && !clusterRestoreArchive) {
+                timestar::http_log.error(
+                    "cluster restore is incomplete; restart with the same --cluster-restore archive to resume");
+                return 1;
+            }
+            if (clusterRestoreArchive) {
+                const auto& clusterConfig = timestar::config().cluster;
+                if (restoreState != timestar::features::ClusterRestoreTargetState::Complete &&
+                    clusterConfig.node_id == clusterConfig.control_seed_node_id && !clusterInitRequested) {
+                    timestar::http_log.error(
+                        "the control seed requires --cluster-init with its first --cluster-restore invocation");
+                    return 1;
+                }
+                if (!clusterJournalIdentity) {
+                    timestar::http_log.error("cluster restore has no durable replicated-cluster journal identity");
+                    return 1;
+                }
+                if (restoreState != timestar::features::ClusterRestoreTargetState::Complete &&
+                    !shardStoreStartup.inspection().isFresh()) {
+                    timestar::http_log.error(
+                        "--cluster-restore requires the Engine store to remain fresh until local import completes; "
+                        "existing data will not be overwritten");
+                    return 1;
+                }
+                try {
+                    const auto runtime = timestar::cluster::ClusterRuntime::fromConfig(timestar::config().cluster);
+                    timestar::features::ClusterRestoreSeedRequest request;
+                    request.archiveDirectory = *clusterRestoreArchive;
+                    request.dataDirectory = dataRoot;
+                    request.newClusterUuid = timestar::config().cluster.cluster_uuid;
+                    request.clusterUuidBytes = clusterJournalIdentity->clusterUuid;
+                    request.bootId = clusterJournalIdentity->bootId;
+                    request.self = runtime.selfId;
+                    request.controlSeed = timestar::config().cluster.control_seed_node_id;
+                    request.coreCount = seastar::smp::count;
+                    request.servingMap = runtime.map;
+                    if (runtime.selfId == request.controlSeed) {
+                        if (!group0Identity)
+                            throw std::runtime_error("control seed restore has no persistent node identity record");
+                        request.controlSeedRecord = *group0Identity;
+                    }
+                    const auto result = timestar::features::ClusterRestoreSeeder::seed(std::move(request)).get();
+                    timestar::http_log.info(
+                        "cluster restore seed complete on node {}: {} local VShards ({} written or revalidated this "
+                        "run, resumed={})",
+                        runtime.selfId, result.localVShards, result.seededThisRun, result.resumed);
+                } catch (const std::exception& e) {
+                    timestar::http_log.error("cluster restore refused or failed: {}", e.what());
+                    return 1;
+                }
             }
 
             // Initialize virtual shard placement table (Phase 5).

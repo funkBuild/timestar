@@ -313,10 +313,14 @@ evidence below.
   interrupted stage/manifest write and restores one real Engine payload with
   exact readback. A local leader capture now obtains a deadline-bounded quorum
   ReadIndex, waits/rolls to a TSP1 boundary at or beyond it, and pins the
-  sidecar across supersession and archival. This does not close the blocker:
-  the server still needs durable cross-node orchestration over all current
-  leaders and generation-one import into a fresh cluster UUID/new Raft
-  membership, followed by a live RF=3 recovery gate.
+  sidecar across supersession and archival. The offline server path now seeds a
+  fresh node's selected data groups at term 1 under new voters, reconstructs a
+  scrubbed one-seed Group-0 snapshot under a new cluster UUID, persists the new
+  serving-map cache before completion, and resumes crashes from a checksummed
+  marker while Engine and networking remain closed. This does not close the
+  blocker: the server still needs durable cross-node export orchestration and a
+  restore ceremony which proves every configured data voter imported the same
+  archive before any cluster transport opens, followed by the live RF=3 gate.
 
 ### P2 — release and operations
 

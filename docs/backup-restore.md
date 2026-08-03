@@ -12,12 +12,12 @@ journals. Copying only `shard_*` directories omits cluster authority and cannot
 produce a restorable cluster backup. Independently copying three live replicas
 also does not create one coordinated recovery point.
 
-The internal exact-v1 cluster artifact layer is implemented, but a supported
-server export/import workflow is not. Until leader-pinned export, generation-one
-membership-scrubbing import, and the RF=3 recovery gate are shipped, clustered
-deployment remains blocked for production. Do not clone `node.json`,
-`control_map.cache`, or `cluster_raft/` into a new node or cluster; that can
-duplicate identity or resurrect obsolete membership.
+The internal exact-v1 cluster artifact and node-local restore layers are
+implemented, but a supported cluster-wide export/import workflow is not. Until
+durable all-leader export coordination and an all-voter RF=3 recovery gate are
+shipped, clustered deployment remains blocked for production. Do not clone
+`node.json`, `control_map.cache`, or `cluster_raft/` into a new node or cluster;
+that can duplicate identity or resurrect obsolete membership.
 
 ## Cluster artifact foundation (not yet an operator procedure)
 
@@ -62,6 +62,36 @@ rolls the active store once, and pins the durable sidecar name while it is being
 archived. A newer Raft snapshot cannot unlink the pinned source mid-copy. This
 is not yet a cluster export: no authenticated command dispatches work to every
 current leader or durably tracks the 4,096-unit operation across nodes.
+
+The server also has an offline, node-local generation-one importer. On a fresh
+data root, `--cluster-restore <archive>` validates the complete exact-v1 archive
+before Engine or any network listener opens, creates only the local VShard Raft
+journals selected by the new epoch-1 serving map, and rebases them to term 1
+with the newly configured voter sets. Revision-one empty snapshots are
+losslessly re-encoded at revision 2 because Raft index 0 is the sentinel for no
+snapshot. The configured control seed additionally receives a term-1 Group-0
+snapshot containing the new cluster UUID, one new active seed identity, the new
+serving map, and only the portable policy/retention/frozen-delete state. Old
+nodes, voters, tokens, jobs, placement authority, and controller ownership are
+not imported.
+
+The control seed's first restore invocation also requires `--cluster-init`.
+Once the local marker is complete, ordinary recovery does not require either
+restore option.
+
+The importer writes a checksummed marker before creating `cluster_raft/`,
+durably advances batched progress, revalidates already-written journals after a
+crash, publishes `control_map.cache` before marking the node complete, and
+refuses ordinary startup while the marker is incomplete. Resume requires the
+same archive, cluster UUID, identity, core count, and serving map.
+
+**This is not yet a safe RF=3 restore procedure.** Every voter named for every
+data group must import the same archive before any restored node opens its
+cluster transport. That cluster-wide barrier is not implemented. Starting one
+restored voter beside two fresh empty voters can allow the empty majority to
+elect and overwrite restored state. The local importer is recovery machinery
+for the eventual coordinated procedure, not authorization to deploy clustered
+backup/restore in production.
 
 ## Data Directory Structure
 
@@ -167,12 +197,14 @@ procedure is:
   survive leader changes and process/node restarts without mixing operations.
 - [ ] Expose authenticated, authorized server/operator commands for starting,
   observing, resuming, cancelling, and safely retaining an export.
-- [ ] Bootstrap a different cluster UUID and import every `TSP1` as
-  generation-one state under newly selected Raft membership. Import must be
-  idempotent, durably resumable, and must never expose a partially restored map.
+- [x] On each node, bootstrap a different cluster UUID and import its selected
+  `TSP1` units as generation-one state under new Raft membership. The offline
+  importer is idempotent and durably resumable, rejects conflicting progress,
+  and does not open Engine or networking while the local marker is partial.
 - [ ] Run the RF=3 live gate: writes during export, full restore, exact readback,
   corrupt/missing/extra artifact rejection, interrupted export/import resume,
-  restart during import, and proof that old identities cannot join or actuate.
+  restart during import, proof that every configured voter was seeded before
+  networking, and proof that old identities cannot join or actuate.
 - [ ] Publish artifact retention, capacity/headroom, authenticated integrity or
   encryption, key management, off-site replication, restore, and disaster-
   recovery procedures.

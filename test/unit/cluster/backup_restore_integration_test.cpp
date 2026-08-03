@@ -2,8 +2,12 @@
 // VShard unit, the complete 4,096-unit TSBK v1 manifest validates into a fresh
 // cluster UUID, and that real unit installs into a fresh Engine which serves the
 // original data. Same-UUID restore, corrupt TSP1 and incomplete manifest fail.
+#include "../../../lib/cluster/control/durable_control_map.hpp"
+#include "../../../lib/cluster/control/group0_state_machine.hpp"
 #include "../../../lib/cluster/data/snapshot_payload.hpp"
 #include "../../../lib/cluster/features/backup_restore.hpp"
+#include "../../../lib/cluster/features/cluster_restore_seeder.hpp"
+#include "../../../lib/cluster/raft/raft_journal_persistence.hpp"
 #include "../../../lib/core/engine.hpp"
 #include "../../../lib/core/placement_table.hpp"  // virtualShard
 #include "../../../lib/core/vshard.hpp"           // vshardsCohesiveOnCores
@@ -37,6 +41,18 @@ void writeBytes(const fs::path& path, std::string_view bytes) {
     output.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
     if (!output)
         throw std::runtime_error("failed to write backup test fixture " + path.string());
+}
+
+std::array<uint8_t, 16> hexBytes(std::string_view value) {
+    const auto nibble = [](char c) -> uint8_t {
+        if (c >= '0' && c <= '9')
+            return static_cast<uint8_t>(c - '0');
+        return static_cast<uint8_t>(c - 'a' + 10);
+    };
+    std::array<uint8_t, 16> out{};
+    for (size_t i = 0; i < out.size(); ++i)
+        out[i] = static_cast<uint8_t>((nibble(value[2 * i]) << 4) | nibble(value[2 * i + 1]));
+    return out;
 }
 
 std::string emptyVShardSnapshot(uint16_t vshard) {
@@ -136,6 +152,7 @@ TEST(BackupRestoreIntegration, ExportRestoreInstallAndFailClosed) {
         // payload above; the rest are minimal exact-v1 empty VShard payloads.
         features::ClusterBackupManifest backup;
         backup.sourceClusterUuid = "00112233445566778899aabbccddeeff";
+        backup.control.policies.emplace("schema/imported", control::PolicyCell{7, "portable-value"});
         backup.vshards.reserve(VIRTUAL_SHARD_COUNT);
         std::vector<std::string> emptyUnits(VIRTUAL_SHARD_COUNT);
         for (uint16_t i = 0; i < VIRTUAL_SHARD_COUNT; ++i) {
@@ -230,11 +247,104 @@ TEST(BackupRestoreIntegration, ExportRestoreInstallAndFailClosed) {
             ASSERT_TRUE(features::ClusterBackupArchive::validate("bkp_archive").get());
         }
 
+        // Seed a genuinely new Raft generation. Only two VShards belong to this
+        // node in the target map, keeping the gate bounded while still proving
+        // interrupted progress, revision-one rebasing, fresh membership, and
+        // portable Group-0 recovery.
+        {
+            const uint16_t second = static_cast<uint16_t>((vshard.value() + 1) % VIRTUAL_SHARD_COUNT);
+            features::ClusterRestoreSeedRequest request;
+            request.archiveDirectory = "bkp_archive";
+            request.dataDirectory = "bkp_seed";
+            request.newClusterUuid = "ffeeddccbbaa00998877665544332211";
+            request.clusterUuidBytes = hexBytes(request.newClusterUuid);
+            request.bootId.fill(0x5a);
+            request.self = 1;
+            request.controlSeed = 1;
+            request.coreCount = 1;
+            request.servingMap.epoch = 1;
+            for (uint16_t i = 0; i < VIRTUAL_SHARD_COUNT; ++i)
+                request.servingMap.placement[i] = (i == vshard.value() || i == second)
+                                                      ? std::vector<raft::NodeId>{1, 2, 3}
+                                                      : std::vector<raft::NodeId>{2, 3, 4};
+            request.controlSeedRecord =
+                control::NodeRecord{1, "new-node-uuid", "127.0.0.1:8086", "rack-a", control::NodeState::Joining};
+
+            size_t durable = 0;
+            request.vshardDurableForTesting = [&](uint16_t) {
+                if (++durable == 1)
+                    throw std::runtime_error("injected restore interruption");
+            };
+            EXPECT_THROW(features::ClusterRestoreSeeder::seed(request).get(), std::runtime_error);
+            EXPECT_EQ(features::ClusterRestoreSeeder::inspectTarget("bkp_seed"),
+                      features::ClusterRestoreTargetState::InProgress);
+
+            auto conflicting = request;
+            conflicting.coreCount = 2;
+            EXPECT_THROW(features::ClusterRestoreSeeder::seed(std::move(conflicting)).get(), std::runtime_error);
+
+            request.vshardDurableForTesting = {};
+            auto seeded = features::ClusterRestoreSeeder::seed(request).get();
+            EXPECT_TRUE(seeded.resumed);
+            EXPECT_EQ(seeded.localVShards, 2u);
+            EXPECT_EQ(features::ClusterRestoreSeeder::inspectTarget("bkp_seed"),
+                      features::ClusterRestoreTargetState::Complete);
+            auto cached = control::DurableControlMapStore("bkp_seed").load();
+            ASSERT_TRUE(cached);
+            EXPECT_EQ(*cached, request.servingMap);
+
+            auto alreadyComplete = features::ClusterRestoreSeeder::seed(request).get();
+            EXPECT_TRUE(alreadyComplete.resumed);
+            EXPECT_EQ(alreadyComplete.localVShards, 2u);
+            EXPECT_EQ(alreadyComplete.seededThisRun, 0u);
+
+            JournalSegmentHeader header;
+            header.clusterUuid = request.clusterUuidBytes;
+            header.bootId.fill(0xa5);
+            {
+                header.coreNumber = 0;
+                JournalWriter writer("bkp_seed/cluster_raft/group0", header, 1u << 20);
+                auto records = writer.open().get();
+                auto state = raft::recoverRaftState(records, VShardId{0});
+                ASSERT_TRUE(state.snapshot);
+                EXPECT_EQ(state.hardState, (raft::HardState{1, raft::kNoNode}));
+                control::Group0StateMachine sm;
+                sm.applySnapshot(*state.snapshot).get();
+                EXPECT_EQ(sm.state().clusterUuid, request.newClusterUuid);
+                EXPECT_EQ(sm.state().nodes.size(), 1u);
+                EXPECT_EQ(sm.state().metaVoters, std::vector<raft::NodeId>{1});
+                EXPECT_EQ(sm.state().policies.at("schema/imported"), (control::PolicyCell{7, "portable-value"}));
+                EXPECT_TRUE(sm.state().joinTokens.empty());
+                EXPECT_TRUE(sm.state().jobs.empty());
+                writer.close().get();
+            }
+            for (uint16_t imported : {vshard.value(), second}) {
+                header.coreNumber = 0;
+                const auto directory = fs::path("bkp_seed/cluster_raft") / ("vshard_" + std::to_string(imported));
+                JournalWriter writer(directory, header, 1u << 20);
+                auto records = writer.open().get();
+                auto state = raft::recoverRaftState(records, VShardId{imported}, directory / "snapshot_sidecars");
+                ASSERT_TRUE(state.snapshot);
+                ASSERT_TRUE(state.snapshot->file);
+                EXPECT_TRUE(state.snapshotFromPeer);
+                EXPECT_EQ(state.snapshot->term, 1u);
+                EXPECT_EQ(state.snapshot->config.voters, (std::vector<raft::NodeId>{1, 2, 3}));
+                auto info = data::inspectSnapshotPayloadFile(state.snapshot->file->path).get();
+                ASSERT_TRUE(info);
+                EXPECT_EQ(info->manifest.vshard, VShardId{imported});
+                EXPECT_GE(info->manifest.snapshotRevision, 2u) << "Raft snapshots cannot use the index-zero sentinel";
+                EXPECT_EQ(state.snapshot->index + 1, info->manifest.snapshotRevision);
+                EXPECT_EQ(state.hardState, (raft::HardState{1, raft::kNoNode}));
+                writer.close().get();
+            }
+        }
+
         fs::remove_all("bkp_src");
         fs::remove_all("bkp_dst");
         fs::remove_all("bkp_archive");
         fs::remove_all("bkp_stage");
         fs::remove_all("bkp_stage_fresh");
+        fs::remove_all("bkp_seed");
         fs::remove("bkp_source.tsp1");
     })
         .join()

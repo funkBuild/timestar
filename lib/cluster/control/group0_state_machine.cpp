@@ -768,6 +768,14 @@ std::string Group0StateMachine::snapshot() const {
     return std::move(w.out);
 }
 
+std::optional<std::string> Group0StateMachine::snapshotForRestore(Group0State state) {
+    if (!validSnapshotState(state))
+        return std::nullopt;
+    Group0StateMachine encoder;
+    encoder.state_ = std::move(state);
+    return encoder.snapshot();
+}
+
 bool Group0StateMachine::decodeSnapshot(const std::string& data, Group0State& decoded) const {
     SR r{data.data(), data.data() + data.size()};
     Group0State s;

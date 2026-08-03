@@ -43,8 +43,10 @@ Production blockers take priority and are authoritative in
   portable control-state capture, full-set validation, and in-process readback
   gate are complete. The local deadline-bounded leader ReadIndex capture,
   safe-boundary rollover/wait, and supersession pin are also complete.
-  Cross-node resumable export coordination, fresh-membership import, resumable
-  import state, and the RF=3 operator gate remain.
+  Fresh-node term-1 membership import, old-authority scrubbing, an offline
+  partial-startup fence, and resumable node-local import state are complete.
+  Cross-node resumable export coordination, an all-voter pre-network restore
+  barrier, and the RF=3 operator gate remain.
 
 ## Feature completion
 

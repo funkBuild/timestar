@@ -40,6 +40,10 @@ public:
 
     // Serialize the entire state for a Raft snapshot (the compaction payload).
     std::string snapshot() const;
+    // Encode a fully-formed fresh-cluster restore state without installing it
+    // into a live state machine. Invalid state is rejected before any journal
+    // can make it durable.
+    static std::optional<std::string> snapshotForRestore(Group0State state);
     // Restore the whole state from a snapshot payload; false (state unchanged) on
     // a corrupt/truncated payload rather than a half-applied state.
     bool loadSnapshot(const std::string& data);
