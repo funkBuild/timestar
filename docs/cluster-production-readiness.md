@@ -250,6 +250,18 @@ inventory and rules.
   `503`s, retained 33% in its worst arm, executed 201 rebalance calls, preserved
   every acknowledged probe on all replicas, and observed no server `500` or
   crash.
+- [x] Fence the skewed-movement control/storm arm boundary on public readiness.
+  The SLO collector found a clean 500/500 control whose final acknowledged
+  writes were still applying when the storm client's strict, one-shot health
+  preflight ran. The client correctly exited nonzero before issuing a request,
+  but the gate then produced a misleading zero-workload, zero-transfer cascade
+  instead of identifying the transient boundary. The gate now waits for all
+  three public `/health` contracts after the control and before starting the
+  storm. A bounded reproduction crossed that exact boundary, initiated 1,533
+  transfers in 567 calls, retained 65% throughput with a 1.690-s p99 and eight
+  typed retryable errors, converged to an even leader distribution, and read
+  every one of 141 acknowledged hot-group probes from every replica with zero
+  connection failure, server `500`, or crash.
 - [x] Remove the VShard snapshot reactor-memory ceiling without adding another
   protocol version. Production snapshots now encode the exact existing `TSP1`
   v1 bytes directly from immutable Engine objects into owned sidecars, hydrate
@@ -438,11 +450,14 @@ integrity. Production remains blocked on the P1 evidence below.
   synchronizing thousands of campaigns after a failure; production data groups
   now use stable per-node/per-VShard seeds, with all 4,096 streams and the full
   timeout distribution pinned by a regression. Earlier collector attempts also
-  exposed and closed two harness defects: a fixed join delay could start the
-  movement load before node 3 opened HTTP, and a failed benchmark lost its exit
-  status and transcript. Both movement gates now require exact 4,096-group
-  convergence plus public health, reject missing or duplicate leader totals,
-  and retain failure evidence.
+  exposed and closed three harness defects: a fixed join delay could start the
+  movement load before node 3 opened HTTP; a failed benchmark lost its exit
+  status and transcript; and the skewed gate could start its storm client's
+  strict health preflight while the clean control's accepted tail was still
+  applying. Both movement gates require exact 4,096-group convergence plus
+  public health, reject missing or duplicate leader totals, and retain failure
+  evidence; the two-arm gate also re-establishes public readiness at the arm
+  boundary.
 
   The complete serial collector passed on 2026-08-03 against clean candidate
   `305a030e394a669601daabe57a58c7d88a1cb487`. Its report authenticated both the

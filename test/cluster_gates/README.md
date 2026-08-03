@@ -339,6 +339,14 @@ used to print `ERROR: server health check failed`, return success, and yield no 
 summary. The benchmark now exits non-zero for a failed health preflight (and for an
 unknown wire format), so no caller can confuse “campaign never ran” with a clean result.
 
+`skewed_rebalance_gate.sh` also re-establishes `/health` after its clean control and
+before launching the storm benchmark. The control client's summary proves that every
+request was acknowledged; it does not prove every follower has already applied the tail.
+Without the arm-boundary wait, the next client's strict one-shot preflight could observe
+that correct transient fence and exit before issuing any workload, leaving a misleading
+zero-throughput/zero-transfer failure cascade. A failed readiness barrier is still a gate
+failure; it is never converted into a successful or vacuous movement arm.
+
 `deposed_primary_gate.sh` hard-asserts what Phase 3 owns -- zero server-side 500s, zero
 crashes, and enough real leadership transfers for the run to be non-vacuous -- plus, since
 D-13, that reads work. The accepted-write count is ADVISORY, because a rebalance storm

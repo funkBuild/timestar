@@ -226,6 +226,14 @@ fi
     gate_void "the rebalance-free control took $CTL_ERRS client errors -- the skewed load is saturating its ${HOSTS}x10 groups on this box, so the storm arm would measure that. Lower GATE_CONNECTIONS or GATE_BATCH_SIZE."
 gate_ok "control clean under the skew: $CTL_TPUT pts/s, 0 client errors"
 
+# The control's final accepted batches can still be applying on followers when the
+# client prints its summary.  /health correctly fences that transient lag, and the
+# movement benchmark deliberately performs a one-shot strict health preflight.  Make
+# the arm boundary explicit: without this wait, a clean control can be followed by a
+# benchmark that exits before issuing a single request, producing zero movement and a
+# misleading seven-assertion failure even though all three nodes recover immediately.
+wait_healthy "$PORTS" 180 || gate_exit
+
 # ---------------------------------------------------------------------------
 echo "=== rebalance storm under the SAME skewed load ==="
 BASE_TS=1760000000000000000
