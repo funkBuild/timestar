@@ -299,6 +299,13 @@ evidence below.
 - [ ] **Measure production SLOs.** Record one-node-failure write error band,
   recovery time, query latency, snapshot catch-up, and movement impact using the
   final binary and deployment settings.
+- [ ] **Deliver and prove clustered backup/restore.** The existing filesystem
+  copy guidance is now explicitly limited to standalone mode: it omitted
+  persistent node identity, Group-0/control state, the committed serving map,
+  and per-VShard Raft journals, and independent live replica copies are not one
+  recovery point. Production requires pinned VShard export plus restore into a
+  fresh cluster UUID with old membership scrubbed, corruption/interruption
+  rejection, and exact readback evidence.
 
 ### P2 — release and operations
 
@@ -308,7 +315,8 @@ evidence below.
   is unsupported for production, and the file names the partitioned Group-0,
   mTLS, and authenticated-operator requirements it does not demonstrate.
 - [ ] Reconcile architecture, API, runbook, and deployment documentation after
-  the remaining behavior is complete.
+  the remaining behavior is complete. The backup document now fails closed for
+  clustered use instead of presenting the standalone copy procedure as safe.
 - [ ] Record one final serial build, focused unit/socket tests, and each required
   live gate against the exact release commit.
 

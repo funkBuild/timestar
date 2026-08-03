@@ -27,7 +27,7 @@
 
 ## Operational
 
-- [Backup & Restore](backup-restore.md) - Backing up and restoring data directories
+- [Backup & Restore](backup-restore.md) - Standalone procedures and the open clustered backup/restore blocker
 - [Security](security.md) - Authentication and deployment hardening
 
 ## Format & Internals

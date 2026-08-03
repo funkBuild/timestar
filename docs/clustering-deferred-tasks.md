@@ -35,13 +35,15 @@ Production blockers take priority and are authoritative in
   repository-local temporary storage.
 - [ ] Run final multi-host topology, security, durability, and SLO gates against
   the exact release candidate.
+- [ ] Deliver a cluster backup/restore workflow over pinned, hash-verified
+  VShard snapshot streams. Restore must create a fresh cluster UUID, scrub old
+  node/Raft membership, reject partial or corrupt artifacts, resume interrupted
+  import safely, and pass exact post-restore readback.
 
 ## Feature completion
 
 - [ ] Cluster-aware `/subscribe` with one backfill/live barrier, resumable
   cursor, and no silent loss or duplicate through leader movement.
-- [ ] Backup/restore CLI over pinned VShard snapshot streams, restoring into a
-  fresh cluster UUID without resurrecting old membership.
 - [ ] Routing summaries that may prune fan-out only when complete and bound to
   the pinned map epoch.
 - [ ] Hierarchical query merge for saturated coordinators with deterministic
