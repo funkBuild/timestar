@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <limits>
 #include <numeric>
 #include <vector>
 
@@ -19,6 +20,33 @@ namespace timestar::bench {
 // JsonBatch — {"writes":[...]} batch of scalar write points (DOM batch path).
 // Protobuf  — serialized WriteRequest proto.
 enum class WireFormat { Json, JsonBatch, Protobuf, ProtobufBatch };
+
+// Array-format JSON generation reserves about 30 bytes per field value plus a
+// small envelope. Keep ordinary peak-rate runs pre-generated, but never let a
+// large campaign retain payloads proportional to its total duration. The
+// caller generates those payloads only after acquiring an in-flight request
+// slot, so retained payload memory is then bounded by connection concurrency.
+inline constexpr size_t kMaxPregeneratedArrayPayloadBytes = 256ULL * 1024 * 1024;
+
+inline bool shouldPreGenerateArrayPayloads(size_t timestampsPerBatch, size_t batchCount, size_t fieldCount,
+                                           size_t budgetBytes = kMaxPregeneratedArrayPayloadBytes) {
+    if (batchCount == 0) {
+        return true;
+    }
+
+    constexpr size_t kEnvelopeBytes = 512;
+    constexpr size_t kBytesPerFieldValue = 30;
+    const size_t max = std::numeric_limits<size_t>::max();
+    if (fieldCount > (max - kEnvelopeBytes) / kBytesPerFieldValue) {
+        return false;
+    }
+    const size_t bytesPerTimestamp = fieldCount * kBytesPerFieldValue;
+    if (bytesPerTimestamp != 0 && timestampsPerBatch > (max - kEnvelopeBytes) / bytesPerTimestamp) {
+        return false;
+    }
+    const size_t estimatedPayloadBytes = kEnvelopeBytes + timestampsPerBatch * bytesPerTimestamp;
+    return estimatedPayloadBytes <= budgetBytes && batchCount <= budgetBytes / estimatedPayloadBytes;
+}
 
 // Monotonic clock used for all latency timing.
 using clk = std::chrono::steady_clock;

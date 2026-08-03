@@ -129,11 +129,12 @@ durable shared mount or constrain resume to the original node.
 
 ## Run them ONE AT A TIME, with the previous run's data dirs deleted
 
-These gates are disk-hungry (the plan doc's MEASUREMENT HAZARD covers the quota-fence
-case). Run back-to-back as a battery, `fault_injection_gate.sh` FAILED -- 929/2000 client
-errors, 8% of baseline throughput, 794 reset rounds -- purely because free space had
-fallen 39 G to 13 G across the preceding gates. Run alone with space free, the same binary
-passes with 146 rounds and zero errors.
+These gates can be disk-hungry (the plan doc's MEASUREMENT HAZARD covers the quota-fence
+case). With the retired tmpfs-era fault profile, running a battery back-to-back made
+`fault_injection_gate.sh` fail with 929/2000 client errors, 8% of baseline throughput and
+794 reset rounds after free space fell from 39 G to 13 G. That history is why every gate
+still preflights its actual scratch filesystem and cleans its own roots; the current
+durable profile is much smaller.
 
 The failure mode is self-amplifying, which makes it very convincing as a "regression":
 less headroom -> slower bench -> the 0.3 s resetter fires more rounds -> slower still. If
@@ -167,11 +168,13 @@ cluster and performs exactly one verified reset inside `run_arm`.
 **Budget the disk before a run, not after.** Each bench writes
 `batches * batch-size * 10` points and the cluster keeps them at RF=3; measured here that
 is ~22 bytes per point per replica, i.e. ~6.7 G per 100 M points. `fault_injection_gate.sh`
-runs K+1 benches against ONE cluster and nothing is deleted between them, which is why its
-bench size came DOWN when it went to K storms (see its `BENCH_BATCHES` note): its measured
-peak was 27 G on the measured host. The gate checks the filesystem containing
-`GATE_TMP_ROOT` before starting; the historical 62 G `/tmp` tmpfs is no longer
-used by default.
+runs K+1 benches against ONE cluster and nothing is deleted between them. Its current
+1000-by-300, K=3 profile is about 12 M points before replication, or roughly 0.8 GiB at
+that measured density; the old 27-GiB peak belonged to the retired tmpfs-era profile. The
+gate requires 5 GiB free by default and exposes `GATE_MIN_FREE_GB` for deliberately larger
+site headroom. Larger batch/storm overrides automatically raise the minimum from the
+measured 22-byte density and cannot use that setting to weaken it. The historical 62 G
+`/tmp` tmpfs is no longer used by default.
 
 `restart_catchup_gate.sh` is now a focused correctness and resource gate. It
 uses 96 awaited hot-series prefix writes to force the same non-empty VShard
@@ -382,8 +385,9 @@ exactly that). The cluster planes only ever dial `port+1000` / `port+2000`.
    second, so the storm never fired and every "0 errors" assertion passed vacuously. The
    bench, the resetter and the probe now run decoupled.
    **The floors are 35 rounds / 100 connections PER STORM**, multiplied by K, and they are
-   roughly half of what a real run injects at the gate's own sizing (76-84 rounds
-   destroying 217-243 connections per storm). They were 8/8 — about 5% of observed, i.e.
+   roughly half of what a real durable run injects at the gate's own sizing (66-69 rounds
+   destroying 266-276 connections per storm). They were 8/8 — about 5% of the earlier
+   profile's observation, i.e.
    barely a vacuity check — until D-4, and 70/180 until the bench came down for K storms
    (D-21; at 2000 batches a storm injects ~147 rounds, which is what the A/B still uses).
    Half leaves room for a faster or slower box: the resetter fires on a fixed 0.3 s wall
@@ -399,8 +403,8 @@ exactly that). The cluster planes only ever dial `port+1000` / `port+2000`.
 
 **The proxy is a handicap and the gate says so.** Absolute throughput through a Python
 forwarder is not a server number, so the dip is asserted against a QUIET baseline measured
-through the same proxy — not against an unproxied figure. (In practice the handicap is
-small: 4.96 M pts/s baseline vs 5.0-5.1 M unproxied.)
+through the same proxy — not against an unproxied figure. The current private-journal
+control measured 171 kpts/s with zero errors; the three reset arms retained 85-90%.
 
 **It is a discriminating gate, and `fault_injection_ab.sh` proves that on demand — it has
 now actually been run (debt D-19).** It creates a `git worktree` at HEAD, applies a
@@ -434,12 +438,13 @@ discrimination is the COUNT separation in the table above, which is the assertio
 fails the script; the signature check is informational on both arms and prints both counts.
 
 **The A/B storms harder than the CI gate, deliberately.** The signal scales with reset
-ROUNDS, and the gate's own sizing is chosen for DISK (K+1 benches against one cluster, ~27 G
-of a 62 G tmpfs). At the gate's default 1000 batches / K=3, three A/B draws gave HEAD 0/4/2
-against REVERTED 7/22/4: the first two separate, the **third overlaps** and the reverted
-binary passed the gate outright. At 2000 batches a storm injects ~147 rounds instead of ~79,
-which is the intensity behind the original "9-10 errors in a single storm" observation. Both
-arms always get the identical setting, and the intensity ratio between them is asserted.
+ROUNDS. The current gate uses 1000 timed requests at 300 timestamps and K=3 so the private
+durable journals stay out of overload; the A/B pins the same request size but doubles the
+request count and uses K=2. The historical 1000-by-10000 A/B draws gave HEAD 0/4/2 against
+REVERTED 7/22/4: the first two separated and the third overlapped. Those figures explain
+the within-run ratio design, but they are not claimed as calibration for the new durable
+profile; rerun the on-demand A/B before changing its ratio or the production gate budget.
+Both arms always get the identical setting, and their observed intensity ratio is asserted.
 
 **Why the claim is a ratio and not a threshold.** Two absolute floors were tried and both
 were wrong: `3 * GATE_MAX_STORM_ERRORS` = 9 failed a correct REVERTED 7, and the absolute 5

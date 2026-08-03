@@ -42,8 +42,8 @@
 # storm that followed inherited a sick cluster AND a longer bench (the resetter fires on a
 # fixed 0.3 s clock, so a slower bench takes MORE rounds -- 199 against the usual 145-148).
 #
-# THE K-STORM FORM IS NOW MEASURED TOO -- five runs of THIS text, K=3, against one
-# unchanged HEAD binary (2fdde50 + the sizing below), each run a fresh cluster:
+# THE K-STORM FORM WAS MEASURED at the original tmpfs-era sizing -- five runs,
+# K=3, against one unchanged HEAD binary (2fdde50), each a fresh cluster:
 #
 #     run          A              B              C              D              E
 #     errors       [0 0 0] = 0    [1 0 0] = 1    [1 0 1] = 2    [0 0 0] = 0    [0 4 0] = 4
@@ -90,10 +90,15 @@
 # Usage: fault_injection_gate.sh [SERVER_BINARY]
 #   GATE_STORM_ROUNDS=K        storms per run (default 3)
 #   GATE_MAX_STORM_ERRORS=N    total client-error budget across all K (default 6)
+#   GATE_BATCH_SIZE=N           timestamps per timed request (default 300)
+#   GATE_BENCH_BATCHES=N        timed requests per arm (default 1000)
+#   GATE_BENCH_TIMEOUT=N        seconds before TERM (default 300)
+#   GATE_BENCH_KILL_AFTER=N     TERM-to-KILL grace in seconds (default 15)
 #   exit 0 = pass, 1 = property failed, 2 = setup refused, 3 = VOID (re-draw)
 set -u
 cd "$(dirname "$0")" || exit 2
 . ./cluster_gate_lib.sh
+. ./benchmark_result_lib.sh
 
 BIN="${1:-$BUILD_DIR/bin/timestar_http_server}"
 [ -x "$BIN" ] || { echo "no server binary at $BIN"; exit 2; }
@@ -116,8 +121,9 @@ PORTS="19410 19411 19412"
 # test it, and it must say so.
 #
 # They came down from 70/180 with the bench size (see BENCH_BATCHES below): 70/180 was
-# ~50% of a 2000-batch storm, and K storms of that size do not fit this box's tmpfs.
-# Per-storm observations at the current 1000 batches are in the header's table.
+# ~50% of a 2000-batch storm. The current private-journal profile measured 66-69
+# rounds and 266-276 destroyed connections per storm, so 35/100 remains a
+# conservative approximately-half-observed floor.
 #
 # If a genuinely slower/faster box needs a different number, override rather than edit:
 # GATE_MIN_RESET_ROUNDS / GATE_MIN_RESET_CONNS. Record the observed counts when you do.
@@ -138,12 +144,41 @@ MIN_RESET_CONNS="${GATE_MIN_RESET_CONNS:-100}"
 # destroys EVERY live connection on every round, 0.3 s apart), not by how long the bench
 # runs. A shorter bench buys fewer ROUNDS, not weaker ones.
 #
-# 1000 batches => 100 M points/bench, ~4 benches/run => ~25 G peak, leaving the README's
-# headroom intact. The floors above move with it: 146-155 rounds / 400-431 connections
-# measured per storm at 2000 batches, so ~73/200 at 1000, and the floors are ~50% of that
-# (the resetter fires on a wall clock while bench length is machine-dependent, so a faster
-# box legitimately injects fewer rounds).
+# The old disk-backed invocation kept 1000 x 10,000 timestamps with four
+# connections: 400,000 points simultaneously entered the write router. Its
+# fault-free control shed 920/1000 requests as overloaded, so it measured
+# admission pressure before injecting a reset. A first replacement at 1500 x
+# 500 was clean for one storm but self-amplified across three on the required
+# private durable journals: errors [1 16 580], reset rounds [126 215 465], and
+# retained throughput [83% 48% 13%]. By the last arm, retryable overload rather
+# than reconnect behavior dominated the result.
+#
+# The durable-disk control below keeps the historical 1000 timed requests while
+# reducing each request enough that all three storms remain the same fault:
+#
+#   1000 batches x 300 timestamps x 10 fields = 3 M points/arm
+#   four arms x RF=3 ~= 0.8 GiB measured-disk scale
+#   four connections x 300 timestamps x 10 fields = 12,000 concurrent points
+#
+# Measured on the private v1 layout: a clean 171k-point/s control, 66-69 reset
+# rounds and 266-276 destroyed connections in every storm, zero errors, 85-90%
+# retained throughput, and zero uncommitted-Raft refusals. That remains well
+# above every anti-vacuity floor without turning later draws into an endurance
+# test. A hard-kill grace prevents a stuck graceful shutdown from turning the
+# arm bound into an indefinite gate.
+BATCH_SIZE="${GATE_BATCH_SIZE:-300}"
 BENCH_BATCHES="${GATE_BENCH_BATCHES:-1000}"
+BENCH_TIMEOUT="${GATE_BENCH_TIMEOUT:-300}"
+BENCH_KILL_AFTER="${GATE_BENCH_KILL_AFTER:-15}"
+require_positive_setting() { # NAME VALUE
+    case "$2" in
+        ''|*[!0-9]*|0) echo "ABORT: $1 must be a positive integer" >&2; exit 2 ;;
+    esac
+}
+require_positive_setting GATE_BATCH_SIZE "$BATCH_SIZE"
+require_positive_setting GATE_BENCH_BATCHES "$BENCH_BATCHES"
+require_positive_setting GATE_BENCH_TIMEOUT "$BENCH_TIMEOUT"
+require_positive_setting GATE_BENCH_KILL_AFTER "$BENCH_KILL_AFTER"
 # The dip bound, as a percentage of the quiet-through-the-proxy baseline.
 MIN_DIP_PCT="${GATE_MIN_DIP_PCT:-40}"
 # D-21: K storms per run, and a budget on their TOTAL rather than a zero on one draw. The
@@ -160,13 +195,37 @@ MAX_STORM_ERRORS="${GATE_MAX_STORM_ERRORS:-6}"
 REBALANCE_STORM="${GATE_REBALANCE_STORM:-0}"
 MIN_COMBINED_CALLS="${GATE_MIN_COMBINED_CALLS:-0}"
 CONNECTIONS="${GATE_CONNECTIONS:-4}"
-# A baseline slower than this VOIDS the run rather than failing it (see the header): the
-# fault-free control through the proxy runs 4.98-5.16 M pts/s here, and the one collapse
-# observed came in at 0.45 M. The floor is ~40% of the low end -- far enough below the
-# observed band to never fire on an honestly slower box, far enough above the collapse to
-# catch it.
-MIN_BASE_TPUT="${GATE_MIN_BASE_TPUT:-2000000}"
-require_gate_space_gb 30 "fault-injection gate" || exit 2
+require_positive_setting GATE_STORM_ROUNDS "$STORM_ROUNDS"
+require_positive_setting GATE_MIN_RESET_ROUNDS "$MIN_RESET_ROUNDS"
+require_positive_setting GATE_MIN_RESET_CONNS "$MIN_RESET_CONNS"
+require_positive_setting GATE_CONNECTIONS "$CONNECTIONS"
+case "$REBALANCE_STORM" in
+    0|1) ;;
+    *) echo "ABORT: GATE_REBALANCE_STORM must be 0 or 1" >&2; exit 2 ;;
+esac
+case "$MAX_STORM_ERRORS:$MIN_COMBINED_CALLS" in
+    *[!0-9:]*|:*|*:) echo "ABORT: error and combined-call budgets must be non-negative integers" >&2; exit 2 ;;
+esac
+# A baseline slower than this VOIDS the run rather than failing it. The former
+# 2-Mpoint/s floor was calibrated on a tmpfs and rejects the required durable
+# disk profile before a fault is injected; repeated disk-backed skew controls
+# measured ~71k points/s. Keep a 50k liveness floor while control cleanliness,
+# timeout bounds, and reset anti-vacuity enforce the useful property.
+MIN_BASE_TPUT="${GATE_MIN_BASE_TPUT:-50000}"
+# Derive scratch admission from the actual workload at the measured private-
+# journal density (22 bytes/point/replica), with 25% headroom and a 5-GiB floor.
+# Thus the default needs 5 GiB, while restoring the 10,000-timestamp shape
+# automatically restores its approximately 31-GiB preflight. An explicit
+# override may add site headroom but cannot weaken the calculated requirement.
+CALCULATED_MIN_FREE_GB=$(awk -v batches="$BENCH_BATCHES" -v batch_size="$BATCH_SIZE" -v storms="$STORM_ROUNDS" \
+    'BEGIN { gib=1073741824; bytes=batches*batch_size*10*(storms+1)*3*22*1.25; n=int(bytes/gib); if (n*gib < bytes) n++; if (n < 5) n=5; print n }')
+MIN_FREE_GB="${GATE_MIN_FREE_GB:-$CALCULATED_MIN_FREE_GB}"
+require_positive_setting GATE_MIN_FREE_GB "$MIN_FREE_GB"
+[ "$MIN_FREE_GB" -ge "$CALCULATED_MIN_FREE_GB" ] || {
+    echo "ABORT: GATE_MIN_FREE_GB=$MIN_FREE_GB is below the calculated ${CALCULATED_MIN_FREE_GB}-GiB workload requirement" >&2
+    exit 2
+}
+require_gate_space_gb "$MIN_FREE_GB" "fault-injection gate" || exit 2
 
 # VOID is not a pass and not a failure: it is a run that did not test the property. It gets
 # its own exit code so a caller (fault_injection_ab.sh, CI) can re-draw instead of filing a
@@ -177,15 +236,54 @@ gate_void() {
     exit 3
 }
 
+BASE_TRANSCRIPT="$GATE_TMP_ROOT/tsgate_fi_base.txt"
+STORM_TRANSCRIPT="$GATE_TMP_ROOT/tsgate_fi_storm.txt"
+BENCH_FAILURE_EVIDENCE="$GATE_TMP_ROOT/tsgate_fi_bench_failure.log"
+
+preserve_and_void_benchmark() { # LABEL EXIT_CODE TRANSCRIPT REASON
+    local label="$1" exit_code="$2" transcript="$3" reason="$4" evidence_note
+    echo "  $label benchmark transcript tail:" >&2
+    tail -n 80 "$transcript" >&2 2>/dev/null || true
+    if record_benchmark_failure "$label" "$exit_code" "$transcript" "$BENCH_FAILURE_EVIDENCE"; then
+        evidence_note="complete transcript retained at $BENCH_FAILURE_EVIDENCE"
+    else
+        evidence_note="WARNING: could not retain transcript at $BENCH_FAILURE_EVIDENCE"
+    fi
+    gate_void "$reason; $evidence_note"
+}
+
+run_benchmark() {
+    run_bounded_command "$BENCH_TIMEOUT" "$BENCH_KILL_AFTER" "$BENCH" \
+        --server-port 19410 --smp "$GATE_BENCH_SMP" --memory "$GATE_BENCH_MEMORY" --overprovisioned \
+        --batches "$BENCH_BATCHES" --batch-size "$BATCH_SIZE" --verify 0 --warmup 5 \
+        --connections "$CONNECTIONS" --hosts 1000 --racks 2
+}
+
+LAST_RAFT_REFUSALS=0
+report_raft_admission() {
+    local port status current peak limit refusals total=0
+    for port in $PORTS; do
+        status=$(cluster_status "$port")
+        current=$(status_field "$status" uncommitted_raft_bytes)
+        peak=$(status_field "$status" uncommitted_raft_peak_bytes)
+        limit=$(status_field "$status" uncommitted_raft_limit_bytes)
+        refusals=$(status_field "$status" uncommitted_raft_refusals)
+        echo "  :$port uncommitted=${current:-?} peak=${peak:-?} limit=${limit:-?} refusals=${refusals:-?}"
+        total=$((total + ${refusals:-0}))
+    done
+    LAST_RAFT_REFUSALS=$total
+}
+
 cleanup() {
     [ -n "${PROXY_PID:-}" ] && kill -9 "$PROXY_PID" 2>/dev/null
     gate_cleanup 1941 $GATE_TMP_ROOT/tsgate_fi1 $GATE_TMP_ROOT/tsgate_fi2 $GATE_TMP_ROOT/tsgate_fi3
-    rm -f $GATE_TMP_ROOT/tsgate_fi_base.txt $GATE_TMP_ROOT/tsgate_fi_storm.txt $GATE_TMP_ROOT/tsgate_fi_resp.txt \
-        $GATE_TMP_ROOT/tsgate_fi_rounds $GATE_TMP_ROOT/tsgate_fi_stop
+    rm -f "$BASE_TRANSCRIPT" "$STORM_TRANSCRIPT" "$GATE_TMP_ROOT/tsgate_fi_resp.txt" \
+        "$GATE_TMP_ROOT/tsgate_fi_rounds" "$GATE_TMP_ROOT/tsgate_fi_stop"
 }
 kill_cluster 1941
 require_ports_free 19410 19411 19412
 fresh_gate_data_dirs $GATE_TMP_ROOT/tsgate_fi1 $GATE_TMP_ROOT/tsgate_fi2 $GATE_TMP_ROOT/tsgate_fi3 || exit 2
+rm -f "$BENCH_FAILURE_EVIDENCE"
 trap cleanup EXIT
 
 # Node 3 is reached through 127.0.0.2 by everyone EXCEPT itself.
@@ -251,23 +349,34 @@ assert_ge "VShards led behind the proxy (traffic that must cross the fault)" "${
 # Baseline: the same load through the same proxy, with NO resets. Everything below is
 # measured against this, not against an unproxied number.
 echo "=== baseline (proxy in path, no faults) ==="
-timeout 300 "$BENCH" --server-port 19410 --smp "$GATE_BENCH_SMP" --memory "$GATE_BENCH_MEMORY" --overprovisioned --batches "$BENCH_BATCHES" --batch-size 10000 --verify 0 \
-    --warmup 5 --connections 4 --hosts 1000 --racks 2 >$GATE_TMP_ROOT/tsgate_fi_base.txt 2>&1
+BASE_RC=0
+run_benchmark >"$BASE_TRANSCRIPT" 2>&1 || BASE_RC=$?
 # "First error" is printed here too (D-21): when the baseline DOES break, its signature is
 # the only evidence of why, and the run that first showed this had none recorded.
-grep -E "Requests:|First error|Throughput|batch latency" $GATE_TMP_ROOT/tsgate_fi_base.txt
-BASE_TPUT=$(grep -oE 'Throughput:[[:space:]]*[0-9.]+' $GATE_TMP_ROOT/tsgate_fi_base.txt | head -1 | grep -oE '[0-9.]+')
-BASE_ERRS=$(grep -o '[0-9]* HTTP errors' $GATE_TMP_ROOT/tsgate_fi_base.txt | head -1 | cut -d' ' -f1)
+grep -E "Requests:|First error|Throughput|batch latency" "$BASE_TRANSCRIPT"
+if [ "$BASE_RC" -ne 0 ]; then
+    preserve_and_void_benchmark baseline "$BASE_RC" "$BASE_TRANSCRIPT" \
+        "the fault-free baseline benchmark exited $BASE_RC (arm bound ${BENCH_TIMEOUT}s plus ${BENCH_KILL_AFTER}s shutdown grace)"
+fi
+if ! parse_benchmark_result "$BASE_TRANSCRIPT"; then
+    preserve_and_void_benchmark baseline "$BASE_RC" "$BASE_TRANSCRIPT" \
+        "the successful fault-free baseline emitted no complete benchmark summary"
+fi
+BASE_TPUT="$BENCHMARK_RESULT_THROUGHPUT"
+BASE_ERRS="$BENCHMARK_RESULT_HTTP_ERRORS"
 echo "  baseline throughput: ${BASE_TPUT:-?} (errors ${BASE_ERRS:-?})"
 # THE CONTROL ARM, AND IT VOIDS RATHER THAN FAILS (debt D-21). No fault has been injected
 # yet, so a broken baseline is a broken environment -- disk headroom, a starved proxy, a
 # co-tenant -- and everything downstream of it measures that instead of the server. Failing
 # here would be indistinguishable from the property failing, which is precisely the
 # confusion that left a red run uninformative.
-[ "${BASE_ERRS:-missing}" = "0" ] || gate_void "the fault-free baseline through the proxy took ${BASE_ERRS} client errors"
+[ "${BASE_ERRS:-missing}" = "0" ] ||
+    preserve_and_void_benchmark baseline "$BASE_RC" "$BASE_TRANSCRIPT" \
+        "the fault-free baseline through the proxy took ${BASE_ERRS} client errors"
 if [ -n "${BASE_TPUT:-}" ]; then
     awk -v t="$BASE_TPUT" -v m="$MIN_BASE_TPUT" 'BEGIN{exit !(t+0 < m+0)}' &&
-        gate_void "the fault-free baseline ran at $BASE_TPUT pts/s, under the ${MIN_BASE_TPUT} floor"
+        preserve_and_void_benchmark baseline "$BASE_RC" "$BASE_TRANSCRIPT" \
+            "the fault-free baseline ran at $BASE_TPUT pts/s, under the ${MIN_BASE_TPUT} floor"
 else
     gate_void "could not parse a throughput from the baseline run"
 fi
@@ -303,8 +412,7 @@ while [ "$storm" -le "$STORM_ROUNDS" ]; do
     # second, so the storm never fired -- the anti-vacuity assertions below exist because
     # of that.
     rm -f $GATE_TMP_ROOT/tsgate_fi_stop $GATE_TMP_ROOT/tsgate_fi_rebal
-    ( timeout 300 "$BENCH" --server-port 19410 --smp "$GATE_BENCH_SMP" --memory "$GATE_BENCH_MEMORY" --overprovisioned --batches "$BENCH_BATCHES" --batch-size 10000 --verify 0 \
-        --warmup 5 --connections "$CONNECTIONS" --hosts 1000 --racks 2 >$GATE_TMP_ROOT/tsgate_fi_storm.txt 2>&1 ) &
+    ( run_benchmark >"$STORM_TRANSCRIPT" 2>&1 ) &
     BENCHPID=$!
     ( ROUNDS=0
       while [ ! -f $GATE_TMP_ROOT/tsgate_fi_stop ]; do
@@ -349,7 +457,8 @@ while [ "$storm" -le "$STORM_ROUNDS" ]; do
         esac
         i=$((i + 1))
     done
-    wait $BENCHPID
+    wait "$BENCHPID"
+    BENCH_RC=$?
     touch $GATE_TMP_ROOT/tsgate_fi_stop
     wait $RESETPID
     if [ -n "$REBALPID" ]; then
@@ -362,7 +471,7 @@ while [ "$storm" -le "$STORM_ROUNDS" ]; do
     fi
     ROUNDS=$(cat $GATE_TMP_ROOT/tsgate_fi_rounds 2>/dev/null || echo 0)
     echo "  probe writes: $PROBE_OK ok, $PROBE_5XX 5xx, $PROBE_OTHER other (of $i attempted)"
-    grep -E "Requests:|First error|Throughput|batch latency" $GATE_TMP_ROOT/tsgate_fi_storm.txt
+    grep -E "Requests:|First error|Throughput|batch latency" "$STORM_TRANSCRIPT"
 
     # The proxy's RESET lines are CUMULATIVE across the whole run, so this storm's share is
     # the delta. Summing the file per storm would count every earlier storm again and make
@@ -372,12 +481,17 @@ while [ "$storm" -le "$STORM_ROUNDS" ]; do
     PREV_CONNS=$ALL_CONNS
     echo "  reset rounds: $ROUNDS, connections destroyed: $RESET_CONNS"
 
-    STORM_ERRS=$(grep -o '[0-9]* HTTP errors' $GATE_TMP_ROOT/tsgate_fi_storm.txt | head -1 | cut -d' ' -f1)
-    STORM_CONN=$(grep -o '[0-9]* connection failures' $GATE_TMP_ROOT/tsgate_fi_storm.txt | head -1 | cut -d' ' -f1)
-    STORM_TPUT=$(grep -oE 'Throughput:[[:space:]]*[0-9.]+' $GATE_TMP_ROOT/tsgate_fi_storm.txt | head -1 | grep -oE '[0-9.]+')
-    # A bench that produced no parseable counter at all is a harness failure, not a zero.
-    [ -n "${STORM_ERRS:-}" ] && [ -n "${STORM_TPUT:-}" ] ||
-        gate_void "storm $storm produced no parseable bench result (timeout? see $GATE_TMP_ROOT/tsgate_fi_storm.txt)"
+    if [ "$BENCH_RC" -ne 0 ]; then
+        preserve_and_void_benchmark "storm-$storm" "$BENCH_RC" "$STORM_TRANSCRIPT" \
+            "storm $storm benchmark exited $BENCH_RC (arm bound ${BENCH_TIMEOUT}s plus ${BENCH_KILL_AFTER}s shutdown grace)"
+    fi
+    if ! parse_benchmark_result "$STORM_TRANSCRIPT"; then
+        preserve_and_void_benchmark "storm-$storm" "$BENCH_RC" "$STORM_TRANSCRIPT" \
+            "storm $storm emitted no complete benchmark summary"
+    fi
+    STORM_ERRS="$BENCHMARK_RESULT_HTTP_ERRORS"
+    STORM_CONN="$BENCHMARK_RESULT_CONNECTION_FAILURES"
+    STORM_TPUT="$BENCHMARK_RESULT_THROUGHPUT"
 
     TOT_ROUNDS=$((TOT_ROUNDS + ROUNDS))
     TOT_CONNS=$((TOT_CONNS + RESET_CONNS))
@@ -403,6 +517,8 @@ while [ "$storm" -le "$STORM_ROUNDS" ]; do
     # that a failure three times over. What must never happen is FEWER than the acked count
     # (loss) or MORE than were attempted (fabrication or a double count).
     sleep 3
+    echo "=== storm $storm raft proposal admission ==="
+    report_raft_admission
     for p in $PORTS; do
         RESP=$(curl -s -m20 -X POST "http://127.0.0.1:$p/query" -H 'Content-Type: application/json' \
             -d "{\"query\":\"count:faultprobe(v){}\",\"startTime\":$STORM_TS,\"endTime\":$((STORM_TS + PROBE * 1000000000))}")
@@ -449,6 +565,11 @@ echo "GATE_METRIC worst_storm_pct $WORST_PCT"
 echo "GATE_METRIC rebalance_transfers $TOT_TRANSFERS"
 echo "GATE_METRIC rebalance_calls $TOT_REBAL_CALLS"
 echo "GATE_METRIC bench_connections $CONNECTIONS"
+echo "GATE_METRIC bench_batches $BENCH_BATCHES"
+echo "GATE_METRIC bench_batch_size $BATCH_SIZE"
+echo "GATE_METRIC bench_timeout_seconds $BENCH_TIMEOUT"
+echo "GATE_METRIC bench_kill_after_seconds $BENCH_KILL_AFTER"
+echo "GATE_METRIC uncommitted_raft_refusals_total $LAST_RAFT_REFUSALS"
 
 # THE ANTI-VACUITY ASSERTIONS. Without a real storm this gate proves nothing: a proxy that
 # never fired, or one that fired while no connection was open, would otherwise pass. The

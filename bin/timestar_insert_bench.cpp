@@ -15,9 +15,9 @@
  */
 
 #include "bench_common.hpp"
+#include "timestar/version.hpp"
 
 #include "timestar.pb.h"
-#include "timestar/version.hpp"
 
 #include <boost/range/irange.hpp>
 
@@ -27,8 +27,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
-#include <cstring>
 #include <cstdint>
+#include <cstring>
 #include <iomanip>
 #include <iostream>
 #include <numeric>
@@ -48,6 +48,7 @@
 #include <seastar/http/request.hh>
 #include <seastar/net/inet_address.hh>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace seastar;
@@ -299,7 +300,9 @@ struct ShardResult {
  *
  * All parallelism comes from the HTTP connection pool (`maxConn` in-flight
  * requests).  This avoids competing with the server for CPU cores when both
- * run on the same machine.  Payloads are pre-generated before timing starts.
+ * run on the same machine. Small array-format campaigns pre-generate payloads;
+ * larger campaigns generate only after acquiring a connection slot so memory
+ * is bounded by concurrency rather than total run length.
  */
 static future<ShardResult> runBenchmark(socket_address addr, unsigned maxConn, size_t batchSize, size_t batchCount,
                                         int numHosts, int numRacks, uint64_t globalSeed,
@@ -310,14 +313,14 @@ static future<ShardResult> runBenchmark(socket_address addr, unsigned maxConn, s
     auto factory = std::make_unique<http::experimental::basic_connection_factory>(addr);
     auto client = std::make_unique<http_client>(std::move(factory), maxConn);
 
-    // Pre-generate payloads for the array formats so timing measures only
-    // server throughput. json-batch payloads are generated LAZILY per request
-    // instead: high-cardinality endurance runs (30k batches x ~14MB) would
-    // need hundreds of GB pre-generated, which is exactly the client-side
-    // bad_alloc this loop produced at 130k batches. Lazy generation costs
-    // client CPU during the run, which only matters when benchmarking the
-    // server's peak rate -- use the array formats for that.
+    // Pre-generate array payloads only when their conservative retained-capacity
+    // estimate fits a fixed budget. Large array campaigns and both scalar-batch
+    // formats generate after acquiring a connection slot: a 1000 x 10k x 10
+    // fault campaign otherwise reserves roughly 3 GB before sending its first
+    // timed request and dies under the driver's documented 1-GiB limit. Small
+    // peak-rate campaigns retain the pre-generated timing behavior.
     std::vector<std::string> payloads;
+    std::vector<std::pair<int, int>> arrayTagSets;
 
     std::mt19937 rng(globalSeed);
     std::uniform_int_distribution<int> hostDist(1, numHosts);
@@ -325,12 +328,19 @@ static future<ShardResult> runBenchmark(socket_address addr, unsigned maxConn, s
 
     constexpr uint64_t BASE_TS = 1'000'000'000'000'000'000ULL;
 
-    const bool lazyPayloads = (format == WireFormat::JsonBatch || format == WireFormat::ProtobufBatch);
-    if (!lazyPayloads) {
+    const bool scalarBatchFormat = (format == WireFormat::JsonBatch || format == WireFormat::ProtobufBatch);
+    const bool preGenerateArrayPayloads = !scalarBatchFormat && timestar::bench::shouldPreGenerateArrayPayloads(
+                                                                    batchSize, batchCount, FIELD_NAMES.size());
+    if (!scalarBatchFormat) {
+        arrayTagSets.reserve(batchCount);
+        for (size_t i = 0; i < batchCount; ++i) {
+            arrayTagSets.emplace_back(hostDist(rng), rackDist(rng));
+        }
+    }
+    if (preGenerateArrayPayloads) {
         payloads.reserve(batchCount);
         for (size_t i = 0; i < batchCount; ++i) {
-            int hid = hostDist(rng);
-            int rid = rackDist(rng);
+            const auto [hid, rid] = arrayTagSets[i];
             uint64_t startTs = BASE_TS + i * batchSize * MINUTE_NS;
             if (format == WireFormat::Protobuf) {
                 payloads.push_back(buildPayloadProto(globalSeed, hid, rid, startTs, batchSize));
@@ -363,10 +373,10 @@ static future<ShardResult> runBenchmark(socket_address addr, unsigned maxConn, s
         auto t0 = clk::now();
 
         auto req = http::request::make("POST", sstring("localhost"), sstring("/write"));
-        // Lazy check FIRST: ProtobufBatch is both lazy and proto, and the
-        // pregenerated `payloads` vector is empty in lazy mode -- indexing it
-        // here was an instant segfault.
-        if (lazyPayloads) {
+        // Scalar batches are always generated lazily. Large array campaigns
+        // use the same concurrency-bounded lifetime while preserving their
+        // original deterministic host/rack sequence.
+        if (scalarBatchFormat) {
             const uint64_t startTs = BASE_TS + i * batchSize * MINUTE_NS;
             if (format == WireFormat::ProtobufBatch) {
                 req.write_body("bin",
@@ -376,11 +386,27 @@ static future<ShardResult> runBenchmark(socket_address addr, unsigned maxConn, s
                 req.write_body("json",
                                sstring(buildPayloadJsonBatch(globalSeed, numHosts, numRacks, startTs, batchSize, i)));
             }
-        } else if (useProto) {
-            req.write_body("bin", sstring(payloads[i]));
-            req.set_mime_type("application/x-protobuf");
         } else {
-            req.write_body("json", sstring(payloads[i]));
+            std::string generatedPayload;
+            const std::string* payload = nullptr;
+            if (preGenerateArrayPayloads) {
+                payload = &payloads[i];
+            } else {
+                const auto [hid, rid] = arrayTagSets[i];
+                const uint64_t startTs = BASE_TS + i * batchSize * MINUTE_NS;
+                if (useProto) {
+                    generatedPayload = buildPayloadProto(globalSeed, hid, rid, startTs, batchSize);
+                } else {
+                    generatedPayload = buildPayload(globalSeed, hid, rid, startTs, batchSize);
+                }
+                payload = &generatedPayload;
+            }
+            if (useProto) {
+                req.write_body("bin", sstring(*payload));
+                req.set_mime_type("application/x-protobuf");
+            } else {
+                req.write_body("json", sstring(*payload));
+            }
         }
 
         try {

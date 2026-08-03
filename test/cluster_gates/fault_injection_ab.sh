@@ -83,21 +83,19 @@ GATE="$(pwd)/fault_injection_gate.sh"
 
 # THE A/B STORMS HARDER THAN THE CI GATE, and it must, because the two are sized for
 # different things. The discrimination signal is the reverted binary failing writes it
-# cannot re-dial for, so it scales with the number of RESET ROUNDS a bench is exposed to;
-# the CI gate's own sizing is chosen for DISK (K+1 benches against one cluster, ~27 G of a
-# 62 G tmpfs) and not for signal. Measured at the gate's default 1000 batches / K=3, three
-# A/B draws came out HEAD 0/4/2 against REVERTED 7/22/4 -- real, but the third draw's arms
-# OVERLAP and the reverted binary passed the gate outright. At 2000 batches a storm injects
-# ~147 rounds instead of ~79, which is the intensity behind the original "9-10 errors in a
-# SINGLE storm" observation.
+# cannot re-dial for, so it scales with the number of RESET ROUNDS a bench is exposed to.
+# The durable CI gate uses 1000 requests x 300 timestamps x K=3; this A/B pins the same
+# request size and doubles the request count while using K=2. Historical draws from the
+# retired 10,000-timestamp profile explain the ratio below, but are not silently reused as
+# calibration for this profile.
 #
 # So: twice the bench, two storms instead of three. Both arms get the identical setting --
 # that is the whole point, and the storm-intensity ratio is asserted below -- and the run
-# stays at 3 benches, i.e. the ~34 G peak measured for that shape -- which is why the
-# free-space precondition below is 40 G and not the 30 G it used to be: 34 G is the exact
-# point at which the K=3 sizing was killed for filling this tmpfs, so a 30 G floor admitted
-# a run that could not fit.
+# stays at three benches. The conservative 40-GiB outer preflight also covers the retained
+# comparison build/worktree; the gate data itself is now much smaller and stays outside
+# `/tmp`.
 export GATE_BENCH_BATCHES="${GATE_BENCH_BATCHES:-2000}"
+export GATE_BATCH_SIZE="${GATE_BATCH_SIZE:-300}"
 export GATE_STORM_ROUNDS="${GATE_STORM_ROUNDS:-2}"
 # NEITHER OF THESE MAY LIVE ON /tmp, and that is a hard requirement rather than a
 # preference. On hosts where /tmp is tmpfs, a comparison worktree (~1 G with seastar)
@@ -231,7 +229,7 @@ PATCH_LINES=$(git -C "$AB_WORKTREE" diff --numstat HEAD -- | awk '{a+=$1; d+=$2}
 # clone ~1 G from GitHub over the network for a dependency that is byte-identical to the
 # one already on disk.
 #
-# A SYMLINK IS CORRECT HERE, not a shortcut. The revert set is three files under
+# A SYMLINK IS CORRECT HERE, not a shortcut. The revert set is two files under
 # lib/cluster/data; seastar is not in it and cannot be, so both arms are meant to compile
 # the SAME seastar source. The build is out-of-source (everything lands in $AB_BUILD), so
 # sharing the source directory cannot let one arm's objects reach the other's.
@@ -330,8 +328,9 @@ fi
 # THE FLOORS SCALE WITH K, because these are RUN TOTALS. They were flat 70/180 -- the
 # gate's old PER-STORM numbers -- so at K=2 they demanded less than one storm's worth of
 # resets across two, and a run in which the second storm never fired would have passed.
-# The gate's own per-storm floors are 35/100 (see its BENCH_BATCHES note); at the A/B's
-# 2000 batches a storm injects ~140 rounds / ~390 connections, so these stay conservative.
+# The gate's own per-storm floors are 35/100 (see its BENCH_BATCHES note). The A/B keeps
+# those same hard anti-vacuity floors and additionally compares the measured arm intensity;
+# it no longer claims the retired 10,000-timestamp profile's ~140/390 observation.
 AB_MIN_ROUNDS=$(( ${GATE_MIN_RESET_ROUNDS:-35} * GATE_STORM_ROUNDS ))
 AB_MIN_CONNS=$(( ${GATE_MIN_RESET_CONNS:-100} * GATE_STORM_ROUNDS ))
 assert_ge "reverted run: reset rounds (K=$GATE_STORM_ROUNDS)"  "${R_ROUNDS:-0}" "$AB_MIN_ROUNDS"

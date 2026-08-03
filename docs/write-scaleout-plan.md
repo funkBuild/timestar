@@ -155,6 +155,13 @@ see [ADR 0005](adr/0005-checkquorum-transfer-bypass.md).
 - [ ] Run final same-candidate multi-process gates with explicit per-process
   memory budgets: node kill, pattern-delete failover/restart, network fault
   injection, and the final serial release rerun of the completed storage gates.
+  The exact `26b68b4` server passed the bounded 6,000-target pattern-delete arm,
+  and its node-kill, empty-root catch-up, movement, unit, and socket evidence is
+  recorded in the readiness review. The corrected connection-bounded benchmark
+  driver and durable private-journal reset profile passed three local storms
+  with zero errors, 203 reset rounds, 812 live connections destroyed, 85%
+  worst-arm throughput retention, and exact per-replica probe readback. Commit
+  those fixes and repeat the serial battery against that one resulting identity.
 - [ ] Measure final multi-host throughput, latency, recovery, and movement SLOs.
 
 ## Acceptance gates

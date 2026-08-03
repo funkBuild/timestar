@@ -189,6 +189,26 @@ inventory and rules.
   node recovered the same one-plan/6,000-target state without resurrection. The
   three one-reactor nodes stayed within their 1-GiB process limits and the gate
   removed all four `build/tmp` roots afterward.
+- [x] Make the local network-reset qualification bounded and diagnostic on the
+  required private durable journals. The insert driver no longer retains every
+  array payload for a long campaign: it pre-generates only below a conservative
+  256-MiB payload budget and otherwise builds after acquiring one of the bounded
+  connection slots. This removed the measured approximately 3-GiB reservation
+  and `std::bad_alloc` from the former 1,000-by-10,000-by-10 shape under the
+  driver's 1-GiB limit. Overflow-safe policy tests pin the boundary. The gate
+  now rejects a nonzero or incomplete benchmark result, retains the complete
+  failed transcript outside disposable node roots, and hard-kills a benchmark
+  that cannot finish its graceful shutdown after the configured deadline.
+  Its old durable-disk control was invalid: 920/1,000 fault-free requests were
+  shed as overloaded. A later 1,500-by-500 profile passed one storm but turned
+  successive storms into a storage-overload feedback loop, with errors
+  `[1,16,580]` and throughput retention `[83%,48%,13%]`. The replacement keeps
+  1,000 requests at 300 timestamps by ten fields. The bounded 2026-08-03 local
+  run passed three storms with zero errors, 203 reset rounds, 812 destroyed live
+  peer connections, 85% worst-arm throughput retention, exact 200-point probe
+  readback on every replica after every storm, and zero uncommitted-Raft
+  refusals. System `/tmp` remained at 105 MiB; gate data lived and cleaned under
+  `build/tmp`.
 - [x] Remove the VShard snapshot reactor-memory ceiling without adding another
   protocol version. Production snapshots now encode the exact existing `TSP1`
   v1 bytes directly from immutable Engine objects into owned sidecars, hydrate
@@ -320,7 +340,10 @@ integrity. Production remains blocked on the P1 evidence below.
   There is no fallback, negotiation above v1, or activation path.
 - [ ] **Run multi-host topology, security, and fault gates.** The bounded local
   mTLS identity gate now covers positive, trusted-wrong-endpoint, and recovery
-  paths. The read-only multi-host preflight now binds the deployed nodes to the
+  paths. The bounded local data-plane reset gate now proves repeated real TCP
+  RST recovery, retry classification, exact acknowledged-write readback, and
+  throughput retention without saturating the private journal layout. The
+  read-only multi-host preflight now binds the deployed nodes to the
   authenticated local SLO candidate and rejects overlapping resolved addresses,
   duplicate failure domains, redirects, mixed components/revisions/cluster
   UUIDs, disabled snapshotting, the optional shared journal, unstable map or
@@ -337,8 +360,9 @@ integrity. Production remains blocked on the P1 evidence below.
   prove no outbound message escapes, subsequent proposals do not mutate the core,
   and the other two voters elect and commit. `/cluster/status` exposes
   `raft_durability_failures` and `control_durability_failed`, and data/control
-  readiness fail closed. The remaining item is live distinct-host fault and
-  recovery evidence against the release binary, not this core behavior.
+  readiness fail closed. The remaining item is live distinct-host bidirectional
+  partition, disk-fault, and recovery evidence against the release binary, not
+  this core behavior.
 - [ ] **Measure production SLOs.** Record one-node-failure write error band,
   recovery time, query latency, snapshot catch-up, and movement impact using the
   final binary and deployment settings. The local harness precondition is now
@@ -391,6 +415,19 @@ integrity. Production remains blocked on the P1 evidence below.
   remained at 105 MiB. These are bounded local regression results using the
   collector's provisional thresholds, not approved production SLOs. Approved
   thresholds and distinct-host deployment evidence remain open release work.
+
+  The same collector was repeated after the evidence commit on exact candidate
+  `26b68b4`: a clean full build, 4,393/4,393 runnable unit tests and 28/28
+  runnable socket tests preceded it. The report authenticated server
+  `73f2e1df9cdaba2bc3f18e7c6c6d8ed833fbe291141076570af1a1d67bb75361`
+  and benchmark
+  `76e7e8ef6a7a288605c9024084c1fcd0d7958912f286d9edde0e1f8b70be3dea`.
+  It measured 53/400 retryable node-kill errors, 14.680-s recovery and 26-ms
+  query p99; 64.370-s snapshot installation and 68.810-s exact catch-up; and a
+  movement arm that retained 55% throughput with 1.660-s p99, 13 benchmark
+  errors, 1,759 transfers, and 136/150 successful live probes. This confirms the
+  collector is repeatable, but the benchmark-memory and network-gate fixes made
+  afterward still require one final exact-candidate collector run.
 - [x] **Deliver and prove clustered backup/restore.** The existing filesystem
   copy guidance is now explicitly limited to standalone mode: it omitted
   persistent node identity, Group-0/control state, the committed serving map,
@@ -444,10 +481,13 @@ integrity. Production remains blocked on the P1 evidence below.
   snapshot, barrier, GC, and file-descriptor contract instead of the retired
   per-reactor/4-ms/256-MiB proposal.
 - [ ] Record one final serial build, focused unit/socket tests, and each required
-  live gate against the exact release commit. Candidate `305a030` has a clean
+  live gate against the exact release commit. Candidate `26b68b4` has a clean
   full build, 4,393/4,393 runnable unit tests, 28/28 runnable socket tests, and
-  the complete local serial SLO collector above. Distinct-host arms and a final
-  rerun after any later tracked evidence change remain required.
+  the repeated complete local serial SLO collector above. Its exact server also
+  passed the 6,000-target pattern-delete failover/restart gate. The bounded
+  network-reset profile passed against that server plus the corrected local
+  benchmark driver. A final rerun after committing the driver and harness fixes,
+  followed by the distinct-host arms, remains required.
 
 ## Release exit criteria
 

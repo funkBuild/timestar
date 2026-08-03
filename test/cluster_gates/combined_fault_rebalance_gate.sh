@@ -32,9 +32,16 @@
 #     rebalance          129 / 420    13 / 420     0 / 408   (transfers / calls)
 #     probe read-back    200/200 on every node, every storm, all three runs
 #
-# The ceiling is ~2x the worst draw (36). Note the reset gate's own budget is 6 across
-# THREE storms at 4 connections: the extra errors here are the CONNECTION COUNT, which
-# multiplies the sockets each reset round destroys, far more than they are the rebalance.
+# Those are historical 10,000-timestamp results. The current durable profile measured
+# `[7 2]` errors, 45/37 reset rounds, 169/143 destroyed connections, 53/66% retained
+# throughput, zero transfers and 177 rebalance calls. Its 150-call floor is tied to the
+# reset anti-vacuity floor: a minimally valid 70-round run lasts about 21 seconds and must
+# therefore execute the 0.2-second three-node rebalance loop throughout.
+#
+# The error ceiling remains ~2x the historical worst draw (36). Note the reset gate's own
+# budget is 6 across THREE storms at 4 connections: the extra errors here are the
+# CONNECTION COUNT, which multiplies the sockets each reset round destroys, far more than
+# they are the rebalance.
 #
 # THE FINDING, and it is why the anti-vacuity floor is on CALLS and not on transfers.
 # `transfers_initiated` is ~ZERO under the fault -- 0, 0 and 13 across the runs above, with
@@ -53,9 +60,10 @@
 # the filter permissive would show up as a transfer count that suddenly is not zero.
 #
 # DISK. Each storm is a full bench and nothing is deleted between them (see the reset
-# gate's BENCH_BATCHES note): two storms plus the baseline is three benches, measured at
-# ~20 G. Do not raise GATE_STORM_ROUNDS here without doing that arithmetic or checking the
-# filesystem selected by GATE_TMP_ROOT.
+# gate's BENCH_BATCHES note). The durable profile is about 0.6 GiB at RF=3 for
+# two storms plus the baseline; the historical ~20-GiB figure used the retired 10,000-
+# timestamp request. Do not raise GATE_STORM_ROUNDS or either bench dimension without
+# doing that arithmetic and raising the scratch preflight when needed.
 #
 # Usage: combined_fault_rebalance_gate.sh [SERVER_BINARY]
 #   exit 0 = pass, 1 = property failed, 2 = setup refused, 3 = VOID (re-draw)
@@ -66,7 +74,7 @@ export GATE_REBALANCE_STORM=1
 export GATE_CONNECTIONS="${GATE_CONNECTIONS:-16}"
 export GATE_STORM_ROUNDS="${GATE_STORM_ROUNDS:-2}"
 export GATE_MAX_STORM_ERRORS="${GATE_MAX_STORM_ERRORS:-80}"
-export GATE_MIN_COMBINED_CALLS="${GATE_MIN_COMBINED_CALLS:-200}"
+export GATE_MIN_COMBINED_CALLS="${GATE_MIN_COMBINED_CALLS:-150}"
 # The rebalance storm competes with the bench for the same reactors, so the throughput dip
 # is deeper than the reset gate's and the floor moves with it.
 export GATE_MIN_DIP_PCT="${GATE_MIN_DIP_PCT:-25}"
