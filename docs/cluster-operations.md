@@ -210,12 +210,18 @@ python3 test/cluster_gates/multi_host_evidence_bundle.py \
   --output build/tmp/partition-evidence.v1.json
 ```
 
-The binder permits leadership, term, and Group-0 log progress, but rejects a
-different candidate, deployment profile, cluster UUID, node/peer/failure-domain
-identity, or stable map epoch. It requires one distinct regular server log per
-qualified node and distinct infrastructure/workload logs, hashes each file in
-bounded streaming chunks, and fails if a file changes during the read. Retain
-the bundle and its referenced immutable evidence together.
+For ordinary recovery arms, the binder permits leadership, term, and Group-0
+log progress, but rejects a different candidate, deployment profile, cluster
+UUID, persistent node/peer/failure-domain identity, or stable map epoch. The
+`backup-resume-restore` arm deliberately has the opposite identity rule: its
+post-restore preflight must retain the same complete logical node-ID set while
+using a different cluster UUID and persistent node UUIDs disjoint from the
+source. Its resolved client endpoints and configured inter-node peer addresses
+must also be disjoint from the source cluster. Every arm requires one distinct
+regular server log per qualified node and distinct infrastructure/workload
+logs. It hashes each file in bounded streaming chunks and fails if a file
+changes during the read. Retain the bundle and its referenced immutable
+evidence together.
 
 On disposable production-equivalent hosts, exercise these arms serially:
 

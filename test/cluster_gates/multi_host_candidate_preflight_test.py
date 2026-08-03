@@ -79,6 +79,7 @@ def status(node_id: int, domain: str, led: int) -> dict:
     return {
         "clustered": True,
         "node_id": node_id,
+        "node_uuid": f"{node_id:032x}",
         "cluster_uuid": "00112233445566778899aabbccddeeff",
         "failure_domain": domain,
         "reactor_count": SERVER_SMP,
@@ -199,6 +200,14 @@ class MultiHostCandidatePreflightTest(unittest.TestCase):
         fixture = Fixture()
         fixture.responses[f"{NODES[2]}/cluster/status"]["failure_domain"] = "az-b"
         with self.assertRaisesRegex(preflight.QualificationError, "failure domains"):
+            fixture.qualify()
+
+    def test_rejects_duplicate_persistent_node_identity(self):
+        fixture = Fixture()
+        fixture.responses[f"{NODES[2]}/cluster/status"]["node_uuid"] = fixture.responses[
+            f"{NODES[1]}/cluster/status"
+        ]["node_uuid"]
+        with self.assertRaisesRegex(preflight.QualificationError, "persistent node UUIDs"):
             fixture.qualify()
 
     def test_rejects_durability_failure(self):

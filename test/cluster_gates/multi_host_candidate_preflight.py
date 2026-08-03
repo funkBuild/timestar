@@ -326,6 +326,7 @@ def qualify(
                 "endpoint": endpoint,
                 "resolved_addresses": sorted(addresses),
                 "node_id": status.get("node_id"),
+                "node_uuid": status.get("node_uuid"),
                 "cluster_uuid": status.get("cluster_uuid"),
                 "failure_domain": status.get("failure_domain"),
                 "embedded_revision": version["git_commit"],
@@ -353,6 +354,14 @@ def qualify(
     node_ids = [record["node_id"] for record in records]
     if any(type(node_id) is not int or node_id <= 0 for node_id in node_ids) or len(set(node_ids)) != len(records):
         raise QualificationError("nodes must report distinct positive node IDs")
+    node_uuids = [record["node_uuid"] for record in records]
+    if any(
+        not isinstance(node_uuid, str)
+        or len(node_uuid) != 32
+        or any(character not in "0123456789abcdef" for character in node_uuid)
+        for node_uuid in node_uuids
+    ) or len(set(node_uuids)) != len(records):
+        raise QualificationError("nodes must report distinct 32-character persistent node UUIDs")
     cluster_uuids = {record["cluster_uuid"] for record in records}
     cluster_uuid = records[0]["cluster_uuid"]
     if (

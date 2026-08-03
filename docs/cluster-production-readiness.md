@@ -435,10 +435,16 @@ integrity. Production remains blocked on the P1 evidence below.
   profile; a configured 2-GiB policy can no longer qualify a process actually
   started with 1 GiB. This also avoids rejecting a correct four-reactor
   deployment as though its process-wide 256-MiB proposal budget were a
-  one-reactor 64-MiB budget. An exact-v1 evidence binder now rejects before/after reports
-  from different candidates, deployments, clusters, node/peer/failure-domain
-  identities, or stable map epochs and requires distinct hashed infrastructure,
-  workload, and per-node transcripts for every arm. Repeat identity and
+  one-reactor 64-MiB budget. Each preflight also records the committed local
+  persistent node UUID. The exact-v1 evidence binder rejects ordinary recovery
+  reports from different candidates, deployments, clusters,
+  node/peer/failure-domain identities, or stable map epochs. Its backup/restore
+  arm instead requires the same complete logical node-ID set under a fresh
+  cluster UUID, a disjoint set of persistent node UUIDs, and no reused source
+  endpoint or peer address, matching the restore contract rather than
+  incorrectly demanding source identity reuse. Every arm
+  requires distinct hashed infrastructure, workload, and per-node transcripts.
+  Repeat identity and
   authenticated operator mutation on distinct hosts, then verify network
   partitions, restart, disk-full behavior, and
   bounded recovery there. The local disk-failure behavior is no longer an

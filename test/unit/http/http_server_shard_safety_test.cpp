@@ -356,6 +356,8 @@ TEST_F(HttpServerShardSafetyTest, ClusterStatusPublishesTopologyProvenance) {
     ASSERT_FALSE(setRoutes.empty());
     EXPECT_NE(setRoutes.find("\\\"cluster_uuid\\\""), std::string::npos);
     EXPECT_NE(setRoutes.find("clusterConfig.cluster_uuid"), std::string::npos);
+    EXPECT_NE(setRoutes.find("\\\"node_uuid\\\""), std::string::npos);
+    EXPECT_NE(sourceCode.find("g_nodeUuid = identity.node_uuid"), std::string::npos);
     EXPECT_NE(setRoutes.find("\\\"failure_domain\\\""), std::string::npos);
     EXPECT_NE(setRoutes.find("clusterConfig.failure_domain"), std::string::npos);
     EXPECT_NE(setRoutes.find("\\\"reactor_count\\\""), std::string::npos);

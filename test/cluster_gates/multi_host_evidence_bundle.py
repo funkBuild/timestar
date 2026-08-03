@@ -179,6 +179,7 @@ def validate_preflight(report: object, label: str) -> None:
         "endpoint",
         "resolved_addresses",
         "node_id",
+        "node_uuid",
         "cluster_uuid",
         "failure_domain",
         "embedded_revision",
@@ -202,6 +203,7 @@ def validate_preflight(report: object, label: str) -> None:
         "vshards_led",
     }
     node_ids: set[int] = set()
+    node_uuids: set[str] = set()
     endpoints: set[str] = set()
     failure_domains: set[str] = set()
     endpoint_addresses: set[str] = set()
@@ -213,6 +215,15 @@ def validate_preflight(report: object, label: str) -> None:
         if type(node_id) is not int or node_id <= 0 or node_id in node_ids:
             raise EvidenceError(f"{label} contains an invalid or duplicate node ID {node_id!r}")
         node_ids.add(node_id)
+        node_uuid = node["node_uuid"]
+        if (
+            not isinstance(node_uuid, str)
+            or len(node_uuid) != 32
+            or any(character not in "0123456789abcdef" for character in node_uuid)
+            or node_uuid in node_uuids
+        ):
+            raise EvidenceError(f"{label} node {node_id} has an invalid or duplicate persistent node UUID")
+        node_uuids.add(node_uuid)
         if not isinstance(node["endpoint"], str) or not node["endpoint"].startswith("https://"):
             raise EvidenceError(f"{label} node {node_id} has an invalid HTTPS endpoint")
         if node["endpoint"] in endpoints:
@@ -337,6 +348,7 @@ def stable_node_identity(node: dict) -> dict:
         "endpoint",
         "resolved_addresses",
         "node_id",
+        "node_uuid",
         "cluster_uuid",
         "failure_domain",
         "embedded_revision",
@@ -366,21 +378,51 @@ def pair_reports(before: dict, after: dict, fault_arm: str) -> dict:
         ("candidate", "candidate identity"),
         ("slo_policy", "approved SLO policy"),
         ("expected_deployment", "deployment profile"),
-        ("cluster_uuid", "cluster UUID"),
     ):
         if after[key] != before[key]:
             raise EvidenceError(f"before and after reports use different {description}")
     before_nodes = {node["node_id"]: stable_node_identity(node) for node in before["nodes"]}
     after_nodes = {node["node_id"]: stable_node_identity(node) for node in after["nodes"]}
-    if before_nodes != after_nodes:
-        raise EvidenceError("before and after reports use different node, peer, or stable-map topology")
+    fresh_restore = fault_arm == "backup-resume-restore"
+    if fresh_restore:
+        if after["cluster_uuid"] == before["cluster_uuid"]:
+            raise EvidenceError("backup restore must use a fresh cluster UUID")
+        if set(after_nodes) != set(before_nodes):
+            raise EvidenceError("backup restore must cover the same complete logical node ID set")
+        before_uuids = {node["node_uuid"] for node in before["nodes"]}
+        after_uuids = {node["node_uuid"] for node in after["nodes"]}
+        if before_uuids & after_uuids:
+            raise EvidenceError("backup restore reused a source persistent node UUID")
+        before_endpoint_addresses = {
+            address for node in before["nodes"] for address in node["resolved_addresses"]
+        }
+        after_endpoint_addresses = {
+            address for node in after["nodes"] for address in node["resolved_addresses"]
+        }
+        before_peer_addresses = {peer["address"] for peer in before["nodes"][0]["peers"]}
+        after_peer_addresses = {peer["address"] for peer in after["nodes"][0]["peers"]}
+        if before_endpoint_addresses & after_endpoint_addresses or before_peer_addresses & after_peer_addresses:
+            raise EvidenceError("backup restore reused a source endpoint or inter-node peer address")
+    else:
+        if after["cluster_uuid"] != before["cluster_uuid"]:
+            raise EvidenceError("before and after reports use different cluster UUID")
+        if before_nodes != after_nodes:
+            raise EvidenceError("before and after reports use different node, peer, or stable-map topology")
     return {
         "fault_arm": fault_arm,
         "candidate": before["candidate"],
         "slo_policy": before["slo_policy"],
         "expected_deployment": before["expected_deployment"],
-        "cluster_uuid": before["cluster_uuid"],
+        "cluster_identity": {
+            "before_uuid": before["cluster_uuid"],
+            "after_uuid": after["cluster_uuid"],
+            "transition": "fresh-restore" if fresh_restore else "preserved",
+        },
         "node_ids": sorted(before_nodes),
+        "node_uuids": {
+            "before": sorted(node["node_uuid"] for node in before["nodes"]),
+            "after": sorted(node["node_uuid"] for node in after["nodes"]),
+        },
     }
 
 

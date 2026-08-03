@@ -74,6 +74,7 @@ seastar::sharded<Engine> g_engine;
 timestar::cluster::ClusterDataPlane g_clusterDataPlane;
 bool g_clusterPartitioned = false;
 std::atomic<uint64_t> g_serverMemoryBytes{0};
+std::string g_nodeUuid;
 static std::optional<timestar::features::ClusterBackupAuthenticationKey> g_clusterBackupAuthenticationKey;
 
 // Consecutive compaction failures on any one tier before /health reports
@@ -270,6 +271,7 @@ void set_routes(routes& r) {
                 }
                 const auto& clusterConfig = timestar::config().cluster;
                 std::string body = "{\"clustered\":true,\"node_id\":" + std::to_string(st.self) +
+                                   ",\"node_uuid\":\"" + timestar::jsonEscape(g_nodeUuid) + "\"" +
                                    ",\"cluster_uuid\":\"" + timestar::jsonEscape(clusterConfig.cluster_uuid) +
                                    "\",\"failure_domain\":\"" +
                                    timestar::jsonEscape(clusterConfig.failure_domain) + "\"" +
@@ -1152,6 +1154,7 @@ int main(int argc, char** argv) {
                     auto identity = timestar::cluster::NodeIdentity::loadOrCreate(dataRoot);
                     timestar::cluster::bindClusterUuid(identity, dataRoot, cc.cluster_uuid);
                     timestar::cluster::bindStaticTopology(identity, dataRoot, staticTopologyDescription(cc));
+                    g_nodeUuid = identity.node_uuid;
                     clusterJournalIdentity = timestar::cluster::JournalIdentity::fromHex(
                         identity.cluster_uuid, timestar::cluster::NodeIdentity::generateUuid());
                     if (cc.control_enabled)

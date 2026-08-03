@@ -305,7 +305,10 @@ below.
    retention state, and readback of the recorded canary/query set on every
    node. Restart all restored nodes once and repeat health and readback. Mint
    new join/operator credentials; verify source join tokens and node identities
-   are rejected.
+   are rejected. For release qualification, bind the source preflight and this
+   final restored-cluster preflight with the `backup-resume-restore` evidence
+   arm; it fails unless the cluster UUID changed and every persistent node UUID
+   is fresh.
 8. Record actual recovery point and recovery time, archive operation/key/object
    versions, all marker identities, validation results, and deviations. Keep
    the old cluster fenced and the selected backup locked until incident review

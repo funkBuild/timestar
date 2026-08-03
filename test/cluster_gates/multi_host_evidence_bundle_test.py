@@ -41,6 +41,20 @@ def recovered_report() -> dict:
     return value
 
 
+def restored_report() -> dict:
+    value = recovered_report()
+    value["cluster_uuid"] = "ffeeddccbbaa99887766554433221100"
+    for node in value["nodes"]:
+        node["cluster_uuid"] = value["cluster_uuid"]
+        node["node_uuid"] = f"{node['node_id'] + 100:032x}"
+        node["endpoint"] = f"https://restore{node['node_id']}.example:8443"
+        node["resolved_addresses"] = [f"10.30.0.{node['node_id']}"]
+        node["peers"] = [
+            {"node": peer_id, "address": f"restore{peer_id}.example:8086"} for peer_id in (1, 2, 3)
+        ]
+    return value
+
+
 class MultiHostEvidenceBundleTest(unittest.TestCase):
     def setUp(self):
         self.before = report("2026-08-04T01:00:00Z")
@@ -48,8 +62,35 @@ class MultiHostEvidenceBundleTest(unittest.TestCase):
 
     def test_accepts_recovery_with_new_leadership_but_identical_stable_topology(self):
         paired = bundle.pair_reports(self.before, self.after, "bidirectional-partition")
-        self.assertEqual(paired["cluster_uuid"], self.before["cluster_uuid"])
+        self.assertEqual(paired["cluster_identity"]["transition"], "preserved")
         self.assertEqual(paired["node_ids"], [1, 2, 3])
+
+    def test_accepts_backup_restore_only_with_fresh_cluster_and_node_identities(self):
+        paired = bundle.pair_reports(self.before, restored_report(), "backup-resume-restore")
+        self.assertEqual(paired["cluster_identity"]["transition"], "fresh-restore")
+        self.assertNotEqual(paired["cluster_identity"]["before_uuid"], paired["cluster_identity"]["after_uuid"])
+        self.assertTrue(set(paired["node_uuids"]["before"]).isdisjoint(paired["node_uuids"]["after"]))
+
+    def test_rejects_backup_restore_that_reuses_source_identity(self):
+        restored = restored_report()
+        restored["nodes"][2]["node_uuid"] = self.before["nodes"][1]["node_uuid"]
+        with self.assertRaisesRegex(bundle.EvidenceError, "reused a source persistent node UUID"):
+            bundle.pair_reports(self.before, restored, "backup-resume-restore")
+
+    def test_rejects_backup_restore_without_fresh_cluster_uuid(self):
+        restored = restored_report()
+        restored["cluster_uuid"] = self.before["cluster_uuid"]
+        for node in restored["nodes"]:
+            node["cluster_uuid"] = restored["cluster_uuid"]
+        with self.assertRaisesRegex(bundle.EvidenceError, "fresh cluster UUID"):
+            bundle.pair_reports(self.before, restored, "backup-resume-restore")
+
+    def test_rejects_backup_restore_on_source_peer_addresses(self):
+        restored = restored_report()
+        for source, target in zip(self.before["nodes"], restored["nodes"]):
+            target["peers"] = copy.deepcopy(source["peers"])
+        with self.assertRaisesRegex(bundle.EvidenceError, "source endpoint or inter-node peer address"):
+            bundle.pair_reports(self.before, restored, "backup-resume-restore")
 
     def test_rejects_different_candidate(self):
         self.after["candidate"]["server"]["sha256"] = "d" * 64
