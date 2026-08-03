@@ -153,6 +153,8 @@ add_test(NAME timestar_insert_bench_version
     COMMAND $<TARGET_FILE:timestar_insert_bench> --version)
 set_tests_properties(timestar_insert_bench_version PROPERTIES
     PASS_REGULAR_EXPRESSION "Component: timestar_insert_bench")
+add_test(NAME cluster_gate_multi_host_candidate_preflight
+    COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/cluster_gates/multi_host_candidate_preflight_test.py)
 
 # Optional: Create separate test executables for different categories
 # This allows running specific test categories independently

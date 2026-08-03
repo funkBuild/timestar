@@ -164,29 +164,6 @@ fs::path StorageLayout::placementFile() const {
     return underRoot("placement.json");
 }
 
-fs::path StorageLayout::vshardDataDir() const {
-    return underRoot("vshards");
-}
-
-fs::path StorageLayout::vshardDir(VShardId vshard) const {
-    if (!vshard.valid())
-        throw std::out_of_range("VShard ID is outside the fixed storage-layout range");
-    return vshardDataDir() / std::format("{:04}", vshard.value());
-}
-
-std::optional<VShardId> StorageLayout::parseVShardDirName(std::string_view name) const {
-    uint32_t parsed = 0;
-    const auto result = std::from_chars(name.data(), name.data() + name.size(), parsed);
-    // Canonical spelling only: exactly the four-digit zero-padded form vshardDir
-    // produces, in range, no sign/whitespace/suffix/path separators.
-    if (name.empty() || result.ec != std::errc{} || result.ptr != name.data() + name.size() ||
-        parsed >= VIRTUAL_SHARD_COUNT ||
-        name != vshardDir(VShardId{static_cast<uint16_t>(parsed)}).filename().string()) {
-        return std::nullopt;
-    }
-    return VShardId{static_cast<uint16_t>(parsed)};
-}
-
 fs::path StorageLayout::shardCountMetadataFile() const {
     return underRoot("shard_count.meta");
 }

@@ -168,7 +168,7 @@ Several in-memory caches avoid redundant I/O:
 
 - **Prometheus metrics** at `GET /metrics` — per-shard counters/gauges + Seastar built-ins
 - **Slow query logging** — queries exceeding configurable threshold (default 500ms) auto-logged with full timing breakdown
-- **Version endpoint** at `GET /version` — build version, git commit, compiler
+- **Version endpoint** at `GET /version` — server component, build version, git commit, compiler
 - **Health endpoint** at `GET /health` — readiness-aware (returns "starting" during init)
 
 ## Configuration

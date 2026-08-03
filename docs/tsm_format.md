@@ -117,8 +117,8 @@ loading every full index entry.
 
 ## Tombstone sidecar
 
-`{tsm_path}.tombstones` is a separate v1 format. Its header contains `TSMT`,
-version 1, entry count, and a CRC32. Each entry contains a 16-byte
+The `.tsm` suffix replaced by `.tombstone` names the separate v1 sidecar. Its
+header contains `TSMT`, version 1, entry count, and a CRC32. Each entry contains a 16-byte
 `SeriesId128`, inclusive start/end timestamps, and a CRC32. Any unsupported
 version, malformed entry, or checksum failure fences startup for that immutable
 generation.

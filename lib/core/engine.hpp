@@ -124,7 +124,7 @@ private:
     // assignments stay a monotonic subsequence). Restored on init above every
     // revision already durable in memory (WAL replay) and TSM (file trailer).
     bool assignRevisions_ = false;
-    uint64_t nextRevision_ = 1;  // timestar::kFirstAssignedRevision
+    uint64_t nextRevision_ = 1;
     template <class T>
     void stampRevisions(TimeStarInsert<T>& req);
     void restoreRevisionCounter();

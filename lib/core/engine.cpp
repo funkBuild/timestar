@@ -1273,7 +1273,7 @@ void Engine::restoreRevisionCounter() {
         if (tsmFile && tsmFile->maxRevision() > maxRev)
             maxRev = tsmFile->maxRevision();
     }
-    nextRevision_ = maxRev + 1;  // == kFirstAssignedRevision (1) when nothing is tracked
+    nextRevision_ = maxRev + 1;  // Starts at 1 when no tracked revision exists.
 
     // Tracking is STICKY: if any durable data already carries a revision, this
     // store is revision-tracked, so keep assigning -- otherwise new writes would

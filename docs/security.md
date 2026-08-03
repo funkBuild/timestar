@@ -34,6 +34,8 @@ documented production operation.
 
 The server is still designed to run behind a reverse proxy for client TLS,
 rate-limiting, network policy, and stronger authentication/authorization.
+The complete RF=3 deployment, failure-domain, resource, lifecycle, and
+qualification contract is in [cluster-operations.md](cluster-operations.md).
 
 ## Recommended Deployment
 

@@ -688,9 +688,8 @@ void WAL::encodeInsertEntry(AlignedBuffer& buffer, TimeStarInsert<T>& insertRequ
     }
 
     // Optional per-point revision column (ADR 0003), appended AFTER the value
-    // block. Present iff the series is revision-tracked; old WAL files and
-    // untracked series simply have no trailing bytes, so recovery detects it by
-    // whether any entry bytes remain after the values. The CRC below covers it.
+    // block. Present iff the series is revision-tracked; untracked exact-v1
+    // entries have no trailing bytes. The CRC below covers it.
     if (!insertRequest.revisions.empty()) {
         const size_t sizePos = buffer.size();
         buffer.write(static_cast<uint32_t>(0));  // placeholder for encoded size
@@ -1315,10 +1314,10 @@ TimeStarInsert<T> WALReader::readSeries(Slice& walSlice, const std::string& seri
         static_assert(sizeof(T) == 0, "Unsupported WAL value type");
     }
 
-    // Optional trailing per-point revision column (see encodeInsertEntry). Absent
-    // for old WAL files and untracked series -> no entry bytes remain after the
-    // values. When present it is parallel to the full point set (recovery is
-    // unfiltered), so replay restores revision tracking exactly.
+    // Optional trailing per-point revision column (see encodeInsertEntry).
+    // Untracked exact-v1 entries have no bytes after the values. When present it
+    // is parallel to the full point set (recovery is unfiltered), so replay
+    // restores revision tracking exactly.
     if (walSlice.bytesLeft() >= sizeof(uint32_t)) {
         uint32_t encodedRevSize = walSlice.read<uint32_t>();
         if (encodedRevSize > MAX_ENCODED_SIZE) {

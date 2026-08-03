@@ -54,10 +54,8 @@ struct TSMIndexBlock {
     uint64_t minTime;
     uint64_t maxTime;
     uint64_t offset;
-    // Per-block replicated revision range [minRev, maxRev] (ADR 0003 sec 4).
-    // Serialized after the per-type stats. Drives the LWW read-path merge: two blocks
-    // whose ranges are disjoint resolve by range alone (higher wins, no per-point
-    // read); overlap falls back to per-point revisions.
+    // Replicated revision range covered by the block. Serialized after the
+    // per-type statistics and retained for recovery/snapshot fencing.
     uint64_t blockMinRev = 0;
     uint64_t blockMaxRev = 0;
     // Block-level statistics.

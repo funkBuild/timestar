@@ -347,3 +347,21 @@ TEST_F(HttpServerShardSafetyTest, ReplicatedOpenFileLimitIsResolvedBeforeEngineS
     EXPECT_NE(sourceCode.find("2 * timestar::VIRTUAL_SHARD_COUNT"), std::string::npos)
         << "The minimum must scale from the canonical VShard count and retain runtime headroom.";
 }
+
+// Distinct-host qualification cannot infer cluster identity or placement
+// domains from node IDs and peer addresses. Keep both exact configured values
+// on the public read-only status surface used by the release preflight.
+TEST_F(HttpServerShardSafetyTest, ClusterStatusPublishesTopologyProvenance) {
+    const std::string setRoutes = extractFunctionBody("void set_routes(");
+    ASSERT_FALSE(setRoutes.empty());
+    EXPECT_NE(setRoutes.find("\\\"cluster_uuid\\\""), std::string::npos);
+    EXPECT_NE(setRoutes.find("clusterConfig.cluster_uuid"), std::string::npos);
+    EXPECT_NE(setRoutes.find("\\\"failure_domain\\\""), std::string::npos);
+    EXPECT_NE(setRoutes.find("clusterConfig.failure_domain"), std::string::npos);
+}
+
+TEST_F(HttpServerShardSafetyTest, VersionEndpointIdentifiesTheServerComponent) {
+    const std::string setRoutes = extractFunctionBody("void set_routes(");
+    ASSERT_FALSE(setRoutes.empty());
+    EXPECT_NE(setRoutes.find("\"component\":\"timestar_http_server\""), std::string::npos);
+}

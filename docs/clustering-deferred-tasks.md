@@ -35,7 +35,7 @@ Production blockers take priority and are authoritative in
   repository-local temporary storage.
 - [ ] Run final multi-host topology, security, durability, and SLO gates against
   the exact release candidate.
-- [ ] Finish qualification and operations for the cluster backup/restore
+- [x] Finish implementation and operations for the cluster backup/restore
   workflow over pinned, hash-verified
   VShard snapshot streams. Restore must create a fresh cluster UUID, scrub old
   node/Raft membership, reject partial or corrupt artifacts, resume interrupted
@@ -90,10 +90,14 @@ Production blockers take priority and are authoritative in
   `Ready` failures now quarantine before send/apply/ack, propagate across a shared
   journal, release waiters, fail readiness, and permit healthy-voter re-election;
   live distinct-host injection and repair/restart evidence remain.
-- [ ] Record supported memory, file-descriptor, snapshot, proposal, journal,
-  and background-work budgets.
-- [ ] Publish production runbooks for bootstrap, join, drain, replace, backup,
-  restore, and disaster recovery.
+- [x] Record the enforced memory, file-descriptor, snapshot, proposal, journal,
+  and background-work budgets in
+  [cluster-operations.md](cluster-operations.md). Deployment-specific capacity
+  and SLO approval remain part of the final multi-host run.
+- [x] Publish the exact-v1 bootstrap, join, movement, drain, removal, monitoring,
+  fault-qualification, backup, restore, and disaster-recovery procedures in
+  [cluster-operations.md](cluster-operations.md) and
+  [backup-restore.md](backup-restore.md).
 
 ## Deferred beyond the first release
 

@@ -296,7 +296,12 @@ evidence below.
   There is no fallback, negotiation above v1, or activation path.
 - [ ] **Run multi-host topology, security, and fault gates.** The bounded local
   mTLS identity gate now covers positive, trusted-wrong-endpoint, and recovery
-  paths. Repeat identity and authenticated operator mutation on distinct hosts,
+  paths. The read-only multi-host preflight now binds the deployed nodes to the
+  authenticated local SLO candidate and rejects overlapping resolved addresses,
+  duplicate failure domains, redirects, mixed components/revisions/cluster
+  UUIDs, disabled snapshotting, the optional shared journal, unstable map or
+  lifecycle state, incomplete RF=3 totals, or any apply/durability fault. Repeat identity and
+  authenticated operator mutation on distinct hosts,
   then verify network partitions, restart, disk-full behavior, and bounded
   recovery there. The local disk-failure behavior is no longer an implementation
   ambiguity: an append, snapshot-promotion, or sync failure permanently
@@ -324,10 +329,11 @@ evidence below.
   prevents multi-gigabyte datasets from consuming a `/tmp` tmpfs as raw memory.
   A serial exact-v1 SLO collector now reuses the
   discriminating node-kill, bounded snapshot-catch-up, and skewed-movement gates
-  and binds their metrics, thresholds, commit, binary hash, resource settings,
-  and raw transcripts into one report. It now refuses an `unknown`, dirty, stale,
-  or unresolvable embedded binary revision rather than binding a clean worktree
-  commit to an executable built from different source. Its high-volume arms use
+  and binds their metrics, thresholds, commit, authenticated server and benchmark
+  hashes, resource settings, and raw transcripts into one report. It refuses an
+  `unknown`, dirty, stale, or unresolvable embedded revision on either executable
+  rather than binding a clean worktree commit to tools built from different
+  source, and detects either binary changing during the serial run. Its high-volume arms use
   the recorded 2-GiB/four-reactor profile without overriding the focused
   catch-up arm's 1-GiB/one-reactor bound. Diagnostic node-kill runs also found
   that
@@ -398,9 +404,13 @@ evidence below.
   requires `TIMESTAR_ACK_UNSAFE_STATIC_CLUSTER`, container labels state that it
   is unsupported for production, and the file names the partitioned Group-0,
   mTLS, and authenticated-operator requirements it does not demonstrate.
-- [ ] Reconcile architecture, API, runbook, and deployment documentation after
-  the remaining behavior is complete. The backup document now fails closed for
-  clustered use instead of presenting the standalone copy procedure as safe.
+- [x] Reconcile architecture, API, runbook, and deployment documentation. The
+  exact-v1 operations runbook now covers bootstrap, failure domains, enforced
+  resource budgets, join/move/drain/remove, monitoring, distinct-host fault
+  qualification, and recovery; the backup document fails closed for clustered
+  filesystem-copy use. ADR 0001 now describes the shipped private-journal,
+  snapshot, barrier, GC, and file-descriptor contract instead of the retired
+  per-reactor/4-ms/256-MiB proposal.
 - [ ] Record one final serial build, focused unit/socket tests, and each required
   live gate against the exact release commit.
 

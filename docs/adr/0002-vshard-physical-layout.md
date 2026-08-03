@@ -1,160 +1,130 @@
-# ADR 0002 — VShard-partitioned physical TSM and NativeIndex layout
+# ADR 0002 — VShard-aware physical storage and snapshots
 
-**Status:** Accepted (Phase 1 / Task 4 prerequisite; resolves open decision 3
-and the Task-4-critical part of open decision 5)
+**Status:** Accepted and implemented for exact v1
 
 **Parent design:** [Cluster Architecture and Implementation Plan](../clustering.md)
-(sections "Stable identity and layout", "Multiplexed object model", "TSM and
-catalog requirements")
-
-**Prerequisite for:** VShard-workers Task 4a (catalog), 4c (TSM/index/compaction
-partitioning), 4d (snapshot/restore).
 
 ## Context
 
-The plan simultaneously mandates multiplexing ("no 4,096 independent services")
-and per-VShard guarantees (snapshot, pin, extraction, anti-entropy). These
-reconcile only if the physical layout is fixed precisely enough that Task 4 code
-can cite it rather than each guarantee re-deriving it. Decision 5 additionally
-requires resolving the VShard identity before Task 4 bakes IDs into every file.
+TimeStar has 4,096 stable VShard identities but must not create 4,096 storage
+engines or indexes per node. The shipped implementation therefore separates the
+logical Raft/snapshot boundary (one group per VShard) from the physical Engine
+boundary (one Engine, WAL stream, TSM directory, and NativeIndex per reactor).
+
+The original proposal reserved a live `vshards/NNNN/` tree containing
+`raft.meta`, a per-VShard `MANIFEST`, catalogs, tombstone objects, and TSM extent
+references. That tree was never the implementation. Keeping it in the accepted
+ADR made non-existent files look like production authority, so exact v1 removes
+the unused path API and documents the storage that is actually opened.
 
 ## Decision
 
-### 1. Directory layout
+### Live data-root layout
 
-```
+```text
 <data_dir>/
-  node.json                       # node identity (Phase 3; proposal)
-  journals/core_<n>/seg_*.jnl     # per-core multiplexed journals (ADR 0001)
-  vshards/<id>/                   # <id> = zero-padded 0000..4095 (StorageLayout::vshardDir)
-    raft.meta                     # per-VShard Raft hard state snapshot pointer
-    MANIFEST                      # per-VShard object set (CRC-framed, like today's index MANIFEST)
-    catalog/                      # durable SeriesId128 -> definition (Task 4a)
-    tsm/                          # VShard-pure TSM objects (tier >= 1) + tier-0 extent refs
-    tombstones/                   # first-class tombstone objects
-    snapshots/<S>.pin             # persistent pin files listing object UUIDs
-  tsm-shared/core_<n>/seg_*.t0    # tier-0 multiplexed segments (see 3)
-  index/core_<n>/                 # one NativeIndex per core, VShard-prefixed keys (see 4)
+  node.json                         # stable node and cluster identity
+  control_map.cache                 # latest durably applied Group-0 serving map
+  cluster_raft/
+    group0/
+      seg_*.jnl
+      snapshot_sidecars/
+    vshard_<id>/                    # default private data-group journal, id 0..4095
+      seg_*.jnl
+      snapshot_sidecars/
+    retired/                        # exact-v1 epoch-named journal quarantines
+  shard_<reactor>/
+    <sequence>.wal                  # reactor-local Engine WAL generations
+    tsm/
+      <tier>_<sequence>.tsm
+      <tier>_<sequence>_d<data-sequence>.tsm
+      <matching-basename>.tombstone
+    native_index/
+      MANIFEST
+      wal/idx_*.wal
+      idx_*.sst
 ```
 
-The `vshards/0000`..`vshards/4095` boundary is frozen (StorageLayout owns it).
-`journals/`, `tsm-shared/`, and `index/` are per-core and multiplexed; only the
-`vshards/<id>/` subtree is per-VShard, and even there tier-0 data lives by
-reference into the shared segments.
+Snapshot staging directories below `tsm/`, restore markers, and backup-export
+state are temporary or workflow-specific namespaces, not independent storage
+authorities. `vshards/NNNN.tsp1` is an archive namespace inside an exact-v1
+cluster backup, not a live data-root layout.
 
-### 2. Immutable object identity
+The optional shared journal replaces the `vshard_<id>` directories with one
+`cluster_raft/shard_<reactor>` stream. It is not the release or restore layout;
+see [ADR 0001](0001-journal-segmentation-and-retention.md).
 
-Every immutable object (a tier ≥ 1 TSM file, a tier-0 shared segment, a catalog
-snapshot, a tombstone object, an index SSTable) carries in its header:
+### VShard identity and reactor ownership
 
-```
-object_uuid (16 bytes)     # stable, globally unique, assigned at creation, never reused
-format_version (u32)
-virtual_shard_count (u16)  # the VIRTUAL_SHARD_COUNT the object was written under (see 6)
-byte_length (u64)
-whole_file_hash (32 bytes) # BLAKE3/SHA-256 over the file's bytes
-```
+A VShard is the fixed 12-bit value `0..4095` derived from the canonical
+`SeriesId128`. The reserved upper four bits of its on-wire/on-journal `u16`
+must be zero. Exact-v1 replicated startup accepts only a reactor count for which
+`assignCore(vshard, core_count)` keeps every series in a VShard on one reactor.
 
-TSM data blocks additionally gain a per-block `crc32` so corruption is
-attributable to a block and repairable, not fatal to the whole file.
+The VShard identity selects its data Raft group, routing entry, snapshot, backup
+unit, and retirement operation. It does not select a separate Engine instance.
+WAL and freshly flushed TSM generations may contain many VShards owned by the
+reactor.
 
-The MANIFEST is the authority for which objects are live; an object present on
-disk but absent from the MANIFEST (and from every pin file) is GC-eligible.
+### TSM placement and last-write ordering
 
-### 3. Tier-0 multiplexing, converging to VShard-pure files
+Clustered startup enables VShard-partitioned background compaction before the
+compaction loop starts. Ordinary mixed inputs converge into VShard-pure outputs;
+a retention merge may temporarily produce another mixed physical generation.
+Correctness never depends on physical purity: every series ID deterministically
+names its VShard, reads can filter by that identity, and snapshot creation always
+materializes a VShard-pure resolved object.
 
-- **Tier 0 may be multiplexed.** A flush writes a shared tier-0 segment
-  (`tsm-shared/core_<n>/seg_*.t0`) containing blocks for many VShards; the
-  per-VShard MANIFEST records the byte **extents** of that VShard's blocks
-  within the segment. This keeps flush to one append stream per core.
-- **Compaction converges to VShard-pure files at tier ≥ 1.** A tier-0→tier-1
-  merge reads one VShard's extents and writes a VShard-pure object under
-  `vshards/<id>/tsm/`. From tier 1 up, a TSM object belongs to exactly one
-  VShard.
-- **Snapshotting a VShard extracts only its tier-0 extents** from the shared
-  segments plus its VShard-pure tier ≥ 1 objects — never the whole segment.
+TSM filenames carry immutable file identity and write-generation rank. A flush
+reserves its sequence at memory-store rollover, before concurrent conversions
+can reorder completion. Compaction inherits the maximum input data sequence.
+That makes file rank follow store write order and preserves last-write-wins when
+the same timestamp appears in multiple generations.
 
-### 4. NativeIndex: one per core, VShard-prefixed keys
+Exact-v1 TSM framing, block metadata, revision ranges, and tombstone sidecars are
+defined in [tsm_format.md](../tsm_format.md). There is no object UUID, live
+per-VShard manifest, whole-file BLAKE3 field, or old-layout reader in the local
+TSM format.
 
-- One NativeIndex instance per core (`index/core_<n>/`), not per VShard.
-- Every key is prefixed with the 2-byte VShard id **before** the existing type
-  prefix (0x01..0x1x). So the current key `<type><measurement>...` becomes
-  `<vshard:2><type><measurement>...`. Day bitmaps (0x0D) and HLL sketches (0x14)
-  are likewise VShard-prefixed.
-- A VShard's index extract is a prefix range-scan `[<vshard>, <vshard>+1)`
-  serialised into the snapshot, so **install is a load, not a rebuild**.
-  Rebuild-from-journal is the repair path only, with the stated cost bound
-  (replay of the VShard's retained log).
+### NativeIndex layout
 
-### 5. Revisions replace `_d<N>` inside `vshards/`
+Each reactor owns one NativeIndex under `shard_<reactor>/native_index`. Durable
+series-metadata and value-type keys encode the VShard after their type byte, so
+the implementation can address the per-VShard catalog state without creating
+one index service per group. Measurement/tag discovery structures remain shared
+reactor-local indexes and are updated or removed through the same Engine
+transaction as VShard snapshot install and retirement.
 
-Duplicate-timestamp resolution uses replicated point revisions (ADR 0003), not
-local tier/sequence ranking. Inside `vshards/` the `_d<N>` dataSeq filename
-ranking is dead: flush and compaction always materialise the LWW winner;
-steady-state blocks store only a per-block `[minRev, maxRev]` in the index entry;
-a per-point revision column exists only in tier-0 blocks that may hold intra-file
-duplicates. Legacy `_d<N>` names remain migration input only.
+The earlier generic `<vshard><type><payload>` key wrapper was never called by
+NativeIndex. Exact v1 removes that duplicate helper and its standalone test;
+`key_encoding.cpp` is the one durable key grammar.
 
-### 6. VShard identity and decision 5 (split epoch) — accept the risk, make it safe
+### Snapshot boundary
 
-The on-disk VShard identity is the canonical **12-bit value 0..4095**
-(`VShardId`), frozen at cluster creation. We **do not** bake speculative
-split-epoch bits into the hot identity or the directory grammar: doing so would
-complicate every ID, journal record, and `vshards/NNNN` name for a feature that
-may never ship, and 4,096 VShards already give ample headroom (4096 / node-count
-VShards per node).
+Snapshot production pins the current immutable TSM generation, resolves only
+the selected VShard with tombstone effects applied, and writes one VShard-pure
+TSM object plus its deterministic catalog. The manifest records:
 
-Instead we **record the accepted risk that splitting requires a full versioned
-data migration**, and make that migration *safe and detectable* rather than
-ambiguous: every immutable object and journal segment stamps the
-`virtual_shard_count` and `format_version` it was created under (field in 2).
-A future scheme that changes the VShard count or splits a VShard is therefore a
-detectable format-version change with a migration, never a silent
-reinterpretation of existing IDs. The unused top 4 bits of the 16-bit on-disk
-VShard field are **reserved and must be zero** (validated on read), leaving a
-clean escape hatch without committing to a split encoding now.
+- VShard and snapshot-revision fence;
+- ordered object identifiers and revision ranges;
+- logical verification hash and catalog hash;
+- delete-receipt and retention state needed after log compaction.
 
-### 7. Per-VShard gates are logical, not byte-for-byte
-
-Wherever shared tier-0 segments or the multiplexed index exist, "unrelated
-VShards untouched" means their **logical** time-block hashes and MANIFEST entries
-are unchanged; shared-segment and multiplexed-index bytes are exempt from
-byte-identity. Anti-entropy compares logical hashes (ADR-adjacent; see the
-plan's anti-entropy section), so replicas that compacted independently still
-agree.
-
-## Rationale
-
-- Multiplex where cost scales with VShard count (flush streams, index instances,
-  compaction fibers); partition where the guarantee is per-VShard (snapshot,
-  pin, extract, catalog). The MANIFEST-extent indirection is what lets tier-0 be
-  shared yet per-VShard-extractable.
-- Object UUID + whole-file hash + block CRC give attributable corruption and the
-  anti-entropy verification hash the Task 4 gate consumes.
-- Accepting the split risk (6) keeps v1 IDs minimal; the format-version stamp is
-  the cheap insurance that turns a hypothetical future split into a bounded,
-  detectable migration.
-
-## Alternatives considered
-
-- **Pure physical partitioning (a real directory + files per VShard for
-  everything).** Rejected: 4,096 tiny tier-0 files per flush cycle, 4,096 index
-  instances — the "no 4,096 services" violation.
-- **Reserve split-epoch bits in the live VShard id now.** Rejected as premature:
-  it taxes every record/path for a maybe-never feature; the format-version stamp
-  achieves detectability without the tax.
-- **Keep `_d<N>` dataSeq ranking inside `vshards/`.** Rejected: local sequence
-  numbering is not comparable across replicas that compact independently;
-  revisions are the replicated, comparable ordering (ADR 0003).
+The production encoder streams that state into one checksummed `TSP1` sidecar.
+Install validates exact-v1 framing, complete-file hash/size, manifest and catalog
+hashes, canonical object names, the Raft-to-manifest revision boundary, and the
+resolved logical view before publishing receiver-allocated local TSM names.
+Snapshot install or replica retirement replaces only the named VShard's logical
+state; unrelated series in mixed Engine objects remain live.
 
 ## Consequences
 
-- Task 4a writes the catalog under `vshards/<id>/catalog/` with object identity
-  from (2).
-- Task 4c implements tier-0 shared segments + extents, tier ≥ 1 VShard-pure
-  convergence, VShard-prefixed index keys, and `[minRev,maxRev]` block ranges.
-- Task 4d implements snapshot extraction (tier-0 extents + pure objects + index
-  prefix extract + tombstones) and pin files with controller leases.
-- The `virtual_shard_count`/`format_version` stamp is validated on every object
-  open; a mismatch fails closed (a store from a different VShard count is not
-  silently opened).
+- Operators back up and restore through the exact-v1 cluster workflow, never by
+  copying a proposed `vshards/NNNN` live directory.
+- Reactor-count changes are allowed only when the VShard cohesion rule holds;
+  VShard count changes require a future format/migration design.
+- Raft state is isolated by private VShard journals, while Engine files remain
+  bounded by reactor count and are isolated logically.
+- Snapshot/backup integrity is self-contained in `TSP1`; local TSM integrity is
+  governed separately by the exact-v1 TSM format and its production-readiness
+  gate.

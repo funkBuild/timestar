@@ -5,9 +5,6 @@
 
 #include <cstdint>
 #include <map>
-#include <optional>
-#include <string>
-#include <string_view>
 #include <vector>
 
 namespace timestar {
@@ -21,18 +18,9 @@ struct VShardExtent {
     friend bool operator==(const VShardExtent&, const VShardExtent&) = default;
 };
 
-// Per-core "VShard extents in the tier-0 manifest" (Task 4c): the set of TSM
-// files covering each VShard, with per-VShard revision ranges. It is the
-// metadata a VShard snapshot (Task 4d) reads to find exactly which files hold a
-// VShard's data without scanning every file.
-//
-// Because tier-0 TSM files are (for now) multiplexed across VShards, one file
-// appears as an extent under every VShard whose series it contains. Extraction
-// of one VShard is then "iterate its extents", and its overall revision range is
-// the union across them.
-//
-// Serialisation is deterministic (entries ordered by (vshard, fileId)) with a
-// trailing CRC; decode() fails closed on any corruption.
+// Transient snapshot-builder index: the set of pinned TSM files covering each
+// VShard and their revision ranges. This is never a separate durable format;
+// VShardSnapshotManifest serializes the selected VShard's extents inside TSP1.
 class VShardExtentMap {
 public:
     // Record that `file` (with the given per-VShard revision range) covers
@@ -43,18 +31,8 @@ public:
     [[nodiscard]] std::vector<VShardExtent> extents(VShardId vshard) const;
     // Union revision range of a VShard across all its extents (empty if none).
     [[nodiscard]] RevisionRange revRange(VShardId vshard) const;
-    // All covered VShards, ascending.
-    [[nodiscard]] std::vector<VShardId> vshards() const;
-    // Total number of (vshard, file) extents.
-    [[nodiscard]] size_t extentCount() const { return countExtents(); }
-
-    [[nodiscard]] std::string encode() const;
-    [[nodiscard]] static std::optional<VShardExtentMap> decode(std::string_view bytes);
-
 private:
-    [[nodiscard]] size_t countExtents() const;
-
-    // vshard -> (fileId -> revRange), both ordered for deterministic encode.
+    // vshard -> (fileId -> revRange), ordered for deterministic snapshot manifests.
     std::map<uint16_t, std::map<uint64_t, RevisionRange>> byVShard_;
 };
 

@@ -266,7 +266,11 @@ void set_routes(routes& r) {
                         peers += ",";
                     peers += "{\"node\":" + std::to_string(id) + ",\"address\":\"" + timestar::jsonEscape(addr) + "\"}";
                 }
+                const auto& clusterConfig = timestar::config().cluster;
                 std::string body = "{\"clustered\":true,\"node_id\":" + std::to_string(st.self) +
+                                   ",\"cluster_uuid\":\"" + timestar::jsonEscape(clusterConfig.cluster_uuid) +
+                                   "\",\"failure_domain\":\"" +
+                                   timestar::jsonEscape(clusterConfig.failure_domain) + "\"" +
                                    ",\"replication_factor\":" + std::to_string(st.replicationFactor) +
                                    ",\"replicated\":" + (st.replicated ? "true" : "false") + ",\"peers\":[" + peers +
                                    "],\"unresolved_peers\":" + std::to_string(st.unresolvedPeerCount);
@@ -826,7 +830,7 @@ void set_routes(routes& r) {
                       rep->_content = timestar::proto::formatStatusResponse("ok", versionStr);
                   } else {
                       rep->_content = sstring(fmt::format(
-                          R"({{"version":"{}","git_commit":"{}","build_time":"{}","compiler":"{}"}})",
+                          R"({{"version":"{}","component":"timestar_http_server","git_commit":"{}","build_time":"{}","compiler":"{}"}})",
                           timestar::jsonEscape(timestar::VERSION), timestar::jsonEscape(timestar::GIT_COMMIT),
                           timestar::jsonEscape(timestar::BUILD_TIME), timestar::jsonEscape(timestar::COMPILER)));
                   }

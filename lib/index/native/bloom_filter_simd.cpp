@@ -148,8 +148,11 @@ bool MayContainKernel(const uint64_t* HWY_RESTRICT filter, size_t numBits, int k
     const size_t N = hn::Lanes(d);
 
     if (k <= kMaxProbes) {
-        uint8_t probeBytes[kMaxProbes];
-        uint8_t probeMasks[kMaxProbes];
+        // Highway's masked LoadN may still issue one full-width load before
+        // masking. AVX-512 therefore needs 64 readable bytes even though v1
+        // permits at most 32 probes.
+        alignas(64) uint8_t probeBytes[64]{};
+        alignas(64) uint8_t probeMasks[64]{};
 
         // Gather probe bytes and compute bit masks
         for (int i = 0; i < k; ++i) {

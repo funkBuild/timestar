@@ -71,8 +71,6 @@ seastar::future<> testExtentsGroupByVShard(std::string p) {
     co_await timestar::addTsmFileExtents(map, /*fileId=*/42, tsm);
 
     // Every expected VShard is present with the right union range and file id.
-    std::vector<timestar::VShardId> gotVShards = map.vshards();
-    EXPECT_EQ(gotVShards.size(), expected.size());
     for (const auto& [vs, range] : expected) {
         const timestar::VShardId id{vs};
         auto extents = map.extents(id);

@@ -124,44 +124,6 @@ TEST(StorageLayoutTest, CanonicalShardDirectoryParsingSharesTheLayoutGrammar) {
     EXPECT_FALSE(layout.isShardNamespaceEntry("placement.json"));
 }
 
-TEST(StorageLayoutTest, VShardNamespaceIsFrozenAndZeroPadded) {
-    const timestar::StorageLayout layout(".");
-    EXPECT_EQ(layout.vshardDataDir(), "vshards");
-    EXPECT_EQ(layout.vshardDir(timestar::VShardId{0}), "vshards/0000");
-    EXPECT_EQ(layout.vshardDir(timestar::VShardId{27}), "vshards/0027");
-    EXPECT_EQ(layout.vshardDir(timestar::VShardId{4095}), "vshards/4095");
-    // A VShard directory never encodes a core number; the id is the whole name.
-    EXPECT_THROW((void)layout.vshardDir(timestar::VShardId{4096}), std::out_of_range);
-
-    const timestar::StorageLayout rooted("/var/lib/timestar");
-    EXPECT_EQ(rooted.vshardDir(timestar::VShardId{27}), "/var/lib/timestar/vshards/0027");
-    EXPECT_EQ(rooted.vshardDataDir(), "/var/lib/timestar/vshards");
-}
-
-TEST(StorageLayoutTest, VShardDirectoryParsingRejectsAliasesAndEscapes) {
-    const timestar::StorageLayout layout("/var/lib/timestar");
-    const auto parsed = [&](std::string_view name) -> std::optional<unsigned> {
-        if (const auto v = layout.parseVShardDirName(name))
-            return v->value();
-        return std::nullopt;
-    };
-
-    EXPECT_EQ(parsed("0000"), 0u);
-    EXPECT_EQ(parsed("0027"), 27u);
-    EXPECT_EQ(parsed("4095"), 4095u);
-    EXPECT_FALSE(parsed("0").has_value());        // not zero-padded to four digits
-    EXPECT_FALSE(parsed("00000").has_value());    // over-padded
-    EXPECT_FALSE(parsed("+001").has_value());     // sign
-    EXPECT_FALSE(parsed("-001").has_value());     // sign
-    EXPECT_FALSE(parsed("4096").has_value());     // out of range
-    EXPECT_FALSE(parsed("65536").has_value());    // out of range / overflow
-    EXPECT_FALSE(parsed("../0001").has_value());  // path escape
-    EXPECT_FALSE(parsed("vshards/0001").has_value());
-    EXPECT_FALSE(parsed("0001/").has_value());
-    EXPECT_FALSE(parsed("").has_value());
-    EXPECT_FALSE(parsed("0abc").has_value());
-}
-
 TEST(StorageLayoutTest, EquivalentLexicalRootsProduceEqualValues) {
     const timestar::StorageLayout first("data/./tenant/../primary");
     const timestar::StorageLayout second("data/primary///");

@@ -636,10 +636,8 @@ void TSMWriter::writeCompressedBlockWithStats(TSMValueType seriesType, const Ser
     indexBlock.boolTrueCount = srcBlock.boolTrueCount;
     indexBlock.boolFirstValue = srcBlock.boolFirstValue;
     indexBlock.boolLatestValue = srcBlock.boolLatestValue;
-    // This path copies the block's compressed bytes and revision range verbatim,
-    // so its points -- and hence its [minRev, maxRev] -- are unchanged. Carry the
-    // range forward (dropping it would let a later stale flush win the LWW merge
-    // outright; see ADR 0003 / point_revision.hpp rangeWinner).
+    // This path copies the block's compressed bytes, so preserve the source
+    // revision range used by snapshot/recovery metadata as well.
     indexBlock.blockMinRev = srcBlock.blockMinRev;
     indexBlock.blockMaxRev = srcBlock.blockMaxRev;
 

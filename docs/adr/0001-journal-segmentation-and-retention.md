@@ -1,178 +1,132 @@
-# ADR 0001 — Journal segmentation and retention for multiplexed VShard groups
+# ADR 0001 — Raft journal segmentation and retention
 
-**Status:** Accepted (Phase 1 / Task 4 prerequisite; resolves open decision 2)
+**Status:** Accepted and implemented for exact v1
 
 **Parent design:** [Cluster Architecture and Implementation Plan](../clustering.md)
-(sections "Journal safety contract", "Multiplexed object model", "Durability")
-
-**Prerequisite for:** VShard-workers Task 4.0 (durable acknowledgement boundary)
-and Task 4b (journal partitioning).
 
 ## Context
 
-Storage is addressed by VShard, but there are 4,096 VShards and the plan
-forbids 4,096 independent services ("no 4,096 independent services"). Journals
-are therefore **per reactor core and multiplexed**: one append stream per core
-carries records for every VShard that core currently owns. The owning core is
-derived at startup (`assignCore(vshard, coreCount)`, ADR-adjacent, see
-`lib/core/vshard.hpp`); there is no persisted local ownership.
+TimeStar hosts 4,096 VShard Raft groups. Each group needs durable HardState,
+entries, configuration, and snapshot boundaries, but the implementation must
+also bound replay, reclaim compacted prefixes, survive torn tails, and prevent
+one failed storage device from acknowledging state it did not make durable.
 
-The plan fixes the hard invariants (record framing, fenced-failed on I/O error,
-GC at the minimum released position with laggard copy-forward, a per-VShard byte
-cap, group-commit barriers paying alignment padding). This ADR fixes the
-concrete segmentation and retention design those invariants require.
+The original plan selected one multiplexed journal per reactor. Production
+experience changed that choice before release: the exact-v1 default is one
+private journal per locally hosted VShard. This costs descriptors and fsyncs,
+but isolates a durability failure to one replica and makes deletion-only GC
+independent per group. Replicated startup therefore requires an
+`RLIMIT_NOFILE` soft limit of at least 8,192 and raises it to that value when the
+hard limit permits.
+
+An optional shared-per-reactor journal remains behind
+`TIMESTAR_CLUSTER_SHARED_JOURNAL=1` for measured group-commit qualification.
+It is not accepted by the cluster restore workflow and is not the release
+default.
 
 ## Decision
 
-### 1. Record framing
+### Exact-v1 framing
 
-Every journal record is length-prefixed and CRC-covered and carries, at minimum:
+Every segment begins with a CRC-covered header containing the exact format
+version, cluster UUID, reactor number, segment number, and boot ID. Segment
+filenames are canonical zero-padded identities and are never reused.
 
-```
-record_len (u32)              # payload length, excludes this header + CRC
-crc32c     (u32)              # over the payload bytes only
-vshard     (u16)             # 0..4095; the record's owning VShard
-vshard_seq (u64)             # per-VShard monotonic append sequence
-raft_term  (u64)             # per-VShard Raft hard state
-raft_index (u64)             # per-VShard Raft log index
-record_kind(u8)              # data / catalog / truncation / hard-state / config / retention
-payload    (record_len bytes)
+Every record is encoded little-endian as:
+
+```text
+body_len:u32 | crc32:u32 | vshard:u16 | vshard_seq:u64 |
+raft_term:u64 | raft_index:u64 | kind:u8 | payload
 ```
 
-`(vshard, vshard_seq)` totally orders one VShard's records independent of their
-physical position in the shared stream. The append sequence is gap-free; GC may
-later leave holes only in the prefix superseded by a retained snapshot. Replay
-routes each record to `assignCore(vshard, live_core_count)` and applies it in
-`vshard_seq` order, so records written under a previous core count remain
-recoverable under a new one.
+The CRC covers the complete record body. Unknown kinds, reserved VShard bits,
+bad lengths, bad CRCs, foreign cluster/core headers, noncanonical directory
+entries, segment-number conflicts, and corruption in a sealed segment fail
+closed. A torn record tail is repairable only in the final segment; recovery
+truncates it to the last complete record.
 
-### 2. Segments
+### Layout and rotation
 
-- A core journal is a directory `journals/core_<n>/` of fixed-capacity segment
-  files `seg_<20-digit-zero-padded-segment-number>.jnl`. Segment numbers are
-  globally increasing per core and never reused.
-- **Segment target size: 64 MiB** (`journal.segment_bytes`, validated, default
-  fixed in v1). A record is never split across segments; a record that would
-  cross the boundary rotates first. A single record larger than a segment is a
-  configuration/logic error and latches the journal (records are bounded by the
-  write-batch limit, which is below the segment size).
-- Each segment begins with a header: magic, format version, cluster UUID, core
-  number, segment number, and the creating process's boot id. Recovery validates
-  the header before trusting the segment.
+- The default private layout stores one journal in
+  `cluster_raft/.../vshard_<id>/`, with a 1 MiB rotation target.
+- The optional shared layout stores one journal per reactor in
+  `cluster_raft/.../shard_<reactor>/`, with a 64 MiB rotation target.
+- A record never straddles segments. A fresh segment may hold one record larger
+  than its target; the Raft proposal and snapshot limits remain the binding
+  producer bounds.
+- Creating and deleting a segment includes a parent-directory sync. A segment
+  is sealed by a durability barrier, truncation to its logical length, another
+  flush, and close.
 
-### 3. Group commit and the durability barrier
+### Durability barrier and failure fence
 
-- Appends accumulate into an O_DIRECT-aligned buffer. A **barrier**
-  (`flush` + `fdatasync` covering the buffer's byte range) is scheduled at
-  **buffer-fill (the aligned buffer is full) or a maximum delay of 4 ms
-  (`journal.max_commit_delay_ms`), whichever comes first.**
-- An acknowledged write (and any Raft vote/term response that references a
-  record) is released only after the barrier that covers its byte range
-  completes — the plan's "no RPC response before its covering barrier" rule and
-  the transferred Phase-0 power-loss gate (Task 4.0).
-- O_DIRECT alignment padding is paid **per barrier** (the tail is padded to the
-  DMA alignment; the next append rewinds to the true logical end). Padding bytes
-  per barrier are exported as `journal_barrier_padding_bytes` so the overhead is
-  a documented, watchable metric.
-- Any append or barrier I/O error **latches the core's journal into a fenced
-  failed state**: it rejects all further appends, reports unhealthy, and marks
-  every VShard it owns as storage-failed so queries against them return an
-  explicit error rather than an omitted-series false negative. Catch-and-continue
-  on the durability path is prohibited; crash injection covers injected flush
-  errors.
+The Raft driver appends a complete `Ready` and then awaits `sync()`. The direct
+sink issues a whole-buffer `fdatasync` for that group. The shared sink may serve
+multiple already-enqueued group waiters with one whole-buffer barrier. There is
+no time-based 4 ms journal promise: the caller's awaited barrier is the
+acknowledgement boundary.
 
-### 4. Watermarks and retention
+No Raft message is sent, state-machine command applied, or proposal waiter
+acknowledged before that covering barrier succeeds. Append, rotation,
+snapshot-promotion, directory-sync, or barrier failure permanently fences the
+writer and quarantines the affected replica before its failed `Ready` can send,
+apply, or acknowledge. With a shared writer the fence deliberately covers
+every group on that reactor, because none can prove a durable barrier after the
+shared device failure.
 
-Each VShard maintains two durable per-VShard watermarks, checkpointed into the
-core's manifest (not into the journal stream itself):
+### Snapshot and replay bounds
 
-- `applied_seq` — the highest `vshard_seq` whose query-visible effects are fully
-  materialised into TSM/index/catalog.
-- `released_seq` — the highest `vshard_seq` no longer needed for recovery or
-  replica catch-up (`min(applied_seq, min over live learners of their matched
-  seq)`).
+A data group becomes snapshot-eligible after either 8,192 applied entries or
+64 MiB of applied entry bytes since its previous snapshot. The sweep runs every
+five seconds and does not snapshot the same group more than once per minute.
+The private layout produces at most one snapshot per reactor per sweep. The
+shared layout derives a sequential batch intended to scan hosted groups within
+15 minutes.
 
-A record at position `P` is reclaimable once every VShard whose records precede
-`P` has `released_seq` past it. Because streams are multiplexed, a single laggard
-VShard would otherwise pin the whole shared segment.
+Production VShard snapshots are file-backed, limited to 1 TiB, transferred in
+4 MiB chunks, and limited to four concurrent outbound transfers per reactor.
+A follower behind a compacted prefix installs the retained snapshot rather
+than depending on a separate 256 MiB log cap; no
+`journal.per_vshard_cap_bytes` setting exists in v1.
 
-### 5. Segment GC with laggard copy-forward
+### Retention and GC
 
-- GC reclaims a segment only when **every** record in it is below its VShard's
-  `released_seq`.
-- When a sealed segment contains a bounded set of live records for a **laggard**
-  VShard while the rest is reclaimable, those live records are **copied
-  forward** into the current segment (as opaque, re-CRC-checked records), made
-  durable, and only then is the old segment deleted.
-- A shared-journal pass continues scanning after an unreclaimable segment. A
-  pin retains that segment, but does not retain an independently fully released
-  physical suffix. This is required to prevent one idle group from
-  head-of-line blocking the entire reactor's journal forever. The private
-  per-VShard layout keeps the simpler stop-at-first-pin/physical-suffix policy,
-  because a pin there affects only that VShard's directory.
-- Shared GC may therefore leave holes in physical segment numbers and in the
-  pre-snapshot portion of one VShard's retained sequence. This is safe only
-  because `released_seq` is derived from durable hard-state, snapshot, and live
-  log-entry records: every deleted sequence is strictly below a retained
-  snapshot and below every record still needed for recovery.
-- **Per-VShard retained-log byte cap: 256 MiB** (`journal.per_vshard_cap_bytes`).
-  If a laggard's un-released log for one VShard exceeds the cap, log catch-up for
-  that learner is abandoned: the learner is dropped and **restarted from a fresh
-  snapshot** (install-not-replay; see ADR 0002). This is the plan's
-  "exceeding the cap abandons log catch-up and restarts from a fresh snapshot".
+Each persistence object publishes a monotonic released sequence derived from
+its durable snapshot and retained live suffix. Once a minute, the snapshot
+maintenance path publishes advanced floors and considers only sealed segments
+older than the active segment.
 
-### 6. Recovery
+- In the default private layout, a segment is deleted only when all of its
+  records are released. A pinned segment retains that VShard's physical suffix;
+  GC never writes through the active private writer.
+- In the shared layout, fully released segments are deleted independently.
+  A partially released segment may copy at most 512 live records into the
+  active segment under the shared writer's exclusive barrier, make those copies
+  durable, then delete and directory-sync the old segment. Mostly-live segments
+  remain pinned, but do not prevent later independently released segments from
+  being inspected.
 
-Startup, for each core it will own after boot-derived assignment:
+Copy-forward is crash-safe: before its barrier the old segment is authoritative;
+after the barrier the new copy is durable; before deletion completes both may
+exist. Recovery replays identical `(vshard, vshard_seq)` records idempotently and
+rejects uncovered gaps or conflicting state.
 
-1. Enumerate its segments in order; tolerate physical segment-number holes,
-   validate headers, and find the durable tail
-   (last record fully covered by a completed barrier — a torn tail past the last
-   barrier is discarded, matching the Phase-0 WAL recovery discipline).
-2. Sort and de-duplicate each VShard by `vshard_seq`. A sequence gap is accepted
-   only when its upper record is at or before the newest retained snapshot;
-   any gap after that snapshot fails closed as live-suffix loss.
-3. Reconstruct per-VShard `(term, vote, log suffix)` honouring per-group logical
-   truncation records in append order.
-4. Route each surviving record to its current owning core and apply in
-   `vshard_seq` order.
+Replica retirement publishes a terminal release floor, atomically quarantines
+the private journal generation, retains it for 24 hours, and reclaims it only
+after the grace marker expires. Re-adding that VShard clears the old generation's
+watermark before the first new append.
 
-A logical truncation (post-leadership-conflict suffix drop) is itself an appended
-record ordered after the conflict discovery, never an in-place erase.
+## Operational consequences
 
-## Rationale
+- Use the private layout for release qualification and restore. Do not set
+  `TIMESTAR_CLUSTER_SHARED_JOURNAL` in a production candidate.
+- Replicated startup fails before Engine or Raft opens if the process cannot
+  obtain 8,192 file descriptors.
+- `/cluster/status` exposes journal fsync/sync counts, GC passes, deleted and
+  pinned segments, copy-forward records, retired/reclaimed replicas, snapshots,
+  transfer backlog, and durability failures.
+- Alert on any `raft_durability_failures`, steadily pinned segment growth,
+  snapshot production refusal, apply failure, or nonzero durability fence.
 
-- **64 MiB segments / 4 ms / 256 MiB cap** are chosen as safe, roundable v1
-  defaults: large enough that segment rotation and directory-entry fsync are
-  amortised across thousands of records, small enough that GC granularity and
-  copy-forward cost stay bounded; 4 ms bounds ack latency while letting a busy
-  core coalesce a full aligned buffer; 256 MiB per-VShard cap bounds the pin a
-  single stuck learner imposes while comfortably exceeding a normal snapshot
-  interval. All three are validated config, frozen (not advertised as tunable) in
-  v1, and revisited with measured data before GA.
-- Watermarks live in the manifest, not the journal, so GC does not itself append
-  to the stream it is trying to reclaim.
-- Copy-forward keeps multiplexing (one stream, cheap appends) while giving each
-  VShard an independent retention horizon, reconciling "no 4,096 services" with
-  per-VShard snapshot/catch-up guarantees.
-
-## Alternatives considered
-
-- **One journal per VShard (4,096 streams).** Rejected by the plan — 4,096 open
-  files, 4,096 fsync cadences, and 4,096 group-commit timers per node.
-- **Time-based retention.** Rejected: retention must follow the recovery/replica
-  frontier (released position), not wall-clock, and cluster-mode bans local
-  `now()` in durability decisions.
-- **In-place segment compaction (rewrite the oldest segment in place).**
-  Rejected: not crash-atomic. Copy-forward-then-delete chooses one complete
-  generation on every crash.
-
-## Consequences
-
-- Task 4.0 implements the barrier + fenced-failed latch on this record framing.
-- Task 4b implements the watermarks, GC, and copy-forward.
-- The per-VShard cap makes learner restart-from-snapshot (ADR 0002) a required,
-  tested path, not an exceptional one.
-- Metrics: `journal_barrier_padding_bytes`, `journal_segment_count`,
-  `journal_copy_forward_bytes`, `journal_per_vshard_retained_bytes`,
-  `journal_fenced_total`.
+The crash, compacted restart, empty-node catch-up, retirement, directory-sync,
+and ENOSPC tests are the executable acceptance contract for this ADR.

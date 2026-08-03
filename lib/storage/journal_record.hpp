@@ -39,7 +39,7 @@ enum class JournalRecordKind : uint8_t {
 // boot-derived owning core (assignCore) and applies it in vshard_seq order.
 struct JournalRecord {
     VShardId vshard{0};
-    uint64_t vshardSeq = 0;  // per-VShard monotonic sequence (also the pre-Raft point revision)
+    uint64_t vshardSeq = 0;  // per-VShard monotonic persistence sequence
     uint64_t raftTerm = 0;
     uint64_t raftIndex = 0;
     JournalRecordKind kind = JournalRecordKind::Data;

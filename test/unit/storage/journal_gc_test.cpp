@@ -307,12 +307,18 @@ seastar::future<> testSharedGcContinuesPastAPinAndRecoveryAcceptsTheCoveredGap()
     // Large enough to rotate into segment 1, which is fully released.
     co_await w.append(rec(1, 2, std::string(30, 'r')));
     // Rotate once more so segment 1 is sealed and retain a snapshot in active segment 2.
-    JournalRecord snapshot = rec(1, 3, std::string(60, 's'));
-    snapshot.kind = JournalRecordKind::Snapshot;
-    snapshot.raftIndex = 2;
-    snapshot.raftTerm = 1;
-    co_await w.append(snapshot);
-    co_await w.barrier();
+    // Write it through the production persistence path: recovery deliberately rejects a
+    // Snapshot record whose payload is not the exact-v1 snapshot envelope. Eighteen data
+    // bytes plus that envelope preserve the old fixture's 60-byte payload/segment layout.
+    {
+        timestar::raft::JournalRaftPersistence persistence(w, VShardId{1}, 3);
+        timestar::raft::Snapshot snapshot;
+        snapshot.index = 2;
+        snapshot.term = 1;
+        snapshot.data = std::string(18, 's');
+        co_await persistence.persistSnapshot(std::move(snapshot), /*receivedFromPeer=*/false);
+        co_await persistence.sync();
+    }
     ASSERT_TRUE_OR_RETURN(w.currentSegmentNumber() >= 2);
 
     JournalRetention ret;

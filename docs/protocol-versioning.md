@@ -36,10 +36,7 @@ historical-reader guarantees during the greenfield phase.
 | NativeIndex manifest | `TSMF` plus `uint32(1)` |
 | NativeIndex SSTable footer | `TSIX` plus `uint32(1)` |
 | Raft journal segment | `JRNL` plus `uint32(1)` |
-| VShard manifest | `VSMF` plus `uint32(1)` |
 | VShard snapshot manifest | `VSNP` plus `uint32(1)` |
-| VShard extent map | `VXMP` plus `uint32(1)` |
-| Snapshot pin set | `SPNS` plus `uint32(1)` |
 | Durable control map | `TSCMAP1` and version `1` |
 
 Nested request/reply payloads carried over the negotiated data-plane connection
