@@ -355,6 +355,12 @@ TEST_F(ShardRaftPlaneTest, DataPeerAddressChangeRetiresTheCachedConnection) {
     }).get();
 }
 
+TEST_F(ShardRaftPlaneTest, DataPlaneTlsRefusesARegisteredPeerWithoutAnEndpointName) {
+    timestar::data::DataPlaneRpc rpc;
+    rpc.addPeer(2, loopback(39099));
+    EXPECT_THROW(rpc.setTlsCredentials({}, {}, {}), std::logic_error);
+}
+
 TEST_F(ShardRaftPlaneTest, MovementControlFencesCrossTheExactV1Socket) {
     seastar::async([] {
         RecordingStore store;

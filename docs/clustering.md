@@ -1020,11 +1020,13 @@ failure_domain = "rack-a"          # stable rack/AZ/host label for this node
 tls_cert_file = "/run/secrets/timestar-node.crt"
 tls_key_file = "/run/secrets/timestar-node.key"
 tls_ca_file = "/run/secrets/timestar-cluster-ca.crt"
-tls_peer_name = "timestar-node"
 ```
 
 The same mTLS identity protects both the data-plane port (HTTP port + 1000) and
-Raft port (HTTP port + 2000), with client certificates required. The
+Raft port (HTTP port + 2000), with client certificates required. Outbound TLS
+derives the expected DNS/IP SAN separately from each configured or committed
+peer address; there is no shared peer-name override that lets one endpoint's
+certificate stand in for another. The
 `development_allow_insecure_transport` setting and corresponding environment
 variable exist only for local test gates; they are not production settings.
 

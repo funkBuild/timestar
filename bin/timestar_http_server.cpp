@@ -936,7 +936,7 @@ int main(int argc, char** argv) {
                         clusterTls = timestar::cluster::DataPlaneTls{
                             readClusterCredential(cc.tls_cert_file, "certificate"),
                             readClusterCredential(cc.tls_key_file, "private key"),
-                            readClusterCredential(cc.tls_ca_file, "CA"), cc.tls_peer_name};
+                            readClusterCredential(cc.tls_ca_file, "CA")};
                     } else {
                         timestar::http_log.warn(
                             "replicated cluster transport is PLAINTEXT because the explicit development-only insecure "

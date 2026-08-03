@@ -227,7 +227,6 @@ struct ClusterConfig {
     std::string tls_cert_file;
     std::string tls_key_file;
     std::string tls_ca_file;
-    std::string tls_peer_name;
     // Development escape hatch for local fault tests only. Production deployments
     // must leave this false; without it an RF>1 server refuses plaintext startup.
     bool development_allow_insecure_transport = false;
@@ -382,8 +381,8 @@ struct glz::meta<timestar::ClusterConfig> {
     static constexpr auto value =
         object("enabled", &T::enabled, "node_id", &T::node_id, "peers", &T::peers, "partitioned", &T::partitioned,
                "replication_factor", &T::replication_factor, "cluster_uuid", &T::cluster_uuid, "tls_cert_file",
-               &T::tls_cert_file, "tls_key_file", &T::tls_key_file, "tls_ca_file", &T::tls_ca_file, "tls_peer_name",
-               &T::tls_peer_name, "development_allow_insecure_transport", &T::development_allow_insecure_transport,
+               &T::tls_cert_file, "tls_key_file", &T::tls_key_file, "tls_ca_file", &T::tls_ca_file,
+               "development_allow_insecure_transport", &T::development_allow_insecure_transport,
                "control_enabled", &T::control_enabled, "control_seed_node_id", &T::control_seed_node_id,
                "failure_domain", &T::failure_domain);
 };

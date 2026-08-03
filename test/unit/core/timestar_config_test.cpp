@@ -284,7 +284,6 @@ TEST(TimestarConfigValidateTest, ReplicatedClusterRequiresCompleteTlsUnlessDevel
     EXPECT_FALSE(errorsMatching(cfg.validate(), "cluster TLS requires").empty());
     cfg.cluster.tls_key_file = "node.key";
     cfg.cluster.tls_ca_file = "ca.crt";
-    cfg.cluster.tls_peer_name = "timestar-node";
     EXPECT_TRUE(errorsMatching(cfg.validate(), "cluster TLS").empty());
     EXPECT_TRUE(errorsMatching(cfg.validate(), "requires mTLS").empty());
 }

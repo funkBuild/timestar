@@ -83,7 +83,7 @@ public:
     // core.
     seastar::future<> startClientOnly();
     seastar::future<> stop();
-    void addPeer(NodeId id, seastar::socket_address addr);
+    void addPeer(NodeId id, seastar::socket_address addr, std::string tlsServerName = {});
 
     // forwardWriteBatch resolves only once
     // the owner has durably applied the batch; queryNode returns the owner's
@@ -140,11 +140,11 @@ public:
 
     // Enable mutual TLS on this transport (X1b, required before GA): the server
     // requires a client certificate and both sides trust `caPem`; each presents
-    // (certPem, keyPem). MUST be called before start(). `expectedPeerName` is the SAN
-    // the client verifies the server's cert against (cluster-UUID-bound node name in
-    // production). With TLS on, a plaintext peer -- or one whose cert the CA does not
-    // sign -- cannot connect. All PEM (x509).
-    void setTlsCredentials(std::string certPem, std::string keyPem, std::string caPem, std::string expectedPeerName);
+    // (certPem, keyPem). MUST be called before start(). Each addPeer call supplies
+    // that endpoint's configured DNS/IP name for certificate SAN verification. With
+    // TLS on, a plaintext peer, wrong endpoint certificate, or cert the CA does not
+    // sign cannot connect. All PEM (x509).
+    void setTlsCredentials(std::string certPem, std::string keyPem, std::string caPem);
 
 private:
     // Require an exact-v1 handshake once per connection. The optional deadline

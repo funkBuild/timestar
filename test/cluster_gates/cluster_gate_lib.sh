@@ -1,5 +1,7 @@
 #!/bin/bash
 # Shared helpers for the cluster write-path gates. Source, don't execute.
+# The authoritative per-gate port and cleanup-prefix inventory, including the
+# 1992 mTLS-identity gate, is in README.md.
 #
 # NOTE ON pkill: only ever from a SCRIPT FILE, never inlined into `bash -c`, because an
 # inline pattern matches the invoking shell's own argv and kills it mid-command.

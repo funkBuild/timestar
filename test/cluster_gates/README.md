@@ -23,14 +23,15 @@ not probes, so they can be run from CI or a release checklist.
 | `large_snapshot_streaming_gate.sh` | an exact-v1 snapshot of 128 MiB + 1 byte crosses leader hydration, v1 Raft framing and receiver disk staging in chunks no larger than 4 MiB, with a 1 GiB process limit and all temporary data under `build/tmp` |
 | `delete_receipt_retirement_gate.sh` | a real canonical exact delete changes four seed points to three on every node, then sustained deletes cross the 1,024-receipt per-VShard capacity on every replica, advance the replicated retirement floor twice, preserve expired/retained retry outcomes, become snapshot-covered, reclaim production-sized sealed v1 journal segments, and retain only the current snapshot sidecar |
 | `homogeneous_v1_rejection_gate.sh` | exact-v1 codec and real-socket handshake rejection, plus a production restart over a real acknowledged WAL whose version field is changed to an unsupported value; startup must exit before HTTP and preserve the source byte-for-byte |
+| `mtls_peer_identity_gate.sh` | matching per-peer IP SANs converge and commit, a certificate signed by the cluster CA for the wrong configured endpoint produces bounded 503 on a real write, and restoring the correct endpoint identity commits that exact write |
 
 All of them take an optional server binary as `$1` (default
 `build/bin/timestar_http_server`), so a "before" binary can be measured the same way.
 Every node also receives an explicit `--memory` budget: 8 GiB by default,
 overrideable with `GATE_SERVER_MEMORY`. The low-volume `restart_catchup`,
 `snapshot_durability`, topology, retention, pattern-delete, receipt-retirement,
-and homogeneous-v1 gates pin 1 GiB per process. This is a per-process limit, so
-size the aggregate as `node count * GATE_SERVER_MEMORY`; leaving it implicit
+homogeneous-v1, and mTLS-identity gates pin 1 GiB per process. This is a
+per-process limit, so size the aggregate as `node count * GATE_SERVER_MEMORY`; leaving it implicit
 lets every Seastar process size itself from the whole host and can overcommit a
 multi-node gate before the property under test is reached.
 
@@ -69,6 +70,11 @@ socket, and production-restart arms keep every temporary and durable artifact
 under `build/tmp`. The live arm changes only the version field of a real
 acknowledged WAL, then requires a non-zero startup exit before `/health`, an
 explicit unsupported-version diagnostic, and byte-for-byte source preservation.
+
+`mtls_peer_identity_gate.sh` uses three 1-GiB, one-reactor processes and
+repository-local roots. It generates a one-run CA and three distinct IP-SAN
+certificates under `build/tmp`, never exports private material, and removes the
+credentials with the node roots on exit.
 
 ## Run them ONE AT A TIME, with the previous run's data dirs deleted
 
@@ -214,6 +220,7 @@ cannot reintroduce the race.
 | `pattern_delete_failover_gate.sh` | 19850-19852 | 20850-20852 | 21850-21852 | `1985` | `build/tmp/tsgate_pd*` |
 | `delete_receipt_retirement_gate.sh` | 19870-19872 | 20870-20872 | 21870-21872 | `1987` | `build/tmp/tsgate_dr*` |
 | `homogeneous_v1_rejection_gate.sh` | 19890 | 20890 | 21890 | `1989` | `build/tmp/tsgate_v1*` |
+| `mtls_peer_identity_gate.sh` | 19920-19922 | 20920-20922 | 21920-21922 | `1992` | `build/tmp/tsgate_ti*` |
 
 The prefixes are now four digits and unique per gate — they used to be three, so `492`
 covered both `backpressure` and `rolling_rebalance` and `197` also matched `--port 19730`,

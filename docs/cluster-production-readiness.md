@@ -256,6 +256,15 @@ inventory and rules.
   three compacted journals, and read all 128 acknowledged points exactly once
   from every node. Both gates used one reactor and 1 GiB per process, stored all
   artifacts under `build/tmp`, and removed their data roots on exit.
+- [x] Remove the shared mTLS peer-name override. Both inter-node transports now
+  bind outbound certificate SAN verification to each peer's configured or
+  Group-0-committed DNS/IP address, retire a cached connection when that identity
+  changes, and refuse TLS activation if any registered peer lacks a name. A
+  bounded three-node live gate converged with three distinct IP identities,
+  returned retryable `503` when node 2 presented node 3's otherwise trusted
+  certificate, then committed that exact write after node 2 restored its own
+  certificate. The obsolete `tls_peer_name` config and environment paths are
+  removed rather than retained as aliases.
 
 ## Remaining production blockers
 
@@ -282,9 +291,11 @@ evidence below.
   as unsupported and preserved the rejected WAL byte-for-byte. One 1-GiB,
   one-reactor process ran at a time and all artifacts were under `build/tmp`.
   There is no fallback, negotiation above v1, or activation path.
-- [ ] **Run multi-host topology, security, and fault gates.** Verify mTLS peer
-  identity, authenticated operator mutations, network partitions, restart,
-  disk-full behavior, and bounded recovery on distinct hosts.
+- [ ] **Run multi-host topology, security, and fault gates.** The bounded local
+  mTLS identity gate now covers positive, trusted-wrong-endpoint, and recovery
+  paths. Repeat identity and authenticated operator mutation on distinct hosts,
+  then verify network partitions, restart, disk-full behavior, and bounded
+  recovery there.
 - [ ] **Measure production SLOs.** Record one-node-failure write error band,
   recovery time, query latency, snapshot catch-up, and movement impact using the
   final binary and deployment settings.

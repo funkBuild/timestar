@@ -51,13 +51,12 @@ public:
     // Drain in-flight sends, then close the server and all peer clients.
     seastar::future<> stop();
     // Register how to reach a peer node (its host RPC address).
-    void addPeer(NodeId id, seastar::socket_address addr);
+    void addPeer(NodeId id, seastar::socket_address addr, std::string tlsServerName = {});
 
     // Require mutual TLS for the listener and every peer connection. Must be set
-    // before start(); the server requires a client certificate and outbound peers
-    // are verified against expectedPeerName.
-    void setTlsCredentials(std::string certPem, std::string keyPem, std::string caPem,
-                           std::string expectedPeerName);
+    // before start(); the server requires a client certificate and each addPeer
+    // endpoint supplies its own configured DNS/IP name for SAN verification.
+    void setTlsCredentials(std::string certPem, std::string keyPem, std::string caPem);
 
     seastar::future<> send(Envelope env) override;
 

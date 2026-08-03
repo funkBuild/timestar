@@ -136,10 +136,14 @@ seastar::rpc::client_options peerClientOptions() {
 
 struct RaftRpcTransport::Impl {
     using Client = seastar::rpc::protocol<RaftSerializer>::client;
+    struct PeerEndpoint {
+        seastar::socket_address address;
+        std::string tlsServerName;
+    };
 
     seastar::rpc::protocol<RaftSerializer> proto{RaftSerializer{}};
     std::unique_ptr<seastar::rpc::protocol<RaftSerializer>::server> server;
-    std::map<NodeId, seastar::socket_address> peers;
+    std::map<NodeId, PeerEndpoint> peers;
     std::map<NodeId, std::unique_ptr<Client>> clients;
     // Earliest time we may re-attempt a peer whose connection died (see kReconnectBackoff).
     std::map<NodeId, seastar::lowres_clock::time_point> nextRetry;
@@ -148,7 +152,6 @@ struct RaftRpcTransport::Impl {
     bool stopping = false;
     seastar::shared_ptr<seastar::tls::server_credentials> serverCreds;
     seastar::shared_ptr<seastar::tls::certificate_credentials> clientCreds;
-    std::string tlsPeerName;
     bool tlsEnabled = false;
 
     // The deliver stub is created ONCE. Allocating one per send (as this used to)
@@ -340,10 +343,11 @@ struct RaftRpcTransport::Impl {
         const auto opts = peerClientOptions();
         if (tlsEnabled) {
             seastar::tls::tls_options tlsOpts;
-            tlsOpts.server_name = seastar::sstring(tlsPeerName);
-            c = std::make_unique<Client>(proto, opts, seastar::tls::socket(clientCreds, tlsOpts), pit->second);
+            tlsOpts.server_name = seastar::sstring(pit->second.tlsServerName);
+            c = std::make_unique<Client>(proto, opts, seastar::tls::socket(clientCreds, tlsOpts),
+                                         pit->second.address);
         } else {
-            c = std::make_unique<Client>(proto, opts, pit->second);
+            c = std::make_unique<Client>(proto, opts, pit->second.address);
         }
         auto* p = c.get();
         clients[to] = std::move(c);
@@ -354,22 +358,26 @@ struct RaftRpcTransport::Impl {
 RaftRpcTransport::RaftRpcTransport() : impl_(std::make_unique<Impl>()) {}
 RaftRpcTransport::~RaftRpcTransport() = default;
 
-void RaftRpcTransport::addPeer(NodeId id, seastar::socket_address addr) {
+void RaftRpcTransport::addPeer(NodeId id, seastar::socket_address addr, std::string tlsServerName) {
+    if (impl_->tlsEnabled && tlsServerName.empty())
+        throw std::invalid_argument("RaftRpcTransport: TLS peer server name must not be empty");
     auto existing = impl_->peers.find(id);
-    if (existing != impl_->peers.end() && existing->second == addr)
+    if (existing != impl_->peers.end() && existing->second.address == addr &&
+        existing->second.tlsServerName == tlsServerName)
         return;
     if (auto client = impl_->clients.find(id); client != impl_->clients.end()) {
         impl_->retire(std::move(client->second));
         impl_->clients.erase(client);
     }
     impl_->nextRetry.erase(id);
-    impl_->peers[id] = addr;
+    impl_->peers.insert_or_assign(id, Impl::PeerEndpoint{addr, std::move(tlsServerName)});
 }
 
-void RaftRpcTransport::setTlsCredentials(std::string certPem, std::string keyPem, std::string caPem,
-                                         std::string expectedPeerName) {
+void RaftRpcTransport::setTlsCredentials(std::string certPem, std::string keyPem, std::string caPem) {
     if (impl_->server)
         throw std::logic_error("RaftRpcTransport TLS must be configured before start");
+    if (std::ranges::any_of(impl_->peers, [](const auto& peer) { return peer.second.tlsServerName.empty(); }))
+        throw std::logic_error("RaftRpcTransport: TLS requires a server name for every registered peer");
     seastar::tls::credentials_builder builder;
     builder.set_x509_trust(seastar::tls::blob(caPem.data(), caPem.size()), seastar::tls::x509_crt_format::PEM);
     builder.set_x509_key(seastar::tls::blob(certPem.data(), certPem.size()),
@@ -377,7 +385,6 @@ void RaftRpcTransport::setTlsCredentials(std::string certPem, std::string keyPem
     builder.set_client_auth(seastar::tls::client_auth::REQUIRE);
     impl_->serverCreds = builder.build_server_credentials();
     impl_->clientCreds = builder.build_certificate_credentials();
-    impl_->tlsPeerName = std::move(expectedPeerName);
     impl_->tlsEnabled = true;
 }
 

@@ -9,11 +9,12 @@ diagnostics; cluster mutation routes such as leadership rebalance use the normal
 bearer-token wrapper.
 
 Replicated RF&gt;1 clusters require mutual TLS for both data-plane and Raft RPC by
-default. Configure `cluster.tls_cert_file`, `tls_key_file`, `tls_ca_file`, and
-`tls_peer_name`; listeners require a client certificate and outbound connections
-verify the CA and certificate SAN. Plaintext replicated transport is available
-only through `cluster.development_allow_insecure_transport` and must not be used
-in production. The obsolete best-effort static full-replication mode remains an
+default. Configure `cluster.tls_cert_file`, `tls_key_file`, and `tls_ca_file`;
+listeners require a client certificate and outbound connections verify the CA
+and the certificate DNS/IP SAN against that peer's configured address.
+Plaintext replicated transport is available only through
+`cluster.development_allow_insecure_transport` and must not be used in
+production. The obsolete best-effort static full-replication mode remains an
 explicitly quarantined demo and does not inherit these RF&gt;1 guarantees.
 
 The server is still designed to run behind a reverse proxy for client TLS,

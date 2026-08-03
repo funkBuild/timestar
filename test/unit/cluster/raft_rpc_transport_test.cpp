@@ -420,6 +420,12 @@ TEST(RaftRpcTransportTest, PeerAddressChangeRetiresTheCachedConnection) {
     testPeerAddressChangeRetiresCachedConnection().get();
 }
 
+TEST(RaftRpcTransportTest, TlsRefusesARegisteredPeerWithoutAnEndpointName) {
+    RaftRpcTransport transport;
+    transport.addPeer(2, loopback(39174));
+    EXPECT_THROW(transport.setTlsCredentials({}, {}, {}), std::logic_error);
+}
+
 TEST(RaftRpcTransportTest, ManyGroupMessagesToOnePeerShareFrames) {
     testBatchedDelivery().get();
 }

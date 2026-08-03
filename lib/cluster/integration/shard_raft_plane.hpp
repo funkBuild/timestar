@@ -121,7 +121,6 @@ struct DataPlaneTls {
     std::string certPem;
     std::string keyPem;
     std::string caPem;
-    std::string expectedPeerName;
 };
 
 // One shard's slice of the replicated data plane: a full ReplicatedDataPlane holding
@@ -293,7 +292,7 @@ public:
     // write path's only peer clients.
     seastar::future<> startDataPlane(seastar::socket_address local, const std::optional<DataPlaneTls>& tls) {
         if (tls)
-            rpc_->setTlsCredentials(tls->certPem, tls->keyPem, tls->caPem, tls->expectedPeerName);
+            rpc_->setTlsCredentials(tls->certPem, tls->keyPem, tls->caPem);
         rpc_->setProposeSink(*this);
         rpc_->setReadIndexSink(*this);
         rpc_->setFrozenDeletePlanSink(*this);
@@ -303,7 +302,9 @@ public:
         return rpc_->start(local, *queryStore_, /*perShardListener=*/true);
     }
 
-    void addDataPeer(data::NodeId id, seastar::socket_address addr) { rpc_->addPeer(id, addr); }
+    void addDataPeer(data::NodeId id, seastar::socket_address addr, const std::string& tlsServerName) {
+        rpc_->addPeer(id, addr, tlsServerName);
+    }
 
     seastar::future<control::FreezeDeletePlanResult> forwardFrozenDeletePlan(
         data::NodeId leader, control::FrozenDeletePlanRpcRequest request, data::OptDeadline deadline = std::nullopt) {
@@ -574,7 +575,7 @@ public:
     // envelope (Raft would retry, but there is no reason to allow the window).
     seastar::future<> startTransport(seastar::socket_address local, const std::optional<DataPlaneTls>& tls) {
         if (tls)
-            transport_->setTlsCredentials(tls->certPem, tls->keyPem, tls->caPem, tls->expectedPeerName);
+            transport_->setTlsCredentials(tls->certPem, tls->keyPem, tls->caPem);
         transport_->setRawDeliver([this](uint16_t groupId, const char* bytes, size_t len) {
             // Already a GROUP id (the transport's 2-byte peek reads the envelope's
             // groupId), so this is an identity-free integer op and needs no directory.
@@ -592,7 +593,9 @@ public:
         co_return;
     }
 
-    void addRaftPeer(data::NodeId id, seastar::socket_address addr) { transport_->addPeer(id, addr); }
+    void addRaftPeer(data::NodeId id, seastar::socket_address addr, const std::string& tlsServerName) {
+        transport_->addPeer(id, addr, tlsServerName);
+    }
 
     // Decode on THIS shard and hand to the local group registry.
     seastar::future<> deliverDecoded(const char* bytes, size_t len) {

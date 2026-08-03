@@ -74,11 +74,11 @@ std::vector<std::string> TimestarConfig::validate() const {
             errors.emplace_back("cluster.cluster_uuid must be exactly 32 hexadecimal characters for RF > 1");
 
         const bool anyTls = !cluster.tls_cert_file.empty() || !cluster.tls_key_file.empty() ||
-                            !cluster.tls_ca_file.empty() || !cluster.tls_peer_name.empty();
+                            !cluster.tls_ca_file.empty();
         const bool completeTls = !cluster.tls_cert_file.empty() && !cluster.tls_key_file.empty() &&
-                                 !cluster.tls_ca_file.empty() && !cluster.tls_peer_name.empty();
+                                 !cluster.tls_ca_file.empty();
         if (anyTls && !completeTls)
-            errors.emplace_back("cluster TLS requires tls_cert_file, tls_key_file, tls_ca_file, and tls_peer_name");
+            errors.emplace_back("cluster TLS requires tls_cert_file, tls_key_file, and tls_ca_file");
         if (!completeTls && !cluster.development_allow_insecure_transport)
             errors.emplace_back(
                 "replicated cluster transport requires mTLS; set every cluster TLS field (the insecure override is "
@@ -529,7 +529,6 @@ void applyEnvironmentOverrides(TimestarConfig& cfg) {
     envString("TIMESTAR_CLUSTER_TLS_CERT_FILE", cfg.cluster.tls_cert_file);
     envString("TIMESTAR_CLUSTER_TLS_KEY_FILE", cfg.cluster.tls_key_file);
     envString("TIMESTAR_CLUSTER_TLS_CA_FILE", cfg.cluster.tls_ca_file);
-    envString("TIMESTAR_CLUSTER_TLS_PEER_NAME", cfg.cluster.tls_peer_name);
     envBool("TIMESTAR_CLUSTER_DEVELOPMENT_ALLOW_INSECURE_TRANSPORT",
             cfg.cluster.development_allow_insecure_transport);
     envBool("TIMESTAR_CLUSTER_CONTROL_ENABLED", cfg.cluster.control_enabled);

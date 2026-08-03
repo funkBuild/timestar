@@ -207,7 +207,7 @@ seastar::future<> ClusterDataPlane::startImpl(const ClusterConfig& cfg, seastar:
     // instances (started below) are the listeners and the write path's clients, and they
     // get the identical settings.
     if (tls_)
-        rpc_->setTlsCredentials(tls_->certPem, tls_->keyPem, tls_->caPem, tls_->expectedPeerName);
+        rpc_->setTlsCredentials(tls_->certPem, tls_->keyPem, tls_->caPem);
     if (replicated)
         // Replicated mode serves the data plane from EVERY shard (see below); this
         // instance stays client-only, for the shard-0 query/metadata fan-out.
@@ -572,12 +572,12 @@ seastar::future<bool> ClusterDataPlane::registerPeer(NodeId id, std::string addr
     }
     const seastar::socket_address dataAddr(*a, static_cast<uint16_t>(hp.port + kDataPlanePortOffset));
     // The shard-0 client-only instance (query/metadata fan-out) always needs it.
-    rpc_->addPeer(id, dataAddr);
+    rpc_->addPeer(id, dataAddr, hp.host);
     if (replicated) {
         const seastar::socket_address raftAddr(*a, static_cast<uint16_t>(hp.port + kRaftPortOffset));
-        co_await shards_.invoke_on_all([id, raftAddr, dataAddr](ShardRaftPlane& p) {
-            p.addRaftPeer(id, raftAddr);
-            p.addDataPeer(id, dataAddr);
+        co_await shards_.invoke_on_all([id, raftAddr, dataAddr, tlsServerName = hp.host](ShardRaftPlane& p) {
+            p.addRaftPeer(id, raftAddr, tlsServerName);
+            p.addDataPeer(id, dataAddr, tlsServerName);
         });
     }
     co_return true;

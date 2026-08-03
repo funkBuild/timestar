@@ -213,9 +213,13 @@ std::optional<ProposeOutcome> decodeProposeOutcome(const seastar::sstring& s) {
 
 struct DataPlaneRpc::Impl {
     using Client = seastar::rpc::protocol<DpSerializer>::client;
+    struct PeerEndpoint {
+        seastar::socket_address address;
+        std::string tlsServerName;
+    };
     seastar::rpc::protocol<DpSerializer> proto{DpSerializer{}};
     std::unique_ptr<seastar::rpc::protocol<DpSerializer>::server> server;
-    std::map<NodeId, seastar::socket_address> peers;
+    std::map<NodeId, PeerEndpoint> peers;
     std::map<NodeId, std::unique_ptr<Client>> clients;
     NodeStore* nodeSink = nullptr;
     ProposeSink* proposeSink = nullptr;                    // RF=3 Raft propose target (M3)
@@ -228,11 +232,10 @@ struct DataPlaneRpc::Impl {
     // connection is retired because the peer may return on another binary.
     std::set<NodeId> v1Connections;
     // Mutual TLS (X1b): null unless setTlsCredentials was called. serverCreds requires a
-    // client cert; clientCreds presents ours + trusts the CA; peerName is the SAN we
-    // verify the server against.
+    // client cert; clientCreds presents ours + trusts the CA. Each PeerEndpoint
+    // carries the distinct DNS/IP SAN expected for that target.
     seastar::shared_ptr<seastar::tls::server_credentials> serverCreds;
     seastar::shared_ptr<seastar::tls::certificate_credentials> clientCreds;
-    std::string tlsPeerName;
     bool tlsEnabled = false;
     bool stopping = false;
     // Earliest time a peer whose connection died may be re-attempted (see clientFor).
@@ -337,13 +340,13 @@ struct DataPlaneRpc::Impl {
         std::unique_ptr<seastar::rpc::protocol<DpSerializer>::client> c;
         const seastar::rpc::client_options copts = peerClientOptions();
         if (tlsEnabled) {
-            // Present our cert + verify the peer's against tlsPeerName over TLS.
+            // Present our cert and verify this exact configured endpoint's SAN.
             seastar::tls::tls_options topts;
-            topts.server_name = seastar::sstring(tlsPeerName);
+            topts.server_name = seastar::sstring(pit->second.tlsServerName);
             c = std::make_unique<seastar::rpc::protocol<DpSerializer>::client>(
-                proto, copts, seastar::tls::socket(clientCreds, topts), pit->second);
+                proto, copts, seastar::tls::socket(clientCreds, topts), pit->second.address);
         } else {
-            c = std::make_unique<seastar::rpc::protocol<DpSerializer>::client>(proto, copts, pit->second);
+            c = std::make_unique<seastar::rpc::protocol<DpSerializer>::client>(proto, copts, pit->second.address);
         }
         auto* p = c.get();
         clients[to] = std::move(c);
@@ -414,9 +417,12 @@ struct DataPlaneRpc::Impl {
 DataPlaneRpc::DataPlaneRpc() : impl_(std::make_unique<Impl>()) {}
 DataPlaneRpc::~DataPlaneRpc() = default;
 
-void DataPlaneRpc::addPeer(NodeId id, seastar::socket_address addr) {
+void DataPlaneRpc::addPeer(NodeId id, seastar::socket_address addr, std::string tlsServerName) {
+    if (impl_->tlsEnabled && tlsServerName.empty())
+        throw std::invalid_argument("DataPlaneRpc: TLS peer server name must not be empty");
     auto existing = impl_->peers.find(id);
-    if (existing != impl_->peers.end() && existing->second == addr)
+    if (existing != impl_->peers.end() && existing->second.address == addr &&
+        existing->second.tlsServerName == tlsServerName)
         return;
     if (auto client = impl_->clients.find(id); client != impl_->clients.end()) {
         impl_->retire(std::move(client->second));
@@ -424,7 +430,7 @@ void DataPlaneRpc::addPeer(NodeId id, seastar::socket_address addr) {
     }
     impl_->nextRetry.erase(id);
     impl_->v1Connections.erase(id);
-    impl_->peers[id] = addr;
+    impl_->peers.insert_or_assign(id, Impl::PeerEndpoint{addr, std::move(tlsServerName)});
 }
 
 seastar::future<> DataPlaneRpc::start(seastar::socket_address local, NodeStore& sink, bool perShardListener) {
@@ -682,8 +688,9 @@ void DataPlaneRpc::setMoveActuationSink(MoveActuationSink& sink) {
     impl_->moveActuationSink = &sink;
 }
 
-void DataPlaneRpc::setTlsCredentials(std::string certPem, std::string keyPem, std::string caPem,
-                                     std::string expectedPeerName) {
+void DataPlaneRpc::setTlsCredentials(std::string certPem, std::string keyPem, std::string caPem) {
+    if (std::ranges::any_of(impl_->peers, [](const auto& peer) { return peer.second.tlsServerName.empty(); }))
+        throw std::logic_error("DataPlaneRpc: TLS requires a server name for every registered peer");
     seastar::tls::credentials_builder b;
     b.set_x509_trust(seastar::tls::blob(caPem.data(), caPem.size()), seastar::tls::x509_crt_format::PEM);
     b.set_x509_key(seastar::tls::blob(certPem.data(), certPem.size()), seastar::tls::blob(keyPem.data(), keyPem.size()),
@@ -693,7 +700,6 @@ void DataPlaneRpc::setTlsCredentials(std::string certPem, std::string keyPem, st
     b.set_client_auth(seastar::tls::client_auth::REQUIRE);
     impl_->serverCreds = b.build_server_credentials();
     impl_->clientCreds = b.build_certificate_credentials();
-    impl_->tlsPeerName = std::move(expectedPeerName);
     impl_->tlsEnabled = true;
 }
 
