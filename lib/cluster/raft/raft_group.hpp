@@ -124,7 +124,9 @@ public:
     // confirmed current-term leadership AND this node has applied through that
     // index. The caller may then read committed state (e.g. the group-0 map)
     // linearizably. Fails if this node is not the leader (redirect to the leader).
-    seastar::future<LogIndex> readBarrier();
+    // An optional absolute deadline bounds the complete quorum/apply wait and
+    // removes this request's exact waiter on expiry.
+    seastar::future<LogIndex> readBarrier(std::optional<seastar::lowres_clock::time_point> deadline = std::nullopt);
 
     // Resolve once THIS node has applied through `index`, regardless of role.
     // Unlike proposeAndAwaitApplied it neither requires nor tracks leadership: a
@@ -174,6 +176,8 @@ public:
     // the owning shard between async operations, like the other observers above.
     size_t pendingApplyWaiters() const { return applyWaiters_.size(); }
     size_t pendingConfigWaiters() const { return configWaiters_.size(); }
+    size_t pendingReadWaiters() const { return readWaiters_.size(); }
+    size_t confirmedReadWaiters() const { return confirmedReads_.size(); }
     // Highest index this leader knows replicated on `peer` (M5 move catchUp signal).
     LogIndex matchIndexOf(NodeId peer) const { return node_.matchIndexOf(peer); }
     // Ticks since `peer` last replied to us in this term (RaftNode::kNeverAcked if

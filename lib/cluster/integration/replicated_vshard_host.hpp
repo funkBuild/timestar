@@ -213,6 +213,21 @@ public:
     // Requires a VShard-cohesive core count (buildVShardSnapshotFile throws otherwise).
     seastar::future<uint64_t> snapshotVShard(uint16_t vshard);
 
+    // One live export unit, fenced by a quorum-confirmed ReadIndex obtained
+    // while this host was the VShard leader. The pin keeps the durable TSP1
+    // sidecar's name alive if a later snapshot supersedes it during archival.
+    struct BackupSnapshotCapture {
+        uint16_t vshard = 0;
+        raft::LogIndex readIndex = raft::kNoIndex;
+        raft::LogIndex snapshotIndex = raft::kNoIndex;
+        raft::Term snapshotTerm = raft::kNoTerm;
+        raft::PinnedSnapshotFile file;
+    };
+    static constexpr std::chrono::minutes kBackupSnapshotCaptureTimeout{5};
+    seastar::future<std::optional<BackupSnapshotCapture>> captureVShardBackup(
+        uint16_t vshard, std::chrono::milliseconds budget =
+                             std::chrono::duration_cast<std::chrono::milliseconds>(kBackupSnapshotCaptureTimeout));
+
     // ProposeSink (debt D-14): un-hibernate the groups on THIS shard that still believe
     // `node` leads them, so a killed leader costs an election rather than a
     // hibernation-stretched one. Same remedy the read path applies to an unreachable
@@ -549,6 +564,8 @@ private:
         CommittedServingMap,
     };
     seastar::future<bool> retireVShard(uint16_t vshard, uint64_t mapEpoch, RetirementAuthority authority);
+    // maintenanceLock_ must be held by the caller.
+    seastar::future<uint64_t> snapshotVShardLocked(uint16_t vshard);
     // See classifyRefusal / proposeRefusedWhileLeader.
     data::SliceReject classifyRefusal(uint16_t vshard);
     seastar::future<> ensureRetiredJournalMarker(const std::filesystem::path& directory);

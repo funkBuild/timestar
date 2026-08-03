@@ -135,6 +135,7 @@ public:
     // fetch the commit index for `vshard` at peer `to` (which must be its leader). The
     // peer's rejection (not-leader / not-hosted / no-quorum) propagates as a thrown
     // exception -- the caller treats it as a partition/redirect, never a stale value.
+    // Both the exact-v1 handshake and request/reply use ReadIndexSink::kAttemptTimeout.
     seastar::future<raft::LogIndex> leaderReadIndex(NodeId to, uint16_t vshard);
     seastar::future<raft::LogIndex> leaderCommitIndex(NodeId to, uint16_t vshard);
 

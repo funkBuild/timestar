@@ -456,6 +456,45 @@ seastar::future<> testReadyDrainFailuresReclaimProposalWaiters() {
             << "a Ready-drain error must not strand an unreachable membership waiter";
         EXPECT_EQ(net.group(1).pendingConfigWaiters(), 0u);
     }
+    {
+        GroupNetwork net({1, 2, 3}, opts());
+        co_await net.group(1).campaign();
+        co_await net.pump();
+        EXPECT_EQ(net.leader(), 1u);
+
+        net.failSends = true;
+        EXPECT_THROW(co_await net.group(1).readBarrier(), std::runtime_error);
+        EXPECT_EQ(net.group(1).pendingReadWaiters(), 0u);
+        EXPECT_EQ(net.group(1).confirmedReadWaiters(), 0u);
+        EXPECT_EQ(net.group(1).node().pendingReadIndexes(), 0u);
+    }
+}
+
+seastar::future<> testReadBarrierDeadlineReclaimsExactWaiter() {
+    GroupNetwork net({1, 2, 3}, opts());
+    co_await net.group(1).campaign();
+    co_await net.pump();
+    EXPECT_EQ(net.leader(), 1u);
+
+    auto barrier = net.group(1).readBarrier(seastar::lowres_clock::now() + std::chrono::milliseconds(20));
+    co_await seastar::yield();
+    EXPECT_EQ(net.group(1).pendingReadWaiters(), 1u);
+    net.discardQueued();
+    EXPECT_THROW(co_await std::move(barrier), seastar::timed_out_error);
+    EXPECT_EQ(net.group(1).pendingReadWaiters(), 0u);
+    EXPECT_EQ(net.group(1).confirmedReadWaiters(), 0u);
+    EXPECT_EQ(net.group(1).node().pendingReadIndexes(), 0u)
+        << "a partitioned leader must not retain one core request per expired caller";
+
+    // A late response for the expired context must not recreate an orphaned
+    // confirmed-read record, and a later barrier must still complete normally.
+    co_await net.tickAll();
+    co_await net.pump();
+    EXPECT_EQ(net.group(1).confirmedReadWaiters(), 0u);
+    EXPECT_EQ(net.group(1).node().pendingReadIndexes(), 0u);
+    auto retry = net.group(1).readBarrier(seastar::lowres_clock::now() + std::chrono::milliseconds(100));
+    co_await net.pump();
+    EXPECT_GT(co_await std::move(retry), 0u);
 }
 
 // THE DRIVER MUST PROPAGATE "did a transfer actually start?" (debt D-24). The balancer's
@@ -562,4 +601,8 @@ TEST(RaftGroupTest, ConfigChangeDeadlineReclaimsFinalWaiter) {
 
 TEST(RaftGroupTest, ReadyDrainFailuresReclaimProposalWaiters) {
     testReadyDrainFailuresReclaimProposalWaiters().get();
+}
+
+TEST(RaftGroupTest, ReadBarrierDeadlineReclaimsExactWaiter) {
+    testReadBarrierDeadlineReclaimsExactWaiter().get();
 }

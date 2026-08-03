@@ -1488,6 +1488,11 @@ bool RaftNode::requestReadIndex(uint64_t context) {
     return true;
 }
 
+void RaftNode::cancelReadIndex(uint64_t context) {
+    std::erase_if(pendingReads_, [context](const PendingRead& read) { return read.context == context; });
+    std::erase_if(confirmedReads_, [context](const ReadState& read) { return read.context == context; });
+}
+
 void RaftNode::confirmReads() {
     if (role_ != Role::Leader || pendingReads_.empty())
         return;

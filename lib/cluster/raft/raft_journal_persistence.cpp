@@ -2,11 +2,13 @@
 
 #include "raft_config.hpp"
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <array>
 #include <cerrno>
 #include <cstring>
-#include <fcntl.h>
 #include <fstream>
 #include <map>
 #include <seastar/core/coroutine.hh>
@@ -14,7 +16,6 @@
 #include <seastar/util/file.hh>
 #include <stdexcept>
 #include <system_error>
-#include <unistd.h>
 #include <vector>
 
 namespace timestar::raft {
@@ -350,10 +351,10 @@ seastar::future<> JournalRaftPersistence::stageSnapshotChunk(InstallSnapshot& ch
     if (chunk.offset == 0) {
         incomingStage_.reset();
         const uint64_t nonce = ++snapshotNonce_;
-        const auto path = snapshotDirectory_ /
-                          ("snapshot_v1_stage_g" + std::to_string(vshard_.value()) + "_i" +
-                           std::to_string(chunk.lastIncludedIndex) + "_t" + std::to_string(chunk.lastIncludedTerm) +
-                           "_n" + std::to_string(nonce) + ".bin");
+        const auto path =
+            snapshotDirectory_ /
+            ("snapshot_v1_stage_g" + std::to_string(vshard_.value()) + "_i" + std::to_string(chunk.lastIncludedIndex) +
+             "_t" + std::to_string(chunk.lastIncludedTerm) + "_n" + std::to_string(nonce) + ".bin");
         co_await seastar::async([directory = snapshotDirectory_, path] {
             createDirectoriesDurable(directory);
             std::ofstream out(path, std::ios::binary | std::ios::trunc);
@@ -452,9 +453,8 @@ seastar::future<> JournalRaftPersistence::persistSnapshot(Snapshot snap, bool re
                 throw std::runtime_error("JournalRaftPersistence: file-backed snapshot has no sidecar directory");
             co_await validateSnapshotFile(*snap.file);
             const auto target = snapshotDirectory_ /
-                                ("snapshot_v1_g" + std::to_string(vshard_.value()) + "_i" +
-                                 std::to_string(snap.index) + "_t" + std::to_string(snap.term) + "_s" +
-                                 std::to_string(r.vshardSeq) + ".bin");
+                                ("snapshot_v1_g" + std::to_string(vshard_.value()) + "_i" + std::to_string(snap.index) +
+                                 "_t" + std::to_string(snap.term) + "_s" + std::to_string(r.vshardSeq) + ".bin");
             if (snap.file->path != target) {
                 const auto source = snap.file->path;
                 co_await seastar::async([directory = snapshotDirectory_, source, target] {
@@ -534,8 +534,10 @@ seastar::future<> JournalRaftPersistence::sync() {
             // removeOnDestroy armed as a best-effort retry if the unlink fails.  A crash
             // before the directory entry is durably retired is harmless because startup
             // cleanup retains only the latest descriptor.
-            std::error_code ec;
-            std::filesystem::remove(pendingSupersededFile_->path, ec);
+            if (!pendingSupersededFile_->pinned()) {
+                std::error_code ec;
+                std::filesystem::remove(pendingSupersededFile_->path, ec);
+            }
         }
         if (pendingSnapshotFile_)
             pendingSnapshotFile_->removeOnDestroy = false;
@@ -558,8 +560,7 @@ seastar::future<> validateSnapshotFile(const SnapshotFile& file) {
     });
 }
 
-seastar::future<> cleanupSnapshotDirectory(const std::filesystem::path& directory,
-                                           const SnapshotFilePtr& retained) {
+seastar::future<> cleanupSnapshotDirectory(const std::filesystem::path& directory, const SnapshotFilePtr& retained) {
     if (directory.empty())
         co_return;
     const auto retainedPath = retained ? retained->path : std::filesystem::path{};

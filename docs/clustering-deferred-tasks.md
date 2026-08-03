@@ -41,8 +41,10 @@ Production blockers take priority and are authoritative in
   import safely, and pass exact post-restore readback. The exact-v1 `TSBK` /
   4,096-`TSP1` artifact codec, bounded staging, manifest-last publication,
   portable control-state capture, full-set validation, and in-process readback
-  gate are complete. Live leader-pinned capture, fresh-membership import,
-  resumable import state, and the RF=3 operator gate remain.
+  gate are complete. The local deadline-bounded leader ReadIndex capture,
+  safe-boundary rollover/wait, and supersession pin are also complete.
+  Cross-node resumable export coordination, fresh-membership import, resumable
+  import state, and the RF=3 operator gate remain.
 
 ## Feature completion
 

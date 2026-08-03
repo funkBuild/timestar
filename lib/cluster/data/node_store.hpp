@@ -8,6 +8,7 @@
 #include "write_errors.hpp"
 #include "write_record.hpp"
 
+#include <chrono>
 #include <cstdint>
 #include <optional>
 #include <seastar/core/coroutine.hh>
@@ -264,6 +265,11 @@ public:
 // the RPC into this sink on the leader node. ReplicatedVShardHost implements it.
 class ReadIndexSink {
 public:
+    // One replica-read leader reach is deliberately short and independently
+    // bounded. The caller may retry or redirect, but a dead peer must not retain an
+    // RPC future or Raft ReadIndex waiter indefinitely.
+    static constexpr auto kAttemptTimeout = std::chrono::milliseconds(600);
+
     virtual ~ReadIndexSink() = default;
     // A quorum-confirmed linearizable ReadIndex for `vshard` at THIS node. MUST reject
     // (throw) if this node is not the current leader or cannot confirm a quorum, so a

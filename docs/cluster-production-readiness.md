@@ -311,9 +311,12 @@ evidence below.
   manifest only after all 4,096 units validate, and rejects corrupt, missing,
   extra, aliased, or symlinked entries. Its bounded in-process gate covers an
   interrupted stage/manifest write and restores one real Engine payload with
-  exact readback. This does not close the blocker: the server still needs
-  leader-ReadIndex-pinned export orchestration and generation-one import into a
-  fresh cluster UUID/new Raft membership, followed by a live RF=3 recovery gate.
+  exact readback. A local leader capture now obtains a deadline-bounded quorum
+  ReadIndex, waits/rolls to a TSP1 boundary at or beyond it, and pins the
+  sidecar across supersession and archival. This does not close the blocker:
+  the server still needs durable cross-node orchestration over all current
+  leaders and generation-one import into a fresh cluster UUID/new Raft
+  membership, followed by a live RF=3 recovery gate.
 
 ### P2 — release and operations
 

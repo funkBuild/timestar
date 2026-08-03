@@ -228,7 +228,8 @@ seastar::future<> RaftGroup::drainReady() {
         // Record newly-confirmed read barriers, then release any whose ReadIndex
         // we have now applied through.
         for (const auto& rs : rd.readStates)
-            confirmedReads_[rs.context] = rs.readIndex;
+            if (readWaiters_.contains(rs.context))
+                confirmedReads_[rs.context] = rs.readIndex;
         releaseReadBarriers();
         // Resolve write waiters whose entry we have now applied (or fail them all
         // if we just lost leadership).
@@ -449,28 +450,58 @@ seastar::future<bool> RaftGroup::proposeAndAwaitApplied(std::string data,
     co_return ok;
 }
 
-seastar::future<LogIndex> RaftGroup::readBarrier() {
+seastar::future<LogIndex> RaftGroup::readBarrier(std::optional<seastar::lowres_clock::time_point> deadline) {
     auto operation = holdOperation();
     // Register the waiter INSIDE the lock (with requestReadIndex), so no
     // concurrent drainReady can observe/fail a half-created waiter and so a
     // leader->follower->leader flap between here and acquiring the lock cannot
     // spuriously fail a barrier we could still satisfy.
     std::optional<seastar::future<LogIndex>> fut;
+    uint64_t waiterContext = 0;
     {
         auto units = co_await seastar::get_units(lock_, 1);
         ensureActive();
+        if (deadline && seastar::lowres_clock::now() >= *deadline)
+            throw seastar::timed_out_error{};
         if (node_.isLeader()) {  // otherwise fut stays empty -> not leader
             const uint64_t ctx = nextReadCtx_++;
+            waiterContext = ctx;
             seastar::promise<LogIndex> promise;
             fut = promise.get_future();
             readWaiters_.emplace(ctx, std::move(promise));
             node_.requestReadIndex(ctx);
-            co_await drainReady();  // heartbeats out; confirmation arrives on later steps
+            try {
+                co_await drainReady();  // heartbeats out; confirmation arrives on later steps
+            } catch (...) {
+                node_.cancelReadIndex(ctx);
+                readWaiters_.erase(ctx);
+                confirmedReads_.erase(ctx);
+                if (fut->available())
+                    fut->ignore_ready_future();
+                throw;
+            }
         }
     }  // lock released here -- the barrier wait below must NOT hold it
     if (!fut)
         throw std::runtime_error("readBarrier: not leader");  // caller redirects to the leader
-    co_return co_await std::move(*fut);
+    if (!deadline)
+        co_return co_await std::move(*fut);
+
+    std::exception_ptr failure;
+    try {
+        co_return co_await seastar::with_timeout(*deadline, std::move(*fut));
+    } catch (...) {
+        failure = std::current_exception();
+    }
+    // ReadIndex completions and waiter removal are serialized by lock_. The
+    // timed wrapper still observes the inner broken-promise result, so erasing
+    // an unresolved promise here cannot create an abandoned exceptional future.
+    auto units = co_await seastar::get_units(lock_, 1);
+    node_.cancelReadIndex(waiterContext);
+    readWaiters_.erase(waiterContext);
+    confirmedReads_.erase(waiterContext);
+    units.return_all();
+    std::rethrow_exception(failure);
 }
 
 seastar::future<> RaftGroup::step(Message m) {

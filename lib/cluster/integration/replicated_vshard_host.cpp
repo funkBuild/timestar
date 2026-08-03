@@ -28,6 +28,8 @@ namespace fs = std::filesystem;
 namespace {
 static_assert(ReplicatedVShardHost::kProposalTimeout == data::ReplicatedBatchWriteRouter::kAttemptTimeout,
               "receiver proposal bound must track one forwarding attempt");
+static_assert(ReplicatedVShardHost::kProposalTimeout == data::ReadIndexSink::kAttemptTimeout,
+              "receiver ReadIndex bound must track one leader-reach attempt");
 
 uint8_t hexNibble(char c) {
     if (c >= '0' && c <= '9')
@@ -56,9 +58,8 @@ data::OptDeadline boundedProposalDeadline(data::OptDeadline requested) {
 }
 
 fs::path snapshotDirectoryFor(const fs::path& journalRoot, uint16_t vshard, bool sharedJournal) {
-    const auto journalDirectory = sharedJournal
-                                      ? journalRoot / ("shard_" + std::to_string(seastar::this_shard_id()))
-                                      : journalRoot / ("vshard_" + std::to_string(vshard));
+    const auto journalDirectory = sharedJournal ? journalRoot / ("shard_" + std::to_string(seastar::this_shard_id()))
+                                                : journalRoot / ("vshard_" + std::to_string(vshard));
     const auto sidecars = journalDirectory / "snapshot_sidecars";
     return sharedJournal ? sidecars / ("vshard_" + std::to_string(vshard)) : sidecars;
 }
@@ -292,11 +293,10 @@ seastar::future<> ReplicatedVShardHost::addVShard(uint16_t vshard, std::vector<N
     }
 
     vs.persistence = sharedSink_
-                         ? std::make_unique<raft::JournalRaftPersistence>(static_cast<JournalSink&>(*sharedSink_),
-                                                                          VShardId{vshard}, st.nextSeq,
-                                                                          snapshotDirectory)
+                         ? std::make_unique<raft::JournalRaftPersistence>(
+                               static_cast<JournalSink&>(*sharedSink_), VShardId{vshard}, st.nextSeq, snapshotDirectory)
                          : std::make_unique<raft::JournalRaftPersistence>(*vs.writer, VShardId{vshard}, st.nextSeq,
-                                                                           snapshotDirectory);
+                                                                          snapshotDirectory);
     // SEED THE RECLAIM FLOOR FROM WHAT WAS ACTUALLY RECOVERED (debt D-34). Mandatory,
     // not an optimisation: a fresh persistence object knows none of the on-disk records'
     // seqs, so its "oldest live entry" would be the first entry appended AFTER this
@@ -733,6 +733,10 @@ seastar::future<data::ProposeOutcome> ReplicatedVShardHost::proposeCommandHinted
 
 seastar::future<uint64_t> ReplicatedVShardHost::snapshotVShard(uint16_t vshard) {
     auto maintenance = co_await seastar::get_units(maintenanceLock_, 1);
+    co_return co_await snapshotVShardLocked(vshard);
+}
+
+seastar::future<uint64_t> ReplicatedVShardHost::snapshotVShardLocked(uint16_t vshard) {
     auto operation = holdVShardOperation(vshard);
     if (!operation)
         co_return 0;
@@ -858,8 +862,8 @@ seastar::future<uint64_t> ReplicatedVShardHost::snapshotVShard(uint16_t vshard) 
     // hostile descriptor; unlike the former 128-MiB RAM ceiling, it does not
     // strand a healthy large VShard behind an ever-growing uncompacted log.
     const auto snapshotDirectory = snapshotDirectoryFor(journalRoot_, vshard, sharedSink_ != nullptr);
-    const auto output = snapshotDirectory /
-                        ("snapshot_v1_produce_g" + std::to_string(vshard) + "_i" + std::to_string(upto) + ".bin");
+    const auto output =
+        snapshotDirectory / ("snapshot_v1_produce_g" + std::to_string(vshard) + "_i" + std::to_string(upto) + ".bin");
     auto encoded = co_await data::encodeSnapshotPayloadFile(std::move(payload), output);
     if (encoded.size > raft::kMaxVShardSnapshotFileBytes) {
         timestar::http_log.error(
@@ -883,6 +887,66 @@ seastar::future<uint64_t> ReplicatedVShardHost::snapshotVShard(uint16_t vshard) 
             it->second.sm->noteSnapshotTaken();  // the bytes below the new boundary are gone
     }
     co_return upto;
+}
+
+seastar::future<std::optional<ReplicatedVShardHost::BackupSnapshotCapture>> ReplicatedVShardHost::captureVShardBackup(
+    uint16_t vshard, std::chrono::milliseconds budget) {
+    if (budget <= std::chrono::milliseconds::zero())
+        throw std::invalid_argument("cluster backup capture budget must be positive");
+    const auto deadline = seastar::lowres_clock::now() + budget;
+    auto maintenance = co_await seastar::get_units(
+        maintenanceLock_, 1, std::chrono::duration_cast<std::chrono::steady_clock::duration>(budget));
+    if (stopped_)
+        throw std::runtime_error("cluster backup capture stopped with its VShard host");
+    auto operation = holdVShardOperation(vshard);
+    if (!operation)
+        co_return std::nullopt;
+    raft::RaftGroup* g = registry_.group(vshard);
+    if (!g)
+        co_return std::nullopt;
+
+    // readBarrier both proves current leadership to a quorum and applies the
+    // returned index locally. Everything below `target` is therefore a valid
+    // export prefix even if leadership changes after this point.
+    const raft::LogIndex target = co_await g->readBarrier(deadline);
+    bool forcedRollover = false;
+    while (true) {
+        if (stopped_)
+            throw std::runtime_error("cluster backup capture stopped with its VShard host");
+        const auto& current = g->node().servableSnapshot();
+        if (current.index >= target) {
+            if (!current.fileBacked() || !current.file || current.file->path.empty())
+                throw std::runtime_error("cluster backup capture reached a non-file-backed VShard snapshot");
+            BackupSnapshotCapture capture;
+            capture.vshard = vshard;
+            capture.readIndex = target;
+            capture.snapshotIndex = current.index;
+            capture.snapshotTerm = current.term;
+            capture.file = raft::PinnedSnapshotFile(current.file);
+            co_return std::optional<BackupSnapshotCapture>(std::move(capture));
+        }
+        if (seastar::lowres_clock::now() >= deadline)
+            throw seastar::timed_out_error{};
+
+        (void)co_await snapshotVShardLocked(vshard);
+        if (seastar::lowres_clock::now() >= deadline)
+            throw seastar::timed_out_error{};
+        if (g->node().servableSnapshot().index >= target)
+            continue;
+
+        // One conditional rollover is sufficient: it moves every active point
+        // at or below the sampled ReadIndex into the bounded conversion path.
+        // Writes arriving later remain a suffix and do not need to be chased.
+        if (!forcedRollover) {
+            (void)co_await store_.forceSnapshotRollover(VShardId{vshard});
+            forcedRollover = true;
+        }
+        const auto remaining = deadline - seastar::lowres_clock::now();
+        if (remaining <= seastar::lowres_clock::duration::zero())
+            throw seastar::timed_out_error{};
+        const auto poll = std::chrono::duration_cast<seastar::lowres_clock::duration>(std::chrono::milliseconds(50));
+        co_await seastar::sleep(std::min(remaining, poll));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1420,7 +1484,7 @@ seastar::future<raft::LogIndex> ReplicatedVShardHost::leaderReadIndex(uint16_t v
     // readBarrier() runs a quorum-confirmed ReadIndex round and REJECTS (throws) if this
     // node is not the current-term leader -- exactly the partition/redirect signal the
     // reaching replica needs, so no forwarding of stale barriers.
-    co_return co_await g->readBarrier();
+    co_return co_await g->readBarrier(seastar::lowres_clock::now() + data::ReadIndexSink::kAttemptTimeout);
 }
 
 seastar::future<raft::LogIndex> ReplicatedVShardHost::leaderCommitIndex(uint16_t vshard) {

@@ -210,6 +210,10 @@ public:
     // once a quorum has confirmed current-term leadership AFTER this request.
     // Returns false (no barrier) if not the leader -- the caller redirects.
     bool requestReadIndex(uint64_t context);
+    // Cancel one caller-owned context after its deadline or driver failure. A
+    // partitioned leader must not retain one core request per timed-out read.
+    void cancelReadIndex(uint64_t context);
+    [[nodiscard]] size_t pendingReadIndexes() const { return pendingReads_.size() + confirmedReads_.size(); }
 
     // Compact this node's log up to `upto` (<= commitIndex) and record the
     // resulting snapshot so the leader can serve it to lagging followers. Called
@@ -549,9 +553,7 @@ private:
         uint64_t receivedBytes = 0;
         bool external = false;
 
-        [[nodiscard]] uint64_t size() const {
-            return external ? receivedBytes : static_cast<uint64_t>(data.size());
-        }
+        [[nodiscard]] uint64_t size() const { return external ? receivedBytes : static_cast<uint64_t>(data.size()); }
     };
     std::optional<SnapshotStaging> snapStaging_;
     uint64_t snapshotsInstalled_ = 0;

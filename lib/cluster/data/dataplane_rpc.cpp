@@ -288,8 +288,12 @@ struct DataPlaneRpc::Impl {
     std::function<seastar::future<seastar::sstring>(Client&, seastar::rpc::rpc_clock_type::time_point,
                                                     seastar::sstring)>
         actuateMoveTimedStub;
-    std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> leaderReadIndexStub;
-    std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> leaderCommitIndexStub;
+    std::function<seastar::future<seastar::sstring>(Client&, seastar::rpc::rpc_clock_type::time_point,
+                                                    seastar::sstring)>
+        leaderReadIndexTimedStub;
+    std::function<seastar::future<seastar::sstring>(Client&, seastar::rpc::rpc_clock_type::time_point,
+                                                    seastar::sstring)>
+        leaderCommitIndexTimedStub;
     std::function<seastar::future<seastar::sstring>(Client&, seastar::sstring)> requireV1Stub;
 
     // Retire a dead connection without blocking the caller: stop it in the background
@@ -374,8 +378,8 @@ struct DataPlaneRpc::Impl {
         controlJoinTimedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kControlJoin);
         ensureMoveDestinationTimedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kEnsureMoveDestination);
         actuateMoveTimedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kActuateMove);
-        leaderReadIndexStub = proto.make_client<seastar::sstring(seastar::sstring)>(kLeaderReadIndex);
-        leaderCommitIndexStub = proto.make_client<seastar::sstring(seastar::sstring)>(kLeaderCommitIndex);
+        leaderReadIndexTimedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kLeaderReadIndex);
+        leaderCommitIndexTimedStub = proto.make_client<seastar::sstring(seastar::sstring)>(kLeaderCommitIndex);
         requireV1Stub = proto.make_client<seastar::sstring(seastar::sstring)>(kRequireV1);
     }
 
@@ -723,11 +727,12 @@ seastar::future<> DataPlaneRpc::ensureV1(NodeId to, OptDeadline deadline) {
 seastar::future<raft::LogIndex> DataPlaneRpc::leaderReadIndex(NodeId to, uint16_t vshard) {
     if (impl_->stopping)
         throw std::runtime_error("dataplane: shutting down");
-    co_await ensureV1(to);
+    const auto deadline = seastar::rpc::rpc_clock_type::now() + ReadIndexSink::kAttemptTimeout;
+    co_await ensureV1(to, deadline);
     auto* conn = impl_->clientFor(to);
     if (!conn)
         throw std::runtime_error("dataplane: unknown peer");
-    seastar::sstring reply = co_await impl_->leaderReadIndexStub(*conn, encU16(vshard));
+    seastar::sstring reply = co_await impl_->leaderReadIndexTimedStub(*conn, deadline, encU16(vshard));
     auto idx = decU64(reply);
     if (!idx)
         throw std::runtime_error("dataplane: malformed leaderReadIndex reply");
@@ -737,11 +742,12 @@ seastar::future<raft::LogIndex> DataPlaneRpc::leaderReadIndex(NodeId to, uint16_
 seastar::future<raft::LogIndex> DataPlaneRpc::leaderCommitIndex(NodeId to, uint16_t vshard) {
     if (impl_->stopping)
         throw std::runtime_error("dataplane: shutting down");
-    co_await ensureV1(to);
+    const auto deadline = seastar::rpc::rpc_clock_type::now() + ReadIndexSink::kAttemptTimeout;
+    co_await ensureV1(to, deadline);
     auto* conn = impl_->clientFor(to);
     if (!conn)
         throw std::runtime_error("dataplane: unknown peer");
-    seastar::sstring reply = co_await impl_->leaderCommitIndexStub(*conn, encU16(vshard));
+    seastar::sstring reply = co_await impl_->leaderCommitIndexTimedStub(*conn, deadline, encU16(vshard));
     auto idx = decU64(reply);
     if (!idx)
         throw std::runtime_error("dataplane: malformed leaderCommitIndex reply");

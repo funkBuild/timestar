@@ -8,6 +8,7 @@
 
 #include "../../../lib/cluster/control/control_map_cache.hpp"
 #include "../../../lib/cluster/data/snapshot_payload.hpp"
+#include "../../../lib/cluster/features/backup_restore.hpp"
 #include "../../../lib/cluster/integration/replica_engine_reader.hpp"
 #include "../../../lib/cluster/integration/retirement_fault_injection.hpp"
 #include "../../../lib/cluster/raft/raft_journal_persistence.hpp"
@@ -625,6 +626,74 @@ TEST_F(ReplicatedVShardHostTest, SnapshotVShardCompactsLogOverFlushedData) {
 
         host.stop().get();
         fs::remove_all(jroot);
+    }).get();
+}
+
+TEST_F(ReplicatedVShardHostTest, BackupCaptureFencesLeaderReadAndPinsSupersededSidecar) {
+    seastar::async([] {
+        ScopedShardedEngine eng;
+        eng.start();
+        cluster::EngineLocalStore store(*eng);
+        NoopTransport transport;
+        fs::path jroot = tmpDir();
+        fs::path archive = tmpDir();
+        cluster::ReplicatedVShardHost host(store, transport, /*self=*/1, jroot);
+
+        RaftOptions opts;
+        opts.electionTimeoutMin = opts.electionTimeoutMax = 1;
+        opts.heartbeatTimeout = 1;
+        const uint16_t vs = 0;
+        const std::string key = seriesKeyOnVShard("backup-capture", vs);
+        host.addVShard(vs, {1}, opts).get();
+        RaftGroup* g = host.group(vs);
+        ASSERT_NE(g, nullptr);
+        for (int i = 0; i < 10 && !g->isLeader(); ++i)
+            g->tick().get();
+        ASSERT_TRUE(g->isLeader());
+
+        if (!timestar::vshardsCohesiveOnCores(seastar::smp::count)) {
+            host.stop().get();
+            fs::remove_all(jroot);
+            return;
+        }
+
+        const auto proposeValue = [&](double value) {
+            auto proposed = host.propose(vs, writeCmd(key, value));
+            for (int i = 0; i < 20 && !proposed.available(); ++i)
+                g->tick().get();
+            ASSERT_TRUE(proposed.get());
+        };
+
+        proposeValue(1.0);
+        auto first = host.captureVShardBackup(vs, std::chrono::seconds(5)).get();
+        ASSERT_TRUE(first);
+        EXPECT_GT(first->readIndex, 0u);
+        EXPECT_GE(first->snapshotIndex, first->readIndex);
+        ASSERT_TRUE(first->file);
+        const fs::path firstPath = first->file->path;
+        auto firstInfo = data::inspectSnapshotPayloadFile(firstPath).get();
+        ASSERT_TRUE(firstInfo);
+        EXPECT_EQ(firstInfo->manifest.vshard, VShardId{vs});
+        EXPECT_EQ(firstInfo->manifest.snapshotRevision, first->snapshotIndex + 1);
+
+        // Advance and snapshot again while the first result remains pinned. The
+        // persistence layer may supersede its descriptor, but archival must
+        // still be able to open the exact ReadIndex-fenced source by name.
+        proposeValue(2.0);
+        auto second = host.captureVShardBackup(vs, std::chrono::seconds(5)).get();
+        ASSERT_TRUE(second);
+        EXPECT_GT(second->snapshotIndex, first->snapshotIndex);
+        EXPECT_NE(second->file->path, firstPath);
+        EXPECT_TRUE(fs::is_regular_file(firstPath));
+        auto staged = features::ClusterBackupArchive::stageVShard(archive, vs, firstPath).get();
+        ASSERT_TRUE(staged);
+        EXPECT_EQ(staged->snapshotRevision, first->snapshotIndex + 1);
+
+        first.reset();
+        second.reset();
+        host.stop().get();
+        fs::remove_all(jroot);
+        fs::remove_all(archive);
     }).get();
 }
 

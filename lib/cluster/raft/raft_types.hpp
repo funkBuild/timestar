@@ -1,15 +1,17 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <limits>
 #include <map>
-#include <filesystem>
 #include <memory>
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace timestar::raft {
@@ -419,9 +421,54 @@ struct SnapshotFile {
     bool removeOnDestroy = false;
 
     ~SnapshotFile();
+
+    [[nodiscard]] bool pinned() const noexcept { return pins_.load(std::memory_order_relaxed) != 0; }
+
+private:
+    friend class PinnedSnapshotFile;
+    std::atomic_size_t pins_{0};
 };
 
 using SnapshotFilePtr = std::shared_ptr<SnapshotFile>;
+
+// Keep a durable snapshot sidecar's directory entry alive while an external
+// consumer opens or copies it. Raft normally unlinks a superseded sidecar as
+// soon as the newer descriptor is durable; a shared_ptr alone keeps only the
+// C++ object alive and therefore is not a filesystem pin.
+class PinnedSnapshotFile {
+public:
+    PinnedSnapshotFile() = default;
+    explicit PinnedSnapshotFile(SnapshotFilePtr file) : file_(std::move(file)) {
+        if (!file_)
+            throw std::invalid_argument("cannot pin an empty snapshot sidecar");
+        file_->pins_.fetch_add(1, std::memory_order_relaxed);
+    }
+    PinnedSnapshotFile(const PinnedSnapshotFile&) = delete;
+    PinnedSnapshotFile& operator=(const PinnedSnapshotFile&) = delete;
+    PinnedSnapshotFile(PinnedSnapshotFile&& other) noexcept : file_(std::move(other.file_)) {}
+    PinnedSnapshotFile& operator=(PinnedSnapshotFile&& other) noexcept {
+        if (this != &other) {
+            reset();
+            file_ = std::move(other.file_);
+        }
+        return *this;
+    }
+    ~PinnedSnapshotFile() { reset(); }
+
+    void reset() noexcept {
+        if (!file_)
+            return;
+        file_->pins_.fetch_sub(1, std::memory_order_relaxed);
+        file_.reset();
+    }
+
+    [[nodiscard]] explicit operator bool() const noexcept { return static_cast<bool>(file_); }
+    [[nodiscard]] const SnapshotFile* operator->() const noexcept { return file_.get(); }
+    [[nodiscard]] const SnapshotFile& operator*() const noexcept { return *file_; }
+
+private:
+    SnapshotFilePtr file_;
+};
 
 struct Snapshot {
     LogIndex index = kNoIndex;
@@ -433,9 +480,7 @@ struct Snapshot {
     std::string data;
     SnapshotFilePtr file;
 
-    [[nodiscard]] uint64_t dataSize() const {
-        return file ? file->size : static_cast<uint64_t>(data.size());
-    }
+    [[nodiscard]] uint64_t dataSize() const { return file ? file->size : static_cast<uint64_t>(data.size()); }
     [[nodiscard]] bool fileBacked() const { return static_cast<bool>(file); }
 };
 

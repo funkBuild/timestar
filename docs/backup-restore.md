@@ -52,8 +52,16 @@ treated as a complete off-site backup product.
 The bounded in-process gate creates all 4,096 units, includes one real Engine
 snapshot, exercises interrupted staging and manifest publication, rejects
 corruption/extra/missing entries, restores that real unit into a fresh Engine,
-and reads the exact value back. It does not simulate leader ReadIndex capture,
-new Raft membership, or an RF=3 disaster recovery.
+and reads the exact value back. That artifact-only gate does not simulate live
+leader capture, new Raft membership, or an RF=3 disaster recovery.
+
+The VShard host now also has the local live-capture primitive required by the
+eventual coordinator. It obtains a deadline-bounded quorum ReadIndex while the
+host is leader, waits for a TSP1 boundary at or beyond that index, conditionally
+rolls the active store once, and pins the durable sidecar name while it is being
+archived. A newer Raft snapshot cannot unlink the pinned source mid-copy. This
+is not yet a cluster export: no authenticated command dispatches work to every
+current leader or durably tracks the 4,096-unit operation across nodes.
 
 ## Data Directory Structure
 
@@ -151,9 +159,12 @@ procedure is:
   without old identity, membership, placement, tokens, or controller authority.
 - [x] Make unit staging and manifest-last publication crash-safe, reject partial
   or corrupt artifacts, and prove one real Engine snapshot readback.
-- [ ] Obtain a quorum-confirmed ReadIndex from each VShard leader, force/wait a
-  safe snapshot boundary at or beyond it, pin the sidecar while copying, and
-  coordinate all 4,096 results with the portable Group-0 capture.
+- [x] On one hosting leader, obtain a deadline-bounded quorum ReadIndex,
+  force/wait a safe snapshot boundary at or beyond it, and pin a superseded
+  sidecar while it is copied and revalidated.
+- [ ] Dispatch that capture to every current VShard leader and durably
+  coordinate all 4,096 results with one portable Group-0 capture. Retry must
+  survive leader changes and process/node restarts without mixing operations.
 - [ ] Expose authenticated, authorized server/operator commands for starting,
   observing, resuming, cancelling, and safely retaining an export.
 - [ ] Bootstrap a different cluster UUID and import every `TSP1` as
