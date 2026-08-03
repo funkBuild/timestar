@@ -364,24 +364,32 @@ integrity. Production remains blocked on the P1 evidence below.
   every VShard on one node inherited the same node-id-only election RNG stream,
   synchronizing thousands of campaigns after a failure; production data groups
   now use stable per-node/per-VShard seeds, with all 4,096 streams and the full
-  timeout distribution pinned by a regression. On the bounded local per-VShard
-  journal layout, a clean collector attempt accepted 296/400 batches, preserved
-  all 34 acknowledged outage probes on both survivors, recorded zero 500s or
-  crashes, a 26-ms survivor query p99, and 28.8 s for all 4,096 groups to have a
-  leader. Its empty-root arm installed a non-empty snapshot in 84.46 s and read
-  the exact 103-point post-delete result after 88.91 s. That attempt also exposed
-  a harness defect before the movement arm: a fixed eight-second join delay let
-  load start before node 3 had opened its HTTP listener, then deleted the failed
-  benchmark transcript. Both movement gates now wait for exact 4,096-group
-  convergence and public health, reject missing or duplicate leader totals, and
-  retain a failed benchmark's exit status and transcript tail. The old
-  tmpfs-calibrated skew profile also saturated durable disk before movement; its
-  bounded disk-backed replacement passed a standalone run with a 500/500 clean
-  control, 2,398 transfers, 36 bounded retryable errors, 28% retained throughput,
-  1.79-s movement p99, zero 500s/crashes, and every acknowledged hot-group probe
-  readable from all three nodes. The provisional local all-group ceiling remains
-  30 s (well below the historical 43-s hibernation regression); it is recorded
-  in the artifact, not presented as an approved production SLO. Approved
+  timeout distribution pinned by a regression. Earlier collector attempts also
+  exposed and closed two harness defects: a fixed join delay could start the
+  movement load before node 3 opened HTTP, and a failed benchmark lost its exit
+  status and transcript. Both movement gates now require exact 4,096-group
+  convergence plus public health, reject missing or duplicate leader totals,
+  and retain failure evidence.
+
+  The complete serial collector passed on 2026-08-03 against clean candidate
+  `305a030e394a669601daabe57a58c7d88a1cb487`. Its report authenticated both the
+  server (`c5b1a77050af390e246edefd090e0fb4de9699f83cf30e517f0255545edc09f0`)
+  and benchmark
+  (`086db47d7b9976782dadb725e7b147354b818f91758312c75e0be419ece07319`)
+  before and after the campaign. Killing a voter produced 338/400 successful
+  batches and 62 retryable failures, preserved all 37 acknowledged outage
+  probes on both survivors, recovered leaders for all 4,096 groups in 17.03 s,
+  and measured a 27-ms survivor query p99 with zero server 500s or crashes. The proven-empty
+  voter installed a non-empty snapshot in 62.36 s and returned the exact
+  103-point post-delete result after 66.74 s. The skewed movement control was
+  500/500 clean at 71,598 points/s; the storm initiated 3,206 transfers,
+  retained 23% throughput with a 1.823-s p99 and 39 bounded retryable failures,
+  converged to an even leader distribution, and made every acknowledged hot
+  probe readable from all three nodes with zero server 500s or crashes. The
+  report and raw transcripts are retained under
+  `build/tmp/tsgate_slo_report`; gate data cleaned back to 8.9 MiB and `/tmp`
+  remained at 105 MiB. These are bounded local regression results using the
+  collector's provisional thresholds, not approved production SLOs. Approved
   thresholds and distinct-host deployment evidence remain open release work.
 - [x] **Deliver and prove clustered backup/restore.** The existing filesystem
   copy guidance is now explicitly limited to standalone mode: it omitted
@@ -436,7 +444,10 @@ integrity. Production remains blocked on the P1 evidence below.
   snapshot, barrier, GC, and file-descriptor contract instead of the retired
   per-reactor/4-ms/256-MiB proposal.
 - [ ] Record one final serial build, focused unit/socket tests, and each required
-  live gate against the exact release commit.
+  live gate against the exact release commit. Candidate `305a030` has a clean
+  full build, 4,393/4,393 runnable unit tests, 28/28 runnable socket tests, and
+  the complete local serial SLO collector above. Distinct-host arms and a final
+  rerun after any later tracked evidence change remain required.
 
 ## Release exit criteria
 
