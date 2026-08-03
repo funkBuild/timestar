@@ -358,6 +358,8 @@ TEST_F(HttpServerShardSafetyTest, ClusterStatusPublishesTopologyProvenance) {
     EXPECT_NE(setRoutes.find("clusterConfig.cluster_uuid"), std::string::npos);
     EXPECT_NE(setRoutes.find("\\\"failure_domain\\\""), std::string::npos);
     EXPECT_NE(setRoutes.find("clusterConfig.failure_domain"), std::string::npos);
+    EXPECT_NE(setRoutes.find("\\\"reactor_count\\\""), std::string::npos);
+    EXPECT_NE(setRoutes.find("seastar::smp::count"), std::string::npos);
 }
 
 TEST_F(HttpServerShardSafetyTest, VersionEndpointIdentifiesTheServerComponent) {

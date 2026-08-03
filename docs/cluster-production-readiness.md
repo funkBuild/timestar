@@ -369,13 +369,17 @@ integrity. Production remains blocked on the P1 evidence below.
   throughput retention without saturating the private journal layout. The
   read-only multi-host preflight now binds the deployed nodes to the
   authenticated local SLO candidate and rejects overlapping resolved addresses,
-  duplicate failure domains, redirects, mixed components/revisions/cluster
-  UUIDs, disabled snapshotting, the optional shared journal, unstable map or
-  lifecycle state, incomplete RF=3 totals, or any apply/durability fault. Repeat identity and
-  authenticated operator mutation on distinct hosts,
-  then verify network partitions, restart, disk-full behavior, and bounded
-  recovery there. The local disk-failure behavior is no longer an implementation
-  ambiguity: an append, snapshot-promotion, or sync failure permanently
+  duplicate failure domains, plaintext/redirected endpoints, mixed
+  components/revisions/cluster UUIDs, divergent or overlapping peer maps,
+  disabled snapshotting, the optional shared journal, unstable map or lifecycle
+  state, incomplete RF=3 totals, or any apply/durability fault. It also binds the
+  server's explicit reactor count and aggregate uncommitted-proposal budget to
+  the high-volume SLO profile; this avoids rejecting a correct four-reactor
+  deployment as though its process-wide 256-MiB budget were a one-reactor
+  64-MiB budget. Repeat identity and authenticated operator mutation on distinct
+  hosts, then verify network partitions, restart, disk-full behavior, and
+  bounded recovery there. The local disk-failure behavior is no longer an
+  implementation ambiguity: an append, snapshot-promotion, or sync failure permanently
   quarantines that Raft replica before the failed `Ready` can send, apply, or
   acknowledge. Pending write, membership, read-index, and apply waiters fail
   promptly with a typed retryable error; the replica stops protocol traffic so a

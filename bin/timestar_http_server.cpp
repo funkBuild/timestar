@@ -271,6 +271,7 @@ void set_routes(routes& r) {
                                    ",\"cluster_uuid\":\"" + timestar::jsonEscape(clusterConfig.cluster_uuid) +
                                    "\",\"failure_domain\":\"" +
                                    timestar::jsonEscape(clusterConfig.failure_domain) + "\"" +
+                                   ",\"reactor_count\":" + std::to_string(seastar::smp::count) +
                                    ",\"replication_factor\":" + std::to_string(st.replicationFactor) +
                                    ",\"replicated\":" + (st.replicated ? "true" : "false") + ",\"peers\":[" + peers +
                                    "],\"unresolved_peers\":" + std::to_string(st.unresolvedPeerCount);

@@ -157,13 +157,20 @@ python3 test/cluster_gates/multi_host_candidate_preflight.py \
 ```
 
 Use `--client-cert` and `--client-key` together when the ingress requires mTLS,
-and `--bearer-token-file` when it protects even public diagnostic routes. The
-preflight rejects redirects, loopback/link-local addresses, DNS/IP overlap,
-duplicate failure domains, mixed components/revisions/cluster UUIDs, disabled
-snapshotting, the optional shared journal, unstable maps or lifecycle work,
-incomplete RF=3 totals, and any apply/durability fault. Run it before and after
-every fault arm and retain server, load-client, infrastructure, and preflight
-transcripts.
+and `--bearer-token-file` when it protects even public diagnostic routes. Plain
+HTTP, redirects, embedded credentials, and bearer tokens containing HTTP
+control characters are rejected. The preflight also rejects loopback,
+link-local, or reserved addresses; endpoint or inter-node peer DNS/IP overlap;
+peer-map disagreement; duplicate failure domains; mixed
+components/revisions/cluster UUIDs; disabled snapshotting; the optional shared
+journal; unstable maps or lifecycle work; incomplete RF=3 totals; and any
+apply/durability fault. Every endpoint must cover the exact all-voter Group-0
+and inter-node peer topology. The deployed reactor count and its aggregate
+64-MiB-per-reactor uncommitted-proposal budget must match the high-volume server
+profile authenticated by the candidate SLO report. Retain separate
+infrastructure evidence that the report's per-process memory setting is also
+the deployed limit. Run the preflight before and after every fault arm and
+retain server, load-client, infrastructure, and preflight transcripts.
 
 On disposable production-equivalent hosts, exercise these arms serially:
 

@@ -7,7 +7,9 @@ import argparse
 import datetime as dt
 import ipaddress
 import json
+import math
 import pathlib
+import re
 import socket
 import ssl
 import sys
@@ -18,6 +20,9 @@ import urllib.request
 MAX_RESPONSE_BYTES = 1 << 20
 MAX_TOKEN_BYTES = 64 << 10
 VSHARD_COUNT = 4096
+UNCOMMITTED_RAFT_BYTES_PER_REACTOR = 64 << 20
+DEFAULT_PEER_PORT = 8086
+MAX_PEER_BASE_PORT = (1 << 16) - 3  # the data and Raft listeners use +1/+2
 
 
 class QualificationError(RuntimeError):
@@ -31,17 +36,45 @@ class RejectRedirects(urllib.request.HTTPRedirectHandler):
 
 def normalize_endpoint(value: str) -> tuple[str, str, int]:
     parsed = urllib.parse.urlsplit(value)
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-        raise QualificationError(f"invalid node endpoint {value!r}: expected http(s)://host[:port]")
+    if parsed.scheme != "https" or not parsed.hostname:
+        raise QualificationError(f"invalid node endpoint {value!r}: expected https://host[:port]")
     if parsed.username or parsed.password or parsed.query or parsed.fragment or parsed.path not in {"", "/"}:
         raise QualificationError(f"invalid node endpoint {value!r}: credentials, paths, queries, and fragments are forbidden")
     try:
-        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        parsed_port = parsed.port
     except ValueError as exc:
         raise QualificationError(f"invalid node endpoint {value!r}: {exc}") from exc
+    port = 443 if parsed_port is None else parsed_port
+    if port == 0:
+        raise QualificationError(f"invalid node endpoint {value!r}: port must be greater than zero")
     host = parsed.hostname
     rendered_host = f"[{host}]" if ":" in host else host
-    return f"{parsed.scheme}://{rendered_host}:{port}", host, port
+    return f"https://{rendered_host}:{port}", host, port
+
+
+def normalize_peer_address(value: object, endpoint: str) -> tuple[str, str, int]:
+    if not isinstance(value, str) or not value:
+        raise QualificationError(f"{endpoint} reports an invalid empty peer address")
+    parsed = urllib.parse.urlsplit(f"//{value}")
+    if (
+        not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise QualificationError(f"{endpoint} reports invalid peer address {value!r}")
+    try:
+        parsed_port = parsed.port
+    except ValueError as exc:
+        raise QualificationError(f"{endpoint} reports invalid peer address {value!r}: {exc}") from exc
+    port = DEFAULT_PEER_PORT if parsed_port is None else parsed_port
+    if port == 0 or port > MAX_PEER_BASE_PORT:
+        raise QualificationError(f"{endpoint} reports peer address {value!r} outside the usable port range")
+    host = parsed.hostname
+    rendered_host = f"[{host}]" if ":" in host else host
+    return f"{rendered_host}:{port}", host, port
 
 
 def resolve_addresses(host: str, port: int) -> set[str]:
@@ -54,7 +87,7 @@ def resolve_addresses(host: str, port: int) -> set[str]:
         raise QualificationError(f"{host}:{port} resolved to no stream address")
     for address in addresses:
         ip = ipaddress.ip_address(address)
-        if ip.is_loopback or ip.is_unspecified or ip.is_multicast or ip.is_link_local:
+        if ip.is_loopback or ip.is_unspecified or ip.is_multicast or ip.is_link_local or ip.is_reserved:
             raise QualificationError(f"{host}:{port} resolves to non-production address {address}")
     return addresses
 
@@ -96,12 +129,24 @@ def fetch_json(url: str, timeout: float, opener: urllib.request.OpenerDirector, 
 
 
 def require_equal(status: dict, key: str, expected: object, endpoint: str) -> None:
-    if status.get(key) != expected:
+    actual = status.get(key)
+    if type(actual) is not type(expected) or actual != expected:
         raise QualificationError(f"{endpoint} reports {key}={status.get(key)!r}, expected {expected!r}")
 
 
+def validate_bearer_token(token: str) -> str:
+    token = token.strip()
+    if not token:
+        raise QualificationError("bearer token file is empty")
+    if any(ord(character) < 0x20 or ord(character) == 0x7F for character in token):
+        raise QualificationError("bearer token contains an HTTP control character")
+    if re.fullmatch(r"[A-Za-z0-9\-._~+/]+=*", token) is None:
+        raise QualificationError("bearer token is not an RFC 6750 b64token")
+    return token
+
+
 def candidate_from_slo_report(report: object) -> dict:
-    if not isinstance(report, dict) or report.get("version") != 1:
+    if not isinstance(report, dict) or type(report.get("version")) is not int or report.get("version") != 1:
         raise QualificationError("candidate SLO report is not exact version 1")
     candidate = report.get("candidate")
     if not isinstance(candidate, dict) or set(candidate) != {"commit", "server", "benchmark"}:
@@ -113,8 +158,11 @@ def candidate_from_slo_report(report: object) -> dict:
         identity = candidate[component]
         if not isinstance(identity, dict) or set(identity) != {"binary", "embedded_revision", "sha256"}:
             raise QualificationError(f"candidate SLO report has an invalid {component} identity")
+        binary = identity["binary"]
         revision = identity["embedded_revision"]
         digest = identity["sha256"]
+        if not isinstance(binary, str) or not binary:
+            raise QualificationError(f"candidate SLO report has an invalid {component} binary path")
         if not isinstance(revision, str) or not revision or revision == "unknown" or revision.endswith("-dirty"):
             raise QualificationError(f"candidate SLO report has an unqualified {component} revision")
         if not isinstance(digest, str) or len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
@@ -124,16 +172,40 @@ def candidate_from_slo_report(report: object) -> dict:
     return copy_json(candidate)
 
 
+def deployment_settings_from_slo_report(report: object) -> dict:
+    if not isinstance(report, dict) or type(report.get("version")) is not int or report.get("version") != 1:
+        raise QualificationError("candidate SLO report is not exact version 1")
+    settings = report.get("settings")
+    if not isinstance(settings, dict):
+        raise QualificationError("candidate SLO report has no deployment settings")
+    reactors = settings.get("high_volume_server_smp")
+    memory = settings.get("high_volume_server_memory_per_process")
+    if type(reactors) is not int or reactors <= 0 or reactors > 1024:
+        raise QualificationError("candidate SLO report has an invalid high-volume server reactor count")
+    if not isinstance(memory, str) or re.fullmatch(r"[1-9][0-9]*[KMGT]?", memory) is None:
+        raise QualificationError("candidate SLO report has an invalid high-volume server memory setting")
+    return {"server_smp": reactors, "server_memory_per_process": memory}
+
+
 def copy_json(value: object) -> object:
     """Copy JSON-compatible evidence without sharing caller-owned dictionaries."""
     return json.loads(json.dumps(value))
 
 
-def qualify(nodes: list[str], expected_revision: str, resolver=resolve_addresses, fetcher=None) -> dict:
+def qualify(
+    nodes: list[str],
+    expected_revision: str,
+    expected_server_smp: int,
+    resolver=resolve_addresses,
+    fetcher=None,
+) -> dict:
     if len(nodes) < 3:
         raise QualificationError("multi-host qualification requires at least three node endpoints")
     if not expected_revision or expected_revision == "unknown" or expected_revision.endswith("-dirty"):
         raise QualificationError("expected revision must be a clean, known embedded revision")
+    if type(expected_server_smp) is not int or expected_server_smp <= 0 or expected_server_smp > 1024:
+        raise QualificationError("expected server reactor count must be an integer from 1 through 1,024")
+    expected_uncommitted_limit = expected_server_smp * UNCOMMITTED_RAFT_BYTES_PER_REACTOR
 
     normalized: list[tuple[str, str, int]] = [normalize_endpoint(node) for node in nodes]
     if len({endpoint for endpoint, _, _ in normalized}) != len(normalized):
@@ -177,10 +249,10 @@ def qualify(nodes: list[str], expected_revision: str, resolver=resolve_addresses
             ("replicated", True),
             ("replication_factor", 3),
             ("healthy", True),
+            ("reactor_count", expected_server_smp),
             ("snapshot_trigger", True),
             ("snapshot_production_limit_per_shard", 1),
             ("journal_shared", False),
-            ("uncommitted_raft_limit_bytes", 64 << 20),
             ("protocol_version", 1),
             ("control_enabled", True),
             ("control_hosted", True),
@@ -196,8 +268,21 @@ def qualify(nodes: list[str], expected_revision: str, resolver=resolve_addresses
             ("control_removals_pending", 0),
         ):
             require_equal(status, key, expected, endpoint)
+        require_equal(status, "uncommitted_raft_limit_bytes", expected_uncommitted_limit, endpoint)
         for key in strict_zero:
             require_equal(status, key, False if key == "control_durability_failed" else 0, endpoint)
+        peers = status.get("peers")
+        if not isinstance(peers, list):
+            raise QualificationError(f"{endpoint} reports peers={peers!r}, expected an array")
+        peer_map: dict[int, str] = {}
+        for peer in peers:
+            if not isinstance(peer, dict) or set(peer) != {"node", "address"}:
+                raise QualificationError(f"{endpoint} reports an invalid peer record {peer!r}")
+            peer_id = peer["node"]
+            if type(peer_id) is not int or peer_id <= 0 or peer_id in peer_map:
+                raise QualificationError(f"{endpoint} reports invalid or duplicate peer node {peer_id!r}")
+            address, _, _ = normalize_peer_address(peer["address"], endpoint)
+            peer_map[peer_id] = address
         records.append(
             {
                 "endpoint": endpoint,
@@ -206,7 +291,17 @@ def qualify(nodes: list[str], expected_revision: str, resolver=resolve_addresses
                 "cluster_uuid": status.get("cluster_uuid"),
                 "failure_domain": status.get("failure_domain"),
                 "embedded_revision": version["git_commit"],
+                "peers": [{"node": peer_id, "address": peer_map[peer_id]} for peer_id in sorted(peer_map)],
+                "server_smp": status.get("reactor_count"),
+                "uncommitted_raft_limit_bytes": status.get("uncommitted_raft_limit_bytes"),
+                "control_leader_here": status.get("control_leader_here"),
                 "control_leader": status.get("control_leader"),
+                "control_term": status.get("control_term"),
+                "control_controller_leader": status.get("control_controller_leader"),
+                "control_controller_term": status.get("control_controller_term"),
+                "control_commit_index": status.get("control_commit_index"),
+                "control_applied_index": status.get("control_applied_index"),
+                "control_snapshot_index": status.get("control_snapshot_index"),
                 "control_nodes": status.get("control_nodes"),
                 "control_voters": status.get("control_voters"),
                 "map_epoch": status.get("control_map_epoch"),
@@ -232,8 +327,38 @@ def qualify(nodes: list[str], expected_revision: str, resolver=resolve_addresses
     if any(not isinstance(domain, str) or not domain for domain in domains) or len(set(domains)) != len(records):
         raise QualificationError("nodes must report distinct non-empty failure domains")
 
+    expected_peer_ids = set(node_ids)
+    peer_maps: list[dict[int, str]] = []
+    for record in records:
+        peer_map = {peer["node"]: peer["address"] for peer in record["peers"]}
+        if set(peer_map) != expected_peer_ids:
+            raise QualificationError(
+                f"{record['endpoint']} peer IDs {sorted(peer_map)} do not match qualified node IDs {sorted(node_ids)}"
+            )
+        peer_maps.append(peer_map)
+    if any(peer_map != peer_maps[0] for peer_map in peer_maps[1:]):
+        raise QualificationError("nodes disagree on the configured peer address map")
+    peer_resolved: dict[int, set[str]] = {}
+    for peer_id, address in peer_maps[0].items():
+        _, host, port = normalize_peer_address(address, f"peer {peer_id}")
+        addresses = resolver(host, port)
+        for previous_id, previous_addresses in peer_resolved.items():
+            overlap = addresses & previous_addresses
+            if overlap:
+                raise QualificationError(
+                    f"peer nodes {peer_id} and {previous_id} resolve to the same address(es): "
+                    f"{', '.join(sorted(overlap))}"
+                )
+        peer_resolved[peer_id] = addresses
+
     numeric_fields = (
         "control_leader",
+        "control_term",
+        "control_controller_leader",
+        "control_controller_term",
+        "control_commit_index",
+        "control_applied_index",
+        "control_snapshot_index",
         "control_nodes",
         "control_voters",
         "map_epoch",
@@ -242,18 +367,47 @@ def qualify(nodes: list[str], expected_revision: str, resolver=resolve_addresses
         "vshards_led",
     )
     for record in records:
+        if type(record["control_leader_here"]) is not bool:
+            raise QualificationError(
+                f"{record['endpoint']} reports invalid control_leader_here={record['control_leader_here']!r}"
+            )
         for key in numeric_fields:
             if type(record[key]) is not int or record[key] < 0:
                 raise QualificationError(f"{record['endpoint']} reports invalid {key}={record[key]!r}")
 
-    for key in ("control_leader", "control_nodes", "control_voters", "map_epoch", "serving_map_epoch"):
+    for key in (
+        "control_leader",
+        "control_term",
+        "control_controller_leader",
+        "control_controller_term",
+        "control_nodes",
+        "control_voters",
+        "map_epoch",
+        "serving_map_epoch",
+    ):
         values = {record[key] for record in records}
         if len(values) != 1:
             raise QualificationError(f"nodes disagree on {key}: {sorted(values, key=str)}")
     if records[0]["control_leader"] not in node_ids:
         raise QualificationError("the common control leader is not one of the qualified nodes")
-    if records[0]["control_nodes"] != len(records) or records[0]["control_voters"] < 3:
-        raise QualificationError("the supplied endpoints do not cover the complete control topology with at least three voters")
+    if records[0]["control_term"] <= 0 or records[0]["control_controller_term"] <= 0:
+        raise QualificationError("the qualified Group-0 term must be positive")
+    if records[0]["control_nodes"] != len(records) or records[0]["control_voters"] != len(records):
+        raise QualificationError("the supplied endpoints do not cover the complete all-voter control topology")
+    for record in records:
+        if record["control_leader_here"] != (record["node_id"] == record["control_leader"]):
+            raise QualificationError(f"{record['endpoint']} reports an inconsistent control_leader_here flag")
+        if (
+            record["control_controller_leader"] != record["control_leader"]
+            or record["control_controller_term"] != record["control_term"]
+        ):
+            raise QualificationError(f"{record['endpoint']} control controller is not stamped by the current leader term")
+        if record["control_applied_index"] != record["control_commit_index"]:
+            raise QualificationError(f"{record['endpoint']} has unapplied committed Group-0 entries")
+        if record["control_commit_index"] <= 0:
+            raise QualificationError(f"{record['endpoint']} has no committed Group-0 state")
+        if record["control_snapshot_index"] > record["control_applied_index"]:
+            raise QualificationError(f"{record['endpoint']} reports a Group-0 snapshot beyond its applied index")
     if records[0]["map_epoch"] != records[0]["serving_map_epoch"] or not isinstance(records[0]["map_epoch"], int) or records[0]["map_epoch"] <= 0:
         raise QualificationError("the control and serving maps are not at one positive stable epoch")
     if sum(record["vshards_led"] for record in records) != VSHARD_COUNT:
@@ -265,6 +419,7 @@ def qualify(nodes: list[str], expected_revision: str, resolver=resolve_addresses
         "version": 1,
         "generated_at": dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
         "expected_revision": expected_revision,
+        "expected_server_smp": expected_server_smp,
         "cluster_uuid": cluster_uuid,
         "nodes": records,
     }
@@ -272,7 +427,7 @@ def qualify(nodes: list[str], expected_revision: str, resolver=resolve_addresses
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--node", action="append", required=True, help="base HTTP(S) endpoint; repeat for every node")
+    parser.add_argument("--node", action="append", required=True, help="base HTTPS endpoint; repeat for every node")
     parser.add_argument("--candidate-report", required=True, type=pathlib.Path, help="exact-v1 production SLO report")
     parser.add_argument("--output", required=True, type=pathlib.Path, help="new exact-v1 JSON evidence file")
     parser.add_argument("--timeout", type=float, default=10.0)
@@ -282,7 +437,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--bearer-token-file", type=pathlib.Path)
     args = parser.parse_args(argv)
 
-    if args.timeout <= 0 or args.timeout > 60:
+    if not math.isfinite(args.timeout) or args.timeout <= 0 or args.timeout > 60:
         parser.error("--timeout must be greater than zero and at most 60 seconds")
     if bool(args.client_cert) != bool(args.client_key):
         parser.error("--client-cert and --client-key must be supplied together")
@@ -293,18 +448,27 @@ def main(argv: list[str] | None = None) -> int:
         opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=context), RejectRedirects())
         token = None
         if args.bearer_token_file:
-            token = read_bounded_text(args.bearer_token_file, MAX_TOKEN_BYTES, "bearer token file").strip()
-            if not token:
-                raise QualificationError("bearer token file is empty")
+            token = validate_bearer_token(
+                read_bounded_text(args.bearer_token_file, MAX_TOKEN_BYTES, "bearer token file")
+            )
 
         def live_fetch(url: str) -> dict:
             return fetch_json(url, args.timeout, opener, token)
 
         candidate_text = read_bounded_text(args.candidate_report, MAX_RESPONSE_BYTES, "candidate SLO report")
-        candidate = candidate_from_slo_report(json.loads(candidate_text))
-        report = qualify(args.node, candidate["server"]["embedded_revision"], fetcher=live_fetch)
+        candidate_report = json.loads(candidate_text)
+        candidate = candidate_from_slo_report(candidate_report)
+        deployment = deployment_settings_from_slo_report(candidate_report)
+        report = qualify(
+            args.node,
+            candidate["server"]["embedded_revision"],
+            deployment["server_smp"],
+            fetcher=live_fetch,
+        )
         report.pop("expected_revision")
+        report.pop("expected_server_smp")
         report["candidate"] = candidate
+        report["expected_deployment"] = deployment
         args.output.parent.mkdir(parents=True, exist_ok=True)
         with args.output.open("x", encoding="utf-8") as destination:
             json.dump(report, destination, indent=2, sort_keys=True)
