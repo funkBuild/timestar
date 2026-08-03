@@ -33,18 +33,12 @@ trap 'gate_cleanup 1922 $GATE_TMP_ROOT/tsgate_rb1 $GATE_TMP_ROOT/tsgate_rb2 $GAT
 
 # Two-node phase: a 2-of-3 quorum elects leaders for every VShard between nodes 1 and 2.
 start_node 1; start_node 2
-for _ in $(seq 1 90); do
-    sleep 2
-    A=$(status_field "$(cluster_status 19220)" vshards_led)
-    B=$(status_field "$(cluster_status 19221)" vshards_led)
-    X=$(status_field "$(cluster_status 19220)" vshards_leaderless)
-    [ -z "$A" ] && continue
-    [ "$(( ${A:-0} + ${B:-0} ))" -ge 4080 ] && [ "${X:-9999}" -le 8 ] && break
-done
+wait_all_led "19220 19221" 4096 180 || gate_exit
 echo "  before node 3 joins: led=[$(status_field "$(cluster_status 19220)" vshards_led) $(status_field "$(cluster_status 19221)" vshards_led)] (fair share 1365)"
 
 start_node 3
-sleep 8
+wait_all_led "$PORTS" 4096 180 || gate_exit
+wait_healthy "$PORTS" 180 || gate_exit
 echo "  node 3 joined with ~no leadership: led=[$(status_field "$(cluster_status 19220)" vshards_led) $(status_field "$(cluster_status 19221)" vshards_led) $(status_field "$(cluster_status 19222)" vshards_led)]"
 
 echo "=== rebalance storm under sustained writes ==="
@@ -61,7 +55,13 @@ while kill -0 $BENCHPID 2>/dev/null; do
     done
     sleep 0.2
 done
-wait $BENCHPID
+wait "$BENCHPID"
+BENCH_RC=$?
+if [ "$BENCH_RC" -ne 0 ]; then
+    echo "  movement benchmark transcript tail:" >&2
+    tail -n 80 "$GATE_TMP_ROOT/tsgate_rb_bench.txt" >&2
+    gate_fail "movement benchmark exited $BENCH_RC (124 means its 300s bound expired)"
+fi
 echo "  rebalance calls: $CALLS"
 grep -E "Requests:|First error|Throughput|batch latency" $GATE_TMP_ROOT/tsgate_rb_bench.txt
 echo "  final led=[$(status_field "$(cluster_status 19220)" vshards_led) $(status_field "$(cluster_status 19221)" vshards_led) $(status_field "$(cluster_status 19222)" vshards_led)]"

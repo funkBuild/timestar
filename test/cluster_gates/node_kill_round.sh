@@ -115,7 +115,7 @@ rm -f "$RECOVERY_FILE"
     for _ in $(seq 1 600); do
         led1=$(status_field "$(cluster_status 19610)" vshards_led)
         led2=$(status_field "$(cluster_status 19611)" vshards_led)
-        if [ "$(( ${led1:-0} + ${led2:-0} ))" -ge 4096 ]; then
+        if [ "$(( ${led1:-0} + ${led2:-0} ))" -eq 4096 ]; then
             recovered=$(( $(monotonic_ms) - KILL_MS ))
             break
         fi

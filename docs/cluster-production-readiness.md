@@ -330,15 +330,24 @@ evidence below.
   synchronizing thousands of campaigns after a failure; production data groups
   now use stable per-node/per-VShard seeds, with all 4,096 streams and the full
   timeout distribution pinned by a regression. On the bounded local per-VShard
-  journal layout, the post-fix arm accepted 344/400 batches, preserved every one
-  of 38 acknowledged outage probes on both survivors, recorded zero 500s or
-  crashes, a 27-ms survivor query p99, and 17.03 s for all 4,096 groups to have a
-  leader. The provisional local all-group ceiling is therefore 30 s (well below
-  the historical 43-s hibernation regression); it is recorded in the artifact,
-  not presented as an approved production SLO. The measurements themselves,
-  especially distinct-host deployment evidence, remain open until the clean
-  collector is run against the final candidate with approved deployment
-  thresholds.
+  journal layout, a clean collector attempt accepted 296/400 batches, preserved
+  all 34 acknowledged outage probes on both survivors, recorded zero 500s or
+  crashes, a 26-ms survivor query p99, and 28.8 s for all 4,096 groups to have a
+  leader. Its empty-root arm installed a non-empty snapshot in 84.46 s and read
+  the exact 103-point post-delete result after 88.91 s. That attempt also exposed
+  a harness defect before the movement arm: a fixed eight-second join delay let
+  load start before node 3 had opened its HTTP listener, then deleted the failed
+  benchmark transcript. Both movement gates now wait for exact 4,096-group
+  convergence and public health, reject missing or duplicate leader totals, and
+  retain a failed benchmark's exit status and transcript tail. The old
+  tmpfs-calibrated skew profile also saturated durable disk before movement; its
+  bounded disk-backed replacement passed a standalone run with a 500/500 clean
+  control, 2,398 transfers, 36 bounded retryable errors, 28% retained throughput,
+  1.79-s movement p99, zero 500s/crashes, and every acknowledged hot-group probe
+  readable from all three nodes. The provisional local all-group ceiling remains
+  30 s (well below the historical 43-s hibernation regression); it is recorded
+  in the artifact, not presented as an approved production SLO. Approved
+  thresholds and distinct-host deployment evidence remain open release work.
 - [x] **Deliver and prove clustered backup/restore.** The existing filesystem
   copy guidance is now explicitly limited to standalone mode: it omitted
   persistent node identity, Group-0/control state, the committed serving map,
@@ -411,11 +420,12 @@ Production approval requires all of the following:
 Builds may compile concurrently, but compiler temporaries must stay under the
 disk-backed `build/tmp` rather than the quota-limited `/tmp`. Run memory-heavy
 Seastar test processes one at a time with explicit `--smp` and `--memory`
-limits. Live multi-process gates default to a 1-GiB per-process cap, put all
-roots and implicit temporaries under `GATE_TMP_ROOT` (`build/tmp` by default),
-and are not run concurrently on one host. High-volume gates preflight the free
-space of that configured filesystem; overrides require an explicitly
-provisioned disk and aggregate memory budget.
+limits. High-volume multi-process gates use 2 GiB per four-reactor server;
+focused gates pin one reactor and 1 GiB. All roots and implicit temporaries live
+under `GATE_TMP_ROOT` (`build/tmp` by default), and live gates are not run
+concurrently on one host. High-volume gates preflight the free space of that
+configured filesystem; overrides require an explicitly provisioned disk and
+aggregate memory budget.
 
 The live-directory gate covers stale update rejection, idempotent replay,
 same-epoch conflict, incomplete-map rejection, and independent routing views on

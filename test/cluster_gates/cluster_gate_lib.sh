@@ -285,7 +285,7 @@ report_journal_counters() {
     echo "GATE_METRIC journal_coalescing $(awk -v a="$tr" -v b="$tf" 'BEGIN{printf (b>0)?"%.3f":"0", a/b}')"
 }
 
-# wait_all_led "PORT..." TOTAL_VSHARDS MAX_POLLS -- every VShard has SOME leader
+# wait_all_led "PORT..." TOTAL_VSHARDS MAX_POLLS -- every VShard has EXACTLY one leader
 # somewhere, summed across nodes. Use this when the gate does not need leadership to be
 # evenly spread (and especially when it goes on to create imbalance deliberately): on a
 # fresh 5-node RF=3 cluster the background balancer needs minutes to reach fair shares,
@@ -299,19 +299,22 @@ report_journal_counters() {
 # host, exactly as gatherLeaders() does. It is still a PER-NODE count of that node's own
 # replicas, so at RF < N a leaderless VShard is reported by each of its RF holders and a
 # cross-node SUM over-counts by up to RF; wait_all_led wants a cluster-wide total, which
-# the summed vshards_led gives exactly (a node only ever claims leadership it holds).
+# the summed vshards_led gives exactly (a node only ever claims leadership it holds). An
+# equality check is intentional: a stale/double-leader view is not convergence either.
 wait_all_led() {
     local ports="$1" total="$2" polls="${3:-120}"
     for _ in $(seq 1 "$polls"); do
         sleep 2
-        local ok=1 led=0 s
+        local ok=1 led=0 s l
         for p in $ports; do
             s=$(cluster_status "$p"); [ -z "$s" ] && { ok=0; break; }
-            led=$((led + $(status_field "$s" vshards_led)))
+            l=$(status_field "$s" vshards_led)
+            case "$l" in ''|*[!0-9]*) ok=0; break ;; esac
+            led=$((led + l))
         done
         [ "$ok" = "0" ] && continue
-        if [ "$led" -ge "$total" ]; then
-            echo "  cluster converged (led=$led/$total across $(echo "$ports" | wc -w) nodes)"
+        if [ "$led" -eq "$total" ]; then
+            echo "  cluster converged exactly (led=$led/$total across $(echo "$ports" | wc -w) nodes)"
             return 0
         fi
     done

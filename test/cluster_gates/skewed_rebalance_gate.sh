@@ -137,15 +137,15 @@ PORTS="19240 19241 19242"
 # the floor is ~a third of the lowest.
 MIN_TRANSFERS="${GATE_MIN_TRANSFERS:-800}"
 HOSTS="${GATE_HOSTS:-4}"
-# THE LOAD IS SIZED TO THE 39 GROUPS IT LANDS ON, not copied from the rolling gate. See the
-# header: the rolling gate's `--connections 8 --batch-size 10000` concentrated here
-# saturates them (210/400 batches refused, median latency at the 1500 ms write deadline,
-# 30 G of tmpfs in 95 s). 4 connections x 20 000 points per batch keeps every hot group
-# continuously mid-append -- which is the state this gate exists to create -- without
-# driving it into its own ceiling. Measured peak with the control arm included: 4.6 G.
+# THE LOAD IS SIZED TO THE 39 GROUPS IT LANDS ON, not copied from the rolling gate. The
+# old tmpfs-calibrated four-connection profile overloaded repo-backed durable storage
+# before a rebalance began (454/500 errors at 2,000 points/batch; 356/500 even at 500).
+# One 500-point batch still fans out over every hot group and keeps the campaign in flight,
+# while its disk-backed control measured 500/500 OK, p99 93 ms, and under 500 MiB of
+# scratch through the movement arm.
 BATCHES="${GATE_BATCHES:-500}"
-BATCH_SIZE="${GATE_BATCH_SIZE:-2000}"
-CONNECTIONS="${GATE_CONNECTIONS:-4}"
+BATCH_SIZE="${GATE_BATCH_SIZE:-500}"
+CONNECTIONS="${GATE_CONNECTIONS:-1}"
 PROBE="${GATE_PROBE:-150}"
 # The joining node must end up with a REAL share, not a token one. Fair share of 4096 over
 # three nodes is 1365, and the storm reaches it: 1364-1365 on all four calibration runs
@@ -161,39 +161,15 @@ HOT_KB="${GATE_HOT_KB:-1024}"
 # any hash and so asserted nothing) while leaving room for a hash change that collides
 # differently.
 MAX_HOT_VSHARDS="${GATE_MAX_HOT_VSHARDS:-60}"
-# THE RETRYABLE-503 CEILING AND THE DIP FLOOR, both CALIBRATED, both bands rather than
-# absolutes -- see the long note at the assertions for why a zero would be wrong here.
-# Three runs of this exact configuration (500 batches x 20 000 points, 4 connections):
-#
-#     run                 2      3      4      5      6      7      8      9
-#     retained            29 %   16 %   22 %   44 %   30 %   43 %   22 %   14 %
-#     retryable 503s      6      5      24     0      13     0      17     11
-#     transfers           2175   2298   2901   2196   2532   2201   2581   2307
-#     hot VShards         39     39     39     39     39     39     39     39
-#     joiner led          1364   1364   1364   1365   1364   1364   1365   1365
-#
-#     control             1.32-3.43 M pts/s, ZERO client errors on all eight
-#     probe read-back     150/150 on every node, all eight runs
-#     failure class       transport at attempt 8 wherever there were errors at all
-#
-# (A reviewer's independent run of the same configuration drew 20, inside this band.)
-#
-# THE CEILING IS A COARSE TRIPWIRE, NOT A TIGHT BOUND, and it is set that way on purpose --
-# D-21's whole lesson is that a threshold fitted to a handful of draws of a heavy-tailed
-# count gets crossed by the good binary. Identical input has drawn 0, 0, 5, 6, 11, 13, 17,
-# 20 and 24 here;
-# a ~2x-the-worst ceiling (50) is exactly the shape that failed for D-21 at 3, so it is 100
-# -- 20 % of the batches, still an order of magnitude below the saturation regime the
-# oversized first calibration run produced (210 of 400, 52 %).
-#
-# The tight, falsifiable assertion is the FAILURE CLASS below, not this number: a give-up
-# must name a retryable class, and the (class, attempt-count) pair distinguishes the
-# election-extension composition from a plain transport failure. That is what would catch a
-# change in KIND; the ceiling only catches a change in ORDER OF MAGNITUDE.
+# THE RETRYABLE-503 CEILING AND DIP FLOOR are bands, not zero-cost claims. The bounded
+# disk-backed calibration retained 26%, reported 28 retryable errors, moved 3,684 leaders,
+# and still concentrated traffic on 39 VShards. A 100/500 ceiling detects an order-of-
+# magnitude regression; the retryable failure-class assertion below detects a change in
+# kind.
 MAX_STORM_5XX="${GATE_MAX_STORM_5XX:-100}"
 MIN_DIP_PCT="${GATE_MIN_DIP_PCT:-10}"
 MAX_MOVEMENT_P99_MS="${GATE_MAX_MOVEMENT_P99_MS:-5000}"
-require_gate_space_gb 35 "skewed-rebalance gate" || exit 2
+require_gate_space_gb 5 "skewed-rebalance gate" || exit 2
 
 kill_cluster 1924
 require_ports_free 19240 19241 19242
@@ -211,18 +187,12 @@ trap 'gate_cleanup 1924 $GATE_TMP_ROOT/tsgate_sk1 $GATE_TMP_ROOT/tsgate_sk2 $GAT
 # already-balanced cluster initiates ZERO transfers and proves nothing -- the same reason
 # rolling_rebalance_gate.sh starts its third node last.)
 start_node 1; start_node 2
-for _ in $(seq 1 90); do
-    sleep 2
-    A=$(status_field "$(cluster_status 19240)" vshards_led)
-    B=$(status_field "$(cluster_status 19241)" vshards_led)
-    X=$(status_field "$(cluster_status 19240)" vshards_leaderless)
-    [ -z "$A" ] && continue
-    [ "$(( ${A:-0} + ${B:-0} ))" -ge 4080 ] && [ "${X:-9999}" -le 8 ] && break
-done
+wait_all_led "19240 19241" 4096 180 || gate_exit
 echo "  before node 3 joins: led=[$(status_field "$(cluster_status 19240)" vshards_led) $(status_field "$(cluster_status 19241)" vshards_led)] (fair share 1365)"
 
 start_node 3
-sleep 8
+wait_all_led "$PORTS" 4096 180 || gate_exit
+wait_healthy "$PORTS" 180 || gate_exit
 echo "  node 3 joined with ~no leadership: led=[$(status_field "$(cluster_status 19240)" vshards_led) $(status_field "$(cluster_status 19241)" vshards_led) $(status_field "$(cluster_status 19242)" vshards_led)]"
 
 # ---------------------------------------------------------------------------
@@ -238,12 +208,22 @@ gate_void() {
 echo "=== control: the same skewed load with NO rebalance ($HOSTS hosts x 1 rack x 10 fields) ==="
 timeout 300 "$BENCH" --server-port 19240 --smp "$GATE_BENCH_SMP" --memory "$GATE_BENCH_MEMORY" --overprovisioned --batches "$BATCHES" --batch-size "$BATCH_SIZE" --verify 0 \
     --warmup 5 --connections "$CONNECTIONS" --hosts "$HOSTS" --racks 1 >$GATE_TMP_ROOT/tsgate_sk_control.txt 2>&1
-grep -E "Requests:|First error|Throughput|batch latency" $GATE_TMP_ROOT/tsgate_sk_control.txt
-CTL_ERRS=$(grep -o '[0-9]* HTTP errors' $GATE_TMP_ROOT/tsgate_sk_control.txt | head -1 | cut -d' ' -f1)
-CTL_TPUT=$(grep -oE 'Throughput:[[:space:]]*[0-9.]+' $GATE_TMP_ROOT/tsgate_sk_control.txt | head -1 | grep -oE '[0-9.]+')
-[ "${CTL_ERRS:-missing}" = "0" ] ||
-    gate_void "the rebalance-free control took ${CTL_ERRS:-<unparseable>} client errors -- the skewed load is saturating its ${HOSTS}x10 groups on this box, so the storm arm would measure that. Lower GATE_CONNECTIONS or GATE_BATCH_SIZE."
-[ -n "${CTL_TPUT:-}" ] || gate_void "could not parse a throughput from the control run"
+CONTROL_RC=$?
+grep -E "Requests:|First error|Throughput|batch latency" "$GATE_TMP_ROOT/tsgate_sk_control.txt"
+if [ "$CONTROL_RC" -ne 0 ]; then
+    echo "  control benchmark transcript tail:" >&2
+    tail -n 80 "$GATE_TMP_ROOT/tsgate_sk_control.txt" >&2
+    gate_void "the rebalance-free control benchmark exited $CONTROL_RC (124 means its 300s bound expired)"
+fi
+CTL_ERRS=$(grep -o '[0-9]* HTTP errors' "$GATE_TMP_ROOT/tsgate_sk_control.txt" | head -1 | cut -d' ' -f1)
+CTL_TPUT=$(grep -oE 'Throughput:[[:space:]]*[0-9.]+' "$GATE_TMP_ROOT/tsgate_sk_control.txt" | head -1 | grep -oE '[0-9.]+')
+if [ -z "${CTL_ERRS:-}" ] || [ -z "${CTL_TPUT:-}" ]; then
+    echo "  control benchmark transcript tail:" >&2
+    tail -n 80 "$GATE_TMP_ROOT/tsgate_sk_control.txt" >&2
+    gate_void "the successful control benchmark did not emit its required HTTP-error and throughput summary"
+fi
+[ "$CTL_ERRS" = "0" ] ||
+    gate_void "the rebalance-free control took $CTL_ERRS client errors -- the skewed load is saturating its ${HOSTS}x10 groups on this box, so the storm arm would measure that. Lower GATE_CONNECTIONS or GATE_BATCH_SIZE."
 gate_ok "control clean under the skew: $CTL_TPUT pts/s, 0 client errors"
 
 # ---------------------------------------------------------------------------
@@ -291,8 +271,16 @@ while [ "$i" -lt "$PROBE" ]; do
     esac
     i=$((i + 1))
 done
-wait $BENCHPID
-wait $STORMPID
+wait "$BENCHPID"
+BENCH_RC=$?
+wait "$STORMPID"
+STORM_RC=$?
+if [ "$BENCH_RC" -ne 0 ]; then
+    echo "  movement benchmark transcript tail:" >&2
+    tail -n 80 "$GATE_TMP_ROOT/tsgate_sk_bench.txt" >&2
+    gate_fail "movement benchmark exited $BENCH_RC (124 means its 300s bound expired)"
+fi
+[ "$STORM_RC" -eq 0 ] || gate_fail "rebalance storm driver exited $STORM_RC"
 # A missing file means the storm subshell died; do not let `set -u` turn that into an
 # obscure unbound-variable abort three lines later -- the floor below will report 0
 # transfers, which is the honest result.
@@ -301,7 +289,7 @@ TRANSFERS=0; CALLS=0
 
 echo "  rebalance calls: $CALLS, transfers initiated: $TRANSFERS"
 echo "  probe writes into the hot group: $PROBE_OK ok, $PROBE_5XX 5xx, $PROBE_OTHER other (of $PROBE)"
-grep -E "Requests:|First error|Throughput|batch latency" $GATE_TMP_ROOT/tsgate_sk_bench.txt
+grep -E "Requests:|First error|Throughput|batch latency" "$GATE_TMP_ROOT/tsgate_sk_bench.txt"
 LED1=$(status_field "$(cluster_status 19240)" vshards_led)
 LED2=$(status_field "$(cluster_status 19241)" vshards_led)
 LED3=$(status_field "$(cluster_status 19242)" vshards_led)
