@@ -49,6 +49,7 @@ fi
 
 export GATE_SERVER_MEMORY="${GATE_SERVER_MEMORY:-2G}"
 export GATE_SERVER_SMP="${GATE_SERVER_SMP:-4}"
+GATE_SNAPSHOT_SERVER_MEMORY="${GATE_SNAPSHOT_SERVER_MEMORY:-1G}"
 export GATE_BENCH_SMP="${GATE_BENCH_SMP:-1}"
 export GATE_BENCH_MEMORY="${GATE_BENCH_MEMORY:-1G}"
 export GATE_MAX_NODE_FAILURE_ERROR_BPS="${GATE_MAX_NODE_FAILURE_ERROR_BPS:-5000}"
@@ -91,10 +92,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
-run_gate() { # LABEL SCRIPT LOG
-    local label="$1" script="$2" log="$3" rc
+run_gate() { # LABEL SCRIPT LOG SERVER_MEMORY
+    local label="$1" script="$2" log="$3" server_memory="$4" rc
     echo "=== SLO arm: $label ==="
-    "$script" "$BIN" >"$log" 2>&1
+    GATE_SERVER_MEMORY="$server_memory" "$script" "$BIN" >"$log" 2>&1
     rc=$?
     grep -E '^GATE_METRIC |^GATE (PASSED|FAILED|VOID)' "$log" | sed 's/^/  /'
     if [ "$rc" -ne 0 ]; then
@@ -105,11 +106,11 @@ run_gate() { # LABEL SCRIPT LOG
 }
 
 run_gate "one-node failure, recovery, and survivor query latency" \
-    ./node_kill_round.sh "$NODE_LOG"
+    ./node_kill_round.sh "$NODE_LOG" "$GATE_SERVER_MEMORY"
 run_gate "empty-node snapshot installation and exact catch-up" \
-    ./restart_catchup_gate.sh "$SNAPSHOT_LOG"
+    ./restart_catchup_gate.sh "$SNAPSHOT_LOG" "$GATE_SNAPSHOT_SERVER_MEMORY"
 run_gate "leadership-movement throughput and latency impact" \
-    ./skewed_rebalance_gate.sh "$MOVEMENT_LOG"
+    ./skewed_rebalance_gate.sh "$MOVEMENT_LOG" "$GATE_SERVER_MEMORY"
 
 metric() { # LOG NAME
     awk -v name="$2" '$1 == "GATE_METRIC" && $2 == name { print $3; exit }' "$1"
@@ -158,6 +159,7 @@ GENERATED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 HOST=$(hostname)
 
 export COMMIT BINARY_REVISION BINARY_SHA256 SERVER_ENV_SHA256 GENERATED_AT HOST BIN GATE_SERVER_MEMORY GATE_SERVER_SMP
+export GATE_SNAPSHOT_SERVER_MEMORY
 export GATE_BENCH_SMP GATE_BENCH_MEMORY NODE_BATCHES NODE_BATCH_SIZE NODE_CONNECTIONS
 export NODE_HOSTS NODE_PROBES NODE_ERRORS NODE_ERROR_BPS NODE_RECOVERY_MS
 export NODE_QUERY_P99_MS NODE_QUERY_SAMPLES SNAPSHOT_INSTALL_MS SNAPSHOT_CATCHUP_MS
@@ -192,12 +194,13 @@ report = {
         "binary_sha256": os.environ["BINARY_SHA256"],
     },
     "settings": {
-        "server_memory_per_process": os.environ["GATE_SERVER_MEMORY"],
+        "high_volume_server_memory_per_process": os.environ["GATE_SERVER_MEMORY"],
         "high_volume_server_smp": integer("GATE_SERVER_SMP"),
         "bench_smp": integer("GATE_BENCH_SMP"),
         "bench_memory": os.environ["GATE_BENCH_MEMORY"],
         "server_environment_sha256": os.environ["SERVER_ENV_SHA256"],
         "node_failure_smp": integer("GATE_SERVER_SMP"),
+        "snapshot_catchup_server_memory_per_process": os.environ["GATE_SNAPSHOT_SERVER_MEMORY"],
         "snapshot_catchup_smp": 1,
         "movement_smp": integer("GATE_SERVER_SMP"),
         "scratch_root": os.environ["GATE_TMP_ROOT"],

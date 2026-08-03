@@ -327,8 +327,10 @@ evidence below.
   and binds their metrics, thresholds, commit, binary hash, resource settings,
   and raw transcripts into one report. It now refuses an `unknown`, dirty, stale,
   or unresolvable embedded binary revision rather than binding a clean worktree
-  commit to an executable built from different source. Diagnostic node-kill runs
-  also found that
+  commit to an executable built from different source. Its high-volume arms use
+  the recorded 2-GiB/four-reactor profile without overriding the focused
+  catch-up arm's 1-GiB/one-reactor bound. Diagnostic node-kill runs also found
+  that
   every VShard on one node inherited the same node-id-only election RNG stream,
   synchronizing thousands of campaigns after a failure; production data groups
   now use stable per-node/per-VShard seeds, with all 4,096 streams and the full
