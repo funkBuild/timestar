@@ -409,9 +409,10 @@ exactly that). The cluster planes only ever dial `port+1000` / `port+2000`.
    intensity is now bounded independently of disk speed.
 2. Node 3 must LEAD at least 800 VShards before every storm. The first node to start wins every election, and
    a converged-but-skewed cluster left node 3 leading 128 of 4096 — 3% of traffic crossing
-   the fault. A sufficiently long reset can also wake those groups and move their
-   leadership away from the proxy, making later arms vacuous. The gate now rebalances and
-   reasserts the traffic floor for every arm.
+   the fault. The old 400-pass targeted wake could also keep those groups active long
+   enough for a reset draw to move leadership away from the proxy. Targeted wake is now
+   one prompt check-tick, but the gate still rebalances and reasserts the traffic floor for
+   every arm so any future leadership change cannot make later arms vacuous.
 3. The baseline run through the proxy must itself be error-free, so a proxy bug cannot be
    read as a server property.
 
@@ -420,6 +421,14 @@ forwarder is not a server number, so the dip is asserted against a QUIET baselin
 through the same proxy — not against an unproxied figure. The current private-journal
 control measured 171 kpts/s with zero errors; one fully reconditioned three-arm draw
 retained 86-91% with zero errors.
+
+The combined reset/rebalance profile also guards the cost of Raft wake work. D-29 made
+hibernated groups credit skipped passes, but the wake hook still pinned every matching
+group at full rate for 400 passes (about eight seconds). One combined draw crossed that
+feedback cliff: 249 typed `503`s and 22% retained throughput failed its 80-error/25%
+bounds. A targeted wake now lasts one registry pass. The same live profile then admitted
+46 typed `503`s, retained 33% in its worst arm, issued 201 rebalance calls, and preserved
+every acknowledged probe on all three replicas with no `500` or crash.
 
 `fault_injection_ab.sh` is now a deterministic counterfactual, not a second noisy capacity
 run. The former sequential A/B was invalidated by a measured reversed draw: the flat-pacing

@@ -153,12 +153,11 @@ public:
     seastar::future<> write(VShardBatches groups);
 
 private:
-    // Ask the local Raft plane to un-hibernate the groups that still believe `node` leads
-    // them, after this write GAVE UP with `node` unreachable (debt D-14). Called at
-    // give-up time and not per failed attempt, which is what keeps a mere connection reset
-    // -- absorbed inside the retry budget by design -- from provoking spurious elections
-    // against a healthy peer; the .cpp has the measurement. RATE-LIMITED per node: the
-    // wake is O(groups on this shard) and its effect lasts seconds.
+    // Ask the local Raft plane to promptly check the groups that still believe `node`
+    // leads them, after this write GAVE UP with `node` unreachable (debt D-14). Called at
+    // give-up time and not per failed attempt, which keeps an absorbed connection reset
+    // from disturbing healthy groups. RATE-LIMITED per node: selecting the groups is
+    // O(groups on this shard), while the wake itself lasts exactly one tick pass.
     void wakeGroupsBehind(NodeId node);
 
     const VShardDirectory& dir_;

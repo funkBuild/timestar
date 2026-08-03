@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <set>
 #include <seastar/core/future.hh>
 #include <seastar/core/gate.hh>
 #include <seastar/core/timer.hh>
@@ -64,8 +65,8 @@ public:
     // persist, send, APPLY -- so an apply that throws surfaces here.
     uint64_t tickErrors() const { return tickErrors_; }
 
-    // Un-hibernate every group that still believes `leader` leads it, so it ticks at
-    // full rate. Returns how many woke.
+    // Make every group that still believes `leader` leads it run on the next tick pass.
+    // Returns how many groups were scheduled.
     //
     // WHAT THIS IS STILL FOR, now that skipped passes are credited (D-29(b)): granularity,
     // not magnitude. A hibernating follower's election timeout expires on schedule in real
@@ -80,8 +81,12 @@ public:
     // a dead node failed every query cluster-wide for the whole stretched window. That is
     // fixed at the source in tickAll; this remains as the latency trim.
     //
-    // It only resets the skip counter -- no forced election, so it cannot disturb a healthy
-    // group.
+    // This is deliberately ONE pass, not a full election-time window. Crediting skipped
+    // passes already keeps election time in wall-clock time; pinning every matching group
+    // awake for that whole window turns repeated data-plane resets into thousands of
+    // unnecessary Raft ticks even when the Raft leader is healthy. One prompt check pays
+    // the real skipped-pass credit, after which a dead leader's candidate ticks are
+    // naturally unhibernated while a healthy follower goes back to sleep.
     size_t wakeFollowersOf(NodeId leader);
 
     // TEST SEAM: run ONE tick pass synchronously. Not a knob -- `startTicking()` is the
@@ -99,10 +104,8 @@ private:
     // its first suspension. Concurrent removal can erase the registry entry while
     // that pass still owns a safe, already-retired group object.
     std::map<uint16_t, std::shared_ptr<RaftGroup>> groups_;
-    std::map<uint16_t, unsigned> skips_;     // consecutive passes a group has been skipped
-    std::map<uint16_t, unsigned> awakeFor_;  // passes left of forced full-rate ticking
-    // Must exceed the election timeout in passes (125-250) so a woken group campaigns.
-    static constexpr unsigned kWakePasses = 400;
+    std::map<uint16_t, unsigned> skips_;  // consecutive passes a group has been skipped
+    std::set<uint16_t> wakeNext_;         // groups that must run on the next pass only
     seastar::timer<> timer_;
     seastar::gate gate_;
     unsigned followerSkip_ = 9;  // idle followers tick every 10th pass by default

@@ -238,10 +238,9 @@ public:
                                                                 uint32_t maximumBytes);
     seastar::future<> finishBackupCapture(std::string operationId, std::string clusterUuid, uint16_t vshard);
 
-    // ProposeSink (debt D-14): un-hibernate the groups on THIS shard that still believe
-    // `node` leads them, so a killed leader costs an election rather than a
-    // hibernation-stretched one. Same remedy the read path applies to an unreachable
-    // leader; idempotent and self-limiting (the wake window expires on its own).
+    // ProposeSink (debt D-14): schedule one prompt check-tick for groups on THIS shard
+    // that still believe `node` leads them. Skipped passes already preserve wall-clock
+    // election timing; this removes only hibernation's remaining check-tick granularity.
     size_t wakeGroupsLedBy(NodeId node) override { return registry_.wakeFollowersOf(node); }
 
     raft::RaftGroup* group(uint16_t vshard);

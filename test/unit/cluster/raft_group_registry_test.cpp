@@ -365,10 +365,50 @@ seastar::future<> testHibernationDoesNotStretchTheLease() {
     co_await reg.stop();
 }
 
+// Since skipped passes are credited, a targeted wake is only a request to run the next
+// check-tick promptly. Keeping a healthy follower awake for an election-length window is
+// both unnecessary and dangerous: a repeated data-plane reset can otherwise pin thousands
+// of Raft groups at full tick rate even though their Raft heartbeats are healthy.
+seastar::future<> testTargetedWakeRunsOnePassOnly() {
+    RaftOptions o;
+    o.electionTimeoutMin = o.electionTimeoutMax = 60;
+    o.heartbeatTimeout = 5;
+
+    DropTransport transport;
+    NoopPersistence persistence;
+    RecordingSM sm;
+    RaftGroupRegistry reg(transport, 1ms);
+    reg.addGroup(1, RaftNode(2, {1, 2, 3}, RaftLog{}, HardState{}, o), persistence, sm);
+
+    AppendEntries ae;
+    ae.term = 1;
+    ae.leaderId = 1;
+    co_await reg.deliver(Envelope{1, Message{.to = 2, .from = 1, .payload = ae}});
+
+    // Establish that the healthy, quiescent follower is eligible for hibernation.
+    co_await reg.tickAllForTest();
+    const uint64_t skippedBeforeWake = reg.skippedTicks();
+    EXPECT_EQ(skippedBeforeWake, 1u);
+    EXPECT_EQ(reg.wakeFollowersOf(1), 1u);
+
+    // The scheduled pass runs and pays the existing skip credit.
+    co_await reg.tickAllForTest();
+    EXPECT_EQ(reg.skippedTicks(), skippedBeforeWake);
+
+    // The wake is consumed. A still-healthy follower hibernates again immediately;
+    // the old 400-pass wake window fails here by keeping skippedTicks unchanged.
+    co_await reg.tickAllForTest();
+    EXPECT_EQ(reg.skippedTicks(), skippedBeforeWake + 1);
+}
+
 }  // namespace
 
 TEST(RaftGroupRegistryTest, HibernationDoesNotStretchTheLease) {
     testHibernationDoesNotStretchTheLease().get();
+}
+
+TEST(RaftGroupRegistryTest, TargetedWakeRunsOnePassOnly) {
+    testTargetedWakeRunsOnePassOnly().get();
 }
 
 TEST(RaftGroupRegistryTest, ManyGroupsMultiplexOverSharedTransportAndTimer) {

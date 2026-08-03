@@ -3,7 +3,7 @@
 **Status:** BLOCKED — clustered deployment is not approved for production.
 
 **Reviewed baseline:** `cluster-design`, reviewed 2026-08-01 and updated
-2026-08-03.
+2026-08-04.
 
 This is the authoritative blocker list for the cluster redesign. Historical
 milestone documents describe how the design evolved; they are not release
@@ -233,6 +233,23 @@ inventory and rules.
   wall-clock blip behavioral tests against both binaries. The reverted arm must
   fail both and HEAD must pass both; the live gate above remains the end-to-end
   availability and durability proof.
+- [x] Bound targeted Raft wake work after a data-plane give-up. D-29 made
+  hibernated followers credit every skipped pass, so an unreachable-leader hint
+  only needs to make each matching group run its next check-tick promptly. The
+  registry still carried the superseded pre-D-29 behavior and pinned every
+  matching group at full-rate ticking for 400 passes (about eight seconds).
+  Repeated data-plane resets could therefore keep thousands of otherwise healthy
+  Raft groups awake and feed CPU pressure back into write deadlines. The combined
+  reset/rebalance gate exposed the cliff with 249 retryable errors against its
+  80-error ceiling and 22% retained throughput against a 25% floor, while all
+  durability checks remained correct. The wake is now a one-pass set consumed by
+  the next registry pass without discarding the real skipped-pass credit; a dead
+  leader naturally stays awake after becoming a candidate, while a healthy
+  follower immediately hibernates again. The regression test distinguishes one
+  pass from the old 400-pass window. The corrected live run admitted 46 typed
+  `503`s, retained 33% in its worst arm, executed 201 rebalance calls, preserved
+  every acknowledged probe on all replicas, and observed no server `500` or
+  crash.
 - [x] Remove the VShard snapshot reactor-memory ceiling without adding another
   protocol version. Production snapshots now encode the exact existing `TSP1`
   v1 bytes directly from immutable Engine objects into owned sidecars, hydrate
@@ -538,7 +555,10 @@ integrity. Production remains blocked on the P1 evidence below.
   live pacing A/B with a passing deterministic counterfactual. The remaining
   step is procedural: choose the release identity, build that exact identity,
   repeat the serial battery once, then run the distinct-host arms. It is not an
-  unresolved storage or runtime implementation defect.
+  unresolved storage defect. A later exact-candidate combined run found and
+  corrected the stale 400-pass Raft wake described above; its corrected live
+  reproduction is green, but the final exact-commit battery must include that
+  change before this release step can close.
 
 ## Release exit criteria
 
