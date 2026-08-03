@@ -337,6 +337,11 @@ inline WriteFailure classifyLocalWriteFailure(const std::exception_ptr& e) {
         std::rethrow_exception(e);
     } catch (const raft::LeadershipLostError&) {
         return WriteFailure::LeadershipLost;
+    } catch (const raft::DurabilityUnavailableError&) {
+        // The group stopped before sending the failed Ready. Treat this like a
+        // stopping shard: retry against another replica without labelling the result
+        // ambiguous, while arbitrary journal-shaped runtime_errors remain fatal.
+        return WriteFailure::ShardStopping;
     } catch (const ShardStoppingError&) {
         return WriteFailure::ShardStopping;
     } catch (const seastar::timed_out_error&) {

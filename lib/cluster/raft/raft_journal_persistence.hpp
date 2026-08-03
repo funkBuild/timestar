@@ -70,6 +70,7 @@ public:
     seastar::future<> hydrateSnapshotChunk(InstallSnapshot& chunk) override;
     seastar::future<> stageSnapshotChunk(InstallSnapshot& chunk) override;
     seastar::future<> sync() override;
+    [[nodiscard]] bool durabilityAvailable() const override { return !fenced_ && sink_.durabilityAvailable(); }
 
     uint64_t nextSeq() const { return nextSeq_; }
     // sync() calls this group made (debt D-10 evidence; see JournalSink::fsyncs).

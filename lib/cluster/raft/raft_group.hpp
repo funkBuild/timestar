@@ -144,15 +144,20 @@ public:
     // Observers (safe to read between async operations on the same core).
     uint16_t groupId() const { return groupId_; }
     Role role() const { return node_.role(); }
-    bool isLeader() const { return node_.isLeader(); }
+    // A replica whose durable Ready boundary failed is operationally offline even
+    // though the deterministic core still remembers its last role. Never advertise
+    // that stale role to routing/readiness code.
+    bool isLeader() const { return durabilityAvailable() && node_.isLeader(); }
     Term currentTerm() const { return node_.currentTerm(); }
-    NodeId leader() const { return node_.leader(); }
+    NodeId leader() const { return durabilityAvailable() ? node_.leader() : kNoNode; }
+    bool durabilityAvailable() const { return !durabilityFailed_ && persistence_.durabilityAvailable(); }
+    const std::string& durabilityFailureReason() const { return durabilityFailureReason_; }
     bool transferInFlight() const { return node_.transferInFlight(); }
     LogIndex commitIndex() const { return node_.commitIndex(); }
     // Does commitIndex() reflect a commit in the CURRENT term? Until it does, the value
     // is a stale watermark and "commit minus applied" is a meaningless zero -- see
     // RaftNode::hasCurrentTermCommit, and the read fence (debt D-36) that depends on it.
-    bool hasCurrentTermCommit() const { return node_.hasCurrentTermCommit(); }
+    bool hasCurrentTermCommit() const { return durabilityAvailable() && node_.hasCurrentTermCommit(); }
     // How many committed entries this group has NOT yet handed to its state machine
     // (debt D-36). Zero on a caught-up group. This is the ONE number that separates
     // "the write was lost" from "the write is on disk and not applied yet" after a
@@ -190,6 +195,9 @@ private:
     seastar::future<> compactImpl(LogIndex upto, std::string snapshotData, SnapshotFilePtr snapshotFile);
     seastar::gate::holder holdOperation();
     void ensureActive() const;
+    // Permanently take this local replica out of protocol service after a failed
+    // journal/snapshot durability operation. The caller holds lock_.
+    void fenceDurability(std::exception_ptr cause);
     // The ready/persist/send/apply/advance loop. MUST run under the group lock so
     // no step()/tick()/propose() interleaves a ready()..advance() pair.
     seastar::future<> drainReady();
@@ -226,6 +234,8 @@ private:
     seastar::semaphore lock_{1};
     seastar::gate operationGate_;
     bool retiring_ = false;
+    bool durabilityFailed_ = false;
+    std::string durabilityFailureReason_;
 
     // Read-barrier tracking.
     uint64_t appliedIndex_ = 0;   // highest entry index applied to the SM

@@ -49,6 +49,10 @@ public:
     // invisible by construction (plan 5.3, and its risks section).
     [[nodiscard]] virtual uint64_t fsyncs() const = 0;
     [[nodiscard]] virtual uint64_t syncRequests() const = 0;
+    // False once the underlying writer can no longer provide a durable barrier.
+    // Shared users inspect this even when their own current Ready has no records,
+    // preventing heartbeat-only groups from masking a shard-wide journal failure.
+    [[nodiscard]] virtual bool durabilityAvailable() const { return true; }
 };
 
 // Today's behaviour, unchanged: this group's own writer, this group's own fsync.
@@ -63,6 +67,7 @@ public:
     }
     [[nodiscard]] uint64_t fsyncs() const override { return writer_.fsyncs(); }
     [[nodiscard]] uint64_t syncRequests() const override { return syncRequests_; }
+    [[nodiscard]] bool durabilityAvailable() const override { return !writer_.fenced(); }
 
 private:
     JournalWriter& writer_;
@@ -120,10 +125,11 @@ private:
 //     segment), which a concurrent append or barrier would be operating across.
 //   * A barrier that throws FENCES the writer. The round fails every waiter in it
 //     with that exception, and every later append/sync throws too -- so a group
-//     whose sync failed can never ack. drainReady propagates, which stops that
-//     group. The blast radius is wider than the per-VShard sink (all groups on the
-//     shard, not one), and that is the correct direction: a shard that cannot
-//     fdatasync must not ack anything.
+//     whose sync failed can never ack. drainReady quarantines that group, while
+//     durabilityAvailable() makes heartbeat-only groups sharing the writer stop on
+//     their next driver pass. The blast radius is wider than the per-VShard sink
+//     (all groups on the shard, not one), and that is the correct direction: a
+//     shard that cannot fdatasync must not ack anything.
 //
 // SEGMENT RETENTION IS NOW WIRED, THROUGH runExclusive(). With one journal per shard
 // a sealed segment holds records from many groups and can only be reclaimed once
@@ -166,6 +172,7 @@ public:
 
     [[nodiscard]] uint64_t fsyncs() const override { return writer_.fsyncs(); }
     [[nodiscard]] uint64_t syncRequests() const override { return syncRequests_; }
+    [[nodiscard]] bool durabilityAvailable() const override { return !writer_.fenced() && !gate_.is_closed(); }
     // Waiters served by the largest single round so far -- the coalescing factor at
     // its peak, which is what "one fsync served N groups" means concretely.
     [[nodiscard]] uint64_t maxRoundWaiters() const { return maxRoundWaiters_; }

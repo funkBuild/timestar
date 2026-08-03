@@ -1997,6 +1997,7 @@ seastar::future<ClusterDataPlane::Status> ClusterDataPlane::status() const {
         st.applyLagEntries += c.applyLagEntries;
         st.applyGroupsBehind += c.groupsBehind;
         st.applyFailures += c.applyFailures;
+        st.raftDurabilityFailures += c.durabilityFailures;
         st.tickErrors += c.tickErrors;
         auto sc = co_await shards.invoke_on(sh, [](ShardRaftPlane& p) { return p.snapshotCounts(); });
         st.snapshotsTaken += sc.taken;
@@ -2070,6 +2071,7 @@ seastar::future<ClusterDataPlane::Status> ClusterDataPlane::status() const {
     st.controlRetentionCutoffRecords = control.retentionCutoffRecords;
     st.controlApplyLagEntries = control.applyLagEntries;
     st.controlApplyFailures = control.applyFailures;
+    st.controlDurabilityFailed = control.durabilityFailed;
     st.controlTickErrors = control.tickErrors;
     st.controlMaintenancePasses = control.maintenancePasses;
     st.controlMaintenanceFailures = control.maintenanceFailures;

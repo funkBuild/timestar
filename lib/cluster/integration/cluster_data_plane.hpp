@@ -234,6 +234,7 @@ public:
         // progress at all, which is what turns a transient apply failure into a read
         // that stays short.
         uint64_t applyFailures = 0;
+        size_t raftDurabilityFailures = 0;
         uint64_t tickErrors = 0;
         // Raft-log snapshot/compaction (debt D-5/D-6). `snapshotsTaken` rising is how an
         // operator sees that log compaction is actually running; `snapshotChunksSent` /
@@ -325,6 +326,7 @@ public:
         size_t controlFrozenDeletePlanBytes = 0;
         uint64_t controlApplyLagEntries = 0;
         uint64_t controlApplyFailures = 0;
+        bool controlDurabilityFailed = false;
         uint64_t controlTickErrors = 0;
         uint64_t controlMaintenancePasses = 0;
         uint64_t controlMaintenanceFailures = 0;
@@ -356,7 +358,8 @@ public:
             return controlHosted && controlInitialized && controlServingMapEpoch != 0 &&
                    controlLeader != raft::kNoNode && controlControllerTerm == controlTerm &&
                    controlControllerLeader == controlLeader && controlCurrentTermCommit &&
-                   controlApplyLagEntries == 0 && controlApplyFailures == 0 && controlTickErrors == 0 &&
+                   controlApplyLagEntries == 0 && controlApplyFailures == 0 && !controlDurabilityFailed &&
+                   controlTickErrors == 0 &&
                    controlMaintenanceFailures == 0 && controlControllerActuationFailures == 0 &&
                    controlCompactionsRefusedTooLarge == 0;
         }
@@ -366,9 +369,9 @@ public:
                 return false;
             if (!replicated)
                 return true;
-            return vshardsHostedHere != 0 && vshardsLeaderless == 0 && applyLagEntries == 0 && applyFailures == 0 &&
-                   tickErrors == 0 && snapshotTriggerEnabled && snapshotsRefusedTooLarge == 0 &&
-                   snapshotsUndeliverable == 0;
+            return vshardsHostedHere != 0 && raftDurabilityFailures == 0 && vshardsLeaderless == 0 &&
+                   applyLagEntries == 0 && applyFailures == 0 && tickErrors == 0 && snapshotTriggerEnabled &&
+                   snapshotsRefusedTooLarge == 0 && snapshotsUndeliverable == 0;
         }
 
         [[nodiscard]] std::string readinessReason() const {
@@ -378,6 +381,9 @@ public:
                 return {};
             if (vshardsHostedHere == 0)
                 return "this replicated node hosts no VShards";
+            if (raftDurabilityFailures != 0)
+                return std::to_string(raftDurabilityFailures) +
+                       " Raft replica durability failure(s) are quarantined; repair storage and restart this node";
             if (vshardsLeaderless != 0)
                 return std::to_string(vshardsLeaderless) + " hosted VShard(s) have no elected leader";
             if (applyFailures != 0)

@@ -57,7 +57,11 @@ Production blockers take priority and are authoritative in
   RF=3 export/restore/restart/corruption gate now passes, including leader-loss
   resume, malformed artifacts, killed import/activation, all-voter release,
   fresh identities, old-authority rejection, exact readback, and restart.
-  Artifact security, capacity policy, and the production runbook remain.
+  The manifest is HMAC-SHA-256 authenticated with a required protected key;
+  encrypted staging/off-site storage, capacity reserve, retention/key lifetime,
+  and the isolated RF=3 recovery drill are documented. Backup-specific
+  implementation, security, and runbook work is complete; only the shared final
+  release-candidate multi-host/SLO evidence remains.
 
 ## Feature completion
 
@@ -82,7 +86,10 @@ Production blockers take priority and are authoritative in
 - [x] Quarantine the static full-replication Compose example behind an explicit
   unsafe profile, acknowledgement variable, and unsupported-deployment labels.
 - [ ] Exercise disk-full, directory-sync failure, corrupt artifact, network
-  partition, and restart at every remaining durable boundary.
+  partition, and restart at every remaining durable boundary. Local Raft durable
+  `Ready` failures now quarantine before send/apply/ack, propagate across a shared
+  journal, release waiters, fail readiness, and permit healthy-voter re-election;
+  live distinct-host injection and repair/restart evidence remain.
 - [ ] Record supported memory, file-descriptor, snapshot, proposal, journal,
   and background-work budgets.
 - [ ] Publish production runbooks for bootstrap, join, drain, replace, backup,

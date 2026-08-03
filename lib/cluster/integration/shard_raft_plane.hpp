@@ -685,6 +685,7 @@ public:
         size_t retentionCutoffRecords = 0;
         uint64_t applyLagEntries = 0;
         uint64_t applyFailures = 0;
+        bool durabilityFailed = false;
         uint64_t tickErrors = 0;
         uint64_t maintenancePasses = 0;
         uint64_t maintenanceFailures = 0;
@@ -710,7 +711,7 @@ public:
         c.leaderHere = group->isLeader();
         c.voter = group->node().isVoter(group->node().id());
         c.jointConfig = config.joint();
-        c.currentTermCommit = group->node().hasCurrentTermCommit();
+        c.currentTermCommit = group->hasCurrentTermCommit();
         c.leader = group->leader();
         c.term = group->currentTerm();
         c.controllerLeader = state.controllerLeader;
@@ -748,6 +749,7 @@ public:
         c.retentionCutoffRecords = state.retentionCutoffs.size();
         c.applyLagEntries = group->applyLag();
         c.applyFailures = group->applyFailures();
+        c.durabilityFailed = !group->durabilityAvailable();
         c.tickErrors = host->tickErrors();
         c.maintenancePasses = host->maintenancePasses();
         c.maintenanceFailures = host->maintenanceFailures();
@@ -929,9 +931,10 @@ public:
         // existed the only way to observe that was to notice acknowledged points
         // missing from a query -- which is indistinguishable from having lost them.
         uint64_t applyLagEntries = 0;
-        size_t groupsBehind = 0;     // hosted groups with commitIndex > appliedIndex
-        uint64_t applyFailures = 0;  // committed applies that threw
-        uint64_t tickErrors = 0;     // ticks that threw (a superset of the above)
+        size_t groupsBehind = 0;        // hosted groups with commitIndex > appliedIndex
+        uint64_t applyFailures = 0;     // committed applies that threw
+        size_t durabilityFailures = 0;  // replicas quarantined after durable Ready failure
+        uint64_t tickErrors = 0;        // ticks that threw (a superset of the above)
     };
 
     Counts counts(data::NodeId self, const std::vector<data::NodeId>& peers) const {
@@ -962,6 +965,8 @@ public:
                     ++c.groupsBehind;
                 }
                 c.applyFailures += hg->applyFailures();
+                if (!hg->durabilityAvailable())
+                    ++c.durabilityFailures;
             }
             const data::NodeId leader = host.leaderOf(vs);
             if (leader == timestar::raft::kNoNode) {

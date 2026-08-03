@@ -8,6 +8,7 @@
 
 #include <chrono>
 #include <deque>
+#include <system_error>
 #include <map>
 #include <memory>
 #include <seastar/core/coroutine.hh>
@@ -45,13 +46,23 @@ public:
     // payload" is now an invariant with a way to break it. See
     // testAReceivedSnapshotIsPersistedAndAppliedWithItsWholePayload.
     std::vector<std::string> snapshots;
+    bool failNextSync = false;
+    bool available = true;
     seastar::future<> persistHardState(HardState) override { return seastar::make_ready_future<>(); }
     seastar::future<> persistEntries(std::vector<LogEntry>) override { return seastar::make_ready_future<>(); }
     seastar::future<> persistSnapshot(Snapshot s, bool) override {
         snapshots.push_back(std::move(s.data));
         return seastar::make_ready_future<>();
     }
-    seastar::future<> sync() override { return seastar::make_ready_future<>(); }
+    seastar::future<> sync() override {
+        if (!failNextSync)
+            return seastar::make_ready_future<>();
+        failNextSync = false;
+        available = false;
+        return seastar::make_exception_future<>(
+            std::system_error(std::make_error_code(std::errc::no_space_on_device), "Raft journal sync"));
+    }
+    bool durabilityAvailable() const override { return available; }
 };
 
 class RecordingSM : public RaftStateMachine {
@@ -119,9 +130,11 @@ public:
     RaftGroup& group(NodeId id) { return *groups_.at(id); }
     const std::vector<std::string>& applied(NodeId id) const { return sm_.at(id)->applied; }
     const std::vector<std::string>& persistedSnapshots(NodeId id) const { return persistence_.at(id)->snapshots; }
+    void failNextSync(NodeId id) { persistence_.at(id)->failNextSync = true; }
 
     void enqueue(Envelope e) { queue_.push_back(std::move(e)); }
     void discardQueued() { queue_.clear(); }
+    size_t queued() const { return queue_.size(); }
 
     // Deliver all queued envelopes (and any they cascade) until quiescent.
     seastar::future<bool> pumpOne() {
@@ -470,6 +483,79 @@ seastar::future<> testReadyDrainFailuresReclaimProposalWaiters() {
     }
 }
 
+// A failed durable Ready is not a transient tick error. The journal writer is fenced
+// permanently after ENOSPC/EIO, so continuing to heartbeat from the in-memory leader
+// pins leadership on a replica that can never accept another write. Quarantine must
+// happen before this Ready sends anything, release every caller, and make the failed
+// replica behave like an offline node so the other two voters can recover quorum.
+seastar::future<> testDurabilityFailureQuarantinesReplicaAndAllowsReelection() {
+    GroupNetwork net({1, 2, 3}, opts());
+    co_await net.group(1).campaign();
+    co_await net.pump();
+    EXPECT_EQ(net.leader(), 1u);
+
+    auto barrier = net.group(1).readBarrier();
+    co_await seastar::yield();
+    EXPECT_EQ(net.group(1).pendingReadWaiters(), 1u);
+    net.discardQueued();
+
+    const LogIndex before = net.group(1).node().log().lastIndex();
+    net.failNextSync(1);
+    EXPECT_THROW(co_await net.group(1).proposeAndAwaitApplied("will-not-send"), DurabilityUnavailableError);
+    EXPECT_EQ(net.queued(), 0u) << "no message from a Ready may precede its durability barrier";
+    EXPECT_FALSE(net.group(1).durabilityAvailable());
+    EXPECT_FALSE(net.group(1).isLeader()) << "routing must not advertise a fenced in-memory leader";
+    EXPECT_EQ(net.group(1).leader(), kNoNode);
+    EXPECT_EQ(net.group(1).pendingApplyWaiters(), 0u);
+    EXPECT_EQ(net.group(1).pendingReadWaiters(), 0u);
+    EXPECT_EQ(net.group(1).confirmedReadWaiters(), 0u);
+    EXPECT_EQ(net.group(1).node().pendingReadIndexes(), 0u);
+    EXPECT_THROW(co_await std::move(barrier), DurabilityUnavailableError);
+
+    const LogIndex failedTail = net.group(1).node().log().lastIndex();
+    EXPECT_EQ(failedTail, before + 1);
+    EXPECT_THROW(co_await net.group(1).propose("must-fail-immediately"), DurabilityUnavailableError);
+    EXPECT_EQ(net.group(1).node().log().lastIndex(), failedTail)
+        << "a quarantined replica must reject before mutating the Raft core";
+    co_await net.group(1).tick(100);
+    EXPECT_EQ(net.queued(), 0u) << "a quarantined former leader must stop heartbeats";
+
+    co_await net.group(2).campaign();
+    co_await net.pump();
+    EXPECT_EQ(net.leader(), 2u) << "the healthy quorum must be able to replace the disk-failed leader";
+    EXPECT_TRUE(co_await net.group(2).propose("after-failure"));
+    co_await net.pump();
+    EXPECT_EQ(net.applied(1).size(), 0u);
+    EXPECT_EQ(net.applied(2), (std::vector<std::string>{"after-failure"}));
+    EXPECT_EQ(net.applied(3), (std::vector<std::string>{"after-failure"}));
+}
+
+seastar::future<> testSharedPersistenceFailureQuarantinesHeartbeatOnlyGroups() {
+    NoopPersistence persistence;
+    NullTransport transport;
+    RecordingSM firstSm;
+    RecordingSM secondSm;
+    RaftGroup first(1, RaftNode(1, {1}, RaftLog{}, HardState{}, opts()), persistence, transport, firstSm);
+    RaftGroup second(2, RaftNode(1, {1}, RaftLog{}, HardState{}, opts()), persistence, transport, secondSm);
+    co_await first.campaign();
+    co_await second.campaign();
+    EXPECT_TRUE(first.isLeader());
+    EXPECT_TRUE(second.isLeader());
+
+    persistence.failNextSync = true;
+    EXPECT_THROW(co_await first.propose("trigger-shared-failure"), DurabilityUnavailableError);
+    EXPECT_FALSE(first.durabilityAvailable());
+    EXPECT_FALSE(second.durabilityAvailable())
+        << "a heartbeat-only group must observe the shared writer fence without issuing its own append";
+    EXPECT_FALSE(second.isLeader());
+    EXPECT_EQ(second.leader(), kNoNode);
+
+    co_await second.tick();
+    EXPECT_FALSE(second.durabilityFailureReason().empty())
+        << "the next driver pass must make the shared failure permanent and release its waiters";
+    EXPECT_THROW(co_await second.propose("must-not-append"), DurabilityUnavailableError);
+}
+
 seastar::future<> testReadBarrierDeadlineReclaimsExactWaiter() {
     GroupNetwork net({1, 2, 3}, opts());
     co_await net.group(1).campaign();
@@ -601,6 +687,14 @@ TEST(RaftGroupTest, ConfigChangeDeadlineReclaimsFinalWaiter) {
 
 TEST(RaftGroupTest, ReadyDrainFailuresReclaimProposalWaiters) {
     testReadyDrainFailuresReclaimProposalWaiters().get();
+}
+
+TEST(RaftGroupTest, DurabilityFailureQuarantinesReplicaAndAllowsReelection) {
+    testDurabilityFailureQuarantinesReplicaAndAllowsReelection().get();
+}
+
+TEST(RaftGroupTest, SharedPersistenceFailureQuarantinesHeartbeatOnlyGroups) {
+    testSharedPersistenceFailureQuarantinesHeartbeatOnlyGroups().get();
 }
 
 TEST(RaftGroupTest, ReadBarrierDeadlineReclaimsExactWaiter) {

@@ -49,6 +49,11 @@ TEST_F(ClusterDataPlaneTest, ClusterReadinessFailsClosedOnCurrentServingBlockers
     EXPECT_NE(st.readinessReason().find("no elected leader"), std::string::npos);
     st.vshardsLeaderless = 0;
 
+    st.raftDurabilityFailures = 1;
+    EXPECT_FALSE(st.readyForTraffic());
+    EXPECT_NE(st.readinessReason().find("durability failure"), std::string::npos);
+    st.raftDurabilityFailures = 0;
+
     st.applyLagEntries = 1;
     EXPECT_FALSE(st.readyForTraffic());
     EXPECT_NE(st.readinessReason().find("not applied"), std::string::npos);
@@ -108,6 +113,10 @@ TEST_F(ClusterDataPlaneTest, ControlHealthIsVisibleWithoutBlockingExistingDataGr
     EXPECT_FALSE(st.controlLocallyReady());
     EXPECT_TRUE(st.readyForTraffic());
     st.controlApplyLagEntries = 0;
+    st.controlDurabilityFailed = true;
+    EXPECT_FALSE(st.controlLocallyReady());
+    EXPECT_TRUE(st.readyForTraffic());
+    st.controlDurabilityFailed = false;
     st.controlCompactionsRefusedTooLarge = 1;
     EXPECT_FALSE(st.controlLocallyReady());
 }

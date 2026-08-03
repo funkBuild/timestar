@@ -153,6 +153,15 @@ publication succeeds. Startup recovery fails if recovered data cannot be made
 live. TSM and NativeIndex registration abort rather than serving a partial
 immutable set.
 
+A failed Raft append, snapshot durability operation, or sync is a permanent local
+replica quarantine, not a catch-and-continue tick error. The driver fails all
+pending callers, advertises no leader/current-term read fence, and stops protocol
+traffic before any message from the failed `Ready` is sent. A shared-journal fence
+also quarantines groups whose next `Ready` would otherwise contain only a
+heartbeat. Operators repair storage and restart the node; healthy voters elect and
+continue in the meantime. Exact-v1 status reports data-group and Group-0 durability
+failures separately.
+
 ## V1 versioning policy
 
 Version markers remain mandatory, but no v2-vN implementation, activation

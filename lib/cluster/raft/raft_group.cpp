@@ -96,6 +96,47 @@ seastar::gate::holder RaftGroup::holdOperation() {
 void RaftGroup::ensureActive() const {
     if (retiring_)
         throw std::runtime_error("raft: group " + std::to_string(groupId_) + " is retired");
+    if (!durabilityAvailable()) {
+        const std::string reason = durabilityFailed_
+                                       ? durabilityFailureReason_
+                                       : "raft: group " + std::to_string(groupId_) +
+                                             " durability unavailable; shared persistence is fenced";
+        throw DurabilityUnavailableError(reason);
+    }
+}
+
+void RaftGroup::fenceDurability(std::exception_ptr cause) {
+    if (durabilityFailed_)
+        return;
+
+    std::string detail = "unknown persistence failure";
+    try {
+        std::rethrow_exception(cause);
+    } catch (const std::exception& ex) {
+        detail = ex.what();
+    } catch (...) {
+    }
+    durabilityFailureReason_ = "raft: group " + std::to_string(groupId_) +
+                               " durability unavailable; local replica quarantined: " + detail;
+    durabilityFailed_ = true;
+    timestar::http_log.error("{}", durabilityFailureReason_);
+
+    const auto failure = std::make_exception_ptr(DurabilityUnavailableError(durabilityFailureReason_));
+    for (auto& [ctx, promise] : readWaiters_) {
+        node_.cancelReadIndex(ctx);
+        promise.set_exception(failure);
+    }
+    readWaiters_.clear();
+    confirmedReads_.clear();
+    for (auto& [index, promise] : applyWaiters_)
+        promise.set_exception(failure);
+    applyWaiters_.clear();
+    for (auto& waiter : configWaiters_)
+        waiter.promise.set_exception(failure);
+    configWaiters_.clear();
+    for (auto& [index, promise] : appliedWaiters_)
+        promise.set_exception(failure);
+    appliedWaiters_.clear();
 }
 
 seastar::future<> RaftGroup::retire() {
@@ -150,21 +191,26 @@ seastar::future<> RaftGroup::drainReady() {
         //    may supersede the log), then hard state, then the new log entries,
         //    then one sync() -- a single fsync makes the whole Ready durable.
         bool persisted = false;
-        if (rd.snapshot) {
-            co_await persistence_.persistSnapshot(*rd.snapshot, /*receivedFromPeer=*/true);
-            persisted = true;
-        }
-        if (rd.hardState) {
-            co_await persistence_.persistHardState(*rd.hardState);
-            persisted = true;
-        }
-        if (!rd.entries.empty()) {
-            co_await persistence_.persistEntries(rd.entries);
-            persisted = true;
-        }
         const uint64_t tP0 = profileEnabled() ? nowNs() : 0;
-        if (persisted)
-            co_await persistence_.sync();
+        try {
+            if (rd.snapshot) {
+                co_await persistence_.persistSnapshot(*rd.snapshot, /*receivedFromPeer=*/true);
+                persisted = true;
+            }
+            if (rd.hardState) {
+                co_await persistence_.persistHardState(*rd.hardState);
+                persisted = true;
+            }
+            if (!rd.entries.empty()) {
+                co_await persistence_.persistEntries(rd.entries);
+                persisted = true;
+            }
+            if (persisted)
+                co_await persistence_.sync();
+        } catch (...) {
+            fenceDurability(std::current_exception());
+            throw DurabilityUnavailableError(durabilityFailureReason_);
+        }
         if (profileEnabled()) {
             g_prof.persistNs += nowNs() - tP0;
             ++g_prof.drains;
@@ -505,12 +551,16 @@ seastar::future<LogIndex> RaftGroup::readBarrier(std::optional<seastar::lowres_c
 }
 
 seastar::future<> RaftGroup::step(Message m) {
-    if (retiring_)
+    if (retiring_ || durabilityFailed_)
         co_return;
     auto operation = operationGate_.hold();
     auto units = co_await seastar::get_units(lock_, 1);
-    if (retiring_)
+    if (retiring_ || durabilityFailed_)
         co_return;
+    if (!persistence_.durabilityAvailable()) {
+        fenceDurability(std::make_exception_ptr(std::runtime_error("shared persistence is fenced")));
+        co_return;
+    }
     if (auto* snapshot = std::get_if<InstallSnapshot>(&m.payload)) {
         // Do no disk work for a message the deterministic core will reject
         // before snapshot handling. Without these two cheap fences, a stale or
@@ -530,12 +580,16 @@ seastar::future<> RaftGroup::step(Message m) {
 }
 
 seastar::future<> RaftGroup::tick(unsigned passes) {
-    if (retiring_)
+    if (retiring_ || durabilityFailed_)
         co_return;
     auto operation = operationGate_.hold();
     auto units = co_await seastar::get_units(lock_, 1);
-    if (retiring_)
+    if (retiring_ || durabilityFailed_)
         co_return;
+    if (!persistence_.durabilityAvailable()) {
+        fenceDurability(std::make_exception_ptr(std::runtime_error("shared persistence is fenced")));
+        co_return;
+    }
     node_.tick(passes);
     co_await drainReady();
 }
@@ -729,17 +783,22 @@ seastar::future<> RaftGroup::compactImpl(LogIndex upto, std::string snapshotData
     // AT the boundary (the payload is durable), and a crash before the record recovers with
     // the full log (no compaction, no loss).
     if (node_.log().snapshotIndex() > before && node_.servableSnapshot().index != kNoIndex) {
-        co_await persistence_.persistSnapshot(node_.servableSnapshot(), /*receivedFromPeer=*/false);
-        // RE-PERSIST THE CURRENT HARD STATE (debt D-34). Not redundant, and not for this
-        // group's benefit: it is what lets the journal's segment GC actually reclaim
-        // anything. A HardState record is written only when the term or vote CHANGES, so
-        // a group with stable leadership has exactly ONE, from startup -- and that record
-        // is needed forever, which pins every segment at or after it and makes the
-        // snapshot boundary reclaim nothing at all. One ~40-byte record moves the pin up
-        // to the new boundary. Replaying it is idempotent: same term, same vote, and
-        // recoverRaftState simply overwrites what an earlier identical record set.
-        co_await persistence_.persistHardState(node_.hardState());
-        co_await persistence_.sync();
+        try {
+            co_await persistence_.persistSnapshot(node_.servableSnapshot(), /*receivedFromPeer=*/false);
+            // RE-PERSIST THE CURRENT HARD STATE (debt D-34). Not redundant, and not for this
+            // group's benefit: it is what lets the journal's segment GC actually reclaim
+            // anything. A HardState record is written only when the term or vote CHANGES, so
+            // a group with stable leadership has exactly ONE, from startup -- and that record
+            // is needed forever, which pins every segment at or after it and makes the
+            // snapshot boundary reclaim nothing at all. One ~40-byte record moves the pin up
+            // to the new boundary. Replaying it is idempotent: same term, same vote, and
+            // recoverRaftState simply overwrites what an earlier identical record set.
+            co_await persistence_.persistHardState(node_.hardState());
+            co_await persistence_.sync();
+        } catch (...) {
+            fenceDurability(std::current_exception());
+            throw DurabilityUnavailableError(durabilityFailureReason_);
+        }
     }
     co_await drainReady();
 }

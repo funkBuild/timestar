@@ -1619,7 +1619,7 @@ FenceGroupState ReplicatedVShardHost::fenceStateOf(uint16_t vshard) {
     if (!g)
         return s;  // not hosted: the policy drops it
     s.hosted = true;
-    s.hasCurrentTermCommit = g->hasCurrentTermCommit();
+    s.hasCurrentTermCommit = g->hasCurrentTermCommit();  // false for a durability-quarantined replica
     s.commitIndex = g->commitIndex();
     s.appliedIndex = g->appliedIndex();
     return s;

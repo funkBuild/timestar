@@ -41,6 +41,10 @@ public:
     virtual seastar::future<> stageSnapshotChunk(InstallSnapshot&) { return seastar::make_ready_future<>(); }
     // Make everything appended since the last sync() durable (fsync).
     virtual seastar::future<> sync() = 0;
+    // Synchronous health of the durable boundary. Production overrides this so
+    // heartbeat-only Ready cycles still notice a writer shared with a group whose
+    // barrier failed. In-memory/test implementations are healthy by default.
+    [[nodiscard]] virtual bool durabilityAvailable() const { return true; }
 };
 
 // Sends an envelope toward its addressed peer. Fire-and-forget and best-effort:

@@ -29,6 +29,16 @@ public:
     explicit LeadershipLostError(const std::string& what) : std::runtime_error(what) {}
 };
 
+// The local durable Ready boundary failed. RaftGroup permanently quarantines the
+// replica before sending any message from that Ready, so callers may retry against a
+// healthy replica and peers are free to elect one. This is deliberately distinct from
+// LeadershipLostError: no quorum-observable action from the failed Ready occurred, and
+// matching a journal error's text would turn unrelated bugs into retryable failures.
+class DurabilityUnavailableError : public std::runtime_error {
+public:
+    explicit DurabilityUnavailableError(const std::string& what) : std::runtime_error(what) {}
+};
+
 // Core Raft scalar types (Phase 2 / Stage 3). A group is one VShard's replicated
 // log; these are shared by the log, the node state machine, and the RPCs.
 using Term = uint64_t;      // election term; monotonically non-decreasing per node

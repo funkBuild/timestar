@@ -62,6 +62,8 @@ TEST(WriteFailureTaxonomyTest, RetryAndAmbiguityPolicyIsExplicit) {
 TEST(WriteFailureTaxonomyTest, LocalClassificationIsConservative) {
     auto cls = [](std::exception_ptr e) { return data::classifyLocalWriteFailure(e); };
     EXPECT_EQ(cls(std::make_exception_ptr(raft::LeadershipLostError("lost"))), WriteFailure::LeadershipLost);
+    EXPECT_EQ(cls(std::make_exception_ptr(raft::DurabilityUnavailableError("disk full"))),
+              WriteFailure::ShardStopping);
     EXPECT_EQ(cls(std::make_exception_ptr(data::WriteOverloadedError("full"))), WriteFailure::Overloaded);
     EXPECT_EQ(cls(std::make_exception_ptr(data::UnassignedVShardError("none"))), WriteFailure::Unassigned);
     EXPECT_EQ(cls(std::make_exception_ptr(data::WriteFrameTooLargeError("big"))), WriteFailure::Fatal);

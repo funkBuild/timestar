@@ -292,6 +292,7 @@ void set_routes(routes& r) {
                     body += ",\"apply_lag_entries\":" + std::to_string(st.applyLagEntries) +
                             ",\"apply_groups_behind\":" + std::to_string(st.applyGroupsBehind) +
                             ",\"apply_failures\":" + std::to_string(st.applyFailures) +
+                            ",\"raft_durability_failures\":" + std::to_string(st.raftDurabilityFailures) +
                             ",\"tick_errors\":" + std::to_string(st.tickErrors);
                     // Raft-log snapshot/compaction (debt D-5/D-6). `snapshots_taken`
                     // rising is how an operator sees compaction running at all; the chunk
@@ -379,6 +380,8 @@ void set_routes(routes& r) {
                         ",\"control_frozen_delete_plan_bytes\":" + std::to_string(st.controlFrozenDeletePlanBytes) +
                         ",\"control_apply_lag_entries\":" + std::to_string(st.controlApplyLagEntries) +
                         ",\"control_apply_failures\":" + std::to_string(st.controlApplyFailures) +
+                        ",\"control_durability_failed\":" +
+                        std::string(st.controlDurabilityFailed ? "true" : "false") +
                         ",\"control_tick_errors\":" + std::to_string(st.controlTickErrors) +
                         ",\"control_maintenance_passes\":" + std::to_string(st.controlMaintenancePasses) +
                         ",\"control_maintenance_failures\":" + std::to_string(st.controlMaintenanceFailures) +

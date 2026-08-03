@@ -298,7 +298,18 @@ evidence below.
   mTLS identity gate now covers positive, trusted-wrong-endpoint, and recovery
   paths. Repeat identity and authenticated operator mutation on distinct hosts,
   then verify network partitions, restart, disk-full behavior, and bounded
-  recovery there.
+  recovery there. The local disk-failure behavior is no longer an implementation
+  ambiguity: an append, snapshot-promotion, or sync failure permanently
+  quarantines that Raft replica before the failed `Ready` can send, apply, or
+  acknowledge. Pending write, membership, read-index, and apply waiters fail
+  promptly with a typed retryable error; the replica stops protocol traffic so a
+  healthy quorum can elect a replacement. A shared shard-journal fence is visible
+  to heartbeat-only groups without requiring another append. Focused ENOSPC tests
+  prove no outbound message escapes, subsequent proposals do not mutate the core,
+  and the other two voters elect and commit. `/cluster/status` exposes
+  `raft_durability_failures` and `control_durability_failed`, and data/control
+  readiness fail closed. The remaining item is live distinct-host fault and
+  recovery evidence against the release binary, not this core behavior.
 - [ ] **Measure production SLOs.** Record one-node-failure write error band,
   recovery time, query latency, snapshot catch-up, and movement impact using the
   final binary and deployment settings.
