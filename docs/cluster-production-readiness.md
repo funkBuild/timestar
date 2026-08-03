@@ -188,7 +188,12 @@ inventory and rules.
   changed request bytes returned the stable 409 conflict. Restarting the killed
   node recovered the same one-plan/6,000-target state without resurrection. The
   three one-reactor nodes stayed within their 1-GiB process limits and the gate
-  removed all four `build/tmp` roots afterward.
+  removed all four `build/tmp` roots afterward. A later exact-candidate rerun
+  received a valid retryable `503` while one VShard was still uncommitted after
+  failover, exposing that the gate itself made only one retry. The gate now
+  repeats the byte-identical request only after transport errors or `503`, with
+  a ten-attempt, 30-second-per-attempt ceiling; it still fails immediately on a
+  conflict or any other HTTP outcome.
 - [x] Make the local network-reset qualification bounded and diagnostic on the
   required private durable journals. The insert driver no longer retains every
   array payload for a long campaign: it pre-generates only below a conservative

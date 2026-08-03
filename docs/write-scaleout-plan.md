@@ -163,7 +163,11 @@ see [ADR 0005](adr/0005-checkquorum-transfer-bypass.md).
   worst-arm throughput retention, and exact per-replica probe readback. Commit
   those fixes and repeat the serial battery against that one resulting identity;
   the follow-up fixes the per-storm intensity at no more than 70 reset rounds so
-  a slow disk cannot silently turn the same gate into a stronger fault.
+  a slow disk cannot silently turn the same gate into a stronger fault. The
+  final pattern-delete rerun also exposed a valid transient `503` from an
+  uncommitted VShard after coordinator failover; its acceptance client now
+  repeats only the byte-identical request after transport errors or `503`, with
+  a ten-attempt, 30-second-per-attempt ceiling.
 - [ ] Measure final multi-host throughput, latency, recovery, and movement SLOs.
 
 ## Acceptance gates

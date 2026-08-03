@@ -19,6 +19,8 @@
 
 GATE_SERVER_MEMORY="${GATE_SERVER_MEMORY:-1G}"
 GATE_SHUTDOWN_TIMEOUT_SECONDS="${GATE_SHUTDOWN_TIMEOUT_SECONDS:-120}"
+DELETE_RETRY_ATTEMPTS="${GATE_PATTERN_DELETE_RETRY_ATTEMPTS:-10}"
+DELETE_RETRY_TIMEOUT_SECONDS="${GATE_PATTERN_DELETE_RETRY_TIMEOUT_SECONDS:-30}"
 set -u
 cd "$(dirname "$0")" || exit 2
 . ./cluster_gate_lib.sh
@@ -41,6 +43,13 @@ TARGETS=6000
 BATCH_SIZE=500
 POINT_TS=1700000000000000000
 declare -a NODE_PIDS
+
+case "$DELETE_RETRY_ATTEMPTS" in
+    ''|*[!0-9]*|0) echo "ABORT: GATE_PATTERN_DELETE_RETRY_ATTEMPTS must be a positive integer" >&2; exit 2 ;;
+esac
+case "$DELETE_RETRY_TIMEOUT_SECONDS" in
+    ''|*[!0-9]*|0) echo "ABORT: GATE_PATTERN_DELETE_RETRY_TIMEOUT_SECONDS must be a positive integer" >&2; exit 2 ;;
+esac
 
 mkdir -p "$GATE_ROOT"
 kill_cluster "$PREFIX"
@@ -253,9 +262,9 @@ wait_late_visible() { # PORT
     return 1
 }
 
-delete_request() { # PORT OUTPUT_CODE OUTPUT_BODY
-    local port="$1" code_file="$2" body_file="$3"
-    curl -sS -m300 -o "$body_file" -w '%{http_code}' -X POST \
+delete_request() { # PORT OUTPUT_CODE OUTPUT_BODY [TIMEOUT_SECONDS]
+    local port="$1" code_file="$2" body_file="$3" timeout="${4:-300}"
+    curl -sS -m"$timeout" -o "$body_file" -w '%{http_code}' -X POST \
         "http://127.0.0.1:$port/delete" \
         -H "Authorization: Bearer $AUTH_TOKEN" -H 'Content-Type: application/json' \
         -H "Idempotency-Key: $DELETE_KEY" -H "Idempotency-Key-Timestamp: $DELETE_ISSUED_MS" \
@@ -339,12 +348,31 @@ gate_ok "Group-0 and every VShard recovered without coordinator node $OLD_LEADER
 echo "=== add a new match, then retry the exact identity against the new leader ==="
 write_late_match "$NEW_PORT" || gate_exit
 wait_late_visible "$NEW_PORT" || gate_exit
-delete_request "$NEW_PORT" "$WORK/retry_code" "$WORK/retry_body"
-RETRY_RC=$?
-RETRY_CODE=$(sed -n '1p' "$WORK/retry_code" 2>/dev/null)
-RETRY_BODY=$(sed -n '1p' "$WORK/retry_body" 2>/dev/null)
+RETRY_RC=1
+RETRY_CODE=""
+RETRY_BODY=""
+RETRY_ATTEMPT=0
+while [ "$RETRY_ATTEMPT" -lt "$DELETE_RETRY_ATTEMPTS" ]; do
+    RETRY_ATTEMPT=$((RETRY_ATTEMPT + 1))
+    : >"$WORK/retry_code"
+    : >"$WORK/retry_body"
+    delete_request "$NEW_PORT" "$WORK/retry_code" "$WORK/retry_body" \
+        "$DELETE_RETRY_TIMEOUT_SECONDS"
+    RETRY_RC=$?
+    RETRY_CODE=$(sed -n '1p' "$WORK/retry_code" 2>/dev/null)
+    RETRY_BODY=$(sed -n '1p' "$WORK/retry_body" 2>/dev/null)
+    [ "$RETRY_RC" -eq 0 ] && [ "$RETRY_CODE" = 200 ] && break
+    if [ "$RETRY_RC" -ne 0 ] || [ "$RETRY_CODE" = 503 ]; then
+        echo "  exact retry attempt $RETRY_ATTEMPT remained retryable (curl=$RETRY_RC HTTP=${RETRY_CODE:-missing})"
+        [ "$RETRY_ATTEMPT" -lt "$DELETE_RETRY_ATTEMPTS" ] && sleep 1
+        continue
+    fi
+    break
+done
 assert_eq "exact retry curl status" "$RETRY_RC" 0
 assert_eq "exact retry HTTP status" "${RETRY_CODE:-missing}" 200
+[ "$RETRY_RC" -eq 0 ] && [ "$RETRY_CODE" = 200 ] \
+    && gate_ok "exact retry converged in $RETRY_ATTEMPT bounded attempt(s)"
 printf '%s' "$RETRY_BODY" | grep -q "\"seriesDeleted\":$TARGETS" \
     && gate_ok "retry reported the original $TARGETS exact targets" \
     || gate_fail "retry did not return the frozen target count: ${RETRY_BODY:-<empty>}"
