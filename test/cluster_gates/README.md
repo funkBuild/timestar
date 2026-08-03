@@ -25,6 +25,7 @@ not probes, so they can be run from CI or a release checklist.
 | `homogeneous_v1_rejection_gate.sh` | exact-v1 codec and real-socket handshake rejection, plus a production restart over a real acknowledged WAL whose version field is changed to an unsupported value; startup must exit before HTTP and preserve the source byte-for-byte |
 | `mtls_peer_identity_gate.sh` | matching per-peer IP SANs converge and commit; with the other voter down, a certificate signed by the cluster CA for the wrong configured endpoint produces bounded 503, while rolling that node to a newly issued certificate for the correct endpoint commits that exact write and restores full health |
 | `cluster_backup_restore_gate.sh` | an authenticated live export survives Group-0 leader loss, validates all 4,096 exact-v1 units, rejects wrong-key/missing/corrupt/extra artifacts, resumes a killed offline import, requires every prepared voter for release, rejects source authority, restores under fresh identities, and preserves the acknowledged baseline through full-cluster restart |
+| `production_slo_report.sh` | serially runs the node-kill, bounded empty-node catch-up, and skewed-movement gates against one clean candidate, then binds their error-band, recovery, query-latency, snapshot, and movement measurements to the commit, binary hash, resource settings, thresholds, and raw transcripts in one exact-v1 JSON report |
 
 All of them take an optional server binary as `$1` (default
 `build/bin/timestar_http_server`), so a "before" binary can be measured the same way.
@@ -42,6 +43,18 @@ implicit process temporaries (`TMPDIR`). It defaults to the repository-local
 at a memory-backed `/tmp`: the legacy load shapes can write tens of GiB, turning
 their disk workload into raw-memory pressure and killing the harness instead of
 measuring the intended fault.
+
+`production_slo_report.sh` is the release collector, not another workload. It
+requires a clean tracked worktree and runs the three underlying gates serially.
+Its report is retained at
+`build/tmp/tsgate_slo_report/report.v1.json`, beside the complete arm logs. The
+local safety defaults are a 50% post-kill write-error ceiling, 15 s for complete
+leader recovery, 2 s for survivor query p99, 360 s for snapshot installation,
+750 s for exact catch-up, 10% retained movement throughput, and 5 s for movement
+batch p99. Set the corresponding
+`GATE_MAX_*` values to the approved deployment SLOs before release
+qualification; the report records the actual thresholds so a relaxed run
+cannot be mistaken for production evidence.
 
 `topology_mutation_gate.sh` is a low-volume correctness gate and deliberately
 pins a smaller 1 GiB per-process default (4 GiB aggregate). Its four durable

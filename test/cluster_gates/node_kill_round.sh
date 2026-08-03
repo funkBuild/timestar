@@ -22,6 +22,9 @@
 # binaries by running this against each, in the same session, on an idle box.
 #
 # Usage: node_kill_round.sh [SERVER_BINARY]
+#   GATE_MAX_NODE_FAILURE_ERROR_BPS=N error-band ceiling, basis points (default 5000)
+#   GATE_MAX_FAILOVER_RECOVERY_MS=N  all-group leader recovery ceiling (default 15000)
+#   GATE_MAX_FAILOVER_QUERY_P99_MS=N survivor query p99 ceiling (default 2000)
 set -u
 cd "$(dirname "$0")" || exit 2
 . ./cluster_gate_lib.sh
@@ -33,6 +36,9 @@ BENCH="$BUILD_DIR/bin/timestar_insert_bench"
 PORTS="19610 19611 19612"
 BATCHES="${GATE_BATCHES:-400}"
 PROBES="${GATE_PROBES:-50}"
+MAX_NODE_FAILURE_ERROR_BPS="${GATE_MAX_NODE_FAILURE_ERROR_BPS:-5000}"
+MAX_FAILOVER_RECOVERY_MS="${GATE_MAX_FAILOVER_RECOVERY_MS:-15000}"
+MAX_FAILOVER_QUERY_P99_MS="${GATE_MAX_FAILOVER_QUERY_P99_MS:-2000}"
 
 require_gate_space_gb 20 "node-kill round" || exit 2
 
@@ -45,7 +51,13 @@ start_node() {
         TIMESTAR_CLUSTER_REPLICATION_FACTOR=3 TIMESTAR_CLUSTER_UUID=00112233445566778899aabbccddeeff TIMESTAR_CLUSTER_DEVELOPMENT_ALLOW_INSECURE_TRANSPORT=true TIMESTAR_CLUSTER_NODE_ID=$1 TIMESTAR_CLUSTER_PEERS="$PEERS" \
         "$BIN" --port $((19609 + $1)) --smp 4 --memory "$GATE_SERVER_MEMORY" >>"$GATE_TMP_ROOT/tsgate_nk$1/s.log" 2>&1 &
 }
-trap 'gate_cleanup 1961 $GATE_TMP_ROOT/tsgate_nk1 $GATE_TMP_ROOT/tsgate_nk2 $GATE_TMP_ROOT/tsgate_nk3' EXIT
+cleanup() {
+    [ -n "${RECOVERY_PID:-}" ] && kill "$RECOVERY_PID" 2>/dev/null
+    gate_cleanup 1961 "$GATE_TMP_ROOT/tsgate_nk1" "$GATE_TMP_ROOT/tsgate_nk2" "$GATE_TMP_ROOT/tsgate_nk3"
+    rm -f "$GATE_TMP_ROOT/tsgate_nk_bench.txt" "$GATE_TMP_ROOT/tsgate_nk_recovery_ms" \
+        "$GATE_TMP_ROOT/tsgate_nk_query_ms"
+}
+trap cleanup EXIT
 
 for i in 1 2 3; do start_node $i; done
 wait_all_led "$PORTS" 4096 120 || gate_exit
@@ -75,6 +87,25 @@ if ! kill -0 "$BENCH_PID" 2>/dev/null; then
 fi
 pkill -u "$(id -u)" -9 -f -- "--port 19612"
 KILL_T=$(date +%s)
+KILL_MS=$(date +%s%3N)
+RECOVERY_FILE="$GATE_TMP_ROOT/tsgate_nk_recovery_ms"
+rm -f "$RECOVERY_FILE"
+# Poll concurrently with the outage probes. Waiting until the bench ends would
+# report only an upper bound and could miss a slow all-group election window.
+(
+    recovered=-1
+    for _ in $(seq 1 600); do
+        led1=$(status_field "$(cluster_status 19610)" vshards_led)
+        led2=$(status_field "$(cluster_status 19611)" vshards_led)
+        if [ "$(( ${led1:-0} + ${led2:-0} ))" -ge 4096 ]; then
+            recovered=$(( $(date +%s%3N) - KILL_MS ))
+            break
+        fi
+        sleep 0.1
+    done
+    echo "$recovered" >"$RECOVERY_FILE"
+) &
+RECOVERY_PID=$!
 echo "  node 3 killed at t+3s"
 
 # Probe writes DURING the outage, against a surviving node: these are the ones whose acks
@@ -91,10 +122,16 @@ for i in $(seq 0 $((PROBES - 1))); do
     esac
 done
 wait $BENCH_PID 2>/dev/null
+wait "$RECOVERY_PID" 2>/dev/null
 BENCH_END=$(date +%s)
 grep -E "Requests:|Throughput" $GATE_TMP_ROOT/tsgate_nk_bench.txt | sed 's/^/  /'
 OK_REQS=$(grep -oE '[0-9]+ OK' $GATE_TMP_ROOT/tsgate_nk_bench.txt | head -1 | cut -d' ' -f1)
 HTTP_ERRS=$(grep -o '[0-9]* HTTP errors' $GATE_TMP_ROOT/tsgate_nk_bench.txt | head -1 | cut -d' ' -f1)
+case "$HTTP_ERRS" in
+    ''|*[!0-9]*) gate_fail "node-kill bench did not produce a parseable HTTP-error count" ;;
+esac
+RECOVERY_MS=$(cat "$RECOVERY_FILE" 2>/dev/null || echo -1)
+FAILOVER_ERROR_BPS=$(( ${HTTP_ERRS:-0} * 10000 / BATCHES ))
 
 echo "  === D-14 BAND: ${HTTP_ERRS:-?} of $BATCHES bench batches failed (${OK_REQS:-?} OK) during a $((BENCH_END - KILL_T))s post-kill window ==="
 echo "  probe writes during the outage: $PROBE_OK/$PROBES acked, $PROBE_5XX 5xx"
@@ -109,6 +146,9 @@ grep -oE '\(last: [a-z-]+\)' $GATE_TMP_ROOT/tsgate_nk_bench.txt | sort | uniq -c
 assert_eq "server-side 500s" "$(cat $GATE_TMP_ROOT/tsgate_nk*/s.log | grep -c 'Error handling write request')" 0
 assert_eq "node crashes" "$(grep -l 'Segmentation fault' $GATE_TMP_ROOT/tsgate_nk*/s.log 2>/dev/null | wc -l)" 0
 assert_ge "batches accepted (anti-vacuity)" "${OK_REQS:-0}" "$((BATCHES / 4))"
+assert_le "node-failure write error band (basis points)" "$FAILOVER_ERROR_BPS" "$MAX_NODE_FAILURE_ERROR_BPS"
+assert_ge "all-group leader recovery measured" "$RECOVERY_MS" 0
+assert_le "all-group leader recovery (ms)" "$RECOVERY_MS" "$MAX_FAILOVER_RECOVERY_MS"
 
 # NO ACKNOWLEDGED LOSS: every probe write that was ACKED while the node was down must be
 # readable from both survivors.
@@ -159,5 +199,29 @@ print(int(t))')
     [ "${N:-0}" -gt "$PROBE_OK" ] &&
         echo "  (note) node at $p reads $N of $PROBES probes against $PROBE_OK acked: $((N - PROBE_OK)) ambiguous 503(s) committed after all"
 done
+
+QUERY_TIMES="$GATE_TMP_ROOT/tsgate_nk_query_ms"
+: >"$QUERY_TIMES"
+QUERY_BODY="{\"query\":\"count:nkprobe(v)\",\"startTime\":$((BASE_TS - 1000000000)),\"endTime\":$((BASE_TS + PROBES * 1000000000)),\"aggregationInterval\":\"1h\"}"
+for p in 19610 19611; do
+    for _ in $(seq 1 10); do
+        seconds=$(curl -fsS -m20 -o /dev/null -w '%{time_total}' \
+            -X POST "http://127.0.0.1:$p/query" -H 'Content-Type: application/json' \
+            -d "$QUERY_BODY") || { gate_fail "timed survivor query failed on $p"; continue; }
+        awk -v seconds="$seconds" 'BEGIN { printf "%.0f\n", seconds * 1000 }' >>"$QUERY_TIMES"
+    done
+done
+QUERY_SAMPLES=$(wc -l <"$QUERY_TIMES")
+QUERY_P99_MS=$(sort -n "$QUERY_TIMES" | tail -1)
+assert_eq "survivor query latency samples" "$QUERY_SAMPLES" 20
+assert_le "survivor query p99 (ms)" "${QUERY_P99_MS:-999999}" "$MAX_FAILOVER_QUERY_P99_MS"
+
+echo "GATE_METRIC node_failure_batches $BATCHES"
+echo "GATE_METRIC node_failure_probes $PROBES"
+echo "GATE_METRIC node_failure_http_errors ${HTTP_ERRS:-0}"
+echo "GATE_METRIC node_failure_error_bps $FAILOVER_ERROR_BPS"
+echo "GATE_METRIC node_failure_recovery_ms $RECOVERY_MS"
+echo "GATE_METRIC node_failure_query_p99_ms ${QUERY_P99_MS:-0}"
+echo "GATE_METRIC node_failure_query_samples $QUERY_SAMPLES"
 
 gate_exit

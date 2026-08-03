@@ -118,6 +118,7 @@
 #   GATE_MIN_TRANSFERS=N   anti-vacuity floor on transfers_initiated (default 800)
 #   GATE_MAX_STORM_5XX=N   ceiling on retryable 503s under the storm (default 100 of 500)
 #   GATE_MIN_DIP_PCT=N     throughput floor vs the control, percent (default 10)
+#   GATE_MAX_MOVEMENT_P99_MS=N movement batch-latency ceiling (default 5000)
 #   GATE_HOSTS=N           simulated hosts; the skew knob (default 4 => 40 series)
 #   GATE_KEEP_DATA=1       keep the data dirs (they are deleted on exit by default)
 #   exit 0 = pass, 1 = property failed, 2 = setup refused, 3 = VOID (control arm failed)
@@ -191,6 +192,7 @@ MAX_HOT_VSHARDS="${GATE_MAX_HOT_VSHARDS:-60}"
 # change in KIND; the ceiling only catches a change in ORDER OF MAGNITUDE.
 MAX_STORM_5XX="${GATE_MAX_STORM_5XX:-100}"
 MIN_DIP_PCT="${GATE_MIN_DIP_PCT:-10}"
+MAX_MOVEMENT_P99_MS="${GATE_MAX_MOVEMENT_P99_MS:-5000}"
 require_gate_space_gb 35 "skewed-rebalance gate" || exit 2
 
 kill_cluster 1924
@@ -335,17 +337,20 @@ assert_ge "leadership the joining node ended up with (fair share 1365)" "${LED3:
 HTTP_ERRS=$(grep -o '[0-9]* HTTP errors' $GATE_TMP_ROOT/tsgate_sk_bench.txt | head -1 | cut -d' ' -f1)
 CONN_FAILS=$(grep -o '[0-9]* connection failures' $GATE_TMP_ROOT/tsgate_sk_bench.txt | head -1 | cut -d' ' -f1)
 STORM_TPUT=$(grep -oE 'Throughput:[[:space:]]*[0-9.]+' $GATE_TMP_ROOT/tsgate_sk_bench.txt | head -1 | grep -oE '[0-9.]+')
-# LATENCY IS RECORDED AND DELIBERATELY NOT BOUNDED HERE, which is a stated gap rather than
-# an oversight. Measured p99 under the storm reaches 3460 ms against a control p99 of 88 ms
-# -- a 39x tail -- and a batch that exceeds the router's budget already surfaces as one of
-# the 503s bounded above, so a p99 bound would mostly re-assert the error ceiling. Bounding
-# the tail honestly needs its own calibration across more runs than four; until then the
-# numbers are printed so a drift is visible.
+# Movement latency is an explicit release SLO. The default ceiling is deliberately above
+# the measured 3460 ms worst draw (control p99 was 88 ms) while still rejecting an
+# unbounded tail. Production qualification should override it with the deployment target.
 # `sed` and not a second `grep -oE '[0-9.]+'`: the LABEL contains digits, so that pipeline
 # returns "99" from "p99" before the value and the variable ends up holding two lines.
 CTL_P99=$(grep -oE 'p99=[[:space:]]*[0-9.]+' $GATE_TMP_ROOT/tsgate_sk_control.txt | head -1 | sed 's/.*p99=[[:space:]]*//')
 STORM_P99=$(grep -oE 'p99=[[:space:]]*[0-9.]+' $GATE_TMP_ROOT/tsgate_sk_bench.txt | head -1 | sed 's/.*p99=[[:space:]]*//')
-echo "  batch latency p99: control ${CTL_P99:-?} ms -> storm ${STORM_P99:-?} ms (NOT bounded by this gate)"
+echo "  batch latency p99: control ${CTL_P99:-?} ms -> storm ${STORM_P99:-?} ms"
+if awk -v value="${STORM_P99:-}" -v limit="$MAX_MOVEMENT_P99_MS" \
+    'BEGIN { exit !(value ~ /^[0-9]+([.][0-9]+)?$/ && value + 0 <= limit + 0) }'; then
+    gate_ok "movement batch latency p99 = ${STORM_P99} ms (<= ${MAX_MOVEMENT_P99_MS})"
+else
+    gate_fail "movement batch latency p99 = ${STORM_P99:-<missing>} ms, expected <= ${MAX_MOVEMENT_P99_MS}"
+fi
 STORM_PCT=$(awk -v a="${STORM_TPUT:-0}" -v b="${CTL_TPUT:-0}" 'BEGIN{ if (b+0==0) print 0; else printf "%d", 100*a/b }')
 echo "  throughput under the storm: ${STORM_TPUT:-?} vs control ${CTL_TPUT:-?} (${STORM_PCT}%)"
 # THE CLIENT-ERROR BOUND IS A BAND, NOT A ZERO, AND THAT IS THIS GATE'S FINDING (D-18).
@@ -458,5 +463,11 @@ echo "GATE_METRIC control_tput ${CTL_TPUT:-0}"
 echo "GATE_METRIC storm_tput ${STORM_TPUT:-0}"
 echo "GATE_METRIC storm_pct ${STORM_PCT:-0}"
 echo "GATE_METRIC storm_http_errors ${HTTP_ERRS:-0}"
+echo "GATE_METRIC control_p99_ms ${CTL_P99:-0}"
+echo "GATE_METRIC movement_p99_ms ${STORM_P99:-0}"
+echo "GATE_METRIC movement_batches $BATCHES"
+echo "GATE_METRIC movement_batch_size $BATCH_SIZE"
+echo "GATE_METRIC movement_connections $CONNECTIONS"
+echo "GATE_METRIC movement_hosts $HOSTS"
 
 gate_exit

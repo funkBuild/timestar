@@ -9,6 +9,8 @@
 # durable state, responses, logs, and process temporaries live under build/tmp.
 #
 # Usage: restart_catchup_gate.sh [SERVER_BINARY]
+#   GATE_MAX_SNAPSHOT_INSTALL_MS=N  snapshot-install ceiling (default 360000)
+#   GATE_MAX_SNAPSHOT_CATCHUP_MS=N  exact-readback ceiling (default 750000)
 
 GATE_SERVER_MEMORY="${GATE_SERVER_MEMORY:-1G}"
 set -u
@@ -31,6 +33,8 @@ PREFIX_WRITES="${GATE_PREFIX_WRITES:-96}"
 SUFFIX_WRITES="${GATE_SUFFIX_WRITES:-8}"
 SNAP_ENTRIES="${GATE_SNAPSHOT_ENTRIES:-80}"
 WAL_THRESHOLD="${GATE_WAL_THRESHOLD:-4096}"
+MAX_SNAPSHOT_INSTALL_MS="${GATE_MAX_SNAPSHOT_INSTALL_MS:-360000}"
+MAX_SNAPSHOT_CATCHUP_MS="${GATE_MAX_SNAPSHOT_CATCHUP_MS:-750000}"
 declare -a NODE_PIDS
 
 mkdir -p "$ROOT"
@@ -204,17 +208,22 @@ CHUNKS_BEFORE_REJOIN=$(survivor_counter_sum snapshot_chunks_sent)
 ABANDONED_BEFORE_REJOIN=$(survivor_counter_sum snapshot_transfers_abandoned)
 
 echo "=== restart the empty node and require snapshot installation plus suffix catch-up ==="
+REJOIN_START_MS=$(date +%s%3N)
 start_node 3
 INSTALLED=0
+SNAPSHOT_INSTALL_MS=-1
 for _ in $(seq 1 180); do
     installed=$(status_field "$(cluster_status 19512)" snapshots_installed)
     if [ "${installed:-0}" -ge 1 ]; then
         INSTALLED=1
+        SNAPSHOT_INSTALL_MS=$(( $(date +%s%3N) - REJOIN_START_MS ))
         break
     fi
     sleep 2
 done
 assert_eq "empty node installed a transferred snapshot" "$INSTALLED" 1
+assert_ge "snapshot install time measured" "$SNAPSHOT_INSTALL_MS" 0
+assert_le "snapshot install time (ms)" "$SNAPSHOT_INSTALL_MS" "$MAX_SNAPSHOT_INSTALL_MS"
 
 # Returning from a completely empty root creates the maximum possible leader
 # deficit. The periodic balancer uses jittered, bounded passes and only targets
@@ -243,6 +252,7 @@ for _ in $(seq 1 12); do
     sleep 2
 done
 assert_eq "snapshot prefix plus retained suffix minus exact delete" "$COUNT" "$EXPECTED"
+SNAPSHOT_CATCHUP_MS=$(( $(date +%s%3N) - REJOIN_START_MS ))
 
 CHUNKS=$(survivor_counter_sum snapshot_chunks_sent)
 UNDELIVERABLE=$(survivor_counter_sum snapshots_undeliverable)
@@ -258,5 +268,12 @@ assert_eq "undeliverable snapshots" "$UNDELIVERABLE" 0
 assert_le "snapshot transfers abandoned after empty-node restart" "$ABANDONED_AFTER_REJOIN" 8
 assert_eq "server-side 500s" "$SERVER_500" 0
 assert_eq "node crashes" "$CRASHES" 0
+assert_le "snapshot catch-up and exact readback (ms)" "$SNAPSHOT_CATCHUP_MS" "$MAX_SNAPSHOT_CATCHUP_MS"
+
+echo "GATE_METRIC snapshot_install_ms $SNAPSHOT_INSTALL_MS"
+echo "GATE_METRIC snapshot_catchup_ms $SNAPSHOT_CATCHUP_MS"
+echo "GATE_METRIC snapshot_chunks_after_rejoin $CHUNKS_AFTER_REJOIN"
+echo "GATE_METRIC snapshot_prefix_writes $PREFIX_WRITES"
+echo "GATE_METRIC snapshot_suffix_writes $SUFFIX_WRITES"
 
 gate_exit

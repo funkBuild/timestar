@@ -318,8 +318,12 @@ evidence below.
   that actual filesystem for high-volume campaigns, and caps the expensive A/B
   comparison build at two jobs. This removes the former 24--40 GiB aggregate
   reservation and prevents multi-gigabyte datasets from consuming a `/tmp`
-  tmpfs as raw memory. The measurements themselves, especially distinct-host
-  deployment evidence, remain open.
+  tmpfs as raw memory. A serial exact-v1 SLO collector now reuses the
+  discriminating node-kill, bounded snapshot-catch-up, and skewed-movement gates
+  and binds their metrics, thresholds, commit, binary hash, resource settings,
+  and raw transcripts into one report. The measurements themselves, especially
+  distinct-host deployment evidence, remain open until that collector is run
+  against the final candidate with approved deployment thresholds.
 - [x] **Deliver and prove clustered backup/restore.** The existing filesystem
   copy guidance is now explicitly limited to standalone mode: it omitted
   persistent node identity, Group-0/control state, the committed serving map,
