@@ -64,12 +64,9 @@
 # same ceiling), and every admitted error must be proven HTTP 503 by the driver's complete
 # status histogram.
 #
-# WHAT THIS GATE ALONE CANNOT DO, said plainly: IT CAN PASS A BINARY WITHOUT THE 4a FIX.
-# At this sizing the A/B's reverted arm has drawn 7, 22 and **4** across runs, all inside
-# the durable availability ceiling. This is a smoke test for the pacing, not proof of it.
-# The discriminating claim is `fault_injection_ab.sh`'s WITHIN-RUN ratio plus its separate
-# seven-error floor, which compares the two binaries under the same environment without
-# confusing a production availability ceiling with a discrimination threshold.
+# WHAT THIS GATE ALONE CANNOT DO, said plainly: its bounded availability ceiling can pass a
+# binary without the 4a pacing fix. `fault_injection_ab.sh` owns the deterministic
+# counterfactual; this gate owns the end-to-end durable transport and data invariants.
 #
 # The two failure modes are separated rather than averaged:
 #

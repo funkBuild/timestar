@@ -13,7 +13,7 @@ not probes, so they can be run from CI or a release checklist.
 | `fault_injection_gate.sh` | a BURST of TCP connection resets between two live nodes costs latency, not client errors, and loses/duplicates nothing (write-scaleout 4c) |
 | `restart_catchup_gate.sh` | a follower whose entire durable root is removed while DOWN catches up through a non-empty chunked snapshot plus the retained suffix, then reads an exact delete correctly; it also bounds transfer abandonment, server RSS, and crashes (write-scaleout 5.4 / CR-FIX-011) |
 | `combined_fault_rebalance_gate.sh` | **(debt D-19)** TCP resets **and** a leadership rebalance **and** 4x the connections, all at once — the faults a single-fault gate cannot compose. It is `fault_injection_gate.sh` in combined mode, not a copy. Its finding: under the reset storm `transfers_initiated` collapses to ~0 because D-1's liveness filter refuses the peer behind the fault |
-| `fault_injection_ab.sh` | **(expensive, on-demand — not a CI gate)** that `fault_injection_gate.sh` DISCRIMINATES: builds the 4a-reverted binary and asserts it fails the same storm HEAD passes |
+| `fault_injection_ab.sh` | deterministic on-demand counterfactual: builds the exact two-anchor flat-pacing revert, proves it fails both reconnect invariants, and proves HEAD passes them |
 | `node_kill_round.sh` | `kill -9` of one node MID-BENCH: no 500s, no crashes, every ACKED write readable afterwards on both survivors — and it prints the one-node-down 503 band (debt D-14), which stays advisory |
 | `snapshot_durability_gate.sh` | TAKING SNAPSHOTS DOES NOT COST DURABILITY (debt D-6): a focused hot VShard is snapshotted on every replica, then every acked point is readable exactly once after the whole cluster is `kill -9`'d and restarted OVER COMPACTED JOURNALS |
 | `restart_readback_gate.sh` | AN ACKED WRITE IS READABLE AFTER A RESTART THAT FOLLOWS A HEAVY CAMPAIGN (debt D-36). It re-reads REPEATEDLY, which is the whole point: a single read cannot tell 25 lost points from 25 durable ones that apply() has not reached, and that ambiguity is what left D-36 undetermined for a session. A count that climbs is a stall; one that stays flat is loss. Reports `apply_lag_entries` / `apply_failures` / `tick_errors` while it waits |
@@ -389,7 +389,7 @@ exactly that). The cluster planes only ever dial `port+1000` / `port+2000`.
    destroying 266-276 connections per storm). They were 8/8 — about 5% of the earlier
    profile's observation, i.e.
    barely a vacuity check — until D-4, and 70/180 until the bench came down for K storms
-   (D-21; at 2000 batches a storm injects ~147 rounds, which is what the A/B still uses).
+   (D-21; the retired 2000-batch profile injected about 147 rounds).
    Half leaves room for a faster or slower box: the resetter fires on a fixed 0.3 s wall
    clock while the bench length is machine-dependent, so a machine that finishes the bench
    in half the time legitimately injects half the rounds. Override with
@@ -399,8 +399,7 @@ exactly that). The cluster planes only ever dial `port+1000` / `port+2000`.
    run total; otherwise a strong later storm can mask a vacuous earlier draw.
    Each storm is also capped at 70 rounds. An uncapped wall-clock resetter made a transiently
    slower arm inject 154 rounds, which created more failures and slowed it further; fault
-   intensity is now bounded independently of disk speed. The on-demand A/B explicitly
-   raises this cap because its purpose is to discriminate the retry schedule.
+   intensity is now bounded independently of disk speed.
 2. Node 3 must LEAD at least 800 VShards before every storm. The first node to start wins every election, and
    a converged-but-skewed cluster left node 3 leading 128 of 4096 — 3% of traffic crossing
    the fault. A sufficiently long reset can also wake those groups and move their
@@ -415,80 +414,23 @@ through the same proxy — not against an unproxied figure. The current private-
 control measured 171 kpts/s with zero errors; one fully reconditioned three-arm draw
 retained 86-91% with zero errors.
 
-**It is a discriminating gate, and `fault_injection_ab.sh` proves that on demand — it has
-now actually been run (debt D-19).** It creates a `git worktree` at HEAD, applies a
-two-anchor patch that undoes 4a's PACING and nothing else (`writeFailureRetryDelay` stops
-doubling for the Transport/Overloaded classes, and the coupling `static_assert` that makes
-exactly that a compile error is switched off — that assert *is* the fix's guarantee, so
-disabling it is the honest inverse), builds a comparison `timestar_http_server` in its own
-build dir beside the repo, runs the storm gate against both binaries in turn, and asserts a
-**within-run separation** plus the [D6] signature.
+`fault_injection_ab.sh` is now a deterministic counterfactual, not a second noisy capacity
+run. The former sequential A/B was invalidated by a measured reversed draw: the flat-pacing
+binary returned zero errors while HEAD returned six under nearly identical intensity
+(276 rounds/1,098 connections versus 280/1,111). Run order and host variance dominated the
+small error-count signal, so a ratio could still confidently choose the wrong binary.
 
-It used to `git checkout fcb2a94^` the three 4a files instead. That still produces exactly
-the intended 3-file diff — and then **does not compile**: later work needs
-`WriteFailure::LeaderRefused` and `ReplicatedBatchWriteRouter::kElectionDeadline`, which the
-pre-4a files do not define. The comparison binary that description implies had never
-existed. The patch is also *narrower* than the checkout was, which reached past 4a and
-dropped `d101c07`'s and `c052253`'s later fixes in those files.
+The replacement keeps the useful part: an isolated worktree at HEAD receives exactly two
+anchor edits—geometric Transport/Overloaded delay becomes the old flat 20 ms, and the
+compiler fence that deliberately forbids that schedule is disabled. It builds the focused
+unit target on disk and runs the same two invariants against both binaries. The reverted
+arm must fail the arithmetic check that a full retry schedule spans multiple reconnect
+windows and the behavioral check that a blip longer than one backoff is absorbed; HEAD
+must pass both. This counterfactual is stable and mechanism-specific. The production reset
+gate above remains the end-to-end durable-disk smoke test for typed 503 bounds, throughput,
+anti-vacuity, and exact readback.
 
-Measured, two runs at the A/B's own sizing (2000 batches, K=2):
-
-| draw | REVERTED | HEAD | separation | intensity ratio |
-|---|---|---|---|---|
-| 1 | `[3 10]` = 13, rc=1 | `[1 0]` = 1, rc=0 | 13x | 103% |
-| 2 | `[16 11]` = 27, rc=1 | `[3 0]` = 3, rc=0 | 9x | 102% |
-
-**The [D6] signature pins a CLASS both binaries can reach — it is not the discriminator.**
-Every reverted-arm failure carried `uncommitted after 6 attempt(s) (last: transport)`, the
-BASE attempt budget exhausted on the transport class. So did HEAD's: on one run's retained
-logs the reverted arm carried 6 of that exact string and **the HEAD arm carried 2**, at the
-same attempt count. HEAD reaches the transport class too, just far less often. The
-discrimination is the COUNT separation in the table above, which is the assertion that
-fails the script; the signature check is informational on both arms and prints both counts.
-
-**The A/B storms harder than the CI gate, deliberately.** The signal scales with reset
-ROUNDS. The current gate uses 1000 timed requests at 300 timestamps, a 70-round cap and K=3 so the private
-durable journals stay out of overload; the A/B pins the same request size but doubles the
-request count and uses K=2. The historical 1000-by-10000 A/B draws gave HEAD 0/4/2 against
-REVERTED 7/22/4: the first two separated and the third overlapped. Those figures explain
-the within-run ratio design, but they are not claimed as calibration for the new durable
-profile; rerun the on-demand A/B before changing its ratio or the production gate budget.
-Both arms always get the identical setting, and their observed intensity ratio is asserted.
-
-**Why the claim is a ratio and not a threshold.** Two absolute floors were tried and both
-were wrong: `3 * GATE_MAX_STORM_ERRORS` = 9 failed a correct REVERTED 7, and the absolute 5
-that replaced it then failed on HEAD's own noisy `[0 4 0]`. The two arms of one run share a
-box, a disk, a proxy and a storm within 3% of each other, so `REVERTED >= 3x HEAD` (floor 3)
-cancels exactly the variance the absolutes kept tripping over. HEAD's own budget and exit
-code are ADVISORY here — they are the gate's business, and an unlucky HEAD draw says nothing
-about whether the A/B discriminated.
-
-Two things to know before running it:
-
-- **It is expensive and it is NOT a CI gate.** A fresh comparison build dir builds
-  seastar too (tens of minutes); then it runs the full storm gate twice. Keep
-  `GATE_AB_BUILD_DIR` between runs to make the rebuild incremental. CI runs
-  `fault_injection_gate.sh`; this validates that gate, on demand.
-- **The revert reaches past 4a.** A hunk-level `git revert fcb2a94` conflicts — two later
-  commits (`d101c07`, `c052253`) touch the same lines — so the whole-file checkout also
-  drops those. That is why the script asserts the *signature* and not merely that errors
-  appeared: `last: transport` is specific to the retry-pacing defect.
-
-It never touches your working tree; the revert happens in the worktree.
-
-**Run it more than once before believing either answer (debt D-20, D-21).** The old tmpfs
-profile produced run totals **0, 1, 2, 0 and 4**, but the required private-journal profile
-later produced a valid `[16,20,0] = 36` draw: all failures were retryable 503s, every
-attempted probe was present on every replica, throughput retained 46%, and admission,
-500, and crash counts stayed zero. The former six-error ceiling was fitted to the wrong
-distribution. The durable ceiling is 60 across 3,000 timed requests (at most 2%; the 600
-probes share the same ceiling), and the benchmark's complete HTTP-status histogram must
-show that every allowed error is 503. The A/B's within-run ratio, not this availability
-ceiling, remains the discriminator for retry pacing.
-
-**Earlier result on the Phase-4 binary**, five runs at the old tmpfs sizing (1000 batches, K=3):
-**76-84 reset rounds destroying 217-243 peer connections per storm**, run totals of 0, 1, 2,
-0 and 4 client errors, **0 server-side 500s and 0 crashes throughout**, every acked probe
-point readable **on every node** in every storm, and 84-89% of the proxied baseline
-(5.06-5.29 M pts/s) retained. Those figures explain the retry-pacing history; the durable
-profile and typed-503 ceiling above are the current release contract.
+The comparison worktree/build may not live under `/tmp`, compilation defaults to two jobs,
+each focused test process is one reactor/1 GiB with a hard timeout, and the reusable build
+directory is retained while the patched worktree is removed. The old heavy A/B history is
+kept only in git; it is not release evidence.

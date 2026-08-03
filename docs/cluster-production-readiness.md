@@ -225,6 +225,14 @@ inventory and rules.
   reasserts at least 800 proxied leaders; a corrected diagnostic draw held 1,365
   before each arm and passed `[0,0,0]` with 86% worst retention. System `/tmp`
   remained at 105 MiB; gate data lived and cleaned under `build/tmp`.
+- [x] Replace the noisy retry-pacing A/B with a deterministic counterfactual.
+  The former sequential live comparison produced a reversed draw: the flat
+  20-ms pacing arm had zero errors while HEAD had six at matched reset
+  intensity. The replacement still builds the exact two-anchor revert in an
+  isolated disk-backed worktree, but runs the arithmetic reconnect-span and
+  wall-clock blip behavioral tests against both binaries. The reverted arm must
+  fail both and HEAD must pass both; the live gate above remains the end-to-end
+  availability and durability proof.
 - [x] Remove the VShard snapshot reactor-memory ceiling without adding another
   protocol version. Production snapshots now encode the exact existing `TSP1`
   v1 bytes directly from immutable Engine objects into owned sidecars, hydrate
@@ -388,8 +396,8 @@ integrity. Production remains blocked on the P1 evidence below.
   begins at the production 256-MiB-per-shard free-memory floor and therefore
   sheds every write. Every gate exports `GATE_TMP_ROOT`/`TMPDIR` to
   repository-local `build/tmp`, checks free space on that actual filesystem for
-  high-volume campaigns, and the expensive A/B comparison build is capped at
-  two jobs. This removes the former 24--40 GiB aggregate reservation and
+  high-volume campaigns, and the deterministic pacing-counterfactual build is
+  capped at two jobs. This removes the former 24--40 GiB aggregate reservation and
   prevents multi-gigabyte datasets from consuming a `/tmp` tmpfs as raw memory.
   A serial exact-v1 SLO collector now reuses the
   discriminating node-kill, bounded snapshot-catch-up, and skewed-movement gates
