@@ -53,8 +53,9 @@
 # the filter permissive would show up as a transfer count that suddenly is not zero.
 #
 # DISK. Each storm is a full bench and nothing is deleted between them (see the reset
-# gate's BENCH_BATCHES note): two storms plus the baseline is three benches, ~20 G of the
-# 62 G tmpfs. Do not raise GATE_STORM_ROUNDS here without doing that arithmetic.
+# gate's BENCH_BATCHES note): two storms plus the baseline is three benches, measured at
+# ~20 G. Do not raise GATE_STORM_ROUNDS here without doing that arithmetic or checking the
+# filesystem selected by GATE_TMP_ROOT.
 #
 # Usage: combined_fault_rebalance_gate.sh [SERVER_BINARY]
 #   exit 0 = pass, 1 = property failed, 2 = setup refused, 3 = VOID (re-draw)

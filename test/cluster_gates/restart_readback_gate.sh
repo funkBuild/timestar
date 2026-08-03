@@ -53,29 +53,25 @@ BATCHES="${GATE_BATCHES:-150}"
 READ_POLLS="${GATE_READ_POLLS:-24}"
 READ_INTERVAL="${GATE_READ_INTERVAL:-10}"
 
-FREE_GB=$(df -BG --output=avail /tmp | tail -1 | tr -dc '0-9')
-if [ "${FREE_GB:-0}" -lt 30 ]; then
-    echo "ABORT: only ${FREE_GB}G free on /tmp; this gate needs ~30G (see the plan doc's MEASUREMENT HAZARD)" >&2
-    exit 2
-fi
+require_gate_space_gb 30 "restart-readback gate" || exit 2
 
 # CLEAN UP ON EVERY EXIT, not just the happy one. This gate holds three RF=3 data dirs
-# of a 150x10k campaign -- tens of gigabytes of tmpfs -- and every `gate_exit` before the
+# of a 150x10k campaign -- tens of gigabytes -- and every `gate_exit` before the
 # end (a cluster that never converged, a failed wait) used to leave all of it behind. The
 # next gate then measures a box with no headroom, which is self-amplifying and reads
 # exactly like a regression (see the README's ONE AT A TIME section).
 cleanup() {
-    gate_cleanup 1973 /tmp/tsgate_rr1 /tmp/tsgate_rr2 /tmp/tsgate_rr3
-    rm -f /tmp/tsgate_rr_bench.txt
+    gate_cleanup 1973 $GATE_TMP_ROOT/tsgate_rr1 $GATE_TMP_ROOT/tsgate_rr2 $GATE_TMP_ROOT/tsgate_rr3
+    rm -f $GATE_TMP_ROOT/tsgate_rr_bench.txt
 }
 trap cleanup EXIT
 
 PEERS="127.0.0.1:19730,127.0.0.1:19731,127.0.0.1:19732"
 start_node() {
-    env $GATE_SERVER_ENV TIMESTAR_DATA_DIR="/tmp/tsgate_rr$1" TIMESTAR_CLUSTER_ENABLED=true TIMESTAR_CLUSTER_PARTITIONED=true \
+    env $GATE_SERVER_ENV TIMESTAR_DATA_DIR="$GATE_TMP_ROOT/tsgate_rr$1" TIMESTAR_CLUSTER_ENABLED=true TIMESTAR_CLUSTER_PARTITIONED=true \
         TIMESTAR_CLUSTER_REPLICATION_FACTOR=3 TIMESTAR_CLUSTER_UUID=00112233445566778899aabbccddeeff TIMESTAR_CLUSTER_DEVELOPMENT_ALLOW_INSECURE_TRANSPORT=true TIMESTAR_CLUSTER_NODE_ID=$1 TIMESTAR_CLUSTER_PEERS="$PEERS" \
         TIMESTAR_WAL_SIZE_THRESHOLD="${GATE_WAL_THRESHOLD:-2097152}" \
-        "$BIN" --port $((19729 + $1)) --smp 4 --memory "$GATE_SERVER_MEMORY" >>"/tmp/tsgate_rr$1/s.log" 2>&1 &
+        "$BIN" --port $((19729 + $1)) --smp 4 --memory "$GATE_SERVER_MEMORY" >>"$GATE_TMP_ROOT/tsgate_rr$1/s.log" 2>&1 &
 }
 
 # status_sum FIELD -- summed across the three nodes.
@@ -90,7 +86,7 @@ status_sum() {
 
 kill_cluster 1973
 require_ports_free $PORTS
-fresh_gate_data_dirs /tmp/tsgate_rr1 /tmp/tsgate_rr2 /tmp/tsgate_rr3 || exit 2
+fresh_gate_data_dirs $GATE_TMP_ROOT/tsgate_rr1 $GATE_TMP_ROOT/tsgate_rr2 $GATE_TMP_ROOT/tsgate_rr3 || exit 2
 
 echo "=== phase 1: bring up an RF=3 cluster and load it heavily ==="
 for i in 1 2 3; do start_node $i; done
@@ -98,8 +94,8 @@ wait_all_led "$PORTS" 4096 120 || gate_exit
 wait_leadership_settled "$PORTS" 40 || gate_exit
 
 "$BENCH" --server-port 19730 -c 4 --batches "$BATCHES" --batch-size 10000 --verify 0 \
-    --warmup 3 --connections 8 --hosts 500 --racks 2 >/tmp/tsgate_rr_bench.txt 2>&1
-grep -E "Requests:|Throughput" /tmp/tsgate_rr_bench.txt | sed 's/^/    /'
+    --warmup 3 --connections 8 --hosts 500 --racks 2 >$GATE_TMP_ROOT/tsgate_rr_bench.txt 2>&1
+grep -E "Requests:|Throughput" $GATE_TMP_ROOT/tsgate_rr_bench.txt | sed 's/^/    /'
 
 echo "=== phase 2: 200 acked probe writes ==="
 # One point per probe, distinct series AND distinct timestamp, each write awaited -- so
@@ -175,10 +171,10 @@ fi
 # WHY the applies failed, not just how many. Rate-limited at the source, so this is a
 # handful of lines even when the counter is in the tens of thousands.
 echo "  apply-failure reasons (rate-limited sample):"
-cat /tmp/tsgate_rr*/s.log | grep -o 'could not apply committed entry.*' | sed 's/^/    /' | sort | uniq -c | sort -rn | head -5
-SVR500=$(cat /tmp/tsgate_rr*/s.log | grep -c 'Error handling write request')
-CRASH=$(grep -l 'Segmentation fault' /tmp/tsgate_rr*/s.log 2>/dev/null | wc -l)
-BACKLOG=$(cat /tmp/tsgate_rr*/s.log | grep -ciE 'ingest backlog|backlogged')
+cat $GATE_TMP_ROOT/tsgate_rr*/s.log | grep -o 'could not apply committed entry.*' | sed 's/^/    /' | sort | uniq -c | sort -rn | head -5
+SVR500=$(cat $GATE_TMP_ROOT/tsgate_rr*/s.log | grep -c 'Error handling write request')
+CRASH=$(grep -l 'Segmentation fault' $GATE_TMP_ROOT/tsgate_rr*/s.log 2>/dev/null | wc -l)
+BACKLOG=$(cat $GATE_TMP_ROOT/tsgate_rr*/s.log | grep -ciE 'ingest backlog|backlogged')
 echo "  server 500s=$SVR500 crashes=$CRASH ingest_backlog_lines=$BACKLOG"
 
 # ANTI-VACUITY: without acked probes there is no promise to keep.

@@ -32,14 +32,14 @@ WRITES="${GATE_WRITES:-300}"
 
 kill_cluster 1931
 require_ports_free 19310 19311 19312 19313 19314
-fresh_gate_data_dirs /tmp/tsgate_dp1 /tmp/tsgate_dp2 /tmp/tsgate_dp3 /tmp/tsgate_dp4 /tmp/tsgate_dp5 || exit 2
+fresh_gate_data_dirs $GATE_TMP_ROOT/tsgate_dp1 $GATE_TMP_ROOT/tsgate_dp2 $GATE_TMP_ROOT/tsgate_dp3 $GATE_TMP_ROOT/tsgate_dp4 $GATE_TMP_ROOT/tsgate_dp5 || exit 2
 PEERS="127.0.0.1:19310,127.0.0.1:19311,127.0.0.1:19312,127.0.0.1:19313,127.0.0.1:19314"
 for i in 1 2 3 4 5; do
-    env $GATE_SERVER_ENV TIMESTAR_DATA_DIR="/tmp/tsgate_dp$i" TIMESTAR_CLUSTER_ENABLED=true TIMESTAR_CLUSTER_PARTITIONED=true \
+    env $GATE_SERVER_ENV TIMESTAR_DATA_DIR="$GATE_TMP_ROOT/tsgate_dp$i" TIMESTAR_CLUSTER_ENABLED=true TIMESTAR_CLUSTER_PARTITIONED=true \
         TIMESTAR_CLUSTER_REPLICATION_FACTOR=3 TIMESTAR_CLUSTER_UUID=00112233445566778899aabbccddeeff TIMESTAR_CLUSTER_DEVELOPMENT_ALLOW_INSECURE_TRANSPORT=true TIMESTAR_CLUSTER_NODE_ID=$i TIMESTAR_CLUSTER_PEERS="$PEERS" \
-        "$BIN" --port $((19309 + i)) --smp 2 --memory "$GATE_SERVER_MEMORY" >"/tmp/tsgate_dp$i/s.log" 2>&1 &
+        "$BIN" --port $((19309 + i)) --smp 2 --memory "$GATE_SERVER_MEMORY" >"$GATE_TMP_ROOT/tsgate_dp$i/s.log" 2>&1 &
 done
-trap 'gate_cleanup 1931 /tmp/tsgate_dp1 /tmp/tsgate_dp2 /tmp/tsgate_dp3 /tmp/tsgate_dp4 /tmp/tsgate_dp5' EXIT
+trap 'gate_cleanup 1931 $GATE_TMP_ROOT/tsgate_dp1 $GATE_TMP_ROOT/tsgate_dp2 $GATE_TMP_ROOT/tsgate_dp3 $GATE_TMP_ROOT/tsgate_dp4 $GATE_TMP_ROOT/tsgate_dp5' EXIT
 
 wait_all_led "$PORTS" 4096 150 || gate_exit
 
@@ -92,12 +92,12 @@ echo "=== $WRITES writes to node 1, against deposed primaries ==="
 BASE_TS=1700000000000000000
 OK=0; E5XX=0; OTHER=0
 for i in $(seq 0 $((WRITES - 1))); do
-    CODE=$(curl -s -m10 -o /tmp/tsgate_dp_resp.txt -w '%{http_code}' -X POST http://127.0.0.1:19310/write \
+    CODE=$(curl -s -m10 -o $GATE_TMP_ROOT/tsgate_dp_resp.txt -w '%{http_code}' -X POST http://127.0.0.1:19310/write \
         -H 'Content-Type: application/json' \
         -d "{\"measurement\":\"deposed\",\"tags\":{\"host\":\"h$i\"},\"fields\":{\"v\":1.0},\"timestamp\":$((BASE_TS + i * 1000000000))}")
     case "$CODE" in
         2*) OK=$((OK + 1)) ;;
-        5*) E5XX=$((E5XX + 1)); [ "$E5XX" = "1" ] && echo "  first 5xx ($CODE): $(head -c 200 /tmp/tsgate_dp_resp.txt)" ;;
+        5*) E5XX=$((E5XX + 1)); [ "$E5XX" = "1" ] && echo "  first 5xx ($CODE): $(head -c 200 $GATE_TMP_ROOT/tsgate_dp_resp.txt)" ;;
         *)  OTHER=$((OTHER + 1)) ;;
     esac
 done
@@ -108,7 +108,7 @@ echo "  result: $OK accepted, $E5XX 5xx, $OTHER other"
 # and the failure was mapped as an internal error. With the leader hint + bounded retry +
 # honest status mapping there must be ZERO 500s, and the residual failures must be a small
 # number of retryable 503s from VShards caught mid-transfer.
-assert_eq "server-side 500s" "$(cat /tmp/tsgate_dp*/s.log | grep -c 'Error handling write request')" 0
+assert_eq "server-side 500s" "$(cat $GATE_TMP_ROOT/tsgate_dp*/s.log | grep -c 'Error handling write request')" 0
 assert_eq "non-HTTP failures" "$OTHER" 0
 # ADVISORY: the 5xx here are retryable 503s from VShards caught mid-transfer by the storm,
 # and their count tracks that churn rather than anything Phase 3 owns. Measured 274-300 of
@@ -117,7 +117,7 @@ echo "  (advisory) $OK/$WRITES accepted, $E5XX retryable 5xx -- see the balancer
 if [ "$E5XX" -gt 0 ]; then
     echo "  (advisory) first 5xx must be a 503 naming a retryable condition, never an opaque 500"
 fi
-assert_eq "node crashes" "$(grep -l 'Segmentation fault' /tmp/tsgate_dp*/s.log 2>/dev/null | wc -l)" 0
+assert_eq "node crashes" "$(grep -l 'Segmentation fault' $GATE_TMP_ROOT/tsgate_dp*/s.log 2>/dev/null | wc -l)" 0
 
 # === READS (debt D-13) ==============================================================
 # This is a FIVE-node RF=3 cluster, so every coordinator hosts a STRICT SUBSET of the

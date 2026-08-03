@@ -7,11 +7,12 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 BIN="${1:-$ROOT/build/test/timestar_test}"
-WORK="$ROOT/build/tmp/large_snapshot_streaming_gate"
+GATE_TMP_ROOT="${GATE_TMP_ROOT:-$ROOT/build/tmp}"
+WORK="$GATE_TMP_ROOT/large_snapshot_streaming_gate"
 
 [ -x "$BIN" ] || { echo "no test binary at $BIN" >&2; exit 2; }
 case "$WORK" in
-    "$ROOT"/build/tmp/large_snapshot_streaming_gate) ;;
+    "$GATE_TMP_ROOT"/large_snapshot_streaming_gate) ;;
     *) echo "unsafe gate workspace: $WORK" >&2; exit 2 ;;
 esac
 rm -rf "$WORK"

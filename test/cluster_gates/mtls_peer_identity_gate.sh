@@ -16,7 +16,7 @@ command -v openssl >/dev/null || { echo "openssl is required"; exit 2; }
 PORTS="19920 19921 19922"
 PREFIX=1992
 PEERS="127.0.0.11:19920,127.0.0.12:19921,127.0.0.13:19922"
-ROOT="$BUILD_DIR/tmp/tsgate_ti"
+ROOT="$GATE_TMP_ROOT/tsgate_ti"
 CERTS="$ROOT/certs"
 PIDS=("" "" "" "")
 

@@ -72,6 +72,7 @@
 #                             assignment. Kept between runs so the second A/B is
 #                             incremental; delete it by hand to reclaim ~10 G.
 #   GATE_AB_WORKTREE=<dir>    comparison worktree; default ../tsdb-ab-worktree
+#   GATE_BUILD_JOBS=<n>       comparison-build concurrency; default 2
 #   GATE_AB_KEEP=1            leave the worktree in place afterwards
 set -u
 cd "$(dirname "$0")" || exit 2
@@ -99,14 +100,17 @@ GATE="$(pwd)/fault_injection_gate.sh"
 export GATE_BENCH_BATCHES="${GATE_BENCH_BATCHES:-2000}"
 export GATE_STORM_ROUNDS="${GATE_STORM_ROUNDS:-2}"
 # NEITHER OF THESE MAY LIVE ON /tmp, and that is a hard requirement rather than a
-# preference. /tmp here is a tmpfs with a per-user quota, and the storm gate needs every
-# gigabyte of it for its data dirs; a comparison worktree (~1 G with seastar) plus a full
-# build tree (~10 G) inside the same quota is precisely the self-amplifying disk failure
-# the README describes -- and it would be spent on build output, which is not what the
-# quota is for. They default beside the repo instead, on real disk, so the build tree also
-# SURVIVES between runs and the second A/B is incremental.
+# preference. On hosts where /tmp is tmpfs, a comparison worktree (~1 G with seastar)
+# plus a full build tree (~10 G) consumes raw memory before either storm arm starts.
+# Gate data now defaults to repository-local disk for the same reason. These larger,
+# reusable trees default beside the repo so the build also SURVIVES between runs and the
+# second A/B is incremental.
 AB_WORKTREE="${GATE_AB_WORKTREE:-$(dirname "$REPO")/tsdb-ab-worktree}"
 AB_BUILD="${GATE_AB_BUILD_DIR:-$(dirname "$REPO")/tsdb-ab-build}"
+GATE_BUILD_JOBS="${GATE_BUILD_JOBS:-2}"
+case "$GATE_BUILD_JOBS" in
+    ''|*[!0-9]*|0) echo "ABORT: GATE_BUILD_JOBS must be a positive integer" >&2; exit 2 ;;
+esac
 
 # The two files the pacing patch touches, named once. See the header for why this is a
 # patch and not a `git checkout` of the pre-4a versions.
@@ -140,12 +144,7 @@ PY
 # THREE benches against one cluster, whose measured peak is ~34 G -- so a 30 G floor
 # admitted a run that could not fit, and 34 G is the exact point at which the K=3 sizing was
 # killed for filling the tmpfs. The floor must exceed the peak, not approach it.
-FREE_G=$(df -BG --output=avail /tmp | tail -1 | tr -dc '0-9')
-if [ "${FREE_G:-0}" -lt 40 ]; then
-    echo "ABORT: only ${FREE_G}G free on /tmp; this A/B peaks at ~34G per arm and needs >= 40G"
-    echo "       (the gate alone needs 30G; see test/cluster_gates/README.md)"
-    exit 2
-fi
+require_gate_space_gb 40 "fault-injection A/B" || exit 2
 
 # THE TWO ARMS MUST DIFFER ONLY BY THE REVERT. The reverted arm is built from a clean
 # worktree at HEAD; the HEAD arm is whatever `$BUILD_DIR/bin/timestar_http_server`
@@ -246,11 +245,11 @@ if [ ! -e "$AB_WORKTREE/external/seastar/CMakeLists.txt" ]; then
 fi
 
 mkdir -p "$AB_BUILD"
-( cd "$AB_BUILD" && cmake "$AB_WORKTREE" >/tmp/tsgate_ab_cmake.log 2>&1 ) || {
-    echo "ABORT: cmake failed; see /tmp/tsgate_ab_cmake.log"; tail -20 /tmp/tsgate_ab_cmake.log; exit 2; }
+( cd "$AB_BUILD" && cmake "$AB_WORKTREE" >"$GATE_TMP_ROOT/tsgate_ab_cmake.log" 2>&1 ) || {
+    echo "ABORT: cmake failed; see $GATE_TMP_ROOT/tsgate_ab_cmake.log"; tail -20 "$GATE_TMP_ROOT/tsgate_ab_cmake.log"; exit 2; }
 echo "  compiling (this is the slow part; first run builds seastar too)"
-( cd "$AB_BUILD" && make timestar_http_server -j"$(nproc)" >/tmp/tsgate_ab_build.log 2>&1 ) || {
-    echo "ABORT: build failed; see /tmp/tsgate_ab_build.log"; tail -30 /tmp/tsgate_ab_build.log; exit 2; }
+( cd "$AB_BUILD" && make timestar_http_server -j"$GATE_BUILD_JOBS" >"$GATE_TMP_ROOT/tsgate_ab_build.log" 2>&1 ) || {
+    echo "ABORT: build failed; see $GATE_TMP_ROOT/tsgate_ab_build.log"; tail -30 "$GATE_TMP_ROOT/tsgate_ab_build.log"; exit 2; }
 AB_BIN="$AB_BUILD/bin/timestar_http_server"
 [ -x "$AB_BIN" ] || { echo "ABORT: no binary at $AB_BIN"; exit 2; }
 echo "  comparison binary: $AB_BIN"
@@ -278,24 +277,27 @@ run_gate() { # $1 = binary, $2 = log file  -- returns the gate's exit code
     return $rc
 }
 
+REVERTED_LOG="$GATE_TMP_ROOT/tsgate_ab_reverted.log"
+HEAD_LOG="$GATE_TMP_ROOT/tsgate_ab_head.log"
+
 # ONE AT A TIME, sequentially, each with the fresh dirs the gate makes for itself. Running
 # them concurrently would have them fight over ports, data dirs and disk -- and the disk
 # part is what the README's self-amplifying failure is about.
-run_gate "$AB_BIN" /tmp/tsgate_ab_reverted.log
+run_gate "$AB_BIN" "$REVERTED_LOG"
 REVERTED_RC=$?
-run_gate "$BUILD_DIR/bin/timestar_http_server" /tmp/tsgate_ab_head.log
+run_gate "$BUILD_DIR/bin/timestar_http_server" "$HEAD_LOG"
 HEAD_RC=$?
 
 # ---------------------------------------------------------------------------
 # The error counter is now an AGGREGATE over the gate's K storms (debt D-21); the gate
 # prints the per-storm vector next to it, which is what to read when the two arms are
 # closer than expected.
-R_ROUNDS=$(gate_number /tmp/tsgate_ab_reverted.log reset_rounds_total)
-R_CONNS=$(gate_number /tmp/tsgate_ab_reverted.log reset_conns_total)
-R_TOTAL=$(gate_number /tmp/tsgate_ab_reverted.log storm_errors_total)
-H_ROUNDS=$(gate_number /tmp/tsgate_ab_head.log reset_rounds_total)
-H_CONNS=$(gate_number /tmp/tsgate_ab_head.log reset_conns_total)
-H_TOTAL=$(gate_number /tmp/tsgate_ab_head.log storm_errors_total)
+R_ROUNDS=$(gate_number "$REVERTED_LOG" reset_rounds_total)
+R_CONNS=$(gate_number "$REVERTED_LOG" reset_conns_total)
+R_TOTAL=$(gate_number "$REVERTED_LOG" storm_errors_total)
+H_ROUNDS=$(gate_number "$HEAD_LOG" reset_rounds_total)
+H_CONNS=$(gate_number "$HEAD_LOG" reset_conns_total)
+H_TOTAL=$(gate_number "$HEAD_LOG" storm_errors_total)
 # A metric that did not parse is a HARNESS failure, and it must not be allowed to reach
 # the separation assertions as a default -- that is exactly how the old scrape produced an
 # unmeasured "pass". Fail here, where the message names the cause.
@@ -307,8 +309,8 @@ done
 echo "=== A/B result ==="
 echo "  reverted: ${R_ROUNDS:-?} rounds / ${R_CONNS:-?} conns -> ${R_TOTAL:-?} client errors (gate rc=$REVERTED_RC)"
 echo "  HEAD:     ${H_ROUNDS:-?} rounds / ${H_CONNS:-?} conns -> ${H_TOTAL:-?} client errors (gate rc=$HEAD_RC)"
-grep -h "storms: errors\[" /tmp/tsgate_ab_reverted.log | sed 's/^/    reverted /'
-grep -h "storms: errors\[" /tmp/tsgate_ab_head.log | sed 's/^/    HEAD     /'
+grep -h "storms: errors\[" "$REVERTED_LOG" | sed 's/^/    reverted /'
+grep -h "storms: errors\[" "$HEAD_LOG" | sed 's/^/    HEAD     /'
 
 # A VOID run (exit 3) is neither arm's answer: the gate's own fault-free control failed, so
 # the storm that followed measured the environment. Re-draw rather than reporting an A/B
@@ -317,7 +319,7 @@ grep -h "storms: errors\[" /tmp/tsgate_ab_head.log | sed 's/^/    HEAD     /'
 if [ "$REVERTED_RC" -eq 3 ] || [ "$HEAD_RC" -eq 3 ]; then
     echo "ABORT (VOID): the $([ "$REVERTED_RC" -eq 3 ] && echo REVERTED || echo HEAD) arm voided --"
     echo "  its fault-free baseline through the proxy failed, so neither arm's storm is"
-    echo "  comparable. Re-run; check /tmp free space first (see the gate README)."
+    echo "  comparable. Re-run; check $GATE_TMP_ROOT free space first (see the gate README)."
     exit 3
 fi
 
@@ -421,15 +423,15 @@ fi
 # patch is not exercising the pacing at all, and both counts side by side make the
 # "same class, different rate" shape visible instead of implied.
 D6_SIGNATURE='uncommitted after [0-9]+ attempt\(s\) \(last: transport\)'
-R_SIG=$(grep -cE "$D6_SIGNATURE" /tmp/tsgate_ab_reverted.log)
-H_SIG=$(grep -cE "$D6_SIGNATURE" /tmp/tsgate_ab_head.log)
+R_SIG=$(grep -cE "$D6_SIGNATURE" "$REVERTED_LOG")
+H_SIG=$(grep -cE "$D6_SIGNATURE" "$HEAD_LOG")
 echo "  [D6] class ([last: transport] give-ups logged): REVERTED $R_SIG, HEAD $H_SIG"
 if [ "$R_SIG" -gt 0 ]; then
     gate_ok "REVERTED binary: failures carry the [D6] class (informational; HEAD carries it $H_SIG time(s) too)"
 else
     gate_fail "REVERTED binary failed, but NOT with the [D6] class -- the patch may not be \
 exercising the retry pacing at all. First error line: \
-$(grep -m1 'First error' /tmp/tsgate_ab_reverted.log)"
+$(grep -m1 'First error' "$REVERTED_LOG")"
 fi
 # Also advisory, and for the same reason as the budget above: the HEAD arm's exit code is
 # just its budget check restated, so asserting it here would re-import the absolute
@@ -443,5 +445,5 @@ else
     gate_ok "the reverted binary failed the gate, as it must"
 fi
 
-echo "  full logs: /tmp/tsgate_ab_reverted.log /tmp/tsgate_ab_head.log"
+echo "  full logs: $REVERTED_LOG $HEAD_LOG"
 gate_exit

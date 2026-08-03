@@ -7,7 +7,18 @@
 # inline pattern matches the invoking shell's own argv and kills it mid-command.
 
 BUILD_DIR="${BUILD_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../build" && pwd)}"
+GATE_TMP_ROOT="${GATE_TMP_ROOT:-$BUILD_DIR/tmp}"
 GATE_FAILURES=0
+
+# Keep every implicit temporary created by the server, build tools, Python, or
+# the shell off a potentially memory-backed /tmp.  A caller may select another
+# root, but it must be provisioned before a high-volume campaign.
+if ! mkdir -p -- "$GATE_TMP_ROOT"; then
+    echo "ABORT: could not create gate scratch root: $GATE_TMP_ROOT" >&2
+    exit 2
+fi
+GATE_TMP_ROOT="$(cd "$GATE_TMP_ROOT" && pwd -P)"
+export GATE_TMP_ROOT TMPDIR="$GATE_TMP_ROOT"
 
 # EXTRA SERVER ENVIRONMENT, applied by every gate to every node it starts.
 #
@@ -31,7 +42,7 @@ GATE_SERVER_ENV="${GATE_SERVER_ENV:-}"
 # otherwise healthy nodes can collectively overcommit the machine and kill the
 # harness during catch-up/compaction. Keep the default aggregate bounded and
 # reproducible; a capacity run may override this in its invocation.
-GATE_SERVER_MEMORY="${GATE_SERVER_MEMORY:-8G}"
+GATE_SERVER_MEMORY="${GATE_SERVER_MEMORY:-1G}"
 
 gate_fail() {
     echo "  GATE FAILURE: $*" >&2
@@ -52,6 +63,22 @@ assert_le() {
     if [ "${2:-999999999}" -le "$3" ] 2>/dev/null; then gate_ok "$1 = $2 (<= $3)"; else gate_fail "$1 = ${2:-<empty>}, expected <= $3"; fi
 }
 
+# require_gate_space_gb MIN LABEL -- verify the filesystem actually used by
+# gate data, rather than assuming /tmp and GATE_TMP_ROOT are the same mount.
+require_gate_space_gb() {
+    local need="$1" label="$2" free
+    free=$(df -BG --output=avail "$GATE_TMP_ROOT" 2>/dev/null | tail -1 | tr -dc '0-9')
+    if [ -z "$free" ]; then
+        echo "ABORT: could not determine free space at $GATE_TMP_ROOT for $label" >&2
+        return 2
+    fi
+    if [ "$free" -lt "$need" ]; then
+        echo "ABORT: only ${free}G free at $GATE_TMP_ROOT; $label needs >= ${need}G" >&2
+        return 2
+    fi
+    echo "  scratch preflight: ${free}G free at $GATE_TMP_ROOT (need >= ${need}G)"
+}
+
 gate_exit() {
     if [ "$GATE_FAILURES" -gt 0 ]; then
         echo "GATE FAILED ($GATE_FAILURES assertion(s))"
@@ -62,10 +89,11 @@ gate_exit() {
 }
 
 # remove_gate_data_dirs DIR... -- remove only this harness's narrowly-named
-# roots under /tmp or build/tmp, retrying races and proving they are gone before
-# returning. New low-volume correctness gates prefer build/tmp so they do not
-# consume the host's quota-limited tmpfs; historical load gates retain /tmp so
-# their recorded I/O shape stays comparable.
+# roots under the configured repository-local gate root, retrying races and
+# proving they are gone before returning. Keeping high-volume load campaigns out
+# of /tmp is mandatory: on hosts where /tmp is tmpfs, writing a large gate dataset
+# consumes raw memory and can kill the server or harness rather than exercise the
+# intended fault. Override GATE_TMP_ROOT only with an explicitly provisioned disk.
 #
 # A plain `rm -rf; mkdir -p` is not a reset unless removal actually succeeded.
 # snapshot_durability_gate exposed this with "Directory not empty" and then
@@ -76,8 +104,7 @@ remove_gate_data_dirs() {
     local d suffix pass remaining
     for d in "$@"; do
         case "$d" in
-            /tmp/tsgate_*) suffix="${d#/tmp/tsgate_}" ;;
-            "$BUILD_DIR"/tmp/tsgate_*) suffix="${d#"$BUILD_DIR"/tmp/tsgate_}" ;;
+            "$GATE_TMP_ROOT"/tsgate_*) suffix="${d#"$GATE_TMP_ROOT"/tsgate_}" ;;
             *) suffix="" ;;
         esac
         if [ -z "$suffix" ] || [[ "$suffix" == */* ]]; then
@@ -144,13 +171,12 @@ kill_cluster() { # $1 = port prefix used by this gate, e.g. 492
 
 # gate_cleanup PREFIX DATADIR... -- kill this gate's cluster AND RECLAIM ITS DISK.
 #
-# THE rm IS THE POINT, and it is not tidiness. These gates run on a tmpfs /tmp with a
-# per-user QUOTA, and a gate that leaves 3-10 G of data dirs behind does not merely waste
-# space: the next gate's bench slows down, the 0.3 s resetter fires more rounds, it slows
-# further, and the run fails as a plausible-looking "regression" (the README's
-# self-amplifying failure). Left unattended it exhausts the quota outright, at which point
-# "Disk quota exceeded" reaches every process on the box -- including the shell driving
-# the gate, which is how one session lost its whole harness mid-run.
+# THE rm IS THE POINT, and it is not tidiness. Before the repository-local scratch policy,
+# these gates used a quota-limited /tmp tmpfs. A gate that leaves 3-10 G of data dirs behind
+# still does not merely waste space: the next gate's bench slows down, the 0.3 s resetter
+# fires more rounds, it slows further, and the run fails as a plausible-looking
+# "regression" (the README's self-amplifying failure). Left unattended, any configured
+# scratch filesystem can still fill and make every process on the box fail writes.
 #
 # Only `restart_readback_gate.sh` did this before; every other gate leaked its dirs.
 #
@@ -164,11 +190,11 @@ gate_cleanup() {
         echo "  GATE_KEEP_DATA=1: leaving $* in place ($(du -shc "$@" 2>/dev/null | tail -1 | cut -f1))"
         return
     fi
-    # Keep even diagnostic output off the quota-limited /tmp tmpfs. The tails
+    # Keep even diagnostic output under the configured scratch root. The tails
     # are small, but a correctness harness should have one storage policy for
     # all of its own artifacts.
-    mkdir -p "$BUILD_DIR/tmp"
-    local tails="$BUILD_DIR/tmp/tsgate_${prefix}_tails.log" d f
+    mkdir -p "$GATE_TMP_ROOT"
+    local tails="$GATE_TMP_ROOT/tsgate_${prefix}_tails.log" d f
     : >"$tails"
     for d in "$@"; do
         [ -d "$d" ] || continue

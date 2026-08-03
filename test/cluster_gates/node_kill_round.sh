@@ -34,22 +34,18 @@ PORTS="19610 19611 19612"
 BATCHES="${GATE_BATCHES:-400}"
 PROBES="${GATE_PROBES:-50}"
 
-FREE_GB=$(df -BG --output=avail /tmp | tail -1 | tr -dc '0-9')
-if [ "${FREE_GB:-0}" -lt 20 ]; then
-    echo "ABORT: only ${FREE_GB}G free on /tmp; this round needs ~20G (see the plan doc's MEASUREMENT HAZARD)" >&2
-    exit 2
-fi
+require_gate_space_gb 20 "node-kill round" || exit 2
 
 kill_cluster 1961
 require_ports_free $PORTS
-fresh_gate_data_dirs /tmp/tsgate_nk1 /tmp/tsgate_nk2 /tmp/tsgate_nk3 || exit 2
+fresh_gate_data_dirs $GATE_TMP_ROOT/tsgate_nk1 $GATE_TMP_ROOT/tsgate_nk2 $GATE_TMP_ROOT/tsgate_nk3 || exit 2
 PEERS="127.0.0.1:19610,127.0.0.1:19611,127.0.0.1:19612"
 start_node() {
-    env $GATE_SERVER_ENV TIMESTAR_DATA_DIR="/tmp/tsgate_nk$1" TIMESTAR_CLUSTER_ENABLED=true TIMESTAR_CLUSTER_PARTITIONED=true \
+    env $GATE_SERVER_ENV TIMESTAR_DATA_DIR="$GATE_TMP_ROOT/tsgate_nk$1" TIMESTAR_CLUSTER_ENABLED=true TIMESTAR_CLUSTER_PARTITIONED=true \
         TIMESTAR_CLUSTER_REPLICATION_FACTOR=3 TIMESTAR_CLUSTER_UUID=00112233445566778899aabbccddeeff TIMESTAR_CLUSTER_DEVELOPMENT_ALLOW_INSECURE_TRANSPORT=true TIMESTAR_CLUSTER_NODE_ID=$1 TIMESTAR_CLUSTER_PEERS="$PEERS" \
-        "$BIN" --port $((19609 + $1)) --smp 4 --memory "$GATE_SERVER_MEMORY" >>"/tmp/tsgate_nk$1/s.log" 2>&1 &
+        "$BIN" --port $((19609 + $1)) --smp 4 --memory "$GATE_SERVER_MEMORY" >>"$GATE_TMP_ROOT/tsgate_nk$1/s.log" 2>&1 &
 }
-trap 'gate_cleanup 1961 /tmp/tsgate_nk1 /tmp/tsgate_nk2 /tmp/tsgate_nk3' EXIT
+trap 'gate_cleanup 1961 $GATE_TMP_ROOT/tsgate_nk1 $GATE_TMP_ROOT/tsgate_nk2 $GATE_TMP_ROOT/tsgate_nk3' EXIT
 
 for i in 1 2 3; do start_node $i; done
 wait_all_led "$PORTS" 4096 120 || gate_exit
@@ -68,7 +64,7 @@ assert_ge "leadership on the node about to be killed (anti-vacuity)" "${LED3:-0}
 
 echo "=== bench $BATCHES x 10k against node 1; kill -9 node 3 at t+3s ==="
 "$BENCH" --server-port 19610 -c 4 --batches "$BATCHES" --batch-size 10000 --verify 0 \
-    --warmup 5 --connections 8 --hosts 1000 --racks 2 >/tmp/tsgate_nk_bench.txt 2>&1 &
+    --warmup 5 --connections 8 --hosts 1000 --racks 2 >$GATE_TMP_ROOT/tsgate_nk_bench.txt 2>&1 &
 BENCH_PID=$!
 sleep 3
 # The bench must still be running when the kill lands, or the round measures a healthy
@@ -96,9 +92,9 @@ for i in $(seq 0 $((PROBES - 1))); do
 done
 wait $BENCH_PID 2>/dev/null
 BENCH_END=$(date +%s)
-grep -E "Requests:|Throughput" /tmp/tsgate_nk_bench.txt | sed 's/^/  /'
-OK_REQS=$(grep -oE '[0-9]+ OK' /tmp/tsgate_nk_bench.txt | head -1 | cut -d' ' -f1)
-HTTP_ERRS=$(grep -o '[0-9]* HTTP errors' /tmp/tsgate_nk_bench.txt | head -1 | cut -d' ' -f1)
+grep -E "Requests:|Throughput" $GATE_TMP_ROOT/tsgate_nk_bench.txt | sed 's/^/  /'
+OK_REQS=$(grep -oE '[0-9]+ OK' $GATE_TMP_ROOT/tsgate_nk_bench.txt | head -1 | cut -d' ' -f1)
+HTTP_ERRS=$(grep -o '[0-9]* HTTP errors' $GATE_TMP_ROOT/tsgate_nk_bench.txt | head -1 | cut -d' ' -f1)
 
 echo "  === D-14 BAND: ${HTTP_ERRS:-?} of $BATCHES bench batches failed (${OK_REQS:-?} OK) during a $((BENCH_END - KILL_T))s post-kill window ==="
 echo "  probe writes during the outage: $PROBE_OK/$PROBES acked, $PROBE_5XX 5xx"
@@ -107,11 +103,11 @@ echo "  probe writes during the outage: $PROBE_OK/$PROBES acked, $PROBE_5XX 5xx"
 # not just eyeballed. The bench prints only its FIRST error, so this is the kinds it saw at
 # all rather than a full histogram.
 echo "  failure kinds seen by the bench:"
-grep -oE '\(last: [a-z-]+\)' /tmp/tsgate_nk_bench.txt | sort | uniq -c | sed 's/^/    /'
+grep -oE '\(last: [a-z-]+\)' $GATE_TMP_ROOT/tsgate_nk_bench.txt | sort | uniq -c | sed 's/^/    /'
 
 # The contract, hard-asserted.
-assert_eq "server-side 500s" "$(cat /tmp/tsgate_nk*/s.log | grep -c 'Error handling write request')" 0
-assert_eq "node crashes" "$(grep -l 'Segmentation fault' /tmp/tsgate_nk*/s.log 2>/dev/null | wc -l)" 0
+assert_eq "server-side 500s" "$(cat $GATE_TMP_ROOT/tsgate_nk*/s.log | grep -c 'Error handling write request')" 0
+assert_eq "node crashes" "$(grep -l 'Segmentation fault' $GATE_TMP_ROOT/tsgate_nk*/s.log 2>/dev/null | wc -l)" 0
 assert_ge "batches accepted (anti-vacuity)" "${OK_REQS:-0}" "$((BATCHES / 4))"
 
 # NO ACKNOWLEDGED LOSS: every probe write that was ACKED while the node was down must be

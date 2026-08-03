@@ -26,11 +26,11 @@ SOCKET="$BUILD_DIR/test/timestar_cluster_socket_test"
 
 PORT=19890
 PREFIX=1989
-ROOT="$BUILD_DIR/tmp/tsgate_v1_reject"
-WORK="$BUILD_DIR/tmp/tsgate_v1_work"
+ROOT="$GATE_TMP_ROOT/tsgate_v1_reject"
+WORK="$GATE_TMP_ROOT/tsgate_v1_work"
 TEST_TMP="$WORK/test_tmp"
 LOG="$WORK/server.log"
-TAILS="$BUILD_DIR/tmp/tsgate_${PREFIX}_tails.log"
+TAILS="$GATE_TMP_ROOT/tsgate_${PREFIX}_tails.log"
 SERVER_PID=""
 
 stop_server() {
@@ -54,7 +54,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-mkdir -p "$BUILD_DIR/tmp"
+mkdir -p "$GATE_TMP_ROOT"
 kill_cluster "$PREFIX"
 require_ports_free "$PORT"
 fresh_gate_data_dirs "$ROOT" "$WORK" || exit 2

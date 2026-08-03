@@ -29,15 +29,15 @@ PORTS="19210 19211 19212"
 
 kill_cluster 1921
 require_ports_free 19210 19211 19212
-fresh_gate_data_dirs /tmp/tsgate_bp1 /tmp/tsgate_bp2 /tmp/tsgate_bp3 || exit 2
+fresh_gate_data_dirs $GATE_TMP_ROOT/tsgate_bp1 $GATE_TMP_ROOT/tsgate_bp2 $GATE_TMP_ROOT/tsgate_bp3 || exit 2
 PEERS="127.0.0.1:19210,127.0.0.1:19211,127.0.0.1:19212"
 for i in 1 2 3; do
-    env $GATE_SERVER_ENV TIMESTAR_CLUSTER_WRITE_INFLIGHT_BYTES="$LIMIT" TIMESTAR_DATA_DIR="/tmp/tsgate_bp$i" \
+    env $GATE_SERVER_ENV TIMESTAR_CLUSTER_WRITE_INFLIGHT_BYTES="$LIMIT" TIMESTAR_DATA_DIR="$GATE_TMP_ROOT/tsgate_bp$i" \
         TIMESTAR_CLUSTER_ENABLED=true TIMESTAR_CLUSTER_PARTITIONED=true \
         TIMESTAR_CLUSTER_REPLICATION_FACTOR=3 TIMESTAR_CLUSTER_UUID=00112233445566778899aabbccddeeff TIMESTAR_CLUSTER_DEVELOPMENT_ALLOW_INSECURE_TRANSPORT=true TIMESTAR_CLUSTER_NODE_ID=$i TIMESTAR_CLUSTER_PEERS="$PEERS" \
-        "$BIN" --port $((19209 + i)) --smp 4 --memory "$GATE_SERVER_MEMORY" >"/tmp/tsgate_bp$i/s.log" 2>&1 &
+        "$BIN" --port $((19209 + i)) --smp 4 --memory "$GATE_SERVER_MEMORY" >"$GATE_TMP_ROOT/tsgate_bp$i/s.log" 2>&1 &
 done
-trap 'gate_cleanup 1921 /tmp/tsgate_bp1 /tmp/tsgate_bp2 /tmp/tsgate_bp3' EXIT
+trap 'gate_cleanup 1921 $GATE_TMP_ROOT/tsgate_bp1 $GATE_TMP_ROOT/tsgate_bp2 $GATE_TMP_ROOT/tsgate_bp3' EXIT
 
 wait_balanced "$PORTS" 4096 3 90 || gate_exit
 wait_healthy "$PORTS" 60 || gate_exit
@@ -45,7 +45,7 @@ wait_healthy "$PORTS" 60 || gate_exit
 # The effective budget must be LOGGED at startup -- a mis-set value has to be visible in
 # the boot log rather than inferred from a wall of 503s.
 assert_ge "startup log names the in-flight budget" \
-    "$(cat /tmp/tsgate_bp*/s.log | grep -c "cluster write in-flight budget: $LIMIT")" 1
+    "$(cat $GATE_TMP_ROOT/tsgate_bp*/s.log | grep -c "cluster write in-flight budget: $LIMIT")" 1
 
 run_bench() { # $1 = connections, $2 = batches, $3 = persistent transcript
     timeout 300 "$BENCH" --server-port 19210 -c 4 --batches "$2" --batch-size 10000 --verify 0 \
@@ -78,26 +78,26 @@ echo "=== A0: header shape of a rejection (deterministic, no bench) ==="
 # (`roaring_bitmap_add` dereferencing a failed allocation, right after seastar's
 # memory-pressure dump) -- a pre-existing defect in the INDEX path, unrelated to write
 # routing, and not what this gate tests.
-python3 - >/tmp/tsgate_bp_probe.json <<'PY'
+python3 - >$GATE_TMP_ROOT/tsgate_bp_probe.json <<'PY'
 import json
 w = [{"measurement": "bpp", "tags": {"host": "h0"}, "fields": {"v": float(i)},
       "timestamp": 1700000000000000000 + i * 1000000} for i in range(20000)]
 print(json.dumps({"writes": w}))
 PY
-rm -f /tmp/tsgate_bp_h_*.txt
-seq 1 16 | xargs -P 16 -I{} curl -s -m60 -o /dev/null -D "/tmp/tsgate_bp_h_{}.txt" \
+rm -f $GATE_TMP_ROOT/tsgate_bp_h_*.txt
+seq 1 16 | xargs -P 16 -I{} curl -s -m60 -o /dev/null -D "$GATE_TMP_ROOT/tsgate_bp_h_{}.txt" \
     -X POST http://127.0.0.1:19210/write -H 'Content-Type: application/json' \
-    --data-binary @/tmp/tsgate_bp_probe.json >/dev/null 2>&1
-rm -f /tmp/tsgate_bp_probe.json
-echo "  probe statuses: $(grep -h '^HTTP/1.1' /tmp/tsgate_bp_h_*.txt 2>/dev/null | tr -d '\r' | sort | uniq -c | tr '\n' ' ')"
-N503=$(grep -l ' 503 ' /tmp/tsgate_bp_h_*.txt 2>/dev/null | wc -l)
-NRETRY=$(grep -il '^retry-after:' /tmp/tsgate_bp_h_*.txt 2>/dev/null | wc -l)
-N500=$(grep -l ' 500 ' /tmp/tsgate_bp_h_*.txt 2>/dev/null | wc -l)
+    --data-binary @$GATE_TMP_ROOT/tsgate_bp_probe.json >/dev/null 2>&1
+rm -f $GATE_TMP_ROOT/tsgate_bp_probe.json
+echo "  probe statuses: $(grep -h '^HTTP/1.1' $GATE_TMP_ROOT/tsgate_bp_h_*.txt 2>/dev/null | tr -d '\r' | sort | uniq -c | tr '\n' ' ')"
+N503=$(grep -l ' 503 ' $GATE_TMP_ROOT/tsgate_bp_h_*.txt 2>/dev/null | wc -l)
+NRETRY=$(grep -il '^retry-after:' $GATE_TMP_ROOT/tsgate_bp_h_*.txt 2>/dev/null | wc -l)
+N500=$(grep -l ' 500 ' $GATE_TMP_ROOT/tsgate_bp_h_*.txt 2>/dev/null | wc -l)
 echo "  $N503 x 503, $NRETRY carrying Retry-After, $N500 x 500"
 assert_ge "503 responses when concurrent batches exceed the bound" "$N503" 1
 assert_eq "503s WITHOUT Retry-After" "$((N503 - NRETRY))" 0
 assert_eq "500 responses in the probe" "$N500" 0
-rm -f /tmp/tsgate_bp_h_*.txt
+rm -f $GATE_TMP_ROOT/tsgate_bp_h_*.txt
 
 # The large concurrent probes can leave a short node-local apply tail even when
 # every HTTP request was refused/ambiguous. The benchmark has its own /health
@@ -106,23 +106,23 @@ rm -f /tmp/tsgate_bp_h_*.txt
 wait_healthy "$PORTS" 60 || gate_exit
 
 echo "=== A: 12 connections against a $LIMIT-byte/shard budget (must PUSH BACK) ==="
-run_bench 12 200 /tmp/tsgate_bp_overload_bench.txt
+run_bench 12 200 $GATE_TMP_ROOT/tsgate_bp_overload_bench.txt
 A_RC=$BENCH_RC
-A=$(</tmp/tsgate_bp_overload_bench.txt)
+A=$(<$GATE_TMP_ROOT/tsgate_bp_overload_bench.txt)
 grep -E "Requests:|First error|Throughput" <<<"$A"
 assert_eq "overload benchmark completed" "$A_RC" 0
 assert_ge "batches rejected under overload" "$(errs_of "$A")" 1
 assert_ge "server-side 'shard write buffer full' rejections" \
-    "$(cat /tmp/tsgate_bp*/s.log | grep -c 'shard write buffer full')" 1
+    "$(cat $GATE_TMP_ROOT/tsgate_bp*/s.log | grep -c 'shard write buffer full')" 1
 assert_eq "server-side 500s under overload" \
-    "$(cat /tmp/tsgate_bp*/s.log | grep -c 'Error handling write request')" 0
+    "$(cat $GATE_TMP_ROOT/tsgate_bp*/s.log | grep -c 'Error handling write request')" 0
 
 echo "=== C: a single write still succeeds at the tiny budget ==="
 CODE=$(curl -s -m10 -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:19210/write \
     -H 'Content-Type: application/json' \
     -d '{"measurement":"bp2","tags":{"host":"x"},"fields":{"v":1.5},"timestamp":1700000900000000000}')
 assert_eq "single write status" "$CODE" 200
-assert_eq "node crashes under overload" "$(grep -l 'Segmentation fault' /tmp/tsgate_bp*/s.log 2>/dev/null | wc -l)" 0
+assert_eq "node crashes under overload" "$(grep -l 'Segmentation fault' $GATE_TMP_ROOT/tsgate_bp*/s.log 2>/dev/null | wc -l)" 0
 
 echo "=== B: SAME cluster restarted at the DEFAULT budget (must run clean) ==="
 # Recovery is measured at the default budget on a fresh start, not by lowering the load on
@@ -133,27 +133,27 @@ echo "=== B: SAME cluster restarted at the DEFAULT budget (must run clean) ==="
 # is that the DEFAULT budget never gets in the way, which is what this measures.
 kill_cluster 1921
 require_ports_free 19210 19211 19212
-fresh_gate_data_dirs /tmp/tsgate_bp1 /tmp/tsgate_bp2 /tmp/tsgate_bp3 || exit 2
+fresh_gate_data_dirs $GATE_TMP_ROOT/tsgate_bp1 $GATE_TMP_ROOT/tsgate_bp2 $GATE_TMP_ROOT/tsgate_bp3 || exit 2
 for i in 1 2 3; do
-    env $GATE_SERVER_ENV TIMESTAR_DATA_DIR="/tmp/tsgate_bp$i" \
+    env $GATE_SERVER_ENV TIMESTAR_DATA_DIR="$GATE_TMP_ROOT/tsgate_bp$i" \
         TIMESTAR_CLUSTER_ENABLED=true TIMESTAR_CLUSTER_PARTITIONED=true \
         TIMESTAR_CLUSTER_REPLICATION_FACTOR=3 TIMESTAR_CLUSTER_UUID=00112233445566778899aabbccddeeff TIMESTAR_CLUSTER_DEVELOPMENT_ALLOW_INSECURE_TRANSPORT=true TIMESTAR_CLUSTER_NODE_ID=$i TIMESTAR_CLUSTER_PEERS="$PEERS" \
-        "$BIN" --port $((19209 + i)) --smp 4 --memory "$GATE_SERVER_MEMORY" >"/tmp/tsgate_bp$i/s.log" 2>&1 &
+        "$BIN" --port $((19209 + i)) --smp 4 --memory "$GATE_SERVER_MEMORY" >"$GATE_TMP_ROOT/tsgate_bp$i/s.log" 2>&1 &
 done
 wait_balanced "$PORTS" 4096 3 90 || gate_exit
 wait_healthy "$PORTS" 60 || gate_exit
 assert_ge "startup log names the DEFAULT budget" \
-    "$(cat /tmp/tsgate_bp*/s.log | grep -c 'in-flight budget: 33554432 bytes/shard (default)')" 1
-run_bench 8 200 /tmp/tsgate_bp_default_bench.txt
+    "$(cat $GATE_TMP_ROOT/tsgate_bp*/s.log | grep -c 'in-flight budget: 33554432 bytes/shard (default)')" 1
+run_bench 8 200 $GATE_TMP_ROOT/tsgate_bp_default_bench.txt
 B_RC=$BENCH_RC
-B=$(</tmp/tsgate_bp_default_bench.txt)
+B=$(<$GATE_TMP_ROOT/tsgate_bp_default_bench.txt)
 grep -E "Requests:|First error|Throughput" <<<"$B"
 assert_eq "default-budget benchmark completed" "$B_RC" 0
 assert_eq "client HTTP errors at the default budget" "$(errs_of "$B")" 0
 assert_ge "batches accepted at the default budget" "$(oks_of "$B")" 200
 assert_eq "server-side rejections at the default budget" \
-    "$(cat /tmp/tsgate_bp*/s.log | grep -c 'shard write buffer full')" 0
+    "$(cat $GATE_TMP_ROOT/tsgate_bp*/s.log | grep -c 'shard write buffer full')" 0
 assert_eq "node crashes at the default budget" \
-    "$(grep -l 'Segmentation fault' /tmp/tsgate_bp*/s.log 2>/dev/null | wc -l)" 0
+    "$(grep -l 'Segmentation fault' $GATE_TMP_ROOT/tsgate_bp*/s.log 2>/dev/null | wc -l)" 0
 
 gate_exit

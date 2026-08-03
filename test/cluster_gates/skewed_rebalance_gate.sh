@@ -191,17 +191,18 @@ MAX_HOT_VSHARDS="${GATE_MAX_HOT_VSHARDS:-60}"
 # change in KIND; the ceiling only catches a change in ORDER OF MAGNITUDE.
 MAX_STORM_5XX="${GATE_MAX_STORM_5XX:-100}"
 MIN_DIP_PCT="${GATE_MIN_DIP_PCT:-10}"
+require_gate_space_gb 35 "skewed-rebalance gate" || exit 2
 
 kill_cluster 1924
 require_ports_free 19240 19241 19242
-fresh_gate_data_dirs /tmp/tsgate_sk1 /tmp/tsgate_sk2 /tmp/tsgate_sk3 || exit 2
+fresh_gate_data_dirs $GATE_TMP_ROOT/tsgate_sk1 $GATE_TMP_ROOT/tsgate_sk2 $GATE_TMP_ROOT/tsgate_sk3 || exit 2
 PEERS="127.0.0.1:19240,127.0.0.1:19241,127.0.0.1:19242"
 start_node() {
-    env $GATE_SERVER_ENV TIMESTAR_DATA_DIR="/tmp/tsgate_sk$1" TIMESTAR_CLUSTER_ENABLED=true TIMESTAR_CLUSTER_PARTITIONED=true \
+    env $GATE_SERVER_ENV TIMESTAR_DATA_DIR="$GATE_TMP_ROOT/tsgate_sk$1" TIMESTAR_CLUSTER_ENABLED=true TIMESTAR_CLUSTER_PARTITIONED=true \
         TIMESTAR_CLUSTER_REPLICATION_FACTOR=3 TIMESTAR_CLUSTER_UUID=00112233445566778899aabbccddeeff TIMESTAR_CLUSTER_DEVELOPMENT_ALLOW_INSECURE_TRANSPORT=true TIMESTAR_CLUSTER_NODE_ID=$1 TIMESTAR_CLUSTER_PEERS="$PEERS" \
-        "$BIN" --port $((19239 + $1)) --smp 4 --memory "$GATE_SERVER_MEMORY" >>"/tmp/tsgate_sk$1/s.log" 2>&1 &
+        "$BIN" --port $((19239 + $1)) --smp 4 --memory "$GATE_SERVER_MEMORY" >>"$GATE_TMP_ROOT/tsgate_sk$1/s.log" 2>&1 &
 }
-trap 'gate_cleanup 1924 /tmp/tsgate_sk1 /tmp/tsgate_sk2 /tmp/tsgate_sk3; rm -f /tmp/tsgate_sk_bench.txt /tmp/tsgate_sk_control.txt /tmp/tsgate_sk_resp.txt /tmp/tsgate_sk_transfers' EXIT
+trap 'gate_cleanup 1924 $GATE_TMP_ROOT/tsgate_sk1 $GATE_TMP_ROOT/tsgate_sk2 $GATE_TMP_ROOT/tsgate_sk3; rm -f $GATE_TMP_ROOT/tsgate_sk_bench.txt $GATE_TMP_ROOT/tsgate_sk_control.txt $GATE_TMP_ROOT/tsgate_sk_resp.txt $GATE_TMP_ROOT/tsgate_sk_transfers' EXIT
 
 # Two-node phase: a 2-of-3 quorum elects leaders for every VShard between nodes 1 and 2, so
 # node 3 joins with nothing and every rebalance call has real work to do. (Storming an
@@ -234,10 +235,10 @@ gate_void() {
 }
 echo "=== control: the same skewed load with NO rebalance ($HOSTS hosts x 1 rack x 10 fields) ==="
 timeout 300 "$BENCH" --server-port 19240 -c 4 --batches "$BATCHES" --batch-size "$BATCH_SIZE" --verify 0 \
-    --warmup 5 --connections "$CONNECTIONS" --hosts "$HOSTS" --racks 1 >/tmp/tsgate_sk_control.txt 2>&1
-grep -E "Requests:|First error|Throughput|batch latency" /tmp/tsgate_sk_control.txt
-CTL_ERRS=$(grep -o '[0-9]* HTTP errors' /tmp/tsgate_sk_control.txt | head -1 | cut -d' ' -f1)
-CTL_TPUT=$(grep -oE 'Throughput:[[:space:]]*[0-9.]+' /tmp/tsgate_sk_control.txt | head -1 | grep -oE '[0-9.]+')
+    --warmup 5 --connections "$CONNECTIONS" --hosts "$HOSTS" --racks 1 >$GATE_TMP_ROOT/tsgate_sk_control.txt 2>&1
+grep -E "Requests:|First error|Throughput|batch latency" $GATE_TMP_ROOT/tsgate_sk_control.txt
+CTL_ERRS=$(grep -o '[0-9]* HTTP errors' $GATE_TMP_ROOT/tsgate_sk_control.txt | head -1 | cut -d' ' -f1)
+CTL_TPUT=$(grep -oE 'Throughput:[[:space:]]*[0-9.]+' $GATE_TMP_ROOT/tsgate_sk_control.txt | head -1 | grep -oE '[0-9.]+')
 [ "${CTL_ERRS:-missing}" = "0" ] ||
     gate_void "the rebalance-free control took ${CTL_ERRS:-<unparseable>} client errors -- the skewed load is saturating its ${HOSTS}x10 groups on this box, so the storm arm would measure that. Lower GATE_CONNECTIONS or GATE_BATCH_SIZE."
 [ -n "${CTL_TPUT:-}" ] || gate_void "could not parse a throughput from the control run"
@@ -247,14 +248,14 @@ gate_ok "control clean under the skew: $CTL_TPUT pts/s, 0 client errors"
 echo "=== rebalance storm under the SAME skewed load ==="
 BASE_TS=1760000000000000000
 ( timeout 300 "$BENCH" --server-port 19240 -c 4 --batches "$BATCHES" --batch-size "$BATCH_SIZE" --verify 0 \
-    --warmup 5 --connections "$CONNECTIONS" --hosts "$HOSTS" --racks 1 >/tmp/tsgate_sk_bench.txt 2>&1 ) &
+    --warmup 5 --connections "$CONNECTIONS" --hosts "$HOSTS" --racks 1 >$GATE_TMP_ROOT/tsgate_sk_bench.txt 2>&1 ) &
 BENCHPID=$!
 sleep 2
 
 # The storm runs in its own subshell so the probe below can run against it concurrently:
 # the point of this gate is a write meeting a group that is BOTH mid-append and
 # mid-transfer, which needs all three things live at once.
-rm -f /tmp/tsgate_sk_transfers
+rm -f $GATE_TMP_ROOT/tsgate_sk_transfers
 ( T=0; C=0
   while kill -0 $BENCHPID 2>/dev/null; do
       for p in $PORTS; do
@@ -264,7 +265,7 @@ rm -f /tmp/tsgate_sk_transfers
       done
       sleep 0.2
   done
-  echo "$T $C" >/tmp/tsgate_sk_transfers ) &
+  echo "$T $C" >$GATE_TMP_ROOT/tsgate_sk_transfers ) &
 STORMPID=$!
 
 # THE PROBE GOES INTO A HOT GROUP, and that is the whole reason it names the bench's own
@@ -277,13 +278,13 @@ STORMPID=$!
 PROBE_OK=0; PROBE_5XX=0; PROBE_OTHER=0
 i=0
 while [ "$i" -lt "$PROBE" ]; do
-    CODE=$(curl -s -m10 -o /tmp/tsgate_sk_resp.txt -w '%{http_code}' -X POST http://127.0.0.1:19240/write \
+    CODE=$(curl -s -m10 -o $GATE_TMP_ROOT/tsgate_sk_resp.txt -w '%{http_code}' -X POST http://127.0.0.1:19240/write \
         -H 'Content-Type: application/json' \
         -d "{\"measurement\":\"server.metrics\",\"tags\":{\"host\":\"host-01\",\"rack\":\"rack-1\"},\"fields\":{\"cpu_usage\":1.0},\"timestamp\":$((BASE_TS + i * 1000000000))}")
     case "$CODE" in
         2*) PROBE_OK=$((PROBE_OK + 1)) ;;
         5*) PROBE_5XX=$((PROBE_5XX + 1))
-            [ "$PROBE_5XX" = "1" ] && echo "  first probe 5xx ($CODE): $(head -c 200 /tmp/tsgate_sk_resp.txt)" ;;
+            [ "$PROBE_5XX" = "1" ] && echo "  first probe 5xx ($CODE): $(head -c 200 $GATE_TMP_ROOT/tsgate_sk_resp.txt)" ;;
         *)  PROBE_OTHER=$((PROBE_OTHER + 1)) ;;
     esac
     i=$((i + 1))
@@ -294,11 +295,11 @@ wait $STORMPID
 # obscure unbound-variable abort three lines later -- the floor below will report 0
 # transfers, which is the honest result.
 TRANSFERS=0; CALLS=0
-[ -s /tmp/tsgate_sk_transfers ] && read -r TRANSFERS CALLS </tmp/tsgate_sk_transfers
+[ -s $GATE_TMP_ROOT/tsgate_sk_transfers ] && read -r TRANSFERS CALLS <$GATE_TMP_ROOT/tsgate_sk_transfers
 
 echo "  rebalance calls: $CALLS, transfers initiated: $TRANSFERS"
 echo "  probe writes into the hot group: $PROBE_OK ok, $PROBE_5XX 5xx, $PROBE_OTHER other (of $PROBE)"
-grep -E "Requests:|First error|Throughput|batch latency" /tmp/tsgate_sk_bench.txt
+grep -E "Requests:|First error|Throughput|batch latency" $GATE_TMP_ROOT/tsgate_sk_bench.txt
 LED1=$(status_field "$(cluster_status 19240)" vshards_led)
 LED2=$(status_field "$(cluster_status 19241)" vshards_led)
 LED3=$(status_field "$(cluster_status 19242)" vshards_led)
@@ -308,7 +309,7 @@ echo "  final led=[$LED1 $LED2 $LED3] (fair share 1365)"
 # HOW SKEWED WAS IT, PER VSHARD. Measured, not assumed -- see the header. Each VShard keeps
 # its own Raft journal directory, so a group's traffic is its directory's size.
 HOT=0; TOTAL_VS=0
-JROOT=/tmp/tsgate_sk1/cluster_raft
+JROOT=$GATE_TMP_ROOT/tsgate_sk1/cluster_raft
 if [ -d "$JROOT" ] && [ -d "$JROOT/vshard_0" ]; then
     TOTAL_VS=$(find "$JROOT" -maxdepth 1 -name 'vshard_*' -type d | wc -l)
     HOT=$(du -sk "$JROOT"/vshard_* 2>/dev/null | awk -v t="$HOT_KB" '$1 > t' | wc -l)
@@ -331,9 +332,9 @@ fi
 assert_ge "leadership transfers initiated mid-bench" "$TRANSFERS" "$MIN_TRANSFERS"
 assert_ge "leadership the joining node ended up with (fair share 1365)" "${LED3:-0}" "$MIN_JOINER_LED"
 
-HTTP_ERRS=$(grep -o '[0-9]* HTTP errors' /tmp/tsgate_sk_bench.txt | head -1 | cut -d' ' -f1)
-CONN_FAILS=$(grep -o '[0-9]* connection failures' /tmp/tsgate_sk_bench.txt | head -1 | cut -d' ' -f1)
-STORM_TPUT=$(grep -oE 'Throughput:[[:space:]]*[0-9.]+' /tmp/tsgate_sk_bench.txt | head -1 | grep -oE '[0-9.]+')
+HTTP_ERRS=$(grep -o '[0-9]* HTTP errors' $GATE_TMP_ROOT/tsgate_sk_bench.txt | head -1 | cut -d' ' -f1)
+CONN_FAILS=$(grep -o '[0-9]* connection failures' $GATE_TMP_ROOT/tsgate_sk_bench.txt | head -1 | cut -d' ' -f1)
+STORM_TPUT=$(grep -oE 'Throughput:[[:space:]]*[0-9.]+' $GATE_TMP_ROOT/tsgate_sk_bench.txt | head -1 | grep -oE '[0-9.]+')
 # LATENCY IS RECORDED AND DELIBERATELY NOT BOUNDED HERE, which is a stated gap rather than
 # an oversight. Measured p99 under the storm reaches 3460 ms against a control p99 of 88 ms
 # -- a 39x tail -- and a batch that exceeds the router's budget already surfaces as one of
@@ -342,8 +343,8 @@ STORM_TPUT=$(grep -oE 'Throughput:[[:space:]]*[0-9.]+' /tmp/tsgate_sk_bench.txt 
 # numbers are printed so a drift is visible.
 # `sed` and not a second `grep -oE '[0-9.]+'`: the LABEL contains digits, so that pipeline
 # returns "99" from "p99" before the value and the variable ends up holding two lines.
-CTL_P99=$(grep -oE 'p99=[[:space:]]*[0-9.]+' /tmp/tsgate_sk_control.txt | head -1 | sed 's/.*p99=[[:space:]]*//')
-STORM_P99=$(grep -oE 'p99=[[:space:]]*[0-9.]+' /tmp/tsgate_sk_bench.txt | head -1 | sed 's/.*p99=[[:space:]]*//')
+CTL_P99=$(grep -oE 'p99=[[:space:]]*[0-9.]+' $GATE_TMP_ROOT/tsgate_sk_control.txt | head -1 | sed 's/.*p99=[[:space:]]*//')
+STORM_P99=$(grep -oE 'p99=[[:space:]]*[0-9.]+' $GATE_TMP_ROOT/tsgate_sk_bench.txt | head -1 | sed 's/.*p99=[[:space:]]*//')
 echo "  batch latency p99: control ${CTL_P99:-?} ms -> storm ${STORM_P99:-?} ms (NOT bounded by this gate)"
 STORM_PCT=$(awk -v a="${STORM_TPUT:-0}" -v b="${CTL_TPUT:-0}" 'BEGIN{ if (b+0==0) print 0; else printf "%d", 100*a/b }')
 echo "  throughput under the storm: ${STORM_TPUT:-?} vs control ${CTL_TPUT:-?} (${STORM_PCT}%)"
@@ -376,12 +377,12 @@ assert_le "client HTTP errors (retryable 503s under the storm)" "${HTTP_ERRS:-99
 # returns two matches from a single `grep -m1` line and the variable ends up holding
 # "transport\ntransport". That got as far as a run, where the `case` below matched neither
 # alternative and failed the gate with a truncated message.
-ERR_CLASS=$(grep -m1 -oE '\(last: [a-z-]+\)' /tmp/tsgate_sk_bench.txt | head -1 | tr -d '()' | cut -d' ' -f2)
-ERR_ATTEMPTS=$(grep -m1 -oE 'after [0-9]+ attempt\(s\)' /tmp/tsgate_sk_bench.txt | head -1 | grep -oE '[0-9]+')
+ERR_CLASS=$(grep -m1 -oE '\(last: [a-z-]+\)' $GATE_TMP_ROOT/tsgate_sk_bench.txt | head -1 | tr -d '()' | cut -d' ' -f2)
+ERR_ATTEMPTS=$(grep -m1 -oE 'after [0-9]+ attempt\(s\)' $GATE_TMP_ROOT/tsgate_sk_bench.txt | head -1 | grep -oE '[0-9]+')
 # The refusal line carries a RUNNING COUNT ("N such refusals so far") and is not emitted on
 # every refusal, so counting LINES undercounts badly -- one line was logged against 13
 # client errors. Take the largest counter any node reported instead.
-REFUSALS=$(cat /tmp/tsgate_sk*/s.log 2>/dev/null | grep -oE '\(([0-9]+) such refusals so far\)' |
+REFUSALS=$(cat $GATE_TMP_ROOT/tsgate_sk*/s.log 2>/dev/null | grep -oE '\(([0-9]+) such refusals so far\)' |
     grep -oE '[0-9]+' | sort -rn | head -1)
 REFUSALS="${REFUSALS:-0}"
 echo "  failure class: ${ERR_CLASS:-<none, no client errors>} after ${ERR_ATTEMPTS:-0} attempts;"
@@ -416,8 +417,8 @@ assert_eq "client connection failures" "${CONN_FAILS:-missing}" 0
 # costs an order of magnitude of throughput and that is the workload, not the storm.
 assert_ge "throughput retained vs the rebalance-free control (%)" "${STORM_PCT:-0}" "$MIN_DIP_PCT"
 assert_eq "probe non-HTTP failures" "$PROBE_OTHER" 0
-assert_eq "server-side 500s" "$(cat /tmp/tsgate_sk*/s.log | grep -c 'Error handling write request')" 0
-assert_eq "node crashes" "$(grep -l 'Segmentation fault' /tmp/tsgate_sk*/s.log 2>/dev/null | wc -l)" 0
+assert_eq "server-side 500s" "$(cat $GATE_TMP_ROOT/tsgate_sk*/s.log | grep -c 'Error handling write request')" 0
+assert_eq "node crashes" "$(grep -l 'Segmentation fault' $GATE_TMP_ROOT/tsgate_sk*/s.log 2>/dev/null | wc -l)" 0
 # ADVISORY, like the deposed-primary gate's: a probe write can meet a VShard genuinely
 # mid-transfer and get a retryable 503, which is the storm's doing rather than a defect.
 # The HARD assertion is the 500 count above.

@@ -312,7 +312,14 @@ evidence below.
   recovery evidence against the release binary, not this core behavior.
 - [ ] **Measure production SLOs.** Record one-node-failure write error band,
   recovery time, query latency, snapshot catch-up, and movement impact using the
-  final binary and deployment settings.
+  final binary and deployment settings. The local harness precondition is now
+  complete: every cluster gate defaults to 1 GiB per server, exports
+  `GATE_TMP_ROOT`/`TMPDIR` to repository-local `build/tmp`, checks free space on
+  that actual filesystem for high-volume campaigns, and caps the expensive A/B
+  comparison build at two jobs. This removes the former 24--40 GiB aggregate
+  reservation and prevents multi-gigabyte datasets from consuming a `/tmp`
+  tmpfs as raw memory. The measurements themselves, especially distinct-host
+  deployment evidence, remain open.
 - [x] **Deliver and prove clustered backup/restore.** The existing filesystem
   copy guidance is now explicitly limited to standalone mode: it omitted
   persistent node identity, Group-0/control state, the committed serving map,
@@ -385,9 +392,11 @@ Production approval requires all of the following:
 Builds may compile concurrently, but compiler temporaries must stay under the
 disk-backed `build/tmp` rather than the quota-limited `/tmp`. Run memory-heavy
 Seastar test processes one at a time with explicit `--smp` and `--memory`
-limits. Live multi-process gates use an explicit per-process memory cap, keep
-low-volume correctness roots under `build/tmp`, and are not run concurrently on
-one host.
+limits. Live multi-process gates default to a 1-GiB per-process cap, put all
+roots and implicit temporaries under `GATE_TMP_ROOT` (`build/tmp` by default),
+and are not run concurrently on one host. High-volume gates preflight the free
+space of that configured filesystem; overrides require an explicitly
+provisioned disk and aggregate memory budget.
 
 The live-directory gate covers stale update rejection, idempotent replay,
 same-epoch conflict, incomplete-map rejection, and independent routing views on

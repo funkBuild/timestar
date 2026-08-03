@@ -166,6 +166,7 @@ CONNECTIONS="${GATE_CONNECTIONS:-4}"
 # observed band to never fire on an honestly slower box, far enough above the collapse to
 # catch it.
 MIN_BASE_TPUT="${GATE_MIN_BASE_TPUT:-2000000}"
+require_gate_space_gb 30 "fault-injection gate" || exit 2
 
 # VOID is not a pass and not a failure: it is a run that did not test the property. It gets
 # its own exit code so a caller (fault_injection_ab.sh, CI) can re-draw instead of filing a
@@ -178,22 +179,22 @@ gate_void() {
 
 cleanup() {
     [ -n "${PROXY_PID:-}" ] && kill -9 "$PROXY_PID" 2>/dev/null
-    gate_cleanup 1941 /tmp/tsgate_fi1 /tmp/tsgate_fi2 /tmp/tsgate_fi3
-    rm -f /tmp/tsgate_fi_base.txt /tmp/tsgate_fi_storm.txt /tmp/tsgate_fi_resp.txt \
-        /tmp/tsgate_fi_rounds /tmp/tsgate_fi_stop
+    gate_cleanup 1941 $GATE_TMP_ROOT/tsgate_fi1 $GATE_TMP_ROOT/tsgate_fi2 $GATE_TMP_ROOT/tsgate_fi3
+    rm -f $GATE_TMP_ROOT/tsgate_fi_base.txt $GATE_TMP_ROOT/tsgate_fi_storm.txt $GATE_TMP_ROOT/tsgate_fi_resp.txt \
+        $GATE_TMP_ROOT/tsgate_fi_rounds $GATE_TMP_ROOT/tsgate_fi_stop
 }
 kill_cluster 1941
 require_ports_free 19410 19411 19412
-fresh_gate_data_dirs /tmp/tsgate_fi1 /tmp/tsgate_fi2 /tmp/tsgate_fi3 || exit 2
+fresh_gate_data_dirs $GATE_TMP_ROOT/tsgate_fi1 $GATE_TMP_ROOT/tsgate_fi2 $GATE_TMP_ROOT/tsgate_fi3 || exit 2
 trap cleanup EXIT
 
 # Node 3 is reached through 127.0.0.2 by everyone EXCEPT itself.
 PEERS_VIA_PROXY="127.0.0.1:19410,127.0.0.1:19411,127.0.0.2:19412"
 PEERS_DIRECT="127.0.0.1:19410,127.0.0.1:19411,127.0.0.1:19412"
 start_node() { # $1 = node id, $2 = peers list
-    env $GATE_SERVER_ENV TIMESTAR_DATA_DIR="/tmp/tsgate_fi$1" TIMESTAR_CLUSTER_ENABLED=true TIMESTAR_CLUSTER_PARTITIONED=true \
+    env $GATE_SERVER_ENV TIMESTAR_DATA_DIR="$GATE_TMP_ROOT/tsgate_fi$1" TIMESTAR_CLUSTER_ENABLED=true TIMESTAR_CLUSTER_PARTITIONED=true \
         TIMESTAR_CLUSTER_REPLICATION_FACTOR=3 TIMESTAR_CLUSTER_UUID=00112233445566778899aabbccddeeff TIMESTAR_CLUSTER_DEVELOPMENT_ALLOW_INSECURE_TRANSPORT=true TIMESTAR_CLUSTER_NODE_ID=$1 TIMESTAR_CLUSTER_PEERS="$2" \
-        "$BIN" --port $((19409 + $1)) --smp 4 --memory "$GATE_SERVER_MEMORY" >>"/tmp/tsgate_fi$1/s.log" 2>&1 &
+        "$BIN" --port $((19409 + $1)) --smp 4 --memory "$GATE_SERVER_MEMORY" >>"$GATE_TMP_ROOT/tsgate_fi$1/s.log" 2>&1 &
 }
 
 # Only the DATA-PLANE and RAFT ports are proxied. Node 3's HTTP listener binds
@@ -202,7 +203,7 @@ start_node() { # $1 = node id, $2 = peers list
 # first version of this gate did. The cluster planes only ever dial port+1000 and
 # port+2000, so leaving the HTTP port unproxied costs nothing.
 echo "=== proxy: 127.0.0.2:{20412,21412} -> 127.0.0.1:{20412,21412} ==="
-PROXY_LOG=/tmp/tsgate_fi_proxy.log
+PROXY_LOG=$GATE_TMP_ROOT/tsgate_fi_proxy.log
 : >"$PROXY_LOG"
 python3 ./tcp_reset_proxy.py \
     --map 127.0.0.2:20412:127.0.0.1:20412:reset \
@@ -251,12 +252,12 @@ assert_ge "VShards led behind the proxy (traffic that must cross the fault)" "${
 # measured against this, not against an unproxied number.
 echo "=== baseline (proxy in path, no faults) ==="
 timeout 300 "$BENCH" --server-port 19410 -c 4 --batches "$BENCH_BATCHES" --batch-size 10000 --verify 0 \
-    --warmup 5 --connections 4 --hosts 1000 --racks 2 >/tmp/tsgate_fi_base.txt 2>&1
+    --warmup 5 --connections 4 --hosts 1000 --racks 2 >$GATE_TMP_ROOT/tsgate_fi_base.txt 2>&1
 # "First error" is printed here too (D-21): when the baseline DOES break, its signature is
 # the only evidence of why, and the run that first showed this had none recorded.
-grep -E "Requests:|First error|Throughput|batch latency" /tmp/tsgate_fi_base.txt
-BASE_TPUT=$(grep -oE 'Throughput:[[:space:]]*[0-9.]+' /tmp/tsgate_fi_base.txt | head -1 | grep -oE '[0-9.]+')
-BASE_ERRS=$(grep -o '[0-9]* HTTP errors' /tmp/tsgate_fi_base.txt | head -1 | cut -d' ' -f1)
+grep -E "Requests:|First error|Throughput|batch latency" $GATE_TMP_ROOT/tsgate_fi_base.txt
+BASE_TPUT=$(grep -oE 'Throughput:[[:space:]]*[0-9.]+' $GATE_TMP_ROOT/tsgate_fi_base.txt | head -1 | grep -oE '[0-9.]+')
+BASE_ERRS=$(grep -o '[0-9]* HTTP errors' $GATE_TMP_ROOT/tsgate_fi_base.txt | head -1 | cut -d' ' -f1)
 echo "  baseline throughput: ${BASE_TPUT:-?} (errors ${BASE_ERRS:-?})"
 # THE CONTROL ARM, AND IT VOIDS RATHER THAN FAILS (debt D-21). No fault has been injected
 # yet, so a broken baseline is a broken environment -- disk headroom, a starved proxy, a
@@ -301,16 +302,16 @@ while [ "$storm" -le "$STORM_ROUNDS" ]; do
     # gated the resetter on the bench still running and the bench finished in under a
     # second, so the storm never fired -- the anti-vacuity assertions below exist because
     # of that.
-    rm -f /tmp/tsgate_fi_stop /tmp/tsgate_fi_rebal
+    rm -f $GATE_TMP_ROOT/tsgate_fi_stop $GATE_TMP_ROOT/tsgate_fi_rebal
     ( timeout 300 "$BENCH" --server-port 19410 -c 4 --batches "$BENCH_BATCHES" --batch-size 10000 --verify 0 \
-        --warmup 5 --connections "$CONNECTIONS" --hosts 1000 --racks 2 >/tmp/tsgate_fi_storm.txt 2>&1 ) &
+        --warmup 5 --connections "$CONNECTIONS" --hosts 1000 --racks 2 >$GATE_TMP_ROOT/tsgate_fi_storm.txt 2>&1 ) &
     BENCHPID=$!
     ( ROUNDS=0
-      while [ ! -f /tmp/tsgate_fi_stop ]; do
+      while [ ! -f $GATE_TMP_ROOT/tsgate_fi_stop ]; do
           kill -USR1 "$PROXY_PID" 2>/dev/null && ROUNDS=$((ROUNDS + 1))
           sleep 0.3
       done
-      echo "$ROUNDS" >/tmp/tsgate_fi_rounds ) &
+      echo "$ROUNDS" >$GATE_TMP_ROOT/tsgate_fi_rounds ) &
     RESETPID=$!
     # THE FOURTH THING, when this is the COMBINED gate (debt D-19's second half): a
     # leadership rebalance storm running THROUGH the reset storm. Two faults at once is not
@@ -321,7 +322,7 @@ while [ "$storm" -le "$STORM_ROUNDS" ]; do
     REBALPID=""
     if [ "$REBALANCE_STORM" = "1" ]; then
         ( T=0; C=0
-          while [ ! -f /tmp/tsgate_fi_stop ]; do
+          while [ ! -f $GATE_TMP_ROOT/tsgate_fi_stop ]; do
               for p in $PORTS; do
                   R=$(curl -s -m5 -X POST "http://127.0.0.1:$p/cluster/rebalance-leadership?max=512" 2>/dev/null)
                   N=$(printf '%s' "$R" | grep -o '"transfers_initiated":[0-9]*' | cut -d: -f2)
@@ -329,7 +330,7 @@ while [ "$storm" -le "$STORM_ROUNDS" ]; do
               done
               sleep 0.2
           done
-          echo "$T $C" >/tmp/tsgate_fi_rebal ) &
+          echo "$T $C" >$GATE_TMP_ROOT/tsgate_fi_rebal ) &
         REBALPID=$!
     fi
     sleep 1
@@ -337,31 +338,31 @@ while [ "$storm" -le "$STORM_ROUNDS" ]; do
     PROBE_OK=0; PROBE_5XX=0; PROBE_OTHER=0
     i=0
     while [ "$i" -lt "$PROBE" ]; do
-        CODE=$(curl -s -m10 -o /tmp/tsgate_fi_resp.txt -w '%{http_code}' -X POST http://127.0.0.1:19410/write \
+        CODE=$(curl -s -m10 -o $GATE_TMP_ROOT/tsgate_fi_resp.txt -w '%{http_code}' -X POST http://127.0.0.1:19410/write \
             -H 'Content-Type: application/json' \
             -d "{\"measurement\":\"faultprobe\",\"tags\":{\"host\":\"p$i\"},\"fields\":{\"v\":1.0},\"timestamp\":$((STORM_TS + i * 1000000000))}")
         case "$CODE" in
             2*) PROBE_OK=$((PROBE_OK + 1)) ;;
             5*) PROBE_5XX=$((PROBE_5XX + 1))
-                [ "$PROBE_5XX" = "1" ] && echo "  first probe 5xx ($CODE): $(head -c 200 /tmp/tsgate_fi_resp.txt)" ;;
+                [ "$PROBE_5XX" = "1" ] && echo "  first probe 5xx ($CODE): $(head -c 200 $GATE_TMP_ROOT/tsgate_fi_resp.txt)" ;;
             *)  PROBE_OTHER=$((PROBE_OTHER + 1)) ;;
         esac
         i=$((i + 1))
     done
     wait $BENCHPID
-    touch /tmp/tsgate_fi_stop
+    touch $GATE_TMP_ROOT/tsgate_fi_stop
     wait $RESETPID
     if [ -n "$REBALPID" ]; then
         wait $REBALPID
         STORM_TRANSFERS=0; STORM_CALLS=0
-        [ -s /tmp/tsgate_fi_rebal ] && read -r STORM_TRANSFERS STORM_CALLS </tmp/tsgate_fi_rebal
+        [ -s $GATE_TMP_ROOT/tsgate_fi_rebal ] && read -r STORM_TRANSFERS STORM_CALLS <$GATE_TMP_ROOT/tsgate_fi_rebal
         TOT_TRANSFERS=$((TOT_TRANSFERS + STORM_TRANSFERS))
         TOT_REBAL_CALLS=$((TOT_REBAL_CALLS + STORM_CALLS))
         echo "  rebalance: $STORM_TRANSFERS transfers over $STORM_CALLS calls, DURING the reset storm"
     fi
-    ROUNDS=$(cat /tmp/tsgate_fi_rounds 2>/dev/null || echo 0)
+    ROUNDS=$(cat $GATE_TMP_ROOT/tsgate_fi_rounds 2>/dev/null || echo 0)
     echo "  probe writes: $PROBE_OK ok, $PROBE_5XX 5xx, $PROBE_OTHER other (of $i attempted)"
-    grep -E "Requests:|First error|Throughput|batch latency" /tmp/tsgate_fi_storm.txt
+    grep -E "Requests:|First error|Throughput|batch latency" $GATE_TMP_ROOT/tsgate_fi_storm.txt
 
     # The proxy's RESET lines are CUMULATIVE across the whole run, so this storm's share is
     # the delta. Summing the file per storm would count every earlier storm again and make
@@ -371,12 +372,12 @@ while [ "$storm" -le "$STORM_ROUNDS" ]; do
     PREV_CONNS=$ALL_CONNS
     echo "  reset rounds: $ROUNDS, connections destroyed: $RESET_CONNS"
 
-    STORM_ERRS=$(grep -o '[0-9]* HTTP errors' /tmp/tsgate_fi_storm.txt | head -1 | cut -d' ' -f1)
-    STORM_CONN=$(grep -o '[0-9]* connection failures' /tmp/tsgate_fi_storm.txt | head -1 | cut -d' ' -f1)
-    STORM_TPUT=$(grep -oE 'Throughput:[[:space:]]*[0-9.]+' /tmp/tsgate_fi_storm.txt | head -1 | grep -oE '[0-9.]+')
+    STORM_ERRS=$(grep -o '[0-9]* HTTP errors' $GATE_TMP_ROOT/tsgate_fi_storm.txt | head -1 | cut -d' ' -f1)
+    STORM_CONN=$(grep -o '[0-9]* connection failures' $GATE_TMP_ROOT/tsgate_fi_storm.txt | head -1 | cut -d' ' -f1)
+    STORM_TPUT=$(grep -oE 'Throughput:[[:space:]]*[0-9.]+' $GATE_TMP_ROOT/tsgate_fi_storm.txt | head -1 | grep -oE '[0-9.]+')
     # A bench that produced no parseable counter at all is a harness failure, not a zero.
     [ -n "${STORM_ERRS:-}" ] && [ -n "${STORM_TPUT:-}" ] ||
-        gate_void "storm $storm produced no parseable bench result (timeout? see /tmp/tsgate_fi_storm.txt)"
+        gate_void "storm $storm produced no parseable bench result (timeout? see $GATE_TMP_ROOT/tsgate_fi_storm.txt)"
 
     TOT_ROUNDS=$((TOT_ROUNDS + ROUNDS))
     TOT_CONNS=$((TOT_CONNS + RESET_CONNS))
@@ -492,8 +493,8 @@ assert_eq "probe non-HTTP failures" "$TOT_PROBE_OTHER" 0
 assert_eq "bench client connection failures" "$TOT_CONN_FAILS" 0
 # NEITHER IS A 500. The whole point of 4a is that this fault is retryable and says so;
 # an opaque 500 is a defect at any rate.
-assert_eq "server-side 500s" "$(cat /tmp/tsgate_fi*/s.log | grep -c 'Error handling write request')" 0
-assert_eq "node crashes" "$(grep -l 'Segmentation fault' /tmp/tsgate_fi*/s.log 2>/dev/null | wc -l)" 0
+assert_eq "server-side 500s" "$(cat $GATE_TMP_ROOT/tsgate_fi*/s.log | grep -c 'Error handling write request')" 0
+assert_eq "node crashes" "$(grep -l 'Segmentation fault' $GATE_TMP_ROOT/tsgate_fi*/s.log 2>/dev/null | wc -l)" 0
 
 # BOUNDED DIP, against the proxied baseline (see the header), on the WORST storm.
 assert_ge "throughput retained vs the proxied baseline, worst storm (%)" "$WORST_PCT" "$MIN_DIP_PCT"

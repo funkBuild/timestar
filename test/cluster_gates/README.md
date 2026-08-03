@@ -28,13 +28,20 @@ not probes, so they can be run from CI or a release checklist.
 
 All of them take an optional server binary as `$1` (default
 `build/bin/timestar_http_server`), so a "before" binary can be measured the same way.
-Every node also receives an explicit `--memory` budget: 8 GiB by default,
-overrideable with `GATE_SERVER_MEMORY`. The low-volume `restart_catchup`,
-`snapshot_durability`, topology, retention, pattern-delete, receipt-retirement,
-homogeneous-v1, and mTLS-identity gates pin 1 GiB per process. This is a
-per-process limit, so size the aggregate as `node count * GATE_SERVER_MEMORY`; leaving it implicit
-lets every Seastar process size itself from the whole host and can overcommit a
-multi-node gate before the property under test is reached.
+Every node also receives an explicit `--memory` budget: 1 GiB by default,
+overrideable with `GATE_SERVER_MEMORY`. This is a per-process limit, so size the
+aggregate as `node count * GATE_SERVER_MEMORY`; leaving it implicit lets every
+Seastar process size itself from the whole host and can overcommit a multi-node
+gate before the property under test is reached. Capacity qualification may raise
+the value after provisioning the aggregate explicitly; a correctness or release
+run must not silently reserve 8 GiB for each of three to five local processes.
+
+Every gate also uses `GATE_TMP_ROOT` for durable roots, retained transcripts, and
+implicit process temporaries (`TMPDIR`). It defaults to the repository-local
+`build/tmp`; override it only with a provisioned disk filesystem. Do not point it
+at a memory-backed `/tmp`: the legacy load shapes can write tens of GiB, turning
+their disk workload into raw-memory pressure and killing the harness instead of
+measuring the intended fault.
 
 `topology_mutation_gate.sh` is a low-volume correctness gate and deliberately
 pins a smaller 1 GiB per-process default (4 GiB aggregate). Its four durable
@@ -106,21 +113,22 @@ a gate fails, re-run it ALONE before believing it.
 **Every gate now deletes its own data dirs in an EXIT trap** (`gate_cleanup` in
 `cluster_gate_lib.sh`), so "with the previous run's data dirs deleted" is the default
 rather than an instruction. It was not: only `restart_readback_gate.sh` cleaned up, and a
-session that ran several gates back to back walked the tmpfs down to nothing. That is worse
-than a slow bench — /tmp here is a tmpfs with a per-user quota, and exhausting it produces
-"Disk quota exceeded" in EVERY process on the box, including the shell driving the gate.
-One session lost its whole harness that way mid-run.
+session using the old `/tmp` roots ran several gates back to back and walked that tmpfs
+down to nothing. That is worse than a slow bench — exhausting a tmpfs consumes raw memory
+and produces "Disk quota exceeded" in every process on the box, including the shell
+driving the gate. One session lost its whole harness that way mid-run.
 
-The tail of each node log is copied to `build/tmp/tsgate_<prefix>_tails.log` before the delete,
-so a failed run is still diagnosable; `GATE_KEEP_DATA=1` keeps everything when it is not.
-Check `df -h /tmp` and `ls -d /tmp/tsgate_*` before and after a run anyway — a gate killed
-between its `mkdir` and its trap leaves dirs behind.
+The tail of each node log is copied to
+`$GATE_TMP_ROOT/tsgate_<prefix>_tails.log` before the delete, so a failed run is
+still diagnosable; `GATE_KEEP_DATA=1` keeps everything when it is not. Check
+`df -h "$GATE_TMP_ROOT"` and `ls -d "$GATE_TMP_ROOT"/tsgate_*` before and after
+a run anyway — a gate killed between its `mkdir` and its trap leaves dirs behind.
 
 Data reset is a VERIFIED operation, not a best-effort `rm -rf; mkdir`. The shared
-`fresh_gate_data_dirs` helper accepts only direct `/tmp/tsgate_*` or
-`build/tmp/tsgate_*` roots (never a nested or arbitrary path), retries a removal race five
-times, proves every old root is absent, and only then recreates it. A gate aborts before
-starting a node if that proof fails. This is
+`fresh_gate_data_dirs` helper accepts only direct
+`$GATE_TMP_ROOT/tsgate_*` roots (never a nested or arbitrary path), retries a
+removal race five times, proves every old root is absent, and only then recreates
+it. A gate aborts before starting a node if that proof fails. This is
 load-bearing for multi-arm gates: `snapshot_durability_gate.sh` once had extra `rm -rf`
 calls between arms while the prior arm's post-crash readback servers were still RUNNING.
 They predictably reported `Directory not empty`; worse, the script ignored that and went
@@ -132,7 +140,9 @@ cluster and performs exactly one verified reset inside `run_arm`.
 is ~22 bytes per point per replica, i.e. ~6.7 G per 100 M points. `fault_injection_gate.sh`
 runs K+1 benches against ONE cluster and nothing is deleted between them, which is why its
 bench size came DOWN when it went to K storms (see its `BENCH_BATCHES` note): its measured
-peak is 27 G of the 62 G tmpfs.
+peak was 27 G on the measured host. The gate checks the filesystem containing
+`GATE_TMP_ROOT` before starting; the historical 62 G `/tmp` tmpfs is no longer
+used by default.
 
 `restart_catchup_gate.sh` is now a focused correctness and resource gate. It
 uses 96 awaited hot-series prefix writes to force the same non-empty VShard
@@ -220,16 +230,16 @@ cannot reintroduce the race.
 
 | gate | HTTP ports | data (+1000) | Raft (+2000) | `kill_cluster` prefix | data dirs |
 |---|---|---|---|---|---|
-| `backpressure_gate.sh` | 19210-19212 | 20210-20212 | 21210-21212 | `1921` | `/tmp/tsgate_bp*` |
-| `rolling_rebalance_gate.sh` | 19220-19222 | 20220-20222 | 21220-21222 | `1922` | `/tmp/tsgate_rb*` |
-| `skewed_rebalance_gate.sh` | 19240-19242 | 20240-20242 | 21240-21242 | `1924` | `/tmp/tsgate_sk*` |
-| `deposed_primary_gate.sh` | 19310-19314 | 20310-20314 | 21310-21314 | `1931` | `/tmp/tsgate_dp*` |
-| `fault_injection_gate.sh` | 19410-19412 | 20410-20412 | 21410-21412 | `1941` | `/tmp/tsgate_fi*` |
+| `backpressure_gate.sh` | 19210-19212 | 20210-20212 | 21210-21212 | `1921` | `build/tmp/tsgate_bp*` |
+| `rolling_rebalance_gate.sh` | 19220-19222 | 20220-20222 | 21220-21222 | `1922` | `build/tmp/tsgate_rb*` |
+| `skewed_rebalance_gate.sh` | 19240-19242 | 20240-20242 | 21240-21242 | `1924` | `build/tmp/tsgate_sk*` |
+| `deposed_primary_gate.sh` | 19310-19314 | 20310-20314 | 21310-21314 | `1931` | `build/tmp/tsgate_dp*` |
+| `fault_injection_gate.sh` | 19410-19412 | 20410-20412 | 21410-21412 | `1941` | `build/tmp/tsgate_fi*` |
 | `combined_fault_rebalance_gate.sh` | (runs `fault_injection_gate.sh` in combined mode — same ports, dirs and prefix; never run both at once) |||||
 | `restart_catchup_gate.sh` | 19510-19512 | 20510-20512 | 21510-21512 | `1951` | `build/tmp/tsgate_cu*` |
-| `node_kill_round.sh` | 19610-19612 | 20610-20612 | 21610-21612 | `1961` | `/tmp/tsgate_nk*` |
+| `node_kill_round.sh` | 19610-19612 | 20610-20612 | 21610-21612 | `1961` | `build/tmp/tsgate_nk*` |
 | `snapshot_durability_gate.sh` | 19710-19712 | 20710-20712 | 21710-21712 | `1971` | `build/tmp/tsgate_sd*` |
-| `restart_readback_gate.sh` | 19730-19732 | 20730-20732 | 21730-21732 | `1973` | `/tmp/tsgate_rr*` |
+| `restart_readback_gate.sh` | 19730-19732 | 20730-20732 | 21730-21732 | `1973` | `build/tmp/tsgate_rr*` |
 | `topology_mutation_gate.sh` | 19810-19813 | 20810-20813 | 21810-21813 | `1981` | `build/tmp/tsgate_tm*` |
 | `retention_failover_gate.sh` | 19830-19832 | 20830-20832 | 21830-21832 | `1983` | `build/tmp/tsgate_rt*` |
 | `pattern_delete_failover_gate.sh` | 19850-19852 | 20850-20852 | 21850-21852 | `1985` | `build/tmp/tsgate_pd*` |
@@ -275,7 +285,7 @@ lowering the load on the artificial one: the insert bench pipelines several batc
 even at `--connections 1`, so "the load dropped" is not expressible at a budget small
 enough for curl to trip.
 
-Both benchmark arms persist their complete stdout/stderr under `/tmp` and assert the
+Both benchmark arms persist their complete stdout/stderr under `GATE_TMP_ROOT` and assert the
 benchmark process exit code before parsing request counts. Command substitution used to
 discard the only diagnostic when the benchmark died before printing its summary: the
 gate then showed an empty anti-vacuity count even though server logs proved that a few

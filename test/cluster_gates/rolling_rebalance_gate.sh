@@ -22,14 +22,14 @@ MIN_TRANSFERS="${GATE_MIN_TRANSFERS:-200}"
 
 kill_cluster 1922
 require_ports_free 19220 19221 19222
-fresh_gate_data_dirs /tmp/tsgate_rb1 /tmp/tsgate_rb2 /tmp/tsgate_rb3 || exit 2
+fresh_gate_data_dirs $GATE_TMP_ROOT/tsgate_rb1 $GATE_TMP_ROOT/tsgate_rb2 $GATE_TMP_ROOT/tsgate_rb3 || exit 2
 PEERS="127.0.0.1:19220,127.0.0.1:19221,127.0.0.1:19222"
 start_node() {
-    env $GATE_SERVER_ENV TIMESTAR_DATA_DIR="/tmp/tsgate_rb$1" TIMESTAR_CLUSTER_ENABLED=true TIMESTAR_CLUSTER_PARTITIONED=true \
+    env $GATE_SERVER_ENV TIMESTAR_DATA_DIR="$GATE_TMP_ROOT/tsgate_rb$1" TIMESTAR_CLUSTER_ENABLED=true TIMESTAR_CLUSTER_PARTITIONED=true \
         TIMESTAR_CLUSTER_REPLICATION_FACTOR=3 TIMESTAR_CLUSTER_UUID=00112233445566778899aabbccddeeff TIMESTAR_CLUSTER_DEVELOPMENT_ALLOW_INSECURE_TRANSPORT=true TIMESTAR_CLUSTER_NODE_ID=$1 TIMESTAR_CLUSTER_PEERS="$PEERS" \
-        "$BIN" --port $((19219 + $1)) --smp 4 --memory "$GATE_SERVER_MEMORY" >>"/tmp/tsgate_rb$1/s.log" 2>&1 &
+        "$BIN" --port $((19219 + $1)) --smp 4 --memory "$GATE_SERVER_MEMORY" >>"$GATE_TMP_ROOT/tsgate_rb$1/s.log" 2>&1 &
 }
-trap 'gate_cleanup 1922 /tmp/tsgate_rb1 /tmp/tsgate_rb2 /tmp/tsgate_rb3' EXIT
+trap 'gate_cleanup 1922 $GATE_TMP_ROOT/tsgate_rb1 $GATE_TMP_ROOT/tsgate_rb2 $GATE_TMP_ROOT/tsgate_rb3' EXIT
 
 # Two-node phase: a 2-of-3 quorum elects leaders for every VShard between nodes 1 and 2.
 start_node 1; start_node 2
@@ -49,7 +49,7 @@ echo "  node 3 joined with ~no leadership: led=[$(status_field "$(cluster_status
 
 echo "=== rebalance storm under sustained writes ==="
 ( timeout 300 "$BENCH" --server-port 19220 -c 4 --batches 600 --batch-size 10000 --verify 0 \
-    --warmup 5 --connections 8 --hosts 1000 --racks 2 >/tmp/tsgate_rb_bench.txt 2>&1 ) &
+    --warmup 5 --connections 8 --hosts 1000 --racks 2 >$GATE_TMP_ROOT/tsgate_rb_bench.txt 2>&1 ) &
 BENCHPID=$!
 sleep 2
 TRANSFERS=0; CALLS=0
@@ -63,18 +63,18 @@ while kill -0 $BENCHPID 2>/dev/null; do
 done
 wait $BENCHPID
 echo "  rebalance calls: $CALLS"
-grep -E "Requests:|First error|Throughput|batch latency" /tmp/tsgate_rb_bench.txt
+grep -E "Requests:|First error|Throughput|batch latency" $GATE_TMP_ROOT/tsgate_rb_bench.txt
 echo "  final led=[$(status_field "$(cluster_status 19220)" vshards_led) $(status_field "$(cluster_status 19221)" vshards_led) $(status_field "$(cluster_status 19222)" vshards_led)]"
 
 # THE anti-vacuity assertion: without real transfers this gate tests nothing.
 assert_ge "leadership transfers initiated mid-bench" "$TRANSFERS" "$MIN_TRANSFERS"
 
-HTTP_ERRS=$(grep -o '[0-9]* HTTP errors' /tmp/tsgate_rb_bench.txt | head -1 | cut -d' ' -f1)
-CONN_FAILS=$(grep -o '[0-9]* connection failures' /tmp/tsgate_rb_bench.txt | head -1 | cut -d' ' -f1)
+HTTP_ERRS=$(grep -o '[0-9]* HTTP errors' $GATE_TMP_ROOT/tsgate_rb_bench.txt | head -1 | cut -d' ' -f1)
+CONN_FAILS=$(grep -o '[0-9]* connection failures' $GATE_TMP_ROOT/tsgate_rb_bench.txt | head -1 | cut -d' ' -f1)
 assert_eq "client HTTP errors" "${HTTP_ERRS:-missing}" 0
 assert_eq "client connection failures" "${CONN_FAILS:-missing}" 0
-assert_eq "server-side 500s" "$(cat /tmp/tsgate_rb*/s.log | grep -c 'Error handling write request')" 0
-assert_eq "node crashes" "$(grep -l 'Segmentation fault' /tmp/tsgate_rb*/s.log 2>/dev/null | wc -l)" 0
+assert_eq "server-side 500s" "$(cat $GATE_TMP_ROOT/tsgate_rb*/s.log | grep -c 'Error handling write request')" 0
+assert_eq "node crashes" "$(grep -l 'Segmentation fault' $GATE_TMP_ROOT/tsgate_rb*/s.log 2>/dev/null | wc -l)" 0
 
 # The cluster must go QUIET once the storm stops. At RF == N the balancer converges, so
 # leadership settling is a real property -- and it is the one that catches a transfer
