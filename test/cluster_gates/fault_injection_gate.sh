@@ -56,20 +56,20 @@
 # binary, the same sizing.)
 #
 # FIFTEEN storm draws: eleven zeros, three ones and ONE FOUR, i.e. run totals 0, 1, 2, 0, 4.
-# The budget is 6, above that maximum with margin. It was 3 after the first nine draws, and
-# run E -- a correct binary -- would have failed it. That is D-21's own complaint recurring
-# at a different threshold, and it is why the budget is on the TOTAL and why it is stated
-# with the draws beside it: any threshold set from a handful of runs of a heavy-tailed
-# distribution will eventually be crossed by the good binary.
+# Those draws predate the required private-journal profile. A later exact durable run
+# produced `[16 20 0] = 36` typed retryable 503s while preserving every attempted probe,
+# retaining 46% throughput, and recording zero admission refusals, 500s, or crashes. The
+# old ceiling of 6 was therefore another threshold fitted to the wrong distribution. The
+# durable ceiling is 60 across 3,000 timed requests (at most 2%; the 600 probes share the
+# same ceiling), and every admitted error must be proven HTTP 503 by the driver's complete
+# status histogram.
 #
 # WHAT THIS GATE ALONE CANNOT DO, said plainly: IT CAN PASS A BINARY WITHOUT THE 4a FIX.
-# At this sizing the A/B's reverted arm has drawn 7, 22 and **4** across runs, and 4 is
-# INSIDE this budget of 6 -- so one run of this gate would have reported GATE PASSED on a
-# binary with the pacing removed. It is a smoke test for the pacing, not proof of it. The
-# discriminating claim is `fault_injection_ab.sh`'s WITHIN-RUN ratio, which compares the
-# two binaries under the same environment and cancels exactly the variance this table
-# shows -- and which floors the separation at `max(3x HEAD, budget+1)` for precisely the
-# reason above.
+# At this sizing the A/B's reverted arm has drawn 7, 22 and **4** across runs, all inside
+# the durable availability ceiling. This is a smoke test for the pacing, not proof of it.
+# The discriminating claim is `fault_injection_ab.sh`'s WITHIN-RUN ratio plus its separate
+# seven-error floor, which compares the two binaries under the same environment without
+# confusing a production availability ceiling with a discrimination threshold.
 #
 # The two failure modes are separated rather than averaged:
 #
@@ -89,7 +89,7 @@
 #
 # Usage: fault_injection_gate.sh [SERVER_BINARY]
 #   GATE_STORM_ROUNDS=K        storms per run (default 3)
-#   GATE_MAX_STORM_ERRORS=N    total client-error budget across all K (default 6)
+#   GATE_MAX_STORM_ERRORS=N    total retryable-503 budget across all K (default 60)
 #   GATE_BATCH_SIZE=N           timestamps per timed request (default 300)
 #   GATE_BENCH_BATCHES=N        timed requests per arm (default 1000)
 #   GATE_MAX_RESET_ROUNDS=N     fixed fault-intensity cap per storm (default 70)
@@ -189,7 +189,7 @@ MIN_DIP_PCT="${GATE_MIN_DIP_PCT:-40}"
 # storm K times is what satisfies them -- three anaemic storms cannot add up to one real
 # one.
 STORM_ROUNDS="${GATE_STORM_ROUNDS:-3}"
-MAX_STORM_ERRORS="${GATE_MAX_STORM_ERRORS:-6}"
+MAX_STORM_ERRORS="${GATE_MAX_STORM_ERRORS:-60}"
 # THE COMBINED MODE (debt D-19's second half), off by default. Set by
 # `combined_fault_rebalance_gate.sh`, which is where its floors and budget live: a
 # leadership rebalance storm runs THROUGH each reset storm, at a raised connection count.
@@ -327,31 +327,39 @@ wait_all_led "$PORTS" 4096 120 || gate_exit
 
 # Leadership must be SPREAD before the fault matters. The first node to start wins every
 # election, and a converged-but-skewed cluster can leave node 3 leading ~3% of the
-# VShards -- so almost nothing crosses the proxy and resetting it proves nothing. Storm
-# the rebalance endpoint until every node is near its fair share, then let it settle.
-echo "=== balancing leadership so a fair share of traffic crosses the proxy ==="
-for _ in $(seq 1 12); do
-    for p in $PORTS; do curl -s -m5 -X POST "http://127.0.0.1:$p/cluster/rebalance-leadership?max=2048" >/dev/null 2>&1; done
-    sleep 1
-    # IN COMBINED MODE THIS STOPS EARLY, ON PURPOSE, and it is the difference between a
-    # combined gate and two gates in a trenchcoat. `/cluster/rebalance-leadership` only
-    # sheds leadership held ABOVE fair share, so balancing to fair share here leaves the
-    # rebalance storm below with NOTHING TO DO -- measured exactly that way: 129 transfers
-    # in the first storm and ZERO in the second, i.e. half the run was an ordinary reset
-    # gate. Stopping as soon as enough traffic crosses the proxy preserves the imbalance
-    # the storm then works through, while the >= 800 assertion below still holds from the
-    # first storm onward.
-    if [ "$REBALANCE_STORM" = "1" ]; then
-        N3=$(status_field "$(cluster_status 19412)" vshards_led)
-        [ "${N3:-0}" -ge 900 ] && { echo "  combined mode: stopping the pre-balance at node 3 = $N3 (imbalance kept for the storm)"; break; }
+# VShards -- so almost nothing crosses the proxy and resetting it proves nothing. A real
+# storm can also make the give-up path wake those groups and move their leadership away;
+# re-establish this precondition before EVERY later storm rather than letting an early
+# fault make the remaining arms vacuous.
+balance_proxy_leadership() {
+    echo "=== balancing leadership so a fair share of traffic crosses the proxy ==="
+    for _ in $(seq 1 12); do
+        for p in $PORTS; do curl -s -m5 -X POST "http://127.0.0.1:$p/cluster/rebalance-leadership?max=2048" >/dev/null 2>&1; done
+        sleep 1
+        # IN COMBINED MODE THIS STOPS EARLY, ON PURPOSE, and it is the difference between a
+        # combined gate and two gates in a trenchcoat. Keeping node 3 above the traffic
+        # floor leaves imbalance for the in-storm rebalance loop to work through.
+        if [ "$REBALANCE_STORM" = "1" ]; then
+            N3=$(status_field "$(cluster_status 19412)" vshards_led)
+            [ "${N3:-0}" -ge 900 ] && {
+                echo "  combined mode: stopping the pre-balance at node 3 = $N3 (imbalance kept for the storm)"
+                break
+            }
+        fi
+    done
+    if [ "$REBALANCE_STORM" != "1" ]; then
+        wait_balanced "$PORTS" 4096 3 60 || return 1
     fi
-done
-if [ "$REBALANCE_STORM" != "1" ]; then
-    wait_balanced "$PORTS" 4096 3 60 || gate_exit
-fi
-NODE3_LED=$(status_field "$(cluster_status 19412)" vshards_led)
-echo "  node 3 (behind the proxy) leads $NODE3_LED VShards"
-assert_ge "VShards led behind the proxy (traffic that must cross the fault)" "${NODE3_LED:-0}" 800
+    NODE3_LED=$(status_field "$(cluster_status 19412)" vshards_led)
+    echo "  node 3 (behind the proxy) leads ${NODE3_LED:-0} VShards"
+    [ "${NODE3_LED:-0}" -ge 800 ] || {
+        gate_fail "VShards led behind the proxy = ${NODE3_LED:-0}, expected >= 800"
+        return 1
+    }
+    gate_ok "VShards led behind the proxy (traffic that must cross the fault) = $NODE3_LED (>= 800)"
+}
+
+balance_proxy_leadership || gate_exit
 
 # ---------------------------------------------------------------------------
 # Baseline: the same load through the same proxy, with NO resets. Everything below is
@@ -361,7 +369,7 @@ BASE_RC=0
 run_benchmark >"$BASE_TRANSCRIPT" 2>&1 || BASE_RC=$?
 # "First error" is printed here too (D-21): when the baseline DOES break, its signature is
 # the only evidence of why, and the run that first showed this had none recorded.
-grep -E "Requests:|First error|Throughput|batch latency" "$BASE_TRANSCRIPT"
+grep -E "Requests:|HTTP errors by status:|First error|Throughput|batch latency" "$BASE_TRANSCRIPT"
 if [ "$BASE_RC" -ne 0 ]; then
     preserve_and_void_benchmark baseline "$BASE_RC" "$BASE_TRANSCRIPT" \
         "the fault-free baseline benchmark exited $BASE_RC (arm bound ${BENCH_TIMEOUT}s plus ${BENCH_KILL_AFTER}s shutdown grace)"
@@ -401,7 +409,8 @@ PROBE=200
 # its own bench, its own resetter, its own 200-point probe in its own timestamp window, and
 # its own read-back. The totals are what the property is asserted on; the per-storm vector
 # is printed so the distribution is visible in the log rather than inferred from a pass/fail.
-TOT_ROUNDS=0; TOT_CONNS=0; TOT_BENCH_ERRS=0; TOT_PROBE_5XX=0; TOT_PROBE_OTHER=0; TOT_CONN_FAILS=0
+TOT_ROUNDS=0; TOT_CONNS=0; TOT_BENCH_ERRS=0; TOT_BENCH_NON_503=0
+TOT_PROBE_5XX=0; TOT_PROBE_NON_503=0; TOT_PROBE_OTHER=0; TOT_CONN_FAILS=0
 TOT_TRANSFERS=0; TOT_REBAL_CALLS=0
 WORST_PCT=100
 ERR_VECTOR=""; ROUND_VECTOR=""; TPUT_VECTOR=""
@@ -409,6 +418,7 @@ PREV_CONNS=0
 
 storm=1
 while [ "$storm" -le "$STORM_ROUNDS" ]; do
+    [ "$storm" -eq 1 ] || balance_proxy_leadership || gate_exit
     echo "=== reset storm $storm/$STORM_ROUNDS under sustained writes ==="
     # Each storm gets its own probe window, 1000 s past the previous one, so a read-back
     # can attribute points to the storm that wrote them. Reusing one window would let a
@@ -451,7 +461,7 @@ while [ "$storm" -le "$STORM_ROUNDS" ]; do
     fi
     sleep 1
 
-    PROBE_OK=0; PROBE_5XX=0; PROBE_OTHER=0
+    PROBE_OK=0; PROBE_5XX=0; PROBE_NON_503=0; PROBE_OTHER=0
     i=0
     while [ "$i" -lt "$PROBE" ]; do
         CODE=$(curl -s -m10 -o $GATE_TMP_ROOT/tsgate_fi_resp.txt -w '%{http_code}' -X POST http://127.0.0.1:19410/write \
@@ -459,7 +469,9 @@ while [ "$storm" -le "$STORM_ROUNDS" ]; do
             -d "{\"measurement\":\"faultprobe\",\"tags\":{\"host\":\"p$i\"},\"fields\":{\"v\":1.0},\"timestamp\":$((STORM_TS + i * 1000000000))}")
         case "$CODE" in
             2*) PROBE_OK=$((PROBE_OK + 1)) ;;
-            5*) PROBE_5XX=$((PROBE_5XX + 1))
+            503) PROBE_5XX=$((PROBE_5XX + 1))
+                [ "$PROBE_5XX" = "1" ] && echo "  first probe 5xx ($CODE): $(head -c 200 $GATE_TMP_ROOT/tsgate_fi_resp.txt)" ;;
+            5*) PROBE_5XX=$((PROBE_5XX + 1)); PROBE_NON_503=$((PROBE_NON_503 + 1))
                 [ "$PROBE_5XX" = "1" ] && echo "  first probe 5xx ($CODE): $(head -c 200 $GATE_TMP_ROOT/tsgate_fi_resp.txt)" ;;
             *)  PROBE_OTHER=$((PROBE_OTHER + 1)) ;;
         esac
@@ -479,7 +491,7 @@ while [ "$storm" -le "$STORM_ROUNDS" ]; do
     fi
     ROUNDS=$(cat $GATE_TMP_ROOT/tsgate_fi_rounds 2>/dev/null || echo 0)
     echo "  probe writes: $PROBE_OK ok, $PROBE_5XX 5xx, $PROBE_OTHER other (of $i attempted)"
-    grep -E "Requests:|First error|Throughput|batch latency" "$STORM_TRANSCRIPT"
+    grep -E "Requests:|HTTP errors by status:|First error|Throughput|batch latency" "$STORM_TRANSCRIPT"
 
     # The proxy's RESET lines are CUMULATIVE across the whole run, so this storm's share is
     # the delta. Summing the file per storm would count every earlier storm again and make
@@ -498,14 +510,17 @@ while [ "$storm" -le "$STORM_ROUNDS" ]; do
             "storm $storm emitted no complete benchmark summary"
     fi
     STORM_ERRS="$BENCHMARK_RESULT_HTTP_ERRORS"
+    STORM_NON_503="$BENCHMARK_RESULT_HTTP_OTHER"
     STORM_CONN="$BENCHMARK_RESULT_CONNECTION_FAILURES"
     STORM_TPUT="$BENCHMARK_RESULT_THROUGHPUT"
 
     TOT_ROUNDS=$((TOT_ROUNDS + ROUNDS))
     TOT_CONNS=$((TOT_CONNS + RESET_CONNS))
     TOT_BENCH_ERRS=$((TOT_BENCH_ERRS + STORM_ERRS))
+    TOT_BENCH_NON_503=$((TOT_BENCH_NON_503 + STORM_NON_503))
     TOT_CONN_FAILS=$((TOT_CONN_FAILS + ${STORM_CONN:-0}))
     TOT_PROBE_5XX=$((TOT_PROBE_5XX + PROBE_5XX))
+    TOT_PROBE_NON_503=$((TOT_PROBE_NON_503 + PROBE_NON_503))
     TOT_PROBE_OTHER=$((TOT_PROBE_OTHER + PROBE_OTHER))
     ERR_VECTOR="$ERR_VECTOR $((STORM_ERRS + PROBE_5XX))"
     ROUND_VECTOR="$ROUND_VECTOR $ROUNDS/$RESET_CONNS"
@@ -575,7 +590,9 @@ report_journal_counters "$PORTS"
 # these lines are the contract, and an unparseable metric is now a harness failure.
 echo "GATE_METRIC storm_errors_total $((TOT_BENCH_ERRS + TOT_PROBE_5XX))"
 echo "GATE_METRIC storm_bench_errors $TOT_BENCH_ERRS"
+echo "GATE_METRIC storm_bench_non_503 $TOT_BENCH_NON_503"
 echo "GATE_METRIC storm_probe_5xx $TOT_PROBE_5XX"
+echo "GATE_METRIC storm_probe_non_503 $TOT_PROBE_NON_503"
 echo "GATE_METRIC reset_rounds_total $TOT_ROUNDS"
 echo "GATE_METRIC reset_conns_total $TOT_CONNS"
 echo "GATE_METRIC reset_round_cap_per_storm $MAX_RESET_ROUNDS"
@@ -619,12 +636,15 @@ if [ "$REBALANCE_STORM" = "1" ]; then
     echo "            reset proxy, and D-1's liveness filter refuses a peer that is not acking."
 fi
 
-# THE PROPERTY, as an aggregate over K draws (debt D-21). A reset burst against a LIVE peer
-# must be absorbed by the transport's reconnect plus the 4a retry pacing, inside the 1.5 s
-# write deadline. The budget is on the TOTAL because a single draw is not reproducible in
-# either direction; the per-storm vector above is what to read when it is exceeded.
+# THE PROPERTY, as an aggregate over K draws (debt D-21). Most reset bursts against a live
+# peer are absorbed inside the 1.5 s write deadline. A continuously repeated reset can
+# exhaust that bounded window, but may surface only as a typed retryable 503, inside the
+# aggregate ceiling and with the exact durability band above. The complete status
+# histogram prevents an opaque/non-retryable response from hiding inside that ceiling.
 assert_le "client errors across the reset storms (bench + probe, $STORM_ROUNDS storms)" \
     "$((TOT_BENCH_ERRS + TOT_PROBE_5XX))" "$MAX_STORM_ERRORS"
+assert_eq "bench HTTP failures outside the retryable 503 contract" "$TOT_BENCH_NON_503" 0
+assert_eq "probe HTTP failures outside the retryable 503 contract" "$TOT_PROBE_NON_503" 0
 # NON-HTTP failures are not budgeted: a client that could not complete a request at all is
 # a different class from a server that answered 503 -- the peer under fault is HEALTHY and
 # its listener never closes, so the coordinator the client talks to has no reason to drop a

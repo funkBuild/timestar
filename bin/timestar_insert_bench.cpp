@@ -31,6 +31,7 @@
 #include <cstring>
 #include <iomanip>
 #include <iostream>
+#include <map>
 #include <numeric>
 #include <random>
 #include <seastar/core/app-template.hh>
@@ -290,6 +291,7 @@ struct ShardResult {
     size_t requests_ok = 0;
     size_t requests_fail = 0;
     size_t requests_http_err = 0;  // non-2xx responses
+    std::map<unsigned, size_t> http_error_statuses;
     size_t total_points = 0;
     clk::duration wall_time{};
     std::string first_error;  // first error body for debugging
@@ -411,11 +413,14 @@ static future<ShardResult> runBenchmark(socket_address addr, unsigned maxConn, s
 
         try {
             bool httpOk = false;
+            unsigned httpStatus = 0;
             sstring errBody;
             co_await client->make_request(
-                std::move(req), [&httpOk, &errBody](const http::reply& rep, input_stream<char>&& body_in) -> future<> {
+                std::move(req), [&httpOk, &httpStatus,
+                                 &errBody](const http::reply& rep, input_stream<char>&& body_in) -> future<> {
                     auto body = std::move(body_in);
-                    httpOk = (static_cast<int>(rep._status) >= 200 && static_cast<int>(rep._status) < 300);
+                    httpStatus = static_cast<unsigned>(rep._status);
+                    httpOk = (httpStatus >= 200 && httpStatus < 300);
                     sstring acc;
                     auto buf = co_await body.read();
                     while (!buf.empty()) {
@@ -434,6 +439,7 @@ static future<ShardResult> runBenchmark(socket_address addr, unsigned maxConn, s
                 res->total_points += pointsPerRequest;
             } else {
                 res->requests_http_err++;
+                res->http_error_statuses[httpStatus]++;
                 if (res->first_error.empty()) {
                     res->first_error = std::move(errBody);
                 }
@@ -605,6 +611,14 @@ int main(int argc, char** argv) {
 
         fmt::print("\n  Requests:       {} OK, {} HTTP errors, {} connection failures\n", totalOk, totalHttpErr,
                    totalFail);
+        fmt::print("  HTTP errors by status:");
+        if (result.http_error_statuses.empty()) {
+            fmt::print(" none");
+        } else {
+            for (const auto& [status, count] : result.http_error_statuses)
+                fmt::print(" {}={}", status, count);
+        }
+        fmt::print("\n");
         if (!firstError.empty()) {
             fmt::print("  First error:    {}\n", firstError);
         }

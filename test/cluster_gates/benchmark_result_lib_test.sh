@@ -31,10 +31,13 @@ BOUND_ELAPSED=$((SECONDS - BOUND_START))
 VALID="$TEST_ROOT/valid.log"
 printf '%s\n' \
     'Requests:       500 OK, 7 HTTP errors, 2 connection failures' \
+    'HTTP errors by status: 409=2 503=5' \
     'Throughput:     12345 pts/sec' \
     'batch latency   p99=12.0' >"$VALID"
 parse_benchmark_result "$VALID"
 [ "$BENCHMARK_RESULT_HTTP_ERRORS" = "7" ]
+[ "$BENCHMARK_RESULT_HTTP_503" = "5" ]
+[ "$BENCHMARK_RESULT_HTTP_OTHER" = "2" ]
 [ "$BENCHMARK_RESULT_CONNECTION_FAILURES" = "2" ]
 [ "$BENCHMARK_RESULT_THROUGHPUT" = "12345" ]
 
@@ -42,6 +45,16 @@ MALFORMED="$TEST_ROOT/malformed.log"
 printf '%s\n' 'fatal: benchmark failed before producing a summary' >"$MALFORMED"
 if parse_benchmark_result "$MALFORMED"; then
     echo "accepted a benchmark transcript without its required summary" >&2
+    exit 1
+fi
+
+MISMATCHED="$TEST_ROOT/mismatched.log"
+printf '%s\n' \
+    'Requests:       500 OK, 7 HTTP errors, 0 connection failures' \
+    'HTTP errors by status: 503=6' \
+    'Throughput:     12345 pts/sec' >"$MISMATCHED"
+if parse_benchmark_result "$MISMATCHED"; then
+    echo "accepted an HTTP status histogram that did not account for every error" >&2
     exit 1
 fi
 

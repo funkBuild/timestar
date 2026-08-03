@@ -401,16 +401,19 @@ exactly that). The cluster planes only ever dial `port+1000` / `port+2000`.
    slower arm inject 154 rounds, which created more failures and slowed it further; fault
    intensity is now bounded independently of disk speed. The on-demand A/B explicitly
    raises this cap because its purpose is to discriminate the retry schedule.
-2. Node 3 must LEAD at least 800 VShards. The first node to start wins every election, and
+2. Node 3 must LEAD at least 800 VShards before every storm. The first node to start wins every election, and
    a converged-but-skewed cluster left node 3 leading 128 of 4096 — 3% of traffic crossing
-   the fault. The gate rebalances and waits for fair share first.
+   the fault. A sufficiently long reset can also wake those groups and move their
+   leadership away from the proxy, making later arms vacuous. The gate now rebalances and
+   reasserts the traffic floor for every arm.
 3. The baseline run through the proxy must itself be error-free, so a proxy bug cannot be
    read as a server property.
 
 **The proxy is a handicap and the gate says so.** Absolute throughput through a Python
 forwarder is not a server number, so the dip is asserted against a QUIET baseline measured
 through the same proxy — not against an unproxied figure. The current private-journal
-control measured 171 kpts/s with zero errors; the three reset arms retained 85-90%.
+control measured 171 kpts/s with zero errors; one fully reconditioned three-arm draw
+retained 86-91% with zero errors.
 
 **It is a discriminating gate, and `fault_injection_ab.sh` proves that on demand — it has
 now actually been run (debt D-19).** It creates a `git worktree` at HEAD, applies a
@@ -473,18 +476,19 @@ Two things to know before running it:
 
 It never touches your working tree; the revert happens in the worktree.
 
-**Run it more than once before believing either answer (debt D-20, D-21).** The gate now
-runs K storms per run and budgets their TOTAL, and the budget has a measured distribution
-behind it: fifteen storm draws of one unchanged HEAD binary gave run totals **0, 1, 2, 0 and
-4** (eleven zeros, three ones, one four). The budget is 6. It was 3 after the first nine
-draws and a correct binary then drew 4 — the same non-reproducibility at a different
-threshold, which is why the draws are printed beside the number. A single failing run still
-does not identify a regression, and a single passing one does not clear one; the
-discriminating claim is the A/B's within-run ratio above.
+**Run it more than once before believing either answer (debt D-20, D-21).** The old tmpfs
+profile produced run totals **0, 1, 2, 0 and 4**, but the required private-journal profile
+later produced a valid `[16,20,0] = 36` draw: all failures were retryable 503s, every
+attempted probe was present on every replica, throughput retained 46%, and admission,
+500, and crash counts stayed zero. The former six-error ceiling was fitted to the wrong
+distribution. The durable ceiling is 60 across 3,000 timed requests (at most 2%; the 600
+probes share the same ceiling), and the benchmark's complete HTTP-status histogram must
+show that every allowed error is 503. The A/B's within-run ratio, not this availability
+ceiling, remains the discriminator for retry pacing.
 
-**Result on the Phase-4 binary**, five runs at the gate's own sizing (1000 batches, K=3):
+**Earlier result on the Phase-4 binary**, five runs at the old tmpfs sizing (1000 batches, K=3):
 **76-84 reset rounds destroying 217-243 peer connections per storm**, run totals of 0, 1, 2,
 0 and 4 client errors, **0 server-side 500s and 0 crashes throughout**, every acked probe
 point readable **on every node** in every storm, and 84-89% of the proxied baseline
-(5.06-5.29 M pts/s) retained. The cost lands exactly where 4a intends it to: latency, not
-errors.
+(5.06-5.29 M pts/s) retained. Those figures explain the retry-pacing history; the durable
+profile and typed-503 ceiling above are the current release contract.

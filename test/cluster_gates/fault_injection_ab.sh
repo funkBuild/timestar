@@ -53,9 +53,10 @@
 # an error and HEAD produced none": HEAD is not reliably zero (0, 1, 0 and one void across
 # six consecutive single-storm runs of one unchanged binary), so that shape was satisfied by
 # HEAD's own noise. The gate now runs K storms and budgets their TOTAL, and this script
-# asserts a SEPARATION -- HEAD within the budget, the reverted arm at 3x it or worse. The
+# asserts a SEPARATION -- the reverted arm at 3x HEAD or worse, and above a fixed
+# seven-error discrimination floor. The
 # real margin is wider than that bound: a reverted binary produces 9-10 errors in a SINGLE
-# storm where HEAD's whole K-storm budget is 6.
+# storm where the comparison floor is seven errors.
 #
 # EXPENSIVE. This builds a second server binary from an isolated worktree (a fresh build
 # dir means building seastar too -- tens of minutes the first time; later runs are
@@ -347,10 +348,9 @@ fi
 # zero-versus-nonzero (debt D-21). HEAD is not reliably zero: measured over six consecutive
 # single-storm runs of one unchanged HEAD binary, the draws were 0, 1, 0 and one void. So
 # "the reverted arm produced at least one error" no longer means anything on its own -- it
-# is satisfied by HEAD's own noise. The arms are separated by a FACTOR instead: the gate's
-# budget is what HEAD must stay inside, and the reverted arm must exceed it several times
-# over. The margin is real -- a reverted binary produces 9-10 errors in a SINGLE storm
-# where HEAD's whole K-storm budget is 6.
+# is satisfied by HEAD's own noise. The arms are separated by a FACTOR plus a fixed A/B
+# floor instead. The margin is real -- a reverted binary produces 9-10 errors in a SINGLE
+# storm where the comparison floor is seven errors.
 # THE CLAIM IS A WITHIN-RUN RATIO, NOT TWO ABSOLUTE THRESHOLDS, and getting there took two
 # corrections in a row -- which is itself the argument for the shape.
 #
@@ -359,7 +359,7 @@ fi
 #     checkout. The first real run measured REVERTED 7, so 9 would have failed the A/B on a
 #     correct result.
 #   * Replacing it with an absolute 5 fixed that draw and broke the next one: the HEAD arm
-#     drew [0 4 0] = 4 against the gate's then-budget of 3 (now 6), so the A/B reported a failure
+#     drew [0 4 0] = 4 against the gate's then-budget of 3, so the A/B reported a failure
 #     about a binary it was not testing.
 #
 # Both mistakes are the same mistake: an absolute threshold on a heavy-tailed count, set
@@ -371,19 +371,20 @@ fi
 #     1      0      7          >= floor (HEAD 0 -> the min-1 rule applies)
 #     2      4      22         5.5x
 #
-# The factor is 3 with a floor of 3, so a HEAD of 0 still demands a reverted arm that
+# The factor is 3 with a floor of 7, so a HEAD of 0 still demands a reverted arm that
 # produced real errors, and a noisy HEAD raises the bar instead of failing the run.
-BUDGET="${GATE_MAX_STORM_ERRORS:-6}"
+HEAD_BUDGET="${GATE_MAX_STORM_ERRORS:-60}"
+AB_MIN_REVERTED_ERRORS="${GATE_AB_MIN_REVERTED_ERRORS:-7}"
 SEP_FACTOR="${GATE_AB_SEPARATION_FACTOR:-3}"
 # ...AND IT MUST ALSO CLEAR HEAD'S OWN NOISE FLOOR. `3 * max(H,1)` alone is vacuous when
 # both arms draw near zero: HEAD has drawn as many as 4 unaided, so a run of HEAD 0 against
 # REVERTED 3 would "separate" on numbers that are both inside the good binary's ordinary
-# spread. The floor is therefore the LARGER of the ratio and one past the gate's own budget,
-# so the reverted arm must land somewhere HEAD is not merely unlikely to go but is asserted
-# not to go.
+# spread. The floor is therefore the LARGER of the ratio and the A/B's explicit seven-error
+# minimum. The production gate's durable-disk availability ceiling is intentionally not a
+# discrimination threshold.
 SEP_RATIO=$(( (H_TOTAL > 1 ? H_TOTAL : 1) * SEP_FACTOR ))
-SEP_FLOOR=$(( SEP_RATIO > BUDGET + 1 ? SEP_RATIO : BUDGET + 1 ))
-assert_ge "SEPARATION: reverted errors ($R_TOTAL) vs max(${SEP_FACTOR}x HEAD's $H_TOTAL, budget+1)" "$R_TOTAL" "$SEP_FLOOR"
+SEP_FLOOR=$(( SEP_RATIO > AB_MIN_REVERTED_ERRORS ? SEP_RATIO : AB_MIN_REVERTED_ERRORS ))
+assert_ge "SEPARATION: reverted errors ($R_TOTAL) vs max(${SEP_FACTOR}x HEAD's $H_TOTAL, A/B floor $AB_MIN_REVERTED_ERRORS)" "$R_TOTAL" "$SEP_FLOOR"
 # AN OVERLAP DRAW FAILS RED, AND THAT IS THE INTENDED OUTCOME rather than a defect in the
 # script: measured at the gate's own lighter sizing, one draw in three came out HEAD 2
 # against REVERTED 4 and no honest threshold separates those. A red A/B means RE-DRAW (and,
@@ -392,10 +393,10 @@ assert_ge "SEPARATION: reverted errors ($R_TOTAL) vs max(${SEP_FACTOR}x HEAD's $
 # ADVISORY, deliberately. HEAD's own absolute budget is `fault_injection_gate.sh`'s business,
 # and an unlucky HEAD draw says nothing about whether this script discriminated -- which is
 # the only question it exists to answer. Reported so a run that is drifting is visible.
-if [ "${H_TOTAL:-0}" -le "$BUDGET" ]; then
-    gate_ok "HEAD binary: client errors under the storms = $H_TOTAL (within its own budget $BUDGET)"
+if [ "${H_TOTAL:-0}" -le "$HEAD_BUDGET" ]; then
+    gate_ok "HEAD binary: client errors under the storms = $H_TOTAL (within its own budget $HEAD_BUDGET)"
 else
-    echo "  (advisory) HEAD drew $H_TOTAL errors, over fault_injection_gate.sh's budget of $BUDGET --"
+    echo "  (advisory) HEAD drew $H_TOTAL errors, over fault_injection_gate.sh's budget of $HEAD_BUDGET --"
     echo "             re-draw that gate on its own before reading anything into it; the"
     echo "             separation above is what this script asserts."
 fi

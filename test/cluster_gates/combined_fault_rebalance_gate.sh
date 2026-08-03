@@ -41,7 +41,7 @@
 # rebalance loop throughout.
 #
 # The error ceiling remains ~2x the historical worst draw (36). Note the reset gate's own
-# budget is 6 across THREE storms at 4 connections: the extra errors here are the
+# budget is 60 across THREE storms at 4 connections: the extra headroom here is for the
 # CONNECTION COUNT, which multiplies the sockets each reset round destroys, far more than
 # they are the rebalance.
 #

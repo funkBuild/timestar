@@ -12,13 +12,17 @@ run_bounded_command() { # TIMEOUT_SECONDS KILL_AFTER_SECONDS COMMAND...
 }
 
 # Parse the summary emitted by timestar_insert_bench. Results are returned in
-# BENCHMARK_RESULT_HTTP_ERRORS, BENCHMARK_RESULT_CONNECTION_FAILURES, and
-# BENCHMARK_RESULT_THROUGHPUT. Connection failures are optional because older
-# focused drivers did not print that counter, but the two release-gating fields
-# must both be present or the transcript is not a usable measurement.
+# BENCHMARK_RESULT_HTTP_ERRORS, BENCHMARK_RESULT_HTTP_503,
+# BENCHMARK_RESULT_HTTP_OTHER, BENCHMARK_RESULT_CONNECTION_FAILURES, and
+# BENCHMARK_RESULT_THROUGHPUT. The status histogram must account for every HTTP
+# error so a release gate cannot accept an opaque/non-retryable response inside
+# a numeric error budget.
 parse_benchmark_result() { # TRANSCRIPT
     local transcript="$1"
+    local statuses entry status count status_total=0
     BENCHMARK_RESULT_HTTP_ERRORS=""
+    BENCHMARK_RESULT_HTTP_503=0
+    BENCHMARK_RESULT_HTTP_OTHER=0
     BENCHMARK_RESULT_CONNECTION_FAILURES=""
     BENCHMARK_RESULT_THROUGHPUT=""
 
@@ -29,7 +33,24 @@ parse_benchmark_result() { # TRANSCRIPT
     BENCHMARK_RESULT_THROUGHPUT=$(grep -oE 'Throughput:[[:space:]]*[0-9.]+' "$transcript" |
         head -1 | grep -oE '[0-9.]+')
 
-    [ -n "$BENCHMARK_RESULT_HTTP_ERRORS" ] && [ -n "$BENCHMARK_RESULT_THROUGHPUT" ]
+    [ -n "$BENCHMARK_RESULT_HTTP_ERRORS" ] && [ -n "$BENCHMARK_RESULT_THROUGHPUT" ] || return 1
+    statuses=$(sed -n 's/^[[:space:]]*HTTP errors by status:[[:space:]]*//p' "$transcript" | head -1)
+    [ -n "$statuses" ] || return 1
+    if [ "$statuses" != none ]; then
+        for entry in $statuses; do
+            status=${entry%%=*}
+            count=${entry#*=}
+            case "$status" in ''|*[!0-9]*) return 1 ;; esac
+            case "$count" in ''|*[!0-9]*) return 1 ;; esac
+            status_total=$((status_total + count))
+            if [ "$status" = 503 ]; then
+                BENCHMARK_RESULT_HTTP_503=$((BENCHMARK_RESULT_HTTP_503 + count))
+            else
+                BENCHMARK_RESULT_HTTP_OTHER=$((BENCHMARK_RESULT_HTTP_OTHER + count))
+            fi
+        done
+    fi
+    [ "$status_total" -eq "$BENCHMARK_RESULT_HTTP_ERRORS" ]
 }
 
 # Preserve a failed benchmark independently of the gate's disposable data
