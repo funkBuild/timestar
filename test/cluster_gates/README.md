@@ -24,7 +24,7 @@ not probes, so they can be run from CI or a release checklist.
 | `delete_receipt_retirement_gate.sh` | a real canonical exact delete changes four seed points to three on every node, then sustained deletes cross the 1,024-receipt per-VShard capacity on every replica, advance the replicated retirement floor twice, preserve expired/retained retry outcomes, become snapshot-covered, reclaim production-sized sealed v1 journal segments, and retain only the current snapshot sidecar |
 | `homogeneous_v1_rejection_gate.sh` | exact-v1 codec and real-socket handshake rejection, plus a production restart over a real acknowledged WAL whose version field is changed to an unsupported value; startup must exit before HTTP and preserve the source byte-for-byte |
 | `mtls_peer_identity_gate.sh` | matching per-peer IP SANs converge and commit; with the other voter down, a certificate signed by the cluster CA for the wrong configured endpoint produces bounded 503, while rolling that node to a newly issued certificate for the correct endpoint commits that exact write and restores full health |
-| `cluster_backup_restore_gate.sh` | an authenticated live export survives Group-0 leader loss, validates all 4,096 exact-v1 units, rejects missing/corrupt/extra artifacts, resumes a killed offline import, requires every prepared voter for release, rejects source authority, restores under fresh identities, and preserves the acknowledged baseline through full-cluster restart |
+| `cluster_backup_restore_gate.sh` | an authenticated live export survives Group-0 leader loss, validates all 4,096 exact-v1 units, rejects wrong-key/missing/corrupt/extra artifacts, resumes a killed offline import, requires every prepared voter for release, rejects source authority, restores under fresh identities, and preserves the acknowledged baseline through full-cluster restart |
 
 All of them take an optional server binary as `$1` (default
 `build/bin/timestar_http_server`), so a "before" binary can be measured the same way.
@@ -84,10 +84,12 @@ health.
 `cluster_backup_restore_gate.sh` also uses at most three 1-GiB, one-reactor
 processes. Source and restored clusters run sequentially on the same ports, all
 offline negative/import/finalization arms run one process at a time, and every
-root and artifact is under `build/tmp`. The export archive is intentionally on
-storage visible to each local process so a new Group-0 leader can resume the
-same checkpoint; production multi-host qualification must provide the
-equivalent durable shared mount or constrain resume to the original node.
+root and artifact is under `build/tmp`. It generates owner-only exact-v1 test
+keys inside that workspace and proves a valid archive is refused under a
+different key before any import. The export archive is intentionally on storage
+visible to each local process so a new Group-0 leader can resume the same
+checkpoint; production multi-host qualification must provide the equivalent
+durable shared mount or constrain resume to the original node.
 
 ## Run them ONE AT A TIME, with the previous run's data dirs deleted
 

@@ -402,10 +402,10 @@ No additional manual steps are required -- the NativeIndex rebuilds its in-memor
   explicitly v1, but the v1 layout is updated in place and has no development-
   build migration guarantee.
 
-## Required Cluster Backup/Restore Work
+## Cluster Backup/Restore Delivery Record
 
-The remaining ordered task list before this document can provide an RF=3
-procedure is:
+The completed implementation and qualification sequence for the RF=3 procedure
+is:
 
 - [x] Define and validate a bounded exact-v1 artifact containing all canonical
   VShard units and portable schema, retention, and frozen delete-plan state,
@@ -442,6 +442,6 @@ procedure is:
   concurrent set before and after a full-cluster restart. At most three
   one-reactor, 1-GiB processes ran, observed aggregate RSS stayed below 400 MiB,
   every artifact stayed under `build/tmp`, and `/tmp` stayed at 105 MiB.
-- [ ] Publish artifact retention, capacity/headroom, authenticated integrity or
+- [x] Publish artifact retention, capacity/headroom, authenticated integrity or
   encryption, key management, off-site replication, restore, and disaster-
   recovery procedures.
