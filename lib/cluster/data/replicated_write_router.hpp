@@ -156,8 +156,9 @@ private:
     // Ask the local Raft plane to promptly check the groups that still believe `node`
     // leads them, after this write GAVE UP with `node` unreachable (debt D-14). Called at
     // give-up time and not per failed attempt, which keeps an absorbed connection reset
-    // from disturbing healthy groups. RATE-LIMITED per node: selecting the groups is
-    // O(groups on this shard), while the wake itself lasts exactly one tick pass.
+    // from disturbing healthy groups. RATE-LIMITED per node for a complete election
+    // window: selecting the groups is O(groups on this shard), one wake already removes
+    // the check-tick granularity, and credited periodic passes do the rest.
     void wakeGroupsBehind(NodeId node);
 
     const VShardDirectory& dir_;
@@ -167,7 +168,7 @@ private:
     // Last time we asked the plane to wake groups behind a given peer.
     std::map<NodeId, seastar::lowres_clock::time_point> lastWake_;
     uint64_t remoteTransportFailures_ = 0;
-    static constexpr auto kWakeInterval = std::chrono::milliseconds(500);
+    static constexpr auto kWakeInterval = kElectionDeadline;
 };
 
 }  // namespace timestar::data

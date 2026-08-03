@@ -20,6 +20,7 @@
 #   GATE_CONNECTIONS=16      4x the reset gate's connection count
 #   GATE_STORM_ROUNDS=2      two storms, not three -- see the disk note below
 #   GATE_BENCH_BATCHES=1200  keeps each fast arm above the per-storm reset floor
+#   GATE_RESET_ROUNDS=50     exact per-arm reset exposure on every host
 #
 # THE BUDGET IS ITS OWN, AND IT IS NOT THE RESET GATE'S. Two faults produce more client
 # errors than one, and pretending otherwise would either fail this gate on correct
@@ -36,9 +37,10 @@
 # Those are historical 10,000-timestamp results. Two current 1,200-request durable draws
 # measured totals of 26 and 54 errors, 49-66 reset rounds and 196-266 destroyed
 # connections per storm, 38-53% retained throughput, 1/15 transfers and 195/201 rebalance
-# calls. Its 150-call floor is tied to the reset anti-vacuity floor: a minimally valid
-# 70-round run lasts about 21 seconds and must therefore execute the 0.2-second three-node
-# rebalance loop throughout.
+# calls. Later same-binary draws proved that the 35--70-round range changed the property:
+# fast arms passed at 50--67 rounds, while slow arms hit 70 and crossed the error ceiling.
+# The profile now fixes every arm at 50 rounds (15 seconds of repeated RSTs). Its 150-call
+# run-total floor proves the 0.2-second three-node rebalance loop ran throughout both arms.
 #
 # The error ceiling remains ~2x the historical worst draw (36). Note the reset gate's own
 # budget is 60 across THREE storms at 4 connections: the extra headroom here is for the
@@ -76,6 +78,7 @@ export GATE_REBALANCE_STORM=1
 export GATE_CONNECTIONS="${GATE_CONNECTIONS:-16}"
 export GATE_STORM_ROUNDS="${GATE_STORM_ROUNDS:-2}"
 export GATE_BENCH_BATCHES="${GATE_BENCH_BATCHES:-1200}"
+export GATE_RESET_ROUNDS="${GATE_RESET_ROUNDS:-50}"
 export GATE_MAX_STORM_ERRORS="${GATE_MAX_STORM_ERRORS:-80}"
 export GATE_MIN_COMBINED_CALLS="${GATE_MIN_COMBINED_CALLS:-150}"
 # The rebalance storm competes with the bench for the same reactors, so the throughput dip

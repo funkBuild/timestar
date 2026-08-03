@@ -204,10 +204,14 @@ inventory and rules.
   now rejects a nonzero or incomplete benchmark result, retains the complete
   failed transcript outside disposable node roots, and hard-kills a benchmark
   that cannot finish its graceful shutdown after the configured deadline.
-  Reset intensity is capped at 70 rounds per storm as well as floored at 35: an
-  uncapped exact-candidate arm that transiently ran slower injected 154 rounds,
-  then amplified its own latency and error count even though Raft admission
-  remained empty with zero refusals.
+  Reset intensity was first capped at 70 rounds per storm as well as floored at
+  35: an uncapped exact-candidate arm that transiently ran slower injected 154
+  rounds, then amplified its own latency and error count even though Raft
+  admission remained empty with zero refusals. Later same-binary combined draws
+  proved that even the 35--70 range changed the property: fast arms passed at
+  50--67 rounds, while slow arms reached 70 and crossed the error ceiling. Every
+  arm now requires exactly 50 rounds (15 seconds of repeated RSTs); an early end
+  is VOID, so machine speed can neither strengthen nor weaken the fault silently.
   Its old durable-disk control was invalid: 920/1,000 fault-free requests were
   shed as overloaded. A later 1,500-by-500 profile passed one storm but turned
   successive storms into a storage-overload feedback loop, with errors
@@ -224,7 +228,11 @@ inventory and rules.
   move leadership away from the reset proxy, every storm now re-establishes and
   reasserts at least 800 proxied leaders; a corrected diagnostic draw held 1,365
   before each arm and passed `[0,0,0]` with 86% worst retention. System `/tmp`
-  remained at 105 MiB; gate data lived and cleaned under `build/tmp`.
+  remained at 105 MiB; gate data lived and cleaned under `build/tmp`. The gate
+  also re-establishes public readiness before durability read-back. A fixed
+  three-second delay once queried two replicas while several KiB of admitted
+  Raft work remained and misreported `QUERY_INCOMPLETE` as lost data; the bounded
+  readiness wait then proves admission drained before interpreting the count.
 - [x] Replace the noisy retry-pacing A/B with a deterministic counterfactual.
   The former sequential live comparison produced a reversed draw: the flat
   20-ms pacing arm had zero errors while HEAD had six at matched reset
@@ -249,7 +257,17 @@ inventory and rules.
   pass from the old 400-pass window. The corrected live run admitted 46 typed
   `503`s, retained 33% in its worst arm, executed 201 rebalance calls, preserved
   every acknowledged probe on all replicas, and observed no server `500` or
-  crash.
+  crash. A later slow draw exposed the remaining cross-request seam: every shard
+  could schedule that one-pass wake again for the same leader every 500 ms.
+  Repeated transport give-ups then added whole-leader scans and tick bursts while
+  the data plane was already distressed. One prompt pass plus credited periodic
+  passes already spans the election, so per-node wakes are now coalesced for the
+  six-second election window. The regression runs two complete dead-peer writes
+  (longer than the retired cooldown) and requires only one wake per peer; the
+  full router suite remains green. With fixed 50-round exposure, the corrected
+  combined diagnostic admitted 29 typed `503`s, retained 45% in its worst arm,
+  executed 189 rebalance calls, drained admission, and read all 200 probes from
+  every replica with zero connection failure, `500`, or crash.
 - [x] Fence the skewed-movement control/storm arm boundary on public readiness.
   The SLO collector found a clean 500/500 control whose final acknowledged
   writes were still applying when the storm client's strict, one-shot health

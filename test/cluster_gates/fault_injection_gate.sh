@@ -89,7 +89,7 @@
 #   GATE_MAX_STORM_ERRORS=N    total retryable-503 budget across all K (default 60)
 #   GATE_BATCH_SIZE=N           timestamps per timed request (default 300)
 #   GATE_BENCH_BATCHES=N        timed requests per arm (default 1000)
-#   GATE_MAX_RESET_ROUNDS=N     fixed fault-intensity cap per storm (default 70)
+#   GATE_RESET_ROUNDS=N         exact fault intensity per storm (default 50)
 #   GATE_BENCH_TIMEOUT=N        seconds before TERM (default 300)
 #   GATE_BENCH_KILL_AFTER=N     TERM-to-KILL grace in seconds (default 15)
 #   exit 0 = pass, 1 = property failed, 2 = setup refused, 3 = VOID (re-draw)
@@ -105,29 +105,17 @@ BENCH="$GATE_BENCH_BINARY"
 command -v python3 >/dev/null || { echo "python3 required for the reset proxy"; exit 2; }
 
 PORTS="19410 19411 19412"
-# Minimum resets the run must actually have injected. Without this the gate is vacuous:
-# a proxy that never fired, or a bench that finished before the storm started, would pass.
+# Exact resets the run must inject. Without this the gate is either vacuous (a proxy that
+# never fired) or machine-speed dependent (a slower bench receives a stronger fault).
 #
-# THESE FLOORS ARE SET AGAINST THE OBSERVED STORM, not against zero (debt D-4). They used
-# to be 8 and 8 -- about 5% of what a real run injects, which is barely more than the
-# vacuity check they replaced: a storm that fired 9 times would have satisfied them while
-# proving almost nothing about a burst. They are ~50% of observed, which is the largest
-# fraction that still leaves room for a slower box (the resetter fires on a fixed 0.3 s
-# clock while the bench length is machine-dependent, so a machine that finishes the bench
-# in half the time legitimately injects half the rounds). A run that comes in under these
-# is not a pass and is not a failure of the property either -- it is a run that did not
-# test it, and it must say so.
-#
-# They came down from 70/180 with the bench size (see BENCH_BATCHES below): 70/180 was
-# ~50% of a 2000-batch storm. The current private-journal profile measured 66-69
-# rounds and 266-276 destroyed connections per storm, so 35/100 remains a
-# conservative approximately-half-observed floor.
-#
-# If a genuinely slower/faster box needs a different number, override rather than edit:
-# GATE_MIN_RESET_ROUNDS / GATE_MIN_RESET_CONNS. Record the observed counts when you do.
-MIN_RESET_ROUNDS="${GATE_MIN_RESET_ROUNDS:-35}"
+# Earlier bounds allowed 35--70 rounds. That twofold range made the result depend on host
+# speed: a fast exact-candidate draw received 50--67 rounds and passed, while a slower draw
+# hit 70 in both arms and crossed the availability ceiling despite an error-free control.
+# Fifty rounds is still 15 seconds of repeated RSTs and about 200 live connections at the
+# default topology. A run that cannot complete the exact count is VOID, never a weaker
+# pass. Override only to run a separately recorded intensity profile.
+RESET_ROUNDS="${GATE_RESET_ROUNDS:-50}"
 MIN_RESET_CONNS="${GATE_MIN_RESET_CONNS:-100}"
-MAX_RESET_ROUNDS="${GATE_MAX_RESET_ROUNDS:-70}"
 # HOW BIG EACH BENCH IS, and why K STORMS FORCED IT DOWN. Every bench here writes
 # `batches * batch-size * 10 fields` points into a cluster that keeps all of them at RF=3,
 # and NOTHING is deleted between storms -- the K storms share one cluster by design, so
@@ -141,8 +129,9 @@ MAX_RESET_ROUNDS="${GATE_MAX_RESET_ROUNDS:-70}"
 # So the K-storm restructure and the old bench size are not simultaneously affordable, and
 # the bench size is the right thing to give up: storm INTENSITY is set by the resetter (it
 # destroys EVERY live connection on every round, 0.3 s apart), not by how long the bench
-# runs. A shorter bench buys fewer ROUNDS, not weaker ones; a slower bench cannot buy more
-# than MAX_RESET_ROUNDS, so disk variance cannot silently strengthen the fault.
+# runs. The resetter now injects exactly RESET_ROUNDS unless the arm ends too soon, in
+# which case the per-storm equality check marks the draw VOID. Disk variance therefore
+# cannot silently strengthen or weaken the fault.
 #
 # The old disk-backed invocation kept 1000 x 10,000 timestamps with four
 # connections: 400,000 points simultaneously entered the write router. Its
@@ -196,14 +185,9 @@ REBALANCE_STORM="${GATE_REBALANCE_STORM:-0}"
 MIN_COMBINED_CALLS="${GATE_MIN_COMBINED_CALLS:-0}"
 CONNECTIONS="${GATE_CONNECTIONS:-4}"
 require_positive_setting GATE_STORM_ROUNDS "$STORM_ROUNDS"
-require_positive_setting GATE_MIN_RESET_ROUNDS "$MIN_RESET_ROUNDS"
+require_positive_setting GATE_RESET_ROUNDS "$RESET_ROUNDS"
 require_positive_setting GATE_MIN_RESET_CONNS "$MIN_RESET_CONNS"
-require_positive_setting GATE_MAX_RESET_ROUNDS "$MAX_RESET_ROUNDS"
 require_positive_setting GATE_CONNECTIONS "$CONNECTIONS"
-[ "$MAX_RESET_ROUNDS" -ge "$MIN_RESET_ROUNDS" ] || {
-    echo "ABORT: GATE_MAX_RESET_ROUNDS=$MAX_RESET_ROUNDS is below the $MIN_RESET_ROUNDS-round anti-vacuity floor" >&2
-    exit 2
-}
 case "$REBALANCE_STORM" in
     0|1) ;;
     *) echo "ABORT: GATE_REBALANCE_STORM must be 0 or 1" >&2; exit 2 ;;
@@ -430,7 +414,7 @@ while [ "$storm" -le "$STORM_ROUNDS" ]; do
     ( run_benchmark >"$STORM_TRANSCRIPT" 2>&1 ) &
     BENCHPID=$!
     ( ROUNDS=0
-      while [ ! -f $GATE_TMP_ROOT/tsgate_fi_stop ] && [ "$ROUNDS" -lt "$MAX_RESET_ROUNDS" ]; do
+      while [ ! -f $GATE_TMP_ROOT/tsgate_fi_stop ] && [ "$ROUNDS" -lt "$RESET_ROUNDS" ]; do
           kill -USR1 "$PROXY_PID" 2>/dev/null && ROUNDS=$((ROUNDS + 1))
           sleep 0.3
       done
@@ -536,7 +520,11 @@ while [ "$storm" -le "$STORM_ROUNDS" ]; do
     # probe 5xx read back 200 of 200 attempted, and the old `== PROBE_OK` assertion called
     # that a failure three times over. What must never happen is FEWER than the acked count
     # (loss) or MORE than were attempted (fabrication or a double count).
-    sleep 3
+    # A finished client is not a drained cluster. Under the slowest valid draw the old
+    # fixed three-second pause left several KiB of admitted Raft proposals in flight and
+    # two follower queries correctly returned QUERY_INCOMPLETE. Wait on the product's
+    # public readiness contract before calling that durability loss.
+    wait_healthy "$PORTS" 180 || gate_exit
     echo "=== storm $storm raft proposal admission ==="
     report_raft_admission
     for p in $PORTS; do
@@ -548,13 +536,12 @@ while [ "$storm" -le "$STORM_ROUNDS" ]; do
         assert_le "storm $storm: probe points readable on :$p (attempted $PROBE)" "${N:-999999}" "$PROBE"
     done
 
-    # These are PER-STORM floors, not merely run totals. Checking only the sum
-    # allowed a strong later draw to hide an anaemic earlier one (observed 33 +
-    # 70 rounds satisfying a nominal 35 x 2 assertion). Finish the attributable
-    # read-back above, then void immediately: this draw did not test the promised
-    # fault intensity even if all acknowledged data remained correct.
-    [ "$ROUNDS" -ge "$MIN_RESET_ROUNDS" ] ||
-        gate_void "storm $storm injected only $ROUNDS reset rounds, below the per-storm $MIN_RESET_ROUNDS floor"
+    # Exact PER-STORM intensity, not a total or a range. Checking only the sum once let a
+    # strong arm hide an anaemic one; allowing 35--70 later made a slow host receive twice
+    # the disturbance of a fast host. Finish attributable read-back, then void any draw
+    # that did not execute the requested count.
+    [ "$ROUNDS" -eq "$RESET_ROUNDS" ] ||
+        gate_void "storm $storm injected $ROUNDS reset rounds, expected exactly $RESET_ROUNDS"
     [ "$RESET_CONNS" -ge "$MIN_RESET_CONNS" ] ||
         gate_void "storm $storm destroyed only $RESET_CONNS connections, below the per-storm $MIN_RESET_CONNS floor"
 
@@ -592,7 +579,7 @@ echo "GATE_METRIC storm_probe_5xx $TOT_PROBE_5XX"
 echo "GATE_METRIC storm_probe_non_503 $TOT_PROBE_NON_503"
 echo "GATE_METRIC reset_rounds_total $TOT_ROUNDS"
 echo "GATE_METRIC reset_conns_total $TOT_CONNS"
-echo "GATE_METRIC reset_round_cap_per_storm $MAX_RESET_ROUNDS"
+echo "GATE_METRIC reset_rounds_per_storm $RESET_ROUNDS"
 echo "GATE_METRIC storm_count $STORM_ROUNDS"
 echo "GATE_METRIC worst_storm_pct $WORST_PCT"
 echo "GATE_METRIC rebalance_transfers $TOT_TRANSFERS"
@@ -606,9 +593,8 @@ echo "GATE_METRIC uncommitted_raft_refusals_total $LAST_RAFT_REFUSALS"
 
 # THE ANTI-VACUITY ASSERTIONS. Without a real storm this gate proves nothing: a proxy that
 # never fired, or one that fired while no connection was open, would otherwise pass. The
-# floors are PER STORM and scaled by K here, so K feeble storms cannot substitute for one
-# real one.
-assert_ge "reset rounds injected" "$TOT_ROUNDS" "$((MIN_RESET_ROUNDS * STORM_ROUNDS))"
+# exact count is PER STORM, so K feeble storms cannot substitute for one real one.
+assert_eq "reset rounds injected" "$TOT_ROUNDS" "$((RESET_ROUNDS * STORM_ROUNDS))"
 assert_ge "peer connections actually destroyed" "$TOT_CONNS" "$((MIN_RESET_CONNS * STORM_ROUNDS))"
 # In combined mode the SECOND fault needs its own anti-vacuity floor, and it is on the CALLS
 # rather than on the transfers -- which is a MEASUREMENT, not a weakening.

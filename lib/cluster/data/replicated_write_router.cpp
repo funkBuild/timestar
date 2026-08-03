@@ -21,8 +21,11 @@ namespace timestar::data {
 //
 // A RESET connection to a HEALTHY peer is absorbed inside the retry budget -- that is
 // exactly what 4a's schedule is for -- so it never reaches here and never touches Raft. A
-// peer that is really GONE fails the batch, and only then do we un-hibernate the groups
-// behind it.
+// peer that is really GONE fails the batch, and only then do we schedule one prompt
+// check-tick for the groups behind it. Skipped passes are credited, so ordinary periodic
+// checks carry a dead follower through the rest of its election timeout. Another client
+// give-up inside that same election window cannot make it campaign earlier; coalescing it
+// avoids another O(groups) selection and tick burst while the data plane is distressed.
 //
 // Waking on every failed ATTEMPT instead was measured to cost errors on the reset gate: it
 // puts ~1364 groups (a third of the map) on full-rate ticking for 8 s, and a follower
@@ -36,17 +39,20 @@ void ReplicatedBatchWriteRouter::wakeGroupsBehind(NodeId node) {
     auto it = lastWake_.find(node);
     if (it != lastWake_.end() && now - it->second < kWakeInterval)
         return;
-    lastWake_[node] = now;
     // Local and synchronous: the router and the Raft groups it is talking about live on the
     // SAME shard (ReplicatedDataPlane owns both), so this needs no cross-shard hop and
     // cannot suspend. Other shards' routers wake their own groups when their own slices
     // fail, which is what makes per-shard coverage complete without a fan-out.
     const size_t woken = local_.wakeGroupsLedBy(node);
-    if (woken > 0)
+    if (woken > 0) {
+        // A zero result is not a wake and must not suppress a later one: the local leader
+        // view can change between requests as Raft messages arrive.
+        lastWake_[node] = now;
         timestar::http_log.info(
-            "cluster: node {} unreachable for writes; woke {} group(s) that still believe it "
-            "leads them, so they campaign at the normal election timeout",
+            "cluster: node {} unreachable for writes; scheduled one prompt Raft check for {} "
+            "group(s) that still believe it leads them",
             node, woken);
+    }
 }
 
 seastar::future<> ReplicatedBatchWriteRouter::write(WriteBatch batch) {

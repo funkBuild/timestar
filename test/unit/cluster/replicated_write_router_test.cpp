@@ -901,6 +901,58 @@ seastar::future<> testUnreachablePeerWakesItsGroups() {
     EXPECT_EQ(local.wakes[3], 1u);
 }
 
+// A second client give-up inside the SAME election window has no new timing information.
+// The first wake already schedules a prompt check, and the registry's ordinary credited
+// passes carry every dead follower through its election timeout. Repeating the O(groups)
+// scan/tick every 500 ms created a feedback loop under combined storage pressure, where
+// healthy peers began timing out and caused still more whole-leader wakes.
+seastar::future<> testRepeatedGiveupsCoalesceWakeForOneElection() {
+    VShardDirectory dir(1, rf3Map(3));
+    WakeCountingSink local;
+    ScriptedTransport client;
+    client.deadNodes = {2, 3};
+    NoLeaderResolver leaders;
+    ReplicatedBatchWriteRouter router(dir, local, client, leaders);
+
+    EXPECT_THROW(co_await router.write(manySeries(30)), RetryableWriteError);
+    EXPECT_EQ(local.wakes[2], 1u);
+    EXPECT_EQ(local.wakes[3], 1u);
+
+    // A complete failed write spans more than the retired 500-ms cooldown, so the old
+    // behavior wakes both peers again here. It is still far inside the six-second
+    // election window and must now be coalesced.
+    EXPECT_THROW(co_await router.write(manySeries(30)), RetryableWriteError);
+    EXPECT_EQ(local.wakes[2], 1u);
+    EXPECT_EQ(local.wakes[3], 1u);
+}
+
+class LateLeaderWakeSink : public ScriptedLocalSink {
+public:
+    std::map<NodeId, size_t> calls;
+    size_t wakeGroupsLedBy(NodeId n) override {
+        return ++calls[n] == 1 ? 0 : 7;
+    }
+};
+
+seastar::future<> testEmptyWakeDoesNotStartTheCooldown() {
+    VShardDirectory dir(1, rf3Map(3));
+    LateLeaderWakeSink local;
+    ScriptedTransport client;
+    client.deadNodes = {2, 3};
+    NoLeaderResolver leaders;
+    ReplicatedBatchWriteRouter router(dir, local, client, leaders);
+
+    EXPECT_THROW(co_await router.write(manySeries(30)), RetryableWriteError);
+    EXPECT_EQ(local.calls[2], 1u);
+    EXPECT_EQ(local.calls[3], 1u);
+
+    // Raft may learn that this peer leads local groups after the first give-up. A zero
+    // selection did no work and must not suppress that newly actionable wake for 6 s.
+    EXPECT_THROW(co_await router.write(manySeries(30)), RetryableWriteError);
+    EXPECT_EQ(local.calls[2], 2u);
+    EXPECT_EQ(local.calls[3], 2u);
+}
+
 // THE [D6] SHAPE: a connection that dies and comes back is absorbed by the retry budget,
 // and must leave the Raft groups completely alone. Waking here put a third of the map on
 // full-rate ticking during a reset storm, and followers ticking at full rate through
@@ -1188,6 +1240,12 @@ TEST(ReplicatedBatchWriteRouterTest, OneTransportFailureRevokesTheElectionWindow
 }
 TEST(ReplicatedBatchWriteRouterTest, UnreachablePeerWakesItsGroups) {
     testUnreachablePeerWakesItsGroups().get();
+}
+TEST(ReplicatedBatchWriteRouterTest, RepeatedGiveupsCoalesceWakeForOneElection) {
+    testRepeatedGiveupsCoalesceWakeForOneElection().get();
+}
+TEST(ReplicatedBatchWriteRouterTest, EmptyWakeDoesNotStartTheCooldown) {
+    testEmptyWakeDoesNotStartTheCooldown().get();
 }
 TEST(ReplicatedBatchWriteRouterTest, LocalFailureDoesNotWake) {
     testLocalFailureDoesNotWake().get();

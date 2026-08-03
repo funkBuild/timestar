@@ -399,28 +399,21 @@ exactly that). The cluster planes only ever dial `port+1000` / `port+2000`.
    gated the resetter on the bench still running, and the bench finished in under a
    second, so the storm never fired and every "0 errors" assertion passed vacuously. The
    bench, the resetter and the probe now run decoupled.
-   **The floors are 35 rounds / 100 connections PER STORM**, multiplied by K, and they are
-   roughly half of what a real durable run injects at the gate's own sizing (66-69 rounds
-   destroying 266-276 connections per storm). They were 8/8 — about 5% of the earlier
-   profile's observation, i.e.
-   barely a vacuity check — until D-4, and 70/180 until the bench came down for K storms
-   (D-21; the retired 2000-batch profile injected about 147 rounds).
-   Half leaves room for a faster or slower box: the resetter fires on a fixed 0.3 s wall
-   clock while the bench length is machine-dependent, so a machine that finishes the bench
-   in half the time legitimately injects half the rounds. Override with
-   `GATE_MIN_RESET_ROUNDS` / `GATE_MIN_RESET_CONNS` rather than editing, and record the
-   observed counts when you do.
-   The floor is enforced on every storm after its attributable read-back, not only on the
-   run total; otherwise a strong later storm can mask a vacuous earlier draw.
-   Each storm is also capped at 70 rounds. An uncapped wall-clock resetter made a transiently
-   slower arm inject 154 rounds, which created more failures and slowed it further; fault
-   intensity is now bounded independently of disk speed.
+   **Every storm must execute exactly 50 rounds**, while destroying at least 100 live
+   connections. At the fixed 0.3-second cadence this is 15 seconds of repeated RSTs and
+   about 200 destroyed connections in the default topology. An arm that ends before the
+   count is VOID, and `GATE_RESET_ROUNDS` is an explicit alternate profile rather than a
+   hidden tolerance. The former 35--70 range made a slower benchmark receive up to twice
+   the disturbance of a faster one: exact same-binary combined draws passed at 50--67 and
+   failed at 70. Exact per-arm intensity prevents machine speed from changing the tested
+   property, and prevents one strong arm from hiding an anaemic one in the run total.
 2. Node 3 must LEAD at least 800 VShards before every storm. The first node to start wins every election, and
    a converged-but-skewed cluster left node 3 leading 128 of 4096 — 3% of traffic crossing
    the fault. The old 400-pass targeted wake could also keep those groups active long
    enough for a reset draw to move leadership away from the proxy. Targeted wake is now
-   one prompt check-tick, but the gate still rebalances and reasserts the traffic floor for
-   every arm so any future leadership change cannot make later arms vacuous.
+   one prompt check-tick, coalesced per leader for a complete election window, but the gate
+   still rebalances and reasserts the traffic floor for every arm so any future leadership
+   change cannot make later arms vacuous.
 3. The baseline run through the proxy must itself be error-free, so a proxy bug cannot be
    read as a server property.
 
@@ -434,9 +427,11 @@ The combined reset/rebalance profile also guards the cost of Raft wake work. D-2
 hibernated groups credit skipped passes, but the wake hook still pinned every matching
 group at full rate for 400 passes (about eight seconds). One combined draw crossed that
 feedback cliff: 249 typed `503`s and 22% retained throughput failed its 80-error/25%
-bounds. A targeted wake now lasts one registry pass. The same live profile then admitted
-46 typed `503`s, retained 33% in its worst arm, issued 201 rebalance calls, and preserved
-every acknowledged probe on all three replicas with no `500` or crash.
+bounds. A targeted wake now lasts one registry pass, and repeated client give-ups for the
+same leader are coalesced for the six-second election window. With exact 50-round arms the
+corrected live profile admitted 29 typed `503`s, retained 45% in its worst arm, issued 189
+rebalance calls, drained public readiness before read-back, and preserved all 200 probes on
+all three replicas with no connection failure, `500`, or crash.
 
 `fault_injection_ab.sh` is now a deterministic counterfactual, not a second noisy capacity
 run. The former sequential A/B was invalidated by a measured reversed draw: the flat-pacing
