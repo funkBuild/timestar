@@ -161,7 +161,9 @@ see [ADR 0005](adr/0005-checkquorum-transfer-bypass.md).
   driver and durable private-journal reset profile passed three local storms
   with zero errors, 203 reset rounds, 812 live connections destroyed, 85%
   worst-arm throughput retention, and exact per-replica probe readback. Commit
-  those fixes and repeat the serial battery against that one resulting identity.
+  those fixes and repeat the serial battery against that one resulting identity;
+  the follow-up fixes the per-storm intensity at no more than 70 reset rounds so
+  a slow disk cannot silently turn the same gate into a stronger fault.
 - [ ] Measure final multi-host throughput, latency, recovery, and movement SLOs.
 
 ## Acceptance gates

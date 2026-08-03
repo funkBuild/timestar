@@ -96,6 +96,7 @@ GATE="$(pwd)/fault_injection_gate.sh"
 # `/tmp`.
 export GATE_BENCH_BATCHES="${GATE_BENCH_BATCHES:-2000}"
 export GATE_BATCH_SIZE="${GATE_BATCH_SIZE:-300}"
+export GATE_MAX_RESET_ROUNDS="${GATE_MAX_RESET_ROUNDS:-140}"
 export GATE_STORM_ROUNDS="${GATE_STORM_ROUNDS:-2}"
 # NEITHER OF THESE MAY LIVE ON /tmp, and that is a hard requirement rather than a
 # preference. On hosts where /tmp is tmpfs, a comparison worktree (~1 G with seastar)

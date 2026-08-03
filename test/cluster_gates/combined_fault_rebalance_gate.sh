@@ -19,6 +19,7 @@
 #   GATE_REBALANCE_STORM=1   a rebalance loop runs through every reset storm
 #   GATE_CONNECTIONS=16      4x the reset gate's connection count
 #   GATE_STORM_ROUNDS=2      two storms, not three -- see the disk note below
+#   GATE_BENCH_BATCHES=1200  keeps each fast arm above the per-storm reset floor
 #
 # THE BUDGET IS ITS OWN, AND IT IS NOT THE RESET GATE'S. Two faults produce more client
 # errors than one, and pretending otherwise would either fail this gate on correct
@@ -32,11 +33,12 @@
 #     rebalance          129 / 420    13 / 420     0 / 408   (transfers / calls)
 #     probe read-back    200/200 on every node, every storm, all three runs
 #
-# Those are historical 10,000-timestamp results. The current durable profile measured
-# `[7 2]` errors, 45/37 reset rounds, 169/143 destroyed connections, 53/66% retained
-# throughput, zero transfers and 177 rebalance calls. Its 150-call floor is tied to the
-# reset anti-vacuity floor: a minimally valid 70-round run lasts about 21 seconds and must
-# therefore execute the 0.2-second three-node rebalance loop throughout.
+# Those are historical 10,000-timestamp results. Two current 1,200-request durable draws
+# measured totals of 26 and 54 errors, 49-66 reset rounds and 196-266 destroyed
+# connections per storm, 38-53% retained throughput, 1/15 transfers and 195/201 rebalance
+# calls. Its 150-call floor is tied to the reset anti-vacuity floor: a minimally valid
+# 70-round run lasts about 21 seconds and must therefore execute the 0.2-second three-node
+# rebalance loop throughout.
 #
 # The error ceiling remains ~2x the historical worst draw (36). Note the reset gate's own
 # budget is 6 across THREE storms at 4 connections: the extra errors here are the
@@ -60,7 +62,7 @@
 # the filter permissive would show up as a transfer count that suddenly is not zero.
 #
 # DISK. Each storm is a full bench and nothing is deleted between them (see the reset
-# gate's BENCH_BATCHES note). The durable profile is about 0.6 GiB at RF=3 for
+# gate's BENCH_BATCHES note). The durable profile is about 0.7 GiB at RF=3 for
 # two storms plus the baseline; the historical ~20-GiB figure used the retired 10,000-
 # timestamp request. Do not raise GATE_STORM_ROUNDS or either bench dimension without
 # doing that arithmetic and raising the scratch preflight when needed.
@@ -73,6 +75,7 @@ cd "$(dirname "$0")" || exit 2
 export GATE_REBALANCE_STORM=1
 export GATE_CONNECTIONS="${GATE_CONNECTIONS:-16}"
 export GATE_STORM_ROUNDS="${GATE_STORM_ROUNDS:-2}"
+export GATE_BENCH_BATCHES="${GATE_BENCH_BATCHES:-1200}"
 export GATE_MAX_STORM_ERRORS="${GATE_MAX_STORM_ERRORS:-80}"
 export GATE_MIN_COMBINED_CALLS="${GATE_MIN_COMBINED_CALLS:-150}"
 # The rebalance storm competes with the bench for the same reactors, so the throughput dip

@@ -395,6 +395,12 @@ exactly that). The cluster planes only ever dial `port+1000` / `port+2000`.
    in half the time legitimately injects half the rounds. Override with
    `GATE_MIN_RESET_ROUNDS` / `GATE_MIN_RESET_CONNS` rather than editing, and record the
    observed counts when you do.
+   The floor is enforced on every storm after its attributable read-back, not only on the
+   run total; otherwise a strong later storm can mask a vacuous earlier draw.
+   Each storm is also capped at 70 rounds. An uncapped wall-clock resetter made a transiently
+   slower arm inject 154 rounds, which created more failures and slowed it further; fault
+   intensity is now bounded independently of disk speed. The on-demand A/B explicitly
+   raises this cap because its purpose is to discriminate the retry schedule.
 2. Node 3 must LEAD at least 800 VShards. The first node to start wins every election, and
    a converged-but-skewed cluster left node 3 leading 128 of 4096 — 3% of traffic crossing
    the fault. The gate rebalances and waits for fair share first.
@@ -438,7 +444,7 @@ discrimination is the COUNT separation in the table above, which is the assertio
 fails the script; the signature check is informational on both arms and prints both counts.
 
 **The A/B storms harder than the CI gate, deliberately.** The signal scales with reset
-ROUNDS. The current gate uses 1000 timed requests at 300 timestamps and K=3 so the private
+ROUNDS. The current gate uses 1000 timed requests at 300 timestamps, a 70-round cap and K=3 so the private
 durable journals stay out of overload; the A/B pins the same request size but doubles the
 request count and uses K=2. The historical 1000-by-10000 A/B draws gave HEAD 0/4/2 against
 REVERTED 7/22/4: the first two separated and the third overlapped. Those figures explain

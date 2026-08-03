@@ -92,6 +92,7 @@
 #   GATE_MAX_STORM_ERRORS=N    total client-error budget across all K (default 6)
 #   GATE_BATCH_SIZE=N           timestamps per timed request (default 300)
 #   GATE_BENCH_BATCHES=N        timed requests per arm (default 1000)
+#   GATE_MAX_RESET_ROUNDS=N     fixed fault-intensity cap per storm (default 70)
 #   GATE_BENCH_TIMEOUT=N        seconds before TERM (default 300)
 #   GATE_BENCH_KILL_AFTER=N     TERM-to-KILL grace in seconds (default 15)
 #   exit 0 = pass, 1 = property failed, 2 = setup refused, 3 = VOID (re-draw)
@@ -129,6 +130,7 @@ PORTS="19410 19411 19412"
 # GATE_MIN_RESET_ROUNDS / GATE_MIN_RESET_CONNS. Record the observed counts when you do.
 MIN_RESET_ROUNDS="${GATE_MIN_RESET_ROUNDS:-35}"
 MIN_RESET_CONNS="${GATE_MIN_RESET_CONNS:-100}"
+MAX_RESET_ROUNDS="${GATE_MAX_RESET_ROUNDS:-70}"
 # HOW BIG EACH BENCH IS, and why K STORMS FORCED IT DOWN. Every bench here writes
 # `batches * batch-size * 10 fields` points into a cluster that keeps all of them at RF=3,
 # and NOTHING is deleted between storms -- the K storms share one cluster by design, so
@@ -142,7 +144,8 @@ MIN_RESET_CONNS="${GATE_MIN_RESET_CONNS:-100}"
 # So the K-storm restructure and the old bench size are not simultaneously affordable, and
 # the bench size is the right thing to give up: storm INTENSITY is set by the resetter (it
 # destroys EVERY live connection on every round, 0.3 s apart), not by how long the bench
-# runs. A shorter bench buys fewer ROUNDS, not weaker ones.
+# runs. A shorter bench buys fewer ROUNDS, not weaker ones; a slower bench cannot buy more
+# than MAX_RESET_ROUNDS, so disk variance cannot silently strengthen the fault.
 #
 # The old disk-backed invocation kept 1000 x 10,000 timestamps with four
 # connections: 400,000 points simultaneously entered the write router. Its
@@ -198,7 +201,12 @@ CONNECTIONS="${GATE_CONNECTIONS:-4}"
 require_positive_setting GATE_STORM_ROUNDS "$STORM_ROUNDS"
 require_positive_setting GATE_MIN_RESET_ROUNDS "$MIN_RESET_ROUNDS"
 require_positive_setting GATE_MIN_RESET_CONNS "$MIN_RESET_CONNS"
+require_positive_setting GATE_MAX_RESET_ROUNDS "$MAX_RESET_ROUNDS"
 require_positive_setting GATE_CONNECTIONS "$CONNECTIONS"
+[ "$MAX_RESET_ROUNDS" -ge "$MIN_RESET_ROUNDS" ] || {
+    echo "ABORT: GATE_MAX_RESET_ROUNDS=$MAX_RESET_ROUNDS is below the $MIN_RESET_ROUNDS-round anti-vacuity floor" >&2
+    exit 2
+}
 case "$REBALANCE_STORM" in
     0|1) ;;
     *) echo "ABORT: GATE_REBALANCE_STORM must be 0 or 1" >&2; exit 2 ;;
@@ -415,7 +423,7 @@ while [ "$storm" -le "$STORM_ROUNDS" ]; do
     ( run_benchmark >"$STORM_TRANSCRIPT" 2>&1 ) &
     BENCHPID=$!
     ( ROUNDS=0
-      while [ ! -f $GATE_TMP_ROOT/tsgate_fi_stop ]; do
+      while [ ! -f $GATE_TMP_ROOT/tsgate_fi_stop ] && [ "$ROUNDS" -lt "$MAX_RESET_ROUNDS" ]; do
           kill -USR1 "$PROXY_PID" 2>/dev/null && ROUNDS=$((ROUNDS + 1))
           sleep 0.3
       done
@@ -528,6 +536,16 @@ while [ "$storm" -le "$STORM_ROUNDS" ]; do
         assert_le "storm $storm: probe points readable on :$p (attempted $PROBE)" "${N:-999999}" "$PROBE"
     done
 
+    # These are PER-STORM floors, not merely run totals. Checking only the sum
+    # allowed a strong later draw to hide an anaemic earlier one (observed 33 +
+    # 70 rounds satisfying a nominal 35 x 2 assertion). Finish the attributable
+    # read-back above, then void immediately: this draw did not test the promised
+    # fault intensity even if all acknowledged data remained correct.
+    [ "$ROUNDS" -ge "$MIN_RESET_ROUNDS" ] ||
+        gate_void "storm $storm injected only $ROUNDS reset rounds, below the per-storm $MIN_RESET_ROUNDS floor"
+    [ "$RESET_CONNS" -ge "$MIN_RESET_CONNS" ] ||
+        gate_void "storm $storm destroyed only $RESET_CONNS connections, below the per-storm $MIN_RESET_CONNS floor"
+
     storm=$((storm + 1))
 done
 
@@ -560,6 +578,7 @@ echo "GATE_METRIC storm_bench_errors $TOT_BENCH_ERRS"
 echo "GATE_METRIC storm_probe_5xx $TOT_PROBE_5XX"
 echo "GATE_METRIC reset_rounds_total $TOT_ROUNDS"
 echo "GATE_METRIC reset_conns_total $TOT_CONNS"
+echo "GATE_METRIC reset_round_cap_per_storm $MAX_RESET_ROUNDS"
 echo "GATE_METRIC storm_count $STORM_ROUNDS"
 echo "GATE_METRIC worst_storm_pct $WORST_PCT"
 echo "GATE_METRIC rebalance_transfers $TOT_TRANSFERS"

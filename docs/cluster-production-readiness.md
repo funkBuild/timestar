@@ -199,13 +199,17 @@ inventory and rules.
   now rejects a nonzero or incomplete benchmark result, retains the complete
   failed transcript outside disposable node roots, and hard-kills a benchmark
   that cannot finish its graceful shutdown after the configured deadline.
+  Reset intensity is capped at 70 rounds per storm as well as floored at 35: an
+  uncapped exact-candidate arm that transiently ran slower injected 154 rounds,
+  then amplified its own latency and error count even though Raft admission
+  remained empty with zero refusals.
   Its old durable-disk control was invalid: 920/1,000 fault-free requests were
   shed as overloaded. A later 1,500-by-500 profile passed one storm but turned
   successive storms into a storage-overload feedback loop, with errors
   `[1,16,580]` and throughput retention `[83%,48%,13%]`. The replacement keeps
-  1,000 requests at 300 timestamps by ten fields. The bounded 2026-08-03 local
-  run passed three storms with zero errors, 203 reset rounds, 812 destroyed live
-  peer connections, 85% worst-arm throughput retention, exact 200-point probe
+  1,000 requests at 300 timestamps by ten fields. The bounded capped local run
+  passed with error vector `[0,1,2]`, exactly 210 reset rounds, 839 destroyed live
+  peer connections, 51% worst-arm throughput retention, exact 200-point probe
   readback on every replica after every storm, and zero uncommitted-Raft
   refusals. System `/tmp` remained at 105 MiB; gate data lived and cleaned under
   `build/tmp`.
