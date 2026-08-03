@@ -440,18 +440,25 @@ integrity. Production remains blocked on the P1 evidence below.
   collector's provisional thresholds, not approved production SLOs. Approved
   thresholds and distinct-host deployment evidence remain open release work.
 
-  The same collector was repeated after the evidence commit on exact candidate
-  `26b68b4`: a clean full build, 4,393/4,393 runnable unit tests and 28/28
-  runnable socket tests preceded it. The report authenticated server
-  `73f2e1df9cdaba2bc3f18e7c6c6d8ed833fbe291141076570af1a1d67bb75361`
+  The final local collector rerun after the benchmark-memory and network-gate
+  fixes passed on exact runtime candidate
+  `b9dd41749fd1eb49e891354b4cb9147ec4c9fa43`. A clean full build, 4,398 passed
+  unit tests plus nine intentional skips and one disabled test, and 28 passed
+  socket tests plus two one-shard skips preceded it. The report authenticated
+  server
+  `ed3d67721a4dc8b9aeac1f1bfe3e6d3083e89bc02fee1a94f5372a7a6a0db101`
   and benchmark
-  `76e7e8ef6a7a288605c9024084c1fcd0d7958912f286d9edde0e1f8b70be3dea`.
-  It measured 53/400 retryable node-kill errors, 14.680-s recovery and 26-ms
-  query p99; 64.370-s snapshot installation and 68.810-s exact catch-up; and a
-  movement arm that retained 55% throughput with 1.660-s p99, 13 benchmark
-  errors, 1,759 transfers, and 136/150 successful live probes. This confirms the
-  collector is repeatable, but the benchmark-memory and network-gate fixes made
-  afterward still require one final exact-candidate collector run.
+  `1f79dc373c1aa6f871d1c87f3f79c5da83269092013f2a72073f430020663216`
+  before and after the campaign. It measured 57/400 retryable node-kill
+  errors, 16.420-s recovery, and 29-ms query p99; 64.380-s snapshot
+  installation and 68.800-s exact catch-up; and a movement arm that retained
+  58% throughput with 1.757-s p99, 12 benchmark errors, 2,851 transfers, and
+  136/150 successful live probes. Every acknowledged probe was durable and no
+  arm observed a server 500 or crash. The later `1e76f1d` commit changes only
+  gates and documentation; its bounded deterministic retry-pacing
+  counterfactual failed both required invariants while HEAD passed both. Local
+  implementation qualification is therefore complete. Approved thresholds and
+  distinct-host deployment evidence remain open release work.
 - [x] **Deliver and prove clustered backup/restore.** The existing filesystem
   copy guidance is now explicitly limited to standalone mode: it omitted
   persistent node identity, Group-0/control state, the committed serving map,
@@ -505,13 +512,20 @@ integrity. Production remains blocked on the P1 evidence below.
   snapshot, barrier, GC, and file-descriptor contract instead of the retired
   per-reactor/4-ms/256-MiB proposal.
 - [ ] Record one final serial build, focused unit/socket tests, and each required
-  live gate against the exact release commit. Candidate `26b68b4` has a clean
-  full build, 4,393/4,393 runnable unit tests, 28/28 runnable socket tests, and
-  the repeated complete local serial SLO collector above. Its exact server also
-  passed the 6,000-target pattern-delete failover/restart gate. The bounded
-  network-reset profile passed against that server plus the corrected local
-  benchmark driver. A final rerun after committing the driver and harness fixes,
-  followed by the distinct-host arms, remains required.
+  live gate against the exact release commit. Exact runtime candidate `b9dd417`
+  completed the full bounded local serial battery: build, unit/socket tests,
+  6,000-target pattern-delete failover/restart, three reset storms, combined
+  reset plus rebalance, node-kill durability, empty-root snapshot catch-up, and
+  skewed movement. Its reset-only run retained 87--89% throughput with 202
+  bounded reset rounds, 804 destroyed connections, zero errors, and exact
+  replica readback. The combined run admitted 47 typed `503`s under its
+  80-error ceiling, retained 36--45% throughput, completed 216 rebalance calls,
+  and preserved every acknowledged write with no other status, server 500, or
+  crash. The later `1e76f1d` gate/documentation-only commit replaced the noisy
+  live pacing A/B with a passing deterministic counterfactual. The remaining
+  step is procedural: choose the release identity, build that exact identity,
+  repeat the serial battery once, then run the distinct-host arms. It is not an
+  unresolved storage or runtime implementation defect.
 
 ## Release exit criteria
 

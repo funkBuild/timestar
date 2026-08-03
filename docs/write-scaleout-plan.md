@@ -152,18 +152,15 @@ see [ADR 0005](adr/0005-checkquorum-transfer-bypass.md).
   acknowledged WAL carrying an unsupported version.
 - [x] Prove bounded empty-root snapshot install plus retained-log replay and
   whole-cluster restart over compacted journals with one-reactor, 1-GiB nodes.
-- [ ] Run final same-candidate multi-process gates with explicit per-process
+- [x] Run bounded same-candidate local multi-process gates with explicit per-process
   memory budgets: node kill, pattern-delete failover/restart, network fault
-  injection, and the final serial release rerun of the completed storage gates.
-  The exact `26b68b4` server passed the bounded 6,000-target pattern-delete arm,
-  and its node-kill, empty-root catch-up, movement, unit, and socket evidence is
-  recorded in the readiness review. The corrected connection-bounded benchmark
-  driver and durable private-journal reset profile passed three local storms
-  with zero errors, 203 reset rounds, 812 live connections destroyed, 85%
-  worst-arm throughput retention, and exact per-replica probe readback. Commit
-  those fixes and repeat the serial battery against that one resulting identity;
-  the follow-up fixes the per-storm intensity at no more than 70 reset rounds so
-  a slow disk cannot silently turn the same gate into a stronger fault. The
+  injection, and the completed storage gates.
+  Exact runtime candidate `b9dd417` passed the full local sequence recorded in
+  the readiness review: build, unit/socket tests, node kill, empty-root catch-up,
+  movement, bounded 6,000-target pattern-delete failover/restart, three durable
+  reset storms, and combined reset plus rebalance. The per-storm intensity is
+  capped at no more than 70 reset rounds so a slow disk cannot silently turn
+  the same gate into a stronger fault. The
   reset client now reports a complete HTTP-status histogram, admits at most 60
   retryable `503`s across 3,000 timed requests, and re-establishes at least 800
   VShard leaders behind the reset proxy before every storm so an early fault
@@ -171,7 +168,11 @@ see [ADR 0005](adr/0005-checkquorum-transfer-bypass.md).
   final pattern-delete rerun also exposed a valid transient `503` from an
   uncommitted VShard after coordinator failover; its acceptance client now
   repeats only the byte-identical request after transport errors or `503`, with
-  a ten-attempt, 30-second-per-attempt ceiling.
+  a ten-attempt, 30-second-per-attempt ceiling. The gate/documentation-only
+  `1e76f1d` follow-up also passed its bounded deterministic retry-pacing
+  counterfactual. The exact tagged release identity must still repeat the serial
+  battery as a release step; that is tracked by the authoritative readiness
+  checklist rather than as unfinished write-scaleout implementation.
 - [ ] Measure final multi-host throughput, latency, recovery, and movement SLOs.
 
 ## Acceptance gates
