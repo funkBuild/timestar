@@ -15,7 +15,7 @@ cd "$(dirname "$0")" || exit 2
 
 BIN="${1:-$BUILD_DIR/bin/timestar_http_server}"
 [ -x "$BIN" ] || { echo "no server binary at $BIN"; exit 2; }
-BENCH="$BUILD_DIR/bin/timestar_insert_bench"
+BENCH="$GATE_BENCH_BINARY"
 [ -x "$BENCH" ] || { echo "no insert bench at $BENCH"; exit 2; }
 PORTS="19220 19221 19222"
 MIN_TRANSFERS="${GATE_MIN_TRANSFERS:-200}"

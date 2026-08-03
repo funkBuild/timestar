@@ -25,7 +25,7 @@ not probes, so they can be run from CI or a release checklist.
 | `homogeneous_v1_rejection_gate.sh` | exact-v1 codec and real-socket handshake rejection, plus a production restart over a real acknowledged WAL whose version field is changed to an unsupported value; startup must exit before HTTP and preserve the source byte-for-byte |
 | `mtls_peer_identity_gate.sh` | matching per-peer IP SANs converge and commit; with the other voter down, a certificate signed by the cluster CA for the wrong configured endpoint produces bounded 503, while rolling that node to a newly issued certificate for the correct endpoint commits that exact write and restores full health |
 | `cluster_backup_restore_gate.sh` | an authenticated live export survives Group-0 leader loss, validates all 4,096 exact-v1 units, rejects wrong-key/missing/corrupt/extra artifacts, resumes a killed offline import, requires every prepared voter for release, rejects source authority, restores under fresh identities, and preserves the acknowledged baseline through full-cluster restart |
-| `production_slo_report.sh` | serially runs the node-kill, bounded empty-node catch-up, and skewed-movement gates against one clean candidate, then binds their error-band, recovery, query-latency, snapshot, and movement measurements to the commit, binary hash, resource settings, thresholds, and raw transcripts in one exact-v1 JSON report |
+| `production_slo_report.sh` | serially runs the node-kill, bounded empty-node catch-up, and skewed-movement gates against one clean candidate, then binds their error-band, recovery, query-latency, snapshot, and movement measurements to the commit, authenticated server and benchmark hashes, resource settings, thresholds, and raw transcripts in one exact-v1 JSON report |
 
 All of them take an optional server binary as `$1` (default
 `build/bin/timestar_http_server`), so a "before" binary can be measured the same way.
@@ -56,6 +56,11 @@ measuring the intended fault.
 
 `production_slo_report.sh` is the release collector, not another workload. It
 requires a clean tracked worktree and runs the three underlying gates serially.
+Before the first arm it requires both `timestar_http_server` and
+`timestar_insert_bench` to identify their component and embed that exact clean
+HEAD revision; after the final arm it proves neither binary's SHA-256 changed.
+The report records both executable paths, revisions, and hashes because the
+driver controls the offered load, error accounting, and readback verification.
 Its report is retained at
 `build/tmp/tsgate_slo_report/report.v1.json`, beside the complete arm logs. The
 local safety defaults are a 50% post-kill write-error ceiling, 30 s for complete

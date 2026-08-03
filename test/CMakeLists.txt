@@ -140,6 +140,20 @@ target_compile_definitions(timestar_test PRIVATE ${SOURCE_INSPECTION_DEFS})
 # build with no test executable.
 gtest_discover_tests(timestar_test DISCOVERY_TIMEOUT 120)
 
+# Release evidence depends on both executables reporting an authenticated
+# component identity before Seastar starts. Keep the shell verifier's rejection
+# paths and the two real CLI surfaces in ordinary CTest coverage.
+add_test(NAME cluster_gate_candidate_binary_identity
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/cluster_gates/candidate_binary_identity_test.sh)
+add_test(NAME timestar_http_server_version
+    COMMAND $<TARGET_FILE:timestar_http_server> --version)
+set_tests_properties(timestar_http_server_version PROPERTIES
+    PASS_REGULAR_EXPRESSION "Component: timestar_http_server")
+add_test(NAME timestar_insert_bench_version
+    COMMAND $<TARGET_FILE:timestar_insert_bench> --version)
+set_tests_properties(timestar_insert_bench_version PROPERTIES
+    PASS_REGULAR_EXPRESSION "Component: timestar_insert_bench")
+
 # Optional: Create separate test executables for different categories
 # This allows running specific test categories independently
 

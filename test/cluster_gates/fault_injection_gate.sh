@@ -97,7 +97,7 @@ cd "$(dirname "$0")" || exit 2
 
 BIN="${1:-$BUILD_DIR/bin/timestar_http_server}"
 [ -x "$BIN" ] || { echo "no server binary at $BIN"; exit 2; }
-BENCH="$BUILD_DIR/bin/timestar_insert_bench"
+BENCH="$GATE_BENCH_BINARY"
 [ -x "$BENCH" ] || { echo "no insert bench at $BENCH"; exit 2; }
 command -v python3 >/dev/null || { echo "python3 required for the reset proxy"; exit 2; }
 

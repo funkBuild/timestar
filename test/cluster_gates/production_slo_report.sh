@@ -8,6 +8,8 @@ cd "$(dirname "$0")" || exit 2
 
 BIN="${1:-$BUILD_DIR/bin/timestar_http_server}"
 [ -x "$BIN" ] || { echo "no server binary at $BIN" >&2; exit 2; }
+BENCH="$GATE_BENCH_BINARY"
+[ -x "$BENCH" ] || { echo "no insert benchmark at $BENCH" >&2; exit 2; }
 command -v python3 >/dev/null || { echo "python3 is required" >&2; exit 2; }
 
 REPO="$(git rev-parse --show-toplevel)"
@@ -24,34 +26,19 @@ CANDIDATE_COMMIT=$(git -C "$REPO" rev-parse HEAD) || {
     echo "ABORT: could not resolve the candidate commit" >&2
     exit 2
 }
-if ! BINARY_VERSION_OUTPUT=$("$BIN" --version 2>&1); then
-    echo "ABORT: candidate binary did not report its version" >&2
-    printf '%s\n' "$BINARY_VERSION_OUTPUT" >&2
-    exit 2
-fi
-BINARY_REVISION=$(printf '%s\n' "$BINARY_VERSION_OUTPUT" |
-    awk -F'[()]' '/^TimeStar / && NF >= 3 { print $2; exit }')
-case "$BINARY_REVISION" in
-    ''|unknown|*-dirty)
-        echo "ABORT: candidate binary has an unqualified embedded revision: ${BINARY_REVISION:-<missing>}" >&2
-        exit 2
-        ;;
-esac
-if ! BINARY_SOURCE_COMMIT=$(git -C "$REPO" rev-parse --verify --end-of-options \
-    "${BINARY_REVISION}^{commit}" 2>/dev/null); then
-    echo "ABORT: candidate binary revision '$BINARY_REVISION' does not resolve in this repository" >&2
-    exit 2
-fi
-if [ "$BINARY_SOURCE_COMMIT" != "$CANDIDATE_COMMIT" ]; then
-    echo "ABORT: candidate binary is from $BINARY_SOURCE_COMMIT, not clean HEAD $CANDIDATE_COMMIT" >&2
-    exit 2
-fi
+verify_candidate_binary "$REPO" "$CANDIDATE_COMMIT" "$BIN" timestar_http_server || exit $?
+SERVER_REVISION="$VERIFIED_BINARY_REVISION"
+SERVER_SHA256="$VERIFIED_BINARY_SHA256"
+verify_candidate_binary "$REPO" "$CANDIDATE_COMMIT" "$BENCH" timestar_insert_bench || exit $?
+BENCH_REVISION="$VERIFIED_BINARY_REVISION"
+BENCH_SHA256="$VERIFIED_BINARY_SHA256"
 
 export GATE_SERVER_MEMORY="${GATE_SERVER_MEMORY:-2G}"
 export GATE_SERVER_SMP="${GATE_SERVER_SMP:-4}"
 GATE_SNAPSHOT_SERVER_MEMORY="${GATE_SNAPSHOT_SERVER_MEMORY:-1G}"
 export GATE_BENCH_SMP="${GATE_BENCH_SMP:-1}"
 export GATE_BENCH_MEMORY="${GATE_BENCH_MEMORY:-1G}"
+export GATE_BENCH_BINARY
 export GATE_MAX_NODE_FAILURE_ERROR_BPS="${GATE_MAX_NODE_FAILURE_ERROR_BPS:-5000}"
 export GATE_MAX_FAILOVER_RECOVERY_MS="${GATE_MAX_FAILOVER_RECOVERY_MS:-30000}"
 export GATE_MAX_FAILOVER_QUERY_P99_MS="${GATE_MAX_FAILOVER_QUERY_P99_MS:-2000}"
@@ -112,6 +99,12 @@ run_gate "empty-node snapshot installation and exact catch-up" \
 run_gate "leadership-movement throughput and latency impact" \
     ./skewed_rebalance_gate.sh "$MOVEMENT_LOG" "$GATE_SERVER_MEMORY"
 
+# A build or replacement during the serial campaign would mix candidates in a
+# single report. Bind the report only after proving both executables are the
+# exact bytes authenticated before the first arm.
+verify_candidate_binary_unchanged "$BIN" "$SERVER_SHA256" timestar_http_server || exit $?
+verify_candidate_binary_unchanged "$BENCH" "$BENCH_SHA256" timestar_insert_bench || exit $?
+
 metric() { # LOG NAME
     awk -v name="$2" '$1 == "GATE_METRIC" && $2 == name { print $3; exit }' "$1"
 }
@@ -153,12 +146,12 @@ MOVEMENT_CONNECTIONS=$(require_metric "$MOVEMENT_LOG" movement_connections)
 MOVEMENT_HOSTS=$(require_metric "$MOVEMENT_LOG" movement_hosts)
 
 COMMIT="$CANDIDATE_COMMIT"
-BINARY_SHA256=$(sha256sum "$BIN" | awk '{print $1}')
 SERVER_ENV_SHA256=$(printf '%s' "$GATE_SERVER_ENV" | sha256sum | awk '{print $1}')
 GENERATED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 HOST=$(hostname)
 
-export COMMIT BINARY_REVISION BINARY_SHA256 SERVER_ENV_SHA256 GENERATED_AT HOST BIN GATE_SERVER_MEMORY GATE_SERVER_SMP
+export COMMIT SERVER_REVISION SERVER_SHA256 BENCH_REVISION BENCH_SHA256 SERVER_ENV_SHA256 GENERATED_AT HOST
+export BIN BENCH GATE_SERVER_MEMORY GATE_SERVER_SMP
 export GATE_SNAPSHOT_SERVER_MEMORY
 export GATE_BENCH_SMP GATE_BENCH_MEMORY NODE_BATCHES NODE_BATCH_SIZE NODE_CONNECTIONS
 export NODE_HOSTS NODE_PROBES NODE_ERRORS NODE_ERROR_BPS NODE_RECOVERY_MS
@@ -189,9 +182,16 @@ report = {
     "host": os.environ["HOST"],
     "candidate": {
         "commit": os.environ["COMMIT"],
-        "embedded_revision": os.environ["BINARY_REVISION"],
-        "binary": os.environ["BIN"],
-        "binary_sha256": os.environ["BINARY_SHA256"],
+        "server": {
+            "binary": os.environ["BIN"],
+            "embedded_revision": os.environ["SERVER_REVISION"],
+            "sha256": os.environ["SERVER_SHA256"],
+        },
+        "benchmark": {
+            "binary": os.environ["BENCH"],
+            "embedded_revision": os.environ["BENCH_REVISION"],
+            "sha256": os.environ["BENCH_SHA256"],
+        },
     },
     "settings": {
         "high_volume_server_memory_per_process": os.environ["GATE_SERVER_MEMORY"],
@@ -263,7 +263,9 @@ PY
 
 echo "PRODUCTION_SLO_REPORT PASSED"
 echo "  report: $REPORT"
-echo "  candidate: $COMMIT ($BINARY_SHA256)"
+echo "  candidate: $COMMIT"
+echo "  server sha256: $SERVER_SHA256"
+echo "  benchmark sha256: $BENCH_SHA256"
 echo "  node failure: $NODE_ERRORS/$NODE_BATCHES errors, ${NODE_RECOVERY_MS}ms recovery, ${NODE_QUERY_P99_MS}ms query p99"
 echo "  snapshot catch-up: ${SNAPSHOT_INSTALL_MS}ms install, ${SNAPSHOT_CATCHUP_MS}ms exact readback"
 echo "  movement: ${MOVEMENT_RETAINED_PCT}% throughput retained, ${MOVEMENT_P99_MS}ms p99"

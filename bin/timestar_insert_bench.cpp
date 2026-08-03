@@ -17,6 +17,7 @@
 #include "bench_common.hpp"
 
 #include "timestar.pb.h"
+#include "timestar/version.hpp"
 
 #include <boost/range/irange.hpp>
 
@@ -26,8 +27,10 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <cstdint>
 #include <iomanip>
+#include <iostream>
 #include <numeric>
 #include <random>
 #include <seastar/core/app-template.hh>
@@ -433,6 +436,18 @@ static future<ShardResult> runBenchmark(socket_address addr, unsigned maxConn, s
 // ──────────────────────────────────────────────────────────────────────
 
 int main(int argc, char** argv) {
+    // Report provenance without starting Seastar. The production SLO collector
+    // authenticates this driver as well as the server because both determine
+    // the resulting measurements.
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--version") == 0) {
+            std::cout << "TimeStar " << timestar::VERSION << " (" << timestar::GIT_COMMIT << ")"
+                      << "\nComponent: timestar_insert_bench"
+                      << "\nBuilt: " << timestar::BUILD_TIME << "\nCompiler: " << timestar::COMPILER << std::endl;
+            return 0;
+        }
+    }
+
     app_template app;
 
     namespace bpo = boost::program_options;

@@ -23,7 +23,7 @@ LIMIT="${2:-1000000}"   # ~3 canonical batches per shard: 12 connections trip it
 # charge across shards. A 2 MiB budget is therefore only reachable by many-way concurrency,
 # which cannot be aimed at a particular shard from curl.
 [ -x "$BIN" ] || { echo "no server binary at $BIN"; exit 2; }
-BENCH="$BUILD_DIR/bin/timestar_insert_bench"
+BENCH="$GATE_BENCH_BINARY"
 [ -x "$BENCH" ] || { echo "no insert bench at $BENCH"; exit 2; }
 PORTS="19210 19211 19212"
 

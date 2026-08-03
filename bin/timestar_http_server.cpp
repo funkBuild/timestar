@@ -880,6 +880,7 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--version") == 0) {
             std::cout << "TimeStar " << timestar::VERSION << " (" << timestar::GIT_COMMIT << ")"
+                      << "\nComponent: timestar_http_server"
                       << "\nBuilt: " << timestar::BUILD_TIME << "\nCompiler: " << timestar::COMPILER << std::endl;
             return 0;
         } else if (std::strcmp(argv[i], "--dump-config") == 0) {

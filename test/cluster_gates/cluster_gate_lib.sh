@@ -55,6 +55,7 @@ GATE_SERVER_SMP="${GATE_SERVER_SMP:-4}"
 # allocation explicit and override only as part of a recorded capacity run.
 GATE_BENCH_SMP="${GATE_BENCH_SMP:-1}"
 GATE_BENCH_MEMORY="${GATE_BENCH_MEMORY:-1G}"
+GATE_BENCH_BINARY="${GATE_BENCH_BINARY:-$BUILD_DIR/bin/timestar_insert_bench}"
 
 # Milliseconds from a monotonic kernel clock. `date +%s%3N` is not portable:
 # this host emits seconds followed by all nine nanosecond digits, and arithmetic
@@ -68,6 +69,82 @@ gate_fail() {
     GATE_FAILURES=$((GATE_FAILURES + 1))
 }
 gate_ok() { echo "  ok: $*"; }
+
+# verify_candidate_binary REPOSITORY EXPECTED_COMMIT BINARY COMPONENT
+#
+# Authenticate both executables that participate in a release measurement.
+# Checking only the server is insufficient: the insert driver chooses the load
+# shape, computes latency/error statistics, and verifies persisted data.  A
+# stale driver can therefore change a report while its server hash stays fixed.
+#
+# Results are returned in VERIFIED_BINARY_REVISION and
+# VERIFIED_BINARY_SHA256. Callers must copy them before verifying another
+# component.
+verify_candidate_binary() {
+    local repo="$1" expected_commit="$2" binary="$3" component="$4"
+    local output revision source_commit digest
+
+    if [ ! -x "$binary" ]; then
+        echo "ABORT: no executable candidate $component at $binary" >&2
+        return 2
+    fi
+    if ! output=$("$binary" --version 2>&1); then
+        echo "ABORT: candidate $component did not report its version" >&2
+        printf '%s\n' "$output" >&2
+        return 2
+    fi
+    revision=$(printf '%s\n' "$output" |
+        awk -F'[()]' '/^TimeStar [^ ]+ \([^()]+\)$/ && NF == 3 { print $2; exit }')
+    case "$revision" in
+        ''|unknown|*-dirty)
+            echo "ABORT: candidate $component has an unqualified embedded revision: ${revision:-<missing>}" >&2
+            return 2
+            ;;
+    esac
+    if ! printf '%s\n' "$output" | grep -Fqx -- "Component: $component"; then
+        echo "ABORT: candidate at $binary does not identify as component $component" >&2
+        return 2
+    fi
+    if ! source_commit=$(git -C "$repo" rev-parse --verify --end-of-options \
+        "${revision}^{commit}" 2>/dev/null); then
+        echo "ABORT: candidate $component revision '$revision' does not resolve in this repository" >&2
+        return 2
+    fi
+    if [ "$source_commit" != "$expected_commit" ]; then
+        echo "ABORT: candidate $component is from $source_commit, not clean HEAD $expected_commit" >&2
+        return 2
+    fi
+    if ! digest=$(sha256sum -- "$binary" 2>/dev/null | awk 'NF == 2 { print $1; exit }'); then
+        echo "ABORT: could not hash candidate $component at $binary" >&2
+        return 2
+    fi
+    case "$digest" in
+        ''|*[!0-9a-fA-F]*)
+            echo "ABORT: invalid SHA-256 for candidate $component at $binary" >&2
+            return 2
+            ;;
+    esac
+    if [ "${#digest}" -ne 64 ]; then
+        echo "ABORT: invalid SHA-256 for candidate $component at $binary" >&2
+        return 2
+    fi
+
+    VERIFIED_BINARY_REVISION="$revision"
+    VERIFIED_BINARY_SHA256="$digest"
+}
+
+# verify_candidate_binary_unchanged BINARY EXPECTED_SHA256 COMPONENT
+verify_candidate_binary_unchanged() {
+    local binary="$1" expected_digest="$2" component="$3" current_digest
+    if ! current_digest=$(sha256sum -- "$binary" 2>/dev/null | awk 'NF == 2 { print $1; exit }'); then
+        echo "ABORT: candidate $component disappeared before qualification completed" >&2
+        return 2
+    fi
+    if [ "$current_digest" != "$expected_digest" ]; then
+        echo "ABORT: candidate $component changed while qualification was running" >&2
+        return 2
+    fi
+}
 
 # assert_eq NAME ACTUAL EXPECTED
 assert_eq() {
