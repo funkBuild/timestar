@@ -376,12 +376,16 @@ integrity. Production remains blocked on the P1 evidence below.
   server's explicit reactor count and aggregate uncommitted-proposal budget to
   the high-volume SLO profile; this avoids rejecting a correct four-reactor
   deployment as though its process-wide 256-MiB budget were a one-reactor
-  64-MiB budget. Repeat identity and authenticated operator mutation on distinct
-  hosts, then verify network partitions, restart, disk-full behavior, and
+  64-MiB budget. An exact-v1 evidence binder now rejects before/after reports
+  from different candidates, deployments, clusters, node/peer/failure-domain
+  identities, or stable map epochs and requires distinct hashed infrastructure,
+  workload, and per-node transcripts for every arm. Repeat identity and
+  authenticated operator mutation on distinct hosts, then verify network
+  partitions, restart, disk-full behavior, and
   bounded recovery there. The local disk-failure behavior is no longer an
-  implementation ambiguity: an append, snapshot-promotion, or sync failure permanently
-  quarantines that Raft replica before the failed `Ready` can send, apply, or
-  acknowledge. Pending write, membership, read-index, and apply waiters fail
+  implementation ambiguity: an append, snapshot-promotion, or sync failure
+  permanently quarantines that Raft replica before the failed `Ready` can send,
+  apply, or acknowledge. Pending write, membership, read-index, and apply waiters fail
   promptly with a typed retryable error; the replica stops protocol traffic so a
   healthy quorum can elect a replacement. A shared shard-journal fence is visible
   to heartbeat-only groups without requiring another append. Focused ENOSPC tests

@@ -172,6 +172,30 @@ infrastructure evidence that the report's per-process memory setting is also
 the deployed limit. Run the preflight before and after every fault arm and
 retain server, load-client, infrastructure, and preflight transcripts.
 
+After each recovered post-fault preflight, bind it to the pre-fault report and
+to distinct transcripts for the infrastructure action, workload, and every
+qualified server:
+
+```sh
+python3 test/cluster_gates/multi_host_evidence_bundle.py \
+  --before build/tmp/multi-host-before.v1.json \
+  --after build/tmp/multi-host-after.v1.json \
+  --fault-arm bidirectional-partition \
+  --infrastructure-transcript build/tmp/partition-infrastructure.log \
+  --workload-transcript build/tmp/partition-workload.log \
+  --server-transcript 1=build/tmp/partition-node1.log \
+  --server-transcript 2=build/tmp/partition-node2.log \
+  --server-transcript 3=build/tmp/partition-node3.log \
+  --output build/tmp/partition-evidence.v1.json
+```
+
+The binder permits leadership, term, and Group-0 log progress, but rejects a
+different candidate, deployment profile, cluster UUID, node/peer/failure-domain
+identity, or stable map epoch. It requires one distinct regular server log per
+qualified node and distinct infrastructure/workload logs, hashes each file in
+bounded streaming chunks, and fails if a file changes during the read. Retain
+the bundle and its referenced immutable evidence together.
+
 On disposable production-equivalent hosts, exercise these arms serially:
 
 1. Authenticated leadership rebalance while reads and idempotent writes run;
