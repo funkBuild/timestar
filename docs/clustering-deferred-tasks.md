@@ -35,7 +35,8 @@ Production blockers take priority and are authoritative in
   repository-local temporary storage.
 - [ ] Run final multi-host topology, security, durability, and SLO gates against
   the exact release candidate.
-- [ ] Deliver a cluster backup/restore workflow over pinned, hash-verified
+- [ ] Finish qualification and operations for the cluster backup/restore
+  workflow over pinned, hash-verified
   VShard snapshot streams. Restore must create a fresh cluster UUID, scrub old
   node/Raft membership, reject partial or corrupt artifacts, resume interrupted
   import safely, and pass exact post-restore readback. The exact-v1 `TSBK` /
@@ -49,8 +50,12 @@ Production blockers take priority and are authoritative in
   every configured data voter plus the Group-0 seed before any prepared root
   can open Engine/networking. Exact-v1 peer capture sessions now route to the
   owning reactor and transfer pinned snapshots in bounded hash-identified
-  chunks. The durable all-VShard operation coordinator above those sessions and
-  the RF=3 operator gate remain.
+  chunks. The durable exact-v1 coordinator now binds one operation to a stable
+  serving map and portable Group-0 capture, retries leaders sequentially,
+  resumes immutable staged units, publishes the manifest after a final quorum
+  fence, and exposes authenticated start/status/cancel commands. The RF=3
+  export/restore/restart/corruption gate, artifact security, capacity policy,
+  and production runbook remain.
 
 ## Feature completion
 

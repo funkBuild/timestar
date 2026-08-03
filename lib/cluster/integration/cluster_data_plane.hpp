@@ -8,6 +8,7 @@
 #include "../data/node_query_coordinator.hpp"
 #include "../data/node_write_router.hpp"
 #include "../data/replicated_command.hpp"  // kWriteCommandFramingBytes
+#include "../features/cluster_backup_export.hpp"
 #include "../raft/raft_group.hpp"          // kMaxProposalBytes
 #include "../raft/raft_rpc_transport.hpp"
 #include "cluster_runtime.hpp"
@@ -460,6 +461,27 @@ public:
     // fresh cluster puts ALL write coordination on one node until this runs.
     seastar::future<size_t> rebalanceLeadership(size_t maxTransfers, bool requireExactMatch = false);
 
+    enum class BackupExportPhase : uint8_t { Idle = 0, Running = 1, Cancelled = 2, Failed = 3, Complete = 4 };
+    struct BackupExportStatus {
+        BackupExportPhase phase = BackupExportPhase::Idle;
+        std::string operationId;
+        std::string archiveDirectory;
+        std::string sourceClusterUuid;
+        uint64_t servingMapEpoch = 0;
+        uint32_t completedVShards = 0;
+        NodeId controlLeader = raft::kNoNode;
+        std::string error;
+    };
+    // Authenticated operator seam for a crash-resumable exact-v1 export. The
+    // operation ID and immutable checkpoint make repeated starts idempotent;
+    // a different operation/fence for an archive is rejected. Work runs in the
+    // background and is observed through backupExportStatus().
+    seastar::future<BackupExportStatus> startBackupExport(std::filesystem::path archiveDirectory,
+                                                          std::string operationId);
+    BackupExportStatus backupExportStatus() const { return backupExportStatus_; }
+    BackupExportStatus cancelBackupExport(std::string_view operationId);
+    static std::string_view backupExportPhaseName(BackupExportPhase phase);
+
     // ProposeSink: a peer forwarded a batch for VShards THIS node leads. Split it by
     // the shard owning each VShard's Raft group and replicate each slice there.
     // NOTE: in replicated mode the peer-facing listeners are the PER-SHARD ones, whose
@@ -525,6 +547,20 @@ private:
     void startTopologyController();
     seastar::future<> retentionControllerSweep();
     void startRetentionController();
+    seastar::future<features::ClusterBackupExportCheckpoint> captureBackupExportFence(std::string operationId);
+    seastar::future<> runBackupExport();
+    seastar::future<std::optional<features::VShardBackupUnit>> captureBackupExportVShard(
+        const features::ClusterBackupExportCheckpoint& checkpoint, uint16_t vshard,
+        const std::filesystem::path& downloadPath);
+    seastar::future<data::BackupCaptureDescriptor> beginBackupExportCapture(NodeId target,
+                                                                            const std::string& operationId,
+                                                                            const std::string& clusterUuid,
+                                                                            uint16_t vshard);
+    seastar::future<data::BackupCaptureChunk> readBackupExportCapture(NodeId target, const std::string& operationId,
+                                                                      const std::string& clusterUuid, uint16_t vshard,
+                                                                      uint64_t offset);
+    seastar::future<> finishBackupExportCapture(NodeId target, const std::string& operationId,
+                                                const std::string& clusterUuid, uint16_t vshard);
 
     std::optional<ClusterRuntime> rt_;
     seastar::sharded<Engine>* enginesPtr_ = nullptr;
@@ -561,6 +597,16 @@ private:
     bool replicated_ = false;
     uint16_t rf_ = 1;  // configured replication factor (reported by status())
     bool controlEnabled_ = false;
+
+    // One sequential export keeps peer sessions, file descriptors and memory
+    // bounded independently of the 4,096-unit archive size. The checkpoint is
+    // persisted beside the archive before this in-memory task starts.
+    seastar::gate backupExportGate_;
+    bool backupExportRunning_ = false;
+    bool backupExportCancelRequested_ = false;
+    BackupExportStatus backupExportStatus_;
+    std::filesystem::path backupExportArchive_;
+    std::optional<features::ClusterBackupExportCheckpoint> backupExportCheckpoint_;
 
     // Production topology actuation. Passes never overlap and each successful
     // pass persists at most one MoveJob step through Group 0.

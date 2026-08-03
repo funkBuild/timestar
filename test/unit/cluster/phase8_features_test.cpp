@@ -3,6 +3,7 @@
 // scrubbed membership, verified), conservative
 // routing summaries (no false negatives), and hierarchical query merge.
 #include "../../../lib/cluster/features/backup_restore.hpp"
+#include "../../../lib/cluster/features/cluster_backup_export.hpp"
 #include "../../../lib/cluster/features/operator_surface.hpp"
 #include "../../../lib/cluster/features/routing_summary.hpp"
 #include "../../../lib/cluster/features/stream_subscription.hpp"
@@ -10,6 +11,8 @@
 
 #include <gtest/gtest.h>
 
+#include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -184,6 +187,81 @@ TEST(BackupRestore, PortableControlCaptureScrubsAuthorityAndFencesActiveSweep) {
     state.retentionSweep = RetentionSweep{10, "cpu", 3, 2000, 17};
     EXPECT_FALSE(BackupRestore::capturePortableControl(state).has_value())
         << "a partially fanned-out retention decision has no portable restore state";
+}
+
+TEST(BackupRestore, PortableControlAndExportCheckpointHaveOneChecksummedV1Identity) {
+    PortableControlBackup portable;
+    portable.policies.emplace("schema/cpu", PolicyCell{3, "portable"});
+    const auto portableBytes = portable.encode();
+    auto decodedPortable = PortableControlBackup::decode(portableBytes);
+    ASSERT_TRUE(decodedPortable);
+    EXPECT_EQ(*decodedPortable, portable);
+    auto corruptPortable = portableBytes;
+    corruptPortable[corruptPortable.size() / 2] ^= 0x20;
+    EXPECT_FALSE(PortableControlBackup::decode(corruptPortable));
+
+    ClusterBackupExportCheckpoint checkpoint;
+    checkpoint.operationId = "11112222333344445555666677778888";
+    checkpoint.sourceClusterUuid = "00112233445566778899aabbccddeeff";
+    checkpoint.servingMap.epoch = 9;
+    for (uint16_t vshard = 0; vshard < VIRTUAL_SHARD_COUNT; ++vshard)
+        checkpoint.servingMap.placement.emplace(vshard, std::vector<raft::NodeId>{1, 2, 3});
+    checkpoint.control = portable;
+    ASSERT_TRUE(checkpoint.valid());
+    const auto encoded = checkpoint.encode();
+    auto decoded = ClusterBackupExportCheckpoint::decode(encoded);
+    ASSERT_TRUE(decoded);
+    EXPECT_EQ(*decoded, checkpoint);
+
+    auto corrupt = encoded;
+    corrupt[corrupt.size() / 2] ^= 0x40;
+    EXPECT_FALSE(ClusterBackupExportCheckpoint::decode(corrupt));
+    checkpoint.operationId = std::string(32, '0');
+    EXPECT_FALSE(checkpoint.valid()) << "the peer protocol reserves the all-zero operation identity";
+}
+
+TEST(BackupRestore, DurableExportCheckpointRefusesOperationMixingAndRetainsProgress) {
+    namespace fs = std::filesystem;
+    const fs::path archive = "backup_export_checkpoint_test";
+    fs::remove_all(archive);
+    fs::remove_all(archive.string() + ".export.v1");
+
+    ClusterBackupExportCheckpoint checkpoint;
+    checkpoint.operationId = "11112222333344445555666677778888";
+    checkpoint.sourceClusterUuid = "00112233445566778899aabbccddeeff";
+    checkpoint.servingMap.epoch = 4;
+    for (uint16_t vshard = 0; vshard < VIRTUAL_SHARD_COUNT; ++vshard)
+        checkpoint.servingMap.placement.emplace(vshard, std::vector<raft::NodeId>{1, 2, 3});
+
+    DurableClusterBackupExport durable(archive);
+    EXPECT_EQ(durable.createOrLoad(checkpoint), checkpoint);
+    ASSERT_TRUE(durable.load());
+    EXPECT_EQ(*durable.load(), checkpoint);
+
+    const auto interrupted = durable.prepareDownload(7);
+    {
+        std::ofstream out(interrupted, std::ios::binary);
+        out << "interrupted";
+    }
+    EXPECT_TRUE(fs::exists(interrupted));
+    const auto resumed = durable.prepareDownload(8);
+    EXPECT_FALSE(fs::exists(interrupted));
+    EXPECT_NE(resumed, interrupted);
+
+    auto conflict = checkpoint;
+    conflict.operationId = "99990000aaaabbbbccccddddeeeeffff";
+    EXPECT_THROW((void)durable.createOrLoad(conflict), std::invalid_argument);
+    EXPECT_EQ(*durable.load(), checkpoint) << "a conflicting resume must not replace the first operation fence";
+
+    fs::remove_all(archive.string() + ".export.v1");
+    fs::create_directories(archive);
+    {
+        std::ofstream out(archive / "foreign");
+        out << "not this operation";
+    }
+    EXPECT_THROW((void)DurableClusterBackupExport(archive).createOrLoad(checkpoint), std::invalid_argument);
+    fs::remove_all(archive);
+    fs::remove_all(archive.string() + ".export.v1");
 }
 
 TEST(BackupRestore, PortableControlRejectsInconsistentRetentionState) {

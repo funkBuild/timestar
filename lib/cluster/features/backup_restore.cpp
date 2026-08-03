@@ -24,6 +24,7 @@ namespace {
 
 constexpr uint32_t kMagic = 0x4b425354;  // "TSBK" little-endian
 constexpr uint32_t kVersion = 1;
+constexpr uint32_t kPortableMagic = 0x43505354;  // "TSPC" little-endian
 constexpr size_t kHashHexBytes = 32;
 constexpr size_t kMaxManifestBytes = 64u << 20;
 constexpr size_t kMaxPortableControlEncodedBytes = kMaxManifestBytes - (size_t{1} << 20);
@@ -424,6 +425,82 @@ bool PortableControlBackup::valid() const {
         frozenBytes += bytes;
     }
     return true;
+}
+
+std::string PortableControlBackup::encode() const {
+    if (!valid())
+        throw std::invalid_argument("cannot encode invalid TSPC v1 portable control state");
+    std::string out;
+    putU32(out, kPortableMagic);
+    putU32(out, kVersion);
+    putU32(out, static_cast<uint32_t>(policies.size()));
+    for (const auto& [key, cell] : policies) {
+        putBlob(out, key);
+        putU64(out, cell.version);
+        putBlob(out, cell.value);
+    }
+    putU64(out, lastRetentionSweepId);
+    putU32(out, static_cast<uint32_t>(retentionCutoffs.size()));
+    for (const auto& [measurement, cutoff] : retentionCutoffs) {
+        putBlob(out, measurement);
+        putU64(out, cutoff.policyVersion);
+        putU64(out, cutoff.cutoffTime);
+    }
+    putU32(out, static_cast<uint32_t>(frozenDeletePlans.size()));
+    for (const auto& [id, plan] : frozenDeletePlans) {
+        (void)id;
+        putFrozenPlan(out, plan);
+    }
+    putU32(out, CRC32::compute(out.data(), out.size()));
+    if (out.size() > kMaxPortableControlEncodedBytes)
+        throw std::length_error("TSPC v1 portable control state exceeds its bounded encoding");
+    return out;
+}
+
+std::optional<PortableControlBackup> PortableControlBackup::decode(std::string_view bytes) {
+    if (bytes.size() < 12 || bytes.size() > kMaxPortableControlEncodedBytes)
+        return std::nullopt;
+    const size_t bodySize = bytes.size() - 4;
+    Reader crcReader(std::span<const char>(bytes.data() + bodySize, 4));
+    const uint32_t storedCrc = crcReader.u32();
+    if (!crcReader.exhausted() || CRC32::compute(bytes.data(), bodySize) != storedCrc)
+        return std::nullopt;
+    Reader reader(std::span<const char>(bytes.data(), bodySize));
+    if (reader.u32() != kPortableMagic || reader.u32() != kVersion)
+        return std::nullopt;
+
+    PortableControlBackup out;
+    const uint32_t policyCount = reader.u32();
+    if (!reader.ok() || policyCount > kMaxPortablePolicies)
+        return std::nullopt;
+    for (uint32_t i = 0; i < policyCount; ++i) {
+        std::string key = reader.blob(control::kMaxPolicyKeyBytes);
+        control::PolicyCell cell{reader.u64(), reader.blob(control::kMaxPolicyValueBytes)};
+        if (!reader.ok() || !validPolicy(key, cell) || !out.policies.emplace(std::move(key), std::move(cell)).second)
+            return std::nullopt;
+    }
+    out.lastRetentionSweepId = reader.u64();
+    const uint32_t cutoffCount = reader.u32();
+    if (!reader.ok() || cutoffCount > control::kMaxRetentionPolicies)
+        return std::nullopt;
+    for (uint32_t i = 0; i < cutoffCount; ++i) {
+        std::string measurement = reader.blob(control::kMaxRetentionMeasurementBytes);
+        control::RetentionCutoffRecord cutoff{reader.u64(), reader.u64()};
+        if (!reader.ok() || !control::validRetentionMeasurement(measurement) || cutoff.policyVersion == 0 ||
+            cutoff.cutoffTime == 0 || !out.retentionCutoffs.emplace(std::move(measurement), cutoff).second)
+            return std::nullopt;
+    }
+    const uint32_t planCount = reader.u32();
+    if (!reader.ok() || planCount > control::kMaxFrozenDeletePlans)
+        return std::nullopt;
+    for (uint32_t i = 0; i < planCount; ++i) {
+        auto plan = readFrozenPlan(reader);
+        if (!plan || !out.frozenDeletePlans.emplace(plan->requestId, std::move(*plan)).second)
+            return std::nullopt;
+    }
+    if (!reader.exhausted() || !out.valid())
+        return std::nullopt;
+    return out;
 }
 
 bool VShardBackupUnit::valid() const {

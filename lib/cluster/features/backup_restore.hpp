@@ -25,6 +25,10 @@ struct PortableControlBackup {
 
     friend bool operator==(const PortableControlBackup&, const PortableControlBackup&) = default;
     [[nodiscard]] bool valid() const;
+    // Checksummed exact-v1 encoding used by the durable export checkpoint. It
+    // contains only portable authority-free state, just like the manifest.
+    [[nodiscard]] std::string encode() const;
+    [[nodiscard]] static std::optional<PortableControlBackup> decode(std::string_view bytes);
 };
 
 // One immutable TSP1 file in a completed archive. The filename is derived from

@@ -176,3 +176,23 @@ TEST_F(HttpAuthWrapTest, ClusterLeadershipRebalanceRouteRequiresAuth) {
     EXPECT_NE(registration.find("addJsonRoute"), std::string::npos);
     EXPECT_NE(registration.find("authToken()"), std::string::npos);
 }
+
+TEST_F(HttpAuthWrapTest, ClusterBackupLifecycleRoutesRequireConfiguredAuthentication) {
+#ifdef HTTP_SERVER_SOURCE_PATH
+    std::string src = readFile(HTTP_SERVER_SOURCE_PATH);
+#else
+    std::string src = readFile("../bin/timestar_http_server.cpp");
+#endif
+    ASSERT_FALSE(src.empty()) << "Could not read server source";
+    for (const std::string routeName : {"\"/cluster/backup/export\"", "\"/cluster/backup/export/cancel\""}) {
+        size_t route = src.find(routeName);
+        ASSERT_NE(route, std::string::npos) << routeName;
+        const auto begin = route > 180 ? route - 180 : 0;
+        const auto registration = src.substr(begin, 360);
+        EXPECT_NE(registration.find("addJsonRoute"), std::string::npos) << routeName;
+        EXPECT_NE(registration.find("authToken()"), std::string::npos) << routeName;
+        const auto handler = src.substr(route, 700);
+        EXPECT_NE(handler.find("authToken().empty()"), std::string::npos)
+            << routeName << " must be unavailable rather than public in unauthenticated development mode";
+    }
+}

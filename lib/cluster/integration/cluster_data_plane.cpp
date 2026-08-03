@@ -8,9 +8,14 @@
 #include "../control/group0_controller.hpp"
 #include "../data/read_routing.hpp"
 #include "../data/write_errors.hpp"
+#include "../movement/snapshot_stream.hpp"
 #include "../reconnect_policy.hpp"
 #include "group0_startup.hpp"
 #include "write_admission.hpp"
+
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <cctype>
@@ -26,13 +31,89 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <unordered_set>
+#include <utility>
 
 namespace timestar::cluster {
 
 namespace {
 constexpr std::chrono::milliseconds kLeadershipBalanceInterval{5000};
 constexpr unsigned kLeadershipBalanceJitterPercent = 40;
+constexpr uint32_t kBackupExportChunkBytes = 1u << 20;
+constexpr unsigned kBackupExportCaptureAttempts = 24;
+constexpr std::chrono::milliseconds kBackupExportRetryDelay{250};
+constexpr std::chrono::seconds kBackupExportControlFenceTimeout{6};
+constexpr std::chrono::seconds kBackupExportChunkTimeout{30};
+constexpr std::chrono::seconds kBackupExportFinishTimeout{30};
+constexpr std::chrono::seconds kBackupExportBeginTimeout{310};
+
+class BackupExportCancelled final : public std::runtime_error {
+public:
+    BackupExportCancelled() : std::runtime_error("cluster backup export was cancelled") {}
+};
+
+class ExportDownloadFd {
+public:
+    explicit ExportDownloadFd(int fd = -1) : fd_(fd) {}
+    ExportDownloadFd(const ExportDownloadFd&) = delete;
+    ExportDownloadFd& operator=(const ExportDownloadFd&) = delete;
+    ExportDownloadFd(ExportDownloadFd&& other) noexcept : fd_(std::exchange(other.fd_, -1)) {}
+    ~ExportDownloadFd() {
+        if (fd_ >= 0)
+            ::close(fd_);
+    }
+    int get() const { return fd_; }
+    int release() { return std::exchange(fd_, -1); }
+
+private:
+    int fd_;
+};
+
+[[noreturn]] void throwBackupExportIo(const std::string& operation, const std::filesystem::path& path) {
+    throw std::system_error(errno, std::generic_category(), operation + ": " + path.string());
+}
+
+int createBackupExportDownload(const std::filesystem::path& path) {
+    const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (fd < 0)
+        throwBackupExportIo("create backup-export download", path);
+    return fd;
+}
+
+void writeBackupExportChunk(int fd, const std::filesystem::path& path, uint64_t offset, std::string bytes) {
+    size_t written = 0;
+    while (written < bytes.size()) {
+        const ssize_t count =
+            ::pwrite(fd, bytes.data() + written, bytes.size() - written, static_cast<off_t>(offset + written));
+        if (count < 0) {
+            if (errno == EINTR)
+                continue;
+            throwBackupExportIo("write backup-export download", path);
+        }
+        if (count == 0)
+            throw std::runtime_error("zero-byte write to backup-export download " + path.string());
+        written += static_cast<size_t>(count);
+    }
+}
+
+void finishBackupExportDownload(int fd, const std::filesystem::path& path, uint64_t expectedSize) {
+    ExportDownloadFd guard(fd);
+    struct stat st{};
+    if (::fstat(guard.get(), &st) < 0)
+        throwBackupExportIo("stat backup-export download", path);
+    if (!S_ISREG(st.st_mode) || st.st_size < 0 || static_cast<uint64_t>(st.st_size) != expectedSize)
+        throw std::runtime_error("backup-export download size changed before publication");
+    int rc = 0;
+    do {
+        rc = ::fsync(guard.get());
+    } while (rc < 0 && errno == EINTR);
+    if (rc < 0)
+        throwBackupExportIo("fsync backup-export download", path);
+    const int completedFd = guard.release();
+    if (::close(completedFd) < 0 && errno != EINTR)
+        throwBackupExportIo("close backup-export download", path);
+}
 
 std::chrono::milliseconds nextLeadershipBalanceDelay() {
     return jitteredDelay(kLeadershipBalanceInterval, kLeadershipBalanceJitterPercent);
@@ -891,7 +972,341 @@ seastar::future<> ClusterDataPlane::setReplicaRetirementCheckpointForTesting(
     });
 }
 
+std::string_view ClusterDataPlane::backupExportPhaseName(BackupExportPhase phase) {
+    switch (phase) {
+        case BackupExportPhase::Idle:
+            return "idle";
+        case BackupExportPhase::Running:
+            return "running";
+        case BackupExportPhase::Cancelled:
+            return "cancelled";
+        case BackupExportPhase::Failed:
+            return "failed";
+        case BackupExportPhase::Complete:
+            return "complete";
+    }
+    return "invalid";
+}
+
+seastar::future<features::ClusterBackupExportCheckpoint> ClusterDataPlane::captureBackupExportFence(
+    std::string operationId) {
+    if (!controlEnabled_ || !replicated_ || !shardsStarted_ || !rt_)
+        throw std::invalid_argument("cluster backup export requires a live replicated Group-0 cluster");
+    auto* host = shards_.local().group0();
+    if (!host || !host->group() || !host->stateMachine())
+        throw std::runtime_error("cluster backup export cannot reach local Group 0");
+    auto* group = host->group();
+    backupExportStatus_.controlLeader = group->isLeader() ? group->node().id() : group->leader();
+    if (!group->isLeader())
+        throw std::runtime_error("cluster backup export must start or resume on the current Group-0 leader");
+    (void)co_await group->readBarrier(seastar::lowres_clock::now() + kBackupExportControlFenceTimeout);
+    if (!group->isLeader())
+        throw std::runtime_error("cluster backup export lost Group-0 leadership while fencing control state");
+    const auto& state = host->state();
+    if (state.clusterUuid != controlClusterUuid_ || state.mapEpoch != state.servingMap.epoch ||
+        !control::isCompleteControlMap(state.servingMap))
+        throw std::runtime_error("cluster backup export requires one complete, currently served Group-0 map");
+    auto portable = features::BackupRestore::capturePortableControl(state);
+    if (!portable)
+        throw std::runtime_error("cluster backup export is fenced while a retention sweep is active");
+    co_return features::ClusterBackupExportCheckpoint{std::move(operationId), state.clusterUuid, state.servingMap,
+                                                      std::move(*portable)};
+}
+
+seastar::future<ClusterDataPlane::BackupExportStatus> ClusterDataPlane::startBackupExport(
+    std::filesystem::path archiveDirectory, std::string operationId) {
+    if (!features::ClusterBackupExportCheckpoint::canonicalOperationId(operationId))
+        throw std::invalid_argument("cluster backup operation_id must be 32 lowercase hexadecimal characters");
+    if (backupExportGate_.is_closed())
+        throw std::runtime_error("cluster backup export is shutting down");
+    if (backupExportRunning_) {
+        if (backupExportStatus_.operationId == operationId && backupExportArchive_ == archiveDirectory)
+            co_return backupExportStatus_;
+        throw std::runtime_error("another cluster backup export is already running");
+    }
+
+    auto existing = co_await seastar::async(
+        [archiveDirectory] { return features::DurableClusterBackupExport(archiveDirectory).load(); });
+    if (existing && existing->operationId != operationId)
+        throw std::invalid_argument("backup archive belongs to a different operation_id");
+
+    if (existing) {
+        auto published = co_await features::ClusterBackupArchive::validate(archiveDirectory);
+        if (published) {
+            if (published->sourceClusterUuid != existing->sourceClusterUuid || published->control != existing->control)
+                throw std::runtime_error("published backup archive conflicts with its durable export checkpoint");
+            backupExportArchive_ = std::move(archiveDirectory);
+            backupExportCheckpoint_ = std::move(*existing);
+            backupExportStatus_ = BackupExportStatus{BackupExportPhase::Complete,
+                                                     operationId,
+                                                     backupExportArchive_.string(),
+                                                     backupExportCheckpoint_->sourceClusterUuid,
+                                                     backupExportCheckpoint_->servingMap.epoch,
+                                                     VIRTUAL_SHARD_COUNT,
+                                                     backupExportStatus_.controlLeader,
+                                                     {}};
+            co_return backupExportStatus_;
+        }
+    }
+
+    auto current = co_await captureBackupExportFence(operationId);
+    if (existing && *existing != current)
+        throw std::runtime_error(
+            "backup export cannot resume because its source serving map or portable Group-0 state changed");
+    auto checkpoint = co_await seastar::async([archiveDirectory, desired = std::move(current)]() mutable {
+        return features::DurableClusterBackupExport(archiveDirectory).createOrLoad(desired);
+    });
+
+    backupExportArchive_ = std::move(archiveDirectory);
+    backupExportCheckpoint_ = std::move(checkpoint);
+    backupExportCancelRequested_ = false;
+    backupExportRunning_ = true;
+    backupExportStatus_ = BackupExportStatus{BackupExportPhase::Running,
+                                             operationId,
+                                             backupExportArchive_.string(),
+                                             backupExportCheckpoint_->sourceClusterUuid,
+                                             backupExportCheckpoint_->servingMap.epoch,
+                                             0,
+                                             rt_->selfId,
+                                             {}};
+    (void)seastar::with_gate(backupExportGate_, [this] {
+        return runBackupExport().then_wrapped([this](seastar::future<> result) {
+            try {
+                result.get();
+            } catch (const BackupExportCancelled& e) {
+                backupExportStatus_.phase = BackupExportPhase::Cancelled;
+                backupExportStatus_.error = e.what();
+            } catch (const std::exception& e) {
+                backupExportStatus_.phase = BackupExportPhase::Failed;
+                backupExportStatus_.error = e.what();
+                timestar::http_log.error("cluster: backup export {} failed after {}/{} VShards: {}",
+                                         backupExportStatus_.operationId, backupExportStatus_.completedVShards,
+                                         VIRTUAL_SHARD_COUNT, e.what());
+            } catch (...) {
+                backupExportStatus_.phase = BackupExportPhase::Failed;
+                backupExportStatus_.error = "unknown backup-export failure";
+                timestar::http_log.error("cluster: backup export {} failed with an unknown error",
+                                         backupExportStatus_.operationId);
+            }
+            backupExportRunning_ = false;
+        });
+    });
+    co_return backupExportStatus_;
+}
+
+ClusterDataPlane::BackupExportStatus ClusterDataPlane::cancelBackupExport(std::string_view operationId) {
+    if (!features::ClusterBackupExportCheckpoint::canonicalOperationId(operationId) ||
+        operationId != backupExportStatus_.operationId)
+        throw std::invalid_argument("operation_id does not identify the current cluster backup export");
+    if (backupExportRunning_)
+        backupExportCancelRequested_ = true;
+    return backupExportStatus_;
+}
+
+seastar::future<data::BackupCaptureDescriptor> ClusterDataPlane::beginBackupExportCapture(
+    NodeId target, const std::string& operationId, const std::string& clusterUuid, uint16_t vshard) {
+    if (target == rt_->selfId)
+        co_return co_await shards_.local().beginBackupCapture(operationId, clusterUuid, vshard);
+    co_return co_await rpc_->beginBackupCapture(target, operationId, clusterUuid, vshard,
+                                                seastar::rpc::rpc_clock_type::now() + kBackupExportBeginTimeout);
+}
+
+seastar::future<data::BackupCaptureChunk> ClusterDataPlane::readBackupExportCapture(NodeId target,
+                                                                                    const std::string& operationId,
+                                                                                    const std::string& clusterUuid,
+                                                                                    uint16_t vshard, uint64_t offset) {
+    if (target == rt_->selfId)
+        co_return co_await shards_.local().readBackupCapture(operationId, clusterUuid, vshard, offset,
+                                                             kBackupExportChunkBytes);
+    co_return co_await rpc_->readBackupCapture(target, operationId, clusterUuid, vshard, offset,
+                                               kBackupExportChunkBytes,
+                                               seastar::rpc::rpc_clock_type::now() + kBackupExportChunkTimeout);
+}
+
+seastar::future<> ClusterDataPlane::finishBackupExportCapture(NodeId target, const std::string& operationId,
+                                                              const std::string& clusterUuid, uint16_t vshard) {
+    if (target == rt_->selfId) {
+        co_await shards_.local().finishBackupCapture(operationId, clusterUuid, vshard);
+        co_return;
+    }
+    co_await rpc_->finishBackupCapture(target, operationId, clusterUuid, vshard,
+                                       seastar::rpc::rpc_clock_type::now() + kBackupExportFinishTimeout);
+}
+
+seastar::future<std::optional<features::VShardBackupUnit>> ClusterDataPlane::captureBackupExportVShard(
+    const features::ClusterBackupExportCheckpoint& checkpoint, uint16_t vshard,
+    const std::filesystem::path& downloadPath) {
+    const auto placement = checkpoint.servingMap.placement.find(vshard);
+    if (placement == checkpoint.servingMap.placement.end() || placement->second.empty())
+        throw std::runtime_error("backup-export checkpoint has no serving replicas for VShard " +
+                                 std::to_string(vshard));
+    std::exception_ptr lastFailure;
+    std::optional<NodeId> redirected;
+    for (unsigned attempt = 0; attempt < kBackupExportCaptureAttempts; ++attempt) {
+        if (backupExportCancelRequested_)
+            throw BackupExportCancelled{};
+        NodeId target = redirected.value_or(placement->second[attempt % placement->second.size()]);
+        redirected.reset();
+        bool sessionStarted = false;
+        try {
+            auto descriptor =
+                co_await beginBackupExportCapture(target, checkpoint.operationId, checkpoint.sourceClusterUuid, vshard);
+            if (descriptor.status == data::BackupCaptureStatus::Redirect) {
+                if (std::ranges::find(placement->second, descriptor.leaderHint) != placement->second.end())
+                    redirected = descriptor.leaderHint;
+                co_await seastar::sleep(kBackupExportRetryDelay);
+                continue;
+            }
+            if (descriptor.status == data::BackupCaptureStatus::Unavailable) {
+                co_await seastar::sleep(kBackupExportRetryDelay);
+                continue;
+            }
+            if (descriptor.encodedSize < 12 || descriptor.encodedSize > (uint64_t{1} << 40))
+                throw std::runtime_error("backup capture returned an invalid exact-v1 file size");
+            sessionStarted = true;
+            ExportDownloadFd file(
+                co_await seastar::async([downloadPath] { return createBackupExportDownload(downloadPath); }));
+            uint64_t offset = 0;
+            uint64_t hash = 1469598103934665603ull;
+            while (offset < descriptor.encodedSize) {
+                if (backupExportCancelRequested_)
+                    throw BackupExportCancelled{};
+                auto chunk = co_await readBackupExportCapture(target, checkpoint.operationId,
+                                                              checkpoint.sourceClusterUuid, vshard, offset);
+                if (chunk.totalSize != descriptor.encodedSize || chunk.totalHash != descriptor.encodedHash ||
+                    chunk.bytes.empty() || chunk.bytes.size() > descriptor.encodedSize - offset)
+                    throw std::runtime_error("backup capture changed or returned a malformed chunk");
+                hash = movement::detail::fnv1a(chunk.bytes.data(), chunk.bytes.size(), hash);
+                const size_t chunkBytes = chunk.bytes.size();
+                co_await seastar::async(
+                    [fd = file.get(), downloadPath, offset, bytes = std::move(chunk.bytes)]() mutable {
+                        writeBackupExportChunk(fd, downloadPath, offset, std::move(bytes));
+                    });
+                offset += chunkBytes;
+            }
+            if (hash != descriptor.encodedHash)
+                throw std::runtime_error("backup capture whole-file hash mismatch");
+            const int completedFd = file.release();
+            co_await seastar::async([completedFd, downloadPath, size = descriptor.encodedSize] {
+                finishBackupExportDownload(completedFd, downloadPath, size);
+            });
+            try {
+                co_await finishBackupExportCapture(target, checkpoint.operationId, checkpoint.sourceClusterUuid,
+                                                   vshard);
+            } catch (const std::exception& e) {
+                // The immutable download is complete and hash-verified. Finish
+                // only releases the remote pin early; the bounded session TTL
+                // is the fallback after a lost acknowledgement.
+                timestar::http_log.warn("cluster: completed VShard {} download but capture finish failed: {}", vshard,
+                                        e.what());
+            }
+            sessionStarted = false;
+            if (backupExportCancelRequested_)
+                throw BackupExportCancelled{};
+            auto unit =
+                co_await features::ClusterBackupArchive::stageVShard(backupExportArchive_, vshard, downloadPath);
+            if (!unit)
+                throw std::runtime_error("downloaded backup unit failed exact-v1 archive staging validation");
+            try {
+                co_await seastar::async([archive = backupExportArchive_, downloadPath] {
+                    features::DurableClusterBackupExport(archive).removeDownload(downloadPath);
+                });
+            } catch (const std::exception& e) {
+                // The archive unit is already durable and immutable. A sibling
+                // download is not part of archive validity; the next resume or
+                // VShard preparation retries its removal.
+                timestar::http_log.warn("cluster: staged VShard {} but could not remove export download: {}", vshard,
+                                        e.what());
+            }
+            co_return unit;
+        } catch (...) {
+            lastFailure = std::current_exception();
+        }
+        if (sessionStarted) {
+            try {
+                co_await finishBackupExportCapture(target, checkpoint.operationId, checkpoint.sourceClusterUuid,
+                                                   vshard);
+            } catch (...) {
+                // The bounded session expires remotely; preserve the original
+                // transfer failure as the actionable status.
+            }
+        }
+        co_await seastar::async([archive = backupExportArchive_, downloadPath] {
+            features::DurableClusterBackupExport(archive).removeDownload(downloadPath);
+        });
+        if (backupExportCancelRequested_)
+            throw BackupExportCancelled{};
+        co_await seastar::sleep(kBackupExportRetryDelay);
+    }
+    if (lastFailure)
+        std::rethrow_exception(lastFailure);
+    throw std::runtime_error("no serving replica could capture VShard " + std::to_string(vshard));
+}
+
+seastar::future<> ClusterDataPlane::runBackupExport() {
+    if (!backupExportCheckpoint_)
+        throw std::runtime_error("cluster backup export started without a durable checkpoint");
+    const auto& checkpoint = *backupExportCheckpoint_;
+    std::vector<features::VShardBackupUnit> units;
+    units.reserve(VIRTUAL_SHARD_COUNT);
+    features::DurableClusterBackupExport durable(backupExportArchive_);
+    for (uint32_t value = 0; value < VIRTUAL_SHARD_COUNT; ++value) {
+        if (backupExportCancelRequested_)
+            throw BackupExportCancelled{};
+        const uint16_t vshard = static_cast<uint16_t>(value);
+        const auto finalPath = backupExportArchive_ / features::BackupRestore::unitRelativePath(vshard);
+        const bool finalExists = co_await seastar::async([finalPath] {
+            std::error_code ec;
+            const auto status = std::filesystem::symlink_status(finalPath, ec);
+            if (ec == std::errc::no_such_file_or_directory)
+                return false;
+            if (ec)
+                throw std::filesystem::filesystem_error("inspect resumed backup unit", finalPath, ec);
+            if (status.type() == std::filesystem::file_type::not_found)
+                return false;
+            if (status.type() != std::filesystem::file_type::regular)
+                throw std::runtime_error("resumed backup unit is not a regular file: " + finalPath.string());
+            return true;
+        });
+        std::optional<features::VShardBackupUnit> unit;
+        if (finalExists)
+            unit = co_await features::ClusterBackupArchive::stageVShard(backupExportArchive_, vshard, finalPath);
+        else {
+            const auto download = co_await seastar::async([archive = backupExportArchive_, vshard] {
+                return features::DurableClusterBackupExport(archive).prepareDownload(vshard);
+            });
+            unit = co_await captureBackupExportVShard(checkpoint, vshard, download);
+        }
+        if (!unit)
+            throw std::runtime_error("resumed backup unit conflicts with durable operation at VShard " +
+                                     std::to_string(vshard));
+        units.push_back(std::move(*unit));
+        backupExportStatus_.completedVShards = value + 1;
+    }
+
+    auto finalFence = co_await captureBackupExportFence(checkpoint.operationId);
+    if (finalFence != checkpoint)
+        throw std::runtime_error(
+            "cluster serving map or portable Group-0 state changed during export; publication refused");
+    features::ClusterBackupManifest manifest{checkpoint.sourceClusterUuid, std::move(finalFence.control),
+                                             std::move(units)};
+    if (!co_await features::ClusterBackupArchive::publish(backupExportArchive_, manifest))
+        throw std::runtime_error("complete backup units failed manifest-last publication");
+    auto validated = co_await features::ClusterBackupArchive::validate(backupExportArchive_);
+    if (!validated || *validated != manifest)
+        throw std::runtime_error("published cluster backup did not pass exact-v1 validation");
+    backupExportStatus_.phase = BackupExportPhase::Complete;
+    backupExportStatus_.error.clear();
+    timestar::http_log.info("cluster: backup export {} completed {} VShards at serving-map epoch {}",
+                            checkpoint.operationId, VIRTUAL_SHARD_COUNT, checkpoint.servingMap.epoch);
+}
+
 seastar::future<> ClusterDataPlane::stop() {
+    // Export borrows Group 0, every data group, and the peer RPC client. Request
+    // cancellation and drain it before any of those dependencies are stopped.
+    backupExportCancelRequested_ = true;
+    if (!backupExportGate_.is_closed())
+        co_await backupExportGate_.close();
     // The peer re-resolution loop touches rpc_ and shards_; quiesce it first.
     peerResolveTimer_.cancel();
     if (!peerResolveGate_.is_closed())

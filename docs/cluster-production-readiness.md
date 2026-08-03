@@ -315,7 +315,13 @@ evidence below.
   ReadIndex, waits/rolls to a TSP1 boundary at or beyond it, and pins the
   sidecar across supersession and archival. Exact-v1 peer RPCs now route capture
   requests to the owning reactor and stream that pinned sidecar in bounded,
-  hash-identified 1-MiB chunks under bounded expiring sessions. The offline
+  hash-identified 1-MiB chunks under bounded expiring sessions. The Group-0
+  leader now persists one checksummed exact-v1 export checkpoint beside the
+  archive, binds it to the operation/source/complete serving map/portable
+  control fence, sequentially retries every current VShard leader, and resumes
+  immutable staged units after interruption. Authenticated start/status/cancel
+  routes retain resumable progress, and a second quorum fence precedes
+  manifest-last publication. The offline
   server path now seeds a
   fresh node's selected data groups at term 1 under new voters, reconstructs a
   scrubbed one-seed Group-0 snapshot under a new cluster UUID, persists the new
@@ -324,8 +330,9 @@ evidence below.
   ordinary startup remains fenced until the offline finalizer has validated a
   consistent marker from every data voter plus the Group-0 seed and activation
   has persisted that exact release locally. This does not close the blocker:
-  the server still needs a durable operation coordinator above those peer RPCs
-  and the live RF=3 restore/restart/corruption gate.
+  the live RF=3 export/restore/restart/corruption gate, artifact
+  authentication/encryption, and capacity/retention/disaster-recovery
+  procedures remain.
 
 ### P2 — release and operations
 
@@ -399,6 +406,13 @@ IDs, constant-space fence snapshot/restore, catalog pagination, and measurement
 and VShard isolation. The production retention gate adds current-leader HTTP
 CAS, controller kill after partial progress, durable all-VShard resume, data
 readback, old-controller restart, and tombstone-version recreation.
+
+The backup-export coordinator build covers the production server and unit-test
+targets with compiler temporaries under `build/tmp`. Focused one-reactor,
+1-GiB tests cover portable-control/checkpoint exact-v1 round trips and corruption
+rejection, durable checkpoint conflicts and retained progress, and explicit
+refusal of every backup lifecycle route when authentication is disabled. The
+remaining evidence is the multi-process RF=3 workflow gate listed above.
 
 The delete-receipt suites cover capacity- and time-based retirement, stable
 expired/conflict outcomes, snapshot state, recovery, and the write barrier

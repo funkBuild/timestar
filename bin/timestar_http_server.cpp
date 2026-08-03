@@ -1,3 +1,4 @@
+#include "cluster/features/backup_restore.hpp"
 #include "cluster/features/cluster_restore_seeder.hpp"
 #include "cluster/integration/cluster_data_plane.hpp"
 #include "cluster/integration/group0_identity_bridge.hpp"
@@ -157,6 +158,27 @@ struct ClusterMoveRequestBody {
 struct ClusterNodeRequestBody {
     uint64_t node = timestar::raft::kNoNode;
 };
+
+struct ClusterBackupExportRequestBody {
+    std::string archive_directory;
+    std::string operation_id;
+};
+
+struct ClusterBackupCancelRequestBody {
+    std::string operation_id;
+};
+
+static std::string backupExportJson(const timestar::cluster::ClusterDataPlane::BackupExportStatus& status) {
+    return "{\"status\":\"" + std::string(timestar::cluster::ClusterDataPlane::backupExportPhaseName(status.phase)) +
+           "\",\"operation_id\":\"" + timestar::jsonEscape(status.operationId) + "\",\"archive_directory\":\"" +
+           timestar::jsonEscape(status.archiveDirectory) + "\",\"source_cluster_uuid\":\"" +
+           timestar::jsonEscape(status.sourceClusterUuid) +
+           "\",\"serving_map_epoch\":" + std::to_string(status.servingMapEpoch) +
+           ",\"completed_vshards\":" + std::to_string(status.completedVShards) +
+           ",\"total_vshards\":" + std::to_string(timestar::VIRTUAL_SHARD_COUNT) +
+           ",\"control_leader\":" + std::to_string(status.controlLeader) + ",\"error\":\"" +
+           timestar::jsonEscape(status.error) + "\",\"protocol_version\":1}";
+}
 
 static void setControlMutationReply(seastar::http::reply& rep,
                                     const timestar::cluster::ClusterDataPlane::ControlMutationResult& result,
@@ -388,6 +410,110 @@ void set_routes(routes& r) {
                 co_return std::move(rep);
             },
             "json"));
+
+    // Cluster backups contain the complete dataset, so every lifecycle route
+    // stays unavailable when bearer authentication is disabled. Start is
+    // idempotent for one archive/operation ID; cancel retains the immutable
+    // checkpoint and completed units so the same operation can resume.
+    timestar::http::addJsonRoute(
+        r, operation_type::GET, "/cluster/backup/export", authToken(),
+        [](std::unique_ptr<seastar::http::request>,
+           std::unique_ptr<seastar::http::reply> rep) -> seastar::future<std::unique_ptr<seastar::http::reply>> {
+            if (authToken().empty()) {
+                rep->set_status(seastar::http::reply::status_type::unauthorized);
+                rep->_content =
+                    R"({"status":"error","message":"cluster backup export requires server authentication"})";
+                co_return std::move(rep);
+            }
+            if (!g_clusterPartitioned) {
+                rep->set_status(seastar::http::reply::status_type::bad_request);
+                rep->_content = R"({"status":"error","message":"node is not clustered"})";
+                co_return std::move(rep);
+            }
+            const auto status =
+                co_await seastar::smp::submit_to(0u, [] { return g_clusterDataPlane.backupExportStatus(); });
+            rep->set_status(seastar::http::reply::status_type::ok);
+            rep->_content = backupExportJson(status);
+            co_return std::move(rep);
+        });
+
+    timestar::http::addJsonRoute(
+        r, operation_type::POST, "/cluster/backup/export", authToken(),
+        [](std::unique_ptr<seastar::http::request> req,
+           std::unique_ptr<seastar::http::reply> rep) -> seastar::future<std::unique_ptr<seastar::http::reply>> {
+            if (authToken().empty()) {
+                rep->set_status(seastar::http::reply::status_type::unauthorized);
+                rep->_content =
+                    R"({"status":"error","message":"cluster backup export requires server authentication"})";
+                co_return std::move(rep);
+            }
+            if (!g_clusterPartitioned) {
+                rep->set_status(seastar::http::reply::status_type::bad_request);
+                rep->_content = R"({"status":"error","message":"node is not clustered"})";
+                co_return std::move(rep);
+            }
+            ClusterBackupExportRequestBody body;
+            if (req->content.size() > 4096 || glz::read_json(body, req->content) || body.archive_directory.empty() ||
+                body.archive_directory.size() > 2048 ||
+                (!body.operation_id.empty() &&
+                 !timestar::features::ClusterBackupExportCheckpoint::canonicalOperationId(body.operation_id))) {
+                rep->set_status(seastar::http::reply::status_type::bad_request);
+                rep->_content =
+                    R"({"status":"error","message":"archive_directory and an optional canonical operation_id are required"})";
+                co_return std::move(rep);
+            }
+            if (body.operation_id.empty())
+                body.operation_id = timestar::http::generateToken(16);
+            try {
+                auto status = co_await seastar::smp::submit_to(
+                    0u,
+                    [archive = std::move(body.archive_directory), operation = std::move(body.operation_id)]() mutable {
+                        return g_clusterDataPlane.startBackupExport(std::move(archive), std::move(operation));
+                    });
+                rep->add_header("Cache-Control", "no-store");
+                rep->set_status(status.phase == timestar::cluster::ClusterDataPlane::BackupExportPhase::Complete
+                                    ? seastar::http::reply::status_type::ok
+                                    : seastar::http::reply::status_type::accepted);
+                rep->_content = backupExportJson(status);
+            } catch (const std::invalid_argument& e) {
+                rep->set_status(seastar::http::reply::status_type::conflict);
+                rep->_content = "{\"status\":\"error\",\"message\":\"" + timestar::jsonEscape(e.what()) + "\"}";
+            } catch (const std::exception& e) {
+                rep->set_status(seastar::http::reply::status_type::service_unavailable);
+                rep->_content = "{\"status\":\"error\",\"message\":\"" + timestar::jsonEscape(e.what()) + "\"}";
+            }
+            co_return std::move(rep);
+        });
+
+    timestar::http::addJsonRoute(
+        r, operation_type::POST, "/cluster/backup/export/cancel", authToken(),
+        [](std::unique_ptr<seastar::http::request> req,
+           std::unique_ptr<seastar::http::reply> rep) -> seastar::future<std::unique_ptr<seastar::http::reply>> {
+            if (authToken().empty()) {
+                rep->set_status(seastar::http::reply::status_type::unauthorized);
+                rep->_content =
+                    R"({"status":"error","message":"cluster backup export requires server authentication"})";
+                co_return std::move(rep);
+            }
+            ClusterBackupCancelRequestBody body;
+            if (!g_clusterPartitioned || req->content.size() > 512 || glz::read_json(body, req->content) ||
+                !timestar::features::ClusterBackupExportCheckpoint::canonicalOperationId(body.operation_id)) {
+                rep->set_status(seastar::http::reply::status_type::bad_request);
+                rep->_content = R"({"status":"error","message":"a current canonical operation_id is required"})";
+                co_return std::move(rep);
+            }
+            try {
+                const auto status = co_await seastar::smp::submit_to(0u, [operation = std::move(body.operation_id)] {
+                    return g_clusterDataPlane.cancelBackupExport(operation);
+                });
+                rep->set_status(seastar::http::reply::status_type::accepted);
+                rep->_content = backupExportJson(status);
+            } catch (const std::exception& e) {
+                rep->set_status(seastar::http::reply::status_type::conflict);
+                rep->_content = "{\"status\":\"error\",\"message\":\"" + timestar::jsonEscape(e.what()) + "\"}";
+            }
+            co_return std::move(rep);
+        });
 
     // Operator action: hand leadership of VShards this node leads beyond its fair
     // share to lighter peers (M5 leadership balancing == v1 read balancing). Bounded

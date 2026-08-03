@@ -12,14 +12,15 @@ journals. Copying only `shard_*` directories omits cluster authority and cannot
 produce a restorable cluster backup. Independently copying three live replicas
 also does not create one coordinated recovery point.
 
-The internal exact-v1 cluster artifact and node-local restore layers are
-implemented, but a supported cluster-wide export/import workflow is not. Until
-durable all-leader export coordination and an all-voter RF=3 recovery gate are
-shipped, clustered deployment remains blocked for production. Do not clone
+The internal exact-v1 cluster artifact, coordinated export, and node-local
+restore layers are implemented, but they are not yet an approved production
+workflow. Until the all-voter RF=3 recovery gate, authenticated artifact
+handling, capacity policy, and disaster-recovery runbook are complete,
+clustered deployment remains blocked for production. Do not clone
 `node.json`, `control_map.cache`, or `cluster_raft/` into a new node or cluster;
 that can duplicate identity or resurrect obsolete membership.
 
-## Cluster artifact foundation (not yet an operator procedure)
+## Pre-release cluster workflow
 
 The in-tree artifact primitives now define one layout, updated in place during
 the greenfield phase:
@@ -55,8 +56,8 @@ corruption/extra/missing entries, restores that real unit into a fresh Engine,
 and reads the exact value back. That artifact-only gate does not simulate live
 leader capture, new Raft membership, or an RF=3 disaster recovery.
 
-The VShard host now also has the live-capture and peer-transfer primitives
-required by the eventual coordinator. A hosting leader obtains a
+The VShard host and export coordinator now provide the live-capture and
+peer-transfer path. A hosting leader obtains a
 deadline-bounded quorum ReadIndex, waits for a TSP1 boundary at or beyond that
 index, conditionally rolls the active store once, and pins the durable sidecar
 name. Exact-v1 peer RPCs can then begin an idempotent operation/VShard session,
@@ -64,9 +65,75 @@ read the immutable file in at most 1-MiB binary chunks, and finish it
 idempotently. The reply repeats the total size and whole-file hash, a maximum of
 eight sessions are retained per reactor, inactive sessions expire after five
 minutes, and shutdown drains reads before releasing their pins. A newer Raft
-snapshot therefore cannot unlink a source during remote transfer. This is not
-yet a cluster export: no operator command durably assigns and resumes all 4,096
-captures or publishes one stable Group-0 view with them.
+snapshot therefore cannot unlink a source during remote transfer.
+
+The Group-0 leader creates one checksummed `TBEX` v1 checkpoint beside the
+archive before staging any unit. It binds one nonzero operation ID to the source
+cluster UUID, complete serving map, and authority-free portable control state.
+The coordinator processes one VShard at a time, follows leader redirects,
+retries all serving replicas, streams to one bounded partial file, verifies the
+whole-file hash, and stages the exact `TSP1` without replacement. Completed
+archive units are the durable progress journal. A process restart resumes them
+only when the same operation and Group-0 fence still match; conflicting state,
+an active retention sweep, or a topology/portable-control change refuses
+publication instead of mixing recovery points. A second Group-0 quorum fence is
+checked before `manifest.tsbk1` is published last.
+
+Each `TSP1` is a quorum-confirmed prefix of its own VShard. The export does not
+claim one cluster-wide write timestamp: v1 has no cross-VShard transactions, so
+VShards captured later can include later concurrent writes. The RF=3 gate must
+still prove that every acknowledged pre-export write is present after restore.
+
+## Pre-release cluster export API
+
+These routes exist for the remaining RF=3 qualification work; their presence
+does not remove the production block above. They are unavailable when server
+bearer authentication is disabled and must be called on the current Group-0
+leader.
+
+Start a new export (the server returns a generated 32-hex operation ID), or
+resume by resubmitting the returned ID and exact archive path:
+
+```http
+POST /cluster/backup/export
+Authorization: Bearer <server-token>
+Content-Type: application/json
+
+{"archive_directory":"/srv/timestar-backups/2026-08-03"}
+```
+
+Observe the in-process task with `GET /cluster/backup/export`. The response
+reports `running`, `cancelled`, `failed`, or `complete`, the operation and
+source identities, serving-map epoch, control leader, and completed count out
+of 4,096. After a process restart, resume the durable archive with:
+
+```http
+POST /cluster/backup/export
+Authorization: Bearer <server-token>
+Content-Type: application/json
+
+{"archive_directory":"/srv/timestar-backups/2026-08-03",
+ "operation_id":"<32-lowercase-hex-id>"}
+```
+
+Cancellation is operation-scoped:
+
+```http
+POST /cluster/backup/export/cancel
+Authorization: Bearer <server-token>
+Content-Type: application/json
+
+{"operation_id":"<32-lowercase-hex-id>"}
+```
+
+Cancellation removes only the current incomplete download. The immutable
+checkpoint and completed units are deliberately retained for a safe resume.
+Cancellation is cooperative and can wait for the bounded in-flight capture or
+peer-RPC deadline before the status changes from `running` to `cancelled`;
+there is no server-side destructive delete operation. A failed operation whose
+Group-0 fence changed cannot be reused: select a new empty archive path and a
+new operation ID. Operators must not modify the sibling `<archive>.export.v1`
+directory or a partial archive.
 
 The server also has an offline, node-local generation-one importer. On a fresh
 data root, `--cluster-restore <archive>` validates the complete exact-v1 archive
@@ -216,10 +283,10 @@ procedure is:
   fixed-shape begin/read/finish RPCs with canonical operation/cluster identity,
   bounded binary chunks, bounded expiring sessions, leader redirection, and
   cross-reactor VShard routing.
-- [ ] Dispatch that capture to every current VShard leader and durably
+- [x] Dispatch that capture to every current VShard leader and durably
   coordinate all 4,096 results with one portable Group-0 capture. Retry must
   survive leader changes and process/node restarts without mixing operations.
-- [ ] Expose authenticated, authorized server/operator commands for starting,
+- [x] Expose authenticated, authorized server/operator commands for starting,
   observing, resuming, cancelling, and safely retaining an export.
 - [x] On each node, bootstrap a different cluster UUID and import its selected
   `TSP1` units as generation-one state under new Raft membership. The offline
