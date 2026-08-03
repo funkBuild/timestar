@@ -35,7 +35,7 @@ for i in 1 2 3; do
     env $GATE_SERVER_ENV TIMESTAR_CLUSTER_WRITE_INFLIGHT_BYTES="$LIMIT" TIMESTAR_DATA_DIR="$GATE_TMP_ROOT/tsgate_bp$i" \
         TIMESTAR_CLUSTER_ENABLED=true TIMESTAR_CLUSTER_PARTITIONED=true \
         TIMESTAR_CLUSTER_REPLICATION_FACTOR=3 TIMESTAR_CLUSTER_UUID=00112233445566778899aabbccddeeff TIMESTAR_CLUSTER_DEVELOPMENT_ALLOW_INSECURE_TRANSPORT=true TIMESTAR_CLUSTER_NODE_ID=$i TIMESTAR_CLUSTER_PEERS="$PEERS" \
-        "$BIN" --port $((19209 + i)) --smp 4 --memory "$GATE_SERVER_MEMORY" >"$GATE_TMP_ROOT/tsgate_bp$i/s.log" 2>&1 &
+        "$BIN" --port $((19209 + i)) --smp "$GATE_SERVER_SMP" --memory "$GATE_SERVER_MEMORY" >"$GATE_TMP_ROOT/tsgate_bp$i/s.log" 2>&1 &
 done
 trap 'gate_cleanup 1921 $GATE_TMP_ROOT/tsgate_bp1 $GATE_TMP_ROOT/tsgate_bp2 $GATE_TMP_ROOT/tsgate_bp3' EXIT
 
@@ -48,7 +48,7 @@ assert_ge "startup log names the in-flight budget" \
     "$(cat $GATE_TMP_ROOT/tsgate_bp*/s.log | grep -c "cluster write in-flight budget: $LIMIT")" 1
 
 run_bench() { # $1 = connections, $2 = batches, $3 = persistent transcript
-    timeout 300 "$BENCH" --server-port 19210 -c 4 --batches "$2" --batch-size 10000 --verify 0 \
+    timeout 300 "$BENCH" --server-port 19210 --smp "$GATE_BENCH_SMP" --memory "$GATE_BENCH_MEMORY" --overprovisioned --batches "$2" --batch-size 10000 --verify 0 \
         --warmup 3 --connections "$1" --hosts 1000 --racks 2 >"$3" 2>&1
     BENCH_RC=$?
 }
@@ -138,7 +138,7 @@ for i in 1 2 3; do
     env $GATE_SERVER_ENV TIMESTAR_DATA_DIR="$GATE_TMP_ROOT/tsgate_bp$i" \
         TIMESTAR_CLUSTER_ENABLED=true TIMESTAR_CLUSTER_PARTITIONED=true \
         TIMESTAR_CLUSTER_REPLICATION_FACTOR=3 TIMESTAR_CLUSTER_UUID=00112233445566778899aabbccddeeff TIMESTAR_CLUSTER_DEVELOPMENT_ALLOW_INSECURE_TRANSPORT=true TIMESTAR_CLUSTER_NODE_ID=$i TIMESTAR_CLUSTER_PEERS="$PEERS" \
-        "$BIN" --port $((19209 + i)) --smp 4 --memory "$GATE_SERVER_MEMORY" >"$GATE_TMP_ROOT/tsgate_bp$i/s.log" 2>&1 &
+        "$BIN" --port $((19209 + i)) --smp "$GATE_SERVER_SMP" --memory "$GATE_SERVER_MEMORY" >"$GATE_TMP_ROOT/tsgate_bp$i/s.log" 2>&1 &
 done
 wait_balanced "$PORTS" 4096 3 90 || gate_exit
 wait_healthy "$PORTS" 60 || gate_exit

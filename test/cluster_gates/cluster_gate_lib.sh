@@ -40,9 +40,28 @@ GATE_SERVER_ENV="${GATE_SERVER_ENV:-}"
 # Every gate runs multiple Seastar processes on one host. Without an explicit
 # budget each process sizes itself from the host's full available RAM, so three
 # otherwise healthy nodes can collectively overcommit the machine and kill the
-# harness during catch-up/compaction. Keep the default aggregate bounded and
-# reproducible; a capacity run may override this in its invocation.
-GATE_SERVER_MEMORY="${GATE_SERVER_MEMORY:-1G}"
+# harness during catch-up/compaction. The high-volume gates retain the four
+# reactors their failover and movement SLOs were designed to measure, with a
+# bounded 2 GiB process pool. That leaves comfortably more than the production
+# 256 MiB ingest free-memory floor on each shard. Four reactors at 1 GiB begin
+# at the floor and correctly reject every write as memory pressure. Capacity
+# runs may override both values in their recorded invocation.
+GATE_SERVER_MEMORY="${GATE_SERVER_MEMORY:-2G}"
+GATE_SERVER_SMP="${GATE_SERVER_SMP:-4}"
+
+# The Seastar benchmark is a process too. Its historical `-c 4` selected four
+# reactors but left memory implicit, which reserved about 2 GiB before any gate
+# data existed. One reactor is sufficient for the client driver; keep its
+# allocation explicit and override only as part of a recorded capacity run.
+GATE_BENCH_SMP="${GATE_BENCH_SMP:-1}"
+GATE_BENCH_MEMORY="${GATE_BENCH_MEMORY:-1G}"
+
+# Milliseconds from a monotonic kernel clock. `date +%s%3N` is not portable:
+# this host emits seconds followed by all nine nanosecond digits, and arithmetic
+# across a second boundary produces meaningless multi-day durations.
+monotonic_ms() {
+    awk '{ printf "%.0f\n", $1 * 1000 }' /proc/uptime
+}
 
 gate_fail() {
     echo "  GATE FAILURE: $*" >&2
@@ -291,7 +310,7 @@ wait_all_led() {
             led=$((led + $(status_field "$s" vshards_led)))
         done
         [ "$ok" = "0" ] && continue
-        if [ "$led" -ge $((total - 16)) ]; then
+        if [ "$led" -ge "$total" ]; then
             echo "  cluster converged (led=$led/$total across $(echo "$ports" | wc -w) nodes)"
             return 0
         fi

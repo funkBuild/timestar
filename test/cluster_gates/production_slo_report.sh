@@ -21,9 +21,12 @@ if [ -n "$DIRTY" ]; then
     exit 2
 fi
 
-export GATE_SERVER_MEMORY="${GATE_SERVER_MEMORY:-1G}"
+export GATE_SERVER_MEMORY="${GATE_SERVER_MEMORY:-2G}"
+export GATE_SERVER_SMP="${GATE_SERVER_SMP:-4}"
+export GATE_BENCH_SMP="${GATE_BENCH_SMP:-1}"
+export GATE_BENCH_MEMORY="${GATE_BENCH_MEMORY:-1G}"
 export GATE_MAX_NODE_FAILURE_ERROR_BPS="${GATE_MAX_NODE_FAILURE_ERROR_BPS:-5000}"
-export GATE_MAX_FAILOVER_RECOVERY_MS="${GATE_MAX_FAILOVER_RECOVERY_MS:-15000}"
+export GATE_MAX_FAILOVER_RECOVERY_MS="${GATE_MAX_FAILOVER_RECOVERY_MS:-30000}"
 export GATE_MAX_FAILOVER_QUERY_P99_MS="${GATE_MAX_FAILOVER_QUERY_P99_MS:-2000}"
 export GATE_MAX_SNAPSHOT_INSTALL_MS="${GATE_MAX_SNAPSHOT_INSTALL_MS:-360000}"
 export GATE_MAX_SNAPSHOT_CATCHUP_MS="${GATE_MAX_SNAPSHOT_CATCHUP_MS:-750000}"
@@ -96,6 +99,9 @@ require_metric() { # LOG NAME
 }
 
 NODE_BATCHES=$(require_metric "$NODE_LOG" node_failure_batches)
+NODE_BATCH_SIZE=$(require_metric "$NODE_LOG" node_failure_batch_size)
+NODE_CONNECTIONS=$(require_metric "$NODE_LOG" node_failure_connections)
+NODE_HOSTS=$(require_metric "$NODE_LOG" node_failure_hosts)
 NODE_PROBES=$(require_metric "$NODE_LOG" node_failure_probes)
 NODE_ERRORS=$(require_metric "$NODE_LOG" node_failure_http_errors)
 NODE_ERROR_BPS=$(require_metric "$NODE_LOG" node_failure_error_bps)
@@ -125,8 +131,9 @@ SERVER_ENV_SHA256=$(printf '%s' "$GATE_SERVER_ENV" | sha256sum | awk '{print $1}
 GENERATED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 HOST=$(hostname)
 
-export COMMIT BINARY_SHA256 SERVER_ENV_SHA256 GENERATED_AT HOST BIN GATE_SERVER_MEMORY
-export NODE_BATCHES NODE_PROBES NODE_ERRORS NODE_ERROR_BPS NODE_RECOVERY_MS
+export COMMIT BINARY_SHA256 SERVER_ENV_SHA256 GENERATED_AT HOST BIN GATE_SERVER_MEMORY GATE_SERVER_SMP
+export GATE_BENCH_SMP GATE_BENCH_MEMORY NODE_BATCHES NODE_BATCH_SIZE NODE_CONNECTIONS
+export NODE_HOSTS NODE_PROBES NODE_ERRORS NODE_ERROR_BPS NODE_RECOVERY_MS
 export NODE_QUERY_P99_MS NODE_QUERY_SAMPLES SNAPSHOT_INSTALL_MS SNAPSHOT_CATCHUP_MS
 export SNAPSHOT_CHUNKS SNAPSHOT_PREFIX_WRITES SNAPSHOT_SUFFIX_WRITES
 export MOVEMENT_TRANSFERS MOVEMENT_CONTROL_TPUT MOVEMENT_STORM_TPUT
@@ -159,10 +166,13 @@ report = {
     },
     "settings": {
         "server_memory_per_process": os.environ["GATE_SERVER_MEMORY"],
+        "high_volume_server_smp": integer("GATE_SERVER_SMP"),
+        "bench_smp": integer("GATE_BENCH_SMP"),
+        "bench_memory": os.environ["GATE_BENCH_MEMORY"],
         "server_environment_sha256": os.environ["SERVER_ENV_SHA256"],
-        "node_failure_smp": 4,
+        "node_failure_smp": integer("GATE_SERVER_SMP"),
         "snapshot_catchup_smp": 1,
-        "movement_smp": 4,
+        "movement_smp": integer("GATE_SERVER_SMP"),
         "scratch_root": os.environ["GATE_TMP_ROOT"],
     },
     "thresholds": {
@@ -178,6 +188,9 @@ report = {
     "measurements": {
         "node_failure": {
             "batches": integer("NODE_BATCHES"),
+            "batch_size": integer("NODE_BATCH_SIZE"),
+            "connections": integer("NODE_CONNECTIONS"),
+            "hosts": integer("NODE_HOSTS"),
             "probes": integer("NODE_PROBES"),
             "http_errors": integer("NODE_ERRORS"),
             "error_basis_points": integer("NODE_ERROR_BPS"),

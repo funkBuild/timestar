@@ -71,7 +71,7 @@ start_node() {
     env $GATE_SERVER_ENV TIMESTAR_DATA_DIR="$GATE_TMP_ROOT/tsgate_rr$1" TIMESTAR_CLUSTER_ENABLED=true TIMESTAR_CLUSTER_PARTITIONED=true \
         TIMESTAR_CLUSTER_REPLICATION_FACTOR=3 TIMESTAR_CLUSTER_UUID=00112233445566778899aabbccddeeff TIMESTAR_CLUSTER_DEVELOPMENT_ALLOW_INSECURE_TRANSPORT=true TIMESTAR_CLUSTER_NODE_ID=$1 TIMESTAR_CLUSTER_PEERS="$PEERS" \
         TIMESTAR_WAL_SIZE_THRESHOLD="${GATE_WAL_THRESHOLD:-2097152}" \
-        "$BIN" --port $((19729 + $1)) --smp 4 --memory "$GATE_SERVER_MEMORY" >>"$GATE_TMP_ROOT/tsgate_rr$1/s.log" 2>&1 &
+        "$BIN" --port $((19729 + $1)) --smp "$GATE_SERVER_SMP" --memory "$GATE_SERVER_MEMORY" >>"$GATE_TMP_ROOT/tsgate_rr$1/s.log" 2>&1 &
 }
 
 # status_sum FIELD -- summed across the three nodes.
@@ -93,7 +93,7 @@ for i in 1 2 3; do start_node $i; done
 wait_all_led "$PORTS" 4096 120 || gate_exit
 wait_leadership_settled "$PORTS" 40 || gate_exit
 
-"$BENCH" --server-port 19730 -c 4 --batches "$BATCHES" --batch-size 10000 --verify 0 \
+"$BENCH" --server-port 19730 --smp "$GATE_BENCH_SMP" --memory "$GATE_BENCH_MEMORY" --overprovisioned --batches "$BATCHES" --batch-size 10000 --verify 0 \
     --warmup 3 --connections 8 --hosts 500 --racks 2 >$GATE_TMP_ROOT/tsgate_rr_bench.txt 2>&1
 grep -E "Requests:|Throughput" $GATE_TMP_ROOT/tsgate_rr_bench.txt | sed 's/^/    /'
 

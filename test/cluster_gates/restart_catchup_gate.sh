@@ -208,7 +208,7 @@ CHUNKS_BEFORE_REJOIN=$(survivor_counter_sum snapshot_chunks_sent)
 ABANDONED_BEFORE_REJOIN=$(survivor_counter_sum snapshot_transfers_abandoned)
 
 echo "=== restart the empty node and require snapshot installation plus suffix catch-up ==="
-REJOIN_START_MS=$(date +%s%3N)
+REJOIN_START_MS=$(monotonic_ms)
 start_node 3
 INSTALLED=0
 SNAPSHOT_INSTALL_MS=-1
@@ -216,7 +216,7 @@ for _ in $(seq 1 180); do
     installed=$(status_field "$(cluster_status 19512)" snapshots_installed)
     if [ "${installed:-0}" -ge 1 ]; then
         INSTALLED=1
-        SNAPSHOT_INSTALL_MS=$(( $(date +%s%3N) - REJOIN_START_MS ))
+        SNAPSHOT_INSTALL_MS=$(( $(monotonic_ms) - REJOIN_START_MS ))
         break
     fi
     sleep 2
@@ -252,7 +252,7 @@ for _ in $(seq 1 12); do
     sleep 2
 done
 assert_eq "snapshot prefix plus retained suffix minus exact delete" "$COUNT" "$EXPECTED"
-SNAPSHOT_CATCHUP_MS=$(( $(date +%s%3N) - REJOIN_START_MS ))
+SNAPSHOT_CATCHUP_MS=$(( $(monotonic_ms) - REJOIN_START_MS ))
 
 CHUNKS=$(survivor_counter_sum snapshot_chunks_sent)
 UNDELIVERABLE=$(survivor_counter_sum snapshots_undeliverable)

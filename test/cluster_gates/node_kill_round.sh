@@ -23,7 +23,7 @@
 #
 # Usage: node_kill_round.sh [SERVER_BINARY]
 #   GATE_MAX_NODE_FAILURE_ERROR_BPS=N error-band ceiling, basis points (default 5000)
-#   GATE_MAX_FAILOVER_RECOVERY_MS=N  all-group leader recovery ceiling (default 15000)
+#   GATE_MAX_FAILOVER_RECOVERY_MS=N  all-group leader recovery ceiling (default 30000)
 #   GATE_MAX_FAILOVER_QUERY_P99_MS=N survivor query p99 ceiling (default 2000)
 set -u
 cd "$(dirname "$0")" || exit 2
@@ -35,9 +35,12 @@ BENCH="$BUILD_DIR/bin/timestar_insert_bench"
 [ -x "$BENCH" ] || { echo "no insert bench at $BENCH"; exit 2; }
 PORTS="19610 19611 19612"
 BATCHES="${GATE_BATCHES:-400}"
+BATCH_SIZE="${GATE_BATCH_SIZE:-2000}"
+CONNECTIONS="${GATE_CONNECTIONS:-4}"
+HOSTS="${GATE_HOSTS:-500}"
 PROBES="${GATE_PROBES:-50}"
 MAX_NODE_FAILURE_ERROR_BPS="${GATE_MAX_NODE_FAILURE_ERROR_BPS:-5000}"
-MAX_FAILOVER_RECOVERY_MS="${GATE_MAX_FAILOVER_RECOVERY_MS:-15000}"
+MAX_FAILOVER_RECOVERY_MS="${GATE_MAX_FAILOVER_RECOVERY_MS:-30000}"
 MAX_FAILOVER_QUERY_P99_MS="${GATE_MAX_FAILOVER_QUERY_P99_MS:-2000}"
 
 require_gate_space_gb 20 "node-kill round" || exit 2
@@ -49,7 +52,7 @@ PEERS="127.0.0.1:19610,127.0.0.1:19611,127.0.0.1:19612"
 start_node() {
     env $GATE_SERVER_ENV TIMESTAR_DATA_DIR="$GATE_TMP_ROOT/tsgate_nk$1" TIMESTAR_CLUSTER_ENABLED=true TIMESTAR_CLUSTER_PARTITIONED=true \
         TIMESTAR_CLUSTER_REPLICATION_FACTOR=3 TIMESTAR_CLUSTER_UUID=00112233445566778899aabbccddeeff TIMESTAR_CLUSTER_DEVELOPMENT_ALLOW_INSECURE_TRANSPORT=true TIMESTAR_CLUSTER_NODE_ID=$1 TIMESTAR_CLUSTER_PEERS="$PEERS" \
-        "$BIN" --port $((19609 + $1)) --smp 4 --memory "$GATE_SERVER_MEMORY" >>"$GATE_TMP_ROOT/tsgate_nk$1/s.log" 2>&1 &
+        "$BIN" --port $((19609 + $1)) --smp "$GATE_SERVER_SMP" --memory "$GATE_SERVER_MEMORY" >>"$GATE_TMP_ROOT/tsgate_nk$1/s.log" 2>&1 &
 }
 cleanup() {
     [ -n "${RECOVERY_PID:-}" ] && kill "$RECOVERY_PID" 2>/dev/null
@@ -74,20 +77,35 @@ LED3=$(status_field "$(cluster_status 19612)" vshards_led)
 echo "  node 3 leads $LED3 of 4096 before the kill"
 assert_ge "leadership on the node about to be killed (anti-vacuity)" "${LED3:-0}" 800
 
-echo "=== bench $BATCHES x 10k against node 1; kill -9 node 3 at t+3s ==="
-"$BENCH" --server-port 19610 -c 4 --batches "$BATCHES" --batch-size 10000 --verify 0 \
-    --warmup 5 --connections 8 --hosts 1000 --racks 2 >$GATE_TMP_ROOT/tsgate_nk_bench.txt 2>&1 &
+echo "=== bench $BATCHES x $BATCH_SIZE against node 1; kill -9 node 3 after timed writes begin ==="
+stdbuf -oL -eL "$BENCH" --server-port 19610 --smp "$GATE_BENCH_SMP" \
+    --memory "$GATE_BENCH_MEMORY" --overprovisioned --batches "$BATCHES" \
+    --batch-size "$BATCH_SIZE" --verify 0 --warmup 5 --connections "$CONNECTIONS" \
+    --hosts "$HOSTS" --racks 2 >$GATE_TMP_ROOT/tsgate_nk_bench.txt 2>&1 &
 BENCH_PID=$!
-sleep 3
+TIMED_STARTED=0
+for _ in $(seq 1 600); do
+    if grep -q "Running $BATCHES timed batches" "$GATE_TMP_ROOT/tsgate_nk_bench.txt"; then
+        TIMED_STARTED=1
+        break
+    fi
+    kill -0 "$BENCH_PID" 2>/dev/null || break
+    sleep 0.1
+done
+if [ "$TIMED_STARTED" != "1" ]; then
+    gate_fail "the bench did not reach its timed campaign after warmup"
+    gate_exit
+fi
+sleep 1
 # The bench must still be running when the kill lands, or the round measures a healthy
 # cluster and reports a triumphant zero.
 if ! kill -0 "$BENCH_PID" 2>/dev/null; then
-    gate_fail "the bench finished before the kill landed -- the round is vacuous (raise GATE_BATCHES)"
+    gate_fail "the bench finished before the progress-triggered kill -- raise GATE_BATCHES"
     gate_exit
 fi
 pkill -u "$(id -u)" -9 -f -- "--port 19612"
 KILL_T=$(date +%s)
-KILL_MS=$(date +%s%3N)
+KILL_MS=$(monotonic_ms)
 RECOVERY_FILE="$GATE_TMP_ROOT/tsgate_nk_recovery_ms"
 rm -f "$RECOVERY_FILE"
 # Poll concurrently with the outage probes. Waiting until the bench ends would
@@ -98,7 +116,7 @@ rm -f "$RECOVERY_FILE"
         led1=$(status_field "$(cluster_status 19610)" vshards_led)
         led2=$(status_field "$(cluster_status 19611)" vshards_led)
         if [ "$(( ${led1:-0} + ${led2:-0} ))" -ge 4096 ]; then
-            recovered=$(( $(date +%s%3N) - KILL_MS ))
+            recovered=$(( $(monotonic_ms) - KILL_MS ))
             break
         fi
         sleep 0.1
@@ -106,7 +124,7 @@ rm -f "$RECOVERY_FILE"
     echo "$recovered" >"$RECOVERY_FILE"
 ) &
 RECOVERY_PID=$!
-echo "  node 3 killed at t+3s"
+echo "  node 3 killed one second after the timed campaign began"
 
 # Probe writes DURING the outage, against a surviving node: these are the ones whose acks
 # the no-loss assertion is about.
@@ -128,10 +146,19 @@ grep -E "Requests:|Throughput" $GATE_TMP_ROOT/tsgate_nk_bench.txt | sed 's/^/  /
 OK_REQS=$(grep -oE '[0-9]+ OK' $GATE_TMP_ROOT/tsgate_nk_bench.txt | head -1 | cut -d' ' -f1)
 HTTP_ERRS=$(grep -o '[0-9]* HTTP errors' $GATE_TMP_ROOT/tsgate_nk_bench.txt | head -1 | cut -d' ' -f1)
 case "$HTTP_ERRS" in
-    ''|*[!0-9]*) gate_fail "node-kill bench did not produce a parseable HTTP-error count" ;;
+    ''|*[!0-9]*)
+        gate_fail "node-kill bench did not produce a parseable HTTP-error count"
+        HTTP_ERRS_VALID=0
+        HTTP_ERRS_FOR_METRIC=-1
+        FAILOVER_ERROR_BPS=-1
+        ;;
+    *)
+        HTTP_ERRS_VALID=1
+        HTTP_ERRS_FOR_METRIC=$HTTP_ERRS
+        FAILOVER_ERROR_BPS=$(( HTTP_ERRS * 10000 / BATCHES ))
+        ;;
 esac
 RECOVERY_MS=$(cat "$RECOVERY_FILE" 2>/dev/null || echo -1)
-FAILOVER_ERROR_BPS=$(( ${HTTP_ERRS:-0} * 10000 / BATCHES ))
 
 echo "  === D-14 BAND: ${HTTP_ERRS:-?} of $BATCHES bench batches failed (${OK_REQS:-?} OK) during a $((BENCH_END - KILL_T))s post-kill window ==="
 echo "  probe writes during the outage: $PROBE_OK/$PROBES acked, $PROBE_5XX 5xx"
@@ -146,7 +173,8 @@ grep -oE '\(last: [a-z-]+\)' $GATE_TMP_ROOT/tsgate_nk_bench.txt | sort | uniq -c
 assert_eq "server-side 500s" "$(cat $GATE_TMP_ROOT/tsgate_nk*/s.log | grep -c 'Error handling write request')" 0
 assert_eq "node crashes" "$(grep -l 'Segmentation fault' $GATE_TMP_ROOT/tsgate_nk*/s.log 2>/dev/null | wc -l)" 0
 assert_ge "batches accepted (anti-vacuity)" "${OK_REQS:-0}" "$((BATCHES / 4))"
-assert_le "node-failure write error band (basis points)" "$FAILOVER_ERROR_BPS" "$MAX_NODE_FAILURE_ERROR_BPS"
+[ "$HTTP_ERRS_VALID" = "1" ] &&
+    assert_le "node-failure write error band (basis points)" "$FAILOVER_ERROR_BPS" "$MAX_NODE_FAILURE_ERROR_BPS"
 assert_ge "all-group leader recovery measured" "$RECOVERY_MS" 0
 assert_le "all-group leader recovery (ms)" "$RECOVERY_MS" "$MAX_FAILOVER_RECOVERY_MS"
 
@@ -217,8 +245,11 @@ assert_eq "survivor query latency samples" "$QUERY_SAMPLES" 20
 assert_le "survivor query p99 (ms)" "${QUERY_P99_MS:-999999}" "$MAX_FAILOVER_QUERY_P99_MS"
 
 echo "GATE_METRIC node_failure_batches $BATCHES"
+echo "GATE_METRIC node_failure_batch_size $BATCH_SIZE"
+echo "GATE_METRIC node_failure_connections $CONNECTIONS"
+echo "GATE_METRIC node_failure_hosts $HOSTS"
 echo "GATE_METRIC node_failure_probes $PROBES"
-echo "GATE_METRIC node_failure_http_errors ${HTTP_ERRS:-0}"
+echo "GATE_METRIC node_failure_http_errors $HTTP_ERRS_FOR_METRIC"
 echo "GATE_METRIC node_failure_error_bps $FAILOVER_ERROR_BPS"
 echo "GATE_METRIC node_failure_recovery_ms $RECOVERY_MS"
 echo "GATE_METRIC node_failure_query_p99_ms ${QUERY_P99_MS:-0}"

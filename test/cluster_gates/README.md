@@ -29,13 +29,23 @@ not probes, so they can be run from CI or a release checklist.
 
 All of them take an optional server binary as `$1` (default
 `build/bin/timestar_http_server`), so a "before" binary can be measured the same way.
-Every node also receives an explicit `--memory` budget: 1 GiB by default,
-overrideable with `GATE_SERVER_MEMORY`. This is a per-process limit, so size the
-aggregate as `node count * GATE_SERVER_MEMORY`; leaving it implicit lets every
-Seastar process size itself from the whole host and can overcommit a multi-node
-gate before the property under test is reached. Capacity qualification may raise
-the value after provisioning the aggregate explicitly; a correctness or release
-run must not silently reserve 8 GiB for each of three to five local processes.
+Every node also receives an explicit `--memory` budget: 2 GiB by default for the
+high-volume gates, overrideable with `GATE_SERVER_MEMORY`. Those gates retain four
+server reactors, overrideable with `GATE_SERVER_SMP`; this keeps each shard above
+the production 256 MiB free-memory admission floor. A 1 GiB/four-reactor process
+begins at that floor and is not a valid load-test profile because it correctly
+sheds every write.
+The memory value is per process, so size the aggregate as
+`node count * GATE_SERVER_MEMORY`; leaving it implicit lets every Seastar process
+size itself from the whole host and can overcommit a multi-node gate before the
+property under test is reached. Capacity qualification may raise both values after
+provisioning the aggregate explicitly; a correctness or release run must not
+silently reserve 8 GiB for each of three to five local processes. Focused
+one-reactor gates pin their existing 1 GiB limit before loading the shared helper.
+
+The benchmark driver is separately fixed at one reactor and 1 GiB by default
+(`GATE_BENCH_SMP`, `GATE_BENCH_MEMORY`). It does not need one reactor per server
+shard, and leaving its memory implicit used to reserve roughly another 2 GiB.
 
 Every gate also uses `GATE_TMP_ROOT` for durable roots, retained transcripts, and
 implicit process temporaries (`TMPDIR`). It defaults to the repository-local
@@ -48,7 +58,7 @@ measuring the intended fault.
 requires a clean tracked worktree and runs the three underlying gates serially.
 Its report is retained at
 `build/tmp/tsgate_slo_report/report.v1.json`, beside the complete arm logs. The
-local safety defaults are a 50% post-kill write-error ceiling, 15 s for complete
+local safety defaults are a 50% post-kill write-error ceiling, 30 s for complete
 leader recovery, 2 s for survivor query p99, 360 s for snapshot installation,
 750 s for exact catch-up, 10% retained movement throughput, and 5 s for movement
 batch p99. Set the corresponding

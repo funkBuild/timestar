@@ -202,7 +202,7 @@ PEERS="127.0.0.1:19240,127.0.0.1:19241,127.0.0.1:19242"
 start_node() {
     env $GATE_SERVER_ENV TIMESTAR_DATA_DIR="$GATE_TMP_ROOT/tsgate_sk$1" TIMESTAR_CLUSTER_ENABLED=true TIMESTAR_CLUSTER_PARTITIONED=true \
         TIMESTAR_CLUSTER_REPLICATION_FACTOR=3 TIMESTAR_CLUSTER_UUID=00112233445566778899aabbccddeeff TIMESTAR_CLUSTER_DEVELOPMENT_ALLOW_INSECURE_TRANSPORT=true TIMESTAR_CLUSTER_NODE_ID=$1 TIMESTAR_CLUSTER_PEERS="$PEERS" \
-        "$BIN" --port $((19239 + $1)) --smp 4 --memory "$GATE_SERVER_MEMORY" >>"$GATE_TMP_ROOT/tsgate_sk$1/s.log" 2>&1 &
+        "$BIN" --port $((19239 + $1)) --smp "$GATE_SERVER_SMP" --memory "$GATE_SERVER_MEMORY" >>"$GATE_TMP_ROOT/tsgate_sk$1/s.log" 2>&1 &
 }
 trap 'gate_cleanup 1924 $GATE_TMP_ROOT/tsgate_sk1 $GATE_TMP_ROOT/tsgate_sk2 $GATE_TMP_ROOT/tsgate_sk3; rm -f $GATE_TMP_ROOT/tsgate_sk_bench.txt $GATE_TMP_ROOT/tsgate_sk_control.txt $GATE_TMP_ROOT/tsgate_sk_resp.txt $GATE_TMP_ROOT/tsgate_sk_transfers' EXIT
 
@@ -236,7 +236,7 @@ gate_void() {
     exit 3
 }
 echo "=== control: the same skewed load with NO rebalance ($HOSTS hosts x 1 rack x 10 fields) ==="
-timeout 300 "$BENCH" --server-port 19240 -c 4 --batches "$BATCHES" --batch-size "$BATCH_SIZE" --verify 0 \
+timeout 300 "$BENCH" --server-port 19240 --smp "$GATE_BENCH_SMP" --memory "$GATE_BENCH_MEMORY" --overprovisioned --batches "$BATCHES" --batch-size "$BATCH_SIZE" --verify 0 \
     --warmup 5 --connections "$CONNECTIONS" --hosts "$HOSTS" --racks 1 >$GATE_TMP_ROOT/tsgate_sk_control.txt 2>&1
 grep -E "Requests:|First error|Throughput|batch latency" $GATE_TMP_ROOT/tsgate_sk_control.txt
 CTL_ERRS=$(grep -o '[0-9]* HTTP errors' $GATE_TMP_ROOT/tsgate_sk_control.txt | head -1 | cut -d' ' -f1)
@@ -249,7 +249,7 @@ gate_ok "control clean under the skew: $CTL_TPUT pts/s, 0 client errors"
 # ---------------------------------------------------------------------------
 echo "=== rebalance storm under the SAME skewed load ==="
 BASE_TS=1760000000000000000
-( timeout 300 "$BENCH" --server-port 19240 -c 4 --batches "$BATCHES" --batch-size "$BATCH_SIZE" --verify 0 \
+( timeout 300 "$BENCH" --server-port 19240 --smp "$GATE_BENCH_SMP" --memory "$GATE_BENCH_MEMORY" --overprovisioned --batches "$BATCHES" --batch-size "$BATCH_SIZE" --verify 0 \
     --warmup 5 --connections "$CONNECTIONS" --hosts "$HOSTS" --racks 1 >$GATE_TMP_ROOT/tsgate_sk_bench.txt 2>&1 ) &
 BENCHPID=$!
 sleep 2

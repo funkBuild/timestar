@@ -313,17 +313,32 @@ evidence below.
 - [ ] **Measure production SLOs.** Record one-node-failure write error band,
   recovery time, query latency, snapshot catch-up, and movement impact using the
   final binary and deployment settings. The local harness precondition is now
-  complete: every cluster gate defaults to 1 GiB per server, exports
-  `GATE_TMP_ROOT`/`TMPDIR` to repository-local `build/tmp`, checks free space on
-  that actual filesystem for high-volume campaigns, and caps the expensive A/B
-  comparison build at two jobs. This removes the former 24--40 GiB aggregate
-  reservation and prevents multi-gigabyte datasets from consuming a `/tmp`
-  tmpfs as raw memory. A serial exact-v1 SLO collector now reuses the
+  complete: high-volume gates use a recorded four-reactor/2-GiB server profile,
+  focused one-reactor gates retain their 1-GiB pin, and the benchmark driver is
+  capped at one reactor/1 GiB. Four reactors at 1 GiB was rejected because it
+  begins at the production 256-MiB-per-shard free-memory floor and therefore
+  sheds every write. Every gate exports `GATE_TMP_ROOT`/`TMPDIR` to
+  repository-local `build/tmp`, checks free space on that actual filesystem for
+  high-volume campaigns, and the expensive A/B comparison build is capped at
+  two jobs. This removes the former 24--40 GiB aggregate reservation and
+  prevents multi-gigabyte datasets from consuming a `/tmp` tmpfs as raw memory.
+  A serial exact-v1 SLO collector now reuses the
   discriminating node-kill, bounded snapshot-catch-up, and skewed-movement gates
   and binds their metrics, thresholds, commit, binary hash, resource settings,
-  and raw transcripts into one report. The measurements themselves, especially
-  distinct-host deployment evidence, remain open until that collector is run
-  against the final candidate with approved deployment thresholds.
+  and raw transcripts into one report. Diagnostic node-kill runs also found that
+  every VShard on one node inherited the same node-id-only election RNG stream,
+  synchronizing thousands of campaigns after a failure; production data groups
+  now use stable per-node/per-VShard seeds, with all 4,096 streams and the full
+  timeout distribution pinned by a regression. On the bounded local per-VShard
+  journal layout, the post-fix arm accepted 344/400 batches, preserved every one
+  of 38 acknowledged outage probes on both survivors, recorded zero 500s or
+  crashes, a 27-ms survivor query p99, and 17.03 s for all 4,096 groups to have a
+  leader. The provisional local all-group ceiling is therefore 30 s (well below
+  the historical 43-s hibernation regression); it is recorded in the artifact,
+  not presented as an approved production SLO. The measurements themselves,
+  especially distinct-host deployment evidence, remain open until the clean
+  collector is run against the final candidate with approved deployment
+  thresholds.
 - [x] **Deliver and prove clustered backup/restore.** The existing filesystem
   copy guidance is now explicitly limited to standalone mode: it omitted
   persistent node identity, Group-0/control state, the committed serving map,

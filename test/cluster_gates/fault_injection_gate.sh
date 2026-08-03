@@ -194,7 +194,7 @@ PEERS_DIRECT="127.0.0.1:19410,127.0.0.1:19411,127.0.0.1:19412"
 start_node() { # $1 = node id, $2 = peers list
     env $GATE_SERVER_ENV TIMESTAR_DATA_DIR="$GATE_TMP_ROOT/tsgate_fi$1" TIMESTAR_CLUSTER_ENABLED=true TIMESTAR_CLUSTER_PARTITIONED=true \
         TIMESTAR_CLUSTER_REPLICATION_FACTOR=3 TIMESTAR_CLUSTER_UUID=00112233445566778899aabbccddeeff TIMESTAR_CLUSTER_DEVELOPMENT_ALLOW_INSECURE_TRANSPORT=true TIMESTAR_CLUSTER_NODE_ID=$1 TIMESTAR_CLUSTER_PEERS="$2" \
-        "$BIN" --port $((19409 + $1)) --smp 4 --memory "$GATE_SERVER_MEMORY" >>"$GATE_TMP_ROOT/tsgate_fi$1/s.log" 2>&1 &
+        "$BIN" --port $((19409 + $1)) --smp "$GATE_SERVER_SMP" --memory "$GATE_SERVER_MEMORY" >>"$GATE_TMP_ROOT/tsgate_fi$1/s.log" 2>&1 &
 }
 
 # Only the DATA-PLANE and RAFT ports are proxied. Node 3's HTTP listener binds
@@ -251,7 +251,7 @@ assert_ge "VShards led behind the proxy (traffic that must cross the fault)" "${
 # Baseline: the same load through the same proxy, with NO resets. Everything below is
 # measured against this, not against an unproxied number.
 echo "=== baseline (proxy in path, no faults) ==="
-timeout 300 "$BENCH" --server-port 19410 -c 4 --batches "$BENCH_BATCHES" --batch-size 10000 --verify 0 \
+timeout 300 "$BENCH" --server-port 19410 --smp "$GATE_BENCH_SMP" --memory "$GATE_BENCH_MEMORY" --overprovisioned --batches "$BENCH_BATCHES" --batch-size 10000 --verify 0 \
     --warmup 5 --connections 4 --hosts 1000 --racks 2 >$GATE_TMP_ROOT/tsgate_fi_base.txt 2>&1
 # "First error" is printed here too (D-21): when the baseline DOES break, its signature is
 # the only evidence of why, and the run that first showed this had none recorded.
@@ -303,7 +303,7 @@ while [ "$storm" -le "$STORM_ROUNDS" ]; do
     # second, so the storm never fired -- the anti-vacuity assertions below exist because
     # of that.
     rm -f $GATE_TMP_ROOT/tsgate_fi_stop $GATE_TMP_ROOT/tsgate_fi_rebal
-    ( timeout 300 "$BENCH" --server-port 19410 -c 4 --batches "$BENCH_BATCHES" --batch-size 10000 --verify 0 \
+    ( timeout 300 "$BENCH" --server-port 19410 --smp "$GATE_BENCH_SMP" --memory "$GATE_BENCH_MEMORY" --overprovisioned --batches "$BENCH_BATCHES" --batch-size 10000 --verify 0 \
         --warmup 5 --connections "$CONNECTIONS" --hosts 1000 --racks 2 >$GATE_TMP_ROOT/tsgate_fi_storm.txt 2>&1 ) &
     BENCHPID=$!
     ( ROUNDS=0
