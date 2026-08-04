@@ -12,6 +12,7 @@
 // spills, and pin the NaN/Inf rules at EVERY stage rather than only the finest.
 
 #include "../../../lib/core/series_id.hpp"
+#include "../../../lib/query/aggregator.hpp"
 #include "../../../lib/retention/retention_policy.hpp"
 #include "../../../lib/storage/tsm_compactor.hpp"
 #include "../../../lib/storage/tsm_file_manager.hpp"
@@ -22,10 +23,12 @@
 
 #include <gtest/gtest.h>
 
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <filesystem>
 #include <map>
+#include <random>
 #include <seastar/core/future.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <vector>
@@ -452,6 +455,220 @@ SEASTAR_TEST_F(DownsampleCascadeAdversarialTest, EmptyMiddleStageDoesNotDisturbN
     EXPECT_DOUBLE_EQ(out[1].second, 120.0);
     EXPECT_DOUBLE_EQ(out[2].second, 180.0);
     EXPECT_DOUBLE_EQ(out[3].second, 240.0);
+
+    co_return;
+}
+
+// ===========================================================================
+// RUN-BATCHED FOLD == PER-POINT FOLD, BIT FOR BIT, ACROSS SPILL SEAMS.
+//
+// CascadeFolder folds a whole bucket's run through one flat kernel, but a
+// bucket that is still open at a spill boundary — or whose run ends at the end
+// of a chunk, because the next chunk may extend it — stays on the per-point
+// AggregationState path. The two arms must produce the SAME bucket at the SAME
+// timestamp with the SAME bits, or a fold's value would depend on where the
+// chunk boundaries happened to fall: a placement-dependent answer, and one that
+// would drift further at every cascade stage.
+//
+// So the values here are deliberately hostile to any reassociation: mantissas
+// scaled across 2^-40..2^41 inside a single bucket, where a 4-accumulator sum
+// and a sequential Kahan sum genuinely disagree in the low bits. Ordinary
+// SCADA-shaped data (the other tests in this file) would pass either way. Add
+// NaN (whole-bucket and scattered), a ±Inf bucket whose AVG is a data-derived
+// NaN, empty buckets, short buckets, and >MERGE_CHUNK_POINTS points so the
+// seam is actually crossed.
+//
+// The reference IS the per-point implementation — the same AggregationState,
+// fed one point at a time in stream order — which is what makes this an
+// equivalence test rather than a restatement of the kernel.
+// ===========================================================================
+SEASTAR_TEST_F(DownsampleCascadeAdversarialTest, RunBatchedFoldMatchesPerPointFoldBitForBit) {
+    const std::string measurement = "scada";
+    const double NaN = std::numeric_limits<double>::quiet_NaN();
+    const double Inf = std::numeric_limits<double>::infinity();
+
+    const uint64_t now = nowNs();
+    const uint64_t afterFine = 7 * ONE_DAY_NS;
+    const uint64_t afterCoarse = 30 * ONE_DAY_NS;
+    const uint64_t coarseThreshold = ((now - afterCoarse) / FIFTEEN_MINUTES_NS) * FIFTEEN_MINUTES_NS;
+    const uint64_t fineThreshold = ((now - afterFine) / ONE_MINUTE_NS) * ONE_MINUTE_NS;
+
+    constexpr size_t kCoarseBuckets = 340;
+    constexpr size_t kFineBuckets = 200;
+    const uint64_t coarseEnd = coarseThreshold - FIFTEEN_MINUTES_NS;
+    const uint64_t coarseStart = coarseEnd - kCoarseBuckets * FIFTEEN_MINUTES_NS;
+    const uint64_t fineEnd = fineThreshold - ONE_MINUTE_NS;
+    const uint64_t fineStart = fineEnd - kFineBuckets * ONE_MINUTE_NS;
+    EXPECT_GT(fineStart, coarseThreshold) << "fixture: the fine band must sit above the coarse threshold";
+
+    std::mt19937_64 rng(0xC0FFEEULL);
+    std::uniform_real_distribution<double> mantissa(1.0, 2.0);
+    std::uniform_int_distribution<int> exponent(-40, 41);
+    // Signed so a zero can be the MAX of its bucket, not only the MIN, and so
+    // AVG/SUM see real cancellation rather than a monotone positive sum.
+    auto hostileValue = [&]() { return std::ldexp(mantissa(rng), exponent(rng)) * ((rng() & 1) ? 1.0 : -1.0); };
+
+    std::vector<uint64_t> ts;
+    std::vector<double> vals;
+
+    auto emitBucket = [&](uint64_t bucketStart, size_t points, uint64_t step, size_t index) {
+        for (size_t i = 0; i < points; ++i) {
+            double v;
+            if (index % 53 == 7) {
+                v = NaN;  // whole bucket is NaN: must emit nothing at all
+            } else if (index % 71 == 5 && i == 0) {
+                v = Inf;  // ...paired with the -Inf below: AVG is a data-derived
+            } else if (index % 71 == 5 && i == 1) {
+                v = -Inf;  // NaN with count > 0, which MUST still be emitted
+            } else if (i % 251 == 17) {
+                v = NaN;  // scattered NaN inside an otherwise real bucket
+            } else if (index % 43 == 9) {
+                // SIGNED-ZERO TIE-BREAK, aimed at MIN. +0.0 and -0.0 compare
+                // EQUAL while having different bits, so nothing but the ORDER a
+                // reduction visits them in decides which sign it keeps —
+                // std::min keeps the value it already holds, so the per-point
+                // path settles on the FIRST zero in stream order. MIN/MAX fold
+                // through four independent accumulator chains, and index 1 and
+                // index 4 are in DIFFERENT chains: chain a0 (0,4,8,…) reaches
+                // the +0.0 at index 4 while chain a1 (1,5,9,…) holds the -0.0 at
+                // index 1, and the tree reduce prefers the chain over the
+                // earlier index. Every other value in the bucket is positive so
+                // that a zero really is the minimum — scattering zeros through
+                // signed data does NOT reach this, because the extremum is then
+                // some large value and the tie never arises.
+                //
+                // The sign of zero is STORED (ALP keeps -0.0 as a raw-bit
+                // exception, docs/nan_policy.md), and a straddling bucket stays
+                // on the per-point path, so a disagreement here is a stored
+                // value that depends on where the chunk boundary fell. Zeros are
+                // the only doubles that compare equal with different bits, so
+                // this pair of buckets is the whole exposure.
+                v = (i == 1) ? -0.0 : (i == 4 ? 0.0 : std::abs(hostileValue()));
+            } else if (index % 43 == 22) {
+                // ...and the same tie aimed at MAX: all-negative, so a zero is
+                // the maximum, with the two signs again one chain apart.
+                v = (i == 1) ? 0.0 : (i == 4 ? -0.0 : -std::abs(hostileValue()));
+            } else {
+                v = hostileValue();
+            }
+            ts.push_back(bucketStart + static_cast<uint64_t>(i) * step);
+            vals.push_back(v);
+        }
+    };
+
+    for (size_t b = 0; b < kCoarseBuckets; ++b) {
+        if (b % 37 == 11) {
+            continue;  // an entirely empty bucket
+        }
+        emitBucket(coarseStart + b * FIFTEEN_MINUTES_NS, (b % 17 == 3) ? 5 : 900, NS_PER_SEC, b);
+    }
+    for (size_t b = 0; b < kFineBuckets; ++b) {
+        if (b % 23 == 4) {
+            continue;
+        }
+        emitBucket(fineStart + b * ONE_MINUTE_NS, (b % 11 == 2) ? 3 : 60, NS_PER_SEC, b + 7);
+    }
+    const size_t foldedInput = ts.size();
+    EXPECT_GT(foldedInput, 256u * 1024u) << "fixture must exceed MERGE_CHUNK_POINTS or no spill occurs";
+
+    // Raw tail above the finest threshold.
+    const uint64_t rawStart = fineThreshold + ONE_MINUTE_NS;
+    for (size_t i = 0; i < 100; ++i) {
+        ts.push_back(rawStart + static_cast<uint64_t>(i) * NS_PER_SEC);
+        vals.push_back(hostileValue());
+    }
+
+    // The per-point fold, verbatim: one AggregationState, one point at a time,
+    // closed when the (stage, bucket) pair changes.
+    auto perPointFold = [&](timestar::AggregationMethod method) {
+        std::vector<std::pair<uint64_t, double>> out;
+        timestar::AggregationState state;
+        bool live = false;
+        uint64_t liveBucket = 0;
+        uint64_t liveInterval = 0;
+        auto close = [&]() {
+            if (live && state.count > 0) {
+                out.emplace_back(liveBucket, state.getValue(method));
+            }
+            live = false;
+        };
+        for (size_t i = 0; i < foldedInput; ++i) {
+            const uint64_t interval = (ts[i] < coarseThreshold) ? FIFTEEN_MINUTES_NS : ONE_MINUTE_NS;
+            const uint64_t bucket = (ts[i] / interval) * interval;
+            if (!live || bucket != liveBucket || interval != liveInterval) {
+                close();
+                live = true;
+                liveBucket = bucket;
+                liveInterval = interval;
+                state = timestar::AggregationState{};
+            }
+            state.addValue(vals[i], ts[i]);
+        }
+        close();
+        return out;
+    };
+
+    struct MethodCase {
+        const char* name;
+        timestar::AggregationMethod method;
+    };
+    // avg/sum exercise the Kahan run kernel, latest the backward scan. min AND
+    // max are both listed even though they share an implementation: they differ
+    // in identity (+Inf vs -Inf) and in comparison direction, and the
+    // signed-zero tie-break above is only reachable through whichever of the two
+    // a zero is extremal for.
+    const std::vector<MethodCase> cases{{"avg", timestar::AggregationMethod::AVG},
+                                        {"sum", timestar::AggregationMethod::SUM},
+                                        {"max", timestar::AggregationMethod::MAX},
+                                        {"min", timestar::AggregationMethod::MIN},
+                                        {"latest", timestar::AggregationMethod::LATEST}};
+
+    for (const auto& c : cases) {
+        const std::string seriesKey = std::string("scada|dev=batch_") + c.name + "|value";
+        auto policy = adversarialPolicy(measurement, {adversarialTier(afterFine, ONE_MINUTE_NS, c.name),
+                                                      adversarialTier(afterCoarse, FIFTEEN_MINUTES_NS, c.name)});
+        EXPECT_FALSE(timestar::retention::validateRetentionPolicy(policy).has_value()) << c.name;
+
+        auto out = co_await self->writeAndFold(seriesKey, ts, vals, policy);
+        if (out.empty()) {
+            ADD_FAILURE() << "fold produced no points for method " << c.name;
+            continue;
+        }
+
+        for (size_t i = 1; i < out.size(); ++i) {
+            EXPECT_LT(out[i - 1].first, out[i].first)
+                << "method " << c.name << ": stored point " << i
+                << " is not after its predecessor — the batch path emitted a bucket across a seam out of order";
+        }
+
+        std::vector<std::pair<uint64_t, double>> actual;
+        size_t rawSeen = 0;
+        for (const auto& [t, v] : out) {
+            if (t < fineThreshold) {
+                actual.emplace_back(t, v);
+            } else {
+                ++rawSeen;
+            }
+        }
+        EXPECT_EQ(rawSeen, 100u) << "method " << c.name << ": raw tail must pass through unfolded";
+
+        const auto expected = perPointFold(c.method);
+        EXPECT_EQ(actual.size(), expected.size()) << "method " << c.name
+                                                  << ": bucket count differs from the "
+                                                     "per-point fold (an all-NaN bucket must emit nothing)";
+        const size_t common = std::min(actual.size(), expected.size());
+        for (size_t i = 0; i < common; ++i) {
+            EXPECT_EQ(actual[i].first, expected[i].first) << "method " << c.name << ": bucket " << i;
+            if (std::isnan(expected[i].second)) {
+                // Data-derived NaN (+Inf + -Inf): emitted, and still NaN.
+                EXPECT_TRUE(std::isnan(actual[i].second)) << "method " << c.name << ": bucket " << i;
+            } else {
+                EXPECT_EQ(std::bit_cast<uint64_t>(actual[i].second), std::bit_cast<uint64_t>(expected[i].second))
+                    << "method " << c.name << ": bucket " << i << " at " << expected[i].first
+                    << " differs from the per-point fold in the low bits — the run kernel reassociated something";
+            }
+        }
+    }
 
     co_return;
 }

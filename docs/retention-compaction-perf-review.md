@@ -110,20 +110,59 @@ same data shapes) attributes the 5.2–7.0 ns/pt:
 | v3 — v2 + single-point-bucket passthrough | 1.20 | 1.97 |
 | v4 — run-batched fold, 4 independent NaN-skip accumulators | 1.73 | **0.63** |
 
-Three findings, two of them negative:
+> **CORRECTION (adversarial review of the run-batched fold implementation).**
+> The v0 and v1 rows above are **invalid**, and the "Welford-skip buys nothing"
+> conclusion drawn from them is **wrong**. The micro-benchmark hard-coded
+> `getValue(AVG)`, which lets the compiler prove `mean`/`m2` dead and delete the
+> Welford update — so v0 never executed the code v1 removes, and the two
+> *had* to agree. In the real fold `CascadeFolder::method_` is a runtime member,
+> `getValue(method_)` may read `mean`/`m2` (STDDEV/STDVAR), and the update is
+> live.
+>
+> Re-measured with the method made opaque to the optimiser (same host, same
+> shapes, min of 7):
+>
+> | | folded shape (1 pt/bkt) | scada shape (60 pts/bkt) |
+> |---|---|---|
+> | v0 `addValue`, Welford live | 3.75 ns/pt | 4.95 ns/pt |
+> | v1 `addValueForMethod(AVG)`, Welford skipped | 3.14 | 3.83 |
+>
+> Welford-skip is worth **~1.1 ns/pt (23 %)**, not zero. The arithmetic said so
+> before the measurement did: `mean += delta / count` puts a double division on
+> the *loop-carried* chain, and that chain measured 3.59 ns/pt in isolation
+> (~18 cycles) against a plain `sum +=` at 0.53 — so no variant that really
+> runs it can also run at 1.8–2.0 ns/pt.
+>
+> Two knock-on corrections:
+> - The "tight loop is not where most of the real cost is / ~60–70 % is
+>   surrounding plumbing" finding below is **overstated**. With Welford live the
+>   tight loop alone is 3.75–4.95 ns/pt against a real fold line of 5.2–7.0, so
+>   most of the fold cost *was* the arithmetic — much of it the division this
+>   benchmark had optimised away.
+> - The division strength-reduction result (v2) is **not** re-validated here; it
+>   rode on the same DCE'd baseline and should be treated as unmeasured rather
+>   than as a negative result.
+>
+> None of this changes the recommendation: the run-batched fold subsumes
+> Welford-skip entirely, because its kernels bypass `AggregationState`.
 
-- **Skipping Welford and the per-point `ts / interval` division buys
-  nothing.** v0≈v1≈v2 on both shapes, cold and warm. The modern OoO core
-  hides the division and the extra state updates behind the loop-carried
-  dependency; the hypothesis that "integer division by a runtime interval is
-  expensive" is simply false *in this loop's context*. Recorded so nobody
-  re-litigates a `libdivide`/reciprocal scheme here.
+Three findings, two of them negative — **but see the correction above: the
+first is wrong and the second is overstated**:
+
+- ~~**Skipping Welford and the per-point `ts / interval` division buys
+  nothing.**~~ **WRONG for the Welford half** (see correction). The
+  *division* half — `ts / interval` per point — is not re-tested here and
+  remains plausible, but was measured against the same DCE'd baseline.
+  Recorded so nobody re-litigates a `libdivide`/reciprocal scheme without
+  first re-measuring it honestly.
 - **The tight loop is not where most of the real cost is.** Cache-warm v0
   runs at ~1.9 ns/pt; the compactor's measured fold line is 5.2–7.0 ns/pt.
   So ~60–70 % of the real fold cost is the surrounding plumbing: the
   per-point `CascadeFolder::add` state machine (stage scan, live-bucket
   compare), the per-bucket `AggregationState{}` reset (~136 B including a
   `std::vector` member), and the emit/drain path.
+  **Overstated — see the correction: v0 with Welford live is 3.75–4.95 ns/pt,
+  so the split is far closer to even.**
 - **Run-batching is the only variant that moves the needle**, and it moves it
   3.1× on multi-point buckets (0.63 vs 1.97 ns/pt) because it converts the
   loop-carried scalar fold into independent accumulator chains over a flat
@@ -288,11 +327,16 @@ being re-nominated every sweep).
 
 Recorded so they are not re-proposed:
 
-- **Welford-skip / method-aware `addValueForMethod` in the fold** — zero
-  measurable effect (v1 ≈ v0 cold and warm, both shapes). The full
-  `addValue` is not the bottleneck.
+- ~~**Welford-skip / method-aware `addValueForMethod` in the fold** — zero
+  measurable effect~~ — **RETRACTED.** The benchmark that produced that result
+  had dead-code-eliminated the Welford update it claimed to be measuring; with
+  the method opaque it is worth ~1.1 ns/pt (23 %). See the correction under
+  "The fold line item, dissected". Moot in practice only because the shipped
+  run-batched kernels bypass `AggregationState` altogether — not because the
+  saving was not there.
 - **Division strength-reduction (reciprocal or boundary-advance)** — zero
-  measurable effect (v2 ≈ v0). The division is hidden by the OoO window.
+  measurable effect (v2 ≈ v0). **Treat as UNMEASURED**: v2 was compared against
+  the same DCE'd v0 baseline, so the comparison establishes nothing either way.
 - **Single-point-bucket passthrough as a standalone fix** — real but small
   (1.82 → 1.20 ns/pt warm ≈ ~35 ms end-to-end on `folded`); subsumed by the
   run-batched fold, which short-circuits length-1 runs anyway.

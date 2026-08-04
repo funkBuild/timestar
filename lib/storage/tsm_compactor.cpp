@@ -7,7 +7,9 @@
 #include "tsm_writer.hpp"
 #include "value_type_dispatch.hpp"  // valueTypeName for type-conflict diagnostics
 
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <filesystem>
 #include <limits>
 #include <seastar/core/reactor.hh>
@@ -111,6 +113,81 @@ public:
         ++foldedPoints_;
     }
 
+    // BULK FORM of add(), for callers that already hold the points as flat
+    // ascending arrays -- both fold sites do.
+    //
+    // Same fold, same buckets, same values; what changes is that a whole
+    // bucket's RUN of points is folded by one flat kernel instead of driving
+    // the per-point state machine once per point: the stage scan, the divide,
+    // the live-bucket compare, the ~136 B AggregationState reset per bucket,
+    // and the Welford/min/max/latest bookkeeping that the chosen method never
+    // reads. That plumbing -- not the arithmetic -- is where the measured
+    // 5.2-7.0 ns/pt of the fold line went
+    // (docs/retention-compaction-perf-review.md).
+    //
+    // ORDERING AT THE SEAM. The merged stream ascends and the streaming writer
+    // NEVER sorts, so every bucket appended here must already be in ascending
+    // order -- including across a drainDsOut()/spill boundary, where the bucket
+    // left OPEN by the previous call is older than everything in this one, and
+    // across a stage transition. Two structural rules keep that true, rather
+    // than a check at the seam that a later edit could forget:
+    //
+    //   1. emitCompleteRun() closes the open bucket BEFORE appending its own,
+    //      so a direct emit can never overtake a pending older bucket;
+    //   2. a run that CONTINUES the open bucket, or that ends at the end of the
+    //      range (the next call may extend it), stays on the per-point path --
+    //      so a bucket is never emitted while more of its points may arrive.
+    //
+    // Together those make "one bucket at most is open, and it is the newest
+    // thing the folder has seen" an invariant of the batch path too, which is
+    // exactly what the per-point path guarantees.
+    //
+    // Takes the buffers themselves rather than pointers: std::vector<bool> has
+    // no data(), and Boolean is a legal (opt-in) fold type.
+    void addRange(const std::vector<uint64_t>& tsBuf, const std::vector<T>& valBuf, size_t n) {
+        if constexpr (!kNumeric) {
+            // Boolean/String fold latest-wins in the written type; the
+            // per-point arm is already trivial and must not route through the
+            // double kernels below.
+            for (size_t i = 0; i < n; ++i) {
+                add(tsBuf[i], valBuf[i]);
+            }
+            return;
+        } else {
+            const uint64_t* ts = tsBuf.data();
+            const T* vals = valBuf.data();
+            size_t i = 0;
+            while (i < n) {
+                const size_t stage = stageFor(ts[i]);
+                const uint64_t interval = stages_[stage].interval;
+                const uint64_t bucket = (ts[i] / interval) * interval;
+                // A run ends at its bucket's end and, defensively, at the
+                // stage's own upper bound: a point at or above
+                // stages_[stage].threshold belongs to a FINER stage, so it
+                // cannot share this bucket. Thresholds are interval-aligned
+                // (buildDownsampleStages), which makes the second clamp a
+                // no-op today -- it is here so the run is stage-homogeneous by
+                // construction rather than by that alignment holding.
+                uint64_t limit = bucket + interval;
+                if (stage > 0 && stages_[stage].threshold < limit) {
+                    limit = stages_[stage].threshold;
+                }
+                const size_t end = runEnd(ts, i, n, limit);
+
+                if (end == n || (live_ && liveStage_ == stage && liveBucket_ == bucket)) {
+                    // Trailing run (the next call may extend it) or a
+                    // continuation of the open bucket: rule 2 above.
+                    for (size_t k = i; k < end; ++k) {
+                        add(ts[k], vals[k]);
+                    }
+                } else {
+                    emitCompleteRun(bucket, ts + i, vals + i, end - i);
+                }
+                i = end;
+            }
+        }
+    }
+
     // No more points: close whatever bucket is open.
     void finish() { closeLiveBucket(); }
 
@@ -132,6 +209,204 @@ private:
         // below the finest threshold); fold at the finest stage rather than
         // read past the array if a caller ever gets the partition wrong.
         return 0;
+    }
+
+    // First index in (i, n) whose timestamp reaches `limit`, i.e. one past the
+    // end of the run starting at i. Timestamps ascend.
+    //
+    // Galloping rather than a linear scan: a 15 m bucket of 1 Hz data is 900
+    // points and the value kernels below never read their timestamps, so a
+    // linear scan would stream 7 KB of timestamps per bucket to find one
+    // boundary. A length-1 run (the already-folded shape) costs exactly one
+    // comparison, which is why this is not a plain lower_bound over the whole
+    // remainder -- that would binary-search a 256 Ki range per point.
+    static size_t runEnd(const uint64_t* ts, size_t i, size_t n, uint64_t limit) {
+        size_t lo = i + 1;
+        if (lo >= n || ts[lo] >= limit) {
+            return std::min(lo, n);
+        }
+        // Invariant from here: ts[lo] < limit.
+        size_t step = 2;
+        size_t hi = lo + step;
+        while (hi < n && ts[hi] < limit) {
+            lo = hi;
+            step *= 2;
+            hi = lo + step;
+        }
+        if (hi > n) {
+            hi = n;
+        }
+        return static_cast<size_t>(std::lower_bound(ts + lo + 1, ts + hi, limit) - ts);
+    }
+
+    // Fold one COMPLETE run (a whole bucket's points) and append it.
+    //
+    // Closing the open bucket first is rule 1 of the ordering contract in
+    // addRange(): this is the only place a bucket is appended without having
+    // been the live one, so doing it here -- not at the call site -- is what
+    // makes ascending output a property of the class instead of a property of
+    // its callers. addRange() guarantees the open bucket (if any) is strictly
+    // older, by keeping same-bucket continuations on the per-point path.
+    void emitCompleteRun(uint64_t bucket, const uint64_t* ts, const T* vals, size_t n) {
+        closeLiveBucket();
+        double value = 0.0;
+        if (!foldRun(ts, vals, n, value)) {
+            // All-NaN run: emits nothing, exactly as an all-NaN live bucket
+            // does. A count check, never a NaN check -- a data-derived NaN
+            // (+Inf + -Inf) has real points behind it and must be emitted.
+            foldedPoints_ += n;
+            return;
+        }
+        outTs_.push_back(bucket);
+        outVals_.push_back(static_cast<T>(value));
+        ++emittedBuckets_;
+        foldedPoints_ += n;
+    }
+
+    // The run kernels. Each is BIT-IDENTICAL to feeding the same points through
+    // AggregationState::addValue() + getValue(method_) -- deliberately, because
+    // a bucket that straddles a chunk boundary still takes the per-point path
+    // and the two must not disagree about the same data:
+    //
+    //  - SUM/AVG keep the sequential Kahan recurrence, non-finite guard and
+    //    all, in the SAME order. Reassociating it over independent accumulators
+    //    is faster still, but it moves results by an ulp on pathological
+    //    buckets, which would make a fold's value depend on where the spill
+    //    boundaries fell. Kahan measured free in the review's ablations, and
+    //    the win here is the deleted plumbing, not the summation.
+    //  - MIN/MAX use four independent accumulators: min/max are associative and
+    //    commutative over non-NaN values, so reassociation is exact IN VALUE.
+    //    It is not exact in BITS, for exactly one input -- +0.0 against -0.0,
+    //    which compare equal and so let the visit order pick the sign. The
+    //    kernel restores the per-point path's first-wins tie-break explicitly;
+    //    see the note at the reduce.
+    //  - NaN is skipped by every kernel, and the return value is "this bucket
+    //    saw at least one non-NaN point" -- the emit gate.
+    //
+    // The default arm folds through AggregationState itself, so a method added
+    // to downsampleMethodFor() without a kernel here is slow, never wrong.
+    [[nodiscard]] bool foldRun(const uint64_t* ts, const T* vals, size_t n, double& out) const {
+        switch (method_) {
+            case timestar::AggregationMethod::AVG:
+            case timestar::AggregationMethod::SUM: {
+                double sum = 0.0;
+                double comp = 0.0;
+                size_t count = 0;
+                for (size_t i = 0; i < n; ++i) {
+                    const double v = static_cast<double>(vals[i]);
+                    if (std::isnan(v)) {
+                        continue;
+                    }
+                    const double y = v - comp;
+                    const double t = sum + y;
+                    // Reset the compensation once the sum goes non-finite, or
+                    // legitimate +-Inf data degenerates to NaN. Same test as
+                    // AggregationState::addValue().
+                    comp = ((t - t) == 0.0) ? (t - sum) - y : 0.0;
+                    sum = t;
+                    ++count;
+                }
+                if (count == 0) {
+                    return false;
+                }
+                out = (method_ == timestar::AggregationMethod::AVG) ? (sum + comp) / static_cast<double>(count)
+                                                                    : (sum + comp);
+                return true;
+            }
+            case timestar::AggregationMethod::MIN:
+            case timestar::AggregationMethod::MAX: {
+                const bool wantMin = (method_ == timestar::AggregationMethod::MIN);
+                // Identities are +-infinity, not DBL_MAX: +-Inf is real data
+                // and must order correctly (docs/nan_policy.md).
+                const double identity =
+                    wantMin ? std::numeric_limits<double>::infinity() : -std::numeric_limits<double>::infinity();
+                double a0 = identity, a1 = identity, a2 = identity, a3 = identity;
+                size_t c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+                size_t i = 0;
+                for (; i + 4 <= n; i += 4) {
+                    const double v0 = static_cast<double>(vals[i]);
+                    const double v1 = static_cast<double>(vals[i + 1]);
+                    const double v2 = static_cast<double>(vals[i + 2]);
+                    const double v3 = static_cast<double>(vals[i + 3]);
+                    // A NaN loses both comparisons, so it can never displace an
+                    // accumulator -- the skip is the comparison itself.
+                    a0 = wantMin ? (v0 < a0 ? v0 : a0) : (v0 > a0 ? v0 : a0);
+                    a1 = wantMin ? (v1 < a1 ? v1 : a1) : (v1 > a1 ? v1 : a1);
+                    a2 = wantMin ? (v2 < a2 ? v2 : a2) : (v2 > a2 ? v2 : a2);
+                    a3 = wantMin ? (v3 < a3 ? v3 : a3) : (v3 > a3 ? v3 : a3);
+                    c0 += static_cast<size_t>(!std::isnan(v0));
+                    c1 += static_cast<size_t>(!std::isnan(v1));
+                    c2 += static_cast<size_t>(!std::isnan(v2));
+                    c3 += static_cast<size_t>(!std::isnan(v3));
+                }
+                for (; i < n; ++i) {
+                    const double v = static_cast<double>(vals[i]);
+                    a0 = wantMin ? (v < a0 ? v : a0) : (v > a0 ? v : a0);
+                    c0 += static_cast<size_t>(!std::isnan(v));
+                }
+                if (c0 + c1 + c2 + c3 == 0) {
+                    return false;
+                }
+                const double m01 = wantMin ? (a1 < a0 ? a1 : a0) : (a1 > a0 ? a1 : a0);
+                const double m23 = wantMin ? (a3 < a2 ? a3 : a2) : (a3 > a2 ? a3 : a2);
+                out = wantMin ? (m23 < m01 ? m23 : m01) : (m23 > m01 ? m23 : m01);
+                // SIGNED-ZERO TIE-BREAK -- the one place min/max do NOT
+                // reassociate losslessly. +0.0 and -0.0 compare EQUAL while
+                // having different bits, so which one a reduction keeps depends
+                // on the order it visits them in. std::min/std::max keep the
+                // value they already hold, so the per-point path settles on the
+                // FIRST zero in stream order; four accumulator chains do not
+                // visit the run in that order (a zero at index 1 and one at
+                // index 4 land in different chains, and the tree reduce prefers
+                // the chain, not the earlier index).
+                //
+                // Without this a bucket that straddles a chunk boundary (which
+                // rule 2 of addRange() keeps on the per-point path) and the same
+                // bucket wholly inside one chunk can store zeros of OPPOSITE
+                // SIGN -- a placement-dependent stored value, and -0.0 is
+                // preserved bit-exactly on the read path (docs/nan_policy.md).
+                // Found by differential fuzzing against the per-point fold.
+                //
+                // Zeros are the only doubles that compare equal with different
+                // bit patterns, so this is the complete repair, and the guard is
+                // one predictable compare per bucket rather than per point.
+                if (out == 0.0) {
+                    for (size_t k = 0; k < n; ++k) {
+                        const double v = static_cast<double>(vals[k]);
+                        if (v == 0.0) {
+                            out = v;
+                            break;
+                        }
+                    }
+                }
+                return true;
+            }
+            case timestar::AggregationMethod::LATEST: {
+                // Timestamps ascend and duplicates are resolved upstream, so
+                // the LAST non-NaN value of the run is the greatest-timestamp
+                // one -- what addValue()'s `timestamp >= latestTimestamp`
+                // tie-break settles on.
+                for (size_t i = n; i-- > 0;) {
+                    const double v = static_cast<double>(vals[i]);
+                    if (!std::isnan(v)) {
+                        out = v;
+                        return true;
+                    }
+                }
+                return false;
+            }
+            default: {
+                timestar::AggregationState state;
+                for (size_t i = 0; i < n; ++i) {
+                    state.addValue(static_cast<double>(vals[i]), ts[i]);
+                }
+                if (state.count == 0) {
+                    return false;
+                }
+                out = state.getValue(method_);
+                return true;
+            }
+        }
     }
 
     void closeLiveBucket() {
@@ -572,9 +847,12 @@ seastar::future<SeriesCompactionData<T>> TSMCompactor::processSeriesForCompactio
     // stage.
     auto foldOldPrefixIntoBuckets = [&](size_t count) {
         if constexpr (kTypeSupportsDownsample) {
-            for (size_t i = 0; i < count; ++i) {
-                dsFolder.add(result.timestamps[i], result.values[i]);
-            }
+            // Run-batched: the prefix is already a flat ascending array, which
+            // is exactly what the folder's bulk form wants. Successive calls
+            // are a seam -- a bucket may be left open here and continued by the
+            // next spill's prefix -- and addRange() is written to keep that
+            // case on the per-point path (see its ordering contract).
+            dsFolder.addRange(result.timestamps, result.values, count);
             result.timestamps.erase(result.timestamps.begin(), result.timestamps.begin() + count);
             result.values.erase(result.values.begin(), result.values.begin() + count);
         } else {
@@ -1079,9 +1357,7 @@ seastar::future<SeriesCompactionData<T>> TSMCompactor::processSeriesForCompactio
                 std::vector<uint64_t> dsTimestamps;
                 std::vector<T> dsValues;
                 CascadeFolder<T> folder(dsStages, dsStageCount, downsampleMethod, dsTimestamps, dsValues);
-                for (size_t i = 0; i < partIdx; ++i) {
-                    folder.add(result.timestamps[i], result.values[i]);
-                }
+                folder.addRange(result.timestamps, result.values, partIdx);
                 folder.finish();
 
                 // Buckets actually emitted (all-NaN buckets contributed none).
