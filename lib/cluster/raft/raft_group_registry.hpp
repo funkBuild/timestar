@@ -8,10 +8,10 @@
 #include <cstdint>
 #include <map>
 #include <memory>
-#include <set>
 #include <seastar/core/future.hh>
 #include <seastar/core/gate.hh>
 #include <seastar/core/timer.hh>
+#include <set>
 
 namespace timestar::raft {
 

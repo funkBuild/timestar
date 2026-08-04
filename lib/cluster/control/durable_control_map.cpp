@@ -1,10 +1,9 @@
 #include "durable_control_map.hpp"
 
-#include <xxhash.h>
-
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <xxhash.h>
 
 #include <cerrno>
 #include <stdexcept>
@@ -72,7 +71,7 @@ std::optional<std::string> readFile(const std::filesystem::path& path) {
     }
 
     try {
-        struct stat statBuf {};
+        struct stat statBuf{};
         if (::fstat(fd, &statBuf) < 0)
             throwIo("stat control-map cache: " + path.string());
         if (!S_ISREG(statBuf.st_mode) || statBuf.st_size < static_cast<off_t>(kHeaderBytes) ||

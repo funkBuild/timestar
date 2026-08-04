@@ -270,17 +270,16 @@ void set_routes(routes& r) {
                     peers += "{\"node\":" + std::to_string(id) + ",\"address\":\"" + timestar::jsonEscape(addr) + "\"}";
                 }
                 const auto& clusterConfig = timestar::config().cluster;
-                std::string body = "{\"clustered\":true,\"node_id\":" + std::to_string(st.self) +
-                                   ",\"node_uuid\":\"" + timestar::jsonEscape(g_nodeUuid) + "\"" +
-                                   ",\"cluster_uuid\":\"" + timestar::jsonEscape(clusterConfig.cluster_uuid) +
-                                   "\",\"failure_domain\":\"" +
-                                   timestar::jsonEscape(clusterConfig.failure_domain) + "\"" +
-                                   ",\"reactor_count\":" + std::to_string(seastar::smp::count) +
-                                   ",\"server_memory_bytes\":" +
-                                   std::to_string(g_serverMemoryBytes.load(std::memory_order_acquire)) +
-                                   ",\"replication_factor\":" + std::to_string(st.replicationFactor) +
-                                   ",\"replicated\":" + (st.replicated ? "true" : "false") + ",\"peers\":[" + peers +
-                                   "],\"unresolved_peers\":" + std::to_string(st.unresolvedPeerCount);
+                std::string body =
+                    "{\"clustered\":true,\"node_id\":" + std::to_string(st.self) + ",\"node_uuid\":\"" +
+                    timestar::jsonEscape(g_nodeUuid) + "\"" + ",\"cluster_uuid\":\"" +
+                    timestar::jsonEscape(clusterConfig.cluster_uuid) + "\",\"failure_domain\":\"" +
+                    timestar::jsonEscape(clusterConfig.failure_domain) + "\"" +
+                    ",\"reactor_count\":" + std::to_string(seastar::smp::count) +
+                    ",\"server_memory_bytes\":" + std::to_string(g_serverMemoryBytes.load(std::memory_order_acquire)) +
+                    ",\"replication_factor\":" + std::to_string(st.replicationFactor) +
+                    ",\"replicated\":" + (st.replicated ? "true" : "false") + ",\"peers\":[" + peers +
+                    "],\"unresolved_peers\":" + std::to_string(st.unresolvedPeerCount);
                 if (st.replicated) {
                     body += ",\"vshards_hosted\":" + std::to_string(st.vshardsHostedHere) +
                             ",\"vshards_led\":" + std::to_string(st.vshardsLedHere) +
@@ -325,19 +324,17 @@ void set_routes(routes& r) {
                             ",\"snapshot_transfers_abandoned\":" + std::to_string(st.snapshotTransfersAbandoned) +
                             ",\"snapshot_production_limit_per_shard\":" +
                             std::to_string(st.snapshotProductionLimitPerShard);
-                    body += ",\"delete_receipts_retained\":" + std::to_string(st.deleteReceiptsRetained) +
-                            ",\"delete_receipts_max_per_vshard\":" +
-                            std::to_string(st.deleteReceiptsMaxPerVShard) +
-                            ",\"delete_receipt_capacity_per_vshard\":" +
-                            std::to_string(st.deleteReceiptCapacityPerVShard) +
-                            ",\"delete_receipt_groups_with_retired_floor\":" +
-                            std::to_string(st.deleteReceiptGroupsWithRetiredFloor) +
-                            ",\"delete_receipt_retirement_snapshot_pending\":" +
-                            std::to_string(st.deleteReceiptRetirementSnapshotPending) +
-                            ",\"delete_receipt_retired_before_max_ms\":" +
-                            std::to_string(st.deleteReceiptRetiredBeforeMaxMs) +
-                            ",\"delete_receipt_retired_at_max_index\":" +
-                            std::to_string(st.deleteReceiptRetiredAtMaxIndex);
+                    body +=
+                        ",\"delete_receipts_retained\":" + std::to_string(st.deleteReceiptsRetained) +
+                        ",\"delete_receipts_max_per_vshard\":" + std::to_string(st.deleteReceiptsMaxPerVShard) +
+                        ",\"delete_receipt_capacity_per_vshard\":" + std::to_string(st.deleteReceiptCapacityPerVShard) +
+                        ",\"delete_receipt_groups_with_retired_floor\":" +
+                        std::to_string(st.deleteReceiptGroupsWithRetiredFloor) +
+                        ",\"delete_receipt_retirement_snapshot_pending\":" +
+                        std::to_string(st.deleteReceiptRetirementSnapshotPending) +
+                        ",\"delete_receipt_retired_before_max_ms\":" +
+                        std::to_string(st.deleteReceiptRetiredBeforeMaxMs) +
+                        ",\"delete_receipt_retired_at_max_index\":" + std::to_string(st.deleteReceiptRetiredAtMaxIndex);
                     // Raft journal fsyncs (debt D-10). journal_sync_requests /
                     // journal_fsyncs is the coalescing factor: 1.0 per-VShard, > 1
                     // with the shared per-shard journal. The DISK win is invisible on
@@ -386,13 +383,11 @@ void set_routes(routes& r) {
                         ",\"control_drain_blocked\":" + std::string(st.controlDrainBlocked ? "true" : "false") +
                         ",\"control_removals_pending\":" + std::to_string(st.controlRemovalsPending) +
                         ",\"control_frozen_delete_plans\":" + std::to_string(st.controlFrozenDeletePlans) +
-                        ",\"control_frozen_delete_plan_targets\":" +
-                        std::to_string(st.controlFrozenDeletePlanTargets) +
+                        ",\"control_frozen_delete_plan_targets\":" + std::to_string(st.controlFrozenDeletePlanTargets) +
                         ",\"control_frozen_delete_plan_bytes\":" + std::to_string(st.controlFrozenDeletePlanBytes) +
                         ",\"control_apply_lag_entries\":" + std::to_string(st.controlApplyLagEntries) +
                         ",\"control_apply_failures\":" + std::to_string(st.controlApplyFailures) +
-                        ",\"control_durability_failed\":" +
-                        std::string(st.controlDurabilityFailed ? "true" : "false") +
+                        ",\"control_durability_failed\":" + std::string(st.controlDurabilityFailed ? "true" : "false") +
                         ",\"control_tick_errors\":" + std::to_string(st.controlTickErrors) +
                         ",\"control_maintenance_passes\":" + std::to_string(st.controlMaintenancePasses) +
                         ",\"control_maintenance_failures\":" + std::to_string(st.controlMaintenanceFailures) +
@@ -447,8 +442,7 @@ void set_routes(routes& r) {
             }
             if (!g_clusterBackupAuthenticationKey) {
                 rep->set_status(seastar::http::reply::status_type::service_unavailable);
-                rep->_content =
-                    R"({"status":"error","message":"cluster backup authentication key is not configured"})";
+                rep->_content = R"({"status":"error","message":"cluster backup authentication key is not configured"})";
                 co_return std::move(rep);
             }
             const auto status =
@@ -475,8 +469,7 @@ void set_routes(routes& r) {
             }
             if (!g_clusterBackupAuthenticationKey) {
                 rep->set_status(seastar::http::reply::status_type::service_unavailable);
-                rep->_content =
-                    R"({"status":"error","message":"cluster backup authentication key is not configured"})";
+                rep->_content = R"({"status":"error","message":"cluster backup authentication key is not configured"})";
                 co_return std::move(rep);
             }
             ClusterBackupExportRequestBody body;
@@ -493,9 +486,8 @@ void set_routes(routes& r) {
                 body.operation_id = timestar::http::generateToken(16);
             try {
                 auto status = co_await seastar::smp::submit_to(
-                    0u,
-                    [archive = std::move(body.archive_directory), operation = std::move(body.operation_id),
-                     authenticationKey = *g_clusterBackupAuthenticationKey]() mutable {
+                    0u, [archive = std::move(body.archive_directory), operation = std::move(body.operation_id),
+                         authenticationKey = *g_clusterBackupAuthenticationKey]() mutable {
                         return g_clusterDataPlane.startBackupExport(std::move(archive), std::move(operation),
                                                                     std::move(authenticationKey));
                     });
@@ -825,27 +817,28 @@ void set_routes(routes& r) {
               },
               "json"));
 
-    r.add(operation_type::GET, url("/version"),
-          new function_handler(
-              [](std::unique_ptr<seastar::http::request> req,
-                 std::unique_ptr<seastar::http::reply> rep) -> seastar::future<std::unique_ptr<seastar::http::reply>> {
-                  auto resFmt = timestar::http::responseFormat(*req);
-                  rep->set_status(seastar::http::reply::status_type::ok);
-                  if (timestar::http::isProtobuf(resFmt)) {
-                      auto versionStr = fmt::format("{} ({}) built {} with {}", timestar::VERSION, timestar::GIT_COMMIT,
-                                                    timestar::BUILD_TIME, timestar::COMPILER);
-                      rep->_content = timestar::proto::formatStatusResponse("ok", versionStr);
-                  } else {
-                      rep->_content = sstring(fmt::format(
-                          R"({{"version":"{}","component":"timestar_http_server","git_commit":"{}","build_time":"{}","compiler":"{}"}})",
-                          timestar::jsonEscape(timestar::VERSION), timestar::jsonEscape(timestar::GIT_COMMIT),
-                          timestar::jsonEscape(timestar::BUILD_TIME), timestar::jsonEscape(timestar::COMPILER)));
-                  }
-                  timestar::http::setContentType(*rep, resFmt);
-                  rep->done();
-                  return seastar::make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
-              },
-              "json"));
+    r.add(
+        operation_type::GET, url("/version"),
+        new function_handler(
+            [](std::unique_ptr<seastar::http::request> req,
+               std::unique_ptr<seastar::http::reply> rep) -> seastar::future<std::unique_ptr<seastar::http::reply>> {
+                auto resFmt = timestar::http::responseFormat(*req);
+                rep->set_status(seastar::http::reply::status_type::ok);
+                if (timestar::http::isProtobuf(resFmt)) {
+                    auto versionStr = fmt::format("{} ({}) built {} with {}", timestar::VERSION, timestar::GIT_COMMIT,
+                                                  timestar::BUILD_TIME, timestar::COMPILER);
+                    rep->_content = timestar::proto::formatStatusResponse("ok", versionStr);
+                } else {
+                    rep->_content = sstring(fmt::format(
+                        R"({{"version":"{}","component":"timestar_http_server","git_commit":"{}","build_time":"{}","compiler":"{}"}})",
+                        timestar::jsonEscape(timestar::VERSION), timestar::jsonEscape(timestar::GIT_COMMIT),
+                        timestar::jsonEscape(timestar::BUILD_TIME), timestar::jsonEscape(timestar::COMPILER)));
+                }
+                timestar::http::setContentType(*rep, resFmt);
+                rep->done();
+                return seastar::make_ready_future<std::unique_ptr<seastar::http::reply>>(std::move(rep));
+            },
+            "json"));
 
     // Protected endpoints — when g_authToken is non-empty, each handler wraps
     // its routes with Bearer token authentication via wrapWithAuth().
@@ -1019,8 +1012,8 @@ int main(int argc, char** argv) {
             uint64_t serverMemoryBytes = 0;
             for (unsigned shard = 0; shard < seastar::smp::count; ++shard) {
                 serverMemoryBytes += seastar::smp::submit_to(shard, [] {
-                    return static_cast<uint64_t>(seastar::memory::stats().total_memory());
-                }).get();
+                                         return static_cast<uint64_t>(seastar::memory::stats().total_memory());
+                                     }).get();
             }
             g_serverMemoryBytes.store(serverMemoryBytes, std::memory_order_release);
 
@@ -1162,10 +1155,10 @@ int main(int argc, char** argv) {
                             identity, cc.node_id, cc.peers.at(cc.node_id - 1), cc.failure_domain);
 
                     if (!cc.tls_cert_file.empty()) {
-                        clusterTls = timestar::cluster::DataPlaneTls{
-                            readClusterCredential(cc.tls_cert_file, "certificate"),
-                            readClusterCredential(cc.tls_key_file, "private key"),
-                            readClusterCredential(cc.tls_ca_file, "CA")};
+                        clusterTls =
+                            timestar::cluster::DataPlaneTls{readClusterCredential(cc.tls_cert_file, "certificate"),
+                                                            readClusterCredential(cc.tls_key_file, "private key"),
+                                                            readClusterCredential(cc.tls_ca_file, "CA")};
                     } else {
                         timestar::http_log.warn(
                             "replicated cluster transport is PLAINTEXT because the explicit development-only insecure "

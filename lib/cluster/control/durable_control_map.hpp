@@ -31,9 +31,7 @@ public:
     void persist(const ControlMap& map) const;
 
     const std::filesystem::path& path() const { return path_; }
-    static std::filesystem::path pathIn(const std::filesystem::path& dataDir) {
-        return dataDir / "control_map.cache";
-    }
+    static std::filesystem::path pathIn(const std::filesystem::path& dataDir) { return dataDir / "control_map.cache"; }
 
 private:
     std::filesystem::path path_;

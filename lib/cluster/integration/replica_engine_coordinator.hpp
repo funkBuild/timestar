@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../data/data_plane.hpp"  // QueryIncomplete
+#include "../data/data_plane.hpp"    // QueryIncomplete
 #include "../data/replica_read.hpp"  // ReadConsistency, ReadEnvelope
 #include "replica_engine_reader.hpp"
 

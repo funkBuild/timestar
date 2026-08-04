@@ -267,8 +267,7 @@ bool canonicalHex256(std::string_view value) {
 }
 
 unsigned char decodeHexNibble(unsigned char value) {
-    return value <= '9' ? static_cast<unsigned char>(value - '0')
-                        : static_cast<unsigned char>(value - 'a' + 10);
+    return value <= '9' ? static_cast<unsigned char>(value - '0') : static_cast<unsigned char>(value - 'a' + 10);
 }
 
 std::array<unsigned char, 32> decodeHex256(std::string_view value) {
@@ -414,7 +413,7 @@ ClusterBackupAuthenticationKey ClusterBackupAuthenticationKey::load(const std::f
     UniqueFd fd(::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
     if (fd.get() < 0)
         throwIo("open cluster backup authentication key", path);
-    struct stat metadata {};
+    struct stat metadata{};
     if (::fstat(fd.get(), &metadata) < 0)
         throwIo("stat cluster backup authentication key", path);
     if (!S_ISREG(metadata.st_mode) || metadata.st_uid != ::geteuid() || (metadata.st_mode & 0077) != 0 ||

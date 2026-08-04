@@ -484,13 +484,15 @@ seastar::future<> Manifest::recover() {
         p += 8;
         if (CRC32::compute(p, recordLen) != storedCrc) {
             throw std::runtime_error("Manifest record CRC mismatch at offset " +
-                                     std::to_string(static_cast<size_t>(p - 8 - fileBuf.get())) + " in " + manifestPath_);
+                                     std::to_string(static_cast<size_t>(p - 8 - fileBuf.get())) + " in " +
+                                     manifestPath_);
         }
 
         const auto recordType = static_cast<uint8_t>(*p);
         if ((completeRecords == 0 && recordType != RecordType::Snapshot) ||
             (completeRecords != 0 && recordType == RecordType::Snapshot)) {
-            throw std::runtime_error("Manifest record sequence does not begin with exactly one snapshot: " + manifestPath_);
+            throw std::runtime_error("Manifest record sequence does not begin with exactly one snapshot: " +
+                                     manifestPath_);
         }
         applyRecord(p, p + recordLen);
         p += recordLen;

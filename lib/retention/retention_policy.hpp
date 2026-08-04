@@ -23,7 +23,7 @@ struct glz::meta<DownsamplePolicy> {
 struct RetentionPolicy {
     std::string measurement;
     uint64_t version = 0;  // Group-0 CAS version; zero for standalone policies
-    std::string ttl;  // Duration string, e.g. "90d"
+    std::string ttl;       // Duration string, e.g. "90d"
     uint64_t ttlNanos = 0;
     std::optional<DownsamplePolicy> downsample;
 };
@@ -31,9 +31,8 @@ struct RetentionPolicy {
 template <>
 struct glz::meta<RetentionPolicy> {
     using T = RetentionPolicy;
-    static constexpr auto value =
-        object("measurement", &T::measurement, "version", &T::version, "ttl", &T::ttl, "ttlNanos", &T::ttlNanos,
-               "downsample", &T::downsample);
+    static constexpr auto value = object("measurement", &T::measurement, "version", &T::version, "ttl", &T::ttl,
+                                         "ttlNanos", &T::ttlNanos, "downsample", &T::downsample);
 };
 
 // Request structure for PUT /retention (ttl and downsample are optional)
@@ -47,6 +46,6 @@ struct RetentionPolicyRequest {
 template <>
 struct glz::meta<RetentionPolicyRequest> {
     using T = RetentionPolicyRequest;
-    static constexpr auto value = object("measurement", &T::measurement, "expectedVersion", &T::expectedVersion,
-                                         "ttl", &T::ttl, "downsample", &T::downsample);
+    static constexpr auto value = object("measurement", &T::measurement, "expectedVersion", &T::expectedVersion, "ttl",
+                                         &T::ttl, "downsample", &T::downsample);
 };

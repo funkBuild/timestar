@@ -66,8 +66,7 @@ std::string MoveJob::encode() const {
 }
 
 std::optional<MoveJob> MoveJob::decode(const std::string& bytes) {
-    if (bytes.size() < kMoveJobHeaderBytes ||
-        std::memcmp(bytes.data(), kMoveJobMagic, sizeof(kMoveJobMagic)) != 0)
+    if (bytes.size() < kMoveJobHeaderBytes || std::memcmp(bytes.data(), kMoveJobMagic, sizeof(kMoveJobMagic)) != 0)
         return std::nullopt;
     size_t offset = sizeof(kMoveJobMagic);
     const uint8_t s = static_cast<uint8_t>(bytes[offset++]);

@@ -70,7 +70,7 @@ public:
         uint64_t bytesSent = 0;
         uint64_t envelopesRecv = 0;
         uint64_t framesRecv = 0;
-        uint64_t dropped = 0;  // no peer, reconnect backoff, or outbound admission bound
+        uint64_t dropped = 0;        // no peer, reconnect backoff, or outbound admission bound
         uint64_t backpressured = 0;  // outbound envelopes dropped at the frame/byte bound
     };
     [[nodiscard]] Stats stats() const;

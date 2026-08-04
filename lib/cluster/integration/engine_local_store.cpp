@@ -99,8 +99,7 @@ seastar::future<bool> EngineLocalStore::installVShardSnapshot(VShardId vshard, d
     });
 }
 
-seastar::future<bool> EngineLocalStore::installVShardSnapshotFile(VShardId vshard,
-                                                                  data::SnapshotPayloadFile payload) {
+seastar::future<bool> EngineLocalStore::installVShardSnapshotFile(VShardId vshard, data::SnapshotPayloadFile payload) {
     if (!timestar::vshardsCohesiveOnCores(seastar::smp::count))
         throw std::runtime_error("installVShardSnapshotFile: core count is not VShard-cohesive");
     if (payload.manifest.vshard != vshard)

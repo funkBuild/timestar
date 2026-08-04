@@ -416,8 +416,8 @@ static future<ShardResult> runBenchmark(socket_address addr, unsigned maxConn, s
             unsigned httpStatus = 0;
             sstring errBody;
             co_await client->make_request(
-                std::move(req), [&httpOk, &httpStatus,
-                                 &errBody](const http::reply& rep, input_stream<char>&& body_in) -> future<> {
+                std::move(req),
+                [&httpOk, &httpStatus, &errBody](const http::reply& rep, input_stream<char>&& body_in) -> future<> {
                     auto body = std::move(body_in);
                     httpStatus = static_cast<unsigned>(rep._status);
                     httpOk = (httpStatus >= 200 && httpStatus < 300);

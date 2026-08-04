@@ -97,10 +97,9 @@ void RaftGroup::ensureActive() const {
     if (retiring_)
         throw std::runtime_error("raft: group " + std::to_string(groupId_) + " is retired");
     if (!durabilityAvailable()) {
-        const std::string reason = durabilityFailed_
-                                       ? durabilityFailureReason_
-                                       : "raft: group " + std::to_string(groupId_) +
-                                             " durability unavailable; shared persistence is fenced";
+        const std::string reason = durabilityFailed_ ? durabilityFailureReason_
+                                                     : "raft: group " + std::to_string(groupId_) +
+                                                           " durability unavailable; shared persistence is fenced";
         throw DurabilityUnavailableError(reason);
     }
 }
@@ -114,10 +113,9 @@ void RaftGroup::fenceDurability(std::exception_ptr cause) {
         std::rethrow_exception(cause);
     } catch (const std::exception& ex) {
         detail = ex.what();
-    } catch (...) {
-    }
-    durabilityFailureReason_ = "raft: group " + std::to_string(groupId_) +
-                               " durability unavailable; local replica quarantined: " + detail;
+    } catch (...) {}
+    durabilityFailureReason_ =
+        "raft: group " + std::to_string(groupId_) + " durability unavailable; local replica quarantined: " + detail;
     durabilityFailed_ = true;
     timestar::http_log.error("{}", durabilityFailureReason_);
 

@@ -15,8 +15,8 @@
 template <>
 struct glz::meta<timestar::cluster::NodeIdentity> {
     using T = timestar::cluster::NodeIdentity;
-    static constexpr auto value = object("node_uuid", &T::node_uuid, "cluster_uuid", &T::cluster_uuid,
-                                         "static_topology", &T::static_topology);
+    static constexpr auto value =
+        object("node_uuid", &T::node_uuid, "cluster_uuid", &T::cluster_uuid, "static_topology", &T::static_topology);
 };
 
 namespace timestar::cluster {

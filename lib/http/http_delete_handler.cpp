@@ -296,8 +296,8 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDeleteHandler::handle
     if (partitionedCluster_) {
         // Include the decoded media family and a NUL separator so identical
         // bytes interpreted as JSON and protobuf cannot share a frozen plan.
-        std::string fingerprintBytes = timestar::http::isProtobuf(reqFmt) ? std::string("protobuf\0", 9)
-                                                                          : std::string("json\0", 5);
+        std::string fingerprintBytes =
+            timestar::http::isProtobuf(reqFmt) ? std::string("protobuf\0", 9) : std::string("json\0", 5);
         fingerprintBytes.append(req->content.data(), req->content.size());
         clusterRequestFingerprint = SeriesId128::fromSeriesKey(fingerprintBytes);
     }
@@ -458,8 +458,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDeleteHandler::handle
             // wired: lookup, quorum-fenced catalog discovery, and group-0 plan
             // freeze. Check before discovery so an incompletely composed server
             // does no work and can never fall through to an unfrozen mutation.
-            if (hasPattern &&
-                (!clusterPatternExpandHook || !clusterDeletePlanLookupHook || !clusterDeletePlanHook)) {
+            if (hasPattern && (!clusterPatternExpandHook || !clusterDeletePlanLookupHook || !clusterDeletePlanHook)) {
                 reply->set_status(seastar::http::reply::status_type::not_implemented);
                 constexpr std::string_view message =
                     "Pattern delete requires quorum-fenced discovery and a replicated frozen expansion plan";
@@ -498,8 +497,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDeleteHandler::handle
                 expanded.clear();
                 expanded.reserve(frozen.size());
                 for (auto& target : frozen)
-                    expanded.push_back(
-                        ExpandedDelete{std::move(target.seriesKey), target.startTime, target.endTime});
+                    expanded.push_back(ExpandedDelete{std::move(target.seriesKey), target.startTime, target.endTime});
             };
 
             // An ambiguous first attempt may already have frozen and partially
@@ -509,8 +507,8 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDeleteHandler::handle
             // finish safely.
             bool loadedFrozen = false;
             if (hasPattern) {
-                auto existing = co_await clusterDeletePlanLookupHook(
-                    clusterRequestId, clusterRequestFingerprint, clusterRequestIssuedAtMs);
+                auto existing = co_await clusterDeletePlanLookupHook(clusterRequestId, clusterRequestFingerprint,
+                                                                     clusterRequestIssuedAtMs);
                 if (existing) {
                     installFrozen(std::move(*existing));
                     loadedFrozen = true;
@@ -524,8 +522,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDeleteHandler::handle
                         selector.measurement = delReq.measurement;
                         selector.tags = delReq.tags;
                         selector.fields = delReq.fields;
-                        auto keys =
-                            co_await clusterPatternExpandHook(std::move(selector), kMaxExpandedClusterDeletes);
+                        auto keys = co_await clusterPatternExpandHook(std::move(selector), kMaxExpandedClusterDeletes);
                         for (auto& key : keys)
                             expanded.push_back(ExpandedDelete{std::move(key), delReq.startTime, delReq.endTime});
                     } else {
@@ -543,9 +540,8 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDeleteHandler::handle
                 // byte-identical triples before proposal: duplicate range tombstones in
                 // one HTTP operation only enlarge the ambiguity window for concurrent
                 // writes and provide no semantic value.
-                std::sort(expanded.begin(), expanded.end(), [](const ExpandedDelete& lhs, const ExpandedDelete& rhs) {
-                    return lhs.tie() < rhs.tie();
-                });
+                std::sort(expanded.begin(), expanded.end(),
+                          [](const ExpandedDelete& lhs, const ExpandedDelete& rhs) { return lhs.tie() < rhs.tie(); });
                 expanded.erase(std::unique(expanded.begin(), expanded.end(),
                                            [](const ExpandedDelete& lhs, const ExpandedDelete& rhs) {
                                                return lhs.tie() == rhs.tie();
@@ -560,9 +556,8 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpDeleteHandler::handle
                     candidateTargets.reserve(expanded.size());
                     for (const auto& target : expanded)
                         candidateTargets.push_back({target.seriesKey, target.startTime, target.endTime});
-                    auto frozen = co_await clusterDeletePlanHook(
-                        clusterRequestId, clusterRequestFingerprint, clusterRequestIssuedAtMs,
-                        std::move(candidateTargets));
+                    auto frozen = co_await clusterDeletePlanHook(clusterRequestId, clusterRequestFingerprint,
+                                                                 clusterRequestIssuedAtMs, std::move(candidateTargets));
                     installFrozen(std::move(frozen));
                 }
             }

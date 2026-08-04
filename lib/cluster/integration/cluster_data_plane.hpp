@@ -9,7 +9,7 @@
 #include "../data/node_write_router.hpp"
 #include "../data/replicated_command.hpp"  // kWriteCommandFramingBytes
 #include "../features/cluster_backup_export.hpp"
-#include "../raft/raft_group.hpp"          // kMaxProposalBytes
+#include "../raft/raft_group.hpp"  // kMaxProposalBytes
 #include "../raft/raft_rpc_transport.hpp"
 #include "cluster_runtime.hpp"
 #include "engine_local_store.hpp"
@@ -359,9 +359,8 @@ public:
                    controlLeader != raft::kNoNode && controlControllerTerm == controlTerm &&
                    controlControllerLeader == controlLeader && controlCurrentTermCommit &&
                    controlApplyLagEntries == 0 && controlApplyFailures == 0 && !controlDurabilityFailed &&
-                   controlTickErrors == 0 &&
-                   controlMaintenanceFailures == 0 && controlControllerActuationFailures == 0 &&
-                   controlCompactionsRefusedTooLarge == 0;
+                   controlTickErrors == 0 && controlMaintenanceFailures == 0 &&
+                   controlControllerActuationFailures == 0 && controlCompactionsRefusedTooLarge == 0;
         }
 
         [[nodiscard]] bool readyForTraffic() const {

@@ -702,8 +702,9 @@ seastar::future<std::shared_ptr<raft::SnapshotFile>> prepareImportedSnapshot(
             throw std::filesystem::filesystem_error("clean interrupted restore staging", extraction, ec);
     });
 
-    co_await seastar::async(
-        [source, authenticated, expectedSize = unit.encodedSize] { copyFileDurably(source, authenticated, expectedSize); });
+    co_await seastar::async([source, authenticated, expectedSize = unit.encodedSize] {
+        copyFileDurably(source, authenticated, expectedSize);
+    });
     auto importedInfo = co_await data::inspectSnapshotPayloadFile(authenticated);
     if (!importedInfo || importedInfo->manifest.vshard.value() != unit.vshard ||
         importedInfo->encodedSize != unit.encodedSize || importedInfo->encodedSha256 != unit.encodedSha256)

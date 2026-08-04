@@ -1,7 +1,7 @@
 #pragma once
 
 #include "dataplane_limits.hpp"
-#include "node_query.hpp"    // VShardRedirect
+#include "node_query.hpp"  // VShardRedirect
 
 #include <cstddef>
 #include <cstdint>

@@ -781,8 +781,8 @@ seastar::future<bool> Engine::installVShardSnapshotBundle(timestar::VShardSnapsh
 }
 
 seastar::future<bool> Engine::installVShardSnapshotBundleFromFiles(
-    timestar::VShardSnapshotManifest manifest,
-    std::vector<std::pair<std::string, std::filesystem::path>> files, std::string catalog) {
+    timestar::VShardSnapshotManifest manifest, std::vector<std::pair<std::string, std::filesystem::path>> files,
+    std::string catalog) {
     auto owned = std::make_shared<const timestar::VShardSnapshotManifest>(std::move(manifest));
     std::vector<EngineSnapshotInstallFile> sources;
     sources.reserve(files.size());
@@ -806,8 +806,8 @@ seastar::future<> Engine::retireVShardData(timestar::VShardId vshard) {
 }
 
 seastar::future<bool> Engine::installVShardSnapshotBundleOwned(
-    std::shared_ptr<const timestar::VShardSnapshotManifest> manifestOwner,
-    std::vector<EngineSnapshotInstallFile> files, std::string catalogBytes, SnapshotInstallPurpose purpose) {
+    std::shared_ptr<const timestar::VShardSnapshotManifest> manifestOwner, std::vector<EngineSnapshotInstallFile> files,
+    std::string catalogBytes, SnapshotInstallPurpose purpose) {
     auto installUnits = co_await seastar::get_units(_snapshotInstallSemaphore, 1);
     const auto& manifest = *manifestOwner;
 

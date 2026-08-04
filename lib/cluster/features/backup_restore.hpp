@@ -138,8 +138,7 @@ public:
 
     // Validate a published archive in bounded memory. No unit is extracted.
     static seastar::future<std::optional<ClusterBackupManifest>> validate(
-        const std::filesystem::path& archiveDirectory,
-        const ClusterBackupAuthenticationKey& authenticationKey);
+        const std::filesystem::path& archiveDirectory, const ClusterBackupAuthenticationKey& authenticationKey);
 };
 
 }  // namespace timestar::features

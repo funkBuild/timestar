@@ -1,9 +1,9 @@
 #include "group0_host.hpp"
 
-#include "replicated_vshard_host.hpp"  // JournalIdentity
 #include "../../storage/journal_segment.hpp"
 #include "../../utils/logger.hpp"
 #include "../raft/raft_node.hpp"
+#include "replicated_vshard_host.hpp"  // JournalIdentity
 
 #include <algorithm>
 #include <seastar/core/coroutine.hh>
@@ -38,8 +38,7 @@ Group0Host::~Group0Host() {
 }
 
 seastar::future<> Group0Host::start(std::vector<raft::NodeId> voters, raft::RaftOptions opts,
-                                    std::string expectedClusterUuid,
-                                    std::optional<control::NodeRecord> localRecord,
+                                    std::string expectedClusterUuid, std::optional<control::NodeRecord> localRecord,
                                     std::optional<control::ControlMap> expectedServingMap,
                                     control::Group0StateMachine::ServingMapObserver servingMapObserver) {
     if (started_ || writer_)
@@ -74,8 +73,7 @@ seastar::future<> Group0Host::start(std::vector<raft::NodeId> voters, raft::Raft
             baseLearners = st.snapshot->config.learners;
         }
 
-        persistence_ =
-            std::make_unique<raft::JournalRaftPersistence>(*writer_, kControlJournalStorageId, st.nextSeq);
+        persistence_ = std::make_unique<raft::JournalRaftPersistence>(*writer_, kControlJournalStorageId, st.nextSeq);
         persistence_->seedRetention(std::move(st.retention));
         sm_ = std::make_unique<control::Group0StateMachine>();
         if (localRecord)
@@ -97,11 +95,9 @@ seastar::future<> Group0Host::start(std::vector<raft::NodeId> voters, raft::Raft
         registry_.addGroup(kControlRaftGroupId, std::move(node), *persistence_, *sm_);
         started_ = true;
         if (freshJournal_)
-            timestar::http_log.info("cluster: group 0 opened a fresh dedicated journal at {}",
-                                    dir.string());
+            timestar::http_log.info("cluster: group 0 opened a fresh dedicated journal at {}", dir.string());
         else
-            timestar::http_log.info("cluster: group 0 recovered its dedicated journal at {}",
-                                    dir.string());
+            timestar::http_log.info("cluster: group 0 recovered its dedicated journal at {}", dir.string());
     } catch (...) {
         failure = std::current_exception();
     }
@@ -135,18 +131,16 @@ void Group0Host::startTicking() {
         maintenanceRunning_ = true;
         // A named member owns the coroutine frame; the callback itself never
         // suspends or outlives its captures.
-        (void)seastar::with_gate(backgroundGate_, [this] {
-            return maintenanceSweep().finally([this] { maintenanceRunning_ = false; });
-        });
+        (void)seastar::with_gate(
+            backgroundGate_, [this] { return maintenanceSweep().finally([this] { maintenanceRunning_ = false; }); });
     });
     maintenanceTimer_.arm(seastar::lowres_clock::now() + kMaintenanceInterval, {kMaintenanceInterval});
     controllerTimer_.set_callback([this] {
         if (stopped_ || controllerRunning_ || backgroundGate_.is_closed())
             return;
         controllerRunning_ = true;
-        (void)seastar::with_gate(backgroundGate_, [this] {
-            return controllerSweep().finally([this] { controllerRunning_ = false; });
-        });
+        (void)seastar::with_gate(backgroundGate_,
+                                 [this] { return controllerSweep().finally([this] { controllerRunning_ = false; }); });
     });
     controllerTimer_.arm_periodic(kControllerActuationInterval);
 }
@@ -219,8 +213,8 @@ seastar::future<bool> Group0Host::maybeCompactOnce() {
         throw std::logic_error("Group0Host::maybeCompactOnce before start");
     const raft::LogIndex applied = g->appliedIndex();
     const raft::LogIndex snapshot = g->node().log().snapshotIndex();
-    const bool due = compactionEntryThreshold_ != 0 && applied > snapshot &&
-                     applied - snapshot >= compactionEntryThreshold_;
+    const bool due =
+        compactionEntryThreshold_ != 0 && applied > snapshot && applied - snapshot >= compactionEntryThreshold_;
     const bool compacted = due ? co_await compactAppliedState() : false;
     (void)co_await reclaimJournalSegments();
     co_return compacted;
@@ -236,8 +230,7 @@ seastar::future<> Group0Host::maintenanceSweep() {
             throw std::logic_error("Group0Host::maintenanceSweep before start");
         const raft::LogIndex applied = g->appliedIndex();
         const raft::LogIndex snapshot = g->node().log().snapshotIndex();
-        if (compactionEntryThreshold_ != 0 && applied > snapshot &&
-            applied - snapshot >= compactionEntryThreshold_)
+        if (compactionEntryThreshold_ != 0 && applied > snapshot && applied - snapshot >= compactionEntryThreshold_)
             (void)co_await compactAppliedState();
         const size_t deleted = co_await reclaimJournalSegments();
         if (deleted > 0)
@@ -287,9 +280,8 @@ seastar::future<> Group0Host::controllerSweep() {
     } catch (const std::exception& e) {
         ++controllerActuationFailures_;
         if (controllerActuationFailures_ == 1 || controllerActuationFailures_ % 1024 == 0)
-            timestar::http_log.warn(
-                "cluster: group-0 controller-term actuation failed: {} (will retry; occurrence {})", e.what(),
-                controllerActuationFailures_);
+            timestar::http_log.warn("cluster: group-0 controller-term actuation failed: {} (will retry; occurrence {})",
+                                    e.what(), controllerActuationFailures_);
     } catch (...) {
         ++controllerActuationFailures_;
         if (controllerActuationFailures_ == 1 || controllerActuationFailures_ % 1024 == 0)

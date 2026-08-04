@@ -37,7 +37,7 @@ struct Group0StartupDecision {
 // configured seed on a fresh directory remains inert until the operator asks
 // for bootstrap; simply enabling/restarting a server can never mint a cluster.
 inline Group0StartupDecision decideGroup0Startup(bool enabled, raft::NodeId self, raft::NodeId seed,
-                                                  bool bootstrapRequested, bool journalExists) {
+                                                 bool bootstrapRequested, bool journalExists) {
     if (!enabled) {
         if (bootstrapRequested)
             throw std::invalid_argument("--cluster-init requires cluster.control_enabled=true");
@@ -61,7 +61,7 @@ inline Group0StartupDecision decideGroup0Startup(bool enabled, raft::NodeId self
 // win over that seed. Equal epochs remain immutable: two placements claiming
 // the same epoch are irreconcilable and fail startup closed.
 inline control::ControlMap selectServingMapForStartup(control::ControlMap configured,
-                                                       std::optional<control::ControlMap> cached) {
+                                                      std::optional<control::ControlMap> cached) {
     if (!control::isCompleteControlMap(configured))
         throw std::invalid_argument("group0 startup requires a complete configured serving map");
     if (!cached)

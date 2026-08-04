@@ -31,6 +31,7 @@ public:
     [[nodiscard]] std::vector<VShardExtent> extents(VShardId vshard) const;
     // Union revision range of a VShard across all its extents (empty if none).
     [[nodiscard]] RevisionRange revRange(VShardId vshard) const;
+
 private:
     // vshard -> (fileId -> revRange), ordered for deterministic snapshot manifests.
     std::map<uint16_t, std::map<uint64_t, RevisionRange>> byVShard_;

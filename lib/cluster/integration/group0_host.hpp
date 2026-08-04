@@ -1,13 +1,13 @@
 #pragma once
 
+#include "../../core/vshard.hpp"
 #include "../../storage/journal_gc.hpp"
 #include "../../storage/journal_retention.hpp"
+#include "../../storage/journal_writer.hpp"
 #include "../control/control_command.hpp"
 #include "../control/group0_state_machine.hpp"
 #include "../raft/raft_group_registry.hpp"
 #include "../raft/raft_journal_persistence.hpp"
-#include "../../core/vshard.hpp"
-#include "../../storage/journal_writer.hpp"
 
 #include <array>
 #include <chrono>
@@ -49,8 +49,7 @@ public:
     static constexpr std::chrono::seconds kProposalTimeout{6};
 
     Group0Host(raft::RaftTransport& transport, raft::NodeId self, std::filesystem::path journalRoot,
-               const JournalIdentity& identity,
-               std::chrono::milliseconds tick = std::chrono::milliseconds(20));
+               const JournalIdentity& identity, std::chrono::milliseconds tick = std::chrono::milliseconds(20));
     ~Group0Host();
     Group0Host(const Group0Host&) = delete;
     Group0Host& operator=(const Group0Host&) = delete;

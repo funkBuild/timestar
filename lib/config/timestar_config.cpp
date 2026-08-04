@@ -5,10 +5,10 @@
 #include <algorithm>
 #include <atomic>
 #include <cassert>
+#include <cctype>
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
-#include <cctype>
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
@@ -67,16 +67,16 @@ std::vector<std::string> TimestarConfig::validate() const {
             errors.emplace_back("cluster.replication_factor must be odd (Raft majority quorum)");
         if (cluster.enabled && cluster.replication_factor > cluster.peers.size())
             errors.emplace_back("cluster.replication_factor must not exceed the number of nodes");
-        const bool validClusterUuid = cluster.cluster_uuid.size() == 32 &&
-                                      std::all_of(cluster.cluster_uuid.begin(), cluster.cluster_uuid.end(),
-                                                  [](unsigned char c) { return std::isxdigit(c) != 0; });
+        const bool validClusterUuid =
+            cluster.cluster_uuid.size() == 32 && std::all_of(cluster.cluster_uuid.begin(), cluster.cluster_uuid.end(),
+                                                             [](unsigned char c) { return std::isxdigit(c) != 0; });
         if (!validClusterUuid)
             errors.emplace_back("cluster.cluster_uuid must be exactly 32 hexadecimal characters for RF > 1");
 
-        const bool anyTls = !cluster.tls_cert_file.empty() || !cluster.tls_key_file.empty() ||
-                            !cluster.tls_ca_file.empty();
-        const bool completeTls = !cluster.tls_cert_file.empty() && !cluster.tls_key_file.empty() &&
-                                 !cluster.tls_ca_file.empty();
+        const bool anyTls =
+            !cluster.tls_cert_file.empty() || !cluster.tls_key_file.empty() || !cluster.tls_ca_file.empty();
+        const bool completeTls =
+            !cluster.tls_cert_file.empty() && !cluster.tls_key_file.empty() && !cluster.tls_ca_file.empty();
         if (anyTls && !completeTls)
             errors.emplace_back("cluster TLS requires tls_cert_file, tls_key_file, and tls_ca_file");
         if (!completeTls && !cluster.development_allow_insecure_transport)
@@ -530,8 +530,7 @@ void applyEnvironmentOverrides(TimestarConfig& cfg) {
     envString("TIMESTAR_CLUSTER_TLS_KEY_FILE", cfg.cluster.tls_key_file);
     envString("TIMESTAR_CLUSTER_TLS_CA_FILE", cfg.cluster.tls_ca_file);
     envString("TIMESTAR_CLUSTER_BACKUP_AUTH_KEY_FILE", cfg.cluster.backup_auth_key_file);
-    envBool("TIMESTAR_CLUSTER_DEVELOPMENT_ALLOW_INSECURE_TRANSPORT",
-            cfg.cluster.development_allow_insecure_transport);
+    envBool("TIMESTAR_CLUSTER_DEVELOPMENT_ALLOW_INSECURE_TRANSPORT", cfg.cluster.development_allow_insecure_transport);
     envBool("TIMESTAR_CLUSTER_CONTROL_ENABLED", cfg.cluster.control_enabled);
     envU16("TIMESTAR_CLUSTER_CONTROL_SEED_NODE_ID", cfg.cluster.control_seed_node_id);
     envString("TIMESTAR_CLUSTER_FAILURE_DOMAIN", cfg.cluster.failure_domain);

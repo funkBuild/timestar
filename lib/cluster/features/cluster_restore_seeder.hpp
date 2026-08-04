@@ -1,8 +1,8 @@
 #pragma once
 
-#include "backup_restore.hpp"
 #include "../control/group0_state.hpp"
 #include "../raft/raft_types.hpp"
+#include "backup_restore.hpp"
 
 #include <array>
 #include <cstddef>

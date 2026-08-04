@@ -1013,7 +1013,7 @@ public:
     // plane: reading the Raft view into a survey, and awaiting the transfer. Keep it that
     // way -- arithmetic that creeps back into this loop is arithmetic nothing pins.
     seastar::future<size_t> rebalance(size_t maxTransfers, data::NodeId self, std::vector<data::NodeId> peers,
-                                     bool requireExactMatch = false) {
+                                      bool requireExactMatch = false) {
         if (!plane_ || maxTransfers == 0 || peers.empty())
             co_return 0;  // (planLeadershipBalance refuses these too; this skips the survey)
         auto& host = plane_->host();
@@ -1036,16 +1036,15 @@ public:
             if (requireExactMatch && leader == self) {
                 const auto last = g->node().log().lastIndex();
                 for (data::NodeId voter : voters) {
-                    if (voter != self && !data::automaticBalancePeerReady(
-                                             last, g->matchIndexOf(voter), g->ticksSinceAck(voter),
-                                             g->heartbeatTimeout())) {
+                    if (voter != self &&
+                        !data::automaticBalancePeerReady(last, g->matchIndexOf(voter), g->ticksSinceAck(voter),
+                                                         g->heartbeatTimeout())) {
                         recoveringPeer = true;
                         break;
                     }
                 }
             }
-            groups.push_back(
-                data::BalanceGroup{vs, std::vector<data::NodeId>(voters.begin(), voters.end()), leader});
+            groups.push_back(data::BalanceGroup{vs, std::vector<data::NodeId>(voters.begin(), voters.end()), leader});
         }
 
         // Periodic balancing is background maintenance, not recovery. Starting

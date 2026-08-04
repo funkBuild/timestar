@@ -20,8 +20,8 @@
 #include "wal.hpp"
 #include "wal_file_manager.hpp"
 
-#include <functional>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <memory>
 #include <seastar/core/coroutine.hh>
@@ -53,7 +53,9 @@ struct EngineSnapshotFile {
     EngineSnapshotFile(const EngineSnapshotFile&) = delete;
     EngineSnapshotFile& operator=(const EngineSnapshotFile&) = delete;
     EngineSnapshotFile(EngineSnapshotFile&& other) noexcept
-        : name(std::move(other.name)), path(std::move(other.path)), size(other.size),
+        : name(std::move(other.name)),
+          path(std::move(other.path)),
+          size(other.size),
           removeOnDestroy(std::exchange(other.removeOnDestroy, false)) {}
     EngineSnapshotFile& operator=(EngineSnapshotFile&& other) noexcept {
         if (this != &other) {
@@ -260,9 +262,8 @@ private:
         std::shared_ptr<const timestar::VShardSnapshotManifest> manifest,
         std::vector<std::pair<std::string, std::string>> files);
     seastar::future<bool> installVShardSnapshotBundleOwned(
-        std::shared_ptr<const timestar::VShardSnapshotManifest> manifest,
-        std::vector<EngineSnapshotInstallFile> files, std::string catalog,
-        SnapshotInstallPurpose purpose = SnapshotInstallPurpose::Snapshot);
+        std::shared_ptr<const timestar::VShardSnapshotManifest> manifest, std::vector<EngineSnapshotInstallFile> files,
+        std::string catalog, SnapshotInstallPurpose purpose = SnapshotInstallPurpose::Snapshot);
     enum class SnapshotInstallDisposition { Fresh, Idempotent, Reject };
     seastar::future<SnapshotInstallDisposition> classifySnapshotInstall(
         const timestar::VShardSnapshotManifest& manifest,
@@ -316,8 +317,8 @@ public:
                                                       std::vector<std::pair<std::string, std::string>> files,
                                                       std::string catalog);
     seastar::future<bool> installVShardSnapshotBundleFromFiles(
-        timestar::VShardSnapshotManifest manifest,
-        std::vector<std::pair<std::string, std::filesystem::path>> files, std::string catalog);
+        timestar::VShardSnapshotManifest manifest, std::vector<std::pair<std::string, std::filesystem::path>> files,
+        std::string catalog);
 
     // Durably discard one retired replica's complete storage generation. This
     // is the empty-generation form of snapshot replacement: it quiesces the

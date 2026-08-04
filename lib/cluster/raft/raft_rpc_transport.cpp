@@ -344,8 +344,7 @@ struct RaftRpcTransport::Impl {
         if (tlsEnabled) {
             seastar::tls::tls_options tlsOpts;
             tlsOpts.server_name = seastar::sstring(pit->second.tlsServerName);
-            c = std::make_unique<Client>(proto, opts, seastar::tls::socket(clientCreds, tlsOpts),
-                                         pit->second.address);
+            c = std::make_unique<Client>(proto, opts, seastar::tls::socket(clientCreds, tlsOpts), pit->second.address);
         } else {
             c = std::make_unique<Client>(proto, opts, pit->second.address);
         }
@@ -439,8 +438,7 @@ seastar::future<> RaftRpcTransport::start(seastar::socket_address local, Deliver
                     continue;
                 const uint16_t gid =
                     static_cast<uint16_t>(static_cast<unsigned char>(bytes[kRaftEnvelopeV1MagicBytes])) |
-                    static_cast<uint16_t>(
-                        static_cast<unsigned char>(bytes[kRaftEnvelopeV1MagicBytes + 1]) << 8);
+                    static_cast<uint16_t>(static_cast<unsigned char>(bytes[kRaftEnvelopeV1MagicBytes + 1]) << 8);
                 recs.push_back(BatchRecord{bytes, n, gid});
             }
             if (recs.empty())
@@ -546,8 +544,8 @@ seastar::future<> RaftRpcTransport::start(seastar::socket_address local, Deliver
     lim.max_memory = kMaxInboundRaftMemory;
     seastar::server_socket listener =
         impl_->tlsEnabled ? seastar::tls::listen(impl_->serverCreds, local, lo) : seastar::listen(local, lo);
-    impl_->server = std::make_unique<seastar::rpc::protocol<RaftSerializer>::server>(impl_->proto,
-                                                                                    std::move(listener), lim);
+    impl_->server =
+        std::make_unique<seastar::rpc::protocol<RaftSerializer>::server>(impl_->proto, std::move(listener), lim);
     return seastar::make_ready_future<>();
 }
 

@@ -122,9 +122,9 @@ seastar::future<> EngineDataStateMachine::applySnapshot(raft::Snapshot snap) {
             throw std::runtime_error(
                 "EngineDataStateMachine::applySnapshot: data revision does not match Raft snapshot boundary "
                 "(fail-stop)");
-        deleteState = data::DeleteReceiptSnapshotState{payload->deleteReceiptsRetiredBeforeMs,
-                                                       payload->deleteReceiptsRetiredAtIndex,
-                                                       std::move(payload->deleteReceipts)};
+        deleteState =
+            data::DeleteReceiptSnapshotState{payload->deleteReceiptsRetiredBeforeMs,
+                                             payload->deleteReceiptsRetiredAtIndex, std::move(payload->deleteReceipts)};
         retentionState = std::move(payload->retentionCutoff);
         installed = co_await store_.installVShardSnapshotFile(vshard_, std::move(*payload));
     } else {
@@ -136,9 +136,9 @@ seastar::future<> EngineDataStateMachine::applySnapshot(raft::Snapshot snap) {
             throw std::runtime_error(
                 "EngineDataStateMachine::applySnapshot: data revision does not match Raft snapshot boundary "
                 "(fail-stop)");
-        deleteState = data::DeleteReceiptSnapshotState{payload->deleteReceiptsRetiredBeforeMs,
-                                                       payload->deleteReceiptsRetiredAtIndex,
-                                                       std::move(payload->deleteReceipts)};
+        deleteState =
+            data::DeleteReceiptSnapshotState{payload->deleteReceiptsRetiredBeforeMs,
+                                             payload->deleteReceiptsRetiredAtIndex, std::move(payload->deleteReceipts)};
         retentionState = std::move(payload->retentionCutoff);
         installed = co_await store_.installVShardSnapshot(vshard_, std::move(*payload));
     }

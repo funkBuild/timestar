@@ -32,9 +32,7 @@ private:
 public:
     explicit HttpRetentionHandler(seastar::sharded<Engine>* _engineSharded, bool partitionedCluster = false,
                                   timestar::cluster::ClusterDataPlane* clusterDataPlane = nullptr)
-        : engineSharded(_engineSharded),
-          partitionedCluster_(partitionedCluster),
-          clusterDataPlane_(clusterDataPlane) {}
+        : engineSharded(_engineSharded), partitionedCluster_(partitionedCluster), clusterDataPlane_(clusterDataPlane) {}
 
     // Validate an aggregation method string.
     // Exposed publicly to allow direct unit testing.

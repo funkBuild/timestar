@@ -40,8 +40,8 @@ seastar::future<> TSM::loadTombstones() {
             LOG_INSERT_PATH(timestar::tsm_log, debug, "Successfully loaded tombstones from: {}", tombstonePath);
         } catch (const std::exception& e) {
             tombstones.reset();
-            throw std::runtime_error("Failed to load tombstone sidecar " + tombstonePath + " for " + filePath +
-                                     ": " + e.what());
+            throw std::runtime_error("Failed to load tombstone sidecar " + tombstonePath + " for " + filePath + ": " +
+                                     e.what());
         }
     } else {
         LOG_INSERT_PATH(timestar::tsm_log, trace, "No tombstone file found for: {}", filePath);

@@ -564,8 +564,7 @@ seastar::future<std::unique_ptr<seastar::http::reply>> HttpStreamHandler::handle
     // position. This happens before parsing or allocating subscription state.
     if (_partitionedCluster) {
         rep->set_status(seastar::http::reply::status_type::not_implemented);
-        constexpr std::string_view message =
-            "Streaming subscriptions are unavailable in partitioned cluster mode";
+        constexpr std::string_view message = "Streaming subscriptions are unavailable in partitioned cluster mode";
         if (timestar::http::isProtobuf(resFmt))
             rep->_content = timestar::proto::formatErrorResponse(std::string(message), "CLUSTER_STREAM_UNSUPPORTED");
         else

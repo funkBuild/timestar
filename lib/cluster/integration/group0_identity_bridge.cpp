@@ -42,8 +42,9 @@ bool bindStaticTopology(NodeIdentity& identity, const std::filesystem::path& dat
     if (identity.static_topology == topology)
         return false;
     if (!identity.static_topology.empty())
-        throw std::runtime_error("configured cluster topology differs from the topology bound to this data directory; "
-                                 "static peer-list edits are unsafe without group-0 movement");
+        throw std::runtime_error(
+            "configured cluster topology differs from the topology bound to this data directory; "
+            "static peer-list edits are unsafe without group-0 movement");
     identity.static_topology = topology;
     identity.persist(dataDir);
     return true;

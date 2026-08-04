@@ -122,8 +122,8 @@ using timestar::raft::NodeId;
 // into the resumed leader instead of failing.
 inline constexpr LogIndex kMaxTransferLagEntries = 64;
 
-inline bool transferrableTo(LogIndex lastIndex, LogIndex matchIndex, uint64_t ticksSinceAck,
-                            uint64_t heartbeatTimeout, bool requireExactMatch = false) {
+inline bool transferrableTo(LogIndex lastIndex, LogIndex matchIndex, uint64_t ticksSinceAck, uint64_t heartbeatTimeout,
+                            bool requireExactMatch = false) {
     const LogIndex maxLagEntries = requireExactMatch ? 0 : kMaxTransferLagEntries;
     const bool caughtUp = matchIndex >= lastIndex || (lastIndex - matchIndex) <= maxLagEntries;
     const bool live = ticksSinceAck <= heartbeatTimeout;

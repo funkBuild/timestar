@@ -18,9 +18,8 @@ namespace timestar {
 namespace fs = std::filesystem;
 
 TSMTombstone::TSMTombstone(const std::string& path)
-    : tombstonePath(path), directorySync_([](const std::string& directory) {
-          return seastar::sync_directory(directory);
-      }) {
+    : tombstonePath(path),
+      directorySync_([](const std::string& directory) { return seastar::sync_directory(directory); }) {
     if (path.empty()) {
         throw std::invalid_argument("TSMTombstone path must not be empty");
     }
@@ -195,8 +194,8 @@ seastar::future<> TSMTombstone::load() {
             throw std::runtime_error("Tombstone header checksum mismatch");
         }
 
-        const size_t expectedSize = TombstoneHeader::SIZE + (header.entryCount * TombstoneEntry::SIZE) +
-                                    sizeof(uint64_t);  // Footer checksum
+        const size_t expectedSize =
+            TombstoneHeader::SIZE + (header.entryCount * TombstoneEntry::SIZE) + sizeof(uint64_t);  // Footer checksum
 
         if (static_cast<size_t>(fileSize) != expectedSize) {
             throw std::runtime_error("Tombstone file corrupt: file size mismatch");
