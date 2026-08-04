@@ -147,6 +147,21 @@ struct AnomalyQueryResult {
         size_t anomalyCount = 0;
         size_t totalPoints = 0;
         double executionTimeMs = 0.0;
+
+        // Groups the detector DECLINED: fewer than minDataPoints finite
+        // observations on an axis LONGER than minDataPoints, which is not
+        // enough to bound anything without inventing the envelope.  (A row no
+        // longer than the warm-up is answered whatever it holds -- see the
+        // gate in AnomalyExecutor::detectOneSeries.)  A declined group is
+        // absent from `series` entirely, so without this count the caller
+        // cannot tell "this device has too little data" from "this device does
+        // not exist".
+        //
+        // Declining is not a failed read -- the stored data is fine, there is
+        // just too little of it -- so this is deliberately NOT the
+        // QUERY_INCOMPLETE case in CLAUDE.md's "Incomplete Results Are
+        // Failures" rule.  The response reports the fact instead of failing.
+        size_t declinedSeriesCount = 0;
     } statistics;
 
     // Error information (if detection failed)

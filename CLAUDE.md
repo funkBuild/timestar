@@ -692,12 +692,19 @@ numeric series — grouping does not apply to it.)
 ```json
 {
   "status": "error",
-  "error": {
-    "code": "INVALID_QUERY",
-    "message": "Invalid query format: missing measurement"
-  }
+  "error_code": "INVALID_QUERY",
+  "message": "Query parse error: Query needs to specify an aggregation method",
+  "error": "Query parse error: Query needs to specify an aggregation method"
 }
 ```
+
+`error` is a plain **string**, not an object — this is the canonical body
+`timestar::http::jsonError` emits for **every** HTTP handler, so `/query`,
+`/derived`, `/tags` and `/subscribe` all fail in exactly this shape. `error` is
+the field to assert on; `message` mirrors it for backwards compatibility;
+`error_code` is present only when a machine-readable code was supplied. (This
+example previously showed `"error": {"code", "message"}`, which no endpoint has
+ever returned.)
 
 ### Aggregation Result Shape (canonical semantics)
 
@@ -876,6 +883,85 @@ via real file corruption) and `test/unit/encoding/decoder_produced_count_test.cp
 - Join operations between multiple measurements
 - Continuous queries and materialized views
 - InfluxQL compatibility layer
+
+## Derived Query Fan-Out (canonical semantics)
+
+`POST /derived` runs `forecast()` and `anomalies()` **once per series** the
+sub-query resolves to, returning **one group per series**. This is not opt-in —
+the response schema's `group_tags`/`series_count` always described it. Full
+specification in `docs/api-derived.md` ("Per-series fan-out"); the rules that
+must not drift:
+
+**A group's key is `(tag set, field)`.** Both axes split: `by {dev}` over two
+devices gives two groups, and a leg naming three fields gives three. A *scope*
+filter narrows which series match but does not label them — only a `by {tag}`
+key survives into a series' tags.
+
+**Ordering is a total order and a pure function of the input:** tag set
+ascending, then field rank (query-string order for an explicit field list,
+ascending name for `()`), then field name, then input index. Rules 3 and 4 exist
+because two series each rank their own first field 0, so without them the
+sequence flipped when the shards answered in a different order.
+
+**`group_tags` = tags flattened to `"k=v"` ascending, then `"_field=<name>"`
+LAST — and only when the result spans more than one distinct field.** A
+single-field result carries no field label, which is what keeps every
+pre-fan-out response byte-identical. The underscore follows InfluxDB's
+reserved-column convention (`_field`/`_measurement`); the unprefixed `field=`
+this started as collided with a real tag key named `field`, and `by {field}` is
+in real callers' vocabulary. A measurement carrying a tag literally named
+`_field` still emits two `"_field="` entries — **position is the only
+discriminator**, so the synthetic entry being last is a contract.
+
+**Fan-out never un-merges what the query layer merged.** `avg:m(f){}` over two
+devices is ONE series to `POST /query` and therefore ONE group here — a fleet
+average with an `aggregationInterval`, an interleaved raw union without one
+(canonical per-timestamp cross-series aggregation, see "Aggregation Result
+Shape"). Ask for `by {dev}` if you want per-device answers.
+
+**`aggregationInterval` reaches `forecast()`/`anomalies()` legs.** It previously
+did not — the same body bucketed `a * 1` to 120 daily points while
+`forecast(a,…)` fitted 2,880 raw hourly ones and reported success. It accepts a
+JSON number (ns), a unit string (`"5m"`), or a bare numeric string, all
+agreeing, exactly as `POST /query` does.
+
+**Plain arithmetic fans out only behind `"multiSeries": true`,** because
+`DerivedQueryResponse`'s flat `timestamps`/`values` pair would read a multi-group
+answer as *empty* — a silent wrong answer. Under the flag `series` is the whole
+answer at every group count and the flat columns stay empty.
+
+**Three bounds guard a leg,** all HTTP 400 with the numbers that tripped them:
+`maxSeriesPerLeg` 200 (tag-set × field entries), `maxFanOutPoints` 250,000
+(cells = groups × axis; a **single-group** leg is exempt, so a query that worked
+before fan-out cannot start failing), and `maxForecastOutputPoints` 500,000
+(forecast only, single-group legs included, since forecast slots are fabricated
+rather than stored). The last is deliberately **2×** the cell bound and must not
+be "harmonised" with it: for a leg spanning its window `horizon ≈ N`, so equal
+constants would make the output bound strictly tighter on every forecast and
+silently supersede the cell bound.
+
+**A declined group is a success, not an incomplete read.** `series_count` counts
+groups EMITTED, `declined_series_count` counts groups declined for insufficient
+data, and they sum to the resolved group count. Nothing is wrong with the stored
+data — this is deliberately not the `QUERY_INCOMPLETE` case. `anomalies()` has
+no emitted counter, so the invariant has no anomaly analogue.
+
+Only **`declined_series_count`** is additive/optional: it is omitted from the
+JSON and off the proto3 wire at zero, so absent means none. `series_count` is
+emitted **unconditionally**, including as `0` on an empty or wholly-declined
+leg — that is exactly what keeps a pre-fan-out response byte-identical, so do
+not "make it consistent" with the other counter.
+
+**`/derived` carries a vestigial success-side `error`, and is left that way.**
+ERROR bodies are identical on `/query` and `/derived` — the canonical
+`timestar::http::jsonError` shape,
+`{"status":"error","error_code":…,"message":…,"error":"<string>"}`, with `error`
+a plain STRING — so one accessor serves both. The inconsistency is only on the
+SUCCESS side: `/derived` still emits an always-empty `error` OBJECT
+(`{"code":"","message":""}` for an arithmetic formula, `{"message":""}` for
+`forecast()`/`anomalies()`) where `/query` has no `error` key at all. So neither
+the presence of `error` nor its type tells you whether a `/derived` request
+failed — **branch on `status`**.
 
 ## Performance Logging Configuration
 

@@ -670,6 +670,7 @@ ParsedDerivedQueryRequest parseDerivedQueryRequest(const void* data, size_t size
     result.startTime = req.start_time();
     result.endTime = req.end_time();
     result.aggregationInterval = req.aggregation_interval();
+    result.multiSeries = req.multi_series();
 
     for (const auto& sub : req.queries()) {
         result.queries[sub.name()] = sub.query();
@@ -694,11 +695,31 @@ std::string formatDerivedQueryResponse(const DerivedQueryResultData& result) {
         resp.set_compressed_values(vEncoded.data.data(), vEncoded.dataByteSize());
     }
 
+    // Per-group results (multi_series opt-in only).  Compressed exactly like
+    // the flat columns above -- an existing protobuf client already has to read
+    // compressed_timestamps / compressed_values, so the array asks nothing new
+    // of it beyond the group_tags.
+    for (const auto& series : result.series) {
+        auto* pbSeries = resp.add_series();
+        for (const auto& groupTag : series.groupTags) {
+            pbSeries->add_group_tags(groupTag);
+        }
+        if (!series.timestamps.empty()) {
+            auto tsEncoded = IntegerEncoder::encode(std::span<const uint64_t>(series.timestamps));
+            pbSeries->set_compressed_timestamps(tsEncoded.data.data(), tsEncoded.size());
+        }
+        if (!series.values.empty()) {
+            auto vEncoded = FloatEncoder::encode(std::span<const double>(series.values));
+            pbSeries->set_compressed_values(vEncoded.data.data(), vEncoded.dataByteSize());
+        }
+    }
+
     auto* stats = resp.mutable_statistics();
     stats->set_point_count(result.stats.pointCount);
     stats->set_execution_time_ms(result.stats.executionTimeMs);
     stats->set_sub_queries_executed(result.stats.subQueriesExecuted);
     stats->set_points_dropped_due_to_alignment(result.stats.pointsDroppedDueToAlignment);
+    stats->set_group_count(result.stats.groupCount);
 
     std::string out;
     resp.SerializeToString(&out);
@@ -748,6 +769,7 @@ std::string formatAnomalyResponse(const AnomalyQueryResultData& result) {
     stats->set_anomaly_count(result.statistics.anomalyCount);
     stats->set_total_points(result.statistics.totalPoints);
     stats->set_execution_time_ms(result.statistics.executionTimeMs);
+    stats->set_declined_series_count(result.statistics.declinedSeriesCount);
 
     std::string out;
     resp.SerializeToString(&out);
@@ -802,6 +824,7 @@ std::string formatForecastResponse(const ForecastQueryResultData& result) {
     stats->set_forecast_points(result.statistics.forecastPoints);
     stats->set_series_count(result.statistics.seriesCount);
     stats->set_execution_time_ms(result.statistics.executionTimeMs);
+    stats->set_declined_series_count(result.statistics.declinedSeriesCount);
 
     std::string out;
     resp.SerializeToString(&out);

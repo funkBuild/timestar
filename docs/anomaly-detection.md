@@ -27,6 +27,34 @@ anomalies(query_ref, 'algorithm', bounds[, 'seasonality'])
 }
 ```
 
+## Per-series fan-out
+
+`anomalies()` runs **once per series** its sub-query resolves to and returns one
+group per series, labelled in `group_tags`. A group's identity is its
+**(tag set, field)** key — so `by {deviceId}` fans out by device, and a
+multi-field leg fans out by field with a synthetic `_field=<name>` label. No
+request flag is needed.
+
+The group key, the ordering rule, the `_field=` label convention and the size
+bounds are specified once in
+[docs/api-derived.md](api-derived.md#per-series-fan-out).
+
+Detection runs **independently per group**, over that group's own observations
+rather than over the shared time axis it is projected onto. Groups carrying too
+few observations are [declined](api-derived.md#declined-groups) and counted in
+`declined_series_count` (see "Minimum Data" below for the exact rule, which
+differs from `forecast()`'s).
+
+> **Known limitation.** `AnomalyStatistics` carries `declined_series_count` but
+> no counter for groups actually **emitted** — there is no anomaly analogue of
+> forecast's `series_count`, so the invariant *emitted + declined = resolved*
+> cannot be checked from the response alone. Count the distinct `group_tags`
+> under `series` if you need the emitted figure.
+
+`algorithm`, `bounds` and `seasonality` are **global** — all three are taken
+once from the request's config and describe the whole query, not any one group.
+`anomaly_count` and `total_points` are **sums** across the emitted groups.
+
 ## Algorithms
 
 ### Basic
@@ -108,10 +136,25 @@ Each piece includes an `alert_value` field with the maximum anomaly score.
   "seasonality": "none",
   "anomaly_count": 5,
   "total_points": 1000,
+  "declined_series_count": 2,
   "execution_time_ms": 32.1
 }
 ```
 
+`declined_series_count` is **additive**: omitted from the JSON when zero, and
+(as a proto3 scalar) likewise absent from the protobuf wire format. Absent means
+none. `total_points` counts the **real** observations across the answered
+groups, not the width of the shared axis — under fan-out a group carries `null`
+wherever it has no sample, and those slots are not its data.
+
 ## Minimum Data
 
 At least `minDataPoints` (default 10) values are needed before bounds are produced. Earlier points will have infinite bounds and zero scores. This warm-up applies to **basic** and **agile** only. For agile, the effective warm-up is `max(minDataPoints, seasonalPeriod)`. The **robust** algorithm has no warm-up -- it runs STL decomposition over the entire series and produces finite bounds for all points.
+
+A **sparse** series carrying fewer than `minDataPoints` **observations** is not warmed up at all -- it is **declined**, and reported in `declined_series_count` rather than returned. The warm-up above is indexed by slot, which is only equivalent to counting observations when every slot holds one; under the per-group fan-out of `anomalies()` a group carries `null` wherever it has no sample, so a device with a single observation would otherwise leave warm-up and be given a full confidence envelope built from that one sample. See "Declined groups" in [docs/api-derived.md](api-derived.md).
+
+The decline applies only to a series **longer than** `minDataPoints`. A series at or below that length is always answered, however many of its slots are `null` -- a series that short cannot leave a slot-indexed warm-up at all, so for **basic** and **agile** there is nothing there to fabricate, and declining it would only throw away the stored values under `raw` and `predictions`. Both halves of the rule matter: judging a series on the observations it really holds is the point, and not applying that judgement below the warm-up length is what keeps a genuinely short series returnable.
+
+For **robust** the decline effectively never fires on such a series: robust has no warm-up (see above), so it produces a finite envelope at every slot however short the input is -- a dense 3-point robust series comes back with a `±0.36` band, not an all-`null` one. What the length arm of the rule preserves for robust is simply the answer it gave before per-group fan-out existed.
+
+`forecast()` and `anomalies()` **disagree** about a short dense series, and that is deliberate and pre-existing: a 5-point series is answered by `anomalies()` (its stored values are returned; only the envelope is empty) and declined by `forecast()` (a fit under `minDataPoints` has no values to lose in the first place -- see [docs/forecasting.md](forecasting.md), "Minimum Data"). Both halves are preserving the behaviour they had before the fan-out work; neither was unified with the other.

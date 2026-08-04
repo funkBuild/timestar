@@ -229,9 +229,10 @@ static std::vector<QueryDef> buildQuerySuite(WireFormat format = WireFormat::Jso
     qs.push_back({"latest: tag filter (repeated)", "POST", "/query",
                   q("latest:server.metrics(temperature){host:host-03}", BASE_TS, END_TS), 50});
 
-    // Set the wire format on all entries.
-    for (auto& q : qs) {
-        q.format = format;
+    // Set the wire format on all entries.  Named `entry` rather than `q` so it
+    // does not shadow the `q(...)` body builder above (-Wshadow).
+    for (auto& entry : qs) {
+        entry.format = format;
     }
 
     return qs;

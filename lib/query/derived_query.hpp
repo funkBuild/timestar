@@ -4,11 +4,13 @@
 #include "expression_parser.hpp"
 #include "query_parser.hpp"
 
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace timestar {
 
@@ -32,6 +34,25 @@ struct DerivedQueryRequest {
 
     // Aggregation interval for time bucketing (applies to final result)
     uint64_t aggregationInterval = 0;
+
+    // OPT-IN (JSON "multiSeries", protobuf DerivedQueryRequest.multi_series):
+    // let an ARITHMETIC formula's sub-queries resolve to more than one series.
+    // Groups are paired across sub-queries by (tag set, field) and the formula
+    // is evaluated once per group; the answer arrives under
+    // DerivedQueryResult::series.
+    //
+    // Off by default, and deliberately so: DerivedQueryResponse is a FLAT
+    // timestamps/values pair, so a client that has not been taught about
+    // `series` would read a multi-group answer as an empty one -- the
+    // silent-wrong-answer class this project treats as a defect.  With the flag
+    // clear, a multi-series sub-query keeps returning the same 400 it always
+    // has.  Same shape of opt-in as /query's bucketAlignment /
+    // booleansAsNumeric.
+    //
+    // forecast() and anomalies() fan out over groups unconditionally (they
+    // carry per-group `group_tags` in their own response shape) and ignore
+    // this flag.
+    bool multiSeries = false;
 
     // Validate the request
     void validate() const {
@@ -120,10 +141,74 @@ struct SubQueryResult {
     size_t size() const { return timestamps.size(); }
 };
 
+// One member of a multi-series sub-query result: exactly one (tag set x field)
+// pair with its own time axis.  `tags` is the series' INTERNAL tag map (the
+// same std::map SeriesResult carries), not the flattened "k=v" strings the
+// /query JSON serializer emits under `groupTags` -- consumers that need the
+// wire shape flatten it themselves.
+struct SubQuerySeries {
+    std::map<std::string, std::string> tags;
+    std::string field;
+    std::vector<uint64_t> timestamps;
+    std::vector<double> values;
+
+    bool empty() const { return timestamps.empty(); }
+    size_t size() const { return timestamps.size(); }
+};
+
+// Result of a single sub-query that is allowed to resolve to MORE THAN ONE
+// series -- the group model behind per-device / per-group forecast() and
+// anomalies().  SubQueryResult (above) is the single-series flattening of the
+// same data and stays the shape the arithmetic formula path consumes.
+//
+// The order of `series` is a deterministic function of the input; see
+// DerivedQueryExecutor::convertQueryResponseMulti() for the exact rule.
+struct MultiSeriesSubQueryResult {
+    std::string queryName;
+    std::string measurement;
+    std::vector<SubQuerySeries> series;
+
+    bool empty() const { return series.empty(); }
+    size_t size() const { return series.size(); }
+};
+
+// One series of a MULTI-SERIES derived result: the arithmetic formula
+// evaluated over a single (tag set x field) group.
+struct DerivedSeriesResult {
+    // The group's tags flattened to "key=value" in ascending key order, then --
+    // only when the RESULT spans more than one distinct field -- the synthetic
+    // "_field=<name>" entry appended LAST.  Same convention as the forecast and
+    // anomaly series pieces; see DerivedQueryExecutor::alignSubQueryGroups().
+    std::vector<std::string> groupTags;
+    std::vector<uint64_t> timestamps;
+    std::vector<double> values;
+
+    bool empty() const { return timestamps.empty(); }
+    size_t size() const { return timestamps.size(); }
+};
+
 // Result of a derived query (computed from sub-queries)
 struct DerivedQueryResult {
     std::vector<uint64_t> timestamps;
     std::vector<double> values;
+
+    // Per-group results.  EMPTY unless the request set multiSeries -- that is
+    // what keeps the response byte-identical for every client that predates the
+    // flag.  (Byte-identity is a claim about the RESPONSE; the REQUEST surface
+    // did widen in one place -- see GlazeDerivedQueryRequest::
+    // aggregationInterval, which now also accepts the JSON-numeric spelling the
+    // API always documented.)  Under the flag this is the WHOLE answer at every
+    // group count: the
+    // flat timestamps/values above stay empty, including for a single group (an
+    // earlier revision duplicated a one-group answer into both forms, which
+    // doubled the body for good).
+    std::vector<DerivedSeriesResult> series;
+
+    // Was this answer produced by the per-group path?  Distinguishes "the flag
+    // was set and nothing matched" (`series` empty, and the serializer emits
+    // `"series": []`) from "the flag was not set" (`series` omitted entirely),
+    // which a multiSeries client would otherwise have to read as `undefined`.
+    bool multiSeries = false;
 
     // Formula that produced this result
     std::string formula;
@@ -136,7 +221,15 @@ struct DerivedQueryResult {
         size_t pointCount = 0;
         double executionTimeMs = 0.0;
         size_t subQueriesExecuted = 0;
+        // On the multi-series path this is the SUM across groups: each group is
+        // aligned independently, so a timestamp missing from one group's legs is
+        // counted once for that group.  Reported (and documented) as a total
+        // rather than a per-group figure.
         size_t pointsDroppedDueToAlignment = 0;
+        // Groups the formula was evaluated over.  Only meaningful -- and only
+        // serialized -- on the multi-series path, where it plays the part
+        // `series_count` plays for forecast().
+        size_t groupCount = 0;
     } stats;
 
     bool empty() const { return timestamps.empty(); }
@@ -170,6 +263,13 @@ public:
 
     DerivedQueryBuilder& setAggregationInterval(uint64_t interval) {
         request_.aggregationInterval = interval;
+        return *this;
+    }
+
+    // Opt in to per-group evaluation of an arithmetic formula; see
+    // DerivedQueryRequest::multiSeries.
+    DerivedQueryBuilder& setMultiSeries(bool multiSeries) {
+        request_.multiSeries = multiSeries;
         return *this;
     }
 

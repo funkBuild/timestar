@@ -384,6 +384,15 @@ message DerivedQueryRequest {
     uint64                   start_time           = 3;
     uint64                   end_time             = 4;
     string                   aggregation_interval = 5;  // Duration string
+    // OPT-IN: let an arithmetic formula's sub-queries resolve to more than one
+    // series, pairing them by (tag set, field) and answering under `series`
+    // below.  Without it a sub-query resolving to several series is still the
+    // 400 it has always been -- a client that reads only the flat
+    // timestamps/values would otherwise read a multi-series answer as "no
+    // data".  Mirrors the JSON request key "multiSeries"; see
+    // docs/api-derived.md.  forecast() / anomalies() fan out regardless and
+    // ignore this flag.
+    bool                     multi_series         = 6;
 }
 
 // Statistics for derived query execution
@@ -391,7 +400,28 @@ message DerivedQueryStatistics {
     uint64 point_count                     = 1;
     double execution_time_ms               = 2;
     uint64 sub_queries_executed            = 3;
+    // SUM across groups on the multi-series path: each group is aligned on its
+    // own, so this is a total rather than a per-group figure.
     uint64 points_dropped_due_to_alignment = 4;
+    // Groups the formula was evaluated over -- what series_count is to a
+    // forecast response.  Only ever non-zero when the request set multi_series;
+    // additive, so 0 is not on the wire.
+    uint64 group_count                     = 5;
+}
+
+// One series of a MULTI-SERIES derived result: the formula evaluated over a
+// single (tag set x field) group.  Only ever present when the request set
+// multi_series.
+message DerivedSeries {
+    // The group's tags flattened to "key=value" in ascending key order, then --
+    // ONLY when the result spans more than one distinct field -- the synthetic
+    // "_field=<name>" entry LAST.  Exactly the convention ForecastSeriesPiece
+    // and AnomalySeriesPiece use.
+    repeated string group_tags            = 1;
+    repeated uint64 timestamps            = 2 [packed = true];
+    repeated double values                = 3 [packed = true];
+    bytes           compressed_timestamps = 4;  // FFOR compressed
+    bytes           compressed_values     = 5;  // ALP compressed
 }
 
 // Standard derived query response
@@ -405,6 +435,13 @@ message DerivedQueryResponse {
     string                   error_message           = 7;
     bytes                    compressed_timestamps   = 8;   // FFOR compressed
     bytes                    compressed_values       = 9;   // ALP compressed
+    // Per-group results, present ONLY when the request set multi_series -- and
+    // then this is the WHOLE answer at every group count, the flat
+    // timestamps/values above staying empty.  (An earlier revision also filled
+    // the flat columns for a one-group answer so a client could adopt the flag
+    // before the array; that doubled the body, and the compression ran over the
+    // same points twice.)
+    repeated DerivedSeries   series                  = 10;
 }
 
 // ============================================================================
@@ -427,6 +464,13 @@ message AnomalyStatistics {
     uint64 anomaly_count    = 4;
     uint64 total_points     = 5;
     double execution_time_ms = 6;
+    // Groups the query resolved to but DECLINED to answer for -- too few
+    // observations to detect against without inventing an envelope.  A
+    // declined group is absent from `series` entirely, so without this the
+    // caller cannot tell "this device has too little data" from "this device
+    // does not exist".  Additive: 0 (the overwhelmingly common case) is not
+    // on the wire.
+    uint64 declined_series_count = 7;
 }
 
 message AnomalyResponse {
@@ -459,8 +503,16 @@ message ForecastStatistics {
     double residual_std_dev   = 7;
     uint64 historical_points  = 8;
     uint64 forecast_points    = 9;
+    // Groups actually EMITTED in `series`, not groups the leg resolved to.
     uint64 series_count       = 10;
     double execution_time_ms  = 11;
+    // Groups the query resolved to but DECLINED to forecast -- too few finite
+    // observations to fit a line that carries any uncertainty.  A declined
+    // group is absent from `series` entirely, so without this the caller
+    // cannot tell "this device has too little data" from "this device does not
+    // exist".  series_count + declined_series_count is the number of groups
+    // the leg resolved to.  Additive: 0 is not on the wire.
+    uint64 declined_series_count = 12;
 }
 
 message ForecastResponse {

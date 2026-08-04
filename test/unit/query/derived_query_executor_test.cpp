@@ -497,3 +497,219 @@ TEST_F(DerivedQueryExecutorTest, VeryLongFormula) {
 
     EXPECT_NO_THROW(request.validate());
 }
+
+// ==================== Phase 4: the multiSeries wire surface ====================
+//
+// DerivedQueryResponse is a FLAT timestamps/values pair, so a multi-group
+// answer needs a `series` array -- and an old client that reads only the flat
+// columns must never be handed one silently.  Hence: the array is emitted ONLY
+// when the executor produced groups, and the request key that produces them is
+// an explicit opt-in on a STRICT Glaze struct (an unknown key is a 400, so a
+// missing struct field would make the flag unreachable rather than ignored).
+
+// A response type that KNOWS about `series`, for reading the new shape back.
+struct TestGlazeDerivedSeries {
+    std::vector<std::string> group_tags;
+    std::vector<uint64_t> timestamps;
+    std::vector<double> values;
+};
+
+// Glaze reads STRICTLY by default (an unknown key is an error), so this must
+// name every key the response carries, not just the new ones -- including
+// "group_count", which a multi-series response always carries.
+struct TestGlazeMultiSeriesStatistics {
+    size_t pointCount = 0;
+    double executionTimeMs = 0.0;
+    size_t subQueriesExecuted = 0;
+    size_t pointsDroppedDueToAlignment = 0;
+    size_t groupCount = 0;
+};
+
+struct TestGlazeMultiSeriesResponse {
+    std::string status;
+    std::vector<uint64_t> timestamps;
+    std::vector<double> values;
+    std::vector<TestGlazeDerivedSeries> series;
+    std::string formula;
+    TestGlazeMultiSeriesStatistics statistics;
+    TestGlazeDerivedQueryResponse::Error error;
+};
+
+template <>
+struct glz::meta<TestGlazeDerivedSeries> {
+    using T = TestGlazeDerivedSeries;
+    static constexpr auto value =
+        object("group_tags", &T::group_tags, "timestamps", &T::timestamps, "values", &T::values);
+};
+
+template <>
+struct glz::meta<TestGlazeMultiSeriesStatistics> {
+    using T = TestGlazeMultiSeriesStatistics;
+    static constexpr auto value =
+        object("point_count", &T::pointCount, "execution_time_ms", &T::executionTimeMs, "sub_queries_executed",
+               &T::subQueriesExecuted, "points_dropped_due_to_alignment", &T::pointsDroppedDueToAlignment,
+               "group_count", &T::groupCount);
+};
+
+template <>
+struct glz::meta<TestGlazeMultiSeriesResponse> {
+    using T = TestGlazeMultiSeriesResponse;
+    static constexpr auto value =
+        object("status", &T::status, "timestamps", &T::timestamps, "values", &T::values, "series", &T::series,
+               "formula", &T::formula, "statistics", &T::statistics, "error", &T::error);
+};
+
+// The request key must PARSE.  This reads the library struct directly, so it
+// pins the STRUCT member (without it "multiSeries" is an unknown key and the
+// whole request 400s -- GlazeDerivedQueryRequest is parsed strictly).  The
+// glz::meta entry lives in the .cpp and is proven end to end by the
+// executeFromJson tests in derived_query_executor_seastar_test.cpp, which send
+// the key over the real parser.
+TEST_F(DerivedQueryExecutorTest, MultiSeriesRequestKeyIsAccepted) {
+    const std::string json = R"json({
+        "queries": {"a": "avg:cpu(usage)", "b": "avg:mem(used)"},
+        "formula": "a / b",
+        "startTime": 1000,
+        "endTime": 2000,
+        "multiSeries": true
+    })json";
+
+    GlazeDerivedQueryRequest request;
+    auto err = glz::read_json(request, json);
+    ASSERT_FALSE(err) << glz::format_error(err, json);
+    EXPECT_TRUE(request.multiSeries);
+}
+
+TEST_F(DerivedQueryExecutorTest, MultiSeriesRequestKeyDefaultsToFalseWhenAbsent) {
+    const std::string json = R"json({"queries":{"a":"avg:cpu(usage)"},"formula":"a"})json";
+
+    GlazeDerivedQueryRequest request;
+    auto err = glz::read_json(request, json);
+    ASSERT_FALSE(err) << glz::format_error(err, json);
+    EXPECT_FALSE(request.multiSeries) << "an older client sends no flag and must keep the old behaviour";
+}
+
+// A result with no groups -- every response that predates the flag -- must not
+// grow a "series" key at all.  Glaze skips null members, which is why the
+// response member is a std::optional and not a plain vector.
+TEST_F(DerivedQueryExecutorTest, FormatResponseOmitsTheSeriesKeyWithoutGroups) {
+    DerivedQueryResult result;
+    result.timestamps = {1000, 2000};
+    result.values = {1.0, 2.0};
+    result.formula = "a + b";
+    result.stats.pointCount = 2;
+
+    DerivedQueryExecutor executor(nullptr);
+    const std::string json = executor.formatResponse(result);
+
+    EXPECT_EQ(json.find("\"series\""), std::string::npos) << json;
+    EXPECT_EQ(json.find("null"), std::string::npos) << "not even as an explicit null: " << json;
+}
+
+TEST_F(DerivedQueryExecutorTest, FormatResponseEmitsGroupsWithTheirTags) {
+    DerivedQueryResult result;
+    result.formula = "a / b";
+    result.multiSeries = true;
+    result.series.push_back({{"deviceId=DEV-A", "_field=rx"}, {1000, 2000}, {1.5, 2.5}});
+    result.series.push_back({{"deviceId=DEV-B", "_field=rx"}, {1000, 2000}, {10.5, 20.5}});
+    result.stats.pointCount = 4;
+
+    DerivedQueryExecutor executor(nullptr);
+    const std::string json = executor.formatResponse(result);
+
+    TestGlazeMultiSeriesResponse response;
+    auto err = glz::read_json(response, json);
+    ASSERT_FALSE(err) << glz::format_error(err, json);
+
+    ASSERT_EQ(response.series.size(), 2u);
+    EXPECT_EQ(response.series[0].group_tags, (std::vector<std::string>{"deviceId=DEV-A", "_field=rx"}));
+    EXPECT_EQ(response.series[0].timestamps, (std::vector<uint64_t>{1000, 2000}));
+    EXPECT_EQ(response.series[0].values, (std::vector<double>{1.5, 2.5}));
+    EXPECT_EQ(response.series[1].group_tags, (std::vector<std::string>{"deviceId=DEV-B", "_field=rx"}));
+    EXPECT_EQ(response.series[1].values, (std::vector<double>{10.5, 20.5}));
+
+    // More than one group: the flat columns are empty and the array is the
+    // whole answer.
+    EXPECT_TRUE(response.timestamps.empty());
+    EXPECT_TRUE(response.values.empty());
+}
+
+// REPOINTED (was FormatResponseSingleGroupCarriesBothForms): under the flag the
+// array is the whole answer at EVERY group count, one included.  Emitting both
+// forms let a client adopt the flag before the array, but carried every point
+// twice -- a measured 56.85 MB body became 113.71 MB, uncapped, because the
+// one-group case is exempt from maxFanOutPoints.
+TEST_F(DerivedQueryExecutorTest, FormatResponseSingleGroupEmitsOnlyTheArray) {
+    DerivedQueryResult result;
+    result.formula = "a / b";
+    result.multiSeries = true;
+    result.series.push_back({{"deviceId=DEV-A"}, {1000, 2000}, {1.5, 2.5}});
+    result.stats.pointCount = 2;
+    result.stats.groupCount = 1;
+
+    DerivedQueryExecutor executor(nullptr);
+    const std::string json = executor.formatResponse(result);
+
+    TestGlazeMultiSeriesResponse response;
+    auto err = glz::read_json(response, json);
+    ASSERT_FALSE(err) << glz::format_error(err, json);
+
+    ASSERT_EQ(response.series.size(), 1u);
+    EXPECT_EQ(response.series[0].timestamps, (std::vector<uint64_t>{1000, 2000}));
+    EXPECT_EQ(response.series[0].values, (std::vector<double>{1.5, 2.5}));
+    EXPECT_EQ(response.series[0].group_tags, (std::vector<std::string>{"deviceId=DEV-A"}));
+
+    // The points appear ONCE: the flat columns are empty.
+    EXPECT_TRUE(response.timestamps.empty());
+    EXPECT_TRUE(response.values.empty());
+    EXPECT_NE(json.find("\"timestamps\":[],\"values\":[]"), std::string::npos) << json;
+    EXPECT_NE(json.find("\"group_count\":1"), std::string::npos) << json;
+}
+
+// An opted-in answer that matched NOTHING still says `"series": []`.  Absent
+// means "this server has no such flag"; empty means "no groups".  A multiSeries
+// client would otherwise have to treat `undefined` as a third state.
+TEST_F(DerivedQueryExecutorTest, FormatResponseEmitsAnEmptyArrayForAnOptedInEmptyAnswer) {
+    DerivedQueryResult result;
+    result.formula = "a / b";
+    result.multiSeries = true;
+
+    DerivedQueryExecutor executor(nullptr);
+    const std::string json = executor.formatResponse(result);
+
+    EXPECT_NE(json.find("\"series\":[]"), std::string::npos) << json;
+    EXPECT_NE(json.find("\"group_count\":0"), std::string::npos) << json;
+}
+
+// Duplicated keys in one request body are LAST-WINS.  Benign, but pinned so it
+// cannot change silently: a client that templates the body and appends an
+// override gets the override.
+TEST_F(DerivedQueryExecutorTest, DuplicateMultiSeriesKeysAreLastWins) {
+    const std::string trueLast =
+        R"json({"queries":{"a":"avg:cpu(usage)"},"formula":"a","multiSeries":false,"multiSeries":true})json";
+    const std::string falseLast =
+        R"json({"queries":{"a":"avg:cpu(usage)"},"formula":"a","multiSeries":true,"multiSeries":false})json";
+
+    GlazeDerivedQueryRequest a;
+    ASSERT_FALSE(glz::read_json(a, trueLast));
+    EXPECT_TRUE(a.multiSeries);
+
+    GlazeDerivedQueryRequest b;
+    ASSERT_FALSE(glz::read_json(b, falseLast));
+    EXPECT_FALSE(b.multiSeries);
+}
+
+TEST_F(DerivedQueryExecutorTest, BuilderCarriesTheMultiSeriesFlag) {
+    DerivedQueryRequest request = DerivedQueryBuilder()
+                                      .addQuery("a", "avg:cpu(usage)")
+                                      .addQuery("b", "avg:mem(used)")
+                                      .setFormula("a / b")
+                                      .setTimeRange(1000, 2000)
+                                      .setMultiSeries(true)
+                                      .build();
+    EXPECT_TRUE(request.multiSeries);
+
+    DerivedQueryRequest defaulted =
+        DerivedQueryBuilder().addQuery("a", "avg:cpu(usage)").setFormula("a").setTimeRange(1000, 2000).build();
+    EXPECT_FALSE(defaulted.multiSeries);
+}

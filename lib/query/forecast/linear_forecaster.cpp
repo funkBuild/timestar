@@ -29,6 +29,7 @@ LinearForecaster::LinearFit LinearForecaster::fitLinearRegression(const std::vec
         fit.residualStdDev = 0.0;
         fit.sumSquaredX = 0.0;
         fit.meanX = n > 0 ? x[0] : 0.0;
+        fit.usedPoints = (n > 0 && std::isfinite(x[0]) && std::isfinite(y[0])) ? 1 : 0;
         return fit;
     }
 
@@ -45,14 +46,27 @@ LinearForecaster::LinearFit LinearForecaster::fitLinearRegression(const std::vec
     double sumWeights = 0.0;
     double weightedSumX = 0.0;
     double weightedSumY = 0.0;
+    size_t usedPoints = 0;  // finite (x, y) pairs -- NOT n, see below
 
-    // Scalar fallback (skip NaN values by zeroing their weight)
+    // Skip non-finite points entirely.  Zeroing the weight and multiplying
+    // anyway does NOT skip them: 0.0 * NaN is NaN, so a single missing value
+    // poisoned every accumulator and the whole fit came back NaN (slope,
+    // intercept and residual std dev all null in the response) despite the
+    // "skip NaN values by zeroing their weight" the loops claimed to do.
+    // NaN means missing here (docs/nan_policy.md); a gap must cost the fit
+    // nothing, which is what a real skip does.
     for (size_t i = 0; i < n; ++i) {
-        double w = (!std::isfinite(px[i]) || !std::isfinite(py[i])) ? 0.0 : pw[i];
+        if (!std::isfinite(px[i]) || !std::isfinite(py[i])) {
+            continue;
+        }
+        const double w = pw[i];
+        ++usedPoints;
         sumWeights += w;
         weightedSumX += w * px[i];
         weightedSumY += w * py[i];
     }
+
+    fit.usedPoints = usedPoints;
 
     if (sumWeights <= 0.0) {
         // All data points are NaN or zero-weighted — no valid regression
@@ -78,9 +92,12 @@ LinearForecaster::LinearFit LinearForecaster::fitLinearRegression(const std::vec
     double sumXX = 0.0;
     double sumYY = 0.0;
 
-    // Scalar fallback (skip NaN values)
+    // Skipped, not zero-weighted -- see loop 1.
     for (size_t i = 0; i < n; ++i) {
-        double w = (!std::isfinite(px[i]) || !std::isfinite(py[i])) ? 0.0 : pw[i];
+        if (!std::isfinite(px[i]) || !std::isfinite(py[i])) {
+            continue;
+        }
+        const double w = pw[i];
         double dx = px[i] - fit.meanX;
         double dy = py[i] - meanY;
         sumXY += w * dx * dy;
@@ -100,7 +117,9 @@ LinearForecaster::LinearFit LinearForecaster::fitLinearRegression(const std::vec
         fit.intercept = meanY - fit.slope * fit.meanX;
     }
 
-    // Compute R-squared
+    // Compute R-squared.  No n/k confusion here to fix: sumXX and sumYY are
+    // both accumulated over the finite points only, so the ratio is already
+    // taken entirely within the k points that entered the fit.
     if (std::abs(sumYY) > 1e-10) {
         double ssReg = fit.slope * fit.slope * sumXX;
         fit.rSquared = std::clamp(ssReg / sumYY, 0.0, 1.0);
@@ -115,18 +134,39 @@ LinearForecaster::LinearFit LinearForecaster::fitLinearRegression(const std::vec
     // ======================================================================
     double sse = 0.0;
 
-    // Scalar fallback
+    // Skipped, not zero-weighted -- see loop 1.
     for (size_t i = 0; i < n; ++i) {
-        double w = (!std::isfinite(px[i]) || !std::isfinite(py[i])) ? 0.0 : pw[i];
+        if (!std::isfinite(px[i]) || !std::isfinite(py[i])) {
+            continue;
+        }
         double predicted = fit.slope * px[i] + fit.intercept;
         double residual = py[i] - predicted;
-        sse += w * residual * residual;
+        sse += pw[i] * residual * residual;
     }
 
-    if (n > 2) {
-        // Use degrees of freedom (n-2) for 2-parameter model (slope + intercept).
-        // For weighted regression: s^2 = (n / sumWeights) * (SSE / (n - 2))
-        fit.residualStdDev = std::sqrt(sse * n / (sumWeights * (n - 2)));
+    // Degrees of freedom for a 2-parameter model (slope + intercept) are
+    // k - 2, over the k points that ACTUALLY entered the fit -- not n, the
+    // length of the input vector.
+    //
+    // The two are the same thing only when every point is finite.  On a
+    // fan-out group they are not: the groups share one time axis and a group
+    // carries NaN wherever it has no sample (docs/nan_policy.md), so n is the
+    // union axis while k is that group's own point count.  Mixing them --
+    // sqrt(sse * n / (sumWeights * (n - 2))), with sse and sumWeights summed
+    // over k points and n taken from the axis -- inflates the denominator by
+    // roughly n/k and makes every confidence band on a sparse group too
+    // NARROW: measured -0.25% at k=133/n=200, -8% at k=12/n=200, -42% at
+    // k=3/n=200.  Bands that are too narrow are the dangerous direction; they
+    // read as confidence the fit does not have.
+    //
+    // The shape is otherwise unchanged and still correct for the REACTIVE
+    // model's non-unit weights: (sse / sumWeights) is the weighted mean
+    // squared residual and k/(k-2) is the bias correction, which collapses to
+    // the textbook sqrt(SSE / (k - 2)) when the weights are all 1 (DEFAULT and
+    // SIMPLE), because then sumWeights == k.
+    const double k = static_cast<double>(usedPoints);
+    if (usedPoints > 2) {
+        fit.residualStdDev = std::sqrt(sse * k / (sumWeights * (k - 2.0)));
     } else {
         fit.residualStdDev = 0.0;
     }
@@ -134,6 +174,11 @@ LinearForecaster::LinearFit LinearForecaster::fitLinearRegression(const std::vec
     return fit;
 }
 
+// `n` here is the OBSERVATION count -- fit.usedPoints, the points that entered
+// the regression -- not the length of the input vector.  The 1/n term in the
+// prediction interval is "one over the number of observations"; feeding it the
+// union-axis length on a sparse fan-out group shrinks it towards zero and
+// narrows the band for exactly the groups that deserve the widest one.
 double LinearForecaster::predictionIntervalWidth(const LinearFit& fit, double x, size_t n, double deviations) {
     if (n < 3 || fit.sumSquaredX < 1e-10) {
         return deviations * fit.residualStdDev;
@@ -156,8 +201,50 @@ ForecastOutput LinearForecaster::forecast(const ForecastInput& input, const Fore
     size_t n = input.size();
     size_t nForecast = forecastTimestamps.size();
 
+    // ForecastInput::size() is the TIMESTAMP count, and nothing in the type
+    // ties the two vectors together, so treat a short value column as the
+    // shorter input rather than reading past it.  This used to be caught
+    // downstream, by fitLinearRegression's "x, y and weights must have the
+    // same size" throw -- but that throw is now reached only AFTER the
+    // finite-point scan below has already indexed input.values[i] for every
+    // i < timestamps.size(), which is an out-of-bounds read on a mismatched
+    // input.  Clamping keeps the sizes consistent for every path that follows
+    // (SIMPLE halves n, the interval calculation indexes timestamps[n-1]), so
+    // no later step can reintroduce the mismatch.
+    n = std::min(n, input.values.size());
+
     if (n < config.minDataPoints) {
         // Not enough data - return empty with error indication
+        return output;
+    }
+
+    // ...and the same test against the points that are actually THERE.
+    //
+    // n is the length of the input vector, which on a fan-out group is the
+    // SHARED time axis: every group is projected onto the union of all the
+    // groups' timestamps and carries NaN wherever it has no sample
+    // (docs/nan_policy.md).  A device that stopped reporting is then a group of
+    // 0 finite points on a 16-slot axis -- and gating on 16 let it through, at
+    // which point fitLinearRegression's sumWeights <= 0 branch escaped as a
+    // real answer: a constant 0.0 forecast with a ZERO-WIDTH confidence band,
+    // labelled with the device's own group_tags, inside a "status":"success"
+    // response.  A fabricated number that names a real device is worse than no
+    // number.  The same gate covers the sparse case (6 daily points on a
+    // 30-slot axis fitted a flat line with r^2 = 1.0 and zero uncertainty).
+    //
+    // Returning an EMPTY output is how a forecaster declines: ForecastExecutor
+    // ::executeMulti() skips a group whose output is empty, so the group is
+    // simply absent from the response rather than present and wrong.  This is
+    // exactly the guard SeasonalForecaster::forecast() already had, which is
+    // why the identical request answered with algorithm='seasonal' omitted the
+    // group while 'linear' fabricated it.
+    size_t finitePoints = 0;
+    for (size_t i = 0; i < n; ++i) {
+        if (std::isfinite(input.values[i])) {
+            ++finitePoints;
+        }
+    }
+    if (finitePoints < config.minDataPoints) {
         return output;
     }
 
@@ -170,13 +257,20 @@ ForecastOutput LinearForecaster::forecast(const ForecastInput& input, const Fore
     std::vector<double> y;
     std::vector<double> weights(n, 1.0);  // Default: uniform weights
 
-    // Apply model-specific weighting and data selection
+    // Apply model-specific weighting and data selection.
+    //
+    // Every branch copies exactly n values out of input.values -- never
+    // "to the end" -- so that a value column longer than the timestamp column
+    // cannot leave y longer than x and trip fitLinearRegression's size check
+    // on an input the clamp above already reconciled.  For a well-formed input
+    // (the only kind any caller in this tree produces) n IS input.values.size()
+    // and this is the same copy as before.
     const size_t originalN = n;  // Save original input size before SIMPLE model halves n
     size_t startIdx = 0;
     switch (config.linearModel) {
         case LinearModelType::DEFAULT:
             // Standard least-squares: use all data with uniform weights
-            y = input.values;
+            y.assign(input.values.begin(), input.values.begin() + static_cast<ptrdiff_t>(n));
             for (size_t i = 0; i < n; ++i) {
                 x[i] = static_cast<double>(i);
             }
@@ -185,7 +279,8 @@ ForecastOutput LinearForecaster::forecast(const ForecastInput& input, const Fore
         case LinearModelType::SIMPLE:
             // Less sensitive to recent changes: use only last half of data
             startIdx = n / 2;
-            y.assign(input.values.begin() + startIdx, input.values.end());
+            y.assign(input.values.begin() + static_cast<ptrdiff_t>(startIdx),
+                     input.values.begin() + static_cast<ptrdiff_t>(n));
             x.resize(n - startIdx);
             weights.resize(n - startIdx, 1.0);
             for (size_t i = 0; i < x.size(); ++i) {
@@ -197,7 +292,7 @@ ForecastOutput LinearForecaster::forecast(const ForecastInput& input, const Fore
         case LinearModelType::REACTIVE:
             // More sensitive to recent changes: exponential decay weighting
             // w[i] = exp(-lambda * (n-1-i)) where lambda ≈ 0.05
-            y = input.values;
+            y.assign(input.values.begin(), input.values.begin() + static_cast<ptrdiff_t>(n));
             for (size_t i = 0; i < n; ++i) {
                 x[i] = static_cast<double>(i);
                 // Exponential decay: more weight on recent points
@@ -210,13 +305,40 @@ ForecastOutput LinearForecaster::forecast(const ForecastInput& input, const Fore
     // Fit linear regression with weights
     auto fit = fitLinearRegression(x, y, weights);
 
+    // The gate above counts finite points across the WHOLE input; the SIMPLE
+    // model then fits only the last half of it, so a group whose finite points
+    // all sit in the first half still reaches the fit with almost nothing
+    // usable in it.  Decline anything the fit cannot put an honest error bar
+    // around.
+    //
+    // THREE, not two.  A 2-parameter model has k - 2 degrees of freedom, so at
+    // k == 2 there is no residual left to estimate: the line passes exactly
+    // through both points, residualStdDev is forced to 0 and
+    // predictionIntervalWidth returns deviations * 0 == 0.  The result is a
+    // forecast with a ZERO-WIDTH confidence band labelled with a real device --
+    // fabricated certainty, and precisely the failure mode the gate above
+    // exists to stop rather than to relocate.  (Live: a group with 18 finite
+    // points in slots 0-17 and exactly 2 in slots 30-31 under model='simple'
+    // came back as a flat 1270 with upper - lower == 0.000000 at every
+    // forecast point.)  A caller cannot tell that band from a confident one.
+    //
+    // Two points remain a mathematically valid fit, and fitLinearRegression
+    // still computes one for any direct caller; what is refused is PUBLISHING
+    // it as a forecast with an uncertainty estimate it does not have.
+    if (fit.usedPoints < 3) {
+        return ForecastOutput{};
+    }
+
     output.slope = fit.slope;
     output.intercept = fit.intercept;
     output.rSquared = fit.rSquared;
     output.residualStdDev = fit.residualStdDev;
 
-    // Generate past values (just copy input)
-    output.past = input.values;
+    // Generate past values (just copy input).  Clamped to the same n as
+    // historicalCount so the two agree: ForecastExecutor::addSeriesPieces
+    // reads output.past.back() as "the last historical value", which is only
+    // true while past is exactly the historical window.
+    output.past.assign(input.values.begin(), input.values.begin() + static_cast<ptrdiff_t>(originalN));
 
     // Generate forecast values and bounds
     output.forecast.resize(nForecast);
@@ -245,8 +367,10 @@ ForecastOutput LinearForecaster::forecast(const ForecastInput& input, const Fore
         double predicted = fit.slope * xForecast + fit.intercept;
         output.forecast[i] = predicted;
 
-        // Compute prediction interval
-        double width = predictionIntervalWidth(fit, xForecast, n, config.deviations);
+        // Compute prediction interval.  fit.usedPoints, not n: the interval's
+        // 1/n term counts OBSERVATIONS, and on a sparse group the input vector
+        // is mostly NaN padding.
+        double width = predictionIntervalWidth(fit, xForecast, fit.usedPoints, config.deviations);
         output.upper[i] = predicted + width;
         output.lower[i] = predicted - width;
     }

@@ -677,10 +677,15 @@ TEST_F(ForecastTest, ForecastDeterminism) {
     EXPECT_DOUBLE_EQ(output1.rSquared, output2.rSquared);
 }
 
+// NaN = missing (docs/nan_policy.md).  A gap must cost the fit NOTHING: the
+// surviving points here lie exactly on y = 0.5x + 10, so that line must come
+// back exactly.
+//
+// This used to assert only "does not throw", with a comment calling NaN
+// propagation "a known limitation" -- and it WAS propagating: the accumulation
+// loops zero-weighted non-finite points and multiplied anyway, and 0.0 * NaN
+// is NaN, so three holes made every coefficient NaN.
 TEST_F(ForecastTest, InputContainsNaN) {
-    // Test graceful handling of NaN values
-    // This is a robustness test - current implementation may propagate NaN
-    // Ideally should filter NaN or return empty, but should not crash
     auto values = generateLinearData(0.5, 10.0, 0.0);
 
     // Inject NaN values at various positions
@@ -699,24 +704,30 @@ TEST_F(ForecastTest, InputContainsNaN) {
     auto forecastTimestamps = ForecastExecutor::generateForecastTimestamps(timestamps_, 10);
 
     LinearForecaster forecaster;
+    ForecastOutput output;
+    ASSERT_NO_THROW({ output = forecaster.forecast(input, config, forecastTimestamps); });
 
-    // Test should not crash - this is the main robustness check
-    EXPECT_NO_THROW({
-        auto output = forecaster.forecast(input, config, forecastTimestamps);
+    // 97 finite points out of 100 is plenty of data: the group is answered,
+    // not declined.
+    ASSERT_FALSE(output.empty());
+    EXPECT_EQ(output.forecastCount, 10u);
 
-        // If implementation improves to filter NaN, check results are valid
-        // Currently may return NaN, which is acceptable for robustness test
-        if (!output.empty()) {
-            EXPECT_EQ(output.forecastCount, 10);
-            // Note: Current implementation may produce NaN - this is a known limitation
-        }
-    });
+    EXPECT_NEAR(output.slope, 0.5, 1e-9) << "a NaN gap must not move the fit";
+    EXPECT_NEAR(output.intercept, 10.0, 1e-9);
+    EXPECT_NEAR(output.residualStdDev, 0.0, 1e-9);
+
+    for (size_t i = 0; i < output.forecastCount; ++i) {
+        EXPECT_TRUE(std::isfinite(output.forecast[i])) << "forecast[" << i << "] is not finite";
+        EXPECT_TRUE(std::isfinite(output.upper[i]));
+        EXPECT_TRUE(std::isfinite(output.lower[i]));
+    }
 }
 
+// ±Inf is NOT valid input to a regression -- an infinite residual has no
+// meaning -- so the fit treats it as missing, exactly as it treats NaN.  Note
+// this differs from the AGGREGATION rule (CLAUDE.md: "±Infinity is valid
+// data"), which is about reporting stored values, not fitting a model to them.
 TEST_F(ForecastTest, InputContainsInf) {
-    // Test graceful handling of Inf values
-    // This is a robustness test - current implementation may propagate Inf
-    // Ideally should filter Inf or return empty, but should not crash
     auto values = generateLinearData(0.5, 10.0, 0.0);
 
     // Inject Inf values
@@ -734,23 +745,25 @@ TEST_F(ForecastTest, InputContainsInf) {
     auto forecastTimestamps = ForecastExecutor::generateForecastTimestamps(timestamps_, 10);
 
     LinearForecaster forecaster;
+    ForecastOutput output;
+    ASSERT_NO_THROW({ output = forecaster.forecast(input, config, forecastTimestamps); });
 
-    // Test should not crash - this is the main robustness check
-    EXPECT_NO_THROW({
-        auto output = forecaster.forecast(input, config, forecastTimestamps);
+    ASSERT_FALSE(output.empty());
+    EXPECT_EQ(output.forecastCount, 10u);
 
-        // If implementation improves to filter Inf, check results are valid
-        // Currently may return Inf, which is acceptable for robustness test
-        if (!output.empty()) {
-            EXPECT_EQ(output.forecastCount, 10);
-            // Note: Current implementation may produce Inf - this is a known limitation
-        }
-    });
+    EXPECT_NEAR(output.slope, 0.5, 1e-9) << "an infinity must not move the fit";
+    EXPECT_NEAR(output.intercept, 10.0, 1e-9);
+
+    for (size_t i = 0; i < output.forecastCount; ++i) {
+        EXPECT_TRUE(std::isfinite(output.forecast[i])) << "forecast[" << i << "] is not finite";
+        EXPECT_TRUE(std::isfinite(output.upper[i]));
+        EXPECT_TRUE(std::isfinite(output.lower[i]));
+    }
 }
 
+// A few holes in noisy data: the fit is approximate but must be FINITE and
+// close, and the confidence band must be a real, positive width.
 TEST_F(ForecastTest, PartialMissingValues) {
-    // Test with a few NaN values (3% of data) - tests robustness to sparse missing data
-    // Current implementation may propagate NaN, which is acceptable for robustness test
     auto values = generateLinearData(0.5, 10.0, 1.0);
 
     // Inject only a few NaN values (3% of data)
@@ -769,18 +782,21 @@ TEST_F(ForecastTest, PartialMissingValues) {
     auto forecastTimestamps = ForecastExecutor::generateForecastTimestamps(timestamps_, 10);
 
     LinearForecaster forecaster;
+    ForecastOutput output;
+    ASSERT_NO_THROW({ output = forecaster.forecast(input, config, forecastTimestamps); });
 
-    // Test should not crash
-    EXPECT_NO_THROW({
-        auto output = forecaster.forecast(input, config, forecastTimestamps);
+    ASSERT_FALSE(output.empty());
+    EXPECT_EQ(output.forecastCount, 10u);
 
-        // With mostly valid data, implementation might still produce output
-        if (!output.empty()) {
-            EXPECT_EQ(output.forecastCount, 10);
-            // Note: Current implementation may propagate NaN from input data
-            // Future improvements could filter NaN values before regression
-        }
-    });
+    EXPECT_NEAR(output.slope, 0.5, 0.05);
+    EXPECT_NEAR(output.intercept, 10.0, 2.0);
+    EXPECT_TRUE(std::isfinite(output.residualStdDev));
+    EXPECT_GT(output.residualStdDev, 0.0) << "noisy data must produce a non-degenerate band";
+
+    for (size_t i = 0; i < output.forecastCount; ++i) {
+        EXPECT_TRUE(std::isfinite(output.forecast[i]));
+        EXPECT_GT(output.upper[i], output.lower[i]);
+    }
 }
 
 TEST_F(ForecastTest, NegativeValuesLinear) {

@@ -4,10 +4,8 @@
 // Build: add_executable(forecast_benchmark forecast_benchmark.cpp)
 //        target_link_libraries(forecast_benchmark libtimestar benchmark::benchmark)
 //
-// Run:   ./bin/forecast_benchmark \
-//            --benchmark_repetitions=5 \
-//            --benchmark_report_aggregates_only=true \
-//            --benchmark_display_aggregates_only=true
+// Run:   ./bin/forecast_benchmark --benchmark_repetitions=5
+//        --benchmark_report_aggregates_only=true --benchmark_display_aggregates_only=true
 
 #include "forecast/forecast_executor.hpp"
 #include "forecast/forecast_result.hpp"

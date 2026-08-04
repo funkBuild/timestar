@@ -54,6 +54,24 @@ public:
     static std::vector<uint64_t> generateForecastTimestamps(const std::vector<uint64_t>& historicalTimestamps,
                                                             size_t forecastHorizon = 0);
 
+    /**
+     * Resolve ForecastConfig::forecastHorizon against the AUTO rule.
+     *
+     * A configured horizon is used verbatim; 0 means auto, which is 20% of the
+     * historical length, floored at 50 and capped at 2000 (forecasting a full
+     * year of 5-minute points is neither useful nor cheap).
+     *
+     * Exposed because callers that must SIZE the result before running the
+     * forecast -- DerivedQueryExecutor::executeForecast(), which bounds
+     * `groups * (historical + horizon)` -- need the same number this class will
+     * use, and a second copy of the rule would drift from this one.
+     *
+     * @param historicalPoints Length of the historical input
+     * @param configuredHorizon ForecastConfig::forecastHorizon (0 = auto)
+     * @return Number of forecast points that will be produced
+     */
+    static size_t resolveHorizon(size_t historicalPoints, size_t configuredHorizon);
+
 private:
     LinearForecaster linearForecaster_;
     SeasonalForecaster seasonalForecaster_;
