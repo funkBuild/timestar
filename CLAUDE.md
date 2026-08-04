@@ -963,6 +963,49 @@ SUCCESS side: `/derived` still emits an always-empty `error` OBJECT
 the presence of `error` nor its type tells you whether a `/derived` request
 failed — **branch on `status`**.
 
+## Retention and Downsampling (canonical semantics)
+
+Retention policies now **run**. Both halves of the feature were previously dead
+code: `setRetentionContext()` had no production caller, so per-point TTL
+trimming never happened (only `sweepExpiredFiles()` deleting *wholly* expired
+files) and downsampling never happened at all. Full API in
+`docs/api-retention.md`; the rules that must not drift:
+
+- **Compaction applies retention.** Every merge and every single-file rewrite
+  routes through `executeCompaction()`, which resolves per-series context from
+  an Engine-injected provider. A compaction that cannot obtain that context
+  **fails** rather than silently compacting without retention — silent
+  no-retention was exactly the original defect.
+- **TTL is trimmed per point**, not per file. Whole blocks older than the cutoff
+  are still dropped wholesale as a fast path.
+- **`downsample` is an ordered cascade** of up to 4 tiers (1 Hz → 1m after 7d →
+  15m after 90d). `downsampleTiers` is canonical and always serialised;
+  `downsample` is a legacy mirror of tier 0, so an old reader degrades to the
+  *finest* tier — finer than intended, never coarser.
+- **Only COMPLETE buckets fold.** Every threshold is aligned down to its own
+  interval (`((now - after) / interval) * interval`), which is what makes
+  re-folding already-folded data byte-identical at every stage. An unaligned
+  threshold re-folds a partial bucket against its own raw remainder.
+- **An all-NaN bucket emits nothing** (`count == 0` suppression, deliberately a
+  count check and not a NaN check, so a data-derived `+Inf + -Inf` still emits).
+- **`min`/`max`/`sum`/`latest` compose exactly across stages; `avg` does not** —
+  it is an unweighted mean of bucket means, exact only under uniform per-bucket
+  counts. Per-field `fieldMethods` exist so counters and totalizers route to a
+  method that composes.
+- **Boolean/String never fold by default and are never coerced to 1.0/0.0.** The
+  only opt-in is an explicit `fieldMethods` entry of `latest`, which reduces to
+  LATEST-per-bucket in the written type — matching the query-time rule. A
+  measurement-wide `"method": "latest"` does *not* enable it.
+- **An invalid policy refuses to fold** (TTL still applies) rather than
+  defaulting an unrecognised method to AVG, which would destructively average a
+  totalizer on a typo. `timestar::retention::validateRetentionPolicy()` is the
+  single definition, and `buildDownsampleStages()` is the single threshold
+  resolver shared by the compactor and the age-driven sweep — a divergence
+  between those two is an endless rewrite loop.
+- **Storage resolution is not a query concept.** Downsampling changes *which
+  points are stored*; it does not change how any path aggregates or labels them,
+  so every rule in "Aggregation Result Shape" holds unchanged.
+
 ## Performance Logging Configuration
 
 The TimeStar includes compile-time controls for verbose logging in performance-critical paths. This allows developers to enable detailed logging for debugging without impacting production performance.

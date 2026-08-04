@@ -21,6 +21,170 @@
 
 namespace fs = std::filesystem;
 
+namespace {
+
+// Map a validated tier method string onto the aggregator's enum.
+//
+// Only ever reached after timestar::retention::validateRetentionPolicy() has
+// accepted the policy, so the final `else` is unreachable rather than a silent
+// default — which is what it used to be, and what let an unrecognised method
+// destructively average data the operator asked to keep as max or latest.
+timestar::AggregationMethod downsampleMethodFor(const std::string& method) {
+    if (method == "min") {
+        return timestar::AggregationMethod::MIN;
+    }
+    if (method == "max") {
+        return timestar::AggregationMethod::MAX;
+    }
+    if (method == "sum") {
+        return timestar::AggregationMethod::SUM;
+    }
+    if (method == "latest") {
+        return timestar::AggregationMethod::LATEST;
+    }
+    return timestar::AggregationMethod::AVG;
+}
+
+// INCREMENTAL, ASCENDING, MULTI-STAGE DOWNSAMPLE FOLD.
+//
+// Points are fed in the merged stream's own ascending timestamp order, which is
+// the whole reason this can hold O(1) live state instead of a bucket map:
+//
+//  - a bucket is FINAL the moment a timestamp at or past its end arrives, so at
+//    most one bucket is ever open;
+//  - a stage is final the moment a point belonging to a finer stage arrives,
+//    because thresholds decrease with k and the stream ascends.
+//
+// The map this replaces held one AggregationState (~112 B) per bucket for a
+// series' ENTIRE aged segment before flushing. A first fold of 83 days of 1 Hz
+// data at 1m resolution is ~120k buckets, ~14 MB resident per in-flight series,
+// multiplied by the pipeline count — and the cascade would have made it worse,
+// since a deeper history is exactly what a second tier exists to fold.
+//
+// Completed buckets are APPENDED to caller-owned vectors; the caller drains
+// them (block-aligned, through the sink) at its own suspension points. Nothing
+// here suspends: a coroutine frame per point measured ~15x slower than a plain
+// call on this path.
+//
+// NON-NUMERIC (Boolean/String) instantiations fold LATEST-PER-BUCKET in the
+// WRITTEN TYPE — never through AggregationState, which is a double pipeline and
+// would surface a boolean as 1.0/0.0. That coercion is forbidden everywhere
+// else in this engine (CLAUDE.md, dynamo-equivalence), and it must not sneak in
+// through storage. `latest` is the only method reachable here for those types:
+// the policy layer refuses any other (validateRetentionPolicy) and
+// processSeriesForCompaction declines to fold at all unless the resolved method
+// is LATEST, so the two gates agree even for a hand-built policy.
+template <typename T>
+class CascadeFolder {
+    static constexpr bool kNumeric = std::is_same_v<T, double> || std::is_same_v<T, int64_t>;
+
+public:
+    CascadeFolder(const std::array<DownsampleStage, MAX_DOWNSAMPLE_STAGES>& stages, uint8_t stageCount,
+                  timestar::AggregationMethod method, std::vector<uint64_t>& outTs, std::vector<T>& outVals)
+        : stages_(stages), stageCount_(stageCount), method_(method), outTs_(outTs), outVals_(outVals) {}
+
+    // ts must ascend across calls and satisfy ts < stages[0].threshold.
+    void add(uint64_t ts, const T& value) {
+        const size_t stage = stageFor(ts);
+        const uint64_t interval = stages_[stage].interval;
+        const uint64_t bucket = (ts / interval) * interval;
+        if (!live_ || stage != liveStage_ || bucket != liveBucket_) {
+            closeLiveBucket();
+            liveStage_ = stage;
+            liveBucket_ = bucket;
+            live_ = true;
+            if constexpr (kNumeric) {
+                state_ = timestar::AggregationState{};
+            } else {
+                nonNumericCount_ = 0;
+            }
+        }
+        if constexpr (kNumeric) {
+            state_.addValue(static_cast<double>(value), ts);
+        } else {
+            // The merged stream ascends and duplicates are already resolved, so
+            // the LAST value seen in a bucket is the greatest-timestamp one —
+            // exactly the query path's LATEST-per-bucket.
+            nonNumericValue_ = value;
+            ++nonNumericCount_;
+        }
+        ++foldedPoints_;
+    }
+
+    // No more points: close whatever bucket is open.
+    void finish() { closeLiveBucket(); }
+
+    size_t foldedPoints() const { return foldedPoints_; }
+    size_t emittedBuckets() const { return emittedBuckets_; }
+
+private:
+    // The largest k with ts < threshold[k]. Thresholds are non-increasing in k,
+    // so a back-to-front scan finds it in at most MAX_DOWNSAMPLE_STAGES
+    // comparisons — and typically one, since the stream ascends through the
+    // stages in order.
+    size_t stageFor(uint64_t ts) const {
+        for (size_t k = stageCount_; k-- > 0;) {
+            if (ts < stages_[k].threshold) {
+                return k;
+            }
+        }
+        // Unreachable for a correctly partitioned prefix (every fed point is
+        // below the finest threshold); fold at the finest stage rather than
+        // read past the array if a caller ever gets the partition wrong.
+        return 0;
+    }
+
+    void closeLiveBucket() {
+        if (!live_) {
+            return;
+        }
+        live_ = false;
+        // An ALL-NaN bucket must emit NOTHING. addValue() NaN-skips, so such a
+        // state has count == 0 and getValue() would return NaN at a bucket-start
+        // timestamp that never existed in the data — a fabricated point that raw
+        // reads surface as a `null`.
+        //
+        // Deliberately a COUNT check, not a NaN check on the result: a
+        // data-derived NaN (+Inf + -Inf) is the correct IEEE aggregate of real
+        // points and must still be emitted. See docs/nan_policy.md.
+        if constexpr (kNumeric) {
+            if (state_.count == 0) {
+                return;
+            }
+            outTs_.push_back(liveBucket_);
+            outVals_.push_back(static_cast<T>(state_.getValue(method_)));
+        } else {
+            // No NaN analogue for Boolean/String: every stored value is real
+            // data, so a bucket emits iff it received a point at all.
+            if (nonNumericCount_ == 0) {
+                return;
+            }
+            outTs_.push_back(liveBucket_);
+            outVals_.push_back(nonNumericValue_);
+        }
+        ++emittedBuckets_;
+    }
+
+    const std::array<DownsampleStage, MAX_DOWNSAMPLE_STAGES>& stages_;
+    uint8_t stageCount_;
+    timestar::AggregationMethod method_;
+    std::vector<uint64_t>& outTs_;
+    std::vector<T>& outVals_;
+
+    // Numeric fold state (unused, and never constructed into, for T that is
+    // Boolean/String — those carry the latest-wins pair below instead).
+    timestar::AggregationState state_;
+    T nonNumericValue_{};
+    size_t nonNumericCount_ = 0;
+    uint64_t liveBucket_ = 0;
+    size_t liveStage_ = 0;
+    bool live_ = false;
+    size_t foldedPoints_ = 0;
+    size_t emittedBuckets_ = 0;
+};
+
+}  // namespace
+
 TSMCompactor::TSMCompactor(TSMFileManager* manager)
     : fileManager(manager),
       strategy(std::make_unique<LeveledCompactionStrategy>()),
@@ -197,10 +361,34 @@ seastar::future<SeriesCompactionData<T>> TSMCompactor::processSeriesForCompactio
     // Look up retention context for this series (populated in compact())
     auto retIt = seriesRetention.find(seriesId);
     bool hasRetention = (retIt != seriesRetention.end());
-    uint64_t ttlCutoff = hasRetention ? retIt->second.ttlCutoff : 0;
-    uint64_t downsampleThreshold = hasRetention ? retIt->second.downsampleThreshold : 0;
-    uint64_t downsampleInterval = hasRetention ? retIt->second.downsampleInterval : 0;
-    auto downsampleMethod = hasRetention ? retIt->second.downsampleMethod : timestar::AggregationMethod::AVG;
+    uint64_t ttlCutoff = hasRetention ? retIt->second->ttlCutoff : 0;
+    // The downsample cascade, finest stage first. `dsFinestThreshold` is the
+    // boundary between "folds at some stage" and "passes through raw".
+    std::array<DownsampleStage, MAX_DOWNSAMPLE_STAGES> dsStages =
+        hasRetention ? retIt->second->stages : std::array<DownsampleStage, MAX_DOWNSAMPLE_STAGES>{};
+    uint8_t dsStageCount = hasRetention ? retIt->second->stageCount : 0;
+    auto downsampleMethod = hasRetention ? retIt->second->downsampleMethod : timestar::AggregationMethod::AVG;
+
+    // NON-NUMERIC OPT-IN. Boolean and String pass through unfolded unless the
+    // series' field carries an explicit `fieldMethods` entry of "latest"
+    // (retention_policy.hpp). Two conditions, not one:
+    //
+    //  * `nonNumericFold` — set only from an explicit override, so a
+    //    measurement-wide `"method": "latest"` leaves these types exactly as
+    //    they behaved before per-field methods existed;
+    //  * `downsampleMethod == LATEST` — the runtime backstop. The policy layer
+    //    already refuses any other method on a non-numeric field, but that
+    //    check needs the field-type index; this one needs only T, so a
+    //    hand-built policy reaching compact() directly still cannot average a
+    //    boolean as 1.0/0.0.
+    if constexpr (isNonNumericValueType(TSM::getValueType<T>())) {
+        const bool optedIn =
+            hasRetention && retIt->second->nonNumericFold && downsampleMethod == timestar::AggregationMethod::LATEST;
+        if (!optedIn) {
+            dsStageCount = 0;
+        }
+    }
+    const uint64_t dsFinestThreshold = dsStageCount > 0 ? dsStages[0].threshold : 0;
 
     // Check if we can use zero-copy fast path
     // Retention (TTL or downsampling) disables zero-copy since we need to filter/transform points
@@ -223,7 +411,7 @@ seastar::future<SeriesCompactionData<T>> TSMCompactor::processSeriesForCompactio
         }
     }
 
-    bool hasPerPointRetention = (ttlCutoff > 0 || downsampleThreshold > 0);
+    bool hasPerPointRetention = (ttlCutoff > 0 || dsStageCount > 0);
 
     // String dictionaries (STR2 blocks store per-file dictionary IDs): the
     // zero-copy carry is only sound when the output file's index entry can
@@ -348,33 +536,45 @@ seastar::future<SeriesCompactionData<T>> TSMCompactor::processSeriesForCompactio
 
     // Incremental emission state. Chunking is available whenever a sink is
     // supplied — including under a downsample policy: the merged stream is
-    // ascending and the threshold is fixed, so every old-segment
-    // (< threshold) point precedes every recent one. Old points are folded
-    // into a persistent bucket map at spill time (never handed to the sink),
-    // and the completed buckets are emitted the moment the first recent point
-    // reaches a spill — before any recent point is written, preserving
-    // ascending block order. Downsampling therefore no longer needs the whole
-    // series resident; it was the last remaining whole-series path.
+    // ascending and the thresholds are fixed, so every point below the finest
+    // threshold precedes every raw one, and within the folded region the stages
+    // are traversed coarsest-first. Old points go through the cascade folder at
+    // spill time (never handed to the sink raw), and completed buckets drain
+    // through the sink as they close — with the whole cascade forced out the
+    // moment the first raw point reaches a spill, before any raw point is
+    // written, preserving ascending block order. Downsampling therefore needs
+    // neither the whole series nor the whole bucket set resident.
     const bool chunkedEmit = static_cast<bool>(sink);
     size_t bufferedSinceSpill = 0;
 
-    constexpr bool kTypeSupportsDownsample = std::is_same_v<T, double> || std::is_same_v<T, int64_t>;
-    const bool streamingDownsample =
-        chunkedEmit && kTypeSupportsDownsample && downsampleThreshold > 0 && downsampleInterval > 0;
-    std::map<uint64_t, timestar::AggregationState> dsBuckets;  // old-segment fold (streaming downsample)
-    bool dsFlushed = false;        // buckets have been emitted; stream is pure recent from here
-    size_t dsOldPointsFolded = 0;  // raw points folded, for pointsWritten accounting
+    // EVERY value type can now reach the fold: numeric types through
+    // AggregationState, Boolean/String through the folder's latest-per-bucket
+    // arm. Whether a given series actually folds is decided above, by
+    // dsStageCount — which the non-numeric gate zeroes unless the field opted
+    // in. Kept as a named constant because the fold blocks below are still
+    // `if constexpr`-guarded in shape.
+    constexpr bool kTypeSupportsDownsample = true;
+    const bool streamingDownsample = chunkedEmit && kTypeSupportsDownsample && dsStageCount > 0;
 
-    // Fold result[0..count) into dsBuckets and drop them from the buffers.
+    // Completed buckets waiting to be handed to the sink. Bounded: the fold
+    // below only ever consumes the buffered prefix (<= one spill window), and
+    // the drain runs at every spill, so this never accumulates the series'
+    // whole aged segment the way the old bucket map did.
+    std::vector<uint64_t> dsOutTs;
+    std::vector<T> dsOutVals;
+    CascadeFolder<T> dsFolder(dsStages, dsStageCount, downsampleMethod, dsOutTs, dsOutVals);
+    bool dsFlushed = false;  // buckets have been emitted; stream is pure recent from here
+
+    // Fold result[0..count) into the cascade and drop them from the buffers.
     // Only ever called with count <= the deduplicated prefix (the retained
-    // last point is excluded until the series is complete).
+    // last point is excluded until the series is complete), and only with
+    // points strictly below the finest threshold, so every fed point has a
+    // stage.
     auto foldOldPrefixIntoBuckets = [&](size_t count) {
         if constexpr (kTypeSupportsDownsample) {
             for (size_t i = 0; i < count; ++i) {
-                uint64_t bucket = (result.timestamps[i] / downsampleInterval) * downsampleInterval;
-                dsBuckets[bucket].addValue(static_cast<double>(result.values[i]), result.timestamps[i]);
+                dsFolder.add(result.timestamps[i], result.values[i]);
             }
-            dsOldPointsFolded += count;
             result.timestamps.erase(result.timestamps.begin(), result.timestamps.begin() + count);
             result.values.erase(result.values.begin(), result.values.begin() + count);
         } else {
@@ -382,41 +582,66 @@ seastar::future<SeriesCompactionData<T>> TSMCompactor::processSeriesForCompactio
         }
     };
 
-    // Emit the completed bucket map through the sink in bounded chunks
-    // (ascending by construction — std::map), then release it.
+    // Hand completed buckets to the sink. Ascending by construction: stage
+    // k+1's bucket starts all precede stage k's, which all precede the first
+    // raw point (guaranteed by threshold alignment plus interval divisibility).
+    //
+    // Sends are BLOCK-ALIGNED for the same reason raw spills are — an unaligned
+    // hand-off leaves a short tail block on every drain, systematic
+    // fragmentation the under-full coalescer never reclaims. `force` (the final
+    // drain) is the only place a short chunk is allowed.
+    auto drainDsOut = [&](bool force) -> seastar::future<> {
+        if constexpr (kTypeSupportsDownsample) {
+            if (dsOutTs.empty()) {
+                co_return;
+            }
+            const size_t send = force ? dsOutTs.size() : (dsOutTs.size() / blockAlign) * blockAlign;
+            if (send == 0) {
+                co_return;
+            }
+            std::vector<uint64_t> chunkTs;
+            std::vector<T> chunkVals;
+            if (send == dsOutTs.size()) {
+                chunkTs = std::move(dsOutTs);
+                chunkVals = std::move(dsOutVals);
+                dsOutTs = {};
+                dsOutVals = {};
+            } else {
+                // Keep the (sub-block) tail, move the aligned prefix out.
+                std::vector<uint64_t> tailTs(dsOutTs.begin() + send, dsOutTs.end());
+                std::vector<T> tailVals(std::make_move_iterator(dsOutVals.begin() + send),
+                                        std::make_move_iterator(dsOutVals.end()));
+                dsOutTs.resize(send);
+                dsOutVals.resize(send);
+                chunkTs = std::move(dsOutTs);
+                chunkVals = std::move(dsOutVals);
+                dsOutTs = std::move(tailTs);
+                dsOutVals = std::move(tailVals);
+            }
+            result.emittedViaSink = true;
+            co_await sink(std::move(chunkTs), std::move(chunkVals));
+        } else {
+            (void)force;
+            co_return;
+        }
+    };
+
+    // The old segment is complete: close the open bucket, drain everything, and
+    // fix up the point accounting. Called before any raw point is written, so
+    // block order stays ascending.
     auto flushDsBuckets = [&]() -> seastar::future<> {
         if constexpr (kTypeSupportsDownsample) {
-            if (!dsBuckets.empty()) {
-                const size_t bucketCount = dsBuckets.size();
-                std::vector<uint64_t> ts;
-                std::vector<T> vals;
-                ts.reserve(std::min(bucketCount, MERGE_CHUNK_POINTS));
-                vals.reserve(std::min(bucketCount, MERGE_CHUNK_POINTS));
-                for (auto& [bucket, state] : dsBuckets) {
-                    ts.push_back(bucket);
-                    double aggVal = state.getValue(downsampleMethod);
-                    if constexpr (std::is_same_v<T, double>) {
-                        vals.push_back(aggVal);
-                    } else {
-                        vals.push_back(static_cast<int64_t>(aggVal));
-                    }
-                    if (ts.size() >= MERGE_CHUNK_POINTS) {
-                        result.emittedViaSink = true;
-                        co_await sink(std::move(ts), std::move(vals));
-                        ts = {};
-                        vals = {};
-                    }
-                }
-                if (!ts.empty()) {
-                    result.emittedViaSink = true;
-                    co_await sink(std::move(ts), std::move(vals));
-                }
+            dsFolder.finish();
+            co_await drainDsOut(true);
+            if (dsFolder.foldedPoints() > 0) {
                 // processPoint counted every folded raw point as written;
-                // replace that with the bucket count actually emitted.
-                result.pointsWritten = result.pointsWritten - dsOldPointsFolded + bucketCount;
-                timestar::compactor_log.info("Downsample (streaming): {} old points -> {} buckets for series {}",
-                                             dsOldPointsFolded, bucketCount, seriesId.toHex());
-                dsBuckets.clear();
+                // replace that with the bucket count actually emitted (which
+                // excludes all-NaN buckets).
+                result.pointsWritten = result.pointsWritten - dsFolder.foldedPoints() + dsFolder.emittedBuckets();
+                timestar::compactor_log.info(
+                    "Downsample (streaming): {} old points -> {} buckets across {} stage(s) for series {}",
+                    dsFolder.foldedPoints(), dsFolder.emittedBuckets(), static_cast<unsigned>(dsStageCount),
+                    seriesId.toHex());
             }
         }
         dsFlushed = true;
@@ -449,16 +674,16 @@ seastar::future<SeriesCompactionData<T>> TSMCompactor::processSeriesForCompactio
 
         if (streamingDownsample && !dsFlushed) {
             // Fold the old-segment part of the deduplicated prefix (all but
-            // the retained last point) into the bucket map instead of sending
-            // it to the sink.
+            // the retained last point) into the cascade instead of sending it
+            // to the sink. Each point lands in its own stage's bucket.
             const size_t prefix = result.timestamps.size() - 1;
             const size_t partIdx = static_cast<size_t>(
-                std::lower_bound(result.timestamps.begin(), result.timestamps.begin() + prefix, downsampleThreshold) -
+                std::lower_bound(result.timestamps.begin(), result.timestamps.begin() + prefix, dsFinestThreshold) -
                 result.timestamps.begin());
             if (partIdx > 0) {
                 foldOldPrefixIntoBuckets(partIdx);
             }
-            if (!result.timestamps.empty() && result.timestamps.front() >= downsampleThreshold) {
+            if (!result.timestamps.empty() && result.timestamps.front() >= dsFinestThreshold) {
                 // A recent point reached a spill: the ascending stream proves
                 // the old segment is complete. Emit the buckets NOW, before
                 // any recent point is written, so block order stays ascending.
@@ -466,7 +691,11 @@ seastar::future<SeriesCompactionData<T>> TSMCompactor::processSeriesForCompactio
                 // Fall through to the normal send below for the recent points.
             } else {
                 // Everything spillable was old and is now folded; only the
-                // retained point remains.
+                // retained point remains. Hand off whatever buckets have
+                // completed so far — this is what keeps the fold's memory
+                // bounded across a deep first fold instead of accumulating
+                // every bucket of the aged segment.
+                co_await drainDsOut(false);
                 bufferedSinceSpill = result.timestamps.size();
                 co_return;
             }
@@ -815,7 +1044,7 @@ seastar::future<SeriesCompactionData<T>> TSMCompactor::processSeriesForCompactio
     // Buckets are emitted BEFORE the recent tail below, keeping order.
     if (streamingDownsample && !dsFlushed) {
         const size_t partIdx = static_cast<size_t>(
-            std::lower_bound(result.timestamps.begin(), result.timestamps.end(), downsampleThreshold) -
+            std::lower_bound(result.timestamps.begin(), result.timestamps.end(), dsFinestThreshold) -
             result.timestamps.begin());
         if (partIdx > 0) {
             foldOldPrefixIntoBuckets(partIdx);
@@ -834,43 +1063,29 @@ seastar::future<SeriesCompactionData<T>> TSMCompactor::processSeriesForCompactio
         co_await sink(std::move(tailTs), std::move(tailVals));
     }
 
-    // Phase 4: Downsampling for series processed WITHOUT a sink (direct
-    // callers/tests) — sink-driven series were folded incrementally above.
-    if constexpr (std::is_same_v<T, double> || std::is_same_v<T, int64_t>) {
-        if (!streamingDownsample && downsampleThreshold > 0 && downsampleInterval > 0 && !result.timestamps.empty()) {
-            // Find partition point: first timestamp >= threshold
-            auto partIt = std::lower_bound(result.timestamps.begin(), result.timestamps.end(), downsampleThreshold);
+    // Downsampling for series processed WITHOUT a sink (direct callers/tests) —
+    // sink-driven series were folded incrementally above.
+    if constexpr (kTypeSupportsDownsample) {
+        if (!streamingDownsample && dsStageCount > 0 && !result.timestamps.empty()) {
+            // Find partition point: first timestamp >= the finest threshold.
+            auto partIt = std::lower_bound(result.timestamps.begin(), result.timestamps.end(), dsFinestThreshold);
             size_t partIdx = static_cast<size_t>(partIt - result.timestamps.begin());
 
             if (partIdx > 0) {
-                // Old segment: timestamps[0..partIdx) — downsample these
+                // Old segment: timestamps[0..partIdx) — fold through the SAME
+                // cascade the streaming path uses. Sharing the folder is the
+                // point: two implementations of this would let the answer
+                // depend on whether the caller supplied a sink.
                 std::vector<uint64_t> dsTimestamps;
                 std::vector<T> dsValues;
-
-                // Bucket and aggregate
-                std::map<uint64_t, timestar::AggregationState> buckets;
+                CascadeFolder<T> folder(dsStages, dsStageCount, downsampleMethod, dsTimestamps, dsValues);
                 for (size_t i = 0; i < partIdx; ++i) {
-                    uint64_t bucket = (result.timestamps[i] / downsampleInterval) * downsampleInterval;
-                    double val;
-                    if constexpr (std::is_same_v<T, double>) {
-                        val = result.values[i];
-                    } else {
-                        val = static_cast<double>(result.values[i]);
-                    }
-                    buckets[bucket].addValue(val, result.timestamps[i]);
+                    folder.add(result.timestamps[i], result.values[i]);
                 }
+                folder.finish();
 
-                dsTimestamps.reserve(buckets.size());
-                dsValues.reserve(buckets.size());
-                for (auto& [bucket, state] : buckets) {
-                    dsTimestamps.push_back(bucket);
-                    double aggVal = state.getValue(downsampleMethod);
-                    if constexpr (std::is_same_v<T, double>) {
-                        dsValues.push_back(aggVal);
-                    } else {
-                        dsValues.push_back(static_cast<int64_t>(aggVal));
-                    }
-                }
+                // Buckets actually emitted (all-NaN buckets contributed none).
+                const size_t emittedBuckets = dsTimestamps.size();
 
                 // Recent segment: timestamps[partIdx..end) — keep at full resolution
                 size_t recentCount = result.timestamps.size() - partIdx;
@@ -887,8 +1102,10 @@ seastar::future<SeriesCompactionData<T>> TSMCompactor::processSeriesForCompactio
                 result.pointsWritten = result.timestamps.size();
 
                 timestar::compactor_log.info(
-                    "Downsample: {} -> {} points for series {} ({} old -> {} buckets, {} recent kept)", originalCount,
-                    result.timestamps.size(), seriesId.toHex(), partIdx, buckets.size(), recentCount);
+                    "Downsample: {} -> {} points for series {} ({} old -> {} buckets across {} stage(s), {} recent "
+                    "kept)",
+                    originalCount, result.timestamps.size(), seriesId.toHex(), partIdx, emittedBuckets,
+                    static_cast<unsigned>(dsStageCount), recentCount);
             }
         }
     }
@@ -966,7 +1183,8 @@ seastar::future<> TSMCompactor::writeSeriesCompactionData(TSMWriter& writer, Ser
 seastar::future<CompactionResult> TSMCompactor::compact(
     const std::vector<seastar::shared_ptr<TSM>>& files, uint64_t targetTier, uint64_t targetSeq,
     const std::unordered_map<std::string, RetentionPolicy>& retentionPolicies,
-    const std::unordered_map<SeriesId128, std::string, SeriesId128::Hash>& seriesMeasurementMap) {
+    const std::unordered_map<SeriesId128, std::string, SeriesId128::Hash>& seriesMeasurementMap,
+    const std::unordered_map<SeriesId128, std::string, SeriesId128::Hash>& seriesFieldMap) {
     if (files.empty()) {
         co_return CompactionResult{};
     }
@@ -1015,49 +1233,111 @@ seastar::future<CompactionResult> TSMCompactor::compact(
         // Get all unique series across files
         auto allSeries = getAllSeriesIds(files);
 
-        // Build per-series retention context from policies + metadata map (local to this compaction)
+        // Build per-series retention context from policies + metadata map (local to this compaction).
+        //
+        // `resolvedByKey` OWNS the contexts; `seriesRetention` only points into
+        // it, so it must be declared here, at the same scope, and must not be
+        // mutated after the series loop below fills the map.
+        //
+        // The key is `measurement '\0' field`, with an empty field naming the
+        // measurement's DEFAULT context. Phase 2 resolved one context per
+        // measurement to keep the per-series cost at a hash lookup; per-field
+        // methods do not change that — the table simply gains one extra entry
+        // per overridden field (bounded by the policy, not by cardinality), and
+        // a series still costs exactly one lookup.
+        std::unordered_map<std::string, SeriesRetentionContext> resolvedByKey;
         SeriesRetentionMap seriesRetention;
+        // Reused across the series loop so the composite key costs no
+        // allocation per series once it has grown.
+        std::string contextKey;
+        auto makeContextKey = [&contextKey](const std::string& measurement, std::string_view field) -> std::string& {
+            contextKey.assign(measurement);
+            contextKey.push_back('\0');
+            contextKey.append(field);
+            return contextKey;
+        };
+
         if (!retentionPolicies.empty() && !seriesMeasurementMap.empty()) {
             uint64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
                                std::chrono::system_clock::now().time_since_epoch())
                                .count();
 
-            for (const auto& sid : allSeries) {
-                auto measIt = seriesMeasurementMap.find(sid);
-                if (measIt == seriesMeasurementMap.end())
-                    continue;
-
-                auto policyIt = retentionPolicies.find(measIt->second);
-                if (policyIt == retentionPolicies.end())
-                    continue;
-
-                const auto& policy = policyIt->second;
+            // Resolve each POLICY once, not once per series. Every series under
+            // a measurement gets the identical context, and the resolution now
+            // has real work in it (a tier list to walk, a method string to map),
+            // so doing it per series would multiply it by cardinality — the
+            // cascade's tier count times a 128k-series shard.
+            resolvedByKey.reserve(retentionPolicies.size() * 2);
+            for (const auto& [measurement, policy] : retentionPolicies) {
                 SeriesRetentionContext ctx;
 
                 if (policy.ttlNanos > 0 && now > policy.ttlNanos) {
                     ctx.ttlCutoff = now - policy.ttlNanos;
                 }
 
-                if (policy.downsample.has_value() && policy.downsample->afterNanos > 0 &&
-                    now > policy.downsample->afterNanos) {
-                    ctx.downsampleThreshold = now - policy.downsample->afterNanos;
-                    ctx.downsampleInterval = policy.downsample->intervalNanos;
-
-                    const auto& method = policy.downsample->method;
-                    if (method == "min")
-                        ctx.downsampleMethod = timestar::AggregationMethod::MIN;
-                    else if (method == "max")
-                        ctx.downsampleMethod = timestar::AggregationMethod::MAX;
-                    else if (method == "sum")
-                        ctx.downsampleMethod = timestar::AggregationMethod::SUM;
-                    else if (method == "latest")
-                        ctx.downsampleMethod = timestar::AggregationMethod::LATEST;
-                    else
-                        ctx.downsampleMethod = timestar::AggregationMethod::AVG;
+                // Stage resolution lives in timestar::retention so the
+                // age-driven sweep (Engine::sweepDownsampleRewrites) decides
+                // whether a fold is worth scheduling from EXACTLY the stages
+                // this merge will then apply. Two copies of this arithmetic
+                // drift into either an endless rewrite loop (sweep says fold,
+                // merge declines) or a quiet series that never folds.
+                const auto tiers = timestar::retention::effectiveTiers(policy);
+                std::string invalidReason;
+                ctx.stageCount = timestar::retention::buildDownsampleStages(policy, now, ctx.stages, &invalidReason);
+                if (!invalidReason.empty()) {
+                    timestar::compactor_log.error(
+                        "Retention: refusing to downsample measurement '{}' — invalid policy: {}", measurement,
+                        invalidReason);
+                } else if (ctx.stageCount > 0) {
+                    ctx.downsampleMethod = downsampleMethodFor(tiers.front().method);
                 }
 
-                if (ctx.ttlCutoff > 0 || ctx.downsampleThreshold > 0) {
-                    seriesRetention[sid] = ctx;
+                if (ctx.ttlCutoff == 0 && ctx.stageCount == 0) {
+                    continue;  // inert for every field of this measurement
+                }
+                resolvedByKey.emplace(makeContextKey(measurement, std::string_view{}), ctx);
+
+                // One extra context per OVERRIDDEN field. buildDownsampleStages
+                // has already refused an invalid policy (stageCount == 0), and
+                // validation forces every tier to resolve a given field to the
+                // same method, so tier 0's view is the whole answer.
+                if (ctx.stageCount == 0 || tiers.empty()) {
+                    continue;
+                }
+                for (const auto& [field, fieldMethod] : timestar::retention::fieldMethodsOf(tiers.front())) {
+                    SeriesRetentionContext fieldCtx = ctx;
+                    fieldCtx.downsampleMethod = downsampleMethodFor(fieldMethod);
+                    // The ONLY route by which a Boolean/String series folds.
+                    fieldCtx.nonNumericFold = (fieldMethod == "latest");
+                    resolvedByKey.insert_or_assign(makeContextKey(measurement, field), fieldCtx);
+                }
+            }
+
+            if (!resolvedByKey.empty()) {
+                for (const auto& sid : allSeries) {
+                    auto measIt = seriesMeasurementMap.find(sid);
+                    if (measIt == seriesMeasurementMap.end())
+                        continue;
+
+                    // The field map only ever holds series whose field carries
+                    // an override (the provider filters), so this is a miss for
+                    // every series of a policy without `fieldMethods` — which
+                    // is what keeps that case identical to Phase 2.
+                    const SeriesRetentionContext* resolved = nullptr;
+                    if (auto fieldIt = seriesFieldMap.find(sid); fieldIt != seriesFieldMap.end()) {
+                        auto overrideIt = resolvedByKey.find(makeContextKey(measIt->second, fieldIt->second));
+                        if (overrideIt != resolvedByKey.end()) {
+                            resolved = &overrideIt->second;
+                        }
+                    }
+                    if (!resolved) {
+                        auto defaultIt = resolvedByKey.find(makeContextKey(measIt->second, std::string_view{}));
+                        if (defaultIt == resolvedByKey.end())
+                            continue;
+                        resolved = &defaultIt->second;
+                    }
+
+                    seriesRetention[sid] = resolved;
                 }
             }
 
@@ -1347,12 +1627,25 @@ seastar::future<CompactionStats> TSMCompactor::executeCompaction(CompactionPlan 
         }
     }
 
-    // Move policies into locals so they survive across multiple executeCompaction calls
-    // (e.g., forceFullCompaction calls executeCompaction per tier).
-    auto localRetention = std::exchange(_pendingRetentionPolicies, {});
-    auto localSeriesMap = std::exchange(_pendingSeriesMeasurementMap, {});
-    auto compactionResult =
-        co_await compact(plan.sourceFiles, plan.targetTier, plan.targetSeqNum, localRetention, localSeriesMap);
+    // Resolve retention for THIS plan's series, now that the merge slot is
+    // held. Built per plan rather than parked on the compactor beforehand: two
+    // merges can be in flight at once, so shared pending state belongs to
+    // whichever plan consumes it first, not to the one that set it.
+    //
+    // getAllSeriesIds() iterates the already-resident sparse indexes, so this
+    // costs no I/O; the provider is what may touch the index, and it caches.
+    //
+    // A provider failure propagates out of this coroutine deliberately.
+    // compactOneTier() catches it and applies its exponential backoff, so the
+    // merge is retried later; compacting without retention would silently
+    // preserve expired points and silently skip downsampling.
+    RetentionCompactionContext retention;
+    if (retentionContextProvider_ && (!retentionActiveProbe_ || retentionActiveProbe_())) {
+        auto planSeries = getAllSeriesIds(plan.sourceFiles);
+        retention = co_await retentionContextProvider_(planSeries);
+    }
+    auto compactionResult = co_await compact(plan.sourceFiles, plan.targetTier, plan.targetSeqNum, retention.policies,
+                                             retention.seriesMeasurement, retention.seriesField);
 
     if (!compactionResult.outputPath.empty()) {
         // Open the new file
@@ -1480,7 +1773,21 @@ bool TSMCompactor::isFileInActiveCompaction(const seastar::shared_ptr<TSM>& file
 }
 
 seastar::future<CompactionStats> TSMCompactor::executeTombstoneRewrite(seastar::shared_ptr<TSM> file) {
-    // Build a single-file compaction plan at the same tier
+    co_return co_await executeSingleFileRewrite(std::move(file), "TOMBSTONE-REWRITE");
+}
+
+seastar::future<CompactionStats> TSMCompactor::executeDownsampleRewrite(seastar::shared_ptr<TSM> file) {
+    co_return co_await executeSingleFileRewrite(std::move(file), "DOWNSAMPLE-REWRITE");
+}
+
+seastar::future<CompactionStats> TSMCompactor::executeSingleFileRewrite(seastar::shared_ptr<TSM> file,
+                                                                        const char* reason) {
+    // Build a single-file compaction plan at the same tier.
+    //
+    // Same tier is what keeps a rewrite from being mistaken for a merge:
+    // LeveledCompactionStrategy::getTargetTier already keeps sub-files_per_merge
+    // rewrites in their own tier, and nothing about a one-file plan should
+    // promote the data.
     CompactionPlan plan;
     plan.sourceFiles = {file};
     plan.targetTier = file->tierNum;
@@ -1488,7 +1795,7 @@ seastar::future<CompactionStats> TSMCompactor::executeTombstoneRewrite(seastar::
     plan.targetPath = generateCompactedFilename(plan.targetTier, plan.targetSeqNum, file->dataSeq);
     plan.estimatedSize = file->getFileSize();
 
-    timestar::compactor_log.info("[TOMBSTONE-REWRITE] Rewriting {} at tier {} seq {} -> seq {}", file->getFileSize(),
+    timestar::compactor_log.info("[{}] Rewriting {} at tier {} seq {} -> seq {}", reason, file->getFileSize(),
                                  plan.targetTier, file->seqNum, plan.targetSeqNum);
 
     co_return co_await executeCompaction(plan);

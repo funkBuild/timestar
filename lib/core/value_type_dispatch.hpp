@@ -22,6 +22,7 @@
 #include "tsm.hpp"  // TSMValueType (Float=0, Boolean, String, Integer)
 
 #include <cstdint>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -43,6 +44,26 @@ inline std::string_view valueTypeName(TSMValueType t) noexcept {
             return "integer";
     }
     return "";
+}
+
+// Inverse of valueTypeName(). nullopt for an unrecognised name — including the
+// empty string the field-type index returns for a field it has never seen.
+//
+// Exists so callers that only hold the field-type index's STRING can still
+// reach timestar::isNonNumericValueType(), which is the single definition of
+// the non-numeric rule (lib/storage/tsm.hpp). Spelling out
+// `name == "boolean" || name == "string"` at those call sites would be a second
+// copy of that rule, free to drift.
+inline std::optional<TSMValueType> valueTypeFromName(std::string_view name) noexcept {
+    if (name == "float")
+        return TSMValueType::Float;
+    if (name == "boolean")
+        return TSMValueType::Boolean;
+    if (name == "string")
+        return TSMValueType::String;
+    if (name == "integer")
+        return TSMValueType::Integer;
+    return std::nullopt;
 }
 
 // Compile-time TSMValueType → C++ type mapping.

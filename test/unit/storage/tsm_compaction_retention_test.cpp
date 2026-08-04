@@ -112,6 +112,39 @@ public:
         p.ttlNanos = ONE_DAY_NS;
         return p;
     }
+
+    // Build a downsample-only RetentionPolicy (no TTL).
+    static RetentionPolicy downsamplePolicy(const std::string& measurement, uint64_t afterNanos, uint64_t intervalNanos,
+                                            const std::string& method) {
+        RetentionPolicy p;
+        p.measurement = measurement;
+        DownsamplePolicy ds;
+        ds.afterNanos = afterNanos;
+        ds.intervalNanos = intervalNanos;
+        ds.method = method;
+        p.downsample = ds;
+        return p;
+    }
+
+    // Compact `files` under one measurement's policy and return the output path.
+    seastar::future<std::string> compactWithPolicy(std::vector<seastar::shared_ptr<TSM>> files,
+                                                   const RetentionPolicy& policy, const SeriesId128& sid) {
+        std::unordered_map<std::string, RetentionPolicy> policies{{policy.measurement, policy}};
+        std::unordered_map<SeriesId128, std::string, SeriesId128::Hash> seriesMap{{sid, policy.measurement}};
+        auto result = co_await compactor->compact(files, policies, seriesMap);
+        co_return result.outputPath;
+    }
+
+    // Open a compacted output and read one float series back.
+    static seastar::future<std::map<uint64_t, double>> openAndReadFloat(const std::string& path,
+                                                                        const std::string& seriesKey) {
+        auto tsm = seastar::make_shared<TSM>(path);
+        co_await tsm->open();
+        co_await tsm->readSparseIndex();
+        auto data = co_await readAllFloat(tsm, seriesKey);
+        co_await tsm->close();
+        co_return data;
+    }
 };
 
 // ===========================================================================
@@ -598,26 +631,39 @@ SEASTAR_TEST_F(CompactionRetentionTest, ShortRetentionWindowDropsMostData) {
 }
 
 // ===========================================================================
-// Test 9: setRetentionContext API — verify the method is callable and that
-//         the subsequent compact() with the same policy applies retention.
+// Test 9: the retention CONSUMPTION path — executeCompaction() must obtain its
+//         retention context from the injected provider.
+//
+// This test used to call setRetentionContext() *and* pass the same policies to
+// compact() explicitly, so it passed regardless of what executeCompaction()
+// did with the parked context — which in production was to consume an
+// always-empty map, leaving TTL and downsampling dead in every running server.
+//
+// Nothing is passed to compact() here. The ONLY route by which retention can
+// reach the merge is the provider, so if executeCompaction() stops consulting
+// it the expired points survive and this fails.
 // ===========================================================================
-SEASTAR_TEST_F(CompactionRetentionTest, SetRetentionContextAppliedOnCompact) {
+SEASTAR_TEST_F(CompactionRetentionTest, ExecuteCompactionAppliesProviderRetention) {
     const std::string measurement = "env";
     const std::string seriesKey = "env|zone=a|humidity";
+    const uint64_t ONE_SEC_NS = 1'000'000'000ULL;
 
     uint64_t now = nowNs();
     uint64_t threeDaysAgo = now - 3 * ONE_DAY_NS;
     uint64_t oneHourAgo = now - ONE_HOUR_NS;
 
-    auto file0 = self->makeFloatFile(0, 0, seriesKey, {threeDaysAgo, threeDaysAgo + 1'000'000'000ULL}, {80.0, 81.0});
-    auto file1 = self->makeFloatFile(0, 1, seriesKey, {oneHourAgo, oneHourAgo + 1'000'000'000ULL}, {90.0, 91.0});
-
-    co_await file0->open();
-    co_await file0->readSparseIndex();
-    co_await file1->open();
-    co_await file1->readSparseIndex();
-
     SeriesId128 sid = SeriesId128::fromSeriesKey(seriesKey);
+
+    // A full merge's worth of tier-0 files, so planCompaction(0) yields a valid
+    // plan: this is the production entry point, not a hand-built plan.
+    const size_t filesPerMerge = timestar::config().storage.compaction.files_per_merge;
+    for (size_t i = 0; i < filesPerMerge; ++i) {
+        auto file = self->makeFloatFile(0, i, seriesKey, {threeDaysAgo + i * ONE_SEC_NS, oneHourAgo + i * ONE_SEC_NS},
+                                        {80.0 + static_cast<double>(i), 90.0 + static_cast<double>(i)});
+        co_await file->open();
+        co_await file->readSparseIndex();
+        co_await self->fileManager->addTSMFile(file);
+    }
 
     std::unordered_map<std::string, RetentionPolicy> policies;
     policies[measurement] = CompactionRetentionTest::oneDayPolicy(measurement);
@@ -625,15 +671,34 @@ SEASTAR_TEST_F(CompactionRetentionTest, SetRetentionContextAppliedOnCompact) {
     std::unordered_map<SeriesId128, std::string, SeriesId128::Hash> seriesMap;
     seriesMap[sid] = measurement;
 
-    // Use setRetentionContext to pre-load the policy (Engine does this before
-    // triggering compaction in production code).
-    self->compactor->setRetentionContext(policies, seriesMap);
+    bool providerCalled = false;
+    self->compactor->setRetentionContextProvider(
+        [&providerCalled, policies, seriesMap](const std::vector<SeriesId128>& planSeries) {
+            providerCalled = true;
+            EXPECT_FALSE(planSeries.empty()) << "provider was handed no series ids from the plan";
+            RetentionCompactionContext ctx;
+            ctx.policies = policies;
+            for (const auto& id : planSeries) {
+                auto it = seriesMap.find(id);
+                if (it != seriesMap.end()) {
+                    ctx.seriesMeasurement.emplace(id, it->second);
+                }
+            }
+            return seastar::make_ready_future<RetentionCompactionContext>(std::move(ctx));
+        });
 
-    // Pass the same policies explicitly to the compact() call so retention
-    // is applied via both the pre-loaded context and the direct argument.
-    auto compactedPath = (co_await self->compactor->compact({file0, file1}, policies, seriesMap)).outputPath;
+    auto plan = self->compactor->planCompaction(0);
+    EXPECT_TRUE(plan.isValid());
+    if (!plan.isValid()) {
+        co_return;
+    }
+    const std::string compactedPath = plan.targetPath;
 
-    EXPECT_FALSE(compactedPath.empty());
+    co_await self->compactor->executeCompaction(plan);
+
+    EXPECT_TRUE(providerCalled) << "executeCompaction() did not consult the retention provider, so the merge ran "
+                                   "with no retention at all — the exact production defect.";
+    EXPECT_TRUE(fs::exists(compactedPath));
 
     auto compacted = seastar::make_shared<TSM>(compactedPath);
     co_await compacted->open();
@@ -641,10 +706,352 @@ SEASTAR_TEST_F(CompactionRetentionTest, SetRetentionContextAppliedOnCompact) {
 
     auto data = co_await CompactionRetentionTest::readAllFloat(compacted, seriesKey);
 
-    // Old 2 points dropped, recent 2 kept.
-    EXPECT_EQ(data.size(), 2u);
+    // Expired points dropped, recent ones kept — with policies reaching the
+    // merge ONLY through the provider.
+    EXPECT_EQ(data.size(), filesPerMerge);
     EXPECT_EQ(data.count(threeDaysAgo), 0u);
     EXPECT_DOUBLE_EQ(data[oneHourAgo], 90.0);
+
+    co_await compacted->close();
+    co_return;
+}
+
+// ===========================================================================
+// Test 10: a provider failure FAILS the compaction.
+//
+// Compacting without retention when a policy exists silently preserves expired
+// points and silently skips the fold, and the source files are deleted on
+// success — so the wrong answer becomes the only answer. The exception must
+// escape executeCompaction() into compactOneTier()'s failure backoff, which
+// retries the merge later.
+// ===========================================================================
+SEASTAR_TEST_F(CompactionRetentionTest, ProviderFailureFailsCompaction) {
+    const std::string seriesKey = "env|zone=b|humidity";
+    const uint64_t ONE_SEC_NS = 1'000'000'000ULL;
+
+    uint64_t now = nowNs();
+    uint64_t oneHourAgo = now - ONE_HOUR_NS;
+
+    const size_t filesPerMerge = timestar::config().storage.compaction.files_per_merge;
+    std::vector<std::string> sourcePaths;
+    for (size_t i = 0; i < filesPerMerge; ++i) {
+        auto file =
+            self->makeFloatFile(0, i, seriesKey, {oneHourAgo + i * ONE_SEC_NS}, {90.0 + static_cast<double>(i)});
+        co_await file->open();
+        co_await file->readSparseIndex();
+        sourcePaths.push_back(file->getFilePath());
+        co_await self->fileManager->addTSMFile(file);
+    }
+
+    self->compactor->setRetentionContextProvider([](const std::vector<SeriesId128>&) {
+        return seastar::make_exception_future<RetentionCompactionContext>(
+            std::runtime_error("index unavailable while resolving retention"));
+    });
+
+    auto plan = self->compactor->planCompaction(0);
+    EXPECT_TRUE(plan.isValid());
+    if (!plan.isValid()) {
+        co_return;
+    }
+
+    bool threw = false;
+    try {
+        co_await self->compactor->executeCompaction(plan);
+    } catch (const std::exception&) {
+        threw = true;
+    }
+
+    EXPECT_TRUE(threw) << "executeCompaction() swallowed a retention-provider failure and compacted anyway. "
+                          "A merge that cannot obtain retention context must fail and be retried, not write a "
+                          "file with retention silently unapplied.";
+
+    // The source files must survive: a compaction that did not complete must
+    // not have removed its inputs.
+    for (const auto& path : sourcePaths) {
+        EXPECT_TRUE(fs::exists(path)) << "source file " << path << " was removed by a failed compaction";
+    }
+
+    co_return;
+}
+
+// ===========================================================================
+// Test 10b: the retention-active probe short-circuits the provider entirely.
+//
+// The provider's own fast path returns empty maps without an index read, but
+// REACHING it still costs getAllSeriesIds() over every source file's sparse
+// index — O(series) per merge, on every merge of a shard that has no policy at
+// all. The probe exists so that cost is not imposed on the common case.
+// ===========================================================================
+SEASTAR_TEST_F(CompactionRetentionTest, InactiveRetentionProbeSkipsProvider) {
+    const std::string seriesKey = "env|zone=c|humidity";
+    const uint64_t ONE_SEC_NS = 1'000'000'000ULL;
+
+    uint64_t oneHourAgo = nowNs() - ONE_HOUR_NS;
+
+    const size_t filesPerMerge = timestar::config().storage.compaction.files_per_merge;
+    for (size_t i = 0; i < filesPerMerge; ++i) {
+        auto file =
+            self->makeFloatFile(0, i, seriesKey, {oneHourAgo + i * ONE_SEC_NS}, {90.0 + static_cast<double>(i)});
+        co_await file->open();
+        co_await file->readSparseIndex();
+        co_await self->fileManager->addTSMFile(file);
+    }
+
+    bool providerCalled = false;
+    self->compactor->setRetentionContextProvider(
+        [&providerCalled](const std::vector<SeriesId128>&) {
+            providerCalled = true;
+            return seastar::make_ready_future<RetentionCompactionContext>();
+        },
+        [] { return false; });
+
+    auto plan = self->compactor->planCompaction(0);
+    EXPECT_TRUE(plan.isValid());
+    if (!plan.isValid()) {
+        co_return;
+    }
+    co_await self->compactor->executeCompaction(plan);
+
+    EXPECT_FALSE(providerCalled) << "executeCompaction() enumerated the plan's series and called the provider even "
+                                    "though the shard reported no actionable retention policy.";
+    EXPECT_TRUE(fs::exists(plan.targetPath));
+
+    co_return;
+}
+
+// ===========================================================================
+// Test 11: threshold straddle — only COMPLETE buckets may fold.
+//
+// downsampleThreshold is derived from wall-clock `now`, so it sweeps through
+// the bucket grid. Unaligned, the bucket containing the threshold gets its
+// [bucketStart, threshold) prefix folded and emitted at bucketStart while the
+// rest of the SAME bucket passes through raw; the next compaction then folds
+// that partial aggregate together with the raw remainder — avg(avg(prefix),
+// rest...), an unweighted fold-of-fold with wrong weights, compounding once
+// per compaction while the threshold sits inside the bucket.
+//
+// Aligning the threshold down to the bucket grid means a bucket only folds
+// once it can no longer receive raw points, so the final value equals the
+// direct fold of ALL its raw points regardless of how many compactions ran.
+//
+// The clock is "advanced" by shrinking afterNanos, which moves the threshold
+// forward exactly as the passage of time does.
+// ===========================================================================
+SEASTAR_TEST_F(CompactionRetentionTest, ThresholdStraddleFoldsOnlyCompleteBuckets) {
+    const std::string measurement = "straddle";
+    const std::string seriesKey = "straddle|zone=a|value";
+    SeriesId128 sid = SeriesId128::fromSeriesKey(seriesKey);
+
+    const uint64_t SEC = 1'000'000'000ULL;
+    const uint64_t INTERVAL = 60 * SEC;
+
+    const uint64_t now0 = nowNs();
+    const uint64_t bucketB = ((now0 - 2 * ONE_HOUR_NS) / INTERVAL) * INTERVAL;
+    const uint64_t bucketA = bucketB - INTERVAL;
+    const uint64_t recentTs = now0 - 60 * SEC;
+
+    std::vector<uint64_t> ts;
+    std::vector<double> vals;
+    for (int i = 0; i < 6; ++i) {
+        ts.push_back(bucketA + static_cast<uint64_t>(i) * 10 * SEC);
+        vals.push_back(10.0 + i);  // avg = 12.5
+    }
+    for (int i = 0; i < 6; ++i) {
+        ts.push_back(bucketB + static_cast<uint64_t>(i) * 10 * SEC);
+        vals.push_back(1.0 + i);  // avg = 3.5
+    }
+    ts.push_back(recentTs);
+    vals.push_back(99.0);
+
+    auto file0 = self->makeFloatFile(0, 0, seriesKey, ts, vals);
+    co_await file0->open();
+    co_await file0->readSparseIndex();
+
+    // Fold 1: raw threshold lands INSIDE bucket B, at B + 30s. Bucket A is
+    // complete and folds; bucket B must NOT be touched.
+    auto policy1 =
+        CompactionRetentionTest::downsamplePolicy(measurement, nowNs() - (bucketB + 30 * SEC), INTERVAL, "avg");
+    auto path1 = co_await self->compactWithPolicy({file0}, policy1, sid);
+    EXPECT_FALSE(path1.empty());
+    co_await file0->close();
+    if (path1.empty()) {
+        co_return;
+    }
+
+    auto mid = co_await CompactionRetentionTest::openAndReadFloat(path1, seriesKey);
+    EXPECT_EQ(mid.count(bucketA), 1u) << "complete bucket A did not fold";
+    EXPECT_DOUBLE_EQ(mid[bucketA], 12.5);
+    EXPECT_EQ(mid.size(), 8u) << "bucket B was partially folded: only complete buckets may fold "
+                                 "(1 folded A + 6 raw B + 1 recent expected)";
+
+    // Fold 2: the clock has moved past bucket B's end (raw threshold B + 90s),
+    // so bucket B is now complete and folds in one go.
+    auto file1 = seastar::make_shared<TSM>(path1);
+    co_await file1->open();
+    co_await file1->readSparseIndex();
+
+    auto policy2 =
+        CompactionRetentionTest::downsamplePolicy(measurement, nowNs() - (bucketB + 90 * SEC), INTERVAL, "avg");
+    auto path2 = co_await self->compactWithPolicy({file1}, policy2, sid);
+    EXPECT_FALSE(path2.empty());
+    co_await file1->close();
+    if (path2.empty()) {
+        co_return;
+    }
+
+    auto out = co_await CompactionRetentionTest::openAndReadFloat(path2, seriesKey);
+
+    EXPECT_EQ(out.size(), 3u) << "expected folded A, folded B, and the untouched recent point";
+    EXPECT_EQ(out.count(bucketB), 1u);
+    EXPECT_DOUBLE_EQ(out[bucketB], 3.5)
+        << "boundary bucket does not equal the direct fold of its raw points. A partial fold at "
+           "the straddling threshold was later re-folded against its own raw remainder "
+           "(unweighted fold-of-fold), which compounds on every compaction.";
+    // Re-folding an already-folded bucket must be the identity.
+    EXPECT_DOUBLE_EQ(out[bucketA], 12.5);
+    EXPECT_DOUBLE_EQ(out[recentTs], 99.0);
+
+    co_return;
+}
+
+// ===========================================================================
+// Test 12: idempotency — compacting already-folded data again is
+//          point-identical. This is what bucket-aligned thresholds buy: a
+//          completed bucket's single bucket-start point re-folds to itself.
+// ===========================================================================
+SEASTAR_TEST_F(CompactionRetentionTest, RepeatedFoldIsPointIdentical) {
+    const std::string measurement = "idem";
+    const std::string seriesKey = "idem|zone=a|value";
+    SeriesId128 sid = SeriesId128::fromSeriesKey(seriesKey);
+
+    const uint64_t SEC = 1'000'000'000ULL;
+    const uint64_t INTERVAL = 60 * SEC;
+
+    const uint64_t now0 = nowNs();
+    const uint64_t bucketB = ((now0 - 2 * ONE_HOUR_NS) / INTERVAL) * INTERVAL;
+    const uint64_t bucketA = bucketB - INTERVAL;
+    // Threshold sits one full interval past bucket B, so both buckets are
+    // complete on the first fold and stay complete on the second.
+    const uint64_t thresholdTarget = bucketB + INTERVAL;
+    const uint64_t recentTs = now0 - 60 * SEC;
+
+    std::vector<uint64_t> ts;
+    std::vector<double> vals;
+    for (int i = 0; i < 6; ++i) {
+        ts.push_back(bucketA + static_cast<uint64_t>(i) * 10 * SEC);
+        vals.push_back(3.0 + i * 0.25);
+    }
+    for (int i = 0; i < 6; ++i) {
+        ts.push_back(bucketB + static_cast<uint64_t>(i) * 10 * SEC);
+        vals.push_back(7.5 - i * 0.5);
+    }
+    ts.push_back(recentTs);
+    vals.push_back(42.0);
+
+    auto file0 = self->makeFloatFile(0, 0, seriesKey, ts, vals);
+    co_await file0->open();
+    co_await file0->readSparseIndex();
+
+    auto policy1 = CompactionRetentionTest::downsamplePolicy(measurement, nowNs() - thresholdTarget, INTERVAL, "avg");
+    auto path1 = co_await self->compactWithPolicy({file0}, policy1, sid);
+    co_await file0->close();
+    EXPECT_FALSE(path1.empty());
+    if (path1.empty()) {
+        co_return;
+    }
+    auto first = co_await CompactionRetentionTest::openAndReadFloat(path1, seriesKey);
+    EXPECT_EQ(first.size(), 3u);
+
+    auto file1 = seastar::make_shared<TSM>(path1);
+    co_await file1->open();
+    co_await file1->readSparseIndex();
+
+    auto policy2 = CompactionRetentionTest::downsamplePolicy(measurement, nowNs() - thresholdTarget, INTERVAL, "avg");
+    auto path2 = co_await self->compactWithPolicy({file1}, policy2, sid);
+    co_await file1->close();
+    EXPECT_FALSE(path2.empty());
+    if (path2.empty()) {
+        co_return;
+    }
+    auto second = co_await CompactionRetentionTest::openAndReadFloat(path2, seriesKey);
+
+    EXPECT_EQ(first.size(), second.size()) << "second fold changed the point count";
+    for (const auto& [t, v] : first) {
+        EXPECT_EQ(second.count(t), 1u) << "point at " << t << " lost on the second fold";
+        if (second.count(t)) {
+            EXPECT_DOUBLE_EQ(second.at(t), v) << "point at " << t << " changed value on the second fold";
+        }
+    }
+
+    co_return;
+}
+
+// ===========================================================================
+// Test 13: NaN buckets.
+//
+// The bucket state is materialised by operator[] BEFORE addValue() NaN-skips,
+// so an all-NaN bucket used to emit getValue()'s count==0 NaN at a
+// bucket-start timestamp that never existed in the data — a fabricated point
+// that raw reads surface as a `null`.
+//
+// The fix is a count check, deliberately NOT a NaN check on the result: a
+// data-derived NaN (+Inf + -Inf) is the correct IEEE aggregate of real points
+// and must still be emitted (docs/nan_policy.md).
+// ===========================================================================
+SEASTAR_TEST_F(CompactionRetentionTest, AllNaNBucketEmitsNothingMixedBucketSkipsNaN) {
+    const std::string measurement = "nanfold";
+    const std::string seriesKey = "nanfold|zone=a|value";
+    SeriesId128 sid = SeriesId128::fromSeriesKey(seriesKey);
+
+    const uint64_t SEC = 1'000'000'000ULL;
+    const uint64_t INTERVAL = 60 * SEC;
+    const double NaN = std::numeric_limits<double>::quiet_NaN();
+
+    const uint64_t now0 = nowNs();
+    const uint64_t bucketC = ((now0 - 2 * ONE_HOUR_NS) / INTERVAL) * INTERVAL;
+    const uint64_t bucketB = bucketC - INTERVAL;      // mixed NaN
+    const uint64_t bucketA = bucketC - 2 * INTERVAL;  // all NaN
+    const uint64_t thresholdTarget = bucketC + INTERVAL;
+    const uint64_t recentTs = now0 - 60 * SEC;
+
+    std::vector<uint64_t> ts{
+        bucketA,  bucketA + 10 * SEC, bucketA + 20 * SEC,  // all NaN -> no point
+        bucketB,  bucketB + 10 * SEC, bucketB + 20 * SEC,  // 1.0, NaN, 3.0 -> avg 2.0
+        bucketC,  bucketC + 10 * SEC,                      // +Inf, -Inf -> NaN aggregate, EMITTED
+        recentTs,
+    };
+    std::vector<double> vals{
+        NaN, NaN, NaN, 1.0, NaN, 3.0, std::numeric_limits<double>::infinity(), -std::numeric_limits<double>::infinity(),
+        5.0,
+    };
+
+    auto file0 = self->makeFloatFile(0, 0, seriesKey, ts, vals);
+    co_await file0->open();
+    co_await file0->readSparseIndex();
+
+    auto policy = CompactionRetentionTest::downsamplePolicy(measurement, nowNs() - thresholdTarget, INTERVAL, "avg");
+    auto path = co_await self->compactWithPolicy({file0}, policy, sid);
+    co_await file0->close();
+    EXPECT_FALSE(path.empty());
+    if (path.empty()) {
+        co_return;
+    }
+
+    auto out = co_await CompactionRetentionTest::openAndReadFloat(path, seriesKey);
+
+    EXPECT_EQ(out.count(bucketA), 0u) << "an all-NaN bucket emitted a fabricated point at a bucket-start "
+                                         "timestamp that never existed in the data";
+    EXPECT_EQ(out.count(bucketB), 1u) << "mixed-NaN bucket must still emit";
+    if (out.count(bucketB)) {
+        EXPECT_DOUBLE_EQ(out.at(bucketB), 2.0) << "mixed-NaN bucket must aggregate the non-NaN values only";
+    }
+    EXPECT_EQ(out.count(bucketC), 1u) << "a DATA-DERIVED NaN (+Inf + -Inf) is the correct IEEE aggregate and must "
+                                         "still be emitted; the suppression rule is count==0, not isnan(result)";
+    if (out.count(bucketC)) {
+        EXPECT_TRUE(std::isnan(out.at(bucketC)));
+    }
+    EXPECT_EQ(out.count(recentTs), 1u);
+    EXPECT_EQ(out.size(), 3u) << "expected exactly: mixed bucket, Inf-Inf bucket, recent point";
 
     co_return;
 }

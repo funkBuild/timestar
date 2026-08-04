@@ -444,6 +444,7 @@ seastar::future<> TSM::readSparseIndex() {
         // Peek at first/last block metadata from the index for sparse lookups.
         uint64_t seriesMinTime = 0;
         uint64_t seriesMaxTime = 0;
+        uint32_t seriesPointCount = 0;
         double firstValue = 0.0;
         double latestValue = 0.0;
         bool hasExtStats = false;
@@ -458,6 +459,33 @@ seastar::future<> TSM::readSparseIndex() {
             std::memcpy(&seriesMinTime, indexSlice.data + blockStart, sizeof(uint64_t));
             // Last block: maxTime at offset 8
             std::memcpy(&seriesMaxTime, indexSlice.data + lastBlockStart + 8, sizeof(uint64_t));
+
+            // Sum the per-block point counts. This is the ONLY pass in this
+            // function that touches every block rather than just the first and
+            // last, and it exists so the age-driven downsample sweep can judge
+            // a series' stored density without a single disk read (see
+            // SparseIndexEntry::pointCount). It is a strided read over a buffer
+            // this function has already DMA'd in full, so the marginal cost is
+            // one pass over the index region — far below the read that fetched
+            // it. V1 non-Float entries carry no count and stay at 0, which the
+            // sweep reads as "unknown, do not act".
+            if (auto countOffset = indexBlockCountOffset(seriesType, fileVersion); countOffset.has_value()) {
+                const uint8_t* blockBase = indexSlice.data + blockStart + *countOffset;
+                // Saturating: the accumulator is uint32 (it lives in an
+                // alignment hole, see SparseIndexEntry::pointCount) and a
+                // corrupt index could otherwise wrap it to a small number,
+                // which the sweep would read as a genuinely sparse series.
+                // Saturation reads as "very dense", the safe direction.
+                for (uint32_t b = 0; b < blockCount; ++b) {
+                    uint32_t blockPoints = 0;
+                    std::memcpy(&blockPoints, blockBase + static_cast<size_t>(b) * perBlockBytes, sizeof(uint32_t));
+                    if (blockPoints > std::numeric_limits<uint32_t>::max() - seriesPointCount) {
+                        seriesPointCount = std::numeric_limits<uint32_t>::max();
+                        break;
+                    }
+                    seriesPointCount += blockPoints;
+                }
+            }
 
             // Float: blockFirstValue at offset 64, blockLatestValue at offset 72
             if (seriesType == TSMValueType::Float) {
@@ -532,6 +560,7 @@ seastar::future<> TSM::readSparseIndex() {
                                      .fileOffset = entryStartOffset,
                                      .entrySize = entrySize,
                                      .seriesType = seriesType,
+                                     .pointCount = seriesPointCount,
                                      .minTime = seriesMinTime,
                                      .maxTime = seriesMaxTime,
                                      .firstValue = firstValue,

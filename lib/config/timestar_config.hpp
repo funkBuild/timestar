@@ -189,6 +189,43 @@ struct EngineConfig {
     uint32_t retention_sweep_interval_minutes = 15;
     double tombstone_dead_fraction_threshold = 0.10;
     uint32_t max_tombstone_rewrites_per_sweep = 2;
+    // Age-driven downsample rewrites (Engine::sweepDownsampleRewrites), the
+    // third stage of the retention sweep. A tier merge only happens once
+    // files_per_merge files accumulate, so a series that stops receiving writes
+    // — a decommissioned RTU — is never re-compacted and stays at raw
+    // resolution forever. This stage lets AGE alone initiate the fold.
+    //
+    // 0 disables the stage outright.
+    uint32_t max_downsample_rewrites_per_sweep = 2;
+    // HYSTERESIS. A file is only rewritten when the estimated fold would divide
+    // its aged point count by at least this factor.
+    //
+    // Without it, a file already folded to its stage's bucket rate would be
+    // rewritten every sweep for the handful of points the advancing threshold
+    // newly covers.
+    //
+    // The window this has to sit inside is [1.0, 1.5]:
+    //
+    //  - CEILING ON A NO-OP: a series already folded to interval[k] holds at
+    //    most one point per occupied bucket, and the estimate's denominator is
+    //    span/interval + 1 >= the occupied bucket count. Its ratio is therefore
+    //    <= 1.0 EXACTLY, for every span. Anything above 1.0 rejects every no-op.
+    //  - FLOOR ON A REAL STAGE TRANSITION: the estimate counts BUCKETS, not
+    //    intervals, so a step from interval[k] to interval[k+1] = r*interval[k]
+    //    yields (m+1)/(floor(m/r)+1) for m spans — strictly BELOW r, and
+    //    approaching it only as m grows. Validation admits r as small as 2
+    //    (interval[k+1] need only be an exact multiple), and for r == 2 that
+    //    expression never reaches 2.0: it is 2 - 1/(m/2 + 1) at even m, whose
+    //    minimum over all m is 1.5.
+    //
+    // So the old default of 2.0 was not "the largest value admitting every legal
+    // cascade step" — it admitted NO 2x step at an even bucket count, and since
+    // the series is quiet by definition, m never changes and no later sweep
+    // could ever produce a different answer. Pinned by
+    // DownsampleSweepTest.TwoTimesCascadeStepIsAdmittedByTheHysteresisFactor.
+    //
+    // 1.25 keeps a 25% margin over the no-op ceiling and clears the 1.5 floor.
+    double downsample_rewrite_min_reduction_factor = 1.25;
     IOPriorityConfig io_priority;
 };
 
@@ -318,7 +355,9 @@ struct glz::meta<timestar::EngineConfig> {
         "metadata_retry_interval_seconds", &T::metadata_retry_interval_seconds, "max_metadata_retry_ops",
         &T::max_metadata_retry_ops, "retention_sweep_interval_minutes", &T::retention_sweep_interval_minutes,
         "tombstone_dead_fraction_threshold", &T::tombstone_dead_fraction_threshold, "max_tombstone_rewrites_per_sweep",
-        &T::max_tombstone_rewrites_per_sweep, "io_priority", &T::io_priority);
+        &T::max_tombstone_rewrites_per_sweep, "max_downsample_rewrites_per_sweep",
+        &T::max_downsample_rewrites_per_sweep, "downsample_rewrite_min_reduction_factor",
+        &T::downsample_rewrite_min_reduction_factor, "io_priority", &T::io_priority);
 };
 
 template <>

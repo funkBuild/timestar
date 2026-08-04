@@ -13,6 +13,7 @@
 #include "subscription_manager.hpp"
 #include "timestar_config.hpp"
 #include "timestar_value.hpp"
+#include "tsm_compactor.hpp"  // RetentionCompactionContext (compaction retention provider)
 #include "tsm_file_manager.hpp"
 #include "wal.hpp"
 #include "wal_file_manager.hpp"
@@ -27,6 +28,23 @@
 #include <seastar/core/sharded.hh>
 #include <seastar/core/timer.hh>
 #include <vector>
+
+// What the age-driven downsample sweep (Engine::sweepDownsampleRewrites)
+// actually did, cumulative per shard.
+//
+// `seriesEnumerations` and `filesExamined` are the observable proof that the
+// no-policy case costs nothing: they are the sweep's ONLY index reads and its
+// ONLY per-series work respectively, so both staying at zero is the difference
+// between "found no candidates" and "never looked". Without a counter that
+// distinction is invisible from outside the process — which is how the original
+// retention wiring stayed broken through a green suite.
+struct DownsampleSweepStats {
+    uint64_t sweeps = 0;              // times the stage was entered (with the stage enabled)
+    uint64_t seriesEnumerations = 0;  // index prefix scans issued (the only I/O)
+    uint64_t filesExamined = 0;       // files whose sparse index was walked
+    uint64_t candidateFiles = 0;      // files that passed the density test
+    uint64_t rewrites = 0;            // rewrites started (bounded by the per-sweep cap)
+};
 
 class Engine {
 private:
@@ -82,6 +100,114 @@ private:
             _seriesTypeCache.clear();
         _seriesTypeCache[seriesId] = type;
     }
+
+    // --- SeriesId -> measurement cache (shard-local) ---
+    //
+    // Feeds the compaction retention provider, which needs a measurement name
+    // for each series in a merge's INPUT FILES.
+    //
+    // An entry mapping to a real measurement name is a PERMANENT fact: a
+    // SeriesId128 hashes measurement+tags+field, so the mapping is immutable
+    // once known and can never go stale.
+    //
+    // An entry mapping to the EMPTY STRING is the negative sentinel: "this
+    // series belongs to no measurement that currently has a policy". That is
+    // the one policy-DEPENDENT thing in here, produced by the bulk resolution
+    // path below (which learns membership rather than identity), so every
+    // mutator of _retentionPolicies drops the cache — see
+    // invalidateSeriesMeasurementCache().
+    //
+    // A miss always re-resolves through the index, which is what makes
+    // clearing the whole map on overflow safe (same argument as
+    // _seriesTypeCache). 128k entries is ~8 MB worst case.
+    std::unordered_map<SeriesId128, std::string, SeriesId128::Hash> _seriesMeasurementCache;
+    static constexpr size_t MAX_SERIES_MEASUREMENT_CACHE = 128'000;
+
+    void cacheSeriesMeasurement(const SeriesId128& seriesId, const std::string& measurement) {
+        if (_seriesMeasurementCache.size() >= MAX_SERIES_MEASUREMENT_CACHE)
+            _seriesMeasurementCache.clear();
+        _seriesMeasurementCache[seriesId] = measurement;
+    }
+
+    // --- SeriesId -> field cache (shard-local) ---
+    //
+    // Feeds per-field downsample methods (Phase 4). Populated ONLY for series
+    // whose measurement declares `fieldMethods`, so a deployment that never
+    // uses the feature never allocates an entry.
+    //
+    // Every entry is a PERMANENT fact for the same reason the measurement cache
+    // is: a SeriesId128 hashes measurement+tags+field, so a series' field is
+    // immutable. There is deliberately NO negative sentinel here — every series
+    // has a field, so "absent" only ever means "not yet looked up", which makes
+    // this cache policy-INDEPENDENT and exempt from
+    // invalidateSeriesMeasurementCache(). (It is cleared there anyway, only
+    // because a policy change is also the moment the set of interesting series
+    // changes and the memory is better spent on the new one.)
+    std::unordered_map<SeriesId128, std::string, SeriesId128::Hash> _seriesFieldCache;
+
+    // At the cap, STOP ADMITTING rather than clear.
+    //
+    // The measurement cache clears wholesale because a miss there re-resolves
+    // through a single 0x0A prefix scan (~40 ms for a whole measurement). A miss
+    // HERE costs one sequential 0x05 point lookup PER SERIES — there is no bulk
+    // source for a series' field — so a wholesale clear is far more expensive:
+    // a single resolution pass larger than the cap would evict everything it had
+    // just learned and leave the cache holding one entry, turning a one-off cold
+    // cost into the same cost on EVERY subsequent merge, forever.
+    //
+    // Retaining instead is sound because every entry is an immutable fact (a
+    // SeriesId128 hashes measurement+tags+field, so a series' field can never
+    // change) and because the one moment the interesting set genuinely shifts —
+    // a policy change — clears this cache outright via
+    // invalidateSeriesMeasurementCache(). Memory is bounded identically.
+    void cacheSeriesField(const SeriesId128& seriesId, const std::string& field) {
+        if (_seriesFieldCache.size() >= MAX_SERIES_MEASUREMENT_CACHE && !_seriesFieldCache.contains(seriesId))
+            return;
+        _seriesFieldCache[seriesId] = field;
+    }
+
+    // Drop the cache when the policy set changes: the negative sentinels above
+    // are only valid relative to the policy set that produced them.
+    //
+    // Clearing alone is NOT sufficient, because the resolution that produces
+    // sentinels suspends: a provider call that snapshotted the OLD policy set
+    // before its index scan writes its sentinels AFTER this clear, repoisoning
+    // the cache with answers about a policy set that no longer exists — and
+    // nothing invalidates again until the next policy change, so the affected
+    // series stay silently exempt from TTL and downsampling forever. The
+    // generation counter is what lets a resuming resolution notice that its
+    // snapshot was superseded and drop its sentinels; see
+    // buildCompactionRetentionContext(). Positive entries need no such guard:
+    // a SeriesId128 hashes measurement+tags+field, so an id's measurement is
+    // immutable and policy-independent.
+    void invalidateSeriesMeasurementCache() {
+        _seriesMeasurementCache.clear();
+        _seriesFieldCache.clear();
+        ++_retentionPolicyGeneration;
+    }
+
+    // Bumped by every mutation of _retentionPolicies (see the three cache
+    // mutators). Only ever compared for equality.
+    uint64_t _retentionPolicyGeneration = 0;
+
+    // Cumulative counters for the age-driven downsample sweep; see
+    // getDownsampleSweepStats().
+    DownsampleSweepStats _downsampleSweepStats;
+
+    // Above this many unresolved ids, resolve by MEASUREMENT (one 0x0A
+    // prefix scan per policy-bearing measurement) instead of by ID (one
+    // bloom-filtered point lookup each).
+    //
+    // Measured on a 100k-series shard: resolving all 100k ids through
+    // getSeriesMetadataBatch cost 6.9 s cold (~70 us per bloom-filtered kvGet,
+    // issued strictly sequentially — queue-depth-1 latency, not work), and up
+    // to 58 s under I/O contention. The 0x0A prefix scan answering the same
+    // question for the whole measurement costs 20-230 ms, and the whole
+    // provider call end to end drops to ~40 ms. Merges can run every few
+    // seconds, so the per-id path is only affordable for small unresolved
+    // sets — a tombstone rewrite of one small file, or the trickle of
+    // genuinely new series after the cache has warmed.
+    static constexpr size_t MAX_UNRESOLVED_FOR_PER_ID_LOOKUP = 4096;
 
     // --- Streaming subscription manager (per-shard) ---
     timestar::SubscriptionManager _subscriptionManager;
@@ -276,6 +402,62 @@ public:
     // and rewrites them at the same tier to reclaim space. Runs on every shard.
     seastar::future<> sweepTombstoneRewrites();
 
+    // Third stage of the retention sweep: AGE-DRIVEN DOWNSAMPLING.
+    //
+    // A tier merge needs files_per_merge files to accumulate, so a series that
+    // stops receiving writes is never re-compacted and never folds, however old
+    // its data gets. This finds files holding aged, still-too-dense data and
+    // rewrites them in place (single file, same tier) so the Phase 1 retention
+    // provider applies the cascade.
+    //
+    // The candidate test performs NO I/O — it reads only the resident sparse
+    // index — and the sweep is self-limiting with no persisted watermark: an
+    // already-folded series' stored density sits at ~1 point per bucket and
+    // fails the hysteresis check. Runs on every shard.
+    //
+    // Public so tests can drive one sweep deterministically instead of waiting
+    // out the 15-minute timer.
+    seastar::future<> sweepDownsampleRewrites();
+
+    // What the age-driven downsample stage actually did, cumulative per shard.
+    const DownsampleSweepStats& getDownsampleSweepStats() const { return _downsampleSweepStats; }
+
+    // Retention context provider for the compactor, installed in init().
+    //
+    // Public so tests can drive it directly — the wiring it replaces went
+    // unnoticed for exactly as long as it did because every retention test
+    // entered BELOW this layer.
+    //
+    // Returns empty maps without touching the index when no policy on this
+    // shard carries a TTL or a downsample clause (the common case). Throws on
+    // an index failure, which fails the compaction rather than silently
+    // compacting without retention.
+    seastar::future<RetentionCompactionContext> buildCompactionRetentionContext(
+        const std::vector<SeriesId128>& seriesIds);
+
+    // Second half of the context: seriesId -> FIELD, for the series whose
+    // measurement declares per-field downsample methods. Returns immediately
+    // when no policy does — see the cost contract on the definition.
+    //
+    // Public for the same reason the provider is: tests must be able to observe
+    // that the default path performs no field resolution.
+    seastar::future<RetentionCompactionContext> attachFieldOverrides(RetentionCompactionContext ctx);
+
+    // Entries currently resolved in the seriesId -> field cache. Zero on every
+    // shard whose policies name no `fieldMethods`, which is what makes the
+    // "costs nothing by default" claim observable rather than asserted.
+    size_t seriesFieldCacheSize() const { return _seriesFieldCache.size(); }
+
+    // Does any policy on this shard carry a TTL or a usable downsample clause?
+    // Injected into the compactor alongside the provider so a merge on a shard
+    // with no (effective) policy skips even enumerating its series ids.
+    bool hasActionableRetentionPolicy() const;
+
+    // Entries currently resolved in the seriesId -> measurement cache. Exposed
+    // so tests can observe that the no-policy fast path performed no index
+    // resolution at all (a resolution always populates this cache).
+    size_t seriesMeasurementCacheSize() const { return _seriesMeasurementCache.size(); }
+
     // Get reference to the index for this shard
     timestar::index::NativeIndex& getIndex() { return index; }
 
@@ -291,6 +473,9 @@ public:
     // background work actually landed in its scheduling group -- the original
     // bug was invisible precisely because nothing could observe this.
     const TSMFileManager& getTSMFileManager() const { return tsmFileManager; }
+    // Mutable access, for tests that must drive a merge deterministically
+    // (compactOneTier) instead of waiting on the background loop.
+    TSMFileManager& getTSMFileManager() { return tsmFileManager; }
     const timestar::EngineMetrics& getMetrics() const { return _metrics; }
 
     // Compaction health. A tier that can never merge is otherwise invisible from

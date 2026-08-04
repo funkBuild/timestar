@@ -343,8 +343,17 @@ struct ParsedRetentionPutRequest {
         std::string interval;
         uint64_t intervalNanos = 0;
         std::string method;
+        // Per-field method overrides; empty means "no overrides", which is what
+        // a client that predates the field always sends.
+        std::map<std::string, std::string> fieldMethods;
     };
+    // Legacy single-tier field, kept for clients that predate the cascade.
     std::optional<DownsampleData> downsample;
+    // Canonical ordered cascade. When non-empty it WINS over `downsample`;
+    // when empty the legacy field is promoted to a one-element cascade by the
+    // handler. proto3 repeated-absent is empty, so old clients land here with
+    // nothing set and are unaffected.
+    std::vector<DownsampleData> downsampleTiers;
 };
 
 // Parse a RetentionPutRequest proto from raw bytes.
@@ -355,7 +364,10 @@ struct RetentionPolicyData {
     std::string measurement;
     std::string ttl;
     uint64_t ttlNanos = 0;
+    // Mirrors the wire message: `downsample` is the legacy view of
+    // downsampleTiers[0], emitted alongside the full cascade.
     std::optional<ParsedRetentionPutRequest::DownsampleData> downsample;
+    std::vector<ParsedRetentionPutRequest::DownsampleData> downsampleTiers;
 };
 
 // Format retention get response as serialized RetentionGetResponse proto bytes.
