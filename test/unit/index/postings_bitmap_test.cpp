@@ -327,3 +327,54 @@ SEASTAR_TEST_F(PostingsBitmapTest, MigrationFromPhase1) {
         co_await index.close();
     }
 }
+
+// Regression: the measurement bloom must never acquire a false negative.
+//
+// Production (2026-08-25, 1.4.0): scoped lookups returned NO series for ~52% of
+// tag values that findSeries-by-prefix (`by {tag}`) could enumerate. Sequence:
+// a session opens with persisted postings for A; the first bloom rebuild does
+// the full KV scan and sets bloomFullyBuilt_; nothing loads A's bitmap into
+// bitmapCache_ (existing-series inserts short-circuit on the series cache, and
+// the scan itself does not populate the cache); the next rebuild trusts the
+// flag and rebuilds from the cache alone, so A's key drops out of the bloom
+// and getPostingsBitmapByKey short-circuits to "no such series" forever.
+SEASTAR_TEST_F(PostingsBitmapTest, BloomRebuildKeepsSeriesNotResidentInCache) {
+    SeriesId128 idA;
+    {
+        NativeIndex index(0);
+        co_await index.open();
+        idA = co_await createSeries(index, "deviceData", {{"deviceName", "GW85"}}, "valveSetpoint");
+        co_await index.close();  // persists postings + a bloom containing GW85
+    }
+
+    NativeIndex index(0);
+    co_await index.open();  // fresh caches: GW85's bitmap is NOT resident
+
+    // Rebuild #1 — no full-scan record yet, so it scans KV and sees GW85.
+    // Deliberately NO lookup of GW85 in between: a read would load its bitmap
+    // into the cache and mask the defect (which is exactly why tag values on
+    // a frequently viewed dashboard survived in production and the rest did not).
+    co_await createSeries(index, "deviceData", {{"deviceName", "GW001"}}, "valveSetpoint");
+    co_await index.compact();
+
+    // Rebuild #2 in the same session — was built from bitmapCache_ only.
+    co_await createSeries(index, "deviceData", {{"deviceName", "GW002"}}, "valveSetpoint");
+    co_await index.compact();
+
+    // GW85 was never loaded into the cache by anything above, so a cache-only
+    // rebuild loses it. The scoped lookup must still find it.
+    auto found2 = co_await index.findSeriesByTag("deviceData", "deviceName", "GW85");
+    EXPECT_EQ(found2.size(), 1u) << "GW85 vanished from the measurement bloom";
+    if (!found2.empty()) EXPECT_EQ(found2[0], idA);
+
+    // And the multi-tag intersection path, which the console's scoped queries use.
+    auto scoped = co_await index.findSeries("deviceData", {{"deviceName", "GW85"}});
+    EXPECT_TRUE(scoped.has_value());
+    if (scoped.has_value()) EXPECT_EQ(scoped->size(), 1u);
+
+    // Enumeration never used the bloom and always saw all three.
+    auto grouped = co_await index.getSeriesGroupedByTag("deviceData", "deviceName");
+    EXPECT_EQ(grouped.size(), 3u);
+
+    co_await index.close();
+}

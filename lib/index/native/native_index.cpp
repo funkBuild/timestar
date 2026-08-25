@@ -326,6 +326,22 @@ seastar::future<> NativeIndex::open() {
     // This avoids scanning all HLL/bloom KV entries at startup, which can stall for
     // 10K+ measurements.
 
+    // Schedule a one-time rebuild of every measurement's persisted bloom at the
+    // first flush. Blooms written by versions <= 1.4.0 can carry false negatives
+    // (flushDirtyMeasurementBlooms rebuilt from the bitmap cache alone), and a
+    // bloom is otherwise only rebuilt when its measurement gains a new series —
+    // so without this, a quiet measurement would keep hiding series indefinitely
+    // after the upgrade. Lazy loading above is unaffected: this only marks names.
+    {
+        auto measurements = co_await getAllMeasurements();
+        for (auto& m : measurements) {
+            dirtyMeasurementBlooms_.insert(m);
+        }
+        if (!measurements.empty()) {
+            ::native_index_log.info("Scheduled bloom rebuild for {} measurements at next flush", measurements.size());
+        }
+    }
+
     ::native_index_log.info("NativeIndex opened at: {} ({} SSTables, {} MemTable entries, {} local IDs)", indexPath_,
                             manifest_->files().size(), memtable_->size(), localIdMap_.size());
 }
@@ -2404,10 +2420,8 @@ void NativeIndex::trimBitmapCache() {
     // enforced independently of the entry count: a few thousand huge bitmaps
     // can blow the memory budget while staying far under the entry cap
     // (previously the loop broke on entry count alone, making the byte budget
-    // dead code). Evicting a persisted postings entry also invalidates the
-    // measurement's bloomFullyBuilt_ claim — the next bloom rebuild must
-    // re-scan KV or it would persist a bloom missing the evicted keys
-    // (false negatives = series silently invisible).
+    // dead code). Eviction needs no bookkeeping for the measurement bloom:
+    // flushDirtyMeasurementBlooms always re-scans the persisted keys.
     const size_t entryTarget = MAX_BITMAP_CACHE_ENTRIES / 2;  // evict to 50% to avoid thrashing
     const size_t byteTarget = maxBitmapCacheBytes() / 2;
     for (auto it = bitmapCache_.begin(); it != bitmapCache_.end();) {
@@ -2418,10 +2432,6 @@ void NativeIndex::trimBitmapCache() {
         if (!it->second.dirty) {
             if (overBytes) {
                 totalBytes -= it->second.approxBytes + it->first.size();
-            }
-            auto nullPos = it->first.find('\0');
-            if (nullPos != std::string::npos) {
-                bloomFullyBuilt_.erase(it->first.substr(0, nullPos));
             }
             it = bitmapCache_.erase(it);
         } else {
@@ -2560,7 +2570,6 @@ void NativeIndex::trimMeasurementBloomCache() {
             break;
         if (dirtyMeasurementBlooms_.count(it->first) == 0) {
             bytes -= std::min(bytes, it->second.filterSize() + it->first.size());
-            bloomFullyBuilt_.erase(it->first);
             it = measurementBloomCache_.erase(it);
         } else {
             ++it;
@@ -2960,19 +2969,27 @@ seastar::future<> NativeIndex::flushDirtyMeasurementBlooms(IndexWriteBatch& batc
             bloom.addKey(bitmapKvKey);
         }
 
-        // Only scan KV store if we haven't done a full scan for this measurement yet.
-        // After getOrCreateSeriesId, the cache contains all bitmap entries for the measurement,
-        // so the KV scan only adds entries from prior sessions (before this process opened).
-        if (bloomFullyBuilt_.find(measurement) == bloomFullyBuilt_.end()) {
-            std::string kvScanPrefix;
-            kvScanPrefix.push_back(static_cast<char>(POSTINGS_BITMAP));
-            kvScanPrefix.append(measPrefix);
-            co_await kvPrefixScan(kvScanPrefix, [&](std::string_view key, std::string_view) {
-                bloom.addKey(key);
-                return true;
-            });
-            bloomFullyBuilt_.insert(measurement);
-        }
+        // ALWAYS scan the persisted postings keys too. This used to be skipped
+        // after one full scan per measurement (a bloomFullyBuilt_ flag) on the
+        // premise that bitmapCache_ then held every bitmap for the measurement.
+        // It does not: the scan never populates the cache, inserts for an
+        // existing series short-circuit on the series cache and never touch its
+        // bitmap, and a read only loads a bitmap if the bloom lets it through.
+        // So any tag value not queried since the last full scan was absent from
+        // the cache, dropped out of the next cache-only rebuild, and from then
+        // on getPostingsBitmapByKey rejected it before ever reaching KV — a
+        // false negative that made the series permanently invisible to scoped
+        // queries (~52% of one production measurement, 2026-08-25). A bloom is
+        // only ever allowed false positives; the scan is the price of that.
+        // Duplicate keys between the cache pass above and this scan are
+        // harmless — adding a key twice is idempotent.
+        std::string kvScanPrefix;
+        kvScanPrefix.push_back(static_cast<char>(POSTINGS_BITMAP));
+        kvScanPrefix.append(measPrefix);
+        co_await kvPrefixScan(kvScanPrefix, [&](std::string_view key, std::string_view) {
+            bloom.addKey(key);
+            return true;
+        });
 
         bloom.build();
 
