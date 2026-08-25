@@ -400,7 +400,6 @@ private:
     // Per-measurement bloom filter of all LocalIds (for short-circuiting non-existent tag lookups)
     tsl::robin_map<std::string, BloomFilter> measurementBloomCache_;
     std::unordered_set<std::string> dirtyMeasurementBlooms_;
-    std::unordered_set<std::string> bloomFullyBuilt_;  // Measurements where bloom KV scan already done
     // Count-bounding this was wrong: BloomFilter::build() sizes from the number
     // of distinct tag values in the measurement, so one entry ranges from 8 KB to
     // megabytes. At 5000 entries the "~40MB" assumed a fixed 8 KB entry; at the
