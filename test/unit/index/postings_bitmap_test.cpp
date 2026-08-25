@@ -25,8 +25,10 @@
 
 using namespace timestar::index;
 
+namespace timestar::index {
 // Plants a persisted measurement bloom that omits some postings keys — what a
 // <= 1.4.0 server could leave on disk — bypassing every normal write path.
+// Lives in timestar::index because that is where NativeIndex befriends it.
 struct NativeIndexTestAccess {
     static seastar::future<> plantStaleBloom(NativeIndex& index, const std::string& measurement,
                                              const std::vector<std::string>& postingsKeysToKeep) {
@@ -41,6 +43,7 @@ struct NativeIndexTestAccess {
         index.measurementBloomCache_.erase(measurement);
     }
 };
+}  // namespace timestar::index
 
 class PostingsBitmapTest : public ::testing::Test {
 public:
