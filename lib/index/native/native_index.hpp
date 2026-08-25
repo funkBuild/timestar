@@ -235,7 +235,16 @@ public:
     // (including the origin shard's own) is a harmless union no-op.
     seastar::future<> applySchemaUpdate(SchemaUpdate update);
 
+    // Rebuild and persist the bloom of every measurement currently marked
+    // dirty. open() marks them all, so a fresh process serves correct blooms
+    // from its first request; nothing else has to wait for a memtable flush.
+    seastar::future<> rebuildMeasurementBlooms();
+
 private:
+    // Test seam: lets a unit test plant a deliberately stale persisted bloom
+    // to prove open() repairs it. Not used by production code.
+    friend struct NativeIndexTestAccess;
+
     int shardId_;
     std::string indexPath_;
 
