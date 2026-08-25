@@ -12,6 +12,8 @@
  */
 
 #include "../../../lib/index/native/native_index.hpp"
+#include "../../../lib/index/native/bloom_filter.hpp"
+#include "../../../lib/index/key_encoding.hpp"
 #include "../../../lib/core/series_id.hpp"
 #include "../../seastar_gtest.hpp"
 
@@ -22,6 +24,26 @@
 #include <string>
 
 using namespace timestar::index;
+
+namespace timestar::index {
+// Plants a persisted measurement bloom that omits some postings keys — what a
+// <= 1.4.0 server could leave on disk — bypassing every normal write path.
+// Lives in timestar::index because that is where NativeIndex befriends it.
+struct NativeIndexTestAccess {
+    static seastar::future<> plantStaleBloom(NativeIndex& index, const std::string& measurement,
+                                             const std::vector<std::string>& postingsKeysToKeep) {
+        BloomFilter bloom(10);
+        for (const auto& key : postingsKeysToKeep) {
+            bloom.addKey(key);
+        }
+        bloom.build();
+        std::string serialized;
+        bloom.serializeTo(serialized);
+        co_await index.kvPut(keys::encodeMeasurementBloomKey(measurement), serialized);
+        index.measurementBloomCache_.erase(measurement);
+    }
+};
+}  // namespace timestar::index
 
 class PostingsBitmapTest : public ::testing::Test {
 public:
@@ -376,5 +398,47 @@ SEASTAR_TEST_F(PostingsBitmapTest, BloomRebuildKeepsSeriesNotResidentInCache) {
     auto grouped = co_await index.getSeriesGroupedByTag("deviceData", "deviceName");
     EXPECT_EQ(grouped.size(), 3u);
 
+    co_await index.close();
+}
+
+// A server that wrote a bloom missing persisted postings keys (any <= 1.4.0)
+// must be fully repaired by the NEXT open(), before it serves anything — not at
+// some later memtable flush that a quiet measurement may never trigger.
+SEASTAR_TEST_F(PostingsBitmapTest, OpenRepairsStalePersistedBloomImmediately) {
+    SeriesId128 idA;
+    {
+        NativeIndex index(0);
+        co_await index.open();
+        idA = co_await createSeries(index, "deviceData", {{"deviceName", "GW85"}}, "valveSetpoint");
+        co_await createSeries(index, "deviceData", {{"deviceName", "GW001"}}, "valveSetpoint");
+        co_await index.close();
+    }
+
+    // Session 2: overwrite the persisted bloom with one that only knows GW001,
+    // AFTER open() has done its repair, and shut down with nothing else dirty
+    // so the stale bloom is what remains on disk.
+    {
+        NativeIndex index(0);
+        co_await index.open();
+        auto onlyGW001 = keys::encodePostingsBitmapPrefix("deviceData", "deviceName") + "GW001";
+        co_await NativeIndexTestAccess::plantStaleBloom(index, "deviceData", {onlyGW001});
+
+        // Control: with the stale bloom in place, the scoped lookup is blind.
+        auto blind = co_await index.findSeriesByTag("deviceData", "deviceName", "GW85");
+        EXPECT_EQ(blind.size(), 0u) << "test precondition: the planted bloom should hide GW85";
+
+        co_await index.close();
+    }
+
+    // Session 3: a bare open() must have rebuilt the bloom from the persisted
+    // postings keys. No flush, no enumeration, no other activity first.
+    NativeIndex index(0);
+    co_await index.open();
+    auto found = co_await index.findSeriesByTag("deviceData", "deviceName", "GW85");
+    EXPECT_EQ(found.size(), 1u) << "open() did not repair the stale bloom";
+    if (!found.empty()) EXPECT_EQ(found[0], idA);
+    auto scoped = co_await index.findSeries("deviceData", {{"deviceName", "GW85"}});
+    EXPECT_TRUE(scoped.has_value());
+    if (scoped.has_value()) EXPECT_EQ(scoped->size(), 1u);
     co_await index.close();
 }

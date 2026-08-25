@@ -326,19 +326,23 @@ seastar::future<> NativeIndex::open() {
     // This avoids scanning all HLL/bloom KV entries at startup, which can stall for
     // 10K+ measurements.
 
-    // Schedule a one-time rebuild of every measurement's persisted bloom at the
-    // first flush. Blooms written by versions <= 1.4.0 can carry false negatives
-    // (flushDirtyMeasurementBlooms rebuilt from the bitmap cache alone), and a
-    // bloom is otherwise only rebuilt when its measurement gains a new series —
-    // so without this, a quiet measurement would keep hiding series indefinitely
-    // after the upgrade. Lazy loading above is unaffected: this only marks names.
+    // Rebuild every measurement's persisted bloom NOW, before serving. Blooms
+    // written by versions <= 1.4.0 can carry false negatives (they were rebuilt
+    // from the bitmap cache alone), and a bloom is otherwise only rewritten when
+    // its measurement gains a new series AND the index memtable flushes — which
+    // in a steady fleet can be days. 1.4.1 merely marked them dirty "for the
+    // next flush", and that flush never came. Doing it here costs one postings
+    // prefix scan per measurement (seconds for a few thousand) and makes the
+    // invariant "bloom contains every persisted postings key" hold from the
+    // first request of every process, whatever a previous version wrote.
     {
         auto measurements = co_await getAllMeasurements();
         for (auto& m : measurements) {
             dirtyMeasurementBlooms_.insert(m);
         }
         if (!measurements.empty()) {
-            ::native_index_log.info("Scheduled bloom rebuild for {} measurements at next flush", measurements.size());
+            co_await rebuildMeasurementBlooms();
+            ::native_index_log.info("Rebuilt blooms for {} measurements", measurements.size());
         }
     }
 
@@ -354,10 +358,15 @@ seastar::future<> NativeIndex::close() {
         co_await walSyncGate_.close();
     }
 
-    // Wait for any in-flight background flush, then flush remaining data
+    // Wait for any in-flight background flush, then flush remaining data.
+    // Unconditional: flushMemTable() persists the dirty bitmap/day-bitmap/HLL/
+    // bloom caches BEFORE it checks whether the memtable is empty, and returns
+    // early when it is. Gating on the memtable alone dropped a pending bloom
+    // rebuild (and any other dirty cache) on every clean shutdown that happened
+    // to have no new index entries.
     try {
         co_await waitForFlush();
-        if (memtable_ && !memtable_->empty()) {
+        if (memtable_) {
             co_await flushMemTable();
         }
     } catch (const std::exception& e) {
@@ -2917,6 +2926,18 @@ void NativeIndex::flushDirtyHLLs(IndexWriteBatch& batch) {
         batch.put(kvKey, serialized);
     }
     hllCacheDirty_.clear();
+}
+
+seastar::future<> NativeIndex::rebuildMeasurementBlooms() {
+    IndexWriteBatch batch;
+    co_await flushDirtyMeasurementBlooms(batch);
+    if (batch.empty()) {
+        co_return;
+    }
+    // Same durability order as flushMemTable(): WAL first, then the memtable,
+    // so a crash in between replays the new blooms rather than losing them.
+    co_await wal_->append(batch);
+    batch.applyTo(*memtable_);
 }
 
 seastar::future<> NativeIndex::flushDirtyMeasurementBlooms(IndexWriteBatch& batch) {
