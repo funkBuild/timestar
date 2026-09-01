@@ -3309,12 +3309,17 @@ seastar::future<SeriesId128> NativeIndex::indexInsert(const TimeStarInsert<T>& i
                 if ((co_await getOrLoadDayBitmapForInsert(dayCacheKey))->addChecked(localId)) {
                     newDayMembership = true;
                 }
+                noteRecordedDay(day);
                 lastDay = day;
             }
         }
         if (newDayMembership) {
             invalidateDiscoveryCache(insert.measurement);
         }
+    }
+
+    if (!localIdOpt.has_value()) {
+        warnMissingLocalId(insert.measurement, seriesId);
     }
 
     std::string fieldTypeCacheKey;
