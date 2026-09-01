@@ -134,6 +134,12 @@ struct NativeIndexTestAccess {
         co_await index.kvPut(ke::encodeDayBitmapWatermarkKey(), ke::encodeDay(lastDurableDay));
     }
 
+    // Make the coming close() look like a process that died: no clean-shutdown
+    // marker, so the next open() repairs. A test cannot kill the process, and
+    // without this every test that shuts down tidily would skip the repair it
+    // means to exercise.
+    static void simulateUncleanShutdown(NativeIndex& index) { index.suppressCleanShutdownMarker(); }
+
     // True when a day bitmap for (measurement, day) is durable — the state a
     // recovery pass has to restore. Deliberately reads the KV store only, not
     // the cache.

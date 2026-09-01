@@ -247,6 +247,17 @@ seastar::future<> NativeIndex::open() {
     });
     walSyncTimer_.arm_periodic(kWalSyncInterval);
 
+    // Did the previous session shut down cleanly? Read BEFORE the marker is
+    // cleared, and cleared immediately so that a crash from this point on is
+    // indistinguishable from any other crash: absent means repair.
+    {
+        auto cleanVal = co_await kvGet(ke::encodeCleanShutdownKey());
+        openedCleanly_ = cleanVal.has_value();
+        if (openedCleanly_) {
+            co_await kvDelete(ke::encodeCleanShutdownKey());
+        }
+    }
+
     // Day-bitmap durability. The watermark is the day through which membership
     // was durable at the last flush; Engine::rebuildDayBitmaps() reconstructs
     // from there. Loaded before any recording so the first flush cannot lower it.
@@ -398,13 +409,28 @@ seastar::future<> NativeIndex::close() {
     // early when it is. Gating on the memtable alone dropped a pending bloom
     // rebuild (and any other dirty cache) on every clean shutdown that happened
     // to have no new index entries.
+    bool flushedCleanly = true;
     try {
         co_await waitForFlush();
         if (memtable_) {
             co_await flushMemTable();
         }
     } catch (const std::exception& e) {
+        flushedCleanly = false;
         ::native_index_log.warn("Failed to flush MemTable on close: {} — data preserved in WAL", e.what());
+    }
+
+    // Only now, with every dirty cache persisted, may the next open() skip the
+    // day-bitmap repair. A failed flush above leaves the marker absent, exactly
+    // as a crash would, so the repair runs — which is the point: this marker may
+    // only ever say "clean" when it is provably true.
+    if (flushedCleanly && !suppressCleanMarker_) {
+        try {
+            co_await kvPut(ke::encodeCleanShutdownKey(), "1");
+        } catch (const std::exception& e) {
+            ::native_index_log.warn("Could not record clean shutdown: {} — next open will repair day bitmaps",
+                                    e.what());
+        }
     }
 
     // Close all SSTable readers (Step 4: map-keyed)
@@ -761,12 +787,22 @@ seastar::future<> NativeIndex::maybeFlushMemTable() {
     if (!bitmapCache_.empty() || !dayBitmapCache_.empty() || !hllCacheDirty_.empty() ||
         !dirtyMeasurementBlooms_.empty()) {
         IndexWriteBatch postingsBatch;
-        flushDirtyBitmaps(postingsBatch);
-        flushDirtyDayBitmaps(postingsBatch);
-        flushDirtyHLLs(postingsBatch);
-        co_await flushDirtyMeasurementBlooms(postingsBatch);
+        FlushRollback rollback;
+        rollback.lastFlushedLocalId = lastFlushedLocalId_;
+        rollback.dayBitmapWatermark = dayBitmapWatermark_;
+        flushDirtyBitmaps(postingsBatch, &rollback.bitmapKeys);
+        flushDirtyDayBitmaps(postingsBatch, &rollback.dayBitmapKeys);
+        flushDirtyHLLs(postingsBatch, &rollback.hllKeys);
+        co_await flushDirtyMeasurementBlooms(postingsBatch, &rollback.bloomMeasurements);
         if (!postingsBatch.empty()) {
-            co_await wal_->append(postingsBatch);
+            // Nothing above is durable until this returns; a failure that left
+            // the caches marked clean would silently drop membership.
+            try {
+                co_await wal_->append(postingsBatch);
+            } catch (...) {
+                restoreAfterFailedFlush(rollback);
+                throw;
+            }
             postingsBatch.applyTo(*memtable_);
         }
         // Evict non-dirty cache entries to bound memory growth
@@ -809,12 +845,22 @@ seastar::future<> NativeIndex::flushMemTable() {
     if (!bitmapCache_.empty() || !dayBitmapCache_.empty() || !hllCacheDirty_.empty() ||
         !dirtyMeasurementBlooms_.empty()) {
         IndexWriteBatch postingsBatch;
-        flushDirtyBitmaps(postingsBatch);
-        flushDirtyDayBitmaps(postingsBatch);
-        flushDirtyHLLs(postingsBatch);
-        co_await flushDirtyMeasurementBlooms(postingsBatch);
+        FlushRollback rollback;
+        rollback.lastFlushedLocalId = lastFlushedLocalId_;
+        rollback.dayBitmapWatermark = dayBitmapWatermark_;
+        flushDirtyBitmaps(postingsBatch, &rollback.bitmapKeys);
+        flushDirtyDayBitmaps(postingsBatch, &rollback.dayBitmapKeys);
+        flushDirtyHLLs(postingsBatch, &rollback.hllKeys);
+        co_await flushDirtyMeasurementBlooms(postingsBatch, &rollback.bloomMeasurements);
         if (!postingsBatch.empty()) {
-            co_await wal_->append(postingsBatch);
+            // Nothing above is durable until this returns; a failure that left
+            // the caches marked clean would silently drop membership.
+            try {
+                co_await wal_->append(postingsBatch);
+            } catch (...) {
+                restoreAfterFailedFlush(rollback);
+                throw;
+            }
             postingsBatch.applyTo(*memtable_);
         }
         trimBitmapCache();
@@ -2094,7 +2140,7 @@ void NativeIndex::buildBitmapCacheKey(std::string& out, const std::string& measu
     out += tagValue;
 }
 
-void NativeIndex::flushDirtyBitmaps(IndexWriteBatch& batch) {
+void NativeIndex::flushDirtyBitmaps(IndexWriteBatch& batch, std::vector<std::string>* flushedKeys) {
     // Persist the local ID counter once per flush
     if (localIdMap_.size() > 0) {
         batch.put(ke::encodeLocalIdCounterKey(), ke::encodeLocalId(localIdMap_.nextId()));
@@ -2144,6 +2190,9 @@ void NativeIndex::flushDirtyBitmaps(IndexWriteBatch& batch) {
         std::string serialized(serializedSize, '\0');
         bitmap.write(serialized.data());
         batch.put(bitmapKey, serialized);
+        if (flushedKeys) {
+            flushedKeys->push_back(it->first);
+        }
     }
     bitmapCacheDirtyKeys_.clear();
 }
@@ -2467,6 +2516,29 @@ void NativeIndex::restoreDirtyDayBitmaps(const std::vector<std::string>& keys,
         dayBitmapCacheDirtyKeys_.insert(key);
     }
     dayBitmapWatermark_ = previousWatermark;
+}
+
+void NativeIndex::restoreAfterFailedFlush(const FlushRollback& rollback) {
+    for (const auto& key : rollback.bitmapKeys) {
+        auto it = bitmapCache_.find(key);
+        if (it == bitmapCache_.end())
+            continue;  // evicted meanwhile — its content is gone either way
+        it.value().dirty = true;
+        bitmapCacheDirtyKeys_.insert(key);
+    }
+    for (const auto& key : rollback.hllKeys) {
+        if (hllCache_.find(key) != hllCache_.end()) {
+            hllCacheDirty_.insert(key);
+        }
+    }
+    for (const auto& measurement : rollback.bloomMeasurements) {
+        dirtyMeasurementBlooms_.insert(measurement);
+    }
+    // Forward LocalId mappings in the failed batch must be written again, and
+    // the postings watermark must not be believed: it is only ever persisted
+    // inside the batch, so the on-disk one is still the older, correct value.
+    lastFlushedLocalId_ = rollback.lastFlushedLocalId;
+    restoreDirtyDayBitmaps(rollback.dayBitmapKeys, rollback.dayBitmapWatermark);
 }
 
 // Persist dirty day bitmaps without waiting for the index memtable to cross
@@ -3126,7 +3198,7 @@ seastar::future<> NativeIndex::updateTagHLL(const std::string& measurement, cons
     hllCacheDirty_.insert(key);
 }
 
-void NativeIndex::flushDirtyHLLs(IndexWriteBatch& batch) {
+void NativeIndex::flushDirtyHLLs(IndexWriteBatch& batch, std::vector<std::string>* flushedKeys) {
     for (const auto& cacheKey : hllCacheDirty_) {
         auto it = hllCache_.find(cacheKey);
         if (it == hllCache_.end() || it->second.empty())
@@ -3141,6 +3213,9 @@ void NativeIndex::flushDirtyHLLs(IndexWriteBatch& batch) {
         serialized.reserve(HyperLogLog::SERIALIZED_SIZE);
         it->second.serialize(serialized);
         batch.put(kvKey, serialized);
+        if (flushedKeys) {
+            flushedKeys->push_back(cacheKey);
+        }
     }
     hllCacheDirty_.clear();
 }
@@ -3157,7 +3232,8 @@ seastar::future<> NativeIndex::rebuildMeasurementBlooms() {
     batch.applyTo(*memtable_);
 }
 
-seastar::future<> NativeIndex::flushDirtyMeasurementBlooms(IndexWriteBatch& batch) {
+seastar::future<> NativeIndex::flushDirtyMeasurementBlooms(IndexWriteBatch& batch,
+                                                           std::unordered_set<std::string>* flushedMeasurements) {
     // Swap the dirty set into a local before iterating: the KV prefix scan
     // below suspends, and a concurrent insert doing dirtyMeasurementBlooms_.
     // insert() could rehash the set under our iterator (UAF). Marks added
@@ -3165,6 +3241,9 @@ seastar::future<> NativeIndex::flushDirtyMeasurementBlooms(IndexWriteBatch& batc
     // the next flush — previously the trailing clear() silently dropped them,
     // leaving a stale persisted bloom that hid the new tag combination.
     auto pending = std::exchange(dirtyMeasurementBlooms_, {});
+    if (flushedMeasurements) {
+        *flushedMeasurements = pending;
+    }
     if (pending.empty()) {
         co_return;
     }

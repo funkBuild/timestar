@@ -92,6 +92,12 @@ enum IndexKeyType : uint8_t {
     // timestamps themselves come from the TSM sparse index (see
     // Engine::rebuildDayBitmaps).
     DAY_BITMAP_WATERMARK = 0x19,  // singleton -> day (4B LE) at last day-bitmap flush
+
+    // Written by close() after its final flush succeeds, deleted by open().
+    // Present at open == the previous session shut down cleanly, so every dirty
+    // cache reached disk and the startup day-bitmap repair has nothing to do.
+    // Absent (the default, and what any crash leaves) == repair.
+    INDEX_CLEAN_SHUTDOWN = 0x1A,  // singleton -> "1"
 };
 
 // Metadata for a time series

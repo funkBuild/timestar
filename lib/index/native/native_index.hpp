@@ -251,6 +251,18 @@ public:
     seastar::future<uint64_t> rebuildDayBitmapsFromBounds(const std::vector<SeriesTimeBounds>& bounds, uint32_t fromDay,
                                                           uint32_t toDay);
 
+    // True when the previous session ended in close() with its final flush
+    // intact. The day-bitmap repair is only needed after an unclean exit, so
+    // this is what keeps a 32-day rescan off every ordinary restart. It is
+    // deliberately fail-safe: anything unexpected (missing key, failed flush,
+    // first ever boot) reads as UNCLEAN and repairs.
+    bool openedCleanly() const { return openedCleanly_; }
+
+    // Test/ops hook: make close() behave like a process that died — skip the
+    // clean-shutdown marker. Modelling a crash otherwise requires killing the
+    // process, which a test cannot do.
+    void suppressCleanShutdownMarker() { suppressCleanMarker_ = true; }
+
     // Day through which day-bitmap membership was durable at the last flush;
     // nullopt when nothing has ever been flushed. Bounds the rebuild above.
     std::optional<uint32_t> dayBitmapWatermark() const { return dayBitmapWatermark_; }
@@ -428,7 +440,13 @@ private:
     // cacheKey is consumed on cache miss (moved into map).
     seastar::future<roaring::Roaring*> getOrLoadBitmapForInsert(std::string& cacheKey);
     // Flush dirty bitmaps + batched LOCAL_ID_FORWARD entries into the KV store.
-    void flushDirtyBitmaps(IndexWriteBatch& batch);
+    // The flushDirty* family clears dirty state SYNCHRONOUSLY while filling the
+    // batch, but nothing is durable until the caller's wal_->append() returns.
+    // Each optionally records what it cleared so a failed append can put it
+    // back — without that, a full disk leaves the new membership in RAM marked
+    // clean: never rewritten, evictable back to the stale persisted value, and
+    // invisible to queries with no crash and no error anyone sees.
+    void flushDirtyBitmaps(IndexWriteBatch& batch, std::vector<std::string>* flushedKeys = nullptr);
     // Migration: build LocalIdMap + bitmaps from existing TAG_INDEX data on first open.
     seastar::future<> migrateToLocalIds(IndexWriteBatch& batch);
     // Build a bitmap cache key: "measurement\0tagKey\0tagValue"
@@ -464,8 +482,20 @@ private:
     // this call before mutating the key buffer.
     seastar::future<> updateTagHLL(const std::string& measurement, const std::string& tagKey,
                                    const std::string& tagValue, uint32_t localId, const std::string& seedBitmapKey);
-    void flushDirtyHLLs(IndexWriteBatch& batch);
-    seastar::future<> flushDirtyMeasurementBlooms(IndexWriteBatch& batch);
+    void flushDirtyHLLs(IndexWriteBatch& batch, std::vector<std::string>* flushedKeys = nullptr);
+    seastar::future<> flushDirtyMeasurementBlooms(IndexWriteBatch& batch,
+                                                  std::unordered_set<std::string>* flushedMeasurements = nullptr);
+
+    // Everything one flush cleared, so a failed append can undo it as a unit.
+    struct FlushRollback {
+        std::vector<std::string> bitmapKeys;
+        std::vector<std::string> dayBitmapKeys;
+        std::vector<std::string> hllKeys;
+        std::unordered_set<std::string> bloomMeasurements;
+        uint32_t lastFlushedLocalId = 0;
+        std::optional<uint32_t> dayBitmapWatermark;
+    };
+    void restoreAfterFailedFlush(const FlushRollback& rollback);
     // Step 7: Trim HLL cache after flush — evict non-dirty entries when too large
     void trimHllCache();
     static constexpr size_t MAX_HLL_CACHE_ENTRIES = 1000;
@@ -486,6 +516,8 @@ private:
     // wall-clock so backfill and tests bound the same way live ingest does.
     uint32_t maxRecordedDay_ = 0;
     std::optional<uint32_t> dayBitmapWatermark_;
+    bool openedCleanly_ = false;
+    bool suppressCleanMarker_ = false;
     seastar::timer<> dayBitmapFlushTimer_;
     seastar::gate dayBitmapFlushGate_;
     // Advance the "highest day recorded" mark, ignoring days implausibly far in

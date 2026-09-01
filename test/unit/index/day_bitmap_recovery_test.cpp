@@ -85,6 +85,7 @@ SEASTAR_TEST_F(DayBitmapRecoveryTest, InitRepairsDayBitmapsLostToAnUncleanShutdo
         // process, exactly as an unclean exit leaves it. The data itself is
         // untouched — that is the whole point, it was always readable.
         co_await NativeIndexTestAccess::dropDayBitmapsFrom(engine.getIndex(), kMeasurement, kFirstDay + 1);
+        NativeIndexTestAccess::simulateUncleanShutdown(engine.getIndex());
 
         EXPECT_EQ(co_await seriesInDay(engine, kFirstDay + kDays - 1), 0u)
             << "test precondition: the lost days should be undiscoverable before the repair";
@@ -139,6 +140,7 @@ SEASTAR_TEST_F(DayBitmapRecoveryTest, InitRepairsBackfilledDaysBelowTheWatermark
         }
         co_await NativeIndexTestAccess::dropDayBitmapsInRange(engine.getIndex(), kMeasurement, backfillFirst,
                                                               backfillLast);
+        NativeIndexTestAccess::simulateUncleanShutdown(engine.getIndex());
 
         EXPECT_EQ(co_await seriesInDay(engine, backfillLast, "dev-buffered"), 0u) << "test precondition";
         EXPECT_EQ(engine.getIndex().dayBitmapWatermark().value_or(0), liveDay)
@@ -155,5 +157,36 @@ SEASTAR_TEST_F(DayBitmapRecoveryTest, InitRepairsBackfilledDaysBelowTheWatermark
     }
     EXPECT_EQ(co_await seriesInDay(engine, liveDay, "dev-live"), 1u) << "the live series must be untouched";
 
+    co_await engine.stop();
+}
+
+// A clean shutdown must skip the repair — that is what keeps ordinary restarts
+// off a window-wide scan — and a shutdown whose final flush did not happen must
+// NOT be mistaken for one.
+SEASTAR_TEST_F(DayBitmapRecoveryTest, CleanShutdownSkipsTheRepairAndUncleanDoesNot) {
+    const uint32_t day = todayDay() - 1;
+
+    {
+        Engine engine;
+        co_await engine.init();
+        EXPECT_FALSE(engine.getIndex().openedCleanly()) << "first ever boot must read as unclean";
+        co_await insertDay(engine, day);
+        co_await engine.stop();  // clean
+    }
+
+    {
+        Engine engine;
+        co_await engine.init();
+        EXPECT_TRUE(engine.getIndex().openedCleanly()) << "a clean stop must be recorded";
+        // Data is still discoverable, repair or no repair.
+        EXPECT_EQ(co_await seriesInDay(engine, day), 1u);
+        NativeIndexTestAccess::simulateUncleanShutdown(engine.getIndex());
+        co_await engine.stop();  // crash
+    }
+
+    Engine engine;
+    co_await engine.init();
+    EXPECT_FALSE(engine.getIndex().openedCleanly()) << "a crash must not leave the marker behind";
+    EXPECT_EQ(co_await seriesInDay(engine, day), 1u);
     co_await engine.stop();
 }
