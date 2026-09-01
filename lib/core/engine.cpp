@@ -789,7 +789,7 @@ seastar::future<> Engine::rebuildDayBitmaps() {
 
     // Merge bounds across files: a series usually appears in several, and the
     // union of their spans is the span to reconstruct.
-    tsl::robin_map<SeriesId128, NativeIndex::SeriesTimeBounds, SeriesId128::Hash> merged;
+    tsl::robin_map<SeriesId128, timestar::index::NativeIndex::SeriesTimeBounds, SeriesId128::Hash> merged;
     for (const auto& [seq, tsmFile] : tsmFileManager.getSequencedTsmFiles()) {
         if (!tsmFile) {
             continue;
@@ -799,7 +799,7 @@ seastar::future<> Engine::rebuildDayBitmaps() {
             const uint64_t maxTs = tsmFile->getSeriesMaxTime(id);
             auto it = merged.find(id);
             if (it == merged.end()) {
-                merged.emplace(id, NativeIndex::SeriesTimeBounds{id, minTs, maxTs});
+                merged.emplace(id, timestar::index::NativeIndex::SeriesTimeBounds{id, minTs, maxTs});
             } else {
                 it.value().minTs = std::min(it->second.minTs, minTs);
                 it.value().maxTs = std::max(it->second.maxTs, maxTs);
@@ -810,7 +810,7 @@ seastar::future<> Engine::rebuildDayBitmaps() {
         co_return;
     }
 
-    std::vector<NativeIndex::SeriesTimeBounds> bounds;
+    std::vector<timestar::index::NativeIndex::SeriesTimeBounds> bounds;
     bounds.reserve(merged.size());
     uint32_t maxDay = 0;
     for (const auto& [id, b] : merged) {
