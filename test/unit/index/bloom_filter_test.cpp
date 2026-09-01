@@ -14,8 +14,14 @@ TEST(BloomFilterTest, EmptyFilter) {
     BloomFilter bf(10);
     bf.build();
     EXPECT_EQ(bf.keyCount(), 0u);
-    // Empty filter should return false for any key
-    EXPECT_FALSE(bf.mayContain("anything"));
+    // CONTRACT CHANGE: a filter with no keys used to answer "definitely absent"
+    // for everything. A bloom is only ever consulted to SKIP work, so that let a
+    // never-populated filter veto every lookup that consulted it — on the
+    // discovery path, a measurement's series silently ceasing to exist. A filter
+    // with no bits cannot prove absence, so it now says "maybe" and is marked
+    // null. See BloomFilterEmptyFilter.* below.
+    EXPECT_TRUE(bf.isNull());
+    EXPECT_TRUE(bf.mayContain("anything"));
 }
 
 TEST(BloomFilterTest, SingleKey) {
