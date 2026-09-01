@@ -33,6 +33,7 @@
 #include "../../../lib/core/series_id.hpp"
 #include "../../../lib/index/key_encoding.hpp"
 #include "../../../lib/index/native/native_index.hpp"
+#include "../../../lib/storage/tsm.hpp"
 #include "../../seastar_gtest.hpp"
 #include "../../test_helpers/native_index_test_access.hpp"
 
