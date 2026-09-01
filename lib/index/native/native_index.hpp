@@ -489,6 +489,13 @@ private:
     seastar::timer<> dayBitmapFlushTimer_;
     seastar::gate dayBitmapFlushGate_;
     void noteRecordedDay(uint32_t day) { maxRecordedDay_ = std::max(maxRecordedDay_, day); }
+    // True when the persisted watermark trails what is now durable. A flush is
+    // worth doing for this alone: without it a rebuild that found everything
+    // already intact would never move the watermark forward, and every
+    // subsequent startup would redo the same work over the same window.
+    bool dayBitmapWatermarkNeedsAdvance() const {
+        return maxRecordedDay_ > 0 && (!dayBitmapWatermark_.has_value() || *dayBitmapWatermark_ < maxRecordedDay_);
+    }
     // Flush mid-rebuild once this many day bitmaps are dirty: trimDayBitmapCache()
     // cannot evict dirty entries, so an unbounded rebuild pins the whole window
     // in RAM.

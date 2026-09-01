@@ -2434,7 +2434,7 @@ void NativeIndex::flushDirtyDayBitmaps(IndexWriteBatch& batch) {
     // Day-shaped, not wall-clock-shaped: backfill and replay record days that
     // are not "today", and a wall-clock watermark would exclude exactly those
     // from the repair window.
-    if (maxRecordedDay_ > 0 && (!dayBitmapWatermark_.has_value() || *dayBitmapWatermark_ < maxRecordedDay_)) {
+    if (dayBitmapWatermarkNeedsAdvance()) {
         dayBitmapWatermark_ = maxRecordedDay_;
         batch.put(ke::encodeDayBitmapWatermarkKey(), ke::encodeDay(maxRecordedDay_));
     }
@@ -2446,14 +2446,14 @@ void NativeIndex::flushDirtyDayBitmaps(IndexWriteBatch& batch) {
 // everything recorded in between is lost to an unclean exit, taking those
 // series out of any query whose range starts in the lost window.
 seastar::future<> NativeIndex::flushDayBitmapsNow() {
-    if (dayBitmapCacheDirtyKeys_.empty())
+    if (dayBitmapCacheDirtyKeys_.empty() && !dayBitmapWatermarkNeedsAdvance())
         co_return;
 
     // Same serialization as the memtable-flush path: flushDirtyDayBitmaps
     // mutates the cache and the batch is appended to the WAL and applied to
     // memtable_, which a concurrent flush may be swapping.
     auto flushUnits = co_await seastar::get_units(flushMutex_, 1);
-    if (dayBitmapCacheDirtyKeys_.empty())
+    if (dayBitmapCacheDirtyKeys_.empty() && !dayBitmapWatermarkNeedsAdvance())
         co_return;
 
     IndexWriteBatch batch;
@@ -2516,13 +2516,21 @@ seastar::future<uint64_t> NativeIndex::rebuildDayBitmapsFromBounds(const std::ve
             if ((co_await getOrLoadDayBitmapForInsert(dayCacheKey))->addChecked(localId)) {
                 ++added;
             }
-            noteRecordedDay(day);
         }
         touchedMeasurements.insert(meta->measurement);
 
         // Bound peak memory: trimDayBitmapCache() cannot evict a DIRTY entry,
         // so a rebuild that dirties every (measurement, day) in the window
         // would otherwise pin all of it until the caller flushes.
+        //
+        // These intermediate flushes deliberately do NOT advance the watermark:
+        // noteRecordedDay() is not called in the loop above, so maxRecordedDay_
+        // still holds its pre-rebuild value and flushDirtyDayBitmaps' guard
+        // finds nothing to raise. That is what makes an interrupted rebuild
+        // safe — a watermark advanced to toDay after repairing only the first
+        // N series would tell the NEXT startup those days were already durable,
+        // turning a recoverable gap into a permanent one: precisely the bug
+        // this whole change exists to fix.
         if (dayBitmapCacheDirtyKeys_.size() >= kRebuildFlushEveryDirtyKeys) {
             co_await flushDayBitmapsNow();
         }
@@ -2531,9 +2539,11 @@ seastar::future<uint64_t> NativeIndex::rebuildDayBitmapsFromBounds(const std::ve
     for (const auto& measurement : touchedMeasurements) {
         invalidateDiscoveryCache(measurement);
     }
-    if (added > 0) {
-        co_await flushDayBitmapsNow();
-    }
+
+    // Only now, with every series in `bounds` repaired, is membership through
+    // toDay actually complete — so only now may the watermark say so.
+    noteRecordedDay(toDay);
+    co_await flushDayBitmapsNow();
     co_return added;
 }
 

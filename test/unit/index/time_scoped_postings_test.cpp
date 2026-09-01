@@ -888,3 +888,80 @@ SEASTAR_TEST_F(TimeScopedPostingsTest, RebuildRespectsWindowAndDoesNotResurrectE
 
     co_await index.close();
 }
+
+// The watermark must never run ahead of what has actually been repaired.
+//
+// A rebuild flushes intermediately to bound memory (dirty day bitmaps cannot be
+// evicted). If those flushes also advanced the watermark, a rebuild killed
+// halfway would tell the NEXT startup that days it never got to were already
+// durable — converting a recoverable gap into a permanent one, which is the
+// exact failure this change exists to remove. So the watermark moves once, at
+// the end, and a rebuild wide enough to force intermediate flushes must still
+// end with every day discoverable.
+SEASTAR_TEST_F(TimeScopedPostingsTest, RebuildAdvancesWatermarkOnlyOnCompletion) {
+    // Wide enough to cross kRebuildFlushEveryDirtyKeys (4096 dirty day keys).
+    constexpr uint32_t kFirstDay = 12000;
+    constexpr uint32_t kSpanDays = 5000;
+    const uint64_t firstNs = static_cast<uint64_t>(kFirstDay) * ke::NS_PER_DAY;
+    const uint64_t lastNs = static_cast<uint64_t>(kFirstDay + kSpanDays) * ke::NS_PER_DAY;
+
+    NativeIndex index(0);
+    co_await index.open();
+
+    auto seriesId = co_await index.getOrCreateSeriesId("wide", {{"host", "h1"}}, "v");
+    const uint32_t before = index.dayBitmapWatermark().value_or(0);
+
+    std::vector<NativeIndex::SeriesTimeBounds> bounds{{seriesId, firstNs, lastNs}};
+    auto added = co_await index.rebuildDayBitmapsFromBounds(bounds, kFirstDay, kFirstDay + kSpanDays);
+    EXPECT_EQ(added, static_cast<uint64_t>(kSpanDays) + 1);
+
+    ASSERT_TRUE(index.dayBitmapWatermark().has_value());
+    EXPECT_GT(*index.dayBitmapWatermark(), before);
+    EXPECT_EQ(*index.dayBitmapWatermark(), kFirstDay + kSpanDays);
+
+    // Every day is discoverable, including ones written before an intermediate
+    // flush and ones written after it.
+    for (uint32_t day : {kFirstDay, kFirstDay + kSpanDays / 2, kFirstDay + kSpanDays}) {
+        const uint64_t start = static_cast<uint64_t>(day) * ke::NS_PER_DAY;
+        auto r = co_await index.findSeriesWithMetadataTimeScoped("wide", {{"host", "h1"}}, {}, start,
+                                                                 start + ke::NS_PER_DAY - 1);
+        EXPECT_TRUE(r.has_value());
+        EXPECT_EQ(r->size(), 1u) << "day " << day;
+    }
+
+    co_await index.close();
+}
+
+// A rebuild that finds everything already intact must still move the watermark
+// forward — otherwise the repair window never advances and every restart pays
+// for the same scan.
+SEASTAR_TEST_F(TimeScopedPostingsTest, RebuildAdvancesWatermarkWhenNothingWasMissing) {
+    constexpr uint32_t kDay = 21700;
+    const uint64_t dayNs = static_cast<uint64_t>(kDay) * ke::NS_PER_DAY;
+
+    NativeIndex index(0);
+    co_await index.open();
+
+    auto insert = makeInsert<double>("intact", "v", {{"host", "h1"}}, {dayNs + 1}, {1.0});
+    auto seriesId = co_await index.indexInsert(insert);
+    co_await index.flushDayBitmapsNow();
+    ASSERT_TRUE(index.dayBitmapWatermark().has_value());
+    EXPECT_EQ(*index.dayBitmapWatermark(), kDay);
+
+    // Nothing to add: every day in the window is already recorded.
+    std::vector<NativeIndex::SeriesTimeBounds> bounds{{seriesId, dayNs + 1, dayNs + 2}};
+    auto added = co_await index.rebuildDayBitmapsFromBounds(bounds, kDay, kDay + 3);
+    EXPECT_EQ(added, 0u);
+
+    // The window examined reached kDay+3, so that is now known durable.
+    EXPECT_EQ(*index.dayBitmapWatermark(), kDay + 3);
+
+    {
+        NativeIndex reopened(0);
+        co_await index.close();
+        co_await reopened.open();
+        ASSERT_TRUE(reopened.dayBitmapWatermark().has_value());
+        EXPECT_EQ(*reopened.dayBitmapWatermark(), kDay + 3) << "the advance must be durable, not just in RAM";
+        co_await reopened.close();
+    }
+}
