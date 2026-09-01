@@ -1513,7 +1513,13 @@ seastar::future<std::expected<std::vector<SeriesId128>, SeriesLimitExceeded>> Na
     // Single-tag fast path — no bitmap copy needed, delegate to findSeriesByTag
     if (tagFilters.size() == 1) {
         auto& [tagKey, tagValue] = *tagFilters.begin();
-        auto res = co_await findSeriesByTag(measurement, tagKey, tagValue, maxSeries);
+        // Ask for one MORE than the limit: findSeriesByTag stops collecting at
+        // its cap, so passing maxSeries made `res.size() > maxSeries` unable to
+        // fire and a query over the limit came back silently TRUNCATED —
+        // missing series reported as a complete answer, which is the same
+        // failure mode as a wrong empty, just partial.
+        const size_t probe = maxSeries > 0 ? maxSeries + 1 : 0;
+        auto res = co_await findSeriesByTag(measurement, tagKey, tagValue, probe);
         if (maxSeries > 0 && res.size() > maxSeries) {
             co_return std::unexpected(SeriesLimitExceeded{res.size(), maxSeries});
         }
@@ -1871,7 +1877,13 @@ seastar::future<std::map<std::string, std::vector<SeriesId128>>> NativeIndex::ge
             return true;
         fullCacheKey.assign(cachePrefix);
         fullCacheKey.append(tagValue);
-        if (bitmapCache_.find(fullCacheKey) != bitmapCache_.end()) {
+        auto cacheIt = bitmapCache_.find(fullCacheKey);
+        // A `loading` entry is an insert's empty placeholder, published before
+        // its KV read finished. Preferring it over the persisted bytes we are
+        // holding right here would drop the whole tag value from the grouping
+        // (it is skipped as empty below) despite having had the correct answer
+        // in hand — so treat it as a miss and merge the bytes in.
+        if (cacheIt != bitmapCache_.end() && !cacheIt->second.loading) {
             cacheHitValues.emplace_back(tagValue);
         } else {
             toLoad.emplace_back(std::string(tagValue), std::string(value));
@@ -1883,8 +1895,11 @@ seastar::future<std::map<std::string, std::vector<SeriesId128>>> NativeIndex::ge
         fullCacheKey.assign(cachePrefix);
         fullCacheKey.append(tagValue);
         auto& entry = bitmapCache_[fullCacheKey];
-        entry.bitmap = roaring::Roaring::readSafe(value.data(), value.size());
-        entry.dirty = false;
+        // OR, never assign: the entry may be a placeholder an in-flight insert
+        // has already added local ids to, and its own load will OR the same
+        // bytes in again (idempotent). Its dirty flag is left alone for the
+        // same reason — clearing it would strand those adds.
+        entry.bitmap |= roaring::Roaring::readSafe(value.data(), value.size());
         cacheHitValues.push_back(std::move(tagValue));
     }
 
@@ -3210,6 +3225,21 @@ seastar::future<> NativeIndex::updateHLL(const std::string& measurement, uint32_
             if (val.has_value() && val->size() >= HyperLogLog::SERIALIZED_SIZE) {
                 it = hllCache_.try_emplace(key, HyperLogLog::deserialize(*val)).first;
             } else {
+                if (val.has_value()) {
+                    // Short payload: the persisted sketch is truncated. Starting
+                    // a fresh one is fine for accuracy (it re-accumulates), but
+                    // it must not be flushed OVER the persisted bytes as though
+                    // it were authoritative — that discards whatever survived
+                    // and turns a partial loss into a total one. Left out of the
+                    // dirty set below by returning before it is marked.
+                    ::native_index_log.warn(
+                        "Truncated cardinality sketch for measurement '{}' ({} of {} bytes) — estimates will "
+                        "re-accumulate from empty; not overwriting the persisted copy",
+                        measurement, val->size(), HyperLogLog::SERIALIZED_SIZE);
+                    auto fresh = hllCache_.try_emplace(key).first;
+                    fresh.value().add(localId);
+                    co_return;
+                }
                 it = hllCache_.try_emplace(key).first;
             }
         }

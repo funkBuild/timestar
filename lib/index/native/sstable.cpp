@@ -493,6 +493,15 @@ seastar::future<std::unique_ptr<SSTableReader>> SSTableReader::open(std::string 
         reader->bloom_ = BloomFilter::createNull();
     }
 
+    // A file that holds entries but produced no index would answer "not found"
+    // for every key in it — silently, for the life of the file, with nothing in
+    // the log. Every other corruption path here throws; this one must too, so
+    // the file surfaces as unreadable rather than as an authoritative empty.
+    if (entryCount > 0 && reader->index_.empty()) {
+        throw std::runtime_error("SSTable metadata region unreadable (no index for " + std::to_string(entryCount) +
+                                 " entries): " + filename);
+    }
+
     // Build two-level summary index for faster block lookups
     reader->buildSummary();
 

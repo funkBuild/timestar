@@ -1011,3 +1011,30 @@ SEASTAR_TEST_F(TimeScopedPostingsTest, ImplausibleFutureTimestampDoesNotPoisonTh
 
     co_await index.close();
 }
+
+// A single-tag query over the series limit must ERROR, not truncate.
+//
+// findSeriesByTag stops collecting at its cap, so findSeries' `size > maxSeries`
+// check could never fire: an over-limit query came back as a short, complete
+// looking answer. Missing series presented as the whole truth is the same
+// failure as a wrong empty, only partial — and harder to notice.
+SEASTAR_TEST_F(TimeScopedPostingsTest, SingleTagQueryOverTheLimitReportsItInsteadOfTruncating) {
+    NativeIndex index(0);
+    co_await index.open();
+
+    for (int i = 0; i < 10; ++i) {
+        co_await index.getOrCreateSeriesId("limited", {{"site", "north"}, {"deviceId", "dev-" + std::to_string(i)}},
+                                           "v");
+    }
+
+    auto overLimit = co_await index.findSeries("limited", {{"site", "north"}}, 5);
+    EXPECT_FALSE(overLimit.has_value()) << "10 series with a limit of 5 must report the limit, not return 5";
+
+    auto withinLimit = co_await index.findSeries("limited", {{"site", "north"}}, 50);
+    EXPECT_TRUE(withinLimit.has_value());
+    if (withinLimit.has_value()) {
+        EXPECT_EQ(withinLimit->size(), 10u);
+    }
+
+    co_await index.close();
+}
