@@ -12,9 +12,9 @@
 
 #pragma once
 
+#include "../../lib/index/key_encoding.hpp"
 #include "../../lib/index/native/bloom_filter.hpp"
 #include "../../lib/index/native/native_index.hpp"
-#include "../../lib/index/key_encoding.hpp"
 
 #include <endian.h>
 
@@ -47,8 +47,7 @@ struct NativeIndexTestAccess {
     // write_buffer_size), so it is gone. Series metadata and LocalIds are NOT
     // touched — those are persisted with each series-creation batch, which is
     // exactly why the two can disagree after a crash.
-    static seastar::future<> dropDayBitmapsFrom(NativeIndex& index, const std::string& measurement,
-                                                uint32_t fromDay) {
+    static seastar::future<> dropDayBitmapsFrom(NativeIndex& index, const std::string& measurement, uint32_t fromDay) {
         namespace ke = timestar::index::keys;
 
         IndexWriteBatch batch;

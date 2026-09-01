@@ -511,16 +511,15 @@ SEASTAR_TEST_F(TimeScopedPostingsTest, MetadataOpDaySpanCoversFirstBatch) {
 
     // Series must be discoverable on every day of the span.
     for (int d = 0; d < 3; ++d) {
-        auto r = co_await index.findSeriesWithMetadataTimeScoped(
-            "batchmeas", {{"host", "h1"}}, {}, day21000 + d * ke::NS_PER_DAY,
-            day21000 + d * ke::NS_PER_DAY + ke::NS_PER_DAY - 1);
+        auto r = co_await index.findSeriesWithMetadataTimeScoped("batchmeas", {{"host", "h1"}}, {},
+                                                                 day21000 + d * ke::NS_PER_DAY,
+                                                                 day21000 + d * ke::NS_PER_DAY + ke::NS_PER_DAY - 1);
         EXPECT_TRUE(r.has_value());
         EXPECT_EQ(r->size(), 1u) << "day offset " << d;
     }
     // And absent outside it.
-    auto rOut = co_await index.findSeriesWithMetadataTimeScoped("batchmeas", {{"host", "h1"}}, {},
-                                                                day21000 + 5 * ke::NS_PER_DAY,
-                                                                day21000 + 6 * ke::NS_PER_DAY - 1);
+    auto rOut = co_await index.findSeriesWithMetadataTimeScoped(
+        "batchmeas", {{"host", "h1"}}, {}, day21000 + 5 * ke::NS_PER_DAY, day21000 + 6 * ke::NS_PER_DAY - 1);
     EXPECT_TRUE(rOut.has_value());
     EXPECT_EQ(rOut->size(), 0u);
     co_await index.close();
@@ -548,8 +547,7 @@ SEASTAR_TEST_F(TimeScopedPostingsTest, RecordInsertDaysAddsLaterDays) {
     std::vector<uint64_t> ts = {day22000 + 3 * ke::NS_PER_DAY, day22000 + 3 * ke::NS_PER_DAY + 1'000'000'000ULL};
     co_await index.recordInsertDays("bm2", seriesId, ts);
 
-    auto r = co_await index.findSeriesWithMetadataTimeScoped("bm2", {{"host", "h1"}}, {},
-                                                             day22000 + 3 * ke::NS_PER_DAY,
+    auto r = co_await index.findSeriesWithMetadataTimeScoped("bm2", {{"host", "h1"}}, {}, day22000 + 3 * ke::NS_PER_DAY,
                                                              day22000 + 4 * ke::NS_PER_DAY - 1);
     EXPECT_TRUE(r.has_value());
     EXPECT_EQ(r->size(), 1u);
@@ -565,8 +563,8 @@ SEASTAR_TEST_F(TimeScopedPostingsTest, TimeScopedCachedServesSharedVector) {
     co_await index.open();
 
     uint64_t day23000 = 23000ULL * ke::NS_PER_DAY;
-    auto insert = makeInsert<double>("tsc_cache", "usage", {{"host", "h1"}}, {day23000, day23000 + 1'000'000'000ULL},
-                                     {1.0, 2.0});
+    auto insert =
+        makeInsert<double>("tsc_cache", "usage", {{"host", "h1"}}, {day23000, day23000 + 1'000'000'000ULL}, {1.0, 2.0});
     co_await index.indexInsert(insert);
 
     auto r1 = co_await index.findSeriesWithMetadataTimeScopedCached("tsc_cache", {{"host", "h1"}}, {}, day23000,
@@ -581,9 +579,8 @@ SEASTAR_TEST_F(TimeScopedPostingsTest, TimeScopedCachedServesSharedVector) {
     EXPECT_EQ(r1.value().get(), r2.value().get()) << "identical day-scoped queries must share the cached vector";
 
     // A different day range must NOT alias to the same cache entry.
-    auto r3 = co_await index.findSeriesWithMetadataTimeScopedCached("tsc_cache", {{"host", "h1"}}, {},
-                                                                    day23000 + ke::NS_PER_DAY,
-                                                                    day23000 + 2 * ke::NS_PER_DAY - 1);
+    auto r3 = co_await index.findSeriesWithMetadataTimeScopedCached(
+        "tsc_cache", {{"host", "h1"}}, {}, day23000 + ke::NS_PER_DAY, day23000 + 2 * ke::NS_PER_DAY - 1);
     EXPECT_TRUE(r3.has_value());
     EXPECT_NE(r1.value().get(), r3.value().get());
     EXPECT_EQ((*r3)->size(), 0u);
@@ -662,8 +659,8 @@ SEASTAR_TEST_F(TimeScopedPostingsTest, DayMembershipSurvivesUncleanShutdown) {
         NativeIndex index(0);
         co_await index.open();
 
-        auto insert = makeInsert<double>("stats", "batteryPercent", {{"deviceId", "dev-1c4e"}},
-                                         {flushedDayNs + 1}, {94.0});
+        auto insert =
+            makeInsert<double>("stats", "batteryPercent", {{"deviceId", "dev-1c4e"}}, {flushedDayNs + 1}, {94.0});
         co_await index.indexInsert(insert);
         co_await index.compact();  // day 20100 is now on disk
         co_await index.close();
@@ -701,15 +698,15 @@ SEASTAR_TEST_F(TimeScopedPostingsTest, DayMembershipSurvivesUncleanShutdown) {
         // The console's narrow window: a range that STARTS inside the crash
         // window. This is the query that returned nothing in production.
         const uint64_t narrowStart = static_cast<uint64_t>(kCrashDay + 2) * ke::NS_PER_DAY;
-        auto narrow = co_await index.findSeriesWithMetadataTimeScoped(
-            "stats", {{"deviceId", "dev-1c4e"}}, {}, narrowStart, narrowStart + ke::NS_PER_DAY - 1);
+        auto narrow = co_await index.findSeriesWithMetadataTimeScoped("stats", {{"deviceId", "dev-1c4e"}}, {},
+                                                                      narrowStart, narrowStart + ke::NS_PER_DAY - 1);
         EXPECT_TRUE(narrow.has_value());
         EXPECT_EQ(narrow->size(), 1u) << "series lost from a range starting inside the crash window";
 
         // Widening the start to before the last durable day must not change the
         // answer. In production it did — that asymmetry IS the bug.
-        auto wide = co_await index.findSeriesWithMetadataTimeScoped(
-            "stats", {{"deviceId", "dev-1c4e"}}, {}, flushedDayNs, narrowStart + ke::NS_PER_DAY - 1);
+        auto wide = co_await index.findSeriesWithMetadataTimeScoped("stats", {{"deviceId", "dev-1c4e"}}, {},
+                                                                    flushedDayNs, narrowStart + ke::NS_PER_DAY - 1);
         EXPECT_TRUE(wide.has_value());
         EXPECT_EQ(wide->size(), 1u);
 
@@ -751,8 +748,8 @@ SEASTAR_TEST_F(TimeScopedPostingsTest, EveryDayInTheCrashWindowStaysDiscoverable
         NativeIndex index(0);
         co_await index.open();
         for (int d = 0; d < kDevices; ++d) {
-            auto seriesId = SeriesId128::fromSeriesKey(timestar::buildSeriesKey(
-                "fleet", {{"deviceId", "dev-" + std::to_string(d)}}, "uptimeSeconds"));
+            auto seriesId = SeriesId128::fromSeriesKey(
+                timestar::buildSeriesKey("fleet", {{"deviceId", "dev-" + std::to_string(d)}}, "uptimeSeconds"));
             for (int day = 1; day <= kCrashDays; ++day) {
                 co_await index.recordInsertDays(
                     "fleet", seriesId,
@@ -768,8 +765,8 @@ SEASTAR_TEST_F(TimeScopedPostingsTest, EveryDayInTheCrashWindowStaysDiscoverable
         co_await index.open();
         for (int day = 1; day <= kCrashDays; ++day) {
             const uint64_t start = (static_cast<uint64_t>(kFlushedDay) + day) * ke::NS_PER_DAY;
-            auto r = co_await index.findSeriesWithMetadataTimeScoped("fleet", {}, {}, start,
-                                                                     start + ke::NS_PER_DAY - 1);
+            auto r =
+                co_await index.findSeriesWithMetadataTimeScoped("fleet", {}, {}, start, start + ke::NS_PER_DAY - 1);
             EXPECT_TRUE(r.has_value());
             EXPECT_EQ(r->size(), static_cast<size_t>(kDevices)) << "day " << (kFlushedDay + day);
         }
