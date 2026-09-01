@@ -279,13 +279,36 @@ SEASTAR_TEST_F(DiscoveryConsistencyTest, QueryBelowTheOldestRecordedDayFallsBack
         EXPECT_EQ(r->size(), 0u) << "an unclamped measurement must keep pruning below its oldest recorded day";
     }
 
-    // A quiet day INSIDE the recorded range must still prune — the fallback may
-    // not become "always discoverable".
-    const uint64_t quietStart = static_cast<uint64_t>(recentDay - 200) * ke::NS_PER_DAY;
-    auto quiet = co_await index.findSeriesWithMetadataTimeScoped("clamped", {{"deviceId", "dev-a"}}, {}, quietStart,
-                                                                 quietStart + ke::NS_PER_DAY - 1);
-    EXPECT_TRUE(quiet.has_value());
-    EXPECT_EQ(quiet->size(), 0u) << "pruning inside the recorded range must survive the fallback";
+    // Pruning must survive the fallback. Note what CANNOT be asserted here:
+    // recordDaySpan marks every day of the span it accepts, so dev-a has
+    // membership on all of [recentDay-365, recentDay] — there is no quiet day
+    // inside its own recorded range to test with. The meaningful check is a
+    // DIFFERENT series that only wrote recently: it must not be dragged in by a
+    // query for an old day just because a clamped neighbour matches it.
+    MetadataOp recent;
+    recent.valueType = TSMValueType::Float;
+    recent.measurement = "clamped";
+    recent.fieldName = "v";
+    recent.tags = {{"deviceId", "dev-recent"}};
+    recent.minTs = static_cast<uint64_t>(recentDay) * ke::NS_PER_DAY;
+    recent.maxTs = recent.minTs;
+    co_await index.indexMetadataBatch({recent});
+
+    const uint64_t oldDayStart = static_cast<uint64_t>(recentDay - 200) * ke::NS_PER_DAY;
+    auto onOldDay = co_await index.findSeriesWithMetadataTimeScoped("clamped", {}, {}, oldDayStart,
+                                                                    oldDayStart + ke::NS_PER_DAY - 1);
+    EXPECT_TRUE(onOldDay.has_value());
+    std::set<std::string> devicesOnOldDay;
+    if (onOldDay.has_value()) {
+        for (const auto& series : *onOldDay) {
+            auto tag = series.metadata.tags.find("deviceId");
+            if (tag != series.metadata.tags.end()) {
+                devicesOnOldDay.insert(tag->second);
+            }
+        }
+    }
+    EXPECT_TRUE(devicesOnOldDay.count("dev-a")) << "the clamped series spans this day and must be found";
+    EXPECT_FALSE(devicesOnOldDay.count("dev-recent")) << "a series that never wrote this day must still be pruned";
 
     co_await index.close();
 }
