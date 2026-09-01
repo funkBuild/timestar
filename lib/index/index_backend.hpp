@@ -98,6 +98,12 @@ enum IndexKeyType : uint8_t {
     // cache reached disk and the startup day-bitmap repair has nothing to do.
     // Absent (the default, and what any crash leaves) == repair.
     INDEX_CLEAN_SHUTDOWN = 0x1A,  // singleton -> "1"
+
+    // measurement -> earliest day (4B LE) that recordDaySpan's kMaxDaySpan clamp
+    // REFUSED to record. Its presence is the only honest signal that a
+    // measurement's day bitmaps are known-incomplete at the old end, which is
+    // what lets a query starting there fall back instead of trusting silence.
+    CLAMPED_DAY_HISTORY = 0x1B,
 };
 
 // Metadata for a time series
