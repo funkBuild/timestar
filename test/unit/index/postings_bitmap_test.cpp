@@ -11,39 +11,20 @@
  * - getSeriesGroupedByTag via bitmap prefix scan
  */
 
-#include "../../../lib/index/native/native_index.hpp"
-#include "../../../lib/index/native/bloom_filter.hpp"
-#include "../../../lib/index/key_encoding.hpp"
 #include "../../../lib/core/series_id.hpp"
+#include "../../../lib/index/key_encoding.hpp"
+#include "../../../lib/index/native/bloom_filter.hpp"
+#include "../../../lib/index/native/native_index.hpp"
 #include "../../seastar_gtest.hpp"
+#include "../../test_helpers/native_index_test_access.hpp"
 
 #include <gtest/gtest.h>
-#include <seastar/core/coroutine.hh>
 
 #include <filesystem>
+#include <seastar/core/coroutine.hh>
 #include <string>
 
 using namespace timestar::index;
-
-namespace timestar::index {
-// Plants a persisted measurement bloom that omits some postings keys — what a
-// <= 1.4.0 server could leave on disk — bypassing every normal write path.
-// Lives in timestar::index because that is where NativeIndex befriends it.
-struct NativeIndexTestAccess {
-    static seastar::future<> plantStaleBloom(NativeIndex& index, const std::string& measurement,
-                                             const std::vector<std::string>& postingsKeysToKeep) {
-        BloomFilter bloom(10);
-        for (const auto& key : postingsKeysToKeep) {
-            bloom.addKey(key);
-        }
-        bloom.build();
-        std::string serialized;
-        bloom.serializeTo(serialized);
-        co_await index.kvPut(keys::encodeMeasurementBloomKey(measurement), serialized);
-        index.measurementBloomCache_.erase(measurement);
-    }
-};
-}  // namespace timestar::index
 
 class PostingsBitmapTest : public ::testing::Test {
 public:
@@ -53,8 +34,7 @@ public:
 
 // Helper: create series and return its ID
 static seastar::future<SeriesId128> createSeries(NativeIndex& index, const std::string& measurement,
-                                                   std::map<std::string, std::string> tags,
-                                                   const std::string& field) {
+                                                 std::map<std::string, std::string> tags, const std::string& field) {
     co_return co_await index.getOrCreateSeriesId(measurement, std::move(tags), field);
 }
 
@@ -94,7 +74,8 @@ SEASTAR_TEST_F(PostingsBitmapTest, MultiTagIntersection) {
 
     // Create series with varying tags
     auto id1 = co_await createSeries(index, "cpu", {{"region", "us-west"}, {"host", "h1"}, {"env", "prod"}}, "usage");
-    auto id2 = co_await createSeries(index, "cpu", {{"region", "us-west"}, {"host", "h2"}, {"env", "staging"}}, "usage");
+    auto id2 =
+        co_await createSeries(index, "cpu", {{"region", "us-west"}, {"host", "h2"}, {"env", "staging"}}, "usage");
     auto id3 = co_await createSeries(index, "cpu", {{"region", "us-east"}, {"host", "h3"}, {"env", "prod"}}, "usage");
     auto id4 = co_await createSeries(index, "cpu", {{"region", "us-west"}, {"host", "h4"}, {"env", "prod"}}, "usage");
 
@@ -287,8 +268,11 @@ SEASTAR_TEST_F(PostingsBitmapTest, BulkInsertWithMultipleFlushes) {
             for (int f = 0; f < 8; ++f) {
                 std::string field = "f" + std::to_string(f);
                 co_await index.getOrCreateSeriesId(meas,
-                    {{"host", host}, {"region", region}, {"rack", "rack-" + std::to_string(i % 5)},
-                     {"env", (i < 10) ? "staging" : "production"}}, field);
+                                                   {{"host", host},
+                                                    {"region", region},
+                                                    {"rack", "rack-" + std::to_string(i % 5)},
+                                                    {"env", (i < 10) ? "staging" : "production"}},
+                                                   field);
             }
         }
     }
@@ -387,12 +371,14 @@ SEASTAR_TEST_F(PostingsBitmapTest, BloomRebuildKeepsSeriesNotResidentInCache) {
     // rebuild loses it. The scoped lookup must still find it.
     auto found2 = co_await index.findSeriesByTag("deviceData", "deviceName", "GW85");
     EXPECT_EQ(found2.size(), 1u) << "GW85 vanished from the measurement bloom";
-    if (!found2.empty()) EXPECT_EQ(found2[0], idA);
+    if (!found2.empty())
+        EXPECT_EQ(found2[0], idA);
 
     // And the multi-tag intersection path, which the console's scoped queries use.
     auto scoped = co_await index.findSeries("deviceData", {{"deviceName", "GW85"}});
     EXPECT_TRUE(scoped.has_value());
-    if (scoped.has_value()) EXPECT_EQ(scoped->size(), 1u);
+    if (scoped.has_value())
+        EXPECT_EQ(scoped->size(), 1u);
 
     // Enumeration never used the bloom and always saw all three.
     auto grouped = co_await index.getSeriesGroupedByTag("deviceData", "deviceName");
@@ -436,9 +422,11 @@ SEASTAR_TEST_F(PostingsBitmapTest, OpenRepairsStalePersistedBloomImmediately) {
     co_await index.open();
     auto found = co_await index.findSeriesByTag("deviceData", "deviceName", "GW85");
     EXPECT_EQ(found.size(), 1u) << "open() did not repair the stale bloom";
-    if (!found.empty()) EXPECT_EQ(found[0], idA);
+    if (!found.empty())
+        EXPECT_EQ(found[0], idA);
     auto scoped = co_await index.findSeries("deviceData", {{"deviceName", "GW85"}});
     EXPECT_TRUE(scoped.has_value());
-    if (scoped.has_value()) EXPECT_EQ(scoped->size(), 1u);
+    if (scoped.has_value())
+        EXPECT_EQ(scoped->size(), 1u);
     co_await index.close();
 }

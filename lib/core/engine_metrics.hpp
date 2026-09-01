@@ -26,6 +26,13 @@ struct EngineMetrics {
     // Non-zero means ingest is sustainably above what this shard can convert.
     uint64_t inserts_rejected_backlog_total = 0;
 
+    // Series/day memberships restored by the startup day-bitmap repair. Any
+    // non-zero value means the previous shutdown was unclean AND its lost
+    // membership would otherwise have made those series silently undiscoverable
+    // for queries starting in the affected range — the 2026-09-01 incident. A
+    // repair that keeps finding work every restart is a signal in itself.
+    uint64_t day_bitmap_memberships_repaired_total = 0;
+
     // Seastar metrics registration (automatically deregisters on destruction)
     seastar::metrics::metric_groups _metrics;
 

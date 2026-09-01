@@ -33,10 +33,16 @@ static inline size_t fastRange(uint32_t x, size_t n) {
 
 void BloomFilter::build() {
     if (numKeys_ == 0) {
+        // Nothing to encode. Mark it NULL rather than merely empty so it can
+        // never short-circuit a lookup: a zero-key filter serializes to a
+        // zero-length payload that deserializeFrom would otherwise accept as a
+        // real, everything-rejecting filter.
         filter_.clear();
+        isNull_ = true;
         built_ = true;
         return;
     }
+    isNull_ = false;
 
     // Total bits = numKeys * bitsPerKey, rounded up to 64-bit words, minimum 64 bits
     size_t numBits = std::max(static_cast<size_t>(64), numKeys_ * bitsPerKey_);
@@ -82,8 +88,14 @@ bool BloomFilter::mayContain(std::string_view key) const {
 bool BloomFilter::mayContainHash(uint64_t hash) const {
     if (isNull_)
         return true;
+    // An empty filter has no bits to prove anything with. Answering "definitely
+    // absent" here lets a filter that was never populated — built with zero
+    // keys, or deserialized from a zero-length payload — veto every lookup that
+    // consults it, which on the discovery path means a measurement's series
+    // silently ceasing to exist. Absence of evidence is not evidence of
+    // absence: say "maybe" and let the caller check the real data.
     if (filter_.empty())
-        return false;
+        return true;
 
     size_t numBits = filter_.size() * 64;
 
@@ -157,6 +169,11 @@ BloomFilter BloomFilter::deserializeFrom(std::string_view data) {
                     (static_cast<uint32_t>(static_cast<uint8_t>(data[4])) << 24);
 
     if (data.size() < 5 + size) {
+        return createNull();
+    }
+    if (size == 0) {
+        // A filter with no bits rejects everything it is asked about. Treat it
+        // as absent rather than as authority.
         return createNull();
     }
 

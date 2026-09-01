@@ -147,6 +147,19 @@ struct IndexConfig {
     uint64_t discovery_cache_bytes = 16 * 1024 * 1024;  // 16MB for discovery result LRU cache
     uint64_t block_cache_bytes = 8 * 1024 * 1024;       // 8MB per shard for SSTable block cache
     uint32_t compaction_rate_limit_mbps = 0;            // Max compaction write MB/s (0 = unlimited)
+
+    // Day bitmaps (time-scoped discovery) are otherwise persisted only when the
+    // index memtable crosses write_buffer_size — which a fleet writing to
+    // long-established series may not do for days, since that memtable is fed
+    // mostly by NEW series metadata. Flushing them on a timer bounds what an
+    // unclean shutdown can lose to this interval. 0 disables the timer.
+    uint32_t day_bitmap_flush_interval_seconds = 30;
+    // How far back Engine::rebuildDayBitmaps() reconstructs day membership from
+    // TSM per-series time bounds at startup. Every day in the window costs one
+    // KV get per (measurement, day) and holds a dirty bitmap in RAM until the
+    // next flush, so this bounds both startup time and memory. 0 disables the
+    // rebuild.
+    uint32_t day_bitmap_rebuild_window_days = 32;
 };
 
 struct StreamingConfig {
@@ -296,12 +309,13 @@ struct glz::meta<timestar::HttpConfig> {
 template <>
 struct glz::meta<timestar::IndexConfig> {
     using T = timestar::IndexConfig;
-    static constexpr auto value =
-        object("bloom_filter_bits", &T::bloom_filter_bits, "block_size", &T::block_size, "write_buffer_size",
-               &T::write_buffer_size, "max_open_files", &T::max_open_files, "max_file_size", &T::max_file_size,
-               "series_cache_size", &T::series_cache_size, "metadata_cache_bytes", &T::metadata_cache_bytes,
-               "discovery_cache_bytes", &T::discovery_cache_bytes, "block_cache_bytes", &T::block_cache_bytes,
-               "compaction_rate_limit_mbps", &T::compaction_rate_limit_mbps);
+    static constexpr auto value = object(
+        "bloom_filter_bits", &T::bloom_filter_bits, "block_size", &T::block_size, "write_buffer_size",
+        &T::write_buffer_size, "max_open_files", &T::max_open_files, "max_file_size", &T::max_file_size,
+        "series_cache_size", &T::series_cache_size, "metadata_cache_bytes", &T::metadata_cache_bytes,
+        "discovery_cache_bytes", &T::discovery_cache_bytes, "block_cache_bytes", &T::block_cache_bytes,
+        "compaction_rate_limit_mbps", &T::compaction_rate_limit_mbps, "day_bitmap_flush_interval_seconds",
+        &T::day_bitmap_flush_interval_seconds, "day_bitmap_rebuild_window_days", &T::day_bitmap_rebuild_window_days);
 };
 
 template <>

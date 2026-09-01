@@ -16,10 +16,12 @@
 #include "../../../lib/index/native/native_index.hpp"
 #include "../../../lib/storage/tsm.hpp"
 #include "../../seastar_gtest.hpp"
+#include "../../test_helpers/native_index_test_access.hpp"
 
 #include <endian.h>
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <filesystem>
 #include <seastar/core/coroutine.hh>
 #include <string>
@@ -37,6 +39,17 @@ static std::string testEncodeDayBitmapKey(const std::string& measurement, uint32
     return key;
 }
 namespace ke = timestar::index::keys;
+
+// Days used by the watermark tests must be real (past) days: noteRecordedDay
+// refuses days more than a week ahead of the wall clock, so a hardcoded
+// far-future day would correctly fail to advance the watermark and the test
+// would be asserting the guard rather than the behaviour it means to pin.
+static uint32_t todayDay() {
+    const auto nowNs = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch())
+            .count());
+    return ke::dayBucketFromNs(nowNs);
+}
 
 class TimeScopedPostingsTest : public ::testing::Test {
 public:
@@ -510,16 +523,15 @@ SEASTAR_TEST_F(TimeScopedPostingsTest, MetadataOpDaySpanCoversFirstBatch) {
 
     // Series must be discoverable on every day of the span.
     for (int d = 0; d < 3; ++d) {
-        auto r = co_await index.findSeriesWithMetadataTimeScoped(
-            "batchmeas", {{"host", "h1"}}, {}, day21000 + d * ke::NS_PER_DAY,
-            day21000 + d * ke::NS_PER_DAY + ke::NS_PER_DAY - 1);
+        auto r = co_await index.findSeriesWithMetadataTimeScoped("batchmeas", {{"host", "h1"}}, {},
+                                                                 day21000 + d * ke::NS_PER_DAY,
+                                                                 day21000 + d * ke::NS_PER_DAY + ke::NS_PER_DAY - 1);
         EXPECT_TRUE(r.has_value());
         EXPECT_EQ(r->size(), 1u) << "day offset " << d;
     }
     // And absent outside it.
-    auto rOut = co_await index.findSeriesWithMetadataTimeScoped("batchmeas", {{"host", "h1"}}, {},
-                                                                day21000 + 5 * ke::NS_PER_DAY,
-                                                                day21000 + 6 * ke::NS_PER_DAY - 1);
+    auto rOut = co_await index.findSeriesWithMetadataTimeScoped(
+        "batchmeas", {{"host", "h1"}}, {}, day21000 + 5 * ke::NS_PER_DAY, day21000 + 6 * ke::NS_PER_DAY - 1);
     EXPECT_TRUE(rOut.has_value());
     EXPECT_EQ(rOut->size(), 0u);
     co_await index.close();
@@ -547,8 +559,7 @@ SEASTAR_TEST_F(TimeScopedPostingsTest, RecordInsertDaysAddsLaterDays) {
     std::vector<uint64_t> ts = {day22000 + 3 * ke::NS_PER_DAY, day22000 + 3 * ke::NS_PER_DAY + 1'000'000'000ULL};
     co_await index.recordInsertDays("bm2", seriesId, ts);
 
-    auto r = co_await index.findSeriesWithMetadataTimeScoped("bm2", {{"host", "h1"}}, {},
-                                                             day22000 + 3 * ke::NS_PER_DAY,
+    auto r = co_await index.findSeriesWithMetadataTimeScoped("bm2", {{"host", "h1"}}, {}, day22000 + 3 * ke::NS_PER_DAY,
                                                              day22000 + 4 * ke::NS_PER_DAY - 1);
     EXPECT_TRUE(r.has_value());
     EXPECT_EQ(r->size(), 1u);
@@ -564,8 +575,8 @@ SEASTAR_TEST_F(TimeScopedPostingsTest, TimeScopedCachedServesSharedVector) {
     co_await index.open();
 
     uint64_t day23000 = 23000ULL * ke::NS_PER_DAY;
-    auto insert = makeInsert<double>("tsc_cache", "usage", {{"host", "h1"}}, {day23000, day23000 + 1'000'000'000ULL},
-                                     {1.0, 2.0});
+    auto insert =
+        makeInsert<double>("tsc_cache", "usage", {{"host", "h1"}}, {day23000, day23000 + 1'000'000'000ULL}, {1.0, 2.0});
     co_await index.indexInsert(insert);
 
     auto r1 = co_await index.findSeriesWithMetadataTimeScopedCached("tsc_cache", {{"host", "h1"}}, {}, day23000,
@@ -580,9 +591,8 @@ SEASTAR_TEST_F(TimeScopedPostingsTest, TimeScopedCachedServesSharedVector) {
     EXPECT_EQ(r1.value().get(), r2.value().get()) << "identical day-scoped queries must share the cached vector";
 
     // A different day range must NOT alias to the same cache entry.
-    auto r3 = co_await index.findSeriesWithMetadataTimeScopedCached("tsc_cache", {{"host", "h1"}}, {},
-                                                                    day23000 + ke::NS_PER_DAY,
-                                                                    day23000 + 2 * ke::NS_PER_DAY - 1);
+    auto r3 = co_await index.findSeriesWithMetadataTimeScopedCached(
+        "tsc_cache", {{"host", "h1"}}, {}, day23000 + ke::NS_PER_DAY, day23000 + 2 * ke::NS_PER_DAY - 1);
     EXPECT_TRUE(r3.has_value());
     EXPECT_NE(r1.value().get(), r3.value().get());
     EXPECT_EQ((*r3)->size(), 0u);
@@ -616,6 +626,415 @@ SEASTAR_TEST_F(TimeScopedPostingsTest, TimeScopedCachedInvalidatedByNewDayMember
     EXPECT_TRUE(after.has_value());
     EXPECT_EQ((*after)->size(), 1u) << "new day membership must invalidate cached day-scoped discovery";
     EXPECT_EQ((*(*after))[0].seriesId, seriesId);
+
+    co_await index.close();
+}
+
+// ── Regression: day bitmaps lost to an unclean shutdown ──
+//
+// Production 2026-09-01 (1.4.2), project 99e7bc58 `builtIn.node.stats`: for a
+// given series a query over [T, now] returned ZERO points while [T-2d, now]
+// returned every point after T. The cutoff was per-series (2026-08-30T00:00Z on
+// one series, 2026-08-31T03:57Z on another) and fell on data that was written,
+// stored and readable — only DISCOVERY dropped it.
+//
+// Mechanism: findSeriesWithMetadataTimeScoped unions the per-day bitmaps of the
+// days the query spans and treats an empty union as "no active series". Day
+// membership lives in dayBitmapCache_ and is persisted ONLY when the index
+// memtable crosses write_buffer_size (flushDirtyDayBitmaps, called from
+// maybeFlushMemTable/flushMemTable). In steady state that memtable is driven by
+// NEW series metadata, so a fleet writing to long-established series can go days
+// without a flush. Postings bitmaps get a crash-window repair at open() and the
+// measurement blooms have been rebuilt at open() since 1.4.2 — day bitmaps get
+// neither (native_index.cpp:285-289 concedes this and assumes the gap is
+// "bounded to the crash window").
+//
+// So an unclean exit — a health-check restart, an OOM kill, a task replacement —
+// permanently erases day membership for every day since the last flush, and the
+// series silently disappears from any query that STARTS in that region. Widening
+// the start picks up an older day, the union is non-empty, and the same points
+// come back: exactly the asymmetry observed.
+//
+// Note what the fix must NOT be: making an empty union fall back to
+// non-time-scoped discovery. InactiveDayReturnsEmpty above pins the opposite —
+// a day with genuinely no data must return empty. The recovery has to restore
+// the membership (rebuild at open from the TSM per-series [minTime,maxTime]
+// bounds plus the memory stores), not weaken the pruning.
+
+SEASTAR_TEST_F(TimeScopedPostingsTest, DayMembershipSurvivesUncleanShutdown) {
+    // Day 20100 is flushed and durable; 20101-20103 are the "crash window".
+    constexpr uint32_t kFlushedDay = 20100;
+    constexpr uint32_t kCrashDay = 20101;
+    const uint64_t flushedDayNs = static_cast<uint64_t>(kFlushedDay) * ke::NS_PER_DAY;
+
+    {
+        NativeIndex index(0);
+        co_await index.open();
+
+        auto insert =
+            makeInsert<double>("stats", "batteryPercent", {{"deviceId", "dev-1c4e"}}, {flushedDayNs + 1}, {94.0});
+        co_await index.indexInsert(insert);
+        co_await index.compact();  // day 20100 is now on disk
+        co_await index.close();
+    }
+
+    {
+        NativeIndex index(0);
+        co_await index.open();
+
+        // Three more days of writes to the SAME, already-established series —
+        // no new series metadata, so nothing forces a memtable flush.
+        auto seriesId =
+            SeriesId128::fromSeriesKey(timestar::buildSeriesKey("stats", {{"deviceId", "dev-1c4e"}}, "batteryPercent"));
+        for (uint32_t d = kCrashDay; d <= kCrashDay + 2; ++d) {
+            co_await index.recordInsertDays("stats", seriesId,
+                                            {static_cast<uint64_t>(d) * ke::NS_PER_DAY + 1'000'000'000ULL});
+        }
+
+        // Precondition: those three days are RAM-only. If a future change makes
+        // recordInsertDays durable immediately, this test stops modelling a
+        // crash — say so loudly rather than passing for the wrong reason.
+        EXPECT_FALSE(co_await NativeIndexTestAccess::hasPersistedDayBitmap(index, "stats", kCrashDay))
+            << "test precondition: day membership was expected to be RAM-only until a memtable flush";
+
+        // The process dies here: everything dirty is lost, metadata and LocalIds
+        // (written with the series-creation batch) are not.
+        co_await NativeIndexTestAccess::dropDayBitmapsFrom(index, "stats", kCrashDay);
+        co_await index.close();
+    }
+
+    {
+        NativeIndex index(0);
+        co_await index.open();
+
+        // What Engine::rebuildDayBitmaps() does at startup, with the time bounds
+        // the TSM sparse index supplies (Engine drives this because the index
+        // itself has no access to storage-layer timestamps — see engine.cpp).
+        auto seriesId =
+            SeriesId128::fromSeriesKey(timestar::buildSeriesKey("stats", {{"deviceId", "dev-1c4e"}}, "batteryPercent"));
+        std::vector<NativeIndex::SeriesTimeBounds> bounds{
+            {seriesId, flushedDayNs, static_cast<uint64_t>(kCrashDay + 2) * ke::NS_PER_DAY + 1'000'000'000ULL}};
+        const uint32_t watermark = index.dayBitmapWatermark().value_or(0);
+        EXPECT_EQ(watermark, kCrashDay - 1) << "watermark must name the last durable day";
+        co_await index.rebuildDayBitmapsFromBounds(bounds, watermark, kCrashDay + 2);
+
+        // The console's narrow window: a range that STARTS inside the crash
+        // window. This is the query that returned nothing in production.
+        const uint64_t narrowStart = static_cast<uint64_t>(kCrashDay + 2) * ke::NS_PER_DAY;
+        auto narrow = co_await index.findSeriesWithMetadataTimeScoped("stats", {{"deviceId", "dev-1c4e"}}, {},
+                                                                      narrowStart, narrowStart + ke::NS_PER_DAY - 1);
+        EXPECT_TRUE(narrow.has_value());
+        EXPECT_EQ(narrow->size(), 1u) << "series lost from a range starting inside the crash window";
+
+        // Widening the start to before the last durable day must not change the
+        // answer. In production it did — that asymmetry IS the bug.
+        auto wide = co_await index.findSeriesWithMetadataTimeScoped("stats", {{"deviceId", "dev-1c4e"}}, {},
+                                                                    flushedDayNs, narrowStart + ke::NS_PER_DAY - 1);
+        EXPECT_TRUE(wide.has_value());
+        EXPECT_EQ(wide->size(), 1u);
+
+        // A day the series never wrote to must still prune — the repair may not
+        // degrade into "always discoverable".
+        const uint64_t quietStart = static_cast<uint64_t>(kCrashDay + 10) * ke::NS_PER_DAY;
+        auto quiet = co_await index.findSeriesWithMetadataTimeScoped("stats", {{"deviceId", "dev-1c4e"}}, {},
+                                                                     quietStart, quietStart + ke::NS_PER_DAY - 1);
+        EXPECT_TRUE(quiet.has_value());
+        EXPECT_EQ(quiet->size(), 0u) << "pruning must survive the repair";
+
+        co_await index.close();
+    }
+}
+
+// The same defect seen through the aggregate symptom rather than one series: a
+// measurement keeps ingesting, and every device's recent day membership is lost.
+// A per-day walk over the affected window must not report a hole that the
+// whole-range query contradicts.
+SEASTAR_TEST_F(TimeScopedPostingsTest, EveryDayInTheCrashWindowStaysDiscoverable) {
+    constexpr uint32_t kFlushedDay = 20500;
+    constexpr int kDevices = 5;
+    constexpr int kCrashDays = 4;
+    const uint64_t flushedDayNs = static_cast<uint64_t>(kFlushedDay) * ke::NS_PER_DAY;
+
+    {
+        NativeIndex index(0);
+        co_await index.open();
+        for (int d = 0; d < kDevices; ++d) {
+            auto insert = makeInsert<double>("fleet", "uptimeSeconds", {{"deviceId", "dev-" + std::to_string(d)}},
+                                             {flushedDayNs + 1}, {1.0});
+            co_await index.indexInsert(insert);
+        }
+        co_await index.compact();
+        co_await index.close();
+    }
+
+    {
+        NativeIndex index(0);
+        co_await index.open();
+        for (int d = 0; d < kDevices; ++d) {
+            auto seriesId = SeriesId128::fromSeriesKey(
+                timestar::buildSeriesKey("fleet", {{"deviceId", "dev-" + std::to_string(d)}}, "uptimeSeconds"));
+            for (int day = 1; day <= kCrashDays; ++day) {
+                co_await index.recordInsertDays(
+                    "fleet", seriesId,
+                    {(static_cast<uint64_t>(kFlushedDay) + day) * ke::NS_PER_DAY + 1'000'000'000ULL});
+            }
+        }
+        co_await NativeIndexTestAccess::dropDayBitmapsFrom(index, "fleet", kFlushedDay + 1);
+        co_await index.close();
+    }
+
+    {
+        NativeIndex index(0);
+        co_await index.open();
+
+        std::vector<NativeIndex::SeriesTimeBounds> bounds;
+        for (int d = 0; d < kDevices; ++d) {
+            bounds.push_back({SeriesId128::fromSeriesKey(timestar::buildSeriesKey(
+                                  "fleet", {{"deviceId", "dev-" + std::to_string(d)}}, "uptimeSeconds")),
+                              flushedDayNs,
+                              (static_cast<uint64_t>(kFlushedDay) + kCrashDays) * ke::NS_PER_DAY + 1'000'000'000ULL});
+        }
+        co_await index.rebuildDayBitmapsFromBounds(bounds, index.dayBitmapWatermark().value_or(0),
+                                                   kFlushedDay + kCrashDays);
+
+        for (int day = 1; day <= kCrashDays; ++day) {
+            const uint64_t start = (static_cast<uint64_t>(kFlushedDay) + day) * ke::NS_PER_DAY;
+            auto r =
+                co_await index.findSeriesWithMetadataTimeScoped("fleet", {}, {}, start, start + ke::NS_PER_DAY - 1);
+            EXPECT_TRUE(r.has_value());
+            EXPECT_EQ(r->size(), static_cast<size_t>(kDevices)) << "day " << (kFlushedDay + day);
+        }
+        co_await index.close();
+    }
+}
+
+// Phase 1: the watermark names the last day whose membership is durable, and it
+// survives a reopen. Without it the startup repair has no bound and would have
+// to choose between rescanning all history or guessing.
+SEASTAR_TEST_F(TimeScopedPostingsTest, DayBitmapWatermarkPersistsLastDurableDay) {
+    const uint32_t kDay = todayDay() - 3;
+    {
+        NativeIndex index(0);
+        co_await index.open();
+        EXPECT_FALSE(index.dayBitmapWatermark().has_value()) << "nothing flushed yet";
+
+        auto insert =
+            makeInsert<double>("wm", "v", {{"host", "h1"}}, {static_cast<uint64_t>(kDay) * ke::NS_PER_DAY + 1}, {1.0});
+        co_await index.indexInsert(insert);
+        co_await index.close();  // flushes day bitmaps + watermark
+    }
+
+    NativeIndex index(0);
+    co_await index.open();
+    EXPECT_TRUE(index.dayBitmapWatermark().has_value());
+    EXPECT_EQ(index.dayBitmapWatermark().value_or(0), kDay);
+    co_await index.close();
+}
+
+// Phase 3: membership becomes durable on the timed flush path, with no memtable
+// crossing. This is what shrinks the crash window from days to one interval —
+// the memtable threshold is fed by NEW series metadata, so a shard writing only
+// to established series may never cross it.
+SEASTAR_TEST_F(TimeScopedPostingsTest, TimedFlushPersistsDayBitmapsWithoutMemtableCrossing) {
+    const uint32_t kDay = todayDay() - 4;
+    NativeIndex index(0);
+    co_await index.open();
+
+    auto insert =
+        makeInsert<double>("timed", "v", {{"host", "h1"}}, {static_cast<uint64_t>(kDay) * ke::NS_PER_DAY + 1}, {1.0});
+    auto seriesId = co_await index.indexInsert(insert);
+
+    // A later day on an ESTABLISHED series: no new metadata, so nothing pushes
+    // the memtable past write_buffer_size.
+    const uint32_t laterDay = kDay + 1;
+    co_await index.recordInsertDays("timed", seriesId,
+                                    {static_cast<uint64_t>(laterDay) * ke::NS_PER_DAY + 1'000'000'000ULL});
+    EXPECT_FALSE(co_await NativeIndexTestAccess::hasPersistedDayBitmap(index, "timed", laterDay))
+        << "precondition: not yet durable";
+
+    co_await index.flushDayBitmapsNow();
+
+    EXPECT_TRUE(co_await NativeIndexTestAccess::hasPersistedDayBitmap(index, "timed", laterDay))
+        << "the timed flush must make day membership durable";
+    EXPECT_TRUE(index.dayBitmapWatermark().has_value());
+    EXPECT_EQ(index.dayBitmapWatermark().value_or(0), laterDay);
+
+    co_await index.close();
+}
+
+// The repair is a superset, never a resurrection of everything: it must respect
+// the window it is given, so a clamped window (and the retention deletes below
+// it) is not undone. Bounds spanning far more days than the window are handed
+// in deliberately.
+SEASTAR_TEST_F(TimeScopedPostingsTest, RebuildRespectsWindowAndDoesNotResurrectExpiredDays) {
+    constexpr uint32_t kOldDay = 21100;
+    constexpr uint32_t kRecentDay = 21140;
+
+    NativeIndex index(0);
+    co_await index.open();
+
+    auto insert = makeInsert<double>(
+        "ret", "v", {{"host", "h1"}},
+        {static_cast<uint64_t>(kOldDay) * ke::NS_PER_DAY + 1, static_cast<uint64_t>(kRecentDay) * ke::NS_PER_DAY + 1},
+        {1.0, 2.0});
+    auto seriesId = co_await index.indexInsert(insert);
+
+    // Retention drops everything before the recent day.
+    co_await index.removeExpiredDayBitmaps("ret", kRecentDay);
+    co_await NativeIndexTestAccess::dropDayBitmapsFrom(index, "ret", kRecentDay);
+
+    // Repair only the recent window, exactly as Engine clamps it — even though
+    // the series' bounds reach back to kOldDay.
+    std::vector<NativeIndex::SeriesTimeBounds> bounds{{seriesId, static_cast<uint64_t>(kOldDay) * ke::NS_PER_DAY + 1,
+                                                       static_cast<uint64_t>(kRecentDay) * ke::NS_PER_DAY + 1}};
+    co_await index.rebuildDayBitmapsFromBounds(bounds, kRecentDay, kRecentDay);
+
+    const uint64_t recentStart = static_cast<uint64_t>(kRecentDay) * ke::NS_PER_DAY;
+    auto recent =
+        co_await index.findSeriesWithMetadataTimeScoped("ret", {}, {}, recentStart, recentStart + ke::NS_PER_DAY - 1);
+    EXPECT_TRUE(recent.has_value());
+    EXPECT_EQ(recent->size(), 1u) << "the repaired window must be discoverable";
+
+    EXPECT_FALSE(co_await NativeIndexTestAccess::hasPersistedDayBitmap(index, "ret", kOldDay))
+        << "a day outside the window must stay deleted — the repair must not undo retention";
+
+    co_await index.close();
+}
+
+// The watermark must never run ahead of what has actually been repaired.
+//
+// A rebuild flushes intermediately to bound memory (dirty day bitmaps cannot be
+// evicted). If those flushes also advanced the watermark, a rebuild killed
+// halfway would tell the NEXT startup that days it never got to were already
+// durable — converting a recoverable gap into a permanent one, which is the
+// exact failure this change exists to remove. So the watermark moves once, at
+// the end, and a rebuild wide enough to force intermediate flushes must still
+// end with every day discoverable.
+SEASTAR_TEST_F(TimeScopedPostingsTest, RebuildAdvancesWatermarkOnlyOnCompletion) {
+    // Wide enough to cross kRebuildFlushEveryDirtyKeys (4096 dirty day keys).
+    const uint32_t kSpanDays = 5000;
+    const uint32_t kFirstDay = todayDay() - kSpanDays - 1;
+    const uint64_t firstNs = static_cast<uint64_t>(kFirstDay) * ke::NS_PER_DAY;
+    const uint64_t lastNs = static_cast<uint64_t>(kFirstDay + kSpanDays) * ke::NS_PER_DAY;
+
+    NativeIndex index(0);
+    co_await index.open();
+
+    auto seriesId = co_await index.getOrCreateSeriesId("wide", {{"host", "h1"}}, "v");
+    const uint32_t before = index.dayBitmapWatermark().value_or(0);
+
+    std::vector<NativeIndex::SeriesTimeBounds> bounds{{seriesId, firstNs, lastNs}};
+    auto added = co_await index.rebuildDayBitmapsFromBounds(bounds, kFirstDay, kFirstDay + kSpanDays);
+    EXPECT_EQ(added, static_cast<uint64_t>(kSpanDays) + 1);
+
+    EXPECT_TRUE(index.dayBitmapWatermark().has_value());
+    EXPECT_GT(index.dayBitmapWatermark().value_or(0), before);
+    EXPECT_EQ(index.dayBitmapWatermark().value_or(0), kFirstDay + kSpanDays);
+
+    // Every day is discoverable, including ones written before an intermediate
+    // flush and ones written after it.
+    for (uint32_t day : {kFirstDay, kFirstDay + kSpanDays / 2, kFirstDay + kSpanDays}) {
+        const uint64_t start = static_cast<uint64_t>(day) * ke::NS_PER_DAY;
+        auto r = co_await index.findSeriesWithMetadataTimeScoped("wide", {{"host", "h1"}}, {}, start,
+                                                                 start + ke::NS_PER_DAY - 1);
+        EXPECT_TRUE(r.has_value());
+        EXPECT_EQ(r->size(), 1u) << "day " << day;
+    }
+
+    co_await index.close();
+}
+
+// A rebuild that finds everything already intact must still move the watermark
+// forward — otherwise the repair window never advances and every restart pays
+// for the same scan.
+SEASTAR_TEST_F(TimeScopedPostingsTest, RebuildAdvancesWatermarkWhenNothingWasMissing) {
+    const uint32_t kDay = todayDay() - 5;
+    const uint64_t dayNs = static_cast<uint64_t>(kDay) * ke::NS_PER_DAY;
+
+    NativeIndex index(0);
+    co_await index.open();
+
+    auto insert = makeInsert<double>("intact", "v", {{"host", "h1"}}, {dayNs + 1}, {1.0});
+    auto seriesId = co_await index.indexInsert(insert);
+    co_await index.flushDayBitmapsNow();
+    EXPECT_TRUE(index.dayBitmapWatermark().has_value());
+    EXPECT_EQ(index.dayBitmapWatermark().value_or(0), kDay);
+
+    // Nothing to add: every day in the window is already recorded.
+    std::vector<NativeIndex::SeriesTimeBounds> bounds{{seriesId, dayNs + 1, dayNs + 2}};
+    auto added = co_await index.rebuildDayBitmapsFromBounds(bounds, kDay, kDay + 3);
+    EXPECT_EQ(added, 0u);
+
+    // The window examined reached kDay+3, so that is now known durable.
+    EXPECT_EQ(index.dayBitmapWatermark().value_or(0), kDay + 3);
+
+    {
+        NativeIndex reopened(0);
+        co_await index.close();
+        co_await reopened.open();
+        EXPECT_TRUE(reopened.dayBitmapWatermark().has_value());
+        EXPECT_EQ(reopened.dayBitmapWatermark().value_or(0), kDay + 3)
+            << "the advance must be durable, not just in RAM";
+        co_await reopened.close();
+    }
+}
+
+// A client timestamp years in the future must not move the watermark.
+//
+// The watermark is what a later boot trusts when deciding how much to repair.
+// One device with an unset clock stamping 2040 would otherwise pin it there for
+// a decade: every flush would consider itself current, and the repair window
+// would sit in a range no data lives in while real days lost to a crash stayed
+// lost. The point still gets its day bitmap — it is discoverable — it just does
+// not get to certify durability for everything below it.
+SEASTAR_TEST_F(TimeScopedPostingsTest, ImplausibleFutureTimestampDoesNotPoisonTheWatermark) {
+    const uint32_t realDay = todayDay() - 2;
+    const uint32_t farFutureDay = todayDay() + 5000;
+
+    NativeIndex index(0);
+    co_await index.open();
+
+    auto insert =
+        makeInsert<double>("skew", "v", {{"host", "h1"}}, {static_cast<uint64_t>(realDay) * ke::NS_PER_DAY + 1}, {1.0});
+    auto seriesId = co_await index.indexInsert(insert);
+    co_await index.recordInsertDays("skew", seriesId, {static_cast<uint64_t>(farFutureDay) * ke::NS_PER_DAY + 1});
+    co_await index.flushDayBitmapsNow();
+
+    EXPECT_EQ(index.dayBitmapWatermark().value_or(0), realDay) << "a future timestamp must not advance the watermark";
+
+    // The future day is still recorded, so a query for it finds the series.
+    const uint64_t futureStart = static_cast<uint64_t>(farFutureDay) * ke::NS_PER_DAY;
+    auto r =
+        co_await index.findSeriesWithMetadataTimeScoped("skew", {}, {}, futureStart, futureStart + ke::NS_PER_DAY - 1);
+    EXPECT_TRUE(r.has_value());
+    EXPECT_EQ(r->size(), 1u) << "the point is still discoverable on its own day";
+
+    co_await index.close();
+}
+
+// A single-tag query over the series limit must ERROR, not truncate.
+//
+// findSeriesByTag stops collecting at its cap, so findSeries' `size > maxSeries`
+// check could never fire: an over-limit query came back as a short, complete
+// looking answer. Missing series presented as the whole truth is the same
+// failure as a wrong empty, only partial — and harder to notice.
+SEASTAR_TEST_F(TimeScopedPostingsTest, SingleTagQueryOverTheLimitReportsItInsteadOfTruncating) {
+    NativeIndex index(0);
+    co_await index.open();
+
+    for (int i = 0; i < 10; ++i) {
+        co_await index.getOrCreateSeriesId("limited", {{"site", "north"}, {"deviceId", "dev-" + std::to_string(i)}},
+                                           "v");
+    }
+
+    auto overLimit = co_await index.findSeries("limited", {{"site", "north"}}, 5);
+    EXPECT_FALSE(overLimit.has_value()) << "10 series with a limit of 5 must report the limit, not return 5";
+
+    auto withinLimit = co_await index.findSeries("limited", {{"site", "north"}}, 50);
+    EXPECT_TRUE(withinLimit.has_value());
+    if (withinLimit.has_value()) {
+        EXPECT_EQ(withinLimit->size(), 10u);
+    }
 
     co_await index.close();
 }

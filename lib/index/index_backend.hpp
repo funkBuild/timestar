@@ -83,6 +83,27 @@ enum IndexKeyType : uint8_t {
     // Shard-local: every reader and writer of an id routes to the same shard,
     // so unlike FIELD_TYPE (0x09) this is never broadcast.
     SERIES_VALUE_TYPE = 0x18,  // series_id -> 1 byte TSMValueType
+
+    // Day (4B LE) through which day-bitmap membership is known durable: the
+    // wall-clock day of the last flushDirtyDayBitmaps(). Unlike
+    // POSTINGS_WATERMARK this is TIME-shaped, not local-id-shaped, because day
+    // membership is a function of insert timestamps — which the index never
+    // persists per series — so the repair bound has to be a day, and the
+    // timestamps themselves come from the TSM sparse index (see
+    // Engine::rebuildDayBitmaps).
+    DAY_BITMAP_WATERMARK = 0x19,  // singleton -> day (4B LE) at last day-bitmap flush
+
+    // Written by close() after its final flush succeeds, deleted by open().
+    // Present at open == the previous session shut down cleanly, so every dirty
+    // cache reached disk and the startup day-bitmap repair has nothing to do.
+    // Absent (the default, and what any crash leaves) == repair.
+    INDEX_CLEAN_SHUTDOWN = 0x1A,  // singleton -> "1"
+
+    // measurement -> earliest day (4B LE) that recordDaySpan's kMaxDaySpan clamp
+    // REFUSED to record. Its presence is the only honest signal that a
+    // measurement's day bitmaps are known-incomplete at the old end, which is
+    // what lets a query starting there fall back instead of trusting silence.
+    CLAMPED_DAY_HISTORY = 0x1B,
 };
 
 // Metadata for a time series
