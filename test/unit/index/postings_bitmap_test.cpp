@@ -16,6 +16,7 @@
 #include "../../../lib/index/key_encoding.hpp"
 #include "../../../lib/core/series_id.hpp"
 #include "../../seastar_gtest.hpp"
+#include "../../test_helpers/native_index_test_access.hpp"
 
 #include <gtest/gtest.h>
 #include <seastar/core/coroutine.hh>
@@ -25,25 +26,6 @@
 
 using namespace timestar::index;
 
-namespace timestar::index {
-// Plants a persisted measurement bloom that omits some postings keys — what a
-// <= 1.4.0 server could leave on disk — bypassing every normal write path.
-// Lives in timestar::index because that is where NativeIndex befriends it.
-struct NativeIndexTestAccess {
-    static seastar::future<> plantStaleBloom(NativeIndex& index, const std::string& measurement,
-                                             const std::vector<std::string>& postingsKeysToKeep) {
-        BloomFilter bloom(10);
-        for (const auto& key : postingsKeysToKeep) {
-            bloom.addKey(key);
-        }
-        bloom.build();
-        std::string serialized;
-        bloom.serializeTo(serialized);
-        co_await index.kvPut(keys::encodeMeasurementBloomKey(measurement), serialized);
-        index.measurementBloomCache_.erase(measurement);
-    }
-};
-}  // namespace timestar::index
 
 class PostingsBitmapTest : public ::testing::Test {
 public:
