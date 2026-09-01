@@ -814,8 +814,8 @@ SEASTAR_TEST_F(TimeScopedPostingsTest, DayBitmapWatermarkPersistsLastDurableDay)
 
     NativeIndex index(0);
     co_await index.open();
-    ASSERT_TRUE(index.dayBitmapWatermark().has_value());
-    EXPECT_EQ(*index.dayBitmapWatermark(), kDay);
+    EXPECT_TRUE(index.dayBitmapWatermark().has_value());
+    EXPECT_EQ(index.dayBitmapWatermark().value_or(0), kDay);
     co_await index.close();
 }
 
@@ -844,8 +844,8 @@ SEASTAR_TEST_F(TimeScopedPostingsTest, TimedFlushPersistsDayBitmapsWithoutMemtab
 
     EXPECT_TRUE(co_await NativeIndexTestAccess::hasPersistedDayBitmap(index, "timed", laterDay))
         << "the timed flush must make day membership durable";
-    ASSERT_TRUE(index.dayBitmapWatermark().has_value());
-    EXPECT_EQ(*index.dayBitmapWatermark(), laterDay);
+    EXPECT_TRUE(index.dayBitmapWatermark().has_value());
+    EXPECT_EQ(index.dayBitmapWatermark().value_or(0), laterDay);
 
     co_await index.close();
 }
@@ -915,9 +915,9 @@ SEASTAR_TEST_F(TimeScopedPostingsTest, RebuildAdvancesWatermarkOnlyOnCompletion)
     auto added = co_await index.rebuildDayBitmapsFromBounds(bounds, kFirstDay, kFirstDay + kSpanDays);
     EXPECT_EQ(added, static_cast<uint64_t>(kSpanDays) + 1);
 
-    ASSERT_TRUE(index.dayBitmapWatermark().has_value());
-    EXPECT_GT(*index.dayBitmapWatermark(), before);
-    EXPECT_EQ(*index.dayBitmapWatermark(), kFirstDay + kSpanDays);
+    EXPECT_TRUE(index.dayBitmapWatermark().has_value());
+    EXPECT_GT(index.dayBitmapWatermark().value_or(0), before);
+    EXPECT_EQ(index.dayBitmapWatermark().value_or(0), kFirstDay + kSpanDays);
 
     // Every day is discoverable, including ones written before an intermediate
     // flush and ones written after it.
@@ -945,8 +945,8 @@ SEASTAR_TEST_F(TimeScopedPostingsTest, RebuildAdvancesWatermarkWhenNothingWasMis
     auto insert = makeInsert<double>("intact", "v", {{"host", "h1"}}, {dayNs + 1}, {1.0});
     auto seriesId = co_await index.indexInsert(insert);
     co_await index.flushDayBitmapsNow();
-    ASSERT_TRUE(index.dayBitmapWatermark().has_value());
-    EXPECT_EQ(*index.dayBitmapWatermark(), kDay);
+    EXPECT_TRUE(index.dayBitmapWatermark().has_value());
+    EXPECT_EQ(index.dayBitmapWatermark().value_or(0), kDay);
 
     // Nothing to add: every day in the window is already recorded.
     std::vector<NativeIndex::SeriesTimeBounds> bounds{{seriesId, dayNs + 1, dayNs + 2}};
@@ -954,14 +954,15 @@ SEASTAR_TEST_F(TimeScopedPostingsTest, RebuildAdvancesWatermarkWhenNothingWasMis
     EXPECT_EQ(added, 0u);
 
     // The window examined reached kDay+3, so that is now known durable.
-    EXPECT_EQ(*index.dayBitmapWatermark(), kDay + 3);
+    EXPECT_EQ(index.dayBitmapWatermark().value_or(0), kDay + 3);
 
     {
         NativeIndex reopened(0);
         co_await index.close();
         co_await reopened.open();
-        ASSERT_TRUE(reopened.dayBitmapWatermark().has_value());
-        EXPECT_EQ(*reopened.dayBitmapWatermark(), kDay + 3) << "the advance must be durable, not just in RAM";
+        EXPECT_TRUE(reopened.dayBitmapWatermark().has_value());
+        EXPECT_EQ(reopened.dayBitmapWatermark().value_or(0), kDay + 3)
+            << "the advance must be durable, not just in RAM";
         co_await reopened.close();
     }
 }
