@@ -557,7 +557,8 @@ private:
     // introduce a clamp for this shard's series is this shard.
     tsl::robin_map<std::string, std::optional<uint32_t>> clampedHistoryCache_;
     seastar::future<> noteClampedHistory(const std::string& measurement, uint32_t droppedFromDay);
-    seastar::future<bool> hasClampedHistory(const std::string& measurement);
+    // The last day the clamp refused to record for this measurement, if any.
+    seastar::future<std::optional<uint32_t>> clampedHistoryThrough(const std::string& measurement);
     seastar::future<roaring::Roaring*> getOrLoadDayBitmapForInsert(std::string& cacheKey);
     seastar::future<const roaring::Roaring*> getDayBitmapByKey(const std::string& cacheKey);
     // flushedKeys, when given, receives the cache keys whose dirty flag this

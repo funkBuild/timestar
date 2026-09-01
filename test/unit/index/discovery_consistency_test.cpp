@@ -274,3 +274,59 @@ SEASTAR_TEST_F(DiscoveryConsistencyTest, QueryBelowTheOldestRecordedDayFallsBack
 
     co_await index.close();
 }
+
+// One healthy series must not be able to hide a clamped one.
+//
+// The clamp fallback originally lived inside the "day union came back empty"
+// branch. A measurement normally holds many devices: if one device's history
+// was clamped away while its neighbours are healthy, the union is NON-empty —
+// the neighbours match — so that branch never runs and the clamped device is
+// dropped from every query reaching into its missing range. The single-series
+// test passed the whole time, because with one series the union IS empty.
+SEASTAR_TEST_F(DiscoveryConsistencyTest, ClampedSeriesIsFoundEvenWhenHealthySeriesMatchTheSameRange) {
+    const uint32_t recentDay = todayDay() - 1;
+    const uint32_t oldDay = recentDay - 900;  // far outside kMaxDaySpan (366)
+
+    NativeIndex index(0);
+    co_await index.open();
+
+    // dev-clamped: first batch spans ~900 days, so the old end is refused.
+    MetadataOp clamped;
+    clamped.valueType = TSMValueType::Float;
+    clamped.measurement = "mixed";
+    clamped.fieldName = "v";
+    clamped.tags = {{"deviceId", "dev-clamped"}};
+    clamped.minTs = static_cast<uint64_t>(oldDay) * ke::NS_PER_DAY;
+    clamped.maxTs = static_cast<uint64_t>(recentDay) * ke::NS_PER_DAY;
+    co_await index.indexMetadataBatch({clamped});
+
+    // dev-healthy: writes on the old day too, and IS recorded there, so the day
+    // union for a query over that range is non-empty.
+    MetadataOp healthy;
+    healthy.valueType = TSMValueType::Float;
+    healthy.measurement = "mixed";
+    healthy.fieldName = "v";
+    healthy.tags = {{"deviceId", "dev-healthy"}};
+    healthy.minTs = static_cast<uint64_t>(oldDay) * ke::NS_PER_DAY;
+    healthy.maxTs = static_cast<uint64_t>(oldDay) * ke::NS_PER_DAY;
+    co_await index.indexMetadataBatch({healthy});
+
+    const uint64_t start = static_cast<uint64_t>(oldDay) * ke::NS_PER_DAY;
+    auto found = co_await index.findSeriesWithMetadataTimeScoped("mixed", {}, {}, start, start + 3 * ke::NS_PER_DAY);
+    EXPECT_TRUE(found.has_value());
+
+    std::set<std::string> devices;
+    if (found.has_value()) {
+        for (const auto& s : *found) {
+            auto it = s.metadata.tags.find("deviceId");
+            if (it != s.metadata.tags.end()) {
+                devices.insert(it->second);
+            }
+        }
+    }
+    EXPECT_TRUE(devices.count("dev-healthy")) << "the healthy series must still be found";
+    EXPECT_TRUE(devices.count("dev-clamped"))
+        << "a healthy neighbour made the day union non-empty and hid the clamped series";
+
+    co_await index.close();
+}

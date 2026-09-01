@@ -1449,7 +1449,7 @@ seastar::future<> NativeIndex::recordDaySpan(const std::string& measurement, con
         // Remember that this measurement's history is under-recorded, so a query
         // reaching into the dropped range can tell "no series here" apart from
         // "never recorded". Without this the silence is indistinguishable.
-        co_await noteClampedHistory(measurement, firstDay);
+        co_await noteClampedHistory(measurement, lastDay - kMaxDaySpan);
         ::native_index_log.warn(
             "recordDaySpan: day span [{}, {}] for measurement '{}' exceeds {} days — "
             "recording only the trailing window (check client timestamp precision)",
@@ -2202,6 +2202,7 @@ void NativeIndex::flushDirtyBitmaps(IndexWriteBatch& batch, std::vector<std::str
     // Serialize dirty bitmaps — iterate the dirty-key set, not the whole
     // cache (up to 100K entries walked per flush previously).
     std::string bitmapKey;
+    std::vector<std::string> stillDirty;
     for (const auto& cacheKey : bitmapCacheDirtyKeys_) {
         auto it = bitmapCache_.find(cacheKey);
         if (it == bitmapCache_.end())
@@ -2209,6 +2210,17 @@ void NativeIndex::flushDirtyBitmaps(IndexWriteBatch& batch, std::vector<std::str
         auto& entry = it.value();
         if (!entry.dirty)
             continue;
+        // NEVER serialize a `loading` placeholder. It is an empty bitmap an
+        // insert published before its KV read finished, possibly with a
+        // concurrent insert's ids already added — writing it would put those
+        // few ids OVER the full persisted bitmap, destroying every member it
+        // held. The loader ORs the persisted bytes in and re-marks dirty when
+        // it resumes, so the entry is flushed correctly on the next pass; it
+        // must stay dirty until then.
+        if (entry.loading) {
+            stillDirty.push_back(cacheKey);
+            continue;
+        }
 
         auto& bitmap = entry.bitmap;
         if (bitmap.isEmpty()) {
@@ -2235,6 +2247,9 @@ void NativeIndex::flushDirtyBitmaps(IndexWriteBatch& batch, std::vector<std::str
         }
     }
     bitmapCacheDirtyKeys_.clear();
+    for (auto& key : stillDirty) {
+        bitmapCacheDirtyKeys_.insert(std::move(key));
+    }
 }
 
 seastar::future<const roaring::Roaring*> NativeIndex::getPostingsBitmapByKey(const std::string& cacheKey) {
@@ -2531,6 +2546,7 @@ seastar::future<const roaring::Roaring*> NativeIndex::getDayBitmapByKey(const st
 void NativeIndex::flushDirtyDayBitmaps(IndexWriteBatch& batch, std::vector<std::string>* flushedKeys) {
     // Iterate the dirty-key set, not the whole cache (see flushDirtyBitmaps).
     std::string kvKey;
+    std::vector<std::string> stillDirty;
     for (const auto& cacheKey : dayBitmapCacheDirtyKeys_) {
         auto it = dayBitmapCache_.find(cacheKey);
         if (it == dayBitmapCache_.end())
@@ -2538,6 +2554,17 @@ void NativeIndex::flushDirtyDayBitmaps(IndexWriteBatch& batch, std::vector<std::
         auto& entry = it.value();
         if (!entry.dirty)
             continue;
+        // NEVER serialize a `loading` placeholder. It is an empty bitmap an
+        // insert published before its KV read finished, possibly with a
+        // concurrent insert's ids already added — writing it would put those
+        // few ids OVER the full persisted bitmap, destroying every member it
+        // held. The loader ORs the persisted bytes in and re-marks dirty when
+        // it resumes, so the entry is flushed correctly on the next pass; it
+        // must stay dirty until then.
+        if (entry.loading) {
+            stillDirty.push_back(cacheKey);
+            continue;
+        }
 
         auto& bitmap = entry.bitmap;
         if (bitmap.isEmpty()) {
@@ -2562,6 +2589,9 @@ void NativeIndex::flushDirtyDayBitmaps(IndexWriteBatch& batch, std::vector<std::
         }
     }
     dayBitmapCacheDirtyKeys_.clear();
+    for (auto& key : stillDirty) {
+        dayBitmapCacheDirtyKeys_.insert(std::move(key));
+    }
 
     // Everything recorded so far is in this batch, so membership is durable
     // through the highest day touched. A crash after this point can only lose
@@ -2656,19 +2686,22 @@ seastar::future<> NativeIndex::flushDayBitmapsNow() {
     // into a day this shard is actively writing.
 }
 
-seastar::future<> NativeIndex::noteClampedHistory(const std::string& measurement, uint32_t droppedFromDay) {
+seastar::future<> NativeIndex::noteClampedHistory(const std::string& measurement, uint32_t refusedThroughDay) {
+    // Keep the HIGHEST refused day: every day at or below it is potentially
+    // unrecorded for some series in this measurement, so the widest claim is
+    // the safe one.
     auto it = clampedHistoryCache_.find(measurement);
-    if (it != clampedHistoryCache_.end() && it->second.has_value() && *it->second <= droppedFromDay) {
-        co_return;  // already known, and no earlier than what we are recording
+    if (it != clampedHistoryCache_.end() && it->second.has_value() && *it->second >= refusedThroughDay) {
+        co_return;
     }
-    clampedHistoryCache_[measurement] = droppedFromDay;
-    co_await kvPut(ke::encodeClampedHistoryKey(measurement), ke::encodeDay(droppedFromDay));
+    clampedHistoryCache_[measurement] = refusedThroughDay;
+    co_await kvPut(ke::encodeClampedHistoryKey(measurement), ke::encodeDay(refusedThroughDay));
 }
 
-seastar::future<bool> NativeIndex::hasClampedHistory(const std::string& measurement) {
+seastar::future<std::optional<uint32_t>> NativeIndex::clampedHistoryThrough(const std::string& measurement) {
     auto it = clampedHistoryCache_.find(measurement);
     if (it != clampedHistoryCache_.end()) {
-        co_return it->second.has_value();
+        co_return it->second;
     }
     auto val = co_await kvGet(ke::encodeClampedHistoryKey(measurement));
     std::optional<uint32_t> parsed;
@@ -2676,7 +2709,7 @@ seastar::future<bool> NativeIndex::hasClampedHistory(const std::string& measurem
         parsed = ke::decodeDay(*val);
     }
     clampedHistoryCache_[measurement] = parsed;
-    co_return parsed.has_value();
+    co_return parsed;
 }
 
 void NativeIndex::noteRecordedDay(uint32_t day) {
@@ -3045,62 +3078,54 @@ NativeIndex::findSeriesWithMetadataTimeScoped(const std::string& measurement,
         co_return co_await findSeriesWithMetadata(measurement, tagFilters, fieldFilter, maxSeries);
     }
 
+    // Does this query reach into a range the clamp refused to record?
+    //
+    // This has to be asked BEFORE the day union is consulted, not only when the
+    // union comes back empty. A measurement normally holds many devices: if one
+    // device's history was clamped away while its neighbours are healthy, the
+    // union is NON-empty (the neighbours match), the empty-union branch never
+    // runs, and the clamped device is silently dropped from every query that
+    // reaches into its missing range. One healthy series is enough to hide a
+    // broken one.
+    //
+    // The marker names the last day the clamp refused, so this is a cached
+    // lookup — no scan on the ordinary path.
+    if (auto refusedThrough = co_await clampedHistoryThrough(measurement);
+        refusedThrough.has_value() && startDay <= *refusedThrough) {
+        co_return co_await findSeriesWithMetadata(measurement, tagFilters, fieldFilter, maxSeries);
+    }
+
     roaring::Roaring activeSeries = co_await buildActiveSeriesBitmap(measurement, startDay, endDay);
 
     if (activeSeries.isEmpty()) {
-        // Find the OLDEST day this measurement has membership for. Day keys are
-        // `measurement\0day(4B big-endian)`, so the prefix scan yields them in
-        // day order and the first hit is the minimum — no extra state to
-        // maintain, and the scan already happened on this path.
+        // Does this measurement have ANY day bitmaps? If not, it predates
+        // Phase 3 and day scoping cannot answer for it at all.
+        //
+        // Deliberately a first-hit probe, not a scan for the oldest recorded
+        // day: computing a minimum meant walking the whole dayBitmapCache_ on
+        // every empty result, and empty results are no longer cached — a
+        // dashboard polling a quiet day would have paid that walk on every
+        // request. The clamp case is handled above, where it costs a hash
+        // lookup.
         std::string prefix = ke::encodeDayBitmapPrefix(measurement);
         bool hasDayBitmaps = false;
-        uint32_t minRecordedDay = 0;
-        co_await kvPrefixScan(prefix, [&](std::string_view key, std::string_view) {
+        co_await kvPrefixScan(prefix, [&](std::string_view, std::string_view) {
             hasDayBitmaps = true;
-            minRecordedDay = ke::decodeDayFromDayBitmapKey(key);
-            return false;  // ordered scan: the first hit is the oldest day
+            return false;  // stop at the first hit
         });
-        // Also check dirty cache entries for this measurement
-        std::string measPrefix = measurement;
-        measPrefix.push_back('\0');
-        for (auto it = dayBitmapCache_.begin(); it != dayBitmapCache_.end(); ++it) {
-            if (it->first.size() == measPrefix.size() + 4 && it->first.compare(0, measPrefix.size(), measPrefix) == 0 &&
-                !it->second.bitmap.isEmpty()) {
-                uint32_t dayBE;
-                std::memcpy(&dayBE, it->first.data() + it->first.size() - 4, 4);
-                const uint32_t cachedDay = be32toh(dayBE);
-                minRecordedDay = hasDayBitmaps ? std::min(minRecordedDay, cachedDay) : cachedDay;
-                hasDayBitmaps = true;
+        if (!hasDayBitmaps) {
+            std::string measPrefix = measurement;
+            measPrefix.push_back('\0');
+            for (auto it = dayBitmapCache_.begin(); it != dayBitmapCache_.end(); ++it) {
+                if (it->first.size() >= measPrefix.size() && it->first.compare(0, measPrefix.size(), measPrefix) == 0 &&
+                    !it->second.bitmap.isEmpty()) {
+                    hasDayBitmaps = true;
+                    break;
+                }
             }
         }
         if (!hasDayBitmaps) {
             // Pre-Phase-3 data — fall back to non-time-scoped discovery
-            co_return co_await findSeriesWithMetadata(measurement, tagFilters, fieldFilter, maxSeries);
-        }
-        // A query reaching BELOW the oldest recorded day is asking about a range
-        // the day bitmaps cannot answer for, so their silence means "unknown",
-        // not "nothing". Two ways to get there, both real:
-        //
-        //   - recordDaySpan clamps a first batch's span to the trailing 366 days
-        //     (kMaxDaySpan), so a series whose first write carried older history
-        //     has no membership for it. This is why a point with a near-epoch
-        //     timestamp (an unset device clock) was invisible until the query
-        //     range grew past 365 days and MAX_DAY_SCAN bypassed day scoping
-        //     altogether — the bug looked like "needs endTime >= 1e17".
-        //   - removeExpiredDayBitmaps deletes days below a TTL cutoff while
-        //     partially-expired TSM files keep serving data from them.
-        //
-        // Falling back costs a wider discovery scan; trusting the empty union
-        // returns nothing at all for data that is sitting on disk.
-        //
-        // Gated on the clamp marker, NOT on the gap alone. Every young
-        // measurement has days below its oldest recorded one — they are simply
-        // days before it existed, and genuinely empty. Falling back for those
-        // would turn each ordinary "last 30 days" query on a week-old
-        // measurement into a full discovery scan: a wrong-empty traded for a
-        // performance cliff on the hottest path. Only a measurement the clamp
-        // actually refused history for can be under-recorded at the old end.
-        if (startDay < minRecordedDay && co_await hasClampedHistory(measurement)) {
             co_return co_await findSeriesWithMetadata(measurement, tagFilters, fieldFilter, maxSeries);
         }
         // Day bitmaps cover the queried range and none matched — genuinely no
