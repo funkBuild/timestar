@@ -17,6 +17,7 @@
 #include <filesystem>
 #include <format>
 #include <seastar/core/coroutine.hh>
+#include <seastar/core/lowres_clock.hh>
 #include <seastar/core/memory.hh>
 #include <seastar/core/seastar.hh>
 #include <seastar/core/smp.hh>
@@ -1445,6 +1446,10 @@ seastar::future<> NativeIndex::recordDaySpan(const std::string& measurement, con
     // day bitmaps are a superset filter.
     constexpr uint32_t kMaxDaySpan = 366;
     if (lastDay - firstDay >= kMaxDaySpan) {
+        // Remember that this measurement's history is under-recorded, so a query
+        // reaching into the dropped range can tell "no series here" apart from
+        // "never recorded". Without this the silence is indistinguishable.
+        co_await noteClampedHistory(measurement, firstDay);
         ::native_index_log.warn(
             "recordDaySpan: day span [{}, {}] for measurement '{}' exceeds {} days — "
             "recording only the trailing window (check client timestamp precision)",
@@ -2244,6 +2249,13 @@ seastar::future<const roaring::Roaring*> NativeIndex::getPostingsBitmapByKey(con
     // bytes in below; the OR is idempotent with the loader's, so either order is
     // correct.
 
+    // A cache entry existing at all — even a loading one — proves this key is
+    // live, so the bloom must not be allowed to veto it below. The bloom is
+    // rebuilt on flush, so a tag value created since the last one is legitimately
+    // absent from it; before this fall-through existed, a cache hit skipped the
+    // bloom entirely and that gap never mattered.
+    const bool knownLive = (it != bitmapCache_.end());
+
     // Build KV key by prepending prefix byte to cache key (used for both bloom check and KV lookup)
     std::string bitmapKvKey;
     bitmapKvKey.reserve(1 + cacheKey.size());
@@ -2253,7 +2265,7 @@ seastar::future<const roaring::Roaring*> NativeIndex::getPostingsBitmapByKey(con
     // Phase 4: Check measurement bloom filter before KV lookup.
     // Cache key format: "measurement\0tagKey\0tagValue"
     auto nullPos = cacheKey.find('\0');
-    if (nullPos != std::string::npos) {
+    if (!knownLive && nullPos != std::string::npos) {
         std::string measurement = cacheKey.substr(0, nullPos);
         auto bloomIt = measurementBloomCache_.find(measurement);
         if (bloomIt == measurementBloomCache_.end()) {
@@ -2644,9 +2656,35 @@ seastar::future<> NativeIndex::flushDayBitmapsNow() {
     // into a day this shard is actively writing.
 }
 
+seastar::future<> NativeIndex::noteClampedHistory(const std::string& measurement, uint32_t droppedFromDay) {
+    auto it = clampedHistoryCache_.find(measurement);
+    if (it != clampedHistoryCache_.end() && it->second.has_value() && *it->second <= droppedFromDay) {
+        co_return;  // already known, and no earlier than what we are recording
+    }
+    clampedHistoryCache_[measurement] = droppedFromDay;
+    co_await kvPut(ke::encodeClampedHistoryKey(measurement), ke::encodeDay(droppedFromDay));
+}
+
+seastar::future<bool> NativeIndex::hasClampedHistory(const std::string& measurement) {
+    auto it = clampedHistoryCache_.find(measurement);
+    if (it != clampedHistoryCache_.end()) {
+        co_return it->second.has_value();
+    }
+    auto val = co_await kvGet(ke::encodeClampedHistoryKey(measurement));
+    std::optional<uint32_t> parsed;
+    if (val.has_value() && val->size() >= 4) {
+        parsed = ke::decodeDay(*val);
+    }
+    clampedHistoryCache_[measurement] = parsed;
+    co_return parsed.has_value();
+}
+
 void NativeIndex::noteRecordedDay(uint32_t day) {
+    // lowres_system_clock, not system_clock: this runs once per distinct day per
+    // batch on the ingest path, and the horizon is a week wide — millisecond
+    // resolution from a timer-updated clock is ample, and free.
     const auto nowNs = static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch())
+        std::chrono::duration_cast<std::chrono::nanoseconds>(seastar::lowres_system_clock::now().time_since_epoch())
             .count());
     const uint32_t horizon = ke::dayBucketFromNs(nowNs) + kMaxFutureWatermarkDays;
     if (day > horizon) {
@@ -3054,7 +3092,15 @@ NativeIndex::findSeriesWithMetadataTimeScoped(const std::string& measurement,
         //
         // Falling back costs a wider discovery scan; trusting the empty union
         // returns nothing at all for data that is sitting on disk.
-        if (startDay < minRecordedDay) {
+        //
+        // Gated on the clamp marker, NOT on the gap alone. Every young
+        // measurement has days below its oldest recorded one — they are simply
+        // days before it existed, and genuinely empty. Falling back for those
+        // would turn each ordinary "last 30 days" query on a week-old
+        // measurement into a full discovery scan: a wrong-empty traded for a
+        // performance cliff on the hottest path. Only a measurement the clamp
+        // actually refused history for can be under-recorded at the old end.
+        if (startDay < minRecordedDay && co_await hasClampedHistory(measurement)) {
             co_return co_await findSeriesWithMetadata(measurement, tagFilters, fieldFilter, maxSeries);
         }
         // Day bitmaps cover the queried range and none matched — genuinely no

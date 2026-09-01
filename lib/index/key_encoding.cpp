@@ -359,6 +359,15 @@ std::string encodeCleanShutdownKey() {
     return std::string(1, static_cast<char>(INDEX_CLEAN_SHUTDOWN));
 }
 
+std::string encodeClampedHistoryKey(const std::string& measurement) {
+    validateNoNullBytes({measurement});
+    std::string key;
+    key.reserve(1 + measurement.size());
+    key.push_back(static_cast<char>(CLAMPED_DAY_HISTORY));
+    key += measurement;
+    return key;
+}
+
 uint32_t decodeDayFromDayBitmapKey(std::string_view key) {
     // Minimum valid key: prefix(1) + measurement(>=1) + null(1) + day(4) = 7
     if (key.size() < 7) {

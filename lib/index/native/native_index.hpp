@@ -549,6 +549,15 @@ private:
     // forever with no LocalId must be visible in the log without drowning it.
     uint64_t missingLocalIdDrops_ = 0;
     void warnMissingLocalId(const std::string& measurement, const SeriesId128& seriesId);
+
+    // Measurements whose day history recordDaySpan refused to record in full,
+    // with the earliest day it dropped. Per-shard, like the series it describes.
+    // Populated on clamp and lazily from KV; a measurement that has never
+    // clamped caches as absent, which is safe because the only thing that can
+    // introduce a clamp for this shard's series is this shard.
+    tsl::robin_map<std::string, std::optional<uint32_t>> clampedHistoryCache_;
+    seastar::future<> noteClampedHistory(const std::string& measurement, uint32_t droppedFromDay);
+    seastar::future<bool> hasClampedHistory(const std::string& measurement);
     seastar::future<roaring::Roaring*> getOrLoadDayBitmapForInsert(std::string& cacheKey);
     seastar::future<const roaring::Roaring*> getDayBitmapByKey(const std::string& cacheKey);
     // flushedKeys, when given, receives the cache keys whose dirty flag this

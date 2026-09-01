@@ -242,6 +242,27 @@ SEASTAR_TEST_F(DiscoveryConsistencyTest, QueryBelowTheOldestRecordedDayFallsBack
     EXPECT_TRUE(early.has_value());
     EXPECT_EQ(early->size(), 1u) << "a query below the oldest recorded day must fall back, not report nothing";
 
+    // A measurement that was never clamped must NOT fall back: days below its
+    // oldest recorded day are days before it existed, and a fallback there
+    // would turn every ordinary query on a young measurement into a full
+    // discovery scan.
+    {
+        MetadataOp young;
+        young.valueType = TSMValueType::Float;
+        young.measurement = "young";
+        young.fieldName = "v";
+        young.tags = {{"deviceId", "dev-b"}};
+        young.minTs = static_cast<uint64_t>(recentDay) * ke::NS_PER_DAY;
+        young.maxTs = young.minTs;
+        co_await index.indexMetadataBatch({young});
+
+        const uint64_t beforeItExisted = static_cast<uint64_t>(recentDay - 30) * ke::NS_PER_DAY;
+        auto r = co_await index.findSeriesWithMetadataTimeScoped("young", {{"deviceId", "dev-b"}}, {}, beforeItExisted,
+                                                                 beforeItExisted + ke::NS_PER_DAY - 1);
+        EXPECT_TRUE(r.has_value());
+        EXPECT_EQ(r->size(), 0u) << "an unclamped measurement must keep pruning below its oldest recorded day";
+    }
+
     // A quiet day INSIDE the recorded range must still prune — the fallback may
     // not become "always discoverable".
     const uint64_t quietStart = static_cast<uint64_t>(recentDay - 200) * ke::NS_PER_DAY;
