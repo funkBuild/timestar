@@ -421,6 +421,12 @@ private:
     struct BitmapEntry {
         roaring::Roaring bitmap;
         bool dirty = false;  // true if modified since last flushDirtyBitmaps()
+        // True between an insert publishing this entry and its KV load
+        // completing. The entry is deliberately visible while empty so
+        // concurrent inserts can add to it — but a READER that takes it at face
+        // value during that window sees "no such series". Readers must merge
+        // the persisted bytes in themselves instead of trusting it.
+        bool loading = false;
         // Approximate serialized size, refreshed at load/flush time. Used by
         // the trim byte budgets so they don't have to walk every bitmap's
         // container list (getSizeInBytes) on every flush.

@@ -882,6 +882,8 @@ seastar::future<> Engine::rebuildDayBitmaps() {
     const auto elapsedMs =
         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
 
+    _metrics.day_bitmap_memberships_repaired_total += addedMemberships;
+
     if (addedMemberships > 0) {
         ::timestar::engine_log.info(
             "[SHARD {}] Repaired day bitmaps: {} series/day memberships restored across days [{}, {}] from {} series "

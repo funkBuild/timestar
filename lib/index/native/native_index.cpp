@@ -1314,7 +1314,12 @@ seastar::future<std::set<std::string>> NativeIndex::getAllMeasurements() {
 }
 
 seastar::future<std::set<std::string>> NativeIndex::getFields(std::string measurement) {
-    if (auto it = fieldsCache_.find(measurement); it != fieldsCache_.end())
+    // An EMPTY cached set is not an answer: getOrCreateSeriesId publishes exactly
+    // this entry as a placeholder before suspending on its own kvGet, so a
+    // concurrent reader taking it at face value reports a measurement with no
+    // fields/tags that does have them. Fall through to KV instead — the same
+    // guard tagValuesCache_ already applies.
+    if (auto it = fieldsCache_.find(measurement); it != fieldsCache_.end() && !it->second.empty())
         co_return it->second;
 
     auto val = co_await kvGet(ke::encodeMeasurementFieldsKey(measurement));
@@ -1323,13 +1328,19 @@ seastar::future<std::set<std::string>> NativeIndex::getFields(std::string measur
         fieldsCache_[measurement] = decoded;
         co_return decoded;
     }
-    // Cache empty result to avoid repeated KV lookups for non-existent measurements
-    fieldsCache_[measurement] = {};
+    // Deliberately NOT cached: an empty set here is indistinguishable from the
+    // placeholder above, and a wrong empty on this path hides a measurement's
+    // whole schema. A non-existent measurement costs one kvGet.
     co_return std::set<std::string>{};
 }
 
 seastar::future<std::set<std::string>> NativeIndex::getTags(std::string measurement) {
-    if (auto it = tagsCache_.find(measurement); it != tagsCache_.end())
+    // An EMPTY cached set is not an answer: getOrCreateSeriesId publishes exactly
+    // this entry as a placeholder before suspending on its own kvGet, so a
+    // concurrent reader taking it at face value reports a measurement with no
+    // fields/tags that does have them. Fall through to KV instead — the same
+    // guard tagValuesCache_ already applies.
+    if (auto it = tagsCache_.find(measurement); it != tagsCache_.end() && !it->second.empty())
         co_return it->second;
 
     auto val = co_await kvGet(ke::encodeMeasurementTagsKey(measurement));
@@ -1338,8 +1349,9 @@ seastar::future<std::set<std::string>> NativeIndex::getTags(std::string measurem
         tagsCache_[measurement] = decoded;
         co_return decoded;
     }
-    // Cache empty result to avoid repeated KV lookups
-    tagsCache_[measurement] = {};
+    // Deliberately NOT cached: an empty set here is indistinguishable from the
+    // placeholder above, and a wrong empty on this path hides a measurement's
+    // whole schema. A non-existent measurement costs one kvGet.
     co_return std::set<std::string>{};
 }
 
@@ -1767,7 +1779,15 @@ NativeIndex::findSeriesWithMetadataCached(const std::string& measurement,
     }
 
     auto ptr = std::make_shared<const std::vector<SeriesWithMetadata>>(std::move(*result));
-    discoveryCache_.put(cacheKey, ptr);
+    // Never cache an empty discovery result. Generation bumps only fire on new
+    // series, new day membership or a repair — none of which happen for an
+    // established series — so a transient wrong-empty (a bloom false negative,
+    // an unfinished bitmap load, day membership lost to a crash) would be
+    // frozen here and served long after the underlying structure recovered.
+    // Repeating the lookup for a genuinely empty query is the cheaper mistake.
+    if (!ptr->empty()) {
+        discoveryCache_.put(cacheKey, ptr);
+    }
     co_return ptr;
 }
 
@@ -2199,9 +2219,15 @@ void NativeIndex::flushDirtyBitmaps(IndexWriteBatch& batch, std::vector<std::str
 
 seastar::future<const roaring::Roaring*> NativeIndex::getPostingsBitmapByKey(const std::string& cacheKey) {
     auto it = bitmapCache_.find(cacheKey);
-    if (it != bitmapCache_.end()) {
+    if (it != bitmapCache_.end() && !it->second.loading) {
         co_return &it->second.bitmap;
     }
+    // A `loading` entry is the empty placeholder an insert publishes before its
+    // own KV read completes. Returning it answers "this tag value has no
+    // series" from a bitmap that simply has not been read yet — a wrong empty,
+    // from a cache, on the discovery path. Fall through and merge the persisted
+    // bytes in below; the OR is idempotent with the loader's, so either order is
+    // correct.
 
     // Build KV key by prepending prefix byte to cache key (used for both bloom check and KV lookup)
     std::string bitmapKvKey;
@@ -2280,11 +2306,25 @@ seastar::future<roaring::Roaring*> NativeIndex::getOrLoadBitmapForInsert(std::st
     // can start adding local IDs immediately (cache hit path at line 1742).
     // Do NOT hold a reference across the suspension — robin_map rehash
     // would invalidate it.
-    bitmapCache_[cacheKey].dirty = true;
+    {
+        auto& placeholder = bitmapCache_[cacheKey];
+        placeholder.dirty = true;
+        placeholder.loading = true;
+    }
     bitmapCacheDirtyKeys_.insert(cacheKey);
     auto existing = co_await kvGet(bitmapKvKey);
     // Re-find after co_await (rehash may have moved entries)
     auto& entry = bitmapCache_[cacheKey];
+    // Re-mark dirty. A flush during the suspension above saw this entry still
+    // empty, wrote nothing for it and cleared the flag (and trimBitmapCache may
+    // have evicted it outright, leaving a fresh clean entry here). The caller is
+    // about to add a local id; without this the add sits in RAM in no dirty set,
+    // is lost to the next eviction, and the postings watermark has meanwhile
+    // advanced past it — so the crash-window repair at open() skips it too, and
+    // the series disappears from every tag-filtered query. Same hazard, same fix
+    // as getOrLoadDayBitmapForInsert.
+    entry.dirty = true;
+    bitmapCacheDirtyKeys_.insert(cacheKey);
     if (existing.has_value()) {
         // IMPORTANT: Merge (OR) the KV-loaded bitmap into the existing entry
         // rather than replacing it. During the co_await above, concurrent
@@ -2293,6 +2333,7 @@ seastar::future<roaring::Roaring*> NativeIndex::getOrLoadBitmapForInsert(std::st
         entry.bitmap |= roaring::Roaring::readSafe(existing->data(), existing->size());
         entry.approxBytes = existing->size();
     }
+    entry.loading = false;
     co_return &entry.bitmap;
 }
 
@@ -2396,7 +2437,11 @@ seastar::future<roaring::Roaring*> NativeIndex::getOrLoadDayBitmapForInsert(std:
 
     // Pre-insert an empty bitmap before co_await so concurrent coroutines
     // can start adding local IDs immediately.
-    dayBitmapCache_[cacheKey].dirty = true;
+    {
+        auto& placeholder = dayBitmapCache_[cacheKey];
+        placeholder.dirty = true;
+        placeholder.loading = true;
+    }
     dayBitmapCacheDirtyKeys_.insert(cacheKey);
     auto existing = co_await kvGet(kvKey);
     // Re-find after co_await (rehash may have moved entries)
@@ -2408,6 +2453,7 @@ seastar::future<roaring::Roaring*> NativeIndex::getOrLoadDayBitmapForInsert(std:
     // without this the add would sit in RAM in no dirty set: lost to the next
     // eviction, while the watermark claims that day is durable.
     entry.dirty = true;
+    entry.loading = false;
     dayBitmapCacheDirtyKeys_.insert(cacheKey);
     if (existing.has_value()) {
         // Merge (OR) to preserve concurrent adds during the co_await suspension.
@@ -2419,7 +2465,10 @@ seastar::future<roaring::Roaring*> NativeIndex::getOrLoadDayBitmapForInsert(std:
 
 seastar::future<const roaring::Roaring*> NativeIndex::getDayBitmapByKey(const std::string& cacheKey) {
     auto it = dayBitmapCache_.find(cacheKey);
-    if (it != dayBitmapCache_.end()) {
+    // Skip a `loading` placeholder: it is empty only because its KV read has not
+    // finished, and treating that as "no series active on this day" is exactly
+    // the wrong-empty this whole change is about (see getPostingsBitmapByKey).
+    if (it != dayBitmapCache_.end() && !it->second.loading) {
         co_return &it->second.bitmap;
     }
 
@@ -2946,30 +2995,55 @@ NativeIndex::findSeriesWithMetadataTimeScoped(const std::string& measurement,
     roaring::Roaring activeSeries = co_await buildActiveSeriesBitmap(measurement, startDay, endDay);
 
     if (activeSeries.isEmpty()) {
-        // Check if any day bitmaps exist for this measurement (pre-Phase-3 fallback)
+        // Find the OLDEST day this measurement has membership for. Day keys are
+        // `measurement\0day(4B big-endian)`, so the prefix scan yields them in
+        // day order and the first hit is the minimum — no extra state to
+        // maintain, and the scan already happened on this path.
         std::string prefix = ke::encodeDayBitmapPrefix(measurement);
         bool hasDayBitmaps = false;
-        co_await kvPrefixScan(prefix, [&](std::string_view, std::string_view) {
+        uint32_t minRecordedDay = 0;
+        co_await kvPrefixScan(prefix, [&](std::string_view key, std::string_view) {
             hasDayBitmaps = true;
-            return false;  // Stop after first hit
+            minRecordedDay = ke::decodeDayFromDayBitmapKey(key);
+            return false;  // ordered scan: the first hit is the oldest day
         });
         // Also check dirty cache entries for this measurement
-        if (!hasDayBitmaps) {
-            std::string measPrefix = measurement;
-            measPrefix.push_back('\0');
-            for (auto it = dayBitmapCache_.begin(); it != dayBitmapCache_.end(); ++it) {
-                if (it->first.size() >= measPrefix.size() && it->first.compare(0, measPrefix.size(), measPrefix) == 0 &&
-                    !it->second.bitmap.isEmpty()) {
-                    hasDayBitmaps = true;
-                    break;
-                }
+        std::string measPrefix = measurement;
+        measPrefix.push_back('\0');
+        for (auto it = dayBitmapCache_.begin(); it != dayBitmapCache_.end(); ++it) {
+            if (it->first.size() == measPrefix.size() + 4 && it->first.compare(0, measPrefix.size(), measPrefix) == 0 &&
+                !it->second.bitmap.isEmpty()) {
+                uint32_t dayBE;
+                std::memcpy(&dayBE, it->first.data() + it->first.size() - 4, 4);
+                const uint32_t cachedDay = be32toh(dayBE);
+                minRecordedDay = hasDayBitmaps ? std::min(minRecordedDay, cachedDay) : cachedDay;
+                hasDayBitmaps = true;
             }
         }
         if (!hasDayBitmaps) {
             // Pre-Phase-3 data — fall back to non-time-scoped discovery
             co_return co_await findSeriesWithMetadata(measurement, tagFilters, fieldFilter, maxSeries);
         }
-        // Day bitmaps exist but none in the queried range — no active series
+        // A query reaching BELOW the oldest recorded day is asking about a range
+        // the day bitmaps cannot answer for, so their silence means "unknown",
+        // not "nothing". Two ways to get there, both real:
+        //
+        //   - recordDaySpan clamps a first batch's span to the trailing 366 days
+        //     (kMaxDaySpan), so a series whose first write carried older history
+        //     has no membership for it. This is why a point with a near-epoch
+        //     timestamp (an unset device clock) was invisible until the query
+        //     range grew past 365 days and MAX_DAY_SCAN bypassed day scoping
+        //     altogether — the bug looked like "needs endTime >= 1e17".
+        //   - removeExpiredDayBitmaps deletes days below a TTL cutoff while
+        //     partially-expired TSM files keep serving data from them.
+        //
+        // Falling back costs a wider discovery scan; trusting the empty union
+        // returns nothing at all for data that is sitting on disk.
+        if (startDay < minRecordedDay) {
+            co_return co_await findSeriesWithMetadata(measurement, tagFilters, fieldFilter, maxSeries);
+        }
+        // Day bitmaps cover the queried range and none matched — genuinely no
+        // active series (a quiet day), which must stay an empty result.
         co_return std::vector<SeriesWithMetadata>{};
     }
 
@@ -3101,7 +3175,15 @@ NativeIndex::findSeriesWithMetadataTimeScopedCached(const std::string& measureme
     }
 
     auto ptr = std::make_shared<const std::vector<SeriesWithMetadata>>(std::move(*result));
-    discoveryCache_.put(cacheKey, ptr);
+    // Never cache an empty discovery result. Generation bumps only fire on new
+    // series, new day membership or a repair — none of which happen for an
+    // established series — so a transient wrong-empty (a bloom false negative,
+    // an unfinished bitmap load, day membership lost to a crash) would be
+    // frozen here and served long after the underlying structure recovered.
+    // Repeating the lookup for a genuinely empty query is the cheaper mistake.
+    if (!ptr->empty()) {
+        discoveryCache_.put(cacheKey, ptr);
+    }
     co_return ptr;
 }
 

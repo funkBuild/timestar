@@ -1,0 +1,254 @@
+/*
+ * Discovery consistency: scoped lookup vs independent enumeration.
+ *
+ * Three production incidents share one shape — a structure derived from a cache
+ * is consulted first, and an empty result is treated as "does not exist" rather
+ * than "unknown, go look":
+ *
+ *   1.4.0  measurement blooms rebuilt from bitmapCache_ alone → scoped queries
+ *          returned 0 series for ~52% of the series that existed.
+ *   1.4.2  per-day bitmaps never rebuilt at open → any query whose range STARTED
+ *          in the window lost to a crash returned 0 series.
+ *   live   recordDaySpan's 366-day clamp → a first batch carrying older history
+ *          records no membership for it, so a query starting there returns 0.
+ *
+ * Every one of them is invisible to a test that only asks the scoped path — it
+ * answers confidently, just wrongly. The invariant that catches all three is a
+ * differential: whatever a scoped lookup finds, an INDEPENDENT enumeration must
+ * also find.
+ *
+ * getAllSeriesForMeasurement is the one true oracle here. It is a single
+ * kvPrefixScan over MEASUREMENT_SERIES keys and touches none of bitmapCache_,
+ * measurementBloomCache_, dayBitmapCache_, discoveryCache_, localIdMap_ or
+ * seriesMetadataCache_ — so it cannot confirm the structures under test.
+ *
+ * Deliberately NOT used as the oracle:
+ *   - findSeries with empty tagFilters — it delegates to
+ *     getAllSeriesForMeasurement, so comparing them proves nothing.
+ *   - getSeriesGroupedByTag — it shares the postings substrate AND warms
+ *     bitmapCache_ as a side effect, which would mask the very false negative
+ *     being hunted on any later scoped call.
+ */
+
+#include "../../../lib/core/series_id.hpp"
+#include "../../../lib/index/key_encoding.hpp"
+#include "../../../lib/index/native/native_index.hpp"
+#include "../../seastar_gtest.hpp"
+#include "../../test_helpers/native_index_test_access.hpp"
+
+#include <gtest/gtest.h>
+
+#include <chrono>
+#include <cstdint>
+#include <seastar/core/coroutine.hh>
+#include <set>
+#include <string>
+#include <vector>
+
+using namespace timestar::index;
+namespace ke = timestar::index::keys;
+
+class DiscoveryConsistencyTest : public ::testing::Test {
+public:
+    void SetUp() override { std::filesystem::remove_all("shard_0/native_index"); }
+    void TearDown() override { std::filesystem::remove_all("shard_0/native_index"); }
+};
+
+namespace {
+
+uint32_t todayDay() {
+    const auto nowNs = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch())
+            .count());
+    return ke::dayBucketFromNs(nowNs);
+}
+
+// Every series the scoped/tag-filtered path can reach, unioned over the
+// measurement's own tag values.
+seastar::future<std::set<SeriesId128>> scopedReachable(NativeIndex& index, const std::string& measurement) {
+    // The discovery cache must not answer — it would return whatever the
+    // structures said last time, which is what we are trying to test.
+    index.invalidateDiscoveryCache(measurement);
+
+    std::set<SeriesId128> reachable;
+    auto tagKeys = co_await index.getTags(measurement);
+    for (const auto& tagKey : tagKeys) {
+        auto values = co_await index.getTagValues(measurement, tagKey);
+        for (const auto& value : values) {
+            // maxSeries = 0: findSeriesByTag TRUNCATES rather than erroring on a
+            // limit, which would look like a real difference below.
+            auto found = co_await index.findSeriesByTag(measurement, tagKey, value, 0);
+            reachable.insert(found.begin(), found.end());
+        }
+    }
+    co_return reachable;
+}
+
+seastar::future<std::set<SeriesId128>> enumerated(NativeIndex& index, const std::string& measurement) {
+    auto all = co_await index.getAllSeriesForMeasurement(measurement, 0);
+    EXPECT_TRUE(all.has_value());
+    std::set<SeriesId128> ids;
+    if (all.has_value()) {
+        ids.insert(all->begin(), all->end());
+    }
+    co_return ids;
+}
+
+// Report the difference rather than just a count: the failing ids are the whole
+// diagnostic — they are exactly {bloom false negatives} ∪ {missing LocalIds} ∪
+// {lost day membership}.
+void expectNoneMissing(const std::set<SeriesId128>& enumeratedIds, const std::set<SeriesId128>& reachableIds,
+                       const char* what) {
+    std::vector<std::string> missing;
+    for (const auto& id : enumeratedIds) {
+        if (reachableIds.count(id) == 0) {
+            missing.push_back(id.toHex());
+        }
+    }
+    EXPECT_TRUE(missing.empty()) << missing.size() << " series exist but are unreachable by " << what << ": "
+                                 << (missing.empty() ? std::string{} : missing.front())
+                                 << (missing.size() > 1 ? " …" : "");
+}
+
+}  // namespace
+
+// Baseline: on a healthy index the two agree exactly.
+SEASTAR_TEST_F(DiscoveryConsistencyTest, ScopedLookupReachesEverySeriesEnumerationFinds) {
+    NativeIndex index(0);
+    co_await index.open();
+
+    const uint64_t dayNs = static_cast<uint64_t>(todayDay() - 1) * ke::NS_PER_DAY;
+    for (int i = 0; i < 50; ++i) {
+        TimeStarInsert<double> insert("consistency", "v");
+        insert.tags = {{"deviceId", "dev-" + std::to_string(i)}, {"site", i % 2 ? "north" : "south"}};
+        insert.timestamps = {dayNs + static_cast<uint64_t>(i)};
+        insert.values = {1.0};
+        co_await index.indexInsert(insert);
+    }
+
+    auto enumeratedIds = co_await enumerated(index, "consistency");
+    auto reachableIds = co_await scopedReachable(index, "consistency");
+    EXPECT_EQ(enumeratedIds.size(), 50u);
+    expectNoneMissing(enumeratedIds, reachableIds, "tag-scoped lookup");
+
+    co_await index.close();
+}
+
+// The 1.4.0 shape: a persisted bloom that has lost keys must not be able to
+// hide a series. This is the differential the incident needed and did not have.
+SEASTAR_TEST_F(DiscoveryConsistencyTest, StaleBloomCannotHideSeriesFromScopedLookup) {
+    {
+        NativeIndex index(0);
+        co_await index.open();
+        for (int i = 0; i < 5; ++i) {
+            co_await index.getOrCreateSeriesId("bloomcheck", {{"deviceId", "dev-" + std::to_string(i)}}, "v");
+        }
+        co_await index.close();
+    }
+
+    NativeIndex index(0);
+    co_await index.open();
+
+    // A bloom that only knows dev-0 — what a <= 1.4.0 server could leave behind.
+    auto onlyDev0 = ke::encodePostingsBitmapPrefix("bloomcheck", "deviceId") + "dev-0";
+    co_await NativeIndexTestAccess::plantStaleBloom(index, "bloomcheck", {onlyDev0});
+
+    auto enumeratedIds = co_await enumerated(index, "bloomcheck");
+    auto reachableIds = co_await scopedReachable(index, "bloomcheck");
+    EXPECT_EQ(enumeratedIds.size(), 5u);
+    expectNoneMissing(enumeratedIds, reachableIds, "tag-scoped lookup with a stale bloom");
+
+    co_await index.close();
+}
+
+// The 1.4.2 shape, plus the still-live clamp: time-scoped discovery over the
+// range the data actually spans must reach every series enumeration finds.
+//
+// The range is kept under MAX_DAY_SCAN (365) on purpose — beyond it the day
+// filter is bypassed entirely and the check would pass without testing
+// anything.
+SEASTAR_TEST_F(DiscoveryConsistencyTest, TimeScopedDiscoveryReachesEverySeriesAfterLostDayMembership) {
+    const uint32_t lastDay = todayDay() - 1;
+    const uint32_t firstDay = lastDay - 10;
+
+    NativeIndex index(0);
+    co_await index.open();
+
+    for (int i = 0; i < 20; ++i) {
+        TimeStarInsert<double> insert("daycheck", "v");
+        insert.tags = {{"deviceId", "dev-" + std::to_string(i)}};
+        insert.timestamps = {static_cast<uint64_t>(firstDay + (i % 10)) * ke::NS_PER_DAY + 1};
+        insert.values = {1.0};
+        co_await index.indexInsert(insert);
+    }
+
+    // Lose the second half of the window, as a crash would.
+    co_await NativeIndexTestAccess::dropDayBitmapsInRange(index, "daycheck", firstDay + 5, lastDay);
+
+    std::vector<NativeIndex::SeriesTimeBounds> bounds;
+    for (int i = 0; i < 20; ++i) {
+        bounds.push_back({SeriesId128::fromSeriesKey(
+                              timestar::buildSeriesKey("daycheck", {{"deviceId", "dev-" + std::to_string(i)}}, "v")),
+                          static_cast<uint64_t>(firstDay) * ke::NS_PER_DAY,
+                          static_cast<uint64_t>(lastDay) * ke::NS_PER_DAY});
+    }
+    co_await index.rebuildDayBitmapsFromBounds(bounds, firstDay, lastDay);
+
+    index.invalidateDiscoveryCache("daycheck");
+    auto timeScoped = co_await index.findSeriesWithMetadataTimeScoped(
+        "daycheck", {}, {}, static_cast<uint64_t>(firstDay) * ke::NS_PER_DAY,
+        static_cast<uint64_t>(lastDay + 1) * ke::NS_PER_DAY - 1);
+    EXPECT_TRUE(timeScoped.has_value());
+
+    std::set<SeriesId128> reachableIds;
+    if (timeScoped.has_value()) {
+        for (const auto& s : *timeScoped) {
+            reachableIds.insert(s.seriesId);
+        }
+    }
+    auto enumeratedIds = co_await enumerated(index, "daycheck");
+    EXPECT_EQ(enumeratedIds.size(), 20u);
+    expectNoneMissing(enumeratedIds, reachableIds, "time-scoped discovery after a repair");
+
+    co_await index.close();
+}
+
+// The still-live clamp, end to end: a first batch spanning more than
+// kMaxDaySpan (366) days records membership only for the trailing window, so a
+// query starting at the old end has no day bitmap to match. It must fall back
+// to unscoped discovery rather than reporting nothing — this is the
+// "invisible until endTime >= 1e17" behaviour seen in production.
+SEASTAR_TEST_F(DiscoveryConsistencyTest, QueryBelowTheOldestRecordedDayFallsBackInsteadOfReturningNothing) {
+    const uint32_t recentDay = todayDay() - 1;
+    const uint64_t nearEpochNs = 90'000'000'000ULL;  // ~day 1: an unset device clock
+
+    NativeIndex index(0);
+    co_await index.open();
+
+    // The batch path: metadata carries only [minTs, maxTs], and the span is far
+    // wider than the clamp allows.
+    MetadataOp op;
+    op.valueType = TSMValueType::Float;
+    op.measurement = "clamped";
+    op.fieldName = "v";
+    op.tags = {{"deviceId", "dev-a"}};
+    op.minTs = nearEpochNs;
+    op.maxTs = static_cast<uint64_t>(recentDay) * ke::NS_PER_DAY;
+    co_await index.indexMetadataBatch({op});
+
+    // A narrow query at the near-epoch end: no day bitmap covers it.
+    auto early = co_await index.findSeriesWithMetadataTimeScoped("clamped", {{"deviceId", "dev-a"}}, {}, 0,
+                                                                 10ULL * ke::NS_PER_DAY);
+    EXPECT_TRUE(early.has_value());
+    EXPECT_EQ(early->size(), 1u) << "a query below the oldest recorded day must fall back, not report nothing";
+
+    // A quiet day INSIDE the recorded range must still prune — the fallback may
+    // not become "always discoverable".
+    const uint64_t quietStart = static_cast<uint64_t>(recentDay - 200) * ke::NS_PER_DAY;
+    auto quiet = co_await index.findSeriesWithMetadataTimeScoped("clamped", {{"deviceId", "dev-a"}}, {}, quietStart,
+                                                                 quietStart + ke::NS_PER_DAY - 1);
+    EXPECT_TRUE(quiet.has_value());
+    EXPECT_EQ(quiet->size(), 0u) << "pruning inside the recorded range must survive the fallback";
+
+    co_await index.close();
+}
