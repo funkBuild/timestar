@@ -225,6 +225,39 @@ public:
     // Phase 3: Remove day bitmaps for days before cutoffDay (retention cleanup)
     seastar::future<> removeExpiredDayBitmaps(const std::string& measurement, uint32_t cutoffDay);
 
+    // One series' time bounds as the storage layer knows them. Engine fills
+    // these from the TSM sparse index (which carries [minTime, maxTime] per
+    // series per file but no measurement name) and hands them here, where the
+    // seriesId -> measurement/LocalId join lives.
+    struct SeriesTimeBounds {
+        SeriesId128 seriesId;
+        uint64_t minTs;
+        uint64_t maxTs;
+    };
+
+    // Reconstruct day-bitmap membership for [fromDay, toDay] from storage-layer
+    // time bounds. Day membership is otherwise unrecoverable after an unclean
+    // shutdown: it lives in dayBitmapCache_ until a flush, and unlike postings
+    // it cannot be derived from series metadata (it is a function of insert
+    // TIMESTAMPS, which the index never persists per series).
+    //
+    // The result is a SUPERSET: TSM gives a span, not per-day membership, so a
+    // series with a gap is marked present on days it never wrote to. That costs
+    // discovery precision only — the data path then returns no points for those
+    // days — whereas a missing day silently drops the series from every query
+    // whose range starts inside it. Superset is the safe direction.
+    //
+    // Returns the number of (series, day) memberships added.
+    seastar::future<uint64_t> rebuildDayBitmapsFromBounds(const std::vector<SeriesTimeBounds>& bounds, uint32_t fromDay,
+                                                          uint32_t toDay);
+
+    // Day through which day-bitmap membership was durable at the last flush;
+    // nullopt when nothing has ever been flushed. Bounds the rebuild above.
+    std::optional<uint32_t> dayBitmapWatermark() const { return dayBitmapWatermark_; }
+
+    // Persist dirty day bitmaps now (timer callback; also called by close()).
+    seastar::future<> flushDayBitmapsNow();
+
     // Schema broadcast: index metadata and return schema changes for broadcast
     seastar::future<SchemaUpdate> indexMetadataBatchWithSchema(const std::vector<MetadataOp>& ops);
 
@@ -446,6 +479,24 @@ private:
     std::unordered_set<std::string> dayBitmapCacheDirtyKeys_;  // see bitmapCacheDirtyKeys_
 
     static void buildDayBitmapCacheKey(std::string& out, const std::string& measurement, uint32_t day);
+
+    // Highest day any recorded membership has touched this session, and the
+    // day through which membership is known durable (persisted by
+    // flushDirtyDayBitmaps, reloaded at open). Day-shaped rather than
+    // wall-clock so backfill and tests bound the same way live ingest does.
+    uint32_t maxRecordedDay_ = 0;
+    std::optional<uint32_t> dayBitmapWatermark_;
+    seastar::timer<> dayBitmapFlushTimer_;
+    seastar::gate dayBitmapFlushGate_;
+    void noteRecordedDay(uint32_t day) { maxRecordedDay_ = std::max(maxRecordedDay_, day); }
+    // Flush mid-rebuild once this many day bitmaps are dirty: trimDayBitmapCache()
+    // cannot evict dirty entries, so an unbounded rebuild pins the whole window
+    // in RAM.
+    static constexpr size_t kRebuildFlushEveryDirtyKeys = 4096;
+    // Rate limit for the "series has no LocalId" warning — one series writing
+    // forever with no LocalId must be visible in the log without drowning it.
+    uint64_t missingLocalIdDrops_ = 0;
+    void warnMissingLocalId(const std::string& measurement, const SeriesId128& seriesId);
     seastar::future<roaring::Roaring*> getOrLoadDayBitmapForInsert(std::string& cacheKey);
     seastar::future<const roaring::Roaring*> getDayBitmapByKey(const std::string& cacheKey);
     void flushDirtyDayBitmaps(IndexWriteBatch& batch);

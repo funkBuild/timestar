@@ -80,6 +80,16 @@ struct NativeIndexTestAccess {
             index.dayBitmapCache_.erase(k);
             index.dayBitmapCacheDirtyKeys_.erase(k);
         }
+
+        // Roll the durability watermark back to just before the lost region, as
+        // a crash would leave it: the last flush happened at fromDay-1, and
+        // everything recorded after it died with the process. Without this the
+        // watermark would still claim the dropped days are durable and the
+        // startup repair would skip exactly the days it needs to rebuild.
+        const uint32_t lastDurableDay = fromDay > 0 ? fromDay - 1 : 0;
+        index.maxRecordedDay_ = lastDurableDay;
+        index.dayBitmapWatermark_ = lastDurableDay;
+        co_await index.kvPut(ke::encodeDayBitmapWatermarkKey(), ke::encodeDay(lastDurableDay));
     }
 
     // True when a day bitmap for (measurement, day) is durable — the state a

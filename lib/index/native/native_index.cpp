@@ -145,9 +145,11 @@ NativeIndex::NativeIndex(int shardId)
       discoveryCache_(timestar::config().index.discovery_cache_bytes / std::max(1u, seastar::smp::count)) {}
 
 NativeIndex::~NativeIndex() {
-    // Stop the periodic WAL sync from firing after destruction (close() also
-    // cancels it; this covers destruction-without-close paths).
+    // Stop the periodic WAL sync and day-bitmap flush from firing after
+    // destruction (close() also cancels them; this covers
+    // destruction-without-close paths).
     walSyncTimer_.cancel();
+    dayBitmapFlushTimer_.cancel();
 
     // Guard against destroying the index while a background flush is still in flight.
     // The caller must co_await close() (which calls waitForFlush()) before destruction.
@@ -244,6 +246,34 @@ seastar::future<> NativeIndex::open() {
         });
     });
     walSyncTimer_.arm_periodic(kWalSyncInterval);
+
+    // Day-bitmap durability. The watermark is the day through which membership
+    // was durable at the last flush; Engine::rebuildDayBitmaps() reconstructs
+    // from there. Loaded before any recording so the first flush cannot lower it.
+    {
+        auto dayWmVal = co_await kvGet(ke::encodeDayBitmapWatermarkKey());
+        if (dayWmVal.has_value()) {
+            dayBitmapWatermark_ = ke::decodeDay(*dayWmVal);
+            maxRecordedDay_ = std::max(maxRecordedDay_, *dayBitmapWatermark_);
+        }
+    }
+
+    // Bound what an unclean exit can cost: without this, day membership is
+    // persisted only when the index memtable crosses write_buffer_size, which a
+    // shard writing to long-established series may not do for days.
+    if (auto interval = timestar::config().index.day_bitmap_flush_interval_seconds; interval > 0) {
+        dayBitmapFlushTimer_.set_callback([this] {
+            if (dayBitmapFlushGate_.is_closed()) {
+                return;
+            }
+            (void)seastar::with_gate(dayBitmapFlushGate_, [this] {
+                return flushDayBitmapsNow();
+            }).handle_exception([](std::exception_ptr ep) {
+                ::native_index_log.warn("Background day-bitmap flush failed: {}", ep);
+            });
+        });
+        dayBitmapFlushTimer_.arm_periodic(std::chrono::seconds(interval));
+    }
 
     // Phase 2: Load or migrate LocalIdMap for roaring bitmap postings
     auto counterKey = ke::encodeLocalIdCounterKey();
@@ -354,6 +384,10 @@ seastar::future<> NativeIndex::close() {
     // Stop the periodic WAL sync and drain any in-flight sync before touching
     // the WAL below (wal_->close() flushes everything anyway).
     walSyncTimer_.cancel();
+    dayBitmapFlushTimer_.cancel();
+    if (!dayBitmapFlushGate_.is_closed()) {
+        co_await dayBitmapFlushGate_.close();
+    }
     if (!walSyncGate_.is_closed()) {
         co_await walSyncGate_.close();
     }
@@ -907,14 +941,21 @@ seastar::future<SeriesId128> NativeIndex::getOrCreateSeriesId(std::string measur
 seastar::future<SeriesId128> NativeIndex::getOrCreateSeriesId(SeriesId128 seriesId, const std::string& measurement,
                                                               const std::map<std::string, std::string>& tags,
                                                               const std::string& field) {
-    // Fast path: already indexed (no string allocation needed)
-    if (seriesCacheContains(seriesId)) {
+    // Fast path: already indexed (no string allocation needed).
+    //
+    // The LocalId check is not redundant: a series whose forward mapping was
+    // lost (a skipped LocalIdMap restore entry — see open()) would otherwise
+    // return here forever, recording no day and no postings membership, and so
+    // stay permanently invisible to time- and tag-scoped queries. Falling
+    // through re-assigns and re-persists it; every write below is idempotent
+    // for an existing series.
+    if (seriesCacheContains(seriesId) && localIdMap_.getLocalId(seriesId).has_value()) {
         co_return seriesId;
     }
 
     // Step 8: Check if series exists in storage (existence check only — no value copy)
     auto metaKey = ke::encodeSeriesMetadataKey(seriesId);
-    if (co_await kvExists(metaKey)) {
+    if (co_await kvExists(metaKey) && localIdMap_.getLocalId(seriesId).has_value()) {
         seriesCacheInsert(seriesId);
         co_return seriesId;
     }
@@ -1329,8 +1370,10 @@ seastar::future<> NativeIndex::indexMetadataBatch(const std::vector<MetadataOp>&
 seastar::future<> NativeIndex::recordDaySpan(const std::string& measurement, const SeriesId128& seriesId,
                                              uint64_t minTs, uint64_t maxTs) {
     auto localIdOpt = localIdMap_.getLocalId(seriesId);
-    if (!localIdOpt.has_value())
+    if (!localIdOpt.has_value()) {
+        warnMissingLocalId(measurement, seriesId);
         co_return;
+    }
     const uint32_t localId = *localIdOpt;
     const uint32_t firstDay = ke::dayBucketFromNs(minTs);
     const uint32_t lastDay = ke::dayBucketFromNs(maxTs);
@@ -1360,6 +1403,7 @@ seastar::future<> NativeIndex::recordDaySpan(const std::string& measurement, con
         if ((co_await getOrLoadDayBitmapForInsert(dayCacheKey))->addChecked(localId)) {
             newDayMembership = true;
         }
+        noteRecordedDay(day);
     }
     if (newDayMembership) {
         invalidateDiscoveryCache(measurement);
@@ -1372,8 +1416,10 @@ seastar::future<> NativeIndex::recordInsertDays(const std::string& measurement, 
     // day loop). Skips silently when the series has no LocalId yet — the
     // first-batch case is covered by the MetadataOp day-span path above.
     auto localIdOpt = localIdMap_.getLocalId(seriesId);
-    if (!localIdOpt.has_value())
+    if (!localIdOpt.has_value()) {
+        warnMissingLocalId(measurement, seriesId);
         co_return;
+    }
     const uint32_t localId = *localIdOpt;
     std::string dayCacheKey;
     uint32_t lastDay = UINT32_MAX;
@@ -1387,6 +1433,7 @@ seastar::future<> NativeIndex::recordInsertDays(const std::string& measurement, 
             if ((co_await getOrLoadDayBitmapForInsert(dayCacheKey))->addChecked(localId)) {
                 newDayMembership = true;
             }
+            noteRecordedDay(day);
             lastDay = day;
         }
     }
@@ -2379,6 +2426,115 @@ void NativeIndex::flushDirtyDayBitmaps(IndexWriteBatch& batch) {
         batch.put(kvKey, serialized);
     }
     dayBitmapCacheDirtyKeys_.clear();
+
+    // Everything recorded so far is in this batch, so membership is durable
+    // through the highest day touched. A crash after this point can only lose
+    // days recorded LATER, which is what bounds the startup rebuild.
+    //
+    // Day-shaped, not wall-clock-shaped: backfill and replay record days that
+    // are not "today", and a wall-clock watermark would exclude exactly those
+    // from the repair window.
+    if (maxRecordedDay_ > 0 && (!dayBitmapWatermark_.has_value() || *dayBitmapWatermark_ < maxRecordedDay_)) {
+        dayBitmapWatermark_ = maxRecordedDay_;
+        batch.put(ke::encodeDayBitmapWatermarkKey(), ke::encodeDay(maxRecordedDay_));
+    }
+}
+
+// Persist dirty day bitmaps without waiting for the index memtable to cross
+// write_buffer_size. That threshold is fed mostly by NEW series metadata, so a
+// fleet writing to long-established series can go days between flushes — and
+// everything recorded in between is lost to an unclean exit, taking those
+// series out of any query whose range starts in the lost window.
+seastar::future<> NativeIndex::flushDayBitmapsNow() {
+    if (dayBitmapCacheDirtyKeys_.empty())
+        co_return;
+
+    // Same serialization as the memtable-flush path: flushDirtyDayBitmaps
+    // mutates the cache and the batch is appended to the WAL and applied to
+    // memtable_, which a concurrent flush may be swapping.
+    auto flushUnits = co_await seastar::get_units(flushMutex_, 1);
+    if (dayBitmapCacheDirtyKeys_.empty())
+        co_return;
+
+    IndexWriteBatch batch;
+    flushDirtyDayBitmaps(batch);
+    if (batch.empty())
+        co_return;
+
+    co_await wal_->append(batch);
+    batch.applyTo(*memtable_);
+    // Deliberately no trimDayBitmapCache() here: entries just cleaned are now
+    // evictable, and dropping them would force a re-read on the next insert
+    // into a day this shard is actively writing.
+}
+
+void NativeIndex::warnMissingLocalId(const std::string& measurement, const SeriesId128& seriesId) {
+    // A series with durable metadata but no LocalId records NO day membership
+    // and NO postings, forever — a permanent per-series blind spot rather than
+    // one bounded by a crash window. It should be impossible (the forward
+    // mapping is written atomically with the metadata), but a skipped
+    // LocalIdMap restore entry can produce it, so make it visible instead of
+    // returning silently. Powers of two keep a persistent offender in the log
+    // without flooding it.
+    ++missingLocalIdDrops_;
+    if ((missingLocalIdDrops_ & (missingLocalIdDrops_ - 1)) == 0) {
+        ::native_index_log.warn(
+            "Series {} in measurement '{}' has no LocalId — its day/postings membership is NOT being recorded and it "
+            "will be invisible to time- and tag-scoped queries ({} occurrences)",
+            seriesId.toHex(), measurement, missingLocalIdDrops_);
+    }
+}
+
+seastar::future<uint64_t> NativeIndex::rebuildDayBitmapsFromBounds(const std::vector<SeriesTimeBounds>& bounds,
+                                                                   uint32_t fromDay, uint32_t toDay) {
+    if (fromDay > toDay)
+        co_return 0;
+
+    uint64_t added = 0;
+    std::string dayCacheKey;
+    std::unordered_set<std::string> touchedMeasurements;
+
+    for (const auto& b : bounds) {
+        auto localIdOpt = localIdMap_.getLocalId(b.seriesId);
+        if (!localIdOpt.has_value())
+            continue;  // no LocalId: nothing to add to a bitmap (see warnMissingLocalId)
+        const uint32_t localId = *localIdOpt;
+
+        const uint32_t seriesFirst = ke::dayBucketFromNs(b.minTs);
+        const uint32_t seriesLast = ke::dayBucketFromNs(b.maxTs);
+        if (seriesLast < fromDay || seriesFirst > toDay)
+            continue;
+
+        auto meta = co_await getSeriesMetadata(b.seriesId);
+        if (!meta.has_value())
+            continue;
+
+        const uint32_t first = std::max(seriesFirst, fromDay);
+        const uint32_t last = std::min(seriesLast, toDay);
+        for (uint32_t day = first; day <= last; ++day) {
+            buildDayBitmapCacheKey(dayCacheKey, meta->measurement, day);
+            if ((co_await getOrLoadDayBitmapForInsert(dayCacheKey))->addChecked(localId)) {
+                ++added;
+            }
+            noteRecordedDay(day);
+        }
+        touchedMeasurements.insert(meta->measurement);
+
+        // Bound peak memory: trimDayBitmapCache() cannot evict a DIRTY entry,
+        // so a rebuild that dirties every (measurement, day) in the window
+        // would otherwise pin all of it until the caller flushes.
+        if (dayBitmapCacheDirtyKeys_.size() >= kRebuildFlushEveryDirtyKeys) {
+            co_await flushDayBitmapsNow();
+        }
+    }
+
+    for (const auto& measurement : touchedMeasurements) {
+        invalidateDiscoveryCache(measurement);
+    }
+    if (added > 0) {
+        co_await flushDayBitmapsNow();
+    }
+    co_return added;
 }
 
 // Fraction of this shard's arena that ALL index caches together may occupy.

@@ -351,6 +351,10 @@ std::string encodeDayBitmapPrefix(const std::string& measurement) {
     return prefix;
 }
 
+std::string encodeDayBitmapWatermarkKey() {
+    return std::string(1, static_cast<char>(DAY_BITMAP_WATERMARK));
+}
+
 uint32_t decodeDayFromDayBitmapKey(std::string_view key) {
     // Minimum valid key: prefix(1) + measurement(>=1) + null(1) + day(4) = 7
     if (key.size() < 7) {

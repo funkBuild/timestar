@@ -13,6 +13,8 @@
 #include "value_coercion.hpp"       // lossless coercion into a series' bound type
 #include "value_type_dispatch.hpp"  // dispatchValueType / valueTypeOf / valueTypeName
 
+#include <tsl/robin_map.h>
+
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
@@ -44,6 +46,11 @@ seastar::future<> Engine::init() {
         tsmFileManager.setFlushGroup(_flushGroup);
     }
     co_await walFileManager.init(*this, tsmFileManager);
+
+    // Must follow both of the above: the day-bitmap repair reads per-series time
+    // bounds from the TSM sparse index, and WAL replay has by now converted every
+    // recovered store into a TSM file, so replayed points are covered too.
+    co_await rebuildDayBitmaps();
 
     // Register per-shard Prometheus metrics
     _metrics.setup(*this);
@@ -757,6 +764,98 @@ seastar::future<> Engine::prefetchSeriesIndices(const std::vector<SeriesId128>& 
     co_await seastar::parallel_for_each(tsmSnapshot, [&seriesIds](seastar::shared_ptr<TSM>& tsmFile) {
         return tsmFile->prefetchFullIndexEntries(seriesIds);
     });
+}
+
+// Rebuild day-bitmap membership lost to an unclean shutdown.
+//
+// Day bitmaps gate time-scoped series discovery: findSeriesWithMetadataTimeScoped
+// unions the per-day bitmaps a query's range spans and treats an empty union as
+// "no active series". Membership lives in RAM until a flush, and unlike postings
+// it cannot be derived from series metadata — it is a function of insert
+// timestamps, which the index never persists per series. So an unclean exit
+// silently drops every series from any query whose range STARTS in the lost
+// window, while a wider range still finds them (it picks up an older, durable
+// day). That asymmetry was the production symptom.
+//
+// The timestamps come from the storage layer instead: each TSM file's sparse
+// index carries [minTime, maxTime] per series, already in memory after
+// tsmFileManager.init() with no data-block I/O. TSM does not carry measurement
+// names, so NativeIndex does the seriesId -> measurement join.
+seastar::future<> Engine::rebuildDayBitmaps() {
+    const uint32_t windowDays = timestar::config().index.day_bitmap_rebuild_window_days;
+    if (windowDays == 0) {
+        co_return;
+    }
+
+    // Merge bounds across files: a series usually appears in several, and the
+    // union of their spans is the span to reconstruct.
+    tsl::robin_map<SeriesId128, NativeIndex::SeriesTimeBounds, SeriesId128::Hash> merged;
+    for (const auto& [seq, tsmFile] : tsmFileManager.getSequencedTsmFiles()) {
+        if (!tsmFile) {
+            continue;
+        }
+        tsmFile->forEachSeriesId([&](const SeriesId128& id) {
+            const uint64_t minTs = tsmFile->getSeriesMinTime(id);
+            const uint64_t maxTs = tsmFile->getSeriesMaxTime(id);
+            auto it = merged.find(id);
+            if (it == merged.end()) {
+                merged.emplace(id, NativeIndex::SeriesTimeBounds{id, minTs, maxTs});
+            } else {
+                it.value().minTs = std::min(it->second.minTs, minTs);
+                it.value().maxTs = std::max(it->second.maxTs, maxTs);
+            }
+        });
+    }
+    if (merged.empty()) {
+        co_return;
+    }
+
+    std::vector<NativeIndex::SeriesTimeBounds> bounds;
+    bounds.reserve(merged.size());
+    uint32_t maxDay = 0;
+    for (const auto& [id, b] : merged) {
+        bounds.push_back(b);
+        maxDay = std::max(maxDay, timestar::index::keys::dayBucketFromNs(b.maxTs));
+    }
+    merged.clear();
+
+    // Repair [watermark, newest day on disk], clamped to the configured window.
+    //
+    // The clamp is what keeps startup bounded — every day in the window costs a
+    // KV get per (measurement, day) and pins a dirty bitmap until flushed. It
+    // also keeps the window recent, which is what makes the retention
+    // interaction acceptable: a partially-expired TSM file's minTime still
+    // points before a TTL cutoff, so an unclamped rebuild could resurrect day
+    // bitmaps that removeExpiredDayBitmaps() deliberately deleted. Retention
+    // policies are not even loaded at this point in startup
+    // (loadAndBroadcastRetentionPolicies runs later), so a cutoff filter is not
+    // available here; the periodic sweep re-deletes anything that slips in.
+    const uint32_t clampFloor = maxDay >= (windowDays - 1) ? maxDay - (windowDays - 1) : 0;
+    const uint32_t watermark = index.dayBitmapWatermark().value_or(0);
+    const uint32_t fromDay = std::max(watermark, clampFloor);
+
+    if (watermark > 0 && watermark < clampFloor) {
+        ::timestar::engine_log.warn(
+            "[SHARD {}] Day-bitmap repair window clamped to {} days: membership was last durable on day {}, newest day "
+            "on disk is {}. Days [{}, {}) stay unrepaired — time-scoped queries starting in that range may miss "
+            "series; raise index.day_bitmap_rebuild_window_days to cover it.",
+            shardId, windowDays, watermark, maxDay, watermark, clampFloor);
+    }
+
+    const auto start = std::chrono::steady_clock::now();
+    const uint64_t addedMemberships = co_await index.rebuildDayBitmapsFromBounds(bounds, fromDay, maxDay);
+    const auto elapsedMs =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+
+    if (addedMemberships > 0) {
+        ::timestar::engine_log.info(
+            "[SHARD {}] Repaired day bitmaps: {} series/day memberships restored across days [{}, {}] from {} series "
+            "in {} ms",
+            shardId, addedMemberships, fromDay, maxDay, bounds.size(), elapsedMs);
+    } else {
+        ::timestar::engine_log.debug("[SHARD {}] Day bitmaps intact across days [{}, {}] ({} ms)", shardId, fromDay,
+                                     maxDay, elapsedMs);
+    }
 }
 
 seastar::future<> Engine::startBackgroundTasks() {
