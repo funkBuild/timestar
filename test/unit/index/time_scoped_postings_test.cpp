@@ -21,6 +21,7 @@
 #include <endian.h>
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <filesystem>
 #include <seastar/core/coroutine.hh>
 #include <string>
@@ -38,6 +39,17 @@ static std::string testEncodeDayBitmapKey(const std::string& measurement, uint32
     return key;
 }
 namespace ke = timestar::index::keys;
+
+// Days used by the watermark tests must be real (past) days: noteRecordedDay
+// refuses days more than a week ahead of the wall clock, so a hardcoded
+// far-future day would correctly fail to advance the watermark and the test
+// would be asserting the guard rather than the behaviour it means to pin.
+static uint32_t todayDay() {
+    const auto nowNs = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch())
+            .count());
+    return ke::dayBucketFromNs(nowNs);
+}
 
 class TimeScopedPostingsTest : public ::testing::Test {
 public:
@@ -800,7 +812,7 @@ SEASTAR_TEST_F(TimeScopedPostingsTest, EveryDayInTheCrashWindowStaysDiscoverable
 // survives a reopen. Without it the startup repair has no bound and would have
 // to choose between rescanning all history or guessing.
 SEASTAR_TEST_F(TimeScopedPostingsTest, DayBitmapWatermarkPersistsLastDurableDay) {
-    constexpr uint32_t kDay = 20800;
+    const uint32_t kDay = todayDay() - 3;
     {
         NativeIndex index(0);
         co_await index.open();
@@ -824,7 +836,7 @@ SEASTAR_TEST_F(TimeScopedPostingsTest, DayBitmapWatermarkPersistsLastDurableDay)
 // the memtable threshold is fed by NEW series metadata, so a shard writing only
 // to established series may never cross it.
 SEASTAR_TEST_F(TimeScopedPostingsTest, TimedFlushPersistsDayBitmapsWithoutMemtableCrossing) {
-    constexpr uint32_t kDay = 20900;
+    const uint32_t kDay = todayDay() - 4;
     NativeIndex index(0);
     co_await index.open();
 
@@ -900,8 +912,8 @@ SEASTAR_TEST_F(TimeScopedPostingsTest, RebuildRespectsWindowAndDoesNotResurrectE
 // end with every day discoverable.
 SEASTAR_TEST_F(TimeScopedPostingsTest, RebuildAdvancesWatermarkOnlyOnCompletion) {
     // Wide enough to cross kRebuildFlushEveryDirtyKeys (4096 dirty day keys).
-    constexpr uint32_t kFirstDay = 12000;
-    constexpr uint32_t kSpanDays = 5000;
+    const uint32_t kSpanDays = 5000;
+    const uint32_t kFirstDay = todayDay() - kSpanDays - 1;
     const uint64_t firstNs = static_cast<uint64_t>(kFirstDay) * ke::NS_PER_DAY;
     const uint64_t lastNs = static_cast<uint64_t>(kFirstDay + kSpanDays) * ke::NS_PER_DAY;
 
@@ -936,7 +948,7 @@ SEASTAR_TEST_F(TimeScopedPostingsTest, RebuildAdvancesWatermarkOnlyOnCompletion)
 // forward — otherwise the repair window never advances and every restart pays
 // for the same scan.
 SEASTAR_TEST_F(TimeScopedPostingsTest, RebuildAdvancesWatermarkWhenNothingWasMissing) {
-    constexpr uint32_t kDay = 21700;
+    const uint32_t kDay = todayDay() - 5;
     const uint64_t dayNs = static_cast<uint64_t>(kDay) * ke::NS_PER_DAY;
 
     NativeIndex index(0);
@@ -965,4 +977,37 @@ SEASTAR_TEST_F(TimeScopedPostingsTest, RebuildAdvancesWatermarkWhenNothingWasMis
             << "the advance must be durable, not just in RAM";
         co_await reopened.close();
     }
+}
+
+// A client timestamp years in the future must not move the watermark.
+//
+// The watermark is what a later boot trusts when deciding how much to repair.
+// One device with an unset clock stamping 2040 would otherwise pin it there for
+// a decade: every flush would consider itself current, and the repair window
+// would sit in a range no data lives in while real days lost to a crash stayed
+// lost. The point still gets its day bitmap — it is discoverable — it just does
+// not get to certify durability for everything below it.
+SEASTAR_TEST_F(TimeScopedPostingsTest, ImplausibleFutureTimestampDoesNotPoisonTheWatermark) {
+    const uint32_t realDay = todayDay() - 2;
+    const uint32_t farFutureDay = todayDay() + 5000;
+
+    NativeIndex index(0);
+    co_await index.open();
+
+    auto insert =
+        makeInsert<double>("skew", "v", {{"host", "h1"}}, {static_cast<uint64_t>(realDay) * ke::NS_PER_DAY + 1}, {1.0});
+    auto seriesId = co_await index.indexInsert(insert);
+    co_await index.recordInsertDays("skew", seriesId, {static_cast<uint64_t>(farFutureDay) * ke::NS_PER_DAY + 1});
+    co_await index.flushDayBitmapsNow();
+
+    EXPECT_EQ(index.dayBitmapWatermark().value_or(0), realDay) << "a future timestamp must not advance the watermark";
+
+    // The future day is still recorded, so a query for it finds the series.
+    const uint64_t futureStart = static_cast<uint64_t>(farFutureDay) * ke::NS_PER_DAY;
+    auto r =
+        co_await index.findSeriesWithMetadataTimeScoped("skew", {}, {}, futureStart, futureStart + ke::NS_PER_DAY - 1);
+    EXPECT_TRUE(r.has_value());
+    EXPECT_EQ(r->size(), 1u) << "the point is still discoverable on its own day";
+
+    co_await index.close();
 }

@@ -488,7 +488,14 @@ private:
     std::optional<uint32_t> dayBitmapWatermark_;
     seastar::timer<> dayBitmapFlushTimer_;
     seastar::gate dayBitmapFlushGate_;
-    void noteRecordedDay(uint32_t day) { maxRecordedDay_ = std::max(maxRecordedDay_, day); }
+    // Advance the "highest day recorded" mark, ignoring days implausibly far in
+    // the future. Timestamps are raw client input: one point stamped years ahead
+    // (an unset or skewed device clock) would otherwise pin the watermark there
+    // for a decade, so every later flush would consider it current and the
+    // repair window would sit where no data lives. A week of slack covers real
+    // skew without letting a garbage timestamp through.
+    void noteRecordedDay(uint32_t day);
+    static constexpr uint32_t kMaxFutureWatermarkDays = 7;
     // True when the persisted watermark trails what is now durable. A flush is
     // worth doing for this alone: without it a rebuild that found everything
     // already intact would never move the watermark forward, and every
@@ -506,7 +513,10 @@ private:
     void warnMissingLocalId(const std::string& measurement, const SeriesId128& seriesId);
     seastar::future<roaring::Roaring*> getOrLoadDayBitmapForInsert(std::string& cacheKey);
     seastar::future<const roaring::Roaring*> getDayBitmapByKey(const std::string& cacheKey);
-    void flushDirtyDayBitmaps(IndexWriteBatch& batch);
+    // flushedKeys, when given, receives the cache keys whose dirty flag this
+    // call cleared, so a caller whose write then FAILS can put them back.
+    void flushDirtyDayBitmaps(IndexWriteBatch& batch, std::vector<std::string>* flushedKeys = nullptr);
+    void restoreDirtyDayBitmaps(const std::vector<std::string>& keys, std::optional<uint32_t> previousWatermark);
     seastar::future<roaring::Roaring> buildActiveSeriesBitmap(const std::string& measurement, uint32_t startDay,
                                                               uint32_t endDay);
 

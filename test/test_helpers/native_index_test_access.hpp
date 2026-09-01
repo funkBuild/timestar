@@ -47,6 +47,48 @@ struct NativeIndexTestAccess {
     // write_buffer_size), so it is gone. Series metadata and LocalIds are NOT
     // touched — those are persisted with each series-creation batch, which is
     // exactly why the two can disagree after a crash.
+    // Drop day membership for [fromDay, toDay] WITHOUT touching the watermark —
+    // the shape a crash leaves when the lost days are older than the newest day
+    // recorded (a device uploading buffered points, say). The watermark keeps
+    // claiming those days are durable, which is exactly what the repair must
+    // not trust.
+    static seastar::future<> dropDayBitmapsInRange(NativeIndex& index, const std::string& measurement, uint32_t fromDay,
+                                                   uint32_t toDay) {
+        namespace ke = timestar::index::keys;
+
+        IndexWriteBatch batch;
+        co_await index.kvPrefixScan(ke::encodeDayBitmapPrefix(measurement),
+                                    [&](std::string_view key, std::string_view) {
+                                        const uint32_t day = ke::decodeDayFromDayBitmapKey(key);
+                                        if (day >= fromDay && day <= toDay) {
+                                            batch.remove(std::string(key));
+                                        }
+                                        return true;
+                                    });
+        if (!batch.empty()) {
+            co_await index.kvWriteBatch(batch);
+        }
+
+        std::string measPrefix = measurement;
+        measPrefix.push_back('\0');
+        std::vector<std::string> toEvict;
+        for (const auto& [k, entry] : index.dayBitmapCache_) {
+            if (k.size() != measPrefix.size() + 4 || k.compare(0, measPrefix.size(), measPrefix) != 0) {
+                continue;
+            }
+            uint32_t dayBE;
+            std::memcpy(&dayBE, k.data() + k.size() - 4, 4);
+            const uint32_t day = be32toh(dayBE);
+            if (day >= fromDay && day <= toDay) {
+                toEvict.push_back(k);
+            }
+        }
+        for (const auto& k : toEvict) {
+            index.dayBitmapCache_.erase(k);
+            index.dayBitmapCacheDirtyKeys_.erase(k);
+        }
+    }
+
     static seastar::future<> dropDayBitmapsFrom(NativeIndex& index, const std::string& measurement, uint32_t fromDay) {
         namespace ke = timestar::index::keys;
 

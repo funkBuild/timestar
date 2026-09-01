@@ -812,34 +812,45 @@ seastar::future<> Engine::rebuildDayBitmaps() {
 
     std::vector<timestar::index::NativeIndex::SeriesTimeBounds> bounds;
     bounds.reserve(merged.size());
+
+    // Cap the newest day at ~today. A single point stamped years in the future
+    // (a device with an unset or skewed clock — this fleet has them) would
+    // otherwise drag maxDay with it, and the clamped window would then cover
+    // only days no data lives in: the repair would run, find nothing, and every
+    // real day lost to the crash would stay lost. One day of slack absorbs
+    // ordinary clock skew.
+    const uint32_t todayDay =
+        timestar::index::keys::dayBucketFromNs(static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch())
+                .count())) +
+        1;
     uint32_t maxDay = 0;
     for (const auto& [id, b] : merged) {
         bounds.push_back(b);
-        maxDay = std::max(maxDay, timestar::index::keys::dayBucketFromNs(b.maxTs));
+        maxDay = std::max(maxDay, std::min(timestar::index::keys::dayBucketFromNs(b.maxTs), todayDay));
     }
     merged.clear();
 
-    // Repair [watermark, newest day on disk], clamped to the configured window.
+    // Repair the whole clamped window, ending at the newest day on disk.
     //
-    // The clamp is what keeps startup bounded — every day in the window costs a
-    // KV get per (measurement, day) and pins a dirty bitmap until flushed. It
-    // also keeps the window recent, which is what makes the retention
-    // interaction acceptable: a partially-expired TSM file's minTime still
-    // points before a TTL cutoff, so an unclamped rebuild could resurrect day
-    // bitmaps that removeExpiredDayBitmaps() deliberately deleted. Retention
-    // policies are not even loaded at this point in startup
-    // (loadAndBroadcastRetentionPolicies runs later), so a cutoff filter is not
-    // available here; the periodic sweep re-deletes anything that slips in.
-    const uint32_t clampFloor = maxDay >= (windowDays - 1) ? maxDay - (windowDays - 1) : 0;
+    // The floor is deliberately NOT raised to the watermark. The watermark is a
+    // single "highest day recorded", so it says nothing about days BELOW it: a
+    // device uploading days of buffered points marks older days that a crash
+    // then loses, while the watermark — already at today — claims they are
+    // durable. Starting the repair there would skip exactly those days, on this
+    // boot and every later one, turning a crash-window gap into a permanent
+    // one. Re-marking days that are already present is idempotent and cheap
+    // (addChecked), so the only cost of the wider floor is the scan itself,
+    // which the window bounds.
+    const uint32_t fromDay = maxDay >= (windowDays - 1) ? maxDay - (windowDays - 1) : 0;
     const uint32_t watermark = index.dayBitmapWatermark().value_or(0);
-    const uint32_t fromDay = std::max(watermark, clampFloor);
 
-    if (watermark > 0 && watermark < clampFloor) {
+    if (watermark > 0 && watermark + 1 < fromDay) {
         ::timestar::engine_log.warn(
-            "[SHARD {}] Day-bitmap repair window clamped to {} days: membership was last durable on day {}, newest day "
-            "on disk is {}. Days [{}, {}) stay unrepaired — time-scoped queries starting in that range may miss "
-            "series; raise index.day_bitmap_rebuild_window_days to cover it.",
-            shardId, windowDays, watermark, maxDay, watermark, clampFloor);
+            "[SHARD {}] Day-bitmap repair window is {} days [{}, {}], but membership was last durable on day {}. Days "
+            "[{}, {}) stay unrepaired — time-scoped queries starting in that range may miss series; raise "
+            "index.day_bitmap_rebuild_window_days to cover it.",
+            shardId, windowDays, fromDay, maxDay, watermark, watermark, fromDay);
     }
 
     const auto start = std::chrono::steady_clock::now();

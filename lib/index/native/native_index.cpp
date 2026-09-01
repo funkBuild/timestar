@@ -2352,6 +2352,14 @@ seastar::future<roaring::Roaring*> NativeIndex::getOrLoadDayBitmapForInsert(std:
     auto existing = co_await kvGet(kvKey);
     // Re-find after co_await (rehash may have moved entries)
     auto& entry = dayBitmapCache_[cacheKey];
+    // Re-mark dirty: a flush during the suspension above saw this entry still
+    // empty, wrote nothing for it and cleared its flag — and trimDayBitmapCache
+    // may have evicted it entirely, so this may be a fresh default-constructed
+    // (clean) entry. Either way the caller is about to add a local id, and
+    // without this the add would sit in RAM in no dirty set: lost to the next
+    // eviction, while the watermark claims that day is durable.
+    entry.dirty = true;
+    dayBitmapCacheDirtyKeys_.insert(cacheKey);
     if (existing.has_value()) {
         // Merge (OR) to preserve concurrent adds during the co_await suspension.
         entry.bitmap |= roaring::Roaring::readSafe(existing->data(), existing->size());
@@ -2395,7 +2403,7 @@ seastar::future<const roaring::Roaring*> NativeIndex::getDayBitmapByKey(const st
     co_return nullptr;
 }
 
-void NativeIndex::flushDirtyDayBitmaps(IndexWriteBatch& batch) {
+void NativeIndex::flushDirtyDayBitmaps(IndexWriteBatch& batch, std::vector<std::string>* flushedKeys) {
     // Iterate the dirty-key set, not the whole cache (see flushDirtyBitmaps).
     std::string kvKey;
     for (const auto& cacheKey : dayBitmapCacheDirtyKeys_) {
@@ -2424,6 +2432,9 @@ void NativeIndex::flushDirtyDayBitmaps(IndexWriteBatch& batch) {
         std::string serialized(serializedSize, '\0');
         bitmap.write(serialized.data());
         batch.put(kvKey, serialized);
+        if (flushedKeys) {
+            flushedKeys->push_back(it->first);
+        }
     }
     dayBitmapCacheDirtyKeys_.clear();
 
@@ -2438,6 +2449,24 @@ void NativeIndex::flushDirtyDayBitmaps(IndexWriteBatch& batch) {
         dayBitmapWatermark_ = maxRecordedDay_;
         batch.put(ke::encodeDayBitmapWatermarkKey(), ke::encodeDay(maxRecordedDay_));
     }
+}
+
+// Undo the bookkeeping of a flush whose write did not make it to the WAL. The
+// bitmaps still hold the new memberships in RAM, but marked CLEAN they would
+// never be written again — and trimDayBitmapCache() may evict them, silently
+// reverting to the stale persisted bitmap with no crash involved. The watermark
+// must go back too, or a later successful flush would certify days that were
+// never written.
+void NativeIndex::restoreDirtyDayBitmaps(const std::vector<std::string>& keys,
+                                         std::optional<uint32_t> previousWatermark) {
+    for (const auto& key : keys) {
+        auto it = dayBitmapCache_.find(key);
+        if (it == dayBitmapCache_.end())
+            continue;  // evicted meanwhile: its content is already gone, nothing to re-dirty
+        it.value().dirty = true;
+        dayBitmapCacheDirtyKeys_.insert(key);
+    }
+    dayBitmapWatermark_ = previousWatermark;
 }
 
 // Persist dirty day bitmaps without waiting for the index memtable to cross
@@ -2457,15 +2486,37 @@ seastar::future<> NativeIndex::flushDayBitmapsNow() {
         co_return;
 
     IndexWriteBatch batch;
-    flushDirtyDayBitmaps(batch);
+    std::vector<std::string> flushedKeys;
+    const auto previousWatermark = dayBitmapWatermark_;
+    flushDirtyDayBitmaps(batch, &flushedKeys);
     if (batch.empty())
         co_return;
 
-    co_await wal_->append(batch);
+    // Nothing is durable until the append returns. flushDirtyDayBitmaps has
+    // already cleared the dirty flags and advanced the in-memory watermark, so
+    // a failure here must put both back — otherwise a full disk turns into
+    // permanently missing series with no crash and no error visible to queries.
+    try {
+        co_await wal_->append(batch);
+    } catch (...) {
+        restoreDirtyDayBitmaps(flushedKeys, previousWatermark);
+        throw;
+    }
     batch.applyTo(*memtable_);
     // Deliberately no trimDayBitmapCache() here: entries just cleaned are now
     // evictable, and dropping them would force a re-read on the next insert
     // into a day this shard is actively writing.
+}
+
+void NativeIndex::noteRecordedDay(uint32_t day) {
+    const auto nowNs = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch())
+            .count());
+    const uint32_t horizon = ke::dayBucketFromNs(nowNs) + kMaxFutureWatermarkDays;
+    if (day > horizon) {
+        return;  // implausible client timestamp — recorded in its day bitmap, but it must not move the watermark
+    }
+    maxRecordedDay_ = std::max(maxRecordedDay_, day);
 }
 
 void NativeIndex::warnMissingLocalId(const std::string& measurement, const SeriesId128& seriesId) {
