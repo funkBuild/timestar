@@ -253,8 +253,12 @@ seastar::future<> NativeIndex::open() {
     // indistinguishable from any other crash: absent means repair.
     {
         auto cleanVal = co_await kvGet(ke::encodeCleanShutdownKey());
-        openedCleanly_ = cleanVal.has_value();
-        if (openedCleanly_) {
+        // A marker from an older recorder generation is treated as unclean on
+        // purpose: the previous build may have failed to record membership
+        // while believing it had (1.4.3 did, on every batch write), and only
+        // the repair can put that right. See kDayBitmapRecorderGeneration.
+        openedCleanly_ = cleanVal.has_value() && *cleanVal == kDayBitmapRecorderGeneration;
+        if (cleanVal.has_value()) {
             co_await kvDelete(ke::encodeCleanShutdownKey());
         }
     }
@@ -427,7 +431,7 @@ seastar::future<> NativeIndex::close() {
     // only ever say "clean" when it is provably true.
     if (flushedCleanly && !suppressCleanMarker_) {
         try {
-            co_await kvPut(ke::encodeCleanShutdownKey(), "1");
+            co_await kvPut(ke::encodeCleanShutdownKey(), kDayBitmapRecorderGeneration);
         } catch (const std::exception& e) {
             ::native_index_log.warn("Could not record clean shutdown: {} — next open will repair day bitmaps",
                                     e.what());

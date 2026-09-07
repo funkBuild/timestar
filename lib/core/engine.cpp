@@ -432,16 +432,25 @@ seastar::future<WALTimingInfo> Engine::insertBatch(std::vector<TimeStarInsert<T>
 #if TIMESTAR_LOG_INSERT_PATH
     auto start_wal_batch = std::chrono::high_resolution_clock::now();
 #endif
-    co_await walFileManager.insertBatch(insertRequests);
-
-    // Record day bitmaps for time-scoped discovery (0x0D postings). The batch
-    // path previously never recorded them, so batch-only series were wrongly
-    // pruned from time-scoped queries once any day bitmap existed for the
-    // measurement. Skips per series when the LocalId doesn't exist yet (first
-    // batch of a new series — covered by the MetadataOp day-span path).
+    // Record day bitmaps for time-scoped discovery (0x0D postings) BEFORE the
+    // WAL+MemoryStore insert below: InMemorySeries::insert takes the request by
+    // rvalue and moves its timestamps out (takeTimestamps), so after that call
+    // req.getTimestamps() is EMPTY and this loop would record nothing. That is
+    // exactly what happened in production: the loop ran after the insert, so
+    // an established series only ever got day membership from the first-batch
+    // MetadataOp span (and from the startup repair) — and went invisible to
+    // any time-scoped query whose range started after its last announcement.
+    //
+    // Recording ahead of the data write is safe: day bitmaps are a superset
+    // filter, so membership for a write that then fails at the WAL only costs
+    // pruning precision, never correctness. Skips per series when the LocalId
+    // doesn't exist yet (first batch of a new series — covered by the
+    // MetadataOp day-span path).
     for (const auto& req : insertRequests) {
         co_await index.recordInsertDays(req.measurement, req.seriesId128(), req.getTimestamps());
     }
+
+    co_await walFileManager.insertBatch(insertRequests);
 
     // Create timing info
     WALTimingInfo walTiming;

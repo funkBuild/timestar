@@ -140,6 +140,13 @@ struct NativeIndexTestAccess {
     // means to exercise.
     static void simulateUncleanShutdown(NativeIndex& index) { index.suppressCleanShutdownMarker(); }
 
+    // Leave behind a clean-shutdown marker as an OLDER build would have written
+    // it. Pair with simulateUncleanShutdown() on the same index so close() does
+    // not overwrite it with the current generation.
+    static seastar::future<> plantCleanShutdownMarker(NativeIndex& index, const std::string& value) {
+        co_await index.kvPut(keys::encodeCleanShutdownKey(), value);
+    }
+
     // True when a day bitmap for (measurement, day) is durable — the state a
     // recovery pass has to restore. Deliberately reads the KV store only, not
     // the cache.

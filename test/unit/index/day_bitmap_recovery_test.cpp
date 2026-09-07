@@ -190,3 +190,45 @@ SEASTAR_TEST_F(DayBitmapRecoveryTest, CleanShutdownSkipsTheRepairAndUncleanDoesN
     EXPECT_EQ(co_await seriesInDay(engine, day), 1u);
     co_await engine.stop();
 }
+
+// A clean stop by a build whose recorder silently dropped membership leaves a
+// "clean" marker that is not worth believing: 1.4.3 recorded nothing for any
+// batch write and still stopped cleanly, so an upgrade that honoured its
+// marker would skip the only thing able to restore the missing days. The
+// marker therefore carries a recorder generation, and open() treats any other
+// value as unclean.
+SEASTAR_TEST_F(DayBitmapRecoveryTest, StaleRecorderGenerationMarkerRunsTheRepair) {
+    constexpr uint32_t kDays = 3;
+    const uint32_t kFirstDay = todayDay() - kDays;
+
+    {
+        Engine engine;
+        co_await engine.init();
+        for (uint32_t d = 0; d < kDays; ++d) {
+            co_await insertDay(engine, kFirstDay + d);
+        }
+        // What the old recorder left on disk: data for every day, membership
+        // for none but the first.
+        co_await NativeIndexTestAccess::dropDayBitmapsFrom(engine.getIndex(), kMeasurement, kFirstDay + 1);
+        EXPECT_EQ(co_await seriesInDay(engine, kFirstDay + kDays - 1), 0u) << "test precondition";
+        co_await engine.stop();  // clean — writes the CURRENT generation
+    }
+
+    {
+        // Rewrite the marker as the previous generation would have.
+        timestar::index::NativeIndex index(0);
+        co_await index.open();
+        EXPECT_TRUE(index.openedCleanly()) << "the engine's stop above was clean";
+        co_await NativeIndexTestAccess::plantCleanShutdownMarker(index, "1");
+        NativeIndexTestAccess::simulateUncleanShutdown(index);  // keep the planted value on close
+        co_await index.close();
+    }
+
+    Engine engine;
+    co_await engine.init();
+    EXPECT_FALSE(engine.getIndex().openedCleanly()) << "an older generation's marker must read as unclean";
+    for (uint32_t d = 0; d < kDays; ++d) {
+        EXPECT_EQ(co_await seriesInDay(engine, kFirstDay + d), 1u) << "day " << (kFirstDay + d) << " must be repaired";
+    }
+    co_await engine.stop();
+}
