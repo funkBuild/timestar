@@ -17,6 +17,7 @@
 #include <seastar/core/seastar.hh>
 #include <seastar/util/later.hh>
 #include <string_view>
+#include <tuple>
 
 // Block header: uint8_t type + uint32_t timestampSize + uint32_t timestampBytes
 static constexpr size_t BLOCK_HEADER_SIZE = sizeof(uint8_t) + 2 * sizeof(uint32_t);  // 9 bytes
@@ -1058,6 +1059,48 @@ seastar::future<> TSM::dispatchPendingDmaReads() {
     }
 }
 
+// Decode-time facts for a block, filled in as readSingleBlockImpl parses the
+// header. Left at the defaults when the failure happened before the header.
+struct BlockDecodeContext {
+    uint32_t timestampSize = 0;
+    uint32_t timestampBytes = 0;
+    size_t nSkipped = 0;
+    size_t nTimestamps = 0;
+    size_t valueByteSize = 0;
+    bool haveHeader = false;
+};
+
+// Re-raise the in-flight decode exception with the block's identity appended,
+// mirroring rethrowWithFilePath (bad_alloc passes through untouched,
+// BlockDecodeError keeps its type). The descriptor half comes from the index
+// entry the caller handed in; the header half from the bytes just read. When
+// the two disagree the DESCRIPTOR was wrong (stale, mis-parsed, freed under a
+// suspension); when they agree and the value decoder still ran out, the BYTES
+// are wrong. Production only ever saw "CompressedSlice - attempted to read
+// beyond buffer bounds [tsm …]", which distinguishes neither — the 2026-09-03
+// drop of two series from a query could not be diagnosed for exactly that
+// reason.
+[[noreturn]] static void rethrowWithBlockContext(const TSMIndexBlock& block, const BlockDecodeContext* ctx) {
+    std::string suffix = " [block offset=" + std::to_string(block.offset) + " size=" + std::to_string(block.size) +
+                         " count=" + std::to_string(block.blockCount) + " time=" + std::to_string(block.minTime) +
+                         ".." + std::to_string(block.maxTime);
+    if (ctx && ctx->haveHeader) {
+        suffix += " hdr.count=" + std::to_string(ctx->timestampSize) +
+                  " hdr.tsBytes=" + std::to_string(ctx->timestampBytes) + " skip=" + std::to_string(ctx->nSkipped) +
+                  " n=" + std::to_string(ctx->nTimestamps) + " valueBytes=" + std::to_string(ctx->valueByteSize);
+    }
+    suffix += "]";
+    try {
+        throw;
+    } catch (const std::bad_alloc&) {
+        throw;
+    } catch (const timestar::BlockDecodeError& e) {
+        throw timestar::BlockDecodeError(std::string(e.what()) + suffix);
+    } catch (const std::exception& e) {
+        throw std::runtime_error(std::string(e.what()) + suffix);
+    }
+}
+
 // Phase 1.1: Read a single block and return it (not appending to results)
 template <class T>
 seastar::future<std::unique_ptr<TSMBlock<T>>> TSM::readSingleBlock(const TSMIndexBlock& indexBlock, uint64_t startTime,
@@ -1071,12 +1114,20 @@ seastar::future<std::unique_ptr<TSMBlock<T>>> TSM::readSingleBlock(const TSMInde
 }
 
 template <class T>
-seastar::future<std::unique_ptr<TSMBlock<T>>> TSM::readSingleBlockImpl(const TSMIndexBlock& indexBlock,
+seastar::future<std::unique_ptr<TSMBlock<T>>> TSM::readSingleBlockImpl(const TSMIndexBlock& indexBlockRef,
                                                                        uint64_t startTime, uint64_t endTime,
                                                                        const std::vector<std::string>* stringDict) {
     // Capture the dictionary pointer before co_await.  All callers pass
     // coroutine-frame-local copies that survive DMA suspensions, so a shallow
     // pointer save is sufficient here.
+    // Copy the descriptor BEFORE the DMA suspension. Its size is read again after
+    // the co_await to size the value section, and a reference into storage the
+    // caller does not keep stable across that suspension would then decode the
+    // right bytes against the wrong size — which fails only in the value decoder,
+    // after every header check has passed. Every current caller copies its block
+    // list first; this makes the contract not depend on that.
+    const TSMIndexBlock indexBlock = indexBlockRef;
+
     const std::vector<std::string>* localDict = nullptr;
     if constexpr (std::is_same_v<T, std::string>) {
         localDict = stringDict;
@@ -1092,80 +1143,95 @@ seastar::future<std::unique_ptr<TSMBlock<T>>> TSM::readSingleBlockImpl(const TSM
     auto blockBuf = co_await coalescedDmaRead(indexBlock.offset, indexBlock.size);
     Slice blockSlice(blockBuf.get(), blockBuf.size());
 
-    if (indexBlock.size < BLOCK_HEADER_SIZE) {
-        throw std::runtime_error("TSM block too small: " + std::to_string(indexBlock.size));
-    }
-
-    auto headerSlice = blockSlice.getSlice(BLOCK_HEADER_SIZE);
-    uint8_t blockType = headerSlice.read<uint8_t>();
-    uint32_t timestampSize = headerSlice.read<uint32_t>();
-    uint32_t timestampBytes = headerSlice.read<uint32_t>();
-
-    if (timestampBytes > indexBlock.size - BLOCK_HEADER_SIZE) {
-        throw std::runtime_error("TSM block timestampBytes exceeds block size");
-    }
-    if (!timestampCountIsPlausible(timestampSize, timestampBytes)) {
-        throw std::runtime_error("TSM block timestampSize " + std::to_string(timestampSize) + " is impossible for " +
-                                 std::to_string(timestampBytes) + " compressed bytes");
-    }
-
-    // Validate that the block's stored type matches the template parameter
-    TSMValueType expectedType = getValueType<T>();
-    if (static_cast<TSMValueType>(blockType) != expectedType) {
-        throw std::runtime_error("TSM block type mismatch: block contains type " + std::to_string(blockType) +
-                                 " but reader expects type " + std::to_string(static_cast<uint8_t>(expectedType)));
-    }
-
-    auto blockResults = std::make_unique<TSMBlock<T>>(timestampSize);
-    auto timestampsSlice = blockSlice.getSlice(timestampBytes);
-    auto [nSkipped, nTimestamps] =
-        IntegerEncoder::decode(timestampsSlice, timestampSize, blockResults->timestamps, startTime, endTime);
-    size_t valueByteSize = indexBlock.size - timestampBytes - BLOCK_HEADER_SIZE;
-
-    if constexpr (std::is_same_v<T, double>) {
-        auto valuesSlice = blockSlice.getCompressedSlice(valueByteSize);
-        FloatDecoder::decode(valuesSlice, nSkipped, nTimestamps, blockResults->values);
-    } else if constexpr (std::is_same_v<T, bool>) {
-        auto valuesSlice = blockSlice.getSlice(valueByteSize);
-        BoolEncoderRLE::decode(valuesSlice, nSkipped, nTimestamps, blockResults->values);
-    } else if constexpr (std::is_same_v<T, std::string>) {
-        auto valuesSlice = blockSlice.getSlice(valueByteSize);
-        // Phase 3: Check if dictionary-encoded (STR2 magic)
-        if (StringEncoder::isDictionaryEncoded(valuesSlice) && localDict && !localDict->empty()) {
-            StringEncoder::decodeDictionary(valuesSlice, timestampSize, nSkipped, nTimestamps, *localDict,
-                                            blockResults->values);
-        } else {
-            StringEncoder::decode(valuesSlice, timestampSize, nSkipped, nTimestamps, blockResults->values);
+    // Everything from here on is synchronous. Whatever it throws is re-raised
+    // with the block's identity and the header values decoded so far
+    // (rethrowWithBlockContext), so a production decode failure names the block
+    // and says whether the descriptor or the bytes disagreed — not just the file.
+    BlockDecodeContext ctx;
+    try {
+        if (indexBlock.size < BLOCK_HEADER_SIZE) {
+            throw std::runtime_error("TSM block too small: " + std::to_string(indexBlock.size));
         }
-    } else if constexpr (std::is_same_v<T, int64_t>) {
-        auto valuesSlice = blockSlice.getSlice(valueByteSize);
-        // Coroutine-local buffer — thread_local is unsafe in coroutines because
-        // another coroutine on the same thread could clear it during a co_await.
-        std::vector<uint64_t> rawUintScratch;
-        IntegerEncoder::decode(valuesSlice, timestampSize, rawUintScratch);
-        blockResults->values.reserve(nTimestamps);
-        size_t end = std::min(nSkipped + nTimestamps, rawUintScratch.size());
-        for (size_t i = nSkipped; i < end; ++i) {
-            blockResults->values.push_back(ZigZag::zigzagDecode(rawUintScratch[i]));
+
+        auto headerSlice = blockSlice.getSlice(BLOCK_HEADER_SIZE);
+        uint8_t blockType = headerSlice.read<uint8_t>();
+        ctx.timestampSize = headerSlice.read<uint32_t>();
+        ctx.timestampBytes = headerSlice.read<uint32_t>();
+        ctx.haveHeader = true;
+        const uint32_t timestampSize = ctx.timestampSize;
+        const uint32_t timestampBytes = ctx.timestampBytes;
+
+        if (timestampBytes > indexBlock.size - BLOCK_HEADER_SIZE) {
+            throw std::runtime_error("TSM block timestampBytes exceeds block size");
         }
-    }
+        if (!timestampCountIsPlausible(timestampSize, timestampBytes)) {
+            throw std::runtime_error("TSM block timestampSize " + std::to_string(timestampSize) +
+                                     " is impossible for " + std::to_string(timestampBytes) + " compressed bytes");
+        }
 
-    // Same count contract as decodeBlockFlat(): these per-block decoders build a
-    // TSMBlock whose consumers index values by a TIMESTAMP index
-    // (TSMBlock::valueAt), so a desynced pair is an out-of-bounds read.
-    //
-    // Excess values are truncated (benign); a shortfall is raised, because the
-    // only alternatives are to mispair real data or to drop the block and report
-    // success -- a silent partial answer.
-    if (blockResults->values.size() > blockResults->timestamps.size()) {
-        blockResults->values.resize(blockResults->timestamps.size());
-    } else if (blockResults->values.size() < blockResults->timestamps.size()) {
-        throw timestar::BlockDecodeError("TSM block decode short: " + std::to_string(blockResults->values.size()) +
-                                         " values for " + std::to_string(blockResults->timestamps.size()) +
-                                         " timestamps");
-    }
+        // Validate that the block's stored type matches the template parameter
+        TSMValueType expectedType = getValueType<T>();
+        if (static_cast<TSMValueType>(blockType) != expectedType) {
+            throw std::runtime_error("TSM block type mismatch: block contains type " + std::to_string(blockType) +
+                                     " but reader expects type " + std::to_string(static_cast<uint8_t>(expectedType)));
+        }
 
-    co_return blockResults;
+        auto blockResults = std::make_unique<TSMBlock<T>>(timestampSize);
+        auto timestampsSlice = blockSlice.getSlice(timestampBytes);
+        std::tie(ctx.nSkipped, ctx.nTimestamps) =
+            IntegerEncoder::decode(timestampsSlice, timestampSize, blockResults->timestamps, startTime, endTime);
+        const size_t nSkipped = ctx.nSkipped;
+        const size_t nTimestamps = ctx.nTimestamps;
+        ctx.valueByteSize = indexBlock.size - timestampBytes - BLOCK_HEADER_SIZE;
+        const size_t valueByteSize = ctx.valueByteSize;
+
+        if constexpr (std::is_same_v<T, double>) {
+            auto valuesSlice = blockSlice.getCompressedSlice(valueByteSize);
+            FloatDecoder::decode(valuesSlice, nSkipped, nTimestamps, blockResults->values);
+        } else if constexpr (std::is_same_v<T, bool>) {
+            auto valuesSlice = blockSlice.getSlice(valueByteSize);
+            BoolEncoderRLE::decode(valuesSlice, nSkipped, nTimestamps, blockResults->values);
+        } else if constexpr (std::is_same_v<T, std::string>) {
+            auto valuesSlice = blockSlice.getSlice(valueByteSize);
+            // Phase 3: Check if dictionary-encoded (STR2 magic)
+            if (StringEncoder::isDictionaryEncoded(valuesSlice) && localDict && !localDict->empty()) {
+                StringEncoder::decodeDictionary(valuesSlice, timestampSize, nSkipped, nTimestamps, *localDict,
+                                                blockResults->values);
+            } else {
+                StringEncoder::decode(valuesSlice, timestampSize, nSkipped, nTimestamps, blockResults->values);
+            }
+        } else if constexpr (std::is_same_v<T, int64_t>) {
+            auto valuesSlice = blockSlice.getSlice(valueByteSize);
+            // Coroutine-local buffer — thread_local is unsafe in coroutines because
+            // another coroutine on the same thread could clear it during a co_await.
+            std::vector<uint64_t> rawUintScratch;
+            IntegerEncoder::decode(valuesSlice, timestampSize, rawUintScratch);
+            blockResults->values.reserve(nTimestamps);
+            size_t end = std::min(nSkipped + nTimestamps, rawUintScratch.size());
+            for (size_t i = nSkipped; i < end; ++i) {
+                blockResults->values.push_back(ZigZag::zigzagDecode(rawUintScratch[i]));
+            }
+        }
+
+        // Same count contract as decodeBlockFlat(): these per-block decoders build a
+        // TSMBlock whose consumers index values by a TIMESTAMP index
+        // (TSMBlock::valueAt), so a desynced pair is an out-of-bounds read.
+        //
+        // Excess values are truncated (benign); a shortfall is raised, because the
+        // only alternatives are to mispair real data or to drop the block and report
+        // success -- a silent partial answer.
+        if (blockResults->values.size() > blockResults->timestamps.size()) {
+            blockResults->values.resize(blockResults->timestamps.size());
+        } else if (blockResults->values.size() < blockResults->timestamps.size()) {
+            throw timestar::BlockDecodeError("TSM block decode short: " + std::to_string(blockResults->values.size()) +
+                                             " values for " + std::to_string(blockResults->timestamps.size()) +
+                                             " timestamps");
+        }
+
+        co_return blockResults;
+    } catch (...) {
+        rethrowWithBlockContext(indexBlock, &ctx);
+    }
 }
 
 template seastar::future<> TSM::readSeries<double>(const SeriesId128& seriesId, uint64_t startTime, uint64_t endTime,
@@ -1799,53 +1865,57 @@ seastar::future<size_t> TSM::aggregateSeriesImpl(const SeriesId128& seriesId, ui
 
             // Phase 0: per-block tombstone check instead of global gate
             bool blockHasTombstones = blockOverlapsTombstones(block.minTime, block.maxTime, tombstoneRanges);
-            if (!blockHasTombstones) {
-                // Fast path: no tombstones for this block — decode into scratch buffers and fold.
-                // Fully-contained blocks (index bounds prove every point passes the time
-                // filter) use sentinel bounds to hit the branch-free timestamp decode
-                // fast path — result-identical, but skips 2 compares per point.
-                const bool fullyContained = block.minTime >= startTime && block.maxTime <= endTime;
-                const uint64_t decodeStart = fullyContained ? 0 : startTime;
-                const uint64_t decodeEnd = fullyContained ? UINT64_MAX : endTime;
-                size_t n;
-                if (countOnly) {
-                    n = decodeBlockCountOnly(batchBuf.get() + bufferOffset, block.size, decodeStart, decodeEnd,
-                                             aggregator, seriesType, block.blockCount);
-                } else if (seriesType == TSMValueType::Float) {
-                    n = decodeBlockIntoAggregator(batchBuf.get() + bufferOffset, block.size, decodeStart, decodeEnd,
-                                                  aggregator);
-                } else if (seriesType == TSMValueType::Integer) {
-                    n = decodeIntegerBlockIntoAggregator(batchBuf.get() + bufferOffset, block.size, decodeStart,
-                                                         decodeEnd, aggregator);
-                } else {
-                    // Boolean
-                    n = decodeBoolBlockIntoAggregator(batchBuf.get() + bufferOffset, block.size, decodeStart, decodeEnd,
+            try {
+                if (!blockHasTombstones) {
+                    // Fast path: no tombstones for this block — decode into scratch buffers and fold.
+                    // Fully-contained blocks (index bounds prove every point passes the time
+                    // filter) use sentinel bounds to hit the branch-free timestamp decode
+                    // fast path — result-identical, but skips 2 compares per point.
+                    const bool fullyContained = block.minTime >= startTime && block.maxTime <= endTime;
+                    const uint64_t decodeStart = fullyContained ? 0 : startTime;
+                    const uint64_t decodeEnd = fullyContained ? UINT64_MAX : endTime;
+                    size_t n;
+                    if (countOnly) {
+                        n = decodeBlockCountOnly(batchBuf.get() + bufferOffset, block.size, decodeStart, decodeEnd,
+                                                 aggregator, seriesType, block.blockCount);
+                    } else if (seriesType == TSMValueType::Float) {
+                        n = decodeBlockIntoAggregator(batchBuf.get() + bufferOffset, block.size, decodeStart, decodeEnd,
                                                       aggregator);
+                    } else if (seriesType == TSMValueType::Integer) {
+                        n = decodeIntegerBlockIntoAggregator(batchBuf.get() + bufferOffset, block.size, decodeStart,
+                                                             decodeEnd, aggregator);
+                    } else {
+                        // Boolean
+                        n = decodeBoolBlockIntoAggregator(batchBuf.get() + bufferOffset, block.size, decodeStart,
+                                                          decodeEnd, aggregator);
+                    }
+                    totalPoints += n;
+                } else {
+                    // Tombstone path: need per-point filtering, use full decode.
+                    // The fold is synchronous (no co_await) — the shared-state
+                    // contract above still holds.
+                    Slice blockSlice(batchBuf.get() + bufferOffset, block.size);
+                    decodeBlockAndFold(blockSlice, seriesType, block.size, startTime, endTime,
+                                       [&](const std::vector<uint64_t>& ts, auto getValue) {
+                                           // Decoded timestamps are ascending and tombstoneRanges are
+                                           // sorted + non-overlapping, so a monotonic cursor replaces
+                                           // the per-point std::upper_bound: O(N + T) instead of
+                                           // O(N log T).
+                                           size_t ri = 0;
+                                           const size_t nr = tombstoneRanges.size();
+                                           for (size_t i = 0; i < ts.size(); ++i) {
+                                               uint64_t t = ts[i];
+                                               while (ri < nr && tombstoneRanges[ri].second < t)
+                                                   ++ri;
+                                               if (ri < nr && t >= tombstoneRanges[ri].first)
+                                                   continue;  // tombstoned
+                                               aggregator.addPoint(t, getValue(i));
+                                               totalPoints++;
+                                           }
+                                       });
                 }
-                totalPoints += n;
-            } else {
-                // Tombstone path: need per-point filtering, use full decode.
-                // The fold is synchronous (no co_await) — the shared-state
-                // contract above still holds.
-                Slice blockSlice(batchBuf.get() + bufferOffset, block.size);
-                decodeBlockAndFold(blockSlice, seriesType, block.size, startTime, endTime,
-                                   [&](const std::vector<uint64_t>& ts, auto getValue) {
-                                       // Decoded timestamps are ascending and tombstoneRanges are
-                                       // sorted + non-overlapping, so a monotonic cursor replaces
-                                       // the per-point std::upper_bound: O(N + T) instead of
-                                       // O(N log T).
-                                       size_t ri = 0;
-                                       const size_t nr = tombstoneRanges.size();
-                                       for (size_t i = 0; i < ts.size(); ++i) {
-                                           uint64_t t = ts[i];
-                                           while (ri < nr && tombstoneRanges[ri].second < t)
-                                               ++ri;
-                                           if (ri < nr && t >= tombstoneRanges[ri].first)
-                                               continue;  // tombstoned
-                                           aggregator.addPoint(t, getValue(i));
-                                           totalPoints++;
-                                       }
-                                   });
+            } catch (...) {
+                rethrowWithBlockContext(block, nullptr);
             }
 
             bufferOffset += block.size;
