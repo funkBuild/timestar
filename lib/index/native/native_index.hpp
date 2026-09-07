@@ -258,6 +258,19 @@ public:
     // first ever boot) reads as UNCLEAN and repairs.
     bool openedCleanly() const { return openedCleanly_; }
 
+    // Value stored in the INDEX_CLEAN_SHUTDOWN marker. open() only trusts a
+    // marker carrying the CURRENT generation; any other value reads as an
+    // unclean stop and runs the day-bitmap repair. Bump it whenever a fix
+    // changes what the recording paths persist (a recorder that silently
+    // dropped membership leaves a "clean" marker behind that is not worth
+    // believing), so the first boot of the fixed build re-derives membership
+    // from TSM exactly once, and ordinary restarts of the same build stay
+    // off the window-wide scan.
+    //   "1": 1.4.3 and earlier (batch writes recorded no membership).
+    //   "2": batch writes record membership before the memory store consumes
+    //        their timestamps.
+    static constexpr const char* kDayBitmapRecorderGeneration = "2";
+
     // Test/ops hook: make close() behave like a process that died — skip the
     // clean-shutdown marker. Modelling a crash otherwise requires killing the
     // process, which a test cannot do.
