@@ -1,0 +1,40 @@
+INFO  2026-09-11 22:05:50,763 seastar - Reactor backend: linux-aio
+INFO  2026-09-11 22:05:50,763 seastar - Perf-based stall detector creation failed (EACCESS), try setting /proc/sys/kernel/perf_event_paranoid to 1 or less to enable kernel backtraces: falling back to posix timer.
+Reactor stalled for 65 ms on shard 0, in scheduling group main. Backtrace: 0x1ce2a1 0x175fe3 0x17654b 0x176737 0x45caf 0x1b12ff 0x176879 0x10184f 0x9df55 0xa2160 0xa26c0 0xa359f 0xa4cc1 0x168416 0x168bac 0x1b33b6 0x1b47dc 0x113b21 0x1144a0 0x98621 0x2a600 0x2a717 0x9a3a4
+======================================================================
+ TimeStar C++ Insert Benchmark (Seastar HTTP client)
+======================================================================
+  Server:         127.0.0.1:18086
+  Format:         protobuf
+  Connections:    8 (concurrent HTTP connections)
+  Batch size:     10000 timestamps x 10 fields = 100000 pts
+  Batches:        210 (10 warmup + 200 timed)
+  Total points:   20000000 (timed)
+  Hosts/Racks:    10 / 2
+  Seed:           42
+======================================================================
+
+Server health check: OK
+
+Running 10 warmup batches...
+Warmup complete.
+
+Running 200 timed batches with 8 connections...
+
+======================================================================
+ RESULTS
+======================================================================
+
+  Requests:       200 OK, 0 HTTP errors, 0 connection failures
+  Points written: 20000000
+  Wall time:      1.072 s
+  Including setup/teardown: 1.180 s
+  Throughput:     18648887 pts/sec
+  Batch rate:     186.5 batches/sec
+
+  Latency per batch:
+  batch latency           min=   14.28  avg=   42.23  med=   41.12  p95=   71.40  p99=   75.74  max=   80.52  (ms, n=200)
+
+======================================================================
+ Benchmark complete.
+======================================================================

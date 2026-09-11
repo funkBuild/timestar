@@ -1,0 +1,29 @@
+INFO  2026-09-11 17:19:54,354 seastar - Reactor backend: linux-aio
+INFO  2026-09-11 17:19:54,354 seastar - Perf-based stall detector creation failed (EACCESS), try setting /proc/sys/kernel/perf_event_paranoid to 1 or less to enable kernel backtraces: falling back to posix timer.
+Segmentation fault: si_code: 1, si_addr: 0000000000000002, ip: 000055d7c84e2233
+Segmentation fault: resolved ip: 0x000000000082d233 in [0x000055d7c7cb5000+0x0000000000d1a26d]
+Segmentation fault on shard 3, in scheduling group main.
+Backtrace:
+  0x8e2994
+  0x88d313
+  0x88da84
+  0x890fac
+  /usr/lib/x86_64-linux-gnu/libc.so.6+0x45caf
+  0x82d232
+  0x380fe5
+  0x3a1e98
+  0x3a20c3
+  0x3a21eb
+  0x3a24e3
+  0x23bd95
+  0x23c63f
+  0x32e67c
+  0x32f391
+  0x333eec
+  0x87f6d6
+  0x87fe6c
+  0x8ca676
+  0x8cbf96
+  0x84b6e5
+  /usr/lib/x86_64-linux-gnu/libc.so.6+0xa3df9
+  /usr/lib/x86_64-linux-gnu/libc.so.6+0x1375cb

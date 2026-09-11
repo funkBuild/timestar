@@ -28,6 +28,45 @@
 namespace timestar::index {
 
 struct NativeIndexTestAccess {
+    // Exercise the completion/resumption gap: a caller may not consume a ready
+    // future until after cache entries have moved or been evicted.
+    static seastar::future<> visitBitmap(NativeIndex& index, const std::string& key, bool day,
+                                        seastar::noncopyable_function<void(const roaring::Roaring*)> consume) {
+        return day ? index.withDayBitmap(key, std::move(consume))
+                   : index.withPostingsBitmap(key, std::move(consume));
+    }
+
+    static seastar::future<> updateBitmap(NativeIndex& index, std::string& key, bool day, uint32_t id) {
+        auto update = [id](roaring::Roaring& bitmap) { bitmap.add(id); };
+        return day ? index.withDayBitmapForInsert(key, update) : index.withBitmapForInsert(key, update);
+    }
+
+    static seastar::future<bool> addDayMembership(NativeIndex& index, std::string& key, uint32_t id) {
+        return index.addDayMembership(key, id);
+    }
+
+    static void plantBitmap(NativeIndex& index, const std::string& key, bool day, uint32_t id) {
+        auto& entry = day ? index.dayBitmapCache_[key] : index.bitmapCache_[key];
+        entry.bitmap.add(id);
+    }
+
+    static void rehashBitmaps(NativeIndex& index) {
+        index.bitmapCache_.reserve(index.bitmapCache_.bucket_count() * 4 + 100);
+        index.dayBitmapCache_.reserve(index.dayBitmapCache_.bucket_count() * 4 + 100);
+    }
+
+    static void clearBitmaps(NativeIndex& index) {
+        index.bitmapCache_.clear();
+        index.dayBitmapCache_.clear();
+        index.bitmapCacheDirtyKeys_.clear();
+        index.dayBitmapCacheDirtyKeys_.clear();
+    }
+
+    static double cachedSketchEstimate(const NativeIndex& index, const std::string& key) {
+        auto it = index.hllCache_.find(key);
+        return it == index.hllCache_.end() ? 0.0 : it->second.estimate();
+    }
+
     static void clearBlockCache(NativeIndex& index) { index.blockCache_ = BlockCache(index.blockCache_.maxBytes()); }
 
     static seastar::future<> setIndexWalReadOnly(NativeIndex& index, bool readOnly) {

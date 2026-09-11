@@ -28,6 +28,7 @@
 #include <seastar/core/shared_future.hh>
 #include <seastar/core/smp.hh>
 #include <seastar/core/timer.hh>
+#include <seastar/util/noncopyable_function.hh>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -480,12 +481,18 @@ private:
     // set instead of walking the entire cache (up to 100K entries) per flush.
     std::unordered_set<std::string> bitmapCacheDirtyKeys_;
 
-    // Get or load a bitmap (read-only). Returns nullptr if not found anywhere.
-    // Uses pre-built cache key to avoid double string construction.
-    seastar::future<const roaring::Roaring*> getPostingsBitmapByKey(const std::string& cacheKey);
-    // Get or load a bitmap for insert (mutable). Marks entry dirty.
-    // cacheKey is consumed on cache miss (moved into map).
-    seastar::future<roaring::Roaring*> getOrLoadBitmapForInsert(std::string& cacheKey);
+    // Consume cached bitmaps synchronously, before completing the future. Even
+    // awaiting a ready future can yield; returning a pointer into robin_map
+    // would let another coroutine invalidate it before the caller resumes.
+    // Visitors must not suspend, mutate the cache, or retain the borrowed pointer.
+    // The read visitor receives nullptr for a missing key.
+    using BitmapReader = seastar::noncopyable_function<void(const roaring::Roaring*)>;
+    using BitmapWriter = seastar::noncopyable_function<void(roaring::Roaring&)>;
+    seastar::future<> withPostingsBitmap(const std::string& cacheKey, BitmapReader consume);
+    seastar::future<> withPostingsBitmapCold(const std::string& cacheKey, BitmapReader consume);
+    // Marks the entry dirty before invoking the writer.
+    seastar::future<> withBitmapForInsert(std::string& cacheKey, BitmapWriter update);
+    seastar::future<> withBitmapForInsertCold(std::string& cacheKey, BitmapWriter update);
     // Flush dirty bitmaps + batched LOCAL_ID_FORWARD entries into the KV store.
     // The flushDirty* family clears dirty state SYNCHRONOUSLY while filling the
     // batch, but nothing is durable until the caller's wal_->append() returns.
@@ -606,9 +613,11 @@ private:
     seastar::future<> noteClampedHistory(const std::string& measurement, uint32_t droppedFromDay);
     // The last day the clamp refused to record for this measurement, if any.
     seastar::future<std::optional<uint32_t>> clampedHistoryThrough(const std::string& measurement);
-    seastar::future<roaring::Roaring*> getOrLoadDayBitmapForInsert(std::string& cacheKey);
+    seastar::future<> withDayBitmapForInsert(std::string& cacheKey, BitmapWriter update);
+    seastar::future<> withDayBitmapForInsertCold(std::string& cacheKey, BitmapWriter update);
     seastar::future<bool> addDayMembership(std::string& cacheKey, uint32_t localId);
-    seastar::future<const roaring::Roaring*> getDayBitmapByKey(const std::string& cacheKey);
+    seastar::future<> withDayBitmap(const std::string& cacheKey, BitmapReader consume);
+    seastar::future<> withDayBitmapCold(const std::string& cacheKey, BitmapReader consume);
     // flushedKeys, when given, receives the cache keys whose dirty flag this
     // call cleared, so a caller whose write then FAILS can put them back.
     void flushDirtyDayBitmaps(IndexWriteBatch& batch, std::vector<std::string>* flushedKeys = nullptr);

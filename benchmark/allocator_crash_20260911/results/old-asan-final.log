@@ -1,0 +1,75 @@
+INFO  2026-09-11 22:08:09,568 seastar - Reactor backend: linux-aio
+INFO  2026-09-11 22:08:09,568 seastar - Perf-based stall detector creation failed (EACCESS), try setting /proc/sys/kernel/perf_event_paranoid to 1 or less to enable kernel backtraces: falling back to posix timer.
+pending=1; forcing cache rehash before resumption
+=================================================================
+==1882538==ERROR: AddressSanitizer: heap-use-after-free on address 0x6e1a679e3768 at pc 0x6168417f9f5d bp 0x7fff4b5eab30 sp 0x7fff4b5eab20
+READ of size 4 at 0x6e1a679e3768 thread T0
+    #0 0x6168417f9f5c in ra_get_index /home/matt/Desktop/source/tsdb/build-asan/_deps/roaring-src/include/roaring/roaring_array.h:80
+    #1 0x6168417f4f62 in roaring_bitmap_contains /home/matt/Desktop/source/tsdb/build-asan/_deps/roaring-src/src/roaring.c:2812
+    #2 0x6168411bba0f in roaring::Roaring::contains(unsigned int) const /home/matt/Desktop/source/tsdb/build-asan/_deps/roaring-src/cpp/roaring.hh:263
+    #3 0x6168411bba0f in addDayMembership /home/matt/Desktop/source/tsdb/build/perf-query-pass7-before/lib/index/native/native_index.cpp:2595
+    #4 0x61684126f5f0 in std::__n4861::coroutine_handle<seastar::internal::coroutine_traits_base<bool>::promise_type>::resume() const /usr/include/c++/14/coroutine:242
+    #5 0x61684126f5f0 in seastar::internal::coroutine_traits_base<bool>::promise_type::run_and_dispose() /home/matt/Desktop/source/tsdb/external/seastar/include/seastar/core/coroutine.hh:80
+    #6 0x616841a81953 in seastar::reactor::run_tasks(seastar::reactor::task_queue&) /home/matt/Desktop/source/tsdb/external/seastar/src/core/reactor.cc:2622
+    #7 0x616841a866cb in seastar::reactor::run_some_tasks() /home/matt/Desktop/source/tsdb/external/seastar/src/core/reactor.cc:3092
+    #8 0x616841b58d4d in seastar::reactor::do_run() /home/matt/Desktop/source/tsdb/external/seastar/src/core/reactor.cc:3255
+    #9 0x616841b5a137 in seastar::reactor::run() /home/matt/Desktop/source/tsdb/external/seastar/src/core/reactor.cc:3143
+    #10 0x6168418fd77a in seastar::app_template::run_deprecated(int, char**, std::function<void ()>&&) /home/matt/Desktop/source/tsdb/external/seastar/src/core/app-template.cc:273
+    #11 0x6168418fea06 in seastar::app_template::run(int, char**, std::function<seastar::future<int> ()>&&) /home/matt/Desktop/source/tsdb/external/seastar/src/core/app-template.cc:167
+    #12 0x61684110136e in main /home/matt/Desktop/source/tsdb/benchmark/allocator_crash_20260911/preemption_probe.cpp:36
+    #13 0x711a6882a600 in __libc_start_call_main ../sysdeps/nptl/libc_start_call_main.h:59
+    #14 0x711a6882a717 in __libc_start_main_impl ../csu/libc-start.c:360
+    #15 0x616841104784 in _start (/home/matt/Desktop/source/tsdb/build/allocator-crash-probes/old-asan/preemption_probe+0x3578784) (BuildId: f280e89850ded846c561d6784b1fb0543612145e)
+
+0x6e1a679e3768 is located 40 bytes inside of 192-byte region [0x6e1a679e3740,0x6e1a679e3800)
+freed by thread T0 here:
+    #0 0x711a6a12d89f in operator delete(void*, unsigned long) ../../../../src/libsanitizer/asan/asan_new_delete.cpp:190
+    #1 0x61684111b485 in std::__new_allocator<tsl::detail_robin_hash::bucket_entry<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, timestar::index::NativeIndex::BitmapEntry>, true> >::deallocate(tsl::detail_robin_hash::bucket_entry<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, timestar::index::NativeIndex::BitmapEntry>, true>*, unsigned long) /usr/include/c++/14/bits/new_allocator.h:172
+    #2 0x61684111b485 in std::allocator<tsl::detail_robin_hash::bucket_entry<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, timestar::index::NativeIndex::BitmapEntry>, true> >::deallocate(tsl::detail_robin_hash::bucket_entry<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, timestar::index::NativeIndex::BitmapEntry>, true>*, unsigned long) /usr/include/c++/14/bits/allocator.h:208
+    #3 0x61684111b485 in std::allocator_traits<std::allocator<tsl::detail_robin_hash::bucket_entry<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, timestar::index::NativeIndex::BitmapEntry>, true> > >::deallocate(std::allocator<tsl::detail_robin_hash::bucket_entry<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, timestar::index::NativeIndex::BitmapEntry>, true> >&, tsl::detail_robin_hash::bucket_entry<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, timestar::index::NativeIndex::BitmapEntry>, true>*, unsigned long) /usr/include/c++/14/bits/alloc_traits.h:550
+    #4 0x61684111b485 in std::_Vector_base<tsl::detail_robin_hash::bucket_entry<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, timestar::index::NativeIndex::BitmapEntry>, true>, std::allocator<tsl::detail_robin_hash::bucket_entry<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, timestar::index::NativeIndex::BitmapEntry>, true> > >::_M_deallocate(tsl::detail_robin_hash::bucket_entry<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, timestar::index::NativeIndex::BitmapEntry>, true>*, unsigned long) /usr/include/c++/14/bits/stl_vector.h:392
+    #5 0x61684111b485 in std::_Vector_base<tsl::detail_robin_hash::bucket_entry<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, timestar::index::NativeIndex::BitmapEntry>, true>, std::allocator<tsl::detail_robin_hash::bucket_entry<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, timestar::index::NativeIndex::BitmapEntry>, true> > >::~_Vector_base() /usr/include/c++/14/bits/stl_vector.h:371
+    #6 0x61684111b485 in std::vector<tsl::detail_robin_hash::bucket_entry<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, timestar::index::NativeIndex::BitmapEntry>, true>, std::allocator<tsl::detail_robin_hash::bucket_entry<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, timestar::index::NativeIndex::BitmapEntry>, true> > >::~vector() /usr/include/c++/14/bits/stl_vector.h:751
+
+previously allocated by thread T0 here:
+    #0 0x711a6a12c73f in operator new(unsigned long) ../../../../src/libsanitizer/asan/asan_new_delete.cpp:109
+    #1 0x61684111b580 in std::__new_allocator<tsl::detail_robin_hash::bucket_entry<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, timestar::index::NativeIndex::BitmapEntry>, true> >::allocate(unsigned long, void const*) /usr/include/c++/14/bits/new_allocator.h:151
+    #2 0x61684111b580 in std::allocator<tsl::detail_robin_hash::bucket_entry<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, timestar::index::NativeIndex::BitmapEntry>, true> >::allocate(unsigned long) /usr/include/c++/14/bits/allocator.h:196
+    #3 0x61684111b580 in std::allocator_traits<std::allocator<tsl::detail_robin_hash::bucket_entry<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, timestar::index::NativeIndex::BitmapEntry>, true> > >::allocate(std::allocator<tsl::detail_robin_hash::bucket_entry<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, timestar::index::NativeIndex::BitmapEntry>, true> >&, unsigned long) /usr/include/c++/14/bits/alloc_traits.h:515
+    #4 0x61684111b580 in std::_Vector_base<tsl::detail_robin_hash::bucket_entry<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, timestar::index::NativeIndex::BitmapEntry>, true>, std::allocator<tsl::detail_robin_hash::bucket_entry<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, timestar::index::NativeIndex::BitmapEntry>, true> > >::_M_allocate(unsigned long) /usr/include/c++/14/bits/stl_vector.h:383
+    #5 0x61684111b580 in std::_Vector_base<tsl::detail_robin_hash::bucket_entry<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, timestar::index::NativeIndex::BitmapEntry>, true>, std::allocator<tsl::detail_robin_hash::bucket_entry<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, timestar::index::NativeIndex::BitmapEntry>, true> > >::_M_allocate(unsigned long) /usr/include/c++/14/bits/stl_vector.h:380
+    #6 0x61684111b580 in std::_Vector_base<tsl::detail_robin_hash::bucket_entry<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, timestar::index::NativeIndex::BitmapEntry>, true>, std::allocator<tsl::detail_robin_hash::bucket_entry<std::pair<std::__cxx11::basic_string<char, std::char_traits<char>, std::allocator<char> >, timestar::index::NativeIndex::BitmapEntry>, true> > >::_M_create_storage(unsigned long) /usr/include/c++/14/bits/stl_vector.h:401
+
+SUMMARY: AddressSanitizer: heap-use-after-free /home/matt/Desktop/source/tsdb/build-asan/_deps/roaring-src/include/roaring/roaring_array.h:80 in ra_get_index
+Shadow bytes around the buggy address:
+  0x6e1a679e3480: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 01 fa
+  0x6e1a679e3500: fa fa fa fa fa fa fa fa 00 00 00 00 00 00 00 00
+  0x6e1a679e3580: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 04 fa
+  0x6e1a679e3600: fa fa fa fa fa fa fa fa 00 00 00 00 00 00 00 00
+  0x6e1a679e3680: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 01
+=>0x6e1a679e3700: fa fa fa fa fa fa fa fa fd fd fd fd fd[fd]fd fd
+  0x6e1a679e3780: fd fd fd fd fd fd fd fd fd fd fd fd fd fd fd fd
+  0x6e1a679e3800: fa fa fa fa fa fa fa fa 00 00 00 00 00 00 00 00
+  0x6e1a679e3880: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 fa
+  0x6e1a679e3900: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+  0x6e1a679e3980: fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa fa
+Shadow byte legend (one shadow byte represents 8 application bytes):
+  Addressable:           00
+  Partially addressable: 01 02 03 04 05 06 07 
+  Heap left redzone:       fa
+  Freed heap region:       fd
+  Stack left redzone:      f1
+  Stack mid redzone:       f2
+  Stack right redzone:     f3
+  Stack after return:      f5
+  Stack use after scope:   f8
+  Global redzone:          f9
+  Global init order:       f6
+  Poisoned by user:        f7
+  Container overflow:      fc
+  Array cookie:            ac
+  Intra object redzone:    bb
+  ASan internal:           fe
+  Left alloca redzone:     ca
+  Right alloca redzone:    cb
+==1882538==ABORTING
