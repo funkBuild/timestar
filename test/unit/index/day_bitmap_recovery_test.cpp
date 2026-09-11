@@ -27,6 +27,7 @@
 #include <chrono>
 #include <cstdint>
 #include <seastar/core/coroutine.hh>
+#include <seastar/util/defer.hh>
 #include <string>
 #include <vector>
 
@@ -70,6 +71,74 @@ seastar::future<size_t> seriesInDay(Engine& engine, uint32_t day, const std::str
 }
 
 }  // namespace
+
+SEASTAR_TEST_F(DayBitmapRecoveryTest, OlderThanRepairWindowRemainsVisibleAcrossCleanRestart) {
+    const uint32_t liveDay = todayDay();
+    const uint32_t oldDay = liveDay - 90;
+    {
+        Engine engine;
+        co_await engine.init();
+        co_await insertDay(engine, oldDay, "old");
+        co_await insertDay(engine, oldDay, "healthy");
+        co_await insertDay(engine, liveDay, "live");
+        co_await NativeIndexTestAccess::dropDayBitmapsInRange(engine.getIndex(), kMeasurement, oldDay, oldDay);
+        // Keep a nonempty day bitmap: an empty-union fallback alone is insufficient.
+        co_await insertDay(engine, oldDay, "healthy");
+        EXPECT_EQ(co_await seriesInDay(engine, oldDay, "old"), 0u);
+        NativeIndexTestAccess::simulateUncleanShutdown(engine.getIndex());
+        co_await engine.stop();
+    }
+    for (int boot = 0; boot < 2; ++boot) {
+        Engine engine;
+        co_await engine.init();
+        EXPECT_EQ(co_await seriesInDay(engine, oldDay, "old"), 1u);
+        EXPECT_EQ(co_await seriesInDay(engine, liveDay, "live"), 1u);
+        EXPECT_EQ(co_await seriesInDay(engine, liveDay + 2, "live"), 0u);
+        co_await engine.stop();
+    }
+}
+
+SEASTAR_TEST_F(DayBitmapRecoveryTest, DisabledRepairCannotSealIncompleteDayBitmaps) {
+    const uint32_t day = todayDay();
+    {
+        Engine engine;
+        co_await engine.init();
+        co_await insertDay(engine, day);
+        co_await NativeIndexTestAccess::dropDayBitmapsInRange(engine.getIndex(), kMeasurement, day, day);
+        NativeIndexTestAccess::simulateUncleanShutdown(engine.getIndex());
+        co_await engine.stop();
+    }
+    const auto previous = timestar::config();
+    auto restore = seastar::defer([&previous] { timestar::setGlobalConfig(previous); });
+    auto disabled = previous;
+    disabled.index.day_bitmap_rebuild_window_days = 0;
+    timestar::setGlobalConfig(disabled);
+    for (int boot = 0; boot < 2; ++boot) {
+        Engine engine;
+        co_await engine.init();
+        EXPECT_EQ(co_await seriesInDay(engine, day), 1u);
+        co_await engine.stop();
+    }
+}
+
+SEASTAR_TEST_F(DayBitmapRecoveryTest, FutureDatedDataOutsideRepairCapRemainsVisible) {
+    const uint32_t day = todayDay();
+    const uint32_t futureDay = day + 365;
+    {
+        Engine engine;
+        co_await engine.init();
+        co_await insertDay(engine, day);
+        co_await insertDay(engine, futureDay, "future");
+        co_await NativeIndexTestAccess::dropDayBitmapsInRange(engine.getIndex(), kMeasurement, futureDay, futureDay);
+        NativeIndexTestAccess::simulateUncleanShutdown(engine.getIndex());
+        co_await engine.stop();
+    }
+    Engine engine;
+    co_await engine.init();
+    EXPECT_EQ(co_await seriesInDay(engine, futureDay, "future"), 1u);
+    EXPECT_EQ(co_await seriesInDay(engine, day), 1u);
+    co_await engine.stop();
+}
 
 SEASTAR_TEST_F(DayBitmapRecoveryTest, InitRepairsDayBitmapsLostToAnUncleanShutdown) {
     const uint32_t kFirstDay = todayDay() - kDays;

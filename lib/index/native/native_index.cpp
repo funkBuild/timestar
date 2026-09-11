@@ -23,6 +23,7 @@
 #include <seastar/core/smp.hh>
 #include <seastar/core/thread.hh>
 #include <seastar/coroutine/maybe_yield.hh>
+#include <seastar/util/defer.hh>
 #include <seastar/util/log.hh>
 
 // Use short namespace alias for key encoding
@@ -260,12 +261,24 @@ seastar::future<> NativeIndex::open() {
         openedCleanly_ = cleanVal.has_value() && *cleanVal == kDayBitmapRecorderGeneration;
         if (cleanVal.has_value()) {
             co_await kvDelete(ke::encodeCleanShutdownKey());
+            // A crash after open() must never resurrect the old marker.
+            // kvDelete only buffers its WAL record; the transition must be
+            // durable BEFORE Engine can accept another data write.
+            co_await wal_->sync();
         }
     }
 
-    // Day-bitmap durability. The watermark is the day through which membership
-    // was durable at the last flush; Engine::rebuildDayBitmaps() reconstructs
-    // from there. Loaded before any recording so the first flush cannot lower it.
+    if (auto coverage = co_await kvGet(std::string(1, static_cast<char>(DAY_BITMAP_COVERAGE)))) {
+        if (coverage->size() != 8) {
+            throw std::runtime_error("Invalid day-bitmap coverage record");
+        }
+        dayBitmapCoverage_ = {ke::decodeDay(std::string_view(*coverage).substr(0, 4)),
+                              ke::decodeDay(std::string_view(*coverage).substr(4, 4))};
+    }
+
+    // Legacy high-day watermark (diagnostic, not proof of coverage). Repair
+    // deliberately ignores it as a lower bound: historical backfills can be
+    // missing below it. Load before recording so the first flush cannot lower it.
     {
         auto dayWmVal = co_await kvGet(ke::encodeDayBitmapWatermarkKey());
         if (dayWmVal.has_value()) {
@@ -274,9 +287,8 @@ seastar::future<> NativeIndex::open() {
         }
     }
 
-    // Bound what an unclean exit can cost: without this, day membership is
-    // persisted only when the index memtable crosses write_buffer_size, which a
-    // shard writing to long-established series may not do for days.
+    // Background staging for low-level index callers. Engine acknowledgements
+    // independently call sync(), including when this timer is disabled.
     if (auto interval = timestar::config().index.day_bitmap_flush_interval_seconds; interval > 0) {
         dayBitmapFlushTimer_.set_callback([this] {
             if (dayBitmapFlushGate_.is_closed()) {
@@ -333,17 +345,22 @@ seastar::future<> NativeIndex::open() {
     // have durable metadata + local IDs (persisted in their creation batch) but
     // their postings-bitmap membership only lived in RAM. Re-add them from
     // metadata so tag-filtered queries see them again. Day bitmaps cannot be
-    // reconstructed here (insert timestamps are unknown) — future inserts
-    // re-record days; the time-scoped gap is bounded to the crash window.
+    // reconstructed here (insert timestamps are unknown); Engine repairs them
+    // from data bounds and disables day pruning outside verified coverage.
     {
         auto wmVal = co_await kvGet(ke::encodePostingsWatermarkKey());
+        const std::string generationKey(1, static_cast<char>(POSTINGS_REPAIR_GENERATION));
+        auto generation = co_await kvGet(generationKey);
+        const bool repairAll = !generation || *generation != "1";
         // A missing watermark does NOT mean "nothing to repair": the watermark
         // is only written by flushDirtyBitmaps(), while local IDs are persisted
         // with each series-creation batch. A crash before the first bitmap
         // flush/clean close leaves assigned IDs with no watermark — the crash
         // window is then every assigned local ID, so default to 0. (Bitmap
         // adds are idempotent, so over-repairing is safe.)
-        uint32_t watermark = wmVal.has_value() ? ke::decodeLocalId(*wmVal) : 0;
+        uint32_t watermark = !repairAll && wmVal.has_value() ? ke::decodeLocalId(*wmVal) : 0;
+        postingsRepairInProgress_ = true;
+        auto repairGuard = seastar::defer([this] { postingsRepairInProgress_ = false; });
         uint32_t repaired = 0;
         std::string bitmapCacheKey;
         for (uint32_t id = watermark; id < localIdMap_.nextId(); ++id) {
@@ -360,6 +377,20 @@ seastar::future<> NativeIndex::open() {
             }
             dirtyMeasurementBlooms_.insert(meta->measurement);
             ++repaired;
+            if (bitmapCacheDirtyKeys_.size() >= 4096) {
+                auto units = co_await seastar::get_units(flushMutex_, 1);
+                co_await flushDirtyCachesToMemtable();
+                trimBitmapCache();
+            }
+        }
+        postingsRepairInProgress_ = false;
+        if (repairAll) {
+            {
+                auto units = co_await seastar::get_units(flushMutex_, 1);
+                co_await flushDirtyCachesToMemtable();
+            }
+            co_await kvPut(generationKey, "1");
+            co_await wal_->sync();
         }
         if (repaired > 0) {
             ::native_index_log.info("Repaired postings for {} series in crash window [{}, {})", repaired, watermark,
@@ -416,10 +447,10 @@ seastar::future<> NativeIndex::close() {
     // to have no new index entries.
     bool flushedCleanly = true;
     try {
-        co_await waitForFlush();
         if (memtable_) {
             co_await flushMemTable();
         }
+        flushedCleanly = bitmapCacheDirtyKeys_.empty() && dayBitmapCacheDirtyKeys_.empty();
     } catch (const std::exception& e) {
         flushedCleanly = false;
         ::native_index_log.warn("Failed to flush MemTable on close: {} — data preserved in WAL", e.what());
@@ -626,35 +657,46 @@ seastar::future<bool> NativeIndex::kvExists(std::string_view key) {
     co_return false;
 }
 
-// Write ordering: apply to the memtable BEFORE the WAL append. append() can
-// suspend (threshold flush / write semaphore), and a concurrent memtable swap
-// during that suspension would otherwise pair the WAL record with the OLD
-// generation while the memtable apply landed in the NEW memtable — the old
-// WAL is deleted after flushing the old memtable, silently orphaning the
-// record. Applying first guarantees the record is covered by whichever
-// memtable's flush runs; the WAL copy is then redundant-but-idempotent on
-// replay. Callers are acked only after the append returns, so the earlier
-// read visibility is not an early ack.
+// Keep WAL generation and memtable ownership paired across I/O suspension.
+// Ordering the two writes alone is insufficient: an insert arriving AFTER
+// the memtable swap but DURING rotate() can still land in the old WAL, which
+// will be deleted without its new-memtable record ever reaching an SSTable.
 seastar::future<> NativeIndex::kvPut(const std::string& key, const std::string& value) {
     IndexWriteBatch batch;
     batch.put(key, value);
-    memtable_->put(key, value);
-    co_await wal_->append(batch);
-    co_await maybeFlushMemTable();
+    co_await kvWriteBatch(batch);
 }
 
 seastar::future<> NativeIndex::kvDelete(const std::string& key) {
     IndexWriteBatch batch;
     batch.remove(key);
-    memtable_->remove(key);
-    co_await wal_->append(batch);
-    co_await maybeFlushMemTable();
+    co_await kvWriteBatch(batch);
 }
 
 seastar::future<> NativeIndex::kvWriteBatch(const IndexWriteBatch& batch) {
-    batch.applyTo(*memtable_);
-    co_await wal_->append(batch);
+    {
+        auto units = co_await seastar::get_units(flushMutex_, 1);
+        co_await appendAndApplyBatch(batch);
+    }
     co_await maybeFlushMemTable();
+}
+
+seastar::future<> NativeIndex::recoverWriteState() {
+    if (rotationPending_)
+        co_await beginMemtableFlush();
+    if (pendingWrite_) {
+        // Duplicate puts/deletes are idempotent. Keep the owned batch until
+        // BOTH WAL staging and complete memtable application have succeeded.
+        co_await wal_->append(*pendingWrite_);
+        pendingWrite_->applyTo(*memtable_);
+        pendingWrite_.reset();
+    }
+}
+
+seastar::future<> NativeIndex::appendAndApplyBatch(const IndexWriteBatch& batch) {
+    co_await recoverWriteState();
+    pendingWrite_.emplace(batch);  // allocate the retry record before mutating anything
+    co_await recoverWriteState();
 }
 
 // Async streaming kvPrefixScan using MergeIterator.
@@ -758,16 +800,51 @@ seastar::future<> NativeIndex::kvPrefixScan(const std::string& prefix, ScanCallb
 }
 
 seastar::future<> NativeIndex::waitForFlush() {
-    // Reentrant: any number of coroutines may wait on the same in-flight
-    // flush (shared_future is multi-consumer). Loop because a new flush may
-    // have been scheduled while we were suspended.
-    while (flushFuture_) {
-        auto fut = flushFuture_->get_future();
-        co_await std::move(fut);
-        if (flushFuture_ && flushFuture_->available()) {
-            flushFuture_.reset();
+    // All callers hold flushMutex_: no other caller can consume/replace this
+    // future while we wait. The background task never takes this mutex.
+    bool failed = false;
+    if (flushFuture_) {
+        try {
+            co_await flushFuture_->get_future();
+        } catch (...) {
+            failed = true;
+            ::native_index_log.warn("Retrying failed background index flush on shard {}", shardId_);
         }
+        flushFuture_.reset();
     }
+    if (rotationPending_)
+        co_await beginMemtableFlush();
+    if (immutableMemtable_) {
+        co_await finishImmutableFlush();
+    } else if (failed) {
+        // Failure may have happened in maintenance after the immutable and
+        // WAL were safely retired. Retry maintenance, not the old data.
+        co_await compaction_->maybeCompact();
+        co_await refreshSSTables();
+    }
+}
+
+seastar::future<> NativeIndex::beginMemtableFlush() {
+    assert(!immutableMemtable_ && !immutableWalPath_);
+    auto fresh = std::make_shared<MemTable>();
+    // A failed rotate must be retried before any append: flushTail may already
+    // have finalized the old WAL's partial block. Until rotate succeeds the
+    // original active memtable remains readable and paired with that WAL.
+    rotationPending_ = true;
+    auto path = co_await wal_->rotate();
+    immutableWalPath_.emplace(std::move(path));
+    immutableMemtable_ = std::exchange(memtable_, std::move(fresh));
+    rotationPending_ = false;
+}
+
+seastar::future<> NativeIndex::finishImmutableFlush() {
+    assert(immutableMemtable_ && immutableWalPath_);
+    co_await doFlushImmutableMemTable();
+    co_await IndexWAL::deleteFile(*immutableWalPath_);
+    immutableWalPath_.reset();
+    immutableMemtable_.reset();
+    co_await compaction_->maybeCompact();
+    co_await refreshSSTables();
 }
 
 seastar::future<> NativeIndex::maybeFlushMemTable() {
@@ -781,6 +858,8 @@ seastar::future<> NativeIndex::maybeFlushMemTable() {
     // memtable and its WAL was deleted after flushing the wrong data.
     auto flushUnits = co_await seastar::get_units(flushMutex_, 1);
 
+    co_await recoverWriteState();
+
     // Re-check after acquiring — another coroutine may have flushed already.
     auto usage = memtable_->approximateMemoryUsage();
     if (usage < threshold)
@@ -791,25 +870,7 @@ seastar::future<> NativeIndex::maybeFlushMemTable() {
     // Phase 2+3+4: Flush dirty bitmaps, day bitmaps, HLLs, and blooms before memtable swap
     if (!bitmapCache_.empty() || !dayBitmapCache_.empty() || !hllCacheDirty_.empty() ||
         !dirtyMeasurementBlooms_.empty()) {
-        IndexWriteBatch postingsBatch;
-        FlushRollback rollback;
-        rollback.lastFlushedLocalId = lastFlushedLocalId_;
-        rollback.dayBitmapWatermark = dayBitmapWatermark_;
-        flushDirtyBitmaps(postingsBatch, &rollback.bitmapKeys);
-        flushDirtyDayBitmaps(postingsBatch, &rollback.dayBitmapKeys);
-        flushDirtyHLLs(postingsBatch, &rollback.hllKeys);
-        co_await flushDirtyMeasurementBlooms(postingsBatch, &rollback.bloomMeasurements);
-        if (!postingsBatch.empty()) {
-            // Nothing above is durable until this returns; a failure that left
-            // the caches marked clean would silently drop membership.
-            try {
-                co_await wal_->append(postingsBatch);
-            } catch (...) {
-                restoreAfterFailedFlush(rollback);
-                throw;
-            }
-            postingsBatch.applyTo(*memtable_);
-        }
+        co_await flushDirtyCachesToMemtable();
         // Evict non-dirty cache entries to bound memory growth
         trimBitmapCache();
         trimDayBitmapCache();
@@ -822,22 +883,13 @@ seastar::future<> NativeIndex::maybeFlushMemTable() {
     // If a previous flush is still in progress, wait for it
     co_await waitForFlush();
 
-    // Swap: active memtable becomes immutable, create fresh active
-    immutableMemtable_ = std::move(memtable_);
-    memtable_ = std::make_shared<MemTable>();
-
-    // Rotate WAL so new writes go to a fresh log
-    auto oldWalPath = co_await wal_->rotate();
+    if (memtable_->empty())
+        co_return;
+    co_await beginMemtableFlush();
 
     // Schedule the flush asynchronously — writer is NOT blocked.
-    // Use a lambda coroutine that owns the oldWalPath by value.
-    flushFuture_.emplace([](NativeIndex* self, std::string walPath) -> seastar::future<> {
-        co_await self->doFlushImmutableMemTable();
-        co_await IndexWAL::deleteFile(walPath);
-        self->immutableMemtable_.reset();
-        co_await self->compaction_->maybeCompact();
-        co_await self->refreshSSTables();
-    }(this, std::move(oldWalPath)));
+    // The index owns the immutable/WAL pair even if this future fails.
+    flushFuture_.emplace(finishImmutableFlush());
 }
 
 // Blocking flush — used by close() and compact() where we need synchronous completion.
@@ -845,29 +897,13 @@ seastar::future<> NativeIndex::flushMemTable() {
     // Same serialization as maybeFlushMemTable — the swap/rotate region must
     // never run concurrently with another flush.
     auto flushUnits = co_await seastar::get_units(flushMutex_, 1);
+    co_await recoverWriteState();
+    co_await waitForFlush();
 
     // Phase 2+3+4: Flush dirty bitmaps, day bitmaps, HLLs, and blooms before checking empty
     if (!bitmapCache_.empty() || !dayBitmapCache_.empty() || !hllCacheDirty_.empty() ||
         !dirtyMeasurementBlooms_.empty()) {
-        IndexWriteBatch postingsBatch;
-        FlushRollback rollback;
-        rollback.lastFlushedLocalId = lastFlushedLocalId_;
-        rollback.dayBitmapWatermark = dayBitmapWatermark_;
-        flushDirtyBitmaps(postingsBatch, &rollback.bitmapKeys);
-        flushDirtyDayBitmaps(postingsBatch, &rollback.dayBitmapKeys);
-        flushDirtyHLLs(postingsBatch, &rollback.hllKeys);
-        co_await flushDirtyMeasurementBlooms(postingsBatch, &rollback.bloomMeasurements);
-        if (!postingsBatch.empty()) {
-            // Nothing above is durable until this returns; a failure that left
-            // the caches marked clean would silently drop membership.
-            try {
-                co_await wal_->append(postingsBatch);
-            } catch (...) {
-                restoreAfterFailedFlush(rollback);
-                throw;
-            }
-            postingsBatch.applyTo(*memtable_);
-        }
+        co_await flushDirtyCachesToMemtable();
         trimBitmapCache();
         trimDayBitmapCache();
         trimHllCache();        // Step 7
@@ -877,26 +913,10 @@ seastar::future<> NativeIndex::flushMemTable() {
     }
 
     if (memtable_->empty()) {
-        co_await waitForFlush();
         co_return;
     }
-
-    // Wait for any in-flight flush first
-    co_await waitForFlush();
-
-    // Swap to immutable
-    immutableMemtable_ = std::move(memtable_);
-    memtable_ = std::make_shared<MemTable>();
-
-    auto oldWalPath = co_await wal_->rotate();
-
-    // Flush synchronously (blocking)
-    co_await doFlushImmutableMemTable();
-    co_await IndexWAL::deleteFile(oldWalPath);
-    immutableMemtable_.reset();
-
-    co_await compaction_->maybeCompact();
-    co_await refreshSSTables();
+    co_await beginMemtableFlush();
+    co_await finishImmutableFlush();
 }
 
 // Writes the immutable memtable to an SSTable. Does NOT touch active memtable.
@@ -1004,10 +1024,28 @@ seastar::future<SeriesId128> NativeIndex::getOrCreateSeriesId(SeriesId128 series
         co_return seriesId;
     }
 
+    // A field/tag blob is a read-modify-write transaction, not just an atomic
+    // KV put. Keep its snapshot protected through all cold loads and commit.
+    // Broadcasts take the same mutex, so neither can overwrite the other's union.
+    auto schemaUnits = co_await seastar::get_units(schemaMutex_, 1);
+    bool schemaCommitted = false;
+    auto invalidateOnFailure = seastar::defer([this, &schemaCommitted] {
+        if (!schemaCommitted) {
+            fieldsCache_.clear();
+            tagsCache_.clear();
+            tagValuesCache_.clear();
+        }
+    });
+    if (pendingWrite_ || rotationPending_) {
+        auto units = co_await seastar::get_units(flushMutex_, 1);
+        co_await recoverWriteState();
+    }
+
     // Step 8: Check if series exists in storage (existence check only — no value copy)
     auto metaKey = ke::encodeSeriesMetadataKey(seriesId);
     if (co_await kvExists(metaKey) && localIdMap_.getLocalId(seriesId).has_value()) {
         seriesCacheInsert(seriesId);
+        schemaCommitted = true;
         co_return seriesId;
     }
 
@@ -1016,6 +1054,7 @@ seastar::future<SeriesId128> NativeIndex::getOrCreateSeriesId(SeriesId128 series
     // fields/tags indexing pass = 2-6 separate WAL writes. Now it's exactly 1.
     IndexWriteBatch batch;
     batch.reserve(4 + tags.size());  // metadata + 2 indexes + local ID forward + per-tag bitmap
+    SchemaUpdate schemaUpdate;
 
     // Series metadata
     SeriesMetadata metadata{measurement, tags, field};
@@ -1030,8 +1069,16 @@ seastar::future<SeriesId128> NativeIndex::getOrCreateSeriesId(SeriesId128 series
     // the metadata and returned without re-assigning, leaving the series
     // permanently invisible to tag-filtered and time-scoped queries.
     uint32_t localId = localIdMap_.getOrAssign(seriesId);
+    auto pendingId = pendingPostingsIds_.insert(localId);
+    auto finishPostings = seastar::defer([this, pendingId] { pendingPostingsIds_.erase(pendingId); });
     batch.put(ke::encodeLocalIdForwardKey(localId), seriesId.toBytes());
     batch.put(ke::encodeLocalIdCounterKey(), ke::encodeLocalId(localId + 1));
+    // A failed earlier creation may have assigned this ID before a flush
+    // advanced the checkpoint past it. Atomically lower that checkpoint with
+    // the retried metadata, so a crash cannot skip its still-volatile postings.
+    auto checkpoint = co_await kvGet(ke::encodePostingsWatermarkKey());
+    const uint32_t repairFrom = checkpoint ? std::min(localId, ke::decodeLocalId(*checkpoint)) : 0;
+    batch.put(ke::encodePostingsWatermarkKey(), ke::encodeLocalId(repairFrom));
 
     // Phase 2: Add local ID to dirty postings bitmaps (TAG_INDEX/GROUP_BY_INDEX removed in Phase 3)
     std::string bitmapCacheKey;
@@ -1089,7 +1136,7 @@ seastar::future<SeriesId128> NativeIndex::getOrCreateSeriesId(SeriesId128 series
     }
     if (fieldCache->insert(field).second) {
         batch.put(ke::encodeMeasurementFieldsKey(measurement), ke::encodeStringSet(*fieldCache));
-        pendingSchemaUpdate_.newFields[measurement].insert(field);
+        schemaUpdate.newFields[measurement].insert(field);
     }
 
     // --- Tag metadata (was addTag for each tag) ---
@@ -1106,7 +1153,7 @@ seastar::future<SeriesId128> NativeIndex::getOrCreateSeriesId(SeriesId128 series
     for (const auto& [tagKey, tagValue] : tags) {
         if (tagsCache_[measurement].insert(tagKey).second) {
             tagKeysChanged = true;
-            pendingSchemaUpdate_.newTags[measurement].insert(tagKey);
+            schemaUpdate.newTags[measurement].insert(tagKey);
         }
 
         tvCacheKey.clear();
@@ -1126,7 +1173,7 @@ seastar::future<SeriesId128> NativeIndex::getOrCreateSeriesId(SeriesId128 series
             // measurement's entire value set (O(V²) write amplification).
             // The legacy TAG_VALUES blob is no longer written; reads union it.
             batch.put(ke::encodeTagValueMarkerKey(measurement, tagKey, tagValue), "");
-            pendingSchemaUpdate_.newTagValues[tvCacheKey].insert(tagValue);
+            schemaUpdate.newTagValues[tvCacheKey].insert(tagValue);
         }
     }
     // Write measurement-tags once after processing all tags (not per-tag)
@@ -1135,7 +1182,11 @@ seastar::future<SeriesId128> NativeIndex::getOrCreateSeriesId(SeriesId128 series
     }
 
     // Single WAL write for everything
+    // Keep the delta available if this batch is retained for retry. The next
+    // successful metadata barrier recovers pending writes before broadcasting.
+    pendingSchemaUpdate_.merge(schemaUpdate);
     co_await kvWriteBatch(batch);
+    schemaCommitted = true;
     seriesCacheInsert(seriesId);
 
     // The forward mapping was persisted in this batch — skip it in the next
@@ -1428,6 +1479,9 @@ seastar::future<> NativeIndex::indexMetadataBatch(const std::vector<MetadataOp>&
             co_await recordDaySpan(op.measurement, seriesId, op.minTs, op.maxTs);
         }
     }
+    // The HTTP metadata future is an acknowledgement boundary, not just an
+    // in-memory visibility fence. Amortize this over the whole metadata batch.
+    co_await sync();
 }
 
 seastar::future<> NativeIndex::recordDaySpan(const std::string& measurement, const SeriesId128& seriesId,
@@ -1467,7 +1521,7 @@ seastar::future<> NativeIndex::recordDaySpan(const std::string& measurement, con
         buildDayBitmapCacheKey(dayCacheKey, measurement, day);
         // addChecked: day-scoped discovery results cached under the current
         // generation go stale when an EXISTING series first appears in a day.
-        if ((co_await getOrLoadDayBitmapForInsert(dayCacheKey))->addChecked(localId)) {
+        if (co_await addDayMembership(dayCacheKey, localId)) {
             newDayMembership = true;
         }
         noteRecordedDay(day);
@@ -1497,7 +1551,7 @@ seastar::future<> NativeIndex::recordInsertDays(const std::string& measurement, 
             buildDayBitmapCacheKey(dayCacheKey, measurement, day);
             // addChecked: invalidate cached day-scoped discovery when an
             // existing series first appears in a day (see recordDaySpan).
-            if ((co_await getOrLoadDayBitmapForInsert(dayCacheKey))->addChecked(localId)) {
+            if (co_await addDayMembership(dayCacheKey, localId)) {
                 newDayMembership = true;
             }
             noteRecordedDay(day);
@@ -2151,8 +2205,7 @@ size_t NativeIndex::getSeriesCountSync() const {
 
 seastar::future<> NativeIndex::compact() {
     // Wait for any in-flight background flush, then flush active memtable
-    co_await waitForFlush();
-    if (memtable_ && !memtable_->empty()) {
+    if (memtable_) {
         co_await flushMemTable();
     }
 
@@ -2197,11 +2250,6 @@ void NativeIndex::flushDirtyBitmaps(IndexWriteBatch& batch, std::vector<std::str
         batch.put(ke::encodeLocalIdForwardKey(id), localIdMap_.getGlobalId(id).toBytes());
     }
     lastFlushedLocalId_ = localIdMap_.nextId();
-
-    // Advance the postings watermark: every local ID below nextId() has its
-    // bitmap membership included in this batch. On restart, open() re-adds
-    // postings only for IDs at/after the persisted watermark (crash window).
-    batch.put(ke::encodePostingsWatermarkKey(), ke::encodeLocalId(localIdMap_.nextId()));
 
     // Serialize dirty bitmaps — iterate the dirty-key set, not the whole
     // cache (up to 100K entries walked per flush previously).
@@ -2251,6 +2299,13 @@ void NativeIndex::flushDirtyBitmaps(IndexWriteBatch& batch, std::vector<std::str
         }
     }
     bitmapCacheDirtyKeys_.clear();
+    // A loading bitmap can contain a concurrent insert's completed metadata
+    // but not its durable postings. Retain the previous checkpoint until all
+    // loading entries are included; also stop before any unfinished creation.
+    if (stillDirty.empty() && !postingsRepairInProgress_) {
+        const uint32_t watermark = pendingPostingsIds_.empty() ? localIdMap_.nextId() : *pendingPostingsIds_.begin();
+        batch.put(ke::encodePostingsWatermarkKey(), ke::encodeLocalId(watermark));
+    }
     for (auto& key : stillDirty) {
         bitmapCacheDirtyKeys_.insert(std::move(key));
     }
@@ -2337,6 +2392,13 @@ seastar::future<const roaring::Roaring*> NativeIndex::getPostingsBitmapByKey(con
 seastar::future<roaring::Roaring*> NativeIndex::getOrLoadBitmapForInsert(std::string& cacheKey) {
     auto it = bitmapCache_.find(cacheKey);
     if (it != bitmapCache_.end()) {
+        if (it->second.loading) {
+            // Complete the persisted union before this writer can acknowledge
+            // an add. Its flush must not skip an unfinished placeholder.
+            co_await getPostingsBitmapByKey(cacheKey);
+            it = bitmapCache_.find(cacheKey);
+            it.value().loading = false;
+        }
         it.value().dirty = true;
         bitmapCacheDirtyKeys_.insert(cacheKey);
         co_return &it.value().bitmap;
@@ -2470,8 +2532,11 @@ void NativeIndex::buildDayBitmapCacheKey(std::string& out, const std::string& me
 seastar::future<roaring::Roaring*> NativeIndex::getOrLoadDayBitmapForInsert(std::string& cacheKey) {
     auto it = dayBitmapCache_.find(cacheKey);
     if (it != dayBitmapCache_.end()) {
-        it.value().dirty = true;
-        dayBitmapCacheDirtyKeys_.insert(cacheKey);
+        if (it->second.loading) {
+            co_await getDayBitmapByKey(cacheKey);
+            it = dayBitmapCache_.find(cacheKey);
+            it.value().loading = false;
+        }
         co_return &it.value().bitmap;
     }
 
@@ -2485,28 +2550,29 @@ seastar::future<roaring::Roaring*> NativeIndex::getOrLoadDayBitmapForInsert(std:
     // can start adding local IDs immediately.
     {
         auto& placeholder = dayBitmapCache_[cacheKey];
-        placeholder.dirty = true;
         placeholder.loading = true;
     }
-    dayBitmapCacheDirtyKeys_.insert(cacheKey);
     auto existing = co_await kvGet(kvKey);
     // Re-find after co_await (rehash may have moved entries)
     auto& entry = dayBitmapCache_[cacheKey];
-    // Re-mark dirty: a flush during the suspension above saw this entry still
-    // empty, wrote nothing for it and cleared its flag — and trimDayBitmapCache
-    // may have evicted it entirely, so this may be a fresh default-constructed
-    // (clean) entry. Either way the caller is about to add a local id, and
-    // without this the add would sit in RAM in no dirty set: lost to the next
-    // eviction, while the watermark claims that day is durable.
-    entry.dirty = true;
-    entry.loading = false;
-    dayBitmapCacheDirtyKeys_.insert(cacheKey);
     if (existing.has_value()) {
         // Merge (OR) to preserve concurrent adds during the co_await suspension.
         entry.bitmap |= roaring::Roaring::readSafe(existing->data(), existing->size());
         entry.approxBytes = existing->size();
     }
+    entry.loading = false;
     co_return &entry.bitmap;
+}
+
+seastar::future<bool> NativeIndex::addDayMembership(std::string& cacheKey, uint32_t localId) {
+    auto* bitmap = co_await getOrLoadDayBitmapForInsert(cacheKey);
+    if (bitmap->contains(localId))
+        co_return false;
+    // Mark first so an allocation failure during add cannot strand an update.
+    dayBitmapCacheDirtyKeys_.insert(cacheKey);
+    dayBitmapCache_.at(cacheKey).dirty = true;
+    bitmap->add(localId);
+    co_return true;
 }
 
 seastar::future<const roaring::Roaring*> NativeIndex::getDayBitmapByKey(const std::string& cacheKey) {
@@ -2597,13 +2663,8 @@ void NativeIndex::flushDirtyDayBitmaps(IndexWriteBatch& batch, std::vector<std::
         dayBitmapCacheDirtyKeys_.insert(std::move(key));
     }
 
-    // Everything recorded so far is in this batch, so membership is durable
-    // through the highest day touched. A crash after this point can only lose
-    // days recorded LATER, which is what bounds the startup rebuild.
-    //
-    // Day-shaped, not wall-clock-shaped: backfill and replay record days that
-    // are not "today", and a wall-clock watermark would exclude exactly those
-    // from the repair window.
+    // Retain the high-day diagnostic, but never use it as a completeness
+    // checkpoint: a later backfill can add membership BELOW this watermark.
     if (dayBitmapWatermarkNeedsAdvance()) {
         dayBitmapWatermark_ = maxRecordedDay_;
         batch.put(ke::encodeDayBitmapWatermarkKey(), ke::encodeDay(maxRecordedDay_));
@@ -2651,65 +2712,115 @@ void NativeIndex::restoreAfterFailedFlush(const FlushRollback& rollback) {
     restoreDirtyDayBitmaps(rollback.dayBitmapKeys, rollback.dayBitmapWatermark);
 }
 
+NativeIndex::FlushRollback NativeIndex::snapshotDirtyState() const {
+    // Allocate the rollback record BEFORE changing anything. In particular,
+    // preparation can fail while serializing a bitmap or reading bloom keys.
+    FlushRollback rollback;
+    rollback.bitmapKeys.assign(bitmapCacheDirtyKeys_.begin(), bitmapCacheDirtyKeys_.end());
+    rollback.dayBitmapKeys.assign(dayBitmapCacheDirtyKeys_.begin(), dayBitmapCacheDirtyKeys_.end());
+    rollback.hllKeys.assign(hllCacheDirty_.begin(), hllCacheDirty_.end());
+    rollback.bloomMeasurements = dirtyMeasurementBlooms_;
+    rollback.lastFlushedLocalId = lastFlushedLocalId_;
+    rollback.dayBitmapWatermark = dayBitmapWatermark_;
+    return rollback;
+}
+
+seastar::future<> NativeIndex::flushDirtyCachesToMemtable() {
+    co_await recoverWriteState();
+    const auto rollback = snapshotDirtyState();
+    try {
+        IndexWriteBatch batch;
+        flushDirtyBitmaps(batch);
+        flushDirtyDayBitmaps(batch);
+        flushDirtyHLLs(batch);
+        co_await flushDirtyMeasurementBlooms(batch);
+        if (!batch.empty()) {
+            co_await appendAndApplyBatch(batch);
+        }
+    } catch (...) {
+        restoreAfterFailedFlush(rollback);
+        throw;
+    }
+}
+
 // Persist dirty day bitmaps without waiting for the index memtable to cross
 // write_buffer_size. That threshold is fed mostly by NEW series metadata, so a
 // fleet writing to long-established series can go days between flushes — and
 // everything recorded in between is lost to an unclean exit, taking those
 // series out of any query whose range starts in the lost window.
 seastar::future<> NativeIndex::flushDayBitmapsNow() {
-    if (dayBitmapCacheDirtyKeys_.empty() && !dayBitmapWatermarkNeedsAdvance())
-        co_return;
-
     // Same serialization as the memtable-flush path: flushDirtyDayBitmaps
     // mutates the cache and the batch is appended to the WAL and applied to
     // memtable_, which a concurrent flush may be swapping.
+    // Acquire even with no dirty keys: another flush can have cleared them
+    // while its prepared batch is still awaiting bloom reads or WAL append.
     auto flushUnits = co_await seastar::get_units(flushMutex_, 1);
+    co_await recoverWriteState();
     if (dayBitmapCacheDirtyKeys_.empty() && !dayBitmapWatermarkNeedsAdvance())
         co_return;
 
     IndexWriteBatch batch;
-    std::vector<std::string> flushedKeys;
+    const std::vector<std::string> flushedKeys(dayBitmapCacheDirtyKeys_.begin(), dayBitmapCacheDirtyKeys_.end());
     const auto previousWatermark = dayBitmapWatermark_;
-    flushDirtyDayBitmaps(batch, &flushedKeys);
-    if (batch.empty())
-        co_return;
 
-    // Nothing is durable until the append returns. flushDirtyDayBitmaps has
-    // already cleared the dirty flags and advanced the in-memory watermark, so
+    // Nothing is staged in the WAL until the append returns. Serialization
+    // clears the dirty flags and advances the in-memory watermark, so
     // a failure here must put both back — otherwise a full disk turns into
     // permanently missing series with no crash and no error visible to queries.
     try {
-        co_await wal_->append(batch);
+        flushDirtyDayBitmaps(batch);
+        if (batch.empty())
+            co_return;
+        co_await appendAndApplyBatch(batch);
     } catch (...) {
         restoreDirtyDayBitmaps(flushedKeys, previousWatermark);
         throw;
     }
-    batch.applyTo(*memtable_);
     // Deliberately no trimDayBitmapCache() here: entries just cleaned are now
     // evictable, and dropping them would force a re-read on the next insert
     // into a day this shard is actively writing.
+}
+
+seastar::future<> NativeIndex::sync() {
+    co_await flushDayBitmapsNow();
+    co_await wal_->sync();
 }
 
 seastar::future<> NativeIndex::noteClampedHistory(const std::string& measurement, uint32_t refusedThroughDay) {
     // Keep the HIGHEST refused day: every day at or below it is potentially
     // unrecorded for some series in this measurement, so the widest claim is
     // the safe one.
+    auto units = co_await seastar::get_units(clampedHistoryMutex_, 1);
     auto it = clampedHistoryCache_.find(measurement);
+    if (it == clampedHistoryCache_.end()) {
+        auto val = co_await kvGet(ke::encodeClampedHistoryKey(measurement));
+        std::optional<uint32_t> previous;
+        if (val) {
+            if (val->size() != 4)
+                throw std::runtime_error("Invalid clamped-history record");
+            previous = ke::decodeDay(*val);
+        }
+        it = clampedHistoryCache_.emplace(measurement, previous).first;
+    }
     if (it != clampedHistoryCache_.end() && it->second.has_value() && *it->second >= refusedThroughDay) {
         co_return;
     }
-    clampedHistoryCache_[measurement] = refusedThroughDay;
     co_await kvPut(ke::encodeClampedHistoryKey(measurement), ke::encodeDay(refusedThroughDay));
+    clampedHistoryCache_[measurement] = refusedThroughDay;
+    invalidateDiscoveryCache(measurement);
 }
 
 seastar::future<std::optional<uint32_t>> NativeIndex::clampedHistoryThrough(const std::string& measurement) {
+    auto units = co_await seastar::get_units(clampedHistoryMutex_, 1);
     auto it = clampedHistoryCache_.find(measurement);
     if (it != clampedHistoryCache_.end()) {
         co_return it->second;
     }
     auto val = co_await kvGet(ke::encodeClampedHistoryKey(measurement));
     std::optional<uint32_t> parsed;
-    if (val.has_value() && val->size() >= 4) {
+    if (val.has_value()) {
+        if (val->size() != 4)
+            throw std::runtime_error("Invalid clamped-history record");
         parsed = ke::decodeDay(*val);
     }
     clampedHistoryCache_[measurement] = parsed;
@@ -2749,33 +2860,48 @@ void NativeIndex::warnMissingLocalId(const std::string& measurement, const Serie
 
 seastar::future<uint64_t> NativeIndex::rebuildDayBitmapsFromBounds(const std::vector<SeriesTimeBounds>& bounds,
                                                                    uint32_t fromDay, uint32_t toDay) {
+    // Until the complete scan succeeds, even a nonempty union may be missing
+    // series. This restriction also survives a later clean shutdown.
+    co_await disableDayPruning();
     if (fromDay > toDay)
         co_return 0;
 
     uint64_t added = 0;
     std::string dayCacheKey;
     std::unordered_set<std::string> touchedMeasurements;
+    bool hasUnrepairedFuture = false;
+    bool incomplete = false;
 
     for (const auto& b : bounds) {
-        auto localIdOpt = localIdMap_.getLocalId(b.seriesId);
-        if (!localIdOpt.has_value())
-            continue;  // no LocalId: nothing to add to a bitmap (see warnMissingLocalId)
-        const uint32_t localId = *localIdOpt;
-
+        hasUnrepairedFuture |= ke::dayBucketFromNs(b.maxTs) > toDay;
         const uint32_t seriesFirst = ke::dayBucketFromNs(b.minTs);
         const uint32_t seriesLast = ke::dayBucketFromNs(b.maxTs);
         if (seriesLast < fromDay || seriesFirst > toDay)
             continue;
 
         auto meta = co_await getSeriesMetadata(b.seriesId);
-        if (!meta.has_value())
+        if (!meta.has_value()) {
+            incomplete = true;
+            ::native_index_log.error("Day repair cannot recover series {} without metadata; day pruning stays disabled",
+                                     b.seriesId.toHex());
             continue;
+        }
+        auto localIdOpt = localIdMap_.getLocalId(b.seriesId);
+        if (!localIdOpt.has_value()) {
+            // Metadata contains everything needed to repair the mapping and
+            // tag postings. Do not certify a day range after silently skipping it.
+            co_await getOrCreateSeriesId(b.seriesId, meta->measurement, meta->tags, meta->field);
+            localIdOpt = localIdMap_.getLocalId(b.seriesId);
+        }
+        if (!localIdOpt.has_value())
+            throw std::runtime_error("Day repair failed to restore LocalId");
+        const uint32_t localId = *localIdOpt;
 
         const uint32_t first = std::max(seriesFirst, fromDay);
         const uint32_t last = std::min(seriesLast, toDay);
         for (uint32_t day = first; day <= last; ++day) {
             buildDayBitmapCacheKey(dayCacheKey, meta->measurement, day);
-            if ((co_await getOrLoadDayBitmapForInsert(dayCacheKey))->addChecked(localId)) {
+            if (co_await addDayMembership(dayCacheKey, localId)) {
                 ++added;
             }
         }
@@ -2795,6 +2921,8 @@ seastar::future<uint64_t> NativeIndex::rebuildDayBitmapsFromBounds(const std::ve
         // this whole change exists to fix.
         if (dayBitmapCacheDirtyKeys_.size() >= kRebuildFlushEveryDirtyKeys) {
             co_await flushDayBitmapsNow();
+            auto units = co_await seastar::get_units(flushMutex_, 1);
+            trimDayBitmapCache();
         }
     }
 
@@ -2806,7 +2934,26 @@ seastar::future<uint64_t> NativeIndex::rebuildDayBitmapsFromBounds(const std::ve
     // toDay actually complete — so only now may the watermark say so.
     noteRecordedDay(toDay);
     co_await flushDayBitmapsNow();
+    // Bounds include every stored series reaching this window or beyond it.
+    // If no stored point is beyond toDay, later days start empty and remain
+    // complete because new data writes persist membership before acknowledging.
+    if (!incomplete)
+        co_await setDayBitmapCoverage(fromDay, hasUnrepairedFuture ? toDay : UINT32_MAX);
+    co_await wal_->sync();
     co_return added;
+}
+
+seastar::future<> NativeIndex::setDayBitmapCoverage(uint32_t firstDay, uint32_t lastDay) {
+    dayBitmapCoverage_ = {firstDay, lastDay};
+    ++dayBitmapCoverageRevision_;
+    discoveryCache_.clear();
+    co_await kvPut(std::string(1, static_cast<char>(DAY_BITMAP_COVERAGE)),
+                   ke::encodeDay(firstDay) + ke::encodeDay(lastDay));
+}
+
+seastar::future<> NativeIndex::disableDayPruning() {
+    co_await setDayBitmapCoverage(1, 0);
+    co_await wal_->sync();
 }
 
 // Fraction of this shard's arena that ALL index caches together may occupy.
@@ -2898,7 +3045,7 @@ void NativeIndex::trimDayBitmapCache() {
         bool doneBytes = !overBytes || totalBytes <= byteTarget;
         if (doneEntries && doneBytes)
             break;
-        if (!it->second.dirty) {
+        if (!it->second.dirty && !it->second.loading) {
             if (overBytes) {
                 totalBytes -= it->second.approxBytes + it->first.size();
             }
@@ -3078,6 +3225,11 @@ NativeIndex::findSeriesWithMetadataTimeScoped(const std::string& measurement,
     uint32_t startDay = ke::dayBucketFromNs(startTimeNs);
     uint32_t endDay = ke::dayBucketFromNs(endTimeNs);
 
+    if (dayBitmapCoverage_ && (startDay < dayBitmapCoverage_->first || endDay > dayBitmapCoverage_->second ||
+                               dayBitmapCoverage_->first > dayBitmapCoverage_->second)) {
+        co_return co_await findSeriesWithMetadata(measurement, tagFilters, fieldFilter, maxSeries);
+    }
+
     if (endDay < startDay || endDay - startDay > MAX_DAY_SCAN) {
         co_return co_await findSeriesWithMetadata(measurement, tagFilters, fieldFilter, maxSeries);
     }
@@ -3253,6 +3405,8 @@ NativeIndex::findSeriesWithMetadataTimeScopedCached(const std::string& measureme
     cacheKey += std::to_string(startDay);
     cacheKey += '-';
     cacheKey += std::to_string(endDay);
+    cacheKey += ":C";
+    cacheKey += std::to_string(dayBitmapCoverageRevision_);
 
     auto cached = discoveryCache_.get(cacheKey);
     if (cached)
@@ -3408,15 +3562,19 @@ void NativeIndex::flushDirtyHLLs(IndexWriteBatch& batch, std::vector<std::string
 }
 
 seastar::future<> NativeIndex::rebuildMeasurementBlooms() {
-    IndexWriteBatch batch;
-    co_await flushDirtyMeasurementBlooms(batch);
-    if (batch.empty()) {
-        co_return;
+    auto units = co_await seastar::get_units(flushMutex_, 1);
+    co_await recoverWriteState();
+    const auto rollback = snapshotDirtyState();
+    try {
+        IndexWriteBatch batch;
+        co_await flushDirtyMeasurementBlooms(batch);
+        if (!batch.empty()) {
+            co_await appendAndApplyBatch(batch);
+        }
+    } catch (...) {
+        restoreAfterFailedFlush(rollback);
+        throw;
     }
-    // Same durability order as flushMemTable(): WAL first, then the memtable,
-    // so a crash in between replays the new blooms rather than losing them.
-    co_await wal_->append(batch);
-    batch.applyTo(*memtable_);
 }
 
 seastar::future<> NativeIndex::flushDirtyMeasurementBlooms(IndexWriteBatch& batch,
@@ -3623,7 +3781,7 @@ seastar::future<SeriesId128> NativeIndex::indexInsert(const TimeStarInsert<T>& i
                 buildDayBitmapCacheKey(dayCacheKey, insert.measurement, day);
                 // addChecked: invalidate cached day-scoped discovery when an
                 // existing series first appears in a day (see recordDaySpan).
-                if ((co_await getOrLoadDayBitmapForInsert(dayCacheKey))->addChecked(localId)) {
+                if (co_await addDayMembership(dayCacheKey, localId)) {
                     newDayMembership = true;
                 }
                 noteRecordedDay(day);
@@ -3677,6 +3835,19 @@ seastar::future<SchemaUpdate> NativeIndex::indexMetadataBatchWithSchema(const st
 // data. Broadcasts are idempotent unions, so the origin shard re-applying its
 // own update is harmless.
 seastar::future<> NativeIndex::applySchemaUpdate(SchemaUpdate update) {
+    auto schemaUnits = co_await seastar::get_units(schemaMutex_, 1);
+    bool schemaCommitted = false;
+    auto invalidateOnFailure = seastar::defer([this, &schemaCommitted] {
+        if (!schemaCommitted) {
+            fieldsCache_.clear();
+            tagsCache_.clear();
+            tagValuesCache_.clear();
+        }
+    });
+    if (pendingWrite_ || rotationPending_) {
+        auto units = co_await seastar::get_units(flushMutex_, 1);
+        co_await recoverWriteState();
+    }
     IndexWriteBatch batch;
 
     // --- Fields / tag keys: read-modify-write the schema blobs ---
@@ -3746,9 +3917,8 @@ seastar::future<> NativeIndex::applySchemaUpdate(SchemaUpdate update) {
         }
     }
 
-    // Encode blobs from the freshest state (staged union ∪ live cache) with no
-    // suspension between here and the synchronous memtable apply inside
-    // kvWriteBatch — later writers always persist a superset.
+    // Encode the staged union while schemaMutex_ excludes other schema writers,
+    // including during kvWriteBatch's WAL/flush suspensions.
     for (auto& [measurement, merged] : fieldBlobs) {
         if (auto it = fieldsCache_.find(measurement); it != fieldsCache_.end()) {
             merged.insert(it->second.begin(), it->second.end());
@@ -3765,6 +3935,7 @@ seastar::future<> NativeIndex::applySchemaUpdate(SchemaUpdate update) {
     if (!batch.empty()) {
         co_await kvWriteBatch(batch);
     }
+    schemaCommitted = true;
 }
 
 // Explicit template instantiations

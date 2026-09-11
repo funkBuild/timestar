@@ -148,17 +148,16 @@ struct IndexConfig {
     uint64_t block_cache_bytes = 8 * 1024 * 1024;       // 8MB per shard for SSTable block cache
     uint32_t compaction_rate_limit_mbps = 0;            // Max compaction write MB/s (0 = unlimited)
 
-    // Day bitmaps (time-scoped discovery) are otherwise persisted only when the
-    // index memtable crosses write_buffer_size — which a fleet writing to
-    // long-established series may not do for days, since that memtable is fed
-    // mostly by NEW series metadata. Flushing them on a timer bounds what an
-    // unclean shutdown can lose to this interval. 0 disables the timer.
+    // Background staging for day bitmaps written through low-level index APIs.
+    // Engine writes independently sync metadata and day membership before
+    // acknowledging data, even when this timer is disabled. 0 disables it.
     uint32_t day_bitmap_flush_interval_seconds = 30;
     // How far back Engine::rebuildDayBitmaps() reconstructs day membership from
     // TSM per-series time bounds at startup. Every day in the window costs one
     // KV get per (measurement, day) and holds a dirty bitmap in RAM until the
     // next flush, so this bounds both startup time and memory. 0 disables the
-    // rebuild.
+    // rebuild. Outside verified coverage (or with repair disabled after an
+    // unclean shutdown), discovery conservatively skips day pruning.
     uint32_t day_bitmap_rebuild_window_days = 32;
 };
 

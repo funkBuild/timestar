@@ -25,6 +25,7 @@
 ## Operational
 
 - [Backup & Restore](backup-restore.md) - Backing up and restoring data directories
+- [Index Recovery](index-recovery.md) - Write durability, crash repair, and regression coverage
 - [Security](security.md) - Authentication and deployment hardening
 
 ## Format & Internals

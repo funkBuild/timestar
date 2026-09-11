@@ -19,13 +19,158 @@
 #include <endian.h>
 
 #include <cstring>
+#include <fstream>
 #include <seastar/core/coroutine.hh>
+#include <seastar/core/seastar.hh>
 #include <string>
 #include <vector>
 
 namespace timestar::index {
 
 struct NativeIndexTestAccess {
+    static void clearBlockCache(NativeIndex& index) { index.blockCache_ = BlockCache(index.blockCache_.maxBytes()); }
+
+    static seastar::future<> setIndexWalReadOnly(NativeIndex& index, bool readOnly) {
+        return setWalReadOnly(*index.wal_, readOnly);
+    }
+
+    // Leave less than one series-creation batch before the automatic WAL flush.
+    static seastar::future<> fillIndexWalNearThreshold(NativeIndex& index) {
+        IndexWriteBatch batch;
+        batch.put("padding", std::string(1024 * 1024 - 64, 'p'));
+        co_await index.wal_->append(batch);
+    }
+
+    static std::string nextSstablePath(NativeIndex& index) {
+        return index.sstFilename(index.manifest_->currentFileNumber());
+    }
+
+    static seastar::future<> stagePostingsCheckpoint(NativeIndex& index) {
+        auto key = keys::encodePostingsWatermarkKey();
+        auto value = co_await index.kvGet(key);
+        co_await index.kvPut(key, value.value_or(keys::encodeLocalId(0)));
+    }
+
+    static seastar::future<> triggerBackgroundFlush(NativeIndex& index) { return index.maybeFlushMemTable(); }
+
+    static seastar::future<> waitForBackgroundResult(NativeIndex& index) {
+        if (index.flushFuture_)
+            co_await index.flushFuture_->get_future();
+    }
+
+    static uint32_t reserveUncommittedLocalId(NativeIndex& index, SeriesId128 id) {
+        return index.localIdMap_.getOrAssign(id);
+    }
+
+    static bool dayPruningDisabled(const NativeIndex& index) {
+        return index.dayBitmapCoverage_ && index.dayBitmapCoverage_->first > index.dayBitmapCoverage_->second;
+    }
+
+    // Used only after sync(): keep durable metadata, but discard all derived
+    // RAM state as a crash would. Clearing just postings while leaving dirty
+    // HLL/bloom caches would make close() perform an artificial new checkpoint.
+    static void discardAllVolatileDerivedState(NativeIndex& index) {
+        discardVolatilePostings(index);
+        index.dayBitmapCache_.clear();
+        index.dayBitmapCacheDirtyKeys_.clear();
+        index.hllCache_.clear();
+        index.hllCacheDirty_.clear();
+        index.dirtyMeasurementBlooms_.clear();
+    }
+
+    // Model a legacy missing forward mapping while retaining recoverable metadata.
+    static seastar::future<> dropLocalIdMapping(NativeIndex& index, SeriesId128 id) {
+        const auto lost = *index.localIdMap_.getLocalId(id);
+        LocalIdMap restored;
+        restored.restoreBegin(index.localIdMap_.nextId(), index.localIdMap_.nextId());
+        for (uint32_t n = 0; n < index.localIdMap_.nextId(); ++n) {
+            if (n != lost && index.localIdMap_.isValid(n))
+                (void)restored.restoreEntry(n, index.localIdMap_.getGlobalId(n));
+        }
+        index.localIdMap_ = std::move(restored);
+        co_await index.kvDelete(keys::encodeLocalIdForwardKey(lost));
+    }
+
+    static seastar::future<seastar::semaphore_units<>> holdIndexFlush(NativeIndex& index) {
+        return seastar::get_units(index.flushMutex_, 1);
+    }
+
+    static seastar::future<> flushWalBlocks(IndexWAL& wal) {
+        auto units = co_await seastar::get_units(*wal.writeSem_, 1);
+        co_await wal.flushBuffer();
+    }
+
+    static seastar::future<> setWalReadOnly(IndexWAL& wal, bool readOnly) {
+        co_await wal.walFile_->close();
+        wal.walFile_.emplace(co_await seastar::open_file_dma(
+            wal.currentPath_, readOnly ? seastar::open_flags::ro : seastar::open_flags::rw));
+    }
+
+    static uint64_t walSequence(const NativeIndex& index) { return index.wal_->sequenceNumber(); }
+
+    static seastar::future<> plantLegacyPostingsCheckpoint(NativeIndex& index) {
+        co_await index.kvPut(keys::encodePostingsWatermarkKey(), keys::encodeLocalId(index.localIdMap_.nextId()));
+        co_await index.kvDelete(std::string(1, static_cast<char>(POSTINGS_REPAIR_GENERATION)));
+    }
+
+    // Read independently recoverable state, excluding the live memtable and
+    // all derived caches. Do not close or sync the index under test.
+    static seastar::future<std::optional<std::string>> durableValue(NativeIndex& index, const std::string& key) {
+        auto wal = co_await IndexWAL::open(index.indexPath_ + "/wal");
+        MemTable replayed;
+        co_await wal.replay(replayed);
+        if (replayed.isTombstone(key))
+            co_return std::nullopt;
+        if (auto val = replayed.get(key))
+            co_return std::string(*val);
+        for (auto it = index.sstableReaders_.rbegin(); it != index.sstableReaders_.rend(); ++it) {
+            auto val = co_await it->second->get(key);
+            if (val) {
+                if (*val == std::string(1, '\0'))
+                    co_return std::nullopt;
+                co_return val;
+            }
+        }
+        co_return std::nullopt;
+    }
+
+    static void cancelTimers(NativeIndex& index) {
+        index.walSyncTimer_.cancel();
+        index.dayBitmapFlushTimer_.cancel();
+    }
+
+    // Model a suspended cold load plus a concurrent insert's placeholder add.
+    static void holdPostingsLoad(NativeIndex& index, const std::string& measurement, const std::string& tagKey,
+                                 const std::string& tagValue, SeriesId128 concurrentSeries) {
+        std::string key;
+        index.buildBitmapCacheKey(key, measurement, tagKey, tagValue);
+        auto& entry = index.bitmapCache_[key];
+        entry.bitmap = roaring::Roaring();
+        entry.bitmap.add(*index.localIdMap_.getLocalId(concurrentSeries));
+        entry.loading = true;
+        entry.dirty = true;
+        index.bitmapCacheDirtyKeys_.insert(key);
+    }
+
+    static void discardVolatilePostings(NativeIndex& index) {
+        index.bitmapCache_.clear();
+        index.bitmapCacheDirtyKeys_.clear();
+        index.suppressCleanShutdownMarker();
+    }
+
+    // Flip twice to restore the original bytes after a real CRC read failure.
+    static void flipSstableDataByte(NativeIndex& index) {
+        auto path = index.sstFilename(index.sstableReaders_.begin()->first);
+        std::fstream file(path, std::ios::in | std::ios::out | std::ios::binary);
+        file.exceptions(std::ios::failbit | std::ios::badbit);
+        char byte = 0;
+        file.get(byte);
+        file.seekp(0);
+        file.put(byte ^ 1);
+        file.flush();
+        index.blockCache_ = BlockCache(index.blockCache_.maxBytes());
+    }
+
     // Plants a persisted measurement bloom that omits some postings keys — what a
     // <= 1.4.0 server could leave on disk — bypassing every normal write path.
     static seastar::future<> plantStaleBloom(NativeIndex& index, const std::string& measurement,

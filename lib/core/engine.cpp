@@ -169,8 +169,11 @@ seastar::future<> Engine::insert(TimeStarInsert<T> insertRequest, bool skipMetad
     if (!skipMetadataIndexing) {
         LOG_INSERT_PATH(timestar::engine_log, debug, "[ENGINE] Indexing metadata locally for series: '{}'",
                         insertRequest.seriesKey());
-        co_await index.indexInsert(insertRequest);
     }
+    // The caller's hint cannot replace validation of the owning shard's
+    // metadata and LocalId. indexInsert already has an allocation-free hot path.
+    co_await index.indexInsert(insertRequest);
+    co_await index.sync();
 
     LOG_INSERT_PATH(timestar::engine_log, debug, "[ENGINE] Processing data storage for series: '{}'",
                     insertRequest.seriesKey());
@@ -383,8 +386,8 @@ seastar::future<WALTimingInfo> Engine::insertBatch(std::vector<TimeStarInsert<T>
         _metrics.insert_points_total += req.getTimestamps().size();
     }
 
-    // Metadata indexing is now handled at the HTTP handler level on shard 0
-    // This Engine method now only handles data storage (WAL + MemoryStore)
+    // The data owner records metadata too. HTTP's known-series cache is an
+    // optimization for schema broadcasts, not an authority on durability.
     LOG_INSERT_PATH(timestar::engine_log, debug, "[ENGINE] Processing batch data storage for {} requests",
                     insertRequests.size());
 
@@ -443,12 +446,14 @@ seastar::future<WALTimingInfo> Engine::insertBatch(std::vector<TimeStarInsert<T>
     //
     // Recording ahead of the data write is safe: day bitmaps are a superset
     // filter, so membership for a write that then fails at the WAL only costs
-    // pruning precision, never correctness. Skips per series when the LocalId
-    // doesn't exist yet (first batch of a new series — covered by the
-    // MetadataOp day-span path).
+    // pruning precision, never correctness. Create metadata on the owning shard
+    // too: an HTTP announcement cache must not be the authority for whether a
+    // new series has recoverable metadata. One durability barrier covers the
+    // entire batch before any data can be acknowledged.
     for (const auto& req : insertRequests) {
-        co_await index.recordInsertDays(req.measurement, req.seriesId128(), req.getTimestamps());
+        co_await index.indexInsert(req);
     }
+    co_await index.sync();
 
     co_await walFileManager.insertBatch(insertRequests);
 
@@ -468,6 +473,7 @@ seastar::future<SeriesId128> Engine::indexMetadata(TimeStarInsert<T> insertReque
     LOG_INSERT_PATH(timestar::engine_log, debug, "[ENGINE] Indexing metadata for series: '{}' on shard {}",
                     insertRequest.seriesKey(), shardId);
     SeriesId128 seriesId = co_await index.indexInsert(insertRequest);
+    co_await index.sync();
     LOG_INSERT_PATH(timestar::engine_log, debug, "[ENGINE] Metadata indexed, series ID: {}", seriesId.toHex());
     co_return seriesId;
 }
@@ -792,9 +798,6 @@ seastar::future<> Engine::prefetchSeriesIndices(const std::vector<SeriesId128>& 
 // names, so NativeIndex does the seriesId -> measurement join.
 seastar::future<> Engine::rebuildDayBitmaps() {
     const uint32_t windowDays = timestar::config().index.day_bitmap_rebuild_window_days;
-    if (windowDays == 0) {
-        co_return;
-    }
 
     // A clean shutdown flushed every dirty day bitmap, so there is nothing to
     // reconstruct and no reason to make ordinary restarts pay for a window-wide
@@ -802,6 +805,10 @@ seastar::future<> Engine::rebuildDayBitmaps() {
     // boot — reads as unclean and repairs.
     if (index.openedCleanly()) {
         ::timestar::engine_log.debug("[SHARD {}] Clean shutdown recorded — skipping the day-bitmap repair", shardId);
+        co_return;
+    }
+    if (windowDays == 0) {
+        co_await index.disableDayPruning();
         co_return;
     }
 
@@ -849,8 +856,8 @@ seastar::future<> Engine::rebuildDayBitmaps() {
     if (watermark > 0 && watermark + 1 < fromDay) {
         ::timestar::engine_log.warn(
             "[SHARD {}] Day-bitmap repair window is {} days [{}, {}], but membership was last durable on day {}. Days "
-            "[{}, {}) stay unrepaired — time-scoped queries starting in that range may miss series; raise "
-            "index.day_bitmap_rebuild_window_days to cover it.",
+            "[{}, {}) will use conservative series discovery; raise index.day_bitmap_rebuild_window_days to "
+            "restore day pruning there.",
             shardId, windowDays, fromDay, maxDay, watermark, watermark, fromDay);
     }
 
@@ -875,10 +882,6 @@ seastar::future<> Engine::rebuildDayBitmaps() {
             }
         });
     }
-    if (merged.empty()) {
-        co_return;
-    }
-
     std::vector<timestar::index::NativeIndex::SeriesTimeBounds> bounds;
     bounds.reserve(merged.size());
     for (const auto& [id, b] : merged) {

@@ -165,14 +165,12 @@ seastar::future<> IndexWAL::flushBuffer() {
         co_return;
 
     // Prepend any existing tail (partial block from previous flush)
+    // Retain a retryable copy until every I/O step succeeds. A failed DMA
+    // write used to destroy the only copy of these records on unwinding.
     std::string combined;
-    if (!tailBuf_.empty()) {
-        combined.reserve(tailBuf_.size() + buffer_.size());
-        combined = std::move(tailBuf_);
-        combined.append(buffer_);
-    } else {
-        combined = std::move(buffer_);
-    }
+    combined.reserve(tailBuf_.size() + buffer_.size());
+    combined.append(tailBuf_);
+    combined.append(buffer_);
     buffer_.clear();
     tailBuf_.clear();
 
@@ -180,39 +178,50 @@ seastar::future<> IndexWAL::flushBuffer() {
     const size_t alignedSize = totalSize & ~(dmaAlignment_ - 1);  // round down
     const size_t tailSize = totalSize - alignedSize;
 
-    // Write full aligned blocks
-    if (alignedSize > 0) {
-        const size_t paddedSize = alignedSize;  // already aligned
-        auto buf = seastar::temporary_buffer<char>::aligned(dmaAlignment_, paddedSize);
-        std::memcpy(buf.get_write(), combined.data(), alignedSize);
+    try {
+        // Write full aligned blocks
+        if (alignedSize > 0) {
+            const size_t paddedSize = alignedSize;  // already aligned
+            auto buf = seastar::temporary_buffer<char>::aligned(dmaAlignment_, paddedSize);
+            std::memcpy(buf.get_write(), combined.data(), alignedSize);
 
-        // DMA write offset must be aligned — dmaWritePos_ is always aligned
-        size_t written = 0;
-        while (written < paddedSize) {
-            auto n = co_await walFile_->dma_write(dmaWritePos_ + written, buf.get() + written, paddedSize - written);
-            if (n == 0)
-                throw std::runtime_error("IndexWAL dma_write returned 0");
-            written += n;
+            // DMA write offset must be aligned — dmaWritePos_ is always aligned
+            size_t written = 0;
+            while (written < paddedSize) {
+                auto n =
+                    co_await walFile_->dma_write(dmaWritePos_ + written, buf.get() + written, paddedSize - written);
+                if (n == 0)
+                    throw std::runtime_error("IndexWAL dma_write returned 0");
+                written += n;
+            }
         }
+
+        // Do not truncate here: a previous sync may have made the partial
+        // tail durable. Until its replacement is written, shortening the file
+        // to the full-block boundary would destroy acknowledged records.
+        // sync()/flushTail() remove padding only AFTER writing the new tail.
+        if (alignedSize > 0)
+            co_await walFile_->flush();
+
+        // Keep the partial tail in memory for the next flush
+        if (tailSize > 0) {
+            tailBuf_.assign(combined.data() + alignedSize, tailSize);
+        }
+
+        // writePos_ is the logical end of all data written so far.
+        // It equals the DMA-written bytes + any pending tail bytes.
+        // (Cannot use += totalSize because totalSize includes tail bytes
+        // that were already counted in writePos_ during the previous flush.)
         dmaWritePos_ += alignedSize;
+        writePos_ = dmaWritePos_ + tailSize;
+    } catch (...) {
+        // Appends during the I/O suspension belong AFTER this failed write.
+        combined.append(buffer_);
+        buffer_ = std::move(combined);
+        tailBuf_.clear();
+        needsSync_ = true;
+        throw;
     }
-
-    // Keep the partial tail in memory for the next flush
-    if (tailSize > 0) {
-        tailBuf_.assign(combined.data() + alignedSize, tailSize);
-    }
-
-    // writePos_ is the logical end of all data written so far.
-    // It equals the DMA-written bytes + any pending tail bytes.
-    // (Cannot use += totalSize because totalSize includes tail bytes
-    // that were already counted in writePos_ during the previous flush.)
-    writePos_ = dmaWritePos_ + tailSize;
-
-    // Truncate to the actual DMA-written position (not writePos_, which
-    // includes tail bytes still in memory — truncating to writePos_ would
-    // create a zero gap from dmaWritePos_ to writePos_ that breaks replay).
-    co_await walFile_->truncate(dmaWritePos_);
-    co_await walFile_->flush();
 }
 
 seastar::future<IndexWAL> IndexWAL::open(std::string directory) {
@@ -262,11 +271,14 @@ seastar::future<> IndexWAL::append(const IndexWriteBatch& batch) {
 
     size_t headerOffset = buffer_.size();
     // Reserve space for header: length(4) + CRC(4) + sequence(8) = 16 bytes
-    buffer_.resize(headerOffset + 16);
-
-    // Serialize batch payload directly into buffer_ (appends after the header).
-    // This may reallocate buffer_, so all header writes use offsets computed AFTER.
-    batch.serializeTo(buffer_);
+    try {
+        buffer_.resize(headerOffset + 16);
+        // Do not leave a partial frame behind if serialization allocates and fails.
+        batch.serializeTo(buffer_);
+    } catch (...) {
+        buffer_.resize(headerOffset);
+        throw;
+    }
 
     // Fill in the header (all pointer arithmetic done after final buffer_ state)
     size_t payloadSize = buffer_.size() - headerOffset - 16;
@@ -300,9 +312,8 @@ seastar::future<> IndexWAL::append(const IndexWriteBatch& batch) {
 // dmaWritePos_ or clearing tailBuf_ — the next flush simply rewrites the same
 // block in place, so appends can continue seamlessly after a sync.
 seastar::future<> IndexWAL::sync() {
-    if (!needsSync_) {
-        co_return;
-    }
+    // Even when needsSync_ is false, another sync may still be writing the
+    // bytes it claimed. Wait for that operation before acknowledging them.
     auto units = co_await seastar::get_units(*writeSem_, 1);
     if (!needsSync_) {  // another sync/rotate/close won the race
         co_return;
@@ -311,34 +322,39 @@ seastar::future<> IndexWAL::sync() {
     // suspension re-sets it, guaranteeing the next sync picks it up even if
     // this flush already carried its bytes.
     needsSync_ = false;
-
-    if (!walFile_) {
-        if (buffer_.empty()) {
-            co_return;
+    try {
+        if (!walFile_) {
+            if (buffer_.empty()) {
+                co_return;
+            }
+            co_await openFile();
         }
-        co_await openFile();
-    }
-    co_await flushBuffer();  // writes aligned blocks, leaves partial tail in tailBuf_
+        co_await flushBuffer();  // writes aligned blocks, leaves partial tail in tailBuf_
 
-    if (!tailBuf_.empty()) {
-        const size_t tailSize = tailBuf_.size();
-        const size_t paddedSize = (tailSize + dmaAlignment_ - 1) & ~(dmaAlignment_ - 1);
+        if (!tailBuf_.empty()) {
+            const size_t tailSize = tailBuf_.size();
+            const size_t paddedSize = (tailSize + dmaAlignment_ - 1) & ~(dmaAlignment_ - 1);
 
-        auto buf = seastar::temporary_buffer<char>::aligned(dmaAlignment_, paddedSize);
-        std::memset(buf.get_write(), 0, paddedSize);
-        std::memcpy(buf.get_write(), tailBuf_.data(), tailSize);
+            auto buf = seastar::temporary_buffer<char>::aligned(dmaAlignment_, paddedSize);
+            std::memset(buf.get_write(), 0, paddedSize);
+            std::memcpy(buf.get_write(), tailBuf_.data(), tailSize);
 
-        size_t written = 0;
-        while (written < paddedSize) {
-            auto n = co_await walFile_->dma_write(dmaWritePos_ + written, buf.get() + written, paddedSize - written);
-            if (n == 0)
-                throw std::runtime_error("IndexWAL sync dma_write returned 0");
-            written += n;
+            size_t written = 0;
+            while (written < paddedSize) {
+                auto n =
+                    co_await walFile_->dma_write(dmaWritePos_ + written, buf.get() + written, paddedSize - written);
+                if (n == 0)
+                    throw std::runtime_error("IndexWAL sync dma_write returned 0");
+                written += n;
+            }
+            // dmaWritePos_ and tailBuf_ intentionally untouched — the tail block
+            // will be rewritten at the same offset by the next flush.
         }
-        // dmaWritePos_ and tailBuf_ intentionally untouched — the tail block
-        // will be rewritten at the same offset by the next flush.
         co_await walFile_->truncate(writePos_);
         co_await walFile_->flush();
+    } catch (...) {
+        needsSync_ = true;
+        throw;
     }
 }
 
@@ -452,6 +468,10 @@ seastar::future<uint64_t> IndexWAL::replayOneFile(const std::string& path, MemTa
 
 seastar::future<std::string> IndexWAL::rotate() {
     auto units = co_await seastar::get_units(*writeSem_, 1);
+    // Allocate names before finalizing the file. After close succeeds the
+    // generation transition below must not fail half-way through allocation.
+    auto oldPath = currentPath_;
+    auto nextPath = walFileName(directory_, walGeneration_ + 1);
 
     // Materialize buffered records that never hit the flush threshold —
     // append() opens the file lazily only when the buffer fills.
@@ -466,11 +486,12 @@ seastar::future<std::string> IndexWAL::rotate() {
         co_await walFile_->close();
         walFile_.reset();
     }
-    needsSync_ = false;
+    // An append may have arrived after flushBuffer took its snapshot. Those
+    // bytes belong to the next file and still require a durability barrier.
+    needsSync_ = !buffer_.empty();
 
-    auto oldPath = currentPath_;
     ++walGeneration_;
-    currentPath_ = walFileName(directory_, walGeneration_);
+    currentPath_ = std::move(nextPath);
 
     // File opened lazily on next append()
 
@@ -478,9 +499,14 @@ seastar::future<std::string> IndexWAL::rotate() {
 }
 
 seastar::future<> IndexWAL::deleteFile(const std::string& path) {
+    const auto directory = std::filesystem::path(path).parent_path().string();
     if (co_await seastar::file_exists(path)) {
         co_await seastar::remove_file(path);
     }
+    // An older WAL must not reappear after a newer memtable has been flushed:
+    // replay would put its stale values over the newer SST. Also retry the
+    // directory barrier if a previous unlink succeeded but its fsync failed.
+    co_await seastar::sync_directory(directory);
 }
 
 // Write the remaining tail buffer (partial DMA block) to disk.
@@ -503,12 +529,11 @@ seastar::future<> IndexWAL::flushTail() {
             throw std::runtime_error("IndexWAL flushTail dma_write returned 0");
         written += n;
     }
-    dmaWritePos_ += paddedSize;
-    tailBuf_.clear();
-
     // Truncate to logical size (remove DMA padding)
     co_await walFile_->truncate(writePos_);
     co_await walFile_->flush();
+    dmaWritePos_ += paddedSize;
+    tailBuf_.clear();
 }
 
 seastar::future<> IndexWAL::close() {

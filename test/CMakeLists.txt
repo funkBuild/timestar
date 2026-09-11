@@ -12,6 +12,9 @@ FetchContent_MakeAvailable(googletest)
 
 include(GoogleTest)
 
+add_executable(timestar_index_crash_worker crash/index_crash_worker.cpp)
+target_link_libraries(timestar_index_crash_worker PRIVATE libtimestar)
+
 # Collect test files from organized subdirectories
 file(GLOB_RECURSE UNIT_STORAGE_TESTS CONFIGURE_DEPENDS unit/storage/*.cpp)
 file(GLOB_RECURSE UNIT_ENCODING_TESTS CONFIGURE_DEPENDS unit/encoding/*.cpp)
@@ -114,6 +117,8 @@ add_executable(timestar_test ${TEST_SRCS})
 target_link_libraries(timestar_test libtimestar libtimestar_proto_conv timestar_proto gtest_main)
 target_include_directories(timestar_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_definitions(timestar_test PRIVATE ${SOURCE_INSPECTION_DEFS})
+target_compile_definitions(timestar_test PRIVATE INDEX_CRASH_WORKER_PATH="$<TARGET_FILE:timestar_index_crash_worker>")
+add_dependencies(timestar_test timestar_index_crash_worker)
 
 # Discover tests for CTest
 # DISCOVERY_TIMEOUT: the post-build discovery step runs the binary to list its
@@ -143,6 +148,8 @@ add_executable(timestar_unit_test ${UNIT_TEST_SRCS})
 target_link_libraries(timestar_unit_test libtimestar libtimestar_proto_conv timestar_proto gtest_main)
 target_include_directories(timestar_unit_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_definitions(timestar_unit_test PRIVATE ${SOURCE_INSPECTION_DEFS})
+target_compile_definitions(timestar_unit_test PRIVATE INDEX_CRASH_WORKER_PATH="$<TARGET_FILE:timestar_index_crash_worker>")
+add_dependencies(timestar_unit_test timestar_index_crash_worker)
 gtest_discover_tests(timestar_unit_test DISCOVERY_TIMEOUT 120)
 
 # Integration tests only

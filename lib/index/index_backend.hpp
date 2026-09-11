@@ -104,6 +104,14 @@ enum IndexKeyType : uint8_t {
     // measurement's day bitmaps are known-incomplete at the old end, which is
     // what lets a query starting there fall back instead of trusting silence.
     CLAMPED_DAY_HISTORY = 0x1B,
+
+    // Singleton [firstDay,lastDay] (two LE uint32s) where day pruning was
+    // verified against storage. Outside it discovery must enumerate series.
+    // An inverted range disables day pruning; absence is a fresh index.
+    DAY_BITMAP_COVERAGE = 0x1C,
+    // Upgrade repair version. Written only after all postings are rebuilt;
+    // old versions could persist an invalidly advanced postings watermark.
+    POSTINGS_REPAIR_GENERATION = 0x1D,
 };
 
 // Metadata for a time series
