@@ -233,6 +233,9 @@ TEST_F(BugfixSourceInspectionTest, Bug11_LineParserOwnsTags) {
 // trim). The seed source is passed as the cache KEY and re-looked-up after
 // the co_await. Seeding must also run on the deserialize branch, so a stale
 // sketch persisted below the threshold by an older version is back-filled.
+// The re-lookup goes through withPostingsBitmap(): the cached bitmap is only
+// ever seen inside its synchronous visitor, so no pointer can outlive a
+// suspension even inside this function.
 // ---------------------------------------------------------------------------
 TEST_F(BugfixSourceInspectionTest, Bug12_UpdateTagHllSeedsByKeyNotPointer) {
     std::string hppSrc = readFile(NATIVE_INDEX_HPP_SOURCE_PATH);
@@ -249,10 +252,23 @@ TEST_F(BugfixSourceInspectionTest, Bug12_UpdateTagHllSeedsByKeyNotPointer) {
 
     auto fnStart = cppSrc.find("NativeIndex::updateTagHLL");
     ASSERT_NE(fnStart, std::string::npos);
-    auto fnEnd = cppSrc.find("\nseastar::future", fnStart + 10);
-    std::string fnBody = cppSrc.substr(fnStart, fnEnd != std::string::npos ? fnEnd - fnStart : std::string::npos);
+    // Bounded by the function's closing brace so the negative checks below
+    // cannot match a later function.
+    auto fnEnd = cppSrc.find("\n}\n", fnStart);
+    ASSERT_NE(fnEnd, std::string::npos);
+    std::string fnBody = cppSrc.substr(fnStart, fnEnd - fnStart);
 
-    // The bitmap must be re-found after the suspension, not captured before it.
-    EXPECT_NE(fnBody.find("bitmapCache_.find(seedBitmapKey)"), std::string::npos)
-        << "updateTagHLL must re-look up the seed bitmap after its kvGet suspension";
+    // The bitmap must be re-found by key after the suspension, not captured before it.
+    auto kvGetPos = fnBody.find("co_await kvGet(");
+    ASSERT_NE(kvGetPos, std::string::npos);
+    auto seedPos = fnBody.find("withPostingsBitmap(seedBitmapKey");
+    ASSERT_NE(seedPos, std::string::npos)
+        << "updateTagHLL must re-look up the seed bitmap by key through the synchronous visitor";
+    EXPECT_GT(seedPos, kvGetPos) << "updateTagHLL must re-look up the seed bitmap after its kvGet suspension";
+
+    // No pointer into bitmapCache_ may escape the visitor.
+    EXPECT_EQ(fnBody.find("bitmapCache_.find("), std::string::npos)
+        << "updateTagHLL must not hold a bitmapCache_ iterator; read the bitmap inside withPostingsBitmap";
+    EXPECT_EQ(fnBody.find("getPostingsBitmapByKey"), std::string::npos)
+        << "updateTagHLL must not use a pointer-returning bitmap loader";
 }
