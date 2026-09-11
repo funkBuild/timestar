@@ -148,6 +148,7 @@ seastar::future<TSMResult<T>> TSM::queryWithTombstones(const SeriesId128& series
     auto& outTimestamps = filteredBlock->timestamps;
     auto& outValues = filteredBlock->values;
 
+    const bool keepRollups = hasRollups(seriesId);
     size_t tombstonedCount = 0;
     // Two-pointer sweep: since both timestamps and tombstone ranges are sorted,
     // we advance a range index linearly instead of binary searching per point.
@@ -174,6 +175,8 @@ seastar::future<TSMResult<T>> TSM::queryWithTombstones(const SeriesId128& series
             bool isTombstoned = (ri < numRanges && t >= ranges[ri].first && t <= ranges[ri].second);
             if (!isTombstoned) {
                 outTimestamps.push_back(t);
+                if (keepRollups)
+                    filteredBlock->rollups.push_back(block->rollups.empty() ? RollupState{} : block->rollups[i]);
                 if constexpr (std::is_same_v<T, bool>) {
                     outValues.push_back(vals[i]);
                 } else {

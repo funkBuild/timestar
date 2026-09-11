@@ -68,6 +68,7 @@ struct TSMIndexBlock {
     double blockLatestValue = 0.0;  // Value at latest timestamp (for LATEST)
     // 4-byte fields grouped together
     uint32_t size;
+    uint32_t rollupSize = 0;     // V4: compressed metadata immediately following the value block
     uint32_t blockCount = 0;     // 0 means stats not available
     uint32_t boolTrueCount = 0;  // Number of true values in block (Boolean)
     // 1-byte fields grouped together
@@ -96,6 +97,32 @@ struct SparseIndexEntry {
     // blockCount field can express.
     uint64_t entrySize;
     TSMValueType seriesType;  // series value type (captured during sparse index parse)
+    // Total points this file holds for the series: the sum of every block's
+    // count, accumulated during readSparseIndex() while the index region is
+    // already resident. In-memory only; the on-disk format is unchanged.
+    //
+    // Deliberately uint32 and deliberately HERE, immediately after the 4-byte
+    // seriesType: that slot is otherwise pure alignment padding, so this field
+    // is FREE. As a uint64 placed below it grew SparseIndexEntry from 80 to 88
+    // bytes — a 10% increase in the resident sparse index, which is per series
+    // PER OPEN FILE and is exactly the memory this engine is built to conserve
+    // (8 MB per million series per file). Saturating: 4.29e9 points for one
+    // series in one file is ~136 years at 1 Hz, and saturation reads as "very
+    // dense", which is the safe direction for the sweep.
+    //
+    // Exists so the age-driven downsample sweep can estimate a series' STORED
+    // POINT DENSITY with no I/O at all. The alternative — reading each series'
+    // full index entry — is a DMA read per series on the same reactor that
+    // serves queries, which is exactly the stall the sweep must not cause.
+    //
+    // CAVEAT, inherited from the writer (tsm_writer.cpp ~430): for Float
+    // series a block's count is the NON-NaN count, so a NaN-heavy series
+    // reports a lower density than it stores. It may therefore never trip the
+    // sweep's threshold. Accepted: folding NaN points yields nothing but block
+    // -count reduction, since NaN is missing everywhere else in the engine
+    // (docs/nan_policy.md). An all-NaN Float series therefore reports 0, which
+    // the sweep must read as "unknown, do not act" — never "empty".
+    uint32_t pointCount = 0;
     // Per-series time bounds (parsed from first/last block during sparse index load).
     // Enables skipping entire files for time-filtered queries without loading the
     // full index entry — critical for narrow-range queries with many TSM files.
@@ -109,7 +136,14 @@ struct SparseIndexEntry {
     // Boolean sparse stats for zero-I/O LATEST/FIRST
     bool boolFirstValue = false;
     bool boolLatestValue = false;
+    bool hasRollups = false;
 };
+
+// The sparse index is resident for every open file, so its per-series footprint
+// is a first-order memory cost at high cardinality. pointCount lives in
+// seriesType's alignment padding to keep this at 80; a widened or relocated
+// field silently costs 8 MB per million series per open file.
+static_assert(sizeof(SparseIndexEntry) == 80, "SparseIndexEntry grew: check field packing before accepting this");
 
 struct TSMIndexEntry {
     SeriesId128 seriesId;
@@ -166,7 +200,7 @@ struct CacheSizeEstimator<::TSMIndexEntry> {
 // V1: Float blocks have stats (80 bytes), non-Float blocks are base-only (28 bytes).
 // V2: All types have block stats (Float=80, Integer=72, Boolean=40, String=32).
 // V3: per-series index block count widened from uint16 to uint32.
-static constexpr uint8_t TSM_VERSION = 3;
+static constexpr uint8_t TSM_VERSION = 4;
 // Oldest version we can READ. Dropping V2 readability would orphan every
 // pre-V3 file on upgrade (data invisible to queries, file never compacted or
 // reclaimed) — V2 files stay readable and are rewritten as V3 by compaction.
@@ -199,12 +233,33 @@ inline size_t indexBlockBytesV2(TSMValueType type) {
     }
 }
 
+// Byte offset of a block's point count WITHIN a serialized index block, or
+// nullopt when that (type, version) pair carries none.
+//
+// Float packs sum/min/max ahead of the count (28 base + 24); every other type
+// puts the count first, immediately after the 28-byte base. Layouts are
+// identical in V2 and V3 (V3 only widened the per-SERIES block count in the
+// entry header — docs/tsm_format.md "V1/V2 Compatibility").
+//
+// The version < 2 arm is defence, not a live path: TSM_VERSION_MIN is 2, so
+// readSparseIndex() — this function's only caller — never sees a V1 file. It is
+// kept so a future widening of the supported range cannot silently misparse.
+inline std::optional<size_t> indexBlockCountOffset(TSMValueType type, uint8_t version) {
+    if (type == TSMValueType::Float) {
+        return 52;  // minTime(8) maxTime(8) offset(8) size(4) sum(8) min(8) max(8)
+    }
+    if (version >= 2) {
+        return 28;  // minTime(8) maxTime(8) offset(8) size(4)
+    }
+    return std::nullopt;
+}
+
 inline size_t indexBlockBytes(TSMValueType type, uint8_t version) {
     if (version < 2) {
         // V1: only Float has stats
         return (type == TSMValueType::Float) ? 80 : 28;
     }
-    return indexBlockBytesV2(type);
+    return indexBlockBytesV2(type) + (version >= 4 ? 4 : 0);
 }
 
 class TSM {
@@ -221,6 +276,7 @@ private:
     // Defaults to the current version: a truncated header must never leave this
     // at 1 and silently select the V1 index-block layout.
     uint8_t fileVersion = TSM_VERSION;
+    std::vector<uint64_t> replacedFileRanks_;
     // Set by scheduleDelete(): the on-disk file was unlinked but the fd must
     // stay open for in-flight snapshot readers; the destructor closes it.
     bool deferCloseOnDestroy_ = false;
@@ -464,6 +520,49 @@ public:
 
     // Series count without materializing the id list (compaction sizing).
     size_t getSeriesCount() const { return sparseIndex.size(); }
+
+    // Everything the age-driven downsample sweep needs about one series in this
+    // file, straight out of the resident sparse index — NO I/O, no allocation,
+    // no suspension point.
+    struct SeriesDensity {
+        uint64_t minTime = 0;
+        uint64_t maxTime = 0;
+        // Sum of every block's point count. 0 means "unknown" (a V1 non-Float
+        // entry, or a Float series whose blocks are entirely NaN), never
+        // "empty" — see SparseIndexEntry::pointCount.
+        uint64_t pointCount = 0;
+        TSMValueType type = TSMValueType::Float;
+    };
+
+    // Visit every series in this file with its density stats. Callers that scan
+    // whole files must yield between files themselves; this walk is
+    // O(series in file) with no suspension point inside it, so the sparse index
+    // cannot be mutated underneath it.
+    template <typename Fn>
+    void forEachSeriesDensity(Fn&& fn) const {
+        for (const auto& [id, entry] : sparseIndex) {
+            fn(id, SeriesDensity{entry.minTime, entry.maxTime, entry.pointCount, entry.seriesType});
+        }
+    }
+
+    // Density stats for one series, or nullopt when this file does not hold it.
+    seastar::future<std::pair<uint64_t, uint64_t>> estimateRollupDensity(
+        const SeriesId128& seriesId, const std::vector<std::pair<uint64_t, uint64_t>>& stages);
+
+    const std::vector<uint64_t>& replacedFileRanks() const { return replacedFileRanks_; }
+
+    bool hasRollups(const SeriesId128& id) const {
+        auto it = sparseIndex.find(id);
+        return it != sparseIndex.end() && it->second.hasRollups;
+    }
+
+    std::optional<SeriesDensity> getSeriesDensity(const SeriesId128& seriesId) const {
+        auto it = sparseIndex.find(seriesId);
+        if (it == sparseIndex.end()) {
+            return std::nullopt;
+        }
+        return SeriesDensity{it->second.minTime, it->second.maxTime, it->second.pointCount, it->second.seriesType};
+    }
 
     // Visit every series id without copying the list. At high cardinality
     // getSeriesIds() is a 16 B x series allocation per call — the compaction

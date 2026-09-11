@@ -145,6 +145,13 @@ std::vector<std::string> TimestarConfig::validate() const {
     if (engine.retention_sweep_interval_minutes == 0) {
         errors.emplace_back("engine.retention_sweep_interval_minutes must be > 0");
     }
+    // A factor below 1.0 would admit a "fold" that ADDS points; 1.0 exactly
+    // admits a no-op rewrite of an already-folded file on every sweep forever.
+    if (std::isnan(engine.downsample_rewrite_min_reduction_factor) ||
+        std::isinf(engine.downsample_rewrite_min_reduction_factor) ||
+        engine.downsample_rewrite_min_reduction_factor <= 1.0) {
+        errors.emplace_back("engine.downsample_rewrite_min_reduction_factor must be > 1 and finite");
+    }
     // Validate I/O priority shares
     auto validateShares = [&](float val, const char* name) {
         if (std::isnan(val) || std::isinf(val) || val <= 0.0f) {
@@ -479,6 +486,8 @@ void applyEnvironmentOverrides(TimestarConfig& cfg) {
     envU32("TIMESTAR_MAX_METADATA_RETRY_OPS", cfg.engine.max_metadata_retry_ops);
     envDbl("TIMESTAR_TOMBSTONE_DEAD_FRACTION_THRESHOLD", cfg.engine.tombstone_dead_fraction_threshold);
     envU32("TIMESTAR_MAX_TOMBSTONE_REWRITES_PER_SWEEP", cfg.engine.max_tombstone_rewrites_per_sweep);
+    envU32("TIMESTAR_MAX_DOWNSAMPLE_REWRITES_PER_SWEEP", cfg.engine.max_downsample_rewrites_per_sweep);
+    envDbl("TIMESTAR_DOWNSAMPLE_REWRITE_MIN_REDUCTION_FACTOR", cfg.engine.downsample_rewrite_min_reduction_factor);
     envU32("TIMESTAR_METADATA_RETRY_INTERVAL_SECONDS", cfg.engine.metadata_retry_interval_seconds);
     envFlt("TIMESTAR_IO_QUERY_SHARES", cfg.engine.io_priority.query_shares);
     envFlt("TIMESTAR_IO_WRITE_SHARES", cfg.engine.io_priority.write_shares);

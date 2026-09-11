@@ -2137,10 +2137,30 @@ size_t NativeIndex::getSeriesCacheSize() const {
 // Retention policies
 // ============================================================================
 
+// Retention records are OUR OWN documents and must survive a reader that
+// predates one of their fields. Glaze defaults to error_on_unknown_keys = true,
+// which turns "this binary is one schema version behind" into "this record does
+// not parse at all" — the whole policy, TTL included, silently disappears.
+//
+// That is exactly what the legacy `downsample` mirror below exists to prevent,
+// and a strict read defeats it: a pre-cascade binary reading a cascade record
+// never gets as far as the mirror, because `downsampleTiers` is an unknown key
+// to it. Reading leniently here cannot repair binaries that already shipped,
+// but it is what makes the mirror work for every reader from this version
+// forward (Phase 4's per-field methods are the next field to land).
+static constexpr glz::opts kRetentionReadOpts{.error_on_unknown_keys = false};
+
 seastar::future<> NativeIndex::setRetentionPolicy(const RetentionPolicy& policy) {
     auto key = ke::encodeRetentionPolicyKey(policy.measurement);
+    // Persist BOTH representations: the canonical `downsampleTiers` and a
+    // legacy `downsample` mirroring the finest tier, so a reader that knows
+    // only the legacy field applies tier 0 — finer than intended, which is
+    // never coarser and never destroys data. See kRetentionReadOpts for the
+    // condition that mirror depends on.
+    auto stored = policy;
+    timestar::retention::normalizeRetentionTiers(stored);
     std::string value;
-    auto ec = glz::write_json(policy, value);
+    auto ec = glz::write_json(stored, value);
     if (ec) {
         throw std::runtime_error("Failed to serialize retention policy");
     }
@@ -2154,12 +2174,16 @@ seastar::future<std::optional<RetentionPolicy>> NativeIndex::getRetentionPolicy(
         co_return std::nullopt;
 
     RetentionPolicy policy;
-    auto ec = glz::read_json(policy, *val);
+    auto ec = glz::read<kRetentionReadOpts>(policy, *val);
     if (ec) {
         ::native_index_log.warn("Failed to parse retention policy JSON for measurement '{}' — treating as no policy",
                                 measurement);
         co_return std::nullopt;
     }
+    // A record written before the cascade carries only the legacy `downsample`
+    // object; promote it to a one-element tier list so every reader above this
+    // layer sees exactly one representation.
+    timestar::retention::normalizeRetentionTiers(policy);
     co_return policy;
 }
 
@@ -2170,8 +2194,10 @@ seastar::future<std::vector<RetentionPolicy>> NativeIndex::getAllRetentionPolici
     co_await kvPrefixScan(prefix, [&](std::string_view key, std::string_view value) {
         RetentionPolicy policy;
         std::string valStr(value);
-        auto ec = glz::read_json(policy, valStr);
+        auto ec = glz::read<kRetentionReadOpts>(policy, valStr);
         if (!ec) {
+            // Legacy single-object records promote to a one-element tier list.
+            timestar::retention::normalizeRetentionTiers(policy);
             result.push_back(std::move(policy));
         } else {
             // Key layout: RETENTION_POLICY prefix byte + measurement name.

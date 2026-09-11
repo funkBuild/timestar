@@ -278,20 +278,36 @@ message DownsamplePolicy {
     string interval       = 3;  // Duration string, e.g. "5m"
     uint64 interval_nanos = 4;  // Computed nanoseconds
     string method         = 5;  // "avg", "min", "max", "sum", "latest"
+    // Per-field method overrides: field name -> method. Absent (proto3 empty
+    // map) means every field takes `method`, which is exactly how this message
+    // behaved before the field existed.
+    //
+    // A boolean/string field may only be given "latest"; anything else is
+    // rejected rather than coerced to 1.0/0.0.
+    map<string, string> field_methods = 6;
 }
 
 message RetentionPolicy {
     string           measurement = 1;
     string           ttl         = 2;  // Duration string, e.g. "90d"
     uint64           ttl_nanos   = 3;  // Computed nanoseconds
-    DownsamplePolicy downsample  = 4;  // Optional downsampling
+    // Legacy mirror of downsample_tiers[0]. Always populated when any tier
+    // exists, so a client that predates the cascade reads the FINEST tier.
+    DownsamplePolicy downsample  = 4;
+    // Canonical ordered cascade (finest first). proto3 repeated-absent is
+    // empty, so a client that never sets it is indistinguishable from one that
+    // predates it — and its legacy `downsample` is still honoured.
+    repeated DownsamplePolicy downsample_tiers = 5;
 }
 
 // PUT /retention
 message RetentionPutRequest {
     string           measurement = 1;
     string           ttl         = 2;  // Duration string
-    DownsamplePolicy downsample  = 3;
+    DownsamplePolicy downsample  = 3;  // Legacy single-tier form
+    // Cascade form. When non-empty this WINS over `downsample`; when empty the
+    // legacy field is promoted to a one-element cascade.
+    repeated DownsamplePolicy downsample_tiers = 4;
 }
 
 // GET /retention?measurement=...

@@ -24,6 +24,7 @@
 #include <seastar/core/thread.hh>
 #include <seastar/core/when_all.hh>
 #include <seastar/core/with_scheduling_group.hh>
+#include <seastar/util/later.hh>
 #include <unordered_set>
 #include <vector>
 
@@ -45,6 +46,23 @@ seastar::future<> Engine::init() {
         tsmFileManager.setCompactionGroup(_compactionGroup);
         tsmFileManager.setFlushGroup(_flushGroup);
     }
+    // Wire retention into the PRODUCTION compaction path.
+    //
+    // Must come after tsmFileManager.init(), which is where the compactor is
+    // constructed. Without this, TTL trimming and downsampling are dead code:
+    // every merge ran with an empty policy map, so expired points survived in
+    // any file that was not wholly expired, and the fold never happened at all.
+    //
+    // Lifetime: the compactor is owned by tsmFileManager, itself a member of
+    // this Engine, and stop() closes the retention gate and stops the
+    // compaction loop before any member teardown — so a provider capturing
+    // `this` cannot outlive the Engine.
+    if (auto* compactor = tsmFileManager.getCompactor()) {
+        compactor->setRetentionContextProvider(
+            [this](const std::vector<SeriesId128>& seriesIds) { return buildCompactionRetentionContext(seriesIds); },
+            [this] { return hasActionableRetentionPolicy(); });
+    }
+
     co_await walFileManager.init(*this, tsmFileManager);
 
     // Must follow both of the above: the day-bitmap repair reads per-series time
@@ -1193,15 +1211,28 @@ template seastar::future<SeriesId128> Engine::indexMetadata<int64_t>(TimeStarIns
 // --- Retention policy management ---
 
 void Engine::updateRetentionPolicyCache(const RetentionPolicy& policy) {
-    _retentionPolicies[policy.measurement] = policy;
+    // Normalize on the way in so no consumer below this layer has to know
+    // whether the record arrived with a legacy `downsample` object or the
+    // canonical tier list. A pre-cascade persisted record reaches us through
+    // loadAndBroadcastRetentionPolicies with only the legacy field set.
+    auto normalized = policy;
+    timestar::retention::normalizeRetentionTiers(normalized);
+    _retentionPolicies[normalized.measurement] = std::move(normalized);
+    invalidateSeriesMeasurementCache();
 }
 
 void Engine::removeRetentionPolicyCache(const std::string& measurement) {
     _retentionPolicies.erase(measurement);
+    invalidateSeriesMeasurementCache();
 }
 
 void Engine::setRetentionPolicies(std::unordered_map<std::string, RetentionPolicy> policies) {
     _retentionPolicies = std::move(policies);
+    for (auto& [measurement, policy] : _retentionPolicies) {
+        (void)measurement;
+        timestar::retention::normalizeRetentionTiers(policy);
+    }
+    invalidateSeriesMeasurementCache();
 }
 
 std::optional<RetentionPolicy> Engine::getRetentionPolicy(const std::string& measurement) const {
@@ -1210,6 +1241,264 @@ std::optional<RetentionPolicy> Engine::getRetentionPolicy(const std::string& mea
         return it->second;
     }
     return std::nullopt;
+}
+
+bool Engine::hasActionableRetentionPolicy() const {
+    // A policy with neither a TTL nor a usable downsample clause is INERT: the
+    // compactor's context build would produce an all-zero
+    // SeriesRetentionContext and discard it. Treat it as absent, so we never
+    // resolve metadata for a policy that cannot change a single stored point.
+    for (const auto& [measurement, policy] : _retentionPolicies) {
+        (void)measurement;
+        if (timestar::retention::policyIsActionable(policy)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+seastar::future<RetentionCompactionContext> Engine::buildCompactionRetentionContext(
+    const std::vector<SeriesId128>& seriesIds) {
+    RetentionCompactionContext ctx;
+
+    // FAST PATH: no policy on this shard can affect stored points, so no series
+    // needs a measurement name. Returns without a single index read — this is
+    // the common case (most deployments have no retention policy at all) and it
+    // must cost nothing on the merge path. The compactor also consults
+    // hasActionableRetentionPolicy() BEFORE enumerating the plan's series ids,
+    // so a no-policy shard does not even pay that O(series) pass; this check
+    // stands on its own for direct callers.
+    if (!hasActionableRetentionPolicy() || seriesIds.empty()) {
+        co_return ctx;
+    }
+
+    // Snapshot the policy set (and the generation that identifies it) BEFORE
+    // any suspension. Everything below reasons about THIS set: a broadcast can
+    // land on the reactor while an index read is outstanding, and a decision
+    // half-computed from the old set and half from the new one is wrong in both
+    // directions.
+    ctx.policies = _retentionPolicies;
+    const uint64_t policyGeneration = _retentionPolicyGeneration;
+
+    // Resolve seriesId -> measurement for the plan's series. The cache carries
+    // the steady state (the mapping is immutable, so a hit is permanent);
+    // only genuinely unseen ids reach the index.
+    std::vector<SeriesId128> unresolved;
+    for (const auto& sid : seriesIds) {
+        auto it = _seriesMeasurementCache.find(sid);
+        if (it == _seriesMeasurementCache.end()) {
+            unresolved.push_back(sid);
+            continue;
+        }
+        // Only series under a policy need to reach the compactor; anything else
+        // (including the empty-string negative sentinel) would just be filtered
+        // again in its context build.
+        if (!it->second.empty() && _retentionPolicies.contains(it->second)) {
+            ctx.seriesMeasurement.emplace(sid, it->second);
+        }
+    }
+
+    if (unresolved.empty()) {
+        co_return co_await attachFieldOverrides(std::move(ctx));
+    }
+
+    // Any exception below propagates to executeCompaction() and fails the merge
+    // (retried with backoff). Deliberate: a merge that cannot learn which
+    // measurement its series belong to must not run, because it would write out
+    // a file with retention silently unapplied.
+    if (unresolved.size() <= MAX_UNRESOLVED_FOR_PER_ID_LOOKUP) {
+        // BY ID: one bloom-filtered point lookup per unresolved series.
+        // Cheapest when the set is small, and it learns each series' real
+        // measurement name — a permanent fact, cacheable with no invalidation.
+        auto batch = co_await index.getSeriesMetadataBatch(unresolved);
+        for (auto& [sid, metadata] : batch) {
+            if (!metadata.has_value()) {
+                // Unknown to the index: no measurement, hence no policy. NOT
+                // cached — a later write may index it, and a stale negative
+                // would then silently exempt it from retention.
+                continue;
+            }
+            cacheSeriesMeasurement(sid, metadata->measurement);
+            // The FIELD arrives in the same lookup, so per-field methods cost
+            // this path nothing at all — cache it here and attachFieldOverrides
+            // finds it already resolved. (Only for measurements that actually
+            // declare fieldMethods: caching every series' field otherwise would
+            // be pure memory for no reader.)
+            if (auto polIt = ctx.policies.find(metadata->measurement); polIt != ctx.policies.end()) {
+                ctx.seriesMeasurement.emplace(sid, metadata->measurement);
+                if (timestar::retention::policyHasFieldMethods(polIt->second)) {
+                    cacheSeriesField(sid, metadata->field);
+                }
+            }
+        }
+        co_return co_await attachFieldOverrides(std::move(ctx));
+    }
+
+    // BY MEASUREMENT: one 0x0A (MEASUREMENT_SERIES) prefix scan per
+    // policy-bearing measurement.
+    //
+    // Measured at 100k series: ~40 ms for this whole function versus 6.9 s to
+    // resolve the same ids one at a time (and 58 s under I/O contention). The
+    // point-lookup path is queue-depth-1 latency (~70 us per bloom-filtered
+    // kvGet) and a merge cannot afford seconds of it, so above the threshold
+    // the scan wins by two orders of magnitude.
+    //
+    // Soundness: 0x05 (SERIES_METADATA) and 0x0A (MEASUREMENT_SERIES) are
+    // written in the SAME atomic IndexWriteBatch by getOrCreateSeriesId, so
+    // membership here is exactly as complete as the per-id lookup above. The
+    // two paths cannot disagree about which series a measurement holds.
+    std::unordered_set<SeriesId128, SeriesId128::Hash> unresolvedSet(unresolved.begin(), unresolved.end());
+
+    // Iterate the frame-local SNAPSHOT, never the member map. This loop
+    // suspends in its body, and _retentionPolicies can be mutated during that
+    // suspension by a policy broadcast (invoke_on_all ->
+    // updateRetentionPolicyCache / removeRetentionPolicyCache /
+    // setRetentionPolicies). An insert can rehash the map, invalidating every
+    // iterator; an erase destroys the node `measurement` binds to. Either way
+    // the resumed loop is undefined behaviour.
+    for (const auto& [measurement, policy] : ctx.policies) {
+        if (!timestar::retention::policyIsActionable(policy)) {
+            continue;  // inert policy — cannot change any stored point
+        }
+        auto scan = co_await index.getAllSeriesForMeasurement(measurement);
+        if (!scan.has_value()) {
+            // The safety cap tripped, so membership is unknown for this
+            // measurement. Fail rather than treat the truncated set as
+            // complete, which would silently exempt the missing series.
+            throw std::runtime_error("retention context: series enumeration for measurement '" + measurement +
+                                     "' exceeded the index safety limit (" + std::to_string(scan.error().discovered) +
+                                     " > " + std::to_string(scan.error().limit) + ")");
+        }
+        for (const auto& sid : scan.value()) {
+            if (unresolvedSet.erase(sid) > 0) {
+                cacheSeriesMeasurement(sid, measurement);
+                ctx.seriesMeasurement.emplace(sid, measurement);
+            }
+        }
+    }
+
+    // Whatever is still unresolved belongs to no policy-bearing measurement —
+    // a definite answer FOR THE POLICY SET SNAPSHOTTED ABOVE, so record the
+    // negative sentinel. It is the only policy-DEPENDENT entry in the cache,
+    // which is why every mutator of _retentionPolicies clears it
+    // (invalidateSeriesMeasurementCache).
+    //
+    // Clearing is not enough on its own: the scan above suspends, so a
+    // broadcast can clear the cache while this call is in flight and these
+    // sentinels would land AFTER that clear — permanently asserting "no policy
+    // covers this series" about a policy set that no longer exists, with no
+    // further invalidation coming. Drop them instead; the next merge simply
+    // resolves again. (The positive entries recorded above are unaffected: a
+    // series' measurement is immutable, so they are true under any policy set.)
+    if (policyGeneration == _retentionPolicyGeneration) {
+        for (const auto& sid : unresolvedSet) {
+            cacheSeriesMeasurement(sid, std::string{});
+        }
+    }
+
+    co_return co_await attachFieldOverrides(std::move(ctx));
+}
+
+// ---------------------------------------------------------------------------
+// PER-FIELD DOWNSAMPLE METHODS (Phase 4) — the field half of the context.
+//
+// COST CONTRACT, stated plainly because Phase 2 deliberately moved context
+// resolution to PER MEASUREMENT to avoid a per-series charge:
+//
+//  * No policy declares `fieldMethods` -> this returns on its first line. Not
+//    one extra index read, allocation, or map lookup. That is the whole
+//    default population, and it is why "a policy without fieldMethods behaves
+//    identically" is a structural property here, not a test result.
+//  * A policy DOES declare them -> a series' FIELD is needed, and a field is
+//    per series, not per measurement. There is no cheaper source: SeriesId128
+//    hashes measurement+tags+field and cannot be inverted, and no postings
+//    structure maps (measurement, field) -> series. So this costs one 0x05
+//    point lookup per series of a declaring measurement, ONCE — the mapping is
+//    immutable, so a cache hit is permanent and the steady-state cost returns
+//    to zero. On the by-id path (the warm case: only genuinely new series are
+//    unresolved) it costs nothing extra at all, because that path already
+//    fetched the metadata the field comes from.
+//
+// The per-MEASUREMENT context build in the compactor is untouched: the context
+// table gains one entry per overridden field (bounded by the policy), and a
+// series still resolves through exactly one hash lookup.
+seastar::future<RetentionCompactionContext> Engine::attachFieldOverrides(RetentionCompactionContext ctx) {
+    if (ctx.seriesMeasurement.empty()) {
+        co_return ctx;
+    }
+
+    // Which measurements in THIS snapshot name per-field methods, and which
+    // fields they name. Built once per call; policies hold at most 4 tiers.
+    std::unordered_map<std::string, std::unordered_set<std::string>> overriddenFields;
+    for (const auto& [measurement, policy] : ctx.policies) {
+        if (!timestar::retention::policyHasFieldMethods(policy)) {
+            continue;
+        }
+        auto& fields = overriddenFields[measurement];
+        for (const auto& tier : timestar::retention::effectiveTiers(policy)) {
+            for (const auto& [field, method] : timestar::retention::fieldMethodsOf(tier)) {
+                (void)method;
+                fields.insert(field);
+            }
+        }
+    }
+    if (overriddenFields.empty()) {
+        co_return ctx;  // THE DEFAULT PATH — nothing below runs.
+    }
+
+    // Only series whose field is actually OVERRIDDEN reach the compactor's
+    // field map. Everything else misses there and takes the measurement's
+    // default context, which is exactly the pre-Phase-4 resolution.
+    auto record = [&](const SeriesId128& sid, const std::string& measurement, const std::string& field) {
+        auto it = overriddenFields.find(measurement);
+        if (it != overriddenFields.end() && it->second.contains(field)) {
+            ctx.seriesField.emplace(sid, field);
+        }
+    };
+
+    std::vector<SeriesId128> needField;
+    for (const auto& [sid, measurement] : ctx.seriesMeasurement) {
+        if (!overriddenFields.contains(measurement)) {
+            continue;
+        }
+        auto cached = _seriesFieldCache.find(sid);
+        if (cached != _seriesFieldCache.end()) {
+            record(sid, measurement, cached->second);
+            continue;
+        }
+        needField.push_back(sid);
+    }
+
+    if (needField.empty()) {
+        co_return ctx;
+    }
+
+    // A failure here propagates and FAILS the merge, matching the measurement
+    // resolution above: folding a totalizer with the tier's default `avg`
+    // because its field could not be read is silent data destruction, and
+    // exactly what per-field methods exist to prevent.
+    auto batch = co_await index.getSeriesMetadataBatch(needField);
+    for (auto& [sid, metadata] : batch) {
+        if (!metadata.has_value()) {
+            // 0x05 and 0x0A are written in one atomic batch, so this should be
+            // unreachable for a series the measurement scan just produced. If
+            // it ever happens, leaving the series out of ctx.seriesField gives
+            // it the measurement default — so a totalizer would be averaged.
+            // Drop it from the retention set entirely instead: keeping raw data
+            // is the only non-destructive direction. TTL is forfeited with it,
+            // which is the lesser loss.
+            timestar::engine_log.warn(
+                "[RETENTION] Shard {}: series {} has no indexed metadata; excluding it from this merge's retention "
+                "context rather than folding it with the wrong per-field method",
+                shardId, sid.toHex());
+            ctx.seriesMeasurement.erase(sid);
+            continue;
+        }
+        cacheSeriesField(sid, metadata->field);
+        record(sid, metadata->measurement, metadata->field);
+    }
+
+    co_return ctx;
 }
 
 seastar::future<> Engine::loadAndBroadcastRetentionPolicies() {
@@ -1250,7 +1539,13 @@ void Engine::startRetentionSweepTimer() {
         // This avoids the TOCTOU race between is_closed() check and enter().
         (void)seastar::try_with_gate(_retentionGate, [this] {
             return shardedRef->invoke_on_all([](Engine& engine) {
-                return engine.sweepExpiredFiles().then([&engine] { return engine.sweepTombstoneRewrites(); });
+                // Three stages, in order: whole-file expiry, tombstone
+                // reclamation, then age-driven downsampling. Downsampling runs
+                // last so it never proposes a rewrite of a file the expiry
+                // stage is about to delete outright.
+                return engine.sweepExpiredFiles()
+                    .then([&engine] { return engine.sweepTombstoneRewrites(); })
+                    .then([&engine] { return engine.sweepDownsampleRewrites(); });
             });
         }).handle_exception([](std::exception_ptr ep) {
             try {
@@ -1457,6 +1752,430 @@ seastar::future<> Engine::sweepTombstoneRewrites() {
                 shardId, stats.pointsWritten, stats.duration.count());
         } catch (const std::exception& e) {
             timestar::engine_log.warn("[TOMBSTONE-REWRITE] Shard {}: rewrite failed: {}", shardId, e.what());
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AGE-DRIVEN DOWNSAMPLE TRIGGER.
+//
+// The fold otherwise runs only when a tier merge happens, and a merge needs
+// files_per_merge files to accumulate. A series that stops receiving writes — a
+// decommissioned RTU — generates no new files, is never re-compacted, and stays
+// at 1 Hz forever no matter how old its data gets. This stage lets AGE alone
+// initiate the work.
+//
+// Modeled on sweepTombstoneRewrites(): snapshot, estimate, cap, rewrite. That
+// function already solves the two hard problems here — a file set that mutates
+// across every suspension, and a compactor that must not be handed more work
+// than it has slots for.
+//
+// THE CANDIDATE TEST IS ZERO-I/O, by construction. This runs on the reactor
+// that serves queries, at a cadence measured in minutes, over potentially every
+// file on the shard; a DMA read per series would be a stall, not a sweep. Every
+// input comes from the resident sparse index (SparseIndexEntry::pointCount,
+// minTime, maxTime) — see TSM::forEachSeriesDensity.
+//
+// SELF-LIMITING WITHOUT A PERSISTED WATERMARK. Nothing records "this series has
+// been folded through stage k". Instead the test asks whether the series' own
+// stored density still exceeds the stage's bucket rate: a series correctly
+// folded to stage k holds at most one point per occupied bucket, and the
+// estimate's denominator (span/interval + 1) is an upper bound on that count, so
+// its ratio is <= 1.0 EXACTLY — below the hysteresis factor, which config
+// validation forces above 1.0. When the next stage's threshold passes, the ratio
+// climbs TOWARD interval[k+1]/interval[k] and the series folds again, once.
+//
+// It climbs toward, never to: the estimate counts BUCKETS, so an r-fold step
+// yields (m+1)/(floor(m/r)+1) for m spans, strictly below r. That is why the
+// hysteresis factor must sit below the SMALLEST value that expression can take
+// for the smallest legal r (r == 2, minimum 1.5) and not at r itself — see
+// EngineConfig::downsample_rewrite_min_reduction_factor. The plan deliberately
+// rejected a persisted watermark (it must survive compaction, delete and
+// replication, and cannot fix avg weighting anyway); this is what replaces it.
+// ---------------------------------------------------------------------------
+seastar::future<> Engine::sweepDownsampleRewrites() {
+    const size_t MAX_REWRITES_PER_SWEEP = timestar::config().engine.max_downsample_rewrites_per_sweep;
+    const double MIN_REDUCTION_FACTOR = timestar::config().engine.downsample_rewrite_min_reduction_factor;
+
+    if (MAX_REWRITES_PER_SWEEP == 0) {
+        co_return;  // stage disabled
+    }
+
+    auto* compactor = tsmFileManager.getCompactor();
+    if (!compactor) {
+        co_return;
+    }
+    ++_downsampleSweepStats.sweeps;
+
+    // --- Phase 0: is there anything to do AT ALL? ---
+    //
+    // No policy, or no policy whose downsample cascade has a reachable stage,
+    // means zero work: no index scan, no file walk, no allocation beyond the
+    // (empty) stage table. Most deployments never install a retention policy,
+    // and this stage must cost them nothing every 15 minutes forever.
+    if (_retentionPolicies.empty()) {
+        co_return;
+    }
+
+    const uint64_t now =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now().time_since_epoch())
+            .count();
+
+    // measurement -> its resolved cascade, finest stage first. Built from the
+    // SAME helper the compactor uses, so the sweep can never schedule a rewrite
+    // the merge would then decline to fold (an endless rewrite loop) nor miss a
+    // stage the merge would have applied.
+    //
+    // An INVALID policy resolves to zero stages and is skipped here silently:
+    // buildDownsampleStages() refuses it, so a rewrite could not change a single
+    // point. The compactor already logs the reason (once per merge); repeating
+    // it every sweep would turn a misconfiguration into log spam AND, worse,
+    // into a file rewritten every sweep for no effect.
+    struct MeasurementCascade {
+        std::array<timestar::retention::DownsampleStage, timestar::retention::kMaxDownsampleTiers> stages{};
+        uint8_t stageCount = 0;
+    };
+    std::unordered_map<std::string, MeasurementCascade> cascades;
+    // Measurements that opted a Boolean/String field into a `latest` fold
+    // (Phase 4), and the fields they named. EMPTY for every policy that does
+    // not use per-field methods, which is what keeps the extra resolution below
+    // off the default sweep entirely.
+    std::unordered_map<std::string, std::unordered_set<std::string>> nonNumericFoldFields;
+    for (const auto& [measurement, policy] : _retentionPolicies) {
+        MeasurementCascade cascade;
+        cascade.stageCount = timestar::retention::buildDownsampleStages(policy, now, cascade.stages);
+        if (cascade.stageCount > 0) {
+            cascades.emplace(measurement, cascade);
+            auto fields = timestar::retention::nonNumericFoldFields(policy);
+            if (!fields.empty()) {
+                nonNumericFoldFields.emplace(measurement,
+                                             std::unordered_set<std::string>(fields.begin(), fields.end()));
+            }
+        }
+    }
+    if (cascades.empty()) {
+        co_return;
+    }
+
+    // No files, nothing to rewrite — checked before any index read.
+    if (tsmFileManager.getSequencedTsmFiles().empty()) {
+        co_return;
+    }
+
+    // --- Phase 1: which series carry a cascade? ---
+    //
+    // One 0x0A prefix scan per policy-bearing measurement, exactly as
+    // sweepExpiredFiles() does, and at the same 15-minute cadence — not per
+    // file and not per merge.
+    //
+    // The scan's safety cap is a REAL failure mode (a measurement holding more
+    // than the index's series limit answers with an error, not a truncated
+    // list). The compaction provider throws there, because a merge that cannot
+    // learn its series' measurements would silently write out unretained data.
+    // This sweep must NOT: it initiates optional extra work, so an unknown
+    // membership means "skip this measurement", never "wedge". Failing here
+    // would also compound the known permanent-compaction-wedge failure mode on
+    // the very shard already suffering it.
+    std::unordered_map<SeriesId128, const MeasurementCascade*, SeriesId128::Hash> seriesCascade;
+    // Series whose Boolean/String field opted into a `latest` fold; empty
+    // unless some policy declares one.
+    std::unordered_set<SeriesId128, SeriesId128::Hash> nonNumericFoldable;
+    for (const auto& [measurement, cascade] : cascades) {
+        ++_downsampleSweepStats.seriesEnumerations;
+        auto scan = co_await index.getAllSeriesForMeasurement(measurement);
+        if (!scan.has_value()) {
+            timestar::engine_log.warn(
+                "[DOWNSAMPLE-SWEEP] Shard {}: skipping measurement '{}' — series enumeration exceeded the index "
+                "safety limit ({} > {}); age-driven folding is disabled for it until cardinality drops",
+                shardId, measurement, scan.error().discovered, scan.error().limit);
+            continue;
+        }
+        for (const auto& sid : scan.value()) {
+            seriesCascade.emplace(sid, &cascade);
+        }
+
+        // NON-NUMERIC OPT-IN (Phase 4). A Boolean/String series folds only when
+        // its FIELD carries an explicit `latest` override, and 0x0A yields no
+        // field — so the eligible set has to be resolved per series.
+        //
+        // Gated on the measurement having declared such an override, so a sweep
+        // over ordinary policies does exactly what it did before. Bounded per
+        // sweep: what does not fit is simply resolved on a later sweep, which
+        // delays a quiet status word's first fold by one 15-minute period and
+        // costs nothing in correctness. Without this, a decommissioned RTU's
+        // opted-in status word would never fold — it stops producing files, so
+        // no merge ever reconsiders it, which is the exact gap the age-driven
+        // trigger exists to close.
+        auto optInIt = nonNumericFoldFields.find(measurement);
+        if (optInIt == nonNumericFoldFields.end()) {
+            continue;
+        }
+        std::vector<SeriesId128> needField;
+        for (const auto& sid : scan.value()) {
+            auto cached = _seriesFieldCache.find(sid);
+            if (cached != _seriesFieldCache.end()) {
+                if (optInIt->second.contains(cached->second)) {
+                    nonNumericFoldable.insert(sid);
+                }
+                continue;
+            }
+            if (needField.size() < MAX_UNRESOLVED_FOR_PER_ID_LOOKUP) {
+                needField.push_back(sid);
+            }
+        }
+        if (needField.empty()) {
+            continue;
+        }
+        auto batch = co_await index.getSeriesMetadataBatch(needField);
+        for (auto& [sid, metadata] : batch) {
+            if (!metadata.has_value()) {
+                continue;  // unknown field: not eligible, retry next sweep
+            }
+            cacheSeriesField(sid, metadata->field);
+            if (optInIt->second.contains(metadata->field)) {
+                nonNumericFoldable.insert(sid);
+            }
+        }
+    }
+    if (seriesCascade.empty()) {
+        co_return;
+    }
+
+    // --- Phase 2: snapshot the files, then estimate (no I/O) ---
+    //
+    // Snapshot before the walk for the same reason the tombstone sweep does:
+    // the compaction loop runs as a separate coroutine on this shard and can
+    // add/remove files during any suspension, invalidating a live iterator.
+    std::vector<seastar::shared_ptr<TSM>> tsmSnapshot;
+    tsmSnapshot.reserve(tsmFileManager.getSequencedTsmFiles().size());
+    for (const auto& [rank, tsmFile] : tsmFileManager.getSequencedTsmFiles()) {
+        tsmSnapshot.push_back(tsmFile);
+    }
+
+    struct Candidate {
+        seastar::shared_ptr<TSM> file;
+        uint64_t pointsRemoved = 0;  // estimated
+        uint64_t pointsBefore = 0;
+    };
+    std::vector<Candidate> candidates;
+
+    // The walk is O(series) of pure hash lookups per file. It runs on the
+    // reactor that serves queries, so yield every kSeriesPerYield series
+    // examined — a high-cardinality shard must not buy this sweep a stall.
+    constexpr size_t kSeriesPerYield = 16'384;
+    size_t sinceYield = 0;
+
+    uint64_t pointsBefore = 0;
+    uint64_t pointsAfter = 0;
+
+    // The candidate test for ONE series against its measurement's cascade.
+    // Accumulates into pointsBefore/pointsAfter for the file being examined.
+    // Contains no suspension point, by design (see the header comment).
+    auto evaluateSeries = [&](const TSM::SeriesDensity& density, const MeasurementCascade& cascade,
+                              bool nonNumericOptedIn) {
+        // KNOWN AND ACCEPTED CAVEAT — NaN-heavy Float series under-report.
+        //
+        // A Float block's stored count is the NON-NaN count (tsm_writer.cpp
+        // ~430: NaN is missing everywhere in this engine, docs/nan_policy.md),
+        // so a series carrying NaNs looks sparser here than it is stored and
+        // may never trip the threshold — an all-NaN series never does. That
+        // is deliberate, not a bug to fix: folding NaN points yields nothing
+        // but block-count reduction, since every aggregation already skips
+        // them and a raw read returns them either way.
+        //
+        // Consequently pointCount == 0 means UNKNOWN (a V1 non-Float entry
+        // carries no count at all; an all-NaN Float series reports zero),
+        // never "the series is empty". Acting on it would divide by a
+        // fiction, so the sweep declines.
+        if (density.pointCount == 0) {
+            return;
+        }
+        // Boolean and String pass through UNFOLDED unless their field carries
+        // an explicit `latest` override (Phase 4). Without one, a rewrite
+        // returns the file byte-for-byte equivalent and the sweep proposes it
+        // again next time — an endless rewrite loop, which is why this must
+        // mirror the compactor's own gate exactly rather than approximate it.
+        if (isNonNumericValueType(density.type) && !nonNumericOptedIn) {
+            return;
+        }
+
+        // Only consider a series whose data lies ENTIRELY older than a
+        // stage threshold. That restriction is what makes the estimate
+        // EXACT rather than an assumption about how points are distributed
+        // inside the file:
+        //
+        //   * TSM files are immutable, so a series' maxTime never grows —
+        //     "wholly aged" is a monotone, stable predicate.
+        //   * Every one of the series' points therefore folds at the SAME
+        //     stage, so the post-fold count is exactly the number of
+        //     occupied buckets, bounded by span/interval + 1.
+        //
+        // A partially-aged series (data straddling the threshold) is left
+        // to the normal merge path. Prorating its aged fraction by assuming
+        // uniform density is precisely wrong for the file this sweep just
+        // produced — a half-folded file looks 30x too dense under that
+        // assumption and gets rewritten on every sweep forever.
+        //
+        // Thresholds are non-increasing in k, so the stages covering the
+        // series are a prefix; the LAST of them is the coarsest, and it is
+        // the one the fold will actually apply to every point.
+        int stage = -1;
+        for (uint8_t k = 0; k < cascade.stageCount; ++k) {
+            if (density.maxTime < cascade.stages[k].threshold) {
+                stage = static_cast<int>(k);
+            } else {
+                break;
+            }
+        }
+        if (stage < 0) {
+            return;  // not wholly aged into any stage
+        }
+
+        const uint64_t interval = cascade.stages[static_cast<size_t>(stage)].interval;
+        const uint64_t span = density.maxTime - density.minTime;
+        // Epoch-aligned buckets: a span of `span` touches at most
+        // span/interval + 1 of them, and the fold emits at most one point
+        // per occupied bucket.
+        const uint64_t foldedPoints = span / interval + 1;
+        if (density.pointCount < foldedPoints) {
+            return;  // already sparser than the target rate
+        }
+        const double ratio = static_cast<double>(density.pointCount) / static_cast<double>(foldedPoints);
+        if (ratio < MIN_REDUCTION_FACTOR) {
+            return;  // hysteresis: not worth a rewrite
+        }
+
+        pointsBefore += density.pointCount;
+        pointsAfter += foldedPoints;
+    };
+
+    for (auto& tsmFile : tsmSnapshot) {
+        // Already being merged: whatever it becomes will have retention applied
+        // by that merge (Phase 1 wiring), so a rewrite would be redundant.
+        if (compactor->isFileInActiveCompaction(tsmFile)) {
+            continue;
+        }
+
+        ++_downsampleSweepStats.filesExamined;
+        pointsBefore = 0;
+        pointsAfter = 0;
+
+        // Walk whichever side is SMALLER. A shard can hold a million series in
+        // one file with only a handful under a policy, or a hundred policy-bearing
+        // series spread over dozens of files; iterating the wrong side turns
+        // either case into a needless full scan.
+        //
+        // The probing direction is also the only one that can yield MID-FILE:
+        // forEachSeriesDensity takes a plain callback, so a single enormous file
+        // is walked in one go. That is bounded by that file's own cardinality
+        // and by the yield after it; the probing direction covers the case where
+        // the bound would otherwise be large and the useful work tiny.
+        if (seriesCascade.size() < tsmFile->getSeriesCount()) {
+            for (const auto& [seriesId, cascade] : seriesCascade) {
+                if (auto density = tsmFile->getSeriesDensity(seriesId); density.has_value()) {
+                    evaluateSeries(*density, *cascade, nonNumericFoldable.contains(seriesId));
+                }
+                if (++sinceYield >= kSeriesPerYield) {
+                    sinceYield = 0;
+                    co_await seastar::yield();
+                }
+            }
+        } else {
+            tsmFile->forEachSeriesDensity([&](const SeriesId128& seriesId, const TSM::SeriesDensity& density) {
+                auto it = seriesCascade.find(seriesId);
+                if (it != seriesCascade.end()) {
+                    evaluateSeries(density, *it->second, nonNumericFoldable.contains(seriesId));
+                }
+            });
+            sinceYield += tsmFile->getSeriesCount();
+            if (sinceYield >= kSeriesPerYield) {
+                sinceYield = 0;
+                co_await seastar::yield();
+            }
+        }
+
+        // A whole-series estimate cannot see an aged prefix in a file that
+        // also contains newer resolutions. Inspect timestamps in those files:
+        // counting occupied target buckets is exact, works across block seams,
+        // and becomes a no-op after the rewrite rather than churning forever.
+        if (pointsBefore == 0) {
+            for (const auto& [seriesId, cascade] : seriesCascade) {
+                auto density = tsmFile->getSeriesDensity(seriesId);
+                if (!density || density->pointCount == 0 ||
+                    (isNonNumericValueType(density->type) && !nonNumericFoldable.contains(seriesId)))
+                    continue;
+                bool straddles = false;
+                std::vector<std::pair<uint64_t, uint64_t>> stages;
+                for (uint8_t k = 0; k < cascade->stageCount; ++k) {
+                    const auto& stage = cascade->stages[k];
+                    stages.emplace_back(stage.threshold, stage.interval);
+                    straddles |= density->minTime < stage.threshold && density->maxTime >= stage.threshold;
+                }
+                if (!straddles)
+                    continue;
+                auto [before, after] = co_await tsmFile->estimateRollupDensity(seriesId, stages);
+                if (after && static_cast<double>(before) / after >= MIN_REDUCTION_FACTOR) {
+                    pointsBefore += before;
+                    pointsAfter += after;
+                }
+            }
+        }
+        if (pointsBefore > pointsAfter) {
+            ++_downsampleSweepStats.candidateFiles;
+            candidates.push_back({tsmFile, pointsBefore - pointsAfter, pointsBefore});
+        }
+    }
+
+    if (candidates.empty()) {
+        co_return;
+    }
+
+    // Biggest reduction first: a capped sweep should spend its slots where the
+    // fold reclaims the most.
+    std::sort(candidates.begin(), candidates.end(),
+              [](const Candidate& a, const Candidate& b) { return a.pointsRemoved > b.pointsRemoved; });
+
+    // --- Phase 3: rewrite, capped ---
+    const size_t rewriteCount = std::min(candidates.size(), MAX_REWRITES_PER_SWEEP);
+    for (size_t i = 0; i < rewriteCount; ++i) {
+        auto& candidate = candidates[i];
+
+        // Non-blocking: leave the remaining rewrites for the next sweep rather
+        // than queueing behind the merge semaphore. This is background
+        // housekeeping and must never sit in front of a tier merge or a
+        // WAL->TSM conversion. (The rewrite runs in the compaction scheduling
+        // group like any other executeCompaction; nothing here changes that.)
+        if (!compactor->hasCompactionCapacity()) {
+            break;
+        }
+
+        // Staleness guard: a compaction that completed during one of our
+        // suspensions may already have removed this file. The shared_ptr keeps
+        // the object alive, but executeCompaction would try to remove and
+        // delete a file that is no longer registered.
+        auto rank = candidate.file->rankAsInteger();
+        auto it = tsmFileManager.getSequencedTsmFiles().find(rank);
+        if (it == tsmFileManager.getSequencedTsmFiles().end() || it->second.get() != candidate.file.get()) {
+            continue;
+        }
+        if (compactor->isFileInActiveCompaction(candidate.file)) {
+            continue;
+        }
+
+        timestar::engine_log.info(
+            "[DOWNSAMPLE-SWEEP] Shard {}: rewriting file (tier {}, seq {}) — {} aged points estimated to fold to {}",
+            shardId, candidate.file->tierNum, candidate.file->seqNum, candidate.pointsBefore,
+            candidate.pointsBefore - candidate.pointsRemoved);
+        ++_downsampleSweepStats.rewrites;
+        try {
+            // Single file, SAME TIER, straight through executeCompaction —
+            // exactly what executeTombstoneRewrite does, which is what makes
+            // the Phase 1 retention provider apply the cascade automatically.
+            auto stats = co_await compactor->executeDownsampleRewrite(candidate.file);
+            timestar::engine_log.info("[DOWNSAMPLE-SWEEP] Shard {}: rewrite complete, {} points written in {}ms",
+                                      shardId, stats.pointsWritten, stats.duration.count());
+        } catch (const std::exception& e) {
+            timestar::engine_log.warn("[DOWNSAMPLE-SWEEP] Shard {}: rewrite failed: {}", shardId, e.what());
         }
     }
 }

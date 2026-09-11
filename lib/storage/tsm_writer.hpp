@@ -1,6 +1,7 @@
 #pragma once
 
 #include "aligned_buffer.hpp"
+#include "crc32.hpp"
 #include "memory_store.hpp"
 #include "series_id.hpp"
 #include "timestar_config.hpp"
@@ -53,7 +54,9 @@ private:
     // are written; the remainder is moved to the front and kept.
     static constexpr size_t FLUSH_THRESHOLD = 8u << 20;  // 8 MB
 
+    uint8_t version_ = 3;
     void writeHeader();
+    void writeRollups(TSMIndexBlock& block, std::span<const RollupState> states);
 
     template <class T>
     TSMIndexEntry beginSeriesEntry(TSMValueType seriesType, const SeriesId128& seriesId, const std::vector<T>& values);
@@ -78,6 +81,23 @@ private:
 
 public:
     TSMWriter(std::string _filename);
+    void enableRollups(const std::vector<uint64_t>& replacedFiles = {}) {
+        if (buffer.size() != 5 || flushedBytes_ != 0 || version_ != 3) {
+            throw std::logic_error("Rollup format must be enabled before writing data");
+        }
+        if (replacedFiles.size() > UINT32_MAX)
+            throw std::overflow_error("Too many compaction ancestors");
+        version_ = 4;
+        buffer.writeAt<uint8_t>(4, version_);
+        buffer.write(static_cast<uint32_t>(replacedFiles.size()));
+        for (const auto rank : replacedFiles)
+            buffer.write(rank);
+        const auto count = static_cast<uint32_t>(replacedFiles.size());
+        uint32_t crc = CRC32::update(CRC32::INIT, reinterpret_cast<const uint8_t*>(&count), sizeof(count));
+        if (!replacedFiles.empty())
+            crc = CRC32::update(crc, reinterpret_cast<const uint8_t*>(replacedFiles.data()), replacedFiles.size() * 8);
+        buffer.write(CRC32::finalize(crc));
+    }
 
     // Set zstd compression level for string blocks (higher = better ratio, slower).
     // Call before writing any series. Default is 1 (fast).
@@ -125,7 +145,8 @@ public:
     // Reference parameters would dangle across the first suspension.
     template <class T>
     seastar::future<> appendSeriesChunk(TSMValueType seriesType, const SeriesId128& seriesId,
-                                        std::vector<uint64_t> timestamps, std::vector<T> values);
+                                        std::vector<uint64_t> timestamps, std::vector<T> values,
+                                        std::vector<RollupState> rollups = {});
     template <class T>
     void writeBlock(TSMValueType seriesType, const SeriesId128& seriesId, std::span<const uint64_t> timestamps,
                     std::span<const T> values, TSMIndexEntry& indexEntry);

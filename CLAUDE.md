@@ -963,6 +963,53 @@ SUCCESS side: `/derived` still emits an always-empty `error` OBJECT
 the presence of `error` nor its type tells you whether a `/derived` request
 failed — **branch on `status`**.
 
+## Retention and Downsampling (canonical semantics)
+
+Retention policies now **run**. Both halves of the feature were previously dead
+code: `setRetentionContext()` had no production caller, so per-point TTL
+trimming never happened (only `sweepExpiredFiles()` deleting *wholly* expired
+files) and downsampling never happened at all. Full API in
+`docs/api-retention.md`; the rules that must not drift:
+
+- **Compaction applies retention.** Every merge and every single-file rewrite
+  routes through `executeCompaction()`, which resolves per-series context from
+  an Engine-injected provider. A compaction that cannot obtain that context
+  **fails** rather than silently compacting without retention — silent
+  no-retention was exactly the original defect.
+- **TTL is trimmed per point**, not per file. Whole blocks older than the cutoff
+  are still dropped wholesale as a fast path.
+- **`downsample` is an ordered cascade** of up to 4 tiers (1 Hz → 1m after 7d →
+  15m after 90d). `downsampleTiers` is canonical and always serialised;
+  `downsample` is a legacy mirror of tier 0, so an old reader degrades to the
+  *finest* tier — finer than intended, never coarser.
+- **Downsampling uses persisted V4 rollup state.** Counts, sums, original latest
+  timestamps and aggregation methods survive compaction. Equal aggregate bucket
+  labels are contributions to combine, while raw timestamp duplicates retain
+  last-write-wins semantics. Do not feed aggregate values through raw dedup.
+- **Age thresholds are interval-aligned.** The sweep also checks partially aged
+  files by counting target buckets from block timestamps, without repeatedly
+  rewriting already-folded regions.
+- **Averages preserve sample weights through cascade stages.** Integers use a
+  128-bit sum; integer result overflow fails without deleting inputs. Aggregate
+  NaNs retain nonzero counts and must not disappear on a later fold.
+- **V4 files carry checksummed input ancestry.** Startup excludes replaced input
+  files before serving reads; registry replacement removes all inputs before
+  suspending. Shard rebalancing must preserve rollup state and clear old shard
+  ancestry. Older binaries cannot read V4; V2/V3 raw files stay readable.
+- **Boolean/String never fold by default and are never coerced to 1.0/0.0.** The
+  only opt-in is an explicit `fieldMethods` entry of `latest`, which reduces to
+  LATEST-per-bucket in the written type — matching the query-time rule. A
+  measurement-wide `"method": "latest"` does *not* enable it.
+- **An invalid policy refuses to fold** (TTL still applies) rather than
+  defaulting an unrecognised method to AVG, which would destructively average a
+  totalizer on a typo. `timestar::retention::validateRetentionPolicy()` is the
+  single definition, and `buildDownsampleStages()` is the single threshold
+  resolver shared by the compactor and the age-driven sweep — a divergence
+  between those two is an endless rewrite loop.
+- **Storage resolution is not a query concept.** Downsampling changes *which
+  points are stored*; it does not change how any path aggregates or labels them,
+  so every rule in "Aggregation Result Shape" holds unchanged.
+
 ## Performance Logging Configuration
 
 The TimeStar includes compile-time controls for verbose logging in performance-critical paths. This allows developers to enable detailed logging for debugging without impacting production performance.

@@ -67,10 +67,6 @@ private:
     seastar::future<> openTsmFile(std::string path);
     std::string basePath();
 
-    // Compact one tier if it is eligible and not in failure backoff.
-    // Returns true if a merge actually ran.
-    seastar::future<bool> compactOneTier(uint64_t tier);
-
     // One INDEPENDENT FIBER PER TIER.
     //
     // Measured on a 1.3B-point ingest (2 shards): tier 0 accounted for 77 of 89
@@ -162,8 +158,23 @@ public:
     seastar::future<> addTSMFile(seastar::shared_ptr<TSM> file);
     seastar::future<> removeTSMFiles(const std::vector<seastar::shared_ptr<TSM>>& files);
 
+    // Compact one tier if it is eligible and not in failure backoff.
+    // Returns true if a merge actually ran.
+    //
+    // Public so tests can drive the PRODUCTION merge path deterministically
+    // rather than racing the background fibers. This is the call
+    // tierCompactionLoop() makes; entering below it (straight into
+    // TSMCompactor::compact) is what let the retention wiring defect survive a
+    // green suite.
+    seastar::future<bool> compactOneTier(uint64_t tier);
+
     // Allocate a globally unique sequence ID for new TSM files
-    uint64_t allocateSequenceId() { return nextSequenceId++; }
+    uint64_t allocateSequenceId(uint64_t minimum = 0) {
+        nextSequenceId = std::max(nextSequenceId, minimum);
+        if (nextSequenceId >= (uint64_t{1} << 60))
+            throw std::overflow_error("TSM sequence numbers exhausted");
+        return nextSequenceId++;
+    }
 
     // Get the compactor (for tombstone rewrites)
     TSMCompactor* getCompactor() { return compactor.get(); }

@@ -10,6 +10,7 @@
 #include "tsm_writer.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <functional>
 #include <memory>
@@ -20,6 +21,7 @@
 #include <seastar/core/semaphore.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 // Forward declarations
@@ -42,6 +44,57 @@ struct CompactionResult {
     std::string outputPath;
     CompactionStats stats;
 };
+
+// Retention context for ONE compaction, resolved at execute time.
+//
+// Deliberately not a "set this before you trigger" handshake. The compactor
+// runs up to compactionSemaphore concurrent merges driven by one fiber per
+// tier, so any state parked on the compactor for "the next" compaction can be
+// consumed by a different plan than the one it was built for. This bundle is
+// produced per plan, from that plan's own series ids, and flows straight into
+// compact() as arguments.
+struct RetentionCompactionContext {
+    std::unordered_map<std::string, RetentionPolicy> policies;
+    std::unordered_map<SeriesId128, std::string, SeriesId128::Hash> seriesMeasurement;
+    // seriesId -> FIELD name, populated ONLY for series whose measurement's
+    // policy names that field in `fieldMethods` (Phase 4). Deliberately sparse:
+    // a policy with no per-field overrides leaves this empty and costs the
+    // provider not one extra index read, so the default path is unchanged.
+    std::unordered_map<SeriesId128, std::string, SeriesId128::Hash> seriesField;
+};
+
+// Injected by Engine at startup (see Engine::init). Takes the series ids a
+// compaction plan touches and resolves the retention context for exactly
+// those. Async because resolution may consult the shard's index.
+//
+// An exception from the provider FAILS the compaction: compacting without
+// retention when a policy exists is silent data retention loss (expired points
+// survive) and silent non-downsampling — precisely the defect this replaced.
+using RetentionContextProvider =
+    std::function<seastar::future<RetentionCompactionContext>(const std::vector<SeriesId128>&)>;
+
+// Cheap synchronous "could retention apply on this shard at all?" probe,
+// injected alongside the provider (same shape as setWalConversionProbe).
+//
+// The provider's own fast path already returns empty maps without an index
+// read, but reaching it still costs getAllSeriesIds() over every source file's
+// sparse index — O(series) per merge, ~500k hash inserts on a 128k-series
+// shard, paid on every merge of a shard that has no policy at all. This probe
+// lets executeCompaction skip that work entirely. Unset means "assume active".
+using RetentionActiveProbe = std::function<bool()>;
+
+// ONE STAGE of a downsample cascade, resolved for a compaction at execute time.
+//
+// Defined in lib/retention/retention_policy.hpp alongside the builder that
+// produces it: Engine::sweepDownsampleRewrites() must decide "is a fold worth
+// scheduling?" from exactly the stages the compactor will then apply, and two
+// copies of that arithmetic would drift into either an endless rewrite loop or
+// a quiet series that never folds.
+using DownsampleStage = timestar::retention::DownsampleStage;
+
+// Cascade depth cap; mirrors timestar::retention::kMaxDownsampleTiers. Kept as
+// a fixed array bound so a per-series retention context costs no allocation.
+inline constexpr size_t MAX_DOWNSAMPLE_STAGES = timestar::retention::kMaxDownsampleTiers;
 
 // Represents a plan for compacting a set of TSM files
 struct CompactionPlan {
@@ -70,16 +123,56 @@ private:
 
     // Per-series retention context built in compact(), passed to processSeriesForCompaction
     struct SeriesRetentionContext {
-        uint64_t ttlCutoff = 0;            // Points with ts < ttlCutoff are expired
-        uint64_t downsampleThreshold = 0;  // Points with ts < threshold get downsampled
-        uint64_t downsampleInterval = 0;   // Bucket size in nanoseconds
-        timestar::AggregationMethod downsampleMethod = timestar::AggregationMethod::AVG;
-    };
-    using SeriesRetentionMap = std::unordered_map<SeriesId128, SeriesRetentionContext, SeriesId128::Hash>;
+        uint64_t ttlCutoff = 0;  // Points with ts < ttlCutoff are expired
 
-    // Pending retention context set by Engine before compaction
-    std::unordered_map<std::string, RetentionPolicy> _pendingRetentionPolicies;
-    std::unordered_map<SeriesId128, std::string, SeriesId128::Hash> _pendingSeriesMeasurementMap;
+        // The downsample CASCADE, ordered FINEST FIRST (stages[0] is the tier a
+        // point reaches first as it ages: the largest threshold, the smallest
+        // interval). Thresholds are non-increasing and intervals strictly
+        // increasing across k.
+        //
+        // A point's stage is the LARGEST k with `ts < stages[k].threshold`;
+        // a point with `ts >= stages[0].threshold` is raw and passes through.
+        //
+        // Because validation forces interval[k] to divide interval[k+1] and
+        // every threshold is aligned down to its own interval, the bucket START
+        // timestamps produced by stage k+1 are all strictly below those produced
+        // by stage k, which are all strictly below the first raw point. The fold
+        // output is therefore ascending without sorting — the property the
+        // streaming writer depends on.
+        std::array<DownsampleStage, MAX_DOWNSAMPLE_STAGES> stages{};
+        uint8_t stageCount = 0;
+        // The fold method for the series this context is resolved FOR. With
+        // per-field overrides (Phase 4) this is the tier method only when the
+        // series' field names none.
+        timestar::AggregationMethod downsampleMethod = timestar::AggregationMethod::AVG;
+
+        // May a Boolean/String series fold at all? True ONLY when the series'
+        // field carries an explicit `fieldMethods` entry of "latest".
+        //
+        // Deliberately NOT `downsampleMethod == LATEST`: a measurement-wide
+        // `"method": "latest"` must leave non-numeric series passing through
+        // exactly as it did before Phase 4. Opting a status word into
+        // destruction has to be an explicit act.
+        bool nonNumericFold = false;
+
+        // Boundary between "folds at some stage" and "passes through raw".
+        uint64_t finestThreshold() const { return stageCount > 0 ? stages[0].threshold : 0; }
+    };
+    // seriesId -> the context resolved for its (MEASUREMENT, FIELD). A pointer,
+    // not a copy: every series under one measurement-and-field shares one
+    // context, and a merge on a fully-policy-covered 128k-series shard would
+    // otherwise carry 128k copies of an 88-byte struct (~16 MB per merge, and
+    // merges can run every few seconds). The pointees live in compact()'s
+    // context table, which outlives every processSeriesForCompaction it awaits;
+    // unordered_map nodes are address-stable, so a rehash of that table cannot
+    // dangle these.
+    using SeriesRetentionMap = std::unordered_map<SeriesId128, const SeriesRetentionContext*, SeriesId128::Hash>;
+
+    // Resolves retention context per compaction plan. Unset (tests, standalone
+    // benchmarks) means "no retention", which is safe: nothing installed it, so
+    // no policy exists to be skipped.
+    RetentionContextProvider retentionContextProvider_;
+    RetentionActiveProbe retentionActiveProbe_;
 
     // Track active compactions
     struct ActiveCompaction {
@@ -99,8 +192,17 @@ private:
     // path hands off each bounded chunk instead of accumulating the whole
     // series in SeriesCompactionData::timestamps/values.
     template <typename T>
-    using PointChunkSink =
-        std::function<seastar::future<>(std::vector<uint64_t>&& timestamps, std::vector<T>&& values)>;
+    using PointChunkSink = std::function<seastar::future<>(std::vector<uint64_t>&& timestamps, std::vector<T>&& values,
+                                                           std::vector<RollupState>&& rollups)>;
+
+    template <typename T>
+    using RollupChunkSink = PointChunkSink<T>;
+
+    template <typename T>
+    seastar::future<SeriesCompactionData<T>> processRollupSeries(const SeriesId128& seriesId,
+                                                                 const std::vector<seastar::shared_ptr<TSM>>& sources,
+                                                                 const SeriesRetentionMap& retention,
+                                                                 RollupChunkSink<T> sink);
 
     // Points buffered before a chunk is handed to the sink. 256K points is
     // ~4 MB for double (8B ts + 8B value), i.e. bounded regardless of series
@@ -193,33 +295,41 @@ public:
     explicit TSMCompactor(TSMFileManager* manager);
     ~TSMCompactor() = default;
 
-    // Set retention policies and series->measurement map for the next compaction.
-    // Called by Engine before triggering compaction so that TTL/downsampling
-    // can be applied during processSeriesForCompaction().
-    void setRetentionContext(
-        const std::unordered_map<std::string, RetentionPolicy>& policies,
-        const std::unordered_map<SeriesId128, std::string, SeriesId128::Hash>& seriesMeasurementMap) {
-        _pendingRetentionPolicies = policies;
-        _pendingSeriesMeasurementMap = seriesMeasurementMap;
+    // Install the retention context provider. Called once by Engine::init(),
+    // after TSMFileManager::init() has constructed this compactor.
+    void setRetentionContextProvider(RetentionContextProvider provider, RetentionActiveProbe active = nullptr) {
+        retentionContextProvider_ = std::move(provider);
+        retentionActiveProbe_ = std::move(active);
     }
 
     // Main compaction method - merges files and returns result with path + stats.
     // retentionPolicies: per-measurement policies for TTL/downsampling (empty = no retention).
-    // seriesMetadataMap: SeriesId128 -> measurement name, pre-built by caller for efficiency.
+    // seriesMeasurementMap: SeriesId128 -> measurement name, pre-built by caller for efficiency.
+    // seriesFieldMap: SeriesId128 -> field name. Only needs entries for series
+    //   whose policy names their field in `fieldMethods`; anything absent takes
+    //   the tier's default method, which is exactly pre-Phase-4 behaviour.
     // targetTier/targetSeq: pre-allocated from CompactionPlan.  When called
     // without a plan (e.g. from tests), pass 0 for both and compact() will
     // compute the tier from input files and allocate a fresh sequence ID.
+    //
+    // The three maps are taken by const reference and consumed BEFORE the first
+    // co_await in the body (the context build sits above every suspension
+    // point), which is what makes the `= {}` defaults safe in a coroutine: the
+    // caller's temporaries outlive every read of them. Moving the context build
+    // below a suspension would break that silently.
     seastar::future<CompactionResult> compact(
         const std::vector<seastar::shared_ptr<TSM>>& files, uint64_t targetTier, uint64_t targetSeq,
         const std::unordered_map<std::string, RetentionPolicy>& retentionPolicies = {},
-        const std::unordered_map<SeriesId128, std::string, SeriesId128::Hash>& seriesMeasurementMap = {});
+        const std::unordered_map<SeriesId128, std::string, SeriesId128::Hash>& seriesMeasurementMap = {},
+        const std::unordered_map<SeriesId128, std::string, SeriesId128::Hash>& seriesFieldMap = {});
 
     // Convenience overload for callers without a pre-allocated plan (auto-allocates tier/seq).
     seastar::future<CompactionResult> compact(
         const std::vector<seastar::shared_ptr<TSM>>& files,
         const std::unordered_map<std::string, RetentionPolicy>& retentionPolicies,
-        const std::unordered_map<SeriesId128, std::string, SeriesId128::Hash>& seriesMeasurementMap) {
-        return compact(files, 0, 0, retentionPolicies, seriesMeasurementMap);
+        const std::unordered_map<SeriesId128, std::string, SeriesId128::Hash>& seriesMeasurementMap,
+        const std::unordered_map<SeriesId128, std::string, SeriesId128::Hash>& seriesFieldMap = {}) {
+        return compact(files, 0, 0, retentionPolicies, seriesMeasurementMap, seriesFieldMap);
     }
 
     // Convenience overload: compact files with no retention and auto-allocated tier/seq.
@@ -301,6 +411,23 @@ public:
     // Rewrite a single tombstoned file at the same tier to reclaim space.
     // Caller must verify hasCompactionCapacity() first (non-blocking design).
     seastar::future<CompactionStats> executeTombstoneRewrite(seastar::shared_ptr<TSM> file);
+
+    // Rewrite a single file at the same tier so its aged points fold to their
+    // downsample stage. Driven by Engine::sweepDownsampleRewrites() for series
+    // that stopped receiving writes and would therefore never be re-compacted.
+    //
+    // Mechanically identical to executeTombstoneRewrite — one file, same tier,
+    // through executeCompaction, which is what makes the retention provider
+    // apply the cascade. Separate only so the two reasons a file gets rewritten
+    // are distinguishable in the log.
+    //
+    // Caller must verify hasCompactionCapacity() first (non-blocking design).
+    seastar::future<CompactionStats> executeDownsampleRewrite(seastar::shared_ptr<TSM> file);
+
+private:
+    // Shared body of the two single-file rewrites above. `reason` only labels
+    // the log line.
+    seastar::future<CompactionStats> executeSingleFileRewrite(seastar::shared_ptr<TSM> file, const char* reason);
 };
 
 // Abstract base class for compaction strategies
