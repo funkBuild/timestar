@@ -6,6 +6,7 @@
 
 #include <filesystem>
 #include <seastar/util/defer.hh>
+#include <seastar/util/later.hh>
 
 using namespace timestar::index;
 namespace ke = timestar::index::keys;
@@ -15,6 +16,32 @@ public:
     void SetUp() override { std::filesystem::remove_all("shard_0/native_index"); }
     void TearDown() override { std::filesystem::remove_all("shard_0/native_index"); }
 };
+
+namespace {
+
+// Drive a suspended getOrCreateSeriesId() until it has published `field` to the
+// schema cache. A release build gets there before the writer's first real
+// suspension (its cold tag-values scan), so the first check succeeds. A Seastar
+// debug build -- which the coverage preset is -- makes need_preempt() always
+// true, so the writer yields at every co_await, even on a ready future, and is
+// several steps short of its field-schema snapshot when the caller next runs.
+// The field is published immediately before the cold scan and the commit is
+// after it, so the caller observes it while the writer is still mid-transaction.
+// Returns false if the writer completed first: the interleaving under test did
+// not happen.
+seastar::future<bool> waitForPublishedField(NativeIndex& index, const std::string& measurement,
+                                            const std::string& field, const seastar::future<SeriesId128>& writer) {
+    for (int i = 0; i < 10000; ++i) {
+        if ((co_await index.getFields(measurement)).contains(field))
+            co_return !writer.available();
+        if (writer.available())
+            co_return false;
+        co_await seastar::yield();
+    }
+    co_return false;
+}
+
+}  // namespace
 
 SEASTAR_TEST_F(IndexTransactionRecoveryTest, SuccessfulRetryPersistsSchemaAfterAppendFailure) {
     {
@@ -238,8 +265,8 @@ SEASTAR_TEST_F(IndexTransactionRecoveryTest, ConcurrentCreationCannotOverwriteNe
         NativeIndexTestAccess::clearBlockCache(index);
         auto first = index.getOrCreateSeriesId("m", {{"z", "old"}}, "first");
         EXPECT_FALSE(first.available()) << "first writer suspends in its cold tag-values scan";
-        EXPECT_EQ((co_await index.getFields("m")).count("first"), 1u)
-            << "the first writer has already captured its field-schema snapshot";
+        EXPECT_TRUE(co_await waitForPublishedField(index, "m", "first", first))
+            << "the first writer has captured its field-schema snapshot and is still mid-transaction";
         auto second = index.getOrCreateSeriesId("m", {{"a", "x"}}, "second");
         co_await std::move(second);
         co_await std::move(first);
@@ -274,7 +301,8 @@ SEASTAR_TEST_F(IndexTransactionRecoveryTest, SchemaBroadcastAndLocalCreationPres
         NativeIndexTestAccess::clearBlockCache(index);
         auto local = index.getOrCreateSeriesId("m", {{"z", "old"}}, "local");
         EXPECT_FALSE(local.available());
-        EXPECT_EQ((co_await index.getFields("m")).count("local"), 1u);
+        EXPECT_TRUE(co_await waitForPublishedField(index, "m", "local", local))
+            << "the local writer has captured its field-schema snapshot and is still mid-transaction";
         SchemaUpdate update;
         update.newFields["m"].insert("remote");
         auto broadcast = index.applySchemaUpdate(std::move(update));
